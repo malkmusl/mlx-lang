@@ -1,0 +1,937 @@
+// Shaping (HarfBuzz's hb-ot-shape.cc, hb-shape-plan.cc, hb-shape.cc and
+// hb-fallback-shape.cc): shape plans (made per face, properties, user
+// features and variation coordinates, and cached in the face), and the
+// shaping of a buffer by a plan: Unicode properties, clusters, the native
+// direction, the shaper's preprocessing, normalization and glyph mapping,
+// masks, GSUB, default positions, GPOS (or the kern table, or the
+// fallbacks), and the cleanup after.
+const m = @import("./memory.mlx")
+const o = @import("./object.mlx")
+const common = @import("./common.mlx")
+const unicode = @import("./unicode.mlx")
+const face = @import("./face.mlx")
+const font = @import("./font.mlx")
+const buffer = @import("./buffer.mlx")
+const layout = @import("./layout.mlx")
+const p = @import("./props.mlx")
+const apply = @import("./apply.mlx")
+const plan = @import("./plan.mlx")
+const shapers = @import("./shapers.mlx")
+const normalize = @import("./normalize.mlx")
+const fallback = @import("./fallback.mlx")
+const kern = @import("./kern.mlx")
+const set = @import("./set.mlx")
+
+const GlyphInfo = buffer.GlyphInfo
+
+const SHAPER_OT: u32 = 1
+const SHAPER_FALLBACK: u32 = 2
+
+pub const FEATURE_GLOBAL_START: u32 = 0
+pub const FEATURE_GLOBAL_END: u32 = 0xFFFFFFFF
+
+fn tag(a: u8, b: u8, c: u8, d: u8) -> u32 { return common.tag(a, b, c, d) }
+
+// ---------------------------------------------------------------------------
+// Shape plans
+
+pub const ShapePlan = struct {
+    refcount: u32
+    writable: u32
+    userList: usize
+    lock: u32
+    count: u32
+    faceUnsafe: usize
+    direction: u32
+    script: u32
+    language: usize
+    // The user features (16 bytes each: tag, value, start, end), copied.
+    userFeatures: usize
+    numUserFeatures: u32
+    variations0: u32
+    variations1: u32
+    shaper: u32
+    ot: plan.Plan
+}
+
+pub fn shapePlan(address: usize) -> *ShapePlan { unsafe { return @ptrFromInt(*ShapePlan, address) } }
+
+var emptyPlan: usize = 0
+
+pub fn getEmptyPlan() -> usize {
+    var e = m.atomicLoadWord(@intFromPtr(&emptyPlan))
+    if e == 0 {
+        const made = o.createInert(@sizeOf(ShapePlan))
+        plan.mapInit(&shapePlan(made).*.ot.map)
+        if !m.swapWord(@intFromPtr(&emptyPlan), 0, made) { m.release(made) }
+        e = m.atomicLoadWord(@intFromPtr(&emptyPlan))
+    }
+    return e
+}
+
+// The shaper a list of names asks for (0: none of the known ones); the
+// default is "ot".
+fn chooseShaper(shaperList: usize) -> u32 {
+    if shaperList == 0 { return SHAPER_OT }
+    var at = shaperList
+    while m.getWord(at) != 0 {
+        const name = m.getWord(at)
+        if m.bytesAre(name, m.cLength(name), "ot") { return SHAPER_OT }
+        if m.bytesAre(name, m.cLength(name), "fallback") { return SHAPER_FALLBACK }
+        at += 8
+    }
+    return 0
+}
+
+fn isGlobal(f: usize) -> bool { return m.get32(f + 8) == FEATURE_GLOBAL_START && m.get32(f + 12) == FEATURE_GLOBAL_END }
+
+const TAG_GSUB: u32 = 0x47535542
+const TAG_GPOS: u32 = 0x47504F53
+
+// The common features and the horizontal ones (tags and map flags).
+fn addCommonFeatures(b: *plan.Builder) -> void {
+    plan.addFeature(b, tag(97, 98, 118, 109), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(98, 108, 119, 109), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(99, 99, 109, 112), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(108, 111, 99, 108), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(109, 97, 114, 107), plan.F_GLOBAL_MANUAL_JOINERS, 1)
+    plan.addFeature(b, tag(109, 107, 109, 107), plan.F_GLOBAL_MANUAL_JOINERS, 1)
+    plan.addFeature(b, tag(114, 108, 105, 103), plan.F_GLOBAL, 1)
+}
+
+fn addHorizontalFeatures(b: *plan.Builder) -> void {
+    plan.addFeature(b, tag(99, 97, 108, 116), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(99, 108, 105, 103), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(99, 117, 114, 115), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(100, 105, 115, 116), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(107, 101, 114, 110), plan.F_GLOBAL_HAS_FALLBACK, 1)
+    plan.addFeature(b, tag(108, 105, 103, 97), plan.F_GLOBAL, 1)
+    plan.addFeature(b, tag(114, 99, 108, 116), plan.F_GLOBAL, 1)
+}
+
+// hb_ot_shape_collect_features
+fn collectFeatures(b: *plan.Builder, shaper: u32, userFeatures: usize, count: u32) -> void {
+    b.*.isSimple = true
+    plan.enableFeature(b, tag(114, 118, 114, 110), plan.F_NONE, 1)
+    plan.addGsubPause(b, 0)
+    if b.*.direction == common.DIRECTION_LTR {
+        plan.enableFeature(b, tag(108, 116, 114, 97), plan.F_NONE, 1)
+        plan.enableFeature(b, tag(108, 116, 114, 109), plan.F_NONE, 1)
+    } else if b.*.direction == common.DIRECTION_RTL {
+        plan.enableFeature(b, tag(114, 116, 108, 97), plan.F_NONE, 1)
+        plan.addFeature(b, tag(114, 116, 108, 109), plan.F_NONE, 1)
+    }
+    plan.addFeature(b, tag(102, 114, 97, 99), plan.F_NONE, 1)
+    plan.addFeature(b, tag(110, 117, 109, 114), plan.F_NONE, 1)
+    plan.addFeature(b, tag(100, 110, 111, 109), plan.F_NONE, 1)
+    plan.enableFeature(b, tag(114, 97, 110, 100), plan.F_RANDOM, plan.MAX_VALUE)
+    plan.enableFeature(b, tag(116, 114, 97, 107), plan.F_HAS_FALLBACK, 1)
+    plan.enableFeature(b, tag(72, 97, 114, 102), plan.F_NONE, 1)
+    plan.enableFeature(b, tag(72, 65, 82, 70), plan.F_NONE, 1)
+    if shapers.collectFeatures(shaper, b) { b.*.isSimple = false }
+    plan.enableFeature(b, tag(66, 117, 122, 122), plan.F_NONE, 1)
+    plan.enableFeature(b, tag(66, 85, 90, 90), plan.F_NONE, 1)
+    addCommonFeatures(b)
+    if common.isHorizontal(b.*.direction) {
+        addHorizontalFeatures(b)
+    } else {
+        plan.enableFeature(b, tag(118, 101, 114, 116), plan.F_GLOBAL_SEARCH, 1)
+    }
+    if count != 0 { b.*.isSimple = false }
+    var i: u32 = 0
+    while i < count {
+        const f = userFeatures + @intCast(usize, i) * 16
+        plan.addFeature(b, m.get32(f), if isGlobal(f) { plan.F_GLOBAL } else { plan.F_NONE }, m.get32(f + 4))
+        i += 1
+    }
+    shapers.overrideFeatures(shaper, b)
+}
+
+// Makes the OpenType plan of shape plan `sp` (hb_ot_shape_plan_t::init0).
+fn initOtPlan(sp: *ShapePlan, fc: usize) -> bool {
+    const pl = &sp.*.ot
+    plan.mapInit(&pl.*.map)
+    pl.*.direction = sp.*.direction
+    pl.*.script = sp.*.script
+    pl.*.language = sp.*.language
+    var b: plan.Builder = undefined
+    plan.builderInit(&b, fc, sp.*.direction, sp.*.script, sp.*.language)
+    const shaper = shapers.categorize(sp.*.script, sp.*.direction, b.chosenScript0)
+    pl.*.shaper = shaper
+    collectFeatures(&b, shaper, sp.*.userFeatures, sp.*.numUserFeatures)
+    plan.compile(&b, &pl.*.map, sp.*.variations0, sp.*.variations1)
+    plan.builderFini(&b)
+    plan.decide(pl, fc, shapers.gposTag(shaper), shapers.zeroWidthMarks(shaper) != plan.ZERO_WIDTH_MARKS_NONE, shapers.fallbackPosition(shaper))
+    pl.*.data = shapers.dataCreate(shaper, pl)
+    if pl.*.data == 0 {
+        plan.mapFini(&pl.*.map)
+        return false
+    }
+    return true
+}
+
+pub fn createPlan(fc_: usize, direction: u32, script: u32, language: usize, features: usize, count: u32, coords: usize, numCoords: u32, shaperList: usize) -> usize {
+    if direction == common.DIRECTION_INVALID { return getEmptyPlan() }
+    const address = o.create(@sizeOf(ShapePlan))
+    if address == 0 { return getEmptyPlan() }
+    var fc = fc_
+    if fc == 0 { fc = face.getEmpty() }
+    o.makeImmutable(fc)
+    o.header(address).*.writable = 1
+    const sp = shapePlan(address)
+    sp.*.faceUnsafe = fc
+    sp.*.direction = direction
+    sp.*.script = script
+    sp.*.language = language
+    sp.*.numUserFeatures = count
+    if count != 0 {
+        sp.*.userFeatures = m.alloc(@intCast(usize, count) * 16)
+        if sp.*.userFeatures == 0 {
+            m.release(address)
+            return getEmptyPlan()
+        }
+        m.copy(sp.*.userFeatures, features, @intCast(usize, count) * 16)
+        // (HarfBuzz makes the first feature's range uniform, once per feature.)
+        var i: u32 = 0
+        while i < count {
+            if m.get32(sp.*.userFeatures + 8) != FEATURE_GLOBAL_START { m.put32(sp.*.userFeatures + 8, 1) }
+            if m.get32(sp.*.userFeatures + 12) != FEATURE_GLOBAL_END { m.put32(sp.*.userFeatures + 12, 2) }
+            i += 1
+        }
+    }
+    sp.*.variations0 = plan.variationsIndex(fc, 0, coords, numCoords)
+    sp.*.variations1 = plan.variationsIndex(fc, 1, coords, numCoords)
+    sp.*.shaper = chooseShaper(shaperList)
+    if sp.*.shaper == 0 || !initOtPlan(sp, fc) {
+        m.release(sp.*.userFeatures)
+        m.release(address)
+        return getEmptyPlan()
+    }
+    return address
+}
+
+pub fn destroyPlan(address: usize) -> void {
+    if !o.destroy(address) { return }
+    const sp = shapePlan(address)
+    shapers.dataDestroy(sp.*.ot.shaper, sp.*.ot.data)
+    plan.mapFini(&sp.*.ot.map)
+    m.release(sp.*.userFeatures)
+    m.release(address)
+}
+
+pub fn destroyPlanCallback(address: usize) -> void { destroyPlan(address) }
+
+// Whether plan `sp` is the one for these properties, features (their tags,
+// values and globalness), variations and shaper.
+fn planMatches(sp: *ShapePlan, direction: u32, script: u32, language: usize, features: usize, count: u32, variations0: u32, variations1: u32, shaper: u32) -> bool {
+    if sp.*.direction != direction || sp.*.script != script || sp.*.language != language { return false }
+    if sp.*.numUserFeatures != count { return false }
+    var i: u32 = 0
+    while i < count {
+        const a = sp.*.userFeatures + @intCast(usize, i) * 16
+        const c = features + @intCast(usize, i) * 16
+        if m.get32(a) != m.get32(c) || m.get32(a + 4) != m.get32(c + 4) || isGlobal(a) != isGlobal(c) { return false }
+        i += 1
+    }
+    return sp.*.variations0 == variations0 && sp.*.variations1 == variations1 && sp.*.shaper == shaper
+}
+
+pub fn createPlanCached(fc: usize, direction: u32, script: u32, language: usize, features: usize, count: u32, coords: usize, numCoords: u32, shaperList: usize) -> usize {
+    if direction == common.DIRECTION_INVALID { return getEmptyPlan() }
+    const dontCache = fc == 0 || o.isInert(fc)
+    if !dontCache {
+        const shaper = chooseShaper(shaperList)
+        if shaper == 0 { return getEmptyPlan() }
+        const v0 = plan.variationsIndex(fc, 0, coords, numCoords)
+        const v1 = plan.variationsIndex(fc, 1, coords, numCoords)
+        var node = m.atomicLoadWord(@intFromPtr(&face.face(fc).*.plans))
+        while node != 0 {
+            const sp = m.getWord(node + 8)
+            if planMatches(shapePlan(sp), direction, script, language, features, count, v0, v1, shaper) { return o.reference(sp) }
+            node = m.getWord(node)
+        }
+    }
+    const made = createPlan(fc, direction, script, language, features, count, coords, numCoords, shaperList)
+    if dontCache || o.isInert(made) { return made }
+    const node = m.alloc(24)
+    if node == 0 { return made }
+    m.putWord(node + 8, made)
+    m.putWord(node + 16, @intFromPtr(destroyPlanCallback))
+    while true {
+        const head = m.atomicLoadWord(@intFromPtr(&face.face(fc).*.plans))
+        m.putWord(node, head)
+        if m.swapWord(@intFromPtr(&face.face(fc).*.plans), head, node) { break }
+    }
+    return o.reference(made)
+}
+
+// ---------------------------------------------------------------------------
+// The shaping
+
+const Context = struct {
+    plan: *plan.Plan
+    font: usize
+    face: usize
+    buf: *buffer.Buffer
+    userFeatures: usize
+    numUserFeatures: u32
+    targetDirection: u32
+}
+
+fn isRegionalIndicator(u: u32) -> bool { return u >= 0x1F1E6 && u <= 0x1F1FF }
+
+fn setUnicodeProps(b: *buffer.Buffer) -> void {
+    const count = b.*.len
+    var i: u32 = 0
+    while i < count {
+        const g = buffer.info(b, i)
+        p.setUnicodePropsFor(g, b)
+        const gc = p.generalCategory(g)
+        const letterOrSpace = unicode.flag(unicode.GC_LOWERCASE_LETTER) | unicode.flag(unicode.GC_UPPERCASE_LETTER) | unicode.flag(unicode.GC_TITLECASE_LETTER) | unicode.flag(unicode.GC_OTHER_LETTER) | unicode.flag(unicode.GC_SPACE_SEPARATOR)
+        if (unicode.flag(gc) & letterOrSpace) != 0 {
+            i += 1
+            continue
+        }
+        if gc == unicode.GC_MODIFIER_SYMBOL && g.*.codepoint >= 0x1F3FB && g.*.codepoint <= 0x1F3FF {
+            p.setContinuation(g)
+        } else if i != 0 && isRegionalIndicator(g.*.codepoint) {
+            const before = buffer.info(b, i - 1)
+            if isRegionalIndicator(before.*.codepoint) && !p.isContinuation(before) { p.setContinuation(g) }
+        } else if p.isZwj(g) {
+            p.setContinuation(g)
+            if i + 1 < count && unicode.isExtendedPictographic(buffer.info(b, i + 1).*.codepoint) {
+                i += 1
+                p.setUnicodePropsFor(buffer.info(b, i), b)
+                p.setContinuation(buffer.info(b, i))
+            }
+        } else if (g.*.codepoint >= 0xFF9E && g.*.codepoint <= 0xFF9F) || (g.*.codepoint >= 0xE0020 && g.*.codepoint <= 0xE007F) {
+            p.setContinuation(g)
+        }
+        i += 1
+    }
+}
+
+fn insertDottedCircle(b: *buffer.Buffer, f: usize) -> void {
+    if (b.*.flags & buffer.FLAG_DO_NOT_INSERT_DOTTED_CIRCLE) != 0 { return }
+    if (b.*.flags & buffer.FLAG_BOT) == 0 || b.*.contextLen0 != 0 || !p.isUnicodeMark(buffer.info(b, 0)) { return }
+    if !font.hasGlyph(f, 0x25CC) { return }
+    var dotted: GlyphInfo = undefined
+    dotted.codepoint = 0x25CC
+    dotted.mask = buffer.cur(b).*.mask
+    dotted.cluster = buffer.info(b, 0).*.cluster
+    dotted.var1 = 0
+    dotted.var2 = 0
+    p.setUnicodePropsFor(&dotted, b)
+    buffer.clearOutput(b)
+    b.*.idx = 0
+    dotted.cluster = buffer.cur(b).*.cluster
+    dotted.mask = buffer.cur(b).*.mask
+    _ = buffer.outputInfo(b, &dotted)
+    _ = buffer.sync(b)
+}
+
+// The end of the grapheme starting at `start`.
+fn nextGrapheme(b: *buffer.Buffer, start_: u32) -> u32 {
+    var start = start_ + 1
+    while start < b.*.len && p.isContinuation(buffer.info(b, start)) { start += 1 }
+    return start
+}
+
+fn formClusters(b: *buffer.Buffer) -> void {
+    if (b.*.scratchFlags & buffer.SCRATCH_HAS_NON_ASCII) == 0 { return }
+    var start: u32 = 0
+    while start < b.*.len {
+        const end = nextGrapheme(b, start)
+        if b.*.clusterLevel == buffer.CLUSTER_MONOTONE_GRAPHEMES {
+            buffer.mergeClusters(b, start, end)
+        } else {
+            buffer.unsafeToBreak(b, start, end)
+        }
+        start = end
+    }
+}
+
+// Reverses the graphemes (as groups) of the buffer, and the buffer
+// (_hb_ot_layout_reverse_graphemes).
+fn reverseGraphemes(b: *buffer.Buffer) -> void {
+    const count = b.*.len
+    if count == 0 { return }
+    const merge = b.*.clusterLevel == buffer.CLUSTER_MONOTONE_CHARACTERS
+    var start: u32 = 0
+    var i: u32 = 1
+    while i < count {
+        if !p.isContinuation(buffer.info(b, i)) {
+            if merge { buffer.mergeClusters(b, start, i) }
+            buffer.reverseRange(b, start, i)
+            start = i
+        }
+        i += 1
+    }
+    if merge { buffer.mergeClusters(b, start, i) }
+    buffer.reverseRange(b, start, i)
+    buffer.reverse(b)
+}
+
+fn ensureNativeDirection(b: *buffer.Buffer) -> void {
+    const direction = b.*.direction
+    var horizDir = common.horizontalDirection(b.*.script)
+    if horizDir == common.DIRECTION_RTL && direction == common.DIRECTION_LTR {
+        var foundNumber = false
+        var foundLetter = false
+        var foundRi = false
+        var i: u32 = 0
+        while i < b.*.len {
+            const g = buffer.info(b, i)
+            const gc = p.generalCategory(g)
+            if gc == unicode.GC_DECIMAL_NUMBER {
+                foundNumber = true
+            } else if unicode.isLetter(gc) {
+                foundLetter = true
+                break
+            } else if isRegionalIndicator(g.*.codepoint) {
+                foundRi = true
+            }
+            i += 1
+        }
+        if (foundNumber || foundRi) && !foundLetter { horizDir = common.DIRECTION_LTR }
+    }
+    if (common.isHorizontal(direction) && direction != horizDir && horizDir != common.DIRECTION_INVALID) || (common.isVertical(direction) && direction != common.DIRECTION_TTB) {
+        reverseGraphemes(b)
+        b.*.direction = common.reverse(b.*.direction)
+    }
+}
+
+fn vertCharFor(u: u32) -> u32 {
+    const page = u >> 8
+    if page == 0x20 {
+        if u == 0x2013 { return 0xfe32 }
+        if u == 0x2014 { return 0xfe31 }
+        if u == 0x2025 { return 0xfe30 }
+        if u == 0x2026 { return 0xfe19 }
+    } else if page == 0x30 {
+        if u == 0x3001 { return 0xfe11 }
+        if u == 0x3002 { return 0xfe12 }
+        if u == 0x3008 { return 0xfe3f }
+        if u == 0x3009 { return 0xfe40 }
+        if u == 0x300a { return 0xfe3d }
+        if u == 0x300b { return 0xfe3e }
+        if u == 0x300c { return 0xfe41 }
+        if u == 0x300d { return 0xfe42 }
+        if u == 0x300e { return 0xfe43 }
+        if u == 0x300f { return 0xfe44 }
+        if u == 0x3010 { return 0xfe3b }
+        if u == 0x3011 { return 0xfe3c }
+        if u == 0x3014 { return 0xfe39 }
+        if u == 0x3015 { return 0xfe3a }
+        if u == 0x3016 { return 0xfe17 }
+        if u == 0x3017 { return 0xfe18 }
+    } else if page == 0xfe {
+        if u == 0xfe4f { return 0xfe34 }
+    } else if page == 0xff {
+        if u == 0xff01 { return 0xfe15 }
+        if u == 0xff08 { return 0xfe35 }
+        if u == 0xff09 { return 0xfe36 }
+        if u == 0xff0c { return 0xfe10 }
+        if u == 0xff1a { return 0xfe13 }
+        if u == 0xff1b { return 0xfe14 }
+        if u == 0xff1f { return 0xfe16 }
+        if u == 0xff3b { return 0xfe47 }
+        if u == 0xff3d { return 0xfe48 }
+        if u == 0xff3f { return 0xfe33 }
+        if u == 0xff5b { return 0xfe37 }
+        if u == 0xff5d { return 0xfe38 }
+    }
+    return u
+}
+
+fn rotateChars(c: *Context) -> void {
+    const b = c.*.buf
+    const count = b.*.len
+    if common.isBackward(c.*.targetDirection) {
+        const rtlm = c.*.plan.*.rtlmMask
+        var i: u32 = 0
+        while i < count {
+            const g = buffer.info(b, i)
+            const mirrored = unicode.mirroring(b.*.unicode, g.*.codepoint)
+            if mirrored != g.*.codepoint && font.hasGlyph(c.*.font, mirrored) {
+                g.*.codepoint = mirrored
+            } else {
+                g.*.mask |= rtlm
+            }
+            i += 1
+        }
+    }
+    if common.isVertical(c.*.targetDirection) && !c.*.plan.*.hasVert {
+        var i: u32 = 0
+        while i < count {
+            const g = buffer.info(b, i)
+            const v = vertCharFor(g.*.codepoint)
+            if v != g.*.codepoint && font.hasGlyph(c.*.font, v) { g.*.codepoint = v }
+            i += 1
+        }
+    }
+}
+
+fn setupMasksFraction(c: *Context) -> void {
+    const b = c.*.buf
+    const pl = c.*.plan
+    if (b.*.scratchFlags & buffer.SCRATCH_HAS_NON_ASCII) == 0 || !pl.*.hasFrac { return }
+    var preMask: u32 = 0
+    var postMask: u32 = 0
+    if common.isForward(b.*.direction) {
+        preMask = pl.*.numrMask | pl.*.fracMask
+        postMask = pl.*.fracMask | pl.*.dnomMask
+    } else {
+        preMask = pl.*.fracMask | pl.*.dnomMask
+        postMask = pl.*.numrMask | pl.*.fracMask
+    }
+    const count = b.*.len
+    var i: u32 = 0
+    while i < count {
+        if buffer.info(b, i).*.codepoint == 0x2044 {
+            var start = i
+            var end = i + 1
+            while start > 0 && p.generalCategory(buffer.info(b, start - 1)) == unicode.GC_DECIMAL_NUMBER { start -= 1 }
+            while end < count && p.generalCategory(buffer.info(b, end)) == unicode.GC_DECIMAL_NUMBER { end += 1 }
+            if start == i || end == i + 1 {
+                if start == i { buffer.unsafeToConcat(b, start, start + 1) }
+                if end == i + 1 { buffer.unsafeToConcat(b, end - 1, end) }
+                i += 1
+                continue
+            }
+            buffer.unsafeToBreak(b, start, end)
+            var j = start
+            while j < i {
+                buffer.info(b, j).*.mask |= preMask
+                j += 1
+            }
+            buffer.info(b, i).*.mask |= pl.*.fracMask
+            j = i + 1
+            while j < end {
+                buffer.info(b, j).*.mask |= postMask
+                j += 1
+            }
+            i = end
+            continue
+        }
+        i += 1
+    }
+}
+
+fn setupMasks(c: *Context) -> void {
+    const b = c.*.buf
+    const map = &c.*.plan.*.map
+    setupMasksFraction(c)
+    shapers.setupMasks(c.*.plan.*.shaper, c.*.plan, b, c.*.font)
+    var i: u32 = 0
+    while i < c.*.numUserFeatures {
+        const f = c.*.userFeatures + @intCast(usize, i) * 16
+        if !isGlobal(f) {
+            var shift: u32 = 0
+            const mask = plan.getMask(map, m.get32(f), &shift)
+            buffer.setMasks(b, m.get32(f + 4) << @intCast(u5, shift & 31), mask, m.get32(f + 8), m.get32(f + 12))
+        }
+        i += 1
+    }
+}
+
+fn isDefaultIgnorableInfo(g: *GlyphInfo) -> bool { return p.isDefaultIgnorable(g) }
+
+fn zeroWidthDefaultIgnorables(b: *buffer.Buffer) -> void {
+    if (b.*.scratchFlags & buffer.SCRATCH_HAS_DEFAULT_IGNORABLES) == 0 || (b.*.flags & buffer.FLAG_PRESERVE_DEFAULT_IGNORABLES) != 0 || (b.*.flags & buffer.FLAG_REMOVE_DEFAULT_IGNORABLES) != 0 { return }
+    var i: u32 = 0
+    while i < b.*.len {
+        if p.isDefaultIgnorable(buffer.info(b, i)) {
+            const q = buffer.pos(b, i)
+            q.*.xAdvance = 0
+            q.*.yAdvance = 0
+            q.*.xOffset = 0
+            q.*.yOffset = 0
+        }
+        i += 1
+    }
+}
+
+fn hideDefaultIgnorables(b: *buffer.Buffer, f: usize) -> void {
+    if (b.*.scratchFlags & buffer.SCRATCH_HAS_DEFAULT_IGNORABLES) == 0 || (b.*.flags & buffer.FLAG_PRESERVE_DEFAULT_IGNORABLES) != 0 { return }
+    var invisible = b.*.invisible
+    var replace = false
+    if (b.*.flags & buffer.FLAG_REMOVE_DEFAULT_IGNORABLES) == 0 {
+        if invisible != 0 {
+            replace = true
+        } else {
+            replace = font.getNominalGlyph(f, 0x20, &invisible)
+        }
+    }
+    if replace {
+        var i: u32 = 0
+        while i < b.*.len {
+            const g = buffer.info(b, i)
+            if p.isDefaultIgnorable(g) { g.*.codepoint = invisible }
+            i += 1
+        }
+    } else {
+        buffer.deleteGlyphsInplace(b, isDefaultIgnorableInfo)
+    }
+}
+
+fn mapGlyphsFast(b: *buffer.Buffer) -> void {
+    var i: u32 = 0
+    while i < b.*.len {
+        const g = buffer.info(b, i)
+        g.*.codepoint = p.glyphIndex(g)
+        i += 1
+    }
+    b.*.contentType = buffer.CONTENT_GLYPHS
+}
+
+fn synthesizeGlyphClasses(b: *buffer.Buffer) -> void {
+    var i: u32 = 0
+    while i < b.*.len {
+        const g = buffer.info(b, i)
+        const klass = if p.generalCategory(g) != unicode.GC_NON_SPACING_MARK || p.isDefaultIgnorable(g) { p.PROPS_BASE_GLYPH } else { p.PROPS_MARK }
+        p.setGlyphProps(g, klass)
+        i += 1
+    }
+}
+
+// Sets the glyph properties from GDEF and clears the ligature properties
+// (hb_ot_layout_substitute_start).
+fn substituteStart(f: usize, b: *buffer.Buffer) -> void {
+    var gdef: m.Table = undefined
+    layout.gdefView(font.font(f).*.face, &gdef)
+    var i: u32 = 0
+    while i < b.*.len {
+        const g = buffer.info(b, i)
+        p.setGlyphProps(g, layout.glyphProps(&gdef, g.*.codepoint))
+        p.clearLigProps(g)
+        i += 1
+    }
+}
+
+// Applies the map's lookups of one table, stage by stage (hb_ot_map_t::
+// apply).
+fn applyMap(c: *Context, tableIndex: u32) -> void {
+    const map = &c.*.plan.*.map
+    const b = c.*.buf
+    var ac: apply.Apply = undefined
+    apply.init(&ac, tableIndex, c.*.font, @intFromPtr(b))
+    const ls = plan.lookups(map, tableIndex)
+    const ss = plan.stages(map, tableIndex)
+    var i: u32 = 0
+    var s: u32 = 0
+    while s < ss.*.count {
+        const stage = plan.vecAt(ss, s)
+        const last = m.get32(stage + plan.ST_LAST)
+        while i < last {
+            const lm = plan.vecAt(ls, i)
+            const lookupIndex = m.get32(lm + plan.LM_INDEX)
+            const l = layout.lookup(&ac.t, lookupIndex)
+            if l != 0 {
+                const flags = m.get32(lm + plan.LM_FLAGS)
+                ac.lookupIndex = lookupIndex
+                apply.setLookupMask(&ac, m.get32(lm + plan.LM_MASK))
+                ac.autoZwj = (flags & plan.MF_AUTO_ZWJ) != 0
+                ac.autoZwnj = (flags & plan.MF_AUTO_ZWNJ) != 0
+                ac.random = (flags & plan.MF_RANDOM) != 0
+                ac.perSyllable = (flags & plan.MF_PER_SYLLABLE) != 0
+                _ = apply.applyString(&ac, l)
+            }
+            i += 1
+        }
+        const pause = m.get32(stage + plan.ST_PAUSE)
+        if pause != 0 { _ = shapers.pause(pause, c.*.plan, c.*.font, b) }
+        s += 1
+    }
+    apply.fini(&ac)
+}
+
+fn substitute(c: *Context) -> void {
+    const b = c.*.buf
+    // hb_ot_substitute_default
+    rotateChars(c)
+    normalize.normalize(c.*.plan, b, c.*.font)
+    setupMasks(c)
+    if c.*.plan.*.fallbackMarkPositioning { fallback.recategorizeMarks(b) }
+    mapGlyphsFast(b)
+    // hb_ot_substitute_plan
+    substituteStart(c.*.font, b)
+    if c.*.plan.*.fallbackGlyphClasses { synthesizeGlyphClasses(b) }
+    applyMap(c, 0)
+}
+
+fn zeroMarkWidthsByGdef(b: *buffer.Buffer, adjust: bool) -> void {
+    var i: u32 = 0
+    while i < b.*.len {
+        if p.isMark(buffer.info(b, i)) {
+            const q = buffer.pos(b, i)
+            if adjust {
+                q.*.xOffset -%= q.*.xAdvance
+                q.*.yOffset -%= q.*.yAdvance
+            }
+            q.*.xAdvance = 0
+            q.*.yAdvance = 0
+        }
+        i += 1
+    }
+}
+
+fn positionDefault(c: *Context) -> void {
+    const b = c.*.buf
+    const f = c.*.font
+    const count = b.*.len
+    if common.isHorizontal(b.*.direction) {
+        font.getGlyphHAdvances(f, count, b.*.info, 20, b.*.pos, 20)
+        if font.hasFunc(f, font.F_GLYPH_H_ORIGIN) {
+            var i: u32 = 0
+            while i < count {
+                const q = buffer.pos(b, i)
+                font.subtractGlyphHOrigin(f, buffer.info(b, i).*.codepoint, &q.*.xOffset, &q.*.yOffset)
+                i += 1
+            }
+        }
+    } else {
+        font.getGlyphVAdvances(f, count, b.*.info, 20, b.*.pos + 4, 20)
+        var i: u32 = 0
+        while i < count {
+            const q = buffer.pos(b, i)
+            font.subtractGlyphVOrigin(f, buffer.info(b, i).*.codepoint, &q.*.xOffset, &q.*.yOffset)
+            i += 1
+        }
+    }
+    if (b.*.scratchFlags & buffer.SCRATCH_HAS_SPACE_FALLBACK) != 0 { fallback.spaces(f, b) }
+}
+
+fn positionPlan(c: *Context) -> void {
+    const b = c.*.buf
+    const f = c.*.font
+    const pl = c.*.plan
+    const count = b.*.len
+    const adjust = pl.*.adjustMarkPositioningWhenZeroing && common.isForward(b.*.direction)
+    const hasHOrigin = font.hasFunc(f, font.F_GLYPH_H_ORIGIN)
+    if hasHOrigin {
+        var i: u32 = 0
+        while i < count {
+            const q = buffer.pos(b, i)
+            font.addGlyphHOrigin(f, buffer.info(b, i).*.codepoint, &q.*.xOffset, &q.*.yOffset)
+            i += 1
+        }
+    }
+    apply.positionStart(b)
+    const zwm = shapers.zeroWidthMarks(pl.*.shaper)
+    if pl.*.zeroMarks && zwm == plan.ZERO_WIDTH_MARKS_BY_GDEF_EARLY { zeroMarkWidthsByGdef(b, adjust) }
+    // hb_ot_shape_plan_t::position
+    if pl.*.applyGpos { applyMap(c, 1) }
+    if pl.*.applyKern {
+        kern.applyTable(f, b, pl.*.kernMask, pl.*.requestedKerning)
+    } else if pl.*.applyFallbackKern {
+        kern.applyFallback(f, b, pl.*.kernMask)
+    }
+    if pl.*.zeroMarks && zwm == plan.ZERO_WIDTH_MARKS_BY_GDEF_LATE { zeroMarkWidthsByGdef(b, adjust) }
+    zeroWidthDefaultIgnorables(b)
+    apply.positionFinishOffsets(f, b)
+    if hasHOrigin {
+        var i: u32 = 0
+        while i < count {
+            const q = buffer.pos(b, i)
+            font.subtractGlyphHOrigin(f, buffer.info(b, i).*.codepoint, &q.*.xOffset, &q.*.yOffset)
+            i += 1
+        }
+    }
+    if pl.*.fallbackMarkPositioning { fallback.markPosition(pl, f, b, adjust) }
+}
+
+fn position(c: *Context) -> void {
+    const b = c.*.buf
+    buffer.clearPositions(b)
+    positionDefault(c)
+    positionPlan(c)
+    if common.isBackward(b.*.direction) { buffer.reverse(b) }
+}
+
+fn propagateFlags(b: *buffer.Buffer) -> void {
+    if (b.*.scratchFlags & buffer.SCRATCH_HAS_GLYPH_FLAGS) == 0 { return }
+    const flipTatweel = (b.*.flags & buffer.FLAG_PRODUCE_SAFE_TO_INSERT_TATWEEL) != 0
+    const clearConcat = (b.*.flags & buffer.FLAG_PRODUCE_UNSAFE_TO_CONCAT) == 0
+    var start: u32 = 0
+    while start < b.*.len {
+        const end = p.nextCluster(b, start)
+        var mask: u32 = 0
+        var i = start
+        while i < end {
+            mask |= buffer.info(b, i).*.mask & buffer.GLYPH_FLAG_DEFINED
+            i += 1
+        }
+        if flipTatweel {
+            if (mask & buffer.GLYPH_FLAG_UNSAFE_TO_BREAK) != 0 { mask &= ~buffer.GLYPH_FLAG_SAFE_TO_INSERT_TATWEEL }
+            if (mask & buffer.GLYPH_FLAG_SAFE_TO_INSERT_TATWEEL) != 0 { mask |= buffer.GLYPH_FLAG_UNSAFE_TO_BREAK | buffer.GLYPH_FLAG_UNSAFE_TO_CONCAT }
+        }
+        if clearConcat { mask &= ~buffer.GLYPH_FLAG_UNSAFE_TO_CONCAT }
+        i = start
+        while i < end {
+            buffer.info(b, i).*.mask = mask
+            i += 1
+        }
+        start = end
+    }
+}
+
+fn shapeInternal(c: *Context) -> void {
+    const b = c.*.buf
+    c.*.targetDirection = b.*.direction
+    buffer.resetMasks(b, c.*.plan.*.map.globalMask)
+    setUnicodeProps(b)
+    insertDottedCircle(b, c.*.font)
+    formClusters(b)
+    ensureNativeDirection(b)
+    if shapers.hasPreprocessText(c.*.plan.*.shaper) { shapers.preprocessText(c.*.plan.*.shaper, c.*.plan, b, c.*.font) }
+    substitute(c)
+    position(c)
+    hideDefaultIgnorables(b, c.*.font)
+    if shapers.hasPostprocessGlyphs(c.*.plan.*.shaper) { shapers.postprocessGlyphs(c.*.plan.*.shaper, c.*.plan, b, c.*.font) }
+    propagateFlags(b)
+    b.*.direction = c.*.targetDirection
+    buffer.leave(b)
+}
+
+fn fallbackShape(f: usize, b: *buffer.Buffer) -> void {
+    var space: u32 = 0
+    const hasSpace = font.getNominalGlyph(f, 0x20, &space)
+    buffer.clearPositions(b)
+    const direction = b.*.direction
+    var i: u32 = 0
+    while i < b.*.len {
+        const g = buffer.info(b, i)
+        const q = buffer.pos(b, i)
+        if hasSpace && unicode.isDefaultIgnorable(g.*.codepoint) {
+            g.*.codepoint = space
+            q.*.xAdvance = 0
+            q.*.yAdvance = 0
+        } else {
+            var glyph: u32 = 0
+            _ = font.getNominalGlyph(f, g.*.codepoint, &glyph)
+            g.*.codepoint = glyph
+            if common.isHorizontal(direction) {
+                q.*.xAdvance = font.getGlyphHAdvance(f, glyph)
+                q.*.yAdvance = 0
+            } else {
+                q.*.xAdvance = 0
+                q.*.yAdvance = font.getGlyphVAdvance(f, glyph)
+            }
+            font.subtractGlyphOriginForDirection(f, glyph, direction, &q.*.xOffset, &q.*.yOffset)
+        }
+        i += 1
+    }
+    if common.isBackward(direction) { buffer.reverse(b) }
+    i = 0
+    while i < b.*.len {
+        buffer.info(b, i).*.mask &= ~buffer.GLYPH_FLAG_DEFINED
+        i += 1
+    }
+}
+
+pub fn execute(spAddress: usize, f: usize, bAddress: usize, features: usize, count: u32) -> bool {
+    const b = buffer.buf(bAddress)
+    if b.*.len == 0 { return true }
+    if o.isInert(spAddress) { return false }
+    const sp = shapePlan(spAddress)
+    var ret = false
+    if sp.*.shaper == SHAPER_OT {
+        var c: Context = undefined
+        c.plan = &sp.*.ot
+        c.font = f
+        c.face = font.font(f).*.face
+        c.buf = b
+        c.userFeatures = features
+        c.numUserFeatures = count
+        shapeInternal(&c)
+        ret = true
+    } else if sp.*.shaper == SHAPER_FALLBACK {
+        fallbackShape(f, b)
+        ret = true
+    }
+    if ret && b.*.contentType == buffer.CONTENT_UNICODE { b.*.contentType = buffer.CONTENT_GLYPHS }
+    return ret
+}
+
+pub fn run(f: usize, bAddress: usize, features: usize, count: u32, shaperList: usize) -> bool {
+    const b = buffer.buf(bAddress)
+    if b.*.len == 0 { return true }
+    buffer.enter(b)
+    const fo = font.font(f)
+    const sp = createPlanCached(fo.*.face, b.*.direction, b.*.script, b.*.language, features, count, fo.*.coords, fo.*.numCoords, shaperList)
+    const res = execute(sp, f, bAddress, features, count)
+    if b.*.maxOps <= 0 { b.*.shapingFailed = 1 }
+    destroyPlan(sp)
+    buffer.leave(b)
+    return res
+}
+
+// ---------------------------------------------------------------------------
+// The functions of hb-shape.h and hb-shape-plan.h
+
+fn bool32(v: bool) -> i32 { return if v { 1 } else { 0 } }
+
+pub fn shape(f: usize, b: usize, features: usize, count: u32) -> void { _ = run(f, b, features, count, 0) }
+pub fn shapeFull(f: usize, b: usize, features: usize, count: u32, shaperList: usize) -> i32 { return bool32(run(f, b, features, count, shaperList)) }
+
+var shaperNames: [3]usize = [_]usize{ 0, 0, 0 }
+
+pub fn shapeListShapers() -> usize {
+    if shaperNames[0] == 0 {
+        shaperNames[1] = m.literal("fallback")
+        shaperNames[0] = m.literal("ot")
+    }
+    return @intFromPtr(&shaperNames)
+}
+
+fn propsOf(props: usize, direction: *u32, script: *u32, language: *usize) -> void {
+    direction.* = m.get32(props)
+    script.* = m.get32(props + 4)
+    language.* = m.getWord(props + 8)
+}
+
+pub fn shapePlanCreate2(fc: usize, props: usize, features: usize, count: u32, coords: usize, numCoords: u32, shaperList: usize) -> usize {
+    var d: u32 = 0
+    var s: u32 = 0
+    var l: usize = 0
+    propsOf(props, &d, &s, &l)
+    return createPlan(fc, d, s, l, features, count, coords, numCoords, shaperList)
+}
+
+pub fn shapePlanCreate(fc: usize, props: usize, features: usize, count: u32, shaperList: usize) -> usize { return shapePlanCreate2(fc, props, features, count, 0, 0, shaperList) }
+
+pub fn shapePlanCreateCached2(fc: usize, props: usize, features: usize, count: u32, coords: usize, numCoords: u32, shaperList: usize) -> usize {
+    var d: u32 = 0
+    var s: u32 = 0
+    var l: usize = 0
+    propsOf(props, &d, &s, &l)
+    return createPlanCached(fc, d, s, l, features, count, coords, numCoords, shaperList)
+}
+
+pub fn shapePlanCreateCached(fc: usize, props: usize, features: usize, count: u32, shaperList: usize) -> usize { return shapePlanCreateCached2(fc, props, features, count, 0, 0, shaperList) }
+pub fn shapePlanGetEmpty() -> usize { return getEmptyPlan() }
+pub fn shapePlanReference(sp: usize) -> usize { return o.reference(sp) }
+pub fn shapePlanDestroy(sp: usize) -> void { destroyPlan(sp) }
+pub fn shapePlanSetUserData(sp: usize, key: usize, data: usize, d: usize, replace: i32) -> i32 { return bool32(o.setUserData(sp, key, data, d, replace != 0)) }
+pub fn shapePlanGetUserData(sp: usize, key: usize) -> usize { return o.getUserData(sp, key) }
+pub fn shapePlanExecute(sp: usize, f: usize, b: usize, features: usize, count: u32) -> i32 { return bool32(execute(sp, f, b, features, count)) }
+
+pub fn shapePlanGetShaper(sp: usize) -> usize {
+    if o.isInert(sp) { return 0 }
+    const s = shapePlan(sp).*.shaper
+    if s == SHAPER_OT { return m.literal("ot") }
+    if s == SHAPER_FALLBACK { return m.literal("fallback") }
+    return 0
+}
+
+pub fn otShapePlanCollectLookups(sp: usize, tableTag: u32, out: usize) -> void {
+    const ti = layout.tableIndexOf(tableTag)
+    if ti > 1 || o.isInert(sp) { return }
+    const ls = plan.lookups(&shapePlan(sp).*.ot.map, ti)
+    var i: u32 = 0
+    while i < ls.*.count {
+        set.add(out, m.get32(plan.vecAt(ls, i) + plan.LM_INDEX))
+        i += 1
+    }
+}

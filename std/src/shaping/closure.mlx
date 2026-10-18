@@ -1,0 +1,943 @@
+// The glyphs that substitutions can reach (HarfBuzz's hb_closure_context_t
+// and the closure of each GSUB subtable): starting from a set of glyphs,
+// the glyphs that lookups can turn them into, nested lookups of contexts
+// included, the way HarfBuzz 8.3 computes them (with its limits and its
+// shortcuts, so that the closures come out the same).
+const m = @import("./memory.mlx")
+const face = @import("./face.mlx")
+const layout = @import("./layout.mlx")
+const set = @import("./set.mlx")
+const collect = @import("./collect.mlx")
+const font = @import("./font.mlx")
+const buffer = @import("./buffer.mlx")
+const unicode = @import("./unicode.mlx")
+const common = @import("./common.mlx")
+const shape = @import("./shape.mlx")
+
+const INVALID: u32 = 0xFFFFFFFF
+const MAX_NESTING: u32 = 64
+const MAX_LOOKUP_VISITS: u32 = 35000
+const MAX_STAGES: u32 = 12
+
+// How the values of a context rule name glyphs.
+const BY_GLYPH: u32 = 1
+const BY_CLASS: u32 = 2
+const BY_COVERAGE: u32 = 3
+
+// Sets kept by a key (a lookup index, a class).
+const SetTable = struct {
+    slots: usize
+    sets: usize
+    length: u32
+    capacity: u32
+}
+
+fn tableInit(st: *SetTable) -> void {
+    st.*.slots = set.mapCreate()
+    st.*.sets = 0
+    st.*.length = 0
+    st.*.capacity = 0
+}
+
+fn tableFree(st: *SetTable) -> void {
+    var i: u32 = 0
+    while i < st.*.length {
+        set.destroy(m.getWord(st.*.sets + @intCast(usize, i) * 8))
+        i += 1
+    }
+    m.release(st.*.sets)
+    set.mapDestroy(st.*.slots)
+}
+
+// The set kept for `key`, 0 when there is none.
+fn tableFind(st: *SetTable, key: u32) -> usize {
+    var slot: u32 = 0
+    if !set.mapHas(st.*.slots, key, &slot) { return 0 }
+    return m.getWord(st.*.sets + @intCast(usize, slot) * 8)
+}
+
+// The set kept for `key`, made (empty) when there is none.
+fn tableMake(st: *SetTable, key: u32) -> usize {
+    const found = tableFind(st, key)
+    if found != 0 { return found }
+    if st.*.length == st.*.capacity {
+        const c = st.*.capacity * 2 + 16
+        const grown = m.grow(st.*.sets, @intCast(usize, c) * 8)
+        if grown == 0 { return 0 }
+        st.*.sets = grown
+        st.*.capacity = c
+    }
+    const made = set.create()
+    m.putWord(st.*.sets + @intCast(usize, st.*.length) * 8, made)
+    set.mapSet(st.*.slots, key, st.*.length)
+    st.*.length += 1
+    return made
+}
+
+pub const Closure = struct {
+    t: m.Table
+    glyphs: usize
+    output: usize
+    // The active glyphs: the glyphs each nested level applies to.
+    stack: usize
+    depth: u32
+    capacity: u32
+    nestingLeft: u32
+    lookupCount: u32
+    numGlyphs: u32
+    // Per lookup: the population of `glyphs` it was last visited with, and
+    // the active glyphs it was visited with since.
+    doneCount: usize
+    done: SetTable
+}
+
+fn init(c: *Closure, fc: usize, glyphs: usize) -> void {
+    layout.gsubgpos(fc, 0, &c.*.t)
+    c.*.glyphs = glyphs
+    c.*.output = set.create()
+    c.*.stack = 0
+    c.*.depth = 0
+    c.*.capacity = 0
+    c.*.nestingLeft = MAX_NESTING
+    c.*.lookupCount = 0
+    c.*.numGlyphs = face.numGlyphs(fc)
+    c.*.doneCount = set.mapCreate()
+    tableInit(&c.*.done)
+}
+
+fn fini(c: *Closure) -> void {
+    flush(c)
+    var i: u32 = 0
+    while i < c.*.capacity {
+        set.destroy(m.getWord(c.*.stack + @intCast(usize, i) * 8))
+        i += 1
+    }
+    m.release(c.*.stack)
+    set.destroy(c.*.output)
+    set.mapDestroy(c.*.doneCount)
+    tableFree(&c.*.done)
+}
+
+fn stackAt(c: *Closure, i: u32) -> usize { return m.getWord(c.*.stack + @intCast(usize, i) * 8) }
+
+fn parentActive(c: *Closure) -> usize {
+    if c.*.depth == 0 { return c.*.glyphs }
+    return stackAt(c, c.*.depth - 1)
+}
+
+fn previousParentActive(c: *Closure) -> usize {
+    if c.*.depth <= 1 { return c.*.glyphs }
+    return stackAt(c, c.*.depth - 2)
+}
+
+// A new, empty level of active glyphs (0 when out of memory).
+fn push(c: *Closure) -> usize {
+    if c.*.depth == c.*.capacity {
+        const n = c.*.capacity * 2 + 8
+        const grown = m.grow(c.*.stack, @intCast(usize, n) * 8)
+        if grown == 0 { return 0 }
+        var i = c.*.capacity
+        while i < n {
+            m.putWord(grown + @intCast(usize, i) * 8, set.create())
+            i += 1
+        }
+        c.*.stack = grown
+        c.*.capacity = n
+    }
+    const s = stackAt(c, c.*.depth)
+    set.clear(s)
+    c.*.depth += 1
+    return s
+}
+
+fn pop(c: *Closure) -> void {
+    if c.*.depth > 0 { c.*.depth -= 1 }
+}
+
+// The output (glyphs that exist) joins the glyphs.
+fn flush(c: *Closure) -> void {
+    set.delRange(c.*.output, c.*.numGlyphs, INVALID)
+    set.unionWith(c.*.glyphs, c.*.output)
+    set.clear(c.*.output)
+    c.*.depth = 0
+}
+
+fn limitExceeded(c: *Closure) -> bool { return c.*.lookupCount > MAX_LOOKUP_VISITS }
+
+// Whether the lookup was visited with the current glyphs and with active
+// glyphs that include the current ones.
+fn isLookupDone(c: *Closure, index: u32) -> bool {
+    const population = set.population(c.*.glyphs)
+    if set.mapGet(c.*.doneCount, index) != population {
+        set.mapSet(c.*.doneCount, index, population)
+        const s = tableMake(&c.*.done, index)
+        if s == 0 { return true }
+        set.clear(s)
+    }
+    const covered = tableFind(&c.*.done, index)
+    if covered == 0 { return true }
+    const active = parentActive(c)
+    if set.isSubset(active, covered) { return true }
+    set.unionWith(covered, active)
+    return false
+}
+
+fn shouldVisit(c: *Closure, index: u32) -> bool {
+    const n = c.*.lookupCount
+    c.*.lookupCount = n + 1
+    if n > MAX_LOOKUP_VISITS { return false }
+    return !isLookupDone(c, index)
+}
+
+// ---------------------------------------------------------------------------
+// Sets against coverage tables and class definitions
+
+fn bitStorage(v_: u32) -> u32 {
+    var v = v_
+    var n: u32 = 0
+    while v != 0 {
+        n += 1
+        v >>= 1
+    }
+    return n
+}
+
+// Adds the members of `glyphs` from `a` to `b` to `out`.
+fn addIntersection(out: usize, glyphs: usize, a: u32, b: u32) -> void {
+    if a > b { return }
+    var i = set.rangeFrom(glyphs, a)
+    const n = set.rangeCount(glyphs)
+    while i < n {
+        const first = set.rangeFirst(glyphs, i)
+        if first > b { break }
+        const last = set.rangeLast(glyphs, i)
+        set.addRange(out, if first > a { first } else { a }, if last < b { last } else { b })
+        i += 1
+    }
+}
+
+// Whether `glyphs` has a member from `a` to `b`.
+fn hasBetween(glyphs: usize, a: u32, b: u32) -> bool {
+    const g = set.next(glyphs, a -% 1)
+    return g != INVALID && g <= b
+}
+
+fn coveragePopulation(t: *m.Table, cov: usize) -> u32 {
+    if cov == 0 { return INVALID }
+    const format = m.u16at(t, cov)
+    const count = m.u16at(t, cov + 2)
+    if format == 1 { return count }
+    if format == 2 {
+        var n: u32 = 0
+        var i: u32 = 0
+        while i < count {
+            const r = cov + 4 + @intCast(usize, i) * 6
+            const first = m.u16at(t, r)
+            const last = m.u16at(t, r + 2)
+            if last >= first { n += last - first + 1 }
+            i += 1
+        }
+        return n
+    }
+    return INVALID
+}
+
+fn coverageIntersects(t: *m.Table, cov: usize, glyphs: usize) -> bool {
+    if cov == 0 { return false }
+    const format = m.u16at(t, cov)
+    if format != 1 && format != 2 { return false }
+    const count = m.u16at(t, cov + 2)
+    if count > set.population(glyphs) *% bitStorage(count) / 2 {
+        var g = set.next(glyphs, INVALID)
+        while g != INVALID {
+            if layout.coverage(t, cov, g) != layout.NOT_COVERED { return true }
+            g = set.next(glyphs, g)
+        }
+        return false
+    }
+    var i: u32 = 0
+    while i < count {
+        if format == 1 {
+            if set.has(glyphs, m.u16at(t, cov + 4 + @intCast(usize, i) * 2)) { return true }
+        } else {
+            const r = cov + 4 + @intCast(usize, i) * 6
+            if hasBetween(glyphs, m.u16at(t, r), m.u16at(t, r + 2)) { return true }
+        }
+        i += 1
+    }
+    return false
+}
+
+// Adds the glyphs of `glyphs` the coverage covers to `out`.
+fn coverageIntersectSet(t: *m.Table, cov: usize, glyphs: usize, out: usize) -> void {
+    if cov == 0 { return }
+    const format = m.u16at(t, cov)
+    const count = m.u16at(t, cov + 2)
+    if format == 1 {
+        var i: u32 = 0
+        while i < count {
+            const g = m.u16at(t, cov + 4 + @intCast(usize, i) * 2)
+            if set.has(glyphs, g) { set.add(out, g) }
+            i += 1
+        }
+    } else if format == 2 {
+        // (Stops at ranges out of order, as HarfBuzz does.)
+        var last: u32 = 0
+        var i: u32 = 0
+        while i < count {
+            const r = cov + 4 + @intCast(usize, i) * 6
+            const first = m.u16at(t, r)
+            if first < last { break }
+            last = m.u16at(t, r + 2)
+            addIntersection(out, glyphs, first, last)
+            i += 1
+        }
+    }
+}
+
+fn classIntersectsClass(t: *m.Table, cd: usize, glyphs: usize, klass: u32) -> bool {
+    if cd == 0 { return false }
+    const format = m.u16at(t, cd)
+    if format == 1 {
+        const start = m.u16at(t, cd + 2)
+        const count = m.u16at(t, cd + 4)
+        if klass == 0 {
+            // Any glyph not listed.
+            var g = set.next(glyphs, INVALID)
+            if g == INVALID { return false }
+            if g < start { return true }
+            g = start +% count -% 1
+            if set.next(glyphs, g) != INVALID { return true }
+        }
+        var i: u32 = 0
+        while i < count {
+            if m.u16at(t, cd + 6 + @intCast(usize, i) * 2) == klass && set.has(glyphs, start + i) { return true }
+            i += 1
+        }
+        return false
+    }
+    if format == 2 {
+        const count = m.u16at(t, cd + 2)
+        if klass == 0 {
+            // Any glyph not listed. (HarfBuzz walks a second iterator over
+            // the ranges here that only moves on when a range starts right
+            // after the last one looked at, skipping the range in turn.)
+            var g = INVALID
+            var last = INVALID
+            var j: u32 = 0
+            var i: u32 = 0
+            while i < count {
+                const itFirst = if j < count { m.u16at(t, cd + 4 + @intCast(usize, j) * 6) } else { @intCast(u32, 256) }
+                if itFirst == last +% 1 {
+                    if j < count { j += 1 }
+                    i += 1
+                    continue
+                }
+                g = set.next(glyphs, g)
+                if g == INVALID { break }
+                const r = cd + 4 + @intCast(usize, i) * 6
+                if g < m.u16at(t, r) { return true }
+                g = m.u16at(t, r + 2)
+                last = g
+                i += 1
+            }
+            if g != INVALID && set.next(glyphs, g) != INVALID { return true }
+        }
+        var i: u32 = 0
+        while i < count {
+            const r = cd + 4 + @intCast(usize, i) * 6
+            if m.u16at(t, r + 4) == klass && hasBetween(glyphs, m.u16at(t, r), m.u16at(t, r + 2)) { return true }
+            i += 1
+        }
+        return false
+    }
+    return false
+}
+
+// Adds the glyphs of `glyphs` from `from` on to `out`.
+fn addFrom(out: usize, glyphs: usize, from: u32) -> void {
+    if from == INVALID {
+        addIntersection(out, glyphs, 0, INVALID - 1)
+    } else if from < INVALID - 1 {
+        addIntersection(out, glyphs, from + 1, INVALID - 1)
+    }
+}
+
+fn classIntersectedGlyphs(t: *m.Table, cd: usize, glyphs: usize, klass: u32, out: usize) -> void {
+    if cd == 0 { return }
+    const format = m.u16at(t, cd)
+    if format == 1 {
+        const start = m.u16at(t, cd + 2)
+        const count = m.u16at(t, cd + 4)
+        if klass == 0 {
+            if start > 0 { addIntersection(out, glyphs, 0, start - 1) }
+            addFrom(out, glyphs, start +% count -% 1)
+            return
+        }
+        var i: u32 = 0
+        while i < count {
+            if m.u16at(t, cd + 6 + @intCast(usize, i) * 2) == klass && set.has(glyphs, start + i) { set.add(out, start + i) }
+            i += 1
+        }
+        return
+    }
+    if format != 2 { return }
+    const count = m.u16at(t, cd + 2)
+    if klass == 0 {
+        var g = INVALID
+        var i: u32 = 0
+        while i < count {
+            const r = cd + 4 + @intCast(usize, i) * 6
+            g = set.next(glyphs, g)
+            if g == INVALID { return }
+            const first = m.u16at(t, r)
+            while g < first {
+                set.add(out, g)
+                g = set.next(glyphs, g)
+                if g == INVALID { return }
+            }
+            g = m.u16at(t, r + 2)
+            i += 1
+        }
+        addFrom(out, glyphs, g)
+        return
+    }
+    if count > set.population(glyphs) *% bitStorage(count) *% 8 {
+        var g = set.next(glyphs, INVALID)
+        while g != INVALID {
+            if layout.classOf(t, cd, g) == klass { set.add(out, g) }
+            g = set.next(glyphs, g)
+        }
+        return
+    }
+    var i: u32 = 0
+    while i < count {
+        const r = cd + 4 + @intCast(usize, i) * 6
+        if m.u16at(t, r + 4) == klass { addIntersection(out, glyphs, m.u16at(t, r), m.u16at(t, r + 2)) }
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contexts
+
+// Whether the glyphs can match each of `count` values at `at`.
+fn valuesIntersect(c: *Closure, at: usize, count: u32, how: u32, data: usize) -> bool {
+    const t = &c.*.t
+    var i: u32 = 0
+    while i < count {
+        const v = m.u16at(t, at + @intCast(usize, i) * 2)
+        if how == BY_GLYPH {
+            if !set.has(c.*.glyphs, v) { return false }
+        } else if how == BY_CLASS {
+            if !classIntersectsClass(t, data, c.*.glyphs, v) { return false }
+        } else {
+            if !coverageIntersects(t, if v == 0 { 0 } else { data + @intCast(usize, v) }, c.*.glyphs) { return false }
+        }
+        i += 1
+    }
+    return true
+}
+
+// The glyphs of class `klass` among `glyphs`, kept per class (whichever
+// glyphs a class was first asked for with, as HarfBuzz's cache does).
+fn intersectedClass(c: *Closure, glyphs: usize, cd: usize, klass: u32, out: usize, cache: *SetTable) -> void {
+    const cached = tableFind(cache, klass)
+    if cached != 0 {
+        set.unionWith(out, cached)
+        return
+    }
+    const v = tableMake(cache, klass)
+    if v == 0 { return }
+    classIntersectedGlyphs(&c.*.t, cd, glyphs, klass, v)
+    set.unionWith(out, v)
+}
+
+// The nested lookups of a rule: each applied to the glyphs that can be at
+// its position in the sequence.
+fn recurseLookups(c: *Closure, inputCount: u32, input: usize, lookupCount: u32, records: usize, value: u32, how: u32, data: usize, cache: *SetTable) -> void {
+    const t = &c.*.t
+    const covered = set.create()
+    const positions = set.create()
+    var i: u32 = 0
+    while i < lookupCount {
+        const seqIndex = m.u16at(t, records + @intCast(usize, i) * 4)
+        const lookupIndex = m.u16at(t, records + @intCast(usize, i) * 4 + 2)
+        i += 1
+        if seqIndex >= inputCount { continue }
+        var hasPositions = false
+        if !set.has(covered, seqIndex) {
+            hasPositions = true
+            set.clear(positions)
+            if seqIndex == 0 {
+                if how == BY_GLYPH {
+                    set.add(positions, value)
+                } else if how == BY_CLASS {
+                    intersectedClass(c, parentActive(c), data, value, positions, cache)
+                } else {
+                    set.assign(positions, parentActive(c))
+                }
+            } else {
+                const v = m.u16at(t, input + @intCast(usize, seqIndex - 1) * 2)
+                if how == BY_GLYPH {
+                    set.add(positions, v)
+                } else if how == BY_CLASS {
+                    intersectedClass(c, c.*.glyphs, data, v, positions, cache)
+                } else {
+                    coverageIntersectSet(t, if v == 0 { 0 } else { data + @intCast(usize, v) }, c.*.glyphs, positions)
+                }
+            }
+        }
+        set.add(covered, seqIndex)
+        const active = push(c)
+        if active == 0 { break }
+        if hasPositions {
+            set.assign(active, positions)
+            set.clear(positions)
+        } else {
+            set.assign(active, c.*.glyphs)
+        }
+        const endIndex = if how == BY_COVERAGE { inputCount + 1 } else { inputCount }
+        recurse(c, lookupIndex, covered, seqIndex, endIndex)
+        pop(c)
+    }
+    set.destroy(covered)
+    set.destroy(positions)
+}
+
+fn ruleClosure(c: *Closure, r: usize, value: u32, how: u32, data: usize, cache: *SetTable) -> void {
+    if limitExceeded(c) { return }
+    const t = &c.*.t
+    const inputCount = m.u16at(t, r)
+    const lookupCount = m.u16at(t, r + 2)
+    const n = if inputCount != 0 { inputCount - 1 } else { @intCast(u32, 0) }
+    if !valuesIntersect(c, r + 4, n, how, data) { return }
+    recurseLookups(c, inputCount, r + 4, lookupCount, r + 4 + @intCast(usize, n) * 2, value, how, data, cache)
+}
+
+fn chainRuleClosure(c: *Closure, r: usize, value: u32, how: u32, data0: usize, data1: usize, data2: usize, cache: *SetTable) -> void {
+    if limitExceeded(c) { return }
+    const t = &c.*.t
+    const backtrack = m.u16at(t, r)
+    var at = r + 2 + @intCast(usize, backtrack) * 2
+    const inputCount = m.u16at(t, at)
+    const input = at + 2
+    const n = if inputCount != 0 { inputCount - 1 } else { @intCast(u32, 0) }
+    at = input + @intCast(usize, n) * 2
+    const lookahead = m.u16at(t, at)
+    at += 2 + @intCast(usize, lookahead) * 2
+    const lookupCount = m.u16at(t, at)
+    if !valuesIntersect(c, r + 2, backtrack, how, data0) { return }
+    if !valuesIntersect(c, input, n, how, data1) { return }
+    if !valuesIntersect(c, at - @intCast(usize, lookahead) * 2, lookahead, how, data2) { return }
+    recurseLookups(c, inputCount, input, lookupCount, at + 2, value, how, data1, cache)
+}
+
+fn ruleSetClosure(c: *Closure, rs: usize, chain: bool, value: u32, how: u32, data0: usize, data1: usize, data2: usize, cache: *SetTable) -> void {
+    if limitExceeded(c) || rs == 0 { return }
+    const t = &c.*.t
+    const count = m.u16at(t, rs)
+    var k: u32 = 0
+    while k < count {
+        const r = layout.sub16(t, rs, 2 + @intCast(usize, k) * 2)
+        if r != 0 {
+            if chain { chainRuleClosure(c, r, value, how, data0, data1, data2, cache) } else { ruleClosure(c, r, value, how, data1, cache) }
+        }
+        k += 1
+    }
+}
+
+// Format 1: rule sets per covered glyph (sets at `sets`).
+fn glyphContext(c: *Closure, st: usize, sets: usize, chain: bool) -> void {
+    const t = &c.*.t
+    const cov = layout.sub16(t, st, 2)
+    const active = push(c)
+    if active == 0 { return }
+    coverageIntersectSet(t, cov, previousParentActive(c), active)
+    var cache: SetTable = undefined
+    tableInit(&cache)
+    var it: collect.CovIter = undefined
+    collect.covInit(&it, t, cov)
+    const count = m.u16at(t, sets)
+    var k: u32 = 0
+    while k < count && collect.covMore(&it) {
+        const g = collect.covGlyph(&it)
+        if set.has(previousParentActive(c), g) {
+            ruleSetClosure(c, layout.sub16(t, st, sets - st + 2 + @intCast(usize, k) * 2), chain, g, BY_GLYPH, 0, 0, 0, &cache)
+        }
+        collect.covNext(&it)
+        k += 1
+    }
+    tableFree(&cache)
+    pop(c)
+}
+
+// Format 2: rule sets per class of the input class definition.
+fn classContext(c: *Closure, st: usize, sets: usize, chain: bool, cd0: usize, cd1: usize, cd2: usize) -> void {
+    const t = &c.*.t
+    const cov = layout.sub16(t, st, 2)
+    if !coverageIntersects(t, cov, c.*.glyphs) { return }
+    const active = push(c)
+    if active == 0 { return }
+    coverageIntersectSet(t, cov, previousParentActive(c), active)
+    var cache: SetTable = undefined
+    tableInit(&cache)
+    const count = m.u16at(t, sets)
+    var k: u32 = 0
+    while k < count {
+        if classIntersectsClass(t, cd1, parentActive(c), k) {
+            ruleSetClosure(c, layout.sub16(t, st, sets - st + 2 + @intCast(usize, k) * 2), chain, k, BY_CLASS, cd0, cd1, cd2, &cache)
+        }
+        k += 1
+    }
+    tableFree(&cache)
+    pop(c)
+}
+
+fn contextClosure(c: *Closure, st: usize) -> void {
+    const t = &c.*.t
+    const format = m.u16at(t, st)
+    if format == 1 {
+        glyphContext(c, st, st + 4, false)
+    } else if format == 2 {
+        const cd = layout.sub16(t, st, 4)
+        classContext(c, st, st + 6, false, 0, cd, 0)
+    } else if format == 3 {
+        const glyphCount = m.u16at(t, st + 2)
+        const lookupCount = m.u16at(t, st + 4)
+        const cov = layout.sub16(t, st, 6)
+        if !coverageIntersects(t, cov, c.*.glyphs) { return }
+        const active = push(c)
+        if active == 0 { return }
+        coverageIntersectSet(t, cov, previousParentActive(c), active)
+        const n = if glyphCount != 0 { glyphCount - 1 } else { @intCast(u32, 0) }
+        if valuesIntersect(c, st + 8, n, BY_COVERAGE, st) {
+            var cache: SetTable = undefined
+            tableInit(&cache)
+            recurseLookups(c, glyphCount, st + 8, lookupCount, st + 6 + @intCast(usize, glyphCount) * 2, 0, BY_COVERAGE, st, &cache)
+            tableFree(&cache)
+        }
+        pop(c)
+    }
+}
+
+fn chainContextClosure(c: *Closure, st: usize) -> void {
+    const t = &c.*.t
+    const format = m.u16at(t, st)
+    if format == 1 {
+        glyphContext(c, st, st + 4, true)
+    } else if format == 2 {
+        classContext(c, st, st + 10, true, layout.sub16(t, st, 4), layout.sub16(t, st, 6), layout.sub16(t, st, 8))
+    } else if format == 3 {
+        const backtrack = m.u16at(t, st + 2)
+        const ib = st + 4 + @intCast(usize, backtrack) * 2
+        const inputCount = m.u16at(t, ib)
+        const cov = if inputCount != 0 { layout.sub16(t, st, ib + 2 - st) } else { @intCast(usize, 0) }
+        if !coverageIntersects(t, cov, c.*.glyphs) { return }
+        const active = push(c)
+        if active == 0 { return }
+        coverageIntersectSet(t, cov, previousParentActive(c), active)
+        const la = ib + 2 + @intCast(usize, inputCount) * 2
+        const lookahead = m.u16at(t, la)
+        const lk = la + 2 + @intCast(usize, lookahead) * 2
+        if valuesIntersect(c, st + 4, backtrack, BY_COVERAGE, st) && valuesIntersect(c, ib + 4, inputCount - 1, BY_COVERAGE, st) && valuesIntersect(c, la + 2, lookahead, BY_COVERAGE, st) {
+            var cache: SetTable = undefined
+            tableInit(&cache)
+            recurseLookups(c, inputCount, ib + 4, m.u16at(t, lk), lk + 2, 0, BY_COVERAGE, st, &cache)
+            tableFree(&cache)
+        }
+        pop(c)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Substitutions
+
+// Adds the 16-bit glyphs of an array (count first) at `a` to the output.
+fn addArray(c: *Closure, a: usize) -> void {
+    if a == 0 { return }
+    const t = &c.*.t
+    const count = m.u16at(t, a)
+    var k: u32 = 0
+    while k < count {
+        set.add(c.*.output, m.u16at(t, a + 2 + @intCast(usize, k) * 2))
+        k += 1
+    }
+}
+
+fn singleClosure(c: *Closure, st: usize, format: u32) -> void {
+    const t = &c.*.t
+    const cov = layout.sub16(t, st, 2)
+    if format == 1 {
+        const d = m.u16at(t, st + 4)
+        const mask: u32 = 0xFFFF
+        if coveragePopulation(t, cov) >= mask { return }
+        const intersection = set.create()
+        coverageIntersectSet(t, cov, parentActive(c), intersection)
+        // (Not when it maps a run of glyphs onto itself, which could keep
+        // adding glyphs in each round.)
+        const minBefore = set.getMin(intersection)
+        const maxBefore = set.getMax(intersection)
+        const minAfter = (minBefore +% d) & mask
+        const maxAfter = (maxBefore +% d) & mask
+        const overlapping = set.population(intersection) == maxBefore -% minBefore +% 1 && ((minBefore <= minAfter && minAfter <= maxBefore) || (minBefore <= maxAfter && maxAfter <= maxBefore))
+        if !overlapping {
+            var g = set.next(intersection, INVALID)
+            while g != INVALID {
+                set.add(c.*.output, (g + d) & mask)
+                g = set.next(intersection, g)
+            }
+        }
+        set.destroy(intersection)
+        return
+    }
+    const active = parentActive(c)
+    const n = m.u16at(t, st + 4)
+    if n > set.population(active) *% 4 {
+        var g = set.next(active, INVALID)
+        while g != INVALID {
+            const i = layout.coverage(t, cov, g)
+            if i != layout.NOT_COVERED && i < n { set.add(c.*.output, m.u16at(t, st + 6 + @intCast(usize, i) * 2)) }
+            g = set.next(active, g)
+        }
+        return
+    }
+    var it: collect.CovIter = undefined
+    collect.covInit(&it, t, cov)
+    var k: u32 = 0
+    while k < n && collect.covMore(&it) {
+        if set.has(active, collect.covGlyph(&it)) { set.add(c.*.output, m.u16at(t, st + 6 + @intCast(usize, k) * 2)) }
+        collect.covNext(&it)
+        k += 1
+    }
+}
+
+// Multiple, alternate and ligature substitutions: the sets of the covered
+// glyphs that are active.
+fn setsClosure(c: *Closure, st: usize, kind: u32) -> void {
+    const t = &c.*.t
+    const cov = layout.sub16(t, st, 2)
+    const active = parentActive(c)
+    var it: collect.CovIter = undefined
+    collect.covInit(&it, t, cov)
+    const count = m.u16at(t, st + 4)
+    var k: u32 = 0
+    while k < count && collect.covMore(&it) {
+        if set.has(active, collect.covGlyph(&it)) {
+            const s = layout.sub16(t, st, 6 + @intCast(usize, k) * 2)
+            if kind != 4 {
+                addArray(c, s)
+            } else if s != 0 {
+                const ligatures = m.u16at(t, s)
+                var j: u32 = 0
+                while j < ligatures {
+                    const lig = layout.sub16(t, s, 2 + @intCast(usize, j) * 2)
+                    if lig == 0 {
+                        set.add(c.*.output, 0)
+                    } else {
+                        // (All the components but the first among the glyphs.)
+                        const comps = m.u16at(t, lig + 2)
+                        var all = true
+                        var q: u32 = 1
+                        while q < comps {
+                            if !set.has(c.*.glyphs, m.u16at(t, lig + 4 + @intCast(usize, q - 1) * 2)) {
+                                all = false
+                                break
+                            }
+                            q += 1
+                        }
+                        if all { set.add(c.*.output, m.u16at(t, lig)) }
+                    }
+                    j += 1
+                }
+            }
+        }
+        collect.covNext(&it)
+        k += 1
+    }
+}
+
+fn reverseClosure(c: *Closure, st: usize) -> void {
+    const t = &c.*.t
+    const cov = layout.sub16(t, st, 2)
+    if !coverageIntersects(t, cov, c.*.glyphs) { return }
+    const backtrack = m.u16at(t, st + 4)
+    var i: u32 = 0
+    while i < backtrack {
+        if !coverageIntersects(t, layout.sub16(t, st, 6 + @intCast(usize, i) * 2), c.*.glyphs) { return }
+        i += 1
+    }
+    const la = st + 6 + @intCast(usize, backtrack) * 2
+    const lookahead = m.u16at(t, la)
+    i = 0
+    while i < lookahead {
+        if !coverageIntersects(t, layout.sub16(t, st, la - st + 2 + @intCast(usize, i) * 2), c.*.glyphs) { return }
+        i += 1
+    }
+    const subs = la + 2 + @intCast(usize, lookahead) * 2
+    const n = m.u16at(t, subs)
+    const active = parentActive(c)
+    var it: collect.CovIter = undefined
+    collect.covInit(&it, t, cov)
+    var k: u32 = 0
+    while k < n && collect.covMore(&it) {
+        if set.has(active, collect.covGlyph(&it)) { set.add(c.*.output, m.u16at(t, subs + 2 + @intCast(usize, k) * 2)) }
+        collect.covNext(&it)
+        k += 1
+    }
+}
+
+// The kind and offset of a subtable, through an extension (kind 0: none).
+fn resolve(t: *m.Table, kind: *u32, st: *usize) -> void {
+    if kind.* == 7 {
+        if st.* == 0 || m.u16at(t, st.*) != 1 {
+            kind.* = 0
+            return
+        }
+        const inner = m.u16at(t, st.* + 2)
+        st.* = layout.sub32(t, st.*, 4)
+        kind.* = if inner == 7 { @intCast(u32, 0) } else { inner }
+    }
+    if st.* == 0 { kind.* = 0 }
+}
+
+fn subtableClosure(c: *Closure, kind_: u32, st_: usize) -> void {
+    const t = &c.*.t
+    var kind = kind_
+    var st = st_
+    resolve(t, &kind, &st)
+    if kind == 0 { return }
+    const format = m.u16at(t, st)
+    if kind == 1 {
+        if format == 1 || format == 2 { singleClosure(c, st, format) }
+    } else if kind == 2 || kind == 3 || kind == 4 {
+        if format == 1 { setsClosure(c, st, kind) }
+    } else if kind == 5 {
+        contextClosure(c, st)
+    } else if kind == 6 {
+        chainContextClosure(c, st)
+    } else if kind == 8 {
+        if format == 1 { reverseClosure(c, st) }
+    }
+}
+
+// Whether a lookup may turn a glyph into other than one glyph.
+fn mayHaveNon1to1(t: *m.Table, l: usize) -> bool {
+    const n = layout.subtableCount(t, l)
+    var i: u32 = 0
+    while i < n {
+        var kind = layout.lookupType(t, l)
+        var st = layout.subtable(t, l, i)
+        resolve(t, &kind, &st)
+        if kind != 0 {
+            const format = m.u16at(t, st)
+            if (kind == 2 || kind == 4) && format == 1 { return true }
+            if (kind == 5 || kind == 6) && format >= 1 && format <= 3 { return true }
+        }
+        i += 1
+    }
+    return false
+}
+
+fn lookupDispatch(c: *Closure, l: usize) -> void {
+    const t = &c.*.t
+    const kind = layout.lookupType(t, l)
+    const n = layout.subtableCount(t, l)
+    var i: u32 = 0
+    while i < n {
+        subtableClosure(c, kind, layout.subtable(t, l, i))
+        i += 1
+    }
+}
+
+// A nested lookup (its output is joined at the end of the outer lookup).
+fn recurse(c: *Closure, index: u32, covered: usize, seqIndex: u32, endIndex: u32) -> void {
+    if c.*.nestingLeft == 0 { return }
+    c.*.nestingLeft -= 1
+    if shouldVisit(c, index) {
+        const l = layout.lookup(&c.*.t, index)
+        if l != 0 {
+            if mayHaveNon1to1(&c.*.t, l) { set.addRange(covered, seqIndex, endIndex) }
+            lookupDispatch(c, l)
+        }
+    }
+    c.*.nestingLeft += 1
+}
+
+fn lookupClosure(c: *Closure, index: u32) -> void {
+    if !shouldVisit(c, index) { return }
+    const l = layout.lookup(&c.*.t, index)
+    if l != 0 { lookupDispatch(c, l) }
+    flush(c)
+}
+
+pub fn otLayoutLookupSubstituteClosure(fc: usize, index: u32, glyphs: usize) -> void {
+    var c: Closure = undefined
+    init(&c, fc, glyphs)
+    lookupClosure(&c, index)
+    fini(&c)
+}
+
+pub fn otLayoutLookupsSubstituteClosure(fc: usize, lookups: usize, glyphs: usize) -> void {
+    var c: Closure = undefined
+    init(&c, fc, glyphs)
+    var iteration: u32 = 0
+    while true {
+        c.lookupCount = 0
+        const before = set.population(glyphs)
+        if lookups != 0 {
+            const ranges = set.rangeCount(lookups)
+            var r: u32 = 0
+            while r < ranges {
+                var index = set.rangeFirst(lookups, r)
+                const last = set.rangeLast(lookups, r)
+                while true {
+                    lookupClosure(&c, index)
+                    if index == last { break }
+                    index += 1
+                }
+                r += 1
+            }
+        } else {
+            const n = layout.lookupCount(&c.t)
+            var i: u32 = 0
+            while i < n {
+                lookupClosure(&c, i)
+                i += 1
+            }
+        }
+        const again = iteration <= MAX_STAGES && before != set.population(glyphs)
+        iteration += 1
+        if !again { break }
+    }
+    fini(&c)
+}
+
+// ---------------------------------------------------------------------------
+// The glyphs shaping a buffer can give with some features
+
+pub fn otShapeGlyphsClosure(f: usize, b_: usize, features: usize, count: u32, glyphs: usize) -> void {
+    const b = buffer.buf(b_)
+    var shapers: [2]usize = undefined
+    shapers[0] = m.literal("ot")
+    shapers[1] = 0
+    const fc = font.fontGetFace(f)
+    const sp = shape.shapePlanCreateCached(fc, @intFromPtr(&b.*.direction), features, count, @intFromPtr(&shapers))
+    const mirror = common.scriptGetHorizontalDirection(b.*.script) == common.DIRECTION_RTL
+    var i: u32 = 0
+    while i < b.*.len {
+        const u = m.get32(b.*.info + @intCast(usize, i) * @sizeOf(buffer.GlyphInfo))
+        var g: u32 = 0
+        if font.getNominalGlyph(f, u, &g) { set.add(glyphs, g) }
+        if mirror {
+            const mirrored = unicode.unicodeMirroring(b.*.unicode, u)
+            if mirrored != u && font.getNominalGlyph(f, mirrored, &g) { set.add(glyphs, g) }
+        }
+        i += 1
+    }
+    const lookups = set.create()
+    shape.otShapePlanCollectLookups(sp, layout.TAG_GSUB, lookups)
+    otLayoutLookupsSubstituteClosure(fc, lookups, glyphs)
+    set.destroy(lookups)
+    shape.shapePlanDestroy(sp)
+}

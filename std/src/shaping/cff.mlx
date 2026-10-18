@@ -1,0 +1,1774 @@
+// CFF and CFF2 (HarfBuzz's hb-ot-cff1-table, hb-ot-cff2-table and the
+// charstring interpreters of hb-cff-interp-*): the tables read as
+// HarfBuzz reads them (the top, font and private dicts, the charset, the
+// encoding, the font dict select and the variation store, with its
+// checks: a table that fails one is not used), glyph extents and cubic
+// outlines from the Type 2 charstrings (subroutines, hints skipped, the
+// seac accents of CFF, the blends of CFF2 at the font's coordinates), and
+// glyph names from the charset and the string index.
+const m = @import("./memory.mlx")
+const sort = @import("./sort.mlx")
+const face = @import("./face.mlx")
+const font = @import("./font.mlx")
+const draw = @import("./draw.mlx")
+const common = @import("./common.mlx")
+const variations = @import("./variations.mlx")
+const ct = @import("./cfftable.mlx")
+
+const MAX_OPS: u32 = 10000
+const ARG_LIMIT: u32 = 513
+const CALL_LIMIT: u32 = 10
+const UNDEF: u32 = 0xFFFFFFFF
+const INVALID_OP: u32 = 0xFFFF
+const ESC: u32 = 256
+
+// The kinds of dicts.
+const TOP1: u32 = 0
+const FONT1: u32 = 1
+const PRIVATE1: u32 = 2
+const TOP2: u32 = 3
+const FONT2: u32 = 4
+const PRIVATE2: u32 = 5
+
+// What a charstring is read for.
+const EXTENTS: u32 = 0
+const PATH: u32 = 1
+
+// ---------------------------------------------------------------------------
+// The table
+
+pub const Cff = struct {
+    valid: u32
+    cff2: u32
+    t: m.Table
+    numGlyphs: u32
+    isCid: u32
+    // The charset of the top dict (0, 1, 2: a predefined one) and the
+    // charset read (its offset; 0 for a predefined one).
+    charsetId: u32
+    charset: usize
+    stringIndex: usize
+    globalSubrs: usize
+    charStrings: usize
+    fdSelect: usize
+    fdCount: u32
+    // Per font dict: the offset of its local subroutines (0: none) and its
+    // item variation store index, 16 bytes each.
+    privates: usize
+    // The item variation store of CFF2 (its offset; 0: none) and the size
+    // its header gives.
+    varStore: usize
+    varStoreSize: u32
+    // The glyph names sorted (made when first asked for).
+    names: usize
+    nameCount: u32
+}
+
+fn cffOf(address: usize) -> *Cff { unsafe { return @ptrFromInt(*Cff, address) } }
+
+pub fn cffFreeCallback(a: usize) -> void {
+    const c = cffOf(a)
+    if c.*.privates != 0 { m.release(c.*.privates) }
+    if c.*.names != 0 { m.release(c.*.names) }
+    m.release(a)
+}
+
+// ---------------------------------------------------------------------------
+// INDEXes: a count (2 bytes in CFF, 4 in CFF2), an offset size and count + 1
+// offsets (1-based) into the data after them.
+
+fn indexCount(t: *m.Table, at: usize, cs: usize) -> u32 { return if cs == 2 { m.u16at(t, at) } else { m.u32at(t, at) } }
+
+fn offsetAt(t: *m.Table, at: usize, cs: usize, i: u32) -> u32 {
+    const size = m.u8at(t, at + cs)
+    const p = at + cs + 1 + @intCast(usize, i) * @intCast(usize, size)
+    if size == 1 { return m.u8at(t, p) }
+    if size == 2 { return m.u16at(t, p) }
+    if size == 3 { return m.u24at(t, p) }
+    if size == 4 { return m.u32at(t, p) }
+    return 0
+}
+
+// Where the data of an index starts, less one (offsets count from 1).
+fn dataBase(t: *m.Table, at: usize, cs: usize) -> usize {
+    const count = @intCast(usize, indexCount(t, at, cs))
+    return at + cs + @intCast(usize, m.u8at(t, at + cs)) * (count + 1)
+}
+
+fn indexValid(t: *m.Table, at: usize, cs: usize) -> bool {
+    if !m.fits(t, at, cs) { return false }
+    const count = indexCount(t, at, cs)
+    if count == 0 { return true }
+    if count == 0xFFFFFFFF { return false }
+    if !m.fits(t, at + cs, 1) { return false }
+    const size = m.u8at(t, at + cs)
+    if size < 1 || size > 4 { return false }
+    if !m.fits(t, at + cs + 1, @intCast(usize, size) * (@intCast(usize, count) + 1)) { return false }
+    return m.fits(t, dataBase(t, at, cs), @intCast(usize, offsetAt(t, at, cs, count)))
+}
+
+// The size of an index (32-bit arithmetic, as HarfBuzz's).
+fn indexSize(t: *m.Table, at: usize, cs: usize) -> usize {
+    const count = indexCount(t, at, cs)
+    if count == 0 { return cs }
+    const size = m.u8at(t, at + cs)
+    const n: u32 = @intCast(u32, cs) +% 1 +% size *% (count +% 1) +% (offsetAt(t, at, cs, count) -% 1)
+    return @intCast(usize, n)
+}
+
+// Item `i` of the index: the address and length of its bytes (0, 0: none).
+fn indexItem(t: *m.Table, at: usize, cs: usize, i: u32, start: *usize, length: *u32) -> void {
+    start.* = 0
+    length.* = 0
+    const count = indexCount(t, at, cs)
+    if i >= count { return }
+    const o0 = offsetAt(t, at, cs, i)
+    const o1 = offsetAt(t, at, cs, i + 1)
+    if o1 < o0 || o1 > offsetAt(t, at, cs, count) { return }
+    start.* = t.*.data + dataBase(t, at, cs) + @intCast(usize, o0)
+    length.* = o1 - o0
+}
+
+// Whether `length` bytes at `address` are in the table (as HarfBuzz checks
+// ranges, an empty one too: its address in the table or at its end).
+fn inTable(t: *m.Table, address: usize, length: u32) -> bool {
+    if address < t.*.data { return false }
+    return m.fits(t, address - t.*.data, @intCast(usize, length))
+}
+
+// ---------------------------------------------------------------------------
+// DICTs
+
+const Dict = struct {
+    args: [513]f64
+    count: u32
+    argError: u32
+    start: usize
+    length: u32
+    offset: u32
+    kind: u32
+    charStrings: u32
+    fdArray: u32
+    fdSelect: u32
+    charset: u32
+    encoding: u32
+    privateOffset: u32
+    privateSize: u32
+    registry: u32
+    subrs: u32
+    vstore: u32
+    ivs: u32
+    seenVsindex: u32
+}
+
+fn dictOf(address: usize) -> *Dict { unsafe { return @ptrFromInt(*Dict, address) } }
+fn envOf(address: usize) -> *Env { unsafe { return @ptrFromInt(*Env, address) } }
+
+fn dictError(d: *Dict) -> void { d.*.offset = d.*.length + 1 }
+
+fn dictInError(d: *Dict) -> bool { return d.*.offset > d.*.length || d.*.argError != 0 }
+
+fn dictAvail(d: *Dict, n: u32) -> bool { return @intCast(u64, d.*.offset) + @intCast(u64, n) <= @intCast(u64, d.*.length) }
+
+fn dictByte(d: *Dict, i: u32) -> u32 {
+    if @intCast(u64, d.*.offset) + @intCast(u64, i) >= @intCast(u64, d.*.length) {
+        dictError(d)
+        return 0
+    }
+    return @intCast(u32, m.get8(d.*.start + @intCast(usize, d.*.offset + i)))
+}
+
+fn dictSkip(d: *Dict, n: u32) -> void {
+    const o = @intCast(u64, d.*.offset) + @intCast(u64, n)
+    d.*.offset = if o > @intCast(u64, d.*.length) { d.*.length + 1 } else { @intCast(u32, o) }
+}
+
+fn dictPush(d: *Dict, v: f64) -> void {
+    if d.*.count < ARG_LIMIT {
+        d.*.args[@intCast(usize, d.*.count)] = v
+        d.*.count += 1
+    } else {
+        d.*.argError = 1
+    }
+}
+
+fn dictPopUint(d: *Dict) -> u32 {
+    if d.*.count == 0 {
+        d.*.argError = 1
+        return 0
+    }
+    d.*.count -= 1
+    const i = m.intOf64(d.*.args[@intCast(usize, d.*.count)])
+    if i < 0 {
+        d.*.argError = 1
+        return 0
+    }
+    return @intCast(u32, i)
+}
+
+// A real number in binary coded decimal (dict_opset_t::parse_bcd).
+fn parseBcd(d: *Dict) -> f64 {
+    if dictInError(d) { return 0.0 }
+    var buf: [32]u8 = undefined
+    const chars = "0123456789.EE?-?"
+    var byte: u32 = 0
+    var i: u32 = 0
+    var count: u32 = 0
+    while count < 32 {
+        var nibble: u32 = 0
+        if (i & 1) == 0 {
+            if !dictAvail(d, 1) { break }
+            byte = dictByte(d, 0)
+            dictSkip(d, 1)
+            nibble = byte >> 4
+        } else {
+            nibble = byte & 15
+        }
+        if nibble == 13 { break }
+        if nibble == 15 {
+            var p = @intFromPtr(&buf)
+            var v: f64 = 0.0
+            const end = p + @intCast(usize, count)
+            if !common.parseDouble(&p, end, &v) || p != end { break }
+            return v
+        }
+        buf[@intCast(usize, count)] = chars[@intCast(usize, nibble)]
+        if nibble == 12 {
+            count += 1
+            if count == 32 { break }
+            buf[@intCast(usize, count)] = 45
+        }
+        i += 1
+        count += 1
+    }
+    dictError(d)
+    return 0.0
+}
+
+fn dictFetchOp(d: *Dict) -> u32 {
+    if !dictAvail(d, 1) { return INVALID_OP }
+    var op = @intCast(u32, m.get8(d.*.start + @intCast(usize, d.*.offset)))
+    d.*.offset += 1
+    if op == 12 {
+        if !dictAvail(d, 1) { return INVALID_OP }
+        op = ESC + @intCast(u32, m.get8(d.*.start + @intCast(usize, d.*.offset)))
+        d.*.offset += 1
+    }
+    return op
+}
+
+// The operands (dict_opset_t::process_op): integers and reals; any other
+// operator is an error.
+fn dictNumber(d: *Dict, op: u32) -> void {
+    if op == 29 {
+        const v = (dictByte(d, 0) << 24) | (dictByte(d, 1) << 16) | (dictByte(d, 2) << 8) | dictByte(d, 3)
+        dictPush(d, @floatFromInt(f64, @bitCast(i32, v)))
+        dictSkip(d, 4)
+    } else if op == 30 {
+        dictPush(d, parseBcd(d))
+    } else if op == 28 {
+        const v = (dictByte(d, 0) << 8) | dictByte(d, 1)
+        dictPush(d, @floatFromInt(f64, @intCast(i32, @bitCast(i16, @intCast(u16, v)))))
+        dictSkip(d, 2)
+    } else if op >= 247 && op <= 250 {
+        dictPush(d, @floatFromInt(f64, @intCast(i32, (op - 247) * 256 + dictByte(d, 0) + 108)))
+        dictSkip(d, 1)
+    } else if op >= 251 && op <= 254 {
+        dictPush(d, @floatFromInt(f64, 0 - @intCast(i32, (op - 251) * 256 + dictByte(d, 0) + 108)))
+        dictSkip(d, 1)
+    } else if op >= 32 && op <= 246 {
+        dictPush(d, @floatFromInt(f64, @intCast(i32, op) - 139))
+    } else {
+        d.*.count = 0
+        dictError(d)
+    }
+}
+
+fn isNameOp(op: u32) -> bool {
+    return op <= 4 || op == ESC + 0 || op == ESC + 38 || op == ESC + 21 || op == ESC + 22
+}
+
+fn isTop1ClearOp(op: u32) -> bool {
+    return op == ESC + 1 || op == ESC + 2 || op == ESC + 3 || op == ESC + 4 || op == ESC + 5 || op == ESC + 6 ||
+        op == 13 || op == ESC + 8 || op == ESC + 20 || op == ESC + 31 || op == ESC + 32 || op == ESC + 33 ||
+        op == ESC + 35 || op == 5 || op == 14 || op == ESC + 23
+}
+
+fn isHintDictOp(op: u32) -> bool {
+    return (op >= 6 && op <= 11) || op == ESC + 9 || op == ESC + 10 || op == ESC + 11 || op == ESC + 12 ||
+        op == ESC + 13 || op == ESC + 17 || op == ESC + 18
+}
+
+// The operators of the top dict's opset shared by CFF and CFF2
+// (top_dict_opset_t), then the operands.
+fn topCommon(d: *Dict, op: u32) -> void {
+    if op == 17 {
+        d.*.charStrings = dictPopUint(d)
+        d.*.count = 0
+    } else if op == ESC + 36 {
+        d.*.fdArray = dictPopUint(d)
+        d.*.count = 0
+    } else if op == ESC + 7 {
+        d.*.count = 0
+    } else {
+        dictNumber(d, op)
+    }
+}
+
+fn dictOp(d: *Dict, op: u32) -> void {
+    const kind = d.*.kind
+    if kind == TOP1 {
+        if isNameOp(op) {
+            _ = dictPopUint(d)
+            d.*.count = 0
+        } else if isTop1ClearOp(op) {
+            d.*.count = 0
+        } else if op == ESC + 34 {
+            _ = dictPopUint(d)
+            d.*.count = 0
+        } else if op == ESC + 30 {
+            _ = dictPopUint(d)
+            _ = dictPopUint(d)
+            d.*.registry = dictPopUint(d)
+            d.*.count = 0
+        } else if op == 16 {
+            d.*.encoding = dictPopUint(d)
+            d.*.count = 0
+        } else if op == 15 {
+            d.*.charset = dictPopUint(d)
+            d.*.count = 0
+        } else if op == ESC + 37 {
+            d.*.fdSelect = dictPopUint(d)
+            d.*.count = 0
+        } else if op == 18 {
+            d.*.privateOffset = dictPopUint(d)
+            d.*.privateSize = dictPopUint(d)
+            d.*.count = 0
+        } else {
+            topCommon(d, op)
+        }
+    } else if kind == FONT1 {
+        if op == ESC + 38 {
+            _ = dictPopUint(d)
+            d.*.count = 0
+        } else if op == ESC + 7 || op == ESC + 5 {
+            d.*.count = 0
+        } else if op == 18 {
+            d.*.privateOffset = dictPopUint(d)
+            d.*.privateSize = dictPopUint(d)
+            d.*.count = 0
+        } else {
+            dictNumber(d, op)
+        }
+    } else if kind == PRIVATE1 {
+        if isHintDictOp(op) || op == ESC + 14 || op == ESC + 19 || op == 20 || op == 21 {
+            d.*.count = 0
+        } else if op == 19 {
+            d.*.subrs = dictPopUint(d)
+            d.*.count = 0
+        } else {
+            dictNumber(d, op)
+        }
+    } else if kind == TOP2 {
+        if op == ESC + 7 {
+            d.*.count = 0
+        } else if op == 24 {
+            d.*.vstore = dictPopUint(d)
+            d.*.count = 0
+        } else if op == ESC + 37 {
+            d.*.fdSelect = dictPopUint(d)
+            d.*.count = 0
+        } else {
+            topCommon(d, op)
+        }
+    } else if kind == FONT2 {
+        if op == 18 {
+            d.*.privateOffset = dictPopUint(d)
+            d.*.privateSize = dictPopUint(d)
+            d.*.count = 0
+        } else {
+            dictNumber(d, op)
+        }
+    } else {
+        if isHintDictOp(op) {
+            d.*.count = 0
+        } else if op == 19 {
+            d.*.subrs = dictPopUint(d)
+            d.*.count = 0
+        } else if op == 22 {
+            if d.*.seenVsindex == 0 { d.*.ivs = dictPopUint(d) }
+            d.*.seenVsindex = 1
+            d.*.count = 0
+        } else if op == 23 {
+            // (blend leaves its operands.)
+        } else {
+            dictNumber(d, op)
+        }
+    }
+}
+
+// Reads a dict of `kind` (its results start as HarfBuzz's defaults):
+// whether it has no error.
+fn parseDict(d: *Dict, kind: u32, start: usize, length: u32) -> bool {
+    d.*.count = 0
+    d.*.argError = 0
+    d.*.start = start
+    d.*.length = length
+    d.*.offset = 0
+    d.*.kind = kind
+    d.*.charStrings = 0
+    d.*.fdArray = 0
+    d.*.fdSelect = 0
+    d.*.charset = 0
+    d.*.encoding = 0
+    d.*.privateOffset = 0
+    d.*.privateSize = 0
+    d.*.registry = UNDEF
+    d.*.subrs = 0
+    d.*.vstore = 0
+    d.*.ivs = 0
+    d.*.seenVsindex = 0
+    while dictAvail(d, 1) {
+        dictOp(d, dictFetchOp(d))
+        if dictInError(d) { return false }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The charset, the encoding, the font dict select, the variation store
+
+fn charsetValid(t: *m.Table, at: usize, numGlyphs: u32) -> bool {
+    if !m.fits(t, at, 1) { return false }
+    const format = m.u8at(t, at)
+    if format == 0 {
+        if numGlyphs == 0 { return false }
+        return m.fits(t, at + 1, @intCast(usize, numGlyphs - 1) * 2)
+    }
+    if format != 1 && format != 2 { return false }
+    const size: usize = if format == 1 { 3 } else { 4 }
+    var n = numGlyphs -% 1
+    var r = at + 1
+    while n > 0 {
+        if !m.fits(t, r, size) { return false }
+        const left = if format == 1 { m.u8at(t, r + 2) } else { m.u16at(t, r + 2) }
+        if n < left + 1 { return false }
+        n -= left + 1
+        r += size
+    }
+    return true
+}
+
+fn charsetSid(a: *Cff, glyph: u32) -> u32 {
+    const t = &a.*.t
+    const at = a.*.charset
+    if glyph >= a.*.numGlyphs || glyph == 0 { return 0 }
+    const format = m.u8at(t, at)
+    if format == 0 { return m.u16at(t, at + 1 + @intCast(usize, glyph - 1) * 2) }
+    const size: usize = if format == 1 { 3 } else { 4 }
+    var g = glyph - 1
+    var r = at + 1
+    while m.fits(t, r, size) {
+        const left = if format == 1 { m.u8at(t, r + 2) } else { m.u16at(t, r + 2) }
+        if g <= left { return m.u16at(t, r) + g }
+        g -= left + 1
+        r += size
+    }
+    return 0
+}
+
+fn charsetGlyph(a: *Cff, sid: u32) -> u32 {
+    const t = &a.*.t
+    const at = a.*.charset
+    if sid == 0 { return 0 }
+    const format = m.u8at(t, at)
+    if format == 0 {
+        var g: u32 = 1
+        while g < a.*.numGlyphs {
+            if m.u16at(t, at + 1 + @intCast(usize, g - 1) * 2) == sid { return g }
+            g += 1
+        }
+        return 0
+    }
+    const size: usize = if format == 1 { 3 } else { 4 }
+    var glyph: u32 = 1
+    var r = at + 1
+    while true {
+        if glyph >= a.*.numGlyphs { return 0 }
+        const first = m.u16at(t, r)
+        const left = if format == 1 { m.u8at(t, r + 2) } else { m.u16at(t, r + 2) }
+        if first <= sid && sid <= first + left { return glyph + (sid - first) }
+        glyph += left + 1
+        r += size
+    }
+    return 0
+}
+
+fn encodingValid(t: *m.Table, at: usize) -> bool {
+    if !m.fits(t, at, 1) { return false }
+    const format = m.u8at(t, at)
+    var supp: usize = 0
+    if (format & 0x7F) == 0 {
+        if !m.fits(t, at + 1, 1) { return false }
+        const n = m.u8at(t, at + 1)
+        if !m.fits(t, at + 2, @intCast(usize, n)) { return false }
+        if (format & 0x80) != 0 && n == 0 { return false }
+        supp = at + 2 + @intCast(usize, n)
+    } else if (format & 0x7F) == 1 {
+        if !m.fits(t, at + 1, 1) { return false }
+        const n = m.u8at(t, at + 1)
+        if !m.fits(t, at + 2, @intCast(usize, n) * 2) { return false }
+        if (format & 0x80) != 0 && n == 0 { return false }
+        supp = at + 2 + @intCast(usize, n) * 2
+    } else {
+        return false
+    }
+    if (format & 0x80) == 0 { return true }
+    if !m.fits(t, supp, 1) { return false }
+    return m.fits(t, supp + 1, @intCast(usize, m.u8at(t, supp)) * 3)
+}
+
+// The font dict select (formats 0 and 3, and 4 in CFF2).
+fn fdSelectValid(t: *m.Table, at: usize, fdCount: u32, numGlyphs: u32, cff2: bool) -> bool {
+    const minSize: usize = if cff2 { 2 } else { 1 }
+    if !m.fits(t, at, minSize) { return false }
+    const format = m.u8at(t, at)
+    if format == 0 { return m.fits(t, at + 1, @intCast(usize, numGlyphs)) }
+    if format != 3 && !(format == 4 && cff2) { return false }
+    const gs: usize = if format == 3 { 2 } else { 4 }
+    const rs: usize = if format == 3 { 3 } else { 6 }
+    if !m.fits(t, at + 1, gs) { return false }
+    const n = if format == 3 { m.u16at(t, at + 1) } else { m.u32at(t, at + 1) }
+    const ranges = at + 1 + gs
+    if !m.fits(t, ranges, @intCast(usize, n) * rs) { return false }
+    var i: u32 = 0
+    while i < n {
+        const r = ranges + @intCast(usize, i) * rs
+        const first = if format == 3 { m.u16at(t, r) } else { m.u32at(t, r) }
+        const fd = if format == 3 { m.u8at(t, r + 2) } else { m.u16at(t, r + 4) }
+        if first >= numGlyphs || fd >= fdCount { return false }
+        i += 1
+    }
+    if n == 0 { return false }
+    if (if format == 3 { m.u16at(t, ranges) } else { m.u32at(t, ranges) }) != 0 { return false }
+    i = 1
+    while i < n {
+        const a = ranges + @intCast(usize, i - 1) * rs
+        const b = ranges + @intCast(usize, i) * rs
+        const fa = if format == 3 { m.u16at(t, a) } else { m.u32at(t, a) }
+        const fb = if format == 3 { m.u16at(t, b) } else { m.u32at(t, b) }
+        if fa >= fb { return false }
+        i += 1
+    }
+    const sentinel = ranges + @intCast(usize, n) * rs
+    if !m.fits(t, sentinel, gs) { return false }
+    return (if format == 3 { m.u16at(t, sentinel) } else { m.u32at(t, sentinel) }) == numGlyphs
+}
+
+fn fdOf(a: *Cff, glyph: u32) -> u32 {
+    const at = a.*.fdSelect
+    if at == 0 { return 0 }
+    const t = &a.*.t
+    const format = m.u8at(t, at)
+    if format == 0 { return m.u8at(t, at + 1 + @intCast(usize, glyph)) }
+    if format != 3 && format != 4 { return 0 }
+    const gs: usize = if format == 3 { 2 } else { 4 }
+    const rs: usize = if format == 3 { 3 } else { 6 }
+    const n = if format == 3 { m.u16at(t, at + 1) } else { m.u32at(t, at + 1) }
+    const ranges = at + 1 + gs
+    // A binary search over the first n - 1 ranges, each to the next's first.
+    var lo: i64 = 0
+    var hi: i64 = @intCast(i64, n) - 2
+    while lo <= hi {
+        const mid = @intCast(i64, (@intCast(u64, lo) + @intCast(u64, hi)) / 2)
+        const r = ranges + @intCast(usize, mid) * rs
+        const first = if format == 3 { m.u16at(t, r) } else { m.u32at(t, r) }
+        const next = if format == 3 { m.u16at(t, r + rs) } else { m.u32at(t, r + rs) }
+        if glyph < first {
+            hi = mid - 1
+        } else if glyph >= next {
+            lo = mid + 1
+        } else {
+            return if format == 3 { m.u8at(t, r + 2) } else { m.u16at(t, r + 4) }
+        }
+    }
+    const last = ranges + @intCast(usize, n - 1) * rs
+    return if format == 3 { m.u8at(t, last + 2) } else { m.u16at(t, last + 4) }
+}
+
+// The item variation store (ItemVariationStore::sanitize) at `at`.
+fn varStoreValid(t: *m.Table, at: usize) -> bool {
+    if !m.fits(t, at, 8) || m.u16at(t, at) != 1 { return false }
+    const regions = @intCast(usize, m.u32at(t, at + 2))
+    if regions != 0 {
+        const list = at + regions
+        if !m.fits(t, list, 4) { return false }
+        const n = @intCast(usize, m.u16at(t, list)) * @intCast(usize, m.u16at(t, list + 2) & 0x7FFF)
+        if !m.fits(t, list + 4, n * 6) { return false }
+    }
+    const count = m.u16at(t, at + 6)
+    if !m.fits(t, at + 8, @intCast(usize, count) * 4) { return false }
+    var i: u32 = 0
+    while i < count {
+        const o = @intCast(usize, m.u32at(t, at + 8 + @intCast(usize, i) * 4))
+        if o != 0 {
+            const d = at + o
+            if !m.fits(t, d, 6) { return false }
+            const items = @intCast(usize, m.u16at(t, d))
+            const words = m.u16at(t, d + 2)
+            const regionCount = m.u16at(t, d + 4)
+            if !m.fits(t, d + 6, @intCast(usize, regionCount) * 2) { return false }
+            if (words & 0x7FFF) > regionCount { return false }
+            const row = (@intCast(usize, words & 0x7FFF) + @intCast(usize, regionCount)) * (if (words & 0x8000) != 0 { @intCast(usize, 2) } else { @intCast(usize, 1) })
+            if !m.fits(t, d + 6 + @intCast(usize, regionCount) * 2, items * row) { return false }
+        }
+        i += 1
+    }
+    return true
+}
+
+// The item variation data `major` of the store (0: none).
+fn varData(a: *Cff, major: u32) -> usize {
+    const t = &a.*.t
+    const at = a.*.varStore
+    if at == 0 { return 0 }
+    if major >= m.u16at(t, at + 6) { return 0 }
+    const o = @intCast(usize, m.u32at(t, at + 8 + @intCast(usize, major) * 4))
+    if o == 0 { return 0 }
+    return at + o
+}
+
+// ---------------------------------------------------------------------------
+// Making the accelerators
+
+fn readPrivate(a: *Cff, d: *Dict, i: u32, kind: u32, offset: u32, size: u32) -> bool {
+    const t = &a.*.t
+    const cs: usize = if a.*.cff2 != 0 { 4 } else { 2 }
+    // (A private dict at offset 0 of CFF2 is none, which fails the check.)
+    if !m.fits(t, @intCast(usize, offset), @intCast(usize, size)) || (offset == 0 && a.*.cff2 != 0) { return false }
+    if !parseDict(d, kind, t.*.data + @intCast(usize, offset), size) { return false }
+    var subrs: usize = 0
+    if d.*.subrs != 0 {
+        subrs = @intCast(usize, offset) + @intCast(usize, d.*.subrs)
+        if !indexValid(t, subrs, cs) { return false }
+    }
+    m.putWord(a.*.privates + @intCast(usize, i) * 16, subrs)
+    m.put32(a.*.privates + @intCast(usize, i) * 16 + 8, d.*.ivs)
+    return true
+}
+
+fn makeCff1(fc: usize, a: *Cff, d: *Dict) -> bool {
+    const t = &a.*.t
+    face.view(fc, face.T_CFF, t)
+    if t.*.length < 4 || m.u8at(t, 0) != 1 { return false }
+    const faceGlyphs = face.numGlyphs(fc)
+    const nameIndex = @intCast(usize, m.u8at(t, 2))
+    if !indexValid(t, nameIndex, 2) { return false }
+    const topIndex = nameIndex + indexSize(t, nameIndex, 2)
+    if !indexValid(t, topIndex, 2) || indexCount(t, topIndex, 2) == 0 { return false }
+    var start: usize = 0
+    var length: u32 = 0
+    indexItem(t, topIndex, 2, 0, &start, &length)
+    if !inTable(t, start, length) || !parseDict(d, TOP1, start, length) { return false }
+    const charsetId = d.*.charset
+    const encodingId = d.*.encoding
+    const charStrings = d.*.charStrings
+    const fdArray = d.*.fdArray
+    const fdSelect = d.*.fdSelect
+    const privateOffset = d.*.privateOffset
+    const privateSize = d.*.privateSize
+    a.*.isCid = if d.*.registry != UNDEF { 1 } else { 0 }
+    a.*.charsetId = charsetId
+    if charsetId > 2 {
+        a.*.charset = @intCast(usize, charsetId)
+        if !charsetValid(t, a.*.charset, faceGlyphs) { return false }
+    }
+    a.*.fdCount = 1
+    if a.*.isCid != 0 {
+        if fdArray == 0 || fdSelect == 0 { return false }
+        if !indexValid(t, @intCast(usize, fdArray), 2) { return false }
+        a.*.fdCount = indexCount(t, @intCast(usize, fdArray), 2)
+        if !fdSelectValid(t, @intCast(usize, fdSelect), a.*.fdCount, faceGlyphs, false) { return false }
+        a.*.fdSelect = @intCast(usize, fdSelect)
+        if a.*.charset == 0 { return false }
+    } else if encodingId > 1 {
+        if !encodingValid(t, @intCast(usize, encodingId)) { return false }
+    }
+    a.*.stringIndex = topIndex + indexSize(t, topIndex, 2)
+    if !indexValid(t, a.*.stringIndex, 2) { return false }
+    a.*.globalSubrs = a.*.stringIndex + indexSize(t, a.*.stringIndex, 2)
+    if !indexValid(t, a.*.globalSubrs, 2) { return false }
+    if charStrings == 0 || !indexValid(t, @intCast(usize, charStrings), 2) { return false }
+    a.*.charStrings = @intCast(usize, charStrings)
+    a.*.numGlyphs = indexCount(t, a.*.charStrings, 2)
+    if a.*.numGlyphs != faceGlyphs { return false }
+    a.*.privates = m.alloc(@intCast(usize, a.*.fdCount) * 16 + 16)
+    if a.*.isCid != 0 {
+        var i: u32 = 0
+        while i < a.*.fdCount {
+            indexItem(t, @intCast(usize, fdArray), 2, i, &start, &length)
+            if !inTable(t, start, length) || !parseDict(d, FONT1, start, length) { return false }
+            if !readPrivate(a, d, i, PRIVATE1, d.*.privateOffset, d.*.privateSize) { return false }
+            i += 1
+        }
+    } else if !readPrivate(a, d, 0, PRIVATE1, privateOffset, privateSize) {
+        return false
+    }
+    return true
+}
+
+fn makeCff2(fc: usize, a: *Cff, d: *Dict) -> bool {
+    const t = &a.*.t
+    face.view(fc, face.T_CFF2, t)
+    if t.*.length < 5 || m.u8at(t, 0) != 2 { return false }
+    const top = @intCast(usize, m.u8at(t, 2))
+    const topSize = m.u16at(t, 3)
+    if !inTable(t, t.*.data + top, topSize) { return false }
+    if !parseDict(d, TOP2, t.*.data + top, topSize) { return false }
+    a.*.globalSubrs = top + @intCast(usize, topSize)
+    const fdArray = @intCast(usize, d.*.fdArray)
+    if d.*.vstore != 0 {
+        const vs = @intCast(usize, d.*.vstore)
+        if !m.fits(t, vs, 10) { return false }
+        a.*.varStoreSize = m.u16at(t, vs)
+        if !m.fits(t, vs + 2, @intCast(usize, a.*.varStoreSize)) || !varStoreValid(t, vs + 2) { return false }
+        a.*.varStore = vs + 2
+    }
+    if d.*.charStrings == 0 || !indexValid(t, @intCast(usize, d.*.charStrings), 4) { return false }
+    if !indexValid(t, a.*.globalSubrs, 4) { return false }
+    if fdArray == 0 || !indexValid(t, fdArray, 4) { return false }
+    a.*.fdCount = indexCount(t, fdArray, 4)
+    if d.*.fdSelect != 0 {
+        if !fdSelectValid(t, @intCast(usize, d.*.fdSelect), a.*.fdCount, face.numGlyphs(fc), true) { return false }
+        a.*.fdSelect = @intCast(usize, d.*.fdSelect)
+    }
+    a.*.charStrings = @intCast(usize, d.*.charStrings)
+    a.*.numGlyphs = indexCount(t, a.*.charStrings, 4)
+    if a.*.numGlyphs != face.numGlyphs(fc) { return false }
+    a.*.privates = m.alloc(@intCast(usize, a.*.fdCount) * 16 + 16)
+    var i: u32 = 0
+    var start: usize = 0
+    var length: u32 = 0
+    while i < a.*.fdCount {
+        indexItem(t, fdArray, 4, i, &start, &length)
+        if !inTable(t, start, length) || !parseDict(d, FONT2, start, length) { return false }
+        if !readPrivate(a, d, i, PRIVATE2, d.*.privateOffset, d.*.privateSize) { return false }
+        i += 1
+    }
+    return true
+}
+
+// The accelerator of CFF (`cff2` false) or CFF2 of a face.
+fn accel(fc: usize, cff2: bool) -> *Cff {
+    const slot = if cff2 { face.A_CFF2 } else { face.A_CFF }
+    var a = face.accel(fc, slot)
+    if a == 0 {
+        const made = m.alloc(@sizeOf(Cff))
+        const c = cffOf(made)
+        c.*.cff2 = if cff2 { 1 } else { 0 }
+        const d = m.alloc(@sizeOf(Dict))
+        const ok = if cff2 { makeCff2(fc, c, dictOf(d)) } else { makeCff1(fc, c, dictOf(d)) }
+        m.release(d)
+        if ok {
+            c.*.valid = 1
+        } else {
+            c.*.numGlyphs = 0
+        }
+        a = face.keepAccel(fc, slot, made, @intFromPtr(cffFreeCallback))
+    }
+    return cffOf(a)
+}
+
+pub fn hasData(fc: usize) -> bool { return accel(fc, false).*.valid != 0 }
+pub fn hasData2(fc: usize) -> bool { return accel(fc, true).*.valid != 0 }
+
+// ---------------------------------------------------------------------------
+// Glyph names (CFF only, not CID-keyed)
+
+fn glyphToSid(a: *Cff, glyph: u32) -> u32 {
+    if a.*.charset != 0 { return charsetSid(a, glyph) }
+    if a.*.charsetId == 0 { return if glyph <= 228 { glyph } else { 0 } }
+    if a.*.charsetId == 1 { return ct.expertCharsetSid(glyph) }
+    if a.*.charsetId == 2 { return ct.expertSubsetCharsetSid(glyph) }
+    return 0
+}
+
+fn sidToGlyph(a: *Cff, sid: u32) -> u32 {
+    if a.*.charset != 0 { return charsetGlyph(a, sid) }
+    if a.*.charsetId == 0 { return if sid <= 228 { sid } else { 0 } }
+    if a.*.charsetId == 1 { return ct.expertCharsetGlyph(sid) }
+    if a.*.charsetId == 2 { return ct.expertSubsetCharsetGlyph(sid) }
+    return 0
+}
+
+// The glyph of a code of the standard encoding (for seac).
+fn stdCodeToGlyph(a: *Cff, code: u32) -> u32 {
+    const sid = ct.standardEncodingSid(code)
+    if sid == UNDEF { return 0 }
+    if a.*.charset != 0 { return charsetGlyph(a, sid) }
+    if a.*.charsetId == 0 && code <= 228 { return sid }
+    return 0
+}
+
+// The bytes of string `sid` (length 0: none).
+fn sidString(a: *Cff, sid: u32, start: *usize, length: *u32) -> void {
+    if sid < ct.STRING_COUNT {
+        const s = @intCast(usize, ct.STRING_OFFSETS[@intCast(usize, sid)])
+        start.* = @intFromPtr(ct.STRINGS.pointer) + s
+        length.* = @intCast(u32, @intCast(usize, ct.STRING_OFFSETS[@intCast(usize, sid) + 1]) - s)
+        return
+    }
+    indexItem(&a.*.t, a.*.stringIndex, 2, sid - ct.STRING_COUNT, start, length)
+}
+
+pub fn getGlyphName(fc: usize, glyph: u32, name: usize, size: u32) -> bool {
+    const a = accel(fc, false)
+    if glyph >= a.*.numGlyphs || a.*.valid == 0 || a.*.isCid != 0 { return false }
+    if size == 0 { return true }
+    var start: usize = 0
+    var length: u32 = 0
+    sidString(a, glyphToSid(a, glyph), &start, &length)
+    if length == 0 { return false }
+    const n = if size - 1 < length { size - 1 } else { length }
+    // (strncpy: up to a zero byte, then zeros.)
+    var i: u32 = 0
+    var ended = false
+    while i < n {
+        var c: u8 = 0
+        if !ended {
+            c = m.get8(start + @intCast(usize, i))
+            if c == 0 { ended = true }
+        }
+        m.put8(name + @intCast(usize, i), c)
+        i += 1
+    }
+    m.put8(name + @intCast(usize, n), 0)
+    return true
+}
+
+// The sorted names: per glyph 16 bytes, the address of its name, its
+// length and its string id (16 bits).
+fn nameStart(e: usize) -> usize { return m.getWord(e) }
+fn nameLength(e: usize) -> u32 { return m.get32(e + 8) }
+
+// strncmp over the shorter length, then the shorter first.
+fn compareNames(a: usize, aLength: u32, b: usize, bLength: u32) -> i32 {
+    const n = if aLength < bLength { aLength } else { bLength }
+    var i: u32 = 0
+    while i < n {
+        const x = m.get8(a + @intCast(usize, i))
+        const y = m.get8(b + @intCast(usize, i))
+        if x != y { return @intCast(i32, x) - @intCast(i32, y) }
+        if x == 0 { return 0 }
+        i += 1
+    }
+    return @bitCast(i32, aLength -% bLength)
+}
+
+fn compareEntries(x: usize, y: usize) -> i32 { return compareNames(nameStart(x), nameLength(x), nameStart(y), nameLength(y)) }
+
+fn compareSorted(x: usize, y: usize, context: usize) -> i32 { return compareEntries(x, y) }
+
+// The names sorted by HarfBuzz's quicksort (which of the glyphs of a name
+// a search finds depends on it).
+fn sortedNames(a: *Cff) -> usize {
+    const s = m.atomicLoadWord(@intFromPtr(&a.*.names))
+    if s != 0 { return s }
+    const n = @intCast(usize, a.*.numGlyphs)
+    const made = m.alloc(n * 16 + 16)
+    var g: usize = 0
+    while g < n {
+        const sid = glyphToSid(a, @intCast(u32, g))
+        var start: usize = 0
+        var length: u32 = 0
+        sidString(a, sid, &start, &length)
+        m.putWord(made + g * 16, start)
+        m.put32(made + g * 16 + 8, length)
+        m.put32(made + g * 16 + 12, sid & 0xFFFF)
+        g += 1
+    }
+    sort.sort(made, n, 16, @intFromPtr(compareSorted), 0)
+    if !m.swapWord(@intFromPtr(&a.*.names), 0, made) { m.release(made) }
+    return m.atomicLoadWord(@intFromPtr(&a.*.names))
+}
+
+pub fn getGlyphFromName(fc: usize, name: usize, len_: i32, glyph: *u32) -> bool {
+    const a = accel(fc, false)
+    if a.*.valid == 0 || a.*.isCid != 0 { return false }
+    const length = if len_ < 0 { @intCast(u32, m.cLength(name)) } else { @intCast(u32, len_) }
+    if length == 0 { return false }
+    const names = sortedNames(a)
+    var lo: i64 = 0
+    var hi: i64 = @intCast(i64, a.*.numGlyphs) - 1
+    while lo <= hi {
+        const mid = @intCast(i64, (@intCast(u64, lo) + @intCast(u64, hi)) / 2)
+        const e = names + @intCast(usize, mid) * 16
+        const c = compareNames(name, length, nameStart(e), nameLength(e))
+        if c < 0 {
+            hi = mid - 1
+        } else if c > 0 {
+            lo = mid + 1
+        } else {
+            const sid = m.get32(e + 12)
+            const gid = sidToGlyph(a, sid)
+            if gid == 0 && sid != 0 { return false }
+            glyph.* = gid
+            return true
+        }
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// The charstring interpreter
+
+const Env = struct {
+    args: [513]f64
+    argCount: u32
+    argError: u32
+    // The charstring (or subroutine) being read: its bytes, length and
+    // place (past its length: an error).
+    start: usize
+    length: u32
+    offset: u32
+    callStart: [10]usize
+    callLength: [10]u32
+    callOffset: [10]u32
+    callCount: u32
+    callError: u32
+    endchar: u32
+    seenHintmask: u32
+    hstemCount: u32
+    vstemCount: u32
+    hintmaskSize: u32
+    x: f64
+    y: f64
+    globalSubrs: usize
+    globalCount: u32
+    globalBias: u32
+    localSubrs: usize
+    localCount: u32
+    localBias: u32
+    acc: usize
+    font: usize
+    inSeac: u32
+    cff2: u32
+    // CFF2's blends.
+    coords: usize
+    numCoords: u32
+    doBlend: u32
+    seenBlend: u32
+    seenVsindex: u32
+    ivs: u32
+    regionCount: u32
+    scalars: usize
+    scalarCount: u32
+}
+
+// What the charstring makes: extents (the bounds of the points, control
+// points too) or a path into a drawing session.
+const Param = struct {
+    mode: u32
+    pathOpen: u32
+    minX: f64
+    minY: f64
+    maxX: f64
+    maxY: f64
+    session: usize
+    xMultf: f32
+    yMultf: f32
+    hasDelta: u32
+    dx: f64
+    dy: f64
+}
+
+fn bias(count: u32) -> u32 { return if count < 1240 { 107 } else if count < 33900 { 1131 } else { 32768 } }
+
+fn initEnv(e: *Env, a: *Cff, f: usize, glyph: u32) -> void {
+    const t = &a.*.t
+    const cs: usize = if a.*.cff2 != 0 { 4 } else { 2 }
+    const fd = fdOf(a, glyph)
+    e.*.argCount = 0
+    e.*.argError = 0
+    indexItem(t, a.*.charStrings, cs, glyph, &e.*.start, &e.*.length)
+    e.*.offset = 0
+    e.*.callCount = 0
+    e.*.callError = 0
+    e.*.endchar = 0
+    e.*.seenHintmask = 0
+    e.*.hstemCount = 0
+    e.*.vstemCount = 0
+    e.*.hintmaskSize = 0
+    e.*.x = 0.0
+    e.*.y = 0.0
+    e.*.globalSubrs = a.*.globalSubrs
+    e.*.globalCount = indexCount(t, a.*.globalSubrs, cs)
+    e.*.globalBias = bias(e.*.globalCount)
+    e.*.localSubrs = 0
+    e.*.ivs = 0
+    if fd < a.*.fdCount {
+        e.*.localSubrs = m.getWord(a.*.privates + @intCast(usize, fd) * 16)
+        e.*.ivs = m.get32(a.*.privates + @intCast(usize, fd) * 16 + 8)
+    }
+    e.*.localCount = if e.*.localSubrs != 0 { indexCount(t, e.*.localSubrs, cs) } else { 0 }
+    e.*.localBias = bias(e.*.localCount)
+    e.*.acc = @intFromPtr(a)
+    e.*.font = f
+    e.*.inSeac = 0
+    e.*.cff2 = a.*.cff2
+    const fo = font.font(f)
+    e.*.coords = fo.*.coords
+    e.*.numCoords = fo.*.numCoords
+    e.*.doBlend = if e.*.numCoords != 0 && e.*.coords != 0 && a.*.varStoreSize != 0 { 1 } else { 0 }
+    e.*.seenBlend = 0
+    e.*.seenVsindex = 0
+    e.*.regionCount = 0
+    e.*.scalars = 0
+    e.*.scalarCount = 0
+}
+
+fn finiEnv(e: *Env) -> void {
+    if e.*.scalars != 0 { m.release(e.*.scalars) }
+}
+
+fn initParam(p: *Param, mode: u32, f: usize, session: usize) -> void {
+    p.*.mode = mode
+    p.*.pathOpen = 0
+    p.*.minX = 2147483647.0
+    p.*.minY = 2147483647.0
+    p.*.maxX = -2147483648.0
+    p.*.maxY = -2147483648.0
+    p.*.session = session
+    const fo = font.font(f)
+    p.*.xMultf = fo.*.xMultf
+    p.*.yMultf = fo.*.yMultf
+    p.*.hasDelta = 0
+    p.*.dx = 0.0
+    p.*.dy = 0.0
+}
+
+fn accOf(e: *Env) -> *Cff { return cffOf(e.*.acc) }
+
+fn setError(e: *Env) -> void { e.*.offset = e.*.length + 1 }
+
+fn inError(e: *Env) -> bool { return e.*.callError != 0 || e.*.offset > e.*.length || e.*.argError != 0 }
+
+fn avail(e: *Env, n: u32) -> bool { return @intCast(u64, e.*.offset) + @intCast(u64, n) <= @intCast(u64, e.*.length) }
+
+fn byteAt(e: *Env, i: u32) -> u32 {
+    if @intCast(u64, e.*.offset) + @intCast(u64, i) >= @intCast(u64, e.*.length) {
+        setError(e)
+        return 0
+    }
+    return @intCast(u32, m.get8(e.*.start + @intCast(usize, e.*.offset + i)))
+}
+
+fn skip(e: *Env, n: u32) -> void {
+    const o = @intCast(u64, e.*.offset) + @intCast(u64, n)
+    e.*.offset = if o > @intCast(u64, e.*.length) { e.*.length + 1 } else { @intCast(u32, o) }
+}
+
+fn push(e: *Env, v: f64) -> void {
+    if e.*.argCount < ARG_LIMIT {
+        e.*.args[@intCast(usize, e.*.argCount)] = v
+        e.*.argCount += 1
+    } else {
+        e.*.argError = 1
+    }
+}
+
+fn pop(e: *Env) -> f64 {
+    if e.*.argCount == 0 {
+        e.*.argError = 1
+        return 0.0
+    }
+    e.*.argCount -= 1
+    return e.*.args[@intCast(usize, e.*.argCount)]
+}
+
+fn popUint(e: *Env) -> u32 {
+    const i = m.intOf64(pop(e))
+    if i < 0 {
+        e.*.argError = 1
+        return 0
+    }
+    return @intCast(u32, i)
+}
+
+fn arg(e: *Env, i: u32) -> f64 {
+    if i >= e.*.argCount {
+        e.*.argError = 1
+        return 0.0
+    }
+    return e.*.args[@intCast(usize, i)]
+}
+
+fn fetchOp(e: *Env) -> u32 {
+    if avail(e, 1) {
+        var op = @intCast(u32, m.get8(e.*.start + @intCast(usize, e.*.offset)))
+        e.*.offset += 1
+        if op == 12 {
+            if !avail(e, 1) { return INVALID_OP }
+            op = ESC + @intCast(u32, m.get8(e.*.start + @intCast(usize, e.*.offset)))
+            e.*.offset += 1
+        }
+        return op
+    }
+    // (CFF2's charstrings end without endchar, its subroutines without
+    // return.)
+    if e.*.cff2 != 0 { return if e.*.callCount == 0 { 14 } else { 11 } }
+    return INVALID_OP
+}
+
+fn callSubr(e: *Env, global: bool) -> void {
+    const cs: usize = if e.*.cff2 != 0 { 4 } else { 2 }
+    const n = @intCast(i64, m.intOf64(pop(e))) + @intCast(i64, if global { e.*.globalBias } else { e.*.localBias })
+    const count = if global { e.*.globalCount } else { e.*.localCount }
+    if n < 0 || n >= @intCast(i64, count) || e.*.callCount >= CALL_LIMIT {
+        setError(e)
+        return
+    }
+    const k = @intCast(usize, e.*.callCount)
+    e.*.callStart[k] = e.*.start
+    e.*.callLength[k] = e.*.length
+    e.*.callOffset[k] = e.*.offset
+    e.*.callCount += 1
+    indexItem(&accOf(e).*.t, if global { e.*.globalSubrs } else { e.*.localSubrs }, cs, @intCast(u32, n), &e.*.start, &e.*.length)
+    e.*.offset = 0
+}
+
+fn returnFromSubr(e: *Env) -> void {
+    if e.*.callCount == 0 {
+        e.*.callError = 1
+        e.*.start = 0
+        e.*.length = 0
+        e.*.offset = 0
+        return
+    }
+    e.*.callCount -= 1
+    const k = @intCast(usize, e.*.callCount)
+    e.*.start = e.*.callStart[k]
+    e.*.length = e.*.callLength[k]
+    e.*.offset = e.*.callOffset[k]
+}
+
+// The path procedures: moving, a line and a curve, for extents or a path.
+
+fn update(p: *Param, x: f64, y: f64) -> void {
+    if x < p.*.minX { p.*.minX = x }
+    if x > p.*.maxX { p.*.maxX = x }
+    if y < p.*.minY { p.*.minY = y }
+    if y > p.*.maxY { p.*.maxY = y }
+}
+
+fn sx(p: *Param, x: f64) -> f32 { return @floatCast(f32, if p.*.hasDelta != 0 { x + p.*.dx } else { x }) * p.*.xMultf }
+fn sy(p: *Param, y: f64) -> f32 { return @floatCast(f32, if p.*.hasDelta != 0 { y + p.*.dy } else { y }) * p.*.yMultf }
+
+fn moveto(e: *Env, p: *Param, x: f64, y: f64) -> void {
+    if p.*.mode == EXTENTS {
+        p.*.pathOpen = 0
+    } else {
+        draw.sMoveTo(p.*.session, sx(p, x), sy(p, y))
+    }
+    e.*.x = x
+    e.*.y = y
+}
+
+fn line(e: *Env, p: *Param, x: f64, y: f64) -> void {
+    if p.*.mode == EXTENTS {
+        if p.*.pathOpen == 0 {
+            p.*.pathOpen = 1
+            update(p, e.*.x, e.*.y)
+        }
+        e.*.x = x
+        e.*.y = y
+        update(p, x, y)
+    } else {
+        draw.sLineTo(p.*.session, sx(p, x), sy(p, y))
+        e.*.x = x
+        e.*.y = y
+    }
+}
+
+fn curve(e: *Env, p: *Param, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> void {
+    if p.*.mode == EXTENTS {
+        if p.*.pathOpen == 0 {
+            p.*.pathOpen = 1
+            update(p, e.*.x, e.*.y)
+        }
+        update(p, x1, y1)
+        update(p, x2, y2)
+        e.*.x = x3
+        e.*.y = y3
+        update(p, x3, y3)
+    } else {
+        draw.sCubicTo(p.*.session, sx(p, x1), sy(p, y1), sx(p, x2), sy(p, y2), sx(p, x3), sy(p, y3))
+        e.*.x = x3
+        e.*.y = y3
+    }
+}
+
+fn rlineto(e: *Env, p: *Param) -> void {
+    var i: u32 = 0
+    while i + 2 <= e.*.argCount {
+        line(e, p, e.*.x + arg(e, i), e.*.y + arg(e, i + 1))
+        i += 2
+    }
+}
+
+// hlineto (`vertical` false) and vlineto: lines alternately horizontal and
+// vertical.
+fn hvlineto(e: *Env, p: *Param, vertical: bool) -> void {
+    var i: u32 = 0
+    while i + 2 <= e.*.argCount {
+        if vertical {
+            const y = e.*.y + arg(e, i)
+            const x = e.*.x
+            line(e, p, x, y)
+            line(e, p, x + arg(e, i + 1), y)
+        } else {
+            const x = e.*.x + arg(e, i)
+            const y = e.*.y
+            line(e, p, x, y)
+            line(e, p, x, y + arg(e, i + 1))
+        }
+        i += 2
+    }
+    if i < e.*.argCount {
+        if vertical {
+            line(e, p, e.*.x, e.*.y + arg(e, i))
+        } else {
+            line(e, p, e.*.x + arg(e, i), e.*.y)
+        }
+    }
+}
+
+fn rrcurve(e: *Env, p: *Param, i: u32) -> void {
+    const x1 = e.*.x + arg(e, i)
+    const y1 = e.*.y + arg(e, i + 1)
+    const x2 = x1 + arg(e, i + 2)
+    const y2 = y1 + arg(e, i + 3)
+    curve(e, p, x1, y1, x2, y2, x2 + arg(e, i + 4), y2 + arg(e, i + 5))
+}
+
+fn rrcurveto(e: *Env, p: *Param) -> void {
+    var i: u32 = 0
+    while i + 6 <= e.*.argCount {
+        rrcurve(e, p, i)
+        i += 6
+    }
+}
+
+fn rcurveline(e: *Env, p: *Param) -> void {
+    const count = e.*.argCount
+    if count < 8 { return }
+    var i: u32 = 0
+    const limit = count - 2
+    while i + 6 <= limit {
+        rrcurve(e, p, i)
+        i += 6
+    }
+    line(e, p, e.*.x + arg(e, i), e.*.y + arg(e, i + 1))
+}
+
+fn rlinecurve(e: *Env, p: *Param) -> void {
+    const count = e.*.argCount
+    if count < 8 { return }
+    var i: u32 = 0
+    const limit = count - 6
+    while i + 2 <= limit {
+        line(e, p, e.*.x + arg(e, i), e.*.y + arg(e, i + 1))
+        i += 2
+    }
+    rrcurve(e, p, i)
+}
+
+// vvcurveto (`horizontal` false) and hhcurveto.
+fn sameCurveto(e: *Env, p: *Param, horizontal: bool) -> void {
+    var i: u32 = 0
+    var x1 = e.*.x
+    var y1 = e.*.y
+    if (e.*.argCount & 1) != 0 {
+        if horizontal { y1 = y1 + arg(e, 0) } else { x1 = x1 + arg(e, 0) }
+        i = 1
+    }
+    while i + 4 <= e.*.argCount {
+        if horizontal { x1 = x1 + arg(e, i) } else { y1 = y1 + arg(e, i) }
+        const x2 = x1 + arg(e, i + 1)
+        const y2 = y1 + arg(e, i + 2)
+        if horizontal {
+            curve(e, p, x1, y1, x2, y2, x2 + arg(e, i + 3), y2)
+        } else {
+            curve(e, p, x1, y1, x2, y2, x2, y2 + arg(e, i + 3))
+        }
+        x1 = e.*.x
+        y1 = e.*.y
+        i += 4
+    }
+}
+
+// vhcurveto (`hv` false) and hvcurveto: curves starting alternately
+// vertical and horizontal.
+fn altCurveto(e: *Env, p: *Param, hv: bool) -> void {
+    const count = e.*.argCount
+    var i: u32 = 0
+    var x1: f64 = 0.0
+    var y1: f64 = 0.0
+    var x2: f64 = 0.0
+    var y2: f64 = 0.0
+    var x3: f64 = 0.0
+    var y3: f64 = 0.0
+    // Whether the next curve starts horizontal.
+    const h = hv
+    if (count % 8) >= 4 {
+        x1 = e.*.x
+        y1 = e.*.y
+        if h { x1 = x1 + arg(e, 0) } else { y1 = y1 + arg(e, 0) }
+        x2 = x1 + arg(e, 1)
+        y2 = y1 + arg(e, 2)
+        x3 = x2
+        y3 = y2
+        if h { y3 = y3 + arg(e, 3) } else { x3 = x3 + arg(e, 3) }
+        i = 4
+        while i + 8 <= count {
+            curve(e, p, x1, y1, x2, y2, x3, y3)
+            x1 = e.*.x
+            y1 = e.*.y
+            if h { y1 = y1 + arg(e, i) } else { x1 = x1 + arg(e, i) }
+            x2 = x1 + arg(e, i + 1)
+            y2 = y1 + arg(e, i + 2)
+            x3 = x2
+            y3 = y2
+            if h { x3 = x3 + arg(e, i + 3) } else { y3 = y3 + arg(e, i + 3) }
+            curve(e, p, x1, y1, x2, y2, x3, y3)
+            x1 = x3
+            y1 = y3
+            if h { x1 = x1 + arg(e, i + 4) } else { y1 = y1 + arg(e, i + 4) }
+            x2 = x1 + arg(e, i + 5)
+            y2 = y1 + arg(e, i + 6)
+            x3 = x2
+            y3 = y2
+            if h { y3 = y3 + arg(e, i + 7) } else { x3 = x3 + arg(e, i + 7) }
+            i += 8
+        }
+        if i < count {
+            if h { x3 = x3 + arg(e, i) } else { y3 = y3 + arg(e, i) }
+        }
+        curve(e, p, x1, y1, x2, y2, x3, y3)
+    } else {
+        while i + 8 <= count {
+            x1 = e.*.x
+            y1 = e.*.y
+            if h { x1 = x1 + arg(e, i) } else { y1 = y1 + arg(e, i) }
+            x2 = x1 + arg(e, i + 1)
+            y2 = y1 + arg(e, i + 2)
+            x3 = x2
+            y3 = y2
+            if h { y3 = y3 + arg(e, i + 3) } else { x3 = x3 + arg(e, i + 3) }
+            curve(e, p, x1, y1, x2, y2, x3, y3)
+            x1 = x3
+            y1 = y3
+            if h { y1 = y1 + arg(e, i + 4) } else { x1 = x1 + arg(e, i + 4) }
+            x2 = x1 + arg(e, i + 5)
+            y2 = y1 + arg(e, i + 6)
+            x3 = x2
+            y3 = y2
+            if h { x3 = x3 + arg(e, i + 7) } else { y3 = y3 + arg(e, i + 7) }
+            if count - i < 16 && (count & 1) != 0 {
+                if h { y3 = y3 + arg(e, i + 8) } else { x3 = x3 + arg(e, i + 8) }
+            }
+            curve(e, p, x1, y1, x2, y2, x3, y3)
+            i += 8
+        }
+    }
+}
+
+fn fabs(x: f64) -> f64 { return if x < 0.0 { 0.0 - x } else { x } }
+
+// hflex, flex, hflex1 and flex1 (operators 34 to 37 after the escape).
+fn flexes(e: *Env, p: *Param, which: u32) -> void {
+    const count = e.*.argCount
+    const needed: u32 = if which == 34 { 7 } else if which == 35 { 13 } else if which == 36 { 9 } else { 11 }
+    if count != needed {
+        setError(e)
+        return
+    }
+    var x1: f64 = 0.0
+    var y1: f64 = 0.0
+    var x2: f64 = 0.0
+    var y2: f64 = 0.0
+    var x3: f64 = 0.0
+    var y3: f64 = 0.0
+    var x4: f64 = 0.0
+    var y4: f64 = 0.0
+    var x5: f64 = 0.0
+    var y5: f64 = 0.0
+    var x6: f64 = 0.0
+    var y6: f64 = 0.0
+    if which == 34 {
+        x1 = e.*.x + arg(e, 0)
+        y1 = e.*.y
+        x2 = x1 + arg(e, 1)
+        y2 = y1 + arg(e, 2)
+        x3 = x2 + arg(e, 3)
+        y3 = y2
+        x4 = x3 + arg(e, 4)
+        y4 = y3
+        x5 = x4 + arg(e, 5)
+        y5 = y1
+        x6 = x5 + arg(e, 6)
+        y6 = y5
+    } else if which == 35 {
+        x1 = e.*.x + arg(e, 0)
+        y1 = e.*.y + arg(e, 1)
+        x2 = x1 + arg(e, 2)
+        y2 = y1 + arg(e, 3)
+        x3 = x2 + arg(e, 4)
+        y3 = y2 + arg(e, 5)
+        x4 = x3 + arg(e, 6)
+        y4 = y3 + arg(e, 7)
+        x5 = x4 + arg(e, 8)
+        y5 = y4 + arg(e, 9)
+        x6 = x5 + arg(e, 10)
+        y6 = y5 + arg(e, 11)
+    } else if which == 36 {
+        x1 = e.*.x + arg(e, 0)
+        y1 = e.*.y + arg(e, 1)
+        x2 = x1 + arg(e, 2)
+        y2 = y1 + arg(e, 3)
+        x3 = x2 + arg(e, 4)
+        y3 = y2
+        x4 = x3 + arg(e, 5)
+        y4 = y3
+        x5 = x4 + arg(e, 6)
+        y5 = y4 + arg(e, 7)
+        x6 = x5 + arg(e, 8)
+        y6 = e.*.y
+    } else {
+        var dx: f64 = 0.0
+        var dy: f64 = 0.0
+        var k: u32 = 0
+        while k < 10 {
+            dx = dx + arg(e, k)
+            dy = dy + arg(e, k + 1)
+            k += 2
+        }
+        x1 = e.*.x + arg(e, 0)
+        y1 = e.*.y + arg(e, 1)
+        x2 = x1 + arg(e, 2)
+        y2 = y1 + arg(e, 3)
+        x3 = x2 + arg(e, 4)
+        y3 = y2 + arg(e, 5)
+        x4 = x3 + arg(e, 6)
+        y4 = y3 + arg(e, 7)
+        x5 = x4 + arg(e, 8)
+        y5 = y4 + arg(e, 9)
+        if fabs(dx) > fabs(dy) {
+            x6 = x5 + arg(e, 10)
+            y6 = e.*.y
+        } else {
+            x6 = e.*.x
+            y6 = y5 + arg(e, 10)
+        }
+    }
+    curve(e, p, x1, y1, x2, y2, x3, y3)
+    curve(e, p, x4, y4, x5, y5, x6, y6)
+}
+
+// The operands of charstrings (opset_t::process_op); any other operator
+// is an error.
+fn number(e: *Env, op: u32) -> void {
+    if op == 28 {
+        const v = (byteAt(e, 0) << 8) | byteAt(e, 1)
+        push(e, @floatFromInt(f64, @intCast(i32, @bitCast(i16, @intCast(u16, v)))))
+        skip(e, 2)
+    } else if op >= 247 && op <= 250 {
+        push(e, @floatFromInt(f64, @intCast(i32, (op - 247) * 256 + byteAt(e, 0) + 108)))
+        skip(e, 1)
+    } else if op >= 251 && op <= 254 {
+        push(e, @floatFromInt(f64, 0 - @intCast(i32, (op - 251) * 256 + byteAt(e, 0) + 108)))
+        skip(e, 1)
+    } else if op >= 32 && op <= 246 {
+        push(e, @floatFromInt(f64, @intCast(i32, op) - 139))
+    } else {
+        e.*.argCount = 0
+        setError(e)
+    }
+}
+
+// CFF2's blend: the n values before the deltas get the deltas of the
+// regions times the regions' scalars at the font's coordinates.
+fn blend(e: *Env) -> void {
+    if e.*.seenBlend == 0 {
+        const a = accOf(e)
+        const t = &a.*.t
+        const d = varData(a, e.*.ivs)
+        e.*.regionCount = if d != 0 { m.u16at(t, d + 4) } else { 0 }
+        if e.*.doBlend != 0 {
+            e.*.scalars = m.alloc(@intCast(usize, e.*.regionCount) * 4 + 4)
+            e.*.scalarCount = e.*.regionCount
+            const regions = @intCast(usize, m.u32at(t, a.*.varStore + 2))
+            var i: u32 = 0
+            while i < e.*.regionCount {
+                var s: f32 = 0.0
+                if regions != 0 {
+                    s = variations.regionScalar(t, a.*.varStore + regions, m.u16at(t, d + 6 + @intCast(usize, i) * 2), e.*.coords, e.*.numCoords)
+                }
+                m.putF32(e.*.scalars + @intCast(usize, i) * 4, s)
+                i += 1
+            }
+        }
+        e.*.seenBlend = 1
+    }
+    const k = e.*.regionCount
+    const n = popUint(e)
+    const start = e.*.argCount -% (k +% 1) *% n
+    if start > e.*.argCount {
+        setError(e)
+        return
+    }
+    var i: u32 = 0
+    while i < n {
+        var v: f64 = 0.0
+        if e.*.doBlend != 0 && e.*.scalarCount == k {
+            const base = start + n + i * k
+            var j: u32 = 0
+            while j < k {
+                v = v + @floatCast(f64, m.getF32(e.*.scalars + @intCast(usize, j) * 4)) * e.*.args[@intCast(usize, base + j)]
+                j += 1
+            }
+        }
+        const at = @intCast(usize, start + i)
+        e.*.args[at] = e.*.args[at] + v
+        i += 1
+    }
+    const drop = k *% n
+    if e.*.argCount >= drop { e.*.argCount -= drop } else { e.*.argError = 1 }
+}
+
+fn vsindex(e: *Env) -> void {
+    const index = popUint(e)
+    if e.*.seenVsindex != 0 || e.*.seenBlend != 0 {
+        setError(e)
+    } else {
+        e.*.ivs = index
+    }
+    e.*.seenVsindex = 1
+    e.*.argCount = 0
+}
+
+fn seac(e: *Env, p: *Param) -> void {
+    const a = accOf(e)
+    const n = e.*.argCount
+    const adx = e.*.args[@intCast(usize, n - 4)]
+    const ady = e.*.args[@intCast(usize, n - 3)]
+    const base = stdCodeToGlyph(a, @bitCast(u32, m.intOf64(e.*.args[@intCast(usize, n - 2)])))
+    const accent = stdCodeToGlyph(a, @bitCast(u32, m.intOf64(e.*.args[@intCast(usize, n - 1)])))
+    if p.*.mode == EXTENTS {
+        var b: Param = undefined
+        var c: Param = undefined
+        if e.*.inSeac == 0 && base != 0 && accent != 0 && bounds(a, e.*.font, base, true, &b) && bounds(a, e.*.font, accent, true, &c) {
+            merge(p, &b)
+            if !empty(&c) {
+                c.minX = c.minX + adx
+                c.minY = c.minY + ady
+                c.maxX = c.maxX + adx
+                c.maxY = c.maxY + ady
+            }
+            merge(p, &c)
+        } else {
+            setError(e)
+        }
+    } else {
+        draw.sClosePath(p.*.session)
+        if !(e.*.inSeac == 0 && base != 0 && accent != 0 && path(a, e.*.font, base, p.*.session, true, false, 0.0, 0.0) && path(a, e.*.font, accent, p.*.session, true, true, adx, ady)) {
+            setError(e)
+        }
+    }
+}
+
+fn empty(p: *Param) -> bool { return p.*.minX >= p.*.maxX || p.*.minY >= p.*.maxY }
+
+fn merge(p: *Param, b: *Param) -> void {
+    if empty(p) {
+        p.*.minX = b.*.minX
+        p.*.minY = b.*.minY
+        p.*.maxX = b.*.maxX
+        p.*.maxY = b.*.maxY
+    } else if !empty(b) {
+        if b.*.minX < p.*.minX { p.*.minX = b.*.minX }
+        if b.*.maxX > p.*.maxX { p.*.maxX = b.*.maxX }
+        if b.*.minY < p.*.minY { p.*.minY = b.*.minY }
+        if b.*.maxY > p.*.maxY { p.*.maxY = b.*.maxY }
+    }
+}
+
+fn processOp(e: *Env, p: *Param, op: u32) -> void {
+    if op == 11 {
+        returnFromSubr(e)
+    } else if op == 14 {
+        if e.*.cff2 == 0 && e.*.argCount >= 4 { seac(e, p) }
+        e.*.argCount = 0
+        e.*.endchar = 1
+    } else if op == 255 {
+        if avail(e, 4) {
+            const v = (byteAt(e, 0) << 24) | (byteAt(e, 1) << 16) | (byteAt(e, 2) << 8) | byteAt(e, 3)
+            push(e, @floatFromInt(f64, @bitCast(i32, v)) / 65536.0)
+            skip(e, 4)
+        }
+    } else if op == 10 {
+        callSubr(e, false)
+    } else if op == 29 {
+        callSubr(e, true)
+    } else if op == 1 || op == 18 {
+        e.*.hstemCount += e.*.argCount / 2
+        e.*.argCount = 0
+    } else if op == 3 || op == 23 {
+        e.*.vstemCount += e.*.argCount / 2
+        e.*.argCount = 0
+    } else if op == 19 || op == 20 {
+        if e.*.seenHintmask == 0 {
+            e.*.vstemCount += e.*.argCount / 2
+            e.*.hintmaskSize = (e.*.hstemCount + e.*.vstemCount + 7) >> 3
+            e.*.seenHintmask = 1
+        }
+        if avail(e, e.*.hintmaskSize) {
+            e.*.argCount = 0
+            skip(e, e.*.hintmaskSize)
+        }
+    } else if op == 21 {
+        const dy = pop(e)
+        const dx = pop(e)
+        moveto(e, p, e.*.x + dx, e.*.y + dy)
+        e.*.argCount = 0
+    } else if op == 22 {
+        moveto(e, p, e.*.x + pop(e), e.*.y)
+        e.*.argCount = 0
+    } else if op == 4 {
+        moveto(e, p, e.*.x, e.*.y + pop(e))
+        e.*.argCount = 0
+    } else if op == 5 {
+        rlineto(e, p)
+        e.*.argCount = 0
+    } else if op == 6 || op == 7 {
+        hvlineto(e, p, op == 7)
+        e.*.argCount = 0
+    } else if op == 8 {
+        rrcurveto(e, p)
+        e.*.argCount = 0
+    } else if op == 24 {
+        rcurveline(e, p)
+        e.*.argCount = 0
+    } else if op == 25 {
+        rlinecurve(e, p)
+        e.*.argCount = 0
+    } else if op == 26 || op == 27 {
+        sameCurveto(e, p, op == 27)
+        e.*.argCount = 0
+    } else if op == 30 || op == 31 {
+        altCurveto(e, p, op == 31)
+        e.*.argCount = 0
+    } else if op >= ESC + 34 && op <= ESC + 37 {
+        flexes(e, p, op - ESC)
+        e.*.argCount = 0
+    } else if op == ESC + 0 && e.*.cff2 == 0 {
+        e.*.argCount = 0
+    } else if op == 16 && e.*.cff2 != 0 {
+        blend(e)
+    } else if op == 15 && e.*.cff2 != 0 {
+        vsindex(e)
+    } else {
+        number(e, op)
+    }
+}
+
+fn interpret(e: *Env, p: *Param) -> bool {
+    e.*.endchar = 0
+    var ops = MAX_OPS
+    while true {
+        processOp(e, p, fetchOp(e))
+        ops -= 1
+        if inError(e) || ops == 0 {
+            setError(e)
+            return false
+        }
+        if e.*.endchar != 0 { break }
+    }
+    return true
+}
+
+// The bounds of `glyph` (_get_bounds of CFF, the extents of CFF2).
+fn bounds(a: *Cff, f: usize, glyph: u32, inSeac: bool, p: *Param) -> bool {
+    initParam(p, EXTENTS, f, 0)
+    if a.*.valid == 0 || glyph >= a.*.numGlyphs { return false }
+    // (The interpreter's state on the heap: a large local would take its
+    // bytes of the call's aggregate arena at every glyph.)
+    const made = m.alloc(@sizeOf(Env))
+    if made == 0 { return false }
+    const e = envOf(made)
+    initEnv(e, a, f, glyph)
+    e.*.inSeac = if inSeac { 1 } else { 0 }
+    const ok = interpret(e, p)
+    finiEnv(e)
+    m.release(made)
+    return ok
+}
+
+// Draws `glyph` into the session, moved by (dx, dy) if `moved` (_get_path
+// of CFF, get_path of CFF2).
+fn path(a: *Cff, f: usize, glyph: u32, session: usize, inSeac: bool, moved: bool, dx: f64, dy: f64) -> bool {
+    if a.*.valid == 0 || glyph >= a.*.numGlyphs { return false }
+    var p: Param = undefined
+    initParam(&p, PATH, f, session)
+    if moved {
+        p.hasDelta = 1
+        p.dx = dx
+        p.dy = dy
+    }
+    const made = m.alloc(@sizeOf(Env))
+    if made == 0 { return false }
+    const e = envOf(made)
+    initEnv(e, a, f, glyph)
+    e.*.inSeac = if inSeac { 1 } else { 0 }
+    const ok = interpret(e, &p)
+    finiEnv(e)
+    m.release(made)
+    if !ok { return false }
+    if a.*.cff2 == 0 { draw.sClosePath(session) }
+    return true
+}
+
+fn extents(f: usize, a: *Cff, glyph: u32, out: usize) -> bool {
+    var p: Param = undefined
+    if !bounds(a, f, glyph, false, &p) { return false }
+    if p.minX >= p.maxX {
+        m.putI32(out, 0)
+        m.putI32(out + 8, 0)
+    } else {
+        const xb = m.intOf(m.roundf(@floatCast(f32, p.minX)))
+        m.putI32(out, xb)
+        m.putI32(out + 8, m.intOf(m.roundf(@floatCast(f32, p.maxX - @floatFromInt(f64, xb)))))
+    }
+    if p.minY >= p.maxY {
+        m.putI32(out + 4, 0)
+        m.putI32(out + 12, 0)
+    } else {
+        const yb = m.intOf(m.roundf(@floatCast(f32, p.maxY)))
+        m.putI32(out + 4, yb)
+        m.putI32(out + 12, m.intOf(m.roundf(@floatCast(f32, p.minY - @floatFromInt(f64, yb)))))
+    }
+    font.scaleGlyphExtents(f, out)
+    return true
+}
+
+// The extents of `glyph` from CFF, scaled to the font: whether CFF has it.
+pub fn getExtents(f: usize, glyph: u32, e: usize) -> bool { return extents(f, accel(font.font(f).*.face, false), glyph, e) }
+
+// The same from CFF2, at the font's coordinates.
+pub fn getExtents2(f: usize, glyph: u32, e: usize) -> bool { return extents(f, accel(font.font(f).*.face, true), glyph, e) }
+
+// Draws `glyph` from CFF into the session: whether CFF has it.
+pub fn getPath(f: usize, glyph: u32, session: usize) -> bool { return path(accel(font.font(f).*.face, false), f, glyph, session, false, false, 0.0, 0.0) }
+
+// The same from CFF2.
+pub fn getPath2(f: usize, glyph: u32, session: usize) -> bool { return path(accel(font.font(f).*.face, true), f, glyph, session, false, false, 0.0, 0.0) }
