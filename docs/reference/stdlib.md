@@ -876,7 +876,8 @@ pub fn main() -> u8 {
 ## math (`std.math`)
 
 **Implementation:** `std/src/math.mlx`
-**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`
+**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`,
+`350_math_helpers_runtime.mlx`
 
 Floating-point math in Mlx on the doubles' bits, without libm. Import it as
 `@import("std.math")`; it imports nothing itself, so a `--plugin` library
@@ -886,7 +887,16 @@ can use it too.
   `infinity()`, `negativeInfinity()`, `nan()`, `isNan(x)`, `abs(x)`.
 - Whole numbers: `floor`, `ceil`, `trunc` are the builtins `@floor`,
   `@ceil`, `@trunc` (one instruction); `round(x)` rounds halves away from
-  zero. The square root is `@sqrt`.
+  zero.
+- `min(a, b)`, `max(a, b)`, `clamp(x, low, high)` and `absolute(x)` on
+  `f64`, and `minOf`, `maxOf`, `clampOf`, `absoluteOf` for any number type
+  named first (`math.minOf(u32, version, 4)`); an `anytype` parameter
+  would take a literal's type from the literal, so the type is given.
+  `sqrt(x)` is `@sqrt` but 0 from 0 down (NaN stays NaN), what lengths
+  want; `smoothstep(from, to, x)` is 0 up to `from`, 1 from `to` on and
+  3t² − 2t³ between. The splash, MLX Observatory, `std.ui.vector`, the
+  compositor and the Android runtime use these instead of copies of
+  their own.
 - `sin(x)`, `cos(x)`: argument reduction by pi/2 in three parts, then
   fdlibm's minimax kernels; within an ulp of the exact value for |x| up to
   about 2^20 pi, 0 past 2^52 (NaN for the infinities and NaN).
@@ -911,6 +921,129 @@ pub fn main() -> u8 {
 ```
 
 (`tests/325_standard_math_runtime.mlx`)
+
+## Encodings (`std.base64`)
+
+**Implementation:** `std/src/base64.mlx`
+**Source tests:** `347_base64_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The encodings of RFC 4648 — `Encoding.base64`, `base64url`, `base32`,
+`base32hex` and `base16` — without allocating: the caller sizes the
+output with `encodedLength(encoding, length, padded)` and
+`decodedLength(encoding, length)`. `encode(encoding, bytes, out, padded)`
+and `decode(encoding, text, out, ignoreGarbage)` work in one call; an
+`Encoder` (`encoderInit`, `encodeUpdate`, `encodeFinal`) and a `Decoder`
+(`decoderInit`, `decodeUpdate`) take the data in pieces and keep the bits
+of an unfinished symbol or byte between them. Decoding skips line breaks,
+spaces and tabs, stops at the padding, and refuses (or, with
+`ignoreGarbage`, skips) bytes outside the alphabet. `hexEncode` writes
+lower-case hex, the way digests are printed, and `hexDecode` reads hex
+of either case. The coreutils `base64`, `base32` and `basenc` and GLib's
+`g_base64_*` (`compiler/capi/glib/strings.mlx`) use it.
+
+```mlx
+const base64 = @import("std.base64")
+
+pub fn main() -> u8 {
+    var out: [8]u8 = undefined
+    const bytes: [*]u8 = &out
+    const count = base64.encode(base64.Encoding.base64, "foo", bytes, true)   // "Zm9v"
+    const back = base64.decode(base64.Encoding.base64, bytes[0..count], bytes, false)
+    return if back.ok && back.length == 3 { 13 } else { 1 }
+}
+```
+
+## Digests (`std.md5`, `std.blake2`, `std.sha1`, `std.sha2`)
+
+**Implementation:** `std/src/md5.mlx`, `std/src/blake2.mlx`,
+`std/src/sha1.mlx`, `std/src/sha2.mlx`
+**Source tests:** `348_md5_blake2_runtime.mlx`, `349_sha2_runtime.mlx`
+(run by `tests/run_std_modules.sh`); `tools/check_wifi.sh` for SHA-1's
+HMAC and PBKDF2
+
+Each digest has a state that takes the message in pieces (`…Init`,
+`…Update`, `…Final`, which wipes the state) and a one-call function;
+`std.base64.hexEncode` prints a digest the way the `…sum` tools do.
+
+- `std.md5`: `Md5`, `md5Init`, `md5Update`, `md5Final(&state, *[16]u8)`,
+  `md5(bytes, *[16]u8)` and `md5Hex(bytes, *[32]u8)` (RFC 1321; for the
+  formats that still use it, not for security). md5sum, the thumbnail
+  cache's file names (`projects/desktop/shared/thumbs.mlx`) and GLib's
+  `GChecksum` use it.
+- `std.blake2`: BLAKE2b (RFC 7693) with digests of 1 to 64 bytes, keyed
+  with up to 64 bytes or not: `Blake2b`, `blake2bInit(&state, length,
+  key)`, `blake2bUpdate`, `blake2bFinal(&state, out)`, `blake2b(bytes,
+  *[64]u8)` (512 bits, unkeyed, what b2sum prints) and
+  `blake2bWith(bytes, key, out, length)`.
+- `std.sha1`: SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1 (what WPA2 needs).
+- `std.sha2`: SHA-256 and SHA-512 (`Sha256`, `Sha512`, `sha256Init`,
+  `sha256Update`, `sha256Final`, `sha256`, and the same for 512), SHA-224
+  and SHA-384 on the same states from their own initial words
+  (`sha224Init` and `sha224Final(&state, *[28]u8)` on a `Sha256`,
+  `sha384Init` and `sha384Final(&state, *[48]u8)` on a `Sha512`;
+  `sha224`, `sha384` in one call), HMAC-SHA256 and PBKDF2-HMAC-SHA256.
+
+```mlx
+const md5 = @import("std.md5")
+const blake2 = @import("std.blake2")
+
+pub fn main() -> u8 {
+    var text: [32]u8 = undefined
+    md5.md5Hex("abc", &text)                  // 900150983cd24fb0d6963f7d28e17f72
+    var digest: [64]u8 = undefined
+    blake2.blake2b("abc", &digest)            // ba80a53f...
+    return if text[0] == 57 && digest[0] == 186 { 13 } else { 1 }
+}
+```
+
+## Random numbers (`std.random`)
+
+**Implementation:** `std/src/random.mlx`
+**Source tests:** `351_random_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+- From the kernel (getrandom(2)): `fill(into, length)` (false only on a
+  kernel without getrandom), `random64()` and `random32()` (mixed from the
+  monotonic clock if the kernel gives nothing, so they never fail), and
+  `getrandom(into, length, flags)` as the kernel answers it. Keys,
+  nonces and ids come from these: mlx-netd's DHCP transaction ids and
+  WPA nonces, MLXIPC's bus id, libpipewire's `pw_getrandom`/`pw_random`
+  and shuf without `--random-source`.
+- Seeded, for numbers that repeat with their seed: `Xoshiro256`
+  (xoshiro256**, its 256-bit state filled from the seed by splitmix64)
+  with `seed(&g, value)`, `seedFromKernel(&g)`, `next(&g)`,
+  `below(&g, bound)` (unbiased) and `unit(&g)` (a double in [0, 1));
+  `splitmix64(&state)` itself; and `Xorshift64Star` (Marsaglia's
+  xorshift64*) with `xorshift64StarNext` and `xorshift64StarUnit`, the
+  sequence the boot splash draws its stars from. None of these is for
+  secrets.
+
+```mlx
+const random = @import("std.random")
+
+pub fn main() -> u8 {
+    var generator: random.Xoshiro256 = undefined
+    random.seed(&generator, 42)
+    const roll = random.below(&generator, 6)       // 0 to 5, the same for seed 42
+    var key: [16]u8 = undefined
+    if !random.fill(&key, 16) { return 1 }
+    return if roll < 6 { 13 } else { 2 }
+}
+```
+
+## Terminals (`std.terminal.tty`)
+
+**Implementation:** `std/src/terminal/tty.mlx`
+**Source tests:** `352_terminal_tty_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The terminal a program runs on, on Linux: `isTerminal(descriptor)`;
+`windowSize(descriptor, &size)`, `columns(descriptor)` and
+`rows(descriptor)` (0 when unknown); the modes as a `Termios`
+(`getAttributes`, `setAttributes`) and `makeRaw(&cooked, &raw)` for a line
+editor (no echo, no canonical input, no signals from keys, no CR
+translation or flow control, reads of one byte); and job control:
+`foregroundGroup`, `setForegroundGroup`, `setProcessGroup` and
+`processGroup`. mlx-sh's line editor and job control and ls's column
+width use it; the test runs it on a pseudo-terminal of its own.
 
 ## fmt
 

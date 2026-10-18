@@ -21,8 +21,17 @@ name and are not re-exported from `std.mlx`.
 `netlink.mlx` (`std.netlink`) speaks netlink: route netlink (links, IPv4
 addresses, routes and their change groups) and generic netlink (families
 looked up by name, as nl80211).
-`sha2.mlx` (`std.sha2`) has SHA-256, SHA-512, HMAC-SHA256 and
-PBKDF2-HMAC-SHA256.
+`sha2.mlx` (`std.sha2`) has SHA-224, SHA-256, SHA-384, SHA-512,
+HMAC-SHA256 and PBKDF2-HMAC-SHA256.
+`base64.mlx` (`std.base64`) has RFC 4648's base64, base64url, base32,
+base32hex and base16, in one call or in pieces, and lower-case hex.
+`md5.mlx` (`std.md5`) has MD5 and `blake2.mlx` (`std.blake2`) BLAKE2b,
+keyed or not, of any digest length up to 64 bytes.
+`random.mlx` (`std.random`) has the kernel's random bytes (getrandom)
+and seeded generators: xoshiro256** and, by name, xorshift64*.
+`terminal/tty.mlx` (`std.terminal.tty`) is the terminal a program runs
+on: whether a descriptor is one, its size, raw mode and the foreground
+process group.
 `sha1.mlx` (`std.sha1`) has SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, and
 `aes.mlx` (`std.aes`) AES-128 on blocks and the RFC 3394 key wrap: what
 WPA2 needs (`tools/check_wifi.sh`).

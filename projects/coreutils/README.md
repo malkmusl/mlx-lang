@@ -2,12 +2,17 @@
 
 Dependency-free Linux userland programs written in MLX. Each utility lives in
 its own directory and imports only the MLX standard library plus the shared
-modules next to it: the CLI diagnostic helpers in `common.mlx`, the digests in
-`checksum.mlx`, and the base encodings in `codec.mlx`. Path manipulation and
-canonicalization, chmod-style mode parsing, sized-number/duration parsing,
-POSIX-ish word splitting, and calendar/timestamp parsing were generalized out
-of these examples into `std.path`, `std.mode`, `std.parse`, `std.shell`, and
-`std.calendar` respectively, so other MLX programs can reuse them too.
+modules next to it: the CLI diagnostic helpers in `common.mlx`, the digest
+tools' shared program in `digest_cli.mlx` (md5sum, sha1sum, sha224sum,
+sha256sum, sha384sum, sha512sum and b2sum are each a call to it, and cksum
+takes its digests from it), and base2 and line wrapping for the base
+encodings in `codec.mlx`. Path manipulation and canonicalization,
+chmod-style mode parsing, sized-number/duration parsing, POSIX-ish word
+splitting, calendar/timestamp parsing, the digests (MD5, SHA-1, SHA-2,
+BLAKE2b) and RFC 4648's encodings were generalized out of these examples
+into `std.path`, `std.mode`, `std.parse`, `std.shell`, `std.calendar`,
+`std.md5`, `std.sha1`, `std.sha2`, `std.blake2` and `std.base64`
+respectively, so other MLX programs can reuse them too.
 
 Every utility calls `std.crash.install()` first thing in `main`, as the
 desktop programs do: a crash (a failed runtime check, a bad pointer, a stack
