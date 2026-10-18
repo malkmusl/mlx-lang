@@ -12,6 +12,24 @@ int MNearly::nearly() const { return 1; }
 void MNearly::other() {}
 MPrim::MPrim(int p) : MBase(p * 3), prim(p) {}
 int MPrim::nearly() const { return prim; }
+MV::MV() : v(1) {}
+int MV::f() const { return v; }
+int MV::g() const { return v; }
+MV::~MV() {}
+ML::ML() : l(2) {}
+int ML::f() const { return l; }
+int ML::h() const { return l; }
+MR::MR() : r(3) {}
+int MR::g() const { return r; }
+int MR::k() const { return r; }
+MJ::MJ() : j(4) {}
+int MJ::h() const { return j; }
+MX::MX() : x(5) {}
+long MX::ex() const { return x; }
+MX::~MX() {}
+MK::MK() : kk(6) { v = 10; l = 20; r = 30; j = 40; x = 50; }
+int MK::f() const { return kk; }
+long MK::ex() const { return kk; }
 MFar::MFar(int f) : MBase(f), MBoth(f + 1, f + 2, f + 3, f + 4), far(f + 5) { extra[0] = 'm'; }
 
 int main() {
@@ -48,6 +66,13 @@ int main() {
     MPrim prim(4);
     GPrim *gprim = gMakePrim(6);
     printf("prim: %ld sizes %zu %zu, theirs %d %d\n", gReadPrim(&prim), sizeof(MPrim), sizeof(GPrim), gprim->base, gprim->prim);
+    // Virtual functions over the virtual bases.
+    MK mk;
+    const MR *mr = &mk;
+    GK *gk = gMakeK();
+    const GR *gr = gk;
+    const GV *gv = gk;
+    printf("functions: %ld %ld, theirs %d %d %d %d %d %ld %d, %d %d\n", gReadK(&mk), gReadR(mr), gk->v, gk->l, gk->r, gk->j, gk->kk, gk->x, gr->r, gr->v, gv->v);
     delete made;
     delete theirs;
     delete gfar;

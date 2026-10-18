@@ -25,3 +25,25 @@ GPrim::GPrim(int p) : GBase(p * 2), prim(p) {}
 int GPrim::nearly() const { return prim; }
 GPrim *gMakePrim(int k) { return new GPrim(k); }
 long gReadPrim(const MPrim *p) { return p->base * 100 + p->prim; }
+
+GV::GV() : v(1) {}
+int GV::f() const { return v; }
+int GV::g() const { return v; }
+GV::~GV() {}
+GL::GL() : l(2) {}
+int GL::f() const { return l; }
+int GL::h() const { return l; }
+GR::GR() : r(3) {}
+int GR::g() const { return r; }
+int GR::k() const { return r; }
+GJ::GJ() : j(4) {}
+int GJ::h() const { return j; }
+GX::GX() : x(5) {}
+long GX::ex() const { return x; }
+GX::~GX() {}
+GK::GK() : kk(6) { v = 10; l = 20; r = 30; j = 40; x = 50; }
+int GK::f() const { return kk; }
+long GK::ex() const { return kk; }
+GK *gMakeK() { return new GK; }
+long gReadK(const MK *k) { return k->v * 100000L + k->l * 10000L + k->r * 1000L + k->j * 100L + k->x * 10L + k->kk; }
+long gReadR(const MR *r) { return r->v * 10L + r->r; }

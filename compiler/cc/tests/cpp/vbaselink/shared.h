@@ -15,8 +15,20 @@
     struct P##Nearly { virtual int nearly() const; virtual void other(); }; \
     struct P##Prim : virtual P##Nearly, virtual P##Base { int prim; P##Prim(int p); int nearly() const override; };
 
+// Virtual functions over virtual bases (the vcall offsets before the
+// vbase offsets), a virtual base of its own beside the diamond's.
+#define FUNCTIONS(P) \
+    struct P##V { int v; P##V(); virtual int f() const; virtual int g() const; virtual ~P##V(); }; \
+    struct P##L : virtual P##V { int l; P##L(); int f() const override; virtual int h() const; }; \
+    struct P##R : virtual P##V { int r; P##R(); int g() const override; virtual int k() const; }; \
+    struct P##J : P##L, P##R { int j; P##J(); int h() const override; }; \
+    struct P##X { long x; P##X(); virtual long ex() const; virtual ~P##X(); }; \
+    struct P##K : virtual P##X, P##J { int kk; P##K(); int f() const override; long ex() const override; };
+
 HIERARCHY(G)
 HIERARCHY(M)
+FUNCTIONS(G)
+FUNCTIONS(M)
 
 // Made by g++'s code: its own objects and mlx-cc's.
 GBoth *gMakeBoth(int k);
@@ -30,3 +42,6 @@ long gReadFar(const MFar *f);
 const MBase *gBaseOf(const MRight *r);
 GPrim *gMakePrim(int k);
 long gReadPrim(const MPrim *p);
+GK *gMakeK();
+long gReadK(const MK *k);
+long gReadR(const MR *r);
