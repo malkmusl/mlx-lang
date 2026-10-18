@@ -1,0 +1,358 @@
+// Closures (gclosure.h): a callback and its data called through a
+// marshaller with GValues, as GLib's gclosure.c keeps them.
+//
+// A GClosure: GLib's bit fields in its first word (the reference count
+// in the low 15 bits; bit 28 floating, 29 the C closure's swap flag, 30
+// in a marshaller, 31 invalid), the marshaller (8), the data (16), and
+// in the notifiers word a record of the library's own (the finalize and
+// invalidate notifiers, data and function each, and the meta
+// marshaller). A GCClosure adds the C callback (32).
+//
+// The marshaller of every C closure here is GLib's generic one: it reads
+// the C type of each argument from its GValue's type and calls the
+// callback as C would (the integer and pointer arguments in the six
+// integer registers then on the stack, the floating ones in the vector
+// registers), the instance first and the data last, or the other way
+// round for a swapped closure; its result goes into the return value.
+// The marshallers GLib generates for common signatures are this one.
+const m = @import("./memory.mlx")
+const threads = @import("./threads.mlx")
+const messages = @import("./messages.mlx")
+const types = @import("./types.mlx")
+const values = @import("./values.mlx")
+
+extern("c") fn g_value_peek_pointer(value: usize) -> usize
+extern("c") fn g_type_interface_peek(class: usize, iface: usize) -> usize
+
+const REFS_MASK: u32 = 0x7fff
+const FLOATING: u32 = 1 << 28
+const SWAP: u32 = 1 << 29
+const IN_MARSHAL: u32 = 1 << 30
+const INVALID: u32 = 1 << 31
+
+const C_MARSHAL: usize = 8
+const C_DATA: usize = 16
+const C_NOTIFIERS: usize = 24
+const C_CALLBACK: usize = 32
+
+const R_FINALIZE: usize = 0
+const R_INVALIDATE: usize = 24
+const R_META_DATA: usize = 48
+const R_META: usize = 56
+const R_SIZE: usize = 64
+
+pub const Notify = fn(usize, usize) -> void
+pub const Marshal = fn(usize, usize, u32, usize, usize, usize) -> void
+pub const IntCall = fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, f64, f64, f64, f64, f64, f64, f64, f64) -> usize
+pub const FloatCall = fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, f64, f64, f64, f64, f64, f64, f64, f64) -> f64
+
+fn bits(closure: usize) -> u32 { return @atomicLoad(u32, m.word32(closure), acquire) }
+
+fn setBit(closure: usize, bit: u32, on: bool) -> void {
+    if on {
+        _ = @atomicRmw(u32, m.word32(closure), or, bit, acq_rel)
+    } else {
+        _ = @atomicRmw(u32, m.word32(closure), and, 0xffffffff ^ bit, acq_rel)
+    }
+}
+
+fn record(closure: usize) -> usize { return m.getWord(closure + C_NOTIFIERS) }
+fn wordsAt(address: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, address) } }
+
+pub fn newSimple(size: u32, data: usize) -> usize {
+    const closure = m.alloc(@intCast(usize, if size < 40 { 40 } else { size }))
+    m.put32(closure, 1 | FLOATING)
+    m.putWord(closure + C_DATA, data)
+    m.putWord(closure + C_NOTIFIERS, m.alloc(R_SIZE))
+    return closure
+}
+
+export fn g_closure_new_simple(sizeof_closure: u32, data: usize) -> usize { return newSimple(sizeof_closure, data) }
+
+pub fn ref(closure: usize) -> usize {
+    _ = @atomicRmw(u32, m.word32(closure), add, 1, acq_rel)
+    return closure
+}
+
+// The notifiers of a list, the last added first, each removed before it
+// is called.
+fn callNotifiers(closure: usize, list: *m.Words) -> void {
+    while list.*.length >= 2 {
+        const notify = m.wordAt(list, list.*.length - 1)
+        const data = m.wordAt(list, list.*.length - 2)
+        list.*.length -= 2
+        const call: Notify = unsafe { @ptrFromInt(Notify, notify) }
+        call(data, closure)
+    }
+}
+
+pub fn invalidate(closure: usize) -> void {
+    if (bits(closure) & INVALID) != 0 { return }
+    _ = ref(closure)
+    setBit(closure, INVALID, true)
+    callNotifiers(closure, wordsAt(record(closure) + R_INVALIDATE))
+    unref(closure)
+}
+
+pub fn unref(closure: usize) -> void {
+    if (bits(closure) & REFS_MASK) == 1 { invalidate(closure) }
+    const old = @atomicRmw(u32, m.word32(closure), sub, 1, acq_rel)
+    if (old & REFS_MASK) == 1 {
+        const r = record(closure)
+        callNotifiers(closure, wordsAt(r + R_FINALIZE))
+        m.disposeWords(wordsAt(r + R_FINALIZE))
+        m.disposeWords(wordsAt(r + R_INVALIDATE))
+        m.release(r)
+        m.release(closure)
+    }
+}
+
+export fn g_closure_ref(closure: usize) -> usize { return ref(closure) }
+export fn g_closure_unref(closure: usize) -> void { unref(closure) }
+export fn g_closure_invalidate(closure: usize) -> void { invalidate(closure) }
+
+pub fn sink(closure: usize) -> void {
+    if (bits(closure) & FLOATING) != 0 {
+        setBit(closure, FLOATING, false)
+        unref(closure)
+    }
+}
+
+export fn g_closure_sink(closure: usize) -> void { sink(closure) }
+
+fn addNotifier(list: *m.Words, data: usize, func: usize) -> void {
+    m.pushWord(list, data)
+    m.pushWord(list, func)
+}
+
+fn removeNotifier(list: *m.Words, data: usize, func: usize) -> bool {
+    var k: usize = 0
+    while k + 1 < list.*.length {
+        if m.wordAt(list, k) == data && m.wordAt(list, k + 1) == func {
+            var i = k
+            while i + 2 < list.*.length {
+                m.putWord(list.*.address + i * 8, m.wordAt(list, i + 2))
+                i += 1
+            }
+            list.*.length -= 2
+            return true
+        }
+        k += 2
+    }
+    return false
+}
+
+pub fn addFinalizeNotifier(closure: usize, data: usize, func: usize) -> void { addNotifier(wordsAt(record(closure) + R_FINALIZE), data, func) }
+pub fn addInvalidateNotifier(closure: usize, data: usize, func: usize) -> void { addNotifier(wordsAt(record(closure) + R_INVALIDATE), data, func) }
+pub fn removeInvalidateNotifier(closure: usize, data: usize, func: usize) -> void { _ = removeNotifier(wordsAt(record(closure) + R_INVALIDATE), data, func) }
+
+export fn g_closure_add_finalize_notifier(closure: usize, data: usize, func: usize) -> void { addFinalizeNotifier(closure, data, func) }
+export fn g_closure_remove_finalize_notifier(closure: usize, data: usize, func: usize) -> void { _ = removeNotifier(wordsAt(record(closure) + R_FINALIZE), data, func) }
+export fn g_closure_add_invalidate_notifier(closure: usize, data: usize, func: usize) -> void { addInvalidateNotifier(closure, data, func) }
+export fn g_closure_remove_invalidate_notifier(closure: usize, data: usize, func: usize) -> void { removeInvalidateNotifier(closure, data, func) }
+
+export fn g_closure_set_marshal(closure: usize, marshal: usize) -> void { m.putWord(closure + C_MARSHAL, marshal) }
+
+export fn g_closure_set_meta_marshal(closure: usize, marshal_data: usize, meta_marshal: usize) -> void {
+    m.putWord(record(closure) + R_META_DATA, marshal_data)
+    m.putWord(record(closure) + R_META, meta_marshal)
+}
+
+pub fn invoke(closure: usize, returnValue: usize, n: u32, params: usize, hint: usize) -> void {
+    _ = ref(closure)
+    if (bits(closure) & INVALID) == 0 {
+        const wasIn = (bits(closure) & IN_MARSHAL) != 0
+        setBit(closure, IN_MARSHAL, true)
+        var marshal = m.getWord(closure + C_MARSHAL)
+        var marshalData: usize = 0
+        const meta = m.getWord(record(closure) + R_META)
+        if meta != 0 {
+            marshal = meta
+            marshalData = m.getWord(record(closure) + R_META_DATA)
+        }
+        if marshal == 0 {
+            values.gobjectCritical("g_closure_invoke: assertion 'closure->marshal || real_closure->meta_marshal' failed")
+        } else {
+            const call: Marshal = unsafe { @ptrFromInt(Marshal, marshal) }
+            call(closure, returnValue, n, params, hint, marshalData)
+        }
+        setBit(closure, IN_MARSHAL, wasIn)
+    }
+    unref(closure)
+}
+
+export fn g_closure_invoke(closure: usize, return_value: usize, n_param_values: u32, param_values: usize, invocation_hint: usize) -> void { invoke(closure, return_value, n_param_values, param_values, invocation_hint) }
+
+pub fn isInvalid(closure: usize) -> bool { return (bits(closure) & INVALID) != 0 }
+
+// ---------------------------------------------------------------------------
+// C closures
+
+pub fn newC(callback: usize, data: usize, destroy: usize, swap: bool) -> usize {
+    const closure = newSimple(40, data)
+    if destroy != 0 { addFinalizeNotifier(closure, data, destroy) }
+    m.putWord(closure + C_CALLBACK, callback)
+    if swap { setBit(closure, SWAP, true) }
+    return closure
+}
+
+export fn g_cclosure_new(callback_func: usize, user_data: usize, destroy_data: usize) -> usize { return newC(callback_func, user_data, destroy_data, false) }
+export fn g_cclosure_new_swap(callback_func: usize, user_data: usize, destroy_data: usize) -> usize { return newC(callback_func, user_data, destroy_data, true) }
+
+// GLib's g_type_class_meta_marshal and g_type_iface_meta_marshal: the
+// function at an offset of the instance's class (or of its vtable of the
+// interface) is the callback.
+export fn __mlx_glib_class_meta_marshal(closure: usize, returnValue: usize, n: u32, params: usize, hint: usize, offset: usize) -> void {
+    const instance = g_value_peek_pointer(params)
+    var class = m.getWord(instance)
+    const itype = m.getWord(closure + C_DATA)
+    if types.fundamentalOf(itype) == types.T_INTERFACE { class = g_type_interface_peek(class, itype) }
+    if class == 0 { return }
+    const callback = m.getWord(class + offset)
+    if callback == 0 { return }
+    const marshal = m.getWord(closure + C_MARSHAL)
+    if marshal == 0 { return }
+    const call: Marshal = unsafe { @ptrFromInt(Marshal, marshal) }
+    call(closure, returnValue, n, params, hint, callback)
+}
+
+pub fn typeClosure(itype: usize, offset: u32) -> usize {
+    const closure = newSimple(32, itype)
+    m.putWord(record(closure) + R_META_DATA, @intCast(usize, offset))
+    m.putWord(record(closure) + R_META, @intFromPtr(__mlx_glib_class_meta_marshal))
+    return closure
+}
+
+export fn g_signal_type_cclosure_new(itype: usize, struct_offset: u32) -> usize { return typeClosure(itype, struct_offset) }
+
+// ---------------------------------------------------------------------------
+// The generic marshaller
+
+const KIND_INT: u32 = 0
+const KIND_FLOAT: u32 = 1
+const KIND_DOUBLE: u32 = 2
+
+fn kindOf(t: usize) -> u32 {
+    const f = types.fundamentalOf(t)
+    if f == types.T_FLOAT { return KIND_FLOAT }
+    if f == types.T_DOUBLE { return KIND_DOUBLE }
+    return KIND_INT
+}
+
+// The C value of a GValue as an integer-class word.
+fn wordOf(value: usize) -> usize {
+    const f = types.fundamentalOf(m.getWord(value))
+    if f == types.T_CHAR { return @bitCast(usize, @intCast(i64, @bitCast(i8, m.get8(value + 8)))) }
+    if f == types.T_UCHAR { return @intCast(usize, m.get8(value + 8)) }
+    if f == types.T_BOOLEAN || f == types.T_INT || f == types.T_ENUM { return @bitCast(usize, @intCast(i64, m.getI32(value + 8))) }
+    if f == types.T_UINT || f == types.T_FLAGS { return @intCast(usize, m.get32(value + 8)) }
+    return m.getWord(value + 8)
+}
+
+pub fn callC(callback: usize, ints: usize, nInts: usize, doubles: usize, floatResult: bool) -> u64 {
+    const i = ints
+    const d = doubles
+    if floatResult {
+        const call: FloatCall = unsafe { @ptrFromInt(FloatCall, callback) }
+        return @bitCast(u64, call(m.getWord(i), m.getWord(i + 8), m.getWord(i + 16), m.getWord(i + 24), m.getWord(i + 32), m.getWord(i + 40), m.getWord(i + 48), m.getWord(i + 56), m.getWord(i + 64), m.getWord(i + 72), m.getWord(i + 80), m.getWord(i + 88), m.getF64(d), m.getF64(d + 8), m.getF64(d + 16), m.getF64(d + 24), m.getF64(d + 32), m.getF64(d + 40), m.getF64(d + 48), m.getF64(d + 56)))
+    }
+    const call: IntCall = unsafe { @ptrFromInt(IntCall, callback) }
+    return @intCast(u64, call(m.getWord(i), m.getWord(i + 8), m.getWord(i + 16), m.getWord(i + 24), m.getWord(i + 32), m.getWord(i + 40), m.getWord(i + 48), m.getWord(i + 56), m.getWord(i + 64), m.getWord(i + 72), m.getWord(i + 80), m.getWord(i + 88), m.getF64(d), m.getF64(d + 8), m.getF64(d + 16), m.getF64(d + 24), m.getF64(d + 32), m.getF64(d + 40), m.getF64(d + 48), m.getF64(d + 56)))
+}
+
+// Stores a C result into the (initialized) return value, taking what it
+// points to over, as GLib's value_from_ffi_type does.
+fn storeResult(value: usize, result: u64) -> void {
+    const f = types.fundamentalOf(m.getWord(value))
+    values.reset(value)
+    if f == types.T_FLOAT {
+        m.put32(value + 8, @intCast(u32, result & 0xffffffff))
+    } else if f == types.T_DOUBLE {
+        m.put64(value + 8, result)
+    } else if f == types.T_BOOLEAN {
+        m.putWord(value + 8, if (result & 0xffffffff) != 0 { 1 } else { 0 })
+    } else if f == types.T_CHAR {
+        m.putWord(value + 8, @bitCast(usize, @intCast(i64, @bitCast(i8, @intCast(u8, result & 0xff)))))
+    } else if f == types.T_UCHAR {
+        m.putWord(value + 8, @intCast(usize, result & 0xff))
+    } else if f == types.T_INT || f == types.T_ENUM {
+        m.putWord(value + 8, @bitCast(usize, @intCast(i64, @bitCast(i32, @intCast(u32, result & 0xffffffff)))))
+    } else if f == types.T_UINT || f == types.T_FLAGS {
+        m.putWord(value + 8, @intCast(usize, result & 0xffffffff))
+    } else {
+        m.put64(value + 8, result)
+    }
+}
+
+pub fn marshalGeneric(closure: usize, returnValue: usize, n: u32, params: usize, marshalData: usize) -> void {
+    const callback = if marshalData != 0 { marshalData } else { m.getWord(closure + C_CALLBACK) }
+    if callback == 0 { return }
+    const ints = m.alloc(12 * 8)
+    const doubles = m.alloc(8 * 8)
+    var nInts: usize = 0
+    var nDoubles: usize = 0
+    const swap = (bits(closure) & SWAP) != 0
+    const count = @intCast(usize, n) + 1
+    var k: usize = 0
+    while k < count {
+        var value: usize = 0
+        var isData = false
+        if k == 0 {
+            if swap { isData = true } else { value = params }
+        } else if k == count - 1 {
+            if swap { value = params } else { isData = true }
+        } else {
+            value = params + k * 24
+        }
+        if isData {
+            if nInts < 12 {
+                m.putWord(ints + nInts * 8, m.getWord(closure + C_DATA))
+                nInts += 1
+            }
+        } else {
+            const kind = kindOf(m.getWord(value))
+            if kind == KIND_INT {
+                if nInts < 12 {
+                    m.putWord(ints + nInts * 8, wordOf(value))
+                    nInts += 1
+                }
+            } else if nDoubles < 8 {
+                if kind == KIND_FLOAT {
+                    m.put64(doubles + nDoubles * 8, @intCast(u64, m.get32(value + 8)))
+                } else {
+                    m.put64(doubles + nDoubles * 8, m.get64(value + 8))
+                }
+                nDoubles += 1
+            }
+        }
+        k += 1
+    }
+    const floatResult = returnValue != 0 && m.getWord(returnValue) != 0 && kindOf(m.getWord(returnValue)) != KIND_INT
+    const result = callC(callback, ints, nInts, doubles, floatResult)
+    if returnValue != 0 && m.getWord(returnValue) != 0 && types.fundamentalOf(m.getWord(returnValue)) != types.T_NONE { storeResult(returnValue, result) }
+    m.release(ints)
+    m.release(doubles)
+}
+
+export fn g_cclosure_marshal_generic(closure: usize, return_gvalue: usize, n_param_values: u32, param_values: usize, invocation_hint: usize, marshal_data: usize) -> void {
+    marshalGeneric(closure, return_gvalue, n_param_values, param_values, marshal_data)
+}
+
+pub fn genericAddress() -> usize { return @intFromPtr(g_cclosure_marshal_generic) }
+
+export fn g_cclosure_marshal_VOID__VOID(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__BOOLEAN(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__INT(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__UINT(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__ENUM(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__FLAGS(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__STRING(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__PARAM(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__BOXED(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__POINTER(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__OBJECT(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__VARIANT(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_VOID__UINT_POINTER(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_BOOLEAN__FLAGS(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_BOOLEAN__BOXED_BOXED(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
+export fn g_cclosure_marshal_STRING__OBJECT_POINTER(closure: usize, r: usize, n: u32, p: usize, h: usize, d: usize) -> void { marshalGeneric(closure, r, n, p, d) }
