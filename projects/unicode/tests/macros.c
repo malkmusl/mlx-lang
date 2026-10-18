@@ -25,6 +25,7 @@
 #include <unicode/uset.h>
 #include <unicode/ucol.h>
 #include <unicode/ucal.h>
+#include <unicode/ucsdet.h>
 
 int main(void)
 {

@@ -39,6 +39,7 @@ there are no headers written by hand.
 | `zones.mlx` | The time zones at run time: an ID's zone, the offsets at a moment, the transitions |
 | `locale.mlx` | The default locale (from the environment), a locale's language, region (its own, `rg`, or the likely one) and keywords, the region's week (CLDR's week data) |
 | `idna.mlx` | `uidna.h`: UTS #46 (mapping, NFC, the validity criteria, bidi, CONTEXTJ and CONTEXTO), Punycode, ToASCII and ToUnicode of names and labels, UTF-16 and UTF-8 |
+| `charsets.mlx` | `ucsdet.h`: charset detection (the Unicode forms by mark and validity, ISO-2022 by its escapes, Shift_JIS, EUC-JP, EUC-KR, GB18030 and Big5 by their structure, Latin-1 and windows-1252) |
 | `enumeration.mlx` | `uenum.h` |
 
 ## Conformance
@@ -71,7 +72,9 @@ from C programs compiled by mlx-cc:
   - formatting for `Intl` (`udat`, `unum`, `unumf`, `uplrules`, `ulistfmt`, `ureldatefmt`), which needs locale data;
   - locales (`uloc`);
   - bidi (`ubidi`);
-  - legacy charset conversion and detection (`ucnv`, `ucsdet`);
+  - legacy charset conversion (`ucnv`); detecting single-byte charsets
+    other than Latin-1 and windows-1252 (ICU rates them by n-gram
+    statistics of their languages);
   - sets (`uset`).
   They come next, in Mlx, from the Unicode and CLDR data.
 - Rules of a program's own for a break iterator (`ubrk_openRules`).
