@@ -7,6 +7,8 @@
 #include <type_traits>
 #include <initializer_list>
 #include <iterator>
+#include <string>
+#include <vector>
 
 template <typename T> class Span {
 public:
@@ -57,6 +59,11 @@ int main(int argc, char **argv) {
     int values[4] = {1, 2, 3, 4};
     takeInts({values, 4});
     takeInts({5, 6});
+    const Span<const int> five = {values, 4};
+    struct Holder { const Span<const int> fSpan; Holder(Span<const int> s) : fSpan{s} {} } holder(five);
+    std::vector<std::string> names{"a", "bc"};
+    std::vector<std::vector<int>> nested{std::vector<int>{1, 2}};
+    printf("%zu %d %zu %zu\n", holder.fSpan.size(), holder.fSpan.fromList(), names.size(), nested.size());
     Point quad[4];
     Matrix().toQuad(quad);
     return argc;
