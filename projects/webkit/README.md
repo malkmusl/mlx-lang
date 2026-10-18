@@ -23,6 +23,7 @@ and GIO, here mlx-glib (projects/glib).
     ./mlx build webkit-webcore-derived  what WebCore's build generates (the WPE port)
     ./mlx build webkit-jsc            JavaScriptCore, C_LOOP (libJavaScriptCore.a)
     ./mlx build webkit-jsc-shell      mlx-out/webkit/bin/jsc
+    ./mlx build webkit-angle          ANGLE, WebGL's OpenGL ES (libANGLE.a, libGLESv2.a)
 
     ./mlx build webkit-wpe-bmalloc    the WPE port's bmalloc
     ./mlx build webkit-wpe-wtf        WTF for WPE (PlatformWPE.cmake's sources) on mlx-glib and mlx-unicode
@@ -99,8 +100,9 @@ are what JavaScriptCore prints for them.
 | `build.mlx` | The steps: the libraries from WebKit's source lists, the generators and their outputs, the forwarding headers (`<bmalloc/...>`, `<JavaScriptCore/...>`), the configuration header |
 | `config.mlx` | The JSCOnly and WPE configurations (`cmakeconfig.h`'s defines) and their feature defines |
 | `webcore.mlx` | WebCore's generated sources (WPE): the generators run as WebCore's CMake files run its scripts, gperf after them, the copies of the source lists and their unified sources |
+| `angle.mlx` | ANGLE as WPE builds it: its configuration (defines, include directories, ANGLEPrefix.h first), the headers it gives WebCore (ANGLE/Headers, includes adjusted as adjust-angle-include-paths.py does) |
 | `unified.mlx` | Unified sources: generate-unified-source-bundles.py's bundles of a source list (Sources.txt), made while the steps are declared |
-| `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for each port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces |
+| `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for each port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces; ANGLE's sources of libANGLE.a and libGLESv2.a and its public headers |
 | `generators/` | WebKit's code generators in Mlx (below) |
 | `tests/` | Programs of the WPE port and what they print: `wtf-wpe.cpp` (WTF), `jsc-glib.c` (JavaScriptCore's GLib API), `wpe.js` (for its jsc) |
 
@@ -154,3 +156,12 @@ bundles and the copies of the source lists among them). Two of them
 name paths and differ by those alone: ColorData.cpp's header repeats gperf's command line with its
 output file, and supplemental_dependency.tmp lists the IDL files by
 path, the generated one among them.
+
+ANGLE's 305 sources (WebKit's CMake build compiles 307: two are its
+precompiled headers, here `-include ANGLEPrefix.h`) compile with mlx-cc,
+and libANGLE.a and libGLESv2.a are made. Four include `<zlib.h>`
+(MemoryProgramCache.cpp, Program.cpp, angletypes.cpp and
+third_party/zlib/google/compression_utils_portable.cc use zlib's deflate
+and inflate streams): theirs are mlx-zlib's headers
+(mlx-out/include/mlx-zlib, made by the step zlib-headers, projects/zlib),
+and the program linking ANGLE links mlx-out/lib/libmlxz.so.
