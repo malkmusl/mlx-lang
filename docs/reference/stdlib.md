@@ -887,9 +887,9 @@ pub fn main() -> u8 {
 
 **Implementation:** `std/src/md5.mlx`, `std/src/blake2.mlx`,
 `std/src/sha1.mlx`, `std/src/sha2.mlx`
-**Source tests:** `344_md5_blake2_runtime.mlx` (run by
-`tests/run_std_modules.sh`); `tools/check_wifi.sh` for SHA-1's HMAC and
-PBKDF2
+**Source tests:** `344_md5_blake2_runtime.mlx`, `345_sha2_runtime.mlx`
+(run by `tests/run_std_modules.sh`); `tools/check_wifi.sh` for SHA-1's
+HMAC and PBKDF2
 
 Each digest has a state that takes the message in pieces (`…Init`,
 `…Update`, `…Final`, which wipes the state) and a one-call function;
@@ -905,6 +905,13 @@ Each digest has a state that takes the message in pieces (`…Init`,
   key)`, `blake2bUpdate`, `blake2bFinal(&state, out)`, `blake2b(bytes,
   *[64]u8)` (512 bits, unkeyed, what b2sum prints) and
   `blake2bWith(bytes, key, out, length)`.
+- `std.sha1`: SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1 (what WPA2 needs).
+- `std.sha2`: SHA-256 and SHA-512 (`Sha256`, `Sha512`, `sha256Init`,
+  `sha256Update`, `sha256Final`, `sha256`, and the same for 512), SHA-224
+  and SHA-384 on the same states from their own initial words
+  (`sha224Init` and `sha224Final(&state, *[28]u8)` on a `Sha256`,
+  `sha384Init` and `sha384Final(&state, *[48]u8)` on a `Sha512`;
+  `sha224`, `sha384` in one call), HMAC-SHA256 and PBKDF2-HMAC-SHA256.
 
 ```mlx
 const md5 = @import("std.md5")
