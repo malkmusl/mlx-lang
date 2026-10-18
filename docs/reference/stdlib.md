@@ -296,6 +296,13 @@ desktop names apps: `identify` gives a Flatpak app's id (from
 `/proc/PID/root/.flatpak-info`, then sandboxed) or its program's name
 (`/proc/PID/exe`, without a `-bin` at its end). MLXIPC's permissions and
 MLX Audio's PulseAudio socket name apps with it.
+`std.pipewire` (`std/src/pipewire.mlx`) has the numbers of PipeWire's
+native protocol (the core's, client's, registry's and client node's
+methods and events, SPA's params, IO areas, commands, formats, buffer
+data and struct pw_node_activation's layout) and `std.pipewire.pod`
+writes and reads the SPA pods its messages are made of; MLX Capture's
+server (`projects/desktop/capture`) and its libpipewire
+(`compiler/capi/pipewire`) are the two ends that use them.
 
 `std.jpeg` (`std/src/jpeg.mlx`) encodes premultiplied ARGB words as
 baseline JPEG (4:2:0, standard tables scaled by a quality of 1 to 100,

@@ -1395,9 +1395,9 @@ both, without xdg-desktop-portal and without a PipeWire daemon:
   no after two minutes). The app is named from its process (`std.appid`).
 - `OpenPipeWireRemote` hands the app one end of a socket pair; the other
   end speaks PipeWire's native protocol, version 3
-  ([`pipewire.mlx`](../capture/pipewire.mlx), on SPA pods from
-  [`pod.mlx`](../capture/pod.mlx)): the core, the client, a registry
-  with the session's nodes, and the client nodes apps create for their
+  ([`pipewire.mlx`](../capture/pipewire.mlx), on the numbers and SPA pods
+  of [`std.pipewire`](../../../std/src/pipewire.mlx)): the core, the
+  client, a registry with the session's nodes, and the client nodes apps create for their
   streams. A connection sees its session's screens and windows only.
 - Each stream ([`stream.mlx`](../capture/stream.mlx)) is linked as
   PipeWire's session manager would: the format (BGRx, or BGRA when the
