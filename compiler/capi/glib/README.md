@@ -55,7 +55,7 @@ GIO those sources reach.
 | `task.mlx` | `gasyncresult.h`, `gtask.h`: tasks returning at once, from idle sources, from threads (and synchronously) |
 | `localfile.mlx` | `gfile.h`: local files (paths, URIs, reading, replacing with etags, deleting, making directories); `gfilemonitor.h` on inotify, with GIO's rules for pending changes and renames |
 | `socket.mlx` | `gsocket.h`, `giostream.h`, `gsocketconnection.h`: sockets (always non-blocking underneath, as in GIO), their sources, and Unix and TCP connections |
-| `resource.mlx`, `inflate.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (an inflater of its own), the registry, static resources |
+| `resource.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (inflated by std.flate), the registry, static resources |
 | `application.mlx` | `gapplication.h`: application ids and the default application |
 | `dbus.mlx` | `gdbus*.h`: bus addresses, proxies, errors, introspection data; see below |
 | `tests/` | C programs built by mlx-cc against the library, each with the output GLib 2.80 gives (`NAME.expected`, the exit status last); `tests/wtf/` the WPE configuration and the WTF sources compiled by the check |
