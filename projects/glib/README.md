@@ -19,10 +19,12 @@ there). `mlx-cheaders` (projects/cc) makes the C headers of them into
 
 The scope is what WTF's WPE sources use (`wtf/glib/*.cpp`,
 `generic/MainThreadGeneric.cpp`, `generic/WorkQueueGeneric.cpp`,
-`unix/`, `linux/`, `posix/`), with the behaviour GLib gives it: a real
-main loop, threads, memory, strings, containers, errors, GVariant, GUri,
-the GObject type system with properties and signals, and the part of
-GIO those sources reach.
+`unix/`, `linux/`, `posix/`) and JavaScriptCore's for WPE (its GLib API,
+`API/glib`, and the remote inspector's `inspector/remote/glib`), with the
+behaviour GLib gives it: a real main loop, threads, memory, strings,
+containers, errors, GVariant, GUri, command line options, the GObject
+type system with properties and signals, and the part of GIO those
+sources reach.
 
 ## Parts
 
@@ -38,7 +40,8 @@ GIO those sources reach.
 | `strings.mlx` | `gstrfuncs.h`, `gstring.h`, `gunicode.h`, `gconvert.h`, `gbase64.h`: strings, ASCII classes and case, UTF-8 (validation, iteration, lengths and offsets, making valid), conversions between UTF-8, UTF-16 and UCS-4, escaping, `g_strdup_printf` with C's formats |
 | `lists.mlx`, `hash.mlx`, `arrays.mlx` | `glist.h`, `gslist.h`; `ghash.h` (GHashTable); `garray.h`, `gbytes.h` (GArray, GPtrArray, GByteArray, GBytes) |
 | `files.mlx` | `gfileutils.h`, `gstdio.h`, `gdir.h`, `gmappedfile.h`, file names and URIs, host names |
-| `checksum.mlx`, `misc.mlx` | `gchecksum.h` (MD5, SHA-1, SHA-256, SHA-384, SHA-512); `gpattern.h`, `gtimer.h`, `gkeyfile.h`, `gshell.h` |
+| `checksum.mlx`, `misc.mlx` | `gchecksum.h` (MD5, SHA-1, SHA-256, SHA-384, SHA-512); `gpattern.h`, `gtimer.h`, `gkeyfile.h`, `gshell.h`; `ggettext.h` and `gi18n-lib.h` (no message catalogs: a message is the program's own) |
+| `options.mlx` | `goption.h`: contexts and groups of entries; parsing long, grouped short and group-prefixed options, `--`, the remaining arguments and callbacks, every value put back on an error, with GLib's messages |
 | `main.mlx` | `gmain.h`: contexts, loops, sources (idle, timeout, child watch, Unix descriptors, ready times), thread-default contexts, `poll` with the context's wake-up descriptor |
 | `variant.mlx` | `gvariant.h`, `gvarianttype.h`: every type, the serialized form GLib reads and writes (its framing offsets, alignment, the normal form of data that does not hold together), builders, iterators, dictionaries, `g_variant_print` |
 | `uri.mlx` | `guri.h`: parsing with GLib's flags, building, escaping and unescaping, parameters |
@@ -55,6 +58,7 @@ GIO those sources reach.
 | `task.mlx` | `gasyncresult.h`, `gtask.h`: tasks returning at once, from idle sources, from threads (and synchronously) |
 | `localfile.mlx` | `gfile.h`: local files (paths, URIs, reading, replacing with etags, deleting, making directories); `gfilemonitor.h` on inotify, with GIO's rules for pending changes and renames |
 | `socket.mlx` | `gsocket.h`, `giostream.h`, `gsocketconnection.h`: sockets (always non-blocking underneath, as in GIO), their sources, and Unix and TCP connections |
+| `network.mlx` | `ginetaddress.h`, `gsocketaddress.h`, `ginetsocketaddress.h`, `gsocketconnectable.h`, `gsocketlistener.h`, `gsocketservice.h`, `gsocketclient.h`: IPv4 and IPv6 addresses, listening (a service accepts in its main context and emits "incoming"), connecting to "host:port" at once or asynchronously |
 | `resource.mlx`, `inflate.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (an inflater of its own), the registry, static resources |
 | `application.mlx` | `gapplication.h`: application ids and the default application |
 | `dbus.mlx` | `gdbus*.h`: bus addresses, proxies, errors, introspection data; see below |
@@ -65,12 +69,15 @@ GIO those sources reach.
 `tools/check_glib.sh`:
 
 - builds the library and its headers; checks that every function the
-  headers declare is in the library (1422);
-- compiles `glib.h`, `glib-object.h`, `glib-unix.h`, `glib/gstdio.h` and
-  `gio/gio.h` together as C and as C++;
+  headers declare is in the library (1508);
+- compiles `glib.h`, `glib-object.h`, `glib-unix.h`, `glib/gstdio.h`,
+  `gio/gio.h` and `gobject/gvaluecollector.h` together as C and as C++;
 - runs `tests/strings.c`, `mainloop.c`, `variant.c`, `uri.c`,
-  `gobject.c`, `system.c` and `gio.c` and compares what they print with
-  what the same programs print on GLib 2.80;
+  `gobject.c`, `system.c`, `gio.c`, `collect.c` (G_DECLARE_FINAL_TYPE,
+  G_VALUE_COLLECT_INIT and G_VALUE_LCOPY, g_alloca), `options.c`
+  (GOption, gettext) and `network.c` (addresses, a service, a client,
+  their errors) and compares what they print with what the same programs
+  print on GLib 2.80;
 - compiles WTF's GLib-based sources for WPE (`tests/wtf/files.txt`: the
   14 of `wtf/glib`, `MainThreadGeneric.cpp`, `WorkQueueGeneric.cpp` and
   those of `unix/`, `linux/`, `posix/`) with mlx-cc on these headers and
@@ -114,11 +121,17 @@ system without it:
 - **GObject**: class private data (`g_type_add_class_private`) and
   dynamic types (`GTypePlugin`, `GTypeModule`;
   `g_type_register_dynamic` reports a critical and returns 0) are not
-  here. The `G_DEFINE_*` and `G_DECLARE_*` macros, which make names by
-  pasting tokens, cannot be written as Mlx; code that uses them needs
-  them added to mlx-cheaders first (WTF's GLib sources do not).
-- Everything of GLib, GObject and GIO that WTF does not use (GIO's
-  settings, network addresses and resolvers, TLS, GSubprocess, GVfs...).
+  here. `G_DECLARE_FINAL_TYPE` and `G_DECLARE_DERIVABLE_TYPE` are (as C
+  the header carries, `c_macros`), the `G_DEFINE_*` macros not yet;
+  `g_autoptr` is not (mlx-cc has no cleanup attribute): the cleanup
+  functions are declared for code that calls them.
+- **GOption**'s help (`--help`, `g_option_context_get_help`) is not here:
+  `--help` is an unknown option unless an entry has that name.
+- **Networking**: names are resolved by the C library at once, before
+  connecting (GResolver, proxies, GNetworkAddress and TLS are not here);
+  Unix socket addresses are not here.
+- Everything of GLib, GObject and GIO that WTF and JavaScriptCore do not
+  use (GIO's settings, TLS, GSubprocess, GVfs...).
 
 The library's messages, errors and their texts are GLib's, in English;
 there is no translation.
@@ -131,6 +144,9 @@ true`), variadic functions (`c_varargs`) and `va_list` (`c_va_list`), the
 tag spelling `typedef struct _T T`, unions (named and in place), macros
 of any case (`pub inline fn`), `p.*.field` as `p->field`, `@offsetOf`,
 `@sizeOf(@TypeOf(e))` as `sizeof(e)`, constants made by casts, C's
-`signed char`, `unsigned char` and `float`, and the system headers a
-header brings (`const c_system_headers = "a.h b.h"`). The unicode headers
-come out as before.
+`signed char`, `unsigned char` and `float`, the system headers a
+header brings (`const c_system_headers = "a.h b.h"`), and C as it is at
+the end of a header (`const c_macros = "..."`) for the macros Mlx cannot
+say: those that paste or quote tokens or read `va_arg`
+(`G_DECLARE_FINAL_TYPE`, `G_VALUE_COLLECT_INIT`, `G_BEGIN_DECLS`). The
+unicode headers come out as before.
