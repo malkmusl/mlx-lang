@@ -167,7 +167,14 @@ pub fn constantObject(o: usize, init: usize) -> bool {
     if depth > 0 { return false }
     const ty = ast.obj(o).*.ty
     const size = types.size(ty)
-    if size <= 0 || size > 65536 || ast.obj(o).*.initData == 0 || !pointerFree(ty) { return false }
+    if size <= 0 || size > 65536 || ast.obj(o).*.initData == 0 || !pointerFree(ty) {
+        if trace {
+            base.say("constexpr object not made here: ")
+            base.say(base.nameOf(ast.obj(o).*.name))
+            base.say("\n")
+        }
+        return false
+    }
     const mark = base.scratchMark()
     const saved = environment
     const savedFailed = failed
@@ -178,11 +185,86 @@ pub fn constantObject(o: usize, init: usize) -> bool {
     bind(o, p)
     const ignored = value(init)
     const ok = !failed
-    if ok { base.copy(ast.obj(o).*.initData, @intCast(usize, p & ~TAGS), @intCast(usize, size)) }
+    if !ok && trace {
+        base.say("constexpr object failed: ")
+        base.say(base.nameOf(ast.obj(o).*.name))
+        base.say("\n")
+        dumpTree(init, 1, "")
+    }
+    if ok {
+        const made = @intCast(usize, p & ~TAGS)
+        base.copy(ast.obj(o).*.initData, made, @intCast(usize, size))
+        // Functions' addresses in it (member function pointers): the
+        // program's bytes get relocations, the evaluator keeps an image
+        // with the values it reads.
+        if addressRelocations(o, ty, 0) {
+            const image = base.alloc(@intCast(usize, size))
+            base.copy(image, made, @intCast(usize, size))
+            const cell = base.alloc(24)
+            base.putWord(cell, o)
+            base.putWord(cell + 8, image)
+            base.putWord(cell + 16, images)
+            images = cell
+        }
+    }
     failed = savedFailed
     environment = saved
     base.releaseScratch(mark)
     return ok
+}
+
+// The constant objects holding functions' addresses: cells of (object,
+// its bytes with the addresses as values, next).
+var images: usize = 0
+
+fn imageOf(o: usize) -> usize {
+    var c = images
+    while c != 0 {
+        if base.getWord(c) == o { return base.getWord(c + 8) }
+        c = base.getWord(c + 16)
+    }
+    return 0
+}
+
+// The member pointers of type `ty` at `offset` in the global `o`'s
+// initial bytes holding a function's address (a value OPAQUE tags):
+// zeroed there, a relocation each; whether there was any.
+fn addressRelocations(o: usize, ty: usize, offset: i64) -> bool {
+    const k = types.kind(ty)
+    if k == types.ARRAY {
+        const element = types.baseOf(ty)
+        const size = types.size(element)
+        var any = false
+        var i: i64 = 0
+        while size > 0 && i < types.at(ty).*.arrayLength {
+            if addressRelocations(o, element, offset + i * size) { any = true }
+            i += 1
+        }
+        return any
+    }
+    if k == types.STRUCT || k == types.UNION {
+        var any = false
+        var m = types.at(ty).*.members
+        while m != 0 {
+            if addressRelocations(o, types.member(m).*.ty, offset + types.member(m).*.offset) { any = true }
+            m = types.member(m).*.next
+        }
+        return any
+    }
+    if !types.isMemberPointer(ty) || types.size(ty) != 8 { return false }
+    const at_ = ast.obj(o).*.initData + @intCast(usize, offset)
+    const word = @bitCast(i64, base.getWord(at_))
+    if (word & OPAQUE) == 0 { return false }
+    const target = @intCast(usize, word & ~TAGS)
+    base.putWord(at_, 0)
+    const r = base.alloc(@sizeOf(ast.Relocation))
+    ast.relocation(r).*.offset = offset
+    ast.relocation(r).*.target = target
+    ast.relocation(r).*.addend = 0
+    ast.relocation(r).*.next = ast.obj(o).*.relocations
+    ast.obj(o).*.relocations = r
+    ast.obj(target).*.isReferenced = true
+    return true
 }
 
 // The value of the call `n` (isConstantCall) with the argument values
@@ -222,6 +304,9 @@ fn callWith(f: usize, values: usize, count: usize, byValue: u64) -> (bool, i64) 
     const savedFailed = failed
     const savedTarget = currentTarget
     currentTarget = resultTarget
+    const savedWants = currentWantsPlace
+    currentWantsPlace = placeResult
+    placeResult = false
     failed = false
     depth += 1
     // The parameters bound to the values.
@@ -256,7 +341,8 @@ fn callWith(f: usize, values: usize, count: usize, byValue: u64) -> (bool, i64) 
     if !ok && trace {
         base.say("constexpr call failed: ")
         base.say(base.nameOf(ast.obj(f).*.name))
-        base.say("\n")
+        base.say(if failed { "\n" } else { " (no return)\n" })
+        if !failed { dumpTree(ast.obj(f).*.body, 1, "") }
     }
     const result = returned
     depth -= 1
@@ -265,6 +351,7 @@ fn callWith(f: usize, values: usize, count: usize, byValue: u64) -> (bool, i64) 
     returnsReference = savedReturns
     failed = savedFailed
     currentTarget = savedTarget
+    currentWantsPlace = savedWants
     outcome = NORMAL
     base.releaseScratch(mark)
     return -> (ok, result)
@@ -375,9 +462,18 @@ fn bufferOf(o: usize) -> i64 {
 // (a DATA pointer), 0 when they are not its value.
 fn globalBytes(o: usize) -> i64 {
     const object = ast.obj(o)
+    const image = imageOf(o)
+    if image != 0 { return DATA | @intCast(i64, image) }
     if object.*.isLocal || object.*.isFunction || object.*.initData == 0 { return 0 }
     if !(object.*.isConstexpr || types.isConst(object.*.ty)) { return 0 }
-    if object.*.relocations != 0 || object.*.runtimeInit || program.hasLateInitializer(o) { return 0 }
+    if object.*.relocations != 0 || object.*.runtimeInit || program.hasLateInitializer(o) {
+        if trace {
+            base.say("constexpr: made when the program starts: ")
+            base.say(base.nameOf(object.*.name))
+            base.say("\n")
+        }
+        return 0
+    }
     return DATA | @intCast(i64, object.*.initData)
 }
 
@@ -462,6 +558,9 @@ fn placeOf(n: usize) -> i64 {
         if isAggregate(ast.obj(o).*.ty) {
             // (A parameter passed by its address: the object it points at.)
             if ast.obj(o).*.isLocal && ast.obj(o).*.storedAt != 0 && cellOf(ast.obj(o).*.storedAt) != 0 { return load(ast.obj(o).*.storedAt) }
+            // (A constexpr local read outside a call: its value made at
+            // compile time.)
+            if ast.obj(o).*.isLocal && ast.obj(o).*.constantImage != 0 && depth == 0 && cellOf(o) == 0 { return DATA | @intCast(i64, ast.obj(ast.obj(o).*.constantImage).*.initData) }
             if ast.obj(o).*.isLocal { return bufferOf(o) }
             // (A global being made by constantObject.)
             const made = cellOf(o)
@@ -476,6 +575,14 @@ fn placeOf(n: usize) -> i64 {
         const pointer = ast.node(n).*.lhs
         // A reference parameter holding its value itself.
         if ast.kindOf(pointer) == ast.VAR && isValueRef(ast.node(pointer).*.variable) { return @intCast(i64, ast.node(pointer).*.variable) }
+        // A call returning a reference: the place it refers to.
+        if returnsReferenceCall(pointer) {
+            placeResult = true
+            const place = value(pointer)
+            placeResult = false
+            if failed || place == 0 || (place & OPAQUE) != 0 { return 0 }
+            return place
+        }
         const p = value(pointer)
         if failed || p == 0 || (p & OPAQUE) != 0 { return 0 }
         return p
@@ -502,6 +609,13 @@ fn placeOf(n: usize) -> i64 {
     }
     return 0
 }
+
+// Set while a call returning a reference is made for the place it
+// refers to (`v[1] = x` through `T &operator[]`): its result is then that
+// place, a MEM or DATA pointer, instead of the value there. The running
+// call's (from placeResult at its start).
+var placeResult = false
+var currentWantsPlace = false
 
 // The bytes a call returning an object of class type writes its result
 // to (MEM pointer; 0: none).
@@ -553,6 +667,9 @@ pub fn dataPointer(n: usize) -> i64 {
     while ast.kindOf(x) == ast.CAST { x = ast.node(x).*.lhs }
     if ast.kindOf(x) == ast.ADDR { x = ast.node(x).*.lhs }
     if ast.kindOf(x) == ast.CAST { x = ast.node(x).*.lhs }
+    // (`&g.member`, a member of a constant global: the global's bytes
+    // at the member's offset.)
+    if ast.kindOf(x) == ast.MEMBER && addressed(n) { return globalMemberBytes(x) }
     if ast.kindOf(x) != ast.VAR { return 0 }
     const o = ast.obj(ast.node(x).*.variable)
     if addressed(n) && !o.*.isLocal && !o.*.isFunction && types.kind(o.*.ty) != types.ARRAY && (types.kind(o.*.ty) == types.STRUCT || types.kind(o.*.ty) == types.UNION) {
@@ -567,6 +684,28 @@ pub fn dataPointer(n: usize) -> i64 {
     if types.kind(o.*.ty) != types.ARRAY { return 0 }
     if !(o.*.isLiteral || types.isConst(types.baseOf(o.*.ty)) || o.*.isConstexpr) { return 0 }
     return DATA | @intCast(i64, o.*.initData)
+}
+
+// The bytes of the member `n` (a chain of members) of a constant global
+// of class type, a DATA pointer (or MEM, the global being made by
+// constantObject); 0 when it is no such member.
+fn globalMemberBytes(n: usize) -> i64 {
+    const k = ast.kindOf(n)
+    if k == ast.MEMBER {
+        const m = ast.node(n).*.member
+        if types.member(m).*.bitWidth != 0 { return 0 }
+        const whole = globalMemberBytes(ast.node(n).*.lhs)
+        if whole == 0 { return 0 }
+        return whole + types.member(m).*.offset
+    }
+    if k != ast.VAR { return 0 }
+    const o = ast.node(n).*.variable
+    if ast.obj(o).*.isLocal || ast.obj(o).*.isFunction { return 0 }
+    const tk = types.kind(ast.obj(o).*.ty)
+    if tk != types.STRUCT && tk != types.UNION { return 0 }
+    const made = cellOf(o)
+    if made != 0 { return @bitCast(i64, base.getWord(made + 8)) }
+    return globalBytes(o)
 }
 
 // Whether `n` takes an address (`&x`, under casts).
@@ -612,6 +751,35 @@ fn referencedValue(e: usize) -> i64 {
         return 0
     }
     return load(@intCast(usize, p))
+}
+
+// The place the reference `e` (an address) refers to, for a caller
+// asking for it (placeResult): an object's bytes (MEM or DATA), not a
+// scalar local of the call or a value given by value.
+fn referencedPlace(e: usize) -> i64 {
+    const k = ast.kindOf(e)
+    if k == ast.CAST { return referencedPlace(ast.node(e).*.lhs) }
+    if k == ast.COND {
+        if value(ast.node(e).*.cond) != 0 { return referencedPlace(ast.node(e).*.then) }
+        return referencedPlace(ast.node(e).*.els)
+    }
+    if k == ast.VAR && isValueRef(ast.node(e).*.variable) {
+        failed = true
+        return 0
+    }
+    const p = value(e)
+    if failed { return 0 }
+    if (p & (DATA | MEM)) == 0 || (p & OPAQUE) != 0 {
+        failed = true
+        return 0
+    }
+    return p
+}
+
+// Whether `n` is a call of a function returning a reference.
+fn returnsReferenceCall(n: usize) -> bool {
+    if ast.kindOf(n) != ast.FUNCALL || ast.node(n).*.funcType == 0 { return false }
+    return types.isReference(types.baseOf(ast.node(n).*.funcType))
 }
 
 // A bit builtin (builtins.mlx) on `v` (unsigned, `width` bits).
@@ -725,8 +893,13 @@ fn value(n: usize) -> i64 {
     if k == ast.VAR {
         const o = node.*.variable
         if ast.obj(o).*.isFunction {
-            failed = true
-            return 0
+            // A function's address (`&State::sync`, a member function's
+            // pointer): a value only.
+            if ast.obj(o).*.isVirtual {
+                failed = true
+                return 0
+            }
+            return OPAQUE | @intCast(i64, o)
         }
         if ast.obj(o).*.hasConstValue { return ast.obj(o).*.constValue }
         const data = dataPointer(n)
@@ -745,11 +918,18 @@ fn value(n: usize) -> i64 {
                 return readData(DATA | @intCast(i64, ast.obj(o).*.initData), if vk == types.DOUBLE { types.ulongOf() } else { types.uintOf() })
             }
         }
+        // (A constexpr floating-point local read outside a call: its
+        // value made at compile time.)
+        if ast.obj(o).*.isLocal && ast.obj(o).*.constantImage != 0 && depth == 0 && cellOf(o) == 0 && types.isFloat(ast.obj(o).*.ty) {
+            const fk = types.kind(types.unqualified(ast.obj(o).*.ty))
+            if fk == types.DOUBLE || fk == types.FLOAT { return readData(DATA | @intCast(i64, ast.obj(ast.obj(o).*.constantImage).*.initData), if fk == types.DOUBLE { types.ulongOf() } else { types.uintOf() }) }
+        }
         return load(o)
     }
     if k == ast.ADDR {
         const data = dataPointer(n)
         if data != 0 { return data }
+        if ast.kindOf(node.*.lhs) == ast.VAR && ast.obj(ast.node(node.*.lhs).*.variable).*.isFunction { return value(node.*.lhs) }
         // `&*p`: p.
         if ast.kindOf(node.*.lhs) == ast.DEREF {
             const inner = value(ast.node(node.*.lhs).*.lhs)
@@ -836,6 +1016,9 @@ fn value(n: usize) -> i64 {
         return v
     }
     if k == ast.FUNCALL {
+        // (Asked of this call, not of the calls among its arguments.)
+        const wantsPlace = placeResult
+        placeResult = false
         const callee = node.*.lhs
         if ast.kindOf(callee) != ast.VAR {
             failed = true
@@ -873,6 +1056,7 @@ fn value(n: usize) -> i64 {
         var resultOk = false
         var resultValue: i64 = 0
         if !failed {
+            placeResult = wantsPlace
             const result = callFunction(f, values, count)
             resultOk = result.0
             resultValue = result.1
@@ -976,8 +1160,12 @@ fn execOne(n: usize) -> void {
             // caller's buffer.
             const from = value(node.*.lhs)
             if failed { return }
+            if trace && (currentTarget & MEM) == 0 { base.say("constexpr: no buffer for the result\n") }
+            if trace && (from & (MEM | DATA)) == 0 { base.say("constexpr: the result has no bytes\n") }
             copyBytes(currentTarget, from, types.size(ast.typeOf(node.*.lhs)))
             returned = currentTarget
+        } else if node.*.lhs != 0 && returnsReference != 0 && currentWantsPlace {
+            returned = referencedPlace(node.*.lhs)
         } else if node.*.lhs != 0 { returned = if returnsReference != 0 { referencedValue(node.*.lhs) } else { value(node.*.lhs) } }
         outcome = RETURNED
         return
