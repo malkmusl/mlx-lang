@@ -339,10 +339,65 @@ def struct_pack_gid(gid):
     return struct.pack(">H", gid)
 
 
+# Glyph names a Unicode charmap is made of: names of the Adobe Glyph
+# List (two of a character too), `uniXXXX` and `uXXXX[XX]` names, good
+# and not, variants, the names FreeType adds a second character for, and
+# names of nothing.
+NAMES = ["A", "uni0041", "A.swash", "A.swash.2", "uni0041.sc", "u0041.alt", "B", "Delta", "Omega", "Omegagreek",
+         "fraction", "hyphen", "uni00AD", "macron", "mu", "periodcentered", "space", "nbspace", "Tcommaaccent",
+         "tcommaaccent", "uni021B", "afii10017", "Euro", "uni20AC.tf", "u1F600", "u10FFFF", "uFFFFFFF", "u12",
+         "uni004", "unid800", "uni00410042", "uniFB01", "uni1234ABCD", "uniABCD.", "ff", "f_f", "zz", "foo",
+         ".alt", "Ab", "a", "a.sc", "dalethatafpatah", "Lcommaaccent", "Dotaccentsmall", "onehalf"]
+
+
+def build_names(kind):
+    # A font of triangles whose only charmap is a Macintosh one: FreeType
+    # makes a Unicode charmap of its `post` names (names.ttf) or of its
+    # CFF charset (names.otf).
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib.tables._c_m_a_p import cmap_format_6
+    glyphs = [".notdef"] + NAMES
+    fb = FontBuilder(1000, isTTF=(kind == "tt"))
+    fb.setupGlyphOrder(glyphs)
+    if kind == "tt":
+        pen = TTGlyphPen(None)
+        pen.moveTo((0, 0)); pen.lineTo((0, 100)); pen.lineTo((100, 0)); pen.closePath()
+        glyph = pen.glyph()
+        fb.setupGlyf({n: glyph for n in glyphs})
+    else:
+        charstrings = {}
+        for n in glyphs:
+            pen = T2CharStringPen(500, None)
+            pen.moveTo((0, 0)); pen.lineTo((0, 100)); pen.lineTo((100, 0)); pen.closePath()
+            charstrings[n] = pen.getCharString()
+        fb.setupCFF("MlxNamesTest", {"FullName": "MlxNamesTest"}, charstrings, {})
+    fb.setupHorizontalMetrics({n: (500, 0) for n in glyphs})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "MlxNamesTest", "styleName": "Regular",
+                       "copyright": "Made for mlx-freetype's tests (see make_fonts.py)."})
+    cmap = newTable("cmap")
+    cmap.tableVersion = 0
+    sub = cmap_format_6(6)
+    sub.platformID = 1
+    sub.platEncID = 0
+    sub.language = 0
+    sub.cmap = {0x41: "A", 0x42: "B"}
+    cmap.tables = [sub]
+    fb.font["cmap"] = cmap
+    fb.setupOS2()
+    fb.setupPost(keepGlyphNames=(kind == "tt"))
+    fb.font["head"].created = fb.font["head"].modified = 0x7C259DC0
+    fb.font.recalcTimestamp = False
+    fb.save(os.path.join(out, "names.ttf" if kind == "tt" else "names.otf"))
+
+
 build_tt_var()
 build_cff2_var()
 build_colr()
 build_colr1()
 build_sbix()
+build_names("tt")
+build_names("cff")
 for name in sorted(os.listdir(out)):
     print(name, os.path.getsize(os.path.join(out, name)))

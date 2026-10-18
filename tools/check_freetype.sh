@@ -23,6 +23,8 @@
 #                    glyphs and metrics (TrueType and CFF2)
 #       color.c      CPAL palettes, COLR layers and version 1 paints
 #       bitmaps.c    embedded bitmaps: EBDT, CBDT (PNG), sbix
+#       damaged.c    fonts with bytes changed or cut short: the errors,
+#                    and what loads of them still give
 #     on the fonts of a Debian or Ubuntu system (fonts-dejavu-core,
 #     fonts-liberation, fonts-freefont-ttf, fonts-crosextra-*,
 #     fonts-ipafont-gothic, fonts-inter, fonts-tlwg-loma-otf, fonts-unifont,

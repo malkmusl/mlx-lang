@@ -3,9 +3,9 @@
    bitmap (its mode, size, pitch and a hash of its bytes), metrics and
    advances, in color and in gray, horizontal and vertical, and with the
    metrics only; then a size no strike has. (The glyphs a strike has no
-   bitmap for are outlines, hinted by FreeType's TrueType bytecode
-   interpreter, which mlx-freetype does not have: their metrics are
-   compared, and their renderings only unhinted.)
+   bitmap for are outlines, loaded unhinted: FreeType hints TrueType
+   outlines with its bytecode interpreter, which mlx-freetype does not
+   have.)
 
    bitmaps FONT [FACE-INDEX [STEP]] */
 #include <ft2build.h>
@@ -39,7 +39,7 @@ static void glyphs(FT_Face face, long step)
 {
     static const FT_Int32 flag_sets[] = {
         FT_LOAD_COLOR,
-        FT_LOAD_DEFAULT,
+        FT_LOAD_NO_HINTING,
         FT_LOAD_COLOR | FT_LOAD_VERTICAL_LAYOUT,
         FT_LOAD_COLOR | FT_LOAD_BITMAP_METRICS_ONLY,
         FT_LOAD_RENDER | FT_LOAD_TARGET_MONO | FT_LOAD_NO_HINTING,
@@ -85,8 +85,8 @@ int main(int argc, char **argv)
     printf("select beyond: %d\n", error);
     error = FT_Set_Pixel_Sizes(face, 0, 77);
     print_size(face, "unmatched", error);
-    load(face, face->num_glyphs / 3, FT_LOAD_COLOR);
-    load(face, face->num_glyphs / 3, FT_LOAD_NO_BITMAP);
+    load(face, face->num_glyphs / 3, FT_LOAD_COLOR | FT_LOAD_NO_HINTING);
+    load(face, face->num_glyphs / 3, FT_LOAD_NO_BITMAP | FT_LOAD_NO_HINTING);
     FT_Done_Face(face);
     FT_Done_FreeType(library);
     return 0;
