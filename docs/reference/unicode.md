@@ -83,11 +83,11 @@ fn example(allocator: unicode.utf.Allocator) -> unicode.Error!void {
 `std.unicode.format` itself is what the formatters share: formatted values
 and the spans of their fields (ICU's `UFormattedValue`).
 
-`tests/343_unicode_utf_runtime.mlx` tests `std.unicode.utf` (a static
-program: no tables, no C library); `tests/344_unicode_text_runtime.mlx`
+`tests/344_unicode_utf_runtime.mlx` tests `std.unicode.utf` (a static
+program: no tables, no C library); `tests/345_unicode_text_runtime.mlx`
 the text parts (properties, casing, normalization, breaks, collation by
 locale and by rules, IDNA, charset detection);
-`tests/345_unicode_locale_runtime.mlx` the locale parts over `cldr.dat`
+`tests/346_unicode_locale_runtime.mlx` the locale parts over `cldr.dat`
 (tags, likely subtags, display names, calendar fields in Berlin and in
 the Thai Buddhist calendar, numbers, plural categories, dates, lists,
 relative times) and `std.timezone.database` by name.
