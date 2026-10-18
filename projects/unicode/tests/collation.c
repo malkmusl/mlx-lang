@@ -26,7 +26,10 @@ static int run(const char *path, UColAttributeValue alternate, int verbose)
     FILE *file = fopen(path, "r");
     if (!file) { printf("cannot read %s\n", path); return 1; }
     UErrorCode status = U_ZERO_ERROR;
-    UCollator *coll = ucol_open("", &status);
+    /* The root as DUCET has it (`ducet`): its variable elements and its
+       Han order (CLDR's root, the default, has only spaces and
+       punctuation variable and Han in radical-stroke order). */
+    UCollator *coll = ucol_open("und-u-co-ducet", &status);
     ucol_setAttribute(coll, UCOL_ALTERNATE_HANDLING, alternate, &status);
     ucol_setAttribute(coll, UCOL_STRENGTH, UCOL_IDENTICAL, &status);
     char line[1024];

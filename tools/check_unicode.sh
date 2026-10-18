@@ -8,7 +8,9 @@
 #   - the tables in the tree (tables.mlx, api/ugenerated.mlx) are what
 #     the generator makes of the UCD (projects/unicode/ucd) now, and
 #     timezones.mlx what tz-generate makes of the IANA database (tz/),
-#     locales.mlx what cldr-generate makes of CLDR (cldr/);
+#     locales.mlx what cldr-generate makes of CLDR (cldr/),
+#     collationrules.mlx what collation-generate makes of CLDR's
+#     collation data (cldr/collation/);
 #   - tests/zones.mlx: every zone's offsets, 1850 to 2100, against the
 #     files zic made of the same database, where the system has them;
 #   - tests/api.mlx: the API modules compile as Mlx, and the macros, run
@@ -21,10 +23,13 @@
 #                              and line break tests of the UCD
 #       tests/collation.c      every line of the Collation Algorithm's
 #                              tests (non-ignorable and shifted) in order
+#       tests/tailoring.c      collation by locale (CLDR's tailorings) and
+#                              by rules, as ICU 74 sorts the same words
 #       tests/idna.c           every line of IdnaTestV2.txt (UTS #46)
 #       tests/properties.c, tests/strings.c, tests/calendar.c,
 #       tests/charsets.c, tests/locales.c, tests/bundles.c (over
-#       cldr.dat)                       print what NAME.expected says
+#       cldr.dat), ... tests/numbers.c, tests/units.c (measure units)
+#                                       print what NAME.expected says
 #
 #   tools/check_unicode.sh
 set -euo pipefail
@@ -48,6 +53,10 @@ echo "ok   the tables are what the generator makes of the UCD"
 mlx-out/bin/cldr-generate projects/unicode/cldr "$work/locales.mlx" || fail "cldr-generate"
 cmp -s "$work/locales.mlx" projects/unicode/locales.mlx || fail "projects/unicode/locales.mlx is not what cldr-generate makes"
 echo "ok   the locale data is what cldr-generate makes of CLDR"
+
+mlx-out/bin/collation-generate "$work/collationrules.mlx" projects/unicode/cldr/collation/radicals.txt projects/unicode/cldr/collation/*.xml || fail "collation-generate"
+cmp -s "$work/collationrules.mlx" projects/unicode/collationrules.mlx || fail "projects/unicode/collationrules.mlx is not what collation-generate makes"
+echo "ok   the collation rules are what collation-generate makes of CLDR"
 
 mlx-out/bin/tz-generate projects/unicode/tz "$work/timezones.mlx" || fail "tz-generate"
 cmp -s "$work/timezones.mlx" projects/unicode/timezones.mlx || fail "projects/unicode/timezones.mlx is not what tz-generate makes"
@@ -90,7 +99,7 @@ cc projects/unicode/tests/idna.c -o "$work/idna" || fail "tests/idna.c does not 
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar charsets locales bundles lists displaynames dates numbers; do
+for test in properties strings calendar charsets locales bundles lists displaynames dates numbers units tailoring; do
     cc "projects/unicode/tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "projects/unicode/tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"
