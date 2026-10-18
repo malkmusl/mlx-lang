@@ -127,6 +127,23 @@ extends_signed_results() {
     return $ok
 }
 
+# Whether programs $1 builds give the wrapping operators on a narrow
+# signed type a sign-extended result (tests/359_signed_wrapping_runtime.mlx
+# exits 13); older compilers only masked it to the type's width, so a
+# negative i32 from `a -% b` compared as large and positive.
+extends_signed_wrapping() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/359_signed_wrapping_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 gives a plugin a soname and its exports a symbol version
 # (--soname, --symbol-version; projects/desktop/libpulse needs them).
 writes_symbol_versions() {
@@ -616,6 +633,7 @@ probes=(
     "has_large_arena|the 1 GiB arena"
     "keeps_match_widths|match values stored at their width"
     "extends_signed_results|signed results sign-extended"
+    "extends_signed_wrapping|signed wrapping arithmetic sign-extended"
     "writes_symbol_versions|symbol versions"
     "resolves_named_array_lengths|array lengths from named constants"
     "exports_data|data symbols for export const"
