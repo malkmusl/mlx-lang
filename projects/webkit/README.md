@@ -18,6 +18,7 @@ with `Source/`), by default /home/user/csrc/wpe/wpewebkit-2.54.1.
     ./mlx build webkit-webcore-derived  what WebCore's build generates (the WPE port)
     ./mlx build webkit-jsc            JavaScriptCore, C_LOOP (libJavaScriptCore.a)
     ./mlx build webkit-jsc-shell      mlx-out/webkit/bin/jsc
+    ./mlx build webkit-angle          ANGLE, WebGL's OpenGL ES (libANGLE.a, libGLESv2.a)
     ./mlx build webkit                all of it
 
     tools/check_webkit_generators.sh  the generated sources against those of a build by WebKit's generators
@@ -34,8 +35,9 @@ WebCore/ for WebCore's).
 | `build.mlx` | The steps: the libraries from WebKit's source lists, the generators and their outputs, the forwarding headers (`<bmalloc/...>`, `<JavaScriptCore/...>`), the configuration header |
 | `config.mlx` | The JSCOnly configuration (`cmakeconfig.h`'s defines) and its feature defines; the WPE port's feature defines |
 | `webcore.mlx` | WebCore's generated sources (WPE): the generators run as WebCore's CMake files run its scripts, gperf after them, the copies of the source lists and their unified sources |
+| `angle.mlx` | ANGLE as WPE builds it: its configuration (defines, include directories, ANGLEPrefix.h first), the headers it gives WebCore (ANGLE/Headers, includes adjusted as adjust-angle-include-paths.py does) |
 | `unified.mlx` | Unified sources: generate-unified-source-bundles.py's bundles of a source list (Sources.txt), made while the steps are declared |
-| `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for the port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces |
+| `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for the port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces; ANGLE's sources of libANGLE.a and libGLESv2.a and its public headers |
 | `generators/` | WebKit's code generators in Mlx (below) |
 
 ## The generators
