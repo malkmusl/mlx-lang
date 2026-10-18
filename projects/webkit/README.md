@@ -94,5 +94,6 @@ and libANGLE.a and libGLESv2.a are made. Four include `<zlib.h>`
 (MemoryProgramCache.cpp, Program.cpp, angletypes.cpp and
 third_party/zlib/google/compression_utils_portable.cc use zlib's deflate
 and inflate streams): theirs are mlx-zlib's headers
-(mlx-out/include/mlx-zlib, made by the step zlib-headers, projects/zlib),
-and the program linking ANGLE links mlx-out/lib/libmlxz.so.
+(mlx-out/include/mlx-zlib, made by the step zlib-headers;
+compiler/capi/zlib, over std.flate), and the program linking ANGLE
+links mlx-out/lib/libmlxz.so.
