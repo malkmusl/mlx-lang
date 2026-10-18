@@ -1158,6 +1158,37 @@ text)` takes the bytes a shell quoted instead (`literal[i] & 1`). mlx-sh's
 pathname expansion, `case` and `${...#...}`, and ls's `--ignore` and
 `--hide` use it.
 
+## Starting programs (`std.spawn`)
+
+**Implementation:** `std/src/spawn.mlx`
+**Source tests:** `360_spawn_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+A child is described by `Options` (`options(program, arguments,
+environment)` changes nothing else): `searchPath` looks a name without a
+slash up in the environment's PATH (`defaultPath` when it has none),
+`input`/`output`/`errors` become its standard descriptors, `extra` is
+handed over at `extraAt`, `keep`/`keepAlso` stay open across execve and
+`closing`/`closingAlso` are closed in it, `directory` is its working
+directory, `newSession` gives it a session of its own, `unblockSignals`
+clears the mask a parent with a signal descriptor left, `detach` starts
+the program from an intermediate child reaped at once, and `shareMemory`
+vforks (for large parents). `start` returns the pid (or -errno);
+`startReading` hands back the read end of a pipe the child writes to;
+`capture` runs it to its end with its output kept; `wait` and `ended`
+give the exit code or 128 plus the signal; `execute` and `executeIn` are
+the PATH lookup for children that fork themselves. A program that cannot
+run exits with 127.
+
+```mlx
+const spawn = @import("std.spawn")
+
+var options = spawn.options(program, argv, envp)
+options.searchPath = true
+var output: [4096]u8 = undefined
+var status: usize = 0
+const length = spawn.capture(&options, true, &output, 4096, &status)
+```
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`
@@ -1267,7 +1298,9 @@ What exists today is the **Linux raw syscall gateway** (Stage-1 Core), not
 yet a portable `std.posix` facade abstracting over multiple backends.
 `std/bootstrap/os/linux.mlx` defines the `syscall0`..`syscall6` extern
 gateway (`extern("syscall")`, arguments loaded per the x86_64 Linux ABI) plus
-`SYS_*` numeric constants for the file/process syscalls it wraps in `fs.mlx`:
+the `SYS_*` numbers of every system call the repository makes (x86_64's;
+the aarch64 backend translates them, so programs keep no table of their
+own):
 
 ```mlx
 pub extern("syscall") fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {}
@@ -1278,6 +1311,19 @@ pub const SYS_open: usize = 2
 ```
 
 (`std/bootstrap/os/linux.mlx`)
+
+Beside them it has the kernel's constants as the system calls take them:
+errors negated (`EINTR`, `EAGAIN`, ... as `isize`), `O_*`, `AT_FDCWD`,
+`F_*`, `S_IF*`, `PROT_*`/`MAP_*`/`MFD_*`, the signal numbers (`SIGHUP` ...
+`SIGWINCH`), `SIG_BLOCK`..., `WNOHANG`..., `CLOCK_*`; and thin wrappers
+over raw descriptors (`isize`, -errno on failure): `read`, `write`,
+`writeAll` (again after `EINTR`), `close` (a negative descriptor is left
+alone), `open`, `openAt`, `ioctl`, `fcntl`, `keepOnExec` (clears
+`FD_CLOEXEC` for a child), `setNonBlocking`, `dup`, `dup2`, `pipe`,
+`seek`, `truncate`, `getdents`, `unlink`, `makeDirectory`, `chmod`,
+`chdir`, `mmap`, `mapShared`/`munmap`, `memfdCreate`, `getpid`,
+`exitGroup`, `sleepMilliseconds`, and `failed` (whether a raw result is
+an error rather than an address).
 
 It re-exports five sub-namespaces, each a thin syscall wrapper module:
 
@@ -1291,16 +1337,36 @@ It re-exports five sub-namespaces, each a thin syscall wrapper module:
   `SOCK_STREAM`/`SOCK_DGRAM`, and syscall wrappers `open` (socket),
   `bind`/`listen`/`connect`/`accept`/`accept4`, `send`/`receive`/`sendTo`/
   `receiveFrom`/`sendMessage`/`receiveMessage`, `setOption`/`getOption`,
-  `setNonBlocking` (via `fcntl`).
+  `setNonBlocking` (via `fcntl`); Unix sockets by path or abstract name
+  (`unixAddress`, `connectUnix`, `listenUnix`), `peerCredentials`
+  (`SO_PEERCRED`), and descriptors passed along (`sendWithDescriptors`,
+  `receiveWithDescriptors`: `SCM_RIGHTS`, `EINTR` retried, descriptors
+  beyond the caller's room closed).
 - `os/linux/event.mlx` — raw `poll`, `epollCreate`/`epollControl`/
-  `epollWait`, and `io_uring` setup/enter/register wrappers, with kernel ABI
-  event-buffer layouts left to a future portable event-loop layer.
+  `epollWait`, and `io_uring` setup/enter/register wrappers; `poll` records
+  in byte arrays (`pollSet`, `pollResult`, `waitReady`); the event loop the
+  services share: an epoll set whose descriptors carry a token of the
+  caller's (`createEventLoop`, `watch`/`rewatch`/`unwatch`, `waitEvents`
+  into `Events`, `eventFlags`, `eventToken`; std.wayland's and std.dbus's
+  loops are this one); signals as a descriptor (`signalDescriptor(mask)`
+  blocks them, `readSignal`), timers (`createTimer`, `setTimer`), event
+  counters (`createCounter`, `addToCounter`, `readCounter`) and inotify
+  (`createWatcher`, `addWatch`).
 - `os/linux/system.mlx` — `getSystemInfo` (`uname`, filling a `UtsName` of
   six 65-byte fields) and `availableProcessorCount` (via
   `sched_getaffinity`'s returned CPU mask, popcounted by hand).
 - `os/linux/process.mlx` — `execve`, `ignoreSignal`/`defaultSignal`
   (`rt_sigaction`), `blockSignals`/`unblockSignals`, `isAlive` (`kill(pid,
-  0)`).
+  0)`); `fork`, `waitProcess` (`wait4`, `EINTR` retried) with `exitStatus`
+  (the code, or 128 plus the signal), `succeeded`, `stopped`,
+  `stopSignal`, `continued`; `kill`, `setSession`, `prctl`; signal sets as
+  a word (`signalBit`, `changeSignalMask`, `unblockAllSignals`,
+  `setSignalHandler`).
+
+`tests/359_linux_descriptors_runtime.mlx` (run by
+`tests/run_std_modules.sh`) takes a pipe, a timer, a signal and an event
+counter through the event loop and poll, passes descriptors over a socket
+pair, connects to a Unix socket by path and forks and waits for a child.
 
 A socketpair + non-blocking + epoll round-trip:
 

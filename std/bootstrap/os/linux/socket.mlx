@@ -85,3 +85,213 @@ pub fn setNonBlocking(descriptor: isize) -> isize {
     if flags < 0 { return flags }
     return setFlags(descriptor, @bitCast(usize, flags) | O_NONBLOCK)
 }
+
+// ---------------------------------------------------------------------------
+// Unix sockets
+
+pub const MSG_CTRUNC: u32 = 8
+pub const MSG_CMSG_CLOEXEC: usize = 1073741824
+pub const SO_PEERCRED: usize = 17
+pub const SCM_RIGHTS: u32 = 1
+// The longest path a sockaddr_un holds (108 bytes with its NUL).
+pub const MAX_UNIX_PATH: usize = 107
+
+const EINTR: isize = -4
+const ENAMETOOLONG: isize = -36
+
+// A sockaddr_un in `address` (110 bytes or more): AF_UNIX, then `path`
+// NUL-terminated, or for an abstract socket (`abstract`) a NUL and the
+// name. Its length for bind and connect, or 0 when the path does not fit
+// (or is empty).
+pub fn unixAddress(address: [*]u8, path: []const u8, abstract: bool) -> usize {
+    if path.length == 0 || path.length > MAX_UNIX_PATH { return 0 }
+    var index: usize = 0
+    while index < 110 {
+        address[index] = 0
+        index += 1
+    }
+    address[0] = 1
+    const start: usize = if abstract { 3 } else { 2 }
+    if start + path.length > 110 { return 0 }
+    index = 0
+    while index < path.length {
+        address[start + index] = path[index]
+        index += 1
+    }
+    // A path's length counts its NUL; an abstract name's is exact.
+    return if abstract { start + path.length } else { start + path.length + 1 }
+}
+
+// A stream socket (`flags`: SOCK_NONBLOCK, SOCK_CLOEXEC) connected to the
+// Unix socket `path`: its descriptor, or -errno.
+pub fn connectUnix(path: []const u8, abstract: bool, flags: usize) -> isize {
+    var address: [112]u8 = undefined
+    const bytes: [*]u8 = &address
+    const length = unixAddress(bytes, path, abstract)
+    if length == 0 { return ENAMETOOLONG }
+    const descriptor = open(AF_UNIX, SOCK_STREAM | flags, 0)
+    if descriptor < 0 { return descriptor }
+    const result = connect(descriptor, @intFromPtr(bytes), length)
+    if result < 0 {
+        const ignored = close(descriptor)
+        return result
+    }
+    return descriptor
+}
+
+// A stream socket (`flags` as above) listening at `path` with `backlog`:
+// its descriptor, or -errno. A path socket left behind by an earlier run
+// is the caller's to remove (it may be another's).
+pub fn listenUnix(path: []const u8, abstract: bool, flags: usize, backlog: usize) -> isize {
+    var address: [112]u8 = undefined
+    const bytes: [*]u8 = &address
+    const length = unixAddress(bytes, path, abstract)
+    if length == 0 { return ENAMETOOLONG }
+    const descriptor = open(AF_UNIX, SOCK_STREAM | flags, 0)
+    if descriptor < 0 { return descriptor }
+    const bound = bind(descriptor, @intFromPtr(bytes), length)
+    if bound < 0 {
+        const ignored = close(descriptor)
+        return bound
+    }
+    const listening = listen(descriptor, backlog)
+    if listening < 0 {
+        const ignored = close(descriptor)
+        return listening
+    }
+    return descriptor
+}
+
+// The pid, uid and gid of a Unix socket's peer (SO_PEERCRED).
+pub fn peerCredentials(descriptor: isize, pid: *u32, uid: *u32, gid: *u32) -> bool {
+    var credentials: [3]u32 = [3]u32{ 0, 0, 0 }
+    var length: u32 = 12
+    if getOption(descriptor, SOL_SOCKET, SO_PEERCRED, @intFromPtr(&credentials), @intFromPtr(&length)) != 0 { return false }
+    pid.* = credentials[0]
+    uid.* = credentials[1]
+    gid.* = credentials[2]
+    return true
+}
+
+fn zeroBytes(bytes: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        bytes[index] = 0
+        index += 1
+    }
+}
+
+fn store64(bytes: [*]u8, at: usize, value: usize) -> void {
+    var index: usize = 0
+    while index < 8 {
+        bytes[at + index] = @intCast(u8, (value >> (index * 8)) & 255)
+        index += 1
+    }
+}
+
+fn load64(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var index: usize = 0
+    while index < 8 {
+        value = value | (@intCast(usize, bytes[at + index]) << (index * 8))
+        index += 1
+    }
+    return value
+}
+
+fn store32(bytes: [*]u8, at: usize, value: u32) -> void {
+    bytes[at] = @intCast(u8, value & 255)
+    bytes[at + 1] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 2] = @intCast(u8, (value >> 16) & 255)
+    bytes[at + 3] = @intCast(u8, (value >> 24) & 255)
+}
+
+fn load32(bytes: [*]const u8, at: usize) -> u32 {
+    return @intCast(u32, bytes[at]) | (@intCast(u32, bytes[at + 1]) << 8) | (@intCast(u32, bytes[at + 2]) << 16) | (@intCast(u32, bytes[at + 3]) << 24)
+}
+
+// The most descriptors one message carries here (the kernel's limit is
+// 253; Wayland's and D-Bus's messages take far fewer).
+pub const MAX_PASSED: usize = 28
+
+// sendmsg(2) of `length` bytes with `count` descriptors (SCM_RIGHTS, at
+// most MAX_PASSED; the kernel duplicates them, the caller's stay open),
+// again after a signal interrupts it: the bytes sent, or -errno.
+pub fn sendWithDescriptors(descriptor: isize, bytes: [*]const u8, length: usize, descriptors: [*]const isize, count: usize, flags: usize) -> isize {
+    var header: [56]u8 = undefined
+    var vector: [16]u8 = undefined
+    var control: [128]u8 = undefined
+    const header_bytes: [*]u8 = &header
+    const vector_bytes: [*]u8 = &vector
+    const control_bytes: [*]u8 = &control
+    zeroBytes(header_bytes, 56)
+    store64(vector_bytes, 0, @intFromPtr(bytes))
+    store64(vector_bytes, 8, length)
+    store64(header_bytes, 16, @intFromPtr(vector_bytes))
+    store64(header_bytes, 24, 1)
+    const passed = if count > MAX_PASSED { MAX_PASSED } else { count }
+    if passed > 0 {
+        zeroBytes(control_bytes, 128)
+        store64(control_bytes, 0, 16 + passed * 4)
+        store32(control_bytes, 8, 1)
+        store32(control_bytes, 12, SCM_RIGHTS)
+        var index: usize = 0
+        while index < passed {
+            store32(control_bytes, 16 + index * 4, @intCast(u32, descriptors[index] & 4294967295))
+            index += 1
+        }
+        store64(header_bytes, 32, @intFromPtr(control_bytes))
+        store64(header_bytes, 40, 16 + ((passed * 4 + 7) / 8) * 8)
+    }
+    var sent = sendMessage(descriptor, @intFromPtr(header_bytes), flags)
+    while sent == EINTR { sent = sendMessage(descriptor, @intFromPtr(header_bytes), flags) }
+    return sent
+}
+
+// recvmsg(2) into `into` (again after a signal interrupts it), with the
+// descriptors that came along (SCM_RIGHTS) put in `descriptors`: their
+// number in `count`; those beyond `room` are closed. The bytes read, 0 at
+// the end of the stream, or -errno; -EPROTO when the kernel had more
+// descriptors than the record had room for (the bytes are lost then, and
+// the descriptors that did come are in `descriptors`).
+pub fn receiveWithDescriptors(descriptor: isize, into: [*]u8, capacity: usize, descriptors: [*]isize, room: usize, count: *usize, flags: usize) -> isize {
+    count.* = 0
+    var header: [56]u8 = undefined
+    var vector: [16]u8 = undefined
+    var control: [256]u8 = undefined
+    const header_bytes: [*]u8 = &header
+    const vector_bytes: [*]u8 = &vector
+    const control_bytes: [*]u8 = &control
+    zeroBytes(header_bytes, 56)
+    store64(vector_bytes, 0, @intFromPtr(into))
+    store64(vector_bytes, 8, capacity)
+    store64(header_bytes, 16, @intFromPtr(vector_bytes))
+    store64(header_bytes, 24, 1)
+    store64(header_bytes, 32, @intFromPtr(control_bytes))
+    store64(header_bytes, 40, 256)
+    var received = receiveMessage(descriptor, @intFromPtr(header_bytes), flags)
+    while received == EINTR { received = receiveMessage(descriptor, @intFromPtr(header_bytes), flags) }
+    if received < 0 { return received }
+    const control_length = load64(header_bytes, 40)
+    var offset: usize = 0
+    while offset + 16 <= control_length {
+        const record_length = load64(control_bytes, offset)
+        if record_length < 16 || offset + record_length > control_length { break }
+        if load32(control_bytes, offset + 8) == 1 && load32(control_bytes, offset + 12) == SCM_RIGHTS {
+            var index: usize = 0
+            while index < (record_length - 16) / 4 {
+                const passed = @intCast(isize, load32(control_bytes, offset + 16 + index * 4))
+                if count.* < room {
+                    descriptors[count.*] = passed
+                    count.* += 1
+                } else {
+                    const ignored = close(passed)
+                }
+                index += 1
+            }
+        }
+        offset += ((record_length + 7) / 8) * 8
+    }
+    if (load32(header_bytes, 48) & MSG_CTRUNC) != 0 { return -71 }
+    return received
+}

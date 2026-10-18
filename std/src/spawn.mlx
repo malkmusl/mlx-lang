@@ -1,0 +1,255 @@
+// std.spawn: starting programs. A child is described by Options (what
+// runs, with which arguments and environment, and what the child does
+// with its descriptors before execve), started with `start`, and waited
+// for with `wait` or `ended`:
+//
+//     var options = spawn.options(path, argv, envp)
+//     options.output = log            // its standard output (and errors)
+//     options.errors = log
+//     options.searchPath = true       // a name without a slash: in PATH
+//     const pid = spawn.start(&options)
+//     const status = spawn.wait(pid)  // the exit code, or 128 + signal
+//
+// `startReading` hands back a pipe with what the child writes, and
+// `capture` runs a program to its end with its output kept.
+//
+// The child is forked (or vforked with `shareMemory`, for a large parent:
+// the child borrows its memory until execve, so only these system calls
+// run in it). Everything the child does is here: descriptors moved and
+// kept, its directory, a session of its own, its signals unblocked, the
+// program found in PATH; a program that cannot run exits with 127, as a
+// shell's would. Programs whose child does more (a pty's, a login's)
+// fork themselves with std.linux.process.fork and run `execute`.
+const std = @import("std")
+
+const linux = std.linux
+const process = std.linux.process
+
+// PATH when the environment has none (as execvp's).
+pub const DEFAULT_PATH: []const u8 = "/usr/local/bin:/usr/bin:/bin"
+
+pub const Options = struct {
+    // The program (NUL-terminated), its NULL-terminated arguments (the
+    // first is its name) and environment.
+    program: [*]const u8
+    arguments: [*][*]const u8
+    environment: [*][*]const u8
+    // A program named without a slash is looked up in the environment's
+    // PATH (else in `defaultPath`; "": then it does not run).
+    searchPath: bool
+    defaultPath: []const u8
+    // What the child gets as its standard input, output and errors (-1:
+    // the parent's).
+    input: isize
+    output: isize
+    errors: isize
+    // A descriptor the child gets as `extraAt` (-1: none), as a socket's
+    // end handed over at a number agreed on.
+    extra: isize
+    extraAt: isize
+    // Descriptors kept open as they are across execve (FD_CLOEXEC
+    // cleared; -1: none), and ones closed in the child first.
+    keep: isize
+    keepAlso: isize
+    closing: isize
+    closingAlso: isize
+    // The child's working directory (NUL-terminated; null: the parent's).
+    directory: ?[*]const u8
+    // The child leads a session of its own (setsid).
+    newSession: bool
+    // The child starts with no signal blocked (its parent took some
+    // through a signal descriptor).
+    unblockSignals: bool
+    // The program is no child of ours: an intermediate child starts it
+    // and ends at once (reaped here), so nobody waits for the program.
+    detach: bool
+    // vfork rather than fork.
+    shareMemory: bool
+}
+
+// Options that run `program` with `arguments` and `environment` and
+// change nothing else.
+pub fn options(program: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8) -> Options {
+    return Options.{
+        .program = program,
+        .arguments = arguments,
+        .environment = environment,
+        .searchPath = false,
+        .defaultPath = DEFAULT_PATH,
+        .input = -1,
+        .output = -1,
+        .errors = -1,
+        .extra = -1,
+        .extraAt = -1,
+        .keep = -1,
+        .keepAlso = -1,
+        .closing = -1,
+        .closingAlso = -1,
+        .directory = null,
+        .newSession = false,
+        .unblockSignals = false,
+        .detach = false,
+        .shareMemory = false,
+    }
+}
+
+fn hasSlash(program: [*]const u8) -> bool {
+    var index: usize = 0
+    while program[index] != 0 {
+        if program[index] == 47 { return true }
+        index += 1
+    }
+    return false
+}
+
+// execve `program`, looked up in `path` (directories separated by ':')
+// when it has no slash. Returns only when it could not run (in a child,
+// before it exits).
+pub fn executeIn(program: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8, path: []const u8) -> void {
+    if hasSlash(program) {
+        _ = process.execute(program, arguments, environment)
+        return
+    }
+    var length: usize = 0
+    while program[length] != 0 { length += 1 }
+    var candidate: [1024]u8 = undefined
+    const candidate_bytes: [*]u8 = &candidate
+    var start: usize = 0
+    while start <= path.length {
+        var end = start
+        while end < path.length && path[end] != 58 { end += 1 }
+        if end > start && end - start + length + 2 < 1024 {
+            var at = std.text.append(candidate_bytes, 0, end - start, path[start..end])
+            candidate[at] = 47
+            at += 1
+            at = std.text.append(candidate_bytes, at, at + length, program[0..length])
+            candidate[at] = 0
+            _ = process.execute(candidate_bytes, arguments, environment)
+        }
+        start = end + 1
+    }
+}
+
+// The same with the environment's PATH (`fallback` when it has none).
+pub fn execute(program: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8, fallback: []const u8) -> void {
+    const found = std.process.environmentFrom(environment, "PATH")
+    if found == null {
+        executeIn(program, arguments, environment, fallback)
+        return
+    }
+    const path = found.?
+    executeIn(program, arguments, environment, std.string.asSlice(path))
+}
+
+// What the child does between fork and execve; it never returns.
+fn child(spec: *const Options) -> void {
+    if spec.*.closing >= 0 { linux.close(spec.*.closing) }
+    if spec.*.closingAlso >= 0 { linux.close(spec.*.closingAlso) }
+    if spec.*.unblockSignals { process.unblockAllSignals() }
+    if spec.*.newSession { _ = process.setSession() }
+    if spec.*.input >= 0 { _ = linux.dup2(spec.*.input, 0) }
+    if spec.*.output >= 0 { _ = linux.dup2(spec.*.output, 1) }
+    if spec.*.errors >= 0 { _ = linux.dup2(spec.*.errors, 2) }
+    if spec.*.extra >= 0 && spec.*.extraAt >= 0 {
+        // dup2 onto itself would leave FD_CLOEXEC set.
+        if spec.*.extra == spec.*.extraAt {
+            _ = linux.keepOnExec(spec.*.extra)
+        } else {
+            _ = linux.dup2(spec.*.extra, spec.*.extraAt)
+        }
+    }
+    if spec.*.keep >= 0 { _ = linux.keepOnExec(spec.*.keep) }
+    if spec.*.keepAlso >= 0 { _ = linux.keepOnExec(spec.*.keepAlso) }
+    if spec.*.directory != null {
+        const directory = spec.*.directory.?
+        _ = linux.chdir(directory)
+    }
+    if spec.*.detach && process.fork() != 0 { linux.exitGroup(0) }
+    if spec.*.searchPath {
+        execute(spec.*.program, spec.*.arguments, spec.*.environment, spec.*.defaultPath)
+    } else {
+        _ = process.execute(spec.*.program, spec.*.arguments, spec.*.environment)
+    }
+    linux.exitGroup(127)
+}
+
+// Starts the child: its pid (with `detach`: the intermediate child's,
+// already reaped), or -errno.
+pub fn start(spec: *const Options) -> isize {
+    var pid: isize = 0
+    if spec.*.shareMemory {
+        pid = linux.syscall0(linux.SYS_vfork)
+    } else {
+        pid = process.fork()
+    }
+    if pid == 0 { child(spec) }
+    if pid > 0 && spec.*.detach {
+        var status: usize = 0
+        _ = process.waitProcess(pid, &status, 0)
+    }
+    return pid
+}
+
+// Starts the child with its output (and its errors when `errors_too`)
+// into a new pipe, whose read end (close-on-exec, and non-blocking when
+// `nonblocking`) goes to `read_end`: the pid, or -errno.
+pub fn startReading(spec: *Options, errors_too: bool, nonblocking: bool, read_end: *isize) -> isize {
+    var reading: isize = -1
+    var writing: isize = -1
+    const flags = if nonblocking { linux.O_CLOEXEC | linux.O_NONBLOCK } else { linux.O_CLOEXEC }
+    if !linux.pipe(&reading, &writing, flags) { return linux.EMFILE }
+    spec.*.output = writing
+    if errors_too { spec.*.errors = writing }
+    const pid = start(spec)
+    linux.close(writing)
+    if pid < 0 {
+        linux.close(reading)
+        return pid
+    }
+    read_end.* = reading
+    return pid
+}
+
+// Waits for `pid` to end: its exit code, or 128 plus the signal that
+// ended it (255 when it was no child of ours).
+pub fn wait(pid: isize) -> usize {
+    var status: usize = 0
+    if process.waitProcess(pid, &status, 0) != pid { return 255 }
+    return process.exitStatus(status)
+}
+
+// Whether `pid` has ended (it is reaped then; its status in `status`);
+// false while it runs.
+pub fn ended(pid: isize, status: *usize) -> bool {
+    var raw: usize = 0
+    const waited = process.waitProcess(pid, &raw, linux.WNOHANG)
+    if waited == 0 { return false }
+    status.* = if waited == pid { process.exitStatus(raw) } else { 255 }
+    return true
+}
+
+// Runs the child to its end with its output (and its errors when
+// `errors_too`) read into `into` (what does not fit is read and dropped):
+// the bytes kept, the exit status in `status` (as `wait`'s); -errno when
+// it did not start.
+pub fn capture(spec: *Options, errors_too: bool, into: [*]u8, capacity: usize, status: *usize) -> isize {
+    var reading: isize = -1
+    const pid = startReading(spec, errors_too, false, &reading)
+    if pid < 0 { return pid }
+    var length: usize = 0
+    var spare: [512]u8 = undefined
+    while true {
+        var got: isize = 0
+        if length < capacity {
+            got = linux.read(reading, into + length, capacity - length)
+        } else {
+            got = linux.read(reading, &spare, 512)
+        }
+        if got == linux.EINTR { continue }
+        if got <= 0 { break }
+        if length < capacity { length += @bitCast(usize, got) }
+    }
+    linux.close(reading)
+    status.* = wait(pid)
+    return @bitCast(isize, length)
+}
