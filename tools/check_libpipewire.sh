@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MLX Capture's client library (projects/desktop/libpipewire, built by
+# MLX Capture's client library (compiler/capi/pipewire, built by
 # tools/build_libpipewire.sh) as the stand-in for PipeWire's libpipewire:
 #
 #   - it exports what libpipewire 1.0.5 does (every function and the two

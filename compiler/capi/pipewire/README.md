@@ -28,7 +28,7 @@ linked against PipeWire's library load it in its place: GStreamer's
 
 ## How it is made
 
-- **Memory and calls** (`../libpulse/c.mlx`, shared with libpulse): the
+- **Memory and calls** (`../pulse/c.mlx`, shared with libpulse): the
   objects (loops, contexts, cores, proxies, streams, properties) live in C
   memory (`calloc`), since a call's arena is gone when it returns; the
   program's callbacks are called through function pointers. Locks are
@@ -41,7 +41,7 @@ linked against PipeWire's library load it in its place: GStreamer's
   pw_properties` as C reads it (`props->dict`, the items in an array of
   C strings), building, lookup, the parsing of numbers and booleans,
   copying, updating by keys, the `{ key = value }` strings,
-  `pw_properties_setf`'s printf (`../libpulse/printf.mlx`) and the JSON
+  `pw_properties_setf`'s printf (`../pulse/printf.mlx`) and the JSON
   serialization. `tools/libpipewire_values.py` compares 106 results with
   PipeWire's library.
 - **Loops** (`loop.mlx`, `thread_loop.mlx`, `export_loops.mlx`): `pw_loop`
