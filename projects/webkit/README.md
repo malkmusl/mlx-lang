@@ -12,31 +12,86 @@ WebKit's own generators to the byte.
 The sources are WPE WebKit 2.54.1's tree: `WEBKIT_SOURCE` (the directory
 with `Source/`), by default /home/user/csrc/wpe/wpewebkit-2.54.1.
 
+Two of WebKit's ports are built, by the same steps from a description
+of each (`Port` in build.mlx): JSCOnly (JavaScriptCore alone, the
+generic event loop) and WPE, whose lower layers stand on GLib, GObject
+and GIO, here mlx-glib (projects/glib).
+
     ./mlx build webkit-bmalloc        bmalloc and libpas (libbmalloc.a)
     ./mlx build webkit-wtf            WTF, the JSCOnly port, on mlx-unicode (libWTF.a)
     ./mlx build webkit-jsc-derived    what JavaScriptCore's build generates
     ./mlx build webkit-webcore-derived  what WebCore's build generates (the WPE port)
     ./mlx build webkit-jsc            JavaScriptCore, C_LOOP (libJavaScriptCore.a)
     ./mlx build webkit-jsc-shell      mlx-out/webkit/bin/jsc
+
+    ./mlx build webkit-wpe-bmalloc    the WPE port's bmalloc
+    ./mlx build webkit-wpe-wtf        WTF for WPE (PlatformWPE.cmake's sources) on mlx-glib and mlx-unicode
+    ./mlx build webkit-wpe-jsc-derived  what JavaScriptCore's build generates for WPE
+    ./mlx build webkit-wpe-wtf-test   mlx-out/webkit/wpe/bin/wtf-test (tests/wtf-wpe.cpp)
+
     ./mlx build webkit                all of it
 
-    tools/check_webkit_generators.sh  the generated sources against those of a build by WebKit's generators
+    tools/check_webkit_generators.sh [jsconly|wpe]  the generated sources against those of a build by WebKit's generators (JSC_REFERENCE)
     tools/check_webcore_generators.sh WebCore's likewise (WEBCORE_REFERENCE, a WPE build's WebCore/DerivedSources)
+    tools/check_wpe_wtf.sh            WTF (WPE) at work: run loop, timers, work queues, strings, URLs
 
-Objects go to mlx-out/webkit/obj, archives to mlx-out/webkit/lib, what
-is generated to mlx-out/webkit/generated (JavaScriptCore/ for JSC's,
-WebCore/ for WebCore's).
+The JSCOnly port's objects go to mlx-out/webkit/obj, its archives to
+mlx-out/webkit/lib, what is generated to mlx-out/webkit/generated
+(JavaScriptCore/ for JSC's, WebCore/ for WebCore's); the WPE port's to
+mlx-out/webkit/wpe/obj, lib, generated and bin.
+
+## The ports
+
+A `Port` says what WebKit's CMake build takes from `Options<PORT>.cmake`
+and the `Platform<PORT>.cmake` files of each library: the configuration
+header's lines (`cmakeconfig.h`, NAME VALUE, in config.mlx), the
+feature defines the generators take, where the files go, the defines
+of bmalloc's, WTF's and JavaScriptCore's sources (as the reference
+build's compile lines have them), the source lists, the include
+directories and libraries beyond every port's. The steps of a port
+other than JSCOnly are named with its tag (`webkit-wpe-wtf`,
+`wpe-libWTF.a`, `wpe-wtf/WTF/wtf/URL.cpp`); the generators are
+programs shared by the ports.
+
+| | JSCOnly | WPE |
+|---|---|---|
+| configuration | `config.JSC_ONLY` | `config.WPE`: the `cmakeconfig.h` of a WPE build with C_LOOP, Skia, no video or web audio |
+| WTF's sources | `lists/wtf.txt` | `lists/wtf-wpe.txt` (the reference build's 189: `wtf/glib`, `generic/MainThreadGeneric`, `WorkQueueGeneric`, `linux`, `posix`, `unix`, `android`) |
+| JavaScriptCore's source lists | `Sources.txt` | and `inspector/remote/SourcesGLib.txt` |
+| forwarding headers | `lists/jsc-headers.txt` | and `lists/jsc-headers-glib.txt` (the remote inspector's) |
+| JavaScriptCore's GLib API | | `JavaScriptCoreGLib/`: `jsc/*.h` of `lists/jsc-glib-api.txt` (the 2022 API), `JSCVersion.h`, `Headers/jsc` |
+| defines | `BUILDING_JSCONLY__` | `BUILDING_WPE__`, `JSC_GLIB_API_ENABLED`, `GETTEXT_PACKAGE`, `PKGDATADIR` |
+| beyond mlx-unicode | | mlx-glib's headers and `libmlxglib.so` |
+
+The inspector's protocol follows each port's feature defines
+(`ENABLE_REMOTE_INSPECTOR` and the others of WPE). For WPE, every file
+of JavaScriptCore's DerivedSources is the reference build's to the
+byte but `LLIntAssembly.h`: the interpreter's offsets are those of the
+compiler that compiled the offsets extractor, and GCC lays out
+`[[no_unique_address]]` members, which mlx-cc does not, otherwise (in
+the WPE configuration `JSC::VM`'s first members). The check compares
+it with what WebKit's own offlineasm (Ruby) makes of mlx-cc's
+extractor, and that is the same to the byte.
+
+`tests/wtf-wpe.cpp` runs WTF (WPE) on mlx-glib: `RunLoop::run()` on
+GLib's main loop with a repeating `RunLoop::Timer` and
+`RunLoop::dispatchAfter`, `WorkQueue::create` and `dispatch` from its
+thread back to the main one, `WTF::String` (UTF-8, case, splitting,
+numbers) and `URL` (parsing, relative URLs, file paths).
+`tests/wtf-wpe.expected` is what the same program prints built by GCC
+against the reference build's WTF and GLib 2.80.
 
 ## Parts
 
 | File | What |
 |---|---|
 | `build.mlx` | The steps: the libraries from WebKit's source lists, the generators and their outputs, the forwarding headers (`<bmalloc/...>`, `<JavaScriptCore/...>`), the configuration header |
-| `config.mlx` | The JSCOnly configuration (`cmakeconfig.h`'s defines) and its feature defines; the WPE port's feature defines |
+| `config.mlx` | The JSCOnly and WPE configurations (`cmakeconfig.h`'s defines) and their feature defines |
 | `webcore.mlx` | WebCore's generated sources (WPE): the generators run as WebCore's CMake files run its scripts, gperf after them, the copies of the source lists and their unified sources |
 | `unified.mlx` | Unified sources: generate-unified-source-bundles.py's bundles of a source list (Sources.txt), made while the steps are declared |
-| `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for the port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces |
+| `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for each port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces |
 | `generators/` | WebKit's code generators in Mlx (below) |
+| `tests/` | `wtf-wpe.cpp`: a program of WTF's for the WPE port, and what it prints |
 
 ## The generators
 
@@ -55,6 +110,7 @@ WebCore/ for WebCore's).
 | `regextables.mlx` | yarr/create_regex_tables | yarr/RegExpJitTables.h |
 | `yarrcanonicalize.mlx` | generateYarrCanonicalizeUnicode | yarr/YarrCanonicalizeUnicode.cpp |
 | `yarrunicode.mlx` (+ `ucdsupport.mlx`) | generateYarrUnicodePropertyTables.py | yarr/UnicodePatternTables.h |
+| `glibapi.mlx` (webkit-glib-api) | Scripts/glib/generate-api-header.py with unifdef; CMake's configure_file | the GLib API's headers (WPE: JavaScriptCoreGLib/DerivedSources/jsc/*.h, JSCVersion.h) |
 | `support.mlx`, `rapidhash.mlx` | | what the generators share; WTF's string hash |
 
 WebCore's (`webcore.mlx` runs them):
@@ -78,10 +134,12 @@ WebCore's (`webcore.mlx` runs them):
 | `webcoredomjit.mlx` | domjit/generate-abstract-heap.rb | DOMJITAbstractHeapRepository.h |
 | `webcoreatspi.mlx` | gdbus-codegen 2.80 (--interface-info-header/-body) | AccessibilityAtspiInterfaces.h/.c |
 
-Every source JavaScriptCore's build generates (299 files, and the 167
-unified bundles) is made so, and every file of WebCore's DerivedSources
-for the WPE port (5464 files: the 518 unified bundles and the copies of
-the source lists among them). Two of them name paths and differ by those
-alone: ColorData.cpp's header repeats gperf's command line with its
+Every source JavaScriptCore's build generates (JSCOnly: 300 files, the
+167 unified bundles and the copy of Sources.txt among them; WPE: 302,
+with 168 bundles and SourcesGLib.txt, and the 9 headers of its GLib
+API) is made so, and every file of
+WebCore's DerivedSources for the WPE port (5464 files: the 518 unified
+bundles and the copies of the source lists among them). Two of them
+name paths and differ by those alone: ColorData.cpp's header repeats gperf's command line with its
 output file, and supplemental_dependency.tmp lists the IDL files by
 path, the generated one among them.
