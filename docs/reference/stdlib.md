@@ -724,7 +724,8 @@ specialized over.
 **Source tests:** `134_bootstrap_fs_runtime.mlx`,
 `142_bootstrap_process_arguments_runtime.mlx`,
 `204_process_environment_runtime.mlx`, `205_bootstrap_fs_status_runtime.mlx`,
-`139_bootstrap_elf_file_runtime.mlx`, `277_fs_entries_runtime.mlx`
+`139_bootstrap_elf_file_runtime.mlx`, `277_fs_entries_runtime.mlx`,
+`353_fs_whole_files_runtime.mlx` (run by `tests/run_std_modules.sh`)
 
 `fs.xml` names a portable filesystem API (`open create read write seek stat
 iterateDirectory makeDir delete rename`) "over std.os/std.posix backends,"
@@ -751,6 +752,30 @@ while std.fs.nextEntry(&reader, &entry) {
     ...
 }
 if reader.failed { ... }
+```
+
+Whole files, by path, the way a program reads a setting or a /proc value
+and writes a cache (`tests/353_fs_whole_files_runtime.mlx`):
+`readFile(path, into, capacity)` reads all of a file or its first
+`capacity` bytes and returns how many (0 when it could not be opened;
+`readFileResult` returns -1 then), `readFileAlloc(path, allocator)` reads
+one of any length into an `ArrayList` (null when it could not be opened),
+`writeFile(path, bytes, length, mode)` writes one (made or emptied first),
+and `replaceFile(path, bytes, length, mode)` writes one whole or not at
+all: into `PATH.new`, made anew with `mode`, then renamed over `PATH`.
+`makeDirectories(path, mode)` is `mkdir -p` (for a slice),
+`makeParents(path, mode)` makes the folders a file goes in, `isDirectory`
+follows links, and `executablePath(into, capacity)` is /proc/self/exe's
+target, NUL-terminated. The desktop's settings files, the coreutils'
+operands, mlx-init, mlx-netd, mlx-sh, the generators under std/registry
+and the compiler's own output use them.
+
+```mlx
+var line: [256]u8 = undefined
+const bytes: [*]u8 = &line
+const length = std.fs.readFile("/proc/sys/kernel/hostname".pointer, bytes, 256)
+// `path` a slice, `c_path` the same path NUL-terminated.
+if !std.fs.makeParents(path, 493) || !std.fs.replaceFile(c_path, text.pointer, text.length, 420) { ... }
 ```
 
 A round-trip open/write/seek/read/close/delete over `/tmp`:

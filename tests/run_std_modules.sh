@@ -11,6 +11,9 @@
 #   tests/351_random_runtime.mlx        std.random (xoshiro256**'s and
 #                                       splitmix64's reference outputs)
 #   tests/352_terminal_tty_runtime.mlx  std.terminal.tty on a pty of its own
+#   tests/353_fs_whole_files_runtime.mlx
+#                                       std.fs's whole files, folders made
+#                                       on the way and executablePath
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -44,6 +47,7 @@ run 349_sha2_runtime "SHA-224 and SHA-384 (and SHA-1, SHA-256, SHA-512)"
 run 350_math_helpers_runtime "min, max, clamp, absolute, sqrt and smoothstep"
 run 351_random_runtime "getrandom, xoshiro256**, splitmix64 and xorshift64*"
 run 352_terminal_tty_runtime "a pty's size, raw mode and process groups"
+run 353_fs_whole_files_runtime "files read and written whole, mkdir -p and the program's path"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
