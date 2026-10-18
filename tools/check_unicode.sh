@@ -86,6 +86,15 @@ fi
 "$work/api" || fail "tests/api.mlx exits $?"
 echo "ok   the API modules compile, their macros run as Mlx"
 
+for test in tests/*_unicode_*_runtime.mlx; do
+    name=$(basename "$test" .mlx)
+    ./mlx --quiet "$test" -o "$work/$name" || fail "$test does not build"
+    status=0
+    MLX_UNICODE_DATA="$repo_root/mlx-out/share/mlx-unicode/cldr.dat" "$work/$name" || status=$?
+    [ "$status" -eq 13 ] || fail "$test exits $status"
+    echo "ok   $test"
+done
+
 cc() { mlx-out/bin/mlx-cc -I"$headers" "$@" mlx-out/lib/libmlxunicode.so; }
 run() { LD_LIBRARY_PATH=mlx-out/lib "$@"; }
 
