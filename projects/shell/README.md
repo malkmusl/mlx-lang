@@ -120,7 +120,8 @@ given back after it (`std.turns`), so a long loop does not grow the
 shell; with `MLX_TURNS_POISON` set what is given back is overwritten,
 which `tools/check_shell.sh` runs with.
 
-- `sys.mlx`: the syscalls, termios, signals.
+- `sys.mlx`: the syscalls and signals; the terminal (raw mode, its size,
+  job control's process groups) is `std.terminal.tty`'s.
 - `state.mlx`: the `Shell`, the arenas, variables, functions,
   positionals, messages.
 - `parser.mlx`: a tokenizer and recursive descent into nodes (words are

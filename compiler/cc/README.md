@@ -569,7 +569,56 @@ slots hold the class's final overriders, so a call through any base
 reaches the override and `delete` through any base frees the whole
 object; a polymorphic base goes first in the layout, and a class with
 virtual functions over bases without any has its own vtable pointer
-first. Constructors and destructors defaulted outside the class, and a
+first. A virtual function of a base after the first called on the
+derived object goes through that base's vtable pointer, a destructor
+sets the vtable pointers back to its class's tables before its body (so
+that what it calls is its class's, as the derived part is gone), and a
+virtual destructor defaulted (`virtual ~A() = default;`), or the one a
+class has implicitly when a base's is virtual, is made (when a vtable
+holding it is used, or it is called: at the end of the unit, a member's
+class complete by then), so `delete` through a base unmakes the whole
+object (`tests/cpp/virtualdtors.cpp`, `tests/cpp/secondarycalls.cpp`).
+
+Virtual bases (`cpp.mlx`'s section of that name) are laid out as the
+Itanium ABI says, as g++ lays them out: the primary base (the first
+non-virtual polymorphic base, else a nearly empty virtual base no other
+base claims) or the class's own vtable pointer at 0, the other
+non-virtual bases at their size without their virtual bases (a non-POD
+base's tail padding reused), the members, then each virtual base once
+(`tests/cpp/vbaselayout.cpp` prints the sizes and offsets g++'s build
+does). A virtual base is reached through the offset its vtable holds
+before the offset to the top, where the ABI puts the vbase offsets
+(after the vcall offsets): a conversion to it, its members, its
+functions (a null pointer stays null; the conversion back is refused,
+as C++ has it). Every subobject with a vtable pointer has a table of
+ours (the ABI's vcall and vbase offsets, offset to the top and a null
+typeinfo before it); every base subobject with virtual bases has
+construction vtables (its own functions, its virtual bases where the
+whole object has them) and a VTT listing them, then its bases' VTTs. A
+constructor of such a class reads its VTT from the object's first word,
+which its caller sets: 0 for a complete object, whose virtual bases it
+makes first (from the most derived class's initializers, an indirect
+virtual base's too; the intermediate classes' are passed over), else
+the VTT of the base subobject it makes; its symbol is the base-object
+one (`C2`), and `C1` is an entry zeroing the word that complete objects
+are made through (g++'s classes too). A destructor takes the VTT after
+`this` (`D2`; `D1` its entry, which a virtual destructor's slot holds)
+and unmakes the virtual bases, last, for a complete object
+(`tests/cpp/vbasector.cpp` traces the constructions and destructions,
+virtual calls in constructors and destructors among them). Final
+overriders along virtual paths are taken per table (each slot's
+adjustment of `this` is the table's own: no thunks, no vcall offsets
+read; `tests/cpp/vbasecalls.cpp`). The implicit copy constructor and
+assignment go member by member, the virtual base copied by the complete
+object once, the vtable pointers left as they are
+(`tests/cpp/vbasecopy.cpp`, `tests/cpp/vbaseforms.cpp`). Objects g++'s
+code makes and ours share their layout, the vbase offsets and the
+complete-object constructors and destructors (`tests/cpp/vbaselink`:
+each side makes the other's objects and reads them through their
+virtual bases); their vtables' slots, construction vtables and VTTs are
+not g++'s, so a virtual call or a base subobject's construction across
+the two does not work, and vtables nothing refers to are left out of an
+object (so that g++'s of the name is the one linked). Constructors and destructors defaulted outside the class, and a
 class template's friend functions made when used, followed; then
 init-captures (`[f = std::move(f), &r = x, n{3}]`, a member made from
 its initializer, `tests/cpp/lambdas2.cpp`), the implicit move
@@ -666,8 +715,8 @@ a pack in a lambda's explicit captures, a generic
 lambda capturing `this` implicitly, a lambda with captures in a
 constant expression, constant
 evaluation of `<=>`, structured bindings in an
-`if` or `switch` condition, virtual bases, `dynamic_cast` and
-`typeid`, a data
+`if` or `switch` condition, `dynamic_cast` (a `static_cast` here,
+refused from a virtual base) and `typeid`, a data
 member of the class named in a declaration inside it (`auto get() ->
 decltype(x)`; in a member template's signature it is seen), overloads
 of a name joined across bases by `using B::f...;`,
@@ -680,7 +729,9 @@ functions naming the function's locals or the class itself,
 a replaced or class-specific `operator new` for `new T` without
 placement arguments (it calls `_Znwm`, which mlxlibcpp provides). The mangled names leave out the ABI's
 substitutions (`S_`), so a name with a repeated parameter type
-differs from g++'s; constructors have only their `C1` symbol. Programs are linked to
+differs from g++'s; constructors have only their `C1` symbol (those of a
+class with virtual bases `C2` and the entry `C1`, its destructor `D2`
+and `D1`). Programs are linked to
 glibc without symbol versions, so a symbol glibc keeps in two
 versions binds the older one (`realpath` refusing a null buffer).
 The C++

@@ -1,0 +1,916 @@
+// TrueType outlines (`glyf` and `loca`): a glyph's contours and points,
+// its components put together, its phantom points (the side bearings
+// and advances as points) and its metrics, as FreeType's TrueType driver
+// loads them unhinted: scaled by the size's TrueType scales (those of the
+// rounded ppem when `head` asks for integer ppems), varied by `gvar` for
+// a variable font.
+const m = @import("./memory.mlx")
+const r = @import("./records.mlx")
+const o = @import("./objects.mlx")
+const calc = @import("./calc.mlx")
+const sfnt = @import("./sfnt.mlx")
+const variations = @import("./variations.mlx")
+const outlines = @import("./outlines.mlx")
+
+const Face = o.Face
+
+// ---------------------------------------------------------------------------
+// `loca`.
+
+pub fn loadLocations(f: *Face, root: *o.Face) -> i32 {
+    const glyf = o.table(f, o.TAG_glyf)
+    f.*.glyfLen = glyf.1
+    f.*.glyfOffset = if glyf.1 != 0 { glyf.0 } else { 0 }
+    const loca = o.table(f, o.TAG_loca)
+    if loca.1 == 0 { return r.ERR_LOCATIONS_MISSING }
+    const shift: u6 = if sfnt.indexToLocFormat(f) != 0 { 2 } else { 1 }
+    var tableLen = loca.1
+    const maxLen: u64 = @intCast(u64, 0x10000) << shift
+    if tableLen > maxLen { tableLen = maxLen }
+    f.*.numLocations = tableLen >> shift
+    const glyphs = @intCast(u64, root.*.numGlyphs)
+    if f.*.numLocations != glyphs + 1 && f.*.numLocations < glyphs + 1 {
+        // (A table too short for the glyphs: longer, when the bytes after
+        // it are not another table's.)
+        const newLen = (glyphs + 1) << shift
+        const pos = loca.0
+        var dist: u64 = 0x7FFFFFFF
+        var found = false
+        var i: i64 = 0
+        while i < f.*.numTables {
+            const offset = @intCast(u64, m.get32(f.*.tables + @intCast(usize, i) * 16 + 8))
+            if offset > pos && offset - pos < dist {
+                dist = offset - pos
+                found = true
+            }
+            i += 1
+        }
+        if !found { dist = f.*.size - pos }
+        if newLen <= dist {
+            f.*.numLocations = glyphs + 1
+            tableLen = newLen
+        } else {
+            root.*.numGlyphs = if f.*.numLocations != 0 { @intCast(i64, f.*.numLocations) - 1 } else { 0 }
+        }
+    }
+    if !o.within(f, loca.0, tableLen) { return r.ERR_INVALID_STREAM_OPERATION }
+    f.*.locaOffset = loca.0
+    f.*.locaSize = tableLen
+    return r.OK
+}
+
+// The offset of glyph `gindex` in `glyf` and its length (FreeType's
+// tt_face_get_location).
+pub fn location(f: *Face, gindex: u64) -> (u64, u64) {
+    var pos1: u64 = 0
+    var pos2: u64 = 0
+    if gindex < f.*.numLocations {
+        if sfnt.indexToLocFormat(f) != 0 {
+            const p = f.*.locaOffset + gindex * 4
+            pos1 = @intCast(u64, o.u32At(f, p))
+            pos2 = pos1
+            if gindex + 2 <= f.*.numLocations { pos2 = @intCast(u64, o.u32At(f, p + 4)) }
+        } else {
+            const p = f.*.locaOffset + gindex * 2
+            pos1 = @intCast(u64, o.u16At(f, p))
+            pos2 = pos1
+            if gindex + 2 <= f.*.numLocations { pos2 = @intCast(u64, o.u16At(f, p + 2)) }
+            pos1 <<= 1
+            pos2 <<= 1
+        }
+    }
+    if pos1 > f.*.glyfLen { return -> (0, 0) }
+    if pos2 > f.*.glyfLen {
+        if gindex == f.*.numLocations - 2 {
+            pos2 = f.*.glyfLen
+        } else {
+            return -> (0, 0)
+        }
+    }
+    if pos2 >= pos1 { return -> (pos1, pos2 - pos1) }
+    return -> (pos1, f.*.glyfLen - pos1)
+}
+
+// Whether the font's only glyph with an outline is .notdef (a bitmap
+// font with an empty `glyf`).
+pub fn singleNotdef(face: usize) -> bool {
+    const f = o.faceRecord(face)
+    var count: i64 = 0
+    var index: u64 = 0
+    var i: u64 = 0
+    while i < f.*.numLocations {
+        if location(f, i).1 > 0 {
+            count += 1
+            if count > 1 { break }
+            index = i
+        }
+        i += 1
+    }
+    if count != 1 { return false }
+    if index == 0 { return true }
+    if (o.faceRecord(face).*.faceFlags & r.FACE_GLYPH_NAMES) == 0 { return false }
+    if @intCast(i64, index) >= o.faceRecord(face).*.numGlyphs { return false }
+    return m.cIs(sfnt.postGlyphName(f, @intCast(i64, index)), ".notdef")
+}
+
+// ---------------------------------------------------------------------------
+// The glyph loader: the outline being made (points, tags and contours in
+// the slot's storage), the glyph's header and metrics, the phantom points.
+
+pub const Loader = struct {
+    face: usize
+    slot: usize
+    loadFlags: i64
+    xScale: i64
+    yScale: i64
+    glyphIndex: i64
+    byteLen: u64
+    nContours: i64
+    bboxXMin: i64
+    bboxYMin: i64
+    bboxXMax: i64
+    bboxYMax: i64
+    leftBearing: i64
+    advance: i64
+    topBearing: i64
+    vadvance: i64
+    linear: i64
+    linearDef: bool
+    pp1x: i64
+    pp1y: i64
+    pp2x: i64
+    pp2y: i64
+    pp3x: i64
+    pp3y: i64
+    pp4x: i64
+    pp4y: i64
+    // The outline so far, and the points of the simple glyph being loaded.
+    nPoints: i64
+    currentPoints: i64
+    nOutlineContours: i64
+    outlineFlags: i32
+    // The subglyphs so far (8 words each).
+    numSubglyphs: i64
+    // The glyphs being loaded, a composite's at each depth (to catch one
+    // made of itself).
+    composites: usize
+    compositesMax: i64
+    compositesCount: i64
+    // Scratch for variations: unrounded points.
+    unrounded: usize
+    unroundedMax: i64
+}
+
+pub fn loader(address: usize) -> *Loader { unsafe { return @ptrFromInt(*Loader, address) } }
+
+fn pointX(s: *o.Slot, i: i64) -> i64 { return m.getI64(s.*.points + @intCast(usize, i) * 16) }
+fn pointY(s: *o.Slot, i: i64) -> i64 { return m.getI64(s.*.points + @intCast(usize, i) * 16 + 8) }
+fn setPoint(s: *o.Slot, i: i64, x: i64, y: i64) -> void {
+    m.putI64(s.*.points + @intCast(usize, i) * 16, x)
+    m.putI64(s.*.points + @intCast(usize, i) * 16 + 8, y)
+}
+
+// Room in the slot's storage for `points` points and `contours` contours.
+pub fn ensure(memory: usize, s: *o.Slot, points: i64, contours: i64) -> bool {
+    if points > s.*.pointsMax {
+        var n = s.*.pointsMax * 2
+        if n < points { n = points + 16 }
+        const p = m.grow(memory, s.*.points, @intCast(usize, s.*.pointsMax) * 16, @intCast(usize, n) * 16)
+        if p == 0 { return false }
+        s.*.points = p
+        const t = m.grow(memory, s.*.tags, @intCast(usize, s.*.pointsMax), @intCast(usize, n))
+        if t == 0 { return false }
+        s.*.tags = t
+        s.*.pointsMax = n
+    }
+    if contours > s.*.contoursMax {
+        var n = s.*.contoursMax * 2
+        if n < contours { n = contours + 8 }
+        const c = m.grow(memory, s.*.contours, @intCast(usize, s.*.contoursMax) * 2, @intCast(usize, n) * 2)
+        if c == 0 { return false }
+        s.*.contours = c
+        s.*.contoursMax = n
+    }
+    return true
+}
+
+fn ensureSubglyphs(memory: usize, s: *o.Slot, count: i64) -> bool {
+    if count > s.*.subglyphsMax {
+        var n = s.*.subglyphsMax * 2
+        if n < count { n = count + 8 }
+        const p = m.grow(memory, s.*.subglyphStore, @intCast(usize, s.*.subglyphsMax) * 64, @intCast(usize, n) * 64)
+        if p == 0 { return false }
+        s.*.subglyphStore = p
+        s.*.subglyphsMax = n
+    }
+    return true
+}
+
+// A subglyph: index, flags, arg1, arg2, xx, xy, yx, yy.
+fn sub(s: *o.Slot, i: i64, field: usize) -> i64 { return m.getI64(s.*.subglyphStore + @intCast(usize, i) * 64 + field * 8) }
+fn setSub(s: *o.Slot, i: i64, field: usize, value: i64) -> void { m.putI64(s.*.subglyphStore + @intCast(usize, i) * 64 + field * 8, value) }
+
+const ARGS_ARE_WORDS: i64 = 0x0001
+const ARGS_ARE_XY_VALUES: i64 = 0x0002
+const ROUND_XY_TO_GRID: i64 = 0x0004
+const WE_HAVE_A_SCALE: i64 = 0x0008
+const MORE_COMPONENTS: i64 = 0x0020
+const WE_HAVE_AN_XY_SCALE: i64 = 0x0040
+const WE_HAVE_A_2X2: i64 = 0x0080
+const WE_HAVE_INSTR: i64 = 0x0100
+const USE_MY_METRICS: i64 = 0x0200
+const OVERLAP_COMPOUND: i64 = 0x0400
+const SCALED_COMPONENT_OFFSET: i64 = 0x0800
+const UNSCALED_COMPONENT_OFFSET: i64 = 0x1000
+
+const ON_CURVE_POINT: u8 = 0x01
+const X_SHORT_VECTOR: u8 = 0x02
+const Y_SHORT_VECTOR: u8 = 0x04
+const REPEAT_FLAG: u8 = 0x08
+const X_POSITIVE: u8 = 0x10
+const SAME_X: u8 = 0x10
+const Y_POSITIVE: u8 = 0x20
+const SAME_Y: u8 = 0x20
+const OVERLAP_SIMPLE: u8 = 0x40
+
+fn hinted(l: *Loader) -> bool { return (l.*.loadFlags & r.LOAD_NO_HINTING) == 0 }
+
+// The glyph's side bearings and advances (FreeType's tt_get_metrics).
+fn getMetrics(l: *Loader, f: *Face, gindex: i64) -> void {
+    const h = variations.glyphMetrics(l.*.face, false, gindex)
+    var tsb: i64 = 0
+    var ah: i64 = 0
+    if f.*.verticalInfo {
+        const v = variations.glyphMetrics(l.*.face, true, gindex)
+        tsb = v.0
+        ah = v.1
+    } else if sfnt.os2Present(f) {
+        tsb = calc.low16(sfnt.typoAscender(f) - l.*.bboxYMax)
+        ah = calc.ulow16(calc.abs(sfnt.typoAscender(f) - sfnt.typoDescender(f)))
+    } else {
+        tsb = calc.low16(sfnt.ascender(f) - l.*.bboxYMax)
+        ah = calc.ulow16(calc.abs(sfnt.ascender(f) - sfnt.descender(f)))
+    }
+    l.*.leftBearing = h.0
+    l.*.advance = h.1
+    l.*.topBearing = tsb
+    l.*.vadvance = ah
+    if !l.*.linearDef {
+        l.*.linearDef = true
+        l.*.linear = h.1
+    }
+}
+
+fn setPhantoms(l: *Loader) -> void {
+    l.*.pp1x = l.*.bboxXMin - l.*.leftBearing
+    l.*.pp1y = 0
+    l.*.pp2x = l.*.pp1x + l.*.advance
+    l.*.pp2y = 0
+    l.*.pp3x = 0
+    l.*.pp3y = l.*.bboxYMax + l.*.topBearing
+    l.*.pp4x = 0
+    l.*.pp4y = l.*.pp3y - l.*.vadvance
+}
+
+fn scalePhantoms(l: *Loader) -> void {
+    if (l.*.loadFlags & r.LOAD_NO_SCALE) != 0 { return }
+    l.*.pp1x = calc.mulFix(l.*.pp1x, l.*.xScale)
+    l.*.pp2x = calc.mulFix(l.*.pp2x, l.*.xScale)
+    l.*.pp3x = calc.mulFix(l.*.pp3x, l.*.xScale)
+    l.*.pp3y = calc.mulFix(l.*.pp3y, l.*.yScale)
+    l.*.pp4x = calc.mulFix(l.*.pp4x, l.*.xScale)
+    l.*.pp4y = calc.mulFix(l.*.pp4y, l.*.yScale)
+}
+
+// A simple glyph's contours, points and tags, after the outline so far
+// (FreeType's TT_Load_Simple_Glyph); `p` and `limit` its bytes after the
+// header.
+fn loadSimple(l: *Loader, f: *Face, s: *o.Slot, start: u64, limit: u64) -> i32 {
+    const memory = f.*.memory
+    const nContours = l.*.nContours
+    const base = l.*.nPoints
+    const baseContours = l.*.nOutlineContours
+    if !ensure(memory, s, base + 4, baseContours + nContours) { return r.ERR_OUT_OF_MEMORY }
+    var p = start
+    if nContours >= 0xFFF || p + 2 * @intCast(u64, nContours) + 2 > limit { return r.ERR_INVALID_OUTLINE }
+    var last: i64 = -1
+    var c: i64 = 0
+    while c < nContours {
+        const end = o.i16At(f, p)
+        p += 2
+        if end <= last { return r.ERR_INVALID_OUTLINE }
+        last = end
+        m.putI16(s.*.contours + @intCast(usize, baseContours + c) * 2, @intCast(i16, end))
+        c += 1
+    }
+    const nPoints = last + 1
+    if !ensure(memory, s, base + nPoints + 4, 0) { return r.ERR_OUT_OF_MEMORY }
+    const nIns = @intCast(u64, o.u16At(f, p))
+    p += 2
+    if p + nIns > limit { return r.ERR_TOO_MANY_HINTS }
+    p += nIns
+    const tags = s.*.tags + @intCast(usize, base)
+    var i: i64 = 0
+    while i < nPoints {
+        if p + 1 > limit { return r.ERR_INVALID_OUTLINE }
+        const flag = m.get8(f.*.data + p)
+        p += 1
+        m.put8(tags + @intCast(usize, i), flag)
+        i += 1
+        if (flag & REPEAT_FLAG) != 0 {
+            if p + 1 > limit { return r.ERR_INVALID_OUTLINE }
+            var count = @intCast(i64, m.get8(f.*.data + p))
+            p += 1
+            if i + count > nPoints { return r.ERR_INVALID_OUTLINE }
+            while count > 0 {
+                m.put8(tags + @intCast(usize, i), flag)
+                i += 1
+                count -= 1
+            }
+        }
+    }
+    if nPoints > 0 && (m.get8(tags) & OVERLAP_SIMPLE) != 0 { l.*.outlineFlags |= r.OUTLINE_OVERLAP }
+    var x: i64 = 0
+    i = 0
+    while i < nPoints {
+        const flag = m.get8(tags + @intCast(usize, i))
+        var delta: i64 = 0
+        if (flag & X_SHORT_VECTOR) != 0 {
+            if p + 1 > limit { return r.ERR_INVALID_OUTLINE }
+            delta = @intCast(i64, m.get8(f.*.data + p))
+            p += 1
+            if (flag & X_POSITIVE) == 0 { delta = 0 - delta }
+        } else if (flag & SAME_X) == 0 {
+            if p + 2 > limit { return r.ERR_INVALID_OUTLINE }
+            delta = o.i16At(f, p)
+            p += 2
+        }
+        x += delta
+        m.putI64(s.*.points + @intCast(usize, base + i) * 16, x)
+        i += 1
+    }
+    var y: i64 = 0
+    i = 0
+    while i < nPoints {
+        const flag = m.get8(tags + @intCast(usize, i))
+        var delta: i64 = 0
+        if (flag & Y_SHORT_VECTOR) != 0 {
+            if p + 1 > limit { return r.ERR_INVALID_OUTLINE }
+            delta = @intCast(i64, m.get8(f.*.data + p))
+            p += 1
+            if (flag & Y_POSITIVE) == 0 { delta = 0 - delta }
+        } else if (flag & SAME_Y) == 0 {
+            if p + 2 > limit { return r.ERR_INVALID_OUTLINE }
+            delta = o.i16At(f, p)
+            p += 2
+        }
+        y += delta
+        m.putI64(s.*.points + @intCast(usize, base + i) * 16 + 8, y)
+        m.put8(tags + @intCast(usize, i), flag & ON_CURVE_POINT)
+        i += 1
+    }
+    // (The contours' ends, relative to the outline so far.)
+    if base != 0 {
+        c = 0
+        while c < nContours {
+            const at = s.*.contours + @intCast(usize, baseContours + c) * 2
+            m.putI16(at, @intCast(i16, calc.low16(@intCast(i64, m.getI16(at)) + base)))
+            c += 1
+        }
+    }
+    l.*.currentPoints = nPoints
+    return r.OK
+}
+
+// The points of a simple glyph scaled (and varied), the phantom points
+// with them (FreeType's TT_Process_Simple_Glyph).
+fn processSimple(l: *Loader, f: *Face, s: *o.Slot) -> i32 {
+    const base = l.*.nPoints
+    var nPoints = l.*.currentPoints
+    setPoint(s, base + nPoints, l.*.pp1x, l.*.pp1y)
+    setPoint(s, base + nPoints + 1, l.*.pp2x, l.*.pp2y)
+    setPoint(s, base + nPoints + 2, l.*.pp3x, l.*.pp3y)
+    setPoint(s, base + nPoints + 3, l.*.pp4x, l.*.pp4y)
+    nPoints += 4
+    var varied = false
+    if variations.isVaried(l.*.face) {
+        if !ensureUnrounded(l, f.*.memory, nPoints) { return r.ERR_OUT_OF_MEMORY }
+        const result = variations.applyGlyphDeltas(l.*.face, l.*.glyphIndex, s.*.points + @intCast(usize, base) * 16, nPoints, s.*.contours + @intCast(usize, l.*.nOutlineContours) * 2, l.*.nContours, base, l.*.unrounded)
+        if result.0 != r.OK { return result.0 }
+        if result.1 { updateFromDeltas(l, f, s.*.points + @intCast(usize, base) * 16, nPoints) }
+        varied = true
+    }
+    if (l.*.loadFlags & r.LOAD_NO_SCALE) == 0 {
+        const xs = l.*.xScale
+        const ys = l.*.yScale
+        var i: i64 = 0
+        while i < nPoints {
+            if varied {
+                const ux = m.getI64(l.*.unrounded + @intCast(usize, i) * 16)
+                const uy = m.getI64(l.*.unrounded + @intCast(usize, i) * 16 + 8)
+                setPoint(s, base + i, (calc.mulFix(ux, xs) +% 32) >> 6, (calc.mulFix(uy, ys) +% 32) >> 6)
+            } else {
+                setPoint(s, base + i, calc.mulFix(pointX(s, base + i), xs), calc.mulFix(pointY(s, base + i), ys))
+            }
+            i += 1
+        }
+    }
+    l.*.pp1x = pointX(s, base + nPoints - 4)
+    l.*.pp1y = pointY(s, base + nPoints - 4)
+    l.*.pp2x = pointX(s, base + nPoints - 3)
+    l.*.pp2y = pointY(s, base + nPoints - 3)
+    l.*.pp3x = pointX(s, base + nPoints - 2)
+    l.*.pp3y = pointY(s, base + nPoints - 2)
+    l.*.pp4x = pointX(s, base + nPoints - 1)
+    l.*.pp4y = pointY(s, base + nPoints - 1)
+    return r.OK
+}
+
+fn ensureUnrounded(l: *Loader, memory: usize, count: i64) -> bool {
+    if count > l.*.unroundedMax {
+        const n = count + 32
+        const p = m.grow(memory, l.*.unrounded, @intCast(usize, l.*.unroundedMax) * 16, @intCast(usize, n) * 16)
+        if p == 0 { return false }
+        l.*.unrounded = p
+        l.*.unroundedMax = n
+    }
+    return true
+}
+
+// After `gvar`'s deltas: the phantom points and the linear advances of
+// the varied points, unless HVAR and VVAR vary them (FreeType's end of
+// TT_Vary_Apply_Glyph_Deltas).
+fn updateFromDeltas(l: *Loader, f: *Face, points: usize, nPoints: i64) -> void {
+    const u = l.*.unrounded
+    if !variations.variesHorizontalAdvances(l.*.face) {
+        l.*.pp1x = m.getI64(points + @intCast(usize, nPoints - 4) * 16)
+        l.*.pp1y = m.getI64(points + @intCast(usize, nPoints - 4) * 16 + 8)
+        l.*.pp2x = m.getI64(points + @intCast(usize, nPoints - 3) * 16)
+        l.*.pp2y = m.getI64(points + @intCast(usize, nPoints - 3) * 16 + 8)
+        l.*.linear = calc.pixRound(m.getI64(u + @intCast(usize, nPoints - 3) * 16) - m.getI64(u + @intCast(usize, nPoints - 4) * 16)) / 64
+    }
+    if !variations.variesVerticalAdvances(l.*.face) {
+        l.*.pp3x = m.getI64(points + @intCast(usize, nPoints - 2) * 16)
+        l.*.pp3y = m.getI64(points + @intCast(usize, nPoints - 2) * 16 + 8)
+        l.*.pp4x = m.getI64(points + @intCast(usize, nPoints - 1) * 16)
+        l.*.pp4y = m.getI64(points + @intCast(usize, nPoints - 1) * 16 + 8)
+        l.*.vadvance = calc.pixRound(m.getI64(u + @intCast(usize, nPoints - 1) * 16 + 8) - m.getI64(u + @intCast(usize, nPoints - 2) * 16 + 8)) / 64
+    }
+}
+
+// A composite glyph's components (FreeType's TT_Load_Composite_Glyph),
+// appended to the subglyphs so far; their count.
+fn loadComposite(l: *Loader, f: *Face, s: *o.Slot, start: u64, limit: u64) -> (i64, i32) {
+    const memory = f.*.memory
+    const numGlyphs = o.faceRecord(l.*.face).*.numGlyphs
+    var p = start
+    var count: i64 = 0
+    while true {
+        const n = l.*.numSubglyphs + count
+        if !ensureSubglyphs(memory, s, n + 1) { return -> (0, r.ERR_OUT_OF_MEMORY) }
+        if p + 4 > limit { return -> (0, r.ERR_INVALID_COMPOSITE) }
+        const flags = o.u16At(f, p)
+        const index = o.u16At(f, p + 2)
+        p += 4
+        if index >= numGlyphs { return -> (0, r.ERR_INVALID_COMPOSITE) }
+        var size: u64 = 2
+        if (flags & ARGS_ARE_WORDS) != 0 { size += 2 }
+        if (flags & WE_HAVE_A_SCALE) != 0 {
+            size += 2
+        } else if (flags & WE_HAVE_AN_XY_SCALE) != 0 {
+            size += 4
+        } else if (flags & WE_HAVE_A_2X2) != 0 {
+            size += 8
+        }
+        if p + size > limit { return -> (0, r.ERR_INVALID_COMPOSITE) }
+        var arg1: i64 = 0
+        var arg2: i64 = 0
+        if (flags & ARGS_ARE_XY_VALUES) != 0 {
+            if (flags & ARGS_ARE_WORDS) != 0 {
+                arg1 = o.i16At(f, p)
+                arg2 = o.i16At(f, p + 2)
+                p += 4
+            } else {
+                arg1 = m.i8at(f.*.data + p)
+                arg2 = m.i8at(f.*.data + p + 1)
+                p += 2
+            }
+        } else {
+            if (flags & ARGS_ARE_WORDS) != 0 {
+                arg1 = o.u16At(f, p)
+                arg2 = o.u16At(f, p + 2)
+                p += 4
+            } else {
+                arg1 = o.byteAt(f, p)
+                arg2 = o.byteAt(f, p + 1)
+                p += 2
+            }
+        }
+        var xx: i64 = 0x10000
+        var yy: i64 = 0x10000
+        var xy: i64 = 0
+        var yx: i64 = 0
+        if (flags & WE_HAVE_A_SCALE) != 0 {
+            xx = o.i16At(f, p) * 4
+            yy = xx
+            p += 2
+        } else if (flags & WE_HAVE_AN_XY_SCALE) != 0 {
+            xx = o.i16At(f, p) * 4
+            yy = o.i16At(f, p + 2) * 4
+            p += 4
+        } else if (flags & WE_HAVE_A_2X2) != 0 {
+            xx = o.i16At(f, p) * 4
+            yx = o.i16At(f, p + 2) * 4
+            xy = o.i16At(f, p + 4) * 4
+            yy = o.i16At(f, p + 6) * 4
+            p += 8
+        }
+        setSub(s, n, 0, index)
+        setSub(s, n, 1, flags)
+        setSub(s, n, 2, arg1)
+        setSub(s, n, 3, arg2)
+        setSub(s, n, 4, xx)
+        setSub(s, n, 5, xy)
+        setSub(s, n, 6, yx)
+        setSub(s, n, 7, yy)
+        count += 1
+        if (flags & MORE_COMPONENTS) == 0 { break }
+    }
+    return -> (count, r.OK)
+}
+
+// Places a component's points (FreeType's TT_Process_Composite_Component):
+// its transform, then its offset (by points matched or by x and y).
+fn processComponent(l: *Loader, f: *Face, s: *o.Slot, n: i64, startPoint: i64, numBasePoints: i64) -> i32 {
+    const flags = sub(s, n, 1)
+    const haveScale = (flags & (WE_HAVE_A_SCALE | WE_HAVE_AN_XY_SCALE | WE_HAVE_A_2X2)) != 0
+    const count = l.*.nPoints - numBasePoints
+    if haveScale {
+        const xx = sub(s, n, 4)
+        const xy = sub(s, n, 5)
+        const yx = sub(s, n, 6)
+        const yy = sub(s, n, 7)
+        var i: i64 = 0
+        while i < count {
+            const px = pointX(s, numBasePoints + i)
+            const py = pointY(s, numBasePoints + i)
+            setPoint(s, numBasePoints + i, calc.mulFix(px, xx) +% calc.mulFix(py, xy), calc.mulFix(px, yx) +% calc.mulFix(py, yy))
+            i += 1
+        }
+    }
+    var x: i64 = 0
+    var y: i64 = 0
+    if (flags & ARGS_ARE_XY_VALUES) == 0 {
+        const k = sub(s, n, 2) + startPoint
+        const lp = sub(s, n, 3) + numBasePoints
+        if k >= numBasePoints || lp >= l.*.nPoints { return r.ERR_INVALID_COMPOSITE }
+        x = pointX(s, k) -% pointX(s, lp)
+        y = pointY(s, k) -% pointY(s, lp)
+    } else {
+        x = sub(s, n, 2)
+        y = sub(s, n, 3)
+        if x == 0 && y == 0 { return r.OK }
+        if haveScale && (flags & SCALED_COMPONENT_OFFSET) != 0 {
+            const macX = calc.hypot(sub(s, n, 4), sub(s, n, 5))
+            const macY = calc.hypot(sub(s, n, 7), sub(s, n, 6))
+            x = calc.mulFix(x, macX)
+            y = calc.mulFix(y, macY)
+        }
+        if (l.*.loadFlags & r.LOAD_NO_SCALE) == 0 {
+            x = calc.mulFix(x, l.*.xScale)
+            y = calc.mulFix(y, l.*.yScale)
+            // (Rounding to the grid is the hinter's; there is none.)
+        }
+    }
+    if x != 0 || y != 0 {
+        var i: i64 = 0
+        while i < count {
+            setPoint(s, numBasePoints + i, pointX(s, numBasePoints + i) +% x, pointY(s, numBasePoints + i) +% y)
+            i += 1
+        }
+    }
+    return r.OK
+}
+
+// Loads glyph `gindex` into the outline so far, its components too
+// (FreeType's load_truetype_glyph).
+fn loadGlyph(l: *Loader, f: *Face, s: *o.Slot, gindex: i64, recurse: i64, headerOnly: bool) -> i32 {
+    const maxDepth = @intCast(i64, m.get16(f.*.maxp + 34))
+    if recurse > maxDepth { m.put16(f.*.maxp + 34, @intCast(u16, recurse & 0xFFFF)) }
+    if gindex >= o.faceRecord(l.*.face).*.numGlyphs { return r.ERR_INVALID_GLYPH_INDEX }
+    l.*.glyphIndex = gindex
+    const loc = location(f, @intCast(u64, gindex))
+    const offset = loc.0
+    l.*.byteLen = loc.1
+    l.*.nContours = 0
+    if l.*.byteLen > 0 {
+        if f.*.glyfOffset == 0 { return r.ERR_INVALID_TABLE }
+        const at = f.*.glyfOffset + offset
+        if !o.within(f, at, l.*.byteLen) { return r.ERR_INVALID_STREAM_OPERATION }
+        if l.*.byteLen < 10 { return r.ERR_INVALID_OUTLINE }
+        l.*.nContours = o.i16At(f, at)
+        l.*.bboxXMin = o.i16At(f, at + 2)
+        l.*.bboxYMin = o.i16At(f, at + 4)
+        l.*.bboxXMax = o.i16At(f, at + 6)
+        l.*.bboxYMax = o.i16At(f, at + 8)
+    }
+    if l.*.byteLen == 0 || l.*.nContours == 0 {
+        l.*.bboxXMin = 0
+        l.*.bboxXMax = 0
+        l.*.bboxYMin = 0
+        l.*.bboxYMax = 0
+    }
+    getMetrics(l, f, gindex)
+    if headerOnly { return r.OK }
+    const memory = f.*.memory
+    if l.*.byteLen == 0 || l.*.nContours == 0 {
+        setPhantoms(l)
+        if variations.isVaried(l.*.face) {
+            // (The phantom points of an empty glyph varied alone.)
+            if !ensure(memory, s, l.*.nPoints + 4, 0) { return r.ERR_OUT_OF_MEMORY }
+            if !ensureUnrounded(l, memory, 4) { return r.ERR_OUT_OF_MEMORY }
+            const pts = s.*.points + @intCast(usize, l.*.nPoints) * 16
+            m.putI64(pts, l.*.pp1x)
+            m.putI64(pts + 8, l.*.pp1y)
+            m.putI64(pts + 16, l.*.pp2x)
+            m.putI64(pts + 24, l.*.pp2y)
+            m.putI64(pts + 32, l.*.pp3x)
+            m.putI64(pts + 40, l.*.pp3y)
+            m.putI64(pts + 48, l.*.pp4x)
+            m.putI64(pts + 56, l.*.pp4y)
+            const result = variations.applyGlyphDeltas(l.*.face, gindex, pts, 4, 0, 0, l.*.nPoints, l.*.unrounded)
+            if result.0 != r.OK { return result.0 }
+            if result.1 { updateFromDeltas(l, f, pts, 4) }
+        }
+        scalePhantoms(l)
+        return r.OK
+    }
+    setPhantoms(l)
+    const start = f.*.glyfOffset + offset + 10
+    const limit = f.*.glyfOffset + offset + l.*.byteLen
+    if l.*.nContours > 0 {
+        var err = loadSimple(l, f, s, start, limit)
+        if err != r.OK { return err }
+        err = processSimple(l, f, s)
+        if err != r.OK { return err }
+        l.*.nPoints += l.*.currentPoints
+        l.*.nOutlineContours += l.*.nContours
+        return r.OK
+    }
+    // A composite.
+    l.*.nContours = -1
+    if !ensureComposites(l, memory, recurse + 1) { return r.ERR_OUT_OF_MEMORY }
+    var k: i64 = 0
+    while k < recurse {
+        if m.getI64(l.*.composites + @intCast(usize, k) * 8) == gindex { return r.ERR_INVALID_COMPOSITE }
+        k += 1
+    }
+    m.putI64(l.*.composites + @intCast(usize, recurse) * 8, gindex)
+    const startPoint = l.*.nPoints
+    const loaded = loadComposite(l, f, s, start, limit)
+    if loaded.1 != r.OK { return loaded.1 }
+    const numSubglyphs = loaded.0
+    const firstSub = l.*.numSubglyphs
+    if variations.isVaried(l.*.face) {
+        // (The components' offsets and the phantom points varied as points
+        // of their own.)
+        if !ensure(memory, s, l.*.nPoints + numSubglyphs + 4, l.*.nOutlineContours + numSubglyphs) { return r.ERR_OUT_OF_MEMORY }
+        if !ensureUnrounded(l, memory, numSubglyphs + 4) { return r.ERR_OUT_OF_MEMORY }
+        const scratch = m.alloc(memory, @intCast(usize, numSubglyphs + 4) * 16 + @intCast(usize, numSubglyphs) * 2)
+        if scratch == 0 { return r.ERR_OUT_OF_MEMORY }
+        const contours = scratch + @intCast(usize, numSubglyphs + 4) * 16
+        var i: i64 = 0
+        while i < numSubglyphs {
+            m.putI64(scratch + @intCast(usize, i) * 16, sub(s, firstSub + i, 2))
+            m.putI64(scratch + @intCast(usize, i) * 16 + 8, sub(s, firstSub + i, 3))
+            m.putI16(contours + @intCast(usize, i) * 2, @intCast(i16, i))
+            i += 1
+        }
+        const pp = scratch + @intCast(usize, numSubglyphs) * 16
+        m.putI64(pp, l.*.pp1x)
+        m.putI64(pp + 8, l.*.pp1y)
+        m.putI64(pp + 16, l.*.pp2x)
+        m.putI64(pp + 24, l.*.pp2y)
+        m.putI64(pp + 32, l.*.pp3x)
+        m.putI64(pp + 40, l.*.pp3y)
+        m.putI64(pp + 48, l.*.pp4x)
+        m.putI64(pp + 56, l.*.pp4y)
+        const result = variations.applyGlyphDeltas(l.*.face, gindex, scratch, numSubglyphs + 4, contours, numSubglyphs, 0, l.*.unrounded)
+        if result.0 != r.OK {
+            m.release(memory, scratch)
+            return result.0
+        }
+        if result.1 { updateFromDeltas(l, f, scratch, numSubglyphs + 4) }
+        i = 0
+        while i < numSubglyphs {
+            if (sub(s, firstSub + i, 1) & ARGS_ARE_XY_VALUES) != 0 {
+                setSub(s, firstSub + i, 2, calc.low16(m.getI64(scratch + @intCast(usize, i) * 16)))
+                setSub(s, firstSub + i, 3, calc.low16(m.getI64(scratch + @intCast(usize, i) * 16 + 8)))
+            }
+            i += 1
+        }
+        m.release(memory, scratch)
+    }
+    scalePhantoms(l)
+    l.*.numSubglyphs += numSubglyphs
+    if (l.*.loadFlags & r.LOAD_NO_RECURSE) != 0 {
+        o.slotRecord(l.*.slot).*.format = r.FORMAT_COMPOSITE
+        return r.OK
+    }
+    var n: i64 = 0
+    while n < numSubglyphs {
+        const index = sub(s, firstSub + n, 0)
+        const p1x = l.*.pp1x
+        const p1y = l.*.pp1y
+        const p2x = l.*.pp2x
+        const p2y = l.*.pp2y
+        const p3x = l.*.pp3x
+        const p3y = l.*.pp3y
+        const p4x = l.*.pp4x
+        const p4y = l.*.pp4y
+        const linear = l.*.linear
+        const vadvance = l.*.vadvance
+        const numBasePoints = l.*.nPoints
+        const err = loadGlyph(l, f, s, index, recurse + 1, false)
+        if err != r.OK { return err }
+        if (sub(s, firstSub + n, 1) & USE_MY_METRICS) == 0 {
+            l.*.pp1x = p1x
+            l.*.pp1y = p1y
+            l.*.pp2x = p2x
+            l.*.pp2y = p2y
+            l.*.pp3x = p3x
+            l.*.pp3y = p3y
+            l.*.pp4x = p4x
+            l.*.pp4y = p4y
+            l.*.linear = linear
+            l.*.vadvance = vadvance
+        }
+        if l.*.nPoints != numBasePoints {
+            const e = processComponent(l, f, s, firstSub + n, startPoint, numBasePoints)
+            if e != r.OK { return e }
+        }
+        n += 1
+    }
+    if l.*.numSubglyphs > 0 && (sub(s, 0, 1) & OVERLAP_COMPOUND) != 0 { l.*.outlineFlags |= r.OUTLINE_OVERLAP }
+    return r.OK
+}
+
+fn ensureComposites(l: *Loader, memory: usize, count: i64) -> bool {
+    if count > l.*.compositesMax {
+        const n = count + 8
+        const p = m.grow(memory, l.*.composites, @intCast(usize, l.*.compositesMax) * 8, @intCast(usize, n) * 8)
+        if p == 0 { return false }
+        l.*.composites = p
+        l.*.compositesMax = n
+    }
+    return true
+}
+
+// The slot's metrics of the loaded glyph (FreeType's compute_glyph_metrics).
+fn computeMetrics(l: *Loader, f: *Face, slot: usize) -> void {
+    const s = o.slotRecord(slot)
+    const yScale = if (l.*.loadFlags & r.LOAD_NO_SCALE) == 0 { l.*.yScale } else { 0x10000 }
+    var xMin = l.*.bboxXMin
+    var yMin = l.*.bboxYMin
+    var xMax = l.*.bboxXMax
+    var yMax = l.*.bboxYMax
+    if s.*.format != r.FORMAT_COMPOSITE {
+        const box = outlines.cbox(s.*.outline.points, @intCast(i64, s.*.outline.nPoints))
+        xMin = box.0
+        yMin = box.1
+        xMax = box.2
+        yMax = box.3
+    }
+    s.*.linearHoriAdvance = l.*.linear
+    s.*.metrics.horiBearingX = xMin
+    s.*.metrics.horiBearingY = yMax
+    s.*.metrics.horiAdvance = l.*.pp2x -% l.*.pp1x
+    s.*.metrics.width = xMax -% xMin
+    s.*.metrics.height = yMax -% yMin
+    var top: i64 = 0
+    var advance: i64 = 0
+    if f.*.verticalInfo && sfnt.numberOfVMetrics(f) > 0 {
+        top = calc.low16(calc.divFix(l.*.pp3y -% yMax, yScale))
+        if l.*.pp3y <= l.*.pp4y {
+            advance = 0
+        } else {
+            advance = calc.ulow16(calc.divFix(l.*.pp3y -% l.*.pp4y, yScale))
+        }
+    } else {
+        const height = calc.low16(calc.divFix(yMax -% yMin, yScale))
+        if sfnt.os2Present(f) {
+            advance = sfnt.typoAscender(f) - sfnt.typoDescender(f)
+        } else {
+            advance = sfnt.ascender(f) - sfnt.descender(f)
+        }
+        top = (advance - height) / 2
+    }
+    s.*.linearVertAdvance = advance
+    if (l.*.loadFlags & r.LOAD_NO_SCALE) == 0 {
+        top = calc.mulFix(top, yScale)
+        advance = calc.mulFix(advance, yScale)
+    }
+    s.*.metrics.vertBearingX = s.*.metrics.horiBearingX -% s.*.metrics.horiAdvance / 2
+    s.*.metrics.vertBearingY = top
+    s.*.metrics.vertAdvance = advance
+}
+
+// The glyph loader's record of a slot (made when first needed).
+fn loaderOf(slot: usize, memory: usize) -> usize {
+    const s = o.slotRecord(slot)
+    if s.*.loader == 0 { s.*.loader = m.alloc(memory, @sizeOf(Loader)) }
+    return s.*.loader
+}
+
+// Loads a TrueType glyph into the slot (FreeType's TT_Load_Glyph, past
+// the embedded bitmaps); the glyph's outline and metrics are the slot's.
+pub fn load(face: usize, size: usize, slot: usize, gindex: i64, loadFlags: i64) -> i32 {
+    const f = o.faceRecord(face)
+    const memory = f.*.memory
+    const t = o.sizeRecord(size)
+    if (loadFlags & r.LOAD_NO_SCALE) == 0 && !t.*.ttValid { return r.ERR_INVALID_SIZE_HANDLE }
+    const address = loaderOf(slot, memory)
+    if address == 0 { return r.ERR_OUT_OF_MEMORY }
+    const l = loader(address)
+    // (The loader's storage is kept; the rest starts afresh.)
+    const composites = l.*.composites
+    const compositesMax = l.*.compositesMax
+    const unrounded = l.*.unrounded
+    const unroundedMax = l.*.unroundedMax
+    m.zero(address, @sizeOf(Loader))
+    l.*.composites = composites
+    l.*.compositesMax = compositesMax
+    l.*.unrounded = unrounded
+    l.*.unroundedMax = unroundedMax
+    l.*.face = face
+    l.*.slot = slot
+    l.*.loadFlags = loadFlags
+    if (loadFlags & r.LOAD_NO_SCALE) != 0 {
+        l.*.xScale = 0x10000
+        l.*.yScale = 0x10000
+    } else if (loadFlags & r.LOAD_NO_HINTING) != 0 {
+        // (Unhinted: the size's scales; hinted: TrueType's, of the rounded
+        // ppem when `head` asks for integer ppems.)
+        l.*.xScale = o.sizeRecord(size).*.xScale
+        l.*.yScale = o.sizeRecord(size).*.yScale
+    } else {
+        l.*.xScale = t.*.tt_x_scale
+        l.*.yScale = t.*.tt_y_scale
+    }
+    const s = o.slotRecord(slot)
+    const internal = o.slotRecord(slot)
+    s.*.format = r.FORMAT_OUTLINE
+    s.*.numSubglyphs = 0
+    s.*.outline.flags = 0
+    const err = loadGlyph(l, f, internal, gindex, 0, false)
+    if err != r.OK { return err }
+    if s.*.format == r.FORMAT_COMPOSITE {
+        s.*.numSubglyphs = @intCast(u32, l.*.numSubglyphs)
+        s.*.subglyphs = internal.*.subglyphStore
+    } else {
+        s.*.outline.nPoints = @intCast(i16, calc.low16(l.*.nPoints))
+        s.*.outline.nContours = @intCast(i16, calc.low16(l.*.nOutlineContours))
+        s.*.outline.points = internal.*.points
+        s.*.outline.tags = internal.*.tags
+        s.*.outline.contours = internal.*.contours
+        s.*.outline.flags = l.*.outlineFlags & ~r.OUTLINE_SINGLE_PASS
+        if l.*.pp1x != 0 { outlines.translate(s.*.outline.points, l.*.nPoints, 0 - l.*.pp1x, 0) }
+    }
+    computeMetrics(l, f, slot)
+    if (loadFlags & r.LOAD_NO_SCALE) == 0 && t.*.tt_y_ppem < 24 { s.*.outline.flags |= r.OUTLINE_HIGH_PRECISION }
+    return r.OK
+}
+
+// The glyph's header only: its bounding box, side bearings and advances
+// (for a bitmap glyph of a scalable font: FreeType's header-only load).
+pub fn loadHeader(face: usize, size: usize, slot: usize, gindex: i64, loadFlags: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
+    const f = o.faceRecord(face)
+    const memory = f.*.memory
+    const address = loaderOf(slot, memory)
+    if address == 0 { return -> (0, 0, 0, 0, 0, 0, 0) }
+    const l = loader(address)
+    const composites = l.*.composites
+    const compositesMax = l.*.compositesMax
+    const unrounded = l.*.unrounded
+    const unroundedMax = l.*.unroundedMax
+    m.zero(address, @sizeOf(Loader))
+    l.*.composites = composites
+    l.*.compositesMax = compositesMax
+    l.*.unrounded = unrounded
+    l.*.unroundedMax = unroundedMax
+    l.*.face = face
+    l.*.slot = slot
+    l.*.loadFlags = loadFlags
+    _ = loadGlyph(l, f, o.slotRecord(slot), gindex, 0, true)
+    return -> (l.*.linear, l.*.vadvance, l.*.nContours, l.*.bboxXMin, l.*.bboxYMin, l.*.leftBearing, l.*.topBearing)
+}
+
+pub fn doneLoader(slot: usize, memory: usize) -> void {
+    const s = o.slotRecord(slot)
+    if s.*.loader == 0 { return }
+    const l = loader(s.*.loader)
+    m.release(memory, l.*.composites)
+    m.release(memory, l.*.unrounded)
+    m.release(memory, s.*.loader)
+    s.*.loader = 0
+}

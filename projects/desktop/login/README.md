@@ -119,6 +119,25 @@ controller that disconnected. A signalfd reaps both the VT watcher and the
 session without waiting for new bus traffic, releases the seat, and leaves
 it ready for a new greeter.
 
+The same MLXIPC service exposes the login1 manager's power surface:
+
+| Method | Result |
+| --- | --- |
+| `CanPowerOff() -> s` | `yes` while mlx-init's control socket accepts connections, otherwise `no` |
+| `CanReboot() -> s` | `yes` while mlx-init's control socket accepts connections, otherwise `no` |
+| `PowerOff(b interactive)` | asks MLXIPC for `login.power`, then sends `poweroff` to mlx-init |
+| `Reboot(b interactive)` | asks MLXIPC for `login.power`, then sends `reboot` to mlx-init |
+
+These are D-Bus-compatible method names and encodings carried by MLXIPC;
+they do not contact dbus-daemon or systemd. `PowerOff` and `Reboot` work
+from the greeter as well as from a logged-in session and always require
+the caller's `login.power` permission. The boolean is accepted for login1
+compatibility; MLXIPC makes the authorization decision. mlx-init supplies
+its root-only control path in `MLX_INIT_CONTROL`; without that environment
+entry the login service uses `/run/mlx/init`. A missing, stale or refusing
+socket produces a D-Bus `Failed` error instead of attempting a kernel
+reboot directly.
+
 ## Files
 
 | File | What it does |
