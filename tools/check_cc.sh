@@ -137,4 +137,13 @@ for name in "${programs[@]}"; do
     cmp -s "$tests/$name.expected" "$work/sep/$name.mlxlibc" || fail "$name from objects on mlxlibc prints otherwise: $(diff "$tests/$name.expected" "$work/sep/$name.mlxlibc" | head -12)"
 done
 echo "ok   -c, mlx-ar, -L and -l: the ${#programs[@]} programs built from objects and archives run alike, on glibc and on mlxlibc"
+# -MD, -MMD, -MF, -MT: the dependency file make and mlx build read.
+mkdir -p "$work/deps"
+printf '#include "deps.h"\nint main(void) { return VALUE; }\n' > "$work/deps/main.c"
+printf '#include <stddef.h>\n#define VALUE 0\n' > "$work/deps/deps.h"
+(cd "$work/deps" && "$cc" -MD -MT made.o -MF main.dep -c main.c -o main.o) || fail "-MD did not compile"
+grep -q '^made.o: main.c' "$work/deps/main.dep" && grep -q '^  deps.h ' "$work/deps/main.dep" && grep -q 'stddef.h$' "$work/deps/main.dep" || fail "-MD wrote the wrong dependency file: $(cat "$work/deps/main.dep")"
+(cd "$work/deps" && "$cc" -MMD -c main.c -o other.o) || fail "-MMD did not compile"
+grep -q '^other.o: main.c' "$work/deps/other.d" || fail "-MMD did not write OUTPUT.d"
+echo "ok   -MD, -MMD, -MF and -MT write the dependency file"
 echo "check_cc.sh: all checks passed"

@@ -20,7 +20,8 @@ mlxlibc (`projects/libc`) on MLX/Linux and glibc elsewhere.
     ./mlx-cc -o hello hello.c -L. -lmine      # or hello.o libmine.a
 
     mlx-cc [-o OUT] [-std=VARIANT] [-E] [-c] [-I DIR] [-D NAME[=VALUE]] [-U NAME]
-           [-L DIR] [-lNAME] [--dynamic-linker PATH] FILE.c... [FILE.o...] [LIB.a...]
+           [-L DIR] [-lNAME] [--dynamic-linker PATH] [-MD|-MMD] [-MF DEP] [-MT TARGET]
+           FILE.c... [FILE.o...] [LIB.a...]
     mlx-ar rcs LIB.a FILE.o...  |  mlx-ar t LIB.a  |  mlx-ar x LIB.a
 
 The `.c` files given together are compiled as one, each a translation
@@ -36,7 +37,10 @@ ordinary C compiler made with `-fPIE` link too, in either direction
 directory when there is one, else the shared `libNAME.so`; `-lm` is
 `libm.so.6` (glibc's, or the one built next to mlxlibc) and
 `-lpthread`, `-ldl` and `-lrt` are part of the C library. `-E` writes
-the preprocessed tokens instead. Options of other compilers that change
+the preprocessed tokens instead. `-MD` (or `-MMD`) writes make's rule of
+the source and every file it included and embedded, at `-MF`'s path
+(else the output's with `.d`) naming `-MT`'s target (else the output):
+what `mlx build` reads to rebuild an object when a header changed. Options of other compilers that change
 nothing here (`-O2`, `-g`, `-Wall`, `-fPIC`, `-pthread` ...) are
 accepted silently.
 
@@ -231,7 +235,12 @@ type made the first time their declaration runs (`static Point p(7)`),
 once whatever the threads (a guard libmlxcpp's `__mlxcc_guard_acquire`
 takes), and one object for the program when the function is inline or
 a template's (weak `_ZZ<function>E<name>` symbols, the code reaching
-them and inline variables by name; `tests/cpp/shared`),
+them and inline variables by name; `tests/cpp/shared`), a class that
+cannot move by its bytes (a copy or move constructor, a destructor of
+its own) passed by value by its address, as the Itanium ABI passes it,
+and a local returned made right in the caller's buffer when every
+return returns it (else moved out by its move constructor;
+`tests/cpp/wtfforms64.cpp`),
 `using T = type;`, explicit template arguments for some of a function
 template's parameters with the rest deduced from the call
 (`make_shared<Resource>(name)`), deduction through a class template's
@@ -741,3 +750,18 @@ gcc's build printed (`tests/sqlite.expected`), on glibc and on mlxlibc
 alone with the `libm.so.6` built next to it. The tarballs are
 downloaded, or taken from `--sources DIR`, and checked against their
 SHA-256 sums.
+
+## C headers made of Mlx: mlx-cheaders
+
+A library written in Mlx for C and C++ programs (projects/unicode) declares
+its interface once, in Mlx modules, and `mlx-cheaders OUT MODULE.mlx...`
+(projects/cc/cheaders.mlx) writes the headers C includes. It reads the
+modules with the Mlx compiler's own parser. Enums, structures (all
+declared first, so that one may point to another), function types (a
+value of one is a pointer in C), aliases, constants and `extern("c")`
+functions become their C forms. A `pub fn` named in capitals becomes a
+macro: of an expression when its body is one `return`, else of
+statements, with its `*T` parameters the lvalues it writes and its
+locals named apart. Other `pub fn`s become static inline functions. The
+Mlx of the macros is real: it compiles and runs as Mlx, and
+projects/unicode/tests/api.mlx tests it so.
