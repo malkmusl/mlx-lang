@@ -950,6 +950,9 @@ int main(void)
     C(FT_LONG_MIN);
     C(FT_LONG_MAX);
     C(FT_ULONG_MAX);
+    C(FT_LLONG_MAX);
+    C(FT_LLONG_MIN);
+    C(FT_ULLONG_MAX);
     C(FT_ANGLE_PI);
     C(FT_ANGLE_2PI);
     C(FT_ANGLE_PI2);

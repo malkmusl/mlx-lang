@@ -63,8 +63,10 @@ for name in sorted(os.listdir(api)):
         if m:
             strings.append(m.group(1))
         else:
-            m = re.match(r'pub const (\w+): (\w+) = ', line)
-            if m:
+            m = re.match(r'pub const (\w+): (\w+) = (.*)$', line)
+            # (Not the names of the C library's functions and types, as
+            # `ft_smalloc` is `malloc`.)
+            if m and not (re.match(r'^[A-Za-z_]\w*$', m.group(3).strip()) and not re.match(r'^(FT|TT|T1)_', m.group(3).strip())):
                 constants.append(m.group(1))
         i += 1
 
