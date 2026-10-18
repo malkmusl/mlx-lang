@@ -1072,6 +1072,90 @@ translation or flow control, reads of one byte); and job control:
 `processGroup`. mlx-sh's line editor and job control and ls's column
 width use it; the test runs it on a pseudo-terminal of its own.
 
+## Base directories (`std.xdg`)
+
+**Implementation:** `std/src/xdg.mlx`
+**Source tests:** `354_xdg_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+Where a program keeps its files, by the XDG Base Directory
+Specification, from an environment list (`[*][*]const u8`, the program's
+or a child's). `home(environment, kind, into, capacity)` writes the
+user's directory of `kind` — `CONFIG` (`$XDG_CONFIG_HOME`, else
+`~/.config`), `DATA` (`~/.local/share`), `CACHE` (`~/.cache`) or `STATE`
+(`~/.local/state`) — NUL-terminated and returns its length, 0 when there
+is no home or it does not fit; `path(environment, kind, rest, into,
+capacity)` is the same with `rest` after it, all of it or nothing.
+`runtimeDirectory` is `$XDG_RUNTIME_DIR`; `dataDirectories` and
+`configDirectories` are the system's colon-separated lists (with the
+specification's defaults), walked by `nextDirectory(list, &at,
+&directory)`. As the specification asks, an empty or relative variable is
+ignored, and so is a `$HOME` that is not absolute. The desktop's settings
+and caches (the audio server, the compositor, the settings app, the dock's
+pins, the clock, the top bar, the trash, the thumbnails, MLXIPC's policy,
+service files and prompts, the greeter's sessions), std.ui's appearance,
+std.xkb, std.vulkan's loader and the code map use it.
+
+```mlx
+const xdg = @import("std.xdg")
+
+var path: [512]u8 = undefined
+const bytes: [*]u8 = &path
+const length = xdg.path(environment, xdg.CONFIG, "/mlx/audio.conf", bytes, 512)
+if length == 0 { ... }                          // no home, or too long
+```
+
+## Accounts and groups (`std.passwd`)
+
+**Implementation:** `std/src/passwd.mlx`
+**Source tests:** `355_passwd_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The accounts of /etc/passwd (`User`: `name`, `password`, `id`, `group`,
+`gecos`, `home`, `shell`) and the groups of /etc/group (`Group`: `name`,
+`password`, `id`, `members`), their fields slices of the file's text.
+`parseUser` and `parseGroup` read one line (false for a line with too
+few or too many fields or a number that is not one); `findUserNamed`,
+`findUserById`, `findGroupNamed` and `findGroupById` search a file's text;
+`userById`, `userNamed`, `groupById` and `groupNamed` read the file into
+the caller's buffer first. Nothing allocates. chown, chgrp and ls (the
+coreutils), libpulse's user name and home and libpipewire's user name use
+it.
+
+## Settings files (`std.conf`)
+
+**Implementation:** `std/src/conf.mlx`
+**Source tests:** `356_conf_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The "key = value" files the desktop and its services keep: blanks around
+keys and values, `#` comment lines, `[Group]` lines. `parseLine(line,
+&entry)` says what a line is (`BLANK`, `ENTRY`, `GROUP` or `OTHER`, a line
+without `=`); `lines(text)` and `next(&lines, &entry)` walk a file's
+entries, each with the group it is in; `find(text, key)` is the first
+value of a key; `parseSwitch(value, &on)` reads on/off, yes/no, true/false
+and 1/0.
+
+```mlx
+const conf = @import("std.conf")
+
+var lines = conf.lines(text)
+var entry: conf.Entry = undefined
+while conf.next(&lines, &entry) {
+    if std.text.same(entry.key, "volume") { ... entry.value ... }
+}
+```
+
+## Patterns (`std.glob`)
+
+**Implementation:** `std/src/glob.mlx`
+**Source tests:** `357_glob_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The shell's patterns, as fnmatch has them: `*`, `?` and sets (`[a-z]`,
+`[!...]` or `[^...]`, a `]` first a member, a `[` without its `]` itself),
+over whole byte strings. `matches(pattern, text)` takes a backslash as
+making the next byte stand for itself; `matchesQuoted(pattern, literal,
+text)` takes the bytes a shell quoted instead (`literal[i] & 1`). mlx-sh's
+pathname expansion, `case` and `${...#...}`, and ls's `--ignore` and
+`--hide` use it.
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`

@@ -14,6 +14,12 @@
 #   tests/353_fs_whole_files_runtime.mlx
 #                                       std.fs's whole files, folders made
 #                                       on the way and executablePath
+#   tests/354_xdg_runtime.mlx           std.xdg (the base directories over
+#                                       environments of its own)
+#   tests/355_passwd_runtime.mlx        std.passwd (accounts and groups, by
+#                                       name and by number)
+#   tests/356_conf_runtime.mlx          std.conf ("key = value" files)
+#   tests/357_glob_runtime.mlx          std.glob (fnmatch patterns)
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -48,6 +54,10 @@ run 350_math_helpers_runtime "min, max, clamp, absolute, sqrt and smoothstep"
 run 351_random_runtime "getrandom, xoshiro256**, splitmix64 and xorshift64*"
 run 352_terminal_tty_runtime "a pty's size, raw mode and process groups"
 run 353_fs_whole_files_runtime "files read and written whole, mkdir -p and the program's path"
+run 354_xdg_runtime "the XDG base directories, their defaults and lists"
+run 355_passwd_runtime "accounts and groups by name and number, malformed lines passed over"
+run 356_conf_runtime "settings lines, comments, groups and switches"
+run 357_glob_runtime "stars, sets, ranges, escapes and quoted bytes"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
