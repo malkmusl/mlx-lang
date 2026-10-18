@@ -91,7 +91,12 @@ against the reference build's WTF and GLib 2.80.
 (`<jsc/jsc.h>`: a context evaluating scripts, values made from C, C
 functions and a C class called from JavaScript, an exception), and
 `tests/wpe.js` a script for the WPE port's jsc; their `.expected` files
-are what JavaScriptCore prints for them.
+are what JavaScriptCore prints for them (`wpe-js.expected` is node's
+output with JSC's wording of the ReferenceError). Built by mlx-cc, jsc
+prints `wpe-js.expected`, and jsc-glib prints every line of
+`jsc-glib.expected` up to `done`, then crashes while its context's VM
+is destroyed (`JSC::Heap::lastChanceToFinalize` destroying a cell), so
+check_wpe_jsc.sh still fails on it.
 
 ## Parts
 
