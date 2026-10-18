@@ -1,0 +1,217 @@
+// Service-output relay. A relay owns the log descriptor instead of the
+// service, which lets it move from the early runtime file to persistent
+// storage and rotate a live service's log without restarting that service.
+const std = @import("std")
+const linux = @import("./linux.mlx")
+const config = @import("./config.mlx")
+
+const State = config.State
+const Service = config.Service
+
+const PATH_CAPACITY: usize = config.PATH_CAPACITY + config.NAME_CAPACITY + 24
+const BACKUPS: usize = 4
+const RETRY_MILLISECONDS: usize = 100
+const EINTR: isize = -4
+
+pub const Relay = struct {
+    writer: isize
+    pid: isize
+}
+
+fn bytes(array: *const [PATH_CAPACITY]u8) -> [*]u8 {
+    var pointer: [*]u8 = undefined
+    unsafe { pointer = @ptrCast([*]u8, array) }
+    return pointer
+}
+
+fn appendPath(into: [*]u8, capacity: usize, directory: []const u8, service: *Service) -> usize {
+    var length = std.text.append(into, 0, capacity, directory)
+    length = std.text.append(into, length, capacity, "/")
+    length = std.text.append(into, length, capacity, config.name(service))
+    return std.text.append(into, length, capacity, ".log")
+}
+
+fn persistentPath(state: *State, service: *Service, into: [*]u8) -> usize {
+    const own = config.log(service)
+    if own.length > 0 { return std.text.append(into, 0, PATH_CAPACITY, own) }
+    return appendPath(into, PATH_CAPACITY, config.logDirectory(state), service)
+}
+
+fn runtimePath(state: *State, service: *Service, into: [*]u8) -> usize {
+    return appendPath(into, PATH_CAPACITY, config.runtimeLogDirectory(state), service)
+}
+
+fn makeParents(path: []const u8) -> void {
+    var end = path.length
+    while end > 0 && path[end - 1] != 47 { end -= 1 }
+    if end <= 1 { return }
+    const parent = path[0..end - 1]
+    makeParents(parent)
+    const made = linux.makeDirectory(parent, 493)
+}
+
+fn openLog(path: []const u8) -> isize {
+    makeParents(path)
+    return linux.open(path, linux.O_WRONLY | linux.O_CREAT | linux.O_APPEND | linux.O_CLOEXEC, 420)
+}
+
+fn fileSize(descriptor: isize) -> usize {
+    var status: std.fs.Stat = undefined
+    if std.fs.fileStatus(std.fs.File.{ .descriptor = descriptor }, &status) != 0 || status.size <= 0 { return 0 }
+    return @intCast(usize, status.size)
+}
+
+fn writeAll(descriptor: isize, source: [*]const u8, length: usize) -> bool {
+    var done: usize = 0
+    while done < length {
+        const wrote = linux.write(descriptor, unsafe { @ptrFromInt([*]const u8, @intFromPtr(source) + done) }, length - done)
+        if wrote == EINTR { continue }
+        if wrote <= 0 { return false }
+        done += @bitCast(usize, wrote)
+    }
+    return true
+}
+
+fn suffixed(path: []const u8, number: usize, into: [*]u8) -> usize {
+    var length = std.text.append(into, 0, PATH_CAPACITY, path)
+    length = std.text.append(into, length, PATH_CAPACITY, ".")
+    return std.text.appendUnsigned(into, length, PATH_CAPACITY, number)
+}
+
+fn rotate(path: []const u8) -> isize {
+    var from: [PATH_CAPACITY]u8 = undefined
+    var to: [PATH_CAPACITY]u8 = undefined
+    var fromBytes = bytes(&from)
+    var toBytes = bytes(&to)
+    const oldestLength = suffixed(path, BACKUPS, toBytes)
+    const removed = linux.unlink(toBytes[0..oldestLength])
+    var number = BACKUPS
+    while number > 1 {
+        const fromLength = suffixed(path, number - 1, fromBytes)
+        const toLength = suffixed(path, number, toBytes)
+        const moved = linux.rename(fromBytes[0..fromLength], toBytes[0..toLength])
+        number -= 1
+    }
+    const firstLength = suffixed(path, 1, toBytes)
+    const moved = linux.rename(path, toBytes[0..firstLength])
+    return openLog(path)
+}
+
+fn copyInto(path: []const u8, output: isize) -> bool {
+    const input = linux.open(path, linux.O_RDONLY | linux.O_CLOEXEC, 0)
+    if input < 0 { return true }
+    var storage: [8192]u8 = undefined
+    var buffer: [*]u8 = undefined
+    unsafe { buffer = @ptrCast([*]u8, &storage) }
+    var reading = true
+    var copied = true
+    while reading {
+        const got = linux.read(input, buffer, 8192)
+        if got == EINTR { continue }
+        if got < 0 {
+            copied = false
+            reading = false
+        } else if got == 0 {
+            reading = false
+        } else {
+            const wrote = writeAll(output, buffer, @bitCast(usize, got))
+            if !wrote {
+                copied = false
+                reading = false
+            }
+        }
+    }
+    linux.close(input)
+    return copied
+}
+
+fn closeInherited(state: *State, keep: isize) -> void {
+    if linux.closeExcept(keep) { return }
+    if state.*.listener >= 0 && state.*.listener != keep { linux.close(state.*.listener) }
+    if state.*.signals >= 0 && state.*.signals != keep { linux.close(state.*.signals) }
+    if state.*.eventLoop >= 0 && state.*.eventLoop != keep { linux.close(state.*.eventLoop) }
+    var index: usize = 0
+    while index < config.MAX_CLIENTS {
+        var client: *config.ControlClient = undefined
+        unsafe { client = @ptrCast(*config.ControlClient, &state.*.clients[index]) }
+        if client.*.used && client.*.descriptor != keep { linux.close(client.*.descriptor) }
+        index += 1
+    }
+}
+
+fn relay(state: *State, service: *Service, input: isize, target: []const u8, temporary: []const u8) -> void {
+    linux.unblockAllSignals()
+    const session = linux.setSession()
+    closeInherited(state, input)
+    var output = openLog(target)
+    var persistent = output >= 0
+    if !persistent { output = openLog(temporary) }
+    var size = if output >= 0 { fileSize(output) } else { 0 }
+    var lastRetry: usize = 0
+    var storage: [8192]u8 = undefined
+    var buffer: [*]u8 = undefined
+    unsafe { buffer = @ptrCast([*]u8, &storage) }
+    var reading = true
+    while reading {
+        const got = linux.read(input, buffer, 8192)
+        if got == EINTR { continue }
+        if got <= 0 { break }
+        const amount = @bitCast(usize, got)
+        const at = std.time.milliseconds()
+        if !persistent && (lastRetry == 0 || at - lastRetry >= RETRY_MILLISECONDS) {
+            lastRetry = at
+            const promoted = openLog(target)
+            if promoted >= 0 {
+                if output >= 0 { linux.close(output) }
+                if copyInto(temporary, promoted) {
+                    const removed = linux.unlink(temporary)
+                    output = promoted
+                    persistent = true
+                    size = fileSize(output)
+                } else {
+                    linux.close(promoted)
+                    output = openLog(temporary)
+                }
+            }
+        }
+        if output < 0 { output = if persistent { openLog(target) } else { openLog(temporary) } }
+        if output >= 0 && persistent && size > 0 && size + amount > state.*.logRotateSize {
+            linux.close(output)
+            output = rotate(target)
+            size = 0
+        }
+        if output >= 0 {
+            if writeAll(output, buffer, amount) { size += amount }
+        }
+    }
+    if output >= 0 { linux.close(output) }
+    linux.close(input)
+    linux.exit(0)
+}
+
+// Starts one relay and returns the descriptor the service child should dup
+// onto stdout/stderr. Console and terminal services intentionally bypass it.
+pub fn start(state: *State, service: *Service) -> Relay {
+    if config.stdio(service).length > 0 || std.text.same(config.log(service), "console") { return Relay.{ .writer = -1, .pid = 0 } }
+    var targetStorage: [PATH_CAPACITY]u8 = undefined
+    var temporaryStorage: [PATH_CAPACITY]u8 = undefined
+    const targetBytes = bytes(&targetStorage)
+    const temporaryBytes = bytes(&temporaryStorage)
+    const targetLength = persistentPath(state, service, targetBytes)
+    const temporaryLength = runtimePath(state, service, temporaryBytes)
+    var input: isize = -1
+    var output: isize = -1
+    if !linux.pipe(&input, &output) { return Relay.{ .writer = -1, .pid = 0 } }
+    const pid = linux.fork()
+    if pid < 0 {
+        linux.close(input)
+        linux.close(output)
+        return Relay.{ .writer = -1, .pid = 0 }
+    }
+    if pid == 0 {
+        linux.close(output)
+        relay(state, service, input, targetBytes[0..targetLength], temporaryBytes[0..temporaryLength])
+    }
+    linux.close(input)
+    return Relay.{ .writer = output, .pid = pid }
+}

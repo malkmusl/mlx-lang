@@ -1,0 +1,655 @@
+// The linker: relocatable objects (relocatable.mlx) and the members of
+// archives (archive.mlx) that define what the others need, placed into
+// one encoder and written as a dynamically linked program
+// (elf64_dynamic.mlx).
+//
+// The code of every object goes after a `_start` the linker makes, the
+// data and zero data into the data area. A reference from code to a
+// function or variable of the program is resolved to its distance; one
+// to a name no object defines is an import from the libraries named
+// (DT_NEEDED): a call goes through a stub that jumps through the GOT
+// slot, the address of one is read from the slot (a `lea` becomes a
+// `mov`). A GOT-relative reference to a name of the program reads a
+// word of the data area holding its address. Addresses held by data
+// (an initialized pointer, a table of functions) and those words are
+// written when the program starts, by `__mlxcc_init`, which `_start`
+// calls before main(argc, argv, envp) and which runs the functions of
+// the objects' .init_array sections (a C unit's own initialization).
+const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
+const mem = @import("../../../std/bootstrap/mem.mlx")
+const vector = @import("../../../std/bootstrap/vector.mlx")
+const encoder_module = @import("../backend/x86_64/encoder.mlx")
+const x86 = @import("../backend/x86_64/target.mlx")
+const elf64_dynamic = @import("./elf64_dynamic.mlx")
+const relocatable = @import("./relocatable.mlx")
+const archive = @import("./archive.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const Object = relocatable.Object
+
+const NONE: usize = relocatable.NONE
+
+// What a symbol stands for once placed.
+const IN_CODE: u8 = 1
+const IN_DATA: u8 = 2
+const IMPORTED: u8 = 3
+const ABSOLUTE: u8 = 4
+// A thread-local variable: `value` its offset in the TLS image.
+const IN_TLS: u8 = 5
+
+const Resolved = struct {
+    kind: u8
+    value: usize
+    namePointer: [*]const u8
+    nameLength: usize
+}
+
+// An address written into the data area at start: the word at `place`
+// holds `target` plus `addend`.
+const Absolute = struct {
+    place: usize
+    target: Resolved
+    addend: i64
+}
+
+// A stub of an imported function: `jmp [rip + GOT slot]` at `offset`.
+const Stub = struct {
+    namePointer: [*]const u8
+    nameLength: usize
+    nameHash: usize
+    offset: usize
+}
+
+pub const Linker = struct {
+    allocator: Allocator
+    enc: *encoder_module.Encoder
+    // The objects (Object, by address), in the order given.
+    objects: *vector.Vector
+    // The global symbols' definitions: open addressing by name hash,
+    // each slot the object's index and the symbol's (NONE: empty).
+    tableObjects: [*]usize
+    tableSymbols: [*]usize
+    tableCapacity: usize
+    absolutes: *vector.Vector
+    stubs: *vector.Vector
+    // The init functions (code offsets) to call, in order.
+    inits: *vector.Vector
+    // The first error: a message and the name it is about.
+    errorPointer: [*]const u8
+    errorLength: usize
+    errorNamePointer: [*]const u8
+    errorNameLength: usize
+}
+
+fn newVector(allocator: Allocator, element_size: usize, element_alignment: usize, capacity: usize) -> *vector.Vector {
+    unsafe {
+        const v = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        vector.Vector.initAt(v, allocator, element_size, element_alignment, capacity)
+        return v
+    }
+}
+
+pub fn initAt(linker: *Linker, allocator: Allocator, enc: *encoder_module.Encoder) -> void {
+    linker.*.allocator = allocator
+    linker.*.enc = enc
+    linker.*.objects = newVector(allocator, 8, 8, 16)
+    unsafe {
+        linker.*.tableObjects = @ptrFromInt([*]usize, 0)
+        linker.*.tableSymbols = @ptrFromInt([*]usize, 0)
+        linker.*.errorPointer = @ptrCast([*]const u8, "")
+        linker.*.errorNamePointer = @ptrCast([*]const u8, "")
+    }
+    linker.*.tableCapacity = 0
+    linker.*.absolutes = newVector(allocator, @sizeOf(Absolute), @alignOf(Absolute), 64)
+    linker.*.stubs = newVector(allocator, @sizeOf(Stub), @alignOf(Stub), 16)
+    linker.*.inits = newVector(allocator, 8, 8, 8)
+    linker.*.errorLength = 0
+    linker.*.errorNameLength = 0
+}
+
+fn fail(linker: *Linker, message: []const u8, name: [*]const u8, name_length: usize) -> bool {
+    if linker.*.errorLength != 0 { return false }
+    unsafe { linker.*.errorPointer = @ptrCast([*]const u8, message) }
+    linker.*.errorLength = message.length
+    linker.*.errorNamePointer = name
+    linker.*.errorNameLength = name_length
+    return false
+}
+
+pub fn errorMessage(linker: *Linker) -> []const u8 { return linker.*.errorPointer[0..linker.*.errorLength] }
+pub fn errorName(linker: *Linker) -> []const u8 { return linker.*.errorNamePointer[0..linker.*.errorNameLength] }
+
+pub fn objectCount(linker: *Linker) -> usize { return linker.*.objects.*.length }
+
+pub fn objectAt(linker: *Linker, index: usize) -> *Object {
+    unsafe { return @ptrFromInt(*Object, @ptrCast(*usize, vector.Vector.at(linker.*.objects.*, index)).*) }
+}
+
+// Adds an object of the program.
+pub fn addObject(linker: *Linker, object: *Object) -> void {
+    object.*.included = true
+    const address = @intFromPtr(object)
+    unsafe { const appended = vector.Vector.appendAt(linker.*.objects, @ptrCast([*]const u8, &address)) }
+}
+
+// Adds the members of an archive: each becomes part of the program when
+// a symbol it defines is needed. False when a member is not an object.
+pub fn addArchive(linker: *Linker, bytes: [*]const u8, length: usize, path: [*]const u8, path_length: usize) -> bool {
+    var r = archive.reader(bytes, length)
+    var member: archive.Member = undefined
+    while archive.next(&r, &member) {
+        const memory = linker.*.allocator.alloc(@sizeOf(Object), @alignOf(Object))
+        if memory == null { return fail(linker, "out of memory", path, path_length) }
+        var object: *Object = undefined
+        unsafe { object = @ptrCast(*Object, memory.?) }
+        relocatable.initAt(object, linker.*.allocator, member.namePointer, member.nameLength)
+        if !relocatable.read(object, member.bytes, member.length) { return fail(linker, "not an object in the archive", member.namePointer, member.nameLength) }
+        object.*.included = false
+        const address = @intFromPtr(object)
+        unsafe { const appended = vector.Vector.appendAt(linker.*.objects, @ptrCast([*]const u8, &address)) }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Symbols
+
+fn isGlobal(symbol: *relocatable.Symbol) -> bool {
+    return symbol.*.binding == relocatable.GLOBAL || symbol.*.binding == relocatable.WEAK
+}
+
+fn sameName(symbol: *relocatable.Symbol, name: [*]const u8, length: usize, hash: usize) -> bool {
+    return symbol.*.nameHash == hash && symbol.*.nameLength == length && mem.eql(symbol.*.namePointer, name, length)
+}
+
+fn tableInsert(linker: *Linker, object_index: usize, symbol_index: usize) -> void {
+    const symbol = relocatable.symbolAt(objectAt(linker, object_index), symbol_index)
+    var slot = symbol.*.nameHash % linker.*.tableCapacity
+    while linker.*.tableObjects[slot] != NONE {
+        slot = (slot + 1) % linker.*.tableCapacity
+    }
+    linker.*.tableObjects[slot] = object_index
+    linker.*.tableSymbols[slot] = symbol_index
+}
+
+// The definition of the global `name` among the included objects: the
+// object's index and the symbol's, or NONE.
+fn tableFind(linker: *Linker, name: [*]const u8, length: usize, hash: usize) -> (usize, usize) {
+    if linker.*.tableCapacity == 0 { return -> (NONE, NONE) }
+    var slot = hash % linker.*.tableCapacity
+    var probes: usize = 0
+    while linker.*.tableObjects[slot] != NONE && probes < linker.*.tableCapacity {
+        const symbol = relocatable.symbolAt(objectAt(linker, linker.*.tableObjects[slot]), linker.*.tableSymbols[slot])
+        if sameName(symbol, name, length, hash) { return -> (linker.*.tableObjects[slot], linker.*.tableSymbols[slot]) }
+        slot = (slot + 1) % linker.*.tableCapacity
+        probes += 1
+    }
+    return -> (NONE, NONE)
+}
+
+// Builds the table of the included objects' defined global symbols: a
+// strong definition over a weak one, two strong ones an error.
+fn buildTable(linker: *Linker) -> bool {
+    var total: usize = 0
+    var index: usize = 0
+    while index < objectCount(linker) {
+        const object = objectAt(linker, index)
+        if object.*.included { total += relocatable.symbolCount(object) }
+        index += 1
+    }
+    var capacity: usize = 16
+    while capacity < total * 2 + 2 { capacity *= 2 }
+    if linker.*.tableCapacity != 0 {
+        unsafe {
+            linker.*.allocator.free(@ptrCast([*]u8, linker.*.tableObjects), linker.*.tableCapacity * 8, 8)
+            linker.*.allocator.free(@ptrCast([*]u8, linker.*.tableSymbols), linker.*.tableCapacity * 8, 8)
+        }
+    }
+    const objects_memory = linker.*.allocator.alloc(capacity * 8, 8)
+    const symbols_memory = linker.*.allocator.alloc(capacity * 8, 8)
+    if objects_memory == null || symbols_memory == null { return fail(linker, "out of memory", linker.*.errorNamePointer, 0) }
+    unsafe {
+        linker.*.tableObjects = @ptrCast([*]usize, objects_memory.?)
+        linker.*.tableSymbols = @ptrCast([*]usize, symbols_memory.?)
+    }
+    linker.*.tableCapacity = capacity
+    var slot: usize = 0
+    while slot < capacity {
+        linker.*.tableObjects[slot] = NONE
+        slot += 1
+    }
+    index = 0
+    while index < objectCount(linker) {
+        const object = objectAt(linker, index)
+        if object.*.included {
+            var symbol_index: usize = 0
+            while symbol_index < relocatable.symbolCount(object) {
+                const symbol = relocatable.symbolAt(object, symbol_index)
+                if isGlobal(symbol) && relocatable.isDefined(symbol) {
+                    const known = tableFind(linker, symbol.*.namePointer, symbol.*.nameLength, symbol.*.nameHash)
+                    if known.0 == NONE {
+                        tableInsert(linker, index, symbol_index)
+                    } else {
+                        const previous = relocatable.symbolAt(objectAt(linker, known.0), known.1)
+                        if previous.*.binding == relocatable.WEAK && symbol.*.binding == relocatable.GLOBAL {
+                            // The strong definition replaces the weak one.
+                            var probe = symbol.*.nameHash % capacity
+                            while !(linker.*.tableObjects[probe] == known.0 && linker.*.tableSymbols[probe] == known.1) { probe = (probe + 1) % capacity }
+                            linker.*.tableObjects[probe] = index
+                            linker.*.tableSymbols[probe] = symbol_index
+                        } else if previous.*.binding == relocatable.GLOBAL && symbol.*.binding == relocatable.GLOBAL {
+                            return fail(linker, "multiple definition of", symbol.*.namePointer, symbol.*.nameLength)
+                        }
+                    }
+                }
+                symbol_index += 1
+            }
+        }
+        index += 1
+    }
+    return true
+}
+
+// Includes the archive members that define what the included objects
+// need, until nothing more is needed.
+fn resolve(linker: *Linker) -> bool {
+    while true {
+        if !buildTable(linker) { return false }
+        var added = false
+        var index: usize = 0
+        while index < objectCount(linker) && !added {
+            const object = objectAt(linker, index)
+            if object.*.included {
+                var symbol_index: usize = 0
+                while symbol_index < relocatable.symbolCount(object) && !added {
+                    const symbol = relocatable.symbolAt(object, symbol_index)
+                    if isGlobal(symbol) && !relocatable.isDefined(symbol) && symbol.*.binding != relocatable.WEAK {
+                        const known = tableFind(linker, symbol.*.namePointer, symbol.*.nameLength, symbol.*.nameHash)
+                        if known.0 == NONE {
+                            // A member defining it?
+                            var member_index: usize = 0
+                            while member_index < objectCount(linker) && !added {
+                                const member = objectAt(linker, member_index)
+                                if !member.*.included {
+                                    const found = relocatable.findSymbol(member, symbol.*.namePointer, symbol.*.nameLength)
+                                    if found != NONE {
+                                        const definition = relocatable.symbolAt(member, found)
+                                        if isGlobal(definition) && relocatable.isDefined(definition) {
+                                            member.*.included = true
+                                            added = true
+                                        }
+                                    }
+                                }
+                                member_index += 1
+                            }
+                        }
+                    }
+                    symbol_index += 1
+                }
+            }
+            index += 1
+        }
+        if !added { return true }
+    }
+    return true
+}
+
+// What the symbol `symbol_index` of `object` refers to, once the
+// sections are placed: a local one in its own object, a global one by
+// its definition anywhere, an undefined one an import.
+fn resolveSymbol(linker: *Linker, object: *Object, symbol_index: usize) -> Resolved {
+    var symbol = relocatable.symbolAt(object, symbol_index)
+    var owner = object
+    if isGlobal(symbol) {
+        const known = tableFind(linker, symbol.*.namePointer, symbol.*.nameLength, symbol.*.nameHash)
+        if known.0 != NONE {
+            owner = objectAt(linker, known.0)
+            symbol = relocatable.symbolAt(owner, known.1)
+        }
+    }
+    var resolved = Resolved.{ .kind = IMPORTED, .value = 0, .namePointer = symbol.*.namePointer, .nameLength = symbol.*.nameLength }
+    if symbol.*.section == relocatable.ABSOLUTE {
+        resolved.kind = ABSOLUTE
+        resolved.value = symbol.*.value
+    } else if symbol.*.section != NONE {
+        const section = relocatable.sectionAt(owner, symbol.*.section)
+        resolved.kind = if section.*.kind == relocatable.TEXT { IN_CODE } else if section.*.kind == relocatable.TDATA { IN_TLS } else { IN_DATA }
+        resolved.value = section.*.placed + symbol.*.value
+    } else if symbol.*.binding == relocatable.WEAK {
+        // An undefined weak symbol is 0.
+        resolved.kind = ABSOLUTE
+        resolved.value = 0
+    }
+    return resolved
+}
+
+// ---------------------------------------------------------------------------
+// Placement and relocation
+
+fn padCode(linker: *Linker, alignment: usize) -> void {
+    const enc = linker.*.enc
+    var padding = alignment
+    if padding < 16 { padding = 16 }
+    while encoder_module.pos(enc) % padding != 0 { encoder_module.emit1(enc, 0xCC) }
+}
+
+fn emptyName() -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, "") }
+}
+
+// Places every included object's sections: the code appended, the data
+// and zero data reserved in the data area.
+fn place(linker: *Linker) -> void {
+    const enc = linker.*.enc
+    var index: usize = 0
+    while index < objectCount(linker) {
+        const object = objectAt(linker, index)
+        if object.*.included {
+            var section_index: usize = 0
+            while section_index < relocatable.sectionCount(object) {
+                const section = relocatable.sectionAt(object, section_index)
+                if section.*.kind == relocatable.TEXT {
+                    padCode(linker, section.*.alignment)
+                    section.*.placed = encoder_module.pos(enc)
+                    encoder_module.appendBytes(enc, section.*.bytes, section.*.length)
+                } else if section.*.kind == relocatable.DATA {
+                    section.*.placed = encoder_module.reserveData(enc, emptyName(), 0, if section.*.length == 0 { 1 } else { section.*.length }, section.*.alignment, 0, section.*.bytes, section.*.length, false)
+                } else if section.*.kind == relocatable.BSS {
+                    section.*.placed = encoder_module.reserveData(enc, emptyName(), 0, if section.*.length == 0 { 1 } else { section.*.length }, section.*.alignment, 0, section.*.bytes, 0, false)
+                } else if section.*.kind == relocatable.TDATA {
+                    const given = if @intFromPtr(section.*.bytes) == 0 { 0 } else { section.*.length }
+                    section.*.placed = encoder_module.reserveTls(enc, section.*.bytes, given, section.*.length, section.*.alignment)
+                }
+                section_index += 1
+            }
+        }
+        index += 1
+    }
+}
+
+// The stub of an imported function, made on first use: jmp [rip + GOT].
+fn stubOf(linker: *Linker, name: [*]const u8, length: usize) -> usize {
+    const hash = relocatable.hashName(name, length)
+    var index: usize = 0
+    while index < linker.*.stubs.*.length {
+        unsafe {
+            const stub = @ptrCast(*Stub, vector.Vector.at(linker.*.stubs.*, index))
+            if stub.*.nameHash == hash && stub.*.nameLength == length && mem.eql(stub.*.namePointer, name, length) { return stub.*.offset }
+        }
+        index += 1
+    }
+    const enc = linker.*.enc
+    padCode(linker, 8)
+    const offset = encoder_module.pos(enc)
+    encoder_module.emit2(enc, 0xFF, 0x25)
+    const recorded = encoder_module.importIndex(enc, name, length)
+    encoder_module.addFixup(enc, encoder_module.FixupKind.got_rel32, name, length)
+    encoder_module.emit2(enc, 0xCC, 0xCC)
+    const stub = Stub.{ .namePointer = name, .nameLength = length, .nameHash = hash, .offset = offset }
+    unsafe { const appended = vector.Vector.appendAt(linker.*.stubs, @ptrCast([*]const u8, &stub)) }
+    return offset
+}
+
+fn patch(linker: *Linker, offset: usize, value: i64) -> void {
+    encoder_module.patch32(linker.*.enc, offset, @intCast(i32, value))
+}
+
+fn dataOffsetOf(value: usize, addend: i64) -> usize {
+    return @intCast(usize, @intCast(i64, value) + addend)
+}
+
+// A word of the data area that holds the address of `target` at start
+// (a GOT-relative reference to a name of the program).
+fn localGotWord(linker: *Linker, target: Resolved) -> usize {
+    const word = encoder_module.reserveData(linker.*.enc, emptyName(), 0, 8, 8, 0, emptyName(), 0, false)
+    const absolute = Absolute.{ .place = word, .target = target, .addend = 0 }
+    unsafe { const appended = vector.Vector.appendAt(linker.*.absolutes, @ptrCast([*]const u8, &absolute)) }
+    return word
+}
+
+fn isRelative(kind: u8) -> bool { return kind == relocatable.R_PC32 || kind == relocatable.R_PLT32 }
+
+fn isGotRelative(kind: u8) -> bool {
+    return kind == relocatable.R_GOTPCREL || kind == relocatable.R_GOTPCRELX || kind == relocatable.R_REX_GOTPCRELX
+}
+
+// Applies one relocation of a code section placed at `base`.
+fn relocateCode(linker: *Linker, object: *Object, relocation: *relocatable.Relocation, base: usize) -> bool {
+    const enc = linker.*.enc
+    const place = base + relocation.*.offset
+    const target = resolveSymbol(linker, object, relocation.*.symbol)
+    const addend = relocation.*.addend
+    const kind = relocation.*.kind
+    if kind == relocatable.R_TPOFF32 {
+        // Local exec: the image ends at the thread pointer (variant II,
+        // the program's block first).
+        if target.kind != IN_TLS { return fail(linker, "a thread-local reference to a name that is not thread-local data of the program", target.namePointer, target.nameLength) }
+        const block = relocatable.alignUp(encoder_module.tlsSize(), encoder_module.tlsAlignment())
+        patch(linker, place, @intCast(i64, target.value) + addend - @intCast(i64, block))
+        return true
+    }
+    if target.kind == IN_TLS { return fail(linker, "a thread-local variable referred to other than from the thread pointer", target.namePointer, target.nameLength) }
+    if isRelative(kind) {
+        if target.kind == IN_CODE {
+            patch(linker, place, @intCast(i64, target.value) + addend - @intCast(i64, place))
+            return true
+        }
+        if target.kind == IN_DATA {
+            encoder_module.addDataFixupAt(enc, place, dataOffsetOf(target.value, addend + 4))
+            return true
+        }
+        if target.kind == ABSOLUTE {
+            // Only a value no program needs (an undefined weak symbol).
+            if target.value != 0 { return fail(linker, "an absolute symbol cannot be referred to relative to the code", target.namePointer, target.nameLength) }
+            patch(linker, place, 0)
+            return true
+        }
+        // An import: a call goes through a stub; `lea r, [rip + name]`
+        // (8D) becomes `mov r, [rip + GOT slot]` (8B).
+        if addend != -4 { return fail(linker, "an import with an addend", target.namePointer, target.nameLength) }
+        const opcode = encoder_module.byteAt(enc, place - 1)
+        if opcode == 0xE8 || opcode == 0xE9 {
+            const stub = stubOf(linker, target.namePointer, target.nameLength)
+            patch(linker, place, @intCast(i64, stub) - @intCast(i64, place + 4))
+            return true
+        }
+        if opcode == 0x8D && place >= 2 && encoder_module.byteAt(enc, place - 2) == 0x05 {
+            encoder_module.setByte(enc, place - 2, 0x8B)
+        } else if encoder_module.byteAt(enc, place - 2) == 0x8D {
+            encoder_module.setByte(enc, place - 2, 0x8B)
+        } else {
+            return fail(linker, "an import referred to by an instruction other than a call or lea", target.namePointer, target.nameLength)
+        }
+        const recorded = encoder_module.importIndex(enc, target.namePointer, target.nameLength)
+        encoder_module.addFixupAt(enc, encoder_module.FixupKind.got_rel32, place, target.namePointer, target.nameLength)
+        return true
+    }
+    if isGotRelative(kind) {
+        if addend != -4 { return fail(linker, "a GOT reference with an addend", target.namePointer, target.nameLength) }
+        if target.kind == IMPORTED {
+            const recorded = encoder_module.importIndex(enc, target.namePointer, target.nameLength)
+            encoder_module.addFixupAt(enc, encoder_module.FixupKind.got_rel32, place, target.namePointer, target.nameLength)
+            return true
+        }
+        const word = localGotWord(linker, target)
+        encoder_module.addDataFixupAt(enc, place, word)
+        return true
+    }
+    if kind == relocatable.R_32 || kind == relocatable.R_32S {
+        return fail(linker, "an absolute 32-bit address in the code (compile with -fPIE)", target.namePointer, target.nameLength)
+    }
+    return fail(linker, "a relocation of a kind the linker does not know in the code of", object.*.pathPointer, object.*.pathLength)
+}
+
+// Applies one relocation of a data section placed at `base`: an
+// address written at start.
+fn relocateData(linker: *Linker, object: *Object, relocation: *relocatable.Relocation, base: usize) -> bool {
+    if relocation.*.kind != relocatable.R_64 {
+        return fail(linker, "a relocation other than an address in the data of", object.*.pathPointer, object.*.pathLength)
+    }
+    const target = resolveSymbol(linker, object, relocation.*.symbol)
+    if target.kind == IN_TLS { return fail(linker, "the address of a thread-local variable in data", target.namePointer, target.nameLength) }
+    const absolute = Absolute.{ .place = base + relocation.*.offset, .target = target, .addend = relocation.*.addend }
+    unsafe { const appended = vector.Vector.appendAt(linker.*.absolutes, @ptrCast([*]const u8, &absolute)) }
+    return true
+}
+
+fn relocateInit(linker: *Linker, object: *Object, relocation: *relocatable.Relocation) -> bool {
+    if relocation.*.kind != relocatable.R_64 { return fail(linker, "an init_array entry that is not an address in", object.*.pathPointer, object.*.pathLength) }
+    const target = resolveSymbol(linker, object, relocation.*.symbol)
+    if target.kind != IN_CODE { return fail(linker, "an init_array entry that is not a function of the program in", object.*.pathPointer, object.*.pathLength) }
+    const offset = dataOffsetOf(target.value, relocation.*.addend)
+    unsafe { const appended = vector.Vector.appendAt(linker.*.inits, @ptrCast([*]const u8, &offset)) }
+    return true
+}
+
+fn relocate(linker: *Linker) -> bool {
+    var index: usize = 0
+    while index < objectCount(linker) {
+        const object = objectAt(linker, index)
+        if object.*.included {
+            var relocation_index: usize = 0
+            while relocation_index < relocatable.relocationCount(object) {
+                const relocation = relocatable.relocationAt(object, relocation_index)
+                const section = relocatable.sectionAt(object, relocation.*.section)
+                if section.*.kind == relocatable.TEXT {
+                    if !relocateCode(linker, object, relocation, section.*.placed) { return false }
+                } else if section.*.kind == relocatable.DATA {
+                    if !relocateData(linker, object, relocation, section.*.placed) { return false }
+                } else if section.*.kind == relocatable.INIT {
+                    if !relocateInit(linker, object, relocation) { return false }
+                }
+                relocation_index += 1
+            }
+        }
+        index += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The code the linker makes
+
+fn name(text: []const u8) -> [*]const u8 {
+    unsafe { return @ptrCast([*]const u8, text) }
+}
+
+// call rel32 to `code_offset`.
+fn callTo(linker: *Linker, code_offset: usize) -> void {
+    const enc = linker.*.enc
+    encoder_module.emit1(enc, 0xE8)
+    const after = encoder_module.pos(enc) + 4
+    encoder_module.emitImm32(enc, @intCast(i32, @intCast(i64, code_offset) - @intCast(i64, after)))
+}
+
+// rax = the address `target` + `addend` stands for.
+fn loadAddress(linker: *Linker, target: Resolved, addend: i64) -> bool {
+    const enc = linker.*.enc
+    if target.kind == IN_CODE {
+        // lea rax, [rip + disp32]
+        encoder_module.emit3(enc, 0x48, 0x8D, 0x05)
+        const after = encoder_module.pos(enc) + 4
+        encoder_module.emitImm32(enc, @intCast(i32, @intCast(i64, target.value) + addend - @intCast(i64, after)))
+        return true
+    }
+    if target.kind == IN_DATA {
+        encoder_module.emitLeaData(enc, x86.Register.rax, dataOffsetOf(target.value, addend))
+        return true
+    }
+    if target.kind == ABSOLUTE {
+        encoder_module.emitMovRegImm64(enc, x86.Register.rax, @intCast(i64, target.value) + addend)
+        return true
+    }
+    encoder_module.emitImportAddress(enc, x86.Register.rax, target.namePointer, target.nameLength)
+    if addend != 0 {
+        if addend < -2147483648 || addend > 2147483647 { return fail(linker, "an addend too large", target.namePointer, target.nameLength) }
+        encoder_module.emitAluImm(enc, x86.Register.rax, @intCast(i32, addend), 0, 0x05)
+    }
+    return true
+}
+
+// __mlxcc_init: the addresses held by data (and the GOT words of the
+// program's own names) written, then the objects' init functions
+// called, in order.
+fn genInit(linker: *Linker) -> bool {
+    const enc = linker.*.enc
+    padCode(linker, 16)
+    encoder_module.defineSymbol(enc, name("__mlxcc_init"), 12)
+    encoder_module.emitPushRbp(enc)
+    encoder_module.emitMovRbpRsp(enc)
+    var index: usize = 0
+    while index < linker.*.absolutes.*.length {
+        unsafe {
+            const absolute = @ptrCast(*Absolute, vector.Vector.at(linker.*.absolutes.*, index))
+            if !loadAddress(linker, absolute.*.target, absolute.*.addend) { return false }
+            encoder_module.emitDataStore(enc, absolute.*.place, x86.Register.rax)
+        }
+        index += 1
+    }
+    index = 0
+    while index < linker.*.inits.*.length {
+        unsafe {
+            const offset = @ptrCast(*usize, vector.Vector.at(linker.*.inits.*, index)).*
+            callTo(linker, offset)
+        }
+        index += 1
+    }
+    encoder_module.emitLeave(enc)
+    encoder_module.emitRet(enc)
+    return true
+}
+
+// _start, at the start of the code: the stack aligned, __mlxcc_init,
+// main(argc, argv, envp), exit with its result. The initial stack is
+// kept in rbx, which the calls preserve.
+fn genStart(linker: *Linker) -> void {
+    const enc = linker.*.enc
+    encoder_module.defineSymbol(enc, name("_start"), 6)
+    encoder_module.emitMovRegImm64(enc, x86.Register.rbp, 0)
+    encoder_module.emitMovRegReg(enc, x86.Register.rbx, x86.Register.rsp)
+    // and rsp, -16
+    encoder_module.emit4(enc, 0x48, 0x83, 0xE4, 0xF0)
+    encoder_module.emitCallRel(enc, name("__mlxcc_init"), 12)
+    // mov rdi, [rbx]; lea rsi, [rbx + 8]; mov rdx, rdi; shl rdx, 3; add rdx, rsi; lea rdx, [rdx + 8]
+    encoder_module.emitLoadPointer(enc, x86.Register.rdi, x86.Register.rbx, 8)
+    encoder_module.emit4(enc, 0x48, 0x8D, 0x73, 0x08)
+    encoder_module.emitMovRegReg(enc, x86.Register.rdx, x86.Register.rdi)
+    encoder_module.emit4(enc, 0x48, 0xC1, 0xE2, 0x03)
+    encoder_module.emitAdd(enc, x86.Register.rdx, x86.Register.rsi)
+    encoder_module.emit4(enc, 0x48, 0x8D, 0x52, 0x08)
+    encoder_module.emitMovRegImm64(enc, x86.Register.rax, 0)
+    encoder_module.emitCallRel(enc, name("main"), 4)
+    encoder_module.emitMovRegReg(enc, x86.Register.rdi, x86.Register.rax)
+    encoder_module.emitImportCall(enc, name("exit"), 4, 0)
+}
+
+// Links the objects into the encoder: the program's code and data,
+// ready for elf64_dynamic. False with the error set.
+pub fn link(linker: *Linker) -> bool {
+    if !resolve(linker) { return false }
+    genStart(linker)
+    place(linker)
+    if !relocate(linker) { return false }
+    if !genInit(linker) { return false }
+    const main_symbol = tableFind(linker, name("main"), 4, relocatable.hashName(name("main"), 4))
+    if main_symbol.0 == NONE { return fail(linker, "the program has no main function", name("main"), 4) }
+    const main_resolved = resolveSymbol(linker, objectAt(linker, main_symbol.0), main_symbol.1)
+    if main_resolved.kind != IN_CODE { return fail(linker, "main is not a function", name("main"), 4) }
+    encoder_module.defineSymbolAt(linker.*.enc, name("main"), 4, main_resolved.value)
+    if !encoder_module.applyFixups(linker.*.enc) { return fail(linker, "internal error: a reference of the linker's own code is unresolved", name(""), 0) }
+    return true
+}
+
+// Links and writes the program to `output`, needing the libraries
+// `needed` (NUL-ended names) and starting on `interpreter` (NUL-ended;
+// length 0 for the system's).
+pub fn writeProgram(linker: *Linker, needed: [*]const [*]const u8, needed_count: usize, interpreter: [*]const u8, interpreter_length: usize, output: [*]const u8) -> bool {
+    if !link(linker) { return false }
+    var naming = elf64_dynamic.noNaming()
+    naming.interpreterPointer = interpreter
+    naming.interpreterLength = interpreter_length
+    if !elf64_dynamic.writeExecutableNamed(linker.*.allocator, linker.*.enc, needed, needed_count, naming, output) {
+        return fail(linker, "cannot write", output, 0)
+    }
+    return true
+}

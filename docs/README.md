@@ -74,6 +74,8 @@ How the compiler itself works, normatively and concretely:
 
 ## Architecture notes
 
+- [`ROADMAP.md`](ROADMAP.md) — where MLX/Linux stands on the way to a
+  system without GNU, and the phases ahead (the C compiler first)
 - [`BOOTSTRAP.md`](BOOTSTRAP.md) — the Zig-to-self-hosting bootstrap chain
 - [`WAYLAND.md`](WAYLAND.md) — why Wayland is a stdlib-bootstrap protocol
   extension, not a compiler feature

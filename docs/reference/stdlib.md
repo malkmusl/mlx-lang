@@ -132,7 +132,16 @@ key (Linux key code, modifiers, the text it types and the text without
 Control and Alt) as xterm does; `std.terminal.pty` runs a program on a
 pseudo-terminal. `std.ui.terminal` draws a screen on a `std.ui` canvas with
 the monospaced font of `std.ui.text` and handles its keys and wheel, for
-`projects/desktop/terminal` and any app with a terminal pane. A
+`projects/desktop/terminal` and any app with a terminal pane, and draws
+its selection (`selectionRange()`; lines counted from the history's
+oldest through `lineCell()`). `std.ui.terminal_input` makes the
+selection from the pointer (`press()`, `motion()`, `release()`: cells,
+words, lines, Shift to extend; `follow()` after output keeps it on its
+lines), gives its text (`selectedText()`), reports the pointer to
+programs that asked (X10 or SGR, `wheel()` sends arrows on the alternate
+screen), filters pastes (`filterPaste()`: no escape or other controls,
+line ends as CR; `pasteBegin()`/`pasteEnd()` for bracketed paste) and
+quotes dropped files' paths for a shell (`quotedPaths()`). A
 `std.ui.host` app watches a descriptor (the pty) with `watchDescriptor()`
 and gets `EVENT_WATCH`; `plainTyped()` is the key's text without Control
 and Alt. Without a compositor the same screen and drawing run on the
@@ -141,8 +150,10 @@ Linux framebuffer (`projects/console`, mlx-console): `std.ui.text`'s
 reads keys from evdev with a keymap of the program's own through
 `useKeymap()` and `press()`. The emulation is checked by
 `tests/301_terminal_core_runtime.mlx`, the drawing and the pty by
-`tests/support/terminal_render.mlx` and `tests/support/terminal_pty.mlx`
-(`tools/check_terminal.sh`), the console's picture against
+`tests/support/terminal_render.mlx` and `tests/support/terminal_pty.mlx`,
+the selection, the mouse reports, the paste filter and dropped files by
+`tests/support/terminal_input.mlx` (all three in `tools/check_terminal.sh`),
+the console's picture against
 `tests/support/console_expected.mlx` (`tools/check_console.sh`).
 
 `std.crash` (`std/src/crash.mlx`) is a program's crash report: `install()`
@@ -196,7 +207,9 @@ like a processor's crash, in the pass that failed with the functions that
 recorded it, and kept as a `gpu-crash` line. With `MLX_GPU_PROFILE` (`1`,
 or a directory) timestamp queries time each pass and the time goes on
 those functions, written as a profile with the source `gpu`
-(`tools/check_gpu_diagnostics.sh`, on lavapipe). With `MLX_FRAMES` each
+(`tools/check_gpu_diagnostics.sh`, on lavapipe, with
+`tests/support/gpu_diagnostics_program.mlx`: a pass that faults, timed
+passes, small and large buffers, slow frames). With `MLX_FRAMES` each
 frame's command buffer gets a timestamp at its start and its end, and the
 GPU's time goes on the frame the program was drawing when it began.
 
@@ -244,7 +257,11 @@ stream socket, without libc or libxcb: the connection setup, the requests
 a window manager sends (InternAtom, CreateWindow, ChangeWindowAttributes,
 MapWindow, ConfigureWindow, ChangeProperty, GetProperty, SendEvent,
 SetInputFocus, SetSelectionOwner, KillClient, QueryExtension and
-Composite's RedirectSubwindows) and the messages it reads back. It never
+Composite's RedirectSubwindows), the selection requests (ConvertSelection,
+SetSelectionOwner at a given time, GetProperty in parts
+with delete, DeleteProperty, ChangeProperty of any size in appended parts,
+GetAtomName, SelectionNotify, XFixes' SelectSelectionInput) and the
+messages it reads back. It never
 waits for the server: `fill` reads what arrived, `take` hands out one
 complete message (the setup's answer, a reply, an error or an event) at a
 time, and requests with a reply return their sequence number. The
@@ -262,6 +279,37 @@ for the next one (its body at `bodyOf`, its descriptors at
 (`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use it;
 `tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl and
 dbus-monitor.
+
+`std.ipc` (`std/src/ipc.mlx`) is MLXIPC's native wire format, what Mlx
+programs speak to the bus and to each other over direct channels, next
+to D-Bus on the same socket: the preamble that opens a connection (and
+tells it from a D-Bus one by its first byte), messages of a 20-byte
+little-endian header, fields and a body without padding (`Reader`,
+`Writer`, `messageSize`, `parse`, `write`), the D-Bus signature alphabet
+for its values (so a signature means the same on both sides of the bus),
+`bodyToNative`/`bodyToDBus` and `fromDBus`/`toDBus`, which carry a body
+or a whole message between the two formats without loss (the bus does
+that for every message between a native and a D-Bus connection), and a
+client with `std.dbus`'s client API (`connectSession`, `call`, `signal`,
+`reply`, `replyError`, `next`, `waitReply`; `attach` for a direct
+channel). Both formats are
+checked as dbus-daemon checks D-Bus: `std.dbus`'s `validUtf8`,
+`validPath`, `validMember`, `validInterface`, `validBusName`,
+`validSignature`, `validBody` and `validMessage` (and `std.ipc`'s
+`parse` and `validMessage`) refuse malformed names, strings that are not
+UTF-8, booleans other than 0 or 1, descriptor indexes past a message's,
+arrays past the body, padding that is not zero and anything nested too
+deep, so a receiver never sees what would make it drop its connection.
+`tests/343_ipc_wire_runtime.mlx` writes and reads every kind of value,
+frames, parses and refuses messages, carries a D-Bus body to the native
+format and back byte for byte, checks what the validators refuse, and
+runs thousands of mutated messages of either format through parsers,
+validators and conversions; `tools/check_ipc.sh` runs `mlx-ipc --native`
+against the bus next to dbus-send, gdbus and dbus-monitor, and
+`tools/check_ipc_hostile.py` sends what each validator refuses. The
+format, and what a round trip costs (about 85 µs through the bus for a
+small message in either format, about 40 µs over a direct channel;
+`mlx-ipc bench`), is described in `projects/desktop/ipc/README.md`.
 
 `std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
 `connect` finds the sound server on the session bus and gets a direct
@@ -464,7 +512,8 @@ defer leaks.finish()            // the blocks the loop kept, and the arena
 
 It is part of the runtime: `std.crash.install()`, which every program
 calls first, calls `leaks.watch()`, so with `MLX_LEAK_CHECK` set any
-program is watched from its start. `MLX_LEAK_CHECK=1` reports on stderr,
+program is watched from its start (`tests/support/leaks_program.mlx`, in
+`tests/run_debug_allocator.sh`). `MLX_LEAK_CHECK=1` reports on stderr,
 `MLX_LEAK_CHECK=/a/path` appends to
 that file (each line names the program and its process), `0` or nothing
 watches nothing. While a watched program runs, its memory is written
@@ -810,6 +859,45 @@ pub fn main() -> u8 {
 
 (`tests/161_standard_io_runtime.mlx`)
 
+## math (`std.math`)
+
+**Implementation:** `std/src/math.mlx`
+**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`
+
+Floating-point math in Mlx on the doubles' bits, without libm. Import it as
+`@import("std.math")`; it imports nothing itself, so a `--plugin` library
+can use it too.
+
+- Constants: `pi`, `tau`, `e`, `ln2`, `ln10`, `sqrt2` (`f64`), and
+  `infinity()`, `negativeInfinity()`, `nan()`, `isNan(x)`, `abs(x)`.
+- Whole numbers: `floor`, `ceil`, `trunc` are the builtins `@floor`,
+  `@ceil`, `@trunc` (one instruction); `round(x)` rounds halves away from
+  zero. The square root is `@sqrt`.
+- `sin(x)`, `cos(x)`: argument reduction by pi/2 in three parts, then
+  fdlibm's minimax kernels; within an ulp of the exact value for |x| up to
+  about 2^20 pi, 0 past 2^52 (NaN for the infinities and NaN).
+- `exp(x)`, `ln(x)`, `log2(x)`, `log10(x)`: fdlibm's reductions and
+  polynomials, within an ulp; `log2` and `log10` take the exponent exactly,
+  so whole powers of two and of ten come out exact. `ln` of 0 is minus
+  infinity, of a negative number NaN; `exp` overflows to infinity past
+  709.78 and underflows to 0 below -745.13.
+- `pow(x, y)` for `x > 0` (`exp(y ln x)`: a few ulps for results up to
+  about 2^50), `cbrt(x)` for any sign.
+
+```mlx
+const math = @import("std.math")
+
+pub fn main() -> u8 {
+    if @bitCast(u64, math.sin(1.0)) != 4605754516372524270 { return 1 }   // the correctly rounded sin(1)
+    if math.log10(1000.0) != 3.0 || math.log2(1024.0) != 10.0 { return 6 }
+    if math.round(-2.5) != -3.0 { return 8 }
+    if !math.isNan(math.ln(-1.0)) { return 9 }
+    return 13
+}
+```
+
+(`tests/325_standard_math_runtime.mlx`)
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`
@@ -1084,6 +1172,9 @@ Neither surface has a runtime fixture: no file under `tests/` contains a
 `fn main() -> u8` return-code convention shown throughout this chapter (and
 `tests/run_error.sh` for compile-error fixtures, per
 [`docs/guide/README.md`](../guide/README.md)), not the `test` declaration or
-a `std.testing` module. This chapter does not describe an `expect*` API
+a `std.testing` module. Some library checks compare an Mlx program
+with a system reference instead: `tools/check_crypt.sh` feeds settings
+to `tests/support/crypt_hashes.mlx` and compares its hashes with
+crypt(3)'s. This chapter does not describe an `expect*` API
 surface beyond the four names `testing.xml` gives, since none of them is
 grounded in source or a runtime fixture.

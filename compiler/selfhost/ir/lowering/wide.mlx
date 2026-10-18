@@ -1,0 +1,405 @@
+// Integers wider than a word: u65 to u128 and i65 to i128 are two words
+// in the LIR, the low one first, held like a tuple's components (a
+// local's two slots, a struct field's two words, two registers of a call).
+// Every operation on them is expanded here into word-sized instructions:
+// carries from unsigned comparisons, the high half of a product from
+// 32-bit halves, shifts across the words by masks, division bit by bit in
+// a loop, so the backends only ever see 64-bit arithmetic. A width under
+// 128 keeps its top word canonical (the bits above the width zero, or
+// copies of the sign). A one-word value widens by its type's sign; an
+// untyped one (a literal) by the target's.
+const lir = @import("../lir.mlx")
+const types_store = @import("../../sema/types/store.mlx")
+
+pub const Context = struct {
+    ir: *lir.Lir
+    types: *types_store.Store
+    blockCounter: *usize
+}
+
+pub fn isWideType(types: *types_store.Store, type_id: usize) -> bool {
+    if type_id == 0 || type_id == lir.NONE || type_id >= types_store.Store.count(types) { return false }
+    const value = types_store.Store.get(types, type_id)
+    return value.*.kind == types_store.Kind.integer && value.*.bits > 64
+}
+
+// The words of an integer of `bits` bits.
+pub fn wordCount(bits: usize) -> usize { return (bits + 63) / 64 }
+
+// Whether the wide type is one these expansions compute on (two words).
+pub fn isSupported(types: *types_store.Store, type_id: usize) -> bool {
+    return isWideType(types, type_id) && types_store.Store.get(types, type_id).*.bits <= 128
+}
+
+fn bitsOf(c: *Context, type_id: usize) -> usize {
+    return types_store.Store.get(c.*.types, type_id).*.bits
+}
+
+fn isSignedInteger(types: *types_store.Store, type_id: usize) -> bool {
+    if type_id == 0 || type_id == lir.NONE || type_id >= types_store.Store.count(types) { return false }
+    const value = types_store.Store.get(types, type_id)
+    return value.*.kind == types_store.Kind.integer && value.*.flags & types_store.FLAG_SIGNED != 0
+}
+
+fn isInteger(types: *types_store.Store, type_id: usize) -> bool {
+    if type_id == 0 || type_id == lir.NONE || type_id >= types_store.Store.count(types) { return false }
+    return types_store.Store.get(types, type_id).*.kind == types_store.Kind.integer
+}
+
+fn add(c: *Context, inst: lir.Inst) -> usize { return lir.addInst(c.*.ir, inst) }
+
+fn constant(c: *Context, value: usize) -> usize { return add(c, lir.constI(lir.NONE, value)) }
+
+fn op(c: *Context, opcode: lir.Opcode, a: usize, b: usize) -> usize {
+    return add(c, lir.binary(opcode, lir.NONE, a, b))
+}
+
+// An arithmetic shift right: the instruction typed i64 shifts in the sign.
+fn sar(c: *Context, a: usize, b: usize) -> usize {
+    const i64_type = types_store.Store.integer(c.*.types, true, 64)
+    return add(c, lir.binary(lir.Opcode.shr, i64_type, a, b))
+}
+
+fn cmp(c: *Context, predicate: lir.CmpPredicate, a: usize, b: usize) -> usize {
+    var inst = lir.initInst(lir.Opcode.icmp, lir.NONE)
+    inst.arg0 = @intCast(usize, @intFromEnum(predicate))
+    inst.arg1 = a
+    inst.arg2 = b
+    return add(c, inst)
+}
+
+fn allOnes(c: *Context) -> usize { return constant(c, 18446744073709551615) }
+
+// A mask of all ones when `flag` (0 or 1) is set.
+fn maskOf(c: *Context, flag: usize) -> usize { return op(c, lir.Opcode.sub, constant(c, 0), flag) }
+
+pub fn low(c: *Context, v: usize) -> usize {
+    var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+    extract.arg0 = v
+    extract.arg1 = 0
+    return add(c, extract)
+}
+
+pub fn high(c: *Context, v: usize) -> usize {
+    var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+    extract.arg0 = v
+    extract.arg1 = 1
+    return add(c, extract)
+}
+
+// The two words as a value of the wide type `type_id`.
+fn pack(c: *Context, type_id: usize, lo: usize, hi: usize) -> usize {
+    const extra_start = c.*.ir.*.extraData.*.length
+    lir.addExtra(c.*.ir, lo)
+    lir.addExtra(c.*.ir, hi)
+    var tuple = lir.initInst(lir.Opcode.tuple_literal, type_id)
+    tuple.arg0 = extra_start
+    tuple.arg1 = 2
+    return add(c, tuple)
+}
+
+// The words made a canonical value of `type_id`: for a width under 128
+// the top word's bits above the width are cleared (unsigned) or made
+// copies of the sign (signed).
+fn canon(c: *Context, type_id: usize, lo: usize, hi: usize) -> usize {
+    const bits = bitsOf(c, type_id)
+    if bits >= 128 { return pack(c, type_id, lo, hi) }
+    const top = bits - 64
+    if isSignedInteger(c.*.types, type_id) {
+        const shift = constant(c, 64 - top)
+        return pack(c, type_id, lo, sar(c, op(c, lir.Opcode.shl, hi, shift), shift))
+    }
+    const mask = constant(c, (@intCast(usize, 1) << @intCast(u6, top)) - 1)
+    return pack(c, type_id, lo, op(c, lir.Opcode.bit_and, hi, mask))
+}
+
+// Whether the instruction `v` holds two words already (a constant typed
+// wide by a comptime binding is one word).
+pub fn isWideValue(c: *Context, v: usize) -> bool {
+    if v == lir.NONE { return false }
+    const inst = lir.getInst(c.*.ir, v)
+    if inst.opcode == lir.Opcode.const_i { return false }
+    return isWideType(c.*.types, inst.typeId)
+}
+
+// `v` as a value of the wide `type_id`: a one-word value extended by the
+// sign of `source_type` (an untyped one by the target's); a wide value as
+// it is.
+pub fn widen(c: *Context, v: usize, source_type: usize, type_id: usize) -> usize {
+    if isWideValue(c, v) { return v }
+    var signed = isSignedInteger(c.*.types, type_id)
+    if isInteger(c.*.types, source_type) { signed = isSignedInteger(c.*.types, source_type) }
+    const inst = lir.getInst(c.*.ir, v)
+    if inst.opcode != lir.Opcode.const_i && isInteger(c.*.types, inst.typeId) { signed = isSignedInteger(c.*.types, inst.typeId) }
+    const hi = if signed { sar(c, v, constant(c, 63)) } else { constant(c, 0) }
+    return canon(c, type_id, v, hi)
+}
+
+// A wide value as another wide type: widened by its sign, or truncated.
+pub fn convert(c: *Context, v: usize, type_id: usize) -> usize {
+    return canon(c, type_id, low(c, v), high(c, v))
+}
+
+// A wide value's low bits as the one-word integer `type_id`, canonical
+// for a width under 64 (zero- or sign-extended in the word).
+pub fn narrow(c: *Context, v: usize, type_id: usize) -> usize {
+    const lo = low(c, v)
+    const bits = bitsOf(c, type_id)
+    if bits >= 64 { return lo }
+    if isSignedInteger(c.*.types, type_id) {
+        const shift = constant(c, 64 - bits)
+        return sar(c, op(c, lir.Opcode.shl, lo, shift), shift)
+    }
+    return op(c, lir.Opcode.bit_and, lo, constant(c, (@intCast(usize, 1) << @intCast(u6, bits)) - 1))
+}
+
+fn addWords(c: *Context, al: usize, ah: usize, bl: usize, bh: usize) -> (usize, usize) {
+    const lo = op(c, lir.Opcode.add, al, bl)
+    const carry = cmp(c, lir.CmpPredicate.ult, lo, al)
+    const hi = op(c, lir.Opcode.add, op(c, lir.Opcode.add, ah, bh), carry)
+    return -> (lo, hi)
+}
+
+fn subWords(c: *Context, al: usize, ah: usize, bl: usize, bh: usize) -> (usize, usize) {
+    const lo = op(c, lir.Opcode.sub, al, bl)
+    const borrow = cmp(c, lir.CmpPredicate.ult, al, bl)
+    const hi = op(c, lir.Opcode.sub, op(c, lir.Opcode.sub, ah, bh), borrow)
+    return -> (lo, hi)
+}
+
+// The high word of the 128-bit product of two words, from 32-bit halves.
+fn mulHigh(c: *Context, a: usize, b: usize) -> usize {
+    const m32 = constant(c, 4294967295)
+    const s32 = constant(c, 32)
+    const al = op(c, lir.Opcode.bit_and, a, m32)
+    const ah = op(c, lir.Opcode.shr, a, s32)
+    const bl = op(c, lir.Opcode.bit_and, b, m32)
+    const bh = op(c, lir.Opcode.shr, b, s32)
+    const ll = op(c, lir.Opcode.mul, al, bl)
+    const lh = op(c, lir.Opcode.mul, al, bh)
+    const hl = op(c, lir.Opcode.mul, ah, bl)
+    const hh = op(c, lir.Opcode.mul, ah, bh)
+    const mid = op(c, lir.Opcode.add, op(c, lir.Opcode.add, op(c, lir.Opcode.shr, ll, s32), op(c, lir.Opcode.bit_and, lh, m32)), op(c, lir.Opcode.bit_and, hl, m32))
+    const sum = op(c, lir.Opcode.add, op(c, lir.Opcode.add, hh, op(c, lir.Opcode.shr, lh, s32)), op(c, lir.Opcode.shr, hl, s32))
+    return op(c, lir.Opcode.add, sum, op(c, lir.Opcode.shr, mid, s32))
+}
+
+// The low 128 bits of the product.
+fn mulWords(c: *Context, al: usize, ah: usize, bl: usize, bh: usize) -> (usize, usize) {
+    const lo = op(c, lir.Opcode.mul, al, bl)
+    const cross = op(c, lir.Opcode.add, op(c, lir.Opcode.mul, al, bh), op(c, lir.Opcode.mul, ah, bl))
+    const hi = op(c, lir.Opcode.add, mulHigh(c, al, bl), cross)
+    return -> (lo, hi)
+}
+
+// The words shifted by `n` (0 to 127, one word) left, or right logically
+// or arithmetically: a count of 64 and more moves whole words, chosen
+// by masks rather than branches.
+fn shiftWords(c: *Context, lo: usize, hi: usize, n: usize, left: bool, arithmetic: bool) -> (usize, usize) {
+    const n64 = op(c, lir.Opcode.bit_and, n, constant(c, 63))
+    const big = cmp(c, lir.CmpPredicate.uge, n, constant(c, 64))
+    const m = maskOf(c, big)
+    const nm = op(c, lir.Opcode.bit_xor, m, allOnes(c))
+    // The bits that cross between the words: shifted by 63 - n and once
+    // more, so that a count of 0 moves none.
+    const back = op(c, lir.Opcode.sub, constant(c, 63), n64)
+    const one = constant(c, 1)
+    var lo1: usize = 0
+    var hi1: usize = 0
+    var lo2: usize = 0
+    var hi2: usize = 0
+    if left {
+        lo1 = op(c, lir.Opcode.shl, lo, n64)
+        hi1 = op(c, lir.Opcode.bit_or, op(c, lir.Opcode.shl, hi, n64), op(c, lir.Opcode.shr, op(c, lir.Opcode.shr, lo, back), one))
+        lo2 = constant(c, 0)
+        hi2 = op(c, lir.Opcode.shl, lo, n64)
+    } else {
+        lo1 = op(c, lir.Opcode.bit_or, op(c, lir.Opcode.shr, lo, n64), op(c, lir.Opcode.shl, op(c, lir.Opcode.shl, hi, back), one))
+        if arithmetic {
+            hi1 = sar(c, hi, n64)
+            hi2 = sar(c, hi, constant(c, 63))
+        } else {
+            hi1 = op(c, lir.Opcode.shr, hi, n64)
+            hi2 = constant(c, 0)
+        }
+        lo2 = hi1
+    }
+    const result_lo = op(c, lir.Opcode.bit_or, op(c, lir.Opcode.bit_and, lo1, nm), op(c, lir.Opcode.bit_and, lo2, m))
+    const result_hi = op(c, lir.Opcode.bit_or, op(c, lir.Opcode.bit_and, hi1, nm), op(c, lir.Opcode.bit_and, hi2, m))
+    return -> (result_lo, result_hi)
+}
+
+fn load(c: *Context, address: usize) -> usize {
+    var inst = lir.initInst(lir.Opcode.load, lir.NONE)
+    inst.arg0 = address
+    inst.arg1 = 8
+    return add(c, inst)
+}
+
+fn store(c: *Context, address: usize, value: usize) -> void {
+    var inst = lir.initInst(lir.Opcode.store, lir.NONE)
+    inst.arg0 = address
+    inst.arg1 = value
+    inst.arg2 = 8
+    const stored = add(c, inst)
+}
+
+fn slot(c: *Context, initial: usize) -> usize {
+    const address = add(c, lir.initInst(lir.Opcode.alloca, lir.NONE))
+    store(c, address, initial)
+    return address
+}
+
+fn newBlock(c: *Context) -> usize {
+    const block = c.*.blockCounter.*
+    c.*.blockCounter.* = block + 1
+    return block
+}
+
+// Unsigned division of the 128-bit value a by b, bit by bit from the
+// top: the quotient's and the remainder's words. A zero divisor gives a
+// quotient of all ones and the dividend as the remainder.
+fn divideWords(c: *Context, al: usize, ah: usize, bl: usize, bh: usize) -> (usize, usize, usize, usize) {
+    const zero = constant(c, 0)
+    const one = constant(c, 1)
+    const q_lo = slot(c, zero)
+    const q_hi = slot(c, zero)
+    const r_lo = slot(c, zero)
+    const r_hi = slot(c, zero)
+    const counter = slot(c, constant(c, 128))
+    const head = newBlock(c)
+    const body = newBlock(c)
+    const done = newBlock(c)
+    const entered = add(c, lir.branch(head))
+    const head_label = add(c, lir.blockLabelInst(head))
+    const remaining = load(c, counter)
+    const finished = cmp(c, lir.CmpPredicate.eq, remaining, zero)
+    const decided = add(c, lir.condBranch(finished, done, body))
+    const body_label = add(c, lir.blockLabelInst(body))
+    const index = op(c, lir.Opcode.sub, remaining, one)
+    store(c, counter, index)
+    // The dividend's bit at `index`, into the remainder from below.
+    const dividend = shiftWords(c, al, ah, index, false, false)
+    const bit = op(c, lir.Opcode.bit_and, dividend.0, one)
+    const old_lo = load(c, r_lo)
+    const old_hi = load(c, r_hi)
+    const next_lo = op(c, lir.Opcode.bit_or, op(c, lir.Opcode.shl, old_lo, one), bit)
+    const next_hi = op(c, lir.Opcode.bit_or, op(c, lir.Opcode.shl, old_hi, one), op(c, lir.Opcode.shr, old_lo, constant(c, 63)))
+    // When the remainder reached the divisor: subtract it, set the
+    // quotient's bit (by masks: no branch).
+    const above = cmp(c, lir.CmpPredicate.ugt, next_hi, bh)
+    const same = cmp(c, lir.CmpPredicate.eq, next_hi, bh)
+    const low_enough = cmp(c, lir.CmpPredicate.uge, next_lo, bl)
+    const takes = op(c, lir.Opcode.bit_or, above, op(c, lir.Opcode.bit_and, same, low_enough))
+    const mask = maskOf(c, takes)
+    const taken = subWords(c, next_lo, next_hi, op(c, lir.Opcode.bit_and, bl, mask), op(c, lir.Opcode.bit_and, bh, mask))
+    store(c, r_lo, taken.0)
+    store(c, r_hi, taken.1)
+    const flag = shiftWords(c, one, zero, index, true, false)
+    store(c, q_lo, op(c, lir.Opcode.bit_or, load(c, q_lo), op(c, lir.Opcode.bit_and, flag.0, mask)))
+    store(c, q_hi, op(c, lir.Opcode.bit_or, load(c, q_hi), op(c, lir.Opcode.bit_and, flag.1, mask)))
+    const again = add(c, lir.branch(head))
+    const done_label = add(c, lir.blockLabelInst(done))
+    return -> (load(c, q_lo), load(c, q_hi), load(c, r_lo), load(c, r_hi))
+}
+
+// The words negated when `mask` is all ones (two's complement: the words
+// inverted, then the mask subtracted).
+fn negateIf(c: *Context, lo: usize, hi: usize, mask: usize) -> (usize, usize) {
+    return subWords(c, op(c, lir.Opcode.bit_xor, lo, mask), op(c, lir.Opcode.bit_xor, hi, mask), mask, mask)
+}
+
+// Signed or unsigned division or remainder, C's way: the quotient
+// truncated toward zero, the remainder with the dividend's sign.
+fn divide(c: *Context, al: usize, ah: usize, bl: usize, bh: usize, signed: bool, remainder: bool) -> (usize, usize) {
+    if !signed {
+        const parts = divideWords(c, al, ah, bl, bh)
+        if remainder { return -> (parts.2, parts.3) }
+        return -> (parts.0, parts.1)
+    }
+    const zero = constant(c, 0)
+    const a_mask = maskOf(c, cmp(c, lir.CmpPredicate.lt, ah, zero))
+    const b_mask = maskOf(c, cmp(c, lir.CmpPredicate.lt, bh, zero))
+    const a = negateIf(c, al, ah, a_mask)
+    const b = negateIf(c, bl, bh, b_mask)
+    const parts = divideWords(c, a.0, a.1, b.0, b.1)
+    if remainder { return negateIf(c, parts.2, parts.3, a_mask) }
+    return negateIf(c, parts.0, parts.1, op(c, lir.Opcode.bit_xor, a_mask, b_mask))
+}
+
+// A binary operation (the LIR opcode) on two wide values of `type_id`.
+pub fn arithmetic(c: *Context, opcode: lir.Opcode, type_id: usize, a: usize, b: usize) -> usize {
+    const al = low(c, a)
+    const ah = high(c, a)
+    const bl = low(c, b)
+    const bh = high(c, b)
+    var result: (usize, usize) = (al, ah)
+    if opcode == lir.Opcode.add {
+        result = addWords(c, al, ah, bl, bh)
+    } else if opcode == lir.Opcode.sub {
+        result = subWords(c, al, ah, bl, bh)
+    } else if opcode == lir.Opcode.mul {
+        result = mulWords(c, al, ah, bl, bh)
+    } else if opcode == lir.Opcode.div || opcode == lir.Opcode.udiv {
+        result = divide(c, al, ah, bl, bh, opcode == lir.Opcode.div, false)
+    } else if opcode == lir.Opcode.rem || opcode == lir.Opcode.urem {
+        result = divide(c, al, ah, bl, bh, opcode == lir.Opcode.rem, true)
+    } else {
+        result = (op(c, opcode, al, bl), op(c, opcode, ah, bh))
+    }
+    return canon(c, type_id, result.0, result.1)
+}
+
+// A wide value of `type_id` shifted by the one-word count `n`.
+pub fn shift(c: *Context, type_id: usize, v: usize, n: usize, left: bool) -> usize {
+    const shifted = shiftWords(c, low(c, v), high(c, v), n, left, isSignedInteger(c.*.types, type_id))
+    return canon(c, type_id, shifted.0, shifted.1)
+}
+
+// Two wide values compared (0 or 1 in a word): the high words decide,
+// the low ones at a tie.
+pub fn compare(c: *Context, predicate: lir.CmpPredicate, a: usize, b: usize) -> usize {
+    var left = a
+    var right = b
+    var p = predicate
+    if predicate == lir.CmpPredicate.gt || predicate == lir.CmpPredicate.ugt || predicate == lir.CmpPredicate.ge || predicate == lir.CmpPredicate.uge {
+        left = b
+        right = a
+        if predicate == lir.CmpPredicate.gt { p = lir.CmpPredicate.lt }
+        if predicate == lir.CmpPredicate.ugt { p = lir.CmpPredicate.ult }
+        if predicate == lir.CmpPredicate.ge { p = lir.CmpPredicate.le }
+        if predicate == lir.CmpPredicate.uge { p = lir.CmpPredicate.ule }
+    }
+    const al = low(c, left)
+    const ah = high(c, left)
+    const bl = low(c, right)
+    const bh = high(c, right)
+    if p == lir.CmpPredicate.eq {
+        return op(c, lir.Opcode.bit_and, cmp(c, lir.CmpPredicate.eq, al, bl), cmp(c, lir.CmpPredicate.eq, ah, bh))
+    }
+    if p == lir.CmpPredicate.ne {
+        return op(c, lir.Opcode.bit_or, cmp(c, lir.CmpPredicate.ne, al, bl), cmp(c, lir.CmpPredicate.ne, ah, bh))
+    }
+    const signed = p == lir.CmpPredicate.lt || p == lir.CmpPredicate.le
+    const strict = cmp(c, if signed { lir.CmpPredicate.lt } else { lir.CmpPredicate.ult }, ah, bh)
+    const same = cmp(c, lir.CmpPredicate.eq, ah, bh)
+    const or_equal = p == lir.CmpPredicate.le || p == lir.CmpPredicate.ule
+    const below = cmp(c, if or_equal { lir.CmpPredicate.ule } else { lir.CmpPredicate.ult }, al, bl)
+    return op(c, lir.Opcode.bit_or, strict, op(c, lir.Opcode.bit_and, same, below))
+}
+
+pub fn negate(c: *Context, type_id: usize, v: usize) -> usize {
+    const zero = constant(c, 0)
+    const result = subWords(c, zero, zero, low(c, v), high(c, v))
+    return canon(c, type_id, result.0, result.1)
+}
+
+pub fn complement(c: *Context, type_id: usize, v: usize) -> usize {
+    const ones = allOnes(c)
+    return canon(c, type_id, op(c, lir.Opcode.bit_xor, low(c, v), ones), op(c, lir.Opcode.bit_xor, high(c, v), ones))
+}
+
+// Whether a wide value is zero (0 or 1 in a word).
+pub fn isZero(c: *Context, v: usize) -> usize {
+    return cmp(c, lir.CmpPredicate.eq, op(c, lir.Opcode.bit_or, low(c, v), high(c, v)), constant(c, 0))
+}

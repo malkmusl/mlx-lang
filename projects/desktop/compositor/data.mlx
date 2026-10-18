@@ -16,13 +16,27 @@
 // would the selection, then says finish. Released anywhere else, or over
 // a surface that accepted nothing, the source is cancelled. A drag
 // without a source stays within its client.
+//
+// An X program's CLIPBOARD comes as an X source (no client of ours: the
+// X window manager reads it, xwm_selection.mlx), and every change of the
+// selection is told to the X side. Clipboard tools (wl-copy, clipboard
+// managers) see and set the selection through ext-data-control
+// (data_control.mlx) with sources and offers of their own kind. A drag over an X window goes to it by
+// XDND (xwm_dnd.mlx), not as data offers; an X program's drag off its
+// windows is dragged here as an X source.
 
 const std = @import("std")
 const wl = @import("std.wayland")
 const state = @import("./state.mlx")
 const scene = @import("./scene.mlx")
+const xwm_selection = @import("./xwm_selection.mlx")
+const xwm_dnd = @import("./xwm_dnd.mlx")
+const data_control = @import("./data_control.mlx")
 
 const Compositor = state.Compositor
+
+const SYS_fcntl: usize = 72
+const F_DUPFD_CLOEXEC: usize = 1030
 
 // Room for a source's MIME types, each stored as a length byte and its
 // bytes (types longer than 255 bytes are not offered).
@@ -35,6 +49,10 @@ pub const Source = struct {
     mimeBytes: usize
     // The drag and drop actions it offers (wl_data_source.set_actions).
     actions: u32
+    // An X program's selection (resource: none; xwm_selection reads it).
+    x: bool
+    // A clipboard tool's (resource: its ext_data_control_source_v1).
+    control: bool
 }
 
 pub const Device = struct {
@@ -138,16 +156,38 @@ pub fn offerToFocus(compositor: *Compositor) -> void {
     }
 }
 
+// A source's client hears it is no longer the selection.
+fn cancelSource(source: *Source) -> void {
+    if source.*.x { return }
+    if source.*.control {
+        wl.ext_data_control_source_v1.Resource.fromObject(source.*.resource).sendCancelled()
+    } else {
+        wl.wl_data_source.Resource.fromObject(source.*.resource).sendCancelled()
+    }
+}
+
+// Asks a source's client to write its data as `mime` into `fd` (it gets
+// a copy).
+fn askSource(source: *Source, mime: []const u8, fd: wl.server.Handle) -> void {
+    if source.*.control {
+        wl.ext_data_control_source_v1.Resource.fromObject(source.*.resource).sendSend(mime, fd)
+    } else {
+        wl.wl_data_source.Resource.fromObject(source.*.resource).sendSend(mime, fd)
+    }
+}
+
 fn setSelection(compositor: *Compositor, address: usize) -> void {
     const old = compositor.*.selection
     if old == address { return }
     // The replaced source learns that it is no longer the selection.
-    if old != 0 { wl.wl_data_source.Resource.fromObject(sourceAt(old).*.resource).sendCancelled() }
+    if old != 0 { cancelSource(sourceAt(old)) }
     compositor.*.selection = address
     if compositor.*.verbose {
         if address == 0 { state.say("selection: cleared\n") } else { state.say("selection: set\n") }
     }
     offerToFocus(compositor)
+    xwm_selection.selectionChanged(compositor)
+    data_control.selectionChanged(compositor)
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +199,7 @@ fn onOffer(context: *anyopaque, request: wl.server.Request) -> void {
     if request.opcode == wl.wl_data_offer.REQUEST_ACCEPT {
         const mime = wl.wl_data_offer.decodeRequest(request).accept.mime_type
         offer.*.accepted = mime.length > 0
-        if offer.*.drag && offer.*.source != 0 {
+        if offer.*.drag && offer.*.source != 0 && !sourceAt(offer.*.source).*.x {
             const source = wl.wl_data_source.Resource.fromObject(sourceAt(offer.*.source).*.resource)
             if mime.length > 0 { source.sendTarget(mime.pointer[0..mime.length]) } else { source.sendTarget(null) }
         }
@@ -179,7 +219,10 @@ fn onOffer(context: *anyopaque, request: wl.server.Request) -> void {
             wl.wl_data_offer.Resource.fromObject(request.object).postError(@intFromEnum(wl.wl_data_offer.Error.invalid_finish), "finished without a type accepted or an action chosen")
             return
         }
-        if offer.*.drag && offer.*.source != 0 {
+        if offer.*.drag && offer.*.source != 0 && sourceAt(offer.*.source).*.x {
+            // An X program's drop: its XdndFinished.
+            xwm_dnd.waylandFinished(compositor, offer.*.action)
+        } else if offer.*.drag && offer.*.source != 0 {
             const source = wl.wl_data_source.Resource.fromObject(sourceAt(offer.*.source).*.resource)
             if source.version() >= 3 { source.sendDndFinished() }
         }
@@ -187,15 +230,28 @@ fn onOffer(context: *anyopaque, request: wl.server.Request) -> void {
         return
     }
     if request.opcode != wl.wl_data_offer.REQUEST_RECEIVE { return }
-    const decoded = wl.wl_data_offer.decodeRequest(request)
-    const receive = decoded.receive
-    // The source's client writes into the pipe (sendSend passes a copy);
-    // the reader sees end of file once the writer closes it.
-    if offer.*.source != 0 {
-        const mime = receive.mime_type
-        wl.wl_data_source.Resource.fromObject(sourceAt(offer.*.source).*.resource).sendSend(mime.pointer[0..mime.length], receive.fd)
-    }
+    const receive = wl.wl_data_offer.decodeRequest(request).receive
+    const mime = receive.mime_type
+    receiveFrom(compositor, offer.*.source, mime.pointer[0..mime.length], receive.fd)
     receive.fd.close()
+}
+
+// An offer of the source at `address` read as `mime` into `fd` (the
+// caller closes its own): the source's client writes into the pipe
+// (sendSend passes a copy) and the reader sees end of file once the
+// writer closes it. An X selection is converted into a copy of the pipe.
+fn receiveFrom(compositor: *Compositor, address: usize, mime: []const u8, fd: wl.server.Handle) -> void {
+    if address == 0 { return }
+    if sourceAt(address).*.x {
+        const copy = std.linux.syscall3(SYS_fcntl, @bitCast(usize, fd.descriptor), F_DUPFD_CLOEXEC, 0)
+        if copy >= 0 && xwm_dnd.isDragSource(compositor, address) {
+            xwm_dnd.receive(compositor, mime, copy)
+        } else if copy >= 0 {
+            xwm_selection.receive(compositor, mime, copy)
+        }
+    } else {
+        askSource(sourceAt(address), mime, fd)
+    }
 }
 
 fn onOfferDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
@@ -218,20 +274,31 @@ fn onSource(context: *anyopaque, request: wl.server.Request) -> void {
     if request.opcode != wl.wl_data_source.REQUEST_OFFER { return }
     const decoded = wl.wl_data_source.decodeRequest(request)
     const mime = decoded.offer.mime_type
+    addType(source, mime.pointer[0..mime.length])
+}
+
+fn addType(source: *Source, mime: []const u8) -> void {
     if mime.length == 0 || mime.length > 255 || source.*.mimeBytes + 1 + mime.length > MIME_BYTES { return }
     source.*.mimes[source.*.mimeBytes] = @intCast(u8, mime.length)
     var index: usize = 0
     while index < mime.length {
-        source.*.mimes[source.*.mimeBytes + 1 + index] = mime.pointer[index]
+        source.*.mimes[source.*.mimeBytes + 1 + index] = mime[index]
         index += 1
     }
     source.*.mimeBytes += 1 + mime.length
 }
 
 fn onSourceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
-    const address = recordOf(context)
+    forgetSource(recordOf(context))
+}
+
+// A source gone: its offers read nothing more, and a selection of it
+// ends.
+fn forgetSource(address: usize) -> void {
     const source = sourceAt(address)
     const compositor = source.*.compositor
+    xwm_selection.sourceGone(compositor, address)
+    xwm_dnd.sourceGone(compositor, address)
     // A drag whose source went is over.
     if compositor.*.dragging && compositor.*.dragSource == address {
         dragFocus(compositor, 0)
@@ -248,23 +315,124 @@ fn onSourceDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
     if compositor.*.selection == address {
         compositor.*.selection = 0
         offerToFocus(compositor)
+        if !source.*.x { xwm_selection.selectionChanged(compositor) }
+        data_control.selectionChanged(compositor)
     }
     state.release(compositor, source.*.mimes, MIME_BYTES)
     unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Source)) }
 }
 
-fn createSource(compositor: *Compositor, resource: wl.wl_data_source.Resource) -> void {
+fn newSource(compositor: *Compositor) -> usize {
     const memory = state.allocate(compositor, @sizeOf(Source))
     const address = @intFromPtr(memory)
     const source = sourceAt(address)
     source.*.compositor = compositor
-    source.*.resource = resource.object
     source.*.mimes = state.allocate(compositor, MIME_BYTES)
     source.*.mimeBytes = 0
     source.*.actions = 0
+    source.*.x = false
+    source.*.control = false
     compositor.*.dataSources = state.listAppend(compositor.*.dataSources, address)
+    return address
+}
+
+fn createSource(compositor: *Compositor, resource: wl.wl_data_source.Resource) -> void {
+    const address = newSource(compositor)
+    sourceAt(address).*.resource = resource.object
     resource.setHandler(onSource, contextAt(address))
     resource.setDestroyHandler(onSourceDestroyed, contextAt(address))
+}
+
+// ---------------------------------------------------------------------------
+// X sources (xwm_selection.mlx)
+
+// A source standing for an X program's selection (its types added with
+// addXSourceType).
+pub fn newXSource(compositor: *Compositor) -> usize {
+    const address = newSource(compositor)
+    const source = sourceAt(address)
+    // No client's: an id no object has.
+    source.*.resource.id = 0
+    source.*.x = true
+    return address
+}
+
+pub fn addXSourceType(address: usize, mime: []const u8) -> void {
+    const source = sourceAt(address)
+    // Each type once.
+    var at: usize = 0
+    while at < source.*.mimeBytes {
+        const length = @intCast(usize, source.*.mimes[at])
+        if std.text.same(source.*.mimes[at + 1..at + 1 + length], mime) { return }
+        at += 1 + length
+    }
+    addType(source, mime)
+}
+
+pub fn setXSelection(compositor: *Compositor, address: usize) -> void { setSelection(compositor, address) }
+
+pub fn dropXSource(compositor: *Compositor, address: usize) -> void {
+    if address == 0 { return }
+    forgetSource(address)
+}
+
+// A source's types: a length byte and the type each.
+pub fn typesOf(address: usize) -> []const u8 {
+    if address == 0 { return "" }
+    const source = sourceAt(address)
+    return source.*.mimes[0..source.*.mimeBytes]
+}
+
+// Asks a client's source to write its data as `mime` into `descriptor`
+// (a pipe's end; the caller closes its own).
+pub fn sendFromSource(compositor: *Compositor, address: usize, mime: []const u8, descriptor: isize) -> void {
+    if address == 0 || sourceAt(address).*.x { return }
+    askSource(sourceAt(address), mime, wl.server.Handle.fromDescriptor(descriptor))
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard tools (data_control.mlx)
+
+// A source of a clipboard tool's (its types added with addControlType).
+pub fn newControlSource(compositor: *Compositor, resource: wl.server.Object) -> usize {
+    const address = newSource(compositor)
+    sourceAt(address).*.resource = resource
+    sourceAt(address).*.control = true
+    return address
+}
+
+pub fn addControlType(address: usize, mime: []const u8) -> void { addType(sourceAt(address), mime) }
+
+// A clipboard tool's source as the selection (0: none).
+pub fn setControlSelection(compositor: *Compositor, address: usize) -> void { setSelection(compositor, address) }
+
+pub fn dropControlSource(address: usize) -> void { forgetSource(address) }
+
+// An offer of the selection for a clipboard tool's `resource`
+// (ext_data_control_offer_v1): an Offer record as a client's has.
+pub fn newControlOffer(compositor: *Compositor, resource: wl.server.Object) -> usize {
+    const address = @intFromPtr(state.allocate(compositor, @sizeOf(Offer)))
+    const record = offerAt(address)
+    record.*.compositor = compositor
+    record.*.resource = resource
+    record.*.source = compositor.*.selection
+    record.*.drag = false
+    record.*.accepted = false
+    record.*.actions = 0
+    record.*.preferred = 0
+    record.*.action = 0
+    compositor.*.dataOffers = state.listAppend(compositor.*.dataOffers, address)
+    return address
+}
+
+pub fn controlReceive(address: usize, mime: []const u8, fd: wl.server.Handle) -> void {
+    receiveFrom(offerAt(address).*.compositor, offerAt(address).*.source, mime, fd)
+}
+
+pub fn dropControlOffer(address: usize) -> void {
+    const compositor = offerAt(address).*.compositor
+    compositor.*.dataOffers = state.listRemove(compositor.*.dataOffers, address)
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Offer)) }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +477,8 @@ fn startDrag(compositor: *Compositor, source: wl.wl_data_source.Resource, origin
     compositor.*.dragOffer = 0
     compositor.*.dragAction = 0
     compositor.*.dragging = true
+    // X windows may take it (xwm_dnd.mlx).
+    if compositor.*.dragSource != 0 { xwm_selection.dragStarted(compositor, compositor.*.dragSource) }
     if compositor.*.verbose { state.say("drag: started\n") }
     scene.damageCursor(compositor)
     // What is under the pointer now has the drag (a busy client asks late,
@@ -337,6 +507,7 @@ fn negotiate(compositor: *Compositor, address: usize) -> void {
     if compositor.*.dragOffer == address { compositor.*.dragAction = action }
     const resource = wl.wl_data_offer.Resource.fromObject(offer.*.resource)
     if resource.version() >= 3 { resource.sendAction(action) }
+    if source.*.x { return }
     const source_resource = wl.wl_data_source.Resource.fromObject(source.*.resource)
     if source_resource.version() >= 3 { source_resource.sendAction(action) }
 }
@@ -347,7 +518,9 @@ fn dragFocus(compositor: *Compositor, target: usize) -> void {
     if target == compositor.*.dragTarget { return }
     const old = compositor.*.dragTarget
     var index: usize = 0
-    if old != 0 {
+    if xwm_dnd.isX(compositor, old) {
+        xwm_dnd.leave(compositor)
+    } else if old != 0 {
         while index < compositor.*.dataDevices.length {
             const device = deviceAt(state.listAt(compositor.*.dataDevices, index))
             if state.sameClient(device.*.resource, state.surfaceAt(old).*.resource) { wl.wl_data_device.Resource.fromObject(device.*.resource).sendLeave() }
@@ -362,6 +535,13 @@ fn dragFocus(compositor: *Compositor, target: usize) -> void {
     if target == 0 { return }
     const surface = state.surfaceAt(target)
     if compositor.*.dragSource == 0 && !state.sameClient(surface.*.resource, compositor.*.dragOrigin) { return }
+    // X windows take drags by XDND (xwm_dnd.mlx).
+    if xwm_dnd.isX(compositor, target) {
+        if compositor.*.dragSource == 0 || sourceAt(compositor.*.dragSource).*.x { return }
+        compositor.*.dragTarget = target
+        xwm_dnd.enter(compositor, target)
+        return
+    }
     compositor.*.dragTarget = target
     const serial = compositor.*.server.nextSerial()
     const x = wl.Fixed.fromInt(compositor.*.pointerX - scene.originX(surface))
@@ -412,6 +592,10 @@ pub fn dragMotion(compositor: *Compositor) -> void {
     dragFocus(compositor, scene.surfaceAtPoint(compositor, compositor.*.pointerX, compositor.*.pointerY))
     const target = compositor.*.dragTarget
     if target == 0 { return }
+    if xwm_dnd.isX(compositor, target) {
+        xwm_dnd.motion(compositor)
+        return
+    }
     const surface = state.surfaceAt(target)
     const x = wl.Fixed.fromInt(compositor.*.pointerX - scene.originX(surface))
     const y = wl.Fixed.fromInt(compositor.*.pointerY - scene.originY(surface))
@@ -437,25 +621,27 @@ fn endDrag(compositor: *Compositor) -> void {
 pub fn dragRelease(compositor: *Compositor) -> void {
     if !compositor.*.dragging { return }
     const target = compositor.*.dragTarget
+    const over_x = xwm_dnd.isX(compositor, target)
     var dropped = false
-    if target != 0 {
+    if over_x {
+        dropped = xwm_dnd.drop(compositor)
+    } else if target != 0 {
         if compositor.*.dragSource == 0 {
             dropped = true
         } else if compositor.*.dragOffer != 0 {
-            const offer = offerAt(compositor.*.dragOffer)
-            const needs_action = wl.wl_data_offer.Resource.fromObject(offer.*.resource).version() >= 3 && wl.wl_data_source.Resource.fromObject(sourceAt(compositor.*.dragSource).*.resource).version() >= 3
-            dropped = offer.*.accepted && (!needs_action || compositor.*.dragAction != 0)
+            dropped = dropTaken(compositor)
         }
     }
+    const from_x = compositor.*.dragSource != 0 && sourceAt(compositor.*.dragSource).*.x
     if dropped {
         const surface = state.surfaceAt(target)
         var index: usize = 0
-        while index < compositor.*.dataDevices.length {
+        while index < compositor.*.dataDevices.length && !over_x {
             const device = deviceAt(state.listAt(compositor.*.dataDevices, index))
             if state.sameClient(device.*.resource, surface.*.resource) { wl.wl_data_device.Resource.fromObject(device.*.resource).sendDrop() }
             index += 1
         }
-        if compositor.*.dragSource != 0 {
+        if compositor.*.dragSource != 0 && !from_x {
             const source = wl.wl_data_source.Resource.fromObject(sourceAt(compositor.*.dragSource).*.resource)
             if source.version() >= 3 { source.sendDndDropPerformed() }
         }
@@ -472,15 +658,96 @@ pub fn dragRelease(compositor: *Compositor) -> void {
         }
     } else {
         dragFocus(compositor, 0)
-        if compositor.*.dragSource != 0 { wl.wl_data_source.Resource.fromObject(sourceAt(compositor.*.dragSource).*.resource).sendCancelled() }
+        if compositor.*.dragSource != 0 && !from_x { wl.wl_data_source.Resource.fromObject(sourceAt(compositor.*.dragSource).*.resource).sendCancelled() }
         if compositor.*.verbose { state.say("drag: cancelled\n") }
     }
+    // X reads what was dropped on it until its XdndFinished.
+    if !dropped || !over_x { xwm_selection.dragEnded(compositor) }
     endDrag(compositor)
+}
+
+// Whether the offer the drag is over took a type and (both from version
+// 3) agreed on an action.
+fn dropTaken(compositor: *Compositor) -> bool {
+    if compositor.*.dragOffer == 0 || compositor.*.dragSource == 0 { return false }
+    const offer = offerAt(compositor.*.dragOffer)
+    const source = sourceAt(compositor.*.dragSource)
+    const needs_action = wl.wl_data_offer.Resource.fromObject(offer.*.resource).version() >= 3 && (source.*.x || wl.wl_data_source.Resource.fromObject(source.*.resource).version() >= 3)
+    return offer.*.accepted && (!needs_action || compositor.*.dragAction != 0)
+}
+
+// An X program's drag left its windows (xwm_dnd.mlx): the X source at
+// `address` is dragged over Wayland surfaces from now on, the pointer
+// staying with the X window.
+pub fn startXDrag(compositor: *Compositor, address: usize) -> void {
+    if compositor.*.dragging { return }
+    compositor.*.dragSource = address
+    if compositor.*.pointerFocus != 0 { compositor.*.dragOrigin = state.surfaceAt(compositor.*.pointerFocus).*.resource }
+    compositor.*.dragIcon = 0
+    compositor.*.dragTarget = 0
+    compositor.*.dragOffer = 0
+    compositor.*.dragAction = 0
+    compositor.*.dragging = true
+    if compositor.*.verbose { state.say("drag: started from an X program\n") }
+    dragMotion(compositor)
+}
+
+// The actions an X source offers (as the program asks).
+pub fn setXSourceActions(address: usize, actions: u32) -> void {
+    if address == 0 { return }
+    sourceAt(address).*.actions = actions
+}
+
+// The action the target under the pointer agreed on when it took a type
+// (0: it would not take the drop).
+pub fn xDragAction(compositor: *Compositor) -> u32 {
+    if !compositor.*.dragging || !dropTaken(compositor) { return 0 }
+    return compositor.*.dragAction
+}
+
+// The X program dropped (its XdndDrop): dropped where the pointer is, or
+// cancelled; true when a target took it.
+pub fn xDrop(compositor: *Compositor) -> bool {
+    if !compositor.*.dragging { return false }
+    const taken = compositor.*.dragTarget != 0 && dropTaken(compositor)
+    dragRelease(compositor)
+    return taken
+}
+
+// The actions the drag's source offers (0: none, or no source).
+pub fn dragActions(compositor: *Compositor) -> u32 {
+    if compositor.*.dragSource == 0 { return 0 }
+    return sourceAt(compositor.*.dragSource).*.actions
+}
+
+// An X window's status for the drag over it (xwm_dnd.mlx): the source
+// hears whether a type is taken (its first) and the action.
+pub fn xStatus(compositor: *Compositor, accepted: bool, action: u32) -> void {
+    if !compositor.*.dragging || compositor.*.dragSource == 0 || sourceAt(compositor.*.dragSource).*.x { return }
+    const source = sourceAt(compositor.*.dragSource)
+    const resource = wl.wl_data_source.Resource.fromObject(source.*.resource)
+    if accepted && source.*.mimeBytes > 0 {
+        const length = @intCast(usize, source.*.mimes[0])
+        resource.sendTarget(source.*.mimes[1..1 + length])
+    } else {
+        resource.sendTarget(null)
+    }
+    if action != compositor.*.dragAction && resource.version() >= 3 { resource.sendAction(action) }
+    compositor.*.dragAction = action
+}
+
+// An X window finished reading what was dropped on it (xwm_dnd.mlx).
+pub fn xFinished(compositor: *Compositor, address: usize) -> void {
+    if address == 0 || !state.listContains(compositor.*.dataSources, address) || sourceAt(address).*.x { return }
+    const resource = wl.wl_data_source.Resource.fromObject(sourceAt(address).*.resource)
+    if resource.version() >= 3 { resource.sendDndFinished() }
+    if compositor.*.verbose { state.say("drag: finished\n") }
 }
 
 // A surface is going away: no longer the drag's target or icon.
 pub fn surfaceGone(compositor: *Compositor, address: usize) -> void {
     if compositor.*.dragTarget == address {
+        xwm_dnd.surfaceGone(compositor, address)
         compositor.*.dragTarget = 0
         compositor.*.dragOffer = 0
     }
@@ -520,8 +787,7 @@ pub fn createGlobal(compositor: *Compositor) -> bool {
     compositor.*.dataDevices = state.newList(compositor.*.allocator)
     compositor.*.dataOffers = state.newList(compositor.*.allocator)
     compositor.*.selection = 0
-    var memory: [*]u8 = undefined
-    unsafe { memory = @ptrCast([*]u8, compositor) }
+    const memory: [*]u8 = unsafe { @ptrCast([*]u8, compositor) }
     return compositor.*.server.createGlobal(wl.Interface.wl_data_device_manager, 3, bindManager, state.contextOf(memory)) != 0
 }
 

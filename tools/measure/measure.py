@@ -15,11 +15,18 @@ where their time and memory go and to compare before and after a change:
     codemap on this repository, mlx-sh on a loop) for their wall time,
     processor time and most memory resident.
 
-    tools/measure/measure.py [--compiler PATH] [--out DIR] [--only NAME,...] [--canvas gpu,cpu] [--profile]
+    tools/measure/measure.py [--compiler PATH] [--out DIR] [--only NAME,...] [--canvas gpu,cpu] [--profile] [--profile-after MS]
 
 With --profile each desktop program runs under mlx-profile (tools/profile)
 and the functions where its main thread spent the most time are listed
-under the table.
+under the table; with --profile-after only from that many milliseconds
+after its start on (its frames, not its start).
+
+The longest pause is the longest time between the end of one frame and
+the start of the next: where a program did something else than drawing
+for long (MLX Observatory reading the code base after its first frame).
+A program that draws only when something changes pauses while nothing
+does too (the dock, the terminal): there it is time waited, not worked.
 
 It prints a table (Markdown) and writes it with the numbers as JSON into
 the output directory (measure.md, measure.json), so two runs can be laid
@@ -100,13 +107,14 @@ def read_frames(path):
         if fields[0] == 'frames':
             header = fields
         elif fields[0] == 'frame' and len(fields) >= 5:
-            frames.append((int(fields[3]), int(fields[4])))
+            frames.append((int(fields[3]), int(fields[4]), int(fields[2])))
     if not header or not frames:
         return None
+    pauses = [frames[at + 1][2] - frames[at][2] - frames[at][0] for at in range(len(frames) - 1)]
     def percentile(values, share):
         ordered = sorted(values)
         return ordered[min(len(ordered) - 1, len(ordered) * share // 100)]
-    work = [max(processor, gpu) for processor, gpu in frames]
+    work = [max(processor, gpu) for processor, gpu, start in frames]
     return {
         'frames': int(header[4]),
         'startup_ms': int(header[5]) / 1000,
@@ -115,6 +123,7 @@ def read_frames(path):
         'processor_median_ms': percentile([f[0] for f in frames], 50) / 1000,
         'gpu_median_ms': percentile([f[1] for f in frames], 50) / 1000,
         'first_frame_ms': work[0] / 1000,
+        'longest_pause_ms': max(pauses) / 1000 if pauses else 0,
     }
 
 
@@ -133,8 +142,14 @@ def read_memory(path):
 
 def read_profile(folder):
     """The processor's profile mlx-profile wrote: the functions by their own
-    share, most first."""
-    files = [f for f in os.listdir(folder) if f.endswith('.profile') and '-gpu-' not in f] if os.path.isdir(folder) else []
+    share, most first. mlx-profile writes it once the program has ended,
+    which can be after the compositor has: it is waited for a while."""
+    files = []
+    for _ in range(100):
+        files = [f for f in os.listdir(folder) if f.endswith('.profile') and '-gpu-' not in f] if os.path.isdir(folder) else []
+        if files:
+            break
+        time.sleep(0.1)
     if not files:
         return []
     rows = []
@@ -149,7 +164,7 @@ def read_profile(folder):
     return [{'self': own, 'total': total, 'share': own * 100 / samples if samples else 0, 'function': name} for own, total, name in rows[:15]]
 
 
-def run_desktop(work, name, canvas, keymap, profile=False):
+def run_desktop(work, name, canvas, keymap, profile=False, profile_after=0):
     source, how, extra = DESKTOP[name]
     runtime = tempfile.mkdtemp(prefix='measure-')
     os.chmod(runtime, 0o700)
@@ -178,7 +193,8 @@ def run_desktop(work, name, canvas, keymap, profile=False):
     profiles = os.path.join(work, 'profiles-' + name + '-' + canvas)
     wrapper = os.path.join(work, name + '-' + canvas + '.sh')
     with open(wrapper, 'w') as file:
-        runner = '%s -o %s ' % (os.path.join(work, 'mlx-profile'), profiles) if profile else ''
+        after = '--after %d ' % profile_after if profile_after else ''
+        runner = '%s -o %s %s' % (os.path.join(work, 'mlx-profile'), profiles, after) if profile else ''
         file.write('#!/bin/sh\nexec %s%s %s\n' % (runner, program, ' '.join(extra)))
     os.chmod(wrapper, 0o755)
     for helper in ('launcher', 'dock', 'topbar'):
@@ -245,11 +261,11 @@ def number(value, digits=1):
 
 def table(desktop, commands, builds):
     lines = ['## Desktop programs', '',
-             '| program | canvas | start to first frame ms | frames | frame work median ms | p95 ms | processor median ms | GPU median ms | resident MiB | blocks | GPU MiB |',
-             '|---|---|---|---|---|---|---|---|---|---|---|']
+             '| program | canvas | start to first frame ms | longest pause ms | frames | frame work median ms | p95 ms | processor median ms | GPU median ms | resident MiB | blocks | GPU MiB |',
+             '|---|---|---|---|---|---|---|---|---|---|---|---|']
     for row in desktop:
-        lines.append('| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
-            row['program'], row['canvas'], number(row.get('startup_ms')), number(row.get('frames')), number(row.get('work_median_ms'), 2),
+        lines.append('| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+            row['program'], row['canvas'], number(row.get('startup_ms')), number(row.get('longest_pause_ms')), number(row.get('frames')), number(row.get('work_median_ms'), 2),
             number(row.get('work_p95_ms'), 2), number(row.get('processor_median_ms'), 2), number(row.get('gpu_median_ms'), 2),
             number(row['resident_kib'] / 1024 if 'resident_kib' in row else None), number(row.get('blocks')),
             number(row['gpu_bytes'] / 1048576 if row.get('gpu_bytes') else None)))
@@ -273,6 +289,7 @@ def main():
     parser.add_argument('--canvas', default='gpu,cpu')
     parser.add_argument('--no-commands', action='store_true')
     parser.add_argument('--profile', action='store_true')
+    parser.add_argument('--profile-after', type=int, default=0)
     arguments = parser.parse_args()
     names = [name for name in arguments.only.split(',') if name]
     work = tempfile.mkdtemp(prefix='mlx-measure-')
@@ -286,7 +303,7 @@ def main():
     desktop = []
     for name in names:
         for canvas in arguments.canvas.split(','):
-            row = run_desktop(work, name, canvas, keymap, arguments.profile)
+            row = run_desktop(work, name, canvas, keymap, arguments.profile or arguments.profile_after > 0, arguments.profile_after)
             print('measured %s (%s): %s' % (name, canvas, json.dumps(row)), file=sys.stderr)
             desktop.append(row)
     commands = [] if arguments.no_commands else run_commands(compiler, work)

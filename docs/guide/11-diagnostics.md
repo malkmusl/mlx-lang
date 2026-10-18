@@ -41,7 +41,7 @@ A compile-error fixture is checked with `tests/run_error.sh`:
 
 | Code | Name | Example fixture |
 | --- | --- | --- |
-| `MLX-E3001` | `UnknownIdentifier` | — |
+| `MLX-E3001` | `UnknownIdentifier` | `12_unknown_builtin.mlx` |
 | `MLX-E3002` | `DuplicateDeclaration` | — |
 | `MLX-E3003` | `PrivateDeclaration` | `tests/76_import_private_error.mlx` — see [Modules](10-modules.md) |
 | `MLX-E3004` | `ImportNotFound` | `tests/77_import_not_found_error.mlx` — see [Modules](10-modules.md) |

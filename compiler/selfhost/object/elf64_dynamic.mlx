@@ -41,6 +41,8 @@ const INTERPRETER_LENGTH: usize = 27
 const SHSTRTAB_LENGTH: usize = 105
 
 const PROGRAM_HEADERS: usize = 7
+// With thread-local data: PT_TLS after them.
+fn programHeaderCount() -> usize { return if encoder_module.tlsSize() > 0 { PROGRAM_HEADERS + 1 } else { PROGRAM_HEADERS } }
 const SECTION_COUNT: usize = 11
 // .gnu.version and .gnu.version_d, after .shstrtab, when versioned.
 const VERSION_SECTIONS: usize = 2
@@ -85,10 +87,14 @@ pub const Naming = struct {
     entryLength: usize
     initPointer: [*]const u8
     initLength: usize
+    // The program interpreter an executable names (PT_INTERP); length 0
+    // for the system's (/lib64/ld-linux-x86-64.so.2).
+    interpreterPointer: [*]const u8
+    interpreterLength: usize
 }
 
 pub fn noNaming() -> Naming {
-    unsafe { return Naming.{ .sonamePointer = @ptrFromInt([*]const u8, 0), .sonameLength = 0, .versionPointer = @ptrFromInt([*]const u8, 0), .versionLength = 0, .entryPointer = @ptrFromInt([*]const u8, 0), .entryLength = 0, .initPointer = @ptrFromInt([*]const u8, 0), .initLength = 0 } }
+    unsafe { return Naming.{ .sonamePointer = @ptrFromInt([*]const u8, 0), .sonameLength = 0, .versionPointer = @ptrFromInt([*]const u8, 0), .versionLength = 0, .entryPointer = @ptrFromInt([*]const u8, 0), .entryLength = 0, .initPointer = @ptrFromInt([*]const u8, 0), .initLength = 0, .interpreterPointer = @ptrFromInt([*]const u8, 0), .interpreterLength = 0 } }
 }
 
 pub const Layout = struct {
@@ -99,6 +105,7 @@ pub const Layout = struct {
     verdefOffset: usize
     verdefSize: usize
     interpOffset: usize
+    interpLength: usize
     hashOffset: usize
     hashSize: usize
     dynsymOffset: usize
@@ -114,6 +121,8 @@ pub const Layout = struct {
     gotOffset: usize
     mlxDataOffset: usize
     dataEnd: usize
+    // The TLS image (in the writable segment, after the data area).
+    tlsOffset: usize
     shstrtabOffset: usize
     sectionOffset: usize
     totalSize: usize
@@ -168,8 +177,9 @@ pub fn layout(enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed
     if naming.sonameLength > 0 { dynstr_size += naming.sonameLength + 1 }
     const version_name = dynstr_size
     if naming.versionLength > 0 { dynstr_size += naming.versionLength + 1 }
-    const interp_offset = elf.ELF_HEADER_SIZE + PROGRAM_HEADERS * elf.PROGRAM_HEADER_SIZE
-    const hash_offset = elf64.alignUp(interp_offset + INTERPRETER_LENGTH + 1, 8)
+    const interp_offset = elf.ELF_HEADER_SIZE + programHeaderCount() * elf.PROGRAM_HEADER_SIZE
+    const interp_length = if naming.interpreterLength > 0 { naming.interpreterLength } else { INTERPRETER_LENGTH }
+    const hash_offset = elf64.alignUp(interp_offset + interp_length + 1, 8)
     const hash_size = 4 * (3 + symbol_count)
     const dynsym_offset = elf64.alignUp(hash_offset + hash_size, 8)
     const dynstr_offset = dynsym_offset + 24 * symbol_count
@@ -182,11 +192,20 @@ pub fn layout(enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed
     var text_offset = elf64.alignUp(headers_end, elf64.PAGE_SIZE)
     if text_offset < elf64.TEXT_FILE_OFFSET { text_offset = elf64.TEXT_FILE_OFFSET }
     const code_length = encoder_module.pos(enc)
-    const data_offset = elf64.alignUp(text_offset + code_length, elf64.PAGE_SIZE)
+    // (Data aligned beyond a page, `alignas(16384)`, has its start so:
+    // the segment's and the data area's after the GOT.)
+    var data_alignment: usize = elf64.PAGE_SIZE
+    if encoder_module.largestDataAlignment() > data_alignment { data_alignment = encoder_module.largestDataAlignment() }
+    const data_offset = elf64.alignUp(text_offset + code_length, data_alignment)
     const dynamic_size = 16 * (needed_count + 18)
     const got_offset = data_offset + dynamic_size
-    const mlx_data_offset = got_offset + 8 * got_slots
-    const data_end = mlx_data_offset + encoder_module.dataSize(enc)
+    const mlx_data_offset = elf64.alignUp(got_offset + 8 * got_slots, encoder_module.largestDataAlignment())
+    var data_end = mlx_data_offset + encoder_module.dataSize(enc)
+    var tls_offset: usize = 0
+    if encoder_module.tlsSize() > 0 {
+        tls_offset = elf64.alignUp(data_end, encoder_module.tlsAlignment())
+        data_end = tls_offset + encoder_module.tlsSize()
+    }
     const shstrtab_offset = data_end
     const section_offset = elf64.alignUp(shstrtab_offset + SHSTRTAB_LENGTH, 8)
     return Layout.{
@@ -197,6 +216,7 @@ pub fn layout(enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed
         .verdefOffset = verdef_offset,
         .verdefSize = verdef_size,
         .interpOffset = interp_offset,
+        .interpLength = interp_length,
         .hashOffset = hash_offset,
         .hashSize = hash_size,
         .dynsymOffset = dynsym_offset,
@@ -212,6 +232,7 @@ pub fn layout(enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed
         .gotOffset = got_offset,
         .mlxDataOffset = mlx_data_offset,
         .dataEnd = data_end,
+        .tlsOffset = tls_offset,
         .shstrtabOffset = shstrtab_offset,
         .sectionOffset = section_offset,
         .totalSize = section_offset + (SECTION_COUNT + (if versioned { VERSION_SECTIONS } else { 0 })) * 64,
@@ -339,24 +360,32 @@ pub fn build(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]cons
     elf.writeU64(buffer, 40, @intCast(u64, shape.sectionOffset))
     elf.writeU16(buffer, 52, 64)
     elf.writeU16(buffer, 54, 56)
-    elf.writeU16(buffer, 56, @intCast(u16, PROGRAM_HEADERS))
+    elf.writeU16(buffer, 56, @intCast(u16, programHeaderCount()))
     elf.writeU16(buffer, 58, 64)
     elf.writeU16(buffer, 60, @intCast(u16, sections))
     elf.writeU16(buffer, 62, @intCast(u16, SECTION_COUNT - 1))
 
     // Program headers
-    programHeader(buffer, base, 0, 6, 4, elf.ELF_HEADER_SIZE, PROGRAM_HEADERS * elf.PROGRAM_HEADER_SIZE, 8) // PT_PHDR
+    programHeader(buffer, base, 0, 6, 4, elf.ELF_HEADER_SIZE, programHeaderCount() * elf.PROGRAM_HEADER_SIZE, 8) // PT_PHDR
     // A shared object names no interpreter (PT_NULL in the slot): run as a
     // program (an --entry one, mlxlibc as loader), it starts on its own.
-    programHeader(buffer, base, 1, if shared { 0 } else { 3 }, 4, shape.interpOffset, INTERPRETER_LENGTH + 1, 1) // PT_INTERP
+    programHeader(buffer, base, 1, if shared { 0 } else { 3 }, 4, shape.interpOffset, shape.interpLength + 1, 1) // PT_INTERP
     programHeader(buffer, base, 2, 1, 4, 0, shape.headersEnd, elf64.PAGE_SIZE) // PT_LOAD R
     programHeader(buffer, base, 3, 1, 5, shape.textOffset, shape.codeLength, elf64.PAGE_SIZE) // PT_LOAD R+X
     programHeader(buffer, base, 4, 1, 6, shape.dataOffset, shape.dataEnd - shape.dataOffset, elf64.PAGE_SIZE) // PT_LOAD R+W
     programHeader(buffer, base, 5, 2, 6, shape.dynamicOffset, shape.dynamicSize, 8) // PT_DYNAMIC
     programHeader(buffer, base, 6, 1685382481, 6, 0, 0, 16) // PT_GNU_STACK (not executable)
+    if encoder_module.tlsSize() > 0 {
+        programHeader(buffer, base, 7, 7, 4, shape.tlsOffset, encoder_module.tlsSize(), encoder_module.tlsAlignment()) // PT_TLS
+        unsafe { mem.copy(@ptrFromInt([*]u8, @intFromPtr(buffer) + shape.tlsOffset), encoder_module.tlsBytes(), encoder_module.tlsSize()) }
+    }
 
     // .interp
-    unsafe { const interp_end = copyText(buffer, shape.interpOffset, @ptrCast([*]const u8, "/lib64/ld-linux-x86-64.so.2"), INTERPRETER_LENGTH) }
+    if naming.interpreterLength > 0 {
+        const named_end = copyText(buffer, shape.interpOffset, naming.interpreterPointer, naming.interpreterLength)
+    } else {
+        unsafe { const interp_end = copyText(buffer, shape.interpOffset, @ptrCast([*]const u8, "/lib64/ld-linux-x86-64.so.2"), INTERPRETER_LENGTH) }
+    }
 
     // .dynstr: library names, then imported and exported function names.
     var string_at: usize = 1
@@ -488,7 +517,7 @@ pub fn build(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]cons
         name_index += 1
     }
     const sh = shape.sectionOffset
-    sectionHeader(buffer, base, sh + 64, 1, 1, 2, shape.interpOffset, INTERPRETER_LENGTH + 1, 0, 0, 1, 0)
+    sectionHeader(buffer, base, sh + 64, 1, 1, 2, shape.interpOffset, shape.interpLength + 1, 0, 0, 1, 0)
     sectionHeader(buffer, base, sh + 128, 9, 5, 2, shape.hashOffset, shape.hashSize, 3, 0, 8, 4)
     sectionHeader(buffer, base, sh + 192, 15, 11, 2, shape.dynsymOffset, 24 * shape.symbolCount, 4, 1, 8, 24)
     sectionHeader(buffer, base, sh + 256, 23, 3, 2, shape.dynstrOffset, shape.dynstrSize, 0, 0, 1, 0)
@@ -508,6 +537,12 @@ pub fn build(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]cons
 
 pub fn writeExecutable(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed_count: usize, output_path: [*]const u8) -> bool {
     return write(allocator, enc, needed, needed_count, false, noNaming(), output_path)
+}
+
+// An executable naming its own program interpreter (and nothing else of
+// `naming`), as a C compiler's --dynamic-linker asks.
+pub fn writeExecutableNamed(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed_count: usize, naming: Naming, output_path: [*]const u8) -> bool {
+    return write(allocator, enc, needed, needed_count, false, naming, output_path)
 }
 
 pub fn writeSharedObject(allocator: Allocator, enc: *encoder_module.Encoder, needed: [*]const [*]const u8, needed_count: usize, naming: Naming, output_path: [*]const u8) -> bool {

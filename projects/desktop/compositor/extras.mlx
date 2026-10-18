@@ -1,0 +1,326 @@
+// Small protocols programs look for:
+//
+//   - zxdg_output_manager_v1 (xdg-output): an output's logical position,
+//     size and name (waybar, grim, Qt and SDL ask for it);
+//   - zwp_idle_inhibit_manager_v1 (idle-inhibit): a surface asks that the
+//     screen stay on while it shows (video players). The compositor keeps
+//     the inhibitors; idleInhibited says whether one of a mapped surface
+//     holds (`idle inhibit: on` and `off` in the log);
+//   - xdg_activation_v1 (xdg-activation): a program asks for a token
+//     (handed to another program it starts, as XDG_ACTIVATION_TOKEN) and
+//     whoever has it may bring a window forward once. A token is good only
+//     when the program asking had the keyboard (or is a part of the
+//     desktop in a layer: the dock, the launcher), for ten seconds and
+//     once, so a program cannot take the focus by itself (`activation:
+//     WINDOW` or `activation: refused` in the log).
+
+const std = @import("std")
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const windows_module = @import("./windows.mlx")
+
+const Compositor = state.Compositor
+
+const SYS_getrandom: usize = 318
+// How long a token is good for (microseconds), and how many are kept.
+const TOKEN_LIFETIME: usize = 10000000
+pub const TOKENS: usize = 16
+const TOKEN_LENGTH: usize = 32
+
+pub const Inhibitor = struct {
+    compositor: *Compositor
+    resource: wl.server.Object
+    // The surface it is for (its address; 0 once that surface went).
+    surface: usize
+}
+
+// A token being made (xdg_activation_token_v1): whether its program had
+// the keyboard or the surface it named did.
+pub const Request = struct {
+    compositor: *Compositor
+    resource: wl.server.Object
+    surface: usize
+    committed: bool
+}
+
+fn inhibitorAt(address: usize) -> *Inhibitor {
+    unsafe { return @ptrFromInt(*Inhibitor, address) }
+}
+
+fn requestAt(address: usize) -> *Request {
+    unsafe { return @ptrFromInt(*Request, address) }
+}
+
+fn contextAt(address: usize) -> *anyopaque {
+    unsafe { return @ptrFromInt(*anyopaque, address) }
+}
+
+fn recordOf(context: *anyopaque) -> usize { return @intFromPtr(context) }
+
+// ---------------------------------------------------------------------------
+// xdg-output
+
+fn onOutputManager(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.zxdg_output_manager_v1.REQUEST_GET_XDG_OUTPUT { return }
+    const decoded = wl.zxdg_output_manager_v1.decodeRequest(request).get_xdg_output
+    const output = decoded.id
+    output.sendLogicalPosition(0, 0)
+    output.sendLogicalSize(@intCast(i32, compositor.*.width), @intCast(i32, compositor.*.height))
+    const version = wl.zxdg_output_v1.Resource.fromObject(output.object).version()
+    if version >= 2 {
+        const name: [*]const u8 = &compositor.*.outputName
+        output.sendName(if compositor.*.outputNameLength > 0 { name[0..compositor.*.outputNameLength] } else { "MLX-1" })
+        output.sendDescription(if compositor.*.freestanding { "Mlx compositor output" } else { "Mlx nested compositor output" })
+    }
+    // From version 3 the output's own done ends the description.
+    if version >= 3 { decoded.output.sendDone() } else { output.sendDone() }
+}
+
+fn bindOutputManager(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.zxdg_output_manager_v1.Resource.fromObject(object).setHandler(onOutputManager, context)
+}
+
+// ---------------------------------------------------------------------------
+// idle-inhibit
+
+// Whether a mapped surface asks for the screen to stay on.
+pub fn idleInhibited(compositor: *Compositor) -> bool {
+    var index: usize = 0
+    while index < compositor.*.idleInhibitors.length {
+        const inhibitor = inhibitorAt(state.listAt(compositor.*.idleInhibitors, index))
+        if inhibitor.*.surface != 0 && state.surfaceAt(inhibitor.*.surface).*.mapped { return true }
+        index += 1
+    }
+    return false
+}
+
+fn sayInhibited(compositor: *Compositor, was: bool) -> void {
+    const now = idleInhibited(compositor)
+    if now == was || !compositor.*.verbose { return }
+    state.say(if now { "idle inhibit: on\n" } else { "idle inhibit: off\n" })
+}
+
+fn onInhibitorDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const address = recordOf(context)
+    const compositor = inhibitorAt(address).*.compositor
+    const was = idleInhibited(compositor)
+    compositor.*.idleInhibitors = state.listRemove(compositor.*.idleInhibitors, address)
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Inhibitor)) }
+    sayInhibited(compositor, was)
+}
+
+fn onInhibitor(context: *anyopaque, request: wl.server.Request) -> void {}
+
+fn onInhibitManager(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.zwp_idle_inhibit_manager_v1.REQUEST_CREATE_INHIBITOR { return }
+    const decoded = wl.zwp_idle_inhibit_manager_v1.decodeRequest(request).create_inhibitor
+    const was = idleInhibited(compositor)
+    const memory = state.allocate(compositor, @sizeOf(Inhibitor))
+    const address = @intFromPtr(memory)
+    const inhibitor = inhibitorAt(address)
+    inhibitor.*.compositor = compositor
+    inhibitor.*.resource = decoded.id.object
+    inhibitor.*.surface = state.findSurface(compositor, decoded.surface.object)
+    compositor.*.idleInhibitors = state.listAppend(compositor.*.idleInhibitors, address)
+    decoded.id.setHandler(onInhibitor, contextAt(address))
+    decoded.id.setDestroyHandler(onInhibitorDestroyed, contextAt(address))
+    sayInhibited(compositor, was)
+}
+
+fn bindInhibitManager(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.zwp_idle_inhibit_manager_v1.Resource.fromObject(object).setHandler(onInhibitManager, context)
+}
+
+// ---------------------------------------------------------------------------
+// xdg-activation
+
+// Whether the client of `object` may hand out the focus: it has the
+// keyboard, or it is a part of the desktop in a layer.
+fn mayActivate(compositor: *Compositor, object: wl.server.Object, surface: usize) -> bool {
+    const focused = compositor.*.keyboardFocus
+    if focused != 0 && state.sameClient(object, state.surfaceAt(focused).*.resource) { return true }
+    if surface != 0 && surface == focused { return true }
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const other = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        if other.*.role == state.ROLE_LAYER && other.*.mapped && state.sameClient(object, other.*.resource) { return true }
+        index += 1
+    }
+    return false
+}
+
+// A token: 32 random hex digits, kept (with when it was made and whether
+// it is good) in the ring of TOKENS.
+fn issue(compositor: *Compositor, good: bool, out: *[32]u8) -> void {
+    var random: [16]u8 = undefined
+    const got = std.linux.syscall3(SYS_getrandom, @intFromPtr(&random), 16, 0)
+    var index: usize = 0
+    while index < 16 {
+        // (Without randomness, the time keeps tokens apart.)
+        const byte = if got == 16 { random[index] } else { @intCast(u8, (state.microseconds() >> @intCast(u6, index % 8 * 4)) & 255) }
+        out.*[index * 2] = hexDigit(byte >> 4)
+        out.*[index * 2 + 1] = hexDigit(byte & 15)
+        index += 1
+    }
+    const slot = compositor.*.activationNext % TOKENS
+    compositor.*.activationNext += 1
+    index = 0
+    while index < TOKEN_LENGTH {
+        compositor.*.activationTokens[slot * TOKEN_LENGTH + index] = out.*[index]
+        index += 1
+    }
+    compositor.*.activationMade[slot] = state.microseconds()
+    compositor.*.activationGood[slot] = good
+}
+
+fn hexDigit(value: u8) -> u8 { return if value < 10 { 48 + value } else { 87 + value } }
+
+// Takes the token `text`: true once when it is good and fresh.
+fn redeem(compositor: *Compositor, text: []const u8) -> bool {
+    if text.length != TOKEN_LENGTH { return false }
+    var slot: usize = 0
+    while slot < TOKENS {
+        const kept = compositor.*.activationTokens[slot * TOKEN_LENGTH..slot * TOKEN_LENGTH + TOKEN_LENGTH]
+        if compositor.*.activationMade[slot] != 0 && std.text.same(kept, text) {
+            const fresh = state.microseconds() - compositor.*.activationMade[slot] < TOKEN_LIFETIME
+            const good = compositor.*.activationGood[slot] && fresh
+            compositor.*.activationMade[slot] = 0
+            compositor.*.activationGood[slot] = false
+            return good
+        }
+        slot += 1
+    }
+    return false
+}
+
+fn onTokenDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const address = recordOf(context)
+    const compositor = requestAt(address).*.compositor
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Request)) }
+}
+
+fn onToken(context: *anyopaque, request: wl.server.Request) -> void {
+    const record = requestAt(recordOf(context))
+    const compositor = record.*.compositor
+    const decoded = wl.xdg_activation_token_v1.decodeRequest(request)
+    if request.opcode == wl.xdg_activation_token_v1.REQUEST_SET_SURFACE {
+        record.*.surface = state.findSurface(compositor, decoded.set_surface.surface.object)
+    } else if request.opcode == wl.xdg_activation_token_v1.REQUEST_COMMIT {
+        const token = wl.xdg_activation_token_v1.Resource.fromObject(request.object)
+        if record.*.committed {
+            token.postError(@intFromEnum(wl.xdg_activation_token_v1.Error.already_used), "the token was already committed")
+            return
+        }
+        record.*.committed = true
+        var text: [32]u8 = undefined
+        issue(compositor, mayActivate(compositor, request.object, record.*.surface), &text)
+        const bytes: [*]const u8 = &text
+        token.sendDone(bytes[0..TOKEN_LENGTH])
+    }
+}
+
+fn onActivation(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    const decoded = wl.xdg_activation_v1.decodeRequest(request)
+    if request.opcode == wl.xdg_activation_v1.REQUEST_GET_ACTIVATION_TOKEN {
+        const resource = decoded.get_activation_token.id
+        const memory = state.allocate(compositor, @sizeOf(Request))
+        const address = @intFromPtr(memory)
+        const record = requestAt(address)
+        record.*.compositor = compositor
+        record.*.resource = resource.object
+        record.*.surface = 0
+        record.*.committed = false
+        resource.setHandler(onToken, contextAt(address))
+        resource.setDestroyHandler(onTokenDestroyed, contextAt(address))
+    } else if request.opcode == wl.xdg_activation_v1.REQUEST_ACTIVATE {
+        const activate = decoded.activate
+        const surface = state.findSurface(compositor, activate.surface.object)
+        const window = if surface != 0 { scene.toplevelOf(surface) } else { 0 }
+        const token = activate.token
+        const good = redeem(compositor, token.pointer[0..token.length])
+        if !good || window == 0 || state.surfaceAt(window).*.role != state.ROLE_TOPLEVEL || compositor.*.locked || compositor.*.exclusiveLayer != 0 {
+            if compositor.*.verbose { state.say("activation: refused\n") }
+            return
+        }
+        windows_module.focus(compositor, window)
+        if compositor.*.verbose {
+            state.say("activation: ")
+            state.sayTitle(state.surfaceAt(window))
+            state.say("\n")
+        }
+    }
+}
+
+fn bindActivation(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.xdg_activation_v1.Resource.fromObject(object).setHandler(onActivation, context)
+}
+
+// ---------------------------------------------------------------------------
+
+// A surface is going away: its inhibitors no longer hold.
+pub fn surfaceGone(compositor: *Compositor, address: usize) -> void {
+    if !compositor.*.hasExtras || compositor.*.idleInhibitors.length == 0 { return }
+    const was = idleInhibited(compositor)
+    var index: usize = 0
+    while index < compositor.*.idleInhibitors.length {
+        const inhibitor = inhibitorAt(state.listAt(compositor.*.idleInhibitors, index))
+        if inhibitor.*.surface == address { inhibitor.*.surface = 0 }
+        index += 1
+    }
+    sayInhibited(compositor, was)
+}
+
+pub fn createGlobals(compositor: *Compositor) -> bool {
+    compositor.*.idleInhibitors = state.newList(compositor.*.allocator)
+    compositor.*.hasExtras = true
+    compositor.*.activationNext = 0
+    var slot: usize = 0
+    while slot < TOKENS {
+        compositor.*.activationMade[slot] = 0
+        compositor.*.activationGood[slot] = false
+        slot += 1
+    }
+    const memory: [*]u8 = unsafe { @ptrCast([*]u8, compositor) }
+    const context = state.contextOf(memory)
+    if compositor.*.server.createGlobal(wl.Interface.zxdg_output_manager_v1, 3, bindOutputManager, context) == 0 { return false }
+    if compositor.*.server.createGlobal(wl.Interface.zwp_idle_inhibit_manager_v1, 1, bindInhibitManager, context) == 0 { return false }
+    return compositor.*.server.createGlobal(wl.Interface.xdg_activation_v1, 1, bindActivation, context) != 0
+}
+
+// ---------------------------------------------------------------------------
+// The handlers this file registers with the Wayland server, by name (see
+// data.mlx; tools/check_compositor_modules.py checks the table).
+
+pub const HANDLER_COUNT: usize = 10
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(bindActivation) }
+    if index == 1 { return @intFromPtr(bindInhibitManager) }
+    if index == 2 { return @intFromPtr(bindOutputManager) }
+    if index == 3 { return @intFromPtr(onActivation) }
+    if index == 4 { return @intFromPtr(onInhibitManager) }
+    if index == 5 { return @intFromPtr(onInhibitor) }
+    if index == 6 { return @intFromPtr(onInhibitorDestroyed) }
+    if index == 7 { return @intFromPtr(onOutputManager) }
+    if index == 8 { return @intFromPtr(onToken) }
+    if index == 9 { return @intFromPtr(onTokenDestroyed) }
+    return 0
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "extras.bindActivation" }
+    if index == 1 { return "extras.bindInhibitManager" }
+    if index == 2 { return "extras.bindOutputManager" }
+    if index == 3 { return "extras.onActivation" }
+    if index == 4 { return "extras.onInhibitManager" }
+    if index == 5 { return "extras.onInhibitor" }
+    if index == 6 { return "extras.onInhibitorDestroyed" }
+    if index == 7 { return "extras.onOutputManager" }
+    if index == 8 { return "extras.onToken" }
+    if index == 9 { return "extras.onTokenDestroyed" }
+    return ""
+}
