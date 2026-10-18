@@ -1,9 +1,11 @@
 // The small org.freedesktop.login1 surface the MLX compositor needs.
 // mlx-login owns it on MLXIPC's system bus so the compositor can obtain
-// device descriptors after it has dropped root. This is deliberately a
-// one-seat, one-session service; it is not a general logind clone.
+// device descriptors after it has dropped root and route authorized power
+// requests to mlx-init. This is deliberately a one-seat, one-session
+// service; it is not a general logind clone.
 const std = @import("std")
 const dbus = @import("std.dbus")
+const init_linux = @import("../../init/linux.mlx")
 
 pub const NAME: []const u8 = "org.freedesktop.login1"
 const MANAGER_PATH: []const u8 = "/org/freedesktop/login1"
@@ -31,10 +33,14 @@ const CHARACTER_DEVICE: u32 = 8192
 const CONTROLLER_MOST: usize = 128
 const PENDING_MOST: usize = 4
 const DEVICE_MOST: usize = 32
+const CONTROL_PENDING: u8 = 1
+const POWEROFF_PENDING: u8 = 2
+const REBOOT_PENDING: u8 = 3
 
 const Pending = struct {
     used: bool
     check: u32
+    kind: u8
     serial: u32
     flags: u8
     generation: u32
@@ -52,6 +58,7 @@ pub const State = struct {
     controller: [CONTROLLER_MOST]u8
     controllerLength: usize
     ttyPath: []const u8
+    initControlPath: []const u8
     allowTestDevice: bool
     activeVT: u32
     generation: u32
@@ -107,9 +114,11 @@ fn noDescriptors() -> [*]const isize {
     return result
 }
 
-pub fn init(state: *State, ttyPath: []const u8, allowTestDevice: bool) -> void {
+pub fn init(state: *State, ttyPath: []const u8, allowTestDevice: bool, environment: [*][*]const u8) -> void {
     state.*.controllerLength = 0
     state.*.ttyPath = ttyPath
+    const configuredControl = std.process.environmentFrom(environment, "MLX_INIT_CONTROL")
+    state.*.initControlPath = if configuredControl == null || configuredControl.?.length == 0 { "/run/mlx/init" } else { std.string.asSlice(configuredControl.?) }
     state.*.allowTestDevice = allowTestDevice
     state.*.activeVT = 1
     state.*.generation = 1
@@ -153,6 +162,14 @@ fn pathReply(client: *dbus.Client, call: *const dbus.Header) -> void {
     unsafe { const sent = dbus.reply(client, call, "o", @ptrCast([*]const u8, &body), writing.length, noDescriptors(), 0) }
 }
 
+fn stringReply(client: *dbus.Client, call: *const dbus.Header, value: []const u8) -> void {
+    var body: [64]u8 = undefined
+    var writing: dbus.Writer = undefined
+    unsafe { dbus.begin(&writing, @ptrCast([*]u8, &body), 64, call.*.big) }
+    dbus.putString(&writing, value)
+    unsafe { const sent = dbus.reply(client, call, "s", @ptrCast([*]const u8, &body), writing.length, noDescriptors(), 0) }
+}
+
 fn isController(state: *State, call: *const dbus.Header) -> bool {
     return state.*.controllerLength > 0 && same(controller(state), call.*.sender)
 }
@@ -165,6 +182,13 @@ fn requireController(state: *State, client: *dbus.Client, call: *const dbus.Head
 
 fn parseNone(call: *const dbus.Header) -> bool { return call.*.signature.length == 0 }
 
+fn parseBool(call: *const dbus.Header, body: [*]const u8, value: *bool) -> bool {
+    if !same(call.*.signature, "b") { return false }
+    var reading = dbus.reader(body, call.*.bodyLength, call.*.big)
+    value.* = dbus.readBool(&reading)
+    return !reading.failed
+}
+
 fn parseTwoU32(call: *const dbus.Header, body: [*]const u8, first: *u32, second: *u32) -> bool {
     if !same(call.*.signature, "uu") { return false }
     var reading = dbus.reader(body, call.*.bodyLength, call.*.big)
@@ -173,7 +197,89 @@ fn parseTwoU32(call: *const dbus.Header, body: [*]const u8, first: *u32, second:
     return !reading.failed
 }
 
-fn managerCall(client: *dbus.Client, call: *const dbus.Header, body: [*]const u8, activePid: isize) -> void {
+fn powerAvailable(state: *State) -> bool {
+    if state.*.initControlPath.length == 0 || state.*.initControlPath.length > 107 { return false }
+    // The control protocol explicitly drops clients that close without a
+    // request. This probe distinguishes a listener from a stale socket.
+    const descriptor = init_linux.connect(state.*.initControlPath)
+    if descriptor < 0 { return false }
+    init_linux.close(descriptor)
+    return true
+}
+
+fn requestPower(state: *State, kind: u8) -> bool {
+    if kind != POWEROFF_PENDING && kind != REBOOT_PENDING { return false }
+    // sockaddr_un has 108 bytes including its family and terminating NUL.
+    if state.*.initControlPath.length == 0 || state.*.initControlPath.length > 107 { return false }
+    const descriptor = init_linux.connect(state.*.initControlPath)
+    if descriptor < 0 { return false }
+    const sent = init_linux.writeAll(descriptor, if kind == POWEROFF_PENDING { "poweroff\n" } else { "reboot\n" })
+    var response: [64]u8 = undefined
+    var length: usize = 0
+    var complete = false
+    while sent && !complete && length < 64 {
+        const received = init_linux.read(descriptor, unsafe { @ptrCast([*]u8, &response) } + length, 64 - length)
+        if received <= 0 {
+            complete = true
+        } else {
+            const before = length
+            length += @bitCast(usize, received)
+            var index = before
+            while index < length {
+                if response[index] == 10 { complete = true }
+                index += 1
+            }
+        }
+    }
+    init_linux.close(descriptor)
+    return sent && same(std.text.trimmed(response[0..length]), "ok")
+}
+
+fn askPower(state: *State, client: *dbus.Client, call: *const dbus.Header, body: [*]const u8, kind: u8) -> void {
+    var interactive = false
+    if !parseBool(call, body, &interactive) || call.*.sender.length == 0 || call.*.sender.length > CONTROLLER_MOST {
+        errorReply(client, call, "org.freedesktop.DBus.Error.InvalidArgs", "PowerOff and Reboot take one boolean")
+        return
+    }
+    var slot: usize = 0
+    while slot < PENDING_MOST && pendingAt(state, slot).*.used { slot += 1 }
+    if slot == PENDING_MOST {
+        errorReply(client, call, "org.freedesktop.login1.OperationInProgress", "too many power operations await authorization")
+        return
+    }
+    const pending = pendingAt(state, slot)
+    pending.*.kind = kind
+    pending.*.serial = call.*.serial
+    pending.*.flags = call.*.flags
+    pending.*.generation = 0
+    pending.*.senderLength = copyInto(pendingBytes(pending), CONTROLLER_MOST, call.*.sender)
+    var message: [256]u8 = undefined
+    var writing: dbus.Writer = undefined
+    unsafe { dbus.begin(&writing, @ptrCast([*]u8, &message), 256, false) }
+    dbus.putString(&writing, pendingSender(pending))
+    dbus.putString(&writing, "login.power")
+    pending.*.check = dbus.call(client, BUS_NAME, IPC_PATH, IPC_INTERFACE, "Check", "ss", unsafe { @ptrCast([*]const u8, &message) }, writing.length)
+    if pending.*.check == 0 {
+        pending.*.senderLength = 0
+        errorReply(client, call, "org.freedesktop.DBus.Error.AccessDenied", "the bus could not authorize login.power")
+        return
+    }
+    pending.*.used = true
+}
+
+fn managerCall(state: *State, client: *dbus.Client, call: *const dbus.Header, body: [*]const u8, activePid: isize) -> void {
+    if same(call.*.member, "CanPowerOff") || same(call.*.member, "CanReboot") {
+        if !parseNone(call) {
+            errorReply(client, call, "org.freedesktop.DBus.Error.InvalidArgs", "CanPowerOff and CanReboot take no arguments")
+        } else {
+            stringReply(client, call, if powerAvailable(state) { "yes" } else { "no" })
+        }
+        return
+    }
+    if same(call.*.member, "PowerOff") || same(call.*.member, "Reboot") {
+        askPower(state, client, call, body, if same(call.*.member, "PowerOff") { POWEROFF_PENDING } else { REBOOT_PENDING })
+        return
+    }
     var valid = false
     if same(call.*.member, "GetSession") && same(call.*.signature, "s") {
         var reading = dbus.reader(body, call.*.bodyLength, call.*.big)
@@ -218,6 +324,7 @@ fn askControl(state: *State, client: *dbus.Client, call: *const dbus.Header, bod
         return
     }
     const pending = pendingAt(state, slot)
+    pending.*.kind = CONTROL_PENDING
     pending.*.serial = call.*.serial
     pending.*.flags = call.*.flags
     pending.*.generation = state.*.generation
@@ -248,15 +355,23 @@ pub fn answered(state: *State, client: *dbus.Client, reply: *const dbus.Header, 
             var call = dbus.newHeader(dbus.METHOD_CALL, pending.*.serial)
             call.flags = pending.*.flags
             call.sender = pendingSender(pending)
-            if !allowed {
-                errorReply(client, &call, "org.freedesktop.DBus.Error.AccessDenied", "this app may not control session devices (login.device)")
-            } else if !active || pending.*.generation != state.*.generation {
-                errorReply(client, &call, "org.freedesktop.login1.NoSessionForPID", "the MLX session ended while authorization was pending")
-            } else if state.*.controllerLength > 0 && !same(controller(state), call.sender) {
-                errorReply(client, &call, "org.freedesktop.login1.SessionBusy", "another compositor controls the session")
-            } else {
-                state.*.controllerLength = copyInto(bytesAt(state, @offsetOf(State, "controller")), CONTROLLER_MOST, call.sender)
+            if pending.*.kind == CONTROL_PENDING {
+                if !allowed {
+                    errorReply(client, &call, "org.freedesktop.DBus.Error.AccessDenied", "this app may not control session devices (login.device)")
+                } else if !active || pending.*.generation != state.*.generation {
+                    errorReply(client, &call, "org.freedesktop.login1.NoSessionForPID", "the MLX session ended while authorization was pending")
+                } else if state.*.controllerLength > 0 && !same(controller(state), call.sender) {
+                    errorReply(client, &call, "org.freedesktop.login1.SessionBusy", "another compositor controls the session")
+                } else {
+                    state.*.controllerLength = copyInto(bytesAt(state, @offsetOf(State, "controller")), CONTROLLER_MOST, call.sender)
+                    emptyReply(client, &call)
+                }
+            } else if !allowed {
+                errorReply(client, &call, "org.freedesktop.DBus.Error.AccessDenied", "this app may not power off or reboot (login.power)")
+            } else if requestPower(state, pending.*.kind) {
                 emptyReply(client, &call)
+            } else {
+                errorReply(client, &call, "org.freedesktop.DBus.Error.Failed", "mlx-init did not accept the power request")
             }
             pending.*.used = false
             pending.*.senderLength = 0
@@ -563,7 +678,7 @@ fn sessionCall(state: *State, client: *dbus.Client, call: *const dbus.Header, bo
 pub fn called(state: *State, client: *dbus.Client, call: *const dbus.Header, body: [*]const u8, activePid: isize) -> bool {
     if call.*.kind != dbus.METHOD_CALL { return false }
     if same(call.*.path, MANAGER_PATH) && same(call.*.interface, MANAGER) {
-        managerCall(client, call, body, activePid)
+        managerCall(state, client, call, body, activePid)
         return true
     }
     if same(call.*.path, SESSION_PATH) && same(call.*.interface, SESSION) {

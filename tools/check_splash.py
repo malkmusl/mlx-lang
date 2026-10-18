@@ -105,6 +105,8 @@ def headless():
     snapshot = os.path.join(WORK, "headless.png")
     splash = start(name, "headless", ["--output", "none", "--size", "1280x720", "--snapshot", snapshot])
     wait_socket(name, splash)
+    if ctl(name, "absent").returncode != 1:
+        fail("absent did not detect a running initramfs splash")
     if request(name, b"P") != ACK:
         fail("ping not answered ACK")
     # systemd: the unit's name, nonblocking, the answer never read.
@@ -177,7 +179,42 @@ def headless():
         fail(f"the boot's length was kept as {duration!r}")
     if os.path.getsize(snapshot) < 40000:
         fail("the snapshot is (nearly) empty")
-    ok(f"quit: answered when done, wait returns, the boot's length kept ({duration.strip()} s), the snapshot drawn")
+    if ctl(name, "absent").returncode != 0:
+        fail("absent did not succeed after the splash ended")
+    ok(f"quit: answered when done, wait returns, the boot's length kept ({duration.strip()} s), the snapshot drawn; duplicate guard follows the socket")
+
+
+def new_root():
+    """The initramfs hands the daemon a mounted real root. The daemon must
+    chroot before switch-root so its persistent paths belong to that root."""
+    name = f"/mlx-splash-newroot-{os.getpid()}"
+    root = os.path.join(WORK, "new-root")
+    duration = os.path.join(root, "var/lib/mlx/splash/boot-duration")
+    os.makedirs(root)
+    log_path = os.path.join(WORK, "newroot.log")
+    log = open(log_path, "w")
+    splash = subprocess.Popen([
+        SPLASH, "--no-tty", "--output", "none", "--size", "320x180",
+        "--socket", name, "--duration-file", "/var/lib/mlx/splash/boot-duration",
+        "--ask-password-dir", "/run/systemd/ask-password",
+    ], stdout=log, stderr=log)
+    splash.log_path = log_path
+    wait_socket(name, splash)
+    if request(name, b"R", b"relative-root") != NAK:
+        fail("newroot accepted a relative path")
+    if request(name, b"R", os.fsencode(root)) != ACK:
+        fail(f"newroot did not enter {root}: {open(log_path).read()}")
+    if request(name, b"P") != ACK:
+        fail("the splash stopped answering after newroot")
+    time.sleep(1.05)
+    if ctl(name, "quit").returncode != 0 or splash.wait(timeout=10) != 0:
+        fail(f"the splash did not quit after newroot: {open(log_path).read()}")
+    if not os.path.isfile(duration):
+        fail("the duration file was not written inside the handed-over root")
+    kept = open(duration).read().strip()
+    if not kept.replace(".", "", 1).isdigit() or float(kept) < 1.0:
+        fail(f"the handed-over root got an invalid duration {kept!r}")
+    ok(f"newroot: relative path refused, daemon chrooted, persistent state written in the real root ({kept} s)")
 
 
 class Harness:
@@ -409,6 +446,7 @@ def kms(retain):
 
 
 headless()
+new_root()
 take_over()
 kms(False)
 kms(True)
