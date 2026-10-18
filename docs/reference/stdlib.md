@@ -936,6 +936,40 @@ pub fn main() -> u8 {
 }
 ```
 
+## Random numbers (`std.random`)
+
+**Implementation:** `std/src/random.mlx`
+**Source tests:** `347_random_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+- From the kernel (getrandom(2)): `fill(into, length)` (false only on a
+  kernel without getrandom), `random64()` and `random32()` (mixed from the
+  monotonic clock if the kernel gives nothing, so they never fail), and
+  `getrandom(into, length, flags)` as the kernel answers it. Keys,
+  nonces and ids come from these: mlx-netd's DHCP transaction ids and
+  WPA nonces, MLXIPC's bus id, libpipewire's `pw_getrandom`/`pw_random`
+  and shuf without `--random-source`.
+- Seeded, for numbers that repeat with their seed: `Xoshiro256`
+  (xoshiro256**, its 256-bit state filled from the seed by splitmix64)
+  with `seed(&g, value)`, `seedFromKernel(&g)`, `next(&g)`,
+  `below(&g, bound)` (unbiased) and `unit(&g)` (a double in [0, 1));
+  `splitmix64(&state)` itself; and `Xorshift64Star` (Marsaglia's
+  xorshift64*) with `xorshift64StarNext` and `xorshift64StarUnit`, the
+  sequence the boot splash draws its stars from. None of these is for
+  secrets.
+
+```mlx
+const random = @import("std.random")
+
+pub fn main() -> u8 {
+    var generator: random.Xoshiro256 = undefined
+    random.seed(&generator, 42)
+    const roll = random.below(&generator, 6)       // 0 to 5, the same for seed 42
+    var key: [16]u8 = undefined
+    if !random.fill(&key, 16) { return 1 }
+    return if roll < 6 { 13 } else { 2 }
+}
+```
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`

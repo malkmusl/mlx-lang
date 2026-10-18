@@ -8,6 +8,8 @@
 #                                       (FIPS 180-4's examples)
 #   tests/346_math_helpers_runtime.mlx  std.math's min, max, clamp,
 #                                       absolute, sqrt and smoothstep
+#   tests/347_random_runtime.mlx        std.random (xoshiro256**'s and
+#                                       splitmix64's reference outputs)
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -39,6 +41,7 @@ run 343_base64_runtime "base64, base64url, base32, base32hex, base16 and hex"
 run 344_md5_blake2_runtime "MD5 and BLAKE2b, plain, keyed and in pieces"
 run 345_sha2_runtime "SHA-224 and SHA-384 (and SHA-1, SHA-256, SHA-512)"
 run 346_math_helpers_runtime "min, max, clamp, absolute, sqrt and smoothstep"
+run 347_random_runtime "getrandom, xoshiro256**, splitmix64 and xorshift64*"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
