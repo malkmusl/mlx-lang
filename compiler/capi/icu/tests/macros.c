@@ -48,6 +48,8 @@
 #include <unicode/ures.h>
 #include <unicode/ubidi.h>
 #include <unicode/usearch.h>
+#include <unicode/ucnv.h>
+#include <unicode/ucnv_cb.h>
 
 int main(void)
 {

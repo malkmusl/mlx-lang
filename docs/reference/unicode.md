@@ -72,6 +72,7 @@ fn example(allocator: unicode.utf.Allocator) -> unicode.Error!void {
 | `std.unicode.charsets` | `detect`: the likely charset (`Detected`: name, language, confidence) |
 | `std.unicode.bidi` | the Bidirectional Algorithm (UAX #9): `resolveLevels` (the level of each code point in paragraphs of a direction, or of their own, P2 and P3), `visualOrder` (L2), `baseDirection` (the first strong character's) |
 | `std.unicode.search` | string search by collation (`usearch.h`): `find` and `findLast` of a pattern in UTF-8 text as a `collation.Collator` compares them, matches on grapheme cluster boundaries, the pattern's base letters wildcards when asked (a `Match` of byte offsets) |
+| `std.unicode.converters` | converters between charsets and UTF-16 (`ucnv.h`): UTF-8, UTF-16 and UTF-32, ISO-8859-1, US-ASCII and the single-byte charsets of `charmaps`, by any of their names; streaming, the callbacks of `ucnv_err.h`; `decode` and `encode` between a charset and UTF-8 |
 | `std.unicode.charmaps` | the single-byte charsets (ISO-8859-2 to -16, the Windows code pages, KOI8-R and -U, IBM866, the Mac OS ones) as the Encoding Standard's tables have them: `find` by name or label (a `Charmap`), `nameOf`, `decode` a byte, `encode` a code point (`NONE` where there is none); no tables beyond its own, no C library |
 | `std.unicode.locale` | `canonical`, `toLanguageTag`, `fromLanguageTag`, `maximize` and `minimize` (likely subtags), `defaultLocale` |
 | `std.unicode.locale.displaynames` | `languageName`, `scriptName`, `regionName` in a display locale |
@@ -90,7 +91,8 @@ and the spans of their fields (ICU's `UFormattedValue`).
 program: no tables, no C library); `tests/345_unicode_text_runtime.mlx`
 the text parts (properties, casing, normalization, breaks, collation by
 locale and by rules, IDNA, charset detection, the single-byte charsets,
-the bidirectional algorithm, string search by collation);
+the bidirectional algorithm, string search by collation, converters between
+charsets);
 `tests/346_unicode_locale_runtime.mlx` the locale parts over `cldr.dat`
 (tags, likely subtags, display names, calendar fields in Berlin and in
 the Thai Buddhist calendar, numbers, plural categories, dates, lists,
@@ -128,6 +130,7 @@ against the zone files zic made of the same database.
 | `charsets.mlx` | `ucsdet.h`: charset detection |
 | `bidi.mlx` | `ubidi.h`: the Bidirectional Algorithm (UAX #9) with ICU's conventions where it leaves the choice open (levels a UTF-16 unit, the levels of removed characters, text of one direction at its paragraph level, lines); runs, maps, the text in visual order |
 | `search.mlx` | `usearch.h`: string search by collation, ICU's element comparisons, forwards and backwards |
+| `converters.mlx` | `ucnv.h`, `ucnv_err.h`, `ucnv_cb.h`: converters, streaming, with what an incomplete character leaves for the next call and the callbacks for what cannot be converted |
 | `charmaps.mlx` | The single-byte charsets: names and labels, a byte's code point and back |
 | `charmaps/tables.mlx` | Generated (`charset-generate`): the code points of their bytes 0x80 to 0xFF, of the Encoding Standard's indexes and Apple's tables (`std/registry/unicode/charsets`) |
 | `enumeration.mlx` | `uenum.h` |

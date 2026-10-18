@@ -40,6 +40,7 @@ hand.
 | `charsets.mlx` | `ucsdet.h` (std.unicode.charsets) |
 | `bidi.mlx` | `ubidi.h` (std.unicode.bidi) |
 | `search.mlx` | `usearch.h` (std.unicode.search, over std.unicode.collation and breaks) |
+| `converters.mlx` | `ucnv.h`, `ucnv_err.h`, `ucnv_cb.h` (std.unicode.converters, over std.unicode.charmaps); the callbacks of `ucnv_err.h` |
 | `enumeration.mlx` | `uenum.h` (std.unicode.enumeration) |
 | `localeid.mlx`, `displaynames.mlx`, `bundles.mlx` | `uloc.h` (std.unicode.locale); `uldnames.h` and `uloc_getDisplay*` (std.unicode.locale.displaynames); `ures.h` over cldr.dat (std.unicode.locale.bundles) |
 | `calendar.mlx`, `timezonenames.mlx` | `ucal.h` (std.unicode.calendar); the names of zones (std.unicode.format.date.zonenames) |
@@ -106,6 +107,20 @@ from C programs compiled by mlx-cc:
   (forwards: ICU 74's backward search leaves out, in some of them, a
   first match made of an expansion, and takes ignorables after a match
   into it), prints what ICU 74 prints (search.expected)
+- converters: tests/converters.c, as WebKit's TextCodecICU uses them
+  (open by name, fallbacks, `ucnv_toUnicode` in pieces into a small
+  buffer until it stops overflowing, the substitute callback stopping on
+  illegal input, `ucnv_fromUnicode` with the XML escape or a callback of
+  its own writing with `ucnv_cbFromUWriteBytes`, reset) and the rest of
+  the API: names, aliases and `ucnv_compareNames`, whole texts both ways
+  with every callback and escape context, ill-formed UTF-8 (maximal
+  subparts), UTF-16 and UTF-32 with and without byte order marks, unpaired
+  surrogates, the substitution, the invalid input a callback is given,
+  what is pending, offsets, one character at a time, `ucnv_convert` and
+  `ucnv_convertEx` with a small pivot, signatures, clones, the errors,
+  and 1500 random texts of whole and broken characters converted both
+  ways in random pieces into random room: prints what ICU 74 prints
+  (converters.expected)
 - IdnaTestV2.txt: 19169 of 19169 conversions (toUnicode, toAsciiN,
   toAsciiT of 6389 lines, and UTF-8)
 - locale IDs and tags: tests/locales.c against ICU's results
@@ -143,11 +158,28 @@ from C programs compiled by mlx-cc:
     (`ucol_getTailoredSet`, `ucol_getContractionsAndExpansions`);
   - Windows' zone IDs; parsing leap months and cyclic years of the
     Chinese calendars;
-  - legacy charset conversion (`ucnv`); detecting single-byte charsets
-    other than Latin-1 and windows-1252 (ICU rates them by n-gram
-    statistics of their languages);
+  - detecting single-byte charsets other than Latin-1 and windows-1252
+    (ICU rates them by n-gram statistics of their languages);
   - sets (`uset`).
   They come next, in Mlx, from the Unicode and CLDR data.
+- Of the converters (`ucnv.h`): the East Asian multi-byte charsets
+  (Shift_JIS, EUC-JP, GBK, gb18030, Big5, EUC-KR: WebKit has its own),
+  EUC-TW, the stateful ones (ISO-2022-*, HZ, UTF-7, SCSU, BOCU-1), EBCDIC
+  and CESU-8: opening one fails with `U_FILE_ACCESS_ERROR`. The
+  single-byte charsets map as the Encoding Standard's tables do (where
+  ICU's tables differ in a few bytes, the browser's reading); a
+  converter's name is its own (`ISO-8859-2`, not ICU's
+  `ibm-912_P100-1995`), with ICU 74's aliases for the Unicode, Latin-1
+  and ASCII converters and the Encoding Standard's labels for the
+  others; `ucnv_getStandardName` and `ucnv_getCanonicalName` answer that
+  name whatever the standard. The default converter is UTF-8, as ICU's is
+  built with `U_CHARSET_IS_UTF8` (`ucnv_setDefaultName` changes nothing).
+  Not here: `ucnv_getUnicodeSet`, `ucnv_getStarters`,
+  `ucnv_getDisplayName`, the algorithmic and package functions
+  (`ucnv_openPackage` fails), `ucnv_openAllNames`, the standards' names;
+  a callback is not told of a clone (`UCNV_CLONE`); in random pieces,
+  where a call stops when its output overflows is not always ICU's (the
+  output is).
 - Of `usearch.h`: canonical matching (`USEARCH_CANONICAL_MATCH`, kept
   but not applied, as it takes no part in ICU 74 either); a match goes on
   over at most two clusters that do not match while looking for a

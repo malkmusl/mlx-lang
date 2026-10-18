@@ -139,7 +139,7 @@ cc $tests/idna.c -o "$work/idna" || fail "tests/idna.c does not build"
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom search; do
+for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom search converters; do
     cc "$tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "$tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"
