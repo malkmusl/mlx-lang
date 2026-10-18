@@ -20,6 +20,9 @@
 #                                       name and by number)
 #   tests/356_conf_runtime.mlx          std.conf ("key = value" files)
 #   tests/357_glob_runtime.mlx          std.glob (fnmatch patterns)
+#   tests/358_timezone_names_runtime.mlx
+#                                       std.timezone's abbreviations and
+#                                       loadSetting
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -58,6 +61,7 @@ run 354_xdg_runtime "the XDG base directories, their defaults and lists"
 run 355_passwd_runtime "accounts and groups by name and number, malformed lines passed over"
 run 356_conf_runtime "settings lines, comments, groups and switches"
 run 357_glob_runtime "stars, sets, ranges, escapes and quoted bytes"
+run 358_timezone_names_runtime "zone abbreviations from rules and TZif files"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

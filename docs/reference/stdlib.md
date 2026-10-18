@@ -205,7 +205,9 @@ GPU's time goes on the frame the program was drawing when it began.
 `std.timezone` (`std/src/timezone.mlx`) gives local time: `load` reads the
 zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
 (TZif, RFC 8536, with the POSIX rule past its last transition),
-`offsetAt` gives the offset from UTC at a moment, `civil` and
+`loadSetting` takes such a setting itself, `offsetAt` gives the offset
+from UTC at a moment and `abbreviationAt` the zone's name for it
+("CEST"; `tests/358_timezone_names_runtime.mlx`), `civil` and
 `daysFromCivil` convert between seconds and the proleptic Gregorian
 calendar (`tests/279_timezone_runtime.mlx`).
 `std.process.environmentFrom(entries, name)` looks a name up in any
