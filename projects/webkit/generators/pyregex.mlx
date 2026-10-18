@@ -1,0 +1,802 @@
+// Regular expressions matched as Python's re module matches them, for the
+// generators of WebKit written in Python, whose parsing is done with
+// regular expressions: the same pattern gives the same match, the same
+// groups and the same backtracking choices (leftmost match, greedy and
+// lazy quantifiers trying in Python's order).
+//
+// The patterns are compiled to a small program run by a backtracking
+// machine. What is understood: literals and escapes (\n \t \r \f \v, an
+// escaped punctuation character), `.`, classes `[...]` and `[^...]` with
+// ranges, \d \w \s (and \D \W \S), `^` and `$`, groups `(...)`, `(?:...)`,
+// lookaheads `(?=...)` and `(?!...)`, alternation `|`, and the
+// quantifiers * + ? {n} {n,} {n,m}, each greedy or lazy (with `?`). The
+// flags are MULTILINE and DOTALL.
+//
+// The text is bytes: \w, \s and \d take ASCII (with \x1c to \x1f as
+// space, as Python has them), a byte from 128 on matches none of them.
+const s = @import("./support.mlx")
+
+pub const MULTILINE: u8 = 1
+pub const DOTALL: u8 = 2
+
+const OP_CHAR: u8 = 0
+const OP_ANY: u8 = 1
+const OP_CLASS: u8 = 2
+// Go on at a, and when that fails, at b.
+const OP_SPLIT: u8 = 3
+const OP_JUMP: u8 = 4
+const OP_SAVE: u8 = 5
+const OP_LINE_START: u8 = 6
+const OP_LINE_END: u8 = 7
+// The lookahead's program follows, ended by OP_MATCH; a is past it.
+const OP_AHEAD: u8 = 8
+const OP_NOT_AHEAD: u8 = 9
+const OP_MATCH: u8 = 10
+
+const Instruction = struct {
+    op: u8
+    a: usize
+    b: usize
+}
+
+pub const Regex = struct {
+    code: [*]Instruction
+    count: usize
+    // The capturing groups (group 0, the whole match, not counted).
+    groups: usize
+    // Four words of 64 bits per class: the bytes it holds.
+    classes: [*]u64
+    flags: u8
+}
+
+pub const Match = struct {
+    found: bool
+    // Start and end of each group, -1 when it took no part.
+    spans: [*]i64
+}
+
+// ---------------------------------------------------------------------------
+// The pattern, parsed.
+
+const NONE: usize = 18446744073709551615
+const INFINITE: usize = 18446744073709551615
+
+const N_CHAR: u8 = 0
+const N_ANY: u8 = 1
+const N_CLASS: u8 = 2
+const N_START: u8 = 3
+const N_END: u8 = 4
+const N_GROUP: u8 = 5
+const N_SEQUENCE: u8 = 6
+const N_ALTERNATION: u8 = 7
+const N_REPEAT: u8 = 8
+const N_AHEAD: u8 = 9
+const N_NOT_AHEAD: u8 = 10
+
+const Node = struct {
+    kind: u8
+    // The byte, the class or the group.
+    value: usize
+    first: usize
+    next: usize
+    min: usize
+    max: usize
+    greedy: bool
+}
+
+const MAX_NODES: usize = 4096
+const MAX_CODE: usize = 16384
+const MAX_CLASSES: usize = 256
+
+const Parser = struct {
+    pattern: []const u8
+    at: usize
+    nodes: [*]Node
+    nodeCount: usize
+    regex: *Regex
+    classCount: usize
+}
+
+fn problem(p: *Parser, message: []const u8) -> void {
+    s.fail(s.join3(s.join3("regular expression ", p.*.pattern, ": "), message, ""))
+}
+
+fn newNode(p: *Parser, kind: u8, value: usize) -> usize {
+    if p.*.nodeCount == MAX_NODES { problem(p, "too large") }
+    p.*.nodes[p.*.nodeCount] = Node.{ .kind = kind, .value = value, .first = NONE, .next = NONE, .min = 0, .max = 0, .greedy = true }
+    p.*.nodeCount += 1
+    return p.*.nodeCount - 1
+}
+
+fn more(p: *Parser) -> bool { return p.*.at < p.*.pattern.length }
+fn peek(p: *Parser) -> u8 { return p.*.pattern[p.*.at] }
+
+pub fn isSpace(byte: u8) -> bool { return byte == 32 || (byte >= 9 && byte <= 13) || (byte >= 28 && byte <= 31) }
+pub fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+pub fn isWord(byte: u8) -> bool { return isDigit(byte) || byte == 95 || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) }
+
+fn newClass(p: *Parser) -> usize {
+    if p.*.classCount == MAX_CLASSES { problem(p, "too many classes") }
+    const index = p.*.classCount
+    p.*.classCount += 1
+    var word: usize = 0
+    while word < 4 {
+        p.*.regex.*.classes[index * 4 + word] = 0
+        word += 1
+    }
+    return index
+}
+
+fn addByte(p: *Parser, index: usize, byte: usize) -> void {
+    const shift = @intCast(u64, byte % 64)
+    p.*.regex.*.classes[index * 4 + byte / 64] |= @intCast(u64, 1) << shift
+}
+
+// The bytes of \d, \w or \s (LETTER lowercase), or of their complements
+// (uppercase), into the class.
+fn addShorthand(p: *Parser, index: usize, letter: u8) -> void {
+    var byte: usize = 0
+    while byte < 256 {
+        const b = @intCast(u8, byte)
+        var inside = false
+        if letter == 100 || letter == 68 { inside = isDigit(b) }
+        if letter == 119 || letter == 87 { inside = isWord(b) }
+        if letter == 115 || letter == 83 { inside = isSpace(b) }
+        if letter < 97 { inside = !inside }
+        if inside { addByte(p, index, byte) }
+        byte += 1
+    }
+}
+
+fn isShorthand(letter: u8) -> bool { return letter == 100 || letter == 119 || letter == 115 || letter == 68 || letter == 87 || letter == 83 }
+
+// The byte an escape stands for (the letter after the backslash).
+fn escapedByte(letter: u8) -> u8 {
+    if letter == 110 { return 10 }
+    if letter == 116 { return 9 }
+    if letter == 114 { return 13 }
+    if letter == 102 { return 12 }
+    if letter == 118 { return 11 }
+    if letter == 48 { return 0 }
+    return letter
+}
+
+fn parseClass(p: *Parser) -> usize {
+    const index = newClass(p)
+    var negated = false
+    if more(p) && peek(p) == 94 {
+        negated = true
+        p.*.at += 1
+    }
+    var first = true
+    while true {
+        if !more(p) { problem(p, "unterminated class") }
+        var byte = peek(p)
+        if byte == 93 && !first { break }
+        first = false
+        p.*.at += 1
+        if byte == 92 {
+            if !more(p) { problem(p, "trailing backslash") }
+            const letter = peek(p)
+            p.*.at += 1
+            if isShorthand(letter) {
+                addShorthand(p, index, letter)
+                continue
+            }
+            if letter == 98 { problem(p, "\\b in a class") }
+            byte = escapedByte(letter)
+        }
+        var last = byte
+        if p.*.at + 1 < p.*.pattern.length && peek(p) == 45 && p.*.pattern[p.*.at + 1] != 93 {
+            p.*.at += 1
+            last = peek(p)
+            p.*.at += 1
+            if last == 92 {
+                if !more(p) { problem(p, "trailing backslash") }
+                last = escapedByte(peek(p))
+                p.*.at += 1
+            }
+            if last < byte { problem(p, "bad range") }
+        }
+        var each = @intCast(usize, byte)
+        while each <= @intCast(usize, last) {
+            addByte(p, index, each)
+            each += 1
+        }
+    }
+    p.*.at += 1
+    if negated {
+        var word: usize = 0
+        while word < 4 {
+            p.*.regex.*.classes[index * 4 + word] = ~p.*.regex.*.classes[index * 4 + word]
+            word += 1
+        }
+    }
+    return index
+}
+
+fn parseAtom(p: *Parser) -> usize {
+    const byte = peek(p)
+    p.*.at += 1
+    if byte == 40 {
+        var kind = N_GROUP
+        var value: usize = 0
+        if more(p) && peek(p) == 63 {
+            if p.*.at + 1 >= p.*.pattern.length { problem(p, "bad group") }
+            const what = p.*.pattern[p.*.at + 1]
+            if what == 58 {
+                kind = N_SEQUENCE
+            } else if what == 61 {
+                kind = N_AHEAD
+            } else if what == 33 {
+                kind = N_NOT_AHEAD
+            } else {
+                problem(p, "unknown group")
+            }
+            p.*.at += 2
+        } else {
+            p.*.regex.*.groups += 1
+            value = p.*.regex.*.groups
+        }
+        const inner = parseAlternation(p)
+        if !more(p) || peek(p) != 41 { problem(p, "missing )") }
+        p.*.at += 1
+        if kind == N_SEQUENCE { return inner }
+        const node = newNode(p, kind, value)
+        p.*.nodes[node].first = inner
+        return node
+    }
+    if byte == 91 { return newNode(p, N_CLASS, parseClass(p)) }
+    if byte == 46 { return newNode(p, N_ANY, 0) }
+    if byte == 94 { return newNode(p, N_START, 0) }
+    if byte == 36 { return newNode(p, N_END, 0) }
+    if byte == 42 || byte == 43 || byte == 63 { problem(p, "nothing to repeat") }
+    if byte == 92 {
+        if !more(p) { problem(p, "trailing backslash") }
+        const letter = peek(p)
+        p.*.at += 1
+        if isShorthand(letter) {
+            const index = newClass(p)
+            addShorthand(p, index, letter)
+            return newNode(p, N_CLASS, index)
+        }
+        if isWord(letter) && letter != 110 && letter != 116 && letter != 114 && letter != 102 && letter != 118 && letter != 48 {
+            problem(p, "unsupported escape")
+        }
+        return newNode(p, N_CHAR, @intCast(usize, escapedByte(letter)))
+    }
+    return newNode(p, N_CHAR, @intCast(usize, byte))
+}
+
+// A number at the parser, or NONE.
+fn parseNumber(p: *Parser) -> usize {
+    if !more(p) || !isDigit(peek(p)) { return NONE }
+    var value: usize = 0
+    while more(p) && isDigit(peek(p)) {
+        value = value * 10 + @intCast(usize, peek(p) - 48)
+        p.*.at += 1
+    }
+    return value
+}
+
+fn parseRepeat(p: *Parser) -> usize {
+    var atom = parseAtom(p)
+    while more(p) {
+        const byte = peek(p)
+        var min: usize = 0
+        var max: usize = INFINITE
+        if byte == 42 {
+            p.*.at += 1
+        } else if byte == 43 {
+            min = 1
+            p.*.at += 1
+        } else if byte == 63 {
+            max = 1
+            p.*.at += 1
+        } else if byte == 123 {
+            // {n}, {n,}, {,m}, {n,m}; anything else is the brace itself.
+            const saved = p.*.at
+            p.*.at += 1
+            const low = parseNumber(p)
+            var high = low
+            var comma = false
+            if more(p) && peek(p) == 44 {
+                comma = true
+                p.*.at += 1
+                high = parseNumber(p)
+                if high == NONE { high = INFINITE }
+            }
+            if !more(p) || peek(p) != 125 || (low == NONE && !comma) {
+                p.*.at = saved
+                break
+            }
+            p.*.at += 1
+            min = if low == NONE { 0 } else { low }
+            max = high
+        } else {
+            break
+        }
+        var greedy = true
+        if more(p) && peek(p) == 63 {
+            greedy = false
+            p.*.at += 1
+        }
+        const node = newNode(p, N_REPEAT, 0)
+        p.*.nodes[node].first = atom
+        p.*.nodes[node].min = min
+        p.*.nodes[node].max = max
+        p.*.nodes[node].greedy = greedy
+        atom = node
+    }
+    return atom
+}
+
+fn parseSequence(p: *Parser) -> usize {
+    const sequence = newNode(p, N_SEQUENCE, 0)
+    var last = NONE
+    while more(p) && peek(p) != 124 && peek(p) != 41 {
+        const item = parseRepeat(p)
+        if last == NONE {
+            p.*.nodes[sequence].first = item
+        } else {
+            p.*.nodes[last].next = item
+        }
+        last = item
+    }
+    return sequence
+}
+
+fn parseAlternation(p: *Parser) -> usize {
+    const first = parseSequence(p)
+    if !more(p) || peek(p) != 124 { return first }
+    const alternation = newNode(p, N_ALTERNATION, 0)
+    p.*.nodes[alternation].first = first
+    var last = first
+    while more(p) && peek(p) == 124 {
+        p.*.at += 1
+        const next = parseSequence(p)
+        p.*.nodes[last].next = next
+        last = next
+    }
+    return alternation
+}
+
+// Whether the node can match the empty text (a loop of such a node is
+// not supported).
+fn nullable(p: *Parser, node: usize) -> bool {
+    const n = p.*.nodes[node]
+    if n.kind == N_CHAR || n.kind == N_ANY || n.kind == N_CLASS { return false }
+    if n.kind == N_GROUP { return nullable(p, n.first) }
+    if n.kind == N_REPEAT { return n.min == 0 || nullable(p, n.first) }
+    if n.kind == N_SEQUENCE {
+        var child = n.first
+        while child != NONE {
+            if !nullable(p, child) { return false }
+            child = p.*.nodes[child].next
+        }
+        return true
+    }
+    if n.kind == N_ALTERNATION {
+        var child = n.first
+        while child != NONE {
+            if nullable(p, child) { return true }
+            child = p.*.nodes[child].next
+        }
+        return false
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The program.
+
+fn emit(p: *Parser, op: u8, a: usize, b: usize) -> usize {
+    const r = p.*.regex
+    if r.*.count == MAX_CODE { problem(p, "too large a program") }
+    r.*.code[r.*.count] = Instruction.{ .op = op, .a = a, .b = b }
+    r.*.count += 1
+    return r.*.count - 1
+}
+
+fn here(p: *Parser) -> usize { return p.*.regex.*.count }
+
+fn setA(p: *Parser, at: usize, value: usize) -> void { p.*.regex.*.code[at].a = value }
+fn setB(p: *Parser, at: usize, value: usize) -> void { p.*.regex.*.code[at].b = value }
+
+fn generateAlternatives(p: *Parser, child: usize) -> void {
+    if p.*.nodes[child].next == NONE {
+        generate(p, child)
+        return
+    }
+    const split = emit(p, OP_SPLIT, 0, 0)
+    setA(p, split, here(p))
+    generate(p, child)
+    const jump = emit(p, OP_JUMP, 0, 0)
+    setB(p, split, here(p))
+    generateAlternatives(p, p.*.nodes[child].next)
+    setA(p, jump, here(p))
+}
+
+fn generate(p: *Parser, node: usize) -> void {
+    const n = p.*.nodes[node]
+    if n.kind == N_CHAR {
+        const ignored = emit(p, OP_CHAR, n.value, 0)
+    } else if n.kind == N_ANY {
+        const ignored = emit(p, OP_ANY, 0, 0)
+    } else if n.kind == N_CLASS {
+        const ignored = emit(p, OP_CLASS, n.value, 0)
+    } else if n.kind == N_START {
+        const ignored = emit(p, OP_LINE_START, 0, 0)
+    } else if n.kind == N_END {
+        const ignored = emit(p, OP_LINE_END, 0, 0)
+    } else if n.kind == N_SEQUENCE {
+        var child = n.first
+        while child != NONE {
+            generate(p, child)
+            child = p.*.nodes[child].next
+        }
+    } else if n.kind == N_ALTERNATION {
+        generateAlternatives(p, n.first)
+    } else if n.kind == N_GROUP {
+        const opening = emit(p, OP_SAVE, n.value * 2, 0)
+        generate(p, n.first)
+        const closing = emit(p, OP_SAVE, n.value * 2 + 1, 0)
+    } else if n.kind == N_AHEAD || n.kind == N_NOT_AHEAD {
+        const look = emit(p, if n.kind == N_AHEAD { OP_AHEAD } else { OP_NOT_AHEAD }, 0, 0)
+        generate(p, n.first)
+        const ending = emit(p, OP_MATCH, 0, 0)
+        setA(p, look, here(p))
+    } else {
+        var count: usize = 0
+        while count < n.min {
+            generate(p, n.first)
+            count += 1
+        }
+        if n.max == INFINITE {
+            if nullable(p, n.first) { problem(p, "a loop that can match nothing") }
+            const loop = emit(p, OP_SPLIT, 0, 0)
+            const body = here(p)
+            generate(p, n.first)
+            const back = emit(p, OP_JUMP, loop, 0)
+            if n.greedy {
+                setA(p, loop, body)
+                setB(p, loop, here(p))
+            } else {
+                setA(p, loop, here(p))
+                setB(p, loop, body)
+            }
+        } else {
+            // Each optional copy inside the one before: x{0,2} is (x(x)?)?.
+            var splits: [64]usize = undefined
+            var optional: usize = 0
+            while count < n.max {
+                if optional == 64 { problem(p, "too large a repeat") }
+                splits[optional] = emit(p, OP_SPLIT, 0, 0)
+                if n.greedy { setA(p, splits[optional], here(p)) } else { setB(p, splits[optional], here(p)) }
+                optional += 1
+                generate(p, n.first)
+                count += 1
+            }
+            var index: usize = 0
+            while index < optional {
+                if n.greedy { setB(p, splits[index], here(p)) } else { setA(p, splits[index], here(p)) }
+                index += 1
+            }
+        }
+    }
+}
+
+pub fn compile(pattern: []const u8, flags: u8) -> *Regex {
+    var regex: *Regex = undefined
+    var nodes: [*]Node = undefined
+    unsafe {
+        regex = @ptrFromInt(*Regex, s.alloc(@sizeOf(Regex)))
+        regex.*.code = @ptrFromInt([*]Instruction, s.alloc(MAX_CODE * @sizeOf(Instruction)))
+        regex.*.classes = @ptrFromInt([*]u64, s.alloc(MAX_CLASSES * 32))
+        nodes = @ptrFromInt([*]Node, s.alloc(MAX_NODES * @sizeOf(Node)))
+    }
+    regex.*.count = 0
+    regex.*.groups = 0
+    regex.*.flags = flags
+    var parser = Parser.{ .pattern = pattern, .at = 0, .nodes = nodes, .nodeCount = 0, .regex = regex, .classCount = 0 }
+    const root = parseAlternation(&parser)
+    if parser.at < pattern.length { problem(&parser, "unbalanced )") }
+    const opening = emit(&parser, OP_SAVE, 0, 0)
+    generate(&parser, root)
+    const closing = emit(&parser, OP_SAVE, 1, 0)
+    const ending = emit(&parser, OP_MATCH, 0, 0)
+    return regex
+}
+
+// ---------------------------------------------------------------------------
+// The machine: what is left to try kept on one stack, a choice to come
+// back to or the old value of a group's bound to put back.
+
+const Frame = struct {
+    pc: usize
+    at: usize
+    slot: usize
+    old: i64
+    restore: bool
+}
+
+const MAX_FRAMES: usize = 8388608
+
+var frames: [*]Frame = undefined
+var frameTop: usize = 0
+var framesReady: bool = false
+var lookSpans: [*]i64 = undefined
+
+fn push(frame: Frame) -> void {
+    if frameTop == MAX_FRAMES { s.fail("regular expression: too much backtracking") }
+    frames[frameTop] = frame
+    frameTop += 1
+}
+
+fn inClass(r: *const Regex, index: usize, byte: u8) -> bool {
+    const b = @intCast(usize, byte)
+    return (r.*.classes[index * 4 + b / 64] >> @intCast(u64, b % 64)) & 1 == 1
+}
+
+// From instruction PC at AT: where the match ends, or -1.
+fn run(r: *const Regex, text: []const u8, startPc: usize, startAt: usize, spans: [*]i64) -> i64 {
+    const base = frameTop
+    push(Frame.{ .pc = startPc, .at = startAt, .slot = 0, .old = 0, .restore = false })
+    const multiline = (r.*.flags & MULTILINE) != 0
+    const dotall = (r.*.flags & DOTALL) != 0
+    while frameTop > base {
+        frameTop -= 1
+        const frame = frames[frameTop]
+        if frame.restore {
+            spans[frame.slot] = frame.old
+            continue
+        }
+        var pc = frame.pc
+        var at = frame.at
+        while true {
+            const instruction = r.*.code[pc]
+            const op = instruction.op
+            if op == OP_CHAR {
+                if at < text.length && @intCast(usize, text[at]) == instruction.a {
+                    pc += 1
+                    at += 1
+                    continue
+                }
+                break
+            } else if op == OP_ANY {
+                if at < text.length && (dotall || text[at] != 10) {
+                    pc += 1
+                    at += 1
+                    continue
+                }
+                break
+            } else if op == OP_CLASS {
+                if at < text.length && inClass(r, instruction.a, text[at]) {
+                    pc += 1
+                    at += 1
+                    continue
+                }
+                break
+            } else if op == OP_SPLIT {
+                push(Frame.{ .pc = instruction.b, .at = at, .slot = 0, .old = 0, .restore = false })
+                pc = instruction.a
+            } else if op == OP_JUMP {
+                pc = instruction.a
+            } else if op == OP_SAVE {
+                push(Frame.{ .pc = 0, .at = 0, .slot = instruction.a, .old = spans[instruction.a], .restore = true })
+                spans[instruction.a] = @intCast(i64, at)
+                pc += 1
+            } else if op == OP_LINE_START {
+                if at == 0 || (multiline && text[at - 1] == 10) {
+                    pc += 1
+                    continue
+                }
+                break
+            } else if op == OP_LINE_END {
+                if at == text.length || (text[at] == 10 && (multiline || at + 1 == text.length)) {
+                    pc += 1
+                    continue
+                }
+                break
+            } else if op == OP_AHEAD || op == OP_NOT_AHEAD {
+                const found = run(r, text, pc + 1, at, lookSpans) >= 0
+                if found != (op == OP_AHEAD) { break }
+                pc = instruction.a
+            } else {
+                frameTop = base
+                return @intCast(i64, at)
+            }
+        }
+    }
+    return -1
+}
+
+fn ready() -> void {
+    if framesReady { return }
+    unsafe {
+        frames = @ptrFromInt([*]Frame, s.alloc(MAX_FRAMES * @sizeOf(Frame)))
+        lookSpans = @ptrFromInt([*]i64, s.alloc(256 * 8))
+    }
+    framesReady = true
+}
+
+fn newSpans(r: *const Regex) -> [*]i64 {
+    var spans: [*]i64 = undefined
+    unsafe { spans = @ptrFromInt([*]i64, s.alloc((r.*.groups + 1) * 16)) }
+    return spans
+}
+
+fn clearSpans(r: *const Regex, spans: [*]i64) -> void {
+    var index: usize = 0
+    while index < (r.*.groups + 1) * 2 {
+        spans[index] = -1
+        index += 1
+    }
+}
+
+// The match starting at AT exactly (Python's match, from a position).
+pub fn matchAt(r: *const Regex, text: []const u8, at: usize) -> Match {
+    ready()
+    const spans = newSpans(r)
+    clearSpans(r, spans)
+    const end = run(r, text, 0, at, spans)
+    return Match.{ .found = end >= 0, .spans = spans }
+}
+
+// The leftmost match starting at FROM or later (Python's search).
+pub fn search(r: *const Regex, text: []const u8, from: usize) -> Match {
+    ready()
+    const spans = newSpans(r)
+    var at = from
+    while at <= text.length {
+        clearSpans(r, spans)
+        if run(r, text, 0, at, spans) >= 0 { return Match.{ .found = true, .spans = spans } }
+        at += 1
+    }
+    return Match.{ .found = false, .spans = spans }
+}
+
+pub fn start(m: Match, group: usize) -> usize { return @intCast(usize, m.spans[group * 2]) }
+pub fn end(m: Match, group: usize) -> usize { return @intCast(usize, m.spans[group * 2 + 1]) }
+pub fn took(m: Match, group: usize) -> bool { return m.spans[group * 2] >= 0 && m.spans[group * 2 + 1] >= 0 }
+
+// The text of GROUP ("" when it took no part, as findall has it).
+pub fn group(m: Match, text: []const u8, group: usize) -> []const u8 {
+    if !took(m, group) { return text[0..0] }
+    return text[start(m, group)..end(m, group)]
+}
+
+// Where the next search goes on after M (one further on after an empty
+// match).
+pub fn after(m: Match) -> usize {
+    const finish = end(m, 0)
+    return if finish == start(m, 0) { finish + 1 } else { finish }
+}
+
+// ---------------------------------------------------------------------------
+// Text made by matching.
+
+fn copyInto(at: usize, text: []const u8) -> void {
+    var index: usize = 0
+    while index < text.length {
+        s.put8(at + index, text[index])
+        index += 1
+    }
+}
+
+// TEXT with every match made REPLACEMENT, taken literally (Python's sub,
+// with a replacement holding no backslash).
+pub fn sub(r: *const Regex, text: []const u8, replacement: []const u8) -> []const u8 {
+    // First the matches, then the text in one piece.
+    var starts: [*]usize = undefined
+    var ends: [*]usize = undefined
+    unsafe {
+        starts = @ptrFromInt([*]usize, s.alloc((text.length + 2) * 8))
+        ends = @ptrFromInt([*]usize, s.alloc((text.length + 2) * 8))
+    }
+    var count: usize = 0
+    var at: usize = 0
+    while at <= text.length {
+        const m = search(r, text, at)
+        if !m.found { break }
+        starts[count] = start(m, 0)
+        ends[count] = end(m, 0)
+        count += 1
+        at = after(m)
+    }
+    if count == 0 { return text }
+    var size = text.length
+    var index: usize = 0
+    while index < count {
+        size = size - (ends[index] - starts[index]) + replacement.length
+        index += 1
+    }
+    const result = s.alloc(size + 1)
+    var written: usize = 0
+    var from: usize = 0
+    index = 0
+    while index < count {
+        copyInto(result + written, text[from..starts[index]])
+        written += starts[index] - from
+        copyInto(result + written, replacement)
+        written += replacement.length
+        from = ends[index]
+        index += 1
+    }
+    copyInto(result + written, text[from..text.length])
+    written += text.length - from
+    s.put8(result + written, 0)
+    return s.bytes(result, written)
+}
+
+pub const Pieces = struct {
+    items: [*][]const u8
+    count: usize
+}
+
+// TEXT cut at the matches (Python's split, for a pattern without groups).
+pub fn split(r: *const Regex, text: []const u8) -> Pieces {
+    var items: [*][]const u8 = undefined
+    unsafe { items = @ptrFromInt([*][]const u8, s.alloc((text.length + 2) * 16)) }
+    var count: usize = 0
+    var from: usize = 0
+    var at: usize = 0
+    while at <= text.length {
+        const m = search(r, text, at)
+        if !m.found { break }
+        items[count] = text[from..start(m, 0)]
+        count += 1
+        from = end(m, 0)
+        at = after(m)
+    }
+    items[count] = text[from..text.length]
+    count += 1
+    return Pieces.{ .items = items, .count = count }
+}
+
+// TEXT with every occurrence of NEEDLE made REPLACEMENT (Python's
+// str.replace).
+pub fn replaceAll(text: []const u8, needle: []const u8, replacement: []const u8) -> []const u8 {
+    if needle.length == 0 || needle.length > text.length { return text }
+    var count: usize = 0
+    var at: usize = 0
+    while at + needle.length <= text.length {
+        if s.same(text[at..at + needle.length], needle) {
+            count += 1
+            at += needle.length
+        } else {
+            at += 1
+        }
+    }
+    if count == 0 { return text }
+    const size = text.length - count * needle.length + count * replacement.length
+    const result = s.alloc(size + 1)
+    var written: usize = 0
+    var from: usize = 0
+    at = 0
+    while at + needle.length <= text.length {
+        if s.same(text[at..at + needle.length], needle) {
+            copyInto(result + written, text[from..at])
+            written += at - from
+            copyInto(result + written, replacement)
+            written += replacement.length
+            at += needle.length
+            from = at
+        } else {
+            at += 1
+        }
+    }
+    copyInto(result + written, text[from..text.length])
+    written += text.length - from
+    s.put8(result + written, 0)
+    return s.bytes(result, written)
+}
+
+// TEXT without the space at its ends (Python's str.strip()).
+pub fn strip(text: []const u8) -> []const u8 {
+    var first: usize = 0
+    var last = text.length
+    while first < last && isSpace(text[first]) { first += 1 }
+    while last > first && isSpace(text[last - 1]) { last -= 1 }
+    return text[first..last]
+}
