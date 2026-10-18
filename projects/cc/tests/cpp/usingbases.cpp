@@ -46,7 +46,13 @@ const char *kind(const int *) { return "const int *"; }
 const char *kind(unsigned char *) { return "bytes"; }
 const char *kind(const unsigned char *) { return "const bytes"; }
 
+struct Derived : SArray<4, int> {};
+
 int main(int argc, char **argv) {
+    Derived der;
+    der.push(5);
+    static_assert(std::is_same_v<decltype(der.data()), int *>);
+    printf("%d %d\n", der.size(), der.data()[0]);
     SArray<4, int> a;
     a.push(7);
     const SArray<4, int> &ca = a;
