@@ -25,10 +25,27 @@ struct LineHeight : NumericOrKeyword<int> {
 };
 }
 
+// A dependent base's member is no name in the template (the namespace
+// css is meant in Style::Number's base, though the base has a member css).
+namespace css {
+template<class T> struct Number { using Raw = T; };
+}
+namespace style {
+template<class C> struct Primitive {
+    using css = C;
+    typename css::Raw raw { 7 };
+};
+template<class T> struct Number : Primitive<css::Number<T>> {
+    using Base = Primitive<css::Number<T>>;
+    typename Base::css::Raw twice() const { return this->raw * 2; }
+};
+}
+
 int main(int argc, char **argv)
 {
     style::LineHeight height;
     style::Percentage<float> outside { 1.5f };
-    printf("%d %d\n", height.sum(), (int)(outside.value * 2));
+    style::Number<int> number;
+    printf("%d %d %d\n", height.sum(), (int)(outside.value * 2), number.twice());
     return argc - 2;
 }
