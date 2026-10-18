@@ -68,6 +68,15 @@ echo "ok   a C++ object links with the library and runs"
 cmp -s "$tests/shared/expected" "$work/shared.out" || fail "shared prints otherwise (expected < > got): $(diff "$tests/shared/expected" "$work/shared.out" | head -6)"
 echo "ok   the statics of inline functions are one object across files"
 
+# Lambdas of two files numbered alike (each its file's first in a
+# class), put into one template: each file's instance calls its own.
+"$cc" -c -o "$work/lambdaunits_a.o" "$tests/lambdaunits/a.cpp" 2> "$work/lambdaunits.err" || fail "-c of lambdaunits/a.cpp: $(head -3 "$work/lambdaunits.err")"
+"$cc" -c -o "$work/lambdaunits_b.o" "$tests/lambdaunits/b.cpp" 2>> "$work/lambdaunits.err" || fail "-c of lambdaunits/b.cpp: $(head -3 "$work/lambdaunits.err")"
+"$cc" -x c++ -o "$work/lambdaunits" "$work/lambdaunits_a.o" "$work/lambdaunits_b.o" 2>> "$work/lambdaunits.err" || fail "linking lambdaunits: $(head -3 "$work/lambdaunits.err")"
+"$work/lambdaunits" > "$work/lambdaunits.out" || fail "lambdaunits exits with $?"
+cmp -s "$tests/lambdaunits/expected" "$work/lambdaunits.out" || fail "lambdaunits prints otherwise (expected < > got): $(diff "$tests/lambdaunits/expected" "$work/lambdaunits.out" | head -6)"
+echo "ok   the lambdas of two files are classes of their own"
+
 # The same programs on mlxlibc alone.
 tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/lib" > /dev/null
 lib="$work/lib/libmlxc.so.1"
