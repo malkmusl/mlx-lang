@@ -27,9 +27,9 @@ there are no headers written by hand.
 | `api/` | The interface in Mlx, a module per header (ICU's names and API level, 74); `ugenerated.mlx` (scripts, blocks) is made by `generate.mlx`; the formatting headers WebKit's Intl includes (`udat.h`, `udatpg.h`, `unum.h`, `unumberformatter.h`, `unumberrangeformatter.h`, `upluralrules.h`, `ulistformatter.h`, `ureldatefmt.h`, `uldnames.h`, `udateintervalformat.h`, `ucurr.h`, `unumsys.h`, `ures.h` and the headers they include) are declared, not implemented yet |
 | `uca/`, `idna/` | The Unicode Collation Algorithm's table (DUCET) and its tests; the IDNA mapping table and its tests |
 | `tz/` | The IANA time zone database 2026c (`tzdata.zi`, the form zic reads; `zone.tab`, the zones of each country) |
-| `cldr/` | CLDR 48 (JSON): likely subtags, the aliases of languages, scripts, regions and variants, the BCP 47 keys and types, ISO 3166 codes, the available locales; `packages/`, CLDR's npm packages (core, dates, numbers, misc, locale names, units); `collation/`: CLDR 48's collation data (its XML, a file a locale) and the root's radical-stroke order of Han (`radicals.txt`, the `[radical]` lines of CLDR's FractionalUCA) |
+| `cldr/` | CLDR 48 (JSON): likely subtags, the aliases of languages, scripts, regions and variants, the BCP 47 keys and types, ISO 3166 codes, the available locales; `packages/`, CLDR's npm packages (core, dates, numbers, misc, locale names, units, and the calendars other than the Gregorian: `cldr-cal-*`); `collation/`: CLDR 48's collation data (its XML, a file a locale) and the root's radical-stroke order of Han (`radicals.txt`, the `[radical]` lines of CLDR's FractionalUCA) |
 | `cldrgenerate.mlx` | `cldr-generate CLDR OUT`: writes `locales.mlx`, CLDR's data as sorted tables |
-| `cldrdata.mlx` | `cldr-data PACKAGES OUT`: writes `cldr.dat` (`mlx-out/share/mlx-unicode`), the formatters' locale data of CLDR's packages, each locale's keys and values where they differ from its parent's |
+| `cldrdata.mlx` | `cldr-data PACKAGES OUT`: writes `cldr.dat` (`mlx-out/share/mlx-unicode`), the formatters' locale data of CLDR's packages, each locale's keys and values where they differ from its parent's, a calendar's where they differ from the calendar it falls back on (an Islamic one's from `islamic`, `ethiopic-amete-alem`'s from `ethiopic`, `dangi`'s from `chinese`, the others' from `gregorian`) |
 | `measureunits.mlx` | Measure units for `unumf`: ICU's built-in units and core unit identifiers (products, powers, SI and binary prefixes, `-per-`), their patterns by plural form from CLDR's units (built-in ones their own; others put together of the per, times, power and prefix patterns, as UTS #35 says) |
 | `tzgenerate.mlx` | `tz-generate TZ OUT`: writes `timezones.mlx`, every zone's transitions worked out from its rules as zic does (through 2037, then the rules in force) |
 | `unicode.mlx` | The library's root (`--plugin --stack-arena`) |
@@ -42,7 +42,9 @@ there are no headers written by hand.
 | `collationelements.mlx` | Collation elements (32-bit primaries, room between the root's weights for a tailoring's), the root's (contractions, discontiguous ones too, implicit weights, Han in radical-stroke order), its script groups; a tailoring's mappings (contractions, prefixes) |
 | `collationbuilder.mlx` | Rules (UTS #35 Part 5, as ICU reads them: resets, `[before n]`, the special positions, relations, starred lists, prefixes, extensions, `[import]`, `[reorder]`, `[suppressContractions]`, the settings) into a tailoring, as ICU's CollationBuilder makes it; a locale's chain of collation data (likely script, truncation, CLDR's parents for collation) |
 | `collationgenerate.mlx` | `collation-generate OUT RADICALS XML...`: writes `collationrules.mlx`, each locale's default type and each type's rules (as ICU has them: Chinese's short ones, no provisional or unconfirmed ones), and the Han order |
-| `calendar.mlx` | `ucal.h`: the Gregorian calendar (Julian before its change, 1582 or as set), fields resolved as ICU resolves them, `add`, `roll`, limits, differences, times a transition skips or repeats; zone IDs (canonical, IANA, custom `GMT+hh:mm`), the host's and the default zone, enumerations of zones |
+| `calendar.mlx` | `ucal.h`: the Gregorian calendar (Julian before its change, 1582 or as set) and ICU's others (`japanese`, `buddhist`, `roc`, `persian`, the Islamic ones, `hebrew`, `chinese`, `dangi`, `indian`, `coptic`, `ethiopic`, `ethiopic-amete-alem`, `iso8601`) by the `calendar` keyword or the region's preference, fields resolved as ICU resolves them, `add`, `roll`, limits, differences, times a transition skips or repeats; zone IDs (canonical, IANA, custom `GMT+hh:mm`), the host's and the default zone, enumerations of zones |
+| `calendars.mlx` | The arithmetic of the calendars other than the Gregorian, as ICU 74 does it: Hebrew (the molad and the postponements), Islamic (civil, tabular, Umm al-Qura with ICU's tables, astronomical), Persian, Indian, Coptic and Ethiopic, Chinese and Korean (new moons and solar terms, the leap month) |
+| `astro.mlx` | The sun's longitude and the moon's age, and the moments they reach an angle, as ICU's CalendarAstronomer reckons them |
 | `zones.mlx` | The time zones at run time: an ID's zone, the offsets at a moment, the transitions |
 | `localeid.mlx` | `uloc.h`: ICU's locale IDs (their parts, names, keywords), BCP 47 tags to and from them (the extensions as keywords, legacy tags), likely subtags (UTS #35), the BCP 47 keys and types and their legacy names, orientation, ISO codes |
 | `locale.mlx` | The default locale (from the environment), a locale's language, region (its own, `rg`, or the likely one) and keywords, the region's week (CLDR's week data) |
@@ -78,6 +80,19 @@ from C programs compiled by mlx-cc:
 - locale IDs and tags: tests/locales.c against ICU's results
   (locales.expected)
 - the calendar: tests/calendar.c against what ICU gives (calendar.expected)
+- the calendars other than the Gregorian: tests/calendars.c (every
+  calendar's fields over three thousand years, `add`, `roll`, limits,
+  the eras and the leap months) prints what ICU 74 prints but for
+  the start of Japanese's Meiji era (CLDR 48's 1868-10-23, ICU 74's
+  1868-09-08) and Saudi Arabia's preferred calendar; tests/calendarformats.c, dates of
+  every calendar formatted the way JavaScriptCore formats them, against
+  ICU 74 the same but where CLDR 48's data is not CLDR 44's (Śaka's
+  era, Ethiopic's and Coptic's era names, `Anno Hegirae`, some
+  patterns); numbering systems a pattern names for a field (`hanidays`,
+  `hebr`) are not used, as JavaScriptCore with ICU loses them too
+- zones' names (`ucal_getTimeZoneDisplayName`): tests/zonenames.c, the
+  same as ICU 74 but where CLDR 48's names are not CLDR 44's (Japanese's
+  American zones, Samoa's, Arabic's digits)
 - measure units: tests/units.c (every unit JavaScriptCore's
   Intl.NumberFormat takes, X-per-Y compounds, the stems of units and
   their widths, Intl.DurationFormat's skeletons, ranges) against ICU 74:
@@ -95,8 +110,8 @@ from C programs compiled by mlx-cc:
 - What WebKit uses beyond these:
   - searching by collation (`usearch`); the sets of a collator
     (`ucol_getTailoredSet`, `ucol_getContractionsAndExpansions`);
-  - calendars other than the Gregorian; time zone names other than the
-    localized GMT format (`GMT+01:00`); Windows' zone IDs;
+  - Windows' zone IDs; parsing leap months and cyclic years of the
+    Chinese calendars;
   - formatting for `Intl` (`udat`, `unum`, `unumf`, `uplrules`, `ulistfmt`, `ureldatefmt`), which needs locale data;
   - display names of locales (`uloc_getDisplay*`, `uldn`: the codes stand
     for themselves until CLDR's names are here);
