@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds mlxlibcpp (projects/libcpp): the C++ standard library for mlx-cc,
+# Builds mlxlibcpp (compiler/libcpp): the C++ standard library for mlx-cc,
 # as a static library mlx-cc links into every C++ program by itself.
 #
 #   tools/build_mlxlibcpp.sh [options]
@@ -30,11 +30,11 @@ done
 [[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
 mkdir -p "$out/obj"
 
-"$compiler" --quiet projects/cc/main.mlx -o "$out/mlx-cc"
-"$compiler" --quiet projects/cc/ar.mlx -o "$out/mlx-ar"
-export MLX_CC_INCLUDE="$repo_root/projects/cc/include"
+"$compiler" --quiet compiler/cc/main.mlx -o "$out/mlx-cc"
+"$compiler" --quiet compiler/cc/ar.mlx -o "$out/mlx-ar"
+export MLX_CC_INCLUDE="$repo_root/compiler/cc/include"
 objects=()
-for source in projects/libcpp/*.cpp; do
+for source in compiler/libcpp/*.cpp; do
     name=$(basename "$source" .cpp)
     "$out/mlx-cc" -c -o "$out/obj/$name.o" "$source"
     objects+=("$out/obj/$name.o")

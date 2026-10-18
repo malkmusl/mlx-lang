@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compares libm.so.6 built from projects/libc/libm.mlx with the system's
+"""Compares libm.so.6 built from compiler/libc/libm.mlx with the system's
 libm through ctypes: the same calls answer the same bits, or within a few
 units in the last place where the algorithms differ (the hyperbolic and
 inverse functions, powers with fractional exponents).
