@@ -114,9 +114,6 @@ from C programs compiled by mlx-cc:
     (`ucol_getTailoredSet`, `ucol_getContractionsAndExpansions`);
   - Windows' zone IDs; parsing leap months and cyclic years of the
     Chinese calendars;
-  - formatting for `Intl` (`udat`, `unum`, `unumf`, `uplrules`, `ulistfmt`, `ureldatefmt`), which needs locale data;
-  - display names of locales (`uloc_getDisplay*`, `uldn`: the codes stand
-    for themselves until CLDR's names are here);
   - bidi (`ubidi`);
   - legacy charset conversion (`ucnv`); detecting single-byte charsets
     other than Latin-1 and windows-1252 (ICU rates them by n-gram
