@@ -12,5 +12,7 @@ int main(void) {
     printf("scx 0x3001 hira=%d han=%d latn=%d; ccc 0301=%d lccc 1E08=%d tccc 1E08=%d, block 0041=%d ->%d\n", uscript_hasScript(0x3001, USCRIPT_HIRAGANA), uscript_hasScript(0x3001, USCRIPT_HAN), uscript_hasScript(0x3001, USCRIPT_LATIN), u_getCombiningClass(0x301), u_getIntPropertyValue(0x1E08, UCHAR_LEAD_CANONICAL_COMBINING_CLASS), u_getIntPropertyValue(0x1E08, UCHAR_TRAIL_CANONICAL_COMBINING_CLASS), ublock_getCode('A'), UBLOCK_BASIC_LATIN);
     printf("num 0x00BD=%g 0x0663=%g digit=%d, isprint %d %d, alpha %d, error %s\n", u_getNumericValue(0xBD), u_getNumericValue(0x663), u_charDigitValue(0x669), u_isprint('a'), u_isprint(7), u_isalpha(0x4E00), u_errorName(U_BUFFER_OVERFLOW_ERROR));
     printf("mirror ( -> %c, gcb 0D=%d wb A=%d sb .=%d vo 4E00=%d\n", (char)u_charMirror('('), u_getIntPropertyValue('\r', UCHAR_GRAPHEME_CLUSTER_BREAK), u_getIntPropertyValue('A', UCHAR_WORD_BREAK), u_getIntPropertyValue('.', UCHAR_SENTENCE_BREAK), u_getIntPropertyValue(0x4E00, UCHAR_VERTICAL_ORIENTATION));
+    /* ICU numbers the blocks in the order they came to it, not Blocks.txt's. */
+    printf("blocks 0370=%d 2700=%d 1D360=%d 1FA70=%d 11F00=%d 2EBF0=%d, %d %d\n", ublock_getCode(0x370), ublock_getCode(0x2700), ublock_getCode(0x1D360), ublock_getCode(0x1FA70), ublock_getCode(0x11F00), ublock_getCode(0x2EBF0), UBLOCK_DINGBATS, UBLOCK_SYMBOLS_AND_PICTOGRAPHS_EXTENDED_A);
     return 0;
 }
