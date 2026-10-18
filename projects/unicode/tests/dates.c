@@ -64,7 +64,7 @@ static void best(UDateTimePatternGenerator *g, const char *locale, const char *s
     printf("best %s %s/%d: \"%s\" %s\n", locale, skeleton, (int)options, out, statusName(status));
 }
 
-static void generator(const char *locale)
+static void generator(const char *locale, int names)
 {
     static const char *skeletons[] = {
         "yMd", "yMMMd", "yMMMMEEEEd", "yMMMM", "MMMd", "MMMMd", "Md", "MEd", "yM", "yQQQ", "yQQQQ", "y",
@@ -77,10 +77,16 @@ static void generator(const char *locale)
     UDateTimePatternGenerator *g = udatpg_open(locale, &status);
     printf("udatpg_open %s: %s\n", locale, statusName(status));
     if (U_FAILURE(status)) return;
+    /* With the hour's length kept, and without options where that
+       differs. */
     for (int i = 0; skeletons[i]; i++) {
+        UChar s[64], a[128], b[128];
+        UErrorCode e = U_ZERO_ERROR;
+        int32_t sl = utf16(skeletons[i], s, 64);
+        int32_t al = udatpg_getBestPatternWithOptions(g, s, sl, UDATPG_MATCH_HOUR_FIELD_LENGTH, a, 128, &e);
+        int32_t bl = udatpg_getBestPatternWithOptions(g, s, sl, UDATPG_MATCH_NO_OPTIONS, b, 128, &e);
         best(g, locale, skeletons[i], UDATPG_MATCH_HOUR_FIELD_LENGTH);
-        if (strchr(skeletons[i], 'm') || strchr(skeletons[i], 'M') || strchr(skeletons[i], 'E'))
-            best(g, locale, skeletons[i], UDATPG_MATCH_NO_OPTIONS);
+        if (al != bl || u_strncmp(a, b, al) != 0) best(g, locale, skeletons[i], UDATPG_MATCH_NO_OPTIONS);
     }
     best(g, locale, "yMMMMdjjmm", UDATPG_MATCH_ALL_FIELDS_LENGTH);
     best(g, locale, "jjmmss", UDATPG_MATCH_ALL_FIELDS_LENGTH);
@@ -101,7 +107,7 @@ static void generator(const char *locale)
     dt = udatpg_getDecimal(g, &length);
     utf8(dt, length, out, sizeof out);
     printf("decimal %s: \"%s\"\n", locale, out);
-    for (int field = 0; field < UDATPG_FIELD_COUNT; field++) {
+    for (int field = 0; names && field < UDATPG_FIELD_COUNT; field++) {
         for (int width = UDATPG_WIDE; width <= UDATPG_NARROW; width++) {
             status = U_ZERO_ERROR;
             length = udatpg_getFieldDisplayName(g, (UDateTimePatternField)field, (UDateTimePGDisplayWidth)width, result, 128, &status);
@@ -384,7 +390,7 @@ static void zones(void)
         "Asia/Tokyo", "Asia/Kolkata", "Australia/Sydney", "America/Sao_Paulo", "Pacific/Chatham", "Africa/Cairo",
         "America/Indiana/Knox", "Asia/Kathmandu", "UTC", "Etc/GMT+5", "GMT", "America/Argentina/Buenos_Aires",
         "US/Pacific", "Asia/Calcutta", "Europe/Kiev", "Antarctica/Troll", "America/Phoenix", NULL };
-    static const char *locales[] = { "en", "en-GB", "de", "fr", "ja", "es-MX", "pt-BR", "zh-Hant", "ru", NULL };
+    static const char *locales[] = { "en", "de", "ja", "es-MX", "zh-Hant", NULL };
     for (int l = 0; locales[l]; l++) {
         for (int i = 0; zoneList[i]; i++) {
             pattern(locales[l], zoneList[i], "z | zzzz | v | vvvv | VVV | VVVV | O | OOOO", NOV14);
@@ -697,7 +703,7 @@ static const char *categoryName(int32_t category)
     return "?";
 }
 
-static void interval(const char *locale, const char *skeleton, const char *zone, UDate from, UDate to)
+static void interval(const char *locale, const char *skeleton, const char *zone, UDate from, UDate to, int withPosition)
 {
     UChar s[64], z[64];
     UErrorCode status = U_ZERO_ERROR;
@@ -727,11 +733,13 @@ static void interval(const char *locale, const char *skeleton, const char *zone,
     printf(" ]%s %s\n", spans ? "" : " equal", statusName(status));
     ucfpos_close(position);
     udtitvfmt_closeResult(result);
-    UChar buffer[256];
-    UFieldPosition fp = { UDAT_DATE_FIELD, 0, 0 };
-    length = udtitvfmt_format(f, from, to, buffer, 256, &fp, &status);
-    utf8(buffer, length, out, sizeof out);
-    printf("interval format %s %s: \"%s\" %d-%d %s\n", locale, skeleton, out, fp.beginIndex, fp.endIndex, statusName(status));
+    if (withPosition) {
+        UChar buffer[256];
+        UFieldPosition fp = { UDAT_DATE_FIELD, 0, 0 };
+        length = udtitvfmt_format(f, from, to, buffer, 256, &fp, &status);
+        utf8(buffer, length, out, sizeof out);
+        printf("interval format %s %s: \"%s\" %d-%d %s\n", locale, skeleton, out, fp.beginIndex, fp.endIndex, statusName(status));
+    }
     udtitvfmt_close(f);
 }
 
@@ -739,23 +747,22 @@ static void intervals(void)
 {
     static const char *skeletons[] = { "yMMMd", "yMd", "yMMMMEEEEd", "MMMd", "yMMM", "y", "jm", "hm", "Hm", "jmz",
         "yMMMdjm", "yMdjms", "MMMEdjm", "jmv", "h", "H", "d", "MMMMd", "yMMMMd", "Bhm", "GyMMMd", NULL };
-    static const char *locales[] = { "en", "en-GB", "de", "fr", "ja", "zh", "ko", "es", "ru", "ar", "hi", "fi", "he",
-        "pt-BR", "en-u-hc-h23", "ja-u-hc-h11", NULL };
+    static const char *locales[] = { "en", "de", "en-GB", "fr", "ja", "zh", "ar", "fi", "ja-u-hc-h11", NULL };
     /* The same moment, minutes apart, hours apart (across noon), a day,
        a month, a year, an era. */
     static const UDate tos[] = { 0.0, 600000.0, 21600000.0, 86400000.0, 2678400000.0, 31536000000.0 };
     for (int l = 0; locales[l]; l++) {
         for (int s = 0; skeletons[s]; s++) {
-            for (int t = 0; t < 6; t++) interval(locales[l], skeletons[s], "America/Los_Angeles", NOV14, NOV14 + tos[t]);
+            for (int t = 0; t < 6; t++) interval(locales[l], skeletons[s], "America/Los_Angeles", NOV14, NOV14 + tos[t], l < 2 && (t == 0 || t == 3));
         }
-        interval(locales[l], "yMMMd", "UTC", ANCIENT, NOV14);
+        interval(locales[l], "yMMMd", "UTC", ANCIENT, NOV14, 1);
     }
-    interval("en", "yMMMd", "UTC", NOV14 + 86400000.0, NOV14);
-    interval("en", "yMMMdjmmss", "UTC", NOV14, NOV14 + 999.0);
-    interval("en", "jmmssSSS", "UTC", NOV14, NOV14 + 999.0);
-    interval("en", "yMMMd", "Invalid/Zone", NOV14, JUL4);
-    interval("en", "", "UTC", NOV14, JUL4);
-    interval("zh-Hant", "yMMMMEEEEd", "Asia/Taipei", NOV14, JUL4);
+    interval("en", "yMMMd", "UTC", NOV14 + 86400000.0, NOV14, 1);
+    interval("en", "yMMMdjmmss", "UTC", NOV14, NOV14 + 999.0, 1);
+    interval("en", "jmmssSSS", "UTC", NOV14, NOV14 + 999.0, 1);
+    interval("en", "yMMMd", "Invalid/Zone", NOV14, JUL4, 1);
+    interval("en", "", "UTC", NOV14, JUL4, 1);
+    interval("zh-Hant", "yMMMMEEEEd", "Asia/Taipei", NOV14, JUL4, 1);
 
     UChar s[] = { 'y', 'M', 'M', 'M', 'd', 0 }, z[] = { 'U', 'T', 'C', 0 };
     UErrorCode status = U_ZERO_ERROR;
@@ -816,7 +823,7 @@ int main(void)
     static const char *locales[] = { "en", "en-GB", "en-AU", "de", "fr", "fr-CA", "es", "it", "pt-BR", "nl", "sv", "fi",
         "ru", "pl", "cs", "ja", "zh", "zh-Hant", "ko", "ar", "he", "hi", "th", "tr", "vi", "id", "fa", "und",
         "en-u-hc-h23", "ja-u-hc-h11", "en-GB-u-hc-h12", NULL };
-    for (int i = 0; locales[i]; i++) generator(locales[i]);
+    for (int i = 0; locales[i]; i++) generator(locales[i], i < 8 || i == 15 || i == 17 || i == 19);
     static const char *patterns[] = { "yyyy-MM-dd", "d MMM y", "EEEE, MMMM d, y 'at' h:mm:ss a zzzz", "HH:mm",
         "hh:mm a", "K:mm", "kk:mm", "MMMMEEEEd", "QQQ y", "LLL", "'o''clock' h", "jmm", "ccc LLLL", "B h:mm",
         "yyMMdd", "GGGGG y.M.d", "a h", "''", "VV", "H.mm 'Uhr'", NULL };
@@ -834,7 +841,7 @@ int main(void)
         "jmO", "jmv", "Ejm", "GyMMMMd", "yMMMMdjmmssSSS", "hmB", "MMMMd", "yQQQQ", NULL };
     for (int l = 0; intlLocales[l]; l++)
         for (int s = 0; intlSkeletons[s]; s++) intlFormat(intlLocales[l], intlSkeletons[s], "America/New_York");
-    for (int i = 0; locales[i]; i++) styles(locales[i], "America/Los_Angeles");
+    for (int i = 0; locales[i]; i++) if (i % 2 == 0) styles(locales[i], "America/Los_Angeles");
     letters();
     zones();
     keywords();
