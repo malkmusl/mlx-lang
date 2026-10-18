@@ -753,7 +753,7 @@ SHA-256 sums.
 
 ## C headers made of Mlx: mlx-cheaders
 
-A library written in Mlx for C and C++ programs (projects/unicode) declares
+A library written in Mlx for C and C++ programs (compiler/capi/icu) declares
 its interface once, in Mlx modules, and `mlx-cheaders OUT MODULE.mlx...`
 (compiler/cc/cheaders.mlx) writes the headers C includes. It reads the
 modules with the Mlx compiler's own parser. Enums, structures (all
@@ -764,4 +764,4 @@ macro: of an expression when its body is one `return`, else of
 statements, with its `*T` parameters the lvalues it writes and its
 locals named apart. Other `pub fn`s become static inline functions. The
 Mlx of the macros is real: it compiles and runs as Mlx, and
-projects/unicode/tests/api.mlx tests it so.
+compiler/capi/icu/tests/api.mlx tests it so.

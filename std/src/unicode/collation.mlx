@@ -1,0 +1,1452 @@
+// Collation (ucol.h, uiter.h): the Unicode Collation Algorithm (UTS #10)
+// with CLDR's root collation (the order of uca/allkeys.txt, DUCET, with
+// CLDR's variable top: spaces and punctuation) and the tailorings of
+// CLDR's locales (collationrules.mlx, made of cldr/collation by
+// collation-generate), or a program's own rules (ucol_openRules), made
+// into elements by collationbuilder.mlx. Strings are compared in NFD:
+// their collation elements (collationelements.mlx: contractions matched
+// longest first, then the unblocked non-starters after them; prefixes;
+// implicit weights for what the table does not list), then level by
+// level, with the attributes (strength, alternate shifted and the
+// variable top, case first and case level, French secondaries, numeric
+// collation) and the script reordering the locale, its rules or the
+// program ask for.
+//
+// A locale's collation is found as ICU finds it: the locale with its
+// likely script, less and less of it while the script is the
+// language's own, the parents CLDR names (nb and nn: no), the root; the
+// type its `collation` keyword (`-u-co-`) names, else the default type
+// along that chain (zh: pinyin, zh_Hant: stroke), else `standard`. A
+// tailoring is made once and kept for the process.
+const tables = @import("std.unicode.tables")
+const m = @import("std.unicode.memory")
+const p = @import("std.unicode.properties")
+const enumeration = @import("std.unicode.enumeration")
+const localeModule = @import("std.unicode.locale.defaults")
+const e = @import("std.unicode.collation.elements")
+const builder = @import("std.unicode.collation.builder")
+
+// UColAttribute
+const FRENCH_COLLATION: i32 = 0
+const ALTERNATE_HANDLING: i32 = 1
+const CASE_FIRST: i32 = 2
+const CASE_LEVEL: i32 = 3
+const NORMALIZATION_MODE: i32 = 4
+const STRENGTH: i32 = 5
+const HIRAGANA_QUATERNARY_MODE: i32 = 6
+const NUMERIC_COLLATION: i32 = 7
+
+// UColAttributeValue
+const DEFAULT: i32 = -1
+const PRIMARY: i32 = 0
+const SECONDARY: i32 = 1
+const TERTIARY: i32 = 2
+const QUATERNARY: i32 = 3
+const IDENTICAL: i32 = 15
+const OFF: i32 = 16
+const ON: i32 = 17
+const SHIFTED: i32 = 20
+const NON_IGNORABLE: i32 = 21
+const LOWER_FIRST: i32 = 24
+const UPPER_FIRST: i32 = 25
+
+const INVALID_FORMAT_ERROR: i32 = 3
+
+// The collator (C memory).
+const Collator = struct {
+    attributes: [8]i32
+    // What the tailoring sets (UCOL_DEFAULT goes back to these).
+    defaults: [8]i32
+    // The tailoring (0: the root's).
+    tailoring: usize
+    // The root as the table has it (`-u-co-ducet`): its Han order (code
+    // points) and its variable elements.
+    ducet: bool
+    // The variable top's group (0 space to 3 currency) and primary.
+    maxVariable: i32
+    variableTop: u32
+    // The reordering asked for, and the ranges of primaries it moves:
+    // triples of start, limit, what is added.
+    reorder: m.Buffer
+    ranges: m.Buffer
+    // The locale the tailoring is of ("root" for none).
+    locale: [64]u8
+    localeLength: usize
+}
+
+const SIZE: usize = @sizeOf(Collator)
+
+fn collator(address: usize) -> *Collator { unsafe { return @ptrFromInt(*Collator, address) } }
+
+fn attribute(coll: usize, which: i32) -> i32 { return collator(coll).*.attributes[@intCast(usize, which)] }
+fn setAttributeValue(coll: usize, which: i32, value: i32) -> void { collator(coll).*.attributes[@intCast(usize, which)] = value }
+
+fn rootDefaults(values: *[8]i32) -> void {
+    values.*[0] = OFF
+    values.*[1] = NON_IGNORABLE
+    values.*[2] = OFF
+    values.*[3] = OFF
+    values.*[4] = OFF
+    values.*[5] = TERTIARY
+    values.*[6] = OFF
+    values.*[7] = OFF
+}
+
+// A collator of tailoring `tailoring` with its settings.
+fn newCollator(tailoring: usize) -> usize {
+    const address = m.alloc(SIZE)
+    if address == 0 { return 0 }
+    const c = collator(address)
+    rootDefaults(&c.*.defaults)
+    c.*.tailoring = tailoring
+    c.*.ducet = false
+    c.*.maxVariable = 1
+    c.*.reorder = m.buffer()
+    c.*.ranges = m.buffer()
+    if tailoring != 0 {
+        const t = e.tailoringAt(tailoring)
+        var index: usize = 0
+        while index < 8 {
+            if t.*.settings[index] >= 0 { c.*.defaults[index] = t.*.settings[index] }
+            index += 1
+        }
+        if t.*.maxVariable >= 0 { c.*.maxVariable = t.*.maxVariable }
+        index = 0
+        while index < t.*.reorder.length {
+            m.push(&c.*.reorder, m.at(&t.*.reorder, index))
+            index += 1
+        }
+    }
+    var index: usize = 0
+    while index < 8 {
+        c.*.attributes[index] = c.*.defaults[index]
+        index += 1
+    }
+    c.*.variableTop = e.groupLastPrimary(e.GROUP_SPACE + c.*.maxVariable)
+    makeRanges(c)
+    setLocale(c, "root")
+    return address
+}
+
+fn setLocale(c: *Collator, text: []const u8) -> void {
+    var index: usize = 0
+    while index < text.length && index < 63 {
+        c.*.locale[index] = text[index]
+        index += 1
+    }
+    c.*.locale[index] = 0
+    c.*.localeLength = index
+}
+
+// ---------------------------------------------------------------------------
+// Reordering: the groups (special groups, then scripts) in the order the
+// codes ask for, as ICU orders them: the special groups not named first,
+// then the codes named up to `others`, then the groups not named in
+// their own order, then the codes named after `others`.
+
+fn makeRanges(c: *Collator) -> void {
+    c.*.ranges.length = 0
+    if c.*.reorder.length == 0 { return }
+    if c.*.reorder.length == 1 && @bitCast(i32, m.at(&c.*.reorder, 0)) == e.SCRIPT_UNKNOWN { return }
+    e.ensureRoot()
+    const count = e.groupCount()
+    const placed = m.alloc(count + 1)
+    var order = m.buffer()
+    var high = m.buffer()
+    // The special groups not named.
+    var special: i32 = e.GROUP_SPACE
+    while special <= e.GROUP_DIGIT {
+        var named = false
+        var index: usize = 0
+        while index < c.*.reorder.length {
+            if @bitCast(i32, m.at(&c.*.reorder, index)) == special { named = true }
+            index += 1
+        }
+        const group = e.groupOf(special)
+        if !named && group < count && m.get8(placed + group) == 0 {
+            m.push(&order, @intCast(u32, group))
+            m.put8(placed + group, 1)
+        }
+        special += 1
+    }
+    var toEnd = false
+    var index: usize = 0
+    while index < c.*.reorder.length {
+        const code = @bitCast(i32, m.at(&c.*.reorder, index))
+        index += 1
+        if code == e.SCRIPT_UNKNOWN {
+            toEnd = true
+            continue
+        }
+        const group = e.groupOf(code)
+        if group >= count || m.get8(placed + group) != 0 { continue }
+        m.put8(placed + group, 1)
+        if toEnd { m.push(&high, @intCast(u32, group)) } else { m.push(&order, @intCast(u32, group)) }
+    }
+    var group: usize = 0
+    while group < count {
+        if m.get8(placed + group) == 0 { m.push(&order, @intCast(u32, group)) }
+        group += 1
+    }
+    index = 0
+    while index < high.length {
+        m.push(&order, m.at(&high, index))
+        index += 1
+    }
+    // Each group's primaries to where its turn puts them.
+    var destination = e.groupStart(0)
+    var moved = false
+    index = 0
+    while index < order.length {
+        const g = @intCast(usize, m.at(&order, index))
+        const start = e.groupStart(g)
+        const limit = e.groupLimit(g)
+        if start != destination { moved = true }
+        m.push(&c.*.ranges, start)
+        m.push(&c.*.ranges, limit)
+        m.push(&c.*.ranges, destination -% start)
+        destination += limit - start
+        index += 1
+    }
+    if !moved { c.*.ranges.length = 0 }
+    // Sorted by start.
+    var i: usize = 1
+    while i < c.*.ranges.length / 3 {
+        var j = i
+        while j > 0 && m.at(&c.*.ranges, j * 3) < m.at(&c.*.ranges, j * 3 - 3) {
+            var k: usize = 0
+            while k < 3 {
+                const swap = m.at(&c.*.ranges, j * 3 + k)
+                m.setAt(&c.*.ranges, j * 3 + k, m.at(&c.*.ranges, j * 3 - 3 + k))
+                m.setAt(&c.*.ranges, j * 3 - 3 + k, swap)
+                k += 1
+            }
+            j -= 1
+        }
+        i += 1
+    }
+    m.release(placed)
+    m.dispose(&order)
+    m.dispose(&high)
+}
+
+// A primary where the reordering puts it.
+fn reordered(c: *Collator, primary: u32) -> u32 {
+    const count = c.*.ranges.length / 3
+    if count == 0 { return primary }
+    var low: usize = 0
+    var high = count
+    while low < high {
+        const middle = (low + high) / 2
+        if m.at(&c.*.ranges, middle * 3 + 1) <= primary {
+            low = middle + 1
+        } else if m.at(&c.*.ranges, middle * 3) > primary {
+            high = middle
+        } else {
+            return primary +% m.at(&c.*.ranges, middle * 3 + 2)
+        }
+    }
+    return primary
+}
+
+// ---------------------------------------------------------------------------
+// Numeric collation: each run of decimal digits as one number, by its
+// count of significant digits and then its digits.
+
+fn numericElements(c: *Collator, text: *m.Buffer, out: *m.Buffer) -> void {
+    var plain = m.buffer()
+    const zero = e.singlePrimary(48)
+    const common = e.lowerWord(e.COMMON_SECONDARY, 0, e.COMMON_TERTIARY, 0)
+    var i: usize = 0
+    while i < text.*.length {
+        const code = @intCast(i32, m.at(text, i))
+        if p.category(code) != 9 {
+            m.push(&plain, @intCast(u32, code))
+            i += 1
+            continue
+        }
+        if plain.length > 0 {
+            e.elements(source(c), &plain, out)
+            plain.length = 0
+        }
+        var end = i
+        while end < text.*.length && p.category(@intCast(i32, m.at(text, end))) == 9 { end += 1 }
+        var start = i
+        while start < end && p.digitValue(@intCast(i32, m.at(text, start))) == 0 { start += 1 }
+        e.pushPair(out, zero, common)
+        e.pushPair(out, zero + ((@intCast(u32, end - start) + 1) << 16), common)
+        var d = start
+        while d < end {
+            e.pushPair(out, zero + (@intCast(u32, p.digitValue(@intCast(i32, m.at(text, d)))) << 16), common)
+            d += 1
+        }
+        i = end
+    }
+    if plain.length > 0 { e.elements(source(c), &plain, out) }
+    m.dispose(&plain)
+}
+
+// What the elements come from: the tailoring, or the table's root.
+fn source(c: *Collator) -> usize { return if c.*.ducet { e.DUCET } else { c.*.tailoring } }
+
+fn elementsOf(c: *Collator, nfd: *m.Buffer, out: *m.Buffer) -> void {
+    if c.*.attributes[@intCast(usize, NUMERIC_COLLATION)] == ON {
+        numericElements(c, nfd, out)
+    } else {
+        e.elements(source(c), nfd, out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comparison
+
+const LEVEL_PRIMARY: u32 = 1
+const LEVEL_SECONDARY: u32 = 2
+const LEVEL_CASE: u32 = 3
+const LEVEL_TERTIARY: u32 = 4
+const LEVEL_QUATERNARY: u32 = 5
+
+// The weights of one level of elements `ces` into `out`.
+// The weight of level `which` of element `index` of `ces` (0: none);
+// `afterVariable` says whether a variable element came before it (with
+// only ignorable ones between), for alternate shifted.
+fn weightAt(c: *Collator, ces: *m.Buffer, index: usize, which: u32, afterVariable: *bool) -> u32 {
+    var primary = m.at(ces, index)
+    const low = m.at(ces, index + 1)
+    var secondary = e.secondaryOf(low)
+    var tertiary = e.tertiaryOf(low)
+    var quaternary: u32 = 0
+    if c.*.attributes[@intCast(usize, ALTERNATE_HANDLING)] == SHIFTED {
+        if primary != 0 && primary <= c.*.variableTop {
+            quaternary = primary
+            primary = 0
+            secondary = 0
+            tertiary = 0
+            afterVariable.* = true
+        } else if primary == 0 && afterVariable.* {
+            secondary = 0
+            tertiary = 0
+        } else if primary != 0 || secondary != 0 || tertiary != 0 {
+            if primary != 0 { afterVariable.* = false }
+            quaternary = 4294967292 | e.quaternaryOf(low)
+        }
+    } else if primary != 0 || secondary != 0 || tertiary != 0 {
+        quaternary = 4294967292 | e.quaternaryOf(low)
+    }
+    if which == LEVEL_PRIMARY { return if primary != 0 { reordered(c, primary) } else { 0 } }
+    if which == LEVEL_SECONDARY { return secondary }
+    const caseFirst = c.*.attributes[@intCast(usize, CASE_FIRST)]
+    const letterCase = e.caseOf(low)
+    if which == LEVEL_CASE {
+        if primary == 0 { return 0 }
+        return 1 + (if caseFirst == UPPER_FIRST { 2 - letterCase } else { letterCase })
+    }
+    if which == LEVEL_TERTIARY {
+        if tertiary == 0 { return 0 }
+        // (Upper first: the case bits turned around, but tertiary elements
+        // kept above all others, as ICU keeps them.)
+        if caseFirst == UPPER_FIRST { return tertiary | ((if e.secondaryOf(low) == 0 { 3 } else { 2 - letterCase }) << 12) }
+        if caseFirst == LOWER_FIRST { return tertiary | (letterCase << 12) }
+        return tertiary
+    }
+    return quaternary
+}
+
+// The weights of one level of elements `ces` into `out`.
+fn level(c: *Collator, ces: *m.Buffer, which: u32, out: *m.Buffer) -> void {
+    var afterVariable = false
+    var index: usize = 0
+    while index + 1 < ces.*.length {
+        const weight = weightAt(c, ces, index, which, &afterVariable)
+        if weight != 0 { m.push(out, weight) }
+        index += 2
+    }
+}
+
+fn compareBuffers(a: *m.Buffer, b: *m.Buffer, backwards: bool) -> i32 {
+    var index: usize = 0
+    while index < a.*.length && index < b.*.length {
+        const x = if backwards { m.at(a, a.*.length - 1 - index) } else { m.at(a, index) }
+        const y = if backwards { m.at(b, b.*.length - 1 - index) } else { m.at(b, index) }
+        if x != y { return if x < y { -1 } else { 1 } }
+        index += 1
+    }
+    if a.*.length == b.*.length { return 0 }
+    return if a.*.length < b.*.length { -1 } else { 1 }
+}
+
+fn compareLevel(c: *Collator, a: *m.Buffer, b: *m.Buffer, which: u32) -> i32 {
+    if !(which == LEVEL_SECONDARY && c.*.attributes[@intCast(usize, FRENCH_COLLATION)] == ON) {
+        // Weight by weight, the end below every weight.
+        var i: usize = 0
+        var j: usize = 0
+        var afterA = false
+        var afterB = false
+        while true {
+            var x: u32 = 0
+            while x == 0 && i + 1 < a.*.length {
+                x = weightAt(c, a, i, which, &afterA)
+                i += 2
+            }
+            var y: u32 = 0
+            while y == 0 && j + 1 < b.*.length {
+                y = weightAt(c, b, j, which, &afterB)
+                j += 2
+            }
+            if x != y { return if x < y { -1 } else { 1 } }
+            if x == 0 { return 0 }
+        }
+    }
+    var x = m.buffer()
+    var y = m.buffer()
+    level(c, a, which, &x)
+    level(c, b, which, &y)
+    const result = compareBuffers(&x, &y, which == LEVEL_SECONDARY && c.*.attributes[@intCast(usize, FRENCH_COLLATION)] == ON)
+    m.dispose(&x)
+    m.dispose(&y)
+    return result
+}
+
+fn includesLevel(c: *Collator, which: u32) -> bool {
+    const strength = c.*.attributes[@intCast(usize, STRENGTH)]
+    if which == LEVEL_PRIMARY { return true }
+    if which == LEVEL_SECONDARY { return strength >= SECONDARY }
+    if which == LEVEL_CASE { return c.*.attributes[@intCast(usize, CASE_LEVEL)] == ON }
+    if which == LEVEL_TERTIARY { return strength >= TERTIARY }
+    return strength >= QUATERNARY
+}
+
+// Whether code points `text` are in NFD already (no character that
+// decomposes, the combining marks in their order), as most text is.
+fn isNFD(text: *m.Buffer) -> bool {
+    var lastClass: u32 = 0
+    var index: usize = 0
+    while index < text.*.length {
+        const c = m.at(text, index)
+        index += 1
+        if c < 192 {
+            lastClass = 0
+            continue
+        }
+        const code = @intCast(i32, c)
+        if p.nfdQuickCheck(code) != 0 { return false }
+        const combining = if c < 768 { 0 } else { p.combiningClass(code) }
+        if combining != 0 && combining < lastClass { return false }
+        lastClass = combining
+    }
+    return true
+}
+
+// NFD of `text` into `out` when it is not NFD already; what is.
+fn nfdOf(text: *m.Buffer, out: *m.Buffer) -> *m.Buffer {
+    if isNFD(text) { return text }
+    e.toNFD(text, out)
+    return out
+}
+
+// Two strings of code points, compared by the collator.
+pub fn compareCodes(coll: usize, first: *m.Buffer, second: *m.Buffer) -> i32 {
+    const c = collator(coll)
+    var decomposedA = m.buffer()
+    var decomposedB = m.buffer()
+    const a = nfdOf(first, &decomposedA)
+    const b = nfdOf(second, &decomposedB)
+    var ca = m.buffer()
+    var cb = m.buffer()
+    elementsOf(c, a, &ca)
+    elementsOf(c, b, &cb)
+    var result: i32 = 0
+    var which: u32 = LEVEL_PRIMARY
+    while result == 0 && which <= LEVEL_QUATERNARY {
+        if includesLevel(c, which) { result = compareLevel(c, &ca, &cb, which) }
+        which += 1
+    }
+    if result == 0 && c.*.attributes[@intCast(usize, STRENGTH)] == IDENTICAL {
+        result = compareBuffers(a, b, false)
+        if result == 0 { result = compareBuffers(first, second, false) }
+    }
+    m.dispose(&decomposedA)
+    m.dispose(&decomposedB)
+    m.dispose(&ca)
+    m.dispose(&cb)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Collators
+
+// The tailorings of CLDR's rules, made once each (by RULES entry).
+var cacheLock: u32 = 0
+var cache: usize = 0
+
+fn lockCache() -> void {
+    while @atomicRmw(u32, &cacheLock, xchg, 1, acquire) != 0 {}
+}
+
+fn unlockCache() -> void { @atomicStore(u32, &cacheLock, 0, release) }
+
+// The tailoring of RULES entry `key` (0 for empty rules); its status.
+fn tailoringOf(key: usize, status: *i32) -> usize {
+    status.* = 0
+    lockCache()
+    if cache == 0 { cache = m.alloc(builder.ruleCountOf() * 8 + 8) }
+    var t = m.getWord(cache + key * 8)
+    if t == 0 {
+        var rules = m.buffer()
+        builder.rulesText(key, &rules)
+        if rules.length > 0 {
+            var offset: usize = 0
+            t = builder.build(&rules, status, &offset)
+            if t != 0 {
+                e.tailoringAt(t).*.permanent = true
+                m.putWord(cache + key * 8, t)
+            }
+        } else {
+            // (Empty rules: the root, marked so as not to build again.)
+            m.putWord(cache + key * 8, 1)
+        }
+        m.dispose(&rules)
+    }
+    unlockCache()
+    return if t == 1 { 0 } else { t }
+}
+
+fn holdTailoring(t: usize) -> void {
+    if t != 0 && !e.tailoringAt(t).*.permanent { _ = @atomicRmw(u32, &e.tailoringAt(t).*.references, add, 1, acq_rel) }
+}
+
+fn dropTailoring(t: usize) -> void {
+    if t == 0 || e.tailoringAt(t).*.permanent { return }
+    if @atomicRmw(u32, &e.tailoringAt(t).*.references, sub, 1, acq_rel) == 1 { e.disposeTailoring(t) }
+}
+
+fn isLower(byte: u8) -> u8 { return if byte >= 65 && byte <= 90 { byte + 32 } else { byte } }
+
+fn sameLoosely(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var index: usize = 0
+    while index < a.length {
+        if isLower(a[index]) != isLower(b[index]) { return false }
+        index += 1
+    }
+    return true
+}
+
+// The value of a `-u-` key of a language tag (its type's subtags, `-`
+// between them), and whether it is there.
+fn extensionValue(locale: []const u8, key: []const u8, found: *bool) -> []const u8 {
+    found.* = false
+    var index: usize = 0
+    while index + 2 < locale.length {
+        if locale[index] == 64 { return "" }
+        if (locale[index] == 45 || locale[index] == 95) && isLower(locale[index + 1]) == 117 && (locale[index + 2] == 45 || locale[index + 2] == 95) {
+            var at = index + 3
+            while at < locale.length {
+                const start = at
+                while at < locale.length && locale[at] != 45 && locale[at] != 95 && locale[at] != 64 { at += 1 }
+                const part = locale[start..at]
+                if part.length == 1 { return "" }
+                if at < locale.length && locale[at] != 64 { at += 1 }
+                if part.length == 2 && sameLoosely(part, key) {
+                    found.* = true
+                    const valueStart = at
+                    var valueEnd = at
+                    while at < locale.length && locale[at] != 64 {
+                        const subtag = at
+                        while at < locale.length && locale[at] != 45 && locale[at] != 95 && locale[at] != 64 { at += 1 }
+                        if at - subtag < 3 { break }
+                        valueEnd = at
+                        if at < locale.length && locale[at] != 64 { at += 1 }
+                    }
+                    return locale[valueStart..valueEnd]
+                }
+            }
+            return ""
+        }
+        index += 1
+    }
+    return ""
+}
+
+// A keyword's value: `@legacy=value` or `-u-key-value` (`true` for a
+// key with none).
+fn keywordValue(locale: []const u8, legacy: []const u8, key: []const u8) -> []const u8 {
+    const value = localeModule.keyword(locale, legacy)
+    if value.length > 0 { return value }
+    var found = false
+    const extension = extensionValue(locale, key, &found)
+    if found && extension.length == 0 { return "true" }
+    return extension
+}
+
+fn isTrue(value: []const u8) -> bool { return sameLoosely(value, "yes") || sameLoosely(value, "true") }
+fn isFalse(value: []const u8) -> bool { return sameLoosely(value, "no") || sameLoosely(value, "false") }
+
+// The reordering codes of `value` (`latn-grek`, `Grek-Latn`) into the
+// collator's.
+fn setReorderFromText(c: *Collator, value: []const u8) -> void {
+    c.*.reorder.length = 0
+    var words = m.buffer()
+    var index: usize = 0
+    while index <= value.length {
+        if index == value.length || value[index] == 45 || value[index] == 95 {
+            if words.length > 0 {
+                const code = builder.reorderCodeOf(&words, 0, words.length)
+                if code >= 0 { m.push(&c.*.reorder, @bitCast(u32, code)) }
+            }
+            words.length = 0
+        } else {
+            m.push(&words, @intCast(u32, value[index]))
+        }
+        index += 1
+    }
+    m.dispose(&words)
+    makeRanges(c)
+}
+
+// The attributes a locale's keywords ask for (`@colNumeric=yes`,
+// `-u-kn-true`, ...).
+fn keywords(coll: usize, locale: []const u8) -> void {
+    const c = collator(coll)
+    var value = keywordValue(locale, "colstrength", "ks")
+    if sameLoosely(value, "primary") || sameLoosely(value, "level1") { setAttributeValue(coll, STRENGTH, PRIMARY) }
+    if sameLoosely(value, "secondary") || sameLoosely(value, "level2") { setAttributeValue(coll, STRENGTH, SECONDARY) }
+    if sameLoosely(value, "tertiary") || sameLoosely(value, "level3") { setAttributeValue(coll, STRENGTH, TERTIARY) }
+    if sameLoosely(value, "quaternary") || sameLoosely(value, "level4") { setAttributeValue(coll, STRENGTH, QUATERNARY) }
+    if sameLoosely(value, "identical") || sameLoosely(value, "identic") { setAttributeValue(coll, STRENGTH, IDENTICAL) }
+    value = keywordValue(locale, "colalternate", "ka")
+    if sameLoosely(value, "shifted") { setAttributeValue(coll, ALTERNATE_HANDLING, SHIFTED) }
+    if sameLoosely(value, "non-ignorable") || sameLoosely(value, "noignore") { setAttributeValue(coll, ALTERNATE_HANDLING, NON_IGNORABLE) }
+    value = keywordValue(locale, "colbackwards", "kb")
+    if isTrue(value) { setAttributeValue(coll, FRENCH_COLLATION, ON) }
+    if isFalse(value) { setAttributeValue(coll, FRENCH_COLLATION, OFF) }
+    value = keywordValue(locale, "colcaselevel", "kc")
+    if isTrue(value) { setAttributeValue(coll, CASE_LEVEL, ON) }
+    if isFalse(value) { setAttributeValue(coll, CASE_LEVEL, OFF) }
+    value = keywordValue(locale, "colcasefirst", "kf")
+    if sameLoosely(value, "upper") { setAttributeValue(coll, CASE_FIRST, UPPER_FIRST) }
+    if sameLoosely(value, "lower") { setAttributeValue(coll, CASE_FIRST, LOWER_FIRST) }
+    if isFalse(value) { setAttributeValue(coll, CASE_FIRST, OFF) }
+    value = keywordValue(locale, "colnormalization", "kk")
+    if isTrue(value) { setAttributeValue(coll, NORMALIZATION_MODE, ON) }
+    if isFalse(value) { setAttributeValue(coll, NORMALIZATION_MODE, OFF) }
+    value = keywordValue(locale, "colnumeric", "kn")
+    if isTrue(value) { setAttributeValue(coll, NUMERIC_COLLATION, ON) }
+    if isFalse(value) { setAttributeValue(coll, NUMERIC_COLLATION, OFF) }
+    value = keywordValue(locale, "colreorder", "kr")
+    if value.length > 0 { setReorderFromText(c, value) }
+    value = keywordValue(locale, "maxvariable", "kv")
+    var group: i32 = -1
+    if sameLoosely(value, "space") { group = 0 }
+    if sameLoosely(value, "punct") { group = 1 }
+    if sameLoosely(value, "symbol") { group = 2 }
+    if sameLoosely(value, "currency") { group = 3 }
+    if group >= 0 {
+        c.*.maxVariable = group
+        c.*.variableTop = e.groupLastPrimary(e.GROUP_SPACE + group)
+    }
+}
+
+pub fn ucol_open(locale: usize, status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    var text: []const u8 = ""
+    if locale == 0 { text = localeModule.defaultLocale() } else { text = m.cSlice(locale) }
+    var kind = builder.legacyType(keywordValue(text, "collation", "co"))
+    var lowered: [32]u8 = undefined
+    var index: usize = 0
+    while index < kind.length && index < 32 {
+        lowered[index] = isLower(kind[index])
+        index += 1
+    }
+    const loweredView: [*]const u8 = unsafe { @ptrCast([*]const u8, &lowered) }
+    kind = loweredView[0..index]
+    var found: [64]u8 = undefined
+    var foundLength: usize = 0
+    const ducet = sameLoosely(kind, "ducet")
+    const key = if ducet { builder.NOT_FOUND } else { builder.findRulesIn(text, kind, true, &found, &foundLength) }
+    var tailoring: usize = 0
+    if key != builder.NOT_FOUND {
+        var built: i32 = 0
+        tailoring = tailoringOf(key, &built)
+        if built > 0 {
+            m.setError(status, built)
+            return 0
+        }
+    }
+    const coll = newCollator(tailoring)
+    if coll == 0 {
+        m.setError(status, m.MEMORY_ALLOCATION_ERROR)
+        return 0
+    }
+    const foundView: [*]const u8 = unsafe { @ptrCast([*]const u8, &found) }
+    setLocale(collator(coll), if foundLength > 0 { foundView[0..foundLength] } else { "root" })
+    if ducet {
+        // The table's own variable elements: up to its last `*` (spaces,
+        // punctuation and most symbols).
+        collator(coll).*.ducet = true
+        collator(coll).*.maxVariable = 2
+        collator(coll).*.variableTop = e.tableVariableTop()
+    }
+    keywords(coll, text)
+    return coll
+}
+
+pub fn ucol_openRules(rules: usize, length: i32, normalizationMode: i32, strength: i32, parseError: usize, status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    var codes = m.buffer()
+    if rules != 0 { m.decode16(&codes, rules, m.units(rules, length)) }
+    var tailoring: usize = 0
+    if codes.length > 0 {
+        var built: i32 = 0
+        var offset: usize = 0
+        tailoring = builder.build(&codes, &built, &offset)
+        if built > 0 {
+            if parseError != 0 {
+                m.zero(parseError, 72)
+                m.putI32(parseError + 4, @intCast(i32, offset))
+            }
+            m.dispose(&codes)
+            m.setError(status, built)
+            return 0
+        }
+    }
+    m.dispose(&codes)
+    const coll = newCollator(tailoring)
+    if coll == 0 {
+        m.setError(status, m.MEMORY_ALLOCATION_ERROR)
+        return 0
+    }
+    if normalizationMode == ON || normalizationMode == OFF {
+        collator(coll).*.defaults[@intCast(usize, NORMALIZATION_MODE)] = normalizationMode
+        setAttributeValue(coll, NORMALIZATION_MODE, normalizationMode)
+    }
+    if strength != DEFAULT {
+        collator(coll).*.defaults[@intCast(usize, STRENGTH)] = strength
+        setAttributeValue(coll, STRENGTH, strength)
+    }
+    return coll
+}
+
+pub fn ucol_close(coll: usize) -> void {
+    if coll == 0 { return }
+    const c = collator(coll)
+    dropTailoring(c.*.tailoring)
+    m.dispose(&c.*.reorder)
+    m.dispose(&c.*.ranges)
+    m.release(coll)
+}
+
+fn copyBuffer(from: *m.Buffer) -> m.Buffer {
+    var copy = m.buffer()
+    var index: usize = 0
+    while index < from.*.length {
+        m.push(&copy, m.at(from, index))
+        index += 1
+    }
+    return copy
+}
+
+pub fn ucol_clone(coll: usize, status: usize) -> usize {
+    if m.failed(status) || coll == 0 { return 0 }
+    const copy = m.alloc(SIZE)
+    if copy == 0 {
+        m.setError(status, m.MEMORY_ALLOCATION_ERROR)
+        return 0
+    }
+    m.copy(copy, coll, SIZE)
+    const c = collator(copy)
+    c.*.reorder = copyBuffer(&collator(coll).*.reorder)
+    c.*.ranges = copyBuffer(&collator(coll).*.ranges)
+    holdTailoring(c.*.tailoring)
+    return copy
+}
+
+pub fn ucol_safeClone(coll: usize, stackBuffer: usize, bufferSize: usize, status: usize) -> usize {
+    if bufferSize != 0 && m.getI32(bufferSize) == 0 {
+        m.putI32(bufferSize, @intCast(i32, SIZE))
+        return 0
+    }
+    return ucol_clone(coll, status)
+}
+
+pub fn ucol_setAttribute(coll: usize, which: i32, value: i32, status: usize) -> void {
+    if m.failed(status) { return }
+    if coll == 0 || which < 0 || which > 7 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return
+    }
+    if value == DEFAULT {
+        setAttributeValue(coll, which, collator(coll).*.defaults[@intCast(usize, which)])
+        return
+    }
+    setAttributeValue(coll, which, value)
+}
+
+pub fn ucol_getAttribute(coll: usize, which: i32, status: usize) -> i32 {
+    if m.failed(status) { return DEFAULT }
+    if coll == 0 || which < 0 || which > 7 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return DEFAULT
+    }
+    return attribute(coll, which)
+}
+
+pub fn ucol_setStrength(coll: usize, strength: i32) -> void {
+    if coll != 0 { setAttributeValue(coll, STRENGTH, if strength == DEFAULT { collator(coll).*.defaults[@intCast(usize, STRENGTH)] } else { strength }) }
+}
+
+pub fn ucol_getStrength(coll: usize) -> i32 { return if coll == 0 { TERTIARY } else { attribute(coll, STRENGTH) } }
+
+pub fn ucol_strcoll(coll: usize, source: usize, sourceLength: i32, target: usize, targetLength: i32) -> i32 {
+    var a = m.buffer()
+    var b = m.buffer()
+    m.decode16(&a, source, if source == 0 { 0 } else { m.units(source, sourceLength) })
+    m.decode16(&b, target, if target == 0 { 0 } else { m.units(target, targetLength) })
+    const result = compareCodes(coll, &a, &b)
+    m.dispose(&a)
+    m.dispose(&b)
+    return result
+}
+
+pub fn ucol_equal(coll: usize, source: usize, sourceLength: i32, target: usize, targetLength: i32) -> u8 { return if ucol_strcoll(coll, source, sourceLength, target, targetLength) == 0 { 1 } else { 0 } }
+pub fn ucol_greater(coll: usize, source: usize, sourceLength: i32, target: usize, targetLength: i32) -> u8 { return if ucol_strcoll(coll, source, sourceLength, target, targetLength) > 0 { 1 } else { 0 } }
+pub fn ucol_greaterOrEqual(coll: usize, source: usize, sourceLength: i32, target: usize, targetLength: i32) -> u8 { return if ucol_strcoll(coll, source, sourceLength, target, targetLength) >= 0 { 1 } else { 0 } }
+
+// UTF-8 into code points (ill-formed bytes as U+FFFD).
+pub fn decode8(out: *m.Buffer, s: usize, length: i32) -> void {
+    const count = if s == 0 { 0 } else if length < 0 { m.cLength(s) } else { @intCast(usize, length) }
+    var index: usize = 0
+    while index < count {
+        var used: i32 = 0
+        const c = decodeOne(s + index, count - index, &used)
+        m.push(out, @intCast(u32, c))
+        index += @intCast(usize, used)
+    }
+}
+
+fn decodeOne(s: usize, available: usize, used: *i32) -> i32 {
+    const lead = @intCast(i32, m.get8(s))
+    used.* = 1
+    if lead < 128 { return lead }
+    var need: usize = 0
+    var c: i32 = 0
+    var low: u8 = 128
+    var high: u8 = 191
+    if lead >= 194 && lead <= 223 {
+        need = 1
+        c = lead & 31
+    } else if lead >= 224 && lead <= 239 {
+        need = 2
+        c = lead & 15
+        if c == 0 { low = 160 }
+        if c == 13 { high = 159 }
+    } else if lead >= 240 && lead <= 244 {
+        need = 3
+        c = lead & 7
+        if c == 0 { low = 144 }
+        if c == 4 { high = 143 }
+    } else {
+        return 65533
+    }
+    var k: usize = 1
+    while k <= need {
+        if k >= available { return 65533 }
+        const t = m.get8(s + k)
+        if t < low || t > high { return 65533 }
+        low = 128
+        high = 191
+        c = (c << 6) | @intCast(i32, t & 63)
+        used.* = @intCast(i32, k + 1)
+        k += 1
+    }
+    return c
+}
+
+pub fn ucol_strcollUTF8(coll: usize, source: usize, sourceLength: i32, target: usize, targetLength: i32, status: usize) -> i32 {
+    if m.failed(status) { return 0 }
+    var a = m.buffer()
+    var b = m.buffer()
+    decode8(&a, source, sourceLength)
+    decode8(&b, target, targetLength)
+    const result = compareCodes(coll, &a, &b)
+    m.dispose(&a)
+    m.dispose(&b)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// UCharIterator (uiter.h): a C struct of functions; those of strings
+// and UTF-8 are these.
+
+const IT_CONTEXT: usize = 0
+const IT_LENGTH: usize = 8
+const IT_START: usize = 12
+const IT_INDEX: usize = 16
+const IT_LIMIT: usize = 20
+const IT_RESERVED: usize = 24
+const IT_GET_INDEX: usize = 32
+const IT_MOVE: usize = 40
+const IT_HAS_NEXT: usize = 48
+const IT_HAS_PREVIOUS: usize = 56
+const IT_CURRENT: usize = 64
+const IT_NEXT: usize = 72
+const IT_PREVIOUS: usize = 80
+const IT_GET_STATE: usize = 96
+const IT_SET_STATE: usize = 104
+const ITERATOR_SIZE: usize = 112
+
+const START: i32 = 0
+const CURRENT: i32 = 1
+const LIMIT: i32 = 2
+const ZERO: i32 = 3
+const LENGTH: i32 = 4
+
+const Move = fn(usize, i32, i32) -> i32
+const Step = fn(usize) -> i32
+
+// A string's iterator: the UTF-16 units at `context`.
+fn stringGetIndex(it: usize, origin: i32) -> i32 {
+    if origin == START { return m.getI32(it + IT_START) }
+    if origin == LIMIT { return m.getI32(it + IT_LIMIT) }
+    if origin == LENGTH { return m.getI32(it + IT_LENGTH) }
+    if origin == ZERO { return 0 }
+    return m.getI32(it + IT_INDEX)
+}
+
+fn stringMove(it: usize, delta: i32, origin: i32) -> i32 {
+    var position = delta
+    if origin == CURRENT { position += m.getI32(it + IT_INDEX) }
+    if origin == LIMIT { position += m.getI32(it + IT_LIMIT) }
+    if origin == START { position += m.getI32(it + IT_START) }
+    if origin == LENGTH { position += m.getI32(it + IT_LENGTH) }
+    if position < m.getI32(it + IT_START) { position = m.getI32(it + IT_START) }
+    if position > m.getI32(it + IT_LIMIT) { position = m.getI32(it + IT_LIMIT) }
+    m.putI32(it + IT_INDEX, position)
+    return position
+}
+
+fn stringHasNext(it: usize) -> u8 { return if m.getI32(it + IT_INDEX) < m.getI32(it + IT_LIMIT) { 1 } else { 0 } }
+fn stringHasPrevious(it: usize) -> u8 { return if m.getI32(it + IT_INDEX) > m.getI32(it + IT_START) { 1 } else { 0 } }
+
+fn stringCurrent(it: usize) -> i32 {
+    const index = m.getI32(it + IT_INDEX)
+    if index >= m.getI32(it + IT_LIMIT) { return -1 }
+    return @intCast(i32, m.get16(m.getWord(it + IT_CONTEXT) + @intCast(usize, index) * 2))
+}
+
+fn stringNext(it: usize) -> i32 {
+    const c = stringCurrent(it)
+    if c >= 0 { m.putI32(it + IT_INDEX, m.getI32(it + IT_INDEX) + 1) }
+    return c
+}
+
+fn stringPrevious(it: usize) -> i32 {
+    const index = m.getI32(it + IT_INDEX)
+    if index <= m.getI32(it + IT_START) { return -1 }
+    m.putI32(it + IT_INDEX, index - 1)
+    return @intCast(i32, m.get16(m.getWord(it + IT_CONTEXT) + @intCast(usize, index - 1) * 2))
+}
+
+fn stringGetState(it: usize) -> u32 { return @intCast(u32, m.getI32(it + IT_INDEX)) }
+
+fn stringSetState(it: usize, state: u32, status: usize) -> void { _ = stringMove(it, @intCast(i32, state), ZERO) }
+
+fn setFunctions(it: usize) -> void {
+    m.putWord(it + IT_GET_INDEX, @intFromPtr(stringGetIndex))
+    m.putWord(it + IT_MOVE, @intFromPtr(stringMove))
+    m.putWord(it + IT_HAS_NEXT, @intFromPtr(stringHasNext))
+    m.putWord(it + IT_HAS_PREVIOUS, @intFromPtr(stringHasPrevious))
+    m.putWord(it + IT_CURRENT, @intFromPtr(stringCurrent))
+    m.putWord(it + IT_NEXT, @intFromPtr(stringNext))
+    m.putWord(it + IT_PREVIOUS, @intFromPtr(stringPrevious))
+    m.putWord(it + IT_GET_STATE, @intFromPtr(stringGetState))
+    m.putWord(it + IT_SET_STATE, @intFromPtr(stringSetState))
+}
+
+pub fn uiter_setString(it: usize, s: usize, length: i32) -> void {
+    if it == 0 { return }
+    m.zero(it, ITERATOR_SIZE)
+    const count = if s == 0 { 0 } else { m.units(s, length) }
+    m.putWord(it + IT_CONTEXT, s)
+    m.putI32(it + IT_LENGTH, @intCast(i32, count))
+    m.putI32(it + IT_LIMIT, @intCast(i32, count))
+    setFunctions(it)
+}
+
+// UTF-8: the bytes at `context`; the index counts bytes, and a trail
+// surrogate still to give waits in the reserved field.
+fn utf8Next(it: usize) -> i32 {
+    const pending = m.getI32(it + IT_RESERVED)
+    if pending != 0 {
+        m.putI32(it + IT_RESERVED, 0)
+        return pending
+    }
+    const index = m.getI32(it + IT_INDEX)
+    const limit = m.getI32(it + IT_LIMIT)
+    if index >= limit { return -1 }
+    var used: i32 = 0
+    const c = decodeOne(m.getWord(it + IT_CONTEXT) + @intCast(usize, index), @intCast(usize, limit - index), &used)
+    m.putI32(it + IT_INDEX, index + used)
+    if c >= 65536 {
+        m.putI32(it + IT_RESERVED, (c & 1023) | 56320)
+        return (c >> 10) + 55232
+    }
+    return c
+}
+
+fn utf8Move(it: usize, delta: i32, origin: i32) -> i32 {
+    // (Only to the start or the end: what reading through needs.)
+    m.putI32(it + IT_RESERVED, 0)
+    const position = if origin == LIMIT || origin == LENGTH { m.getI32(it + IT_LIMIT) } else { 0 }
+    m.putI32(it + IT_INDEX, position)
+    return position
+}
+
+pub fn uiter_setUTF8(it: usize, s: usize, length: i32) -> void {
+    if it == 0 { return }
+    m.zero(it, ITERATOR_SIZE)
+    const count = if s == 0 { 0 } else if length < 0 { m.cLength(s) } else { @intCast(usize, length) }
+    m.putWord(it + IT_CONTEXT, s)
+    m.putI32(it + IT_LENGTH, -1)
+    m.putI32(it + IT_LIMIT, @intCast(i32, count))
+    setFunctions(it)
+    m.putWord(it + IT_MOVE, @intFromPtr(utf8Move))
+    m.putWord(it + IT_NEXT, @intFromPtr(utf8Next))
+}
+
+pub fn uiter_current32(it: usize) -> i32 {
+    const c = callStep(it, IT_CURRENT)
+    if c >= 55296 && c <= 56319 {
+        _ = callStep(it, IT_NEXT)
+        const trail = callStep(it, IT_CURRENT)
+        _ = callStep(it, IT_PREVIOUS)
+        if trail >= 56320 && trail <= 57343 { return (c << 10) + trail - 56613888 }
+    }
+    return c
+}
+
+pub fn uiter_next32(it: usize) -> i32 {
+    const c = callStep(it, IT_NEXT)
+    if c >= 55296 && c <= 56319 {
+        const trail = callStep(it, IT_NEXT)
+        if trail >= 56320 && trail <= 57343 { return (c << 10) + trail - 56613888 }
+        if trail >= 0 { _ = callStep(it, IT_PREVIOUS) }
+    }
+    return c
+}
+
+pub fn uiter_previous32(it: usize) -> i32 {
+    const c = callStep(it, IT_PREVIOUS)
+    if c >= 56320 && c <= 57343 {
+        const lead = callStep(it, IT_PREVIOUS)
+        if lead >= 55296 && lead <= 56319 { return (lead << 10) + c - 56613888 }
+        if lead >= 0 { _ = callStep(it, IT_NEXT) }
+    }
+    return c
+}
+
+pub fn uiter_getState(it: usize) -> u32 {
+    const function = m.getWord(it + IT_GET_STATE)
+    if function == 0 { return 0 }
+    const target: GetState = unsafe { @ptrFromInt(GetState, function) }
+    return target(it)
+}
+
+pub fn uiter_setState(it: usize, state: u32, status: usize) -> void {
+    if m.failed(status) { return }
+    const function = m.getWord(it + IT_SET_STATE)
+    if function == 0 {
+        m.setError(status, m.UNSUPPORTED_ERROR)
+        return
+    }
+    const target: SetState = unsafe { @ptrFromInt(SetState, function) }
+    target(it, state, status)
+}
+
+const GetState = fn(usize) -> u32
+const SetState = fn(usize, u32, usize) -> void
+
+fn callStep(it: usize, which: usize) -> i32 {
+    const target: Step = unsafe { @ptrFromInt(Step, m.getWord(it + which)) }
+    return target(it)
+}
+
+// The code units an iterator gives, from its start, as code points.
+fn readIterator(it: usize, out: *m.Buffer) -> void {
+    if m.getWord(it + IT_NEXT) == @intFromPtr(utf8Next) {
+        decode8(out, m.getWord(it + IT_CONTEXT), m.getI32(it + IT_LIMIT))
+        return
+    }
+    if m.getWord(it + IT_NEXT) == @intFromPtr(stringNext) {
+        m.decode16(out, m.getWord(it + IT_CONTEXT) + @intCast(usize, m.getI32(it + IT_START)) * 2, @intCast(usize, m.getI32(it + IT_LIMIT) - m.getI32(it + IT_START)))
+        return
+    }
+    const move: Move = unsafe { @ptrFromInt(Move, m.getWord(it + IT_MOVE)) }
+    _ = move(it, 0, START)
+    var units = m.buffer()
+    while true {
+        const unit = callStep(it, IT_NEXT)
+        if unit < 0 { break }
+        m.push(&units, @intCast(u32, unit))
+    }
+    var index: usize = 0
+    while index < units.length {
+        var c = m.at(&units, index)
+        index += 1
+        if c >= 55296 && c <= 56319 && index < units.length {
+            const trail = m.at(&units, index)
+            if trail >= 56320 && trail <= 57343 {
+                c = (c << 10) + trail - 56613888
+                index += 1
+            }
+        }
+        m.push(out, c)
+    }
+    m.dispose(&units)
+}
+
+pub fn ucol_strcollIter(coll: usize, first: usize, second: usize, status: usize) -> i32 {
+    if m.failed(status) { return 0 }
+    if coll == 0 || first == 0 || second == 0 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return 0
+    }
+    var a = m.buffer()
+    var b = m.buffer()
+    readIterator(first, &a)
+    readIterator(second, &b)
+    const result = compareCodes(coll, &a, &b)
+    m.dispose(&a)
+    m.dispose(&b)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Sort keys: the levels' weights, each level ended by 1, the whole by 0.
+// A weight is written in bytes of seven bits each (2 added, so that no
+// byte is 0 or 1), as many for each weight of a level: the primaries in
+// five, the secondaries in three, the case in one, the tertiaries in
+// two, the quaternaries in five, the code points of the identical level
+// in three.
+
+fn appendWeight(key: *m.Buffer, weight: u32, count: u32) -> void {
+    var index = count
+    while index > 0 {
+        index -= 1
+        m.push(key, ((weight >> @intCast(u5, index * 7)) & 127) + 2)
+    }
+}
+
+fn weightBytes(which: u32) -> u32 {
+    if which == LEVEL_PRIMARY || which == LEVEL_QUATERNARY { return 5 }
+    if which == LEVEL_SECONDARY { return 3 }
+    if which == LEVEL_CASE { return 1 }
+    return 2
+}
+
+pub fn ucol_getSortKey(coll: usize, source: usize, length: i32, result: usize, capacity: i32) -> i32 {
+    const c = collator(coll)
+    var text = m.buffer()
+    m.decode16(&text, source, if source == 0 { 0 } else { m.units(source, length) })
+    var nfd = m.buffer()
+    e.toNFD(&text, &nfd)
+    var ces = m.buffer()
+    elementsOf(c, &nfd, &ces)
+    var key = m.buffer()
+    var which: u32 = LEVEL_PRIMARY
+    while which <= LEVEL_QUATERNARY {
+        if includesLevel(c, which) {
+            var weights = m.buffer()
+            level(c, &ces, which, &weights)
+            var index: usize = 0
+            const backwards = which == LEVEL_SECONDARY && c.*.attributes[@intCast(usize, FRENCH_COLLATION)] == ON
+            while index < weights.length {
+                appendWeight(&key, if backwards { m.at(&weights, weights.length - 1 - index) } else { m.at(&weights, index) }, weightBytes(which))
+                index += 1
+            }
+            m.dispose(&weights)
+            m.push(&key, 1)
+        }
+        which += 1
+    }
+    if c.*.attributes[@intCast(usize, STRENGTH)] == IDENTICAL {
+        var index: usize = 0
+        while index < nfd.length {
+            appendWeight(&key, m.at(&nfd, index), 3)
+            index += 1
+        }
+    }
+    m.push(&key, 0)
+    const room = if capacity > 0 { @intCast(usize, capacity) } else { 0 }
+    var index: usize = 0
+    while index < key.length && index < room {
+        m.put8(result + index, @intCast(u8, m.at(&key, index) & 255))
+        index += 1
+    }
+    const total = key.length
+    m.dispose(&text)
+    m.dispose(&nfd)
+    m.dispose(&ces)
+    m.dispose(&key)
+    return @intCast(i32, total)
+}
+
+// ---------------------------------------------------------------------------
+// What collations there are: the locales CLDR has collation data for,
+// and their types.
+
+// With them the IDs ICU lists too, of the scripts and regions their data
+// is for (zh_Hant_TW: zh_Hant's): so that a lookup among the available
+// locales (Intl's) finds zh-TW's own.
+const MORE_AVAILABLE: []const u8 = "ar_SA\nhe_IL\nid_ID\nnb_NO\npa_Guru\npa_Guru_IN\nsr_Cyrl\nsr_Cyrl_BA\nsr_Cyrl_ME\nsr_Cyrl_RS\nsr_Latn_BA\nsr_Latn_RS\nzh_Hans\nzh_Hans_CN\nzh_Hans_SG\nzh_Hant_HK\nzh_Hant_MO\nzh_Hant_TW\n"
+
+// The list, made once: the IDs' addresses (C strings), sorted.
+var availableList: usize = 0
+var availableTotal: usize = 0
+
+fn textBefore(a: []const u8, b: []const u8) -> bool {
+    var index: usize = 0
+    while index < a.length && index < b.length {
+        if a[index] != b[index] { return a[index] < b[index] }
+        index += 1
+    }
+    return a.length < b.length
+}
+
+fn makeAvailable() -> void {
+    lockCache()
+    if availableList == 0 {
+        const list = m.alloc((builder.localeCount() + 64) * 8)
+        var count: usize = 0
+        var index: usize = 0
+        while index < builder.localeCount() {
+            if !sameLoosely(builder.localeAt(index), "root") {
+                m.putWord(list + count * 8, builder.localeAddress(index))
+                count += 1
+            }
+            index += 1
+        }
+        var start: usize = 0
+        index = 0
+        while index < MORE_AVAILABLE.length {
+            if MORE_AVAILABLE[index] == 10 {
+                const name = MORE_AVAILABLE[start..index]
+                const copy = m.alloc(name.length + 1)
+                m.copy(copy, @intFromPtr(name.pointer), name.length)
+                m.putWord(list + count * 8, copy)
+                count += 1
+                start = index + 1
+            }
+            index += 1
+        }
+        // Sorted (insertion: a few hundred).
+        var i: usize = 1
+        while i < count {
+            const item = m.getWord(list + i * 8)
+            var j = i
+            while j > 0 && textBefore(m.cSlice(item), m.cSlice(m.getWord(list + (j - 1) * 8))) {
+                m.putWord(list + j * 8, m.getWord(list + (j - 1) * 8))
+                j -= 1
+            }
+            m.putWord(list + j * 8, item)
+            i += 1
+        }
+        availableTotal = count
+        availableList = list
+    }
+    unlockCache()
+}
+
+fn availableCount() -> usize {
+    makeAvailable()
+    return availableTotal
+}
+
+fn availableAt(index: usize) -> usize { return m.getWord(availableList + index * 8) }
+
+pub fn ucol_countAvailable() -> i32 { return @intCast(i32, availableCount()) }
+
+pub fn ucol_getAvailable(index: i32) -> usize {
+    if index < 0 || @intCast(usize, index) >= availableCount() { return 0 }
+    return availableAt(@intCast(usize, index))
+}
+
+pub fn ucol_openAvailableLocales(status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    var lines = m.bytesBuffer()
+    var index: usize = 0
+    while index < availableCount() {
+        m.pushText(&lines, m.cSlice(availableAt(index)))
+        m.pushByte(&lines, 10)
+        index += 1
+    }
+    const en = enumeration.ofLines(m.bytesText(&lines), status)
+    m.disposeBytes(&lines)
+    return en
+}
+
+pub fn ucol_getKeywords(status: usize) -> usize { return enumeration.ofLines("collation\n", status) }
+
+fn isCollationKeyword(keyword: usize) -> bool { return keyword != 0 && sameLoosely(m.cSlice(keyword), "collation") }
+
+pub fn ucol_getKeywordValues(keyword: usize, status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    if !isCollationKeyword(keyword) {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return 0
+    }
+    var lines = m.bytesBuffer()
+    m.pushText(&lines, "standard\n")
+    var key: usize = 0
+    while key < builder.ruleCountOf() {
+        const name = builder.ruleKeyAt(key)
+        var slash: usize = 0
+        while slash < name.length && name[slash] != 47 { slash += 1 }
+        const kind = name[slash + 1..name.length]
+        if !(kind.length > 8 && sameLoosely(kind[0..8], "private-")) && !builder.listed(m.bytesText(&lines), kind) {
+            m.pushText(&lines, kind)
+            m.pushByte(&lines, 10)
+        }
+        key += 1
+    }
+    const en = enumeration.ofLines(m.bytesText(&lines), status)
+    m.disposeBytes(&lines)
+    return en
+}
+
+pub fn ucol_getKeywordValuesForLocale(key: usize, locale: usize, commonlyUsed: i8, status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    var lines = m.bytesBuffer()
+    builder.typesOf(if locale == 0 { localeModule.defaultLocale() } else { m.cSlice(locale) }, &lines)
+    const en = enumeration.ofLines(m.bytesText(&lines), status)
+    m.disposeBytes(&lines)
+    return en
+}
+
+pub fn ucol_getLocaleByType(coll: usize, kind: i32, status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    if coll == 0 { return m.literal("root\x00") }
+    return @intFromPtr(&collator(coll).*.locale)
+}
+
+pub fn ucol_getReorderCodes(coll: usize, dest: usize, capacity: i32, status: usize) -> i32 {
+    if m.failed(status) { return 0 }
+    const c = collator(coll)
+    const count = c.*.reorder.length
+    if capacity < @intCast(i32, count) {
+        if count > 0 { m.setError(status, m.BUFFER_OVERFLOW_ERROR) }
+        return @intCast(i32, count)
+    }
+    var index: usize = 0
+    while index < count {
+        m.put32(dest + index * 4, m.at(&c.*.reorder, index))
+        index += 1
+    }
+    return @intCast(i32, count)
+}
+
+pub fn ucol_setReorderCodes(coll: usize, codes: usize, length: i32, status: usize) -> void {
+    if m.failed(status) || coll == 0 { return }
+    const c = collator(coll)
+    c.*.reorder.length = 0
+    if codes != 0 && length > 0 {
+        if length == 1 && m.getI32(codes) == DEFAULT {
+            if c.*.tailoring != 0 {
+                const t = e.tailoringAt(c.*.tailoring)
+                var index: usize = 0
+                while index < t.*.reorder.length {
+                    m.push(&c.*.reorder, m.at(&t.*.reorder, index))
+                    index += 1
+                }
+            }
+        } else if !(length == 1 && m.getI32(codes) == e.SCRIPT_UNKNOWN) {
+            var index: usize = 0
+            while index < @intCast(usize, length) {
+                m.push(&c.*.reorder, m.get32(codes + index * 4))
+                index += 1
+            }
+        }
+    }
+    makeRanges(c)
+}
+
+pub fn ucol_getRules(coll: usize, length: usize) -> usize {
+    if coll != 0 && collator(coll).*.tailoring != 0 {
+        const t = e.tailoringAt(collator(coll).*.tailoring)
+        if length != 0 { m.putI32(length, @intCast(i32, t.*.rulesLength)) }
+        return t.*.rulesUnits
+    }
+    if length != 0 { m.putI32(length, 0) }
+    return @intFromPtr(&emptyRules)
+}
+
+var emptyRules: [2]u16 = [2]u16{ 0, 0 }
+
+pub fn ucol_getVersion(coll: usize, version: usize) -> void {
+    m.put8(version, 16)
+    m.put8(version + 1, 0)
+    m.put8(version + 2, 0)
+    m.put8(version + 3, 0)
+}
+
+pub fn ucol_getUCAVersion(coll: usize, version: usize) -> void { ucol_getVersion(coll, version) }
+
+// The variable top: the last primary of a group (UCOL_REORDER_CODE_SPACE
+// to _CURRENCY), or the primary of a string (ucol_setVariableTop: that
+// primary itself, as before ICU 53).
+pub fn ucol_getMaxVariable(coll: usize) -> i32 { return e.GROUP_SPACE + collator(coll).*.maxVariable }
+
+pub fn ucol_setMaxVariable(coll: usize, group: i32, status: usize) -> void {
+    if m.failed(status) || coll == 0 { return }
+    const c = collator(coll)
+    var value = group
+    if value == DEFAULT {
+        value = e.GROUP_PUNCTUATION
+        if c.*.tailoring != 0 && e.tailoringAt(c.*.tailoring).*.maxVariable >= 0 { value = e.GROUP_SPACE + e.tailoringAt(c.*.tailoring).*.maxVariable }
+    }
+    if value < e.GROUP_SPACE || value > e.GROUP_CURRENCY {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return
+    }
+    c.*.maxVariable = value - e.GROUP_SPACE
+    c.*.variableTop = e.groupLastPrimary(value)
+}
+
+pub fn ucol_getVariableTop(coll: usize, status: usize) -> u32 {
+    if m.failed(status) || coll == 0 { return 0 }
+    return collator(coll).*.variableTop
+}
+
+pub fn ucol_setVariableTop(coll: usize, varTop: usize, length: i32, status: usize) -> u32 {
+    if m.failed(status) || coll == 0 { return 0 }
+    const c = collator(coll)
+    var text = m.buffer()
+    m.decode16(&text, varTop, if varTop == 0 { 0 } else { m.units(varTop, length) })
+    var nfd = m.buffer()
+    e.toNFD(&text, &nfd)
+    var ces = m.buffer()
+    e.elements(source(c), &nfd, &ces)
+    var primary: u32 = 0
+    var index: usize = 0
+    while index < ces.length {
+        if m.at(&ces, index) != 0 {
+            primary = m.at(&ces, index)
+            break
+        }
+        index += 2
+    }
+    m.dispose(&text)
+    m.dispose(&nfd)
+    m.dispose(&ces)
+    if primary == 0 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return 0
+    }
+    c.*.variableTop = primary
+    return primary
+}
+
+pub fn ucol_restoreVariableTop(coll: usize, varTop: u32, status: usize) -> void {
+    if m.failed(status) || coll == 0 { return }
+    collator(coll).*.variableTop = varTop
+}
