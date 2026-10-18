@@ -172,8 +172,8 @@ which then names only the `--library` libraries (none, for an image that
 imports nothing; imports, if there are any, bind against whatever the
 loading process has). `tests/support/plugin_freestanding.mlx`, built with
 both and checked by `tests/run_foreign.sh` (no `NEEDED` entry; under
-`strace`, no mapping per call), is the shape of mlxlibc: `projects/libc`
-(its [README](../../projects/libc/README.md)), built by
+`strace`, no mapping per call), is the shape of mlxlibc: `compiler/libc`
+(its [README](../../compiler/libc/README.md)), built by
 `tools/build_mlxlibc.sh` as `libmlxc.so.1` with no `DT_NEEDED` at all and
 checked against glibc by `tools/check_mlxlibc.sh`.
 
@@ -185,7 +185,7 @@ leaves it (`argc` at `@frameAddress() + 8` inside the entry export); named
 as a program's `PT_INTERP`, the kernel maps it after the program and enters
 it the same way, the program's headers and entry in the aux vector. That is
 how mlxlibc is the dynamic loader of the programs on it
-(`projects/libc/start.mlx`, `loader.mlx`): the entry export maps the
+(`compiler/libc/start.mlx`, `loader.mlx`): the entry export maps the
 program's `DT_NEEDED` libraries, relocates everything and jumps to the
 program's `_start`. `DT_INIT` is for the other direction: a dynamic linker
 that loads the object (glibc's, for a program linked against libmlxc next

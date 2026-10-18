@@ -209,7 +209,11 @@ zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
 `daysFromCivil` convert between seconds and the proleptic Gregorian
 calendar (`tests/279_timezone_runtime.mlx`).
 `std.process.environmentFrom(entries, name)` looks a name up in any
-NUL-terminated environment list, which `load` uses.
+NUL-terminated environment list, which `load` uses. `std.timezone.database`
+is the whole IANA database built in, by zone ID, reckoned with the same
+civil calendar; `std.unicode` is Unicode and CLDR's locale data
+(collation, normalization, IDNA, calendars, formatting): see
+[Unicode and locales](unicode.md).
 
 `std.xkb` (`std/src/xkb.mlx`, with `std/src/xkb/`) is XKB without
 libxkbcommon, behaving as libxkbcommon 1.6 does. `std.xkb.parse` reads
@@ -329,10 +333,66 @@ file that is not a PNG, finds a truncated one corrupt, and checks
 `saveFile(path, pixels, width, height, stride, alpha, allocator)` writes
 premultiplied ARGB words (rows `stride` words apart) as an 8-bit RGBA PNG,
 or RGB with `alpha` false, and returns whether it was written: each row
-with the filter that leaves the smallest differences, deflated with fixed
-Huffman codes and LZ77 matches over a 32 KiB window. `mlx-capture`
+with the filter that leaves the smallest differences, compressed by
+`std.flate` (zlib's level 6), the chunk CRCs by `std.crc`. `mlx-capture`
 saves captures with it. `tests/292_png_encode_runtime.mlx` writes an image
 both ways and reads it back with `loadFile`.
+
+`std.flate` (`std/src/flate.mlx`, its parts in `std/src/flate/`) is the
+repository's one DEFLATE implementation: raw deflate data (RFC 1951), zlib
+streams (RFC 1950) and gzip members (RFC 1952), compressed and
+decompressed. The compressor is zlib's (1.3.1) step for step, every level
+(0 stored, 1 to 3 fast, 4 to 9 lazy matching) and strategy, so its bytes
+are zlib's; the decompressor is zlib's state machine, taking input and
+output in pieces of any size and checking the check values.
+
+```mlx
+const flate = @import("std.flate")
+
+// All at once, into the caller's buffer (0: did not fit, or damaged):
+const room = flate.compressBound(length, flate.Format.zlib)
+const made = flate.compress(data, length, output, room, 6, flate.Format.zlib, allocator)
+const size = flate.decompress(input, count, buffer, capacity, flate.Format.gzip)
+
+// All at once, into an allocator's memory, growing as needed:
+var result: flate.Buffer = undefined
+if flate.decompressAlloc(allocator, input, count, flate.Format.detect, &result) == flate.Status.done {
+    // result.bytes[0..result.length]
+    flate.freeBuffer(allocator, &result)
+}
+
+// In pieces:
+var deflater: flate.Deflater = undefined
+if flate.deflaterInit(&deflater, allocator, flate.options(9, flate.Format.gzip)) == flate.Status.ok {
+    var progress: flate.Progress = undefined
+    const status = flate.deflaterRun(&deflater, piece, pieceLength, out, 4096, flate.Flush.finish, &progress)
+    // progress.consumed taken, progress.produced written; again until Status.done
+    flate.deflaterEnd(&deflater)
+}
+```
+
+`Format` is `raw`, `zlib`, `gzip` or `detect` (decompression: zlib or
+gzip, as the header says); `Status` is `ok`, `done`, `needDictionary`,
+`damaged`, `noMemory`, `stuck` (no progress without more input or room)
+or `misuse`; `Flush` and `Strategy` are zlib's flushes and strategies, and
+`options(level, format)` gives a compressor's `Options` with zlib's
+defaults for the rest (a 32 KiB window, memory level 8). The deflater
+also takes a dictionary, a gzip `Header`, new parameters on the way and
+`deflaterBound`; the inflater a dictionary and a place for the gzip
+header it reads, and `message(&inflater.stream)` words what was wrong
+("incorrect header check"...). `decompress` needs no allocator (its state
+is 8 KiB of stack). `inflate` (raw data), `gunzip` and `gzipSize` are the
+earlier one-call forms. The engine itself (`std.flate.deflate`,
+`std.flate.inflate`, on a `Stream` with zlib's return codes) is what the
+zlib C API, `compiler/capi/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
+programs), is made of. `tests/343_flate_runtime.mlx` checks zlib's bytes,
+round trips in every format and in pieces, and damaged data.
+
+`std.crc` (`std/src/crc.mlx`) has the check values: `crc32(crc, data,
+length)` (the CRC-32 of gzip, zlib, PNG and ZIP, 0 to start),
+`adler32(adler, data, length)` (1 to start), `crc32Join` and `adler32Join`
+(the value of two pieces put together), and `cksum(data, length)` with
+`cksumUpdate` and `cksumFinish` (the CRC of POSIX cksum).
 
 ## Core: allocators
 

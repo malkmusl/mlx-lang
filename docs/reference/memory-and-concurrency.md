@@ -240,7 +240,7 @@ const tid = @spawnThread(flags, top, @intFromPtr(&shared.parentTid), @intFromPtr
   on x86_64, `x29` on aarch64), which every Mlx function keeps: the saved
   caller frame pointer is there, the return address one word above it, and
   above that the arguments the caller passed on the stack. A variadic C
-  function written in Mlx (mlxlibc's `printf`, `projects/libc/format.mlx`)
+  function written in Mlx (mlxlibc's `printf`, `compiler/libc/format.mlx`)
   builds its `va_list` from it: the register arguments it declared, then
   the caller's stack words from `@frameAddress() + 16`.
 

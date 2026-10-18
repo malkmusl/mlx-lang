@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# mlx-cc, the C compiler in Mlx (projects/cc):
+# mlx-cc, the C compiler in Mlx (compiler/cc):
 #
 #   - it builds with the Mlx compiler, and finds its own headers next to
 #     the program (include/);
-#   - -E: projects/cc/tests/preprocess.c (C11 6.10.3.5's examples and
+#   - -E: compiler/cc/tests/preprocess.c (C11 6.10.3.5's examples and
 #     more directives) preprocesses to preprocess.expected;
-#   - every test program in projects/cc/tests (NAME.c, with NAME2.c as its
+#   - every test program in compiler/cc/tests (NAME.c, with NAME2.c as its
 #     second file when there is one, and the options of NAME.flags, such
 #     as -std=c23) compiles, and runs printing what NAME.expected says
 #     (stdout and stderr, then the exit status), as the program gcc made
@@ -34,13 +34,13 @@ work=$(mktemp -d /tmp/mlx-cc.XXXXXX)
 trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 
-"$compiler" --quiet projects/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
-cp -r projects/cc/include "$work/include"
+"$compiler" --quiet compiler/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
+cp -r compiler/cc/include "$work/include"
 cc="$work/mlx-cc"
-"$compiler" --quiet projects/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
+"$compiler" --quiet compiler/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
 echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ar"
 
-tests=projects/cc/tests
+tests=compiler/cc/tests
 (cd "$tests" && "$cc" -E preprocess.c) > "$work/preprocess.out" 2> "$work/preprocess.err" || fail "-E: $(head -3 "$work/preprocess.err")"
 cmp -s "$tests/preprocess.expected" "$work/preprocess.out" || fail "-E differs: $(diff "$tests/preprocess.expected" "$work/preprocess.out" | head -10)"
 echo "ok   -E: the C11 examples expand as the standard says"

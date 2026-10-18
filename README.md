@@ -67,7 +67,7 @@ Read `AGENT_IMPLEMENTATION.md` and `SPEC_INDEX.md` before implementation.
   extensions: Wayland, Vulkan and `std.gpu`, SPIR-V, fonts, UI, ...).
 - `projects/`: programs written in Mlx: the desktop (a Wayland
   compositor and its clients), MLX Observatory, coreutils, mlxlibc (the
-  C library, `projects/libc`), mlx-init (PID 1, `projects/init`), mlx-sh
+  C library, `compiler/libc`), mlx-init (PID 1, `projects/init`), mlx-sh
   (the shell, `projects/shell`) and mlx-console (the terminal on the
   framebuffer, `projects/console`).
 - `examples/`: small programs that show one thing each.
