@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Writes tests/abi.c: a C program printing the size of every structure the
-# API modules (projects/freetype/api) declare, the offset of each of its
+# API modules (compiler/capi/freetype/api) declare, the offset of each of its
 # fields, the value of every constant and enumerator, and the header
 # names. Compiled against FreeType's own headers it prints abi.expected;
 # compiled by mlx-cc against the generated headers it must print the same.
 #
-#   python3 projects/freetype/tests/abi.py > projects/freetype/tests/abi.c
+#   python3 compiler/capi/freetype/tests/abi.py > compiler/capi/freetype/tests/abi.c
 import os
 import re
 import sys
