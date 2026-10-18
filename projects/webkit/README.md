@@ -89,9 +89,10 @@ output file, and supplemental_dependency.tmp lists the IDL files by
 path, the generated one among them.
 
 ANGLE's 305 sources (WebKit's CMake build compiles 307: two are its
-precompiled headers, here `-include ANGLEPrefix.h`) compile with mlx-cc
-but four, which include `<zlib.h>`: MemoryProgramCache.cpp, Program.cpp,
-angletypes.cpp and third_party/zlib/google/compression_utils_portable.cc
-use zlib's deflate and inflate streams, a library WebKit takes from the
-system and this repository does not have yet. libGLESv2.a is made;
-libANGLE.a waits for those four.
+precompiled headers, here `-include ANGLEPrefix.h`) compile with mlx-cc,
+and libANGLE.a and libGLESv2.a are made. Four include `<zlib.h>`
+(MemoryProgramCache.cpp, Program.cpp, angletypes.cpp and
+third_party/zlib/google/compression_utils_portable.cc use zlib's deflate
+and inflate streams): theirs are mlx-zlib's headers
+(mlx-out/include/mlx-zlib, made by the step zlib-headers, projects/zlib),
+and the program linking ANGLE links mlx-out/lib/libmlxz.so.
