@@ -1,0 +1,999 @@
+// GFile (gfile.h) for the files of this system, and GFileMonitor.
+//
+// GFile is an interface; its one implementation here is GLocalFile, a
+// canonical absolute path (as GIO's glocalfile.c keeps it). A URI of
+// another scheme than file:// makes a GDummyFile that only knows its URI
+// (as GIO does without a VFS module for it). Reading, replacing,
+// deleting and making directories report GIO's errors with GIO's
+// messages; an etag is the modification time ("seconds:microseconds").
+//
+// A monitor watches with inotify (a descriptor of its own, the directory
+// itself or a file's directory, events of other files left out) from a
+// source in the thread-default main context it was made in, and emits
+// "changed" there, with the rules of GIO's monitor source: the first
+// change of a file is sent at once and starts a pending change; changes
+// while it is pending are sent at most once per rate limit (800 ms
+// unless set); the end of a write (CHANGES_DONE_HINT) ends it, and so do
+// two seconds without change (a "virtual" hint). A rename in the
+// directory is the old name deleted and the new one created; something
+// created that is not a regular file being written (a directory, a
+// link), or moved in, is done at once (CREATED, then the hint).
+const m = @import("./memory.mlx")
+const sys = @import("./sys.mlx")
+const threads = @import("./threads.mlx")
+const errors = @import("./errors.mlx")
+const messages = @import("./messages.mlx")
+const varargs = @import("./varargs.mlx")
+const types = @import("./types.mlx")
+const signals = @import("./signals.mlx")
+const closures = @import("./closures.mlx")
+const files = @import("./files.mlx")
+const utils = @import("./utils.mlx")
+const ioerrors = @import("./ioerrors.mlx")
+const cancellable = @import("./cancellable.mlx")
+
+extern("c") fn g_object_new(t: usize, first: usize) -> usize
+extern("c") fn g_object_ref(object: usize) -> usize
+extern("c") fn g_object_unref(object: usize) -> void
+extern("c") fn g_type_add_interface_static(t: usize, iface: usize, info: usize) -> void
+extern("c") fn g_type_interface_add_prerequisite(iface: usize, prerequisite: usize) -> void
+extern("c") fn g_type_check_instance_is_a(instance: usize, t: usize) -> i32
+extern("c") fn g_canonicalize_filename(filename: usize, relative_to: usize) -> usize
+extern("c") fn g_filename_to_uri(filename: usize, hostname: usize, err: usize) -> usize
+extern("c") fn g_filename_from_uri(uri: usize, hostname: usize, err: usize) -> usize
+extern("c") fn g_filename_display_name(filename: usize) -> usize
+extern("c") fn g_path_get_basename(path: usize) -> usize
+extern("c") fn g_path_get_dirname(path: usize) -> usize
+extern("c") fn g_uri_parse_scheme(uri: usize) -> usize
+extern("c") fn g_str_hash(text: usize) -> u32
+extern("c") fn g_ascii_strcasecmp(a: usize, b: usize) -> i32
+extern("c") fn g_get_current_dir() -> usize
+extern("c") fn g_get_home_dir() -> usize
+extern("c") fn g_bytes_new_take(data: usize, size: usize) -> usize
+extern("c") fn g_enum_register_static(name: usize, values: usize) -> usize
+extern("c") fn g_signal_emit(instance: usize, id: u32, detail: u32, a: usize, b: usize, c: usize) -> void
+extern("c") fn g_main_context_ref_thread_default() -> usize
+extern("c") fn g_main_context_unref(c: usize) -> void
+extern("c") fn g_source_new(funcs: usize, size: u32) -> usize
+extern("c") fn g_source_add_unix_fd(source: usize, fd: i32, events: i32) -> usize
+extern("c") fn g_source_set_static_name(source: usize, name: usize) -> void
+extern("c") fn g_source_set_ready_time(source: usize, ready_time: i64) -> void
+extern("c") fn g_source_attach(source: usize, context: usize) -> u32
+extern("c") fn g_source_destroy(source: usize) -> void
+extern("c") fn g_source_unref(source: usize) -> void
+extern("c") fn g_get_monotonic_time() -> i64
+extern("c") fn stat(path: usize, buffer: usize) -> i32
+extern("c") fn lstat(path: usize, buffer: usize) -> i32
+extern("c") fn fstat(fd: i32, buffer: usize) -> i32
+extern("c") fn mkdir(path: usize, mode: u32) -> i32
+extern("c") fn remove(path: usize) -> i32
+extern("c") fn rename(from: usize, to: usize) -> i32
+extern("c") fn fsync(fd: i32) -> i32
+extern("c") fn fchmod(fd: i32, mode: u32) -> i32
+extern("c") fn mkstemp(template: usize) -> i32
+
+const O_RDONLY: i32 = 0
+const O_WRONLY: i32 = 1
+const O_CREAT: i32 = 64
+const O_EXCL: i32 = 128
+const O_TRUNC: i32 = 512
+const O_CLOEXEC: i32 = 524288
+const S_IFMT: u32 = 0o170000
+const S_IFDIR: u32 = 0o040000
+const S_IFREG: u32 = 0o100000
+const S_IFLNK: u32 = 0o120000
+
+const SYS_inotify_init1: usize = 294
+const SYS_inotify_add_watch: usize = 254
+const SYS_inotify_rm_watch: usize = 255
+
+// A file: a GObject, the path (24, NULL for a dummy), the URI (32, of a
+// dummy).
+const F_PATH: usize = 24
+const F_URI: usize = 32
+const FILE_SIZE: usize = 40
+
+var fileType: usize = 0
+var fileOnce: u64 = 0
+var localType: usize = 0
+var dummyType: usize = 0
+var monitorType: usize = 0
+var monitorOnce: u64 = 0
+var eventType: usize = 0
+var changedSignal: u32 = 0
+var monitorFuncs: [6]usize = undefined
+var eventValues: [12]usize = undefined
+
+fn pathOf(file: usize) -> usize { return m.getWord(file + F_PATH) }
+
+// ---------------------------------------------------------------------------
+// The types
+
+export fn __mlx_glib_file_finalize(file: usize) -> void {
+    m.release(m.getWord(file + F_PATH))
+    m.release(m.getWord(file + F_URI))
+    ioerrors.chainUp(types.T_OBJECT, 48, file)
+}
+
+export fn __mlx_glib_file_class_init(class: usize, data: usize) -> void { m.putWord(class + 48, @intFromPtr(__mlx_glib_file_finalize)) }
+
+pub fn fileGType() -> usize {
+    if threads.onceEnter(@intFromPtr(&fileOnce)) {
+        types.ensureInit()
+        fileType = ioerrors.defineType(types.T_INTERFACE, "GFile", 16, 0, 0, 0, 0)
+        g_type_interface_add_prerequisite(fileType, types.T_OBJECT)
+        localType = ioerrors.defineType(types.T_OBJECT, "GLocalFile", 136, @intFromPtr(__mlx_glib_file_class_init), FILE_SIZE, 0, 0)
+        dummyType = ioerrors.defineType(types.T_OBJECT, "GDummyFile", 136, @intFromPtr(__mlx_glib_file_class_init), FILE_SIZE, 0, 0)
+        const info = m.alloc(24)
+        g_type_add_interface_static(localType, fileType, info)
+        g_type_add_interface_static(dummyType, fileType, info)
+        m.release(info)
+        threads.onceLeave(@intFromPtr(&fileOnce), 1)
+    }
+    return fileType
+}
+
+export fn g_file_get_type() -> usize { return fileGType() }
+
+// A local file of an absolute canonical path (taken over).
+fn localFile(path: usize) -> usize {
+    _ = fileGType()
+    const file = g_object_new(localType, 0)
+    m.putWord(file + F_PATH, path)
+    return file
+}
+
+fn dummyFile(uri: usize) -> usize {
+    _ = fileGType()
+    const file = g_object_new(dummyType, 0)
+    m.putWord(file + F_URI, m.dup(uri))
+    return file
+}
+
+pub fn newForPath(path: usize) -> usize { return localFile(g_canonicalize_filename(path, 0)) }
+
+export fn g_file_new_for_path(path: usize) -> usize { return newForPath(path) }
+
+export fn g_file_new_for_uri(uri: usize) -> usize {
+    const scheme = g_uri_parse_scheme(uri)
+    var file: usize = 0
+    if scheme != 0 && g_ascii_strcasecmp(scheme, m.literal("file")) == 0 {
+        const path = g_filename_from_uri(uri, 0, 0)
+        if path != 0 {
+            file = newForPath(path)
+            m.release(path)
+        }
+    }
+    m.release(scheme)
+    if file == 0 { file = dummyFile(uri) }
+    return file
+}
+
+export fn g_file_new_for_commandline_arg(arg: usize) -> usize {
+    if m.get8(arg) == '/' { return newForPath(arg) }
+    const scheme = g_uri_parse_scheme(arg)
+    if scheme != 0 {
+        m.release(scheme)
+        return g_file_new_for_uri(arg)
+    }
+    const cwd = g_get_current_dir()
+    const file = localFile(g_canonicalize_filename(arg, cwd))
+    m.release(cwd)
+    return file
+}
+
+export fn g_file_new_build_filename(first: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> usize {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ first, a1, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 1, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    var parts = m.words()
+    m.pushWord(&parts, first)
+    while true {
+        const next = varargs.nextPointer(list)
+        m.pushWord(&parts, next)
+        if next == 0 { break }
+    }
+    const path = utils.buildFilenameArray(parts.address)
+    m.disposeWords(&parts)
+    const file = newForPath(path)
+    m.release(path)
+    return file
+}
+
+export fn g_file_parse_name(parse_name: usize) -> usize {
+    const scheme = g_uri_parse_scheme(parse_name)
+    if scheme != 0 {
+        m.release(scheme)
+        return g_file_new_for_uri(parse_name)
+    }
+    if m.get8(parse_name) == '~' && (m.get8(parse_name + 1) == '/' || m.get8(parse_name + 1) == 0) {
+        var t = m.text()
+        m.pushC(&t, g_get_home_dir())
+        m.pushC(&t, parse_name + 1)
+        const file = newForPath(t.address)
+        m.dispose(&t)
+        return file
+    }
+    return newForPath(parse_name)
+}
+
+fn isLocal(file: usize) -> bool { return pathOf(file) != 0 }
+
+export fn g_file_dup(file: usize) -> usize {
+    if isLocal(file) { return localFile(m.dup(pathOf(file))) }
+    return dummyFile(m.getWord(file + F_URI))
+}
+
+export fn g_file_hash(file: usize) -> u32 { return g_str_hash(if isLocal(file) { pathOf(file) } else { m.getWord(file + F_URI) }) }
+
+export fn g_file_equal(a: usize, b: usize) -> i32 {
+    if a == b { return 1 }
+    if isLocal(a) != isLocal(b) { return 0 }
+    if isLocal(a) { return if m.cEqual(pathOf(a), pathOf(b)) { 1 } else { 0 } }
+    return if m.cEqual(m.getWord(a + F_URI), m.getWord(b + F_URI)) { 1 } else { 0 }
+}
+
+export fn g_file_get_basename(file: usize) -> usize {
+    if isLocal(file) { return g_path_get_basename(pathOf(file)) }
+    // A dummy: the last segment of its URI's path.
+    const uri = m.getWord(file + F_URI)
+    var last = uri
+    var p = uri
+    while m.get8(p) != 0 && m.get8(p) != '?' && m.get8(p) != '#' {
+        if m.get8(p) == '/' && m.get8(p + 1) != 0 { last = p + 1 }
+        p += 1
+    }
+    var end = last
+    while m.get8(end) != 0 && m.get8(end) != '/' && m.get8(end) != '?' && m.get8(end) != '#' { end += 1 }
+    return m.dupBytes(last, end - last)
+}
+
+export fn g_file_get_path(file: usize) -> usize { return if isLocal(file) { m.dup(pathOf(file)) } else { 0 } }
+export fn g_file_peek_path(file: usize) -> usize { return pathOf(file) }
+
+export fn g_file_get_uri(file: usize) -> usize {
+    if isLocal(file) { return g_filename_to_uri(pathOf(file), 0, 0) }
+    return m.dup(m.getWord(file + F_URI))
+}
+
+export fn g_file_get_parse_name(file: usize) -> usize {
+    if isLocal(file) { return g_filename_display_name(pathOf(file)) }
+    return m.dup(m.getWord(file + F_URI))
+}
+
+export fn g_file_get_parent(file: usize) -> usize {
+    if !isLocal(file) { return 0 }
+    const path = pathOf(file)
+    if m.cIs(path, "/") { return 0 }
+    return localFile(g_path_get_dirname(path))
+}
+
+export fn g_file_has_parent(file: usize, parent: usize) -> i32 {
+    const actual = g_file_get_parent(file)
+    if actual == 0 { return 0 }
+    const result = if parent == 0 { 1 } else { g_file_equal(actual, parent) }
+    g_object_unref(actual)
+    return result
+}
+
+export fn g_file_get_child(file: usize, name: usize) -> usize {
+    var t = m.text()
+    m.pushC(&t, pathOf(file))
+    m.pushByte(&t, '/')
+    m.pushC(&t, name)
+    const child = newForPath(t.address)
+    m.dispose(&t)
+    return child
+}
+
+export fn g_file_resolve_relative_path(file: usize, relative_path: usize) -> usize {
+    if m.get8(relative_path) == '/' { return newForPath(relative_path) }
+    return localFile(g_canonicalize_filename(relative_path, pathOf(file)))
+}
+
+// The part of `descendant`'s path under `prefix`'s, 0 when it is not.
+fn under(prefix: usize, descendant: usize) -> usize {
+    if !isLocal(prefix) || !isLocal(descendant) { return 0 }
+    const p = pathOf(prefix)
+    const d = pathOf(descendant)
+    const n = m.cLength(p)
+    if m.cLength(d) <= n || !m.same(m.bytes(p, n), m.bytes(d, n)) { return 0 }
+    if n == 1 && m.get8(p) == '/' { return d + 1 }
+    if m.get8(d + n) != '/' { return 0 }
+    return d + n + 1
+}
+
+export fn g_file_has_prefix(file: usize, prefix: usize) -> i32 { return if under(prefix, file) != 0 { 1 } else { 0 } }
+
+export fn g_file_get_relative_path(parent: usize, descendant: usize) -> usize {
+    const rest = under(parent, descendant)
+    return if rest == 0 { 0 } else { m.dup(rest) }
+}
+
+export fn g_file_is_native(file: usize) -> i32 { return if isLocal(file) { 1 } else { 0 } }
+
+export fn g_file_get_uri_scheme(file: usize) -> usize {
+    if isLocal(file) { return m.dupSlice("file") }
+    const scheme = g_uri_parse_scheme(m.getWord(file + F_URI))
+    if scheme != 0 {
+        var p = scheme
+        while m.get8(p) != 0 {
+            m.put8(p, m.lower(m.get8(p)))
+            p += 1
+        }
+    }
+    return scheme
+}
+
+export fn g_file_has_uri_scheme(file: usize, uri_scheme: usize) -> i32 {
+    const scheme = g_file_get_uri_scheme(file)
+    if scheme == 0 { return 0 }
+    const same = g_ascii_strcasecmp(scheme, uri_scheme) == 0
+    m.release(scheme)
+    return if same { 1 } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Questions and operations
+
+fn statMode(path: usize, follow: bool) -> u32 {
+    const buffer = m.alloc(144)
+    const result = if follow { stat(path, buffer) } else { lstat(path, buffer) }
+    const mode = if result == 0 { m.get32(buffer + 24) } else { 0 }
+    m.release(buffer)
+    return mode
+}
+
+export fn g_file_query_exists(file: usize, c: usize) -> i32 {
+    if !isLocal(file) { return 0 }
+    return if statMode(pathOf(file), true) != 0 { 1 } else { 0 }
+}
+
+export fn g_file_query_file_type(file: usize, flags: i32, c: usize) -> i32 {
+    if !isLocal(file) { return 0 }
+    const mode = statMode(pathOf(file), (flags & 1) == 0)
+    if mode == 0 { return 0 }
+    const kind = mode & S_IFMT
+    if kind == S_IFREG { return 1 }
+    if kind == S_IFDIR { return 2 }
+    if kind == S_IFLNK { return 3 }
+    return 4
+}
+
+// GIO's g_set_io_error: the message with the file's display name and the
+// errno's text, the code errno maps to.
+fn ioError(err: usize, prefix: []const u8, file: usize, errnum: i32) -> void {
+    if err == 0 { return }
+    const display = g_filename_display_name(pathOf(file))
+    var t = m.text()
+    m.pushText(&t, prefix)
+    m.pushC(&t, display)
+    m.pushText(&t, ": ")
+    m.pushC(&t, errors.errnoText(errnum))
+    m.release(display)
+    ioerrors.setText(err, ioerrors.fromErrno(errnum), &t)
+}
+
+fn notLocal(err: usize) -> void { ioerrors.set(err, ioerrors.NOT_SUPPORTED, "Operation not supported") }
+
+fn etagOf(buffer: usize) -> usize {
+    var t = m.text()
+    m.pushDecimal(&t, m.get64(buffer + 88))
+    m.pushByte(&t, ':')
+    m.pushDecimal(&t, m.get64(buffer + 96) / 1000)
+    return m.finish(&t)
+}
+
+export fn g_file_load_contents(file: usize, c: usize, contents: usize, length: usize, etag_out: usize, err: usize) -> i32 {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    if !isLocal(file) {
+        notLocal(err)
+        return 0
+    }
+    const fd = sys.open(pathOf(file), O_RDONLY | O_CLOEXEC, 0)
+    if fd < 0 {
+        ioError(err, "Error opening file ", file, sys.errno())
+        return 0
+    }
+    const buffer = m.alloc(144)
+    if fstat(fd, buffer) == 0 && (m.get32(buffer + 24) & S_IFMT) == S_IFDIR {
+        _ = sys.close(fd)
+        m.release(buffer)
+        ioerrors.set(err, ioerrors.IS_DIRECTORY, "Can’t open directory")
+        return 0
+    }
+    var size: usize = 0
+    const data = files.readAll(fd, &size)
+    const errnum = sys.errno()
+    _ = sys.close(fd)
+    if data == 0 {
+        m.release(buffer)
+        ioError(err, "Error reading from file ", file, errnum)
+        return 0
+    }
+    m.putWord(contents, data)
+    if length != 0 { m.putWord(length, size) }
+    if etag_out != 0 { m.putWord(etag_out, etagOf(buffer)) }
+    m.release(buffer)
+    return 1
+}
+
+export fn g_file_load_bytes(file: usize, c: usize, etag_out: usize, err: usize) -> usize {
+    const cells = m.alloc(16)
+    var bytes: usize = 0
+    if g_file_load_contents(file, c, cells, cells + 8, etag_out, err) != 0 { bytes = g_bytes_new_take(m.getWord(cells), m.getWord(cells + 8)) }
+    m.release(cells)
+    return bytes
+}
+
+fn writeAll(fd: i32, data: usize, length: usize) -> i32 {
+    var done: usize = 0
+    while done < length {
+        const n = sys.write(fd, data + done, length - done)
+        if n < 0 {
+            if sys.errno() == sys.EINTR { continue }
+            return sys.errno()
+        }
+        done += @intCast(usize, n)
+    }
+    return 0
+}
+
+// A new file is written in place. One that is there is written to a
+// temporary file in its directory (".goutputstream-XXXXXX", with its
+// mode) and renamed over it, as GIO does.
+export fn g_file_replace_contents(file: usize, contents: usize, length: usize, etag: usize, make_backup: i32, flags: i32, new_etag: usize, c: usize, err: usize) -> i32 {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    if !isLocal(file) {
+        notLocal(err)
+        return 0
+    }
+    const path = pathOf(file)
+    const buffer = m.alloc(144)
+    if etag != 0 && stat(path, buffer) == 0 {
+        const current = etagOf(buffer)
+        const same = m.cEqual(current, etag)
+        m.release(current)
+        if !same {
+            m.release(buffer)
+            ioerrors.set(err, 23, "The file was externally modified")
+            return 0
+        }
+    }
+    const exists = lstat(path, buffer) == 0
+    var mode: u32 = if (flags & 1) != 0 { 0o600 } else { 0o666 }
+    if exists && (flags & 1) == 0 { mode = m.get32(buffer + 24) & 0o7777 }
+    var tmp = m.text()
+    var fd: i32 = -1
+    if exists {
+        const dirname = g_path_get_dirname(path)
+        m.pushC(&tmp, dirname)
+        m.release(dirname)
+        m.pushText(&tmp, "/.goutputstream-XXXXXX")
+        fd = mkstemp(tmp.address)
+        if fd >= 0 { _ = fchmod(fd, mode) }
+    } else {
+        m.pushC(&tmp, path)
+        fd = sys.open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode)
+    }
+    if fd < 0 {
+        ioError(err, "Error opening file ", file, sys.errno())
+        m.dispose(&tmp)
+        m.release(buffer)
+        return 0
+    }
+    var failed = writeAll(fd, contents, length)
+    if failed == 0 && fsync(fd) != 0 { failed = sys.errno() }
+    _ = sys.close(fd)
+    if failed == 0 && exists && make_backup != 0 {
+        var backup = m.text()
+        m.pushC(&backup, path)
+        m.pushByte(&backup, '~')
+        _ = rename(path, backup.address)
+        m.dispose(&backup)
+    }
+    if failed == 0 && exists && rename(tmp.address, path) != 0 { failed = sys.errno() }
+    if failed != 0 {
+        _ = remove(tmp.address)
+        ioError(err, "Error writing to file ", file, failed)
+        m.dispose(&tmp)
+        m.release(buffer)
+        return 0
+    }
+    m.dispose(&tmp)
+    if new_etag != 0 { m.putWord(new_etag, if stat(path, buffer) == 0 { etagOf(buffer) } else { 0 }) }
+    m.release(buffer)
+    return 1
+}
+
+export fn g_file_delete(file: usize, c: usize, err: usize) -> i32 {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    if !isLocal(file) {
+        notLocal(err)
+        return 0
+    }
+    if remove(pathOf(file)) != 0 {
+        ioError(err, "Error removing file ", file, sys.errno())
+        return 0
+    }
+    return 1
+}
+
+export fn g_file_make_directory(file: usize, c: usize, err: usize) -> i32 {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    if !isLocal(file) {
+        notLocal(err)
+        return 0
+    }
+    if mkdir(pathOf(file), 0o777) != 0 {
+        const errnum = sys.errno()
+        if errnum == 22 {
+            ioerrors.set(err, 10, "Invalid filename")
+        } else {
+            ioError(err, "Error creating directory ", file, errnum)
+        }
+        return 0
+    }
+    return 1
+}
+
+// GIO's algorithm: make it, else its missing parents first.
+export fn g_file_make_directory_with_parents(file: usize, c: usize, err: usize) -> i32 {
+    if !isLocal(file) {
+        notLocal(err)
+        return 0
+    }
+    const cell = m.alloc(8)
+    if g_file_make_directory(file, c, cell) != 0 {
+        m.release(cell)
+        return 1
+    }
+    var e = m.getWord(cell)
+    if errors.code(e) == ioerrors.EXISTS || errors.code(e) != ioerrors.NOT_FOUND {
+        errors.report(err, e)
+        m.release(cell)
+        return 0
+    }
+    errors.freeError(e)
+    m.putWord(cell, 0)
+    const parent = g_file_get_parent(file)
+    var good = parent != 0
+    if good {
+        const made = g_file_make_directory_with_parents(parent, c, cell)
+        if made == 0 && errors.code(m.getWord(cell)) != ioerrors.EXISTS {
+            errors.report(err, m.getWord(cell))
+            good = false
+        } else if made == 0 {
+            errors.freeError(m.getWord(cell))
+        }
+        m.putWord(cell, 0)
+        g_object_unref(parent)
+    }
+    m.release(cell)
+    if !good { return 0 }
+    return g_file_make_directory(file, c, err)
+}
+
+// ---------------------------------------------------------------------------
+// GFileMonitor: a GObject, then (24) a record of the inotify descriptor
+// (0), the watch (4), the source (8), the file watched (16), the name of
+// the one file it watches in its directory (24, 0 for a directory),
+// the context (32), the rate limit in ms (40), cancelled (44), the
+// pending changes (56, a list), the directory's path (64).
+//
+// A pending change: the next (0), the name (8), when a change was last
+// sent (16), whether one came since (24).
+
+const R_FD: usize = 0
+const R_WATCH: usize = 4
+const R_SOURCE: usize = 8
+const R_FILE: usize = 16
+const R_NAME: usize = 24
+const R_CONTEXT: usize = 32
+const R_RATE: usize = 40
+const R_CANCELLED: usize = 44
+const R_PENDING: usize = 56
+const R_DIR: usize = 64
+const R_SIZE: usize = 72
+
+const MONITOR_CLASS_SIZE: usize = 192
+const CLASS_CHANGED: usize = 136
+const CLASS_CANCEL: usize = 144
+
+const IN_MODIFY: u32 = 0x2
+const IN_ATTRIB: u32 = 0x4
+const IN_CLOSE_WRITE: u32 = 0x8
+const IN_MOVED_FROM: u32 = 0x40
+const IN_MOVED_TO: u32 = 0x80
+const IN_CREATE: u32 = 0x100
+const IN_DELETE: u32 = 0x200
+const IN_DELETE_SELF: u32 = 0x400
+const IN_MOVE_SELF: u32 = 0x800
+const IN_IGNORED: u32 = 0x8000
+
+const EVENT_CHANGED: i32 = 0
+const EVENT_CHANGES_DONE_HINT: i32 = 1
+const EVENT_DELETED: i32 = 2
+const EVENT_CREATED: i32 = 3
+const EVENT_ATTRIBUTE_CHANGED: i32 = 4
+
+fn monitorRecord(monitor: usize) -> usize { return m.getWord(monitor + 24) }
+
+export fn __mlx_glib_monitor_init(monitor: usize, class: usize) -> void {
+    const r = m.alloc(R_SIZE)
+    m.putI32(r + R_FD, -1)
+    m.putI32(r + R_RATE, 800)
+    m.putWord(monitor + 24, r)
+}
+
+fn stopWatching(r: usize) -> void {
+    const source = m.getWord(r + R_SOURCE)
+    if source != 0 {
+        g_source_destroy(source)
+        g_source_unref(source)
+        m.putWord(r + R_SOURCE, 0)
+    }
+    if m.getI32(r + R_FD) >= 0 {
+        _ = sys.close(m.getI32(r + R_FD))
+        m.putI32(r + R_FD, -1)
+    }
+}
+
+export fn __mlx_glib_monitor_finalize(monitor: usize) -> void {
+    const r = monitorRecord(monitor)
+    stopWatching(r)
+    if m.getWord(r + R_FILE) != 0 { g_object_unref(m.getWord(r + R_FILE)) }
+    while m.getWord(r + R_PENDING) != 0 { removePending(r, m.getWord(r + R_PENDING)) }
+    m.release(m.getWord(r + R_DIR))
+    if m.getWord(r + R_CONTEXT) != 0 { g_main_context_unref(m.getWord(r + R_CONTEXT)) }
+    m.release(m.getWord(r + R_NAME))
+    m.release(r)
+    ioerrors.chainUp(types.T_OBJECT, 48, monitor)
+}
+
+export fn __mlx_glib_monitor_cancel(monitor: usize) -> i32 {
+    stopWatching(monitorRecord(monitor))
+    return 1
+}
+
+fn eventName(i: usize) -> []const u8 {
+    if i == 0 { return "G_FILE_MONITOR_EVENT_CHANGED" }
+    if i == 1 { return "G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT" }
+    if i == 2 { return "G_FILE_MONITOR_EVENT_DELETED" }
+    if i == 3 { return "G_FILE_MONITOR_EVENT_CREATED" }
+    if i == 4 { return "G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED" }
+    if i == 5 { return "G_FILE_MONITOR_EVENT_PRE_UNMOUNT" }
+    if i == 6 { return "G_FILE_MONITOR_EVENT_UNMOUNTED" }
+    if i == 7 { return "G_FILE_MONITOR_EVENT_MOVED" }
+    if i == 8 { return "G_FILE_MONITOR_EVENT_RENAMED" }
+    if i == 9 { return "G_FILE_MONITOR_EVENT_MOVED_IN" }
+    return "G_FILE_MONITOR_EVENT_MOVED_OUT"
+}
+
+fn eventNick(i: usize) -> []const u8 {
+    if i == 0 { return "changed" }
+    if i == 1 { return "changes-done-hint" }
+    if i == 2 { return "deleted" }
+    if i == 3 { return "created" }
+    if i == 4 { return "attribute-changed" }
+    if i == 5 { return "pre-unmount" }
+    if i == 6 { return "unmounted" }
+    if i == 7 { return "moved" }
+    if i == 8 { return "renamed" }
+    if i == 9 { return "moved-in" }
+    return "moved-out"
+}
+
+export fn __mlx_glib_monitor_class_init(class: usize, data: usize) -> void {
+    m.putWord(class + 48, @intFromPtr(__mlx_glib_monitor_finalize))
+    m.putWord(class + CLASS_CANCEL, @intFromPtr(__mlx_glib_monitor_cancel))
+    const values = m.alloc(12 * 24)
+    var i: usize = 0
+    while i < 11 {
+        m.putI32(values + i * 24, @intCast(i32, i))
+        m.putWord(values + i * 24 + 8, m.literal(eventName(i)))
+        m.putWord(values + i * 24 + 16, m.literal(eventNick(i)))
+        i += 1
+    }
+    eventType = g_enum_register_static(m.literal("GFileMonitorEvent"), values)
+    const params = m.alloc(24)
+    m.putWord(params, fileGType())
+    m.putWord(params + 8, fileGType())
+    m.putWord(params + 16, eventType)
+    changedSignal = signals.newSignal(m.literal("changed"), m.getWord(class), 2, closures.typeClosure(m.getWord(class), @intCast(u32, CLASS_CHANGED)), 0, 0, 0, types.T_NONE, 3, params)
+    m.release(params)
+}
+
+pub fn monitorGType() -> usize {
+    if threads.onceEnter(@intFromPtr(&monitorOnce)) {
+        types.ensureInit()
+        _ = fileGType()
+        monitorType = ioerrors.defineType(types.T_OBJECT, "GFileMonitor", MONITOR_CLASS_SIZE, @intFromPtr(__mlx_glib_monitor_class_init), 32, @intFromPtr(__mlx_glib_monitor_init), 0)
+        monitorFuncs[0] = 0
+        monitorFuncs[1] = 0
+        monitorFuncs[2] = @intFromPtr(__mlx_glib_monitor_dispatch)
+        monitorFuncs[3] = 0
+        monitorFuncs[4] = 0
+        monitorFuncs[5] = 0
+        threads.onceLeave(@intFromPtr(&monitorOnce), 1)
+    }
+    return monitorType
+}
+
+export fn g_file_monitor_get_type() -> usize { return monitorGType() }
+
+export fn g_file_monitor_emit_event(monitor: usize, child: usize, other_file: usize, event_type: i32) -> void {
+    if m.getI32(monitorRecord(monitor) + R_CANCELLED) != 0 { return }
+    g_signal_emit(monitor, changedSignal, 0, child, other_file, @intCast(usize, @bitCast(u32, event_type)))
+}
+
+export fn g_file_monitor_cancel(monitor: usize) -> i32 {
+    const r = monitorRecord(monitor)
+    if m.getI32(r + R_CANCELLED) != 0 { return 1 }
+    m.putI32(r + R_CANCELLED, 1)
+    const cancel = m.getWord(m.getWord(monitor) + CLASS_CANCEL)
+    if cancel != 0 {
+        const call: CancelFunc = unsafe { @ptrFromInt(CancelFunc, cancel) }
+        _ = call(monitor)
+    }
+    return 1
+}
+
+pub const CancelFunc = fn(usize) -> i32
+
+export fn g_file_monitor_is_cancelled(monitor: usize) -> i32 { return m.getI32(monitorRecord(monitor) + R_CANCELLED) }
+export fn g_file_monitor_set_rate_limit(monitor: usize, limit_msecs: i32) -> void { m.putI32(monitorRecord(monitor) + R_RATE, limit_msecs) }
+
+const VIRTUAL_DONE_DELAY: i64 = 2000000
+
+fn findPending(r: usize, name: usize) -> usize {
+    var node = m.getWord(r + R_PENDING)
+    while node != 0 {
+        if m.cEqual(m.getWord(node + 8), name) { return node }
+        node = m.getWord(node)
+    }
+    return 0
+}
+
+fn addPending(r: usize, name: usize, now: i64) -> void {
+    const node = m.alloc(32)
+    m.putWord(node + 8, m.dup(name))
+    m.putI64(node + 16, now)
+    m.putWord(node, m.getWord(r + R_PENDING))
+    m.putWord(r + R_PENDING, node)
+}
+
+fn removePending(r: usize, node: usize) -> void {
+    var link = r + R_PENDING
+    while m.getWord(link) != node { link = m.getWord(link) }
+    m.putWord(link, m.getWord(node))
+    m.release(m.getWord(node + 8))
+    m.release(node)
+}
+
+fn rateLimit(r: usize) -> i64 { return @intCast(i64, m.getI32(r + R_RATE)) * 1000 }
+
+// The source wakes for the earliest pending change that has something
+// to send.
+fn updateReadyTime(r: usize) -> void {
+    const source = m.getWord(r + R_SOURCE)
+    if source == 0 { return }
+    var earliest: i64 = -1
+    var node = m.getWord(r + R_PENDING)
+    while node != 0 {
+        var due = m.getI64(node + 16) + VIRTUAL_DONE_DELAY
+        if m.getI32(node + 24) != 0 { due = m.getI64(node + 16) + rateLimit(r) }
+        if earliest < 0 || due < earliest { earliest = due }
+        node = m.getWord(node)
+    }
+    g_source_set_ready_time(source, earliest)
+}
+
+fn childFile(r: usize, name: usize) -> usize {
+    const watched = m.getWord(r + R_FILE)
+    if name == 0 || m.get8(name) == 0 { return g_object_ref(watched) }
+    const wanted = m.getWord(r + R_NAME)
+    if wanted == 0 { return g_file_get_child(watched, name) }
+    if m.cEqual(name, wanted) { return g_object_ref(watched) }
+    const directory = g_file_get_parent(watched)
+    const child = g_file_get_child(directory, name)
+    g_object_unref(directory)
+    return child
+}
+
+fn emitFor(monitor: usize, r: usize, name: usize, event: i32) -> void {
+    const child = childFile(r, name)
+    g_file_monitor_emit_event(monitor, child, 0, event)
+    g_object_unref(child)
+}
+
+fn fileChanged(monitor: usize, r: usize, name: usize) -> void {
+    const node = findPending(r, name)
+    if node != 0 {
+        m.putI32(node + 24, 1)
+        return
+    }
+    emitFor(monitor, r, name, EVENT_CHANGED)
+    addPending(r, name, g_get_monotonic_time())
+}
+
+// The end of the changes of a file: the hint when they are pending (or
+// always, for the end of a write).
+fn changesDone(monitor: usize, r: usize, name: usize, always: bool) -> void {
+    const node = findPending(r, name)
+    if node == 0 && !always { return }
+    if node != 0 { removePending(r, node) }
+    emitFor(monitor, r, name, EVENT_CHANGES_DONE_HINT)
+}
+
+// Sends what the rate limit held back and the virtual hints that are due.
+fn sendDue(monitor: usize, r: usize) -> void {
+    const now = g_get_monotonic_time()
+    var node = m.getWord(r + R_PENDING)
+    while node != 0 {
+        const next = m.getWord(node)
+        if m.getI32(node + 24) != 0 {
+            if now >= m.getI64(node + 16) + rateLimit(r) {
+                m.putI32(node + 24, 0)
+                m.putI64(node + 16, now)
+                emitFor(monitor, r, m.getWord(node + 8), EVENT_CHANGED)
+            }
+        } else if now >= m.getI64(node + 16) + VIRTUAL_DONE_DELAY {
+            const name = m.dup(m.getWord(node + 8))
+            removePending(r, node)
+            emitFor(monitor, r, name, EVENT_CHANGES_DONE_HINT)
+            m.release(name)
+        }
+        node = next
+    }
+}
+
+// The source: a GSource (96 bytes) and the monitor (96). The events of
+// one read are taken in order; a move out of a name is paired with the
+// move in of the same cookie when it is in the same read.
+export fn __mlx_glib_monitor_dispatch(source: usize, callback: usize, user_data: usize) -> i32 {
+    const monitor = m.getWord(source + 96)
+    const r = monitorRecord(monitor)
+    _ = g_object_ref(monitor)
+    if m.getI32(r + R_CANCELLED) == 0 { sendDue(monitor, r) }
+    const buffer = m.alloc(4096)
+    while m.getI32(r + R_FD) >= 0 {
+        const n = sys.read(m.getI32(r + R_FD), buffer, 4096)
+        if n <= 0 { break }
+        const end = @intCast(usize, n)
+        var at: usize = 0
+        while at + 16 <= end {
+            const event = buffer + at
+            const mask = m.get32(event + 4)
+            const nameLength = @intCast(usize, m.get32(event + 12))
+            const name = if nameLength > 0 { event + 16 } else { 0 }
+            at += 16 + nameLength
+            var other: usize = 0
+            if (mask & IN_MOVED_FROM) != 0 {
+                var look = at
+                while look + 16 <= end {
+                    const candidate = buffer + look
+                    if (m.get32(candidate + 4) & IN_MOVED_TO) != 0 && m.get32(candidate + 8) == m.get32(event + 8) {
+                        if m.get32(candidate + 12) > 0 { other = candidate + 16 }
+                        // Taken here: the move in is not seen again.
+                        m.put32(candidate + 4, 0)
+                        break
+                    }
+                    look += 16 + @intCast(usize, m.get32(candidate + 12))
+                }
+            }
+            handleEvent(monitor, r, mask, name, other)
+        }
+    }
+    m.release(buffer)
+    updateReadyTime(r)
+    g_object_unref(monitor)
+    return 1
+}
+
+fn isWanted(r: usize, name: usize) -> bool {
+    return name != 0 && m.cEqual(name, m.getWord(r + R_NAME))
+}
+
+// Something created that is not a regular file with one link (being
+// written) is done at once.
+fn doneAtCreation(r: usize, name: usize) -> bool {
+    var path = m.text()
+    m.pushC(&path, m.getWord(r + R_DIR))
+    m.pushByte(&path, '/')
+    m.pushC(&path, name)
+    const buffer = m.alloc(144)
+    var done = false
+    if lstat(path.address, buffer) == 0 {
+        done = (m.get32(buffer + 24) & S_IFMT) != S_IFREG || m.getWord(buffer + 16) != 1
+    }
+    m.release(buffer)
+    m.dispose(&path)
+    return done
+}
+
+fn handleEvent(monitor: usize, r: usize, mask: u32, name: usize, other: usize) -> void {
+    if m.getI32(r + R_CANCELLED) != 0 || mask == 0 || (mask & IN_IGNORED) != 0 { return }
+    // A file monitor sees only its file's events (a rename to or from it
+    // among them).
+    if m.getWord(r + R_NAME) != 0 && !isWanted(r, name) && !isWanted(r, other) { return }
+    if m.getWord(r + R_NAME) == 0 && name == 0 && (mask & (IN_DELETE_SELF | IN_MOVE_SELF)) == 0 { return }
+    if (mask & IN_MODIFY) != 0 {
+        fileChanged(monitor, r, name)
+    } else if (mask & IN_CLOSE_WRITE) != 0 {
+        changesDone(monitor, r, name, true)
+    } else if (mask & IN_ATTRIB) != 0 {
+        emitFor(monitor, r, name, EVENT_ATTRIBUTE_CHANGED)
+    } else if (mask & IN_CREATE) != 0 {
+        changesDone(monitor, r, name, false)
+        emitFor(monitor, r, name, EVENT_CREATED)
+        if doneAtCreation(r, name) { emitFor(monitor, r, name, EVENT_CHANGES_DONE_HINT) }
+    } else if (mask & IN_MOVED_TO) != 0 {
+        changesDone(monitor, r, name, false)
+        emitFor(monitor, r, name, EVENT_CREATED)
+        emitFor(monitor, r, name, EVENT_CHANGES_DONE_HINT)
+    } else if (mask & IN_MOVED_FROM) != 0 {
+        changesDone(monitor, r, name, false)
+        emitFor(monitor, r, name, EVENT_DELETED)
+        if other != 0 {
+            changesDone(monitor, r, other, false)
+            emitFor(monitor, r, other, EVENT_CREATED)
+            emitFor(monitor, r, other, EVENT_CHANGES_DONE_HINT)
+        }
+    } else if (mask & (IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF)) != 0 {
+        if name != 0 { changesDone(monitor, r, name, false) }
+        emitFor(monitor, r, name, EVENT_DELETED)
+    }
+}
+
+fn makeMonitor(file: usize, directory: bool, err: usize) -> usize {
+    if !isLocal(file) {
+        notLocal(err)
+        return 0
+    }
+    const monitor = g_object_new(monitorGType(), 0)
+    const r = monitorRecord(monitor)
+    m.putWord(r + R_FILE, g_object_ref(file))
+    const fd = @intCast(i32, sys.syscall1(SYS_inotify_init1, 2048 | 524288))
+    if fd < 0 {
+        ioerrors.setErrno(err, "Unable to find default local file monitor type", -fd)
+        g_object_unref(monitor)
+        return 0
+    }
+    m.putI32(r + R_FD, fd)
+    if directory {
+        m.putWord(r + R_DIR, m.dup(pathOf(file)))
+    } else {
+        m.putWord(r + R_DIR, g_path_get_dirname(pathOf(file)))
+        m.putWord(r + R_NAME, g_path_get_basename(pathOf(file)))
+    }
+    const watched = m.getWord(r + R_DIR)
+    const events = IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF
+    // A directory that is not there yet is watched from nothing (as GIO
+    // does, the monitor reports nothing until it comes).
+    m.putI32(r + R_WATCH, @intCast(i32, sys.syscall3(SYS_inotify_add_watch, @intCast(usize, fd), watched, @intCast(usize, events))))
+    const source = g_source_new(@intFromPtr(&monitorFuncs), 104)
+    m.putWord(source + 96, monitor)
+    _ = g_source_add_unix_fd(source, fd, 1)
+    g_source_set_static_name(source, m.literal("GFileMonitorSource"))
+    m.putWord(r + R_SOURCE, source)
+    m.putWord(r + R_CONTEXT, g_main_context_ref_thread_default())
+    _ = g_source_attach(source, m.getWord(r + R_CONTEXT))
+    return monitor
+}
+
+export fn g_file_monitor_file(file: usize, flags: i32, c: usize, err: usize) -> usize {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    return makeMonitor(file, false, err)
+}
+
+export fn g_file_monitor_directory(file: usize, flags: i32, c: usize, err: usize) -> usize {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    return makeMonitor(file, true, err)
+}
+
+export fn g_file_monitor(file: usize, flags: i32, c: usize, err: usize) -> usize {
+    if g_file_query_file_type(file, 0, c) == 2 { return g_file_monitor_directory(file, flags, c, err) }
+    return g_file_monitor_file(file, flags, c, err)
+}
