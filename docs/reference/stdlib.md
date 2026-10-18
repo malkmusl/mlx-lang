@@ -816,7 +816,8 @@ pub fn main() -> u8 {
 ## math (`std.math`)
 
 **Implementation:** `std/src/math.mlx`
-**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`
+**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`,
+`346_math_helpers_runtime.mlx`
 
 Floating-point math in Mlx on the doubles' bits, without libm. Import it as
 `@import("std.math")`; it imports nothing itself, so a `--plugin` library
@@ -826,7 +827,16 @@ can use it too.
   `infinity()`, `negativeInfinity()`, `nan()`, `isNan(x)`, `abs(x)`.
 - Whole numbers: `floor`, `ceil`, `trunc` are the builtins `@floor`,
   `@ceil`, `@trunc` (one instruction); `round(x)` rounds halves away from
-  zero. The square root is `@sqrt`.
+  zero.
+- `min(a, b)`, `max(a, b)`, `clamp(x, low, high)` and `absolute(x)` on
+  `f64`, and `minOf`, `maxOf`, `clampOf`, `absoluteOf` for any number type
+  named first (`math.minOf(u32, version, 4)`); an `anytype` parameter
+  would take a literal's type from the literal, so the type is given.
+  `sqrt(x)` is `@sqrt` but 0 from 0 down (NaN stays NaN), what lengths
+  want; `smoothstep(from, to, x)` is 0 up to `from`, 1 from `to` on and
+  3t² − 2t³ between. The splash, MLX Observatory, `std.ui.vector`, the
+  compositor and the Android runtime use these instead of copies of
+  their own.
 - `sin(x)`, `cos(x)`: argument reduction by pi/2 in three parts, then
   fdlibm's minimax kernels; within an ulp of the exact value for |x| up to
   about 2^20 pi, 0 past 2^52 (NaN for the infinities and NaN).
