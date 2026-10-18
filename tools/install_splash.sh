@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds the boot splash (projects/desktop/splash: mlx-splash and
-# mlx-splashctl) and installs it in place of Plymouth: the MLX picture
-# while the system starts, powers off or restarts. It speaks Plymouth's
-# protocol, so systemd tells it what starts as it would tell plymouthd.
+# mlx-splashctl) and installs it in place of Plymouth: the initramfs shows
+# the MLX picture while the system starts, powers off or restarts. It
+# speaks Plymouth's protocol, so systemd tells it what starts as it would
+# tell plymouthd.
 # Nothing is switched over unless --enable says so.
 #
 # Installs (PREFIX is /usr unless --prefix says otherwise):
@@ -20,6 +21,12 @@
 #                                     the splash leaving the last frame before
 #                                     the display manager starts
 #   /etc/mlx/init/services/mlx-splash.service (mlx-init)
+#                                     (disabled fallback: the initramfs
+#                                     daemon is already running)
+#   /usr/lib/initcpio/install/mlx-splash and hooks/mlx-splash
+#                                     (classic udev and systemd initramfs)
+#   /etc/systemd/system/mlx-splash-switch-root.service
+#                                     (systemd initramfs root handoff)
 #   /var/lib/mlx/splash/              (the last boot's length, for the bar)
 #   PREFIX/share/doc/mlx/splash/README.md
 #   with --enable: the four units enabled (sysinit.target, multi-user.target,
@@ -29,8 +36,9 @@
 #   with --disable: the units disabled and Plymouth's as they were before
 #   --enable; nothing is built or installed
 #
-# A Plymouth in the initramfs is asked by mlx-splash to quit leaving its
-# picture, and mlx-splash takes over from it.
+# Put mlx-splash after kms in mkinitcpio's HOOKS, in place of plymouth,
+# then rebuild the image. The hook starts the daemon and hands it the real
+# root before switch_root.
 #
 #   tools/install_splash.sh [--prefix DIR] [--destdir DIR] [--enable | --disable] [compiler]
 #
@@ -75,6 +83,7 @@ if [[ -z "$destdir" && $(id -u) -ne 0 ]]; then
 fi
 
 system_dir="$destdir/etc/systemd/system"
+initcpio_dir="$destdir/usr/lib/initcpio"
 state_dir="$destdir/var/lib/mlx/splash-installer"
 # Plymouth's units, masked by --enable.
 replaced=(plymouth-start.service plymouth-read-write.service plymouth-quit.service plymouth-quit-wait.service
@@ -167,19 +176,26 @@ manager=display-manager.service
 if [[ -L "$system_dir/display-manager.service" ]]; then
     manager=$(basename -- "$(readlink -- "$system_dir/display-manager.service")")
 fi
-install -d "$destdir$bindir" "$system_dir" "$system_dir/$manager.d" "$destdir/etc/mlx/init/services" "$destdir$docdir"
+install -d "$destdir$bindir" "$system_dir" "$system_dir/$manager.d" "$destdir/etc/mlx/init/services" "$destdir$docdir" \
+    "$initcpio_dir/install" "$initcpio_dir/hooks"
 install -d -m 755 "$destdir/var/lib/mlx/splash"
 install -m 755 "$build/mlx-splash" "$build/mlx-splashctl" "$destdir$bindir/"
 for unit in mlx-splash.service mlx-splash-quit.service mlx-splash-poweroff.service mlx-splash-reboot.service; do
     sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$docdir|g" "projects/desktop/splash/examples/$unit" > "$build/$unit"
     install -m 644 "$build/$unit" "$system_dir/$unit"
 done
+sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$docdir|g" projects/desktop/splash/examples/mlx-splash-switch-root.service > "$build/mlx-splash-switch-root.service"
+install -m 644 "$build/mlx-splash-switch-root.service" "$system_dir/mlx-splash-switch-root.service"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/splash/examples/mlx-splash-display-manager.conf > "$build/mlx-splash.conf"
 install -m 644 "$build/mlx-splash.conf" "$system_dir/$manager.d/mlx-splash.conf"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/splash/examples/mlx-splash.init > "$build/mlx-splash.init"
 install -m 644 "$build/mlx-splash.init" "$destdir/etc/mlx/init/services/mlx-splash.service"
+for part in install hooks; do
+    sed "s|@BINDIR@|$bindir|g" "projects/desktop/splash/initcpio/$part/mlx-splash" > "$build/mlx-splash-$part"
+    install -m 755 "$build/mlx-splash-$part" "$initcpio_dir/$part/mlx-splash"
+done
 install -m 644 projects/desktop/splash/README.md "$destdir$docdir/README.md"
-echo "installed into ${destdir:-/}: $bindir/mlx-splash, $bindir/mlx-splashctl, the systemd units, the drop-in for $manager, the mlx-init service"
+echo "installed into ${destdir:-/}: $bindir/mlx-splash, $bindir/mlx-splashctl, the systemd units, the drop-in for $manager, the disabled mlx-init fallback, the mkinitcpio hook"
 mlx_install_path_files "$destdir" "$bindir"
 mlx_note_old_layout "$destdir" "$bindir"
 
@@ -203,6 +219,7 @@ if $enable; then
     done
     echo "enabled the MLX splash (boot, poweroff, reboot); masked Plymouth's units"
     if [[ -z "$destdir" ]]; then
+        echo "replace plymouth with mlx-splash after kms in /etc/mkinitcpio.conf, then run: mkinitcpio -P"
         echo "run: systemctl daemon-reload (the splash shows from the next boot; mlx.splash=0 on the kernel's command line keeps it away)"
     fi
 else
