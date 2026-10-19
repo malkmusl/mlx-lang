@@ -1,0 +1,1083 @@
+// std.webp.io: where decoded rows go. libwebp's (1.3.2) decoders hand
+// their rows to a VP8Io and its "put" (dec/io_dec.c), which turns them
+// into the colour space the caller asked for: RGB, RGBA, BGR(A), ARGB,
+// the 16-bit RGBA4444 and RGB565, premultiplied (rgbA, bgrA, Argb,
+// rgbA4444) or not, or the YUV(A) planes as they are. This is that part,
+// step for step: the fancy upsampler (each chroma sample spread over the
+// four pixels around it, dsp/upsampling.c), the plain one, the YUV to
+// RGB conversion (dsp/yuv.h, the integer form that libwebp's SSE2 code
+// computes too), the alpha rows put in place and premultiplied, and the
+// lossless decoder's ARGB words converted (dsp/lossless.c).
+//
+// The structures the C API hands out are laid out as libwebp's are
+// (WebPDecBuffer, WebPDecoderOptions, WebPBitstreamFeatures on a 64-bit
+// system), so that compiler/capi/webp passes the caller's own.
+//
+// Scaling (WebPDecoderOptions.use_scaling) is not supported: a decoder
+// asked for it answers VP8_STATUS_INVALID_PARAM.
+const zs = @import("../flate/stream.mlx")
+
+pub const Allocator = zs.Allocator
+
+// What decoding answers (libwebp's VP8StatusCode).
+pub const OK: i32 = 0
+pub const OUT_OF_MEMORY: i32 = 1
+pub const INVALID_PARAM: i32 = 2
+pub const BITSTREAM_ERROR: i32 = 3
+pub const UNSUPPORTED_FEATURE: i32 = 4
+pub const SUSPENDED: i32 = 5
+pub const USER_ABORT: i32 = 6
+pub const NOT_ENOUGH_DATA: i32 = 7
+
+// Colour spaces (WEBP_CSP_MODE).
+pub const MODE_RGB: i32 = 0
+pub const MODE_RGBA: i32 = 1
+pub const MODE_BGR: i32 = 2
+pub const MODE_BGRA: i32 = 3
+pub const MODE_ARGB: i32 = 4
+pub const MODE_RGBA_4444: i32 = 5
+pub const MODE_RGB_565: i32 = 6
+pub const MODE_rgbA: i32 = 7
+pub const MODE_bgrA: i32 = 8
+pub const MODE_Argb: i32 = 9
+pub const MODE_rgbA_4444: i32 = 10
+pub const MODE_YUV: i32 = 11
+pub const MODE_YUVA: i32 = 12
+pub const MODE_LAST: i32 = 13
+
+pub fn isPremultipliedMode(mode: i32) -> bool {
+    return mode == MODE_rgbA || mode == MODE_bgrA || mode == MODE_Argb || mode == MODE_rgbA_4444
+}
+
+pub fn isAlphaMode(mode: i32) -> bool {
+    return mode == MODE_RGBA || mode == MODE_BGRA || mode == MODE_ARGB || mode == MODE_RGBA_4444 || mode == MODE_YUVA || isPremultipliedMode(mode)
+}
+
+pub fn isRGBMode(mode: i32) -> bool { return mode < MODE_YUV }
+
+// Bytes per pixel of each colour space (kModeBpp).
+pub fn modeBpp(mode: i32) -> usize {
+    if mode == MODE_RGB || mode == MODE_BGR { return 3 }
+    if mode == MODE_RGBA_4444 || mode == MODE_RGB_565 || mode == MODE_rgbA_4444 { return 2 }
+    if mode >= MODE_YUV { return 1 }
+    return 4
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+
+pub inline fn get8(address: usize) -> u64 { unsafe { return @intCast(u64, @ptrFromInt(*u8, address).*) } }
+pub inline fn put8(address: usize, value: u64) -> void { unsafe { @ptrFromInt(*u8, address).* = @intCast(u8, value & 255) } }
+pub inline fn get16(address: usize) -> u64 { unsafe { return @intCast(u64, @ptrFromInt(*u16, address).*) } }
+pub inline fn put16(address: usize, value: u64) -> void { unsafe { @ptrFromInt(*u16, address).* = @intCast(u16, value & 0xffff) } }
+pub inline fn get32(address: usize) -> u64 { unsafe { return @intCast(u64, @ptrFromInt(*u32, address).*) } }
+pub inline fn put32(address: usize, value: u64) -> void { unsafe { @ptrFromInt(*u32, address).* = @intCast(u32, value & 0xffffffff) } }
+pub inline fn get64(address: usize) -> u64 { unsafe { return @ptrFromInt(*u64, address).* } }
+pub inline fn put64(address: usize, value: u64) -> void { unsafe { @ptrFromInt(*u64, address).* = value } }
+pub inline fn getI16(address: usize) -> i64 { unsafe { return @intCast(i64, @ptrFromInt(*i16, address).*) } }
+pub inline fn getI32(address: usize) -> i64 { unsafe { return @intCast(i64, @ptrFromInt(*i32, address).*) } }
+pub inline fn putI32(address: usize, value: i64) -> void { put32(address, @bitCast(u64, value)) }
+
+// Stores the low 16 bits of VALUE (an int16_t store).
+pub inline fn putI16(address: usize, value: i64) -> void { put16(address, @bitCast(u64, value)) }
+
+// ADDRESS moved by DELTA bytes, which may be negative (a row of a buffer
+// with a negative stride).
+pub inline fn offset(address: usize, delta: i64) -> usize {
+    if delta >= 0 { return address + @intCast(usize, delta) }
+    return address - @intCast(usize, 0 - delta)
+}
+
+pub fn copy(target: usize, source: usize, count: usize) -> void { zs.copy(target, source, count) }
+pub fn move(target: usize, source: usize, count: usize) -> void { zs.move(target, source, count) }
+pub fn zero(target: usize, count: usize) -> void { zs.zero(target, count) }
+
+pub fn fill(target: usize, value: u64, count: usize) -> void {
+    var i: usize = 0
+    while i < count {
+        put8(target + i, value)
+        i += 1
+    }
+}
+
+pub fn literal(text: []const u8) -> usize { return zs.literal(text) }
+
+// SIZE bytes, 16-byte aligned; 0 when there are none.
+pub fn allocate(allocator: Allocator, size: usize) -> usize {
+    var asked = size
+    if asked == 0 { asked = 16 }
+    const memory = allocator.alloc(asked, 16)
+    if memory == null { return 0 }
+    return @intFromPtr(memory.?)
+}
+
+pub fn release(allocator: Allocator, address: usize, size: usize) -> void {
+    var given = size
+    if given == 0 { given = 16 }
+    if address != 0 { allocator.free(zs.bytes(address), given, 16) }
+}
+
+// SIZE zeroed bytes (WebPSafeCalloc).
+pub fn allocateZeroed(allocator: Allocator, size: usize) -> usize {
+    const memory = allocate(allocator, size)
+    if memory != 0 { zero(memory, size) }
+    return memory
+}
+
+// ---------------------------------------------------------------------------
+// The structures of the API
+
+// WebPDecBuffer: the colour space, the size, whether the memory is the
+// caller's, then a union (RGBA: the pixels at 16, the stride at 24, the
+// size at 32; YUVA: four planes at 16, 24, 32, 40, their strides at 48,
+// 52, 56, 60, their sizes at 64, 72, 80, 88), four reserved words (here
+// the first two hold the size of the memory the decoder allocated) and
+// that memory.
+pub const Buffer = struct {
+    colorspace: i32
+    width: i32
+    height: i32
+    isExternalMemory: i32
+    y: usize
+    u: usize
+    v: usize
+    a: usize
+    yStride: i32
+    uStride: i32
+    vStride: i32
+    aStride: i32
+    ySize: usize
+    uSize: usize
+    vSize: usize
+    aSize: usize
+    privateSize: usize
+    pad: [2]u32
+    privateMemory: usize
+}
+
+// The RGBA view of the union.
+pub fn rgbaOf(b: *Buffer) -> usize { return b.*.y }
+pub fn setRgba(b: *Buffer, address: usize) -> void { b.*.y = address }
+pub fn strideOf(b: *Buffer) -> i64 { return getI32(@intFromPtr(b) + 24) }
+pub fn setStride(b: *Buffer, stride: i64) -> void { putI32(@intFromPtr(b) + 24, stride) }
+pub fn rgbaSizeOf(b: *Buffer) -> usize { return b.*.v }
+pub fn setRgbaSize(b: *Buffer, size: usize) -> void { b.*.v = size }
+
+// WebPDecoderOptions.
+pub const Options = struct {
+    bypassFiltering: i32
+    noFancyUpsampling: i32
+    useCropping: i32
+    cropLeft: i32
+    cropTop: i32
+    cropWidth: i32
+    cropHeight: i32
+    useScaling: i32
+    scaledWidth: i32
+    scaledHeight: i32
+    useThreads: i32
+    ditheringStrength: i32
+    flip: i32
+    alphaDitheringStrength: i32
+    pad: [5]u32
+}
+
+// WebPBitstreamFeatures.
+pub const Features = struct {
+    width: i32
+    height: i32
+    hasAlpha: i32
+    hasAnimation: i32
+    format: i32
+    pad: [5]u32
+}
+
+// VP8Io: the picture's size, the rows of a call to put (`mbY` the first,
+// `mbH` of them, `mbW` wide: the Y, U, V and alpha samples), the
+// cropping, and the data the decoder reads.
+pub const Io = struct {
+    width: i64
+    height: i64
+    mbY: i64
+    mbW: i64
+    mbH: i64
+    y: usize
+    u: usize
+    v: usize
+    yStride: i64
+    uvStride: i64
+    a: usize
+    // The WebPDecParams the rows go to (0: none, as for an alpha plane's
+    // decoder).
+    params: usize
+    fancyUpsampling: bool
+    data: usize
+    dataSize: usize
+    useCropping: bool
+    cropLeft: i64
+    cropRight: i64
+    cropTop: i64
+    cropBottom: i64
+    useScaling: bool
+    scaledWidth: i64
+    scaledHeight: i64
+    bypassFiltering: bool
+}
+
+pub fn initIo(io: *Io) -> void { zero(@intFromPtr(io), @sizeOf(Io)) }
+
+// What emits the rows (WebPDecParams.emit and emit_alpha).
+const EMIT_NONE: u8 = 0
+const EMIT_YUV: u8 = 1
+const EMIT_SAMPLED_RGB: u8 = 2
+const EMIT_FANCY_RGB: u8 = 3
+const EMIT_ALPHA_YUV: u8 = 4
+const EMIT_ALPHA_RGB: u8 = 5
+const EMIT_ALPHA_RGBA4444: u8 = 6
+
+// WebPDecParams: the output, the rows the fancy upsampler keeps for the
+// next call (the last luma row and chroma row), how far the output is
+// done, the options.
+pub const Params = struct {
+    allocator: Allocator
+    output: usize
+    tmpY: usize
+    tmpU: usize
+    tmpV: usize
+    lastY: i64
+    options: usize
+    memory: usize
+    memorySize: usize
+    emit: u8
+    emitAlpha: u8
+}
+
+pub fn resetParams(p: *Params, allocator: Allocator) -> void {
+    zero(@intFromPtr(p), @sizeOf(Params))
+    p.*.allocator = allocator
+}
+
+pub inline fn bufferAt(address: usize) -> *Buffer { return unsafe { @ptrFromInt(*Buffer, address) } }
+pub inline fn optionsAt(address: usize) -> *Options { return unsafe { @ptrFromInt(*Options, address) } }
+pub inline fn paramsAt(address: usize) -> *Params { return unsafe { @ptrFromInt(*Params, address) } }
+
+// ---------------------------------------------------------------------------
+// Output buffers (dec/buffer_dec.c)
+
+fn absolute(v: i64) -> u64 {
+    if v < 0 { return @intCast(u64, 0 - v) }
+    return @intCast(u64, v)
+}
+
+// stride * (height - 1) + width, the least a plane needs.
+fn minimumSize(width: u64, height: u64, stride: u64) -> u64 {
+    return stride * (height - 1) + width
+}
+
+fn checkBuffer(b: *Buffer) -> i32 {
+    var ok = true
+    const mode = b.*.colorspace
+    const width = @intCast(u64, b.*.width)
+    const height = @intCast(u64, b.*.height)
+    if mode < MODE_RGB || mode >= MODE_LAST {
+        ok = false
+    } else if !isRGBMode(mode) {
+        const uvWidth = (width + 1) / 2
+        const uvHeight = (height + 1) / 2
+        const yStride = absolute(@intCast(i64, b.*.yStride))
+        const uStride = absolute(@intCast(i64, b.*.uStride))
+        const vStride = absolute(@intCast(i64, b.*.vStride))
+        const aStride = absolute(@intCast(i64, b.*.aStride))
+        if minimumSize(width, height, yStride) > @intCast(u64, b.*.ySize) { ok = false }
+        if minimumSize(uvWidth, uvHeight, uStride) > @intCast(u64, b.*.uSize) { ok = false }
+        if minimumSize(uvWidth, uvHeight, vStride) > @intCast(u64, b.*.vSize) { ok = false }
+        if yStride < width || uStride < uvWidth || vStride < uvWidth { ok = false }
+        if b.*.y == 0 || b.*.u == 0 || b.*.v == 0 { ok = false }
+        if mode == MODE_YUVA {
+            if aStride < width { ok = false }
+            if minimumSize(width, height, aStride) > @intCast(u64, b.*.aSize) { ok = false }
+            if b.*.a == 0 { ok = false }
+        }
+    } else {
+        const stride = absolute(strideOf(b))
+        const rowBytes = width * @intCast(u64, modeBpp(mode))
+        if minimumSize(rowBytes, height, stride) > @intCast(u64, rgbaSizeOf(b)) { ok = false }
+        if stride < rowBytes { ok = false }
+        if rgbaOf(b) == 0 { ok = false }
+    }
+    if ok { return OK }
+    return INVALID_PARAM
+}
+
+fn allocateBuffer(b: *Buffer, allocator: Allocator) -> i32 {
+    const w = b.*.width
+    const h = b.*.height
+    const mode = b.*.colorspace
+    if w <= 0 || h <= 0 || mode < MODE_RGB || mode >= MODE_LAST { return INVALID_PARAM }
+    if b.*.isExternalMemory <= 0 && b.*.privateMemory == 0 {
+        const width = @intCast(u64, w)
+        const height = @intCast(u64, h)
+        if width * @intCast(u64, modeBpp(mode)) >= 2147483648 { return INVALID_PARAM }
+        const stride = width * @intCast(u64, modeBpp(mode))
+        const size = stride * height
+        var uvStride: u64 = 0
+        var uvSize: u64 = 0
+        var aStride: u64 = 0
+        var aSize: u64 = 0
+        if !isRGBMode(mode) {
+            uvStride = (width + 1) / 2
+            uvSize = uvStride * ((height + 1) / 2)
+            if mode == MODE_YUVA {
+                aStride = width
+                aSize = aStride * height
+            }
+        }
+        const total = size + 2 * uvSize + aSize
+        // (WebPSafeMalloc's limit.)
+        if total >= 1099511627776 { return OUT_OF_MEMORY }
+        const output = allocate(allocator, @intCast(usize, total))
+        if output == 0 { return OUT_OF_MEMORY }
+        b.*.privateMemory = output
+        b.*.privateSize = @intCast(usize, total)
+        if !isRGBMode(mode) {
+            b.*.y = output
+            b.*.yStride = @intCast(i32, stride)
+            b.*.ySize = @intCast(usize, size)
+            b.*.u = output + @intCast(usize, size)
+            b.*.uStride = @intCast(i32, uvStride)
+            b.*.uSize = @intCast(usize, uvSize)
+            b.*.v = output + @intCast(usize, size + uvSize)
+            b.*.vStride = @intCast(i32, uvStride)
+            b.*.vSize = @intCast(usize, uvSize)
+            if mode == MODE_YUVA { b.*.a = output + @intCast(usize, size + 2 * uvSize) }
+            b.*.aSize = @intCast(usize, aSize)
+            b.*.aStride = @intCast(i32, aStride)
+        } else {
+            setRgba(b, output)
+            setStride(b, @intCast(i64, stride))
+            setRgbaSize(b, @intCast(usize, size))
+        }
+    }
+    return checkBuffer(b)
+}
+
+// WebPFlipBuffer: the rows upside down (each plane starts at its last
+// row, with the stride negated).
+pub fn flipBuffer(b: *Buffer) -> i32 {
+    if isRGBMode(b.*.colorspace) {
+        const stride = strideOf(b)
+        setRgba(b, offset(rgbaOf(b), @intCast(i64, b.*.height - 1) * stride))
+        setStride(b, 0 - stride)
+    } else {
+        const h = @intCast(i64, b.*.height)
+        b.*.y = offset(b.*.y, (h - 1) * @intCast(i64, b.*.yStride))
+        b.*.yStride = 0 - b.*.yStride
+        b.*.u = offset(b.*.u, ((h - 1) >> 1) * @intCast(i64, b.*.uStride))
+        b.*.uStride = 0 - b.*.uStride
+        b.*.v = offset(b.*.v, ((h - 1) >> 1) * @intCast(i64, b.*.vStride))
+        b.*.vStride = 0 - b.*.vStride
+        if b.*.a != 0 {
+            b.*.a = offset(b.*.a, (h - 1) * @intCast(i64, b.*.aStride))
+            b.*.aStride = 0 - b.*.aStride
+        }
+    }
+    return OK
+}
+
+pub fn checkCropDimensions(imageWidth: i64, imageHeight: i64, x: i64, y: i64, w: i64, h: i64) -> bool {
+    return !(x < 0 || y < 0 || w <= 0 || h <= 0 || x >= imageWidth || w > imageWidth || w > imageWidth - x || y >= imageHeight || h > imageHeight || h > imageHeight - y)
+}
+
+// WebPAllocateDecBuffer: the output sized WIDTH x HEIGHT (or the crop
+// the options ask for) and its memory, unless the caller gave it.
+pub fn allocateDecBuffer(width: i64, height: i64, options: usize, b: *Buffer, allocator: Allocator) -> i32 {
+    var w = width
+    var h = height
+    if w <= 0 || h <= 0 { return INVALID_PARAM }
+    if options != 0 {
+        const o = optionsAt(options)
+        if o.*.useCropping != 0 {
+            const cw = @intCast(i64, o.*.cropWidth)
+            const ch = @intCast(i64, o.*.cropHeight)
+            const x = @intCast(i64, o.*.cropLeft) & (0 - 2)
+            const y = @intCast(i64, o.*.cropTop) & (0 - 2)
+            if !checkCropDimensions(w, h, x, y, cw, ch) { return INVALID_PARAM }
+            w = cw
+            h = ch
+        }
+        if o.*.useScaling != 0 { return INVALID_PARAM }
+    }
+    b.*.width = @intCast(i32, w)
+    b.*.height = @intCast(i32, h)
+    const status = allocateBuffer(b, allocator)
+    if status != OK { return status }
+    if options != 0 && optionsAt(options).*.flip != 0 { return flipBuffer(b) }
+    return OK
+}
+
+// WebPFreeDecBuffer.
+pub fn freeDecBuffer(b: *Buffer, allocator: Allocator) -> void {
+    if b.*.isExternalMemory <= 0 { release(allocator, b.*.privateMemory, b.*.privateSize) }
+    b.*.privateMemory = 0
+    b.*.privateSize = 0
+}
+
+pub fn copyPlane(source: usize, sourceStride: i64, target: usize, targetStride: i64, width: usize, height: usize) -> void {
+    var s = source
+    var t = target
+    var row: usize = 0
+    while row < height {
+        copy(t, s, width)
+        s = offset(s, sourceStride)
+        t = offset(t, targetStride)
+        row += 1
+    }
+}
+
+// WebPCopyDecBufferPixels: SOURCE's pixels into TARGET (of the same
+// colour space).
+pub fn copyDecBufferPixels(source: *Buffer, target: *Buffer) -> i32 {
+    target.*.width = source.*.width
+    target.*.height = source.*.height
+    if checkBuffer(target) != OK { return INVALID_PARAM }
+    const width = @intCast(usize, source.*.width)
+    const height = @intCast(usize, source.*.height)
+    if isRGBMode(source.*.colorspace) {
+        copyPlane(rgbaOf(source), strideOf(source), rgbaOf(target), strideOf(target), width * modeBpp(source.*.colorspace), height)
+    } else {
+        copyPlane(source.*.y, @intCast(i64, source.*.yStride), target.*.y, @intCast(i64, target.*.yStride), width, height)
+        copyPlane(source.*.u, @intCast(i64, source.*.uStride), target.*.u, @intCast(i64, target.*.uStride), (width + 1) / 2, (height + 1) / 2)
+        copyPlane(source.*.v, @intCast(i64, source.*.vStride), target.*.v, @intCast(i64, target.*.vStride), (width + 1) / 2, (height + 1) / 2)
+        if isAlphaMode(source.*.colorspace) {
+            copyPlane(source.*.a, @intCast(i64, source.*.aStride), target.*.a, @intCast(i64, target.*.aStride), width, height)
+        }
+    }
+    return OK
+}
+
+// WebPAvoidSlowMemory: whether to decode into memory of the decoder's
+// own and copy (the caller's memory is slow to read, premultiplying
+// reads it).
+pub fn avoidSlowMemory(b: *Buffer, features: usize) -> bool {
+    if features == 0 { return false }
+    const f = unsafe { @ptrFromInt(*Features, features) }
+    return b.*.isExternalMemory >= 2 && isPremultipliedMode(b.*.colorspace) && f.*.hasAlpha != 0
+}
+
+// WebPIoInitFromOptions: the cropping, filtering and upsampling the
+// options ask for. False when the crop is out of the picture.
+pub fn ioInitFromOptions(options: usize, io: *Io, sourceColorspace: i32) -> bool {
+    const W = io.*.width
+    const H = io.*.height
+    var x: i64 = 0
+    var y: i64 = 0
+    var w = W
+    var h = H
+    io.*.useCropping = options != 0 && optionsAt(options).*.useCropping != 0
+    if io.*.useCropping {
+        const o = optionsAt(options)
+        w = @intCast(i64, o.*.cropWidth)
+        h = @intCast(i64, o.*.cropHeight)
+        x = @intCast(i64, o.*.cropLeft)
+        y = @intCast(i64, o.*.cropTop)
+        if !isRGBMode(sourceColorspace) {
+            x = x & (0 - 2)
+            y = y & (0 - 2)
+        }
+        if !checkCropDimensions(W, H, x, y, w, h) { return false }
+    }
+    io.*.cropLeft = x
+    io.*.cropTop = y
+    io.*.cropRight = x + w
+    io.*.cropBottom = y + h
+    io.*.mbW = w
+    io.*.mbH = h
+    io.*.useScaling = options != 0 && optionsAt(options).*.useScaling != 0
+    if io.*.useScaling { return false }
+    io.*.bypassFiltering = options != 0 && optionsAt(options).*.bypassFiltering != 0
+    io.*.fancyUpsampling = options == 0 || optionsAt(options).*.noFancyUpsampling == 0
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// YUV to RGB (dsp/yuv.h)
+
+inline fn multHi(v: i64, coefficient: i64) -> i64 { return (v * coefficient) >> 8 }
+
+inline fn clip8(v: i64) -> u64 {
+    if v >= 0 && v < 16384 { return @intCast(u64, v >> 6) }
+    if v < 0 { return 0 }
+    return 255
+}
+
+pub inline fn yuvToR(y: i64, v: i64) -> u64 { return clip8(multHi(y, 19077) + multHi(v, 26149) - 14234) }
+pub inline fn yuvToG(y: i64, u: i64, v: i64) -> u64 { return clip8(multHi(y, 19077) - multHi(u, 6419) - multHi(v, 13320) + 8708) }
+pub inline fn yuvToB(y: i64, u: i64) -> u64 { return clip8(multHi(y, 19077) + multHi(u, 33050) - 17685) }
+
+// One pixel in colour space MODE at DST.
+fn yuvToPixel(mode: i32, y: u64, u: u64, v: u64, dst: usize) -> void {
+    const Y = @intCast(i64, y)
+    const U = @intCast(i64, u)
+    const V = @intCast(i64, v)
+    const r = yuvToR(Y, V)
+    const g = yuvToG(Y, U, V)
+    const b = yuvToB(Y, U)
+    if mode == MODE_RGB {
+        put8(dst, r)
+        put8(dst + 1, g)
+        put8(dst + 2, b)
+    } else if mode == MODE_RGBA || mode == MODE_rgbA {
+        put8(dst, r)
+        put8(dst + 1, g)
+        put8(dst + 2, b)
+        put8(dst + 3, 255)
+    } else if mode == MODE_BGR {
+        put8(dst, b)
+        put8(dst + 1, g)
+        put8(dst + 2, r)
+    } else if mode == MODE_BGRA || mode == MODE_bgrA {
+        put8(dst, b)
+        put8(dst + 1, g)
+        put8(dst + 2, r)
+        put8(dst + 3, 255)
+    } else if mode == MODE_ARGB || mode == MODE_Argb {
+        put8(dst, 255)
+        put8(dst + 1, r)
+        put8(dst + 2, g)
+        put8(dst + 3, b)
+    } else if mode == MODE_RGBA_4444 || mode == MODE_rgbA_4444 {
+        put8(dst, (r & 0xf0) | (g >> 4))
+        put8(dst + 1, (b & 0xf0) | 0x0f)
+    } else if mode == MODE_RGB_565 {
+        put8(dst, (r & 0xf8) | (g >> 5))
+        put8(dst + 1, ((g << 3) & 0xe0) | (b >> 3))
+    }
+}
+
+// A row of LEN pixels from Y and the half-width U and V (YuvToRgbaRow
+// and its kin).
+fn sampleRow(mode: i32, y: usize, u: usize, v: usize, dst: usize, len: usize) -> void {
+    const step = modeBpp(mode)
+    var x: usize = 0
+    while x + 1 < len {
+        const U = get8(u + x / 2)
+        const V = get8(v + x / 2)
+        yuvToPixel(mode, get8(y + x), U, V, dst + x * step)
+        yuvToPixel(mode, get8(y + x + 1), U, V, dst + (x + 1) * step)
+        x += 2
+    }
+    if (len & 1) != 0 { yuvToPixel(mode, get8(y + x), get8(u + x / 2), get8(v + x / 2), dst + x * step) }
+}
+
+inline fn loadUV(u: u64, v: u64) -> u64 { return u | (v << 16) }
+
+// UPSAMPLE_FUNC: two rows of LEN pixels (TOP_Y and BOTTOM_Y, the bottom
+// one possibly absent: 0) between the chroma rows TOP and CUR, each
+// chroma sample weighed 9:3:3:1 over the four pixels around it.
+fn upsampleLinePair(mode: i32, topY: usize, bottomY: usize, topU: usize, topV: usize, curU: usize, curV: usize, topDst: usize, bottomDst: usize, len: usize) -> void {
+    const step = modeBpp(mode)
+    const lastPixelPair = (len - 1) >> 1
+    var tlUV = loadUV(get8(topU), get8(topV))
+    var lUV = loadUV(get8(curU), get8(curV))
+    {
+        const uv0 = (3 * tlUV + lUV + 0x00020002) >> 2
+        yuvToPixel(mode, get8(topY), uv0 & 0xff, uv0 >> 16, topDst)
+    }
+    if bottomY != 0 {
+        const uv0 = (3 * lUV + tlUV + 0x00020002) >> 2
+        yuvToPixel(mode, get8(bottomY), uv0 & 0xff, uv0 >> 16, bottomDst)
+    }
+    var x: usize = 1
+    while x <= lastPixelPair {
+        const tUV = loadUV(get8(topU + x), get8(topV + x))
+        const uv = loadUV(get8(curU + x), get8(curV + x))
+        const avg = tlUV + tUV + lUV + uv + 0x00080008
+        const diag12 = (avg + 2 * (tUV + lUV)) >> 3
+        const diag03 = (avg + 2 * (tlUV + uv)) >> 3
+        {
+            const uv0 = (diag12 + tlUV) >> 1
+            const uv1 = (diag03 + tUV) >> 1
+            yuvToPixel(mode, get8(topY + 2 * x - 1), uv0 & 0xff, uv0 >> 16, topDst + (2 * x - 1) * step)
+            yuvToPixel(mode, get8(topY + 2 * x), uv1 & 0xff, uv1 >> 16, topDst + 2 * x * step)
+        }
+        if bottomY != 0 {
+            const uv0 = (diag03 + lUV) >> 1
+            const uv1 = (diag12 + uv) >> 1
+            yuvToPixel(mode, get8(bottomY + 2 * x - 1), uv0 & 0xff, uv0 >> 16, bottomDst + (2 * x - 1) * step)
+            yuvToPixel(mode, get8(bottomY + 2 * x), uv1 & 0xff, uv1 >> 16, bottomDst + 2 * x * step)
+        }
+        tlUV = tUV
+        lUV = uv
+        x += 1
+    }
+    if (len & 1) == 0 {
+        {
+            const uv0 = (3 * tlUV + lUV + 0x00020002) >> 2
+            yuvToPixel(mode, get8(topY + len - 1), uv0 & 0xff, uv0 >> 16, topDst + (len - 1) * step)
+        }
+        if bottomY != 0 {
+            const uv0 = (3 * lUV + tlUV + 0x00020002) >> 2
+            yuvToPixel(mode, get8(bottomY + len - 1), uv0 & 0xff, uv0 >> 16, bottomDst + (len - 1) * step)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alpha (dsp/alpha_processing.c)
+
+// WebPApplyAlphaMultiply: W pixels of H rows premultiplied by their
+// alpha (first or last of the four bytes).
+pub fn applyAlphaMultiply(rgba: usize, alphaFirst: bool, w: usize, h: usize, stride: i64) -> void {
+    var row = rgba
+    var j: usize = 0
+    while j < h {
+        var rgb = row
+        var alpha = row + 3
+        if alphaFirst {
+            rgb = row + 1
+            alpha = row
+        }
+        var i: usize = 0
+        while i < w {
+            const a = get8(alpha + 4 * i)
+            if a != 0xff {
+                const mult = a * 32897
+                put8(rgb + 4 * i, (get8(rgb + 4 * i) * mult) >> 23)
+                put8(rgb + 4 * i + 1, (get8(rgb + 4 * i + 1) * mult) >> 23)
+                put8(rgb + 4 * i + 2, (get8(rgb + 4 * i + 2) * mult) >> 23)
+            }
+            i += 1
+        }
+        row = offset(row, stride)
+        j += 1
+    }
+}
+
+inline fn ditherHi(x: u64) -> u64 { return (x & 0xf0) | (x >> 4) }
+inline fn ditherLo(x: u64) -> u64 { return (x & 0x0f) | ((x << 4) & 0xff) }
+
+// WebPApplyAlphaMultiply4444.
+pub fn applyAlphaMultiply4444(rgba: usize, w: usize, h: usize, stride: i64) -> void {
+    var row = rgba
+    var j: usize = 0
+    while j < h {
+        var i: usize = 0
+        while i < w {
+            const rg = get8(row + 2 * i)
+            const ba = get8(row + 2 * i + 1)
+            const a = ba & 0x0f
+            const mult = a * 0x1111
+            const r = ((ditherHi(rg) * mult) >> 16) & 0xff
+            const g = ((ditherLo(rg) * mult) >> 16) & 0xff
+            const b = ((ditherHi(ba) * mult) >> 16) & 0xff
+            put8(row + 2 * i, (r & 0xf0) | ((g >> 4) & 0x0f))
+            put8(row + 2 * i + 1, (b & 0xf0) | a)
+            i += 1
+        }
+        row = offset(row, stride)
+        j += 1
+    }
+}
+
+// WebPDispatchAlpha: the alpha samples into every fourth byte; whether
+// any is not opaque.
+fn dispatchAlpha(alpha: usize, alphaStride: usize, width: usize, height: usize, dst: usize, dstStride: i64) -> bool {
+    var mask: u64 = 0xff
+    var a = alpha
+    var d = dst
+    var j: usize = 0
+    while j < height {
+        var i: usize = 0
+        while i < width {
+            const value = get8(a + i)
+            put8(d + 4 * i, value)
+            mask = mask & value
+            i += 1
+        }
+        a += alphaStride
+        d = offset(d, dstStride)
+        j += 1
+    }
+    return mask != 0xff
+}
+
+// ---------------------------------------------------------------------------
+// Lossless output (VP8LConvertFromBGRA and the YUV conversion)
+
+// NUM pixels of ARGB words at SOURCE into colour space MODE at TARGET.
+pub fn convertFromBGRA(source: usize, num: usize, mode: i32, target: usize) -> void {
+    var i: usize = 0
+    if mode == MODE_RGB || mode == MODE_BGR {
+        while i < num {
+            const argb = get32(source + 4 * i)
+            if mode == MODE_RGB {
+                put8(target + 3 * i, argb >> 16)
+                put8(target + 3 * i + 2, argb)
+            } else {
+                put8(target + 3 * i, argb)
+                put8(target + 3 * i + 2, argb >> 16)
+            }
+            put8(target + 3 * i + 1, argb >> 8)
+            i += 1
+        }
+    } else if mode == MODE_RGBA || mode == MODE_rgbA {
+        while i < num {
+            const argb = get32(source + 4 * i)
+            put8(target + 4 * i, argb >> 16)
+            put8(target + 4 * i + 1, argb >> 8)
+            put8(target + 4 * i + 2, argb)
+            put8(target + 4 * i + 3, argb >> 24)
+            i += 1
+        }
+        if mode == MODE_rgbA { applyAlphaMultiply(target, false, num, 1, 0) }
+    } else if mode == MODE_BGRA || mode == MODE_bgrA {
+        copy(target, source, 4 * num)
+        if mode == MODE_bgrA { applyAlphaMultiply(target, false, num, 1, 0) }
+    } else if mode == MODE_ARGB || mode == MODE_Argb {
+        while i < num {
+            const argb = get32(source + 4 * i)
+            put8(target + 4 * i, argb >> 24)
+            put8(target + 4 * i + 1, argb >> 16)
+            put8(target + 4 * i + 2, argb >> 8)
+            put8(target + 4 * i + 3, argb)
+            i += 1
+        }
+        if mode == MODE_Argb { applyAlphaMultiply(target, true, num, 1, 0) }
+    } else if mode == MODE_RGBA_4444 || mode == MODE_rgbA_4444 {
+        while i < num {
+            const argb = get32(source + 4 * i)
+            put8(target + 2 * i, ((argb >> 16) & 0xf0) | ((argb >> 12) & 0xf))
+            put8(target + 2 * i + 1, (argb & 0xf0) | ((argb >> 28) & 0xf))
+            i += 1
+        }
+        if mode == MODE_rgbA_4444 { applyAlphaMultiply4444(target, num, 1, 0) }
+    } else if mode == MODE_RGB_565 {
+        while i < num {
+            const argb = get32(source + 4 * i)
+            put8(target + 2 * i, ((argb >> 16) & 0xf8) | ((argb >> 13) & 0x7))
+            put8(target + 2 * i + 1, ((argb >> 5) & 0xe0) | ((argb >> 3) & 0x1f))
+            i += 1
+        }
+    }
+}
+
+inline fn rgbToY(r: i64, g: i64, b: i64) -> u64 {
+    return @intCast(u64, (16839 * r + 33059 * g + 6420 * b + 32768 + (16 << 16)) >> 16)
+}
+
+inline fn clipUV(uv: i64) -> u64 {
+    const value = (uv + 131072 + (128 << 18)) >> 18
+    if value >= 0 && value < 256 { return @intCast(u64, value) }
+    if value < 0 { return 0 }
+    return 255
+}
+
+inline fn rgbToU(r: i64, g: i64, b: i64) -> u64 { return clipUV(0 - 9719 * r - 19081 * g + 28800 * b) }
+inline fn rgbToV(r: i64, g: i64, b: i64) -> u64 { return clipUV(28800 * r - 24116 * g - 4684 * b) }
+
+// A row of ARGB words as the YUV(A) output's row Y_POS (ConvertToYUVA):
+// luma, the chroma of two rows averaged (the second row of a pair
+// finishes what the first stored), alpha.
+pub fn convertToYUVA(source: usize, width: usize, yPos: i64, b: *Buffer) -> void {
+    const yRow = offset(b.*.y, yPos * @intCast(i64, b.*.yStride))
+    var i: usize = 0
+    while i < width {
+        const p = get32(source + 4 * i)
+        put8(yRow + i, rgbToY(@intCast(i64, (p >> 16) & 0xff), @intCast(i64, (p >> 8) & 0xff), @intCast(i64, p & 0xff)))
+        i += 1
+    }
+    const uRow = offset(b.*.u, (yPos >> 1) * @intCast(i64, b.*.uStride))
+    const vRow = offset(b.*.v, (yPos >> 1) * @intCast(i64, b.*.vStride))
+    const store = (yPos & 1) == 0
+    const uvWidth = width >> 1
+    i = 0
+    while i <= uvWidth {
+        if i == uvWidth && (width & 1) == 0 { break }
+        var r: i64 = 0
+        var g: i64 = 0
+        var bl: i64 = 0
+        if i < uvWidth {
+            const v0 = get32(source + 8 * i)
+            const v1 = get32(source + 8 * i + 4)
+            r = @intCast(i64, ((v0 >> 15) & 0x1fe) + ((v1 >> 15) & 0x1fe))
+            g = @intCast(i64, ((v0 >> 7) & 0x1fe) + ((v1 >> 7) & 0x1fe))
+            bl = @intCast(i64, ((v0 << 1) & 0x1fe) + ((v1 << 1) & 0x1fe))
+        } else {
+            const v0 = get32(source + 8 * i)
+            r = @intCast(i64, (v0 >> 14) & 0x3fc)
+            g = @intCast(i64, (v0 >> 6) & 0x3fc)
+            bl = @intCast(i64, (v0 << 2) & 0x3fc)
+        }
+        const tu = rgbToU(r, g, bl)
+        const tv = rgbToV(r, g, bl)
+        if store {
+            put8(uRow + i, tu)
+            put8(vRow + i, tv)
+        } else {
+            put8(uRow + i, (get8(uRow + i) + tu + 1) >> 1)
+            put8(vRow + i, (get8(vRow + i) + tv + 1) >> 1)
+        }
+        i += 1
+    }
+    if b.*.a != 0 {
+        const aRow = offset(b.*.a, yPos * @intCast(i64, b.*.aStride))
+        i = 0
+        while i < width {
+            put8(aRow + i, get8(source + 4 * i + 3))
+            i += 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Emitting rows (dec/io_dec.c)
+
+fn emitYUV(io: *Io, p: *Params) -> i64 {
+    const b = bufferAt(p.*.output)
+    const yDst = offset(b.*.y, io.*.mbY * @intCast(i64, b.*.yStride))
+    const uDst = offset(b.*.u, (io.*.mbY >> 1) * @intCast(i64, b.*.uStride))
+    const vDst = offset(b.*.v, (io.*.mbY >> 1) * @intCast(i64, b.*.vStride))
+    const mbW = @intCast(usize, io.*.mbW)
+    const mbH = @intCast(usize, io.*.mbH)
+    const uvW = (mbW + 1) / 2
+    const uvH = (mbH + 1) / 2
+    copyPlane(io.*.y, io.*.yStride, yDst, @intCast(i64, b.*.yStride), mbW, mbH)
+    copyPlane(io.*.u, io.*.uvStride, uDst, @intCast(i64, b.*.uStride), uvW, uvH)
+    copyPlane(io.*.v, io.*.uvStride, vDst, @intCast(i64, b.*.vStride), uvW, uvH)
+    return io.*.mbH
+}
+
+fn emitSampledRGB(io: *Io, p: *Params) -> i64 {
+    const b = bufferAt(p.*.output)
+    const stride = strideOf(b)
+    var dst = offset(rgbaOf(b), io.*.mbY * stride)
+    var y = io.*.y
+    var u = io.*.u
+    var v = io.*.v
+    var j: i64 = 0
+    while j < io.*.mbH {
+        sampleRow(b.*.colorspace, y, u, v, dst, @intCast(usize, io.*.mbW))
+        y = offset(y, io.*.yStride)
+        if (j & 1) != 0 {
+            u = offset(u, io.*.uvStride)
+            v = offset(v, io.*.uvStride)
+        }
+        dst = offset(dst, stride)
+        j += 1
+    }
+    return io.*.mbH
+}
+
+// The rows of a call upsampled, one row late: the last row waits for the
+// chroma of the next call (kept in tmp), unless it is the picture's last.
+fn emitFancyRGB(io: *Io, p: *Params) -> i64 {
+    var numLinesOut = io.*.mbH
+    const b = bufferAt(p.*.output)
+    const mode = b.*.colorspace
+    const stride = strideOf(b)
+    var dst = offset(rgbaOf(b), io.*.mbY * stride)
+    var curY = io.*.y
+    var curU = io.*.u
+    var curV = io.*.v
+    var topU = p.*.tmpU
+    var topV = p.*.tmpV
+    var y = io.*.mbY
+    const yEnd = io.*.mbY + io.*.mbH
+    const mbW = @intCast(usize, io.*.mbW)
+    const uvW = (mbW + 1) / 2
+    if y == 0 {
+        upsampleLinePair(mode, curY, 0, curU, curV, curU, curV, dst, 0, mbW)
+    } else {
+        upsampleLinePair(mode, p.*.tmpY, curY, topU, topV, curU, curV, offset(dst, 0 - stride), dst, mbW)
+        numLinesOut += 1
+    }
+    while y + 2 < yEnd {
+        topU = curU
+        topV = curV
+        curU = offset(curU, io.*.uvStride)
+        curV = offset(curV, io.*.uvStride)
+        dst = offset(dst, 2 * stride)
+        curY = offset(curY, 2 * io.*.yStride)
+        upsampleLinePair(mode, offset(curY, 0 - io.*.yStride), curY, topU, topV, curU, curV, offset(dst, 0 - stride), dst, mbW)
+        y += 2
+    }
+    curY = offset(curY, io.*.yStride)
+    if io.*.cropTop + yEnd < io.*.cropBottom {
+        copy(p.*.tmpY, curY, mbW)
+        copy(p.*.tmpU, curU, uvW)
+        copy(p.*.tmpV, curV, uvW)
+        numLinesOut -= 1
+    } else if (yEnd & 1) == 0 {
+        upsampleLinePair(mode, curY, 0, curU, curV, curU, curV, offset(dst, stride), 0, mbW)
+    }
+    return numLinesOut
+}
+
+fn fillAlphaPlane(dst: usize, w: usize, h: usize, stride: i64) -> void {
+    var row = dst
+    var j: usize = 0
+    while j < h {
+        fill(row, 0xff, w)
+        row = offset(row, stride)
+        j += 1
+    }
+}
+
+fn emitAlphaYUV(io: *Io, p: *Params) -> void {
+    var alpha = io.*.a
+    const b = bufferAt(p.*.output)
+    const mbW = @intCast(usize, io.*.mbW)
+    const mbH = @intCast(usize, io.*.mbH)
+    var dst = offset(b.*.a, io.*.mbY * @intCast(i64, b.*.aStride))
+    if alpha != 0 {
+        var j: usize = 0
+        while j < mbH {
+            copy(dst, alpha, mbW)
+            alpha += @intCast(usize, io.*.width)
+            dst = offset(dst, @intCast(i64, b.*.aStride))
+            j += 1
+        }
+    } else if b.*.a != 0 {
+        fillAlphaPlane(dst, mbW, mbH, @intCast(i64, b.*.aStride))
+    }
+}
+
+// The rows of alpha matching the rows the colour emit wrote (one row
+// earlier with fancy upsampling, which lags a row).
+fn alphaSourceRow(io: *Io, numRows: *i64) -> i64 {
+    var startY = io.*.mbY
+    numRows.* = io.*.mbH
+    if io.*.fancyUpsampling {
+        if startY == 0 {
+            numRows.* = numRows.* - 1
+        } else {
+            startY -= 1
+        }
+        if io.*.cropTop + io.*.mbY + io.*.mbH == io.*.cropBottom {
+            numRows.* = io.*.cropBottom - io.*.cropTop - startY
+        }
+    }
+    return startY
+}
+
+fn emitAlphaRGB(io: *Io, p: *Params) -> void {
+    if io.*.a == 0 { return }
+    const b = bufferAt(p.*.output)
+    const mode = b.*.colorspace
+    const alphaFirst = mode == MODE_ARGB || mode == MODE_Argb
+    var numRows: i64 = 0
+    const startY = alphaSourceRow(io, &numRows)
+    var alpha = io.*.a
+    if startY != io.*.mbY { alpha -= @intCast(usize, io.*.width) }
+    const stride = strideOf(b)
+    const base = offset(rgbaOf(b), startY * stride)
+    var dst = base + 3
+    if alphaFirst { dst = base }
+    const hasAlpha = dispatchAlpha(alpha, @intCast(usize, io.*.width), @intCast(usize, io.*.mbW), @intCast(usize, numRows), dst, stride)
+    if hasAlpha && isPremultipliedMode(mode) {
+        applyAlphaMultiply(base, alphaFirst, @intCast(usize, io.*.mbW), @intCast(usize, numRows), stride)
+    }
+}
+
+fn emitAlphaRGBA4444(io: *Io, p: *Params) -> void {
+    if io.*.a == 0 { return }
+    const b = bufferAt(p.*.output)
+    const mode = b.*.colorspace
+    var numRows: i64 = 0
+    const startY = alphaSourceRow(io, &numRows)
+    var alpha = io.*.a
+    if startY != io.*.mbY { alpha -= @intCast(usize, io.*.width) }
+    const stride = strideOf(b)
+    const base = offset(rgbaOf(b), startY * stride)
+    var alphaDst = base + 1
+    var mask: u64 = 0x0f
+    const mbW = @intCast(usize, io.*.mbW)
+    var j: i64 = 0
+    while j < numRows {
+        var i: usize = 0
+        while i < mbW {
+            const value = get8(alpha + i) >> 4
+            put8(alphaDst + 2 * i, (get8(alphaDst + 2 * i) & 0xf0) | value)
+            mask = mask & value
+            i += 1
+        }
+        alpha += @intCast(usize, io.*.width)
+        alphaDst = offset(alphaDst, stride)
+        j += 1
+    }
+    if mask != 0x0f && isPremultipliedMode(mode) {
+        applyAlphaMultiply4444(base, mbW, @intCast(usize, numRows), stride)
+    }
+}
+
+// CustomSetup: how the rows will be emitted, and the upsampler's rows.
+// False when the options cannot be met.
+pub fn setup(io: *Io) -> bool {
+    const p = paramsAt(io.*.params)
+    const b = bufferAt(p.*.output)
+    const mode = b.*.colorspace
+    const isRgb = isRGBMode(mode)
+    const isAlpha = isAlphaMode(mode)
+    p.*.memory = 0
+    p.*.emit = EMIT_NONE
+    p.*.emitAlpha = EMIT_NONE
+    var source = MODE_YUVA
+    if isAlpha { source = MODE_YUV }
+    if !ioInitFromOptions(p.*.options, io, source) { return false }
+    if isRgb {
+        p.*.emit = EMIT_SAMPLED_RGB
+        if io.*.fancyUpsampling {
+            const uvWidth = @intCast(usize, (io.*.mbW + 1) >> 1)
+            const size = @intCast(usize, io.*.mbW) + 2 * uvWidth
+            p.*.memory = allocate(p.*.allocator, size)
+            if p.*.memory == 0 { return false }
+            p.*.memorySize = size
+            p.*.tmpY = p.*.memory
+            p.*.tmpU = p.*.tmpY + @intCast(usize, io.*.mbW)
+            p.*.tmpV = p.*.tmpU + uvWidth
+            p.*.emit = EMIT_FANCY_RGB
+        }
+    } else {
+        p.*.emit = EMIT_YUV
+    }
+    if isAlpha {
+        if mode == MODE_RGBA_4444 || mode == MODE_rgbA_4444 {
+            p.*.emitAlpha = EMIT_ALPHA_RGBA4444
+        } else if isRgb {
+            p.*.emitAlpha = EMIT_ALPHA_RGB
+        } else {
+            p.*.emitAlpha = EMIT_ALPHA_YUV
+        }
+    }
+    return true
+}
+
+// CustomPut: the rows of IO into the output.
+pub fn put(io: *Io) -> bool {
+    const p = paramsAt(io.*.params)
+    if io.*.mbW <= 0 || io.*.mbH <= 0 { return false }
+    var numLinesOut: i64 = 0
+    if p.*.emit == EMIT_YUV {
+        numLinesOut = emitYUV(io, p)
+    } else if p.*.emit == EMIT_SAMPLED_RGB {
+        numLinesOut = emitSampledRGB(io, p)
+    } else if p.*.emit == EMIT_FANCY_RGB {
+        numLinesOut = emitFancyRGB(io, p)
+    }
+    if p.*.emitAlpha == EMIT_ALPHA_YUV {
+        emitAlphaYUV(io, p)
+    } else if p.*.emitAlpha == EMIT_ALPHA_RGB {
+        emitAlphaRGB(io, p)
+    } else if p.*.emitAlpha == EMIT_ALPHA_RGBA4444 {
+        emitAlphaRGBA4444(io, p)
+    }
+    p.*.lastY += numLinesOut
+    return true
+}
+
+// CustomTeardown.
+pub fn teardown(io: *Io) -> void {
+    const p = paramsAt(io.*.params)
+    release(p.*.allocator, p.*.memory, p.*.memorySize)
+    p.*.memory = 0
+}

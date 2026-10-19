@@ -39,6 +39,9 @@
 #   tests/363_jpeg_decode_runtime.mlx   std.jpeg's decoder: sampling,
 #                                       progressive, grey, CMYK, restarts,
 #                                       EXIF orientation, damage
+#   tests/364_webp_decode_runtime.mlx   std.webp's decoders: lossy, lossless,
+#                                       alpha, animation (demuxer), rows
+#                                       done incrementally, damage
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -83,6 +86,7 @@ run 360_spawn_runtime "PATH lookup, captured output, exit statuses, moved descri
 run 361_dbus_keep_signals_runtime "a client against a child bus: a signal kept across a call with its descriptor; bus addresses; PATH lookup"
 run 362_png_decode_runtime "PNG images of each colour type, interlaced and transparent, decoded to RGBA; damaged ones refused"
 run 363_jpeg_decode_runtime "JPEG images (4:2:0, progressive 4:2:2, grey, CMYK, restarts) decoded as libjpeg decodes them; EXIF orientation; damage"
+run 364_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) decoded as libwebp decodes them; incremental rows; damage"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

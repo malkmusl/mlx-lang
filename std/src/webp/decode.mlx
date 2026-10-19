@@ -1,0 +1,760 @@
+// std.webp.decode: the WebP container and the decoding APIs of libwebp
+// 1.3.2 (dec/webp_dec.c and dec/idec_dec.c), step for step: the RIFF
+// header, the VP8X chunk and the chunks before the image (ALPH kept for
+// the lossy decoder), the features (WebPGetFeatures), a whole picture
+// decoded into a WebPDecBuffer (DecodeInto), and the incremental decoder
+// (WebPIDecoder): data appended or the caller's buffer remapped as it
+// grows, the picture decoded as far as the data goes (a VP8 macroblock,
+// or 8 rows of a VP8L picture, at a time), the rows done so far readable
+// at any time.
+const io = @import("./io.mlx")
+const vp8 = @import("./vp8.mlx")
+const vp8l = @import("./vp8l.mlx")
+
+pub const Allocator = io.Allocator
+pub const Buffer = io.Buffer
+pub const Options = io.Options
+pub const Features = io.Features
+
+inline fn get8(address: usize) -> u64 { return io.get8(address) }
+
+const TAG_SIZE: usize = 4
+const CHUNK_HEADER_SIZE: usize = 8
+const RIFF_HEADER_SIZE: usize = 12
+const VP8X_CHUNK_SIZE: usize = 10
+pub const MAX_CHUNK_PAYLOAD: u64 = 0xffffffff - 8 - 1
+const MAX_IMAGE_AREA: u64 = 4294967296
+pub const ANIMATION_FLAG: u64 = 0x02
+pub const ALPHA_FLAG: u64 = 0x10
+
+pub fn getLE16(data: usize) -> u64 { return get8(data) | (get8(data + 1) << 8) }
+pub fn getLE24(data: usize) -> u64 { return getLE16(data) | (get8(data + 2) << 16) }
+pub fn getLE32(data: usize) -> u64 { return getLE16(data) | (getLE16(data + 2) << 16) }
+
+pub fn isTag(data: usize, tag: []const u8) -> bool {
+    return get8(data) == @intCast(u64, tag[0]) && get8(data + 1) == @intCast(u64, tag[1]) && get8(data + 2) == @intCast(u64, tag[2]) && get8(data + 3) == @intCast(u64, tag[3])
+}
+
+// WebPHeaderStructure.
+pub const Headers = struct {
+    data: usize
+    dataSize: usize
+    haveAllData: bool
+    offset: usize
+    alphaData: usize
+    alphaDataSize: usize
+    compressedSize: usize
+    riffSize: usize
+    isLossless: bool
+}
+
+// ParseRIFF: the RIFF header, when there is one (DATA and SIZE moved past
+// it).
+fn parseRIFF(data: *usize, size: *usize, haveAllData: bool, riffSize: *usize) -> i32 {
+    riffSize.* = 0
+    if size.* >= RIFF_HEADER_SIZE && isTag(data.*, "RIFF") {
+        if !isTag(data.* + 8, "WEBP") { return io.BITSTREAM_ERROR }
+        const s = getLE32(data.* + TAG_SIZE)
+        if s < @intCast(u64, TAG_SIZE + CHUNK_HEADER_SIZE) { return io.BITSTREAM_ERROR }
+        if s > MAX_CHUNK_PAYLOAD { return io.BITSTREAM_ERROR }
+        if haveAllData && s > @intCast(u64, size.* - CHUNK_HEADER_SIZE) { return io.NOT_ENOUGH_DATA }
+        riffSize.* = @intCast(usize, s)
+        data.* = data.* + RIFF_HEADER_SIZE
+        size.* = size.* - RIFF_HEADER_SIZE
+    }
+    return io.OK
+}
+
+fn parseVP8X(data: *usize, size: *usize, foundVP8X: *bool, width: *i64, height: *i64, flags: *u64) -> i32 {
+    const vp8xSize = CHUNK_HEADER_SIZE + VP8X_CHUNK_SIZE
+    foundVP8X.* = false
+    if size.* < CHUNK_HEADER_SIZE { return io.NOT_ENOUGH_DATA }
+    if isTag(data.*, "VP8X") {
+        const chunkSize = getLE32(data.* + TAG_SIZE)
+        if chunkSize != @intCast(u64, VP8X_CHUNK_SIZE) { return io.BITSTREAM_ERROR }
+        if size.* < vp8xSize { return io.NOT_ENOUGH_DATA }
+        const f = getLE32(data.* + 8)
+        const w = 1 + getLE24(data.* + 12)
+        const h = 1 + getLE24(data.* + 15)
+        if w * h >= MAX_IMAGE_AREA { return io.BITSTREAM_ERROR }
+        flags.* = f
+        width.* = @intCast(i64, w)
+        height.* = @intCast(i64, h)
+        data.* = data.* + vp8xSize
+        size.* = size.* - vp8xSize
+        foundVP8X.* = true
+    }
+    return io.OK
+}
+
+// ParseOptionalChunks: the chunks up to the image's, the ALPH one kept.
+fn parseOptionalChunks(data: *usize, size: *usize, riffSize: usize, alphaData: *usize, alphaSize: *usize) -> i32 {
+    var buf = data.*
+    var bufSize = size.*
+    var totalSize: u64 = @intCast(u64, TAG_SIZE + CHUNK_HEADER_SIZE + VP8X_CHUNK_SIZE)
+    alphaData.* = 0
+    alphaSize.* = 0
+    while true {
+        data.* = buf
+        size.* = bufSize
+        if bufSize < CHUNK_HEADER_SIZE { return io.NOT_ENOUGH_DATA }
+        const chunkSize = getLE32(buf + TAG_SIZE)
+        if chunkSize > MAX_CHUNK_PAYLOAD { return io.BITSTREAM_ERROR }
+        const diskChunkSize = (@intCast(u64, CHUNK_HEADER_SIZE) + chunkSize + 1) & 0xfffffffe
+        totalSize = (totalSize + diskChunkSize) & 0xffffffff
+        if riffSize > 0 && totalSize > @intCast(u64, riffSize) { return io.BITSTREAM_ERROR }
+        if isTag(buf, "VP8 ") || isTag(buf, "VP8L") { return io.OK }
+        if @intCast(u64, bufSize) < diskChunkSize { return io.NOT_ENOUGH_DATA }
+        if isTag(buf, "ALPH") {
+            alphaData.* = buf + CHUNK_HEADER_SIZE
+            alphaSize.* = @intCast(usize, chunkSize)
+        }
+        buf += @intCast(usize, diskChunkSize)
+        bufSize -= @intCast(usize, diskChunkSize)
+    }
+    return io.OK
+}
+
+fn parseVP8Header(dataPtr: *usize, size: *usize, haveAllData: bool, riffSize: usize, chunkSize: *usize, isLossless: *bool) -> i32 {
+    const data = dataPtr.*
+    const isVP8 = isTag(data, "VP8 ")
+    const isVP8L = isTag(data, "VP8L")
+    const minimalSize = TAG_SIZE + CHUNK_HEADER_SIZE
+    if size.* < CHUNK_HEADER_SIZE { return io.NOT_ENOUGH_DATA }
+    if isVP8 || isVP8L {
+        const s = getLE32(data + TAG_SIZE)
+        if riffSize >= minimalSize && s > @intCast(u64, riffSize - minimalSize) { return io.BITSTREAM_ERROR }
+        if haveAllData && s > @intCast(u64, size.* - CHUNK_HEADER_SIZE) { return io.NOT_ENOUGH_DATA }
+        chunkSize.* = @intCast(usize, s)
+        dataPtr.* = data + CHUNK_HEADER_SIZE
+        size.* = size.* - CHUNK_HEADER_SIZE
+        isLossless.* = isVP8L
+    } else {
+        isLossless.* = vp8l.checkSignature(data, size.*)
+        chunkSize.* = size.*
+    }
+    return io.OK
+}
+
+// ParseHeadersInternal: the features of DATA (into F), and with HEADERS
+// (0: none) where the image is.
+pub fn parseHeadersInternal(data: usize, dataSize: usize, f: *Features, headers: usize) -> i32 {
+    var canvasWidth: i64 = 0
+    var canvasHeight: i64 = 0
+    var imageWidth: i64 = 0
+    var imageHeight: i64 = 0
+    var foundVP8X = false
+    var animationPresent = false
+    var haveAllData = false
+    if headers != 0 { haveAllData = unsafe { @ptrFromInt(*Headers, headers) }.*.haveAllData }
+    if data == 0 || dataSize < RIFF_HEADER_SIZE { return io.NOT_ENOUGH_DATA }
+    var hdrs: Headers = undefined
+    io.zero(@intFromPtr(&hdrs), @sizeOf(Headers))
+    hdrs.data = data
+    hdrs.dataSize = dataSize
+    var d = data
+    var size = dataSize
+    var status = parseRIFF(&d, &size, haveAllData, &hdrs.riffSize)
+    if status != io.OK { return status }
+    const foundRiff = hdrs.riffSize > 0
+    var hasAlpha = false
+    var flags: u64 = 0
+    var done = false
+    status = parseVP8X(&d, &size, &foundVP8X, &canvasWidth, &canvasHeight, &flags)
+    if status != io.OK { return status }
+    animationPresent = (flags & ANIMATION_FLAG) != 0
+    if !foundRiff && foundVP8X { return io.BITSTREAM_ERROR }
+    hasAlpha = (flags & ALPHA_FLAG) != 0
+    f.*.hasAnimation = 0
+    if animationPresent { f.*.hasAnimation = 1 }
+    f.*.format = 0
+    imageWidth = canvasWidth
+    imageHeight = canvasHeight
+    if foundVP8X && animationPresent && headers == 0 {
+        status = io.OK
+        done = true
+    }
+    if !done && size < TAG_SIZE {
+        status = io.NOT_ENOUGH_DATA
+        done = true
+    }
+    if !done && ((foundRiff && foundVP8X) || (!foundRiff && !foundVP8X && isTag(d, "ALPH"))) {
+        status = parseOptionalChunks(&d, &size, hdrs.riffSize, &hdrs.alphaData, &hdrs.alphaDataSize)
+        if status != io.OK { done = true }
+    }
+    if !done {
+        status = parseVP8Header(&d, &size, haveAllData, hdrs.riffSize, &hdrs.compressedSize, &hdrs.isLossless)
+        if status != io.OK { done = true }
+    }
+    if !done {
+        if @intCast(u64, hdrs.compressedSize) > MAX_CHUNK_PAYLOAD { return io.BITSTREAM_ERROR }
+        if !animationPresent {
+            f.*.format = 1
+            if hdrs.isLossless { f.*.format = 2 }
+        }
+        if !hdrs.isLossless {
+            if size < vp8.VP8_FRAME_HEADER_SIZE {
+                status = io.NOT_ENOUGH_DATA
+                done = true
+            } else if !vp8.getInfo(d, size, hdrs.compressedSize, &imageWidth, &imageHeight) {
+                return io.BITSTREAM_ERROR
+            }
+        } else {
+            if size < vp8l.VP8L_FRAME_HEADER_SIZE {
+                status = io.NOT_ENOUGH_DATA
+                done = true
+            } else if !vp8l.getInfo(d, size, &imageWidth, &imageHeight, &hasAlpha) {
+                return io.BITSTREAM_ERROR
+            }
+        }
+    }
+    if !done {
+        if foundVP8X {
+            if canvasWidth != imageWidth || canvasHeight != imageHeight { return io.BITSTREAM_ERROR }
+        }
+        if headers != 0 {
+            const h = unsafe { @ptrFromInt(*Headers, headers) }
+            const keep = h.*.haveAllData
+            h.* = hdrs
+            h.*.haveAllData = keep
+            h.*.offset = d - h.*.data
+        }
+    }
+    if status == io.OK || (status == io.NOT_ENOUGH_DATA && foundVP8X && headers == 0) {
+        if hdrs.alphaData != 0 { hasAlpha = true }
+        f.*.hasAlpha = 0
+        if hasAlpha { f.*.hasAlpha = 1 }
+        f.*.width = @intCast(i32, imageWidth)
+        f.*.height = @intCast(i32, imageHeight)
+        return io.OK
+    }
+    return status
+}
+
+// WebPParseHeaders: where the image of HEADERS.data is; animations are
+// not decoded this way.
+pub fn parseHeaders(headers: *Headers) -> i32 {
+    var f: Features = undefined
+    io.zero(@intFromPtr(&f), @sizeOf(Features))
+    var status = parseHeadersInternal(headers.*.data, headers.*.dataSize, &f, @intFromPtr(headers))
+    if status == io.OK || status == io.NOT_ENOUGH_DATA {
+        if f.hasAnimation != 0 { status = io.UNSUPPORTED_FEATURE }
+    }
+    return status
+}
+
+// WebPGetFeatures.
+pub fn getFeatures(data: usize, dataSize: usize, f: *Features) -> i32 {
+    if data == 0 { return io.INVALID_PARAM }
+    io.zero(@intFromPtr(f), @sizeOf(Features))
+    return parseHeadersInternal(data, dataSize, f, 0)
+}
+
+// DecodeInto: the whole picture of DATA into PARAMS' output.
+pub fn decodeInto(data: usize, dataSize: usize, p: *io.Params) -> i32 {
+    var headers: Headers = undefined
+    io.zero(@intFromPtr(&headers), @sizeOf(Headers))
+    headers.data = data
+    headers.dataSize = dataSize
+    headers.haveAllData = true
+    var status = parseHeaders(&headers)
+    if status != io.OK { return status }
+    var i: io.Io = undefined
+    io.initIo(&i)
+    i.data = headers.data + headers.offset
+    i.dataSize = headers.dataSize - headers.offset
+    i.params = @intFromPtr(p)
+    const output = io.bufferAt(p.*.output)
+    if !headers.isLossless {
+        const decAddress = io.allocate(p.*.allocator, @sizeOf(vp8.Decoder))
+        if decAddress == 0 { return io.OUT_OF_MEMORY }
+        const dec = unsafe { @ptrFromInt(*vp8.Decoder, decAddress) }
+        vp8.init(dec, p.*.allocator)
+        dec.*.alpha.data = headers.alphaData
+        dec.*.alpha.dataSize = headers.alphaDataSize
+        if !vp8.getHeaders(dec, &i) {
+            status = dec.*.status
+        } else {
+            status = io.allocateDecBuffer(i.width, i.height, p.*.options, output, p.*.allocator)
+            if status == io.OK {
+                if !vp8.decode(dec, &i) { status = dec.*.status }
+            }
+        }
+        vp8.clear(dec)
+        io.release(p.*.allocator, decAddress, @sizeOf(vp8.Decoder))
+    } else {
+        const decAddress = vp8l.create(p.*.allocator)
+        if decAddress == 0 { return io.OUT_OF_MEMORY }
+        const dec = unsafe { @ptrFromInt(*vp8l.Decoder, decAddress) }
+        if !vp8l.decodeHeader(dec, &i) {
+            status = dec.*.status
+        } else {
+            status = io.allocateDecBuffer(i.width, i.height, p.*.options, output, p.*.allocator)
+            if status == io.OK {
+                if !vp8l.decodeImage(dec) { status = dec.*.status }
+            }
+        }
+        vp8l.delete(decAddress)
+    }
+    if status != io.OK {
+        io.freeDecBuffer(output, p.*.allocator)
+    } else if p.*.options != 0 && io.optionsAt(p.*.options).*.flip != 0 {
+        status = io.flipBuffer(output)
+    }
+    return status
+}
+
+// WebPDecode: DATA decoded as the options ask into OUTPUT (its colour
+// space set; its memory the caller's or allocated), the features into F.
+pub fn decode(data: usize, dataSize: usize, f: *Features, options: usize, output: *Buffer, allocator: Allocator) -> i32 {
+    var status = getFeatures(data, dataSize, f)
+    if status != io.OK {
+        if status == io.NOT_ENOUGH_DATA { return io.BITSTREAM_ERROR }
+        return status
+    }
+    var p: io.Params = undefined
+    io.resetParams(&p, allocator)
+    p.options = options
+    p.output = @intFromPtr(output)
+    if io.avoidSlowMemory(output, @intFromPtr(f)) {
+        var inMemory: Buffer = undefined
+        io.zero(@intFromPtr(&inMemory), @sizeOf(Buffer))
+        inMemory.colorspace = output.*.colorspace
+        inMemory.width = f.*.width
+        inMemory.height = f.*.height
+        p.output = @intFromPtr(&inMemory)
+        status = decodeInto(data, dataSize, &p)
+        if status == io.OK { status = io.copyDecBufferPixels(&inMemory, output) }
+        io.freeDecBuffer(&inMemory, allocator)
+    } else {
+        status = decodeInto(data, dataSize, &p)
+    }
+    return status
+}
+
+// ---------------------------------------------------------------------------
+// The incremental decoder (dec/idec_dec.c)
+
+const CHUNK_SIZE: u64 = 4096
+const MAX_MB_SIZE: usize = 4096
+
+pub const STATE_WEBP_HEADER: u8 = 0
+pub const STATE_VP8_HEADER: u8 = 1
+pub const STATE_VP8_PARTS0: u8 = 2
+pub const STATE_VP8_DATA: u8 = 3
+pub const STATE_VP8L_HEADER: u8 = 4
+pub const STATE_VP8L_DATA: u8 = 5
+pub const STATE_DONE: u8 = 6
+pub const STATE_ERROR: u8 = 7
+
+const MEM_MODE_NONE: u8 = 0
+const MEM_MODE_APPEND: u8 = 1
+const MEM_MODE_MAP: u8 = 2
+
+// The data so far: in a buffer of the decoder's (appended) or the
+// caller's (mapped); START is where decoding is, END where the data
+// ends; and the first partition, copied when appending (the buffer
+// moves).
+pub const MemBuffer = struct {
+    mode: u8
+    start: usize
+    end: usize
+    bufSize: usize
+    buf: usize
+    part0Size: usize
+    part0Buf: usize
+}
+
+pub const IDecoder = struct {
+    allocator: Allocator
+    state: u8
+    params: io.Params
+    isLossless: bool
+    dec: usize
+    io: io.Io
+    mem: MemBuffer
+    output: Buffer
+    finalOutput: usize
+    chunkSize: usize
+    lastMbY: i64
+}
+
+inline fn vp8At(address: usize) -> *vp8.Decoder { return unsafe { @ptrFromInt(*vp8.Decoder, address) } }
+inline fn vp8lAt(address: usize) -> *vp8l.Decoder { return unsafe { @ptrFromInt(*vp8l.Decoder, address) } }
+
+inline fn memDataSize(mem: *MemBuffer) -> usize { return mem.*.end - mem.*.start }
+
+fn needCompressedAlpha(idec: *IDecoder) -> bool {
+    if idec.*.state == STATE_WEBP_HEADER { return false }
+    if idec.*.isLossless { return false }
+    const dec = vp8At(idec.*.dec)
+    return dec.*.alpha.data != 0 && !dec.*.alpha.isDecoded
+}
+
+// DoRemap: the decoders' pointers into the data moved by DELTA.
+fn doRemap(idec: *IDecoder, delta: i64) -> void {
+    const mem = &idec.*.mem
+    const newBase = mem.*.buf + mem.*.start
+    idec.*.io.data = newBase
+    idec.*.io.dataSize = memDataSize(mem)
+    if idec.*.dec == 0 { return }
+    if !idec.*.isLossless {
+        const dec = vp8At(idec.*.dec)
+        const lastPart = dec.*.numPartsMinusOne
+        if delta != 0 {
+            var p: usize = 0
+            while p <= lastPart {
+                vp8.remap(&dec.*.parts[p], delta)
+                p += 1
+            }
+            if mem.*.mode == MEM_MODE_MAP { vp8.remap(&dec.*.br, delta) }
+        }
+        {
+            const lastStart = dec.*.parts[lastPart].buf
+            vp8.setBuffer(&dec.*.parts[lastPart], lastStart, mem.*.buf + mem.*.end - lastStart)
+        }
+        if needCompressedAlpha(idec) {
+            dec.*.alpha.data = io.offset(dec.*.alpha.data, delta)
+            if dec.*.alpha.decoder != 0 {
+                const a = vp8l.alphaDecoderAt(dec.*.alpha.decoder)
+                if a.*.vp8lDec != 0 && a.*.method == 1 {
+                    vp8l.setBuffer(&vp8lAt(a.*.vp8lDec).*.br, dec.*.alpha.data + 1, dec.*.alpha.dataSize - 1)
+                }
+            }
+        }
+    } else {
+        const dec = vp8lAt(idec.*.dec)
+        vp8l.setBuffer(&dec.*.br, newBase, memDataSize(mem))
+    }
+}
+
+fn appendToMemBuffer(idec: *IDecoder, data: usize, dataSize: usize) -> bool {
+    const mem = &idec.*.mem
+    const needAlpha = needCompressedAlpha(idec)
+    var oldStart: usize = 0
+    if mem.*.buf != 0 { oldStart = mem.*.buf + mem.*.start }
+    var oldBase = oldStart
+    if needAlpha { oldBase = vp8At(idec.*.dec).*.alpha.data }
+    if @intCast(u64, dataSize) > MAX_CHUNK_PAYLOAD { return false }
+    if mem.*.end + dataSize > mem.*.bufSize {
+        const newMemStart = oldStart - oldBase
+        const currentSize = memDataSize(mem) + newMemStart
+        const newSize = @intCast(u64, currentSize + dataSize)
+        const extraSize = (newSize + CHUNK_SIZE - 1) / CHUNK_SIZE * CHUNK_SIZE
+        const newBuf = io.allocate(idec.*.allocator, @intCast(usize, extraSize))
+        if newBuf == 0 { return false }
+        if oldBase != 0 { io.copy(newBuf, oldBase, currentSize) }
+        io.release(idec.*.allocator, mem.*.buf, mem.*.bufSize)
+        mem.*.buf = newBuf
+        mem.*.bufSize = @intCast(usize, extraSize)
+        mem.*.start = newMemStart
+        mem.*.end = currentSize
+    }
+    io.copy(mem.*.buf + mem.*.end, data, dataSize)
+    mem.*.end += dataSize
+    doRemap(idec, @intCast(i64, mem.*.buf + mem.*.start) - @intCast(i64, oldStart))
+    return true
+}
+
+fn remapMemBuffer(idec: *IDecoder, data: usize, dataSize: usize) -> bool {
+    const mem = &idec.*.mem
+    var oldStart: usize = 0
+    if mem.*.buf != 0 { oldStart = mem.*.buf + mem.*.start }
+    if dataSize < mem.*.bufSize { return false }
+    mem.*.buf = data
+    mem.*.end = dataSize
+    mem.*.bufSize = dataSize
+    doRemap(idec, @intCast(i64, mem.*.buf + mem.*.start) - @intCast(i64, oldStart))
+    return true
+}
+
+fn finishDecoding(idec: *IDecoder) -> i32 {
+    const output = io.bufferAt(idec.*.params.output)
+    idec.*.state = STATE_DONE
+    if idec.*.params.options != 0 && io.optionsAt(idec.*.params.options).*.flip != 0 {
+        const status = io.flipBuffer(output)
+        if status != io.OK { return status }
+    }
+    if idec.*.finalOutput != 0 {
+        const target = io.bufferAt(idec.*.finalOutput)
+        io.copyDecBufferPixels(output, target)
+        io.freeDecBuffer(&idec.*.output, idec.*.allocator)
+        output.* = target.*
+        idec.*.finalOutput = 0
+    }
+    return io.OK
+}
+
+fn idecError(idec: *IDecoder, failure: i32) -> i32 {
+    if idec.*.state == STATE_VP8_DATA { vp8.exitCritical(vp8At(idec.*.dec), &idec.*.io) }
+    idec.*.state = STATE_ERROR
+    return failure
+}
+
+fn changeState(idec: *IDecoder, newState: u8, consumed: usize) -> void {
+    const mem = &idec.*.mem
+    idec.*.state = newState
+    mem.*.start += consumed
+    idec.*.io.data = mem.*.buf + mem.*.start
+    idec.*.io.dataSize = memDataSize(mem)
+}
+
+fn decodeWebPHeaders(idec: *IDecoder) -> i32 {
+    const mem = &idec.*.mem
+    var headers: Headers = undefined
+    io.zero(@intFromPtr(&headers), @sizeOf(Headers))
+    headers.data = mem.*.buf + mem.*.start
+    headers.dataSize = memDataSize(mem)
+    headers.haveAllData = false
+    const status = parseHeaders(&headers)
+    if status == io.NOT_ENOUGH_DATA { return io.SUSPENDED }
+    if status != io.OK { return idecError(idec, status) }
+    idec.*.chunkSize = headers.compressedSize
+    idec.*.isLossless = headers.isLossless
+    if !idec.*.isLossless {
+        const decAddress = io.allocate(idec.*.allocator, @sizeOf(vp8.Decoder))
+        if decAddress == 0 { return io.OUT_OF_MEMORY }
+        const dec = vp8At(decAddress)
+        vp8.init(dec, idec.*.allocator)
+        idec.*.dec = decAddress
+        dec.*.alpha.data = headers.alphaData
+        dec.*.alpha.dataSize = headers.alphaDataSize
+        changeState(idec, STATE_VP8_HEADER, headers.offset)
+    } else {
+        const decAddress = vp8l.create(idec.*.allocator)
+        if decAddress == 0 { return io.OUT_OF_MEMORY }
+        idec.*.dec = decAddress
+        changeState(idec, STATE_VP8L_HEADER, headers.offset)
+    }
+    return io.OK
+}
+
+fn decodeVP8FrameHeader(idec: *IDecoder) -> i32 {
+    const data = idec.*.mem.buf + idec.*.mem.start
+    const currSize = memDataSize(&idec.*.mem)
+    var width: i64 = 0
+    var height: i64 = 0
+    if currSize < vp8.VP8_FRAME_HEADER_SIZE { return io.SUSPENDED }
+    if !vp8.getInfo(data, currSize, idec.*.chunkSize, &width, &height) { return idecError(idec, io.BITSTREAM_ERROR) }
+    const bits = get8(data) | (get8(data + 1) << 8) | (get8(data + 2) << 16)
+    idec.*.mem.part0Size = @intCast(usize, bits >> 5) + vp8.VP8_FRAME_HEADER_SIZE
+    idec.*.io.data = data
+    idec.*.io.dataSize = currSize
+    idec.*.state = STATE_VP8_PARTS0
+    return io.OK
+}
+
+// CopyParts0Data: the first partition (what its reader has not loaded
+// yet) copied when appending, since the buffer it is in moves.
+fn copyParts0Data(idec: *IDecoder) -> i32 {
+    const dec = vp8At(idec.*.dec)
+    const br = &dec.*.br
+    const partSize = br.*.bufEnd - br.*.buf
+    const mem = &idec.*.mem
+    if partSize == 0 { return io.BITSTREAM_ERROR }
+    if mem.*.mode == MEM_MODE_APPEND {
+        const part0Buf = io.allocate(idec.*.allocator, partSize)
+        if part0Buf == 0 { return io.OUT_OF_MEMORY }
+        io.copy(part0Buf, br.*.buf, partSize)
+        mem.*.part0Buf = part0Buf
+        mem.*.part0Size = partSize
+        vp8.setBuffer(br, part0Buf, partSize)
+    }
+    mem.*.start += partSize
+    return io.OK
+}
+
+fn decodePartition0(idec: *IDecoder) -> i32 {
+    const dec = vp8At(idec.*.dec)
+    const i = &idec.*.io
+    const output = io.bufferAt(idec.*.params.output)
+    if memDataSize(&idec.*.mem) < idec.*.mem.part0Size { return io.SUSPENDED }
+    if !vp8.getHeaders(dec, i) {
+        const status = dec.*.status
+        if status == io.SUSPENDED || status == io.NOT_ENOUGH_DATA { return io.SUSPENDED }
+        return idecError(idec, status)
+    }
+    dec.*.status = io.allocateDecBuffer(i.*.width, i.*.height, idec.*.params.options, output, idec.*.allocator)
+    if dec.*.status != io.OK { return idecError(idec, dec.*.status) }
+    dec.*.status = copyParts0Data(idec)
+    if dec.*.status != io.OK { return idecError(idec, dec.*.status) }
+    if vp8.enterCritical(dec, i) != io.OK { return idecError(idec, dec.*.status) }
+    idec.*.state = STATE_VP8_DATA
+    if !vp8.initFrame(dec, i) { return idecError(idec, dec.*.status) }
+    return io.OK
+}
+
+fn decodeRemaining(idec: *IDecoder) -> i32 {
+    const dec = vp8At(idec.*.dec)
+    const i = &idec.*.io
+    if !dec.*.ready { return idecError(idec, io.BITSTREAM_ERROR) }
+    while dec.*.mbY < dec.*.mbH {
+        if idec.*.lastMbY != @intCast(i64, dec.*.mbY) {
+            if !vp8.parseIntraModeRow(dec) { return idecError(idec, io.BITSTREAM_ERROR) }
+            idec.*.lastMbY = @intCast(i64, dec.*.mbY)
+        }
+        while dec.*.mbX < dec.*.mbW {
+            const tokenBr = &dec.*.parts[dec.*.mbY & dec.*.numPartsMinusOne]
+            const flags = vp8.saveFlags(dec)
+            const savedBr = tokenBr.*
+            if !vp8.decodeMB(dec, tokenBr) {
+                if dec.*.numPartsMinusOne == 0 && memDataSize(&idec.*.mem) > MAX_MB_SIZE { return idecError(idec, io.BITSTREAM_ERROR) }
+                vp8.restoreFlags(dec, flags)
+                tokenBr.* = savedBr
+                return io.SUSPENDED
+            }
+            if dec.*.numPartsMinusOne == 0 { idec.*.mem.start = tokenBr.*.buf - idec.*.mem.buf }
+            dec.*.mbX += 1
+        }
+        vp8.initScanline(dec)
+        if !vp8.processRow(dec, i) { return idecError(idec, io.USER_ABORT) }
+        dec.*.mbY += 1
+    }
+    vp8.exitCritical(dec, i)
+    dec.*.ready = false
+    return finishDecoding(idec)
+}
+
+fn decodeVP8LHeader(idec: *IDecoder) -> i32 {
+    const i = &idec.*.io
+    const dec = vp8lAt(idec.*.dec)
+    const output = io.bufferAt(idec.*.params.output)
+    const currSize = memDataSize(&idec.*.mem)
+    if currSize < (idec.*.chunkSize >> 3) {
+        dec.*.status = io.SUSPENDED
+        return io.SUSPENDED
+    }
+    if !vp8l.decodeHeader(dec, i) {
+        if dec.*.status == io.BITSTREAM_ERROR && currSize < idec.*.chunkSize { dec.*.status = io.SUSPENDED }
+        if dec.*.status == io.SUSPENDED || dec.*.status == io.NOT_ENOUGH_DATA { return io.SUSPENDED }
+        return idecError(idec, dec.*.status)
+    }
+    dec.*.status = io.allocateDecBuffer(i.*.width, i.*.height, idec.*.params.options, output, idec.*.allocator)
+    if dec.*.status != io.OK { return idecError(idec, dec.*.status) }
+    idec.*.state = STATE_VP8L_DATA
+    return io.OK
+}
+
+fn decodeVP8LData(idec: *IDecoder) -> i32 {
+    const dec = vp8lAt(idec.*.dec)
+    const currSize = memDataSize(&idec.*.mem)
+    dec.*.incremental = currSize < idec.*.chunkSize
+    if !vp8l.decodeImage(dec) {
+        if dec.*.status == io.SUSPENDED || dec.*.status == io.NOT_ENOUGH_DATA { return io.SUSPENDED }
+        return idecError(idec, dec.*.status)
+    }
+    if dec.*.status == io.SUSPENDED { return io.SUSPENDED }
+    return finishDecoding(idec)
+}
+
+// IDecode: as far as the data goes.
+fn idecode(idec: *IDecoder) -> i32 {
+    var status = io.SUSPENDED
+    if idec.*.state == STATE_WEBP_HEADER {
+        status = decodeWebPHeaders(idec)
+    } else if idec.*.dec == 0 {
+        return io.SUSPENDED
+    }
+    if idec.*.state == STATE_VP8_HEADER { status = decodeVP8FrameHeader(idec) }
+    if idec.*.state == STATE_VP8_PARTS0 { status = decodePartition0(idec) }
+    if idec.*.state == STATE_VP8_DATA {
+        if idec.*.dec == 0 { return io.SUSPENDED }
+        status = decodeRemaining(idec)
+    }
+    if idec.*.state == STATE_VP8L_HEADER { status = decodeVP8LHeader(idec) }
+    if idec.*.state == STATE_VP8L_DATA { status = decodeVP8LData(idec) }
+    return status
+}
+
+// NewDecoder: an incremental decoder into OUTPUT (0: a buffer of its
+// own); FEATURES (0: none) tell whether the caller's memory is slow.
+pub fn newDecoder(output: usize, features: usize, allocator: Allocator) -> usize {
+    const address = io.allocateZeroed(allocator, @sizeOf(IDecoder))
+    if address == 0 { return 0 }
+    const idec = unsafe { @ptrFromInt(*IDecoder, address) }
+    idec.*.allocator = allocator
+    idec.*.state = STATE_WEBP_HEADER
+    idec.*.chunkSize = 0
+    idec.*.lastMbY = 0 - 1
+    io.initIo(&idec.*.io)
+    io.resetParams(&idec.*.params, allocator)
+    if output == 0 || io.avoidSlowMemory(io.bufferAt(output), features) {
+        idec.*.params.output = @intFromPtr(&idec.*.output)
+        idec.*.finalOutput = output
+        if output != 0 { idec.*.output.colorspace = io.bufferAt(output).*.colorspace }
+    } else {
+        idec.*.params.output = output
+        idec.*.finalOutput = 0
+    }
+    idec.*.io.params = @intFromPtr(&idec.*.params)
+    return address
+}
+
+pub inline fn idecAt(address: usize) -> *IDecoder { return unsafe { @ptrFromInt(*IDecoder, address) } }
+
+// WebPIDelete.
+pub fn deleteDecoder(address: usize) -> void {
+    if address == 0 { return }
+    const idec = idecAt(address)
+    const allocator = idec.*.allocator
+    if idec.*.dec != 0 {
+        if !idec.*.isLossless {
+            const dec = vp8At(idec.*.dec)
+            if idec.*.state == STATE_VP8_DATA { vp8.exitCritical(dec, &idec.*.io) }
+            vp8.clear(dec)
+            io.release(allocator, idec.*.dec, @sizeOf(vp8.Decoder))
+        } else {
+            vp8l.delete(idec.*.dec)
+        }
+    }
+    if idec.*.mem.mode == MEM_MODE_APPEND {
+        io.release(allocator, idec.*.mem.buf, idec.*.mem.bufSize)
+        io.release(allocator, idec.*.mem.part0Buf, idec.*.mem.part0Size)
+    }
+    io.freeDecBuffer(&idec.*.output, allocator)
+    io.release(allocator, address, @sizeOf(IDecoder))
+}
+
+fn checkStatus(idec: *IDecoder) -> i32 {
+    if idec.*.state == STATE_ERROR { return io.BITSTREAM_ERROR }
+    if idec.*.state == STATE_DONE { return io.OK }
+    return io.SUSPENDED
+}
+
+fn checkMemBufferMode(mem: *MemBuffer, expected: u8) -> bool {
+    if mem.*.mode == MEM_MODE_NONE {
+        mem.*.mode = expected
+    } else if mem.*.mode != expected {
+        return false
+    }
+    return true
+}
+
+// WebPIAppend: DATA added to what the decoder keeps.
+pub fn append(idec: *IDecoder, data: usize, dataSize: usize) -> i32 {
+    if data == 0 { return io.INVALID_PARAM }
+    const status = checkStatus(idec)
+    if status != io.SUSPENDED { return status }
+    if !checkMemBufferMode(&idec.*.mem, MEM_MODE_APPEND) { return io.INVALID_PARAM }
+    if !appendToMemBuffer(idec, data, dataSize) { return io.OUT_OF_MEMORY }
+    return idecode(idec)
+}
+
+// WebPIUpdate: DATA is all the data so far (the same buffer, grown).
+pub fn update(idec: *IDecoder, data: usize, dataSize: usize) -> i32 {
+    if data == 0 { return io.INVALID_PARAM }
+    const status = checkStatus(idec)
+    if status != io.SUSPENDED { return status }
+    if !checkMemBufferMode(&idec.*.mem, MEM_MODE_MAP) { return io.INVALID_PARAM }
+    if !remapMemBuffer(idec, data, dataSize) { return io.INVALID_PARAM }
+    return idecode(idec)
+}
+
+// GetOutputBuffer: the output once it is set up (0 before, or when the
+// pixels go to the caller's buffer only at the end).
+pub fn outputBuffer(idec: *IDecoder) -> usize {
+    if idec.*.dec == 0 { return 0 }
+    if idec.*.state <= STATE_VP8_PARTS0 { return 0 }
+    if idec.*.finalOutput != 0 { return 0 }
+    return idec.*.params.output
+}

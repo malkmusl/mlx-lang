@@ -1,0 +1,1933 @@
+// std.webp.vp8l: the lossless (VP8L) decoder of libwebp 1.3.2, step for
+// step: the bit reader (utils/bit_reader*), the Huffman codes and their
+// two-level tables (utils/huffman_utils.c), the colour cache, the meta
+// Huffman image, backward references, the transforms (predictor, cross
+// colour, subtract green, colour indexing: dsp/lossless.c), and the rows
+// handed to the output 16 at a time (dec/vp8l_dec.c). The incremental
+// decoder's suspension works as libwebp's: the state is saved every 8
+// rows and a pass that runs out of data goes back to it.
+//
+// It decodes the alpha planes of lossy pictures too (an ALPH chunk
+// compressed losslessly keeps its values in the green channel), with the
+// unfilters of dsp/filters.c; std.webp.alpha drives it.
+const io = @import("./io.mlx")
+
+pub const Allocator = io.Allocator
+pub const Io = io.Io
+
+inline fn get8(address: usize) -> u64 { return io.get8(address) }
+inline fn put8(address: usize, value: u64) -> void { io.put8(address, value) }
+inline fn get16(address: usize) -> u64 { return io.get16(address) }
+inline fn put16(address: usize, value: u64) -> void { io.put16(address, value) }
+inline fn get32(address: usize) -> u64 { return io.get32(address) }
+inline fn put32(address: usize, value: u64) -> void { io.put32(address, value) }
+
+pub const VP8L_MAGIC_BYTE: u64 = 0x2f
+pub const VP8L_FRAME_HEADER_SIZE: usize = 5
+
+const NUM_LITERAL_CODES: u64 = 256
+const NUM_LENGTH_CODES: u64 = 24
+const NUM_DISTANCE_CODES: u64 = 40
+const MAX_CACHE_BITS: u64 = 11
+const MAX_ALLOWED_CODE_LENGTH: usize = 15
+const DEFAULT_CODE_LENGTH: i64 = 8
+const NUM_ARGB_CACHE_ROWS: i64 = 16
+const NUM_CODE_LENGTH_CODES: usize = 19
+const HUFFMAN_TABLE_BITS: u64 = 8
+const LENGTHS_TABLE_BITS: u64 = 7
+const HUFFMAN_PACKED_BITS: u64 = 6
+const BITS_SPECIAL_MARKER: u64 = 0x100
+const SYNC_EVERY_N_ROWS: i64 = 8
+const ARGB_BLACK: u64 = 0xff000000
+
+// Transforms.
+const PREDICTOR_TRANSFORM: u64 = 0
+const CROSS_COLOR_TRANSFORM: u64 = 1
+const SUBTRACT_GREEN_TRANSFORM: u64 = 2
+const COLOR_INDEXING_TRANSFORM: u64 = 3
+
+// The five codes of a group.
+const GREEN: usize = 0
+const RED: usize = 1
+const BLUE: usize = 2
+const ALPHA: usize = 3
+const DIST: usize = 4
+
+// Decoder states.
+const READ_DATA: u8 = 0
+const READ_HDR: u8 = 1
+const READ_DIM: u8 = 2
+
+// What is done with each 16 rows decoded: nothing (an image inside the
+// stream), the output, or an alpha plane.
+const PROCESS_NONE: u8 = 0
+const PROCESS_ROWS: u8 = 1
+const PROCESS_ALPHA: u8 = 2
+
+// Alpha filters (WEBP_FILTER_TYPE).
+pub const FILTER_NONE: u64 = 0
+pub const FILTER_HORIZONTAL: u64 = 1
+pub const FILTER_VERTICAL: u64 = 2
+pub const FILTER_GRADIENT: u64 = 3
+
+pub const BitReader = struct {
+    val: u64
+    buf: usize
+    len: usize
+    pos: usize
+    bitPos: u64
+    eos: bool
+}
+
+// A segment of Huffman table entries (4 bytes each: the bits, then the
+// value as 16 bits at 2).
+pub const Segment = struct {
+    start: usize
+    currTable: usize
+    next: usize
+    size: usize
+}
+
+pub const HuffmanTables = struct {
+    root: Segment
+    currSegment: usize
+}
+
+// HTreeGroup: the five tables, and the shortcuts: a literal whose red,
+// blue and alpha take no bits, a code that takes none, a table of the
+// whole pixel for codes under 6 bits.
+pub const HTreeGroup = struct {
+    htrees: [5]usize
+    isTrivialLiteral: bool
+    literalArb: u64
+    isTrivialCode: bool
+    usePackedTable: bool
+    packedBits: [64]u32
+    packedValue: [64]u32
+}
+
+pub const ColorCache = struct {
+    colors: usize
+    hashShift: u64
+    hashBits: u64
+}
+
+pub const Transform = struct {
+    kind: u64
+    bits: u64
+    xsize: i64
+    ysize: i64
+    data: usize
+    dataSize: usize
+}
+
+pub const Metadata = struct {
+    colorCacheSize: i64
+    colorCache: ColorCache
+    savedColorCache: ColorCache
+    huffmanMask: i64
+    huffmanSubsampleBits: u64
+    huffmanXsize: i64
+    huffmanImage: usize
+    huffmanImageSize: usize
+    numHtreeGroups: usize
+    htreeGroups: usize
+    huffmanTables: HuffmanTables
+}
+
+pub const Decoder = struct {
+    allocator: Allocator
+    status: i32
+    state: u8
+    io: usize
+    output: usize
+    pixels: usize
+    pixelsSize: usize
+    argbCache: usize
+    br: BitReader
+    incremental: bool
+    savedBr: BitReader
+    savedLastPixel: i64
+    width: i64
+    height: i64
+    lastRow: i64
+    lastPixel: i64
+    lastOutRow: i64
+    hdr: Metadata
+    nextTransform: usize
+    transforms: [4]Transform
+    transformsSeen: u64
+    // The alpha decoder this one decodes for (0: none).
+    alphDec: usize
+}
+
+// ALPHDecoder: an ALPH chunk's header (method, filter, pre-processing),
+// its lossless decoder, where the plane goes, the last row unfiltered.
+pub const AlphaDecoder = struct {
+    allocator: Allocator
+    width: i64
+    height: i64
+    method: u64
+    filter: u64
+    preProcessing: u64
+    vp8lDec: usize
+    io: Io
+    use8bDecode: bool
+    output: usize
+    prevLine: usize
+}
+
+inline fn decoderAt(address: usize) -> *Decoder { return unsafe { @ptrFromInt(*Decoder, address) } }
+inline fn groupAt(address: usize) -> *HTreeGroup { return unsafe { @ptrFromInt(*HTreeGroup, address) } }
+inline fn segmentAt(address: usize) -> *Segment { return unsafe { @ptrFromInt(*Segment, address) } }
+pub inline fn alphaDecoderAt(address: usize) -> *AlphaDecoder { return unsafe { @ptrFromInt(*AlphaDecoder, address) } }
+inline fn ioAt(address: usize) -> *Io { return unsafe { @ptrFromInt(*Io, address) } }
+
+// ---------------------------------------------------------------------------
+// The bit reader
+
+pub fn initBitReader(br: *BitReader, start: usize, length: usize) -> void {
+    br.*.len = length
+    br.*.val = 0
+    br.*.bitPos = 0
+    br.*.eos = false
+    var n = length
+    if n > 8 { n = 8 }
+    var value: u64 = 0
+    var i: usize = 0
+    while i < n {
+        value = value | (get8(start + i) << (8 * @intCast(u64, i)))
+        i += 1
+    }
+    br.*.val = value
+    br.*.pos = n
+    br.*.buf = start
+}
+
+pub inline fn isEndOfStream(br: *BitReader) -> bool {
+    return br.*.eos || (br.*.pos == br.*.len && br.*.bitPos > 64)
+}
+
+// VP8LBitReaderSetBuffer: the data moved or grown.
+pub fn setBuffer(br: *BitReader, buffer: usize, length: usize) -> void {
+    br.*.buf = buffer
+    br.*.len = length
+    br.*.eos = br.*.pos > br.*.len || isEndOfStream(br)
+}
+
+fn setEndOfStream(br: *BitReader) -> void {
+    br.*.eos = true
+    br.*.bitPos = 0
+}
+
+fn shiftBytes(br: *BitReader) -> void {
+    while br.*.bitPos >= 8 && br.*.pos < br.*.len {
+        br.*.val = (br.*.val >> 8) | (get8(br.*.buf + br.*.pos) << 56)
+        br.*.pos += 1
+        br.*.bitPos -= 8
+    }
+    if isEndOfStream(br) { setEndOfStream(br) }
+}
+
+fn doFillBitWindow(br: *BitReader) -> void {
+    if br.*.pos + 8 < br.*.len {
+        br.*.val = br.*.val >> 32
+        br.*.bitPos -= 32
+        br.*.val = br.*.val | (get32(br.*.buf + br.*.pos) << 32)
+        br.*.pos += 4
+        return
+    }
+    shiftBytes(br)
+}
+
+inline fn fillBitWindow(br: *BitReader) -> void {
+    if br.*.bitPos >= 32 { doFillBitWindow(br) }
+}
+
+inline fn prefetchBits(br: *BitReader) -> u64 {
+    return (br.*.val >> (br.*.bitPos & 63)) & 0xffffffff
+}
+
+pub fn readBits(br: *BitReader, count: u64) -> u64 {
+    if !br.*.eos && count <= 24 {
+        const val = prefetchBits(br) & ((@intCast(u64, 1) << count) - 1)
+        br.*.bitPos += count
+        shiftBytes(br)
+        return val
+    }
+    setEndOfStream(br)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Huffman tables (utils/huffman_utils.c)
+
+inline fn entryBits(table: usize, index: u64) -> u64 { return get8(table + 4 * @intCast(usize, index)) }
+inline fn entryValue(table: usize, index: u64) -> u64 { return get16(table + 4 * @intCast(usize, index) + 2) }
+
+inline fn setEntry(table: usize, index: usize, bits: u64, value: u64) -> void {
+    put8(table + 4 * index, bits)
+    put16(table + 4 * index + 2, value)
+}
+
+fn replicateValue(table: usize, step: usize, end: usize, bits: u64, value: u64) -> void {
+    var e = end
+    while true {
+        e -= step
+        setEntry(table, e, bits, value)
+        if e == 0 { break }
+    }
+}
+
+fn getNextKey(key: u64, len: u64) -> u64 {
+    var step = @intCast(u64, 1) << (len - 1)
+    while (key & step) != 0 { step = step >> 1 }
+    if step != 0 { return (key & (step - 1)) + step }
+    return key
+}
+
+fn nextTableBitSize(count: [*]i64, len: usize, rootBits: usize) -> usize {
+    var left: i64 = @intCast(i64, 1) << @intCast(u64, len - rootBits)
+    var l = len
+    while l < MAX_ALLOWED_CODE_LENGTH {
+        left -= count[l]
+        if left <= 0 { break }
+        l += 1
+        left = left << 1
+    }
+    return l - rootBits
+}
+
+// BuildHuffmanTable: the table of ROOT_BITS (and its second-level tables)
+// for the code lengths at CODE_LENGTHS (32-bit), into ROOT (0: only
+// checked and sized); its size, 0 for lengths that make no code.
+fn buildTable(root: usize, rootBits: usize, codeLengths: usize, size: usize, sorted: usize) -> usize {
+    var table = root
+    var totalSize: usize = @intCast(usize, 1) << @intCast(u64, rootBits)
+    var countArray: [16]i64 = undefined
+    var offsetArray: [16]i64 = undefined
+    const count = unsafe { @ptrCast([*]i64, &countArray) }
+    const offsets = unsafe { @ptrCast([*]i64, &offsetArray) }
+    var k: usize = 0
+    while k < 16 {
+        count[k] = 0
+        k += 1
+    }
+    var symbol: usize = 0
+    while symbol < size {
+        const length = io.getI32(codeLengths + 4 * symbol)
+        if length > 15 || length < 0 { return 0 }
+        count[@intCast(usize, length)] += 1
+        symbol += 1
+    }
+    if count[0] == @intCast(i64, size) { return 0 }
+    offsets[1] = 0
+    var len: usize = 1
+    while len < MAX_ALLOWED_CODE_LENGTH {
+        if count[len] > (@intCast(i64, 1) << @intCast(u64, len)) { return 0 }
+        offsets[len + 1] = offsets[len] + count[len]
+        len += 1
+    }
+    symbol = 0
+    while symbol < size {
+        const length = @intCast(usize, io.getI32(codeLengths + 4 * symbol))
+        if length > 0 {
+            if sorted != 0 { put16(sorted + 2 * @intCast(usize, offsets[length]), @intCast(u64, symbol)) }
+            offsets[length] += 1
+        }
+        symbol += 1
+    }
+    if offsets[MAX_ALLOWED_CODE_LENGTH] == 1 {
+        if sorted != 0 { replicateValue(table, 1, totalSize, 0, get16(sorted)) }
+        return totalSize
+    }
+    var low: u64 = 0xffffffff
+    const mask = @intCast(u64, totalSize - 1)
+    var key: u64 = 0
+    var numNodes: i64 = 1
+    var numOpen: i64 = 1
+    var tableBits = rootBits
+    var tableSize: usize = @intCast(usize, 1) << @intCast(u64, tableBits)
+    symbol = 0
+    len = 1
+    var step: usize = 2
+    while len <= rootBits {
+        numOpen = numOpen << 1
+        numNodes += numOpen
+        numOpen -= count[len]
+        if numOpen < 0 { return 0 }
+        if root != 0 {
+            while count[len] > 0 {
+                replicateValue(table + 4 * @intCast(usize, key), step, tableSize, @intCast(u64, len), get16(sorted + 2 * symbol))
+                symbol += 1
+                key = getNextKey(key, @intCast(u64, len))
+                count[len] -= 1
+            }
+        }
+        len += 1
+        step = step << 1
+    }
+    len = rootBits + 1
+    step = 2
+    while len <= MAX_ALLOWED_CODE_LENGTH {
+        numOpen = numOpen << 1
+        numNodes += numOpen
+        numOpen -= count[len]
+        if numOpen < 0 { return 0 }
+        while count[len] > 0 {
+            if (key & mask) != low {
+                if root != 0 { table += 4 * tableSize }
+                tableBits = nextTableBitSize(count, len, rootBits)
+                tableSize = @intCast(usize, 1) << @intCast(u64, tableBits)
+                totalSize += tableSize
+                low = key & mask
+                if root != 0 {
+                    setEntry(root, @intCast(usize, low), @intCast(u64, tableBits + rootBits), @intCast(u64, (table - root) / 4) - low)
+                }
+            }
+            if root != 0 {
+                replicateValue(table + 4 * @intCast(usize, key >> @intCast(u64, rootBits)), step, tableSize, @intCast(u64, len - rootBits), get16(sorted + 2 * symbol))
+                symbol += 1
+            }
+            key = getNextKey(key, @intCast(u64, len))
+            count[len] -= 1
+        }
+        len += 1
+        step = step << 1
+    }
+    if numNodes != 2 * offsets[MAX_ALLOWED_CODE_LENGTH] - 1 { return 0 }
+    return totalSize
+}
+
+fn tablesAllocate(allocator: Allocator, size: usize, tables: *HuffmanTables) -> bool {
+    tables.*.currSegment = @intFromPtr(&tables.*.root)
+    tables.*.root.start = io.allocate(allocator, 4 * size)
+    if tables.*.root.start == 0 { return false }
+    tables.*.root.currTable = tables.*.root.start
+    tables.*.root.next = 0
+    tables.*.root.size = size
+    return true
+}
+
+fn tablesDeallocate(allocator: Allocator, tables: *HuffmanTables) -> void {
+    io.release(allocator, tables.*.root.start, 4 * tables.*.root.size)
+    tables.*.root.start = 0
+    var current = tables.*.root.next
+    tables.*.root.next = 0
+    while current != 0 {
+        const s = segmentAt(current)
+        const next = s.*.next
+        io.release(allocator, s.*.start, 4 * s.*.size)
+        io.release(allocator, current, @sizeOf(Segment))
+        current = next
+    }
+    tables.*.currSegment = 0
+}
+
+// VP8LBuildHuffmanTable: the table at the current place of TABLES (a new
+// segment if it does not fit), or only its size when TABLES is 0.
+fn buildHuffmanTable(allocator: Allocator, tables: usize, rootBits: usize, codeLengths: usize, size: usize) -> usize {
+    const totalSize = buildTable(0, rootBits, codeLengths, size, 0)
+    if totalSize == 0 || tables == 0 { return totalSize }
+    const t = unsafe { @ptrFromInt(*HuffmanTables, tables) }
+    var current = segmentAt(t.*.currSegment)
+    if current.*.currTable + 4 * totalSize >= current.*.start + 4 * current.*.size {
+        const segmentSize = current.*.size
+        const next = io.allocate(allocator, @sizeOf(Segment))
+        if next == 0 { return 0 }
+        const n = segmentAt(next)
+        n.*.size = segmentSize
+        if totalSize > segmentSize { n.*.size = totalSize }
+        n.*.start = io.allocate(allocator, 4 * n.*.size)
+        if n.*.start == 0 {
+            io.release(allocator, next, @sizeOf(Segment))
+            return 0
+        }
+        n.*.currTable = n.*.start
+        n.*.next = 0
+        current.*.next = next
+        t.*.currSegment = next
+        current = n
+    }
+    const sorted = io.allocate(allocator, 2 * size)
+    if sorted == 0 { return 0 }
+    buildTable(current.*.currTable, rootBits, codeLengths, size, sorted)
+    io.release(allocator, sorted, 2 * size)
+    return totalSize
+}
+
+// ---------------------------------------------------------------------------
+// Reading codes and symbols
+
+inline fn subSampleSize(size: i64, bits: u64) -> i64 {
+    return (size + (@intCast(i64, 1) << bits) - 1) >> bits
+}
+
+fn readSymbol(table: usize, br: *BitReader) -> u64 {
+    var val = prefetchBits(br)
+    var t = table + 4 * @intCast(usize, val & 0xff)
+    const nbits = get8(t)
+    if nbits > HUFFMAN_TABLE_BITS {
+        br.*.bitPos += HUFFMAN_TABLE_BITS
+        val = prefetchBits(br)
+        t += 4 * @intCast(usize, get16(t + 2))
+        t += 4 * @intCast(usize, val & ((@intCast(u64, 1) << (nbits - HUFFMAN_TABLE_BITS)) - 1))
+    }
+    br.*.bitPos += get8(t)
+    return get16(t + 2)
+}
+
+// A whole pixel from the packed table into DST, answering 0; or the
+// green code (a length or cache code) when it is not a literal.
+fn readPackedSymbols(group: *HTreeGroup, br: *BitReader, dst: usize) -> u64 {
+    const val = prefetchBits(br) & 63
+    const bits = @intCast(u64, group.*.packedBits[@intCast(usize, val)])
+    const value = @intCast(u64, group.*.packedValue[@intCast(usize, val)])
+    if bits < BITS_SPECIAL_MARKER {
+        br.*.bitPos += bits
+        put32(dst, value)
+        return 0
+    }
+    br.*.bitPos += bits - BITS_SPECIAL_MARKER
+    return value
+}
+
+fn buildPackedTable(group: *HTreeGroup) -> void {
+    var code: usize = 0
+    while code < 64 {
+        var bits = @intCast(u64, code)
+        const green = group.*.htrees[GREEN]
+        const gBits = entryBits(green, bits)
+        const gValue = entryValue(green, bits)
+        if gValue >= NUM_LITERAL_CODES {
+            group.*.packedBits[code] = @intCast(u32, gBits + BITS_SPECIAL_MARKER)
+            group.*.packedValue[code] = @intCast(u32, gValue)
+        } else {
+            var total: u64 = gBits
+            var value: u64 = gValue << 8
+            bits = bits >> gBits
+            const rBits = entryBits(group.*.htrees[RED], bits)
+            value = value | (entryValue(group.*.htrees[RED], bits) << 16)
+            total += rBits
+            bits = bits >> rBits
+            const bBits = entryBits(group.*.htrees[BLUE], bits)
+            value = value | entryValue(group.*.htrees[BLUE], bits)
+            total += bBits
+            bits = bits >> bBits
+            const aBits = entryBits(group.*.htrees[ALPHA], bits)
+            value = value | (entryValue(group.*.htrees[ALPHA], bits) << 24)
+            total += aBits
+            group.*.packedBits[code] = @intCast(u32, total)
+            group.*.packedValue[code] = @intCast(u32, value & 0xffffffff)
+        }
+        code += 1
+    }
+}
+
+fn codeLengthCodeOrder(i: usize) -> usize {
+    var order: [19]u8 = [19]u8{ 17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }
+    return @intCast(usize, order[i])
+}
+
+// ReadHuffmanCodeLengths: the lengths of NUM_SYMBOLS symbols, coded with
+// the code-length code.
+fn readHuffmanCodeLengths(dec: *Decoder, codeLengthCodeLengths: usize, numSymbols: usize, codeLengths: usize) -> bool {
+    var ok = false
+    const br = &dec.*.br
+    var prevCodeLen: i64 = DEFAULT_CODE_LENGTH
+    var tables: HuffmanTables = undefined
+    io.zero(@intFromPtr(&tables), @sizeOf(HuffmanTables))
+    var maxSymbol: usize = 0
+    while true {
+        if !tablesAllocate(dec.*.allocator, 128, &tables) { break }
+        if buildHuffmanTable(dec.*.allocator, @intFromPtr(&tables), 7, codeLengthCodeLengths, NUM_CODE_LENGTH_CODES) == 0 { break }
+        if readBits(br, 1) != 0 {
+            const lengthNbits = 2 + 2 * readBits(br, 3)
+            maxSymbol = 2 + @intCast(usize, readBits(br, lengthNbits))
+            if maxSymbol > numSymbols { break }
+        } else {
+            maxSymbol = numSymbols
+        }
+        var symbol: usize = 0
+        var failed = false
+        while symbol < numSymbols {
+            if maxSymbol == 0 { break }
+            maxSymbol -= 1
+            fillBitWindow(br)
+            const start = segmentAt(tables.currSegment).*.start
+            const index = prefetchBits(br) & 127
+            br.*.bitPos += entryBits(start, index)
+            const codeLen = entryValue(start, index)
+            if codeLen < 16 {
+                io.putI32(codeLengths + 4 * symbol, @intCast(i64, codeLen))
+                symbol += 1
+                if codeLen != 0 { prevCodeLen = @intCast(i64, codeLen) }
+            } else {
+                const slot = codeLen - 16
+                var extraBits: u64 = 2
+                var repeatOffset: usize = 3
+                if slot == 1 { extraBits = 3 }
+                if slot == 2 {
+                    extraBits = 7
+                    repeatOffset = 11
+                }
+                var repeat = @intCast(usize, readBits(br, extraBits)) + repeatOffset
+                if symbol + repeat > numSymbols {
+                    failed = true
+                    break
+                }
+                var length: i64 = 0
+                if codeLen == 16 { length = prevCodeLen }
+                while repeat > 0 {
+                    io.putI32(codeLengths + 4 * symbol, length)
+                    symbol += 1
+                    repeat -= 1
+                }
+            }
+        }
+        if failed { break }
+        ok = true
+        break
+    }
+    tablesDeallocate(dec.*.allocator, &tables)
+    if !ok { dec.*.status = io.BITSTREAM_ERROR }
+    return ok
+}
+
+// ReadHuffmanCode: one code of ALPHABET_SIZE symbols, built into TABLES
+// (0: only checked); its table's size, 0 on error.
+fn readHuffmanCode(alphabetSize: usize, dec: *Decoder, codeLengths: usize, tables: usize) -> usize {
+    var ok = false
+    var size: usize = 0
+    const br = &dec.*.br
+    const simpleCode = readBits(br, 1)
+    io.zero(codeLengths, 4 * alphabetSize)
+    if simpleCode != 0 {
+        const numSymbols = readBits(br, 1) + 1
+        const firstSymbolLenCode = readBits(br, 1)
+        var bits: u64 = 8
+        if firstSymbolLenCode == 0 { bits = 1 }
+        var symbol = readBits(br, bits)
+        io.putI32(codeLengths + 4 * @intCast(usize, symbol), 1)
+        if numSymbols == 2 {
+            symbol = readBits(br, 8)
+            io.putI32(codeLengths + 4 * @intCast(usize, symbol), 1)
+        }
+        ok = true
+    } else {
+        var lengths: [19]i32 = undefined
+        const lengthsAddress = @intFromPtr(&lengths)
+        io.zero(lengthsAddress, 76)
+        const numCodes = @intCast(usize, readBits(br, 4)) + 4
+        if numCodes > NUM_CODE_LENGTH_CODES {
+            dec.*.status = io.BITSTREAM_ERROR
+            return 0
+        }
+        var i: usize = 0
+        while i < numCodes {
+            io.putI32(lengthsAddress + 4 * codeLengthCodeOrder(i), @intCast(i64, readBits(br, 3)))
+            i += 1
+        }
+        ok = readHuffmanCodeLengths(dec, lengthsAddress, alphabetSize, codeLengths)
+    }
+    ok = ok && !br.*.eos
+    if ok { size = buildHuffmanTable(dec.*.allocator, tables, 8, codeLengths, alphabetSize) }
+    if !ok || size == 0 {
+        dec.*.status = io.BITSTREAM_ERROR
+        return 0
+    }
+    return size
+}
+
+fn alphabetSize(j: usize, colorCacheBits: u64) -> usize {
+    var size: u64 = NUM_LITERAL_CODES
+    if j == GREEN {
+        size = NUM_LITERAL_CODES + NUM_LENGTH_CODES
+        if colorCacheBits > 0 { size += @intCast(u64, 1) << colorCacheBits }
+    } else if j == DIST {
+        size = NUM_DISTANCE_CODES
+    }
+    return @intCast(usize, size)
+}
+
+// The size of the tables of a group by colour cache bits (kTableSize).
+fn tableSize(colorCacheBits: u64) -> usize {
+    var sizes: [12]u16 = [12]u16{ 654, 656, 658, 662, 670, 686, 718, 782, 912, 1168, 1680, 2704 }
+    return 630 * 3 + 410 + @intCast(usize, sizes[@intCast(usize, colorCacheBits)])
+}
+
+// ReadHuffmanCodes: the meta Huffman image (if any) and every group's
+// five codes.
+fn readHuffmanCodes(dec: *Decoder, xsize: i64, ysize: i64, colorCacheBits: u64, allowRecursion: bool) -> bool {
+    const allocator = dec.*.allocator
+    const br = &dec.*.br
+    const hdr = &dec.*.hdr
+    var huffmanImage: usize = 0
+    var huffmanImageSize: usize = 0
+    var htreeGroups: usize = 0
+    var numHtreeGroups: usize = 1
+    var numHtreeGroupsMax: usize = 1
+    var codeLengths: usize = 0
+    var codeLengthsSize: usize = 0
+    var mapping: usize = 0
+    var mappingSize: usize = 0
+    var ok = false
+    while true {
+        if allowRecursion && readBits(br, 1) != 0 {
+            const precision = readBits(br, 3) + 2
+            const hxsize = subSampleSize(xsize, precision)
+            const hysize = subSampleSize(ysize, precision)
+            const pixs = @intCast(usize, hxsize * hysize)
+            if !decodeImageStream(hxsize, hysize, false, dec, &huffmanImage, &huffmanImageSize) { break }
+            hdr.*.huffmanSubsampleBits = precision
+            var i: usize = 0
+            while i < pixs {
+                const group = @intCast(usize, (get32(huffmanImage + 4 * i) >> 8) & 0xffff)
+                put32(huffmanImage + 4 * i, @intCast(u64, group))
+                if group >= numHtreeGroupsMax { numHtreeGroupsMax = group + 1 }
+                i += 1
+            }
+            if numHtreeGroupsMax > 1000 || @intCast(i64, numHtreeGroupsMax) > xsize * ysize {
+                mappingSize = 4 * numHtreeGroupsMax
+                mapping = io.allocate(allocator, mappingSize)
+                if mapping == 0 {
+                    dec.*.status = io.OUT_OF_MEMORY
+                    break
+                }
+                io.fill(mapping, 0xff, mappingSize)
+                numHtreeGroups = 0
+                i = 0
+                while i < pixs {
+                    const mapped = mapping + 4 * @intCast(usize, get32(huffmanImage + 4 * i))
+                    if get32(mapped) == 0xffffffff {
+                        put32(mapped, @intCast(u64, numHtreeGroups))
+                        numHtreeGroups += 1
+                    }
+                    put32(huffmanImage + 4 * i, get32(mapped))
+                    i += 1
+                }
+            } else {
+                numHtreeGroups = numHtreeGroupsMax
+            }
+        }
+        if br.*.eos { break }
+        var maxAlphabetSize: usize = 0
+        var j: usize = 0
+        while j < 5 {
+            const a = alphabetSize(j, colorCacheBits)
+            if maxAlphabetSize < a { maxAlphabetSize = a }
+            j += 1
+        }
+        codeLengthsSize = 4 * maxAlphabetSize
+        codeLengths = io.allocateZeroed(allocator, codeLengthsSize)
+        htreeGroups = io.allocateZeroed(allocator, numHtreeGroups * @sizeOf(HTreeGroup))
+        if htreeGroups == 0 || codeLengths == 0 || !tablesAllocate(allocator, numHtreeGroups * tableSize(colorCacheBits), &hdr.*.huffmanTables) {
+            dec.*.status = io.OUT_OF_MEMORY
+            break
+        }
+        var failed = false
+        var i: usize = 0
+        while i < numHtreeGroupsMax {
+            if mapping != 0 && get32(mapping + 4 * i) == 0xffffffff {
+                j = 0
+                while j < 5 {
+                    if readHuffmanCode(alphabetSize(j, colorCacheBits), dec, codeLengths, 0) == 0 {
+                        failed = true
+                        break
+                    }
+                    j += 1
+                }
+                if failed { break }
+            } else {
+                var index = i
+                if mapping != 0 { index = @intCast(usize, get32(mapping + 4 * i)) }
+                const group = groupAt(htreeGroups + index * @sizeOf(HTreeGroup))
+                var totalSize: u64 = 0
+                var isTrivialLiteral = true
+                var maxBits: u64 = 0
+                j = 0
+                while j < 5 {
+                    const a = alphabetSize(j, colorCacheBits)
+                    const size = readHuffmanCode(a, dec, codeLengths, @intFromPtr(&hdr.*.huffmanTables))
+                    const segment = segmentAt(hdr.*.huffmanTables.currSegment)
+                    group.*.htrees[j] = segment.*.currTable
+                    if size == 0 {
+                        failed = true
+                        break
+                    }
+                    if isTrivialLiteral && (j == RED || j == BLUE || j == ALPHA) {
+                        isTrivialLiteral = get8(group.*.htrees[j]) == 0
+                    }
+                    totalSize += get8(group.*.htrees[j])
+                    segment.*.currTable += 4 * size
+                    if j <= ALPHA {
+                        var localMaxBits = io.getI32(codeLengths)
+                        var k: usize = 1
+                        while k < a {
+                            const l = io.getI32(codeLengths + 4 * k)
+                            if l > localMaxBits { localMaxBits = l }
+                            k += 1
+                        }
+                        maxBits += @intCast(u64, localMaxBits)
+                    }
+                    j += 1
+                }
+                if failed { break }
+                group.*.isTrivialLiteral = isTrivialLiteral
+                group.*.isTrivialCode = false
+                if isTrivialLiteral {
+                    const red = get16(group.*.htrees[RED] + 2)
+                    const blue = get16(group.*.htrees[BLUE] + 2)
+                    const alphaValue = get16(group.*.htrees[ALPHA] + 2)
+                    group.*.literalArb = ((alphaValue << 24) | (red << 16) | blue) & 0xffffffff
+                    if totalSize == 0 && get16(group.*.htrees[GREEN] + 2) < NUM_LITERAL_CODES {
+                        group.*.isTrivialCode = true
+                        group.*.literalArb = (group.*.literalArb | (get16(group.*.htrees[GREEN] + 2) << 8)) & 0xffffffff
+                    }
+                }
+                group.*.usePackedTable = !group.*.isTrivialCode && maxBits < HUFFMAN_PACKED_BITS
+                if group.*.usePackedTable { buildPackedTable(group) }
+            }
+            i += 1
+        }
+        if failed { break }
+        ok = true
+        hdr.*.huffmanImage = huffmanImage
+        hdr.*.huffmanImageSize = huffmanImageSize
+        hdr.*.numHtreeGroups = numHtreeGroups
+        hdr.*.htreeGroups = htreeGroups
+        break
+    }
+    io.release(allocator, codeLengths, codeLengthsSize)
+    io.release(allocator, mapping, mappingSize)
+    if !ok {
+        io.release(allocator, huffmanImage, huffmanImageSize)
+        tablesDeallocate(allocator, &hdr.*.huffmanTables)
+        io.release(allocator, htreeGroups, numHtreeGroups * @sizeOf(HTreeGroup))
+    }
+    return ok
+}
+
+// ---------------------------------------------------------------------------
+// The colour cache
+
+fn colorCacheInit(allocator: Allocator, cache: *ColorCache, hashBits: u64) -> bool {
+    const size = 4 * (@intCast(usize, 1) << hashBits)
+    cache.*.colors = io.allocateZeroed(allocator, size)
+    if cache.*.colors == 0 { return false }
+    cache.*.hashShift = 32 - hashBits
+    cache.*.hashBits = hashBits
+    return true
+}
+
+fn colorCacheClear(allocator: Allocator, cache: *ColorCache) -> void {
+    if cache.*.colors != 0 { io.release(allocator, cache.*.colors, 4 * (@intCast(usize, 1) << cache.*.hashBits)) }
+    cache.*.colors = 0
+}
+
+fn colorCacheCopy(source: *ColorCache, target: *ColorCache) -> void {
+    io.copy(target.*.colors, source.*.colors, 4 * (@intCast(usize, 1) << target.*.hashBits))
+}
+
+inline fn colorCacheInsert(cache: *ColorCache, argb: u64) -> void {
+    const key = ((argb * 0x1e35a7bd) & 0xffffffff) >> cache.*.hashShift
+    put32(cache.*.colors + 4 * @intCast(usize, key), argb)
+}
+
+// ---------------------------------------------------------------------------
+// Distances
+
+fn getCopyDistance(symbol: u64, br: *BitReader) -> i64 {
+    if symbol < 4 { return @intCast(i64, symbol + 1) }
+    const extraBits = (symbol - 2) >> 1
+    const off = (2 + (symbol & 1)) << extraBits
+    return @intCast(i64, off + readBits(br, extraBits) + 1)
+}
+
+// kCodeToPlane: the 120 short distances as (y, 8 - x) pairs.
+fn codeToPlane(i: usize) -> u64 {
+    var plane: [120]u8 = [120]u8{
+        0x18, 0x07, 0x17, 0x19, 0x28, 0x06, 0x27, 0x29, 0x16, 0x1a,
+        0x26, 0x2a, 0x38, 0x05, 0x37, 0x39, 0x15, 0x1b, 0x36, 0x3a,
+        0x25, 0x2b, 0x48, 0x04, 0x47, 0x49, 0x14, 0x1c, 0x35, 0x3b,
+        0x46, 0x4a, 0x24, 0x2c, 0x58, 0x45, 0x4b, 0x34, 0x3c, 0x03,
+        0x57, 0x59, 0x13, 0x1d, 0x56, 0x5a, 0x23, 0x2d, 0x44, 0x4c,
+        0x55, 0x5b, 0x33, 0x3d, 0x68, 0x02, 0x67, 0x69, 0x12, 0x1e,
+        0x66, 0x6a, 0x22, 0x2e, 0x54, 0x5c, 0x43, 0x4d, 0x65, 0x6b,
+        0x32, 0x3e, 0x78, 0x01, 0x77, 0x79, 0x53, 0x5d, 0x11, 0x1f,
+        0x64, 0x6c, 0x42, 0x4e, 0x76, 0x7a, 0x21, 0x2f, 0x75, 0x7b,
+        0x31, 0x3f, 0x63, 0x6d, 0x52, 0x5e, 0x00, 0x74, 0x7c, 0x41,
+        0x4f, 0x10, 0x20, 0x62, 0x6e, 0x30, 0x73, 0x7d, 0x51, 0x5f,
+        0x40, 0x72, 0x7e, 0x61, 0x6f, 0x50, 0x71, 0x7f, 0x60, 0x70
+    }
+    return @intCast(u64, plane[i])
+}
+
+fn planeCodeToDistance(xsize: i64, planeCode: i64) -> i64 {
+    if planeCode > 120 { return planeCode - 120 }
+    const distCode = codeToPlane(@intCast(usize, planeCode - 1))
+    const yoffset = @intCast(i64, distCode >> 4)
+    const xoffset = 8 - @intCast(i64, distCode & 0xf)
+    const dist = yoffset * xsize + xoffset
+    if dist >= 1 { return dist }
+    return 1
+}
+
+fn getMetaIndex(hdr: *Metadata, x: i64, y: i64) -> usize {
+    const bits = hdr.*.huffmanSubsampleBits
+    if bits == 0 { return 0 }
+    return @intCast(usize, get32(hdr.*.huffmanImage + 4 * @intCast(usize, hdr.*.huffmanXsize * (y >> bits) + (x >> bits))))
+}
+
+inline fn groupForPos(hdr: *Metadata, x: i64, y: i64) -> *HTreeGroup {
+    return groupAt(hdr.*.htreeGroups + getMetaIndex(hdr, x, y) * @sizeOf(HTreeGroup))
+}
+
+// ---------------------------------------------------------------------------
+// Inverse transforms (dsp/lossless.c)
+
+inline fn addPixels(a: u64, b: u64) -> u64 {
+    const alphaAndGreen = (a & 0xff00ff00) + (b & 0xff00ff00)
+    const redAndBlue = (a & 0x00ff00ff) + (b & 0x00ff00ff)
+    return (alphaAndGreen & 0xff00ff00) | (redAndBlue & 0x00ff00ff)
+}
+
+inline fn average2(a0: u64, a1: u64) -> u64 { return (((a0 ^ a1) & 0xfefefefe) >> 1) + (a0 & a1) }
+
+fn clip255(a: i64) -> u64 {
+    if a >= 0 && a < 256 { return @intCast(u64, a) }
+    // (~a >> 24 on the 32-bit value: 0 below, 255 above.)
+    if a < 0 { return 0 }
+    return 255
+}
+
+fn clampedAddSubtractFull(c0: u64, c1: u64, c2: u64) -> u64 {
+    var result: u64 = 0
+    var shift: u64 = 0
+    while shift < 32 {
+        const v = @intCast(i64, (c0 >> shift) & 0xff) + @intCast(i64, (c1 >> shift) & 0xff) - @intCast(i64, (c2 >> shift) & 0xff)
+        result = result | (clip255(v) << shift)
+        shift += 8
+    }
+    return result
+}
+
+fn clampedAddSubtractHalf(c0: u64, c1: u64, c2: u64) -> u64 {
+    const ave = average2(c0, c1)
+    var result: u64 = 0
+    var shift: u64 = 0
+    while shift < 32 {
+        const a = @intCast(i64, (ave >> shift) & 0xff)
+        const b = @intCast(i64, (c2 >> shift) & 0xff)
+        // (a - b) / 2 rounds towards zero.
+        var half = a - b
+        if half < 0 { half = 0 - ((0 - half) / 2) } else { half = half / 2 }
+        result = result | (clip255(a + half) << shift)
+        shift += 8
+    }
+    return result
+}
+
+inline fn sub3(a: i64, b: i64, c: i64) -> i64 {
+    var pb = b - c
+    var pa = a - c
+    if pb < 0 { pb = 0 - pb }
+    if pa < 0 { pa = 0 - pa }
+    return pb - pa
+}
+
+fn select(a: u64, b: u64, c: u64) -> u64 {
+    var paMinusPb: i64 = 0
+    var shift: u64 = 0
+    while shift < 32 {
+        paMinusPb += sub3(@intCast(i64, (a >> shift) & 0xff), @intCast(i64, (b >> shift) & 0xff), @intCast(i64, (c >> shift) & 0xff))
+        shift += 8
+    }
+    if paMinusPb <= 0 { return a }
+    return b
+}
+
+// The prediction of mode MODE from LEFT and the row above (TOP at the
+// pixel's column).
+fn predict(mode: u64, left: u64, top: usize) -> u64 {
+    if mode == 0 || mode >= 14 { return ARGB_BLACK }
+    if mode == 1 { return left }
+    if mode == 2 { return get32(top) }
+    if mode == 3 { return get32(top + 4) }
+    if mode == 4 { return get32(top - 4) }
+    if mode == 5 { return average2(average2(left, get32(top + 4)), get32(top)) }
+    if mode == 6 { return average2(left, get32(top - 4)) }
+    if mode == 7 { return average2(left, get32(top)) }
+    if mode == 8 { return average2(get32(top - 4), get32(top)) }
+    if mode == 9 { return average2(get32(top), get32(top + 4)) }
+    if mode == 10 { return average2(average2(left, get32(top - 4)), average2(get32(top), get32(top + 4))) }
+    if mode == 11 { return select(get32(top), left, get32(top - 4)) }
+    if mode == 12 { return clampedAddSubtractFull(left, get32(top), get32(top - 4)) }
+    return clampedAddSubtractHalf(left, get32(top), get32(top - 4))
+}
+
+fn predictorInverse(t: *Transform, yStart: i64, yEnd: i64, input: usize, out: usize) -> void {
+    const width = @intCast(usize, t.*.xsize)
+    var src = input
+    var dst = out
+    var y = yStart
+    if y == 0 {
+        put32(dst, addPixels(get32(src), ARGB_BLACK))
+        var x: usize = 1
+        while x < width {
+            put32(dst + 4 * x, addPixels(get32(src + 4 * x), get32(dst + 4 * x - 4)))
+            x += 1
+        }
+        src += 4 * width
+        dst += 4 * width
+        y += 1
+    }
+    const tileWidth = @intCast(usize, 1) << t.*.bits
+    const mask = @intCast(i64, tileWidth - 1)
+    const tilesPerRow = @intCast(usize, subSampleSize(t.*.xsize, t.*.bits))
+    var predModeBase = t.*.data + 4 * @intCast(usize, y >> t.*.bits) * tilesPerRow
+    while y < yEnd {
+        var predModeSrc = predModeBase
+        put32(dst, addPixels(get32(src), get32(dst - 4 * width)))
+        var x: usize = 1
+        while x < width {
+            const mode = (get32(predModeSrc) >> 8) & 0xf
+            predModeSrc += 4
+            var xEnd = x / tileWidth * tileWidth + tileWidth
+            if xEnd > width { xEnd = width }
+            while x < xEnd {
+                const pred = predict(mode, get32(dst + 4 * x - 4), dst + 4 * x - 4 * width)
+                put32(dst + 4 * x, addPixels(get32(src + 4 * x), pred))
+                x += 1
+            }
+        }
+        src += 4 * width
+        dst += 4 * width
+        y += 1
+        if (y & mask) == 0 { predModeBase += 4 * tilesPerRow }
+    }
+}
+
+inline fn colorTransformDelta(pred: u64, color: u64) -> i64 {
+    var p = @intCast(i64, pred & 0xff)
+    var c = @intCast(i64, color & 0xff)
+    if p >= 128 { p -= 256 }
+    if c >= 128 { c -= 256 }
+    return (p * c) >> 5
+}
+
+fn colorSpaceInverse(t: *Transform, yStart: i64, yEnd: i64, input: usize, out: usize) -> void {
+    const width = @intCast(usize, t.*.xsize)
+    const tileWidth = @intCast(usize, 1) << t.*.bits
+    const mask = @intCast(i64, tileWidth - 1)
+    const tilesPerRow = @intCast(usize, subSampleSize(t.*.xsize, t.*.bits))
+    var y = yStart
+    var predRow = t.*.data + 4 * @intCast(usize, y >> t.*.bits) * tilesPerRow
+    var src = input
+    var dst = out
+    while y < yEnd {
+        var pred = predRow
+        var x: usize = 0
+        while x < width {
+            const code = get32(pred)
+            pred += 4
+            const greenToRed = code & 0xff
+            const greenToBlue = (code >> 8) & 0xff
+            const redToBlue = (code >> 16) & 0xff
+            var end = x + tileWidth
+            if end > width { end = width }
+            while x < end {
+                const argb = get32(src + 4 * x)
+                const green = (argb >> 8) & 0xff
+                var newRed = @intCast(i64, (argb >> 16) & 0xff)
+                var newBlue = @intCast(i64, argb & 0xff)
+                newRed += colorTransformDelta(greenToRed, green)
+                newRed = newRed & 0xff
+                newBlue += colorTransformDelta(greenToBlue, green)
+                newBlue += colorTransformDelta(redToBlue, @intCast(u64, newRed))
+                newBlue = newBlue & 0xff
+                put32(dst + 4 * x, (argb & 0xff00ff00) | (@intCast(u64, newRed) << 16) | @intCast(u64, newBlue))
+                x += 1
+            }
+        }
+        src += 4 * width
+        dst += 4 * width
+        y += 1
+        if (y & mask) == 0 { predRow += 4 * tilesPerRow }
+    }
+}
+
+fn addGreenToBlueAndRed(src: usize, numPixels: usize, dst: usize) -> void {
+    var i: usize = 0
+    while i < numPixels {
+        const argb = get32(src + 4 * i)
+        const green = (argb >> 8) & 0xff
+        var redBlue = argb & 0x00ff00ff
+        redBlue += (green << 16) | green
+        redBlue = redBlue & 0x00ff00ff
+        put32(dst + 4 * i, (argb & 0xff00ff00) | redBlue)
+        i += 1
+    }
+}
+
+// ColorIndexInverseTransform: the palette indices (packed several to a
+// pixel when the palette is small) replaced by the colours; ALPHA: the
+// 8-bit version, its indices bytes and its values the colours' green.
+fn colorIndexInverse(t: *Transform, yStart: i64, yEnd: i64, input: usize, out: usize, alpha8: bool) -> void {
+    const bitsPerPixel = @intCast(u64, 8) >> t.*.bits
+    const width = @intCast(usize, t.*.xsize)
+    const colorMap = t.*.data
+    var src = input
+    var dst = out
+    var srcStep: usize = 4
+    var dstStep: usize = 4
+    if alpha8 {
+        srcStep = 1
+        dstStep = 1
+    }
+    var y = yStart
+    while y < yEnd {
+        var pack: u64 = 0
+        var x: usize = 0
+        while x < width {
+            var index: u64 = 0
+            if bitsPerPixel < 8 {
+                const countMask = (@intCast(usize, 1) << t.*.bits) - 1
+                if (x & countMask) == 0 {
+                    if alpha8 { pack = get8(src) } else { pack = (get32(src) >> 8) & 0xff }
+                    src += srcStep
+                }
+                index = pack & ((@intCast(u64, 1) << bitsPerPixel) - 1)
+                pack = pack >> bitsPerPixel
+            } else {
+                if alpha8 { index = get8(src) } else { index = (get32(src) >> 8) & 0xff }
+                src += srcStep
+            }
+            const color = get32(colorMap + 4 * @intCast(usize, index))
+            if alpha8 { put8(dst, (color >> 8) & 0xff) } else { put32(dst, color) }
+            dst += dstStep
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// VP8LInverseTransform: rows ROW_START to ROW_END from IN to OUT (which
+// may be the same).
+fn inverseTransform(t: *Transform, rowStart: i64, rowEnd: i64, input: usize, out: usize) -> void {
+    const width = @intCast(usize, t.*.xsize)
+    if t.*.kind == SUBTRACT_GREEN_TRANSFORM {
+        addGreenToBlueAndRed(input, @intCast(usize, rowEnd - rowStart) * width, out)
+    } else if t.*.kind == PREDICTOR_TRANSFORM {
+        predictorInverse(t, rowStart, rowEnd, input, out)
+        if rowEnd != t.*.ysize {
+            io.copy(out - 4 * width, out + 4 * @intCast(usize, rowEnd - rowStart - 1) * width, 4 * width)
+        }
+    } else if t.*.kind == CROSS_COLOR_TRANSFORM {
+        colorSpaceInverse(t, rowStart, rowEnd, input, out)
+    } else {
+        if input == out && t.*.bits > 0 {
+            const outStride = @intCast(usize, rowEnd - rowStart) * width
+            const inStride = @intCast(usize, rowEnd - rowStart) * @intCast(usize, subSampleSize(t.*.xsize, t.*.bits))
+            const src = out + 4 * (outStride - inStride)
+            io.move(src, out, 4 * inStride)
+            colorIndexInverse(t, rowStart, rowEnd, src, out, false)
+        } else {
+            colorIndexInverse(t, rowStart, rowEnd, input, out, false)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unfilters (dsp/filters.c)
+
+fn horizontalUnfilter(prev: usize, input: usize, out: usize, width: usize) -> void {
+    var pred: u64 = 0
+    if prev != 0 { pred = get8(prev) }
+    var i: usize = 0
+    while i < width {
+        pred = (pred + get8(input + i)) & 0xff
+        put8(out + i, pred)
+        i += 1
+    }
+}
+
+fn verticalUnfilter(prev: usize, input: usize, out: usize, width: usize) -> void {
+    if prev == 0 {
+        horizontalUnfilter(0, input, out, width)
+        return
+    }
+    var i: usize = 0
+    while i < width {
+        put8(out + i, get8(prev + i) + get8(input + i))
+        i += 1
+    }
+}
+
+fn gradientUnfilter(prev: usize, input: usize, out: usize, width: usize) -> void {
+    if prev == 0 {
+        horizontalUnfilter(0, input, out, width)
+        return
+    }
+    var top = get8(prev)
+    var topLeft = top
+    var left = top
+    var i: usize = 0
+    while i < width {
+        top = get8(prev + i)
+        var g = @intCast(i64, left) + @intCast(i64, top) - @intCast(i64, topLeft)
+        if g < 0 { g = 0 }
+        if g > 255 { g = 255 }
+        left = (get8(input + i) + @intCast(u64, g)) & 0xff
+        topLeft = top
+        put8(out + i, left)
+        i += 1
+    }
+}
+
+// WebPUnfilters[filter].
+pub fn unfilter(filter: u64, prev: usize, input: usize, out: usize, width: usize) -> void {
+    if filter == FILTER_HORIZONTAL {
+        horizontalUnfilter(prev, input, out, width)
+    } else if filter == FILTER_VERTICAL {
+        verticalUnfilter(prev, input, out, width)
+    } else if filter == FILTER_GRADIENT {
+        gradientUnfilter(prev, input, out, width)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rows to the output
+
+fn applyInverseTransforms(dec: *Decoder, startRow: i64, numRows: i64, rows: usize) -> void {
+    var n = dec.*.nextTransform
+    const cachePixs = @intCast(usize, dec.*.width * numRows)
+    const endRow = startRow + numRows
+    var rowsIn = rows
+    const rowsOut = dec.*.argbCache
+    while n > 0 {
+        n -= 1
+        inverseTransform(&dec.*.transforms[n], startRow, endRow, rowsIn, rowsOut)
+        rowsIn = rowsOut
+    }
+    if rowsIn != rowsOut { io.copy(rowsOut, rowsIn, 4 * cachePixs) }
+}
+
+// SetCropWindow: the part of rows Y_START to Y_END inside the crop, with
+// IN_DATA moved to it; false when none is.
+fn setCropWindow(i: *Io, yStart: i64, yEnd: i64, inData: *usize, pixelStride: usize) -> bool {
+    var start = yStart
+    var end = yEnd
+    if end > i.*.cropBottom { end = i.*.cropBottom }
+    if start < i.*.cropTop {
+        const delta = i.*.cropTop - start
+        start = i.*.cropTop
+        inData.* = inData.* + @intCast(usize, delta) * pixelStride
+    }
+    if start >= end { return false }
+    inData.* = inData.* + 4 * @intCast(usize, i.*.cropLeft)
+    i.*.mbY = start - i.*.cropTop
+    i.*.mbW = i.*.cropRight - i.*.cropLeft
+    i.*.mbH = end - start
+    return true
+}
+
+// ProcessRows: the rows decoded since the last call, transformed and
+// emitted.
+fn processRows(dec: *Decoder, row: i64) -> void {
+    const rows = dec.*.pixels + 4 * @intCast(usize, dec.*.width * dec.*.lastRow)
+    const numRows = row - dec.*.lastRow
+    if numRows > 0 {
+        const i = ioAt(dec.*.io)
+        var rowsData = dec.*.argbCache
+        const inStride = 4 * @intCast(usize, i.*.width)
+        applyInverseTransforms(dec, dec.*.lastRow, numRows, rows)
+        if setCropWindow(i, dec.*.lastRow, row, &rowsData, inStride) {
+            const output = io.bufferAt(dec.*.output)
+            if io.isRGBMode(output.*.colorspace) {
+                const stride = io.strideOf(output)
+                var rowOut = io.offset(io.rgbaOf(output), dec.*.lastOutRow * stride)
+                var lines: i64 = 0
+                while lines < i.*.mbH {
+                    io.convertFromBGRA(rowsData, @intCast(usize, i.*.mbW), output.*.colorspace, rowOut)
+                    rowsData += inStride
+                    rowOut = io.offset(rowOut, stride)
+                    lines += 1
+                }
+                dec.*.lastOutRow += i.*.mbH
+            } else {
+                var yPos = dec.*.lastOutRow
+                var lines: i64 = 0
+                while lines < i.*.mbH {
+                    io.convertToYUVA(rowsData, @intCast(usize, i.*.mbW), yPos, output)
+                    rowsData += inStride
+                    yPos += 1
+                    lines += 1
+                }
+                dec.*.lastOutRow = yPos
+            }
+        }
+    }
+    dec.*.lastRow = row
+}
+
+fn alphaApplyFilter(a: *AlphaDecoder, firstRow: i64, lastRow: i64, out: usize, stride: usize) -> void {
+    if a.*.filter != FILTER_NONE {
+        var prevLine = a.*.prevLine
+        var o = out
+        var y = firstRow
+        while y < lastRow {
+            unfilter(a.*.filter, prevLine, o, o, stride)
+            prevLine = o
+            o += stride
+            y += 1
+        }
+        a.*.prevLine = prevLine
+    }
+}
+
+// ExtractAlphaRows: the alpha plane's rows (the green of the pixels,
+// transformed and unfiltered).
+fn extractAlphaRows(dec: *Decoder, lastRow: i64) -> void {
+    var curRow = dec.*.lastRow
+    var numRows = lastRow - curRow
+    var input = dec.*.pixels + 4 * @intCast(usize, dec.*.width * curRow)
+    const a = alphaDecoderAt(dec.*.alphDec)
+    while numRows > 0 {
+        var count = numRows
+        if count > NUM_ARGB_CACHE_ROWS { count = NUM_ARGB_CACHE_ROWS }
+        const width = @intCast(usize, a.*.io.width)
+        const cachePixs = width * @intCast(usize, count)
+        const dst = a.*.output + width * @intCast(usize, curRow)
+        const src = dec.*.argbCache
+        applyInverseTransforms(dec, curRow, count, input)
+        var k: usize = 0
+        while k < cachePixs {
+            put8(dst + k, get32(src + 4 * k) >> 8)
+            k += 1
+        }
+        alphaApplyFilter(a, curRow, curRow + count, dst, width)
+        numRows -= count
+        input += 4 * @intCast(usize, count * dec.*.width)
+        curRow += count
+    }
+    dec.*.lastRow = lastRow
+    dec.*.lastOutRow = lastRow
+}
+
+fn extractPalettedAlphaRows(dec: *Decoder, lastRow: i64) -> void {
+    const a = alphaDecoderAt(dec.*.alphDec)
+    var topRow = dec.*.lastRow
+    if a.*.filter == FILTER_NONE || a.*.filter == FILTER_HORIZONTAL { topRow = a.*.io.cropTop }
+    var firstRow = dec.*.lastRow
+    if dec.*.lastRow < topRow { firstRow = topRow }
+    if lastRow > firstRow {
+        const width = @intCast(usize, a.*.io.width)
+        const out = a.*.output + width * @intCast(usize, firstRow)
+        const input = dec.*.pixels + @intCast(usize, dec.*.width * firstRow)
+        colorIndexInverse(&dec.*.transforms[0], firstRow, lastRow, input, out, true)
+        alphaApplyFilter(a, firstRow, lastRow, out, width)
+    }
+    dec.*.lastRow = lastRow
+    dec.*.lastOutRow = lastRow
+}
+
+fn processDecodedRows(dec: *Decoder, kind: u8, row: i64) -> void {
+    if kind == PROCESS_ROWS {
+        processRows(dec, row)
+    } else if kind == PROCESS_ALPHA {
+        extractAlphaRows(dec, row)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoding the data
+
+fn saveState(dec: *Decoder, lastPixel: i64) -> void {
+    dec.*.savedBr = dec.*.br
+    dec.*.savedLastPixel = lastPixel
+    if dec.*.hdr.colorCacheSize > 0 { colorCacheCopy(&dec.*.hdr.colorCache, &dec.*.hdr.savedColorCache) }
+}
+
+fn restoreState(dec: *Decoder) -> void {
+    dec.*.status = io.SUSPENDED
+    dec.*.br = dec.*.savedBr
+    dec.*.lastPixel = dec.*.savedLastPixel
+    if dec.*.hdr.colorCacheSize > 0 { colorCacheCopy(&dec.*.hdr.savedColorCache, &dec.*.hdr.colorCache) }
+}
+
+// DecodeImageData: pixels into DATA (WIDTH x HEIGHT) up to row LAST_ROW,
+// from where the last call stopped, PROCESS done every 16 rows.
+fn decodeImageData(dec: *Decoder, data: usize, width: i64, height: i64, lastRow: i64, process: u8) -> bool {
+    var row = dec.*.lastPixel / width
+    var col = dec.*.lastPixel % width
+    const br = &dec.*.br
+    const hdr = &dec.*.hdr
+    var src = dec.*.lastPixel
+    var lastCached = src
+    const srcEnd = width * height
+    const srcLast = width * lastRow
+    const lenCodeLimit = NUM_LITERAL_CODES + NUM_LENGTH_CODES
+    const colorCacheLimit = lenCodeLimit + @intCast(u64, hdr.*.colorCacheSize)
+    var nextSyncRow: i64 = 16777216
+    if dec.*.incremental { nextSyncRow = row }
+    const useCache = hdr.*.colorCacheSize > 0
+    const cache = &hdr.*.colorCache
+    const mask = hdr.*.huffmanMask
+    var group = groupAt(hdr.*.htreeGroups)
+    if src < srcLast { group = groupForPos(hdr, col, row) }
+    var failed = false
+    while src < srcLast {
+        if row >= nextSyncRow {
+            saveState(dec, src)
+            nextSyncRow = row + SYNC_EVERY_N_ROWS
+        }
+        if (col & mask) == 0 { group = groupForPos(hdr, col, row) }
+        var code: u64 = 0
+        var advance = false
+        if group.*.isTrivialCode {
+            put32(data + 4 * @intCast(usize, src), group.*.literalArb)
+            advance = true
+        } else {
+            fillBitWindow(br)
+            var decoded = false
+            if group.*.usePackedTable {
+                code = readPackedSymbols(group, br, data + 4 * @intCast(usize, src))
+                if isEndOfStream(br) { break }
+                if code == 0 {
+                    advance = true
+                    decoded = true
+                }
+            } else {
+                code = readSymbol(group.*.htrees[GREEN], br)
+            }
+            if !decoded {
+                if isEndOfStream(br) { break }
+                if code < NUM_LITERAL_CODES {
+                    if group.*.isTrivialLiteral {
+                        put32(data + 4 * @intCast(usize, src), group.*.literalArb | (code << 8))
+                    } else {
+                        const red = readSymbol(group.*.htrees[RED], br)
+                        fillBitWindow(br)
+                        const blue = readSymbol(group.*.htrees[BLUE], br)
+                        const alphaValue = readSymbol(group.*.htrees[ALPHA], br)
+                        if isEndOfStream(br) { break }
+                        put32(data + 4 * @intCast(usize, src), (alphaValue << 24) | (red << 16) | (code << 8) | blue)
+                    }
+                    advance = true
+                } else if code < lenCodeLimit {
+                    const length = getCopyDistance(code - NUM_LITERAL_CODES, br)
+                    const distSymbol = readSymbol(group.*.htrees[DIST], br)
+                    fillBitWindow(br)
+                    const distCode = getCopyDistance(distSymbol, br)
+                    const dist = planeCodeToDistance(width, distCode)
+                    if isEndOfStream(br) { break }
+                    if src < dist || srcEnd - src < length {
+                        failed = true
+                        break
+                    }
+                    var k: i64 = 0
+                    while k < length {
+                        put32(data + 4 * @intCast(usize, src + k), get32(data + 4 * @intCast(usize, src + k - dist)))
+                        k += 1
+                    }
+                    src += length
+                    col += length
+                    while col >= width {
+                        col -= width
+                        row += 1
+                        if process != PROCESS_NONE && row <= lastRow && (row % NUM_ARGB_CACHE_ROWS) == 0 {
+                            processDecodedRows(dec, process, row)
+                        }
+                    }
+                    if (col & mask) != 0 { group = groupForPos(hdr, col, row) }
+                    if useCache {
+                        while lastCached < src {
+                            colorCacheInsert(cache, get32(data + 4 * @intCast(usize, lastCached)))
+                            lastCached += 1
+                        }
+                    }
+                } else if code < colorCacheLimit {
+                    const key = code - lenCodeLimit
+                    while lastCached < src {
+                        colorCacheInsert(cache, get32(data + 4 * @intCast(usize, lastCached)))
+                        lastCached += 1
+                    }
+                    put32(data + 4 * @intCast(usize, src), get32(cache.*.colors + 4 * @intCast(usize, key)))
+                    advance = true
+                } else {
+                    failed = true
+                    break
+                }
+            }
+        }
+        if advance {
+            src += 1
+            col += 1
+            if col >= width {
+                col = 0
+                row += 1
+                if process != PROCESS_NONE && row <= lastRow && (row % NUM_ARGB_CACHE_ROWS) == 0 {
+                    processDecodedRows(dec, process, row)
+                }
+                if useCache {
+                    while lastCached < src {
+                        colorCacheInsert(cache, get32(data + 4 * @intCast(usize, lastCached)))
+                        lastCached += 1
+                    }
+                }
+            }
+        }
+    }
+    if !failed {
+        br.*.eos = isEndOfStream(br)
+        if dec.*.incremental && br.*.eos && src < srcEnd {
+            restoreState(dec)
+            return true
+        }
+        if !br.*.eos {
+            var upTo = row
+            if upTo > lastRow { upTo = lastRow }
+            processDecodedRows(dec, process, upTo)
+            dec.*.status = io.OK
+            dec.*.lastPixel = src
+            return true
+        }
+    }
+    dec.*.status = io.BITSTREAM_ERROR
+    return false
+}
+
+// DecodeAlphaData: the 8-bit decoding of a paletted alpha plane (only
+// green codes, the palette indices kept as bytes).
+fn decodeAlphaData(dec: *Decoder, data: usize, width: i64, height: i64, lastRow: i64) -> bool {
+    var ok = true
+    var row = dec.*.lastPixel / width
+    var col = dec.*.lastPixel % width
+    const br = &dec.*.br
+    const hdr = &dec.*.hdr
+    var pos = dec.*.lastPixel
+    const end = width * height
+    const last = width * lastRow
+    const lenCodeLimit = NUM_LITERAL_CODES + NUM_LENGTH_CODES
+    const mask = hdr.*.huffmanMask
+    var group = groupAt(hdr.*.htreeGroups)
+    if pos < last { group = groupForPos(hdr, col, row) }
+    var finished = true
+    while !br.*.eos && pos < last {
+        if (col & mask) == 0 { group = groupForPos(hdr, col, row) }
+        fillBitWindow(br)
+        const code = readSymbol(group.*.htrees[GREEN], br)
+        if code < NUM_LITERAL_CODES {
+            put8(data + @intCast(usize, pos), code)
+            pos += 1
+            col += 1
+            if col >= width {
+                col = 0
+                row += 1
+                if row <= lastRow && (row % NUM_ARGB_CACHE_ROWS) == 0 { extractPalettedAlphaRows(dec, row) }
+            }
+        } else if code < lenCodeLimit {
+            const length = getCopyDistance(code - NUM_LITERAL_CODES, br)
+            const distSymbol = readSymbol(group.*.htrees[DIST], br)
+            fillBitWindow(br)
+            const distCode = getCopyDistance(distSymbol, br)
+            const dist = planeCodeToDistance(width, distCode)
+            if pos >= dist && end - pos >= length {
+                var k: i64 = 0
+                while k < length {
+                    put8(data + @intCast(usize, pos + k), get8(data + @intCast(usize, pos + k - dist)))
+                    k += 1
+                }
+            } else {
+                ok = false
+                finished = false
+                break
+            }
+            pos += length
+            col += length
+            while col >= width {
+                col -= width
+                row += 1
+                if row <= lastRow && (row % NUM_ARGB_CACHE_ROWS) == 0 { extractPalettedAlphaRows(dec, row) }
+            }
+            if pos < last && (col & mask) != 0 { group = groupForPos(hdr, col, row) }
+        } else {
+            ok = false
+            finished = false
+            break
+        }
+        br.*.eos = isEndOfStream(br)
+    }
+    if finished {
+        var upTo = row
+        if upTo > lastRow { upTo = lastRow }
+        extractPalettedAlphaRows(dec, upTo)
+    }
+    br.*.eos = isEndOfStream(br)
+    if !ok || (br.*.eos && pos < end) {
+        if br.*.eos { dec.*.status = io.SUSPENDED } else { dec.*.status = io.BITSTREAM_ERROR }
+        return false
+    }
+    dec.*.lastPixel = pos
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Headers and streams
+
+fn clearTransform(dec: *Decoder, t: *Transform) -> void {
+    io.release(dec.*.allocator, t.*.data, t.*.dataSize)
+    t.*.data = 0
+    t.*.dataSize = 0
+}
+
+// ExpandColorMap: the palette's deltas summed, padded with zeros to the
+// size its indices can reach.
+fn expandColorMap(dec: *Decoder, numColors: usize, t: *Transform) -> bool {
+    const finalNumColors = @intCast(usize, 1) << (@intCast(u64, 8) >> t.*.bits)
+    const newMap = io.allocate(dec.*.allocator, 4 * finalNumColors)
+    if newMap == 0 { return false }
+    const data = t.*.data
+    put32(newMap, get32(data))
+    var i: usize = 4
+    while i < 4 * numColors {
+        put8(newMap + i, (get8(data + i) + get8(newMap + i - 4)) & 0xff)
+        i += 1
+    }
+    while i < 4 * finalNumColors {
+        put8(newMap + i, 0)
+        i += 1
+    }
+    io.release(dec.*.allocator, t.*.data, t.*.dataSize)
+    t.*.data = newMap
+    t.*.dataSize = 4 * finalNumColors
+    return true
+}
+
+fn readTransform(xsize: *i64, ysize: i64, dec: *Decoder) -> bool {
+    var ok = true
+    const br = &dec.*.br
+    const t = &dec.*.transforms[dec.*.nextTransform]
+    const kind = readBits(br, 2)
+    if (dec.*.transformsSeen & (@intCast(u64, 1) << kind)) != 0 { return false }
+    dec.*.transformsSeen = dec.*.transformsSeen | (@intCast(u64, 1) << kind)
+    t.*.kind = kind
+    t.*.xsize = xsize.*
+    t.*.ysize = ysize
+    t.*.data = 0
+    t.*.dataSize = 0
+    dec.*.nextTransform += 1
+    if kind == PREDICTOR_TRANSFORM || kind == CROSS_COLOR_TRANSFORM {
+        t.*.bits = readBits(br, 3) + 2
+        ok = decodeImageStream(subSampleSize(t.*.xsize, t.*.bits), subSampleSize(t.*.ysize, t.*.bits), false, dec, &t.*.data, &t.*.dataSize)
+    } else if kind == COLOR_INDEXING_TRANSFORM {
+        const numColors = readBits(br, 8) + 1
+        var bits: u64 = 3
+        if numColors > 16 {
+            bits = 0
+        } else if numColors > 4 {
+            bits = 1
+        } else if numColors > 2 {
+            bits = 2
+        }
+        xsize.* = subSampleSize(t.*.xsize, bits)
+        t.*.bits = bits
+        ok = decodeImageStream(@intCast(i64, numColors), 1, false, dec, &t.*.data, &t.*.dataSize)
+        ok = ok && expandColorMap(dec, @intCast(usize, numColors), t)
+    }
+    return ok
+}
+
+fn clearMetadata(dec: *Decoder) -> void {
+    const hdr = &dec.*.hdr
+    io.release(dec.*.allocator, hdr.*.huffmanImage, hdr.*.huffmanImageSize)
+    tablesDeallocate(dec.*.allocator, &hdr.*.huffmanTables)
+    io.release(dec.*.allocator, hdr.*.htreeGroups, hdr.*.numHtreeGroups * @sizeOf(HTreeGroup))
+    colorCacheClear(dec.*.allocator, &hdr.*.colorCache)
+    colorCacheClear(dec.*.allocator, &hdr.*.savedColorCache)
+    io.zero(@intFromPtr(hdr), @sizeOf(Metadata))
+}
+
+pub fn init(dec: *Decoder, allocator: Allocator) -> void {
+    io.zero(@intFromPtr(dec), @sizeOf(Decoder))
+    dec.*.allocator = allocator
+    dec.*.status = io.OK
+    dec.*.state = READ_DIM
+}
+
+// VP8LClear: everything given back.
+pub fn clear(dec: *Decoder) -> void {
+    clearMetadata(dec)
+    io.release(dec.*.allocator, dec.*.pixels, dec.*.pixelsSize)
+    dec.*.pixels = 0
+    dec.*.pixelsSize = 0
+    var i: usize = 0
+    while i < dec.*.nextTransform {
+        clearTransform(dec, &dec.*.transforms[i])
+        i += 1
+    }
+    dec.*.nextTransform = 0
+    dec.*.transformsSeen = 0
+    dec.*.output = 0
+}
+
+pub fn delete(dec: usize) -> void {
+    if dec == 0 { return }
+    const d = decoderAt(dec)
+    const allocator = d.*.allocator
+    clear(d)
+    io.release(allocator, dec, @sizeOf(Decoder))
+}
+
+pub fn create(allocator: Allocator) -> usize {
+    const dec = io.allocate(allocator, @sizeOf(Decoder))
+    if dec != 0 { init(decoderAt(dec), allocator) }
+    return dec
+}
+
+fn updateDecoder(dec: *Decoder, width: i64, height: i64) -> void {
+    const hdr = &dec.*.hdr
+    const numBits = hdr.*.huffmanSubsampleBits
+    dec.*.width = width
+    dec.*.height = height
+    hdr.*.huffmanXsize = subSampleSize(width, numBits)
+    if numBits == 0 {
+        hdr.*.huffmanMask = 0 - 1
+    } else {
+        hdr.*.huffmanMask = (@intCast(i64, 1) << numBits) - 1
+    }
+}
+
+// DecodeImageStream: an image of XSIZE x YSIZE: at level 0 (the picture)
+// its transforms, cache and codes only (the data is decoded later);
+// inside, its codes and data into DECODED.
+fn decodeImageStream(xsize: i64, ysize: i64, isLevel0: bool, dec: *Decoder, decoded: *usize, decodedSize: *usize) -> bool {
+    var ok = true
+    var transformXsize = xsize
+    const transformYsize = ysize
+    const br = &dec.*.br
+    const hdr = &dec.*.hdr
+    var data: usize = 0
+    var dataSize: usize = 0
+    var colorCacheBits: u64 = 0
+    while true {
+        if isLevel0 {
+            while ok && readBits(br, 1) != 0 { ok = readTransform(&transformXsize, transformYsize, dec) }
+        }
+        if ok && readBits(br, 1) != 0 {
+            colorCacheBits = readBits(br, 4)
+            ok = colorCacheBits >= 1 && colorCacheBits <= MAX_CACHE_BITS
+            if !ok {
+                dec.*.status = io.BITSTREAM_ERROR
+                break
+            }
+        }
+        ok = ok && readHuffmanCodes(dec, transformXsize, transformYsize, colorCacheBits, isLevel0)
+        if !ok {
+            dec.*.status = io.BITSTREAM_ERROR
+            break
+        }
+        if colorCacheBits > 0 {
+            hdr.*.colorCacheSize = @intCast(i64, 1) << colorCacheBits
+            if !colorCacheInit(dec.*.allocator, &hdr.*.colorCache, colorCacheBits) {
+                dec.*.status = io.OUT_OF_MEMORY
+                ok = false
+                break
+            }
+        } else {
+            hdr.*.colorCacheSize = 0
+        }
+        updateDecoder(dec, transformXsize, transformYsize)
+        if isLevel0 {
+            dec.*.state = READ_HDR
+            break
+        }
+        dataSize = 4 * @intCast(usize, transformXsize * transformYsize)
+        data = io.allocate(dec.*.allocator, dataSize)
+        if data == 0 {
+            dec.*.status = io.OUT_OF_MEMORY
+            ok = false
+            break
+        }
+        ok = decodeImageData(dec, data, transformXsize, transformYsize, transformYsize, PROCESS_NONE)
+        ok = ok && !br.*.eos
+        break
+    }
+    if !ok {
+        io.release(dec.*.allocator, data, dataSize)
+        clearMetadata(dec)
+    } else {
+        if !isLevel0 {
+            decoded.* = data
+            decodedSize.* = dataSize
+        }
+        dec.*.lastPixel = 0
+        if !isLevel0 { clearMetadata(dec) }
+    }
+    return ok
+}
+
+fn allocateInternalBuffers32b(dec: *Decoder, finalWidth: i64) -> bool {
+    const numPixels = @intCast(usize, dec.*.width * dec.*.height)
+    const cacheTopPixels = @intCast(usize, finalWidth & 0xffff)
+    const cachePixels = @intCast(usize, finalWidth) * 16
+    const total = numPixels + cacheTopPixels + cachePixels
+    dec.*.pixels = io.allocate(dec.*.allocator, 4 * total)
+    if dec.*.pixels == 0 {
+        dec.*.argbCache = 0
+        dec.*.status = io.OUT_OF_MEMORY
+        return false
+    }
+    dec.*.pixelsSize = 4 * total
+    dec.*.argbCache = dec.*.pixels + 4 * (numPixels + cacheTopPixels)
+    return true
+}
+
+fn allocateInternalBuffers8b(dec: *Decoder) -> bool {
+    const total = @intCast(usize, dec.*.width * dec.*.height)
+    dec.*.argbCache = 0
+    dec.*.pixels = io.allocate(dec.*.allocator, total)
+    if dec.*.pixels == 0 {
+        dec.*.status = io.OUT_OF_MEMORY
+        return false
+    }
+    dec.*.pixelsSize = total
+    return true
+}
+
+pub fn checkSignature(data: usize, size: usize) -> bool {
+    return size >= VP8L_FRAME_HEADER_SIZE && get8(data) == VP8L_MAGIC_BYTE && (get8(data + 4) >> 5) == 0
+}
+
+fn readImageInfo(br: *BitReader, width: *i64, height: *i64, hasAlpha: *bool) -> bool {
+    if readBits(br, 8) != VP8L_MAGIC_BYTE { return false }
+    width.* = @intCast(i64, readBits(br, 14)) + 1
+    height.* = @intCast(i64, readBits(br, 14)) + 1
+    hasAlpha.* = readBits(br, 1) != 0
+    if readBits(br, 3) != 0 { return false }
+    return !br.*.eos
+}
+
+// VP8LGetInfo.
+pub fn getInfo(data: usize, size: usize, width: *i64, height: *i64, hasAlpha: *bool) -> bool {
+    if data == 0 || size < VP8L_FRAME_HEADER_SIZE { return false }
+    if !checkSignature(data, size) { return false }
+    var br: BitReader = undefined
+    initBitReader(&br, data, size)
+    return readImageInfo(&br, width, height, hasAlpha)
+}
+
+// VP8LDecodeHeader: the size, transforms and codes, from io.data.
+pub fn decodeHeader(dec: *Decoder, i: *Io) -> bool {
+    var width: i64 = 0
+    var height: i64 = 0
+    var hasAlpha = false
+    dec.*.io = @intFromPtr(i)
+    dec.*.status = io.OK
+    initBitReader(&dec.*.br, i.*.data, i.*.dataSize)
+    if !readImageInfo(&dec.*.br, &width, &height, &hasAlpha) {
+        dec.*.status = io.BITSTREAM_ERROR
+        clear(dec)
+        return false
+    }
+    dec.*.state = READ_DIM
+    i.*.width = width
+    i.*.height = height
+    var none: usize = 0
+    var noneSize: usize = 0
+    if !decodeImageStream(width, height, true, dec, &none, &noneSize) {
+        clear(dec)
+        return false
+    }
+    return true
+}
+
+// VP8LDecodeImage: the pixels (from where the last call stopped, for the
+// incremental decoder) into the output.
+pub fn decodeImage(dec: *Decoder) -> bool {
+    const i = ioAt(dec.*.io)
+    const p = io.paramsAt(i.*.params)
+    var ok = true
+    if dec.*.state != READ_DATA {
+        dec.*.output = p.*.output
+        if !io.ioInitFromOptions(p.*.options, i, io.MODE_BGRA) {
+            dec.*.status = io.INVALID_PARAM
+            ok = false
+        }
+        if ok { ok = allocateInternalBuffers32b(dec, i.*.width) }
+        if ok && dec.*.incremental {
+            if dec.*.hdr.colorCacheSize > 0 && dec.*.hdr.savedColorCache.colors == 0 {
+                if !colorCacheInit(dec.*.allocator, &dec.*.hdr.savedColorCache, dec.*.hdr.colorCache.hashBits) {
+                    dec.*.status = io.OUT_OF_MEMORY
+                    ok = false
+                }
+            }
+        }
+        if ok { dec.*.state = READ_DATA }
+    }
+    if ok { ok = decodeImageData(dec, dec.*.pixels, dec.*.width, dec.*.height, i.*.cropBottom, PROCESS_ROWS) }
+    if !ok {
+        clear(dec)
+        return false
+    }
+    p.*.lastY = dec.*.lastOutRow
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Alpha planes
+
+fn is8bOptimizable(hdr: *Metadata) -> bool {
+    if hdr.*.colorCacheSize > 0 { return false }
+    var i: usize = 0
+    while i < hdr.*.numHtreeGroups {
+        const group = groupAt(hdr.*.htreeGroups + i * @sizeOf(HTreeGroup))
+        if get8(group.*.htrees[RED]) > 0 { return false }
+        if get8(group.*.htrees[BLUE]) > 0 { return false }
+        if get8(group.*.htrees[ALPHA]) > 0 { return false }
+        i += 1
+    }
+    return true
+}
+
+// VP8LDecodeAlphaHeader: the lossless stream of an alpha plane at DATA.
+pub fn decodeAlphaHeader(a: *AlphaDecoder, data: usize, size: usize) -> bool {
+    const decAddress = create(a.*.allocator)
+    if decAddress == 0 { return false }
+    const dec = decoderAt(decAddress)
+    dec.*.width = a.*.width
+    dec.*.height = a.*.height
+    dec.*.io = @intFromPtr(&a.*.io)
+    dec.*.alphDec = @intFromPtr(a)
+    a.*.io.width = a.*.width
+    a.*.io.height = a.*.height
+    dec.*.status = io.OK
+    initBitReader(&dec.*.br, data, size)
+    var none: usize = 0
+    var noneSize: usize = 0
+    var ok = decodeImageStream(a.*.width, a.*.height, true, dec, &none, &noneSize)
+    if ok {
+        if dec.*.nextTransform == 1 && dec.*.transforms[0].kind == COLOR_INDEXING_TRANSFORM && is8bOptimizable(&dec.*.hdr) {
+            a.*.use8bDecode = true
+            ok = allocateInternalBuffers8b(dec)
+        } else {
+            a.*.use8bDecode = false
+            ok = allocateInternalBuffers32b(dec, a.*.width)
+        }
+    }
+    if !ok {
+        delete(decAddress)
+        return false
+    }
+    a.*.vp8lDec = decAddress
+    return true
+}
+
+// VP8LDecodeAlphaImageStream: the plane's rows up to LAST_ROW.
+pub fn decodeAlphaImageStream(a: *AlphaDecoder, lastRow: i64) -> bool {
+    const dec = decoderAt(a.*.vp8lDec)
+    if dec.*.lastRow >= lastRow { return true }
+    if a.*.use8bDecode { return decodeAlphaData(dec, dec.*.pixels, dec.*.width, dec.*.height, lastRow) }
+    return decodeImageData(dec, dec.*.pixels, dec.*.width, dec.*.height, lastRow, PROCESS_ALPHA)
+}
