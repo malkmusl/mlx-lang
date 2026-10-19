@@ -197,6 +197,8 @@ fn resolveColumn(st: *core.Statement, scope: usize, e: *ast.Expr) -> i32 {
         if matches >= 1 {
             e.*.source = @intCast(i64, core.sourceState(foundSource).*.number)
             e.*.column = found
+            const rc = authorizeRead(st, core.sourceState(foundSource), e)
+            if rc != core.OK { return rc }
             // Found in an outer query: the queries in between read an
             // outer row, and run again for each.
             var inner = scope
@@ -251,6 +253,87 @@ fn resolveColumn(st: *core.Statement, scope: usize, e: *ast.Expr) -> i32 {
 
 fn lexerStart(st: *core.Statement, e: *ast.Expr) -> usize { return st.*.text + e.*.start }
 
+// The authorizer asked about reading a table's column (SQLITE_READ, with
+// the column's name, ROWID for the rowid): IGNORE reads it as NULL. A
+// reference the statement makes itself (`distinct` on a column) is not
+// asked about.
+fn authorizeRead(st: *core.Statement, s: *core.SourceState, e: *ast.Expr) -> i32 {
+    if databaseOf(st).*.authorizer == 0 || s.*.kind != core.SOURCE_TABLE || e.*.distinct { return core.OK }
+    if st.*.holdReads {
+        _ = mem.push(&st.*.heldReads, @intCast(u64, @intFromPtr(e)))
+        return core.OK
+    }
+    const t = schema.table(s.*.table)
+    var column = mem.view(@intFromPtr("ROWID".pointer), 5)
+    if e.*.column >= 0 {
+        column = schema.columnName(schema.column(t, @intCast(usize, e.*.column)))
+    } else if t.*.rowidColumn >= 0 {
+        column = schema.columnName(schema.column(t, @intCast(usize, t.*.rowidColumn)))
+    }
+    const answer = eval.authorize(st, core.AUTH_READ, schema.tableName(t), column)
+    if answer == core.AUTH_DENY {
+        return core.setError3(databaseOf(st), core.AUTH, "access to ", schema.tableName(t), core3(".", column, " is prohibited"))
+    }
+    if answer == core.AUTH_IGNORE {
+        e.*.op = ast.E_NULL
+        e.*.source = -1
+    }
+    return core.OK
+}
+
+// The READs held back while `holdReads` was on, asked about now.
+pub fn authorizeHeldReads(st: *core.Statement) -> i32 {
+    st.*.holdReads = false
+    var i: usize = 0
+    var rc = core.OK
+    while i < st.*.heldReads.length && rc == core.OK {
+        const e = ast.expr(@intCast(usize, mem.at(&st.*.heldReads, i)))
+        if e.*.op == ast.E_COLUMN && e.*.source >= 0 {
+            rc = authorizeRead(st, core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, e.*.source)))), e)
+        }
+        i += 1
+    }
+    st.*.heldReads.length = 0
+    return rc
+}
+
+var joined: mem.Buffer = undefined
+var joinedReady: bool = false
+
+fn core3(a: []const u8, b: []const u8, c: []const u8) -> []const u8 {
+    if !joinedReady {
+        mem.initBuffer(&joined)
+        joinedReady = true
+    }
+    joined.length = 0
+    _ = mem.appendText(&joined, a)
+    _ = mem.appendText(&joined, b)
+    _ = mem.appendText(&joined, c)
+    return mem.bufferText(&joined)
+}
+
+// The authorizer asked about calling a function (SQLITE_FUNCTION).
+fn authorizeFunction(st: *core.Statement, name: []const u8) -> i32 {
+    if databaseOf(st).*.authorizer == 0 { return core.OK }
+    // Built-in names are asked in lower case, as SQLite registers them.
+    var lower: mem.Buffer = undefined
+    mem.initBuffer(&lower)
+    var i: usize = 0
+    while i < name.length {
+        _ = mem.appendByte(&lower, mem.lower(@intCast(u64, name[i])))
+        i += 1
+    }
+    const f = functions.find(databaseOf(st), name, -2)
+    _ = f
+    const answer = eval.authorize(st, core.AUTH_FUNCTION, mem.view(0, 0), mem.bufferText(&lower))
+    var rc = core.OK
+    if answer != core.OK {
+        rc = core.setError2(databaseOf(st), core.AUTH, "not authorized to use function: ", mem.bufferText(&lower))
+    }
+    mem.freeBuffer(&lower)
+    return rc
+}
+
 // Makes `target` the expression `source` is (an alias's), sharing its
 // children.
 fn copyExpr(target: *ast.Expr, source: *ast.Expr) -> void {
@@ -282,7 +365,12 @@ pub fn resolve(st: *core.Statement, scope: usize, address: usize) -> i32 {
     if e.*.op == ast.E_FUNCTION {
         const name = mem.view(e.*.name, e.*.nameLength)
         const arguments = ast.count(e.*.list)
-        if isAggregateName(name, arguments, e.*.star) && functions.findUser(databaseOf(st), name, @intCast(i32, arguments)) == 0 {
+        rc = authorizeFunction(st, name)
+        if rc != core.OK { return rc }
+        // An application's function with a step is an aggregate too.
+        const user = functions.findUser(databaseOf(st), name, @intCast(i32, arguments))
+        const userAggregate = user != 0 && core.functionOf(user).*.step != 0
+        if (isAggregateName(name, arguments, e.*.star) && user == 0) || userAggregate {
             const sc = scopeOf(scope)
             if !sc.*.allowAggregates || sc.*.inAggregate {
                 return core.setError3(databaseOf(st), core.ERROR, "misuse of aggregate function ", name, "()")
@@ -301,7 +389,9 @@ pub fn resolve(st: *core.Statement, scope: usize, address: usize) -> i32 {
             if rc != core.OK { return rc }
             _ = mem.push(&q.*.aggregates, @intCast(u64, address))
             e.*.aggregate = q.*.aggregates.length
-            e.*.function = functions.aggregateKind(name)
+            e.*.function = if userAggregate { functions.A_USER } else { functions.aggregateKind(name) }
+            // (An application's aggregate: its Function.)
+            if userAggregate { e.*.i = @intCast(i64, user) }
             e.*.slot = sc.*.query
             return core.OK
         }
@@ -591,8 +681,6 @@ fn addSources(st: *core.Statement, q: usize, sel: *ast.Select, scope: usize) -> 
                     return fail2(st, "no such index: ", mem.view(x.*.indexedBy, x.*.indexedByLength))
                 }
             }
-            const auth = eval.authorize(st, core.AUTH_SELECT, mem.view(0, 0), mem.view(0, 0))
-            _ = auth
         }
         _ = mem.push(&queryOf(q).*.levels, @intCast(u64, @intFromPtr(s)))
         i += 1
@@ -697,6 +785,23 @@ fn addResults(st: *core.Statement, q: usize, sel: *ast.Select, scope: usize) -> 
     return core.OK
 }
 
+// SELECT count(*) FROM t alone: SQLite counts the table's entries and asks
+// the authorizer about reading the table (with no column and no
+// database).
+fn authorizeSimpleCount(st: *core.Statement, q: *Query, sel: *ast.Select) -> i32 {
+    if databaseOf(st).*.authorizer == 0 || sel.*.where != 0 || sel.*.groupBy != 0 || q.*.prior != 0 || q.*.levels.length != 1 || q.*.results.length != 1 { return core.OK }
+    const s = core.sourceState(@intCast(usize, mem.at(&q.*.levels, 0)))
+    if s.*.kind != core.SOURCE_TABLE { return core.OK }
+    const e = ast.expr(@intCast(usize, mem.at(&q.*.results, 0)))
+    if e.*.op != ast.E_FUNCTION || !e.*.star || e.*.distinct || !mem.sameNoCase(mem.view(e.*.name, e.*.nameLength), "count") { return core.OK }
+    const t = schema.table(s.*.table)
+    const name = mem.dup(t.*.name, t.*.nameLength)
+    const answer = eval.authorizeText(st, core.AUTH_READ, name, @intFromPtr("".pointer), false)
+    mem.free(name)
+    if answer == core.AUTH_DENY { return core.setError(databaseOf(st), core.AUTH, "not authorized") }
+    return core.OK
+}
+
 // A scope whose one source is a row of table `t` (its values set into the
 // source's `row` before an expression is evaluated): for CHECK
 // constraints. The source is the scope's query's first level.
@@ -755,6 +860,14 @@ pub fn compile(st: *core.Statement, select: usize, outerScope: usize) -> usize {
     if sel.*.prior != 0 {
         prior = compile(st, sel.*.prior, outerScope)
         if prior == 0 { return 0 }
+    }
+    // The authorizer is asked about every SELECT (but the scans an UPDATE
+    // or DELETE makes of its table, and VALUES rows).
+    if st.*.quietSelect {
+        st.*.quietSelect = false
+    } else if !sel.*.values && eval.authorize(st, core.AUTH_SELECT, mem.view(0, 0), mem.view(0, 0)) == core.AUTH_DENY {
+        _ = core.setError(databaseOf(st), core.AUTH, "not authorized")
+        return 0
     }
     const q = newQuery(st, select, outerScope)
     const query = queryOf(q)
@@ -895,6 +1008,8 @@ pub fn compile(st: *core.Statement, select: usize, outerScope: usize) -> usize {
             i += 1
         }
     }
+    rc = authorizeSimpleCount(st, query, sel)
+    if rc != core.OK { return 0 }
     // The WHERE's terms to their levels, then the access paths.
     rc = placeTerms(st, q, sel.*.where)
     if rc != core.OK { return 0 }
