@@ -62,7 +62,7 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 | libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | std.xml: a pull tokenizer, a base | 2: mlx-libxml2: the SAX2 push parser WebCore drives (xmlCreatePushParserCtxt, xmlParseChunk, the callbacks), entities, encodings through ICU (its headers' `<iconv.h>` is mlxlibc's now) |
 | libxslt, libexslt | XSLT processing (XSLTProcessor, `<?xml-stylesheet?>`) | 26 / 0 | 5 | none | 3: `ENABLE_XSLT=OFF` |
 | SQLite | storage: IndexedDB's SQLite back end, local storage, the icon and resource load statistics databases | 55 / 19 (60) | 13 | none | 2: the largest of the "small" libraries; a SQL engine of the subset WebKit's statements use, or the stores on another back end |
-| libpng | PNG decoding (ImageDecoder) and Skia's PNG codec | 36 / 0 (/ 47) | 3 | std.png: a decoder and an encoder | 2: mlx-libpng over std.png |
+| libpng | PNG decoding (ImageDecoder) and Skia's PNG codec | 36 / 0 (/ 47) | 3 | mlx-libpng (compiler/capi/png, std.png): all declared; the progressive reader, transformations, gamma and writer give libpng's bytes (tools/check_png.sh); Skia's SkPngCodec and SkPngEncoderImpl compile | done |
 | libjpeg | JPEG decoding (ImageDecoder), Skia's JPEG codec and encoder | 15 / 0 (/ 25) | 2 | std.jpeg: an encoder only | 2: a baseline and progressive decoder in std.jpeg, then mlx-libjpeg |
 | libwebp (+demux, mux) | WebP decoding (ImageDecoder), Skia's codec | 7 / 0 (/ 12) | 2 | none | 3: VP8 and VP8L decoding in std, then the C API |
 | Little CMS 2 | colour management of images (ICC profiles) | 7 / 0 | 4 | none | 3: `USE_LCMS=OFF` |
