@@ -1,0 +1,614 @@
+// The input streams a response's body is read through, each a pollable
+// GInputStream as libsoup's are, so that GIO's asynchronous reads wait on
+// the connection rather than in a thread:
+//
+//   SoupBodyInputStream      the body's bytes off the connection, framed
+//                            by Content-Length, chunked coding (RFC 9112
+//                            7.1, std.http.chunked) or the connection's
+//                            end; each read told to the message as
+//                            "got-body-data"
+//   SoupConverterInputStream a Content-Encoding undone (gzip, deflate) by
+//                            std.flate; data that does not decode from its
+//                            start is passed on as it is, as libsoup's
+//                            converter wrapper does
+//   SoupContentSnifferStream the first 512 bytes held for the content
+//                            sniffer, then given back
+//   SoupClientInputStream    what soup_session_send gives: its end and its
+//                            closing finish the message's I/O (io.mlx)
+//
+// A stream: a GInputStream (32) and a record (32):
+//   0 the kind                 8 the stream read from (wrappers)
+//  16 the connection (body)   24 the message
+//  32 the encoding, 36 the chunked coding's state
+//  40 the bytes left (Content-Length, or of the chunk)
+//  48 at the end, 52 passing data through undecoded
+//  56 the inflater, 64 its input buffer, 72 its start, 80 its end
+//  88 the inflater's format, 92 whether it produced any output
+//  96 the input before the first output (a copy), 104 its length
+// 112 the sniffer's buffer, 120 its length, 128 where reading is in it
+// 136 whether the stream ended while sniffing
+// 144 the I/O record (client), 152 the metrics
+// 160 the end's callback, 168 the close's callback (client)
+const m = @import("../glib/memory.mlx")
+const g = @import("./g.mlx")
+const c = @import("./common.mlx")
+const conn = @import("./conn.mlx")
+const message = @import("./message.mlx")
+const metrics = @import("./metrics.mlx")
+const inflate = @import("./inflate.mlx")
+const chunked = @import("std.http.chunked")
+
+extern("c") fn g_type_check_instance_is_a(instance: usize, t: usize) -> i32
+extern("c") fn g_pollable_input_stream_get_type() -> usize
+extern("c") fn g_pollable_source_new_full(stream: usize, child: usize, cancellable: usize) -> usize
+
+pub const KIND_BODY: i32 = 0
+pub const KIND_CONVERTER: i32 = 1
+pub const KIND_SNIFFER: i32 = 2
+pub const KIND_CLIENT: i32 = 3
+
+const R_KIND: usize = 0
+const R_BASE: usize = 8
+const R_CONN: usize = 16
+const R_MSG: usize = 24
+const R_ENCODING: usize = 32
+const R_CHUNK_STATE: usize = 36
+const R_REMAINING: usize = 40
+const R_EOF: usize = 48
+const R_PASSTHROUGH: usize = 52
+const R_INFLATER: usize = 56
+const R_IN: usize = 64
+const R_IN_START: usize = 72
+const R_IN_END: usize = 80
+const R_FORMAT: usize = 88
+const R_PRODUCED: usize = 92
+const R_FIRST: usize = 96
+const R_FIRST_LENGTH: usize = 104
+const R_SNIFF: usize = 112
+const R_SNIFF_LENGTH: usize = 120
+const R_SNIFF_POS: usize = 128
+const R_SNIFF_EOF: usize = 136
+const R_IO: usize = 144
+const R_METRICS: usize = 152
+const R_EOF_FN: usize = 160
+const R_CLOSE_FN: usize = 168
+const R_SIZE: usize = 176
+
+// SoupEncoding.
+const ENCODING_NONE: i32 = 1
+const ENCODING_CONTENT_LENGTH: i32 = 2
+const ENCODING_EOF: i32 = 3
+const ENCODING_CHUNKED: i32 = 4
+
+// The chunked coding's states.
+const CHUNK_SIZE: i32 = 0
+const CHUNK_DATA: i32 = 1
+const CHUNK_END: i32 = 2
+const CHUNK_TRAILERS: i32 = 3
+const CHUNK_DONE: i32 = 4
+
+pub const SNIFF_SIZE: usize = 512
+const IN_SIZE: usize = 16384
+
+pub const EofFn = fn(usize) -> void
+pub const CloseFn = fn(usize, i32, usize, usize) -> i32
+
+var typesOnce: usize = 0
+var bodyType: usize = 0
+var converterType: usize = 0
+var snifferType: usize = 0
+var clientType: usize = 0
+
+fn rec(stream: usize) -> usize { return m.getWord(stream + 32) }
+
+fn ensureTypes() -> void {
+    if c.onceEnter(&typesOnce) {
+        const parent = g.g_input_stream_get_type()
+        const init = @intFromPtr(__mlx_soup_stream_init)
+        bodyType = c.defineType(parent, "SoupBodyInputStream", 248, @intFromPtr(__mlx_soup_stream_class_init), 40, init, 0)
+        converterType = c.defineType(parent, "SoupConverterInputStream", 248, @intFromPtr(__mlx_soup_stream_class_init), 40, init, 0)
+        snifferType = c.defineType(parent, "SoupContentSnifferStream", 248, @intFromPtr(__mlx_soup_stream_class_init), 40, init, 0)
+        clientType = c.defineType(parent, "SoupClientInputStream", 248, @intFromPtr(__mlx_soup_stream_class_init), 40, init, 0)
+        const pollable = g_pollable_input_stream_get_type()
+        const iface = @intFromPtr(__mlx_soup_stream_pollable_init)
+        c.implement(bodyType, pollable, iface)
+        c.implement(converterType, pollable, iface)
+        c.implement(snifferType, pollable, iface)
+        c.implement(clientType, pollable, iface)
+        c.onceLeave(&typesOnce, 1)
+    }
+}
+
+export fn __mlx_soup_stream_init(stream: usize, class: usize) -> void { m.putWord(stream + 32, m.alloc(R_SIZE)) }
+
+export fn __mlx_soup_stream_finalize(stream: usize) -> void {
+    const r = rec(stream)
+    c.clearObject(r + R_BASE)
+    c.clearObject(r + R_MSG)
+    if m.getWord(r + R_CONN) != 0 { conn.unref(m.getWord(r + R_CONN)) }
+    inflate.dispose(m.getWord(r + R_INFLATER))
+    m.release(m.getWord(r + R_IN))
+    m.release(m.getWord(r + R_FIRST))
+    m.release(m.getWord(r + R_SNIFF))
+    m.release(r)
+    c.chainUp(g.g_type_class_ref(m.getWord(m.getWord(stream))), 48, stream)
+}
+
+// ---------------------------------------------------------------------------
+// Construction
+
+fn make(kind: i32) -> usize {
+    ensureTypes()
+    var t = clientType
+    if kind == KIND_BODY { t = bodyType }
+    if kind == KIND_CONVERTER { t = converterType }
+    if kind == KIND_SNIFFER { t = snifferType }
+    const stream = g.g_object_new(t, 0)
+    m.putI32(rec(stream) + R_KIND, kind)
+    return stream
+}
+
+// The body of `msg` off `connection`, framed by `encoding` (`length` the
+// Content-Length).
+pub fn newBody(connection: usize, msg: usize, encoding: i32, length: i64) -> usize {
+    const stream = make(KIND_BODY)
+    const r = rec(stream)
+    m.putWord(r + R_CONN, conn.ref(connection))
+    m.putWord(r + R_MSG, g.g_object_ref(msg))
+    m.putI32(r + R_ENCODING, encoding)
+    m.putI64(r + R_REMAINING, if encoding == ENCODING_CONTENT_LENGTH { length } else { -1 })
+    m.putWord(r + R_METRICS, message.metricsOf(msg))
+    return stream
+}
+
+// Undoes gzip (gzip true) or deflate over `base`.
+pub fn newConverter(base: usize, gzip: bool) -> usize {
+    const stream = make(KIND_CONVERTER)
+    const r = rec(stream)
+    m.putWord(r + R_BASE, g.g_object_ref(base))
+    m.putI32(r + R_FORMAT, if gzip { 2 } else { 1 })
+    m.putWord(r + R_INFLATER, inflate.new(if gzip { inflate.Format.gzip } else { inflate.Format.zlib }))
+    m.putWord(r + R_IN, m.raw(IN_SIZE))
+    return stream
+}
+
+pub fn newSniffer(base: usize) -> usize {
+    const stream = make(KIND_SNIFFER)
+    const r = rec(stream)
+    m.putWord(r + R_BASE, g.g_object_ref(base))
+    m.putWord(r + R_SNIFF, m.raw(SNIFF_SIZE))
+    return stream
+}
+
+pub fn isSniffer(stream: usize) -> bool {
+    ensureTypes()
+    return stream != 0 && g_type_check_instance_is_a(stream, snifferType) != 0
+}
+
+// What the session gives back: reads of `base`, whose end calls
+// `eofFn(io)` and whose closing calls `closeFn(io, blocking, cancellable,
+// err)`.
+pub fn newClient(base: usize, msg: usize, io: usize, eofFn: usize, closeFn: usize) -> usize {
+    const stream = make(KIND_CLIENT)
+    const r = rec(stream)
+    m.putWord(r + R_BASE, g.g_object_ref(base))
+    m.putWord(r + R_MSG, g.g_object_ref(msg))
+    m.putWord(r + R_IO, io)
+    m.putWord(r + R_METRICS, message.metricsOf(msg))
+    m.putWord(r + R_EOF_FN, eofFn)
+    m.putWord(r + R_CLOSE_FN, closeFn)
+    return stream
+}
+
+// The I/O is done with the stream (a finished or stolen message).
+pub fn detachClient(stream: usize) -> void { m.putWord(rec(stream) + R_IO, 0) }
+
+// ---------------------------------------------------------------------------
+// Reading
+
+fn wouldBlock(err: usize) -> i64 {
+    c.setError(err, g.g_io_error_quark(), conn.WOULD_BLOCK, "Operation would block")
+    return -1
+}
+
+fn partial(err: usize) -> i64 {
+    c.setError(err, g.g_io_error_quark(), conn.PARTIAL_INPUT, "Connection terminated unexpectedly")
+    return -1
+}
+
+// Reads from another stream, at once or without blocking.
+pub fn readStream(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    if blocking || g_type_check_instance_is_a(stream, g_pollable_input_stream_get_type()) == 0 || g.g_pollable_input_stream_can_poll(stream) == 0 {
+        return g.g_input_stream_read(stream, buffer, count, cancellable, err)
+    }
+    return g.g_pollable_input_stream_read_nonblocking(stream, buffer, count, cancellable, err)
+}
+
+fn streamReadable(stream: usize) -> bool {
+    if g_type_check_instance_is_a(stream, g_pollable_input_stream_get_type()) == 0 || g.g_pollable_input_stream_can_poll(stream) == 0 { return true }
+    return g.g_pollable_input_stream_is_readable(stream) != 0
+}
+
+fn streamSource(stream: usize, cancellable: usize) -> usize {
+    if g_type_check_instance_is_a(stream, g_pollable_input_stream_get_type()) == 0 || g.g_pollable_input_stream_can_poll(stream) == 0 { return g.g_timeout_source_new(0) }
+    return g.g_pollable_input_stream_create_source(stream, cancellable)
+}
+
+// A line of the chunked coding from the connection's buffer (its text
+// without the line end, the buffer advanced past it); false when the
+// buffer has no whole line, after reading more.
+fn chunkLine(r: usize, blocking: bool, cancellable: usize, err: usize, text: *[]const u8, failed: *bool) -> bool {
+    const cn = m.getWord(r + R_CONN)
+    while true {
+        const have = m.bytes(conn.bufferStart(cn), conn.buffered(cn))
+        const lf = chunked.lineEnd(have)
+        if lf < have.length {
+            text.* = chunked.lineText(have, lf)
+            return true
+        }
+        const n = conn.fill(cn, blocking, cancellable, err)
+        if n < 0 {
+            failed.* = true
+            return false
+        }
+        if n == 0 {
+            _ = partial(err)
+            failed.* = true
+            return false
+        }
+    }
+    return false
+}
+
+fn lineLength(r: usize, text: []const u8) -> usize {
+    const cn = m.getWord(r + R_CONN)
+    const have = m.bytes(conn.bufferStart(cn), conn.buffered(cn))
+    return chunked.lineEnd(have) + 1
+}
+
+fn readChunked(r: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const cn = m.getWord(r + R_CONN)
+    while true {
+        const state = m.getI32(r + R_CHUNK_STATE)
+        if state == CHUNK_DONE { return 0 }
+        if state == CHUNK_DATA {
+            const left = @intCast(usize, m.getI64(r + R_REMAINING))
+            const n = conn.read(cn, buffer, if left < count { left } else { count }, blocking, cancellable, err)
+            if n < 0 { return n }
+            if n == 0 { return partial(err) }
+            const remaining = m.getI64(r + R_REMAINING) - n
+            m.putI64(r + R_REMAINING, remaining)
+            if remaining == 0 { m.putI32(r + R_CHUNK_STATE, CHUNK_END) }
+            return n
+        }
+        var text: []const u8 = m.bytes(0, 0)
+        var failed = false
+        if !chunkLine(r, blocking, cancellable, err, &text, &failed) { return -1 }
+        const used = lineLength(r, text)
+        if state == CHUNK_SIZE {
+            const size = chunked.chunkSize(text)
+            conn.consume(cn, used)
+            if size > 0 {
+                m.putI64(r + R_REMAINING, size)
+                m.putI32(r + R_CHUNK_STATE, CHUNK_DATA)
+            } else {
+                m.putI32(r + R_CHUNK_STATE, CHUNK_TRAILERS)
+            }
+        } else if state == CHUNK_END {
+            conn.consume(cn, used)
+            m.putI32(r + R_CHUNK_STATE, CHUNK_SIZE)
+        } else {
+            // The trailer's lines, up to an empty one.
+            const empty = text.length == 0
+            conn.consume(cn, used)
+            if empty { m.putI32(r + R_CHUNK_STATE, CHUNK_DONE) }
+        }
+    }
+    return 0
+}
+
+fn readBody(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const r = rec(stream)
+    const cn = m.getWord(r + R_CONN)
+    const encoding = m.getI32(r + R_ENCODING)
+    var n: i64 = 0
+    if encoding == ENCODING_NONE || m.getI32(r + R_EOF) != 0 {
+        n = 0
+    } else if encoding == ENCODING_CONTENT_LENGTH {
+        const left = m.getI64(r + R_REMAINING)
+        if left <= 0 {
+            n = 0
+        } else {
+            const want = if @intCast(u64, left) < count { @intCast(usize, left) } else { count }
+            n = conn.read(cn, buffer, want, blocking, cancellable, err)
+            if n == 0 { return partial(err) }
+            if n > 0 { m.putI64(r + R_REMAINING, left - n) }
+        }
+    } else if encoding == ENCODING_CHUNKED {
+        n = readChunked(r, buffer, count, blocking, cancellable, err)
+    } else {
+        n = conn.read(cn, buffer, count, blocking, cancellable, err)
+    }
+    if n < 0 { return n }
+    if n == 0 {
+        m.putI32(r + R_EOF, 1)
+        return 0
+    }
+    metrics.add(m.getWord(r + R_METRICS), metrics.RESPONSE_BODY_BYTES_RECEIVED, @intCast(u64, n))
+    message.gotBodyData(m.getWord(r + R_MSG), @intCast(usize, n))
+    return n
+}
+
+fn bodyReadable(stream: usize) -> bool {
+    const r = rec(stream)
+    const encoding = m.getI32(r + R_ENCODING)
+    if encoding == ENCODING_NONE || m.getI32(r + R_EOF) != 0 { return true }
+    if encoding == ENCODING_CONTENT_LENGTH && m.getI64(r + R_REMAINING) <= 0 { return true }
+    if encoding == ENCODING_CHUNKED && m.getI32(r + R_CHUNK_STATE) == CHUNK_DONE { return true }
+    const cn = m.getWord(r + R_CONN)
+    if encoding == ENCODING_CHUNKED && m.getI32(r + R_CHUNK_STATE) != CHUNK_DATA && conn.buffered(cn) > 0 {
+        // A line must be whole to be read.
+        const have = m.bytes(conn.bufferStart(cn), conn.buffered(cn))
+        if chunked.lineEnd(have) < have.length { return true }
+        return conn.isReadable(cn) && false
+    }
+    return conn.isReadable(cn)
+}
+
+fn bodySource(stream: usize, cancellable: usize) -> usize {
+    const r = rec(stream)
+    if bodyReadable(stream) { return g.g_timeout_source_new(0) }
+    const cn = m.getWord(r + R_CONN)
+    const s = conn.istream(cn)
+    if s == 0 { return g.g_timeout_source_new(0) }
+    return streamSource(s, cancellable)
+}
+
+// The converter: what the inflater gives, fed from the base stream.
+fn readConverter(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const r = rec(stream)
+    const base = m.getWord(r + R_BASE)
+    if m.getI32(r + R_PASSTHROUGH) != 0 {
+        if m.getWord(r + R_IN_END) > m.getWord(r + R_IN_START) {
+            const have = m.getWord(r + R_IN_END) - m.getWord(r + R_IN_START)
+            const n = if have < count { have } else { count }
+            m.copy(buffer, m.getWord(r + R_IN) + m.getWord(r + R_IN_START), n)
+            m.putWord(r + R_IN_START, m.getWord(r + R_IN_START) + n)
+            return @intCast(i64, n)
+        }
+        return readStream(base, buffer, count, blocking, cancellable, err)
+    }
+    if m.getI32(r + R_EOF) != 0 {
+        // What follows the compressed data is read and dropped, as
+        // libsoup's converter wrapper does, so the body ends where its
+        // framing says.
+        while true {
+            const n = readStream(base, m.getWord(r + R_IN), IN_SIZE, blocking, cancellable, err)
+            if n <= 0 { return n }
+        }
+        return 0
+    }
+    while true {
+        const start = m.getWord(r + R_IN_START)
+        const end = m.getWord(r + R_IN_END)
+        if end > start {
+            var consumed: usize = 0
+            var produced: usize = 0
+            const status = inflate.run(m.getWord(r + R_INFLATER), m.getWord(r + R_IN) + start, end - start, buffer, count, &consumed, &produced)
+            if status == inflate.Status.damaged || status == inflate.Status.needDictionary || status == inflate.Status.misuse {
+                if m.getI32(r + R_PRODUCED) == 0 { return fallBack(stream, buffer, count) }
+                c.setError(err, g.g_io_error_quark(), 35, "Invalid compressed data")
+                return -1
+            }
+            m.putWord(r + R_IN_START, start + consumed)
+            if produced > 0 {
+                if m.getI32(r + R_PRODUCED) == 0 {
+                    m.putI32(r + R_PRODUCED, 1)
+                    m.release(m.getWord(r + R_FIRST))
+                    m.putWord(r + R_FIRST, 0)
+                }
+                if status == inflate.Status.done { m.putI32(r + R_EOF, 1) }
+                return @intCast(i64, produced)
+            }
+            if status == inflate.Status.done {
+                m.putI32(r + R_EOF, 1)
+                return 0
+            }
+            if consumed > 0 { continue }
+        }
+        // More input.
+        m.putWord(r + R_IN_START, 0)
+        m.putWord(r + R_IN_END, 0)
+        const n = readStream(base, m.getWord(r + R_IN), IN_SIZE, blocking, cancellable, err)
+        if n < 0 { return n }
+        if n == 0 {
+            if m.getI32(r + R_PRODUCED) == 0 && m.getWord(r + R_FIRST_LENGTH) > 0 { return fallBack(stream, buffer, count) }
+            m.putI32(r + R_EOF, 1)
+            return 0
+        }
+        m.putWord(r + R_IN_END, @intCast(usize, n))
+        if m.getI32(r + R_PRODUCED) == 0 { keepFirst(r, m.getWord(r + R_IN), @intCast(usize, n)) }
+    }
+    return 0
+}
+
+// The input before any output, kept for falling back.
+fn keepFirst(r: usize, data: usize, length: usize) -> void {
+    const old = m.getWord(r + R_FIRST_LENGTH)
+    const first = m.grow(m.getWord(r + R_FIRST), old + length)
+    m.copy(first + old, data, length)
+    m.putWord(r + R_FIRST, first)
+    m.putWord(r + R_FIRST_LENGTH, old + length)
+}
+
+// Data that does not decode from its start: deflate is tried raw (some
+// servers send it without zlib's wrapper), then the bytes are given as
+// they came.
+fn fallBack(stream: usize, buffer: usize, count: usize) -> i64 {
+    const r = rec(stream)
+    const first = m.getWord(r + R_FIRST)
+    const length = m.getWord(r + R_FIRST_LENGTH)
+    if m.getI32(r + R_FORMAT) == 1 {
+        m.putI32(r + R_FORMAT, 0)
+        inflate.dispose(m.getWord(r + R_INFLATER))
+        m.putWord(r + R_INFLATER, inflate.new(inflate.Format.raw))
+        // Start over on the kept input.
+        const room = if length > IN_SIZE { length } else { IN_SIZE }
+        m.release(m.getWord(r + R_IN))
+        m.putWord(r + R_IN, m.raw(room))
+        m.copy(m.getWord(r + R_IN), first, length)
+        m.putWord(r + R_IN_START, 0)
+        m.putWord(r + R_IN_END, length)
+        return readConverter(stream, buffer, count, true, 0, 0)
+    }
+    m.putI32(r + R_PASSTHROUGH, 1)
+    m.release(m.getWord(r + R_IN))
+    m.putWord(r + R_IN, first)
+    m.putWord(r + R_IN_START, 0)
+    m.putWord(r + R_IN_END, length)
+    m.putWord(r + R_FIRST, 0)
+    m.putWord(r + R_FIRST_LENGTH, 0)
+    return readConverter(stream, buffer, count, true, 0, 0)
+}
+
+fn converterReadable(stream: usize) -> bool {
+    const r = rec(stream)
+    if m.getI32(r + R_EOF) != 0 { return true }
+    if m.getWord(r + R_IN_END) > m.getWord(r + R_IN_START) { return true }
+    return streamReadable(m.getWord(r + R_BASE))
+}
+
+// The sniffer: whether the first bytes are held (or the stream ended
+// before them), reading toward that; false with `err` set when it cannot
+// go on now.
+pub fn snifferReady(stream: usize, blocking: bool, cancellable: usize, err: usize) -> bool {
+    const r = rec(stream)
+    while m.getI32(r + R_SNIFF_EOF) == 0 && m.getWord(r + R_SNIFF_LENGTH) < SNIFF_SIZE {
+        const length = m.getWord(r + R_SNIFF_LENGTH)
+        const n = readStream(m.getWord(r + R_BASE), m.getWord(r + R_SNIFF) + length, SNIFF_SIZE - length, blocking, cancellable, err)
+        if n < 0 { return false }
+        if n == 0 {
+            m.putI32(r + R_SNIFF_EOF, 1)
+        } else {
+            m.putWord(r + R_SNIFF_LENGTH, length + @intCast(usize, n))
+        }
+    }
+    return true
+}
+
+// The bytes held for sniffing.
+pub fn sniffed(stream: usize) -> []const u8 {
+    const r = rec(stream)
+    return m.bytes(m.getWord(r + R_SNIFF), m.getWord(r + R_SNIFF_LENGTH))
+}
+
+fn readSniffer(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const r = rec(stream)
+    const pos = m.getWord(r + R_SNIFF_POS)
+    const length = m.getWord(r + R_SNIFF_LENGTH)
+    if pos < length {
+        const n = if length - pos < count { length - pos } else { count }
+        m.copy(buffer, m.getWord(r + R_SNIFF) + pos, n)
+        m.putWord(r + R_SNIFF_POS, pos + n)
+        return @intCast(i64, n)
+    }
+    if m.getI32(r + R_SNIFF_EOF) != 0 { return 0 }
+    return readStream(m.getWord(r + R_BASE), buffer, count, blocking, cancellable, err)
+}
+
+fn snifferReadable(stream: usize) -> bool {
+    const r = rec(stream)
+    if m.getWord(r + R_SNIFF_POS) < m.getWord(r + R_SNIFF_LENGTH) || m.getI32(r + R_SNIFF_EOF) != 0 { return true }
+    return streamReadable(m.getWord(r + R_BASE))
+}
+
+fn readClient(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const r = rec(stream)
+    const n = readStream(m.getWord(r + R_BASE), buffer, count, blocking, cancellable, err)
+    if n > 0 { metrics.add(m.getWord(r + R_METRICS), metrics.RESPONSE_BODY_SIZE, @intCast(u64, n)) }
+    if n == 0 && m.getWord(r + R_IO) != 0 {
+        const io = m.getWord(r + R_IO)
+        const call: EofFn = unsafe { @ptrFromInt(EofFn, m.getWord(r + R_EOF_FN)) }
+        call(io)
+    }
+    return n
+}
+
+fn readAny(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const kind = m.getI32(rec(stream) + R_KIND)
+    if kind == KIND_BODY { return readBody(stream, buffer, count, blocking, cancellable, err) }
+    if kind == KIND_CONVERTER { return readConverter(stream, buffer, count, blocking, cancellable, err) }
+    if kind == KIND_SNIFFER { return readSniffer(stream, buffer, count, blocking, cancellable, err) }
+    return readClient(stream, buffer, count, blocking, cancellable, err)
+}
+
+fn readableAny(stream: usize) -> bool {
+    const kind = m.getI32(rec(stream) + R_KIND)
+    if kind == KIND_BODY { return bodyReadable(stream) }
+    if kind == KIND_CONVERTER { return converterReadable(stream) }
+    if kind == KIND_SNIFFER { return snifferReadable(stream) }
+    return streamReadable(m.getWord(rec(stream) + R_BASE))
+}
+
+fn sourceAny(stream: usize, cancellable: usize) -> usize {
+    const r = rec(stream)
+    var child: usize = 0
+    if m.getI32(r + R_KIND) == KIND_BODY {
+        child = bodySource(stream, cancellable)
+    } else if readableAny(stream) {
+        child = g.g_timeout_source_new(0)
+    } else {
+        child = streamSource(m.getWord(r + R_BASE), cancellable)
+    }
+    const source = g_pollable_source_new_full(stream, child, cancellable)
+    g.g_source_unref(child)
+    return source
+}
+
+// ---------------------------------------------------------------------------
+// GInputStream and GPollableInputStream
+
+export fn __mlx_soup_stream_read(stream: usize, buffer: usize, count: usize, cancellable: usize, err: usize) -> i64 { return readAny(stream, buffer, count, true, cancellable, err) }
+
+export fn __mlx_soup_stream_close(stream: usize, cancellable: usize, err: usize) -> i32 {
+    const r = rec(stream)
+    const kind = m.getI32(r + R_KIND)
+    if kind == KIND_CLIENT {
+        const io = m.getWord(r + R_IO)
+        if io == 0 { return 1 }
+        m.putWord(r + R_IO, 0)
+        const call: CloseFn = unsafe { @ptrFromInt(CloseFn, m.getWord(r + R_CLOSE_FN)) }
+        return call(io, 1, cancellable, err)
+    }
+    if kind == KIND_BODY { return 1 }
+    // The wrappers close what they read from.
+    return g.g_input_stream_close(m.getWord(r + R_BASE), cancellable, err)
+}
+
+export fn __mlx_soup_stream_can_poll(stream: usize) -> i32 { return 1 }
+export fn __mlx_soup_stream_is_readable(stream: usize) -> i32 { return if readableAny(stream) { 1 } else { 0 } }
+export fn __mlx_soup_stream_create_source(stream: usize, cancellable: usize) -> usize { return sourceAny(stream, cancellable) }
+export fn __mlx_soup_stream_read_nonblocking(stream: usize, buffer: usize, count: usize, err: usize) -> i64 { return readAny(stream, buffer, count, false, 0, err) }
+
+export fn __mlx_soup_stream_class_init(class: usize, data: usize) -> void {
+    m.putWord(class + 48, @intFromPtr(__mlx_soup_stream_finalize))
+    m.putWord(class + 136, @intFromPtr(__mlx_soup_stream_read))
+    m.putWord(class + 152, @intFromPtr(__mlx_soup_stream_close))
+}
+
+export fn __mlx_soup_stream_pollable_init(iface: usize, data: usize) -> void {
+    m.putWord(iface + 16, @intFromPtr(__mlx_soup_stream_can_poll))
+    m.putWord(iface + 24, @intFromPtr(__mlx_soup_stream_is_readable))
+    m.putWord(iface + 32, @intFromPtr(__mlx_soup_stream_create_source))
+    m.putWord(iface + 40, @intFromPtr(__mlx_soup_stream_read_nonblocking))
+}
+
+// Reads without the GInputStream's pending flag (the I/O's own reading
+// of the body, for skipping it).
+pub fn readDirect(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 { return readAny(stream, buffer, count, blocking, cancellable, err) }
+pub fn readable(stream: usize) -> bool { return readableAny(stream) }
+pub fn source(stream: usize, cancellable: usize) -> usize { return sourceAny(stream, cancellable) }
+pub fn isOurs(stream: usize) -> bool {
+    ensureTypes()
+    return g_type_check_instance_is_a(stream, bodyType) != 0 || g_type_check_instance_is_a(stream, converterType) != 0 || g_type_check_instance_is_a(stream, snifferType) != 0 || g_type_check_instance_is_a(stream, clientType) != 0
+}

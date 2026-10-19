@@ -1,0 +1,567 @@
+// A session's connection to a host (libsoup's SoupConnection, kept here
+// as a record rather than a GObject: nothing outside the library sees
+// one): the TCP connection GIO's socket client makes, the TLS client
+// connection over it for https://, the bytes read and not yet used (a
+// response's headers are read in blocks, and what follows them is the
+// body's), and what a message learns from it (its id, remote address and
+// TLS facts).
+//
+// A connection is NEW, CONNECTING, IDLE (open, no message on it, closed
+// after the session's idle timeout), IN_USE or DISCONNECTED. Reads and
+// writes go through read/fill/write here, at once (blocking) or without
+// blocking (G_IO_ERROR_WOULD_BLOCK, and source() tells when to try
+// again), as libsoup's HTTP/1 code does with its pollable streams.
+//
+// The record:
+//   0 references (u32), 4 the state      8 the session
+//  16 the host's URI (scheme, host, port: what the pool is keyed by)
+//  24 the id (u64)                       32 the GSocketConnection
+//  40 the stream read and written: the TLS connection or the socket's
+//  48 its input stream, 56 its output stream
+//  64 the buffer, 72 where its bytes start, 80 end, 88 its room
+//  96 whether reusable, 100 whether ever used
+// 104 the idle timeout's source          112 the remote address
+// 120 the TLS peer certificate, 128 its errors (u32), 132 the version
+// 136 the TLS ciphersuite name           144 the message on it
+// 152 the TLS connection (0: plain)      160 the server identity
+// 168 the connect callback, 176 its data 184 the connect's cancellable
+// 192 the TLS database, 200 the TLS interaction
+// 208 the I/O timeout in seconds (the session's "timeout"; 0: none)
+const m = @import("../glib/memory.mlx")
+const g = @import("./g.mlx")
+const c = @import("./common.mlx")
+const tls = @import("./tls.mlx")
+const message = @import("./message.mlx")
+
+extern("c") fn g_network_address_new(hostname: usize, port: u16) -> usize
+extern("c") fn g_socket_client_connect_to_host(client: usize, host: usize, port: u16, c: usize, err: usize) -> usize
+extern("c") fn g_pollable_output_stream_write_nonblocking(stream: usize, buffer: usize, count: usize, c: usize, err: usize) -> i64
+extern("c") fn g_pollable_output_stream_create_source(stream: usize, c: usize) -> usize
+extern("c") fn g_pollable_output_stream_can_poll(stream: usize) -> i32
+extern("c") fn g_type_check_instance_is_a(instance: usize, t: usize) -> i32
+extern("c") fn g_pollable_output_stream_get_type() -> usize
+
+pub const NEW: i32 = 0
+pub const CONNECTING: i32 = 1
+pub const IDLE: i32 = 2
+pub const IN_USE: i32 = 3
+pub const DISCONNECTED: i32 = 4
+
+const R_REFS: usize = 0
+const R_STATE: usize = 4
+const R_SESSION: usize = 8
+const R_URI: usize = 16
+const R_ID: usize = 24
+const R_SOCKET: usize = 32
+const R_IOSTREAM: usize = 40
+const R_ISTREAM: usize = 48
+const R_OSTREAM: usize = 56
+const R_BUFFER: usize = 64
+const R_START: usize = 72
+const R_END: usize = 80
+const R_ROOM: usize = 88
+const R_REUSABLE: usize = 96
+const R_EVER_USED: usize = 100
+const R_IDLE_SOURCE: usize = 104
+const R_REMOTE: usize = 112
+const R_PEER_CERT: usize = 120
+const R_PEER_ERRORS: usize = 128
+const R_TLS_VERSION: usize = 132
+const R_CIPHERSUITE: usize = 136
+const R_MESSAGE: usize = 144
+const R_TLS: usize = 152
+const R_IDENTITY: usize = 160
+const R_CALLBACK: usize = 168
+const R_DATA: usize = 176
+const R_CANCELLABLE: usize = 184
+const R_DATABASE: usize = 192
+const R_INTERACTION: usize = 200
+const R_TIMEOUT: usize = 208
+const R_SIZE: usize = 216
+
+// G_IO_ERROR codes.
+pub const WOULD_BLOCK: i32 = 27
+pub const CANCELLED: i32 = 19
+pub const TIMED_OUT: i32 = 24
+pub const CONNECTION_CLOSED: i32 = 44
+pub const PARTIAL_INPUT: i32 = 34
+
+// GSocketClientEvent.
+pub const EVENT_RESOLVING: i32 = 0
+pub const EVENT_RESOLVED: i32 = 1
+pub const EVENT_CONNECTING: i32 = 2
+pub const EVENT_CONNECTED: i32 = 3
+pub const EVENT_TLS_HANDSHAKING: i32 = 6
+pub const EVENT_TLS_HANDSHAKED: i32 = 7
+pub const EVENT_COMPLETE: i32 = 8
+
+pub const ConnectedFn = fn(usize, usize, usize) -> void
+
+pub fn new(session: usize, hostUri: usize, timeout: u32, connectionId: u64) -> usize {
+    const conn = m.alloc(R_SIZE)
+    m.put32(conn + R_TIMEOUT, timeout)
+    m.put32(conn + R_REFS, 1)
+    m.putI32(conn + R_STATE, NEW)
+    m.putWord(conn + R_SESSION, session)
+    m.putWord(conn + R_URI, g.g_uri_ref(hostUri))
+    m.putWord(conn + R_ID, connectionId)
+    return conn
+}
+
+pub fn ref(conn: usize) -> usize {
+    m.put32(conn + R_REFS, m.get32(conn + R_REFS) + 1)
+    return conn
+}
+
+pub fn unref(conn: usize) -> void {
+    const refs = m.get32(conn + R_REFS) - 1
+    m.put32(conn + R_REFS, refs)
+    if refs != 0 { return }
+    disconnect(conn)
+    g.g_uri_unref(m.getWord(conn + R_URI))
+    c.clearObject(conn + R_IDENTITY)
+    c.clearObject(conn + R_PEER_CERT)
+    c.clearObject(conn + R_REMOTE)
+    c.clearObject(conn + R_CANCELLABLE)
+    c.clearObject(conn + R_DATABASE)
+    c.clearObject(conn + R_INTERACTION)
+    m.release(m.getWord(conn + R_CIPHERSUITE))
+    m.release(m.getWord(conn + R_BUFFER))
+    m.release(conn)
+}
+
+pub fn state(conn: usize) -> i32 { return m.getI32(conn + R_STATE) }
+pub fn id(conn: usize) -> u64 { return m.getWord(conn + R_ID) }
+pub fn hostUri(conn: usize) -> usize { return m.getWord(conn + R_URI) }
+pub fn session(conn: usize) -> usize { return m.getWord(conn + R_SESSION) }
+pub fn iostream(conn: usize) -> usize { return m.getWord(conn + R_IOSTREAM) }
+pub fn istream(conn: usize) -> usize { return m.getWord(conn + R_ISTREAM) }
+pub fn ostream(conn: usize) -> usize { return m.getWord(conn + R_OSTREAM) }
+pub fn isReusable(conn: usize) -> bool { return m.getI32(conn + R_REUSABLE) != 0 }
+pub fn everUsed(conn: usize) -> bool { return m.getI32(conn + R_EVER_USED) != 0 }
+pub fn setReusable(conn: usize, value: bool) -> void { m.putI32(conn + R_REUSABLE, if value { 1 } else { 0 }) }
+pub fn setEverUsed(conn: usize) -> void { m.putI32(conn + R_EVER_USED, 1) }
+pub fn isTls(conn: usize) -> bool { return m.getWord(conn + R_TLS) != 0 }
+pub fn tlsConnection(conn: usize) -> usize { return m.getWord(conn + R_TLS) }
+pub fn currentMessage(conn: usize) -> usize { return m.getWord(conn + R_MESSAGE) }
+
+pub fn setTlsDatabase(conn: usize, database: usize) -> void { c.replaceObject(conn + R_DATABASE, database) }
+pub fn setTlsInteraction(conn: usize, interaction: usize) -> void { c.replaceObject(conn + R_INTERACTION, interaction) }
+
+// Gives the message the connection's facts, or takes it off.
+pub fn attachMessage(conn: usize, msg: usize) -> void {
+    m.putWord(conn + R_MESSAGE, msg)
+    if msg == 0 { return }
+    message.setConnection(msg, conn, id(conn), m.getWord(conn + R_PEER_CERT), m.get32(conn + R_PEER_ERRORS), m.getI32(conn + R_TLS_VERSION), m.getWord(conn + R_CIPHERSUITE), m.getWord(conn + R_REMOTE))
+}
+
+fn emitEvent(conn: usize, event: i32, stream: usize) -> void {
+    const msg = m.getWord(conn + R_MESSAGE)
+    if msg != 0 { message.networkEvent(msg, event, stream) }
+}
+
+// ---------------------------------------------------------------------------
+// Connecting
+
+fn hostAndPort(conn: usize) -> usize {
+    const uri = m.getWord(conn + R_URI)
+    const host = m.cSlice(g.g_uri_get_host(uri))
+    var t = m.text()
+    var v6 = false
+    for ch in host {
+        if ch == 58 { v6 = true }
+    }
+    if v6 { m.pushByte(&t, 91) }
+    m.pushText(&t, host)
+    if v6 { m.pushByte(&t, 93) }
+    m.pushByte(&t, 58)
+    m.pushDecimal(&t, @intCast(u64, g.g_uri_get_port(uri)))
+    return m.finish(&t)
+}
+
+fn isHttps(conn: usize) -> bool { return m.same(m.cSlice(g.g_uri_get_scheme(m.getWord(conn + R_URI))), "https") || m.same(m.cSlice(g.g_uri_get_scheme(m.getWord(conn + R_URI))), "wss") }
+
+// The plain connection made: its streams, its address.
+fn takeSocket(conn: usize, socketConn: usize, timeout: u32) -> void {
+    m.putWord(conn + R_SOCKET, socketConn)
+    m.putWord(conn + R_IOSTREAM, g.g_object_ref(socketConn))
+    m.putWord(conn + R_ISTREAM, g.g_io_stream_get_input_stream(socketConn))
+    m.putWord(conn + R_OSTREAM, g.g_io_stream_get_output_stream(socketConn))
+    const socket = g.g_socket_connection_get_socket(socketConn)
+    if socket != 0 { g.g_socket_set_timeout(socket, timeout) }
+    c.clearObject(conn + R_REMOTE)
+    m.putWord(conn + R_REMOTE, g.g_socket_connection_get_remote_address(socketConn, 0))
+}
+
+// The TLS client connection over the plain one, set up as libsoup sets
+// it (the session's database and interaction, no close_notify needed).
+fn startTls(conn: usize, err: usize) -> bool {
+    const uri = m.getWord(conn + R_URI)
+    m.putWord(conn + R_IDENTITY, g_network_address_new(g.g_uri_get_host(uri), @intCast(u16, g.g_uri_get_port(uri) & 65535)))
+    const tlsConn = tls.clientConnection(m.getWord(conn + R_SOCKET), m.getWord(conn + R_IDENTITY), err)
+    if tlsConn == 0 { return false }
+    m.putWord(conn + R_TLS, tlsConn)
+    if m.getWord(conn + R_DATABASE) != 0 { tls.setDatabase(tlsConn, m.getWord(conn + R_DATABASE)) }
+    if m.getWord(conn + R_INTERACTION) != 0 { tls.setInteraction(tlsConn, m.getWord(conn + R_INTERACTION)) }
+    tls.setRequireCloseNotify(tlsConn, false)
+    const msg = m.getWord(conn + R_MESSAGE)
+    if msg != 0 && message.clientCertificate(msg) != 0 { tls.setCertificate(tlsConn, message.clientCertificate(msg)) }
+    _ = g.g_signal_connect_data(tlsConn, m.literal("accept-certificate"), @intFromPtr(__mlx_soup_conn_accept_certificate), conn, 0, 0)
+    emitEvent(conn, EVENT_TLS_HANDSHAKING, tlsConn)
+    return true
+}
+
+// "accept-certificate" of the TLS connection: the message's handlers
+// decide.
+export fn __mlx_soup_conn_accept_certificate(tlsConn: usize, certificate: usize, errors: u32, conn: usize) -> i32 {
+    const msg = m.getWord(conn + R_MESSAGE)
+    if msg == 0 { return 0 }
+    return if message.acceptCertificate(msg, certificate, errors) { 1 } else { 0 }
+}
+
+// The handshake done: the connection's streams become the TLS ones, its
+// facts are read.
+fn finishTls(conn: usize) -> void {
+    const tlsConn = m.getWord(conn + R_TLS)
+    c.clearObject(conn + R_IOSTREAM)
+    m.putWord(conn + R_IOSTREAM, g.g_object_ref(tlsConn))
+    m.putWord(conn + R_ISTREAM, g.g_io_stream_get_input_stream(tlsConn))
+    m.putWord(conn + R_OSTREAM, g.g_io_stream_get_output_stream(tlsConn))
+    c.replaceObject(conn + R_PEER_CERT, tls.peerCertificate(tlsConn))
+    m.put32(conn + R_PEER_ERRORS, tls.peerErrors(tlsConn))
+    m.putI32(conn + R_TLS_VERSION, tls.protocolVersion(tlsConn))
+    c.replaceString(conn + R_CIPHERSUITE, tls.ciphersuiteName(tlsConn))
+    emitEvent(conn, EVENT_TLS_HANDSHAKED, tlsConn)
+}
+
+fn connected(conn: usize, err: usize) -> void {
+    m.putI32(conn + R_STATE, IN_USE)
+    emitEvent(conn, EVENT_COMPLETE, m.getWord(conn + R_IOSTREAM))
+    const msg = m.getWord(conn + R_MESSAGE)
+    if msg != 0 { attachMessage(conn, msg) }
+}
+
+fn fail(conn: usize) -> void {
+    m.putI32(conn + R_STATE, DISCONNECTED)
+    disconnect(conn)
+}
+
+fn finishConnect(conn: usize, e: usize) -> void {
+    const callback = m.getWord(conn + R_CALLBACK)
+    const data = m.getWord(conn + R_DATA)
+    m.putWord(conn + R_CALLBACK, 0)
+    if e != 0 {
+        fail(conn)
+    } else {
+        connected(conn, 0)
+    }
+    if callback != 0 {
+        const call: ConnectedFn = unsafe { @ptrFromInt(ConnectedFn, callback) }
+        call(conn, e, data)
+    }
+    unref(conn)
+}
+
+export fn __mlx_soup_conn_handshaken(tlsConn: usize, result: usize, conn: usize) -> void {
+    const cell = m.alloc(8)
+    if tls.handshakeFinish(tlsConn, result, cell) {
+        finishTls(conn)
+    }
+    const e = m.getWord(cell)
+    m.release(cell)
+    finishConnect(conn, e)
+}
+
+export fn __mlx_soup_conn_connected(client: usize, result: usize, conn: usize) -> void {
+    const cell = m.alloc(8)
+    const socketConn = g.g_socket_client_connect_to_host_finish(client, result, cell)
+    var e = m.getWord(cell)
+    m.release(cell)
+    g.g_object_unref(client)
+    if socketConn == 0 {
+        finishConnect(conn, e)
+        return
+    }
+    takeSocket(conn, socketConn, sessionTimeout(conn))
+    emitEvent(conn, EVENT_CONNECTED, socketConn)
+    if !isHttps(conn) {
+        finishConnect(conn, 0)
+        return
+    }
+    const errCell = m.alloc(8)
+    if !startTls(conn, errCell) {
+        e = m.getWord(errCell)
+        m.release(errCell)
+        finishConnect(conn, e)
+        return
+    }
+    m.release(errCell)
+    tls.handshakeAsync(m.getWord(conn + R_TLS), 0, m.getWord(conn + R_CANCELLABLE), @intFromPtr(__mlx_soup_conn_handshaken), conn)
+}
+
+fn sessionTimeout(conn: usize) -> u32 { return m.get32(conn + R_TIMEOUT) }
+
+fn newClient(conn: usize) -> usize {
+    const client = g.g_socket_client_new()
+    g.g_socket_client_set_timeout(client, sessionTimeout(conn))
+    return client
+}
+
+// Connects without blocking; `callback(conn, error, data)` is called in
+// the thread-default main context when it is done (error 0: connected,
+// else a GError the callback owns).
+pub fn connectAsync(conn: usize, msg: usize, cancellable: usize, callback: usize, data: usize) -> void {
+    m.putI32(conn + R_STATE, CONNECTING)
+    m.putWord(conn + R_MESSAGE, msg)
+    m.putWord(conn + R_CALLBACK, callback)
+    m.putWord(conn + R_DATA, data)
+    c.replaceObject(conn + R_CANCELLABLE, cancellable)
+    _ = ref(conn)
+    emitEvent(conn, EVENT_RESOLVING, 0)
+    emitEvent(conn, EVENT_RESOLVED, 0)
+    emitEvent(conn, EVENT_CONNECTING, 0)
+    const target = hostAndPort(conn)
+    g.g_socket_client_connect_to_host_async(newClient(conn), target, 0, cancellable, @intFromPtr(__mlx_soup_conn_connected), conn)
+    m.release(target)
+}
+
+pub const HandshakeFn = fn(usize, usize, usize) -> i32
+
+// Connects at once: false with `err` set when it fails.
+pub fn connectSync(conn: usize, msg: usize, cancellable: usize, err: usize) -> bool {
+    m.putI32(conn + R_STATE, CONNECTING)
+    m.putWord(conn + R_MESSAGE, msg)
+    emitEvent(conn, EVENT_RESOLVING, 0)
+    emitEvent(conn, EVENT_RESOLVED, 0)
+    emitEvent(conn, EVENT_CONNECTING, 0)
+    const target = hostAndPort(conn)
+    const client = newClient(conn)
+    const socketConn = g_socket_client_connect_to_host(client, target, 0, cancellable, err)
+    m.release(target)
+    g.g_object_unref(client)
+    if socketConn == 0 {
+        fail(conn)
+        return false
+    }
+    takeSocket(conn, socketConn, sessionTimeout(conn))
+    emitEvent(conn, EVENT_CONNECTED, socketConn)
+    if isHttps(conn) {
+        if !startTls(conn, err) {
+            fail(conn)
+            return false
+        }
+        const call: HandshakeFn = unsafe { @ptrFromInt(HandshakeFn, tls.lookup("g_tls_connection_handshake")) }
+        if call(m.getWord(conn + R_TLS), cancellable, err) == 0 {
+            fail(conn)
+            return false
+        }
+        finishTls(conn)
+    }
+    connected(conn, 0)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// In use, idle, closed
+
+export fn __mlx_soup_conn_idle_timeout(conn: usize) -> i32 {
+    m.putWord(conn + R_IDLE_SOURCE, 0)
+    disconnect(conn)
+    return 0
+}
+
+fn stopIdleTimer(conn: usize) -> void {
+    const source = m.getWord(conn + R_IDLE_SOURCE)
+    if source == 0 { return }
+    m.putWord(conn + R_IDLE_SOURCE, 0)
+    g.g_source_destroy(source)
+    g.g_source_unref(source)
+}
+
+// Puts the connection in use, or (with no message) idle: kept open for
+// `idleTimeout` seconds (0: as long as the session lives) when reusable,
+// else closed.
+pub fn setInUse(conn: usize, inUse: bool, idleTimeout: u32) -> void {
+    if m.getI32(conn + R_STATE) == DISCONNECTED { return }
+    if inUse {
+        stopIdleTimer(conn)
+        m.putI32(conn + R_STATE, IN_USE)
+        return
+    }
+    m.putWord(conn + R_MESSAGE, 0)
+    if !isReusable(conn) {
+        disconnect(conn)
+        return
+    }
+    m.putI32(conn + R_STATE, IDLE)
+    if idleTimeout > 0 {
+        stopIdleTimer(conn)
+        const source = g.g_timeout_source_new_seconds(idleTimeout)
+        g.g_source_set_callback(source, @intFromPtr(__mlx_soup_conn_idle_timeout), conn, 0)
+        _ = g.g_source_attach(source, g.g_main_context_get_thread_default())
+        m.putWord(conn + R_IDLE_SOURCE, source)
+    }
+}
+
+pub fn disconnect(conn: usize) -> void {
+    stopIdleTimer(conn)
+    m.putI32(conn + R_STATE, DISCONNECTED)
+    const stream = m.getWord(conn + R_IOSTREAM)
+    if stream != 0 {
+        _ = g.g_io_stream_close(stream, 0, 0)
+        c.clearObject(conn + R_IOSTREAM)
+    }
+    if m.getWord(conn + R_SOCKET) != 0 {
+        _ = g.g_io_stream_close(m.getWord(conn + R_SOCKET), 0, 0)
+        c.clearObject(conn + R_SOCKET)
+    }
+    if m.getWord(conn + R_TLS) != 0 {
+        _ = g.g_signal_handlers_disconnect_matched(m.getWord(conn + R_TLS), 16, 0, 0, 0, 0, conn)
+        c.clearObject(conn + R_TLS)
+    }
+    m.putWord(conn + R_ISTREAM, 0)
+    m.putWord(conn + R_OSTREAM, 0)
+    m.putWord(conn + R_START, 0)
+    m.putWord(conn + R_END, 0)
+}
+
+// Whether an idle connection is still worth using: open, with nothing to
+// read (a server that closed it, or sent something unasked, makes it
+// readable).
+pub fn isIdleOpen(conn: usize) -> bool {
+    if m.getI32(conn + R_STATE) != IDLE { return false }
+    if m.getWord(conn + R_END) > m.getWord(conn + R_START) { return false }
+    const socketConn = m.getWord(conn + R_SOCKET)
+    if socketConn == 0 { return false }
+    const socket = g.g_socket_connection_get_socket(socketConn)
+    // G_IO_IN | G_IO_ERR | G_IO_HUP.
+    return g.g_socket_condition_check(socket, 1 | 8 | 16) == 0
+}
+
+// ---------------------------------------------------------------------------
+// Reading and writing
+
+pub fn buffered(conn: usize) -> usize { return m.getWord(conn + R_END) - m.getWord(conn + R_START) }
+pub fn bufferStart(conn: usize) -> usize { return m.getWord(conn + R_BUFFER) + m.getWord(conn + R_START) }
+
+// Takes `count` buffered bytes as used.
+pub fn consume(conn: usize, count: usize) -> void {
+    const start = m.getWord(conn + R_START) + count
+    if start >= m.getWord(conn + R_END) {
+        m.putWord(conn + R_START, 0)
+        m.putWord(conn + R_END, 0)
+    } else {
+        m.putWord(conn + R_START, start)
+    }
+}
+
+fn ensureClosed(err: usize) -> i64 {
+    c.setError(err, g.g_io_error_quark(), CONNECTION_CLOSED, "Connection terminated unexpectedly")
+    return -1
+}
+
+// Reads from the stream into `buffer` (no buffering): bytes read, 0 at
+// the end, -1 with `err` (WOULD_BLOCK when not blocking and nothing is
+// there).
+pub fn rawRead(conn: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const stream = m.getWord(conn + R_ISTREAM)
+    if stream == 0 { return ensureClosed(err) }
+    if blocking { return g.g_input_stream_read(stream, buffer, count, cancellable, err) }
+    if g.g_pollable_input_stream_can_poll(stream) == 0 { return g.g_input_stream_read(stream, buffer, count, cancellable, err) }
+    return g.g_pollable_input_stream_read_nonblocking(stream, buffer, count, cancellable, err)
+}
+
+// Reads more into the buffer: bytes added, 0 at the end, -1 with `err`.
+pub fn fill(conn: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    var start = m.getWord(conn + R_START)
+    var end = m.getWord(conn + R_END)
+    var room = m.getWord(conn + R_ROOM)
+    var buffer = m.getWord(conn + R_BUFFER)
+    if start > 0 && start == end {
+        start = 0
+        end = 0
+    }
+    if room - end < 4096 {
+        if start > 0 {
+            m.copy(buffer, buffer + start, end - start)
+            end -= start
+            start = 0
+        }
+        if room - end < 4096 {
+            room = if room == 0 { 8192 } else { room * 2 }
+            buffer = m.grow(buffer, room)
+            m.putWord(conn + R_BUFFER, buffer)
+            m.putWord(conn + R_ROOM, room)
+        }
+    }
+    m.putWord(conn + R_START, start)
+    m.putWord(conn + R_END, end)
+    const n = rawRead(conn, buffer + end, room - end, blocking, cancellable, err)
+    if n > 0 { m.putWord(conn + R_END, end + @intCast(usize, n)) }
+    return n
+}
+
+// Reads into `buffer`: what is buffered first, else from the stream.
+pub fn read(conn: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const have = buffered(conn)
+    if have > 0 {
+        const n = if have < count { have } else { count }
+        m.copy(buffer, bufferStart(conn), n)
+        consume(conn, n)
+        return @intCast(i64, n)
+    }
+    return rawRead(conn, buffer, count, blocking, cancellable, err)
+}
+
+pub fn isReadable(conn: usize) -> bool {
+    if buffered(conn) > 0 { return true }
+    const stream = m.getWord(conn + R_ISTREAM)
+    if stream == 0 { return true }
+    if g.g_pollable_input_stream_can_poll(stream) == 0 { return true }
+    return g.g_pollable_input_stream_is_readable(stream) != 0
+}
+
+// A source that is ready when reading can go on.
+pub fn inputSource(conn: usize, cancellable: usize) -> usize {
+    const stream = m.getWord(conn + R_ISTREAM)
+    if buffered(conn) > 0 || stream == 0 || g.g_pollable_input_stream_can_poll(stream) == 0 { return g.g_timeout_source_new(0) }
+    return g.g_pollable_input_stream_create_source(stream, cancellable)
+}
+
+pub fn write(conn: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const stream = m.getWord(conn + R_OSTREAM)
+    if stream == 0 { return ensureClosed(err) }
+    if blocking || g_type_check_instance_is_a(stream, g_pollable_output_stream_get_type()) == 0 || g_pollable_output_stream_can_poll(stream) == 0 {
+        return g.g_output_stream_write(stream, buffer, count, cancellable, err)
+    }
+    return g_pollable_output_stream_write_nonblocking(stream, buffer, count, cancellable, err)
+}
+
+pub fn outputSource(conn: usize, cancellable: usize) -> usize {
+    const stream = m.getWord(conn + R_OSTREAM)
+    if stream == 0 || g_type_check_instance_is_a(stream, g_pollable_output_stream_get_type()) == 0 || g_pollable_output_stream_can_poll(stream) == 0 { return g.g_timeout_source_new(0) }
+    return g_pollable_output_stream_create_source(stream, cancellable)
+}
+
+// Takes the connection's streams away (a WebSocket's): the GIOStream,
+// with what was read and not used handed over as `leftover` (a GBytes or
+// 0).
+pub fn steal(conn: usize, leftover: usize) -> usize {
+    const stream = m.getWord(conn + R_IOSTREAM)
+    m.putWord(conn + R_IOSTREAM, 0)
+    var bytes: usize = 0
+    if buffered(conn) > 0 { bytes = g.g_bytes_new(bufferStart(conn), buffered(conn)) }
+    m.putWord(leftover, bytes)
+    m.putWord(conn + R_START, 0)
+    m.putWord(conn + R_END, 0)
+    m.putWord(conn + R_ISTREAM, 0)
+    m.putWord(conn + R_OSTREAM, 0)
+    c.clearObject(conn + R_SOCKET)
+    if m.getWord(conn + R_TLS) != 0 {
+        _ = g.g_signal_handlers_disconnect_matched(m.getWord(conn + R_TLS), 16, 0, 0, 0, 0, conn)
+        c.clearObject(conn + R_TLS)
+    }
+    stopIdleTimer(conn)
+    m.putI32(conn + R_STATE, DISCONNECTED)
+    return stream
+}
