@@ -11,6 +11,11 @@ Native code uses `std.os.*`; portable POSIX software uses `std.posix`; Wayland
 uses `std.wayland` plus generated protocol modules.
 
 `xml.mlx` (`std.xml`) is the allocation-free XML pull tokenizer.
+`xml/sax.mlx` (`std.xml.sax`) is a streaming XML 1.0 parser with
+namespaces, libxml2's SAX2 push parser in Mlx (its events, errors and
+quirks; DTD entities and attribute defaults; UTF-8, UTF-16, Latin-1 and
+std.unicode.charmaps' encodings), on `xml/text.mlx`, `xml/encoding.mlx`
+and `xml/uri.mlx`; compiler/capi/xml2 is libxml2's C API made of it.
 `wayland.mlx` (`std.wayland`) and `wayland/` contain the protocol parser,
 the materializer, the wire format, the Linux transport, and the client and
 server runtimes. `wayland/generated/` holds the modules materialized from

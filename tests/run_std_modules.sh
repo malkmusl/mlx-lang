@@ -68,6 +68,11 @@
 #                                       shaper, grey, 16-bit grid,
 #                                       perceptual with black point
 #                                       compensation), the sRGB curve
+#   tests/373_xml_sax_runtime.mlx       std.xml.sax: libxml2's SAX2 events
+#                                       and errors (namespaces, DTD
+#                                       entities and defaults, chunks,
+#                                       UTF-16, Latin-1, content apart,
+#                                       an entity loop)
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -119,6 +124,7 @@ run 367_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) deco
 run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987) read and written as libsoup does"
 run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk sizes; public suffixes; MIME sniffing"
 run 372_colorprofile_runtime "ICC transforms as Little CMS makes them: BGRA to sRGB, grey, 16-bit, perceptual; the sRGB curve"
+run 373_xml_sax_runtime "XML parsed as libxml2's push parser parses it: SAX2 events, entities, errors, chunks, encodings"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
