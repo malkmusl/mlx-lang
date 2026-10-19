@@ -90,7 +90,7 @@ run 359_linux_descriptors_runtime "pipes, epoll tokens, signalfd, timerfd, event
 run 360_spawn_runtime "PATH lookup, captured output, exit statuses, moved descriptors, vfork, detach"
 run 361_dbus_keep_signals_runtime "a client against a child bus: a signal kept across a call with its descriptor; bus addresses; PATH lookup"
 run 362_crypto_symmetric_runtime "HMAC, HKDF, AES-128/192/256, AES-GCM, ChaCha20, Poly1305 and their AEAD"
-run 363_crypto_public_key_runtime "X25519, Ed25519, ECDSA and ECDH on P-256 and P-384, RSA PKCS #1 v1.5 and PSS"
+run 363_crypto_public_key_runtime "X25519, Ed25519, ECDSA and ECDH on P-256, P-384 and P-521, RSA PKCS #1 v1.5 and PSS"
 run 364_x509_runtime "DER, certificates' fields and names, hostnames, chains to an anchor, the CA bundle"
 
 if [[ $failures -ne 0 ]]; then
