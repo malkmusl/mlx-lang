@@ -1,0 +1,1734 @@
+// Public keys (gcry_pk_*): RSA (PKCS #1 v1.5 and PSS signatures, OAEP and
+// PKCS #1 v1.5 encryption, key generation), ECDSA and ECDH on the NIST
+// curves, EdDSA on Ed25519, X25519 through ECDH, as WebCore's WebCrypto
+// hands them over in S-expressions and as libgcrypt 1.10 answers:
+//
+//   - the key's algorithm is the name after "public-key" or
+//     "private-key"; data come as (data (flags ...) (hash algo value)),
+//     (data (flags ...) (value ...)) and their OAEP, PSS and EdDSA
+//     parameters (hash-algo, label, salt-length), parsed as
+//     libgcrypt's pubkey-util.c does;
+//   - results have libgcrypt's forms: (sig-val (rsa (s ...))) of the
+//     modulus's length, (sig-val (ecdsa (r ...) (s ...))), (sig-val
+//     (eddsa (r ...) (s ...))), (enc-val (rsa (a ...))), (enc-val (ecdh
+//     (s ...) (e ...))), (value ...), and genkey's (key-data
+//     (public-key ...) (private-key ...)).
+//
+// RSA's private operation uses the CRT with the key's p, q and u
+// (libgcrypt's u = p^-1 mod q) when it has them, else d, and a signature
+// is checked with e before it is returned (a wrong u gives
+// GPG_ERR_BAD_SIGNATURE, as libgcrypt's does). The exponentiations are
+// std.crypto.bignum's Montgomery ladder, constant time; the curves are
+// those of ec.mlx.
+const c = @import("./common.mlx")
+const mpi = @import("./mpi.mlx")
+const sexp = @import("./sexp.mlx")
+const ec = @import("./ec.mlx")
+const md = @import("./md.mlx")
+const hash = @import("std.crypto.hash")
+const ecc = @import("std.crypto.ecc")
+const curve25519 = @import("std.crypto.curve25519")
+
+const ALGO_RSA: u8 = 1
+const ALGO_ECC: u8 = 2
+
+const OP_ENCRYPT: u8 = 1
+const OP_DECRYPT: u8 = 2
+const OP_SIGN: u8 = 3
+const OP_VERIFY: u8 = 4
+
+const ENC_UNKNOWN: u8 = 0
+const ENC_RAW: u8 = 1
+const ENC_PKCS1: u8 = 2
+const ENC_OAEP: u8 = 3
+const ENC_PSS: u8 = 4
+const ENC_PKCS1_RAW: u8 = 5
+
+const FLAG_RAW: u32 = 1
+const FLAG_EDDSA: u32 = 2
+const FLAG_PREHASH: u32 = 4
+const FLAG_RFC6979: u32 = 8
+const FLAG_FIXEDLEN: u32 = 16
+const FLAG_LEGACYRESULT: u32 = 32
+const FLAG_DJB_TWEAK: u32 = 64
+const FLAG_PARAM: u32 = 128
+
+// ---------------------------------------------------------------------------
+// Building results.
+
+fn open(g: *sexp.Growing, name: []const u8) -> void {
+    sexp.pushByte(g, sexp.ST_OPEN)
+    sexp.pushData(g, @intFromPtr(name.pointer), name.length)
+}
+
+fn close(g: *sexp.Growing) -> void { sexp.pushByte(g, sexp.ST_CLOSE) }
+
+fn finish(g: *sexp.Growing) -> usize {
+    sexp.pushByte(g, sexp.ST_STOP)
+    if g.*.failed { return 0 }
+    return g.*.address
+}
+
+// (name bytes)
+fn element(g: *sexp.Growing, name: []const u8, bytes: usize, length: usize) -> void {
+    open(g, name)
+    sexp.pushData(g, bytes, length)
+    close(g)
+}
+
+// (name m), m as %m (1, signed) or %M (5, unsigned) print it; an opaque
+// MPI as its data.
+fn elementMpi(g: *sexp.Growing, name: []const u8, m: usize, format: i32) -> void {
+    const value = mpi.at(m)
+    if value.*.flags & mpi.FLAG_OPAQUE != 0 {
+        element(g, name, value.*.limbs, (value.*.opaqueBits + 7) / 8)
+        return
+    }
+    var size: usize = 0
+    const sized = mpi.print(format, 0, 0, @intFromPtr(&size), value)
+    const buffer = c.alloc(size)
+    const printed = mpi.print(format, buffer, size, @intFromPtr(&size), value)
+    element(g, name, buffer, size)
+    c.wipeRelease(buffer, if size == 0 { 1 } else { size })
+}
+
+// ---------------------------------------------------------------------------
+// Keys.
+
+fn algorithmOfName(name: []const u8) -> u8 {
+    if sameFolded(name, "rsa") || sameFolded(name, "openpgp-rsa") || sameFolded(name, "oid.1.2.840.113549.1.1.1") { return ALGO_RSA }
+    if sameFolded(name, "ecc") || sameFolded(name, "ecdsa") || sameFolded(name, "ecdh") || sameFolded(name, "eddsa") { return ALGO_ECC }
+    return 0
+}
+
+fn sameFolded(text: []const u8, lower: []const u8) -> bool {
+    if text.length != lower.length { return false }
+    var index: usize = 0
+    while index < text.length {
+        var byte = text[index]
+        if byte >= 65 && byte <= 90 { byte += 32 }
+        if byte != lower[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// The algorithm's list of a key ("(rsa (n ...) ...)") into *parms and its
+// algorithm into *algo: a gpg error code. A private key serves where a
+// public one is wanted.
+fn keyParms(key: usize, wantPrivate: bool, algo: *u8, parms: *usize) -> u32 {
+    algo.* = 0
+    parms.* = 0
+    var list = sexp.findName(key, if wantPrivate { "private-key" } else { "public-key" })
+    if list == 0 && !wantPrivate { list = sexp.findName(key, "private-key") }
+    if list == 0 { return c.INV_OBJ }
+    const inner = sexp.nth(list, 1)
+    sexp.release(list)
+    if inner == 0 { return c.INV_OBJ }
+    var length: usize = 0
+    const name = sexp.nthData(inner, 0, &length)
+    if name == 0 {
+        sexp.release(inner)
+        return c.INV_OBJ
+    }
+    algo.* = algorithmOfName(c.slice(name, length))
+    if algo.* == 0 {
+        sexp.release(inner)
+        return c.PUBKEY_ALGO
+    }
+    parms.* = inner
+    return 0
+}
+
+// A parameter of a key's list as an unsigned MPI, or 0.
+fn parameter(parms: usize, name: []const u8) -> usize {
+    const list = sexp.findName(parms, name)
+    if list == 0 { return 0 }
+    const value = sexp.nthMpi(list, 1, 5)
+    sexp.release(list)
+    return value
+}
+
+// The data of a list's element 1, or 0 (with its length).
+fn listData(parms: usize, name: []const u8, length: *usize) -> usize {
+    length.* = 0
+    const list = sexp.findName(parms, name)
+    if list == 0 { return 0 }
+    var size: usize = 0
+    const data = sexp.nthData(list, 1, &size)
+    var copied: usize = 0
+    if data != 0 {
+        copied = c.dupBytes(data, if size == 0 { 1 } else { size })
+        length.* = size
+    }
+    sexp.release(list)
+    return copied
+}
+
+// ---------------------------------------------------------------------------
+// Hashes.
+
+fn hashOfName(data: usize, length: usize) -> i32 { return md.numberOfName(c.slice(data, length)) }
+
+fn digestLength(algo: i32) -> usize {
+    var algorithm = hash.Algorithm.sha1
+    if !md.algorithmOf(algo, &algorithm) { return 0 }
+    return hash.digestLength(algorithm)
+}
+
+fn digestInto(algo: i32, data: usize, length: usize, out: usize) -> void {
+    var algorithm = hash.Algorithm.sha1
+    const known = md.algorithmOf(algo, &algorithm)
+    var hashing: hash.Hash = undefined
+    hash.init(&hashing, algorithm)
+    hash.absorb(&hashing, c.bytes(data), length)
+    hash.finish(&hashing, c.bytes(out))
+}
+
+// out[0..length] ^= MGF1(seed) with the hash.
+fn mgf1Xor(algo: i32, seed: usize, seedLength: usize, out: usize, length: usize) -> void {
+    var algorithm = hash.Algorithm.sha1
+    const known = md.algorithmOf(algo, &algorithm)
+    const size = hash.digestLength(algorithm)
+    var block: [64]u8 = undefined
+    var counter: [4]u8 = undefined
+    var done: usize = 0
+    var count: u32 = 0
+    while done < length {
+        counter[0] = @intCast(u8, (count >> 24) & 255)
+        counter[1] = @intCast(u8, (count >> 16) & 255)
+        counter[2] = @intCast(u8, (count >> 8) & 255)
+        counter[3] = @intCast(u8, count & 255)
+        var hashing: hash.Hash = undefined
+        hash.init(&hashing, algorithm)
+        hash.absorb(&hashing, c.bytes(seed), seedLength)
+        hash.absorb(&hashing, &counter, 4)
+        hash.finish(&hashing, &block)
+        var index: usize = 0
+        while index < size && done < length {
+            c.put8(out + done, c.get8(out + done) ^ block[index])
+            done += 1
+            index += 1
+        }
+        count += 1
+    }
+}
+
+// The DER of DigestInfo before the digest (PKCS #1, 9.2, note 1).
+fn digestInfo(algo: i32) -> []const u8 {
+    if algo == md.MD_SHA1 { return "\x30\x21\x30\x09\x06\x05\x2b\x0e\x03\x02\x1a\x05\x00\x04\x14" }
+    if algo == md.MD_SHA224 { return "\x30\x2d\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x04\x05\x00\x04\x1c" }
+    if algo == md.MD_SHA256 { return "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20" }
+    if algo == md.MD_SHA384 { return "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30" }
+    if algo == md.MD_SHA512 { return "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40" }
+    return ""
+}
+
+// ---------------------------------------------------------------------------
+// Data and their encodings (libgcrypt's _gcry_pk_util_data_to_mpi).
+
+const Encoding = struct {
+    op: u8
+    nbits: usize
+    encoding: u8
+    flags: u32
+    hashAlgo: i32
+    label: usize
+    labelLength: usize
+    saltLength: usize
+    // PSS verification: the hash given, compared after the operation.
+    verifyHash: usize
+    verifyHashLength: usize
+}
+
+fn encodingInit(e: *Encoding, op: u8, nbits: usize) -> void {
+    e.*.op = op
+    e.*.nbits = nbits
+    e.*.encoding = ENC_UNKNOWN
+    e.*.flags = 0
+    e.*.hashAlgo = md.MD_SHA1
+    e.*.label = 0
+    e.*.labelLength = 0
+    e.*.saltLength = 20
+    e.*.verifyHash = 0
+    e.*.verifyHashLength = 0
+}
+
+fn encodingFree(e: *Encoding) -> void {
+    c.release(e.*.label)
+    c.release(e.*.verifyHash)
+}
+
+// The flags of a (flags ...) list: a gpg error code for one not known.
+fn parseFlags(list: usize, flags: *u32, encoding: *u8) -> u32 {
+    var code: u32 = 0
+    var number = sexp.listLength(list) - 1
+    while number > 0 {
+        var length: usize = 0
+        const data = sexp.nthData(list, number, &length)
+        number -= 1
+        if data == 0 { continue }
+        const word = c.slice(data, length)
+        if c.same(word, "pss") && encoding.* == ENC_UNKNOWN {
+            encoding.* = ENC_PSS
+            flags.* = flags.* | FLAG_FIXEDLEN
+        } else if c.same(word, "raw") && encoding.* == ENC_UNKNOWN {
+            encoding.* = ENC_RAW
+            flags.* = flags.* | FLAG_RAW
+        } else if c.same(word, "oaep") && encoding.* == ENC_UNKNOWN {
+            encoding.* = ENC_OAEP
+            flags.* = flags.* | FLAG_FIXEDLEN
+        } else if c.same(word, "eddsa") {
+            encoding.* = ENC_RAW
+            flags.* = flags.* | FLAG_EDDSA | FLAG_DJB_TWEAK
+        } else if c.same(word, "pkcs1") && encoding.* == ENC_UNKNOWN {
+            encoding.* = ENC_PKCS1
+            flags.* = flags.* | FLAG_FIXEDLEN
+        } else if c.same(word, "pkcs1-raw") && encoding.* == ENC_UNKNOWN {
+            encoding.* = ENC_PKCS1_RAW
+            flags.* = flags.* | FLAG_FIXEDLEN
+        } else if c.same(word, "djb-tweak") {
+            encoding.* = ENC_RAW
+            flags.* = flags.* | FLAG_DJB_TWEAK
+        } else if c.same(word, "rfc6979") {
+            flags.* = flags.* | FLAG_RFC6979
+        } else if c.same(word, "prehash") {
+            flags.* = flags.* | FLAG_PREHASH
+        } else if c.same(word, "param") {
+            flags.* = flags.* | FLAG_PARAM
+        } else if c.same(word, "comp") || c.same(word, "nocomp") || c.same(word, "noparam") || c.same(word, "no-blinding") || c.same(word, "transient-key") || c.same(word, "no-keytest") || c.same(word, "use-x931") || c.same(word, "use-fips186") || c.same(word, "use-fips186-2") || c.same(word, "igninvflag") {
+            // Accepted; nothing here depends on them.
+        } else {
+            code = c.INV_FLAG
+        }
+    }
+    return code
+}
+
+// hash-algo and label of the data (or enc-val) list into the encoding.
+fn hashAlgoAndLabel(list: usize, e: *Encoding, labelEmptyIsError: bool) -> u32 {
+    const algoList = sexp.findName(list, "hash-algo")
+    if algoList != 0 {
+        var length: usize = 0
+        const data = sexp.nthData(algoList, 1, &length)
+        var code: u32 = 0
+        if data == 0 {
+            code = c.NO_OBJ
+        } else {
+            e.*.hashAlgo = hashOfName(data, length)
+            if e.*.hashAlgo == 0 { code = c.DIGEST_ALGO }
+        }
+        sexp.release(algoList)
+        if code != 0 { return code }
+    }
+    const labelList = sexp.findName(list, "label")
+    if labelList != 0 {
+        var length: usize = 0
+        const data = sexp.nthData(labelList, 1, &length)
+        var code: u32 = 0
+        if data == 0 {
+            code = c.NO_OBJ
+        } else if length > 0 {
+            e.*.label = c.dupBytes(data, length)
+            e.*.labelLength = length
+        } else if labelEmptyIsError {
+            code = c.INV_ARG
+        }
+        sexp.release(labelList)
+        if code != 0 { return code }
+    }
+    return 0
+}
+
+// (hash algo value): the algorithm into the encoding, the value's bytes
+// (a copy) and length.
+fn hashElement(lhash: usize, e: *Encoding, value: *usize, length: *usize) -> u32 {
+    value.* = 0
+    length.* = 0
+    if sexp.listLength(lhash) != 3 { return c.INV_OBJ }
+    var n: usize = 0
+    const name = sexp.nthData(lhash, 1, &n)
+    if name == 0 || n == 0 { return c.INV_OBJ }
+    e.*.hashAlgo = hashOfName(name, n)
+    if e.*.hashAlgo == 0 { return c.DIGEST_ALGO }
+    var size: usize = 0
+    const data = sexp.nthData(lhash, 2, &size)
+    if data == 0 || size == 0 { return c.INV_OBJ }
+    value.* = c.dupBytes(data, size)
+    length.* = size
+    return 0
+}
+
+// The modulus's length in bytes.
+fn modulusBytes(nbits: usize) -> usize { return (nbits + 7) / 8 }
+
+// PKCS #1 v1.5 signature encoding (EMSA-PKCS1-v1_5): a new MPI.
+fn encodePkcs1Signature(e: *Encoding, digest: usize, length: usize, out: *usize) -> u32 {
+    const k = modulusBytes(e.*.nbits)
+    const prefix = digestInfo(e.*.hashAlgo)
+    if prefix.length == 0 { return c.DIGEST_ALGO }
+    if length != digestLength(e.*.hashAlgo) { return c.INV_LENGTH }
+    const t = prefix.length + length
+    if k < t + 11 { return c.TOO_SHORT }
+    const em = c.alloc(k)
+    c.put8(em + 1, 1)
+    var index: usize = 2
+    while index < k - t - 1 {
+        c.put8(em + index, 255)
+        index += 1
+    }
+    c.copy(em + k - t, @intFromPtr(prefix.pointer), prefix.length)
+    c.copy(em + k - length, digest, length)
+    out.* = mpi.fromUnsigned(c.bytes(em), k)
+    c.wipeRelease(em, k)
+    return 0
+}
+
+// PKCS #1 v1.5 encryption padding (EME-PKCS1-v1_5).
+fn encodePkcs1Encryption(e: *Encoding, value: usize, length: usize, out: *usize) -> u32 {
+    const k = modulusBytes(e.*.nbits)
+    if length + 11 > k { return c.TOO_SHORT }
+    const em = c.alloc(k)
+    c.put8(em + 1, 2)
+    var index: usize = 2
+    while index < k - length - 1 {
+        var byte: u8 = 0
+        while byte == 0 {
+            c.fill(em + index, 1)
+            byte = c.get8(em + index)
+        }
+        index += 1
+    }
+    c.copy(em + k - length, value, length)
+    out.* = mpi.fromUnsigned(c.bytes(em), k)
+    c.wipeRelease(em, k)
+    return 0
+}
+
+// OAEP (RFC 8017, 7.1.1): 00 | masked seed | masked DB.
+fn encodeOaep(e: *Encoding, value: usize, length: usize, out: *usize) -> u32 {
+    const k = modulusBytes(e.*.nbits)
+    const h = digestLength(e.*.hashAlgo)
+    if h == 0 { return c.DIGEST_ALGO }
+    if k < 2 * h + 2 || length > k - 2 * h - 2 { return c.TOO_SHORT }
+    const em = c.alloc(k)
+    const seed = em + 1
+    const db = em + 1 + h
+    const dbLength = k - h - 1
+    digestInto(e.*.hashAlgo, if e.*.label != 0 { e.*.label } else { em }, e.*.labelLength, db)
+    c.put8(db + dbLength - length - 1, 1)
+    c.copy(db + dbLength - length, value, length)
+    c.fill(seed, h)
+    mgf1Xor(e.*.hashAlgo, seed, h, db, dbLength)
+    mgf1Xor(e.*.hashAlgo, db, dbLength, seed, h)
+    out.* = mpi.fromUnsigned(c.bytes(em), k)
+    c.wipeRelease(em, k)
+    return 0
+}
+
+// OAEP decoding of the private operation's result: the message (a copy)
+// and its length, GPG_ERR_ENCODING_PROBLEM for anything malformed.
+fn decodeOaep(e: *Encoding, plain: usize, out: *usize, outLength: *usize) -> u32 {
+    const k = modulusBytes(e.*.nbits)
+    const h = digestLength(e.*.hashAlgo)
+    if h == 0 { return c.DIGEST_ALGO }
+    if k < 2 * h + 2 { return c.ENCODING_PROBLEM }
+    const value = mpi.at(plain)
+    if mpi.byteCount(value) > k { return c.ENCODING_PROBLEM }
+    const em = c.alloc(k)
+    mpi.toBytes(value, c.bytes(em), k)
+    const seed = em + 1
+    const db = em + 1 + h
+    const dbLength = k - h - 1
+    mgf1Xor(e.*.hashAlgo, db, dbLength, seed, h)
+    mgf1Xor(e.*.hashAlgo, seed, h, db, dbLength)
+    var expected: [64]u8 = undefined
+    digestInto(e.*.hashAlgo, if e.*.label != 0 { e.*.label } else { em }, e.*.labelLength, @intFromPtr(&expected))
+    var bad: u32 = @intCast(u32, c.get8(em))
+    var index: usize = 0
+    while index < h {
+        bad = bad | @intCast(u32, c.get8(db + index) ^ expected[index])
+        index += 1
+    }
+    // The 01 after the zeroes.
+    var at = h
+    while at < dbLength && c.get8(db + at) == 0 { at += 1 }
+    if at >= dbLength || c.get8(db + at) != 1 { bad = 1 }
+    var code: u32 = 0
+    if bad != 0 {
+        code = c.ENCODING_PROBLEM
+    } else {
+        const length = dbLength - at - 1
+        out.* = c.dupBytes(db + at + 1, if length == 0 { 1 } else { length })
+        outLength.* = length
+    }
+    c.wipeRelease(em, k)
+    return code
+}
+
+// PKCS #1 v1.5 encryption padding undone.
+fn decodePkcs1Encryption(e: *Encoding, plain: usize, out: *usize, outLength: *usize) -> u32 {
+    const k = modulusBytes(e.*.nbits)
+    const value = mpi.at(plain)
+    if mpi.byteCount(value) > k { return c.ENCODING_PROBLEM }
+    const em = c.alloc(k)
+    mpi.toBytes(value, c.bytes(em), k)
+    var code: u32 = 0
+    var at: usize = 2
+    while at < k && c.get8(em + at) != 0 { at += 1 }
+    if c.get8(em) != 0 || c.get8(em + 1) != 2 || at >= k || at < 10 {
+        code = c.ENCODING_PROBLEM
+    } else {
+        const length = k - at - 1
+        out.* = c.dupBytes(em + at + 1, if length == 0 { 1 } else { length })
+        outLength.* = length
+    }
+    c.wipeRelease(em, k)
+    return code
+}
+
+// PSS (RFC 8017, 9.1.1) of a digest, emBits = nbits - 1.
+fn encodePss(e: *Encoding, digest: usize, length: usize, out: *usize) -> u32 {
+    const emBits = e.*.nbits - 1
+    const emLength = (emBits + 7) / 8
+    const h = digestLength(e.*.hashAlgo)
+    if h == 0 { return c.DIGEST_ALGO }
+    if length != h { return c.INV_LENGTH }
+    const salt = e.*.saltLength
+    if emLength < h + salt + 2 { return c.TOO_SHORT }
+    // H = Hash(8 zeroes | mHash | salt)
+    const scratch = c.alloc(8 + h + salt)
+    c.copy(scratch + 8, digest, h)
+    c.fill(scratch + 8 + h, salt)
+    const em = c.alloc(emLength)
+    const dbLength = emLength - h - 1
+    const hashAt = em + dbLength
+    digestInto(e.*.hashAlgo, scratch, 8 + h + salt, hashAt)
+    c.put8(em + dbLength - salt - 1, 1)
+    c.copy(em + dbLength - salt, scratch + 8 + h, salt)
+    mgf1Xor(e.*.hashAlgo, hashAt, h, em, dbLength)
+    const spare = 8 * emLength - emBits
+    c.put8(em, c.get8(em) & @intCast(u8, (@intCast(u32, 255) >> @intCast(u32, spare)) & 255))
+    c.put8(em + emLength - 1, 188)
+    out.* = mpi.fromUnsigned(c.bytes(em), emLength)
+    c.wipeRelease(scratch, 8 + h + salt)
+    c.wipeRelease(em, emLength)
+    return 0
+}
+
+// PSS verification of the public operation's result against the digest.
+fn verifyPss(e: *Encoding, result: usize) -> u32 {
+    const emBits = e.*.nbits - 1
+    const emLength = (emBits + 7) / 8
+    const h = digestLength(e.*.hashAlgo)
+    if h == 0 { return c.DIGEST_ALGO }
+    if e.*.verifyHashLength != h { return c.INV_LENGTH }
+    const salt = e.*.saltLength
+    const value = mpi.at(result)
+    if mpi.byteCount(value) > emLength { return c.BAD_SIGNATURE }
+    if emLength < h + salt + 2 { return c.TOO_SHORT }
+    const em = c.alloc(emLength)
+    mpi.toBytes(value, c.bytes(em), emLength)
+    var code: u32 = 0
+    const dbLength = emLength - h - 1
+    const hashAt = em + dbLength
+    const spare = 8 * emLength - emBits
+    if c.get8(em + emLength - 1) != 188 { code = c.BAD_SIGNATURE }
+    if code == 0 && (@intCast(u32, c.get8(em)) >> @intCast(u32, 8 - spare)) != 0 { code = c.BAD_SIGNATURE }
+    if code == 0 {
+        mgf1Xor(e.*.hashAlgo, hashAt, h, em, dbLength)
+        c.put8(em, c.get8(em) & @intCast(u8, (@intCast(u32, 255) >> @intCast(u32, spare)) & 255))
+        var index: usize = 0
+        while index < dbLength - salt - 1 {
+            if c.get8(em + index) != 0 { code = c.BAD_SIGNATURE }
+            index += 1
+        }
+        if c.get8(em + dbLength - salt - 1) != 1 { code = c.BAD_SIGNATURE }
+    }
+    if code == 0 {
+        const scratch = c.alloc(8 + h + salt)
+        c.copy(scratch + 8, e.*.verifyHash, h)
+        c.copy(scratch + 8 + h, em + dbLength - salt, salt)
+        var computed: [64]u8 = undefined
+        digestInto(e.*.hashAlgo, scratch, 8 + h + salt, @intFromPtr(&computed))
+        if !hash.equal(&computed, c.bytes(hashAt), h) { code = c.BAD_SIGNATURE }
+        c.wipeRelease(scratch, 8 + h + salt)
+    }
+    c.wipeRelease(em, emLength)
+    return code
+}
+
+// The data S-expression as the number to work on (into *out): a gpg error
+// code. An opaque *out carries a hash, an EdDSA message or PSS's digest.
+fn dataToMpi(input: usize, e: *Encoding, out: *usize) -> u32 {
+    out.* = 0
+    const ldata = sexp.findName(input, "data")
+    if ldata == 0 {
+        // The old style: the S-expression is the number.
+        out.* = sexp.nthMpi(input, 0, if e.*.flags & FLAG_RAW != 0 { 8 } else { 1 })
+        return if out.* != 0 { 0 } else { c.INV_OBJ }
+    }
+    var parsed: u32 = 0
+    var unknownFlag = false
+    const lflags = sexp.findName(ldata, "flags")
+    if lflags != 0 {
+        if parseFlags(lflags, &parsed, &e.*.encoding) != 0 { unknownFlag = true }
+        sexp.release(lflags)
+    }
+    if e.*.encoding == ENC_UNKNOWN { e.*.encoding = ENC_RAW }
+    const lhash = sexp.findName(ldata, "hash")
+    const lvalue = if lhash != 0 { 0 } else { sexp.findName(ldata, "value") }
+    var code: u32 = 0
+    var value: usize = 0
+    var length: usize = 0
+    if (lhash == 0) == (lvalue == 0) {
+        code = c.INV_OBJ
+    } else if unknownFlag {
+        code = c.INV_FLAG
+    } else if e.*.encoding == ENC_RAW && (parsed & FLAG_EDDSA != 0 || e.*.flags & FLAG_EDDSA != 0) {
+        // EdDSA: the message as it is.
+        if lvalue == 0 {
+            code = c.INV_OBJ
+        } else {
+            code = hashAlgoAndLabel(ldata, e, false)
+            if code == 0 {
+                var size: usize = 0
+                const data = sexp.nthData(lvalue, 1, &size)
+                const copied = c.alloc(if size == 0 { 1 } else { size })
+                if data != 0 && size > 0 { c.copy(copied, data, size) }
+                out.* = mpi.setOpaque(mpi.create(1), copied, @intCast(u32, (size * 8) & 4294967295))
+            }
+        }
+    } else if e.*.encoding == ENC_RAW && lhash != 0 && (parsed & FLAG_RAW != 0 || parsed & FLAG_RFC6979 != 0) {
+        // A hash for DSA's kind: its bytes, opaque.
+        code = hashAlgoAndLabel(ldata, e, true)
+        if code == 0 { code = hashElement(lhash, e, &value, &length) }
+        if code == 0 { out.* = mpi.setOpaque(mpi.create(1), value, @intCast(u32, (length * 8) & 4294967295)) }
+        value = 0
+    } else if e.*.encoding == ENC_RAW && lvalue != 0 {
+        if parsed & FLAG_RFC6979 != 0 {
+            code = c.CONFLICT
+        } else {
+            out.* = sexp.nthMpi(lvalue, 1, 5)
+            if out.* == 0 { code = c.INV_OBJ }
+        }
+    } else if e.*.encoding == ENC_PKCS1 && lvalue != 0 && e.*.op == OP_ENCRYPT {
+        var size: usize = 0
+        const data = sexp.nthData(lvalue, 1, &size)
+        if data == 0 || size == 0 {
+            code = c.INV_OBJ
+        } else {
+            code = encodePkcs1Encryption(e, data, size, out)
+        }
+    } else if e.*.encoding == ENC_PKCS1 && lhash != 0 && (e.*.op == OP_SIGN || e.*.op == OP_VERIFY) {
+        code = hashElement(lhash, e, &value, &length)
+        if code == 0 { code = encodePkcs1Signature(e, value, length, out) }
+    } else if e.*.encoding == ENC_OAEP && lvalue != 0 && e.*.op == OP_ENCRYPT {
+        var size: usize = 0
+        const data = sexp.nthData(lvalue, 1, &size)
+        if data == 0 || size == 0 {
+            code = c.INV_OBJ
+        } else {
+            code = hashAlgoAndLabel(ldata, e, false)
+            if code == 0 { code = encodeOaep(e, data, size, out) }
+        }
+    } else if e.*.encoding == ENC_PSS && (e.*.op == OP_SIGN || e.*.op == OP_VERIFY) {
+        if lhash != 0 {
+            code = hashElement(lhash, e, &value, &length)
+        } else {
+            code = c.CONFLICT
+        }
+        if code == 0 {
+            const saltList = sexp.findName(ldata, "salt-length")
+            if saltList != 0 {
+                const text = sexp.nthString(saltList, 1)
+                sexp.release(saltList)
+                if text == 0 {
+                    code = c.NO_OBJ
+                } else {
+                    e.*.saltLength = parseDecimal(text)
+                    c.release(text)
+                    if e.*.op == OP_VERIFY && e.*.saltLength > 16384 { code = c.TOO_LARGE }
+                }
+            }
+        }
+        if code == 0 {
+            if e.*.op == OP_SIGN {
+                code = encodePss(e, value, length, out)
+            } else {
+                e.*.verifyHash = value
+                e.*.verifyHashLength = length
+                out.* = mpi.setOpaque(mpi.create(1), c.dupBytes(value, length), @intCast(u32, (length * 8) & 4294967295))
+                value = 0
+            }
+        }
+    } else {
+        code = c.CONFLICT
+    }
+    if value != 0 { c.wipeRelease(value, if length == 0 { 1 } else { length }) }
+    sexp.release(ldata)
+    sexp.release(lhash)
+    sexp.release(lvalue)
+    if code == 0 { e.*.flags = e.*.flags | parsed }
+    return code
+}
+
+fn parseDecimal(text: usize) -> usize {
+    var value: usize = 0
+    var p = text
+    while c.get8(p) >= 48 && c.get8(p) <= 57 {
+        value = value *% 10 +% @intCast(usize, c.get8(p) - 48)
+        p += 1
+    }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// RSA.
+
+const RsaKey = struct {
+    n: usize
+    e: usize
+    d: usize
+    p: usize
+    q: usize
+    u: usize
+}
+
+fn rsaFree(key: *RsaKey) -> void {
+    mpi.destroy(key.*.n)
+    mpi.destroy(key.*.e)
+    mpi.destroy(key.*.d)
+    mpi.destroy(key.*.p)
+    mpi.destroy(key.*.q)
+    mpi.destroy(key.*.u)
+}
+
+fn rsaLoad(parms: usize, key: *RsaKey, private: bool) -> u32 {
+    key.*.n = parameter(parms, "n")
+    key.*.e = parameter(parms, "e")
+    key.*.d = 0
+    key.*.p = 0
+    key.*.q = 0
+    key.*.u = 0
+    if private {
+        key.*.d = parameter(parms, "d")
+        key.*.p = parameter(parms, "p")
+        key.*.q = parameter(parms, "q")
+        key.*.u = parameter(parms, "u")
+    }
+    if key.*.n == 0 || key.*.e == 0 || (private && key.*.d == 0) {
+        rsaFree(key)
+        return c.NO_OBJ
+    }
+    return 0
+}
+
+fn rsaBits(parms: usize) -> usize {
+    const n = parameter(parms, "n")
+    if n == 0 { return 0 }
+    const bits = mpi.bitCount(mpi.at(n))
+    mpi.destroy(n)
+    return bits
+}
+
+// out = input^e mod n (e is public).
+fn rsaPublic(key: *RsaKey, out: usize, input: usize) -> void {
+    mpi.powmPublic(mpi.at(out), mpi.at(input), mpi.at(key.*.e), mpi.at(key.*.n))
+}
+
+// out = input^d mod n, by the CRT when the key has p, q and u (m1 =
+// c^(d mod (p-1)) mod p, m2 = c^(d mod (q-1)) mod q, h = u (m2 - m1)
+// mod q, m = m1 + h p).
+fn rsaSecret(key: *RsaKey, out: usize, input: usize) -> void {
+    if key.*.p == 0 || key.*.q == 0 || key.*.u == 0 {
+        mpi.powm(mpi.at(out), mpi.at(input), mpi.at(key.*.d), mpi.at(key.*.n))
+        return
+    }
+    const m1 = mpi.create(1)
+    const m2 = mpi.create(1)
+    const h = mpi.create(1)
+    const exponent = mpi.create(1)
+    mpi.addSmall(mpi.at(h), mpi.at(key.*.p), 1, true)
+    mpi.mod(mpi.at(exponent), mpi.at(key.*.d), mpi.at(h))
+    mpi.powm(mpi.at(m1), mpi.at(input), mpi.at(exponent), mpi.at(key.*.p))
+    mpi.addSmall(mpi.at(h), mpi.at(key.*.q), 1, true)
+    mpi.mod(mpi.at(exponent), mpi.at(key.*.d), mpi.at(h))
+    mpi.powm(mpi.at(m2), mpi.at(input), mpi.at(exponent), mpi.at(key.*.q))
+    mpi.sub(mpi.at(h), mpi.at(m2), mpi.at(m1))
+    if mpi.at(h).*.negative { mpi.add(mpi.at(h), mpi.at(h), mpi.at(key.*.q)) }
+    mpi.mul(mpi.at(h), mpi.at(key.*.u), mpi.at(h))
+    mpi.mod(mpi.at(h), mpi.at(h), mpi.at(key.*.q))
+    mpi.mul(mpi.at(h), mpi.at(h), mpi.at(key.*.p))
+    mpi.add(mpi.at(out), mpi.at(m1), mpi.at(h))
+    mpi.destroy(m1)
+    mpi.destroy(m2)
+    mpi.destroy(h)
+    mpi.destroy(exponent)
+}
+
+// (name bytes) of a number as `length` big-endian bytes.
+fn elementFixed(g: *sexp.Growing, name: []const u8, m: usize, length: usize) -> void {
+    const buffer = c.alloc(length)
+    mpi.toBytes(mpi.at(m), c.bytes(buffer), length)
+    element(g, name, buffer, length)
+    c.wipeRelease(buffer, if length == 0 { 1 } else { length })
+}
+
+fn rsaSign(result: usize, data: usize, parms: usize) -> u32 {
+    var key: RsaKey = undefined
+    const nbits = rsaBits(parms)
+    var e: Encoding = undefined
+    encodingInit(&e, OP_SIGN, nbits)
+    var input: usize = 0
+    var code = dataToMpi(data, &e, &input)
+    if code == 0 && mpi.at(input).*.flags & mpi.FLAG_OPAQUE != 0 { code = c.INV_DATA }
+    if code == 0 { code = rsaLoad(parms, &key, true) }
+    if code != 0 {
+        mpi.destroy(input)
+        encodingFree(&e)
+        return code
+    }
+    const signature = mpi.create(1)
+    const check = mpi.create(1)
+    rsaSecret(&key, signature, input)
+    // The CRT's result checked (Lenstra's attack): e undoes it.
+    rsaPublic(&key, check, signature)
+    if mpi.compare(mpi.at(check), mpi.at(input)) != 0 {
+        code = c.BAD_SIGNATURE
+    } else {
+        var g: sexp.Growing = undefined
+        sexp.growingInit(&g, 64 + nbits / 8)
+        open(&g, "sig-val")
+        open(&g, "rsa")
+        if e.flags & FLAG_FIXEDLEN != 0 {
+            elementFixed(&g, "s", signature, modulusBytes(mpi.bitCount(mpi.at(key.n))))
+        } else {
+            elementMpi(&g, "s", signature, 5)
+        }
+        close(&g)
+        close(&g)
+        c.putWord(result, finish(&g))
+    }
+    mpi.destroy(signature)
+    mpi.destroy(check)
+    mpi.destroy(input)
+    rsaFree(&key)
+    encodingFree(&e)
+    return code
+}
+
+// The parameters list of (sig-val (algo ...)) or (sig-val (flags ...)
+// (algo ...)), checked against the algorithm; *eddsa set for "eddsa".
+fn sigvalParms(sigval: usize, algo: u8, out: *usize, eddsa: *bool) -> u32 {
+    out.* = 0
+    eddsa.* = false
+    const l1 = sexp.findName(sigval, "sig-val")
+    if l1 == 0 { return c.INV_OBJ }
+    var l2 = sexp.nth(l1, 1)
+    if l2 == 0 {
+        sexp.release(l1)
+        return c.NO_OBJ
+    }
+    var length: usize = 0
+    var name = sexp.nthData(l2, 0, &length)
+    if name != 0 && c.same(c.slice(name, length), "flags") {
+        sexp.release(l2)
+        l2 = sexp.nth(l1, 2)
+        name = if l2 != 0 { sexp.nthData(l2, 0, &length) } else { 0 }
+    }
+    sexp.release(l1)
+    if name == 0 {
+        sexp.release(l2)
+        return c.INV_OBJ
+    }
+    const kind = algorithmOfName(c.slice(name, length))
+    if kind != algo {
+        sexp.release(l2)
+        return c.CONFLICT
+    }
+    eddsa.* = c.same(c.slice(name, length), "eddsa")
+    out.* = l2
+    return 0
+}
+
+fn rsaVerify(sigval: usize, data: usize, parms: usize) -> u32 {
+    const nbits = rsaBits(parms)
+    var e: Encoding = undefined
+    encodingInit(&e, OP_VERIFY, nbits)
+    var input: usize = 0
+    var code = dataToMpi(data, &e, &input)
+    if code == 0 && e.encoding != ENC_PSS && mpi.at(input).*.flags & mpi.FLAG_OPAQUE != 0 { code = c.INV_DATA }
+    var l1: usize = 0
+    var eddsa = false
+    if code == 0 { code = sigvalParms(sigval, ALGO_RSA, &l1, &eddsa) }
+    var signature: usize = 0
+    if code == 0 {
+        signature = parameter(l1, "s")
+        if signature == 0 { code = c.NO_OBJ }
+    }
+    var key: RsaKey = undefined
+    var loaded = false
+    if code == 0 {
+        code = rsaLoad(parms, &key, false)
+        loaded = code == 0
+    }
+    if code == 0 {
+        const result = mpi.create(1)
+        rsaPublic(&key, result, signature)
+        if e.encoding == ENC_PSS {
+            code = verifyPss(&e, result)
+        } else if mpi.compare(mpi.at(result), mpi.at(input)) != 0 {
+            code = c.BAD_SIGNATURE
+        }
+        mpi.destroy(result)
+    }
+    if loaded { rsaFree(&key) }
+    mpi.destroy(signature)
+    mpi.destroy(input)
+    sexp.release(l1)
+    encodingFree(&e)
+    return code
+}
+
+fn rsaEncrypt(result: usize, data: usize, parms: usize) -> u32 {
+    const nbits = rsaBits(parms)
+    var e: Encoding = undefined
+    encodingInit(&e, OP_ENCRYPT, nbits)
+    var input: usize = 0
+    var code = dataToMpi(data, &e, &input)
+    if code == 0 && (input == 0 || mpi.at(input).*.flags & mpi.FLAG_OPAQUE != 0) { code = c.INV_DATA }
+    var key: RsaKey = undefined
+    if code == 0 { code = rsaLoad(parms, &key, false) }
+    if code != 0 {
+        mpi.destroy(input)
+        encodingFree(&e)
+        return code
+    }
+    const cipher = mpi.create(1)
+    rsaPublic(&key, cipher, input)
+    var g: sexp.Growing = undefined
+    sexp.growingInit(&g, 64 + nbits / 8)
+    open(&g, "enc-val")
+    open(&g, "rsa")
+    if e.flags & FLAG_FIXEDLEN != 0 {
+        elementFixed(&g, "a", cipher, modulusBytes(mpi.bitCount(mpi.at(key.n))))
+    } else {
+        elementMpi(&g, "a", cipher, 1)
+    }
+    close(&g)
+    close(&g)
+    c.putWord(result, finish(&g))
+    mpi.destroy(cipher)
+    mpi.destroy(input)
+    rsaFree(&key)
+    encodingFree(&e)
+    return 0
+}
+
+// (enc-val [(flags ...)] [(hash-algo ...)] [(label ...)] (rsa (a ...))):
+// the algorithm's list into *out, the encoding's parameters into e.
+fn encvalParms(data: usize, e: *Encoding, out: *usize) -> u32 {
+    out.* = 0
+    const l1 = sexp.findName(data, "enc-val")
+    if l1 == 0 { return c.INV_OBJ }
+    var l2 = sexp.nth(l1, 1)
+    if l2 == 0 {
+        sexp.release(l1)
+        return c.NO_OBJ
+    }
+    var length: usize = 0
+    var name = sexp.nthData(l2, 0, &length)
+    if name == 0 {
+        sexp.release(l1)
+        sexp.release(l2)
+        return c.INV_OBJ
+    }
+    var parsed: u32 = 0
+    if c.same(c.slice(name, length), "flags") {
+        var code = parseFlags(l2, &parsed, &e.*.encoding)
+        if code == 0 && e.*.encoding == ENC_PSS { code = c.CONFLICT }
+        if code == 0 && e.*.encoding == ENC_OAEP { code = hashAlgoAndLabel(l1, e, false) }
+        if code != 0 {
+            sexp.release(l1)
+            sexp.release(l2)
+            return code
+        }
+        // The algorithm's list: the next one not hash-algo, label or
+        // random-override.
+        var number: i32 = 2
+        while true {
+            sexp.release(l2)
+            l2 = sexp.nth(l1, number)
+            if l2 == 0 { break }
+            name = sexp.nthData(l2, 0, &length)
+            if name == 0 { break }
+            const word = c.slice(name, length)
+            if !c.same(word, "hash-algo") && !c.same(word, "label") && !c.same(word, "random-override") { break }
+            number += 1
+        }
+        if l2 == 0 {
+            sexp.release(l1)
+            return c.NO_OBJ
+        }
+        if name == 0 {
+            sexp.release(l1)
+            sexp.release(l2)
+            return c.INV_OBJ
+        }
+    } else {
+        parsed = parsed | FLAG_LEGACYRESULT
+    }
+    sexp.release(l1)
+    if algorithmOfName(c.slice(name, length)) != ALGO_RSA {
+        sexp.release(l2)
+        return c.CONFLICT
+    }
+    e.*.flags = e.*.flags | parsed
+    out.* = l2
+    return 0
+}
+
+fn rsaDecrypt(result: usize, data: usize, parms: usize) -> u32 {
+    const nbits = rsaBits(parms)
+    var e: Encoding = undefined
+    encodingInit(&e, OP_DECRYPT, nbits)
+    var l1: usize = 0
+    var code = encvalParms(data, &e, &l1)
+    var input: usize = 0
+    if code == 0 {
+        input = parameter(l1, "a")
+        if input == 0 { code = c.NO_OBJ }
+    }
+    var key: RsaKey = undefined
+    var loaded = false
+    if code == 0 {
+        code = rsaLoad(parms, &key, true)
+        loaded = code == 0
+    }
+    if code == 0 {
+        mpi.mod(mpi.at(input), mpi.at(input), mpi.at(key.n))
+        const plain = mpi.create(1)
+        rsaSecret(&key, plain, input)
+        var g: sexp.Growing = undefined
+        sexp.growingInit(&g, 64 + nbits / 8)
+        if e.encoding == ENC_OAEP || e.encoding == ENC_PKCS1 {
+            var message: usize = 0
+            var length: usize = 0
+            code = if e.encoding == ENC_OAEP { decodeOaep(&e, plain, &message, &length) } else { decodePkcs1Encryption(&e, plain, &message, &length) }
+            if code == 0 {
+                element(&g, "value", message, length)
+                c.putWord(result, finish(&g))
+                c.wipeRelease(message, if length == 0 { 1 } else { length })
+            } else {
+                c.release(g.address)
+            }
+        } else if e.flags & FLAG_LEGACYRESULT != 0 {
+            // The bare number, as libgcrypt's legacy result.
+            var size: usize = 0
+            const sized = mpi.print(1, 0, 0, @intFromPtr(&size), mpi.at(plain))
+            const buffer = c.alloc(size)
+            const printed = mpi.print(1, buffer, size, @intFromPtr(&size), mpi.at(plain))
+            sexp.pushData(&g, buffer, size)
+            c.wipeRelease(buffer, if size == 0 { 1 } else { size })
+            c.putWord(result, finish(&g))
+        } else {
+            elementMpi(&g, "value", plain, 1)
+            c.putWord(result, finish(&g))
+        }
+        mpi.destroy(plain)
+    }
+    if loaded { rsaFree(&key) }
+    mpi.destroy(input)
+    sexp.release(l1)
+    encodingFree(&e)
+    return code
+}
+
+// ---------------------------------------------------------------------------
+// RSA keys.
+
+var smallPrimes: usize = 0
+var smallPrimeCount: usize = 0
+
+// The odd primes below 4096, sieved once.
+fn primes() -> [*]u32 {
+    if smallPrimes == 0 {
+        const limit: usize = 4096
+        const sieve = c.alloc(limit)
+        const list = c.alloc(limit * 4)
+        var count: usize = 0
+        var candidate: usize = 3
+        while candidate < limit {
+            if c.get8(sieve + candidate) == 0 {
+                c.put32(list + count * 4, @intCast(u32, candidate))
+                count += 1
+                var multiple = candidate * candidate
+                while multiple < limit {
+                    c.put8(sieve + multiple, 1)
+                    multiple += candidate
+                }
+            }
+            candidate += 2
+        }
+        c.release(sieve)
+        smallPrimeCount = count
+        smallPrimes = list
+    }
+    unsafe { return @ptrFromInt([*]u32, smallPrimes) }
+}
+
+// Miller-Rabin with `rounds` random bases, after trial division (which
+// a sieved candidate has had).
+fn probablyPrime(candidate: usize, rounds: usize, sieved: bool) -> bool {
+    const n = mpi.at(candidate)
+    const table = primes()
+    var index: usize = 0
+    while index < smallPrimeCount && !sieved {
+        const p = @intCast(u64, table[index])
+        if mpi.remainderSmall(n, p) == 0 { return mpi.compareSmall(n, p) == 0 }
+        index += 1
+    }
+    const minusOne = mpi.create(1)
+    mpi.addSmall(mpi.at(minusOne), n, 1, true)
+    // n - 1 = 2^s r, r odd.
+    var s: usize = 0
+    while !mpi.testBit(mpi.at(minusOne), s) { s += 1 }
+    const r = mpi.create(1)
+    mpi.shiftRight(mpi.at(r), mpi.at(minusOne), s)
+    const base = mpi.create(1)
+    const x = mpi.create(1)
+    const bytes = mpi.byteCount(n)
+    const scratch = c.alloc(bytes)
+    var prime = true
+    var round: usize = 0
+    while round < rounds && prime {
+        // A base in [2, n - 2].
+        c.fill(scratch, bytes)
+        mpi.fromBytes(mpi.at(base), c.bytes(scratch), bytes)
+        mpi.mod(mpi.at(base), mpi.at(base), mpi.at(minusOne))
+        if mpi.compareSmall(mpi.at(base), 2) < 0 { mpi.setU64(mpi.at(base), 2) }
+        mpi.powmPublic(mpi.at(x), mpi.at(base), mpi.at(r), n)
+        if mpi.compareSmall(mpi.at(x), 1) != 0 && mpi.compare(mpi.at(x), mpi.at(minusOne)) != 0 {
+            var witness = true
+            var step: usize = 1
+            while step < s {
+                mpi.mul(mpi.at(x), mpi.at(x), mpi.at(x))
+                mpi.mod(mpi.at(x), mpi.at(x), n)
+                if mpi.compare(mpi.at(x), mpi.at(minusOne)) == 0 {
+                    witness = false
+                    break
+                }
+                step += 1
+            }
+            if witness { prime = false }
+        }
+        round += 1
+    }
+    c.wipeRelease(scratch, if bytes == 0 { 1 } else { bytes })
+    mpi.destroy(minusOne)
+    mpi.destroy(r)
+    mpi.destroy(base)
+    mpi.destroy(x)
+    return prime
+}
+
+// A random prime of exactly `bits` bits (its top two set, so that two of
+// them make a modulus of twice the bits) with gcd(p - 1, e) = 1: from a
+// random odd start, the next number no small prime divides (the
+// remainders of the start worked out once, then stepped by two), then
+// Miller-Rabin.
+fn generatePrime(bits: usize, e: usize) -> usize {
+    const table = primes()
+    const bytes = (bits + 7) / 8
+    const scratch = c.alloc(bytes)
+    const residues = c.alloc(smallPrimeCount * 8)
+    const remainders: [*]u64 = unsafe { @ptrFromInt([*]u64, residues) }
+    const start = mpi.create(bytes / 8 + 1)
+    const candidate = mpi.create(bytes / 8 + 1)
+    const minusOne = mpi.create(1)
+    const g = mpi.create(1)
+    var found = false
+    while !found {
+        c.fill(scratch, bytes)
+        mpi.fromBytes(mpi.at(start), c.bytes(scratch), bytes)
+        mpi.clearHigh(mpi.at(start), bits)
+        mpi.setBit(mpi.at(start), bits - 1)
+        mpi.setBit(mpi.at(start), bits - 2)
+        mpi.setBit(mpi.at(start), 0)
+        var index: usize = 0
+        while index < smallPrimeCount {
+            remainders[index] = mpi.remainderSmall(mpi.at(start), @intCast(u64, table[index]))
+            index += 1
+        }
+        var delta: u64 = 0
+        while delta < 1048576 && !found {
+            var divisible = false
+            index = 0
+            while index < smallPrimeCount {
+                if (remainders[index] + delta) % @intCast(u64, table[index]) == 0 {
+                    divisible = true
+                    break
+                }
+                index += 1
+            }
+            if !divisible {
+                mpi.addSmall(mpi.at(candidate), mpi.at(start), delta, false)
+                mpi.addSmall(mpi.at(minusOne), mpi.at(candidate), 1, true)
+                if mpi.bitCount(mpi.at(candidate)) == bits && mpi.gcd(mpi.at(g), mpi.at(minusOne), mpi.at(e)) && probablyPrime(candidate, 5, true) { found = true }
+            }
+            delta += 2
+        }
+    }
+    c.wipeRelease(scratch, bytes)
+    c.wipeRelease(residues, smallPrimeCount * 8)
+    mpi.destroy(start)
+    mpi.destroy(minusOne)
+    mpi.destroy(g)
+    return candidate
+}
+
+fn numberOf(parms: usize, name: []const u8, fallback: u64, out: *u64) -> u32 {
+    out.* = fallback
+    const list = sexp.findName(parms, name)
+    if list == 0 { return 0 }
+    const text = sexp.nthString(list, 1)
+    sexp.release(list)
+    if text == 0 { return c.INV_OBJ }
+    // strtoul with base 0: 0x for hex.
+    var value: u64 = 0
+    var p = text
+    if c.get8(p) == 48 && (c.get8(p + 1) == 120 || c.get8(p + 1) == 88) {
+        p += 2
+        while true {
+            const byte = c.get8(p)
+            var digit: u64 = 16
+            if byte >= 48 && byte <= 57 { digit = @intCast(u64, byte - 48) }
+            if byte >= 97 && byte <= 102 { digit = @intCast(u64, byte - 87) }
+            if byte >= 65 && byte <= 70 { digit = @intCast(u64, byte - 55) }
+            if digit == 16 { break }
+            value = value *% 16 +% digit
+            p += 1
+        }
+    } else {
+        value = @intCast(u64, parseDecimal(text))
+    }
+    c.release(text)
+    out.* = value
+    return 0
+}
+
+fn rsaGenerate(parms: usize, result: usize) -> u32 {
+    var nbits: u64 = 0
+    var code = numberOf(parms, "nbits", 0, &nbits)
+    if code != 0 { return code }
+    var exponent: u64 = 65537
+    code = numberOf(parms, "rsa-use-e", 65537, &exponent)
+    if code != 0 { return code }
+    if nbits < 256 { return c.INV_VALUE }
+    if exponent == 0 { exponent = 65537 }
+    const e = mpi.create(1)
+    mpi.setU64(mpi.at(e), exponent)
+    const bits = @intCast(usize, nbits)
+    var p = generatePrime(bits / 2, e)
+    var q = generatePrime(bits - bits / 2, e)
+    if mpi.compare(mpi.at(p), mpi.at(q)) > 0 {
+        const swapped = p
+        p = q
+        q = swapped
+    }
+    const n = mpi.create(1)
+    mpi.mul(mpi.at(n), mpi.at(p), mpi.at(q))
+    // d = e^-1 mod lcm(p - 1, q - 1); u = p^-1 mod q.
+    const p1 = mpi.create(1)
+    const q1 = mpi.create(1)
+    const phi = mpi.create(1)
+    const g = mpi.create(1)
+    const lcm = mpi.create(1)
+    mpi.addSmall(mpi.at(p1), mpi.at(p), 1, true)
+    mpi.addSmall(mpi.at(q1), mpi.at(q), 1, true)
+    mpi.mul(mpi.at(phi), mpi.at(p1), mpi.at(q1))
+    const one = mpi.gcd(mpi.at(g), mpi.at(p1), mpi.at(q1))
+    mpi.tdivQr(lcm, 0, mpi.at(phi), mpi.at(g))
+    const d = mpi.create(1)
+    const u = mpi.create(1)
+    const invertible = mpi.invm(mpi.at(d), mpi.at(e), mpi.at(lcm))
+    const coefficient = mpi.invm(mpi.at(u), mpi.at(p), mpi.at(q))
+    var g2: sexp.Growing = undefined
+    sexp.growingInit(&g2, 64 + bits)
+    open(&g2, "key-data")
+    open(&g2, "public-key")
+    open(&g2, "rsa")
+    elementMpi(&g2, "n", n, 1)
+    elementMpi(&g2, "e", e, 1)
+    close(&g2)
+    close(&g2)
+    open(&g2, "private-key")
+    open(&g2, "rsa")
+    elementMpi(&g2, "n", n, 1)
+    elementMpi(&g2, "e", e, 1)
+    elementMpi(&g2, "d", d, 1)
+    elementMpi(&g2, "p", p, 1)
+    elementMpi(&g2, "q", q, 1)
+    elementMpi(&g2, "u", u, 1)
+    close(&g2)
+    close(&g2)
+    close(&g2)
+    c.putWord(result, finish(&g2))
+    mpi.destroy(e)
+    mpi.destroy(p)
+    mpi.destroy(q)
+    mpi.destroy(n)
+    mpi.destroy(p1)
+    mpi.destroy(q1)
+    mpi.destroy(phi)
+    mpi.destroy(g)
+    mpi.destroy(lcm)
+    mpi.destroy(d)
+    mpi.destroy(u)
+    return 0
+}
+
+// n = p q and e d = 1 modulo lcm(p - 1, q - 1).
+fn rsaTest(parms: usize) -> u32 {
+    var key: RsaKey = undefined
+    const code = rsaLoad(parms, &key, true)
+    if code != 0 { return code }
+    var good = key.p != 0 && key.q != 0
+    if good {
+        const t = mpi.create(1)
+        mpi.mul(mpi.at(t), mpi.at(key.p), mpi.at(key.q))
+        if mpi.compare(mpi.at(t), mpi.at(key.n)) != 0 { good = false }
+        const p1 = mpi.create(1)
+        const q1 = mpi.create(1)
+        const g = mpi.create(1)
+        mpi.addSmall(mpi.at(p1), mpi.at(key.p), 1, true)
+        mpi.addSmall(mpi.at(q1), mpi.at(key.q), 1, true)
+        mpi.mul(mpi.at(t), mpi.at(p1), mpi.at(q1))
+        const one = mpi.gcd(mpi.at(g), mpi.at(p1), mpi.at(q1))
+        mpi.tdivQr(t, 0, mpi.at(t), mpi.at(g))
+        mpi.mul(mpi.at(g), mpi.at(key.e), mpi.at(key.d))
+        mpi.mod(mpi.at(g), mpi.at(g), mpi.at(t))
+        if mpi.compareSmall(mpi.at(g), 1) != 0 { good = false }
+        mpi.destroy(t)
+        mpi.destroy(p1)
+        mpi.destroy(q1)
+        mpi.destroy(g)
+    }
+    rsaFree(&key)
+    return if good { 0 } else { c.BAD_SECKEY }
+}
+
+// ---------------------------------------------------------------------------
+// Elliptic curves.
+
+// A number as `size` big-endian bytes into a new allocation.
+fn fixedBytes(m: usize, size: usize) -> usize {
+    const buffer = c.alloc(size)
+    mpi.toBytes(mpi.at(m), c.bytes(buffer), size)
+    return buffer
+}
+
+// The bytes of an opaque MPI or the magnitude of another (a copy).
+fn bytesOf(m: usize, length: *usize) -> usize {
+    const value = mpi.at(m)
+    if value.*.flags & mpi.FLAG_OPAQUE != 0 {
+        const n = (value.*.opaqueBits + 7) / 8
+        length.* = n
+        return c.dupBytes(value.*.limbs, if n == 0 { 1 } else { n })
+    }
+    return mpi.magnitude(value, length)
+}
+
+fn eccSign(result: usize, data: usize, parms: usize) -> u32 {
+    var context: usize = 0
+    var code = ec.newContext(parms, 0, &context)
+    if code != 0 { return code }
+    const ctx = ec.contextAt(context)
+    if ctx.*.d == 0 {
+        ec.contextRelease(context)
+        return c.NO_OBJ
+    }
+    var e: Encoding = undefined
+    encodingInit(&e, OP_SIGN, 0)
+    if ctx.*.eddsa { e.flags = e.flags | FLAG_EDDSA }
+    if e.flags & FLAG_EDDSA != 0 { e.hashAlgo = 0 }
+    var input: usize = 0
+    code = dataToMpi(data, &e, &input)
+    var g: sexp.Growing = undefined
+    if code == 0 && e.flags & FLAG_EDDSA != 0 {
+        if ctx.*.kind != ec.EDWARDS || mpi.at(ctx.*.d).*.flags & mpi.FLAG_OPAQUE == 0 {
+            code = c.NOT_IMPLEMENTED
+        } else if e.hashAlgo != 0 && e.hashAlgo != md.MD_SHA512 {
+            code = c.DIGEST_ALGO
+        } else {
+            const message = mpi.at(input)
+            const length = (message.*.opaqueBits + 7) / 8
+            var signature: [64]u8 = undefined
+            curve25519.ed25519Sign(c.bytes(mpi.at(ctx.*.d).*.limbs), c.slice(message.*.limbs, length), &signature)
+            sexp.growingInit(&g, 128)
+            open(&g, "sig-val")
+            open(&g, "eddsa")
+            element(&g, "r", @intFromPtr(&signature), 32)
+            element(&g, "s", @intFromPtr(&signature) + 32, 32)
+            close(&g)
+            close(&g)
+            c.putWord(result, finish(&g))
+        }
+    } else if code == 0 {
+        if ctx.*.kind != ec.WEIERSTRASS {
+            code = c.NOT_IMPLEMENTED
+        } else {
+            var curve: ecc.Curve = undefined
+            ecc.curveInit(&curve, ec.eccName(ctx.*.curve))
+            const size = curve.size
+            // d below n, as size bytes.
+            const reduced = mpi.create(1)
+            mpi.mod(mpi.at(reduced), mpi.at(ctx.*.d), mpi.at(ctx.*.n))
+            const scalar = fixedBytes(reduced, size)
+            mpi.destroy(reduced)
+            var length: usize = 0
+            const digest = bytesOf(input, &length)
+            var r: [66]u8 = undefined
+            var s: [66]u8 = undefined
+            if ecc.ecdsaSign(&curve, c.bytes(scalar), c.bytes(digest), length, &r, &s) {
+                const rm = mpi.fromUnsigned(&r, size)
+                const sm = mpi.fromUnsigned(&s, size)
+                sexp.growingInit(&g, 64 + 2 * size)
+                open(&g, "sig-val")
+                open(&g, "ecdsa")
+                elementMpi(&g, "r", rm, 5)
+                elementMpi(&g, "s", sm, 5)
+                close(&g)
+                close(&g)
+                c.putWord(result, finish(&g))
+                mpi.destroy(rm)
+                mpi.destroy(sm)
+            } else {
+                code = c.INV_DATA
+            }
+            c.wipeRelease(scalar, size)
+            c.wipeRelease(digest, if length == 0 { 1 } else { length })
+        }
+    }
+    mpi.destroy(input)
+    encodingFree(&e)
+    ec.contextRelease(context)
+    return code
+}
+
+fn eccVerify(sigval: usize, data: usize, parms: usize) -> u32 {
+    var context: usize = 0
+    var code = ec.newContext(parms, 0, &context)
+    if code != 0 { return code }
+    const ctx = ec.contextAt(context)
+    if ctx.*.q == 0 {
+        ec.contextRelease(context)
+        return c.NO_OBJ
+    }
+    if ctx.*.kind == ec.MONTGOMERY {
+        ec.contextRelease(context)
+        return c.INTERNAL
+    }
+    var e: Encoding = undefined
+    encodingInit(&e, OP_VERIFY, ec.fieldBits(ctx.*.curve))
+    if ctx.*.eddsa { e.flags = e.flags | FLAG_EDDSA }
+    if e.flags & FLAG_EDDSA != 0 { e.hashAlgo = 0 }
+    var input: usize = 0
+    code = dataToMpi(data, &e, &input)
+    var l1: usize = 0
+    var eddsa = false
+    if code == 0 { code = sigvalParms(sigval, ALGO_ECC, &l1, &eddsa) }
+    var r: usize = 0
+    var s: usize = 0
+    if code == 0 {
+        const format: i32 = if eddsa { 8 } else { 5 }
+        const rl = sexp.findName(l1, "r")
+        const sl = sexp.findName(l1, "s")
+        if rl != 0 { r = sexp.nthMpi(rl, 1, format) }
+        if sl != 0 { s = sexp.nthMpi(sl, 1, format) }
+        sexp.release(rl)
+        sexp.release(sl)
+        if r == 0 || s == 0 { code = if rl == 0 || sl == 0 { c.NO_OBJ } else { c.INV_OBJ } }
+    }
+    if code == 0 && ((e.flags & FLAG_EDDSA != 0) != eddsa) { code = c.CONFLICT }
+    if code == 0 && eddsa {
+        if ctx.*.kind != ec.EDWARDS {
+            code = c.NOT_IMPLEMENTED
+        } else {
+            var rLength: usize = 0
+            var sLength: usize = 0
+            const rb = bytesOf(r, &rLength)
+            const sb = bytesOf(s, &sLength)
+            if rLength != 32 || sLength != 32 {
+                code = c.INV_LENGTH
+            } else {
+                var signature: [64]u8 = undefined
+                c.copy(@intFromPtr(&signature), rb, 32)
+                c.copy(@intFromPtr(&signature) + 32, sb, 32)
+                const key = ec.encodeEddsa(context, ctx.*.q)
+                const message = mpi.at(input)
+                const length = (message.*.opaqueBits + 7) / 8
+                if !curve25519.ed25519Verify(c.bytes(mpi.at(key).*.limbs), c.slice(message.*.limbs, length), &signature) { code = c.BAD_SIGNATURE }
+                mpi.destroy(key)
+            }
+            c.release(rb)
+            c.release(sb)
+        }
+    } else if code == 0 {
+        var curve: ecc.Curve = undefined
+        ecc.curveInit(&curve, ec.eccName(ctx.*.curve))
+        const key = ec.encodeStandard(context, ctx.*.q)
+        var rLength: usize = 0
+        var sLength: usize = 0
+        var dLength: usize = 0
+        const rb = bytesOf(r, &rLength)
+        const sb = bytesOf(s, &sLength)
+        const digest = bytesOf(input, &dLength)
+        const k = mpi.at(key)
+        if rLength > curve.size || sLength > curve.size || !ecc.ecdsaVerify(&curve, c.bytes(k.*.limbs), (k.*.opaqueBits + 7) / 8, c.bytes(digest), dLength, c.bytes(rb), rLength, c.bytes(sb), sLength) {
+            code = c.BAD_SIGNATURE
+        }
+        mpi.destroy(key)
+        c.release(rb)
+        c.release(sb)
+        c.release(digest)
+    }
+    mpi.destroy(r)
+    mpi.destroy(s)
+    mpi.destroy(input)
+    sexp.release(l1)
+    encodingFree(&e)
+    ec.contextRelease(context)
+    return code
+}
+
+// ECDH's "encryption": s = k Q, e = k G.
+fn eccEncrypt(result: usize, data: usize, parms: usize) -> u32 {
+    var context: usize = 0
+    var code = ec.newContext(parms, 0, &context)
+    if code != 0 { return code }
+    const ctx = ec.contextAt(context)
+    const tweak = hasDjbTweak(parms)
+    var e: Encoding = undefined
+    encodingInit(&e, OP_ENCRYPT, ec.fieldBits(ctx.*.curve))
+    var input: usize = 0
+    code = dataToMpi(data, &e, &input)
+    if code == 0 && (input == 0 || mpi.at(input).*.flags & mpi.FLAG_OPAQUE != 0) { code = c.INV_DATA }
+    if code == 0 && ctx.*.q == 0 { code = c.NO_OBJ }
+    if code == 0 {
+        const k = mpi.at(input)
+        if tweak {
+            // The scalar's bits fixed by the cofactor and the field.
+            var bit: usize = 0
+            while (ctx.*.h >> @intCast(u64, bit)) & 1 == 0 {
+                mpi.clearBit(k, bit)
+                bit += 1
+            }
+            mpi.setBit(k, ec.fieldBits(ctx.*.curve) - 1)
+            mpi.clearHigh(k, ec.fieldBits(ctx.*.curve))
+        }
+        const shared = ec.pointNew()
+        const ephemeral = ec.pointNew()
+        ec.multiply(context, shared, input, ctx.*.q)
+        ec.multiply(context, ephemeral, input, ctx.*.g)
+        const montgomery = ctx.*.kind == ec.MONTGOMERY
+        const sm = if montgomery { ec.encodeMontgomery(context, shared) } else { ec.encodeStandard(context, shared) }
+        const em = if montgomery { ec.encodeMontgomery(context, ephemeral) } else { ec.encodeStandard(context, ephemeral) }
+        if sm == 0 || em == 0 {
+            code = c.INV_DATA
+        } else {
+            var g: sexp.Growing = undefined
+            sexp.growingInit(&g, 300)
+            open(&g, "enc-val")
+            open(&g, "ecdh")
+            elementMpi(&g, "s", sm, 1)
+            elementMpi(&g, "e", em, 1)
+            close(&g)
+            close(&g)
+            c.putWord(result, finish(&g))
+        }
+        mpi.destroy(sm)
+        mpi.destroy(em)
+        ec.pointRelease(shared)
+        ec.pointRelease(ephemeral)
+    }
+    mpi.destroy(input)
+    encodingFree(&e)
+    ec.contextRelease(context)
+    return code
+}
+
+fn hasDjbTweak(parms: usize) -> bool { return ec.hasFlag(parms, "djb-tweak") || ec.hasFlag(parms, "eddsa") }
+
+fn eccGenerate(parms: usize, result: usize) -> u32 {
+    var context: usize = 0
+    const code = ec.newContext(parms, 0, &context)
+    if code != 0 { return code }
+    const ctx = ec.contextAt(context)
+    const name = ec.canonicalName(ctx.*.curve)
+    const curveName = c.slice(@intFromPtr(name.pointer), name.length - 1)
+    var q: usize = 0
+    var d: usize = 0
+    var eddsa = false
+    if ctx.*.kind == ec.EDWARDS && ctx.*.eddsa {
+        eddsa = true
+        const seed = c.alloc(32)
+        c.fill(seed, 32)
+        const public = c.alloc(32)
+        curve25519.ed25519Public(c.bytes(seed), c.bytes(public))
+        d = mpi.setOpaque(mpi.create(1), seed, 256)
+        q = mpi.setOpaque(mpi.create(1), public, 256)
+    } else if ctx.*.kind == ec.WEIERSTRASS {
+        var curve: ecc.Curve = undefined
+        ecc.curveInit(&curve, ec.eccName(ctx.*.curve))
+        var scalar: [66]u8 = undefined
+        var public: [133]u8 = undefined
+        if !ecc.generatePrivate(&curve, &scalar) || !ecc.publicKey(&curve, &scalar, &public) {
+            ec.contextRelease(context)
+            return c.INTERNAL
+        }
+        d = mpi.fromUnsigned(&scalar, curve.size)
+        hash.wipe(&scalar, 66)
+        const encoded = c.dupBytes(@intFromPtr(&public), 1 + 2 * curve.size)
+        q = mpi.setOpaque(mpi.create(1), encoded, @intCast(u32, ((1 + 2 * curve.size) * 8) & 4294967295))
+    } else {
+        ec.contextRelease(context)
+        return c.NOT_IMPLEMENTED
+    }
+    var g: sexp.Growing = undefined
+    sexp.growingInit(&g, 512)
+    open(&g, "key-data")
+    var which: usize = 0
+    while which < 2 {
+        open(&g, if which == 0 { "public-key" } else { "private-key" })
+        open(&g, "ecc")
+        element(&g, "curve", @intFromPtr(curveName.pointer), curveName.length)
+        if eddsa { element(&g, "flags", @intFromPtr("eddsa".pointer), 5) }
+        elementMpi(&g, "q", q, 1)
+        if which == 1 { elementMpi(&g, "d", d, 1) }
+        close(&g)
+        close(&g)
+        which += 1
+    }
+    close(&g)
+    c.putWord(result, finish(&g))
+    mpi.destroy(q)
+    mpi.destroy(d)
+    ec.contextRelease(context)
+    return 0
+}
+
+fn eccBits(parms: usize) -> usize {
+    var context: usize = 0
+    if ec.newContext(parms, 0, &context) != 0 { return 0 }
+    const bits = ec.fieldBits(ec.contextAt(context).*.curve)
+    ec.contextRelease(context)
+    return bits
+}
+
+// q = d G when the key has both; a key with d alone passes.
+fn eccTest(parms: usize) -> u32 {
+    var context: usize = 0
+    const code = ec.newContext(parms, 0, &context)
+    if code != 0 { return code }
+    const ctx = ec.contextAt(context)
+    var good = ctx.*.d != 0
+    if good && ctx.*.q != 0 {
+        const given = ec.encodeStandard(context, ctx.*.q)
+        ec.pointRelease(ctx.*.q)
+        ctx.*.q = 0
+        const made = if ec.publicPoint(context) { ec.encodeStandard(context, ctx.*.q) } else { 0 }
+        good = given != 0 && made != 0 && mpi.compare(mpi.at(given), mpi.at(made)) == 0
+        mpi.destroy(given)
+        mpi.destroy(made)
+    }
+    ec.contextRelease(context)
+    return if good { 0 } else { c.BAD_SECKEY }
+}
+
+// ---------------------------------------------------------------------------
+// The C API.
+
+export fn gcry_pk_encrypt(result: usize, data: usize, pkey: usize) -> u32 {
+    c.putWord(result, 0)
+    var algo: u8 = 0
+    var parms: usize = 0
+    var code = keyParms(pkey, false, &algo, &parms)
+    if code == 0 { code = if algo == ALGO_RSA { rsaEncrypt(result, data, parms) } else { eccEncrypt(result, data, parms) } }
+    sexp.release(parms)
+    return c.failure(code)
+}
+
+export fn gcry_pk_decrypt(result: usize, data: usize, skey: usize) -> u32 {
+    c.putWord(result, 0)
+    var algo: u8 = 0
+    var parms: usize = 0
+    var code = keyParms(skey, true, &algo, &parms)
+    if code == 0 { code = if algo == ALGO_RSA { rsaDecrypt(result, data, parms) } else { c.NOT_IMPLEMENTED } }
+    sexp.release(parms)
+    return c.failure(code)
+}
+
+export fn gcry_pk_sign(result: usize, data: usize, skey: usize) -> u32 {
+    c.putWord(result, 0)
+    var algo: u8 = 0
+    var parms: usize = 0
+    var code = keyParms(skey, true, &algo, &parms)
+    if code == 0 { code = if algo == ALGO_RSA { rsaSign(result, data, parms) } else { eccSign(result, data, parms) } }
+    sexp.release(parms)
+    return c.failure(code)
+}
+
+export fn gcry_pk_verify(sigval: usize, data: usize, pkey: usize) -> u32 {
+    var algo: u8 = 0
+    var parms: usize = 0
+    var code = keyParms(pkey, false, &algo, &parms)
+    if code == 0 { code = if algo == ALGO_RSA { rsaVerify(sigval, data, parms) } else { eccVerify(sigval, data, parms) } }
+    sexp.release(parms)
+    return c.failure(code)
+}
+
+export fn gcry_pk_testkey(key: usize) -> u32 {
+    var algo: u8 = 0
+    var parms: usize = 0
+    var code = keyParms(key, true, &algo, &parms)
+    if code == 0 { code = if algo == ALGO_RSA { rsaTest(parms) } else { eccTest(parms) } }
+    sexp.release(parms)
+    return c.failure(code)
+}
+
+export fn gcry_pk_genkey(r_key: usize, s_parms: usize) -> u32 {
+    c.putWord(r_key, 0)
+    const list = sexp.findName(s_parms, "genkey")
+    if list == 0 { return c.failure(c.INV_OBJ) }
+    const inner = sexp.nth(list, 1)
+    sexp.release(list)
+    if inner == 0 { return c.failure(c.NO_OBJ) }
+    var length: usize = 0
+    const name = sexp.nthData(inner, 0, &length)
+    var code: u32 = 0
+    if name == 0 {
+        code = c.INV_OBJ
+    } else {
+        const algo = algorithmOfName(c.slice(name, length))
+        if algo == ALGO_RSA {
+            code = rsaGenerate(inner, r_key)
+        } else if algo == ALGO_ECC {
+            code = eccGenerate(inner, r_key)
+        } else {
+            code = c.PUBKEY_ALGO
+        }
+    }
+    sexp.release(inner)
+    return c.failure(code)
+}
+
+export fn gcry_pk_get_nbits(key: usize) -> u32 {
+    var algo: u8 = 0
+    var parms: usize = 0
+    if keyParms(key, false, &algo, &parms) != 0 { return 0 }
+    const bits = if algo == ALGO_RSA { rsaBits(parms) } else { eccBits(parms) }
+    sexp.release(parms)
+    return @intCast(u32, bits & 4294967295)
+}

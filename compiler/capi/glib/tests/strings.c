@@ -112,6 +112,12 @@ int main(void)
     char inplace[] = "Zm9vYmFy";
     decoded = g_base64_decode_inplace(inplace, &decoded_len);
     printf("base64 decoded in place %zu '%.*s'\n", (size_t)decoded_len, (int)decoded_len, decoded);
+    decoded = g_base64_decode("eA", &decoded_len);
+    printf("base64 decoded unpadded %zu\n", (size_t)decoded_len);
+    g_free(decoded);
+    decoded = g_base64_decode("eHk=eA==", &decoded_len);
+    printf("base64 decoded two groups %zu '%.*s'\n", (size_t)decoded_len, (int)decoded_len, decoded);
+    g_free(decoded);
 
     show("md5", g_compute_checksum_for_string(G_CHECKSUM_MD5, "abc", -1));
     show("sha1", g_compute_checksum_for_string(G_CHECKSUM_SHA1, "abc", -1));

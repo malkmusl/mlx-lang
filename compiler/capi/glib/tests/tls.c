@@ -2,12 +2,13 @@
    a chain, a private key, none), as WebKit makes and copies them
    (g_initable_new with the backend's certificate type and
    "certificate-pem" or "certificate", the issuer chain walked), their
-   PEM and DER read back and compared; TLS passwords; the TLS errors; and
-   what a backend without TLS answers.
+   PEM and DER read back and compared; the fields of their X.509
+   structure (validity, names, alternative names) and their
+   verification (against an authority, a name, the system's anchors);
+   TLS passwords; the TLS errors; the backend and its databases.
 
-   The certificates part prints what GLib 2.80 prints with its GnuTLS
-   backend (glib-networking); the backend part what it prints without a
-   TLS backend (GIO_USE_TLS=dummy): no TLS, no database. */
+   It prints what GLib 2.80 prints with its GnuTLS backend
+   (glib-networking). The handshakes are tls_handshake.c's. */
 #include <gio/gio.h>
 #include <stdio.h>
 #include <string.h>
@@ -173,6 +174,88 @@ static void certificates(void)
     g_object_unref(keyed);
 }
 
+static void print_names(GPtrArray *names, gboolean addresses)
+{
+    if (!names) {
+        printf(" (none)");
+        return;
+    }
+    for (guint i = 0; i < names->len; i++) {
+        if (addresses) {
+            gchar *text = g_inet_address_to_string(g_ptr_array_index(names, i));
+            printf(" %s", text);
+            g_free(text);
+        } else {
+            gsize length;
+            const char *data = g_bytes_get_data(g_ptr_array_index(names, i), &length);
+            printf(" %.*s", (int)length, data);
+        }
+    }
+}
+
+static void describe(const char *what, GTlsCertificate *cert)
+{
+    gchar *subject = NULL, *issuer = NULL;
+    GDateTime *before = NULL, *after = NULL;
+    GPtrArray *names = NULL, *addresses = NULL;
+    g_object_get(cert, "subject-name", &subject, "issuer-name", &issuer, "not-valid-before", &before, "not-valid-after", &after,
+                 "dns-names", &names, "ip-addresses", &addresses, NULL);
+    gchar *from = before ? g_date_time_format_iso8601(before) : NULL;
+    gchar *until = after ? g_date_time_format_iso8601(after) : NULL;
+    printf("%s: subject %s\n  issuer %s\n  valid %s to %s\n  dns names", what, subject, issuer, from, until);
+    print_names(names, FALSE);
+    printf("\n  addresses");
+    print_names(addresses, TRUE);
+    printf("\n");
+    g_free(subject);
+    g_free(issuer);
+    g_free(from);
+    g_free(until);
+    if (before) g_date_time_unref(before);
+    if (after) g_date_time_unref(after);
+    if (names) g_ptr_array_unref(names);
+    if (addresses) g_ptr_array_unref(addresses);
+}
+
+/* The X.509 fields, and verification as GnuTLS does it. */
+static void fields(void)
+{
+    GTlsCertificate *one = g_tls_certificate_new_from_pem(first, -1, NULL);
+    GTlsCertificate *other = g_tls_certificate_new_from_pem(second, -1, NULL);
+    GTlsCertificate *issued = g_tls_certificate_new_from_pem(leaf, -1, NULL);
+    GTlsCertificate *root = g_tls_certificate_new_from_pem(authority, -1, NULL);
+    describe("ISRG Root X2", one);
+    describe("GTS Root R4", other);
+    describe("leaf", issued);
+    describe("authority", root);
+    printf("verify: itself %d, by its authority %d, by another %d, without one %d\n",
+           g_tls_certificate_verify(one, NULL, one), g_tls_certificate_verify(issued, NULL, root),
+           g_tls_certificate_verify(issued, NULL, other), g_tls_certificate_verify(issued, NULL, NULL));
+    GSocketConnectable *address = G_SOCKET_CONNECTABLE(g_inet_socket_address_new_from_string("192.0.2.7", 443));
+    printf("verify for 192.0.2.7: %d\n", g_tls_certificate_verify(issued, address, root));
+    g_object_unref(address);
+
+    GError *e = NULL;
+    GTlsDatabase *system = g_tls_file_database_new("/etc/ssl/certs/ca-certificates.crt", &e);
+    error("system database", &e);
+    gchar *anchors = NULL;
+    g_object_get(system, "anchors", &anchors, NULL);
+    printf("anchors %s\n", anchors);
+    g_free(anchors);
+    printf("database: ISRG Root X2 %d, GTS Root R4 %d, leaf %d\n",
+           g_tls_database_verify_chain(system, one, G_TLS_DATABASE_PURPOSE_AUTHENTICATE_SERVER, NULL, NULL, G_TLS_DATABASE_VERIFY_NONE, NULL, NULL),
+           g_tls_database_verify_chain(system, other, G_TLS_DATABASE_PURPOSE_AUTHENTICATE_SERVER, NULL, NULL, G_TLS_DATABASE_VERIFY_NONE, NULL, NULL),
+           g_tls_database_verify_chain(system, issued, G_TLS_DATABASE_PURPOSE_AUTHENTICATE_SERVER, NULL, NULL, G_TLS_DATABASE_VERIFY_NONE, NULL, NULL));
+    g_object_unref(system);
+    GTlsDatabase *missing = g_tls_file_database_new("/nonexistent/anchors.pem", &e);
+    printf("missing file %p\n", (void *)missing);
+    error("missing file", &e);
+    g_object_unref(one);
+    g_object_unref(other);
+    g_object_unref(issued);
+    g_object_unref(root);
+}
+
 static void passwords(void)
 {
     GTlsPassword *password = g_tls_password_new(G_TLS_PASSWORD_RETRY, "Token PIN");
@@ -208,22 +291,21 @@ static void backend(void)
     g_object_unref(database);
     GError *e = NULL;
     database = g_tls_file_database_new("/etc/ssl/certs/ca-certificates.crt", &e);
-    printf("file database %p\n", (void *)database);
+    printf("file database %d\n", G_IS_TLS_FILE_DATABASE(database));
     error("file database", &e);
+    g_object_unref(database);
+    GType client = g_tls_backend_get_client_connection_type(backend);
+    printf("client connections %d %d\n", g_type_is_a(client, G_TYPE_TLS_CLIENT_CONNECTION), g_type_is_a(client, G_TYPE_INITABLE));
     printf("types %d %d %d %d %d\n", g_type_is_a(G_TYPE_TLS_CONNECTION, G_TYPE_IO_STREAM), g_type_is_a(G_TYPE_TLS_CLIENT_CONNECTION, G_TYPE_TLS_CONNECTION), g_type_is_a(G_TYPE_TLS_FILE_DATABASE, G_TYPE_TLS_DATABASE), G_TYPE_IS_ABSTRACT(G_TYPE_TLS_CERTIFICATE), G_TYPE_IS_INTERFACE(G_TYPE_INITABLE));
     printf("errors %s %s %d\n", g_quark_to_string(G_TLS_ERROR), g_quark_to_string(G_TLS_CHANNEL_BINDING_ERROR), G_TLS_ERROR_BAD_CERTIFICATE);
 }
 
 int main(int argc, char **argv)
 {
-    /* (GLib's run: "certificates" with GnuTLS, "backend" without.) */
-    const char *part = argc > 1 ? argv[1] : "all";
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!strcmp(part, "all") || !strcmp(part, "certificates")) {
-        certificates();
-        passwords();
-    }
-    if (!strcmp(part, "all") || !strcmp(part, "backend"))
-        backend();
+    certificates();
+    fields();
+    passwords();
+    backend();
     return 0;
 }

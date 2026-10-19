@@ -1,0 +1,446 @@
+// std.crypto.bignum: unsigned integers of a fixed number of 64-bit limbs
+// (little-endian, up to 4096 bits) and arithmetic modulo an odd number in
+// Montgomery's form, what RSA and the prime curves are computed with.
+//
+//     var modulus: bignum.Modulus = undefined
+//     var storage: [192]u64 = undefined             // 3 x the limbs
+//     bignum.modulusStorage(&modulus, &storage, 64)
+//     bignum.modulusInit(&modulus, bytes, length)   // big-endian, odd
+//     bignum.fromBytes(a, modulus.n, bytes, length)
+//     bignum.toMontgomery(&modulus, a, a)           // aR mod m
+//     bignum.montMul(&modulus, out, a, b)           // abR^-1 mod m
+//     bignum.fromMontgomery(&modulus, out, a)
+//     bignum.modExp(&modulus, out, base, exponent, length)
+//
+// The arithmetic is constant time: no branch and no memory address
+// depends on the values (only on the number of limbs), and choices are
+// made with masks. Products are of two limbs into a u128.
+//
+// No local here is larger than a kilobyte: Mlx keeps such locals in the
+// function's frame, where larger ones would come from the aggregate
+// arena, which a library's exported function has 64 KB of for all its
+// calls (a TLS handshake verifies several signatures in one). A
+// modulus's numbers are in storage its owner gives, sized for them.
+
+pub const MAX_LIMBS: usize = 64
+
+pub const Modulus = struct {
+    // How many limbs the numbers modulo m have, and may have.
+    n: usize
+    capacity: usize
+    // -m^-1 mod 2^64.
+    inverse: u64
+    // m, R mod m and R^2 mod m (R = 2^(64n)), in the owner's storage.
+    m: [*]u64
+    one: [*]u64
+    squared: [*]u64
+}
+
+const MASK64: u128 = 18446744073709551615
+
+inline fn wide(value: u64) -> u128 {
+    return @intCast(u128, value)
+}
+
+inline fn low(value: u128) -> u64 {
+    return @intCast(u64, value & MASK64)
+}
+
+inline fn high(value: u128) -> u64 {
+    return @intCast(u64, value >> 64)
+}
+
+pub fn zero(a: [*]u64, n: usize) -> void {
+    var index: usize = 0
+    while index < n {
+        a[index] = 0
+        index += 1
+    }
+}
+
+pub fn copy(out: [*]u64, a: [*]const u64, n: usize) -> void {
+    var index: usize = 0
+    while index < n {
+        out[index] = a[index]
+        index += 1
+    }
+}
+
+// A big-endian number into `n` limbs; false when it does not fit.
+pub fn fromBytes(out: [*]u64, n: usize, bytes: [*]const u8, length: usize) -> bool {
+    zero(out, n)
+    var index: usize = 0
+    while index < length {
+        const position = length - 1 - index
+        const limb = index / 8
+        const byte = @intCast(u64, bytes[position])
+        if limb >= n {
+            if byte != 0 { return false }
+        } else {
+            out[limb] = out[limb] | (byte << (8 * (index % 8)))
+        }
+        index += 1
+    }
+    return true
+}
+
+// The number as `length` big-endian bytes (the high ones cut off when it
+// is longer).
+pub fn toBytes(a: [*]const u64, n: usize, out: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        const limb = index / 8
+        var byte: u64 = 0
+        if limb < n { byte = (a[limb] >> (8 * (index % 8))) & 255 }
+        out[length - 1 - index] = @intCast(u8, byte)
+        index += 1
+    }
+}
+
+// out = a + b; the carry out.
+pub fn add(out: [*]u64, a: [*]const u64, b: [*]const u64, n: usize) -> u64 {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < n {
+        const sum = wide(a[index]) +% wide(b[index]) +% wide(carry)
+        out[index] = low(sum)
+        carry = high(sum)
+        index += 1
+    }
+    return carry
+}
+
+// out = a - b; the borrow out (1 when b > a).
+pub fn sub(out: [*]u64, a: [*]const u64, b: [*]const u64, n: usize) -> u64 {
+    var borrow: u64 = 0
+    var index: usize = 0
+    while index < n {
+        // Below zero, the high word of the wide difference is all ones.
+        const difference = wide(a[index]) -% wide(b[index]) -% wide(borrow)
+        out[index] = low(difference)
+        borrow = high(difference) >> 63
+        index += 1
+    }
+    return borrow
+}
+
+// out = a when flag is 1, b when it is 0.
+pub fn select(out: [*]u64, flag: u64, a: [*]const u64, b: [*]const u64, n: usize) -> void {
+    const mask = 0 -% flag
+    var index: usize = 0
+    while index < n {
+        out[index] = (a[index] & mask) | (b[index] & (mask ^ 18446744073709551615))
+        index += 1
+    }
+}
+
+// 1 when a is zero, else 0.
+pub fn isZero(a: [*]const u64, n: usize) -> u64 {
+    var bits: u64 = 0
+    var index: usize = 0
+    while index < n {
+        bits = bits | a[index]
+        index += 1
+    }
+    return ((bits | (0 -% bits)) >> 63) ^ 1
+}
+
+// 1 when a < b, else 0.
+pub fn less(a: [*]const u64, b: [*]const u64, n: usize) -> u64 {
+    var scratch: [64]u64 = undefined
+    const difference: [*]u64 = &scratch
+    return sub(difference, a, b, n)
+}
+
+// 1 when a == b, else 0.
+pub fn equal(a: [*]const u64, b: [*]const u64, n: usize) -> u64 {
+    var bits: u64 = 0
+    var index: usize = 0
+    while index < n {
+        bits = bits | (a[index] ^ b[index])
+        index += 1
+    }
+    return ((bits | (0 -% bits)) >> 63) ^ 1
+}
+
+// The number of significant bits (not constant time: for public values).
+pub fn bitLength(a: [*]const u64, n: usize) -> usize {
+    var limb = n
+    while limb > 0 {
+        limb -= 1
+        if a[limb] != 0 {
+            var bits: usize = 64
+            while ((a[limb] >> @intCast(u64, bits - 1)) & 1) == 0 { bits -= 1 }
+            return limb * 64 + bits
+        }
+    }
+    return 0
+}
+
+pub fn bit(a: [*]const u64, index: usize) -> u64 {
+    return (a[index / 64] >> @intCast(u64, index % 64)) & 1
+}
+
+// out = 2a + incoming (one bit) mod m, a < m.
+fn doubleMod(modulus: *Modulus, out: [*]u64, a: [*]const u64, incoming: u64) -> void {
+    const n = modulus.*.n
+    var doubled: [65]u64 = undefined
+    var carry = incoming
+    var index: usize = 0
+    while index < n {
+        doubled[index] = (a[index] << 1) | carry
+        carry = a[index] >> 63
+        index += 1
+    }
+    const twice: [*]u64 = &doubled
+    const m: [*]const u64 = modulus.*.m
+    var reduced: [64]u64 = undefined
+    const smaller: [*]u64 = &reduced
+    const borrow = sub(smaller, twice, m, n)
+    // Keep 2a - m unless it went below zero without the carry out.
+    const keep = carry | (borrow ^ 1)
+    select(out, keep, smaller, twice, n)
+}
+
+// The storage of a modulus of up to `capacity` limbs: 3 * capacity limbs.
+pub fn modulusStorage(modulus: *Modulus, storage: [*]u64, capacity: usize) -> void {
+    modulus.*.capacity = capacity
+    modulus.*.n = 0
+    modulus.*.m = storage
+    modulus.*.one = storage + capacity
+    modulus.*.squared = storage + 2 * capacity
+}
+
+// Ready for arithmetic modulo the odd big-endian number `bytes`; false
+// when it is even, below 3, or longer than 4096 bits.
+pub fn modulusInit(modulus: *Modulus, bytes: [*]const u8, length: usize) -> bool {
+    var start: usize = 0
+    while start < length && bytes[start] == 0 { start += 1 }
+    const significant = length - start
+    if significant == 0 || significant > modulus.*.capacity * 8 { return false }
+    const n = (significant + 7) / 8
+    const m: [*]u64 = modulus.*.m
+    if !fromBytes(m, n, bytes + start, significant) { return false }
+    return modulusSet(modulus, n)
+}
+
+// The same with the limbs already in modulus.m and their count.
+pub fn modulusSet(modulus: *Modulus, n: usize) -> bool {
+    modulus.*.n = n
+    const m0 = modulus.*.m[0]
+    if (m0 & 1) == 0 { return false }
+    if n == 1 && m0 < 3 { return false }
+    // Newton's iteration for m0^-1 mod 2^64: each step doubles the bits
+    // that are right, from the three an odd number is its own inverse to.
+    var x = m0
+    var step: usize = 0
+    while step < 5 {
+        x = x *% (2 -% m0 *% x)
+        step += 1
+    }
+    modulus.*.inverse = 0 -% x
+    // R mod m and R^2 mod m by doubling 1, reduced at every step.
+    const one: [*]u64 = modulus.*.one
+    const squared: [*]u64 = modulus.*.squared
+    zero(one, n)
+    one[0] = 1
+    var doubling: usize = 0
+    while doubling < 64 * n {
+        doubleMod(modulus, one, one, 0)
+        doubling += 1
+    }
+    copy(squared, one, n)
+    doubling = 0
+    while doubling < 64 * n {
+        doubleMod(modulus, squared, squared, 0)
+        doubling += 1
+    }
+    return true
+}
+
+// out = a * b * R^-1 mod m (a, b < m); out may be a or b.
+pub fn montMul(modulus: *Modulus, out: [*]u64, a: [*]const u64, b: [*]const u64) -> void {
+    const n = modulus.*.n
+    const m: [*]const u64 = modulus.*.m
+    const inverse = modulus.*.inverse
+    var accumulator: [66]u64 = undefined
+    const t: [*]u64 = &accumulator
+    zero(t, n + 2)
+    var i: usize = 0
+    while i < n {
+        const bi = wide(b[i])
+        var carry: u64 = 0
+        var j: usize = 0
+        while j < n {
+            const product = wide(a[j]) *% bi +% wide(t[j]) +% wide(carry)
+            t[j] = low(product)
+            carry = high(product)
+            j += 1
+        }
+        var sum = wide(t[n]) +% wide(carry)
+        t[n] = low(sum)
+        t[n + 1] = high(sum)
+        const factor = wide(t[0] *% inverse)
+        sum = factor *% wide(m[0]) +% wide(t[0])
+        carry = high(sum)
+        j = 1
+        while j < n {
+            const product = factor *% wide(m[j]) +% wide(t[j]) +% wide(carry)
+            t[j - 1] = low(product)
+            carry = high(product)
+            j += 1
+        }
+        sum = wide(t[n]) +% wide(carry)
+        t[n - 1] = low(sum)
+        t[n] = t[n + 1] + high(sum)
+        i += 1
+    }
+    // t < 2m: once more m off unless that goes below zero.
+    var reduced: [64]u64 = undefined
+    const smaller: [*]u64 = &reduced
+    const borrow = sub(smaller, t, m, n)
+    const keep = t[n] | (borrow ^ 1)
+    select(out, keep, smaller, t, n)
+}
+
+pub fn toMontgomery(modulus: *Modulus, out: [*]u64, a: [*]const u64) -> void {
+    const squared: [*]const u64 = modulus.*.squared
+    montMul(modulus, out, a, squared)
+}
+
+pub fn fromMontgomery(modulus: *Modulus, out: [*]u64, a: [*]const u64) -> void {
+    var unit: [64]u64 = undefined
+    const one: [*]u64 = &unit
+    zero(one, modulus.*.n)
+    unit[0] = 1
+    montMul(modulus, out, a, one)
+}
+
+// out = a + b mod m (a, b < m).
+pub fn modAdd(modulus: *Modulus, out: [*]u64, a: [*]const u64, b: [*]const u64) -> void {
+    const n = modulus.*.n
+    const m: [*]const u64 = modulus.*.m
+    var total: [64]u64 = undefined
+    const sum: [*]u64 = &total
+    const carry = add(sum, a, b, n)
+    var reduced: [64]u64 = undefined
+    const smaller: [*]u64 = &reduced
+    const borrow = sub(smaller, sum, m, n)
+    select(out, carry | (borrow ^ 1), smaller, sum, n)
+}
+
+// out = a - b mod m (a, b < m).
+pub fn modSub(modulus: *Modulus, out: [*]u64, a: [*]const u64, b: [*]const u64) -> void {
+    const n = modulus.*.n
+    const m: [*]const u64 = modulus.*.m
+    var total: [64]u64 = undefined
+    const difference: [*]u64 = &total
+    const borrow = sub(difference, a, b, n)
+    var raised: [64]u64 = undefined
+    const back: [*]u64 = &raised
+    const ignored = add(back, difference, m, n)
+    select(out, borrow, back, difference, n)
+}
+
+// out = base^exponent in Montgomery's form (base in it too), the
+// exponent `bits` bits of `exponent`'s limbs: a squaring and a
+// multiplication at every bit, the product kept by mask, so the time is
+// the same for every exponent of that many bits.
+pub fn montExp(modulus: *Modulus, out: [*]u64, base: [*]const u64, exponent: [*]const u64, bits: usize) -> void {
+    const n = modulus.*.n
+    var result: [64]u64 = undefined
+    const accumulator: [*]u64 = &result
+    var product: [64]u64 = undefined
+    const multiplied: [*]u64 = &product
+    copy(accumulator, modulus.*.one, n)
+    var position = bits
+    while position > 0 {
+        position -= 1
+        montMul(modulus, accumulator, accumulator, accumulator)
+        montMul(modulus, multiplied, accumulator, base)
+        select(accumulator, bit(exponent, position), multiplied, accumulator, n)
+    }
+    copy(out, accumulator, n)
+    zero(accumulator, n)
+    zero(multiplied, n)
+}
+
+// The same for an exponent whose timing may show (a public one, or a
+// prime candidate's while it is tested): four bits at a time from a
+// table of base^0 to base^15 in `table` (16 n limbs, the caller's), and
+// no multiplication for a window of zeroes. A quarter of montExp's
+// multiplications.
+pub fn montExpWindow(modulus: *Modulus, out: [*]u64, base: [*]const u64, exponent: [*]const u64, bits: usize, table: [*]u64) -> void {
+    const n = modulus.*.n
+    copy(table, modulus.*.one, n)
+    copy(table + n, base, n)
+    var entry: usize = 2
+    while entry < 16 {
+        montMul(modulus, table + entry * n, table + (entry - 1) * n, base)
+        entry += 1
+    }
+    var result: [64]u64 = undefined
+    const accumulator: [*]u64 = &result
+    copy(accumulator, modulus.*.one, n)
+    var position = (bits + 3) / 4 * 4
+    var started = false
+    while position > 0 {
+        position -= 4
+        if started {
+            montMul(modulus, accumulator, accumulator, accumulator)
+            montMul(modulus, accumulator, accumulator, accumulator)
+            montMul(modulus, accumulator, accumulator, accumulator)
+            montMul(modulus, accumulator, accumulator, accumulator)
+        }
+        const window = (bit(exponent, position + 3) << 3) | (bit(exponent, position + 2) << 2) | (bit(exponent, position + 1) << 1) | bit(exponent, position)
+        if window != 0 {
+            montMul(modulus, accumulator, accumulator, table + @intCast(usize, window) * n)
+            started = true
+        }
+    }
+    copy(out, accumulator, n)
+}
+
+// out = base^exponent mod m, plain numbers (base < m), the exponent
+// big-endian bytes.
+pub fn modExp(modulus: *Modulus, out: [*]u64, base: [*]const u64, exponent: [*]const u8, length: usize) -> bool {
+    var limbs: [64]u64 = undefined
+    const power: [*]u64 = &limbs
+    if !fromBytes(power, MAX_LIMBS, exponent, length) { return false }
+    var converted: [64]u64 = undefined
+    const value: [*]u64 = &converted
+    toMontgomery(modulus, value, base)
+    montExp(modulus, value, value, power, length * 8)
+    fromMontgomery(modulus, out, value)
+    return true
+}
+
+// out = a^-1 in Montgomery's form for a prime m (Fermat: a^(m-2)); zero
+// stays zero.
+pub fn montInverse(modulus: *Modulus, out: [*]u64, a: [*]const u64) -> void {
+    const n = modulus.*.n
+    var two: [64]u64 = undefined
+    const subtrahend: [*]u64 = &two
+    zero(subtrahend, n)
+    two[0] = 2
+    var power: [64]u64 = undefined
+    const exponent: [*]u64 = &power
+    const m: [*]const u64 = modulus.*.m
+    const ignored = sub(exponent, m, subtrahend, n)
+    montExp(modulus, out, a, exponent, 64 * n)
+}
+
+// out = a mod m for a number of `count` limbs, a bit at a time from the
+// top (constant time for a given count).
+pub fn reduce(modulus: *Modulus, out: [*]u64, a: [*]const u64, count: usize) -> void {
+    const n = modulus.*.n
+    var remainder: [64]u64 = undefined
+    const r: [*]u64 = &remainder
+    zero(r, n)
+    var index = count * 64
+    while index > 0 {
+        index -= 1
+        doubleMod(modulus, r, r, bit(a, index))
+    }
+    copy(out, r, n)
+}

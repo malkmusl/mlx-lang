@@ -1,0 +1,780 @@
+// soup-multipart.h, soup-multipart-input-stream.h: multipart bodies (RFC
+// 2046 5.1) as libsoup handles them.
+//
+// A SoupMultipart is a whole body split into parts, or put together from
+// them: its MIME type (0), boundary (8), and the parts' headers (16) and
+// bodies (24) (GPtrArrays of SoupMessageHeaders and GBytes).
+//
+// A SoupMultipartInputStream reads a multipart response as it comes:
+// next_part reads a part's headers (lines up to a blank one, after the
+// boundary line) and gives a stream of its body, which ends at the next
+// boundary. It keeps what it read past what it gave in a buffer, as
+// libsoup's SoupFilterInputStream does, and finds boundaries and line ends
+// the way that stream's read_until does, so that parts are cut where
+// libsoup cuts them. The asynchronous next_part waits on the stream read
+// rather than in a thread.
+//
+// The stream's private data is a pointer to a record:
+//   0 the message                8 the boundary ("--" and the parameter)
+//  16 its length                24 whether the part's end was read
+//  32 the bytes left of a part with a Content-Length
+//  40 the part's headers        48 the buffer, 56 its length, 64 its size
+//  72 whether more input is needed (the last read would have blocked)
+//  80 the header bytes read, 88 their length
+//  96 whether the boundary line was read (while reading headers)
+const m = @import("../glib/memory.mlx")
+const g = @import("./g.mlx")
+const c = @import("./common.mlx")
+const message = @import("./message.mlx")
+const bodystream = @import("./bodystream.mlx")
+const conn = @import("./conn.mlx")
+
+extern("c") fn soup_message_headers_new(t: i32) -> usize
+extern("c") fn soup_message_headers_unref(h: usize) -> void
+extern("c") fn soup_message_headers_append(h: usize, name: usize, value: usize) -> void
+extern("c") fn soup_message_headers_get_content_type(h: usize, params: usize) -> usize
+extern("c") fn soup_message_headers_set_content_type(h: usize, contentType: usize, params: usize) -> void
+extern("c") fn soup_message_headers_get_content_length(h: usize) -> i64
+extern("c") fn soup_message_headers_iter_init(iter: usize, h: usize) -> void
+extern("c") fn soup_message_headers_iter_next(iter: usize, name: usize, value: usize) -> i32
+extern("c") fn soup_headers_parse(text: usize, length: i32, dest: usize) -> i32
+extern("c") fn soup_header_g_string_append_param_quoted(s: usize, name: usize, value: usize) -> void
+extern("c") fn g_ptr_array_new_with_free_func(free: usize) -> usize
+extern("c") fn g_ptr_array_add(array: usize, data: usize) -> void
+extern("c") fn g_ptr_array_free(array: usize, segment: i32) -> usize
+extern("c") fn g_bytes_new(data: usize, size: usize) -> usize
+extern("c") fn g_bytes_new_take(data: usize, size: usize) -> usize
+extern("c") fn g_bytes_new_from_bytes(bytes: usize, offset: usize, length: usize) -> usize
+extern("c") fn g_bytes_ref(bytes: usize) -> usize
+extern("c") fn g_bytes_unref(bytes: usize) -> void
+extern("c") fn g_bytes_get_data(bytes: usize, size: usize) -> usize
+extern("c") fn g_random_int() -> u32
+extern("c") fn g_compute_checksum_for_data(kind: i32, data: usize, length: usize) -> usize
+extern("c") fn g_hash_table_new(hash: usize, equal: usize) -> usize
+extern("c") fn g_str_hash(key: usize) -> u32
+extern("c") fn g_str_equal(a: usize, b: usize) -> i32
+extern("c") fn g_strdup(text: usize) -> usize
+extern("c") fn g_free(address: usize) -> void
+extern("c") fn g_filter_input_stream_get_type() -> usize
+extern("c") fn g_object_new_with_properties(t: usize, count: u32, names: usize, values: usize) -> usize
+extern("c") fn g_filter_input_stream_get_base_stream(stream: usize) -> usize
+extern("c") fn g_pollable_input_stream_get_type() -> usize
+extern("c") fn g_pollable_source_new_full(stream: usize, child: usize, cancellable: usize) -> usize
+extern("c") fn g_input_stream_set_pending(stream: usize, err: usize) -> i32
+extern("c") fn g_input_stream_clear_pending(stream: usize) -> void
+extern("c") fn g_cancellable_set_error_if_cancelled(cancellable: usize, err: usize) -> i32
+extern("c") fn g_source_attach(source: usize, context: usize) -> u32
+extern("c") fn g_source_set_callback(source: usize, callback: usize, data: usize, destroy: usize) -> void
+extern("c") fn g_source_set_priority(source: usize, priority: i32) -> void
+extern("c") fn g_type_check_instance_is_a(instance: usize, t: usize) -> i32
+extern("c") fn g_error_matches(e: usize, domain: u32, code: i32) -> i32
+extern("c") fn g_error_free(e: usize) -> void
+
+// SoupMultipart.
+const M_MIME: usize = 0
+const M_BOUNDARY: usize = 8
+const M_HEADERS: usize = 16
+const M_BODIES: usize = 24
+const M_SIZE: usize = 32
+
+// SoupMultipartInputStream.
+const R_MSG: usize = 0
+const R_BOUNDARY: usize = 8
+const R_BOUNDARY_SIZE: usize = 16
+const R_DONE_WITH_PART: usize = 24
+const R_REMAINING: usize = 32
+const R_HEADERS: usize = 40
+const R_BUF: usize = 48
+const R_BUF_LEN: usize = 56
+const R_BUF_SIZE: usize = 64
+const R_NEED_MORE: usize = 72
+const R_META: usize = 80
+const R_META_LEN: usize = 88
+const R_GOT_BOUNDARY: usize = 96
+const R_SIZE: usize = 104
+
+const HEADERS_MULTIPART: i32 = 2
+const CHECKSUM_SHA256: i32 = 2
+const BLOCK: usize = 8192
+
+// ---------------------------------------------------------------------------
+// SoupMultipart
+
+var multipartType: usize = 0
+
+export fn soup_multipart_get_type() -> usize {
+    if c.onceEnter(&multipartType) {
+        c.onceLeave(&multipartType, g.g_boxed_type_register_static(m.literal("SoupMultipart"), @intFromPtr(__mlx_soup_multipart_copy), @intFromPtr(soup_multipart_free)))
+    }
+    return multipartType
+}
+
+fn newInternal(mimeType: usize, boundary: usize) -> usize {
+    const multipart = m.alloc(M_SIZE)
+    m.putWord(multipart + M_MIME, mimeType)
+    m.putWord(multipart + M_BOUNDARY, boundary)
+    m.putWord(multipart + M_HEADERS, g_ptr_array_new_with_free_func(@intFromPtr(soup_message_headers_unref)))
+    m.putWord(multipart + M_BODIES, g_ptr_array_new_with_free_func(@intFromPtr(g_bytes_unref)))
+    return multipart
+}
+
+fn partCount(multipart: usize) -> usize { return @intCast(usize, m.get32(m.getWord(multipart + M_BODIES) + 8)) }
+fn partAt(array: usize, index: usize) -> usize { return m.getWord(m.getWord(array) + index * 8) }
+
+// A boundary of 64 hex digits: the SHA-256 of 64 random bits.
+fn generateBoundary() -> usize {
+    var data: [2]u32 = [2]u32{ g_random_int(), g_random_int() }
+    return g_compute_checksum_for_data(CHECKSUM_SHA256, @intFromPtr(&data), 8)
+}
+
+export fn soup_multipart_new(mimeType: usize) -> usize { return newInternal(g_strdup(mimeType), generateBoundary()) }
+
+// Where "--boundary" starts a line in [start, end) and is followed by "--"
+// or a line end (0: nowhere).
+fn findBoundary(start: usize, end: usize, boundary: usize, length: usize) -> usize {
+    var b = start
+    while b + length + 4 < end {
+        if m.get8(b) == 45 && m.get8(b + 1) == 45 && m.same(m.bytes(b + 2, length), m.bytes(boundary, length)) {
+            const atLineStart = b == start || (b - start >= 2 && m.get8(b - 1) == 10 && m.get8(b - 2) == 13)
+            const after0 = m.get8(b + length + 2)
+            const after1 = m.get8(b + length + 3)
+            if atLineStart && ((after0 == 45 && after1 == 45) || (after0 == 13 && after1 == 10)) { return b }
+            // libsoup looks on from two bytes on.
+            b += 2
+        } else if m.get8(b) == 45 {
+            b += 2
+        } else {
+            b += 1
+        }
+    }
+    return 0
+}
+
+// The first "\r\n\r\n" in [start, end) (0: none).
+fn findBlankLine(start: usize, end: usize) -> usize {
+    var p = start
+    while p + 4 <= end {
+        if m.get8(p) == 13 && m.get8(p + 1) == 10 && m.get8(p + 2) == 13 && m.get8(p + 3) == 10 { return p }
+        p += 1
+    }
+    return 0
+}
+
+export fn soup_multipart_new_from_message(hdrs: usize, body: usize) -> usize {
+    const paramsCell = m.alloc(8)
+    const contentType = soup_message_headers_get_content_type(hdrs, paramsCell)
+    const params = m.getWord(paramsCell)
+    m.release(paramsCell)
+    if contentType == 0 { return 0 }
+    const boundaryParam = g.g_hash_table_lookup(params, m.literal("boundary"))
+    const text = m.cSlice(contentType)
+    if text.length < 10 || !m.same(text[0..10], "multipart/") || boundaryParam == 0 {
+        g.g_hash_table_destroy(params)
+        return 0
+    }
+    const multipart = newInternal(g_strdup(contentType), g_strdup(boundaryParam))
+    g.g_hash_table_destroy(params)
+    const sizeCell = m.alloc(8)
+    const data = g_bytes_get_data(body, sizeCell)
+    const bodyEnd = data + m.getWord(sizeCell)
+    m.release(sizeCell)
+    const boundary = m.getWord(multipart + M_BOUNDARY)
+    const length = m.cLength(boundary)
+    // The preamble is skipped.
+    var start = findBoundary(data, bodyEnd, boundary, length)
+    if start == 0 {
+        soup_multipart_free(multipart)
+        return 0
+    }
+    while m.get8(start + 2 + length) != 45 {
+        const end = findBoundary(start + 2 + length, bodyEnd, boundary, length)
+        if end == 0 {
+            soup_multipart_free(multipart)
+            return 0
+        }
+        var split = findBlankLine(start, bodyEnd)
+        if split == 0 || split > end {
+            soup_multipart_free(multipart)
+            return 0
+        }
+        split += 4
+        // The headers are parsed from the boundary line, which stands for
+        // the status line soup_headers_parse skips.
+        const partHeaders = soup_message_headers_new(HEADERS_MULTIPART)
+        g_ptr_array_add(m.getWord(multipart + M_HEADERS), partHeaders)
+        if soup_headers_parse(start, @intCast(i32, split - 2 - start), partHeaders) == 0 {
+            soup_multipart_free(multipart)
+            return 0
+        }
+        // The body ends before the line end that comes before the boundary.
+        const bodyLength = if end - 2 >= split { end - 2 - split } else { 0 }
+        g_ptr_array_add(m.getWord(multipart + M_BODIES), g_bytes_new_from_bytes(body, split - data, bodyLength))
+        start = end
+    }
+    return multipart
+}
+
+export fn soup_multipart_get_length(multipart: usize) -> i32 { return @intCast(i32, partCount(multipart)) }
+
+export fn soup_multipart_get_part(multipart: usize, part: i32, hdrs: usize, body: usize) -> i32 {
+    if part < 0 || @intCast(usize, part) >= partCount(multipart) { return 0 }
+    const index = @intCast(usize, part)
+    m.putWord(hdrs, partAt(m.getWord(multipart + M_HEADERS), index))
+    m.putWord(body, partAt(m.getWord(multipart + M_BODIES), index))
+    return 1
+}
+
+export fn soup_multipart_append_part(multipart: usize, hdrs: usize, body: usize) -> void {
+    const copy = soup_message_headers_new(HEADERS_MULTIPART)
+    const iter = m.alloc(32)
+    const cells = m.alloc(16)
+    soup_message_headers_iter_init(iter, hdrs)
+    while soup_message_headers_iter_next(iter, cells, cells + 8) != 0 { soup_message_headers_append(copy, m.getWord(cells), m.getWord(cells + 8)) }
+    m.release(cells)
+    m.release(iter)
+    g_ptr_array_add(m.getWord(multipart + M_HEADERS), copy)
+    g_ptr_array_add(m.getWord(multipart + M_BODIES), g_bytes_ref(body))
+}
+
+export fn soup_multipart_append_form_string(multipart: usize, name: usize, data: usize) -> void {
+    const body = g_bytes_new(data, m.cLength(data))
+    soup_multipart_append_form_file(multipart, name, 0, 0, body)
+    g_bytes_unref(body)
+}
+
+export fn soup_multipart_append_form_file(multipart: usize, name: usize, filename: usize, contentType: usize, body: usize) -> void {
+    const hdrs = soup_message_headers_new(HEADERS_MULTIPART)
+    const disposition = g.g_string_new(m.literal("form-data; "))
+    soup_header_g_string_append_param_quoted(disposition, m.literal("name"), name)
+    if filename != 0 {
+        _ = g.g_string_append_len(disposition, m.literal("; "), 2)
+        soup_header_g_string_append_param_quoted(disposition, m.literal("filename"), filename)
+    }
+    soup_message_headers_append(hdrs, m.literal("Content-Disposition"), m.getWord(disposition))
+    _ = g.g_string_free(disposition, 1)
+    if contentType != 0 { soup_message_headers_append(hdrs, m.literal("Content-Type"), contentType) }
+    g_ptr_array_add(m.getWord(multipart + M_HEADERS), hdrs)
+    g_ptr_array_add(m.getWord(multipart + M_BODIES), g_bytes_ref(body))
+}
+
+fn appendC(s: usize, text: usize) -> void { _ = g.g_string_append_len(s, text, @intCast(i64, m.cLength(text))) }
+fn appendText(s: usize, text: []const u8) -> void { _ = g.g_string_append_len(s, @intFromPtr(text.pointer), @intCast(i64, text.length)) }
+
+export fn soup_multipart_to_message(multipart: usize, dest: usize, destBody: usize) -> void {
+    const params = g_hash_table_new(@intFromPtr(g_str_hash), @intFromPtr(g_str_equal))
+    _ = g.g_hash_table_insert(params, m.literal("boundary"), m.getWord(multipart + M_BOUNDARY))
+    soup_message_headers_set_content_type(dest, m.getWord(multipart + M_MIME), params)
+    g.g_hash_table_destroy(params)
+    const s = g.g_string_new(0)
+    const boundary = m.getWord(multipart + M_BOUNDARY)
+    const iter = m.alloc(32)
+    const cells = m.alloc(16)
+    var index: usize = 0
+    while index < partCount(multipart) {
+        if index > 0 { appendText(s, "\r\n") }
+        appendText(s, "--")
+        appendC(s, boundary)
+        appendText(s, "\r\n")
+        soup_message_headers_iter_init(iter, partAt(m.getWord(multipart + M_HEADERS), index))
+        while soup_message_headers_iter_next(iter, cells, cells + 8) != 0 {
+            appendC(s, m.getWord(cells))
+            appendText(s, ": ")
+            appendC(s, m.getWord(cells + 8))
+            appendText(s, "\r\n")
+        }
+        appendText(s, "\r\n")
+        const sizeCell = m.alloc(8)
+        const data = g_bytes_get_data(partAt(m.getWord(multipart + M_BODIES), index), sizeCell)
+        _ = g.g_string_append_len(s, data, @intCast(i64, m.getWord(sizeCell)))
+        m.release(sizeCell)
+        index += 1
+    }
+    m.release(cells)
+    m.release(iter)
+    // (A line end after the close delimiter, as everyone sends it.)
+    appendText(s, "\r\n--")
+    appendC(s, boundary)
+    appendText(s, "--\r\n")
+    const length = m.getWord(s + 8)
+    m.putWord(destBody, g_bytes_new_take(g.g_string_free(s, 0), length))
+}
+
+export fn soup_multipart_free(multipart: usize) -> void {
+    g_free(m.getWord(multipart + M_MIME))
+    g_free(m.getWord(multipart + M_BOUNDARY))
+    _ = g_ptr_array_free(m.getWord(multipart + M_HEADERS), 1)
+    _ = g_ptr_array_free(m.getWord(multipart + M_BODIES), 1)
+    m.release(multipart)
+}
+
+export fn __mlx_soup_multipart_copy(multipart: usize) -> usize {
+    const copy = newInternal(g_strdup(m.getWord(multipart + M_MIME)), g_strdup(m.getWord(multipart + M_BOUNDARY)))
+    var index: usize = 0
+    while index < partCount(multipart) {
+        soup_multipart_append_part(copy, partAt(m.getWord(multipart + M_HEADERS), index), partAt(m.getWord(multipart + M_BODIES), index))
+        index += 1
+    }
+    return copy
+}
+
+// ---------------------------------------------------------------------------
+// SoupMultipartInputStream: the type
+
+var streamType: usize = 0
+var privateOffset: i32 = 0
+var parentClass: usize = 0
+
+export fn soup_multipart_input_stream_get_type() -> usize {
+    if c.onceEnter(&streamType) {
+        const t = c.defineType(g_filter_input_stream_get_type(), "SoupMultipartInputStream", 272, @intFromPtr(__mlx_soup_multipart_stream_class_init), 40, @intFromPtr(__mlx_soup_multipart_stream_init), c.FINAL)
+        privateOffset = c.addPrivate(t, 8)
+        c.implement(t, g_pollable_input_stream_get_type(), @intFromPtr(__mlx_soup_multipart_stream_pollable_init))
+        c.onceLeave(&streamType, t)
+    }
+    return streamType
+}
+
+fn priv(stream: usize) -> usize { return m.getWord(c.privateAt(stream, privateOffset)) }
+fn baseOf(stream: usize) -> usize { return g_filter_input_stream_get_base_stream(stream) }
+
+export fn __mlx_soup_multipart_stream_init(stream: usize, class: usize) -> void { m.putWord(c.privateAt(stream, privateOffset), m.alloc(R_SIZE)) }
+
+export fn __mlx_soup_multipart_stream_dispose(stream: usize) -> void {
+    c.clearObject(priv(stream) + R_MSG)
+    c.chainUp(parentClass, 40, stream)
+}
+
+export fn __mlx_soup_multipart_stream_finalize(stream: usize) -> void {
+    const r = priv(stream)
+    g_free(m.getWord(r + R_BOUNDARY))
+    m.release(m.getWord(r + R_BUF))
+    m.release(m.getWord(r + R_META))
+    if m.getWord(r + R_HEADERS) != 0 { soup_message_headers_unref(m.getWord(r + R_HEADERS)) }
+    m.release(r)
+    c.chainUp(parentClass, 48, stream)
+}
+
+export fn __mlx_soup_multipart_stream_set_property(stream: usize, id: u32, value: usize, pspec: usize) -> void {
+    if id == 1 { c.replaceObject(priv(stream) + R_MSG, g.g_value_get_object(value)) }
+}
+
+export fn __mlx_soup_multipart_stream_get_property(stream: usize, id: u32, value: usize, pspec: usize) -> void {
+    if id == 1 { g.g_value_set_object(value, m.getWord(priv(stream) + R_MSG)) }
+}
+
+// The boundary, from the response's Content-Type ("--" before it unless
+// it starts so).
+export fn __mlx_soup_multipart_stream_constructed(stream: usize) -> void {
+    const r = priv(stream)
+    const paramsCell = m.alloc(8)
+    _ = soup_message_headers_get_content_type(message.responseHeaders(m.getWord(r + R_MSG)), paramsCell)
+    const params = m.getWord(paramsCell)
+    m.release(paramsCell)
+    const boundary = if params != 0 { g.g_hash_table_lookup(params, m.literal("boundary")) } else { 0 }
+    if boundary != 0 {
+        const text = m.cSlice(boundary)
+        if text.length >= 2 && text[0] == 45 && text[1] == 45 {
+            m.putWord(r + R_BOUNDARY, g_strdup(boundary))
+        } else {
+            var t = m.text()
+            m.pushText(&t, "--")
+            m.pushText(&t, text)
+            const made = m.finish(&t)
+            m.putWord(r + R_BOUNDARY, g_strdup(made))
+            m.release(made)
+        }
+        m.putWord(r + R_BOUNDARY_SIZE, m.cLength(m.getWord(r + R_BOUNDARY)))
+    } else {
+        c.warning("No boundary found in message tagged as multipart.")
+    }
+    if params != 0 { g.g_hash_table_destroy(params) }
+    const f = m.getWord(parentClass + 72)
+    if f != 0 {
+        const call: c.ObjectFunc = unsafe { @ptrFromInt(c.ObjectFunc, f) }
+        call(stream)
+    }
+}
+
+export fn __mlx_soup_multipart_stream_class_init(class: usize, data: usize) -> void {
+    c.adjustPrivate(class, &privateOffset)
+    parentClass = g.g_type_class_peek_parent(class)
+    m.putWord(class + 24, @intFromPtr(__mlx_soup_multipart_stream_set_property))
+    m.putWord(class + 32, @intFromPtr(__mlx_soup_multipart_stream_get_property))
+    m.putWord(class + 40, @intFromPtr(__mlx_soup_multipart_stream_dispose))
+    m.putWord(class + 48, @intFromPtr(__mlx_soup_multipart_stream_finalize))
+    m.putWord(class + 72, @intFromPtr(__mlx_soup_multipart_stream_constructed))
+    m.putWord(class + 136, @intFromPtr(__mlx_soup_multipart_stream_read))
+    _ = c.objectProperty(class, 1, "message", message.messageTypeGet(), c.READWRITE | c.CONSTRUCT_ONLY)
+}
+
+// ---------------------------------------------------------------------------
+// The buffer (libsoup's SoupFilterInputStream)
+
+fn wouldBlockError(err: usize) -> i64 {
+    c.setError(err, g.g_io_error_quark(), conn.WOULD_BLOCK, "Operation would block")
+    return -1
+}
+
+// Takes `count` bytes (at most what is held) off the buffer's front into
+// `buffer` (0: dropped).
+fn readFromBuf(r: usize, buffer: usize, countIn: usize) -> i64 {
+    const length = m.getWord(r + R_BUF_LEN)
+    const count = if countIn > length { length } else { countIn }
+    const buf = m.getWord(r + R_BUF)
+    if buffer != 0 { m.copy(buffer, buf, count) }
+    if count < length {
+        var index: usize = 0
+        while index < length - count {
+            m.put8(buf + index, m.get8(buf + count + index))
+            index += 1
+        }
+    }
+    m.putWord(r + R_BUF_LEN, length - count)
+    return @intCast(i64, count)
+}
+
+// A read of the filter stream: what the buffer holds, else the base's.
+fn filterRead(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const r = priv(stream)
+    m.putI32(r + R_NEED_MORE, 0)
+    if m.getWord(r + R_BUF_LEN) > 0 { return readFromBuf(r, buffer, count) }
+    return bodystream.readStream(baseOf(stream), buffer, count, blocking, cancellable, err)
+}
+
+// soup_filter_input_stream_read_until: up to `length` bytes into
+// `buffer`, ending at `boundary` (with it when `include`) when it is found
+// in the reach of what can be given.
+fn readUntil(stream: usize, buffer: usize, length: usize, boundary: usize, boundaryLength: usize, blocking: bool, include: bool, gotBoundary: *bool, cancellable: usize, err: usize) -> i64 {
+    const r = priv(stream)
+    gotBoundary.* = false
+    m.putI32(r + R_NEED_MORE, 0)
+    var eof = false
+    var fill = m.getWord(r + R_BUF_LEN) < boundaryLength
+    while true {
+        if fill {
+            const previous = m.getWord(r + R_BUF_LEN)
+            if m.getWord(r + R_BUF_SIZE) < length {
+                m.putWord(r + R_BUF, m.grow(m.getWord(r + R_BUF), length))
+                m.putWord(r + R_BUF_SIZE, length)
+            }
+            const cell = m.alloc(8)
+            const n = bodystream.readStream(baseOf(stream), m.getWord(r + R_BUF) + previous, length - previous, blocking, cancellable, cell)
+            if n <= 0 {
+                const e = m.getWord(cell)
+                m.release(cell)
+                if n == 0 && previous > 0 {
+                    eof = true
+                } else {
+                    if e != 0 && g_error_matches(e, g.g_io_error_quark(), conn.WOULD_BLOCK) != 0 { m.putI32(r + R_NEED_MORE, 1) }
+                    if e != 0 {
+                        if err != 0 { m.putWord(err, e) } else { g_error_free(e) }
+                    }
+                    return n
+                }
+            } else {
+                m.release(cell)
+                m.putWord(r + R_BUF_LEN, previous + @intCast(usize, n))
+            }
+        }
+        const buf = m.getWord(r + R_BUF)
+        const held = m.getWord(r + R_BUF_LEN)
+        // The scan reaches as far as what could be given.
+        var last: i64 = 0
+        if include {
+            last = @intCast(i64, if held < length { held } else { length }) - @intCast(i64, boundaryLength)
+        } else {
+            const room = @intCast(i64, held) - @intCast(i64, boundaryLength)
+            last = if room < @intCast(i64, length) { room } else { @intCast(i64, length) }
+        }
+        var p: i64 = 0
+        while p <= last {
+            const at = buf + @intCast(usize, p)
+            if m.get8(at) == m.get8(boundary) && m.same(m.bytes(at, boundaryLength), m.bytes(boundary, boundaryLength)) {
+                if include { p += @intCast(i64, boundaryLength) }
+                gotBoundary.* = true
+                break
+            }
+            p += 1
+        }
+        if !gotBoundary.* && held < length && !eof {
+            fill = true
+            continue
+        }
+        var take: usize = 0
+        if eof && !gotBoundary.* {
+            take = if held < length { held } else { length }
+        } else {
+            take = if p < 0 { 0 } else { @intCast(usize, p) }
+            // libsoup gives one byte more than asked for here when the
+            // buffer holds more than that and no boundary: kept to `length`.
+            if take > length { take = length }
+        }
+        return readFromBuf(r, buffer, take)
+    }
+    return 0
+}
+
+fn readLine(stream: usize, buffer: usize, length: usize, blocking: bool, gotLine: *bool, cancellable: usize, err: usize) -> i64 {
+    return readUntil(stream, buffer, length, m.literal("\n"), 1, blocking, true, gotLine, cancellable, err)
+}
+
+// ---------------------------------------------------------------------------
+// Reading a part
+
+fn readReal(stream: usize, buffer: usize, count: usize, blocking: bool, cancellable: usize, err: usize) -> i64 {
+    const r = priv(stream)
+    if m.getWord(r + R_BOUNDARY) == 0 {
+        c.critical("soup_multipart_input_stream_read_real: assertion 'priv->boundary != NULL' failed")
+        return -1
+    }
+    const boundarySize = m.getWord(r + R_BOUNDARY_SIZE)
+    // A part with a Content-Length is read straight until near its end.
+    const remaining = m.getI64(r + R_REMAINING)
+    if remaining > @intCast(i64, boundarySize) {
+        const left = @intCast(usize, remaining) - boundarySize
+        const n = filterRead(stream, buffer, if count < left { count } else { left }, blocking, cancellable, err)
+        if n > 0 { m.putI64(r + R_REMAINING, remaining - n) }
+        return n
+    }
+    if m.getI32(r + R_DONE_WITH_PART) != 0 { return 0 }
+    var got = false
+    var n = readUntil(stream, buffer, count, m.getWord(r + R_BOUNDARY), boundarySize, blocking, false, &got, cancellable, err)
+    if n <= 0 || !got { return n }
+    m.putI32(r + R_DONE_WITH_PART, 1)
+    // The line end before the boundary is not the part's.
+    if n == 1 {
+        if m.get8(buffer) == 10 { n -= 1 }
+    } else {
+        const tail = buffer + @intCast(usize, n) - 2
+        if m.get8(tail) == 13 && m.get8(tail + 1) == 10 {
+            n -= 2
+        } else if m.get8(tail) == 10 {
+            n -= 1
+        }
+    }
+    return n
+}
+
+export fn __mlx_soup_multipart_stream_read(stream: usize, buffer: usize, count: usize, cancellable: usize, err: usize) -> i64 { return readReal(stream, buffer, count, true, cancellable, err) }
+
+export fn __mlx_soup_multipart_stream_is_readable(stream: usize) -> i32 {
+    const r = priv(stream)
+    if m.getWord(r + R_BUF_LEN) > 0 && m.getI32(r + R_NEED_MORE) == 0 { return 1 }
+    return if bodystream.readable(baseOf(stream)) { 1 } else { 0 }
+}
+
+export fn __mlx_soup_multipart_stream_read_nonblocking(stream: usize, buffer: usize, count: usize, err: usize) -> i64 { return readReal(stream, buffer, count, false, 0, err) }
+
+fn baseSource(stream: usize, cancellable: usize) -> usize {
+    const r = priv(stream)
+    if m.getWord(r + R_BUF_LEN) > 0 && m.getI32(r + R_NEED_MORE) == 0 { return g.g_timeout_source_new(0) }
+    const base = baseOf(stream)
+    if g_type_check_instance_is_a(base, g_pollable_input_stream_get_type()) != 0 && g.g_pollable_input_stream_can_poll(base) != 0 { return g.g_pollable_input_stream_create_source(base, cancellable) }
+    return g.g_timeout_source_new(0)
+}
+
+export fn __mlx_soup_multipart_stream_create_source(stream: usize, cancellable: usize) -> usize {
+    const child = baseSource(stream, cancellable)
+    const source = g_pollable_source_new_full(stream, child, cancellable)
+    g.g_source_unref(child)
+    return source
+}
+
+export fn __mlx_soup_multipart_stream_can_poll(stream: usize) -> i32 { return 1 }
+
+export fn __mlx_soup_multipart_stream_pollable_init(iface: usize, data: usize) -> void {
+    m.putWord(iface + 16, @intFromPtr(__mlx_soup_multipart_stream_can_poll))
+    m.putWord(iface + 24, @intFromPtr(__mlx_soup_multipart_stream_is_readable))
+    m.putWord(iface + 32, @intFromPtr(__mlx_soup_multipart_stream_create_source))
+    m.putWord(iface + 40, @intFromPtr(__mlx_soup_multipart_stream_read_nonblocking))
+}
+
+// ---------------------------------------------------------------------------
+// The parts' headers
+
+fn metaAppend(r: usize, data: usize, length: usize) -> void {
+    const old = m.getWord(r + R_META_LEN)
+    m.putWord(r + R_META, m.grow(m.getWord(r + R_META), old + length + 1))
+    m.copy(m.getWord(r + R_META) + old, data, length)
+    m.putWord(r + R_META_LEN, old + length)
+}
+
+fn metaEndsWith(r: usize, text: []const u8) -> bool {
+    const length = m.getWord(r + R_META_LEN)
+    if length < text.length { return false }
+    return m.same(m.bytes(m.getWord(r + R_META) + length - text.length, text.length), text)
+}
+
+// 1: the headers were read (or the stream ended); 0: there are no more
+// parts; -1: the reading would block (not `blocking`). The boundary line
+// seen and the lines read are kept across calls that would block.
+fn readHeaders(stream: usize, blocking: bool, cancellable: usize, err: usize) -> i32 {
+    const r = priv(stream)
+    if m.getWord(r + R_BOUNDARY) == 0 {
+        c.critical("soup_multipart_input_stream_read_headers: assertion 'priv->boundary != NULL' failed")
+        return 1
+    }
+    const boundary = m.getWord(r + R_BOUNDARY)
+    const boundarySize = m.getWord(r + R_BOUNDARY_SIZE)
+    const line = m.raw(BLOCK)
+    var result: i32 = 1
+    while true {
+        var gotLf = false
+        const cell = m.alloc(8)
+        const n = readLine(stream, line, BLOCK, blocking, &gotLf, cancellable, cell)
+        const e = m.getWord(cell)
+        m.release(cell)
+        if n < 0 && e != 0 && g_error_matches(e, g.g_io_error_quark(), conn.WOULD_BLOCK) != 0 {
+            g_error_free(e)
+            result = -1
+            break
+        }
+        if n <= 0 {
+            if e != 0 {
+                if err != 0 { m.putWord(err, e) } else { g_error_free(e) }
+            }
+            break
+        }
+        const count = @intCast(usize, n)
+        metaAppend(r, line, count)
+        // The boundary is looked for before the line end: the last
+        // boundary need not end its line.
+        if m.getI32(r + R_GOT_BOUNDARY) == 0 && m.getWord(r + R_META_LEN) >= boundarySize && m.same(m.bytes(m.getWord(r + R_META), boundarySize), m.bytes(boundary, boundarySize)) {
+            m.putI32(r + R_GOT_BOUNDARY, 1)
+            // The closing boundary: no more parts.
+            const ends4 = count >= 4 && m.same(m.bytes(line + count - 4, 4), "--\r\n")
+            const ends3 = count >= 3 && m.same(m.bytes(line + count - 3, 3), "--\n")
+            const ends2 = count >= 3 && m.same(m.bytes(line + count - 2, 2), "--")
+            if ends4 || ends3 || ends2 {
+                m.putWord(r + R_META_LEN, 0)
+                result = 0
+                break
+            }
+        }
+        if !gotLf {
+            c.critical("soup_multipart_input_stream_read_headers: assertion 'got_lf' failed")
+            result = 0
+            break
+        }
+        // Lines before the boundary are dropped.
+        if m.getI32(r + R_GOT_BOUNDARY) == 0 {
+            m.putWord(r + R_META_LEN, 0)
+            continue
+        }
+        if count == 1 && metaEndsWith(r, "\n\n") { break }
+        if count == 2 && metaEndsWith(r, "\n\r\n") { break }
+    }
+    m.release(line)
+    return result
+}
+
+fn parseHeaders(stream: usize) -> void {
+    const r = priv(stream)
+    const hdrs = soup_message_headers_new(HEADERS_MULTIPART)
+    m.putWord(r + R_HEADERS, hdrs)
+    // A part without headers is still a part.
+    const length = m.getWord(r + R_META_LEN)
+    if length == 0 { return }
+    if soup_headers_parse(m.getWord(r + R_META), @intCast(i32, length), hdrs) != 0 {
+        m.putI64(r + R_REMAINING, soup_message_headers_get_content_length(hdrs))
+    } else {
+        soup_message_headers_unref(hdrs)
+        m.putWord(r + R_HEADERS, 0)
+    }
+    m.putWord(r + R_META_LEN, 0)
+}
+
+fn beginPart(stream: usize) -> void {
+    const r = priv(stream)
+    if m.getWord(r + R_HEADERS) != 0 {
+        soup_message_headers_unref(m.getWord(r + R_HEADERS))
+        m.putWord(r + R_HEADERS, 0)
+    }
+    m.putI32(r + R_GOT_BOUNDARY, 0)
+}
+
+// The part's body: the multipart stream's reads until the part's end.
+fn finishPart(stream: usize) -> usize {
+    parseHeaders(stream)
+    m.putI32(priv(stream) + R_DONE_WITH_PART, 0)
+    return bodystream.newPart(stream)
+}
+
+export fn soup_multipart_input_stream_new(msg: usize, base: usize) -> usize {
+    var names: [2]usize = [2]usize{ m.literal("message"), m.literal("base-stream") }
+    const values = m.alloc(48)
+    _ = g.g_value_init(values, message.messageTypeGet())
+    g.g_value_set_object(values, msg)
+    _ = g.g_value_init(values + 24, g.g_input_stream_get_type())
+    g.g_value_set_object(values + 24, base)
+    const stream = g_object_new_with_properties(soup_multipart_input_stream_get_type(), 2, @intFromPtr(&names), values)
+    g.g_value_unset(values)
+    g.g_value_unset(values + 24)
+    m.release(values)
+    return stream
+}
+
+export fn soup_multipart_input_stream_next_part(stream: usize, cancellable: usize, err: usize) -> usize {
+    beginPart(stream)
+    if readHeaders(stream, true, cancellable, err) == 0 { return 0 }
+    return finishPart(stream)
+}
+
+// The asynchronous next part: the headers are read without blocking, and
+// read on when the stream has more.
+fn nextPartStep(task: usize) -> void {
+    const stream = g.g_task_get_source_object(task)
+    const cancellable = g.g_task_get_cancellable(task)
+    const cell = m.alloc(8)
+    if g_cancellable_set_error_if_cancelled(cancellable, cell) != 0 {
+        g_input_stream_clear_pending(stream)
+        g.g_task_return_error(task, m.getWord(cell))
+        m.release(cell)
+        return
+    }
+    const result = readHeaders(stream, false, cancellable, cell)
+    if result < 0 {
+        m.release(cell)
+        const source = __mlx_soup_multipart_stream_create_source(stream, cancellable)
+        g_source_set_priority(source, g.g_task_get_priority(task))
+        g_source_set_callback(source, @intFromPtr(__mlx_soup_multipart_next_part_ready), g.g_object_ref(task), @intFromPtr(g.g_object_unref))
+        _ = g_source_attach(source, g.g_task_get_context(task))
+        g.g_source_unref(source)
+        return
+    }
+    g_input_stream_clear_pending(stream)
+    if m.getWord(cell) != 0 {
+        g.g_task_return_error(task, m.getWord(cell))
+    } else if result == 0 {
+        g.g_task_return_pointer(task, 0, @intFromPtr(g.g_object_unref))
+    } else {
+        g.g_task_return_pointer(task, finishPart(stream), @intFromPtr(g.g_object_unref))
+    }
+    m.release(cell)
+}
+
+export fn __mlx_soup_multipart_next_part_ready(stream: usize, task: usize) -> i32 {
+    nextPartStep(task)
+    return 0
+}
+
+export fn soup_multipart_input_stream_next_part_async(stream: usize, priority: i32, cancellable: usize, callback: usize, data: usize) -> void {
+    const task = g.g_task_new(stream, cancellable, callback, data)
+    g.g_task_set_source_tag(task, @intFromPtr(soup_multipart_input_stream_next_part_async))
+    g.g_task_set_priority(task, priority)
+    const cell = m.alloc(8)
+    if g_input_stream_set_pending(stream, cell) == 0 {
+        g.g_task_return_error(task, m.getWord(cell))
+        m.release(cell)
+        g.g_object_unref(task)
+        return
+    }
+    m.release(cell)
+    beginPart(stream)
+    nextPartStep(task)
+    g.g_object_unref(task)
+}
+
+export fn soup_multipart_input_stream_next_part_finish(stream: usize, result: usize, err: usize) -> usize { return g.g_task_propagate_pointer(result, err) }
+
+export fn soup_multipart_input_stream_get_headers(stream: usize) -> usize { return m.getWord(priv(stream) + R_HEADERS) }

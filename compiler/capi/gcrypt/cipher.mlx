@@ -1,0 +1,526 @@
+// Symmetric ciphers (gcry_cipher_*): AES-128, AES-192 and AES-256 (std.aes,
+// bitsliced) in the modes WebCrypto uses: ECB, CBC, CTR, GCM and the AES
+// key wrap (RFC 3394), as libgcrypt runs them.
+//
+// CBC and ECB take whole blocks (no padding: WebCore pads); CTR keeps the
+// unused part of its last keystream block for the next call; GCM takes
+// its additional data before the text, in pieces of any size, and the
+// text in pieces of whole blocks but the last, its GHASH run as they come
+// (std.crypto.gcm's); the key wrap writes 8 bytes more than it takes and
+// unwraps 8 fewer, GPG_ERR_CHECKSUM when the integrity check fails.
+// `in` NULL works in place on `out`.
+const c = @import("./common.mlx")
+const aes = @import("std.aes")
+const gcm = @import("std.crypto.gcm")
+
+const MODE_ECB: i32 = 1
+const MODE_CBC: i32 = 3
+const MODE_CTR: i32 = 6
+const MODE_AESWRAP: i32 = 7
+const MODE_GCM: i32 = 9
+
+const CipherHandle = struct {
+    algo: i32
+    mode: i32
+    keyLength: usize
+    keyed: bool
+    aead: gcm.Gcm
+    // CBC's chaining value; CTR's counter; GCM's J0.
+    iv: [16]u8
+    counter: [16]u8
+    // CTR's keystream block and how much of it is used.
+    stream: [16]u8
+    streamUsed: usize
+    // GCM: the GHASH, what of the AAD and the text it has not taken yet
+    // (less than a block), the lengths, the counter of the text.
+    ghash: gcm.Ghash
+    pending: [16]u8
+    pendingLength: usize
+    aadLength: u64
+    textLength: u64
+    textStarted: bool
+    tagDone: bool
+    tag: [16]u8
+}
+
+fn handleOf(handle: usize) -> *CipherHandle { unsafe { return @ptrFromInt(*CipherHandle, handle) } }
+
+fn keyLengthOf(algo: i32) -> usize {
+    if algo == 7 { return 16 }
+    if algo == 8 { return 24 }
+    if algo == 9 { return 32 }
+    return 0
+}
+
+export fn gcry_cipher_get_algo_keylen(algo: i32) -> usize { return keyLengthOf(algo) }
+
+export fn gcry_cipher_get_algo_blklen(algo: i32) -> usize {
+    return if keyLengthOf(algo) == 0 { 0 } else { 16 }
+}
+
+export fn gcry_cipher_open(out: usize, algo: i32, mode: i32, flags: u32) -> u32 {
+    c.putWord(out, 0)
+    const keyLength = keyLengthOf(algo)
+    if keyLength == 0 { return c.failure(c.CIPHER_ALGO) }
+    if mode != MODE_ECB && mode != MODE_CBC && mode != MODE_CTR && mode != MODE_AESWRAP && mode != MODE_GCM { return c.failure(c.INV_CIPHER_MODE) }
+    if (flags & 4294967290) != 0 { return c.failure(c.INV_FLAG) }
+    const handle = c.alloc(@sizeOf(CipherHandle))
+    if handle == 0 { return c.failure(c.ENOMEM) }
+    const h = handleOf(handle)
+    h.*.algo = algo
+    h.*.mode = mode
+    h.*.keyLength = keyLength
+    c.putWord(out, handle)
+    return 0
+}
+
+export fn gcry_cipher_close(handle: usize) -> void {
+    if handle == 0 { return }
+    gcm.finish(&handleOf(handle).*.aead)
+    c.wipeRelease(handle, @sizeOf(CipherHandle))
+}
+
+// The state after setkey: no IV, no counter, nothing of GCM's.
+fn resetState(h: *CipherHandle) -> void {
+    var index: usize = 0
+    while index < 16 {
+        h.*.iv[index] = 0
+        h.*.counter[index] = 0
+        h.*.stream[index] = 0
+        h.*.pending[index] = 0
+        h.*.tag[index] = 0
+        index += 1
+    }
+    h.*.streamUsed = 16
+    h.*.ghash = gcm.Ghash.{ .y1 = 0, .y0 = 0 }
+    h.*.pendingLength = 0
+    h.*.aadLength = 0
+    h.*.textLength = 0
+    h.*.textStarted = false
+    h.*.tagDone = false
+    if h.*.mode == MODE_GCM && h.*.keyed { gcmIv(h, @intFromPtr(&h.*.iv), 0) }
+}
+
+export fn gcry_cipher_setkey(handle: usize, key: usize, length: usize) -> u32 {
+    const h = handleOf(handle)
+    // libgcrypt reports this one from GPG_ERR_SOURCE_USER_1 (its public
+    // wrapper's default source), not from gcrypt.
+    if length != h.*.keyLength { return (32 << 24) | c.INV_KEYLEN }
+    if h.*.keyed { gcm.finish(&h.*.aead) }
+    const ok = gcm.init(&h.*.aead, c.bytes(key), length)
+    h.*.keyed = true
+    resetState(h)
+    return 0
+}
+
+// GCM's J0: the 12 bytes of a 96-bit IV and 1, or the GHASH of another
+// IV and its length (SP 800-38D, 7.1).
+fn gcmIv(h: *CipherHandle, iv: usize, length: usize) -> void {
+    if length == 12 {
+        c.copy(@intFromPtr(&h.*.iv), iv, 12)
+        h.*.iv[12] = 0
+        h.*.iv[13] = 0
+        h.*.iv[14] = 0
+        h.*.iv[15] = 1
+    } else {
+        var state = gcm.Ghash.{ .y1 = 0, .y0 = 0 }
+        if length > 0 { gcm.ghash(&h.*.aead, &state, c.bytes(iv), length) }
+        var lengths: [16]u8 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+        const bits = @intCast(u64, length) * 8
+        var index: usize = 0
+        while index < 8 {
+            lengths[15 - index] = @intCast(u8, (bits >> (8 * @intCast(u64, index))) & 255)
+            index += 1
+        }
+        const block: [*]const u8 = &lengths
+        gcm.ghash(&h.*.aead, &state, block, 16)
+        writeBig(&h.*.iv, 0, state.y1)
+        writeBig(&h.*.iv, 8, state.y0)
+    }
+    h.*.counter = h.*.iv
+    h.*.ghash = gcm.Ghash.{ .y1 = 0, .y0 = 0 }
+    h.*.pendingLength = 0
+    h.*.aadLength = 0
+    h.*.textLength = 0
+    h.*.textStarted = false
+    h.*.tagDone = false
+}
+
+fn writeBig(out: [*]u8, at: usize, value: u64) -> void {
+    var index: usize = 0
+    while index < 8 {
+        out[at + index] = @intCast(u8, (value >> (56 - 8 * @intCast(u64, index))) & 255)
+        index += 1
+    }
+}
+
+export fn gcry_cipher_setiv(handle: usize, iv: usize, length: usize) -> u32 {
+    const h = handleOf(handle)
+    if h.*.mode == MODE_GCM {
+        if !h.*.keyed { return c.failure(c.MISSING_KEY) }
+        gcmIv(h, iv, length)
+        return 0
+    }
+    var index: usize = 0
+    while index < 16 {
+        h.*.iv[index] = if iv != 0 && index < length { c.get8(iv + index) } else { 0 }
+        index += 1
+    }
+    return 0
+}
+
+export fn gcry_cipher_setctr(handle: usize, counter: usize, length: usize) -> u32 {
+    const h = handleOf(handle)
+    if counter != 0 && length != 16 { return c.failure(c.INV_ARG) }
+    var index: usize = 0
+    while index < 16 {
+        h.*.counter[index] = if counter != 0 { c.get8(counter + index) } else { 0 }
+        index += 1
+    }
+    h.*.streamUsed = 16
+    return 0
+}
+
+// GCRYCTL_RESET (4): the IV and the counter cleared, the key kept;
+// GCRYCTL_FINALIZE (5) has nothing to mark here.
+export fn gcry_cipher_ctl(handle: usize, cmd: i32, buffer: usize, length: usize) -> u32 {
+    if handle == 0 { return c.failure(c.INV_ARG) }
+    const h = handleOf(handle)
+    if cmd == 4 {
+        resetState(h)
+        return 0
+    }
+    if cmd == 5 { return 0 }
+    // GCRYCTL_SET_TAGLEN (75) and the CBC switches: not here.
+    return c.failure(c.INV_OP)
+}
+
+fn incrementCounter(counter: [*]u8) -> void {
+    var index: usize = 16
+    while index > 0 {
+        index -= 1
+        counter[index] = counter[index] +% 1
+        if counter[index] != 0 { break }
+    }
+}
+
+// GCM's text counter: the last 32 bits only.
+fn incrementCounter32(counter: [*]u8) -> void {
+    var index: usize = 16
+    while index > 12 {
+        index -= 1
+        counter[index] = counter[index] +% 1
+        if counter[index] != 0 { break }
+    }
+}
+
+// `length` bytes of CTR keystream XORed into `data`, the unused part of
+// the last block kept.
+fn ctr(h: *CipherHandle, data: usize, length: usize, gcmCounter: bool) -> void {
+    const stream: [*]u8 = &h.*.stream
+    const counter: [*]u8 = &h.*.counter
+    var at: usize = 0
+    while at < length {
+        if h.*.streamUsed == 16 {
+            if gcmCounter { incrementCounter32(counter) }
+            h.*.stream = h.*.counter
+            aes.aesEncrypt(&h.*.aead.cipher, stream)
+            if !gcmCounter { incrementCounter(counter) }
+            h.*.streamUsed = 0
+        }
+        c.put8(data + at, c.get8(data + at) ^ h.*.stream[h.*.streamUsed])
+        h.*.streamUsed += 1
+        at += 1
+    }
+}
+
+// GHASH of what comes, whole blocks at once, the rest kept.
+fn absorb(h: *CipherHandle, data: usize, length: usize) -> void {
+    var at: usize = 0
+    if h.*.pendingLength > 0 {
+        while h.*.pendingLength < 16 && at < length {
+            h.*.pending[h.*.pendingLength] = c.get8(data + at)
+            h.*.pendingLength += 1
+            at += 1
+        }
+        if h.*.pendingLength < 16 { return }
+        const block: [*]const u8 = &h.*.pending
+        gcm.ghash(&h.*.aead, &h.*.ghash, block, 16)
+        h.*.pendingLength = 0
+    }
+    const whole = (length - at) / 16 * 16
+    if whole > 0 {
+        gcm.ghash(&h.*.aead, &h.*.ghash, c.bytes(data + at), whole)
+        at += whole
+    }
+    while at < length {
+        h.*.pending[h.*.pendingLength] = c.get8(data + at)
+        h.*.pendingLength += 1
+        at += 1
+    }
+}
+
+// The rest of a GHASH input, padded with zeroes.
+fn flushPending(h: *CipherHandle) -> void {
+    if h.*.pendingLength == 0 { return }
+    const block: [*]const u8 = &h.*.pending
+    gcm.ghash(&h.*.aead, &h.*.ghash, block, h.*.pendingLength)
+    h.*.pendingLength = 0
+}
+
+export fn gcry_cipher_authenticate(handle: usize, aad: usize, length: usize) -> u32 {
+    const h = handleOf(handle)
+    if h.*.mode != MODE_GCM { return c.failure(c.INV_CIPHER_MODE) }
+    if h.*.textStarted || h.*.tagDone { return c.failure(c.INV_STATE) }
+    absorb(h, aad, length)
+    h.*.aadLength += @intCast(u64, length)
+    return 0
+}
+
+fn gcmText(h: *CipherHandle, out: usize, length: usize, decrypting: bool) -> u32 {
+    if h.*.tagDone { return c.failure(c.INV_STATE) }
+    if !h.*.textStarted {
+        flushPending(h)
+        h.*.textStarted = true
+        h.*.streamUsed = 16
+    }
+    if decrypting { absorb(h, out, length) }
+    ctr(h, out, length, true)
+    if !decrypting { absorb(h, out, length) }
+    h.*.textLength += @intCast(u64, length)
+    return 0
+}
+
+fn computeTag(h: *CipherHandle) -> void {
+    if h.*.tagDone { return }
+    if !h.*.textStarted {
+        flushPending(h)
+        h.*.textStarted = true
+    }
+    flushPending(h)
+    var lengths: [16]u8 = undefined
+    const block: [*]u8 = &lengths
+    writeBig(block, 0, h.*.aadLength * 8)
+    writeBig(block, 8, h.*.textLength * 8)
+    gcm.ghash(&h.*.aead, &h.*.ghash, block, 16)
+    var mask: [16]u8 = h.*.iv
+    const masked: [*]u8 = &mask
+    aes.aesEncrypt(&h.*.aead.cipher, masked)
+    writeBig(&h.*.tag, 0, h.*.ghash.y1)
+    writeBig(&h.*.tag, 8, h.*.ghash.y0)
+    var index: usize = 0
+    while index < 16 {
+        h.*.tag[index] = h.*.tag[index] ^ mask[index]
+        index += 1
+    }
+    h.*.tagDone = true
+}
+
+export fn gcry_cipher_gettag(handle: usize, tag: usize, length: usize) -> u32 {
+    const h = handleOf(handle)
+    if h.*.mode != MODE_GCM { return c.failure(c.INV_CIPHER_MODE) }
+    if length < 4 || length > 16 { return c.failure(c.INV_LENGTH) }
+    computeTag(h)
+    c.copy(tag, @intFromPtr(&h.*.tag), length)
+    return 0
+}
+
+export fn gcry_cipher_checktag(handle: usize, tag: usize, length: usize) -> u32 {
+    const h = handleOf(handle)
+    if h.*.mode != MODE_GCM { return c.failure(c.INV_CIPHER_MODE) }
+    if length < 4 || length > 16 { return c.failure(c.INV_LENGTH) }
+    computeTag(h)
+    var difference: u64 = 0
+    var index: usize = 0
+    while index < length {
+        difference = difference | @intCast(u64, h.*.tag[index] ^ c.get8(tag + index))
+        index += 1
+    }
+    if difference != 0 { return c.failure(c.CHECKSUM) }
+    return 0
+}
+
+// RFC 3394 with any AES key: `length` bytes (a multiple of 8, at least
+// 16) wrapped into length + 8.
+fn wrap(h: *CipherHandle, out: usize, input: usize, length: usize) -> void {
+    const blocks = length / 8
+    // R[1..n] after A, moved up first (out may be the input).
+    var index = length
+    while index > 0 {
+        index -= 1
+        c.put8(out + 8 + index, c.get8(input + index))
+    }
+    index = 0
+    while index < 8 {
+        c.put8(out + index, 166)
+        index += 1
+    }
+    var block: [16]u8 = undefined
+    const b: [*]u8 = &block
+    var step: usize = 0
+    while step < 6 {
+        var item: usize = 1
+        while item <= blocks {
+            index = 0
+            while index < 8 {
+                block[index] = c.get8(out + index)
+                block[8 + index] = c.get8(out + 8 * item + index)
+                index += 1
+            }
+            aes.aesEncrypt(&h.*.aead.cipher, b)
+            var t = @intCast(u64, blocks * step + item)
+            index = 0
+            while index < 8 {
+                c.put8(out + 7 - index, block[7 - index] ^ @intCast(u8, t & 255))
+                t = t >> 8
+                index += 1
+            }
+            index = 0
+            while index < 8 {
+                c.put8(out + 8 * item + index, block[8 + index])
+                index += 1
+            }
+            item += 1
+        }
+        step += 1
+    }
+}
+
+// The unwrap: false when A is not the initial value.
+fn unwrap(h: *CipherHandle, out: usize, input: usize, length: usize) -> bool {
+    const blocks = length / 8 - 1
+    var a: [8]u8 = undefined
+    var index: usize = 0
+    while index < 8 {
+        a[index] = c.get8(input + index)
+        index += 1
+    }
+    index = 0
+    while index < blocks * 8 {
+        c.put8(out + index, c.get8(input + 8 + index))
+        index += 1
+    }
+    var block: [16]u8 = undefined
+    const b: [*]u8 = &block
+    var step: usize = 6
+    while step > 0 {
+        var item = blocks
+        while item >= 1 {
+            var t = @intCast(u64, blocks * (step - 1) + item)
+            index = 0
+            while index < 8 {
+                block[7 - index] = a[7 - index] ^ @intCast(u8, t & 255)
+                t = t >> 8
+                index += 1
+            }
+            index = 0
+            while index < 8 {
+                block[8 + index] = c.get8(out + 8 * (item - 1) + index)
+                index += 1
+            }
+            aes.aesDecrypt(&h.*.aead.cipher, b)
+            index = 0
+            while index < 8 {
+                a[index] = block[index]
+                c.put8(out + 8 * (item - 1) + index, block[8 + index])
+                index += 1
+            }
+            item -= 1
+        }
+        step -= 1
+    }
+    var bad: u64 = 0
+    index = 0
+    while index < 8 {
+        bad = bad | @intCast(u64, a[index] ^ 166)
+        index += 1
+    }
+    return bad == 0
+}
+
+fn run(handle: usize, out: usize, outSize: usize, input: usize, inLength: usize, decrypting: bool) -> u32 {
+    const h = handleOf(handle)
+    if !h.*.keyed { return c.failure(c.MISSING_KEY) }
+    var source = input
+    var length = inLength
+    if source == 0 {
+        source = out
+        length = outSize
+    }
+    if h.*.mode == MODE_AESWRAP {
+        if length < 16 || length % 8 != 0 { return c.failure(c.INV_ARG) }
+        if decrypting {
+            if length < 24 { return c.failure(c.INV_ARG) }
+            if outSize < length - 8 { return c.failure(c.BUFFER_TOO_SHORT) }
+            if !unwrap(h, out, source, length) {
+                c.zero(out, length - 8)
+                return c.failure(c.CHECKSUM)
+            }
+            return 0
+        }
+        if outSize < length + 8 { return c.failure(c.BUFFER_TOO_SHORT) }
+        wrap(h, out, source, length)
+        return 0
+    }
+    if outSize < length { return c.failure(c.BUFFER_TOO_SHORT) }
+    if out != source { c.copy(out, source, length) }
+    if h.*.mode == MODE_CTR {
+        ctr(h, out, length, false)
+        return 0
+    }
+    if h.*.mode == MODE_GCM { return gcmText(h, out, length, decrypting) }
+    if length % 16 != 0 { return c.failure(c.INV_LENGTH) }
+    const blocks = c.bytes(out)
+    if h.*.mode == MODE_ECB {
+        if decrypting { aes.aesDecryptBlocks(&h.*.aead.cipher, blocks, length / 16) } else { aes.aesEncryptBlocks(&h.*.aead.cipher, blocks, length / 16) }
+        return 0
+    }
+    // CBC.
+    var at: usize = 0
+    if !decrypting {
+        while at < length {
+            var index: usize = 0
+            while index < 16 {
+                blocks[at + index] = blocks[at + index] ^ h.*.iv[index]
+                index += 1
+            }
+            aes.aesEncrypt(&h.*.aead.cipher, blocks + at)
+            index = 0
+            while index < 16 {
+                h.*.iv[index] = blocks[at + index]
+                index += 1
+            }
+            at += 16
+        }
+        return 0
+    }
+    // Decryption, four blocks at a time, each XORed with the ciphertext
+    // before it.
+    var saved: [64]u8 = undefined
+    while at < length {
+        var count = (length - at) / 16
+        if count > 4 { count = 4 }
+        var index: usize = 0
+        while index < count * 16 {
+            saved[index] = blocks[at + index]
+            index += 1
+        }
+        aes.aesDecryptBlocks(&h.*.aead.cipher, blocks + at, count)
+        index = 0
+        while index < count * 16 {
+            const previous = if index < 16 { h.*.iv[index] } else { saved[index - 16] }
+            blocks[at + index] = blocks[at + index] ^ previous
+            index += 1
+        }
+        index = 0
+        while index < 16 {
+            h.*.iv[index] = saved[(count - 1) * 16 + index]
+            index += 1
+        }
+        at += count * 16
+    }
+    return 0
+}
+
+export fn gcry_cipher_encrypt(handle: usize, out: usize, outSize: usize, input: usize, inLength: usize) -> u32 { return run(handle, out, outSize, input, inLength, false) }
+export fn gcry_cipher_decrypt(handle: usize, out: usize, outSize: usize, input: usize, inLength: usize) -> u32 { return run(handle, out, outSize, input, inLength, true) }

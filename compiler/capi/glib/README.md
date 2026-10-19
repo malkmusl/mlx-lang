@@ -58,11 +58,24 @@ sources reach.
 | `task.mlx` | `gasyncresult.h`, `gtask.h`: tasks returning at once, from idle sources, from threads (and synchronously) |
 | `localfile.mlx` | `gfile.h`: local files (paths, URIs, reading, replacing with etags, deleting, making directories); `gfilemonitor.h` on inotify, with GIO's rules for pending changes and renames |
 | `socket.mlx` | `gsocket.h`, `giostream.h`, `gsocketconnection.h`: sockets (always non-blocking underneath, as in GIO), their sources, and Unix and TCP connections |
+| `streams.mlx` | `ginputstream.h`, `goutputstream.h`, `gfilterinputstream.h`, `gfilteroutputstream.h`, `gmemoryinputstream.h`, `gmemoryoutputstream.h`, `gpollableinputstream.h`, `gpollableoutputstream.h`, `gpollableutils.h`, `gsimpleiostream.h`, `gseekable.h` and a GIOStream's streams: reading, skipping, writing, flushing, splicing and closing, synchronously and asynchronously (a pollable stream waits on its source, any other runs the synchronous call in a thread, as GIO does), the socket streams of a connection; memory input streams are seekable |
+| `fileinput.mlx` | `gfileinputstream.h`, `g_file_read`: a local file read as a seekable input stream (GIO's GLocalFileInputStream); no GFileInfo |
+| `monitors.mlx` | `gnetworkmonitor.h`, `gpowerprofilemonitor.h`: the default monitors as GIO's are without netlink or a power daemon (the network always available, power saving never on) |
+| `contenttype.mlx` | `gcontenttype.h`: MIME types guessed without shared-mime-info: by extension (the web's common types, as GIO answers with the database), else by the data's signature or text |
 | `network.mlx` | `ginetaddress.h`, `gsocketaddress.h`, `ginetsocketaddress.h`, `gsocketconnectable.h`, `gsocketlistener.h`, `gsocketservice.h`, `gsocketclient.h`: IPv4 and IPv6 addresses, listening (a service accepts in its main context and emits "incoming"), connecting to "host:port" at once or asynchronously |
 | `resource.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (inflated by std.flate), the registry, static resources |
 | `application.mlx` | `gapplication.h`: application ids and the default application |
 | `dbus.mlx` | `gdbus*.h`: bus addresses, proxies, errors, introspection data; see below |
-| `tls.mlx` | `ginitable.h` and GIO's TLS types (`gtlscertificate.h`, `gtlsbackend.h`, `gtlsconnection.h`, `gtlsclientconnection.h`, `gtlsdatabase.h`, `gtlsfiledatabase.h`, `gtlsinteraction.h`, `gtlspassword.h`): what libsoup's headers and WebKit's network code name; see below |
+| `tls.mlx` | `ginitable.h` and GIO's TLS types (`gtlscertificate.h`, `gtlsbackend.h`, `gtlsdatabase.h`, `gtlsfiledatabase.h`, `gtlsinteraction.h`, `gtlspassword.h`): the backend, on std.x509: certificates with their X.509 fields and verification, the default database (the system's CA bundle) and file databases; see below |
+| `tlsconnection.mlx` | `gtlsconnection.h`, `gtlsclientconnection.h`: TLS client connections over a GIOStream on std.tls (TLS 1.3 and 1.2), synchronous and asynchronous handshakes, "accept-certificate", pollable streams |
+| `enumtypes.mlx` | `gioenumtypes.h`: the GTypes of `GSocketClientEvent`, `GTlsAuthenticationMode` and `GNetworkConnectivity` |
+| `random.mlx` | `grand.h`: the global generator, from the kernel's random bytes (getrandom) |
+| `dataset.mlx` | `gdataset.h`: keyed data lists (`GData`) |
+| `charset.mlx` | `gcharset.h`'s `g_get_language_names`: LANGUAGE, LC_ALL, LC_MESSAGES, LANG and each name's variants |
+| `hostnames.mlx` | `ghostutils.h`'s `g_hostname_to_ascii`: IDNA's ACE labels (Punycode) |
+| `proxyresolver.mlx` | `gproxyresolver.h`, `gsimpleproxyresolver.h`: the default resolver (always "direct://", GIO's dummy resolver) and GSimpleProxyResolver with its hosts to ignore |
+| `networkaddress.mlx` | `gnetworkaddress.h`: a host name and port as a GSocketConnectable (the server identity a TLS connection checks) |
+| `resolver.mlx` | `gresolver.h`: GResolver and the default GThreadedResolver: names to addresses and back by the C library (getaddrinfo, getnameinfo), in a thread for the asynchronous calls; addresses and "localhost" answered at once; a subclass (WebKit's cache of names) overrides the class's functions. DNS records (SRV, MX...) are not looked up |
 | `tests/` | C programs built by mlx-cc against the library, each with the output GLib 2.80 gives (`NAME.expected`, the exit status last); `tests/wtf/` the WPE configuration and the WTF sources compiled by the check |
 
 ## Tests
@@ -77,11 +90,24 @@ sources reach.
   `gobject.c`, `system.c`, `gio.c`, `collect.c` (G_DECLARE_FINAL_TYPE,
   G_VALUE_COLLECT_INIT and G_VALUE_LCOPY, g_alloca), `options.c`
   (GOption, gettext), `network.c` (addresses, a service, a client,
-  their errors) and `tls.c` (certificates from PEM and DER as WebKit
-  makes and copies them, chains, keys, passwords; a backend without TLS)
-  and compares what they print with what the same programs print on GLib
-  2.80 (`tls.c`'s certificates with GLib's GnuTLS backend, its backend
-  part with none, `GIO_USE_TLS=dummy`);
+  their errors), `tls.c` (certificates from PEM and DER as WebKit
+  makes and copies them, chains, keys, their X.509 fields and
+  verification, passwords, the backend and its databases) and
+  `streams.c` (memory, filter and socket streams, synchronous and
+  asynchronous, splicing, pollable sources, GSimpleIOStream) and
+  `extras.c` (keyed data lists, random numbers, language names, IDNA
+  host names, GIO's enum types, proxy resolvers, network addresses,
+  GResolver and a subclass of it, files and memory streams sought,
+  the network and power monitors, content types),
+  and
+  compares what they print with what the same programs print on GLib
+  2.80 (with glib-networking's GnuTLS backend for TLS);
+- runs `tests/tls_handshake.c` against two `openssl s_server`s on
+  127.0.0.1 (TLS 1.3 and TLS 1.2, the certificates of
+  `tools/tls-test/make_certs.sh`): handshakes synchronous and
+  asynchronous, pollable reads, "accept-certificate" refusing and
+  accepting, compared with what GLib with glib-networking prints against
+  the same servers (skipped without openssl);
 - compiles WTF's GLib-based sources for WPE (`tests/wtf/files.txt`: the
   14 of `wtf/glib`, `MainThreadGeneric.cpp`, `WorkQueueGeneric.cpp` and
   those of `unix/`, `linux/`, `posix/`) with mlx-cc on these headers and
@@ -118,25 +144,22 @@ system without it:
 - **Files** are local paths; another URI scheme gives a file that knows
   only its URI (GIO's GDummyFile without a VFS module), and operations on
   it fail with `G_IO_ERROR_NOT_SUPPORTED`. GFileInfo, enumerators and
-  streams (GInputStream, GOutputStream, `g_resource_open_stream`) are not
-  here (their instance and class structures are, as GIO lays them out, for
-  types declared over them: libsoup's SoupMultipartInputStream).
-- **TLS**: there is no TLS implementation yet (the TLS of the HTTP
-  client libsoup's layer will need). The backend makes certificates as
-  GIO's GnuTLS backend does (`g_tls_certificate_new_from_pem`,
-  `g_initable_new` of its certificate type with `certificate-pem` or
-  `certificate`, `issuer`, `private-key-pem`, `private-key`, the PKCS #11
-  URIs; their PEM and DER read back, compared by `g_tls_certificate_is_same`,
-  a chain from PEM linked where each certificate names the next as its
-  issuer); what needs TLS answers as GIO does without a TLS module:
-  `g_tls_backend_supports_tls` is FALSE, the default database has no
-  certificates, `g_tls_file_database_new` fails with
-  `G_TLS_ERROR_UNAVAILABLE`. Verifying a certificate reports
-  `G_TLS_CERTIFICATE_GENERIC_ERROR`, and the fields read out of its X.509
-  structure (`not-valid-before`, `not-valid-after`, `subject-name`,
-  `issuer-name`, `dns-names`, `ip-addresses`) are NULL.
-  `GTlsConnection`, `GTlsClientConnection`, `GTlsDatabase` and
-  `GTlsInteraction` are types only; `GTlsPassword` is whole.
+  `g_resource_open_stream` are not here.
+- **TLS**: the backend is the library's own, on std.tls and std.x509
+  (no GnuTLS): client connections (TLS 1.3 and 1.2; ECDHE with X25519,
+  P-256, P-384; AES-GCM and ChaCha20-Poly1305; RSA, ECDSA and Ed25519
+  certificates), the peer's chain verified against the connection's
+  database for the server identity (an address, or the "hostname" of a
+  network address) with "accept-certificate" for one that does not
+  verify, as glib-networking does; certificates with the fields of their
+  X.509 structure and `g_tls_certificate_verify`; the default database is
+  the system's CA bundle, a file database reads its anchors when made.
+  Not here: TLS servers (`g_tls_backend_get_server_connection_type` is
+  0), DTLS, client certificates (an empty one answers a server that asks
+  for one), session resumption, rehandshakes (refused), channel
+  bindings; `validation-flags` is kept but, as in GLib 2.80, every error
+  needs "accept-certificate". `GTlsInteraction` is a type only;
+  `GTlsPassword` is whole.
 - **GVariant**'s text form is printed but not parsed
   (`g_variant_parse`, `g_variant_new_parsed` are not here).
 - **GObject**: class private data (`g_type_add_class_private`) and
@@ -144,14 +167,18 @@ system without it:
   `g_type_register_dynamic` reports a critical and returns 0) are not
   here. `G_DECLARE_FINAL_TYPE`, `G_DECLARE_DERIVABLE_TYPE` and
   `G_DECLARE_INTERFACE` are (as C
-  the header carries, `c_macros`), the `G_DEFINE_*` macros not yet;
+  the header carries, `c_macros`), and `G_IMPLEMENT_INTERFACE` (for the
+  code of a type-defining macro of its own, as WebKit's), the
+  `G_DEFINE_*` macros not yet;
   `g_autoptr` is not (mlx-cc has no cleanup attribute): the cleanup
   functions are declared for code that calls them.
 - **GOption**'s help (`--help`, `g_option_context_get_help`) is not here:
   `--help` is an unknown option unless an entry has that name.
-- **Networking**: names are resolved by the C library at once, before
-  connecting (GResolver, proxies, GNetworkAddress and TLS are not here);
-  Unix socket addresses are not here.
+- **Networking**: a socket client resolves names by the C library at
+  once, before connecting, not through GResolver; GResolver's DNS
+  records (`g_resolver_lookup_records`) answer
+  G_IO_ERROR_NOT_SUPPORTED; proxies are not used; Unix socket addresses
+  are not here.
 - Everything of GLib, GObject and GIO that WTF and JavaScriptCore do not
   use (GIO's settings, TLS, GSubprocess, GVfs...).
 
