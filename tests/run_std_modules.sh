@@ -34,12 +34,12 @@
 #                                       std.dbus's client (signals kept
 #                                       across a call, bus addresses) and
 #                                       std.spawn.find
-#   tests/362_png_decode_runtime.mlx    std.png's decoder: every colour type,
+#   tests/365_png_decode_runtime.mlx    std.png's decoder: every colour type,
 #                                       interlacing, transparency, damage
-#   tests/363_jpeg_decode_runtime.mlx   std.jpeg's decoder: sampling,
+#   tests/366_jpeg_decode_runtime.mlx   std.jpeg's decoder: sampling,
 #                                       progressive, grey, CMYK, restarts,
 #                                       EXIF orientation, damage
-#   tests/364_webp_decode_runtime.mlx   std.webp's decoders: lossy, lossless,
+#   tests/367_webp_decode_runtime.mlx   std.webp's decoders: lossy, lossless,
 #                                       alpha, animation (demuxer), rows
 #                                       done incrementally, damage; the
 #                                       encoder's round trip
@@ -85,9 +85,9 @@ run 358_timezone_names_runtime "zone abbreviations from rules and TZif files"
 run 359_linux_descriptors_runtime "pipes, epoll tokens, signalfd, timerfd, eventfd, poll, Unix sockets, SCM_RIGHTS, wait4"
 run 360_spawn_runtime "PATH lookup, captured output, exit statuses, moved descriptors, vfork, detach"
 run 361_dbus_keep_signals_runtime "a client against a child bus: a signal kept across a call with its descriptor; bus addresses; PATH lookup"
-run 362_png_decode_runtime "PNG images of each colour type, interlaced and transparent, decoded to RGBA; damaged ones refused"
-run 363_jpeg_decode_runtime "JPEG images (4:2:0, progressive 4:2:2, grey, CMYK, restarts) decoded as libjpeg decodes them; EXIF orientation; damage"
-run 364_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) decoded as libwebp decodes them; incremental rows; damage; encoding"
+run 365_png_decode_runtime "PNG images of each colour type, interlaced and transparent, decoded to RGBA; damaged ones refused"
+run 366_jpeg_decode_runtime "JPEG images (4:2:0, progressive 4:2:2, grey, CMYK, restarts) decoded as libjpeg decodes them; EXIF orientation; damage"
+run 367_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) decoded as libwebp decodes them; incremental rows; damage; encoding"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
