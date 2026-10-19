@@ -66,6 +66,9 @@
 #   tests/372_sql_runtime.mlx           std.sql: SQLite's number texts,
 #                                       WebKit's SQL parsed, statements
 #                                       run, a file written and read back
+#   tests/373_fontconfig_runtime.mlx    std.fontconfig: case folding, names,
+#                                       languages; fonts of the tree read,
+#                                       cached, matched, sorted, listed
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -117,6 +120,7 @@ run 367_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) deco
 run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987) read and written as libsoup does"
 run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk sizes; public suffixes; MIME sniffing"
 run 372_sql_runtime "SQLite's reals and numbers, WebKit's SQL parsed, GROUP BY, collations, CHECK, a file of 3000 rows read back"
+run 373_fontconfig_runtime "Fontconfig's case folding, names and substitutions; fonts read, cached, matched, sorted and listed as Fontconfig 2.15 does"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
