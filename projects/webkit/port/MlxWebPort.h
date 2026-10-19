@@ -56,6 +56,18 @@ const char* mlxweb_font_path(uintptr_t font);
 int32_t mlxweb_font_index(uintptr_t font);
 void mlxweb_font_release(uintptr_t font);
 
+// Public suffixes (std.http.psl) for PublicSuffixStore: whether a lower
+// case domain is a public suffix (without the implicit "*" rule), and
+// where a host's base domain starts in it, or MLXWEB_PSL_NO_BASE_DOMAIN
+// (its suffix is not listed), MLXWEB_PSL_NOT_ENOUGH_DOMAINS (it is itself
+// a public suffix).
+enum {
+    MLXWEB_PSL_NO_BASE_DOMAIN = -1,
+    MLXWEB_PSL_NOT_ENOUGH_DOMAINS = -2,
+};
+uint32_t mlxweb_psl_is_public_suffix(const char* domain, size_t length);
+int64_t mlxweb_psl_base_domain(const char* host, size_t length);
+
 #ifdef __cplusplus
 }
 #endif
