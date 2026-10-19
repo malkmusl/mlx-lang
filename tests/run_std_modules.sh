@@ -49,6 +49,11 @@
 #                                       chains, the system's CA bundle
 #   tests/370_http_headers_runtime.mlx  std.http.headers (libsoup's header
 #                                       lists, q-values and parameters)
+#   tests/371_http_protocol_runtime.mlx
+#                                       std.http.websocket (keys, frame
+#                                       headers, masks, UTF-8), chunk
+#                                       sizes, the Public Suffix List,
+#                                       MIME sniffing
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -95,6 +100,7 @@ run 362_crypto_symmetric_runtime "HMAC, HKDF, AES-128/192/256, AES-GCM, ChaCha20
 run 363_crypto_public_key_runtime "X25519, Ed25519, ECDSA and ECDH on P-256, P-384 and P-521, RSA PKCS #1 v1.5 and PSS"
 run 364_x509_runtime "DER, certificates' fields and names, hostnames, chains to an anchor, the CA bundle"
 run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987) read and written as libsoup does"
+run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk sizes; public suffixes; MIME sniffing"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
