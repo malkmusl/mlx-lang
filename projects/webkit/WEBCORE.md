@@ -29,8 +29,8 @@ headless WPEPlatform, no video, web audio, WebRTC, media stream,
 GStreamer, WebGPU, GPU process, spell checking, speech synthesis, AVIF,
 JPEG XL, WOFF2, libdrm, GBM, Wayland, DRM platform, ATK, journald,
 bubblewrap, sysprof, libbacktrace, documentation or introspection; with
-WebGL (ANGLE), XSLT, Little CMS and PDF.js. `cmakeconfig.h` is
-`config.WPE` (config.mlx).
+WebGL (ANGLE), Little CMS and PDF.js, without XSLT (`ENABLE_XSLT=OFF`:
+there is no libxslt). `cmakeconfig.h` is `config.WPE` (config.mlx).
 
 What `OptionsWPE.cmake` requires whatever the options: GLib (with GIO),
 HarfBuzz with its ICU part, ICU, libjpeg, libepoxy, libgcrypt, libsoup
@@ -59,8 +59,8 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 | HarfBuzz (+hb-icu) | text shaping (FontCascade, Skia's) | 46 / 0 (/ 57) | 643 | mlx-harfbuzz (compiler/capi/harfbuzz, std.shaping): all 46 and Skia's 57 declared | done (to be checked at run time) |
 | FreeType | font files, glyphs (Skia's font host) | 0 / 0 (/ 52) | 0 | mlx-freetype (compiler/capi/freetype, std.truetype): Skia's 52 declared | done for compiling |
 | Fontconfig | finding fonts: Skia's font manager, WebCore's FontCache (FreeType platform) | 21 / 0 (/ 53) | 2 | none | 2: mlx-fontconfig, matching over the fonts directories (fonts.conf's essentials) |
-| libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | std.xml: a pull tokenizer, a base | 2: mlx-libxml2: the SAX2 push parser WebCore drives (xmlCreatePushParserCtxt, xmlParseChunk, the callbacks), entities, encodings through ICU (its headers' `<iconv.h>` is mlxlibc's now) |
-| libxslt, libexslt | XSLT processing (XSLTProcessor, `<?xml-stylesheet?>`) | 26 / 0 | 5 | none | 3: `ENABLE_XSLT=OFF` |
+| libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | mlx-xml2 (compiler/capi/xml2, std.xml.sax): libxml2 2.9.14's SAX2 push parser and parser of content in memory, 222 functions declared and made, all WebCore calls with XSLT off (`xmlReadMemory` and the tree and XPath functions it names besides are XSLT's and EME's): the callbacks, entities, errors and encodings of libxml2, its events to the position on 57 documents and 7 fragments whole and in chunks, with WebKit's handler (tools/check_xml2.sh against the system's libxml2); XMLDocumentParserLibxml2.cpp's and XMLErrors.cpp's unified sources get past libxml2's API to mlx-cc's own C++ errors (a `RefPtr` deduced as `RefPtr<void>`, a `WeakRef` constructor). No tree (SAX2's tree callbacks build nothing), no external entities loaded | done for WebCore; the tree if XSLT comes back |
+| libxslt, libexslt | XSLT processing (XSLTProcessor, `<?xml-stylesheet?>`) | 26 / 0 | 5 | none | `ENABLE_XSLT=OFF` (config.mlx): done |
 | SQLite | storage: IndexedDB's SQLite back end, local storage, the icon and resource load statistics databases | 55 / 19 (60) | 13 | none | 2: the largest of the "small" libraries; a SQL engine of the subset WebKit's statements use, or the stores on another back end |
 | libpng | PNG decoding (ImageDecoder) and Skia's PNG codec | 36 / 0 (/ 47) | 3 | mlx-libpng (compiler/capi/png, std.png): all declared; the progressive reader, transformations, gamma and writer give libpng's bytes (tools/check_png.sh); Skia's SkPngCodec and SkPngEncoderImpl compile; WebCore's PNGImageDecoder.cpp compiles (on mlx-lcms2's `lcms2.h`) | done |
 | libjpeg | JPEG decoding (ImageDecoder), Skia's JPEG codec and encoder | 15 / 0 (/ 25) | 2 | mlx-libjpeg (compiler/capi/jpeg, std.jpeg): all declared; the decompressor (suspending sources, buffered-image output, raw data, cropping and skipping, saved markers, the ICC profile) gives libjpeg-turbo's pixels, warnings and errors (tools/check_jpeg.sh); Skia's five JPEG sources compile; WebCore's JPEGImageDecoder.cpp compiles (on mlx-lcms2's `lcms2.h`) | the compressor (Skia's encoder: jpeg_set_defaults ... jpeg_finish_compress raise JERR_NOT_COMPILED for now) |
@@ -77,8 +77,8 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 So the order: the headers and small layers every unit needs (GIO's TLS
 types, `libintl.h`, `iconv.h`, ICU's bidi, search and converter
 headers: done), then libsoup and its HTTP and TLS, the image decoders,
-libxml2, SQLite, Fontconfig, WebCrypto; XSLT and Little CMS are
-configured away.
+libxml2 (done), SQLite, Fontconfig, WebCrypto; XSLT is configured away
+(Little CMS is there: mlx-lcms2).
 
 ## The compiler's pass
 
