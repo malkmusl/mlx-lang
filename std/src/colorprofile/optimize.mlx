@@ -1,0 +1,1101 @@
+// std.colorprofile.optimize: what Little CMS (2.14) makes of a pipeline
+// before a transform of 8- or 16-bit pixels uses it (cmsopt.c), step for
+// step, since every step changes the numbers that come out:
+//
+//   - PreOptimize: identities removed, conversions undone by the next
+//     stage removed, neighbouring matrices multiplied;
+//   - OptimizeByJoiningCurves: a pipeline of curves only becomes one set
+//     of curves, tabulated for 8-bit input (256 entries) or 16-bit
+//     (65536), or nothing at all when they are linear;
+//   - OptimizeMatrixShaper: curves, matrix (or two), curves on 8-bit RGB
+//     become two shapers around a matrix in 1.14 fixed point;
+//   - OptimizeByComputingLinearization: other RGB pipelines on 8-bit
+//     input become prelinearization curves (made of the pipeline itself,
+//     their slopes limited at the ends) before a 33-point grid of what
+//     the curves' inverses and the pipeline give, interpolated in 8-bit
+//     fixed point (PrelinEval8);
+//   - OptimizeByResampling: anything else becomes a grid of the
+//     pipeline, its white patched to land on white.
+//
+// The optimized pipeline keeps its stages (the float evaluation uses
+// them) and evaluates 16-bit pixels with the data made here.
+const mem = @import("./mem.mlx")
+const curve = @import("./curve.mlx")
+const interp = @import("./interp.mlx")
+const pipeline = @import("./pipeline.mlx")
+const matrix = @import("./matrix.mlx")
+const format = @import("./format.mlx")
+const profile = @import("./profile.mlx")
+
+pub const Allocator = mem.Allocator
+const Pipeline = pipeline.Pipeline
+
+// The pipeline's 16-bit evaluation (Pipeline.eval).
+pub const EVAL_STAGES: u64 = 0
+pub const EVAL_IDENTITY: u64 = 1
+pub const EVAL_CURVES8: u64 = 2
+pub const EVAL_CURVES16: u64 = 3
+pub const EVAL_MATSHAPER: u64 = 4
+pub const EVAL_PRELIN8: u64 = 5
+pub const EVAL_PRELIN16: u64 = 6
+pub const EVAL_CLUT: u64 = 7
+
+// cmsFLAGS_*.
+pub const FLAGS_CLUT_POST_LINEARIZATION: u64 = 0x0001
+pub const FLAGS_FORCE_CLUT: u64 = 0x0002
+pub const FLAGS_NOWHITEONWHITEFIXUP: u64 = 0x0004
+pub const FLAGS_CLUT_PRE_LINEARIZATION: u64 = 0x0010
+pub const FLAGS_NOCACHE: u64 = 0x0040
+pub const FLAGS_NOOPTIMIZE: u64 = 0x0100
+pub const FLAGS_HIGHRESPRECALC: u64 = 0x0400
+pub const FLAGS_LOWRESPRECALC: u64 = 0x0800
+
+const PRELINEARIZATION_POINTS: usize = 4096
+
+// The data blocks (offsets in bytes).
+const MS_SHAPER1: usize = 0
+const MS_MAT: usize = 6144
+const MS_OFF: usize = 6216
+const MS_SHAPER2: usize = 6240
+const MS_SIZE: usize = 6240 + 3 * 16385 * 2
+const P8_PARAMS: usize = 0
+const P8_R: usize = 8
+const P8_X0: usize = 8 + 3 * 256 * 2
+const P8_SIZE: usize = P8_X0 + 3 * 256 * 8
+const P16_PRE: usize = 0
+const P16_CLUT: usize = 8
+const P16_POST: usize = 16
+
+fn setOptimization(pipe: *Pipeline, eval: u64, data: usize) -> void {
+    if pipe.*.eval != EVAL_CLUT { mem.release(pipe.*.allocator, pipe.*.data) }
+    pipe.*.eval = eval
+    pipe.*.data = data
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation
+
+fn evalCurves(pipe: *Pipeline, input: [*]const u16, output: [*]u16, eightBit: bool) -> void {
+    const data = pipe.*.data
+    const count = @intCast(usize, mem.get64(data))
+    const elements = @intCast(usize, mem.get64(data + 8))
+    const tables = mem.shorts(data + 16)
+    var index: usize = 0
+    while index < count {
+        const x: usize = if eightBit { @intCast(usize, input[index] >> 8) } else { @intCast(usize, input[index]) }
+        output[index] = tables[index * elements + x]
+        index += 1
+    }
+}
+
+// MatShaperEval16.
+fn evalMatShaper(data: usize, input: [*]const u16, output: [*]u16) -> void {
+    const shaper1 = mem.ints(data + MS_SHAPER1)
+    const mat = mem.ints(data + MS_MAT)
+    const off = mem.ints(data + MS_OFF)
+    const shaper2 = mem.shorts(data + MS_SHAPER2)
+    const r = shaper1[@intCast(usize, input[0] & 0xff)]
+    const g = shaper1[256 + @intCast(usize, input[1] & 0xff)]
+    const b = shaper1[512 + @intCast(usize, input[2] & 0xff)]
+    var channel: usize = 0
+    while channel < 3 {
+        const sum = mem.wrap32(mat[channel * 3] * r + mat[channel * 3 + 1] * g + mat[channel * 3 + 2] * b + off[channel] + 0x2000)
+        const l = sum >> 14
+        const at: usize = if l < 0 { 0 } else if l > 16384 { 16384 } else { @intCast(usize, l) }
+        output[channel] = shaper2[channel * 16385 + at]
+        channel += 1
+    }
+}
+
+inline fn dens(table: [*]const u16, index: i64) -> i64 { return @intCast(i64, table[@intCast(usize, index)]) }
+
+// PrelinEval8.
+fn evalPrelin8(data: usize, input: [*]const u16, output: [*]u16) -> void {
+    const p = unsafe { @ptrFromInt(*interp.Params, @intCast(usize, mem.get64(data + P8_PARAMS))) }
+    const table = mem.shorts(p.*.table)
+    const rs = mem.shorts(data + P8_R)
+    const x0s = mem.ints(data + P8_X0)
+    const r = @intCast(usize, input[0] >> 8)
+    const g = @intCast(usize, input[1] >> 8)
+    const b = @intCast(usize, input[2] >> 8)
+    const x0 = x0s[r]
+    const y0 = x0s[256 + g]
+    const z0 = x0s[512 + b]
+    const rx = @intCast(i64, rs[r])
+    const ry = @intCast(i64, rs[256 + g])
+    const rz = @intCast(i64, rs[512 + b])
+    const x1 = x0 + (if rx == 0 { 0 } else { @intCast(i64, p.*.opta[2]) })
+    const y1 = y0 + (if ry == 0 { 0 } else { @intCast(i64, p.*.opta[1]) })
+    const z1 = z0 + (if rz == 0 { 0 } else { @intCast(i64, p.*.opta[0]) })
+    var channel: i64 = 0
+    while channel < @intCast(i64, p.*.outputs) {
+        const c0 = dens(table, x0 + y0 + z0 + channel)
+        var c1: i64 = 0
+        var c2: i64 = 0
+        var c3: i64 = 0
+        if rx >= ry && ry >= rz {
+            c1 = dens(table, x1 + y0 + z0 + channel) - c0
+            c2 = dens(table, x1 + y1 + z0 + channel) - dens(table, x1 + y0 + z0 + channel)
+            c3 = dens(table, x1 + y1 + z1 + channel) - dens(table, x1 + y1 + z0 + channel)
+        } else if rx >= rz && rz >= ry {
+            c1 = dens(table, x1 + y0 + z0 + channel) - c0
+            c2 = dens(table, x1 + y1 + z1 + channel) - dens(table, x1 + y0 + z1 + channel)
+            c3 = dens(table, x1 + y0 + z1 + channel) - dens(table, x1 + y0 + z0 + channel)
+        } else if rz >= rx && rx >= ry {
+            c1 = dens(table, x1 + y0 + z1 + channel) - dens(table, x0 + y0 + z1 + channel)
+            c2 = dens(table, x1 + y1 + z1 + channel) - dens(table, x1 + y0 + z1 + channel)
+            c3 = dens(table, x0 + y0 + z1 + channel) - c0
+        } else if ry >= rx && rx >= rz {
+            c1 = dens(table, x1 + y1 + z0 + channel) - dens(table, x0 + y1 + z0 + channel)
+            c2 = dens(table, x0 + y1 + z0 + channel) - c0
+            c3 = dens(table, x1 + y1 + z1 + channel) - dens(table, x1 + y1 + z0 + channel)
+        } else if ry >= rz && rz >= rx {
+            c1 = dens(table, x1 + y1 + z1 + channel) - dens(table, x0 + y1 + z1 + channel)
+            c2 = dens(table, x0 + y1 + z0 + channel) - c0
+            c3 = dens(table, x0 + y1 + z1 + channel) - dens(table, x0 + y1 + z0 + channel)
+        } else if rz >= ry && ry >= rx {
+            c1 = dens(table, x1 + y1 + z1 + channel) - dens(table, x0 + y1 + z1 + channel)
+            c2 = dens(table, x0 + y1 + z1 + channel) - dens(table, x0 + y0 + z1 + channel)
+            c3 = dens(table, x0 + y0 + z1 + channel) - c0
+        }
+        const rest = mem.wrap32(c1 * rx + c2 * ry + c3 * rz + 0x8001)
+        const value = c0 + (mem.wrap32(rest + (rest >> 16)) >> 16)
+        output[@intCast(usize, channel)] = @intCast(u16, @bitCast(u64, value) & 0xffff)
+        channel += 1
+    }
+}
+
+// PrelinEval16: curves, grid, curves (any of the curves may be absent).
+fn evalPrelin16(pipe: *Pipeline, input: [*]const u16, output: [*]u16, scratch: usize) -> void {
+    const data = pipe.*.data
+    const pre = @intCast(usize, mem.get64(data + P16_PRE))
+    const clut = pipeline.stageAt(@intCast(usize, mem.get64(data + P16_CLUT)))
+    const post = @intCast(usize, mem.get64(data + P16_POST))
+    const abc = mem.shorts(scratch + 1600)
+    const def = mem.shorts(scratch + 1700)
+    var index: usize = 0
+    while index < clut.*.inputs {
+        if pre == 0 {
+            abc[index] = input[index]
+        } else {
+            abc[index] = @intCast(u16, curve.eval16(curve.curveAt(pipeline.curveOf(pipeline.stageAt(pre), index)), @intCast(u64, input[index])))
+        }
+        index += 1
+    }
+    interp.eval16(&clut.*.clut, abc, def)
+    index = 0
+    while index < clut.*.outputs {
+        if post == 0 {
+            output[index] = def[index]
+        } else {
+            output[index] = @intCast(u16, curve.eval16(curve.curveAt(pipeline.curveOf(pipeline.stageAt(post), index)), @intCast(u64, def[index])))
+        }
+        index += 1
+    }
+}
+
+// cmsPipelineEval16: the optimized evaluation, or the stages'. SCRATCH is
+// pipeline.SCRATCH_SIZE bytes of the caller's.
+pub fn eval16(pipe: *Pipeline, input: [*]const u16, output: [*]u16, scratch: usize) -> void {
+    const kind = pipe.*.eval
+    if kind == EVAL_MATSHAPER {
+        evalMatShaper(pipe.*.data, input, output)
+    } else if kind == EVAL_PRELIN8 {
+        evalPrelin8(pipe.*.data, input, output)
+    } else if kind == EVAL_CURVES8 {
+        evalCurves(pipe, input, output, true)
+    } else if kind == EVAL_CURVES16 {
+        evalCurves(pipe, input, output, false)
+    } else if kind == EVAL_CLUT {
+        interp.eval16(&pipeline.stageAt(pipe.*.data).*.clut, input, output)
+    } else if kind == EVAL_PRELIN16 {
+        evalPrelin16(pipe, input, output, scratch)
+    } else if kind == EVAL_IDENTITY {
+        var index: usize = 0
+        while index < pipe.*.inputs {
+            output[index] = input[index]
+            index += 1
+        }
+    } else {
+        pipeline.evalStages16(pipe, input, output, scratch)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PreOptimize
+
+inline fn slotStage(slot: *usize) -> *pipeline.Stage { return pipeline.stageAt(slot.*) }
+
+// _RemoveElement: the stage in SLOT taken out and freed.
+fn removeElement(slot: *usize) -> void {
+    const stage = slot.*
+    slot.* = pipeline.stageAt(stage).*.next
+    pipeline.stageAt(stage).*.next = 0
+    pipeline.freeStage(stage)
+}
+
+fn remove1Op(pipe: *Pipeline, op: u64) -> bool {
+    var slot: *usize = &pipe.*.first
+    var any = false
+    while slot.* != 0 {
+        if slotStage(slot).*.implements == op {
+            removeElement(slot)
+            any = true
+        } else {
+            slot = &slotStage(slot).*.next
+        }
+    }
+    return any
+}
+
+fn remove2Op(pipe: *Pipeline, op1: u64, op2: u64) -> bool {
+    var slot1: *usize = &pipe.*.first
+    var any = false
+    if slot1.* == 0 { return any }
+    while slot1.* != 0 {
+        const slot2: *usize = &slotStage(slot1).*.next
+        if slot2.* == 0 { return any }
+        if slotStage(slot1).*.implements == op1 && slotStage(slot2).*.implements == op2 {
+            removeElement(slot2)
+            removeElement(slot1)
+            any = true
+        } else {
+            slot1 = &slotStage(slot1).*.next
+        }
+    }
+    return any
+}
+
+fn matrixOf(stage: *pipeline.Stage, m: *[9]f64) -> void {
+    var index: usize = 0
+    while index < 9 {
+        m.*[index] = mem.doubles(stage.*.matrix)[index]
+        index += 1
+    }
+}
+
+// isFloatMatrixIdentity: within (float) 1e-5 of the identity.
+fn isFloatIdentity(m: *[9]f64) -> bool {
+    const tolerance: f64 = @floatCast(f64, @floatCast(f32, 0.00001))
+    var index: usize = 0
+    while index < 9 {
+        const expected: f64 = if index == 0 || index == 4 || index == 8 { 1.0 } else { 0.0 }
+        if !(mem.fabs(expected - m.*[index]) < tolerance) { return false }
+        index += 1
+    }
+    return true
+}
+
+// _MultiplyMatrix.
+fn multiplyMatrices(pipe: *Pipeline) -> bool {
+    var slot1: *usize = &pipe.*.first
+    var any = false
+    if slot1.* == 0 { return any }
+    while slot1.* != 0 {
+        const slot2: *usize = &slotStage(slot1).*.next
+        if slot2.* == 0 { return any }
+        const s1 = slotStage(slot1)
+        const s2 = slotStage(slot2)
+        if s1.*.implements == pipeline.SIG_MATRIX && s2.*.implements == pipeline.SIG_MATRIX {
+            if s1.*.offset != 0 || s2.*.offset != 0 || s1.*.inputs != 3 || s1.*.outputs != 3 || s2.*.inputs != 3 || s2.*.outputs != 3 { return false }
+            var m1: [9]f64 = undefined
+            var m2: [9]f64 = undefined
+            matrixOf(s1, &m1)
+            matrixOf(s2, &m2)
+            var result: [9]f64 = undefined
+            matrix.multiply(&result, &m2, &m1)
+            const chain = s2.*.next
+            removeElement(slot2)
+            removeElement(slot1)
+            if !isFloatIdentity(&result) {
+                const product = pipeline.matrix(pipe.*.allocator, 3, 3, @intFromPtr(&result), 0)
+                if product == 0 { return false }
+                pipeline.stageAt(product).*.next = chain
+                slot1.* = product
+            }
+            any = true
+        } else {
+            slot1 = &slotStage(slot1).*.next
+        }
+    }
+    return any
+}
+
+pub fn preOptimize(pipe: *Pipeline) -> bool {
+    var any = false
+    while true {
+        var opt = false
+        if remove1Op(pipe, pipeline.SIG_IDENTITY) { opt = true }
+        if remove2Op(pipe, pipeline.SIG_XYZ2LAB, pipeline.SIG_LAB2XYZ) { opt = true }
+        if remove2Op(pipe, pipeline.SIG_LAB2XYZ, pipeline.SIG_XYZ2LAB) { opt = true }
+        if remove2Op(pipe, pipeline.SIG_LABV4TOV2, pipeline.SIG_LABV2TOV4) { opt = true }
+        if remove2Op(pipe, pipeline.SIG_LABV2TOV4, pipeline.SIG_LABV4TOV2) { opt = true }
+        if remove2Op(pipe, pipeline.SIG_LAB2FLOATPCS, pipeline.SIG_FLOATPCS2LAB) { opt = true }
+        if remove2Op(pipe, pipeline.SIG_XYZ2FLOATPCS, pipeline.SIG_FLOATPCS2XYZ) { opt = true }
+        if multiplyMatrices(pipe) { opt = true }
+        if !opt { break }
+        any = true
+    }
+    // (The stages' channels are re-read: a pipeline emptied keeps its
+    // own.)
+    if pipe.*.first != 0 {
+        pipe.*.inputs = pipeline.stageAt(pipe.*.first).*.inputs
+        pipe.*.outputs = pipeline.stageAt(pipeline.lastStage(pipe)).*.outputs
+    }
+    return any
+}
+
+// ---------------------------------------------------------------------------
+// The optimizations
+
+// XFormSampler16 over every node of the grid of stage CLUT.
+fn sampleClut(clutAddress: usize, source: *Pipeline, scratch: usize) -> void {
+    const stage = pipeline.stageAt(clutAddress)
+    const clut = &stage.*.clut
+    const table = mem.shorts(clut.*.table)
+    const nodes = pipeline.cubeSize(&clut.*.samples, clut.*.inputs)
+    const in16 = mem.shorts(scratch + 1800)
+    const inFloat = mem.floats(scratch + 1840)
+    const outFloat = mem.floats(scratch + 1920)
+    var index: usize = 0
+    var at: usize = 0
+    while index < nodes {
+        pipeline.nodeInputs(clut, index, in16)
+        var t: usize = 0
+        while t < source.*.inputs {
+            inFloat[t] = @floatCast(f32, @floatFromInt(f64, in16[t]) / 65535.0)
+            t += 1
+        }
+        pipeline.evalFloat(source, inFloat, outFloat, scratch)
+        t = 0
+        while t < clut.*.outputs {
+            table[at + t] = @intCast(u16, mem.saturateWord(@floatCast(f64, outFloat[t]) * 65535.0))
+            t += 1
+        }
+        at += clut.*.outputs
+        index += 1
+    }
+}
+
+fn allCurvesLinear(stage: *pipeline.Stage) -> bool {
+    var index: usize = 0
+    while index < stage.*.outputs {
+        if !curve.isLinear(curve.curveAt(pipeline.curveOf(stage, index))) { return false }
+        index += 1
+    }
+    return true
+}
+
+// _cmsReasonableGridpointsByColorspace.
+pub fn gridPoints(space: u64, flags: u64) -> usize {
+    if (flags & 0x00ff0000) != 0 { return @intCast(usize, (flags >> 16) & 0xff) }
+    const n = profile.channelsOf(space)
+    if (flags & FLAGS_HIGHRESPRECALC) != 0 {
+        if n > 4 { return 7 }
+        if n == 4 { return 23 }
+        return 49
+    }
+    if (flags & FLAGS_LOWRESPRECALC) != 0 {
+        if n > 4 { return 6 }
+        if n == 1 { return 33 }
+        return 17
+    }
+    if n > 4 { return 7 }
+    if n == 4 { return 17 }
+    return 33
+}
+
+// _cmsEndPointsBySpace's white (WHITE, its channels into COUNT); false
+// for spaces without one.
+fn whiteOf(space: u64, white: [*]u16, count: *usize) -> bool {
+    if space == profile.SPACE_GRAY {
+        white[0] = 0xffff
+        count.* = 1
+        return true
+    }
+    if space == profile.SPACE_RGB {
+        white[0] = 0xffff
+        white[1] = 0xffff
+        white[2] = 0xffff
+        count.* = 3
+        return true
+    }
+    if space == profile.SPACE_LAB {
+        white[0] = 0xffff
+        white[1] = 0x8080
+        white[2] = 0x8080
+        count.* = 3
+        return true
+    }
+    if space == profile.SPACE_CMYK {
+        white[0] = 0
+        white[1] = 0
+        white[2] = 0
+        white[3] = 0
+        count.* = 4
+        return true
+    }
+    if space == profile.SPACE_CMY {
+        white[0] = 0
+        white[1] = 0
+        white[2] = 0
+        count.* = 3
+        return true
+    }
+    return false
+}
+
+// PatchLUT: the node at AT set to VALUE when AT falls on a node.
+fn patchLut(stage: *pipeline.Stage, at: [*]const u16, value: [*]const u16, outputs: usize, inputs: usize) -> bool {
+    const p = &stage.*.clut
+    var index: usize = 0
+    if inputs == 3 {
+        const px = (@floatFromInt(f64, at[0]) * @floatFromInt(f64, p.*.domain[0])) / 65535.0
+        const py = (@floatFromInt(f64, at[1]) * @floatFromInt(f64, p.*.domain[1])) / 65535.0
+        const pz = (@floatFromInt(f64, at[2]) * @floatFromInt(f64, p.*.domain[2])) / 65535.0
+        const x0 = @floor(px)
+        const y0 = @floor(py)
+        const z0 = @floor(pz)
+        if px - x0 != 0.0 || py - y0 != 0.0 || pz - z0 != 0.0 { return false }
+        index = p.*.opta[2] * @intFromFloat(usize, x0) + p.*.opta[1] * @intFromFloat(usize, y0) + p.*.opta[0] * @intFromFloat(usize, z0)
+    } else if inputs == 1 {
+        const px = (@floatFromInt(f64, at[0]) * @floatFromInt(f64, p.*.domain[0])) / 65535.0
+        const x0 = @floor(px)
+        if px - x0 != 0.0 { return false }
+        index = p.*.opta[0] * @intFromFloat(usize, x0)
+    } else {
+        return false
+    }
+    const table = mem.shorts(p.*.table)
+    var i: usize = 0
+    while i < outputs {
+        table[index + i] = value[i]
+        i += 1
+    }
+    return true
+}
+
+// FixWhiteMisalignment.
+fn fixWhite(pipe: *Pipeline, entry: u64, exit: u64, scratch: usize) -> bool {
+    const whiteIn = mem.shorts(scratch + 1200)
+    const whiteOut = mem.shorts(scratch + 1240)
+    const obtained = mem.shorts(scratch + 1280)
+    const patchIn = mem.shorts(scratch + 1320)
+    const patchOut = mem.shorts(scratch + 1360)
+    var ins: usize = 0
+    var outs: usize = 0
+    if !whiteOf(entry, whiteIn, &ins) { return false }
+    if !whiteOf(exit, whiteOut, &outs) { return false }
+    if pipe.*.inputs != ins || pipe.*.outputs != outs { return false }
+    eval16(pipe, whiteIn, obtained, scratch)
+    var equal = true
+    var i: usize = 0
+    while i < outs {
+        var difference = @intCast(i64, whiteOut[i]) - @intCast(i64, obtained[i])
+        if difference < 0 { difference = -difference }
+        if difference > 0xf000 { break }
+        if whiteOut[i] != obtained[i] {
+            equal = false
+            break
+        }
+        i += 1
+    }
+    if equal { return true }
+    // [curves] grid [curves].
+    var pre: usize = 0
+    var clut: usize = 0
+    var post: usize = 0
+    const count = pipeline.stageCount(pipe)
+    const first = pipe.*.first
+    if count == 3 && pipeline.stageAt(first).*.kind == pipeline.SIG_CURVES && pipeline.stageAt(pipeline.stageAt(first).*.next).*.kind == pipeline.SIG_CLUT && pipeline.stageAt(pipeline.lastStage(pipe)).*.kind == pipeline.SIG_CURVES {
+        pre = first
+        clut = pipeline.stageAt(first).*.next
+        post = pipeline.lastStage(pipe)
+    } else if count == 2 && pipeline.stageAt(first).*.kind == pipeline.SIG_CURVES && pipeline.stageAt(pipeline.lastStage(pipe)).*.kind == pipeline.SIG_CLUT {
+        pre = first
+        clut = pipeline.lastStage(pipe)
+    } else if count == 2 && pipeline.stageAt(first).*.kind == pipeline.SIG_CLUT && pipeline.stageAt(pipeline.lastStage(pipe)).*.kind == pipeline.SIG_CURVES {
+        clut = first
+        post = pipeline.lastStage(pipe)
+    } else if count == 1 && pipeline.stageAt(first).*.kind == pipeline.SIG_CLUT {
+        clut = first
+    } else {
+        return false
+    }
+    i = 0
+    while i < ins {
+        if pre != 0 {
+            patchIn[i] = @intCast(u16, curve.eval16(curve.curveAt(pipeline.curveOf(pipeline.stageAt(pre), i)), @intCast(u64, whiteIn[i])))
+        } else {
+            patchIn[i] = whiteIn[i]
+        }
+        i += 1
+    }
+    i = 0
+    while i < outs {
+        patchOut[i] = whiteOut[i]
+        if post != 0 {
+            const inverse = curve.reverse(pipeline.curveOf(pipeline.stageAt(post), i), 4096)
+            if inverse != 0 {
+                patchOut[i] = @intCast(u16, curve.eval16(curve.curveAt(inverse), @intCast(u64, whiteOut[i])))
+                curve.freeCurve(inverse)
+            }
+        }
+        i += 1
+    }
+    const ignored = patchLut(pipeline.stageAt(clut), patchIn, patchOut, outs, ins)
+    return true
+}
+
+// OptimizeByResampling.
+fn byResampling(lut: *usize, intent: u64, inputFormat: u64, outputFormat: u64, flags: *u64, scratch: usize) -> bool {
+    if format.isFloat(inputFormat) || format.isFloat(outputFormat) { return false }
+    const space = format.iccColorSpace(format.colorspaceOf(inputFormat))
+    const outSpace = format.iccColorSpace(format.colorspaceOf(outputFormat))
+    if space == 0 || outSpace == 0 { return false }
+    const source = pipeline.pipelineAt(lut.*)
+    const allocator = source.*.allocator
+    var points = gridPoints(space, flags.*)
+    if pipeline.stageCount(source) == 0 { points = 2 }
+    const destAddress = pipeline.allocPipeline(allocator, source.*.inputs, source.*.outputs)
+    if destAddress == 0 { return false }
+    const dest = pipeline.pipelineAt(destAddress)
+    var keepPre: usize = 0
+    var keepPost: usize = 0
+    var newPre: usize = 0
+    var newPost: usize = 0
+    if (flags.* & FLAGS_CLUT_PRE_LINEARIZATION) != 0 {
+        const first = source.*.first
+        if first != 0 && pipeline.stageAt(first).*.kind == pipeline.SIG_CURVES && !allCurvesLinear(pipeline.stageAt(first)) {
+            newPre = pipeline.duplicateStage(first)
+            if !pipeline.insertStage(dest, false, newPre) {
+                pipeline.freePipeline(destAddress)
+                return false
+            }
+            keepPre = pipeline.unlinkStage(source, false)
+        }
+    }
+    const clut = pipeline.clut16(allocator, points, source.*.inputs, source.*.outputs, 0)
+    var good = clut != 0 && pipeline.insertStage(dest, true, clut)
+    if good && (flags.* & FLAGS_CLUT_POST_LINEARIZATION) != 0 {
+        const last = pipeline.lastStage(source)
+        if last != 0 && pipeline.stageAt(last).*.kind == pipeline.SIG_CURVES && !allCurvesLinear(pipeline.stageAt(last)) {
+            newPost = pipeline.duplicateStage(last)
+            good = pipeline.insertStage(dest, true, newPost)
+            if good { keepPost = pipeline.unlinkStage(source, true) }
+        }
+    }
+    if !good {
+        if keepPre != 0 { const a = pipeline.insertStage(source, false, keepPre) }
+        if keepPost != 0 { const b = pipeline.insertStage(source, true, keepPost) }
+        pipeline.freePipeline(destAddress)
+        return false
+    }
+    sampleClut(clut, source, scratch)
+    pipeline.freeStage(keepPre)
+    pipeline.freeStage(keepPost)
+    freePipeline(lut.*)
+    if newPre == 0 && newPost == 0 {
+        setOptimization(dest, EVAL_CLUT, 0)
+        dest.*.data = clut
+    } else {
+        const data = mem.allocate(allocator, 24)
+        if data != 0 {
+            mem.put64(data + P16_PRE, @intCast(u64, newPre))
+            mem.put64(data + P16_CLUT, @intCast(u64, clut))
+            mem.put64(data + P16_POST, @intCast(u64, newPost))
+            setOptimization(dest, EVAL_PRELIN16, data)
+        }
+    }
+    if intent == 3 { flags.* = flags.* | FLAGS_NOWHITEONWHITEFIXUP }
+    if (flags.* & FLAGS_NOWHITEONWHITEFIXUP) == 0 { const ignored = fixWhite(dest, space, outSpace, scratch) }
+    lut.* = destAddress
+    return true
+}
+
+// SlopeLimiting.
+fn slopeLimiting(c: *curve.Curve) -> void {
+    const table = curve.tableOf(c)
+    const n = c.*.entries
+    const atBegin = @intFromFloat(i64, @floor(@floatFromInt(f64, n) * 0.02 + 0.5))
+    const atEnd = @intCast(i64, n) - atBegin - 1
+    var beginValue: f64 = 0.0
+    var endValue: f64 = 65535.0
+    if curve.isDescending(c) {
+        beginValue = 65535.0
+        endValue = 0.0
+    }
+    var value = @floatFromInt(f64, table[@intCast(usize, atBegin)])
+    var slope = (value - beginValue) / @floatFromInt(f64, atBegin)
+    var beta = value - slope * @floatFromInt(f64, atBegin)
+    var i: i64 = 0
+    while i < atBegin {
+        table[@intCast(usize, i)] = @intCast(u16, mem.saturateWord(@floatFromInt(f64, i) * slope + beta))
+        i += 1
+    }
+    value = @floatFromInt(f64, table[@intCast(usize, atEnd)])
+    slope = (endValue - value) / @floatFromInt(f64, atBegin)
+    beta = value - slope * @floatFromInt(f64, atEnd)
+    i = atEnd
+    while i < @intCast(i64, n) {
+        table[@intCast(usize, i)] = @intCast(u16, mem.saturateWord(@floatFromInt(f64, i) * slope + beta))
+        i += 1
+    }
+}
+
+// IsDegenerated.
+fn isDegenerated(c: *curve.Curve) -> bool {
+    const table = curve.tableOf(c)
+    const n = c.*.entries
+    var zeros: usize = 0
+    var poles: usize = 0
+    var i: usize = 0
+    while i < n {
+        if table[i] == 0 { zeros += 1 }
+        if table[i] == 0xffff { poles += 1 }
+        i += 1
+    }
+    if zeros == 1 && poles == 1 { return false }
+    if zeros > n / 20 { return true }
+    if poles > n / 20 { return true }
+    return false
+}
+
+// PrelinOpt8alloc.
+fn prelin8Data(allocator: Allocator, p: *interp.Params, curves: usize) -> usize {
+    const data = mem.allocate(allocator, P8_SIZE)
+    if data == 0 { return 0 }
+    mem.put64(data + P8_PARAMS, @intCast(u64, @intFromPtr(p)))
+    const rs = mem.shorts(data + P8_R)
+    const x0s = mem.ints(data + P8_X0)
+    var i: usize = 0
+    while i < 256 {
+        var channel: usize = 0
+        while channel < 3 {
+            var input = mem.from8to16(@intCast(u64, i))
+            if curves != 0 { input = curve.eval16(curve.curveAt(mem.words(curves)[channel]), input) }
+            const v = mem.toFixedDomain(@intCast(i64, input * @intCast(u64, p.*.domain[channel])))
+            x0s[channel * 256 + i] = @intCast(i64, p.*.opta[2 - channel]) * (v >> 16)
+            rs[channel * 256 + i] = @intCast(u16, v & 0xffff)
+            channel += 1
+        }
+        i += 1
+    }
+    return data
+}
+
+fn freeCurves(list: *[16]usize, count: usize) -> void {
+    var i: usize = 0
+    while i < count {
+        curve.freeCurve(list.*[i])
+        list.*[i] = 0
+        i += 1
+    }
+}
+
+// OptimizeByComputingLinearization.
+fn byComputingLinearization(lut: *usize, intent: u64, inputFormat: u64, outputFormat: u64, flags: *u64, scratch: usize) -> bool {
+    if format.isFloat(inputFormat) || format.isFloat(outputFormat) { return false }
+    if format.colorspaceOf(inputFormat) != format.PT_RGB || format.planar(inputFormat) { return false }
+    if format.colorspaceOf(outputFormat) != format.PT_RGB || format.planar(outputFormat) { return false }
+    if !format.is8bit(inputFormat) && (flags.* & FLAGS_CLUT_PRE_LINEARIZATION) == 0 { return false }
+    const original = pipeline.pipelineAt(lut.*)
+    const allocator = original.*.allocator
+    const space = format.iccColorSpace(format.colorspaceOf(inputFormat))
+    const outSpace = format.iccColorSpace(format.colorspaceOf(outputFormat))
+    if space == 0 || outSpace == 0 { return false }
+    const points = gridPoints(space, flags.*)
+    const last = pipeline.lastStage(original)
+    if last == 0 { return false }
+    if pipeline.stageAt(last).*.kind == pipeline.SIG_CURVES {
+        const stage = pipeline.stageAt(last)
+        var i: usize = 0
+        while i < stage.*.inputs {
+            if isDegenerated(curve.curveAt(pipeline.curveOf(stage, i))) { return false }
+            i += 1
+        }
+    }
+    const inputs = original.*.inputs
+    if inputs > 16 { return false }
+    var trans: [16]usize = undefined
+    var reverse: [16]usize = undefined
+    var t: usize = 0
+    while t < 16 {
+        trans[t] = 0
+        reverse[t] = 0
+        t += 1
+    }
+    t = 0
+    while t < inputs {
+        trans[t] = curve.buildTabulated16(allocator, PRELINEARIZATION_POINTS, 0)
+        if trans[t] == 0 {
+            freeCurves(&trans, inputs)
+            return false
+        }
+        t += 1
+    }
+    const inFloat = mem.floats(scratch + 1840)
+    const outFloat = mem.floats(scratch + 1920)
+    var i: usize = 0
+    while i < PRELINEARIZATION_POINTS {
+        const v: f32 = @floatCast(f32, @floatFromInt(f64, i) / @floatFromInt(f64, PRELINEARIZATION_POINTS - 1))
+        t = 0
+        while t < inputs {
+            inFloat[t] = v
+            t += 1
+        }
+        pipeline.evalFloat(original, inFloat, outFloat, scratch)
+        t = 0
+        while t < inputs {
+            curve.tableOf(curve.curveAt(trans[t]))[i] = @intCast(u16, mem.saturateWord(@floatCast(f64, outFloat[t]) * 65535.0))
+            t += 1
+        }
+        i += 1
+    }
+    t = 0
+    while t < inputs {
+        slopeLimiting(curve.curveAt(trans[t]))
+        t += 1
+    }
+    var suitable = true
+    t = 0
+    while suitable && t < inputs {
+        const c = curve.curveAt(trans[t])
+        if !curve.isMonotonic(c) { suitable = false }
+        if isDegenerated(c) { suitable = false }
+        t += 1
+    }
+    if !suitable {
+        freeCurves(&trans, inputs)
+        return false
+    }
+    t = 0
+    while t < inputs {
+        reverse[t] = curve.reverse(trans[t], PRELINEARIZATION_POINTS)
+        if reverse[t] == 0 {
+            freeCurves(&trans, inputs)
+            freeCurves(&reverse, inputs)
+            return false
+        }
+        t += 1
+    }
+    const plusCurves = pipeline.duplicatePipeline(lut.*)
+    var good = plusCurves != 0
+    if good { good = pipeline.insertStage(pipeline.pipelineAt(plusCurves), false, pipeline.toneCurves(allocator, inputs, @intFromPtr(&reverse))) }
+    var optimized: usize = 0
+    var prelin: usize = 0
+    var clut: usize = 0
+    if good {
+        optimized = pipeline.allocPipeline(allocator, original.*.inputs, original.*.outputs)
+        good = optimized != 0
+    }
+    if good {
+        prelin = pipeline.toneCurves(allocator, inputs, @intFromPtr(&trans))
+        good = pipeline.insertStage(pipeline.pipelineAt(optimized), false, prelin)
+    }
+    if good {
+        clut = pipeline.clut16(allocator, points, original.*.inputs, original.*.outputs, 0)
+        good = pipeline.insertStage(pipeline.pipelineAt(optimized), true, clut)
+    }
+    if good { sampleClut(clut, pipeline.pipelineAt(plusCurves), scratch) }
+    freeCurves(&trans, inputs)
+    freeCurves(&reverse, inputs)
+    if plusCurves != 0 { pipeline.freePipeline(plusCurves) }
+    if !good {
+        if optimized != 0 { pipeline.freePipeline(optimized) }
+        return false
+    }
+    const out = pipeline.pipelineAt(optimized)
+    const clutStage = pipeline.stageAt(clut)
+    if format.is8bit(inputFormat) {
+        const data = prelin8Data(allocator, &clutStage.*.clut, pipeline.stageAt(prelin).*.curves)
+        if data == 0 {
+            pipeline.freePipeline(optimized)
+            return false
+        }
+        setOptimization(out, EVAL_PRELIN8, data)
+    } else {
+        const data = mem.allocate(allocator, 24)
+        if data == 0 {
+            pipeline.freePipeline(optimized)
+            return false
+        }
+        mem.put64(data + P16_PRE, @intCast(u64, prelin))
+        mem.put64(data + P16_CLUT, @intCast(u64, clut))
+        mem.put64(data + P16_POST, 0)
+        setOptimization(out, EVAL_PRELIN16, data)
+    }
+    if intent == 3 { flags.* = flags.* | FLAGS_NOWHITEONWHITEFIXUP }
+    if (flags.* & FLAGS_NOWHITEONWHITEFIXUP) == 0 {
+        if !fixWhite(out, space, outSpace, scratch) {
+            freePipeline(optimized)
+            return false
+        }
+    }
+    freePipeline(lut.*)
+    lut.* = optimized
+    return true
+}
+
+// CurvesAlloc: each curve tabulated for 8-bit (256) or 16-bit (65536)
+// input.
+fn curvesData(allocator: Allocator, stage: *pipeline.Stage, elements: usize) -> usize {
+    const count = stage.*.inputs
+    const data = mem.allocate(allocator, 16 + count * elements * 2)
+    if data == 0 { return 0 }
+    mem.put64(data, @intCast(u64, count))
+    mem.put64(data + 8, @intCast(u64, elements))
+    const tables = mem.shorts(data + 16)
+    var i: usize = 0
+    while i < count {
+        const c = curve.curveAt(pipeline.curveOf(stage, i))
+        var j: usize = 0
+        while j < elements {
+            const x: u64 = if elements == 256 { mem.from8to16(@intCast(u64, j)) } else { @intCast(u64, j) }
+            tables[i * elements + j] = @intCast(u16, curve.eval16(c, x))
+            j += 1
+        }
+        i += 1
+    }
+    return data
+}
+
+// OptimizeByJoiningCurves.
+fn byJoiningCurves(lut: *usize, inputFormat: u64, outputFormat: u64, flags: *u64, scratch: usize) -> bool {
+    if format.isFloat(inputFormat) || format.isFloat(outputFormat) { return false }
+    const source = pipeline.pipelineAt(lut.*)
+    const allocator = source.*.allocator
+    var at = source.*.first
+    while at != 0 {
+        if pipeline.stageAt(at).*.kind != pipeline.SIG_CURVES { return false }
+        at = pipeline.stageAt(at).*.next
+    }
+    const inputs = source.*.inputs
+    if inputs > 16 { return false }
+    const destAddress = pipeline.allocPipeline(allocator, source.*.inputs, source.*.outputs)
+    if destAddress == 0 { return false }
+    const dest = pipeline.pipelineAt(destAddress)
+    var tables: [16]usize = undefined
+    var t: usize = 0
+    while t < 16 {
+        tables[t] = 0
+        t += 1
+    }
+    t = 0
+    while t < inputs {
+        tables[t] = curve.buildTabulated16(allocator, PRELINEARIZATION_POINTS, 0)
+        if tables[t] == 0 {
+            freeCurves(&tables, inputs)
+            pipeline.freePipeline(destAddress)
+            return false
+        }
+        t += 1
+    }
+    const inFloat = mem.floats(scratch + 1840)
+    const outFloat = mem.floats(scratch + 1920)
+    var i: usize = 0
+    while i < PRELINEARIZATION_POINTS {
+        t = 0
+        while t < inputs {
+            inFloat[t] = @floatCast(f32, @floatFromInt(f64, i) / @floatFromInt(f64, PRELINEARIZATION_POINTS - 1))
+            t += 1
+        }
+        pipeline.evalFloat(source, inFloat, outFloat, scratch)
+        t = 0
+        while t < inputs {
+            curve.tableOf(curve.curveAt(tables[t]))[i] = @intCast(u16, mem.saturateWord(@floatCast(f64, outFloat[t]) * 65535.0))
+            t += 1
+        }
+        i += 1
+    }
+    const obtained = pipeline.toneCurves(allocator, inputs, @intFromPtr(&tables))
+    freeCurves(&tables, inputs)
+    if obtained == 0 {
+        pipeline.freePipeline(destAddress)
+        return false
+    }
+    if !allCurvesLinear(pipeline.stageAt(obtained)) {
+        const ignored = pipeline.insertStage(dest, false, obtained)
+        const elements: usize = if format.is8bit(inputFormat) { 256 } else { 65536 }
+        const data = curvesData(allocator, pipeline.stageAt(obtained), elements)
+        if data == 0 {
+            pipeline.freePipeline(destAddress)
+            return false
+        }
+        flags.* = flags.* | FLAGS_NOCACHE
+        setOptimization(dest, if elements == 256 { EVAL_CURVES8 } else { EVAL_CURVES16 }, data)
+    } else {
+        pipeline.freeStage(obtained)
+        if !pipeline.insertStage(dest, false, pipeline.identity(allocator, source.*.inputs)) {
+            pipeline.freePipeline(destAddress)
+            return false
+        }
+        flags.* = flags.* | FLAGS_NOCACHE
+        setOptimization(dest, EVAL_IDENTITY, 0)
+    }
+    freePipeline(lut.*)
+    lut.* = destAddress
+    return true
+}
+
+// FillFirstShaper: 0..255 to 1.14 fixed point.
+fn fillFirstShaper(table: [*]i64, c: *curve.Curve) -> void {
+    var i: usize = 0
+    while i < 256 {
+        const r: f32 = @floatCast(f32, @floatFromInt(f64, i) / 255.0)
+        const y = curve.evalFloat(c, r)
+        if @floatCast(f64, y) < 131072.0 {
+            table[i] = @intFromFloat(i64, @floor(@floatCast(f64, y) * 16384.0 + 0.5))
+        } else {
+            table[i] = 0x7fffffff
+        }
+        i += 1
+    }
+}
+
+// FillSecondShaper: 1.14 fixed point (0..1) to 16 bits, rounded to what
+// 8 bits hold for 8-bit output.
+fn fillSecondShaper(table: [*]u16, c: *curve.Curve, eightBit: bool) -> void {
+    var i: usize = 0
+    while i < 16385 {
+        const r: f32 = @floatCast(f32, @floatFromInt(f64, i) / 16384.0)
+        var value = curve.evalFloat(c, r)
+        if value < @floatCast(f32, 0.0) { value = @floatCast(f32, 0.0) }
+        if value > @floatCast(f32, 1.0) { value = @floatCast(f32, 1.0) }
+        const w = mem.saturateWord(@floatCast(f64, value) * 65535.0)
+        if eightBit {
+            table[i] = @intCast(u16, mem.from8to16(mem.from16to8(w)))
+        } else {
+            table[i] = @intCast(u16, w)
+        }
+        i += 1
+    }
+}
+
+inline fn fixed14(x: f64) -> i64 { return @intFromFloat(i64, @floor(x * 16384.0 + 0.5)) }
+
+// OptimizeMatrixShaper.
+fn matrixShaper(lut: *usize, intent: u64, inputFormat: u64, outputFormat: *u64, flags: *u64, scratch: usize) -> bool {
+    if format.channels(inputFormat) != 3 || format.channels(outputFormat.*) != 3 { return false }
+    if !format.is8bit(inputFormat) { return false }
+    const source = pipeline.pipelineAt(lut.*)
+    const allocator = source.*.allocator
+    const count = pipeline.stageCount(source)
+    var res: [9]f64 = undefined
+    var offset: usize = 0
+    var curve1: usize = 0
+    var curve2: usize = 0
+    var identityMatrix = false
+    const first = source.*.first
+    if count == 4 {
+        const s1 = pipeline.stageAt(first)
+        const s2 = pipeline.stageAt(s1.*.next)
+        const s3 = pipeline.stageAt(s2.*.next)
+        const s4 = pipeline.stageAt(s3.*.next)
+        if s1.*.kind != pipeline.SIG_CURVES || s2.*.kind != pipeline.SIG_MATRIX || s3.*.kind != pipeline.SIG_MATRIX || s4.*.kind != pipeline.SIG_CURVES { return false }
+        if s2.*.offset != 0 { return false }
+        var m1: [9]f64 = undefined
+        var m2: [9]f64 = undefined
+        matrixOf(s2, &m1)
+        matrixOf(s3, &m2)
+        matrix.multiply(&res, &m2, &m1)
+        offset = s3.*.offset
+        if matrix.isIdentity(&res) && offset == 0 { identityMatrix = true }
+        curve1 = first
+        curve2 = s3.*.next
+    } else if count == 3 {
+        const s1 = pipeline.stageAt(first)
+        const s2 = pipeline.stageAt(s1.*.next)
+        const s3 = pipeline.stageAt(s2.*.next)
+        if s1.*.kind != pipeline.SIG_CURVES || s2.*.kind != pipeline.SIG_MATRIX || s3.*.kind != pipeline.SIG_CURVES { return false }
+        matrixOf(s2, &res)
+        offset = s2.*.offset
+        if matrix.isIdentity(&res) && offset == 0 { identityMatrix = true }
+        curve1 = first
+        curve2 = s2.*.next
+    } else {
+        return false
+    }
+    const destAddress = pipeline.allocPipeline(allocator, source.*.inputs, source.*.outputs)
+    if destAddress == 0 { return false }
+    const dest = pipeline.pipelineAt(destAddress)
+    var good = pipeline.insertStage(dest, false, pipeline.duplicateStage(curve1))
+    if good && !identityMatrix { good = pipeline.insertStage(dest, true, pipeline.matrix(allocator, 3, 3, @intFromPtr(&res), offset)) }
+    if good { good = pipeline.insertStage(dest, true, pipeline.duplicateStage(curve2)) }
+    if !good {
+        pipeline.freePipeline(destAddress)
+        return false
+    }
+    var result = destAddress
+    if identityMatrix {
+        const ignored = byJoiningCurves(&result, inputFormat, outputFormat.*, flags, scratch)
+    } else {
+        flags.* = flags.* | FLAGS_NOCACHE
+        const eightBit = format.is8bit(outputFormat.*)
+        const data = mem.allocate(allocator, MS_SIZE)
+        if data == 0 {
+            pipeline.freePipeline(destAddress)
+            return false
+        }
+        const c1 = pipeline.stageAt(curve1)
+        const c2 = pipeline.stageAt(curve2)
+        var channel: usize = 0
+        while channel < 3 {
+            fillFirstShaper(mem.ints(data + MS_SHAPER1 + channel * 256 * 8), curve.curveAt(pipeline.curveOf(c1, channel)))
+            fillSecondShaper(mem.shorts(data + MS_SHAPER2 + channel * 16385 * 2), curve.curveAt(pipeline.curveOf(c2, channel)), eightBit)
+            channel += 1
+        }
+        const mat = mem.ints(data + MS_MAT)
+        var i: usize = 0
+        while i < 9 {
+            mat[i] = fixed14(res[i])
+            i += 1
+        }
+        const off = mem.ints(data + MS_OFF)
+        i = 0
+        while i < 3 {
+            off[i] = if offset == 0 { 0 } else { fixed14(mem.doubles(offset)[i]) }
+            i += 1
+        }
+        if eightBit { outputFormat.* = outputFormat.* | format.OPTIMIZED }
+        setOptimization(dest, EVAL_MATSHAPER, data)
+    }
+    freePipeline(lut.*)
+    lut.* = result
+    return true
+}
+
+// A pipeline with its optimizer's data.
+pub fn freePipeline(address: usize) -> void {
+    if address == 0 { return }
+    const pipe = pipeline.pipelineAt(address)
+    if pipe.*.eval != EVAL_CLUT { mem.release(pipe.*.allocator, pipe.*.data) }
+    pipe.*.data = 0
+    pipeline.freePipeline(address)
+}
+
+// _cmsOptimizePipeline: LUT (an address of the pipeline's address) made
+// fast for pixels of INPUTFORMAT and OUTPUTFORMAT; FLAGS and OUTPUTFORMAT
+// changed as Little CMS changes them.
+pub fn optimizePipeline(lut: *usize, intent: u64, inputFormat: u64, outputFormat: *u64, flags: *u64, scratch: usize) -> bool {
+    const pipe = pipeline.pipelineAt(lut.*)
+    if (flags.* & FLAGS_FORCE_CLUT) != 0 {
+        const ignored = preOptimize(pipe)
+        return byResampling(lut, intent, inputFormat, outputFormat.*, flags, scratch)
+    }
+    if pipe.*.first == 0 {
+        setOptimization(pipe, EVAL_IDENTITY, 0)
+        return true
+    }
+    const any = preOptimize(pipe)
+    if pipe.*.first == 0 {
+        setOptimization(pipe, EVAL_IDENTITY, 0)
+        return true
+    }
+    if (flags.* & FLAGS_NOOPTIMIZE) != 0 { return false }
+    if byJoiningCurves(lut, inputFormat, outputFormat.*, flags, scratch) { return true }
+    if matrixShaper(lut, intent, inputFormat, outputFormat, flags, scratch) { return true }
+    if byComputingLinearization(lut, intent, inputFormat, outputFormat.*, flags, scratch) { return true }
+    if byResampling(lut, intent, inputFormat, outputFormat.*, flags, scratch) { return true }
+    return any
+}

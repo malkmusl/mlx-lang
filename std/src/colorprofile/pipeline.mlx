@@ -1,0 +1,573 @@
+// std.colorprofile.pipeline: Little CMS's (2.14) pipelines (cmslut.c): a
+// list of stages, each taking some channels in [0, 1] to some others as
+// floats: a set of tone curves, a matrix (with or without offsets), a
+// colour lookup table of 16-bit entries, the conversions between Lab and
+// XYZ in the PCS's encodings, an identity, a clip of negatives. A stage
+// knows what it is (`kind`, the element type) and what it implements
+// (the Lab V2 <-> V4 matrices, identity curves), which the optimizer
+// reads.
+//
+// A pipeline evaluates in floats, stage by stage; in 16 bits it goes in
+// and out of floats around the stages (_LUTeval16), unless the optimizer
+// put something faster in its place (std.colorprofile.optimize).
+const mem = @import("./mem.mlx")
+const curve = @import("./curve.mlx")
+const interp = @import("./interp.mlx")
+const math = @import("../math.mlx")
+
+pub const Allocator = mem.Allocator
+
+// Stage signatures (cmsStageSignature).
+pub const SIG_CURVES: u64 = 0x63767374
+pub const SIG_MATRIX: u64 = 0x6D617466
+pub const SIG_CLUT: u64 = 0x636C7574
+pub const SIG_LAB2XYZ: u64 = 0x6C327820
+pub const SIG_XYZ2LAB: u64 = 0x78326C20
+pub const SIG_IDENTITY: u64 = 0x69646E20
+pub const SIG_LABV2TOV4: u64 = 0x76327634
+pub const SIG_LABV4TOV2: u64 = 0x76347632
+pub const SIG_CLIP_NEGATIVES: u64 = 0x636c7020
+pub const SIG_LAB2FLOATPCS: u64 = 0x64326C20
+pub const SIG_FLOATPCS2LAB: u64 = 0x6C326420
+pub const SIG_XYZ2FLOATPCS: u64 = 0x64327820
+pub const SIG_FLOATPCS2XYZ: u64 = 0x78326420
+
+pub const MAX_CHANNELS: usize = 16
+pub const MAX_STAGE_CHANNELS: usize = 128
+
+pub const Stage = struct {
+    allocator: Allocator
+    kind: u64
+    implements: u64
+    inputs: usize
+    outputs: usize
+    // Curves: `inputs` curve addresses.
+    curves: usize
+    // A matrix: outputs x inputs doubles, row by row; its offsets (one a
+    // row) or 0.
+    matrix: usize
+    offset: usize
+    // A lookup table: its interpolation (the table is clut.table) and
+    // the number of entries.
+    clut: interp.Params
+    entries: usize
+    next: usize
+}
+
+// How the pipeline evaluates in 16 bits: its stages, or the optimizer's
+// data (std.colorprofile.optimize's kinds).
+pub const EVAL_STAGES: u64 = 0
+
+pub const Pipeline = struct {
+    allocator: Allocator
+    inputs: usize
+    outputs: usize
+    first: usize
+    eval: u64
+    data: usize
+}
+
+pub inline fn stageAt(address: usize) -> *Stage { return unsafe { @ptrFromInt(*Stage, address) } }
+pub inline fn pipelineAt(address: usize) -> *Pipeline { return unsafe { @ptrFromInt(*Pipeline, address) } }
+pub inline fn curveOf(stage: *Stage, index: usize) -> usize { return mem.words(stage.*.curves)[index] }
+
+// ---------------------------------------------------------------------------
+// Stages
+
+fn placeholder(allocator: Allocator, kind: u64, inputs: usize, outputs: usize) -> usize {
+    const address = mem.allocate(allocator, @sizeOf(Stage))
+    if address == 0 { return 0 }
+    const stage = stageAt(address)
+    stage.*.allocator = allocator
+    stage.*.kind = kind
+    stage.*.implements = kind
+    stage.*.inputs = inputs
+    stage.*.outputs = outputs
+    return address
+}
+
+pub fn freeStage(address: usize) -> void {
+    if address == 0 { return }
+    const stage = stageAt(address)
+    const allocator = stage.*.allocator
+    if stage.*.curves != 0 {
+        var index: usize = 0
+        while index < stage.*.inputs {
+            curve.freeCurve(curveOf(stage, index))
+            index += 1
+        }
+        mem.release(allocator, stage.*.curves)
+    }
+    mem.release(allocator, stage.*.matrix)
+    mem.release(allocator, stage.*.offset)
+    mem.release(allocator, stage.*.clut.table)
+    mem.release(allocator, address)
+}
+
+pub fn identity(allocator: Allocator, channels: usize) -> usize {
+    return placeholder(allocator, SIG_IDENTITY, channels, channels)
+}
+
+pub fn clipNegatives(allocator: Allocator, channels: usize) -> usize {
+    return placeholder(allocator, SIG_CLIP_NEGATIVES, channels, channels)
+}
+
+pub fn lab2xyz(allocator: Allocator) -> usize { return placeholder(allocator, SIG_LAB2XYZ, 3, 3) }
+pub fn xyz2lab(allocator: Allocator) -> usize { return placeholder(allocator, SIG_XYZ2LAB, 3, 3) }
+
+// cmsStageAllocToneCurves: copies of the CHANNELS curves whose addresses
+// are at CURVES (0: curves of gamma 1).
+pub fn toneCurves(allocator: Allocator, channels: usize, curves: usize) -> usize {
+    const address = placeholder(allocator, SIG_CURVES, channels, channels)
+    if address == 0 { return 0 }
+    const stage = stageAt(address)
+    stage.*.curves = mem.allocate(allocator, channels * 8)
+    if stage.*.curves == 0 {
+        mem.release(allocator, address)
+        return 0
+    }
+    var index: usize = 0
+    while index < channels {
+        var made: usize = 0
+        if curves == 0 {
+            made = curve.buildGamma(allocator, 1.0)
+        } else {
+            made = curve.duplicateCurve(mem.words(curves)[index])
+        }
+        if made == 0 {
+            freeStage(address)
+            return 0
+        }
+        mem.words(stage.*.curves)[index] = made
+        index += 1
+    }
+    return address
+}
+
+pub fn identityCurves(allocator: Allocator, channels: usize) -> usize {
+    const address = toneCurves(allocator, channels, 0)
+    if address != 0 { stageAt(address).*.implements = SIG_IDENTITY }
+    return address
+}
+
+// cmsStageAllocMatrix: ROWS x COLS doubles at MATRIX, the ROWS offsets at
+// OFFSET (0: none).
+pub fn matrix(allocator: Allocator, rows: usize, cols: usize, values: usize, offset: usize) -> usize {
+    const n = rows * cols
+    if n == 0 { return 0 }
+    const address = placeholder(allocator, SIG_MATRIX, cols, rows)
+    if address == 0 { return 0 }
+    const stage = stageAt(address)
+    stage.*.matrix = mem.duplicate(allocator, values, n * 8)
+    if stage.*.matrix == 0 {
+        freeStage(address)
+        return 0
+    }
+    if offset != 0 {
+        stage.*.offset = mem.duplicate(allocator, offset, rows * 8)
+        if stage.*.offset == 0 {
+            freeStage(address)
+            return 0
+        }
+    }
+    return address
+}
+
+fn diagonal(allocator: Allocator, value: f64, implements: u64) -> usize {
+    var m: [9]f64 = undefined
+    var index: usize = 0
+    while index < 9 {
+        m[index] = 0.0
+        index += 1
+    }
+    m[0] = value
+    m[4] = value
+    m[8] = value
+    const address = matrix(allocator, 3, 3, @intFromPtr(&m), 0)
+    if address != 0 { stageAt(address).*.implements = implements }
+    return address
+}
+
+pub fn labV2ToV4(allocator: Allocator) -> usize { return diagonal(allocator, 65535.0 / 65280.0, SIG_LABV2TOV4) }
+pub fn labV4ToV2(allocator: Allocator) -> usize { return diagonal(allocator, 65280.0 / 65535.0, SIG_LABV4TOV2) }
+
+// CubeSize: the nodes of a grid; 0 for a dimension below 2 or too many.
+pub fn cubeSize(dims: [*]const usize, inputs: usize) -> usize {
+    var rv: usize = 1
+    var b = inputs
+    while b > 0 {
+        const dim = dims[b - 1]
+        if dim <= 1 { return 0 }
+        rv = rv * dim
+        if rv > 4294967295 / dim { return 0 }
+        b -= 1
+    }
+    return rv
+}
+
+// cmsStageAllocCLut16bitGranular: a grid of GRID[i] points along input
+// i, its entries copied from TABLE (16-bit values, an address) when not
+// 0. 0 for grids with no interpolation here (other than 1 or 3 inputs).
+pub fn clut16Granular(allocator: Allocator, grid: [*]const usize, inputs: usize, outputs: usize, table: usize) -> usize {
+    if inputs > interp.MAX_INPUTS { return 0 }
+    const address = placeholder(allocator, SIG_CLUT, inputs, outputs)
+    if address == 0 { return 0 }
+    const stage = stageAt(address)
+    const n = outputs * cubeSize(grid, inputs)
+    stage.*.entries = n
+    if n == 0 {
+        freeStage(address)
+        return 0
+    }
+    const memory = mem.allocate(allocator, n * 2)
+    if memory == 0 {
+        freeStage(address)
+        return 0
+    }
+    if table != 0 { mem.copy(memory, table, n * 2) }
+    if !interp.compute(&stage.*.clut, grid, inputs, outputs, memory) {
+        mem.release(allocator, memory)
+        freeStage(address)
+        return 0
+    }
+    return address
+}
+
+pub fn clut16(allocator: Allocator, points: usize, inputs: usize, outputs: usize, table: usize) -> usize {
+    var grid: [8]usize = undefined
+    var index: usize = 0
+    while index < 8 {
+        grid[index] = points
+        index += 1
+    }
+    return clut16Granular(allocator, &grid, inputs, outputs, table)
+}
+
+pub fn duplicateStage(address: usize) -> usize {
+    if address == 0 { return 0 }
+    const stage = stageAt(address)
+    const allocator = stage.*.allocator
+    var copy: usize = 0
+    if stage.*.kind == SIG_CURVES {
+        copy = toneCurves(allocator, stage.*.inputs, stage.*.curves)
+    } else if stage.*.kind == SIG_MATRIX {
+        copy = matrix(allocator, stage.*.outputs, stage.*.inputs, stage.*.matrix, stage.*.offset)
+    } else if stage.*.kind == SIG_CLUT {
+        copy = clut16Granular(allocator, &stage.*.clut.samples, stage.*.inputs, stage.*.outputs, stage.*.clut.table)
+        if copy != 0 { stageAt(copy).*.clut.trilinear = stage.*.clut.trilinear }
+    } else {
+        copy = placeholder(allocator, stage.*.kind, stage.*.inputs, stage.*.outputs)
+    }
+    if copy != 0 { stageAt(copy).*.implements = stage.*.implements }
+    return copy
+}
+
+// ---------------------------------------------------------------------------
+// Lab and XYZ (cmspcs.c), D50
+
+pub fn labF(t: f64) -> f64 {
+    const limit: f64 = (24.0 / 116.0) * (24.0 / 116.0) * (24.0 / 116.0)
+    if t <= limit { return (841.0 / 108.0) * t + (16.0 / 116.0) }
+    return curve.pow(t, 1.0 / 3.0)
+}
+
+pub fn labF1(t: f64) -> f64 {
+    const limit: f64 = 24.0 / 116.0
+    if t <= limit { return (108.0 / 841.0) * (t - (16.0 / 116.0)) }
+    return t * t * t
+}
+
+// cmsXYZ2Lab against the white point WX, WY, WZ.
+pub fn xyzToLab(x: f64, y: f64, z: f64, wx: f64, wy: f64, wz: f64, lab: *[3]f64) -> void {
+    const fx = labF(x / wx)
+    const fy = labF(y / wy)
+    const fz = labF(z / wz)
+    lab.*[0] = 116.0 * fy - 16.0
+    lab.*[1] = 500.0 * (fx - fy)
+    lab.*[2] = 200.0 * (fy - fz)
+}
+
+pub fn labToXyz(l: f64, a: f64, b: f64, wx: f64, wy: f64, wz: f64, xyz: *[3]f64) -> void {
+    const y = (l + 16.0) / 116.0
+    const x = y + 0.002 * a
+    const z = y - 0.005 * b
+    xyz.*[0] = labF1(x) * wx
+    xyz.*[1] = labF1(y) * wy
+    xyz.*[2] = labF1(z) * wz
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation
+
+// Evaluation works in memory of the caller's (SCRATCH, SCRATCH_SIZE
+// bytes of the heap), not in arrays of its own: it runs for every pixel
+// of a transform, and memory taken there would be taken again and again.
+pub const SCRATCH_SIZE: usize = 4096
+const SCRATCH_A: usize = 0
+const SCRATCH_B: usize = 512
+const SCRATCH_IN16: usize = 1024
+const SCRATCH_OUT16: usize = 1088
+
+// The stage on INPUT's floats into OUTPUT.
+pub fn evalStage(stage: *Stage, input: [*]const f32, output: [*]f32, scratch: usize) -> void {
+    const kind = stage.*.kind
+    if kind == SIG_CURVES {
+        var index: usize = 0
+        while index < stage.*.inputs {
+            output[index] = curve.evalFloat(curve.curveAt(curveOf(stage, index)), input[index])
+            index += 1
+        }
+    } else if kind == SIG_MATRIX {
+        const m = mem.doubles(stage.*.matrix)
+        var row: usize = 0
+        while row < stage.*.outputs {
+            var sum: f64 = 0.0
+            var col: usize = 0
+            while col < stage.*.inputs {
+                sum += @floatCast(f64, input[col]) * m[row * stage.*.inputs + col]
+                col += 1
+            }
+            if stage.*.offset != 0 { sum += mem.doubles(stage.*.offset)[row] }
+            output[row] = @floatCast(f32, sum)
+            row += 1
+        }
+    } else if kind == SIG_CLUT {
+        const in16 = mem.shorts(scratch + SCRATCH_IN16)
+        const out16 = mem.shorts(scratch + SCRATCH_OUT16)
+        var index: usize = 0
+        while index < stage.*.inputs {
+            in16[index] = @intCast(u16, mem.saturateWord(@floatCast(f64, input[index]) * 65535.0))
+            index += 1
+        }
+        interp.eval16(&stage.*.clut, in16, out16)
+        index = 0
+        while index < stage.*.outputs {
+            output[index] = @floatFromInt(f32, out16[index]) / @floatCast(f32, 65535.0)
+            index += 1
+        }
+    } else if kind == SIG_LAB2XYZ {
+        const l = @floatCast(f64, input[0]) * 100.0
+        const a = @floatCast(f64, input[1]) * 255.0 - 128.0
+        const b = @floatCast(f64, input[2]) * 255.0 - 128.0
+        const y = (l + 16.0) / 116.0
+        const x = y + 0.002 * a
+        const z = y - 0.005 * b
+        output[0] = @floatCast(f32, labF1(x) * mem.D50X / mem.MAX_ENCODEABLE_XYZ)
+        output[1] = @floatCast(f32, labF1(y) * mem.D50Y / mem.MAX_ENCODEABLE_XYZ)
+        output[2] = @floatCast(f32, labF1(z) * mem.D50Z / mem.MAX_ENCODEABLE_XYZ)
+    } else if kind == SIG_XYZ2LAB {
+        const x = @floatCast(f64, input[0]) * mem.MAX_ENCODEABLE_XYZ
+        const y = @floatCast(f64, input[1]) * mem.MAX_ENCODEABLE_XYZ
+        const z = @floatCast(f64, input[2]) * mem.MAX_ENCODEABLE_XYZ
+        const fx = labF(x / mem.D50X)
+        const fy = labF(y / mem.D50Y)
+        const fz = labF(z / mem.D50Z)
+        output[0] = @floatCast(f32, (116.0 * fy - 16.0) / 100.0)
+        output[1] = @floatCast(f32, (500.0 * (fx - fy) + 128.0) / 255.0)
+        output[2] = @floatCast(f32, (200.0 * (fy - fz) + 128.0) / 255.0)
+    } else if kind == SIG_CLIP_NEGATIVES {
+        var index: usize = 0
+        while index < stage.*.inputs {
+            const n = input[index]
+            output[index] = if n < @floatCast(f32, 0.0) { @floatCast(f32, 0.0) } else { n }
+            index += 1
+        }
+    } else {
+        var index: usize = 0
+        while index < stage.*.inputs {
+            output[index] = input[index]
+            index += 1
+        }
+    }
+}
+
+// _LUTevalFloat.
+pub fn evalFloat(pipe: *Pipeline, input: [*]const f32, output: [*]f32, scratch: usize) -> void {
+    const a = mem.floats(scratch + SCRATCH_A)
+    const b = mem.floats(scratch + SCRATCH_B)
+    var index: usize = 0
+    while index < pipe.*.inputs {
+        a[index] = input[index]
+        index += 1
+    }
+    var phase: usize = 0
+    var at = pipe.*.first
+    while at != 0 {
+        const stage = stageAt(at)
+        if phase == 0 { evalStage(stage, a, b, scratch) } else { evalStage(stage, b, a, scratch) }
+        phase = phase ^ 1
+        at = stage.*.next
+    }
+    index = 0
+    while index < pipe.*.outputs {
+        output[index] = if phase == 0 { a[index] } else { b[index] }
+        index += 1
+    }
+}
+
+// _LUTeval16: in and out of floats around the stages. (INPUT and OUTPUT
+// are not in SCRATCH's first 1152 bytes.)
+pub fn evalStages16(pipe: *Pipeline, input: [*]const u16, output: [*]u16, scratch: usize) -> void {
+    const values = mem.floats(scratch + 1152)
+    var index: usize = 0
+    while index < pipe.*.inputs {
+        values[index] = @floatFromInt(f32, input[index]) / @floatCast(f32, 65535.0)
+        index += 1
+    }
+    evalFloat(pipe, values, values, scratch)
+    index = 0
+    while index < pipe.*.outputs {
+        output[index] = @intCast(u16, mem.saturateWord(@floatCast(f64, values[index]) * 65535.0))
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines
+
+pub fn allocPipeline(allocator: Allocator, inputs: usize, outputs: usize) -> usize {
+    if inputs >= MAX_CHANNELS || outputs >= MAX_CHANNELS { return 0 }
+    const address = mem.allocate(allocator, @sizeOf(Pipeline))
+    if address == 0 { return 0 }
+    const pipe = pipelineAt(address)
+    pipe.*.allocator = allocator
+    pipe.*.inputs = inputs
+    pipe.*.outputs = outputs
+    pipe.*.eval = EVAL_STAGES
+    return address
+}
+
+// The optimizer's data is freed by its owner (optimize.freeData) before.
+pub fn freePipeline(address: usize) -> void {
+    if address == 0 { return }
+    const pipe = pipelineAt(address)
+    var at = pipe.*.first
+    while at != 0 {
+        const next = stageAt(at).*.next
+        freeStage(at)
+        at = next
+    }
+    mem.release(pipe.*.allocator, address)
+}
+
+pub fn stageCount(pipe: *Pipeline) -> usize {
+    var count: usize = 0
+    var at = pipe.*.first
+    while at != 0 {
+        count += 1
+        at = stageAt(at).*.next
+    }
+    return count
+}
+
+pub fn lastStage(pipe: *Pipeline) -> usize {
+    var last: usize = 0
+    var at = pipe.*.first
+    while at != 0 {
+        last = at
+        at = stageAt(at).*.next
+    }
+    return last
+}
+
+// BlessLUT: the pipeline's channels are its stages' ends, and each stage
+// takes what the one before gives.
+fn bless(pipe: *Pipeline) -> bool {
+    if pipe.*.first == 0 { return true }
+    const first = stageAt(pipe.*.first)
+    const last = stageAt(lastStage(pipe))
+    pipe.*.inputs = first.*.inputs
+    pipe.*.outputs = last.*.outputs
+    var previous = first
+    var at = first.*.next
+    while at != 0 {
+        const stage = stageAt(at)
+        if stage.*.inputs != previous.*.outputs { return false }
+        previous = stage
+        at = stage.*.next
+    }
+    return true
+}
+
+// cmsPipelineInsertStage: STAGE at the end (or the beginning); false (and
+// the stage freed) when there is none or the channels do not match.
+pub fn insertStage(pipe: *Pipeline, atEnd: bool, stage: usize) -> bool {
+    if stage == 0 { return false }
+    if pipe.*.first == 0 {
+        pipe.*.first = stage
+    } else if atEnd {
+        stageAt(lastStage(pipe)).*.next = stage
+    } else {
+        stageAt(stage).*.next = pipe.*.first
+        pipe.*.first = stage
+    }
+    return bless(pipe)
+}
+
+// cmsPipelineUnlinkStage: the first (or last) stage taken out, its
+// address (0: none).
+pub fn unlinkStage(pipe: *Pipeline, atEnd: bool) -> usize {
+    if pipe.*.first == 0 { return 0 }
+    var taken: usize = 0
+    if !atEnd {
+        taken = pipe.*.first
+        pipe.*.first = stageAt(taken).*.next
+    } else {
+        var previous: usize = 0
+        var at = pipe.*.first
+        while stageAt(at).*.next != 0 {
+            previous = at
+            at = stageAt(at).*.next
+        }
+        taken = at
+        if previous == 0 { pipe.*.first = 0 } else { stageAt(previous).*.next = 0 }
+    }
+    stageAt(taken).*.next = 0
+    const ignored = bless(pipe)
+    return taken
+}
+
+// cmsPipelineDup (the stages; not the optimizer's data).
+pub fn duplicatePipeline(address: usize) -> usize {
+    if address == 0 { return 0 }
+    const pipe = pipelineAt(address)
+    const copy = allocPipeline(pipe.*.allocator, pipe.*.inputs, pipe.*.outputs)
+    if copy == 0 { return 0 }
+    var at = pipe.*.first
+    while at != 0 {
+        if !insertStage(pipelineAt(copy), true, duplicateStage(at)) {
+            freePipeline(copy)
+            return 0
+        }
+        at = stageAt(at).*.next
+    }
+    return copy
+}
+
+// cmsPipelineCat: copies of SOURCE's stages after DEST's.
+pub fn concatenate(dest: *Pipeline, source: *Pipeline) -> bool {
+    if dest.*.first == 0 && source.*.first == 0 {
+        dest.*.inputs = source.*.inputs
+        dest.*.outputs = source.*.outputs
+    }
+    var at = source.*.first
+    while at != 0 {
+        if !insertStage(dest, true, duplicateStage(at)) { return false }
+        at = stageAt(at).*.next
+    }
+    return bless(dest)
+}
+
+// The 16-bit inputs of node INDEX of a lookup table (as
+// cmsStageSampleCLut16bit gives them to its sampler).
+pub fn nodeInputs(clut: *interp.Params, index: usize, input: [*]u16) -> void {
+    var rest = index
+    var t = clut.*.inputs
+    while t > 0 {
+        t -= 1
+        const samples = clut.*.samples[t]
+        const colorant = rest % samples
+        rest = rest / samples
+        input[t] = @intCast(u16, mem.quantize(@floatFromInt(f64, colorant), samples))
+    }
+}

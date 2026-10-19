@@ -63,6 +63,11 @@
 #                                       headers, masks, UTF-8), chunk
 #                                       sizes, the Public Suffix List,
 #                                       MIME sniffing
+#   tests/372_colorprofile_runtime.mlx  std.colorprofile: transforms whose
+#                                       pixels are Little CMS's (matrix-
+#                                       shaper, grey, 16-bit grid,
+#                                       perceptual with black point
+#                                       compensation), the sRGB curve
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -113,6 +118,7 @@ run 366_jpeg_decode_runtime "JPEG images (4:2:0, progressive 4:2:2, grey, CMYK, 
 run 367_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) decoded as libwebp decodes them; incremental rows; damage; encoding"
 run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987) read and written as libsoup does"
 run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk sizes; public suffixes; MIME sniffing"
+run 372_colorprofile_runtime "ICC transforms as Little CMS makes them: BGRA to sRGB, grey, 16-bit, perceptual; the sRGB curve"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
