@@ -34,8 +34,10 @@ it is missing or its sources changed, then runs it. `mlx build` runs
 [`build.mlx`](build.mlx), the project's manifest and build graph (in place
 of `build.zig` and `build.zig.zon`), with `std.build`: a step is built
 again only when a module it read, its options or the compiler changed, and
-the jobs run side by side. Programs go to `mlx-out/bin`, libraries to
-`mlx-out/lib`; see [`docs/reference/build-system.md`](docs/reference/build-system.md).
+the jobs run side by side; a step built before from the same inputs, in
+any checkout of the repository, is taken from the result cache
+(`~/.cache/mlx/build`, `MLX_BUILD_CACHE`). Programs go to `mlx-out/bin`,
+libraries to `mlx-out/lib`; see [`docs/reference/build-system.md`](docs/reference/build-system.md).
 
 ## Core rules
 
