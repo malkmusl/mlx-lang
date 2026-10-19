@@ -69,6 +69,10 @@
 #   tests/373_fontconfig_runtime.mlx    std.fontconfig: case folding, names,
 #                                       languages; fonts of the tree read,
 #                                       cached, matched, sorted, listed
+#   tests/374_dbus_address_auth_runtime.mlx
+#                                       std.dbus's address entries and
+#                                       EXTERNAL authentication on a
+#                                       descriptor of one's own
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -121,6 +125,7 @@ run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987)
 run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk sizes; public suffixes; MIME sniffing"
 run 372_sql_runtime "SQLite's reals and numbers, WebKit's SQL parsed, GROUP BY, collations, CHECK, a file of 3000 rows read back"
 run 373_fontconfig_runtime "Fontconfig's case folding, names and substitutions; fonts read, cached, matched, sorted and listed as Fontconfig 2.15 does"
+run 374_dbus_address_auth_runtime "address transports and %XX values; EXTERNAL authentication with descriptor passing agreed, refused, rejected"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

@@ -272,7 +272,12 @@ their descriptors, for `next` to return first (a logind client must not
 lose a PauseDevice that arrived during a call). `addressPath` takes the
 socket path out of a bus address list and `systemPath` is the system
 bus's (DBUS_SYSTEM_BUS_ADDRESS, else `MLX_SYSTEM_BUS` or `SYSTEM_BUS`).
-MLXIPC's bus (`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use
+For a connection that does its own reading and writing (mlx-glib's
+GDBusConnection, whose messages may outgrow a `Client`'s buffer),
+`addressTransport` and `addressValue` read an address entry (its %XX
+escapes undone) and `authenticate` runs EXTERNAL on a socket of the
+caller's, reading nothing past BEGIN
+(`tests/374_dbus_address_auth_runtime.mlx`). MLXIPC's bus (`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use
 it, as do the compositor's logind session and the desktop's system bus
 clients; `tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl
 and dbus-monitor, and `tests/361_dbus_keep_signals_runtime.mlx` keeps a
