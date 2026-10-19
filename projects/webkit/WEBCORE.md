@@ -197,16 +197,103 @@ No unit stopped at a header of GLib, GIO, ICU, `iconv.h` or `libintl.h`.
 | mpark::variant's and `std::optional<variant>`'s converting constructors | 2 | GPURenderPassColorAttachment.h:49, IDBRequest.cpp:105 |
 | one each: `not a namespace` (SVGPathSegImpl.h:46), `expected an expression` (WebLock.h:39), `not a compile-time constant` (CSSPrimitiveNumericRaw.h:55), `invalid pointer dereference` of a WeakHashMap (UserActionElementSet.cpp:38), `a conversion operator takes a parameter list` (ImageDataArray.cpp:196), `no such name in the namespace` (WebGLExtension.h:123), `no such member` (FontCustomPlatformData.h:129), `no conversion to bool` (RectEdges.h:186), SpaceSeparatedArray's constructor (CSSBorderRadius.h:66), `expected a function template` (StyleValueTypes.h:513), `invalid numeric constant` (SVGToOTFFontConversion.cpp:163), `expected ','` (SVGPropertyOwnerRegistry.h:72) | 12 | |
 
+## The compiler's second pass
+
+### Memory
+
+mlx-cc never frees its arena, so a unit costs what it ever made. Of the
+heavy units' 8 GB and 4 million names, most went to four things:
+
+- each check of a partial specialization's constraints made a name of
+  its own (`partial#check`: 2.6 million of a unit's 4 million names),
+  and weighing the partial specializations copied the arguments for
+  each (1.7 GB);
+- a qualified type name (`typename A<B>::C::D`, nested in the style
+  types' templates) was read again whole wherever it was named, each
+  reading reading its own qualifiers again (3.6 GB of types);
+- every header's path was copied while it was looked for, its file read
+  into a buffer grown by doubling, and its tokens copied into the
+  stream.
+
+Now a partial specialization is weighed on one flattened copy of the
+arguments with no names made, a qualified type name read where nothing
+it depends on changed (the scope, the cursor, the instance being made)
+is remembered, and a header is read in its size (`fstat`), looked for
+in one buffer, its tokens spliced into the stream. Arena bytes
+(`MLX_CC_STATS=1`), peak RSS and seconds of a unit, alone:
+
+| Unit | Before | After |
+|---|---|---|
+| JavaScriptCore's UnifiedSource-runtime-1 | 2.33 GB, 1668 MB, 27.7 s | 1.91 GB, 1420 MB, 24.7 s |
+| JavaScriptCore's UnifiedSource-bytecode-1 | 2.40 GB, 1740 MB, 29.2 s | 1.95 GB, 1466 MB, 26.4 s |
+| NavigatorCredentials.cpp | 3.26 GB, 2527 MB, 46.5 s | 2.36 GB, 1884 MB, 38.6 s |
+| Storage.cpp | 3.46 GB, 2722 MB, 51.0 s | 2.52 GB, 2049 MB, 43.2 s |
+| JSANGLEInstancedArrays.cpp | 4.18 GB, 3391 MB, 67.5 s | 3.23 GB, 2759 MB, 58.2 s |
+| TrailingObjects.cpp | 4 million names at 94 s (7.4 GB, 6.4 GB RSS) | compiles to an error at 61 s, 2807 MB |
+| CSSPropertyParserConsumer+Inline.cpp | 4 million names | compiles: 2.46 GB, 1938 MB, 42 s |
+
+None of the survey's eight units that ran out of names or arena runs out
+now: each compiles, or stops at an error of the compiler, under 3.9 GB of
+RSS (InspectorCSSAgent.cpp, the largest, 124 s). JavaScriptCore's units
+make the same functions as before (their objects compared function by
+function).
+
+### The survey's errors
+
+Each with a program in compiler/cc/tests/cpp:
+
+| mlx-cc | Test | Survey error |
+|---|---|---|
+| a function only declared names its result's class template instance, does not make it | declaredresult | ConversionResult made too early (JSDOMConvertResult.h:159) |
+| a class template's default argument names its class, does not make it | defaultnamedonly | `MarkableTraits<GlyphOverflow>` specialized after its instance |
+| template value parameters of reference and pointer-to-member types | referenceparams | SVGPropertyOwnerRegistry.h:72 |
+| CSS literals: `E unit` deduced, both constraints of a declaration kept, inherited constructors weighed; std::is_constructible weighs constructor templates | valueliteral, constructibletemplates | StylePrimitiveNumeric.h:126 |
+| a trailing requires-clause sees a function parameter pack; a class without a conversion to bool fails a requirement, not the unit; a requires-expression leaves no temporaries | requirespack, requiresnot, requirestemporaries | the style values' constraints |
+| a base's member type hides a namespace's name in the derived class (not an instance's dependent bases); a base's typedef of a class qualifies names; `using Base::Base;` through such a typedef | basememberhides, inheritedqualifier, inheritedctoralias | the style types |
+| algorithms, iterators and constexpr objects in constant expressions; reverse_iterator's converting constructor, no `const T *` to `T *` | constexpralgorithms, reverseconvert | |
+| a missing name inside a qualified name or a template argument fails the candidate (SFINAE) | sfinaenested | |
+| `Ts&&` of a class's own parameters is no forwarding reference in its implicit guides | ctadrvalue | |
+| of two partial specializations otherwise alike, the one without a pack expansion; an alias's pack given one argument is that argument | partialpackorder | |
+| an abbreviated call operator's parameters found after `operator()` | abbreviatedcall | StyleValueTypes.h:513 |
+| a member specialized explicitly before its class's instance keeps that definition | memberspecializedfirst | JSDOMConstructorNotConstructable.h:48 |
+| a call of one function in SFINAE checks how its references bind | invocablerefs | `std::is_invocable<void(int&&), int&>` held |
+| member function templates weighed by their ref-qualifiers (`get_alt<I>() &&` of a moved variant) | refqualifiedtemplates | WTF::switchOn with `T&&` visitors (Variant.h:1415) |
+| a constructor template's signature weighs its own conversions; a copy constructor takes a derived class's object | convertingtemplate | mpark::variant's converting constructor (`"none"_s`, `return options;`) |
+| a range-based for keeps end()'s sentinel as its own type | rangesentinel | ElementChildIterator's and ElementDescendantIterator's constructors |
+| an empty pack an inner `...` expands leaves the outer expansion | nestedpackexpansion | Brigand.h:358 |
+| braces choose a constructor template taking an initializer_list | listconstructortemplate | brigand::any always true (a union taken for one holding undefined) |
+| an instance being read is told apart by its template too | openinstances | |
+
+The 52 files of the survey above (the first file of every tenth unified
+source, each alone, with the same stand-in headers):
+
+| | Files |
+|---|---|
+| compile | 35 of 52 (28 before this pass) |
+| (a) a header of a missing library | 1: `<iconv.h>` (the survey's stand-ins predate mlxlibc's) |
+| (b) mlx-cc's memory | none |
+| (b) mlx-cc errors | 16, below |
+
+| mlx-cc error | Files | Where |
+|---|---|---|
+| `dereferencing a void pointer`: WTF's VariantBestMatch, through `using Bases::operator()...` of a pack of bases | 5 | CompactVariantOperations.h:99 |
+| `more names in the structured binding than the class has members` | 3 | ColorModels.h:94 |
+| EnumSetOrKeywordBase's constructor | 2 | StyleComputedStyleProperties+InitialCustomInlines.h:130 |
+| mpark::variant's move assignment visiting `Expected<Ref<T>, String>` (`invoke` of its generic lambda) | 1 | Variant.h:1340 |
+| PrimitiveNumericRaw's constructor | 1 | StylePrimitiveNumericTypes+CSSValueConversion.h:96 |
+| `no operator<<` | 1 | StyleKeyword+Logging.h:36 |
+| `not a compile-time constant` | 1 | StylePrimitiveNumericTypes+EvaluationMinimum.h:82 |
+| `static assertion failed` | 1 | StdLibExtras.h:870 |
+| `expected a type as the template argument` | 1 | StdMap.h:33 |
+
 ## What is next
 
 - libsoup: every unit includes its headers (mlx-soup, its C API over an
   HTTP client in std, is the first library to write).
-- mlx-cc's memory: a heavy unit (style values, layout, the bindings of
-  big interfaces) fills the 8 GB arena or the 4 million names with
-  instances of WTF's Variant (mpark) and of the style types' templates.
-  Each instance keeps its tokens and its mangled names; sharing them (the
-  way an alias's expansion is shared now) or dropping a failed
-  candidate's is the next step there.
+- mlx-cc's memory: the single files fit now (above); whole unified
+  sources are about ten such files, and still heavier ones may need the
+  instances' tokens and mangled names shared (the way an alias's
+  expansion is shared) or a failed candidate's dropped.
 - The remaining compiler errors of the survey, most common first.
 - Then the libraries in the order above, libsoup's HTTP and TLS being the
   largest.

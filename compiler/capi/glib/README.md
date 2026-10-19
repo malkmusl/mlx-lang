@@ -63,7 +63,8 @@ sources reach.
 | `resource.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (inflated by std.flate), the registry, static resources |
 | `application.mlx` | `gapplication.h`: application ids and the default application |
 | `dbus.mlx` | `gdbus*.h`: bus addresses, proxies, errors, introspection data; see below |
-| `tls.mlx` | `ginitable.h` and GIO's TLS types (`gtlscertificate.h`, `gtlsbackend.h`, `gtlsconnection.h`, `gtlsclientconnection.h`, `gtlsdatabase.h`, `gtlsfiledatabase.h`, `gtlsinteraction.h`, `gtlspassword.h`): what libsoup's headers and WebKit's network code name; see below |
+| `tls.mlx` | `ginitable.h` and GIO's TLS types (`gtlscertificate.h`, `gtlsbackend.h`, `gtlsdatabase.h`, `gtlsfiledatabase.h`, `gtlsinteraction.h`, `gtlspassword.h`): the backend, on std.x509: certificates with their X.509 fields and verification, the default database (the system's CA bundle) and file databases; see below |
+| `tlsconnection.mlx` | `gtlsconnection.h`, `gtlsclientconnection.h`: TLS client connections over a GIOStream on std.tls (TLS 1.3 and 1.2), synchronous and asynchronous handshakes, "accept-certificate", pollable streams |
 | `enumtypes.mlx` | `gioenumtypes.h`: the GTypes of `GSocketClientEvent` and `GTlsAuthenticationMode` |
 | `random.mlx` | `grand.h`: the global generator, from the kernel's random bytes (getrandom) |
 | `dataset.mlx` | `gdataset.h`: keyed data lists (`GData`) |
@@ -85,15 +86,22 @@ sources reach.
   `gobject.c`, `system.c`, `gio.c`, `collect.c` (G_DECLARE_FINAL_TYPE,
   G_VALUE_COLLECT_INIT and G_VALUE_LCOPY, g_alloca), `options.c`
   (GOption, gettext), `network.c` (addresses, a service, a client,
-  their errors) and `tls.c` (certificates from PEM and DER as WebKit
-  makes and copies them, chains, keys, passwords; a backend without TLS)
-  and `streams.c` (memory, filter and socket streams, synchronous and
+  their errors), `tls.c` (certificates from PEM and DER as WebKit
+  makes and copies them, chains, keys, their X.509 fields and
+  verification, passwords, the backend and its databases) and
+  `streams.c` (memory, filter and socket streams, synchronous and
   asynchronous, splicing, pollable sources, GSimpleIOStream) and
   `extras.c` (keyed data lists, random numbers, language names, IDNA
-  host names, GIO's enum types, proxy resolvers, network addresses)
-  and compares what they print with what the same programs print on GLib
-  2.80 (`tls.c`'s certificates with GLib's GnuTLS backend, its backend
-  part with none, `GIO_USE_TLS=dummy`);
+  host names, GIO's enum types, proxy resolvers, network addresses),
+  and
+  compares what they print with what the same programs print on GLib
+  2.80 (with glib-networking's GnuTLS backend for TLS);
+- runs `tests/tls_handshake.c` against two `openssl s_server`s on
+  127.0.0.1 (TLS 1.3 and TLS 1.2, the certificates of
+  `tools/tls-test/make_certs.sh`): handshakes synchronous and
+  asynchronous, pollable reads, "accept-certificate" refusing and
+  accepting, compared with what GLib with glib-networking prints against
+  the same servers (skipped without openssl);
 - compiles WTF's GLib-based sources for WPE (`tests/wtf/files.txt`: the
   14 of `wtf/glib`, `MainThreadGeneric.cpp`, `WorkQueueGeneric.cpp` and
   those of `unix/`, `linux/`, `posix/`) with mlx-cc on these headers and
@@ -131,22 +139,21 @@ system without it:
   only its URI (GIO's GDummyFile without a VFS module), and operations on
   it fail with `G_IO_ERROR_NOT_SUPPORTED`. GFileInfo, enumerators and
   `g_resource_open_stream` are not here.
-- **TLS**: there is no TLS implementation yet (the TLS of the HTTP
-  client libsoup's layer will need). The backend makes certificates as
-  GIO's GnuTLS backend does (`g_tls_certificate_new_from_pem`,
-  `g_initable_new` of its certificate type with `certificate-pem` or
-  `certificate`, `issuer`, `private-key-pem`, `private-key`, the PKCS #11
-  URIs; their PEM and DER read back, compared by `g_tls_certificate_is_same`,
-  a chain from PEM linked where each certificate names the next as its
-  issuer); what needs TLS answers as GIO does without a TLS module:
-  `g_tls_backend_supports_tls` is FALSE, the default database has no
-  certificates, `g_tls_file_database_new` fails with
-  `G_TLS_ERROR_UNAVAILABLE`. Verifying a certificate reports
-  `G_TLS_CERTIFICATE_GENERIC_ERROR`, and the fields read out of its X.509
-  structure (`not-valid-before`, `not-valid-after`, `subject-name`,
-  `issuer-name`, `dns-names`, `ip-addresses`) are NULL.
-  `GTlsConnection`, `GTlsClientConnection`, `GTlsDatabase` and
-  `GTlsInteraction` are types only; `GTlsPassword` is whole.
+- **TLS**: the backend is the library's own, on std.tls and std.x509
+  (no GnuTLS): client connections (TLS 1.3 and 1.2; ECDHE with X25519,
+  P-256, P-384; AES-GCM and ChaCha20-Poly1305; RSA, ECDSA and Ed25519
+  certificates), the peer's chain verified against the connection's
+  database for the server identity (an address, or the "hostname" of a
+  network address) with "accept-certificate" for one that does not
+  verify, as glib-networking does; certificates with the fields of their
+  X.509 structure and `g_tls_certificate_verify`; the default database is
+  the system's CA bundle, a file database reads its anchors when made.
+  Not here: TLS servers (`g_tls_backend_get_server_connection_type` is
+  0), DTLS, client certificates (an empty one answers a server that asks
+  for one), session resumption, rehandshakes (refused), channel
+  bindings; `validation-flags` is kept but, as in GLib 2.80, every error
+  needs "accept-certificate". `GTlsInteraction` is a type only;
+  `GTlsPassword` is whole.
 - **GVariant**'s text form is printed but not parsed
   (`g_variant_parse`, `g_variant_new_parsed` are not here).
 - **GObject**: class private data (`g_type_add_class_private`) and

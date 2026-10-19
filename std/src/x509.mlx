@@ -1,0 +1,1106 @@
+// std.x509: X.509 certificates (RFC 5280) as TLS meets them: parsing,
+// their names, alternative names, validity, key usage and basic
+// constraints, signatures checked with std.crypto, chains built and
+// verified up to a trust store (the system's CA bundle), and the server's
+// identity (RFC 6125).
+//
+//     var cert: x509.Certificate = undefined
+//     if !x509.parse(&cert, der) { ... }               // der is not copied
+//     x509.nameText(&cert, cert.subject, out, room)    // "CN=example.com,O=..."
+//     x509.matchesHostname(&cert, "www.example.com")
+//
+//     var store: x509.TrustStore = undefined
+//     x509.storeInit(&store, allocator)
+//     x509.storeLoadFile(&store, "/etc/ssl/certs/ca-certificates.crt")
+//     const flags = x509.verifyChain(&store, chain, count, hostname, now)
+//     x509.storeFree(&store)
+//
+// verifyChain answers with the flags GIO's GTlsCertificateFlags has
+// (UNKNOWN_CA, BAD_IDENTITY, NOT_ACTIVATED, EXPIRED, INSECURE,
+// GENERIC_ERROR), 0 for a chain that is good.
+
+const std = @import("std")
+const asn1 = @import("./asn1.mlx")
+const base64 = @import("./base64.mlx")
+const hash = @import("./crypto/hash.mlx")
+const rsa = @import("./crypto/rsa.mlx")
+const ecc = @import("./crypto/ecc.mlx")
+const curve25519 = @import("./crypto/curve25519.mlx")
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const fs = @import("../bootstrap/fs.mlx")
+const time = @import("../bootstrap/time.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const UNKNOWN_CA: u32 = 1
+pub const BAD_IDENTITY: u32 = 2
+pub const NOT_ACTIVATED: u32 = 4
+pub const EXPIRED: u32 = 8
+pub const REVOKED: u32 = 16
+pub const INSECURE: u32 = 32
+pub const GENERIC_ERROR: u32 = 64
+
+// KeyUsage's bits (RFC 5280, 4.2.1.3).
+pub const USAGE_DIGITAL_SIGNATURE: u64 = 1
+pub const USAGE_KEY_ENCIPHERMENT: u64 = 4
+pub const USAGE_KEY_CERT_SIGN: u64 = 32
+
+// Where something is in the certificate's DER.
+pub const Range = struct {
+    start: usize
+    length: usize
+}
+
+pub const KeyType = enum(u8) {
+    unknown,
+    rsa,
+    p256,
+    p384,
+    ed25519,
+}
+
+pub const SignatureType = enum(u8) {
+    unknown,
+    rsaPkcs1,
+    rsaPss,
+    ecdsa,
+    ed25519,
+}
+
+pub const Certificate = struct {
+    der: [*]const u8
+    derLength: usize
+    // The signed part, TBSCertificate, header included.
+    tbs: Range
+    version: u64
+    serial: Range
+    // The Names, header included (what is compared to find an issuer).
+    issuer: Range
+    subject: Range
+    notBefore: i64
+    notAfter: i64
+    spki: Range
+    keyType: KeyType
+    // RSA: the RSAPublicKey's DER; EC: the SEC 1 point; Ed25519: 32 bytes.
+    key: Range
+    signatureType: SignatureType
+    signatureHash: hash.Algorithm
+    pssSalt: usize
+    signature: Range
+    hasBasicConstraints: bool
+    isCa: bool
+    // -1 when there is no limit.
+    pathLength: i64
+    hasKeyUsage: bool
+    keyUsage: u64
+    hasExtendedKeyUsage: bool
+    // serverAuth or anyExtendedKeyUsage among them.
+    serverAuth: bool
+    // The GeneralNames of subjectAltName, contents only.
+    hasAltNames: bool
+    altNames: Range
+    subjectKeyId: Range
+    authorityKeyId: Range
+    unknownCritical: bool
+}
+
+fn rangeOf(element: *asn1.Element) -> Range {
+    return Range.{ .start = element.*.start, .length = element.*.end - element.*.start }
+}
+
+fn contentsRange(element: *asn1.Element) -> Range {
+    return Range.{ .start = element.*.contentStart, .length = element.*.length }
+}
+
+pub fn bytesOf(cert: *Certificate, range: Range) -> []const u8 {
+    return cert.*.der[range.start .. range.start + range.length]
+}
+
+pub fn derOf(cert: *Certificate) -> []const u8 {
+    return cert.*.der[0..cert.*.derLength]
+}
+
+fn sameBytes(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var index: usize = 0
+    while index < a.length {
+        if a[index] != b[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Algorithms.
+
+fn hashOfOid(data: []const u8, oid: *asn1.Element, out: *hash.Algorithm) -> bool {
+    if asn1.contentsAre(data, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x01") {
+        out.* = hash.Algorithm.sha256
+        return true
+    }
+    if asn1.contentsAre(data, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x02") {
+        out.* = hash.Algorithm.sha384
+        return true
+    }
+    if asn1.contentsAre(data, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x03") {
+        out.* = hash.Algorithm.sha512
+        return true
+    }
+    if asn1.contentsAre(data, oid, "\x2b\x0e\x03\x02\x1a") {
+        out.* = hash.Algorithm.sha1
+        return true
+    }
+    return false
+}
+
+// RSASSA-PSS-params (RFC 4055, 3.1): the hash, MGF1 with the same hash
+// (the only combination taken), the salt length. Absent fields are SHA-1
+// and 20 bytes.
+fn pssParameters(data: []const u8, params: *asn1.Element, cert: *Certificate) -> bool {
+    cert.*.signatureHash = hash.Algorithm.sha1
+    cert.*.pssSalt = 20
+    var mgfHash = hash.Algorithm.sha1
+    var fields: asn1.Reader = undefined
+    asn1.readerInit(&fields, data, params)
+    var field: asn1.Element = undefined
+    while asn1.next(&fields, &field) {
+        var inner: asn1.Element = undefined
+        if !asn1.readWithin(data.pointer, field.contentStart, field.end, &inner) { return false }
+        if field.tag == asn1.contextTag(0, true) {
+            var parts: asn1.Reader = undefined
+            asn1.readerInit(&parts, data, &inner)
+            var oid: asn1.Element = undefined
+            if !asn1.next(&parts, &oid) || !hashOfOid(data, &oid, &cert.*.signatureHash) { return false }
+        } else if field.tag == asn1.contextTag(1, true) {
+            var parts: asn1.Reader = undefined
+            asn1.readerInit(&parts, data, &inner)
+            var oid: asn1.Element = undefined
+            var algorithm: asn1.Element = undefined
+            if !asn1.next(&parts, &oid) || !asn1.contentsAre(data, &oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x08") { return false }
+            if !asn1.next(&parts, &algorithm) { return false }
+            var hashParts: asn1.Reader = undefined
+            asn1.readerInit(&hashParts, data, &algorithm)
+            var hashOid: asn1.Element = undefined
+            if !asn1.next(&hashParts, &hashOid) || !hashOfOid(data, &hashOid, &mgfHash) { return false }
+        } else if field.tag == asn1.contextTag(2, true) {
+            var salt: u64 = 0
+            if !asn1.smallInteger(data, &inner, &salt) || salt > 512 { return false }
+            cert.*.pssSalt = @intCast(usize, salt)
+        }
+    }
+    return mgfHash == cert.*.signatureHash
+}
+
+// The signatureAlgorithm AlgorithmIdentifier.
+fn signatureAlgorithm(data: []const u8, element: *asn1.Element, cert: *Certificate) -> bool {
+    var parts: asn1.Reader = undefined
+    asn1.readerInit(&parts, data, element)
+    var oid: asn1.Element = undefined
+    if !asn1.next(&parts, &oid) || oid.tag != asn1.TAG_OID { return false }
+    cert.*.signatureType = SignatureType.unknown
+    cert.*.signatureHash = hash.Algorithm.sha256
+    cert.*.pssSalt = 0
+    if asn1.contentsAre(data, &oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b") {
+        cert.*.signatureType = SignatureType.rsaPkcs1
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c") {
+        cert.*.signatureType = SignatureType.rsaPkcs1
+        cert.*.signatureHash = hash.Algorithm.sha384
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d") {
+        cert.*.signatureType = SignatureType.rsaPkcs1
+        cert.*.signatureHash = hash.Algorithm.sha512
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x05") {
+        cert.*.signatureType = SignatureType.rsaPkcs1
+        cert.*.signatureHash = hash.Algorithm.sha1
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a") {
+        var params: asn1.Element = undefined
+        if !asn1.next(&parts, &params) || params.tag != asn1.TAG_SEQUENCE { return false }
+        if !pssParameters(data, &params, cert) { return false }
+        cert.*.signatureType = SignatureType.rsaPss
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\xce\x3d\x04\x03\x02") {
+        cert.*.signatureType = SignatureType.ecdsa
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\xce\x3d\x04\x03\x03") {
+        cert.*.signatureType = SignatureType.ecdsa
+        cert.*.signatureHash = hash.Algorithm.sha384
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\xce\x3d\x04\x03\x04") {
+        cert.*.signatureType = SignatureType.ecdsa
+        cert.*.signatureHash = hash.Algorithm.sha512
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\xce\x3d\x04\x01") {
+        cert.*.signatureType = SignatureType.ecdsa
+        cert.*.signatureHash = hash.Algorithm.sha1
+    } else if asn1.contentsAre(data, &oid, "\x2b\x65\x70") {
+        cert.*.signatureType = SignatureType.ed25519
+        cert.*.signatureHash = hash.Algorithm.sha512
+    }
+    // An unknown algorithm is no reason to refuse the certificate: it is
+    // a reason to refuse what it signs, when that is asked.
+    return true
+}
+
+// SubjectPublicKeyInfo.
+fn publicKeyInfo(data: []const u8, element: *asn1.Element, cert: *Certificate) -> bool {
+    cert.*.spki = rangeOf(element)
+    cert.*.keyType = KeyType.unknown
+    var parts: asn1.Reader = undefined
+    asn1.readerInit(&parts, data, element)
+    var algorithm: asn1.Element = undefined
+    var bits: asn1.Element = undefined
+    if !asn1.nextIf(&parts, asn1.TAG_SEQUENCE, &algorithm) { return false }
+    if !asn1.nextIf(&parts, asn1.TAG_BIT_STRING, &bits) { return false }
+    var start: usize = 0
+    var length: usize = 0
+    if !asn1.bitStringBytes(data, &bits, &start, &length) { return false }
+    cert.*.key = Range.{ .start = start, .length = length }
+    var ids: asn1.Reader = undefined
+    asn1.readerInit(&ids, data, &algorithm)
+    var oid: asn1.Element = undefined
+    if !asn1.next(&ids, &oid) { return false }
+    if asn1.contentsAre(data, &oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01") {
+        cert.*.keyType = KeyType.rsa
+    } else if asn1.contentsAre(data, &oid, "\x2a\x86\x48\xce\x3d\x02\x01") {
+        var named: asn1.Element = undefined
+        if asn1.next(&ids, &named) {
+            if asn1.contentsAre(data, &named, "\x2a\x86\x48\xce\x3d\x03\x01\x07") { cert.*.keyType = KeyType.p256 }
+            if asn1.contentsAre(data, &named, "\x2b\x81\x04\x00\x22") { cert.*.keyType = KeyType.p384 }
+        }
+    } else if asn1.contentsAre(data, &oid, "\x2b\x65\x70") {
+        if length == 32 { cert.*.keyType = KeyType.ed25519 }
+    }
+    return true
+}
+
+// The extensions of a version 3 certificate.
+fn extensions(data: []const u8, element: *asn1.Element, cert: *Certificate) -> bool {
+    var list: asn1.Element = undefined
+    if !asn1.readWithin(data.pointer, element.*.contentStart, element.*.end, &list) || list.tag != asn1.TAG_SEQUENCE { return false }
+    var items: asn1.Reader = undefined
+    asn1.readerInit(&items, data, &list)
+    var extension: asn1.Element = undefined
+    while asn1.next(&items, &extension) {
+        if extension.tag != asn1.TAG_SEQUENCE { return false }
+        var parts: asn1.Reader = undefined
+        asn1.readerInit(&parts, data, &extension)
+        var oid: asn1.Element = undefined
+        if !asn1.nextIf(&parts, asn1.TAG_OID, &oid) { return false }
+        var critical = false
+        var flag: asn1.Element = undefined
+        if asn1.nextIf(&parts, asn1.TAG_BOOLEAN, &flag) {
+            if !asn1.boolean(data, &flag, &critical) { return false }
+        }
+        var value: asn1.Element = undefined
+        if !asn1.nextIf(&parts, asn1.TAG_OCTET_STRING, &value) { return false }
+        var inner: asn1.Element = undefined
+        const parsed = asn1.readWithin(data.pointer, value.contentStart, value.end, &inner)
+        if asn1.contentsAre(data, &oid, "\x55\x1d\x13") {
+            // basicConstraints: cA, pathLenConstraint.
+            if !parsed || inner.tag != asn1.TAG_SEQUENCE { return false }
+            cert.*.hasBasicConstraints = true
+            var fields: asn1.Reader = undefined
+            asn1.readerInit(&fields, data, &inner)
+            var field: asn1.Element = undefined
+            if asn1.nextIf(&fields, asn1.TAG_BOOLEAN, &field) {
+                if !asn1.boolean(data, &field, &cert.*.isCa) { return false }
+            }
+            if asn1.nextIf(&fields, asn1.TAG_INTEGER, &field) {
+                var limit: u64 = 0
+                if !asn1.smallInteger(data, &field, &limit) { return false }
+                cert.*.pathLength = @intCast(i64, limit)
+            }
+        } else if asn1.contentsAre(data, &oid, "\x55\x1d\x0f") {
+            if !parsed || !asn1.bitStringFlags(data, &inner, &cert.*.keyUsage) { return false }
+            cert.*.hasKeyUsage = true
+        } else if asn1.contentsAre(data, &oid, "\x55\x1d\x25") {
+            if !parsed || inner.tag != asn1.TAG_SEQUENCE { return false }
+            cert.*.hasExtendedKeyUsage = true
+            var purposes: asn1.Reader = undefined
+            asn1.readerInit(&purposes, data, &inner)
+            var purpose: asn1.Element = undefined
+            while asn1.next(&purposes, &purpose) {
+                if asn1.contentsAre(data, &purpose, "\x2b\x06\x01\x05\x05\x07\x03\x01") { cert.*.serverAuth = true }
+                if asn1.contentsAre(data, &purpose, "\x55\x1d\x25\x00") { cert.*.serverAuth = true }
+            }
+        } else if asn1.contentsAre(data, &oid, "\x55\x1d\x11") {
+            if !parsed || inner.tag != asn1.TAG_SEQUENCE { return false }
+            cert.*.hasAltNames = true
+            cert.*.altNames = contentsRange(&inner)
+        } else if asn1.contentsAre(data, &oid, "\x55\x1d\x0e") {
+            if parsed && inner.tag == asn1.TAG_OCTET_STRING { cert.*.subjectKeyId = contentsRange(&inner) }
+        } else if asn1.contentsAre(data, &oid, "\x55\x1d\x23") {
+            if parsed && inner.tag == asn1.TAG_SEQUENCE {
+                var fields: asn1.Reader = undefined
+                asn1.readerInit(&fields, data, &inner)
+                var field: asn1.Element = undefined
+                if asn1.nextIf(&fields, asn1.contextTag(0, false), &field) { cert.*.authorityKeyId = contentsRange(&field) }
+            }
+        } else if critical {
+            // Critical extensions this verifier does not act on but which
+            // only narrow what a certificate may do, as browsers take
+            // them: certificate policies, name and policy constraints,
+            // inhibitAnyPolicy. Any other critical one makes the
+            // certificate unusable (RFC 5280, 4.2).
+            const known = asn1.contentsAre(data, &oid, "\x55\x1d\x20") || asn1.contentsAre(data, &oid, "\x55\x1d\x1e") || asn1.contentsAre(data, &oid, "\x55\x1d\x24") || asn1.contentsAre(data, &oid, "\x55\x1d\x36")
+            if !known { cert.*.unknownCritical = true }
+        }
+    }
+    return true
+}
+
+// Parses a certificate's DER, which stays where it is (cert points into
+// it); false for anything that is not one.
+pub fn parse(cert: *Certificate, der: []const u8) -> bool {
+    cert.*.der = der.pointer
+    cert.*.derLength = der.length
+    cert.*.version = 1
+    cert.*.hasBasicConstraints = false
+    cert.*.isCa = false
+    cert.*.pathLength = -1
+    cert.*.hasKeyUsage = false
+    cert.*.keyUsage = 0
+    cert.*.hasExtendedKeyUsage = false
+    cert.*.serverAuth = false
+    cert.*.hasAltNames = false
+    cert.*.altNames = Range.{ .start = 0, .length = 0 }
+    cert.*.subjectKeyId = Range.{ .start = 0, .length = 0 }
+    cert.*.authorityKeyId = Range.{ .start = 0, .length = 0 }
+    cert.*.unknownCritical = false
+    var whole: asn1.Element = undefined
+    if !asn1.read(der, 0, &whole) || whole.tag != asn1.TAG_SEQUENCE || whole.end != der.length { return false }
+    var top: asn1.Reader = undefined
+    asn1.readerInit(&top, der, &whole)
+    var tbs: asn1.Element = undefined
+    var algorithm: asn1.Element = undefined
+    var signature: asn1.Element = undefined
+    if !asn1.nextIf(&top, asn1.TAG_SEQUENCE, &tbs) { return false }
+    if !asn1.nextIf(&top, asn1.TAG_SEQUENCE, &algorithm) { return false }
+    if !asn1.nextIf(&top, asn1.TAG_BIT_STRING, &signature) || !asn1.atEnd(&top) { return false }
+    cert.*.tbs = rangeOf(&tbs)
+    if !signatureAlgorithm(der, &algorithm, cert) { return false }
+    var start: usize = 0
+    var length: usize = 0
+    if !asn1.bitStringBytes(der, &signature, &start, &length) { return false }
+    cert.*.signature = Range.{ .start = start, .length = length }
+
+    var fields: asn1.Reader = undefined
+    asn1.readerInit(&fields, der, &tbs)
+    var field: asn1.Element = undefined
+    if asn1.nextIf(&fields, asn1.contextTag(0, true), &field) {
+        var number: asn1.Element = undefined
+        var version: u64 = 0
+        if !asn1.readWithin(der.pointer, field.contentStart, field.end, &number) || !asn1.smallInteger(der, &number, &version) { return false }
+        if version > 2 { return false }
+        cert.*.version = version + 1
+    }
+    if !asn1.nextIf(&fields, asn1.TAG_INTEGER, &field) { return false }
+    cert.*.serial = contentsRange(&field)
+    // The signature algorithm again, inside what is signed.
+    if !asn1.nextIf(&fields, asn1.TAG_SEQUENCE, &field) { return false }
+    if !asn1.nextIf(&fields, asn1.TAG_SEQUENCE, &field) { return false }
+    cert.*.issuer = rangeOf(&field)
+    var validity: asn1.Element = undefined
+    if !asn1.nextIf(&fields, asn1.TAG_SEQUENCE, &validity) { return false }
+    var times: asn1.Reader = undefined
+    asn1.readerInit(&times, der, &validity)
+    var moment: asn1.Element = undefined
+    if !asn1.next(&times, &moment) || !asn1.time(der, &moment, &cert.*.notBefore) { return false }
+    if !asn1.next(&times, &moment) || !asn1.time(der, &moment, &cert.*.notAfter) { return false }
+    if !asn1.nextIf(&fields, asn1.TAG_SEQUENCE, &field) { return false }
+    cert.*.subject = rangeOf(&field)
+    if !asn1.nextIf(&fields, asn1.TAG_SEQUENCE, &field) { return false }
+    if !publicKeyInfo(der, &field, cert) { return false }
+    // issuerUniqueID, subjectUniqueID: passed over.
+    var ignored: asn1.Element = undefined
+    const issuerId = asn1.nextIf(&fields, asn1.contextTag(1, false), &ignored)
+    const subjectId = asn1.nextIf(&fields, asn1.contextTag(2, false), &ignored)
+    if asn1.nextIf(&fields, asn1.contextTag(3, true), &field) {
+        if !extensions(der, &field, cert) { return false }
+    }
+    return asn1.atEnd(&fields)
+}
+
+// ---------------------------------------------------------------------------
+// Signatures.
+
+// An ECDSA signature's DER (Ecdsa-Sig-Value): r and s.
+fn ecdsaParts(bytes: []const u8, r: *Range, s: *Range) -> bool {
+    var sequence: asn1.Element = undefined
+    if !asn1.read(bytes, 0, &sequence) || sequence.tag != asn1.TAG_SEQUENCE || sequence.end != bytes.length { return false }
+    var parts: asn1.Reader = undefined
+    asn1.readerInit(&parts, bytes, &sequence)
+    var number: asn1.Element = undefined
+    var start: usize = 0
+    var length: usize = 0
+    if !asn1.nextIf(&parts, asn1.TAG_INTEGER, &number) || !asn1.unsignedInteger(bytes, &number, &start, &length) { return false }
+    r.* = Range.{ .start = start, .length = length }
+    if !asn1.nextIf(&parts, asn1.TAG_INTEGER, &number) || !asn1.unsignedInteger(bytes, &number, &start, &length) { return false }
+    s.* = Range.{ .start = start, .length = length }
+    return asn1.atEnd(&parts)
+}
+
+// An RSAPublicKey's modulus and exponent into a key.
+pub fn rsaKey(keyBytes: []const u8, key: *rsa.PublicKey) -> bool {
+    var sequence: asn1.Element = undefined
+    if !asn1.read(keyBytes, 0, &sequence) || sequence.tag != asn1.TAG_SEQUENCE { return false }
+    var parts: asn1.Reader = undefined
+    asn1.readerInit(&parts, keyBytes, &sequence)
+    var number: asn1.Element = undefined
+    var mStart: usize = 0
+    var mLength: usize = 0
+    var eStart: usize = 0
+    var eLength: usize = 0
+    if !asn1.nextIf(&parts, asn1.TAG_INTEGER, &number) || !asn1.unsignedInteger(keyBytes, &number, &mStart, &mLength) { return false }
+    if !asn1.nextIf(&parts, asn1.TAG_INTEGER, &number) || !asn1.unsignedInteger(keyBytes, &number, &eStart, &eLength) { return false }
+    return rsa.publicKeyInit(key, keyBytes.pointer + mStart, mLength, keyBytes.pointer + eStart, eLength)
+}
+
+// Whether `signature` is the signature of `message` by the key of
+// `cert`, with the algorithm given (for ECDSA a DER Ecdsa-Sig-Value, the
+// hash the one of the algorithm; for PSS the salt length given).
+pub fn verifyWithKey(cert: *Certificate, signatureType: SignatureType, algorithm: hash.Algorithm, pssSalt: usize, message: []const u8, signature: []const u8) -> bool {
+    const key = bytesOf(cert, cert.*.key)
+    if signatureType == SignatureType.ed25519 {
+        if cert.*.keyType != KeyType.ed25519 || signature.length != 64 { return false }
+        return curve25519.ed25519Verify(key.pointer, message, signature.pointer)
+    }
+    var digest: [64]u8 = undefined
+    const d: [*]u8 = &digest
+    hash.digest(algorithm, message, d)
+    const digestLength = hash.digestLength(algorithm)
+    if signatureType == SignatureType.rsaPkcs1 || signatureType == SignatureType.rsaPss {
+        if cert.*.keyType != KeyType.rsa { return false }
+        var publicKey: rsa.PublicKey = undefined
+        if !rsaKey(key, &publicKey) { return false }
+        if signatureType == SignatureType.rsaPkcs1 {
+            return rsa.verifyPkcs1(&publicKey, algorithm, d, signature.pointer, signature.length)
+        }
+        return rsa.verifyPss(&publicKey, algorithm, d, signature.pointer, signature.length, pssSalt)
+    }
+    if signatureType == SignatureType.ecdsa {
+        var curve: ecc.Curve = undefined
+        if cert.*.keyType == KeyType.p256 {
+            ecc.curveInit(&curve, ecc.CurveName.p256)
+        } else if cert.*.keyType == KeyType.p384 {
+            ecc.curveInit(&curve, ecc.CurveName.p384)
+        } else {
+            return false
+        }
+        var r: Range = undefined
+        var s: Range = undefined
+        if !ecdsaParts(signature, &r, &s) { return false }
+        return ecc.ecdsaVerify(&curve, key.pointer, key.length, d, digestLength, signature.pointer + r.start, r.length, signature.pointer + s.start, s.length)
+    }
+    return false
+}
+
+// Whether `issuer`'s key signed `cert`.
+pub fn verifySignedBy(cert: *Certificate, issuer: *Certificate) -> bool {
+    return verifyWithKey(issuer, cert.*.signatureType, cert.*.signatureHash, cert.*.pssSalt, bytesOf(cert, cert.*.tbs), bytesOf(cert, cert.*.signature))
+}
+
+// ---------------------------------------------------------------------------
+// Names.
+
+// What an attribute type is called in a name's text (RFC 4514's and
+// GnuTLS's short names); empty for another one.
+fn attributeName(data: []const u8, oid: *asn1.Element) -> []const u8 {
+    if asn1.contentsAre(data, oid, "\x55\x04\x03") { return "CN" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x06") { return "C" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x07") { return "L" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x08") { return "ST" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x0a") { return "O" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x0b") { return "OU" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x09") { return "street" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x05") { return "serialNumber" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x0c") { return "title" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x2a") { return "GN" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x04") { return "SN" }
+    if asn1.contentsAre(data, oid, "\x55\x04\x61") { return "organizationIdentifier" }
+    if asn1.contentsAre(data, oid, "\x09\x92\x26\x89\x93\xf2\x2c\x64\x01\x19") { return "DC" }
+    if asn1.contentsAre(data, oid, "\x09\x92\x26\x89\x93\xf2\x2c\x64\x01\x01") { return "UID" }
+    if asn1.contentsAre(data, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x09\x01") { return "EMAIL" }
+    return ""
+}
+
+fn put(out: [*]u8, room: usize, written: *usize, byte: u8) -> void {
+    if written.* < room { out[written.*] = byte }
+    written.* += 1
+}
+
+fn putCodePoint(out: [*]u8, room: usize, written: *usize, value: u64) -> void {
+    if value < 128 {
+        put(out, room, written, @intCast(u8, value))
+    } else if value < 2048 {
+        put(out, room, written, @intCast(u8, 192 | (value >> 6)))
+        put(out, room, written, @intCast(u8, 128 | (value & 63)))
+    } else if value < 65536 {
+        put(out, room, written, @intCast(u8, 224 | (value >> 12)))
+        put(out, room, written, @intCast(u8, 128 | ((value >> 6) & 63)))
+        put(out, room, written, @intCast(u8, 128 | (value & 63)))
+    } else {
+        put(out, room, written, @intCast(u8, 240 | ((value >> 18) & 7)))
+        put(out, room, written, @intCast(u8, 128 | ((value >> 12) & 63)))
+        put(out, room, written, @intCast(u8, 128 | ((value >> 6) & 63)))
+        put(out, room, written, @intCast(u8, 128 | (value & 63)))
+    }
+}
+
+// A string value as UTF-8, with RFC 4514's escapes when `escaped`.
+fn putString(data: []const u8, value: *asn1.Element, out: [*]u8, room: usize, written: *usize, escaped: bool) -> void {
+    const at = value.*.contentStart
+    const length = value.*.length
+    var index: usize = 0
+    if value.*.tag == asn1.TAG_BMP_STRING || value.*.tag == asn1.TAG_UNIVERSAL_STRING {
+        const width: usize = if value.*.tag == asn1.TAG_BMP_STRING { 2 } else { 4 }
+        while index + width <= length {
+            var code: u64 = 0
+            var part: usize = 0
+            while part < width {
+                code = (code << 8) | @intCast(u64, data[at + index + part])
+                part += 1
+            }
+            index += width
+            // A surrogate pair of UTF-16.
+            if width == 2 && code >= 55296 && code < 56320 && index + 2 <= length {
+                const next = (@intCast(u64, data[at + index]) << 8) | @intCast(u64, data[at + index + 1])
+                if next >= 56320 && next < 57344 {
+                    code = 65536 + ((code - 55296) << 10) + (next - 56320)
+                    index += 2
+                }
+            }
+            putCodePoint(out, room, written, code)
+        }
+        return
+    }
+    while index < length {
+        const byte = data[at + index]
+        if escaped {
+            const special = byte == 44 || byte == 43 || byte == 34 || byte == 92 || byte == 60 || byte == 62 || byte == 59
+            const edge = (index == 0 && (byte == 32 || byte == 35)) || (index + 1 == length && byte == 32)
+            if special || edge { put(out, room, written, 92) }
+        }
+        put(out, room, written, byte)
+        index += 1
+    }
+}
+
+// A Name (the range of cert.subject or cert.issuer) as RFC 4514 text,
+// the last RDN first, as OpenSSL prints it: "CN=example.com,O=Example,C=US".
+// The length it takes; the text is cut at `room`.
+pub fn nameText(cert: *Certificate, name: Range, out: [*]u8, room: usize) -> usize {
+    return nameTextOrdered(cert, name, out, room, true)
+}
+
+// The same with the RDNs in the certificate's order when not
+// `lastFirst`, as GnuTLS (and so GIO) prints them: "C=US,O=Example,CN=...".
+pub fn nameTextOrdered(cert: *Certificate, name: Range, out: [*]u8, room: usize, lastFirst: bool) -> usize {
+    const data = derOf(cert)
+    var element: asn1.Element = undefined
+    if !asn1.readWithin(data.pointer, name.start, name.start + name.length, &element) { return 0 }
+    // The RDNs' positions, to go through them backwards.
+    var starts: [64]usize = undefined
+    var count: usize = 0
+    var rdns: asn1.Reader = undefined
+    asn1.readerInit(&rdns, data, &element)
+    var rdn: asn1.Element = undefined
+    while asn1.next(&rdns, &rdn) && count < 64 {
+        starts[count] = rdn.start
+        count += 1
+    }
+    var written: usize = 0
+    var step: usize = 0
+    while step < count {
+        const index = if lastFirst { count - 1 - step } else { step }
+        step += 1
+        if !asn1.readWithin(data.pointer, starts[index], element.end, &rdn) { break }
+        var attributes: asn1.Reader = undefined
+        asn1.readerInit(&attributes, data, &rdn)
+        var attribute: asn1.Element = undefined
+        var first = true
+        while asn1.next(&attributes, &attribute) {
+            var parts: asn1.Reader = undefined
+            asn1.readerInit(&parts, data, &attribute)
+            var oid: asn1.Element = undefined
+            var value: asn1.Element = undefined
+            if !asn1.next(&parts, &oid) || !asn1.next(&parts, &value) { continue }
+            if written > 0 { put(out, room, &written, if first { 44 } else { 43 }) }
+            first = false
+            const label = attributeName(data, &oid)
+            if label.length > 0 {
+                var at: usize = 0
+                while at < label.length {
+                    put(out, room, &written, label[at])
+                    at += 1
+                }
+            } else {
+                var dotted: [128]u8 = undefined
+                const text: [*]u8 = &dotted
+                const length = asn1.oidText(data, &oid, text)
+                var at: usize = 0
+                while at < length {
+                    put(out, room, &written, dotted[at])
+                    at += 1
+                }
+            }
+            put(out, room, &written, 61)
+            if asn1.isString(value.tag) && label.length > 0 {
+                putString(data, &value, out, room, &written, true)
+            } else {
+                // Another type, or another attribute: # and the DER in hex.
+                const digits = "0123456789abcdef"
+                put(out, room, &written, 35)
+                var at = value.start
+                while at < value.end {
+                    put(out, room, &written, digits[@intCast(usize, data[at] >> 4)])
+                    put(out, room, &written, digits[@intCast(usize, data[at] & 15)])
+                    at += 1
+                }
+            }
+        }
+    }
+    return written
+}
+
+// The last commonName of the subject, as it is (no escapes), into `out`;
+// its length, 0 when there is none.
+pub fn commonName(cert: *Certificate, out: [*]u8, room: usize) -> usize {
+    const data = derOf(cert)
+    var element: asn1.Element = undefined
+    if !asn1.readWithin(data.pointer, cert.*.subject.start, cert.*.subject.start + cert.*.subject.length, &element) { return 0 }
+    var written: usize = 0
+    var rdns: asn1.Reader = undefined
+    asn1.readerInit(&rdns, data, &element)
+    var rdn: asn1.Element = undefined
+    while asn1.next(&rdns, &rdn) {
+        var attributes: asn1.Reader = undefined
+        asn1.readerInit(&attributes, data, &rdn)
+        var attribute: asn1.Element = undefined
+        while asn1.next(&attributes, &attribute) {
+            var parts: asn1.Reader = undefined
+            asn1.readerInit(&parts, data, &attribute)
+            var oid: asn1.Element = undefined
+            var value: asn1.Element = undefined
+            if !asn1.next(&parts, &oid) || !asn1.next(&parts, &value) { continue }
+            if asn1.contentsAre(data, &oid, "\x55\x04\x03") && asn1.isString(value.tag) {
+                written = 0
+                putString(data, &value, out, room, &written, false)
+            }
+        }
+    }
+    return written
+}
+
+// The `wanted`th name of type `tag` among the subjectAltName's
+// GeneralNames ([2] dNSName is 130, [7] iPAddress 135): its contents.
+pub fn altName(cert: *Certificate, tag: u8, wanted: usize, out: *Range) -> bool {
+    if !cert.*.hasAltNames { return false }
+    const data = derOf(cert)
+    var names: asn1.Reader = undefined
+    asn1.readerRange(&names, data, cert.*.altNames.start, cert.*.altNames.start + cert.*.altNames.length)
+    var name: asn1.Element = undefined
+    var seen: usize = 0
+    while asn1.next(&names, &name) {
+        if name.tag == tag {
+            if seen == wanted {
+                out.* = contentsRange(&name)
+                return true
+            }
+            seen += 1
+        }
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// The server's identity (RFC 6125, 6.4).
+
+fn lower(byte: u8) -> u8 {
+    return if byte >= 65 && byte <= 90 { byte + 32 } else { byte }
+}
+
+// A DNS name of the certificate against the host (both without a final
+// dot, case aside). A wildcard is the whole leftmost label of a name of
+// three labels or more, and stands for exactly one label.
+pub fn dnsNameMatches(pattern: []const u8, host: []const u8) -> bool {
+    var plength = pattern.length
+    var hlength = host.length
+    if plength > 0 && pattern[plength - 1] == 46 { plength -= 1 }
+    if hlength > 0 && host[hlength - 1] == 46 { hlength -= 1 }
+    if plength == 0 || hlength == 0 { return false }
+    if plength >= 2 && pattern[0] == 42 && pattern[1] == 46 {
+        // "*." and at least two more labels after it.
+        var dots: usize = 0
+        var index: usize = 2
+        while index < plength {
+            if pattern[index] == 46 { dots += 1 }
+            index += 1
+        }
+        if dots < 1 { return false }
+        // The host's first label goes for the star; the rest must match.
+        var first: usize = 0
+        while first < hlength && host[first] != 46 { first += 1 }
+        if first == 0 || first == hlength { return false }
+        const rest = hlength - first
+        if rest != plength - 1 { return false }
+        index = 0
+        while index < rest {
+            if lower(pattern[1 + index]) != lower(host[first + index]) { return false }
+            index += 1
+        }
+        return true
+    }
+    if plength != hlength { return false }
+    var index: usize = 0
+    while index < plength {
+        if lower(pattern[index]) != lower(host[index]) { return false }
+        // No other stars: a star elsewhere matches only a star.
+        index += 1
+    }
+    return true
+}
+
+// An IPv4 or IPv6 literal as its 4 or 16 bytes; 0 for a name.
+pub fn parseAddress(text: []const u8, out: [*]u8) -> usize {
+    var colons = false
+    var index: usize = 0
+    while index < text.length {
+        if text[index] == 58 { colons = true }
+        index += 1
+    }
+    if !colons {
+        var part: usize = 0
+        var value: u64 = 0
+        var digitsSeen: usize = 0
+        index = 0
+        while index <= text.length {
+            if index == text.length || text[index] == 46 {
+                if digitsSeen == 0 || value > 255 || part >= 4 { return 0 }
+                out[part] = @intCast(u8, value)
+                part += 1
+                value = 0
+                digitsSeen = 0
+            } else {
+                const byte = text[index]
+                if byte < 48 || byte > 57 { return 0 }
+                value = value * 10 + @intCast(u64, byte - 48)
+                digitsSeen += 1
+            }
+            index += 1
+        }
+        return if part == 4 { 4 } else { 0 }
+    }
+    // IPv6: groups of hex digits, one "::" at most standing for zeroes.
+    var groups: [8]u64 = [8]u64{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    var count: usize = 0
+    var gap: usize = 8
+    index = 0
+    if text.length >= 2 && text[0] == 58 && text[1] == 58 {
+        gap = 0
+        index = 2
+    }
+    while index < text.length {
+        var value: u64 = 0
+        var digitsSeen: usize = 0
+        while index < text.length && text[index] != 58 {
+            const digit = base64.hexValue(text[index])
+            if digit == 255 { return 0 }
+            value = (value << 4) | @intCast(u64, digit)
+            digitsSeen += 1
+            index += 1
+        }
+        if digitsSeen == 0 || digitsSeen > 4 || count >= 8 { return 0 }
+        groups[count] = value
+        count += 1
+        if index < text.length {
+            index += 1
+            if index < text.length && text[index] == 58 {
+                if gap != 8 { return 0 }
+                gap = count
+                index += 1
+            } else if index == text.length {
+                return 0
+            }
+        }
+    }
+    if gap == 8 && count != 8 { return 0 }
+    var expanded: [8]u64 = [8]u64{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    if gap == 8 {
+        expanded = groups
+    } else {
+        var at: usize = 0
+        while at < gap {
+            expanded[at] = groups[at]
+            at += 1
+        }
+        const tail = count - gap
+        at = 0
+        while at < tail {
+            expanded[8 - tail + at] = groups[gap + at]
+            at += 1
+        }
+    }
+    index = 0
+    while index < 8 {
+        out[index * 2] = @intCast(u8, expanded[index] >> 8)
+        out[index * 2 + 1] = @intCast(u8, expanded[index] & 255)
+        index += 1
+    }
+    return 16
+}
+
+// Whether the certificate is the host's: an address against its
+// iPAddress names, a name against its dNSNames, or its common name when
+// it has no dNSName at all.
+pub fn matchesHostname(cert: *Certificate, host: []const u8) -> bool {
+    var address: [16]u8 = undefined
+    const bytes: [*]u8 = &address
+    const addressLength = parseAddress(host, bytes)
+    var name: Range = undefined
+    var index: usize = 0
+    if addressLength > 0 {
+        while altName(cert, 135, index, &name) {
+            if name.length == addressLength && sameBytes(bytesOf(cert, name), bytes[0..addressLength]) { return true }
+            index += 1
+        }
+        return false
+    }
+    var anyDns = false
+    while altName(cert, 130, index, &name) {
+        anyDns = true
+        if dnsNameMatches(bytesOf(cert, name), host) { return true }
+        index += 1
+    }
+    if anyDns { return false }
+    var common: [256]u8 = undefined
+    const text: [*]u8 = &common
+    const length = commonName(cert, text, 256)
+    if length == 0 || length > 256 { return false }
+    return dnsNameMatches(text[0..length], host)
+}
+
+// ---------------------------------------------------------------------------
+// PEM.
+
+// The next "-----BEGIN CERTIFICATE-----" block from `at` on, decoded
+// into `out` (room for `room` bytes): its length, 0 when there is none
+// more; `at` moves past it.
+pub fn nextPemCertificate(pem: []const u8, at: *usize, out: [*]u8, room: usize) -> usize {
+    const begin = "-----BEGIN CERTIFICATE-----"
+    const end = "-----END CERTIFICATE-----"
+    var position = at.*
+    while position + begin.length <= pem.length {
+        if sameBytes(pem[position .. position + begin.length], begin) { break }
+        position += 1
+    }
+    if position + begin.length > pem.length {
+        at.* = pem.length
+        return 0
+    }
+    const bodyStart = position + begin.length
+    var bodyEnd = bodyStart
+    while bodyEnd + end.length <= pem.length {
+        if sameBytes(pem[bodyEnd .. bodyEnd + end.length], end) { break }
+        bodyEnd += 1
+    }
+    if bodyEnd + end.length > pem.length {
+        at.* = pem.length
+        return 0
+    }
+    at.* = bodyEnd + end.length
+    if base64.decodedLength(base64.Encoding.base64, bodyEnd - bodyStart) + 1 > room { return 0 }
+    const decoded = base64.decode(base64.Encoding.base64, pem[bodyStart..bodyEnd], out, false)
+    if !decoded.ok { return 0 }
+    return decoded.length
+}
+
+// ---------------------------------------------------------------------------
+// The trust store: anchors, each certificate with its own copy of its
+// DER.
+
+pub const TrustStore = struct {
+    allocator: Allocator
+    certificates: [*]Certificate
+    count: usize
+    capacity: usize
+}
+
+pub fn storeInit(store: *TrustStore, allocator: Allocator) -> void {
+    store.*.allocator = allocator
+    store.*.count = 0
+    store.*.capacity = 0
+}
+
+// Adds a certificate's DER (copied); false when it is not one, or memory
+// ran out.
+pub fn storeAddDer(store: *TrustStore, der: []const u8) -> bool {
+    if store.*.count == store.*.capacity {
+        const capacity = if store.*.capacity == 0 { 64 } else { store.*.capacity * 2 }
+        const memory = store.*.allocator.alloc(capacity * @sizeOf(Certificate), 8)
+        if memory == null { return false }
+        const grown: [*]Certificate = unsafe { @ptrCast([*]Certificate, memory.?) }
+        var index: usize = 0
+        while index < store.*.count {
+            grown[index] = store.*.certificates[index]
+            index += 1
+        }
+        if store.*.capacity > 0 {
+            const old: [*]u8 = unsafe { @ptrCast([*]u8, store.*.certificates) }
+            store.*.allocator.free(old, store.*.capacity * @sizeOf(Certificate), 8)
+        }
+        store.*.certificates = grown
+        store.*.capacity = capacity
+    }
+    const copy = store.*.allocator.alloc(der.length, 8)
+    if copy == null { return false }
+    const bytes = copy.?
+    std.mem.copy(bytes, der.pointer, der.length)
+    if !parse(&store.*.certificates[store.*.count], bytes[0..der.length]) {
+        store.*.allocator.free(bytes, der.length, 8)
+        return false
+    }
+    store.*.count += 1
+    return true
+}
+
+// Adds every certificate of PEM text; how many were added.
+pub fn storeAddPem(store: *TrustStore, pem: []const u8) -> usize {
+    // The decoding buffer from the allocator: a local this large would
+    // come from the aggregate arena (see std.crypto.bignum).
+    const memory = store.*.allocator.alloc(16384, 8)
+    if memory == null { return 0 }
+    const out = memory.?
+    var at: usize = 0
+    var added: usize = 0
+    while at < pem.length {
+        const length = nextPemCertificate(pem, &at, out, 16384)
+        if length > 0 && storeAddDer(store, out[0..length]) { added += 1 }
+    }
+    store.*.allocator.free(out, 16384, 8)
+    return added
+}
+
+// Adds the certificates of a PEM file (a NUL-terminated path); how many
+// were added.
+pub fn storeLoadFile(store: *TrustStore, path: [*]const u8) -> usize {
+    const contents = fs.readFileAlloc(path, store.*.allocator)
+    if contents == null { return 0 }
+    var list = contents.?
+    const added = storeAddPem(store, list.items[0..list.length])
+    list.deinit()
+    return added
+}
+
+pub fn storeFree(store: *TrustStore) -> void {
+    var index: usize = 0
+    while index < store.*.count {
+        const bytes: [*]u8 = unsafe { @ptrCast([*]u8, store.*.certificates[index].der) }
+        store.*.allocator.free(bytes, store.*.certificates[index].derLength, 8)
+        index += 1
+    }
+    if store.*.capacity > 0 {
+        const old: [*]u8 = unsafe { @ptrCast([*]u8, store.*.certificates) }
+        store.*.allocator.free(old, store.*.capacity * @sizeOf(Certificate), 8)
+    }
+    store.*.count = 0
+    store.*.capacity = 0
+}
+
+// ---------------------------------------------------------------------------
+// Chains.
+
+// The current time, seconds since 1970.
+pub fn now() -> i64 {
+    const moment = time.realtime()
+    return @intCast(i64, moment.seconds)
+}
+
+fn validityFlags(cert: *Certificate, moment: i64) -> u32 {
+    if moment < cert.*.notBefore { return NOT_ACTIVATED }
+    if moment > cert.*.notAfter { return EXPIRED }
+    return 0
+}
+
+// Whether `issuer` may have signed `cert`: the names agree, the key
+// identifiers too when both are there.
+fn mayHaveIssued(issuer: *Certificate, cert: *Certificate) -> bool {
+    if !sameBytes(bytesOf(issuer, issuer.*.subject), bytesOf(cert, cert.*.issuer)) { return false }
+    if issuer.*.subjectKeyId.length > 0 && cert.*.authorityKeyId.length > 0 {
+        if !sameBytes(bytesOf(issuer, issuer.*.subjectKeyId), bytesOf(cert, cert.*.authorityKeyId)) { return false }
+    }
+    return true
+}
+
+// Whether a certificate may sign others below it, `below` of them CAs
+// already on the path.
+fn mayActAsCa(cert: *Certificate, below: usize) -> bool {
+    if cert.*.unknownCritical { return false }
+    if cert.*.version == 3 && !(cert.*.hasBasicConstraints && cert.*.isCa) { return false }
+    if cert.*.hasKeyUsage && (cert.*.keyUsage & USAGE_KEY_CERT_SIGN) == 0 { return false }
+    if cert.*.pathLength >= 0 && @intCast(i64, below) > cert.*.pathLength { return false }
+    return true
+}
+
+fn sameCertificate(a: *Certificate, b: *Certificate) -> bool {
+    return sameBytes(derOf(a), derOf(b))
+}
+
+// Verifies `chain` (the server's certificate first, then what came with
+// it, in any order) up to an anchor of `store`, at the time `moment`,
+// and that it is `host`'s (unless host is empty): the flags of what is
+// wrong, 0 for nothing.
+pub fn verifyChain(store: *TrustStore, chain: [*]Certificate, count: usize, host: []const u8, moment: i64) -> u32 {
+    if count == 0 { return GENERIC_ERROR }
+    var flags: u32 = 0
+    const leaf: *Certificate = &chain[0]
+    if host.length > 0 && !matchesHostname(leaf, host) { flags = flags | BAD_IDENTITY }
+    if leaf.*.unknownCritical { flags = flags | GENERIC_ERROR }
+    if leaf.*.hasExtendedKeyUsage && !leaf.*.serverAuth { flags = flags | GENERIC_ERROR }
+    var used: [16]bool = [16]bool{ false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false }
+    used[0] = true
+    var current: *Certificate = leaf
+    var depth: usize = 0
+    var anchored = false
+    while depth < 10 {
+        flags = flags | validityFlags(current, moment)
+        // The certificate itself an anchor.
+        var index: usize = 0
+        while index < store.*.count {
+            if sameCertificate(&store.*.certificates[index], current) {
+                anchored = true
+                break
+            }
+            index += 1
+        }
+        if anchored { break }
+        // An anchor that signed it.
+        index = 0
+        while index < store.*.count {
+            const anchor: *Certificate = &store.*.certificates[index]
+            if mayHaveIssued(anchor, current) && verifySignedBy(current, anchor) {
+                if current.*.signatureHash == hash.Algorithm.sha1 { flags = flags | INSECURE }
+                flags = flags | validityFlags(anchor, moment)
+                anchored = true
+                break
+            }
+            index += 1
+        }
+        if anchored { break }
+        // A certificate that came with the chain and signed it.
+        var found = false
+        index = 1
+        while index < count && index < 16 {
+            if !used[index] {
+                const candidate: *Certificate = &chain[index]
+                if mayHaveIssued(candidate, current) && mayActAsCa(candidate, depth) && verifySignedBy(current, candidate) {
+                    if current.*.signatureHash == hash.Algorithm.sha1 { flags = flags | INSECURE }
+                    used[index] = true
+                    current = candidate
+                    found = true
+                    break
+                }
+            }
+            index += 1
+        }
+        if !found { break }
+        depth += 1
+    }
+    if !anchored { flags = flags | UNKNOWN_CA }
+    return flags
+}
