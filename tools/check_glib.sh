@@ -40,6 +40,10 @@
 #                          and memory streams sought, the network
 #                          and power monitors, content types (what
 #                          libsoup and WebKit stand on)
+#       tests/fileinfo.c   GFileInfo's attributes, masks and matchers;
+#                          g_file_query_info (and async) and
+#                          g_file_input_stream_query_info on files of
+#                          this system, checked against stat
 #   - WTF's sources for WPE that stand on GLib and the system
 #     (tests/wtf/files.txt: wtf/glib, generic, unix, linux and posix)
 #     compile with mlx-cc on these headers, with WPE's configuration
@@ -80,7 +84,7 @@ cc -x c++ -std=c++20 -c "$work/all.c" -o "$work/all-cpp.o" || fail "the headers 
 echo "ok   the headers together in C and C++"
 
 mkdir -p "$work/run"
-for test in strings mainloop variant uri gobject system gio collect options network tls streams extras; do
+for test in strings mainloop variant uri gobject system gio collect options network tls streams extras fileinfo; do
     cc "compiler/capi/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
     status=0
     (cd "$work/run" && run "$work/$test") > "$work/$test.out" 2> "$work/$test.err" || status=$?
