@@ -8,10 +8,11 @@
 //
 // Supported: every colour type (greyscale, RGB, palette, greyscale with
 // alpha, RGBA) at every bit depth PNG allows for it (1, 2, 4, 8, 16),
-// palette transparency (tRNS), all five row filters, and zlib streams with
-// stored, fixed and dynamic Huffman blocks. Not supported: interlaced
-// (Adam7) images (Status.unsupported). Chunk CRCs and the zlib checksum are
-// not checked; malformed data gives Status.corrupt, never a trap.
+// transparency (tRNS) of each, interlaced (Adam7) images, all five row
+// filters. The file is read by std.png.read, libpng's reader in Mlx (the
+// same checks of chunks and CRCs); malformed data gives Status.corrupt,
+// never a trap. decodeRgba gives 8-bit RGBA instead of premultiplied
+// words. The libpng C API (compiler/capi/png) is made of the same parts.
 //
 // scale() resizes an image by area averaging (box filtering), which suits
 // shrinking icons to the size they are shown at.
@@ -21,6 +22,9 @@ const allocator_module = @import("../bootstrap/allocator.mlx")
 const fs = @import("../bootstrap/fs.mlx")
 const flate = @import("./flate.mlx")
 const crc = @import("./crc.mlx")
+const zs = @import("./flate/stream.mlx")
+pub const read = @import("./png/read.mlx")
+pub const rows = @import("./png/rows.mlx")
 
 pub const Allocator = allocator_module.Allocator
 
@@ -37,7 +41,7 @@ pub fn statusMessage(status: Status) -> []const u8 {
     if status == Status.ok { return "ok" }
     if status == Status.unreadable { return "cannot read the file" }
     if status == Status.notPng { return "not a PNG image" }
-    if status == Status.unsupported { return "an interlaced or otherwise unsupported PNG" }
+    if status == Status.unsupported { return "a PNG larger than 16384 pixels across" }
     if status == Status.corrupt { return "a damaged PNG" }
     return "out of memory"
 }
@@ -75,25 +79,11 @@ pub fn loadFile(image: *Image, path: [*]const u8, allocator: Allocator) -> Statu
 }
 
 // ---------------------------------------------------------------------------
-// PNG
-
-fn isChunk(data: [*]const u8, at: usize, a: u8, b: u8, c: u8, d: u8) -> bool {
-    return data[at] == a && data[at + 1] == b && data[at + 2] == c && data[at + 3] == d
-}
-
-fn channelsOf(color_type: u8) -> usize {
-    if color_type == 0 || color_type == 3 { return 1 }
-    if color_type == 4 { return 2 }
-    if color_type == 2 { return 3 }
-    return 4
-}
-
-fn validDepth(color_type: u8, depth: u8) -> bool {
-    if color_type == 0 { return depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16 }
-    if color_type == 3 { return depth == 1 || depth == 2 || depth == 4 || depth == 8 }
-    if color_type == 2 || color_type == 4 || color_type == 6 { return depth == 8 || depth == 16 }
-    return false
-}
+// Decoding: std.png.read reads the file (as libpng does, with the same
+// checks), std.png.rows undoes the filters and makes each row 8-bit RGBA:
+// palettes and transparency expanded, grey made RGB, 16-bit samples cut
+// to their high byte. Interlaced (Adam7) rows go straight to their
+// places. An APNG gives its default image.
 
 fn paeth(left: u8, up: u8, corner: u8) -> u8 {
     const a = @intCast(i32, left)
@@ -108,55 +98,196 @@ fn paeth(left: u8, up: u8, corner: u8) -> u8 {
     return corner
 }
 
-// Undoes the row filters in place; rows are 1 + `row_bytes` long (the
-// filter type first).
-fn unfilter(data: [*]u8, height: usize, row_bytes: usize, pixel_bytes: usize) -> bool {
-    var row: usize = 0
-    while row < height {
-        const start = row * (row_bytes + 1)
-        const filter = data[start]
-        const line = start + 1
-        const previous = if row > 0 { line - row_bytes - 1 } else { 0 }
-        if filter > 4 { return false }
-        var column: usize = 0
-        while column < row_bytes {
-            const left = if column >= pixel_bytes { data[line + column - pixel_bytes] } else { 0 }
-            const up = if row > 0 { data[previous + column] } else { 0 }
-            const corner = if row > 0 && column >= pixel_bytes { data[previous + column - pixel_bytes] } else { 0 }
-            const raw = data[line + column]
-            var value = raw
-            if filter == 1 { value = raw +% left }
-            if filter == 2 { value = raw +% up }
-            if filter == 3 { value = raw +% @intCast(u8, (@intCast(u32, left) + @intCast(u32, up)) / 2) }
-            if filter == 4 { value = raw +% paeth(left, up, corner) }
-            data[line + column] = value
-            column += 1
+// An image as 8-bit RGBA, not premultiplied: 4 bytes a pixel, `width`
+// pixels a row.
+pub const Picture = struct {
+    pixels: [*]u8
+    width: usize
+    height: usize
+    allocator: Allocator
+}
+
+pub fn deinitPicture(picture: *Picture) -> void {
+    if picture.*.width * picture.*.height == 0 { return }
+    picture.*.allocator.free(picture.*.pixels, picture.*.width * picture.*.height * 4, 16)
+    picture.*.width = 0
+    picture.*.height = 0
+}
+
+// The state of a decoding (on the heap: the reader is large).
+const Decoding = struct {
+    reader: read.Reader
+    info: read.Info
+    rowBuffer: usize
+    previous: usize
+    rowCapacity: usize
+    pixels: usize
+    pass: usize
+    row: usize
+    passRows: usize
+    passWidth: usize
+    complete: bool
+}
+
+// The first pass from FIRST on with pixels, or 7.
+fn firstPass(width: usize, height: usize, first: usize) -> usize {
+    var pass = first
+    while pass < 7 {
+        if rows.passWidth(pass, width) != 0 && rows.passHeight(pass, height) != 0 { return pass }
+        pass += 1
+    }
+    return 7
+}
+
+// Sets the reader up for the rows of the current pass.
+fn startPass(d: *Decoding) -> void {
+    const info = &d.*.info
+    if info.*.interlace == 0 {
+        d.*.passWidth = info.*.width
+        d.*.passRows = info.*.height
+    } else {
+        d.*.passWidth = rows.passWidth(d.*.pass, info.*.width)
+        d.*.passRows = rows.passHeight(d.*.pass, info.*.height)
+    }
+    d.*.row = 0
+    zs.zero(d.*.previous, d.*.rowCapacity)
+    d.*.reader.rowSize = rows.rowBytes(info.*.pixelDepth, d.*.passWidth) + 1
+}
+
+fn startImage(d: *Decoding, allocator: Allocator) -> Status {
+    const info = &d.*.info
+    if info.*.width > 16384 || info.*.height > 16384 { return Status.unsupported }
+    // A row at its widest: 8 bytes a pixel, rounded up to 8 pixels.
+    d.*.rowCapacity = ((info.*.width + 7) & ~@intCast(usize, 7)) * 8 + 64
+    const total = d.*.rowCapacity * 2 + info.*.width * info.*.height * 4
+    const memory = allocator.alloc(total, 16)
+    if memory == null { return Status.noMemory }
+    const base = @intFromPtr(memory.?)
+    zs.zero(base, total)
+    d.*.rowBuffer = base
+    d.*.previous = base + d.*.rowCapacity
+    d.*.pixels = base + d.*.rowCapacity * 2
+    d.*.reader.rowBuffer = d.*.rowBuffer
+    d.*.pass = 0
+    if info.*.interlace != 0 { d.*.pass = firstPass(info.*.width, info.*.height, 0) }
+    startPass(d)
+    return Status.ok
+}
+
+// A row inflated: the filter undone, the row made RGBA, put in place.
+fn takeRow(d: *Decoding) -> bool {
+    const info = &d.*.info
+    const bytes = rows.rowBytes(info.*.pixelDepth, d.*.passWidth)
+    const filter = @intCast(usize, zs.get8(d.*.rowBuffer))
+    if filter > 4 { return false }
+    var pixelBytes = info.*.pixelDepth >> 3
+    if pixelBytes == 0 { pixelBytes = 1 }
+    rows.unfilter(filter, d.*.rowBuffer + 1, d.*.previous + 1, bytes, pixelBytes)
+    zs.copy(d.*.previous, d.*.rowBuffer, bytes + 1)
+    var row: rows.RowInfo = undefined
+    row.width = d.*.passWidth
+    row.rowBytes = bytes
+    row.colorType = info.*.colorType
+    row.bitDepth = info.*.bitDepth
+    row.channels = info.*.channels
+    row.pixelDepth = info.*.pixelDepth
+    const line = d.*.rowBuffer + 1
+    if row.colorType == 3 {
+        rows.expandPalette(&row, line, @intFromPtr(&info.*.palette), @intFromPtr(&info.*.transAlpha), info.*.numTrans)
+    } else {
+        rows.expand(&row, line, info.*.numTrans != 0, info.*.transGray, info.*.transRed, info.*.transGreen, info.*.transBlue)
+    }
+    rows.chop16(&row, line)
+    rows.grayToRgb(&row, line)
+    if row.channels == 3 { rows.filler(&row, line, 255, true) }
+    // Where the row's pixels go.
+    var y = d.*.row
+    var x0: usize = 0
+    var step: usize = 1
+    if info.*.interlace != 0 {
+        y = rows.passStartRow(d.*.pass) + d.*.row * rows.passRowStep(d.*.pass)
+        x0 = rows.passStartColumn(d.*.pass)
+        step = rows.passColumnStep(d.*.pass)
+    }
+    var index: usize = 0
+    while index < d.*.passWidth {
+        zs.copy(d.*.pixels + (y * info.*.width + x0 + index * step) * 4, line + index * 4, 4)
+        index += 1
+    }
+    d.*.row += 1
+    if d.*.row >= d.*.passRows {
+        if info.*.interlace != 0 { d.*.pass = firstPass(info.*.width, info.*.height, d.*.pass + 1) } else { d.*.pass = 7 }
+        if d.*.pass >= 7 {
+            d.*.complete = true
+            d.*.reader.imageComplete = true
+        } else {
+            startPass(d)
         }
-        row += 1
     }
     return true
 }
 
-// Sample `index` (a channel value scaled to 0..255) of a row.
-fn sample(line: [*]const u8, index: usize, depth: u8) -> u32 {
-    if depth == 8 { return @intCast(u32, line[index]) }
-    if depth == 16 { return @intCast(u32, line[index * 2]) }
-    const per_byte = 8 / @intCast(usize, depth)
-    const byte = line[index / per_byte]
-    const shift = @intCast(u32, 8 - @intCast(usize, depth) * (index % per_byte + 1))
-    const mask = (@intCast(u32, 1) << @intCast(u32, depth)) - 1
-    const value = (@intCast(u32, byte) >> shift) & mask
-    return value * 255 / mask
-}
-
-// The raw index into the palette (bit depths below 8 are not scaled).
-fn paletteIndex(line: [*]const u8, index: usize, depth: u8) -> usize {
-    if depth == 8 { return @intCast(usize, line[index]) }
-    const per_byte = 8 / @intCast(usize, depth)
-    const byte = line[index / per_byte]
-    const shift = @intCast(u32, 8 - @intCast(usize, depth) * (index % per_byte + 1))
-    const mask = (@intCast(u32, 1) << @intCast(u32, depth)) - 1
-    return @intCast(usize, (@intCast(u32, byte) >> shift) & mask)
+// Decodes a PNG held in memory into 8-bit RGBA.
+pub fn decodeRgba(picture: *Picture, data: [*]const u8, length: usize, allocator: Allocator) -> Status {
+    picture.*.width = 0
+    picture.*.height = 0
+    picture.*.allocator = allocator
+    if length < 8 { return Status.notPng }
+    const signature = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }
+    var index: usize = 0
+    while index < 8 {
+        if data[index] != signature[index] { return Status.notPng }
+        index += 1
+    }
+    const memory = allocator.alloc(@sizeOf(Decoding), 16)
+    if memory == null { return Status.noMemory }
+    const d: *Decoding = unsafe { @ptrCast(*Decoding, memory.?) }
+    read.init(&d.*.reader, &d.*.info, allocator)
+    d.*.rowBuffer = 0
+    d.*.complete = false
+    read.give(&d.*.reader, @intFromPtr(data), length)
+    var status = Status.corrupt
+    var ended = false
+    while true {
+        const event = read.next(&d.*.reader)
+        if event == read.Event.more || event == read.Event.failed { break }
+        if event == read.Event.info {
+            status = startImage(d, allocator)
+            if status != Status.ok { break }
+            status = Status.corrupt
+        } else if event == read.Event.row {
+            if !takeRow(d) { break }
+        } else if event == read.Event.unknown {
+            // An unknown critical chunk cannot be passed over.
+            if d.*.reader.chunkName & 0x20000000 == 0 { break }
+        } else if event == read.Event.end {
+            ended = true
+            break
+        }
+    }
+    if ended && d.*.complete { status = Status.ok }
+    const info = &d.*.info
+    const width = info.*.width
+    const height = info.*.height
+    if d.*.rowBuffer != 0 {
+        const total = d.*.rowCapacity * 2 + width * height * 4
+        if status == Status.ok {
+            // The pixels move to memory of their own.
+            const pixels = allocator.alloc(width * height * 4, 16)
+            if pixels == null {
+                status = Status.noMemory
+            } else {
+                zs.copy(@intFromPtr(pixels.?), d.*.pixels, width * height * 4)
+                picture.*.pixels = pixels.?
+                picture.*.width = width
+                picture.*.height = height
+            }
+        }
+        allocator.free(zs.bytes(d.*.rowBuffer), total, 16)
+    }
+    read.deinit(&d.*.reader)
+    allocator.free(memory.?, @sizeOf(Decoding), 16)
+    return status
 }
 
 fn premultiply(alpha: u32, red: u32, green: u32, blue: u32) -> u32 {
@@ -167,139 +298,30 @@ fn premultiply(alpha: u32, red: u32, green: u32, blue: u32) -> u32 {
     return (alpha << 24) | (r << 16) | (g << 8) | b
 }
 
-// Decodes a PNG held in memory.
+// Decodes a PNG held in memory into premultiplied ARGB words.
 pub fn decode(image: *Image, data: [*]const u8, length: usize, allocator: Allocator) -> Status {
     image.*.width = 0
     image.*.height = 0
     image.*.allocator = allocator
-    if length < 33 { return Status.notPng }
-    if data[0] != 137 || data[1] != 80 || data[2] != 78 || data[3] != 71 || data[4] != 13 || data[5] != 10 || data[6] != 26 || data[7] != 10 { return Status.notPng }
-    if !isChunk(data, 12, 73, 72, 68, 82) || std.mem.readU32Big(data, 8) != 13 { return Status.corrupt }
-    const width = @intCast(usize, std.mem.readU32Big(data, 16))
-    const height = @intCast(usize, std.mem.readU32Big(data, 20))
-    const depth = data[24]
-    const color_type = data[25]
-    if data[26] != 0 || data[27] != 0 { return Status.unsupported }
-    if data[28] != 0 { return Status.unsupported }
-    if width == 0 || height == 0 || width > 16384 || height > 16384 { return Status.unsupported }
-    if !validDepth(color_type, depth) { return Status.corrupt }
-    const channels = channelsOf(color_type)
-    const bits_per_pixel = channels * @intCast(usize, depth)
-    const row_bytes = (width * bits_per_pixel + 7) / 8
-    const pixel_bytes = if bits_per_pixel < 8 { 1 } else { bits_per_pixel / 8 }
-
-    // The chunks: the palette, its transparency, and the image data (all
-    // IDAT chunks, gathered in order).
-    var palette: [768]u8 = undefined
-    var alphas: [256]u8 = undefined
+    var picture: Picture = undefined
+    const status = decodeRgba(&picture, data, length, allocator)
+    if status != Status.ok { return status }
+    const count = picture.width * picture.height
+    // The words take the place of the bytes, one for four.
+    const words: [*]u32 = unsafe { @ptrCast([*]u32, picture.pixels) }
     var index: usize = 0
-    while index < 256 {
-        alphas[index] = 255
+    while index < count {
+        const at = index * 4
+        const red = @intCast(u32, picture.pixels[at])
+        const green = @intCast(u32, picture.pixels[at + 1])
+        const blue = @intCast(u32, picture.pixels[at + 2])
+        const alpha = @intCast(u32, picture.pixels[at + 3])
+        words[index] = premultiply(alpha, red, green, blue)
         index += 1
     }
-    var palette_count: usize = 0
-    var compressed_length: usize = 0
-    var at: usize = 8
-    while at + 12 <= length {
-        const size = @intCast(usize, std.mem.readU32Big(data, at))
-        if at + 12 + size > length { return Status.corrupt }
-        if isChunk(data, at + 4, 73, 68, 65, 84) { compressed_length += size }
-        if isChunk(data, at + 4, 80, 76, 84, 69) {
-            if size % 3 != 0 || size > 768 { return Status.corrupt }
-            palette_count = size / 3
-            index = 0
-            while index < size {
-                palette[index] = data[at + 8 + index]
-                index += 1
-            }
-        }
-        if isChunk(data, at + 4, 116, 82, 78, 83) && color_type == 3 {
-            index = 0
-            while index < size && index < 256 {
-                alphas[index] = data[at + 8 + index]
-                index += 1
-            }
-        }
-        if isChunk(data, at + 4, 73, 69, 78, 68) { break }
-        at += 12 + size
-    }
-    if compressed_length < 6 { return Status.corrupt }
-    if color_type == 3 && palette_count == 0 { return Status.corrupt }
-    const compressed_memory = allocator.alloc(compressed_length, 16)
-    if compressed_memory == null { return Status.noMemory }
-    const compressed = compressed_memory.?
-    var filled: usize = 0
-    at = 8
-    while at + 12 <= length {
-        const size = @intCast(usize, std.mem.readU32Big(data, at))
-        if isChunk(data, at + 4, 73, 68, 65, 84) {
-            index = 0
-            while index < size {
-                compressed[filled + index] = data[at + 8 + index]
-                index += 1
-            }
-            filled += size
-        }
-        if isChunk(data, at + 4, 73, 69, 78, 68) { break }
-        at += 12 + size
-    }
-    // zlib: deflate (method 8), no preset dictionary.
-    if compressed[0] & 15 != 8 || compressed[1] & 32 != 0 || ((@intCast(u32, compressed[0]) << 8) | @intCast(u32, compressed[1])) % 31 != 0 {
-        allocator.free(compressed, compressed_length, 16)
-        return Status.corrupt
-    }
-    const raw_length = height * (row_bytes + 1)
-    const raw_memory = allocator.alloc(raw_length, 16)
-    if raw_memory == null {
-        allocator.free(compressed, compressed_length, 16)
-        return Status.noMemory
-    }
-    const raw = raw_memory.?
-    const stream: [*]const u8 = compressed + 2
-    const inflated = flate.inflate(stream, compressed_length - 2, raw, raw_length)
-    allocator.free(compressed, compressed_length, 16)
-    if inflated != raw_length || !unfilter(raw, height, row_bytes, pixel_bytes) {
-        allocator.free(raw, raw_length, 16)
-        return Status.corrupt
-    }
-
-    const pixel_memory = allocator.alloc(width * height * 4, 16)
-    if pixel_memory == null {
-        allocator.free(raw, raw_length, 16)
-        return Status.noMemory
-    }
-    const pixels: [*]u32 = unsafe { @ptrCast([*]u32, pixel_memory.?) }
-    var row: usize = 0
-    while row < height {
-        const line: [*]const u8 = raw + row * (row_bytes + 1) + 1
-        var column: usize = 0
-        while column < width {
-            var color: u32 = 0
-            if color_type == 0 {
-                const grey = sample(line, column, depth)
-                color = premultiply(255, grey, grey, grey)
-            } else if color_type == 2 {
-                color = premultiply(255, sample(line, column * 3, depth), sample(line, column * 3 + 1, depth), sample(line, column * 3 + 2, depth))
-            } else if color_type == 3 {
-                const entry = paletteIndex(line, column, depth)
-                if entry < palette_count {
-                    color = premultiply(@intCast(u32, alphas[entry]), @intCast(u32, palette[entry * 3]), @intCast(u32, palette[entry * 3 + 1]), @intCast(u32, palette[entry * 3 + 2]))
-                }
-            } else if color_type == 4 {
-                const grey = sample(line, column * 2, depth)
-                color = premultiply(sample(line, column * 2 + 1, depth), grey, grey, grey)
-            } else {
-                color = premultiply(sample(line, column * 4 + 3, depth), sample(line, column * 4, depth), sample(line, column * 4 + 1, depth), sample(line, column * 4 + 2, depth))
-            }
-            pixels[row * width + column] = color
-            column += 1
-        }
-        row += 1
-    }
-    allocator.free(raw, raw_length, 16)
-    image.*.pixels = pixels
-    image.*.width = width
-    image.*.height = height
+    image.*.pixels = words
+    image.*.width = picture.width
+    image.*.height = picture.height
     return Status.ok
 }
 

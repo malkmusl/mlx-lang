@@ -1,0 +1,2245 @@
+// std.png.read: the PNG reader that takes a file in pieces of any size
+// (as it comes from the network) and tells what it found, one event at a
+// time: the header chunks read (`info`), each row of image data inflated
+// (`row`), a chunk it does not know (`unknown`), warnings, a fatal error,
+// the end. It is libpng's progressive reader (pngpread.c, pngrutil.c,
+// 1.6.43) step for step: the same chunk checks and their messages, the
+// same CRC handling, the same treatment of damaged image data, so that
+// the C API (compiler/capi/png) that drives it behaves as libpng does,
+// and std.png (png.mlx) decodes whole images with it.
+//
+//     var reader: read.Reader = undefined   (on the heap: it is large)
+//     read.init(&reader, &info, allocator)
+//     read.give(&reader, bytes, count)
+//     while true {
+//         const event = read.next(&reader)
+//         if event == read.Event.more { break }   (all of `bytes` taken)
+//         ... read.Event.info: the header chunks are in `info`; the
+//             caller sets rowSize (and rowBuffer) for the rows to come
+//         ... read.Event.row: rowSize bytes inflated into rowBuffer
+//             (the filter type first); the caller sets the next rowSize
+//     }
+//
+// The reader does not undo the filters or know the interlaced passes:
+// the caller lays out the rows (std.png.rows has the functions), because
+// libpng's API lets the application decide how passes are delivered. It
+// inflates exactly rowSize bytes for each row, and treats the stream as
+// complete once the caller sets imageComplete.
+//
+// Messages are formatted as libpng formats them: a chunk's own messages
+// start with its name ("tRNS: invalid"), bytes that are not letters as
+// "[XX]". Benign errors are warnings unless benignErrors is false.
+//
+// Arithmetic is done in 64-bit words and narrowed values are masked first.
+const zs = @import("../flate/stream.mlx")
+const flate = @import("../flate.mlx")
+const crc = @import("../crc.mlx")
+
+pub const Allocator = zs.Allocator
+
+// Chunk names as their four bytes read big-endian.
+pub const IHDR: usize = 0x49484452
+pub const PLTE: usize = 0x504c5445
+pub const IDAT: usize = 0x49444154
+pub const IEND: usize = 0x49454e44
+pub const bKGD: usize = 0x624b4744
+pub const cHRM: usize = 0x6348524d
+pub const eXIf: usize = 0x65584966
+pub const gAMA: usize = 0x67414d41
+pub const hIST: usize = 0x68495354
+pub const iCCP: usize = 0x69434350
+pub const iTXt: usize = 0x69545874
+pub const oFFs: usize = 0x6f464673
+pub const pCAL: usize = 0x7043414c
+pub const pHYs: usize = 0x70485973
+pub const sBIT: usize = 0x73424954
+pub const sCAL: usize = 0x7343414c
+pub const sPLT: usize = 0x73504c54
+pub const sRGB: usize = 0x73524742
+pub const tEXt: usize = 0x74455874
+pub const tIME: usize = 0x74494d45
+pub const tRNS: usize = 0x74524e53
+pub const zTXt: usize = 0x7a545874
+// APNG's (read as unknown chunks unless `apng` is set).
+pub const acTL: usize = 0x6163544c
+pub const fcTL: usize = 0x6663544c
+pub const fdAT: usize = 0x66644154
+
+// The colour types and their bits.
+pub const COLOR_MASK_PALETTE: usize = 1
+pub const COLOR_MASK_COLOR: usize = 2
+pub const COLOR_MASK_ALPHA: usize = 4
+pub const COLOR_TYPE_GRAY: usize = 0
+pub const COLOR_TYPE_PALETTE: usize = 3
+pub const COLOR_TYPE_RGB: usize = 2
+pub const COLOR_TYPE_RGB_ALPHA: usize = 6
+pub const COLOR_TYPE_GRAY_ALPHA: usize = 4
+
+// What the info has (libpng's PNG_INFO_ bits).
+pub const INFO_gAMA: usize = 0x0001
+pub const INFO_sBIT: usize = 0x0002
+pub const INFO_cHRM: usize = 0x0004
+pub const INFO_PLTE: usize = 0x0008
+pub const INFO_tRNS: usize = 0x0010
+pub const INFO_bKGD: usize = 0x0020
+pub const INFO_hIST: usize = 0x0040
+pub const INFO_pHYs: usize = 0x0080
+pub const INFO_oFFs: usize = 0x0100
+pub const INFO_tIME: usize = 0x0200
+pub const INFO_pCAL: usize = 0x0400
+pub const INFO_sRGB: usize = 0x0800
+pub const INFO_iCCP: usize = 0x1000
+pub const INFO_sPLT: usize = 0x2000
+pub const INFO_sCAL: usize = 0x4000
+pub const INFO_IDAT: usize = 0x8000
+pub const INFO_eXIf: usize = 0x10000
+
+// The colour space's state (libpng's PNG_COLORSPACE_ bits).
+pub const CS_HAVE_GAMMA: usize = 0x0001
+pub const CS_HAVE_ENDPOINTS: usize = 0x0002
+pub const CS_HAVE_INTENT: usize = 0x0004
+pub const CS_FROM_gAMA: usize = 0x0008
+pub const CS_FROM_cHRM: usize = 0x0010
+pub const CS_FROM_sRGB: usize = 0x0020
+pub const CS_ENDPOINTS_MATCH_sRGB: usize = 0x0040
+pub const CS_MATCHES_sRGB: usize = 0x0080
+pub const CS_INVALID: usize = 0x8000
+
+// Where the reader is in the file (libpng's mode bits).
+pub const HAVE_IHDR: usize = 0x01
+pub const HAVE_PLTE: usize = 0x02
+pub const HAVE_IDAT: usize = 0x04
+pub const AFTER_IDAT: usize = 0x08
+pub const HAVE_IEND: usize = 0x10
+pub const HAVE_CHUNK_HEADER: usize = 0x100
+pub const HAVE_CHUNK_AFTER_IDAT: usize = 0x2000
+
+// What to do about a chunk's bad CRC (libpng's PNG_FLAG_CRC_ bits; the C
+// API's png_set_crc_action sets them). None set: an error for a critical
+// chunk, a warning for an ancillary one, whose data is then dropped.
+pub const CRC_ANCILLARY_USE: usize = 0x0100
+pub const CRC_ANCILLARY_NOWARN: usize = 0x0200
+pub const CRC_CRITICAL_USE: usize = 0x0400
+pub const CRC_CRITICAL_IGNORE: usize = 0x0800
+pub const CRC_ANCILLARY_MASK: usize = 0x0300
+pub const CRC_CRITICAL_MASK: usize = 0x0c00
+
+// How a chunk is kept (png_set_keep_unknown_chunks).
+pub const HANDLE_CHUNK_AS_DEFAULT: u32 = 0
+pub const HANDLE_CHUNK_NEVER: u32 = 1
+pub const HANDLE_CHUNK_IF_SAFE: u32 = 2
+pub const HANDLE_CHUNK_ALWAYS: u32 = 3
+
+// The largest chunk the reader holds without a warning (libpng's
+// PNG_USER_CHUNK_MALLOC_MAX), and the largest 31-bit value.
+pub const CHUNK_MALLOC_MAX: usize = 8000000
+pub const UINT_31_MAX: usize = 0x7fffffff
+
+// Gamma values are fixed-point, 100000 for 1.0.
+pub const FP_1: i64 = 100000
+pub const GAMMA_sRGB_INVERSE: i64 = 45455
+
+const PROCESS_SIGNATURE: u32 = 0
+const PROCESS_CHUNK: u32 = 1
+const PROCESS_IDAT: u32 = 2
+const PROCESS_DONE: u32 = 6
+const PROCESS_FAILED: u32 = 8
+
+pub const Event = enum(u8) {
+    // Everything given was taken: give more.
+    more,
+    // The chunks before the image data were read, and the first IDAT's
+    // header: the info is complete.
+    info,
+    // rowSize bytes of image data are in rowBuffer.
+    row,
+    // A chunk to be handled as unknown is in chunkData (chunkLength
+    // bytes, chunkName, chunkKeep its keep value), its CRC checked.
+    unknown,
+    // A warning: message.
+    warning,
+    // A fatal error: message. The reader takes nothing more.
+    failed,
+    // IEND was read.
+    end
+}
+
+// What the file says (libpng's png_info, the fields read from chunks).
+pub const Info = struct {
+    width: usize
+    height: usize
+    bitDepth: usize
+    colorType: usize
+    compression: usize
+    filter: usize
+    interlace: usize
+    channels: usize
+    pixelDepth: usize
+    rowBytes: usize
+    valid: usize
+    // PLTE: numPalette entries of three bytes.
+    palette: [768]u8
+    numPalette: usize
+    // tRNS: an alpha for each of numTrans palette entries, or one colour
+    // (of the image's depth) that is transparent.
+    transAlpha: [256]u8
+    numTrans: usize
+    transRed: usize
+    transGreen: usize
+    transBlue: usize
+    transGray: usize
+    // The colour space: gAMA, sRGB, cHRM and iCCP together, as libpng
+    // keeps them (an invalid one drops them all).
+    colorspace: usize
+    gamma: i64
+    intent: usize
+    // cHRM: white x, y, red x, y, green x, y, blue x, y.
+    endpoints: [8]i64
+    // sBIT: red, green, blue, gray, alpha.
+    sigBit: [5]u8
+    // bKGD: index, red, green, blue, gray.
+    background: [5]usize
+    // iCCP: the profile's name (NUL-terminated) and the profile itself.
+    iccpName: [81]u8
+    iccpProfile: usize
+    iccpLength: usize
+    // pHYs.
+    xPixelsPerUnit: usize
+    yPixelsPerUnit: usize
+    physUnit: usize
+    // The allocator iccpProfile came from.
+    allocator: Allocator
+}
+
+const QUEUE: usize = 8
+const MESSAGE: usize = 200
+
+pub const Reader = struct {
+    allocator: Allocator
+    info: *Info
+    // The input of the last give(): where, how much, how much is taken.
+    input: usize
+    inputLength: usize
+    inputAt: usize
+    process: u32
+    mode: usize
+    // The settings (the C API's png_set_crc_action, png_set_benign_errors,
+    // png_set_keep_unknown_chunks, png_set_option).
+    crcFlags: usize
+    benignErrors: bool
+    chunkMallocMax: usize
+    // How many more text chunks are read (libpng's user_chunk_cache_max).
+    chunkCacheMax: usize
+    unknownDefault: u32
+    // (name << 8 | keep) of each chunk with a keep value.
+    keepList: [64]u64
+    keepCount: usize
+    maximumWindow: bool
+    ignoreAdler: bool
+    // The signature's bytes so far.
+    signature: [8]u8
+    signatureBytes: usize
+    // The chunk read: its header's bytes so far, name, length, CRC.
+    header: [8]u8
+    headerBytes: usize
+    chunkName: usize
+    chunkLength: usize
+    crcValue: u64
+    // A whole chunk (its data and CRC) gathered before it is handled.
+    chunkData: usize
+    chunkCapacity: usize
+    chunkBytes: usize
+    chunkKeep: u32
+    // The image data: what is left of the IDAT chunk, the inflater, the
+    // row being filled.
+    idatSize: usize
+    inflater: flate.Inflater
+    inflaterReady: bool
+    streamStarted: bool
+    streamEnded: bool
+    // The CRC bytes of an IDAT chunk so far.
+    crcBytes: [4]u8
+    crcHave: usize
+    // Set by the caller: the bytes of the next row (with its filter
+    // byte), where they go (rowBuffer, at least rowSize bytes), and
+    // whether all rows were read.
+    rowSize: usize
+    rowBuffer: usize
+    rowFill: usize
+    imageComplete: bool
+    // Whether the info event was given.
+    infoGiven: bool
+    // The events waiting: kinds and messages.
+    queued: [8]u8
+    queueHead: usize
+    queueCount: usize
+    messages: [1600]u8
+    message: usize
+}
+
+// ---------------------------------------------------------------------------
+// Bytes
+
+inline fn get8(address: usize) -> usize { return @intCast(usize, zs.get8(address)) }
+inline fn put8(address: usize, value: usize) -> void { zs.put8(address, value) }
+
+pub fn read32(address: usize) -> usize {
+    return (get8(address) << 24) | (get8(address + 1) << 16) | (get8(address + 2) << 8) | get8(address + 3)
+}
+
+pub fn read16(address: usize) -> usize {
+    return (get8(address) << 8) | get8(address + 1)
+}
+
+fn infoAddress(r: *Reader) -> usize { return @intFromPtr(r.*.info) }
+
+// ---------------------------------------------------------------------------
+// Events and messages
+
+// The text of event slot `slot`.
+fn slotText(r: *Reader, slot: usize) -> usize {
+    return @intFromPtr(&r.*.messages) + slot * MESSAGE
+}
+
+// Queues an event of `kind` with the text of `prefix` (a chunk's name,
+// when `named`) and `text`.
+fn queue(r: *Reader, kind: Event, named: bool, text: []const u8) -> void {
+    if r.*.queueCount >= QUEUE { return }
+    const slot = (r.*.queueHead + r.*.queueCount) % QUEUE
+    r.*.queued[slot] = @intFromEnum(kind)
+    r.*.queueCount += 1
+    const target = slotText(r, slot)
+    var at: usize = 0
+    if named && r.*.chunkName != 0 {
+        var shift: usize = 24
+        while true {
+            const c = (r.*.chunkName >> shift) & 255
+            if c < 65 || c > 122 || (c > 90 && c < 97) {
+                put8(target + at, 91)
+                put8(target + at + 1, hexDigit(c >> 4))
+                put8(target + at + 2, hexDigit(c & 15))
+                put8(target + at + 3, 93)
+                at += 4
+            } else {
+                put8(target + at, c)
+                at += 1
+            }
+            if shift == 0 { break }
+            shift -= 8
+        }
+        put8(target + at, 58)
+        put8(target + at + 1, 32)
+        at += 2
+    }
+    var index: usize = 0
+    while index < text.length && at < MESSAGE - 1 {
+        put8(target + at, @intCast(usize, text[index]))
+        at += 1
+        index += 1
+    }
+    put8(target + at, 0)
+    if kind == Event.failed { r.*.process = PROCESS_FAILED }
+}
+
+fn hexDigit(value: usize) -> usize {
+    if value < 10 { return 48 + value }
+    return 55 + value
+}
+
+// libpng's png_warning, png_chunk_warning, png_error, png_chunk_error,
+// and the benign errors (warnings unless benignErrors is false).
+fn warning(r: *Reader, text: []const u8) -> void { queue(r, Event.warning, false, text) }
+fn chunkWarning(r: *Reader, text: []const u8) -> void { queue(r, Event.warning, true, text) }
+fn fail(r: *Reader, text: []const u8) -> void { queue(r, Event.failed, false, text) }
+fn chunkError(r: *Reader, text: []const u8) -> void { queue(r, Event.failed, true, text) }
+
+fn chunkBenign(r: *Reader, text: []const u8) -> void {
+    if r.*.benignErrors { chunkWarning(r, text) } else { chunkError(r, text) }
+}
+
+fn benign(r: *Reader, text: []const u8) -> void {
+    if r.*.chunkName != 0 { chunkBenign(r, text) } else if r.*.benignErrors { warning(r, text) } else { fail(r, text) }
+}
+
+// png_chunk_report: a warning, or a benign error.
+fn report(r: *Reader, text: []const u8, isError: bool) -> void {
+    if isError { chunkBenign(r, text) } else { chunkWarning(r, text) }
+}
+
+fn failed(r: *Reader) -> bool { return r.*.process == PROCESS_FAILED }
+
+// ---------------------------------------------------------------------------
+// Setting up
+
+pub fn init(r: *Reader, info: *Info, allocator: Allocator) -> void {
+    zs.zero(@intFromPtr(r), @sizeOf(Reader))
+    zs.zero(@intFromPtr(info), @sizeOf(Info))
+    r.*.allocator = allocator
+    r.*.info = info
+    info.*.allocator = allocator
+    r.*.benignErrors = true
+    r.*.chunkMallocMax = CHUNK_MALLOC_MAX
+    r.*.chunkCacheMax = 1000
+    r.*.process = PROCESS_SIGNATURE
+}
+
+// Gives back the reader's memory (and the info's profile).
+pub fn deinit(r: *Reader) -> void {
+    if r.*.chunkCapacity != 0 { r.*.allocator.free(zs.bytes(r.*.chunkData), r.*.chunkCapacity, 16) }
+    r.*.chunkCapacity = 0
+    if r.*.inflaterReady { flate.inflaterEnd(&r.*.inflater) }
+    r.*.inflaterReady = false
+    freeProfile(r.*.info)
+}
+
+pub fn freeProfile(info: *Info) -> void {
+    if info.*.iccpLength != 0 && info.*.iccpProfile != 0 { info.*.allocator.free(zs.bytes(info.*.iccpProfile), info.*.iccpLength, 16) }
+    info.*.iccpProfile = 0
+    info.*.iccpLength = 0
+}
+
+// The signature bytes the caller checked itself (png_set_sig_bytes).
+pub fn setSignatureBytes(r: *Reader, count: usize) -> void {
+    var bytes = count
+    if bytes > 8 { bytes = 8 }
+    const expected = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }
+    var index: usize = 0
+    while index < bytes {
+        r.*.signature[index] = expected[index]
+        index += 1
+    }
+    r.*.signatureBytes = bytes
+    if bytes >= 8 { r.*.process = PROCESS_CHUNK }
+}
+
+// The keep value of a chunk (png_chunk_unknown_handling): its own, or 0.
+pub fn keepOf(r: *Reader, name: usize) -> u32 {
+    var index = r.*.keepCount
+    while index > 0 {
+        index -= 1
+        const entry = r.*.keepList[index]
+        if @intCast(usize, entry >> 8) == name { return @intCast(u32, entry & 255) }
+    }
+    return HANDLE_CHUNK_AS_DEFAULT
+}
+
+// Sets the keep value of a chunk name (one of png_set_keep_unknown_chunks'
+// names); HANDLE_CHUNK_AS_DEFAULT takes it off the list.
+pub fn setKeep(r: *Reader, name: usize, keep: u32) -> void {
+    var index: usize = 0
+    while index < r.*.keepCount {
+        if @intCast(usize, r.*.keepList[index] >> 8) == name {
+            if keep == HANDLE_CHUNK_AS_DEFAULT {
+                var rest = index
+                while rest + 1 < r.*.keepCount {
+                    r.*.keepList[rest] = r.*.keepList[rest + 1]
+                    rest += 1
+                }
+                r.*.keepCount -= 1
+                return
+            }
+            r.*.keepList[index] = (@intCast(u64, name) << 8) | @intCast(u64, keep)
+            return
+        }
+        index += 1
+    }
+    if keep == HANDLE_CHUNK_AS_DEFAULT || r.*.keepCount >= 64 { return }
+    r.*.keepList[r.*.keepCount] = (@intCast(u64, name) << 8) | @intCast(u64, keep)
+    r.*.keepCount += 1
+}
+
+// The next part of the file: LENGTH bytes at DATA, which stay where they
+// are until next() says `more` (or the caller stops early: remaining()
+// tells how many were not taken).
+pub fn give(r: *Reader, data: usize, length: usize) -> void {
+    r.*.input = data
+    r.*.inputLength = length
+    r.*.inputAt = 0
+}
+
+// The bytes of the last give() not taken yet.
+pub fn remaining(r: *Reader) -> usize { return r.*.inputLength - r.*.inputAt }
+
+// The text of the last warning or error (NUL-terminated).
+pub fn messageText(r: *Reader) -> usize { return r.*.message }
+
+inline fn available(r: *Reader) -> usize { return r.*.inputLength - r.*.inputAt }
+
+// ---------------------------------------------------------------------------
+// The events
+
+pub fn next(r: *Reader) -> Event {
+    while true {
+        if r.*.queueCount > 0 {
+            const slot = r.*.queueHead
+            r.*.queueHead = (slot + 1) % QUEUE
+            r.*.queueCount -= 1
+            r.*.message = slotText(r, slot)
+            const kind = r.*.queued[slot]
+            if kind == @intFromEnum(Event.warning) { return Event.warning }
+            if kind == @intFromEnum(Event.failed) { return Event.failed }
+            if kind == @intFromEnum(Event.info) { return Event.info }
+            if kind == @intFromEnum(Event.unknown) { return Event.unknown }
+            if kind == @intFromEnum(Event.end) { return Event.end }
+            continue
+        }
+        if r.*.process == PROCESS_FAILED {
+            r.*.inputAt = r.*.inputLength
+            return Event.failed
+        }
+        if r.*.process == PROCESS_DONE {
+            // libpng drops whatever follows IEND.
+            r.*.inputAt = r.*.inputLength
+            return Event.more
+        }
+        if available(r) == 0 && r.*.process != PROCESS_IDAT { return Event.more }
+        if r.*.process == PROCESS_SIGNATURE {
+            readSignature(r)
+        } else if r.*.process == PROCESS_CHUNK {
+            // (Waiting for more of a chunk, the events it raised so far go
+            // first.)
+            if !readChunk(r) && r.*.queueCount == 0 { return Event.more }
+        } else {
+            const step = readImageData(r)
+            if step == 1 { return Event.row }
+            if step == 2 && r.*.queueCount == 0 { return Event.more }
+        }
+    }
+    return Event.more
+}
+
+fn queueEvent(r: *Reader, kind: Event) -> void {
+    if r.*.queueCount >= QUEUE { return }
+    const slot = (r.*.queueHead + r.*.queueCount) % QUEUE
+    r.*.queued[slot] = @intFromEnum(kind)
+    put8(slotText(r, slot), 0)
+    r.*.queueCount += 1
+}
+
+fn readSignature(r: *Reader) -> void {
+    const checked = r.*.signatureBytes
+    var count = 8 - checked
+    if count > available(r) { count = available(r) }
+    var index: usize = 0
+    while index < count {
+        r.*.signature[checked + index] = zs.get8(r.*.input + r.*.inputAt + index)
+        index += 1
+    }
+    r.*.inputAt += count
+    r.*.signatureBytes = checked + count
+    // png_sig_cmp over the bytes just read.
+    const expected = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }
+    var bad = false
+    index = checked
+    while index < checked + count {
+        if r.*.signature[index] != expected[index] { bad = true }
+        index += 1
+    }
+    if bad {
+        var early = false
+        if checked < 4 {
+            index = checked
+            while index < checked + count && index < 4 {
+                if r.*.signature[index] != expected[index] { early = true }
+                index += 1
+            }
+        }
+        if early { fail(r, "Not a PNG file") } else { fail(r, "PNG file corrupted by ASCII conversion") }
+        return
+    }
+    if r.*.signatureBytes >= 8 { r.*.process = PROCESS_CHUNK }
+}
+
+// Takes up to COUNT bytes of input into the header buffer; true when it
+// holds 8.
+fn gatherHeader(r: *Reader) -> bool {
+    while r.*.headerBytes < 8 && available(r) > 0 {
+        r.*.header[r.*.headerBytes] = zs.get8(r.*.input + r.*.inputAt)
+        r.*.headerBytes += 1
+        r.*.inputAt += 1
+    }
+    return r.*.headerBytes == 8
+}
+
+// The chunk header gathered: its length (png_get_uint_31), name, the CRC
+// begun, the checks of name and length.
+fn takeHeader(r: *Reader) -> void {
+    const base = @intFromPtr(&r.*.header)
+    const length = read32(base)
+    r.*.headerBytes = 0
+    r.*.chunkName = read32(base + 4)
+    r.*.crcValue = crc.crc32Update(0, base + 4, 4)
+    r.*.mode |= HAVE_CHUNK_HEADER
+    if length > UINT_31_MAX {
+        fail(r, "PNG unsigned integer out of range")
+        return
+    }
+    r.*.chunkLength = length
+    // png_check_chunk_name.
+    var shift: usize = 0
+    while shift < 32 {
+        const c = (r.*.chunkName >> shift) & 255
+        if c < 65 || c > 122 || (c > 90 && c < 97) {
+            chunkError(r, "invalid chunk type")
+            return
+        }
+        shift += 8
+    }
+    // png_check_chunk_length.
+    var limit = UINT_31_MAX
+    if r.*.chunkMallocMax > 0 && r.*.chunkMallocMax < limit { limit = r.*.chunkMallocMax }
+    if r.*.chunkName == IDAT {
+        const info = r.*.info
+        var rowFactor = @intCast(usize, info.*.width) + 1
+        if info.*.interlace != 0 { rowFactor += 6 }
+        var idatLimit = UINT_31_MAX
+        if @intCast(usize, info.*.height) <= 0xffffffff / rowFactor { idatLimit = @intCast(usize, info.*.height) * rowFactor }
+        if rowFactor > 32566 { rowFactor = 32566 }
+        idatLimit += 6 + 5 * (idatLimit / rowFactor + 1)
+        if idatLimit > UINT_31_MAX { idatLimit = UINT_31_MAX }
+        if limit < idatLimit { limit = idatLimit }
+    }
+    if length > limit { benign(r, "chunk data is too large") }
+}
+
+// Gathers the whole chunk (data and CRC); false while more input is
+// needed.
+fn gatherChunk(r: *Reader) -> bool {
+    const need = r.*.chunkLength + 4
+    if r.*.chunkCapacity < need {
+        var capacity = r.*.chunkCapacity * 2
+        if capacity < need { capacity = need }
+        if capacity < 256 { capacity = 256 }
+        const memory = r.*.allocator.alloc(capacity, 16)
+        if memory == null {
+            fail(r, "Insufficient memory for save_buffer")
+            return false
+        }
+        const address = @intFromPtr(memory.?)
+        if r.*.chunkBytes > 0 { zs.copy(address, r.*.chunkData, r.*.chunkBytes) }
+        if r.*.chunkCapacity != 0 { r.*.allocator.free(zs.bytes(r.*.chunkData), r.*.chunkCapacity, 16) }
+        r.*.chunkData = address
+        r.*.chunkCapacity = capacity
+    }
+    var count = need - r.*.chunkBytes
+    if count > available(r) { count = available(r) }
+    zs.copy(r.*.chunkData + r.*.chunkBytes, r.*.input + r.*.inputAt, count)
+    r.*.chunkBytes += count
+    r.*.inputAt += count
+    if r.*.chunkBytes < need { return false }
+    r.*.chunkBytes = 0
+    return true
+}
+
+fn isAncillary(name: usize) -> bool { return (name >> 29) & 1 != 0 }
+
+// png_crc_error over a gathered chunk: whether its stored CRC differs
+// (unless the CRC is not to be checked at all).
+fn crcMismatch(r: *Reader) -> bool {
+    if isAncillary(r.*.chunkName) {
+        if r.*.crcFlags & CRC_ANCILLARY_MASK == (CRC_ANCILLARY_USE | CRC_ANCILLARY_NOWARN) { return false }
+    } else {
+        if r.*.crcFlags & CRC_CRITICAL_IGNORE != 0 { return false }
+    }
+    const computed = crc.crc32Update(r.*.crcValue, r.*.chunkData, r.*.chunkLength) & 0xffffffff
+    return computed != @intCast(u64, read32(r.*.chunkData + r.*.chunkLength))
+}
+
+// png_crc_finish: true when the CRC was bad (after the warning or error).
+fn crcFinish(r: *Reader) -> bool {
+    if !crcMismatch(r) { return false }
+    var warn = false
+    if isAncillary(r.*.chunkName) {
+        warn = r.*.crcFlags & CRC_ANCILLARY_NOWARN == 0
+    } else {
+        warn = r.*.crcFlags & CRC_CRITICAL_USE != 0
+    }
+    if warn { chunkWarning(r, "CRC error") } else { chunkError(r, "CRC error") }
+    return true
+}
+
+// One step of the chunk mode (png_push_read_chunk); false when it needs
+// more input.
+fn readChunk(r: *Reader) -> bool {
+    if r.*.mode & HAVE_CHUNK_HEADER == 0 {
+        if !gatherHeader(r) { return false }
+        takeHeader(r)
+        if failed(r) { return true }
+    }
+    const name = r.*.chunkName
+    if name == IDAT {
+        if r.*.mode & AFTER_IDAT != 0 { r.*.mode |= HAVE_CHUNK_AFTER_IDAT }
+        if r.*.mode & HAVE_IHDR == 0 {
+            fail(r, "Missing IHDR before IDAT")
+            return true
+        }
+        if r.*.info.*.colorType == 3 && r.*.mode & HAVE_PLTE == 0 {
+            fail(r, "Missing PLTE before IDAT")
+            return true
+        }
+        r.*.process = PROCESS_IDAT
+        if r.*.mode & HAVE_IDAT != 0 && r.*.mode & HAVE_CHUNK_AFTER_IDAT == 0 && r.*.chunkLength == 0 { return true }
+        r.*.mode |= HAVE_IDAT
+        if r.*.mode & AFTER_IDAT != 0 { benign(r, "Too many IDATs found") }
+        r.*.idatSize = r.*.chunkLength
+        r.*.crcHave = 0
+        if !r.*.infoGiven {
+            r.*.infoGiven = true
+            queueEvent(r, Event.info)
+        }
+        return true
+    }
+    if name == IHDR {
+        if r.*.chunkLength != 13 {
+            fail(r, "Invalid IHDR length")
+            return true
+        }
+        if !gatherChunk(r) { return false }
+        handleIHDR(r)
+    } else if name == IEND {
+        if !gatherChunk(r) { return false }
+        handleIEND(r)
+        if failed(r) { return true }
+        r.*.process = PROCESS_DONE
+        queueEvent(r, Event.end)
+    } else if keepOf(r, name) != 0 {
+        if !gatherChunk(r) { return false }
+        unknownChunk(r, keepOf(r, name))
+        if name == PLTE { r.*.mode |= HAVE_PLTE }
+    } else if name == PLTE {
+        if !gatherChunk(r) { return false }
+        handlePLTE(r)
+    } else if name == gAMA {
+        if !gatherChunk(r) { return false }
+        handleGAMA(r)
+    } else if name == sBIT {
+        if !gatherChunk(r) { return false }
+        handleSBIT(r)
+    } else if name == cHRM {
+        if !gatherChunk(r) { return false }
+        handleCHRM(r)
+    } else if name == sRGB {
+        if !gatherChunk(r) { return false }
+        handleSRGB(r)
+    } else if name == iCCP {
+        if !gatherChunk(r) { return false }
+        handleICCP(r)
+    } else if name == tRNS {
+        if !gatherChunk(r) { return false }
+        handleTRNS(r)
+    } else if name == bKGD {
+        if !gatherChunk(r) { return false }
+        handleBKGD(r)
+    } else if name == pHYs {
+        if !gatherChunk(r) { return false }
+        handlePHYS(r)
+    } else if name == tEXt || name == zTXt || name == iTXt {
+        if !gatherChunk(r) { return false }
+        handleText(r)
+    } else if name == tIME {
+        if !gatherChunk(r) { return false }
+        handleTIME(r)
+    } else if name == eXIf {
+        if !gatherChunk(r) { return false }
+        handleEXIF(r)
+    } else if name == hIST {
+        if !gatherChunk(r) { return false }
+        handleHIST(r)
+    } else if name == oFFs {
+        if !gatherChunk(r) { return false }
+        handleOther(r, INFO_oFFs, 9, 0)
+    } else if name == pCAL {
+        if !gatherChunk(r) { return false }
+        handlePCAL(r)
+    } else if name == sCAL {
+        if !gatherChunk(r) { return false }
+        handleOther(r, INFO_sCAL, 0, 4)
+    } else if name == sPLT {
+        if !gatherChunk(r) { return false }
+        handleSPLT(r)
+    } else {
+        if !gatherChunk(r) { return false }
+        unknownChunk(r, HANDLE_CHUNK_AS_DEFAULT)
+    }
+    r.*.mode &= ~HAVE_CHUNK_HEADER
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The chunks libpng knows (png_handle_IHDR and the rest): checked as
+// libpng checks them, kept in the info.
+
+fn data(r: *Reader) -> usize { return r.*.chunkData }
+
+fn handleIHDR(r: *Reader) -> void {
+    if r.*.mode & HAVE_IHDR != 0 {
+        chunkError(r, "out of place")
+        return
+    }
+    r.*.mode |= HAVE_IHDR
+    _ = crcFinish(r)
+    if failed(r) { return }
+    const at = data(r)
+    const width = read32(at)
+    const height = read32(at + 4)
+    if width > UINT_31_MAX || height > UINT_31_MAX {
+        fail(r, "PNG unsigned integer out of range")
+        return
+    }
+    const depth = get8(at + 8)
+    const colorType = get8(at + 9)
+    const compression = get8(at + 10)
+    const filter = get8(at + 11)
+    const interlace = get8(at + 12)
+    // png_check_IHDR: each problem a warning, then one error.
+    var bad = false
+    if width == 0 {
+        warning(r, "Image width is zero in IHDR")
+        bad = true
+    }
+    if width > 1000000 {
+        warning(r, "Image width exceeds user limit in IHDR")
+        bad = true
+    }
+    if height == 0 {
+        warning(r, "Image height is zero in IHDR")
+        bad = true
+    }
+    if height > 1000000 {
+        warning(r, "Image height exceeds user limit in IHDR")
+        bad = true
+    }
+    if depth != 1 && depth != 2 && depth != 4 && depth != 8 && depth != 16 {
+        warning(r, "Invalid bit depth in IHDR")
+        bad = true
+    }
+    if colorType == 1 || colorType == 5 || colorType > 6 {
+        warning(r, "Invalid color type in IHDR")
+        bad = true
+    }
+    if (colorType == 3 && depth > 8) || ((colorType == 2 || colorType == 4 || colorType == 6) && depth < 8) {
+        warning(r, "Invalid color type/bit depth combination in IHDR")
+        bad = true
+    }
+    if interlace >= 2 {
+        warning(r, "Unknown interlace method in IHDR")
+        bad = true
+    }
+    if compression != 0 {
+        warning(r, "Unknown compression method in IHDR")
+        bad = true
+    }
+    if filter != 0 {
+        warning(r, "Unknown filter method in IHDR")
+        bad = true
+    }
+    if bad {
+        fail(r, "Invalid IHDR data")
+        return
+    }
+    const info = r.*.info
+    info.*.width = width
+    info.*.height = height
+    info.*.bitDepth = depth
+    info.*.colorType = colorType
+    info.*.compression = compression
+    info.*.filter = filter
+    info.*.interlace = interlace
+    info.*.channels = channelsOf(colorType)
+    info.*.pixelDepth = info.*.channels * depth
+    info.*.rowBytes = rowBytes(info.*.pixelDepth, width)
+}
+
+pub fn channelsOf(colorType: usize) -> usize {
+    if colorType == 2 { return 3 }
+    if colorType == 4 { return 2 }
+    if colorType == 6 { return 4 }
+    return 1
+}
+
+// PNG_ROWBYTES: the bytes of WIDTH pixels of DEPTH bits.
+pub fn rowBytes(depth: usize, width: usize) -> usize {
+    if depth >= 8 { return width * (depth >> 3) }
+    return (width * depth + 7) >> 3
+}
+
+fn handleIEND(r: *Reader) -> void {
+    if r.*.mode & HAVE_IHDR == 0 || r.*.mode & HAVE_IDAT == 0 {
+        chunkError(r, "out of place")
+        return
+    }
+    r.*.mode |= AFTER_IDAT | HAVE_IEND
+    _ = crcFinish(r)
+    if failed(r) { return }
+    if r.*.chunkLength != 0 { chunkBenign(r, "invalid") }
+}
+
+fn handlePLTE(r: *Reader) -> void {
+    const info = r.*.info
+    const length = r.*.chunkLength
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_PLTE != 0 {
+        chunkError(r, "duplicate")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    r.*.mode |= HAVE_PLTE
+    if info.*.colorType & COLOR_MASK_COLOR == 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "ignored in grayscale PNG")
+        return
+    }
+    if length > 768 || length % 3 != 0 {
+        _ = crcFinish(r)
+        if info.*.colorType != COLOR_TYPE_PALETTE { chunkBenign(r, "invalid") } else { chunkError(r, "invalid") }
+        return
+    }
+    var count = length / 3
+    var most: usize = 256
+    if info.*.colorType == COLOR_TYPE_PALETTE { most = @intCast(usize, 1) << info.*.bitDepth }
+    if count > most { count = most }
+    // (The CRC covers the whole chunk; libpng checks it once the entries
+    // it keeps are read.)
+    _ = crcFinish(r)
+    if failed(r) { return }
+    // png_set_PLTE: no entries is an error.
+    if count == 0 {
+        fail(r, "Invalid palette")
+        return
+    }
+    zs.zero(@intFromPtr(&info.*.palette), 768)
+    zs.copy(@intFromPtr(&info.*.palette), data(r), count * 3)
+    info.*.numPalette = count
+    info.*.valid |= INFO_PLTE
+    if info.*.numTrans > 0 || info.*.valid & INFO_tRNS != 0 {
+        info.*.numTrans = 0
+        chunkBenign(r, "tRNS must be after")
+    }
+    if info.*.valid & INFO_hIST != 0 { chunkBenign(r, "hIST must be after") }
+    if info.*.valid & INFO_bKGD != 0 { chunkBenign(r, "bKGD must be after") }
+}
+
+// The checks the colour space chunks share: after IHDR, before PLTE and
+// IDAT, of LENGTH bytes. False when the chunk is to be dropped.
+fn colorspaceChunk(r: *Reader, length: usize) -> bool {
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return false
+    }
+    if r.*.mode & (HAVE_IDAT | HAVE_PLTE) != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return false
+    }
+    if length != 0 && r.*.chunkLength != length {
+        _ = crcFinish(r)
+        chunkBenign(r, "invalid")
+        return false
+    }
+    return true
+}
+
+// png_colorspace_sync_info: what the colour space makes valid.
+fn syncColorspace(r: *Reader) -> void {
+    const info = r.*.info
+    if info.*.colorspace & CS_INVALID != 0 {
+        info.*.valid &= ~(INFO_gAMA | INFO_cHRM | INFO_sRGB | INFO_iCCP)
+        freeProfile(info)
+        return
+    }
+    if info.*.colorspace & CS_MATCHES_sRGB != 0 { info.*.valid |= INFO_sRGB } else { info.*.valid &= ~INFO_sRGB }
+    if info.*.colorspace & CS_HAVE_ENDPOINTS != 0 { info.*.valid |= INFO_cHRM } else { info.*.valid &= ~INFO_cHRM }
+    if info.*.colorspace & CS_HAVE_GAMMA != 0 { info.*.valid |= INFO_gAMA } else { info.*.valid &= ~INFO_gAMA }
+}
+
+// png_gamma_significant: whether a fixed-point gamma is not about 1.
+pub fn gammaSignificant(value: i64) -> bool {
+    return value < FP_1 - 5000 || value > FP_1 + 5000
+}
+
+// png_muldiv: a * times / divisor rounded, false on overflow (in floating
+// point, as libpng builds it).
+pub fn mulDiv(a: i64, times: i64, divisor: i64, result: *i64) -> bool {
+    if divisor == 0 { return false }
+    if a == 0 || times == 0 {
+        result.* = 0
+        return true
+    }
+    var value: f64 = @floatFromInt(f64, a)
+    value = value * @floatFromInt(f64, times)
+    value = value / @floatFromInt(f64, divisor)
+    value = @floor(value + 0.5)
+    if value <= 2147483647.0 && value >= -2147483648.0 {
+        result.* = @intFromFloat(i64, value)
+        return true
+    }
+    return false
+}
+
+// png_colorspace_check_gamma: a new gamma against the one there is.
+fn checkGamma(r: *Reader, value: i64, from: usize) -> bool {
+    const info = r.*.info
+    if info.*.colorspace & CS_HAVE_GAMMA != 0 {
+        var ratio: i64 = 0
+        if !mulDiv(info.*.gamma, FP_1, value, &ratio) || gammaSignificant(ratio) {
+            if info.*.colorspace & CS_FROM_sRGB != 0 || from == 2 {
+                report(r, "gamma value does not match sRGB", true)
+                return from == 2
+            }
+            report(r, "gamma value does not match libpng estimate", false)
+            return from == 1
+        }
+    }
+    return true
+}
+
+fn handleGAMA(r: *Reader) -> void {
+    if !colorspaceChunk(r, 4) { return }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    const info = r.*.info
+    const raw = read32(data(r))
+    // png_get_fixed_point: past 31 bits is an error value, then out of
+    // range below.
+    var value: i64 = -1
+    if raw <= UINT_31_MAX { value = @intCast(i64, raw) }
+    if value < 16 || value > 625000000 {
+        info.*.colorspace |= CS_INVALID
+        report(r, "gamma value out of range", false)
+    } else if info.*.colorspace & CS_FROM_gAMA != 0 {
+        info.*.colorspace |= CS_INVALID
+        report(r, "duplicate", false)
+    } else if info.*.colorspace & CS_INVALID == 0 {
+        if checkGamma(r, value, 1) {
+            info.*.gamma = value
+            info.*.colorspace |= CS_HAVE_GAMMA | CS_FROM_gAMA
+        }
+    }
+    syncColorspace(r)
+}
+
+fn handleSBIT(r: *Reader) -> void {
+    const info = r.*.info
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & (HAVE_IDAT | HAVE_PLTE) != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if info.*.valid & INFO_sBIT != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    var trueLength: usize = 3
+    var sampleDepth: usize = 8
+    if info.*.colorType != COLOR_TYPE_PALETTE {
+        trueLength = info.*.channels
+        sampleDepth = info.*.bitDepth
+    }
+    if r.*.chunkLength != trueLength || r.*.chunkLength > 4 {
+        chunkBenign(r, "invalid")
+        _ = crcFinish(r)
+        return
+    }
+    var values = [4]usize{ sampleDepth, sampleDepth, sampleDepth, sampleDepth }
+    var index: usize = 0
+    while index < trueLength {
+        values[index] = get8(data(r) + index)
+        index += 1
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    index = 0
+    while index < trueLength {
+        if values[index] == 0 || values[index] > sampleDepth {
+            chunkBenign(r, "invalid")
+            return
+        }
+        index += 1
+    }
+    if info.*.colorType & COLOR_MASK_COLOR != 0 {
+        info.*.sigBit[0] = @intCast(u8, values[0])
+        info.*.sigBit[1] = @intCast(u8, values[1])
+        info.*.sigBit[2] = @intCast(u8, values[2])
+        info.*.sigBit[4] = @intCast(u8, values[3])
+    } else {
+        info.*.sigBit[3] = @intCast(u8, values[0])
+        info.*.sigBit[0] = @intCast(u8, values[0])
+        info.*.sigBit[1] = @intCast(u8, values[0])
+        info.*.sigBit[2] = @intCast(u8, values[0])
+        info.*.sigBit[4] = @intCast(u8, values[1])
+    }
+    info.*.valid |= INFO_sBIT
+}
+
+// The chromaticities of sRGB (ITU-R BT.709): white, red, green, blue.
+fn sRGBEndpoint(index: usize) -> i64 {
+    const values = [8]i64{ 31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000 }
+    return values[index]
+}
+
+// png_colorspace_endpoints_match against the stored end points (or
+// sRGB's) within DELTA.
+fn endpointsMatch(info: *Info, xy: [*]const i64, againstSRGB: bool, delta: i64) -> bool {
+    var index: usize = 0
+    while index < 8 {
+        const other = if againstSRGB { sRGBEndpoint(index) } else { info.*.endpoints[index] }
+        const difference = xy[index] - other
+        if difference > delta || difference < -delta { return false }
+        index += 1
+    }
+    return true
+}
+
+fn handleCHRM(r: *Reader) -> void {
+    if !colorspaceChunk(r, 32) { return }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    const info = r.*.info
+    var xy: [8]i64 = undefined
+    var index: usize = 0
+    var invalid = false
+    while index < 8 {
+        const raw = read32(data(r) + index * 4)
+        if raw > UINT_31_MAX { invalid = true } else { xy[index] = @intCast(i64, raw) }
+        index += 1
+    }
+    if invalid {
+        chunkBenign(r, "invalid values")
+        return
+    }
+    if info.*.colorspace & CS_INVALID != 0 { return }
+    if info.*.colorspace & CS_FROM_cHRM != 0 {
+        info.*.colorspace |= CS_INVALID
+        syncColorspace(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    info.*.colorspace |= CS_FROM_cHRM
+    // png_XYZ_from_xy's range checks (white, red, green, blue).
+    const whitex = xy[0]
+    const whitey = xy[1]
+    var good = true
+    index = 2
+    while index < 8 {
+        if xy[index] < 0 || xy[index] > FP_1 || xy[index + 1] < 0 || xy[index + 1] > FP_1 - xy[index] { good = false }
+        index += 2
+    }
+    if whitex < 0 || whitex > FP_1 || whitey < 5 || whitey > FP_1 - whitex { good = false }
+    const points: [*]const i64 = unsafe { @ptrCast([*]const i64, &xy) }
+    if !good {
+        info.*.colorspace |= CS_INVALID
+        benign(r, "invalid chromaticities")
+    } else if info.*.colorspace & CS_HAVE_ENDPOINTS != 0 && !endpointsMatch(info, points, false, 100) {
+        info.*.colorspace |= CS_INVALID
+        benign(r, "inconsistent chromaticities")
+    } else {
+        index = 0
+        while index < 8 {
+            info.*.endpoints[index] = xy[index]
+            index += 1
+        }
+        info.*.colorspace |= CS_HAVE_ENDPOINTS
+        if endpointsMatch(info, points, true, 1000) {
+            info.*.colorspace |= CS_ENDPOINTS_MATCH_sRGB
+        } else {
+            info.*.colorspace &= ~(CS_ENDPOINTS_MATCH_sRGB | CS_MATCHES_sRGB)
+        }
+    }
+    syncColorspace(r)
+}
+
+// png_colorspace_set_sRGB: false when it was not set.
+fn setSRGB(r: *Reader, intent: usize) -> bool {
+    const info = r.*.info
+    if info.*.colorspace & CS_INVALID != 0 { return false }
+    if intent >= 4 {
+        profileError(r, "sRGB", intent, "invalid sRGB rendering intent", true)
+        return false
+    }
+    if info.*.colorspace & CS_HAVE_INTENT != 0 && info.*.intent != intent {
+        profileError(r, "sRGB", intent, "inconsistent rendering intents", true)
+        return false
+    }
+    if info.*.colorspace & CS_FROM_sRGB != 0 {
+        benign(r, "duplicate sRGB information ignored")
+        return false
+    }
+    if info.*.colorspace & CS_HAVE_ENDPOINTS != 0 {
+        var standard: [8]i64 = undefined
+        var index: usize = 0
+        while index < 8 {
+            standard[index] = sRGBEndpoint(index)
+            index += 1
+        }
+        const points: [*]const i64 = unsafe { @ptrCast([*]const i64, &standard) }
+        if !endpointsMatch(info, points, false, 100) { report(r, "cHRM chunk does not match sRGB", true) }
+    }
+    _ = checkGamma(r, GAMMA_sRGB_INVERSE, 2)
+    info.*.intent = intent
+    info.*.colorspace |= CS_HAVE_INTENT
+    var index: usize = 0
+    while index < 8 {
+        info.*.endpoints[index] = sRGBEndpoint(index)
+        index += 1
+    }
+    info.*.colorspace |= CS_HAVE_ENDPOINTS | CS_ENDPOINTS_MATCH_sRGB
+    info.*.gamma = GAMMA_sRGB_INVERSE
+    info.*.colorspace |= CS_HAVE_GAMMA | CS_MATCHES_sRGB | CS_FROM_sRGB
+    return true
+}
+
+fn handleSRGB(r: *Reader) -> void {
+    if !colorspaceChunk(r, 1) { return }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    const info = r.*.info
+    const intent = get8(data(r))
+    if info.*.colorspace & CS_INVALID != 0 { return }
+    if info.*.colorspace & CS_HAVE_INTENT != 0 {
+        info.*.colorspace |= CS_INVALID
+        syncColorspace(r)
+        chunkBenign(r, "too many profiles")
+        return
+    }
+    _ = setSRGB(r, intent)
+    syncColorspace(r)
+}
+
+// png_icc_profile_error: "profile 'NAME': VALUE: REASON", the value as a
+// tag name when it looks like one, else in hexadecimal; a benign error
+// that makes the colour space invalid (`invalidates`), or a warning.
+fn profileError(r: *Reader, name: []const u8, value: usize, reason: []const u8, invalidates: bool) -> void {
+    if invalidates { r.*.info.*.colorspace |= CS_INVALID }
+    var text: [200]u8 = undefined
+    var at: usize = 0
+    at = append(&text, at, "profile '")
+    var index: usize = 0
+    while index < name.length && index < 79 && name[index] != 0 {
+        text[at] = name[index]
+        at += 1
+        index += 1
+    }
+    at = append(&text, at, "': ")
+    if isSignature(value) {
+        text[at] = 39
+        index = 0
+        while index < 4 {
+            var c = (value >> (24 - index * 8)) & 255
+            if c < 32 || c > 126 { c = 63 }
+            text[at + 1 + index] = @intCast(u8, c)
+            index += 1
+        }
+        text[at + 5] = 39
+        text[at + 6] = 58
+        text[at + 7] = 32
+        at += 8
+    } else {
+        // png_format_number's hexadecimal: at least one digit.
+        var digits: [16]u8 = undefined
+        var count: usize = 0
+        var rest = value
+        while rest != 0 || count < 1 {
+            digits[count] = @intCast(u8, hexDigit(rest & 15))
+            rest = rest >> 4
+            count += 1
+        }
+        while count > 0 {
+            count -= 1
+            text[at] = digits[count]
+            at += 1
+        }
+        at = append(&text, at, "h: ")
+    }
+    index = 0
+    while index < reason.length && at < 199 {
+        text[at] = reason[index]
+        at += 1
+        index += 1
+    }
+    const view: [*]const u8 = unsafe { @ptrCast([*]const u8, &text) }
+    report(r, view[0..at], invalidates)
+}
+
+fn append(text: *[200]u8, at: usize, piece: []const u8) -> usize {
+    var index: usize = 0
+    var position = at
+    while index < piece.length && position < 199 {
+        text.*[position] = piece[index]
+        position += 1
+        index += 1
+    }
+    return position
+}
+
+fn isSignatureChar(c: usize) -> bool {
+    return c == 32 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn isSignature(value: usize) -> bool {
+    return isSignatureChar(value >> 24) && isSignatureChar((value >> 16) & 255) && isSignatureChar((value >> 8) & 255) && isSignatureChar(value & 255)
+}
+
+fn handleICCP(r: *Reader) -> void {
+    const info = r.*.info
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & (HAVE_IDAT | HAVE_PLTE) != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    const length = r.*.chunkLength
+    if length < 14 {
+        _ = crcFinish(r)
+        chunkBenign(r, "too short")
+        return
+    }
+    if info.*.colorspace & CS_INVALID != 0 {
+        _ = crcFinish(r)
+        return
+    }
+    var message: []const u8 = ""
+    var reported = false
+    if info.*.colorspace & CS_HAVE_INTENT != 0 {
+        message = "too many profiles"
+    } else {
+        // The keyword, its NUL, the compression method, the zlib stream.
+        var keywordLength: usize = 0
+        while keywordLength < 80 && keywordLength < length && get8(data(r) + keywordLength) != 0 { keywordLength += 1 }
+        var readLength: usize = 81
+        if readLength > length { readLength = length }
+        if length - readLength < 11 {
+            _ = crcFinish(r)
+            chunkBenign(r, "too short")
+            return
+        }
+        if keywordLength < 1 || keywordLength > 79 {
+            message = "bad keyword"
+        } else if keywordLength + 1 >= readLength || get8(data(r) + keywordLength + 1) != 0 {
+            message = "bad compression method"
+        } else {
+            const name: [*]const u8 = zs.bytes(data(r))
+            const keyword = name[0..keywordLength]
+            const stream = data(r) + keywordLength + 2
+            const streamLength = length - keywordLength - 2
+            // The profile's header first: its length, then the checks.
+            var header: [132]u8 = undefined
+            const headerAddress = @intFromPtr(&header)
+            const got = inflateSome(r, stream, streamLength, headerAddress, 132, true, &message)
+            if got >= 132 {
+                message = ""
+                const profileLength = read32(headerAddress)
+                if checkProfileHeader(r, keyword, profileLength, headerAddress) {
+                    const memory = r.*.allocator.alloc(profileLength, 16)
+                    if memory == null {
+                        message = "out of memory"
+                    } else {
+                        const profile = @intFromPtr(memory.?)
+                        var later: []const u8 = ""
+                        const whole = inflateSome(r, stream, streamLength, profile, profileLength, false, &later)
+                        if whole != profileLength {
+                            r.*.allocator.free(memory.?, profileLength, 16)
+                            message = later
+                        } else if !checkTagTable(r, keyword, profileLength, profile) {
+                            r.*.allocator.free(memory.?, profileLength, 16)
+                            reported = true
+                        } else {
+                            if crcFinish(r) {
+                                r.*.allocator.free(memory.?, profileLength, 16)
+                                return
+                            }
+                            if failed(r) { return }
+                            freeProfile(info)
+                            zs.zero(@intFromPtr(&info.*.iccpName), 81)
+                            zs.copy(@intFromPtr(&info.*.iccpName), data(r), keywordLength)
+                            info.*.iccpProfile = profile
+                            info.*.iccpLength = profileLength
+                            info.*.valid |= INFO_iCCP
+                            syncColorspace(r)
+                            return
+                        }
+                    }
+                } else {
+                    reported = true
+                }
+            }
+        }
+    }
+    _ = crcFinish(r)
+    info.*.colorspace |= CS_INVALID
+    syncColorspace(r)
+    if !reported && message.length > 0 { chunkBenign(r, message) }
+}
+
+// Inflates the zlib stream at STREAM (LENGTH bytes) into OUTPUT, at most
+// CAPACITY bytes; the count made. With FINISH the stream must end there.
+// When fewer bytes come, MESSAGE is libpng's: zlib's own for damaged
+// data, else for the profile's header (`first`) the end or truncation of
+// the stream, after it the message libpng's first read left set.
+fn inflateSome(r: *Reader, stream: usize, length: usize, output: usize, capacity: usize, first: bool, message: *[]const u8) -> usize {
+    message.* = "insufficient memory"
+    const memory = r.*.allocator.alloc(@sizeOf(flate.Inflater), 16)
+    if memory == null { return 0 }
+    const inflater: *flate.Inflater = unsafe { @ptrCast(*flate.Inflater, memory.?) }
+    if flate.inflaterInit(inflater, r.*.allocator, flate.Format.zlib) != flate.Status.ok {
+        r.*.allocator.free(memory.?, @sizeOf(flate.Inflater), 16)
+        return 0
+    }
+    var progress: flate.Progress = undefined
+    var status = flate.Status.ok
+    if length > 0 && !r.*.maximumWindow && (get8(stream) >> 4) > 7 {
+        progress.produced = 0
+        message.* = "invalid window size (libpng)"
+    } else {
+        status = flate.inflaterRun(inflater, zs.bytes(stream), length, zs.bytes(output), capacity, &progress)
+        if first {
+            message.* = if status == flate.Status.done { "unexpected end of LZ stream" } else { "truncated" }
+        } else {
+            message.* = "unexpected zlib return code"
+        }
+        if status == flate.Status.damaged {
+            const text = inflater.*.stream.msg
+            if text != 0 {
+                var count: usize = 0
+                while get8(text + count) != 0 { count += 1 }
+                const view: [*]const u8 = zs.bytes(text)
+                message.* = view[0..count]
+            }
+        }
+    }
+    flate.inflaterEnd(inflater)
+    r.*.allocator.free(memory.?, @sizeOf(flate.Inflater), 16)
+    return progress.produced
+}
+
+// The next queued warning or error without reading on: true with its
+// text in `message` and whether it is an error in `isError`; false when
+// none is queued.
+pub fn takeQueued(r: *Reader, isError: *bool) -> bool {
+    while r.*.queueCount > 0 {
+        const slot = r.*.queueHead
+        r.*.queueHead = (slot + 1) % QUEUE
+        r.*.queueCount -= 1
+        r.*.message = slotText(r, slot)
+        const kind = r.*.queued[slot]
+        if kind == @intFromEnum(Event.warning) || kind == @intFromEnum(Event.failed) {
+            isError.* = kind == @intFromEnum(Event.failed)
+            return true
+        }
+    }
+    return false
+}
+
+// The checks of an ICC profile an application gives (png_set_iCCP's
+// png_colorspace_set_ICC): its problems queued as the reader's warnings
+// and errors; false when it is not to be used.
+pub fn checkProfile(r: *Reader, name: []const u8, profile: usize, length: usize, colorType: usize) -> bool {
+    const saved = r.*.info.*.colorType
+    r.*.info.*.colorType = colorType
+    var good = checkProfileHeader(r, name, length, profile)
+    if good { good = checkTagTable(r, name, length, profile) }
+    r.*.info.*.colorType = saved
+    return good
+}
+
+// png_icc_check_length and png_icc_check_header.
+fn checkProfileHeader(r: *Reader, name: []const u8, profileLength: usize, profile: usize) -> bool {
+    if profileLength < 132 {
+        profileError(r, name, profileLength, "too short", true)
+        return false
+    }
+    if r.*.chunkMallocMax > 0 && r.*.chunkMallocMax < profileLength {
+        profileError(r, name, profileLength, "exceeds application limits", true)
+        return false
+    }
+    var temp = read32(profile)
+    if temp != profileLength {
+        profileError(r, name, temp, "length does not match profile", true)
+        return false
+    }
+    temp = get8(profile + 8)
+    if temp > 3 && profileLength & 3 != 0 {
+        profileError(r, name, profileLength, "invalid length", true)
+        return false
+    }
+    temp = read32(profile + 128)
+    if temp > 357913930 || profileLength < 132 + 12 * temp {
+        profileError(r, name, temp, "tag count too large", true)
+        return false
+    }
+    temp = read32(profile + 64)
+    if temp >= 0xffff {
+        profileError(r, name, temp, "invalid rendering intent", true)
+        return false
+    }
+    if temp >= 4 { profileError(r, name, temp, "intent outside defined range", false) }
+    temp = read32(profile + 36)
+    if temp != 0x61637370 {
+        profileError(r, name, temp, "invalid signature", true)
+        return false
+    }
+    const d50 = [12]u8{ 0, 0, 0xf6, 0xd6, 0, 1, 0, 0, 0, 0, 0xd3, 0x2d }
+    var index: usize = 0
+    var isD50 = true
+    while index < 12 {
+        if get8(profile + 68 + index) != @intCast(usize, d50[index]) { isD50 = false }
+        index += 1
+    }
+    if !isD50 { profileError(r, name, 0, "PCS illuminant is not D50", false) }
+    temp = read32(profile + 16)
+    const color = r.*.info.*.colorType & COLOR_MASK_COLOR != 0
+    if temp == 0x52474220 {
+        if !color {
+            profileError(r, name, temp, "RGB color space not permitted on grayscale PNG", true)
+            return false
+        }
+    } else if temp == 0x47524159 {
+        if color {
+            profileError(r, name, temp, "Gray color space not permitted on RGB PNG", true)
+            return false
+        }
+    } else {
+        profileError(r, name, temp, "invalid ICC profile color space", true)
+        return false
+    }
+    temp = read32(profile + 12)
+    if temp == 0x61627374 {
+        profileError(r, name, temp, "invalid embedded Abstract ICC profile", true)
+        return false
+    }
+    if temp == 0x6c696e6b {
+        profileError(r, name, temp, "unexpected DeviceLink ICC profile class", true)
+        return false
+    }
+    if temp == 0x6e6d636c {
+        profileError(r, name, temp, "unexpected NamedColor ICC profile class", false)
+    } else if temp != 0x73636e72 && temp != 0x6d6e7472 && temp != 0x70727472 && temp != 0x73706163 {
+        profileError(r, name, temp, "unrecognized ICC profile class", false)
+    }
+    temp = read32(profile + 20)
+    if temp != 0x58595a20 && temp != 0x4c616220 {
+        profileError(r, name, temp, "unexpected ICC PCS encoding", true)
+        return false
+    }
+    return true
+}
+
+// png_icc_check_tag_table.
+fn checkTagTable(r: *Reader, name: []const u8, profileLength: usize, profile: usize) -> bool {
+    const count = read32(profile + 128)
+    var index: usize = 0
+    while index < count {
+        const tag = profile + 132 + index * 12
+        const id = read32(tag)
+        const start = read32(tag + 4)
+        const tagLength = read32(tag + 8)
+        if start > profileLength || tagLength > profileLength - start {
+            profileError(r, name, id, "ICC profile tag outside profile", true)
+            return false
+        }
+        if start & 3 != 0 { profileError(r, name, id, "ICC profile tag start not a multiple of 4", false) }
+        index += 1
+    }
+    return true
+}
+
+fn handleTRNS(r: *Reader) -> void {
+    const info = r.*.info
+    const length = r.*.chunkLength
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if info.*.valid & INFO_tRNS != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    var count: usize = 0
+    if info.*.colorType == COLOR_TYPE_GRAY {
+        if length != 2 {
+            _ = crcFinish(r)
+            chunkBenign(r, "invalid")
+            return
+        }
+        count = 1
+    } else if info.*.colorType == COLOR_TYPE_RGB {
+        if length != 6 {
+            _ = crcFinish(r)
+            chunkBenign(r, "invalid")
+            return
+        }
+        count = 1
+    } else if info.*.colorType == COLOR_TYPE_PALETTE {
+        if r.*.mode & HAVE_PLTE == 0 {
+            _ = crcFinish(r)
+            chunkBenign(r, "out of place")
+            return
+        }
+        if length > info.*.numPalette || length > 256 || length == 0 {
+            _ = crcFinish(r)
+            chunkBenign(r, "invalid")
+            return
+        }
+        count = length
+    } else {
+        _ = crcFinish(r)
+        chunkBenign(r, "invalid with alpha channel")
+        return
+    }
+    if crcFinish(r) {
+        info.*.numTrans = 0
+        return
+    }
+    if failed(r) { return }
+    // png_set_tRNS.
+    if info.*.colorType == COLOR_TYPE_PALETTE {
+        var index: usize = 0
+        while index < 256 {
+            info.*.transAlpha[index] = if index < count { zs.get8(data(r) + index) } else { 255 }
+            index += 1
+        }
+    } else {
+        if info.*.colorType == COLOR_TYPE_GRAY {
+            info.*.transGray = read16(data(r))
+        } else {
+            info.*.transRed = read16(data(r))
+            info.*.transGreen = read16(data(r) + 2)
+            info.*.transBlue = read16(data(r) + 4)
+        }
+        if info.*.bitDepth < 16 {
+            const most = (@intCast(usize, 1) << info.*.bitDepth) - 1
+            if (info.*.colorType == COLOR_TYPE_GRAY && info.*.transGray > most) || (info.*.colorType == COLOR_TYPE_RGB && (info.*.transRed > most || info.*.transGreen > most || info.*.transBlue > most)) {
+                warning(r, "tRNS chunk has out-of-range samples for bit_depth")
+            }
+        }
+    }
+    info.*.numTrans = count
+    info.*.valid |= INFO_tRNS
+}
+
+fn handleBKGD(r: *Reader) -> void {
+    const info = r.*.info
+    const length = r.*.chunkLength
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 || (info.*.colorType == COLOR_TYPE_PALETTE && r.*.mode & HAVE_PLTE == 0) {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if info.*.valid & INFO_bKGD != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    var trueLength: usize = 2
+    if info.*.colorType == COLOR_TYPE_PALETTE { trueLength = 1 } else if info.*.colorType & COLOR_MASK_COLOR != 0 { trueLength = 6 }
+    if length != trueLength {
+        _ = crcFinish(r)
+        chunkBenign(r, "invalid")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    const at = data(r)
+    if info.*.colorType == COLOR_TYPE_PALETTE {
+        const index = get8(at)
+        if info.*.numPalette != 0 && index >= info.*.numPalette {
+            chunkBenign(r, "invalid index")
+            return
+        }
+        info.*.background[0] = index
+        if info.*.numPalette != 0 {
+            info.*.background[1] = @intCast(usize, info.*.palette[index * 3])
+            info.*.background[2] = @intCast(usize, info.*.palette[index * 3 + 1])
+            info.*.background[3] = @intCast(usize, info.*.palette[index * 3 + 2])
+        } else {
+            info.*.background[1] = 0
+            info.*.background[2] = 0
+            info.*.background[3] = 0
+        }
+        info.*.background[4] = 0
+    } else if info.*.colorType & COLOR_MASK_COLOR == 0 {
+        if info.*.bitDepth <= 8 && (get8(at) != 0 || get8(at + 1) >= (@intCast(usize, 1) << info.*.bitDepth)) {
+            chunkBenign(r, "invalid gray level")
+            return
+        }
+        const gray = read16(at)
+        info.*.background[0] = 0
+        info.*.background[1] = gray
+        info.*.background[2] = gray
+        info.*.background[3] = gray
+        info.*.background[4] = gray
+    } else {
+        if info.*.bitDepth <= 8 && (get8(at) != 0 || get8(at + 2) != 0 || get8(at + 4) != 0) {
+            chunkBenign(r, "invalid color")
+            return
+        }
+        info.*.background[0] = 0
+        info.*.background[1] = read16(at)
+        info.*.background[2] = read16(at + 2)
+        info.*.background[3] = read16(at + 4)
+        info.*.background[4] = 0
+    }
+    info.*.valid |= INFO_bKGD
+}
+
+fn handlePHYS(r: *Reader) -> void {
+    const info = r.*.info
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if info.*.valid & INFO_pHYs != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    if r.*.chunkLength != 9 {
+        _ = crcFinish(r)
+        chunkBenign(r, "invalid")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    info.*.xPixelsPerUnit = read32(data(r))
+    info.*.yPixelsPerUnit = read32(data(r) + 4)
+    info.*.physUnit = get8(data(r) + 8)
+    info.*.valid |= INFO_pHYs
+}
+
+// A chunk handled as unknown: its CRC checked (png_cache_unknown_chunk),
+// then given to the caller.
+fn unknownChunk(r: *Reader, keep: u32) -> void {
+    _ = crcFinish(r)
+    if failed(r) { return }
+    if r.*.chunkLength > r.*.chunkMallocMax && r.*.chunkMallocMax > 0 {
+        chunkBenign(r, "unknown chunk exceeds memory limits")
+        if failed(r) { return }
+        r.*.chunkKeep = HANDLE_CHUNK_NEVER
+    } else {
+        r.*.chunkKeep = keep
+    }
+    queueEvent(r, Event.unknown)
+}
+
+// ---------------------------------------------------------------------------
+// The image data (png_push_read_IDAT and png_process_IDAT_data)
+
+// Sets up (or resets) the inflater for a new image stream.
+pub fn startStream(r: *Reader) -> bool {
+    if r.*.inflaterReady {
+        if flate.inflaterReset(&r.*.inflater) != flate.Status.ok { return false }
+    } else {
+        if flate.inflaterInit(&r.*.inflater, r.*.allocator, flate.Format.zlib) != flate.Status.ok { return false }
+        r.*.inflaterReady = true
+    }
+    r.*.streamStarted = false
+    r.*.streamEnded = false
+    r.*.rowFill = 0
+    r.*.imageComplete = false
+    return true
+}
+
+// One step of the image data: 1 when a row is complete, 2 when more
+// input is needed, 0 to go on.
+fn readImageData(r: *Reader) -> usize {
+    if r.*.mode & HAVE_CHUNK_HEADER == 0 {
+        if !gatherHeader(r) { return 2 }
+        takeHeader(r)
+        if failed(r) { return 0 }
+        if r.*.chunkName != IDAT {
+            r.*.process = PROCESS_CHUNK
+            if !r.*.streamEnded { fail(r, "Not enough compressed data") }
+            return 0
+        }
+        r.*.idatSize = r.*.chunkLength
+        r.*.crcHave = 0
+    }
+    if r.*.idatSize != 0 {
+        if available(r) == 0 { return 2 }
+        var piece = available(r)
+        if piece > r.*.idatSize { piece = r.*.idatSize }
+        const start = r.*.input + r.*.inputAt
+        const used = inflateImage(r, start, piece)
+        r.*.crcValue = crc.crc32Update(r.*.crcValue, start, used)
+        r.*.inputAt += used
+        r.*.idatSize -= used
+        if r.*.rowSize != 0 && r.*.rowFill == r.*.rowSize && !failed(r) {
+            r.*.rowFill = 0
+            return 1
+        }
+        return 0
+    }
+    // The CRC.
+    while r.*.crcHave < 4 && available(r) > 0 {
+        r.*.crcBytes[r.*.crcHave] = zs.get8(r.*.input + r.*.inputAt)
+        r.*.crcHave += 1
+        r.*.inputAt += 1
+    }
+    if r.*.crcHave < 4 { return 2 }
+    r.*.crcHave = 0
+    var mismatch = false
+    if r.*.crcFlags & CRC_CRITICAL_IGNORE == 0 {
+        mismatch = (r.*.crcValue & 0xffffffff) != @intCast(u64, read32(@intFromPtr(&r.*.crcBytes)))
+    }
+    if mismatch {
+        if r.*.crcFlags & CRC_CRITICAL_USE != 0 { chunkWarning(r, "CRC error") } else { chunkError(r, "CRC error") }
+    }
+    r.*.mode &= ~HAVE_CHUNK_HEADER
+    r.*.mode |= AFTER_IDAT
+    return 0
+}
+
+// Inflates what it can of LENGTH bytes at INPUT into the row being
+// filled; the bytes it took. Stops when the row is full.
+fn inflateImage(r: *Reader, input: usize, length: usize) -> usize {
+    if r.*.streamEnded {
+        warning(r, "Extra compression data in IDAT")
+        return length
+    }
+    if !r.*.inflaterReady {
+        if !startStream(r) {
+            fail(r, "zlib initialization failed")
+            return length
+        }
+    }
+    // libpng's own check of the zlib header's window size.
+    if !r.*.streamStarted {
+        if !r.*.maximumWindow && (get8(input) >> 4) > 7 {
+            r.*.streamEnded = true
+            if r.*.imageComplete { warning(r, "Truncated compressed data in IDAT") } else { fail(r, "invalid window size (libpng)") }
+            return length
+        }
+        r.*.streamStarted = true
+    }
+    if r.*.rowSize == 0 || r.*.rowBuffer == 0 {
+        fail(r, "NULL row buffer")
+        return length
+    }
+    var output = r.*.rowBuffer + r.*.rowFill
+    var room = r.*.rowSize - r.*.rowFill
+    if r.*.imageComplete {
+        // Anything more is past the last row: libpng looks with a row's
+        // room and stops at the first byte.
+        output = r.*.rowBuffer
+        room = r.*.rowSize
+    }
+    var progress: flate.Progress = undefined
+    const status = flate.inflaterRun(&r.*.inflater, zs.bytes(input), length, zs.bytes(output), room, &progress)
+    const used = progress.consumed
+    if status == flate.Status.damaged || status == flate.Status.noMemory || status == flate.Status.needDictionary || status == flate.Status.misuse {
+        r.*.streamEnded = true
+        if r.*.imageComplete {
+            warning(r, "Truncated compressed data in IDAT")
+        } else if status == flate.Status.damaged {
+            benign(r, "IDAT: ADLER32 checksum mismatch")
+        } else {
+            fail(r, "Decompression error in IDAT")
+        }
+        return length
+    }
+    if progress.produced > 0 {
+        if r.*.imageComplete {
+            warning(r, "Extra compressed data in IDAT")
+            r.*.streamEnded = true
+            return length
+        }
+        r.*.rowFill += progress.produced
+    }
+    if status == flate.Status.done {
+        r.*.streamEnded = true
+        if used < length && r.*.rowFill != r.*.rowSize {
+            warning(r, "Extra compression data in IDAT")
+            return length
+        }
+    }
+    return used
+}
+
+// ---------------------------------------------------------------------------
+// The other chunks libpng reads (their data is not kept here; their
+// checks and messages are libpng's).
+
+// Inflates the zlib stream at STREAM (LENGTH bytes) to its end, the
+// output dropped; "" when it is whole, else libpng's message for it.
+fn checkStream(r: *Reader, stream: usize, length: usize, extra: *bool) -> []const u8 {
+    extra.* = false
+    if length > 0 && !r.*.maximumWindow && (get8(stream) >> 4) > 7 { return "invalid window size (libpng)" }
+    const memory = r.*.allocator.alloc(@sizeOf(flate.Inflater) + 4096, 16)
+    if memory == null { return "insufficient memory" }
+    const inflater: *flate.Inflater = unsafe { @ptrCast(*flate.Inflater, memory.?) }
+    const scratch = @intFromPtr(memory.?) + @sizeOf(flate.Inflater)
+    if flate.inflaterInit(inflater, r.*.allocator, flate.Format.zlib) != flate.Status.ok {
+        r.*.allocator.free(memory.?, @sizeOf(flate.Inflater) + 4096, 16)
+        return "insufficient memory"
+    }
+    var at: usize = 0
+    var result: []const u8 = "truncated"
+    while true {
+        var progress: flate.Progress = undefined
+        const status = flate.inflaterRun(inflater, zs.bytes(stream + at), length - at, zs.bytes(scratch), 4096, &progress)
+        at += progress.consumed
+        if status == flate.Status.done {
+            result = ""
+            if at != length { extra.* = true }
+            break
+        }
+        if status == flate.Status.damaged {
+            result = "damaged LZ stream"
+            const text = inflater.*.stream.msg
+            if text != 0 {
+                var count: usize = 0
+                while get8(text + count) != 0 { count += 1 }
+                const view: [*]const u8 = zs.bytes(text)
+                result = view[0..count]
+            }
+            break
+        }
+        if status == flate.Status.needDictionary {
+            result = "missing LZ dictionary"
+            break
+        }
+        if status != flate.Status.ok || (progress.consumed == 0 && progress.produced == 0) { break }
+    }
+    flate.inflaterEnd(inflater)
+    r.*.allocator.free(memory.?, @sizeOf(flate.Inflater) + 4096, 16)
+    return result
+}
+
+// The text chunks (tEXt, zTXt, iTXt): libpng's chunk cache count, the
+// keyword and the compressed text checked.
+fn handleText(r: *Reader) -> void {
+    const length = r.*.chunkLength
+    if r.*.chunkCacheMax != 0 {
+        if r.*.chunkCacheMax == 1 {
+            _ = crcFinish(r)
+            return
+        }
+        r.*.chunkCacheMax -= 1
+        if r.*.chunkCacheMax == 1 {
+            _ = crcFinish(r)
+            chunkBenign(r, "no space in chunk cache")
+            return
+        }
+    }
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 { r.*.mode |= AFTER_IDAT }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    if r.*.chunkName == tEXt { return }
+    var keyword: usize = 0
+    while keyword < length && get8(data(r) + keyword) != 0 { keyword += 1 }
+    var message: []const u8 = ""
+    var extra = false
+    if keyword > 79 || keyword < 1 {
+        message = "bad keyword"
+    } else if r.*.chunkName == zTXt {
+        if keyword + 3 > length {
+            message = "truncated"
+        } else if get8(data(r) + keyword + 1) != 0 {
+            message = "unknown compression type"
+        } else {
+            message = checkStream(r, data(r) + keyword + 2, length - keyword - 2, &extra)
+        }
+    } else {
+        if keyword + 5 > length {
+            message = "truncated"
+        } else {
+            const flag = get8(data(r) + keyword + 1)
+            if flag == 0 || (flag == 1 && get8(data(r) + keyword + 2) == 0) {
+                var prefix = keyword + 3
+                while prefix < length && get8(data(r) + prefix) != 0 { prefix += 1 }
+                prefix += 1
+                while prefix < length && get8(data(r) + prefix) != 0 { prefix += 1 }
+                prefix += 1
+                if flag != 0 {
+                    if prefix < length {
+                        message = checkStream(r, data(r) + prefix, length - prefix, &extra)
+                    } else {
+                        message = "truncated"
+                    }
+                } else if prefix > length {
+                    message = "truncated"
+                }
+            } else {
+                message = "bad compression info"
+            }
+        }
+    }
+    if extra { chunkBenign(r, "extra compressed data") }
+    if message.length > 0 { chunkBenign(r, message) }
+}
+
+fn handleTIME(r: *Reader) -> void {
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.info.*.valid & INFO_tIME != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 { r.*.mode |= AFTER_IDAT }
+    if r.*.chunkLength != 7 {
+        _ = crcFinish(r)
+        chunkBenign(r, "invalid")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    // png_set_tIME's check.
+    const at = data(r)
+    const month = get8(at + 2)
+    const day = get8(at + 3)
+    if month == 0 || month > 12 || day == 0 || day > 31 || get8(at + 4) > 23 || get8(at + 5) > 59 || get8(at + 6) > 60 {
+        warning(r, "Ignoring invalid time value")
+        return
+    }
+    r.*.info.*.valid |= INFO_tIME
+}
+
+fn handleEXIF(r: *Reader) -> void {
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    const length = r.*.chunkLength
+    if length < 2 {
+        _ = crcFinish(r)
+        chunkBenign(r, "too short")
+        return
+    }
+    if r.*.info.*.valid & INFO_eXIf != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    const first = get8(data(r))
+    const second = get8(data(r) + 1)
+    if (second != 77 && second != 73) || first != second {
+        _ = crcFinish(r)
+        chunkBenign(r, "incorrect byte-order specifier")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    r.*.info.*.valid |= INFO_eXIf
+}
+
+fn handleHIST(r: *Reader) -> void {
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 || r.*.mode & HAVE_PLTE == 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if r.*.info.*.valid & INFO_hIST != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    const count = r.*.chunkLength / 2
+    if r.*.chunkLength != count * 2 || count != r.*.info.*.numPalette || count > 256 {
+        _ = crcFinish(r)
+        chunkBenign(r, "invalid")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    r.*.info.*.valid |= INFO_hIST
+}
+
+// oFFs, pCAL, sCAL and sPLT: their places and sizes checked.
+fn handleOther(r: *Reader, valid: usize, exactLength: usize, shortest: usize) -> void {
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if valid != 0 && r.*.info.*.valid & valid != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    if (exactLength != 0 && r.*.chunkLength != exactLength) || r.*.chunkLength < shortest {
+        _ = crcFinish(r)
+        chunkBenign(r, "invalid")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    r.*.info.*.valid |= valid
+}
+
+// png_check_fp_string, simplified: [+-] digits [. digits] [eE [+-]
+// digits], at least one digit before the exponent.
+fn isNumber(at: usize, length: usize) -> bool {
+    var index: usize = 0
+    if index < length && (get8(at) == 43 || get8(at) == 45) { index += 1 }
+    var digits: usize = 0
+    while index < length && get8(at + index) >= 48 && get8(at + index) <= 57 {
+        digits += 1
+        index += 1
+    }
+    if index < length && get8(at + index) == 46 {
+        index += 1
+        while index < length && get8(at + index) >= 48 && get8(at + index) <= 57 {
+            digits += 1
+            index += 1
+        }
+    }
+    if digits == 0 { return false }
+    if index < length && (get8(at + index) == 69 || get8(at + index) == 101) {
+        index += 1
+        if index < length && (get8(at + index) == 43 || get8(at + index) == 45) { index += 1 }
+        var exponent: usize = 0
+        while index < length && get8(at + index) >= 48 && get8(at + index) <= 57 {
+            exponent += 1
+            index += 1
+        }
+        if exponent == 0 { return false }
+    }
+    return index == length
+}
+
+fn handlePCAL(r: *Reader) -> void {
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if r.*.info.*.valid & INFO_pCAL != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "duplicate")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    const length = r.*.chunkLength
+    const at = data(r)
+    // (The chunk is read with a NUL after it.)
+    var purpose: usize = 0
+    while purpose < length && get8(at + purpose) != 0 { purpose += 1 }
+    if length <= purpose || length - purpose <= 12 {
+        chunkBenign(r, "invalid")
+        return
+    }
+    const kind = get8(at + purpose + 9)
+    const count = get8(at + purpose + 10)
+    if (kind == 0 && count != 2) || (kind == 1 && count != 3) || (kind == 2 && count != 3) || (kind == 3 && count != 4) {
+        chunkBenign(r, "invalid parameter count")
+        return
+    }
+    if kind >= 4 { chunkBenign(r, "unrecognized equation type") }
+    var index = purpose + 11
+    while index < length && get8(at + index) != 0 { index += 1 }
+    var parameter: usize = 0
+    var bad = false
+    while parameter < count {
+        index += 1
+        const start = index
+        while index < length && get8(at + index) != 0 { index += 1 }
+        if index > length {
+            chunkBenign(r, "invalid data")
+            return
+        }
+        if !isNumber(at + start, index - start) { bad = true }
+        parameter += 1
+    }
+    // png_set_pCAL's own checks.
+    if kind >= 4 {
+        report(r, "Invalid pCAL equation type", false)
+        return
+    }
+    if bad {
+        report(r, "Invalid format for pCAL parameter", false)
+        return
+    }
+    r.*.info.*.valid |= INFO_pCAL
+}
+
+fn handleSPLT(r: *Reader) -> void {
+    if r.*.chunkCacheMax != 0 {
+        if r.*.chunkCacheMax == 1 {
+            _ = crcFinish(r)
+            return
+        }
+        r.*.chunkCacheMax -= 1
+        if r.*.chunkCacheMax == 1 {
+            warning(r, "No space in chunk cache for sPLT")
+            _ = crcFinish(r)
+            return
+        }
+    }
+    if r.*.mode & HAVE_IHDR == 0 {
+        chunkError(r, "missing IHDR")
+        return
+    }
+    if r.*.mode & HAVE_IDAT != 0 {
+        _ = crcFinish(r)
+        chunkBenign(r, "out of place")
+        return
+    }
+    if crcFinish(r) { return }
+    if failed(r) { return }
+    const length = r.*.chunkLength
+    const at = data(r)
+    var start: usize = 0
+    while start < length && get8(at + start) != 0 { start += 1 }
+    start += 1
+    if length < 2 || start > length - 2 {
+        warning(r, "malformed sPLT chunk")
+        return
+    }
+    const depth = get8(at + start)
+    start += 1
+    const entry: usize = if depth == 8 { 6 } else { 10 }
+    if (length - start) % entry != 0 {
+        warning(r, "sPLT chunk has bad length")
+        return
+    }
+    r.*.info.*.valid |= INFO_sPLT
+}

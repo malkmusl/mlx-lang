@@ -34,6 +34,8 @@
 #                                       std.dbus's client (signals kept
 #                                       across a call, bus addresses) and
 #                                       std.spawn.find
+#   tests/362_png_decode_runtime.mlx    std.png's decoder: every colour type,
+#                                       interlacing, transparency, damage
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -76,6 +78,7 @@ run 358_timezone_names_runtime "zone abbreviations from rules and TZif files"
 run 359_linux_descriptors_runtime "pipes, epoll tokens, signalfd, timerfd, eventfd, poll, Unix sockets, SCM_RIGHTS, wait4"
 run 360_spawn_runtime "PATH lookup, captured output, exit statuses, moved descriptors, vfork, detach"
 run 361_dbus_keep_signals_runtime "a client against a child bus: a signal kept across a call with its descriptor; bus addresses; PATH lookup"
+run 362_png_decode_runtime "PNG images of each colour type, interlaced and transparent, decoded to RGBA; damaged ones refused"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
