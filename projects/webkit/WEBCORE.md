@@ -61,7 +61,7 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 | Fontconfig | finding fonts: Skia's font manager, WebCore's FontCache (FreeType platform) | 21 / 0 (/ 53) | 2 | none | 2: mlx-fontconfig, matching over the fonts directories (fonts.conf's essentials) |
 | libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | std.xml: a pull tokenizer, a base | 2: mlx-libxml2: the SAX2 push parser WebCore drives (xmlCreatePushParserCtxt, xmlParseChunk, the callbacks), entities, encodings through ICU (its headers' `<iconv.h>` is mlxlibc's now) |
 | libxslt, libexslt | XSLT processing (XSLTProcessor, `<?xml-stylesheet?>`) | 26 / 0 | 5 | none | 3: `ENABLE_XSLT=OFF` |
-| SQLite | storage: IndexedDB's SQLite back end, local storage, the icon and resource load statistics databases | 55 / 19 (60) | 13 | none | 2: the largest of the "small" libraries; a SQL engine of the subset WebKit's statements use, or the stores on another back end |
+| SQLite | storage: IndexedDB's SQLite back end, local storage, the icon and resource load statistics databases | 55 / 19 (60) | 13 | mlx-sqlite3 (compiler/capi/sqlite3, std.sql): SQLite's C API, 191 functions declared and made (all 59 that WebCore and WebKit call); SQLite's file format and rollback journal (files and hot journals cross over with SQLite 3.45), its locks, the SQL of WebKit's 409 statements and more (joins, subqueries, compounds, views, WITH, upserts, CHECK, foreign keys, partial indexes, savepoints); tools/check_sqlite.sh compares its tests with SQLite 3.45. 19 of the 22 WebCore files calling SQLite compile alone (below) | WITHOUT ROWID tables, triggers, recursive WITH, a real write-ahead log; speed (an indexed insert is about 20 times SQLite's) |
 | libpng | PNG decoding (ImageDecoder) and Skia's PNG codec | 36 / 0 (/ 47) | 3 | mlx-libpng (compiler/capi/png, std.png): all declared; the progressive reader, transformations, gamma and writer give libpng's bytes (tools/check_png.sh); Skia's SkPngCodec and SkPngEncoderImpl compile; WebCore's PNGImageDecoder.cpp stops at Little CMS's `lcms2.h` (LCMSUniquePtr.h; `USE_LCMS` is on) | done |
 | libjpeg | JPEG decoding (ImageDecoder), Skia's JPEG codec and encoder | 15 / 0 (/ 25) | 2 | mlx-libjpeg (compiler/capi/jpeg, std.jpeg): all declared; the decompressor (suspending sources, buffered-image output, raw data, cropping and skipping, saved markers, the ICC profile) gives libjpeg-turbo's pixels, warnings and errors (tools/check_jpeg.sh); Skia's five JPEG sources compile; WebCore's JPEGImageDecoder.cpp stops at Little CMS's `lcms2.h` (LCMSUniquePtr.h) | the compressor (Skia's encoder: jpeg_set_defaults ... jpeg_finish_compress raise JERR_NOT_COMPILED for now) |
 | libwebp (+demux, mux) | WebP decoding (ImageDecoder), Skia's codec | 7 / 0 (/ 12) | 2 | mlx-libwebp (compiler/capi/webp, std.webp): all declared (decode.h, demux.h, encode.h, mux.h); the simple, advanced and incremental decoders, the demuxer and the animation decoder give libwebp 1.3.2's pixels, statuses and rows done; the encoder is lossless (exact pixels, larger files), with the muxer and the animation encoder (tools/check_webp.sh); Skia's SkWebpEncoderImpl and WebCore's WEBPImageDecoder.cpp compile | lossy encoding; scaling (use_scaling) |
@@ -297,7 +297,23 @@ source, each alone, with the same stand-in headers):
   (ResourceLoaderSoup) and platform-25 (LowPowerModeNotifierGLib) stop
   at mlx-cc errors (`ComparableASCIISubsetLiteral`'s constructor in
   `<utility>`, OptionSet's deduction guide in RunLoopObserver.h) and
-  platform-79 (PublicSuffixStoreSoup) at `sqlite3.h`.
+  platform-79 (PublicSuffixStoreSoup) at `sqlite3.h` (mlx-sqlite3's
+  now: PublicSuffixStoreSoup.cpp compiles alone).
+- SQLite: mlx-sqlite3 (compiler/capi/sqlite3). Of WebCore's files that
+  call it, compiled alone as the WPE build would: SQLiteStatement,
+  SQLiteStatementAutoResetScope, SQLiteDatabaseTracker,
+  SQLiteFileSystem, SQLiteAuthorizer (platform/sql), SQLiteIDBBackingStore,
+  SQLiteIDBCursor, SQLiteIDBTransaction, SQLiteMemoryIDBBackingStore,
+  IDBServer (IndexedDB), ResourceMonitorPersistence,
+  ResourceMonitorThrottlerHolder, Web SQL's Database, DatabaseTracker,
+  SQLStatement, SQLTransaction and SQLTransactionBackend, and
+  PublicSuffixStoreSoup compile. Three stop at mlx-cc errors:
+  SQLiteDatabase.cpp:594 (an ASCIILiteral from `?:` of an ASCIILiteral
+  and a `const char*`: no matching constructor), SWRegistrationDatabase
+  (ClientOrigin.h:63, "the instance exists already") and
+  PushDatabase.cpp:413 (no instance of `completeOnMainQueue` takes the
+  arguments). WebKit's own SQLite stores (LocalStorage, resource load
+  statistics, private click measurement) are not compiled yet.
 - mlx-cc's memory: the single files fit now (above); whole unified
   sources are about ten such files, and still heavier ones may need the
   instances' tokens and mangled names shared (the way an alias's
