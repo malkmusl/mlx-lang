@@ -59,6 +59,19 @@ run stdlib "$work/stdlib_sep" "$work/stdlib_sep.out"
 cmp -s "$tests/stdlib.expected" "$work/stdlib_sep.out" || fail "stdlib from an object prints otherwise"
 echo "ok   a C++ object links with the library and runs"
 
+# What an object holds: the inline, static and template functions and the
+# vtables its code or data refers to, not those only named by functions
+# never made (inlinereach.cpp).
+"$cc" -c -o "$work/inlinereach.o" "$tests/inlinereach.cpp" 2> "$work/reach.err" || fail "-c of inlinereach.cpp: $(head -3 "$work/reach.err")"
+symbols=$(nm "$work/inlinereach.o" | awk '{ print $NF }' | sort | tr '\n' ' ')
+for name in _Z7tripledi _Z12unusedInlinei _ZTV6Unused _ZN6Unused5valueEv; do
+    [[ " $symbols" != *" $name "* ]] || fail "inlinereach.o has $name, which nothing made refers to"
+done
+for name in _ZTV4Used _ZN4Used5valueEv _Z7doubledi _Z9quarteredi _Z6halvedIiEi; do
+    [[ " $symbols" == *" $name "* ]] || fail "inlinereach.o lacks $name"
+done
+echo "ok   an object holds the inline functions and vtables its code and data refer to, no others"
+
 # Statics of inline functions and templates, and inline variables: one
 # object for the program across separately compiled files.
 "$cc" -c -o "$work/shared_a.o" "$tests/shared/a.cpp" 2> "$work/shared.err" || fail "-c of shared/a.cpp: $(head -3 "$work/shared.err")"
