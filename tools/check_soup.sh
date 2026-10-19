@@ -19,7 +19,7 @@
 #       tests/multipart.c  multipart bodies whole and as streams
 #       tests/websocket.c  the WebSocket handshake and connections to an
 #                          echo server in the test, permessage-deflate
-#       tests/server.c     SoupServer: the bytes on the wire, handlers,
+#       tests/server.c     SoupServer: the bytes on the wire, handlers, ranges,
 #                          auth domains, a WebSocket upgrade
 #       tests/https.c      requests over TLS 1.3 and 1.2 to openssl
 #                          s_servers (skipped without openssl)

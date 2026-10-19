@@ -55,7 +55,7 @@ and as C++, and runs the tests (servers in the tests themselves, forked
 or in process, on 127.0.0.1): `headers.c`, `misc.c`, `session.c`
 (SoupSession and SoupLogger), `cookies.c` (jars and the Public Suffix
 List), `hsts.c`, `multipart.c`, `websocket.c` (an echo server in the
-test, permessage-deflate), `server.c` (the bytes on the wire, handlers,
+test, permessage-deflate), `server.c` (the bytes on the wire, handlers, ranges,
 auth domains, a WebSocket upgrade) and `https.c` (TLS 1.3 and 1.2 to
 `openssl s_server`, skipped without openssl). `SOUP_COMPARE_SYSTEM=1`
 also runs each test built against the system's libsoup and compares it
@@ -76,7 +76,6 @@ with the expected output.
   text files rather than SQLite.
 - **TLS servers** are not here (mlx-glib's TLS is a client's):
   `SOUP_SERVER_LISTEN_HTTPS` fails; neither are client certificates.
-- **SoupServer** does not answer Range requests with partial content.
 - `soup_multipart_input_stream_next_part_async` waits on the stream on
   the main context rather than reading in a thread; reads of a part
   never give more than asked for (libsoup's give one byte more past a

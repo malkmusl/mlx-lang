@@ -235,6 +235,8 @@ static void by_hand (void)
     exchange (fd, "GET / keep-alive", "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", 0);
     exchange (fd, "GET /missing on the same connection", "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n", 0);
     exchange (fd, "HEAD /", "HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n", 0);
+    exchange (fd, "a range", "GET / HTTP/1.1\r\nHost: localhost\r\nRange: bytes=5-8\r\n\r\n", 0);
+    exchange (fd, "a range past the end", "GET / HTTP/1.1\r\nHost: localhost\r\nRange: bytes=100-\r\n\r\n", 0);
     exchange (fd, "POST /echo", "POST /echo?a=1 HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nhello there", 0);
     exchange (fd, "POST /echo chunked", "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n there\r\n0\r\n\r\n", 0);
     exchange (fd, "GET /chunked", "GET /chunked HTTP/1.1\r\nHost: localhost\r\n\r\n", 0);
