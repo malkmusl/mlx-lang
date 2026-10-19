@@ -53,13 +53,13 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 
 | Library | Needed for | Functions: WebCore / WebKit (/ Skia) | Units including it | Existing Mlx code | Plan, priority |
 |---|---|---|---|---|---|
-| GLib, GObject, GIO | WTF's run loop and threads (done); GIO streams, files, D-Bus, network monitor, proxies, resolver, TLS types (libsoup's headers name GTlsCertificate) in WebCore's soup and GLib platform code; WebKit's whole GObject API, IPC, WPEPlatform | 173 / 502 (571 together) | 644 (all: WTF's headers) | mlx-glib (compiler/capi/glib): 397 of the 571; missing 50 of WebCore's (GDBus, GResolver, GProxyResolver, GNetworkMonitor, GTls*, memory streams) and 124 more of WebKit's | 1: extend mlx-glib, WebCore's 50 first; the GIO TLS types are needed to compile any unit (libsoup's headers) |
+| GLib, GObject, GIO | WTF's run loop and threads (done); GIO streams, files, D-Bus, network monitor, proxies, resolver, TLS types (libsoup's headers name GTlsCertificate) in WebCore's soup and GLib platform code; WebKit's whole GObject API, IPC, WPEPlatform | 173 / 502 (571 together) | 644 (all: WTF's headers) | mlx-glib (compiler/capi/glib): 397 of the 571, and GIO's TLS types (GTlsCertificate from PEM and DER, chains, keys; GTlsPassword; a backend without TLS whose database fails cleanly), GInitable, the stream classes and `G_DECLARE_INTERFACE` that libsoup's headers declare with; missing the rest of WebCore's 50 (GDBus, GResolver, GProxyResolver, GNetworkMonitor, the streams' functions, TLS connections) and 124 more of WebKit's | 1: extend mlx-glib, WebCore's first; the headers every unit needs are there |
 | libsoup 3 | HTTP: every network load (NetworkProcess), cookies, HSTS, authentication, proxies, the public suffix list (WebCore's soup platform code, WebKit's NetworkProcess/soup) | 82 / 75 (143) | 643 (ResourceRequest/Response headers, in the prefix) | none (no HTTP in std) | 1: mlx-soup, a C API layer over a new std HTTP client: HTTP/1.1 first, cookies, HSTS; TLS through GIO's TLS (a TLS implementation is the largest part) |
-| ICU | text: breaking, collation, normalization, bidi, encodings, search, IDNA | 65 / 6 (66) | 643 | mlx-unicode (compiler/capi/icu): 49 of the 66; missing `ubidi_*` (6: bidi of text runs), `usearch_*` (10: find in page, TextIterator), `ucnv_close` and the headers `ubidi.h`, `usearch.h`, `ucnv.h`, `ucnv_cb.h`, `ucnv_err.h` | 1: add the bidi algorithm (UAX #9) and string search to std.unicode, and the headers; the converters exist already |
+| ICU | text: breaking, collation, normalization, bidi, encodings, search, IDNA | 65 / 6 (66) | 643 | mlx-unicode (compiler/capi/icu): all but `u_strToTitle` and the 6 `uset_*` of SmartReplace and ResourceResponseSoup (declared, not yet made); `ubidi.h` (std.unicode.bidi: UAX #9, BidiTest and BidiCharacterTest all passed), `usearch.h` (std.unicode.search) and `ucnv.h`, `ucnv_err.h`, `ucnv_cb.h` (std.unicode.converters: what TextCodecICU asks for, as ICU 74 does) are there | 2: `u_strToTitle` and sets |
 | HarfBuzz (+hb-icu) | text shaping (FontCascade, Skia's) | 46 / 0 (/ 57) | 643 | mlx-harfbuzz (compiler/capi/harfbuzz, std.shaping): all 46 and Skia's 57 declared | done (to be checked at run time) |
 | FreeType | font files, glyphs (Skia's font host) | 0 / 0 (/ 52) | 0 | mlx-freetype (compiler/capi/freetype, std.truetype): Skia's 52 declared | done for compiling |
 | Fontconfig | finding fonts: Skia's font manager, WebCore's FontCache (FreeType platform) | 21 / 0 (/ 53) | 2 | none | 2: mlx-fontconfig, matching over the fonts directories (fonts.conf's essentials) |
-| libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | std.xml: a pull tokenizer, a base | 2: mlx-libxml2: the SAX2 push parser WebCore drives (xmlCreatePushParserCtxt, xmlParseChunk, the callbacks), entities, encodings through ICU; its headers need `<iconv.h>`, which mlxlibc lacks |
+| libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | std.xml: a pull tokenizer, a base | 2: mlx-libxml2: the SAX2 push parser WebCore drives (xmlCreatePushParserCtxt, xmlParseChunk, the callbacks), entities, encodings through ICU (its headers' `<iconv.h>` is mlxlibc's now) |
 | libxslt, libexslt | XSLT processing (XSLTProcessor, `<?xml-stylesheet?>`) | 26 / 0 | 5 | none | 3: `ENABLE_XSLT=OFF` |
 | SQLite | storage: IndexedDB's SQLite back end, local storage, the icon and resource load statistics databases | 55 / 19 (60) | 13 | none | 2: the largest of the "small" libraries; a SQL engine of the subset WebKit's statements use, or the stores on another back end |
 | libpng | PNG decoding (ImageDecoder) and Skia's PNG codec | 36 / 0 (/ 47) | 3 | std.png: a decoder and an encoder | 2: mlx-libpng over std.png |
@@ -71,12 +71,12 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 | libtasn1 | WebCrypto key import and export (DER of SPKI, PKCS#8) | 8 / 0 | 1 | none | 3: a small DER reader and writer |
 | zlib | compression streams (CompressionStream), WebSocket deflate, Skia's PNG | 9 / 1 (9 / 8) | 7 | mlx-zlib (compiler/capi/zlib, std.flate): all declared | done |
 | xkbcommon | keyboard: WPEPlatform's keymaps and key events | 0 / 22 | 0 | std.xkb | 3: a C API layer over std.xkb when WPEPlatform is built |
-| gettext (`libintl.h`) | GLib's `gi18n-lib.h` (the `_()` of WebKit's GLib code) | | | mlxlibc has no `libintl.h` | 1: mlxlibc's `libintl.h`, gettext returning its message id (tiny) |
+| gettext (`libintl.h`), `iconv.h` | GLib's `gi18n-lib.h` (the `_()` of WebKit's GLib code); libxml2's headers | | | mlxlibc: `libintl.h` (the gettext family returning the message untranslated, the domains remembered) and `iconv.h` (UTF-8, -16, -32, UCS-2 and -4, Latin-1, ASCII and std.unicode.charmaps' single-byte charsets, `//TRANSLIT` and `//IGNORE`; tools/check_iconv.sh against glibc) | done |
 | expat, libpsl, brotli, libatomic | expat: Skia on Android only; libpsl, brotli: libsoup's own; libatomic: GCC's atomics | 0 | 0 | | not needed by WebKit directly |
 
 So the order: the headers and small layers every unit needs (GIO's TLS
 types, `libintl.h`, `iconv.h`, ICU's bidi, search and converter
-headers), then libsoup and its HTTP and TLS, the image decoders,
+headers: done), then libsoup and its HTTP and TLS, the image decoders,
 libxml2, SQLite, Fontconfig, WebCrypto; XSLT and Little CMS are
 configured away.
 
@@ -143,7 +143,7 @@ style, svg, ...), one at a time, each alone.
 | | Files |
 |---|---|
 | compile | 28 of 52 |
-| (a) a header of a missing library | 1: libxml2's `<iconv.h>` (mlxlibc has none) |
+| (a) a header of a missing library | 1: libxml2's `<iconv.h>` (mlxlibc had none then) |
 | (b) mlx-cc's memory: the 8 GB arena or the 4 million names | 8: units of style values, layout, CSS parsing and the inspector, heavy with WTF's Variant (mpark) and the style types' templates |
 | (b) mlx-cc errors | 15, below |
 
@@ -162,13 +162,45 @@ Also seen: `std::is_invocable` of a function taking `int&&` holds for
 an `int&` argument in mlx-cc (it does not in C++), which the visitors
 above may meet.
 
+### With the headers made here
+
+GIO's TLS types, `libintl.h`, `iconv.h` and ICU's `ubidi.h`,
+`usearch.h`, `ucnv.h`, `ucnv_err.h`, `ucnv_cb.h` are made of Mlx modules
+now (above). `./mlx build -j 1 --keep-going webkit-wpe-webcore` then
+stops at one header only: all 653 C++ units (518 unified sources and 135
+compiled apart) fail at `libsoup/soup.h` (CertificateInfo.h:31, from
+the prefix's ResourceRequest), and the one C source
+(AccessibilityAtspiInterfaces.c) compiles.
+
+A scratch run with the system's libsoup 3 headers added after mlx-glib's
+(nothing of it kept: the build was patched for the run alone) took
+libsoup's headers over mlx-glib's once `G_DECLARE_INTERFACE` and GIO's
+input stream classes were there. It compiled a sample of whole unified
+sources, every tenth of the 518 (52 units, about ten files each, unlike
+the single files above), one or two at a time:
+
+| | Units |
+|---|---|
+| compile | 11 of 52 (Modules-57, -66, cssjit-1, dom-18, domjit-1, platform-20, -39, -48, -57, -66, plugins-1; and dom-1 outside the sample) |
+| (a) a header of a missing library | 3: `gcrypt.h` (2: crypto, the bindings of WebCrypto), `sqlite3.h` (1: workers) |
+| (b) mlx-cc's memory: "too many names" or the arena | 14 (accessibility, css, html, inspector, layout, mathml, platform, rendering, style) |
+| (b) mlx-cc errors | 24, below |
+
+No unit stopped at a header of GLib, GIO, ICU, `iconv.h` or `libintl.h`.
+
+| mlx-cc error | Units | Where |
+|---|---|---|
+| `expected ';'` in StylePrimitiveNumeric.h:126 | 3 | style values |
+| `static assertion failed` in WTF::switchOn's visitor | 3 | Variant.h:1415 |
+| `expected ';'` reading ConversionResult's `ReturnType` | 2 | JSDOMConvertResult.h:159 |
+| WTF::Function's constructors (`too few arguments`, `no such member`) | 2 | Function.h:56, 59 |
+| mpark::variant's and `std::optional<variant>`'s converting constructors | 2 | GPURenderPassColorAttachment.h:49, IDBRequest.cpp:105 |
+| one each: `not a namespace` (SVGPathSegImpl.h:46), `expected an expression` (WebLock.h:39), `not a compile-time constant` (CSSPrimitiveNumericRaw.h:55), `invalid pointer dereference` of a WeakHashMap (UserActionElementSet.cpp:38), `a conversion operator takes a parameter list` (ImageDataArray.cpp:196), `no such name in the namespace` (WebGLExtension.h:123), `no such member` (FontCustomPlatformData.h:129), `no conversion to bool` (RectEdges.h:186), SpaceSeparatedArray's constructor (CSSBorderRadius.h:66), `expected a function template` (StyleValueTypes.h:513), `invalid numeric constant` (SVGToOTFFontConversion.cpp:163), `expected ','` (SVGPropertyOwnerRegistry.h:72) | 12 | |
+
 ## What is next
 
-- The headers every unit needs before any library is written: GIO's
-  TLS types in mlx-glib, `libintl.h` and `iconv.h` in mlxlibc, ICU's
-  `ubidi.h`, `usearch.h` and `ucnv*.h` in mlx-unicode. With them
-  `./mlx build webkit-wpe-webcore` gets as far as the survey's
-  stand-ins do.
+- libsoup: every unit includes its headers (mlx-soup, its C API over an
+  HTTP client in std, is the first library to write).
 - mlx-cc's memory: a heavy unit (style values, layout, the bindings of
   big interfaces) fills the 8 GB arena or the 4 million names with
   instances of WTF's Variant (mpark) and of the style types' templates.
