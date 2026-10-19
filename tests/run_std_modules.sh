@@ -76,6 +76,9 @@
 #                                       entities and defaults, chunks,
 #                                       UTF-16, Latin-1, content apart,
 #                                       an entity loop)
+#   tests/375_fontconfig_runtime.mlx    std.fontconfig: case folding, names,
+#                                       languages; fonts of the tree read,
+#                                       cached, matched, sorted, listed
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -129,6 +132,7 @@ run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk si
 run 372_sql_runtime "SQLite's reals and numbers, WebKit's SQL parsed, GROUP BY, collations, CHECK, a file of 3000 rows read back"
 run 373_colorprofile_runtime "ICC transforms as Little CMS makes them: BGRA to sRGB, grey, 16-bit, perceptual; the sRGB curve"
 run 374_xml_sax_runtime "XML parsed as libxml2's push parser parses it: SAX2 events, entities, errors, chunks, encodings"
+run 375_fontconfig_runtime "Fontconfig's case folding, names and substitutions; fonts read, cached, matched, sorted and listed as Fontconfig 2.15 does"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
