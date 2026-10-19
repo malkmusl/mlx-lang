@@ -119,7 +119,8 @@ system without it:
   only its URI (GIO's GDummyFile without a VFS module), and operations on
   it fail with `G_IO_ERROR_NOT_SUPPORTED`. GFileInfo, enumerators and
   streams (GInputStream, GOutputStream, `g_resource_open_stream`) are not
-  here.
+  here (their instance and class structures are, as GIO lays them out, for
+  types declared over them: libsoup's SoupMultipartInputStream).
 - **TLS**: there is no TLS implementation yet (the TLS of the HTTP
   client libsoup's layer will need). The backend makes certificates as
   GIO's GnuTLS backend does (`g_tls_certificate_new_from_pem`,
@@ -141,7 +142,8 @@ system without it:
 - **GObject**: class private data (`g_type_add_class_private`) and
   dynamic types (`GTypePlugin`, `GTypeModule`;
   `g_type_register_dynamic` reports a critical and returns 0) are not
-  here. `G_DECLARE_FINAL_TYPE` and `G_DECLARE_DERIVABLE_TYPE` are (as C
+  here. `G_DECLARE_FINAL_TYPE`, `G_DECLARE_DERIVABLE_TYPE` and
+  `G_DECLARE_INTERFACE` are (as C
   the header carries, `c_macros`), the `G_DEFINE_*` macros not yet;
   `g_autoptr` is not (mlx-cc has no cleanup attribute): the cleanup
   functions are declared for code that calls them.

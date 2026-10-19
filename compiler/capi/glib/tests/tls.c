@@ -12,6 +12,21 @@
 #include <stdio.h>
 #include <string.h>
 
+/* What libsoup's headers declare with GIO's beside the TLS types: an
+   interface (G_DECLARE_INTERFACE, as SoupSessionFeature) and a final
+   type over a filter input stream (SoupMultipartInputStream), whose class
+   holds GIO's stream classes whole. Only declared: the types are not
+   registered. */
+G_BEGIN_DECLS
+G_DECLARE_INTERFACE(TestFeature, test_feature, TEST, FEATURE, GObject)
+G_DECLARE_FINAL_TYPE(TestFilter, test_filter, TEST, FILTER, GFilterInputStream)
+G_END_DECLS
+
+GType test_feature_get_type(void) { return G_TYPE_INVALID; }
+GType test_filter_get_type(void) { return G_TYPE_INVALID; }
+
+_Static_assert(sizeof(TestFilterClass) == sizeof(GObjectClass) + 17 * sizeof(gpointer), "GIO's stream classes");
+
 /* Two public root certificates (ISRG Root X2, GTS Root R4), a key, and a
    certificate authority with a certificate it issued, made for this test
    alone. */
