@@ -1,0 +1,953 @@
+// std.colorprofile.link: profiles joined into one pipeline as Little CMS
+// (2.14) joins them for the four ICC intents (cmsio1.c, cmscnvrt.c's
+// DefaultICCintents): each profile's transform from its colour space to
+// the PCS (an input) or back (an output): the LUT-based tags for the
+// intent (A2Bn, B2An, falling back to the perceptual ones) with the Lab
+// V2 <-> V4 encodings around 16-bit LUTs, else the matrix and the tone
+// curves (grey: the grey curve); and between two profiles the
+// conversion of the PCS: Lab and XYZ, and for absolute colorimetry the
+// scaling of the media white points.
+//
+// Black point compensation (asked for, or implied for the perceptual and
+// saturation intents of version 4 profiles) scales XYZ between the
+// profiles' black points, which are found as Little CMS finds them
+// (cmssamp.c): the darkest colorant through a Lab profile, the perceptual
+// black of version 4, or the round trip of Lab through an output profile
+// fitted with a quadratic. Float tags (D2Bn) are not read: such a link
+// fails.
+const mem = @import("./mem.mlx")
+const curve = @import("./curve.mlx")
+const pipeline = @import("./pipeline.mlx")
+const profile = @import("./profile.mlx")
+const matrix = @import("./matrix.mlx")
+const optimize = @import("./optimize.mlx")
+
+pub const Allocator = mem.Allocator
+pub const Profile = profile.Profile
+
+pub const INTENT_PERCEPTUAL: u64 = 0
+pub const INTENT_RELATIVE_COLORIMETRIC: u64 = 1
+pub const INTENT_SATURATION: u64 = 2
+pub const INTENT_ABSOLUTE_COLORIMETRIC: u64 = 3
+
+pub const FLAGS_NONEGATIVES: u64 = 0x8000
+
+// MAX_ENCODEABLE_XYZ's inverse and itself, as cmsio1.c's InpAdj and
+// OutpAdj.
+inline fn inputAdjust() -> f64 { return 1.0 / mem.MAX_ENCODEABLE_XYZ }
+inline fn outputAdjust() -> f64 { return mem.MAX_ENCODEABLE_XYZ }
+
+fn device2pcs16(intent: u64) -> u64 {
+    if intent == 0 { return profile.TAG_A2B0 }
+    if intent == 2 { return profile.TAG_A2B2 }
+    return profile.TAG_A2B1
+}
+
+fn device2pcsFloat(intent: u64) -> u64 {
+    if intent == 0 { return profile.TAG_D2B0 }
+    if intent == 1 { return profile.TAG_D2B1 }
+    if intent == 2 { return profile.TAG_D2B2 }
+    return profile.TAG_D2B3
+}
+
+fn pcs2device16(intent: u64) -> u64 {
+    if intent == 0 { return profile.TAG_B2A0 }
+    if intent == 2 { return profile.TAG_B2A2 }
+    return profile.TAG_B2A1
+}
+
+fn pcs2deviceFloat(intent: u64) -> u64 {
+    if intent == 0 { return profile.TAG_B2D0 }
+    if intent == 1 { return profile.TAG_B2D1 }
+    if intent == 2 { return profile.TAG_B2D2 }
+    return profile.TAG_B2D3
+}
+
+// _cmsReadMediaWhitePoint: D50 without the tag and for version 2 display
+// profiles.
+pub fn mediaWhitePoint(p: *Profile, out: *[3]f64) -> void {
+    const tag = profile.readXYZTag(p, profile.TAG_MEDIA_WHITE_POINT)
+    if tag == 0 || (p.*.version < 0x4000000 && p.*.deviceClass == profile.CLASS_DISPLAY) {
+        out.*[0] = mem.D50X
+        out.*[1] = mem.D50Y
+        out.*[2] = mem.D50Z
+        return
+    }
+    out.*[0] = mem.doubles(tag)[0]
+    out.*[1] = mem.doubles(tag)[1]
+    out.*[2] = mem.doubles(tag)[2]
+}
+
+// _cmsReadCHAD: the tag; else for version 2 display profiles the
+// adaptation of their white point to D50; else the identity.
+pub fn chromaticAdaptation(p: *Profile, out: *[9]f64) -> void {
+    const tag = profile.readDoublesTag(p, profile.TAG_CHROMATIC_ADAPTATION)
+    if tag != 0 {
+        var index: usize = 0
+        while index < 9 {
+            out.*[index] = mem.doubles(tag)[index]
+            index += 1
+        }
+        return
+    }
+    matrix.identity(out)
+    if p.*.version < 0x4000000 && p.*.deviceClass == profile.CLASS_DISPLAY {
+        const white = profile.readXYZTag(p, profile.TAG_MEDIA_WHITE_POINT)
+        if white == 0 { return }
+        var from: [3]f64 = undefined
+        from[0] = mem.doubles(white)[0]
+        from[1] = mem.doubles(white)[1]
+        from[2] = mem.doubles(white)[2]
+        var d50: [3]f64 = undefined
+        d50[0] = mem.D50X
+        d50[1] = mem.D50Y
+        d50[2] = mem.D50Z
+        const ignored = matrix.adaptationMatrix(out, &from, &d50)
+    }
+}
+
+// ReadICCMatrixRGB2XYZ: the colorants as columns.
+fn colorants(p: *Profile, m: *[9]f64) -> bool {
+    const red = profile.readXYZTag(p, profile.TAG_RED_COLORANT)
+    const green = profile.readXYZTag(p, profile.TAG_GREEN_COLORANT)
+    const blue = profile.readXYZTag(p, profile.TAG_BLUE_COLORANT)
+    if red == 0 || green == 0 || blue == 0 { return false }
+    var index: usize = 0
+    while index < 3 {
+        m.*[index * 3] = mem.doubles(red)[index]
+        m.*[index * 3 + 1] = mem.doubles(green)[index]
+        m.*[index * 3 + 2] = mem.doubles(blue)[index]
+        index += 1
+    }
+    return true
+}
+
+fn trcCurves(p: *Profile, curves: *[3]usize) -> bool {
+    curves.*[0] = profile.readCurveTag(p, profile.TAG_RED_TRC)
+    curves.*[1] = profile.readCurveTag(p, profile.TAG_GREEN_TRC)
+    curves.*[2] = profile.readCurveTag(p, profile.TAG_BLUE_TRC)
+    return curves.*[0] != 0 && curves.*[1] != 0 && curves.*[2] != 0
+}
+
+fn buildGrayInput(p: *Profile) -> usize {
+    const allocator = p.*.allocator
+    const gray = profile.readCurveTag(p, profile.TAG_GRAY_TRC)
+    if gray == 0 { return 0 }
+    const address = pipeline.allocPipeline(allocator, 1, 3)
+    if address == 0 { return 0 }
+    const pipe = pipeline.pipelineAt(address)
+    var good = true
+    if p.*.pcs == profile.SPACE_LAB {
+        var zero: [2]u16 = undefined
+        zero[0] = 0x8080
+        zero[1] = 0x8080
+        const empty = curve.buildTabulated16(allocator, 2, @intFromPtr(&zero))
+        var ones: [3]f64 = undefined
+        ones[0] = 1.0
+        ones[1] = 1.0
+        ones[2] = 1.0
+        var lab: [3]usize = undefined
+        lab[0] = gray
+        lab[1] = empty
+        lab[2] = empty
+        good = empty != 0 && pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 1, @intFromPtr(&ones), 0))
+        if good { good = pipeline.insertStage(pipe, true, pipeline.toneCurves(allocator, 3, @intFromPtr(&lab))) }
+        curve.freeCurve(empty)
+    } else {
+        var one: [1]usize = undefined
+        one[0] = gray
+        var m: [3]f64 = undefined
+        m[0] = inputAdjust() * mem.D50X
+        m[1] = inputAdjust() * mem.D50Y
+        m[2] = inputAdjust() * mem.D50Z
+        good = pipeline.insertStage(pipe, true, pipeline.toneCurves(allocator, 1, @intFromPtr(&one)))
+        if good { good = pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 1, @intFromPtr(&m), 0)) }
+    }
+    if !good {
+        pipeline.freePipeline(address)
+        return 0
+    }
+    return address
+}
+
+fn buildRGBInput(p: *Profile) -> usize {
+    const allocator = p.*.allocator
+    var m: [9]f64 = undefined
+    if !colorants(p, &m) { return 0 }
+    var index: usize = 0
+    while index < 9 {
+        m[index] = m[index] * inputAdjust()
+        index += 1
+    }
+    var shapes: [3]usize = undefined
+    if !trcCurves(p, &shapes) { return 0 }
+    const address = pipeline.allocPipeline(allocator, 3, 3)
+    if address == 0 { return 0 }
+    const pipe = pipeline.pipelineAt(address)
+    var good = pipeline.insertStage(pipe, true, pipeline.toneCurves(allocator, 3, @intFromPtr(&shapes)))
+    if good { good = pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 3, @intFromPtr(&m), 0)) }
+    if good && p.*.pcs == profile.SPACE_LAB { good = pipeline.insertStage(pipe, true, pipeline.xyz2lab(allocator)) }
+    if !good {
+        pipeline.freePipeline(address)
+        return 0
+    }
+    return address
+}
+
+// _cmsReadInputLUT.
+pub fn readInputLUT(p: *Profile, intent: u64) -> usize {
+    const allocator = p.*.allocator
+    if p.*.deviceClass == profile.CLASS_NAMED_COLOR { return 0 }
+    if intent <= INTENT_ABSOLUTE_COLORIMETRIC {
+        if profile.isTag(p, device2pcsFloat(intent)) { return 0 }
+        var tag16 = device2pcs16(intent)
+        if !profile.isTag(p, tag16) { tag16 = profile.TAG_A2B0 }
+        if profile.isTag(p, tag16) {
+            const read = profile.readPipelineTag(p, tag16)
+            if read == 0 { return 0 }
+            const lut = pipeline.duplicatePipeline(read)
+            if lut == 0 { return 0 }
+            if profile.tagType(p, tag16) != profile.TYPE_LUT16 || p.*.pcs != profile.SPACE_LAB { return lut }
+            const pipe = pipeline.pipelineAt(lut)
+            var good = true
+            if p.*.colorSpace == profile.SPACE_LAB { good = pipeline.insertStage(pipe, false, pipeline.labV4ToV2(allocator)) }
+            if good { good = pipeline.insertStage(pipe, true, pipeline.labV2ToV4(allocator)) }
+            if !good {
+                pipeline.freePipeline(lut)
+                return 0
+            }
+            return lut
+        }
+    }
+    if p.*.colorSpace == profile.SPACE_GRAY { return buildGrayInput(p) }
+    return buildRGBInput(p)
+}
+
+fn buildGrayOutput(p: *Profile) -> usize {
+    const allocator = p.*.allocator
+    const gray = profile.readCurveTag(p, profile.TAG_GRAY_TRC)
+    if gray == 0 { return 0 }
+    const reversed = curve.reverse(gray, 4096)
+    if reversed == 0 { return 0 }
+    const address = pipeline.allocPipeline(allocator, 3, 1)
+    if address == 0 {
+        curve.freeCurve(reversed)
+        return 0
+    }
+    const pipe = pipeline.pipelineAt(address)
+    var pick: [3]f64 = undefined
+    if p.*.pcs == profile.SPACE_LAB {
+        pick[0] = 1.0
+        pick[1] = 0.0
+        pick[2] = 0.0
+    } else {
+        pick[0] = 0.0
+        pick[1] = outputAdjust() * mem.D50Y
+        pick[2] = 0.0
+    }
+    var one: [1]usize = undefined
+    one[0] = reversed
+    var good = pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 1, 3, @intFromPtr(&pick), 0))
+    if good { good = pipeline.insertStage(pipe, true, pipeline.toneCurves(allocator, 1, @intFromPtr(&one))) }
+    curve.freeCurve(reversed)
+    if !good {
+        pipeline.freePipeline(address)
+        return 0
+    }
+    return address
+}
+
+fn buildRGBOutput(p: *Profile) -> usize {
+    const allocator = p.*.allocator
+    var m: [9]f64 = undefined
+    if !colorants(p, &m) { return 0 }
+    var inverse: [9]f64 = undefined
+    if !matrix.inverse(&m, &inverse) { return 0 }
+    var index: usize = 0
+    while index < 9 {
+        inverse[index] = inverse[index] * outputAdjust()
+        index += 1
+    }
+    var shapes: [3]usize = undefined
+    if !trcCurves(p, &shapes) { return 0 }
+    var inverses: [3]usize = undefined
+    inverses[0] = curve.reverse(shapes[0], 4096)
+    inverses[1] = curve.reverse(shapes[1], 4096)
+    inverses[2] = curve.reverse(shapes[2], 4096)
+    var address: usize = 0
+    if inverses[0] != 0 && inverses[1] != 0 && inverses[2] != 0 {
+        address = pipeline.allocPipeline(allocator, 3, 3)
+        if address != 0 {
+            const pipe = pipeline.pipelineAt(address)
+            var good = true
+            if p.*.pcs == profile.SPACE_LAB { good = pipeline.insertStage(pipe, true, pipeline.lab2xyz(allocator)) }
+            if good { good = pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 3, @intFromPtr(&inverse), 0)) }
+            if good { good = pipeline.insertStage(pipe, true, pipeline.toneCurves(allocator, 3, @intFromPtr(&inverses))) }
+            if !good {
+                pipeline.freePipeline(address)
+                address = 0
+            }
+        }
+    }
+    curve.freeCurve(inverses[0])
+    curve.freeCurve(inverses[1])
+    curve.freeCurve(inverses[2])
+    return address
+}
+
+fn changeToTrilinear(pipe: *pipeline.Pipeline) -> void {
+    var at = pipe.*.first
+    while at != 0 {
+        const stage = pipeline.stageAt(at)
+        if stage.*.kind == pipeline.SIG_CLUT { stage.*.clut.trilinear = true }
+        at = stage.*.next
+    }
+}
+
+// _cmsReadOutputLUT.
+pub fn readOutputLUT(p: *Profile, intent: u64) -> usize {
+    const allocator = p.*.allocator
+    if intent <= INTENT_ABSOLUTE_COLORIMETRIC {
+        if profile.isTag(p, pcs2deviceFloat(intent)) { return 0 }
+        var tag16 = pcs2device16(intent)
+        if !profile.isTag(p, tag16) { tag16 = profile.TAG_B2A0 }
+        if profile.isTag(p, tag16) {
+            const read = profile.readPipelineTag(p, tag16)
+            if read == 0 { return 0 }
+            const lut = pipeline.duplicatePipeline(read)
+            if lut == 0 { return 0 }
+            const pipe = pipeline.pipelineAt(lut)
+            if p.*.pcs == profile.SPACE_LAB { changeToTrilinear(pipe) }
+            if profile.tagType(p, tag16) != profile.TYPE_LUT16 || p.*.pcs != profile.SPACE_LAB { return lut }
+            var good = pipeline.insertStage(pipe, false, pipeline.labV4ToV2(allocator))
+            if good && p.*.colorSpace == profile.SPACE_LAB { good = pipeline.insertStage(pipe, true, pipeline.labV2ToV4(allocator)) }
+            if !good {
+                pipeline.freePipeline(lut)
+                return 0
+            }
+            return lut
+        }
+    }
+    if p.*.colorSpace == profile.SPACE_GRAY { return buildGrayOutput(p) }
+    return buildRGBOutput(p)
+}
+
+// _cmsReadDevicelinkLUT (device links and abstract profiles).
+pub fn readDevicelinkLUT(p: *Profile, intent: u64) -> usize {
+    const allocator = p.*.allocator
+    if intent > INTENT_ABSOLUTE_COLORIMETRIC { return 0 }
+    if p.*.deviceClass == profile.CLASS_NAMED_COLOR { return 0 }
+    if profile.isTag(p, device2pcsFloat(intent)) || profile.isTag(p, profile.TAG_D2B0) { return 0 }
+    var tag16 = device2pcs16(intent)
+    if !profile.isTag(p, tag16) {
+        tag16 = profile.TAG_A2B0
+        if !profile.isTag(p, tag16) { return 0 }
+    }
+    const read = profile.readPipelineTag(p, tag16)
+    if read == 0 { return 0 }
+    const lut = pipeline.duplicatePipeline(read)
+    if lut == 0 { return 0 }
+    const pipe = pipeline.pipelineAt(lut)
+    if p.*.pcs == profile.SPACE_LAB { changeToTrilinear(pipe) }
+    if profile.tagType(p, tag16) != profile.TYPE_LUT16 { return lut }
+    var good = true
+    if p.*.colorSpace == profile.SPACE_LAB { good = pipeline.insertStage(pipe, false, pipeline.labV4ToV2(allocator)) }
+    if good && p.*.pcs == profile.SPACE_LAB { good = pipeline.insertStage(pipe, true, pipeline.labV2ToV4(allocator)) }
+    if !good {
+        pipeline.freePipeline(lut)
+        return 0
+    }
+    return lut
+}
+
+pub fn isMatrixShaper(p: *Profile) -> bool {
+    if p.*.colorSpace == profile.SPACE_GRAY { return profile.isTag(p, profile.TAG_GRAY_TRC) }
+    if p.*.colorSpace == profile.SPACE_RGB {
+        return profile.isTag(p, profile.TAG_RED_COLORANT) && profile.isTag(p, profile.TAG_GREEN_COLORANT) && profile.isTag(p, profile.TAG_BLUE_COLORANT) && profile.isTag(p, profile.TAG_RED_TRC) && profile.isTag(p, profile.TAG_GREEN_TRC) && profile.isTag(p, profile.TAG_BLUE_TRC)
+    }
+    return false
+}
+
+// cmsIsCLUT: DIRECTION 0 input, 1 output.
+pub fn isCLUT(p: *Profile, intent: u64, direction: u64) -> bool {
+    if p.*.deviceClass == profile.CLASS_LINK { return p.*.renderingIntent == intent }
+    if intent > INTENT_ABSOLUTE_COLORIMETRIC { return false }
+    if direction == 0 { return profile.isTag(p, device2pcs16(intent)) }
+    if direction == 1 { return profile.isTag(p, pcs2device16(intent)) }
+    if direction == 2 { return isIntentSupported(p, intent, 0) && isIntentSupported(p, INTENT_RELATIVE_COLORIMETRIC, 1) }
+    return false
+}
+
+pub fn isIntentSupported(p: *Profile, intent: u64, direction: u64) -> bool {
+    if isCLUT(p, intent, direction) { return true }
+    return isMatrixShaper(p)
+}
+
+// ---------------------------------------------------------------------------
+// Joining (cmscnvrt.c)
+
+// ComputeAbsoluteIntent for an adaptation state of 1 (the default) or 0.
+fn absoluteIntent(state: f64, whiteIn: *[3]f64, chadIn: *[9]f64, whiteOut: *[3]f64, chadOut: *[9]f64, m: *[9]f64) -> bool {
+    var scale: [9]f64 = undefined
+    var index: usize = 0
+    while index < 9 {
+        scale[index] = 0.0
+        index += 1
+    }
+    scale[0] = whiteIn.*[0] / whiteOut.*[0]
+    scale[4] = whiteIn.*[1] / whiteOut.*[1]
+    scale[8] = whiteIn.*[2] / whiteOut.*[2]
+    if state == 1.0 {
+        index = 0
+        while index < 9 {
+            m.*[index] = scale[index]
+            index += 1
+        }
+        return true
+    }
+    if state == 0.0 {
+        var m2: [9]f64 = undefined
+        matrix.multiply(&m2, chadOut, &scale)
+        var m4: [9]f64 = undefined
+        if !matrix.inverse(chadIn, &m4) { return false }
+        matrix.multiply(m, &m2, &m4)
+        return true
+    }
+    return false
+}
+
+// IsEmptyLayer.
+fn isEmptyLayer(m: *[9]f64, offset: *[3]f64) -> bool {
+    var diff: f64 = 0.0
+    var index: usize = 0
+    while index < 9 {
+        const expected: f64 = if index == 0 || index == 4 || index == 8 { 1.0 } else { 0.0 }
+        diff += mem.fabs(m.*[index] - expected)
+        index += 1
+    }
+    index = 0
+    while index < 3 {
+        diff += mem.fabs(offset.*[index])
+        index += 1
+    }
+    return diff < 0.002
+}
+
+// AddConversion: from the PCS INPCS to OUTPCS through M and OFFSET.
+fn addConversion(pipe: *pipeline.Pipeline, inPCS: u64, outPCS: u64, m: *[9]f64, offset: *[3]f64) -> bool {
+    const allocator = pipe.*.allocator
+    const empty = isEmptyLayer(m, offset)
+    if inPCS == profile.SPACE_XYZ {
+        if outPCS == profile.SPACE_XYZ {
+            if !empty { return pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 3, @intFromPtr(m), @intFromPtr(offset))) }
+            return true
+        }
+        if outPCS == profile.SPACE_LAB {
+            if !empty && !pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 3, @intFromPtr(m), @intFromPtr(offset))) { return false }
+            return pipeline.insertStage(pipe, true, pipeline.xyz2lab(allocator))
+        }
+        return false
+    }
+    if inPCS == profile.SPACE_LAB {
+        if outPCS == profile.SPACE_XYZ {
+            if !pipeline.insertStage(pipe, true, pipeline.lab2xyz(allocator)) { return false }
+            if !empty { return pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 3, @intFromPtr(m), @intFromPtr(offset))) }
+            return true
+        }
+        if outPCS == profile.SPACE_LAB {
+            if !empty {
+                if !pipeline.insertStage(pipe, true, pipeline.lab2xyz(allocator)) { return false }
+                if !pipeline.insertStage(pipe, true, pipeline.matrix(allocator, 3, 3, @intFromPtr(m), @intFromPtr(offset))) { return false }
+                return pipeline.insertStage(pipe, true, pipeline.xyz2lab(allocator))
+            }
+            return true
+        }
+        return false
+    }
+    return inPCS == outPCS
+}
+
+fn compatible(a: u64, b: u64) -> bool {
+    if a == b { return true }
+    if a == 0x34434C52 && b == profile.SPACE_CMYK { return true }
+    if a == profile.SPACE_CMYK && b == 0x34434C52 { return true }
+    if a == profile.SPACE_XYZ && b == profile.SPACE_LAB { return true }
+    if a == profile.SPACE_LAB && b == profile.SPACE_XYZ { return true }
+    return false
+}
+
+// ComputeConversion: M and OFFSET between profile I-1 and I.
+fn computeConversion(previous: *Profile, current: *Profile, intent: u64, bpc: bool, state: f64, m: *[9]f64, offset: *[3]f64) -> bool {
+    matrix.identity(m)
+    offset.*[0] = 0.0
+    offset.*[1] = 0.0
+    offset.*[2] = 0.0
+    if intent == INTENT_ABSOLUTE_COLORIMETRIC {
+        var whiteIn: [3]f64 = undefined
+        var whiteOut: [3]f64 = undefined
+        var chadIn: [9]f64 = undefined
+        var chadOut: [9]f64 = undefined
+        mediaWhitePoint(previous, &whiteIn)
+        chromaticAdaptation(previous, &chadIn)
+        mediaWhitePoint(current, &whiteOut)
+        chromaticAdaptation(current, &chadOut)
+        if !absoluteIntent(state, &whiteIn, &chadIn, &whiteOut, &chadOut, m) { return false }
+    } else if bpc {
+        var blackIn: [3]f64 = undefined
+        var blackOut: [3]f64 = undefined
+        const ignoredIn = detectBlackPoint(previous, intent, &blackIn)
+        const ignoredOut = detectDestinationBlackPoint(current, intent, &blackOut)
+        if blackIn[0] != blackOut[0] || blackIn[1] != blackOut[1] || blackIn[2] != blackOut[2] {
+            blackPointCompensation(&blackIn, &blackOut, m, offset)
+        }
+    }
+    var index: usize = 0
+    while index < 3 {
+        offset.*[index] = offset.*[index] / mem.MAX_ENCODEABLE_XYZ
+        index += 1
+    }
+    return true
+}
+
+// _cmsLinkProfiles and DefaultICCintents: the pipeline of the COUNT
+// profiles at PROFILES (addresses), with their INTENTS, black point
+// compensation BPC (bools, changed as Little CMS changes them) and
+// adaptation STATES. 0 when they do not link.
+pub fn linkProfiles(allocator: Allocator, count: usize, profiles: [*]const usize, intents: [*]const u64, bpc: [*]bool, states: [*]const f64, flags: u64) -> usize {
+    if count == 0 || count > 255 { return 0 }
+    var index: usize = 0
+    while index < count {
+        if intents[index] == INTENT_ABSOLUTE_COLORIMETRIC { bpc[index] = false }
+        if intents[index] == INTENT_PERCEPTUAL || intents[index] == INTENT_SATURATION {
+            if profile.profileAt(profiles[index]).*.version >= 0x4000000 { bpc[index] = true }
+        }
+        if intents[index] > INTENT_ABSOLUTE_COLORIMETRIC { return 0 }
+        index += 1
+    }
+    const result = pipeline.allocPipeline(allocator, 0, 0)
+    if result == 0 { return 0 }
+    const out = pipeline.pipelineAt(result)
+    var current = profile.profileAt(profiles[0]).*.colorSpace
+    var spaceOut = profile.SPACE_LAB
+    var m: [9]f64 = undefined
+    var offset: [3]f64 = undefined
+    index = 0
+    while index < count {
+        const p = profile.profileAt(profiles[index])
+        const cl = p.*.deviceClass
+        const isDeviceLink = cl == profile.CLASS_LINK || cl == profile.CLASS_ABSTRACT
+        var isInput = false
+        if index == 0 && !isDeviceLink {
+            isInput = true
+        } else {
+            isInput = current != profile.SPACE_XYZ && current != profile.SPACE_LAB
+        }
+        const intent = intents[index]
+        var spaceIn: u64 = 0
+        if isInput || isDeviceLink {
+            spaceIn = p.*.colorSpace
+            spaceOut = p.*.pcs
+        } else {
+            spaceIn = p.*.pcs
+            spaceOut = p.*.colorSpace
+        }
+        if !compatible(spaceIn, current) {
+            pipeline.freePipeline(result)
+            return 0
+        }
+        var lut: usize = 0
+        if isDeviceLink || (cl == profile.CLASS_NAMED_COLOR && count == 1) {
+            lut = readDevicelinkLUT(p, intent)
+            if lut == 0 {
+                pipeline.freePipeline(result)
+                return 0
+            }
+            var good = true
+            if cl == profile.CLASS_ABSTRACT && index > 0 {
+                good = computeConversion(profile.profileAt(profiles[index - 1]), p, intent, bpc[index], states[index], &m, &offset)
+            } else {
+                matrix.identity(&m)
+                offset[0] = 0.0
+                offset[1] = 0.0
+                offset[2] = 0.0
+            }
+            if good { good = addConversion(out, current, spaceIn, &m, &offset) }
+            if !good {
+                pipeline.freePipeline(lut)
+                pipeline.freePipeline(result)
+                return 0
+            }
+        } else if isInput {
+            lut = readInputLUT(p, intent)
+            if lut == 0 {
+                pipeline.freePipeline(result)
+                return 0
+            }
+        } else {
+            lut = readOutputLUT(p, intent)
+            if lut == 0 {
+                pipeline.freePipeline(result)
+                return 0
+            }
+            var good = computeConversion(profile.profileAt(profiles[index - 1]), p, intent, bpc[index], states[index], &m, &offset)
+            if good { good = addConversion(out, current, spaceIn, &m, &offset) }
+            if !good {
+                pipeline.freePipeline(lut)
+                pipeline.freePipeline(result)
+                return 0
+            }
+        }
+        const joined = pipeline.concatenate(out, pipeline.pipelineAt(lut))
+        pipeline.freePipeline(lut)
+        if !joined {
+            pipeline.freePipeline(result)
+            return 0
+        }
+        current = spaceOut
+        index += 1
+    }
+    if (flags & FLAGS_NONEGATIVES) != 0 {
+        if spaceOut == profile.SPACE_GRAY || spaceOut == profile.SPACE_RGB || spaceOut == profile.SPACE_CMYK {
+            if !pipeline.insertStage(out, true, pipeline.clipNegatives(allocator, profile.channelsOf(spaceOut))) {
+                pipeline.freePipeline(result)
+                return 0
+            }
+        }
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Black points (cmssamp.c)
+
+const PERCEPTUAL_BLACK_X: f64 = 0.00336
+const PERCEPTUAL_BLACK_Y: f64 = 0.0034731
+const PERCEPTUAL_BLACK_Z: f64 = 0.00287
+
+fn setXYZ(out: *[3]f64, x: f64, y: f64, z: f64) -> void {
+    out.*[0] = x
+    out.*[1] = y
+    out.*[2] = z
+}
+
+// ComputeBlackPointCompensation.
+fn blackPointCompensation(blackIn: *[3]f64, blackOut: *[3]f64, m: *[9]f64, offset: *[3]f64) -> void {
+    const tx = blackIn.*[0] - mem.D50X
+    const ty = blackIn.*[1] - mem.D50Y
+    const tz = blackIn.*[2] - mem.D50Z
+    const ax = (blackOut.*[0] - mem.D50X) / tx
+    const ay = (blackOut.*[1] - mem.D50Y) / ty
+    const az = (blackOut.*[2] - mem.D50Z) / tz
+    const bx = -mem.D50X * (blackOut.*[0] - blackIn.*[0]) / tx
+    const by = -mem.D50Y * (blackOut.*[1] - blackIn.*[1]) / ty
+    const bz = -mem.D50Z * (blackOut.*[2] - blackIn.*[2]) / tz
+    matrix.identity(m)
+    m.*[0] = ax
+    m.*[4] = ay
+    m.*[8] = az
+    offset.*[0] = bx
+    offset.*[1] = by
+    offset.*[2] = bz
+}
+
+// The COUNT profiles linked for INTENTS (no black point compensation
+// asked for) as a float transform made without optimization, on INPUT
+// into OUTPUT; false when they do not link.
+fn evalChain(allocator: Allocator, count: usize, profiles: [*]const usize, intents: [*]const u64, input: [*]const f32, output: [*]f32) -> bool {
+    var bpc: [4]bool = undefined
+    var states: [4]f64 = undefined
+    var index: usize = 0
+    while index < 4 {
+        bpc[index] = false
+        states[index] = 1.0
+        index += 1
+    }
+    const lut = linkProfiles(allocator, count, profiles, intents, &bpc, &states, 0x0100)
+    if lut == 0 { return false }
+    const scratch = mem.allocate(allocator, pipeline.SCRATCH_SIZE)
+    if scratch == 0 {
+        pipeline.freePipeline(lut)
+        return false
+    }
+    const ignored = optimize.preOptimize(pipeline.pipelineAt(lut))
+    pipeline.evalFloat(pipeline.pipelineAt(lut), input, output, scratch)
+    mem.release(allocator, scratch)
+    optimize.freePipeline(lut)
+    return true
+}
+
+// BlackPointAsDarkerColorant: the profile's darkest colorant through a
+// Lab profile, its a* and b* dropped, L* at most 50.
+fn blackPointAsDarkerColorant(p: *Profile, intent: u64, out: *[3]f64) -> bool {
+    setXYZ(out, 0.0, 0.0, 0.0)
+    if !isIntentSupported(p, intent, 0) { return false }
+    const space = p.*.colorSpace
+    var black: [4]f32 = undefined
+    var channels: usize = 0
+    if space == profile.SPACE_GRAY {
+        black[0] = @floatCast(f32, 0.0)
+        channels = 1
+    } else if space == profile.SPACE_RGB {
+        black[0] = @floatCast(f32, 0.0)
+        black[1] = @floatCast(f32, 0.0)
+        black[2] = @floatCast(f32, 0.0)
+        channels = 3
+    } else if space == profile.SPACE_LAB {
+        black[0] = @floatCast(f32, 0.0)
+        black[1] = @floatFromInt(f32, 0x8080) / @floatCast(f32, 65535.0)
+        black[2] = black[1]
+        channels = 3
+    } else if space == profile.SPACE_CMYK {
+        black[0] = @floatCast(f32, 1.0)
+        black[1] = black[0]
+        black[2] = black[0]
+        black[3] = black[0]
+        channels = 4
+    } else if space == profile.SPACE_CMY {
+        black[0] = @floatCast(f32, 1.0)
+        black[1] = black[0]
+        black[2] = black[0]
+        channels = 3
+    } else {
+        return false
+    }
+    if @intCast(i64, channels) != profile.channelsOfSpace(space) { return false }
+    const allocator = p.*.allocator
+    const lab = profile.createLab(allocator, false)
+    if lab == 0 { return false }
+    var profiles: [2]usize = undefined
+    profiles[0] = @intFromPtr(p)
+    profiles[1] = lab
+    var intents: [2]u64 = undefined
+    intents[0] = intent
+    intents[1] = intent
+    var result: [16]f32 = undefined
+    const linked = evalChain(allocator, 2, &profiles, &intents, &black, &result)
+    profile.close(lab)
+    if !linked { return false }
+    var l = @floatCast(f64, result[0]) * 100.0
+    if l > 50.0 { l = 50.0 }
+    if l < 0.0 { l = 0.0 }
+    pipeline.labToXyz(l, 0.0, 0.0, mem.D50X, mem.D50Y, mem.D50Z, out)
+    return true
+}
+
+// CreateRoundtripXForm on one Lab colour: Lab, the profile as output for
+// INTENT, as input relatively, Lab again.
+fn roundTrip(p: *Profile, intent: u64, labIn: *[3]f64, labOut: *[3]f64) -> bool {
+    const allocator = p.*.allocator
+    const lab = profile.createLab(allocator, true)
+    if lab == 0 { return false }
+    var profiles: [4]usize = undefined
+    profiles[0] = lab
+    profiles[1] = @intFromPtr(p)
+    profiles[2] = @intFromPtr(p)
+    profiles[3] = lab
+    var intents: [4]u64 = undefined
+    intents[0] = INTENT_RELATIVE_COLORIMETRIC
+    intents[1] = intent
+    intents[2] = INTENT_RELATIVE_COLORIMETRIC
+    intents[3] = INTENT_RELATIVE_COLORIMETRIC
+    var input: [4]f32 = undefined
+    input[0] = @floatCast(f32, labIn.*[0] / 100.0)
+    input[1] = @floatCast(f32, (labIn.*[1] + 128.0) / 255.0)
+    input[2] = @floatCast(f32, (labIn.*[2] + 128.0) / 255.0)
+    var result: [16]f32 = undefined
+    const linked = evalChain(allocator, 4, &profiles, &intents, &input, &result)
+    profile.close(lab)
+    if !linked { return false }
+    labOut.*[0] = @floatCast(f64, result[0]) * 100.0
+    labOut.*[1] = @floatCast(f64, result[1]) * 255.0 - 128.0
+    labOut.*[2] = @floatCast(f64, result[2]) * 255.0 - 128.0
+    return true
+}
+
+// BlackPointUsingPerceptualBlack.
+fn blackPointUsingPerceptualBlack(p: *Profile, out: *[3]f64) -> bool {
+    setXYZ(out, 0.0, 0.0, 0.0)
+    if !isIntentSupported(p, INTENT_PERCEPTUAL, 0) { return true }
+    var labIn: [3]f64 = undefined
+    setXYZ(&labIn, 0.0, 0.0, 0.0)
+    var labOut: [3]f64 = undefined
+    if !roundTrip(p, INTENT_PERCEPTUAL, &labIn, &labOut) { return false }
+    var l = labOut[0]
+    if l > 50.0 { l = 50.0 }
+    pipeline.labToXyz(l, 0.0, 0.0, mem.D50X, mem.D50Y, mem.D50Z, out)
+    return true
+}
+
+// cmsDetectBlackPoint.
+pub fn detectBlackPoint(p: *Profile, intent: u64, out: *[3]f64) -> bool {
+    setXYZ(out, 0.0, 0.0, 0.0)
+    const cl = p.*.deviceClass
+    if cl == profile.CLASS_LINK || cl == profile.CLASS_ABSTRACT || cl == profile.CLASS_NAMED_COLOR { return false }
+    if intent != INTENT_PERCEPTUAL && intent != INTENT_RELATIVE_COLORIMETRIC && intent != INTENT_SATURATION { return false }
+    if p.*.version >= 0x4000000 && (intent == INTENT_PERCEPTUAL || intent == INTENT_SATURATION) {
+        if isMatrixShaper(p) { return blackPointAsDarkerColorant(p, INTENT_RELATIVE_COLORIMETRIC, out) }
+        setXYZ(out, PERCEPTUAL_BLACK_X, PERCEPTUAL_BLACK_Y, PERCEPTUAL_BLACK_Z)
+        return true
+    }
+    if intent == INTENT_RELATIVE_COLORIMETRIC && cl == profile.CLASS_OUTPUT && p.*.colorSpace == profile.SPACE_CMYK {
+        return blackPointUsingPerceptualBlack(p, out)
+    }
+    return blackPointAsDarkerColorant(p, intent, out)
+}
+
+inline fn least(a: f64, b: f64) -> f64 { return if a < b { a } else { b } }
+inline fn most(a: f64, b: f64) -> f64 { return if a > b { a } else { b } }
+
+// RootOfLeastSquaresFitQuadraticCurve (its clipping as Little CMS has it).
+fn rootOfQuadraticFit(n: usize, x: [*]const f64, y: [*]const f64) -> f64 {
+    if n < 4 { return 0.0 }
+    var sumX: f64 = 0.0
+    var sumX2: f64 = 0.0
+    var sumX3: f64 = 0.0
+    var sumX4: f64 = 0.0
+    var sumY: f64 = 0.0
+    var sumYX: f64 = 0.0
+    var sumYX2: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        const xn = x[i]
+        const yn = y[i]
+        sumX += xn
+        sumX2 += xn * xn
+        sumX3 += xn * xn * xn
+        sumX4 += xn * xn * xn * xn
+        sumY += yn
+        sumYX += yn * xn
+        sumYX2 += yn * xn * xn
+        i += 1
+    }
+    var m: [9]f64 = undefined
+    m[0] = @floatFromInt(f64, n)
+    m[1] = sumX
+    m[2] = sumX2
+    m[3] = sumX
+    m[4] = sumX2
+    m[5] = sumX3
+    m[6] = sumX2
+    m[7] = sumX3
+    m[8] = sumX4
+    var v: [3]f64 = undefined
+    v[0] = sumY
+    v[1] = sumYX
+    v[2] = sumYX2
+    var inverse: [9]f64 = undefined
+    if !matrix.inverse(&m, &inverse) { return 0.0 }
+    var res: [3]f64 = undefined
+    matrix.apply(&res, &inverse, &v)
+    const a = res[2]
+    const b = res[1]
+    const c = res[0]
+    if mem.fabs(a) < 0.0000000001 {
+        if mem.fabs(b) < 0.0000000001 { return 0.0 }
+        return least(0.0, most(50.0, -c / b))
+    }
+    const d = b * b - 4.0 * a * c
+    if d <= 0.0 { return 0.0 }
+    const rt = (-b + @sqrt(d)) / (2.0 * a)
+    return most(0.0, least(50.0, rt))
+}
+
+// cmsDetectDestinationBlackPoint.
+pub fn detectDestinationBlackPoint(p: *Profile, intent: u64, out: *[3]f64) -> bool {
+    setXYZ(out, 0.0, 0.0, 0.0)
+    const cl = p.*.deviceClass
+    if cl == profile.CLASS_LINK || cl == profile.CLASS_ABSTRACT || cl == profile.CLASS_NAMED_COLOR { return false }
+    if intent != INTENT_PERCEPTUAL && intent != INTENT_RELATIVE_COLORIMETRIC && intent != INTENT_SATURATION { return false }
+    if p.*.version >= 0x4000000 && (intent == INTENT_PERCEPTUAL || intent == INTENT_SATURATION) {
+        if isMatrixShaper(p) { return blackPointAsDarkerColorant(p, INTENT_RELATIVE_COLORIMETRIC, out) }
+        setXYZ(out, PERCEPTUAL_BLACK_X, PERCEPTUAL_BLACK_Y, PERCEPTUAL_BLACK_Z)
+        return true
+    }
+    const space = p.*.colorSpace
+    if !isCLUT(p, intent, 1) || (space != profile.SPACE_GRAY && space != profile.SPACE_RGB && space != profile.SPACE_CMYK) {
+        return detectBlackPoint(p, intent, out)
+    }
+    var initial: [3]f64 = undefined
+    setXYZ(&initial, 0.0, 0.0, 0.0)
+    if intent == INTENT_RELATIVE_COLORIMETRIC {
+        var ini: [3]f64 = undefined
+        if !detectBlackPoint(p, intent, &ini) { return false }
+        pipeline.xyzToLab(ini[0], ini[1], ini[2], mem.D50X, mem.D50Y, mem.D50Z, &initial)
+    }
+    const allocator = p.*.allocator
+    const ramps = mem.allocate(allocator, 256 * 8 * 5)
+    if ramps == 0 { return false }
+    const inRamp = mem.doubles(ramps)
+    const outRamp = mem.doubles(ramps + 2048)
+    const yRamp = mem.doubles(ramps + 4096)
+    const xs = mem.doubles(ramps + 6144)
+    const ys = mem.doubles(ramps + 8192)
+    var lab: [3]f64 = undefined
+    var dest: [3]f64 = undefined
+    var l: usize = 0
+    while l < 256 {
+        lab[0] = @floatFromInt(f64, l) * 100.0 / 255.0
+        lab[1] = least(50.0, most(-50.0, initial[1]))
+        lab[2] = least(50.0, most(-50.0, initial[2]))
+        if !roundTrip(p, intent, &lab, &dest) {
+            mem.release(allocator, ramps)
+            return false
+        }
+        inRamp[l] = lab[0]
+        outRamp[l] = dest[0]
+        l += 1
+    }
+    l = 254
+    while l > 0 {
+        outRamp[l] = least(outRamp[l], outRamp[l + 1])
+        l -= 1
+    }
+    if !(outRamp[0] < outRamp[255]) {
+        mem.release(allocator, ramps)
+        return false
+    }
+    const minL = outRamp[0]
+    const maxL = outRamp[255]
+    if intent == INTENT_RELATIVE_COLORIMETRIC {
+        var straight = true
+        l = 0
+        while l < 256 {
+            if !((inRamp[l] <= minL + 0.2 * (maxL - minL)) || (mem.fabs(inRamp[l] - outRamp[l]) < 4.0)) { straight = false }
+            l += 1
+        }
+        if straight {
+            pipeline.labToXyz(initial[0], initial[1], initial[2], mem.D50X, mem.D50Y, mem.D50Z, out)
+            mem.release(allocator, ramps)
+            return true
+        }
+    }
+    l = 0
+    while l < 256 {
+        yRamp[l] = (outRamp[l] - minL) / (maxL - minL)
+        l += 1
+    }
+    var lo: f64 = 0.03
+    var hi: f64 = 0.25
+    if intent == INTENT_RELATIVE_COLORIMETRIC {
+        lo = 0.1
+        hi = 0.5
+    }
+    var n: usize = 0
+    l = 0
+    while l < 256 {
+        const ff = yRamp[l]
+        if ff >= lo && ff < hi {
+            xs[n] = inRamp[l]
+            ys[n] = yRamp[l]
+            n += 1
+        }
+        l += 1
+    }
+    if n < 3 {
+        mem.release(allocator, ramps)
+        return false
+    }
+    var root = rootOfQuadraticFit(n, xs, ys)
+    if root < 0.0 { root = 0.0 }
+    pipeline.labToXyz(root, initial[1], initial[2], mem.D50X, mem.D50Y, mem.D50Z, out)
+    mem.release(allocator, ramps)
+    return true
+}

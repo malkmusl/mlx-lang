@@ -1,0 +1,1 @@
+<p>para</p>text<b xmlns="urn:b" a="1">bold</b>

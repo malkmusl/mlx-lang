@@ -29,8 +29,8 @@ headless WPEPlatform, no video, web audio, WebRTC, media stream,
 GStreamer, WebGPU, GPU process, spell checking, speech synthesis, AVIF,
 JPEG XL, WOFF2, libdrm, GBM, Wayland, DRM platform, ATK, journald,
 bubblewrap, sysprof, libbacktrace, documentation or introspection; with
-WebGL (ANGLE), XSLT, Little CMS and PDF.js. `cmakeconfig.h` is
-`config.WPE` (config.mlx).
+WebGL (ANGLE), Little CMS and PDF.js, without XSLT (`ENABLE_XSLT=OFF`:
+there is no libxslt). `cmakeconfig.h` is `config.WPE` (config.mlx).
 
 What `OptionsWPE.cmake` requires whatever the options: GLib (with GIO),
 HarfBuzz with its ICU part, ICU, libjpeg, libepoxy, libgcrypt, libsoup
@@ -59,13 +59,13 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 | HarfBuzz (+hb-icu) | text shaping (FontCascade, Skia's) | 46 / 0 (/ 57) | 643 | mlx-harfbuzz (compiler/capi/harfbuzz, std.shaping): all 46 and Skia's 57 declared | done (to be checked at run time) |
 | FreeType | font files, glyphs (Skia's font host) | 0 / 0 (/ 52) | 0 | mlx-freetype (compiler/capi/freetype, std.truetype): Skia's 52 declared | done for compiling |
 | Fontconfig | finding fonts: Skia's font manager, WebCore's FontCache (FreeType platform) | 21 / 0 (/ 53) | 2 | none | 2: mlx-fontconfig, matching over the fonts directories (fonts.conf's essentials) |
-| libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | std.xml: a pull tokenizer, a base | 2: mlx-libxml2: the SAX2 push parser WebCore drives (xmlCreatePushParserCtxt, xmlParseChunk, the callbacks), entities, encodings through ICU (its headers' `<iconv.h>` is mlxlibc's now) |
-| libxslt, libexslt | XSLT processing (XSLTProcessor, `<?xml-stylesheet?>`) | 26 / 0 | 5 | none | 3: `ENABLE_XSLT=OFF` |
+| libxml2 | XML documents (XHTML, SVG as XML) parsed by XMLDocumentParserLibxml2; XSLT's input | 59 / 4 (59) | 10 | mlx-xml2 (compiler/capi/xml2, std.xml.sax): libxml2 2.9.14's SAX2 push parser and parser of content in memory, 222 functions declared and made, all WebCore calls with XSLT off (`xmlReadMemory` and the tree and XPath functions it names besides are XSLT's and EME's): the callbacks, entities, errors and encodings of libxml2, its events to the position on 57 documents and 7 fragments whole and in chunks, with WebKit's handler (tools/check_xml2.sh against the system's libxml2); XMLDocumentParserLibxml2.cpp's and XMLErrors.cpp's unified sources get past libxml2's API to mlx-cc's own C++ errors (a `RefPtr` deduced as `RefPtr<void>`, a `WeakRef` constructor). No tree (SAX2's tree callbacks build nothing), no external entities loaded | done for WebCore; the tree if XSLT comes back |
+| libxslt, libexslt | XSLT processing (XSLTProcessor, `<?xml-stylesheet?>`) | 26 / 0 | 5 | none | `ENABLE_XSLT=OFF` (config.mlx): done |
 | SQLite | storage: IndexedDB's SQLite back end, local storage, the icon and resource load statistics databases | 55 / 19 (60) | 13 | mlx-sqlite3 (compiler/capi/sqlite3, std.sql): SQLite's C API, 191 functions declared and made (all 59 that WebCore and WebKit call); SQLite's file format and rollback journal (files and hot journals cross over with SQLite 3.45), its locks, the SQL of WebKit's 409 statements and more (joins, subqueries, compounds, views, WITH, upserts, CHECK, foreign keys, partial indexes, savepoints); tools/check_sqlite.sh compares its tests with SQLite 3.45. 19 of the 22 WebCore files calling SQLite compile alone (below) | WITHOUT ROWID tables, triggers, recursive WITH, a real write-ahead log; speed (an indexed insert is about 20 times SQLite's) |
-| libpng | PNG decoding (ImageDecoder) and Skia's PNG codec | 36 / 0 (/ 47) | 3 | mlx-libpng (compiler/capi/png, std.png): all declared; the progressive reader, transformations, gamma and writer give libpng's bytes (tools/check_png.sh); Skia's SkPngCodec and SkPngEncoderImpl compile; WebCore's PNGImageDecoder.cpp stops at Little CMS's `lcms2.h` (LCMSUniquePtr.h; `USE_LCMS` is on) | done |
-| libjpeg | JPEG decoding (ImageDecoder), Skia's JPEG codec and encoder | 15 / 0 (/ 25) | 2 | mlx-libjpeg (compiler/capi/jpeg, std.jpeg): all declared; the decompressor (suspending sources, buffered-image output, raw data, cropping and skipping, saved markers, the ICC profile) gives libjpeg-turbo's pixels, warnings and errors (tools/check_jpeg.sh); Skia's five JPEG sources compile; WebCore's JPEGImageDecoder.cpp stops at Little CMS's `lcms2.h` (LCMSUniquePtr.h) | the compressor (Skia's encoder: jpeg_set_defaults ... jpeg_finish_compress raise JERR_NOT_COMPILED for now) |
+| libpng | PNG decoding (ImageDecoder) and Skia's PNG codec | 36 / 0 (/ 47) | 3 | mlx-libpng (compiler/capi/png, std.png): all declared; the progressive reader, transformations, gamma and writer give libpng's bytes (tools/check_png.sh); Skia's SkPngCodec and SkPngEncoderImpl compile; WebCore's PNGImageDecoder.cpp compiles (on mlx-lcms2's `lcms2.h`) | done |
+| libjpeg | JPEG decoding (ImageDecoder), Skia's JPEG codec and encoder | 15 / 0 (/ 25) | 2 | mlx-libjpeg (compiler/capi/jpeg, std.jpeg): all declared; the decompressor (suspending sources, buffered-image output, raw data, cropping and skipping, saved markers, the ICC profile) gives libjpeg-turbo's pixels, warnings and errors (tools/check_jpeg.sh); Skia's five JPEG sources compile; WebCore's JPEGImageDecoder.cpp compiles (on mlx-lcms2's `lcms2.h`) | the compressor (Skia's encoder: jpeg_set_defaults ... jpeg_finish_compress raise JERR_NOT_COMPILED for now) |
 | libwebp (+demux, mux) | WebP decoding (ImageDecoder), Skia's codec | 7 / 0 (/ 12) | 2 | mlx-libwebp (compiler/capi/webp, std.webp): all declared (decode.h, demux.h, encode.h, mux.h); the simple, advanced and incremental decoders, the demuxer and the animation decoder give libwebp 1.3.2's pixels, statuses and rows done; the encoder is lossless (exact pixels, larger files), with the muxer and the animation encoder (tools/check_webp.sh); Skia's SkWebpEncoderImpl and WebCore's WEBPImageDecoder.cpp compile | lossy encoding; scaling (use_scaling) |
-| Little CMS 2 | colour management of images (ICC profiles) | 7 / 0 | 4 | none | 3: `USE_LCMS=OFF` |
+| Little CMS 2 | colour management of images (ICC profiles) | 7 / 0 | 4 | mlx-lcms2 (compiler/capi/lcms2, std.colorprofile): all 7 and 89 more of lcms2.h; ICC v2/v4 profiles (matrix-shapers, lut8, lut16, lutAtoB, lutBtoA), the four intents with black point compensation, Little CMS's optimizations: 8- and 16-bit transforms give Little CMS 2.14's pixels exactly (tools/check_lcms2.sh); WebCore's PNGImageDecoder.cpp and JPEGImageDecoder.cpp compile | float formats, CMYK input grids |
 | libepoxy (GL, EGL) | WebGL (through ANGLE), the compositor's EGL images and contexts | 118 / 51 (129), and ANGLE's own entry points | 39 (+ EGL's 6) | none (std.gpu is Vulkan) | 3: CPU rendering first (Skia's raster back end); then an EGL/GLES layer, or `ENABLE_WEBGL=OFF` |
 | libgcrypt (+gpg-error) | WebCrypto (AES modes, RSA, EC, HMAC, HKDF, PBKDF2, digests) and PAL's CryptoDigest | 71 / 0 | 8 | std: sha1, sha2, md5, blake2, AES-128 single blocks, crc | 2: the WebCrypto algorithms in std, then mlx-gcrypt (digests first: PAL needs them everywhere) |
 | libtasn1 | WebCrypto key import and export (DER of SPKI, PKCS#8) | 8 / 0 | 1 | none | 3: a small DER reader and writer |
@@ -77,8 +77,8 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 So the order: the headers and small layers every unit needs (GIO's TLS
 types, `libintl.h`, `iconv.h`, ICU's bidi, search and converter
 headers: done), then libsoup and its HTTP and TLS, the image decoders,
-libxml2, SQLite, Fontconfig, WebCrypto; XSLT and Little CMS are
-configured away.
+libxml2 (done), SQLite (done), Fontconfig, WebCrypto; XSLT is configured away
+(Little CMS is there: mlx-lcms2).
 
 ## The compiler's pass
 

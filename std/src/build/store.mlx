@@ -1,0 +1,813 @@
+// The result cache: the files steps made, kept by what made them, so that
+// a step whose inputs are as they were at some earlier build (in this
+// checkout before a branch switch, or in another checkout of the
+// repository) takes the file that build made instead of making it again,
+// as ccache's direct mode does.
+//
+// It lives outside the checkout, one for all of the user's checkouts (the
+// worktrees under .claude/worktrees too): $MLX_BUILD_CACHE, else
+// $XDG_CACHE_HOME/mlx/build (~/.cache/mlx/build); MLX_BUILD_CACHE=off
+// turns it off. In it:
+//
+//     objects/1f/1f2e3d4c5b6a7980-2259240-644   a file a step made, named by
+//                                               its contents' hash, its size
+//                                               and its mode
+//     entries/KEY/INPUTS                        what made one: KEY is the
+//                                               step's (its manifest key:
+//                                               kind, line or root, output,
+//                                               options, the compiler's
+//                                               contents, input trees; for
+//                                               a command, the contents of
+//                                               the program it runs), INPUTS
+//                                               the hash of what it read
+//     tmp/                                      files on their way in
+//
+// An entry:
+//
+//     mlx-build-cache 1
+//     key 0a1b2c3d4e5f6071
+//     object 1f2e3d4c5b6a7980-2259240-644
+//     took 25123
+//     input HASH PATH                 a line for each file the build read
+//                                     (its manifest's inputs)
+//
+// with each path in the checkout relative to the checkout's root (the
+// compiler names its own headers by absolute paths), so that every
+// checkout finds the others' entries. A step that is not current looks at
+// the entries of its key: when one entry's inputs all have its hashes now
+// (sizes and times first, as cache.mlx's memo knows them), the step's file
+// is that entry's object, linked into place (copied when the cache is on
+// another file system), and the step's manifest is written as if it had
+// been built. A key keeps an entry for each set of inputs it was built
+// from, so going back to a branch, or bisecting, finds its files again.
+//
+// Concurrent builds share it: a file goes in under a name of its own in
+// tmp/ and is then linked or renamed to its place, so no build sees one
+// half written, and two builds storing the same thing store the same
+// bytes. An object shares its inode with the outputs it was linked to:
+// a cached step's output is removed before its command runs (jobs.mlx), so
+// a tool that writes its output in place never writes into the cache, and
+// an object is checked against its name (hash, size) whenever it is taken,
+// so a damaged one is removed and the step built. When the objects pass
+// the size limit (MLX_BUILD_CACHE_SIZE, bytes or with K, M or G; 6G by
+// default), a build that stored something removes the least recently used
+// ones down to four fifths of it: by the time their inode last changed,
+// which linking an object into place (a hit) or storing it again renews.
+//
+// Which steps: those graph.resultCached names (Mlx steps, and commands
+// with a depfile or marked cacheable), whose one output is all they make.
+const std = @import("std")
+const xdg = @import("../xdg.mlx")
+const graph = @import("./graph.mlx")
+const cache = @import("./cache.mlx")
+const jobs = @import("./jobs.mlx")
+
+const ENTRY_LINE: []const u8 = "mlx-build-cache 1"
+const DEFAULT_LIMIT: usize = 6442450944
+const MODE_KIND: u32 = 61440
+const MODE_FILE: u32 = 32768
+// Files left in tmp/ by a build that was interrupted go after a day.
+const STALE_SECONDS: isize = 86400
+// The objects a trim can sort (a few gigabytes are thousands).
+const MAX_OBJECTS: usize = 1048576
+
+// Sets the cache up for the run from the environment: the checkout's root
+// (the working directory), where the cache is, its limit.
+pub fn configure(b: *graph.Builder) -> void {
+    var buffer: [4096]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    if std.fs.getWorkingDirectory(bytes, 4096) <= 0 { return }
+    b.*.root = graph.keep(b, std.text.cString(bytes))
+    const setting = variable(b, "MLX_BUILD_CACHE")
+    if std.text.same(setting, "off") || std.text.same(setting, "0") { return }
+    if setting.length > 0 {
+        if setting[0] == 47 {
+            b.*.store = graph.keep(b, setting)
+        } else {
+            b.*.store = graph.joined(b, graph.joined(b, b.*.root, "/"), setting)
+        }
+    } else {
+        const length = xdg.path(b.*.environment, xdg.CACHE, "/mlx/build", bytes, 4096)
+        if length == 0 { return }
+        b.*.store = graph.keep(b, bytes[0..length])
+    }
+    b.*.storeLimit = DEFAULT_LIMIT
+    const limit = parseSize(variable(b, "MLX_BUILD_CACHE_SIZE"))
+    if limit > 0 { b.*.storeLimit = limit }
+}
+
+fn variable(b: *graph.Builder, name: []const u8) -> []const u8 {
+    const value = std.process.environmentFrom(b.*.environment, name)
+    if value == null { return "" }
+    return std.string.asSlice(value.?)
+}
+
+// "6G", "500M", "1048576": bytes; 0 when it is none of them.
+fn parseSize(text: []const u8) -> usize {
+    var value: usize = 0
+    var at: usize = 0
+    while at < text.length && text[at] >= 48 && text[at] <= 57 && at < 15 {
+        value = value * 10 + @intCast(usize, text[at] - 48)
+        at += 1
+    }
+    if at == 0 { return 0 }
+    if at == text.length { return value }
+    // (A size with a unit stays far from overflowing.)
+    if at + 1 != text.length || value >= 1048576 { return 0 }
+    const unit = text[at] | 32
+    if unit == 107 { return value * 1024 }
+    if unit == 109 { return value * 1048576 }
+    if unit == 103 { return value * 1073741824 }
+    return 0
+}
+
+// VALUE as sixteen lowercase hex digits after AT; the new length.
+fn appendHex16(into: [*]u8, at: usize, capacity: usize, value: u64) -> usize {
+    var length = at
+    var shift: u64 = 64
+    while shift > 0 && length < capacity {
+        shift -= 4
+        const nibble = @intCast(u8, (value >> shift) & 15)
+        into[length] = if nibble < 10 { nibble + 48 } else { nibble + 87 }
+        length += 1
+    }
+    return length
+}
+
+fn hexName(b: *graph.Builder, value: u64) -> []const u8 {
+    var buffer: [16]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    const length = appendHex16(bytes, 0, 16, value)
+    return graph.keep(b, bytes[0..length])
+}
+
+// An object's name: its contents' hash, size and mode (in octal).
+fn objectName(b: *graph.Builder, hash: u64, size: usize, mode: usize) -> []const u8 {
+    var buffer: [64]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var length = appendHex16(bytes, 0, 64, hash)
+    length = std.text.append(bytes, length, 64, "-")
+    length = std.text.appendUnsigned(bytes, length, 64, size)
+    length = std.text.append(bytes, length, 64, "-")
+    var digits: [8]u8 = undefined
+    var count: usize = 0
+    var rest = mode & 4095
+    while count == 0 || rest > 0 {
+        digits[count] = @intCast(u8, rest & 7) + 48
+        rest = rest >> 3
+        count += 1
+    }
+    while count > 0 {
+        count -= 1
+        bytes[length] = digits[count]
+        length += 1
+    }
+    return graph.keep(b, bytes[0..length])
+}
+
+const Object = struct {
+    hash: u64
+    size: usize
+    mode: usize
+    valid: bool
+}
+
+fn parseObjectName(name: []const u8) -> Object {
+    var result = Object.{ .hash = 0, .size = 0, .mode = 0, .valid = false }
+    if name.length < 20 || name[16] != 45 { return result }
+    var at: usize = 0
+    while at < 16 {
+        result.hash = (result.hash << 4) | @intCast(u64, std.text.hexValue(name[at]))
+        at += 1
+    }
+    at = 17
+    while at < name.length && name[at] != 45 {
+        if name[at] < 48 || name[at] > 57 { return result }
+        result.size = result.size * 10 + @intCast(usize, name[at] - 48)
+        at += 1
+    }
+    if at >= name.length { return result }
+    at += 1
+    const modeStart = at
+    while at < name.length {
+        if name[at] < 48 || name[at] > 55 { return result }
+        result.mode = result.mode * 8 + @intCast(usize, name[at] - 48)
+        at += 1
+    }
+    result.valid = at > modeStart
+    return result
+}
+
+fn objectPath(b: *graph.Builder, name: []const u8) -> []const u8 {
+    const directory = graph.joined(b, graph.joined(b, b.*.store, "/objects/"), name[0..2])
+    return graph.joined(b, graph.joined(b, directory, "/"), name)
+}
+
+fn entryDirectory(b: *graph.Builder, key: []const u8) -> []const u8 {
+    return graph.joined(b, graph.joined(b, b.*.store, "/entries/"), key)
+}
+
+// A name in tmp/ no other build uses (this process's id, and a count).
+fn temporary(b: *graph.Builder) -> []const u8 {
+    var buffer: [64]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var length = std.text.appendUnsigned(bytes, 0, 64, std.linux.process.processId())
+    length = std.text.append(bytes, length, 64, "-")
+    length = std.text.appendUnsigned(bytes, length, 64, b.*.storeTemporaries)
+    b.*.storeTemporaries += 1
+    const directory = graph.joined(b, b.*.store, "/tmp")
+    _ = std.fs.makeDirectories(directory, 493)
+    return graph.joined(b, graph.joined(b, directory, "/"), bytes[0..length])
+}
+
+// PATH as an entry names it: relative to the checkout's root when it is
+// in the checkout (the compiler names its own headers by absolute paths).
+fn underRoot(b: *graph.Builder, path: []const u8) -> []const u8 {
+    const root = b.*.root
+    if root.length == 0 || path.length <= root.length + 1 || path[root.length] != 47 { return path }
+    if !std.text.same(path[0..root.length], root) { return path }
+    return path[root.length + 1..path.length]
+}
+
+// The contents' hash of the program a command runs (its line's first word,
+// along PATH when it has no slash): a command run by another program is
+// another step. 0 when it is not found (the command fails anyway).
+fn programHash(b: *graph.Builder, item: *graph.Node) -> u64 {
+    const line = item.*.source
+    var start: usize = 0
+    while start < line.length && line[start] == 32 { start += 1 }
+    var end = start
+    while end < line.length && line[end] != 32 { end += 1 }
+    var program = line[start..end]
+    var slash = false
+    for byte in program {
+        if byte == 47 { slash = true }
+    }
+    if !slash { program = jobs.findProgram(b, program) }
+    if program.length == 0 { return 0 }
+    const now = cache.identity(b, program)
+    var hash: u64 = 0
+    if !now.exists || !cache.memoHash(b, program, now, &hash) { return 0 }
+    return hash
+}
+
+// The key ITEM's entries are kept under.
+fn storeKey(b: *graph.Builder, item: *graph.Node) -> []const u8 {
+    var hash = cache.hashBytes(cache.FNV_OFFSET, ENTRY_LINE)
+    hash = cache.hashNumber(hash, @bitCast(usize, cache.manifestKey(b, item)))
+    if item.*.kind == graph.KIND_COMMAND { hash = cache.hashNumber(hash, @bitCast(usize, programHash(b, item))) }
+    return hexName(b, hash)
+}
+
+// Copies the file SOURCE to TARGET (made anew with MODE); false when it
+// failed (then TARGET is gone).
+fn copyFile(b: *graph.Builder, source: []const u8, target: []const u8, mode: usize) -> bool {
+    _ = std.fs.delete(graph.cPath(b, target))
+    const from = std.fs.open(graph.cPath(b, source), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(from) { return false }
+    const to = std.fs.open(graph.cPath(b, target), std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, mode)
+    var copied = std.fs.isValid(to) && std.fs.copy(from, to)
+    _ = std.fs.close(from)
+    if std.fs.isValid(to) { copied = std.fs.close(to) && copied }
+    copied = copied && std.fs.chmod(graph.cPath(b, target), mode)
+    if !copied { _ = std.fs.delete(graph.cPath(b, target)) }
+    return copied
+}
+
+// link(2): 0, or the error (EXDEV across file systems, EEXIST when
+// TARGET is there).
+fn link(b: *graph.Builder, source: []const u8, target: []const u8) -> isize {
+    const from = graph.cPath(b, source)
+    const to = graph.cPath(b, target)
+    return std.linux.syscall2(std.linux.SYS_link, @intFromPtr(from), @intFromPtr(to))
+}
+
+// ---------------------------------------------------------------------------
+// Taking a step's file from the cache.
+
+// Makes ITEM's output from the cache when an entry of its key was built
+// from inputs as they are now; true when it did (the step is done, its
+// manifest written), false when the step must be built.
+pub fn restore(b: *graph.Builder, item: *graph.Node) -> bool {
+    if b.*.store.length == 0 || !graph.resultCached(item) { return false }
+    const key = storeKey(b, item)
+    const directory = entryDirectory(b, key)
+    const handle = std.fs.open(graph.cPath(b, directory), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(handle) { return false }
+    var buffer: [8192]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var reader = std.fs.entries(handle, bytes, 8192)
+    var entry: std.fs.Entry = undefined
+    var restored = false
+    while !restored && std.fs.nextEntry(&reader, &entry) {
+        if std.fs.isDotName(entry.name) { continue }
+        const name: []const u8 = unsafe { entry.name.pointer[0..entry.name.length] }
+        const path = graph.joined(b, graph.joined(b, directory, "/"), name)
+        restored = tryEntry(b, item, path, key)
+    }
+    _ = std.fs.close(handle)
+    return restored
+}
+
+// The entry at PATH, when its inputs are as they are now: its object made
+// ITEM's output.
+fn tryEntry(b: *graph.Builder, item: *graph.Node, path: []const u8, key: []const u8) -> bool {
+    const length = cache.readWhole(b, path)
+    if length == graph.NONE { return false }
+    const bytes = graph.fileBytes(b)
+    // Lines become C strings in place (each path is one).
+    var at: usize = 0
+    var lineStart: usize = 0
+    var lines: usize = 0
+    var object: []const u8 = ""
+    var took: usize = 0
+    var keyed = false
+    var matches = true
+    while at <= length && matches {
+        if at == length || bytes[at] == 10 {
+            const end = at
+            bytes[at] = 0
+            if lines == 0 {
+                matches = std.text.same(bytes[lineStart..end], ENTRY_LINE)
+            } else if cache.startsAt(bytes, lineStart, end, "key ") {
+                keyed = std.text.same(bytes[lineStart + 4..end], key)
+                matches = keyed
+            } else if cache.startsAt(bytes, lineStart, end, "object ") {
+                object = bytes[lineStart + 7..end]
+            } else if cache.startsAt(bytes, lineStart, end, "took ") {
+                var cursor = lineStart + 5
+                took = cache.parseNumber(bytes, &cursor, end, 10)
+            } else if cache.startsAt(bytes, lineStart, end, "input ") {
+                var cursor = lineStart + 6
+                const hash = @bitCast(u64, cache.parseNumber(bytes, &cursor, end, 16))
+                const input = bytes[cursor..end]
+                const now = cache.identity(b, input)
+                var contents: u64 = 0
+                if !now.exists || !cache.memoHash(b, input, now, &contents) || contents != hash { matches = false }
+            } else if end > lineStart {
+                matches = false
+            }
+            lines += 1
+            lineStart = at + 1
+        }
+        at += 1
+    }
+    if !matches || !keyed || object.length == 0 { return false }
+    const found = parseObjectName(object)
+    if !found.valid { return false }
+    // The manifest goes first: an interrupted restore leaves a step that
+    // is not current.
+    cache.forget(b, item)
+    if !place(b, item, objectPath(b, object), found) {
+        // Its object is gone (trimmed by another build) or was damaged:
+        // the entry is of no use.
+        _ = std.fs.delete(graph.cPath(b, path))
+        return false
+    }
+    if !writeManifest(b, item, length, took) { return false }
+    // (Its time says it was used.)
+    _ = std.fs.updateTimes(graph.cPath(b, path))
+    item.*.took = took
+    return true
+}
+
+// The object at OBJECT_PATH linked (or copied) into ITEM's place, after it
+// was checked against its name; false when it is missing or damaged (a
+// damaged one is removed).
+fn place(b: *graph.Builder, item: *graph.Node, objectPath: []const u8, object: Object) -> bool {
+    const building = graph.keep(b, jobs.buildingPath(b, item))
+    _ = std.fs.makeParents(item.*.output, 493)
+    _ = std.fs.delete(graph.cPath(b, building))
+    if link(b, objectPath, building) != 0 {
+        if !copyFile(b, objectPath, building, object.mode) { return false }
+        // A copy leaves the object's inode as it was: its mode set again
+        // renews its change time (the trim's "last used").
+        _ = std.fs.chmod(graph.cPath(b, objectPath), object.mode)
+    }
+    var stat: std.fs.Stat = undefined
+    var whole = std.fs.statusAt(graph.cPath(b, building), &stat, true) == 0
+    whole = whole && stat.mode & MODE_KIND == MODE_FILE && @bitCast(usize, stat.size) == object.size
+    var hash: u64 = 0
+    whole = whole && cache.hashFile(b, building, &hash) && hash == object.hash
+    if !whole {
+        _ = std.fs.delete(graph.cPath(b, building))
+        _ = std.fs.delete(graph.cPath(b, objectPath))
+        return false
+    }
+    if @intCast(usize, stat.mode & 4095) != object.mode { _ = std.fs.chmod(graph.cPath(b, building), object.mode) }
+    return std.fs.rename(graph.cPath(b, building), graph.cPath(b, item.*.output))
+}
+
+// ITEM's manifest from the entry in the file buffer (LENGTH bytes, its
+// lines ended by NULs now): its inputs with their sizes and times now.
+fn writeManifest(b: *graph.Builder, item: *graph.Node, length: usize, took: usize) -> bool {
+    const bytes = graph.fileBytes(b)
+    var writer: cache.Writer = unsafe { cache.Writer.{ .bytes = @ptrFromInt([*]u8, @intFromPtr(bytes) + length + 1), .length = 0, .capacity = graph.FILE_BYTES - length - 1 } }
+    cache.put(&writer, cache.VERSION_LINE)
+    cache.put(&writer, "\nkey ")
+    cache.putHex(&writer, cache.manifestKey(b, item))
+    cache.put(&writer, "\ntook ")
+    cache.putNumber(&writer, took)
+    cache.put(&writer, "\n")
+    var lineStart: usize = 0
+    var at: usize = 0
+    while at <= length {
+        if at == length || bytes[at] == 0 {
+            if cache.startsAt(bytes, lineStart, at, "input ") {
+                var cursor = lineStart + 6
+                const hash = @bitCast(u64, cache.parseNumber(bytes, &cursor, at, 16))
+                const input = bytes[cursor..at]
+                const now = cache.identity(b, input)
+                if !now.exists { return false }
+                cache.put(&writer, "input ")
+                cache.putNumber(&writer, now.size)
+                cache.put(&writer, " ")
+                cache.putNumber(&writer, now.seconds)
+                cache.put(&writer, " ")
+                cache.putNumber(&writer, now.nanoseconds)
+                cache.put(&writer, " ")
+                cache.putHex(&writer, hash)
+                cache.put(&writer, " ")
+                cache.put(&writer, input)
+                cache.put(&writer, "\n")
+            }
+            lineStart = at + 1
+        }
+        at += 1
+    }
+    if writer.length + 1 >= writer.capacity { return false }
+    // Whole or not at all (a manifest cut short would name fewer inputs).
+    return std.fs.replaceFile(graph.cPath(b, cache.manifestPath(b, item)), writer.bytes, writer.length, 420)
+}
+
+// ---------------------------------------------------------------------------
+// Keeping a step's file.
+
+// Keeps ITEM's output, just built, with an entry of what it was built
+// from (its manifest's inputs). Nothing is kept when anything fails: the
+// cache is only ever an aid.
+pub fn save(b: *graph.Builder, item: *graph.Node) -> void {
+    if b.*.store.length == 0 || !graph.resultCached(item) { return }
+    var stat: std.fs.Stat = undefined
+    if std.fs.statusAt(graph.cPath(b, item.*.output), &stat, true) != 0 { return }
+    if stat.mode & MODE_KIND != MODE_FILE { return }
+    const size = @bitCast(usize, stat.size)
+    const mode = @intCast(usize, stat.mode & 4095)
+    var hash: u64 = 0
+    if !cache.memoHash(b, item.*.output, cache.identity(b, item.*.output), &hash) { return }
+    const object = objectName(b, hash, size, mode)
+    const objectFile = objectPath(b, object)
+    if !std.fs.makeParents(objectFile, 493) { return }
+    var known: std.fs.Stat = undefined
+    if std.fs.statusAt(graph.cPath(b, objectFile), &known, true) == 0 && known.inode == stat.inode && known.device == stat.device {
+        // The output is the object already (it was linked there before):
+        // its mode set again renews its change time.
+        _ = std.fs.chmod(graph.cPath(b, objectFile), mode)
+    } else {
+        // Renamed over what has that name: the same bytes (another
+        // checkout's, another build's at the same time), or a damaged
+        // file, which this repairs. Whoever linked the old one keeps it.
+        const incoming = temporary(b)
+        if link(b, item.*.output, incoming) != 0 && !copyFile(b, item.*.output, incoming, mode) { return }
+        if !std.fs.rename(graph.cPath(b, incoming), graph.cPath(b, objectFile)) {
+            _ = std.fs.delete(graph.cPath(b, incoming))
+            return
+        }
+    }
+    b.*.storeAdded += size
+    writeEntry(b, item, object)
+}
+
+// The entry for ITEM's output (the object OBJECT), its inputs from the
+// manifest just written.
+fn writeEntry(b: *graph.Builder, item: *graph.Node, object: []const u8) -> void {
+    const key = storeKey(b, item)
+    const length = cache.readWhole(b, cache.manifestPath(b, item))
+    if length == graph.NONE { return }
+    const bytes = graph.fileBytes(b)
+    var writer: cache.Writer = unsafe { cache.Writer.{ .bytes = @ptrFromInt([*]u8, @intFromPtr(bytes) + length + 1), .length = 0, .capacity = graph.FILE_BYTES - length - 1 } }
+    cache.put(&writer, ENTRY_LINE)
+    cache.put(&writer, "\nkey ")
+    cache.put(&writer, key)
+    cache.put(&writer, "\nobject ")
+    cache.put(&writer, object)
+    cache.put(&writer, "\ntook ")
+    cache.putNumber(&writer, item.*.took)
+    cache.put(&writer, "\n")
+    const inputsStart = writer.length
+    var lineStart: usize = 0
+    var at: usize = 0
+    while at <= length {
+        if at == length || bytes[at] == 10 {
+            if cache.startsAt(bytes, lineStart, at, "input ") {
+                // input SIZE SECONDS NANOSECONDS HASH PATH
+                var cursor = lineStart + 6
+                _ = cache.parseNumber(bytes, &cursor, at, 10)
+                _ = cache.parseNumber(bytes, &cursor, at, 10)
+                _ = cache.parseNumber(bytes, &cursor, at, 10)
+                const hash = @bitCast(u64, cache.parseNumber(bytes, &cursor, at, 16))
+                cache.put(&writer, "input ")
+                cache.putHex(&writer, hash)
+                cache.put(&writer, " ")
+                cache.put(&writer, underRoot(b, bytes[cursor..at]))
+                cache.put(&writer, "\n")
+            }
+            lineStart = at + 1
+        }
+        at += 1
+    }
+    if writer.length + 1 >= writer.capacity { return }
+    // Named by its inputs: the same inputs give the same entry.
+    var name = cache.hashBytes(cache.FNV_OFFSET, key)
+    name = cache.hashBytes(name, writer.bytes[inputsStart..writer.length])
+    const directory = entryDirectory(b, key)
+    if !std.fs.makeDirectories(directory, 493) { return }
+    const incoming = temporary(b)
+    if !std.fs.writeFile(graph.cPath(b, incoming), writer.bytes, writer.length, 420) {
+        _ = std.fs.delete(graph.cPath(b, incoming))
+        return
+    }
+    const target = graph.joined(b, graph.joined(b, directory, "/"), hexName(b, name))
+    if !std.fs.rename(graph.cPath(b, incoming), graph.cPath(b, target)) {
+        _ = std.fs.delete(graph.cPath(b, incoming))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The size limit, and what `mlx build --cache-stats` and --cache-clear do.
+
+// An object as the trim sees it.
+const Found = struct {
+    changed: isize
+    size: usize
+    name: []const u8
+}
+
+const Census = struct {
+    found: [*]Found
+    count: usize
+    capacity: usize
+    total: usize
+    linked: usize
+    linkedBytes: usize
+}
+
+// Every object in the cache (kept in a list, up to MAX_OBJECTS of them,
+// when RECORD).
+fn census(b: *graph.Builder, record: bool) -> Census {
+    var result = Census.{ .found = undefined, .count = 0, .capacity = 0, .total = 0, .linked = 0, .linkedBytes = 0 }
+    if record {
+        const allocator = std.page_allocator.init()
+        const memory = allocator.alloc(MAX_OBJECTS * @sizeOf(Found), 16)
+        if memory != null {
+            result.found = unsafe { @ptrCast([*]Found, memory.?) }
+            result.capacity = MAX_OBJECTS
+        }
+    }
+    const objects = graph.joined(b, b.*.store, "/objects")
+    const handle = std.fs.open(graph.cPath(b, objects), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(handle) { return result }
+    var buffer: [8192]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var reader = std.fs.entries(handle, bytes, 8192)
+    var entry: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &entry) {
+        if std.fs.isDotName(entry.name) { continue }
+        const name: []const u8 = unsafe { entry.name.pointer[0..entry.name.length] }
+        const directory = graph.joined(b, graph.joined(b, objects, "/"), name)
+        const inner = std.fs.open(graph.cPath(b, directory), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+        if !std.fs.isValid(inner) { continue }
+        var innerBuffer: [8192]u8 = undefined
+        const innerBytes: [*]u8 = unsafe { @ptrCast([*]u8, &innerBuffer) }
+        var files = std.fs.entries(inner, innerBytes, 8192)
+        var file: std.fs.Entry = undefined
+        while std.fs.nextEntry(&files, &file) {
+            if std.fs.isDotName(file.name) { continue }
+            var stat: std.fs.Stat = undefined
+            if std.fs.statusFrom(inner, file.name.pointer, &stat, true) != 0 { continue }
+            const size = @bitCast(usize, stat.size)
+            result.total += size
+            if stat.links > 1 {
+                result.linked += 1
+                result.linkedBytes += size
+            }
+            if result.count < result.capacity {
+                const kept = graph.keep(b, unsafe { file.name.pointer[0..file.name.length] })
+                result.found[result.count] = Found.{ .changed = stat.changedSeconds, .size = size, .name = kept }
+            }
+            result.count += 1
+        }
+        _ = std.fs.close(inner)
+    }
+    _ = std.fs.close(handle)
+    return result
+}
+
+fn swap(items: [*]Found, left: usize, right: usize) -> void {
+    const kept = items[left]
+    items[left] = items[right]
+    items[right] = kept
+}
+
+fn siftDown(items: [*]Found, start: usize, end: usize) -> void {
+    var root = start
+    while true {
+        var child = root * 2 + 1
+        if child >= end { return }
+        if child + 1 < end && items[child + 1].changed > items[child].changed { child += 1 }
+        if items[root].changed >= items[child].changed { return }
+        swap(items, root, child)
+        root = child
+    }
+}
+
+// Oldest change first (heapsort: there can be thousands).
+fn sortByChange(items: [*]Found, count: usize) -> void {
+    var start = count / 2
+    while start > 0 {
+        start -= 1
+        siftDown(items, start, count)
+    }
+    var end = count
+    while end > 1 {
+        end -= 1
+        swap(items, 0, end)
+        siftDown(items, 0, end)
+    }
+}
+
+// After a build that stored something: when the objects pass the limit,
+// the least recently used go, down to four fifths of it, and so do the
+// entries that named them. Otherwise it costs a status call an object.
+pub fn trim(b: *graph.Builder) -> void {
+    if b.*.store.length == 0 || b.*.storeAdded == 0 { return }
+    removeStaleTemporaries(b)
+    var found = census(b, true)
+    if found.total <= b.*.storeLimit || found.count > found.capacity { return }
+    sortByChange(found.found, found.count)
+    const target = b.*.storeLimit / 5 * 4
+    var removed: usize = 0
+    var freed: usize = 0
+    while removed < found.count && found.total > target {
+        const object = found.found[removed]
+        _ = std.fs.delete(graph.cPath(b, objectPath(b, object.name)))
+        found.total -= object.size
+        freed += object.size
+        removed += 1
+    }
+    removeOrphanEntries(b)
+    jobs.say("mlx build: the result cache passed its limit; removed ")
+    sayCount(removed)
+    jobs.say(" of its files (")
+    sayBytes(freed)
+    jobs.say(")\n")
+}
+
+// Files left in tmp/ by builds that were interrupted.
+fn removeStaleTemporaries(b: *graph.Builder) -> void {
+    const directory = graph.joined(b, b.*.store, "/tmp")
+    const handle = std.fs.open(graph.cPath(b, directory), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(handle) { return }
+    const now = std.time.realtime().seconds
+    var buffer: [8192]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var reader = std.fs.entries(handle, bytes, 8192)
+    var entry: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &entry) {
+        if std.fs.isDotName(entry.name) { continue }
+        var stat: std.fs.Stat = undefined
+        if std.fs.statusFrom(handle, entry.name.pointer, &stat, true) == 0 && stat.modifiedSeconds + STALE_SECONDS < now {
+            _ = std.fs.deleteAt(handle, entry.name.pointer, false)
+        }
+    }
+    _ = std.fs.close(handle)
+}
+
+// The object an entry names (its third line), from the start of the file
+// at PATH; "" when it cannot be read.
+fn entryObject(b: *graph.Builder, path: []const u8) -> []const u8 {
+    const file = std.fs.open(graph.cPath(b, path), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return "" }
+    var buffer: [512]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    const got = std.fs.read(file, bytes, 512)
+    _ = std.fs.close(file)
+    if got <= 0 { return "" }
+    const length = @bitCast(usize, got)
+    var at: usize = 0
+    while at < length {
+        var end = at
+        while end < length && bytes[end] != 10 { end += 1 }
+        if end == length { return "" }
+        if cache.startsAt(bytes, at, end, "object ") { return graph.keep(b, bytes[at + 7..end]) }
+        at = end + 1
+    }
+    return ""
+}
+
+// Entries whose object is gone (and the keys left without entries).
+fn removeOrphanEntries(b: *graph.Builder) -> void {
+    const entries = graph.joined(b, b.*.store, "/entries")
+    const handle = std.fs.open(graph.cPath(b, entries), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(handle) { return }
+    var buffer: [8192]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var reader = std.fs.entries(handle, bytes, 8192)
+    var entry: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &entry) {
+        if std.fs.isDotName(entry.name) { continue }
+        const name: []const u8 = unsafe { entry.name.pointer[0..entry.name.length] }
+        const directory = graph.joined(b, graph.joined(b, entries, "/"), name)
+        const inner = std.fs.open(graph.cPath(b, directory), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+        if !std.fs.isValid(inner) { continue }
+        var innerBuffer: [8192]u8 = undefined
+        const innerBytes: [*]u8 = unsafe { @ptrCast([*]u8, &innerBuffer) }
+        var files = std.fs.entries(inner, innerBytes, 8192)
+        var file: std.fs.Entry = undefined
+        while std.fs.nextEntry(&files, &file) {
+            if std.fs.isDotName(file.name) { continue }
+            const path = graph.joined(b, graph.joined(b, directory, "/"), unsafe { file.name.pointer[0..file.name.length] })
+            const object = entryObject(b, path)
+            if object.length < 2 || !cache.present(b, objectPath(b, object)) { _ = std.fs.delete(graph.cPath(b, path)) }
+        }
+        _ = std.fs.close(inner)
+        _ = std.fs.removeDirResult(graph.cPath(b, directory))
+    }
+    _ = std.fs.close(handle)
+}
+
+fn sayCount(value: usize) -> void {
+    var digits: [24]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &digits) }
+    const length = std.text.appendUnsigned(bytes, 0, 24, value)
+    jobs.say(bytes[0..length])
+}
+
+// BYTES in MB (to a tenth).
+fn sayBytes(bytes: usize) -> void {
+    const tenths = bytes / 1024 * 10 / 1024
+    sayCount(tenths / 10)
+    jobs.say(".")
+    sayCount(tenths % 10)
+    jobs.say(" MB")
+}
+
+// What is in the cache (mlx build --cache-stats).
+pub fn stats(b: *graph.Builder) -> void {
+    if b.*.store.length == 0 {
+        jobs.say("mlx build: the result cache is off (MLX_BUILD_CACHE=off, or no $HOME)\n")
+        return
+    }
+    const found = census(b, false)
+    var keys: usize = 0
+    var entryCount: usize = 0
+    const entries = graph.joined(b, b.*.store, "/entries")
+    const handle = std.fs.open(graph.cPath(b, entries), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if std.fs.isValid(handle) {
+        var buffer: [8192]u8 = undefined
+        const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+        var reader = std.fs.entries(handle, bytes, 8192)
+        var entry: std.fs.Entry = undefined
+        while std.fs.nextEntry(&reader, &entry) {
+            if std.fs.isDotName(entry.name) { continue }
+            const name: []const u8 = unsafe { entry.name.pointer[0..entry.name.length] }
+            const inner = std.fs.open(graph.cPath(b, graph.joined(b, graph.joined(b, entries, "/"), name)), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+            if !std.fs.isValid(inner) { continue }
+            keys += 1
+            var innerBuffer: [8192]u8 = undefined
+            const innerBytes: [*]u8 = unsafe { @ptrCast([*]u8, &innerBuffer) }
+            var files = std.fs.entries(inner, innerBytes, 8192)
+            var file: std.fs.Entry = undefined
+            while std.fs.nextEntry(&files, &file) {
+                if !std.fs.isDotName(file.name) { entryCount += 1 }
+            }
+            _ = std.fs.close(inner)
+        }
+        _ = std.fs.close(handle)
+    }
+    jobs.say("result cache: ")
+    jobs.say(b.*.store)
+    jobs.say("\n  ")
+    sayCount(found.count)
+    jobs.say(" files, ")
+    sayBytes(found.total)
+    jobs.say(" of a limit of ")
+    sayBytes(b.*.storeLimit)
+    jobs.say("\n  ")
+    sayCount(found.linked)
+    jobs.say(" of them (")
+    sayBytes(found.linkedBytes)
+    jobs.say(") linked into checkouts now (no room of their own)\n  ")
+    sayCount(entryCount)
+    jobs.say(" entries for ")
+    sayCount(keys)
+    jobs.say(" steps\n")
+}
+
+// Removes the whole cache (mlx build --cache-clear); false when it is off
+// or could not be removed.
+pub fn clear(b: *graph.Builder) -> bool {
+    if b.*.store.length == 0 { return false }
+    if !cache.present(b, b.*.store) { return true }
+    return std.fs.removeTree(graph.cPath(b, b.*.store))
+}

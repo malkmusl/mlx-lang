@@ -22,7 +22,7 @@ and GIO, here mlx-glib (compiler/capi/glib).
     ./mlx build webkit-jsc-derived    what JavaScriptCore's build generates
     ./mlx build webkit-webcore-derived  what WebCore's build generates (the WPE port)
     ./mlx build webkit-jsc            JavaScriptCore, C_LOOP (libJavaScriptCore.a)
-    ./mlx build webkit-jsc-shell      mlx-out/webkit/bin/jsc
+    ./mlx build webkit-jsc-shell      mlx-out/webkit/bin/jsc, on mlxlibc alone (below)
     ./mlx build webkit-angle          ANGLE, WebGL's OpenGL ES (libANGLE.a, libGLESv2.a)
 
     ./mlx build webkit-wpe-bmalloc    the WPE port's bmalloc
@@ -40,6 +40,7 @@ and GIO, here mlx-glib (compiler/capi/glib).
     tools/check_webcore_generators.sh WebCore's likewise (WEBCORE_REFERENCE, a WPE build's WebCore/DerivedSources)
     tools/check_wpe_wtf.sh            WTF (WPE) at work: run loop, timers, work queues, strings, URLs
     tools/check_wpe_jsc.sh            JavaScriptCore (WPE) at work: jsc on tests/wpe.js, the GLib API's tests/jsc-glib.c
+    tools/check_jsc_mlxlibc.sh        jsc (JSCOnly) on mlxlibc: tests/jsc/*.js as the glibc-linked jsc prints them, no glibc in the process
 
 The JSCOnly port's objects go to mlx-out/webkit/obj, its archives to
 mlx-out/webkit/lib, what is generated to mlx-out/webkit/generated
@@ -69,6 +70,7 @@ programs shared by the ports.
 | JavaScriptCore's GLib API | | `JavaScriptCoreGLib/`: `jsc/*.h` of `lists/jsc-glib-api.txt` (the 2022 API), `JSCVersion.h`, `Headers/jsc` |
 | defines | `BUILDING_JSCONLY__` | `BUILDING_WPE__`, `JSC_GLIB_API_ENABLED`, `GETTEXT_PACKAGE`, `PKGDATADIR` |
 | beyond mlx-unicode | | mlx-glib's headers and `libmlxglib.so` |
+| C library of its programs | mlxlibc: `mlx-out/libc/libmlxc.so.1` is their loader (`Port.mlxlibc`) | the system's (glibc) |
 
 The inspector's protocol follows each port's feature defines
 (`ENABLE_REMOTE_INSPECTOR` and the others of WPE). For WPE, every file
@@ -79,6 +81,23 @@ compiler that compiled the offsets extractor, and GCC lays out
 the WPE configuration `JSC::VM`'s first members). The check compares
 it with what WebKit's own offlineasm (Ruby) makes of mlx-cc's
 extractor, and that is the same to the byte.
+
+The JSCOnly port's jsc runs on mlxlibc alone, the first milestone of
+the Mlx port (PORT.md, M1): it names mlxlibc's loader
+(`mlx-out/libc/libmlxc.so.1`, absolute in the checkout) as its
+interpreter and mlx-unicode by its path, so it starts with an empty
+environment and nothing of glibc in the process: `libc.so.6` is the
+loader itself, `libm.so.6` mlxlibc's beside it, mlxlibcpp its C++
+library. What jsc asked of glibc beyond mlxlibc was `regcomp` and
+`regexec` (JavaScriptCore's configuration files), now in mlxlibc, and
+a main thread's stack that `pthread_getattr_np` describes (JSC's stack
+limit; mlxlibc said 0 before, and every script overflowed).
+`tests/jsc/*.js` are scripts of Intl (node's output), the core language,
+number formatting (`numbers.js -- currency`, `-- percent`), a stress of
+the runtime (classes, closures, strings and regular expressions, JSON,
+typed arrays, Maps, proxies, promises, BigInts, Dates), sorting and typed arrays; their
+`.expected` files are what the glibc-linked jsc printed, and
+tools/check_jsc_mlxlibc.sh holds the mlxlibc one to them.
 
 `tests/wtf-wpe.cpp` runs WTF (WPE) on mlx-glib: `RunLoop::run()` on
 GLib's main loop with a repeating `RunLoop::Timer` and
@@ -111,7 +130,8 @@ check_wpe_jsc.sh still fails on it.
 | `lists/` | Source lists the build takes from WebKit's CMake files: WTF's and bmalloc's sources for each port, the `.lut.h` sources, JSC's headers, builtins and inspector domains; WebCore's IDL files (in CMake's order, which the bindings' batches follow), builtins, user agent style sheets, media controls' style sheets and scripts, AT-SPI interfaces, its forwarding headers, include directories and sources compiled apart; ANGLE's sources of libANGLE.a and libGLESv2.a and its public headers |
 | `WEBCORE.md` | WebCore for WPE: the libraries it needs and what this repository has of them, and how far mlx-cc compiles it |
 | `generators/` | WebKit's code generators in Mlx (below) |
-| `tests/` | Programs of the WPE port and what they print: `wtf-wpe.cpp` (WTF), `jsc-glib.c` (JavaScriptCore's GLib API), `wpe.js` (for its jsc) |
+| `tests/` | Programs of the WPE port and what they print: `wtf-wpe.cpp` (WTF), `jsc-glib.c` (JavaScriptCore's GLib API), `wpe.js` (for its jsc); `jsc/`, scripts for the JSCOnly jsc on mlxlibc |
+| `PORT.md` | The Mlx port of WebKit (PlatformMlx): its design, milestones, and what of compiler/capi and the WPE port it retires |
 
 ## The generators
 

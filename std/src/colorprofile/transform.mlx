@@ -1,0 +1,534 @@
+// std.colorprofile.transform: colour transforms of 8- and 16-bit pixels
+// as Little CMS (2.14) makes and runs them (cmsxform.c, cmspack.c,
+// cmsalpha.c): the profiles linked into a pipeline for the intents, the
+// pipeline optimized for the pixel formats, and each pixel unrolled to
+// 16 bits, evaluated and packed back: chunky or planar, channels swapped
+// (BGR), the extra channel first (ARGB) or last, the 16-bit words of
+// either endianness, reversed (subtractive) values, premultiplied alpha;
+// the extra channels copied (cmsFLAGS_COPY_ALPHA) or left as they are.
+//
+// Floating-point formats are not supported (such a transform is not
+// made), nor is gamut checking or a proofing profile.
+const mem = @import("./mem.mlx")
+const curve = @import("./curve.mlx")
+const pipeline = @import("./pipeline.mlx")
+const profile = @import("./profile.mlx")
+const link = @import("./link.mlx")
+const optimize = @import("./optimize.mlx")
+const format = @import("./format.mlx")
+
+pub const Allocator = mem.Allocator
+
+pub const FLAGS_NOCACHE: u64 = 0x0040
+pub const FLAGS_NOOPTIMIZE: u64 = 0x0100
+pub const FLAGS_NULLTRANSFORM: u64 = 0x0200
+pub const FLAGS_GAMUTCHECK: u64 = 0x1000
+pub const FLAGS_BLACKPOINTCOMPENSATION: u64 = 0x2000
+pub const FLAGS_COPY_ALPHA: u64 = 0x04000000
+
+pub const Transform = struct {
+    allocator: Allocator
+    pipe: usize
+    inputFormat: u64
+    outputFormat: u64
+    flags: u64
+    entrySpace: u64
+    exitSpace: u64
+    intent: u64
+    nullTransform: bool
+}
+
+pub inline fn transformAt(address: usize) -> *Transform { return unsafe { @ptrFromInt(*Transform, address) } }
+
+// The memory a transform evaluates in: the pipeline's scratch and the
+// 16-bit values of a pixel.
+const SCRATCH_TOTAL: usize = pipeline.SCRATCH_SIZE + 128
+const W_IN: usize = pipeline.SCRATCH_SIZE
+const W_OUT: usize = pipeline.SCRATCH_SIZE + 64
+
+// GetXFormColorSpaces: the colour space a chain of profiles starts from
+// and the one it ends in.
+fn colorSpaces(count: usize, profiles: [*]const usize, input: *u64, output: *u64) -> bool {
+    if count == 0 || profiles[0] == 0 { return false }
+    var post = profile.profileAt(profiles[0]).*.colorSpace
+    input.* = post
+    var index: usize = 0
+    while index < count {
+        if profiles[index] == 0 { return false }
+        const p = profile.profileAt(profiles[index])
+        const isInput = post != profile.SPACE_XYZ && post != profile.SPACE_LAB
+        const cl = p.*.deviceClass
+        var spaceIn: u64 = 0
+        var spaceOut: u64 = 0
+        if cl == profile.CLASS_NAMED_COLOR {
+            spaceIn = 0x31434C52
+            spaceOut = if count > 1 { p.*.pcs } else { p.*.colorSpace }
+        } else if isInput || cl == profile.CLASS_LINK {
+            spaceIn = p.*.colorSpace
+            spaceOut = p.*.pcs
+        } else {
+            spaceIn = p.*.pcs
+            spaceOut = p.*.colorSpace
+        }
+        if index == 0 { input.* = spaceIn }
+        post = spaceOut
+        index += 1
+    }
+    output.* = post
+    return true
+}
+
+// IsProperColorSpace.
+fn properColorSpace(check: u64, fmt: u64) -> bool {
+    const space1 = format.colorspaceOf(fmt)
+    const space2 = format.lcmsColorSpace(check)
+    if space1 == format.PT_ANY { return true }
+    if space1 == space2 { return true }
+    if space1 == format.PT_LABV2 && space2 == format.PT_LAB { return true }
+    if space1 == format.PT_LAB && space2 == format.PT_LABV2 { return true }
+    return false
+}
+
+// The formats this module packs and unrolls: 8- and 16-bit integers (and
+// none of Little CMS's special Lab V2 layouts).
+fn supportedFormat(fmt: u64) -> bool {
+    if format.isFloat(fmt) { return false }
+    const b = format.bytes(fmt)
+    if b != 1 && b != 2 { return false }
+    if format.colorspaceOf(fmt) == format.PT_LABV2 { return false }
+    return true
+}
+
+// cmsDetectRGBProfileGamma: the mean exponent of the profile's grey
+// axis (through an XYZ identity profile, without optimization), -1 when
+// there is none within THRESHOLD.
+pub fn detectRGBGamma(address: usize, threshold: f64) -> f64 {
+    const p = profile.profileAt(address)
+    if p.*.colorSpace != profile.SPACE_RGB { return -1.0 }
+    const cl = p.*.deviceClass
+    if cl != profile.CLASS_INPUT && cl != profile.CLASS_DISPLAY && cl != profile.CLASS_OUTPUT && cl != profile.CLASS_COLORSPACE { return -1.0 }
+    const allocator = p.*.allocator
+    const xyz = profile.createXYZ(allocator)
+    if xyz == 0 { return -1.0 }
+    var profiles: [2]usize = undefined
+    profiles[0] = address
+    profiles[1] = xyz
+    var intents: [2]u64 = undefined
+    intents[0] = link.INTENT_RELATIVE_COLORIMETRIC
+    intents[1] = link.INTENT_RELATIVE_COLORIMETRIC
+    var bpc: [2]bool = undefined
+    bpc[0] = false
+    bpc[1] = false
+    var states: [2]f64 = undefined
+    states[0] = 1.0
+    states[1] = 1.0
+    var gamma: f64 = -1.0
+    const lut = link.linkProfiles(allocator, 2, &profiles, &intents, &bpc, &states, FLAGS_NOOPTIMIZE)
+    if lut != 0 {
+        const scratch = mem.allocate(allocator, SCRATCH_TOTAL + 1024 + 256 * 4)
+        if scratch != 0 {
+            var outputFormat: u64 = 0
+            var flags: u64 = FLAGS_NOOPTIMIZE
+            var pipe = lut
+            const ignored = optimize.optimizePipeline(&pipe, link.INTENT_RELATIVE_COLORIMETRIC, 0, &outputFormat, &flags, scratch)
+            const input = mem.floats(scratch + SCRATCH_TOTAL)
+            const output = mem.floats(scratch + SCRATCH_TOTAL + 64)
+            const values = scratch + SCRATCH_TOTAL + 1024
+            var i: usize = 0
+            while i < 256 {
+                const v: f32 = @floatFromInt(f32, mem.from8to16(@intCast(u64, i))) / @floatCast(f32, 65535.0)
+                input[0] = v
+                input[1] = v
+                input[2] = v
+                pipeline.evalFloat(pipeline.pipelineAt(pipe), input, output, scratch)
+                const y = @floatCast(f64, output[1]) * mem.MAX_ENCODEABLE_XYZ
+                mem.putF32(values + i * 4, @floatCast(f32, y))
+                i += 1
+            }
+            const yCurve = curve.buildTabulatedFloat(allocator, 256, values)
+            if yCurve != 0 {
+                gamma = curve.estimateGamma(curve.curveAt(yCurve), threshold)
+                curve.freeCurve(yCurve)
+            }
+            optimize.freePipeline(pipe)
+            mem.release(allocator, scratch)
+        } else {
+            optimize.freePipeline(lut)
+        }
+    }
+    profile.close(xyz)
+    return gamma
+}
+
+// cmsCreateExtendedTransform without gamut checking: COUNT profiles
+// (addresses) with their intents, black point compensations and
+// adaptation states, pixels of INPUTFORMAT to OUTPUTFORMAT. 0 when the
+// profiles do not link or a format is not supported.
+pub fn createExtended(allocator: Allocator, count: usize, profiles: [*]const usize, bpc: [*]bool, intents: [*]const u64, states: [*]const f64, inputFormat: u64, outputFormat: u64, flagsIn: u64) -> usize {
+    var flags = flagsIn & ~FLAGS_GAMUTCHECK
+    if (flags & FLAGS_NULLTRANSFORM) != 0 {
+        if !supportedFormat(inputFormat) || !supportedFormat(outputFormat) { return 0 }
+        const address = mem.allocate(allocator, @sizeOf(Transform))
+        if address == 0 { return 0 }
+        const t = transformAt(address)
+        t.*.allocator = allocator
+        t.*.inputFormat = inputFormat
+        t.*.outputFormat = outputFormat
+        t.*.flags = flags
+        t.*.nullTransform = true
+        return address
+    }
+    if !supportedFormat(inputFormat) || !supportedFormat(outputFormat) { return 0 }
+    var entry: u64 = 0
+    var exit: u64 = 0
+    if !colorSpaces(count, profiles, &entry, &exit) { return 0 }
+    if !properColorSpace(entry, inputFormat) { return 0 }
+    if !properColorSpace(exit, outputFormat) { return 0 }
+    if entry == profile.SPACE_RGB && format.bytes(inputFormat) == 2 && (flags & FLAGS_NOOPTIMIZE) == 0 {
+        const gamma = detectRGBGamma(profiles[0], 0.1)
+        if gamma > 0.0 && gamma < 1.6 { flags = flags | FLAGS_NOOPTIMIZE }
+    }
+    var lut = link.linkProfiles(allocator, count, profiles, intents, bpc, states, flags)
+    if lut == 0 { return 0 }
+    const pipe = pipeline.pipelineAt(lut)
+    if profile.channelsOf(entry) != pipe.*.inputs || profile.channelsOf(exit) != pipe.*.outputs {
+        pipeline.freePipeline(lut)
+        return 0
+    }
+    const scratch = mem.allocate(allocator, SCRATCH_TOTAL)
+    if scratch == 0 {
+        pipeline.freePipeline(lut)
+        return 0
+    }
+    var output = outputFormat
+    const ignored = optimize.optimizePipeline(&lut, intents[count - 1], inputFormat, &output, &flags, scratch)
+    mem.release(allocator, scratch)
+    const address = mem.allocate(allocator, @sizeOf(Transform))
+    if address == 0 {
+        optimize.freePipeline(lut)
+        return 0
+    }
+    const t = transformAt(address)
+    t.*.allocator = allocator
+    t.*.pipe = lut
+    t.*.inputFormat = inputFormat
+    t.*.outputFormat = output
+    t.*.flags = flags
+    t.*.entrySpace = entry
+    t.*.exitSpace = exit
+    t.*.intent = intents[count - 1]
+    return address
+}
+
+// cmsCreateTransform: one profile to another (OUTPUT 0: a device link
+// alone), black point compensation from the flags.
+pub fn create(allocator: Allocator, input: usize, inputFormat: u64, output: usize, outputFormat: u64, intent: u64, flags: u64) -> usize {
+    var profiles: [2]usize = undefined
+    profiles[0] = input
+    profiles[1] = output
+    const count: usize = if output == 0 { 1 } else { 2 }
+    var bpc: [2]bool = undefined
+    bpc[0] = (flags & FLAGS_BLACKPOINTCOMPENSATION) != 0
+    bpc[1] = bpc[0]
+    var intents: [2]u64 = undefined
+    intents[0] = intent
+    intents[1] = intent
+    var states: [2]f64 = undefined
+    states[0] = 1.0
+    states[1] = 1.0
+    return createExtended(allocator, count, &profiles, &bpc, &intents, &states, inputFormat, outputFormat, flags)
+}
+
+pub fn delete(address: usize) -> void {
+    if address == 0 { return }
+    const t = transformAt(address)
+    optimize.freePipeline(t.*.pipe)
+    mem.release(t.*.allocator, address)
+}
+
+// ---------------------------------------------------------------------------
+// Unrolling and packing (cmspack.c)
+
+inline fn reverseFlavor(v: u64) -> u64 { return 0xffff - v }
+inline fn changeEndian(v: u64) -> u64 { return ((v << 8) | (v >> 8)) & 0xffff }
+
+// Rotates the first value to the end (SwapFirst without extra channels).
+fn rotate(w: [*]u16, n: usize) -> void {
+    if n < 2 { return }
+    const first = w[0]
+    var i: usize = 0
+    while i + 1 < n {
+        w[i] = w[i + 1]
+        i += 1
+    }
+    w[n - 1] = first
+}
+
+// One pixel of FMT at ACCUM into W (16 bits a channel); the next pixel's
+// address. STRIDE: the bytes from one plane to the next.
+fn unroll(fmt: u64, w: [*]u16, accum: usize, stride: usize) -> usize {
+    const n = @intCast(usize, format.channels(fmt))
+    const swap = format.doSwap(fmt)
+    const reverse = format.flavor(fmt)
+    const first = format.swapFirst(fmt)
+    const extra = @intCast(usize, format.extra(fmt))
+    const premul = format.premul(fmt)
+    const extraFirst = swap != first
+    var at = accum
+    if format.bytes(fmt) == 1 {
+        if format.planar(fmt) {
+            var alphaFactor: u64 = 1
+            if extraFirst {
+                if premul && extra != 0 { alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.from8to16(mem.get8(at))))) }
+                at += extra * stride
+            } else if premul && extra != 0 {
+                alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.from8to16(mem.get8(at + n * stride)))))
+            }
+            var i: usize = 0
+            while i < n {
+                const index = if swap { n - i - 1 } else { i }
+                var v = mem.from8to16(mem.get8(at))
+                if reverse { v = reverseFlavor(v) }
+                if premul && alphaFactor > 0 {
+                    v = ((v << 16) & 0xffffffff) / alphaFactor
+                    if v > 0xffff { v = 0xffff }
+                }
+                w[index] = @intCast(u16, v & 0xffff)
+                at += stride
+                i += 1
+            }
+            return accum + 1
+        }
+        var alphaFactor: u64 = 1
+        if extraFirst {
+            if premul && extra != 0 { alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.from8to16(mem.get8(at))))) }
+            at += extra
+        } else if premul && extra != 0 {
+            alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.from8to16(mem.get8(at + n)))))
+        }
+        var i: usize = 0
+        while i < n {
+            const index = if swap { n - i - 1 } else { i }
+            var v = mem.from8to16(mem.get8(at))
+            if reverse { v = reverseFlavor(v) }
+            if premul && alphaFactor > 0 {
+                v = ((v << 16) & 0xffffffff) / alphaFactor
+                if v > 0xffff { v = 0xffff }
+            }
+            w[index] = @intCast(u16, v & 0xffff)
+            at += 1
+            i += 1
+        }
+        if !extraFirst { at += extra }
+        if extra == 0 && first { rotate(w, n) }
+        return at
+    }
+    const endian = format.endian16(fmt)
+    if format.planar(fmt) {
+        if swap { at += extra * stride }
+        var i: usize = 0
+        while i < n {
+            const index = if swap { n - i - 1 } else { i }
+            var v = mem.get16(at)
+            if endian { v = changeEndian(v) }
+            w[index] = @intCast(u16, if reverse { reverseFlavor(v) } else { v })
+            at += stride
+            i += 1
+        }
+        return accum + 2
+    }
+    if premul {
+        // UnrollAnyWordsPremul (the alpha read as Little CMS reads it).
+        const alpha = if extraFirst { mem.get8(at) } else { mem.get8(at + n - 1) }
+        const alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.from8to16(alpha))))
+        if extraFirst { at += 2 }
+        var i: usize = 0
+        while i < n {
+            const index = if swap { n - i - 1 } else { i }
+            var v = mem.get16(at)
+            if endian { v = changeEndian(v) }
+            if alphaFactor > 0 {
+                v = ((v << 16) & 0xffffffff) / alphaFactor
+                if v > 0xffff { v = 0xffff }
+            }
+            w[index] = @intCast(u16, if reverse { reverseFlavor(v) } else { v })
+            at += 2
+            i += 1
+        }
+        if !extraFirst { at += 2 }
+        return at
+    }
+    if extraFirst { at += extra * 2 }
+    var i: usize = 0
+    while i < n {
+        const index = if swap { n - i - 1 } else { i }
+        var v = mem.get16(at)
+        if endian { v = changeEndian(v) }
+        w[index] = @intCast(u16, if reverse { reverseFlavor(v) } else { v })
+        at += 2
+        i += 1
+    }
+    if !extraFirst { at += extra * 2 }
+    if extra == 0 && first { rotate(w, n) }
+    return at
+}
+
+// One pixel from W into FMT at OUTPUT; the next pixel's address.
+fn pack(fmt: u64, w: [*]const u16, output: usize, stride: usize) -> usize {
+    const n = @intCast(usize, format.channels(fmt))
+    const swap = format.doSwap(fmt)
+    const reverse = format.flavor(fmt)
+    const first = format.swapFirst(fmt)
+    const extra = @intCast(usize, format.extra(fmt))
+    const premul = format.premul(fmt)
+    const extraFirst = swap != first
+    var at = output
+    if format.bytes(fmt) == 1 {
+        const step: usize = if format.planar(fmt) { stride } else { 1 }
+        var alphaFactor: u64 = 0
+        if extraFirst {
+            if premul && extra != 0 { alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.from8to16(mem.get8(at))))) }
+            at += extra * step
+        } else if premul && extra != 0 {
+            alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.from8to16(mem.get8(at + n * step)))))
+        }
+        var v: u64 = 0
+        var i: usize = 0
+        while i < n {
+            const index = if swap { n - i - 1 } else { i }
+            v = @intCast(u64, w[index])
+            if reverse { v = reverseFlavor(v) }
+            if premul && alphaFactor != 0 { v = (((v * alphaFactor + 0x8000) & 0xffffffff) >> 16) & 0xffff }
+            mem.put8(at, mem.from16to8(v))
+            at += step
+            i += 1
+        }
+        if format.planar(fmt) { return output + 1 }
+        if !extraFirst { at += extra }
+        if extra == 0 && first && n > 0 {
+            mem.move(output + 1, output, n - 1)
+            mem.put8(output, mem.from16to8(v))
+        }
+        return at
+    }
+    const endian = format.endian16(fmt)
+    const step: usize = if format.planar(fmt) { stride } else { 2 }
+    var alphaFactor: u64 = 0
+    if extraFirst {
+        if premul && extra != 0 { alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.get16(at)))) }
+        at += extra * step
+    } else if premul && extra != 0 {
+        alphaFactor = @intCast(u64, mem.toFixedDomain(@intCast(i64, mem.get16(at + n * step))))
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        const index = if swap { n - i - 1 } else { i }
+        v = @intCast(u64, w[index])
+        if endian { v = changeEndian(v) }
+        if reverse { v = reverseFlavor(v) }
+        if premul && alphaFactor != 0 { v = (((v * alphaFactor + 0x8000) & 0xffffffff) >> 16) & 0xffff }
+        mem.put16(at, v)
+        at += step
+        i += 1
+    }
+    if format.planar(fmt) { return output + 2 }
+    if !extraFirst { at += extra * 2 }
+    if extra == 0 && first && n > 0 {
+        mem.move(output + 2, output, (n - 1) * 2)
+        mem.put16(output, v)
+    }
+    return at
+}
+
+fn pixelSize(fmt: u64) -> usize {
+    const b = @intCast(usize, format.bytes(fmt))
+    return if b == 0 { 8 } else { b }
+}
+
+// _cmsHandleExtraChannels for 8- and 16-bit chunky or planar pixels:
+// each extra channel converted to the output's depth.
+fn copyExtraChannels(t: *Transform, input: usize, output: usize, pixels: usize, lines: usize, lineIn: usize, lineOut: usize, planeIn: usize, planeOut: usize) -> void {
+    if (t.*.flags & FLAGS_COPY_ALPHA) == 0 { return }
+    if t.*.inputFormat == t.*.outputFormat && input == output { return }
+    const inFmt = t.*.inputFormat
+    const outFmt = t.*.outputFormat
+    const extras = @intCast(usize, format.extra(inFmt))
+    if extras != @intCast(usize, format.extra(outFmt)) || extras == 0 { return }
+    const inBytes = pixelSize(inFmt)
+    const outBytes = pixelSize(outFmt)
+    const inChannels = @intCast(usize, format.channels(inFmt))
+    const outChannels = @intCast(usize, format.channels(outFmt))
+    var line: usize = 0
+    while line < lines {
+        var pixel: usize = 0
+        while pixel < pixels {
+            var k: usize = 0
+            while k < extras {
+                const inComponent = if format.doSwap(inFmt) != format.swapFirst(inFmt) { k } else { inChannels + k }
+                const outComponent = if format.doSwap(outFmt) != format.swapFirst(outFmt) { k } else { outChannels + k }
+                var source: usize = 0
+                if format.planar(inFmt) {
+                    source = input + line * lineIn + pixel * inBytes + inComponent * planeIn
+                } else {
+                    source = input + line * lineIn + (pixel * (inChannels + extras) + inComponent) * inBytes
+                }
+                var target: usize = 0
+                if format.planar(outFmt) {
+                    target = output + line * lineOut + pixel * outBytes + outComponent * planeOut
+                } else {
+                    target = output + line * lineOut + (pixel * (outChannels + extras) + outComponent) * outBytes
+                }
+                var value: u64 = 0
+                if inBytes == 1 { value = mem.from8to16(mem.get8(source)) } else { value = mem.get16(source) }
+                if outBytes == 1 {
+                    if inBytes == 1 { mem.put8(target, mem.get8(source)) } else { mem.put8(target, mem.from16to8(value)) }
+                } else {
+                    mem.put16(target, value)
+                }
+                k += 1
+            }
+            pixel += 1
+        }
+        line += 1
+    }
+}
+
+// cmsDoTransformLineStride: PIXELS pixels of each of LINES lines.
+pub fn transformLines(address: usize, input: usize, output: usize, pixels: usize, lines: usize, lineIn: usize, lineOut: usize, planeIn: usize, planeOut: usize) -> void {
+    const t = transformAt(address)
+    copyExtraChannels(t, input, output, pixels, lines, lineIn, lineOut, planeIn, planeOut)
+    const scratch = mem.allocate(t.*.allocator, SCRATCH_TOTAL)
+    if scratch == 0 { return }
+    const win = mem.shorts(scratch + W_IN)
+    const wout = mem.shorts(scratch + W_OUT)
+    const pipe = if t.*.pipe == 0 { 0 } else { t.*.pipe }
+    var line: usize = 0
+    while line < lines {
+        var accum = input + line * lineIn
+        var out = output + line * lineOut
+        var pixel: usize = 0
+        while pixel < pixels {
+            accum = unroll(t.*.inputFormat, win, accum, planeIn)
+            if t.*.nullTransform {
+                var i: usize = 0
+                while i < 16 {
+                    wout[i] = win[i]
+                    i += 1
+                }
+            } else {
+                optimize.eval16(pipeline.pipelineAt(pipe), win, wout, scratch)
+            }
+            out = pack(t.*.outputFormat, wout, out, planeOut)
+            pixel += 1
+        }
+        line += 1
+    }
+    mem.release(t.*.allocator, scratch)
+}
+
+// cmsDoTransform: SIZE pixels.
+pub fn transform(address: usize, input: usize, output: usize, size: usize) -> void {
+    const t = transformAt(address)
+    transformLines(address, input, output, size, 1, 0, 0, size * pixelSize(t.*.inputFormat), size * pixelSize(t.*.outputFormat))
+}

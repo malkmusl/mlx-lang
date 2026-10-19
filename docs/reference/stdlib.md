@@ -1210,6 +1210,40 @@ var status: usize = 0
 const length = spawn.capture(&options, true, &output, 4096, &status)
 ```
 
+## Finding fonts (`std.fontconfig`)
+
+**Implementation:** `std/src/fontconfig.mlx` and `std/src/fontconfig/`
+**Source tests:** `373_fontconfig_runtime.mlx` (run by `tests/run_std_modules.sh`);
+`tools/check_fontconfig.sh` for the C API over it (compiler/capi/fontconfig)
+
+Fontconfig 2.15's font matching without a C library: `load.current()`
+reads fonts.conf and what it includes (or Fontconfig's fallback
+configuration) and the fonts of its directories, each face read by
+`std.truetype` into a pattern of Fontconfig's objects and kept in a
+cache of the module's own under `$XDG_CACHE_HOME/mlx-fontconfig`.
+`pattern.parseName` makes a pattern of a name ("sans-serif:bold"),
+`config.substitute` and `config.defaultSubstitute` apply the rules and
+the defaults, and `matching.fontMatch`, `matching.fontSort` and
+`matching.fontList` match, sort and list as Fontconfig does. Patterns,
+character sets, language sets and the configuration are records reached
+by their addresses, as the C API hands them out; strings compare with
+Fontconfig's case folding (`strings`, of CaseFolding.txt). The languages'
+orthographies (`std/registry/fontconfig`, Fontconfig's fc-lang) and the
+folding are made into `std/src/fontconfig/data.mlx` by
+`std/registry/fontconfig/generate.mlx`.
+
+```mlx
+const fc = @import("std.fontconfig")
+
+const config = fc.load.current()
+const p = fc.pattern.parseName(name)
+_ = fc.config.substitute(config, p, fc.config.MATCH_PATTERN)
+fc.config.defaultSubstitute(p)
+var result: i64 = 0
+const font = fc.matching.fontMatch(config, p, &result)
+const file = fc.pattern.firstString(font, fc.objects.FILE)
+```
+
 ## fmt
 
 **Normative source:** `spec/04-stdlib/fmt.xml`
