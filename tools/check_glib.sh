@@ -44,6 +44,13 @@
 #                          g_file_query_info (and async) and
 #                          g_file_input_stream_query_info on files of
 #                          this system, checked against stat
+#       tests/dbus.c       GDBus on a dbus-daemon of the test's own (when
+#                          dbus-daemon is installed): connections,
+#                          names owned, exported objects called
+#                          (methods, errors, properties, Introspect),
+#                          signals and subscriptions, proxies,
+#                          descriptors passed, timeouts, cancelling,
+#                          closing; names' syntax, D-Bus errors
 #   - WTF's sources for WPE that stand on GLib and the system
 #     (tests/wtf/files.txt: wtf/glib, generic, unix, linux and posix)
 #     compile with mlx-cc on these headers, with WPE's configuration
@@ -121,6 +128,31 @@ else
     wait "$tls13_server" "$tls12_server" 2> /dev/null || true
     diff -u compiler/capi/glib/tests/tls_handshake.expected "$work/tls_handshake.out" || { cat "$work/tls_handshake.err"; fail "tests/tls_handshake.c prints otherwise"; }
     echo "ok   tests/tls_handshake.c"
+fi
+
+# GDBus against a session bus of its own: a dbus-daemon started for the
+# test (its first client is :1.0, as when GLib ran the same program on a
+# daemon of its own for dbus.expected).
+if ! command -v dbus-daemon > /dev/null; then
+    echo "skip tests/dbus.c: no dbus-daemon"
+else
+    cc compiler/capi/glib/tests/dbus.c -o "$work/dbus" "$library" || fail "tests/dbus.c does not build"
+    mkdir -p "$work/bus"
+    dbus-daemon --session --address="unix:path=$work/bus/socket" --nofork --print-address=1 > "$work/bus/address" 2> "$work/bus/log" &
+    bus=$!
+    tries=0
+    while [ ! -s "$work/bus/address" ]; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 100 ] || { kill "$bus"; cat "$work/bus/log"; fail "dbus-daemon did not start"; }
+        sleep 0.05
+    done
+    status=0
+    (cd "$work/run" && DBUS_SESSION_BUS_ADDRESS=$(head -n 1 "$work/bus/address") run timeout 150 "$work/dbus") > "$work/dbus.out" 2> "$work/dbus.err" || status=$?
+    echo "exit $status" >> "$work/dbus.out"
+    kill "$bus" 2> /dev/null || true
+    wait "$bus" 2> /dev/null || true
+    diff -u compiler/capi/glib/tests/dbus.expected "$work/dbus.out" || { cat "$work/dbus.err"; fail "tests/dbus.c prints otherwise"; }
+    echo "ok   tests/dbus.c"
 fi
 
 webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
