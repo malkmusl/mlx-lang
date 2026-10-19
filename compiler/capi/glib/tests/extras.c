@@ -164,6 +164,123 @@ static void network_address (void)
     g_object_unref (address);
 }
 
+static void print_addresses (const char *what, GList *addresses, GError **errorp)
+{
+    /* The error is read here, after the lookup the arguments made. */
+    GError *error = *errorp;
+    printf ("%s:", what);
+    if (error) {
+        printf (" error %s %d\n", g_quark_to_string (error->domain), error->code);
+        g_error_free (error);
+        return;
+    }
+    for (GList *l = addresses; l; l = l->next) {
+        gchar *text = g_inet_address_to_string (l->data);
+        printf (" %s", text);
+        g_free (text);
+    }
+    printf ("\n");
+    g_resolver_free_addresses (addresses);
+}
+
+static void resolved (GObject *source, GAsyncResult *result, gpointer data)
+{
+    GError *error = NULL;
+    GList *addresses = g_resolver_lookup_by_name_with_flags_finish (G_RESOLVER (source), result, &error);
+    print_addresses ("async 127.0.0.2", addresses, &error);
+    g_main_loop_quit (data);
+}
+
+static void named (GObject *source, GAsyncResult *result, gpointer data)
+{
+    GError *error = NULL;
+    gchar *name = g_resolver_lookup_by_address_finish (G_RESOLVER (source), result, &error);
+    /* Whether ::1 has a name is the system's: either answer will do. */
+    printf ("async name of ::1: %s\n", (name != NULL) != (error != NULL) ? "a name or an error" : "both or neither");
+    g_clear_error (&error);
+    g_free (name);
+    g_main_loop_quit (data);
+}
+
+/* A resolver of its own, as WebKit's cache of names is: the class's
+   functions answer and GResolver's only call them. */
+typedef GResolver FixedResolver;
+typedef GResolverClass FixedResolverClass;
+static void fixed_resolver_class_init (FixedResolverClass *klass);
+static void fixed_resolver_init (FixedResolver *resolver);
+static GType fixed_resolver_get_type (void)
+{
+    static GType type;
+    if (!type)
+        type = g_type_register_static_simple (G_TYPE_RESOLVER, "FixedResolver", sizeof (FixedResolverClass),
+                                              (GClassInitFunc) fixed_resolver_class_init, sizeof (FixedResolver),
+                                              (GInstanceInitFunc) fixed_resolver_init, 0);
+    return type;
+}
+
+static GList *fixed_lookup (GResolver *resolver, const gchar *hostname, GResolverNameLookupFlags flags,
+                            GCancellable *cancellable, GError **error)
+{
+    if (g_str_equal (hostname, "fixed.test"))
+        return g_list_append (NULL, g_inet_address_new_from_string ("192.0.2.7"));
+    g_set_error (error, G_RESOLVER_ERROR, G_RESOLVER_ERROR_NOT_FOUND, "no %s", hostname);
+    return NULL;
+}
+
+static GList *fixed_lookup_by_name (GResolver *resolver, const gchar *hostname, GCancellable *cancellable, GError **error)
+{
+    return fixed_lookup (resolver, hostname, 0, cancellable, error);
+}
+
+static void fixed_resolver_init (FixedResolver *resolver) { }
+static void fixed_resolver_class_init (FixedResolverClass *klass)
+{
+    klass->lookup_by_name = fixed_lookup_by_name;
+    klass->lookup_by_name_with_flags = fixed_lookup;
+}
+
+static void resolvers (void)
+{
+    GResolver *resolver = g_resolver_get_default ();
+    GError *error = NULL;
+    printf ("default resolver %s, timeout %u\n", G_OBJECT_TYPE_NAME (resolver), g_resolver_get_timeout (resolver));
+    print_addresses ("127.0.0.1", g_resolver_lookup_by_name (resolver, "127.0.0.1", NULL, &error), &error);
+    error = NULL;
+    print_addresses ("[::1]", g_resolver_lookup_by_name (resolver, "::1", NULL, &error), &error);
+    error = NULL;
+    print_addresses ("localhost v4", g_resolver_lookup_by_name_with_flags (resolver, "localhost", G_RESOLVER_NAME_LOOKUP_FLAGS_IPV4_ONLY, NULL, &error), &error);
+    error = NULL;
+    print_addresses ("localhost v6", g_resolver_lookup_by_name_with_flags (resolver, "localhost", G_RESOLVER_NAME_LOOKUP_FLAGS_IPV6_ONLY, NULL, &error), &error);
+
+    GMainLoop *loop = g_main_loop_new (NULL, FALSE);
+    g_resolver_lookup_by_name_with_flags_async (resolver, "127.0.0.2", G_RESOLVER_NAME_LOOKUP_FLAGS_DEFAULT, NULL, resolved, loop);
+    g_main_loop_run (loop);
+    GInetAddress *loopback = g_inet_address_new_loopback (G_SOCKET_FAMILY_IPV6);
+    g_resolver_lookup_by_address_async (resolver, loopback, NULL, named, loop);
+    g_main_loop_run (loop);
+    g_object_unref (loopback);
+    g_main_loop_unref (loop);
+
+    g_object_set (resolver, "timeout", 1500, NULL);
+    guint timeout = 0;
+    g_object_get (resolver, "timeout", &timeout, NULL);
+    printf ("timeout %u %u\n", timeout, g_resolver_get_timeout (resolver));
+    g_resolver_set_timeout (resolver, 0);
+
+    GResolver *fixed = g_object_new (fixed_resolver_get_type (), NULL);
+    error = NULL;
+    print_addresses ("fixed", g_resolver_lookup_by_name (fixed, "fixed.test", NULL, &error), &error);
+    error = NULL;
+    print_addresses ("fixed other", g_resolver_lookup_by_name_with_flags (fixed, "other.test", 0, NULL, &error), &error);
+    g_resolver_set_default (fixed);
+    GResolver *now = g_resolver_get_default ();
+    printf ("default now %s, the same %d\n", G_OBJECT_TYPE_NAME (now), now == fixed);
+    g_object_unref (now);
+    g_resolver_set_default (resolver);
+    g_object_unref (fixed);
+    g_object_unref (resolver);
+}
+
 int main (void)
 {
     setvbuf (stdout, NULL, _IOLBF, 0);
@@ -182,5 +299,6 @@ int main (void)
     enum_type (G_TYPE_TLS_AUTHENTICATION_MODE, G_TLS_AUTHENTICATION_REQUIRED);
     proxies ();
     network_address ();
+    resolvers ();
     return 0;
 }

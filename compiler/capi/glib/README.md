@@ -72,6 +72,7 @@ sources reach.
 | `hostnames.mlx` | `ghostutils.h`'s `g_hostname_to_ascii`: IDNA's ACE labels (Punycode) |
 | `proxyresolver.mlx` | `gproxyresolver.h`, `gsimpleproxyresolver.h`: the default resolver (always "direct://", GIO's dummy resolver) and GSimpleProxyResolver with its hosts to ignore |
 | `networkaddress.mlx` | `gnetworkaddress.h`: a host name and port as a GSocketConnectable (the server identity a TLS connection checks) |
+| `resolver.mlx` | `gresolver.h`: GResolver and the default GThreadedResolver: names to addresses and back by the C library (getaddrinfo, getnameinfo), in a thread for the asynchronous calls; addresses and "localhost" answered at once; a subclass (WebKit's cache of names) overrides the class's functions. DNS records (SRV, MX...) are not looked up |
 | `tests/` | C programs built by mlx-cc against the library, each with the output GLib 2.80 gives (`NAME.expected`, the exit status last); `tests/wtf/` the WPE configuration and the WTF sources compiled by the check |
 
 ## Tests
@@ -92,7 +93,8 @@ sources reach.
   `streams.c` (memory, filter and socket streams, synchronous and
   asynchronous, splicing, pollable sources, GSimpleIOStream) and
   `extras.c` (keyed data lists, random numbers, language names, IDNA
-  host names, GIO's enum types, proxy resolvers, network addresses),
+  host names, GIO's enum types, proxy resolvers, network addresses,
+  GResolver and a subclass of it),
   and
   compares what they print with what the same programs print on GLib
   2.80 (with glib-networking's GnuTLS backend for TLS);
@@ -161,14 +163,18 @@ system without it:
   `g_type_register_dynamic` reports a critical and returns 0) are not
   here. `G_DECLARE_FINAL_TYPE`, `G_DECLARE_DERIVABLE_TYPE` and
   `G_DECLARE_INTERFACE` are (as C
-  the header carries, `c_macros`), the `G_DEFINE_*` macros not yet;
+  the header carries, `c_macros`), and `G_IMPLEMENT_INTERFACE` (for the
+  code of a type-defining macro of its own, as WebKit's), the
+  `G_DEFINE_*` macros not yet;
   `g_autoptr` is not (mlx-cc has no cleanup attribute): the cleanup
   functions are declared for code that calls them.
 - **GOption**'s help (`--help`, `g_option_context_get_help`) is not here:
   `--help` is an unknown option unless an entry has that name.
-- **Networking**: names are resolved by the C library at once, before
-  connecting (GResolver, proxies, GNetworkAddress and TLS are not here);
-  Unix socket addresses are not here.
+- **Networking**: a socket client resolves names by the C library at
+  once, before connecting, not through GResolver; GResolver's DNS
+  records (`g_resolver_lookup_records`) answer
+  G_IO_ERROR_NOT_SUPPORTED; proxies are not used; Unix socket addresses
+  are not here.
 - Everything of GLib, GObject and GIO that WTF and JavaScriptCore do not
   use (GIO's settings, TLS, GSubprocess, GVfs...).
 
