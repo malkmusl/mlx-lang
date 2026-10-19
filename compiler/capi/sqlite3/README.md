@@ -45,7 +45,8 @@ of it; there is no header written by hand.
   connection. `:memory:` databases.
 - **SQL**: SELECT (joins, LEFT JOIN, subqueries in every place, compound
   SELECTs, GROUP BY, HAVING, DISTINCT, ORDER BY with collations and NULLS
-  FIRST/LAST, LIMIT/OFFSET, table-valued pragma functions), INSERT
+  FIRST/LAST, LIMIT/OFFSET, WITH's common table expressions,
+  table-valued pragma functions), INSERT
   (VALUES, SELECT, DEFAULT VALUES, OR conflict resolutions, upserts:
   ON CONFLICT DO NOTHING and DO UPDATE), REPLACE,
   UPDATE, DELETE; NOT NULL, UNIQUE, PRIMARY KEY, CHECK and FOREIGN KEY
@@ -66,9 +67,8 @@ of it; there is no header written by hand.
   (SELECT, READ, FUNCTION, the DDL's statements over sqlite_master).
 
 What it does not do (yet): triggers (refused; a file's are passed
-over), WITH, window
-functions, RETURNING, WITHOUT ROWID tables, ATTACH, virtual
-tables (FTS, R-tree), the JSON and math functions, EXPLAIN. A write-ahead
+over), recursive WITH tables, window functions, RETURNING, WITHOUT
+ROWID tables, ATTACH, virtual tables (FTS, R-tree), the JSON and math functions, EXPLAIN. A write-ahead
 log: `PRAGMA journal_mode=WAL` answers `wal` but the file keeps a
 rollback journal, and checkpoints have nothing to do. `auto_vacuum` is
 kept in the header only (no pointer map pages). `integrity_check` counts
@@ -92,7 +92,7 @@ process gone, its journal hot) is rolled back by the other.
 
 | Test | What it covers |
 |------|----------------|
-| `sql.c` | Expressions, NULLs, types, affinity, collations, LIKE and GLOB, CASE, CAST, the functions, aggregates, GROUP BY, ORDER BY, joins, subqueries, compounds, errors |
+| `sql.c` | Expressions, NULLs, types, affinity, collations, LIKE and GLOB, CASE, CAST, the functions, aggregates, GROUP BY, ORDER BY, joins, subqueries, compounds, views, WITH, errors |
 | `api.c` | Opening, prepare and tails, binds of every type, column accessors and conversions, names and declared types, reset, expanded SQL, changes, error codes and messages, exec, get_table, printf, UTF-16 |
 | `writes.c` | INSERT, UPDATE, DELETE, conflict resolutions, constraints, partial indexes, AUTOINCREMENT, foreign keys, transactions and savepoints, DDL and its errors |
 | `webkit.c` | Every statement of WebKit's databases (`webkit_corpus.h`, 409 statements from WebKit 2.54.1), a database per source file, run with bound values |

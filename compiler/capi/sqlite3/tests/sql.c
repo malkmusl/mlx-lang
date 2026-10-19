@@ -2,7 +2,7 @@
    comparisons, collations, LIKE and GLOB, CASE and CAST, the scalar,
    date and aggregate functions, GROUP BY and HAVING, ORDER BY with
    collations and NULLs, LIMIT and OFFSET, DISTINCT, joins, subqueries,
-   compound SELECTs, views, and their errors. It prints what SQLite 3.45
+   compound SELECTs, views, WITH, and their errors. It prints what SQLite 3.45
    prints for the same program. */
 #include "common.h"
 
@@ -124,6 +124,42 @@ static const char *views =
     "DROP VIEW named;"
     "SELECT name FROM sqlite_master WHERE type = 'view';";
 
+static const char *ctes =
+    "WITH big AS (SELECT name, dept FROM p WHERE id > 2) SELECT name FROM big WHERE dept = 2 ORDER BY name;"
+    "WITH t(a, b) AS (SELECT id, dept FROM p), u AS (SELECT a + b AS s FROM t WHERE b IS NOT NULL) SELECT s FROM u UNION ALL SELECT count(*) FROM t ORDER BY 1;"
+    "WITH t AS (SELECT id, id * 2 AS twice FROM p) SELECT t.id, again.twice FROM t JOIN t AS again ON again.id = t.id + 1 ORDER BY 1;"
+    "WITH t AS NOT MATERIALIZED (SELECT 1 AS one), d AS (SELECT 'shadowed') SELECT one, (SELECT count(*) FROM d) FROM t;"
+    "SELECT * FROM (WITH w AS (SELECT 5 AS five) SELECT five FROM w);"
+    "SELECT id FROM p WHERE id IN (WITH z(n) AS (SELECT 3 UNION SELECT 4) SELECT n FROM z) ORDER BY id;"
+    "WITH c AS (SELECT dept, count(*) AS n FROM p GROUP BY dept) SELECT title, n FROM d JOIN c ON c.dept = d.id ORDER BY title;";
+
+static const char *cte_errors[] = {
+    "WITH t(a) AS (SELECT 1, 2) SELECT * FROM t;",
+    "WITH t AS (SELECT nosuch FROM p) SELECT * FROM t;",
+    "WITH t AS (SELECT 1) SELECT * FROM u;",
+    "WITH t AS (SELECT * FROM t) SELECT * FROM t;",
+    NULL,
+};
+
+/* A WITH's table used twice keeps its parameters' numbers. */
+static void cte_parameters(sqlite3 *db)
+{
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db, "WITH t AS (SELECT id FROM p WHERE id > ? AND id < :most) SELECT t.id, u.id FROM t JOIN t AS u ON u.id = t.id + ?3 ORDER BY 1", -1, &s, 0) != SQLITE_OK) {
+        printf("prepare: %s\n", sqlite3_errmsg(db));
+        return;
+    }
+    int n = sqlite3_bind_parameter_count(s);
+    int most = sqlite3_bind_parameter_index(s, ":most");
+    printf("parameters %d, :most is %d\n", n, most);
+    sqlite3_bind_int(s, 1, 1);
+    sqlite3_bind_int(s, 2, 6);
+    sqlite3_bind_int(s, 3, 2);
+    while (sqlite3_step(s) == SQLITE_ROW)
+        show_row(s);
+    sqlite3_finalize(s);
+}
+
 static const char *view_errors[] = {
     "CREATE VIEW p AS SELECT 1;",
     "CREATE VIEW byDept AS SELECT 1;",
@@ -150,6 +186,10 @@ int main(void)
     run(db, views);
     for (int i = 0; view_errors[i]; i++)
         run(db, view_errors[i]);
+    run(db, ctes);
+    for (int i = 0; cte_errors[i]; i++)
+        run(db, cte_errors[i]);
+    cte_parameters(db);
     /* After a failed statement run stops: the rest one by one. */
     run(db, "SELECT * FROM nosuch;");
     run(db, "SELECT name FROM p, d WHERE id = 1;");
