@@ -17,7 +17,7 @@ gcc program.c -L mlx-out/libc -lmlxc -Wl,-rpath,$PWD/mlx-out/libc  # next to gli
 
 | Library | What it is | Built from |
 | --- | --- | --- |
-| `libmlxc.so.1` (`libmlxc.so`) | 843 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, gettext, iconv, dlfcn; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
+| `libmlxc.so.1` (`libmlxc.so`) | 847 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, gettext, iconv, POSIX regular expressions, dlfcn; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
 | `libm.so.6` (`libm.so`) | the math functions of `<math.h>`: `std.math`'s sine, cosine (huge arguments reduced with the bits of 2/pi), e^x, logarithms and cube root, with the arc tangent, the inverse and hyperbolic functions, powers (whole exponents to an ulp in double-double arithmetic), `fmod` and `remainder` exact, the rounding functions, `frexp`/`ldexp`, `hypot`, `nextafter`, `erf`/`erfc` (a series in double-double, a continued fraction), `tgamma`/`lgamma` (Lanczos and a rising product), the classification, and the `f` variants; `tools/libm_check.py` compares it with glibc's libm call by call; the 41 `l` (long double) variants (`sinl` to `lgammal`) are x87 code of their own, `tools/libc/x87_long.s`, generated into `x87_long.mlx` by `tools/libc/gen_x87.py` and bound by the loader from a page of its own. Not yet: the Bessel functions, errno | `libm.mlx`, `x87_long.mlx` |
 
 It is a `--plugin` shared object on a stack arena with no C library under
@@ -101,6 +101,16 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
   Standard's tables, as browsers read them); UTF-8 past U+10FFFF is
   invalid; the East Asian multi-byte charsets are not here (`iconv_open`
   fails with EINVAL, as for any charset it does not know).
+- **`regex.mlx`**: `regcomp`, `regexec`, `regerror`, `regfree` as
+  glibc's (its `regex_t` and `regmatch_t` layout, its error codes and
+  messages), basic and extended expressions with GNU's operators
+  (`\| \+ \? \w \s \b \< \>`), bracket expressions with the C locale's
+  classes, back-references, `REG_ICASE`, `REG_NEWLINE`, `REG_NOSUB`,
+  `REG_NOTBOL`, `REG_NOTEOL`, `REG_STARTEND`: a tree compiled into a
+  program for a backtracking machine that finds the leftmost match and
+  of those the longest, as POSIX asks, remembering the states it has
+  tried so a search costs the program's length times the text's (but
+  with back-references); a character is a byte.
 - **`time.mlx`**: `clock_gettime`, `gmtime`/`localtime` (`std.timezone`),
   `mktime`/`timegm`, `strftime`, `asctime`.
 - **`signal.mlx`**: `sigaction` with a restorer of its own, `signal`,
@@ -111,7 +121,11 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
   `pthread_join`/`detach` (a registry of the live threads: a handle
   already joined answers ESRCH), mutexes (normal, recursive,
   error-checking), condition variables, rwlocks, spin locks, barriers,
-  semaphores, keys with destructors, `pthread_once`, names.
+  semaphores, keys with destructors, `pthread_once`, names;
+  `pthread_getattr_np` of the main thread describes the kernel's stack
+  as glibc does (the mapping holding the first stack pointer in
+  `/proc/self/maps`, as deep as `RLIMIT_STACK` allows), since
+  JavaScriptCore's stack limits are taken from it.
 - **`loader.mlx`**: the dynamic loader: the list of loaded objects (the
   first five words of a record are glibc's `struct link_map`, and
   `_r_debug` through the program's `DT_DEBUG`, so gdb lists the libraries),
@@ -150,6 +164,12 @@ into `mlx-out/include/mlxlibc` (`./mlx build libc-headers`; `-I` that
 directory): `iconv.h` and `libintl.h`.
 
 ## Checks
+
+`tools/check_regex.sh` runs `tests/regex.c` (extended and basic
+expressions, brackets, case, back-references, GNU's operators, the
+execution flags, the errors and their messages: 104 lines) linked by gcc
+against libmlxc and against glibc, and built by mlx-cc (whose `<regex.h>`
+has glibc's layout) under libmlxc.so.1 as its loader: all print the same.
 
 `tools/check_iconv.sh` runs `tests/iconv.c` (the Unicode forms, byte
 order marks, invalid and incomplete input, a full output, `//TRANSLIT`
