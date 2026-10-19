@@ -1,0 +1,545 @@
+// soup-hsts-policy.h, soup-hsts-enforcer.h, soup-hsts-enforcer-db.h: HTTP
+// Strict Transport Security (RFC 6797). A SoupHSTSPolicy is a domain, its
+// max-age and expiry and whether it covers subdomains; the enforcer (a
+// session feature) learns them from https responses'
+// Strict-Transport-Security headers and sends http:// messages to known
+// hosts over https:// instead ("hsts-enforced"), as libsoup does.
+// SoupHSTSEnforcerDB keeps its policies in its file (this library has no
+// SQLite: a line per policy, the domain, max-age, expiry and whether it
+// covers subdomains, tab-separated).
+//
+// A policy: the domain (0), max-age (8), expiry (16, a GDateTime; 0 for a
+// session policy), whether it covers subdomains (24). An enforcer's
+// private data is a pointer to a record of the session (0), the host
+// policies (8) and the session policies (16) (GHashTables by domain, any
+// case) and a mutex (24); a DB enforcer adds (24) a record of its file
+// name (0).
+//
+// The class (SoupHSTSEnforcerClass): is_persistent (136),
+// has_valid_policy (144), changed (152).
+const m = @import("../glib/memory.mlx")
+const g = @import("./g.mlx")
+const c = @import("./common.mlx")
+const misc = @import("./misc.mlx")
+const message = @import("./message.mlx")
+const feature = @import("./feature.mlx")
+const headers = @import("./headers.mlx")
+const http = @import("std.http.headers")
+
+extern("c") fn soup_header_parse_semi_param_list_strict(header: usize) -> usize
+extern("c") fn soup_header_free_param_list(list: usize) -> void
+extern("c") fn soup_message_add_header_handler(msg: usize, signal: usize, header: usize, callback: usize, data: usize) -> u32
+extern("c") fn soup_uri_copy(uri: usize, first: i32, a: usize, b: i32, c_: usize, end: i32) -> usize
+extern("c") fn g_signal_handlers_disconnect_matched(instance: usize, mask: i32, id: u32, detail: u32, closure: usize, func: usize, data: usize) -> u32
+extern("c") fn g_hash_table_remove_all(table: usize) -> void
+extern("c") fn g_list_prepend(list: usize, data: usize) -> usize
+extern("c") fn g_free(address: usize) -> void
+extern("c") fn __mlx_soup_case_hash(key: usize) -> u32
+extern("c") fn __mlx_soup_case_equal(a: usize, b: usize) -> i32
+extern("c") fn __mlx_soup_session_cancel_message(session: usize, msg: usize) -> void
+
+const P_DOMAIN: usize = 0
+const P_MAX_AGE: usize = 8
+const P_EXPIRES: usize = 16
+const P_SUBDOMAINS: usize = 24
+const P_SIZE: usize = 32
+
+const E_SESSION: usize = 0
+const E_HOST: usize = 8
+const E_SESSIONS: usize = 16
+const E_MUTEX: usize = 24
+const E_SIZE: usize = 32
+
+const C_IS_PERSISTENT: usize = 136
+const C_HAS_VALID_POLICY: usize = 144
+const C_CHANGED: usize = 152
+const CLASS_SIZE: usize = 192
+
+pub const BoolFn = fn(usize) -> i32
+pub const ValidFn = fn(usize, usize) -> i32
+
+var policyType: usize = 0
+var enforcerType: usize = 0
+var dbType: usize = 0
+var privateOffset: i32 = 0
+var sigChanged: u32 = 0
+
+// ---------------------------------------------------------------------------
+// Policies
+
+export fn soup_hsts_policy_get_type() -> usize {
+    if c.onceEnter(&policyType) {
+        c.onceLeave(&policyType, g.g_boxed_type_register_static(m.literal("SoupHSTSPolicy"), @intFromPtr(soup_hsts_policy_copy), @intFromPtr(soup_hsts_policy_free)))
+    }
+    return policyType
+}
+
+export fn soup_hsts_policy_copy(policy: usize) -> usize {
+    const copy = m.alloc(P_SIZE)
+    m.putWord(copy + P_DOMAIN, m.dup(m.getWord(policy + P_DOMAIN)))
+    m.putWord(copy + P_MAX_AGE, m.getWord(policy + P_MAX_AGE))
+    if m.getWord(policy + P_EXPIRES) != 0 { m.putWord(copy + P_EXPIRES, g.g_date_time_ref(m.getWord(policy + P_EXPIRES))) }
+    m.putI32(copy + P_SUBDOMAINS, m.getI32(policy + P_SUBDOMAINS))
+    return copy
+}
+
+export fn soup_hsts_policy_free(policy: usize) -> void {
+    if policy == 0 { return }
+    m.release(m.getWord(policy + P_DOMAIN))
+    if m.getWord(policy + P_EXPIRES) != 0 { g.g_date_time_unref(m.getWord(policy + P_EXPIRES)) }
+    m.release(policy)
+}
+
+export fn soup_hsts_policy_equal(a: usize, b: usize) -> i32 {
+    if !m.cEqual(m.getWord(a + P_DOMAIN), m.getWord(b + P_DOMAIN)) { return 0 }
+    if m.getI32(a + P_SUBDOMAINS) != m.getI32(b + P_SUBDOMAINS) { return 0 }
+    if m.getWord(a + P_MAX_AGE) != m.getWord(b + P_MAX_AGE) { return 0 }
+    const ea = m.getWord(a + P_EXPIRES)
+    const eb = m.getWord(b + P_EXPIRES)
+    if (ea != 0) != (eb != 0) { return 0 }
+    if ea != 0 && g.g_date_time_equal(ea, eb) == 0 { return 0 }
+    return 1
+}
+
+export fn soup_hsts_policy_new_full(domain: usize, max_age: u64, expires: usize, include_subdomains: i32) -> usize {
+    const policy = m.alloc(P_SIZE)
+    m.putWord(policy + P_DOMAIN, m.dup(domain))
+    m.putWord(policy + P_MAX_AGE, max_age)
+    if expires != 0 { m.putWord(policy + P_EXPIRES, g.g_date_time_ref(expires)) }
+    m.putI32(policy + P_SUBDOMAINS, if include_subdomains != 0 { 1 } else { 0 })
+    return policy
+}
+
+// SOUP_HSTS_POLICY_MAX_AGE_PAST (0) expires at 1970, else max-age from now.
+export fn soup_hsts_policy_new(domain: usize, max_age: u64, include_subdomains: i32) -> usize {
+    var expires: usize = 0
+    if max_age == 0 {
+        expires = g.g_date_time_new_from_unix_utc(0)
+    } else {
+        const now = g.g_date_time_new_now_utc()
+        expires = g.g_date_time_add_seconds(now, @floatFromInt(f64, max_age))
+        g.g_date_time_unref(now)
+    }
+    const policy = soup_hsts_policy_new_full(domain, max_age, expires, include_subdomains)
+    g.g_date_time_unref(expires)
+    return policy
+}
+
+export fn soup_hsts_policy_new_session_policy(domain: usize, include_subdomains: i32) -> usize { return soup_hsts_policy_new_full(domain, 0, 0, include_subdomains) }
+
+// The first Strict-Transport-Security header of the response, read
+// strictly: max-age in digits, includeSubDomains without a value.
+export fn soup_hsts_policy_new_from_response(msg: usize) -> usize {
+    const iter = m.alloc(24)
+    const cells = m.alloc(16)
+    headers.iterInit(iter, message.responseHeaders(msg))
+    var policy: usize = 0
+    while headers.iterNext(iter, cells, cells + 8) {
+        if !http.equalsIgnoringCase(m.cSlice(m.getWord(cells)), "Strict-Transport-Security") { continue }
+        const params = soup_header_parse_semi_param_list_strict(m.getWord(cells + 8))
+        if params == 0 { break }
+        const maxAgeText = g.g_hash_table_lookup(params, m.literal("max-age"))
+        if maxAgeText != 0 {
+            var maxAge: u64 = 0
+            var good = true
+            for ch in m.cSlice(maxAgeText) {
+                if ch < 48 || ch > 57 { good = false }
+                if good { maxAge = maxAge *% 10 +% @intCast(u64, ch - 48) }
+            }
+            const valueCell = m.alloc(8)
+            const present = g.g_hash_table_lookup_extended(params, m.literal("includeSubDomains"), 0, valueCell) != 0
+            if good && m.getWord(valueCell) == 0 { policy = soup_hsts_policy_new(g.g_uri_get_host(message.uri(msg)), maxAge, if present { 1 } else { 0 }) }
+            m.release(valueCell)
+        }
+        soup_header_free_param_list(params)
+        break
+    }
+    m.release(cells)
+    m.release(iter)
+    return policy
+}
+
+export fn soup_hsts_policy_get_domain(policy: usize) -> usize { return m.getWord(policy + P_DOMAIN) }
+export fn soup_hsts_policy_is_expired(policy: usize) -> i32 { return if isExpired(policy) { 1 } else { 0 } }
+export fn soup_hsts_policy_includes_subdomains(policy: usize) -> i32 { return m.getI32(policy + P_SUBDOMAINS) }
+export fn soup_hsts_policy_is_session_policy(policy: usize) -> i32 { return if m.getWord(policy + P_EXPIRES) == 0 { 1 } else { 0 } }
+export fn soup_hsts_policy_get_expires(policy: usize) -> usize { return m.getWord(policy + P_EXPIRES) }
+export fn soup_hsts_policy_get_max_age(policy: usize) -> u64 { return m.getWord(policy + P_MAX_AGE) }
+
+fn isExpired(policy: usize) -> bool { return m.getWord(policy + P_EXPIRES) != 0 && misc.isPast(m.getWord(policy + P_EXPIRES)) }
+fn isSession(policy: usize) -> bool { return m.getWord(policy + P_EXPIRES) == 0 }
+
+// ---------------------------------------------------------------------------
+// The enforcer
+
+pub fn enforcerTypeGet() -> usize {
+    if c.onceEnter(&enforcerType) {
+        const t = c.defineType(c.T_OBJECT, "SoupHSTSEnforcer", CLASS_SIZE, @intFromPtr(__mlx_soup_hsts_class_init), 24, @intFromPtr(__mlx_soup_hsts_init), 0)
+        privateOffset = c.addPrivate(t, 8)
+        feature.implementFeature(t, @intFromPtr(__mlx_soup_hsts_feature_init))
+        c.onceLeave(&enforcerType, t)
+    }
+    return enforcerType
+}
+
+export fn soup_hsts_enforcer_get_type() -> usize { return enforcerTypeGet() }
+
+fn priv(enforcer: usize) -> usize { return m.getWord(c.privateAt(enforcer, privateOffset)) }
+
+export fn __mlx_soup_hsts_init(enforcer: usize, class: usize) -> void {
+    const p = m.alloc(E_SIZE)
+    m.putWord(c.privateAt(enforcer, privateOffset), p)
+    m.putWord(p + E_HOST, g.g_hash_table_new_full(@intFromPtr(__mlx_soup_case_hash), @intFromPtr(__mlx_soup_case_equal), @intFromPtr(g_free), @intFromPtr(soup_hsts_policy_free)))
+    m.putWord(p + E_SESSIONS, g.g_hash_table_new_full(@intFromPtr(__mlx_soup_case_hash), @intFromPtr(__mlx_soup_case_equal), @intFromPtr(g_free), @intFromPtr(soup_hsts_policy_free)))
+}
+
+export fn __mlx_soup_hsts_finalize(enforcer: usize) -> void {
+    const p = priv(enforcer)
+    g.g_hash_table_destroy(m.getWord(p + E_HOST))
+    g.g_hash_table_destroy(m.getWord(p + E_SESSIONS))
+    m.release(p)
+    c.chainUp(g.g_type_class_ref(enforcerTypeGet()), 48, enforcer)
+}
+
+export fn __mlx_soup_hsts_real_is_persistent(enforcer: usize) -> i32 { return 0 }
+
+export fn __mlx_soup_hsts_real_has_valid_policy(enforcer: usize, domain: usize) -> i32 {
+    const p = priv(enforcer)
+    if g.g_hash_table_lookup(m.getWord(p + E_SESSIONS), domain) != 0 { return 1 }
+    const policy = g.g_hash_table_lookup(m.getWord(p + E_HOST), domain)
+    if policy != 0 { return if isExpired(policy) { 0 } else { 1 } }
+    return 0
+}
+
+export fn __mlx_soup_hsts_class_init(class: usize, data: usize) -> void {
+    c.adjustPrivate(class, &privateOffset)
+    m.putWord(class + 48, @intFromPtr(__mlx_soup_hsts_finalize))
+    m.putWord(class + C_IS_PERSISTENT, @intFromPtr(__mlx_soup_hsts_real_is_persistent))
+    m.putWord(class + C_HAS_VALID_POLICY, @intFromPtr(__mlx_soup_hsts_real_has_valid_policy))
+    sigChanged = c.signal(class, "changed", c.RUN_FIRST, @intCast(u32, C_CHANGED), 0, c.T_NONE, 2, soup_hsts_policy_get_type(), soup_hsts_policy_get_type(), 0, 0)
+}
+
+export fn soup_hsts_enforcer_new() -> usize { return g.g_object_new(enforcerTypeGet(), 0) }
+
+fn changed(enforcer: usize, old: usize, new: usize) -> void { c.emitTwo(enforcer, sigChanged, soup_hsts_policy_get_type(), old, soup_hsts_policy_get_type(), new) }
+
+fn removeExpired(enforcer: usize) -> void {
+    const table = m.getWord(priv(enforcer) + E_HOST)
+    var again = true
+    while again {
+        again = false
+        const iter = m.alloc(48)
+        const cells = m.alloc(16)
+        g.g_hash_table_iter_init(iter, table)
+        while g.g_hash_table_iter_next(iter, cells, cells + 8) != 0 {
+            const policy = m.getWord(cells + 8)
+            if isExpired(policy) {
+                const copy = soup_hsts_policy_copy(policy)
+                changed(enforcer, copy, 0)
+                _ = g.g_hash_table_remove(table, m.getWord(copy + P_DOMAIN))
+                soup_hsts_policy_free(copy)
+                again = true
+                break
+            }
+        }
+        m.release(cells)
+        m.release(iter)
+    }
+}
+
+fn removeHostPolicy(enforcer: usize, domain: usize) -> void {
+    const table = m.getWord(priv(enforcer) + E_HOST)
+    const policy = g.g_hash_table_lookup(table, domain)
+    if policy == 0 { return }
+    const copy = soup_hsts_policy_copy(policy)
+    _ = g.g_hash_table_remove(table, domain)
+    changed(enforcer, copy, 0)
+    soup_hsts_policy_free(copy)
+    removeExpired(enforcer)
+}
+
+pub fn setPolicy(enforcer: usize, policy: usize) -> void {
+    const p = priv(enforcer)
+    const domain = m.getWord(policy + P_DOMAIN)
+    c.lock(m.word64(p + E_MUTEX))
+    const session = isSession(policy)
+    if !session && isExpired(policy) {
+        removeHostPolicy(enforcer, domain)
+        c.unlock(m.word64(p + E_MUTEX))
+        return
+    }
+    const table = if session { m.getWord(p + E_SESSIONS) } else { m.getWord(p + E_HOST) }
+    const current = g.g_hash_table_lookup(table, domain)
+    if current != 0 {
+        const old = soup_hsts_policy_copy(current)
+        _ = g.g_hash_table_replace(table, m.dup(domain), soup_hsts_policy_copy(policy))
+        if soup_hsts_policy_equal(old, policy) == 0 { changed(enforcer, old, policy) }
+        soup_hsts_policy_free(old)
+        removeExpired(enforcer)
+    } else {
+        _ = g.g_hash_table_insert(table, m.dup(domain), soup_hsts_policy_copy(policy))
+        changed(enforcer, 0, policy)
+    }
+    c.unlock(m.word64(p + E_MUTEX))
+}
+
+export fn soup_hsts_enforcer_set_policy(enforcer: usize, policy: usize) -> void { setPolicy(enforcer, policy) }
+
+export fn soup_hsts_enforcer_set_session_policy(enforcer: usize, domain: usize, include_subdomains: i32) -> void {
+    const policy = soup_hsts_policy_new_session_policy(domain, include_subdomains)
+    setPolicy(enforcer, policy)
+    soup_hsts_policy_free(policy)
+}
+
+fn hasValidPolicy(enforcer: usize, domain: usize) -> bool {
+    const f = m.getWord(m.getWord(enforcer) + C_HAS_VALID_POLICY)
+    if f == 0 { return false }
+    const call: ValidFn = unsafe { @ptrFromInt(ValidFn, f) }
+    return call(enforcer, domain) != 0
+}
+
+export fn soup_hsts_enforcer_has_valid_policy(enforcer: usize, domain: usize) -> i32 { return if hasValidPolicy(enforcer, domain) { 1 } else { 0 } }
+
+export fn soup_hsts_enforcer_is_persistent(enforcer: usize) -> i32 {
+    const f = m.getWord(m.getWord(enforcer) + C_IS_PERSISTENT)
+    if f == 0 { return 0 }
+    const call: BoolFn = unsafe { @ptrFromInt(BoolFn, f) }
+    return call(enforcer)
+}
+
+fn includesSubdomains(enforcer: usize, domain: usize) -> bool {
+    const p = priv(enforcer)
+    var result = false
+    const s = g.g_hash_table_lookup(m.getWord(p + E_SESSIONS), domain)
+    if s != 0 && m.getI32(s + P_SUBDOMAINS) != 0 { result = true }
+    const h = g.g_hash_table_lookup(m.getWord(p + E_HOST), domain)
+    if h != 0 && m.getI32(h + P_SUBDOMAINS) != 0 { result = true }
+    return result
+}
+
+// The domain after the first label (and its dots), or 0.
+fn superDomain(domain: usize) -> usize {
+    var at = domain
+    while m.get8(at) != 0 && m.get8(at) != 46 { at += 1 }
+    while m.get8(at) == 46 { at += 1 }
+    if m.get8(at) == 0 { return 0 }
+    return at
+}
+
+fn mustEnforce(enforcer: usize, domain: usize) -> bool {
+    const p = priv(enforcer)
+    c.lock(m.word64(p + E_MUTEX))
+    var result = hasValidPolicy(enforcer, domain)
+    var parent = superDomain(domain)
+    while !result && parent != 0 {
+        if includesSubdomains(enforcer, parent) && hasValidPolicy(enforcer, parent) { result = true }
+        parent = superDomain(parent)
+    }
+    c.unlock(m.word64(p + E_MUTEX))
+    return result
+}
+
+export fn __mlx_soup_hsts_got_sts_header(msg: usize, enforcer: usize) -> void {
+    const policy = soup_hsts_policy_new_from_response(msg)
+    if policy != 0 {
+        setPolicy(enforcer, policy)
+        soup_hsts_policy_free(policy)
+    }
+}
+
+// A known host's message whose TLS certificate has errors is cancelled.
+export fn __mlx_soup_hsts_known_host_starting(msg: usize, enforcer: usize) -> void {
+    if message.tlsErrors(msg) != 0 { __mlx_soup_session_cancel_message(m.getWord(priv(enforcer) + E_SESSION), msg) }
+}
+
+fn preprocess(enforcer: usize, msg: usize) -> void {
+    const uri = message.uri(msg)
+    const host = g.g_uri_get_host(uri)
+    if host == 0 || g.g_hostname_is_ip_address(host) != 0 { return }
+    if misc.isHttp(uri) {
+        if mustEnforce(enforcer, host) {
+            var port = g.g_uri_get_port(uri)
+            if port == 80 { port = 443 }
+            // SOUP_URI_SCHEME 1, SOUP_URI_PORT 6, SOUP_URI_NONE 0.
+            const secure = soup_uri_copy(uri, 1, m.literal("https"), 6, @intCast(usize, @bitCast(u32, port)), 0)
+            message.setUri(msg, secure)
+            g.g_uri_unref(secure)
+            _ = g.g_signal_connect_data(msg, m.literal("starting"), @intFromPtr(__mlx_soup_hsts_known_host_starting), enforcer, 0, 0)
+            message.hstsEnforced(msg)
+        }
+    } else if misc.isHttps(uri) {
+        _ = soup_message_add_header_handler(msg, m.literal("got-headers"), m.literal("Strict-Transport-Security"), @intFromPtr(__mlx_soup_hsts_got_sts_header), enforcer)
+    }
+}
+
+export fn __mlx_soup_hsts_restarted(msg: usize, enforcer: usize) -> void { preprocess(enforcer, msg) }
+
+export fn __mlx_soup_hsts_attach(enforcer: usize, session: usize) -> void { m.putWord(priv(enforcer) + E_SESSION, session) }
+
+export fn __mlx_soup_hsts_request_queued(enforcer: usize, msg: usize) -> void {
+    _ = g.g_signal_connect_data(msg, m.literal("restarted"), @intFromPtr(__mlx_soup_hsts_restarted), enforcer, 0, 0)
+    preprocess(enforcer, msg)
+}
+
+export fn __mlx_soup_hsts_request_unqueued(enforcer: usize, msg: usize) -> void { _ = g_signal_handlers_disconnect_matched(msg, 16, 0, 0, 0, 0, enforcer) }
+
+export fn __mlx_soup_hsts_feature_init(iface: usize, data: usize) -> void {
+    m.putWord(iface + feature.ATTACH, @intFromPtr(__mlx_soup_hsts_attach))
+    m.putWord(iface + feature.REQUEST_QUEUED, @intFromPtr(__mlx_soup_hsts_request_queued))
+    m.putWord(iface + feature.REQUEST_UNQUEUED, @intFromPtr(__mlx_soup_hsts_request_unqueued))
+}
+
+fn listOf(table: usize, domains: bool, list: usize) -> usize {
+    var result = list
+    const iter = m.alloc(48)
+    const cells = m.alloc(16)
+    g.g_hash_table_iter_init(iter, table)
+    while g.g_hash_table_iter_next(iter, cells, cells + 8) != 0 {
+        result = g_list_prepend(result, if domains { m.dup(m.getWord(cells)) } else { soup_hsts_policy_copy(m.getWord(cells + 8)) })
+    }
+    m.release(cells)
+    m.release(iter)
+    return result
+}
+
+export fn soup_hsts_enforcer_get_domains(enforcer: usize, session_policies: i32) -> usize {
+    const p = priv(enforcer)
+    var list = listOf(m.getWord(p + E_HOST), true, 0)
+    if session_policies != 0 { list = listOf(m.getWord(p + E_SESSIONS), true, list) }
+    return list
+}
+
+export fn soup_hsts_enforcer_get_policies(enforcer: usize, session_policies: i32) -> usize {
+    const p = priv(enforcer)
+    var list = listOf(m.getWord(p + E_HOST), false, 0)
+    if session_policies != 0 { list = listOf(m.getWord(p + E_SESSIONS), false, list) }
+    return list
+}
+
+// ---------------------------------------------------------------------------
+// The DB enforcer: its policies in a file
+
+fn dbFile(enforcer: usize) -> usize { return m.getWord(m.getWord(enforcer + 24)) }
+
+fn save(enforcer: usize) -> void {
+    var t = m.text()
+    const iter = m.alloc(48)
+    const cells = m.alloc(16)
+    g.g_hash_table_iter_init(iter, m.getWord(priv(enforcer) + E_HOST))
+    while g.g_hash_table_iter_next(iter, cells, cells + 8) != 0 {
+        const policy = m.getWord(cells + 8)
+        m.pushC(&t, m.getWord(policy + P_DOMAIN))
+        m.pushByte(&t, 9)
+        m.pushDecimal(&t, m.getWord(policy + P_MAX_AGE))
+        m.pushByte(&t, 9)
+        m.pushSigned(&t, g.g_date_time_to_unix(m.getWord(policy + P_EXPIRES)))
+        m.pushByte(&t, 9)
+        m.pushByte(&t, if m.getI32(policy + P_SUBDOMAINS) != 0 { 49 } else { 48 })
+        m.pushByte(&t, 10)
+    }
+    m.release(cells)
+    m.release(iter)
+    _ = g.g_file_set_contents(dbFile(enforcer), t.address, @intCast(i64, t.length), 0)
+    m.dispose(&t)
+}
+
+fn number(text: []const u8) -> i64 {
+    var value: i64 = 0
+    var negative = false
+    for ch in text {
+        if ch == 45 { negative = true }
+        if ch >= 48 && ch <= 57 { value = value * 10 + @intCast(i64, ch - 48) }
+    }
+    return if negative { 0 - value } else { value }
+}
+
+fn load(enforcer: usize) -> void {
+    const cells = m.alloc(16)
+    if g.g_file_get_contents(dbFile(enforcer), cells, cells + 8, 0) == 0 {
+        m.release(cells)
+        return
+    }
+    const contents = m.bytes(m.getWord(cells), m.getWord(cells + 8))
+    const table = m.getWord(priv(enforcer) + E_HOST)
+    var at: usize = 0
+    while at < contents.length {
+        var end = at
+        while end < contents.length && contents[end] != 10 { end += 1 }
+        const line = contents[at..end]
+        var fields: [4]usize = [4]usize{ 0, 0, 0, 0 }
+        var count: usize = 1
+        var i: usize = 0
+        while i < line.length {
+            if line[i] == 9 && count < 4 {
+                fields[count] = i + 1
+                count += 1
+            }
+            i += 1
+        }
+        if count == 4 {
+            const domain = m.dupSlice(line[0..fields[1] - 1])
+            const expires = g.g_date_time_new_from_unix_utc(number(line[fields[2]..fields[3] - 1]))
+            const policy = soup_hsts_policy_new_full(domain, @bitCast(u64, number(line[fields[1]..fields[2] - 1])), expires, if line[fields[3]] == 49 { 1 } else { 0 })
+            g.g_date_time_unref(expires)
+            if !isExpired(policy) {
+                _ = g.g_hash_table_replace(table, domain, policy)
+            } else {
+                soup_hsts_policy_free(policy)
+                m.release(domain)
+            }
+        }
+        at = end + 1
+    }
+    g.g_free(m.getWord(cells))
+    m.release(cells)
+}
+
+export fn __mlx_soup_hsts_db_changed(enforcer: usize, old: usize, new: usize) -> void {
+    if new != 0 && isSession(new) { return }
+    if old != 0 && isSession(old) && new == 0 { return }
+    save(enforcer)
+}
+
+export fn __mlx_soup_hsts_db_is_persistent(enforcer: usize) -> i32 { return 1 }
+
+export fn __mlx_soup_hsts_db_init(enforcer: usize, class: usize) -> void { m.putWord(enforcer + 24, m.alloc(8)) }
+
+export fn __mlx_soup_hsts_db_finalize(enforcer: usize) -> void {
+    m.release(dbFile(enforcer))
+    m.release(m.getWord(enforcer + 24))
+    c.chainUp(g.g_type_class_ref(dbType), 48, enforcer)
+}
+
+export fn __mlx_soup_hsts_db_set_property(enforcer: usize, id: u32, value: usize, pspec: usize) -> void {
+    if id == 1 {
+        c.replaceString(m.getWord(enforcer + 24), g.g_value_get_string(value))
+        load(enforcer)
+    }
+}
+
+export fn __mlx_soup_hsts_db_get_property(enforcer: usize, id: u32, value: usize, pspec: usize) -> void {
+    if id == 1 { g.g_value_set_string(value, dbFile(enforcer)) }
+}
+
+export fn __mlx_soup_hsts_db_class_init(class: usize, data: usize) -> void {
+    m.putWord(class + 24, @intFromPtr(__mlx_soup_hsts_db_set_property))
+    m.putWord(class + 32, @intFromPtr(__mlx_soup_hsts_db_get_property))
+    m.putWord(class + 48, @intFromPtr(__mlx_soup_hsts_db_finalize))
+    m.putWord(class + C_IS_PERSISTENT, @intFromPtr(__mlx_soup_hsts_db_is_persistent))
+    m.putWord(class + C_CHANGED, @intFromPtr(__mlx_soup_hsts_db_changed))
+    _ = c.stringProperty(class, 1, "filename", c.READWRITE | c.CONSTRUCT_ONLY)
+}
+
+export fn soup_hsts_enforcer_db_get_type() -> usize {
+    if c.onceEnter(&dbType) {
+        c.onceLeave(&dbType, c.defineType(enforcerTypeGet(), "SoupHSTSEnforcerDB", CLASS_SIZE, @intFromPtr(__mlx_soup_hsts_db_class_init), 32, @intFromPtr(__mlx_soup_hsts_db_init), c.FINAL))
+    }
+    return dbType
+}
+
+export fn soup_hsts_enforcer_db_new(filename: usize) -> usize {
+    const enforcer = g.g_object_new(soup_hsts_enforcer_db_get_type(), 0)
+    c.replaceString(m.getWord(enforcer + 24), filename)
+    load(enforcer)
+    return enforcer
+}

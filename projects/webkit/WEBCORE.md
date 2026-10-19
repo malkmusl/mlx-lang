@@ -53,8 +53,8 @@ headers (`g++ -M` with the reference build's flags, 644 units).
 
 | Library | Needed for | Functions: WebCore / WebKit (/ Skia) | Units including it | Existing Mlx code | Plan, priority |
 |---|---|---|---|---|---|
-| GLib, GObject, GIO | WTF's run loop and threads (done); GIO streams, files, D-Bus, network monitor, proxies, resolver, TLS types (libsoup's headers name GTlsCertificate) in WebCore's soup and GLib platform code; WebKit's whole GObject API, IPC, WPEPlatform | 173 / 502 (571 together) | 644 (all: WTF's headers) | mlx-glib (compiler/capi/glib): 397 of the 571, and GIO's TLS types (GTlsCertificate from PEM and DER, chains, keys; GTlsPassword; a backend without TLS whose database fails cleanly), GInitable, the stream classes and `G_DECLARE_INTERFACE` that libsoup's headers declare with; missing the rest of WebCore's 50 (GDBus, GResolver, GProxyResolver, GNetworkMonitor, the streams' functions, TLS connections) and 124 more of WebKit's | 1: extend mlx-glib, WebCore's first; the headers every unit needs are there |
-| libsoup 3 | HTTP: every network load (NetworkProcess), cookies, HSTS, authentication, proxies, the public suffix list (WebCore's soup platform code, WebKit's NetworkProcess/soup) | 82 / 75 (143) | 643 (ResourceRequest/Response headers, in the prefix) | none (no HTTP in std) | 1: mlx-soup, a C API layer over a new std HTTP client: HTTP/1.1 first, cookies, HSTS; TLS through GIO's TLS (a TLS implementation is the largest part) |
+| GLib, GObject, GIO | WTF's run loop and threads (done); GIO streams, files, D-Bus, network monitor, proxies, resolver, TLS types (libsoup's headers name GTlsCertificate) in WebCore's soup and GLib platform code; WebKit's whole GObject API, IPC, WPEPlatform | 173 / 502 (571 together) | 644 (all: WTF's headers) | mlx-glib (compiler/capi/glib): 397 of the 571, and GIO's TLS types (GTlsCertificate from PEM and DER, chains, keys; GTlsPassword; a backend without TLS whose database fails cleanly), GInitable, the stream classes and `G_DECLARE_INTERFACE` that libsoup's headers declare with; since then GIO's TLS connections (std.tls), GResolver, GProxyResolver, the streams' functions, GSeekable and `g_file_read`, the network and power monitors and content types: WebCore's unified sources lack 16 functions, all GDBus (ATSPI accessibility, MediaSessionGLib); WebKit's 124 not counted again | 1: GDBus for WebCore, then WebKit's |
+| libsoup 3 | HTTP: every network load (NetworkProcess), cookies, HSTS, authentication, proxies, the public suffix list (WebCore's soup platform code, WebKit's NetworkProcess/soup) | 82 / 75 (143) | 643 (ResourceRequest/Response headers, in the prefix) | mlx-soup (compiler/capi/soup) on std.http: all 143, of libsoup 3's 454 functions it declares (all made): HTTP/1.1 sessions on the GLib main loop, cookies and the public suffix list, HSTS, Basic and Digest authentication, multipart, WebSockets, SoupServer, HTTPS through mlx-glib's TLS; tools/check_soup.sh compares its tests with libsoup 3.4.4. No HTTP/2, brotli or proxies | done |
 | ICU | text: breaking, collation, normalization, bidi, encodings, search, IDNA | 65 / 6 (66) | 643 | mlx-unicode (compiler/capi/icu): all but `u_strToTitle` and the 6 `uset_*` of SmartReplace and ResourceResponseSoup (declared, not yet made); `ubidi.h` (std.unicode.bidi: UAX #9, BidiTest and BidiCharacterTest all passed), `usearch.h` (std.unicode.search) and `ucnv.h`, `ucnv_err.h`, `ucnv_cb.h` (std.unicode.converters: what TextCodecICU asks for, as ICU 74 does) are there | 2: `u_strToTitle` and sets |
 | HarfBuzz (+hb-icu) | text shaping (FontCascade, Skia's) | 46 / 0 (/ 57) | 643 | mlx-harfbuzz (compiler/capi/harfbuzz, std.shaping): all 46 and Skia's 57 declared | done (to be checked at run time) |
 | FreeType | font files, glyphs (Skia's font host) | 0 / 0 (/ 52) | 0 | mlx-freetype (compiler/capi/freetype, std.truetype): Skia's 52 declared | done for compiling |
@@ -170,7 +170,8 @@ now (above). `./mlx build -j 1 --keep-going webkit-wpe-webcore` then
 stops at one header only: all 653 C++ units (518 unified sources and 135
 compiled apart) fail at `libsoup/soup.h` (CertificateInfo.h:31, from
 the prefix's ResourceRequest), and the one C source
-(AccessibilityAtspiInterfaces.c) compiles.
+(AccessibilityAtspiInterfaces.c) compiles. mlx-soup makes that header
+now: what the soup units do with it is under "What is next".
 
 A scratch run with the system's libsoup 3 headers added after mlx-glib's
 (nothing of it kept: the build was patched for the run alone) took
@@ -288,8 +289,15 @@ source, each alone, with the same stand-in headers):
 
 ## What is next
 
-- libsoup: every unit includes its headers (mlx-soup, its C API over an
-  HTTP client in std, is the first library to write).
+- libsoup: done (mlx-soup). Every unit includes its headers; the units
+  of WebCore's soup and GLib network code compile (platform-77 and -78:
+  all of `platform/network/soup` and `platform/network/glib`;
+  WebKitAutoconfigProxyResolver.cpp and WebKitFormDataInputStream.cpp,
+  compiled apart). Of the other units with soup code, loader-13
+  (ResourceLoaderSoup) and platform-25 (LowPowerModeNotifierGLib) stop
+  at mlx-cc errors (`ComparableASCIISubsetLiteral`'s constructor in
+  `<utility>`, OptionSet's deduction guide in RunLoopObserver.h) and
+  platform-79 (PublicSuffixStoreSoup) at `sqlite3.h`.
 - mlx-cc's memory: the single files fit now (above); whole unified
   sources are about ten such files, and still heavier ones may need the
   instances' tokens and mangled names shared (the way an alias's

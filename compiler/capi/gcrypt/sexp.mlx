@@ -1,0 +1,1374 @@
+// S-expressions (gcry_sexp_*), as libgcrypt keeps, reads, builds, walks
+// and prints them: what WebCore's WebCrypto hands keys, data and
+// signatures to gcry_pk_* in, and reads results back from.
+//
+// An S-expression is one allocation of tags, libgcrypt's own layout: 3
+// opens a list, 4 closes it, 1 is data (a 4-byte little-endian length,
+// then the bytes) and 0 ends the whole. gcry_sexp_t is its address; the
+// walks (find_token, nth, car, cdr) copy what they return into new ones.
+//
+// The reader takes the advanced form and the canonical one alike: tokens,
+// "quoted strings" with C's escapes, #hex#, |base64|, length-prefixed
+// verbatim data (3:abc) and [display hints] (read as plain data, as
+// libgcrypt does); gcry_sexp_build adds %s, %b, %d, %u, %m, %M and %S.
+const c = @import("./common.mlx")
+const mpi = @import("./mpi.mlx")
+const base64 = @import("std.base64")
+
+pub const ST_STOP: u8 = 0
+pub const ST_DATA: u8 = 1
+pub const ST_OPEN: u8 = 3
+pub const ST_CLOSE: u8 = 4
+
+const NONE: usize = 18446744073709551615
+
+// ---------------------------------------------------------------------------
+// A buffer that grows as it is written.
+
+pub const Growing = struct {
+    address: usize
+    length: usize
+    capacity: usize
+    failed: bool
+}
+
+pub fn growingInit(g: *Growing, capacity: usize) -> void {
+    g.*.capacity = if capacity < 16 { 16 } else { capacity }
+    g.*.address = c.alloc(g.*.capacity)
+    g.*.length = 0
+    g.*.failed = g.*.address == 0
+}
+
+fn room(g: *Growing, more: usize) -> bool {
+    if g.*.failed { return false }
+    if g.*.length + more <= g.*.capacity { return true }
+    var capacity = g.*.capacity * 2
+    while capacity < g.*.length + more { capacity *= 2 }
+    const grown = c.grow(g.*.address, capacity)
+    if grown == 0 {
+        g.*.failed = true
+        return false
+    }
+    g.*.address = grown
+    g.*.capacity = capacity
+    return true
+}
+
+pub fn pushByte(g: *Growing, byte: u8) -> void {
+    if !room(g, 1) { return }
+    c.put8(g.*.address + g.*.length, byte)
+    g.*.length += 1
+}
+
+pub fn pushBytes(g: *Growing, source: usize, length: usize) -> void {
+    if !room(g, length) { return }
+    c.copy(g.*.address + g.*.length, source, length)
+    g.*.length += length
+}
+
+// A data element of `length` bytes at `source`.
+pub fn pushData(g: *Growing, source: usize, length: usize) -> void {
+    if !room(g, 5 + length) { return }
+    pushByte(g, ST_DATA)
+    c.put32(g.*.address + g.*.length, @intCast(u32, length & 4294967295))
+    g.*.length += 4
+    pushBytes(g, source, length)
+}
+
+// A data element whose bytes the caller writes next: where they go.
+fn reserveData(g: *Growing, length: usize) -> usize {
+    if !room(g, 5 + length) { return 0 }
+    pushByte(g, ST_DATA)
+    c.put32(g.*.address + g.*.length, @intCast(u32, length & 4294967295))
+    g.*.length += 4
+    const at = g.*.address + g.*.length
+    g.*.length += length
+    return at
+}
+
+pub fn dataLength(at: usize) -> usize { return @intCast(usize, c.get32(at + 1)) }
+
+// The tag after the one at `at` (a data element is 5 bytes and its data).
+fn next(at: usize) -> usize {
+    if c.get8(at) == ST_DATA { return at + 5 + dataLength(at) }
+    return at + 1
+}
+
+// The end of the element at `at` (past its close for a list).
+fn skipElement(at: usize) -> usize {
+    if c.get8(at) != ST_OPEN { return next(at) }
+    var level: usize = 0
+    var p = at
+    while true {
+        const tag = c.get8(p)
+        if tag == ST_OPEN {
+            level += 1
+        } else if tag == ST_CLOSE {
+            level -= 1
+            if level == 0 { return p + 1 }
+        } else if tag == ST_STOP {
+            return p
+        }
+        p = next(p)
+    }
+    return p
+}
+
+// "" and "()" are no S-expression: NULL.
+fn normalize(address: usize) -> usize {
+    if address == 0 { return 0 }
+    const first = c.get8(address)
+    if first == ST_STOP || (first == ST_OPEN && c.get8(address + 1) == ST_CLOSE) {
+        release(address)
+        return 0
+    }
+    return address
+}
+
+// A new S-expression of `length` tag bytes at `source` and a stop.
+fn copyOut(source: usize, length: usize) -> usize {
+    const address = c.alloc(length + 1)
+    if address == 0 { return 0 }
+    c.copy(address, source, length)
+    c.put8(address + length, ST_STOP)
+    return normalize(address)
+}
+
+// The size of the whole buffer (to the stop, inclusive).
+fn totalLength(address: usize) -> usize {
+    var p = address
+    while c.get8(p) != ST_STOP { p = next(p) }
+    return p - address + 1
+}
+
+pub fn release(address: usize) -> void {
+    if address == 0 { return }
+    c.wipeRelease(address, totalLength(address))
+}
+
+// ---------------------------------------------------------------------------
+// Reading.
+
+fn isWhite(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 11 || byte == 12 || byte == 13 || byte == 10 }
+
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+
+fn isAlpha(byte: u8) -> bool { return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) }
+
+fn isHex(byte: u8) -> bool { return isDigit(byte) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102) }
+
+fn isOctal(byte: u8) -> bool { return byte >= 48 && byte <= 55 }
+
+// The characters of a token (libgcrypt also takes a NUL byte as one).
+fn isTokenChar(byte: u8) -> bool {
+    return isAlpha(byte) || isDigit(byte) || byte == 45 || byte == 46 || byte == 47 || byte == 95 || byte == 58 || byte == 42 || byte == 43 || byte == 61 || byte == 0
+}
+
+fn hexNibble(byte: u8) -> u8 {
+    if isDigit(byte) { return byte - 48 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    return 0
+}
+
+// A quoted string's bytes (between the quotes, `length` of them at
+// `source`) with its escapes undone into `out`: how many.
+fn unquote(source: usize, length: usize, out: usize) -> usize {
+    var escaped = false
+    var written: usize = 0
+    var p = source
+    var n = length
+    while n > 0 {
+        const byte = c.get8(p)
+        if escaped {
+            if byte == 98 {
+                c.put8(out + written, 8)
+                written += 1
+            } else if byte == 116 {
+                c.put8(out + written, 9)
+                written += 1
+            } else if byte == 118 {
+                c.put8(out + written, 11)
+                written += 1
+            } else if byte == 110 {
+                c.put8(out + written, 10)
+                written += 1
+            } else if byte == 102 {
+                c.put8(out + written, 12)
+                written += 1
+            } else if byte == 114 {
+                c.put8(out + written, 13)
+                written += 1
+            } else if byte == 34 || byte == 39 || byte == 92 {
+                c.put8(out + written, byte)
+                written += 1
+            } else if byte == 13 {
+                // A line continuation: CR, or CR LF.
+                if n > 1 && c.get8(p + 1) == 10 {
+                    p += 1
+                    n -= 1
+                }
+            } else if byte == 10 {
+                if n > 1 && c.get8(p + 1) == 13 {
+                    p += 1
+                    n -= 1
+                }
+            } else if byte == 120 {
+                if n > 2 && isHex(c.get8(p + 1)) && isHex(c.get8(p + 2)) {
+                    c.put8(out + written, hexNibble(c.get8(p + 1)) * 16 + hexNibble(c.get8(p + 2)))
+                    written += 1
+                    p += 2
+                    n -= 2
+                }
+            } else if n > 2 && isOctal(byte) && isOctal(c.get8(p + 1)) && isOctal(c.get8(p + 2)) {
+                const value = @intCast(u32, byte - 48) * 64 + @intCast(u32, c.get8(p + 1) - 48) * 8 + @intCast(u32, c.get8(p + 2) - 48)
+                c.put8(out + written, @intCast(u8, value & 255))
+                written += 1
+                p += 2
+                n -= 2
+            }
+            escaped = false
+        } else if byte == 92 {
+            escaped = true
+        } else {
+            c.put8(out + written, byte)
+            written += 1
+        }
+        p += 1
+        n -= 1
+    }
+    return written
+}
+
+// The decimal text of `value` into `out` (room for 21 bytes): its length.
+fn decimal(value: u64, negative: bool, out: [*]u8) -> usize {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + (rest % 10))
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var written: usize = 0
+    if negative {
+        out[0] = 45
+        written = 1
+    }
+    while count > 0 {
+        count -= 1
+        out[written] = digits[count]
+        written += 1
+    }
+    return written
+}
+
+// The S-expression `length` bytes at `text` say into *out (0 for an empty
+// one): a gpg error code, *erroff set to where reading stopped for most
+// errors. `list` is gcry_sexp_build's va_list (0: no % formats).
+pub fn parse(text: usize, length: usize, erroff: usize, list: usize, out: *usize) -> u32 {
+    out.* = 0
+    var g: Growing = undefined
+    growingInit(&g, length + 8)
+    if g.failed { return c.ENOMEM }
+    var tokenStart = NONE
+    var quoted = NONE
+    var quotedEscape = false
+    var hexStart = NONE
+    var hexCount: usize = 0
+    var base64Start = NONE
+    var base64Count: usize = 0
+    var digitStart = NONE
+    var percent = false
+    var hint = false
+    var level: usize = 0
+    var code: u32 = 0
+    var p = text
+    var n = length
+    while n > 0 {
+        const byte = c.get8(p)
+        var handled = false
+        if tokenStart != NONE && hexStart == NONE {
+            if isTokenChar(byte) {
+                handled = true
+            } else {
+                pushData(&g, tokenStart, p - tokenStart)
+                tokenStart = NONE
+            }
+        }
+        if handled {
+            // Inside a token.
+        } else if quoted != NONE {
+            if quotedEscape {
+                if byte == 98 || byte == 116 || byte == 118 || byte == 110 || byte == 102 || byte == 114 || byte == 34 || byte == 39 || byte == 92 {
+                    quotedEscape = false
+                } else if isOctal(byte) {
+                    if !(n > 2 && isOctal(c.get8(p + 1)) && isOctal(c.get8(p + 2))) {
+                        code = c.SEXP_BAD_QUOTATION
+                        break
+                    }
+                    p += 2
+                    n -= 2
+                    quotedEscape = false
+                } else if byte == 120 {
+                    if !(n > 2 && isHex(c.get8(p + 1)) && isHex(c.get8(p + 2))) {
+                        code = c.SEXP_BAD_QUOTATION
+                        break
+                    }
+                    p += 2
+                    n -= 2
+                    quotedEscape = false
+                } else if byte == 13 {
+                    if c.get8(p + 1) == 10 {
+                        p += 1
+                        n -= 1
+                    }
+                    quotedEscape = false
+                } else if byte == 10 {
+                    if c.get8(p + 1) == 13 {
+                        p += 1
+                        n -= 1
+                    }
+                    quotedEscape = false
+                } else {
+                    code = c.SEXP_BAD_QUOTATION
+                    break
+                }
+            } else if byte == 92 {
+                quotedEscape = true
+            } else if byte == 34 {
+                const start = quoted + 1
+                const at = reserveData(&g, p - start)
+                if at != 0 {
+                    const written = unquote(start, p - start, at)
+                    // The element is as long as what unquoting left.
+                    c.put32(at - 4, @intCast(u32, written & 4294967295))
+                    g.length = g.length - (p - start) + written
+                }
+                quoted = NONE
+            }
+        } else if hexStart != NONE {
+            if isHex(byte) {
+                hexCount += 1
+            } else if byte == 35 {
+                if hexCount % 2 == 1 {
+                    code = c.SEXP_ODD_HEX_NUMBERS
+                    break
+                }
+                const at = reserveData(&g, hexCount / 2)
+                if at != 0 {
+                    var q = hexStart + 1
+                    var written: usize = 0
+                    while q < p {
+                        if isWhite(c.get8(q)) {
+                            q += 1
+                            continue
+                        }
+                        var value = hexNibble(c.get8(q))
+                        q += 1
+                        while q < p && isWhite(c.get8(q)) { q += 1 }
+                        if q < p {
+                            value = value * 16 + hexNibble(c.get8(q))
+                            q += 1
+                        }
+                        c.put8(at + written, value)
+                        written += 1
+                    }
+                }
+                hexStart = NONE
+            } else if !isWhite(byte) {
+                code = c.SEXP_BAD_HEX_CHAR
+                break
+            }
+        } else if base64Start != NONE {
+            if isDigit(byte) || isAlpha(byte) || byte == 43 || byte == 47 || byte == 61 {
+                base64Count += 1
+            } else if byte == 124 {
+                const decodedRoom = base64Count * 3 / 4 + 3
+                const scratch = c.alloc(decodedRoom)
+                const decoded = base64.decode(base64.Encoding.base64, c.slice(base64Start + 1, base64Count), c.bytes(scratch), false)
+                pushData(&g, scratch, decoded.length)
+                c.release(scratch)
+                base64Start = NONE
+            } else {
+                code = c.SEXP_BAD_CHARACTER
+                break
+            }
+        } else if digitStart != NONE {
+            if isDigit(byte) {
+                // More of the length.
+            } else if byte == 58 {
+                var value: usize = 0
+                var q = digitStart
+                while q < p {
+                    value = value *% 10 +% @intCast(usize, c.get8(q) - 48)
+                    q += 1
+                }
+                digitStart = NONE
+                if value > n - 1 {
+                    code = c.SEXP_STRING_TOO_LONG
+                    break
+                }
+                pushData(&g, p + 1, value)
+                n -= value
+                p += value
+            } else if byte == 34 {
+                digitStart = NONE
+                quoted = p
+                quotedEscape = false
+            } else if byte == 35 {
+                digitStart = NONE
+                hexStart = p
+                hexCount = 0
+            } else if byte == 124 {
+                digitStart = NONE
+                base64Start = p
+                base64Count = 0
+            } else {
+                code = c.SEXP_INV_LEN_SPEC
+                break
+            }
+        } else if percent {
+            if byte == 109 || byte == 77 {
+                const value = mpi.at(c.nextPointer(list))
+                if value.*.flags & mpi.FLAG_OPAQUE != 0 {
+                    const bytes = (value.*.opaqueBits + 7) / 8
+                    if value.*.limbs != 0 && bytes > 0 { pushData(&g, value.*.limbs, bytes) }
+                } else {
+                    const format: i32 = if byte == 109 { 1 } else { 5 }
+                    if format == 5 && mpi.compareSmall(value, 0) < 0 {
+                        // (libgcrypt leaves the offset alone here.)
+                        c.release(g.address)
+                        return c.INV_ARG
+                    }
+                    var size: usize = 0
+                    const sized = mpi.print(format, 0, 0, @intFromPtr(&size), value)
+                    const at = reserveData(&g, size)
+                    if at != 0 && size > 0 { const printed = mpi.print(format, at, size, @intFromPtr(&size), value) }
+                }
+            } else if byte == 115 {
+                const string = c.nextPointer(list)
+                pushData(&g, string, c.cLength(string))
+            } else if byte == 98 {
+                const size = c.nextInt(list)
+                const bytes = c.nextPointer(list)
+                if size < 0 {
+                    code = c.INV_ARG
+                    break
+                }
+                pushData(&g, bytes, @intCast(usize, size))
+            } else if byte == 100 {
+                const value = c.nextInt(list)
+                var digits: [24]u8 = undefined
+                const negative = value < 0
+                const magnitude: u64 = if negative { @intCast(u64, 0 - @intCast(i64, value)) } else { @intCast(u64, value) }
+                const count = decimal(magnitude, negative, &digits)
+                pushData(&g, @intFromPtr(&digits), count)
+            } else if byte == 117 {
+                const value = c.nextWord(list) & 4294967295
+                var digits: [24]u8 = undefined
+                const count = decimal(value, false, &digits)
+                pushData(&g, @intFromPtr(&digits), count)
+            } else if byte == 83 {
+                const inserted = c.nextPointer(list)
+                // The first list of it, whole.
+                if inserted != 0 {
+                    var q = inserted
+                    while c.get8(q) != ST_STOP && c.get8(q) != ST_OPEN { q = next(q) }
+                    if c.get8(q) == ST_OPEN {
+                        const end = skipElement(q)
+                        pushBytes(&g, q, end - q)
+                    }
+                }
+            } else {
+                code = c.SEXP_INV_LEN_SPEC
+                break
+            }
+            percent = false
+        } else if byte == 40 {
+            if hint {
+                code = c.SEXP_UNMATCHED_DH
+                break
+            }
+            pushByte(&g, ST_OPEN)
+            level += 1
+        } else if byte == 41 {
+            if hint {
+                code = c.SEXP_UNMATCHED_DH
+                break
+            }
+            if level == 0 {
+                code = c.SEXP_UNMATCHED_PAREN
+                break
+            }
+            pushByte(&g, ST_CLOSE)
+            level -= 1
+        } else if byte == 34 {
+            quoted = p
+            quotedEscape = false
+        } else if byte == 35 {
+            hexStart = p
+            hexCount = 0
+        } else if byte == 124 {
+            base64Start = p
+            base64Count = 0
+        } else if byte == 91 {
+            if hint {
+                code = c.SEXP_NESTED_DH
+                break
+            }
+            hint = true
+        } else if byte == 93 {
+            if !hint {
+                code = c.SEXP_UNMATCHED_DH
+                break
+            }
+            hint = false
+        } else if isDigit(byte) {
+            if byte == 48 {
+                code = c.SEXP_ZERO_PREFIX
+                break
+            }
+            digitStart = p
+        } else if isTokenChar(byte) {
+            tokenStart = p
+        } else if isWhite(byte) {
+            // Between elements.
+        } else if byte == 123 || byte == 38 || byte == 92 {
+            code = c.SEXP_UNEXPECTED_PUNC
+            break
+        } else if list != 0 && byte == 37 {
+            percent = true
+        } else {
+            code = c.SEXP_BAD_CHARACTER
+            break
+        }
+        p += 1
+        n -= 1
+    }
+    if code != 0 {
+        if erroff != 0 { c.putWord(erroff, p - text) }
+        c.wipeRelease(g.address, g.capacity)
+        return code
+    }
+    pushByte(&g, ST_STOP)
+    if g.failed { return c.ENOMEM }
+    if level != 0 {
+        c.wipeRelease(g.address, g.capacity)
+        return c.SEXP_UNMATCHED_PAREN
+    }
+    out.* = normalize(g.address)
+    return 0
+}
+
+// The length of the canonical S-expression at `buffer` (at most `length`
+// bytes when not 0), 0 for a malformed one: its code into *errcode and
+// where into *erroff.
+pub fn canonLength(buffer: usize, length: usize, erroff: usize, errcode: usize) -> usize {
+    if errcode != 0 { c.put32(errcode, 0) }
+    if erroff != 0 { c.putWord(erroff, 0) }
+    if buffer == 0 { return 0 }
+    var failure: u32 = 0
+    var where_: usize = 0
+    var result: usize = 0
+    if c.get8(buffer) != 40 {
+        failure = c.SEXP_NOT_CANONICAL
+    } else {
+        var count: usize = 0
+        var p = buffer
+        var datalen: usize = 0
+        var level: usize = 0
+        var hint = false
+        while true {
+            if length != 0 && count >= length {
+                failure = c.SEXP_STRING_TOO_LONG
+                where_ = count
+                break
+            }
+            const byte = c.get8(p)
+            if datalen != 0 {
+                if byte == 58 {
+                    if length != 0 && count + datalen >= length {
+                        failure = c.SEXP_STRING_TOO_LONG
+                        where_ = count
+                        break
+                    }
+                    count += datalen
+                    p += datalen
+                    datalen = 0
+                } else if isDigit(byte) {
+                    datalen = datalen * 10 + @intCast(usize, byte - 48)
+                } else {
+                    failure = c.SEXP_INV_LEN_SPEC
+                    where_ = count
+                    break
+                }
+            } else if byte == 40 {
+                if hint {
+                    failure = c.SEXP_UNMATCHED_DH
+                    where_ = count
+                    break
+                }
+                level += 1
+            } else if byte == 41 {
+                if level == 0 {
+                    failure = c.SEXP_UNMATCHED_PAREN
+                    where_ = count
+                    break
+                }
+                if hint {
+                    failure = c.SEXP_UNMATCHED_DH
+                    where_ = count
+                    break
+                }
+                level -= 1
+                if level == 0 {
+                    result = count + 1
+                    break
+                }
+            } else if byte == 91 {
+                if hint {
+                    failure = c.SEXP_NESTED_DH
+                    where_ = count
+                    break
+                }
+                hint = true
+            } else if byte == 93 {
+                if !hint {
+                    failure = c.SEXP_UNMATCHED_DH
+                    where_ = count
+                    break
+                }
+                hint = false
+            } else if isDigit(byte) {
+                if byte == 48 {
+                    failure = c.SEXP_ZERO_PREFIX
+                    where_ = count
+                    break
+                }
+                datalen = @intCast(usize, byte - 48)
+            } else if byte == 38 || byte == 92 {
+                failure = c.SEXP_UNEXPECTED_PUNC
+                where_ = count
+                break
+            } else {
+                failure = c.SEXP_BAD_CHARACTER
+                where_ = count
+                break
+            }
+            p += 1
+            count += 1
+        }
+    }
+    if failure != 0 {
+        if errcode != 0 { c.put32(errcode, c.failure(failure)) }
+        if erroff != 0 { c.putWord(erroff, where_) }
+        return 0
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Walking.
+
+// The list whose first element is the token `token` (`length` bytes),
+// anywhere in `list`: a copy, or 0.
+pub fn findToken(list: usize, token: usize, length: usize) -> usize {
+    if list == 0 { return 0 }
+    var p = list
+    while c.get8(p) != ST_STOP {
+        if c.get8(p) == ST_OPEN && c.get8(p + 1) == ST_DATA {
+            const head = p
+            const data = p + 1
+            const n = dataLength(data)
+            if n == length && c.same(c.slice(data + 5, n), c.slice(token, length)) {
+                return copyOut(head, skipElement(head) - head)
+            }
+            p = data + 5 + n
+        } else {
+            p = next(p)
+        }
+    }
+    return 0
+}
+
+pub fn findName(list: usize, name: []const u8) -> usize { return findToken(list, @intFromPtr(name.pointer), name.length) }
+
+// The elements of the outer list.
+pub fn listLength(list: usize) -> i32 {
+    if list == 0 { return 0 }
+    var count: i32 = 0
+    var level: usize = 0
+    var p = list
+    while c.get8(p) != ST_STOP {
+        const tag = c.get8(p)
+        if tag == ST_DATA {
+            if level == 1 { count += 1 }
+        } else if tag == ST_OPEN {
+            if level == 1 { count += 1 }
+            level += 1
+        } else if tag == ST_CLOSE {
+            level -= 1
+        }
+        p = next(p)
+    }
+    return count
+}
+
+// Where the outer list's element `number` starts, or 0.
+fn elementAt(list: usize, number: i32) -> usize {
+    if list == 0 || c.get8(list) != ST_OPEN { return 0 }
+    var p = list + 1
+    var left = number
+    while left > 0 {
+        const tag = c.get8(p)
+        if tag == ST_STOP || tag == ST_CLOSE { return 0 }
+        p = skipElement(p)
+        left -= 1
+    }
+    const tag = c.get8(p)
+    if tag == ST_STOP || tag == ST_CLOSE { return 0 }
+    return p
+}
+
+// Element `number`: a list's copy, or a datum as a list of it.
+pub fn nth(list: usize, number: i32) -> usize {
+    const at = elementAt(list, number)
+    if at == 0 { return 0 }
+    if c.get8(at) == ST_DATA {
+        const n = dataLength(at)
+        const address = c.alloc(n + 8)
+        if address == 0 { return 0 }
+        c.put8(address, ST_OPEN)
+        c.copy(address + 1, at, 5 + n)
+        c.put8(address + 6 + n, ST_CLOSE)
+        c.put8(address + 7 + n, ST_STOP)
+        return normalize(address)
+    }
+    return copyOut(at, skipElement(at) - at)
+}
+
+// The data of element `number` (of a list; of a datum, its number 0):
+// where it is and its length, 0 when it is a list or missing.
+pub fn nthData(list: usize, number: i32, length: *usize) -> usize {
+    length.* = 0
+    if list == 0 { return 0 }
+    var at: usize = 0
+    if c.get8(list) == ST_OPEN {
+        at = elementAt(list, number)
+    } else if number == 0 {
+        at = list
+    }
+    if at == 0 || c.get8(at) != ST_DATA { return 0 }
+    length.* = dataLength(at)
+    return at + 5
+}
+
+// The second element on (one of them: libgcrypt's cdr keeps only the
+// next), as a list.
+pub fn cdr(list: usize) -> usize {
+    const at = elementAt(list, 1)
+    if at == 0 { return 0 }
+    const end = skipElement(at)
+    const n = end - at
+    const address = c.alloc(n + 3)
+    if address == 0 { return 0 }
+    c.put8(address, ST_OPEN)
+    c.copy(address + 1, at, n)
+    c.put8(address + 1 + n, ST_CLOSE)
+    c.put8(address + 2 + n, ST_STOP)
+    return normalize(address)
+}
+
+// Element `number`'s data as an MPI in `format` (0: STD; 8: opaque), or 0.
+pub fn nthMpi(list: usize, number: i32, format: i32) -> usize {
+    var length: usize = 0
+    const data = nthData(list, number, &length)
+    if format == 8 {
+        if data == 0 || length == 0 { return 0 }
+        const copied = c.dupBytes(data, length)
+        const made = mpi.create(1)
+        return mpi.setOpaque(made, copied, @intCast(u32, (length * 8) & 4294967295))
+    }
+    if data == 0 { return 0 }
+    var made: usize = 0
+    const scanned = mpi.scan(@intFromPtr(&made), if format == 0 { 1 } else { format }, data, length, 0)
+    if scanned != 0 { return 0 }
+    return made
+}
+
+// Element `number`'s data as a new NUL-terminated string, or 0.
+pub fn nthString(list: usize, number: i32) -> usize {
+    var length: usize = 0
+    const data = nthData(list, number, &length)
+    if data == 0 || length == 0 { return 0 }
+    const out = c.alloc(length + 1)
+    if out == 0 { return 0 }
+    c.copy(out, data, length)
+    return out
+}
+
+// ---------------------------------------------------------------------------
+// Printing: GCRYSEXP_FMT_DEFAULT 0, CANON 1, BASE64 2 (as the default),
+// ADVANCED 3.
+
+// How the advanced form writes a datum: 1 quoted, 2 a token, 0 hex.
+fn encodingOf(data: usize, length: usize) -> u8 {
+    if length == 0 { return 1 }
+    if c.get8(data) & 128 != 0 { return 0 }
+    var maybeToken = true
+    var index: usize = 0
+    while index < length {
+        const byte = c.get8(data + index)
+        if byte == 0 { return 0 }
+        const escapable = byte == 8 || byte == 9 || byte == 11 || byte == 10 || byte == 12 || byte == 13 || byte == 34 || byte == 39 || byte == 92
+        if (byte < 32 || (byte >= 127 && byte <= 160)) && !escapable { return 0 }
+        if maybeToken && !isAlpha(byte) && !isDigit(byte) && !(byte == 45 || byte == 46 || byte == 47 || byte == 95 || byte == 58 || byte == 42 || byte == 43 || byte == 61) { maybeToken = false }
+        index += 1
+    }
+    if maybeToken && !isDigit(c.get8(data)) { return 2 }
+    return 1
+}
+
+const HEX_DIGITS = "0123456789ABCDEF"
+const LOWER_HEX = "0123456789abcdef"
+
+// A printer: it counts, and writes while the buffer has room for the
+// count and the NUL after it.
+const Printer = struct {
+    buffer: usize
+    maximum: usize
+    length: usize
+    full: bool
+}
+
+fn emit(printer: *Printer, byte: u8) -> void {
+    printer.*.length += 1
+    if printer.*.buffer == 0 || printer.*.full { return }
+    if printer.*.length >= printer.*.maximum {
+        printer.*.full = true
+        return
+    }
+    c.put8(printer.*.buffer + printer.*.length - 1, byte)
+}
+
+fn emitText(printer: *Printer, text: []const u8) -> void {
+    var index: usize = 0
+    while index < text.length {
+        emit(printer, text[index])
+        index += 1
+    }
+}
+
+fn emitQuoted(printer: *Printer, data: usize, length: usize) -> void {
+    emit(printer, 34)
+    var index: usize = 0
+    while index < length {
+        const byte = c.get8(data + index)
+        if byte == 8 {
+            emitText(printer, "\\b")
+        } else if byte == 9 {
+            emitText(printer, "\\t")
+        } else if byte == 11 {
+            emitText(printer, "\\v")
+        } else if byte == 10 {
+            emitText(printer, "\\n")
+        } else if byte == 12 {
+            emitText(printer, "\\f")
+        } else if byte == 13 {
+            emitText(printer, "\\r")
+        } else if byte == 34 {
+            emitText(printer, "\\\"")
+        } else if byte == 39 {
+            emitText(printer, "\\'")
+        } else if byte == 92 {
+            emitText(printer, "\\\\")
+        } else if byte < 32 || (byte >= 127 && byte <= 160) {
+            emitText(printer, "\\x")
+            emit(printer, LOWER_HEX[@intCast(usize, byte >> 4)])
+            emit(printer, LOWER_HEX[@intCast(usize, byte & 15)])
+        } else {
+            emit(printer, byte)
+        }
+        index += 1
+    }
+    emit(printer, 34)
+}
+
+fn emitIndent(printer: *Printer, indent: usize) -> void {
+    emit(printer, 10)
+    var index: usize = 0
+    while index < indent {
+        emit(printer, 32)
+        index += 1
+    }
+}
+
+// The printed length (without the NUL) or, with no buffer, the room it
+// needs (with it); 0 when the buffer is too short.
+pub fn sprint(list: usize, mode: i32, buffer: usize, maximum: usize) -> usize {
+    var empty: [3]u8 = [3]u8{ ST_OPEN, ST_CLOSE, ST_STOP }
+    var p = if list != 0 { list } else { @intFromPtr(&empty) }
+    var printer = Printer.{ .buffer = buffer, .maximum = maximum, .length = 0, .full = false }
+    var indent: usize = 0
+    while c.get8(p) != ST_STOP {
+        const tag = c.get8(p)
+        if tag == ST_OPEN {
+            if mode != 1 && indent > 0 { emitIndent(&printer, indent) }
+            emit(&printer, 40)
+            indent += 1
+            p += 1
+        } else if tag == ST_CLOSE {
+            emit(&printer, 41)
+            indent -= 1
+            p += 1
+            const following = c.get8(p)
+            if following != ST_OPEN && following != ST_STOP && mode != 1 { emitIndent(&printer, indent) }
+        } else {
+            const n = dataLength(p)
+            const data = p + 5
+            if mode == 3 {
+                const kind = encodingOf(data, n)
+                if kind == 1 {
+                    emitQuoted(&printer, data, n)
+                } else if kind == 2 {
+                    emitText(&printer, c.slice(data, n))
+                } else {
+                    emit(&printer, 35)
+                    var index: usize = 0
+                    while index < n {
+                        const byte = c.get8(data + index)
+                        emit(&printer, HEX_DIGITS[@intCast(usize, byte >> 4)])
+                        emit(&printer, HEX_DIGITS[@intCast(usize, byte & 15)])
+                        index += 1
+                    }
+                    emit(&printer, 35)
+                }
+                if c.get8(data + n) != ST_CLOSE { emit(&printer, 32) }
+            } else {
+                var digits: [24]u8 = undefined
+                const count = decimal(@intCast(u64, n), false, &digits)
+                var index: usize = 0
+                while index < count {
+                    emit(&printer, digits[index])
+                    index += 1
+                }
+                emit(&printer, 58)
+                emitText(&printer, c.slice(data, n))
+            }
+            p = data + n
+        }
+    }
+    if mode != 1 { emit(&printer, 10) }
+    if buffer == 0 { return printer.length + 1 }
+    if printer.full || printer.length >= maximum { return 0 }
+    c.put8(buffer + printer.length, 0)
+    return printer.length
+}
+
+// ---------------------------------------------------------------------------
+// The C API.
+
+export fn gcry_sexp_sscan(retsexp: usize, erroff: usize, buffer: usize, length: usize) -> u32 {
+    if retsexp == 0 { return c.failure(c.INV_ARG) }
+    c.putWord(retsexp, 0)
+    if buffer == 0 { return c.failure(c.INV_ARG) }
+    var made: usize = 0
+    const code = parse(buffer, length, erroff, 0, &made)
+    if code != 0 { return c.failure(code) }
+    c.putWord(retsexp, made)
+    return 0
+}
+
+export fn gcry_sexp_new(retsexp: usize, buffer: usize, length: usize, autodetect: i32) -> u32 {
+    if retsexp == 0 { return c.failure(c.INV_ARG) }
+    c.putWord(retsexp, 0)
+    if autodetect < 0 || autodetect > 1 || buffer == 0 { return c.failure(c.INV_ARG) }
+    var size = length
+    if size == 0 && autodetect == 0 {
+        var code: u32 = 0
+        size = canonLength(buffer, 0, 0, @intFromPtr(&code))
+        if size == 0 { return code }
+    } else if size == 0 {
+        size = c.cLength(buffer)
+    }
+    var made: usize = 0
+    const code = parse(buffer, size, 0, 0, &made)
+    if code != 0 { return c.failure(code) }
+    c.putWord(retsexp, made)
+    return 0
+}
+
+// The format's arguments follow it, C's variable arguments.
+export fn gcry_sexp_build(retsexp: usize, erroff: usize, format: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> u32 {
+    var call: c.CallList = undefined
+    var words: [6]usize = [6]usize{ retsexp, erroff, format, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = c.varStart(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    if retsexp == 0 { return c.failure(c.INV_ARG) }
+    c.putWord(retsexp, 0)
+    if format == 0 { return c.failure(c.INV_ARG) }
+    var made: usize = 0
+    const code = parse(format, c.cLength(format), erroff, list, &made)
+    if code != 0 { return c.failure(code) }
+    c.putWord(retsexp, made)
+    return 0
+}
+
+export fn gcry_sexp_release(sexp: usize) -> void { release(sexp) }
+
+export fn gcry_sexp_canon_len(buffer: usize, length: usize, erroff: usize, errcode: usize) -> usize {
+    return canonLength(buffer, length, erroff, errcode)
+}
+
+export fn gcry_sexp_sprint(sexp: usize, mode: i32, buffer: usize, maxlength: usize) -> usize {
+    return sprint(sexp, mode, buffer, maxlength)
+}
+
+export fn gcry_sexp_find_token(list: usize, tok: usize, toklen: usize) -> usize {
+    if list == 0 { return 0 }
+    return findToken(list, tok, if toklen == 0 { c.cLength(tok) } else { toklen })
+}
+
+export fn gcry_sexp_length(list: usize) -> i32 { return listLength(list) }
+
+export fn gcry_sexp_nth(list: usize, number: i32) -> usize { return nth(list, number) }
+
+export fn gcry_sexp_car(list: usize) -> usize { return nth(list, 0) }
+
+export fn gcry_sexp_cdr(list: usize) -> usize { return cdr(list) }
+
+export fn gcry_sexp_nth_data(list: usize, number: i32, datalen: usize) -> usize {
+    var length: usize = 0
+    const data = nthData(list, number, &length)
+    c.putWord(datalen, length)
+    return data
+}
+
+export fn gcry_sexp_nth_buffer(list: usize, number: i32, rlength: usize) -> usize {
+    c.putWord(rlength, 0)
+    var length: usize = 0
+    const data = nthData(list, number, &length)
+    if data == 0 || length == 0 { return 0 }
+    const out = c.dupBytes(data, length)
+    if out != 0 { c.putWord(rlength, length) }
+    return out
+}
+
+export fn gcry_sexp_nth_string(list: usize, number: i32) -> usize { return nthString(list, number) }
+
+export fn gcry_sexp_nth_mpi(list: usize, number: i32, mpifmt: i32) -> usize { return nthMpi(list, number, mpifmt) }
+
+// ---------------------------------------------------------------------------
+// gcry_sexp_extract_param: the parameters `names` lists (one letter each,
+// or 'quoted'), each into the pointer that follows, from `sexp` or the
+// list `path` names (tokens separated by "!"). The modes: + an unsigned
+// MPI (the default), - a signed one, / an opaque one, & a gcry_buffer_t,
+// %s a string, %#s a list's data joined by spaces, %u, %lu, %zu, %d and
+// %ld numbers; ? after a name makes it optional.
+
+
+const MAX_PARAMETERS: usize = 20
+
+// gcry_buffer_t: size, off, len, data.
+const BUFFER_SIZE: usize = 0
+const BUFFER_OFF: usize = 8
+const BUFFER_LEN: usize = 16
+const BUFFER_DATA: usize = 24
+
+// What an extracted parameter's pointer holds, for the cleanup after a
+// failure: 0 an MPI, 1 the caller's buffer, 2 a buffer made here, 's'
+// (115) a string made here, 'x' (120) nothing to undo.
+fn undo(kind: u8, target: usize) -> void {
+    if kind == 0 {
+        mpi.destroy(c.getWord(target))
+        c.putWord(target, 0)
+    } else if kind == 1 {
+        c.putWord(target + BUFFER_LEN, 0)
+    } else if kind == 2 {
+        c.release(c.getWord(target + BUFFER_DATA))
+        c.putWord(target + BUFFER_DATA, 0)
+        c.putWord(target + BUFFER_SIZE, 0)
+        c.putWord(target + BUFFER_OFF, 0)
+        c.putWord(target + BUFFER_LEN, 0)
+    } else if kind == 115 {
+        c.release(c.getWord(target))
+        c.putWord(target, 0)
+    }
+}
+
+// The first `stop` in the C string from `from`, or 0.
+fn indexOf(from: usize, stop: u8) -> usize {
+    var p = from
+    while c.get8(p) != 0 {
+        if c.get8(p) == stop { return p }
+        p += 1
+    }
+    return 0
+}
+
+// strtol and strtoul's reading of a decimal number (what they wrap to).
+fn parseNumber(text: usize) -> u64 {
+    var value: u64 = 0
+    var p = text
+    while isWhite(c.get8(p)) { p += 1 }
+    var negative = false
+    if c.get8(p) == 45 {
+        negative = true
+        p += 1
+    } else if c.get8(p) == 43 {
+        p += 1
+    }
+    while isDigit(c.get8(p)) {
+        value = value *% 10 +% @intCast(u64, c.get8(p) - 48)
+        p += 1
+    }
+    return if negative { 0 -% value } else { value }
+}
+
+// One parameter, found as `found` (its list), into `target` in `mode`
+// (`submode` l, z or #): a gpg error code; *kind says what was made.
+fn extractOne(found: usize, target: usize, mode: u8, submode: u8, kind: *u8) -> u32 {
+    if mode == 38 {
+        var length: usize = 0
+        const data = nthData(found, 1, &length)
+        if c.getWord(target + BUFFER_DATA) != 0 {
+            if data == 0 || length == 0 { return c.INV_OBJ }
+            const offset = c.getWord(target + BUFFER_OFF)
+            if offset + length > c.getWord(target + BUFFER_SIZE) { return c.BUFFER_TOO_SHORT }
+            c.copy(c.getWord(target + BUFFER_DATA) + offset, data, length)
+            c.putWord(target + BUFFER_LEN, length)
+            kind.* = 1
+        } else {
+            if data == 0 || length == 0 { return c.INV_OBJ }
+            const copied = c.dupBytes(data, length)
+            if copied == 0 { return c.INV_OBJ }
+            c.putWord(target + BUFFER_DATA, copied)
+            c.putWord(target + BUFFER_SIZE, length)
+            c.putWord(target + BUFFER_LEN, length)
+            c.putWord(target + BUFFER_OFF, 0)
+            kind.* = 2
+        }
+        return 0
+    }
+    if mode == 115 {
+        var made: usize = 0
+        if submode == 35 {
+            // The list's data after its name, joined by spaces; "()" for
+            // a list among them.
+            const elements = listLength(found)
+            var needed: usize = 0
+            var number: i32 = 1
+            while number < elements {
+                var length: usize = 0
+                const data = nthData(found, number, &length)
+                needed += (if data == 0 { 2 } else { length }) + 1
+                number += 1
+            }
+            made = c.alloc(if needed == 0 { 1 } else { needed })
+            if made != 0 && needed > 0 {
+                var at = made
+                number = 1
+                while number < elements {
+                    var length: usize = 0
+                    const data = nthData(found, number, &length)
+                    if data == 0 {
+                        c.put8(at, 40)
+                        c.put8(at + 1, 41)
+                        length = 2
+                    } else {
+                        c.copy(at, data, length)
+                    }
+                    c.put8(at + length, 32)
+                    at += length + 1
+                    number += 1
+                }
+                c.put8(at - 1, 0)
+            }
+        } else {
+            made = nthString(found, 1)
+        }
+        c.putWord(target, made)
+        kind.* = 115
+        if made == 0 { return c.ENOMEM }
+        return 0
+    }
+    if mode == 100 || mode == 117 {
+        const text = nthString(found, 1)
+        if text == 0 { return c.ENOMEM }
+        const value = parseNumber(text)
+        c.release(text)
+        if submode == 108 || submode == 122 {
+            c.put64(target, value)
+        } else {
+            c.put32(target, @intCast(u32, value & 4294967295))
+        }
+        kind.* = 120
+        return 0
+    }
+    const format: i32 = if mode == 47 { 8 } else if mode == 45 { 1 } else { 5 }
+    const made = nthMpi(found, 1, format)
+    c.putWord(target, made)
+    kind.* = 0
+    if made == 0 { return c.INV_OBJ }
+    return 0
+}
+
+pub fn extract(sexp: usize, path: usize, names: usize, list: usize) -> u32 {
+    var targets: [20]usize = [20]usize{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    var kinds: [20]u8 = [20]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    // The pointers first, so that a failure can undo what was made.
+    var count: usize = 0
+    var s = names
+    while c.get8(s) != 0 && count < MAX_PARAMETERS {
+        const byte = c.get8(s)
+        if byte == 38 || byte == 43 || byte == 45 || byte == 47 || byte == 63 || isWhite(byte) {
+            // A mode, the optional mark or a space.
+        } else if byte == 37 {
+            s += 1
+            const after = c.get8(s)
+            const then = c.get8(s + 1)
+            if (after == 108 && (then == 117 || then == 100)) || (after == 122 && then == 117) || (after == 35 && then == 115) { s += 1 }
+            s += 1
+            continue
+        } else {
+            if byte == 39 {
+                s += 1
+                const closing = indexOf(s, 39)
+                if closing == 0 || closing == s { return c.SYNTAX }
+                s = closing
+            }
+            targets[count] = c.nextPointer(list)
+            if targets[count] == 0 { return c.MISSING_VALUE }
+            count += 1
+        }
+        s += 1
+    }
+    if c.get8(s) != 0 { return c.LIMIT_REACHED }
+    if c.nextPointer(list) != 0 { return c.INV_ARG }
+
+    // Down the path.
+    var current = sexp
+    var owned: usize = 0
+    var at = path
+    while at != 0 && c.get8(at) != 0 {
+        const bang = indexOf(at, 33)
+        if bang == at {
+            release(owned)
+            return c.NOT_FOUND
+        }
+        const n = if bang != 0 { bang - at } else { c.cLength(at) }
+        const found = findToken(current, at, n)
+        if found == 0 {
+            release(owned)
+            return c.NOT_FOUND
+        }
+        release(owned)
+        owned = found
+        current = found
+        at = if bang != 0 { bang + 1 } else { 0 }
+    }
+
+    var mode: u8 = 43
+    var submode: u8 = 0
+    var index: usize = 0
+    var code: u32 = 0
+    s = names
+    while c.get8(s) != 0 {
+        const byte = c.get8(s)
+        if byte == 38 || byte == 43 || byte == 45 || byte == 47 {
+            mode = byte
+        } else if byte == 37 {
+            s += 1
+            const after = c.get8(s)
+            if after == 0 { continue }
+            if after == 115 || after == 100 || after == 117 {
+                mode = after
+                submode = 0
+            } else if after == 108 && (c.get8(s + 1) == 117 || c.get8(s + 1) == 100) {
+                mode = c.get8(s + 1)
+                submode = 108
+                s += 1
+            } else if after == 122 && c.get8(s + 1) == 117 {
+                mode = 117
+                submode = 122
+                s += 1
+            } else if after == 35 && c.get8(s + 1) == 115 {
+                mode = 115
+                submode = 35
+                s += 1
+            }
+        } else if isWhite(byte) || byte == 63 {
+            // Nothing to extract.
+        } else {
+            var found: usize = 0
+            if byte == 39 {
+                s += 1
+                const closing = indexOf(s, 39)
+                if closing == 0 || closing == s {
+                    code = c.SYNTAX
+                    break
+                }
+                found = findToken(current, s, closing - s)
+                s = closing
+            } else {
+                found = findToken(current, s, 1)
+            }
+            const target = targets[index]
+            if found == 0 && c.get8(s + 1) == 63 {
+                // An optional parameter that is not there: empty.
+                if mode == 38 {
+                    if c.getWord(target + BUFFER_DATA) == 0 {
+                        c.putWord(target + BUFFER_SIZE, 0)
+                        c.putWord(target + BUFFER_OFF, 0)
+                    }
+                    c.putWord(target + BUFFER_LEN, 0)
+                    kinds[index] = 120
+                } else if mode == 115 {
+                    c.putWord(target, 0)
+                    kinds[index] = 115
+                } else if mode == 100 || mode == 117 {
+                    if submode == 108 || submode == 122 {
+                        c.put64(target, 0)
+                    } else {
+                        c.put32(target, 0)
+                    }
+                    kinds[index] = 120
+                } else {
+                    c.putWord(target, 0)
+                }
+            } else if found == 0 {
+                code = c.NO_OBJ
+                break
+            } else {
+                var kind: u8 = 0
+                code = extractOne(found, target, mode, submode, &kind)
+                kinds[index] = kind
+                release(found)
+                if code != 0 {
+                    index += 1
+                    break
+                }
+            }
+            index += 1
+        }
+        s += 1
+    }
+    release(owned)
+    if code != 0 {
+        while index > 0 {
+            index -= 1
+            undo(kinds[index], targets[index])
+        }
+    }
+    return code
+}
+
+export fn gcry_sexp_extract_param(sexp: usize, path: usize, names: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> u32 {
+    var call: c.CallList = undefined
+    var words: [6]usize = [6]usize{ sexp, path, names, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = c.varStart(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    return c.failure(extract(sexp, path, names, list))
+}
