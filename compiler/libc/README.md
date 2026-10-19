@@ -130,8 +130,8 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
   first five words of a record are glibc's `struct link_map`, and
   `_r_debug` through the program's `DT_DEBUG`, so gdb lists the libraries),
   mapping an ELF file's segments, the search for a library (the requester's
-  runpath with `$ORIGIN`, `LD_LIBRARY_PATH`, the system directories,
-  `/lib/mlx` first), symbol lookup through `DT_GNU_HASH` or `DT_HASH` in
+  runpath with `$ORIGIN`, `LD_LIBRARY_PATH`, the loader's own directory
+  (where its `libm.so.6` is), the system directories, `/lib/mlx` first), symbol lookup through `DT_GNU_HASH` or `DT_HASH` in
   load order (symbol versions are not compared), relocations (`RELATIVE`,
   `RELR`, `64`, `GLOB_DAT`, `JUMP_SLOT`, `COPY`, `IRELATIVE`, `DTPMOD64`,
   `DTPOFF64`, `TPOFF64`), static TLS laid out below each thread's control
