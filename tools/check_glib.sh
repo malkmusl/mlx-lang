@@ -36,7 +36,9 @@
 #       tests/extras.c     keyed data lists, random numbers, language
 #                          names, IDNA host names, GIO's enum types,
 #                          proxy resolvers, network addresses,
-#                          GResolver and a subclass of it (what
+#                          GResolver and a subclass of it, files
+#                          and memory streams sought, the network
+#                          and power monitors, content types (what
 #                          libsoup and WebKit stand on)
 #   - WTF's sources for WPE that stand on GLib and the system
 #     (tests/wtf/files.txt: wtf/glib, generic, unix, linux and posix)

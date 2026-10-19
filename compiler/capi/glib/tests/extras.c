@@ -281,6 +281,148 @@ static void resolvers (void)
     g_object_unref (resolver);
 }
 
+static void print_error (const char *what, GError *error)
+{
+    printf ("%s: %s %d %s\n", what, error ? g_quark_to_string (error->domain) : "none", error ? error->code : 0, error ? error->message : "");
+    g_clear_error (&error);
+}
+
+static void read_some (const char *what, GInputStream *stream, gsize count)
+{
+    char buffer[64];
+    GError *error = NULL;
+    gssize n = g_input_stream_read (stream, buffer, count, NULL, &error);
+    printf ("%s: %d \"%.*s\", at %d\n", what, (int) n, n > 0 ? (int) n : 0, buffer,
+            (int) g_seekable_tell (G_SEEKABLE (stream)));
+    g_clear_error (&error);
+}
+
+static void file_read_done (GObject *source, GAsyncResult *result, gpointer data)
+{
+    GError *error = NULL;
+    GFileInputStream *stream = g_file_read_finish (G_FILE (source), result, &error);
+    printf ("async read: a file input stream %d\n", G_IS_FILE_INPUT_STREAM (stream));
+    if (stream) {
+        read_some ("async first", G_INPUT_STREAM (stream), 4);
+        g_object_unref (stream);
+    }
+    g_clear_error (&error);
+    g_main_loop_quit (data);
+}
+
+/* Files read as seekable streams (WebKit's form data), memory streams
+   moved, the monitors of the network and power, content types. */
+static void seekables (void)
+{
+    GError *error = NULL;
+    g_file_set_contents ("seekable.txt", "0123456789abcdef", -1, NULL);
+    GFile *file = g_file_new_for_path ("seekable.txt");
+    GFileInputStream *stream = g_file_read (file, NULL, &error);
+    print_error ("read", error);
+    error = NULL;
+    printf ("seekable %d, can seek %d, can truncate %d\n", G_IS_SEEKABLE (stream),
+            g_seekable_can_seek (G_SEEKABLE (stream)), g_seekable_can_truncate (G_SEEKABLE (stream)));
+    read_some ("first", G_INPUT_STREAM (stream), 4);
+    printf ("seek set 10: %d\n", g_seekable_seek (G_SEEKABLE (stream), 10, G_SEEK_SET, NULL, NULL));
+    read_some ("at 10", G_INPUT_STREAM (stream), 3);
+    printf ("seek cur -5: %d\n", g_seekable_seek (G_SEEKABLE (stream), -5, G_SEEK_CUR, NULL, NULL));
+    read_some ("back 5", G_INPUT_STREAM (stream), 2);
+    printf ("seek end -2: %d\n", g_seekable_seek (G_SEEKABLE (stream), -2, G_SEEK_END, NULL, NULL));
+    read_some ("near the end", G_INPUT_STREAM (stream), 10);
+    read_some ("at the end", G_INPUT_STREAM (stream), 10);
+    g_seekable_seek (G_SEEKABLE (stream), 0, G_SEEK_SET, NULL, NULL);
+    printf ("skip 6: %d\n", (int) g_input_stream_skip (G_INPUT_STREAM (stream), 6, NULL, NULL));
+    printf ("skip 100: %d\n", (int) g_input_stream_skip (G_INPUT_STREAM (stream), 100, NULL, NULL));
+    printf ("seek before the start: %d\n", g_seekable_seek (G_SEEKABLE (stream), -1, G_SEEK_SET, NULL, &error));
+    print_error ("seek error", error);
+    error = NULL;
+    printf ("truncate: %d\n", g_seekable_truncate (G_SEEKABLE (stream), 0, NULL, &error));
+    print_error ("truncate error", error);
+    error = NULL;
+    g_input_stream_close (G_INPUT_STREAM (stream), NULL, NULL);
+    printf ("seek closed: %d\n", g_seekable_seek (G_SEEKABLE (stream), 0, G_SEEK_SET, NULL, &error));
+    print_error ("closed error", error);
+    error = NULL;
+    g_object_unref (stream);
+
+    GMainLoop *loop = g_main_loop_new (NULL, FALSE);
+    g_file_read_async (file, G_PRIORITY_DEFAULT, NULL, file_read_done, loop);
+    g_main_loop_run (loop);
+    g_main_loop_unref (loop);
+    g_object_unref (file);
+
+    file = g_file_new_for_path ("no-such-file.txt");
+    stream = g_file_read (file, NULL, &error);
+    printf ("missing: %p\n", (void *) stream);
+    /* The messages name the file by its absolute path: the codes only. */
+    printf ("missing error: %d\n", error ? error->code : -1);
+    g_clear_error (&error);
+    error = NULL;
+    g_object_unref (file);
+    file = g_file_new_for_path (".");
+    stream = g_file_read (file, NULL, &error);
+    printf ("directory error: %d\n", error ? error->code : -1);
+    g_clear_error (&error);
+    error = NULL;
+    g_object_unref (file);
+    remove ("seekable.txt");
+
+    GInputStream *memory = g_memory_input_stream_new_from_data ("hello ", -1, NULL);
+    g_memory_input_stream_add_data (G_MEMORY_INPUT_STREAM (memory), "world", -1, NULL);
+    printf ("memory seekable %d, can seek %d, can truncate %d\n", G_IS_SEEKABLE (memory),
+            g_seekable_can_seek (G_SEEKABLE (memory)), g_seekable_can_truncate (G_SEEKABLE (memory)));
+    printf ("memory seek 4: %d\n", g_seekable_seek (G_SEEKABLE (memory), 4, G_SEEK_SET, NULL, NULL));
+    read_some ("memory at 4", memory, 5);
+    printf ("memory seek end -1: %d\n", g_seekable_seek (G_SEEKABLE (memory), -1, G_SEEK_END, NULL, NULL));
+    read_some ("memory at the end", memory, 5);
+    printf ("memory seek past the end: %d\n", g_seekable_seek (G_SEEKABLE (memory), 1, G_SEEK_END, NULL, &error));
+    print_error ("memory seek error", error);
+    error = NULL;
+    printf ("memory truncate: %d\n", g_seekable_truncate (G_SEEKABLE (memory), 0, NULL, &error));
+    print_error ("memory truncate error", error);
+    g_object_unref (memory);
+
+    GNetworkMonitor *monitor = g_network_monitor_get_default ();
+    gboolean available = FALSE;
+    GNetworkConnectivity connectivity = 0;
+    g_object_get (monitor, "network-available", &available, "connectivity", &connectivity, NULL);
+    printf ("network monitor %d: available %d, metered %d, connectivity %d; properties %d %d\n", G_IS_NETWORK_MONITOR (monitor),
+            g_network_monitor_get_network_available (monitor), g_network_monitor_get_network_metered (monitor),
+            g_network_monitor_get_connectivity (monitor), available, connectivity);
+    printf ("network-changed is a signal %d\n", g_signal_lookup ("network-changed", G_TYPE_NETWORK_MONITOR) != 0);
+    GSocketConnectable *loopback = g_network_address_new ("127.0.0.1", 80);
+    printf ("can reach 127.0.0.1 %d\n", g_network_monitor_can_reach (monitor, loopback, NULL, NULL));
+    g_object_unref (loopback);
+    GPowerProfileMonitor *power = g_power_profile_monitor_dup_default ();
+    printf ("power monitor %d: power saver %d\n", G_IS_POWER_PROFILE_MONITOR (power), g_power_profile_monitor_get_power_saver_enabled (power));
+    g_object_unref (power);
+
+    const char *names[] = { "page.html", "INDEX.HTM", "style.css", "app.js", "data.json", "/images/logo.png", "photo.JPG",
+                            "anim.gif", "icon.svg", "pic.webp", "notes.txt", "doc.pdf", "mod.wasm", "clip.mp4", "clip.webm",
+                            "song.ogg", "font.woff2", "font.ttf", "archive.tar.gz", "unknown.zzz", "noextension", NULL };
+    for (int i = 0; names[i]; i++) {
+        gboolean uncertain = FALSE;
+        gchar *type = g_content_type_guess (names[i], NULL, 0, &uncertain);
+        printf ("type of %s: %s%s\n", names[i], type, uncertain ? " (uncertain)" : "");
+        g_free (type);
+    }
+    const char *datas[] = { "plain words", "<!DOCTYPE html><html>", "\x89PNG\r\n\x1a\n....", "GIF89a....", "%PDF-1.7",
+                            "<?xml version=\"1.0\"?>", "\x01\x02\x03\x04", "", NULL };
+    for (int i = 0; datas[i]; i++) {
+        gboolean uncertain = FALSE;
+        gchar *type = g_content_type_guess (NULL, (const guchar *) datas[i], strlen (datas[i]), &uncertain);
+        printf ("type of data %d: %s%s\n", i, type, uncertain ? " (uncertain)" : "");
+        g_free (type);
+    }
+    gboolean uncertain = FALSE;
+    gchar *type = g_content_type_guess ("page.html", (const guchar *) "words", 5, &uncertain);
+    printf ("type of page.html with words: %s%s\n", type, uncertain ? " (uncertain)" : "");
+    g_free (type);
+    type = g_content_type_guess (NULL, NULL, 0, &uncertain);
+    printf ("type of nothing: %s%s, unknown %d\n", type, uncertain ? " (uncertain)" : "", g_content_type_is_unknown (type));
+    g_free (type);
+}
+
 int main (void)
 {
     setvbuf (stdout, NULL, _IOLBF, 0);
@@ -300,5 +442,6 @@ int main (void)
     proxies ();
     network_address ();
     resolvers ();
+    seekables ();
     return 0;
 }

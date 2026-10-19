@@ -58,14 +58,17 @@ sources reach.
 | `task.mlx` | `gasyncresult.h`, `gtask.h`: tasks returning at once, from idle sources, from threads (and synchronously) |
 | `localfile.mlx` | `gfile.h`: local files (paths, URIs, reading, replacing with etags, deleting, making directories); `gfilemonitor.h` on inotify, with GIO's rules for pending changes and renames |
 | `socket.mlx` | `gsocket.h`, `giostream.h`, `gsocketconnection.h`: sockets (always non-blocking underneath, as in GIO), their sources, and Unix and TCP connections |
-| `streams.mlx` | `ginputstream.h`, `goutputstream.h`, `gfilterinputstream.h`, `gfilteroutputstream.h`, `gmemoryinputstream.h`, `gmemoryoutputstream.h`, `gpollableinputstream.h`, `gpollableoutputstream.h`, `gpollableutils.h`, `gsimpleiostream.h` and a GIOStream's streams: reading, skipping, writing, flushing, splicing and closing, synchronously and asynchronously (a pollable stream waits on its source, any other runs the synchronous call in a thread, as GIO does), the socket streams of a connection |
+| `streams.mlx` | `ginputstream.h`, `goutputstream.h`, `gfilterinputstream.h`, `gfilteroutputstream.h`, `gmemoryinputstream.h`, `gmemoryoutputstream.h`, `gpollableinputstream.h`, `gpollableoutputstream.h`, `gpollableutils.h`, `gsimpleiostream.h`, `gseekable.h` and a GIOStream's streams: reading, skipping, writing, flushing, splicing and closing, synchronously and asynchronously (a pollable stream waits on its source, any other runs the synchronous call in a thread, as GIO does), the socket streams of a connection; memory input streams are seekable |
+| `fileinput.mlx` | `gfileinputstream.h`, `g_file_read`: a local file read as a seekable input stream (GIO's GLocalFileInputStream); no GFileInfo |
+| `monitors.mlx` | `gnetworkmonitor.h`, `gpowerprofilemonitor.h`: the default monitors as GIO's are without netlink or a power daemon (the network always available, power saving never on) |
+| `contenttype.mlx` | `gcontenttype.h`: MIME types guessed without shared-mime-info: by extension (the web's common types, as GIO answers with the database), else by the data's signature or text |
 | `network.mlx` | `ginetaddress.h`, `gsocketaddress.h`, `ginetsocketaddress.h`, `gsocketconnectable.h`, `gsocketlistener.h`, `gsocketservice.h`, `gsocketclient.h`: IPv4 and IPv6 addresses, listening (a service accepts in its main context and emits "incoming"), connecting to "host:port" at once or asynchronously |
 | `resource.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (inflated by std.flate), the registry, static resources |
 | `application.mlx` | `gapplication.h`: application ids and the default application |
 | `dbus.mlx` | `gdbus*.h`: bus addresses, proxies, errors, introspection data; see below |
 | `tls.mlx` | `ginitable.h` and GIO's TLS types (`gtlscertificate.h`, `gtlsbackend.h`, `gtlsdatabase.h`, `gtlsfiledatabase.h`, `gtlsinteraction.h`, `gtlspassword.h`): the backend, on std.x509: certificates with their X.509 fields and verification, the default database (the system's CA bundle) and file databases; see below |
 | `tlsconnection.mlx` | `gtlsconnection.h`, `gtlsclientconnection.h`: TLS client connections over a GIOStream on std.tls (TLS 1.3 and 1.2), synchronous and asynchronous handshakes, "accept-certificate", pollable streams |
-| `enumtypes.mlx` | `gioenumtypes.h`: the GTypes of `GSocketClientEvent` and `GTlsAuthenticationMode` |
+| `enumtypes.mlx` | `gioenumtypes.h`: the GTypes of `GSocketClientEvent`, `GTlsAuthenticationMode` and `GNetworkConnectivity` |
 | `random.mlx` | `grand.h`: the global generator, from the kernel's random bytes (getrandom) |
 | `dataset.mlx` | `gdataset.h`: keyed data lists (`GData`) |
 | `charset.mlx` | `gcharset.h`'s `g_get_language_names`: LANGUAGE, LC_ALL, LC_MESSAGES, LANG and each name's variants |
@@ -94,7 +97,8 @@ sources reach.
   asynchronous, splicing, pollable sources, GSimpleIOStream) and
   `extras.c` (keyed data lists, random numbers, language names, IDNA
   host names, GIO's enum types, proxy resolvers, network addresses,
-  GResolver and a subclass of it),
+  GResolver and a subclass of it, files and memory streams sought,
+  the network and power monitors, content types),
   and
   compares what they print with what the same programs print on GLib
   2.80 (with glib-networking's GnuTLS backend for TLS);
