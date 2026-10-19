@@ -1389,6 +1389,17 @@ export fn __mlx_glib_output_splice_thread(task: usize, stream: usize, op: usize,
     m.release(cell)
 }
 
+// Whether a stream's asynchronous reads (writes) run in a thread: GIO's
+// defaults on a stream that cannot be polled.
+fn readViaThreads(stream: usize) -> bool { return slot(stream, IN_READ_ASYNC) == @intFromPtr(__mlx_glib_input_real_read_async) && !inputCanPoll(stream) }
+fn writeViaThreads(stream: usize) -> bool { return slot(stream, OUT_WRITE_ASYNC) == @intFromPtr(__mlx_glib_output_real_write_async) && !outputCanPoll(stream) }
+
+// The default splice_async, as GIO's: in a thread only when both the
+// source's reads and the target's writes would be; else reads and writes
+// chained on the task's context, 8 KB at a time. The op keeps the source
+// (OP_OTHER), the flags, the buffer (OP_OWN), what the last read gave
+// (OP_COUNT), how much of it went (OP_DATA), the total (OP_DONE) and the
+// first error (OP_CALLBACK).
 export fn __mlx_glib_output_real_splice_async(stream: usize, source: usize, flags: i32, io_priority: i32, c: usize, callback: usize, data: usize) -> void {
     const task = g_task_new(stream, c, callback, data)
     g_task_set_source_tag(task, tag(&tagRealSplice))
@@ -1396,7 +1407,104 @@ export fn __mlx_glib_output_real_splice_async(stream: usize, source: usize, flag
     const op = newOp(task, 0, 0)
     m.putWord(op + OP_OTHER, g_object_ref(source))
     m.putWord(op + OP_FLAGS, @intCast(usize, flags))
-    g_task_run_in_thread(task, @intFromPtr(__mlx_glib_output_splice_thread))
+    if readViaThreads(source) && writeViaThreads(stream) {
+        g_task_run_in_thread(task, @intFromPtr(__mlx_glib_output_splice_thread))
+        g_object_unref(task)
+        return
+    }
+    const buffer = m.raw(CHUNK)
+    m.putWord(op + OP_OWN, buffer)
+    m.putWord(op + OP_BUFFER, buffer)
+    spliceRead(task)
+}
+
+fn spliceRead(task: usize) -> void {
+    const op = g_task_get_task_data(task)
+    g_input_stream_read_async(m.getWord(op + OP_OTHER), m.getWord(op + OP_BUFFER), CHUNK, g_task_get_priority(task), g_task_get_cancellable(task), @intFromPtr(__mlx_glib_splice_read_ready), task)
+}
+
+fn spliceWrite(task: usize) -> void {
+    const op = g_task_get_task_data(task)
+    const stream = g_task_get_source_object(task)
+    const written = m.getWord(op + OP_DATA)
+    const call: WriteAsyncFn = unsafe { @ptrFromInt(WriteAsyncFn, slot(stream, OUT_WRITE_ASYNC)) }
+    call(stream, m.getWord(op + OP_BUFFER) + written, m.getWord(op + OP_COUNT) - written, g_task_get_priority(task), g_task_get_cancellable(task), @intFromPtr(__mlx_glib_splice_write_ready), task)
+}
+
+export fn __mlx_glib_splice_read_ready(source: usize, result: usize, task: usize) -> void {
+    const op = g_task_get_task_data(task)
+    const cell = m.alloc(8)
+    const n = g_input_stream_read_finish(source, result, cell)
+    if n < 0 { m.putWord(op + OP_CALLBACK, m.getWord(cell)) }
+    m.release(cell)
+    if n <= 0 {
+        spliceComplete(task)
+        return
+    }
+    m.putWord(op + OP_COUNT, @intCast(usize, n))
+    m.putWord(op + OP_DATA, 0)
+    spliceWrite(task)
+}
+
+export fn __mlx_glib_splice_write_ready(stream: usize, result: usize, task: usize) -> void {
+    const op = g_task_get_task_data(task)
+    const cell = m.alloc(8)
+    const call: FinishFn = unsafe { @ptrFromInt(FinishFn, slot(stream, OUT_WRITE_FINISH)) }
+    const n = call(stream, result, cell)
+    if n < 0 {
+        m.putWord(op + OP_CALLBACK, m.getWord(cell))
+        m.release(cell)
+        spliceComplete(task)
+        return
+    }
+    m.release(cell)
+    m.putWord(op + OP_DATA, m.getWord(op + OP_DATA) + @intCast(usize, n))
+    m.putWord(op + OP_DONE, m.getWord(op + OP_DONE) + @intCast(usize, n))
+    if m.getWord(op + OP_DATA) < m.getWord(op + OP_COUNT) {
+        spliceWrite(task)
+    } else {
+        spliceRead(task)
+    }
+}
+
+// The streams closed as the flags say, then the result.
+fn spliceComplete(task: usize) -> void {
+    const op = g_task_get_task_data(task)
+    const source = m.getWord(op + OP_OTHER)
+    if (@intCast(i32, m.getWord(op + OP_FLAGS)) & SPLICE_CLOSE_SOURCE) != 0 && !inputIsClosed(source) {
+        g_input_stream_close_async(source, g_task_get_priority(task), g_task_get_cancellable(task), @intFromPtr(__mlx_glib_splice_input_closed), task)
+        return
+    }
+    spliceCloseTarget(task)
+}
+
+export fn __mlx_glib_splice_input_closed(source: usize, result: usize, task: usize) -> void {
+    const op = g_task_get_task_data(task)
+    const cell = m.alloc(8)
+    if g_input_stream_close_finish(source, result, cell) == 0 {
+        if m.getWord(op + OP_CALLBACK) == 0 { m.putWord(op + OP_CALLBACK, m.getWord(cell)) } else { g_error_free(m.getWord(cell)) }
+    }
+    m.release(cell)
+    spliceCloseTarget(task)
+}
+
+fn spliceCloseTarget(task: usize) -> void {
+    const op = g_task_get_task_data(task)
+    const stream = g_task_get_source_object(task)
+    if (@intCast(i32, m.getWord(op + OP_FLAGS)) & SPLICE_CLOSE_TARGET) != 0 && !outputIsClosed(stream) {
+        const cell = m.alloc(8)
+        if internalClose(stream, g_task_get_cancellable(task), cell) == 0 {
+            if m.getWord(op + OP_CALLBACK) == 0 { m.putWord(op + OP_CALLBACK, m.getWord(cell)) } else { g_error_free(m.getWord(cell)) }
+        }
+        m.release(cell)
+    }
+    const e = m.getWord(op + OP_CALLBACK)
+    if e != 0 {
+        m.putWord(op + OP_CALLBACK, 0)
+        g_task_return_error(task, e)
+    } else {
+        g_task_return_int(task, @intCast(i64, m.getWord(op + OP_DONE)))
+    }
     g_object_unref(task)
 }
 
