@@ -1,0 +1,557 @@
+// soup-logger.h: SoupLogger, the session feature that writes out what a
+// session sends and receives, line by line as libsoup writes it: each
+// message's request line, "Soup-Debug" lines naming the session, the
+// message and the socket (with ids the logger gives each object, counted
+// per class), its headers (a Basic password masked), its body (up to
+// "max-body-size" bytes, "[...]" past it); then the response's status line,
+// headers and body. Lines go to the printer, or to stdout as "> line" and
+// "< line".
+//
+// The request body is given to the logger as it is written (io.mlx calls
+// __mlx_soup_logger_log_request_data); the response's as it is read, the
+// logger wrapping the body stream (bodystream.mlx's tap) at the body data
+// stage. As in libsoup, which level the response body is kept at is asked
+// of the request filter (with the response filter's data).
+//
+// The logger's private data is a pointer to a record:
+//   0 the quark of the ids' data       8 the ids by class (a GHashTable)
+//  16 the request bodies by message   24 the response bodies (GStrings)
+//  32 the session                     40 the level, 44 max-body-size
+//  48 the request filter, 56 its data, 64 its destroy notify
+//  72 the response filter, 80 its data, 88 its destroy notify
+//  96 the printer, 104 its data, 112 its destroy notify
+// 120 a mutex
+const m = @import("../glib/memory.mlx")
+const g = @import("./g.mlx")
+const c = @import("./common.mlx")
+const message = @import("./message.mlx")
+const feature = @import("./feature.mlx")
+const enumtypes = @import("./enumtypes.mlx")
+const bodystream = @import("./bodystream.mlx")
+const conn = @import("./conn.mlx")
+
+extern("c") fn g_quark_from_string(text: usize) -> u32
+extern("c") fn g_object_get_qdata(object: usize, quark: u32) -> usize
+extern("c") fn g_object_set_qdata(object: usize, quark: u32, data: usize) -> void
+extern("c") fn g_type_name_from_instance(instance: usize) -> usize
+extern("c") fn g_hash_table_new(hash: usize, equal: usize) -> usize
+extern("c") fn g_hash_table_steal_extended(table: usize, key: usize, keyOut: usize, valueOut: usize) -> i32
+extern("c") fn g_signal_handlers_disconnect_matched(instance: usize, mask: i32, id: u32, detail: u32, closure: usize, func: usize, data: usize) -> u32
+extern("c") fn g_mutex_lock(mutex: usize) -> void
+extern("c") fn g_mutex_unlock(mutex: usize) -> void
+extern("c") fn g_free(address: usize) -> void
+extern("c") fn printf(format: usize, direction: i32, line: usize) -> i32
+extern("c") fn time(at: usize) -> i64
+extern("c") fn soup_message_get_reason_phrase(msg: usize) -> usize
+extern("c") fn soup_message_headers_get_expectations(hdrs: usize) -> u32
+extern("c") fn soup_message_headers_iter_init(iter: usize, hdrs: usize) -> void
+extern("c") fn soup_message_headers_iter_next(iter: usize, name: usize, value: usize) -> i32
+
+const R_TAG: usize = 0
+const R_IDS: usize = 8
+const R_REQUEST_BODIES: usize = 16
+const R_RESPONSE_BODIES: usize = 24
+const R_SESSION: usize = 32
+const R_LEVEL: usize = 40
+const R_MAX_BODY: usize = 44
+const R_REQUEST_FILTER: usize = 48
+const R_RESPONSE_FILTER: usize = 72
+const R_PRINTER: usize = 96
+const R_MUTEX: usize = 120
+const R_SIZE: usize = 128
+
+// SoupLoggerLogLevel.
+const NONE: i32 = 0
+const MINIMAL: i32 = 1
+const HEADERS: i32 = 2
+const BODY: i32 = 3
+
+// G_SIGNAL_MATCH_FUNC | G_SIGNAL_MATCH_DATA, and the data alone.
+const MATCH_FUNC_DATA: i32 = 24
+const MATCH_DATA: i32 = 16
+
+pub const FilterFn = fn(usize, usize, usize) -> i32
+pub const PrinterFn = fn(usize, i32, i32, usize, usize) -> void
+pub const NotifyFn = fn(usize) -> void
+
+var loggerType: usize = 0
+var privateOffset: i32 = 0
+
+pub fn loggerTypeGet() -> usize {
+    if c.onceEnter(&loggerType) {
+        const t = c.defineType(c.T_OBJECT, "SoupLogger", 136, @intFromPtr(__mlx_soup_logger_class_init), 24, @intFromPtr(__mlx_soup_logger_init), c.FINAL)
+        privateOffset = c.addPrivate(t, 8)
+        feature.implementFeature(t, @intFromPtr(__mlx_soup_logger_feature_init))
+        c.onceLeave(&loggerType, t)
+    }
+    return loggerType
+}
+
+export fn soup_logger_get_type() -> usize { return loggerTypeGet() }
+
+fn priv(logger: usize) -> usize { return m.getWord(c.privateAt(logger, privateOffset)) }
+
+export fn __mlx_soup_logger_init(logger: usize, class: usize) -> void {
+    const p = m.alloc(R_SIZE)
+    m.putWord(c.privateAt(logger, privateOffset), p)
+    // The ids are the object's data under a quark of the logger's own.
+    var t = m.text()
+    m.pushText(&t, "SoupLogger-")
+    pushPointer(&t, logger)
+    const id = m.finish(&t)
+    m.put32(p + R_TAG, g_quark_from_string(id))
+    m.release(id)
+    m.putWord(p + R_IDS, g_hash_table_new(0, 0))
+    m.putWord(p + R_REQUEST_BODIES, g.g_hash_table_new_full(0, 0, 0, @intFromPtr(__mlx_soup_logger_body_free)))
+    m.putWord(p + R_RESPONSE_BODIES, g.g_hash_table_new_full(0, 0, 0, @intFromPtr(__mlx_soup_logger_body_free)))
+}
+
+export fn __mlx_soup_logger_body_free(body: usize) -> void { _ = g.g_string_free(body, 1) }
+
+fn notify(p: usize, at: usize) -> void {
+    const f = m.getWord(p + at + 16)
+    if f == 0 { return }
+    const call: NotifyFn = unsafe { @ptrFromInt(NotifyFn, f) }
+    call(m.getWord(p + at + 8))
+}
+
+export fn __mlx_soup_logger_finalize(logger: usize) -> void {
+    const p = priv(logger)
+    g.g_hash_table_destroy(m.getWord(p + R_IDS))
+    g.g_hash_table_destroy(m.getWord(p + R_REQUEST_BODIES))
+    g.g_hash_table_destroy(m.getWord(p + R_RESPONSE_BODIES))
+    notify(p, R_REQUEST_FILTER)
+    notify(p, R_RESPONSE_FILTER)
+    notify(p, R_PRINTER)
+    m.release(p)
+    c.chainUp(g.g_type_class_ref(loggerTypeGet()), 48, logger)
+}
+
+export fn __mlx_soup_logger_set_property(logger: usize, id: u32, value: usize, pspec: usize) -> void {
+    const p = priv(logger)
+    if id == 1 { m.putI32(p + R_LEVEL, g.g_value_get_enum(value)) }
+    if id == 2 { m.putI32(p + R_MAX_BODY, g.g_value_get_int(value)) }
+}
+
+export fn __mlx_soup_logger_get_property(logger: usize, id: u32, value: usize, pspec: usize) -> void {
+    const p = priv(logger)
+    if id == 1 { g.g_value_set_enum(value, m.getI32(p + R_LEVEL)) }
+    if id == 2 { g.g_value_set_int(value, m.getI32(p + R_MAX_BODY)) }
+}
+
+export fn __mlx_soup_logger_class_init(class: usize, data: usize) -> void {
+    c.adjustPrivate(class, &privateOffset)
+    m.putWord(class + 24, @intFromPtr(__mlx_soup_logger_set_property))
+    m.putWord(class + 32, @intFromPtr(__mlx_soup_logger_get_property))
+    m.putWord(class + 48, @intFromPtr(__mlx_soup_logger_finalize))
+    _ = c.enumProperty(class, 1, "level", enumtypes.loggerLogLevelTypeGet(), MINIMAL, c.READWRITE)
+    _ = c.intProperty(class, 2, "max-body-size", -1, 2147483647, -1, c.READWRITE | c.CONSTRUCT)
+}
+
+export fn soup_logger_new(level: i32) -> usize {
+    const logger = g.g_object_new(loggerTypeGet(), 0)
+    m.putI32(priv(logger) + R_LEVEL, level)
+    return logger
+}
+
+fn setCallback(logger: usize, at: usize, f: usize, data: usize, destroy: usize) -> void {
+    const p = priv(logger)
+    m.putWord(p + at, f)
+    m.putWord(p + at + 8, data)
+    m.putWord(p + at + 16, destroy)
+}
+
+export fn soup_logger_set_request_filter(logger: usize, f: usize, data: usize, destroy: usize) -> void { setCallback(logger, R_REQUEST_FILTER, f, data, destroy) }
+export fn soup_logger_set_response_filter(logger: usize, f: usize, data: usize, destroy: usize) -> void { setCallback(logger, R_RESPONSE_FILTER, f, data, destroy) }
+export fn soup_logger_set_printer(logger: usize, f: usize, data: usize, destroy: usize) -> void { setCallback(logger, R_PRINTER, f, data, destroy) }
+export fn soup_logger_set_max_body_size(logger: usize, size: i32) -> void { m.putI32(priv(logger) + R_MAX_BODY, size) }
+export fn soup_logger_get_max_body_size(logger: usize) -> i32 { return m.getI32(priv(logger) + R_MAX_BODY) }
+
+// The level for `msg`: the filter's at `at` (called with the data at
+// `dataAt`), or the logger's.
+fn levelFor(logger: usize, msg: usize, at: usize, dataAt: usize) -> i32 {
+    const p = priv(logger)
+    const f = m.getWord(p + at)
+    if f == 0 { return m.getI32(p + R_LEVEL) }
+    const call: FilterFn = unsafe { @ptrFromInt(FilterFn, f) }
+    return call(logger, msg, m.getWord(p + dataAt + 8))
+}
+
+// ---------------------------------------------------------------------------
+// Bodies
+
+fn writeBody(logger: usize, data: usize, length: usize, msg: usize, at: usize) -> void {
+    if length == 0 { return }
+    const p = priv(logger)
+    const table = m.getWord(p + at)
+    g_mutex_lock(p + R_MUTEX)
+    var body = g.g_hash_table_lookup(table, msg)
+    if body == 0 {
+        body = g.g_string_new(0)
+        _ = g.g_hash_table_insert(table, msg, body)
+    }
+    g_mutex_unlock(p + R_MUTEX)
+    const limit = m.getI32(p + R_MAX_BODY)
+    if limit >= 0 {
+        const used = m.getWord(body + 8)
+        // Longer than the limit: "[...]" was written.
+        if used > @intCast(usize, limit) { return }
+        const cap = @intCast(usize, limit) - used
+        if cap > 0 { _ = g.g_string_append_len(body, data, @intCast(i64, if length < cap { length } else { cap })) }
+        if length > cap { _ = g.g_string_append_len(body, m.literal("\n[...]"), 6) }
+    } else {
+        _ = g.g_string_append_len(body, data, @intCast(i64, length))
+    }
+}
+
+export fn __mlx_soup_logger_log_request_data(logger: usize, msg: usize, data: usize, length: usize) -> void { writeBody(logger, data, length, msg, R_REQUEST_BODIES) }
+
+export fn __mlx_soup_logger_read_data(logger: usize, msg: usize, data: usize, length: usize) -> void { writeBody(logger, data, length, msg, R_RESPONSE_BODIES) }
+
+export fn __mlx_soup_logger_wrap_input(logger: usize, base: usize, msg: usize) -> usize {
+    if levelFor(logger, msg, R_REQUEST_FILTER, R_RESPONSE_FILTER) < BODY { return 0 }
+    return bodystream.newTap(base, msg, @intFromPtr(__mlx_soup_logger_read_data), logger)
+}
+
+// The body kept for `msg` in the table at `at`, taken out of it (0: none).
+fn takeBody(logger: usize, msg: usize, at: usize) -> usize {
+    const cell = m.alloc(8)
+    var body: usize = 0
+    if g_hash_table_steal_extended(m.getWord(priv(logger) + at), msg, 0, cell) != 0 { body = m.getWord(cell) }
+    m.release(cell)
+    return body
+}
+
+// ---------------------------------------------------------------------------
+// Ids
+
+fn idOf(logger: usize, object: usize) -> u32 { return @intCast(u32, g_object_get_qdata(object, m.get32(priv(logger) + R_TAG)) & 0xffffffff) }
+
+fn setId(logger: usize, object: usize) -> u32 {
+    const p = priv(logger)
+    const class = m.getWord(object)
+    g_mutex_lock(p + R_MUTEX)
+    const id = g.g_hash_table_lookup(m.getWord(p + R_IDS), class) + 1
+    _ = g.g_hash_table_insert(m.getWord(p + R_IDS), class, id)
+    g_mutex_unlock(p + R_MUTEX)
+    g_object_set_qdata(object, m.get32(p + R_TAG), id)
+    return @intCast(u32, id & 0xffffffff)
+}
+
+// ---------------------------------------------------------------------------
+// Printing
+
+// "%p": 0x and the address in hex, "(nil)" for 0.
+fn pushPointer(t: *m.Text, address: usize) -> void {
+    if address == 0 {
+        m.pushText(t, "(nil)")
+        return
+    }
+    m.pushText(t, "0x")
+    var digits: [16]u8 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    var count: usize = 0
+    var rest = address
+    while rest != 0 {
+        const digit = @intCast(u8, rest % 16)
+        digits[count] = if digit < 10 { 48 + digit } else { 87 + digit }
+        count += 1
+        rest = rest / 16
+    }
+    while count > 0 {
+        count -= 1
+        m.pushByte(t, digits[count])
+    }
+}
+
+fn pushVersion(t: *m.Text, msg: usize) -> void {
+    const version = message.httpVersion(msg)
+    if version == 0 {
+        m.pushText(t, "1.0")
+    } else if version == 1 {
+        m.pushText(t, "1.1")
+    } else {
+        m.pushText(t, "2")
+    }
+}
+
+// A type's name, an id and the address: "SoupMessage 1 (0x...)".
+fn pushObject(t: *m.Text, logger: usize, object: usize) -> void {
+    m.pushC(t, g_type_name_from_instance(object))
+    m.pushByte(t, 32)
+    m.pushDecimal(t, @intCast(u64, idOf(logger, object)))
+    m.pushText(t, " (")
+    pushPointer(t, object)
+    m.pushByte(t, 41)
+}
+
+// Gives the text's lines to the printer (or stdout): up to the last line
+// end when the text ends with one, an empty first line kept.
+fn output(logger: usize, level: i32, direction: u8, t: *m.Text) -> void {
+    const data = m.finish(t)
+    const p = priv(logger)
+    var line = data
+    while true {
+        var end = line
+        while m.get8(end) != 0 && m.get8(end) != 10 { end += 1 }
+        const more = m.get8(end) == 10
+        if more { m.put8(end, 0) }
+        const printer = m.getWord(p + R_PRINTER)
+        if printer != 0 {
+            const call: PrinterFn = unsafe { @ptrFromInt(PrinterFn, printer) }
+            call(logger, level, @intCast(i32, direction), line, m.getWord(p + R_PRINTER + 8))
+        } else {
+            _ = printf(m.literal("%c %s\n"), @intCast(i32, direction), line)
+        }
+        if !more { break }
+        line = end + 1
+        if m.get8(line) == 0 { break }
+    }
+    m.release(data)
+}
+
+fn printText(logger: usize, level: i32, direction: u8, text: []const u8) -> void {
+    var t = m.text()
+    m.pushText(&t, text)
+    output(logger, level, direction, &t)
+}
+
+fn printTimestamp(logger: usize, direction: u8) -> void {
+    var t = m.text()
+    m.pushText(&t, "Soup-Debug-Timestamp: ")
+    m.pushDecimal(&t, @intCast(u64, time(0)))
+    output(logger, MINIMAL, direction, &t)
+}
+
+// The bytes as ISO-8859-1 in UTF-8.
+fn latin1(data: usize, length: usize, out: *usize) -> usize {
+    var t = m.text()
+    var index: usize = 0
+    while index < length {
+        const b = m.get8(data + index)
+        if b < 128 {
+            m.pushByte(&t, b)
+        } else {
+            m.pushByte(&t, 192 | (b >> 6))
+            m.pushByte(&t, 128 | (b & 63))
+        }
+        index += 1
+    }
+    out.* = t.length
+    return m.finish(&t)
+}
+
+// "Authorization: Basic [user:****]": the password masked.
+fn printBasicAuth(logger: usize, value: usize) -> void {
+    const lengthCell = m.alloc(8)
+    var decoded = g.g_base64_decode(value + 6, lengthCell)
+    var length = m.getWord(lengthCell)
+    m.release(lengthCell)
+    var own = false
+    if decoded != 0 && g.g_utf8_validate(decoded, -1, 0) == 0 {
+        var converted: usize = 0
+        const utf8 = latin1(decoded, length, &converted)
+        g_free(decoded)
+        decoded = utf8
+        length = converted
+        own = true
+    }
+    var t = m.text()
+    m.pushText(&t, "Authorization: Basic [")
+    var index: usize = 0
+    var masking = false
+    while index < length && m.get8(decoded + index) != 0 {
+        m.pushByte(&t, if masking { 42 } else { m.get8(decoded + index) })
+        if m.get8(decoded + index) == 58 { masking = true }
+        index += 1
+    }
+    m.pushByte(&t, 93)
+    if own { m.release(decoded) } else { g_free(decoded) }
+    output(logger, HEADERS, 62, &t)
+}
+
+fn printHeaders(logger: usize, hdrs: usize, direction: u8, request: bool) -> void {
+    const iter = m.alloc(32)
+    const cells = m.alloc(16)
+    soup_message_headers_iter_init(iter, hdrs)
+    while soup_message_headers_iter_next(iter, cells, cells + 8) != 0 {
+        const name = m.getWord(cells)
+        const value = m.getWord(cells + 8)
+        if request && c.equalsIgnoringCase(m.cSlice(name), "Authorization") && m.cLength(value) >= 6 && c.equalsIgnoringCase(m.bytes(value, 6), "Basic ") {
+            printBasicAuth(logger, value)
+        } else {
+            var t = m.text()
+            m.pushC(&t, name)
+            m.pushText(&t, ": ")
+            m.pushC(&t, value)
+            output(logger, HEADERS, direction, &t)
+        }
+    }
+    m.release(cells)
+    m.release(iter)
+}
+
+fn printBody(logger: usize, direction: u8, body: usize) -> void {
+    var t = m.text()
+    m.pushByte(&t, 10)
+    m.pushBytes(&t, m.getWord(body), m.getWord(body + 8))
+    output(logger, BODY, direction, &t)
+    _ = g.g_string_free(body, 1)
+}
+
+fn printRequest(logger: usize, msg: usize, socket: usize, restarted: bool) -> void {
+    const p = priv(logger)
+    const level = levelFor(logger, msg, R_REQUEST_FILTER, R_REQUEST_FILTER)
+    if level == NONE { return }
+    const u = message.uri(msg)
+    var t = m.text()
+    if message.methodIs(msg, "CONNECT") {
+        m.pushText(&t, "CONNECT ")
+        m.pushC(&t, g.g_uri_get_host(u))
+        m.pushByte(&t, 58)
+        m.pushDecimal(&t, @intCast(u64, @bitCast(u32, g.g_uri_get_port(u))))
+    } else {
+        m.pushC(&t, message.method(msg))
+        m.pushByte(&t, 32)
+        m.pushC(&t, g.g_uri_get_path(u))
+        const query = g.g_uri_get_query(u)
+        if query != 0 {
+            m.pushByte(&t, 63)
+            m.pushC(&t, query)
+        }
+    }
+    m.pushText(&t, " HTTP/")
+    pushVersion(&t, msg)
+    output(logger, MINIMAL, 62, &t)
+    printTimestamp(logger, 62)
+    t = m.text()
+    m.pushText(&t, "Soup-Debug: ")
+    pushObject(&t, logger, m.getWord(p + R_SESSION))
+    m.pushText(&t, ", ")
+    pushObject(&t, logger, msg)
+    m.pushText(&t, ", ")
+    if socket != 0 { pushObject(&t, logger, socket) } else { m.pushText(&t, "cached") }
+    if restarted { m.pushText(&t, ", restarted") }
+    output(logger, MINIMAL, 62, &t)
+    if level == MINIMAL { return }
+    printHeaders(logger, message.requestHeaders(msg), 62, true)
+    if level == HEADERS { return }
+    // With "Expect: 100-continue" the body is logged after the 100.
+    if soup_message_headers_get_expectations(message.requestHeaders(msg)) == 2 { return }
+    const body = takeBody(logger, msg, R_REQUEST_BODIES)
+    if body == 0 { return }
+    printBody(logger, 62, body)
+}
+
+fn printResponse(logger: usize, msg: usize) -> void {
+    const level = levelFor(logger, msg, R_RESPONSE_FILTER, R_RESPONSE_FILTER)
+    if level == NONE { return }
+    var t = m.text()
+    m.pushText(&t, "HTTP/")
+    pushVersion(&t, msg)
+    m.pushByte(&t, 32)
+    m.pushDecimal(&t, @intCast(u64, message.statusOf(msg)))
+    m.pushByte(&t, 32)
+    const reason = soup_message_get_reason_phrase(msg)
+    if reason != 0 { m.pushC(&t, reason) } else { m.pushText(&t, "(null)") }
+    m.pushByte(&t, 10)
+    output(logger, MINIMAL, 60, &t)
+    printTimestamp(logger, 60)
+    t = m.text()
+    m.pushText(&t, "Soup-Debug: ")
+    pushObject(&t, logger, msg)
+    output(logger, MINIMAL, 60, &t)
+    if level == MINIMAL { return }
+    printHeaders(logger, message.responseHeaders(msg), 60, false)
+    if level == HEADERS { return }
+    const body = takeBody(logger, msg, R_RESPONSE_BODIES)
+    if body == 0 { return }
+    printBody(logger, 60, body)
+}
+
+// ---------------------------------------------------------------------------
+// The message's signals
+
+export fn __mlx_soup_logger_finished(msg: usize, logger: usize) -> void {
+    // A message whose request was not logged (a preconnection): nothing.
+    if idOf(logger, msg) == 0 { return }
+    const p = priv(logger)
+    g_mutex_lock(p + R_MUTEX)
+    printResponse(logger, msg)
+    printText(logger, MINIMAL, 32, "\n")
+    g_mutex_unlock(p + R_MUTEX)
+}
+
+export fn __mlx_soup_logger_got_informational(msg: usize, logger: usize) -> void {
+    const p = priv(logger)
+    g_mutex_lock(p + R_MUTEX)
+    const level = levelFor(logger, msg, R_RESPONSE_FILTER, R_RESPONSE_FILTER)
+    _ = g_signal_handlers_disconnect_matched(msg, MATCH_FUNC_DATA, 0, 0, 0, @intFromPtr(__mlx_soup_logger_finished), logger)
+    printResponse(logger, msg)
+    printText(logger, MINIMAL, 32, "\n")
+    // As libsoup does, the body looked for here is the response's.
+    const body = takeBody(logger, msg, R_RESPONSE_BODIES)
+    if body == 0 {
+        g_mutex_unlock(p + R_MUTEX)
+        return
+    }
+    if message.statusOf(msg) == 100 {
+        printText(logger, MINIMAL, 62, "[Now sending request body...]")
+        if level == BODY {
+            var t = m.text()
+            m.pushBytes(&t, m.getWord(body), m.getWord(body + 8))
+            output(logger, BODY, 62, &t)
+        }
+        printText(logger, MINIMAL, 32, "\n")
+    }
+    _ = g.g_string_free(body, 1)
+    g_mutex_unlock(p + R_MUTEX)
+}
+
+export fn __mlx_soup_logger_got_body(msg: usize, logger: usize) -> void {
+    const p = priv(logger)
+    g_mutex_lock(p + R_MUTEX)
+    _ = g_signal_handlers_disconnect_matched(msg, MATCH_FUNC_DATA, 0, 0, 0, @intFromPtr(__mlx_soup_logger_finished), logger)
+    printResponse(logger, msg)
+    printText(logger, MINIMAL, 32, "\n")
+    g_mutex_unlock(p + R_MUTEX)
+}
+
+export fn __mlx_soup_logger_wrote_body(msg: usize, logger: usize) -> void {
+    const p = priv(logger)
+    var restarted = true
+    if idOf(logger, msg) == 0 {
+        _ = setId(logger, msg)
+        restarted = false
+    }
+    const session = m.getWord(p + R_SESSION)
+    if idOf(logger, session) == 0 { _ = setId(logger, session) }
+    var socket: usize = 0
+    const connection = message.connection(msg)
+    if connection != 0 { socket = conn.socket(connection) }
+    if socket != 0 && idOf(logger, socket) == 0 { _ = setId(logger, socket) }
+    g_mutex_lock(p + R_MUTEX)
+    printRequest(logger, msg, socket, restarted)
+    printText(logger, MINIMAL, 32, "\n")
+    g_mutex_unlock(p + R_MUTEX)
+}
+
+fn connect(msg: usize, name: []const u8, handler: usize, logger: usize) -> void { _ = g.g_signal_connect_data(msg, m.literal(name), handler, logger, 0, 0) }
+
+export fn __mlx_soup_logger_request_queued(logger: usize, msg: usize) -> void {
+    connect(msg, "wrote-body", @intFromPtr(__mlx_soup_logger_wrote_body), logger)
+    connect(msg, "got-informational", @intFromPtr(__mlx_soup_logger_got_informational), logger)
+    connect(msg, "got-body", @intFromPtr(__mlx_soup_logger_got_body), logger)
+    connect(msg, "finished", @intFromPtr(__mlx_soup_logger_finished), logger)
+}
+
+export fn __mlx_soup_logger_request_unqueued(logger: usize, msg: usize) -> void { _ = g_signal_handlers_disconnect_matched(msg, MATCH_DATA, 0, 0, 0, 0, logger) }
+
+export fn __mlx_soup_logger_attach(logger: usize, session: usize) -> void { m.putWord(priv(logger) + R_SESSION, session) }
+
+export fn __mlx_soup_logger_feature_init(iface: usize, data: usize) -> void {
+    m.putWord(iface + feature.ATTACH, @intFromPtr(__mlx_soup_logger_attach))
+    m.putWord(iface + feature.REQUEST_QUEUED, @intFromPtr(__mlx_soup_logger_request_queued))
+    m.putWord(iface + feature.REQUEST_UNQUEUED, @intFromPtr(__mlx_soup_logger_request_unqueued))
+    m.putWord(iface + feature.WRAP_INPUT, @intFromPtr(__mlx_soup_logger_wrap_input))
+    m.putWord(iface + feature.STAGE, feature.STAGE_BODY_DATA)
+}

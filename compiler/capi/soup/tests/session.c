@@ -471,6 +471,66 @@ static void reuse (SoupSession *session)
     g_free (u);
 }
 
+/* The logger's lines, with the addresses and times that vary left out. */
+static void print_log (SoupLogger *logger, SoupLoggerLogLevel level, char direction, const char *data, gpointer user_data)
+{
+    GString *line = g_string_new (NULL);
+    const char *p = data;
+    if (g_str_has_prefix (data, "Soup-Debug-Timestamp: ")) {
+        printf ("  log %d %c Soup-Debug-Timestamp: T\n", level, direction);
+        g_string_free (line, TRUE);
+        return;
+    }
+    if (g_str_has_prefix (data, "Host: 127.0.0.1:")) {
+        printf ("  log %d %c Host: 127.0.0.1:PORT\n", level, direction);
+        g_string_free (line, TRUE);
+        return;
+    }
+    while (*p) {
+        if (p[0] == '0' && p[1] == 'x') {
+            g_string_append (line, "P");
+            p += 2;
+            while (g_ascii_isxdigit (*p)) p++;
+        } else {
+            g_string_append_c (line, *p++);
+        }
+    }
+    printf ("  log %d %c %s\n", level, direction, line->str);
+    g_string_free (line, TRUE);
+}
+
+static SoupLoggerLogLevel only_headers (SoupLogger *logger, SoupMessage *msg, gpointer data)
+{
+    return strstr (g_uri_get_path (soup_message_get_uri (msg)), "chunked") ? SOUP_LOGGER_LOG_HEADERS : SOUP_LOGGER_LOG_BODY;
+}
+
+static void logged (SoupSession *session)
+{
+    SoupLogger *logger = soup_logger_new (SOUP_LOGGER_LOG_BODY);
+    int level = -1, size = 0;
+
+    g_object_get (logger, "level", &level, "max-body-size", &size, NULL);
+    printf ("logger level %d, max body %d %d\n", level, size, soup_logger_get_max_body_size (logger));
+    soup_logger_set_printer (logger, print_log, NULL, NULL);
+    soup_session_add_feature (session, SOUP_SESSION_FEATURE (logger));
+    sync_get (session, "/plain");
+    post (session, "/echo", "a logged body", FALSE);
+    post (session, "/echo", "a logged chunked body", TRUE);
+    auth_get (session, "/basic");
+    async_get (session, "/gzip");
+    soup_logger_set_max_body_size (logger, 5);
+    sync_get (session, "/plain");
+    soup_logger_set_request_filter (logger, only_headers, NULL, NULL);
+    soup_logger_set_response_filter (logger, only_headers, NULL, NULL);
+    sync_get (session, "/chunked");
+    g_object_set (logger, "level", SOUP_LOGGER_LOG_MINIMAL, NULL);
+    soup_logger_set_request_filter (logger, NULL, NULL, NULL);
+    soup_logger_set_response_filter (logger, NULL, NULL, NULL);
+    sync_get (session, "/plain");
+    soup_session_remove_feature (session, SOUP_SESSION_FEATURE (logger));
+    g_object_unref (logger);
+}
+
 int main (void)
 {
     pid_t child;
@@ -549,6 +609,8 @@ int main (void)
     printf ("new message for bad URI: %p\n", (void *) soup_message_new ("GET", "not a uri"));
     printf ("new message for ftp: %d\n", soup_message_new ("GET", "ftp://host/") != NULL);
     g_free (u);
+
+    logged (session);
 
     sync_get (session, "/stats");
     sync_get (session, "/quit");
