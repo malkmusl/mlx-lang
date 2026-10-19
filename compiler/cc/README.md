@@ -745,6 +745,8 @@ standard library is mlxlibcpp (`compiler/libcpp`: `<string>`,
 `<chrono>`, `<thread>`, `<condition_variable>`, `<iomanip>`,
 `<version>`, `<filesystem>` (over POSIX calls, with `std::u8string`
 in `<string>`; `tests/cpp/filesystem.cpp`, `tests/cpp/threads.cpp`),
+`<random>` (the standard's engines, and distributions and `shuffle`
+drawing as libstdc++'s do: `tests/cpp/random.cpp`),
 the `c*` headers, `<ranges>` with the range concepts and
 the whole-range algorithms, and `<compare>` as a stub, under
 `include/c++`), linked
