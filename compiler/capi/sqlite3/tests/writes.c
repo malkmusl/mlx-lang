@@ -1,6 +1,7 @@
 /* mlx-sqlite3's writes: INSERT (VALUES, SELECT, DEFAULT VALUES, column
    lists, defaults), INSERT OR REPLACE / IGNORE / ABORT / FAIL /
-   ROLLBACK, REPLACE, UPDATE and DELETE; NOT NULL, UNIQUE, PRIMARY KEY
+   ROLLBACK, REPLACE, upserts (ON CONFLICT DO NOTHING / DO UPDATE),
+   UPDATE and DELETE; NOT NULL, UNIQUE, PRIMARY KEY
    and CHECK constraints with their conflict clauses; partial indexes;
    INTEGER PRIMARY KEY and rowids, AUTOINCREMENT and sqlite_sequence;
    foreign keys (with and without PRAGMA foreign_keys, CASCADE, SET
@@ -47,6 +48,33 @@ static const char *updates =
     "DELETE FROM kv WHERE v IS NULL;"
     "SELECT changes(), count(*) FROM kv;"
     "UPDATE kv SET k = 'a' WHERE k = 'c';";
+
+static const char *upserts =
+    "CREATE TABLE up(k TEXT PRIMARY KEY, v INTEGER, hits INTEGER DEFAULT 0, u TEXT UNIQUE);"
+    "INSERT INTO up(k, v, u) VALUES ('a', 1, 'ua'), ('b', 2, 'ub');"
+    "INSERT INTO up(k, v) VALUES ('a', 10) ON CONFLICT(k) DO UPDATE SET v = excluded.v, hits = hits + 1;"
+    "INSERT INTO up(k, v) VALUES ('b', 20) ON CONFLICT DO NOTHING;"
+    "INSERT INTO up(k, v) VALUES ('c', 30) ON CONFLICT(k) DO UPDATE SET hits = hits + 1;"
+    "INSERT INTO up(k, v) VALUES ('c', 31) ON CONFLICT(k) DO UPDATE SET hits = hits + 1 WHERE excluded.v > 100;"
+    "INSERT INTO up(k, v) VALUES ('c', 131), ('d', 4), ('c', 132) ON CONFLICT(k) DO UPDATE SET hits = hits + 1, v = up.v + excluded.v WHERE excluded.v > 100;"
+    "SELECT changes();"
+    "INSERT INTO up(k, v, u) VALUES ('z', 0, 'ua') ON CONFLICT(u) DO UPDATE SET hits = 100 ON CONFLICT(k) DO NOTHING;"
+    "INSERT INTO up(k, v, u) VALUES ('a', 0, 'new') ON CONFLICT(u) DO UPDATE SET hits = 200 ON CONFLICT(k) DO NOTHING;"
+    "SELECT * FROM up ORDER BY k;"
+    "CREATE TABLE ur(id INTEGER PRIMARY KEY, n);"
+    "INSERT INTO ur VALUES (1, 'x');"
+    "INSERT INTO ur VALUES (1, 'y') ON CONFLICT(id) DO UPDATE SET n = n || excluded.n;"
+    "INSERT INTO ur VALUES (1, 'z') ON CONFLICT DO UPDATE SET id = 5;"
+    "SELECT * FROM ur;"
+    "INSERT INTO up VALUES ('a', 1, 1, NULL) ON CONFLICT(k) DO UPDATE SET k = 'b';";
+
+static const char *upsert_errors[] = {
+    "INSERT INTO up(k, v) VALUES ('a', 1) ON CONFLICT(v) DO NOTHING;",
+    "INSERT INTO up(k, v) VALUES ('a', 1) ON CONFLICT(nosuch) DO NOTHING;",
+    "INSERT INTO up(k, v) VALUES ('a', 1) ON CONFLICT DO NOTHING ON CONFLICT(k) DO NOTHING;",
+    "INSERT INTO up(k, v) VALUES ('a', 1) ON CONFLICT(k) DO UPDATE SET nosuch = 1;",
+    NULL,
+};
 
 static const char *rowids =
     "CREATE TABLE r(a, b);"
@@ -245,6 +273,9 @@ int main(void)
     run(db, conflicts);
     run(db, more);
     run(db, updates);
+    run(db, upserts);
+    for (int i = 0; upsert_errors[i]; i++)
+        run(db, upsert_errors[i]);
     run(db, rowids);
     run(db, rowid_errors);
     run(db, foreign);

@@ -46,7 +46,8 @@ of it; there is no header written by hand.
 - **SQL**: SELECT (joins, LEFT JOIN, subqueries in every place, compound
   SELECTs, GROUP BY, HAVING, DISTINCT, ORDER BY with collations and NULLS
   FIRST/LAST, LIMIT/OFFSET, table-valued pragma functions), INSERT
-  (VALUES, SELECT, DEFAULT VALUES, OR conflict resolutions), REPLACE,
+  (VALUES, SELECT, DEFAULT VALUES, OR conflict resolutions, upserts:
+  ON CONFLICT DO NOTHING and DO UPDATE), REPLACE,
   UPDATE, DELETE; NOT NULL, UNIQUE, PRIMARY KEY, CHECK and FOREIGN KEY
   constraints (CASCADE, SET NULL, SET DEFAULT, RESTRICT) with their
   conflict clauses; INTEGER PRIMARY KEY and AUTOINCREMENT; partial
@@ -65,7 +66,7 @@ of it; there is no header written by hand.
   (SELECT, READ, FUNCTION, the DDL's statements over sqlite_master).
 
 What it does not do (yet): views and triggers (refused), WITH, window
-functions, upserts and RETURNING, WITHOUT ROWID tables, ATTACH, virtual
+functions, RETURNING, WITHOUT ROWID tables, ATTACH, virtual
 tables (FTS, R-tree), the JSON and math functions, EXPLAIN. A write-ahead
 log: `PRAGMA journal_mode=WAL` answers `wal` but the file keeps a
 rollback journal, and checkpoints have nothing to do. `auto_vacuum` is
