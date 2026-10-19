@@ -62,6 +62,7 @@ sources reach.
 | `resource.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (inflated by std.flate), the registry, static resources |
 | `application.mlx` | `gapplication.h`: application ids and the default application |
 | `dbus.mlx` | `gdbus*.h`: bus addresses, proxies, errors, introspection data; see below |
+| `tls.mlx` | `ginitable.h` and GIO's TLS types (`gtlscertificate.h`, `gtlsbackend.h`, `gtlsconnection.h`, `gtlsclientconnection.h`, `gtlsdatabase.h`, `gtlsfiledatabase.h`, `gtlsinteraction.h`, `gtlspassword.h`): what libsoup's headers and WebKit's network code name; see below |
 | `tests/` | C programs built by mlx-cc against the library, each with the output GLib 2.80 gives (`NAME.expected`, the exit status last); `tests/wtf/` the WPE configuration and the WTF sources compiled by the check |
 
 ## Tests
@@ -75,9 +76,12 @@ sources reach.
 - runs `tests/strings.c`, `mainloop.c`, `variant.c`, `uri.c`,
   `gobject.c`, `system.c`, `gio.c`, `collect.c` (G_DECLARE_FINAL_TYPE,
   G_VALUE_COLLECT_INIT and G_VALUE_LCOPY, g_alloca), `options.c`
-  (GOption, gettext) and `network.c` (addresses, a service, a client,
-  their errors) and compares what they print with what the same programs
-  print on GLib 2.80;
+  (GOption, gettext), `network.c` (addresses, a service, a client,
+  their errors) and `tls.c` (certificates from PEM and DER as WebKit
+  makes and copies them, chains, keys, passwords; a backend without TLS)
+  and compares what they print with what the same programs print on GLib
+  2.80 (`tls.c`'s certificates with GLib's GnuTLS backend, its backend
+  part with none, `GIO_USE_TLS=dummy`);
 - compiles WTF's GLib-based sources for WPE (`tests/wtf/files.txt`: the
   14 of `wtf/glib`, `MainThreadGeneric.cpp`, `WorkQueueGeneric.cpp` and
   those of `unix/`, `linux/`, `posix/`) with mlx-cc on these headers and
@@ -115,13 +119,31 @@ system without it:
   only its URI (GIO's GDummyFile without a VFS module), and operations on
   it fail with `G_IO_ERROR_NOT_SUPPORTED`. GFileInfo, enumerators and
   streams (GInputStream, GOutputStream, `g_resource_open_stream`) are not
-  here.
+  here (their instance and class structures are, as GIO lays them out, for
+  types declared over them: libsoup's SoupMultipartInputStream).
+- **TLS**: there is no TLS implementation yet (the TLS of the HTTP
+  client libsoup's layer will need). The backend makes certificates as
+  GIO's GnuTLS backend does (`g_tls_certificate_new_from_pem`,
+  `g_initable_new` of its certificate type with `certificate-pem` or
+  `certificate`, `issuer`, `private-key-pem`, `private-key`, the PKCS #11
+  URIs; their PEM and DER read back, compared by `g_tls_certificate_is_same`,
+  a chain from PEM linked where each certificate names the next as its
+  issuer); what needs TLS answers as GIO does without a TLS module:
+  `g_tls_backend_supports_tls` is FALSE, the default database has no
+  certificates, `g_tls_file_database_new` fails with
+  `G_TLS_ERROR_UNAVAILABLE`. Verifying a certificate reports
+  `G_TLS_CERTIFICATE_GENERIC_ERROR`, and the fields read out of its X.509
+  structure (`not-valid-before`, `not-valid-after`, `subject-name`,
+  `issuer-name`, `dns-names`, `ip-addresses`) are NULL.
+  `GTlsConnection`, `GTlsClientConnection`, `GTlsDatabase` and
+  `GTlsInteraction` are types only; `GTlsPassword` is whole.
 - **GVariant**'s text form is printed but not parsed
   (`g_variant_parse`, `g_variant_new_parsed` are not here).
 - **GObject**: class private data (`g_type_add_class_private`) and
   dynamic types (`GTypePlugin`, `GTypeModule`;
   `g_type_register_dynamic` reports a critical and returns 0) are not
-  here. `G_DECLARE_FINAL_TYPE` and `G_DECLARE_DERIVABLE_TYPE` are (as C
+  here. `G_DECLARE_FINAL_TYPE`, `G_DECLARE_DERIVABLE_TYPE` and
+  `G_DECLARE_INTERFACE` are (as C
   the header carries, `c_macros`), the `G_DEFINE_*` macros not yet;
   `g_autoptr` is not (mlx-cc has no cleanup attribute): the cleanup
   functions are declared for code that calls them.

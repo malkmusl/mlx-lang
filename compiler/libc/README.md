@@ -17,7 +17,7 @@ gcc program.c -L mlx-out/libc -lmlxc -Wl,-rpath,$PWD/mlx-out/libc  # next to gli
 
 | Library | What it is | Built from |
 | --- | --- | --- |
-| `libmlxc.so.1` (`libmlxc.so`) | 830 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, dlfcn; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
+| `libmlxc.so.1` (`libmlxc.so`) | 843 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, gettext, iconv, dlfcn; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
 | `libm.so.6` (`libm.so`) | the math functions of `<math.h>`: `std.math`'s sine, cosine (huge arguments reduced with the bits of 2/pi), e^x, logarithms and cube root, with the arc tangent, the inverse and hyperbolic functions, powers (whole exponents to an ulp in double-double arithmetic), `fmod` and `remainder` exact, the rounding functions, `frexp`/`ldexp`, `hypot`, `nextafter`, `erf`/`erfc` (a series in double-double, a continued fraction), `tgamma`/`lgamma` (Lanczos and a rising product), the classification, and the `f` variants; `tools/libm_check.py` compares it with glibc's libm call by call; the 41 `l` (long double) variants (`sinl` to `lgammal`) are x87 code of their own, `tools/libc/x87_long.s`, generated into `x87_long.mlx` by `tools/libc/gen_x87.py` and bound by the loader from a page of its own. Not yet: the Bessel functions, errno | `libm.mlx`, `x87_long.mlx` |
 
 It is a `--plugin` shared object on a stack arena with no C library under
@@ -86,7 +86,21 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
   `read`, `write`, `stat`, `mmap`, `ioctl`, `poll`, `epoll`, sockets,
   `fork`/`exec`/`wait`, ...), `getopt`/`getopt_long`, `dirent`, `uname`,
   `sysconf`, `err`/`warn`, `syslog`, `getpwnam`/`getgrnam` from the files,
-  locale and gettext stubs.
+  locale stubs, gettext (no message catalogs: a message is its own
+  translation, as with GNU gettext when no catalog has it; the text
+  domain and each domain's directory and codeset are kept and answered).
+- **`iconv.mlx`**: `iconv_open`, `iconv`, `iconv_close` as glibc's: the
+  Unicode forms (UTF-8; UTF-16 and UTF-32 with their byte order marks,
+  read and written, and their LE and BE forms; UCS-2, UCS-4, `WCHAR_T`),
+  ISO-8859-1 and US-ASCII by rule, and the single-byte charsets of
+  `std.unicode.charmaps` (ISO-8859-2 to -16, the Windows code pages,
+  KOI8-R and -U, IBM866, the Mac OS ones) by any of glibc's, ICU's or the
+  Encoding Standard's names; `//TRANSLIT` (a few look-alikes, else `?`)
+  and `//IGNORE`. Where glibc leaves a byte of a Windows code page
+  undefined, it reads as the C1 control of that value (the Encoding
+  Standard's tables, as browsers read them); UTF-8 past U+10FFFF is
+  invalid; the East Asian multi-byte charsets are not here (`iconv_open`
+  fails with EINVAL, as for any charset it does not know).
 - **`time.mlx`**: `clock_gettime`, `gmtime`/`localtime` (`std.timezone`),
   `mktime`/`timegm`, `strftime`, `asctime`.
 - **`signal.mlx`**: `sigaction` with a restorer of its own, `signal`,
@@ -126,7 +140,25 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
   (the mapping stays), `dlerror`, `dladdr`, `dlinfo`, `dl_iterate_phdr`
   on the loader's list.
 
+## Headers
+
+mlx-cc's headers (compiler/cc/include) are mlxlibc's for what they
+declare. What mlxlibc added after them has its headers made of Mlx
+modules, as the libraries of compiler/capi have theirs: `api/` declares
+the types and functions C sees, and `mlx-cheaders` writes the headers
+into `mlx-out/include/mlxlibc` (`./mlx build libc-headers`; `-I` that
+directory): `iconv.h` and `libintl.h`.
+
 ## Checks
+
+`tools/check_iconv.sh` runs `tests/iconv.c` (the Unicode forms, byte
+order marks, invalid and incomplete input, a full output, `//TRANSLIT`
+and `//IGNORE`, the names, input in pieces, every byte of the single-byte
+charsets there and back, and gettext's functions) linked against libmlxc
+and against glibc, and built by mlx-cc on the generated headers: all print
+the same, but for the bytes where the Encoding Standard's tables are not
+glibc's (the test names them).
+
 
 `tools/mlxlibc_check.py` calls the same functions through ctypes in
 libmlxc and in glibc and compares the answers (15 800 comparisons: strings,
@@ -172,7 +204,7 @@ address 8, `abort()`) is reported with its functions and kept in
 - `error()` is exported as `__mlx_error` (`error` is a keyword of Mlx); the
   loader binds the name `error` to it, as it binds `__environ` to `environ`
   and `__progname` to `program_invocation_short_name`.
-- Wide-character stdio, locales beyond "C", `libm` and `iconv` are absent
+- Wide-character stdio and locales beyond "C" are absent
   (so /usr/bin/printf and /bin/ls do not run yet); `dlclose` keeps the
   mapping; a library with initial-exec TLS loaded by dlopen after threads
   started does not reach them.

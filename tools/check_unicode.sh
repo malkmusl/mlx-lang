@@ -11,7 +11,9 @@
 #     and compiler/capi/icu/api/ugenerated.mlx of the UCD (ucd/),
 #     std/src/unicode/locale/data.mlx of CLDR (cldr/),
 #     std/src/unicode/collation/rules.mlx of CLDR's collation data
-#     (cldr/collation/), std/src/timezone/tzdata.mlx of the IANA database;
+#     (cldr/collation/), std/src/unicode/charmaps/tables.mlx of the
+#     single-byte charsets' tables (charsets/), std/src/timezone/tzdata.mlx
+#     of the IANA database;
 #   - std/registry/tz/compare.mlx: every zone's offsets, 1850 to 2100,
 #     against the files zic made of the same database, where the system
 #     has them;
@@ -32,6 +34,15 @@
 #       tests/tailoring.c      collation by locale (CLDR's tailorings) and
 #                              by rules, as ICU 74 sorts the same words
 #       tests/idna.c           every line of IdnaTestV2.txt (UTS #46)
+#       tests/bidi.c           every line of BidiTest.txt and
+#                              BidiCharacterTest.txt (UAX #9): levels and
+#                              visual order
+#       tests/bidirandom.c     random texts of every bidi class through
+#                              ubidi.h: levels, runs, maps, reordered
+#                              text, lines, as ICU 74 reports them
+#       tests/search.c         usearch.h: string search by collation as
+#                              WebKit's find uses it, every attribute,
+#                              random texts, as ICU 74 finds them
 #       tests/calendars.c      the calendars other than the Gregorian:
 #                              their fields over three thousand years,
 #                              add, roll, limits, as ICU 74 has them
@@ -69,6 +80,10 @@ echo "ok   the locale data is what cldr-generate makes of CLDR"
 mlx-out/bin/collation-generate "$work/collationrules.mlx" std/registry/unicode/cldr/collation/radicals.txt std/registry/unicode/cldr/collation/*.xml || fail "collation-generate"
 cmp -s "$work/collationrules.mlx" std/src/unicode/collation/rules.mlx || fail "std/src/unicode/collation/rules.mlx is not what collation-generate makes"
 echo "ok   the collation rules are what collation-generate makes of CLDR"
+
+LC_ALL=C bash -c 'mlx-out/bin/charset-generate "$0" std/registry/unicode/charsets/*.txt std/registry/unicode/charsets/*.TXT' "$work/charmaps.mlx" || fail "charset-generate"
+cmp -s "$work/charmaps.mlx" std/src/unicode/charmaps/tables.mlx || fail "std/src/unicode/charmaps/tables.mlx is not what charset-generate makes"
+echo "ok   the single-byte charsets are what charset-generate makes of their tables"
 
 mlx-out/bin/tz-generate std/registry/tz "$work/timezones.mlx" || fail "tz-generate"
 cmp -s "$work/timezones.mlx" std/src/timezone/tzdata.mlx || fail "std/src/timezone/tzdata.mlx is not what tz-generate makes"
@@ -116,11 +131,15 @@ cc $tests/collation.c -o "$work/collation" || fail "tests/collation.c does not b
 run "$work/collation" > "$work/collation.out" || { cat "$work/collation.out"; fail "the collation tests"; }
 while read -r line; do echo "ok   $line"; done < "$work/collation.out"
 
+cc $tests/bidi.c -o "$work/bidi" || fail "tests/bidi.c does not build"
+run "$work/bidi" > "$work/bidi.out" || { cat "$work/bidi.out"; fail "the bidi tests"; }
+while read -r line; do echo "ok   $line"; done < "$work/bidi.out"
+
 cc $tests/idna.c -o "$work/idna" || fail "tests/idna.c does not build"
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring; do
+for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom search converters; do
     cc "$tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "$tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"

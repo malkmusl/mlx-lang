@@ -1,0 +1,576 @@
+// iconv (iconv.h): converting text between charsets, as glibc's iconv
+// does for the charsets it has here: the Unicode forms (UTF-8; UTF-16 and
+// UTF-32, with a byte order mark read and written, and their LE and BE
+// forms; UCS-2 and UCS-4 and theirs; WCHAR_T, this machine's UCS-4),
+// ISO-8859-1 and US-ASCII by rule, and the single-byte charsets of
+// std.unicode.charmaps (ISO-8859-2 to -16, the Windows code pages,
+// KOI8-R and -U, IBM866, the Mac OS charsets), each by any of glibc's,
+// ICU's or the Encoding Standard's names for it. The multi-byte East
+// Asian charsets are not here: opening a conversion with one fails with
+// EINVAL, as glibc does for a charset it does not know.
+//
+// As in glibc: a conversion consumes whole characters only; an invalid
+// sequence stops it with EILSEQ (the input left at the sequence), an
+// incomplete one at the end of the input with EINVAL, a full output with
+// E2BIG; a character the target cannot encode is EILSEQ, unless the target
+// names `//TRANSLIT` (a few look-alikes, else `?`, each counted in the
+// result as irreversible) or `//IGNORE` (it is left out, and the call
+// converts all it can, then fails with EILSEQ). UTF-16 and UTF-32 read
+// without a byte order mark are this machine's order (little-endian, as
+// glibc reads them) and are written with a mark first, in that order.
+// Unlike glibc, UTF-8 past U+10FFFF is invalid, and the single-byte
+// charsets are the Encoding Standard's tables (where glibc leaves a byte
+// of a Windows code page undefined, a browser and this library read it
+// as the C1 control of that value).
+const sys = @import("./sys.mlx")
+const errno = @import("./errno.mlx")
+const heap = @import("./heap.mlx")
+const charmaps = @import("std.unicode.charmaps")
+
+// The charsets by rule; CHARMAP is one of std.unicode.charmaps.
+const UTF8: u32 = 1
+const UTF16: u32 = 2
+const UTF16LE: u32 = 3
+const UTF16BE: u32 = 4
+const UTF32: u32 = 5
+const UTF32LE: u32 = 6
+const UTF32BE: u32 = 7
+const UCS2: u32 = 8
+const UCS2LE: u32 = 9
+const UCS2BE: u32 = 10
+const UCS4: u32 = 11
+const UCS4LE: u32 = 12
+const LATIN1: u32 = 13
+const ASCII: u32 = 14
+const CHARMAP: u32 = 15
+// UCS-2 with a byte order mark read (glibc's "UNICODE").
+const UNICODE: u32 = 16
+
+// The names of the charsets by rule, compared as charmaps compares them
+// (letters without case, letters and digits only): each line a charset's
+// number, then its names.
+const NAMES = [15][]const u8{
+    "1 utf8",
+    "2 utf16",
+    "3 utf16le",
+    "4 utf16be",
+    "5 utf32",
+    "6 utf32le",
+    "7 utf32be",
+    "8 ucs2",
+    "9 ucs2le unicodelittle",
+    "10 ucs2be unicodebig",
+    "11 ucs4 iso10646ucs4 10646",
+    "12 ucs4le wchart internal",
+    "13 iso88591 latin1 l1 cp819 ibm819 csisolatin1 isoir100 iso885911987",
+    "14 ascii usascii ansix341968 iso646us us cp367 ibm367 csascii 646 iso646irv1991",
+    "16 unicode",
+}
+
+// The descriptor: the source and target charsets and their states.
+const D_FROM: usize = 0
+const D_TO: usize = 4
+const D_FROM_TABLE: usize = 8
+const D_FROM_C1: usize = 12
+const D_TO_TABLE: usize = 16
+const D_TO_C1: usize = 20
+const D_FLAGS: usize = 24
+// The byte order of UTF-16, UTF-32 or UNICODE read so far (0 not known
+// yet, 1 little-endian, 2 big-endian).
+const D_ORDER: usize = 28
+// Whether the byte order mark of UTF-16 or UTF-32 was written.
+const D_MARKED: usize = 32
+const D_SIZE: usize = 40
+
+const TRANSLIT: u32 = 1
+const IGNORE: u32 = 2
+
+const FAILED: usize = 18446744073709551615
+
+fn lower(byte: u8) -> u8 { return if byte >= 65 && byte <= 90 { byte + 32 } else { byte } }
+
+fn isAlphanumeric(byte: u8) -> bool { return (byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) }
+
+fn matches(name: []const u8, label: []const u8) -> bool {
+    var at: usize = 0
+    var index: usize = 0
+    while index < name.length {
+        const byte = name[index]
+        index += 1
+        if !isAlphanumeric(byte) { continue }
+        if at >= label.length || lower(byte) != label[at] { return false }
+        at += 1
+    }
+    return at == label.length
+}
+
+fn numberOf(text: []const u8) -> u32 {
+    var value: u32 = 0
+    var index: usize = 0
+    while index < text.length && text[index] >= 48 && text[index] <= 57 {
+        value = value * 10 + @intCast(u32, text[index] - 48)
+        index += 1
+    }
+    return value
+}
+
+// The charset by rule `name` names (0: none). The empty name is the
+// locale's charset, the C locale's ASCII.
+fn ruleCharset(name: []const u8) -> u32 {
+    if name.length == 0 { return ASCII }
+    for entry in NAMES {
+        var at: usize = 0
+        while at < entry.length && entry[at] != 32 { at += 1 }
+        const number = numberOf(entry[0..at])
+        while at < entry.length {
+            at += 1
+            var end = at
+            while end < entry.length && entry[end] != 32 { end += 1 }
+            if end > at && matches(name, entry[at..end]) { return number }
+            at = end
+        }
+    }
+    return 0
+}
+
+// Splits `name` at its first "//": the charset, and the flags after it
+// (TRANSLIT, IGNORE, separated by "/" or ",").
+fn splitName(name: []const u8, flags: *u32) -> []const u8 {
+    var index: usize = 0
+    while index + 1 < name.length && !(name[index] == 47 && name[index + 1] == 47) { index += 1 }
+    if index + 1 >= name.length { return name }
+    var at = index + 2
+    while at < name.length {
+        var end = at
+        while end < name.length && name[end] != 47 && name[end] != 44 { end += 1 }
+        const word = name[at..end]
+        if matches(word, "translit") { flags.* = flags.* | TRANSLIT }
+        if matches(word, "ignore") { flags.* = flags.* | IGNORE }
+        at = end + 1
+    }
+    return name[0..index]
+}
+
+// Sets the charset of `name` at `field` (and its table); false when it
+// is not one here.
+fn setCharset(cd: usize, field: usize, tableField: usize, c1Field: usize, name: []const u8) -> bool {
+    const rule = ruleCharset(name)
+    if rule != 0 {
+        sys.put32(cd + field, rule)
+        return true
+    }
+    var map: charmaps.Charmap = undefined
+    if !charmaps.find(name, &map) { return false }
+    sys.put32(cd + field, CHARMAP)
+    sys.put32(cd + tableField, @intCast(u32, map.table))
+    sys.put8(cd + c1Field, if map.c1 { 1 } else { 0 })
+    return true
+}
+
+pub export fn iconv_open(tocode: usize, fromcode: usize) -> usize {
+    if tocode == 0 || fromcode == 0 {
+        errno.set(sys.EINVAL)
+        return FAILED
+    }
+    const cd = heap.allocate(D_SIZE, 16)
+    if cd == 0 {
+        errno.set(sys.ENOMEM)
+        return FAILED
+    }
+    sys.fill(cd, 0, D_SIZE)
+    var flags: u32 = 0
+    var ignored: u32 = 0
+    const to = splitName(sys.slice(tocode), &flags)
+    const from = splitName(sys.slice(fromcode), &ignored)
+    if !setCharset(cd, D_TO, D_TO_TABLE, D_TO_C1, to) || !setCharset(cd, D_FROM, D_FROM_TABLE, D_FROM_C1, from) {
+        heap.release(cd)
+        errno.set(sys.EINVAL)
+        return FAILED
+    }
+    sys.put32(cd + D_FLAGS, flags)
+    return cd
+}
+
+pub export fn iconv_close(cd: usize) -> i32 {
+    if cd == 0 || cd == FAILED {
+        errno.set(sys.EBADF)
+        return -1
+    }
+    heap.release(cd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Reading a character
+
+// What reading at the input gave: a code point and the bytes it took, or
+// an invalid sequence of `length` bytes, or too few bytes left for one.
+const READ_OK: u32 = 0
+const READ_INVALID: u32 = 1
+const READ_INCOMPLETE: u32 = 2
+
+const Read = struct {
+    status: u32
+    codepoint: u32
+    length: usize
+}
+
+fn ok(codepoint: u32, length: usize) -> Read { return Read.{ .status = READ_OK, .codepoint = codepoint, .length = length } }
+fn invalid(length: usize) -> Read { return Read.{ .status = READ_INVALID, .codepoint = 0, .length = length } }
+fn incomplete() -> Read { return Read.{ .status = READ_INCOMPLETE, .codepoint = 0, .length = 0 } }
+
+fn isTrail(byte: u8) -> bool { return byte >= 128 && byte <= 191 }
+
+fn readUtf8(at: usize, left: usize) -> Read {
+    const lead = sys.get8(at)
+    if lead < 128 { return ok(@intCast(u32, lead), 1) }
+    if lead < 194 || lead > 244 { return invalid(1) }
+    const need: usize = if lead < 224 { 2 } else if lead < 240 { 3 } else { 4 }
+    // The second byte's range depends on the lead: no overlong forms, no
+    // surrogates, nothing past U+10FFFF.
+    var low: u8 = 128
+    var high: u8 = 191
+    if lead == 224 { low = 160 }
+    if lead == 237 { high = 159 }
+    if lead == 240 { low = 144 }
+    if lead == 244 { high = 143 }
+    var index: usize = 1
+    while index < need {
+        if index >= left { return incomplete() }
+        const byte = sys.get8(at + index)
+        if index == 1 && (byte < low || byte > high) { return invalid(1) }
+        if index > 1 && !isTrail(byte) { return invalid(index) }
+        index += 1
+    }
+    var value: u32 = @intCast(u32, lead) & (if need == 2 { 31 } else if need == 3 { 15 } else { 7 })
+    index = 1
+    while index < need {
+        value = (value << 6) | (@intCast(u32, sys.get8(at + index)) & 63)
+        index += 1
+    }
+    return ok(value, need)
+}
+
+fn unit16(at: usize, little: bool) -> u32 {
+    const first = @intCast(u32, sys.get8(at))
+    const second = @intCast(u32, sys.get8(at + 1))
+    return if little { first | (second << 8) } else { (first << 8) | second }
+}
+
+fn unit32(at: usize, little: bool) -> u32 {
+    var value: u32 = 0
+    var index: usize = 0
+    while index < 4 {
+        const byte = @intCast(u32, sys.get8(at + (if little { 3 - index } else { index })))
+        value = (value << 8) | byte
+        index += 1
+    }
+    return value
+}
+
+fn readUtf16(at: usize, left: usize, little: bool, surrogates: bool) -> Read {
+    if left < 2 { return incomplete() }
+    const first = unit16(at, little)
+    if first < 55296 || first > 57343 { return ok(first, 2) }
+    if !surrogates || first >= 56320 { return invalid(2) }
+    if left < 4 { return incomplete() }
+    const second = unit16(at + 2, little)
+    if second < 56320 || second > 57343 { return invalid(2) }
+    return ok(65536 + ((first - 55296) << 10) + (second - 56320), 4)
+}
+
+fn readUtf32(at: usize, left: usize, little: bool) -> Read {
+    if left < 4 { return incomplete() }
+    const value = unit32(at, little)
+    if value > 1114111 || (value >= 55296 && value <= 57343) { return invalid(4) }
+    return ok(value, 4)
+}
+
+// The byte order of UTF-16, UTF-32 or UNICODE input: its mark, read once
+// at the start (and skipped), else this machine's.
+fn orderOf(cd: usize, at: usize, left: usize, width: usize) -> Read {
+    const known = sys.get32(cd + D_ORDER)
+    if known != 0 { return ok(known, 0) }
+    if left < width { return incomplete() }
+    if width == 2 {
+        const unit = unit16(at, true)
+        if unit == 65279 {
+            sys.put32(cd + D_ORDER, 1)
+            return ok(1, 2)
+        }
+        if unit == 65534 {
+            sys.put32(cd + D_ORDER, 2)
+            return ok(2, 2)
+        }
+    } else {
+        const unit = unit32(at, true)
+        if unit == 65279 {
+            sys.put32(cd + D_ORDER, 1)
+            return ok(1, 4)
+        }
+        if unit == 4294836224 {
+            sys.put32(cd + D_ORDER, 2)
+            return ok(2, 4)
+        }
+    }
+    sys.put32(cd + D_ORDER, 1)
+    return ok(1, 0)
+}
+
+fn readCharacter(cd: usize, at: usize, left: usize) -> Read {
+    const from = sys.get32(cd + D_FROM)
+    if from == UTF8 { return readUtf8(at, left) }
+    if from == LATIN1 { return ok(@intCast(u32, sys.get8(at)), 1) }
+    if from == ASCII {
+        const byte = sys.get8(at)
+        if byte >= 128 { return invalid(1) }
+        return ok(@intCast(u32, byte), 1)
+    }
+    if from == CHARMAP {
+        const map = charmaps.Charmap.{ .table = @intCast(usize, sys.get32(cd + D_FROM_TABLE)), .c1 = sys.get8(cd + D_FROM_C1) != 0 }
+        const code = charmaps.decode(map, sys.get8(at))
+        if code == charmaps.NONE { return invalid(1) }
+        return ok(code, 1)
+    }
+    if from == UTF16LE { return readUtf16(at, left, true, true) }
+    if from == UTF16BE { return readUtf16(at, left, false, true) }
+    if from == UCS2 || from == UCS2LE { return readUtf16(at, left, true, false) }
+    if from == UCS2BE { return readUtf16(at, left, false, false) }
+    if from == UTF32LE || from == UCS4LE { return readUtf32(at, left, true) }
+    if from == UTF32BE || from == UCS4 { return readUtf32(at, left, false) }
+    // UTF-16, UTF-32 and UNICODE: the byte order mark first.
+    const width: usize = if from == UTF32 { 4 } else { 2 }
+    const order = orderOf(cd, at, left, width)
+    if order.status != READ_OK { return order }
+    const little = order.codepoint == 1
+    var result: Read = undefined
+    if order.length >= left {
+        // (The mark alone: a character of no code point, consumed.)
+        return Read.{ .status = READ_OK, .codepoint = 4294967295, .length = order.length }
+    }
+    if from == UTF32 {
+        result = readUtf32(at + order.length, left - order.length, little)
+    } else {
+        result = readUtf16(at + order.length, left - order.length, little, from == UTF16)
+    }
+    if result.status == READ_OK { result.length += order.length }
+    // (An error leaves the mark consumed: the order is known now.)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Writing a character
+
+// The bytes `codepoint` takes in the target (into `into`, room for 8),
+// or 0 when the target cannot encode it.
+fn encodeCharacter(cd: usize, codepoint: u32, into: usize) -> usize {
+    const to = sys.get32(cd + D_TO)
+    if to == UTF8 {
+        if codepoint < 128 {
+            sys.put8(into, @intCast(u8, codepoint))
+            return 1
+        }
+        if codepoint < 2048 {
+            sys.put8(into, @intCast(u8, 192 | (codepoint >> 6)))
+            sys.put8(into + 1, @intCast(u8, 128 | (codepoint & 63)))
+            return 2
+        }
+        if codepoint < 65536 {
+            sys.put8(into, @intCast(u8, 224 | (codepoint >> 12)))
+            sys.put8(into + 1, @intCast(u8, 128 | ((codepoint >> 6) & 63)))
+            sys.put8(into + 2, @intCast(u8, 128 | (codepoint & 63)))
+            return 3
+        }
+        sys.put8(into, @intCast(u8, 240 | (codepoint >> 18)))
+        sys.put8(into + 1, @intCast(u8, 128 | ((codepoint >> 12) & 63)))
+        sys.put8(into + 2, @intCast(u8, 128 | ((codepoint >> 6) & 63)))
+        sys.put8(into + 3, @intCast(u8, 128 | (codepoint & 63)))
+        return 4
+    }
+    if to == LATIN1 {
+        if codepoint > 255 { return 0 }
+        sys.put8(into, @intCast(u8, codepoint))
+        return 1
+    }
+    if to == ASCII {
+        if codepoint > 127 { return 0 }
+        sys.put8(into, @intCast(u8, codepoint))
+        return 1
+    }
+    if to == CHARMAP {
+        const map = charmaps.Charmap.{ .table = @intCast(usize, sys.get32(cd + D_TO_TABLE)), .c1 = sys.get8(cd + D_TO_C1) != 0 }
+        const byte = charmaps.encode(map, codepoint)
+        if byte == charmaps.NONE { return 0 }
+        sys.put8(into, @intCast(u8, byte))
+        return 1
+    }
+    if to == UTF32 || to == UTF32LE || to == UCS4LE || to == UTF32BE || to == UCS4 {
+        const little = to != UTF32BE && to != UCS4
+        var index: usize = 0
+        while index < 4 {
+            const shift = @intCast(u5, if little { index * 8 } else { 24 - index * 8 })
+            sys.put8(into + index, @intCast(u8, (codepoint >> shift) & 255))
+            index += 1
+        }
+        return 4
+    }
+    // UTF-16 and UCS-2.
+    const little = to != UTF16BE && to != UCS2BE
+    if codepoint < 65536 {
+        put16(into, codepoint, little)
+        return 2
+    }
+    if to != UTF16 && to != UTF16LE && to != UTF16BE { return 0 }
+    put16(into, 55296 + ((codepoint - 65536) >> 10), little)
+    put16(into + 2, 56320 + ((codepoint - 65536) & 1023), little)
+    return 4
+}
+
+fn put16(into: usize, unit: u32, little: bool) -> void {
+    const high = @intCast(u8, (unit >> 8) & 255)
+    const low = @intCast(u8, unit & 255)
+    sys.put8(into, if little { low } else { high })
+    sys.put8(into + 1, if little { high } else { low })
+}
+
+// A few look-alikes for //TRANSLIT, as glibc's C locale has them: each
+// line a code point (decimal) and its ASCII spelling.
+const LOOKALIKES = [24][]const u8{
+    "160  ",
+    "169 (C)",
+    "171 <<",
+    "174 (R)",
+    "187 >>",
+    "198 AE",
+    "223 ss",
+    "230 ae",
+    "338 OE",
+    "339 oe",
+    "8208 -",
+    "8209 -",
+    "8211 -",
+    "8212 -",
+    "8216 '",
+    "8217 '",
+    "8218 '",
+    "8220 \"",
+    "8221 \"",
+    "8222 \"",
+    "8226 o",
+    "8230 ...",
+    "8364 EUR",
+    "8482 (TM)",
+}
+
+fn lookalike(codepoint: u32) -> []const u8 {
+    for entry in LOOKALIKES {
+        var space: usize = 0
+        while entry[space] != 32 { space += 1 }
+        if numberOf(entry[0..space]) == codepoint { return entry[space + 1..entry.length] }
+    }
+    return "?"
+}
+
+// ---------------------------------------------------------------------------
+// The conversion
+
+pub export fn iconv(cd: usize, inbuf: usize, inbytesleft: usize, outbuf: usize, outbytesleft: usize) -> usize {
+    if cd == 0 || cd == FAILED {
+        errno.set(sys.EBADF)
+        return FAILED
+    }
+    const to = sys.get32(cd + D_TO)
+    // No input: back to the initial state (the stateful charsets here
+    // have no sequence to write for it).
+    if inbuf == 0 || sys.getPointer(inbuf) == 0 {
+        sys.put32(cd + D_ORDER, 0)
+        sys.put32(cd + D_MARKED, 0)
+        return 0
+    }
+    var input = sys.getPointer(inbuf)
+    var inputLeft = sys.getPointer(inbytesleft)
+    var output = if outbuf != 0 { sys.getPointer(outbuf) } else { 0 }
+    var outputLeft = if outbytesleft != 0 { sys.getPointer(outbytesleft) } else { 0 }
+    const flags = sys.get32(cd + D_FLAGS)
+    var irreversible: usize = 0
+    var skipped = false
+    var failure: i32 = 0
+    var buffer: [32]u8 = undefined
+    const scratch = @intFromPtr(&buffer)
+    // UTF-16, UTF-32 and UNICODE begin with their byte order mark.
+    if (to == UTF16 || to == UTF32 || to == UNICODE) && sys.get32(cd + D_MARKED) == 0 && inputLeft > 0 {
+        const length = encodeCharacter(cd, 65279, scratch)
+        if length > outputLeft {
+            failure = sys.E2BIG
+        } else {
+            sys.copy(output, scratch, length)
+            output += length
+            outputLeft -= length
+            sys.put32(cd + D_MARKED, 1)
+        }
+    }
+    while failure == 0 && inputLeft > 0 {
+        const read = readCharacter(cd, input, inputLeft)
+        if read.status == READ_INCOMPLETE {
+            failure = sys.EINVAL
+            break
+        }
+        if read.status == READ_INVALID {
+            if (flags & IGNORE) != 0 {
+                skipped = true
+                input += read.length
+                inputLeft -= read.length
+                continue
+            }
+            failure = sys.EILSEQ
+            break
+        }
+        // (A byte order mark alone.)
+        if read.codepoint == 4294967295 {
+            input += read.length
+            inputLeft -= read.length
+            continue
+        }
+        var length = encodeCharacter(cd, read.codepoint, scratch)
+        if length == 0 {
+            if (flags & TRANSLIT) != 0 {
+                // The look-alike, each of its characters as the target has it.
+                const spelling = lookalike(read.codepoint)
+                var index: usize = 0
+                while index < spelling.length {
+                    length += encodeCharacter(cd, @intCast(u32, spelling[index]), scratch + length)
+                    index += 1
+                }
+                irreversible += 1
+            } else if (flags & IGNORE) != 0 {
+                skipped = true
+                input += read.length
+                inputLeft -= read.length
+                continue
+            } else {
+                failure = sys.EILSEQ
+                break
+            }
+        }
+        if length > outputLeft {
+            if (flags & TRANSLIT) != 0 && irreversible > 0 && length > 0 { irreversible -= 1 }
+            failure = sys.E2BIG
+            break
+        }
+        sys.copy(output, scratch, length)
+        output += length
+        outputLeft -= length
+        input += read.length
+        inputLeft -= read.length
+    }
+    sys.putPointer(inbuf, input)
+    sys.putPointer(inbytesleft, inputLeft)
+    if outbuf != 0 { sys.putPointer(outbuf, output) }
+    if outbytesleft != 0 { sys.putPointer(outbytesleft, outputLeft) }
+    if failure == 0 && skipped { failure = sys.EILSEQ }
+    if failure != 0 {
+        errno.set(failure)
+        return FAILED
+    }
+    return irreversible
+}
