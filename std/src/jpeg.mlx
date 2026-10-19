@@ -16,7 +16,24 @@
 // (the damage the compositor reports): a desktop that mostly stands still
 // costs little. A block of one colour skips the DCT.
 
+// Decoding is libjpeg-turbo's, byte for byte (std/src/jpeg/read.mlx and
+// output.mlx): baseline and progressive Huffman-coded images, any
+// sampling (4:4:4, 4:2:2, 4:2:0 and the rest), restart markers, grey,
+// YCbCr, RGB, CMYK and Adobe's YCCK, the accurate integer inverse DCT
+// (as libjpeg-turbo computes it on x86-64) and fancy upsampling. decodeRgba gives 8-bit RGBA (CMYK made RGB as browsers
+// make Adobe's inverted CMYK) and the EXIF orientation, which is left
+// for the caller to apply. A file cut short decodes as libjpeg's djpeg
+// decodes it: what is missing is grey. The libjpeg C API
+// (compiler/capi/jpeg) is made of the same parts.
+//
+//     var picture: jpeg.Picture = undefined
+//     if jpeg.decodeRgba(&picture, file, length, allocator) == jpeg.Status.ok { ... }
+//     jpeg.deinitPicture(&picture)
+
 const allocator_module = @import("../bootstrap/allocator.mlx")
+const zs = @import("./flate/stream.mlx")
+pub const read = @import("./jpeg/read.mlx")
+pub const output = @import("./jpeg/output.mlx")
 
 pub const Allocator = allocator_module.Allocator
 
@@ -627,4 +644,215 @@ pub fn encodeFrame(encoder: *Encoder, pixels: [*]const u32, stride: usize, top: 
     word(encoder, 65497)
     if encoder.*.overflow { return 0 }
     return encoder.*.length
+}
+
+// ---------------------------------------------------------------------------
+// Decoding
+
+pub const Status = enum(u8) {
+    ok,
+    notJpeg,
+    unsupported,
+    corrupt,
+    noMemory
+}
+
+pub fn statusMessage(status: Status) -> []const u8 {
+    if status == Status.ok { return "ok" }
+    if status == Status.notJpeg { return "not a JPEG image" }
+    if status == Status.unsupported { return "a kind of JPEG image not supported" }
+    if status == Status.corrupt { return "a damaged JPEG image" }
+    return "out of memory"
+}
+
+// A decoded image: `width` x `height` pixels of 8-bit RGBA, and the EXIF
+// orientation (1 to 8, 1 when the file has none).
+pub const Picture = struct {
+    width: usize
+    height: usize
+    pixels: [*]u8
+    orientation: u32
+    allocator: Allocator
+}
+
+pub fn deinitPicture(picture: *Picture) -> void {
+    if picture.*.width * picture.*.height == 0 { return }
+    picture.*.allocator.free(picture.*.pixels, picture.*.width * picture.*.height * 4, 16)
+    picture.*.width = 0
+    picture.*.height = 0
+}
+
+// The state of a decoding (on the heap: the decoder is large).
+const Decoding = struct {
+    decoder: read.Decoder
+    output: output.Output
+    // How many times the data ran out and an end of image was put in its
+    // place (libjpeg's file source does that, with a warning).
+    endsInserted: usize
+}
+
+inline fn get8(address: usize) -> usize { return @intCast(usize, zs.get8(address)) }
+
+fn read16(address: usize, big: bool) -> usize {
+    if big { return (get8(address) << 8) | get8(address + 1) }
+    return (get8(address + 1) << 8) | get8(address)
+}
+
+fn read32(address: usize, big: bool) -> usize {
+    if big { return (read16(address, true) << 16) | read16(address + 2, true) }
+    return (read16(address + 2, false) << 16) | read16(address, false)
+}
+
+// The EXIF orientation in the saved APP1 markers, read as WebKit reads
+// it: the first IFD's tag 0x112 of type SHORT and count 1.
+pub fn exifOrientation(d: *read.Decoder) -> u32 {
+    var marker = d.*.markerList
+    while marker != 0 {
+        const code = get8(marker + read.SAVED_MARKER)
+        const length = @intCast(usize, zs.get32(marker + read.SAVED_DATA_LENGTH))
+        const data = marker + read.SAVED_SIZE
+        if code == 0xe1 && length >= 14 && get8(data) == 69 && get8(data + 1) == 120 && get8(data + 2) == 105 && get8(data + 3) == 102 && get8(data + 4) == 0 {
+            const big = get8(data + 6) == 77 && get8(data + 7) == 77
+            const little = get8(data + 6) == 73 && get8(data + 7) == 73
+            if (big || little) && read16(data + 8, big) == 42 {
+                var offset = read32(data + 10, big)
+                if offset < length - 6 {
+                    offset += 6
+                    if length - offset >= 2 {
+                        const count = read16(data + offset, big)
+                        var entry = data + offset + 2
+                        var left = length - offset - 2
+                        var index: usize = 0
+                        while index < count && left >= 12 {
+                            if read16(entry, big) == 0x112 && read16(entry + 2, big) == 3 && read32(entry + 4, big) == 1 {
+                                const value = read16(entry + 8, big)
+                                if value >= 1 && value <= 8 { return @intCast(u32, value) }
+                                return 1
+                            }
+                            entry += 12
+                            left -= 12
+                            index += 1
+                        }
+                    }
+                }
+            }
+        }
+        marker = @intCast(usize, zs.get64(marker + read.SAVED_NEXT))
+    }
+    return 1
+}
+
+// When the data runs out: an end of image put in, as libjpeg's file
+// source does; after a few, the file is taken as broken.
+fn insertEnd(decoding: *Decoding) -> bool {
+    if decoding.*.endsInserted == 4 { return false }
+    decoding.*.endsInserted += 1
+    read.warn(&decoding.*.decoder, read.JWRN_JPEG_EOF)
+    var end: [2]u8 = [2]u8{ 255, 217 }
+    const view: [*]u8 = &end
+    return read.giveAs(&decoding.*.decoder, @intFromPtr(view), 2, true)
+}
+
+fn statusOf(d: *read.Decoder) -> Status {
+    const code = d.*.failure.code
+    if code == read.JERR_NO_SOI { return Status.notJpeg }
+    if code == read.JERR_OUT_OF_MEMORY { return Status.noMemory }
+    if code == read.JERR_SOF_UNSUPPORTED || code == read.JERR_NOT_COMPILED || code == read.JERR_BAD_PRECISION || code == read.JERR_CONVERSION_NOTIMPL || code == read.JERR_FRACT_SAMPLE_NOTIMPL || code == read.JERR_IMAGE_TOO_BIG { return Status.unsupported }
+    return Status.corrupt
+}
+
+fn decodeWith(decoding: *Decoding, picture: *Picture, data: [*]const u8, length: usize) -> Status {
+    const d = &decoding.*.decoder
+    const o = &decoding.*.output
+    read.init(d, picture.*.allocator)
+    read.saveMarkers(d, 0xe1, 0xffff)
+    if !read.give(d, @intFromPtr(data), length) { return Status.noMemory }
+    // The header.
+    while true {
+        const status = read.consumeInput(d)
+        if status == read.REACHED_SOS { break }
+        if status == read.FAILED { return statusOf(d) }
+        if status == read.REACHED_EOI { return Status.corrupt }
+        if status == read.SUSPENDED && !insertEnd(decoding) { return Status.corrupt }
+    }
+    read.defaultColorSpaces(d)
+    picture.*.orientation = exifOrientation(d)
+    output.init(o, d)
+    const cmyk = d.*.jpegColorSpace == read.CS_CMYK || d.*.jpegColorSpace == read.CS_YCCK
+    if cmyk { o.*.colorSpace = read.CS_CMYK } else { o.*.colorSpace = read.CS_EXT_RGBA }
+    if !output.start(o) { return statusOf(d) }
+    // An image of several scans is read whole first (jpeg_start_decompress).
+    if d.*.hasMultipleScans {
+        while true {
+            const status = read.consumeInput(d)
+            if status == read.REACHED_EOI { break }
+            if status == read.FAILED { return statusOf(d) }
+            if status == read.SUSPENDED && !insertEnd(decoding) { return Status.corrupt }
+        }
+        d.*.outputScanNumber = d.*.inputScanNumber
+    }
+    output.startPass(o)
+    const width = o.*.width
+    const height = o.*.height
+    const size = width * height * 4
+    const memory = picture.*.allocator.alloc(size, 16)
+    if memory == null { return Status.noMemory }
+    picture.*.pixels = memory.?
+    picture.*.width = width
+    picture.*.height = height
+    var rows: [16]usize = undefined
+    const view: [*]usize = &rows
+    while o.*.scanline < height {
+        var index: usize = 0
+        while index < 16 {
+            rows[index] = @intFromPtr(picture.*.pixels) + (o.*.scanline + index) * width * 4
+            index += 1
+        }
+        const count = output.readScanlines(o, view, 16)
+        if count == 0 {
+            if d.*.failed || !insertEnd(decoding) {
+                deinitPicture(picture)
+                return statusOf(d)
+            }
+        }
+    }
+    // The rest of the file up to its end (jpeg_finish_decompress): what
+    // libjpeg refuses there, WebKit refuses the image for.
+    while !d.*.eoiReached {
+        const status = read.consumeInput(d)
+        if status == read.FAILED || (status == read.SUSPENDED && !insertEnd(decoding)) {
+            deinitPicture(picture)
+            return statusOf(d)
+        }
+    }
+    if cmyk {
+        // Adobe's inverted CMYK: each colour times black.
+        var at: usize = 0
+        while at < size {
+            const k = @intCast(usize, picture.*.pixels[at + 3])
+            picture.*.pixels[at] = @intCast(u8, @intCast(usize, picture.*.pixels[at]) * k / 255)
+            picture.*.pixels[at + 1] = @intCast(u8, @intCast(usize, picture.*.pixels[at + 1]) * k / 255)
+            picture.*.pixels[at + 2] = @intCast(u8, @intCast(usize, picture.*.pixels[at + 2]) * k / 255)
+            picture.*.pixels[at + 3] = 255
+            at += 4
+        }
+    }
+    return Status.ok
+}
+
+// Decodes the JPEG file at DATA (LENGTH bytes) into PICTURE.
+pub fn decodeRgba(picture: *Picture, data: [*]const u8, length: usize, allocator: Allocator) -> Status {
+    picture.*.width = 0
+    picture.*.height = 0
+    picture.*.orientation = 1
+    picture.*.allocator = allocator
+    const memory = allocator.alloc(@sizeOf(Decoding), 16)
+    if memory == null { return Status.noMemory }
+    zs.zero(@intFromPtr(memory.?), @sizeOf(Decoding))
+    const decoding: *Decoding = unsafe { @ptrCast(*Decoding, memory.?) }
+    const status = decodeWith(decoding, picture, data, length)
+    if decoding.*.output.d == &decoding.*.decoder { output.deinit(&decoding.*.output) }
+    read.deinit(&decoding.*.decoder)
+    allocator.free(memory.?, @sizeOf(Decoding), 16)
+    return status
 }

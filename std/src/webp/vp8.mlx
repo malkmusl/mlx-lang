@@ -1,0 +1,1995 @@
+// std.webp.vp8: the lossy (VP8 key frame) decoder of libwebp 1.3.2,
+// step for step: the boolean decoder (utils/bit_reader*, 56 bits at a
+// time as on x86-64), the frame header, segments, loop filter and token
+// partitions (dec/vp8_dec.c), the intra modes and coefficient
+// probabilities (tree_dec.c), the quantizers (quant_dec.c), and the
+// reconstruction row by row: prediction, inverse transforms, the loop
+// filter, and the rows handed to the output with the filter's delay
+// (frame_dec.c, dsp/dec.c). The full inverse transform is computed as
+// libwebp's SSE2 code computes it (16-bit lanes), which only matters for
+// coefficients no encoder makes.
+//
+// The decoder reads from an Io (std.webp.io): `data` and `dataSize`
+// hold the VP8 payload (the frame header onwards). getHeaders reads the
+// headers, then decode reads the whole frame; the incremental decoder
+// (std.webp.decode) drives the same steps itself a macroblock at a time.
+//
+// Dithering (WebPDecoderOptions.dithering_strength) is not done; the
+// default asks for none.
+const io = @import("./io.mlx")
+const alpha = @import("./alpha.mlx")
+
+pub const Allocator = io.Allocator
+pub const Io = io.Io
+
+inline fn get8(address: usize) -> u64 { return io.get8(address) }
+inline fn put8(address: usize, value: u64) -> void { io.put8(address, value) }
+inline fn getI16(address: usize) -> i64 { return io.getI16(address) }
+inline fn putI16(address: usize, value: i64) -> void { io.putI16(address, value) }
+
+// The work buffer's layout (BPS bytes a row): the Y block with a row and
+// a column of its neighbours, then U and V side by side.
+const BPS: usize = 32
+const YUV_SIZE: usize = BPS * 17 + BPS * 9
+const Y_OFF: usize = BPS * 1 + 8
+const U_OFF: usize = Y_OFF + BPS * 16 + BPS
+const V_OFF: usize = U_OFF + 16
+
+// Intra modes.
+const B_DC_PRED: u64 = 0
+const B_TM_PRED: u64 = 1
+const B_VE_PRED: u64 = 2
+const B_HE_PRED: u64 = 3
+const B_RD_PRED: u64 = 4
+const B_VR_PRED: u64 = 5
+const B_LD_PRED: u64 = 6
+const B_VL_PRED: u64 = 7
+const B_HD_PRED: u64 = 8
+const B_HU_PRED: u64 = 9
+const DC_PRED: u64 = 0
+const TM_PRED: u64 = 1
+const V_PRED: u64 = 2
+const H_PRED: u64 = 3
+const B_DC_PRED_NOTOP: u64 = 4
+const B_DC_PRED_NOLEFT: u64 = 5
+const B_DC_PRED_NOTOPLEFT: u64 = 6
+
+const NUM_MB_SEGMENTS: usize = 4
+const MAX_NUM_PARTITIONS: usize = 8
+const NUM_TYPES: usize = 4
+const NUM_BANDS: usize = 8
+const NUM_CTX: usize = 3
+const NUM_PROBAS: usize = 11
+
+pub const VP8_FRAME_HEADER_SIZE: usize = 10
+
+// A macroblock's data (VP8MBData): its 384 coefficients (16-bit), whether
+// it is coded as 4x4 blocks, their 16 modes, the chroma mode, its
+// segment, whether it was skipped, which blocks have coefficients
+// (two bits each).
+const MB_COEFFS: usize = 0
+const MB_IS_I4X4: usize = 768
+const MB_IMODES: usize = 769
+const MB_UVMODE: usize = 785
+const MB_SEGMENT: usize = 786
+const MB_SKIP: usize = 787
+const MB_NON_ZERO_Y: usize = 788
+const MB_NON_ZERO_UV: usize = 792
+const MB_DATA_SIZE: usize = 800
+
+// The rows the loop filter changes below a macroblock row, by filter
+// type (none, simple, complex): the output waits for them.
+fn filterExtraRows(filterType: usize) -> usize {
+    if filterType == 1 { return 2 }
+    if filterType == 2 { return 8 }
+    return 0
+}
+
+// The boolean decoder (VP8BitReader): `value` holds the bits read ahead,
+// `bits` how many of them are left beyond the 8 being decoded, `range`
+// the range less one.
+pub const BoolReader = struct {
+    value: u64
+    range: u64
+    bits: i64
+    buf: usize
+    bufEnd: usize
+    bufMax: usize
+    eof: bool
+}
+
+pub const QuantMatrix = struct {
+    y1: [2]i64
+    y2: [2]i64
+    uv: [2]i64
+    uvQuant: i64
+}
+
+pub const Decoder = struct {
+    allocator: Allocator
+    status: i32
+    ready: bool
+    message: usize
+
+    br: BoolReader
+
+    // The frame header.
+    keyFrame: bool
+    profile: u64
+    show: bool
+    partitionLength: usize
+    // The picture header.
+    width: i64
+    height: i64
+    xscale: u64
+    yscale: u64
+    colorspace: u64
+    clampType: u64
+    // The segment header.
+    useSegment: bool
+    updateMap: bool
+    absoluteDelta: bool
+    quantizer: [4]i64
+    filterStrength: [4]i64
+    // The filter header.
+    simple: bool
+    level: i64
+    sharpness: i64
+    useLfDelta: bool
+    refLfDelta: [4]i64
+    modeLfDelta: [4]i64
+    filterType: usize
+
+    mbW: usize
+    mbH: usize
+    tlMbX: usize
+    tlMbY: usize
+    brMbX: usize
+    brMbY: usize
+
+    numPartsMinusOne: usize
+    parts: [8]BoolReader
+
+    dqm: [4]QuantMatrix
+    // The probabilities: the segment tree's, and the coefficients' by
+    // [type][band][context][11].
+    segments: [3]u64
+    bands: [1056]u8
+    useSkipProba: bool
+    skipP: u64
+
+    // The frame's memory (AllocateMemory): the 4x4 modes above (4 a
+    // macroblock), the samples above (16 Y, 8 U, 8 V a macroblock), the
+    // non-zero flags above and left (2 bytes a macroblock, the left one
+    // just before), the filter strengths (4 bytes), the work buffer, the
+    // macroblocks' data, and the row cache (the rows being made, with the
+    // rows the filter still changes above them).
+    mem: usize
+    memSize: usize
+    intraT: usize
+    intraL: [4]u8
+    yuvT: usize
+    mbInfo: usize
+    fInfo: usize
+    yuvB: usize
+    mbData: usize
+    cacheY: usize
+    cacheU: usize
+    cacheV: usize
+    cacheYStride: usize
+    cacheUVStride: usize
+
+    mbX: usize
+    mbY: usize
+    // The row being finished (VP8ThreadContext).
+    ctxMbY: usize
+    filterRow: bool
+
+    // The filter strengths by segment and 4x4-ness: limit, inner level,
+    // inner, high edge variance threshold.
+    fstrengths: [32]u8
+
+    alpha: alpha.State
+}
+
+// ---------------------------------------------------------------------------
+// The boolean decoder
+
+pub fn setBuffer(br: *BoolReader, start: usize, size: usize) -> void {
+    br.*.buf = start
+    br.*.bufEnd = start + size
+    if size >= 8 {
+        br.*.bufMax = start + size - 8 + 1
+    } else {
+        br.*.bufMax = start
+    }
+}
+
+pub fn initBitReader(br: *BoolReader, start: usize, size: usize) -> void {
+    br.*.range = 255 - 1
+    br.*.value = 0
+    br.*.bits = 0 - 8
+    br.*.eof = false
+    setBuffer(br, start, size)
+    loadNewBytes(br)
+}
+
+// VP8RemapBitReader: the data moved by OFFSET bytes.
+pub fn remap(br: *BoolReader, delta: i64) -> void {
+    if br.*.buf != 0 {
+        br.*.buf = io.offset(br.*.buf, delta)
+        br.*.bufEnd = io.offset(br.*.bufEnd, delta)
+        br.*.bufMax = io.offset(br.*.bufMax, delta)
+    }
+}
+
+fn loadFinalBytes(br: *BoolReader) -> void {
+    if br.*.buf < br.*.bufEnd {
+        br.*.bits += 8
+        br.*.value = get8(br.*.buf) | ((br.*.value & 0x00ffffffffffffff) << 8)
+        br.*.buf += 1
+    } else if !br.*.eof {
+        br.*.value = (br.*.value & 0x00ffffffffffffff) << 8
+        br.*.bits += 8
+        br.*.eof = true
+    } else {
+        br.*.bits = 0
+    }
+}
+
+// Seven more bytes, big-endian, below the bits left.
+fn loadNewBytes(br: *BoolReader) -> void {
+    if br.*.buf < br.*.bufMax {
+        const p = br.*.buf
+        const bits = (get8(p) << 48) | (get8(p + 1) << 40) | (get8(p + 2) << 32) | (get8(p + 3) << 24) | (get8(p + 4) << 16) | (get8(p + 5) << 8) | get8(p + 6)
+        br.*.buf = p + 7
+        br.*.value = bits | ((br.*.value & 0xff) << 56)
+        br.*.bits += 56
+    } else {
+        loadFinalBytes(br)
+    }
+}
+
+inline fn log2Floor(v: u64) -> u64 {
+    var n: u64 = 0
+    var x = v
+    while x > 1 {
+        x = x >> 1
+        n += 1
+    }
+    return n
+}
+
+pub fn getBit(br: *BoolReader, prob: u64) -> u64 {
+    var range = br.*.range
+    if br.*.bits < 0 { loadNewBytes(br) }
+    const pos = @intCast(u64, br.*.bits)
+    const split = (range * prob) >> 8
+    const value = (br.*.value >> pos) & 0xffffffff
+    var bit: u64 = 0
+    if value > split {
+        range -= split
+        br.*.value -= (split + 1) << pos
+        bit = 1
+    } else {
+        range = split + 1
+    }
+    const shift = 7 ^ log2Floor(range)
+    range = range << shift
+    br.*.bits -= @intCast(i64, shift)
+    br.*.range = range - 1
+    return bit
+}
+
+// V or -V, by a bit of probability one half.
+fn getSigned(br: *BoolReader, v: i64) -> i64 {
+    if br.*.bits < 0 { loadNewBytes(br) }
+    const pos = @intCast(u64, br.*.bits)
+    const split = br.*.range >> 1
+    const value = (br.*.value >> pos) & 0xffffffff
+    br.*.bits -= 1
+    if value > split {
+        br.*.range = ((br.*.range + 0xffffffff) & 0xffffffff) | 1
+        br.*.value -= (split + 1) << pos
+        return 0 - v
+    }
+    br.*.range = br.*.range | 1
+    return v
+}
+
+pub fn getValue(br: *BoolReader, count: u64) -> u64 {
+    var v: u64 = 0
+    var n = count
+    while n > 0 {
+        n -= 1
+        v = v | (getBit(br, 0x80) << n)
+    }
+    return v
+}
+
+fn getSignedValue(br: *BoolReader, count: u64) -> i64 {
+    const value = @intCast(i64, getValue(br, count))
+    if getValue(br, 1) != 0 { return 0 - value }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// Headers (vp8_dec.c)
+
+pub fn setError(d: *Decoder, status: i32, message: usize) -> bool {
+    if d.*.status == io.OK {
+        d.*.status = status
+        d.*.message = message
+        d.*.ready = false
+    }
+    return false
+}
+
+fn setOk(d: *Decoder) -> void {
+    d.*.status = io.OK
+    d.*.message = io.literal("OK")
+}
+
+pub fn init(d: *Decoder, allocator: Allocator) -> void {
+    io.zero(@intFromPtr(d), @sizeOf(Decoder))
+    d.*.allocator = allocator
+    setOk(d)
+    alpha.init(&d.*.alpha, allocator)
+}
+
+// VP8Clear: the frame's memory given back.
+pub fn clear(d: *Decoder) -> void {
+    alpha.deallocate(&d.*.alpha)
+    io.release(d.*.allocator, d.*.mem, d.*.memSize)
+    d.*.mem = 0
+    d.*.memSize = 0
+    io.zero(@intFromPtr(&d.*.br), @sizeOf(BoolReader))
+    d.*.ready = false
+}
+
+pub fn checkSignature(data: usize, size: usize) -> bool {
+    return size >= 3 && get8(data) == 0x9d && get8(data + 1) == 0x01 && get8(data + 2) == 0x2a
+}
+
+// VP8GetInfo: whether DATA starts a displayable key frame of a size,
+// which goes to WIDTH and HEIGHT.
+pub fn getInfo(data: usize, size: usize, chunkSize: usize, width: *i64, height: *i64) -> bool {
+    if data == 0 || size < VP8_FRAME_HEADER_SIZE { return false }
+    if !checkSignature(data + 3, size - 3) { return false }
+    const bits = get8(data) | (get8(data + 1) << 8) | (get8(data + 2) << 16)
+    const w = @intCast(i64, ((get8(data + 7) << 8) | get8(data + 6)) & 0x3fff)
+    const h = @intCast(i64, ((get8(data + 9) << 8) | get8(data + 8)) & 0x3fff)
+    if (bits & 1) != 0 { return false }
+    if ((bits >> 1) & 7) > 3 { return false }
+    if ((bits >> 4) & 1) == 0 { return false }
+    if (bits >> 5) >= @intCast(u64, chunkSize) { return false }
+    if w == 0 || h == 0 { return false }
+    width.* = w
+    height.* = h
+    return true
+}
+
+fn resetSegmentHeader(d: *Decoder) -> void {
+    d.*.useSegment = false
+    d.*.updateMap = false
+    d.*.absoluteDelta = true
+    var s: usize = 0
+    while s < NUM_MB_SEGMENTS {
+        d.*.quantizer[s] = 0
+        d.*.filterStrength[s] = 0
+        s += 1
+    }
+}
+
+fn parseSegmentHeader(d: *Decoder) -> bool {
+    const br = &d.*.br
+    d.*.useSegment = getValue(br, 1) != 0
+    if d.*.useSegment {
+        d.*.updateMap = getValue(br, 1) != 0
+        if getValue(br, 1) != 0 {
+            d.*.absoluteDelta = getValue(br, 1) != 0
+            var s: usize = 0
+            while s < NUM_MB_SEGMENTS {
+                d.*.quantizer[s] = 0
+                if getValue(br, 1) != 0 { d.*.quantizer[s] = getSignedValue(br, 7) }
+                s += 1
+            }
+            s = 0
+            while s < NUM_MB_SEGMENTS {
+                d.*.filterStrength[s] = 0
+                if getValue(br, 1) != 0 { d.*.filterStrength[s] = getSignedValue(br, 6) }
+                s += 1
+            }
+        }
+        if d.*.updateMap {
+            var s: usize = 0
+            while s < 3 {
+                d.*.segments[s] = 255
+                if getValue(br, 1) != 0 { d.*.segments[s] = getValue(br, 8) }
+                s += 1
+            }
+        }
+    } else {
+        d.*.updateMap = false
+    }
+    return !br.*.eof
+}
+
+// ParsePartitions: the token partitions after the first, their sizes
+// given 3 bytes each; the last runs to the end of the data.
+fn parsePartitions(d: *Decoder, buf: usize, size: usize) -> i32 {
+    const br = &d.*.br
+    var sz = buf
+    const bufEnd = buf + size
+    d.*.numPartsMinusOne = @intCast(usize, (@intCast(u64, 1) << getValue(br, 2)) - 1)
+    const lastPart = d.*.numPartsMinusOne
+    if size < 3 * lastPart { return io.NOT_ENOUGH_DATA }
+    var partStart = buf + lastPart * 3
+    var sizeLeft = size - lastPart * 3
+    var p: usize = 0
+    while p < lastPart {
+        var psize = @intCast(usize, get8(sz) | (get8(sz + 1) << 8) | (get8(sz + 2) << 16))
+        if psize > sizeLeft { psize = sizeLeft }
+        initBitReader(&d.*.parts[p], partStart, psize)
+        partStart += psize
+        sizeLeft -= psize
+        sz += 3
+        p += 1
+    }
+    initBitReader(&d.*.parts[lastPart], partStart, sizeLeft)
+    if partStart < bufEnd { return io.OK }
+    return io.SUSPENDED
+}
+
+fn parseFilterHeader(d: *Decoder) -> bool {
+    const br = &d.*.br
+    d.*.simple = getValue(br, 1) != 0
+    d.*.level = @intCast(i64, getValue(br, 6))
+    d.*.sharpness = @intCast(i64, getValue(br, 3))
+    d.*.useLfDelta = getValue(br, 1) != 0
+    if d.*.useLfDelta {
+        if getValue(br, 1) != 0 {
+            var i: usize = 0
+            while i < 4 {
+                if getValue(br, 1) != 0 { d.*.refLfDelta[i] = getSignedValue(br, 6) }
+                i += 1
+            }
+            i = 0
+            while i < 4 {
+                if getValue(br, 1) != 0 { d.*.modeLfDelta[i] = getSignedValue(br, 6) }
+                i += 1
+            }
+        }
+    }
+    if d.*.level == 0 {
+        d.*.filterType = 0
+    } else if d.*.simple {
+        d.*.filterType = 1
+    } else {
+        d.*.filterType = 2
+    }
+    return !br.*.eof
+}
+
+inline fn clipIndex(v: i64, m: i64) -> usize {
+    if v < 0 { return 0 }
+    if v > m { return @intCast(usize, m) }
+    return @intCast(usize, v)
+}
+
+// VP8ParseQuant.
+fn parseQuant(d: *Decoder) -> void {
+    const br = &d.*.br
+    const baseQ0 = @intCast(i64, getValue(br, 7))
+    var dqy1Dc: i64 = 0
+    var dqy2Dc: i64 = 0
+    var dqy2Ac: i64 = 0
+    var dquvDc: i64 = 0
+    var dquvAc: i64 = 0
+    if getValue(br, 1) != 0 { dqy1Dc = getSignedValue(br, 4) }
+    if getValue(br, 1) != 0 { dqy2Dc = getSignedValue(br, 4) }
+    if getValue(br, 1) != 0 { dqy2Ac = getSignedValue(br, 4) }
+    if getValue(br, 1) != 0 { dquvDc = getSignedValue(br, 4) }
+    if getValue(br, 1) != 0 { dquvAc = getSignedValue(br, 4) }
+    var i: usize = 0
+    while i < NUM_MB_SEGMENTS {
+        var q: i64 = baseQ0
+        var compute = true
+        if d.*.useSegment {
+            q = d.*.quantizer[i]
+            if !d.*.absoluteDelta { q += baseQ0 }
+        } else if i > 0 {
+            d.*.dqm[i] = d.*.dqm[0]
+            compute = false
+        }
+        if compute {
+            const m = &d.*.dqm[i]
+            m.*.y1[0] = @intCast(i64, DC_TABLE[clipIndex(q + dqy1Dc, 127)])
+            m.*.y1[1] = @intCast(i64, AC_TABLE[clipIndex(q, 127)])
+            m.*.y2[0] = @intCast(i64, DC_TABLE[clipIndex(q + dqy2Dc, 127)]) * 2
+            m.*.y2[1] = (@intCast(i64, AC_TABLE[clipIndex(q + dqy2Ac, 127)]) * 101581) >> 16
+            if m.*.y2[1] < 8 { m.*.y2[1] = 8 }
+            m.*.uv[0] = @intCast(i64, DC_TABLE[clipIndex(q + dquvDc, 117)])
+            m.*.uv[1] = @intCast(i64, AC_TABLE[clipIndex(q + dquvAc, 127)])
+            m.*.uvQuant = q + dquvAc
+        }
+        i += 1
+    }
+}
+
+// VP8ParseProba.
+fn parseProba(d: *Decoder) -> void {
+    const br = &d.*.br
+    var i: usize = 0
+    while i < 1056 {
+        var v = @intCast(u64, COEFFS_PROBA0[i])
+        if getBit(br, @intCast(u64, COEFFS_UPDATE_PROBA[i])) != 0 { v = getValue(br, 8) }
+        d.*.bands[i] = @intCast(u8, v & 255)
+        i += 1
+    }
+    d.*.useSkipProba = getValue(br, 1) != 0
+    if d.*.useSkipProba { d.*.skipP = getValue(br, 8) }
+}
+
+// VP8GetHeaders: the frame, picture, segment and filter headers, the
+// partitions, the quantizers and the probabilities, from io.data.
+pub fn getHeaders(d: *Decoder, i: *Io) -> bool {
+    setOk(d)
+    var buf = i.*.data
+    var bufSize = i.*.dataSize
+    if bufSize < 4 { return setError(d, io.NOT_ENOUGH_DATA, io.literal("Truncated header.")) }
+    {
+        const bits = get8(buf) | (get8(buf + 1) << 8) | (get8(buf + 2) << 16)
+        d.*.keyFrame = (bits & 1) == 0
+        d.*.profile = (bits >> 1) & 7
+        d.*.show = ((bits >> 4) & 1) != 0
+        d.*.partitionLength = @intCast(usize, bits >> 5)
+        if d.*.profile > 3 { return setError(d, io.BITSTREAM_ERROR, io.literal("Incorrect keyframe parameters.")) }
+        if !d.*.show { return setError(d, io.UNSUPPORTED_FEATURE, io.literal("Frame not displayable.")) }
+        buf += 3
+        bufSize -= 3
+    }
+    if d.*.keyFrame {
+        if bufSize < 7 { return setError(d, io.NOT_ENOUGH_DATA, io.literal("cannot parse picture header")) }
+        if !checkSignature(buf, bufSize) { return setError(d, io.BITSTREAM_ERROR, io.literal("Bad code word")) }
+        d.*.width = @intCast(i64, ((get8(buf + 4) << 8) | get8(buf + 3)) & 0x3fff)
+        d.*.xscale = get8(buf + 4) >> 6
+        d.*.height = @intCast(i64, ((get8(buf + 6) << 8) | get8(buf + 5)) & 0x3fff)
+        d.*.yscale = get8(buf + 6) >> 6
+        buf += 7
+        bufSize -= 7
+        d.*.mbW = @intCast(usize, (d.*.width + 15) >> 4)
+        d.*.mbH = @intCast(usize, (d.*.height + 15) >> 4)
+        i.*.width = d.*.width
+        i.*.height = d.*.height
+        i.*.useCropping = false
+        i.*.cropTop = 0
+        i.*.cropLeft = 0
+        i.*.cropRight = i.*.width
+        i.*.cropBottom = i.*.height
+        i.*.useScaling = false
+        i.*.scaledWidth = i.*.width
+        i.*.scaledHeight = i.*.height
+        i.*.mbW = i.*.width
+        i.*.mbH = i.*.height
+        d.*.segments[0] = 255
+        d.*.segments[1] = 255
+        d.*.segments[2] = 255
+        resetSegmentHeader(d)
+    }
+    if d.*.partitionLength > bufSize { return setError(d, io.NOT_ENOUGH_DATA, io.literal("bad partition length")) }
+    initBitReader(&d.*.br, buf, d.*.partitionLength)
+    buf += d.*.partitionLength
+    bufSize -= d.*.partitionLength
+    if d.*.keyFrame {
+        d.*.colorspace = getValue(&d.*.br, 1)
+        d.*.clampType = getValue(&d.*.br, 1)
+    }
+    if !parseSegmentHeader(d) { return setError(d, io.BITSTREAM_ERROR, io.literal("cannot parse segment header")) }
+    if !parseFilterHeader(d) { return setError(d, io.BITSTREAM_ERROR, io.literal("cannot parse filter header")) }
+    const status = parsePartitions(d, buf, bufSize)
+    if status != io.OK { return setError(d, status, io.literal("cannot parse partitions")) }
+    parseQuant(d)
+    if !d.*.keyFrame { return setError(d, io.UNSUPPORTED_FEATURE, io.literal("Not a key frame.")) }
+    getValue(&d.*.br, 1)
+    parseProba(d)
+    d.*.ready = true
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Modes and residuals (tree_dec.c, vp8_dec.c)
+
+// The 4x4 mode tree (kYModesIntra4): positive entries go on in the tree,
+// the others are a mode negated.
+fn modeTree(i: usize) -> i64 {
+    var tree: [18]i8 = [18]i8{ 0, 1, -1, 2, -2, 3, 4, 6, -3, 5, -4, -5, -6, 7, -7, 8, -8, -9 }
+    return @intCast(i64, tree[i])
+}
+
+fn parseIntraMode(d: *Decoder, mbX: usize) -> void {
+    const br = &d.*.br
+    const top = d.*.intraT + 4 * mbX
+    const block = d.*.mbData + mbX * MB_DATA_SIZE
+    if d.*.updateMap {
+        var segment: u64 = 0
+        if getBit(br, d.*.segments[0]) == 0 {
+            segment = getBit(br, d.*.segments[1])
+        } else {
+            segment = getBit(br, d.*.segments[2]) + 2
+        }
+        put8(block + MB_SEGMENT, segment)
+    } else {
+        put8(block + MB_SEGMENT, 0)
+    }
+    if d.*.useSkipProba { put8(block + MB_SKIP, getBit(br, d.*.skipP)) }
+    const isI4x4 = getBit(br, 145) == 0
+    if isI4x4 { put8(block + MB_IS_I4X4, 1) } else { put8(block + MB_IS_I4X4, 0) }
+    if !isI4x4 {
+        var ymode: u64 = 0
+        if getBit(br, 156) != 0 {
+            if getBit(br, 128) != 0 { ymode = TM_PRED } else { ymode = H_PRED }
+        } else {
+            if getBit(br, 163) != 0 { ymode = V_PRED } else { ymode = DC_PRED }
+        }
+        put8(block + MB_IMODES, ymode)
+        var k: usize = 0
+        while k < 4 {
+            put8(top + k, ymode)
+            d.*.intraL[k] = @intCast(u8, ymode)
+            k += 1
+        }
+    } else {
+        var modes = block + MB_IMODES
+        var y: usize = 0
+        while y < 4 {
+            var ymode = @intCast(u64, d.*.intraL[y])
+            var x: usize = 0
+            while x < 4 {
+                const prob = @intCast(usize, get8(top + x) * 90 + ymode * 9)
+                var i = modeTree(@intCast(usize, getBit(br, @intCast(u64, BMODES_PROBA[prob]))))
+                while i > 0 {
+                    const index = @intCast(usize, i)
+                    i = modeTree(2 * index + @intCast(usize, getBit(br, @intCast(u64, BMODES_PROBA[prob + index]))))
+                }
+                ymode = @intCast(u64, 0 - i)
+                put8(top + x, ymode)
+                x += 1
+            }
+            io.copy(modes, top, 4)
+            modes += 4
+            d.*.intraL[y] = @intCast(u8, ymode)
+            y += 1
+        }
+    }
+    var uvmode: u64 = DC_PRED
+    if getBit(br, 142) != 0 {
+        if getBit(br, 114) == 0 {
+            uvmode = V_PRED
+        } else if getBit(br, 183) != 0 {
+            uvmode = TM_PRED
+        } else {
+            uvmode = H_PRED
+        }
+    }
+    put8(block + MB_UVMODE, uvmode)
+}
+
+// VP8ParseIntraModeRow.
+pub fn parseIntraModeRow(d: *Decoder) -> bool {
+    var mbX: usize = 0
+    while mbX < d.*.mbW {
+        parseIntraMode(d, mbX)
+        mbX += 1
+    }
+    return !d.*.br.eof
+}
+
+// The band of coefficient N (kBands; 16 is the end).
+fn band(n: usize) -> usize {
+    var bands: [17]u8 = [17]u8{ 0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0 }
+    return @intCast(usize, bands[n])
+}
+
+fn zigzag(n: usize) -> usize {
+    var order: [16]u8 = [16]u8{ 0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15 }
+    return @intCast(usize, order[n])
+}
+
+// The probabilities of TYPE for coefficient N in context CTX.
+inline fn probas(d: *Decoder, t: usize, n: usize, ctx: usize) -> usize {
+    return @intFromPtr(&d.*.bands) + (t * NUM_BANDS + band(n)) * 33 + ctx * 11
+}
+
+// GetLargeValue: a coefficient of 2 and more.
+fn getLargeValue(br: *BoolReader, p: usize) -> i64 {
+    var v: i64 = 0
+    if getBit(br, get8(p + 3)) == 0 {
+        if getBit(br, get8(p + 4)) == 0 {
+            v = 2
+        } else {
+            v = 3 + @intCast(i64, getBit(br, get8(p + 5)))
+        }
+    } else {
+        if getBit(br, get8(p + 6)) == 0 {
+            if getBit(br, get8(p + 7)) == 0 {
+                v = 5 + @intCast(i64, getBit(br, 159))
+            } else {
+                v = 7 + 2 * @intCast(i64, getBit(br, 165))
+                v += @intCast(i64, getBit(br, 145))
+            }
+        } else {
+            const bit1 = getBit(br, get8(p + 8))
+            const bit0 = getBit(br, get8(p + 9 + @intCast(usize, bit1)))
+            const cat = 2 * bit1 + bit0
+            // kCat3456: the probabilities of the extra bits.
+            var cats: [26]u8 = [26]u8{ 173, 148, 140, 0, 176, 155, 140, 135, 0, 180, 157, 141, 134, 130, 0, 254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129 }
+            var at: usize = 0
+            if cat == 1 { at = 4 }
+            if cat == 2 { at = 9 }
+            if cat == 3 { at = 15 }
+            while at < 26 && cats[at] != 0 {
+                v += v + @intCast(i64, getBit(br, @intCast(u64, cats[at])))
+                at += 1
+            }
+            v += 3 + (@intCast(i64, 8) << cat)
+        }
+    }
+    return v
+}
+
+// GetCoeffs: the coefficients of a block from N on, dequantized by DQ0
+// (the first) and DQ1 into OUT (natural order); the position after the
+// last non-zero one.
+fn getCoeffs(d: *Decoder, br: *BoolReader, t: usize, ctx: usize, dq0: i64, dq1: i64, start: usize, out: usize) -> usize {
+    var n = start
+    var p = probas(d, t, n, ctx)
+    while n < 16 {
+        if getBit(br, get8(p)) == 0 { return n }
+        while getBit(br, get8(p + 1)) == 0 {
+            n += 1
+            p = probas(d, t, n, 0)
+            if n == 16 { return 16 }
+        }
+        const next = probas(d, t, n + 1, 0)
+        var v: i64 = 0
+        if getBit(br, get8(p + 2)) == 0 {
+            v = 1
+            p = next + 11
+        } else {
+            v = getLargeValue(br, p)
+            p = next + 22
+        }
+        var dq = dq0
+        if n > 0 { dq = dq1 }
+        putI16(out + 2 * zigzag(n), getSigned(br, v) * dq)
+        n += 1
+    }
+    return 16
+}
+
+inline fn nzCodeBits(nzCoeffs: u64, nz: usize, dcNz: bool) -> u64 {
+    var code: u64 = 0
+    if nz > 3 {
+        code = 3
+    } else if nz > 1 {
+        code = 2
+    } else if dcNz {
+        code = 1
+    }
+    return ((nzCoeffs << 2) & 0xffffffff) | code
+}
+
+// TransformWHT: the 16 luma DC coefficients' inverse Walsh-Hadamard
+// transform into the first coefficient of each block.
+fn transformWHT(input: usize, out: usize) -> void {
+    var tmp: [16]i64 = undefined
+    var i: usize = 0
+    while i < 4 {
+        const a0 = getI16(input + 2 * i) + getI16(input + 2 * (12 + i))
+        const a1 = getI16(input + 2 * (4 + i)) + getI16(input + 2 * (8 + i))
+        const a2 = getI16(input + 2 * (4 + i)) - getI16(input + 2 * (8 + i))
+        const a3 = getI16(input + 2 * i) - getI16(input + 2 * (12 + i))
+        tmp[i] = a0 + a1
+        tmp[8 + i] = a0 - a1
+        tmp[4 + i] = a3 + a2
+        tmp[12 + i] = a3 - a2
+        i += 1
+    }
+    var o = out
+    i = 0
+    while i < 4 {
+        const dc = tmp[i * 4] + 3
+        const a0 = dc + tmp[3 + i * 4]
+        const a1 = tmp[1 + i * 4] + tmp[2 + i * 4]
+        const a2 = tmp[1 + i * 4] - tmp[2 + i * 4]
+        const a3 = dc - tmp[3 + i * 4]
+        putI16(o, (a0 + a1) >> 3)
+        putI16(o + 32, (a3 + a2) >> 3)
+        putI16(o + 64, (a0 - a1) >> 3)
+        putI16(o + 96, (a3 - a2) >> 3)
+        o += 128
+        i += 1
+    }
+}
+
+// ParseResiduals: the macroblock's coefficients, with the non-zero flags
+// of the blocks above (MB) and left; whether all are zero.
+fn parseResiduals(d: *Decoder, mb: usize, tokenBr: *BoolReader) -> bool {
+    const block = d.*.mbData + d.*.mbX * MB_DATA_SIZE
+    const q = &d.*.dqm[@intCast(usize, get8(block + MB_SEGMENT))]
+    var dst = block + MB_COEFFS
+    const leftMb = d.*.mbInfo - 2
+    var nonZeroY: u64 = 0
+    var nonZeroUV: u64 = 0
+    var first: usize = 0
+    var acType: usize = 3
+    io.zero(dst, 768)
+    if get8(block + MB_IS_I4X4) == 0 {
+        var dc: [16]i16 = undefined
+        const dcAddress = @intFromPtr(&dc)
+        io.zero(dcAddress, 32)
+        const ctx = @intCast(usize, get8(mb + 1) + get8(leftMb + 1))
+        const nz = getCoeffs(d, tokenBr, 1, ctx, q.*.y2[0], q.*.y2[1], 0, dcAddress)
+        var flag: u64 = 0
+        if nz > 0 { flag = 1 }
+        put8(mb + 1, flag)
+        put8(leftMb + 1, flag)
+        if nz > 1 {
+            transformWHT(dcAddress, dst)
+        } else {
+            const dc0 = (getI16(dcAddress) + 3) >> 3
+            var i: usize = 0
+            while i < 256 {
+                putI16(dst + 2 * i, dc0)
+                i += 16
+            }
+        }
+        first = 1
+        acType = 0
+    }
+    var tnz = get8(mb) & 0x0f
+    var lnz = get8(leftMb) & 0x0f
+    var y: usize = 0
+    while y < 4 {
+        var l = lnz & 1
+        var nzCoeffs: u64 = 0
+        var x: usize = 0
+        while x < 4 {
+            const ctx = @intCast(usize, l + (tnz & 1))
+            const nz = getCoeffs(d, tokenBr, acType, ctx, q.*.y1[0], q.*.y1[1], first, dst)
+            l = 0
+            if nz > first { l = 1 }
+            tnz = ((tnz >> 1) | (l << 7)) & 0xff
+            nzCoeffs = nzCodeBits(nzCoeffs, nz, getI16(dst) != 0)
+            dst += 32
+            x += 1
+        }
+        tnz = tnz >> 4
+        lnz = ((lnz >> 1) | (l << 7)) & 0xff
+        nonZeroY = ((nonZeroY << 8) & 0xffffffff) | nzCoeffs
+        y += 1
+    }
+    var outTNz = tnz
+    var outLNz = lnz >> 4
+    var ch: u64 = 0
+    while ch < 4 {
+        var nzCoeffs: u64 = 0
+        tnz = (get8(mb) >> (4 + ch)) & 0xff
+        lnz = (get8(leftMb) >> (4 + ch)) & 0xff
+        y = 0
+        while y < 2 {
+            var l = lnz & 1
+            var x: usize = 0
+            while x < 2 {
+                const ctx = @intCast(usize, l + (tnz & 1))
+                const nz = getCoeffs(d, tokenBr, 2, ctx, q.*.uv[0], q.*.uv[1], 0, dst)
+                l = 0
+                if nz > 0 { l = 1 }
+                tnz = ((tnz >> 1) | (l << 3)) & 0xff
+                nzCoeffs = nzCodeBits(nzCoeffs, nz, getI16(dst) != 0)
+                dst += 32
+                x += 1
+            }
+            tnz = tnz >> 2
+            lnz = ((lnz >> 1) | (l << 5)) & 0xff
+            y += 1
+        }
+        nonZeroUV = nonZeroUV | ((nzCoeffs << (4 * ch)) & 0xffffffff)
+        outTNz = outTNz | ((tnz << 4) << ch)
+        outLNz = outLNz | ((lnz & 0xf0) << ch)
+        ch += 2
+    }
+    put8(mb, outTNz)
+    put8(leftMb, outLNz)
+    io.put32(block + MB_NON_ZERO_Y, nonZeroY)
+    io.put32(block + MB_NON_ZERO_UV, nonZeroUV)
+    return (nonZeroY | nonZeroUV) == 0
+}
+
+// VP8DecodeMB: the current macroblock's residuals and filter strength;
+// false when its partition ran out.
+pub fn decodeMB(d: *Decoder, tokenBr: *BoolReader) -> bool {
+    const left = d.*.mbInfo - 2
+    const mb = d.*.mbInfo + 2 * d.*.mbX
+    const block = d.*.mbData + d.*.mbX * MB_DATA_SIZE
+    var skip = false
+    if d.*.useSkipProba { skip = get8(block + MB_SKIP) != 0 }
+    if !skip {
+        skip = parseResiduals(d, mb, tokenBr)
+    } else {
+        put8(left, 0)
+        put8(mb, 0)
+        if get8(block + MB_IS_I4X4) == 0 {
+            put8(left + 1, 0)
+            put8(mb + 1, 0)
+        }
+        io.put32(block + MB_NON_ZERO_Y, 0)
+        io.put32(block + MB_NON_ZERO_UV, 0)
+    }
+    if d.*.filterType > 0 {
+        const finfo = d.*.fInfo + 4 * d.*.mbX
+        const strength = @intFromPtr(&d.*.fstrengths) + (@intCast(usize, get8(block + MB_SEGMENT)) * 2 + @intCast(usize, get8(block + MB_IS_I4X4))) * 4
+        io.copy(finfo, strength, 4)
+        if !skip { put8(finfo + 2, get8(finfo + 2) | 1) }
+    }
+    return !tokenBr.*.eof
+}
+
+// VP8InitScanline.
+pub fn initScanline(d: *Decoder) -> void {
+    const left = d.*.mbInfo - 2
+    put8(left, 0)
+    put8(left + 1, 0)
+    var k: usize = 0
+    while k < 4 {
+        d.*.intraL[k] = 0
+        k += 1
+    }
+    d.*.mbX = 0
+}
+
+// The macroblock's saved non-zero flags (the incremental decoder's
+// MBContext): the left one in the low byte pair, the current one above.
+pub fn saveFlags(d: *Decoder) -> u64 {
+    return io.get16(d.*.mbInfo - 2) | (io.get16(d.*.mbInfo + 2 * d.*.mbX) << 16)
+}
+
+pub fn restoreFlags(d: *Decoder, flags: u64) -> void {
+    io.put16(d.*.mbInfo - 2, flags)
+    io.put16(d.*.mbInfo + 2 * d.*.mbX, flags >> 16)
+}
+
+// ---------------------------------------------------------------------------
+// Prediction and transforms (dsp/dec.c)
+
+inline fn clip8b(v: i64) -> u64 {
+    if v >= 0 && v < 256 { return @intCast(u64, v) }
+    if v < 0 { return 0 }
+    return 255
+}
+
+// The low 16 bits of V, signed (an SSE2 16-bit lane).
+inline fn w16(v: i64) -> i64 {
+    const low = @bitCast(u64, v) & 0xffff
+    if low >= 0x8000 { return @intCast(i64, low) - 65536 }
+    return @intCast(i64, low)
+}
+
+// _mm_mulhi_epi16.
+inline fn mulhi(a: i64, k: i64) -> i64 { return (a * k) >> 16 }
+
+// Transform_SSE2 on one block: the inverse DCT of IN's 16 coefficients
+// added to the 4x4 samples at DST, in 16-bit lanes.
+fn transformOne(input: usize, dst: usize) -> void {
+    var tmp: [16]i64 = undefined
+    var i: usize = 0
+    while i < 4 {
+        const in0 = getI16(input + 2 * i)
+        const in1 = getI16(input + 2 * (4 + i))
+        const in2 = getI16(input + 2 * (8 + i))
+        const in3 = getI16(input + 2 * (12 + i))
+        const a = w16(in0 + in2)
+        const b = w16(in0 - in2)
+        const c = w16(w16(in1 - in3) + w16(mulhi(in1, 0 - 30068) - mulhi(in3, 20091)))
+        const d = w16(w16(in1 + in3) + w16(mulhi(in1, 20091) + mulhi(in3, 0 - 30068)))
+        tmp[4 * i] = w16(a + d)
+        tmp[4 * i + 1] = w16(b + c)
+        tmp[4 * i + 2] = w16(b - c)
+        tmp[4 * i + 3] = w16(a - d)
+        i += 1
+    }
+    i = 0
+    while i < 4 {
+        const t0 = tmp[i]
+        const t1 = tmp[4 + i]
+        const t2 = tmp[8 + i]
+        const t3 = tmp[12 + i]
+        const dc = w16(t0 + 4)
+        const a = w16(dc + t2)
+        const b = w16(dc - t2)
+        const c = w16(w16(t1 - t3) + w16(mulhi(t1, 0 - 30068) - mulhi(t3, 20091)))
+        const d = w16(w16(t1 + t3) + w16(mulhi(t1, 20091) + mulhi(t3, 0 - 30068)))
+        const row = dst + i * BPS
+        put8(row, clip8b(@intCast(i64, get8(row)) + (w16(a + d) >> 3)))
+        put8(row + 1, clip8b(@intCast(i64, get8(row + 1)) + (w16(b + c) >> 3)))
+        put8(row + 2, clip8b(@intCast(i64, get8(row + 2)) + (w16(b - c) >> 3)))
+        put8(row + 3, clip8b(@intCast(i64, get8(row + 3)) + (w16(a - d) >> 3)))
+        i += 1
+    }
+}
+
+inline fn mul1(a: i64) -> i64 { return ((a * 20091) >> 16) + a }
+inline fn mul2(a: i64) -> i64 { return (a * 35468) >> 16 }
+
+inline fn store(dst: usize, x: usize, y: usize, v: i64) -> void {
+    const at = dst + x + y * BPS
+    put8(at, clip8b(@intCast(i64, get8(at)) + (v >> 3)))
+}
+
+fn store2(dst: usize, y: usize, dc: i64, d: i64, c: i64) -> void {
+    store(dst, 0, y, dc + d)
+    store(dst, 1, y, dc + c)
+    store(dst, 2, y, dc - c)
+    store(dst, 3, y, dc - d)
+}
+
+// TransformAC3: a block with only coefficients 0, 1 and 4.
+fn transformAC3(input: usize, dst: usize) -> void {
+    const a = getI16(input) + 4
+    const c4 = mul2(getI16(input + 8))
+    const d4 = mul1(getI16(input + 8))
+    const c1 = mul2(getI16(input + 2))
+    const d1 = mul1(getI16(input + 2))
+    store2(dst, 0, a + d4, d1, c1)
+    store2(dst, 1, a + c4, d1, c1)
+    store2(dst, 2, a - c4, d1, c1)
+    store2(dst, 3, a - d4, d1, c1)
+}
+
+fn transformDC(input: usize, dst: usize) -> void {
+    const dc = getI16(input) + 4
+    var j: usize = 0
+    while j < 4 {
+        var i: usize = 0
+        while i < 4 {
+            store(dst, i, j, dc)
+            i += 1
+        }
+        j += 1
+    }
+}
+
+// DoTransform: by the block's two bits (3: all, 2: AC3, 1: DC only).
+fn doTransform(bits: u64, input: usize, dst: usize) -> void {
+    const kind = (bits >> 30) & 3
+    if kind == 3 {
+        transformOne(input, dst)
+    } else if kind == 2 {
+        transformAC3(input, dst)
+    } else if kind == 1 {
+        transformDC(input, dst)
+    }
+}
+
+fn doUVTransform(bits: u64, input: usize, dst: usize) -> void {
+    if (bits & 0xff) != 0 {
+        if (bits & 0xaa) != 0 {
+            transformOne(input, dst)
+            transformOne(input + 32, dst + 4)
+            transformOne(input + 64, dst + 4 * BPS)
+            transformOne(input + 96, dst + 4 * BPS + 4)
+        } else {
+            if getI16(input) != 0 { transformDC(input, dst) }
+            if getI16(input + 32) != 0 { transformDC(input + 32, dst + 4) }
+            if getI16(input + 64) != 0 { transformDC(input + 64, dst + 4 * BPS) }
+            if getI16(input + 96) != 0 { transformDC(input + 96, dst + 4 * BPS + 4) }
+        }
+    }
+}
+
+inline fn above(dst: usize, x: usize) -> u64 { return get8(dst - BPS + x) }
+inline fn leftOf(dst: usize, y: usize) -> u64 { return get8(dst + y * BPS - 1) }
+
+fn trueMotion(dst: usize, size: usize) -> void {
+    const corner = @intCast(i64, get8(dst - BPS - 1))
+    var y: usize = 0
+    while y < size {
+        const l = @intCast(i64, leftOf(dst, y)) - corner
+        var x: usize = 0
+        while x < size {
+            put8(dst + y * BPS + x, clip8b(@intCast(i64, above(dst, x)) + l))
+            x += 1
+        }
+        y += 1
+    }
+}
+
+fn fillBlock(dst: usize, size: usize, value: u64) -> void {
+    var j: usize = 0
+    while j < size {
+        io.fill(dst + j * BPS, value, size)
+        j += 1
+    }
+}
+
+fn verticalPred(dst: usize, size: usize) -> void {
+    var j: usize = 0
+    while j < size {
+        io.copy(dst + j * BPS, dst - BPS, size)
+        j += 1
+    }
+}
+
+fn horizontalPred(dst: usize, size: usize) -> void {
+    var j: usize = 0
+    while j < size {
+        io.fill(dst + j * BPS, leftOf(dst, j), size)
+        j += 1
+    }
+}
+
+// The 16x16 and 8x8 predictions (VP8PredLuma16, VP8PredChroma8) by mode,
+// with the DC ones that lack the top or left samples (SIZE 16 or 8,
+// SHIFT the log2 of twice the size).
+fn predictBlock(dst: usize, size: usize, shift: u64, mode: u64) -> void {
+    if mode == TM_PRED {
+        trueMotion(dst, size)
+    } else if mode == V_PRED {
+        verticalPred(dst, size)
+    } else if mode == H_PRED {
+        horizontalPred(dst, size)
+    } else if mode == DC_PRED {
+        var dc: u64 = @intCast(u64, size)
+        var j: usize = 0
+        while j < size {
+            dc += leftOf(dst, j) + above(dst, j)
+            j += 1
+        }
+        fillBlock(dst, size, dc >> shift)
+    } else if mode == B_DC_PRED_NOTOP {
+        var dc: u64 = @intCast(u64, size >> 1)
+        var j: usize = 0
+        while j < size {
+            dc += leftOf(dst, j)
+            j += 1
+        }
+        fillBlock(dst, size, dc >> (shift - 1))
+    } else if mode == B_DC_PRED_NOLEFT {
+        var dc: u64 = @intCast(u64, size >> 1)
+        var j: usize = 0
+        while j < size {
+            dc += above(dst, j)
+            j += 1
+        }
+        fillBlock(dst, size, dc >> (shift - 1))
+    } else {
+        fillBlock(dst, size, 0x80)
+    }
+}
+
+inline fn avg3(a: u64, b: u64, c: u64) -> u64 { return (a + 2 * b + c + 2) >> 2 }
+inline fn avg2(a: u64, b: u64) -> u64 { return (a + b + 1) >> 1 }
+inline fn dst4(dst: usize, x: usize, y: usize, v: u64) -> void { put8(dst + x + y * BPS, v) }
+
+// The 4x4 predictions (VP8PredLuma4).
+fn predict4(dst: usize, mode: u64) -> void {
+    if mode == B_DC_PRED {
+        var dc: u64 = 4
+        var i: usize = 0
+        while i < 4 {
+            dc += above(dst, i) + leftOf(dst, i)
+            i += 1
+        }
+        fillBlock(dst, 4, dc >> 3)
+    } else if mode == B_TM_PRED {
+        trueMotion(dst, 4)
+    } else if mode == B_VE_PRED {
+        const v0 = avg3(get8(dst - BPS - 1), above(dst, 0), above(dst, 1))
+        const v1 = avg3(above(dst, 0), above(dst, 1), above(dst, 2))
+        const v2 = avg3(above(dst, 1), above(dst, 2), above(dst, 3))
+        const v3 = avg3(above(dst, 2), above(dst, 3), above(dst, 4))
+        var j: usize = 0
+        while j < 4 {
+            dst4(dst, 0, j, v0)
+            dst4(dst, 1, j, v1)
+            dst4(dst, 2, j, v2)
+            dst4(dst, 3, j, v3)
+            j += 1
+        }
+    } else if mode == B_HE_PRED {
+        const A = get8(dst - 1 - BPS)
+        const B = leftOf(dst, 0)
+        const C = leftOf(dst, 1)
+        const D = leftOf(dst, 2)
+        const E = leftOf(dst, 3)
+        io.fill(dst, avg3(A, B, C), 4)
+        io.fill(dst + BPS, avg3(B, C, D), 4)
+        io.fill(dst + 2 * BPS, avg3(C, D, E), 4)
+        io.fill(dst + 3 * BPS, avg3(D, E, E), 4)
+    } else if mode == B_RD_PRED {
+        const I = leftOf(dst, 0)
+        const J = leftOf(dst, 1)
+        const K = leftOf(dst, 2)
+        const L = leftOf(dst, 3)
+        const X = get8(dst - 1 - BPS)
+        const A = above(dst, 0)
+        const B = above(dst, 1)
+        const C = above(dst, 2)
+        const D = above(dst, 3)
+        dst4(dst, 0, 3, avg3(J, K, L))
+        const ijk = avg3(I, J, K)
+        dst4(dst, 1, 3, ijk)
+        dst4(dst, 0, 2, ijk)
+        const xij = avg3(X, I, J)
+        dst4(dst, 2, 3, xij)
+        dst4(dst, 1, 2, xij)
+        dst4(dst, 0, 1, xij)
+        const axi = avg3(A, X, I)
+        dst4(dst, 3, 3, axi)
+        dst4(dst, 2, 2, axi)
+        dst4(dst, 1, 1, axi)
+        dst4(dst, 0, 0, axi)
+        const bax = avg3(B, A, X)
+        dst4(dst, 3, 2, bax)
+        dst4(dst, 2, 1, bax)
+        dst4(dst, 1, 0, bax)
+        const cba = avg3(C, B, A)
+        dst4(dst, 3, 1, cba)
+        dst4(dst, 2, 0, cba)
+        dst4(dst, 3, 0, avg3(D, C, B))
+    } else if mode == B_LD_PRED {
+        const A = above(dst, 0)
+        const B = above(dst, 1)
+        const C = above(dst, 2)
+        const D = above(dst, 3)
+        const E = above(dst, 4)
+        const F = above(dst, 5)
+        const G = above(dst, 6)
+        const H = above(dst, 7)
+        dst4(dst, 0, 0, avg3(A, B, C))
+        const bcd = avg3(B, C, D)
+        dst4(dst, 1, 0, bcd)
+        dst4(dst, 0, 1, bcd)
+        const cde = avg3(C, D, E)
+        dst4(dst, 2, 0, cde)
+        dst4(dst, 1, 1, cde)
+        dst4(dst, 0, 2, cde)
+        const def = avg3(D, E, F)
+        dst4(dst, 3, 0, def)
+        dst4(dst, 2, 1, def)
+        dst4(dst, 1, 2, def)
+        dst4(dst, 0, 3, def)
+        const efg = avg3(E, F, G)
+        dst4(dst, 3, 1, efg)
+        dst4(dst, 2, 2, efg)
+        dst4(dst, 1, 3, efg)
+        const fgh = avg3(F, G, H)
+        dst4(dst, 3, 2, fgh)
+        dst4(dst, 2, 3, fgh)
+        dst4(dst, 3, 3, avg3(G, H, H))
+    } else if mode == B_VR_PRED {
+        const I = leftOf(dst, 0)
+        const J = leftOf(dst, 1)
+        const K = leftOf(dst, 2)
+        const X = get8(dst - 1 - BPS)
+        const A = above(dst, 0)
+        const B = above(dst, 1)
+        const C = above(dst, 2)
+        const D = above(dst, 3)
+        const xa = avg2(X, A)
+        dst4(dst, 0, 0, xa)
+        dst4(dst, 1, 2, xa)
+        const ab = avg2(A, B)
+        dst4(dst, 1, 0, ab)
+        dst4(dst, 2, 2, ab)
+        const bc = avg2(B, C)
+        dst4(dst, 2, 0, bc)
+        dst4(dst, 3, 2, bc)
+        dst4(dst, 3, 0, avg2(C, D))
+        dst4(dst, 0, 3, avg3(K, J, I))
+        dst4(dst, 0, 2, avg3(J, I, X))
+        const ixa = avg3(I, X, A)
+        dst4(dst, 0, 1, ixa)
+        dst4(dst, 1, 3, ixa)
+        const xab = avg3(X, A, B)
+        dst4(dst, 1, 1, xab)
+        dst4(dst, 2, 3, xab)
+        const abc = avg3(A, B, C)
+        dst4(dst, 2, 1, abc)
+        dst4(dst, 3, 3, abc)
+        dst4(dst, 3, 1, avg3(B, C, D))
+    } else if mode == B_VL_PRED {
+        const A = above(dst, 0)
+        const B = above(dst, 1)
+        const C = above(dst, 2)
+        const D = above(dst, 3)
+        const E = above(dst, 4)
+        const F = above(dst, 5)
+        const G = above(dst, 6)
+        const H = above(dst, 7)
+        dst4(dst, 0, 0, avg2(A, B))
+        const bc = avg2(B, C)
+        dst4(dst, 1, 0, bc)
+        dst4(dst, 0, 2, bc)
+        const cd = avg2(C, D)
+        dst4(dst, 2, 0, cd)
+        dst4(dst, 1, 2, cd)
+        const de = avg2(D, E)
+        dst4(dst, 3, 0, de)
+        dst4(dst, 2, 2, de)
+        dst4(dst, 0, 1, avg3(A, B, C))
+        const bcd = avg3(B, C, D)
+        dst4(dst, 1, 1, bcd)
+        dst4(dst, 0, 3, bcd)
+        const cde = avg3(C, D, E)
+        dst4(dst, 2, 1, cde)
+        dst4(dst, 1, 3, cde)
+        const def = avg3(D, E, F)
+        dst4(dst, 3, 1, def)
+        dst4(dst, 2, 3, def)
+        dst4(dst, 3, 2, avg3(E, F, G))
+        dst4(dst, 3, 3, avg3(F, G, H))
+    } else if mode == B_HD_PRED {
+        const I = leftOf(dst, 0)
+        const J = leftOf(dst, 1)
+        const K = leftOf(dst, 2)
+        const L = leftOf(dst, 3)
+        const X = get8(dst - 1 - BPS)
+        const A = above(dst, 0)
+        const B = above(dst, 1)
+        const C = above(dst, 2)
+        const ix = avg2(I, X)
+        dst4(dst, 0, 0, ix)
+        dst4(dst, 2, 1, ix)
+        const ji = avg2(J, I)
+        dst4(dst, 0, 1, ji)
+        dst4(dst, 2, 2, ji)
+        const kj = avg2(K, J)
+        dst4(dst, 0, 2, kj)
+        dst4(dst, 2, 3, kj)
+        dst4(dst, 0, 3, avg2(L, K))
+        dst4(dst, 3, 0, avg3(A, B, C))
+        dst4(dst, 2, 0, avg3(X, A, B))
+        const ixa = avg3(I, X, A)
+        dst4(dst, 1, 0, ixa)
+        dst4(dst, 3, 1, ixa)
+        const jix = avg3(J, I, X)
+        dst4(dst, 1, 1, jix)
+        dst4(dst, 3, 2, jix)
+        const kji = avg3(K, J, I)
+        dst4(dst, 1, 2, kji)
+        dst4(dst, 3, 3, kji)
+        dst4(dst, 1, 3, avg3(L, K, J))
+    } else {
+        const I = leftOf(dst, 0)
+        const J = leftOf(dst, 1)
+        const K = leftOf(dst, 2)
+        const L = leftOf(dst, 3)
+        dst4(dst, 0, 0, avg2(I, J))
+        const jk = avg2(J, K)
+        dst4(dst, 2, 0, jk)
+        dst4(dst, 0, 1, jk)
+        const kl = avg2(K, L)
+        dst4(dst, 2, 1, kl)
+        dst4(dst, 0, 2, kl)
+        dst4(dst, 1, 0, avg3(I, J, K))
+        const jkl = avg3(J, K, L)
+        dst4(dst, 3, 0, jkl)
+        dst4(dst, 1, 1, jkl)
+        const kll = avg3(K, L, L)
+        dst4(dst, 3, 1, kll)
+        dst4(dst, 1, 2, kll)
+        dst4(dst, 3, 2, L)
+        dst4(dst, 2, 2, L)
+        dst4(dst, 0, 3, L)
+        dst4(dst, 1, 3, L)
+        dst4(dst, 2, 3, L)
+        dst4(dst, 3, 3, L)
+    }
+}
+
+fn checkMode(mbX: usize, mbY: usize, mode: u64) -> u64 {
+    if mode == B_DC_PRED {
+        if mbX == 0 {
+            if mbY == 0 { return B_DC_PRED_NOTOPLEFT }
+            return B_DC_PRED_NOLEFT
+        }
+        if mbY == 0 { return B_DC_PRED_NOTOP }
+        return B_DC_PRED
+    }
+    return mode
+}
+
+// The position of the 4x4 block N in the work buffer (kScan).
+inline fn scan(n: usize) -> usize { return (n & 3) * 4 + (n >> 2) * 4 * BPS }
+
+// ReconstructRow: the row's macroblocks predicted and transformed in the
+// work buffer, then copied into the row cache.
+fn reconstructRow(d: *Decoder) -> void {
+    const mbY = d.*.ctxMbY
+    const yDst = d.*.yuvB + Y_OFF
+    const uDst = d.*.yuvB + U_OFF
+    const vDst = d.*.yuvB + V_OFF
+    var j: usize = 0
+    while j < 16 {
+        put8(yDst + j * BPS - 1, 129)
+        j += 1
+    }
+    j = 0
+    while j < 8 {
+        put8(uDst + j * BPS - 1, 129)
+        put8(vDst + j * BPS - 1, 129)
+        j += 1
+    }
+    if mbY > 0 {
+        put8(yDst - 1 - BPS, 129)
+        put8(uDst - 1 - BPS, 129)
+        put8(vDst - 1 - BPS, 129)
+    } else {
+        io.fill(yDst - BPS - 1, 127, 16 + 4 + 1)
+        io.fill(uDst - BPS - 1, 127, 8 + 1)
+        io.fill(vDst - BPS - 1, 127, 8 + 1)
+    }
+    var mbX: usize = 0
+    while mbX < d.*.mbW {
+        const block = d.*.mbData + mbX * MB_DATA_SIZE
+        if mbX > 0 {
+            var k: usize = 0
+            while k < 17 {
+                io.copy(yDst + k * BPS - BPS - 4, yDst + k * BPS - BPS + 12, 4)
+                k += 1
+            }
+            k = 0
+            while k < 9 {
+                io.copy(uDst + k * BPS - BPS - 4, uDst + k * BPS - BPS + 4, 4)
+                io.copy(vDst + k * BPS - BPS - 4, vDst + k * BPS - BPS + 4, 4)
+                k += 1
+            }
+        }
+        const topYuv = d.*.yuvT + 32 * mbX
+        const coeffs = block + MB_COEFFS
+        var bits = io.get32(block + MB_NON_ZERO_Y)
+        if mbY > 0 {
+            io.copy(yDst - BPS, topYuv, 16)
+            io.copy(uDst - BPS, topYuv + 16, 8)
+            io.copy(vDst - BPS, topYuv + 24, 8)
+        }
+        if get8(block + MB_IS_I4X4) != 0 {
+            const topRight = yDst - BPS + 16
+            if mbY > 0 {
+                if mbX >= d.*.mbW - 1 {
+                    io.fill(topRight, get8(topYuv + 15), 4)
+                } else {
+                    io.copy(topRight, topYuv + 32, 4)
+                }
+            }
+            io.copy(topRight + 4 * BPS, topRight, 4)
+            io.copy(topRight + 8 * BPS, topRight, 4)
+            io.copy(topRight + 12 * BPS, topRight, 4)
+            var n: usize = 0
+            while n < 16 {
+                const dst = yDst + scan(n)
+                predict4(dst, get8(block + MB_IMODES + n))
+                doTransform(bits, coeffs + n * 32, dst)
+                bits = (bits << 2) & 0xffffffff
+                n += 1
+            }
+        } else {
+            predictBlock(yDst, 16, 5, checkMode(mbX, mbY, get8(block + MB_IMODES)))
+            if bits != 0 {
+                var n: usize = 0
+                while n < 16 {
+                    doTransform(bits, coeffs + n * 32, yDst + scan(n))
+                    bits = (bits << 2) & 0xffffffff
+                    n += 1
+                }
+            }
+        }
+        {
+            const bitsUV = io.get32(block + MB_NON_ZERO_UV)
+            const mode = checkMode(mbX, mbY, get8(block + MB_UVMODE))
+            predictBlock(uDst, 8, 4, mode)
+            predictBlock(vDst, 8, 4, mode)
+            doUVTransform(bitsUV, coeffs + 16 * 32, uDst)
+            doUVTransform(bitsUV >> 8, coeffs + 20 * 32, vDst)
+        }
+        if mbY < d.*.mbH - 1 {
+            io.copy(topYuv, yDst + 15 * BPS, 16)
+            io.copy(topYuv + 16, uDst + 7 * BPS, 8)
+            io.copy(topYuv + 24, vDst + 7 * BPS, 8)
+        }
+        const yOut = d.*.cacheY + mbX * 16
+        const uOut = d.*.cacheU + mbX * 8
+        const vOut = d.*.cacheV + mbX * 8
+        j = 0
+        while j < 16 {
+            io.copy(yOut + j * d.*.cacheYStride, yDst + j * BPS, 16)
+            j += 1
+        }
+        j = 0
+        while j < 8 {
+            io.copy(uOut + j * d.*.cacheUVStride, uDst + j * BPS, 8)
+            io.copy(vOut + j * d.*.cacheUVStride, vDst + j * BPS, 8)
+            j += 1
+        }
+        mbX += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The loop filter (dsp/dec.c and its clip tables)
+
+inline fn sclip1(v: i64) -> i64 {
+    if v < 0 - 128 { return 0 - 128 }
+    if v > 127 { return 127 }
+    return v
+}
+
+inline fn sclip2(v: i64) -> i64 {
+    if v < 0 - 16 { return 0 - 16 }
+    if v > 15 { return 15 }
+    return v
+}
+
+inline fn clip1(v: i64) -> u64 { return clip8b(v) }
+
+inline fn abs0(v: i64) -> i64 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+inline fn px(p: usize, k: i64, step: usize) -> i64 {
+    if k >= 0 { return @intCast(i64, get8(p + @intCast(usize, k) * step)) }
+    return @intCast(i64, get8(p - @intCast(usize, 0 - k) * step))
+}
+
+inline fn setPx(p: usize, k: i64, step: usize, v: u64) -> void {
+    if k >= 0 {
+        put8(p + @intCast(usize, k) * step, v)
+    } else {
+        put8(p - @intCast(usize, 0 - k) * step, v)
+    }
+}
+
+fn doFilter2(p: usize, step: usize) -> void {
+    const p1 = px(p, 0 - 2, step)
+    const p0 = px(p, 0 - 1, step)
+    const q0 = px(p, 0, step)
+    const q1 = px(p, 1, step)
+    const a = 3 * (q0 - p0) + sclip1(p1 - q1)
+    const a1 = sclip2((a + 4) >> 3)
+    const a2 = sclip2((a + 3) >> 3)
+    setPx(p, 0 - 1, step, clip1(p0 + a2))
+    setPx(p, 0, step, clip1(q0 - a1))
+}
+
+fn doFilter4(p: usize, step: usize) -> void {
+    const p1 = px(p, 0 - 2, step)
+    const p0 = px(p, 0 - 1, step)
+    const q0 = px(p, 0, step)
+    const q1 = px(p, 1, step)
+    const a = 3 * (q0 - p0)
+    const a1 = sclip2((a + 4) >> 3)
+    const a2 = sclip2((a + 3) >> 3)
+    const a3 = (a1 + 1) >> 1
+    setPx(p, 0 - 2, step, clip1(p1 + a3))
+    setPx(p, 0 - 1, step, clip1(p0 + a2))
+    setPx(p, 0, step, clip1(q0 - a1))
+    setPx(p, 1, step, clip1(q1 - a3))
+}
+
+fn doFilter6(p: usize, step: usize) -> void {
+    const p2 = px(p, 0 - 3, step)
+    const p1 = px(p, 0 - 2, step)
+    const p0 = px(p, 0 - 1, step)
+    const q0 = px(p, 0, step)
+    const q1 = px(p, 1, step)
+    const q2 = px(p, 2, step)
+    const a = sclip1(3 * (q0 - p0) + sclip1(p1 - q1))
+    const a1 = (27 * a + 63) >> 7
+    const a2 = (18 * a + 63) >> 7
+    const a3 = (9 * a + 63) >> 7
+    setPx(p, 0 - 3, step, clip1(p2 + a3))
+    setPx(p, 0 - 2, step, clip1(p1 + a2))
+    setPx(p, 0 - 1, step, clip1(p0 + a1))
+    setPx(p, 0, step, clip1(q0 - a1))
+    setPx(p, 1, step, clip1(q1 - a2))
+    setPx(p, 2, step, clip1(q2 - a3))
+}
+
+fn hev(p: usize, step: usize, thresh: i64) -> bool {
+    const p1 = px(p, 0 - 2, step)
+    const p0 = px(p, 0 - 1, step)
+    const q0 = px(p, 0, step)
+    const q1 = px(p, 1, step)
+    return abs0(p1 - p0) > thresh || abs0(q1 - q0) > thresh
+}
+
+fn needsFilter(p: usize, step: usize, t: i64) -> bool {
+    const p1 = px(p, 0 - 2, step)
+    const p0 = px(p, 0 - 1, step)
+    const q0 = px(p, 0, step)
+    const q1 = px(p, 1, step)
+    return 4 * abs0(p0 - q0) + abs0(p1 - q1) <= t
+}
+
+fn needsFilter2(p: usize, step: usize, t: i64, it: i64) -> bool {
+    const p3 = px(p, 0 - 4, step)
+    const p2 = px(p, 0 - 3, step)
+    const p1 = px(p, 0 - 2, step)
+    const p0 = px(p, 0 - 1, step)
+    const q0 = px(p, 0, step)
+    const q1 = px(p, 1, step)
+    const q2 = px(p, 2, step)
+    const q3 = px(p, 3, step)
+    if 4 * abs0(p0 - q0) + abs0(p1 - q1) > t { return false }
+    return abs0(p3 - p2) <= it && abs0(p2 - p1) <= it && abs0(p1 - p0) <= it && abs0(q3 - q2) <= it && abs0(q2 - q1) <= it && abs0(q1 - q0) <= it
+}
+
+// The simple filter across an edge of 16 pixels: HSTEP across it,
+// VSTEP along it.
+fn simpleFilter16(p: usize, hstep: usize, vstep: usize, thresh: i64) -> void {
+    const thresh2 = 2 * thresh + 1
+    var i: usize = 0
+    while i < 16 {
+        if needsFilter(p + i * vstep, hstep, thresh2) { doFilter2(p + i * vstep, hstep) }
+        i += 1
+    }
+}
+
+// FilterLoop26 (macroblock edges, SIX true) and FilterLoop24 (inner).
+fn filterLoop(p: usize, hstep: usize, vstep: usize, size: usize, thresh: i64, ithresh: i64, hevThresh: i64, six: bool) -> void {
+    const thresh2 = 2 * thresh + 1
+    var q = p
+    var n: usize = 0
+    while n < size {
+        if needsFilter2(q, hstep, thresh2, ithresh) {
+            if hev(q, hstep, hevThresh) {
+                doFilter2(q, hstep)
+            } else if six {
+                doFilter6(q, hstep)
+            } else {
+                doFilter4(q, hstep)
+            }
+        }
+        q += vstep
+        n += 1
+    }
+}
+
+// DoFilter: the macroblock at MB_X of the row being finished.
+fn doFilter(d: *Decoder, mbX: usize, mbY: usize) -> void {
+    const yBps = d.*.cacheYStride
+    const fInfo = d.*.fInfo + 4 * mbX
+    const yDst = d.*.cacheY + mbX * 16
+    const limit = @intCast(i64, get8(fInfo))
+    const ilevel = @intCast(i64, get8(fInfo + 1))
+    const inner = get8(fInfo + 2) != 0
+    if limit == 0 { return }
+    if d.*.filterType == 1 {
+        if mbX > 0 { simpleFilter16(yDst, 1, yBps, limit + 4) }
+        if inner {
+            simpleFilter16(yDst + 4, 1, yBps, limit)
+            simpleFilter16(yDst + 8, 1, yBps, limit)
+            simpleFilter16(yDst + 12, 1, yBps, limit)
+        }
+        if mbY > 0 { simpleFilter16(yDst, yBps, 1, limit + 4) }
+        if inner {
+            simpleFilter16(yDst + 4 * yBps, yBps, 1, limit)
+            simpleFilter16(yDst + 8 * yBps, yBps, 1, limit)
+            simpleFilter16(yDst + 12 * yBps, yBps, 1, limit)
+        }
+    } else {
+        const uvBps = d.*.cacheUVStride
+        const uDst = d.*.cacheU + mbX * 8
+        const vDst = d.*.cacheV + mbX * 8
+        const hevThresh = @intCast(i64, get8(fInfo + 3))
+        if mbX > 0 {
+            filterLoop(yDst, 1, yBps, 16, limit + 4, ilevel, hevThresh, true)
+            filterLoop(uDst, 1, uvBps, 8, limit + 4, ilevel, hevThresh, true)
+            filterLoop(vDst, 1, uvBps, 8, limit + 4, ilevel, hevThresh, true)
+        }
+        if inner {
+            filterLoop(yDst + 4, 1, yBps, 16, limit, ilevel, hevThresh, false)
+            filterLoop(yDst + 8, 1, yBps, 16, limit, ilevel, hevThresh, false)
+            filterLoop(yDst + 12, 1, yBps, 16, limit, ilevel, hevThresh, false)
+            filterLoop(uDst + 4, 1, uvBps, 8, limit, ilevel, hevThresh, false)
+            filterLoop(vDst + 4, 1, uvBps, 8, limit, ilevel, hevThresh, false)
+        }
+        if mbY > 0 {
+            filterLoop(yDst, yBps, 1, 16, limit + 4, ilevel, hevThresh, true)
+            filterLoop(uDst, uvBps, 1, 8, limit + 4, ilevel, hevThresh, true)
+            filterLoop(vDst, uvBps, 1, 8, limit + 4, ilevel, hevThresh, true)
+        }
+        if inner {
+            filterLoop(yDst + 4 * yBps, yBps, 1, 16, limit, ilevel, hevThresh, false)
+            filterLoop(yDst + 8 * yBps, yBps, 1, 16, limit, ilevel, hevThresh, false)
+            filterLoop(yDst + 12 * yBps, yBps, 1, 16, limit, ilevel, hevThresh, false)
+            filterLoop(uDst + 4 * uvBps, uvBps, 1, 8, limit, ilevel, hevThresh, false)
+            filterLoop(vDst + 4 * uvBps, uvBps, 1, 8, limit, ilevel, hevThresh, false)
+        }
+    }
+}
+
+fn precomputeFilterStrengths(d: *Decoder) -> void {
+    if d.*.filterType == 0 { return }
+    var s: usize = 0
+    while s < NUM_MB_SEGMENTS {
+        var baseLevel: i64 = d.*.level
+        if d.*.useSegment {
+            baseLevel = d.*.filterStrength[s]
+            if !d.*.absoluteDelta { baseLevel += d.*.level }
+        }
+        var i4x4: usize = 0
+        while i4x4 <= 1 {
+            const info = @intFromPtr(&d.*.fstrengths) + (s * 2 + i4x4) * 4
+            var level = baseLevel
+            if d.*.useLfDelta {
+                level += d.*.refLfDelta[0]
+                if i4x4 == 1 { level += d.*.modeLfDelta[0] }
+            }
+            if level < 0 { level = 0 }
+            if level > 63 { level = 63 }
+            if level > 0 {
+                var ilevel = level
+                if d.*.sharpness > 0 {
+                    if d.*.sharpness > 4 {
+                        ilevel = ilevel >> 2
+                    } else {
+                        ilevel = ilevel >> 1
+                    }
+                    if ilevel > 9 - d.*.sharpness { ilevel = 9 - d.*.sharpness }
+                }
+                if ilevel < 1 { ilevel = 1 }
+                put8(info + 1, @intCast(u64, ilevel))
+                put8(info, @intCast(u64, 2 * level + ilevel))
+                var hevThresh: u64 = 0
+                if level >= 40 {
+                    hevThresh = 2
+                } else if level >= 15 {
+                    hevThresh = 1
+                }
+                put8(info + 3, hevThresh)
+            } else {
+                put8(info, 0)
+            }
+            put8(info + 2, @intCast(u64, i4x4))
+            i4x4 += 1
+        }
+        s += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rows (frame_dec.c)
+
+// FinishRow: the row filtered and handed to the output, all but the rows
+// the next row's filter still changes (kept above the cache for it).
+fn finishRow(d: *Decoder, i: *Io) -> bool {
+    const extraYRows = filterExtraRows(d.*.filterType)
+    const ysize = extraYRows * d.*.cacheYStride
+    const uvsize = (extraYRows / 2) * d.*.cacheUVStride
+    const ydst = d.*.cacheY - ysize
+    const udst = d.*.cacheU - uvsize
+    const vdst = d.*.cacheV - uvsize
+    const mbY = d.*.ctxMbY
+    const isFirstRow = mbY == 0
+    const isLastRow = mbY + 1 >= d.*.brMbY
+    var ok = true
+    if d.*.filterRow {
+        var mbX = d.*.tlMbX
+        while mbX < d.*.brMbX {
+            doFilter(d, mbX, mbY)
+            mbX += 1
+        }
+    }
+    if i.*.params != 0 {
+        var yStart = @intCast(i64, mbY * 16)
+        var yEnd = @intCast(i64, (mbY + 1) * 16)
+        if !isFirstRow {
+            yStart -= @intCast(i64, extraYRows)
+            i.*.y = ydst
+            i.*.u = udst
+            i.*.v = vdst
+        } else {
+            i.*.y = d.*.cacheY
+            i.*.u = d.*.cacheU
+            i.*.v = d.*.cacheV
+        }
+        if !isLastRow { yEnd -= @intCast(i64, extraYRows) }
+        if yEnd > i.*.cropBottom { yEnd = i.*.cropBottom }
+        i.*.a = 0
+        if d.*.alpha.data != 0 && yStart < yEnd {
+            i.*.a = alpha.decompressRows(&d.*.alpha, i, yStart, yEnd - yStart)
+            if i.*.a == 0 { return setError(d, io.BITSTREAM_ERROR, io.literal("Could not decode alpha data.")) }
+        }
+        if yStart < i.*.cropTop {
+            const deltaY = i.*.cropTop - yStart
+            yStart = i.*.cropTop
+            i.*.y += d.*.cacheYStride * @intCast(usize, deltaY)
+            i.*.u += d.*.cacheUVStride * @intCast(usize, deltaY >> 1)
+            i.*.v += d.*.cacheUVStride * @intCast(usize, deltaY >> 1)
+            if i.*.a != 0 { i.*.a += @intCast(usize, i.*.width * deltaY) }
+        }
+        if yStart < yEnd {
+            i.*.y += @intCast(usize, i.*.cropLeft)
+            i.*.u += @intCast(usize, i.*.cropLeft >> 1)
+            i.*.v += @intCast(usize, i.*.cropLeft >> 1)
+            if i.*.a != 0 { i.*.a += @intCast(usize, i.*.cropLeft) }
+            i.*.mbY = yStart - i.*.cropTop
+            i.*.mbW = i.*.cropRight - i.*.cropLeft
+            i.*.mbH = yEnd - yStart
+            ok = io.put(i)
+        }
+    }
+    if !isLastRow {
+        io.copy(d.*.cacheY - ysize, ydst + 16 * d.*.cacheYStride, ysize)
+        io.copy(d.*.cacheU - uvsize, udst + 8 * d.*.cacheUVStride, uvsize)
+        io.copy(d.*.cacheV - uvsize, vdst + 8 * d.*.cacheUVStride, uvsize)
+    }
+    return ok
+}
+
+// VP8ProcessRow.
+pub fn processRow(d: *Decoder, i: *Io) -> bool {
+    d.*.filterRow = d.*.filterType > 0 && d.*.mbY >= d.*.tlMbY && d.*.mbY <= d.*.brMbY
+    d.*.ctxMbY = d.*.mbY
+    reconstructRow(d)
+    return finishRow(d, i)
+}
+
+// VP8EnterCritical: the output set up, and what part of the frame needs
+// decoding and filtering.
+pub fn enterCritical(d: *Decoder, i: *Io) -> i32 {
+    if i.*.params != 0 && !io.setup(i) {
+        setError(d, io.USER_ABORT, io.literal("Frame setup failed"))
+        return d.*.status
+    }
+    if i.*.bypassFiltering { d.*.filterType = 0 }
+    const extraPixels = @intCast(i64, filterExtraRows(d.*.filterType))
+    if d.*.filterType == 2 {
+        d.*.tlMbX = 0
+        d.*.tlMbY = 0
+    } else {
+        var x = (i.*.cropLeft - extraPixels) >> 4
+        var y = (i.*.cropTop - extraPixels) >> 4
+        if x < 0 { x = 0 }
+        if y < 0 { y = 0 }
+        d.*.tlMbX = @intCast(usize, x)
+        d.*.tlMbY = @intCast(usize, y)
+    }
+    var brY = (i.*.cropBottom + 15 + extraPixels) >> 4
+    var brX = (i.*.cropRight + 15 + extraPixels) >> 4
+    if brX > @intCast(i64, d.*.mbW) { brX = @intCast(i64, d.*.mbW) }
+    if brY > @intCast(i64, d.*.mbH) { brY = @intCast(i64, d.*.mbH) }
+    d.*.brMbX = @intCast(usize, brX)
+    d.*.brMbY = @intCast(usize, brY)
+    precomputeFilterStrengths(d)
+    return io.OK
+}
+
+pub fn exitCritical(d: *Decoder, i: *Io) -> bool {
+    if i.*.params != 0 { io.teardown(i) }
+    return true
+}
+
+// AllocateMemory and InitIo (VP8InitFrame).
+pub fn initFrame(d: *Decoder, i: *Io) -> bool {
+    const mbW = d.*.mbW
+    const intraSize = 4 * mbW
+    const topSize = 32 * mbW
+    const mbInfoSize = (mbW + 1) * 2
+    var fInfoSize: usize = 0
+    if d.*.filterType > 0 { fInfoSize = mbW * 4 }
+    const mbDataSize = mbW * MB_DATA_SIZE
+    const extraRows = filterExtraRows(d.*.filterType)
+    const cacheHeight = (16 + extraRows) * 3 / 2
+    const cacheSize = topSize * cacheHeight
+    const needed = intraSize + topSize + mbInfoSize + fInfoSize + YUV_SIZE + mbDataSize + cacheSize + 64
+    if needed > d.*.memSize {
+        io.release(d.*.allocator, d.*.mem, d.*.memSize)
+        d.*.memSize = 0
+        d.*.mem = io.allocate(d.*.allocator, needed)
+        if d.*.mem == 0 { return setError(d, io.OUT_OF_MEMORY, io.literal("no memory during frame initialization.")) }
+        d.*.memSize = needed
+    }
+    var mem = d.*.mem
+    d.*.intraT = mem
+    mem += intraSize
+    d.*.yuvT = mem
+    mem += topSize
+    d.*.mbInfo = mem + 2
+    mem += mbInfoSize
+    d.*.fInfo = mem
+    mem += fInfoSize
+    mem = (mem + 31) / 32 * 32
+    d.*.yuvB = mem
+    mem += YUV_SIZE
+    d.*.mbData = mem
+    mem += mbDataSize
+    d.*.cacheYStride = 16 * mbW
+    d.*.cacheUVStride = 8 * mbW
+    {
+        const extraY = extraRows * d.*.cacheYStride
+        const extraUV = (extraRows / 2) * d.*.cacheUVStride
+        d.*.cacheY = mem + extraY
+        d.*.cacheU = d.*.cacheY + 16 * d.*.cacheYStride + extraUV
+        d.*.cacheV = d.*.cacheU + 8 * d.*.cacheUVStride + extraUV
+    }
+    io.zero(d.*.mbInfo - 2, mbInfoSize)
+    io.zero(d.*.mbData, mbDataSize)
+    initScanline(d)
+    io.zero(d.*.intraT, intraSize)
+    i.*.mbY = 0
+    i.*.y = d.*.cacheY
+    i.*.u = d.*.cacheU
+    i.*.v = d.*.cacheV
+    i.*.yStride = @intCast(i64, d.*.cacheYStride)
+    i.*.uvStride = @intCast(i64, d.*.cacheUVStride)
+    i.*.a = 0
+    return true
+}
+
+// ParseFrame: every row, its modes and residuals, then reconstructed.
+fn parseFrame(d: *Decoder, i: *Io) -> bool {
+    d.*.mbY = 0
+    while d.*.mbY < d.*.brMbY {
+        const tokenBr = &d.*.parts[d.*.mbY & d.*.numPartsMinusOne]
+        if !parseIntraModeRow(d) { return setError(d, io.NOT_ENOUGH_DATA, io.literal("Premature end-of-partition0 encountered.")) }
+        while d.*.mbX < d.*.mbW {
+            if !decodeMB(d, tokenBr) { return setError(d, io.NOT_ENOUGH_DATA, io.literal("Premature end-of-file encountered.")) }
+            d.*.mbX += 1
+        }
+        initScanline(d)
+        if !processRow(d, i) { return setError(d, io.USER_ABORT, io.literal("Output aborted.")) }
+        d.*.mbY += 1
+    }
+    return true
+}
+
+// VP8Decode: the headers if not read yet, then the frame.
+pub fn decode(d: *Decoder, i: *Io) -> bool {
+    if !d.*.ready {
+        if !getHeaders(d, i) { return false }
+    }
+    var ok = enterCritical(d, i) == io.OK
+    if ok {
+        ok = initFrame(d, i)
+        if ok { ok = parseFrame(d, i) }
+        if !exitCritical(d, i) { ok = false }
+    }
+    if !ok {
+        clear(d)
+        return false
+    }
+    d.*.ready = false
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+
+// The default coefficient probabilities (tree_dec.c CoeffsProba0), [type][band][context][11].
+const COEFFS_PROBA0: []const u8 = "\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\xfd\x88\xfe\xff\xe4\xdb\x80\x80\x80\x80\x80\xbd\x81\xf2\xff\xe3\xd5\xff\xdb\x80\x80\x80\x6a\x7e\xe3\xfc\xd6\xd1\xff\xff\x80\x80\x80\x01\x62\xf8\xff\xec\xe2\xff\xff\x80\x80\x80\xb5\x85\xee\xfe\xdd\xea\xff\x9a\x80\x80\x80\x4e\x86\xca\xf7\xc6\xb4\xff\xdb\x80\x80\x80\x01\xb9\xf9\xff\xf3\xff\x80\x80\x80\x80\x80\xb8\x96\xf7\xff\xec\xe0\x80\x80\x80\x80\x80\x4d\x6e\xd8\xff\xec\xe6\x80\x80\x80\x80\x80\x01\x65\xfb\xff\xf1\xff\x80\x80\x80\x80\x80\xaa\x8b\xf1\xfc\xec\xd1\xff\xff\x80\x80\x80\x25\x74\xc4\xf3\xe4\xff\xff\xff\x80\x80\x80\x01\xcc\xfe\xff\xf5\xff\x80\x80\x80\x80\x80\xcf\xa0\xfa\xff\xee\x80\x80\x80\x80\x80\x80\x66\x67\xe7\xff\xd3\xab\x80\x80\x80\x80\x80\x01\x98\xfc\xff\xf0\xff\x80\x80\x80\x80\x80\xb1\x87\xf3\xff\xea\xe1\x80\x80\x80\x80\x80\x50\x81\xd3\xff\xc2\xe0\x80\x80\x80\x80\x80\x01\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf6\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xff\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\xc6\x23\xed\xdf\xc1\xbb\xa2\xa0\x91\x9b\x3e\x83\x2d\xc6\xdd\xac\xb0\xdc\x9d\xfc\xdd\x01\x44\x2f\x92\xd0\x95\xa7\xdd\xa2\xff\xdf\x80\x01\x95\xf1\xff\xdd\xe0\xff\xff\x80\x80\x80\xb8\x8d\xea\xfd\xde\xdc\xff\xc7\x80\x80\x80\x51\x63\xb5\xf2\xb0\xbe\xf9\xca\xff\xff\x80\x01\x81\xe8\xfd\xd6\xc5\xf2\xc4\xff\xff\x80\x63\x79\xd2\xfa\xc9\xc6\xff\xca\x80\x80\x80\x17\x5b\xa3\xf2\xaa\xbb\xf7\xd2\xff\xff\x80\x01\xc8\xf6\xff\xea\xff\x80\x80\x80\x80\x80\x6d\xb2\xf1\xff\xe7\xf5\xff\xff\x80\x80\x80\x2c\x82\xc9\xfd\xcd\xc0\xff\xff\x80\x80\x80\x01\x84\xef\xfb\xdb\xd1\xff\xa5\x80\x80\x80\x5e\x88\xe1\xfb\xda\xbe\xff\xff\x80\x80\x80\x16\x64\xae\xf5\xba\xa1\xff\xc7\x80\x80\x80\x01\xb6\xf9\xff\xe8\xeb\x80\x80\x80\x80\x80\x7c\x8f\xf1\xff\xe3\xea\x80\x80\x80\x80\x80\x23\x4d\xb5\xfb\xc1\xd3\xff\xcd\x80\x80\x80\x01\x9d\xf7\xff\xec\xe7\xff\xff\x80\x80\x80\x79\x8d\xeb\xff\xe1\xe3\xff\xff\x80\x80\x80\x2d\x63\xbc\xfb\xc3\xd9\xff\xe0\x80\x80\x80\x01\x01\xfb\xff\xd5\xff\x80\x80\x80\x80\x80\xcb\x01\xf8\xff\xff\x80\x80\x80\x80\x80\x80\x89\x01\xb1\xff\xe0\xff\x80\x80\x80\x80\x80\xfd\x09\xf8\xfb\xcf\xd0\xff\xc0\x80\x80\x80\xaf\x0d\xe0\xf3\xc1\xb9\xf9\xc6\xff\xff\x80\x49\x11\xab\xdd\xa1\xb3\xec\xa7\xff\xea\x80\x01\x5f\xf7\xfd\xd4\xb7\xff\xff\x80\x80\x80\xef\x5a\xf4\xfa\xd3\xd1\xff\xff\x80\x80\x80\x9b\x4d\xc3\xf8\xbc\xc3\xff\xff\x80\x80\x80\x01\x18\xef\xfb\xda\xdb\xff\xcd\x80\x80\x80\xc9\x33\xdb\xff\xc4\xba\x80\x80\x80\x80\x80\x45\x2e\xbe\xef\xc9\xda\xff\xe4\x80\x80\x80\x01\xbf\xfb\xff\xff\x80\x80\x80\x80\x80\x80\xdf\xa5\xf9\xff\xd5\xff\x80\x80\x80\x80\x80\x8d\x7c\xf8\xff\xff\x80\x80\x80\x80\x80\x80\x01\x10\xf8\xff\xff\x80\x80\x80\x80\x80\x80\xbe\x24\xe6\xff\xec\xff\x80\x80\x80\x80\x80\x95\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\x01\xe2\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf7\xc0\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf0\x80\xff\x80\x80\x80\x80\x80\x80\x80\x80\x01\x86\xfc\xff\xff\x80\x80\x80\x80\x80\x80\xd5\x3e\xfa\xff\xff\x80\x80\x80\x80\x80\x80\x37\x5d\xff\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\xca\x18\xd5\xeb\xba\xbf\xdc\xa0\xf0\xaf\xff\x7e\x26\xb6\xe8\xa9\xb8\xe4\xae\xff\xbb\x80\x3d\x2e\x8a\xdb\x97\xb2\xf0\xaa\xff\xd8\x80\x01\x70\xe6\xfa\xc7\xbf\xf7\x9f\xff\xff\x80\xa6\x6d\xe4\xfc\xd3\xd7\xff\xae\x80\x80\x80\x27\x4d\xa2\xe8\xac\xb4\xf5\xb2\xff\xff\x80\x01\x34\xdc\xf6\xc6\xc7\xf9\xdc\xff\xff\x80\x7c\x4a\xbf\xf3\xb7\xc1\xfa\xdd\xff\xff\x80\x18\x47\x82\xdb\x9a\xaa\xf3\xb6\xff\xff\x80\x01\xb6\xe1\xf9\xdb\xf0\xff\xe0\x80\x80\x80\x95\x96\xe2\xfc\xd8\xcd\xff\xab\x80\x80\x80\x1c\x6c\xaa\xf2\xb7\xc2\xfe\xdf\xff\xff\x80\x01\x51\xe6\xfc\xcc\xcb\xff\xc0\x80\x80\x80\x7b\x66\xd1\xf7\xbc\xc4\xff\xe9\x80\x80\x80\x14\x5f\x99\xf3\xa4\xad\xff\xcb\x80\x80\x80\x01\xde\xf8\xff\xd8\xd5\x80\x80\x80\x80\x80\xa8\xaf\xf6\xfc\xeb\xcd\xff\xff\x80\x80\x80\x2f\x74\xd7\xff\xd3\xd4\xff\xff\x80\x80\x80\x01\x79\xec\xfd\xd4\xd6\xff\xff\x80\x80\x80\x8d\x54\xd5\xfc\xc9\xca\xff\xdb\x80\x80\x80\x2a\x50\xa0\xf0\xa2\xb9\xff\xcd\x80\x80\x80\x01\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xf4\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80\xee\x01\xff\x80\x80\x80\x80\x80\x80\x80\x80"
+
+// The probabilities that a coefficient probability is updated (CoeffsUpdateProba).
+const COEFFS_UPDATE_PROBA: []const u8 = "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xb0\xf6\xff\xff\xff\xff\xff\xff\xff\xff\xff\xdf\xf1\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xf9\xfd\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf4\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xea\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf6\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xef\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfd\xff\xfe\xff\xff\xff\xff\xff\xff\xfa\xff\xfe\xff\xfe\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xd9\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xe1\xfc\xf1\xfd\xff\xff\xfe\xff\xff\xff\xff\xea\xfa\xf1\xfa\xfd\xff\xfd\xfe\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xdf\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xee\xfd\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xf9\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf7\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfa\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xba\xfb\xfa\xff\xff\xff\xff\xff\xff\xff\xff\xea\xfb\xf4\xfe\xff\xff\xff\xff\xff\xff\xff\xfb\xfb\xf3\xfd\xfe\xff\xfe\xff\xff\xff\xff\xff\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xec\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfd\xfd\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfa\xfe\xfc\xfe\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xf9\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xf6\xfd\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xfe\xfb\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xfe\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xf8\xfe\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xfe\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xf5\xfb\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfb\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xfd\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf9\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xff\xff\xff\xff\xff\xff\xff\xff\xfa\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+
+// The probabilities of a 4x4 block's mode by the modes above and left (kBModesProba), [top][left][9].
+const BMODES_PROBA: []const u8 = "\xe7\x78\x30\x59\x73\x71\x78\x98\x70\x98\xb3\x40\x7e\xaa\x76\x2e\x46\x5f\xaf\x45\x8f\x50\x55\x52\x48\x9b\x67\x38\x3a\x0a\xab\xda\xbd\x11\x0d\x98\x72\x1a\x11\xa3\x2c\xc3\x15\x0a\xad\x79\x18\x50\xc3\x1a\x3e\x2c\x40\x55\x90\x47\x0a\x26\xab\xd5\x90\x22\x1a\xaa\x2e\x37\x13\x88\xa0\x21\xce\x47\x3f\x14\x08\x72\x72\xd0\x0c\x09\xe2\x51\x28\x0b\x60\xb6\x54\x1d\x10\x24\x86\xb7\x59\x89\x62\x65\x6a\xa5\x94\x48\xbb\x64\x82\x9d\x6f\x20\x4b\x50\x42\x66\xa7\x63\x4a\x3e\x28\xea\x80\x29\x35\x09\xb2\xf1\x8d\x1a\x08\x6b\x4a\x2b\x1a\x92\x49\xa6\x31\x17\x9d\x41\x26\x69\xa0\x33\x34\x1f\x73\x80\x68\x4f\x0c\x1b\xd9\xff\x57\x11\x07\x57\x44\x47\x2c\x72\x33\x0f\xba\x17\x2f\x29\x0e\x6e\xb6\xb7\x15\x11\xc2\x42\x2d\x19\x66\xc5\xbd\x17\x12\x16\x58\x58\x93\x96\x2a\x2e\x2d\xc4\xcd\x2b\x61\xb7\x75\x55\x26\x23\xb3\x3d\x27\x35\xc8\x57\x1a\x15\x2b\xe8\xab\x38\x22\x33\x68\x72\x66\x1d\x5d\x4d\x27\x1c\x55\xab\x3a\xa5\x5a\x62\x40\x22\x16\x74\xce\x17\x22\x2b\xa6\x49\x6b\x36\x20\x1a\x33\x01\x51\x2b\x1f\x44\x19\x6a\x16\x40\xab\x24\xe1\x72\x22\x13\x15\x66\x84\xbc\x10\x4c\x7c\x3e\x12\x4e\x5f\x55\x39\x32\x30\x33\xc1\x65\x23\x9f\xd7\x6f\x59\x2e\x6f\x3c\x94\x1f\xac\xdb\xe4\x15\x12\x6f\x70\x71\x4d\x55\xb3\xff\x26\x78\x72\x28\x2a\x01\xc4\xf5\xd1\x0a\x19\x6d\x58\x2b\x1d\x8c\xa6\xd5\x25\x2b\x9a\x3d\x3f\x1e\x9b\x43\x2d\x44\x01\xd1\x64\x50\x08\x2b\x9a\x01\x33\x1a\x47\x8e\x4e\x4e\x10\xff\x80\x22\xc5\xab\x29\x28\x05\x66\xd3\xb7\x04\x01\xdd\x33\x32\x11\xa8\xd1\xc0\x17\x19\x52\x8a\x1f\x24\xab\x1b\xa6\x26\x2c\xe5\x43\x57\x3a\xa9\x52\x73\x1a\x3b\xb3\x3f\x3b\x5a\xb4\x3b\xa6\x5d\x49\x9a\x28\x28\x15\x74\x8f\xd1\x22\x27\xaf\x2f\x0f\x10\xb7\x22\xdf\x31\x2d\xb7\x2e\x11\x21\xb7\x06\x62\x0f\x20\xb7\x39\x2e\x16\x18\x80\x01\x36\x11\x25\x41\x20\x49\x73\x1c\x80\x17\x80\xcd\x28\x03\x09\x73\x33\xc0\x12\x06\xdf\x57\x25\x09\x73\x3b\x4d\x40\x15\x2f\x68\x37\x2c\xda\x09\x36\x35\x82\xe2\x40\x5a\x46\xcd\x28\x29\x17\x1a\x39\x36\x39\x70\xb8\x05\x29\x26\xa6\xd5\x1e\x22\x1a\x85\x98\x74\x0a\x20\x86\x27\x13\x35\xdd\x1a\x72\x20\x49\xff\x1f\x09\x41\xea\x02\x0f\x01\x76\x49\x4b\x20\x0c\x33\xc0\xff\xa0\x2b\x33\x58\x1f\x23\x43\x66\x55\x37\xba\x55\x38\x15\x17\x6f\x3b\xcd\x2d\x25\xc0\x37\x26\x46\x7c\x49\x66\x01\x22\x62\x7d\x62\x2a\x58\x68\x55\x75\xaf\x52\x5f\x54\x35\x59\x80\x64\x71\x65\x2d\x4b\x4f\x7b\x2f\x33\x80\x51\xab\x01\x39\x11\x05\x47\x66\x39\x35\x29\x31\x26\x21\x0d\x79\x39\x49\x1a\x01\x55\x29\x0a\x43\x8a\x4d\x6e\x5a\x2f\x72\x73\x15\x02\x0a\x66\xff\xa6\x17\x06\x65\x1d\x10\x0a\x55\x80\x65\xc4\x1a\x39\x12\x0a\x66\x66\xd5\x22\x14\x2b\x75\x14\x0f\x24\xa3\x80\x44\x01\x1a\x66\x3d\x47\x25\x22\x35\x1f\xf3\xc0\x45\x3c\x47\x26\x49\x77\x1c\xde\x25\x44\x2d\x80\x22\x01\x2f\x0b\xf5\xab\x3e\x11\x13\x46\x92\x55\x37\x3e\x46\x25\x2b\x25\x9a\x64\xa3\x55\xa0\x01\x3f\x09\x5c\x88\x1c\x40\x20\xc9\x55\x4b\x0f\x09\x09\x40\xff\xb8\x77\x10\x56\x06\x1c\x05\x40\xff\x19\xf8\x01\x38\x08\x11\x84\x89\xff\x37\x74\x80\x3a\x0f\x14\x52\x87\x39\x1a\x79\x28\xa4\x32\x1f\x89\x9a\x85\x19\x23\xda\x33\x67\x2c\x83\x83\x7b\x1f\x06\x9e\x56\x28\x40\x87\x94\xe0\x2d\xb7\x80\x16\x1a\x11\x83\xf0\x9a\x0e\x01\xd1\x2d\x10\x15\x5b\x40\xde\x07\x01\xc5\x38\x15\x27\x9b\x3c\x8a\x17\x66\xd5\x53\x0c\x0d\x36\xc0\xff\x44\x2f\x1c\x55\x1a\x55\x55\x80\x80\x20\x92\xab\x12\x0b\x07\x3f\x90\xab\x04\x04\xf6\x23\x1b\x0a\x92\xae\xab\x0c\x1a\x80\xbe\x50\x23\x63\xb4\x50\x7e\x36\x2d\x55\x7e\x2f\x57\xb0\x33\x29\x14\x20\x65\x4b\x80\x8b\x76\x92\x74\x80\x55\x38\x29\x0f\xb0\xec\x55\x25\x09\x3e\x47\x1e\x11\x77\x76\xff\x11\x12\x8a\x65\x26\x3c\x8a\x37\x46\x2b\x1a\x8e\x92\x24\x13\x1e\xab\xff\x61\x1b\x14\x8a\x2d\x3d\x3e\xdb\x01\x51\xbc\x40\x20\x29\x14\x75\x97\x8e\x14\x15\xa3\x70\x13\x0c\x3d\xc3\x80\x30\x04\x18"
+
+// The DC quantizer by index (quant_dec.c kDcTable).
+const DC_TABLE: []const u8 = "\x04\x05\x06\x07\x08\x09\x0a\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x11\x12\x13\x14\x14\x15\x15\x16\x16\x17\x17\x18\x19\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2e\x2f\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5b\x5d\x5f\x60\x62\x64\x65\x66\x68\x6a\x6c\x6e\x70\x72\x74\x76\x7a\x7c\x7e\x80\x82\x84\x86\x88\x8a\x8c\x8f\x91\x94\x97\x9a\x9d"
+
+// The AC quantizer by index (kAcTable).
+const AC_TABLE: [128]u16 = [128]u16{
+    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+    36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+    52, 53, 54, 55, 56, 57, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76,
+    78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108,
+    110, 112, 114, 116, 119, 122, 125, 128, 131, 134, 137, 140, 143, 146, 149, 152,
+    155, 158, 161, 164, 167, 170, 173, 177, 181, 185, 189, 193, 197, 201, 205, 209,
+    213, 217, 221, 225, 229, 234, 239, 245, 249, 254, 259, 264, 269, 274, 279, 284
+}

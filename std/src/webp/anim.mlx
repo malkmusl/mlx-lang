@@ -1,0 +1,251 @@
+// std.webp.anim: libwebp's animation decoder (1.3.2, demux/anim_decode.c)
+// step for step: each frame of an animation decoded (WebPDecode) into its
+// rectangle of the canvas, blended over what the frames before left
+// (unless it says not to, or is a key frame), and the rectangle cleared
+// afterwards when its disposal says so. The canvas is RGBA or BGRA,
+// premultiplied or not.
+//
+//     const dec = anim.create(data, size, io.MODE_RGBA, allocator)   (0: not an animation libwebp takes)
+//     while anim.hasMoreFrames(dec) { anim.getNext(dec, &canvas, &timestamp) ... }
+//     anim.delete(dec)
+const io = @import("./io.mlx")
+const decode = @import("./decode.mlx")
+const demux = @import("./demux.mlx")
+
+pub const Allocator = io.Allocator
+
+pub const AnimDecoder = struct {
+    allocator: Allocator
+    demuxer: usize
+    // The WebPDecoderConfig each frame is decoded with.
+    features: io.Features
+    output: io.Buffer
+    options: io.Options
+    premultiplied: bool
+    canvasWidth: u64
+    canvasHeight: u64
+    loopCount: u64
+    bgcolor: u64
+    frameCount: u64
+    currFrame: usize
+    prevFrameDisposed: usize
+    prevFrameTimestamp: i64
+    prevIter: demux.Iterator
+    prevFrameWasKeyframe: bool
+    nextFrame: i64
+}
+
+pub inline fn decoderAt(address: usize) -> *AnimDecoder { return unsafe { @ptrFromInt(*AnimDecoder, address) } }
+
+fn canvasSize(dec: *AnimDecoder) -> usize {
+    return @intCast(usize, dec.*.canvasWidth * 4 * dec.*.canvasHeight)
+}
+
+// WebPAnimDecoderNew: a decoder of the animation at DATA (which stays in
+// place) onto a canvas of COLOR_MODE (RGBA, BGRA, rgbA or bgrA); 0 on
+// error.
+pub fn create(data: usize, size: usize, colorMode: i32, allocator: Allocator) -> usize {
+    var features: io.Features = undefined
+    if decode.getFeatures(data, size, &features) != io.OK { return 0 }
+    if colorMode != io.MODE_RGBA && colorMode != io.MODE_BGRA && colorMode != io.MODE_rgbA && colorMode != io.MODE_bgrA { return 0 }
+    const address = io.allocateZeroed(allocator, @sizeOf(AnimDecoder))
+    if address == 0 { return 0 }
+    const dec = decoderAt(address)
+    dec.*.allocator = allocator
+    dec.*.premultiplied = colorMode == io.MODE_rgbA || colorMode == io.MODE_bgrA
+    dec.*.output.colorspace = colorMode
+    dec.*.output.isExternalMemory = 1
+    var state: i32 = 0
+    dec.*.demuxer = demux.create(data, size, false, &state, allocator)
+    if dec.*.demuxer == 0 {
+        delete(address)
+        return 0
+    }
+    const d = demux.demuxerAt(dec.*.demuxer)
+    dec.*.canvasWidth = demux.getI(d, demux.CANVAS_WIDTH)
+    dec.*.canvasHeight = demux.getI(d, demux.CANVAS_HEIGHT)
+    dec.*.loopCount = demux.getI(d, demux.LOOP_COUNT)
+    dec.*.bgcolor = demux.getI(d, demux.BACKGROUND_COLOR)
+    dec.*.frameCount = demux.getI(d, demux.FRAME_COUNT)
+    dec.*.currFrame = io.allocateZeroed(allocator, canvasSize(dec))
+    dec.*.prevFrameDisposed = io.allocateZeroed(allocator, canvasSize(dec))
+    if dec.*.currFrame == 0 || dec.*.prevFrameDisposed == 0 {
+        delete(address)
+        return 0
+    }
+    reset(dec)
+    return address
+}
+
+pub fn reset(dec: *AnimDecoder) -> void {
+    dec.*.prevFrameTimestamp = 0
+    io.zero(@intFromPtr(&dec.*.prevIter), @sizeOf(demux.Iterator))
+    dec.*.prevFrameWasKeyframe = false
+    dec.*.nextFrame = 1
+}
+
+pub fn delete(address: usize) -> void {
+    if address == 0 { return }
+    const dec = decoderAt(address)
+    const allocator = dec.*.allocator
+    demux.delete(dec.*.demuxer)
+    io.release(allocator, dec.*.currFrame, canvasSize(dec))
+    io.release(allocator, dec.*.prevFrameDisposed, canvasSize(dec))
+    io.release(allocator, address, @sizeOf(AnimDecoder))
+}
+
+pub fn hasMoreFrames(dec: *AnimDecoder) -> bool {
+    return dec.*.nextFrame <= @intCast(i64, dec.*.frameCount)
+}
+
+fn isFullFrame(width: i64, height: i64, canvasWidth: i64, canvasHeight: i64) -> bool {
+    return width == canvasWidth && height == canvasHeight
+}
+
+fn isKeyFrame(curr: *demux.Iterator, prev: *demux.Iterator, prevWasKeyFrame: bool, canvasWidth: i64, canvasHeight: i64) -> bool {
+    if curr.*.frameNum == 1 { return true }
+    if (curr.*.hasAlpha == 0 || curr.*.blendMethod == demux.NO_BLEND) && isFullFrame(@intCast(i64, curr.*.width), @intCast(i64, curr.*.height), canvasWidth, canvasHeight) { return true }
+    return prev.*.disposeMethod == demux.DISPOSE_BACKGROUND && (isFullFrame(@intCast(i64, prev.*.width), @intCast(i64, prev.*.height), canvasWidth, canvasHeight) || prevWasKeyFrame)
+}
+
+fn blendChannelNonPremult(src: u64, srcA: u64, dst: u64, dstA: u64, scale: u64, shift: u64) -> u64 {
+    const srcChannel = (src >> shift) & 0xff
+    const dstChannel = (dst >> shift) & 0xff
+    const blendUnscaled = srcChannel * srcA + dstChannel * dstA
+    return ((blendUnscaled * scale) & 0xffffffff) >> 24
+}
+
+fn blendPixelNonPremult(src: u64, dst: u64) -> u64 {
+    const srcA = (src >> 24) & 0xff
+    if srcA == 0 { return dst }
+    const dstA = (dst >> 24) & 0xff
+    const dstFactorA = ((dstA * (256 - srcA)) >> 8) & 0xff
+    const blendA = (srcA + dstFactorA) & 0xff
+    const scale = 16777216 / blendA
+    const r = blendChannelNonPremult(src, srcA, dst, dstFactorA, scale, 0) & 0xff
+    const g = blendChannelNonPremult(src, srcA, dst, dstFactorA, scale, 8) & 0xff
+    const b = blendChannelNonPremult(src, srcA, dst, dstFactorA, scale, 16) & 0xff
+    return r | (g << 8) | (b << 16) | (blendA << 24)
+}
+
+fn channelwiseMultiply(pix: u64, scale: u64) -> u64 {
+    const mask: u64 = 0x00ff00ff
+    const rb = (((pix & mask) * scale) & 0xffffffff) >> 8
+    const ag = (((pix >> 8) & mask) * scale) & 0xffffffff
+    return (rb & mask) | (ag & 0xff00ff00)
+}
+
+fn blendRow(dec: *AnimDecoder, src: usize, dst: usize, numPixels: usize) -> void {
+    var i: usize = 0
+    while i < numPixels {
+        const s = io.get32(src + 4 * i)
+        const srcAlpha = (s >> 24) & 0xff
+        if srcAlpha != 0xff {
+            const d = io.get32(dst + 4 * i)
+            if dec.*.premultiplied {
+                io.put32(src + 4 * i, (s + channelwiseMultiply(d, 256 - srcAlpha)) & 0xffffffff)
+            } else {
+                io.put32(src + 4 * i, blendPixelNonPremult(s, d))
+            }
+        }
+        i += 1
+    }
+}
+
+// FindBlendRangeAtRow: the parts of SRC's row CANVAS_Y outside DST's
+// rectangle (which its disposal cleared): left of it and right of it.
+fn findBlendRangeAtRow(src: *demux.Iterator, dst: *demux.Iterator, canvasY: i64, left1: *i64, width1: *i64, left2: *i64, width2: *i64) -> void {
+    const srcMaxX = @intCast(i64, src.*.xOffset) + @intCast(i64, src.*.width)
+    const dstMaxX = @intCast(i64, dst.*.xOffset) + @intCast(i64, dst.*.width)
+    const dstMaxY = @intCast(i64, dst.*.yOffset) + @intCast(i64, dst.*.height)
+    left1.* = 0 - 1
+    width1.* = 0
+    left2.* = 0 - 1
+    width2.* = 0
+    if canvasY < @intCast(i64, dst.*.yOffset) || canvasY >= dstMaxY || @intCast(i64, src.*.xOffset) >= dstMaxX || srcMaxX <= @intCast(i64, dst.*.xOffset) {
+        left1.* = @intCast(i64, src.*.xOffset)
+        width1.* = @intCast(i64, src.*.width)
+        return
+    }
+    if src.*.xOffset < dst.*.xOffset {
+        left1.* = @intCast(i64, src.*.xOffset)
+        width1.* = @intCast(i64, dst.*.xOffset - src.*.xOffset)
+    }
+    if srcMaxX > dstMaxX {
+        left2.* = dstMaxX
+        width2.* = srcMaxX - dstMaxX
+    }
+}
+
+// WebPAnimDecoderGetNext: the next frame composed; the canvas into BUF,
+// the time the frame ends into TIMESTAMP. False at the end or on error.
+pub fn getNext(dec: *AnimDecoder, buf: *usize, timestamp: *i64) -> bool {
+    if !hasMoreFrames(dec) { return false }
+    const width = dec.*.canvasWidth
+    const height = dec.*.canvasHeight
+    var iter: demux.Iterator = undefined
+    if !demux.getFrame(dec.*.demuxer, dec.*.nextFrame, &iter) { return false }
+    const time = dec.*.prevFrameTimestamp + @intCast(i64, iter.duration)
+    const keyFrame = isKeyFrame(&iter, &dec.*.prevIter, dec.*.prevFrameWasKeyframe, @intCast(i64, width), @intCast(i64, height))
+    if keyFrame {
+        io.zero(dec.*.currFrame, canvasSize(dec))
+    } else {
+        io.copy(dec.*.currFrame, dec.*.prevFrameDisposed, canvasSize(dec))
+    }
+    {
+        const stride = width * 4
+        const outOffset = @intCast(u64, iter.yOffset) * stride + @intCast(u64, iter.xOffset) * 4
+        const size = @intCast(u64, iter.height) * stride
+        io.setStride(&dec.*.output, @intCast(i64, stride))
+        io.setRgbaSize(&dec.*.output, @intCast(usize, size))
+        io.setRgba(&dec.*.output, dec.*.currFrame + @intCast(usize, outOffset))
+        if decode.decode(iter.fragmentBytes, iter.fragmentSize, &dec.*.features, @intFromPtr(&dec.*.options), &dec.*.output, dec.*.allocator) != io.OK { return false }
+    }
+    if iter.frameNum > 1 && iter.blendMethod == demux.BLEND && !keyFrame {
+        if dec.*.prevIter.disposeMethod == demux.DISPOSE_NONE {
+            var y: i64 = 0
+            while y < @intCast(i64, iter.height) {
+                const at = 4 * @intCast(usize, (@intCast(i64, iter.yOffset) + y) * @intCast(i64, width) + @intCast(i64, iter.xOffset))
+                blendRow(dec, dec.*.currFrame + at, dec.*.prevFrameDisposed + at, @intCast(usize, iter.width))
+                y += 1
+            }
+        } else {
+            var y: i64 = 0
+            while y < @intCast(i64, iter.height) {
+                const canvasY = @intCast(i64, iter.yOffset) + y
+                var left1: i64 = 0
+                var width1: i64 = 0
+                var left2: i64 = 0
+                var width2: i64 = 0
+                findBlendRangeAtRow(&iter, &dec.*.prevIter, canvasY, &left1, &width1, &left2, &width2)
+                if width1 > 0 {
+                    const at1 = 4 * @intCast(usize, canvasY * @intCast(i64, width) + left1)
+                    blendRow(dec, dec.*.currFrame + at1, dec.*.prevFrameDisposed + at1, @intCast(usize, width1))
+                }
+                if width2 > 0 {
+                    const at2 = 4 * @intCast(usize, canvasY * @intCast(i64, width) + left2)
+                    blendRow(dec, dec.*.currFrame + at2, dec.*.prevFrameDisposed + at2, @intCast(usize, width2))
+                }
+                y += 1
+            }
+        }
+    }
+    dec.*.prevFrameTimestamp = time
+    dec.*.prevIter = iter
+    dec.*.prevFrameWasKeyframe = keyFrame
+    io.copy(dec.*.prevFrameDisposed, dec.*.currFrame, canvasSize(dec))
+    if dec.*.prevIter.disposeMethod == demux.DISPOSE_BACKGROUND {
+        const stride = @intCast(usize, width * 4)
+        var row = dec.*.prevFrameDisposed + @intCast(usize, dec.*.prevIter.yOffset) * stride + 4 * @intCast(usize, dec.*.prevIter.xOffset)
+        var j: i32 = 0
+        while j < dec.*.prevIter.height {
+            io.zero(row, 4 * @intCast(usize, dec.*.prevIter.width))
+            row += stride
+            j += 1
+        }
+    }
+    dec.*.nextFrame += 1
+    buf.* = dec.*.currFrame
+    timestamp.* = time
+    return true
+}
