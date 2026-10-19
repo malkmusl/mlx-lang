@@ -27,7 +27,7 @@
 // (WARNMS) are queued for the caller to report in order. Trace messages
 // are not made.
 //
-// Arithmetic coding is not supported (JERR_ARITH_NOTIMPL at the start of
+// Arithmetic coding is not supported (JERR_NOT_COMPILED at the start of
 // decompression, as a libjpeg built without it).
 const zs = @import("../flate/stream.mlx")
 
@@ -64,7 +64,7 @@ pub const CS_RGB565: i32 = 16
 // libjpeg's message codes (jerror.h, JPEG_LIB_VERSION 80) for the errors
 // and warnings the decoder makes.
 pub const JMSG_NOMESSAGE: i32 = 0
-pub const JERR_ARITH_NOTIMPL: i32 = 3
+pub const JERR_BAD_BUFFER_MODE: i32 = 3
 pub const JERR_BAD_COMPONENT_ID: i32 = 4
 pub const JERR_BAD_CROP_SPEC: i32 = 5
 pub const JERR_BAD_DCT_COEF: i32 = 6
@@ -217,11 +217,24 @@ pub const Decoder = struct {
     position: usize
     cursor: usize
     skip: usize
+    // Whether the last operation stopped for want of bytes (and not, say,
+    // because a scan decoded as rows are output takes no input).
+    starved: bool
+    // Where the source's buffers ended, as libjpeg would hold them (each
+    // `refill` starts a new one): libjpeg-turbo's choice of its fast path
+    // looks at how much its source's buffer still has.
+    segmentEnds: [16]usize
+    segmentCount: usize
 
     failed: bool
     failure: Message
-    warnings: [32]Message
+    // The warnings not taken yet, oldest first from `warningHead`: their
+    // codes and two parameters, 12 bytes each (a damaged scan can make
+    // thousands between two calls).
+    warnings: usize
+    warningCapacity: usize
     warningCount: usize
+    warningHead: usize
 
     // The marker reader (jdmarker.c).
     sawSOI: bool
@@ -312,10 +325,6 @@ pub const Decoder = struct {
     restartsToGo: u32
     dcDerived: [4]Derived
     acDerived: [4]Derived
-    // Bad Huffman codes met while decoding an MCU that libjpeg's fast
-    // path decodes (it does not warn about them).
-    fastMCU: bool
-    badCodes: u32
     // For each component, the bit position of each coefficient's last
     // refinement (-1: none yet), then the same before the current scan
     // (cinfo->coef_bits, num_components * 2 rows of 64).
@@ -399,38 +408,52 @@ pub fn fail4(d: *Decoder, code: i32, a: i32, b: i32, c: i32, e: i32) -> bool {
 
 pub fn warn(d: *Decoder, code: i32) -> void { warn2(d, code, 0, 0) }
 
+// The most warnings kept between two calls; more than that are lost.
+const MAX_WARNINGS: usize = 1048576
+
 pub fn warn2(d: *Decoder, code: i32, a: i32, b: i32) -> void {
-    // A caller that never takes its warnings loses the oldest ones.
-    if d.*.warningCount == 32 {
-        var index: usize = 1
-        while index < 32 {
-            d.*.warnings[index - 1] = d.*.warnings[index]
-            index += 1
+    if d.*.warningCount == d.*.warningCapacity {
+        if d.*.warningHead != 0 {
+            // The ones taken make room.
+            zs.move(d.*.warnings, d.*.warnings + d.*.warningHead * 12, (d.*.warningCount - d.*.warningHead) * 12)
+            d.*.warningCount -= d.*.warningHead
+            d.*.warningHead = 0
+        } else {
+            if d.*.warningCapacity == MAX_WARNINGS { return }
+            var capacity = d.*.warningCapacity * 2
+            if capacity < 64 { capacity = 64 }
+            const memory = allocate(d, capacity * 12)
+            if memory == 0 { return }
+            zs.copy(memory, d.*.warnings, d.*.warningCount * 12)
+            if d.*.warningCapacity != 0 { release(d, d.*.warnings, d.*.warningCapacity * 12) }
+            d.*.warnings = memory
+            d.*.warningCapacity = capacity
         }
-        d.*.warningCount = 31
     }
-    const m = &d.*.warnings[d.*.warningCount]
-    m.*.code = code
-    var index: usize = 0
-    while index < 8 {
-        m.*.parameters[index] = 0
-        index += 1
-    }
-    m.*.parameters[0] = a
-    m.*.parameters[1] = b
+    const at = d.*.warnings + d.*.warningCount * 12
+    zs.putI32(at, code)
+    zs.putI32(at + 4, a)
+    zs.putI32(at + 8, b)
     d.*.warningCount += 1
 }
 
 // Takes the oldest warning into OUT; false when there is none.
 pub fn takeWarning(d: *Decoder, out: *Message) -> bool {
-    if d.*.warningCount == 0 { return false }
-    out.* = d.*.warnings[0]
-    var index: usize = 1
-    while index < d.*.warningCount {
-        d.*.warnings[index - 1] = d.*.warnings[index]
+    if d.*.warningHead == d.*.warningCount {
+        d.*.warningHead = 0
+        d.*.warningCount = 0
+        return false
+    }
+    const at = d.*.warnings + d.*.warningHead * 12
+    out.*.code = @bitCast(i32, zs.get32(at))
+    var index: usize = 0
+    while index < 8 {
+        out.*.parameters[index] = 0
         index += 1
     }
-    d.*.warningCount -= 1
+    out.*.parameters[0] = @bitCast(i32, zs.get32(at + 4))
+    out.*.parameters[1] = @bitCast(i32, zs.get32(at + 8))
+    d.*.warningHead += 1
     return true
 }
 
@@ -453,6 +476,7 @@ pub fn reset(d: *Decoder) -> void {
     freeMarkers(d)
     d.*.failed = false
     d.*.warningCount = 0
+    d.*.warningHead = 0
     d.*.sawSOI = false
     d.*.sawSOF = false
     d.*.unreadMarker = 0
@@ -501,6 +525,10 @@ fn freeMarkers(d: *Decoder) -> void {
 pub fn deinit(d: *Decoder) -> void {
     freeImage(d)
     freeMarkers(d)
+    if d.*.warningCapacity != 0 { release(d, d.*.warnings, d.*.warningCapacity * 12) }
+    d.*.warningCapacity = 0
+    d.*.warningCount = 0
+    d.*.warningHead = 0
     if d.*.capacity != 0 { release(d, d.*.data, d.*.capacity) }
     d.*.data = 0
     d.*.capacity = 0
@@ -511,6 +539,7 @@ pub fn deinit(d: *Decoder) -> void {
 
 // Drops the bytes given so far (a new datastream follows).
 pub fn dropInput(d: *Decoder) -> void {
+    d.*.segmentCount = 0
     d.*.length = 0
     d.*.position = 0
     d.*.cursor = 0
@@ -520,6 +549,7 @@ pub fn dropInput(d: *Decoder) -> void {
 // Passes over what is still to be skipped, as far as the bytes go, and
 // starts an operation at the commit point.
 fn begin(d: *Decoder) -> void {
+    d.*.starved = false
     if d.*.skip != 0 {
         var available = d.*.length - d.*.position
         if available > d.*.skip { available = d.*.skip }
@@ -532,7 +562,25 @@ fn begin(d: *Decoder) -> void {
 // Takes COUNT more bytes of the datastream from ADDRESS; false when
 // there is no memory for them.
 pub fn give(d: *Decoder, address: usize, count: usize) -> bool {
+    return giveAs(d, address, count, false)
+}
+
+// The same, telling whether the bytes are a new buffer of the source
+// (its fill_input_buffer's), not more of the one it had.
+pub fn giveAs(d: *Decoder, address: usize, count: usize, refill: bool) -> bool {
     if count == 0 { return true }
+    if refill && d.*.length > d.*.position {
+        if d.*.segmentCount == 16 {
+            var i: usize = 1
+            while i < 16 {
+                d.*.segmentEnds[i - 1] = d.*.segmentEnds[i]
+                i += 1
+            }
+            d.*.segmentCount = 15
+        }
+        d.*.segmentEnds[d.*.segmentCount] = d.*.length
+        d.*.segmentCount += 1
+    }
     if d.*.length + count > d.*.capacity {
         // What has been used is dropped first.
         const used = d.*.position
@@ -541,6 +589,16 @@ pub fn give(d: *Decoder, address: usize, count: usize) -> bool {
             d.*.length -= used
             d.*.position = 0
             d.*.cursor = 0
+            var kept: usize = 0
+            var i: usize = 0
+            while i < d.*.segmentCount {
+                if d.*.segmentEnds[i] > used {
+                    d.*.segmentEnds[kept] = d.*.segmentEnds[i] - used
+                    kept += 1
+                }
+                i += 1
+            }
+            d.*.segmentCount = kept
         }
         if d.*.length + count > d.*.capacity {
             var capacity = d.*.capacity * 2
@@ -562,10 +620,23 @@ pub fn give(d: *Decoder, address: usize, count: usize) -> bool {
 // How many bytes are there that the decoder has not used.
 pub fn available(d: *Decoder) -> usize { return d.*.length - d.*.position }
 
+// How many of them libjpeg's source would have in its buffer.
+fn inSourceBuffer(d: *Decoder) -> usize {
+    var i: usize = 0
+    while i < d.*.segmentCount {
+        if d.*.segmentEnds[i] > d.*.position { return d.*.segmentEnds[i] - d.*.position }
+        i += 1
+    }
+    return d.*.length - d.*.position
+}
+
 inline fn commit(d: *Decoder) -> void { d.*.position = d.*.cursor }
 
 fn byte(d: *Decoder, value: *u32) -> bool {
-    if d.*.skip != 0 || d.*.cursor >= d.*.length { return false }
+    if d.*.skip != 0 || d.*.cursor >= d.*.length {
+        d.*.starved = true
+        return false
+    }
     value.* = @intCast(u32, zs.get8(d.*.data + d.*.cursor))
     d.*.cursor += 1
     return true
@@ -944,6 +1015,7 @@ fn saveMarker(d: *Decoder) -> bool {
     while bytesRead < dataLength {
         if d.*.skip != 0 || d.*.cursor >= d.*.length {
             d.*.bytesRead = @intCast(u32, bytesRead)
+            d.*.starved = true
             return false
         }
         var count = d.*.length - d.*.cursor
@@ -1363,7 +1435,7 @@ pub fn defaultColorSpaces(d: *Decoder) -> void {
 // libjpeg's master_selection): the standard Huffman tables where a
 // sequential file has none, the coefficient arrays, the first scan.
 pub fn startDecoding(d: *Decoder, fullBuffer: bool) -> bool {
-    if d.*.arithmetic { return fail(d, JERR_ARITH_NOTIMPL) }
+    if d.*.arithmetic { return fail(d, JERR_NOT_COMPILED) }
     d.*.fullBuffer = fullBuffer
     if d.*.progressive {
         var i: usize = 0
@@ -1636,13 +1708,19 @@ const MIN_GET_BITS: i32 = 57
 fn fillBits(d: *Decoder, nbits: i32) -> bool {
     if d.*.unreadMarker == 0 {
         while d.*.bitsLeft < MIN_GET_BITS {
-            if d.*.cursor >= d.*.length || d.*.skip != 0 { return false }
+            if d.*.cursor >= d.*.length || d.*.skip != 0 {
+                d.*.starved = true
+                return false
+            }
             var c = get8(d.*.data + d.*.cursor)
             d.*.cursor += 1
             if c == 0xff {
                 // Fill bytes of 0xFF, then 0 (a stuffed 0xFF) or a marker.
                 while true {
-                    if d.*.cursor >= d.*.length { return false }
+                    if d.*.cursor >= d.*.length {
+                        d.*.starved = true
+                        return false
+                    }
                     c = get8(d.*.data + d.*.cursor)
                     d.*.cursor += 1
                     if c != 0xff { break }
@@ -1721,7 +1799,7 @@ fn huffDecode(d: *Decoder, t: *Derived, out: *i32) -> bool {
         l += 1
     }
     if l > 16 {
-        if d.*.fastMCU { d.*.badCodes += 1 } else { warn(d, JWRN_HUFF_BAD_CODE) }
+        warn(d, JWRN_HUFF_BAD_CODE)
         out.* = 0
         return true
     }
@@ -1788,26 +1866,38 @@ fn decodeMCU(d: *Decoder, blocks: [*]usize) -> bool {
             i += 1
         }
         const savedRun = d.*.eobrun
-        // libjpeg-turbo decodes an MCU with plenty of data after it and
-        // no restart interval on a fast path that says nothing of a bad
-        // code; it falls back to the careful one at a marker.
-        d.*.fastMCU = !d.*.progressive && d.*.restartInterval == 0 && d.*.unreadMarker == 0 && d.*.length - d.*.position >= 512 * d.*.blocksInMCU
-        d.*.badCodes = 0
         var done = false
         if !d.*.progressive {
-            done = decodeSequential(d, blocks)
+            // libjpeg-turbo decodes a sequential MCU with plenty of data
+            // after it (as much as its source has) and no restart
+            // interval on a fast path, which reads the data otherwise and
+            // says nothing of a bad code; at a marker it starts the MCU
+            // again on the careful path. What it leaves (the bits read,
+            // the coefficients written) is followed exactly.
+            if d.*.restartInterval == 0 && d.*.unreadMarker == 0 && inSourceBuffer(d) >= 512 * d.*.blocksInMCU {
+                decodeSequentialFast(d, blocks)
+                if d.*.unreadMarker == 0 {
+                    done = true
+                } else {
+                    d.*.unreadMarker = 0
+                    d.*.getBuffer = savedBuffer
+                    d.*.bitsLeft = savedBits
+                    i = 0
+                    while i < 4 {
+                        d.*.lastDc[i] = savedDc[i]
+                        i += 1
+                    }
+                    d.*.cursor = d.*.position
+                    done = decodeSequential(d, blocks)
+                }
+            } else {
+                done = decodeSequential(d, blocks)
+            }
         } else if d.*.ah == 0 {
             if d.*.ss == 0 { done = decodeDCFirst(d, blocks) } else { done = decodeACFirst(d, blocks) }
         } else {
             if d.*.ss == 0 { done = decodeDCRefine(d, blocks) } else { done = decodeACRefine(d, blocks) }
         }
-        if d.*.fastMCU && d.*.unreadMarker != 0 {
-            while d.*.badCodes > 0 {
-                warn(d, JWRN_HUFF_BAD_CODE)
-                d.*.badCodes -= 1
-            }
-        }
-        d.*.fastMCU = false
         if !done {
             d.*.getBuffer = savedBuffer
             d.*.bitsLeft = savedBits
@@ -1829,6 +1919,91 @@ fn decodeMCU(d: *Decoder, blocks: [*]usize) -> bool {
     }
     if d.*.restartInterval != 0 { d.*.restartsToGo -= 1 }
     return true
+}
+
+// libjpeg-turbo's GET_BYTE: a byte into the bit buffer; a marker leaves
+// a zero byte and is not passed (the MCU will be decoded again).
+fn fastByte(d: *Decoder) -> void {
+    var c0: usize = 0
+    var c1: usize = 0
+    if d.*.cursor < d.*.length { c0 = get8(d.*.data + d.*.cursor) }
+    d.*.cursor += 1
+    if d.*.cursor < d.*.length { c1 = get8(d.*.data + d.*.cursor) }
+    d.*.getBuffer = (d.*.getBuffer << 8) | @intCast(u64, c0)
+    d.*.bitsLeft += 8
+    if c0 == 0xff {
+        d.*.cursor += 1
+        if c1 != 0 {
+            d.*.unreadMarker = @intCast(u32, c1)
+            d.*.cursor -= 2
+            d.*.getBuffer = d.*.getBuffer & 0xffffffffffffff00
+        }
+    }
+}
+
+// FILL_BIT_BUFFER_FAST: six bytes when 16 bits or fewer are left.
+fn fastFill(d: *Decoder) -> void {
+    if d.*.bitsLeft <= 16 {
+        var n: usize = 0
+        while n < 6 {
+            fastByte(d)
+            n += 1
+        }
+    }
+}
+
+// HUFF_DECODE_FAST: a symbol (0 for a code longer than 16 bits).
+fn fastDecode(d: *Decoder, t: *Derived) -> i32 {
+    fastFill(d)
+    const look = t.*.lookup[@intCast(usize, peekBits(d, 8))]
+    var nb = look >> 8
+    d.*.bitsLeft -= nb
+    if nb <= 8 { return look & 255 }
+    var code = @intCast(i64, (d.*.getBuffer >> @intCast(u64, d.*.bitsLeft)) & ((@intCast(u64, 1) << @intCast(u64, nb)) - 1))
+    while code > t.*.maxcode[@intCast(usize, nb)] {
+        code = (code << 1) | @intCast(i64, getBits(d, 1))
+        nb += 1
+    }
+    if nb > 16 { return 0 }
+    return @intCast(i32, t.*.values[@intCast(usize, (code + t.*.valoffset[@intCast(usize, nb)]) & 255)])
+}
+
+// decode_mcu_fast: one MCU of a sequential scan, never suspending.
+fn decodeSequentialFast(d: *Decoder, blocks: [*]usize) -> void {
+    var n: usize = 0
+    while n < d.*.blocksInMCU {
+        const block = blocks[n]
+        const ci = d.*.membership[n]
+        const c = &d.*.components[d.*.scanComponents[ci]]
+        var s = fastDecode(d, &d.*.dcDerived[c.*.dcTable])
+        if s != 0 {
+            fastFill(d)
+            const r = getBits(d, s)
+            s = extend(r, s)
+        }
+        s = s +% d.*.lastDc[ci]
+        d.*.lastDc[ci] = s
+        setCoefficient(block, s)
+        const acTable = &d.*.acDerived[c.*.acTable]
+        var k: usize = 1
+        while k < 64 {
+            const symbol = fastDecode(d, acTable)
+            var r = symbol >> 4
+            s = symbol & 15
+            if s != 0 {
+                k += @intCast(usize, r)
+                fastFill(d)
+                r = getBits(d, s)
+                s = extend(r, s)
+                setCoefficient(block + natural(k) * 2, s)
+            } else {
+                if r != 15 { break }
+                k += 15
+            }
+            k += 1
+        }
+        n += 1
+    }
 }
 
 fn decodeSequential(d: *Decoder, blocks: [*]usize) -> bool {
