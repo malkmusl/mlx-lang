@@ -1,0 +1,1071 @@
+// std.sql.engine: connections and statements: opening a database,
+// preparing a statement (parsed, its names resolved against the schema,
+// planned), stepping it (ROW until DONE, or an error), resetting and
+// finalizing it; transactions as SQLite runs them: a statement outside
+// BEGIN runs in a transaction of its own (a read transaction for as long
+// as it is stepping, a write transaction committed when it ends, after
+// any other statements reading have ended), and every writing statement
+// has a savepoint of its own, so that one that fails leaves nothing of
+// itself behind (ABORT) unless its conflict resolution says otherwise.
+// BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE], COMMIT/END, ROLLBACK [TO],
+// SAVEPOINT and RELEASE nest as in SQLite.
+//
+// A connection is used by one thread at a time: every entry point takes
+// its recursive mutex. When the database is locked by another connection
+// the busy handler (or the busy timeout's) decides whether to wait.
+// Statements compiled against a schema that has changed since (a DDL
+// statement of this connection, or another connection's, seen by the
+// schema cookie) are compiled again before they run.
+const mem = @import("./mem.mlx")
+const value = @import("./value.mlx")
+const record = @import("./record.mlx")
+const ast = @import("./ast.mlx")
+const parser = @import("./parser.mlx")
+const schema = @import("./schema.mlx")
+const core = @import("./core.mlx")
+const pg = @import("./pager.mlx")
+const os = @import("./os.mlx")
+const query = @import("./query.mlx")
+const eval = @import("./eval.mlx")
+const write = @import("./write.mlx")
+const ddl = @import("./ddl.mlx")
+const pragma = @import("./pragma.mlx")
+const functions = @import("./functions.mlx")
+const vacuum = @import("./vacuum.mlx")
+const lexer = @import("./lexer.mlx")
+
+const Value = value.Value
+
+pub const OPEN_READONLY: i32 = 1
+pub const OPEN_READWRITE: i32 = 2
+pub const OPEN_CREATE: i32 = 4
+
+// ---------------------------------------------------------------------------
+// Connections.
+
+fn addCollation(db: *core.Database, name: []const u8, kind: u8) -> usize {
+    const address = mem.alloc(@sizeOf(value.Collation))
+    const c: *value.Collation = unsafe { @ptrFromInt(*value.Collation, address) }
+    c.*.kind = kind
+    c.*.name = mem.dupText(name)
+    c.*.nameLength = name.length
+    c.*.next = db.*.collations
+    db.*.collations = address
+    return address
+}
+
+// Opens a connection: OK, or an error (the connection is made anyway and
+// holds the error, as sqlite3_open_v2's is).
+pub fn open(path: []const u8, flags: i32, out: *usize) -> i32 {
+    const address = mem.alloc(@sizeOf(core.Database))
+    out.* = address
+    if address == 0 { return core.NOMEM }
+    const db = core.database(address)
+    os.initMutex(&db.*.mutex)
+    mem.initBuffer(&db.*.message)
+    mem.initWords(&db.*.savepoints)
+    mem.initWords(&db.*.statements)
+    schema.init(&db.*.schema)
+    _ = addCollation(db, "RTRIM", value.RTRIM)
+    _ = addCollation(db, "NOCASE", value.NOCASE)
+    db.*.binary = addCollation(db, "BINARY", value.BINARY)
+    functions.registerBuiltins(db)
+    db.*.autocommit = true
+    db.*.maxPageCount = 4294967294
+    db.*.cacheSize = -2000
+    db.*.openFlags = flags
+    db.*.extendedErrors = false
+    db.*.path = mem.dupText(path)
+    db.*.pathLength = path.length
+    const readOnly = (flags & OPEN_READWRITE) == 0
+    const create = (flags & OPEN_CREATE) != 0
+    db.*.readOnly = readOnly
+    var rc = pg.open(&db.*.pager, path, readOnly, create)
+    if rc != core.OK {
+        // The pager is half made: its blocks are given back on close.
+        db.*.pager.inode = 0
+        return core.setError(db, core.CANTOPEN, "unable to open database file")
+    }
+    db.*.journalMode = db.*.pager.journalMode
+    if db.*.pager.readOnly { db.*.readOnly = true }
+    return core.OK
+}
+
+// Closes a connection: BUSY when statements are left (and `force` is
+// false: sqlite3_close; sqlite3_close_v2 finalizes them).
+pub fn close(address: usize, force: bool) -> i32 {
+    if address == 0 { return core.OK }
+    const db = core.database(address)
+    os.enter(&db.*.mutex)
+    if db.*.statements.length > 0 {
+        if !force {
+            const rc = core.setError(db, core.BUSY, "unable to close due to unfinalized statements or unfinished backups")
+            os.leave(&db.*.mutex)
+            return rc
+        }
+        while db.*.statements.length > 0 {
+            finalizeLocked(@intCast(usize, mem.at(&db.*.statements, db.*.statements.length - 1)))
+        }
+    }
+    if !db.*.autocommit || db.*.pager.transaction != pg.NO_TRANSACTION {
+        pg.rollback(&db.*.pager)
+    }
+    while db.*.savepoints.length > 0 { freeSavepoint(@intCast(usize, mem.pop(&db.*.savepoints))) }
+    pg.close(&db.*.pager)
+    schema.deinit(&db.*.schema)
+    functions.freeFunctions(db)
+    var at = db.*.collations
+    while at != 0 {
+        const c: *value.Collation = unsafe { @ptrFromInt(*value.Collation, at) }
+        const next = c.*.next
+        if c.*.destroy != 0 {
+            const destroy: core.DestroyFn = unsafe { @ptrFromInt(core.DestroyFn, c.*.destroy) }
+            destroy(c.*.context)
+        }
+        mem.free(c.*.name)
+        mem.free(at)
+        at = next
+    }
+    mem.freeBuffer(&db.*.message)
+    mem.freeWords(&db.*.savepoints)
+    mem.freeWords(&db.*.statements)
+    mem.free(db.*.path)
+    os.leave(&db.*.mutex)
+    mem.free(address)
+    return core.OK
+}
+
+// Registers a collation (a C function), or replaces one of the name in
+// place (statements holding it keep a good address); a null function
+// removes it.
+pub fn createCollation(db: *core.Database, name: []const u8, context: usize, call: usize, destroy: usize) -> i32 {
+    const existing = eval.findCollation(db, name)
+    if existing != 0 {
+        const c: *value.Collation = unsafe { @ptrFromInt(*value.Collation, existing) }
+        if c.*.kind != value.USER && call == 0 { return core.OK }
+        if c.*.destroy != 0 {
+            const d: core.DestroyFn = unsafe { @ptrFromInt(core.DestroyFn, c.*.destroy) }
+            d(c.*.context)
+        }
+        c.*.kind = value.USER
+        c.*.call = call
+        c.*.context = context
+        c.*.destroy = destroy
+        return core.OK
+    }
+    if call == 0 { return core.OK }
+    const address = addCollation(db, name, value.USER)
+    const c: *value.Collation = unsafe { @ptrFromInt(*value.Collation, address) }
+    c.*.call = call
+    c.*.context = context
+    c.*.destroy = destroy
+    return core.OK
+}
+
+// ---------------------------------------------------------------------------
+// Waiting for a lock.
+
+const delays = [_]i64{ 1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100 }
+
+// Whether to try again after BUSY (the `count`th time): the busy handler
+// says, or the busy timeout's handler waits a while.
+fn retry(db: *core.Database, count: i32) -> bool {
+    if db.*.busyHandler != 0 {
+        const call: core.BusyFn = unsafe { @ptrFromInt(core.BusyFn, db.*.busyHandler) }
+        // The handler runs without the connection's lock held by us? It
+        // is held (SQLite holds it too).
+        return call(db.*.busyArgument, count) != 0
+    }
+    if db.*.busyTimeout <= 0 { return false }
+    var waited: i64 = 0
+    var i: i32 = 0
+    while i < count {
+        waited += if i < 12 { delays[@intCast(usize, i)] } else { 100 }
+        i += 1
+    }
+    if waited >= db.*.busyTimeout { return false }
+    var delay = if count < 12 { delays[@intCast(usize, count)] } else { 100 }
+    if waited + delay > db.*.busyTimeout { delay = db.*.busyTimeout - waited }
+    os.sleepMilliseconds(delay)
+    return true
+}
+
+fn beginRead(db: *core.Database) -> i32 {
+    var count: i32 = 0
+    while true {
+        const rc = pg.beginRead(&db.*.pager)
+        if rc != core.BUSY { return rc }
+        if !retry(db, count) { return core.setError(db, core.BUSY, "database is locked") }
+        count += 1
+    }
+    return core.OK
+}
+
+// A write transaction. Waiting for it (the busy handler) happens only when
+// the connection held no read transaction before (`wait`): a reader that waited
+// for a writer which waits for the readers to go would wait forever
+// (SQLite returns BUSY at once then). Between tries the shared lock this
+// one took is let go, so that a writer waiting to commit can.
+fn beginWrite(db: *core.Database, wait: bool) -> i32 {
+    var count: i32 = 0
+    const reading = !wait
+    while true {
+        const rc = pg.beginWrite(&db.*.pager)
+        if rc == core.OK { return rc }
+        if rc == core.READONLY { return core.setError(db, core.READONLY, "attempt to write a readonly database") }
+        if rc != core.BUSY { return core.setError(db, rc, core.errorText(rc)) }
+        if reading { return core.setError(db, core.BUSY, "database is locked") }
+        pg.endRead(&db.*.pager)
+        if !retry(db, count) { return core.setError(db, core.BUSY, "database is locked") }
+        count += 1
+    }
+    return core.OK
+}
+
+fn commitPager(db: *core.Database) -> i32 {
+    var count: i32 = 0
+    while true {
+        const rc = pg.commit(&db.*.pager)
+        if rc == core.OK { return rc }
+        if rc != core.BUSY { return core.setError(db, rc, core.errorText(rc)) }
+        if !retry(db, count) { return core.setError(db, core.BUSY, "database is locked") }
+        count += 1
+    }
+    return core.OK
+}
+
+// The schema read when it is not, or when the file's cookie says another
+// connection changed it (a read transaction is open).
+fn ensureSchema(db: *core.Database) -> i32 {
+    const p = &db.*.pager
+    if p.*.size > 0 {
+        // Is it a database at all?
+        const cookie = pg.headerGet(p, 40)
+        if db.*.schema.loaded && cookie == db.*.schema.cookie { return core.OK }
+    } else if db.*.schema.loaded {
+        return core.OK
+    }
+    return ddl.load(db)
+}
+
+// The schema made current for a statement about to be prepared: a read
+// transaction for it when there is none.
+fn loadSchemaForPrepare(db: *core.Database) -> i32 {
+    if db.*.pager.transaction != pg.NO_TRANSACTION { return ensureSchema(db) }
+    var rc = beginRead(db)
+    if rc != core.OK {
+        if rc == core.NOTADB { return core.setError(db, core.NOTADB, "file is not a database") }
+        if db.*.errorCode != rc { return core.setError(db, rc, core.errorText(rc)) }
+        return rc
+    }
+    rc = ensureSchema(db)
+    if db.*.active == 0 && db.*.autocommit { pg.endRead(&db.*.pager) }
+    return rc
+}
+
+// ---------------------------------------------------------------------------
+// Statements.
+
+fn databaseOf(st: *core.Statement) -> *core.Database { return core.database(st.*.db) }
+
+fn freeCompiled(st: *core.Statement) -> void {
+    eval.freeCaches(st)
+    var i: usize = 0
+    while i < st.*.queries.length {
+        query.freeQuery(@intCast(usize, mem.at(&st.*.queries, i)))
+        i += 1
+    }
+    st.*.queries.length = 0
+    i = 0
+    while i < st.*.sources.length {
+        query.freeSource(@intCast(usize, mem.at(&st.*.sources, i)))
+        i += 1
+    }
+    st.*.sources.length = 0
+    i = 0
+    while i < st.*.scopes.length {
+        mem.free(@intCast(usize, mem.at(&st.*.scopes, i)))
+        i += 1
+    }
+    st.*.scopes.length = 0
+    write.freeDml(st.*.dml)
+    st.*.dml = 0
+    core.freeRows(st.*.rows)
+    st.*.rows = 0
+    st.*.query = 0
+    st.*.columnNames.length = 0
+    st.*.columnTypes.length = 0
+    st.*.columnCount = 0
+    ast.freeArena(&st.*.arena)
+    ast.initArena(&st.*.arena)
+}
+
+// Parses and compiles the statement's text (its first statement) against
+// the connection's schema. `consumed` is how much of the text it took.
+fn compile(st: *core.Statement, consumed: *usize, keepParameters: bool) -> i32 {
+    const db = databaseOf(st)
+    const text = ast.copyText(&st.*.arena, st.*.text, st.*.textLength)
+    var p: parser.Parser = undefined
+    parser.init(&p, &st.*.arena, text, st.*.textLength)
+    const node = parser.parseStatement(&p)
+    if p.failed {
+        const rc = core.setError(db, core.ERROR, mem.bufferText(&p.message))
+        parser.deinit(&p)
+        return rc
+    }
+    // A statement ends with its semicolon (SQLite's tail begins after it).
+    // (Without one, at the text's end, the statement takes the rest.)
+    consumed.* = p.lastEnd
+    if p.tok.kind == 0 && (node == 0 || ast.statement(node).*.textEnd == p.lastEnd) { consumed.* = st.*.textLength }
+    st.*.node = node
+    st.*.generation = db.*.schemaGeneration
+    // The text the rest of the statement's names point into.
+    st.*.text = text
+    if !keepParameters {
+        st.*.parameterCount = @intCast(usize, p.variables)
+        st.*.parameters = mem.alloc((st.*.parameterCount + 1) * @sizeOf(Value))
+        var i: usize = 0
+        while i < st.*.parameterCount {
+            value.init(core.parameter(st, @intCast(i64, i) + 1))
+            i += 1
+        }
+        i = 0
+        while i < p.names.length {
+            _ = mem.push(&st.*.names, mem.at(&p.names, i))
+            i += 1
+        }
+    }
+    parser.deinit(&p)
+    if node == 0 { return core.OK }
+    const x = ast.statement(node)
+    // (Transaction statements read only, as SQLite counts them.)
+    st.*.readOnly = !x.*.writes
+    if x.*.explain != 0 { return core.setError(db, core.ERROR, "EXPLAIN is not supported") }
+    if x.*.kind == ast.S_SELECT {
+        const q = query.compile(st, x.*.select, 0)
+        if q == 0 { return db.*.errorCode }
+        st.*.query = q
+        const qq = query.queryOf(q)
+        st.*.columnCount = qq.*.width
+        var i: usize = 0
+        while i < qq.*.width * 2 {
+            _ = mem.push(&st.*.columnNames, mem.at(&qq.*.names, i))
+            _ = mem.push(&st.*.columnTypes, mem.at(&qq.*.types, i))
+            i += 1
+        }
+        return core.OK
+    }
+    if x.*.kind == ast.S_INSERT { return write.compileInsert(st, node) }
+    if x.*.kind == ast.S_UPDATE { return write.compileUpdate(st, node) }
+    if x.*.kind == ast.S_DELETE { return write.compileDelete(st, node) }
+    if x.*.kind == ast.S_PRAGMA {
+        // The pragma's name, its value's text, the database when one is
+        // named.
+        var valueText = mem.view(0, 0)
+        if x.*.pragmaValue != 0 {
+            const v = ast.expr(x.*.pragmaValue)
+            valueText = if v.*.op == ast.E_STRING { mem.view(v.*.name, v.*.nameLength) } else { mem.view(st.*.text + v.*.start, v.*.end - v.*.start) }
+        }
+        const pragmaName = mem.dup(x.*.name, x.*.nameLength)
+        const pragmaValue = if x.*.pragmaValue != 0 { mem.dupText(valueText) } else { 0 }
+        const answer = eval.authorizeText(st, core.AUTH_PRAGMA, pragmaName, pragmaValue, x.*.schemaLength > 0)
+        mem.free(pragmaName)
+        mem.free(pragmaValue)
+        if answer == core.AUTH_DENY { return core.setError(db, core.AUTH, "not authorized") }
+        const rc = pragma.prepare(st, node)
+        // (SQLite counts PRAGMA auto_vacuum = N as reading only: it changes
+        // the file only while the database is empty.)
+        st.*.readOnly = !x.*.writes || mem.sameNoCase(mem.view(x.*.name, x.*.nameLength), "auto_vacuum")
+        return rc
+    }
+    if x.*.kind == ast.S_SAVEPOINT || x.*.kind == ast.S_RELEASE || (x.*.kind == ast.S_ROLLBACK && x.*.nameLength > 0) {
+        const operation = if x.*.kind == ast.S_SAVEPOINT { "BEGIN" } else if x.*.kind == ast.S_RELEASE { "RELEASE" } else { "ROLLBACK" }
+        if eval.authorize(st, core.AUTH_SAVEPOINT, operation, mem.view(x.*.name, x.*.nameLength)) == core.AUTH_DENY {
+            return core.setError(db, core.AUTH, "not authorized")
+        }
+    } else if x.*.kind == ast.S_BEGIN || x.*.kind == ast.S_COMMIT || x.*.kind == ast.S_ROLLBACK {
+        if eval.authorize(st, core.AUTH_TRANSACTION, if x.*.kind == ast.S_BEGIN { "BEGIN" } else if x.*.kind == ast.S_COMMIT { "COMMIT" } else { "ROLLBACK" }, mem.view(0, 0)) == core.AUTH_DENY {
+            return core.setError(db, core.AUTH, "not authorized")
+        }
+    }
+    if x.*.kind == ast.S_CREATE_VIEW || x.*.kind == ast.S_DROP_VIEW || x.*.kind == ast.S_CREATE_TABLE || x.*.kind == ast.S_CREATE_INDEX || x.*.kind == ast.S_DROP_TABLE || x.*.kind == ast.S_DROP_INDEX || x.*.kind == ast.S_VACUUM || x.*.kind == ast.S_ALTER_RENAME || x.*.kind == ast.S_ALTER_ADD || x.*.kind == ast.S_ALTER_RENAME_COLUMN || x.*.kind == ast.S_ALTER_DROP_COLUMN {
+        if db.*.readOnly && x.*.kind != ast.S_VACUUM { return core.setError(db, core.READONLY, "attempt to write a readonly database") }
+        if x.*.kind != ast.S_VACUUM { return ddl.check(st, node) }
+    }
+    return core.OK
+}
+
+fn newStatement(db: *core.Database, text: usize, length: usize) -> usize {
+    const address = mem.alloc(@sizeOf(core.Statement))
+    const st = core.statementOf(address)
+    st.*.db = @intFromPtr(db)
+    ast.initArena(&st.*.arena)
+    st.*.text = text
+    st.*.textLength = length
+    mem.initWords(&st.*.names)
+    mem.initWords(&st.*.sources)
+    mem.initWords(&st.*.queries)
+    mem.initWords(&st.*.scopes)
+    mem.initWords(&st.*.caches)
+    mem.initWords(&st.*.columnNames)
+    mem.initWords(&st.*.columnTypes)
+    st.*.failMode = ast.OE_ABORT
+    return address
+}
+
+fn freeStatement(address: usize) -> void {
+    const st = core.statementOf(address)
+    freeCompiled(st)
+    var block = st.*.scratch
+    while block != 0 {
+        const next = @intCast(usize, mem.get64(block))
+        mem.free(block)
+        block = next
+    }
+    var i: usize = 0
+    while i < st.*.parameterCount {
+        value.release(core.parameter(st, @intCast(i64, i) + 1))
+        i += 1
+    }
+    mem.free(st.*.parameters)
+    mem.freeWords(&st.*.names)
+    mem.freeWords(&st.*.heldReads)
+    mem.freeWords(&st.*.ctes)
+    mem.freeWords(&st.*.sources)
+    mem.freeWords(&st.*.queries)
+    mem.freeWords(&st.*.scopes)
+    mem.freeWords(&st.*.caches)
+    mem.freeWords(&st.*.columnNames)
+    mem.freeWords(&st.*.columnTypes)
+    ast.freeArena(&st.*.arena)
+    mem.free(st.*.expanded)
+    mem.free(st.*.originalText)
+    mem.free(address)
+}
+
+// Prepares the first statement of `length` bytes at `text`: the statement
+// (0 when the text holds only spaces and comments) and how many bytes it
+// took (the rest is the tail).
+pub fn prepare(db: *core.Database, text: usize, length: usize, out: *usize, tail: *usize) -> i32 {
+    os.enter(&db.*.mutex)
+    out.* = 0
+    tail.* = length
+    core.clearError(db)
+    var rc = loadSchemaForPrepare(db)
+    if rc != core.OK {
+        os.leave(&db.*.mutex)
+        return rc
+    }
+    // The statement keeps its own copy of the text.
+    const copied = mem.dup(text, length)
+    const address = newStatement(db, copied, length)
+    const st = core.statementOf(address)
+    st.*.originalText = copied
+    var consumed: usize = 0
+    rc = compile(st, &consumed, false)
+    if rc != core.OK || st.*.node == 0 {
+        freeStatement(address)
+        tail.* = if rc == core.OK { length } else { consumed }
+        if rc == core.OK { core.clearError(db) }
+        os.leave(&db.*.mutex)
+        return rc
+    }
+    // The statement's text is its own statement only (sqlite3_sql), and
+    // ends with a NUL for C.
+    st.*.textLength = consumed
+    mem.put8(copied + consumed, 0)
+    tail.* = consumed
+    _ = mem.push(&db.*.statements, @intCast(u64, address))
+    out.* = address
+    core.clearError(db)
+    os.leave(&db.*.mutex)
+    return core.OK
+}
+
+// Compiles a statement again (the schema changed since).
+fn recompile(st: *core.Statement) -> i32 {
+    freeCompiled(st)
+    st.*.text = st.*.originalText
+    var consumed: usize = 0
+    return compile(st, &consumed, true)
+}
+
+fn freeSavepoint(address: usize) -> void {
+    const s: *core.Savepoint = unsafe { @ptrFromInt(*core.Savepoint, address) }
+    mem.free(s.*.name)
+    mem.free(address)
+}
+
+fn savepointOf(address: usize) -> *core.Savepoint { unsafe { return @ptrFromInt(*core.Savepoint, address) } }
+
+// After a rollback the schema is read again (DDL may have been undone).
+fn schemaStale(db: *core.Database) -> void {
+    db.*.schema.loaded = false
+    db.*.schemaGeneration += 1
+}
+
+// Ends the transaction of an autocommit statement: committed when no
+// other statement is reading.
+fn endAutocommit(db: *core.Database) -> i32 {
+    if !db.*.autocommit || db.*.active > 0 { return core.OK }
+    if db.*.pager.transaction == pg.WRITE_TRANSACTION {
+        const rc = commitPager(db)
+        if rc != core.OK {
+            pg.rollback(&db.*.pager)
+            schemaStale(db)
+            return rc
+        }
+        db.*.pendingCommit = false
+        return core.OK
+    }
+    pg.endRead(&db.*.pager)
+    return core.OK
+}
+
+// BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE.
+fn transactionStatement(st: *core.Statement, x: *ast.Statement) -> i32 {
+    const db = databaseOf(st)
+    const p = &db.*.pager
+    if x.*.kind == ast.S_BEGIN {
+        if !db.*.autocommit { return core.setError(db, core.ERROR, "cannot start a transaction within a transaction") }
+        if x.*.transaction != ast.T_DEFERRED {
+            const rc = beginWrite(db, db.*.pager.transaction == pg.NO_TRANSACTION)
+            if rc != core.OK { return rc }
+        }
+        db.*.autocommit = false
+        return core.OK
+    }
+    if x.*.kind == ast.S_COMMIT {
+        if db.*.autocommit { return core.setError(db, core.ERROR, "cannot commit - no transaction is active") }
+        if p.*.transaction == pg.WRITE_TRANSACTION || p.*.transaction == pg.READ_TRANSACTION {
+            if db.*.active > 1 && p.*.transaction == pg.WRITE_TRANSACTION {
+                // Readers of this connection keep the read lock; the pages
+                // still go to the file.
+            }
+            const rc = commitPager(db)
+            if rc != core.OK { return rc }
+        }
+        while db.*.savepoints.length > 0 { freeSavepoint(@intCast(usize, mem.pop(&db.*.savepoints))) }
+        db.*.autocommit = true
+        return core.OK
+    }
+    if x.*.kind == ast.S_ROLLBACK {
+        if x.*.nameLength == 0 {
+            if db.*.autocommit { return core.setError(db, core.ERROR, "cannot rollback - no transaction is active") }
+            pg.rollback(p)
+            while db.*.savepoints.length > 0 { freeSavepoint(@intCast(usize, mem.pop(&db.*.savepoints))) }
+            db.*.autocommit = true
+            schemaStale(db)
+            return core.OK
+        }
+        const index = findSavepoint(db, mem.view(x.*.name, x.*.nameLength))
+        if index < 0 { return core.setError2(db, core.ERROR, "no such savepoint: ", mem.view(x.*.name, x.*.nameLength)) }
+        const s = savepointOf(@intCast(usize, mem.at(&db.*.savepoints, @intCast(usize, index))))
+        pg.rollbackTo(p, s.*.level)
+        while db.*.savepoints.length > @intCast(usize, index) + 1 { freeSavepoint(@intCast(usize, mem.pop(&db.*.savepoints))) }
+        schemaStale(db)
+        return core.OK
+    }
+    if x.*.kind == ast.S_SAVEPOINT {
+        const address = mem.alloc(@sizeOf(core.Savepoint))
+        const s = savepointOf(address)
+        s.*.name = mem.dup(x.*.name, x.*.nameLength)
+        s.*.nameLength = x.*.nameLength
+        s.*.began = db.*.autocommit
+        if db.*.autocommit {
+            const rc = beginRead(db)
+            if rc != core.OK {
+                mem.free(s.*.name)
+                mem.free(address)
+                return rc
+            }
+            db.*.autocommit = false
+        }
+        s.*.level = pg.openSavepoint(p)
+        _ = mem.push(&db.*.savepoints, @intCast(u64, address))
+        return core.OK
+    }
+    // RELEASE.
+    const index = findSavepoint(db, mem.view(x.*.name, x.*.nameLength))
+    if index < 0 { return core.setError2(db, core.ERROR, "no such savepoint: ", mem.view(x.*.name, x.*.nameLength)) }
+    const s = savepointOf(@intCast(usize, mem.at(&db.*.savepoints, @intCast(usize, index))))
+    const began = s.*.began
+    if began {
+        // Releasing the outermost: the transaction commits.
+        const rc = commitPager(db)
+        if rc != core.OK { return rc }
+        while db.*.savepoints.length > 0 { freeSavepoint(@intCast(usize, mem.pop(&db.*.savepoints))) }
+        db.*.autocommit = true
+        return core.OK
+    }
+    pg.release(p, s.*.level)
+    while db.*.savepoints.length > @intCast(usize, index) { freeSavepoint(@intCast(usize, mem.pop(&db.*.savepoints))) }
+    return core.OK
+}
+
+fn findSavepoint(db: *core.Database, name: []const u8) -> i64 {
+    var i = db.*.savepoints.length
+    while i > 0 {
+        i -= 1
+        const s = savepointOf(@intCast(usize, mem.at(&db.*.savepoints, i)))
+        if mem.sameNoCase(mem.view(s.*.name, s.*.nameLength), name) { return @intCast(i64, i) }
+    }
+    return -1
+}
+
+fn isDdl(kind: u8) -> bool {
+    return kind == ast.S_CREATE_VIEW || kind == ast.S_DROP_VIEW || kind == ast.S_CREATE_TABLE || kind == ast.S_CREATE_INDEX || kind == ast.S_DROP_TABLE || kind == ast.S_DROP_INDEX || kind == ast.S_ALTER_RENAME || kind == ast.S_ALTER_ADD || kind == ast.S_ALTER_RENAME_COLUMN || kind == ast.S_ALTER_DROP_COLUMN
+}
+
+// Begins a statement's run: its transaction, the schema checked, its
+// savepoint when it writes.
+fn begin(st: *core.Statement) -> i32 {
+    const db = databaseOf(st)
+    const x = ast.statement(st.*.node)
+    const kind = x.*.kind
+    if kind == ast.S_BEGIN || kind == ast.S_COMMIT || kind == ast.S_ROLLBACK || kind == ast.S_SAVEPOINT || kind == ast.S_RELEASE { return core.OK }
+    // A statement that writes takes its write lock before it reads the
+    // schema; one that starts the connection's transaction may wait for
+    // it.
+    const fresh = db.*.pager.transaction == pg.NO_TRANSACTION
+    var rc = beginRead(db)
+    if rc != core.OK {
+        if rc == core.NOTADB { return core.setError(db, core.NOTADB, "file is not a database") }
+        return rc
+    }
+    const writes = x.*.writes || isDdl(kind)
+    if writes {
+        rc = beginWrite(db, fresh)
+        if rc != core.OK { return rc }
+    }
+    const wasLoaded = db.*.schema.loaded
+    const generation = db.*.schemaGeneration
+    rc = ensureSchema(db)
+    if rc != core.OK { return rc }
+    if !wasLoaded || generation != db.*.schemaGeneration || st.*.generation != db.*.schemaGeneration {
+        rc = recompile(st)
+        if rc != core.OK { return rc }
+    }
+    if writes { st.*.savepoint = pg.openSavepoint(&db.*.pager) }
+    return core.OK
+}
+
+// Runs a statement that does all its work at once (DML, DDL, transaction
+// statements, PRAGMAs, VACUUM).
+fn runOnce(st: *core.Statement) -> i32 {
+    const db = databaseOf(st)
+    const x = ast.statement(st.*.node)
+    const kind = x.*.kind
+    if kind == ast.S_INSERT || kind == ast.S_UPDATE || kind == ast.S_DELETE {
+        if kind == ast.S_DELETE && write.canTruncate(st, st.*.node) {
+            const t = schema.findTable(&db.*.schema, mem.view(x.*.name, x.*.nameLength))
+            var count: i64 = 0
+            const rc = write.truncate(st, schema.table(t), &count)
+            st.*.changes = count
+            return rc
+        }
+        return write.run(st)
+    }
+    if kind == ast.S_CREATE_TABLE { return ddl.createTable(st, st.*.node) }
+    if kind == ast.S_CREATE_INDEX { return ddl.createIndex(st, st.*.node) }
+    if kind == ast.S_DROP_TABLE { return ddl.dropTable(st, st.*.node) }
+    if kind == ast.S_DROP_INDEX { return ddl.dropIndex(st, st.*.node) }
+    if kind == ast.S_ALTER_RENAME || kind == ast.S_ALTER_ADD || kind == ast.S_ALTER_RENAME_COLUMN || kind == ast.S_ALTER_DROP_COLUMN { return ddl.alterTable(st, st.*.node) }
+    if kind == ast.S_PRAGMA { return pragma.run(st, st.*.node) }
+    if kind == ast.S_VACUUM { return vacuum.run(st) }
+    if kind == ast.S_REINDEX || kind == ast.S_ANALYZE { return core.OK }
+    if kind == ast.S_CREATE_VIEW { return ddl.createView(st, st.*.node) }
+    if kind == ast.S_DROP_VIEW { return ddl.dropView(st, st.*.node) }
+    if kind == ast.S_CREATE_TRIGGER || kind == ast.S_DROP_TRIGGER {
+        return core.setError(db, core.ERROR, "triggers are not supported")
+    }
+    return transactionStatement(st, x)
+}
+
+// Ends a statement's run: its savepoint released (or rolled back, as its
+// failure says), the autocommit transaction ended.
+fn finish(st: *core.Statement, rc: i32) -> i32 {
+    const db = databaseOf(st)
+    const p = &db.*.pager
+    var result = rc
+    if st.*.savepoint != 0 {
+        if rc == core.OK || rc == core.DONE || rc == core.ROW {
+            pg.release(p, st.*.savepoint)
+        } else if st.*.failMode == ast.OE_FAIL {
+            pg.release(p, st.*.savepoint)
+        } else if st.*.failMode == ast.OE_ROLLBACK {
+            pg.rollbackTo(p, st.*.savepoint)
+            pg.release(p, st.*.savepoint)
+            pg.rollback(p)
+            while db.*.savepoints.length > 0 { freeSavepoint(@intCast(usize, mem.pop(&db.*.savepoints))) }
+            db.*.autocommit = true
+            schemaStale(db)
+        } else {
+            pg.rollbackTo(p, st.*.savepoint)
+            pg.release(p, st.*.savepoint)
+            if isDdl(ast.statement(st.*.node).*.kind) { schemaStale(db) }
+        }
+        st.*.savepoint = 0
+    }
+    if rc == core.OK || rc == core.DONE {
+        if !st.*.readOnly && st.*.node != 0 {
+            const kind = ast.statement(st.*.node).*.kind
+            if kind == ast.S_INSERT || kind == ast.S_UPDATE || kind == ast.S_DELETE {
+                db.*.changes = st.*.changes
+                db.*.totalChanges += st.*.changes
+            }
+        }
+    }
+    if db.*.active > 0 { db.*.active -= 1 }
+    const ended = endAutocommit(db)
+    if ended != core.OK && (result == core.OK || result == core.DONE) { result = ended }
+    return result
+}
+
+// The next row: ROW, DONE, or an error (the connection's message says
+// which).
+pub fn step(address: usize) -> i32 {
+    const st = core.statementOf(address)
+    const db = databaseOf(st)
+    os.enter(&db.*.mutex)
+    const rc = stepLocked(st)
+    os.leave(&db.*.mutex)
+    return rc
+}
+
+fn stepLocked(st: *core.Statement) -> i32 {
+    const db = databaseOf(st)
+    if st.*.state == core.FINISHED || st.*.state == core.FAILED { resetLocked(st) }
+    core.clearError(db)
+    if st.*.state == core.NOT_STARTED {
+        db.*.interrupted = false
+        st.*.changes = 0
+        st.*.failMode = ast.OE_ABORT
+        st.*.finished = false
+        db.*.active += 1
+        var rc = begin(st)
+        if rc != core.OK {
+            if db.*.errorCode == core.OK { _ = core.setError(db, rc, core.errorText(rc)) }
+            rc = finish(st, rc)
+            st.*.state = core.FAILED
+            st.*.errorCode = rc
+            return rc
+        }
+        st.*.state = core.RUNNING
+        eval.clearCaches(st)
+        if st.*.query != 0 {
+            query.reset(st, st.*.query)
+        } else {
+            rc = runOnce(st)
+            if rc != core.OK {
+                if db.*.errorCode == core.OK { _ = core.setError(db, rc, core.errorText(rc)) }
+                const code = db.*.errorCode
+                const message = mem.dupText(mem.bufferText(&db.*.message))
+                _ = finish(st, rc)
+                // The error is the statement's (a later commit's does not
+                // replace it).
+                db.*.errorCode = code
+                db.*.message.length = 0
+                _ = mem.appendText(&db.*.message, mem.cText(message))
+                mem.free(message)
+                st.*.state = core.FAILED
+                st.*.errorCode = code
+                return code
+            }
+            if st.*.rows != 0 { core.rowsOf(st.*.rows).*.position = 0 }
+        }
+    }
+    // Rows.
+    if st.*.query != 0 {
+        const rc = query.step(st, st.*.query)
+        if rc == core.ROW { return core.ROW }
+        if rc == core.DONE {
+            const ended = finish(st, core.DONE)
+            st.*.state = if ended == core.DONE { core.FINISHED } else { core.FAILED }
+            st.*.errorCode = if ended == core.DONE { core.OK } else { ended }
+            return ended
+        }
+        const code = if db.*.errorCode != core.OK { db.*.errorCode } else { rc }
+        if db.*.errorCode == core.OK { _ = core.setError(db, rc, core.errorText(rc)) }
+        _ = finish(st, rc)
+        db.*.errorCode = code
+        st.*.state = core.FAILED
+        st.*.errorCode = code
+        return code
+    }
+    if st.*.rows != 0 {
+        const r = core.rowsOf(st.*.rows)
+        if r.*.position < r.*.rows.length {
+            r.*.position += 1
+            return core.ROW
+        }
+    }
+    const ended = finish(st, core.DONE)
+    st.*.state = if ended == core.DONE { core.FINISHED } else { core.FAILED }
+    st.*.errorCode = if ended == core.DONE { core.OK } else { ended }
+    return ended
+}
+
+fn resetLocked(st: *core.Statement) -> void {
+    const db = databaseOf(st)
+    if st.*.state == core.RUNNING {
+        // Stopped before DONE: a reader's transaction ends with it.
+        _ = finish(st, core.OK)
+    }
+    if st.*.query != 0 { query.reset(st, st.*.query) }
+    st.*.state = core.NOT_STARTED
+    _ = db
+}
+
+// Resets a statement (bindings stay): the error of its last step, if it
+// failed.
+pub fn reset(address: usize) -> i32 {
+    const st = core.statementOf(address)
+    const db = databaseOf(st)
+    os.enter(&db.*.mutex)
+    const code = if st.*.state == core.FAILED { st.*.errorCode } else { core.OK }
+    resetLocked(st)
+    st.*.errorCode = core.OK
+    os.leave(&db.*.mutex)
+    return code
+}
+
+fn finalizeLocked(address: usize) -> void {
+    const st = core.statementOf(address)
+    const db = databaseOf(st)
+    resetLocked(st)
+    var i: usize = 0
+    while i < db.*.statements.length {
+        if mem.at(&db.*.statements, i) == @intCast(u64, address) {
+            mem.removeAt(&db.*.statements, i)
+            break
+        }
+        i += 1
+    }
+    freeStatement(address)
+}
+
+// Finalizes a statement: the error of its last step, if it failed.
+pub fn finalize(address: usize) -> i32 {
+    if address == 0 { return core.OK }
+    const st = core.statementOf(address)
+    const db = databaseOf(st)
+    os.enter(&db.*.mutex)
+    const code = if st.*.state == core.FAILED { st.*.errorCode } else { core.OK }
+    finalizeLocked(address)
+    os.leave(&db.*.mutex)
+    return code
+}
+
+// ---------------------------------------------------------------------------
+// Results.
+
+// The value of result column `i` of the current row (a NULL value past the
+// columns or when there is no row).
+var noValue: Value = undefined
+var noValueReady: bool = false
+
+pub fn column(address: usize, i: usize) -> *Value {
+    const st = core.statementOf(address)
+    if !noValueReady {
+        value.init(&noValue)
+        noValueReady = true
+    }
+    if st.*.state != core.RUNNING || i >= st.*.columnCount { return &noValue }
+    if st.*.query != 0 { return query.output(st.*.query, i) }
+    if st.*.rows != 0 {
+        const r = core.rowsOf(st.*.rows)
+        if r.*.position == 0 || r.*.position > r.*.rows.length { return &noValue }
+        return record.valueAt(core.rowAt(st.*.rows, r.*.position - 1), i)
+    }
+    return &noValue
+}
+
+pub fn columnName(address: usize, i: usize) -> []const u8 {
+    const st = core.statementOf(address)
+    if i >= st.*.columnCount { return mem.view(0, 0) }
+    return mem.view(@intCast(usize, mem.at(&st.*.columnNames, i * 2)), @intCast(usize, mem.at(&st.*.columnNames, i * 2 + 1)))
+}
+
+// The declared type of result column `i` (a column of a table), or no
+// text (address 0).
+pub fn columnType(address: usize, i: usize, length: *usize) -> usize {
+    const st = core.statementOf(address)
+    length.* = 0
+    if i >= st.*.columnCount { return 0 }
+    length.* = @intCast(usize, mem.at(&st.*.columnTypes, i * 2 + 1))
+    return @intCast(usize, mem.at(&st.*.columnTypes, i * 2))
+}
+
+// The table and column result column `i` is read from (addresses of
+// NUL-terminated names; 0 for an expression that is not a table's column).
+pub fn columnOrigin(address: usize, i: usize, table: *usize, column: *usize) -> void {
+    const st = core.statementOf(address)
+    table.* = 0
+    column.* = 0
+    if st.*.query == 0 || i >= st.*.columnCount { return }
+    const q = query.queryOf(st.*.query)
+    if i >= q.*.results.length { return }
+    const r = ast.expr(@intCast(usize, mem.at(&q.*.results, i)))
+    if r.*.op != ast.E_COLUMN || r.*.source < 0 { return }
+    const s = core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, r.*.source))))
+    if s.*.kind != core.SOURCE_TABLE { return }
+    const t = schema.table(s.*.table)
+    table.* = t.*.name
+    if r.*.column >= 0 {
+        column.* = schema.column(t, @intCast(usize, r.*.column)).*.name
+    } else if t.*.rowidColumn >= 0 {
+        column.* = schema.column(t, @intCast(usize, t.*.rowidColumn)).*.name
+    } else {
+        column.* = @intFromPtr("rowid".pointer)
+    }
+}
+
+pub fn columnCount(address: usize) -> usize { return core.statementOf(address).*.columnCount }
+
+// The number of columns of the current row (0 when there is none).
+pub fn dataCount(address: usize) -> usize {
+    const st = core.statementOf(address)
+    if st.*.state != core.RUNNING { return 0 }
+    if st.*.query == 0 && st.*.rows == 0 { return 0 }
+    return st.*.columnCount
+}
+
+// ---------------------------------------------------------------------------
+// Parameters.
+
+pub fn parameterCount(address: usize) -> usize { return core.statementOf(address).*.parameterCount }
+
+// The parameter numbered `i`, for binding: 0 when there is none (RANGE).
+pub fn parameterValue(address: usize, i: i64) -> usize {
+    const st = core.statementOf(address)
+    if i < 1 || @intCast(usize, i) > st.*.parameterCount { return 0 }
+    return @intFromPtr(core.parameter(st, i))
+}
+
+// A statement may be bound only before its first step or after a reset
+// (MISUSE otherwise, as SQLite has it).
+pub fn canBind(address: usize) -> bool { return core.statementOf(address).*.state == core.NOT_STARTED }
+
+pub fn parameterName(address: usize, i: i64, length: *usize) -> usize {
+    const st = core.statementOf(address)
+    length.* = 0
+    var k: usize = 0
+    while k < st.*.names.length {
+        if @bitCast(i64, mem.at(&st.*.names, k + 2)) == i {
+            length.* = @intCast(usize, mem.at(&st.*.names, k + 1))
+            return @intCast(usize, mem.at(&st.*.names, k))
+        }
+        k += 3
+    }
+    return 0
+}
+
+pub fn parameterIndex(address: usize, name: []const u8) -> i64 {
+    const st = core.statementOf(address)
+    var k: usize = 0
+    while k < st.*.names.length {
+        const at = @intCast(usize, mem.at(&st.*.names, k))
+        const length = @intCast(usize, mem.at(&st.*.names, k + 1))
+        if mem.same(mem.view(at, length), name) { return @bitCast(i64, mem.at(&st.*.names, k + 2)) }
+        k += 3
+    }
+    return 0
+}
+
+pub fn clearBindings(address: usize) -> void {
+    const st = core.statementOf(address)
+    var i: usize = 0
+    while i < st.*.parameterCount {
+        value.setNull(core.parameter(st, @intCast(i64, i) + 1))
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// About statements.
+
+pub fn sqlText(address: usize) -> []const u8 {
+    const st = core.statementOf(address)
+    return mem.view(st.*.originalText, st.*.textLength)
+}
+
+pub fn isReadOnly(address: usize) -> bool { return core.statementOf(address).*.readOnly }
+
+// Stepping and not yet at its end (sqlite3_stmt_busy).
+pub fn isBusy(address: usize) -> bool { return core.statementOf(address).*.state == core.RUNNING }
+
+// The connection's statements after `address` (0: the first).
+pub fn nextStatement(db: *core.Database, address: usize) -> usize {
+    var i: usize = 0
+    if address != 0 {
+        while i < db.*.statements.length {
+            if mem.at(&db.*.statements, i) == @intCast(u64, address) {
+                i += 1
+                break
+            }
+            i += 1
+        }
+    }
+    if i < db.*.statements.length { return @intCast(usize, mem.at(&db.*.statements, i)) }
+    return 0
+}
+
+// The statement's text with its parameters' values in place of them
+// (sqlite3_expanded_sql), kept until the next call.
+pub fn expandedText(address: usize) -> usize {
+    const st = core.statementOf(address)
+    mem.free(st.*.expanded)
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    const text = sqlText(address)
+    var l: lexer.Lexer = undefined
+    lexer.init(&l, @intFromPtr(text.pointer), text.length)
+    var t: lexer.Token = undefined
+    var copied: usize = 0
+    var next: i64 = 0
+    while true {
+        lexer.next(&l, &t)
+        if t.kind == 0 { break }
+        if t.kind == 7 {
+            _ = mem.append(&b, @intFromPtr(text.pointer) + copied, t.start - copied)
+            copied = t.start + t.length
+            var number: i64 = 0
+            const raw = text[t.start..t.start + t.length]
+            if raw.length == 1 {
+                next += 1
+                number = next
+            } else if raw[0] == 63 {
+                var k: usize = 1
+                while k < raw.length {
+                    number = number * 10 + @intCast(i64, raw[k] - 48)
+                    k += 1
+                }
+                if number > next { next = number }
+            } else {
+                number = parameterIndex(address, raw)
+                if number > next { next = number }
+            }
+            const bound = if number >= 1 && @intCast(usize, number) <= st.*.parameterCount { core.parameter(st, number) } else { &noValue }
+            if number >= 1 && @intCast(usize, number) <= st.*.parameterCount && bound.*.kind == value.BLOB {
+                // (Blobs in lower case here, as SQLite writes them.)
+                _ = mem.appendText(&b, "x'")
+                var k: usize = 0
+                while k < bound.*.length {
+                    const byte = mem.get8(bound.*.data + k)
+                    _ = mem.appendByte(&b, if (byte >> 4) < 10 { 48 + (byte >> 4) } else { 87 + (byte >> 4) })
+                    _ = mem.appendByte(&b, if (byte & 15) < 10 { 48 + (byte & 15) } else { 87 + (byte & 15) })
+                    k += 1
+                }
+                _ = mem.appendByte(&b, 39)
+            } else if number >= 1 && @intCast(usize, number) <= st.*.parameterCount {
+                functions.quote(bound, &b)
+            } else {
+                _ = mem.appendText(&b, "NULL")
+            }
+        }
+    }
+    _ = mem.append(&b, @intFromPtr(text.pointer) + copied, text.length - copied)
+    st.*.expanded = mem.takeBuffer(&b)
+    return st.*.expanded
+}

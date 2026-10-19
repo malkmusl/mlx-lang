@@ -1,0 +1,435 @@
+// std.sql.record: SQLite's record format and its variable-length
+// integers. A record is a header (its own length as a varint, then one
+// serial type per column) and the columns' bytes: 0 NULL, 1 to 6 big-endian
+// integers of 1, 2, 3, 4, 6 and 8 bytes, 7 an IEEE double, 8 and 9 the
+// integers 0 and 1, 12 + 2n a blob of n bytes, 13 + 2n a text of n bytes.
+// Records are the rows of tables and the keys of indexes; index keys are
+// ordered column by column, each by its collation, descending where the
+// index says so.
+const mem = @import("./mem.mlx")
+const value = @import("./value.mlx")
+
+pub const Value = value.Value
+
+// ---------------------------------------------------------------------------
+// Varints: 1 to 9 bytes, 7 bits each but the ninth's 8, the most
+// significant first.
+
+pub fn varintLength(v: u64) -> usize {
+    if v <= 127 { return 1 }
+    if v <= 16383 { return 2 }
+    if (v >> 56) != 0 { return 9 }
+    var n: usize = 1
+    var x = v >> 7
+    while x != 0 {
+        n += 1
+        x = x >> 7
+    }
+    return n
+}
+
+// Writes `v` at `at`, answers its length.
+pub fn putVarint(at: usize, v: u64) -> usize {
+    if v <= 127 {
+        mem.put8(at, v)
+        return 1
+    }
+    if (v >> 56) != 0 {
+        mem.put8(at + 8, v & 255)
+        var x = v >> 8
+        var i: usize = 8
+        while i > 0 {
+            i -= 1
+            mem.put8(at + i, (x & 127) | 128)
+            x = x >> 7
+        }
+        return 9
+    }
+    const n = varintLength(v)
+    var x = v
+    var i = n
+    while i > 0 {
+        i -= 1
+        const bits = x & 127
+        mem.put8(at + i, if i == n - 1 { bits } else { bits | 128 })
+        x = x >> 7
+    }
+    return n
+}
+
+// Reads a varint at `at` into `out`, answers its length.
+pub fn getVarint(at: usize, out: *u64) -> usize {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < 8 {
+        const b = mem.get8(at + i)
+        v = (v << 7) | (b & 127)
+        if (b & 128) == 0 {
+            out.* = v
+            return i + 1
+        }
+        i += 1
+    }
+    v = (v << 8) | mem.get8(at + 8)
+    out.* = v
+    return 9
+}
+
+// A varint known to be small (a header's serial types and lengths).
+pub fn getVarint32(at: usize, out: *u64) -> usize {
+    const b = mem.get8(at)
+    if b < 128 {
+        out.* = b
+        return 1
+    }
+    return getVarint(at, out)
+}
+
+// ---------------------------------------------------------------------------
+// Serial types.
+
+pub fn serialSize(serialType: u64) -> usize {
+    if serialType >= 12 { return @intCast(usize, (serialType - 12) / 2) }
+    return match serialType {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 6,
+        6 => 8,
+        7 => 8,
+        else => 0,
+    }
+}
+
+// The serial type a value is stored with (the smallest that holds it).
+pub fn serialTypeOf(v: *Value) -> u64 {
+    if v.*.kind == value.NULL { return 0 }
+    if v.*.kind == value.INTEGER {
+        const i = v.*.i
+        if i == 0 { return 8 }
+        if i == 1 { return 9 }
+        if i >= -128 && i <= 127 { return 1 }
+        if i >= -32768 && i <= 32767 { return 2 }
+        if i >= -8388608 && i <= 8388607 { return 3 }
+        if i >= -2147483648 && i <= 2147483647 { return 4 }
+        if i >= -140737488355328 && i <= 140737488355327 { return 5 }
+        return 6
+    }
+    if v.*.kind == value.REAL { return 7 }
+    if v.*.kind == value.TEXT { return 13 + 2 * @intCast(u64, v.*.length) }
+    return 12 + 2 * @intCast(u64, v.*.length)
+}
+
+fn getSigned(at: usize, size: usize) -> i64 {
+    var x: u64 = 0
+    var i: usize = 0
+    while i < size {
+        x = (x << 8) | mem.get8(at + i)
+        i += 1
+    }
+    // Sign-extend from size * 8 bits.
+    const bits = size * 8
+    if bits < 64 && (x >> (bits - 1)) & 1 == 1 {
+        x = x | (0xffffffffffffffff << bits)
+    }
+    return @bitCast(i64, x)
+}
+
+// The value of a column of serial type `serialType` whose bytes are at
+// `at`, into `out`.
+pub fn decodeColumn(serialType: u64, at: usize, out: *Value) -> void {
+    if serialType == 0 || serialType == 10 || serialType == 11 {
+        value.setNull(out)
+    } else if serialType == 8 {
+        value.setInt(out, 0)
+    } else if serialType == 9 {
+        value.setInt(out, 1)
+    } else if serialType == 7 {
+        value.setReal(out, @bitCast(f64, mem.get64be(at)))
+    } else if serialType <= 6 {
+        value.setInt(out, getSigned(at, serialSize(serialType)))
+    } else if (serialType & 1) == 1 {
+        _ = value.setText(out, at, serialSize(serialType))
+    } else {
+        _ = value.setBlob(out, at, serialSize(serialType))
+    }
+}
+
+// Writes a value's bytes for its serial type at `at`.
+fn encodeColumn(v: *Value, serialType: u64, at: usize) -> void {
+    if serialType >= 1 && serialType <= 6 {
+        const size = serialSize(serialType)
+        var x = @bitCast(u64, v.*.i)
+        var i = size
+        while i > 0 {
+            i -= 1
+            mem.put8(at + i, x & 255)
+            x = x >> 8
+        }
+    } else if serialType == 7 {
+        mem.put64be(at, @bitCast(u64, v.*.r))
+    } else if serialType >= 12 {
+        mem.copy(at, v.*.data, v.*.length)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Records.
+
+// The `index`th of `count` values laid out one after another from `base`.
+pub inline fn valueAt(base: usize, index: usize) -> *Value {
+    unsafe { return @ptrFromInt(*Value, base + index * @sizeOf(Value)) }
+}
+
+// A record of `count` values (laid out from `base`) appended to `out`.
+pub fn encode(base: usize, count: usize, out: *mem.Buffer) -> bool {
+    var headerLength: usize = 0
+    var bodyLength: usize = 0
+    var i: usize = 0
+    while i < count {
+        const t = serialTypeOf(valueAt(base, i))
+        headerLength += varintLength(t)
+        bodyLength += serialSize(t)
+        i += 1
+    }
+    // The header's length counts its own varint.
+    var total = headerLength + 1
+    while headerLength + varintLength(@intCast(u64, total)) != total {
+        total = headerLength + varintLength(@intCast(u64, total))
+    }
+    if !mem.reserve(out, total + bodyLength) { return false }
+    var at = out.*.data + out.*.length
+    at += putVarint(at, @intCast(u64, total))
+    i = 0
+    while i < count {
+        at += putVarint(at, serialTypeOf(valueAt(base, i)))
+        i += 1
+    }
+    i = 0
+    while i < count {
+        const v = valueAt(base, i)
+        const t = serialTypeOf(v)
+        encodeColumn(v, t, at)
+        at += serialSize(t)
+        i += 1
+    }
+    out.*.length += total + bodyLength
+    mem.put8(out.*.data + out.*.length, 0)
+    return true
+}
+
+// A record's header read: where each column's bytes are and their serial
+// types, for columns read one at a time.
+pub const Header = struct {
+    data: usize
+    length: usize
+    count: usize
+    // Two words per column: the serial type and the offset of its bytes.
+    slots: mem.Words
+    // The record is damaged (a column runs past its end).
+    corrupt: bool
+}
+
+pub fn initHeader(h: *Header) -> void {
+    h.*.data = 0
+    h.*.length = 0
+    h.*.count = 0
+    h.*.corrupt = false
+    mem.initWords(&h.*.slots)
+}
+
+pub fn freeHeader(h: *Header) -> void {
+    mem.freeWords(&h.*.slots)
+    h.*.count = 0
+}
+
+// Reads the header of the record of `length` bytes at `data`.
+pub fn readHeader(h: *Header, data: usize, length: usize) -> bool {
+    h.*.data = data
+    h.*.length = length
+    h.*.count = 0
+    h.*.corrupt = false
+    h.*.slots.length = 0
+    if length == 0 { return true }
+    var headerLength: u64 = 0
+    var at = getVarint32(data, &headerLength)
+    if headerLength > @intCast(u64, length) || headerLength < @intCast(u64, at) {
+        h.*.corrupt = true
+        return false
+    }
+    var offset = @intCast(usize, headerLength)
+    while at < @intCast(usize, headerLength) {
+        var t: u64 = 0
+        at += getVarint32(data + at, &t)
+        if !mem.push(&h.*.slots, t) { return false }
+        if !mem.push(&h.*.slots, @intCast(u64, offset)) { return false }
+        offset += serialSize(t)
+        h.*.count += 1
+    }
+    if offset > length {
+        h.*.corrupt = true
+        return false
+    }
+    return true
+}
+
+pub inline fn typeAt(h: *Header, column: usize) -> u64 { return mem.at(&h.*.slots, column * 2) }
+pub inline fn offsetAt(h: *Header, column: usize) -> usize { return @intCast(usize, mem.at(&h.*.slots, column * 2 + 1)) }
+
+// Column `column` of a record whose header was read (NULL past its end).
+pub fn column(h: *Header, index: usize, out: *Value) -> void {
+    if index >= h.*.count {
+        value.setNull(out)
+        return
+    }
+    decodeColumn(typeAt(h, index), h.*.data + offsetAt(h, index), out)
+}
+
+// ---------------------------------------------------------------------------
+// Keys: how an index orders its records.
+
+pub const KeyInfo = struct {
+    // How many columns the index has (its key columns and the rowid).
+    count: usize
+    // Per column: the collation (0 = BINARY) and whether it descends.
+    collations: usize
+    descending: usize
+}
+
+pub fn keyCollation(k: *KeyInfo, index: usize) -> usize {
+    if k.*.collations == 0 { return 0 }
+    return @intCast(usize, mem.get64(k.*.collations + index * 8))
+}
+
+pub fn keyDescending(k: *KeyInfo, index: usize) -> bool {
+    if k.*.descending == 0 { return false }
+    return mem.get8(k.*.descending + index) != 0
+}
+
+fn rankOfType(t: u64) -> u64 {
+    if t == 0 || t == 10 || t == 11 { return 0 }
+    if t <= 9 { return 1 }
+    if (t & 1) == 1 { return 2 }
+    return 3
+}
+
+fn rankOfValue(v: *Value) -> u64 {
+    if v.*.kind == value.NULL { return 0 }
+    if v.*.kind == value.INTEGER || v.*.kind == value.REAL { return 1 }
+    if v.*.kind == value.TEXT { return 2 }
+    return 3
+}
+
+// One stored column (serial type `t`, bytes at `at`) against a value, in
+// the collation's order.
+fn compareStored(t: u64, at: usize, v: *Value, collation: usize) -> i64 {
+    const ra = rankOfType(t)
+    const rb = rankOfValue(v)
+    if ra != rb { return if ra < rb { -1 } else { 1 } }
+    if ra == 0 { return 0 }
+    if ra == 1 {
+        if t == 7 {
+            const r = @bitCast(f64, mem.get64be(at))
+            if v.*.kind == value.REAL {
+                if r < v.*.r { return -1 }
+                if r > v.*.r { return 1 }
+                return 0
+            }
+            return 0 - value.compareIntReal(v.*.i, r)
+        }
+        var i: i64 = 0
+        if t == 9 {
+            i = 1
+        } else if t != 8 {
+            i = getSigned(at, serialSize(t))
+        }
+        if v.*.kind == value.REAL { return value.compareIntReal(i, v.*.r) }
+        if i < v.*.i { return -1 }
+        if i > v.*.i { return 1 }
+        return 0
+    }
+    const n = serialSize(t)
+    if ra == 2 { return value.compareText(collation, at, n, v.*.data, v.*.length) }
+    return mem.compare(at, n, v.*.data, v.*.length)
+}
+
+// A stored record against `keyCount` values (laid out from `keys`), column
+// by column in the index's order: negative, zero (equal on those columns)
+// or positive.
+pub fn compareWithKeys(data: usize, length: usize, keys: usize, keyCount: usize, info: *KeyInfo) -> i64 {
+    var headerLength: u64 = 0
+    var at = getVarint32(data, &headerLength)
+    var offset = @intCast(usize, headerLength)
+    var i: usize = 0
+    while i < keyCount {
+        var t: u64 = 0
+        if at < @intCast(usize, headerLength) {
+            at += getVarint32(data + at, &t)
+        }
+        if offset + serialSize(t) > length { return 0 }
+        var c = compareStored(t, data + offset, valueAt(keys, i), keyCollation(info, i))
+        if c != 0 {
+            if keyDescending(info, i) { c = 0 - c }
+            return c
+        }
+        offset += serialSize(t)
+        i += 1
+    }
+    return 0
+}
+
+// Two stored records, on their first `count` columns.
+pub fn compareRecords(a: usize, aLength: usize, b: usize, bLength: usize, count: usize, info: *KeyInfo) -> i64 {
+    var ah: u64 = 0
+    var bh: u64 = 0
+    var aAt = getVarint32(a, &ah)
+    var bAt = getVarint32(b, &bh)
+    var aOffset = @intCast(usize, ah)
+    var bOffset = @intCast(usize, bh)
+    var scratch: Value = undefined
+    value.init(&scratch)
+    var result: i64 = 0
+    var i: usize = 0
+    while i < count {
+        var at: u64 = 0
+        var bt: u64 = 0
+        if aAt < @intCast(usize, ah) { aAt += getVarint32(a + aAt, &at) }
+        if bAt < @intCast(usize, bh) { bAt += getVarint32(b + bAt, &bt) }
+        decodeColumn(bt, b + bOffset, &scratch)
+        var c = compareStored(at, a + aOffset, &scratch, keyCollation(info, i))
+        if c != 0 {
+            if keyDescending(info, i) { c = 0 - c }
+            result = c
+            break
+        }
+        aOffset += serialSize(at)
+        bOffset += serialSize(bt)
+        i += 1
+    }
+    value.release(&scratch)
+    return result
+}
+
+// The last column of an index record: the rowid of the row it indexes.
+pub fn lastInteger(data: usize, length: usize) -> i64 {
+    var headerLength: u64 = 0
+    var at = getVarint32(data, &headerLength)
+    var offset = @intCast(usize, headerLength)
+    var last: u64 = 0
+    while at < @intCast(usize, headerLength) {
+        var t: u64 = 0
+        at += getVarint32(data + at, &t)
+        if at >= @intCast(usize, headerLength) {
+            last = t
+            break
+        }
+        offset += serialSize(t)
+    }
+    if offset + serialSize(last) > length { return 0 }
+    if last == 8 { return 0 }
+    if last == 9 { return 1 }
+    if last >= 1 && last <= 6 { return getSigned(data + offset, serialSize(last)) }
+    return 0
+}

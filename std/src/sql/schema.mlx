@@ -1,0 +1,854 @@
+// std.sql.schema: what a database holds, as sqlite_master describes it:
+// tables with their columns (declared types, affinities, NOT NULL, DEFAULT,
+// COLLATE, the INTEGER PRIMARY KEY that is the rowid), their indexes (made
+// by CREATE INDEX, or by UNIQUE and PRIMARY KEY constraints:
+// sqlite_autoindex_TABLE_N, numbered in the order the constraints are
+// written, a constraint with the same columns as an earlier one making
+// none) and their foreign keys.
+//
+// A table is always made from its CREATE TABLE text, parsed into an arena
+// the table owns with the text itself: its names, types and DEFAULT
+// expressions are the parse's. CREATE TABLE builds the text sqlite_master
+// will keep and makes the table from it, as loading the schema does.
+const mem = @import("./mem.mlx")
+const ast = @import("./ast.mlx")
+const parser = @import("./parser.mlx")
+const value = @import("./value.mlx")
+const record = @import("./record.mlx")
+
+pub const Column = struct {
+    name: usize
+    nameLength: usize
+    typeName: usize
+    typeLength: usize
+    affinity: u8
+    notNull: bool
+    notNullConflict: u8
+    // DEFAULT's expression (in the table's arena), 0 for NULL.
+    defaultExpr: usize
+    collation: usize
+    collationLength: usize
+    primaryKey: bool
+}
+
+pub const Table = struct {
+    name: usize
+    nameLength: usize
+    root: u64
+    columns: usize
+    columnCount: usize
+    // The INTEGER PRIMARY KEY column (the rowid itself), or -1.
+    rowidColumn: i64
+    rowidConflict: u8
+    autoincrement: bool
+    // Index addresses (the autoindexes first, in their order).
+    indexes: mem.Words
+    foreignKeys: mem.Words
+    // The CREATE TABLE text (in the arena).
+    sql: usize
+    sqlLength: usize
+    // The schema table itself (root page 1).
+    isSchema: bool
+    arena: ast.Arena
+    // The primary key's columns when it is not the rowid.
+    primaryKey: mem.Words
+    // CHECK constraints: per constraint its expression's start and end in
+    // `sql`, and its name (address, length; 0 when it has none).
+    checks: mem.Words
+}
+
+pub const Index = struct {
+    name: usize
+    nameLength: usize
+    table: usize
+    root: u64
+    // Per indexed column: its column (-1 the rowid), its collation's name
+    // and whether it descends.
+    columnCount: usize
+    columns: usize
+    collationNames: usize
+    descending: usize
+    unique: bool
+    onError: u8
+    // 0 CREATE INDEX, 1 a UNIQUE constraint, 2 the PRIMARY KEY.
+    origin: u8
+    // A partial index's WHERE (0: every row), in `arena`.
+    partial: usize
+    arena: ast.Arena
+    sql: usize
+    sqlLength: usize
+    // How its records are ordered (count = columns + the rowid); the
+    // collations are resolved by the connection that uses it.
+    info: record.KeyInfo
+    resolved: bool
+}
+
+pub const ForeignKey = struct {
+    table: usize
+    // The referencing columns (indexes into the table's columns).
+    columnCount: usize
+    columns: usize
+    parent: usize
+    parentLength: usize
+    // The parent's columns named: pairs of name address and length (0
+    // when none are named: its primary key).
+    parentNames: usize
+    onDelete: u8
+    onUpdate: u8
+}
+
+pub inline fn table(address: usize) -> *Table { unsafe { return @ptrFromInt(*Table, address) } }
+pub inline fn index(address: usize) -> *Index { unsafe { return @ptrFromInt(*Index, address) } }
+pub inline fn foreignKey(address: usize) -> *ForeignKey { unsafe { return @ptrFromInt(*ForeignKey, address) } }
+
+pub fn column(t: *Table, i: usize) -> *Column { unsafe { return @ptrFromInt(*Column, t.*.columns + i * @sizeOf(Column)) } }
+
+pub fn tableName(t: *Table) -> []const u8 { return mem.view(t.*.name, t.*.nameLength) }
+pub fn columnName(c: *Column) -> []const u8 { return mem.view(c.*.name, c.*.nameLength) }
+pub fn indexName(x: *Index) -> []const u8 { return mem.view(x.*.name, x.*.nameLength) }
+
+pub fn indexColumn(x: *Index, i: usize) -> i64 { return @bitCast(i64, mem.get64(x.*.columns + i * 8)) }
+
+pub fn indexCollation(x: *Index, i: usize) -> []const u8 {
+    const name = @intCast(usize, mem.get64(x.*.collationNames + i * 16))
+    const length = @intCast(usize, mem.get64(x.*.collationNames + i * 16 + 8))
+    return mem.view(name, length)
+}
+
+pub fn indexDescending(x: *Index, i: usize) -> bool { return mem.get8(x.*.descending + i) != 0 }
+
+pub fn foreignKeyColumn(f: *ForeignKey, i: usize) -> usize { return @intCast(usize, mem.get64(f.*.columns + i * 8)) }
+
+pub fn foreignKeyParentName(f: *ForeignKey, i: usize) -> []const u8 {
+    if f.*.parentNames == 0 { return mem.view(0, 0) }
+    return mem.view(@intCast(usize, mem.get64(f.*.parentNames + i * 16)), @intCast(usize, mem.get64(f.*.parentNames + i * 16 + 8)))
+}
+
+// ---------------------------------------------------------------------------
+// Freeing.
+
+fn freeTable(address: usize) -> void {
+    const t = table(address)
+    mem.free(t.*.columns)
+    mem.freeWords(&t.*.indexes)
+    var i: usize = 0
+    while i < t.*.foreignKeys.length {
+        const f = foreignKey(@intCast(usize, mem.at(&t.*.foreignKeys, i)))
+        mem.free(f.*.columns)
+        mem.free(f.*.parentNames)
+        mem.free(@intFromPtr(f))
+        i += 1
+    }
+    mem.freeWords(&t.*.foreignKeys)
+    mem.freeWords(&t.*.primaryKey)
+    mem.freeWords(&t.*.checks)
+    ast.freeArena(&t.*.arena)
+    mem.free(address)
+}
+
+pub fn freeIndex(address: usize) -> void {
+    const x = index(address)
+    mem.free(x.*.name)
+    mem.free(x.*.columns)
+    var i: usize = 0
+    while i < x.*.columnCount {
+        mem.free(@intCast(usize, mem.get64(x.*.collationNames + i * 16)))
+        i += 1
+    }
+    mem.free(x.*.collationNames)
+    mem.free(x.*.descending)
+    mem.free(x.*.sql)
+    mem.free(x.*.info.collations)
+    mem.free(x.*.info.descending)
+    ast.freeArena(&x.*.arena)
+    mem.free(address)
+}
+
+// ---------------------------------------------------------------------------
+// The schema of a database.
+
+// A view: its CREATE VIEW text (copied), where its SELECT begins, and
+// the names its columns are given (Items in `arena`; 0 for the SELECT's
+// own).
+pub const View = struct {
+    name: usize
+    nameLength: usize
+    sql: usize
+    sqlLength: usize
+    selectStart: usize
+    columns: usize
+    arena: ast.Arena
+}
+
+pub inline fn view(address: usize) -> *View { unsafe { return @ptrFromInt(*View, address) } }
+
+pub const Schema = struct {
+    tables: mem.Words
+    indexes: mem.Words
+    views: mem.Words
+    // The schema cookie it was read at.
+    cookie: u64
+    loaded: bool
+    master: usize
+    // What loading met that it could not read.
+    damaged: bool
+}
+
+pub fn init(s: *Schema) -> void {
+    mem.initWords(&s.*.tables)
+    mem.initWords(&s.*.indexes)
+    mem.initWords(&s.*.views)
+    s.*.cookie = 0
+    s.*.loaded = false
+    s.*.damaged = false
+    s.*.master = makeMaster()
+}
+
+// Everything forgotten (the schema is read again when next needed).
+pub fn clear(s: *Schema) -> void {
+    var i: usize = 0
+    while i < s.*.tables.length {
+        freeTable(@intCast(usize, mem.at(&s.*.tables, i)))
+        i += 1
+    }
+    i = 0
+    while i < s.*.indexes.length {
+        freeIndex(@intCast(usize, mem.at(&s.*.indexes, i)))
+        i += 1
+    }
+    i = 0
+    while i < s.*.views.length {
+        freeView(@intCast(usize, mem.at(&s.*.views, i)))
+        i += 1
+    }
+    s.*.tables.length = 0
+    s.*.indexes.length = 0
+    s.*.views.length = 0
+    s.*.loaded = false
+    s.*.damaged = false
+}
+
+pub fn deinit(s: *Schema) -> void {
+    clear(s)
+    mem.freeWords(&s.*.tables)
+    mem.freeWords(&s.*.indexes)
+    mem.freeWords(&s.*.views)
+    freeTable(s.*.master)
+}
+
+pub fn isMasterName(name: []const u8) -> bool {
+    return mem.sameNoCase(name, "sqlite_master") || mem.sameNoCase(name, "sqlite_schema")
+}
+
+pub fn findTable(s: *Schema, name: []const u8) -> usize {
+    if isMasterName(name) { return s.*.master }
+    var i: usize = 0
+    while i < s.*.tables.length {
+        const address = @intCast(usize, mem.at(&s.*.tables, i))
+        if mem.sameNoCase(tableName(table(address)), name) { return address }
+        i += 1
+    }
+    return 0
+}
+
+pub fn findView(s: *Schema, name: []const u8) -> usize {
+    var i: usize = 0
+    while i < s.*.views.length {
+        const address = @intCast(usize, mem.at(&s.*.views, i))
+        if mem.sameNoCase(mem.view(view(address).*.name, view(address).*.nameLength), name) { return address }
+        i += 1
+    }
+    return 0
+}
+
+fn freeView(address: usize) -> void {
+    ast.freeArena(&view(address).*.arena)
+    mem.free(address)
+}
+
+// A view made from its CREATE VIEW text: 0 and a message when the text
+// is not one.
+pub fn parseView(sql: []const u8, message: *mem.Buffer) -> usize {
+    const address = mem.alloc(@sizeOf(View))
+    const v = view(address)
+    ast.initArena(&v.*.arena)
+    v.*.sql = ast.copyText(&v.*.arena, @intFromPtr(sql.pointer), sql.length)
+    v.*.sqlLength = sql.length
+    var p: parser.Parser = undefined
+    parser.init(&p, &v.*.arena, v.*.sql, v.*.sqlLength)
+    const st = parser.parseStatement(&p)
+    if p.failed || st == 0 || ast.statement(st).*.kind != ast.S_CREATE_VIEW {
+        _ = mem.appendText(message, if p.failed { mem.bufferText(&p.message) } else { "malformed view definition" })
+        parser.deinit(&p)
+        freeView(address)
+        return 0
+    }
+    parser.deinit(&p)
+    const x = ast.statement(st)
+    v.*.name = x.*.name
+    v.*.nameLength = x.*.nameLength
+    v.*.selectStart = x.*.selectStart
+    v.*.columns = x.*.columns
+    return address
+}
+
+pub fn addView(s: *Schema, address: usize) -> void { _ = mem.push(&s.*.views, @intCast(u64, address)) }
+
+pub fn removeView(s: *Schema, address: usize) -> void {
+    removeWord(&s.*.views, @intCast(u64, address))
+    freeView(address)
+}
+
+// "CREATE VIEW " and the text from the view's name on.
+pub fn viewText(text: usize, st: *ast.Statement, out: *mem.Buffer) -> bool {
+    out.*.length = 0
+    if !mem.appendText(out, "CREATE VIEW ") { return false }
+    return mem.append(out, text + st.*.nameStart, st.*.textEnd - st.*.nameStart)
+}
+
+pub fn findIndex(s: *Schema, name: []const u8) -> usize {
+    var i: usize = 0
+    while i < s.*.indexes.length {
+        const address = @intCast(usize, mem.at(&s.*.indexes, i))
+        if mem.sameNoCase(indexName(index(address)), name) { return address }
+        i += 1
+    }
+    return 0
+}
+
+// The column named `name` of a table: its index, or -1.
+pub fn findColumn(t: *Table, name: []const u8) -> i64 {
+    var i: usize = 0
+    while i < t.*.columnCount {
+        if mem.sameNoCase(columnName(column(t, i)), name) { return @intCast(i64, i) }
+        i += 1
+    }
+    return -1
+}
+
+pub fn isRowidName(name: []const u8) -> bool {
+    return mem.sameNoCase(name, "rowid") || mem.sameNoCase(name, "oid") || mem.sameNoCase(name, "_rowid_")
+}
+
+// Adds a table and its indexes to the schema.
+pub fn addTable(s: *Schema, t: usize) -> void {
+    _ = mem.push(&s.*.tables, @intCast(u64, t))
+    var i: usize = 0
+    while i < table(t).*.indexes.length {
+        _ = mem.push(&s.*.indexes, mem.at(&table(t).*.indexes, i))
+        i += 1
+    }
+}
+
+pub fn addIndex(s: *Schema, x: usize) -> void {
+    _ = mem.push(&s.*.indexes, @intCast(u64, x))
+    _ = mem.push(&table(index(x).*.table).*.indexes, @intCast(u64, x))
+}
+
+fn removeWord(w: *mem.Words, word: u64) -> void {
+    var i: usize = 0
+    while i < w.*.length {
+        if mem.at(w, i) == word {
+            mem.removeAt(w, i)
+            return
+        }
+        i += 1
+    }
+}
+
+pub fn removeIndex(s: *Schema, x: usize) -> void {
+    removeWord(&s.*.indexes, @intCast(u64, x))
+    removeWord(&table(index(x).*.table).*.indexes, @intCast(u64, x))
+    freeIndex(x)
+}
+
+pub fn removeTable(s: *Schema, t: usize) -> void {
+    while table(t).*.indexes.length > 0 {
+        removeIndex(s, @intCast(usize, mem.at(&table(t).*.indexes, 0)))
+    }
+    removeWord(&s.*.tables, @intCast(u64, t))
+    freeTable(t)
+}
+
+// ---------------------------------------------------------------------------
+// Tables from their text.
+
+fn newTable() -> usize {
+    const address = mem.alloc(@sizeOf(Table))
+    const t = table(address)
+    mem.initWords(&t.*.indexes)
+    mem.initWords(&t.*.foreignKeys)
+    mem.initWords(&t.*.primaryKey)
+    mem.initWords(&t.*.checks)
+    ast.initArena(&t.*.arena)
+    t.*.rowidColumn = -1
+    return address
+}
+
+const masterText = "CREATE TABLE sqlite_master(type text,name text,tbl_name text,rootpage int,sql text)"
+
+// sqlite_master: type, name, tbl_name, rootpage, sql.
+fn makeMaster() -> usize {
+    var message: mem.Buffer = undefined
+    mem.initBuffer(&message)
+    const address = parseTable(masterText, &message)
+    mem.freeBuffer(&message)
+    const t = table(address)
+    // Its indexes (none) and its name as SQLite reports it.
+    t.*.root = 1
+    t.*.isSchema = true
+    return address
+}
+
+fn columnsSame(x: *Index, cols: *mem.Words, collations: *mem.Words) -> bool {
+    if x.*.columnCount != cols.*.length { return false }
+    var i: usize = 0
+    while i < x.*.columnCount {
+        if indexColumn(x, i) != @bitCast(i64, mem.at(cols, i)) { return false }
+        const name = @intCast(usize, mem.at(collations, i * 2))
+        const length = @intCast(usize, mem.at(collations, i * 2 + 1))
+        if !mem.sameNoCase(indexCollation(x, i), mem.view(name, length)) { return false }
+        i += 1
+    }
+    return true
+}
+
+// An index of table `t` over `cols` (column indexes) with `collations`
+// (pairs of name address and length, copied) and `desc` flags.
+fn makeIndex(t: usize, cols: *mem.Words, collations: *mem.Words, desc: *mem.Words) -> usize {
+    const address = mem.alloc(@sizeOf(Index))
+    const x = index(address)
+    ast.initArena(&x.*.arena)
+    x.*.table = t
+    x.*.columnCount = cols.*.length
+    x.*.columns = mem.alloc(cols.*.length * 8 + 8)
+    x.*.collationNames = mem.alloc(cols.*.length * 16 + 16)
+    x.*.descending = mem.alloc(cols.*.length + 1)
+    var i: usize = 0
+    while i < cols.*.length {
+        mem.put64(x.*.columns + i * 8, mem.at(cols, i))
+        const name = @intCast(usize, mem.at(collations, i * 2))
+        const length = @intCast(usize, mem.at(collations, i * 2 + 1))
+        mem.put64(x.*.collationNames + i * 16, @intCast(u64, mem.dup(name, length)))
+        mem.put64(x.*.collationNames + i * 16 + 8, @intCast(u64, length))
+        mem.put8(x.*.descending + i, mem.at(desc, i))
+        i += 1
+    }
+    // The KeyInfo: one more column, the rowid, ascending.
+    x.*.info.count = cols.*.length + 1
+    x.*.info.collations = mem.alloc((cols.*.length + 1) * 8)
+    x.*.info.descending = mem.alloc(cols.*.length + 1)
+    i = 0
+    while i < cols.*.length {
+        mem.put8(x.*.info.descending + i, mem.at(desc, i))
+        i += 1
+    }
+    return address
+}
+
+// The named columns of a constraint or index (Items) as column indexes,
+// collations (the item's COLLATE, else the column's) and directions; false
+// when a name is no column (the message says so).
+fn namedColumns(t: *Table, items: usize, cols: *mem.Words, collations: *mem.Words, desc: *mem.Words, message: *mem.Buffer) -> bool {
+    var i: usize = 0
+    while i < ast.count(items) {
+        const it = ast.itemAt(items, i)
+        const name = mem.view(it.*.name, it.*.nameLength)
+        var c = findColumn(t, name)
+        if c < 0 && isRowidName(name) && it.*.nameLength > 0 {
+            c = -1
+        } else if c < 0 {
+            if it.*.nameLength == 0 {
+                _ = mem.appendText(message, "expressions prohibited in PRIMARY KEY and UNIQUE constraints")
+            } else {
+                _ = mem.appendText(message, "no such column: ")
+                _ = mem.appendText(message, name)
+            }
+            return false
+        }
+        _ = mem.push(cols, @bitCast(u64, c))
+        if it.*.collationLength > 0 {
+            _ = mem.push(collations, @intCast(u64, it.*.collation))
+            _ = mem.push(collations, @intCast(u64, it.*.collationLength))
+        } else if c >= 0 {
+            const col = column(t, @intCast(usize, c))
+            _ = mem.push(collations, @intCast(u64, col.*.collation))
+            _ = mem.push(collations, @intCast(u64, col.*.collationLength))
+        } else {
+            _ = mem.push(collations, 0)
+            _ = mem.push(collations, 0)
+        }
+        _ = mem.push(desc, if it.*.descending { 1 } else { 0 })
+        i += 1
+    }
+    return true
+}
+
+// Adds the autoindex of a UNIQUE or PRIMARY KEY constraint unless one with
+// the same columns is there.
+fn addAutoindex(t: usize, cols: *mem.Words, collations: *mem.Words, desc: *mem.Words, onError: u8, origin: u8, message: *mem.Buffer) -> bool {
+    const x0 = table(t)
+    var i: usize = 0
+    while i < x0.*.indexes.length {
+        const x = index(@intCast(usize, mem.at(&x0.*.indexes, i)))
+        if columnsSame(x, cols, collations) {
+            if x.*.onError != onError && x.*.onError != ast.OE_NONE && onError != ast.OE_NONE {
+                _ = mem.appendText(message, "conflicting ON CONFLICT clauses specified")
+                return false
+            }
+            if x.*.onError == ast.OE_NONE { x.*.onError = onError }
+            if origin == 2 { x.*.origin = 2 }
+            return true
+        }
+        i += 1
+    }
+    const address = makeIndex(t, cols, collations, desc)
+    const x = index(address)
+    x.*.unique = true
+    x.*.onError = onError
+    x.*.origin = origin
+    // sqlite_autoindex_TABLE_N.
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    _ = mem.appendText(&b, "sqlite_autoindex_")
+    _ = mem.appendText(&b, tableName(x0))
+    _ = mem.appendText(&b, "_")
+    _ = mem.appendDecimal(&b, @intCast(i64, x0.*.indexes.length + 1))
+    x.*.nameLength = b.length
+    x.*.name = mem.takeBuffer(&b)
+    return mem.push(&x0.*.indexes, @intCast(u64, address))
+}
+
+fn isIntegerType(c: *Column) -> bool { return mem.sameNoCase(mem.view(c.*.typeName, c.*.typeLength), "INTEGER") }
+
+// A table made from its CREATE TABLE text (as sqlite_master keeps it): 0
+// and a message when the text is not a table SQLite would make.
+pub fn parseTable(sql: []const u8, message: *mem.Buffer) -> usize {
+    const address = newTable()
+    const t = table(address)
+    t.*.sql = ast.copyText(&t.*.arena, @intFromPtr(sql.pointer), sql.length)
+    t.*.sqlLength = sql.length
+    var p: parser.Parser = undefined
+    parser.init(&p, &t.*.arena, t.*.sql, t.*.sqlLength)
+    const st = parser.parseStatement(&p)
+    if p.failed || st == 0 || ast.statement(st).*.kind != ast.S_CREATE_TABLE || ast.statement(st).*.tableDef == 0 || ast.tableDef(ast.statement(st).*.tableDef).*.asSelect != 0 {
+        if p.failed {
+            _ = mem.appendText(message, mem.bufferText(&p.message))
+        } else {
+            _ = mem.appendText(message, "malformed table definition")
+        }
+        parser.deinit(&p)
+        freeTable(address)
+        return 0
+    }
+    parser.deinit(&p)
+    if !define(address, ast.statement(st), message) {
+        freeTable(address)
+        return 0
+    }
+    return address
+}
+
+fn addCheck(t: *Table, e: usize, name: usize, nameLength: usize) -> void {
+    _ = mem.push(&t.*.checks, @intCast(u64, ast.expr(e).*.start))
+    _ = mem.push(&t.*.checks, @intCast(u64, ast.expr(e).*.end))
+    _ = mem.push(&t.*.checks, @intCast(u64, name))
+    _ = mem.push(&t.*.checks, @intCast(u64, nameLength))
+}
+
+// The table's columns, rowid, constraints and foreign keys from its
+// parsed definition.
+fn define(address: usize, st: *ast.Statement, message: *mem.Buffer) -> bool {
+    const t = table(address)
+    t.*.name = st.*.name
+    t.*.nameLength = st.*.nameLength
+    const def = ast.tableDef(st.*.tableDef)
+    const n = ast.count(def.*.columns)
+    t.*.columnCount = n
+    t.*.columns = mem.alloc(n * @sizeOf(Column) + @sizeOf(Column))
+    var i: usize = 0
+    while i < n {
+        const d = ast.columnDef(@intCast(usize, ast.wordAt(def.*.columns, i)))
+        const name = mem.view(d.*.name, d.*.nameLength)
+        if findColumn(t, name) >= 0 {
+            _ = mem.appendText(message, "duplicate column name: ")
+            _ = mem.appendText(message, name)
+            return false
+        }
+        const c = column(t, i)
+        c.*.name = d.*.name
+        c.*.nameLength = d.*.nameLength
+        // The declared type, NUL-terminated (sqlite3_column_decltype): the
+        // standard names in upper case, as SQLite reports them.
+        const declared = mem.view(t.*.sql + d.*.typeStart, d.*.typeLength)
+        c.*.typeName = ast.copyText(&t.*.arena, t.*.sql + d.*.typeStart, d.*.typeLength)
+        c.*.typeLength = d.*.typeLength
+        if mem.sameNoCase(declared, "INT") || mem.sameNoCase(declared, "INTEGER") || mem.sameNoCase(declared, "REAL") || mem.sameNoCase(declared, "TEXT") || mem.sameNoCase(declared, "BLOB") || mem.sameNoCase(declared, "ANY") {
+            var k: usize = 0
+            while k < c.*.typeLength {
+                mem.put8(c.*.typeName + k, mem.upper(mem.get8(c.*.typeName + k)))
+                k += 1
+            }
+        }
+        c.*.affinity = value.affinityOfType(mem.view(c.*.typeName, c.*.typeLength))
+        c.*.notNull = d.*.notNull
+        c.*.notNullConflict = d.*.notNullConflict
+        c.*.defaultExpr = d.*.defaultExpr
+        c.*.collation = d.*.collation
+        c.*.collationLength = d.*.collationLength
+        c.*.primaryKey = d.*.primaryKey
+        t.*.columnCount = i + 1
+        i += 1
+    }
+    t.*.columnCount = n
+    // CHECK constraints in the order of the text: the columns', then the
+    // table's.
+    i = 0
+    while i < n {
+        const d = ast.columnDef(@intCast(usize, ast.wordAt(def.*.columns, i)))
+        var j: usize = 0
+        while d.*.checks != 0 && j < ast.count(d.*.checks) {
+            const it = ast.itemAt(d.*.checks, j)
+            addCheck(t, it.*.expr, it.*.name, it.*.nameLength)
+            j += 1
+        }
+        i += 1
+    }
+    var j: usize = 0
+    while j < ast.count(def.*.constraints) {
+        const x = ast.tableConstraint(@intCast(usize, ast.wordAt(def.*.constraints, j)))
+        if x.*.kind == ast.K_CHECK { addCheck(t, x.*.check, x.*.name, x.*.nameLength) }
+        j += 1
+    }
+    var cols: mem.Words = undefined
+    mem.initWords(&cols)
+    var collations: mem.Words = undefined
+    mem.initWords(&collations)
+    var desc: mem.Words = undefined
+    mem.initWords(&desc)
+    var ok = true
+    var primaryKeys: usize = 0
+    // Column constraints, in column order: PRIMARY KEY, UNIQUE.
+    i = 0
+    while i < n && ok {
+        const d = ast.columnDef(@intCast(usize, ast.wordAt(def.*.columns, i)))
+        const c = column(t, i)
+        if d.*.primaryKey {
+            primaryKeys += 1
+            if isIntegerType(c) && !d.*.primaryKeyDescending {
+                t.*.rowidColumn = @intCast(i64, i)
+                t.*.rowidConflict = d.*.primaryKeyConflict
+                t.*.autoincrement = d.*.autoincrement
+            } else {
+                if d.*.autoincrement {
+                    _ = mem.appendText(message, "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+                    ok = false
+                    break
+                }
+                cols.length = 0
+                collations.length = 0
+                desc.length = 0
+                _ = mem.push(&cols, @intCast(u64, i))
+                _ = mem.push(&collations, @intCast(u64, c.*.collation))
+                _ = mem.push(&collations, @intCast(u64, c.*.collationLength))
+                _ = mem.push(&desc, if d.*.primaryKeyDescending { 1 } else { 0 })
+                ok = addAutoindex(address, &cols, &collations, &desc, d.*.primaryKeyConflict, 2, message)
+                _ = mem.push(&t.*.primaryKey, @intCast(u64, i))
+            }
+        }
+        if ok && d.*.unique {
+            cols.length = 0
+            collations.length = 0
+            desc.length = 0
+            _ = mem.push(&cols, @intCast(u64, i))
+            _ = mem.push(&collations, @intCast(u64, c.*.collation))
+            _ = mem.push(&collations, @intCast(u64, c.*.collationLength))
+            _ = mem.push(&desc, 0)
+            ok = addAutoindex(address, &cols, &collations, &desc, d.*.uniqueConflict, 1, message)
+        }
+        if ok && d.*.foreignKey != 0 {
+            ok = addForeignKey(t, d.*.foreignKey, i, message)
+        }
+        i += 1
+    }
+    // Table constraints.
+    var k: usize = 0
+    while k < ast.count(def.*.constraints) && ok {
+        const x = ast.tableConstraint(@intCast(usize, ast.wordAt(def.*.constraints, k)))
+        if x.*.kind == ast.K_PRIMARY_KEY || x.*.kind == ast.K_UNIQUE {
+            cols.length = 0
+            collations.length = 0
+            desc.length = 0
+            if !namedColumns(t, x.*.columns, &cols, &collations, &desc, message) {
+                ok = false
+                break
+            }
+            if x.*.kind == ast.K_PRIMARY_KEY {
+                primaryKeys += 1
+                const first = @bitCast(i64, mem.at(&cols, 0))
+                if cols.length == 1 && first >= 0 && isIntegerType(column(t, @intCast(usize, first))) && mem.at(&desc, 0) == 0 {
+                    t.*.rowidColumn = first
+                    t.*.rowidConflict = x.*.conflict
+                    t.*.autoincrement = x.*.autoincrement
+                    column(t, @intCast(usize, first)).*.primaryKey = true
+                    k += 1
+                    continue
+                }
+                if x.*.autoincrement {
+                    _ = mem.appendText(message, "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+                    ok = false
+                    break
+                }
+                var j: usize = 0
+                while j < cols.length {
+                    const ci = @bitCast(i64, mem.at(&cols, j))
+                    if ci >= 0 {
+                        column(t, @intCast(usize, ci)).*.primaryKey = true
+                        _ = mem.push(&t.*.primaryKey, @bitCast(u64, ci))
+                    }
+                    j += 1
+                }
+            }
+            ok = addAutoindex(address, &cols, &collations, &desc, x.*.conflict, if x.*.kind == ast.K_PRIMARY_KEY { 2 } else { 1 }, message)
+        } else if x.*.kind == ast.K_FOREIGN_KEY {
+            ok = addForeignKey(t, x.*.foreignKey, 0, message)
+        }
+        k += 1
+    }
+    if ok && primaryKeys > 1 {
+        _ = mem.appendText(message, "table \"")
+        _ = mem.appendText(message, tableName(t))
+        _ = mem.appendText(message, "\" has more than one primary key")
+        ok = false
+    }
+    mem.freeWords(&cols)
+    mem.freeWords(&collations)
+    mem.freeWords(&desc)
+    if !ok { return false }
+    // Each autoindex's KeyInfo is complete but for its collations.
+    return true
+}
+
+fn addForeignKey(t: *Table, address: usize, single: usize, message: *mem.Buffer) -> bool {
+    const f = ast.foreignKey(address)
+    const fk = mem.alloc(@sizeOf(ForeignKey))
+    const x = foreignKey(fk)
+    x.*.table = @intFromPtr(t)
+    x.*.parent = f.*.parent
+    x.*.parentLength = f.*.parentLength
+    x.*.onDelete = f.*.onDelete
+    x.*.onUpdate = f.*.onUpdate
+    if f.*.columns == 0 {
+        x.*.columnCount = 1
+        x.*.columns = mem.alloc(8)
+        mem.put64(x.*.columns, @intCast(u64, single))
+    } else {
+        x.*.columnCount = ast.count(f.*.columns)
+        x.*.columns = mem.alloc(x.*.columnCount * 8 + 8)
+        var i: usize = 0
+        while i < x.*.columnCount {
+            const it = ast.itemAt(f.*.columns, i)
+            const c = findColumn(t, mem.view(it.*.name, it.*.nameLength))
+            if c < 0 {
+                _ = mem.appendText(message, "unknown column \"")
+                _ = mem.appendText(message, mem.view(it.*.name, it.*.nameLength))
+                _ = mem.appendText(message, "\" in foreign key definition")
+                mem.free(x.*.columns)
+                mem.free(fk)
+                return false
+            }
+            mem.put64(x.*.columns + i * 8, @bitCast(u64, c))
+            i += 1
+        }
+    }
+    if f.*.parentColumns != 0 {
+        if ast.count(f.*.parentColumns) != x.*.columnCount {
+            _ = mem.appendText(message, "number of columns in foreign key does not match the number of columns in the referenced table")
+            mem.free(x.*.columns)
+            mem.free(fk)
+            return false
+        }
+        x.*.parentNames = mem.alloc(x.*.columnCount * 16 + 16)
+        var i: usize = 0
+        while i < x.*.columnCount {
+            const it = ast.itemAt(f.*.parentColumns, i)
+            mem.put64(x.*.parentNames + i * 16, @intCast(u64, it.*.name))
+            mem.put64(x.*.parentNames + i * 16 + 8, @intCast(u64, it.*.nameLength))
+            i += 1
+        }
+    }
+    return mem.push(&t.*.foreignKeys, @intCast(u64, fk))
+}
+
+// An index made from its CREATE INDEX text over a table of the schema: 0
+// and a message when it cannot be.
+pub fn parseIndex(s: *Schema, sql: []const u8, message: *mem.Buffer) -> usize {
+    var arena: ast.Arena = undefined
+    ast.initArena(&arena)
+    const text = ast.copyText(&arena, @intFromPtr(sql.pointer), sql.length)
+    var p: parser.Parser = undefined
+    parser.init(&p, &arena, text, sql.length)
+    const st = parser.parseStatement(&p)
+    if p.failed || st == 0 || ast.statement(st).*.kind != ast.S_CREATE_INDEX {
+        if p.failed {
+            _ = mem.appendText(message, mem.bufferText(&p.message))
+        } else {
+            _ = mem.appendText(message, "malformed index definition")
+        }
+        parser.deinit(&p)
+        ast.freeArena(&arena)
+        return 0
+    }
+    parser.deinit(&p)
+    const x = ast.statement(st)
+    const t = findTable(s, mem.view(x.*.name2, x.*.name2Length))
+    if t == 0 || table(t).*.isSchema {
+        _ = mem.appendText(message, "no such table: main.")
+        _ = mem.appendText(message, mem.view(x.*.name2, x.*.name2Length))
+        ast.freeArena(&arena)
+        return 0
+    }
+    var cols: mem.Words = undefined
+    mem.initWords(&cols)
+    var collations: mem.Words = undefined
+    mem.initWords(&collations)
+    var desc: mem.Words = undefined
+    mem.initWords(&desc)
+    var result: usize = 0
+    if namedColumns(table(t), x.*.columns, &cols, &collations, &desc, message) {
+        result = makeIndex(t, &cols, &collations, &desc)
+        const made = index(result)
+        made.*.unique = x.*.unique
+        made.*.onError = if x.*.unique { ast.OE_ABORT } else { ast.OE_NONE }
+        made.*.name = mem.dup(x.*.name, x.*.nameLength)
+        made.*.nameLength = x.*.nameLength
+        made.*.sql = mem.dupText(sql)
+        made.*.sqlLength = sql.length
+        // The index keeps the arena: its WHERE lives there.
+        made.*.partial = x.*.where
+        made.*.arena = arena
+    } else {
+        ast.freeArena(&arena)
+    }
+    mem.freeWords(&cols)
+    mem.freeWords(&collations)
+    mem.freeWords(&desc)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Texts sqlite_master keeps.
+
+// "CREATE TABLE " and the statement's text from its name on.
+pub fn tableText(text: usize, st: *ast.Statement, out: *mem.Buffer) -> bool {
+    out.*.length = 0
+    if !mem.appendText(out, "CREATE TABLE ") { return false }
+    return mem.append(out, text + st.*.nameStart, st.*.textEnd - st.*.nameStart)
+}
+
+// "CREATE [UNIQUE ]INDEX " and the text from the index's name on.
+pub fn indexText(text: usize, st: *ast.Statement, out: *mem.Buffer) -> bool {
+    out.*.length = 0
+    if !mem.appendText(out, if st.*.unique { "CREATE UNIQUE INDEX " } else { "CREATE INDEX " }) { return false }
+    return mem.append(out, text + st.*.nameStart, st.*.textEnd - st.*.nameStart)
+}

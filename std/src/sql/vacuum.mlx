@@ -1,0 +1,145 @@
+// std.sql.vacuum: VACUUM: the database written again, compactly. Every
+// table and index of sqlite_master (in its order) is copied into a fresh
+// database in memory, entry by entry, the schema's rows with their new
+// root pages; then those pages take the place of the file's (within the
+// write transaction: the journal keeps the old ones until it commits) and
+// the file is cut to their number. The header keeps what is the
+// database's own: user_version, application_id, the text encoding; an
+// INCREMENTAL auto_vacuum asked for is noted (see std.sql.pragma).
+const mem = @import("./mem.mlx")
+const value = @import("./value.mlx")
+const record = @import("./record.mlx")
+const schema = @import("./schema.mlx")
+const core = @import("./core.mlx")
+const pg = @import("./pager.mlx")
+const bt = @import("./btree.mlx")
+const eval = @import("./eval.mlx")
+
+fn databaseOf(st: *core.Statement) -> *core.Database { return core.database(st.*.db) }
+
+fn storage(db: *core.Database, rc: i32) -> i32 {
+    if rc == core.OK { return core.OK }
+    if rc == core.CORRUPT { return core.setError(db, core.CORRUPT, "database disk image is malformed") }
+    return core.setError(db, rc, core.errorText(rc))
+}
+
+// Copies the tree at `root` of `from` into a new tree of `to`: its root.
+fn copyTree(db: *core.Database, from: *pg.Pager, to: *pg.Pager, root: u64, table: bool, info: usize, out: *u64) -> i32 {
+    const fresh = bt.createTree(to, table)
+    if fresh == 0 { return core.NOMEM }
+    out.* = fresh
+    const source = bt.openCursor(from, root, table, info)
+    const target = bt.openCursor(to, fresh, table, info)
+    var rc = bt.first(source)
+    while rc == core.OK && bt.isValid(source) {
+        var length: usize = 0
+        const data = bt.payload(source, &length)
+        if table {
+            rc = bt.insertRow(target, bt.rowid(source), data, length)
+        } else {
+            rc = bt.insertEntry(target, data, length)
+        }
+        if rc == core.OK { rc = bt.next(source) }
+    }
+    bt.closeCursor(source)
+    bt.closeCursor(target)
+    return storage(db, rc)
+}
+
+pub fn run(st: *core.Statement) -> i32 {
+    const db = databaseOf(st)
+    const main = &db.*.pager
+    if !db.*.autocommit { return core.setError(db, core.ERROR, "cannot VACUUM from within a transaction") }
+    if db.*.active > 1 { return core.setError(db, core.ERROR, "cannot VACUUM - SQL statements in progress") }
+    if main.*.size == 0 { return core.OK }
+    var temp: pg.Pager = undefined
+    var rc = pg.open(&temp, ":memory:", false, true)
+    if rc != core.OK { return core.setError(db, rc, core.errorText(rc)) }
+    temp.wantPageSize = main.*.pageSize
+    temp.pageSize = main.*.pageSize
+    rc = pg.beginWrite(&temp)
+    // Every row of sqlite_master, copied with its object.
+    const master = bt.openCursor(main, 1, true, 0)
+    const copy = bt.openCursor(&temp, 1, true, 0)
+    const block = mem.alloc(6 * @sizeOf(value.Value))
+    var k: usize = 0
+    while k < 6 {
+        value.init(record.valueAt(block, k))
+        k += 1
+    }
+    var data: mem.Buffer = undefined
+    mem.initBuffer(&data)
+    var rowids: mem.Words = undefined
+    mem.initWords(&rowids)
+    if rc == core.OK { rc = bt.first(master) }
+    while rc == core.OK && bt.isValid(master) {
+        _ = mem.push(&rowids, @bitCast(u64, bt.rowid(master)))
+        rc = bt.next(master)
+    }
+    var i: usize = 0
+    while rc == core.OK && i < rowids.length {
+        const rowid = @bitCast(i64, mem.at(&rowids, i))
+        i += 1
+        if !bt.seekRowid(master, rowid) { continue }
+        const h = bt.header(master)
+        k = 0
+        while k < 5 {
+            record.column(h, k, record.valueAt(block, k))
+            k += 1
+        }
+        const root = @bitCast(u64, value.toInt(record.valueAt(block, 3)))
+        _ = value.toText(record.valueAt(block, 0))
+        _ = value.toText(record.valueAt(block, 1))
+        const kind = value.bytesOf(record.valueAt(block, 0))
+        var fresh: u64 = 0
+        if root > 0 && mem.same(kind, "table") {
+            rc = copyTree(db, main, &temp, root, true, 0, &fresh)
+        } else if root > 0 && mem.same(kind, "index") {
+            const x = schema.findIndex(&db.*.schema, value.bytesOf(record.valueAt(block, 1)))
+            if x == 0 { rc = core.setError(db, core.CORRUPT, "database disk image is malformed") }
+            if rc == core.OK { rc = eval.resolveIndexOf(db, schema.index(x)) }
+            if rc == core.OK { rc = copyTree(db, main, &temp, root, false, @intFromPtr(&schema.index(x).*.info), &fresh) }
+        }
+        if rc != core.OK { break }
+        value.setInt(record.valueAt(block, 3), @intCast(i64, fresh))
+        data.length = 0
+        _ = record.encode(block, 5, &data)
+        rc = storage(db, bt.insertRow(copy, rowid, data.data, data.length))
+    }
+    bt.closeCursor(master)
+    bt.closeCursor(copy)
+    mem.freeBuffer(&data)
+    mem.freeWords(&rowids)
+    core.freeRow(block, 6)
+    if rc == core.OK {
+        // The header fields that are the database's.
+        const old = pg.data(pg.get(main, 1))
+        const fresh = pg.data(pg.get(&temp, 1))
+        mem.put32be(fresh + 24, mem.get32be(old + 24))
+        mem.put32be(fresh + 40, mem.get32be(old + 40) + 1)
+        mem.put32be(fresh + 48, mem.get32be(old + 48))
+        mem.put32be(fresh + 56, mem.get32be(old + 56))
+        mem.put32be(fresh + 60, mem.get32be(old + 60))
+        mem.put32be(fresh + 64, if db.*.autoVacuum == 2 || mem.get32be(old + 64) != 0 { 1 } else { 0 })
+        mem.put32be(fresh + 68, mem.get32be(old + 68))
+        // The pages take the place of the file's.
+        var n: u64 = 1
+        while rc == core.OK && n <= temp.size {
+            var page = pg.get(main, n)
+            if n > main.*.size { page = pg.append(main) }
+            if page == 0 || !pg.write(main, page) {
+                rc = core.NOMEM
+                break
+            }
+            mem.copy(pg.data(page), pg.data(pg.get(&temp, n)), main.*.pageSize)
+            n += 1
+        }
+        if rc == core.OK { pg.truncateTo(main, temp.size) }
+        main.*.generation += 1
+    }
+    pg.rollback(&temp)
+    pg.close(&temp)
+    db.*.schema.loaded = false
+    db.*.schemaGeneration += 1
+    return rc
+}

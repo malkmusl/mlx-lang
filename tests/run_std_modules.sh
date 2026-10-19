@@ -63,12 +63,15 @@
 #                                       headers, masks, UTF-8), chunk
 #                                       sizes, the Public Suffix List,
 #                                       MIME sniffing
-#   tests/372_colorprofile_runtime.mlx  std.colorprofile: transforms whose
+#   tests/372_sql_runtime.mlx           std.sql: SQLite's number texts,
+#                                       WebKit's SQL parsed, statements
+#                                       run, a file written and read back
+#   tests/373_colorprofile_runtime.mlx  std.colorprofile: transforms whose
 #                                       pixels are Little CMS's (matrix-
 #                                       shaper, grey, 16-bit grid,
 #                                       perceptual with black point
 #                                       compensation), the sRGB curve
-#   tests/373_xml_sax_runtime.mlx       std.xml.sax: libxml2's SAX2 events
+#   tests/374_xml_sax_runtime.mlx       std.xml.sax: libxml2's SAX2 events
 #                                       and errors (namespaces, DTD
 #                                       entities and defaults, chunks,
 #                                       UTF-16, Latin-1, content apart,
@@ -123,8 +126,9 @@ run 366_jpeg_decode_runtime "JPEG images (4:2:0, progressive 4:2:2, grey, CMYK, 
 run 367_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) decoded as libwebp decodes them; incremental rows; damage; encoding"
 run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987) read and written as libsoup does"
 run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk sizes; public suffixes; MIME sniffing"
-run 372_colorprofile_runtime "ICC transforms as Little CMS makes them: BGRA to sRGB, grey, 16-bit, perceptual; the sRGB curve"
-run 373_xml_sax_runtime "XML parsed as libxml2's push parser parses it: SAX2 events, entities, errors, chunks, encodings"
+run 372_sql_runtime "SQLite's reals and numbers, WebKit's SQL parsed, GROUP BY, collations, CHECK, a file of 3000 rows read back"
+run 373_colorprofile_runtime "ICC transforms as Little CMS makes them: BGRA to sRGB, grey, 16-bit, perceptual; the sRGB curve"
+run 374_xml_sax_runtime "XML parsed as libxml2's push parser parses it: SAX2 events, entities, errors, chunks, encodings"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

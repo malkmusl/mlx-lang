@@ -82,6 +82,16 @@ and `http/psl.mlx` with `http/psldata.mlx` (the Public Suffix List, made
 by `./mlx build http-psl` from `std/registry/publicsuffix`). Tests 370
 and 371 check them.
 
+`sql.mlx` (`std.sql`) with `sql/` is an SQLite-compatible database
+engine: SQLite's file format (B-tree pages, records, overflow chains,
+the freelist), its rollback journal and file locks, so that SQLite and
+it read each other's files; SQL as SQLite parses, plans and evaluates it
+(values, affinities, collations, constraints, foreign keys, savepoints,
+the built-in functions, the authorizer); and connections and prepared
+statements as SQLite's C API presents them. mlx-sqlite3
+(compiler/capi/sqlite3) is that C API over it, for WebKit's databases;
+test 372 and `tools/check_sqlite.sh` check it.
+
 `crypt.mlx` (`std.crypt`) checks a password against the hashes of
 `/etc/shadow`, as crypt(3) writes them: `crypt/yescrypt.mlx` for the
 yescrypt ($y$, Ubuntu's default) and scrypt ($7$) ones,
