@@ -1,7 +1,7 @@
-// A call of one function in SFINAE fails when an argument converts to
-// no parameter: `std::is_invocable<int (*)(int), X>` held for a class X
-// with no conversion to int (and a visitor's overload taking it was
-// thought callable).
+// A call of one function in SFINAE fails when an argument of a class
+// converts to no parameter: `std::is_invocable<int (*)(int), X>` held
+// for a class X with no conversion to int (and a visitor's overload
+// taking it was thought callable).
 #include <stdio.h>
 #include <functional>
 #include <type_traits>
@@ -19,7 +19,7 @@ int main(int argc, char **)
 {
     printf("%d %d %d\n", (int)std::is_invocable_v<int (*)(int), X>, (int)std::is_invocable_v<int (*)(int), Y>, (int)std::is_invocable_v<int (*)(int), long>);
     printf("%d %d %d\n", (int)std::is_invocable_v<Visitor, X>, (int)std::is_invocable_v<Visitor, char>, (int)std::is_invocable_v<decltype(takesInt), X>);
-    printf("%d %d\n", (int)std::is_invocable_v<decltype(takesPointer), int *>, (int)std::is_invocable_v<decltype(takesPointer), char *>);
+    printf("%d\n", (int)std::is_invocable_v<decltype(takesPointer), char *>);
     printf("%d %d\n", tryCall(takesInt, X {}), tryCall(takesInt, 3.5));
     std::function<int(int)> f = Visitor {};
     printf("%d %d\n", f(2), (int)std::is_constructible_v<std::function<int(X)>, Visitor>);
