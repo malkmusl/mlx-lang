@@ -1,0 +1,1225 @@
+// Multi-precision integers (gcry_mpi_*): signed numbers of any size, 64-bit
+// limbs from the least significant one, as libgcrypt computes and prints
+// them, quirks included (gcry_mpi_cmp answers the difference of the limb
+// counts when they differ; gcry_mpi_invm ignores the signs; gcry_mpi_mulm
+// keeps the product's sign; a too-short buffer clears *nwritten).
+//
+// The arithmetic is plain schoolbook and Knuth's division, its time
+// depending on the values: for public numbers. A private exponentiation
+// (gcry_mpi_powm with an odd modulus, what RSA's private operations come
+// to) runs on std.crypto.bignum's Montgomery ladder, constant time.
+//
+// An MPI is a heap record C holds as gcry_mpi_t; its limbs are another
+// allocation, replaced whole when a result needs more room (a result is
+// made in a fresh one and installed, so an operand may be the result).
+// An opaque MPI holds bytes instead (gcry_mpi_set_opaque), their bit
+// count where the sign would be, as libgcrypt keeps it.
+const c = @import("./common.mlx")
+const bignum = @import("std.crypto.bignum")
+
+pub const Mpi = struct {
+    limbs: usize
+    used: usize
+    capacity: usize
+    negative: bool
+    flags: u32
+    // An opaque MPI's data is at `limbs`, `opaqueBits` long.
+    opaqueBits: usize
+}
+
+pub const FLAG_SECURE: u32 = 1
+pub const FLAG_OPAQUE: u32 = 4
+pub const FLAG_IMMUTABLE: u32 = 16
+pub const FLAG_CONST: u32 = 32
+
+// (No u128 constant above 2^64 - 1: mlx4 keeps only a constant's low 64
+// bits, so 2^64 would be 0. Borrows are worked out on u64s.)
+const MASK: u128 = 18446744073709551615
+
+pub fn at(address: usize) -> *Mpi { unsafe { return @ptrFromInt(*Mpi, address) } }
+
+pub fn digits(m: *Mpi) -> [*]u64 { unsafe { return @ptrFromInt([*]u64, m.*.limbs) } }
+
+fn words(address: usize) -> [*]u64 { unsafe { return @ptrFromInt([*]u64, address) } }
+
+fn wide(value: u64) -> u128 { return @intCast(u128, value) }
+
+fn lowOf(value: u128) -> u64 { return @intCast(u64, value & MASK) }
+
+fn highOf(value: u128) -> u64 { return @intCast(u64, value >> 64) }
+
+// ---------------------------------------------------------------------------
+// Records and their limbs.
+
+// A new MPI of value 0 with room for `limbs` limbs.
+pub fn create(limbs: usize) -> usize {
+    const address = c.alloc(@sizeOf(Mpi))
+    if address == 0 { return 0 }
+    const m = at(address)
+    const room = if limbs == 0 { 1 } else { limbs }
+    m.*.limbs = c.alloc(room * 8)
+    m.*.capacity = room
+    m.*.used = 0
+    m.*.negative = false
+    m.*.flags = 0
+    m.*.opaqueBits = 0
+    return address
+}
+
+fn dropLimbs(m: *Mpi) -> void {
+    if m.*.flags & FLAG_OPAQUE != 0 {
+        c.release(m.*.limbs)
+    } else {
+        c.wipeRelease(m.*.limbs, m.*.capacity * 8)
+    }
+    m.*.limbs = 0
+    m.*.capacity = 0
+    m.*.used = 0
+}
+
+pub fn destroy(address: usize) -> void {
+    if address == 0 { return }
+    const m = at(address)
+    if m.*.flags & FLAG_CONST != 0 { return }
+    dropLimbs(m)
+    c.release(address)
+}
+
+// Ends the opaque state: an opaque MPI given to arithmetic becomes 0.
+fn plain(m: *Mpi) -> void {
+    if m.*.flags & FLAG_OPAQUE == 0 { return }
+    c.release(m.*.limbs)
+    m.*.flags = m.*.flags & (FLAG_OPAQUE ^ 4294967295)
+    m.*.limbs = c.alloc(8)
+    m.*.capacity = 1
+    m.*.used = 0
+    m.*.negative = false
+    m.*.opaqueBits = 0
+}
+
+// The significant limbs of a[0..n].
+fn significant(a: [*]const u64, n: usize) -> usize {
+    var count = n
+    while count > 0 && a[count - 1] == 0 { count -= 1 }
+    return count
+}
+
+// `count` limbs at `limbs` (an allocation of `capacity` limbs) become w's
+// value, its sign `negative` (none for 0); w's old limbs are freed.
+fn install(w: *Mpi, limbs: usize, count: usize, capacity: usize, negative: bool) -> void {
+    if w.*.flags & FLAG_IMMUTABLE != 0 {
+        c.wipeRelease(limbs, capacity * 8)
+        return
+    }
+    dropLimbs(w)
+    w.*.flags = w.*.flags & (FLAG_OPAQUE ^ 4294967295)
+    w.*.opaqueBits = 0
+    w.*.limbs = limbs
+    w.*.capacity = capacity
+    w.*.used = significant(words(limbs), count)
+    w.*.negative = negative && w.*.used > 0
+}
+
+// Fresh zeroed limbs.
+fn limbsFor(count: usize) -> usize { return c.alloc((if count == 0 { 1 } else { count }) * 8) }
+
+// w = the `count` limbs at `a` with the sign `negative` (a copy).
+fn assignRaw(w: *Mpi, a: [*]const u64, count: usize, negative: bool) -> void {
+    const limbs = limbsFor(count)
+    const out = words(limbs)
+    var index: usize = 0
+    while index < count {
+        out[index] = a[index]
+        index += 1
+    }
+    install(w, limbs, count, if count == 0 { 1 } else { count }, negative)
+}
+
+pub fn assign(w: *Mpi, u: *Mpi) -> void {
+    if w == u { return }
+    if u.*.flags & FLAG_OPAQUE != 0 {
+        const bytes = (u.*.opaqueBits + 7) / 8
+        const data = c.dupBytes(u.*.limbs, bytes)
+        dropLimbs(w)
+        w.*.limbs = data
+        w.*.flags = (w.*.flags & FLAG_SECURE) | FLAG_OPAQUE
+        w.*.opaqueBits = u.*.opaqueBits
+        w.*.negative = false
+        return
+    }
+    assignRaw(w, digits(u), u.*.used, u.*.negative)
+}
+
+pub fn setU64(w: *Mpi, value: u64) -> void {
+    var limb: [1]u64 = [1]u64{ value }
+    assignRaw(w, &limb, 1, false)
+}
+
+pub fn copyOf(u: *Mpi) -> usize {
+    const address = create(u.*.used)
+    if address == 0 { return 0 }
+    assign(at(address), u)
+    return address
+}
+
+pub fn isZero(m: *Mpi) -> bool { return m.*.flags & FLAG_OPAQUE == 0 && m.*.used == 0 }
+
+// The value's bits (for an opaque MPI, its data's).
+pub fn bitCount(m: *Mpi) -> usize {
+    if m.*.flags & FLAG_OPAQUE != 0 { return m.*.opaqueBits }
+    if m.*.used == 0 { return 0 }
+    var top = digits(m)[m.*.used - 1]
+    var bits: usize = 0
+    while top != 0 {
+        bits += 1
+        top = top >> 1
+    }
+    return (m.*.used - 1) * 64 + bits
+}
+
+pub fn byteCount(m: *Mpi) -> usize { return (bitCount(m) + 7) / 8 }
+
+// The magnitude as `length` big-endian bytes, zeroes before it (the high
+// bytes cut off when it is longer).
+pub fn toBytes(m: *Mpi, out: [*]u8, length: usize) -> void {
+    const limbs = digits(m)
+    var index: usize = 0
+    while index < length {
+        const position = length - 1 - index
+        const limb = index / 8
+        var byte: u64 = 0
+        if limb < m.*.used { byte = (limbs[limb] >> @intCast(u64, (index % 8) * 8)) & 255 }
+        out[position] = @intCast(u8, byte)
+        index += 1
+    }
+}
+
+// w = the unsigned big-endian number in `bytes`.
+pub fn fromBytes(w: *Mpi, bytes: [*]const u8, length: usize) -> void {
+    const count = (length + 7) / 8
+    const limbs = limbsFor(count)
+    const out = words(limbs)
+    var index: usize = 0
+    while index < length {
+        const value = @intCast(u64, bytes[length - 1 - index])
+        out[index / 8] = out[index / 8] | (value << @intCast(u64, (index % 8) * 8))
+        index += 1
+    }
+    install(w, limbs, count, if count == 0 { 1 } else { count }, false)
+}
+
+// A new MPI of the unsigned big-endian number in `bytes`.
+pub fn fromUnsigned(bytes: [*]const u8, length: usize) -> usize {
+    const address = create((length + 7) / 8)
+    if address != 0 { fromBytes(at(address), bytes, length) }
+    return address
+}
+
+// The magnitude's big-endian bytes, no leading zeroes, in a new
+// allocation of at least one byte; their count into `length`.
+pub fn magnitude(m: *Mpi, length: *usize) -> usize {
+    const n = byteCount(m)
+    const out = c.alloc(n)
+    if out != 0 { toBytes(m, c.bytes(out), n) }
+    length.* = n
+    return out
+}
+
+// ---------------------------------------------------------------------------
+// Unsigned limb arithmetic.
+
+fn compareRaw(a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> i32 {
+    if an != bn { return if an > bn { 1 } else { -1 } }
+    var index = an
+    while index > 0 {
+        index -= 1
+        if a[index] != b[index] { return if a[index] > b[index] { 1 } else { -1 } }
+    }
+    return 0
+}
+
+// out = a + b (an >= bn; out has an + 1 limbs): the limbs written.
+fn addRaw(out: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> usize {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < an {
+        var sum = wide(a[index]) + wide(carry)
+        if index < bn { sum += wide(b[index]) }
+        out[index] = lowOf(sum)
+        carry = highOf(sum)
+        index += 1
+    }
+    out[an] = carry
+    return an + 1
+}
+
+// out = a - b (a >= b, an >= bn): the limbs written (an).
+fn subRaw(out: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> usize {
+    var borrow: u64 = 0
+    var index: usize = 0
+    while index < an {
+        const x = a[index]
+        const y: u64 = if index < bn { b[index] } else { 0 }
+        const first = x -% y
+        const second = first -% borrow
+        borrow = if x < y || first < borrow { 1 } else { 0 }
+        out[index] = second
+        index += 1
+    }
+    return an
+}
+
+// out (an + bn limbs, zeroed) = a * b.
+fn mulRaw(out: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> void {
+    var i: usize = 0
+    while i < an {
+        var carry: u64 = 0
+        const x = wide(a[i])
+        var j: usize = 0
+        while j < bn {
+            const product = x * wide(b[j]) + wide(out[i + j]) + wide(carry)
+            out[i + j] = lowOf(product)
+            carry = highOf(product)
+            j += 1
+        }
+        out[i + bn] = carry
+        i += 1
+    }
+}
+
+// out = a << bits (out has an + bits / 64 + 1 limbs, zeroed).
+fn shiftLeftRaw(out: [*]u64, a: [*]const u64, an: usize, bits: usize) -> void {
+    const whole = bits / 64
+    const part = @intCast(u64, bits % 64)
+    var index: usize = 0
+    while index < an {
+        if part == 0 {
+            out[index + whole] = a[index]
+        } else {
+            out[index + whole] = out[index + whole] | (a[index] << part)
+            out[index + whole + 1] = a[index] >> (64 - part)
+        }
+        index += 1
+    }
+}
+
+// out = a >> bits, its first `count` limbs.
+fn shiftRightRaw(out: [*]u64, count: usize, a: [*]const u64, an: usize, bits: usize) -> void {
+    const whole = bits / 64
+    const part = @intCast(u64, bits % 64)
+    var index: usize = 0
+    while index < count {
+        var value: u64 = 0
+        if index + whole < an {
+            value = a[index + whole] >> part
+            if part != 0 && index + whole + 1 < an { value = value | (a[index + whole + 1] << (64 - part)) }
+        }
+        out[index] = value
+        index += 1
+    }
+}
+
+// Knuth's algorithm D: q = a / b and r = a mod b for an >= bn > 0, b's
+// top limb not 0. q has an - bn + 1 limbs (or is 0 for none); r has bn.
+fn divRaw(q: usize, r: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> void {
+    if bn == 1 {
+        var rest: u64 = 0
+        const d = wide(b[0])
+        var index = an
+        while index > 0 {
+            index -= 1
+            const value = (wide(rest) << 64) | wide(a[index])
+            if q != 0 { words(q)[index] = lowOf(value / d) }
+            rest = lowOf(value % d)
+        }
+        r[0] = rest
+        return
+    }
+    // Normalized: b's top bit set, a shifted alike (one limb more).
+    var shift: usize = 0
+    var top = b[bn - 1]
+    while top & 9223372036854775808 == 0 {
+        top = top << 1
+        shift += 1
+    }
+    const vAddress = limbsFor(bn + 1)
+    const uAddress = limbsFor(an + 2)
+    const v = words(vAddress)
+    const u = words(uAddress)
+    shiftLeftRaw(v, b, bn, shift)
+    shiftLeftRaw(u, a, an, shift)
+    const vTop = wide(v[bn - 1])
+    const vNext = wide(v[bn - 2])
+    var j = an - bn + 1
+    while j > 0 {
+        j -= 1
+        const numerator = (wide(u[j + bn]) << 64) | wide(u[j + bn - 1])
+        var qhat = numerator / vTop
+        var rhat = numerator % vTop
+        while highOf(qhat) != 0 || qhat * vNext > ((rhat << 64) | wide(u[j + bn - 2])) {
+            qhat -= 1
+            rhat += vTop
+            if highOf(rhat) != 0 { break }
+        }
+        // The digit is below 2^64 now.
+        var digit = lowOf(qhat)
+        // u[j..j+bn] -= digit * v
+        var borrow: u64 = 0
+        var carry: u64 = 0
+        var i: usize = 0
+        while i < bn {
+            const product = wide(digit) * wide(v[i]) + wide(carry)
+            carry = highOf(product)
+            const minuend = u[i + j]
+            const part = lowOf(product)
+            const first = minuend -% part
+            u[i + j] = first -% borrow
+            borrow = if minuend < part || first < borrow { 1 } else { 0 }
+            i += 1
+        }
+        const head = u[j + bn]
+        u[j + bn] = head -% carry -% borrow
+        if wide(head) < wide(carry) + wide(borrow) {
+            // The digit was one too large: add v back.
+            digit -= 1
+            var back: u64 = 0
+            i = 0
+            while i < bn {
+                const sum = wide(u[i + j]) + wide(v[i]) + wide(back)
+                u[i + j] = lowOf(sum)
+                back = highOf(sum)
+                i += 1
+            }
+            u[j + bn] = lowOf(wide(u[j + bn]) + wide(back))
+        }
+        if q != 0 { words(q)[j] = digit }
+    }
+    shiftRightRaw(r, bn, u, bn + 1, shift)
+    c.wipeRelease(vAddress, (bn + 1) * 8)
+    c.wipeRelease(uAddress, (an + 2) * 8)
+}
+
+// ---------------------------------------------------------------------------
+// Signed arithmetic.
+
+// w = (-1)^an * a + (-1)^bn * b.
+fn addSigned(w: *Mpi, a: [*]const u64, an: usize, aNegative: bool, b: [*]const u64, bn: usize, bNegative: bool) -> void {
+    const count = (if an > bn { an } else { bn }) + 1
+    const limbs = limbsFor(count)
+    const out = words(limbs)
+    if aNegative == bNegative {
+        if an >= bn {
+            const written = addRaw(out, a, an, b, bn)
+        } else {
+            const written = addRaw(out, b, bn, a, an)
+        }
+        install(w, limbs, count, count, aNegative)
+        return
+    }
+    if compareRaw(a, significant(a, an), b, significant(b, bn)) >= 0 {
+        const written = subRaw(out, a, an, b, bn)
+        install(w, limbs, count, count, aNegative)
+    } else {
+        const written = subRaw(out, b, bn, a, an)
+        install(w, limbs, count, count, bNegative)
+    }
+}
+
+pub fn add(w: *Mpi, u: *Mpi, v: *Mpi) -> void {
+    addSigned(w, digits(u), u.*.used, u.*.negative, digits(v), v.*.used, v.*.negative)
+}
+
+pub fn sub(w: *Mpi, u: *Mpi, v: *Mpi) -> void {
+    addSigned(w, digits(u), u.*.used, u.*.negative, digits(v), v.*.used, !v.*.negative)
+}
+
+pub fn addSmall(w: *Mpi, u: *Mpi, value: u64, negative: bool) -> void {
+    var limb: [1]u64 = [1]u64{ value }
+    addSigned(w, digits(u), u.*.used, u.*.negative, &limb, 1, negative)
+}
+
+fn mulSigned(w: *Mpi, a: [*]const u64, an: usize, aNegative: bool, b: [*]const u64, bn: usize, bNegative: bool) -> void {
+    const count = an + bn
+    const limbs = limbsFor(count)
+    mulRaw(words(limbs), a, an, b, bn)
+    install(w, limbs, count, if count == 0 { 1 } else { count }, aNegative != bNegative)
+}
+
+pub fn mul(w: *Mpi, u: *Mpi, v: *Mpi) -> void {
+    mulSigned(w, digits(u), u.*.used, u.*.negative, digits(v), v.*.used, v.*.negative)
+}
+
+// Truncating division (the quotient toward zero, the remainder with the
+// dividend's sign); q or r 0 for none. A zero divisor gives zeroes.
+pub fn tdivQr(q: usize, r: usize, u: *Mpi, v: *Mpi) -> void {
+    const an = u.*.used
+    const bn = v.*.used
+    const uNegative = u.*.negative
+    const qNegative = u.*.negative != v.*.negative
+    if bn == 0 {
+        if q != 0 { assignRaw(at(q), digits(u), 0, false) }
+        if r != 0 { assignRaw(at(r), digits(u), 0, false) }
+        return
+    }
+    if compareRaw(digits(u), an, digits(v), bn) < 0 {
+        // The quotient is 0 and the remainder is u.
+        if r != 0 {
+            const copied = limbsFor(an)
+            const out = words(copied)
+            const a = digits(u)
+            var index: usize = 0
+            while index < an {
+                out[index] = a[index]
+                index += 1
+            }
+            if q != 0 { assignRaw(at(q), digits(u), 0, false) }
+            install(at(r), copied, an, if an == 0 { 1 } else { an }, uNegative)
+        } else if q != 0 {
+            assignRaw(at(q), digits(u), 0, false)
+        }
+        return
+    }
+    const qCount = an - bn + 1
+    const quotient = if q != 0 { limbsFor(qCount) } else { 0 }
+    const remainder = limbsFor(bn)
+    divRaw(quotient, words(remainder), digits(u), an, digits(v), bn)
+    if q != 0 { install(at(q), quotient, qCount, qCount, qNegative) }
+    if r != 0 {
+        install(at(r), remainder, bn, bn, uNegative)
+    } else {
+        c.wipeRelease(remainder, bn * 8)
+    }
+}
+
+// Floor division (libgcrypt's fdiv): the remainder has the divisor's sign.
+pub fn fdivQr(q: usize, r: usize, u: *Mpi, v: *Mpi) -> void {
+    const divisor = copyOf(v)
+    const dividendNegative = u.*.negative
+    var remainder = r
+    if remainder == 0 { remainder = create(1) }
+    tdivQr(q, remainder, u, at(divisor))
+    if (at(divisor).*.negative != dividendNegative) && at(remainder).*.used != 0 {
+        if q != 0 { addSmall(at(q), at(q), 1, true) }
+        add(at(remainder), at(remainder), at(divisor))
+    }
+    if r == 0 { destroy(remainder) }
+    destroy(divisor)
+}
+
+// r = u mod m with the sign of m (gcry_mpi_mod).
+pub fn mod(r: *Mpi, u: *Mpi, m: *Mpi) -> void {
+    fdivQr(0, @intFromPtr(r), u, m)
+}
+
+pub fn compare(u: *Mpi, v: *Mpi) -> i32 {
+    const uOpaque = u.*.flags & FLAG_OPAQUE != 0
+    const vOpaque = v.*.flags & FLAG_OPAQUE != 0
+    if uOpaque || vOpaque {
+        if uOpaque && !vOpaque { return -1 }
+        if !uOpaque && vOpaque { return 1 }
+        if u.*.opaqueBits == 0 && v.*.opaqueBits == 0 { return 0 }
+        if u.*.opaqueBits < v.*.opaqueBits { return -1 }
+        if u.*.opaqueBits > v.*.opaqueBits { return 1 }
+        const n = (u.*.opaqueBits + 7) / 8
+        var index: usize = 0
+        while index < n {
+            const x = c.get8(u.*.limbs + index)
+            const y = c.get8(v.*.limbs + index)
+            if x != y { return @intCast(i32, x) - @intCast(i32, y) }
+            index += 1
+        }
+        return 0
+    }
+    const un = u.*.used
+    const vn = v.*.used
+    if un == 0 && vn == 0 { return 0 }
+    if !u.*.negative && v.*.negative { return 1 }
+    if u.*.negative && !v.*.negative { return -1 }
+    // libgcrypt answers the limb counts' difference (or, for two negative
+    // numbers, their sum) when they differ.
+    if un != vn && !u.*.negative { return @intCast(i32, un) - @intCast(i32, vn) }
+    if un != vn { return @intCast(i32, un + vn) }
+    const order = compareRaw(digits(u), un, digits(v), vn)
+    if order == 0 { return 0 }
+    if (order < 0) == u.*.negative { return 1 }
+    return -1
+}
+
+pub fn compareSmall(u: *Mpi, value: u64) -> i32 {
+    if u.*.used == 0 { return if value != 0 { -1 } else { 0 } }
+    if u.*.negative { return -1 }
+    if u.*.used > 1 { return 1 }
+    const limb = digits(u)[0]
+    if limb > value { return 1 }
+    if limb < value { return -1 }
+    return 0
+}
+
+pub fn testBit(m: *Mpi, n: usize) -> bool {
+    const limb = n / 64
+    if limb >= m.*.used { return false }
+    return (digits(m)[limb] >> @intCast(u64, n % 64)) & 1 == 1
+}
+
+// w's limbs with room for `count`, the value kept.
+fn reserve(w: *Mpi, count: usize) -> void {
+    if count <= w.*.capacity { return }
+    const limbs = limbsFor(count)
+    const out = words(limbs)
+    const a = digits(w)
+    var index: usize = 0
+    while index < w.*.used {
+        out[index] = a[index]
+        index += 1
+    }
+    const used = w.*.used
+    const negative = w.*.negative
+    c.wipeRelease(w.*.limbs, w.*.capacity * 8)
+    w.*.limbs = limbs
+    w.*.capacity = count
+    w.*.used = used
+    w.*.negative = negative
+}
+
+pub fn setBit(m: *Mpi, n: usize) -> void {
+    const limb = n / 64
+    reserve(m, limb + 1)
+    const limbs = digits(m)
+    var index = m.*.used
+    while index <= limb {
+        limbs[index] = 0
+        index += 1
+    }
+    limbs[limb] = limbs[limb] | (@intCast(u64, 1) << @intCast(u64, n % 64))
+    if limb + 1 > m.*.used { m.*.used = limb + 1 }
+}
+
+pub fn clearBit(m: *Mpi, n: usize) -> void {
+    const limb = n / 64
+    if limb >= m.*.used { return }
+    const limbs = digits(m)
+    limbs[limb] = limbs[limb] & ((@intCast(u64, 1) << @intCast(u64, n % 64)) ^ 18446744073709551615)
+    m.*.used = significant(limbs, m.*.used)
+    if m.*.used == 0 { m.*.negative = false }
+}
+
+// Bit n and every bit above it cleared.
+pub fn clearHigh(m: *Mpi, n: usize) -> void {
+    const limb = n / 64
+    if limb >= m.*.used { return }
+    const limbs = digits(m)
+    limbs[limb] = limbs[limb] & ((@intCast(u64, 1) << @intCast(u64, n % 64)) -% 1)
+    m.*.used = significant(limbs, limb + 1)
+    if m.*.used == 0 { m.*.negative = false }
+}
+
+pub fn shiftLeft(w: *Mpi, u: *Mpi, bits: usize) -> void {
+    const an = u.*.used
+    const count = an + bits / 64 + 1
+    const limbs = limbsFor(count)
+    shiftLeftRaw(words(limbs), digits(u), an, bits)
+    install(w, limbs, count, count, u.*.negative)
+}
+
+pub fn shiftRight(w: *Mpi, u: *Mpi, bits: usize) -> void {
+    const an = u.*.used
+    const limbs = limbsFor(an)
+    shiftRightRaw(words(limbs), an, digits(u), an, bits)
+    install(w, limbs, an, if an == 0 { 1 } else { an }, u.*.negative)
+}
+
+// ---------------------------------------------------------------------------
+// Modular arithmetic.
+
+// w = b^e mod m (e's sign ignored). An odd m of up to 4096 bits goes by
+// Montgomery's ladder in constant time; any other by squaring and
+// multiplying with divisions.
+pub fn powm(w: *Mpi, b: *Mpi, e: *Mpi, m: *Mpi) -> void {
+    const n = m.*.used
+    if n == 0 { return }
+    if n == 1 && digits(m)[0] == 1 {
+        assignRaw(w, digits(m), 0, false)
+        return
+    }
+    // The base in [0, |m|).
+    const modulusValue = copyOf(m)
+    at(modulusValue).*.negative = false
+    const base = create(n)
+    mod(at(base), b, at(modulusValue))
+    const ebits = bitCount(e)
+    if (digits(m)[0] & 1) == 1 && n <= bignum.MAX_LIMBS {
+        const storage = limbsFor(3 * n)
+        const scratch = limbsFor(3 * n)
+        var modulus: bignum.Modulus = undefined
+        bignum.modulusStorage(&modulus, words(storage), n)
+        bignum.copy(modulus.m, digits(m), n)
+        if bignum.modulusSet(&modulus, n) {
+            const value = words(scratch)
+            const result = words(scratch) + n
+            bignum.zero(value, n)
+            bignum.copy(value, digits(at(base)), at(base).*.used)
+            bignum.toMontgomery(&modulus, value, value)
+            bignum.montExp(&modulus, result, value, digits(e), ebits)
+            bignum.fromMontgomery(&modulus, result, result)
+            assignRaw(w, result, n, false)
+        }
+        c.wipeRelease(storage, 3 * n * 8)
+        c.wipeRelease(scratch, 3 * n * 8)
+    } else {
+        const result = create(n)
+        setU64(at(result), 1)
+        var position = ebits
+        while position > 0 {
+            position -= 1
+            mul(at(result), at(result), at(result))
+            mod(at(result), at(result), at(modulusValue))
+            if testBit(e, position) {
+                mul(at(result), at(result), at(base))
+                mod(at(result), at(result), at(modulusValue))
+            }
+        }
+        assign(w, at(result))
+        destroy(result)
+    }
+    destroy(base)
+    destroy(modulusValue)
+}
+
+// g = gcd(|a|, |b|); whether it is 1.
+pub fn gcd(g: *Mpi, a: *Mpi, b: *Mpi) -> bool {
+    const x = copyOf(a)
+    const y = copyOf(b)
+    at(x).*.negative = false
+    at(y).*.negative = false
+    const t = create(1)
+    while at(y).*.used != 0 {
+        mod(at(t), at(x), at(y))
+        assign(at(x), at(y))
+        assign(at(y), at(t))
+    }
+    assign(g, at(x))
+    destroy(x)
+    destroy(y)
+    destroy(t)
+    return compareSmall(g, 1) == 0
+}
+
+// x = |a|^-1 mod |n| (libgcrypt's gcry_mpi_invm takes the magnitudes);
+// false when there is none.
+pub fn invm(x: *Mpi, a: *Mpi, n: *Mpi) -> bool {
+    if a.*.used == 0 || compareSmall(n, 1) == 0 || n.*.used == 0 { return false }
+    const modulus = copyOf(n)
+    at(modulus).*.negative = false
+    const r0 = create(1)
+    const r1 = copyOf(at(modulus))
+    const s0 = create(1)
+    const s1 = create(1)
+    const quotient = create(1)
+    const product = create(1)
+    const remainder = create(1)
+    const value = copyOf(a)
+    at(value).*.negative = false
+    mod(at(r0), at(value), at(modulus))
+    setU64(at(s0), 1)
+    // r0 = s0 * a (mod n) and r1 = s1 * a (mod n) throughout.
+    while at(r1).*.used != 0 {
+        tdivQr(quotient, remainder, at(r0), at(r1))
+        assign(at(r0), at(r1))
+        assign(at(r1), at(remainder))
+        mul(at(product), at(quotient), at(s1))
+        sub(at(product), at(s0), at(product))
+        assign(at(s0), at(s1))
+        assign(at(s1), at(product))
+    }
+    const found = compareSmall(at(r0), 1) == 0
+    if found { mod(x, at(s0), at(modulus)) }
+    destroy(modulus)
+    destroy(r0)
+    destroy(r1)
+    destroy(s0)
+    destroy(s1)
+    destroy(quotient)
+    destroy(product)
+    destroy(remainder)
+    destroy(value)
+    return found
+}
+
+// ---------------------------------------------------------------------------
+// The C API.
+
+fn mpiOf(address: usize) -> *Mpi {
+    const m = at(address)
+    plain(m)
+    return m
+}
+
+var constants: [9]usize = [9]usize{ 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+
+// GCRYMPI_CONST_ONE and the others: shared, immutable.
+export fn _gcry_mpi_get_const(no: i32) -> usize {
+    if no != 1 && no != 2 && no != 3 && no != 4 && no != 8 { return 0 }
+    const index = @intCast(usize, no)
+    if constants[index] == 0 {
+        const address = create(1)
+        setU64(at(address), @intCast(u64, index))
+        at(address).*.flags = FLAG_IMMUTABLE | FLAG_CONST
+        constants[index] = address
+    }
+    return constants[index]
+}
+
+export fn gcry_mpi_new(nbits: u32) -> usize { return create((@intCast(usize, nbits) + 63) / 64) }
+
+export fn gcry_mpi_snew(nbits: u32) -> usize {
+    const address = create((@intCast(usize, nbits) + 63) / 64)
+    if address != 0 { at(address).*.flags = FLAG_SECURE }
+    return address
+}
+
+export fn gcry_mpi_release(a: usize) -> void { destroy(a) }
+
+export fn gcry_mpi_copy(a: usize) -> usize {
+    const address = create(1)
+    if address != 0 {
+        assign(at(address), at(a))
+        at(address).*.flags = at(address).*.flags & (FLAG_SECURE | FLAG_OPAQUE)
+    }
+    return address
+}
+
+// w = u, then u released.
+export fn gcry_mpi_snatch(w: usize, u: usize) -> void {
+    if w != 0 && u != 0 { assign(at(w), at(u)) }
+    destroy(u)
+}
+
+export fn gcry_mpi_set(w: usize, u: usize) -> usize {
+    var target = w
+    if target == 0 { target = create(1) }
+    assign(at(target), at(u))
+    return target
+}
+
+export fn gcry_mpi_set_ui(w: usize, u: u64) -> usize {
+    var target = w
+    if target == 0 { target = create(1) }
+    plain(at(target))
+    setU64(at(target), u)
+    return target
+}
+
+export fn gcry_mpi_get_ui(w: usize, u: usize) -> u32 {
+    const m = at(u)
+    if m.*.used > 1 || m.*.negative { return c.failure(c.ERANGE) }
+    const value = if m.*.used == 1 { digits(m)[0] } else { 0 }
+    if value > 4294967295 { return c.failure(c.ERANGE) }
+    c.put32(w, @intCast(u32, value))
+    return 0
+}
+
+export fn gcry_mpi_swap(a: usize, b: usize) -> void {
+    var saved: Mpi = at(a).*
+    at(a).* = at(b).*
+    at(b).* = saved
+}
+
+export fn gcry_mpi_is_neg(a: usize) -> i32 {
+    const m = at(a)
+    return if m.*.negative && m.*.used != 0 { 1 } else { 0 }
+}
+
+export fn gcry_mpi_neg(w: usize, u: usize) -> void {
+    const source = mpiOf(u)
+    const negative = !source.*.negative
+    assign(mpiOf(w), source)
+    at(w).*.negative = negative && at(w).*.used != 0
+}
+
+export fn gcry_mpi_abs(w: usize) -> void { mpiOf(w).*.negative = false }
+
+export fn gcry_mpi_cmp(u: usize, v: usize) -> i32 { return compare(at(u), at(v)) }
+
+export fn gcry_mpi_cmp_ui(u: usize, v: u64) -> i32 { return compareSmall(mpiOf(u), v) }
+
+export fn gcry_mpi_add(w: usize, u: usize, v: usize) -> void { add(mpiOf(w), mpiOf(u), mpiOf(v)) }
+
+export fn gcry_mpi_add_ui(w: usize, u: usize, v: u64) -> void { addSmall(mpiOf(w), mpiOf(u), v, false) }
+
+export fn gcry_mpi_sub(w: usize, u: usize, v: usize) -> void { sub(mpiOf(w), mpiOf(u), mpiOf(v)) }
+
+export fn gcry_mpi_sub_ui(w: usize, u: usize, v: u64) -> void { addSmall(mpiOf(w), mpiOf(u), v, true) }
+
+export fn gcry_mpi_addm(w: usize, u: usize, v: usize, m: usize) -> void {
+    add(mpiOf(w), mpiOf(u), mpiOf(v))
+    mod(at(w), at(w), mpiOf(m))
+}
+
+export fn gcry_mpi_subm(w: usize, u: usize, v: usize, m: usize) -> void {
+    sub(mpiOf(w), mpiOf(u), mpiOf(v))
+    mod(at(w), at(w), mpiOf(m))
+}
+
+export fn gcry_mpi_mul(w: usize, u: usize, v: usize) -> void { mul(mpiOf(w), mpiOf(u), mpiOf(v)) }
+
+export fn gcry_mpi_mul_ui(w: usize, u: usize, v: u64) -> void {
+    var limb: [1]u64 = [1]u64{ v }
+    const source = mpiOf(u)
+    mulSigned(mpiOf(w), digits(source), source.*.used, source.*.negative, &limb, 1, false)
+}
+
+// The product's remainder truncated: it keeps the product's sign.
+export fn gcry_mpi_mulm(w: usize, u: usize, v: usize, m: usize) -> void {
+    mul(mpiOf(w), mpiOf(u), mpiOf(v))
+    const divisor = copyOf(mpiOf(m))
+    tdivQr(0, w, at(w), at(divisor))
+    destroy(divisor)
+}
+
+export fn gcry_mpi_mul_2exp(w: usize, u: usize, cnt: u64) -> void { shiftLeft(mpiOf(w), mpiOf(u), @intCast(usize, cnt)) }
+
+// round 0 truncates, a negative round floors.
+export fn gcry_mpi_div(q: usize, r: usize, dividend: usize, divisor: usize, round: i32) -> void {
+    const d = copyOf(mpiOf(divisor))
+    if round == 0 {
+        tdivQr(q, r, mpiOf(dividend), at(d))
+    } else {
+        fdivQr(q, r, mpiOf(dividend), at(d))
+    }
+    destroy(d)
+}
+
+export fn gcry_mpi_mod(r: usize, dividend: usize, divisor: usize) -> void { mod(mpiOf(r), mpiOf(dividend), mpiOf(divisor)) }
+
+export fn gcry_mpi_powm(w: usize, b: usize, e: usize, m: usize) -> void { powm(mpiOf(w), mpiOf(b), mpiOf(e), mpiOf(m)) }
+
+export fn gcry_mpi_gcd(g: usize, a: usize, b: usize) -> i32 { return if gcd(mpiOf(g), mpiOf(a), mpiOf(b)) { 1 } else { 0 } }
+
+export fn gcry_mpi_invm(x: usize, a: usize, m: usize) -> i32 { return if invm(mpiOf(x), mpiOf(a), mpiOf(m)) { 1 } else { 0 } }
+
+export fn gcry_mpi_get_nbits(a: usize) -> u32 { return @intCast(u32, bitCount(at(a)) & 4294967295) }
+
+export fn gcry_mpi_test_bit(a: usize, n: u32) -> i32 { return if testBit(at(a), @intCast(usize, n)) { 1 } else { 0 } }
+
+export fn gcry_mpi_set_bit(a: usize, n: u32) -> void { setBit(mpiOf(a), @intCast(usize, n)) }
+
+export fn gcry_mpi_clear_bit(a: usize, n: u32) -> void { clearBit(mpiOf(a), @intCast(usize, n)) }
+
+// Bit n set and every bit above it cleared.
+export fn gcry_mpi_set_highbit(a: usize, n: u32) -> void {
+    const m = mpiOf(a)
+    setBit(m, @intCast(usize, n))
+    clearHigh(m, @intCast(usize, n) + 1)
+}
+
+export fn gcry_mpi_clear_highbit(a: usize, n: u32) -> void { clearHigh(mpiOf(a), @intCast(usize, n)) }
+
+export fn gcry_mpi_rshift(x: usize, a: usize, n: u32) -> void { shiftRight(mpiOf(x), mpiOf(a), @intCast(usize, n)) }
+
+export fn gcry_mpi_lshift(x: usize, a: usize, n: u32) -> void { shiftLeft(mpiOf(x), mpiOf(a), @intCast(usize, n)) }
+
+// The MPI takes `p` (gcry_malloc'd) as its opaque data.
+export fn gcry_mpi_set_opaque(a: usize, p: usize, nbits: u32) -> usize {
+    var target = a
+    if target == 0 { target = create(1) }
+    const m = at(target)
+    dropLimbs(m)
+    m.*.limbs = p
+    m.*.flags = (m.*.flags & FLAG_SECURE) | FLAG_OPAQUE
+    m.*.opaqueBits = @intCast(usize, nbits)
+    m.*.negative = false
+    return target
+}
+
+export fn gcry_mpi_set_opaque_copy(a: usize, p: usize, nbits: u32) -> usize {
+    const data = c.dupBytes(p, (@intCast(usize, nbits) + 7) / 8)
+    if data == 0 { return 0 }
+    return gcry_mpi_set_opaque(a, data, nbits)
+}
+
+export fn gcry_mpi_get_opaque(a: usize, nbits: usize) -> usize {
+    const m = at(a)
+    if m.*.flags & FLAG_OPAQUE == 0 { return 0 }
+    if nbits != 0 { c.put32(nbits, @intCast(u32, m.*.opaqueBits & 4294967295)) }
+    return m.*.limbs
+}
+
+// (nbits + 7) / 8 random bytes: libgcrypt does not cut them to nbits.
+export fn gcry_mpi_randomize(w: usize, nbits: u32, level: i32) -> void {
+    const length = (@intCast(usize, nbits) + 7) / 8
+    const buffer = c.alloc(length)
+    c.fill(buffer, length)
+    fromBytes(mpiOf(w), c.bytes(buffer), length)
+    c.wipeRelease(buffer, length)
+}
+
+// ---------------------------------------------------------------------------
+// Scanning and printing (GCRYMPI_FMT_STD 1, PGP 2, SSH 3, HEX 4, USG 5).
+
+const FMT_STD: i32 = 1
+const FMT_PGP: i32 = 2
+const FMT_SSH: i32 = 3
+const FMT_HEX: i32 = 4
+const FMT_USG: i32 = 5
+
+// A two's complement big-endian number: a new MPI.
+fn fromSigned(bytes: [*]const u8, length: usize) -> usize {
+    const address = fromUnsigned(bytes, length)
+    if length > 0 && bytes[0] & 128 != 0 {
+        // value - 2^(8 length), as its magnitude and a sign.
+        const m = at(address)
+        const power = create(length / 8 + 1)
+        setBit(at(power), length * 8)
+        sub(m, at(power), m)
+        m.*.negative = m.*.used != 0
+        destroy(power)
+    }
+    return address
+}
+
+fn hexValue(byte: u8) -> i32 {
+    if byte >= 48 && byte <= 57 { return @intCast(i32, byte - 48) }
+    if byte >= 65 && byte <= 70 { return @intCast(i32, byte - 55) }
+    if byte >= 97 && byte <= 102 { return @intCast(i32, byte - 87) }
+    return -1
+}
+
+// libgcrypt's hex: an optional "-", an optional "0x", hex digits (an odd
+// count as if a 0 led); 0 for anything else.
+fn fromHex(text: usize) -> usize {
+    var at_ = text
+    var length = c.cLength(text)
+    var negative = false
+    if length > 0 && c.get8(at_) == 45 {
+        negative = true
+        at_ += 1
+        length -= 1
+    }
+    if length >= 2 && c.get8(at_) == 48 && c.get8(at_ + 1) == 120 {
+        at_ += 2
+        length -= 2
+    }
+    const count = (length + 1) / 2
+    const buffer = c.alloc(count)
+    const out = c.bytes(buffer)
+    var index: usize = 0
+    var odd = length % 2 == 1
+    var position: usize = 0
+    while index < count {
+        var high: i32 = 0
+        if odd {
+            odd = false
+        } else {
+            high = hexValue(c.get8(at_ + position))
+            position += 1
+        }
+        const low = hexValue(c.get8(at_ + position))
+        position += 1
+        if high < 0 || low < 0 {
+            c.release(buffer)
+            return 0
+        }
+        out[index] = @intCast(u8, high * 16 + low)
+        index += 1
+    }
+    const address = fromUnsigned(out, count)
+    c.release(buffer)
+    at(address).*.negative = negative && at(address).*.used != 0
+    return address
+}
+
+export fn gcry_mpi_scan(ret_mpi: usize, format: i32, buffer: usize, buflen: usize, nscanned: usize) -> u32 {
+    if buflen > 16384 {
+        if nscanned != 0 { c.putWord(nscanned, 0) }
+        return c.failure(c.INV_OBJ)
+    }
+    var made: usize = 0
+    var scanned: usize = 0
+    if format == FMT_STD {
+        made = fromSigned(c.bytes(buffer), buflen)
+        scanned = buflen
+    } else if format == FMT_USG {
+        made = fromUnsigned(c.bytes(buffer), buflen)
+        scanned = buflen
+    } else if format == FMT_PGP {
+        if buflen < 2 {
+            if nscanned != 0 { c.putWord(nscanned, 0) }
+            return c.failure(c.INV_OBJ)
+        }
+        const bits = (@intCast(usize, c.get8(buffer)) << 8) | @intCast(usize, c.get8(buffer + 1))
+        const length = (bits + 7) / 8
+        if 2 + length > buflen {
+            if nscanned != 0 { c.putWord(nscanned, buflen) }
+            return c.failure(c.INV_OBJ)
+        }
+        made = fromUnsigned(c.bytes(buffer + 2), length)
+        scanned = 2 + length
+    } else if format == FMT_SSH {
+        // The length is the data's own (buflen is not checked when 0).
+        if buflen != 0 && buflen < 4 { return c.failure(c.TOO_SHORT) }
+        const length = (@intCast(usize, c.get8(buffer)) << 24) | (@intCast(usize, c.get8(buffer + 1)) << 16) | (@intCast(usize, c.get8(buffer + 2)) << 8) | @intCast(usize, c.get8(buffer + 3))
+        if buflen != 0 && length > buflen - 4 { return c.failure(c.TOO_LARGE) }
+        made = fromSigned(c.bytes(buffer + 4), length)
+        scanned = length + 4
+    } else if format == FMT_HEX {
+        if buflen != 0 { return c.failure(c.INV_ARG) }
+        made = fromHex(buffer)
+        if made == 0 { return c.failure(c.INV_OBJ) }
+        scanned = c.cLength(buffer)
+    } else {
+        return c.failure(c.INV_ARG)
+    }
+    if ret_mpi != 0 {
+        c.putWord(ret_mpi, made)
+    } else {
+        destroy(made)
+    }
+    if nscanned != 0 { c.putWord(nscanned, scanned) }
+    return 0
+}
+
+// The magnitude's bytes in two's complement (n bytes, in place).
+fn twosComplement(bytes: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        bytes[index] = bytes[index] ^ 255
+        index += 1
+    }
+    index = length
+    while index > 0 {
+        index -= 1
+        bytes[index] = @intCast(u8, (@intCast(u32, bytes[index]) + 1) & 255)
+        if bytes[index] != 0 { break }
+    }
+}
+
+const DIGITS = "0123456789ABCDEF"
+
+// Prints `a` in `format` into `buffer` (buflen bytes; NULL asks the
+// length), the length into *nwritten: a C function's error code.
+pub fn print(format: i32, buffer: usize, buflen: usize, nwritten: usize, a: *Mpi) -> u32 {
+    if nwritten != 0 { c.putWord(nwritten, 0) }
+    const negative = a.*.negative && a.*.used != 0
+    var length: usize = 0
+    const bytes = magnitude(a, &length)
+    const raw = c.bytes(bytes)
+    var result: u32 = 0
+    var written: usize = 0
+    if format == FMT_STD || format == FMT_SSH {
+        // 0 before a positive number whose top bit is set; 0xff before a
+        // negative one whose complement lacks it.
+        var extra: u8 = 0
+        var size = length
+        if negative {
+            twosComplement(raw, length)
+            if raw[0] & 128 == 0 {
+                extra = 2
+                size += 1
+            }
+        } else if length > 0 && raw[0] & 128 != 0 {
+            extra = 1
+            size += 1
+        }
+        const header: usize = if format == FMT_SSH { 4 } else { 0 }
+        if buffer != 0 && size + header > buflen {
+            result = c.TOO_SHORT
+        } else {
+            if buffer != 0 {
+                var out = buffer
+                if header == 4 {
+                    c.put8(out, @intCast(u8, (size >> 24) & 255))
+                    c.put8(out + 1, @intCast(u8, (size >> 16) & 255))
+                    c.put8(out + 2, @intCast(u8, (size >> 8) & 255))
+                    c.put8(out + 3, @intCast(u8, size & 255))
+                    out += 4
+                }
+                if extra == 1 {
+                    c.put8(out, 0)
+                    out += 1
+                } else if extra == 2 {
+                    c.put8(out, 255)
+                    out += 1
+                }
+                c.copy(out, bytes, length)
+            }
+            written = size + header
+        }
+    } else if format == FMT_USG {
+        if buffer != 0 && length > buflen {
+            result = c.TOO_SHORT
+        } else {
+            if buffer != 0 { c.copy(buffer, bytes, length) }
+            written = length
+        }
+    } else if format == FMT_PGP {
+        const bits = bitCount(a)
+        if negative {
+            result = c.INV_ARG
+        } else if buffer != 0 && length + 2 > buflen {
+            result = c.TOO_SHORT
+        } else {
+            if buffer != 0 {
+                c.put8(buffer, @intCast(u8, (bits >> 8) & 255))
+                c.put8(buffer + 1, @intCast(u8, bits & 255))
+                c.copy(buffer + 2, bytes, length)
+            }
+            written = length + 2
+        }
+    } else if format == FMT_HEX {
+        const extra: usize = if length == 0 || raw[0] & 128 != 0 { 2 } else { 0 }
+        const sign: usize = if negative { 1 } else { 0 }
+        const size = 2 * length + extra + sign + 1
+        if buffer != 0 && size > buflen {
+            result = c.TOO_SHORT
+        } else {
+            if buffer != 0 {
+                var out = buffer
+                if negative {
+                    c.put8(out, 45)
+                    out += 1
+                }
+                if extra == 2 {
+                    c.put8(out, 48)
+                    c.put8(out + 1, 48)
+                    out += 2
+                }
+                var index: usize = 0
+                while index < length {
+                    c.put8(out, DIGITS[@intCast(usize, raw[index] >> 4)])
+                    c.put8(out + 1, DIGITS[@intCast(usize, raw[index] & 15)])
+                    out += 2
+                    index += 1
+                }
+                c.put8(out, 0)
+            }
+            written = size
+        }
+    } else {
+        result = c.INV_ARG
+    }
+    c.wipeRelease(bytes, if length == 0 { 1 } else { length })
+    if result != 0 { return result }
+    if nwritten != 0 { c.putWord(nwritten, written) }
+    return 0
+}
+
+export fn gcry_mpi_print(format: i32, buffer: usize, buflen: usize, nwritten: usize, a: usize) -> u32 {
+    return c.failure(print(format, buffer, buflen, nwritten, at(a)))
+}
+
+export fn gcry_mpi_aprint(format: i32, buffer: usize, nwritten: usize, a: usize) -> u32 {
+    c.putWord(buffer, 0)
+    var size: usize = 0
+    const sizing = print(format, 0, 0, @intFromPtr(&size), at(a))
+    if sizing != 0 { return c.failure(sizing) }
+    const out = c.alloc(size)
+    if out == 0 { return c.failure(c.ENOMEM) }
+    const result = print(format, out, size, @intFromPtr(&size), at(a))
+    if result != 0 {
+        c.release(out)
+        return c.failure(result)
+    }
+    c.putWord(buffer, out)
+    if nwritten != 0 { c.putWord(nwritten, size) }
+    return 0
+}
