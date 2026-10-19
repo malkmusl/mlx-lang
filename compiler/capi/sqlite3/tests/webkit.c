@@ -22,6 +22,15 @@ static int idbkey(void *context, int lengthA, const void *a, int lengthB, const 
     return lengthA - lengthB;
 }
 
+/* unixepoch() (IconDatabase's stamps) is the clock: a fixed one here, so
+   that what is printed is the same every time. */
+static void fixed_clock(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    (void)argc;
+    (void)argv;
+    sqlite3_result_int64(context, 1700000000);
+}
+
 static void bind_all(sqlite3_stmt *s, int round)
 {
     int n = sqlite3_bind_parameter_count(s);
@@ -93,6 +102,7 @@ static void run_file(int first, int end)
 {
     sqlite3 *db = open_memory();
     sqlite3_create_collation(db, "IDBKEY", SQLITE_UTF8, NULL, idbkey);
+    sqlite3_create_function(db, "unixepoch", 0, SQLITE_UTF8, NULL, fixed_clock, NULL, NULL);
     run(db, "PRAGMA foreign_keys = ON;");
     printf("=== %s (%d statements)\n", corpus[first].file, end - first);
     for (int phase = 0; phase <= 4; phase++) {

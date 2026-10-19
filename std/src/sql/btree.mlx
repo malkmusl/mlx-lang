@@ -266,6 +266,145 @@ fn writePage(p: *pg.Pager, number: u64, kind: u64, ct: *Content, from: usize, to
 }
 
 // ---------------------------------------------------------------------------
+// Changes in place: a cell put into the gap between a leaf's pointers and
+// its cells, a cell taken out of a leaf with its bytes on the page's list
+// of free blocks, as SQLite does them. Most inserts and deletes are these;
+// the rest (a page that is full, or would be too empty) rewrite the page
+// from its cells and balance it.
+
+// Where the page's cells begin (0 stands for 65536).
+fn contentStart(d: usize, h: usize) -> usize {
+    const at = @intCast(usize, mem.get16be(d + h + 5))
+    return if at == 0 { 65536 } else { at }
+}
+
+// Puts a cell into leaf page `number` at `index` when the gap holds it:
+// `done` tells.
+fn insertInPlace(p: *pg.Pager, number: u64, index: usize, cell: usize, length: usize, done: *bool) -> i32 {
+    done.* = false
+    const page = pg.get(p, number)
+    if page == 0 { return NOMEM }
+    var d = pg.data(page)
+    const h = headerOffset(number)
+    const kind = mem.get8(d + h)
+    const n = cellCount(d, h)
+    const pointers = h + headerSize(kind)
+    const top = contentStart(d, h)
+    const need = padded(length)
+    if top < pointers + n * 2 + need + 2 { return OK }
+    if !pg.write(p, page) { return NOMEM }
+    d = pg.data(page)
+    const at = top - need
+    mem.copy(d + at, cell, length)
+    if length < 4 { mem.zero(d + at + length, 4 - length) }
+    if index < n { mem.copy(d + pointers + (index + 1) * 2, d + pointers + index * 2, (n - index) * 2) }
+    mem.put16be(d + pointers + index * 2, @intCast(u64, at))
+    mem.put16be(d + h + 3, @intCast(u64, n + 1))
+    mem.put16be(d + h + 5, @intCast(u64, at & 65535))
+    p.*.generation += 1
+    done.* = true
+    return OK
+}
+
+// The bytes free on a page: the gap, the free blocks, the fragments.
+fn freeBytes(d: usize, h: usize, kind: u64) -> usize {
+    const n = cellCount(d, h)
+    var total = contentStart(d, h) - (h + headerSize(kind) + n * 2)
+    var block = @intCast(usize, mem.get16be(d + h + 1))
+    var guard: usize = 0
+    while block != 0 && guard < 10000 {
+        total += @intCast(usize, mem.get16be(d + block + 2))
+        block = @intCast(usize, mem.get16be(d + block))
+        guard += 1
+    }
+    return total + @intCast(usize, mem.get8(d + h + 7))
+}
+
+// SQLite's freeSpace: `size` bytes at `start` join the page's free blocks
+// (kept in order and merged with their neighbours; gaps under 4 bytes
+// between them are fragments), or the gap when they are at its edge.
+fn freeSpace(d: usize, h: usize, start: usize, size: usize) -> void {
+    var previous = h + 1
+    var next = @intCast(usize, mem.get16be(d + previous))
+    while next != 0 && next < start {
+        previous = next
+        next = @intCast(usize, mem.get16be(d + next))
+    }
+    var first = start
+    var end = start + size
+    var fragments: usize = 0
+    if next != 0 && end + 3 >= next {
+        fragments = next - end
+        end = next + @intCast(usize, mem.get16be(d + next + 2))
+        next = @intCast(usize, mem.get16be(d + next))
+    }
+    if previous > h + 1 {
+        const previousEnd = previous + @intCast(usize, mem.get16be(d + previous + 2))
+        if previousEnd + 3 >= first {
+            fragments += first - previousEnd
+            first = previous
+        }
+    }
+    const frag = @intCast(usize, mem.get8(d + h + 7))
+    mem.put8(d + h + 7, @intCast(u64, if frag >= fragments { frag - fragments } else { 0 }))
+    if first <= contentStart(d, h) {
+        // At the start of the cells: the gap grows.
+        if first == previous {
+            // (The previous block was merged: unlink it from its own
+            // predecessor by walking again.)
+            var before = h + 1
+            while @intCast(usize, mem.get16be(d + before)) != previous { before = @intCast(usize, mem.get16be(d + before)) }
+            mem.put16be(d + before, @intCast(u64, next))
+        } else {
+            mem.put16be(d + previous, @intCast(u64, next))
+        }
+        mem.put16be(d + h + 5, @intCast(u64, end & 65535))
+        return
+    }
+    if first != previous { mem.put16be(d + previous, @intCast(u64, first)) }
+    mem.put16be(d + first, @intCast(u64, next))
+    mem.put16be(d + first + 2, @intCast(u64, end - first))
+}
+
+// Takes cell `index` out of leaf page `number` when what is left keeps the
+// page a third full (or the page is the root): `done` tells. The cell's
+// overflow pages are the caller's.
+fn deleteInPlace(p: *pg.Pager, number: u64, index: usize, isRoot: bool, done: *bool) -> i32 {
+    done.* = false
+    const page = pg.get(p, number)
+    if page == 0 { return NOMEM }
+    var d = pg.data(page)
+    const h = headerOffset(number)
+    const kind = mem.get8(d + h)
+    if !isLeaf(kind) { return OK }
+    const n = cellCount(d, h)
+    if index >= n { return CORRUPT }
+    var cell: Cell = undefined
+    parseCell(p, kind, cellAt(d, h, kind, index), &cell)
+    const size = padded(cell.length)
+    const capacity = pg.usableSize(p) - h - headerSize(kind)
+    const used = capacity - freeBytes(d, h, kind) - size - 2
+    if !isRoot && (n <= 1 || used < pg.usableSize(p) / 3) { return OK }
+    if !pg.write(p, page) { return NOMEM }
+    d = pg.data(page)
+    const pointers = h + headerSize(kind)
+    const at = @intCast(usize, mem.get16be(d + pointers + index * 2))
+    if index + 1 < n { mem.copy(d + pointers + index * 2, d + pointers + (index + 1) * 2, (n - index - 1) * 2) }
+    mem.put16be(d + h + 3, @intCast(u64, n - 1))
+    if n == 1 {
+        // An empty page: all of it is gap.
+        mem.put16be(d + h + 1, 0)
+        mem.put8(d + h + 7, 0)
+        mem.put16be(d + h + 5, @intCast(u64, pg.usableSize(p) & 65535))
+    } else {
+        freeSpace(d, h, at, size)
+    }
+    p.*.generation += 1
+    done.* = true
+    return OK
+}
+
+// ---------------------------------------------------------------------------
 // The freelist and new pages.
 
 // A page for a tree: from the freelist, or a new one at the end; zeroed
@@ -1214,6 +1353,58 @@ fn collapseRoot(c: *Cursor, ct: *Content) -> i32 {
     return rc
 }
 
+// The cells of `all` dealt to bounds.length + 1 pages about equally full:
+// `bounds` replaced when every page of the even deal fits in `room`.
+// Outside table leaves the cell at a bound is the divider between pages.
+fn evenBounds(all: *Content, leafTable: bool, room: usize, bounds: *mem.Words) -> void {
+    const pages = bounds.*.length + 1
+    const total = count(all)
+    var sum: usize = 0
+    var i: usize = 0
+    while i < total {
+        sum += padded(spanLength(all, i)) + 2
+        i += 1
+    }
+    var even: mem.Words = undefined
+    mem.initWords(&even)
+    var ok = true
+    var used: usize = 0
+    var start: usize = 0
+    var dealt: usize = 0
+    i = 0
+    while i < total && ok {
+        const need = padded(spanLength(all, i)) + 2
+        // This page ends here when it holds its share of what is left.
+        const share = (sum - dealt) / (pages - even.length)
+        if even.length + 1 < pages && i > start && used + need / 2 > share {
+            if used > room { ok = false }
+            _ = mem.push(&even, @intCast(u64, i))
+            dealt += used
+            used = 0
+            if leafTable {
+                start = i
+            } else {
+                dealt += need
+                start = i + 1
+                i += 1
+                continue
+            }
+        }
+        used += need
+        i += 1
+    }
+    if used > room || used == 0 || even.length + 1 != pages { ok = false }
+    if ok {
+        bounds.*.length = 0
+        i = 0
+        while i < even.length {
+            _ = mem.push(bounds, mem.at(&even, i))
+            i += 1
+        }
+    }
+    mem.freeWords(&even)
+}
+
 // Balances page path[level] (whose new cells are `ct`) with up to two
 // siblings under the same parent, then places the parent.
 fn balanceSiblings(c: *Cursor, level: usize, ct: *Content) -> i32 {
@@ -1326,6 +1517,10 @@ fn balanceSiblings(c: *Cursor, level: usize, ct: *Content) -> i32 {
         const lastBound = @intCast(usize, mem.at(&bounds, bounds.length - 1))
         mem.set(&bounds, bounds.length - 1, @intCast(u64, lastBound - 1))
     }
+    // As many pages as the greedy deal needs, with the cells spread evenly
+    // over them (as SQLite spreads them): a deal that fills its pages up
+    // would split again at the next insert.
+    if bounds.length > 0 { evenBounds(all, leafTable, room, &bounds) }
     const pages = bounds.length + 1
     // Page numbers: the old ones first, new ones as needed; extra old ones
     // freed.
@@ -1475,10 +1670,100 @@ pub fn insertEntry(address: usize, data: usize, length: usize) -> i32 {
     return insertAtLeaf(c, data, length, 0)
 }
 
+// SQLite's balance_quick: a row past the last of a full leaf that is its
+// parent's rightmost child (rows come in rowid order) goes alone to a new
+// page after it; the parent gains the divider (the old leaf, its largest
+// rowid) and points past it to the new page. `done` tells.
+fn appendLeaf(c: *Cursor, level: usize, cell: usize, length: usize, done: *bool) -> i32 {
+    done.* = false
+    const p = pagerOfCursor(c)
+    const number = c.*.pages[level]
+    const parentNumber = c.*.pages[level - 1]
+    if parentNumber == 1 { return OK }
+    const parentPage = pg.get(p, parentNumber)
+    if parentPage == 0 { return NOMEM }
+    const pd = pg.data(parentPage)
+    if @intCast(usize, c.*.indices[level - 1]) != cellCount(pd, 0) || isLeaf(mem.get8(pd)) { return OK }
+    const leafPage = pg.get(p, number)
+    if leafPage == 0 { return NOMEM }
+    const ld = pg.data(leafPage)
+    const lh = headerOffset(number)
+    const n = cellCount(ld, lh)
+    if n == 0 { return OK }
+    var last: Cell = undefined
+    parseCell(p, TABLE_LEAF, cellAt(ld, lh, TABLE_LEAF, n - 1), &last)
+    const fresh = allocatePage(p)
+    if fresh == 0 { return NOMEM }
+    const one = newContent()
+    var rc = OK
+    if !addCell(one, cell, length) { rc = NOMEM }
+    if rc == OK { rc = writePage(p, fresh, TABLE_LEAF, one, 0, 1, 0) }
+    dropContent(one)
+    if rc != OK { return rc }
+    var divider: mem.Buffer = undefined
+    mem.initBuffer(&divider)
+    if !buildDivider(number, last.rowid, &divider) { rc = NOMEM }
+    const parent = newContent()
+    if rc == OK { rc = loadContent(p, parentNumber, parent) }
+    if rc == OK {
+        if !addCell(parent, divider.data, divider.length) { rc = NOMEM }
+        parent.*.rightChild = fresh
+    }
+    if rc == OK {
+        c.*.depth = level
+        rc = place(c, level - 1, parent, false)
+    }
+    dropContent(parent)
+    mem.freeBuffer(&divider)
+    done.* = rc == OK
+    return rc
+}
+
 fn insertAtLeaf(c: *Cursor, data: usize, length: usize, rowid: i64) -> i32 {
     const p = pagerOfCursor(c)
     const level = c.*.depth - 1
     const number = c.*.pages[level]
+    // A new cell (not a row replaced) that fits the page's gap goes there.
+    var fast = true
+    const leafPage = pg.get(p, number)
+    if leafPage == 0 { return NOMEM }
+    const ld = pg.data(leafPage)
+    const lh = headerOffset(number)
+    const leafKind = mem.get8(ld + lh)
+    const at = @intCast(usize, c.*.indices[level])
+    if !isLeaf(leafKind) || isTable(leafKind) != c.*.table { fast = false }
+    if fast && c.*.table && at < cellCount(ld, lh) {
+        var existing: Cell = undefined
+        parseCell(p, leafKind, cellAt(ld, lh, leafKind, at), &existing)
+        if existing.rowid == rowid { fast = false }
+    }
+    if fast {
+        var built: mem.Buffer = undefined
+        mem.initBuffer(&built)
+        var rc = buildCell(p, leafKind, rowid, data, length, &built)
+        var done = false
+        if rc == OK { rc = insertInPlace(p, number, at, built.data, built.length, &done) }
+        if rc == OK && done {
+            mem.freeBuffer(&built)
+            p.*.generation += 1
+            c.*.state = INVALID
+            return OK
+        }
+        if rc == OK && !done && c.*.table && level > 0 && at == cellCount(ld, lh) {
+            rc = appendLeaf(c, level, built.data, built.length, &done)
+            if rc == OK && done {
+                mem.freeBuffer(&built)
+                p.*.generation += 1
+                c.*.state = INVALID
+                return OK
+            }
+        }
+        // (Overflow pages a cell that did not fit took stay its: the
+        // rewrite below builds the cell again.)
+        if rc == OK && built.length > 0 { rc = freeCellOverflow(p, leafKind, built.data) }
+        mem.freeBuffer(&built)
+        if rc != OK { return rc }
+    }
     const ct = newContent()
     var rc = loadContent(p, number, ct)
     if rc != OK {
@@ -1526,13 +1811,25 @@ pub fn deleteRow(address: usize, rowid: i64) -> i32 {
     }
     // seekRowid settles in the leaf for an existing row.
     const level = c.*.depth - 1
+    const leafPage = pg.get(p, c.*.pages[level])
+    if leafPage == 0 { return NOMEM }
+    const ld = pg.data(leafPage)
+    const lh = headerOffset(c.*.pages[level])
+    const at = @intCast(usize, c.*.indices[level])
+    rc = freeCellOverflow(p, mem.get8(ld + lh), cellAt(ld, lh, mem.get8(ld + lh), at))
+    if rc != OK { return rc }
+    var done = false
+    rc = deleteInPlace(p, c.*.pages[level], at, level == 0, &done)
+    if rc != OK || done {
+        c.*.state = INVALID
+        return rc
+    }
     const ct = newContent()
     rc = loadContent(p, c.*.pages[level], ct)
     if rc == OK {
-        const index = @intCast(usize, c.*.indices[level])
-        rc = freeCellOverflow(p, ct.*.kind, spanAddress(ct, index))
-        removeCell(ct, index)
-        if rc == OK { rc = place(c, level, ct, true) }
+        // (Its overflow pages are freed already.)
+        removeCell(ct, @intCast(usize, c.*.indices[level]))
+        rc = place(c, level, ct, true)
     }
     dropContent(ct)
     p.*.generation += 1
@@ -1552,6 +1849,24 @@ pub fn deleteEntry(address: usize, data: usize, length: usize) -> i32 {
         return rc
     }
     const level = c.*.depth - 1
+    const entryPage = pg.get(p, c.*.pages[level])
+    if entryPage == 0 { return NOMEM }
+    const ed = pg.data(entryPage)
+    const eh = headerOffset(c.*.pages[level])
+    if isLeaf(mem.get8(ed + eh)) {
+        const at = @intCast(usize, c.*.indices[level])
+        const kind = mem.get8(ed + eh)
+        var done = false
+        var cell: Cell = undefined
+        parseCell(p, kind, cellAt(ed, eh, kind, at), &cell)
+        const overflow = cell.overflow
+        rc = deleteInPlace(p, c.*.pages[level], at, level == 0, &done)
+        if rc == OK && done && overflow != 0 { rc = freeOverflow(p, overflow) }
+        if rc != OK || done {
+            c.*.state = INVALID
+            return rc
+        }
+    }
     const ct = newContent()
     rc = loadContent(p, c.*.pages[level], ct)
     if rc != OK {
