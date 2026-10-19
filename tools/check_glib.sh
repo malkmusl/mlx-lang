@@ -29,7 +29,8 @@
 #                          splicing, pollable sources, GSimpleIOStream
 #       tests/extras.c     keyed data lists, random numbers, language
 #                          names, IDNA host names, GIO's enum types,
-#                          proxy resolvers (what libsoup stands on)
+#                          proxy resolvers, network addresses (what
+#                          libsoup stands on)
 #   - WTF's sources for WPE that stand on GLib and the system
 #     (tests/wtf/files.txt: wtf/glib, generic, unix, linux and posix)
 #     compile with mlx-cc on these headers, with WPE's configuration

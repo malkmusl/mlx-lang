@@ -150,6 +150,20 @@ static void proxies (void)
     g_object_unref (resolver);
 }
 
+static void network_address (void)
+{
+    GSocketConnectable *address = g_network_address_new ("www.example.com", 443);
+    gchar *host = NULL;
+    guint port = 0;
+    g_object_get (address, "hostname", &host, "port", &port, NULL);
+    printf ("network address %s %u, %s %u, a connectable %d, %s\n",
+            g_network_address_get_hostname (G_NETWORK_ADDRESS (address)),
+            g_network_address_get_port (G_NETWORK_ADDRESS (address)),
+            host, port, G_IS_SOCKET_CONNECTABLE (address), G_OBJECT_TYPE_NAME (address));
+    g_free (host);
+    g_object_unref (address);
+}
+
 int main (void)
 {
     setvbuf (stdout, NULL, _IOLBF, 0);
@@ -167,5 +181,6 @@ int main (void)
     enum_type (G_TYPE_SOCKET_CLIENT_EVENT, G_SOCKET_CLIENT_TLS_HANDSHAKED);
     enum_type (G_TYPE_TLS_AUTHENTICATION_MODE, G_TLS_AUTHENTICATION_REQUIRED);
     proxies ();
+    network_address ();
     return 0;
 }

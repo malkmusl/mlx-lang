@@ -70,6 +70,7 @@ sources reach.
 | `charset.mlx` | `gcharset.h`'s `g_get_language_names`: LANGUAGE, LC_ALL, LC_MESSAGES, LANG and each name's variants |
 | `hostnames.mlx` | `ghostutils.h`'s `g_hostname_to_ascii`: IDNA's ACE labels (Punycode) |
 | `proxyresolver.mlx` | `gproxyresolver.h`, `gsimpleproxyresolver.h`: the default resolver (always "direct://", GIO's dummy resolver) and GSimpleProxyResolver with its hosts to ignore |
+| `networkaddress.mlx` | `gnetworkaddress.h`: a host name and port as a GSocketConnectable (the server identity a TLS connection checks) |
 | `tests/` | C programs built by mlx-cc against the library, each with the output GLib 2.80 gives (`NAME.expected`, the exit status last); `tests/wtf/` the WPE configuration and the WTF sources compiled by the check |
 
 ## Tests
@@ -89,7 +90,7 @@ sources reach.
   and `streams.c` (memory, filter and socket streams, synchronous and
   asynchronous, splicing, pollable sources, GSimpleIOStream) and
   `extras.c` (keyed data lists, random numbers, language names, IDNA
-  host names, GIO's enum types, proxy resolvers)
+  host names, GIO's enum types, proxy resolvers, network addresses)
   and compares what they print with what the same programs print on GLib
   2.80 (`tls.c`'s certificates with GLib's GnuTLS backend, its backend
   part with none, `GIO_USE_TLS=dummy`);
