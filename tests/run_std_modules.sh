@@ -63,6 +63,9 @@
 #                                       headers, masks, UTF-8), chunk
 #                                       sizes, the Public Suffix List,
 #                                       MIME sniffing
+#   tests/372_sql_runtime.mlx           std.sql: SQLite's number texts,
+#                                       WebKit's SQL parsed, statements
+#                                       run, a file written and read back
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -113,6 +116,7 @@ run 366_jpeg_decode_runtime "JPEG images (4:2:0, progressive 4:2:2, grey, CMYK, 
 run 367_webp_decode_runtime "WebP images (lossy, lossless, alpha, animated) decoded as libwebp decodes them; incremental rows; damage; encoding"
 run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987) read and written as libsoup does"
 run 371_http_protocol_runtime "WebSocket keys, frames, masks and UTF-8; chunk sizes; public suffixes; MIME sniffing"
+run 372_sql_runtime "SQLite's reals and numbers, WebKit's SQL parsed, GROUP BY, collations, CHECK, a file of 3000 rows read back"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
