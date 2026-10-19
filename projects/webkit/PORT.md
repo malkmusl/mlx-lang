@@ -87,6 +87,22 @@ Four ways to choose without patching, in this order of preference:
 - WebCore: about 35 of 52 sampled files compile with WPE's flags
   (WEBCORE.md); the WPE targets (`webkit-wpe-*`) build WTF and
   JavaScriptCore on mlx-glib.
+- **M2, under way**: the port is described and builds. `config.MLX`
+  (JSCOnly's configuration with WebCore's choices above), the source
+  selection (webcore.mlx's `mlx()`: Sources.txt, the Skia and Adwaita
+  lists, lists/webcore-mlx-sources.txt of other ports' files that fit,
+  port/SourcesMlx.txt, without lists/webcore-mlx-skipped.txt), what
+  WebCore's build generates for those feature defines
+  (`webkit-mlx-webcore-derived`), and the targets: `webkit-mlx-pal`
+  (libPAL.a, built), `webkit-mlx-webcore` (libWebCore.a),
+  `webkit-mlx-port` (libmlxwebport.so, built) and
+  `webkit-mlx-webcore-test`, the program of tests/webcore-mlx.cpp
+  linked with all of them on mlxlibc (tools/check_webkit_mlx_port.sh).
+  The port's sources are in projects/webkit/port (below: what each
+  replaces); those that only stand in for later milestones say so with
+  a `// STUB (Mn: ...)` line, which the check lists. What remains is
+  mlx-cc's: the units it does not compile yet are listed in WEBCORE.md,
+  each with its first error.
 
 ## The shape of the port
 
@@ -119,7 +135,7 @@ port in the tarball that builds WebCore without GLib).
 | Fonts | Skia's typefaces and our font manager over std.fontconfig | below |
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (RenderThemeAdwaita, ScrollbarThemeAdwaita: GraphicsContext drawing; their GLib resources under `USE(GLIB)`) | WebKit's own non-native theme |
-| Crypto | PAL's digests ours (std.sha1, std.sha2, std.md5); `ENABLE_WEB_CRYPTO` off until M7, then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
+| Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), registers the digests only and refuses the rest until M7 (`port/crypto/CryptoMlx.cpp`), then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBGL`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
 
@@ -180,9 +196,11 @@ graphics, which is WebKit2's; for a single process our own
 Encoding images (`toDataURL`, `toBlob`): `ImageUtilitiesSkia.cpp` is not
 compiled (it calls Skia's encoders, which call libpng, libjpeg and libwebp,
 and includes GLContext.h); `ImageUtilitiesMlx.cpp` defines
-`platformEncodeData` over std.png, std.jpeg and std.webp. Skia is built
-for the port without its codecs and encoders (lists/skia-mlx.txt), so
-Skia needs no image library at all.
+`platformEncodeData` over std.png, std.jpeg and std.webp (a stub until
+M4). Skia is to be built for the port without its codecs and encoders
+(lists/skia-mlx.txt, M4), so that Skia needs no image library at all; M2
+links webkit-skia's libSkia.a as it is, whose codecs the port's sources
+do not reach.
 
 ### Images
 
@@ -288,11 +306,11 @@ and std.x509, as crypto/gcrypt and crypto/openssl are for their ports.
 | MIME types | `MIMETypeRegistryMlx.cpp` (a table, std.xdg's shared-mime-info later), not xdgmime |
 | Screen, user agent | `PlatformScreenMlx.cpp`, `UserAgentMlx.cpp` (as PlayStation's PlatformScreenPlayStation.cpp, UserAgentPlayStation.cpp) |
 | Input events | `PlatformKeyboardEvent`, `PlatformMouseEvent`, `PlatformWheelEvent` made by the embedder from Wayland's events (std.xkb for key symbols); `PlatformKeyboardEventMlx.cpp` for the key names and codes |
-| Clipboard | `Pasteboard` through the embedder's `PasteboardStrategy` over the Wayland data device (M5); drag and drop off until then |
-| Cursors | `CursorMlx.cpp`: the compositor's cursor shapes |
+| Clipboard | `Pasteboard` through the embedder's `PasteboardStrategy` over the Wayland data device (M5); until then `PasteboardMlx.cpp`, a clipboard of the process's own (plain text, HTML, URLs, custom data); drag and drop off until then |
+| Cursors | WebCore's generic `Cursor` (no platform cursor) until the embedder sets the compositor's shapes (M5) |
 | Accessibility | off: `accessibility/playstation/*.cpp` (the stubs PlatformHaiku.cmake compiles too) |
 | Logging, shared memory | `platform/unix/LoggingUnix.cpp`, `SharedMemoryUnix.cpp` (memfd on mlxlibc) |
-| Editing | `editing/glib/EditorGLib.cpp` (no GLib in it, as Haiku compiles it) or the port's |
+| Editing | the port's `EditorMlx.cpp` (`Editor`'s pasteboard functions over the port's Pasteboard: plain text, and the selection as text and HTML); EditorGLib.cpp's `WebContentReader` is GTK's and WPE's |
 | Localized strings | `LocalizedStringsMlx.cpp` (English first) |
 | Memory pressure | WTF's Unix handler; the compositor's memory notices later |
 
@@ -417,3 +435,33 @@ none is solved by a patch.
   `mlx-out/libc/libmlxc.so.1` and mlx-unicode by absolute paths of the
   checkout (mlx-cc writes no runpath); installed, they are
   /lib/mlx/libmlxc.so.1 and a library found in /lib/mlx.
+
+What M2 found, and how the port meets it without a patch:
+
+- **Types a port's configuration must name.** CryptoKeyRSA.h and
+  CryptoKeyEC.h declare their key containers for Darwin, GCrypt and
+  OpenSSL only, and WebCrypto is always compiled: the port's prefix
+  header (port/MlxPrefix.h, included after WebCorePrefix.h as a CMake
+  port's prefix header is) names `PlatformRSAKey`,
+  `PlatformRSAKeyContainer` and `PlatformECKeyContainer`.
+  DNSResolveQueue.cpp makes its singleton of `DNSResolveQueuePlatform`,
+  which only GLib's, curl's and CFNetwork's headers name: the port's
+  DNSResolveQueueMlx.cpp defines its class and compiles WebKit's file
+  after it (the file is skipped from its unified source).
+  SharedMemory.h has a handle type only with `USE_UNIX_DOMAIN_SOCKETS`
+  (GTK's and WPE's, set in config.MLX) or Darwin's and Windows'.
+- **GL in the Skia sources.** GraphicsContextSkia, NativeImageSkia,
+  SkiaUtilities and the others include GLContext.h, GLFence.h and
+  texmap's BitmapTexture.h for their accelerated paths, compiled whatever
+  the configuration: Khronos's headers (ANGLE's copy in the tree) and
+  platform/graphics/texmap are on the include path, no GL library is
+  linked, and PlatformDisplayMlx.cpp answers that there is no display.
+- **Generic headers with a member for one backend.** The generic branch
+  of NetworkStorageSession.h is enough (a session and its networking
+  context); the cookie functions are the port's
+  (NetworkStorageSessionMlx.cpp). FontCache.h's Skia members are kept;
+  `FontSetCache`, which only FontCacheSkia.cpp defines, is the port's
+  own class in FontCacheMlx.cpp.
+- **Bundles too big for mlx-cc.** The dense JSBindings bundle of
+  bindings/js (64 sources) exceeds mlx-cc's 8 GB arena: the Mlx port
+  bundles bindings/js by directory (webcore.mlx, `Derived.dense`).
