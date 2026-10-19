@@ -51,7 +51,7 @@ of it; there is no header written by hand.
   UPDATE, DELETE; NOT NULL, UNIQUE, PRIMARY KEY, CHECK and FOREIGN KEY
   constraints (CASCADE, SET NULL, SET DEFAULT, RESTRICT) with their
   conflict clauses; INTEGER PRIMARY KEY and AUTOINCREMENT; partial
-  indexes; CREATE/DROP TABLE and INDEX, ALTER TABLE RENAME, RENAME
+  indexes; CREATE/DROP TABLE, INDEX and VIEW, ALTER TABLE RENAME, RENAME
   COLUMN and ADD COLUMN; transactions and savepoints; VACUUM; the PRAGMAs
   WebKit uses (and table_info, index_list, index_info, foreign_key_list,
   integrity_check...). Values, affinities, comparisons, collations
@@ -65,7 +65,8 @@ of it; there is no header written by hand.
   WebKit calls among them); the authorizer is asked as SQLite asks it
   (SELECT, READ, FUNCTION, the DDL's statements over sqlite_master).
 
-What it does not do (yet): views and triggers (refused), WITH, window
+What it does not do (yet): triggers (refused; a file's are passed
+over), WITH, window
 functions, RETURNING, WITHOUT ROWID tables, ATTACH, virtual
 tables (FTS, R-tree), the JSON and math functions, EXPLAIN. A write-ahead
 log: `PRAGMA journal_mode=WAL` answers `wal` but the file keeps a

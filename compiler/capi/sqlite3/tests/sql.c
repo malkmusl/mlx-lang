@@ -2,8 +2,8 @@
    comparisons, collations, LIKE and GLOB, CASE and CAST, the scalar,
    date and aggregate functions, GROUP BY and HAVING, ORDER BY with
    collations and NULLs, LIMIT and OFFSET, DISTINCT, joins, subqueries,
-   compound SELECTs and their errors. It prints what SQLite 3.45 prints
-   for the same program. */
+   compound SELECTs, views, and their errors. It prints what SQLite 3.45
+   prints for the same program. */
 #include "common.h"
 
 static const char *expressions =
@@ -112,6 +112,33 @@ static const char *queries =
     "SELECT max(count(*)) FROM p;"
     "SELECT name FROM p WHERE count(*) > 1;";
 
+static const char *views =
+    "CREATE VIEW byDept AS SELECT d.title, count(p.id) AS people, max(p.name) FROM d LEFT JOIN p ON p.dept = d.id GROUP BY d.id;"
+    "CREATE VIEW named(who, dept) AS SELECT name, dept FROM p WHERE dept IS NOT NULL;"
+    "SELECT * FROM byDept ORDER BY people DESC, title;"
+    "SELECT who FROM named WHERE dept = 2 ORDER BY who;"
+    "SELECT n.who, b.title FROM named n JOIN byDept b ON b.people = n.dept ORDER BY 1, 2;"
+    "SELECT count(*) FROM named, named AS again;"
+    "CREATE VIEW IF NOT EXISTS named AS SELECT 1;"
+    "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE type = 'view' ORDER BY name;"
+    "DROP VIEW named;"
+    "SELECT name FROM sqlite_master WHERE type = 'view';";
+
+static const char *view_errors[] = {
+    "CREATE VIEW p AS SELECT 1;",
+    "CREATE VIEW byDept AS SELECT 1;",
+    "INSERT INTO byDept VALUES (1, 2, 3);",
+    "DROP TABLE byDept;",
+    "DROP VIEW p;",
+    "DROP VIEW nosuch;",
+    "CREATE INDEX bd ON byDept(title);",
+    "CREATE VIEW broken(a) AS SELECT 1, 2;",
+    "SELECT * FROM broken;",
+    "CREATE VIEW dangling AS SELECT * FROM nowhere;",
+    "SELECT * FROM dangling;",
+    NULL,
+};
+
 int main(void)
 {
     sqlite3 *db = open_memory();
@@ -120,6 +147,9 @@ int main(void)
     run(db, dates);
     run(db, tables);
     run(db, queries);
+    run(db, views);
+    for (int i = 0; view_errors[i]; i++)
+        run(db, view_errors[i]);
     /* After a failed statement run stops: the rest one by one. */
     run(db, "SELECT * FROM nosuch;");
     run(db, "SELECT name FROM p, d WHERE id = 1;");
