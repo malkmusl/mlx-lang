@@ -1,0 +1,1233 @@
+// std.jpeg.output: the output half of the JPEG decoder: the coefficients
+// std.jpeg.read decoded turned into rows of pixels. It is libjpeg-turbo's
+// (2.1.5) output side step for step, so that the pixels are libjpeg's
+// byte for byte: the dimensions (jdmaster.c), the inverse DCT of
+// jidctint.c (jpeg_idct_islow, with its range limiting), block smoothing
+// of a progressive image not complete yet (jdcoefct.c), the upsampling
+// of jdsample.c (fancy, the triangle filter, or plain replication), the
+// colour conversion of jdcolor.c (YCbCr, RGB, grey, YCCK to CMYK, into
+// RGB, BGR, RGBA, BGRA and the other byte orders), and when the rows can
+// come out as the data arrives (jdmainct.c, jdapistd.c).
+//
+//     var o: output.Output = undefined
+//     output.init(&o, &decoder)          (after the header is read)
+//     o.colorSpace = read.CS_EXT_RGBA ... (the parameters)
+//     output.start(&o)                   (jpeg_start_decompress)
+//     output.startPass(&o)
+//     output.readScanlines(&o, rows, count)   (row addresses; answers how
+//                                         many it filled, 0: more data)
+//
+// The decoder keeps each component's samples for the whole image (where
+// libjpeg keeps a few rows): an upsampled row looks at the rows above and
+// below, the first and last ones repeated at the edges as libjpeg's
+// buffers repeat them.
+//
+// Only unscaled output (scale 1) is decoded; other scales give their
+// dimensions but are refused when decompression starts.
+const zs = @import("../flate/stream.mlx")
+const read = @import("./read.mlx")
+
+pub const Decoder = read.Decoder
+
+// How a component's samples are brought to the output's size
+// (jdsample.c's methods).
+const NOOP: u8 = 0
+const FULLSIZE: u8 = 1
+const H2V1_FANCY: u8 = 2
+const H2V1: u8 = 3
+const H1V2_FANCY: u8 = 4
+const H2V2_FANCY: u8 = 5
+const H2V2: u8 = 6
+const INTEGRAL: u8 = 7
+
+// How rows are coloured (jdcolor.c's converters).
+const NULL_CONVERT: u8 = 0
+const GRAYSCALE_CONVERT: u8 = 1
+const RGB_GRAY: u8 = 2
+const YCC_RGB: u8 = 3
+const GRAY_RGB: u8 = 4
+const RGB_RGB: u8 = 5
+const YCCK_CMYK: u8 = 6
+
+pub const Output = struct {
+    d: *Decoder
+
+    // The parameters (libjpeg's defaults from init).
+    colorSpace: i32
+    scaleNum: u32
+    scaleDenom: u32
+    fancy: bool
+    smoothing: bool
+    bufferedImage: bool
+    rawData: bool
+
+    // What they give (jpeg_calc_output_dimensions).
+    width: usize
+    height: usize
+    components: usize
+    scale: usize
+    recommendedRows: usize
+
+    // Where each colour goes in an output pixel (-1: not there).
+    pixelSize: usize
+    red: usize
+    green: usize
+    blue: usize
+    alpha: usize
+    hasAlpha: bool
+
+    convert: u8
+    contextRows: bool
+    methods: [10]u8
+    hExpand: [10]usize
+    vExpand: [10]usize
+    // Each component's samples (stride, rows) and its upsampled row.
+    planes: [10]usize
+    planeStride: [10]usize
+    planeRows: [10]usize
+    rowBuffers: [10]usize
+    rowBufferSize: usize
+    started: bool
+
+    // The colour tables (build_ycc_rgb_table, build_rgb_y_table).
+    crR: [256]i32
+    cbB: [256]i32
+    crG: [256]i64
+    cbG: [256]i64
+    rgbY: [768]i64
+    // The IDCT's range limit: a sample from the low 10 bits of a value.
+    limit: [1024]u8
+
+    // The pass.
+    scanline: usize
+    smooth: bool
+    coefBitsLatch: [200]i32
+    // Cropping (jpeg_crop_scanline): the first block column and the
+    // columns of each component that are output.
+    firstColumn: [10]usize
+    lastColumn: [10]usize
+}
+
+inline fn get8(address: usize) -> usize { return @intCast(usize, zs.get8(address)) }
+inline fn put8(address: usize, value: usize) -> void { zs.put8(address, value) }
+
+fn divRoundUp(a: usize, b: usize) -> usize { return (a + b - 1) / b }
+fn roundUp(a: usize, b: usize) -> usize { return divRoundUp(a, b) * b }
+
+// The output for decoder D with libjpeg's default parameters, once its
+// header is read.
+pub fn init(o: *Output, d: *Decoder) -> void {
+    zs.zero(@intFromPtr(o), @sizeOf(Output))
+    o.*.d = d
+    o.*.colorSpace = d.*.outColorSpace
+    o.*.scaleNum = 1
+    o.*.scaleDenom = 1
+    o.*.fancy = true
+    o.*.smoothing = true
+}
+
+// Frees the samples and rows.
+pub fn deinit(o: *Output) -> void {
+    const d = o.*.d
+    var ci: usize = 0
+    while ci < read.MAX_COMPONENTS {
+        if o.*.planes[ci] != 0 { read.release(d, o.*.planes[ci], o.*.planeStride[ci] * o.*.planeRows[ci]) }
+        if o.*.rowBuffers[ci] != 0 { read.release(d, o.*.rowBuffers[ci], o.*.rowBufferSize) }
+        o.*.planes[ci] = 0
+        o.*.rowBuffers[ci] = 0
+        ci += 1
+    }
+    o.*.started = false
+}
+
+// Bytes in a pixel and the place of each colour, for the RGB spaces.
+fn layout(o: *Output, space: i32) -> bool {
+    o.*.alpha = 99
+    o.*.hasAlpha = false
+    if space == read.CS_RGB || space == read.CS_EXT_RGB {
+        setLayout(o, 3, 0, 1, 2)
+    } else if space == read.CS_EXT_RGBX || space == read.CS_EXT_RGBA {
+        setLayout(o, 4, 0, 1, 2)
+        o.*.alpha = 3
+    } else if space == read.CS_EXT_BGR {
+        setLayout(o, 3, 2, 1, 0)
+    } else if space == read.CS_EXT_BGRX || space == read.CS_EXT_BGRA {
+        setLayout(o, 4, 2, 1, 0)
+        o.*.alpha = 3
+    } else if space == read.CS_EXT_XBGR || space == read.CS_EXT_ABGR {
+        setLayout(o, 4, 3, 2, 1)
+        o.*.alpha = 0
+    } else if space == read.CS_EXT_XRGB || space == read.CS_EXT_ARGB {
+        setLayout(o, 4, 1, 2, 3)
+        o.*.alpha = 0
+    } else {
+        return false
+    }
+    o.*.hasAlpha = o.*.alpha != 99
+    return true
+}
+
+fn setLayout(o: *Output, size: usize, r: usize, g: usize, b: usize) -> void {
+    o.*.pixelSize = size
+    o.*.red = r
+    o.*.green = g
+    o.*.blue = b
+}
+
+// jpeg_calc_output_dimensions: the size of the output and of a pixel.
+pub fn calcDimensions(o: *Output) -> void {
+    const d = o.*.d
+    // The smallest scale n/8 at least as large as the one asked for.
+    var n: usize = 1
+    while n < 16 && @intCast(usize, o.*.scaleNum) * 8 > @intCast(usize, o.*.scaleDenom) * n { n += 1 }
+    o.*.scale = n
+    o.*.width = divRoundUp(d.*.imageWidth * n, 8)
+    o.*.height = divRoundUp(d.*.imageHeight * n, 8)
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        const c = &d.*.components[ci]
+        c.*.downsampledWidth = divRoundUp(d.*.imageWidth * c.*.hSamp * n, d.*.maxHSamp * 8)
+        c.*.downsampledHeight = divRoundUp(d.*.imageHeight * c.*.vSamp * n, d.*.maxVSamp * 8)
+        ci += 1
+    }
+    const space = o.*.colorSpace
+    if space == read.CS_GRAYSCALE {
+        o.*.components = 1
+    } else if space == read.CS_YCBCR || space == read.CS_RGB565 {
+        o.*.components = 3
+    } else if space == read.CS_CMYK || space == read.CS_YCCK {
+        o.*.components = 4
+    } else if layout(o, space) {
+        o.*.components = o.*.pixelSize
+    } else {
+        o.*.components = d.*.numComponents
+    }
+    o.*.recommendedRows = 1
+    if mergedUpsampling(o) { o.*.recommendedRows = d.*.maxVSamp }
+}
+
+// Whether libjpeg would use its merged upsampler (use_merged_upsample);
+// it gives the same pixels as the plain one, but its own number of rows.
+fn mergedUpsampling(o: *Output) -> bool {
+    const d = o.*.d
+    if o.*.fancy { return false }
+    if d.*.jpegColorSpace != read.CS_YCBCR || d.*.numComponents != 3 { return false }
+    if !layout(o, o.*.colorSpace) && o.*.colorSpace != read.CS_RGB565 { return false }
+    const c0 = &d.*.components[0]
+    const c1 = &d.*.components[1]
+    const c2 = &d.*.components[2]
+    if c0.*.hSamp != 2 || c1.*.hSamp != 1 || c2.*.hSamp != 1 || c0.*.vSamp > 2 || c1.*.vSamp != 1 || c2.*.vSamp != 1 { return false }
+    return true
+}
+
+// libjpeg's master_selection: checks the conversion asked for, chooses
+// the upsampling, makes the coefficient arrays and starts the first
+// scan. False with the decoder failed on an error.
+pub fn start(o: *Output) -> bool {
+    const d = o.*.d
+    calcDimensions(o)
+    if !colorSetup(o) { return false }
+    if !upsamplerSetup(o) { return false }
+    if o.*.scale != 8 { return read.fail1(d, read.JERR_BAD_DCTSIZE, @intCast(i32, o.*.scale)) }
+    prepareLimit(o)
+    // The samples of each component that is output, and its upsampled row.
+    o.*.rowBufferSize = roundUp(o.*.width, d.*.maxHSamp) + 32
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        const c = &d.*.components[ci]
+        o.*.firstColumn[ci] = 0
+        o.*.lastColumn[ci] = c.*.widthInBlocks - 1
+        if c.*.needed {
+            o.*.planeStride[ci] = roundUp(c.*.widthInBlocks, c.*.hSamp) * 8
+            o.*.planeRows[ci] = roundUp(c.*.heightInBlocks, c.*.vSamp) * 8
+            o.*.planes[ci] = read.allocate(d, o.*.planeStride[ci] * o.*.planeRows[ci])
+            if o.*.planes[ci] == 0 { return read.fail1(d, read.JERR_OUT_OF_MEMORY, 4) }
+            zs.zero(o.*.planes[ci], o.*.planeStride[ci] * o.*.planeRows[ci])
+            o.*.rowBuffers[ci] = read.allocate(d, o.*.rowBufferSize)
+            if o.*.rowBuffers[ci] == 0 { return read.fail1(d, read.JERR_OUT_OF_MEMORY, 4) }
+        }
+        ci += 1
+    }
+    o.*.started = true
+    d.*.bufferedImage = o.*.bufferedImage
+    return read.startDecoding(d, d.*.hasMultipleScans || o.*.bufferedImage)
+}
+
+// The IDCT's range limit (prepare_range_limit_table): a value's low 10
+// bits as a signed number, plus 128, clamped to a sample.
+fn prepareLimit(o: *Output) -> void {
+    var i: usize = 0
+    while i < 1024 {
+        var value: usize = 0
+        if i < 128 {
+            value = i + 128
+        } else if i < 512 {
+            value = 255
+        } else if i < 896 {
+            value = 0
+        } else {
+            value = i - 896
+        }
+        o.*.limit[i] = @intCast(u8, value)
+        i += 1
+    }
+}
+
+// jinit_color_deconverter: which conversion, and the tables it uses.
+fn colorSetup(o: *Output) -> bool {
+    const d = o.*.d
+    const jspace = d.*.jpegColorSpace
+    const n = d.*.numComponents
+    if jspace == read.CS_GRAYSCALE {
+        if n != 1 { return read.fail(d, read.JERR_BAD_J_COLORSPACE) }
+    } else if jspace == read.CS_RGB || jspace == read.CS_YCBCR {
+        if n != 3 { return read.fail(d, read.JERR_BAD_J_COLORSPACE) }
+    } else if jspace == read.CS_CMYK || jspace == read.CS_YCCK {
+        if n != 4 { return read.fail(d, read.JERR_BAD_J_COLORSPACE) }
+    } else if n < 1 {
+        return read.fail(d, read.JERR_BAD_J_COLORSPACE)
+    }
+    const space = o.*.colorSpace
+    if space == read.CS_GRAYSCALE {
+        o.*.components = 1
+        if jspace == read.CS_GRAYSCALE || jspace == read.CS_YCBCR {
+            o.*.convert = GRAYSCALE_CONVERT
+            var ci: usize = 1
+            while ci < n {
+                d.*.components[ci].needed = false
+                ci += 1
+            }
+        } else if jspace == read.CS_RGB {
+            o.*.convert = RGB_GRAY
+            buildRgbY(o)
+        } else {
+            return read.fail(d, read.JERR_CONVERSION_NOTIMPL)
+        }
+    } else if layout(o, space) {
+        o.*.components = o.*.pixelSize
+        if jspace == read.CS_YCBCR {
+            o.*.convert = YCC_RGB
+            buildYccRgb(o)
+        } else if jspace == read.CS_GRAYSCALE {
+            o.*.convert = GRAY_RGB
+        } else if jspace == read.CS_RGB {
+            o.*.convert = RGB_RGB
+        } else {
+            return read.fail(d, read.JERR_CONVERSION_NOTIMPL)
+        }
+    } else if space == read.CS_CMYK {
+        o.*.components = 4
+        if jspace == read.CS_YCCK {
+            o.*.convert = YCCK_CMYK
+            buildYccRgb(o)
+        } else if jspace == read.CS_CMYK {
+            o.*.convert = NULL_CONVERT
+        } else {
+            return read.fail(d, read.JERR_CONVERSION_NOTIMPL)
+        }
+    } else if space == read.CS_RGB565 {
+        return read.fail(d, read.JERR_CONVERSION_NOTIMPL)
+    } else {
+        if space == jspace {
+            o.*.components = n
+            o.*.convert = NULL_CONVERT
+        } else {
+            return read.fail(d, read.JERR_CONVERSION_NOTIMPL)
+        }
+    }
+    return true
+}
+
+const SCALEBITS: u64 = 16
+const ONE_HALF: i64 = 32768
+
+// FIX(x) of jdcolor.c: X * 2^16 rounded, the values written out.
+fn buildYccRgb(o: *Output) -> void {
+    var i: usize = 0
+    var x: i64 = -128
+    while i < 256 {
+        o.*.crR[i] = @intCast(i32, (91881 * x + ONE_HALF) >> SCALEBITS)
+        o.*.cbB[i] = @intCast(i32, (116130 * x + ONE_HALF) >> SCALEBITS)
+        o.*.crG[i] = (0 - 46802) * x
+        o.*.cbG[i] = (0 - 22554) * x + ONE_HALF
+        i += 1
+        x += 1
+    }
+}
+
+fn buildRgbY(o: *Output) -> void {
+    var i: usize = 0
+    while i < 256 {
+        const v = @intCast(i64, i)
+        o.*.rgbY[i] = 19595 * v
+        o.*.rgbY[256 + i] = 38470 * v
+        o.*.rgbY[512 + i] = 7471 * v + ONE_HALF
+        i += 1
+    }
+}
+
+// jinit_upsampler: each component's method.
+fn upsamplerSetup(o: *Output) -> bool {
+    const d = o.*.d
+    o.*.contextRows = false
+    const fancy = o.*.fancy && o.*.scale > 1
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        const c = &d.*.components[ci]
+        const hIn = c.*.hSamp
+        const vIn = c.*.vSamp
+        const hOut = d.*.maxHSamp
+        const vOut = d.*.maxVSamp
+        if !c.*.needed {
+            o.*.methods[ci] = NOOP
+        } else if hIn == hOut && vIn == vOut {
+            o.*.methods[ci] = FULLSIZE
+        } else if hIn * 2 == hOut && vIn == vOut {
+            if fancy && c.*.downsampledWidth > 2 { o.*.methods[ci] = H2V1_FANCY } else { o.*.methods[ci] = H2V1 }
+        } else if hIn == hOut && vIn * 2 == vOut && fancy {
+            o.*.methods[ci] = H1V2_FANCY
+            o.*.contextRows = true
+        } else if hIn * 2 == hOut && vIn * 2 == vOut {
+            if fancy && c.*.downsampledWidth > 2 {
+                o.*.methods[ci] = H2V2_FANCY
+                o.*.contextRows = true
+            } else {
+                o.*.methods[ci] = H2V2
+            }
+        } else if hOut % hIn == 0 && vOut % vIn == 0 {
+            o.*.methods[ci] = INTEGRAL
+            o.*.hExpand[ci] = hOut / hIn
+            o.*.vExpand[ci] = vOut / vIn
+        } else {
+            return read.fail(d, read.JERR_FRACT_SAMPLE_NOTIMPL)
+        }
+        ci += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The inverse DCT (jidctint.c's jpeg_idct_islow)
+
+const CONST_BITS: u64 = 13
+const PASS1_BITS: u64 = 2
+
+inline fn descale(x: i64, n: u64) -> i64 {
+    return (x + (@intCast(i64, 1) << (n - 1))) >> n
+}
+
+// The block at BLOCK (64 coefficients) dequantized with QUANT, into the
+// 8x8 samples at OUT, STRIDE apart.
+fn idct(o: *Output, block: usize, quant: [*]u16, out: usize, stride: usize) -> void {
+    var ws: [64]i64 = undefined
+    var column: usize = 0
+    while column < 8 {
+        const a = block + column * 2
+        if read.coefficient(a + 16) == 0 && read.coefficient(a + 32) == 0 && read.coefficient(a + 48) == 0 && read.coefficient(a + 64) == 0 && read.coefficient(a + 80) == 0 && read.coefficient(a + 96) == 0 && read.coefficient(a + 112) == 0 {
+            // The column has only its DC term: the same value all down.
+            const dc = (@intCast(i64, read.coefficient(a)) * @intCast(i64, quant[column])) << PASS1_BITS
+            var row: usize = 0
+            while row < 8 {
+                ws[row * 8 + column] = dc
+                row += 1
+            }
+            column += 1
+            continue
+        }
+        var z2 = @intCast(i64, read.coefficient(a + 32)) * @intCast(i64, quant[16 + column])
+        var z3 = @intCast(i64, read.coefficient(a + 96)) * @intCast(i64, quant[48 + column])
+        var z1 = (z2 + z3) * 4433
+        var tmp2 = z1 + z3 * (0 - 15137)
+        var tmp3 = z1 + z2 * 6270
+        z2 = @intCast(i64, read.coefficient(a)) * @intCast(i64, quant[column])
+        z3 = @intCast(i64, read.coefficient(a + 64)) * @intCast(i64, quant[32 + column])
+        var tmp0 = (z2 + z3) << CONST_BITS
+        var tmp1 = (z2 - z3) << CONST_BITS
+        const tmp10 = tmp0 + tmp3
+        const tmp13 = tmp0 - tmp3
+        const tmp11 = tmp1 + tmp2
+        const tmp12 = tmp1 - tmp2
+        tmp0 = @intCast(i64, read.coefficient(a + 112)) * @intCast(i64, quant[56 + column])
+        tmp1 = @intCast(i64, read.coefficient(a + 80)) * @intCast(i64, quant[40 + column])
+        tmp2 = @intCast(i64, read.coefficient(a + 48)) * @intCast(i64, quant[24 + column])
+        tmp3 = @intCast(i64, read.coefficient(a + 16)) * @intCast(i64, quant[8 + column])
+        z1 = tmp0 + tmp3
+        z2 = tmp1 + tmp2
+        z3 = tmp0 + tmp2
+        var z4 = tmp1 + tmp3
+        const z5 = (z3 + z4) * 9633
+        tmp0 = tmp0 * 2446
+        tmp1 = tmp1 * 16819
+        tmp2 = tmp2 * 25172
+        tmp3 = tmp3 * 12299
+        z1 = z1 * (0 - 7373)
+        z2 = z2 * (0 - 20995)
+        z3 = z3 * (0 - 16069)
+        z4 = z4 * (0 - 3196)
+        z3 += z5
+        z4 += z5
+        tmp0 += z1 + z3
+        tmp1 += z2 + z4
+        tmp2 += z2 + z3
+        tmp3 += z1 + z4
+        // The workspace is int: the descaled values kept as 32 bits.
+        ws[column] = wrap32(descale(tmp10 + tmp3, CONST_BITS - PASS1_BITS))
+        ws[56 + column] = wrap32(descale(tmp10 - tmp3, CONST_BITS - PASS1_BITS))
+        ws[8 + column] = wrap32(descale(tmp11 + tmp2, CONST_BITS - PASS1_BITS))
+        ws[48 + column] = wrap32(descale(tmp11 - tmp2, CONST_BITS - PASS1_BITS))
+        ws[16 + column] = wrap32(descale(tmp12 + tmp1, CONST_BITS - PASS1_BITS))
+        ws[40 + column] = wrap32(descale(tmp12 - tmp1, CONST_BITS - PASS1_BITS))
+        ws[24 + column] = wrap32(descale(tmp13 + tmp0, CONST_BITS - PASS1_BITS))
+        ws[32 + column] = wrap32(descale(tmp13 - tmp0, CONST_BITS - PASS1_BITS))
+        column += 1
+    }
+    var row: usize = 0
+    while row < 8 {
+        const w = row * 8
+        const outRow = out + row * stride
+        if ws[w + 1] == 0 && ws[w + 2] == 0 && ws[w + 3] == 0 && ws[w + 4] == 0 && ws[w + 5] == 0 && ws[w + 6] == 0 && ws[w + 7] == 0 {
+            const value = limited(o, descale(ws[w], PASS1_BITS + 3))
+            var x: usize = 0
+            while x < 8 {
+                put8(outRow + x, value)
+                x += 1
+            }
+            row += 1
+            continue
+        }
+        var z2 = ws[w + 2]
+        var z3 = ws[w + 6]
+        var z1 = (z2 + z3) * 4433
+        var tmp2 = z1 + z3 * (0 - 15137)
+        var tmp3 = z1 + z2 * 6270
+        var tmp0 = (ws[w] + ws[w + 4]) << CONST_BITS
+        var tmp1 = (ws[w] - ws[w + 4]) << CONST_BITS
+        const tmp10 = tmp0 + tmp3
+        const tmp13 = tmp0 - tmp3
+        const tmp11 = tmp1 + tmp2
+        const tmp12 = tmp1 - tmp2
+        tmp0 = ws[w + 7]
+        tmp1 = ws[w + 5]
+        tmp2 = ws[w + 3]
+        tmp3 = ws[w + 1]
+        z1 = tmp0 + tmp3
+        z2 = tmp1 + tmp2
+        z3 = tmp0 + tmp2
+        var z4 = tmp1 + tmp3
+        const z5 = (z3 + z4) * 9633
+        tmp0 = tmp0 * 2446
+        tmp1 = tmp1 * 16819
+        tmp2 = tmp2 * 25172
+        tmp3 = tmp3 * 12299
+        z1 = z1 * (0 - 7373)
+        z2 = z2 * (0 - 20995)
+        z3 = z3 * (0 - 16069)
+        z4 = z4 * (0 - 3196)
+        z3 += z5
+        z4 += z5
+        tmp0 += z1 + z3
+        tmp1 += z2 + z4
+        tmp2 += z2 + z3
+        tmp3 += z1 + z4
+        const shift = CONST_BITS + PASS1_BITS + 3
+        put8(outRow, limited(o, descale(tmp10 + tmp3, shift)))
+        put8(outRow + 7, limited(o, descale(tmp10 - tmp3, shift)))
+        put8(outRow + 1, limited(o, descale(tmp11 + tmp2, shift)))
+        put8(outRow + 6, limited(o, descale(tmp11 - tmp2, shift)))
+        put8(outRow + 2, limited(o, descale(tmp12 + tmp1, shift)))
+        put8(outRow + 5, limited(o, descale(tmp12 - tmp1, shift)))
+        put8(outRow + 3, limited(o, descale(tmp13 + tmp0, shift)))
+        put8(outRow + 4, limited(o, descale(tmp13 - tmp0, shift)))
+        row += 1
+    }
+}
+
+// A value as a C int holds it (the low 32 bits, signed).
+inline fn wrap32(x: i64) -> i64 {
+    const low = @bitCast(u64, x) & 0xffffffff
+    if low >= 0x80000000 { return @intCast(i64, low) - 4294967296 }
+    return @intCast(i64, low)
+}
+
+inline fn limited(o: *Output, x: i64) -> usize {
+    return @intCast(usize, o.*.limit[@intCast(usize, @bitCast(u64, x) & 1023)])
+}
+
+// ---------------------------------------------------------------------------
+// Turning an iMCU row's blocks into samples (jdcoefct.c)
+
+// How many block rows of component C the iMCU row ROW has.
+fn blockRowsOf(d: *Decoder, ci: usize, row: usize) -> usize {
+    const c = &d.*.components[ci]
+    if row < d.*.totalIMCURows - 1 { return c.*.vSamp }
+    var rows = c.*.heightInBlocks % c.*.vSamp
+    if rows == 0 { rows = c.*.vSamp }
+    return rows
+}
+
+// decompress_data's inverse DCT of iMCU row ROW into the samples.
+fn transformRow(o: *Output, row: usize) -> void {
+    const d = o.*.d
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        const c = &d.*.components[ci]
+        if c.*.needed {
+            const blockRows = blockRowsOf(d, ci, row)
+            const quant: [*]u16 = &c.*.quant
+            var br: usize = 0
+            while br < blockRows {
+                const blockRow = row * c.*.vSamp + br
+                var column = o.*.firstColumn[ci]
+                var out = o.*.planes[ci] + blockRow * 8 * o.*.planeStride[ci] + column * 8
+                while column <= o.*.lastColumn[ci] {
+                    idct(o, read.blockAt(d, ci, blockRow, column), quant, out, o.*.planeStride[ci])
+                    out += 8
+                    column += 1
+                }
+                br += 1
+            }
+        }
+        ci += 1
+    }
+}
+
+// The quantization table entries block smoothing looks at.
+const Q01: usize = 1
+const Q10: usize = 8
+const Q20: usize = 16
+const Q11: usize = 9
+const Q02: usize = 2
+const Q03: usize = 3
+const Q12: usize = 10
+const Q21: usize = 17
+const Q30: usize = 24
+
+// smoothing_ok: whether the coefficients still missing make block
+// smoothing worth it, with the progress latched for the pass.
+fn smoothingOk(o: *Output) -> bool {
+    const d = o.*.d
+    if !d.*.progressive { return false }
+    var useful = false
+    const n = d.*.numComponents
+    var ci: usize = 0
+    while ci < n {
+        const c = &d.*.components[ci]
+        if !c.*.latched { return false }
+        if c.*.quant[0] == 0 || c.*.quant[Q01] == 0 || c.*.quant[Q10] == 0 || c.*.quant[Q20] == 0 || c.*.quant[Q11] == 0 || c.*.quant[Q02] == 0 || c.*.quant[Q03] == 0 || c.*.quant[Q12] == 0 || c.*.quant[Q21] == 0 || c.*.quant[Q30] == 0 { return false }
+        const bits = ci * 64
+        const previous = (ci + n) * 64
+        if d.*.coefBits[bits] < 0 { return false }
+        o.*.coefBitsLatch[ci * 10] = d.*.coefBits[bits]
+        var k: usize = 1
+        while k < 10 {
+            if d.*.inputScanNumber > 1 {
+                o.*.coefBitsLatch[(n + ci) * 10 + k] = d.*.coefBits[previous + k]
+            } else {
+                o.*.coefBitsLatch[(n + ci) * 10 + k] = -1
+            }
+            o.*.coefBitsLatch[ci * 10 + k] = d.*.coefBits[bits + k]
+            if d.*.coefBits[bits + k] != 0 { useful = true }
+            k += 1
+        }
+        ci += 1
+    }
+    return useful
+}
+
+// One predicted coefficient of block smoothing.
+fn predict(q00: i64, q: i64, num0: i64, al: i32) -> i32 {
+    const num = q00 * num0
+    var pred: i64 = 0
+    if num >= 0 {
+        pred = ((q << 7) + num) / (q << 8)
+        if al > 0 && pred >= (@intCast(i64, 1) << @intCast(u64, al)) { pred = (@intCast(i64, 1) << @intCast(u64, al)) - 1 }
+        return @intCast(i32, pred)
+    }
+    pred = ((q << 7) - num) / (q << 8)
+    if al > 0 && pred >= (@intCast(i64, 1) << @intCast(u64, al)) { pred = (@intCast(i64, 1) << @intCast(u64, al)) - 1 }
+    return @intCast(i32, 0 - pred)
+}
+
+// The DC of the block at ROW, COLUMN of component CI.
+fn dcAt(d: *Decoder, ci: usize, row: usize, column: usize) -> i64 {
+    return @intCast(i64, read.coefficient(read.blockAt(d, ci, row, column)))
+}
+
+// decompress_smooth_data's inverse DCT of iMCU row ROW: AC coefficients
+// not received yet guessed from the DC values around each block.
+fn transformSmoothRow(o: *Output, row: usize) -> void {
+    const d = o.*.d
+    const lastRow = d.*.totalIMCURows - 1
+    const n = d.*.numComponents
+    var workspace: [64]i16 = undefined
+    const ws: [*]i16 = &workspace
+    const wsAddress = @intFromPtr(ws)
+    var ci: usize = 0
+    while ci < n {
+        const c = &d.*.components[ci]
+        if !c.*.needed {
+            ci += 1
+            continue
+        }
+        const blockRows = blockRowsOf(d, ci, row)
+        var latch = ci * 10
+        if row > d.*.lastGoodIMCURow { latch = (ci + n) * 10 }
+        var changeDc = true
+        var k: usize = 1
+        while k < 10 {
+            if o.*.coefBitsLatch[latch + k] != -1 { changeDc = false }
+            k += 1
+        }
+        const q00 = @intCast(i64, c.*.quant[0])
+        const q01 = @intCast(i64, c.*.quant[Q01])
+        const q10 = @intCast(i64, c.*.quant[Q10])
+        const q20 = @intCast(i64, c.*.quant[Q20])
+        const q11 = @intCast(i64, c.*.quant[Q11])
+        const q02 = @intCast(i64, c.*.quant[Q02])
+        const q03 = @intCast(i64, c.*.quant[Q03])
+        const q12 = @intCast(i64, c.*.quant[Q12])
+        const q21 = @intCast(i64, c.*.quant[Q21])
+        const q30 = @intCast(i64, c.*.quant[Q30])
+        const quant: [*]u16 = &c.*.quant
+        const lastBlockColumn = c.*.widthInBlocks - 1
+        var br: usize = 0
+        while br < blockRows {
+            const r = row * c.*.vSamp + br
+            var prevRow = r
+            if br > 0 || row > 0 { prevRow = r - 1 }
+            var prevPrevRow = prevRow
+            if br > 1 || row > 1 { prevPrevRow = r - 2 }
+            var nextRow = r
+            if br + 1 < blockRows || row < lastRow { nextRow = r + 1 }
+            var nextNextRow = nextRow
+            if br + 2 < blockRows || row + 1 < lastRow { nextNextRow = r + 2 }
+            const first = o.*.firstColumn[ci]
+            var dc01 = dcAt(d, ci, prevPrevRow, first)
+            var dc02 = dc01
+            var dc03 = dc01
+            var dc04 = dc01
+            var dc05 = dc01
+            var dc06 = dcAt(d, ci, prevRow, first)
+            var dc07 = dc06
+            var dc08 = dc06
+            var dc09 = dc06
+            var dc10 = dc06
+            var dc11 = dcAt(d, ci, r, first)
+            var dc12 = dc11
+            var dc13 = dc11
+            var dc14 = dc11
+            var dc15 = dc11
+            var dc16 = dcAt(d, ci, nextRow, first)
+            var dc17 = dc16
+            var dc18 = dc16
+            var dc19 = dc16
+            var dc20 = dc16
+            var dc21 = dcAt(d, ci, nextNextRow, first)
+            var dc22 = dc21
+            var dc23 = dc21
+            var dc24 = dc21
+            var dc25 = dc21
+            var out = o.*.planes[ci] + r * 8 * o.*.planeStride[ci] + first * 8
+            var b = first
+            while b <= o.*.lastColumn[ci] {
+                zs.copy(wsAddress, read.blockAt(d, ci, r, b), 128)
+                if b == first && b < lastBlockColumn {
+                    dc04 = dcAt(d, ci, prevPrevRow, b + 1)
+                    dc09 = dcAt(d, ci, prevRow, b + 1)
+                    dc14 = dcAt(d, ci, r, b + 1)
+                    dc19 = dcAt(d, ci, nextRow, b + 1)
+                    dc24 = dcAt(d, ci, nextNextRow, b + 1)
+                }
+                if b + 1 < lastBlockColumn {
+                    dc05 = dcAt(d, ci, prevPrevRow, b + 2)
+                    dc10 = dcAt(d, ci, prevRow, b + 2)
+                    dc15 = dcAt(d, ci, r, b + 2)
+                    dc20 = dcAt(d, ci, nextRow, b + 2)
+                    dc25 = dcAt(d, ci, nextNextRow, b + 2)
+                }
+                var al = o.*.coefBitsLatch[latch + 1]
+                if al != 0 && ws[1] == 0 {
+                    var num: i64 = 0
+                    if changeDc {
+                        num = 0 - dc01 - dc02 + dc04 + dc05 - 3 * dc06 + 13 * dc07 - 13 * dc09 + 3 * dc10 - 3 * dc11 + 38 * dc12 - 38 * dc14 + 3 * dc15 - 3 * dc16 + 13 * dc17 - 13 * dc19 + 3 * dc20 - dc21 - dc22 + dc24 + dc25
+                    } else {
+                        num = 0 - 7 * dc11 + 50 * dc12 - 50 * dc14 + 7 * dc15
+                    }
+                    ws[1] = jcoef(predict(q00, q01, num, al))
+                }
+                al = o.*.coefBitsLatch[latch + 2]
+                if al != 0 && ws[8] == 0 {
+                    var num: i64 = 0
+                    if changeDc {
+                        num = 0 - dc01 - 3 * dc02 - 3 * dc03 - 3 * dc04 - dc05 - dc06 + 13 * dc07 + 38 * dc08 + 13 * dc09 - dc10 + dc16 - 13 * dc17 - 38 * dc18 - 13 * dc19 + dc20 + dc21 + 3 * dc22 + 3 * dc23 + 3 * dc24 + dc25
+                    } else {
+                        num = 0 - 7 * dc03 + 50 * dc08 - 50 * dc18 + 7 * dc23
+                    }
+                    ws[8] = jcoef(predict(q00, q10, num, al))
+                }
+                al = o.*.coefBitsLatch[latch + 3]
+                if al != 0 && ws[16] == 0 {
+                    var num: i64 = 0
+                    if changeDc {
+                        num = dc03 + 2 * dc07 + 7 * dc08 + 2 * dc09 - 5 * dc12 - 14 * dc13 - 5 * dc14 + 2 * dc17 + 7 * dc18 + 2 * dc19 + dc23
+                    } else {
+                        num = 0 - dc03 + 13 * dc08 - 24 * dc13 + 13 * dc18 - dc23
+                    }
+                    ws[16] = jcoef(predict(q00, q20, num, al))
+                }
+                al = o.*.coefBitsLatch[latch + 4]
+                if al != 0 && ws[9] == 0 {
+                    var num: i64 = 0
+                    if changeDc {
+                        num = 0 - dc01 + dc05 + 9 * dc07 - 9 * dc09 - 9 * dc17 + 9 * dc19 + dc21 - dc25
+                    } else {
+                        num = dc10 + dc16 - 10 * dc17 + 10 * dc19 - dc02 - dc20 + dc22 - dc24 + dc04 - dc06 + 10 * dc07 - 10 * dc09
+                    }
+                    ws[9] = jcoef(predict(q00, q11, num, al))
+                }
+                al = o.*.coefBitsLatch[latch + 5]
+                if al != 0 && ws[2] == 0 {
+                    var num: i64 = 0
+                    if changeDc {
+                        num = 2 * dc07 - 5 * dc08 + 2 * dc09 + dc11 + 7 * dc12 - 14 * dc13 + 7 * dc14 + dc15 + 2 * dc17 - 5 * dc18 + 2 * dc19
+                    } else {
+                        num = 0 - dc11 + 13 * dc12 - 24 * dc13 + 13 * dc14 - dc15
+                    }
+                    ws[2] = jcoef(predict(q00, q02, num, al))
+                }
+                if changeDc {
+                    al = o.*.coefBitsLatch[latch + 6]
+                    if al != 0 && ws[3] == 0 { ws[3] = jcoef(predict(q00, q03, dc07 - dc09 + 2 * dc12 - 2 * dc14 + dc17 - dc19, al)) }
+                    al = o.*.coefBitsLatch[latch + 7]
+                    if al != 0 && ws[10] == 0 { ws[10] = jcoef(predict(q00, q12, dc07 - 3 * dc08 + dc09 - dc17 + 3 * dc18 - dc19, al)) }
+                    al = o.*.coefBitsLatch[latch + 8]
+                    if al != 0 && ws[17] == 0 { ws[17] = jcoef(predict(q00, q21, dc07 - dc09 - 3 * dc12 + 3 * dc14 + dc17 - dc19, al)) }
+                    al = o.*.coefBitsLatch[latch + 9]
+                    if al != 0 && ws[24] == 0 { ws[24] = jcoef(predict(q00, q30, dc07 + 2 * dc08 + dc09 - dc17 - 2 * dc18 - dc19, al)) }
+                    const num = 0 - 2 * dc01 - 6 * dc02 - 8 * dc03 - 6 * dc04 - 2 * dc05 - 6 * dc06 + 6 * dc07 + 42 * dc08 + 6 * dc09 - 6 * dc10 - 8 * dc11 + 42 * dc12 + 152 * dc13 + 42 * dc14 - 8 * dc15 - 6 * dc16 + 6 * dc17 + 42 * dc18 + 6 * dc19 - 6 * dc20 - 2 * dc21 - 6 * dc22 - 8 * dc23 - 6 * dc24 - 2 * dc25
+                    ws[0] = jcoef(predict(q00, q00, num, 0))
+                }
+                idct(o, wsAddress, quant, out, o.*.planeStride[ci])
+                dc01 = dc02
+                dc02 = dc03
+                dc03 = dc04
+                dc04 = dc05
+                dc06 = dc07
+                dc07 = dc08
+                dc08 = dc09
+                dc09 = dc10
+                dc11 = dc12
+                dc12 = dc13
+                dc13 = dc14
+                dc14 = dc15
+                dc16 = dc17
+                dc17 = dc18
+                dc18 = dc19
+                dc19 = dc20
+                dc21 = dc22
+                dc22 = dc23
+                dc23 = dc24
+                dc24 = dc25
+                out += 8
+                b += 1
+            }
+            br += 1
+        }
+        ci += 1
+    }
+}
+
+// An int kept as a JCOEF.
+fn jcoef(value: i32) -> i16 {
+    const low = @bitCast(u32, value) & 0xffff
+    if low >= 0x8000 { return @intCast(i16, @intCast(i32, low) - 65536) }
+    return @intCast(i16, low)
+}
+
+// ---------------------------------------------------------------------------
+// Passes and rows
+
+// The start of an output pass (prepare_for_output_pass, start_output_pass).
+pub fn startPass(o: *Output) -> void {
+    const d = o.*.d
+    o.*.smooth = false
+    if d.*.fullBuffer && o.*.smoothing { o.*.smooth = smoothingOk(o) }
+    d.*.outputIMCURow = 0
+    o.*.scanline = 0
+}
+
+// The next iMCU row's samples (decompress_onepass, decompress_data,
+// decompress_smooth_data): the data it needs consumed first.
+fn decompress(o: *Output) -> i32 {
+    const d = o.*.d
+    if !d.*.fullBuffer {
+        const status = read.decodeRow(d)
+        if status != read.ROW_COMPLETED { return status }
+        transformRow(o, d.*.outputIMCURow)
+        d.*.outputIMCURow += 1
+        return read.finishIMCURow(d)
+    }
+    if o.*.smooth {
+        while d.*.inputScanNumber <= d.*.outputScanNumber && !d.*.eoiReached {
+            if d.*.inputScanNumber == d.*.outputScanNumber {
+                var delta: usize = 0
+                if d.*.ss == 0 { delta = 2 }
+                if d.*.inputIMCURow > d.*.outputIMCURow + delta { break }
+            }
+            const status = read.consumeInput(d)
+            if status == read.SUSPENDED || status == read.FAILED { return status }
+        }
+        transformSmoothRow(o, d.*.outputIMCURow)
+    } else {
+        while d.*.inputScanNumber < d.*.outputScanNumber || (d.*.inputScanNumber == d.*.outputScanNumber && d.*.inputIMCURow <= d.*.outputIMCURow) {
+            const status = read.consumeInput(d)
+            if status == read.SUSPENDED || status == read.FAILED { return status }
+        }
+        transformRow(o, d.*.outputIMCURow)
+    }
+    d.*.outputIMCURow += 1
+    if d.*.outputIMCURow < d.*.totalIMCURows { return read.ROW_COMPLETED }
+    return read.SCAN_COMPLETED
+}
+
+// Row INDEX of component CI's samples, the first and last rows repeated
+// beyond the image's edges (as libjpeg's context rows repeat them).
+fn sampleRow(o: *Output, ci: usize, index: i64) -> usize {
+    const c = &o.*.d.*.components[ci]
+    var row = index
+    if row < 0 { row = 0 }
+    if row >= @intCast(i64, c.*.downsampledHeight) { row = @intCast(i64, c.*.downsampledHeight) - 1 }
+    return o.*.planes[ci] + o.*.firstColumn[ci] * 8 + @intCast(usize, row) * o.*.planeStride[ci]
+}
+
+// Component CI's samples for output row Y at the output's width: the
+// address of a row (its own, or the upsampled one).
+fn upsampledRow(o: *Output, ci: usize, y: usize) -> usize {
+    const d = o.*.d
+    const c = &d.*.components[ci]
+    const method = o.*.methods[ci]
+    const out = o.*.rowBuffers[ci]
+    const width = c.*.downsampledWidth
+    // A cropped row starts at the first block column decoded.
+    const base = o.*.planes[ci] + o.*.firstColumn[ci] * 8
+    if method == FULLSIZE {
+        return base + y * o.*.planeStride[ci]
+    }
+    if method == H2V1_FANCY || method == H2V1 {
+        const input = base + y * o.*.planeStride[ci]
+        if method == H2V1 {
+            var x: usize = 0
+            while x < divRoundUp(o.*.width, 2) {
+                const v = get8(input + x)
+                put8(out + 2 * x, v)
+                put8(out + 2 * x + 1, v)
+                x += 1
+            }
+            return out
+        }
+        var value = get8(input)
+        put8(out, value)
+        put8(out + 1, (value * 3 + get8(input + 1) + 2) >> 2)
+        var x: usize = 1
+        while x + 1 < width {
+            value = get8(input + x) * 3
+            put8(out + 2 * x, (value + get8(input + x - 1) + 1) >> 2)
+            put8(out + 2 * x + 1, (value + get8(input + x + 1) + 2) >> 2)
+            x += 1
+        }
+        value = get8(input + width - 1)
+        put8(out + 2 * width - 2, (value * 3 + get8(input + width - 2) + 1) >> 2)
+        put8(out + 2 * width - 1, value)
+        return out
+    }
+    if method == H2V2 {
+        const input = base + (y / 2) * o.*.planeStride[ci]
+        var x: usize = 0
+        while x < divRoundUp(o.*.width, 2) {
+            const v = get8(input + x)
+            put8(out + 2 * x, v)
+            put8(out + 2 * x + 1, v)
+            x += 1
+        }
+        return out
+    }
+    if method == INTEGRAL {
+        const input = base + (y / o.*.vExpand[ci]) * o.*.planeStride[ci]
+        const h = o.*.hExpand[ci]
+        var x: usize = 0
+        const columns = divRoundUp(o.*.width, h)
+        while x < columns {
+            const v = get8(input + x)
+            var k: usize = 0
+            while k < h {
+                put8(out + x * h + k, v)
+                k += 1
+            }
+            x += 1
+        }
+        return out
+    }
+    // The fancy vertical ones: the row nearer and the one beyond.
+    const r = @intCast(i64, y / 2)
+    var neighbour = r - 1
+    var bias: usize = 1
+    if y % 2 == 1 {
+        neighbour = r + 1
+        bias = 2
+    }
+    const input0 = sampleRow(o, ci, r)
+    const input1 = sampleRow(o, ci, neighbour)
+    if method == H1V2_FANCY {
+        var x: usize = 0
+        while x < width {
+            put8(out + x, (get8(input0 + x) * 3 + get8(input1 + x) + bias) >> 2)
+            x += 1
+        }
+        return out
+    }
+    // H2V2_FANCY: the triangle filter both ways.
+    var thisSum = get8(input0) * 3 + get8(input1)
+    var nextSum = get8(input0 + 1) * 3 + get8(input1 + 1)
+    put8(out, (thisSum * 4 + 8) >> 4)
+    put8(out + 1, (thisSum * 3 + nextSum + 7) >> 4)
+    var lastSum = thisSum
+    thisSum = nextSum
+    var x: usize = 2
+    while x < width {
+        nextSum = get8(input0 + x) * 3 + get8(input1 + x)
+        put8(out + 2 * x - 2, (thisSum * 3 + lastSum + 8) >> 4)
+        put8(out + 2 * x - 1, (thisSum * 3 + nextSum + 7) >> 4)
+        lastSum = thisSum
+        thisSum = nextSum
+        x += 1
+    }
+    put8(out + 2 * width - 2, (thisSum * 3 + lastSum + 8) >> 4)
+    put8(out + 2 * width - 1, (thisSum * 4 + 7) >> 4)
+    return out
+}
+
+inline fn clamp(value: i64) -> usize {
+    if value < 0 { return 0 }
+    if value > 255 { return 255 }
+    return @intCast(usize, value)
+}
+
+// Output row Y into OUT.
+fn produceRow(o: *Output, y: usize, out: usize) -> void {
+    const d = o.*.d
+    var rows: [10]usize = undefined
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        rows[ci] = 0
+        if d.*.components[ci].needed { rows[ci] = upsampledRow(o, ci, y) }
+        ci += 1
+    }
+    const width = o.*.width
+    const convert = o.*.convert
+    if convert == YCC_RGB {
+        const y0 = rows[0]
+        const cb0 = rows[1]
+        const cr0 = rows[2]
+        var x: usize = 0
+        var at = out
+        while x < width {
+            const luma = @intCast(i64, get8(y0 + x))
+            const cb = get8(cb0 + x)
+            const cr = get8(cr0 + x)
+            put8(at + o.*.red, clamp(luma + @intCast(i64, o.*.crR[cr])))
+            put8(at + o.*.green, clamp(luma + ((o.*.cbG[cb] + o.*.crG[cr]) >> SCALEBITS)))
+            put8(at + o.*.blue, clamp(luma + @intCast(i64, o.*.cbB[cb])))
+            if o.*.hasAlpha { put8(at + o.*.alpha, 255) }
+            at += o.*.pixelSize
+            x += 1
+        }
+    } else if convert == GRAY_RGB {
+        const g0 = rows[0]
+        var x: usize = 0
+        var at = out
+        while x < width {
+            const v = get8(g0 + x)
+            put8(at + o.*.red, v)
+            put8(at + o.*.green, v)
+            put8(at + o.*.blue, v)
+            if o.*.hasAlpha { put8(at + o.*.alpha, 255) }
+            at += o.*.pixelSize
+            x += 1
+        }
+    } else if convert == RGB_RGB {
+        const r0 = rows[0]
+        const g0 = rows[1]
+        const b0 = rows[2]
+        var x: usize = 0
+        var at = out
+        while x < width {
+            put8(at + o.*.red, get8(r0 + x))
+            put8(at + o.*.green, get8(g0 + x))
+            put8(at + o.*.blue, get8(b0 + x))
+            if o.*.hasAlpha { put8(at + o.*.alpha, 255) }
+            at += o.*.pixelSize
+            x += 1
+        }
+    } else if convert == GRAYSCALE_CONVERT {
+        zs.copy(out, rows[0], width)
+    } else if convert == RGB_GRAY {
+        const r0 = rows[0]
+        const g0 = rows[1]
+        const b0 = rows[2]
+        var x: usize = 0
+        while x < width {
+            const sum = o.*.rgbY[get8(r0 + x)] + o.*.rgbY[256 + get8(g0 + x)] + o.*.rgbY[512 + get8(b0 + x)]
+            put8(out + x, @intCast(usize, sum >> SCALEBITS) & 255)
+            x += 1
+        }
+    } else if convert == YCCK_CMYK {
+        const y0 = rows[0]
+        const cb0 = rows[1]
+        const cr0 = rows[2]
+        const k0 = rows[3]
+        var x: usize = 0
+        var at = out
+        while x < width {
+            const luma = @intCast(i64, get8(y0 + x))
+            const cb = get8(cb0 + x)
+            const cr = get8(cr0 + x)
+            put8(at, clamp(255 - (luma + @intCast(i64, o.*.crR[cr]))))
+            put8(at + 1, clamp(255 - (luma + ((o.*.cbG[cb] + o.*.crG[cr]) >> SCALEBITS))))
+            put8(at + 2, clamp(255 - (luma + @intCast(i64, o.*.cbB[cb]))))
+            put8(at + 3, get8(k0 + x))
+            at += 4
+            x += 1
+        }
+    } else {
+        // null_convert: the components interleaved.
+        const n = d.*.numComponents
+        ci = 0
+        while ci < n {
+            const source = rows[ci]
+            var x: usize = 0
+            var at = out + ci
+            while x < width {
+                put8(at, get8(source + x))
+                at += n
+                x += 1
+            }
+            ci += 1
+        }
+    }
+}
+
+// The last iMCU row output row Y needs: its own, and with fancy vertical
+// upsampling the next one for the last row group of an iMCU row.
+fn neededRow(o: *Output, y: usize) -> usize {
+    const d = o.*.d
+    const height = d.*.maxVSamp * 8
+    const row = y / height
+    if o.*.contextRows && row + 1 < d.*.totalIMCURows && y % height >= height - d.*.maxVSamp { return row + 1 }
+    return row
+}
+
+// jpeg_read_scanlines: up to MAX rows into the rows whose addresses are
+// at ROWS, as many as libjpeg gives in one call (the rest of a row
+// group). 0 when the data ran out (or an error: the decoder failed).
+pub fn readScanlines(o: *Output, rows: [*]usize, max: usize) -> usize {
+    const d = o.*.d
+    if o.*.scanline >= o.*.height || max == 0 { return 0 }
+    const y = o.*.scanline
+    const needed = neededRow(o, y)
+    while d.*.outputIMCURow <= needed {
+        const status = decompress(o)
+        if status == read.SUSPENDED || status == read.FAILED { return 0 }
+    }
+    // The rest of the row group (merged upsampling gives whole groups of
+    // two only where it is used; libjpeg's other paths give what is
+    // asked up to the group's end).
+    var count = d.*.maxVSamp - y % d.*.maxVSamp
+    if count > max { count = max }
+    if count > o.*.height - y { count = o.*.height - y }
+    var i: usize = 0
+    while i < count {
+        if rows[i] != 0 { produceRow(o, y + i, rows[i]) }
+        i += 1
+    }
+    o.*.scanline += count
+    return count
+}
+
+// Skips COUNT rows (jpeg_skip_scanlines' result: the rows after are the
+// same as if they had been read).
+pub fn skipScanlines(o: *Output, count: usize) -> usize {
+    var left = count
+    if left > o.*.height - o.*.scanline { left = o.*.height - o.*.scanline }
+    const d = o.*.d
+    const target = o.*.scanline + left
+    while o.*.scanline < target {
+        const y = o.*.scanline
+        const needed = neededRow(o, y)
+        while d.*.outputIMCURow <= needed {
+            const status = decompress(o)
+            if status == read.SUSPENDED || status == read.FAILED { return count - left }
+        }
+        o.*.scanline += 1
+        left -= 1
+    }
+    return count
+}
+
+// jpeg_read_raw_data: the next iMCU row of each component's samples
+// (as the IDCT gives them, not upsampled) into the rows whose addresses
+// PLANES gives (component by component, `maxVSamp * 8` rows of each
+// component's `vSamp * 8`). The number of output rows it stands for, 0
+// when the data ran out.
+pub fn readRaw(o: *Output, planes: [*]usize) -> usize {
+    const d = o.*.d
+    const row = d.*.outputIMCURow
+    const status = decompress(o)
+    if status == read.SUSPENDED || status == read.FAILED { return 0 }
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        const c = &d.*.components[ci]
+        if c.*.needed {
+            const rows: [*]usize = unsafe { @ptrFromInt([*]usize, planes[ci]) }
+            const blockRows = blockRowsOf(d, ci, row)
+            var r: usize = 0
+            while r < blockRows * 8 {
+                zs.copy(rows[r], o.*.planes[ci] + (row * c.*.vSamp * 8 + r) * o.*.planeStride[ci], c.*.widthInBlocks * 8)
+                r += 1
+            }
+        }
+        ci += 1
+    }
+    const lines = d.*.maxVSamp * 8
+    o.*.scanline += lines
+    return lines
+}
+
+// jpeg_crop_scanline: decodes only the columns from *X on of the *WIDTH
+// asked, moved left to an iMCU boundary (both updated).
+pub fn crop(o: *Output, x: *usize, width: *usize) -> bool {
+    const d = o.*.d
+    if width.* == 0 || x.* + width.* > o.*.width { return read.fail(d, read.JERR_WIDTH_OVERFLOW) }
+    if width.* == o.*.width { return true }
+    var step = 8 * d.*.maxHSamp
+    if d.*.compsInScan == 1 && d.*.numComponents == 1 { step = 8 }
+    const asked = x.*
+    x.* = (asked / step) * step
+    width.* = width.* + asked - x.*
+    o.*.width = width.*
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        const c = &d.*.components[ci]
+        var hsf = c.*.hSamp
+        if d.*.compsInScan == 1 && d.*.numComponents == 1 { hsf = 1 }
+        const original = c.*.downsampledWidth
+        c.*.downsampledWidth = divRoundUp(o.*.width * c.*.hSamp, d.*.maxHSamp)
+        o.*.firstColumn[ci] = (x.* * hsf) / step
+        o.*.lastColumn[ci] = divRoundUp((x.* + o.*.width) * hsf, step) - 1
+        if c.*.downsampledWidth < 2 && original >= 2 {
+            // libjpeg chooses the upsampling again.
+            if !upsamplerSetup(o) { return false }
+        }
+        ci += 1
+    }
+    return true
+}
