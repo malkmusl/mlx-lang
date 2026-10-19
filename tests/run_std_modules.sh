@@ -34,6 +34,8 @@
 #                                       std.dbus's client (signals kept
 #                                       across a call, bus addresses) and
 #                                       std.spawn.find
+#   tests/370_http_headers_runtime.mlx  std.http.headers (libsoup's header
+#                                       lists, q-values and parameters)
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -76,6 +78,7 @@ run 358_timezone_names_runtime "zone abbreviations from rules and TZif files"
 run 359_linux_descriptors_runtime "pipes, epoll tokens, signalfd, timerfd, eventfd, poll, Unix sockets, SCM_RIGHTS, wait4"
 run 360_spawn_runtime "PATH lookup, captured output, exit statuses, moved descriptors, vfork, detach"
 run 361_dbus_keep_signals_runtime "a client against a child bus: a signal kept across a call with its descriptor; bus addresses; PATH lookup"
+run 370_http_headers_runtime "HTTP header lists, q-values, parameters (RFC 5987) read and written as libsoup does"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
