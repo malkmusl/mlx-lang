@@ -22,8 +22,14 @@
 #                          G_VALUE_LCOPY, g_alloca
 #       tests/options.c    GOptionContext and groups, gettext
 #       tests/network.c    addresses, a socket service, a client
-#       tests/tls.c        TLS certificates (PEM, DER, chains, keys),
-#                          GInitable, passwords, a backend without TLS
+#       tests/tls.c        TLS certificates (PEM, DER, chains, keys,
+#                          X.509 fields, verification), GInitable,
+#                          passwords, the backend and its databases
+#       tests/tls_handshake.c
+#                          TLS connections to openssl s_server (TLS 1.3
+#                          and 1.2, synchronous and asynchronous,
+#                          pollable reads, accept-certificate), when
+#                          openssl is installed
 #       tests/streams.c    input and output streams: memory, filter and
 #                          socket streams, synchronous and asynchronous,
 #                          splicing, pollable sources, GSimpleIOStream
@@ -75,6 +81,36 @@ for test in strings mainloop variant uri gobject system gio collect options netw
     diff -u "compiler/capi/glib/tests/$test.expected" "$work/$test.out" || { cat "$work/$test.err"; fail "tests/$test.c prints otherwise"; }
     echo "ok   tests/$test.c"
 done
+
+# TLS connections against OpenSSL's s_server on 127.0.0.1 (the
+# certificates of tools/tls-test/make_certs.sh, made anew): one server
+# for TLS 1.3, one for TLS 1.2 only, both choosing the suite themselves
+# and keeping no sessions, so that what GIO's GnuTLS backend did on the
+# same servers (tls_handshake.expected) is what is expected here.
+if ! command -v openssl > /dev/null; then
+    echo "skip tests/tls_handshake.c: no openssl"
+else
+    tools/tls-test/make_certs.sh "$work/certs"
+    port=$((20000 + RANDOM % 30000))
+    (cd "$work/certs" && exec openssl s_server -accept "$port" -cert p256.pem -key p256.key -cert_chain intermediate.pem -www -serverpref -num_tickets 0) > "$work/s13.log" 2>&1 &
+    tls13_server=$!
+    (cd "$work/certs" && exec openssl s_server -accept "$((port + 1))" -tls1_2 -cert rsa.pem -key rsa.key -cert_chain intermediate.pem -www -serverpref -no_ticket) > "$work/s12.log" 2>&1 &
+    tls12_server=$!
+    tries=0
+    while ! grep -q ACCEPT "$work/s13.log" 2> /dev/null || ! grep -q ACCEPT "$work/s12.log" 2> /dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 100 ] || { kill "$tls13_server" "$tls12_server"; fail "s_server did not start"; }
+        sleep 0.05
+    done
+    status=0
+    cc compiler/capi/glib/tests/tls_handshake.c -o "$work/tls_handshake" "$library" || { kill "$tls13_server" "$tls12_server"; fail "tests/tls_handshake.c does not build"; }
+    (cd "$work/run" && run timeout 120 "$work/tls_handshake" "$port" "$((port + 1))" "$work/certs") > "$work/tls_handshake.out" 2> "$work/tls_handshake.err" || status=$?
+    echo "exit $status" >> "$work/tls_handshake.out"
+    kill "$tls13_server" "$tls12_server" 2> /dev/null || true
+    wait "$tls13_server" "$tls12_server" 2> /dev/null || true
+    diff -u compiler/capi/glib/tests/tls_handshake.expected "$work/tls_handshake.out" || { cat "$work/tls_handshake.err"; fail "tests/tls_handshake.c prints otherwise"; }
+    echo "ok   tests/tls_handshake.c"
+fi
 
 webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
 generated=mlx-out/webkit/generated
