@@ -63,6 +63,20 @@ CA bundle) and hostnames (RFC 6125). `tls.mlx` (`std.tls`, with
 against `openssl s_server`, and tests 362 to 364 check the rest against
 the standards' vectors.
 
+`http/` (`std.http.*`) is HTTP's pieces that do not depend on how bytes
+move, written to answer as libsoup does for mlx-soup
+(compiler/capi/soup): `http/headers.mlx` (header lists, tokens,
+q-values, parameters with RFC 5987's form, the names libsoup knows),
+`http/date.mlx` (HTTP's and cookies' date forms), `http/cookie.mlx`
+(Set-Cookie's syntax, RFC 6265), `http/status.mlx` (reason phrases),
+`http/form.mlx` (application/x-www-form-urlencoded),
+`http/chunked.mlx` (the chunked coding's size lines),
+`http/sniff.mlx` (MIME sniffing, the WHATWG standard's rules),
+`http/websocket.mlx` (RFC 6455's keys, frame headers, masking, UTF-8)
+and `http/psl.mlx` with `http/psldata.mlx` (the Public Suffix List, made
+by `./mlx build http-psl` from `std/registry/publicsuffix`). Tests 370
+and 371 check them.
+
 `crypt.mlx` (`std.crypt`) checks a password against the hashes of
 `/etc/shadow`, as crypt(3) writes them: `crypt/yescrypt.mlx` for the
 yescrypt ($y$, Ubuntu's default) and scrypt ($7$) ones,
