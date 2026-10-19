@@ -32,10 +32,17 @@ public:
     unsigned schedule(Set<Activity> a = defaultActivities) { return a.toRaw(); }
 };
 
+// (A name that is no enumerator still fails: ColorTypes.h's
+// HasComponentTypeMember of an enum.)
+template<typename, typename = void> inline constexpr bool HasComponentType = false;
+template<typename T> inline constexpr bool HasComponentType<T, std::void_t<typename T::ComponentType>> = true;
+struct Colored { using ComponentType = float; };
+
 int main(int argc, char **argv)
 {
     Observer o;
     constexpr Set local = { Observer::Activity::Entry, Observer::Activity::Exit };
     printf("%u %u\n", o.schedule(), local.toRaw());
+    printf("%d %d\n", (int)HasComponentType<RL::Activity>, (int)HasComponentType<Colored>);
     return argc;
 }
