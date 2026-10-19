@@ -55,6 +55,14 @@ pub fn conversionRank(from: usize, to: usize) -> i64 {
         const constTarget = types.isConst(target) || (types.kind(target) == types.ARRAY && types.isConst(types.baseOf(target)))
         if types.kind(to) == types.REF && !types.isRvalueReference(to) && !constTarget { return 0 }
         if cpp.isClassType(plain) {
+            // (A designated list makes a class with that member only:
+            // MetaConsumer's `consume(range, state, { .overrideParserMode
+            // = m })` takes it as the options, not CSSCalcSymbolsAllowed.)
+            const designator = cpp.bracedDesignator(from)
+            if designator != 0 {
+                const completed = cpp.completeIfNeeded(plain)
+                if findMember(plain, designator) == 0 { return 0 }
+            }
             if !cpp.bracedMayConstructWith(plain, count, element, types.at(from).*.bracedSecond) { return 0 }
             return 2
         }
@@ -110,7 +118,12 @@ pub fn conversionRank(from: usize, to: usize) -> i64 {
         // A derived class to its base; another type through a
         // converting constructor.
         if cpp.isBaseOf(target, from) { return 2 }
-        if cpp.isClassType(from) && cpp.implicitConversionTo(from, target) != 0 { return 1 }
+        // (A constructor's argument weighed for a conversion through it
+        // takes no conversion of its own: one user-defined conversion at
+        // most. WTF's WeakHashSet::add(WeakRef<T> &&) took a Ref<T> so,
+        // through WeakRef(const T &) and Ref's operator T &, before
+        // add(const T &).)
+        if cpp.isClassType(from) && !cpp.userConversion && cpp.implicitConversionTo(from, target) != 0 { return 1 }
         if cpp.convertible(from, target) { return 1 }
         return 0
     }
@@ -120,7 +133,7 @@ pub fn conversionRank(from: usize, to: usize) -> i64 {
         // `std::min<long>(limit, strictNumeric)`, a lambda to `const
         // Callback &`).
         if types.isReference(to) && !types.isConst(target) && !types.isRvalueReference(to) { return 0 }
-        if cpp.implicitConversionTo(from, target) != 0 { return 1 }
+        if !cpp.userConversion && cpp.implicitConversionTo(from, target) != 0 { return 1 }
         return 0
     }
     const fk = types.kind(from)
@@ -401,6 +414,37 @@ pub fn constBindings(candidate: usize, args: usize, count: usize) -> i64 {
     return n
 }
 
+// Of the candidates `a` and `b`, which binds the call's modifiable
+// lvalues to references with less const ([over.ics.rank]: `f(T &)`
+// over `f(const T &)`, both references): 1 for `a`, -1 for `b`, 0 for
+// neither (or each for some).
+pub fn constBindingOrder(a: usize, b: usize, args: usize, count: usize) -> i64 {
+    var p = types.at(ast.obj(a).*.ty).*.params
+    var q = types.at(ast.obj(b).*.ty).*.params
+    if p != 0 && types.param(p).*.name == names.K_THIS { p = types.param(p).*.next }
+    if q != 0 && types.param(q).*.name == names.K_THIS { q = types.param(q).*.next }
+    var aBetter = false
+    var bBetter = false
+    var index: usize = 0
+    while p != 0 && q != 0 && index < count {
+        const pt = types.param(p).*.ty
+        const qt = types.param(q).*.ty
+        const arg = base.getWord(args + index * 8)
+        if types.kind(pt) == types.REF && types.kind(qt) == types.REF && !isRvalueArgument(arg) && !constLvalue(arg) {
+            const pConst = types.isConst(types.referenced(pt))
+            const qConst = types.isConst(types.referenced(qt))
+            if !pConst && qConst { aBetter = true }
+            if pConst && !qConst { bBetter = true }
+        }
+        p = types.param(p).*.next
+        q = types.param(q).*.next
+        index += 1
+    }
+    if aBetter && !bBetter { return 1 }
+    if bBetter && !aBetter { return -1 }
+    return 0
+}
+
 // Whether the lvalue `n` is const: of a const type, or a member of a
 // const object (`a.head` of `const tuple &a`), or read through a
 // pointer or reference to const.
@@ -603,6 +647,12 @@ pub fn baseDistance(candidate: usize, args: usize, count: usize) -> i64 {
         index += 1
     }
     return total
+}
+
+// Whether the function's first parameter is its object's (`this`).
+fn takesThis(f: usize) -> bool {
+    const p = types.at(ast.obj(f).*.ty).*.params
+    return p != 0 && types.param(p).*.name == names.K_THIS
 }
 
 // The fewest derivation steps from the class `from` to its base `to`.
@@ -1552,6 +1602,20 @@ fn boundInsideClass(binding: usize) -> bool {
 // SFINAE: an expression that cannot be read (in a requires
 // expression, a constraint, an instance's signature) marks the
 // candidate as not viable and stands as 0.
+// At `T::~T` or `C<A, B>::~C` after a member access (`thisObject->
+// JSDOMIteratorBase<JSWrapper, IteratorTraits>::~JSDOMIteratorBase()`
+// of WebCore's): the `~` after the class named; 0 for none.
+fn destructorQualifier() -> usize {
+    if !standard.cpp || !cursor.isIdent() { return 0 }
+    var t = cursor.peekNext()
+    if tokens.is(t, names.P_LT) {
+        t = template.endOfArguments(t)
+        if t == 0 { return 0 }
+    }
+    if !tokens.is(t, names.P_SCOPE) || !tokens.is(tokens.next(t), names.P_TILDE) { return 0 }
+    return tokens.next(t)
+}
+
 fn softFailure(token: usize) -> usize {
     decl.sfinaeFailed = true
     return ast.number(0, token)
@@ -1687,10 +1751,8 @@ fn postfix() -> usize {
             // `x.template get<T>()`: the keyword passed over.
             const markedDot = standard.cpp && cursor.consume(names.K_TEMPLATE)
             // `x.T::~T()`: the destructor named with its class.
-            if standard.cpp && cursor.isIdent() && cursor.isToken(cursor.peekNext(), names.P_SCOPE) && tokens.is(tokens.next(cursor.peekNext()), names.P_TILDE) {
-                cursor.advance()
-                cursor.advance()
-            }
+            const afterQualifier = destructorQualifier()
+            if afterQualifier != 0 { cursor.restore(afterQualifier) }
             if standard.cpp && cursor.is(names.P_TILDE) {
                 n = cpp.explicitDestructor(ast.unary(ast.ADDR, n, token), token)
             } else if standard.cpp && cursor.is(names.K_OPERATOR) {
@@ -1714,10 +1776,8 @@ fn postfix() -> usize {
             typing.addType(n)
             if standard.cpp && cpp.isClassType(ast.typeOf(n)) { n = cpp.arrowOperator(n, token) }
             const markedArrow = standard.cpp && cursor.consume(names.K_TEMPLATE)
-            if standard.cpp && cursor.isIdent() && cursor.isToken(cursor.peekNext(), names.P_SCOPE) && tokens.is(tokens.next(cursor.peekNext()), names.P_TILDE) {
-                cursor.advance()
-                cursor.advance()
-            }
+            const afterQualifier = destructorQualifier()
+            if afterQualifier != 0 { cursor.restore(afterQualifier) }
             if standard.cpp && cursor.is(names.P_TILDE) {
                 n = cpp.explicitDestructor(n, token)
             } else if standard.cpp && cursor.is(names.K_OPERATOR) {
@@ -2428,7 +2488,7 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
                 template.objectRvalue = objectIsRvalue(object)
             }
         }
-        const instance = template.candidateInstanceWith(holder.*.template, holder.*.adlTemplates, givenArgs, givenCount, holder.*.templateArgs)
+        const instance = if holder.*.baseTemplates != 0 { template.candidateInstanceAcross(holder.*.template, holder.*.baseTemplates, givenArgs, givenCount, holder.*.templateArgs) } else { template.candidateInstanceWith(holder.*.template, holder.*.adlTemplates, givenArgs, givenCount, holder.*.templateArgs) }
         template.objectConstness = outerConst
         template.objectRvalue = outerRvalue
         var chosen = instance
@@ -2445,7 +2505,11 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
             }
             candidate = ast.obj(candidate).*.nextOverload
         }
-        if plain != 0 && plainScore >= score { chosen = plain }
+        // (Alike otherwise, the nearer base is the better conversion before
+        // a function wins over a template: `test(Base<Args...> *)` over
+        // `test(void *)` for a derived class, WTF's IsBaseOfTemplate.)
+        const nearerInstance = instance != 0 && plain != 0 && plainScore == score && !takesThis(instance) && !takesThis(plain) && baseDistance(instance, givenArgs, givenCount) < baseDistance(plain, givenArgs, givenCount)
+        if plain != 0 && plainScore >= score && !nearerInstance { chosen = plain }
         // (No instance, no function weighed as fitting here: the
         // functions of the name, chosen among below with every
         // conversion, `set->add(this)` to a base's pointer.)
@@ -2871,10 +2935,13 @@ fn primary() -> usize {
             if !cursor.is(names.P_LBRACE) { return sizeOfType(ty, token) }
             cursor.restore(start)
         }
+        // (Its temporaries dropped, as decltype's.)
+        const pending = state.takeTemporaries()
         unevaluated += 1
         const n = unary()
         typing.addType(n)
         unevaluated -= 1
+        state.setTemporaries(pending)
         return sizeOfType(ast.typeOf(n), token)
     }
     if cursor.consume(names.K_ALIGNOF) || cursor.consume(names.K_GNU2_ALIGNOF) {
@@ -2925,9 +2992,11 @@ fn primary() -> usize {
         if cursor.consume(names.K_NOEXCEPT) {
             // `noexcept(e)`: true (nothing throws here).
             cursor.expect(names.P_LPAREN)
+            const pending = state.takeTemporaries()
             unevaluated += 1
             const ignored = expression()
             unevaluated -= 1
+            state.setTemporaries(pending)
             cursor.expect(names.P_RPAREN)
             const n = ast.number(1, token)
             ast.node(n).*.ty = types.boolOf()
@@ -3127,7 +3196,13 @@ fn primary() -> usize {
                 // cursor has it: the name may be a copy, without a next.)
                 const after = template.endOfArguments(cursor.peek())
                 if after != 0 && tokens.is(after, names.P_LPAREN) {
-                    return ast.variableNode(template.explicitPlaceholder(binding), nameToken)
+                    // (Unqualified, argument-dependent lookup joins the
+                    // templates of the arguments' namespaces: `using
+                    // std::get; get<I>(tupleLike)` of WTF::apply finds
+                    // WebCore's get.)
+                    const placeholder = ast.variableNode(template.explicitPlaceholder(binding), nameToken)
+                    if nameToken == token { unqualifiedCallee = placeholder }
+                    return placeholder
                 }
                 const instance = template.explicitFunction(binding)
                 return variableValue(instance, nameToken)
