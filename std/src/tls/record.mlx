@@ -1,0 +1,268 @@
+// std.tls.record: protecting TLS records with the AEADs of the cipher
+// suites, as TLS 1.3 (RFC 8446, 5.2 and 5.3) and TLS 1.2 (RFC 5288 for
+// AES-GCM, RFC 7905 for ChaCha20-Poly1305) frame them.
+//
+// TLS 1.3: the content type goes inside the encryption, after the data;
+// the outer record says application_data; the nonce is the IV XORed
+// with the record's sequence number; the AAD is the record's header.
+// TLS 1.2 with AES-GCM: the nonce is four bytes of IV and eight sent
+// before the ciphertext (the sequence number here); with ChaCha20 it is
+// the IV XORed with the sequence number, as in 1.3. The AAD is the
+// sequence number, type, version and plaintext length.
+
+const gcm = @import("../crypto/gcm.mlx")
+const chacha = @import("../crypto/chacha.mlx")
+
+pub const Cipher = enum(u8) {
+    aes128Gcm,
+    aes256Gcm,
+    chacha20Poly1305,
+}
+
+pub const HEADER: usize = 5
+pub const TAG: usize = 16
+// The largest plaintext of a record.
+pub const MAX_PLAINTEXT: usize = 16384
+
+pub const Protection = struct {
+    active: bool
+    tls13: bool
+    cipher: Cipher
+    aes: gcm.Gcm
+    key: [32]u8
+    iv: [12]u8
+    sequence: u64
+}
+
+pub fn keyLength(cipher: Cipher) -> usize {
+    return match cipher {
+        Cipher.aes128Gcm => 16,
+        Cipher.aes256Gcm => 32,
+        Cipher.chacha20Poly1305 => 32,
+    }
+}
+
+// The IV's length as the key block of TLS 1.2 gives it (the implicit
+// part); TLS 1.3's is always 12.
+pub fn implicitIvLength(cipher: Cipher, tls13: bool) -> usize {
+    if tls13 || cipher == Cipher.chacha20Poly1305 { return 12 }
+    return 4
+}
+
+pub fn clear(protection: *Protection) -> void {
+    protection.*.active = false
+    protection.*.sequence = 0
+}
+
+// Keys for one direction; `iv` has implicitIvLength bytes.
+pub fn install(protection: *Protection, cipher: Cipher, tls13: bool, key: [*]const u8, iv: [*]const u8) -> void {
+    if protection.*.active { wipe(protection) }
+    protection.*.cipher = cipher
+    protection.*.tls13 = tls13
+    const length = keyLength(cipher)
+    var index: usize = 0
+    while index < 32 {
+        protection.*.key[index] = if index < length { key[index] } else { 0 }
+        index += 1
+    }
+    const ivLength = implicitIvLength(cipher, tls13)
+    index = 0
+    while index < 12 {
+        protection.*.iv[index] = if index < ivLength { iv[index] } else { 0 }
+        index += 1
+    }
+    if cipher != Cipher.chacha20Poly1305 {
+        const ok = gcm.init(&protection.*.aes, key, length)
+    }
+    protection.*.sequence = 0
+    protection.*.active = true
+}
+
+pub fn wipe(protection: *Protection) -> void {
+    if protection.*.active && protection.*.cipher != Cipher.chacha20Poly1305 { gcm.finish(&protection.*.aes) }
+    var index: usize = 0
+    while index < 32 {
+        protection.*.key[index] = 0
+        index += 1
+    }
+    index = 0
+    while index < 12 {
+        protection.*.iv[index] = 0
+        index += 1
+    }
+    protection.*.active = false
+}
+
+// The per-record nonce: the IV XORed with the sequence number (TLS 1.3,
+// and ChaCha20 in 1.2), or the IV's four bytes and the sequence number
+// (AES-GCM in 1.2).
+fn nonceOf(protection: *Protection, nonce: [*]u8) -> void {
+    const sequence = protection.*.sequence
+    var index: usize = 0
+    while index < 12 {
+        nonce[index] = protection.*.iv[index]
+        index += 1
+    }
+    index = 0
+    while index < 8 {
+        const byte = @intCast(u8, (sequence >> (56 - 8 * @intCast(u64, index))) & 255)
+        if !protection.*.tls13 && protection.*.cipher != Cipher.chacha20Poly1305 {
+            nonce[4 + index] = byte
+        } else {
+            nonce[4 + index] = nonce[4 + index] ^ byte
+        }
+        index += 1
+    }
+}
+
+fn sealWith(protection: *Protection, nonce: [*]const u8, aad: []const u8, data: [*]u8, length: usize, tag: [*]u8) -> void {
+    if protection.*.cipher == Cipher.chacha20Poly1305 {
+        const key: [*]const u8 = &protection.*.key
+        chacha.seal(key, nonce, aad, data, length, data, tag)
+    } else {
+        gcm.seal(&protection.*.aes, nonce, aad, data, length, data, tag)
+    }
+}
+
+fn openWith(protection: *Protection, nonce: [*]const u8, aad: []const u8, data: [*]u8, length: usize, tag: [*]const u8) -> bool {
+    if protection.*.cipher == Cipher.chacha20Poly1305 {
+        const key: [*]const u8 = &protection.*.key
+        return chacha.open(key, nonce, aad, data, length, tag, data)
+    }
+    return gcm.open(&protection.*.aes, nonce, aad, data, length, tag, data)
+}
+
+// How many bytes a record of `length` plaintext bytes takes, header
+// included.
+pub fn sealedLength(protection: *Protection, length: usize) -> usize {
+    if !protection.*.active { return HEADER + length }
+    if protection.*.tls13 { return HEADER + length + 1 + TAG }
+    if protection.*.cipher == Cipher.chacha20Poly1305 { return HEADER + length + TAG }
+    return HEADER + 8 + length + TAG
+}
+
+fn putHeader(out: [*]u8, contentType: u8, length: usize) -> void {
+    out[0] = contentType
+    out[1] = 3
+    out[2] = 3
+    out[3] = @intCast(u8, (length >> 8) & 255)
+    out[4] = @intCast(u8, length & 255)
+}
+
+// A record of `contentType` with `length` bytes of `plain` into `out`
+// (room for sealedLength): the bytes written. Unprotected while no keys
+// are installed.
+pub fn seal(protection: *Protection, contentType: u8, plain: [*]const u8, length: usize, out: [*]u8) -> usize {
+    if !protection.*.active {
+        putHeader(out, contentType, length)
+        var index: usize = 0
+        while index < length {
+            out[HEADER + index] = plain[index]
+            index += 1
+        }
+        return HEADER + length
+    }
+    var nonce: [12]u8 = undefined
+    const n: [*]u8 = &nonce
+    nonceOf(protection, n)
+    var total: usize = 0
+    if protection.*.tls13 {
+        const inner = length + 1
+        putHeader(out, 23, inner + TAG)
+        const body = out + HEADER
+        var index: usize = 0
+        while index < length {
+            body[index] = plain[index]
+            index += 1
+        }
+        body[length] = contentType
+        sealWith(protection, n, out[0..HEADER], body, inner, body + inner)
+        total = HEADER + inner + TAG
+    } else {
+        var additional: [13]u8 = undefined
+        const aad: [*]u8 = &additional
+        var index: usize = 0
+        while index < 8 {
+            additional[index] = @intCast(u8, (protection.*.sequence >> (56 - 8 * @intCast(u64, index))) & 255)
+            index += 1
+        }
+        putHeader(aad + 8, contentType, length)
+        var explicit: usize = 8
+        if protection.*.cipher == Cipher.chacha20Poly1305 { explicit = 0 }
+        putHeader(out, contentType, explicit + length + TAG)
+        index = 0
+        while index < explicit {
+            out[HEADER + index] = nonce[4 + index]
+            index += 1
+        }
+        const body = out + HEADER + explicit
+        index = 0
+        while index < length {
+            body[index] = plain[index]
+            index += 1
+        }
+        sealWith(protection, n, aad[0..13], body, length, body + length)
+        total = HEADER + explicit + length + TAG
+    }
+    protection.*.sequence += 1
+    return total
+}
+
+// Opens the record whose header is at `record` and whose body follows it
+// (`length` bytes), in place: the plaintext's offset from `record` into
+// `start`, its length into `plainLength`, its type into `contentType`.
+// False when it does not open (a forgery, or the wrong keys), or is too
+// long.
+pub fn open(protection: *Protection, record: [*]u8, length: usize, start: *usize, plainLength: *usize, contentType: *u8) -> bool {
+    const outerType = record[0]
+    if !protection.*.active {
+        if length > MAX_PLAINTEXT { return false }
+        start.* = HEADER
+        plainLength.* = length
+        contentType.* = outerType
+        return true
+    }
+    var nonce: [12]u8 = undefined
+    const n: [*]u8 = &nonce
+    nonceOf(protection, n)
+    const body = record + HEADER
+    if protection.*.tls13 {
+        if outerType != 23 || length < TAG + 1 || length > MAX_PLAINTEXT + 256 { return false }
+        const sealedLength = length - TAG
+        if !openWith(protection, n, record[0..HEADER], body, sealedLength, body + sealedLength) { return false }
+        // The type is the last non-zero byte; zeroes after it are padding.
+        var end = sealedLength
+        while end > 0 && body[end - 1] == 0 { end -= 1 }
+        if end == 0 { return false }
+        contentType.* = body[end - 1]
+        start.* = HEADER
+        plainLength.* = end - 1
+        if end - 1 > MAX_PLAINTEXT { return false }
+    } else {
+        var explicit: usize = 8
+        if protection.*.cipher == Cipher.chacha20Poly1305 { explicit = 0 }
+        if length < explicit + TAG { return false }
+        const plain = length - explicit - TAG
+        if plain > MAX_PLAINTEXT { return false }
+        var index: usize = 0
+        while index < explicit {
+            nonce[4 + index] = body[index]
+            index += 1
+        }
+        var additional: [13]u8 = undefined
+        const aad: [*]u8 = &additional
+        index = 0
+        while index < 8 {
+            additional[index] = @intCast(u8, (protection.*.sequence >> (56 - 8 * @intCast(u64, index))) & 255)
+            index += 1
+        }
+        putHeader(aad + 8, outerType, plain)
+        const data = body + explicit
+        if !openWith(protection, n, aad[0..13], data, plain, data + plain) { return false }
+        contentType.* = outerType
+        start.* = HEADER + explicit
+        plainLength.* = plain
+    }
+    protection.*.sequence += 1
+    return true
+}

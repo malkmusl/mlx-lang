@@ -45,7 +45,23 @@ on: whether a descriptor is one, its size, raw mode and the foreground
 process group.
 `sha1.mlx` (`std.sha1`) has SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1, and
 `aes.mlx` (`std.aes`) AES-128 on blocks and the RFC 3394 key wrap: what
-WPA2 needs (`tools/check_wifi.sh`).
+WPA2 needs (`tools/check_wifi.sh`); and AES-128/192/256 bitsliced in
+constant time, four blocks at once, for TLS.
+
+`crypto/` (`std.crypto.*`) is what TLS and WebCrypto compute with, all
+in Mlx and constant time where a secret is involved: `crypto/hash.mlx`
+(SHA-1/2 behind one state, HMAC, HKDF), `crypto/gcm.mlx` (AES-GCM),
+`crypto/chacha.mlx` (ChaCha20, Poly1305, their AEAD),
+`crypto/bignum.mlx` (Montgomery arithmetic up to 4096 bits),
+`crypto/rsa.mlx` (PKCS #1 v1.5 and PSS verification), `crypto/ecc.mlx`
+(P-256 and P-384: ECDSA, ECDH) and `crypto/curve25519.mlx` (X25519,
+Ed25519). `asn1.mlx` (`std.asn1`) reads DER; `x509.mlx` (`std.x509`)
+parses certificates, verifies chains against a trust store (the system's
+CA bundle) and hostnames (RFC 6125). `tls.mlx` (`std.tls`, with
+`tls/record.mlx`, `tls/schedule.mlx`, `tls/wire.mlx`) is a TLS 1.3 and
+1.2 client that does no I/O of its own; `tools/check_tls.sh` runs it
+against `openssl s_server`, and tests 362 to 364 check the rest against
+the standards' vectors.
 
 `crypt.mlx` (`std.crypt`) checks a password against the hashes of
 `/etc/shadow`, as crypt(3) writes them: `crypt/yescrypt.mlx` for the

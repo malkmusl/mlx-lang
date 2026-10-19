@@ -1,0 +1,1597 @@
+// std.tls: a TLS client, TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246) with
+// ECDHE, in Mlx on std.crypto and std.x509. What HTTPS needs of it:
+//
+//   - key exchange: X25519, P-256 and P-384 (a HelloRetryRequest for the
+//     latter two in TLS 1.3, ECDHE in TLS 1.2);
+//   - ciphers: AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 (TLS 1.3's
+//     three suites; ECDHE-ECDSA and ECDHE-RSA with each in TLS 1.2);
+//   - signatures: RSA-PSS, RSA PKCS #1 v1.5 (TLS 1.2 and certificates),
+//     ECDSA on P-256 and P-384, Ed25519;
+//   - SNI, ALPN, the extended master secret of TLS 1.2 (RFC 7627), secure
+//     renegotiation's empty indication (renegotiation itself is refused),
+//     KeyUpdate, close_notify;
+//   - the server's chain checked against a trust store and its name
+//     (std.x509), the result reported with GIO's flags, and the
+//     handshake paused for the caller to accept or refuse a chain that
+//     did not verify.
+//
+// No session resumption, no 0-RTT, no client certificates (an empty one
+// is sent when a server asks).
+//
+// The engine does no I/O itself: bytes from the network are given to it,
+// and what it has to send is taken from it, so that any transport can
+// carry it (GIO's streams, a socket, a pipe in a test):
+//
+//     var client: tls.Client = undefined
+//     tls.clientInit(&client, allocator)
+//     tls.setServerName(&client, "example.com")
+//     tls.setAlpn(&client, "\x08http/1.1")          // the wire list
+//     tls.setTrustStore(&client, &store)
+//     tls.start(&client)
+//     loop:
+//         send tls.pendingOutput(&client), then tls.outputSent(&client, n)
+//         put received bytes in with tls.feed(&client, bytes, n)
+//         match tls.process(&client): handshaking (more input), connected,
+//             checkCertificate (look at peerFlags, then
+//             tls.acceptCertificate(&client, yes)), closed, failed
+//     tls.write(&client, data, n)   tls.read(&client, out, room)
+//     tls.close(&client)            tls.clientFree(&client)
+//
+// tls.handshake, tls.send and tls.receive do the same over a pair of
+// blocking read and write functions.
+
+const std = @import("std")
+const hash = @import("./crypto/hash.mlx")
+const curve25519 = @import("./crypto/curve25519.mlx")
+const ecc = @import("./crypto/ecc.mlx")
+const random = @import("./random.mlx")
+const x509 = @import("./x509.mlx")
+const record = @import("./tls/record.mlx")
+const wire = @import("./tls/wire.mlx")
+const schedule = @import("./tls/schedule.mlx")
+const allocator_module = @import("../bootstrap/allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const VERSION_12: u64 = 771
+pub const VERSION_13: u64 = 772
+
+// The named groups and signature schemes of the registry.
+pub const GROUP_SECP256R1: u64 = 23
+pub const GROUP_SECP384R1: u64 = 24
+pub const GROUP_X25519: u64 = 29
+
+pub const State = enum(u8) {
+    // The handshake goes on: more input is wanted (send the output).
+    handshaking,
+    // Paused: the server's chain did not verify (peerFlags says how);
+    // acceptCertificate goes on or stops.
+    checkCertificate,
+    connected,
+    // The server closed the connection (close_notify).
+    closed,
+    failed,
+}
+
+// Why a connection failed.
+pub const Failure = enum(u8) {
+    none,
+    // A message that is not TLS, or not what the protocol allows there.
+    protocol,
+    // The server chose what was not offered, or nothing in common.
+    handshake,
+    // A record that did not open: the keys or the data are wrong.
+    badRecord,
+    // A signature or Finished that did not verify.
+    badSignature,
+    // The chain was refused by the caller (or could not be read).
+    badCertificate,
+    // The server sent a fatal alert (peerAlert says which).
+    alertReceived,
+    // Memory, or the system's random numbers.
+    internal,
+    // The transport ended before close_notify.
+    eof,
+}
+
+const Phase = enum(u8) {
+    idle,
+    serverHello,
+    encryptedExtensions,
+    certificate13,
+    certificateVerify13,
+    finished13,
+    certificate12,
+    serverKeyExchange12,
+    serverHelloDone12,
+    changeCipherSpec12,
+    finished12,
+    done,
+}
+
+const INPUT_SIZE: usize = 20480
+const OUTPUT_SIZE: usize = 36864
+const MAX_HANDSHAKE: usize = 262144
+const MAX_PEERS: usize = 10
+
+pub const Client = struct {
+    allocator: Allocator
+    host: [256]u8
+    hostLength: usize
+    alpn: [128]u8
+    alpnLength: usize
+    store: *x509.TrustStore
+    hasStore: bool
+    maxVersion: u64
+    // A time to verify at instead of the clock (0: the clock).
+    time: i64
+
+    state: State
+    phase: Phase
+    failure: Failure
+    peerAlert: u64
+    version: u64
+    suite: u64
+    cipher: record.Cipher
+    algorithm: hash.Algorithm
+    transcript: hash.Hash
+    transcribing: bool
+    clientRandom: [32]u8
+    serverRandom: [32]u8
+    sessionId: [32]u8
+    x25519Private: [32]u8
+    ecPrivate: [48]u8
+    ecGroup: u64
+    group: u64
+    retried: bool
+    // The first ClientHello until the server's choice of hash is known.
+    hello: [*]u8
+    helloLength: usize
+    cookie: [*]u8
+    cookieLength: usize
+    handshakeSecret: [64]u8
+    masterSecret: [64]u8
+    clientSecret: [64]u8
+    serverSecret: [64]u8
+    readKeys: record.Protection
+    writeKeys: record.Protection
+    sentChangeCipherSpec: bool
+    extendedMasterSecret: bool
+    renegotiationInfo: bool
+    certificateRequested: bool
+    requestContext: [256]u8
+    requestContextLength: usize
+    // TLS 1.2's server key share.
+    peerGroup: u64
+    peerShare: [133]u8
+    peerShareLength: usize
+
+    input: [*]u8
+    inputLength: usize
+    output: [*]u8
+    outputLength: usize
+    handshake: [*]u8
+    handshakeLength: usize
+    handshakeCapacity: usize
+    // Application data opened in the input: where and how much is left,
+    // and where its record ends.
+    dataStart: usize
+    dataLength: usize
+    dataRecordEnd: usize
+
+    // The server's chain: the DER of each certificate one after another,
+    // and each parsed over it.
+    chain: [*]u8
+    chainLength: usize
+    chainCapacity: usize
+    peers: [10]x509.Certificate
+    peerCount: usize
+    peerFlags: u32
+    alpnChosen: [256]u8
+    alpnChosenLength: usize
+    closeSent: bool
+    // The secrets in the NSS key log format (SSLKEYLOGFILE), for tools
+    // that decrypt a capture and for comparing with the server's.
+    keyLog: [1024]u8
+    keyLogLength: usize
+}
+
+// ---------------------------------------------------------------------------
+// Setting up.
+
+// A client with its buffers from `allocator`; false when memory ran out.
+pub fn clientInit(client: *Client, allocator: Allocator) -> bool {
+    client.*.allocator = allocator
+    client.*.hostLength = 0
+    client.*.alpnLength = 0
+    client.*.hasStore = false
+    client.*.maxVersion = VERSION_13
+    client.*.time = 0
+    client.*.state = State.handshaking
+    client.*.phase = Phase.idle
+    client.*.failure = Failure.none
+    client.*.peerAlert = 0
+    client.*.version = 0
+    client.*.suite = 0
+    client.*.transcribing = false
+    client.*.ecGroup = 0
+    client.*.group = 0
+    client.*.retried = false
+    client.*.helloLength = 0
+    client.*.cookieLength = 0
+    client.*.sentChangeCipherSpec = false
+    client.*.extendedMasterSecret = false
+    client.*.renegotiationInfo = false
+    client.*.certificateRequested = false
+    client.*.requestContextLength = 0
+    client.*.peerShareLength = 0
+    client.*.inputLength = 0
+    client.*.outputLength = 0
+    client.*.handshakeLength = 0
+    client.*.handshakeCapacity = 0
+    client.*.dataStart = 0
+    client.*.dataLength = 0
+    client.*.dataRecordEnd = 0
+    client.*.chainLength = 0
+    client.*.chainCapacity = 0
+    client.*.peerCount = 0
+    client.*.peerFlags = 0
+    client.*.alpnChosenLength = 0
+    client.*.closeSent = false
+    client.*.keyLogLength = 0
+    record.clear(&client.*.readKeys)
+    record.clear(&client.*.writeKeys)
+    const input = allocator.alloc(INPUT_SIZE, 16)
+    if input == null { return false }
+    client.*.input = input.?
+    const output = allocator.alloc(OUTPUT_SIZE, 16)
+    if output == null {
+        allocator.free(client.*.input, INPUT_SIZE, 16)
+        return false
+    }
+    client.*.output = output.?
+    return true
+}
+
+// The name the server is asked for (SNI) and checked against; an address
+// is checked but not sent.
+pub fn setServerName(client: *Client, name: []const u8) -> void {
+    var length = name.length
+    if length > 255 { length = 255 }
+    var index: usize = 0
+    while index < length {
+        client.*.host[index] = name[index]
+        index += 1
+    }
+    client.*.hostLength = length
+}
+
+// The protocols offered (ALPN), as the extension lists them: each name
+// after its length byte ("\x02h2\x08http/1.1").
+pub fn setAlpn(client: *Client, list: []const u8) -> void {
+    var length = list.length
+    if length > 128 { length = 0 }
+    var index: usize = 0
+    while index < length {
+        client.*.alpn[index] = list[index]
+        index += 1
+    }
+    client.*.alpnLength = length
+}
+
+// The anchors chains are verified against; without one, every chain
+// is of an unknown authority (and checkCertificate asks about it).
+pub fn setTrustStore(client: *Client, store: *x509.TrustStore) -> void {
+    client.*.store = store
+    client.*.hasStore = true
+}
+
+// TLS 1.2 at most (to try a server that fails with TLS 1.3).
+pub fn setMaxVersion(client: *Client, version: u64) -> void {
+    client.*.maxVersion = version
+}
+
+pub fn clientFree(client: *Client) -> void {
+    record.wipe(&client.*.readKeys)
+    record.wipe(&client.*.writeKeys)
+    hash.wipe(&client.*.handshakeSecret, 64)
+    hash.wipe(&client.*.masterSecret, 64)
+    hash.wipe(&client.*.clientSecret, 64)
+    hash.wipe(&client.*.serverSecret, 64)
+    hash.wipe(&client.*.x25519Private, 32)
+    hash.wipe(&client.*.ecPrivate, 48)
+    client.*.allocator.free(client.*.input, INPUT_SIZE, 16)
+    client.*.allocator.free(client.*.output, OUTPUT_SIZE, 16)
+    if client.*.handshakeCapacity > 0 { client.*.allocator.free(client.*.handshake, client.*.handshakeCapacity, 16) }
+    if client.*.chainCapacity > 0 { client.*.allocator.free(client.*.chain, client.*.chainCapacity, 16) }
+    if client.*.helloLength > 0 { client.*.allocator.free(client.*.hello, client.*.helloLength, 16) }
+    if client.*.cookieLength > 0 { client.*.allocator.free(client.*.cookie, client.*.cookieLength, 16) }
+    client.*.handshakeCapacity = 0
+    client.*.chainCapacity = 0
+    client.*.helloLength = 0
+    client.*.cookieLength = 0
+}
+
+// ---------------------------------------------------------------------------
+// What the caller learns.
+
+pub fn negotiatedVersion(client: *Client) -> u64 {
+    return client.*.version
+}
+
+pub fn cipherSuite(client: *Client) -> u64 {
+    return client.*.suite
+}
+
+// The IANA name of the suite ("TLS_AES_128_GCM_SHA256").
+pub fn cipherSuiteName(suite: u64) -> []const u8 {
+    return match suite {
+        4865 => "TLS_AES_128_GCM_SHA256",
+        4866 => "TLS_AES_256_GCM_SHA384",
+        4867 => "TLS_CHACHA20_POLY1305_SHA256",
+        49195 => "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        49196 => "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        49199 => "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        49200 => "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        52392 => "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        52393 => "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        else => "",
+    }
+}
+
+pub fn groupName(group: u64) -> []const u8 {
+    return match group {
+        23 => "secp256r1",
+        24 => "secp384r1",
+        29 => "x25519",
+        else => "",
+    }
+}
+
+pub fn negotiatedGroup(client: *Client) -> u64 {
+    return client.*.group
+}
+
+// The protocol the server chose by ALPN; empty when none.
+pub fn alpnProtocol(client: *Client) -> []const u8 {
+    const bytes: [*]const u8 = &client.*.alpnChosen
+    return bytes[0..client.*.alpnChosenLength]
+}
+
+pub fn peerCertificateCount(client: *Client) -> usize {
+    return client.*.peerCount
+}
+
+// The server's certificates, its own first.
+pub fn peerCertificate(client: *Client, index: usize) -> *x509.Certificate {
+    return &client.*.peers[index]
+}
+
+// The NSS key log lines of the connection's secrets so far.
+pub fn keyLog(client: *Client) -> []const u8 {
+    const bytes: [*]const u8 = &client.*.keyLog
+    return bytes[0..client.*.keyLogLength]
+}
+
+fn logSecret(client: *Client, label: []const u8, secret: [*]const u8, length: usize) -> void {
+    const needed = label.length + 1 + 64 + 1 + 2 * length + 1
+    if client.*.keyLogLength + needed > 1024 { return }
+    const digits = "0123456789abcdef"
+    var at = client.*.keyLogLength
+    var index: usize = 0
+    while index < label.length {
+        client.*.keyLog[at] = label[index]
+        at += 1
+        index += 1
+    }
+    client.*.keyLog[at] = 32
+    at += 1
+    index = 0
+    while index < 32 {
+        client.*.keyLog[at] = digits[@intCast(usize, client.*.clientRandom[index] >> 4)]
+        client.*.keyLog[at + 1] = digits[@intCast(usize, client.*.clientRandom[index] & 15)]
+        at += 2
+        index += 1
+    }
+    client.*.keyLog[at] = 32
+    at += 1
+    index = 0
+    while index < length {
+        client.*.keyLog[at] = digits[@intCast(usize, secret[index] >> 4)]
+        client.*.keyLog[at + 1] = digits[@intCast(usize, secret[index] & 15)]
+        at += 2
+        index += 1
+    }
+    client.*.keyLog[at] = 10
+    client.*.keyLogLength = at + 1
+}
+
+// ---------------------------------------------------------------------------
+// The buffers.
+
+// What is to be sent.
+pub fn pendingOutput(client: *Client) -> []const u8 {
+    return client.*.output[0..client.*.outputLength]
+}
+
+// `count` bytes of pendingOutput were sent.
+pub fn outputSent(client: *Client, count: usize) -> void {
+    var taken = count
+    if taken > client.*.outputLength { taken = client.*.outputLength }
+    std.mem.copy(client.*.output, client.*.output + taken, client.*.outputLength - taken)
+    client.*.outputLength -= taken
+}
+
+// Where received bytes may be put, and how many.
+pub fn inputRoom(client: *Client) -> usize {
+    return INPUT_SIZE - client.*.inputLength
+}
+
+pub fn inputSpace(client: *Client) -> [*]u8 {
+    return client.*.input + client.*.inputLength
+}
+
+// `count` bytes were put at inputSpace.
+pub fn inputAdded(client: *Client, count: usize) -> void {
+    client.*.inputLength += count
+}
+
+// Received bytes, as many as there is room for: how many were taken.
+pub fn feed(client: *Client, bytes: [*]const u8, length: usize) -> usize {
+    var taken = length
+    if taken > inputRoom(client) { taken = inputRoom(client) }
+    std.mem.copy(client.*.input + client.*.inputLength, bytes, taken)
+    client.*.inputLength += taken
+    return taken
+}
+
+fn dropInput(client: *Client, count: usize) -> void {
+    std.mem.copy(client.*.input, client.*.input + count, client.*.inputLength - count)
+    client.*.inputLength -= count
+}
+
+// ---------------------------------------------------------------------------
+// Failing, and alerts.
+
+const ALERT_CLOSE_NOTIFY: u64 = 0
+const ALERT_UNEXPECTED_MESSAGE: u64 = 10
+const ALERT_BAD_RECORD_MAC: u64 = 20
+const ALERT_HANDSHAKE_FAILURE: u64 = 40
+const ALERT_BAD_CERTIFICATE: u64 = 42
+const ALERT_ILLEGAL_PARAMETER: u64 = 47
+const ALERT_DECODE_ERROR: u64 = 50
+const ALERT_DECRYPT_ERROR: u64 = 51
+const ALERT_PROTOCOL_VERSION: u64 = 70
+const ALERT_INTERNAL_ERROR: u64 = 80
+const ALERT_NO_RENEGOTIATION: u64 = 100
+
+fn queueRecord(client: *Client, contentType: u8, bytes: [*]const u8, length: usize) -> bool {
+    var at: usize = 0
+    while at < length || (length == 0 && at == 0) {
+        var piece = length - at
+        if piece > record.MAX_PLAINTEXT { piece = record.MAX_PLAINTEXT }
+        if client.*.outputLength + record.sealedLength(&client.*.writeKeys, piece) > OUTPUT_SIZE { return false }
+        const written = record.seal(&client.*.writeKeys, contentType, bytes + at, piece, client.*.output + client.*.outputLength)
+        client.*.outputLength += written
+        at += piece
+        if length == 0 { break }
+    }
+    return true
+}
+
+fn sendAlert(client: *Client, level: u64, description: u64) -> void {
+    var alert: [2]u8 = undefined
+    alert[0] = @intCast(u8, level)
+    alert[1] = @intCast(u8, description)
+    const bytes: [*]const u8 = &alert
+    const queued = queueRecord(client, 21, bytes, 2)
+}
+
+// Fails the connection, telling the server why.
+fn fail(client: *Client, failure: Failure, alert: u64) -> State {
+    if client.*.state != State.failed {
+        client.*.failure = failure
+        client.*.state = State.failed
+        if failure != Failure.alertReceived && failure != Failure.eof { sendAlert(client, 2, alert) }
+    }
+    return State.failed
+}
+
+// ---------------------------------------------------------------------------
+// The ClientHello.
+
+fn wantsTls13(client: *Client) -> bool {
+    return client.*.maxVersion >= VERSION_13
+}
+
+fn hostIsAddress(client: *Client) -> bool {
+    var address: [16]u8 = undefined
+    const bytes: [*]u8 = &address
+    const host: [*]const u8 = &client.*.host
+    return x509.parseAddress(host[0..client.*.hostLength], bytes) != 0
+}
+
+fn putSignatureAlgorithms(w: *wire.Writer) -> void {
+    const schemes: [12]u64 = [12]u64{ 1027, 1283, 2055, 2052, 2053, 2054, 1025, 1281, 1537, 1539, 513, 515 }
+    wire.put16(w, 13)
+    const outer = wire.begin(w, 2)
+    const inner = wire.begin(w, 2)
+    var index: usize = 0
+    while index < 12 {
+        wire.put16(w, schemes[index])
+        index += 1
+    }
+    wire.finish(w, inner, 2)
+    wire.finish(w, outer, 2)
+}
+
+// A key share of `group` (made now) into the writer: group, key.
+fn putKeyShare(client: *Client, w: *wire.Writer, group: u64) -> bool {
+    wire.put16(w, group)
+    if group == GROUP_X25519 {
+        const secret: [*]u8 = &client.*.x25519Private
+        if !random.fill(secret, 32) { return false }
+        var public: [32]u8 = undefined
+        const key: [*]u8 = &public
+        curve25519.x25519Base(secret, key)
+        wire.put16(w, 32)
+        wire.putBytes(w, key, 32)
+        return true
+    }
+    var curve: ecc.Curve = undefined
+    ecc.curveInit(&curve, if group == GROUP_SECP256R1 { ecc.CurveName.p256 } else { ecc.CurveName.p384 })
+    const secret: [*]u8 = &client.*.ecPrivate
+    if !ecc.generatePrivate(&curve, secret) { return false }
+    var public: [97]u8 = undefined
+    const key: [*]u8 = &public
+    if !ecc.publicKey(&curve, secret, key) { return false }
+    client.*.ecGroup = group
+    const length = 1 + 2 * curve.size
+    wire.put16(w, @intCast(u64, length))
+    wire.putBytes(w, key, length)
+    return true
+}
+
+// The ClientHello (RFC 8446, 4.1.2), first or after a HelloRetryRequest
+// asking for `group`.
+fn sendClientHello(client: *Client, group: u64) -> bool {
+    var buffer: [2048]u8 = undefined
+    const bytes: [*]u8 = &buffer
+    var w = wire.writer(bytes, 2048)
+    wire.put8(&w, 1)
+    const body = wire.begin(&w, 3)
+    wire.put16(&w, VERSION_12)
+    const randomBytes: [*]const u8 = &client.*.clientRandom
+    wire.putBytes(&w, randomBytes, 32)
+    // A session id for the middleboxes that look for one (RFC 8446, D.4).
+    wire.put8(&w, 32)
+    const session: [*]const u8 = &client.*.sessionId
+    wire.putBytes(&w, session, 32)
+    const suites = wire.begin(&w, 2)
+    if wantsTls13(client) {
+        wire.put16(&w, 4865)
+        wire.put16(&w, 4867)
+        wire.put16(&w, 4866)
+    }
+    if !client.*.retried {
+        wire.put16(&w, 49195)
+        wire.put16(&w, 49199)
+        wire.put16(&w, 52393)
+        wire.put16(&w, 52392)
+        wire.put16(&w, 49196)
+        wire.put16(&w, 49200)
+    }
+    wire.finish(&w, suites, 2)
+    wire.put8(&w, 1)
+    wire.put8(&w, 0)
+    const extensions = wire.begin(&w, 2)
+    if client.*.hostLength > 0 && !hostIsAddress(client) {
+        wire.put16(&w, 0)
+        const outer = wire.begin(&w, 2)
+        const list = wire.begin(&w, 2)
+        wire.put8(&w, 0)
+        wire.put16(&w, @intCast(u64, client.*.hostLength))
+        const host: [*]const u8 = &client.*.host
+        wire.putBytes(&w, host, client.*.hostLength)
+        wire.finish(&w, list, 2)
+        wire.finish(&w, outer, 2)
+    }
+    // supported_groups, ec_point_formats (uncompressed).
+    wire.put16(&w, 10)
+    wire.put16(&w, 8)
+    wire.put16(&w, 6)
+    wire.put16(&w, GROUP_X25519)
+    wire.put16(&w, GROUP_SECP256R1)
+    wire.put16(&w, GROUP_SECP384R1)
+    wire.put16(&w, 11)
+    wire.put16(&w, 2)
+    wire.put8(&w, 1)
+    wire.put8(&w, 0)
+    putSignatureAlgorithms(&w)
+    if client.*.alpnLength > 0 {
+        wire.put16(&w, 16)
+        wire.put16(&w, @intCast(u64, client.*.alpnLength + 2))
+        wire.put16(&w, @intCast(u64, client.*.alpnLength))
+        const alpn: [*]const u8 = &client.*.alpn
+        wire.putBytes(&w, alpn, client.*.alpnLength)
+    }
+    // extended_master_secret, renegotiation_info (empty).
+    wire.put16(&w, 23)
+    wire.put16(&w, 0)
+    wire.put16(&w, 65281)
+    wire.put16(&w, 1)
+    wire.put8(&w, 0)
+    if wantsTls13(client) {
+        wire.put16(&w, 43)
+        if client.*.retried {
+            wire.put16(&w, 3)
+            wire.put8(&w, 2)
+            wire.put16(&w, VERSION_13)
+        } else {
+            wire.put16(&w, 5)
+            wire.put8(&w, 4)
+            wire.put16(&w, VERSION_13)
+            wire.put16(&w, VERSION_12)
+        }
+        if client.*.cookieLength > 0 {
+            wire.put16(&w, 44)
+            wire.put16(&w, @intCast(u64, client.*.cookieLength + 2))
+            wire.put16(&w, @intCast(u64, client.*.cookieLength))
+            wire.putBytes(&w, client.*.cookie, client.*.cookieLength)
+        }
+        wire.put16(&w, 51)
+        const shares = wire.begin(&w, 2)
+        const list = wire.begin(&w, 2)
+        if !putKeyShare(client, &w, group) { return false }
+        wire.finish(&w, list, 2)
+        wire.finish(&w, shares, 2)
+    }
+    wire.finish(&w, extensions, 2)
+    wire.finish(&w, body, 3)
+    if !w.ok { return false }
+    if client.*.transcribing {
+        hash.update(&client.*.transcript, bytes[0..w.at])
+    } else {
+        // The hash is the server's choice: the bytes wait for it.
+        const copy = client.*.allocator.alloc(w.at, 16)
+        if copy == null { return false }
+        client.*.hello = copy.?
+        std.mem.copy(client.*.hello, bytes, w.at)
+        client.*.helloLength = w.at
+    }
+    return queueRecord(client, 22, bytes, w.at)
+}
+
+// Starts the handshake: the ClientHello is in the output then.
+pub fn start(client: *Client) -> State {
+    const r: [*]u8 = &client.*.clientRandom
+    const s: [*]u8 = &client.*.sessionId
+    if !random.fill(r, 32) || !random.fill(s, 32) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    if !sendClientHello(client, GROUP_X25519) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    client.*.phase = Phase.serverHello
+    return client.*.state
+}
+
+// ---------------------------------------------------------------------------
+// Handshake messages out.
+
+// A handshake message into the transcript and the output.
+fn sendHandshake(client: *Client, bytes: [*]const u8, length: usize) -> bool {
+    hash.update(&client.*.transcript, bytes[0..length])
+    return queueRecord(client, 22, bytes, length)
+}
+
+fn sendChangeCipherSpec(client: *Client) -> bool {
+    var one: [1]u8 = [1]u8{ 1 }
+    const bytes: [*]const u8 = &one
+    client.*.sentChangeCipherSpec = true
+    return queueRecord(client, 20, bytes, 1)
+}
+
+// ---------------------------------------------------------------------------
+// The ServerHello.
+
+const HELLO_RETRY: [32]u8 = [32]u8{ 207, 33, 173, 116, 229, 154, 97, 17, 190, 29, 140, 2, 30, 101, 184, 145, 194, 162, 17, 22, 122, 187, 140, 94, 7, 158, 9, 226, 200, 168, 51, 156 }
+
+fn suiteParameters(client: *Client, suite: u64) -> bool {
+    client.*.suite = suite
+    if suite == 4865 || suite == 49195 || suite == 49199 {
+        client.*.cipher = record.Cipher.aes128Gcm
+        client.*.algorithm = hash.Algorithm.sha256
+        return true
+    }
+    if suite == 4866 || suite == 49196 || suite == 49200 {
+        client.*.cipher = record.Cipher.aes256Gcm
+        client.*.algorithm = hash.Algorithm.sha384
+        return true
+    }
+    if suite == 4867 || suite == 52392 || suite == 52393 {
+        client.*.cipher = record.Cipher.chacha20Poly1305
+        client.*.algorithm = hash.Algorithm.sha256
+        return true
+    }
+    return false
+}
+
+fn isTls13Suite(suite: u64) -> bool {
+    return suite == 4865 || suite == 4866 || suite == 4867
+}
+
+// The shared secret of ECDHE with the server's key share into `out`: its
+// length, 0 when the share is no good.
+fn sharedSecret(client: *Client, group: u64, share: [*]const u8, length: usize, out: [*]u8) -> usize {
+    if group == GROUP_X25519 {
+        if length != 32 { return 0 }
+        const secret: [*]const u8 = &client.*.x25519Private
+        if !curve25519.x25519Shared(secret, share, out) { return 0 }
+        return 32
+    }
+    if group != client.*.ecGroup { return 0 }
+    var curve: ecc.Curve = undefined
+    ecc.curveInit(&curve, if group == GROUP_SECP256R1 { ecc.CurveName.p256 } else { ecc.CurveName.p384 })
+    if length != 1 + 2 * curve.size || share[0] != 4 { return 0 }
+    const secret: [*]const u8 = &client.*.ecPrivate
+    if !ecc.ecdh(&curve, secret, share, length, out) { return 0 }
+    return curve.size
+}
+
+fn startTranscript(client: *Client) -> void {
+    hash.init(&client.*.transcript, client.*.algorithm)
+    client.*.transcribing = true
+    if client.*.helloLength > 0 {
+        hash.update(&client.*.transcript, client.*.hello[0..client.*.helloLength])
+        client.*.allocator.free(client.*.hello, client.*.helloLength, 16)
+        client.*.helloLength = 0
+    }
+}
+
+fn helloRetry(client: *Client, message: [*]const u8, length: usize, suite: u64, p: *wire.Parser) -> State {
+    if client.*.retried || !isTls13Suite(suite) { return fail(client, Failure.protocol, ALERT_UNEXPECTED_MESSAGE) }
+    if !suiteParameters(client, suite) { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+    var group: u64 = 0
+    var version: u64 = 0
+    var extensions = wire.vector(p, 2)
+    while wire.remaining(&extensions) > 0 {
+        const kind = wire.uint16(&extensions)
+        var data = wire.vector(&extensions, 2)
+        if kind == 43 { version = wire.uint16(&data) }
+        if kind == 51 { group = wire.uint16(&data) }
+        if kind == 44 {
+            var cookie = wire.vector(&data, 2)
+            const size = wire.remaining(&cookie)
+            if size == 0 || size > 4096 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+            const copy = client.*.allocator.alloc(size, 16)
+            if copy == null { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+            client.*.cookie = copy.?
+            std.mem.copy(client.*.cookie, cookie.data + cookie.at, size)
+            client.*.cookieLength = size
+        }
+    }
+    if !extensions.ok || version != VERSION_13 { return fail(client, Failure.protocol, ALERT_ILLEGAL_PARAMETER) }
+    if group != GROUP_SECP256R1 && group != GROUP_SECP384R1 { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+    // The transcript: the first ClientHello by its hash (message_hash),
+    // then the HelloRetryRequest.
+    var first: [64]u8 = undefined
+    const digest: [*]u8 = &first
+    hash.digest(client.*.algorithm, client.*.hello[0..client.*.helloLength], digest)
+    client.*.allocator.free(client.*.hello, client.*.helloLength, 16)
+    client.*.helloLength = 0
+    hash.init(&client.*.transcript, client.*.algorithm)
+    client.*.transcribing = true
+    const size = hash.digestLength(client.*.algorithm)
+    var header: [4]u8 = [4]u8{ 254, 0, 0, 0 }
+    header[3] = @intCast(u8, size)
+    const head: [*]const u8 = &header
+    hash.update(&client.*.transcript, head[0..4])
+    hash.update(&client.*.transcript, digest[0..size])
+    hash.update(&client.*.transcript, message[0..length])
+    client.*.retried = true
+    if !sendChangeCipherSpec(client) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    if !sendClientHello(client, group) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    return client.*.state
+}
+
+fn serverHello(client: *Client, message: [*]const u8, length: usize) -> State {
+    var p = wire.parser(message, 4, length)
+    const legacy = wire.uint16(&p)
+    const randomStart = wire.bytes(&p, 32)
+    var session = wire.vector(&p, 1)
+    const suite = wire.uint16(&p)
+    const compression = wire.byte(&p)
+    if !p.ok || compression != 0 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    if wire.remaining(&session) != 32 || !hash.equal(session.data + session.at, &client.*.sessionId, 32) {
+        // TLS 1.2 servers may answer with a session id of their own.
+        if wantsTls13(client) && wire.remaining(&session) != 0 && false { return fail(client, Failure.protocol, ALERT_ILLEGAL_PARAMETER) }
+    }
+    var isRetry = true
+    var index: usize = 0
+    while index < 32 {
+        if message[randomStart + index] != HELLO_RETRY[index] { isRetry = false }
+        index += 1
+    }
+    if isRetry { return helloRetry(client, message, length, suite, &p) }
+    index = 0
+    while index < 32 {
+        client.*.serverRandom[index] = message[randomStart + index]
+        index += 1
+    }
+    var version = legacy
+    var shareGroup: u64 = 0
+    var shareStart: usize = 0
+    var shareLength: usize = 0
+    if wire.remaining(&p) > 0 {
+        var extensions = wire.vector(&p, 2)
+        while wire.remaining(&extensions) > 0 {
+            const kind = wire.uint16(&extensions)
+            var data = wire.vector(&extensions, 2)
+            if kind == 43 {
+                version = wire.uint16(&data)
+            } else if kind == 51 {
+                shareGroup = wire.uint16(&data)
+                var key = wire.vector(&data, 2)
+                shareStart = key.at
+                shareLength = wire.remaining(&key)
+            } else if kind == 23 {
+                client.*.extendedMasterSecret = true
+            } else if kind == 65281 {
+                if wire.remaining(&data) != 1 || wire.byte(&data) != 0 { return fail(client, Failure.handshake, ALERT_HANDSHAKE_FAILURE) }
+                client.*.renegotiationInfo = true
+            } else if kind == 16 {
+                if !chooseAlpn(client, &data) { return fail(client, Failure.protocol, ALERT_ILLEGAL_PARAMETER) }
+            }
+        }
+        if !extensions.ok { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    }
+    if version == VERSION_13 && wantsTls13(client) {
+        if !isTls13Suite(suite) || !suiteParameters(client, suite) { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+        if wire.remaining(&session) != 32 || !hash.equal(session.data + session.at, &client.*.sessionId, 32) { return fail(client, Failure.protocol, ALERT_ILLEGAL_PARAMETER) }
+        client.*.version = VERSION_13
+        if !client.*.transcribing { startTranscript(client) }
+        hash.update(&client.*.transcript, message[0..length])
+        return handshakeKeys13(client, shareGroup, message + shareStart, shareLength)
+    }
+    if version != VERSION_12 || legacy != VERSION_12 { return fail(client, Failure.handshake, ALERT_PROTOCOL_VERSION) }
+    if client.*.retried { return fail(client, Failure.protocol, ALERT_PROTOCOL_VERSION) }
+    // A TLS 1.3 server answering 1.2 marks its random (RFC 8446, 4.1.3):
+    // someone in between took the 1.3 out of the ClientHello.
+    if wantsTls13(client) {
+        const sentinel = "DOWNGRD\x01"
+        var downgraded = true
+        index = 0
+        while index < 8 {
+            if client.*.serverRandom[24 + index] != sentinel[index] { downgraded = false }
+            index += 1
+        }
+        if downgraded { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+    }
+    if isTls13Suite(suite) || !suiteParameters(client, suite) { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+    if !client.*.renegotiationInfo { return fail(client, Failure.handshake, ALERT_HANDSHAKE_FAILURE) }
+    client.*.version = VERSION_12
+    startTranscript(client)
+    hash.update(&client.*.transcript, message[0..length])
+    client.*.phase = Phase.certificate12
+    return client.*.state
+}
+
+// The server's ALPN choice: one of the protocols offered.
+fn chooseAlpn(client: *Client, data: *wire.Parser) -> bool {
+    var list = wire.vector(data, 2)
+    var name = wire.vector(&list, 1)
+    const length = wire.remaining(&name)
+    if !list.ok || !wire.atEnd(&list) || length == 0 || client.*.alpnLength == 0 { return false }
+    var at: usize = 0
+    var offered = false
+    while at < client.*.alpnLength {
+        const size = @intCast(usize, client.*.alpn[at])
+        if size == length && hash.equal(name.data + name.at, &client.*.alpn[at + 1], length) { offered = true }
+        at += 1 + size
+    }
+    if !offered { return false }
+    std.mem.copy(&client.*.alpnChosen, name.data + name.at, length)
+    client.*.alpnChosenLength = length
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// TLS 1.3's key schedule.
+
+fn handshakeKeys13(client: *Client, group: u64, share: [*]const u8, length: usize) -> State {
+    var shared: [48]u8 = undefined
+    const secret: [*]u8 = &shared
+    const sharedLength = sharedSecret(client, group, share, length, secret)
+    if sharedLength == 0 { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+    client.*.group = group
+    const algorithm = client.*.algorithm
+    const size = hash.digestLength(algorithm)
+    var zeroes: [64]u8 = undefined
+    const zero: [*]u8 = &zeroes
+    hash.wipe(zero, 64)
+    var early: [64]u8 = undefined
+    const earlySecret: [*]u8 = &early
+    hash.hkdfExtract(algorithm, zero[0..size], zero[0..size], earlySecret)
+    var salt: [64]u8 = undefined
+    const derived: [*]u8 = &salt
+    schedule.derived(algorithm, earlySecret, derived)
+    const handshakeSecret: [*]u8 = &client.*.handshakeSecret
+    hash.hkdfExtract(algorithm, derived[0..size], secret[0..sharedLength], handshakeSecret)
+    var digest: [64]u8 = undefined
+    const transcript: [*]u8 = &digest
+    hash.peek(&client.*.transcript, transcript)
+    const clientSecret: [*]u8 = &client.*.clientSecret
+    const serverSecret: [*]u8 = &client.*.serverSecret
+    schedule.deriveSecret(algorithm, handshakeSecret, "c hs traffic", transcript, clientSecret)
+    schedule.deriveSecret(algorithm, handshakeSecret, "s hs traffic", transcript, serverSecret)
+    logSecret(client, "CLIENT_HANDSHAKE_TRAFFIC_SECRET", clientSecret, size)
+    logSecret(client, "SERVER_HANDSHAKE_TRAFFIC_SECRET", serverSecret, size)
+    schedule.derived(algorithm, handshakeSecret, derived)
+    const masterSecret: [*]u8 = &client.*.masterSecret
+    hash.hkdfExtract(algorithm, derived[0..size], zero[0..size], masterSecret)
+    installTraffic(client, &client.*.readKeys, serverSecret)
+    hash.wipe(secret, 48)
+    hash.wipe(earlySecret, 64)
+    client.*.phase = Phase.encryptedExtensions
+    return client.*.state
+}
+
+fn installTraffic(client: *Client, protection: *record.Protection, secret: [*]const u8) -> void {
+    var key: [32]u8 = undefined
+    var iv: [12]u8 = undefined
+    const k: [*]u8 = &key
+    const v: [*]u8 = &iv
+    schedule.trafficKeys(client.*.algorithm, secret, record.keyLength(client.*.cipher), k, v)
+    record.install(protection, client.*.cipher, true, k, v)
+    hash.wipe(k, 32)
+    hash.wipe(v, 12)
+}
+
+fn encryptedExtensions(client: *Client, message: [*]const u8, length: usize) -> State {
+    var p = wire.parser(message, 4, length)
+    var extensions = wire.vector(&p, 2)
+    while wire.remaining(&extensions) > 0 {
+        const kind = wire.uint16(&extensions)
+        var data = wire.vector(&extensions, 2)
+        if kind == 16 {
+            if !chooseAlpn(client, &data) { return fail(client, Failure.protocol, ALERT_ILLEGAL_PARAMETER) }
+        }
+    }
+    if !extensions.ok || !wire.atEnd(&p) { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    hash.update(&client.*.transcript, message[0..length])
+    client.*.phase = Phase.certificate13
+    return client.*.state
+}
+
+fn certificateRequest13(client: *Client, message: [*]const u8, length: usize) -> State {
+    var p = wire.parser(message, 4, length)
+    var context = wire.vector(&p, 1)
+    const size = wire.remaining(&context)
+    if !p.ok { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    std.mem.copy(&client.*.requestContext, context.data + context.at, size)
+    client.*.requestContextLength = size
+    client.*.certificateRequested = true
+    hash.update(&client.*.transcript, message[0..length])
+    return client.*.state
+}
+
+// The server's certificates (TLS 1.3 entries carry extensions, TLS 1.2's
+// do not): copied, and each parsed.
+fn certificates(client: *Client, message: [*]const u8, length: usize, tls13: bool) -> State {
+    var p = wire.parser(message, 4, length)
+    if tls13 {
+        var context = wire.vector(&p, 1)
+        if wire.remaining(&context) != 0 { return fail(client, Failure.protocol, ALERT_ILLEGAL_PARAMETER) }
+    }
+    var list = wire.vector(&p, 3)
+    if !p.ok || !wire.atEnd(&p) { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    const total = wire.remaining(&list)
+    if total == 0 { return fail(client, Failure.badCertificate, ALERT_DECODE_ERROR) }
+    const copy = client.*.allocator.alloc(total, 16)
+    if copy == null { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    client.*.chain = copy.?
+    client.*.chainCapacity = total
+    client.*.chainLength = 0
+    client.*.peerCount = 0
+    while wire.remaining(&list) > 0 {
+        var der = wire.vector(&list, 3)
+        if tls13 { const extensions = wire.vector(&list, 2) }
+        const size = wire.remaining(&der)
+        if !list.ok || size == 0 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+        if client.*.peerCount < MAX_PEERS {
+            const at = client.*.chainLength
+            std.mem.copy(client.*.chain + at, der.data + der.at, size)
+            client.*.chainLength += size
+            const parsed = x509.parse(&client.*.peers[client.*.peerCount], client.*.chain[at .. at + size])
+            if !parsed {
+                // The server's own must be read; one that came with it
+                // and is not is left out.
+                if client.*.peerCount == 0 { return fail(client, Failure.badCertificate, ALERT_BAD_CERTIFICATE) }
+            } else {
+                client.*.peerCount += 1
+            }
+        }
+    }
+    hash.update(&client.*.transcript, message[0..length])
+    client.*.phase = if tls13 { Phase.certificateVerify13 } else { Phase.serverKeyExchange12 }
+    return client.*.state
+}
+
+// A signature by the server's key in `scheme` over `content`.
+fn verifySignature(client: *Client, scheme: u64, content: []const u8, signature: []const u8, tls13: bool) -> bool {
+    const leaf: *x509.Certificate = &client.*.peers[0]
+    if scheme == 2052 || scheme == 2053 || scheme == 2054 {
+        const algorithm = if scheme == 2052 { hash.Algorithm.sha256 } else if scheme == 2053 { hash.Algorithm.sha384 } else { hash.Algorithm.sha512 }
+        return x509.verifyWithKey(leaf, x509.SignatureType.rsaPss, algorithm, hash.digestLength(algorithm), content, signature)
+    }
+    if scheme == 1027 || scheme == 1283 {
+        const algorithm = if scheme == 1027 { hash.Algorithm.sha256 } else { hash.Algorithm.sha384 }
+        // TLS 1.3 ties the curve to the scheme; TLS 1.2 only the hash.
+        if tls13 {
+            if scheme == 1027 && leaf.*.keyType != x509.KeyType.p256 { return false }
+            if scheme == 1283 && leaf.*.keyType != x509.KeyType.p384 { return false }
+        }
+        return x509.verifyWithKey(leaf, x509.SignatureType.ecdsa, algorithm, 0, content, signature)
+    }
+    if scheme == 2055 {
+        return x509.verifyWithKey(leaf, x509.SignatureType.ed25519, hash.Algorithm.sha512, 0, content, signature)
+    }
+    if tls13 { return false }
+    if scheme == 1025 || scheme == 1281 || scheme == 1537 || scheme == 513 {
+        const algorithm = if scheme == 1025 { hash.Algorithm.sha256 } else if scheme == 1281 { hash.Algorithm.sha384 } else if scheme == 1537 { hash.Algorithm.sha512 } else { hash.Algorithm.sha1 }
+        return x509.verifyWithKey(leaf, x509.SignatureType.rsaPkcs1, algorithm, 0, content, signature)
+    }
+    if scheme == 515 {
+        return x509.verifyWithKey(leaf, x509.SignatureType.ecdsa, hash.Algorithm.sha1, 0, content, signature)
+    }
+    return false
+}
+
+// The chain against the trust store and the name; a chain that does not
+// verify pauses the handshake for the caller.
+fn checkChain(client: *Client) -> State {
+    var flags: u32 = x509.UNKNOWN_CA
+    if client.*.hasStore {
+        var moment = client.*.time
+        if moment == 0 { moment = x509.now() }
+        const host: [*]const u8 = &client.*.host
+        const chain: [*]x509.Certificate = &client.*.peers
+        flags = x509.verifyChain(client.*.store, chain, client.*.peerCount, host[0..client.*.hostLength], moment)
+    } else if client.*.hostLength > 0 {
+        const host: [*]const u8 = &client.*.host
+        if !x509.matchesHostname(&client.*.peers[0], host[0..client.*.hostLength]) { flags = flags | x509.BAD_IDENTITY }
+    }
+    client.*.peerFlags = flags
+    if flags != 0 { client.*.state = State.checkCertificate }
+    return client.*.state
+}
+
+// Goes on after checkCertificate when `accepted`, else fails with a
+// bad_certificate alert.
+pub fn acceptCertificate(client: *Client, accepted: bool) -> State {
+    if client.*.state != State.checkCertificate { return client.*.state }
+    if !accepted { return fail(client, Failure.badCertificate, ALERT_BAD_CERTIFICATE) }
+    client.*.state = State.handshaking
+    return process(client)
+}
+
+fn certificateVerify13(client: *Client, message: [*]const u8, length: usize) -> State {
+    var p = wire.parser(message, 4, length)
+    const scheme = wire.uint16(&p)
+    var signature = wire.vector(&p, 2)
+    if !p.ok || !wire.atEnd(&p) { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    // 64 spaces, the context string, a zero, the transcript's digest.
+    var content: [200]u8 = undefined
+    var index: usize = 0
+    while index < 64 {
+        content[index] = 32
+        index += 1
+    }
+    const label = "TLS 1.3, server CertificateVerify"
+    index = 0
+    while index < label.length {
+        content[64 + index] = label[index]
+        index += 1
+    }
+    content[64 + label.length] = 0
+    const bytes: [*]u8 = &content
+    const at = 65 + label.length
+    hash.peek(&client.*.transcript, bytes + at)
+    const total = at + hash.digestLength(client.*.algorithm)
+    if !verifySignature(client, scheme, bytes[0..total], signature.data[signature.at .. signature.end], true) { return fail(client, Failure.badSignature, ALERT_DECRYPT_ERROR) }
+    hash.update(&client.*.transcript, message[0..length])
+    client.*.phase = Phase.finished13
+    return checkChain(client)
+}
+
+fn finished13(client: *Client, message: [*]const u8, length: usize) -> State {
+    const algorithm = client.*.algorithm
+    const size = hash.digestLength(algorithm)
+    if length != 4 + size { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    var digest: [64]u8 = undefined
+    const transcript: [*]u8 = &digest
+    hash.peek(&client.*.transcript, transcript)
+    var expected: [64]u8 = undefined
+    const want: [*]u8 = &expected
+    const serverSecret: [*]u8 = &client.*.serverSecret
+    schedule.finishedData(algorithm, serverSecret, transcript, want)
+    if !hash.equal(want, message + 4, size) { return fail(client, Failure.badSignature, ALERT_DECRYPT_ERROR) }
+    hash.update(&client.*.transcript, message[0..length])
+    // The application secrets come from the transcript up to here.
+    hash.peek(&client.*.transcript, transcript)
+    const masterSecret: [*]const u8 = &client.*.masterSecret
+    var clientApplication: [64]u8 = undefined
+    const clientNext: [*]u8 = &clientApplication
+    schedule.deriveSecret(algorithm, masterSecret, "c ap traffic", transcript, clientNext)
+    schedule.deriveSecret(algorithm, masterSecret, "s ap traffic", transcript, serverSecret)
+    logSecret(client, "CLIENT_TRAFFIC_SECRET_0", clientNext, size)
+    logSecret(client, "SERVER_TRAFFIC_SECRET_0", serverSecret, size)
+    installTraffic(client, &client.*.readKeys, serverSecret)
+    // Our flight, under the handshake keys: the middleboxes'
+    // ChangeCipherSpec, an empty Certificate when one was asked for,
+    // Finished.
+    if !client.*.sentChangeCipherSpec && !sendChangeCipherSpec(client) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    const clientSecret: [*]u8 = &client.*.clientSecret
+    installTraffic(client, &client.*.writeKeys, clientSecret)
+    var flight: [300]u8 = undefined
+    const out: [*]u8 = &flight
+    if client.*.certificateRequested {
+        var w = wire.writer(out, 300)
+        wire.put8(&w, 11)
+        const body = wire.begin(&w, 3)
+        wire.put8(&w, @intCast(u64, client.*.requestContextLength))
+        const context: [*]const u8 = &client.*.requestContext
+        wire.putBytes(&w, context, client.*.requestContextLength)
+        wire.put24(&w, 0)
+        wire.finish(&w, body, 3)
+        if !sendHandshake(client, out, w.at) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    }
+    hash.peek(&client.*.transcript, transcript)
+    flight[0] = 20
+    flight[1] = 0
+    flight[2] = 0
+    flight[3] = @intCast(u8, size)
+    schedule.finishedData(algorithm, clientSecret, transcript, out + 4)
+    if !sendHandshake(client, out, 4 + size) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    std.mem.copy(clientSecret, clientNext, 64)
+    installTraffic(client, &client.*.writeKeys, clientSecret)
+    hash.wipe(clientNext, 64)
+    hash.wipe(&client.*.handshakeSecret, 64)
+    client.*.phase = Phase.done
+    client.*.state = State.connected
+    return client.*.state
+}
+
+// Messages after the handshake: tickets (not kept), KeyUpdate.
+fn postHandshake13(client: *Client, kind: u8, message: [*]const u8, length: usize) -> State {
+    if kind == 4 { return client.*.state }
+    if kind == 24 {
+        if length != 5 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+        const requested = message[4]
+        if requested > 1 { return fail(client, Failure.protocol, ALERT_ILLEGAL_PARAMETER) }
+        const serverSecret: [*]u8 = &client.*.serverSecret
+        schedule.nextTrafficSecret(client.*.algorithm, serverSecret)
+        installTraffic(client, &client.*.readKeys, serverSecret)
+        if requested == 1 {
+            var update: [5]u8 = [5]u8{ 24, 0, 0, 1, 0 }
+            const bytes: [*]const u8 = &update
+            if !queueRecord(client, 22, bytes, 5) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+            const clientSecret: [*]u8 = &client.*.clientSecret
+            schedule.nextTrafficSecret(client.*.algorithm, clientSecret)
+            installTraffic(client, &client.*.writeKeys, clientSecret)
+        }
+        return client.*.state
+    }
+    return fail(client, Failure.protocol, ALERT_UNEXPECTED_MESSAGE)
+}
+
+// ---------------------------------------------------------------------------
+// TLS 1.2.
+
+fn serverKeyExchange12(client: *Client, message: [*]const u8, length: usize) -> State {
+    var p = wire.parser(message, 4, length)
+    const paramsStart = p.at
+    const curveType = wire.byte(&p)
+    const group = wire.uint16(&p)
+    var point = wire.vector(&p, 1)
+    const paramsEnd = p.at
+    const scheme = wire.uint16(&p)
+    var signature = wire.vector(&p, 2)
+    if !p.ok || !wire.atEnd(&p) { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    if curveType != 3 || (group != GROUP_X25519 && group != GROUP_SECP256R1 && group != GROUP_SECP384R1) { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+    const size = wire.remaining(&point)
+    if size == 0 || size > 133 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    // client_random + server_random + the parameters, signed.
+    var content: [400]u8 = undefined
+    const bytes: [*]u8 = &content
+    std.mem.copy(bytes, &client.*.clientRandom, 32)
+    std.mem.copy(bytes + 32, &client.*.serverRandom, 32)
+    std.mem.copy(bytes + 64, message + paramsStart, paramsEnd - paramsStart)
+    const total = 64 + paramsEnd - paramsStart
+    if !verifySignature(client, scheme, bytes[0..total], signature.data[signature.at .. signature.end], false) { return fail(client, Failure.badSignature, ALERT_DECRYPT_ERROR) }
+    client.*.peerGroup = group
+    std.mem.copy(&client.*.peerShare, point.data + point.at, size)
+    client.*.peerShareLength = size
+    hash.update(&client.*.transcript, message[0..length])
+    client.*.phase = Phase.serverHelloDone12
+    return checkChain(client)
+}
+
+fn installKeys12(client: *Client) -> void {
+    const keyLength = record.keyLength(client.*.cipher)
+    const ivLength = record.implicitIvLength(client.*.cipher, false)
+    var block: [128]u8 = undefined
+    const keys: [*]u8 = &block
+    const masterSecret: [*]const u8 = &client.*.masterSecret
+    const serverRandom: [*]const u8 = &client.*.serverRandom
+    const clientRandom: [*]const u8 = &client.*.clientRandom
+    schedule.prf(client.*.algorithm, masterSecret[0..48], "key expansion", serverRandom[0..32], clientRandom[0..32], keys, 2 * keyLength + 2 * ivLength)
+    record.install(&client.*.writeKeys, client.*.cipher, false, keys, keys + 2 * keyLength)
+    // The server's keys wait for its ChangeCipherSpec: kept in the
+    // server secret until then.
+    std.mem.copy(&client.*.serverSecret, keys + keyLength, keyLength)
+    std.mem.copy(&client.*.serverSecret[32], keys + 2 * keyLength + ivLength, ivLength)
+    hash.wipe(keys, 128)
+}
+
+fn serverHelloDone12(client: *Client, message: [*]const u8, length: usize) -> State {
+    if length != 4 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    hash.update(&client.*.transcript, message[0..length])
+    var flight: [200]u8 = undefined
+    const out: [*]u8 = &flight
+    if client.*.certificateRequested {
+        var empty: [7]u8 = [7]u8{ 11, 0, 0, 3, 0, 0, 0 }
+        const bytes: [*]const u8 = &empty
+        if !sendHandshake(client, bytes, 7) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    }
+    // Our key share for the server's group, and the shared secret.
+    var w = wire.writer(out, 200)
+    wire.put8(&w, 16)
+    const body = wire.begin(&w, 3)
+    const share = wire.begin(&w, 1)
+    var scratch: [140]u8 = undefined
+    var sw = wire.writer(&scratch, 140)
+    if !putKeyShare(client, &sw, client.*.peerGroup) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    // putKeyShare wrote group and a two-byte length before the key.
+    const keyBytes: [*]const u8 = &scratch
+    wire.putBytes(&w, keyBytes + 4, sw.at - 4)
+    wire.finish(&w, share, 1)
+    wire.finish(&w, body, 3)
+    var shared: [48]u8 = undefined
+    const secret: [*]u8 = &shared
+    const peer: [*]const u8 = &client.*.peerShare
+    const sharedLength = sharedSecret(client, client.*.peerGroup, peer, client.*.peerShareLength, secret)
+    if sharedLength == 0 { return fail(client, Failure.handshake, ALERT_ILLEGAL_PARAMETER) }
+    client.*.group = client.*.peerGroup
+    if !sendHandshake(client, out, w.at) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    const masterSecret: [*]u8 = &client.*.masterSecret
+    if client.*.extendedMasterSecret {
+        var digest: [64]u8 = undefined
+        const sessionHash: [*]u8 = &digest
+        hash.peek(&client.*.transcript, sessionHash)
+        var nothing: [1]u8 = [1]u8{ 0 }
+        const empty: [*]const u8 = &nothing
+        schedule.prf(client.*.algorithm, secret[0..sharedLength], "extended master secret", sessionHash[0..hash.digestLength(client.*.algorithm)], empty[0..0], masterSecret, 48)
+    } else {
+        const clientRandom: [*]const u8 = &client.*.clientRandom
+        const serverRandom: [*]const u8 = &client.*.serverRandom
+        schedule.prf(client.*.algorithm, secret[0..sharedLength], "master secret", clientRandom[0..32], serverRandom[0..32], masterSecret, 48)
+    }
+    hash.wipe(secret, 48)
+    logSecret(client, "CLIENT_RANDOM", masterSecret, 48)
+    if !sendChangeCipherSpec(client) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    installKeys12(client)
+    var digest: [64]u8 = undefined
+    const transcript: [*]u8 = &digest
+    hash.peek(&client.*.transcript, transcript)
+    flight[0] = 20
+    flight[1] = 0
+    flight[2] = 0
+    flight[3] = 12
+    var nothing: [1]u8 = [1]u8{ 0 }
+    const empty: [*]const u8 = &nothing
+    schedule.prf(client.*.algorithm, masterSecret[0..48], "client finished", transcript[0..hash.digestLength(client.*.algorithm)], empty[0..0], out + 4, 12)
+    if !sendHandshake(client, out, 16) { return fail(client, Failure.internal, ALERT_INTERNAL_ERROR) }
+    client.*.phase = Phase.changeCipherSpec12
+    return client.*.state
+}
+
+fn certificateRequest12(client: *Client, message: [*]const u8, length: usize) -> State {
+    client.*.certificateRequested = true
+    hash.update(&client.*.transcript, message[0..length])
+    return client.*.state
+}
+
+fn finished12(client: *Client, message: [*]const u8, length: usize) -> State {
+    if length != 16 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+    var digest: [64]u8 = undefined
+    const transcript: [*]u8 = &digest
+    hash.peek(&client.*.transcript, transcript)
+    var expected: [12]u8 = undefined
+    const want: [*]u8 = &expected
+    var nothing: [1]u8 = [1]u8{ 0 }
+    const empty: [*]const u8 = &nothing
+    const masterSecret: [*]const u8 = &client.*.masterSecret
+    schedule.prf(client.*.algorithm, masterSecret[0..48], "server finished", transcript[0..hash.digestLength(client.*.algorithm)], empty[0..0], want, 12)
+    if !hash.equal(want, message + 4, 12) { return fail(client, Failure.badSignature, ALERT_DECRYPT_ERROR) }
+    hash.update(&client.*.transcript, message[0..length])
+    client.*.phase = Phase.done
+    client.*.state = State.connected
+    return client.*.state
+}
+
+// ---------------------------------------------------------------------------
+// Handshake messages in.
+
+fn handleMessage(client: *Client, message: [*]const u8, length: usize) -> State {
+    const kind = message[0]
+    const phase = client.*.phase
+    if phase == Phase.done {
+        if client.*.version == VERSION_13 { return postHandshake13(client, kind, message, length) }
+        // TLS 1.2's HelloRequest: renegotiation is refused, politely.
+        if kind == 0 {
+            sendAlert(client, 1, ALERT_NO_RENEGOTIATION)
+            return client.*.state
+        }
+        return fail(client, Failure.protocol, ALERT_UNEXPECTED_MESSAGE)
+    }
+    if phase == Phase.serverHello && kind == 2 { return serverHello(client, message, length) }
+    if phase == Phase.encryptedExtensions && kind == 8 { return encryptedExtensions(client, message, length) }
+    if phase == Phase.certificate13 && kind == 13 && !client.*.certificateRequested { return certificateRequest13(client, message, length) }
+    if phase == Phase.certificate13 && kind == 11 { return certificates(client, message, length, true) }
+    if phase == Phase.certificateVerify13 && kind == 15 { return certificateVerify13(client, message, length) }
+    if phase == Phase.finished13 && kind == 20 { return finished13(client, message, length) }
+    if phase == Phase.certificate12 && kind == 11 { return certificates(client, message, length, false) }
+    if phase == Phase.serverKeyExchange12 && kind == 12 { return serverKeyExchange12(client, message, length) }
+    if phase == Phase.serverHelloDone12 && kind == 13 && !client.*.certificateRequested { return certificateRequest12(client, message, length) }
+    if phase == Phase.serverHelloDone12 && kind == 14 { return serverHelloDone12(client, message, length) }
+    if phase == Phase.finished12 && kind == 20 { return finished12(client, message, length) }
+    return fail(client, Failure.protocol, ALERT_UNEXPECTED_MESSAGE)
+}
+
+// The whole messages gathered so far, one at a time; stops at a pause.
+fn handleMessages(client: *Client) -> State {
+    var at: usize = 0
+    while client.*.state == State.handshaking || client.*.state == State.connected {
+        if client.*.handshakeLength - at < 4 { break }
+        const body = (@intCast(usize, client.*.handshake[at + 1]) << 16) | (@intCast(usize, client.*.handshake[at + 2]) << 8) | @intCast(usize, client.*.handshake[at + 3])
+        if client.*.handshakeLength - at < 4 + body { break }
+        const state = handleMessage(client, client.*.handshake + at, 4 + body)
+        at += 4 + body
+        if state == State.failed { break }
+    }
+    std.mem.copy(client.*.handshake, client.*.handshake + at, client.*.handshakeLength - at)
+    client.*.handshakeLength -= at
+    return client.*.state
+}
+
+fn gatherHandshake(client: *Client, bytes: [*]const u8, length: usize) -> bool {
+    const needed = client.*.handshakeLength + length
+    if needed > MAX_HANDSHAKE { return false }
+    if needed > client.*.handshakeCapacity {
+        var capacity: usize = 32768
+        while capacity < needed { capacity = capacity * 2 }
+        const memory = client.*.allocator.alloc(capacity, 16)
+        if memory == null { return false }
+        const grown = memory.?
+        if client.*.handshakeCapacity > 0 {
+            std.mem.copy(grown, client.*.handshake, client.*.handshakeLength)
+            client.*.allocator.free(client.*.handshake, client.*.handshakeCapacity, 16)
+        }
+        client.*.handshake = grown
+        client.*.handshakeCapacity = capacity
+    }
+    std.mem.copy(client.*.handshake + client.*.handshakeLength, bytes, length)
+    client.*.handshakeLength = needed
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Records in.
+
+// Takes in the records that have arrived: what state the connection is
+// in now. Application data stops it until read takes it.
+pub fn process(client: *Client) -> State {
+    while true {
+        if client.*.state == State.failed || client.*.state == State.closed || client.*.state == State.checkCertificate { return client.*.state }
+        // Messages left over from before a pause.
+        if client.*.handshakeLength >= 4 {
+            const before = client.*.handshakeLength
+            const state = handleMessages(client)
+            if state != State.handshaking && state != State.connected { return state }
+            if client.*.handshakeLength != before { continue }
+        }
+        if client.*.dataLength > 0 { return client.*.state }
+        if client.*.dataRecordEnd > 0 {
+            dropInput(client, client.*.dataRecordEnd)
+            client.*.dataRecordEnd = 0
+        }
+        if client.*.inputLength < record.HEADER { return client.*.state }
+        const input = client.*.input
+        const length = (@intCast(usize, input[3]) << 8) | @intCast(usize, input[4])
+        if input[1] != 3 || length > record.MAX_PLAINTEXT + 2048 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+        if client.*.inputLength < record.HEADER + length { return client.*.state }
+        const outerType = input[0]
+        // TLS 1.3's ChangeCipherSpec is for middleboxes, unprotected and
+        // passed over (RFC 8446, 5).
+        if outerType == 20 && length == 1 && input[5] == 1 {
+            if client.*.version == VERSION_12 && client.*.phase == Phase.changeCipherSpec12 {
+                const serverKeys: [*]const u8 = &client.*.serverSecret
+                record.install(&client.*.readKeys, client.*.cipher, false, serverKeys, serverKeys + 32)
+                client.*.phase = Phase.finished12
+            } else if client.*.version == VERSION_12 || client.*.phase == Phase.done {
+                return fail(client, Failure.protocol, ALERT_UNEXPECTED_MESSAGE)
+            }
+            dropInput(client, record.HEADER + 1)
+            continue
+        }
+        var start: usize = 0
+        var plainLength: usize = 0
+        var contentType: u8 = 0
+        if !record.open(&client.*.readKeys, input, length, &start, &plainLength, &contentType) {
+            return fail(client, Failure.badRecord, ALERT_BAD_RECORD_MAC)
+        }
+        if contentType == 22 {
+            if plainLength == 0 || !gatherHandshake(client, input + start, plainLength) { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+            dropInput(client, record.HEADER + length)
+            const state = handleMessages(client)
+            if state != State.handshaking && state != State.connected { return state }
+        } else if contentType == 21 {
+            if plainLength != 2 { return fail(client, Failure.protocol, ALERT_DECODE_ERROR) }
+            const level = input[start]
+            const description = input[start + 1]
+            dropInput(client, record.HEADER + length)
+            if description == 0 {
+                client.*.state = State.closed
+                return client.*.state
+            }
+            // Warnings other than close_notify are passed over (TLS 1.2's
+            // no_renegotiation and the like); TLS 1.3 has none.
+            if level == 2 || client.*.version == VERSION_13 {
+                client.*.peerAlert = @intCast(u64, description)
+                return fail(client, Failure.alertReceived, 0)
+            }
+        } else if contentType == 23 {
+            if client.*.phase != Phase.done { return fail(client, Failure.protocol, ALERT_UNEXPECTED_MESSAGE) }
+            client.*.dataStart = start
+            client.*.dataLength = plainLength
+            client.*.dataRecordEnd = record.HEADER + length
+            if plainLength == 0 {
+                dropInput(client, client.*.dataRecordEnd)
+                client.*.dataRecordEnd = 0
+                continue
+            }
+            return client.*.state
+        } else {
+            return fail(client, Failure.protocol, ALERT_UNEXPECTED_MESSAGE)
+        }
+    }
+    return client.*.state
+}
+
+// ---------------------------------------------------------------------------
+// Application data.
+
+// How many bytes read can give now.
+pub fn readable(client: *Client) -> usize {
+    return client.*.dataLength
+}
+
+// Received data into `out`, up to `room` bytes: how many.
+pub fn read(client: *Client, out: [*]u8, room: usize) -> usize {
+    var count = client.*.dataLength
+    if count > room { count = room }
+    std.mem.copy(out, client.*.input + client.*.dataStart, count)
+    client.*.dataStart += count
+    client.*.dataLength -= count
+    return count
+}
+
+// Data to send, as much as the output has room for: how many bytes were
+// taken (0 when the output is full: send it first).
+pub fn write(client: *Client, data: [*]const u8, length: usize) -> usize {
+    if client.*.state != State.connected { return 0 }
+    var taken: usize = 0
+    while taken < length {
+        var piece = length - taken
+        if piece > record.MAX_PLAINTEXT { piece = record.MAX_PLAINTEXT }
+        if client.*.outputLength + record.sealedLength(&client.*.writeKeys, piece) > OUTPUT_SIZE {
+            // Room for a smaller record?
+            const room = OUTPUT_SIZE - client.*.outputLength
+            if room < 512 { break }
+            piece = room - 300
+            if piece > length - taken { piece = length - taken }
+        }
+        client.*.outputLength += record.seal(&client.*.writeKeys, 23, data + taken, piece, client.*.output + client.*.outputLength)
+        taken += piece
+    }
+    return taken
+}
+
+// close_notify into the output.
+pub fn close(client: *Client) -> void {
+    if client.*.closeSent || client.*.state == State.failed { return }
+    client.*.closeSent = true
+    sendAlert(client, 1, ALERT_CLOSE_NOTIFY)
+}
+
+// The transport ended: closed if the server said so, a failure if not.
+pub fn endOfInput(client: *Client) -> State {
+    if client.*.state == State.closed || client.*.state == State.failed { return client.*.state }
+    return fail(client, Failure.eof, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Over blocking read and write functions.
+
+pub const ReadFn = fn(context: *anyopaque, into: [*]u8, length: usize) -> isize
+pub const WriteFn = fn(context: *anyopaque, from: [*]const u8, length: usize) -> isize
+
+fn flush(client: *Client, context: *anyopaque, writeFn: WriteFn) -> bool {
+    while client.*.outputLength > 0 {
+        const written = writeFn(context, client.*.output, client.*.outputLength)
+        if written <= 0 { return false }
+        outputSent(client, @intCast(usize, written))
+    }
+    return true
+}
+
+fn fill(client: *Client, context: *anyopaque, readFn: ReadFn) -> bool {
+    if inputRoom(client) == 0 { return false }
+    const count = readFn(context, inputSpace(client), inputRoom(client))
+    if count <= 0 {
+        const ended = endOfInput(client)
+        return false
+    }
+    inputAdded(client, @intCast(usize, count))
+    return true
+}
+
+// The whole handshake: connected, or why not (a chain that does not
+// verify is refused here; use the buffers to decide otherwise).
+pub fn handshake(client: *Client, context: *anyopaque, readFn: ReadFn, writeFn: WriteFn) -> State {
+    if client.*.phase == Phase.idle {
+        const started = start(client)
+    }
+    while true {
+        if !flush(client, context, writeFn) { return fail(client, Failure.eof, 0) }
+        const state = process(client)
+        if state == State.checkCertificate {
+            const refused = acceptCertificate(client, false)
+            const sent = flush(client, context, writeFn)
+            return State.failed
+        }
+        if state != State.handshaking {
+            const sent = flush(client, context, writeFn)
+            return state
+        }
+        if !fill(client, context, readFn) { return client.*.state }
+    }
+    return client.*.state
+}
+
+// Sends all of `data`; false when the connection failed.
+pub fn send(client: *Client, context: *anyopaque, writeFn: WriteFn, data: [*]const u8, length: usize) -> bool {
+    var taken: usize = 0
+    while taken < length {
+        const now = write(client, data + taken, length - taken)
+        if now == 0 && client.*.state != State.connected { return false }
+        taken += now
+        if !flush(client, context, writeFn) { return false }
+    }
+    return true
+}
+
+// Received data, at least a byte unless the connection is over: how
+// many bytes; 0 at close_notify, -1 at a failure.
+pub fn receive(client: *Client, context: *anyopaque, readFn: ReadFn, writeFn: WriteFn, out: [*]u8, room: usize) -> isize {
+    while true {
+        const state = process(client)
+        if !flush(client, context, writeFn) { return -1 }
+        if readable(client) > 0 { return @intCast(isize, read(client, out, room)) }
+        if state == State.closed { return 0 }
+        if state != State.connected { return -1 }
+        if !fill(client, context, readFn) {
+            if client.*.state == State.closed { return 0 }
+            return -1
+        }
+    }
+    return -1
+}
