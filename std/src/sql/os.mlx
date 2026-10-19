@@ -1,0 +1,441 @@
+// std.sql.os: what the database asks of the system: files read and
+// written at offsets, synced, truncated and removed; POSIX advisory locks
+// in SQLite's places, so that SQLite itself and this library, in other
+// processes, see each other's transactions; locks between threads; the
+// time.
+//
+// POSIX locks belong to a process and a file, not to a descriptor, and
+// closing any descriptor of a file drops them all. So every connection of
+// the process to one file shares one descriptor and one record of the
+// locks the process holds on it (an Inode, found by device and inode
+// number), as SQLite's unixInodeInfo does: the process takes the locks
+// its connections need together, and they settle among themselves who
+// may write.
+const mem = @import("./mem.mlx")
+const linux = @import("../../bootstrap/os/linux.mlx")
+
+// ---------------------------------------------------------------------------
+// Locks between threads: a futex word (0 free, 1 held, 2 held and waited
+// for), and a recursive lock of an owner, a word and a depth.
+
+pub fn lock(word: *u32) -> void {
+    const first = @cmpxchgStrong(u32, word, 0, 1, acquire, monotonic)
+    if first.0 { return }
+    while @atomicRmw(u32, word, xchg, 2, acquire) != 0 {
+        _ = linux.syscall6(linux.SYS_futex, @intFromPtr(word), 128, 2, 0, 0, 0)
+    }
+}
+
+pub fn unlock(word: *u32) -> void {
+    if @atomicRmw(u32, word, xchg, 0, release) == 2 {
+        _ = linux.syscall6(linux.SYS_futex, @intFromPtr(word), 129, 1, 0, 0, 0)
+    }
+}
+
+pub fn threadId() -> u32 { return @intCast(u32, @bitCast(usize, linux.syscall0(linux.SYS_gettid)) & 0xffffffff) }
+
+pub const Mutex = struct {
+    owner: u32
+    word: u32
+    depth: u32
+}
+
+pub fn initMutex(m: *Mutex) -> void {
+    m.*.owner = 0
+    m.*.word = 0
+    m.*.depth = 0
+}
+
+pub fn enter(m: *Mutex) -> void {
+    const me = threadId()
+    if @atomicLoad(u32, &m.*.owner, acquire) == me {
+        m.*.depth += 1
+        return
+    }
+    lock(&m.*.word)
+    @atomicStore(u32, &m.*.owner, me, release)
+    m.*.depth = 1
+}
+
+pub fn leave(m: *Mutex) -> void {
+    if m.*.depth > 1 {
+        m.*.depth -= 1
+        return
+    }
+    m.*.depth = 0
+    @atomicStore(u32, &m.*.owner, 0, release)
+    unlock(&m.*.word)
+}
+
+// Whether the calling thread holds the lock.
+pub fn held(m: *Mutex) -> bool { return @atomicLoad(u32, &m.*.owner, acquire) == threadId() }
+
+// ---------------------------------------------------------------------------
+// Time.
+
+// Milliseconds since the Unix epoch.
+pub fn nowMilliseconds() -> i64 {
+    var spec: [2]i64 = undefined
+    _ = linux.syscall2(linux.SYS_clock_gettime, 0, @intFromPtr(&spec))
+    return spec[0] * 1000 + spec[1] / 1000000
+}
+
+pub fn monotonicMilliseconds() -> i64 {
+    var spec: [2]i64 = undefined
+    _ = linux.syscall2(linux.SYS_clock_gettime, 1, @intFromPtr(&spec))
+    return spec[0] * 1000 + spec[1] / 1000000
+}
+
+pub fn sleepMilliseconds(milliseconds: i64) -> void {
+    var spec: [2]i64 = undefined
+    spec[0] = milliseconds / 1000
+    spec[1] = (milliseconds % 1000) * 1000000
+    _ = linux.syscall2(linux.SYS_nanosleep, @intFromPtr(&spec), 0)
+}
+
+// Random bytes from the kernel.
+pub fn randomBytes(into: usize, count: usize) -> void {
+    var done: usize = 0
+    while done < count {
+        const got = linux.syscall3(318, into + done, count - done, 0)
+        if got <= 0 { break }
+        done += @bitCast(usize, got)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Files.
+
+pub const OK: i32 = 0
+pub const BUSY: i32 = 5
+pub const IOERR: i32 = 10
+pub const CANTOPEN: i32 = 14
+pub const READONLY: i32 = 8
+
+// A path as a C string (0 after it) in a block of its own.
+pub fn cPath(path: []const u8) -> usize { return mem.dupText(path) }
+
+pub fn exists(path: usize) -> bool { return linux.syscall2(linux.SYS_access, path, 0) == 0 }
+
+pub fn remove(path: usize) -> bool { return linux.syscall1(linux.SYS_unlink, path) == 0 }
+
+// Opens `path` (a C string): read and write (made when `create`), or read
+// only; the descriptor or a negative errno.
+pub fn openFile(path: usize, write: bool, create: bool) -> isize {
+    var flags = linux.O_CLOEXEC | (if write { linux.O_RDWR } else { linux.O_RDONLY })
+    if create { flags = flags | linux.O_CREAT }
+    var fd = linux.syscall3(linux.SYS_open, path, flags, 420)
+    while fd == linux.EINTR { fd = linux.syscall3(linux.SYS_open, path, flags, 420) }
+    return fd
+}
+
+pub fn closeFile(fd: isize) -> void { linux.close(fd) }
+
+// Reads `count` bytes at `offset` (zeros past the end of the file):
+// whether it could.
+pub fn readAt(fd: isize, into: usize, count: usize, offset: u64) -> bool {
+    var done: usize = 0
+    while done < count {
+        const got = linux.syscall4(linux.SYS_pread64, @bitCast(usize, fd), into + done, count - done, offset + @intCast(u64, done))
+        if got == linux.EINTR { continue }
+        if got < 0 { return false }
+        if got == 0 {
+            mem.zero(into + done, count - done)
+            return true
+        }
+        done += @bitCast(usize, got)
+    }
+    return true
+}
+
+pub fn writeAt(fd: isize, from: usize, count: usize, offset: u64) -> bool {
+    var done: usize = 0
+    while done < count {
+        const wrote = linux.syscall4(linux.SYS_pwrite64, @bitCast(usize, fd), from + done, count - done, offset + @intCast(u64, done))
+        if wrote == linux.EINTR { continue }
+        if wrote <= 0 { return false }
+        done += @bitCast(usize, wrote)
+    }
+    return true
+}
+
+pub fn sync(fd: isize) -> bool { return linux.syscall1(linux.SYS_fdatasync, @bitCast(usize, fd)) == 0 }
+
+pub fn truncate(fd: isize, length: u64) -> bool { return linux.syscall2(linux.SYS_ftruncate, @bitCast(usize, fd), length) == 0 }
+
+// The size of an open file, and its device and inode numbers.
+pub const FileId = struct {
+    device: u64
+    inode: u64
+    size: u64
+}
+
+pub fn identify(fd: isize, out: *FileId) -> bool {
+    const buffer = mem.alloc(256)
+    const result = linux.syscall2(linux.SYS_fstat, @bitCast(usize, fd), buffer)
+    out.*.device = mem.get64(buffer)
+    out.*.inode = mem.get64(buffer + 8)
+    out.*.size = mem.get64(buffer + 48)
+    mem.free(buffer)
+    return result == 0
+}
+
+pub fn sizeOf(fd: isize) -> u64 {
+    var id: FileId = undefined
+    if !identify(fd, &id) { return 0 }
+    return id.size
+}
+
+// ---------------------------------------------------------------------------
+// SQLite's locks: bytes at 1 GiB in the database file. A SHARED lock is a
+// read lock on one of 510 bytes (all of them, here), RESERVED a write lock
+// on the byte before them, PENDING a write lock on the byte before that,
+// EXCLUSIVE a write lock on all 510.
+
+pub const NO_LOCK: u8 = 0
+pub const SHARED_LOCK: u8 = 1
+pub const RESERVED_LOCK: u8 = 2
+pub const PENDING_LOCK: u8 = 3
+pub const EXCLUSIVE_LOCK: u8 = 4
+
+pub const PENDING_BYTE: u64 = 1073741824
+pub const RESERVED_BYTE: u64 = 1073741825
+pub const SHARED_FIRST: u64 = 1073741826
+pub const SHARED_SIZE: u64 = 510
+
+const F_GETLK: usize = 5
+const F_SETLK: usize = 6
+const F_RDLCK: u64 = 0
+const F_WRLCK: u64 = 1
+const F_UNLCK: u64 = 2
+
+// fcntl(F_SETLK) of a range; whether it was granted.
+fn fileLock(fd: isize, kind: u64, start: u64, length: u64) -> bool {
+    const flock = mem.alloc(32)
+    mem.put8(flock, kind)
+    mem.put8(flock + 1, 0)
+    mem.put8(flock + 2, 0)
+    mem.put8(flock + 3, 0)
+    mem.put64(flock + 8, start)
+    mem.put64(flock + 16, length)
+    var result = linux.syscall3(linux.SYS_fcntl, @bitCast(usize, fd), F_SETLK, flock)
+    while result == linux.EINTR { result = linux.syscall3(linux.SYS_fcntl, @bitCast(usize, fd), F_SETLK, flock) }
+    mem.free(flock)
+    return result == 0
+}
+
+// Whether another process holds a lock that a write lock on the range
+// would conflict with.
+fn othersLock(fd: isize, start: u64, length: u64) -> bool {
+    const flock = mem.alloc(32)
+    mem.put8(flock, F_WRLCK)
+    mem.put64(flock + 8, start)
+    mem.put64(flock + 16, length)
+    const result = linux.syscall3(linux.SYS_fcntl, @bitCast(usize, fd), F_GETLK, flock)
+    const kind = mem.get8(flock)
+    mem.free(flock)
+    return result == 0 && kind != F_UNLCK
+}
+
+// A file the process has open, shared by its connections to it.
+pub const Inode = struct {
+    device: u64
+    inode: u64
+    fd: isize
+    writable: bool
+    // Connections using it.
+    references: usize
+    // The strongest lock the process holds, how many connections hold a
+    // SHARED lock or more, and how many hold any.
+    level: u8
+    shared: usize
+    locks: usize
+    // Guards the fields above.
+    word: u32
+    // What the pager keeps per file (its shared write-ahead log index).
+    extra: usize
+    next: usize
+}
+
+var inodes: usize = 0
+var inodesWord: u32 = 0
+
+pub fn inodeOf(address: usize) -> *Inode { unsafe { return @ptrFromInt(*Inode, address) } }
+
+// The process's shared record of the file at `path`, opened (and made,
+// when `create`) if no connection has it open yet; 0 and the error in
+// `error` when it cannot be opened.
+pub fn acquire(path: usize, write: bool, create: bool, failure: *i32) -> usize {
+    var fd = openFile(path, write, create)
+    var writable = write
+    if fd < 0 && write && !create {
+        fd = openFile(path, false, false)
+        writable = false
+    }
+    if fd < 0 && write {
+        // A file we may only read is opened read only (SQLite does so too).
+        fd = openFile(path, false, false)
+        writable = false
+    }
+    if fd < 0 {
+        failure.* = CANTOPEN
+        return 0
+    }
+    var id: FileId = undefined
+    if !identify(fd, &id) {
+        closeFile(fd)
+        failure.* = CANTOPEN
+        return 0
+    }
+    lock(&inodesWord)
+    var at = inodes
+    while at != 0 {
+        const n = inodeOf(at)
+        if n.*.device == id.device && n.*.inode == id.inode {
+            n.*.references += 1
+            if writable && !n.*.writable {
+                // Keep the stronger descriptor: the process's locks stay
+                // (they belong to the file), so swapping is safe while
+                // this lock is held... but only if nobody holds a lock
+                // through the old one, which a close would drop.
+                if n.*.locks == 0 {
+                    closeFile(n.*.fd)
+                    n.*.fd = fd
+                    n.*.writable = true
+                    unlock(&inodesWord)
+                    return at
+                }
+            }
+            unlock(&inodesWord)
+            closeFile(fd)
+            return at
+        }
+        at = n.*.next
+    }
+    const fresh = mem.alloc(@sizeOf(Inode))
+    const n = inodeOf(fresh)
+    n.*.device = id.device
+    n.*.inode = id.inode
+    n.*.fd = fd
+    n.*.writable = writable
+    n.*.references = 1
+    n.*.next = inodes
+    inodes = fresh
+    unlock(&inodesWord)
+    return fresh
+}
+
+// One connection less; the descriptor is closed with the last.
+pub fn releaseInode(address: usize) -> void {
+    lock(&inodesWord)
+    const n = inodeOf(address)
+    n.*.references -= 1
+    if n.*.references == 0 {
+        var link = &inodes
+        while link.* != 0 {
+            if link.* == address {
+                link.* = n.*.next
+                break
+            }
+            link = &inodeOf(link.*).*.next
+        }
+        closeFile(n.*.fd)
+        mem.free(address)
+    }
+    unlock(&inodesWord)
+}
+
+// Raises a connection's lock (`held`, its current level) to `level`, as
+// SQLite's unixLock does: OK or BUSY.
+pub fn raiseLock(address: usize, held: *u8, level: u8) -> i32 {
+    if held.* >= level { return OK }
+    const n = inodeOf(address)
+    lock(&n.*.word)
+    var rc = OK
+    // Another connection of this process holds a lock that keeps this
+    // one out.
+    if held.* != n.*.level && (n.*.level >= PENDING_LOCK || level > SHARED_LOCK) {
+        unlock(&n.*.word)
+        return BUSY
+    }
+    if level == SHARED_LOCK && (n.*.level == SHARED_LOCK || n.*.level == RESERVED_LOCK) {
+        held.* = SHARED_LOCK
+        n.*.shared += 1
+        n.*.locks += 1
+        unlock(&n.*.word)
+        return OK
+    }
+    // PENDING first, for SHARED (then let go) and for EXCLUSIVE.
+    if level == SHARED_LOCK || (level == EXCLUSIVE_LOCK && held.* == RESERVED_LOCK) {
+        if !fileLock(n.*.fd, if level == SHARED_LOCK { F_RDLCK } else { F_WRLCK }, PENDING_BYTE, 1) {
+            unlock(&n.*.word)
+            return BUSY
+        }
+        if level == EXCLUSIVE_LOCK {
+            held.* = PENDING_LOCK
+            n.*.level = PENDING_LOCK
+        }
+    }
+    if level == SHARED_LOCK {
+        const got = fileLock(n.*.fd, F_RDLCK, SHARED_FIRST, SHARED_SIZE)
+        _ = fileLock(n.*.fd, F_UNLCK, PENDING_BYTE, 1)
+        if !got {
+            unlock(&n.*.word)
+            return BUSY
+        }
+        held.* = SHARED_LOCK
+        n.*.locks += 1
+        n.*.shared = 1
+        n.*.level = SHARED_LOCK
+        unlock(&n.*.word)
+        return OK
+    }
+    if level == EXCLUSIVE_LOCK && n.*.shared > 1 {
+        rc = BUSY
+    } else if level == RESERVED_LOCK {
+        if !fileLock(n.*.fd, F_WRLCK, RESERVED_BYTE, 1) { rc = BUSY }
+    } else {
+        if !fileLock(n.*.fd, F_WRLCK, SHARED_FIRST, SHARED_SIZE) { rc = BUSY }
+    }
+    if rc == OK {
+        held.* = level
+        n.*.level = level
+    }
+    unlock(&n.*.word)
+    return rc
+}
+
+// Lowers a connection's lock to SHARED or to none (posixUnlock).
+pub fn lowerLock(address: usize, held: *u8, level: u8) -> void {
+    if held.* <= level { return }
+    const n = inodeOf(address)
+    lock(&n.*.word)
+    if held.* > SHARED_LOCK {
+        if level == SHARED_LOCK {
+            _ = fileLock(n.*.fd, F_RDLCK, SHARED_FIRST, SHARED_SIZE)
+        }
+        _ = fileLock(n.*.fd, F_UNLCK, PENDING_BYTE, 2)
+        n.*.level = SHARED_LOCK
+    }
+    if level == NO_LOCK {
+        n.*.shared -= 1
+        if n.*.shared == 0 {
+            _ = fileLock(n.*.fd, F_UNLCK, 0, 0)
+            n.*.level = NO_LOCK
+        }
+        n.*.locks -= 1
+    }
+    held.* = level
+    unlock(&n.*.word)
+}
+
+// Whether some connection, of this process or another, holds RESERVED
+// or more (a writer is busy, or left a hot journal behind it if none).
+pub fn reservedByAnyone(address: usize) -> bool {
+    const n = inodeOf(address)
+    lock(&n.*.word)
+    var reserved = n.*.level > SHARED_LOCK
+    if !reserved { reserved = othersLock(n.*.fd, RESERVED_BYTE, 1) }
+    unlock(&n.*.word)
+    return reserved
+}

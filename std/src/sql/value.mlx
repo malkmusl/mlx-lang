@@ -1,0 +1,519 @@
+// std.sql.value: SQL values (NULL, INTEGER, REAL, TEXT, BLOB) as SQLite
+// holds them in its registers: the conversions between them that
+// expressions, affinities and the C API's column_* functions make, and
+// their order (NULL, then numbers by value, then text by a collation, then
+// blobs by memcmp).
+//
+// A Value owns the bytes of its text or blob (a block it grows and
+// reuses); setting one copies the bytes in, so values never point into
+// pages or statements that move under them. Text is UTF-8.
+const mem = @import("./mem.mlx")
+const numbers = @import("./numbers.mlx")
+
+// The fundamental types, numbered as SQLITE_INTEGER ... SQLITE_NULL.
+pub const INTEGER: u8 = 1
+pub const REAL: u8 = 2
+pub const TEXT: u8 = 3
+pub const BLOB: u8 = 4
+pub const NULL: u8 = 5
+
+// Affinities, in SQLite's order (SQLITE_AFF_BLOB ... SQLITE_AFF_REAL).
+pub const AFF_NONE: u8 = 0
+pub const AFF_BLOB: u8 = 65
+pub const AFF_TEXT: u8 = 66
+pub const AFF_NUMERIC: u8 = 67
+pub const AFF_INTEGER: u8 = 68
+pub const AFF_REAL: u8 = 69
+
+pub const Value = struct {
+    kind: u8
+    // A subtype (sqlite3_result_subtype), kept for functions' results.
+    subtype: u8
+    i: i64
+    r: f64
+    // The bytes of a TEXT or BLOB, and the block they live in.
+    data: usize
+    length: usize
+    capacity: usize
+}
+
+pub fn init(v: *Value) -> void {
+    v.*.kind = NULL
+    v.*.subtype = 0
+    v.*.i = 0
+    v.*.r = 0.0
+    v.*.data = 0
+    v.*.length = 0
+    v.*.capacity = 0
+}
+
+// The bytes given back; the value is NULL after.
+pub fn release(v: *Value) -> void {
+    if v.*.capacity != 0 { mem.free(v.*.data) }
+    init(v)
+}
+
+pub fn setNull(v: *Value) -> void {
+    v.*.kind = NULL
+    v.*.subtype = 0
+    v.*.length = 0
+}
+
+pub fn setInt(v: *Value, i: i64) -> void {
+    v.*.kind = INTEGER
+    v.*.subtype = 0
+    v.*.i = i
+    v.*.length = 0
+}
+
+pub fn setReal(v: *Value, r: f64) -> void {
+    // NaN is NULL in SQL.
+    if r != r {
+        setNull(v)
+        return
+    }
+    v.*.kind = REAL
+    v.*.subtype = 0
+    v.*.r = r
+    v.*.length = 0
+}
+
+pub fn setBool(v: *Value, b: bool) -> void { setInt(v, if b { 1 } else { 0 }) }
+
+// Room for `length` bytes (and a 0 after them) in the value's own block.
+pub fn room(v: *Value, length: usize) -> bool {
+    if v.*.capacity >= length + 1 { return true }
+    var size = if v.*.capacity < 32 { 32 } else { v.*.capacity * 2 }
+    while size < length + 1 { size = size * 2 }
+    if v.*.capacity != 0 { mem.free(v.*.data) }
+    v.*.data = mem.alloc(size)
+    if v.*.data == 0 {
+        v.*.capacity = 0
+        return false
+    }
+    v.*.capacity = size
+    return true
+}
+
+fn setBytes(v: *Value, kind: u8, address: usize, length: usize) -> bool {
+    // The source may be this value's own block (a copy of a part of it).
+    if v.*.capacity != 0 && address >= v.*.data && address < v.*.data + v.*.capacity {
+        mem.copy(v.*.data, address, length)
+        mem.put8(v.*.data + length, 0)
+    } else {
+        if !room(v, length) {
+            setNull(v)
+            return false
+        }
+        mem.copy(v.*.data, address, length)
+        mem.put8(v.*.data + length, 0)
+    }
+    v.*.kind = kind
+    v.*.subtype = 0
+    v.*.length = length
+    return true
+}
+
+pub fn setText(v: *Value, address: usize, length: usize) -> bool { return setBytes(v, TEXT, address, length) }
+pub fn setBlob(v: *Value, address: usize, length: usize) -> bool { return setBytes(v, BLOB, address, length) }
+pub fn setString(v: *Value, text: []const u8) -> bool { return setBytes(v, TEXT, @intFromPtr(text.pointer), text.length) }
+
+// A zeroed blob of `length` bytes (zeroblob()).
+pub fn setZeroBlob(v: *Value, length: usize) -> bool {
+    if !room(v, length) {
+        setNull(v)
+        return false
+    }
+    mem.zero(v.*.data, length + 1)
+    v.*.kind = BLOB
+    v.*.subtype = 0
+    v.*.length = length
+    return true
+}
+
+pub fn copy(target: *Value, source: *Value) -> bool {
+    if target == source { return true }
+    if source.*.kind == TEXT || source.*.kind == BLOB {
+        if !setBytes(target, source.*.kind, source.*.data, source.*.length) { return false }
+        target.*.subtype = source.*.subtype
+        return true
+    }
+    target.*.kind = source.*.kind
+    target.*.subtype = source.*.subtype
+    target.*.i = source.*.i
+    target.*.r = source.*.r
+    target.*.length = 0
+    return true
+}
+
+// Moves `source`'s contents into `target`, leaving `source` NULL with no
+// block (its block, if any, is `target`'s now).
+pub fn move(target: *Value, source: *Value) -> void {
+    release(target)
+    target.*.kind = source.*.kind
+    target.*.subtype = source.*.subtype
+    target.*.i = source.*.i
+    target.*.r = source.*.r
+    target.*.data = source.*.data
+    target.*.length = source.*.length
+    target.*.capacity = source.*.capacity
+    init(source)
+}
+
+pub fn isNull(v: *Value) -> bool { return v.*.kind == NULL }
+
+pub fn bytesOf(v: *Value) -> []const u8 { return mem.view(v.*.data, v.*.length) }
+
+// ---------------------------------------------------------------------------
+// Conversions.
+
+// The INTEGER a value reads as (sqlite3VdbeIntValue): a REAL cut toward
+// zero (saturated), a TEXT's or BLOB's leading integer (saturated), else 0.
+pub fn toInt(v: *Value) -> i64 {
+    if v.*.kind == INTEGER { return v.*.i }
+    if v.*.kind == REAL { return numbers.realToInteger(v.*.r) }
+    if v.*.kind == TEXT || v.*.kind == BLOB { return textToInt(v.*.data, v.*.length) }
+    return 0
+}
+
+// sqlite3Atoi64 over a text: its leading integer, saturated.
+pub fn textToInt(address: usize, length: usize) -> i64 {
+    var i: usize = 0
+    while i < length && numbers.isSpace(mem.get8(address + i)) { i += 1 }
+    var negative = false
+    if i < length && mem.get8(address + i) == 45 {
+        negative = true
+        i += 1
+    } else if i < length && mem.get8(address + i) == 43 {
+        i += 1
+    }
+    var value: u64 = 0
+    var overflow = false
+    while i < length && numbers.isDigit(mem.get8(address + i)) {
+        const d = mem.get8(address + i) - 48
+        if value > 1844674407370955161 || (value == 1844674407370955161 && d > 5) {
+            overflow = true
+        } else if !overflow {
+            value = value * 10 + d
+        }
+        i += 1
+    }
+    if negative {
+        if overflow || value >= 9223372036854775808 { return -9223372036854775807 - 1 }
+        return 0 - @bitCast(i64, value)
+    }
+    if overflow || value > 9223372036854775807 { return 9223372036854775807 }
+    return @bitCast(i64, value)
+}
+
+// The REAL a value reads as (sqlite3VdbeRealValue): a TEXT's or BLOB's
+// leading number, else 0.0.
+pub fn toReal(v: *Value) -> f64 {
+    if v.*.kind == REAL { return v.*.r }
+    if v.*.kind == INTEGER { return @floatFromInt(f64, v.*.i) }
+    if v.*.kind == TEXT || v.*.kind == BLOB {
+        var p: numbers.Parsed = undefined
+        numbers.parse(v.*.data, v.*.length, &p)
+        if p.kind == numbers.NOT_NUMBER { return 0.0 }
+        return p.real
+    }
+    return 0.0
+}
+
+// A number's text into a buffer (the INTEGER's decimal digits, the
+// REAL's "%!.15g").
+pub fn appendNumber(b: *mem.Buffer, v: *Value) -> bool {
+    if v.*.kind == INTEGER { return mem.appendDecimal(b, v.*.i) }
+    return numbers.appendReal(b, v.*.r)
+}
+
+// Makes the value TEXT (a number rendered, a BLOB's bytes taken as text,
+// NULL left NULL): sqlite3VdbeMemStringify.
+pub fn toText(v: *Value) -> bool {
+    if v.*.kind == TEXT { return true }
+    if v.*.kind == BLOB {
+        v.*.kind = TEXT
+        return true
+    }
+    if v.*.kind == NULL { return true }
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    if !appendNumber(&b, v) {
+        mem.freeBuffer(&b)
+        return false
+    }
+    const ok = setText(v, b.data, b.length)
+    mem.freeBuffer(&b)
+    return ok
+}
+
+pub fn toBlob(v: *Value) -> bool {
+    if v.*.kind == BLOB { return true }
+    if v.*.kind == NULL { return true }
+    if !toText(v) { return false }
+    v.*.kind = BLOB
+    return true
+}
+
+// The number an arithmetic operator takes from a value
+// (computeNumericType): a TEXT or BLOB becomes the number its text starts
+// with (an INTEGER when that is an integer that fits, a REAL else, 0 when
+// there is none). Into `out`; NULL stays NULL.
+pub fn numeric(v: *Value, out: *Value) -> void {
+    if v.*.kind == INTEGER {
+        setInt(out, v.*.i)
+        return
+    }
+    if v.*.kind == REAL {
+        setReal(out, v.*.r)
+        return
+    }
+    if v.*.kind == NULL {
+        setNull(out)
+        return
+    }
+    var p: numbers.Parsed = undefined
+    numbers.parse(v.*.data, v.*.length, &p)
+    if p.kind == numbers.REAL {
+        setReal(out, p.real)
+        return
+    }
+    if p.kind == numbers.INTEGER && !p.fits {
+        setReal(out, p.real)
+        return
+    }
+    setInt(out, textToInt(v.*.data, v.*.length))
+}
+
+// NUMERIC affinity applied to a TEXT (applyNumericAffinity with
+// bTryForInt): a text that is a whole number becomes an INTEGER when its
+// value is integral and fits, a REAL else; other text stays.
+fn numericFromText(v: *Value, tryForInt: bool) -> void {
+    var p: numbers.Parsed = undefined
+    numbers.parse(v.*.data, v.*.length, &p)
+    if p.kind == numbers.NOT_NUMBER || !p.whole { return }
+    if p.kind == numbers.INTEGER && p.fits {
+        setInt(v, p.integer)
+        return
+    }
+    var i: i64 = 0
+    if tryForInt && numbers.realIsInteger(p.real, &i) {
+        setInt(v, i)
+        return
+    }
+    setReal(v, p.real)
+}
+
+// A column's affinity applied to a value stored in it (applyAffinity):
+// REAL keeps numbers as REALs (SQLite may write a whole one as an integer
+// in the record, but reads it back as a REAL).
+pub fn applyAffinity(v: *Value, affinity: u8) -> void {
+    if affinity >= AFF_NUMERIC {
+        if v.*.kind == TEXT { numericFromText(v, true) }
+        if affinity == AFF_REAL {
+            if v.*.kind == INTEGER { setReal(v, @floatFromInt(f64, v.*.i)) }
+        } else if v.*.kind == REAL {
+            var i: i64 = 0
+            if numbers.realIsInteger(v.*.r, &i) { setInt(v, i) }
+        }
+    } else if affinity == AFF_TEXT {
+        if v.*.kind == INTEGER || v.*.kind == REAL { _ = toText(v) }
+    }
+}
+
+// The affinity a comparison applies to a value that has none
+// (sqlite3ApplyNumericAffinity for comparisons: NUMERIC on text only, no
+// conversion of reals to integers).
+pub fn applyComparisonNumeric(v: *Value) -> void {
+    if v.*.kind == TEXT { numericFromText(v, false) }
+}
+
+// CAST(v AS type) for an affinity (sqlite3VdbeMemCast).
+pub fn cast(v: *Value, affinity: u8) -> void {
+    if v.*.kind == NULL { return }
+    if affinity == AFF_BLOB {
+        if v.*.kind != BLOB {
+            _ = toText(v)
+            v.*.kind = BLOB
+        }
+    } else if affinity == AFF_TEXT {
+        _ = toText(v)
+        v.*.kind = TEXT
+    } else if affinity == AFF_INTEGER {
+        setInt(v, toInt(v))
+    } else if affinity == AFF_REAL {
+        setReal(v, toReal(v))
+    } else {
+        // NUMERIC: a text or blob as the number it starts with (an
+        // integer when that fits and is whole); a REAL stays a REAL unless
+        // it is whole.
+        if v.*.kind == TEXT || v.*.kind == BLOB {
+            var p: numbers.Parsed = undefined
+            numbers.parse(v.*.data, v.*.length, &p)
+            if p.kind == numbers.NOT_NUMBER {
+                setInt(v, 0)
+            } else if p.kind == numbers.INTEGER && p.fits {
+                setInt(v, p.integer)
+            } else if p.kind == numbers.INTEGER && !p.whole {
+                setInt(v, textToInt(v.*.data, v.*.length))
+            } else {
+                var i: i64 = 0
+                if numbers.realIsInteger(p.real, &i) {
+                    setInt(v, i)
+                } else {
+                    setReal(v, p.real)
+                }
+            }
+        } else if v.*.kind == REAL {
+            var i: i64 = 0
+            if numbers.realIsInteger(v.*.r, &i) { setInt(v, i) }
+        }
+    }
+}
+
+// The affinity of a declared column type (sqlite3AffinityType).
+pub fn affinityOfType(typeName: []const u8) -> u8 {
+    if typeName.length == 0 { return AFF_BLOB }
+    var affinity = AFF_NUMERIC
+    var i: usize = 0
+    var h: u64 = 0
+    while i < typeName.length {
+        h = ((h << 8) + mem.lower(@intCast(u64, typeName[i]))) & 0xffffffff
+        i += 1
+        if h == 0x63686172 {
+            // "char"
+            affinity = AFF_TEXT
+        } else if h == 0x636c6f62 {
+            // "clob"
+            affinity = AFF_TEXT
+        } else if h == 0x74657874 {
+            // "text"
+            affinity = AFF_TEXT
+        } else if h == 0x626c6f62 && (affinity == AFF_NUMERIC || affinity == AFF_REAL) {
+            // "blob"
+            affinity = AFF_BLOB
+        } else if h == 0x7265616c && affinity == AFF_NUMERIC {
+            // "real"
+            affinity = AFF_REAL
+        } else if h == 0x666c6f61 && affinity == AFF_NUMERIC {
+            // "floa"
+            affinity = AFF_REAL
+        } else if h == 0x646f7562 && affinity == AFF_NUMERIC {
+            // "doub"
+            affinity = AFF_REAL
+        } else if (h & 0x00ffffff) == 0x00696e74 {
+            // "int": INTEGER wins over everything.
+            return AFF_INTEGER
+        }
+    }
+    return affinity
+}
+
+// ---------------------------------------------------------------------------
+// Collations and order.
+
+// A collating function from C: (context, length, bytes, length, bytes).
+pub const CollateFn = fn(usize, i32, usize, i32, usize) -> i32
+
+pub const BINARY: u8 = 0
+pub const NOCASE: u8 = 1
+pub const RTRIM: u8 = 2
+pub const USER: u8 = 3
+
+pub const Collation = struct {
+    kind: u8
+    name: usize
+    nameLength: usize
+    call: usize
+    context: usize
+    destroy: usize
+    next: usize
+}
+
+// Two texts in a collation's order (0 = BINARY's).
+pub fn compareText(collation: usize, a: usize, aLength: usize, b: usize, bLength: usize) -> i64 {
+    if collation == 0 { return mem.compare(a, aLength, b, bLength) }
+    const c: *Collation = unsafe { @ptrFromInt(*Collation, collation) }
+    if c.*.kind == BINARY { return mem.compare(a, aLength, b, bLength) }
+    if c.*.kind == NOCASE {
+        const n = if aLength < bLength { aLength } else { bLength }
+        var i: usize = 0
+        while i < n {
+            const x = mem.lower(mem.get8(a + i))
+            const y = mem.lower(mem.get8(b + i))
+            if x != y { return if x < y { -1 } else { 1 } }
+            i += 1
+        }
+        if aLength == bLength { return 0 }
+        return if aLength < bLength { -1 } else { 1 }
+    }
+    if c.*.kind == RTRIM {
+        var an = aLength
+        var bn = bLength
+        while an > 0 && mem.get8(a + an - 1) == 32 { an -= 1 }
+        while bn > 0 && mem.get8(b + bn - 1) == 32 { bn -= 1 }
+        return mem.compare(a, an, b, bn)
+    }
+    const call: CollateFn = unsafe { @ptrFromInt(CollateFn, c.*.call) }
+    const r = call(c.*.context, @intCast(i32, aLength & 0x7fffffff), a, @intCast(i32, bLength & 0x7fffffff), b)
+    if r < 0 { return -1 }
+    if r > 0 { return 1 }
+    return 0
+}
+
+// An INTEGER against a REAL (sqlite3IntFloatCompare).
+pub fn compareIntReal(i: i64, r: f64) -> i64 {
+    if r != r { return 1 }
+    if r < -9223372036854775808.0 { return 1 }
+    if r >= 9223372036854775808.0 { return -1 }
+    const y = @intFromFloat(i64, r)
+    if i < y { return -1 }
+    if i > y { return 1 }
+    const s = @floatFromInt(f64, i)
+    if s < r { return -1 }
+    if s > r { return 1 }
+    return 0
+}
+
+fn kindRank(v: *Value) -> u64 {
+    if v.*.kind == NULL { return 0 }
+    if v.*.kind == INTEGER || v.*.kind == REAL { return 1 }
+    if v.*.kind == TEXT { return 2 }
+    return 3
+}
+
+// sqlite3MemCompare: NULL first, numbers by value, texts by `collation`,
+// blobs by memcmp.
+pub fn compare(a: *Value, b: *Value, collation: usize) -> i64 {
+    const ra = kindRank(a)
+    const rb = kindRank(b)
+    if ra != rb { return if ra < rb { -1 } else { 1 } }
+    if ra == 0 { return 0 }
+    if ra == 1 {
+        const aReal = a.*.kind == REAL
+        const bReal = b.*.kind == REAL
+        if !aReal && !bReal {
+            if a.*.i < b.*.i { return -1 }
+            if a.*.i > b.*.i { return 1 }
+            return 0
+        }
+        if aReal && bReal {
+            if a.*.r < b.*.r { return -1 }
+            if a.*.r > b.*.r { return 1 }
+            return 0
+        }
+        if aReal { return 0 - compareIntReal(b.*.i, a.*.r) }
+        return compareIntReal(a.*.i, b.*.r)
+    }
+    if ra == 2 { return compareText(collation, a.*.data, a.*.length, b.*.data, b.*.length) }
+    return mem.compare(a.*.data, a.*.length, b.*.data, b.*.length)
+}
+
+// Whether a value counts as true (sqlite3VdbeBooleanValue): a number not
+// zero, a text whose leading number is not zero.
+pub fn isTrue(v: *Value) -> bool {
+    if v.*.kind == INTEGER { return v.*.i != 0 }
+    if v.*.kind == REAL { return v.*.r != 0.0 }
+    if v.*.kind == NULL { return false }
+    return toReal(v) != 0.0
+}

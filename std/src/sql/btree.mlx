@@ -1,0 +1,1640 @@
+// std.sql.btree: SQLite's B-trees on the pager's pages.
+//
+// A table is a B+tree keyed by rowid: its leaves (page type 13) hold the
+// rows, each a cell of the payload's length, the rowid and the payload
+// (the record); interior pages (type 5) hold child page numbers and the
+// largest rowid under each. An index is a B-tree of records (types 10 and
+// 2): every entry is a cell somewhere, in a leaf or between two children
+// of an interior page. A payload too long for its page has its start in
+// the cell and the rest in a chain of overflow pages, as SQLite splits it
+// (the local part between "minLocal" and "maxLocal" of the usable size).
+// Pages no tree uses are on the freelist (trunk pages of leaf numbers),
+// and are taken from it before the file grows.
+//
+// Changing a page rewrites it whole from the list of its cells (a page is
+// at most 64 KiB; this keeps every page defragmented). A page that no
+// longer fits its cells, or that a deletion left less than a third full,
+// is balanced with up to two siblings: their cells, with the dividers
+// between them in the parent, are dealt out again over as few pages as
+// hold them, and the parent's dividers replaced, which may overflow the
+// parent in turn. The root keeps its page number: an overfull root moves
+// its cells to a new child and becomes that child's parent; an interior
+// root left with one child takes the child's cells back.
+//
+// Cursors walk a tree from its root along a path of pages. A cursor holds
+// page numbers, not page addresses, so the cache may drop clean pages
+// between operations; and it remembers the key of its entry, so that
+// after any change to the database (through any cursor, a rollback) it
+// finds its place again.
+const mem = @import("./mem.mlx")
+const pg = @import("./pager.mlx")
+const record = @import("./record.mlx")
+const value = @import("./value.mlx")
+
+pub const TABLE_LEAF: u64 = 13
+pub const TABLE_INTERIOR: u64 = 5
+pub const INDEX_LEAF: u64 = 10
+pub const INDEX_INTERIOR: u64 = 2
+
+pub const OK: i32 = 0
+pub const NOMEM: i32 = 7
+pub const CORRUPT: i32 = 11
+
+pub const MAX_DEPTH: usize = 20
+
+pub fn pagerOf(address: usize) -> *pg.Pager { unsafe { return @ptrFromInt(*pg.Pager, address) } }
+
+inline fn headerOffset(number: u64) -> usize { return if number == 1 { 100 } else { 0 } }
+
+inline fn isLeaf(kind: u64) -> bool { return (kind & 8) != 0 }
+inline fn isTable(kind: u64) -> bool { return (kind & 4) != 0 }
+
+inline fn headerSize(kind: u64) -> usize { return if isLeaf(kind) { 8 } else { 12 } }
+
+fn maxLocal(p: *pg.Pager, kind: u64) -> usize {
+    const u = pg.usableSize(p)
+    if kind == TABLE_LEAF { return u - 35 }
+    return (u - 12) * 64 / 255 - 23
+}
+
+fn minLocal(p: *pg.Pager) -> usize {
+    const u = pg.usableSize(p)
+    return (u - 12) * 32 / 255 - 23
+}
+
+// How much of a payload of `size` bytes stays in the cell.
+fn localSize(p: *pg.Pager, kind: u64, size: u64) -> usize {
+    const most = maxLocal(p, kind)
+    if size <= @intCast(u64, most) { return @intCast(usize, size) }
+    const least = minLocal(p)
+    const u = pg.usableSize(p)
+    const surplus = least + @intCast(usize, (size - @intCast(u64, least)) % @intCast(u64, u - 4))
+    return if surplus <= most { surplus } else { least }
+}
+
+// A cell's parts, read from its bytes.
+pub const Cell = struct {
+    child: u64
+    rowid: i64
+    size: u64
+    local: usize
+    payload: usize
+    overflow: u64
+    // The cell's length in the page (at least 4).
+    length: usize
+}
+
+fn parseCell(p: *pg.Pager, kind: u64, at: usize, out: *Cell) -> void {
+    var cursor = at
+    out.*.child = 0
+    out.*.rowid = 0
+    out.*.size = 0
+    out.*.overflow = 0
+    if !isLeaf(kind) {
+        out.*.child = mem.get32be(cursor)
+        cursor += 4
+        if isTable(kind) {
+            var key: u64 = 0
+            cursor += record.getVarint(cursor, &key)
+            out.*.rowid = @bitCast(i64, key)
+            out.*.local = 0
+            out.*.payload = cursor
+            out.*.length = cursor - at
+            return
+        }
+    }
+    var size: u64 = 0
+    cursor += record.getVarint(cursor, &size)
+    out.*.size = size
+    if kind == TABLE_LEAF {
+        var key: u64 = 0
+        cursor += record.getVarint(cursor, &key)
+        out.*.rowid = @bitCast(i64, key)
+    }
+    out.*.local = localSize(p, kind, size)
+    out.*.payload = cursor
+    cursor += out.*.local
+    if @intCast(u64, out.*.local) < size {
+        out.*.overflow = mem.get32be(cursor)
+        cursor += 4
+    }
+    out.*.length = cursor - at
+    if out.*.length < 4 { out.*.length = 4 }
+}
+
+inline fn cellCount(d: usize, h: usize) -> usize { return @intCast(usize, mem.get16be(d + h + 3)) }
+
+inline fn cellAt(d: usize, h: usize, kind: u64, index: usize) -> usize {
+    return d + @intCast(usize, mem.get16be(d + h + headerSize(kind) + index * 2))
+}
+
+// ---------------------------------------------------------------------------
+// Lists of cells: what a page holds while it is rewritten or balanced.
+
+pub const Content = struct {
+    kind: u64
+    bytes: mem.Buffer
+    // Two words per cell: its offset in `bytes` and its length.
+    spans: mem.Words
+    rightChild: u64
+}
+
+fn initContent(ct: *Content) -> void {
+    ct.*.kind = 0
+    mem.initBuffer(&ct.*.bytes)
+    mem.initWords(&ct.*.spans)
+    ct.*.rightChild = 0
+}
+
+fn freeContent(ct: *Content) -> void {
+    mem.freeBuffer(&ct.*.bytes)
+    mem.freeWords(&ct.*.spans)
+}
+
+inline fn count(ct: *Content) -> usize { return ct.*.spans.length / 2 }
+inline fn spanAddress(ct: *Content, i: usize) -> usize { return ct.*.bytes.data + @intCast(usize, mem.at(&ct.*.spans, i * 2)) }
+inline fn spanLength(ct: *Content, i: usize) -> usize { return @intCast(usize, mem.at(&ct.*.spans, i * 2 + 1)) }
+
+// Adds a cell's bytes (copied) at position `index`.
+fn insertCell(ct: *Content, index: usize, address: usize, length: usize) -> bool {
+    const offset = ct.*.bytes.length
+    // The bytes may be in this very buffer, which may move: copy through
+    // a block of their own.
+    const copied = mem.dup(address, length)
+    if copied == 0 { return false }
+    const ok = mem.append(&ct.*.bytes, copied, length)
+    mem.free(copied)
+    if !ok { return false }
+    if !mem.insertAt(&ct.*.spans, index * 2, @intCast(u64, offset)) { return false }
+    return mem.insertAt(&ct.*.spans, index * 2 + 1, @intCast(u64, length))
+}
+
+fn addCell(ct: *Content, address: usize, length: usize) -> bool { return insertCell(ct, count(ct), address, length) }
+
+fn removeCell(ct: *Content, index: usize) -> void {
+    mem.removeAt(&ct.*.spans, index * 2)
+    mem.removeAt(&ct.*.spans, index * 2)
+}
+
+// The cells of a page (copied) into `ct`.
+fn loadContent(p: *pg.Pager, number: u64, ct: *Content) -> i32 {
+    const page = pg.get(p, number)
+    if page == 0 { return NOMEM }
+    const d = pg.data(page)
+    const h = headerOffset(number)
+    const kind = mem.get8(d + h)
+    ct.*.kind = kind
+    ct.*.rightChild = if isLeaf(kind) { 0 } else { mem.get32be(d + h + 8) }
+    const n = cellCount(d, h)
+    var cell: Cell = undefined
+    var i: usize = 0
+    while i < n {
+        const at = cellAt(d, h, kind, i)
+        parseCell(p, kind, at, &cell)
+        // Cells shorter than 4 bytes take 4 in the page; their own bytes
+        // are fewer.
+        var length = cell.length
+        if at + length > d + p.*.pageSize { length = d + p.*.pageSize - at }
+        if !addCell(ct, at, length) { return NOMEM }
+        i += 1
+    }
+    return OK
+}
+
+inline fn padded(length: usize) -> usize { return if length < 4 { 4 } else { length } }
+
+// Bytes cells [from, to) take in a page, pointers included.
+fn spaceOf(ct: *Content, from: usize, to: usize) -> usize {
+    var total: usize = 0
+    var i = from
+    while i < to {
+        total += padded(spanLength(ct, i)) + 2
+        i += 1
+    }
+    return total
+}
+
+fn capacity(p: *pg.Pager, number: u64, kind: u64) -> usize {
+    return pg.usableSize(p) - headerOffset(number) - headerSize(kind)
+}
+
+// Rewrites page `number` (made writable) with cells [from, to) of `ct`, of
+// page type `kind`, and the right child for an interior page.
+fn writePage(p: *pg.Pager, number: u64, kind: u64, ct: *Content, from: usize, to: usize, rightChild: u64) -> i32 {
+    const page = pg.get(p, number)
+    if page == 0 || !pg.write(p, page) { return NOMEM }
+    const d = pg.data(page)
+    const h = headerOffset(number)
+    const usable = pg.usableSize(p)
+    const n = to - from
+    mem.put8(d + h, kind)
+    mem.put16be(d + h + 1, 0)
+    mem.put16be(d + h + 3, @intCast(u64, n))
+    mem.put8(d + h + 7, 0)
+    if !isLeaf(kind) { mem.put32be(d + h + 8, rightChild) }
+    const pointers = d + h + headerSize(kind)
+    var top = usable
+    var i: usize = 0
+    while i < n {
+        const length = spanLength(ct, from + i)
+        top -= padded(length)
+        mem.copy(d + top, spanAddress(ct, from + i), length)
+        if length < 4 { mem.zero(d + top + length, 4 - length) }
+        mem.put16be(pointers + i * 2, @intCast(u64, top))
+        i += 1
+    }
+    // The gap between the pointers and the cells.
+    const gapStart = h + headerSize(kind) + n * 2
+    if top > gapStart { mem.zero(d + gapStart, top - gapStart) }
+    mem.put16be(d + h + 5, @intCast(u64, top & 65535))
+    p.*.generation += 1
+    return OK
+}
+
+// ---------------------------------------------------------------------------
+// The freelist and new pages.
+
+// A page for a tree: from the freelist, or a new one at the end; zeroed
+// and writable. 0 when there is no memory.
+pub fn allocatePage(p: *pg.Pager) -> u64 {
+    const freeCount = pg.headerGet(p, 36)
+    if freeCount > 0 {
+        const trunk = pg.headerGet(p, 32)
+        const page = pg.get(p, trunk)
+        if page != 0 && pg.write(p, page) {
+            const d = pg.data(page)
+            const leaves = mem.get32be(d + 4)
+            var taken: u64 = 0
+            if leaves > 0 {
+                taken = mem.get32be(d + 8 + @intCast(usize, leaves - 1) * 4)
+                mem.put32be(d + 4, leaves - 1)
+            } else {
+                // The trunk itself; the next trunk takes its place.
+                taken = trunk
+                _ = pg.headerSet(p, 32, mem.get32be(d))
+            }
+            _ = pg.headerSet(p, 36, freeCount - 1)
+            const fresh = pg.get(p, taken)
+            if fresh == 0 || !pg.write(p, fresh) { return 0 }
+            mem.zero(pg.data(fresh), p.*.pageSize)
+            return taken
+        }
+    }
+    const appended = pg.append(p)
+    if appended == 0 { return 0 }
+    return pg.pageOf(appended).*.number
+}
+
+// Puts a page on the freelist.
+pub fn freePage(p: *pg.Pager, number: u64) -> i32 {
+    if number < 2 || number > p.*.size { return CORRUPT }
+    const freeCount = pg.headerGet(p, 36)
+    const trunk = pg.headerGet(p, 32)
+    if trunk != 0 {
+        const page = pg.get(p, trunk)
+        if page == 0 || !pg.write(p, page) { return NOMEM }
+        const d = pg.data(page)
+        const leaves = mem.get32be(d + 4)
+        if leaves < @intCast(u64, pg.usableSize(p) / 4 - 8) {
+            mem.put32be(d + 8 + @intCast(usize, leaves) * 4, number)
+            mem.put32be(d + 4, leaves + 1)
+            if !pg.headerSet(p, 36, freeCount + 1) { return NOMEM }
+            return OK
+        }
+    }
+    const page = pg.get(p, number)
+    if page == 0 || !pg.write(p, page) { return NOMEM }
+    const d = pg.data(page)
+    mem.zero(d, p.*.pageSize)
+    mem.put32be(d, trunk)
+    mem.put32be(d + 4, 0)
+    if !pg.headerSet(p, 32, number) { return NOMEM }
+    if !pg.headerSet(p, 36, freeCount + 1) { return NOMEM }
+    return OK
+}
+
+fn freeOverflow(p: *pg.Pager, first: u64) -> i32 {
+    var next = first
+    var guard: u64 = 0
+    while next != 0 {
+        if next > p.*.size || guard > p.*.size { return CORRUPT }
+        const page = pg.get(p, next)
+        if page == 0 { return NOMEM }
+        const following = mem.get32be(pg.data(page))
+        const rc = freePage(p, next)
+        if rc != OK { return rc }
+        next = following
+        guard += 1
+    }
+    return OK
+}
+
+// The overflow chain of a cell, freed (the cell is going away).
+fn freeCellOverflow(p: *pg.Pager, kind: u64, at: usize) -> i32 {
+    var cell: Cell = undefined
+    parseCell(p, kind, at, &cell)
+    if cell.overflow == 0 { return OK }
+    return freeOverflow(p, cell.overflow)
+}
+
+// ---------------------------------------------------------------------------
+// Making cells.
+
+// A cell for a payload of `size` bytes at `payload` (a table leaf's with
+// its rowid), its overflow pages written: into `out`.
+fn buildCell(p: *pg.Pager, kind: u64, rowid: i64, payload: usize, size: usize, out: *mem.Buffer) -> i32 {
+    out.*.length = 0
+    if !mem.reserve(out, size + 32) { return NOMEM }
+    var at = out.*.data
+    if !isLeaf(kind) {
+        mem.put32be(at, 0)
+        at += 4
+    }
+    at += record.putVarint(at, @intCast(u64, size))
+    if kind == TABLE_LEAF { at += record.putVarint(at, @bitCast(u64, rowid)) }
+    const local = localSize(p, kind, @intCast(u64, size))
+    mem.copy(at, payload, local)
+    at += local
+    if local < size {
+        // The rest in a chain of overflow pages, each holding usable - 4.
+        const room = pg.usableSize(p) - 4
+        var done = local
+        var previous: u64 = 0
+        var first: u64 = 0
+        while done < size {
+            const number = allocatePage(p)
+            if number == 0 { return NOMEM }
+            if first == 0 { first = number }
+            if previous != 0 {
+                const prev = pg.get(p, previous)
+                if prev == 0 || !pg.write(p, prev) { return NOMEM }
+                mem.put32be(pg.data(prev), number)
+            }
+            const page = pg.get(p, number)
+            if page == 0 || !pg.write(p, page) { return NOMEM }
+            const chunk = if size - done < room { size - done } else { room }
+            mem.put32be(pg.data(page), 0)
+            mem.copy(pg.data(page) + 4, payload + done, chunk)
+            done += chunk
+            previous = number
+        }
+        mem.put32be(at, first)
+        at += 4
+    }
+    out.*.length = at - out.*.data
+    return OK
+}
+
+// A table interior cell: a child and a rowid.
+fn buildDivider(child: u64, rowid: i64, out: *mem.Buffer) -> bool {
+    out.*.length = 0
+    if !mem.reserve(out, 16) { return false }
+    mem.put32be(out.*.data, child)
+    out.*.length = 4 + record.putVarint(out.*.data + 4, @bitCast(u64, rowid))
+    return true
+}
+
+// The whole payload of a cell (its local part and its overflow chain).
+fn readPayload(p: *pg.Pager, cell: *Cell, out: *mem.Buffer) -> i32 {
+    out.*.length = 0
+    const size = @intCast(usize, cell.*.size)
+    if !mem.reserve(out, size) { return NOMEM }
+    mem.copy(out.*.data, cell.*.payload, cell.*.local)
+    var done = cell.*.local
+    var next = cell.*.overflow
+    const room = pg.usableSize(p) - 4
+    while done < size {
+        if next == 0 || next > p.*.size { return CORRUPT }
+        const page = pg.get(p, next)
+        if page == 0 { return NOMEM }
+        const chunk = if size - done < room { size - done } else { room }
+        mem.copy(out.*.data + done, pg.data(page) + 4, chunk)
+        done += chunk
+        next = mem.get32be(pg.data(page))
+    }
+    out.*.length = size
+    mem.put8(out.*.data + size, 0)
+    return OK
+}
+
+// ---------------------------------------------------------------------------
+// Trees.
+
+// A new, empty tree: its root page number (0 when there is no memory).
+pub fn createTree(p: *pg.Pager, table: bool) -> u64 {
+    const number = allocatePage(p)
+    if number == 0 { return 0 }
+    const page = pg.get(p, number)
+    const d = pg.data(page)
+    mem.put8(d, if table { TABLE_LEAF } else { INDEX_LEAF })
+    mem.put16be(d + 5, @intCast(u64, pg.usableSize(p) & 65535))
+    p.*.generation += 1
+    return number
+}
+
+// Frees every page under `number` (and their overflow pages); the page
+// itself too unless it is the root being kept.
+fn freeSubtree(p: *pg.Pager, number: u64, keep: bool, depth: usize) -> i32 {
+    if depth > MAX_DEPTH || number == 0 || number > p.*.size { return CORRUPT }
+    const page = pg.get(p, number)
+    if page == 0 { return NOMEM }
+    const d = pg.data(page)
+    const h = headerOffset(number)
+    const kind = mem.get8(d + h)
+    const n = cellCount(d, h)
+    // Children first, by number (the page's bytes may move in the cache:
+    // read the numbers before recursing).
+    var children: mem.Words = undefined
+    mem.initWords(&children)
+    var overflows: mem.Words = undefined
+    mem.initWords(&overflows)
+    var cell: Cell = undefined
+    var i: usize = 0
+    while i < n {
+        parseCell(p, kind, cellAt(d, h, kind, i), &cell)
+        if !isLeaf(kind) { _ = mem.push(&children, cell.child) }
+        if cell.overflow != 0 { _ = mem.push(&overflows, cell.overflow) }
+        i += 1
+    }
+    if !isLeaf(kind) { _ = mem.push(&children, mem.get32be(d + h + 8)) }
+    var rc = OK
+    i = 0
+    while i < overflows.length && rc == OK {
+        rc = freeOverflow(p, mem.at(&overflows, i))
+        i += 1
+    }
+    i = 0
+    while i < children.length && rc == OK {
+        rc = freeSubtree(p, mem.at(&children, i), false, depth + 1)
+        i += 1
+    }
+    mem.freeWords(&children)
+    mem.freeWords(&overflows)
+    if rc != OK { return rc }
+    if keep {
+        const again = pg.get(p, number)
+        if again == 0 || !pg.write(p, again) { return NOMEM }
+        const e = pg.data(again)
+        const leafKind = if isTable(kind) { TABLE_LEAF } else { INDEX_LEAF }
+        mem.zero(e + h, p.*.pageSize - h)
+        mem.put8(e + h, leafKind)
+        mem.put16be(e + h + 5, @intCast(u64, pg.usableSize(p) & 65535))
+    } else {
+        rc = freePage(p, number)
+    }
+    p.*.generation += 1
+    return rc
+}
+
+// Empties a tree, keeping its root.
+pub fn clearTree(p: *pg.Pager, root: u64) -> i32 { return freeSubtree(p, root, true, 0) }
+
+// Frees a whole tree, root and all.
+pub fn dropTree(p: *pg.Pager, root: u64) -> i32 { return freeSubtree(p, root, false, 0) }
+
+// How many entries a tree holds.
+pub fn countEntries(p: *pg.Pager, root: u64, out: *i64) -> i32 {
+    return countUnder(p, root, out, 0)
+}
+
+fn countUnder(p: *pg.Pager, number: u64, out: *i64, depth: usize) -> i32 {
+    if depth > MAX_DEPTH || number == 0 || number > p.*.size { return CORRUPT }
+    const page = pg.get(p, number)
+    if page == 0 { return NOMEM }
+    const d = pg.data(page)
+    const h = headerOffset(number)
+    const kind = mem.get8(d + h)
+    const n = cellCount(d, h)
+    if isLeaf(kind) {
+        out.* += @intCast(i64, n)
+        return OK
+    }
+    if !isTable(kind) { out.* += @intCast(i64, n) }
+    var children: mem.Words = undefined
+    mem.initWords(&children)
+    var i: usize = 0
+    while i < n {
+        _ = mem.push(&children, mem.get32be(cellAt(d, h, kind, i)))
+        i += 1
+    }
+    _ = mem.push(&children, mem.get32be(d + h + 8))
+    var rc = OK
+    i = 0
+    while i < children.length && rc == OK {
+        rc = countUnder(p, mem.at(&children, i), out, depth + 1)
+        i += 1
+    }
+    mem.freeWords(&children)
+    return rc
+}
+
+// ---------------------------------------------------------------------------
+// Cursors.
+
+pub const INVALID: u8 = 0
+pub const VALID: u8 = 1
+pub const AT_END: u8 = 2
+
+pub const Cursor = struct {
+    pager: usize
+    root: u64
+    table: bool
+    info: usize
+    state: u8
+    depth: usize
+    pages: [20]u64
+    indices: [20]u64
+    // The pager's generation when the path was made.
+    generation: u64
+    // The entry's key, to find it again: its rowid, or its record.
+    rowid: i64
+    key: mem.Buffer
+    // After finding its place again the cursor stands on the entry after
+    // the one it had (which is gone): the next step stays there.
+    skipNext: bool
+    skipPrevious: bool
+    // The entry's payload, read when asked for.
+    payload: mem.Buffer
+    payloadValid: bool
+    // The record's header, read when a column is asked for.
+    header: record.Header
+    headerValid: bool
+}
+
+pub fn cursorOf(address: usize) -> *Cursor { unsafe { return @ptrFromInt(*Cursor, address) } }
+
+// A cursor on the tree at `root` (`info`: an index's KeyInfo, 0 for a
+// table), in a block of its own.
+pub fn openCursor(pager: *pg.Pager, root: u64, table: bool, info: usize) -> usize {
+    const address = mem.alloc(@sizeOf(Cursor))
+    if address == 0 { return 0 }
+    const c = cursorOf(address)
+    c.*.pager = @intFromPtr(pager)
+    c.*.root = root
+    c.*.table = table
+    c.*.info = info
+    c.*.state = INVALID
+    c.*.depth = 0
+    c.*.generation = 0
+    c.*.rowid = 0
+    mem.initBuffer(&c.*.key)
+    c.*.skipNext = false
+    c.*.skipPrevious = false
+    mem.initBuffer(&c.*.payload)
+    c.*.payloadValid = false
+    record.initHeader(&c.*.header)
+    c.*.headerValid = false
+    return address
+}
+
+pub fn closeCursor(address: usize) -> void {
+    if address == 0 { return }
+    const c = cursorOf(address)
+    mem.freeBuffer(&c.*.key)
+    mem.freeBuffer(&c.*.payload)
+    record.freeHeader(&c.*.header)
+    mem.free(address)
+}
+
+inline fn pagerOfCursor(c: *Cursor) -> *pg.Pager { return pagerOf(c.*.pager) }
+
+fn moved(c: *Cursor) -> void {
+    c.*.payloadValid = false
+    c.*.headerValid = false
+    c.*.skipNext = false
+    c.*.skipPrevious = false
+}
+
+// The page the cursor's path ends at: its data address, header offset,
+// kind and cell count.
+const Here = struct {
+    d: usize
+    h: usize
+    kind: u64
+    n: usize
+}
+
+fn here(c: *Cursor, level: usize, out: *Here) -> bool {
+    const p = pagerOfCursor(c)
+    const number = c.*.pages[level]
+    if number == 0 || number > p.*.size { return false }
+    const page = pg.get(p, number)
+    if page == 0 { return false }
+    out.*.d = pg.data(page)
+    out.*.h = headerOffset(number)
+    out.*.kind = mem.get8(out.*.d + out.*.h)
+    out.*.n = cellCount(out.*.d, out.*.h)
+    return out.*.kind == TABLE_LEAF || out.*.kind == TABLE_INTERIOR || out.*.kind == INDEX_LEAF || out.*.kind == INDEX_INTERIOR
+}
+
+// The child an interior page's path step goes to.
+fn childAt(at: *Here, index: usize) -> u64 {
+    if index >= at.*.n { return mem.get32be(at.*.d + at.*.h + 8) }
+    return mem.get32be(cellAt(at.*.d, at.*.h, at.*.kind, index))
+}
+
+// Down from the path's last page to its leftmost (or rightmost) leaf
+// entry.
+fn descendEdge(c: *Cursor, right: bool) -> i32 {
+    var h: Here = undefined
+    while true {
+        if !here(c, c.*.depth - 1, &h) { return CORRUPT }
+        if isLeaf(h.kind) {
+            if h.n == 0 {
+                c.*.state = AT_END
+                return OK
+            }
+            c.*.indices[c.*.depth - 1] = if right { @intCast(u64, h.n - 1) } else { 0 }
+            c.*.state = VALID
+            return OK
+        }
+        const index = if right { h.n } else { 0 }
+        c.*.indices[c.*.depth - 1] = @intCast(u64, index)
+        if c.*.depth >= MAX_DEPTH { return CORRUPT }
+        c.*.pages[c.*.depth] = childAt(&h, index)
+        c.*.depth += 1
+    }
+    return OK
+}
+
+fn startAtRoot(c: *Cursor) -> void {
+    c.*.depth = 1
+    c.*.pages[0] = c.*.root
+    c.*.indices[0] = 0
+    c.*.generation = pagerOfCursor(c).*.generation
+    moved(c)
+}
+
+pub fn first(address: usize) -> i32 {
+    const c = cursorOf(address)
+    pg.shrink(pagerOfCursor(c))
+    startAtRoot(c)
+    const rc = descendEdge(c, false)
+    if rc == OK && c.*.state == VALID { rememberKey(c) }
+    return rc
+}
+
+pub fn last(address: usize) -> i32 {
+    const c = cursorOf(address)
+    pg.shrink(pagerOfCursor(c))
+    startAtRoot(c)
+    var rc = descendEdge(c, true)
+    if rc == OK && c.*.state == VALID && !c.*.table {
+        // In an index the last entry may be an interior one: the rightmost
+        // leaf is empty only for an empty tree, so this is the last.
+        rc = OK
+    }
+    if rc == OK && c.*.state == VALID { rememberKey(c) }
+    return rc
+}
+
+// The current entry's cell.
+fn currentCell(c: *Cursor, out: *Cell) -> bool {
+    var h: Here = undefined
+    if c.*.state != VALID || !here(c, c.*.depth - 1, &h) { return false }
+    const index = @intCast(usize, c.*.indices[c.*.depth - 1])
+    if index >= h.n { return false }
+    parseCell(pagerOfCursor(c), h.kind, cellAt(h.d, h.h, h.kind, index), out)
+    return true
+}
+
+// Remembers the entry's key (to find it again after a change).
+fn rememberKey(c: *Cursor) -> void {
+    var cell: Cell = undefined
+    if !currentCell(c, &cell) { return }
+    if c.*.table {
+        c.*.rowid = cell.rowid
+    } else {
+        _ = readPayload(pagerOfCursor(c), &cell, &c.*.key)
+    }
+}
+
+// Finds the place again after the database changed: the remembered entry,
+// or the one after it.
+fn restore(c: *Cursor) -> i32 {
+    if c.*.state != VALID { return OK }
+    if c.*.generation == pagerOfCursor(c).*.generation { return OK }
+    var exact = false
+    var rc = OK
+    if c.*.table {
+        rc = seekRowidInternal(c, c.*.rowid, &exact)
+    } else {
+        // The key buffer is the cursor's own: seek with a copy.
+        const copied = mem.dup(c.*.key.data, c.*.key.length)
+        const length = c.*.key.length
+        rc = seekRecordInternal(c, copied, length, &exact)
+        mem.free(copied)
+    }
+    if rc != OK { return rc }
+    if c.*.state == VALID && !exact { c.*.skipNext = true }
+    if c.*.state == AT_END {
+        // Everything at and after the entry is gone: a step back still
+        // finds the entries before it.
+        c.*.skipPrevious = true
+    }
+    return OK
+}
+
+pub fn isValid(address: usize) -> bool {
+    const c = cursorOf(address)
+    return c.*.state == VALID
+}
+
+// To the next entry (AT_END after the last).
+pub fn next(address: usize) -> i32 {
+    const c = cursorOf(address)
+    pg.shrink(pagerOfCursor(c))
+    var rc = restore(c)
+    if rc != OK { return rc }
+    if c.*.skipNext {
+        moved(c)
+        return OK
+    }
+    if c.*.state != VALID { return OK }
+    moved(c)
+    rc = step(c)
+    if rc == OK && c.*.state == VALID { rememberKey(c) }
+    return rc
+}
+
+fn step(c: *Cursor) -> i32 {
+    var h: Here = undefined
+    const level = c.*.depth - 1
+    if !here(c, level, &h) { return CORRUPT }
+    const index = @intCast(usize, c.*.indices[level])
+    if !isLeaf(h.kind) {
+        // An index entry in an interior page: next is the leftmost entry
+        // of the subtree after it.
+        c.*.indices[level] = @intCast(u64, index + 1)
+        if c.*.depth >= MAX_DEPTH { return CORRUPT }
+        c.*.pages[c.*.depth] = childAt(&h, index + 1)
+        c.*.depth += 1
+        return descendEdge(c, false)
+    }
+    if index + 1 < h.n {
+        c.*.indices[level] = @intCast(u64, index + 1)
+        return OK
+    }
+    // Up until a page has a child (or, in an index, an entry) after the
+    // one the path went through.
+    while c.*.depth > 1 {
+        c.*.depth -= 1
+        const up = c.*.depth - 1
+        if !here(c, up, &h) { return CORRUPT }
+        const i = @intCast(usize, c.*.indices[up])
+        if i < h.n {
+            if !c.*.table {
+                // The divider after the subtree is the next entry.
+                return OK
+            }
+            c.*.indices[up] = @intCast(u64, i + 1)
+            if c.*.depth >= MAX_DEPTH { return CORRUPT }
+            c.*.pages[c.*.depth] = childAt(&h, i + 1)
+            c.*.depth += 1
+            return descendEdge(c, false)
+        }
+    }
+    c.*.state = AT_END
+    return OK
+}
+
+// To the previous entry (AT_END before the first).
+pub fn previous(address: usize) -> i32 {
+    const c = cursorOf(address)
+    pg.shrink(pagerOfCursor(c))
+    if c.*.state == AT_END && c.*.skipPrevious {
+        c.*.skipPrevious = false
+        return last(address)
+    }
+    var rc = restore(c)
+    if rc != OK { return rc }
+    if c.*.state == AT_END && c.*.skipPrevious {
+        c.*.skipPrevious = false
+        return last(address)
+    }
+    if c.*.state != VALID { return OK }
+    moved(c)
+    rc = stepBack(c)
+    if rc == OK && c.*.state == VALID { rememberKey(c) }
+    return rc
+}
+
+fn stepBack(c: *Cursor) -> i32 {
+    var h: Here = undefined
+    const level = c.*.depth - 1
+    if !here(c, level, &h) { return CORRUPT }
+    const index = @intCast(usize, c.*.indices[level])
+    if !isLeaf(h.kind) {
+        // The rightmost entry of the subtree before this interior entry.
+        c.*.indices[level] = @intCast(u64, index)
+        if c.*.depth >= MAX_DEPTH { return CORRUPT }
+        c.*.pages[c.*.depth] = childAt(&h, index)
+        c.*.depth += 1
+        return descendEdge(c, true)
+    }
+    if index > 0 {
+        c.*.indices[level] = @intCast(u64, index - 1)
+        return OK
+    }
+    while c.*.depth > 1 {
+        c.*.depth -= 1
+        const up = c.*.depth - 1
+        if !here(c, up, &h) { return CORRUPT }
+        const i = @intCast(usize, c.*.indices[up])
+        if i > 0 {
+            if !c.*.table {
+                c.*.indices[up] = @intCast(u64, i - 1)
+                return OK
+            }
+            c.*.indices[up] = @intCast(u64, i - 1)
+            if c.*.depth >= MAX_DEPTH { return CORRUPT }
+            c.*.pages[c.*.depth] = childAt(&h, i - 1)
+            c.*.depth += 1
+            return descendEdge(c, true)
+        }
+    }
+    c.*.state = AT_END
+    return OK
+}
+
+// ---------------------------------------------------------------------------
+// Seeking.
+
+// How an entry compares with what is sought: by rowid, or as a record
+// with the key values (the first `keyCount` columns), or with a whole
+// stored record.
+const Target = struct {
+    rowid: i64
+    keys: usize
+    keyCount: usize
+    record: usize
+    recordLength: usize
+    // GT: entries equal on the key count as before it (seek past them).
+    after: bool
+}
+
+// Whether an index entry's payload is at or after the target.
+fn entryAtOrAfter(c: *Cursor, cell: *Cell, t: *Target, scratch: *mem.Buffer) -> bool {
+    var data = cell.*.payload
+    var length = cell.*.local
+    if @intCast(u64, cell.*.local) < cell.*.size {
+        _ = readPayload(pagerOfCursor(c), cell, scratch)
+        data = scratch.*.data
+        length = scratch.*.length
+    }
+    const info: *record.KeyInfo = unsafe { @ptrFromInt(*record.KeyInfo, c.*.info) }
+    var cmp: i64 = 0
+    if t.*.record != 0 {
+        cmp = record.compareRecords(data, length, t.*.record, t.*.recordLength, info.*.count, info)
+    } else {
+        cmp = record.compareWithKeys(data, length, t.*.keys, t.*.keyCount, info)
+    }
+    if t.*.after { return cmp > 0 }
+    return cmp >= 0
+}
+
+fn cellAtOrAfter(c: *Cursor, kind: u64, at: usize, t: *Target, scratch: *mem.Buffer) -> bool {
+    var cell: Cell = undefined
+    parseCell(pagerOfCursor(c), kind, at, &cell)
+    if isTable(kind) {
+        if t.*.after { return cell.rowid > t.*.rowid }
+        return cell.rowid >= t.*.rowid
+    }
+    return entryAtOrAfter(c, &cell, t, scratch)
+}
+
+// Descends to the leaf where the first entry at or after the target is or
+// would go; the leaf's index is the first cell at or after it (perhaps
+// one past its last cell). In an index an interior cell may itself be at
+// or after the target: the path then stops there when `stopInterior`.
+fn descend(c: *Cursor, t: *Target, stopInterior: bool) -> i32 {
+    startAtRoot(c)
+    var scratch: mem.Buffer = undefined
+    mem.initBuffer(&scratch)
+    var h: Here = undefined
+    var rc = OK
+    while true {
+        if !here(c, c.*.depth - 1, &h) {
+            rc = CORRUPT
+            break
+        }
+        // Binary search for the first cell at or after the target.
+        var low: usize = 0
+        var high = h.n
+        while low < high {
+            const middle = (low + high) / 2
+            if cellAtOrAfter(c, h.kind, cellAt(h.d, h.h, h.kind, middle), t, &scratch) {
+                high = middle
+            } else {
+                low = middle + 1
+            }
+        }
+        c.*.indices[c.*.depth - 1] = @intCast(u64, low)
+        if isLeaf(h.kind) { break }
+        if c.*.depth >= MAX_DEPTH {
+            rc = CORRUPT
+            break
+        }
+        c.*.pages[c.*.depth] = childAt(&h, low)
+        c.*.depth += 1
+    }
+    mem.freeBuffer(&scratch)
+    _ = stopInterior
+    return rc
+}
+
+// After `descend`: the cursor on the first entry at or after the target
+// (in a leaf, or the interior entry above when the leaf has none left).
+fn settle(c: *Cursor) -> i32 {
+    var h: Here = undefined
+    const level = c.*.depth - 1
+    if !here(c, level, &h) { return CORRUPT }
+    const index = @intCast(usize, c.*.indices[level])
+    if index < h.n {
+        c.*.state = VALID
+        return OK
+    }
+    // Past the leaf's last cell: up to the first ancestor with something
+    // after the path.
+    while c.*.depth > 1 {
+        c.*.depth -= 1
+        const up = c.*.depth - 1
+        if !here(c, up, &h) { return CORRUPT }
+        const i = @intCast(usize, c.*.indices[up])
+        if i < h.n {
+            if !c.*.table {
+                c.*.state = VALID
+                return OK
+            }
+            c.*.indices[up] = @intCast(u64, i + 1)
+            c.*.pages[c.*.depth] = childAt(&h, i + 1)
+            c.*.depth += 1
+            return descendEdge(c, false)
+        }
+    }
+    c.*.state = AT_END
+    return OK
+}
+
+fn seekRowidInternal(c: *Cursor, rowid: i64, exact: *bool) -> i32 {
+    var t: Target = undefined
+    t.rowid = rowid
+    t.keys = 0
+    t.keyCount = 0
+    t.record = 0
+    t.recordLength = 0
+    t.after = false
+    var rc = descend(c, &t, false)
+    if rc != OK { return rc }
+    rc = settle(c)
+    if rc != OK { return rc }
+    exact.* = false
+    if c.*.state == VALID {
+        var cell: Cell = undefined
+        if currentCell(c, &cell) {
+            exact.* = cell.rowid == rowid
+            c.*.rowid = cell.rowid
+        }
+    }
+    return OK
+}
+
+fn seekRecordInternal(c: *Cursor, data: usize, length: usize, exact: *bool) -> i32 {
+    var t: Target = undefined
+    t.rowid = 0
+    t.keys = 0
+    t.keyCount = 0
+    t.record = data
+    t.recordLength = length
+    t.after = false
+    var rc = descend(c, &t, true)
+    if rc != OK { return rc }
+    rc = settle(c)
+    if rc != OK { return rc }
+    exact.* = false
+    if c.*.state == VALID {
+        rememberKey(c)
+        const info: *record.KeyInfo = unsafe { @ptrFromInt(*record.KeyInfo, c.*.info) }
+        exact.* = record.compareRecords(c.*.key.data, c.*.key.length, data, length, info.*.count, info) == 0
+    }
+    return OK
+}
+
+// The table cursor on the row with `rowid` (true), or on the first row
+// after it (false; AT_END when there is none).
+pub fn seekRowid(address: usize, rowid: i64) -> bool {
+    const c = cursorOf(address)
+    pg.shrink(pagerOfCursor(c))
+    var exact = false
+    if seekRowidInternal(c, rowid, &exact) != OK {
+        c.*.state = AT_END
+        return false
+    }
+    return exact
+}
+
+// The table cursor on the first row whose rowid is above `rowid` (`after`)
+// or at least `rowid`.
+pub fn seekRowidFrom(address: usize, rowid: i64, after: bool) -> i32 {
+    const c = cursorOf(address)
+    pg.shrink(pagerOfCursor(c))
+    if after && rowid == 9223372036854775807 {
+        c.*.state = AT_END
+        return OK
+    }
+    var exact = false
+    const rc = seekRowidInternal(c, if after { rowid + 1 } else { rowid }, &exact)
+    return rc
+}
+
+// The index cursor on the first entry whose first `keyCount` columns are
+// at or after the key values (`after`: past those equal to them).
+pub fn seekKey(address: usize, keys: usize, keyCount: usize, after: bool) -> i32 {
+    const c = cursorOf(address)
+    pg.shrink(pagerOfCursor(c))
+    var t: Target = undefined
+    t.rowid = 0
+    t.keys = keys
+    t.keyCount = keyCount
+    t.record = 0
+    t.recordLength = 0
+    t.after = after
+    var rc = descend(c, &t, true)
+    if rc != OK { return rc }
+    rc = settle(c)
+    if rc == OK && c.*.state == VALID { rememberKey(c) }
+    return rc
+}
+
+// ---------------------------------------------------------------------------
+// Reading the entry.
+
+pub fn rowid(address: usize) -> i64 {
+    const c = cursorOf(address)
+    if restore(c) != OK { return 0 }
+    var cell: Cell = undefined
+    if !currentCell(c, &cell) { return 0 }
+    return cell.rowid
+}
+
+// The entry's payload (its record): address and length, valid until the
+// cursor moves.
+pub fn payload(address: usize, length: *usize) -> usize {
+    const c = cursorOf(address)
+    length.* = 0
+    if restore(c) != OK { return 0 }
+    if c.*.skipNext && c.*.state == VALID {
+        // On the entry after a deleted one: it is the current entry for
+        // reading until the next step.
+    }
+    if !c.*.payloadValid {
+        var cell: Cell = undefined
+        if !currentCell(c, &cell) { return 0 }
+        if readPayload(pagerOfCursor(c), &cell, &c.*.payload) != OK { return 0 }
+        c.*.payloadValid = true
+    }
+    length.* = c.*.payload.length
+    return c.*.payload.data
+}
+
+// The entry's record header, read once per entry.
+pub fn header(address: usize) -> *record.Header {
+    const c = cursorOf(address)
+    if !c.*.headerValid || !c.*.payloadValid || c.*.generation != pagerOfCursor(c).*.generation {
+        var length: usize = 0
+        const data = payload(address, &length)
+        _ = record.readHeader(&c.*.header, data, length)
+        c.*.headerValid = true
+    }
+    return &c.*.header
+}
+
+// ---------------------------------------------------------------------------
+// Balancing.
+
+// The page path [level] now holds `ct` (cells of its kind and a right
+// child): written, or balanced with its siblings when it does not fit or is
+// too empty.
+fn place(c: *Cursor, level: usize, ct: *Content, mayMerge: bool) -> i32 {
+    const p = pagerOfCursor(c)
+    const number = c.*.pages[level]
+    const space = spaceOf(ct, 0, count(ct))
+    const room = capacity(p, number, ct.*.kind)
+    if level == 0 {
+        if space <= room {
+            if !isLeaf(ct.*.kind) && count(ct) == 0 {
+                return collapseRoot(c, ct)
+            }
+            return writePage(p, number, ct.*.kind, ct, 0, count(ct), ct.*.rightChild)
+        }
+        return splitRoot(c, ct)
+    }
+    const empty = count(ct) == 0
+    if space <= room && !empty && !(mayMerge && space < pg.usableSize(p) / 3) {
+        return writePage(p, number, ct.*.kind, ct, 0, count(ct), ct.*.rightChild)
+    }
+    return balanceSiblings(c, level, ct)
+}
+
+// The root holds too much: its cells go to a new child, which is then
+// balanced under the root (now an interior page with that one child).
+fn splitRoot(c: *Cursor, ct: *Content) -> i32 {
+    const p = pagerOfCursor(c)
+    const child = allocatePage(p)
+    if child == 0 { return NOMEM }
+    const root = c.*.pages[0]
+    const interiorKind = ct.*.kind & 0xf7
+    var empty: Content = undefined
+    initContent(&empty)
+    var rc = writePage(p, root, interiorKind, &empty, 0, 0, child)
+    freeContent(&empty)
+    if rc != OK { return rc }
+    // The path: root, then the child in the root's place below it.
+    var i = c.*.depth
+    while i > 0 {
+        i -= 1
+        if i + 1 < MAX_DEPTH {
+            c.*.pages[i + 1] = c.*.pages[i]
+            c.*.indices[i + 1] = c.*.indices[i]
+        }
+    }
+    c.*.pages[0] = root
+    c.*.indices[0] = 0
+    c.*.pages[1] = child
+    c.*.depth += 1
+    if c.*.depth > MAX_DEPTH { return CORRUPT }
+    // The child is not page 1: write it if it fits now, else balance it.
+    const space = spaceOf(ct, 0, count(ct))
+    if space <= capacity(p, child, ct.*.kind) {
+        return writePage(p, child, ct.*.kind, ct, 0, count(ct), ct.*.rightChild)
+    }
+    return balanceSiblings(c, 1, ct)
+}
+
+// An interior root with no cells: its one child's cells move up into it
+// (when they fit there; page 1 has less room).
+fn collapseRoot(c: *Cursor, ct: *Content) -> i32 {
+    const p = pagerOfCursor(c)
+    const root = c.*.pages[0]
+    const child = ct.*.rightChild
+    var below: Content = undefined
+    initContent(&below)
+    var rc = loadContent(p, child, &below)
+    if rc == OK {
+        if spaceOf(&below, 0, count(&below)) <= capacity(p, root, below.kind) {
+            rc = writePage(p, root, below.kind, &below, 0, count(&below), below.rightChild)
+            if rc == OK { rc = freePage(p, child) }
+        } else {
+            rc = writePage(p, root, ct.*.kind, ct, 0, 0, child)
+        }
+    }
+    freeContent(&below)
+    return rc
+}
+
+// Balances page path[level] (whose new cells are `ct`) with up to two
+// siblings under the same parent, then places the parent.
+fn balanceSiblings(c: *Cursor, level: usize, ct: *Content) -> i32 {
+    const p = pagerOfCursor(c)
+    const parentNumber = c.*.pages[level - 1]
+    var parent: Content = undefined
+    initContent(&parent)
+    var rc = loadContent(p, parentNumber, &parent)
+    if rc != OK {
+        freeContent(&parent)
+        return rc
+    }
+    const at = @intCast(usize, c.*.indices[level - 1])
+    const children = count(&parent) + 1
+    // Up to three siblings around the page: [firstChild, lastChild].
+    var firstChild = if at > 0 { at - 1 } else { 0 }
+    var lastChild = firstChild + 2
+    if lastChild > children - 1 { lastChild = children - 1 }
+    if lastChild - firstChild < 2 && firstChild > 0 {
+        firstChild = if lastChild >= 2 { lastChild - 2 } else { 0 }
+    }
+    const kind = ct.*.kind
+    const leafTable = kind == TABLE_LEAF
+    // All their cells, with the dividers between them, in order.
+    var all: Content = undefined
+    initContent(&all)
+    all.kind = kind
+    var oldPages: mem.Words = undefined
+    mem.initWords(&oldPages)
+    var sibling: Content = undefined
+    initContent(&sibling)
+    var cell: Cell = undefined
+    var lastRight: u64 = 0
+    var s = firstChild
+    while s <= lastChild && rc == OK {
+        var number: u64 = 0
+        if s < count(&parent) {
+            number = mem.get32be(spanAddress(&parent, s))
+        } else {
+            number = parent.rightChild
+        }
+        _ = mem.push(&oldPages, number)
+        var source = ct
+        if s != at {
+            sibling.spans.length = 0
+            sibling.bytes.length = 0
+            rc = loadContent(p, number, &sibling)
+            if rc != OK { break }
+            if sibling.kind != kind {
+                rc = CORRUPT
+                break
+            }
+            source = &sibling
+        }
+        var i: usize = 0
+        while i < count(source) {
+            if !addCell(&all, spanAddress(source, i), spanLength(source, i)) { rc = NOMEM }
+            i += 1
+        }
+        lastRight = source.*.rightChild
+        if s < lastChild && !leafTable {
+            // The divider after this sibling comes down between them.
+            const divider = spanAddress(&parent, s)
+            const dividerLength = spanLength(&parent, s)
+            if isLeaf(kind) {
+                if !addCell(&all, divider + 4, dividerLength - 4) { rc = NOMEM }
+            } else {
+                // Its child becomes this sibling's right child.
+                const index = count(&all)
+                if !addCell(&all, divider, dividerLength) { rc = NOMEM }
+                mem.put32be(spanAddress(&all, index), source.*.rightChild)
+            }
+        }
+        s += 1
+    }
+    freeContent(&sibling)
+    if rc != OK {
+        freeContent(&all)
+        freeContent(&parent)
+        mem.freeWords(&oldPages)
+        return rc
+    }
+    // Deal the cells out over pages, as full as they go. For all but table
+    // leaves, the cell after each page but the last goes up as a divider.
+    const room = pg.usableSize(p) - headerSize(kind)
+    var bounds: mem.Words = undefined
+    mem.initWords(&bounds)
+    var start: usize = 0
+    var used: usize = 0
+    var i: usize = 0
+    const total = count(&all)
+    while i < total {
+        const need = padded(spanLength(&all, i)) + 2
+        if used + need > room && i > start {
+            _ = mem.push(&bounds, @intCast(u64, i))
+            if leafTable {
+                start = i
+                used = 0
+            } else {
+                // Cell i is the divider; the next page starts after it.
+                start = i + 1
+                used = 0
+                i += 1
+                continue
+            }
+        }
+        used += need
+        i += 1
+    }
+    // A last page left empty: the divider moves one cell back, so that
+    // it has the last cell (a full page has three cells at least).
+    if !leafTable && bounds.length > 0 && @intCast(usize, mem.at(&bounds, bounds.length - 1)) + 1 >= total {
+        const lastBound = @intCast(usize, mem.at(&bounds, bounds.length - 1))
+        mem.set(&bounds, bounds.length - 1, @intCast(u64, lastBound - 1))
+    }
+    const pages = bounds.length + 1
+    // Page numbers: the old ones first, new ones as needed; extra old ones
+    // freed.
+    var numbers: mem.Words = undefined
+    mem.initWords(&numbers)
+    i = 0
+    while i < pages && rc == OK {
+        if i < oldPages.length {
+            _ = mem.push(&numbers, mem.at(&oldPages, i))
+        } else {
+            const fresh = allocatePage(p)
+            if fresh == 0 { rc = NOMEM }
+            _ = mem.push(&numbers, fresh)
+        }
+        i += 1
+    }
+    i = pages
+    while i < oldPages.length && rc == OK {
+        rc = freePage(p, mem.at(&oldPages, i))
+        i += 1
+    }
+    // Write the pages and make the dividers.
+    var dividers: Content = undefined
+    initContent(&dividers)
+    var built: mem.Buffer = undefined
+    mem.initBuffer(&built)
+    var from: usize = 0
+    var k: usize = 0
+    while k < pages && rc == OK {
+        const to = if k < bounds.length { @intCast(usize, mem.at(&bounds, k)) } else { total }
+        const number = mem.at(&numbers, k)
+        if leafTable {
+            rc = writePage(p, number, kind, &all, from, to, 0)
+            if k < bounds.length && rc == OK {
+                parseCell(p, kind, spanAddress(&all, to - 1), &cell)
+                if !buildDivider(number, cell.rowid, &built) { rc = NOMEM }
+                if !addCell(&dividers, built.data, built.length) { rc = NOMEM }
+            }
+            from = to
+        } else if isLeaf(kind) {
+            rc = writePage(p, number, kind, &all, from, to, 0)
+            if k < bounds.length && rc == OK {
+                // The divider: the cell at `to`, with this page as child.
+                built.length = 0
+                if !mem.reserve(&built, spanLength(&all, to) + 4) { rc = NOMEM }
+                mem.put32be(built.data, number)
+                mem.copy(built.data + 4, spanAddress(&all, to), spanLength(&all, to))
+                built.length = spanLength(&all, to) + 4
+                if !addCell(&dividers, built.data, built.length) { rc = NOMEM }
+            }
+            from = to + 1
+        } else {
+            // Interior: the divider's child is this page's right child.
+            var right = lastRight
+            if k < bounds.length { right = mem.get32be(spanAddress(&all, to)) }
+            rc = writePage(p, number, kind, &all, from, to, right)
+            if k < bounds.length && rc == OK {
+                built.length = 0
+                if !mem.reserve(&built, spanLength(&all, to)) { rc = NOMEM }
+                mem.copy(built.data, spanAddress(&all, to), spanLength(&all, to))
+                mem.put32be(built.data, number)
+                built.length = spanLength(&all, to)
+                if !addCell(&dividers, built.data, built.length) { rc = NOMEM }
+            }
+            from = to + 1
+        }
+        k += 1
+    }
+    // The parent: the old dividers between the siblings out, the new ones
+    // in, the pointer after them to the last page.
+    if rc == OK {
+        var d = firstChild
+        while d < lastChild {
+            removeCell(&parent, firstChild)
+            d += 1
+        }
+        const lastNumber = mem.at(&numbers, pages - 1)
+        if firstChild < count(&parent) {
+            mem.put32be(spanAddress(&parent, firstChild), lastNumber)
+        } else {
+            parent.rightChild = lastNumber
+        }
+        var j: usize = 0
+        while j < count(&dividers) {
+            if !insertCell(&parent, firstChild + j, spanAddress(&dividers, j), spanLength(&dividers, j)) { rc = NOMEM }
+            j += 1
+        }
+    }
+    if rc == OK {
+        // The parent's own place: written, split or merged in its turn.
+        c.*.depth = level
+        c.*.indices[level - 1] = @intCast(u64, firstChild)
+        rc = place(c, level - 1, &parent, true)
+    }
+    mem.freeBuffer(&built)
+    freeContent(&dividers)
+    mem.freeWords(&numbers)
+    mem.freeWords(&bounds)
+    freeContent(&all)
+    freeContent(&parent)
+    mem.freeWords(&oldPages)
+    // The cursor's path is gone; it finds its place by its key.
+    c.*.generation = 0
+    return rc
+}
+
+// ---------------------------------------------------------------------------
+// Inserting and deleting.
+
+// Inserts (or replaces) a table row: `rowid` and its record.
+pub fn insertRow(address: usize, rowid: i64, data: usize, length: usize) -> i32 {
+    const c = cursorOf(address)
+    const p = pagerOfCursor(c)
+    pg.shrink(p)
+    var t: Target = undefined
+    t.rowid = rowid
+    t.keys = 0
+    t.keyCount = 0
+    t.record = 0
+    t.recordLength = 0
+    t.after = false
+    var rc = descend(c, &t, false)
+    if rc != OK { return rc }
+    return insertAtLeaf(c, data, length, rowid)
+}
+
+// Inserts an index entry (a record ending with the rowid); one already
+// there is left as it is.
+pub fn insertEntry(address: usize, data: usize, length: usize) -> i32 {
+    const c = cursorOf(address)
+    const p = pagerOfCursor(c)
+    pg.shrink(p)
+    var t: Target = undefined
+    t.rowid = 0
+    t.keys = 0
+    t.keyCount = 0
+    t.record = data
+    t.recordLength = length
+    t.after = false
+    // An equal entry may be at the leaf position or in an interior page on
+    // the way: find it as a seek would.
+    var exact = false
+    var rc = seekRecordInternal(c, data, length, &exact)
+    if rc != OK { return rc }
+    if exact { return OK }
+    rc = descend(c, &t, true)
+    if rc != OK { return rc }
+    return insertAtLeaf(c, data, length, 0)
+}
+
+fn insertAtLeaf(c: *Cursor, data: usize, length: usize, rowid: i64) -> i32 {
+    const p = pagerOfCursor(c)
+    const level = c.*.depth - 1
+    const number = c.*.pages[level]
+    var ct: Content = undefined
+    initContent(&ct)
+    var rc = loadContent(p, number, &ct)
+    if rc != OK {
+        freeContent(&ct)
+        return rc
+    }
+    if !isLeaf(ct.kind) || isTable(ct.kind) != c.*.table {
+        freeContent(&ct)
+        return CORRUPT
+    }
+    var index = @intCast(usize, c.*.indices[level])
+    var cellBytes: mem.Buffer = undefined
+    mem.initBuffer(&cellBytes)
+    var cell: Cell = undefined
+    if c.*.table && index < count(&ct) {
+        parseCell(p, ct.kind, spanAddress(&ct, index), &cell)
+        if cell.rowid == rowid {
+            // Replacing the row: the old one's overflow pages go.
+            if cell.overflow != 0 { rc = freeOverflow(p, cell.overflow) }
+            removeCell(&ct, index)
+        }
+    }
+    if rc == OK { rc = buildCell(p, ct.kind, rowid, data, length, &cellBytes) }
+    if rc == OK {
+        if !insertCell(&ct, index, cellBytes.data, cellBytes.length) { rc = NOMEM }
+    }
+    if rc == OK { rc = place(c, level, &ct, false) }
+    mem.freeBuffer(&cellBytes)
+    freeContent(&ct)
+    p.*.generation += 1
+    c.*.state = INVALID
+    return rc
+}
+
+// Deletes the table row `rowid`; false when there is none.
+pub fn deleteRow(address: usize, rowid: i64) -> i32 {
+    const c = cursorOf(address)
+    const p = pagerOfCursor(c)
+    pg.shrink(p)
+    var exact = false
+    var rc = seekRowidInternal(c, rowid, &exact)
+    if rc != OK || !exact {
+        c.*.state = INVALID
+        return rc
+    }
+    // seekRowid settles in the leaf for an existing row.
+    const level = c.*.depth - 1
+    var ct: Content = undefined
+    initContent(&ct)
+    rc = loadContent(p, c.*.pages[level], &ct)
+    if rc == OK {
+        const index = @intCast(usize, c.*.indices[level])
+        rc = freeCellOverflow(p, ct.kind, spanAddress(&ct, index))
+        removeCell(&ct, index)
+        if rc == OK { rc = place(c, level, &ct, true) }
+    }
+    freeContent(&ct)
+    p.*.generation += 1
+    c.*.state = INVALID
+    return rc
+}
+
+// Deletes the index entry equal to the record; OK when there is none.
+pub fn deleteEntry(address: usize, data: usize, length: usize) -> i32 {
+    const c = cursorOf(address)
+    const p = pagerOfCursor(c)
+    pg.shrink(p)
+    var exact = false
+    var rc = seekRecordInternal(c, data, length, &exact)
+    if rc != OK || !exact {
+        c.*.state = INVALID
+        return rc
+    }
+    const level = c.*.depth - 1
+    var ct: Content = undefined
+    initContent(&ct)
+    rc = loadContent(p, c.*.pages[level], &ct)
+    if rc != OK {
+        freeContent(&ct)
+        return rc
+    }
+    const index = @intCast(usize, c.*.indices[level])
+    rc = freeCellOverflow(p, ct.kind, spanAddress(&ct, index))
+    if rc != OK {
+        freeContent(&ct)
+        return rc
+    }
+    if isLeaf(ct.kind) {
+        removeCell(&ct, index)
+        rc = place(c, level, &ct, true)
+        freeContent(&ct)
+        p.*.generation += 1
+        c.*.state = INVALID
+        return rc
+    }
+    // An interior entry: the entry before it (the last of the subtree on
+    // its left, in a leaf) takes its place.
+    c.*.indices[level] = @intCast(u64, index)
+    c.*.pages[level + 1] = mem.get32be(spanAddress(&ct, index))
+    c.*.depth = level + 2
+    rc = descendEdge(c, true)
+    if rc != OK || c.*.state != VALID {
+        freeContent(&ct)
+        return CORRUPT
+    }
+    const leafLevel = c.*.depth - 1
+    var leaf: Content = undefined
+    initContent(&leaf)
+    rc = loadContent(p, c.*.pages[leafLevel], &leaf)
+    var replacement: mem.Buffer = undefined
+    mem.initBuffer(&replacement)
+    if rc == OK && count(&leaf) > 0 {
+        const last = count(&leaf) - 1
+        // The predecessor's key, to find its old leaf again below.
+        var cell: Cell = undefined
+        parseCell(p, leaf.kind, spanAddress(&leaf, last), &cell)
+        _ = mem.reserve(&replacement, spanLength(&leaf, last) + 4)
+        mem.put32be(replacement.data, mem.get32be(spanAddress(&ct, index)))
+        mem.copy(replacement.data + 4, spanAddress(&leaf, last), spanLength(&leaf, last))
+        replacement.length = spanLength(&leaf, last) + 4
+        var key: mem.Buffer = undefined
+        mem.initBuffer(&key)
+        rc = readPayload(p, &cell, &key)
+        removeCell(&leaf, last)
+        // The leaf without it (balanced later), then the interior cell.
+        if rc == OK { rc = writePage(p, c.*.pages[leafLevel], leaf.kind, &leaf, 0, count(&leaf), 0) }
+        if rc == OK {
+            removeCell(&ct, index)
+            if !insertCell(&ct, index, replacement.data, replacement.length) { rc = NOMEM }
+        }
+        if rc == OK {
+            c.*.depth = level + 1
+            rc = place(c, level, &ct, false)
+        }
+        // The leaf the predecessor came from, if now too empty: the
+        // descent to the predecessor's key ends there.
+        if rc == OK {
+            var t: Target = undefined
+            t.rowid = 0
+            t.keys = 0
+            t.keyCount = 0
+            t.record = key.data
+            t.recordLength = key.length
+            t.after = false
+            rc = descend(c, &t, true)
+            if rc == OK {
+                var again: Content = undefined
+                initContent(&again)
+                const leafAt = c.*.depth - 1
+                rc = loadContent(p, c.*.pages[leafAt], &again)
+                if rc == OK && isLeaf(again.kind) && (count(&again) == 0 || spaceOf(&again, 0, count(&again)) < pg.usableSize(p) / 3) {
+                    rc = place(c, leafAt, &again, true)
+                }
+                freeContent(&again)
+            }
+        }
+        mem.freeBuffer(&key)
+    } else if rc == OK {
+        rc = CORRUPT
+    }
+    mem.freeBuffer(&replacement)
+    freeContent(&leaf)
+    freeContent(&ct)
+    p.*.generation += 1
+    c.*.state = INVALID
+    return rc
+}
+
+// The largest rowid in a table (0 when it is empty).
+pub fn maxRowid(address: usize, out: *i64) -> i32 {
+    const rc = last(address)
+    if rc != OK { return rc }
+    const c = cursorOf(address)
+    out.* = if c.*.state == VALID { rowid(address) } else { 0 }
+    return OK
+}
