@@ -3,8 +3,8 @@
 #
 #   - `./mlx build webp` builds the library (libmlxwebp.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-webp/webp/decode.h,
-#     demux.h, mux_types.h and types.h of the API's Mlx modules
-#     (compiler/capi/webp/api);
+#     demux.h, encode.h, mux.h, mux_types.h and types.h of the API's Mlx
+#     modules (compiler/capi/webp/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++, and the structures laid out as the
 #     system's headers lay them out (tests/layout.c, where there is gcc
@@ -25,7 +25,15 @@
 #     encoder and muxer) and Python's Pillow: tests/sources.py and
 #     tests/corpus.c make some 450 more files (every source picture
 #     through every encoder setting) and damaged copies of them; decode.c
-#     built by both prints the same for each.
+#     built by both prints the same for each;
+#   - tests/encode.c drives the encoder, the muxer and the animation
+#     encoder as Skia's WebP encoder does (and the rest of their API),
+#     printing what does not depend on whose encoder made the bytes (the
+#     configurations, statuses, each file decoding to the exact pixels
+#     given, what the demuxer and muxer find): what encode.expected says
+#     (the system's libwebp), and at other sizes what the system's prints;
+#   - Skia's units that include libwebp's headers compile with mlx-cc on
+#     these headers, where the WebKit source is (WEBKIT_SOURCE).
 #
 #   tools/check_webp.sh
 set -euo pipefail
@@ -51,11 +59,11 @@ echo "ok   the library defines the $(wc -l < "$work/declared") functions the hea
 cc() { mlx-out/bin/mlx-cc -I"$headers" "$@"; }
 run() { LD_LIBRARY_PATH="$repo_root/mlx-out/lib" "$@"; }
 
-printf '#include <webp/decode.h>\n#include <webp/demux.h>\n#include <webp/mux_types.h>\nint main(void) { WebPDecoderConfig c; WebPData d; WebPDemuxState s; if (!WebPInitDecoderConfig(&c)) return 1; WebPDataInit(&d); if (WebPDemuxPartial(&d, &s) != NULL) return 1; return WebPGetDecoderVersion() == 0x10302 && WebPIsAlphaMode(MODE_bgrA) && !WebPIsRGBMode(MODE_YUV) ? 0 : 1; }\n' > "$work/all.c"
+printf '#include <webp/decode.h>\n#include <webp/demux.h>\n#include <webp/encode.h>\n#include <webp/mux.h>\n#include <webp/mux_types.h>\nint main(void) { WebPDecoderConfig c; WebPConfig e; WebPPicture p; WebPData d; WebPDemuxState s; WebPMux* m; if (!WebPInitDecoderConfig(&c) || !WebPConfigPreset(&e, WEBP_PRESET_PHOTO, 80) || !WebPPictureInit(&p)) return 1; WebPDataInit(&d); if (WebPDemuxPartial(&d, &s) != NULL) return 1; m = WebPMuxNew(); WebPMuxDelete(m); return m != NULL && WebPGetDecoderVersion() == 0x10302 && WebPIsAlphaMode(MODE_bgrA) && !WebPIsRGBMode(MODE_YUV) ? 0 : 1; }\n' > "$work/all.c"
 cc -c "$work/all.c" -o "$work/all.o" || fail "the headers do not compile as C"
 cc -x c++ -std=c++20 -c "$work/all.c" -o "$work/all-cpp.o" || fail "the headers do not compile as C++"
 cc "$work/all.c" -o "$work/all" "$library" || fail "a program does not link with the library"
-run "$work/all" || fail "a program initializing a decoder configuration"
+run "$work/all" || fail "a program initializing a decoder configuration, an encoder configuration and a muxer"
 echo "ok   the headers in C and C++"
 
 decodes() {
@@ -71,14 +79,25 @@ run decodes "$work/decode" "$tests/images" > "$work/decode.out"
 diff -u "$tests/decode.expected" "$work/decode.out" > "$work/decode.diff" || { head -40 "$work/decode.diff"; fail "tests/decode.c prints otherwise"; }
 echo "ok   tests/decode.c on tests/images: what the system's libwebp prints ($(grep -c '^==' "$work/decode.out") files, $(wc -l < "$work/decode.out") lines)"
 
+cc "$tests/encode.c" -o "$work/encode" "$library" || fail "tests/encode.c does not build"
+run "$work/encode" > "$work/encode.out" || fail "tests/encode.c"
+diff -u "$tests/encode.expected" "$work/encode.out" || fail "tests/encode.c prints otherwise"
+echo "ok   tests/encode.c: what the system's libwebp prints (the encoder, the muxer, animations)"
+
 if ! command -v gcc > /dev/null || ! printf '#include <webp/decode.h>\n#include <webp/demux.h>\n#include <webp/encode.h>\n#include <webp/mux.h>\nint main(void) { WebPConfig c; return !WebPConfigInit(&c) || WebPGetDemuxVersion() == 0 || WebPGetMuxVersion() == 0; }\n' | gcc -x c - -o "$work/probe" -lwebpmux -lwebpdemux -lwebp > /dev/null 2>&1; then
     echo "skip the comparisons with the system's libwebp: no gcc with libwebp's headers and libraries"
 else
-    gcc -O1 -w "$tests/layout.c" -o "$work/layout-ref" || fail "tests/layout.c does not build against the system's headers"
-    cc "$tests/layout.c" -o "$work/layout" || fail "tests/layout.c does not build"
+    gcc -O1 -w -DWITH_ENCODER "$tests/layout.c" -o "$work/layout-ref" || fail "tests/layout.c does not build against the system's headers"
+    cc -DWITH_ENCODER "$tests/layout.c" -o "$work/layout" || fail "tests/layout.c does not build"
     diff -u <("$work/layout-ref") <(run "$work/layout") || fail "the structures are not laid out as the system's headers lay them out"
     echo "ok   the structures laid out as the system's headers lay them out"
     gcc -O1 -w "$tests/decode.c" -o "$work/decode-ref" -lwebpdemux -lwebp || fail "tests/decode.c does not build against the system's libwebp"
+    gcc -O1 -w "$tests/encode.c" -o "$work/encode-ref" -lwebpmux -lwebpdemux -lwebp || fail "tests/encode.c does not build against the system's libwebp"
+    for size in "1 1" "2 5" "300 200" "16383 3"; do
+        # shellcheck disable=SC2086
+        diff -u <("$work/encode-ref" $size) <(run "$work/encode" $size) > "$work/diff" || { head -20 "$work/diff"; fail "tests/encode.c at $size differs from the system's libwebp"; }
+    done
+    echo "ok   tests/encode.c at other sizes: the same as the system's libwebp"
     if ! python3 -c 'import PIL' 2> /dev/null; then
         echo "skip the larger corpus: no Python with Pillow"
     else
@@ -118,6 +137,15 @@ PYTHON
         done
         echo "ok   decode.c on $count more files, good and damaged: the same as the system's libwebp"
     fi
+fi
+
+webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+if [ ! -d "$webkit/Source/ThirdParty/skia" ]; then
+    echo "skip Skia's sources that use libwebp: no WebKit source at $webkit (WEBKIT_SOURCE)"
+else
+    units=(skia/src/encode/SkWebpEncoderImpl.cpp)
+    ./mlx build -j 1 "${units[@]}" > "$work/units.log" 2>&1 || { tail -20 "$work/units.log"; fail "Skia's sources that use libwebp do not compile"; }
+    for unit in "${units[@]}"; do echo "ok   $unit"; done
 fi
 
 echo "check_webp.sh: all checks passed"

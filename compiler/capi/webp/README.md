@@ -2,10 +2,12 @@
 
 libwebp for the C and C++ programs built here, in Mlx, with the API of
 libwebp 1.3.2: `<webp/decode.h>` (decoder ABI 0x0209), `<webp/demux.h>`
-(demux ABI 0x0107), `<webp/mux_types.h>` and `<webp/types.h>`. WebKit's
-WebP decoder (WebCore's WEBPImageDecoder) includes them as it would
-libwebp's headers and links `libmlxwebp.so` in place of `libwebp.so.7`
-and `libwebpdemux.so.2`.
+(demux ABI 0x0107), `<webp/encode.h>` (encoder ABI 0x020f),
+`<webp/mux.h>` (mux ABI 0x0108), `<webp/mux_types.h>` and
+`<webp/types.h>`. WebKit's WebP decoder (WebCore's WEBPImageDecoder) and
+Skia's WebP encoder include them as they would libwebp's headers and
+link `libmlxwebp.so` in place of `libwebp.so.7`, `libwebpdemux.so.2` and
+`libwebpmux.so.3`.
 
 The decoders are the standard library's: `std.webp` (std/src/webp.mlx and
 std/src/webp/), which Mlx programs use directly, libwebp's decoder step
@@ -33,6 +35,12 @@ for step:
 - `std.webp.demux` and `std.webp.anim`: the demuxer (partial files too)
   and the animation decoder (frames blended and disposed onto the
   canvas).
+- `std.webp.encode` and `std.webp.mux`: an encoder of its own, not
+  libwebp's: lossless (VP8L with the subtract-green transform, runs and
+  repeated rows as backward references, Huffman codes of the picture's
+  statistics), so its files are larger than libwebp's best but hold the
+  exact pixels; the muxer (metadata chunks, frames, VP8X, ANIM) and the
+  animation encoder (each frame whole, identical frames merged).
 
 This directory is the C layer: the headers (made by mlx-cheaders from
 the Mlx modules of `api/`), the public structures laid out as libwebp's
@@ -43,7 +51,9 @@ and `WebPFreeDecBuffer` as libwebp's is.
 
     ./mlx build webp        the library and its headers
     tools/check_webp.sh     builds it, decodes the test files with it
-                            and with the system's libwebp and compares
+                            and with the system's libwebp and compares,
+                            drives the encoder and muxer both ways,
+                            compiles Skia's WebP encoder
 
 ## What it does
 
@@ -61,6 +71,14 @@ and `WebPFreeDecBuffer` as libwebp's is.
   and chunks (ICCP, EXIF, XMP) with their iterators.
 - The animation decoder: `WebPAnimDecoderNew` (RGBA, BGRA, rgbA, bgrA),
   `WebPAnimDecoderGetNext`, `GetInfo`, `Reset`, `GetDemuxer`.
+- Encoding: the configuration (libwebp's defaults, presets, lossless
+  levels and checks), `WebPPicture` (allocation, the RGB(A)/BGR(A)/RGBX/
+  BGRX importers, copies, views, crops, ARGB and YUVA conversions),
+  `WebPMemoryWriter`, `WebPEncode` (to the picture's writer) and the
+  one-call encoders (`WebPEncodeRGBA` ... `WebPEncodeLosslessBGRA`).
+- Muxing: `WebPMuxNew`, `WebPMuxCreate`, images and frames, chunks,
+  animation parameters, the canvas, `WebPMuxAssemble`; the animation
+  encoder (`WebPAnimEncoderNew`, `Add`, `Assemble`, `GetError`).
 
 ## What it does not do yet
 
@@ -70,3 +88,6 @@ and `WebPFreeDecBuffer` as libwebp's is.
   options are taken and nothing is dithered; the default is none.
 - Threads (`use_threads`): decoding is single-threaded, which gives the
   same pixels.
+- Lossy encoding: every picture is encoded losslessly whatever the
+  configuration asks (the lossy settings are checked and kept, not
+  used); `WebPPictureRescale` and the distortion functions answer 0.
