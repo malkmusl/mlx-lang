@@ -27,6 +27,9 @@
 #       tests/streams.c    input and output streams: memory, filter and
 #                          socket streams, synchronous and asynchronous,
 #                          splicing, pollable sources, GSimpleIOStream
+#       tests/extras.c     keyed data lists, random numbers, language
+#                          names, IDNA host names, GIO's enum types,
+#                          proxy resolvers (what libsoup stands on)
 #   - WTF's sources for WPE that stand on GLib and the system
 #     (tests/wtf/files.txt: wtf/glib, generic, unix, linux and posix)
 #     compile with mlx-cc on these headers, with WPE's configuration
@@ -67,7 +70,7 @@ cc -x c++ -std=c++20 -c "$work/all.c" -o "$work/all-cpp.o" || fail "the headers 
 echo "ok   the headers together in C and C++"
 
 mkdir -p "$work/run"
-for test in strings mainloop variant uri gobject system gio collect options network tls streams; do
+for test in strings mainloop variant uri gobject system gio collect options network tls streams extras; do
     cc "compiler/capi/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
     status=0
     (cd "$work/run" && run "$work/$test") > "$work/$test.out" 2> "$work/$test.err" || status=$?

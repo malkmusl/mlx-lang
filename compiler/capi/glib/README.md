@@ -64,6 +64,12 @@ sources reach.
 | `application.mlx` | `gapplication.h`: application ids and the default application |
 | `dbus.mlx` | `gdbus*.h`: bus addresses, proxies, errors, introspection data; see below |
 | `tls.mlx` | `ginitable.h` and GIO's TLS types (`gtlscertificate.h`, `gtlsbackend.h`, `gtlsconnection.h`, `gtlsclientconnection.h`, `gtlsdatabase.h`, `gtlsfiledatabase.h`, `gtlsinteraction.h`, `gtlspassword.h`): what libsoup's headers and WebKit's network code name; see below |
+| `enumtypes.mlx` | `gioenumtypes.h`: the GTypes of `GSocketClientEvent` and `GTlsAuthenticationMode` |
+| `random.mlx` | `grand.h`: the global generator, from the kernel's random bytes (getrandom) |
+| `dataset.mlx` | `gdataset.h`: keyed data lists (`GData`) |
+| `charset.mlx` | `gcharset.h`'s `g_get_language_names`: LANGUAGE, LC_ALL, LC_MESSAGES, LANG and each name's variants |
+| `hostnames.mlx` | `ghostutils.h`'s `g_hostname_to_ascii`: IDNA's ACE labels (Punycode) |
+| `proxyresolver.mlx` | `gproxyresolver.h`, `gsimpleproxyresolver.h`: the default resolver (always "direct://", GIO's dummy resolver) and GSimpleProxyResolver with its hosts to ignore |
 | `tests/` | C programs built by mlx-cc against the library, each with the output GLib 2.80 gives (`NAME.expected`, the exit status last); `tests/wtf/` the WPE configuration and the WTF sources compiled by the check |
 
 ## Tests
@@ -81,7 +87,9 @@ sources reach.
   their errors) and `tls.c` (certificates from PEM and DER as WebKit
   makes and copies them, chains, keys, passwords; a backend without TLS)
   and `streams.c` (memory, filter and socket streams, synchronous and
-  asynchronous, splicing, pollable sources, GSimpleIOStream)
+  asynchronous, splicing, pollable sources, GSimpleIOStream) and
+  `extras.c` (keyed data lists, random numbers, language names, IDNA
+  host names, GIO's enum types, proxy resolvers)
   and compares what they print with what the same programs print on GLib
   2.80 (`tls.c`'s certificates with GLib's GnuTLS backend, its backend
   part with none, `GIO_USE_TLS=dummy`);
