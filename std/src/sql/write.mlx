@@ -26,6 +26,7 @@ const bt = @import("./btree.mlx")
 const lexer = @import("./lexer.mlx")
 const pg = @import("./pager.mlx")
 const os = @import("./os.mlx")
+const parser = @import("./parser.mlx")
 
 const Value = value.Value
 
@@ -57,6 +58,15 @@ pub const Dml = struct {
     indexCursors: mem.Words
     key: mem.Buffer
     data: mem.Buffer
+    // CHECK constraints: their expressions (resolved against `checkScope`,
+    // a scope over the row being written) and per constraint the name its
+    // error gives (address, length).
+    checks: mem.Words
+    checkNames: mem.Words
+    checkScope: usize
+    // Per index (by its place in the table's list), a partial index's
+    // WHERE resolved against the same row (0: the index holds every row).
+    partials: mem.Words
 }
 
 pub inline fn dmlOf(address: usize) -> *Dml { unsafe { return @ptrFromInt(*Dml, address) } }
@@ -79,6 +89,9 @@ fn newDml(st: *core.Statement, kind: u8, t: usize) -> usize {
     d.*.rowidPlace = -1
     mem.initWords(&d.*.rowids)
     mem.initWords(&d.*.indexCursors)
+    mem.initWords(&d.*.checks)
+    mem.initWords(&d.*.checkNames)
+    mem.initWords(&d.*.partials)
     mem.initBuffer(&d.*.key)
     mem.initBuffer(&d.*.data)
     const n = schema.table(t).*.columnCount
@@ -104,12 +117,86 @@ pub fn freeDml(address: usize) -> void {
         i += 1
     }
     mem.freeWords(&d.*.indexCursors)
+    mem.freeWords(&d.*.checks)
+    mem.freeWords(&d.*.checkNames)
+    mem.freeWords(&d.*.partials)
     mem.freeBuffer(&d.*.key)
     mem.freeBuffer(&d.*.data)
     mem.free(address)
 }
 
 fn fail(st: *core.Statement, message: []const u8) -> i32 { return core.setError(databaseOf(st), core.ERROR, message) }
+
+// The table's CHECK constraints and its partial indexes' WHEREs compiled
+// for the statement: each expression parsed again from the schema's text
+// into the statement's arena and resolved against a row of the table.
+fn compileChecks(st: *core.Statement, d: *Dml) -> i32 {
+    const t = schema.table(d.*.table)
+    var partial = false
+    var i: usize = 0
+    while i < t.*.indexes.length {
+        if schema.index(@intCast(usize, mem.at(&t.*.indexes, i))).*.partial != 0 { partial = true }
+        i += 1
+    }
+    if t.*.checks.length == 0 && !partial { return core.OK }
+    d.*.checkScope = query.rowScope(st, t)
+    i = 0
+    while i < t.*.checks.length {
+        const start = @intCast(usize, mem.at(&t.*.checks, i))
+        const end = @intCast(usize, mem.at(&t.*.checks, i + 1))
+        const e = query.rowExpression(st, d.*.checkScope, t.*.sql + start, end - start)
+        if e == 0 { return databaseOf(st).*.errorCode }
+        _ = mem.push(&d.*.checks, @intCast(u64, e))
+        // The error names the constraint, or shows its expression.
+        if mem.at(&t.*.checks, i + 3) != 0 {
+            _ = mem.push(&d.*.checkNames, mem.at(&t.*.checks, i + 2))
+            _ = mem.push(&d.*.checkNames, mem.at(&t.*.checks, i + 3))
+        } else {
+            _ = mem.push(&d.*.checkNames, @intCast(u64, ast.copyText(&st.*.arena, t.*.sql + start, end - start)))
+            _ = mem.push(&d.*.checkNames, @intCast(u64, end - start))
+        }
+        i += 4
+    }
+    i = 0
+    while i < t.*.indexes.length {
+        const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
+        var e: usize = 0
+        if x.*.partial != 0 {
+            const w = ast.expr(x.*.partial)
+            e = query.rowExpression(st, d.*.checkScope, x.*.sql + w.*.start, w.*.end - w.*.start)
+            if e == 0 { return databaseOf(st).*.errorCode }
+        }
+        _ = mem.push(&d.*.partials, @intCast(u64, e))
+        i += 1
+    }
+    return core.OK
+}
+
+// CHECK constraints over the row's values: each must not be false (NULL
+// passes); `skip` set for IGNORE.
+fn checkChecks(st: *core.Statement, d: *Dml, values: usize, skip: *bool) -> i32 {
+    if d.*.checks.length == 0 { return core.OK }
+    query.rowSource(d.*.checkScope).*.row = values
+    var i: usize = 0
+    while i < d.*.checks.length {
+        var truth: i8 = 0
+        const rc = eval.condition(st, @intCast(usize, mem.at(&d.*.checks, i)), &truth)
+        if rc != core.OK { return rc }
+        if truth == 0 {
+            // (REPLACE is ABORT for a CHECK, as in SQLite.)
+            var how = resolution(d, ast.OE_NONE)
+            if how == ast.OE_IGNORE {
+                skip.* = true
+                return core.OK
+            }
+            if how == ast.OE_REPLACE { how = ast.OE_ABORT }
+            const name = mem.view(@intCast(usize, mem.at(&d.*.checkNames, i * 2)), @intCast(usize, mem.at(&d.*.checkNames, i * 2 + 1)))
+            return violation(st, 275, how, "CHECK constraint failed: ", name)
+        }
+        i += 1
+    }
+    return core.OK
+}
 
 // The table a DML statement names, writable.
 fn targetTable(st: *core.Statement, node: *ast.Statement, out: *usize) -> i32 {
@@ -145,6 +232,8 @@ pub fn compileInsert(st: *core.Statement, address: usize) -> i32 {
     const dml = newDml(st, ast.S_INSERT, t)
     const d = dmlOf(dml)
     d.*.conflict = node.*.conflict
+    rc = compileChecks(st, d)
+    if rc != core.OK { return rc }
     const n = table.*.columnCount
     d.*.columnMap = mem.alloc(n * 8 + 8)
     var i: usize = 0
@@ -290,6 +379,8 @@ pub fn compileUpdate(st: *core.Statement, address: usize) -> i32 {
     const dml = newDml(st, ast.S_UPDATE, t)
     const d = dmlOf(dml)
     d.*.conflict = node.*.conflict
+    rc = compileChecks(st, d)
+    if rc != core.OK { return rc }
     const q = query.compile(st, scanSelect(st, node), 0)
     if q == 0 { return db.*.errorCode }
     d.*.scan = q
@@ -415,7 +506,7 @@ fn writeIndexes(st: *core.Statement, d: *Dml, values: usize, rowid: i64, insert:
         if x.*.partial != 0 {
             // A partial index holds the rows its WHERE holds for.
             var holds = false
-            rc = partialHolds(st, d, x, values, rowid, &holds)
+            rc = partialHolds(st, d, i, values, &holds)
             if rc != core.OK { return rc }
             if !holds {
                 i += 1
@@ -431,17 +522,16 @@ fn writeIndexes(st: *core.Statement, d: *Dml, values: usize, rowid: i64, insert:
     return core.OK
 }
 
-// Evaluates a partial index's WHERE against a row held in `values`: the
-// expression's columns are the table's (resolved when the index was
-// made: by name here).
-fn partialHolds(st: *core.Statement, d: *Dml, x: *schema.Index, values: usize, rowid: i64, holds: *bool) -> i32 {
-    _ = st
-    _ = d
-    _ = x
-    _ = values
-    _ = rowid
+// Whether the partial index at `place` holds the row in `values` (its
+// WHERE is true for it).
+fn partialHolds(st: *core.Statement, d: *Dml, place: usize, values: usize, holds: *bool) -> i32 {
     holds.* = true
-    return core.OK
+    if place >= d.*.partials.length || mem.at(&d.*.partials, place) == 0 { return core.OK }
+    query.rowSource(d.*.checkScope).*.row = values
+    var truth: i8 = 0
+    const rc = eval.condition(st, @intCast(usize, mem.at(&d.*.partials, place)), &truth)
+    holds.* = truth == 1
+    return rc
 }
 
 fn storageError(st: *core.Statement, rc: i32) -> i32 {
@@ -614,6 +704,13 @@ fn checkUnique(st: *core.Statement, d: *Dml, values: usize, rowid: i64, oldRowid
     while i < t.*.indexes.length {
         const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
         if !x.*.unique {
+            i += 1
+            continue
+        }
+        var holds = true
+        rc = partialHolds(st, d, i, values, &holds)
+        if rc != core.OK { return rc }
+        if !holds {
             i += 1
             continue
         }
@@ -1153,6 +1250,8 @@ fn insertRow(st: *core.Statement, d: *Dml, rowidValue: *Value) -> i32 {
         if rc != core.OK { return rc }
     }
     if t.*.rowidColumn >= 0 { value.setInt(record.valueAt(d.*.values, @intCast(usize, t.*.rowidColumn)), rowid) }
+    rc = checkChecks(st, d, d.*.values, &skip)
+    if rc != core.OK || skip { return rc }
     rc = checkUnique(st, d, d.*.values, rowid, 0, false, &skip)
     if rc != core.OK || skip { return rc }
     rc = checkParents(st, d, d.*.values, 0)
@@ -1300,6 +1399,9 @@ fn runUpdate(st: *core.Statement, d: *Dml) -> i32 {
         if t.*.rowidColumn >= 0 { value.setInt(record.valueAt(d.*.values, @intCast(usize, t.*.rowidColumn)), updatedRowid) }
         var skip = false
         rc = checkNotNull(st, d, d.*.values, &skip)
+        if rc != core.OK { break }
+        if skip { continue }
+        rc = checkChecks(st, d, d.*.values, &skip)
         if rc != core.OK { break }
         if skip { continue }
         rc = checkUnique(st, d, d.*.values, updatedRowid, rowid, true, &skip)

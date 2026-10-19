@@ -27,6 +27,7 @@ const bt = @import("./btree.mlx")
 const eval = @import("./eval.mlx")
 const functions = @import("./functions.mlx")
 const lexer = @import("./lexer.mlx")
+const parser = @import("./parser.mlx")
 
 const Value = value.Value
 
@@ -694,6 +695,56 @@ fn addResults(st: *core.Statement, q: usize, sel: *ast.Select, scope: usize) -> 
     }
     query.*.width = query.*.results.length
     return core.OK
+}
+
+// A scope whose one source is a row of table `t` (its values set into the
+// source's `row` before an expression is evaluated): for CHECK
+// constraints. The source is the scope's query's first level.
+pub fn rowScope(st: *core.Statement, t: *schema.Table) -> usize {
+    const arena = &st.*.arena
+    const item = ast.alloc(arena, @sizeOf(ast.Source))
+    ast.source(item).*.name = t.*.name
+    ast.source(item).*.nameLength = t.*.nameLength
+    const select = ast.alloc(arena, @sizeOf(ast.Select))
+    ast.select(select).*.from = ast.newList(arena)
+    _ = ast.push(arena, ast.select(select).*.from, @intCast(u64, item))
+    const q = newQuery(st, select, 0)
+    const scope = mem.alloc(@sizeOf(Scope))
+    _ = mem.push(&st.*.scopes, @intCast(u64, scope))
+    scopeOf(scope).*.query = q
+    const s = core.sourceState(newSource(st, q, item))
+    s.*.kind = core.SOURCE_ROWS
+    s.*.width = t.*.columnCount
+    var i: usize = 0
+    while i < t.*.columnCount {
+        _ = mem.push(&s.*.names, @intCast(u64, schema.column(t, i).*.name))
+        _ = mem.push(&s.*.names, @intCast(u64, schema.column(t, i).*.nameLength))
+        i += 1
+    }
+    _ = mem.push(&queryOf(q).*.levels, @intCast(u64, @intFromPtr(s)))
+    return scope
+}
+
+// An expression of a table's schema text (a CHECK, a partial index's
+// WHERE) parsed again into the statement's arena and resolved in a row
+// scope: 0 with the error on the connection when it cannot be.
+pub fn rowExpression(st: *core.Statement, scope: usize, address: usize, length: usize) -> usize {
+    const text = ast.copyText(&st.*.arena, address, length)
+    var p: parser.Parser = undefined
+    parser.init(&p, &st.*.arena, text, length)
+    const e = parser.parseExpr(&p)
+    const failed = p.failed
+    parser.deinit(&p)
+    if failed || e == 0 {
+        _ = core.setError(databaseOf(st), core.CORRUPT, "malformed database schema")
+        return 0
+    }
+    if resolve(st, scope, e) != core.OK { return 0 }
+    return e
+}
+
+pub fn rowSource(scope: usize) -> *core.SourceState {
+    return core.sourceState(@intCast(usize, mem.at(&queryOf(scopeOf(scope).*.query).*.levels, 0)))
 }
 
 // Compiles a SELECT (and those before it in a compound): its Query, or 0
@@ -1398,18 +1449,30 @@ fn plan(st: *core.Statement, q: usize, index: usize) -> i32 {
         s.*.covering = covers(st, q, s, schema.index(best))
         return eval.resolveIndex(st, schema.index(best))
     }
-    // A scan: of a smaller index holding all the query reads of the table
-    // (SQLite's covering index scan), else of the table.
+    // A scan: of a narrower index holding all the query reads of the table
+    // (SQLite's covering index scan), else of the table. The index is the
+    // one SQLite's costs pick: estimated widths, ties to the first in its
+    // order.
     if !item.*.notIndexed {
         var chosen: usize = 0
+        var chosenCost: i64 = 0
+        const tableWidth = logEst(tableWidthOf(t) * 4)
+        var order: mem.Words = undefined
+        sqliteIndexOrder(t, &order)
         x = 0
-        while x < t.*.indexes.length {
-            const ix = schema.index(@intCast(usize, mem.at(&t.*.indexes, x)))
-            if ix.*.partial == 0 && ix.*.columnCount < t.*.columnCount && covers(st, q, s, ix) && eval.findCollationsOf(st, ix) {
-                if chosen == 0 || ix.*.columnCount < schema.index(chosen).*.columnCount { chosen = @intFromPtr(ix) }
+        while x < order.length {
+            const ix = schema.index(@intCast(usize, mem.at(&order, x)))
+            const width = logEst(indexWidthOf(t, ix) * 4)
+            if ix.*.partial == 0 && width < tableWidth && covers(st, q, s, ix) && eval.findCollationsOf(st, ix) {
+                const cost = (15 * width) / tableWidth
+                if chosen == 0 || cost < chosenCost {
+                    chosen = @intFromPtr(ix)
+                    chosenCost = cost
+                }
             }
             x += 1
         }
+        mem.freeWords(&order)
         if chosen != 0 {
             s.*.index = chosen
             s.*.plan = core.PLAN_INDEX_SCAN
@@ -1418,6 +1481,104 @@ fn plan(st: *core.Statement, q: usize, index: usize) -> i32 {
         }
     }
     return core.OK
+}
+
+// SQLite's LogEst: 10 * log2(x), in whole steps.
+fn logEst(n: u64) -> i64 {
+    var x = n
+    var y: i64 = 40
+    if x < 8 {
+        if x < 2 { return 0 }
+        while x < 8 {
+            y -= 10
+            x = x << 1
+        }
+    } else {
+        while x > 255 {
+            y += 40
+            x = x >> 4
+        }
+        while x > 15 {
+            y += 10
+            x = x >> 1
+        }
+    }
+    const steps = [8]i64{ 0, 2, 3, 5, 6, 7, 8, 9 }
+    return steps[@intCast(usize, x & 7)] + y - 10
+}
+
+// A column's estimated size as SQLite guesses it from its declared type
+// (an integer's being 1): numbers 1; CHAR(n), VARCHAR(n) and the like
+// n / 4 + 1; TEXT 1; BLOB and no type 5.
+fn columnWidthOf(c: *schema.Column) -> u64 {
+    if c.*.affinity >= value.AFF_NUMERIC { return 1 }
+    const n = c.*.typeLength
+    var after: i64 = -1
+    var i: usize = 0
+    while i + 4 <= n {
+        const word = mem.view(c.*.typeName + i, 4)
+        if mem.sameNoCase(word, "char") || mem.sameNoCase(word, "clob") || mem.sameNoCase(word, "text") {
+            after = @intCast(i64, i + 4)
+        } else if after < 0 && mem.sameNoCase(word, "blob") && i + 4 < n && mem.get8(c.*.typeName + i + 4) == 40 {
+            after = @intCast(i64, i + 4)
+        }
+        i += 1
+    }
+    if after < 0 { return 5 }
+    var k = @intCast(usize, after)
+    while k < n {
+        const d = mem.get8(c.*.typeName + k)
+        if d >= 48 && d <= 57 {
+            var v: u64 = 0
+            while k < n && mem.get8(c.*.typeName + k) >= 48 && mem.get8(c.*.typeName + k) <= 57 && v < 100000 {
+                v = v * 10 + (mem.get8(c.*.typeName + k) - 48)
+                k += 1
+            }
+            v = v / 4 + 1
+            return if v > 255 { 255 } else { v }
+        }
+        k += 1
+    }
+    return 1
+}
+
+fn tableWidthOf(t: *schema.Table) -> u64 {
+    var w: u64 = 0
+    var i: usize = 0
+    while i < t.*.columnCount {
+        w += columnWidthOf(schema.column(t, i))
+        i += 1
+    }
+    if t.*.rowidColumn < 0 { w += 1 }
+    return w
+}
+
+// The index's columns and the rowid after them.
+fn indexWidthOf(t: *schema.Table, x: *schema.Index) -> u64 {
+    var w: u64 = 1
+    var i: usize = 0
+    while i < x.*.columnCount {
+        const c = schema.indexColumn(x, i)
+        w += if c < 0 { 1 } else { columnWidthOf(schema.column(t, @intCast(usize, c))) }
+        i += 1
+    }
+    return w
+}
+
+// A table's indexes in the order SQLite keeps them: the newest first,
+// those whose conflicts REPLACE last.
+fn sqliteIndexOrder(t: *schema.Table, out: *mem.Words) -> void {
+    mem.initWords(out)
+    var pass: usize = 0
+    while pass < 2 {
+        var i = t.*.indexes.length
+        while i > 0 {
+            i -= 1
+            const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
+            if (x.*.onError == ast.OE_REPLACE) == (pass == 1) { _ = mem.push(out, mem.at(&t.*.indexes, i)) }
+        }
+        pass += 1
+    }
 }
 
 fn readUsable(candidates: *mem.Words, i: usize, u: *Usable) -> void {
