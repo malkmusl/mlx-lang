@@ -1,0 +1,963 @@
+// std.sql.ddl: the schema read from sqlite_master and changed: CREATE
+// TABLE (its autoindexes made in the order SQLite makes them, and
+// sqlite_sequence with the first AUTOINCREMENT table), CREATE INDEX (its
+// entries made from the table's rows), DROP TABLE and DROP INDEX (their
+// pages to the freelist), ALTER TABLE RENAME TO (the CREATE texts that
+// name the table rewritten, the new name in double quotes as SQLite
+// writes it), RENAME COLUMN, ADD COLUMN (the column's text put before the
+// table text's closing parenthesis; rows written before read its
+// DEFAULT). Each change bumps the schema cookie, so that other connections
+// read the schema again.
+const mem = @import("./mem.mlx")
+const value = @import("./value.mlx")
+const record = @import("./record.mlx")
+const ast = @import("./ast.mlx")
+const parser = @import("./parser.mlx")
+const lexer = @import("./lexer.mlx")
+const schema = @import("./schema.mlx")
+const core = @import("./core.mlx")
+const pg = @import("./pager.mlx")
+const bt = @import("./btree.mlx")
+const eval = @import("./eval.mlx")
+const query = @import("./query.mlx")
+
+const Value = value.Value
+
+fn databaseOf(st: *core.Statement) -> *core.Database { return core.database(st.*.db) }
+
+fn storage(db: *core.Database, rc: i32) -> i32 {
+    if rc == core.OK { return core.OK }
+    if rc == core.CORRUPT { return core.setError(db, core.CORRUPT, "database disk image is malformed") }
+    return core.setError(db, rc, core.errorText(rc))
+}
+
+// ---------------------------------------------------------------------------
+// Reading the schema.
+
+// One sqlite_master row's columns.
+const MasterRow = struct {
+    kind: Value
+    name: Value
+    table: Value
+    root: Value
+    sql: Value
+    rowid: i64
+}
+
+fn initRow(r: *MasterRow) -> void {
+    value.init(&r.*.kind)
+    value.init(&r.*.name)
+    value.init(&r.*.table)
+    value.init(&r.*.root)
+    value.init(&r.*.sql)
+}
+
+fn freeRow(r: *MasterRow) -> void {
+    value.release(&r.*.kind)
+    value.release(&r.*.name)
+    value.release(&r.*.table)
+    value.release(&r.*.root)
+    value.release(&r.*.sql)
+}
+
+fn readMasterRow(cursor: usize, r: *MasterRow) -> void {
+    const h = bt.header(cursor)
+    record.column(h, 0, &r.*.kind)
+    record.column(h, 1, &r.*.name)
+    record.column(h, 2, &r.*.table)
+    record.column(h, 3, &r.*.root)
+    record.column(h, 4, &r.*.sql)
+    _ = value.toText(&r.*.kind)
+    _ = value.toText(&r.*.name)
+    _ = value.toText(&r.*.table)
+    _ = value.toText(&r.*.sql)
+    r.*.rowid = bt.rowid(cursor)
+}
+
+// Reads the schema from sqlite_master (a read transaction is open).
+pub fn load(db: *core.Database) -> i32 {
+    const s = &db.*.schema
+    schema.clear(s)
+    db.*.schemaGeneration += 1
+    const p = &db.*.pager
+    s.*.loaded = true
+    if p.*.size == 0 {
+        s.*.cookie = 0
+        return core.OK
+    }
+    s.*.cookie = pg.headerGet(p, 40)
+    // Rows of tables first, then indexes.
+    var pass: usize = 0
+    var message: mem.Buffer = undefined
+    mem.initBuffer(&message)
+    var row: MasterRow = undefined
+    initRow(&row)
+    const cursor = bt.openCursor(p, 1, true, 0)
+    var rc = core.OK
+    while pass < 2 && rc == core.OK {
+        rc = bt.first(cursor)
+        while rc == core.OK && bt.isValid(cursor) {
+            readMasterRow(cursor, &row)
+            const kind = value.bytesOf(&row.kind)
+            if pass == 0 && mem.same(kind, "table") && row.sql.kind == value.TEXT {
+                message.length = 0
+                const t = schema.parseTable(value.bytesOf(&row.sql), &message)
+                if t != 0 {
+                    schema.table(t).*.root = @bitCast(u64, value.toInt(&row.root))
+                    schema.addTable(s, t)
+                } else {
+                    s.*.damaged = true
+                }
+            } else if pass == 1 && mem.same(kind, "index") {
+                if row.sql.kind == value.TEXT {
+                    message.length = 0
+                    const x = schema.parseIndex(s, value.bytesOf(&row.sql), &message)
+                    if x != 0 {
+                        schema.index(x).*.root = @bitCast(u64, value.toInt(&row.root))
+                        schema.addIndex(s, x)
+                    } else {
+                        s.*.damaged = true
+                    }
+                } else {
+                    // An autoindex: its root.
+                    const x = schema.findIndex(s, value.bytesOf(&row.name))
+                    if x != 0 { schema.index(x).*.root = @bitCast(u64, value.toInt(&row.root)) }
+                }
+            }
+            rc = bt.next(cursor)
+        }
+        pass += 1
+    }
+    bt.closeCursor(cursor)
+    freeRow(&row)
+    mem.freeBuffer(&message)
+    if rc != core.OK { return storage(db, rc) }
+    return core.OK
+}
+
+// ---------------------------------------------------------------------------
+// sqlite_master's rows.
+
+fn masterInsert(st: *core.Statement, kind: []const u8, name: []const u8, table: []const u8, root: u64, sql: []const u8, hasSql: bool) -> i32 {
+    const db = databaseOf(st)
+    const block = mem.alloc(6 * @sizeOf(Value))
+    var i: usize = 0
+    while i < 6 {
+        value.init(record.valueAt(block, i))
+        i += 1
+    }
+    _ = value.setString(record.valueAt(block, 0), kind)
+    _ = value.setString(record.valueAt(block, 1), name)
+    _ = value.setString(record.valueAt(block, 2), table)
+    value.setInt(record.valueAt(block, 3), @intCast(i64, root))
+    if hasSql { _ = value.setString(record.valueAt(block, 4), sql) }
+    var data: mem.Buffer = undefined
+    mem.initBuffer(&data)
+    _ = record.encode(block, 5, &data)
+    const cursor = bt.openCursor(&db.*.pager, 1, true, 0)
+    var largest: i64 = 0
+    var rc = bt.maxRowid(cursor, &largest)
+    if rc == core.OK { rc = bt.insertRow(cursor, largest + 1, data.data, data.length) }
+    bt.closeCursor(cursor)
+    mem.freeBuffer(&data)
+    core.freeRow(block, 6)
+    return storage(db, rc)
+}
+
+// Deletes the rows of the named object (and, for a table, of its
+// indexes).
+fn masterDelete(st: *core.Statement, name: []const u8, table: bool) -> i32 {
+    const db = databaseOf(st)
+    const cursor = bt.openCursor(&db.*.pager, 1, true, 0)
+    var rowids: mem.Words = undefined
+    mem.initWords(&rowids)
+    var row: MasterRow = undefined
+    initRow(&row)
+    var rc = bt.first(cursor)
+    while rc == core.OK && bt.isValid(cursor) {
+        readMasterRow(cursor, &row)
+        if mem.sameNoCase(value.bytesOf(&row.name), name) || (table && mem.sameNoCase(value.bytesOf(&row.table), name) && mem.same(value.bytesOf(&row.kind), "index")) {
+            _ = mem.push(&rowids, @bitCast(u64, row.rowid))
+        }
+        rc = bt.next(cursor)
+    }
+    var i: usize = 0
+    while rc == core.OK && i < rowids.length {
+        rc = bt.deleteRow(cursor, @bitCast(i64, mem.at(&rowids, i)))
+        i += 1
+    }
+    freeRow(&row)
+    mem.freeWords(&rowids)
+    bt.closeCursor(cursor)
+    return storage(db, rc)
+}
+
+// The schema changed: the cookie bumped (other connections read it again).
+fn bumpCookie(st: *core.Statement) -> i32 {
+    const db = databaseOf(st)
+    const cookie = (pg.headerGet(&db.*.pager, 40) + 1) & 0xffffffff
+    if !pg.headerSet(&db.*.pager, 40, cookie) { return core.NOMEM }
+    db.*.schema.cookie = cookie
+    db.*.schemaGeneration += 1
+    return core.OK
+}
+
+fn authorize(st: *core.Statement, action: i32, a: []const u8, b: []const u8) -> i32 {
+    if eval.authorize(st, action, a, b) == core.AUTH_DENY { return core.setError(databaseOf(st), core.AUTH, "not authorized") }
+    return core.OK
+}
+
+fn reservedName(name: []const u8) -> bool { return mem.startsNoCase(name, "sqlite_") }
+
+// ---------------------------------------------------------------------------
+// CREATE TABLE.
+
+pub fn createTable(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    const name = mem.view(node.*.name, node.*.nameLength)
+    var rc = authorize(st, core.AUTH_CREATE_TABLE, name, mem.view(0, 0))
+    if rc != core.OK { return rc }
+    if schema.findTable(&db.*.schema, name) != 0 {
+        if node.*.ifNotExists { return core.OK }
+        return core.setError3(db, core.ERROR, "table ", name, " already exists")
+    }
+    if schema.findIndex(&db.*.schema, name) != 0 {
+        return core.setError3(db, core.ERROR, "there is already an index named ", name, "")
+    }
+    if reservedName(name) {
+        return core.setError2(db, core.ERROR, "object name reserved for internal use: ", name)
+    }
+    if ast.tableDef(node.*.tableDef).*.asSelect != 0 { return createTableAs(st, node) }
+    var text: mem.Buffer = undefined
+    mem.initBuffer(&text)
+    _ = schema.tableText(st.*.text, node, &text)
+    rc = createFromText(st, mem.bufferText(&text))
+    mem.freeBuffer(&text)
+    return rc
+}
+
+// Makes the table of a CREATE TABLE text: its root and autoindexes'
+// pages, its sqlite_master rows, sqlite_sequence when it is the first
+// AUTOINCREMENT table.
+fn createFromText(st: *core.Statement, text: []const u8) -> i32 {
+    const db = databaseOf(st)
+    var message: mem.Buffer = undefined
+    mem.initBuffer(&message)
+    const t = schema.parseTable(text, &message)
+    if t == 0 {
+        const rc = core.setError(db, core.ERROR, mem.bufferText(&message))
+        mem.freeBuffer(&message)
+        return rc
+    }
+    mem.freeBuffer(&message)
+    const table = schema.table(t)
+    table.*.root = bt.createTree(&db.*.pager, true)
+    if table.*.root == 0 { return core.NOMEM }
+    var rc = masterInsert(st, "table", schema.tableName(table), schema.tableName(table), table.*.root, text, true)
+    var i: usize = 0
+    while rc == core.OK && i < table.*.indexes.length {
+        const x = schema.index(@intCast(usize, mem.at(&table.*.indexes, i)))
+        x.*.root = bt.createTree(&db.*.pager, false)
+        if x.*.root == 0 { rc = core.NOMEM }
+        if rc == core.OK { rc = masterInsert(st, "index", schema.indexName(x), schema.tableName(table), x.*.root, "", false) }
+        i += 1
+    }
+    if rc == core.OK {
+        schema.addTable(&db.*.schema, t)
+    } else {
+        // (The rollback of the statement reads the schema again.)
+        return rc
+    }
+    if rc == core.OK && table.*.autoincrement && schema.findTable(&db.*.schema, "sqlite_sequence") == 0 {
+        rc = createFromText(st, "CREATE TABLE sqlite_sequence(name,seq)")
+    }
+    if rc == core.OK { rc = bumpCookie(st) }
+    return rc
+}
+
+// CREATE TABLE ... AS SELECT: columns named and typed after the SELECT's,
+// its rows inserted.
+fn createTableAs(st: *core.Statement, node: *ast.Statement) -> i32 {
+    const db = databaseOf(st)
+    const q = query.compile(st, ast.tableDef(node.*.tableDef).*.asSelect, 0)
+    if q == 0 { return db.*.errorCode }
+    const query0 = query.queryOf(q)
+    var text: mem.Buffer = undefined
+    mem.initBuffer(&text)
+    _ = mem.appendText(&text, "CREATE TABLE ")
+    appendIdentifier(&text, mem.view(node.*.name, node.*.nameLength))
+    _ = mem.appendText(&text, "(")
+    var i: usize = 0
+    while i < query0.*.width {
+        if i > 0 { _ = mem.appendText(&text, ",") }
+        const nameAt = @intCast(usize, mem.at(&query0.*.names, i * 2))
+        const nameLength = @intCast(usize, mem.at(&query0.*.names, i * 2 + 1))
+        appendIdentifier(&text, mem.view(nameAt, nameLength))
+        const affinity = eval.exprAffinity(st, @intCast(usize, mem.at(&query0.*.results, i)))
+        _ = mem.appendText(&text, match affinity {
+            66 => " TEXT",
+            67 => " NUM",
+            68 => " INT",
+            69 => " REAL",
+            else => "",
+        })
+        i += 1
+    }
+    _ = mem.appendText(&text, ")")
+    var rc = createFromText(st, mem.bufferText(&text))
+    mem.freeBuffer(&text)
+    if rc != core.OK { return rc }
+    // The rows.
+    const t = schema.table(schema.findTable(&db.*.schema, mem.view(node.*.name, node.*.nameLength)))
+    const rows = core.newRows(query0.*.width)
+    rc = eval.runSubquery(st, q, rows)
+    const cursor = bt.openCursor(&db.*.pager, t.*.root, true, 0)
+    var data: mem.Buffer = undefined
+    mem.initBuffer(&data)
+    var r: usize = 0
+    while rc == core.OK && r < core.rowCount(rows) {
+        const row = core.rowAt(rows, r)
+        var c: usize = 0
+        while c < t.*.columnCount {
+            value.applyAffinity(record.valueAt(row, c), schema.column(t, c).*.affinity)
+            c += 1
+        }
+        data.length = 0
+        _ = record.encode(row, t.*.columnCount, &data)
+        rc = storage(db, bt.insertRow(cursor, @intCast(i64, r) + 1, data.data, data.length))
+        r += 1
+    }
+    mem.freeBuffer(&data)
+    bt.closeCursor(cursor)
+    core.freeRows(rows)
+    return rc
+}
+
+fn needsQuotes(name: []const u8) -> bool {
+    if name.length == 0 { return true }
+    if !lexer.isIdentStart(@intCast(u64, name[0])) { return true }
+    var i: usize = 0
+    while i < name.length {
+        if !lexer.isIdentChar(@intCast(u64, name[i])) { return true }
+        i += 1
+    }
+    return lexer.isReserved(name)
+}
+
+fn appendIdentifier(b: *mem.Buffer, name: []const u8) -> void {
+    if !needsQuotes(name) {
+        _ = mem.appendText(b, name)
+        return
+    }
+    appendQuoted(b, name)
+}
+
+fn appendQuoted(b: *mem.Buffer, name: []const u8) -> void {
+    _ = mem.appendByte(b, 34)
+    var i: usize = 0
+    while i < name.length {
+        if name[i] == 34 { _ = mem.appendByte(b, 34) }
+        _ = mem.appendByte(b, @intCast(u64, name[i]))
+        i += 1
+    }
+    _ = mem.appendByte(b, 34)
+}
+
+// ---------------------------------------------------------------------------
+// CREATE INDEX.
+
+pub fn createIndex(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    const name = mem.view(node.*.name, node.*.nameLength)
+    const tableName = mem.view(node.*.name2, node.*.name2Length)
+    var rc = authorize(st, core.AUTH_CREATE_INDEX, name, tableName)
+    if rc != core.OK { return rc }
+    if schema.findIndex(&db.*.schema, name) != 0 {
+        if node.*.ifNotExists { return core.OK }
+        return core.setError3(db, core.ERROR, "index ", name, " already exists")
+    }
+    if schema.findTable(&db.*.schema, name) != 0 {
+        return core.setError2(db, core.ERROR, "there is already a table named ", name)
+    }
+    const t = schema.findTable(&db.*.schema, tableName)
+    if t == 0 { return core.setError2(db, core.ERROR, "no such table: main.", tableName) }
+    if schema.table(t).*.isSchema || reservedName(tableName) && !mem.sameNoCase(tableName, "sqlite_sequence") {
+        return core.setError3(db, core.ERROR, "table ", tableName, " may not be indexed")
+    }
+    if reservedName(name) {
+        return core.setError2(db, core.ERROR, "object name reserved for internal use: ", name)
+    }
+    var text: mem.Buffer = undefined
+    mem.initBuffer(&text)
+    _ = schema.indexText(st.*.text, node, &text)
+    var message: mem.Buffer = undefined
+    mem.initBuffer(&message)
+    const x = schema.parseIndex(&db.*.schema, mem.bufferText(&text), &message)
+    if x == 0 {
+        rc = core.setError(db, core.ERROR, mem.bufferText(&message))
+        mem.freeBuffer(&message)
+        mem.freeBuffer(&text)
+        return rc
+    }
+    mem.freeBuffer(&message)
+    const index = schema.index(x)
+    rc = eval.resolveIndex(st, index)
+    if rc != core.OK {
+        schema.freeIndex(x)
+        mem.freeBuffer(&text)
+        return rc
+    }
+    index.*.root = bt.createTree(&db.*.pager, false)
+    if index.*.root == 0 {
+        schema.freeIndex(x)
+        mem.freeBuffer(&text)
+        return core.NOMEM
+    }
+    rc = masterInsert(st, "index", name, schema.tableName(schema.table(t)), index.*.root, mem.bufferText(&text), true)
+    mem.freeBuffer(&text)
+    if rc == core.OK { rc = fillIndex(st, schema.table(t), index) }
+    if rc != core.OK {
+        schema.freeIndex(x)
+        return rc
+    }
+    schema.addIndex(&db.*.schema, x)
+    return bumpCookie(st)
+}
+
+// An index's entries for every row of its table; a UNIQUE index with two
+// equal keys fails.
+fn fillIndex(st: *core.Statement, t: *schema.Table, x: *schema.Index) -> i32 {
+    const db = databaseOf(st)
+    const table = bt.openCursor(&db.*.pager, t.*.root, true, 0)
+    const entries = bt.openCursor(&db.*.pager, x.*.root, false, @intFromPtr(&x.*.info))
+    const n = x.*.columnCount
+    const block = mem.alloc((n + 2) * @sizeOf(Value))
+    var i: usize = 0
+    while i < n + 2 {
+        value.init(record.valueAt(block, i))
+        i += 1
+    }
+    var data: mem.Buffer = undefined
+    mem.initBuffer(&data)
+    var rc = bt.first(table)
+    while rc == core.OK && bt.isValid(table) {
+        const rowid = bt.rowid(table)
+        const h = bt.header(table)
+        var anyNull = false
+        i = 0
+        while i < n {
+            const c = schema.indexColumn(x, i)
+            const v = record.valueAt(block, i)
+            if c < 0 || c == t.*.rowidColumn {
+                value.setInt(v, rowid)
+            } else if @intCast(usize, c) < h.*.count {
+                record.column(h, @intCast(usize, c), v)
+            } else {
+                rc = eval.columnDefault(st, t, @intCast(usize, c), v)
+            }
+            if v.*.kind == value.NULL { anyNull = true }
+            i += 1
+        }
+        value.setInt(record.valueAt(block, n), rowid)
+        if rc != core.OK { break }
+        if x.*.unique && !anyNull {
+            rc = bt.seekKey(entries, block, n, false)
+            if rc == core.OK && bt.isValid(entries) {
+                var length: usize = 0
+                const found = bt.payload(entries, &length)
+                if record.compareWithKeys(found, length, block, n, &x.*.info) == 0 {
+                    var text: mem.Buffer = undefined
+                    mem.initBuffer(&text)
+                    i = 0
+                    while i < n {
+                        if i > 0 { _ = mem.appendText(&text, ", ") }
+                        _ = mem.appendText(&text, schema.tableName(t))
+                        _ = mem.appendText(&text, ".")
+                        const c = schema.indexColumn(x, i)
+                        _ = mem.appendText(&text, if c >= 0 { schema.columnName(schema.column(t, @intCast(usize, c))) } else { "rowid" })
+                        i += 1
+                    }
+                    rc = core.setError2(db, core.CONSTRAINT_UNIQUE, "UNIQUE constraint failed: ", mem.bufferText(&text))
+                    mem.freeBuffer(&text)
+                    break
+                }
+            }
+        }
+        data.length = 0
+        _ = record.encode(block, n + 1, &data)
+        rc = storage(db, bt.insertEntry(entries, data.data, data.length))
+        if rc != core.OK { break }
+        rc = bt.next(table)
+    }
+    mem.freeBuffer(&data)
+    core.freeRow(block, n + 2)
+    bt.closeCursor(table)
+    bt.closeCursor(entries)
+    if rc != core.OK && rc != core.CONSTRAINT_UNIQUE && db.*.errorCode != rc { return storage(db, rc) }
+    return rc
+}
+
+// ---------------------------------------------------------------------------
+// DROP.
+
+pub fn dropTable(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    const name = mem.view(node.*.name, node.*.nameLength)
+    const t = schema.findTable(&db.*.schema, name)
+    if t == 0 {
+        if node.*.ifExists { return core.OK }
+        return core.setError2(db, core.ERROR, "no such table: ", name)
+    }
+    const table = schema.table(t)
+    if table.*.isSchema || (reservedName(name) && !mem.sameNoCase(name, "sqlite_sequence") && !mem.startsNoCase(name, "sqlite_stat")) {
+        return core.setError3(db, core.ERROR, "table ", name, " may not be dropped")
+    }
+    var rc = authorize(st, core.AUTH_DROP_TABLE, name, mem.view(0, 0))
+    if rc != core.OK { return rc }
+    var i: usize = 0
+    while rc == core.OK && i < table.*.indexes.length {
+        rc = storage(db, bt.dropTree(&db.*.pager, schema.index(@intCast(usize, mem.at(&table.*.indexes, i))).*.root))
+        i += 1
+    }
+    if rc == core.OK { rc = storage(db, bt.dropTree(&db.*.pager, table.*.root)) }
+    if rc == core.OK { rc = masterDelete(st, name, true) }
+    if rc == core.OK && table.*.autoincrement { rc = sequenceDelete(st, name) }
+    if rc != core.OK { return rc }
+    schema.removeTable(&db.*.schema, t)
+    return bumpCookie(st)
+}
+
+// The table's row of sqlite_sequence goes with it.
+fn sequenceDelete(st: *core.Statement, name: []const u8) -> i32 {
+    const db = databaseOf(st)
+    const s = schema.findTable(&db.*.schema, "sqlite_sequence")
+    if s == 0 { return core.OK }
+    const cursor = bt.openCursor(&db.*.pager, schema.table(s).*.root, true, 0)
+    var v: Value = undefined
+    value.init(&v)
+    var rc = bt.first(cursor)
+    var rowid: i64 = 0
+    var found = false
+    while rc == core.OK && bt.isValid(cursor) {
+        record.column(bt.header(cursor), 0, &v)
+        if v.kind == value.TEXT && mem.same(value.bytesOf(&v), name) {
+            rowid = bt.rowid(cursor)
+            found = true
+            break
+        }
+        rc = bt.next(cursor)
+    }
+    if rc == core.OK && found { rc = bt.deleteRow(cursor, rowid) }
+    value.release(&v)
+    bt.closeCursor(cursor)
+    return storage(db, rc)
+}
+
+pub fn dropIndex(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    const name = mem.view(node.*.name, node.*.nameLength)
+    const x = schema.findIndex(&db.*.schema, name)
+    if x == 0 {
+        if node.*.ifExists { return core.OK }
+        return core.setError2(db, core.ERROR, "no such index: ", name)
+    }
+    const index = schema.index(x)
+    if index.*.sql == 0 {
+        return core.setError(db, core.ERROR, "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped")
+    }
+    var rc = authorize(st, core.AUTH_DROP_INDEX, name, schema.tableName(schema.table(index.*.table)))
+    if rc != core.OK { return rc }
+    rc = storage(db, bt.dropTree(&db.*.pager, index.*.root))
+    if rc == core.OK { rc = masterDelete(st, name, false) }
+    if rc != core.OK { return rc }
+    schema.removeIndex(&db.*.schema, x)
+    return bumpCookie(st)
+}
+
+// ---------------------------------------------------------------------------
+// ALTER TABLE.
+
+// A CREATE text with every identifier token equal to `old` (any case)
+// replaced: `quote` writes the new name in double quotes (as SQLite's
+// RENAME TO does). `after`: only names right after that word (ON for an
+// index's table, REFERENCES for a foreign key's parent), else all; `first`
+// only the first such token.
+fn renameTokens(text: []const u8, old: []const u8, new: []const u8, quote: bool, after: []const u8, first: bool, out: *mem.Buffer) -> bool {
+    out.*.length = 0
+    var l: lexer.Lexer = undefined
+    lexer.init(&l, @intFromPtr(text.pointer), text.length)
+    var t: lexer.Token = undefined
+    var copied: usize = 0
+    var previousWord = false
+    var changed = false
+    while true {
+        lexer.next(&l, &t)
+        if t.kind == lexer.END { break }
+        var name = lexer.text(&l, &t)
+        if t.kind == lexer.QUOTED { name = name[1..name.length - 1] }
+        const wanted = after.length == 0 || previousWord
+        if (t.kind == lexer.WORD || t.kind == lexer.QUOTED) && wanted && mem.sameNoCase(name, old) && !(first && changed) {
+            _ = mem.append(out, @intFromPtr(text.pointer) + copied, t.start - copied)
+            if quote {
+                appendQuoted(out, new)
+            } else {
+                appendIdentifier(out, new)
+            }
+            copied = t.start + t.length
+            changed = true
+        }
+        previousWord = after.length > 0 && t.kind == lexer.WORD && mem.sameNoCase(lexer.text(&l, &t), after)
+    }
+    _ = mem.append(out, @intFromPtr(text.pointer) + copied, text.length - copied)
+    return changed
+}
+
+// Rewrites sqlite_master rows: the table's (`name` -> `new`), its indexes'
+// tbl_name and texts, autoindex names, and foreign keys of other tables.
+fn renameInMaster(st: *core.Statement, name: []const u8, new: []const u8) -> i32 {
+    const db = databaseOf(st)
+    const cursor = bt.openCursor(&db.*.pager, 1, true, 0)
+    var row: MasterRow = undefined
+    initRow(&row)
+    var rowids: mem.Words = undefined
+    mem.initWords(&rowids)
+    var rc = bt.first(cursor)
+    while rc == core.OK && bt.isValid(cursor) {
+        _ = mem.push(&rowids, @bitCast(u64, bt.rowid(cursor)))
+        rc = bt.next(cursor)
+    }
+    var text: mem.Buffer = undefined
+    mem.initBuffer(&text)
+    var newName: mem.Buffer = undefined
+    mem.initBuffer(&newName)
+    const block = mem.alloc(6 * @sizeOf(Value))
+    var k: usize = 0
+    while k < 6 {
+        value.init(record.valueAt(block, k))
+        k += 1
+    }
+    var data: mem.Buffer = undefined
+    mem.initBuffer(&data)
+    var i: usize = 0
+    while rc == core.OK && i < rowids.length {
+        const rowid = @bitCast(i64, mem.at(&rowids, i))
+        i += 1
+        if !bt.seekRowid(cursor, rowid) { continue }
+        readMasterRow(cursor, &row)
+        const kind = value.bytesOf(&row.kind)
+        var changed = false
+        _ = value.copy(record.valueAt(block, 0), &row.kind)
+        _ = value.copy(record.valueAt(block, 1), &row.name)
+        _ = value.copy(record.valueAt(block, 2), &row.table)
+        _ = value.copy(record.valueAt(block, 3), &row.root)
+        _ = value.copy(record.valueAt(block, 4), &row.sql)
+        const own = mem.sameNoCase(value.bytesOf(&row.table), name)
+        if own {
+            _ = value.setString(record.valueAt(block, 2), new)
+            changed = true
+            if mem.same(kind, "table") {
+                _ = value.setString(record.valueAt(block, 1), new)
+                if row.sql.kind == value.TEXT && renameTokens(value.bytesOf(&row.sql), name, new, true, "", true, &text) {
+                    _ = value.setText(record.valueAt(block, 4), text.data, text.length)
+                }
+            } else if row.sql.kind != value.TEXT {
+                // sqlite_autoindex_OLD_N -> sqlite_autoindex_NEW_N.
+                const old = value.bytesOf(&row.name)
+                newName.length = 0
+                _ = mem.appendText(&newName, "sqlite_autoindex_")
+                _ = mem.appendText(&newName, new)
+                if old.length > 17 + name.length { _ = mem.appendText(&newName, old[17 + name.length..]) }
+                _ = value.setText(record.valueAt(block, 1), newName.data, newName.length)
+            } else if renameTokens(value.bytesOf(&row.sql), name, new, true, "ON", true, &text) {
+                _ = value.setText(record.valueAt(block, 4), text.data, text.length)
+            }
+        } else if mem.same(kind, "table") && row.sql.kind == value.TEXT {
+            if renameTokens(value.bytesOf(&row.sql), name, new, true, "REFERENCES", false, &text) {
+                _ = value.setText(record.valueAt(block, 4), text.data, text.length)
+                changed = true
+            }
+        }
+        if !changed { continue }
+        data.length = 0
+        _ = record.encode(block, 5, &data)
+        rc = bt.insertRow(cursor, rowid, data.data, data.length)
+    }
+    mem.freeBuffer(&data)
+    core.freeRow(block, 6)
+    mem.freeBuffer(&text)
+    mem.freeBuffer(&newName)
+    mem.freeWords(&rowids)
+    freeRow(&row)
+    bt.closeCursor(cursor)
+    return storage(db, rc)
+}
+
+fn renameSequence(st: *core.Statement, name: []const u8, new: []const u8) -> i32 {
+    const db = databaseOf(st)
+    const s = schema.findTable(&db.*.schema, "sqlite_sequence")
+    if s == 0 { return core.OK }
+    const cursor = bt.openCursor(&db.*.pager, schema.table(s).*.root, true, 0)
+    const block = mem.alloc(3 * @sizeOf(Value))
+    value.init(record.valueAt(block, 0))
+    value.init(record.valueAt(block, 1))
+    value.init(record.valueAt(block, 2))
+    var rc = bt.first(cursor)
+    var rowid: i64 = 0
+    var found = false
+    while rc == core.OK && bt.isValid(cursor) {
+        const h = bt.header(cursor)
+        record.column(h, 0, record.valueAt(block, 0))
+        record.column(h, 1, record.valueAt(block, 1))
+        if mem.same(value.bytesOf(record.valueAt(block, 0)), name) {
+            rowid = bt.rowid(cursor)
+            found = true
+            break
+        }
+        rc = bt.next(cursor)
+    }
+    if rc == core.OK && found {
+        _ = value.setString(record.valueAt(block, 0), new)
+        var data: mem.Buffer = undefined
+        mem.initBuffer(&data)
+        _ = record.encode(block, 2, &data)
+        rc = bt.insertRow(cursor, rowid, data.data, data.length)
+        mem.freeBuffer(&data)
+    }
+    core.freeRow(block, 3)
+    bt.closeCursor(cursor)
+    return storage(db, rc)
+}
+
+pub fn alterTable(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    const name = mem.view(node.*.name, node.*.nameLength)
+    const t = schema.findTable(&db.*.schema, name)
+    if t == 0 { return core.setError2(db, core.ERROR, "no such table: ", name) }
+    const table = schema.table(t)
+    if table.*.isSchema || (reservedName(name) && !mem.sameNoCase(name, "sqlite_sequence")) {
+        return core.setError3(db, core.ERROR, "table ", name, " may not be altered")
+    }
+    var rc = authorize(st, core.AUTH_ALTER_TABLE, "main", name)
+    if rc != core.OK { return rc }
+    if node.*.kind == ast.S_ALTER_RENAME {
+        const new = mem.view(node.*.name2, node.*.name2Length)
+        if schema.findTable(&db.*.schema, new) != 0 || schema.findIndex(&db.*.schema, new) != 0 {
+            return core.setError2(db, core.ERROR, "there is already another table or index with this name: ", new)
+        }
+        if reservedName(new) {
+            return core.setError2(db, core.ERROR, "object name reserved for internal use: ", new)
+        }
+        // The old name is copied: the table (whose text holds it) goes.
+        const old = mem.dupText(tableName(table))
+        const oldLength = table.*.nameLength
+        rc = renameInMaster(st, mem.view(old, oldLength), new)
+        if rc == core.OK && table.*.autoincrement { rc = renameSequence(st, mem.view(old, oldLength), new) }
+        mem.free(old)
+        if rc != core.OK { return rc }
+        rc = bumpCookie(st)
+        if rc == core.OK { rc = load(db) }
+        return rc
+    }
+    if node.*.kind == ast.S_ALTER_ADD { return addColumn(st, node, t) }
+    if node.*.kind == ast.S_ALTER_RENAME_COLUMN {
+        const old = mem.view(node.*.schema, node.*.schemaLength)
+        const new = mem.view(node.*.name2, node.*.name2Length)
+        if schema.findColumn(table, old) < 0 { return core.setError2(db, core.ERROR, "no such column: \"", core3(old, "\"")) }
+        if schema.findColumn(table, new) >= 0 { return core.setError2(db, core.ERROR, "duplicate column name: ", new) }
+        rc = renameColumnInMaster(st, name, old, new)
+        if rc == core.OK { rc = bumpCookie(st) }
+        if rc == core.OK { rc = load(db) }
+        return rc
+    }
+    return core.setError(db, core.ERROR, "ALTER TABLE DROP COLUMN is not supported")
+}
+
+fn tableName(t: *schema.Table) -> []const u8 { return schema.tableName(t) }
+
+var joined: mem.Buffer = undefined
+var joinedReady: bool = false
+
+fn core3(a: []const u8, b: []const u8) -> []const u8 {
+    if !joinedReady {
+        mem.initBuffer(&joined)
+        joinedReady = true
+    }
+    joined.length = 0
+    _ = mem.appendText(&joined, a)
+    _ = mem.appendText(&joined, b)
+    return mem.bufferText(&joined)
+}
+
+// RENAME COLUMN: the column's name in the table's text and in its
+// indexes' texts.
+fn renameColumnInMaster(st: *core.Statement, table: []const u8, old: []const u8, new: []const u8) -> i32 {
+    const db = databaseOf(st)
+    const cursor = bt.openCursor(&db.*.pager, 1, true, 0)
+    var row: MasterRow = undefined
+    initRow(&row)
+    var rowids: mem.Words = undefined
+    mem.initWords(&rowids)
+    var rc = bt.first(cursor)
+    while rc == core.OK && bt.isValid(cursor) {
+        _ = mem.push(&rowids, @bitCast(u64, bt.rowid(cursor)))
+        rc = bt.next(cursor)
+    }
+    var text: mem.Buffer = undefined
+    mem.initBuffer(&text)
+    const block = mem.alloc(6 * @sizeOf(Value))
+    var k: usize = 0
+    while k < 6 {
+        value.init(record.valueAt(block, k))
+        k += 1
+    }
+    var data: mem.Buffer = undefined
+    mem.initBuffer(&data)
+    var i: usize = 0
+    while rc == core.OK && i < rowids.length {
+        const rowid = @bitCast(i64, mem.at(&rowids, i))
+        i += 1
+        if !bt.seekRowid(cursor, rowid) { continue }
+        readMasterRow(cursor, &row)
+        if !mem.sameNoCase(value.bytesOf(&row.table), table) || row.sql.kind != value.TEXT { continue }
+        if !renameTokens(value.bytesOf(&row.sql), old, new, false, "", false, &text) { continue }
+        _ = value.copy(record.valueAt(block, 0), &row.kind)
+        _ = value.copy(record.valueAt(block, 1), &row.name)
+        _ = value.copy(record.valueAt(block, 2), &row.table)
+        _ = value.copy(record.valueAt(block, 3), &row.root)
+        _ = value.setText(record.valueAt(block, 4), text.data, text.length)
+        data.length = 0
+        _ = record.encode(block, 5, &data)
+        rc = bt.insertRow(cursor, rowid, data.data, data.length)
+    }
+    mem.freeBuffer(&data)
+    core.freeRow(block, 6)
+    mem.freeBuffer(&text)
+    mem.freeWords(&rowids)
+    freeRow(&row)
+    bt.closeCursor(cursor)
+    return storage(db, rc)
+}
+
+fn isConstant(e: usize) -> bool {
+    if e == 0 { return true }
+    const x = ast.expr(e)
+    if x.*.op == ast.E_COLUMN || x.*.op == ast.E_FUNCTION || x.*.op == ast.E_SUBQUERY || x.*.op == ast.E_VARIABLE { return false }
+    return isConstant(x.*.left) && isConstant(x.*.right) && isConstant(x.*.third)
+}
+
+// ADD COLUMN: the column's text put before the closing parenthesis of the
+// table's text.
+fn addColumn(st: *core.Statement, node: *ast.Statement, t: usize) -> i32 {
+    const db = databaseOf(st)
+    const table = schema.table(t)
+    const column = ast.columnDef(node.*.column)
+    const columnName = mem.view(column.*.name, column.*.nameLength)
+    if schema.findColumn(table, columnName) >= 0 {
+        return core.setError2(db, core.ERROR, "duplicate column name: ", columnName)
+    }
+    if column.*.primaryKey { return core.setError(db, core.ERROR, "Cannot add a PRIMARY KEY column") }
+    if column.*.unique { return core.setError(db, core.ERROR, "Cannot add a UNIQUE column") }
+    var defaultNull = column.*.defaultExpr == 0 || ast.expr(column.*.defaultExpr).*.op == ast.E_NULL
+    if column.*.defaultExpr != 0 && !isConstant(column.*.defaultExpr) {
+        return core.setError(db, core.ERROR, "Cannot add a column with non-constant default")
+    }
+    if column.*.defaultExpr != 0 && ast.expr(column.*.defaultExpr).*.op == ast.E_FUNCTION {
+        return core.setError(db, core.ERROR, "Cannot add a column with non-constant default")
+    }
+    if column.*.notNull && defaultNull {
+        return core.setError(db, core.ERROR, "Cannot add a NOT NULL column with default value NULL")
+    }
+    if column.*.foreignKey != 0 && db.*.foreignKeys && !defaultNull {
+        return core.setError(db, core.ERROR, "Cannot add a REFERENCES column with non-NULL default value")
+    }
+    // The table's text, parsed again for where its definition closes.
+    var arena: ast.Arena = undefined
+    ast.initArena(&arena)
+    const sql = mem.view(table.*.sql, table.*.sqlLength)
+    const copied = ast.copyText(&arena, @intFromPtr(sql.pointer), sql.length)
+    var p: parser.Parser = undefined
+    parser.init(&p, &arena, copied, sql.length)
+    const parsed = parser.parseStatement(&p)
+    if p.failed || parsed == 0 {
+        parser.deinit(&p)
+        ast.freeArena(&arena)
+        return core.setError(db, core.CORRUPT, "database disk image is malformed")
+    }
+    parser.deinit(&p)
+    const end = ast.tableDef(ast.statement(parsed).*.tableDef).*.end
+    ast.freeArena(&arena)
+    var text: mem.Buffer = undefined
+    mem.initBuffer(&text)
+    _ = mem.append(&text, @intFromPtr(sql.pointer), end)
+    // A definition ending with spaces keeps them after the new column.
+    var trimmed = end
+    while trimmed > 0 && (sql[trimmed - 1] == 32 || sql[trimmed - 1] == 10 || sql[trimmed - 1] == 9) { trimmed -= 1 }
+    text.length = trimmed
+    _ = mem.appendText(&text, ", ")
+    _ = mem.append(&text, st.*.text + column.*.start, column.*.end - column.*.start)
+    _ = mem.append(&text, @intFromPtr(sql.pointer) + trimmed, sql.length - trimmed)
+    // The new text must make a table.
+    var message: mem.Buffer = undefined
+    mem.initBuffer(&message)
+    const check = schema.parseTable(mem.bufferText(&text), &message)
+    if check == 0 {
+        const rc = core.setError(db, core.ERROR, mem.bufferText(&message))
+        mem.freeBuffer(&message)
+        mem.freeBuffer(&text)
+        return rc
+    }
+    mem.freeBuffer(&message)
+    // (parseTable's table is let go: the schema is read again.)
+    var rc = updateTableText(st, schema.tableName(table), mem.bufferText(&text))
+    mem.freeBuffer(&text)
+    schema.removeTable(&db.*.schema, check)
+    if rc == core.OK { rc = bumpCookie(st) }
+    if rc == core.OK { rc = load(db) }
+    return rc
+}
+
+fn updateTableText(st: *core.Statement, name: []const u8, text: []const u8) -> i32 {
+    const db = databaseOf(st)
+    const cursor = bt.openCursor(&db.*.pager, 1, true, 0)
+    var row: MasterRow = undefined
+    initRow(&row)
+    var rc = bt.first(cursor)
+    var rowid: i64 = 0
+    var found = false
+    while rc == core.OK && bt.isValid(cursor) {
+        readMasterRow(cursor, &row)
+        if mem.same(value.bytesOf(&row.kind), "table") && mem.sameNoCase(value.bytesOf(&row.name), name) {
+            rowid = row.rowid
+            found = true
+            break
+        }
+        rc = bt.next(cursor)
+    }
+    if rc == core.OK && found {
+        const block = mem.alloc(6 * @sizeOf(Value))
+        var k: usize = 0
+        while k < 6 {
+            value.init(record.valueAt(block, k))
+            k += 1
+        }
+        _ = value.copy(record.valueAt(block, 0), &row.kind)
+        _ = value.copy(record.valueAt(block, 1), &row.name)
+        _ = value.copy(record.valueAt(block, 2), &row.table)
+        _ = value.copy(record.valueAt(block, 3), &row.root)
+        _ = value.setString(record.valueAt(block, 4), text)
+        var data: mem.Buffer = undefined
+        mem.initBuffer(&data)
+        _ = record.encode(block, 5, &data)
+        rc = bt.insertRow(cursor, rowid, data.data, data.length)
+        mem.freeBuffer(&data)
+        core.freeRow(block, 6)
+    }
+    freeRow(&row)
+    bt.closeCursor(cursor)
+    return storage(db, rc)
+}

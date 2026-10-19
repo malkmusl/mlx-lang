@@ -1,0 +1,2652 @@
+// std.sql.query: SELECT, compiled and run.
+//
+// A SELECT is compiled into a Query: its FROM items become sources, one
+// loop level each, in the order written (LEFT JOINs keep theirs); names
+// are resolved against them and the queries around (a correlated
+// subquery reads the current row of an outer source); the WHERE is cut
+// at its ANDs and each term is tested at the innermost level it needs.
+// Each table source gets an access path from the terms at its level, as
+// SQLite's planner would choose most of the time: the rowid (=, IN, a
+// range), an index (equalities on its first columns, IN on the first, a
+// range on the next), a scan of an index that holds every column the
+// query needs of the table (SQLite's "covering index" scan, which also
+// decides the order of rows a query without ORDER BY returns), or a
+// scan of the table. An ORDER BY that the path already gives (the index's
+// order, either way) needs no sort.
+//
+// Rows stream out of the loops one at a time when nothing needs them all
+// first; sorting, grouping, DISTINCT across compound SELECTs, UNION,
+// INTERSECT and EXCEPT gather them in memory first.
+const mem = @import("./mem.mlx")
+const value = @import("./value.mlx")
+const record = @import("./record.mlx")
+const ast = @import("./ast.mlx")
+const schema = @import("./schema.mlx")
+const core = @import("./core.mlx")
+const bt = @import("./btree.mlx")
+const eval = @import("./eval.mlx")
+const functions = @import("./functions.mlx")
+const lexer = @import("./lexer.mlx")
+
+const Value = value.Value
+
+// ---------------------------------------------------------------------------
+// Queries.
+
+pub const Query = struct {
+    select: usize
+    statement: usize
+    // The query whose rows this one may read (a subquery's), or 0.
+    outer: usize
+    // Its sources (SourceState addresses), loop order.
+    levels: mem.Words
+    // The result columns (Expr addresses) after `*` is expanded, their
+    // names (address, length) and declared types (address, length).
+    results: mem.Words
+    names: mem.Words
+    types: mem.Words
+    // The current output row: a block of Values.
+    output: usize
+    width: usize
+    // WHERE terms that need no source (tested once per run).
+    constantTerms: mem.Words
+    // Aggregates (Expr addresses of aggregate calls), their accumulators,
+    // and the column references read after grouping (registers).
+    aggregates: mem.Words
+    accumulators: usize
+    bare: mem.Words
+    isAggregate: bool
+    // GROUP BY terms (Expr addresses).
+    groupBy: mem.Words
+    // The output needs sorting; the ORDER BY terms' values follow the
+    // result columns in each gathered row.
+    sort: bool
+    orderCount: usize
+    distinct: bool
+    // Compound: the query before and how this one follows it.
+    prior: usize
+    op: u8
+    // LIMIT and OFFSET for this run.
+    limit: i64
+    offset: i64
+    returned: i64
+    // How it runs.
+    phase: u8
+    level: i64
+    // Rows gathered (sorted, grouped, compound) and the set of rows seen
+    // (DISTINCT, UNION).
+    gathered: usize
+    seen: usize
+    // A query with no FROM produces one row.
+    single: bool
+    // Bound-to-a-select terms.
+    having: usize
+    // Each run's state was set up.
+    started: bool
+    // Column references outside aggregates read the registers (the group's
+    // values) rather than the sources: on while a group's row is made.
+    readRegisters: bool
+    registers: usize
+    // A subquery that reads rows of an outer query (it runs again for
+    // each of them).
+    correlated: bool
+}
+
+pub inline fn queryOf(address: usize) -> *Query { unsafe { return @ptrFromInt(*Query, address) } }
+
+const PHASE_START: u8 = 0
+const PHASE_LOOP: u8 = 1
+const PHASE_GATHERED: u8 = 2
+const PHASE_PRIOR: u8 = 3
+const PHASE_DONE: u8 = 4
+
+// ---------------------------------------------------------------------------
+// Errors go on the connection.
+
+fn databaseOf(st: *core.Statement) -> *core.Database { return core.database(st.*.db) }
+
+fn fail(st: *core.Statement, message: []const u8) -> i32 { return core.setError(databaseOf(st), core.ERROR, message) }
+
+fn fail2(st: *core.Statement, a: []const u8, b: []const u8) -> i32 { return core.setError2(databaseOf(st), core.ERROR, a, b) }
+
+// ---------------------------------------------------------------------------
+// Scopes: what names mean while a query is resolved.
+
+pub const Scope = struct {
+    query: usize
+    parent: usize
+    // Result items whose aliases ORDER BY, GROUP BY and HAVING may name.
+    aliases: usize
+    // Resolving an aggregate's argument (no aggregates inside).
+    inAggregate: bool
+    // Aggregates are allowed here (result columns, HAVING, ORDER BY).
+    allowAggregates: bool
+}
+
+pub inline fn scopeOf(address: usize) -> *Scope { unsafe { return @ptrFromInt(*Scope, address) } }
+
+fn sourceName(s: *core.SourceState) -> []const u8 {
+    const item = ast.source(s.*.item)
+    if item.*.aliasLength > 0 { return mem.view(item.*.alias, item.*.aliasLength) }
+    return mem.view(item.*.name, item.*.nameLength)
+}
+
+// The column `name` of a source: its index (-1 the rowid), or -2.
+fn sourceColumn(s: *core.SourceState, name: []const u8) -> i64 {
+    if s.*.kind == core.SOURCE_TABLE {
+        const t = schema.table(s.*.table)
+        const c = schema.findColumn(t, name)
+        if c >= 0 { return c }
+        if schema.isRowidName(name) { return -1 }
+        return -2
+    }
+    var i: usize = 0
+    while i < s.*.width {
+        const address = @intCast(usize, mem.at(&s.*.names, i * 2))
+        const length = @intCast(usize, mem.at(&s.*.names, i * 2 + 1))
+        if mem.sameNoCase(mem.view(address, length), name) { return @intCast(i64, i) }
+        i += 1
+    }
+    return -2
+}
+
+// Resolves a column reference: OK, or an error on the connection.
+fn resolveColumn(st: *core.Statement, scope: usize, e: *ast.Expr) -> i32 {
+    const name = mem.view(e.*.name, e.*.nameLength)
+    const qualifier = mem.view(e.*.table, e.*.tableLength)
+    var sc = scope
+    var qualifierSeen = false
+    while sc != 0 {
+        const q = queryOf(scopeOf(sc).*.query)
+        var found: i64 = -2
+        var foundSource: usize = 0
+        var matches: usize = 0
+        var i: usize = 0
+        while i < q.*.levels.length {
+            const s = core.sourceState(@intCast(usize, mem.at(&q.*.levels, i)))
+            if e.*.tableLength > 0 {
+                if !mem.sameNoCase(sourceName(s), qualifier) {
+                    i += 1
+                    continue
+                }
+                qualifierSeen = true
+            }
+            const c = sourceColumn(s, name)
+            if c != -2 {
+                // A rowid name matches only where no other source has a
+                // column of that name.
+                if c == -1 && matches > 0 {
+                    i += 1
+                    continue
+                }
+                if found == -1 && c >= 0 {
+                    matches = 0
+                }
+                if c >= 0 || matches == 0 {
+                    found = c
+                    foundSource = @intFromPtr(s)
+                    matches += 1
+                }
+            }
+            i += 1
+        }
+        if matches > 1 && found >= 0 {
+            return fail2(st, "ambiguous column name: ", name)
+        }
+        if matches >= 1 {
+            e.*.source = @intCast(i64, core.sourceState(foundSource).*.number)
+            e.*.column = found
+            // Found in an outer query: the queries in between read an
+            // outer row, and run again for each.
+            var inner = scope
+            while inner != sc {
+                queryOf(scopeOf(inner).*.query).*.correlated = true
+                inner = scopeOf(inner).*.parent
+            }
+            return core.OK
+        }
+        // A result column's alias (in the query's own scope).
+        if e.*.tableLength == 0 && scopeOf(sc).*.aliases != 0 && sc == scope {
+            const items = scopeOf(sc).*.aliases
+            var k: usize = 0
+            while k < ast.count(items) {
+                const it = ast.itemAt(items, k)
+                if it.*.nameLength > 0 && mem.sameNoCase(mem.view(it.*.name, it.*.nameLength), name) {
+                    // The expression stands for the alias.
+                    const target = it.*.expr
+                    copyExpr(e, ast.expr(target))
+                    return core.OK
+                }
+                k += 1
+            }
+        }
+        sc = scopeOf(sc).*.parent
+    }
+    if e.*.tableLength == 0 && !e.*.quoted {
+        if mem.sameNoCase(name, "TRUE") || mem.sameNoCase(name, "FALSE") {
+            e.*.op = ast.E_INTEGER
+            e.*.i = if mem.sameNoCase(name, "TRUE") { 1 } else { 0 }
+            return core.OK
+        }
+    }
+    if e.*.tableLength == 0 && e.*.quoted && mem.get8(lexerStart(st, e)) == 34 {
+        // A "string" that names no column is a string (SQLite's
+        // double-quoted string literal).
+        e.*.op = ast.E_STRING
+        return core.OK
+    }
+    const db = databaseOf(st)
+    db.*.errorCode = core.ERROR
+    db.*.message.length = 0
+    _ = mem.appendText(&db.*.message, "no such column: ")
+    if e.*.tableLength > 0 {
+        _ = mem.appendText(&db.*.message, qualifier)
+        _ = mem.appendText(&db.*.message, ".")
+    }
+    _ = mem.appendText(&db.*.message, name)
+    _ = qualifierSeen
+    return core.ERROR
+}
+
+fn lexerStart(st: *core.Statement, e: *ast.Expr) -> usize { return st.*.text + e.*.start }
+
+// Makes `target` the expression `source` is (an alias's), sharing its
+// children.
+fn copyExpr(target: *ast.Expr, source: *ast.Expr) -> void {
+    const start = target.*.start
+    const end = target.*.end
+    target.* = source.*
+    target.*.start = start
+    target.*.end = end
+}
+
+fn isAggregateName(name: []const u8, arguments: usize, star: bool) -> bool {
+    if mem.sameNoCase(name, "count") { return arguments <= 1 }
+    if mem.sameNoCase(name, "sum") || mem.sameNoCase(name, "total") || mem.sameNoCase(name, "avg") { return arguments == 1 }
+    if mem.sameNoCase(name, "max") || mem.sameNoCase(name, "min") { return arguments == 1 }
+    if mem.sameNoCase(name, "group_concat") || mem.sameNoCase(name, "string_agg") { return arguments == 1 || arguments == 2 }
+    _ = star
+    return false
+}
+
+// Resolves an expression's names and functions in `scope`; aggregates
+// are registered with the scope's query.
+pub fn resolve(st: *core.Statement, scope: usize, address: usize) -> i32 {
+    if address == 0 { return core.OK }
+    const e = ast.expr(address)
+    var rc = core.OK
+    if e.*.op == ast.E_COLUMN {
+        return resolveColumn(st, scope, e)
+    }
+    if e.*.op == ast.E_FUNCTION {
+        const name = mem.view(e.*.name, e.*.nameLength)
+        const arguments = ast.count(e.*.list)
+        if isAggregateName(name, arguments, e.*.star) && functions.findUser(databaseOf(st), name, @intCast(i32, arguments)) == 0 {
+            const sc = scopeOf(scope)
+            if !sc.*.allowAggregates || sc.*.inAggregate {
+                if sc.*.inAggregate { return fail(st, "misuse of aggregate function ") }
+                return fail2(st, "misuse of aggregate: ", name)
+            }
+            // The aggregate belongs to the innermost query whose sources it
+            // reads; it is this one here.
+            const q = queryOf(sc.*.query)
+            q.*.isAggregate = true
+            sc.*.inAggregate = true
+            var i: usize = 0
+            while i < arguments && rc == core.OK {
+                rc = resolve(st, scope, ast.exprAt(e.*.list, i))
+                i += 1
+            }
+            sc.*.inAggregate = false
+            if rc != core.OK { return rc }
+            _ = mem.push(&q.*.aggregates, @intCast(u64, address))
+            e.*.aggregate = q.*.aggregates.length
+            e.*.function = functions.aggregateKind(name)
+            e.*.slot = sc.*.query
+            return core.OK
+        }
+        if e.*.star {
+            return fail2(st, "wrong number of arguments to function ", name)
+        }
+        e.*.function = functions.find(databaseOf(st), name, @intCast(i32, arguments))
+        if e.*.function == 0 {
+            if functions.knownName(databaseOf(st), name) {
+                return core.setError3(databaseOf(st), core.ERROR, "wrong number of arguments to function ", name, "()")
+            }
+            return fail2(st, "no such function: ", name)
+        }
+        var i: usize = 0
+        while i < arguments && rc == core.OK {
+            rc = resolve(st, scope, ast.exprAt(e.*.list, i))
+            i += 1
+        }
+        return rc
+    }
+    if e.*.op == ast.E_COLLATE {
+        rc = resolve(st, scope, e.*.left)
+        if rc != core.OK { return rc }
+        e.*.collation = eval.findCollation(databaseOf(st), mem.view(e.*.name, e.*.nameLength))
+        if e.*.collation == 0 {
+            return core.setError2(databaseOf(st), core.ERROR, "no such collation sequence: ", mem.view(e.*.name, e.*.nameLength))
+        }
+        return core.OK
+    }
+    if e.*.op == ast.E_SUBQUERY || e.*.op == ast.E_EXISTS || e.*.op == ast.E_IN_SELECT {
+        if e.*.op == ast.E_IN_SELECT {
+            rc = resolve(st, scope, e.*.left)
+            if rc != core.OK { return rc }
+        }
+        const q = compile(st, e.*.select, scope)
+        if q == 0 { return databaseOf(st).*.errorCode }
+        e.*.slot = q
+        if e.*.op != ast.E_EXISTS && queryOf(q).*.width != 1 {
+            if e.*.op == ast.E_IN_SELECT {
+                return core.setError3(databaseOf(st), core.ERROR, "sub-select returns ", decimalText(queryOf(q).*.width), " columns - expected 1")
+            }
+            return core.setError3(databaseOf(st), core.ERROR, "sub-select returns ", decimalText(queryOf(q).*.width), " columns - expected 1")
+        }
+        return core.OK
+    }
+    if e.*.op == ast.E_STAR {
+        return fail(st, "near \"*\": syntax error")
+    }
+    rc = resolve(st, scope, e.*.left)
+    if rc == core.OK { rc = resolve(st, scope, e.*.right) }
+    if rc == core.OK { rc = resolve(st, scope, e.*.third) }
+    if rc == core.OK && e.*.list != 0 {
+        var i: usize = 0
+        while i < ast.count(e.*.list) && rc == core.OK {
+            rc = resolve(st, scope, ast.exprAt(e.*.list, i))
+            i += 1
+        }
+    }
+    return rc
+}
+
+var decimalBuffer: [24]u8 = undefined
+
+fn decimalText(n: usize) -> []const u8 {
+    var count: usize = 0
+    var rest = n
+    while true {
+        decimalBuffer[23 - count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    return mem.view(@intFromPtr(&decimalBuffer) + 24 - count, count)
+}
+
+// ---------------------------------------------------------------------------
+// Compiling.
+
+fn newSource(st: *core.Statement, q: usize, item: usize) -> usize {
+    const address = mem.alloc(@sizeOf(core.SourceState))
+    const s = core.sourceState(address)
+    s.*.item = item
+    s.*.query = q
+    mem.initWords(&s.*.equalities)
+    mem.initWords(&s.*.names)
+    mem.initWords(&s.*.onTerms)
+    mem.initWords(&s.*.whereTerms)
+    s.*.number = st.*.sources.length
+    _ = mem.push(&st.*.sources, @intCast(u64, address))
+    return address
+}
+
+fn newQuery(st: *core.Statement, select: usize, outer: usize) -> usize {
+    const address = mem.alloc(@sizeOf(Query))
+    const q = queryOf(address)
+    q.*.select = select
+    q.*.statement = @intFromPtr(st)
+    q.*.outer = outer
+    mem.initWords(&q.*.levels)
+    mem.initWords(&q.*.results)
+    mem.initWords(&q.*.names)
+    mem.initWords(&q.*.types)
+    mem.initWords(&q.*.constantTerms)
+    mem.initWords(&q.*.aggregates)
+    mem.initWords(&q.*.bare)
+    mem.initWords(&q.*.groupBy)
+    q.*.level = -1
+    // Queries are freed with the statement.
+    _ = mem.push(&st.*.queries, @intCast(u64, address))
+    return address
+}
+
+pub fn freeQuery(address: usize) -> void {
+    const q = queryOf(address)
+    mem.freeWords(&q.*.levels)
+    mem.freeWords(&q.*.results)
+    mem.freeWords(&q.*.names)
+    mem.freeWords(&q.*.types)
+    mem.freeWords(&q.*.constantTerms)
+    mem.freeWords(&q.*.aggregates)
+    mem.freeWords(&q.*.bare)
+    mem.freeWords(&q.*.groupBy)
+    if q.*.output != 0 {
+        core.freeRow(q.*.output, q.*.width + q.*.orderCount)
+    }
+    functions.freeAccumulators(q.*.accumulators, q.*.aggregates.length)
+    if q.*.registers != 0 { core.freeRow(q.*.registers, q.*.bare.length + 1) }
+    core.freeRows(q.*.gathered)
+    eval.freeSet(q.*.seen)
+    mem.free(address)
+}
+
+pub fn freeSource(address: usize) -> void {
+    const s = core.sourceState(address)
+    bt.closeCursor(s.*.cursor)
+    bt.closeCursor(s.*.indexCursor)
+    mem.freeWords(&s.*.equalities)
+    mem.freeWords(&s.*.names)
+    mem.freeWords(&s.*.onTerms)
+    mem.freeWords(&s.*.whereTerms)
+    if s.*.keys != 0 { core.freeRow(s.*.keys, s.*.keyCount) }
+    core.freeRows(s.*.rows)
+    core.freeRows(s.*.inValues)
+    mem.free(address)
+}
+
+// Splits a condition at its ANDs into `terms`.
+fn splitAnd(e: usize, terms: *mem.Words) -> void {
+    if e == 0 { return }
+    if ast.expr(e).*.op == ast.E_AND {
+        splitAnd(ast.expr(e).*.left, terms)
+        splitAnd(ast.expr(e).*.right, terms)
+        return
+    }
+    _ = mem.push(terms, @intCast(u64, e))
+}
+
+// The innermost level of `q` an expression reads (-1: none of q's).
+fn levelOfExpr(st: *core.Statement, q: usize, e: usize) -> i64 {
+    if e == 0 { return -1 }
+    const x = ast.expr(e)
+    var level: i64 = -1
+    if x.*.op == ast.E_COLUMN && x.*.source >= 0 {
+        const s = core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, x.*.source))))
+        if s.*.query == q { level = @intCast(i64, s.*.level) }
+    }
+    if x.*.slot != 0 && (x.*.op == ast.E_SUBQUERY || x.*.op == ast.E_EXISTS || x.*.op == ast.E_IN_SELECT) {
+        const inner = levelOfQuery(st, q, x.*.slot)
+        if inner > level { level = inner }
+    }
+    var l = levelOfExpr(st, q, x.*.left)
+    if l > level { level = l }
+    l = levelOfExpr(st, q, x.*.right)
+    if l > level { level = l }
+    l = levelOfExpr(st, q, x.*.third)
+    if l > level { level = l }
+    var i: usize = 0
+    while i < ast.count(x.*.list) {
+        l = levelOfExpr(st, q, ast.exprAt(x.*.list, i))
+        if l > level { level = l }
+        i += 1
+    }
+    return level
+}
+
+// The innermost level of `q` a subquery reads.
+fn levelOfQuery(st: *core.Statement, q: usize, inner: usize) -> i64 {
+    const iq = queryOf(inner)
+    var level: i64 = -1
+    var i: usize = 0
+    while i < iq.*.results.length {
+        const l = levelOfExpr(st, q, @intCast(usize, mem.at(&iq.*.results, i)))
+        if l > level { level = l }
+        i += 1
+    }
+    i = 0
+    while i < iq.*.levels.length {
+        const s = core.sourceState(@intCast(usize, mem.at(&iq.*.levels, i)))
+        var k: usize = 0
+        while k < s.*.onTerms.length {
+            const l = levelOfExpr(st, q, @intCast(usize, mem.at(&s.*.onTerms, k)))
+            if l > level { level = l }
+            k += 1
+        }
+        k = 0
+        while k < s.*.whereTerms.length {
+            const l = levelOfExpr(st, q, @intCast(usize, mem.at(&s.*.whereTerms, k)))
+            if l > level { level = l }
+            k += 1
+        }
+        if s.*.kind == core.SOURCE_ROWS && s.*.rows == 0 && s.*.subquery != 0 {
+            const l = levelOfQuery(st, q, s.*.subquery)
+            if l > level { level = l }
+        }
+        i += 1
+    }
+    i = 0
+    while i < iq.*.constantTerms.length {
+        const l = levelOfExpr(st, q, @intCast(usize, mem.at(&iq.*.constantTerms, i)))
+        if l > level { level = l }
+        i += 1
+    }
+    i = 0
+    while i < iq.*.groupBy.length {
+        const l = levelOfExpr(st, q, @intCast(usize, mem.at(&iq.*.groupBy, i)))
+        if l > level { level = l }
+        i += 1
+    }
+    var l2 = levelOfExpr(st, q, iq.*.having)
+    if l2 > level { level = l2 }
+    const sel = ast.select(iq.*.select)
+    l2 = levelOfExpr(st, q, sel.*.limit)
+    if l2 > level { level = l2 }
+    l2 = levelOfExpr(st, q, sel.*.offset)
+    if l2 > level { level = l2 }
+    if sel.*.orderBy != 0 {
+        var k: usize = 0
+        while k < ast.count(sel.*.orderBy) {
+            const l = levelOfExpr(st, q, ast.exprAt(sel.*.orderBy, k))
+            if l > level { level = l }
+            k += 1
+        }
+    }
+    if iq.*.prior != 0 {
+        const l = levelOfQuery(st, q, iq.*.prior)
+        if l > level { level = l }
+    }
+    return level
+}
+
+// The FROM items of a SELECT made sources of `q`.
+fn addSources(st: *core.Statement, q: usize, sel: *ast.Select, scope: usize) -> i32 {
+    const db = databaseOf(st)
+    var i: usize = 0
+    while i < ast.count(sel.*.from) {
+        const item = @intCast(usize, ast.wordAt(sel.*.from, i))
+        const x = ast.source(item)
+        const s = core.sourceState(newSource(st, q, item))
+        s.*.level = queryOf(q).*.levels.length
+        s.*.leftJoin = (x.*.join & ast.J_LEFT) != 0
+        if x.*.subquery != 0 {
+            // A subquery's rows: compiled now, run when the loop reaches
+            // it. Its names are its result columns'.
+            const inner = compile(st, x.*.subquery, scope)
+            if inner == 0 { return db.*.errorCode }
+            s.*.kind = core.SOURCE_ROWS
+            s.*.subquery = inner
+            s.*.correlated = queryOf(inner).*.correlated
+            s.*.width = queryOf(inner).*.width
+            var k: usize = 0
+            while k < s.*.width * 2 {
+                _ = mem.push(&s.*.names, mem.at(&queryOf(inner).*.names, k))
+                k += 1
+            }
+        } else if x.*.arguments != 0 {
+            const rc = functions.tableFunction(st, s, x)
+            if rc != core.OK { return rc }
+        } else {
+            const name = mem.view(x.*.name, x.*.nameLength)
+            const t = schema.findTable(&db.*.schema, name)
+            if t == 0 { return fail2(st, "no such table: ", name) }
+            s.*.kind = core.SOURCE_TABLE
+            s.*.table = t
+            if x.*.indexedByLength > 0 {
+                const ix = schema.findIndex(&db.*.schema, mem.view(x.*.indexedBy, x.*.indexedByLength))
+                if ix == 0 || schema.index(ix).*.table != t {
+                    return fail2(st, "no such index: ", mem.view(x.*.indexedBy, x.*.indexedByLength))
+                }
+            }
+            const auth = eval.authorize(st, core.AUTH_SELECT, mem.view(0, 0), mem.view(0, 0))
+            _ = auth
+        }
+        _ = mem.push(&queryOf(q).*.levels, @intCast(u64, @intFromPtr(s)))
+        i += 1
+    }
+    return core.OK
+}
+
+// `*` and `t.*` expanded, every result expression resolved, names and
+// declared types worked out.
+fn addResults(st: *core.Statement, q: usize, sel: *ast.Select, scope: usize) -> i32 {
+    const query = queryOf(q)
+    const items = sel.*.columns
+    var i: usize = 0
+    while i < ast.count(items) {
+        const it = ast.itemAt(items, i)
+        const e = ast.expr(it.*.expr)
+        if e.*.op == ast.E_STAR {
+            var any = false
+            var k: usize = 0
+            while k < query.*.levels.length {
+                const s = core.sourceState(@intCast(usize, mem.at(&query.*.levels, k)))
+                if it.*.tableLength > 0 && !mem.sameNoCase(sourceName(s), mem.view(it.*.table, it.*.tableLength)) {
+                    k += 1
+                    continue
+                }
+                any = true
+                const n = if s.*.kind == core.SOURCE_TABLE { schema.table(s.*.table).*.columnCount } else { s.*.width }
+                var c: usize = 0
+                while c < n {
+                    const ref = ast.newExpr(&st.*.arena, ast.E_COLUMN)
+                    ast.expr(ref).*.source = @intCast(i64, s.*.number)
+                    ast.expr(ref).*.column = @intCast(i64, c)
+                    _ = mem.push(&query.*.results, @intCast(u64, ref))
+                    if s.*.kind == core.SOURCE_TABLE {
+                        const col = schema.column(schema.table(s.*.table), c)
+                        _ = mem.push(&query.*.names, @intCast(u64, col.*.name))
+                        _ = mem.push(&query.*.names, @intCast(u64, col.*.nameLength))
+                        _ = mem.push(&query.*.types, @intCast(u64, col.*.typeName))
+                        _ = mem.push(&query.*.types, @intCast(u64, col.*.typeLength))
+                    } else {
+                        _ = mem.push(&query.*.names, mem.at(&s.*.names, c * 2))
+                        _ = mem.push(&query.*.names, mem.at(&s.*.names, c * 2 + 1))
+                        _ = mem.push(&query.*.types, 0)
+                        _ = mem.push(&query.*.types, 0)
+                    }
+                    c += 1
+                }
+                k += 1
+            }
+            if !any {
+                if it.*.tableLength > 0 { return fail2(st, "no such table: ", mem.view(it.*.table, it.*.tableLength)) }
+                return fail(st, "no tables specified")
+            }
+        } else {
+            const rc = resolve(st, scope, it.*.expr)
+            if rc != core.OK { return rc }
+            _ = mem.push(&query.*.results, @intCast(u64, it.*.expr))
+            // The name: AS, else a column's own name, else the text.
+            const r = ast.expr(it.*.expr)
+            if it.*.nameLength > 0 {
+                _ = mem.push(&query.*.names, @intCast(u64, it.*.name))
+                _ = mem.push(&query.*.names, @intCast(u64, it.*.nameLength))
+            } else if r.*.op == ast.E_COLUMN && r.*.source >= 0 {
+                const s = core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, r.*.source))))
+                if s.*.kind == core.SOURCE_TABLE && r.*.column >= 0 {
+                    const col = schema.column(schema.table(s.*.table), @intCast(usize, r.*.column))
+                    _ = mem.push(&query.*.names, @intCast(u64, col.*.name))
+                    _ = mem.push(&query.*.names, @intCast(u64, col.*.nameLength))
+                } else if s.*.kind == core.SOURCE_ROWS && r.*.column >= 0 {
+                    _ = mem.push(&query.*.names, mem.at(&s.*.names, @intCast(usize, r.*.column) * 2))
+                    _ = mem.push(&query.*.names, mem.at(&s.*.names, @intCast(usize, r.*.column) * 2 + 1))
+                } else {
+                    _ = mem.push(&query.*.names, @intCast(u64, ast.copyText(&st.*.arena, st.*.text + r.*.start, r.*.end - r.*.start)))
+                    _ = mem.push(&query.*.names, @intCast(u64, r.*.end - r.*.start))
+                }
+            } else {
+                // The expression's text (NUL-terminated, for C).
+                _ = mem.push(&query.*.names, @intCast(u64, ast.copyText(&st.*.arena, st.*.text + r.*.start, r.*.end - r.*.start)))
+                _ = mem.push(&query.*.names, @intCast(u64, r.*.end - r.*.start))
+            }
+            var typeAddress: usize = 0
+            var typeLength: usize = 0
+            if r.*.op == ast.E_COLUMN && r.*.source >= 0 {
+                const s = core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, r.*.source))))
+                if s.*.kind == core.SOURCE_TABLE {
+                    if r.*.column >= 0 {
+                        const col = schema.column(schema.table(s.*.table), @intCast(usize, r.*.column))
+                        typeAddress = col.*.typeName
+                        typeLength = col.*.typeLength
+                    } else {
+                        typeAddress = @intFromPtr("INTEGER".pointer)
+                        typeLength = 7
+                    }
+                }
+            }
+            _ = mem.push(&query.*.types, @intCast(u64, typeAddress))
+            _ = mem.push(&query.*.types, @intCast(u64, typeLength))
+        }
+        i += 1
+    }
+    query.*.width = query.*.results.length
+    return core.OK
+}
+
+// Compiles a SELECT (and those before it in a compound): its Query, or 0
+// with the error on the connection.
+pub fn compile(st: *core.Statement, select: usize, outerScope: usize) -> usize {
+    const sel = ast.select(select)
+    var prior: usize = 0
+    if sel.*.prior != 0 {
+        prior = compile(st, sel.*.prior, outerScope)
+        if prior == 0 { return 0 }
+    }
+    const q = newQuery(st, select, outerScope)
+    const query = queryOf(q)
+    query.*.prior = prior
+    query.*.op = sel.*.op
+    const scope = mem.alloc(@sizeOf(Scope))
+    _ = mem.push(&st.*.scopes, @intCast(u64, scope))
+    scopeOf(scope).*.query = q
+    scopeOf(scope).*.parent = outerScope
+    query.*.outer = outerScope
+    var rc = addSources(st, q, sel, scope)
+    if rc != core.OK { return 0 }
+    query.*.single = query.*.levels.length == 0
+    // ON terms, then the result columns (which may hold aggregates).
+    var i: usize = 0
+    while i < query.*.levels.length {
+        const s = core.sourceState(@intCast(usize, mem.at(&query.*.levels, i)))
+        const item = ast.source(s.*.item)
+        if item.*.on != 0 {
+            rc = resolve(st, scope, item.*.on)
+            if rc != core.OK { return 0 }
+        }
+        if item.*.using != 0 {
+            rc = usingTerms(st, q, i, item)
+            if rc != core.OK { return 0 }
+        }
+        i += 1
+    }
+    scopeOf(scope).*.allowAggregates = true
+    rc = addResults(st, q, sel, scope)
+    if rc != core.OK { return 0 }
+    scopeOf(scope).*.allowAggregates = false
+    if sel.*.where != 0 {
+        rc = resolve(st, scope, sel.*.where)
+        if rc != core.OK { return 0 }
+        if containsAggregate(sel.*.where) {
+            _ = fail(st, "misuse of aggregate function")
+            return 0
+        }
+    }
+    // GROUP BY and HAVING: aliases of the result columns may be named.
+    scopeOf(scope).*.aliases = sel.*.columns
+    if sel.*.groupBy != 0 {
+        i = 0
+        while i < ast.count(sel.*.groupBy) {
+            const g = ast.exprAt(sel.*.groupBy, i)
+            if ast.expr(g).*.op == ast.E_INTEGER {
+                // GROUP BY 2: the second result column.
+                const n = ast.expr(g).*.i
+                if n < 1 || n > @intCast(i64, query.*.width) {
+                    _ = core.setError3(databaseOf(st), core.ERROR, ordinalWord(i), " GROUP BY term out of range - should be between 1 and ", decimalText(query.*.width))
+                    return 0
+                }
+                _ = mem.push(&query.*.groupBy, mem.at(&query.*.results, @intCast(usize, n - 1)))
+            } else {
+                rc = resolve(st, scope, g)
+                if rc != core.OK { return 0 }
+                _ = mem.push(&query.*.groupBy, @intCast(u64, g))
+            }
+            i += 1
+        }
+        query.*.isAggregate = true
+    }
+    if sel.*.having != 0 {
+        scopeOf(scope).*.allowAggregates = true
+        rc = resolve(st, scope, sel.*.having)
+        if rc != core.OK { return 0 }
+        query.*.having = sel.*.having
+        if !query.*.isAggregate {
+            _ = fail(st, "a GROUP BY clause is required before HAVING")
+            return 0
+        }
+    }
+    // ORDER BY: a number is a result column, a name may be an alias, an
+    // expression equal to a result column's text is that column.
+    if sel.*.orderBy != 0 {
+        scopeOf(scope).*.allowAggregates = true
+        i = 0
+        while i < ast.count(sel.*.orderBy) {
+            const it = ast.itemAt(sel.*.orderBy, i)
+            var term = it.*.expr
+            var inner = term
+            if ast.expr(inner).*.op == ast.E_COLLATE { inner = ast.expr(inner).*.left }
+            if ast.expr(inner).*.op == ast.E_INTEGER {
+                const n = ast.expr(inner).*.i
+                if n < 1 || n > @intCast(i64, query.*.width) {
+                    _ = core.setError3(databaseOf(st), core.ERROR, ordinalWord(i), " ORDER BY term out of range - should be between 1 and ", decimalText(query.*.width))
+                    return 0
+                }
+                const target = @intCast(usize, mem.at(&query.*.results, @intCast(usize, n - 1)))
+                if inner == term {
+                    it.*.expr = target
+                } else {
+                    ast.expr(term).*.left = target
+                    rc = resolve(st, scope, 0)
+                }
+                if ast.expr(term).*.op == ast.E_COLLATE {
+                    ast.expr(term).*.collation = eval.findCollation(databaseOf(st), mem.view(ast.expr(term).*.name, ast.expr(term).*.nameLength))
+                }
+            } else if prior != 0 {
+                // A compound's ORDER BY names its result columns.
+                const n = compoundColumn(st, q, inner)
+                if n < 0 {
+                    _ = core.setError3(databaseOf(st), core.ERROR, ordinalWord(i), " ORDER BY term does not match any column in the result set", "")
+                    return 0
+                }
+                const ref = ast.newExpr(&st.*.arena, ast.E_REGISTER)
+                ast.expr(ref).*.column = n
+                if inner == term {
+                    it.*.expr = ref
+                } else {
+                    ast.expr(term).*.left = ref
+                    ast.expr(term).*.collation = eval.findCollation(databaseOf(st), mem.view(ast.expr(term).*.name, ast.expr(term).*.nameLength))
+                }
+            } else {
+                rc = resolve(st, scope, term)
+                if rc != core.OK { return 0 }
+            }
+            i += 1
+        }
+        scopeOf(scope).*.allowAggregates = false
+        query.*.orderCount = ast.count(sel.*.orderBy)
+    }
+    if sel.*.distinct { query.*.distinct = true }
+    if prior != 0 && queryOf(prior).*.width != query.*.width {
+        _ = core.setError3(databaseOf(st), core.ERROR, "SELECTs to the left and right of ", compoundName(sel.*.op), " do not have the same number of result columns")
+        return 0
+    }
+    // The WHERE's terms to their levels, then the access paths.
+    rc = placeTerms(st, q, sel.*.where)
+    if rc != core.OK { return 0 }
+    i = 0
+    while i < query.*.levels.length {
+        rc = plan(st, q, i)
+        if rc != core.OK { return 0 }
+        i += 1
+    }
+    // Aggregates: their accumulators, and the column references read
+    // after the rows are gone (registers).
+    if query.*.isAggregate {
+        query.*.accumulators = functions.newAccumulators(&query.*.aggregates)
+        markBare(st, q)
+        query.*.registers = mem.alloc((query.*.bare.length + 1) * @sizeOf(Value))
+        i = 0
+        while i < query.*.bare.length + 1 {
+            value.init(record.valueAt(query.*.registers, i))
+            i += 1
+        }
+    }
+    // The ORDER BY needs a sort unless the loop already yields that order.
+    if sel.*.orderBy != 0 {
+        query.*.sort = !orderSatisfied(st, q)
+    }
+    query.*.output = mem.alloc((query.*.width + query.*.orderCount) * @sizeOf(Value) + 16)
+    i = 0
+    while i < query.*.width + query.*.orderCount {
+        value.init(record.valueAt(query.*.output, i))
+        i += 1
+    }
+    return q
+}
+
+fn compoundName(op: u8) -> []const u8 {
+    return match op {
+        1 => "UNION ALL",
+        2 => "UNION",
+        3 => "INTERSECT",
+        4 => "EXCEPT",
+        else => "",
+    }
+}
+
+fn ordinalWord(i: usize) -> []const u8 {
+    return match i {
+        0 => "1st",
+        1 => "2nd",
+        2 => "3rd",
+        3 => "4th",
+        4 => "5th",
+        5 => "6th",
+        6 => "7th",
+        7 => "8th",
+        8 => "9th",
+        else => "10th",
+    }
+}
+
+// The result column (0-based) an ORDER BY term of a compound names.
+fn compoundColumn(st: *core.Statement, q: usize, e: usize) -> i64 {
+    const x = ast.expr(e)
+    const query = queryOf(q)
+    if x.*.op == ast.E_COLUMN && x.*.tableLength == 0 {
+        const name = mem.view(x.*.name, x.*.nameLength)
+        var i: usize = 0
+        while i < query.*.width {
+            const address = @intCast(usize, mem.at(&query.*.names, i * 2))
+            const length = @intCast(usize, mem.at(&query.*.names, i * 2 + 1))
+            if mem.sameNoCase(mem.view(address, length), name) { return @intCast(i64, i) }
+            i += 1
+        }
+    }
+    // The same text as a result column's.
+    const text = mem.view(st.*.text + x.*.start, x.*.end - x.*.start)
+    var i: usize = 0
+    const sel = ast.select(query.*.select)
+    while i < ast.count(sel.*.columns) {
+        const r = ast.expr(ast.exprAt(sel.*.columns, i))
+        if mem.sameNoCase(mem.view(st.*.text + r.*.start, r.*.end - r.*.start), text) { return @intCast(i64, i) }
+        i += 1
+    }
+    return -1
+}
+
+fn containsAggregate(e: usize) -> bool {
+    if e == 0 { return false }
+    const x = ast.expr(e)
+    if x.*.aggregate != 0 { return true }
+    if containsAggregate(x.*.left) || containsAggregate(x.*.right) || containsAggregate(x.*.third) { return true }
+    var i: usize = 0
+    while i < ast.count(x.*.list) {
+        if containsAggregate(ast.exprAt(x.*.list, i)) { return true }
+        i += 1
+    }
+    return false
+}
+
+// USING (a, b): the ON terms `left.a = right.a` for each name.
+fn usingTerms(st: *core.Statement, q: usize, level: usize, item: *ast.Source) -> i32 {
+    const query = queryOf(q)
+    const right = core.sourceState(@intCast(usize, mem.at(&query.*.levels, level)))
+    var i: usize = 0
+    while i < ast.count(item.*.using) {
+        const it = ast.itemAt(item.*.using, i)
+        const name = mem.view(it.*.name, it.*.nameLength)
+        var leftSource: usize = 0
+        var leftColumn: i64 = -2
+        var k: usize = 0
+        while k < level {
+            const s = core.sourceState(@intCast(usize, mem.at(&query.*.levels, k)))
+            const c = sourceColumn(s, name)
+            if c >= 0 {
+                leftSource = @intFromPtr(s)
+                leftColumn = c
+                break
+            }
+            k += 1
+        }
+        const rightColumn = sourceColumn(right, name)
+        if leftSource == 0 || rightColumn < 0 {
+            return core.setError3(databaseOf(st), core.ERROR, "cannot join using column ", name, " - column not present in both tables")
+        }
+        const l = ast.newExpr(&st.*.arena, ast.E_COLUMN)
+        ast.expr(l).*.source = @intCast(i64, core.sourceState(leftSource).*.number)
+        ast.expr(l).*.column = leftColumn
+        const r = ast.newExpr(&st.*.arena, ast.E_COLUMN)
+        ast.expr(r).*.source = @intCast(i64, right.*.number)
+        ast.expr(r).*.column = rightColumn
+        const eq = ast.newExpr(&st.*.arena, ast.E_BINARY)
+        ast.expr(eq).*.sub = lexer.EQ
+        ast.expr(eq).*.left = l
+        ast.expr(eq).*.right = r
+        if item.*.on == 0 {
+            item.*.on = eq
+        } else {
+            const both = ast.newExpr(&st.*.arena, ast.E_AND)
+            ast.expr(both).*.left = item.*.on
+            ast.expr(both).*.right = eq
+            item.*.on = both
+        }
+        i += 1
+    }
+    return core.OK
+}
+
+// Each WHERE term (and each source's ON terms) to the innermost level it
+// reads.
+fn placeTerms(st: *core.Statement, q: usize, where: usize) -> i32 {
+    const query = queryOf(q)
+    var terms: mem.Words = undefined
+    mem.initWords(&terms)
+    var i: usize = 0
+    // ON terms: a LEFT JOIN's stay at its level (they decide whether the
+    // row matched); an inner join's are WHERE terms.
+    while i < query.*.levels.length {
+        const s = core.sourceState(@intCast(usize, mem.at(&query.*.levels, i)))
+        const item = ast.source(s.*.item)
+        if item.*.on != 0 {
+            if s.*.leftJoin {
+                var on: mem.Words = undefined
+                mem.initWords(&on)
+                splitAnd(item.*.on, &on)
+                var k: usize = 0
+                while k < on.length {
+                    _ = mem.push(&s.*.onTerms, mem.at(&on, k))
+                    k += 1
+                }
+                mem.freeWords(&on)
+            } else {
+                splitAnd(item.*.on, &terms)
+            }
+        }
+        i += 1
+    }
+    splitAnd(where, &terms)
+    i = 0
+    while i < terms.length {
+        const term = @intCast(usize, mem.at(&terms, i))
+        const level = levelOfExpr(st, q, term)
+        if level < 0 || query.*.levels.length == 0 {
+            _ = mem.push(&query.*.constantTerms, @intCast(u64, term))
+        } else {
+            const s = core.sourceState(@intCast(usize, mem.at(&query.*.levels, @intCast(usize, level))))
+            _ = mem.push(&s.*.whereTerms, @intCast(u64, term))
+        }
+        i += 1
+    }
+    mem.freeWords(&terms)
+    return core.OK
+}
+
+// Column references of an aggregate query outside its aggregates get
+// registers: their values are copied there as each row is taken in, and
+// read from there when the result is made.
+fn markBare(st: *core.Statement, q: usize) -> void {
+    const query = queryOf(q)
+    var i: usize = 0
+    while i < query.*.results.length {
+        markBareIn(st, q, @intCast(usize, mem.at(&query.*.results, i)))
+        i += 1
+    }
+    markBareIn(st, q, query.*.having)
+    const sel = ast.select(query.*.select)
+    if sel.*.orderBy != 0 {
+        i = 0
+        while i < ast.count(sel.*.orderBy) {
+            markBareIn(st, q, ast.exprAt(sel.*.orderBy, i))
+            i += 1
+        }
+    }
+}
+
+fn markBareIn(st: *core.Statement, q: usize, e: usize) -> void {
+    if e == 0 { return }
+    const x = ast.expr(e)
+    if x.*.aggregate != 0 { return }
+    if x.*.op == ast.E_COLUMN && x.*.source >= 0 && x.*.slot == 0 {
+        const s = core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, x.*.source))))
+        if s.*.query == q {
+            _ = mem.push(&queryOf(q).*.bare, @intCast(u64, e))
+            x.*.slot = queryOf(q).*.bare.length
+        }
+        return
+    }
+    markBareIn(st, q, x.*.left)
+    markBareIn(st, q, x.*.right)
+    markBareIn(st, q, x.*.third)
+    var i: usize = 0
+    while i < ast.count(x.*.list) {
+        markBareIn(st, q, ast.exprAt(x.*.list, i))
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Access paths.
+
+// A term usable to find rows of source `s`: `column op expression`, the
+// expression reading only levels before s's. Its parts.
+const Usable = struct {
+    column: i64
+    // lexer.EQ, LT, LE, GT, GE, or 0 for IN; IS counts as EQ.
+    op: u8
+    other: usize
+    term: usize
+}
+
+// The affinity a comparison takes (sqlite3CompareAffinity).
+pub fn comparisonAffinity(st: *core.Statement, left: usize, right: usize) -> u8 {
+    const a = eval.exprAffinity(st, left)
+    const b = eval.exprAffinity(st, right)
+    if a > value.AFF_BLOB && b > value.AFF_BLOB {
+        if a >= value.AFF_NUMERIC || b >= value.AFF_NUMERIC { return value.AFF_NUMERIC }
+        return value.AFF_BLOB
+    }
+    if a > value.AFF_BLOB { return a }
+    if b > value.AFF_BLOB { return b }
+    return value.AFF_BLOB
+}
+
+// Whether an index on a column of affinity `columnAffinity` can serve a
+// comparison of affinity `affinity` (sqlite3IndexAffinityOk).
+fn affinityOk(affinity: u8, columnAffinity: u8) -> bool {
+    if affinity <= value.AFF_BLOB { return true }
+    if affinity == value.AFF_TEXT { return columnAffinity == value.AFF_TEXT }
+    return columnAffinity >= value.AFF_NUMERIC
+}
+
+fn isColumnOf(e: usize, s: *core.SourceState) -> bool {
+    if e == 0 { return false }
+    const x = ast.expr(e)
+    return x.*.op == ast.E_COLUMN && x.*.source == @intCast(i64, s.*.number) && x.*.slot == 0
+}
+
+fn flipOp(op: u8) -> u8 {
+    if op == lexer.LT { return lexer.GT }
+    if op == lexer.LE { return lexer.GE }
+    if op == lexer.GT { return lexer.LT }
+    if op == lexer.GE { return lexer.LE }
+    return op
+}
+
+// The term as a usable constraint on `s`, or false.
+fn usable(st: *core.Statement, q: usize, s: *core.SourceState, term: usize, out: *Usable) -> bool {
+    const x = ast.expr(term)
+    const level = @intCast(i64, s.*.level)
+    if x.*.op == ast.E_BINARY && (x.*.sub == lexer.EQ || x.*.sub == lexer.LT || x.*.sub == lexer.LE || x.*.sub == lexer.GT || x.*.sub == lexer.GE) {
+        var col = x.*.left
+        var other = x.*.right
+        var op = x.*.sub
+        if !isColumnOf(col, s) || levelOfExpr(st, q, other) >= level {
+            col = x.*.right
+            other = x.*.left
+            op = flipOp(op)
+            if !isColumnOf(col, s) || levelOfExpr(st, q, other) >= level { return false }
+        }
+        out.*.column = ast.expr(col).*.column
+        out.*.op = op
+        out.*.other = other
+        out.*.term = term
+        return true
+    }
+    if x.*.op == ast.E_IS && !x.*.negated {
+        var col = x.*.left
+        var other = x.*.right
+        if !isColumnOf(col, s) || levelOfExpr(st, q, other) >= level {
+            col = x.*.right
+            other = x.*.left
+            if !isColumnOf(col, s) || levelOfExpr(st, q, other) >= level { return false }
+        }
+        out.*.column = ast.expr(col).*.column
+        out.*.op = lexer.EQ
+        out.*.other = other
+        out.*.term = term
+        return true
+    }
+    if (x.*.op == ast.E_IN_LIST || x.*.op == ast.E_IN_SELECT) && !x.*.negated && isColumnOf(x.*.left, s) {
+        if x.*.op == ast.E_IN_LIST {
+            var i: usize = 0
+            while i < ast.count(x.*.list) {
+                if levelOfExpr(st, q, ast.exprAt(x.*.list, i)) >= level { return false }
+                i += 1
+            }
+        } else if levelOfQuery(st, q, x.*.slot) >= level {
+            return false
+        }
+        out.*.column = ast.expr(x.*.left).*.column
+        out.*.op = 0
+        out.*.other = 0
+        out.*.term = term
+        return true
+    }
+    return false
+}
+
+// The collation a comparison term uses.
+fn termCollation(st: *core.Statement, term: usize) -> usize {
+    const x = ast.expr(term)
+    if x.*.op == ast.E_IN_LIST || x.*.op == ast.E_IN_SELECT { return eval.exprCollation(st, x.*.left) }
+    return eval.binaryCollation(st, x.*.left, x.*.right)
+}
+
+fn termAffinity(st: *core.Statement, term: usize) -> u8 {
+    const x = ast.expr(term)
+    if x.*.op == ast.E_IN_LIST || x.*.op == ast.E_IN_SELECT { return eval.exprAffinity(st, x.*.left) }
+    return comparisonAffinity(st, x.*.left, x.*.right)
+}
+
+// Whether a usable term can drive index column `i` of `x`.
+fn termFitsIndex(st: *core.Statement, u: *Usable, x: *schema.Index, i: usize, t: *schema.Table) -> bool {
+    const c = schema.indexColumn(x, i)
+    if u.*.column != c {
+        // The rowid's column (INTEGER PRIMARY KEY) is the rowid.
+        if !(c == -1 && u.*.column == t.*.rowidColumn) { return false }
+    }
+    const indexCollation = eval.findCollation(databaseOf(st), schema.indexCollation(x, i))
+    if indexCollation == 0 { return false }
+    if !eval.sameCollation(termCollation(st, u.*.term), indexCollation) { return false }
+    const columnAffinity = if c >= 0 { schema.column(t, @intCast(usize, c)).*.affinity } else { value.AFF_INTEGER }
+    return affinityOk(termAffinity(st, u.*.term), columnAffinity)
+}
+
+fn isRowidColumn(t: *schema.Table, column: i64) -> bool { return column == -1 || column == t.*.rowidColumn }
+
+// Chooses the access path of level `index`.
+fn plan(st: *core.Statement, q: usize, index: usize) -> i32 {
+    const query = queryOf(q)
+    const s = core.sourceState(@intCast(usize, mem.at(&query.*.levels, index)))
+    if s.*.kind != core.SOURCE_TABLE { return core.OK }
+    const t = schema.table(s.*.table)
+    const item = ast.source(s.*.item)
+    // The terms that may drive the path: a LEFT JOIN's ON terms, an inner
+    // level's WHERE terms.
+    const terms = if s.*.leftJoin { &s.*.onTerms } else { &s.*.whereTerms }
+    var candidates: mem.Words = undefined
+    mem.initWords(&candidates)
+    var u: Usable = undefined
+    var i: usize = 0
+    while i < terms.*.length {
+        const term = @intCast(usize, mem.at(terms, i))
+        if usable(st, q, s, term, &u) {
+            _ = mem.push(&candidates, @bitCast(u64, u.column))
+            _ = mem.push(&candidates, @intCast(u64, u.op))
+            _ = mem.push(&candidates, @intCast(u64, u.other))
+            _ = mem.push(&candidates, @intCast(u64, u.term))
+        }
+        i += 1
+    }
+    const count = candidates.length / 4
+    s.*.plan = core.PLAN_SCAN
+    if !item.*.notIndexed && item.*.indexedByLength == 0 {
+        // The rowid: = first, then IN.
+        i = 0
+        while i < count {
+            readUsable(&candidates, i, &u)
+            if isRowidColumn(t, u.column) && u.op == lexer.EQ && affinityOk(termAffinity(st, u.term), value.AFF_INTEGER) {
+                s.*.plan = core.PLAN_ROWID_EQ
+                _ = mem.push(&s.*.equalities, @intCast(u64, u.other))
+                mem.freeWords(&candidates)
+                return core.OK
+            }
+            i += 1
+        }
+    }
+    // The best index: most equalities, a unique one with all its columns
+    // equal first, then one with a range on the next column.
+    var best: usize = 0
+    var bestEq: usize = 0
+    var bestRange = false
+    var bestScore: i64 = 0
+    var x: usize = 0
+    if !item.*.notIndexed {
+        while x < t.*.indexes.length {
+            const ix = schema.index(@intCast(usize, mem.at(&t.*.indexes, x)))
+            if ix.*.partial != 0 {
+                x += 1
+                continue
+            }
+            if item.*.indexedByLength > 0 && !mem.sameNoCase(schema.indexName(ix), mem.view(item.*.indexedBy, item.*.indexedByLength)) {
+                x += 1
+                continue
+            }
+            var eq: usize = 0
+            var hasIn = false
+            while eq < ix.*.columnCount {
+                var found = false
+                i = 0
+                while i < count {
+                    readUsable(&candidates, i, &u)
+                    if (u.op == lexer.EQ || (u.op == 0 && eq == 0)) && termFitsIndex(st, &u, ix, eq, t) {
+                        found = true
+                        if u.op == 0 { hasIn = true }
+                        break
+                    }
+                    i += 1
+                }
+                if !found || hasIn { break }
+                eq += 1
+            }
+            if hasIn { eq = 1 }
+            var range = false
+            if eq < ix.*.columnCount && !hasIn {
+                i = 0
+                while i < count {
+                    readUsable(&candidates, i, &u)
+                    if u.op != lexer.EQ && u.op != 0 && termFitsIndex(st, &u, ix, eq, t) {
+                        range = true
+                        break
+                    }
+                    i += 1
+                }
+            }
+            var score: i64 = @intCast(i64, eq) * 4 + (if range { 2 } else { 0 })
+            if ix.*.unique && eq == ix.*.columnCount { score += 100 }
+            if hasIn { score = 3 }
+            if item.*.indexedByLength > 0 { score += 1000 }
+            if score > bestScore {
+                bestScore = score
+                best = @intFromPtr(ix)
+                bestEq = eq
+                bestRange = range
+            }
+            x += 1
+        }
+    }
+    // A rowid range or IN beats no index equality.
+    if bestEq == 0 && !item.*.notIndexed && item.*.indexedByLength == 0 {
+        var low: usize = 0
+        var high: usize = 0
+        var lowInclusive = false
+        var highInclusive = false
+        var inTerm: usize = 0
+        i = 0
+        while i < count {
+            readUsable(&candidates, i, &u)
+            if isRowidColumn(t, u.column) && affinityOk(termAffinity(st, u.term), value.AFF_INTEGER) {
+                if (u.op == lexer.GT || u.op == lexer.GE) && low == 0 {
+                    low = u.other
+                    lowInclusive = u.op == lexer.GE
+                } else if (u.op == lexer.LT || u.op == lexer.LE) && high == 0 {
+                    high = u.other
+                    highInclusive = u.op == lexer.LE
+                } else if u.op == 0 && inTerm == 0 {
+                    inTerm = u.term
+                }
+            }
+            i += 1
+        }
+        if inTerm != 0 {
+            s.*.plan = core.PLAN_ROWID_IN
+            s.*.inTerm = inTerm
+            mem.freeWords(&candidates)
+            return core.OK
+        }
+        if low != 0 || high != 0 {
+            s.*.plan = core.PLAN_ROWID_RANGE
+            s.*.low = low
+            s.*.lowInclusive = lowInclusive
+            s.*.high = high
+            s.*.highInclusive = highInclusive
+            mem.freeWords(&candidates)
+            return core.OK
+        }
+    }
+    if best != 0 && (bestEq > 0 || bestRange) {
+        const ix = schema.index(best)
+        s.*.index = best
+        s.*.plan = core.PLAN_INDEX
+        var k: usize = 0
+        while k < bestEq {
+            i = 0
+            while i < count {
+                readUsable(&candidates, i, &u)
+                if (u.op == lexer.EQ || (u.op == 0 && k == 0)) && termFitsIndex(st, &u, ix, k, t) {
+                    if u.op == 0 {
+                        s.*.plan = core.PLAN_INDEX_IN
+                        s.*.inTerm = u.term
+                    } else {
+                        _ = mem.push(&s.*.equalities, @intCast(u64, u.other))
+                    }
+                    break
+                }
+                i += 1
+            }
+            k += 1
+        }
+        if bestRange {
+            i = 0
+            while i < count {
+                readUsable(&candidates, i, &u)
+                if u.op != lexer.EQ && u.op != 0 && termFitsIndex(st, &u, ix, bestEq, t) {
+                    if (u.op == lexer.GT || u.op == lexer.GE) && s.*.low == 0 {
+                        s.*.low = u.other
+                        s.*.lowInclusive = u.op == lexer.GE
+                    } else if (u.op == lexer.LT || u.op == lexer.LE) && s.*.high == 0 {
+                        s.*.high = u.other
+                        s.*.highInclusive = u.op == lexer.LE
+                    }
+                }
+                i += 1
+            }
+        }
+        s.*.covering = covers(st, q, s, ix)
+        mem.freeWords(&candidates)
+        return eval.resolveIndex(st, ix)
+    }
+    mem.freeWords(&candidates)
+    if item.*.indexedByLength > 0 && best != 0 {
+        s.*.index = best
+        s.*.plan = core.PLAN_INDEX_SCAN
+        s.*.covering = covers(st, q, s, schema.index(best))
+        return eval.resolveIndex(st, schema.index(best))
+    }
+    // A scan: of a smaller index holding all the query reads of the table
+    // (SQLite's covering index scan), else of the table.
+    if !item.*.notIndexed {
+        var chosen: usize = 0
+        x = 0
+        while x < t.*.indexes.length {
+            const ix = schema.index(@intCast(usize, mem.at(&t.*.indexes, x)))
+            if ix.*.partial == 0 && ix.*.columnCount < t.*.columnCount && covers(st, q, s, ix) && eval.findCollationsOf(st, ix) {
+                if chosen == 0 || ix.*.columnCount < schema.index(chosen).*.columnCount { chosen = @intFromPtr(ix) }
+            }
+            x += 1
+        }
+        if chosen != 0 {
+            s.*.index = chosen
+            s.*.plan = core.PLAN_INDEX_SCAN
+            s.*.covering = true
+            return eval.resolveIndex(st, schema.index(chosen))
+        }
+    }
+    return core.OK
+}
+
+fn readUsable(candidates: *mem.Words, i: usize, u: *Usable) -> void {
+    u.*.column = @bitCast(i64, mem.at(candidates, i * 4))
+    u.*.op = @intCast(u8, mem.at(candidates, i * 4 + 1) & 255)
+    u.*.other = @intCast(usize, mem.at(candidates, i * 4 + 2))
+    u.*.term = @intCast(usize, mem.at(candidates, i * 4 + 3))
+}
+
+// Whether index `x` holds every column of source `s` the statement reads.
+fn covers(st: *core.Statement, q: usize, s: *core.SourceState, x: *schema.Index) -> bool {
+    var i: usize = 0
+    while i < st.*.sources.length {
+        _ = i
+        break
+    }
+    return coversIn(st, s, x, st.*.node)
+}
+
+// Every column reference to `s` in the statement's text is one the index
+// holds (or the rowid).
+fn coversIn(st: *core.Statement, s: *core.SourceState, x: *schema.Index, node: usize) -> bool {
+    var i: usize = 0
+    var ok = true
+    // Walk every expression of the statement: they are all in the arena,
+    // reached from the queries.
+    while i < st.*.queries.length && ok {
+        const q = queryOf(@intCast(usize, mem.at(&st.*.queries, i)))
+        var k: usize = 0
+        while k < q.*.results.length && ok {
+            ok = exprCovered(@intCast(usize, mem.at(&q.*.results, k)), s, x)
+            k += 1
+        }
+        k = 0
+        while k < q.*.constantTerms.length && ok {
+            ok = exprCovered(@intCast(usize, mem.at(&q.*.constantTerms, k)), s, x)
+            k += 1
+        }
+        k = 0
+        while k < q.*.groupBy.length && ok {
+            ok = exprCovered(@intCast(usize, mem.at(&q.*.groupBy, k)), s, x)
+            k += 1
+        }
+        if ok { ok = exprCovered(q.*.having, s, x) }
+        const sel = ast.select(q.*.select)
+        if sel.*.orderBy != 0 {
+            k = 0
+            while k < ast.count(sel.*.orderBy) && ok {
+                ok = exprCovered(ast.exprAt(sel.*.orderBy, k), s, x)
+                k += 1
+            }
+        }
+        k = 0
+        while k < q.*.levels.length && ok {
+            const level = core.sourceState(@intCast(usize, mem.at(&q.*.levels, k)))
+            var j: usize = 0
+            while j < level.*.onTerms.length && ok {
+                ok = exprCovered(@intCast(usize, mem.at(&level.*.onTerms, j)), s, x)
+                j += 1
+            }
+            j = 0
+            while j < level.*.whereTerms.length && ok {
+                ok = exprCovered(@intCast(usize, mem.at(&level.*.whereTerms, j)), s, x)
+                j += 1
+            }
+            k += 1
+        }
+        i += 1
+    }
+    _ = node
+    return ok
+}
+
+fn exprCovered(e: usize, s: *core.SourceState, x: *schema.Index) -> bool {
+    if e == 0 { return true }
+    const ex = ast.expr(e)
+    if ex.*.op == ast.E_COLUMN && ex.*.source == @intCast(i64, s.*.number) {
+        if ex.*.column < 0 { return true }
+        const t = schema.table(s.*.table)
+        if ex.*.column == t.*.rowidColumn { return true }
+        var i: usize = 0
+        while i < x.*.columnCount {
+            if schema.indexColumn(x, i) == ex.*.column { return true }
+            i += 1
+        }
+        return false
+    }
+    if !exprCovered(ex.*.left, s, x) || !exprCovered(ex.*.right, s, x) || !exprCovered(ex.*.third, s, x) { return false }
+    var i: usize = 0
+    while i < ast.count(ex.*.list) {
+        if !exprCovered(ast.exprAt(ex.*.list, i), s, x) { return false }
+        i += 1
+    }
+    return true
+}
+
+// Whether the loop yields rows in the ORDER BY's order already (a single
+// table source, ordered by its rowid, or by an index's columns after the
+// ones held equal); the source's direction is set to match.
+fn orderSatisfied(st: *core.Statement, q: usize) -> bool {
+    const query = queryOf(q)
+    if query.*.isAggregate || query.*.prior != 0 || query.*.distinct { return false }
+    if query.*.levels.length == 0 { return false }
+    const sel = ast.select(query.*.select)
+    const n = ast.count(sel.*.orderBy)
+    const s = core.sourceState(@intCast(usize, mem.at(&query.*.levels, 0)))
+    if s.*.kind != core.SOURCE_TABLE { return false }
+    // Later levels must give one row per outer row for the order to hold.
+    if query.*.levels.length > 1 { return false }
+    const t = schema.table(s.*.table)
+    var descending = false
+    var i: usize = 0
+    while i < n {
+        const it = ast.itemAt(sel.*.orderBy, i)
+        if i == 0 {
+            descending = it.*.descending
+        } else if it.*.descending != descending {
+            return false
+        }
+        if it.*.nulls != 0 { return false }
+        i += 1
+    }
+    const first = ast.exprAt(sel.*.orderBy, 0)
+    if s.*.plan == core.PLAN_SCAN || s.*.plan == core.PLAN_ROWID_RANGE || s.*.plan == core.PLAN_ROWID_EQ {
+        // Rowid order.
+        if n == 1 && isColumnOf(first, s) && isRowidColumn(t, ast.expr(first).*.column) {
+            s.*.descending = descending
+            return true
+        }
+        if s.*.plan != core.PLAN_SCAN { return false }
+        // A full scan may go by an index whose order is the ORDER BY's.
+        var x: usize = 0
+        while x < t.*.indexes.length {
+            const ix = schema.index(@intCast(usize, mem.at(&t.*.indexes, x)))
+            if ix.*.partial == 0 && indexOrders(st, s, ix, 0, sel.*.orderBy) {
+                s.*.index = @intFromPtr(ix)
+                s.*.plan = core.PLAN_INDEX_SCAN
+                s.*.covering = covers(st, q, s, ix)
+                s.*.descending = descending
+                _ = eval.resolveIndex(st, ix)
+                return true
+            }
+            x += 1
+        }
+        return false
+    }
+    if s.*.plan == core.PLAN_INDEX || s.*.plan == core.PLAN_INDEX_SCAN {
+        const ix = schema.index(s.*.index)
+        if indexOrders(st, s, ix, s.*.equalities.length, sel.*.orderBy) {
+            s.*.descending = descending
+            return true
+        }
+    }
+    return false
+}
+
+// Whether ordering by `orderBy` is the index's order from column `skip`
+// on (the rowid may close it), each term in the index's collation, all
+// the index's directions matching.
+fn indexOrders(st: *core.Statement, s: *core.SourceState, ix: *schema.Index, skip: usize, orderBy: usize) -> bool {
+    const t = schema.table(s.*.table)
+    const n = ast.count(orderBy)
+    var i: usize = 0
+    var position = skip
+    while i < n {
+        var e = ast.exprAt(orderBy, i)
+        var collation: usize = 0
+        if ast.expr(e).*.op == ast.E_COLLATE {
+            collation = ast.expr(e).*.collation
+            e = ast.expr(e).*.left
+        }
+        if !isColumnOf(e, s) { return false }
+        const c = ast.expr(e).*.column
+        if position < ix.*.columnCount {
+            if schema.indexColumn(ix, position) != c { return false }
+            if schema.indexDescending(ix, position) != schema.indexDescending(ix, skip) { return false }
+            const indexCollation = eval.findCollation(databaseOf(st), schema.indexCollation(ix, position))
+            const termCollationValue = if collation != 0 { collation } else { eval.exprCollation(st, e) }
+            if !eval.sameCollation(termCollationValue, indexCollation) { return false }
+            if schema.indexDescending(ix, position) && !ast.itemAt(orderBy, i).*.descending { return false }
+            if !schema.indexDescending(ix, position) && ast.itemAt(orderBy, i).*.descending && i > 0 && !ast.itemAt(orderBy, 0).*.descending { return false }
+            position += 1
+        } else if !isRowidColumn(t, c) {
+            return false
+        } else {
+            position += 1
+        }
+        i += 1
+    }
+    // A descending index column reverses: only all-ascending indexes here.
+    i = skip
+    while i < ix.*.columnCount {
+        if schema.indexDescending(ix, i) { return false }
+        i += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Running.
+
+fn sourceAt(q: *Query, level: usize) -> *core.SourceState { return core.sourceState(@intCast(usize, mem.at(&q.*.levels, level))) }
+
+fn pagerOf(st: *core.Statement) -> usize { return @intFromPtr(&databaseOf(st).*.pager) }
+
+// The rowid of a table source's current row, its record loaded.
+fn loadRow(st: *core.Statement, s: *core.SourceState) -> i32 {
+    if s.*.rowLoaded { return core.OK }
+    if s.*.plan == core.PLAN_INDEX || s.*.plan == core.PLAN_INDEX_IN || s.*.plan == core.PLAN_INDEX_SCAN {
+        var length: usize = 0
+        const data = bt.payload(s.*.indexCursor, &length)
+        s.*.rowid = record.lastInteger(data, length)
+        if !s.*.covering {
+            if !bt.seekRowid(s.*.cursor, s.*.rowid) {
+                return core.setError(databaseOf(st), core.CORRUPT, "database disk image is malformed")
+            }
+        }
+    } else {
+        s.*.rowid = bt.rowid(s.*.cursor)
+    }
+    s.*.rowLoaded = true
+    return core.OK
+}
+
+// A column of a source's current row into `out`.
+pub fn readColumn(st: *core.Statement, number: i64, column: i64, out: *Value) -> i32 {
+    const s = core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, number))))
+    if s.*.nullRow {
+        value.setNull(out)
+        return core.OK
+    }
+    if s.*.kind == core.SOURCE_ROWS {
+        if s.*.row == 0 || column < 0 {
+            value.setNull(out)
+            return core.OK
+        }
+        _ = value.copy(out, record.valueAt(s.*.row, @intCast(usize, column)))
+        return core.OK
+    }
+    var rc = loadRow(st, s)
+    if rc != core.OK { return rc }
+    const t = schema.table(s.*.table)
+    if column < 0 || column == t.*.rowidColumn {
+        value.setInt(out, s.*.rowid)
+        return core.OK
+    }
+    if s.*.covering {
+        const x = schema.index(s.*.index)
+        var i: usize = 0
+        while i < x.*.columnCount {
+            if schema.indexColumn(x, i) == column {
+                const h = bt.header(s.*.indexCursor)
+                record.column(h, i, out)
+                break
+            }
+            i += 1
+        }
+    } else {
+        const h = bt.header(s.*.cursor)
+        if @intCast(usize, column) >= h.*.count {
+            // A column added after the row was written: its default.
+            return eval.columnDefault(st, t, @intCast(usize, column), out)
+        }
+        record.column(h, @intCast(usize, column), out)
+    }
+    const c = schema.column(t, @intCast(usize, column))
+    if c.*.affinity == value.AFF_REAL && out.*.kind == value.INTEGER { value.setReal(out, @floatFromInt(f64, out.*.i)) }
+    return core.OK
+}
+
+fn openCursors(st: *core.Statement, s: *core.SourceState) -> i32 {
+    const db = databaseOf(st)
+    const t = schema.table(s.*.table)
+    if s.*.cursor == 0 {
+        s.*.cursor = bt.openCursor(&db.*.pager, t.*.root, true, 0)
+        if s.*.cursor == 0 { return core.NOMEM }
+    }
+    if s.*.index != 0 && s.*.indexCursor == 0 {
+        const x = schema.index(s.*.index)
+        s.*.indexCursor = bt.openCursor(&db.*.pager, x.*.root, false, @intFromPtr(&x.*.info))
+        if s.*.indexCursor == 0 { return core.NOMEM }
+    }
+    return core.OK
+}
+
+// The key block of a source: `count` Values.
+fn keysOf(s: *core.SourceState, count: usize) -> usize {
+    if s.*.keys != 0 && s.*.keyCount >= count { return s.*.keys }
+    if s.*.keys != 0 { core.freeRow(s.*.keys, s.*.keyCount) }
+    s.*.keys = mem.alloc((count + 1) * @sizeOf(Value))
+    s.*.keyCount = count + 1
+    var i: usize = 0
+    while i < count + 1 {
+        value.init(record.valueAt(s.*.keys, i))
+        i += 1
+    }
+    return s.*.keys
+}
+
+// The value a seek uses for `other` compared with index column `i`:
+// evaluated, the comparison's affinity applied. False when the value can
+// match nothing (NULL).
+fn seekValue(st: *core.Statement, s: *core.SourceState, other: usize, column: i64, out: *Value) -> i32 {
+    const rc = eval.evaluate(st, other, out)
+    if rc != core.OK { return rc }
+    const t = schema.table(s.*.table)
+    const columnAffinity = if column >= 0 && column != t.*.rowidColumn { schema.column(t, @intCast(usize, column)).*.affinity } else { value.AFF_INTEGER }
+    // The column's affinity applies to the other side when it has none
+    // or is not numeric where the column is.
+    const otherAffinity = eval.exprAffinity(st, other)
+    if columnAffinity >= value.AFF_NUMERIC && otherAffinity < value.AFF_NUMERIC {
+        value.applyComparisonNumeric(out)
+    } else if columnAffinity == value.AFF_TEXT && otherAffinity <= value.AFF_BLOB {
+        if out.*.kind == value.INTEGER || out.*.kind == value.REAL { _ = value.toText(out) }
+    }
+    return core.OK
+}
+
+// Positions a table source on its first candidate row: true when there is
+// one.
+fn beginSource(st: *core.Statement, s: *core.SourceState, found: *bool) -> i32 {
+    s.*.rowLoaded = false
+    s.*.nullRow = false
+    found.* = false
+    if s.*.kind == core.SOURCE_ROWS {
+        if s.*.subquery != 0 && (s.*.rows == 0 || s.*.correlated || core.rowsOf(s.*.rows).*.position != 1) {
+            const rc = materialize(st, s)
+            if rc != core.OK { return rc }
+            core.rowsOf(s.*.rows).*.position = 1
+        } else if s.*.functionKind != 0 {
+            const rc = functions.fillTableFunction(st, s)
+            if rc != core.OK { return rc }
+        }
+        s.*.position = 0
+        if core.rowCount(s.*.rows) == 0 { return core.OK }
+        s.*.row = core.rowAt(s.*.rows, 0)
+        found.* = true
+        return core.OK
+    }
+    var rc = openCursors(st, s)
+    if rc != core.OK { return rc }
+    st.*.fullScans += if s.*.plan == core.PLAN_SCAN { 1 } else { 0 }
+    if s.*.plan == core.PLAN_SCAN {
+        rc = if s.*.descending { bt.last(s.*.cursor) } else { bt.first(s.*.cursor) }
+        found.* = rc == core.OK && bt.isValid(s.*.cursor)
+        return rc
+    }
+    if s.*.plan == core.PLAN_ROWID_EQ {
+        const v = record.valueAt(keysOf(s, 1), 0)
+        rc = eval.evaluate(st, @intCast(usize, mem.at(&s.*.equalities, 0)), v)
+        if rc != core.OK { return rc }
+        value.applyComparisonNumeric(v)
+        var rowid: i64 = 0
+        if !rowidOf(v, &rowid) { return core.OK }
+        found.* = bt.seekRowid(s.*.cursor, rowid)
+        return core.OK
+    }
+    if s.*.plan == core.PLAN_ROWID_IN || s.*.plan == core.PLAN_INDEX_IN {
+        rc = inValues(st, s)
+        if rc != core.OK { return rc }
+        s.*.inPosition = 0
+        return nextInValue(st, s, found)
+    }
+    if s.*.plan == core.PLAN_ROWID_RANGE {
+        const keys = keysOf(s, 2)
+        if s.*.descending {
+            if s.*.high != 0 {
+                rc = eval.evaluate(st, s.*.high, record.valueAt(keys, 1))
+                if rc != core.OK { return rc }
+                const v = record.valueAt(keys, 1)
+                value.applyComparisonNumeric(v)
+                if v.*.kind == value.NULL { return core.OK }
+                const bound = rangeBound(v, !s.*.highInclusive, false)
+                rc = bt.seekRowidFrom(s.*.cursor, bound, true)
+                if rc != core.OK { return rc }
+                if bt.isValid(s.*.cursor) {
+                    rc = bt.previous(s.*.cursor)
+                } else {
+                    rc = bt.last(s.*.cursor)
+                }
+            } else {
+                rc = bt.last(s.*.cursor)
+            }
+        } else if s.*.low != 0 {
+            rc = eval.evaluate(st, s.*.low, record.valueAt(keys, 0))
+            if rc != core.OK { return rc }
+            const v = record.valueAt(keys, 0)
+            value.applyComparisonNumeric(v)
+            if v.*.kind == value.NULL { return core.OK }
+            const bound = rangeBound(v, !s.*.lowInclusive, true)
+            rc = bt.seekRowidFrom(s.*.cursor, bound, false)
+        } else {
+            rc = bt.first(s.*.cursor)
+        }
+        if rc != core.OK { return rc }
+        found.* = bt.isValid(s.*.cursor)
+        return core.OK
+    }
+    // An index.
+    const x = schema.index(s.*.index)
+    const eq = s.*.equalities.length
+    const keys = keysOf(s, x.*.columnCount + 1)
+    var i: usize = 0
+    while i < eq {
+        rc = seekValue(st, s, @intCast(usize, mem.at(&s.*.equalities, i)), schema.indexColumn(x, i), record.valueAt(keys, i))
+        if rc != core.OK { return rc }
+        // A NULL equals nothing (but IS NULL would: the plan takes = only
+        // for the index when the value is not NULL).
+        i += 1
+    }
+    return seekIndexStart(st, s, eq, found)
+}
+
+// The rowid a value names (an integer, or a real that is one).
+fn rowidOf(v: *Value, out: *i64) -> bool {
+    if v.*.kind == value.INTEGER {
+        out.* = v.*.i
+        return true
+    }
+    if v.*.kind == value.REAL {
+        const r = v.*.r
+        if r >= -9223372036854775808.0 && r < 9223372036854775808.0 {
+            const i = @intFromFloat(i64, r)
+            if @floatFromInt(f64, i) == r {
+                out.* = i
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// A range's rowid bound for a value of any type: the rowid at or past
+// which (low) or before which (high) the range starts.
+fn rangeBound(v: *Value, strict: bool, low: bool) -> i64 {
+    var i: i64 = 0
+    if v.*.kind == value.INTEGER {
+        i = v.*.i
+        if strict {
+            if low {
+                if i == 9223372036854775807 { return i }
+                return i + 1
+            }
+            if i == -9223372036854775807 - 1 { return i }
+            return i - 1
+        }
+        return i
+    }
+    if v.*.kind == value.REAL {
+        const r = v.*.r
+        if r >= 9223372036854775807.0 { return 9223372036854775807 }
+        if r <= -9223372036854775808.0 { return -9223372036854775807 - 1 }
+        const t = @intFromFloat(i64, r)
+        if @floatFromInt(f64, t) == r { return rangeBound2(t, strict, low) }
+        // Between integers: the next one up (low) or down (high).
+        if low { return if r > 0.0 { t + 1 } else { t } }
+        return if r > 0.0 { t } else { t - 1 }
+    }
+    // Text and blobs sort after every number.
+    return if low { 9223372036854775807 } else { 9223372036854775807 }
+}
+
+fn rangeBound2(t: i64, strict: bool, low: bool) -> i64 {
+    if !strict { return t }
+    if low { return if t == 9223372036854775807 { t } else { t + 1 } }
+    return if t == -9223372036854775807 - 1 { t } else { t - 1 }
+}
+
+// Positions an index source at the start of its range: equal on the first
+// `eq` key values, then from the range's low end (or high, descending).
+fn seekIndexStart(st: *core.Statement, s: *core.SourceState, eq: usize, found: *bool) -> i32 {
+    const keys = s.*.keys
+    var rc = core.OK
+    var i: usize = 0
+    while i < eq {
+        if record.valueAt(keys, i).*.kind == value.NULL { return core.OK }
+        i += 1
+    }
+    if s.*.descending {
+        var count = eq
+        var after = true
+        if s.*.high != 0 {
+            rc = seekValue(st, s, s.*.high, schema.indexColumn(schema.index(s.*.index), eq), record.valueAt(keys, eq))
+            if rc != core.OK { return rc }
+            if record.valueAt(keys, eq).*.kind == value.NULL { return core.OK }
+            count = eq + 1
+            after = s.*.highInclusive
+        }
+        if count == 0 {
+            rc = bt.last(s.*.indexCursor)
+        } else {
+            rc = bt.seekKey(s.*.indexCursor, keys, count, after)
+            if rc != core.OK { return rc }
+            if bt.isValid(s.*.indexCursor) {
+                rc = bt.previous(s.*.indexCursor)
+            } else {
+                rc = bt.last(s.*.indexCursor)
+            }
+        }
+    } else {
+        var count = eq
+        var after = false
+        if s.*.low != 0 {
+            rc = seekValue(st, s, s.*.low, schema.indexColumn(schema.index(s.*.index), eq), record.valueAt(keys, eq))
+            if rc != core.OK { return rc }
+            if record.valueAt(keys, eq).*.kind == value.NULL { return core.OK }
+            count = eq + 1
+            after = !s.*.lowInclusive
+        } else if s.*.high != 0 {
+            // Past the NULLs at the start of the range column.
+            value.setNull(record.valueAt(keys, eq))
+            count = eq + 1
+            after = true
+        }
+        if count == 0 {
+            rc = bt.first(s.*.indexCursor)
+        } else {
+            rc = bt.seekKey(s.*.indexCursor, keys, count, after)
+        }
+    }
+    if rc != core.OK { return rc }
+    return checkIndexEntry(st, s, eq, found)
+}
+
+// Whether the index cursor's entry is still in the range: equal on the
+// first `eq` keys, before the range's far end; found is false past it.
+fn checkIndexEntry(st: *core.Statement, s: *core.SourceState, eq: usize, found: *bool) -> i32 {
+    found.* = false
+    if !bt.isValid(s.*.indexCursor) { return core.OK }
+    const x = schema.index(s.*.index)
+    var length: usize = 0
+    const data = bt.payload(s.*.indexCursor, &length)
+    if eq > 0 && record.compareWithKeys(data, length, s.*.keys, eq, &x.*.info) != 0 { return core.OK }
+    if s.*.plan != core.PLAN_INDEX_SCAN {
+        const far = if s.*.descending { s.*.low } else { s.*.high }
+        const inclusive = if s.*.descending { s.*.lowInclusive } else { s.*.highInclusive }
+        if far != 0 {
+            const v = record.valueAt(s.*.keys, eq + 1)
+            const rc = seekValue(st, s, far, schema.indexColumn(x, eq), v)
+            if rc != core.OK { return rc }
+            if v.*.kind == value.NULL { return core.OK }
+            // Compare the entry's column `eq` with the bound.
+            const save = record.valueAt(s.*.keys, eq)
+            var held: Value = undefined
+            value.init(&held)
+            value.move(&held, save)
+            _ = value.copy(save, v)
+            const c = record.compareWithKeys(data, length, s.*.keys, eq + 1, &x.*.info)
+            value.move(save, &held)
+            if s.*.descending {
+                if c < 0 || (c == 0 && !inclusive) { return core.OK }
+            } else if c > 0 || (c == 0 && !inclusive) {
+                return core.OK
+            }
+        }
+        if s.*.descending && s.*.high != 0 && s.*.low == 0 {
+            // Down to the NULLs of the range column: they are out.
+            var h: record.Header = undefined
+            record.initHeader(&h)
+            _ = record.readHeader(&h, data, length)
+            const t = if eq < h.count { record.typeAt(&h, eq) } else { 0 }
+            record.freeHeader(&h)
+            if t == 0 { return core.OK }
+        }
+    }
+    found.* = true
+    return core.OK
+}
+
+// The values an IN term lists, evaluated, the comparison affinity applied,
+// sorted and without repeats.
+fn inValues(st: *core.Statement, s: *core.SourceState) -> i32 {
+    if s.*.inValues == 0 { s.*.inValues = core.newRows(1) }
+    core.clearRows(s.*.inValues)
+    const x = ast.expr(s.*.inTerm)
+    const t = schema.table(s.*.table)
+    const column = ast.expr(x.*.left).*.column
+    var rc = core.OK
+    if x.*.op == ast.E_IN_LIST {
+        var i: usize = 0
+        while i < ast.count(x.*.list) && rc == core.OK {
+            const row = core.addRow(s.*.inValues)
+            rc = seekValue(st, s, ast.exprAt(x.*.list, i), column, record.valueAt(row, 0))
+            i += 1
+        }
+    } else {
+        rc = eval.runSubquery(st, x.*.slot, s.*.inValues)
+        if rc == core.OK {
+            var i: usize = 0
+            while i < core.rowCount(s.*.inValues) {
+                const v = record.valueAt(core.rowAt(s.*.inValues, i), 0)
+                if s.*.plan == core.PLAN_ROWID_IN || (column >= 0 && column != t.*.rowidColumn && schema.column(t, @intCast(usize, column)).*.affinity >= value.AFF_NUMERIC) {
+                    value.applyComparisonNumeric(v)
+                } else if column >= 0 && column != t.*.rowidColumn && schema.column(t, @intCast(usize, column)).*.affinity == value.AFF_TEXT {
+                    if v.*.kind == value.INTEGER || v.*.kind == value.REAL { _ = value.toText(v) }
+                }
+                i += 1
+            }
+        }
+    }
+    if rc != core.OK { return rc }
+    const collation = if s.*.plan == core.PLAN_INDEX_IN { eval.findCollation(databaseOf(st), schema.indexCollation(schema.index(s.*.index), 0)) } else { 0 }
+    eval.sortRows(s.*.inValues, 1, collation)
+    eval.dedupRows(s.*.inValues, collation)
+    return core.OK
+}
+
+fn nextInValue(st: *core.Statement, s: *core.SourceState, found: *bool) -> i32 {
+    found.* = false
+    while s.*.inPosition < core.rowCount(s.*.inValues) {
+        const v = record.valueAt(core.rowAt(s.*.inValues, s.*.inPosition), 0)
+        s.*.inPosition += 1
+        if v.*.kind == value.NULL { continue }
+        if s.*.plan == core.PLAN_ROWID_IN {
+            var rowid: i64 = 0
+            if !rowidOf(v, &rowid) { continue }
+            if bt.seekRowid(s.*.cursor, rowid) {
+                found.* = true
+                return core.OK
+            }
+            continue
+        }
+        const keys = keysOf(s, schema.index(s.*.index).*.columnCount + 1)
+        _ = value.copy(record.valueAt(keys, 0), v)
+        const rc = seekIndexStart(st, s, 1, found)
+        if rc != core.OK { return rc }
+        if found.* { return core.OK }
+    }
+    return core.OK
+}
+
+// The next candidate row of a source.
+fn advanceSource(st: *core.Statement, s: *core.SourceState, found: *bool) -> i32 {
+    s.*.rowLoaded = false
+    found.* = false
+    if s.*.nullRow { return core.OK }
+    if s.*.kind == core.SOURCE_ROWS {
+        s.*.position += 1
+        if s.*.position >= core.rowCount(s.*.rows) {
+            s.*.row = 0
+            return core.OK
+        }
+        s.*.row = core.rowAt(s.*.rows, s.*.position)
+        found.* = true
+        return core.OK
+    }
+    var rc = core.OK
+    if s.*.plan == core.PLAN_ROWID_EQ { return core.OK }
+    if s.*.plan == core.PLAN_ROWID_IN { return nextInValue(st, s, found) }
+    if s.*.plan == core.PLAN_SCAN || s.*.plan == core.PLAN_ROWID_RANGE {
+        rc = if s.*.descending { bt.previous(s.*.cursor) } else { bt.next(s.*.cursor) }
+        if rc != core.OK { return rc }
+        if !bt.isValid(s.*.cursor) { return core.OK }
+        if s.*.plan == core.PLAN_ROWID_RANGE {
+            const rowid = bt.rowid(s.*.cursor)
+            const far = if s.*.descending { s.*.low } else { s.*.high }
+            if far != 0 {
+                const v = record.valueAt(s.*.keys, if s.*.descending { 0 } else { 1 })
+                rc = eval.evaluate(st, far, v)
+                if rc != core.OK { return rc }
+                value.applyComparisonNumeric(v)
+                if v.*.kind == value.NULL { return core.OK }
+                const inclusive = if s.*.descending { s.*.lowInclusive } else { s.*.highInclusive }
+                const bound = rangeBound(v, !inclusive, s.*.descending)
+                if s.*.descending {
+                    if rowid < bound { return core.OK }
+                } else if rowid > bound {
+                    return core.OK
+                }
+            }
+        }
+        found.* = true
+        return core.OK
+    }
+    rc = if s.*.descending { bt.previous(s.*.indexCursor) } else { bt.next(s.*.indexCursor) }
+    if rc != core.OK { return rc }
+    const eq = if s.*.plan == core.PLAN_INDEX_IN { 1 } else { s.*.equalities.length }
+    rc = checkIndexEntry(st, s, eq, found)
+    if rc != core.OK { return rc }
+    if !found.* && s.*.plan == core.PLAN_INDEX_IN { return nextInValue(st, s, found) }
+    return core.OK
+}
+
+// Whether every term holds for the current rows.
+fn termsHold(st: *core.Statement, terms: *mem.Words, ok: *bool) -> i32 {
+    ok.* = true
+    var i: usize = 0
+    while i < terms.*.length {
+        var truth: i8 = 0
+        const rc = eval.condition(st, @intCast(usize, mem.at(terms, i)), &truth)
+        if rc != core.OK { return rc }
+        if truth != 1 {
+            ok.* = false
+            return core.OK
+        }
+        i += 1
+    }
+    return core.OK
+}
+
+// The next joined row that every term holds for: ROW, DONE or an error.
+fn loopNext(st: *core.Statement, q: *Query) -> i32 {
+    const db = databaseOf(st)
+    if q.*.levels.length == 0 {
+        if q.*.level >= 0 { return core.DONE }
+        q.*.level = 0
+        var ok = true
+        const rc = termsHold(st, &q.*.constantTerms, &ok)
+        if rc != core.OK { return rc }
+        return if ok { core.ROW } else { core.DONE }
+    }
+    var level = q.*.level
+    if level < 0 {
+        // A new run: the constant terms first.
+        var ok = true
+        const rc = termsHold(st, &q.*.constantTerms, &ok)
+        if rc != core.OK { return rc }
+        if !ok { return core.DONE }
+        level = 0
+        sourceAt(q, 0).*.begun = false
+    }
+    const last = @intCast(i64, q.*.levels.length) - 1
+    while level >= 0 {
+        if db.*.interrupted { return core.setError(db, core.INTERRUPT, "interrupted") }
+        const s = sourceAt(q, @intCast(usize, level))
+        var found = false
+        var rc = core.OK
+        if !s.*.begun {
+            s.*.begun = true
+            s.*.matched = false
+            rc = beginSource(st, s, &found)
+        } else {
+            rc = advanceSource(st, s, &found)
+        }
+        if rc != core.OK { return rc }
+        if !found {
+            if s.*.leftJoin && !s.*.matched && !s.*.nullRow {
+                s.*.nullRow = true
+                s.*.matched = true
+                var ok = true
+                rc = termsHold(st, &s.*.whereTerms, &ok)
+                if rc != core.OK { return rc }
+                if !ok { continue }
+            } else {
+                s.*.begun = false
+                s.*.nullRow = false
+                level -= 1
+                continue
+            }
+        } else {
+            var ok = true
+            rc = termsHold(st, &s.*.onTerms, &ok)
+            if rc != core.OK { return rc }
+            if !ok { continue }
+            s.*.matched = true
+            rc = termsHold(st, &s.*.whereTerms, &ok)
+            if rc != core.OK { return rc }
+            if !ok { continue }
+        }
+        if level == last {
+            q.*.level = level
+            return core.ROW
+        }
+        level += 1
+        sourceAt(q, @intCast(usize, level)).*.begun = false
+    }
+    q.*.level = -2
+    return core.DONE
+}
+
+// A subquery source's rows, gathered.
+fn materialize(st: *core.Statement, s: *core.SourceState) -> i32 {
+    if s.*.rows == 0 { s.*.rows = core.newRows(s.*.width) }
+    core.clearRows(s.*.rows)
+    return eval.runSubquery(st, s.*.subquery, s.*.rows)
+}
+
+// LIMIT and OFFSET for a run.
+fn limits(st: *core.Statement, q: *Query) -> i32 {
+    const sel = ast.select(q.*.select)
+    q.*.limit = -1
+    q.*.offset = 0
+    var v: Value = undefined
+    value.init(&v)
+    var rc = core.OK
+    if sel.*.limit != 0 {
+        rc = eval.evaluate(st, sel.*.limit, &v)
+        if rc == core.OK {
+            value.applyComparisonNumeric(&v)
+            if v.kind != value.INTEGER {
+                rc = core.setError(databaseOf(st), core.MISMATCH, "datatype mismatch")
+            } else {
+                q.*.limit = if v.i < 0 { -1 } else { v.i }
+            }
+        }
+    }
+    if rc == core.OK && sel.*.offset != 0 {
+        rc = eval.evaluate(st, sel.*.offset, &v)
+        if rc == core.OK {
+            value.applyComparisonNumeric(&v)
+            if v.kind != value.INTEGER {
+                rc = core.setError(databaseOf(st), core.MISMATCH, "datatype mismatch")
+            } else {
+                q.*.offset = if v.i < 0 { 0 } else { v.i }
+            }
+        }
+    }
+    value.release(&v)
+    return rc
+}
+
+// Starts (or restarts) a query.
+pub fn reset(st: *core.Statement, address: usize) -> void {
+    const q = queryOf(address)
+    q.*.phase = PHASE_START
+    q.*.level = -1
+    q.*.returned = 0
+    q.*.started = false
+    core.clearRows(q.*.gathered)
+    eval.clearSet(q.*.seen)
+    var i: usize = 0
+    while i < q.*.levels.length {
+        const s = sourceAt(q, i)
+        s.*.begun = false
+        s.*.nullRow = false
+        if s.*.rows != 0 && s.*.subquery != 0 { core.rowsOf(s.*.rows).*.position = 0 }
+        if s.*.subquery != 0 { reset(st, s.*.subquery) }
+        i += 1
+    }
+    if q.*.prior != 0 { reset(st, q.*.prior) }
+}
+
+// The result values of the current joined row into q's output (and the
+// ORDER BY terms' after them).
+fn makeOutput(st: *core.Statement, q: *Query) -> i32 {
+    var i: usize = 0
+    while i < q.*.width {
+        const rc = eval.evaluate(st, @intCast(usize, mem.at(&q.*.results, i)), record.valueAt(q.*.output, i))
+        if rc != core.OK { return rc }
+        i += 1
+    }
+    if q.*.sort {
+        const sel = ast.select(q.*.select)
+        i = 0
+        while i < q.*.orderCount {
+            const rc = eval.evaluate(st, orderExpr(sel, i), record.valueAt(q.*.output, q.*.width + i))
+            if rc != core.OK { return rc }
+            i += 1
+        }
+    }
+    return core.OK
+}
+
+fn orderExpr(sel: *ast.Select, i: usize) -> usize {
+    var e = ast.exprAt(sel.*.orderBy, i)
+    if ast.expr(e).*.op == ast.E_COLLATE { e = ast.expr(e).*.left }
+    return e
+}
+
+// Copies the output row into the gathered rows.
+fn gather(q: *Query) -> i32 {
+    if q.*.gathered == 0 { q.*.gathered = core.newRows(q.*.width + q.*.orderCount) }
+    const row = core.addRow(q.*.gathered)
+    if row == 0 { return core.NOMEM }
+    var i: usize = 0
+    while i < q.*.width + q.*.orderCount {
+        value.move(record.valueAt(row, i), record.valueAt(q.*.output, i))
+        i += 1
+    }
+    return core.OK
+}
+
+// Whether the output row is new to the query's set (DISTINCT, UNION).
+fn firstTime(st: *core.Statement, q: *Query, added: *bool) -> i32 {
+    if q.*.seen == 0 { q.*.seen = eval.newSet() }
+    return eval.addToSet(st, q.*.seen, q.*.output, q.*.width, added)
+}
+
+// Runs the aggregate loop (and groups) to the end, gathering the result
+// rows.
+fn aggregateAll(st: *core.Statement, q: *Query) -> i32 {
+    var rc = core.OK
+    if q.*.groupBy.length == 0 {
+        functions.resetAccumulators(q.*.accumulators, q.*.aggregates.length)
+        var any = false
+        while true {
+            rc = loopNext(st, q)
+            if rc == core.DONE { break }
+            if rc != core.ROW { return rc }
+            any = true
+            rc = accumulate(st, q)
+            if rc != core.OK { return rc }
+        }
+        _ = any
+        return emitGroup(st, q)
+    }
+    // Rows of [group terms, aggregate arguments (all the arguments of each
+    // aggregate), bare columns], sorted by the group terms, then taken a
+    // group at a time.
+    const groupCount = q.*.groupBy.length
+    var argumentCount: usize = 0
+    var i: usize = 0
+    while i < q.*.aggregates.length {
+        argumentCount += functions.argumentCount(@intCast(usize, mem.at(&q.*.aggregates, i)))
+        i += 1
+    }
+    const width = groupCount + argumentCount + q.*.bare.length
+    const rows = core.newRows(width)
+    while true {
+        rc = loopNext(st, q)
+        if rc == core.DONE { break }
+        if rc != core.ROW {
+            core.freeRows(rows)
+            return rc
+        }
+        const row = core.addRow(rows)
+        var k: usize = 0
+        while k < groupCount && rc == core.OK {
+            rc = eval.evaluate(st, @intCast(usize, mem.at(&q.*.groupBy, k)), record.valueAt(row, k))
+            k += 1
+        }
+        var at = groupCount
+        var a: usize = 0
+        while a < q.*.aggregates.length && rc == core.OK {
+            const agg = ast.expr(@intCast(usize, mem.at(&q.*.aggregates, a)))
+            var j: usize = 0
+            while j < ast.count(agg.*.list) && rc == core.OK {
+                rc = eval.evaluate(st, ast.exprAt(agg.*.list, j), record.valueAt(row, at))
+                at += 1
+                j += 1
+            }
+            a += 1
+        }
+        k = 0
+        while k < q.*.bare.length && rc == core.OK {
+            const b = ast.expr(@intCast(usize, mem.at(&q.*.bare, k)))
+            rc = readColumn(st, b.*.source, b.*.column, record.valueAt(row, at))
+            at += 1
+            k += 1
+        }
+        if rc != core.OK {
+            core.freeRows(rows)
+            return rc
+        }
+    }
+    // Sort by the group terms, each in its own collation.
+    var collations: mem.Words = undefined
+    mem.initWords(&collations)
+    i = 0
+    while i < groupCount {
+        _ = mem.push(&collations, @intCast(u64, eval.exprCollation(st, @intCast(usize, mem.at(&q.*.groupBy, i)))))
+        i += 1
+    }
+    eval.sortRowsBy(rows, groupCount, collations.data)
+    st.*.sorts += 1
+    i = 0
+    const n = core.rowCount(rows)
+    while i < n && rc == core.OK {
+        const row = core.rowAt(rows, i)
+        if i == 0 || !eval.sameGroup(core.rowAt(rows, i - 1), row, groupCount, collations.data) {
+            if i > 0 {
+                rc = emitGroup(st, q)
+                if rc != core.OK { break }
+            }
+            functions.resetAccumulators(q.*.accumulators, q.*.aggregates.length)
+        }
+        // Accumulate from the row's stored arguments.
+        var at = groupCount
+        var a: usize = 0
+        while a < q.*.aggregates.length && rc == core.OK {
+            const agg = @intCast(usize, mem.at(&q.*.aggregates, a))
+            const argc = functions.argumentCount(agg)
+            rc = functions.step(st, q.*.accumulators, a, agg, row + at * @sizeOf(Value), argc)
+            at += argc
+            a += 1
+        }
+        var k: usize = 0
+        const take = functions.takeBare(q.*.accumulators, q.*.aggregates.length, &q.*.aggregates)
+        while k < q.*.bare.length {
+            if take { _ = value.copy(eval.register(st, @intFromPtr(q), k), record.valueAt(row, at)) }
+            at += 1
+            k += 1
+        }
+        i += 1
+    }
+    if rc == core.OK && n > 0 { rc = emitGroup(st, q) }
+    mem.freeWords(&collations)
+    core.freeRows(rows)
+    return rc
+}
+
+// One row into the aggregates (no GROUP BY): their arguments evaluated,
+// the bare columns kept.
+fn accumulate(st: *core.Statement, q: *Query) -> i32 {
+    var rc = core.OK
+    var a: usize = 0
+    const args = mem.alloc(8 * @sizeOf(Value))
+    var k: usize = 0
+    while k < 8 {
+        value.init(record.valueAt(args, k))
+        k += 1
+    }
+    while a < q.*.aggregates.length && rc == core.OK {
+        const agg = @intCast(usize, mem.at(&q.*.aggregates, a))
+        const x = ast.expr(agg)
+        const argc = functions.argumentCount(agg)
+        var j: usize = 0
+        while j < argc && j < 8 && rc == core.OK {
+            rc = eval.evaluate(st, ast.exprAt(x.*.list, j), record.valueAt(args, j))
+            j += 1
+        }
+        if rc == core.OK { rc = functions.step(st, q.*.accumulators, a, agg, args, argc) }
+        a += 1
+    }
+    core.freeRow(args, 8)
+    // Bare columns: the last row's values (a lone min() or max() keeps the
+    // row it chose: the step says when to take this row's).
+    k = 0
+    while k < q.*.bare.length && rc == core.OK {
+        if functions.takeBare(q.*.accumulators, q.*.aggregates.length, &q.*.aggregates) {
+            const b = ast.expr(@intCast(usize, mem.at(&q.*.bare, k)))
+            rc = readColumn(st, b.*.source, b.*.column, eval.register(st, @intFromPtr(q), k))
+        }
+        k += 1
+    }
+    return rc
+}
+
+// A group's result row: HAVING tested, the result columns made from the
+// aggregates' values and the registers, gathered.
+fn emitGroup(st: *core.Statement, q: *Query) -> i32 {
+    var rc = functions.finishAll(st, q.*.accumulators, q.*.aggregates.length, &q.*.aggregates)
+    if rc != core.OK { return rc }
+    q.*.readRegisters = true
+    if q.*.having != 0 {
+        var truth: i8 = 0
+        rc = eval.condition(st, q.*.having, &truth)
+        if rc != core.OK || truth != 1 {
+            q.*.readRegisters = false
+            return rc
+        }
+    }
+    rc = makeOutput(st, q)
+    q.*.readRegisters = false
+    if rc != core.OK { return rc }
+    if q.*.distinct {
+        var added = false
+        rc = firstTime(st, q, &added)
+        if rc != core.OK || !added { return rc }
+    }
+    return gather(q)
+}
+
+// The next row of a query into its output: ROW, DONE or an error.
+pub fn step(st: *core.Statement, address: usize) -> i32 {
+    const q = queryOf(address)
+    var rc = core.OK
+    if q.*.phase == PHASE_DONE { return core.DONE }
+    if q.*.phase == PHASE_START {
+        rc = limits(st, q)
+        if rc != core.OK { return rc }
+        if q.*.prior != 0 {
+            rc = runCompound(st, address)
+            if rc != core.OK { return rc }
+            q.*.phase = PHASE_GATHERED
+        } else if q.*.isAggregate {
+            rc = aggregateAll(st, q)
+            if rc != core.OK { return rc }
+            if q.*.sort { sortGathered(st, q) }
+            q.*.phase = PHASE_GATHERED
+        } else if q.*.sort {
+            while true {
+                rc = loopNext(st, q)
+                if rc == core.DONE { break }
+                if rc != core.ROW { return rc }
+                rc = makeOutput(st, q)
+                if rc != core.OK { return rc }
+                if q.*.distinct {
+                    var added = false
+                    rc = firstTime(st, q, &added)
+                    if rc != core.OK { return rc }
+                    if !added { continue }
+                }
+                rc = gather(q)
+                if rc != core.OK { return rc }
+            }
+            sortGathered(st, q)
+            q.*.phase = PHASE_GATHERED
+        } else {
+            q.*.phase = PHASE_LOOP
+        }
+        if q.*.gathered != 0 { core.rowsOf(q.*.gathered).*.position = 0 }
+    }
+    while true {
+        if q.*.limit >= 0 && q.*.returned >= q.*.limit {
+            q.*.phase = PHASE_DONE
+            return core.DONE
+        }
+        if q.*.phase == PHASE_LOOP {
+            rc = loopNext(st, q)
+            if rc == core.DONE {
+                q.*.phase = PHASE_DONE
+                return core.DONE
+            }
+            if rc != core.ROW { return rc }
+            rc = makeOutput(st, q)
+            if rc != core.OK { return rc }
+            if q.*.distinct {
+                var added = false
+                rc = firstTime(st, q, &added)
+                if rc != core.OK { return rc }
+                if !added { continue }
+            }
+        } else {
+            if q.*.gathered == 0 || core.rowsOf(q.*.gathered).*.position >= core.rowCount(q.*.gathered) {
+                q.*.phase = PHASE_DONE
+                return core.DONE
+            }
+            const g = core.rowsOf(q.*.gathered)
+            const row = core.rowAt(q.*.gathered, g.*.position)
+            g.*.position += 1
+            var i: usize = 0
+            while i < q.*.width {
+                value.move(record.valueAt(q.*.output, i), record.valueAt(row, i))
+                i += 1
+            }
+        }
+        if q.*.offset > 0 {
+            q.*.offset -= 1
+            continue
+        }
+        q.*.returned += 1
+        return core.ROW
+    }
+    return core.DONE
+}
+
+// Sorts the gathered rows by the ORDER BY terms.
+fn sortGathered(st: *core.Statement, q: *Query) -> void {
+    if q.*.gathered == 0 { return }
+    const sel = ast.select(q.*.select)
+    eval.sortByOrder(st, q.*.gathered, q.*.width, sel.*.orderBy)
+    st.*.sorts += 1
+}
+
+// A compound: every SELECT of it run, their rows combined by the
+// operators (left to right), the whole sorted by the last's ORDER BY.
+fn runCompound(st: *core.Statement, address: usize) -> i32 {
+    const q = queryOf(address)
+    // The chain, first SELECT first.
+    var chain: mem.Words = undefined
+    mem.initWords(&chain)
+    var at = address
+    while at != 0 {
+        _ = mem.insertAt(&chain, 0, @intCast(u64, at))
+        at = queryOf(at).*.prior
+    }
+    var rows = core.newRows(q.*.width + q.*.orderCount)
+    var rc = core.OK
+    var i: usize = 0
+    while i < chain.length && rc == core.OK {
+        const part = @intCast(usize, mem.at(&chain, i))
+        const op = if i == 0 { ast.C_UNION_ALL } else { queryOf(part).*.op }
+        var partRows = core.newRows(q.*.width + q.*.orderCount)
+        // The part runs as a plain SELECT (its own ORDER BY and LIMIT
+        // apply only when it is the last, to the whole).
+        rc = eval.runSimple(st, part, partRows, part == address)
+        if rc != core.OK {
+            core.freeRows(partRows)
+            break
+        }
+        rc = eval.combine(st, rows, partRows, op, q.*.width)
+        core.freeRows(partRows)
+        i += 1
+    }
+    mem.freeWords(&chain)
+    if rc != core.OK {
+        core.freeRows(rows)
+        return rc
+    }
+    core.freeRows(q.*.gathered)
+    q.*.gathered = rows
+    // UNION, INTERSECT and EXCEPT give their rows in order (SQLite's
+    // temporary B-trees); ORDER BY decides when given.
+    if ast.select(q.*.select).*.orderBy != 0 {
+        eval.sortCompound(st, q.*.gathered, q.*.width, ast.select(q.*.select).*.orderBy)
+    }
+    return core.OK
+}
+
+// Rows of a plain (not compound) part of a compound into `out`, in loop
+// order, DISTINCT applied.
+pub fn runPart(st: *core.Statement, address: usize, out: usize) -> i32 {
+    const q = queryOf(address)
+    var rc = core.OK
+    q.*.level = -1
+    if q.*.isAggregate {
+        core.clearRows(q.*.gathered)
+        rc = aggregateAll(st, q)
+        if rc != core.OK { return rc }
+        var i: usize = 0
+        while i < core.rowCount(q.*.gathered) {
+            const row = core.rowAt(q.*.gathered, i)
+            const target = core.addRow(out)
+            var k: usize = 0
+            while k < q.*.width {
+                value.move(record.valueAt(target, k), record.valueAt(row, k))
+                k += 1
+            }
+            i += 1
+        }
+        core.clearRows(q.*.gathered)
+        return core.OK
+    }
+    eval.clearSet(q.*.seen)
+    while true {
+        rc = loopNext(st, q)
+        if rc == core.DONE { break }
+        if rc != core.ROW { return rc }
+        var i: usize = 0
+        while i < q.*.width {
+            rc = eval.evaluate(st, @intCast(usize, mem.at(&q.*.results, i)), record.valueAt(q.*.output, i))
+            if rc != core.OK { return rc }
+            i += 1
+        }
+        if q.*.distinct {
+            var added = false
+            rc = firstTime(st, q, &added)
+            if rc != core.OK { return rc }
+            if !added { continue }
+        }
+        const target = core.addRow(out)
+        i = 0
+        while i < q.*.width {
+            _ = value.copy(record.valueAt(target, i), record.valueAt(q.*.output, i))
+            i += 1
+        }
+    }
+    return core.OK
+}
+
+// The output row's value `i`.
+pub fn output(address: usize, i: usize) -> *Value { return record.valueAt(queryOf(address).*.output, i) }
