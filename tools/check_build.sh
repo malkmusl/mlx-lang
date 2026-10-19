@@ -5,7 +5,7 @@
 # again (and not for a file saved unchanged), commands with input trees and
 # with another step's output, a changed build.mlx and a changed compiler,
 # a failing step, --keep-going, --dry-run, --force, --clean, --list, and the
-# compiler's --depfile.
+# compiler's --depfile (without the result cache: check_build_cache.sh).
 #
 #   tools/check_build.sh [compiler]
 set -euo pipefail
@@ -29,6 +29,10 @@ fail() {
     [[ -f "${2:-}" ]] && cat "$2" >&2
     exit 1
 }
+
+# What is built here, built: the result cache (the user's, shared by their
+# checkouts) has a check of its own, tools/check_build_cache.sh.
+export MLX_BUILD_CACHE=off
 
 # The project: std/ is where the compiler looks for it.
 project="$work/project"
