@@ -1,0 +1,230 @@
+// Incremental blob I/O (sqlite3_blob_open, _reopen, _read, _write,
+// _bytes, _close). A handle holds a copy of the row's value, read when it
+// is opened; a write changes the copy and stores it back in the row with
+// an UPDATE (the value keeps its type and size, as SQLite's writes do).
+const c = @import("./common.mlx")
+const sql = @import("std.sql")
+
+const mem = c.mem
+const value = c.value
+const core = c.core
+const engine = c.engine
+const schema = @import("std.sql.schema")
+
+const Value = value.Value
+
+const Blob = struct {
+    db: usize
+    // The SELECT that reads the value and the UPDATE that writes it (0
+    // for a handle opened to read only).
+    select: usize
+    update: usize
+    rowid: i64
+    data: Value
+    // The row was changed or deleted (SQLITE_ABORT from now on).
+    expired: bool
+}
+
+fn blobOf(address: usize) -> *Blob { unsafe { return @ptrFromInt(*Blob, address) } }
+
+// A name in double quotes, its own quotes doubled.
+fn appendQuoted(b: *mem.Buffer, name: usize) -> void {
+    _ = mem.appendByte(b, 34)
+    var i: usize = 0
+    const n = c.cLength(name)
+    while i < n {
+        const ch = mem.get8(name + i)
+        if ch == 34 { _ = mem.appendByte(b, 34) }
+        _ = mem.appendByte(b, ch)
+        i += 1
+    }
+    _ = mem.appendByte(b, 34)
+}
+
+fn prepareText(d: *core.Database, b: *mem.Buffer, out: *usize) -> i32 {
+    var tail: usize = 0
+    return engine.prepare(d, b.*.data, b.*.length, out, &tail)
+}
+
+// Reads row `rowid`'s value into the handle: OK, or the error SQLite
+// gives (no such row, a value that is not a text or blob).
+fn load(h: *Blob, rowid: i64) -> i32 {
+    const d = core.database(h.*.db)
+    const parameter = engine.parameterValue(h.*.select, 1)
+    value.setInt(unsafe { @ptrFromInt(*Value, parameter) }, rowid)
+    const rc = engine.step(h.*.select)
+    if rc == core.ROW {
+        const v = engine.column(h.*.select, 0)
+        if v.*.kind != value.TEXT && v.*.kind != value.BLOB {
+            const kind = if v.*.kind == value.NULL { "null" } else if v.*.kind == value.INTEGER { "integer" } else { "real" }
+            _ = engine.reset(h.*.select)
+            return core.setError2(d, core.ERROR, "cannot open value of type ", kind)
+        }
+        _ = value.copy(&h.*.data, v)
+        _ = engine.reset(h.*.select)
+        h.*.rowid = rowid
+        h.*.expired = false
+        return core.OK
+    }
+    _ = engine.reset(h.*.select)
+    if rc != core.DONE { return rc }
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    _ = mem.appendText(&b, "no such rowid: ")
+    _ = mem.appendDecimal(&b, rowid)
+    const result = core.setError(d, core.ERROR, mem.bufferText(&b))
+    mem.freeBuffer(&b)
+    return result
+}
+
+fn freeBlob(address: usize) -> void {
+    const h = blobOf(address)
+    if h.*.select != 0 { _ = engine.finalize(h.*.select) }
+    if h.*.update != 0 { _ = engine.finalize(h.*.update) }
+    value.release(&h.*.data)
+    mem.free(address)
+}
+
+// Whether column `column` of table `t` is in an index (or is the rowid):
+// such a column cannot be opened for writing.
+fn indexed(t: *schema.Table, column: i64) -> bool {
+    if column == t.*.rowidColumn { return true }
+    var i: usize = 0
+    while i < t.*.indexes.length {
+        const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
+        var k: usize = 0
+        while k < x.*.columnCount {
+            if schema.indexColumn(x, k) == column { return true }
+            k += 1
+        }
+        i += 1
+    }
+    return false
+}
+
+export fn sqlite3_blob_open(db: usize, database: usize, table: usize, column: usize, rowid: i64, flags: i32, out: usize) -> i32 {
+    c.ready()
+    if out != 0 { mem.put64(out, 0) }
+    if db == 0 || table == 0 || column == 0 || out == 0 { return core.MISUSE }
+    const d = core.database(db)
+    const address = mem.alloc(@sizeOf(Blob))
+    if address == 0 { return core.NOMEM }
+    const h = blobOf(address)
+    h.*.db = db
+    value.init(&h.*.data)
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    _ = mem.appendText(&b, "SELECT ")
+    appendQuoted(&b, column)
+    _ = mem.appendText(&b, " FROM ")
+    appendQuoted(&b, table)
+    _ = mem.appendText(&b, " WHERE rowid = ?1")
+    var rc = prepareText(d, &b, &h.*.select)
+    if rc != core.OK {
+        // SQLite's messages name what is missing its own way.
+        const message = mem.bufferText(&d.*.message)
+        if message.length >= 14 && mem.same(message[0..14], "no such table:") {
+            _ = core.setError3(d, core.ERROR, "no such table: ", if database == 0 { "main" } else { mem.view(database, c.cLength(database)) }, ".")
+            _ = mem.appendText(&d.*.message, mem.view(table, c.cLength(table)))
+        } else if message.length >= 15 && mem.same(message[0..15], "no such column:") {
+            _ = core.setError3(d, core.ERROR, "no such column: \"", mem.view(column, c.cLength(column)), "\"")
+        }
+        mem.freeBuffer(&b)
+        freeBlob(address)
+        return c.reported(d, rc)
+    }
+    if flags != 0 {
+        const t = schema.findTable(&d.*.schema, mem.view(table, c.cLength(table)))
+        if t != 0 {
+            const k = schema.findColumn(schema.table(t), mem.view(column, c.cLength(column)))
+            if k >= 0 && indexed(schema.table(t), k) {
+                _ = core.setError(d, core.ERROR, "cannot open indexed column for writing")
+                mem.freeBuffer(&b)
+                freeBlob(address)
+                return c.reported(d, core.ERROR)
+            }
+        }
+        b.length = 0
+        _ = mem.appendText(&b, "UPDATE ")
+        appendQuoted(&b, table)
+        _ = mem.appendText(&b, " SET ")
+        appendQuoted(&b, column)
+        _ = mem.appendText(&b, " = ?1 WHERE rowid = ?2")
+        rc = prepareText(d, &b, &h.*.update)
+        if rc != core.OK {
+            mem.freeBuffer(&b)
+            freeBlob(address)
+            return c.reported(d, rc)
+        }
+    }
+    mem.freeBuffer(&b)
+    sql.os.enter(&d.*.mutex)
+    rc = load(h, rowid)
+    sql.os.leave(&d.*.mutex)
+    if rc != core.OK {
+        freeBlob(address)
+        return c.reported(d, rc)
+    }
+    core.clearError(d)
+    mem.put64(out, @intCast(u64, address))
+    return core.OK
+}
+
+export fn sqlite3_blob_reopen(blob: usize, rowid: i64) -> i32 {
+    if blob == 0 { return core.MISUSE }
+    const h = blobOf(blob)
+    const d = core.database(h.*.db)
+    sql.os.enter(&d.*.mutex)
+    var rc = load(h, rowid)
+    if rc != core.OK {
+        h.*.expired = true
+    } else {
+        core.clearError(d)
+    }
+    sql.os.leave(&d.*.mutex)
+    return c.reported(d, rc)
+}
+
+export fn sqlite3_blob_close(blob: usize) -> i32 {
+    if blob == 0 { return core.OK }
+    freeBlob(blob)
+    return core.OK
+}
+
+export fn sqlite3_blob_bytes(blob: usize) -> i32 {
+    if blob == 0 { return 0 }
+    const h = blobOf(blob)
+    if h.*.expired { return 0 }
+    return @intCast(i32, h.*.data.length & 0x7fffffff)
+}
+
+fn outOfRange(h: *Blob, bytes: i32, offset: i32) -> bool {
+    if bytes < 0 || offset < 0 { return true }
+    return @intCast(usize, bytes) + @intCast(usize, offset) > h.*.data.length
+}
+
+export fn sqlite3_blob_read(blob: usize, into: usize, bytes: i32, offset: i32) -> i32 {
+    if blob == 0 { return core.MISUSE }
+    const h = blobOf(blob)
+    const d = core.database(h.*.db)
+    if h.*.expired { return core.setError(d, core.ABORT, "") }
+    if outOfRange(h, bytes, offset) { return core.setError(d, core.ERROR, "") }
+    if bytes > 0 { mem.copy(into, h.*.data.data + @intCast(usize, offset), @intCast(usize, bytes)) }
+    return core.OK
+}
+
+export fn sqlite3_blob_write(blob: usize, from: usize, bytes: i32, offset: i32) -> i32 {
+    if blob == 0 { return core.MISUSE }
+    const h = blobOf(blob)
+    const d = core.database(h.*.db)
+    if h.*.update == 0 { return core.setError(d, core.READONLY, "") }
+    if h.*.expired { return core.setError(d, core.ABORT, "") }
+    if outOfRange(h, bytes, offset) { return core.setError(d, core.ERROR, "") }
+    if bytes > 0 { mem.copy(h.*.data.data + @intCast(usize, offset), from, @intCast(usize, bytes)) }
+    _ = value.copy(unsafe { @ptrFromInt(*Value, engine.parameterValue(h.*.update, 1)) }, &h.*.data)
+    value.setInt(unsafe { @ptrFromInt(*Value, engine.parameterValue(h.*.update, 2)) }, h.*.rowid)
+    var rc = engine.step(h.*.update)
+    _ = engine.reset(h.*.update)
+    if rc == core.DONE { rc = core.OK }
+    return c.reported(d, rc)
+}

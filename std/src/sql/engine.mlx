@@ -305,8 +305,10 @@ fn compile(st: *core.Statement, consumed: *usize, keepParameters: bool) -> i32 {
         parser.deinit(&p)
         return rc
     }
-    consumed.* = p.tok.start
-    if p.tok.kind == 0 { consumed.* = st.*.textLength }
+    // A statement ends with its semicolon (SQLite's tail begins after it).
+    // (Without one, at the text's end, the statement takes the rest.)
+    consumed.* = p.lastEnd
+    if p.tok.kind == 0 && (node == 0 || ast.statement(node).*.textEnd == p.lastEnd) { consumed.* = st.*.textLength }
     st.*.node = node
     st.*.generation = db.*.schemaGeneration
     // The text the rest of the statement's names point into.
@@ -328,7 +330,8 @@ fn compile(st: *core.Statement, consumed: *usize, keepParameters: bool) -> i32 {
     parser.deinit(&p)
     if node == 0 { return core.OK }
     const x = ast.statement(node)
-    st.*.readOnly = !x.*.writes && x.*.kind != ast.S_BEGIN && x.*.kind != ast.S_COMMIT && x.*.kind != ast.S_ROLLBACK && x.*.kind != ast.S_SAVEPOINT && x.*.kind != ast.S_RELEASE
+    // (Transaction statements read only, as SQLite counts them.)
+    st.*.readOnly = !x.*.writes
     if x.*.explain != 0 { return core.setError(db, core.ERROR, "EXPLAIN is not supported") }
     if x.*.kind == ast.S_SELECT {
         const q = query.compile(st, x.*.select, 0)
@@ -353,7 +356,9 @@ fn compile(st: *core.Statement, consumed: *usize, keepParameters: bool) -> i32 {
     if x.*.kind == ast.S_PRAGMA {
         const answer = eval.authorize(st, core.AUTH_PRAGMA, mem.view(x.*.name, x.*.nameLength), mem.view(0, 0))
         if answer == core.AUTH_DENY { return core.setError(db, core.AUTH, "not authorized") }
-        return pragma.prepare(st, node)
+        const rc = pragma.prepare(st, node)
+        st.*.readOnly = !x.*.writes
+        return rc
     }
     if x.*.kind == ast.S_BEGIN || x.*.kind == ast.S_COMMIT || x.*.kind == ast.S_ROLLBACK {
         if eval.authorize(st, core.AUTH_TRANSACTION, if x.*.kind == ast.S_BEGIN { "BEGIN" } else if x.*.kind == ast.S_COMMIT { "COMMIT" } else { "ROLLBACK" }, mem.view(0, 0)) == core.AUTH_DENY {
@@ -387,6 +392,12 @@ fn newStatement(db: *core.Database, text: usize, length: usize) -> usize {
 fn freeStatement(address: usize) -> void {
     const st = core.statementOf(address)
     freeCompiled(st)
+    var block = st.*.scratch
+    while block != 0 {
+        const next = @intCast(usize, mem.get64(block))
+        mem.free(block)
+        block = next
+    }
     var i: usize = 0
     while i < st.*.parameterCount {
         value.release(core.parameter(st, @intCast(i64, i) + 1))
@@ -433,8 +444,10 @@ pub fn prepare(db: *core.Database, text: usize, length: usize, out: *usize, tail
         os.leave(&db.*.mutex)
         return rc
     }
-    // The statement's text is its own statement only (sqlite3_sql).
+    // The statement's text is its own statement only (sqlite3_sql), and
+    // ends with a NUL for C.
     st.*.textLength = consumed
+    mem.put8(copied + consumed, 0)
     tail.* = consumed
     _ = mem.push(&db.*.statements, @intCast(u64, address))
     out.* = address
@@ -852,6 +865,30 @@ pub fn columnType(address: usize, i: usize, length: *usize) -> usize {
     return @intCast(usize, mem.at(&st.*.columnTypes, i * 2))
 }
 
+// The table and column result column `i` is read from (addresses of
+// NUL-terminated names; 0 for an expression that is not a table's column).
+pub fn columnOrigin(address: usize, i: usize, table: *usize, column: *usize) -> void {
+    const st = core.statementOf(address)
+    table.* = 0
+    column.* = 0
+    if st.*.query == 0 || i >= st.*.columnCount { return }
+    const q = query.queryOf(st.*.query)
+    if i >= q.*.results.length { return }
+    const r = ast.expr(@intCast(usize, mem.at(&q.*.results, i)))
+    if r.*.op != ast.E_COLUMN || r.*.source < 0 { return }
+    const s = core.sourceState(@intCast(usize, mem.at(&st.*.sources, @intCast(usize, r.*.source))))
+    if s.*.kind != core.SOURCE_TABLE { return }
+    const t = schema.table(s.*.table)
+    table.* = t.*.name
+    if r.*.column >= 0 {
+        column.* = schema.column(t, @intCast(usize, r.*.column)).*.name
+    } else if t.*.rowidColumn >= 0 {
+        column.* = schema.column(t, @intCast(usize, t.*.rowidColumn)).*.name
+    } else {
+        column.* = @intFromPtr("rowid".pointer)
+    }
+}
+
 pub fn columnCount(address: usize) -> usize { return core.statementOf(address).*.columnCount }
 
 // The number of columns of the current row (0 when there is none).
@@ -874,8 +911,9 @@ pub fn parameterValue(address: usize, i: i64) -> usize {
     return @intFromPtr(core.parameter(st, i))
 }
 
-// A statement may be bound only when not stepping (MISUSE otherwise).
-pub fn canBind(address: usize) -> bool { return core.statementOf(address).*.state != core.RUNNING }
+// A statement may be bound only before its first step or after a reset
+// (MISUSE otherwise, as SQLite has it).
+pub fn canBind(address: usize) -> bool { return core.statementOf(address).*.state == core.NOT_STARTED }
 
 pub fn parameterName(address: usize, i: i64, length: *usize) -> usize {
     const st = core.statementOf(address)
@@ -976,8 +1014,20 @@ pub fn expandedText(address: usize) -> usize {
                 number = parameterIndex(address, raw)
                 if number > next { next = number }
             }
-            if number >= 1 && @intCast(usize, number) <= st.*.parameterCount {
-                functions.quote(core.parameter(st, number), &b)
+            const bound = if number >= 1 && @intCast(usize, number) <= st.*.parameterCount { core.parameter(st, number) } else { &noValue }
+            if number >= 1 && @intCast(usize, number) <= st.*.parameterCount && bound.*.kind == value.BLOB {
+                // (Blobs in lower case here, as SQLite writes them.)
+                _ = mem.appendText(&b, "x'")
+                var k: usize = 0
+                while k < bound.*.length {
+                    const byte = mem.get8(bound.*.data + k)
+                    _ = mem.appendByte(&b, if (byte >> 4) < 10 { 48 + (byte >> 4) } else { 87 + (byte >> 4) })
+                    _ = mem.appendByte(&b, if (byte & 15) < 10 { 48 + (byte & 15) } else { 87 + (byte & 15) })
+                    k += 1
+                }
+                _ = mem.appendByte(&b, 39)
+            } else if number >= 1 && @intCast(usize, number) <= st.*.parameterCount {
+                functions.quote(bound, &b)
             } else {
                 _ = mem.appendText(&b, "NULL")
             }
