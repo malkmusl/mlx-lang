@@ -58,6 +58,7 @@ sources reach.
 | `task.mlx` | `gasyncresult.h`, `gtask.h`: tasks returning at once, from idle sources, from threads (and synchronously) |
 | `localfile.mlx` | `gfile.h`: local files (paths, URIs, reading, replacing with etags, deleting, making directories); `gfilemonitor.h` on inotify, with GIO's rules for pending changes and renames |
 | `socket.mlx` | `gsocket.h`, `giostream.h`, `gsocketconnection.h`: sockets (always non-blocking underneath, as in GIO), their sources, and Unix and TCP connections |
+| `streams.mlx` | `ginputstream.h`, `goutputstream.h`, `gfilterinputstream.h`, `gfilteroutputstream.h`, `gmemoryinputstream.h`, `gmemoryoutputstream.h`, `gpollableinputstream.h`, `gpollableoutputstream.h`, `gpollableutils.h`, `gsimpleiostream.h` and a GIOStream's streams: reading, skipping, writing, flushing, splicing and closing, synchronously and asynchronously (a pollable stream waits on its source, any other runs the synchronous call in a thread, as GIO does), the socket streams of a connection |
 | `network.mlx` | `ginetaddress.h`, `gsocketaddress.h`, `ginetsocketaddress.h`, `gsocketconnectable.h`, `gsocketlistener.h`, `gsocketservice.h`, `gsocketclient.h`: IPv4 and IPv6 addresses, listening (a service accepts in its main context and emits "incoming"), connecting to "host:port" at once or asynchronously |
 | `resource.mlx` | `gresource.h`: the GVDB files `glib-compile-resources` writes, compressed entries (inflated by std.flate), the registry, static resources |
 | `application.mlx` | `gapplication.h`: application ids and the default application |
@@ -79,6 +80,8 @@ sources reach.
   (GOption, gettext), `network.c` (addresses, a service, a client,
   their errors) and `tls.c` (certificates from PEM and DER as WebKit
   makes and copies them, chains, keys, passwords; a backend without TLS)
+  and `streams.c` (memory, filter and socket streams, synchronous and
+  asynchronous, splicing, pollable sources, GSimpleIOStream)
   and compares what they print with what the same programs print on GLib
   2.80 (`tls.c`'s certificates with GLib's GnuTLS backend, its backend
   part with none, `GIO_USE_TLS=dummy`);
@@ -118,9 +121,7 @@ system without it:
 - **Files** are local paths; another URI scheme gives a file that knows
   only its URI (GIO's GDummyFile without a VFS module), and operations on
   it fail with `G_IO_ERROR_NOT_SUPPORTED`. GFileInfo, enumerators and
-  streams (GInputStream, GOutputStream, `g_resource_open_stream`) are not
-  here (their instance and class structures are, as GIO lays them out, for
-  types declared over them: libsoup's SoupMultipartInputStream).
+  `g_resource_open_stream` are not here.
 - **TLS**: there is no TLS implementation yet (the TLS of the HTTP
   client libsoup's layer will need). The backend makes certificates as
   GIO's GnuTLS backend does (`g_tls_certificate_new_from_pem`,
