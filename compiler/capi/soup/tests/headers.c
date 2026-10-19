@@ -7,6 +7,7 @@
    Content-Type and Content-Disposition. */
 #include <libsoup/soup.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void print_headers(const char *what, SoupMessageHeaders *hdrs)
