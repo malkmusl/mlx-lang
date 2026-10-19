@@ -1,0 +1,357 @@
+// std.crypto.chacha: ChaCha20, Poly1305 and their AEAD (RFC 8439), the
+// cipher suite TLS offers beside AES-GCM. Both are constant time by
+// construction: additions, rotations and XORs, and products of
+// 44-bit limbs.
+//
+//     chacha.chacha20(key, counter, nonce, input, length, out)
+//     chacha.poly1305(key, message, tag)               // 32-byte one-time key
+//     chacha.seal(key, nonce, aad, plain, length, out, tag)
+//     if !chacha.open(key, nonce, aad, sealed, length, tag, out) { ... }
+//
+// Keys are 32 bytes, nonces 12, tags 16; `out` may be the input itself.
+
+const MASK32: u64 = 4294967295
+const MASK44: u64 = 17592186044415
+const MASK42: u64 = 4398046511103
+
+fn readLittle32(bytes: [*]const u8, at: usize) -> u64 {
+    return @intCast(u64, bytes[at]) | (@intCast(u64, bytes[at + 1]) << 8) | (@intCast(u64, bytes[at + 2]) << 16) | (@intCast(u64, bytes[at + 3]) << 24)
+}
+
+fn readLittle64(bytes: [*]const u8, at: usize) -> u64 {
+    return readLittle32(bytes, at) | (readLittle32(bytes, at + 4) << 32)
+}
+
+fn writeLittle64(bytes: [*]u8, at: usize, value: u64) -> void {
+    var index: usize = 0
+    while index < 8 {
+        bytes[at + index] = @intCast(u8, (value >> (8 * index)) & 255)
+        index += 1
+    }
+}
+
+// The words are kept in 64-bit integers, masked to 32 bits.
+fn rotate(value: u64, count: u64) -> u64 {
+    return ((value << count) & MASK32) | (value >> (32 - count))
+}
+
+fn quarter(x: [*]u64, a: usize, b: usize, c: usize, d: usize) -> void {
+    x[a] = (x[a] + x[b]) & MASK32
+    x[d] = rotate(x[d] ^ x[a], 16)
+    x[c] = (x[c] + x[d]) & MASK32
+    x[b] = rotate(x[b] ^ x[c], 12)
+    x[a] = (x[a] + x[b]) & MASK32
+    x[d] = rotate(x[d] ^ x[a], 8)
+    x[c] = (x[c] + x[d]) & MASK32
+    x[b] = rotate(x[b] ^ x[c], 7)
+}
+
+// The 64 bytes of keystream of block `counter`.
+fn block(key: [*]const u8, counter: u64, nonce: [*]const u8, out: [*]u8) -> void {
+    var state: [16]u64 = undefined
+    state[0] = 1634760805
+    state[1] = 857760878
+    state[2] = 2036477234
+    state[3] = 1797285236
+    var index: usize = 0
+    while index < 8 {
+        state[4 + index] = readLittle32(key, index * 4)
+        index += 1
+    }
+    state[12] = counter & MASK32
+    state[13] = readLittle32(nonce, 0)
+    state[14] = readLittle32(nonce, 4)
+    state[15] = readLittle32(nonce, 8)
+    var working: [16]u64 = state
+    const x: [*]u64 = &working
+    var round: usize = 0
+    while round < 10 {
+        quarter(x, 0, 4, 8, 12)
+        quarter(x, 1, 5, 9, 13)
+        quarter(x, 2, 6, 10, 14)
+        quarter(x, 3, 7, 11, 15)
+        quarter(x, 0, 5, 10, 15)
+        quarter(x, 1, 6, 11, 12)
+        quarter(x, 2, 7, 8, 13)
+        quarter(x, 3, 4, 9, 14)
+        round += 1
+    }
+    index = 0
+    while index < 16 {
+        const word = (working[index] + state[index]) & MASK32
+        out[index * 4] = @intCast(u8, word & 255)
+        out[index * 4 + 1] = @intCast(u8, (word >> 8) & 255)
+        out[index * 4 + 2] = @intCast(u8, (word >> 16) & 255)
+        out[index * 4 + 3] = @intCast(u8, (word >> 24) & 255)
+        working[index] = 0
+        state[index] = 0
+        index += 1
+    }
+}
+
+// `length` bytes of `input` XORed with the keystream from block
+// `counter` on, into `out`.
+pub fn chacha20(key: [*]const u8, counter: u64, nonce: [*]const u8, input: [*]const u8, length: usize, out: [*]u8) -> void {
+    var stream: [64]u8 = undefined
+    const keystream: [*]u8 = &stream
+    var next = counter
+    var at: usize = 0
+    while at < length {
+        block(key, next, nonce, keystream)
+        next += 1
+        var index: usize = 0
+        while index < 64 && at < length {
+            out[at] = input[at] ^ stream[index]
+            at += 1
+            index += 1
+        }
+    }
+    var index: usize = 0
+    while index < 64 {
+        stream[index] = 0
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Poly1305, in three limbs of 44, 44 and 42 bits (poly1305-donna's 64-bit
+// form): the products of two limbs fit a u128.
+
+pub const Poly1305 = struct {
+    r: [3]u64
+    h: [3]u64
+    pad: [2]u64
+    buffer: [16]u8
+    filled: usize
+}
+
+fn wide(value: u64) -> u128 {
+    return @intCast(u128, value)
+}
+
+fn low64(value: u128) -> u64 {
+    return @intCast(u64, value & 18446744073709551615)
+}
+
+// The 32-byte one-time key: r (clamped) and s.
+pub fn polyInit(mac: *Poly1305, key: [*]const u8) -> void {
+    const t0 = readLittle64(key, 0)
+    const t1 = readLittle64(key, 8)
+    mac.*.r[0] = t0 & 17575274610687
+    mac.*.r[1] = ((t0 >> 44) | (t1 << 20)) & 17592181915647
+    mac.*.r[2] = (t1 >> 24) & 68719475727
+    mac.*.h[0] = 0
+    mac.*.h[1] = 0
+    mac.*.h[2] = 0
+    mac.*.pad[0] = readLittle64(key, 16)
+    mac.*.pad[1] = readLittle64(key, 24)
+    mac.*.filled = 0
+}
+
+// Blocks of 16 bytes into the accumulator; `high` is 2^128's bit, 0 for
+// the padded last block.
+fn polyBlocks(mac: *Poly1305, bytes: [*]const u8, count: usize, high: u64) -> void {
+    const r0 = mac.*.r[0]
+    const r1 = mac.*.r[1]
+    const r2 = mac.*.r[2]
+    const s1 = r1 * 20
+    const s2 = r2 * 20
+    var h0 = mac.*.h[0]
+    var h1 = mac.*.h[1]
+    var h2 = mac.*.h[2]
+    var at: usize = 0
+    while at < count * 16 {
+        const t0 = readLittle64(bytes, at)
+        const t1 = readLittle64(bytes, at + 8)
+        h0 += t0 & MASK44
+        h1 += ((t0 >> 44) | (t1 << 20)) & MASK44
+        h2 += ((t1 >> 24) & MASK42) | high
+        var d0 = wide(h0) * wide(r0) + wide(h1) * wide(s2) + wide(h2) * wide(s1)
+        var d1 = wide(h0) * wide(r1) + wide(h1) * wide(r0) + wide(h2) * wide(s2)
+        var d2 = wide(h0) * wide(r2) + wide(h1) * wide(r1) + wide(h2) * wide(r0)
+        var c = low64(d0 >> 44)
+        h0 = low64(d0) & MASK44
+        d1 += wide(c)
+        c = low64(d1 >> 44)
+        h1 = low64(d1) & MASK44
+        d2 += wide(c)
+        c = low64(d2 >> 42)
+        h2 = low64(d2) & MASK42
+        h0 += c * 5
+        c = h0 >> 44
+        h0 = h0 & MASK44
+        h1 += c
+        at += 16
+    }
+    mac.*.h[0] = h0
+    mac.*.h[1] = h1
+    mac.*.h[2] = h2
+}
+
+pub fn polyUpdate(mac: *Poly1305, bytes: []const u8) -> void {
+    var at: usize = 0
+    if mac.*.filled > 0 {
+        while mac.*.filled < 16 && at < bytes.length {
+            mac.*.buffer[mac.*.filled] = bytes[at]
+            mac.*.filled += 1
+            at += 1
+        }
+        if mac.*.filled < 16 { return }
+        const buffered: [*]const u8 = &mac.*.buffer
+        polyBlocks(mac, buffered, 1, 1099511627776)
+        mac.*.filled = 0
+    }
+    const whole = (bytes.length - at) / 16
+    if whole > 0 {
+        polyBlocks(mac, bytes.pointer + at, whole, 1099511627776)
+        at += whole * 16
+    }
+    while at < bytes.length {
+        mac.*.buffer[mac.*.filled] = bytes[at]
+        mac.*.filled += 1
+        at += 1
+    }
+}
+
+// The 16-byte tag; the state is wiped.
+pub fn polyFinish(mac: *Poly1305, tag: [*]u8) -> void {
+    if mac.*.filled > 0 {
+        // The last block: a 1 after the bytes, zeroes to 16, and no 2^128.
+        mac.*.buffer[mac.*.filled] = 1
+        var index = mac.*.filled + 1
+        while index < 16 {
+            mac.*.buffer[index] = 0
+            index += 1
+        }
+        const buffered: [*]const u8 = &mac.*.buffer
+        polyBlocks(mac, buffered, 1, 0)
+    }
+    var h0 = mac.*.h[0]
+    var h1 = mac.*.h[1]
+    var h2 = mac.*.h[2]
+    var c = h1 >> 44
+    h1 = h1 & MASK44
+    h2 += c
+    c = h2 >> 42
+    h2 = h2 & MASK42
+    h0 += c * 5
+    c = h0 >> 44
+    h0 = h0 & MASK44
+    h1 += c
+    c = h1 >> 44
+    h1 = h1 & MASK44
+    h2 += c
+    c = h2 >> 42
+    h2 = h2 & MASK42
+    h0 += c * 5
+    c = h0 >> 44
+    h0 = h0 & MASK44
+    h1 += c
+
+    // h - p = h + 5 - 2^130: kept when it does not go below zero.
+    var g0 = h0 + 5
+    c = g0 >> 44
+    g0 = g0 & MASK44
+    var g1 = h1 + c
+    c = g1 >> 44
+    g1 = g1 & MASK44
+    var g2 = (h2 + c) -% 4398046511104
+    var mask = (g2 >> 63) -% 1
+    g0 = g0 & mask
+    g1 = g1 & mask
+    g2 = g2 & mask
+    mask = mask ^ 18446744073709551615
+    h0 = (h0 & mask) | g0
+    h1 = (h1 & mask) | g1
+    h2 = (h2 & mask) | g2
+
+    // + s, mod 2^128.
+    const t0 = mac.*.pad[0]
+    const t1 = mac.*.pad[1]
+    h0 += t0 & MASK44
+    c = h0 >> 44
+    h0 = h0 & MASK44
+    h1 += (((t0 >> 44) | (t1 << 20)) & MASK44) + c
+    c = h1 >> 44
+    h1 = h1 & MASK44
+    h2 += ((t1 >> 24) & MASK42) + c
+    h2 = h2 & MASK42
+    writeLittle64(tag, 0, h0 | (h1 << 44))
+    writeLittle64(tag, 8, (h1 >> 20) | (h2 << 24))
+    polyWipe(mac)
+}
+
+fn polyWipe(mac: *Poly1305) -> void {
+    var index: usize = 0
+    while index < 3 {
+        mac.*.r[index] = 0
+        mac.*.h[index] = 0
+        index += 1
+    }
+    mac.*.pad[0] = 0
+    mac.*.pad[1] = 0
+    index = 0
+    while index < 16 {
+        mac.*.buffer[index] = 0
+        index += 1
+    }
+    mac.*.filled = 0
+}
+
+pub fn poly1305(key: [*]const u8, message: []const u8, tag: [*]u8) -> void {
+    var mac: Poly1305 = undefined
+    polyInit(&mac, key)
+    polyUpdate(&mac, message)
+    polyFinish(&mac, tag)
+}
+
+// ---------------------------------------------------------------------------
+// The AEAD (RFC 8439, 2.8): the one-time key is block 0's first 32
+// bytes, the text is encrypted from block 1, and the tag covers the AAD,
+// the ciphertext (each padded to 16 bytes) and both lengths.
+
+fn aeadTag(key: [*]const u8, nonce: [*]const u8, aad: []const u8, sealed: [*]const u8, length: usize, tag: [*]u8) -> void {
+    var first: [64]u8 = undefined
+    const one_time: [*]u8 = &first
+    block(key, 0, nonce, one_time)
+    var mac: Poly1305 = undefined
+    polyInit(&mac, one_time)
+    var zeroes: [16]u8 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    const padding: [*]const u8 = &zeroes
+    polyUpdate(&mac, aad)
+    if aad.length % 16 != 0 { polyUpdate(&mac, padding[0 .. 16 - aad.length % 16]) }
+    polyUpdate(&mac, sealed[0..length])
+    if length % 16 != 0 { polyUpdate(&mac, padding[0 .. 16 - length % 16]) }
+    var lengths: [16]u8 = undefined
+    const counts: [*]u8 = &lengths
+    writeLittle64(counts, 0, @intCast(u64, aad.length))
+    writeLittle64(counts, 8, @intCast(u64, length))
+    polyUpdate(&mac, counts[0..16])
+    polyFinish(&mac, tag)
+    var index: usize = 0
+    while index < 64 {
+        first[index] = 0
+        index += 1
+    }
+}
+
+pub fn seal(key: [*]const u8, nonce: [*]const u8, aad: []const u8, plain: [*]const u8, length: usize, out: [*]u8, tag: [*]u8) -> void {
+    chacha20(key, 1, nonce, plain, length, out)
+    aeadTag(key, nonce, aad, out, length, tag)
+}
+
+// Decrypts when the tag is right; false (and `out` untouched) when not.
+pub fn open(key: [*]const u8, nonce: [*]const u8, aad: []const u8, sealed: [*]const u8, length: usize, tag: [*]const u8, out: [*]u8) -> bool {
+    var computed: [16]u8 = undefined
+    const mine: [*]u8 = &computed
+    aeadTag(key, nonce, aad, sealed, length, mine)
+    var difference: u64 = 0
+    var index: usize = 0
+    while index < 16 {
+        difference = difference | @intCast(u64, computed[index] ^ tag[index])
+        index += 1
+    }
+    if difference != 0 { return false }
+    chacha20(key, 1, nonce, sealed, length, out)
+    return true
+}

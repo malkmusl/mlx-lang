@@ -34,6 +34,11 @@
 #                                       std.dbus's client (signals kept
 #                                       across a call, bus addresses) and
 #                                       std.spawn.find
+#   tests/362_crypto_symmetric_runtime.mlx
+#                                       std.crypto's HMAC, HKDF, AES-GCM,
+#                                       ChaCha20-Poly1305 and std.aes's
+#                                       constant-time AES (RFC 4231, 5869,
+#                                       8439, FIPS 197, the GCM test cases)
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -76,6 +81,7 @@ run 358_timezone_names_runtime "zone abbreviations from rules and TZif files"
 run 359_linux_descriptors_runtime "pipes, epoll tokens, signalfd, timerfd, eventfd, poll, Unix sockets, SCM_RIGHTS, wait4"
 run 360_spawn_runtime "PATH lookup, captured output, exit statuses, moved descriptors, vfork, detach"
 run 361_dbus_keep_signals_runtime "a client against a child bus: a signal kept across a call with its descriptor; bus addresses; PATH lookup"
+run 362_crypto_symmetric_runtime "HMAC, HKDF, AES-128/192/256, AES-GCM, ChaCha20, Poly1305 and their AEAD"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
