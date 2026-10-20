@@ -465,3 +465,11 @@ What M2 found, and how the port meets it without a patch:
 - **Bundles too big for mlx-cc.** The dense JSBindings bundle of
   bindings/js (64 sources) exceeds mlx-cc's 8 GB arena: the Mlx port
   bundles bindings/js by directory (webcore.mlx, `Derived.dense`).
+- **Accessibility's platform shape.** AXCoreObject's wrapper member
+  exists for Cocoa, Windows, PlayStation, Haiku and ATSPI only, and
+  accessibility is always compiled: config.MLX sets `WTF_PLATFORM_HAIKU`,
+  the Haiku port's shape of it (an AccessibilityObjectWrapper that is a
+  RefCounted nothing, which the PlayStation stubs the port compiles make;
+  ChromeClient's three accessibility notification functions, which
+  EmptyClients defines and the embedder will), and Pasteboard.h's
+  members for GTK, WPE and Haiku: all WebKit asks PLATFORM(HAIKU) for.

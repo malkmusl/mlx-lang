@@ -287,6 +287,57 @@ source, each alone, with the same stand-in headers):
 | `static assertion failed` | 1 | StdLibExtras.h:870 |
 | `expected a type as the template argument` | 1 | StdMap.h:33 |
 
+## The Mlx port's build
+
+`./mlx build webkit-mlx-webcore` compiles WebCore for PlatformMlx
+(PORT.md: config.MLX, the source selection of webcore.mlx's `mlx()`,
+the port's own sources in projects/webkit/port) as unified sources of 8
+files at most, bindings/js bundled by directory, and a few files
+compiled apart. The configuration leaves out what the WPE survey
+stopped at (libsoup, GLib, GCrypt, ATSPI, XSLT, video, WebGL), and the
+units it does not compile yet are the compiler's: the count of the last
+full build is in PORT.md's M2 entry, the units that fail and why below
+it.
+
+The pass fixed these in mlx-cc, each with a test in
+compiler/cc/tests/cpp (the WebCore place that met it in the commit):
+
+| mlx-cc | Test |
+|---|---|
+| a member's requires clause read before its class's argument is defined waits for the call (WeakHashSet::forEach's pair, IDBConnectionToClient) | incompleteconstrained |
+| a function template's parameter naming no template parameter deduces nothing, the argument converting after (`std::span<const uint8_t>`, a Variant from `0U`, GPUBuffer) | nondependentpattern |
+| C++20's parenthesized aggregate initialization, and `__is_constructible` of an aggregate (std::optional<StepsEasingParameters>) | parenaggregate |
+| a constexpr function's class result over 16 bytes binds its parameters after the hidden one; constexpr std::get and make_tuple (the color descriptors' components) | constexprresultbuffer |
+| a pattern `U<T>` of a template template parameter names a parameter (JSConverter<IDLPromise<T>>::convert of a DOMPromiseProxy<T>) | templatetemplatededuce |
+| `__is_constructible` through a conversion operator of a class without declared constructors (a Variant from WebAnimationTime, for std::optional's constrained converting constructor) | conversionconstructible |
+| `__is_convertible_to` makes a pointer's class whole before looking at its bases (unique_ptr<SkExecutor> of a SkThreadPool<WorkList>) | convertibleinstance |
+| an initializer_list guide deduces its element from the second element too (`SkSpan{ptr, count}`) | ctadlistpair |
+| a class instance named in a nested class read apart takes the instance made for the member (`Ref<IsFinished>` in JSDOMAsyncIteratorBase) | nestedinstance |
+| `auto x { e }` of a global or static (URLPatternCanonical's dummyURLCharacters) | autobraceinit |
+| class template argument deduction in a new-expression (StyleInterpolationWrapperMap) | ctadnew |
+| a guide's `const T &` and `T &&` from a pointer to member function's class (StyleInterpolationWrapperMap's wrappers) | refpatterndeduce |
+| an explicit specialization among overloaded templates binds the arguments given before matching (`writeLittleEndian<uint8_t>` of the IDB serialization) | explicitoverloadspec |
+| implicit deduction guides of constructors taking pointers to member functions, named or through an alias | memberpointerguide |
+| argument-dependent lookup through a pointer to a class declared only (`toJS(JSContextRef)` past WebCore's toJS) | adlincomplete |
+| a reference member given `{ }` binds to a temporary living with the block (`.symbolTable = { }` of CSSCalc::EvaluationOptions) | refmemberbrace |
+| argument-dependent lookup sees the namespaces of base classes (`map(styleProperties, f)` finds WTF::map through RefCounted) | adlbase |
+| deduction from an overloaded function's name takes the one overload the pattern deduces from (`typeFromVector(values, addTypes)`) | overloadsetdeduce |
+
+What the pass found and did not fix:
+
+- the interpreter holds no constexpr object with a pointer in it: a
+  `static constexpr auto header = "..."_s` (an ASCIILiteral) has no
+  `header.length()` for an array's size (PushMessageCrypto.cpp);
+- a global of a class with no destructor brace-initialized from a bare
+  call, `static Lit g { make() };`, gets no value (`= make()`, `{ (make()) }`
+  and a class with a destructor do; `static constexpr auto x { "..."_s }`
+  is such a global, its bytes made when the program starts);
+- a reference to a scalar local returned by a constexpr function
+  (`std::forward<int>(n)`): std::make_tuple of integers computes nothing;
+- a member's `requires (decltype(f<T>(0))::value)` reads the member's
+  body too early (`undeclared identifier`); WTF's traits are classes, so
+  WebCore does not meet it.
+
 ## What is next
 
 - libsoup: done (mlx-soup). Every unit includes its headers; the units
