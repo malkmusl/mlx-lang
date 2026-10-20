@@ -7,7 +7,7 @@ as FreeType 2.13 reads and renders them, to the bit (outlines, metrics,
 advances, every rendered pixel). It needs no C library: it is plain Mlx,
 and it runs unchanged on x86_64 and on aarch64 (Android). FreeType's C
 API for C and C++ programs (WebKit's Skia and WebCore) is a layer over
-it, `compiler/capi/freetype` (`libmlxfreetype.so`, see its README).
+it, `compiler/libc/freetype` (`libmlxfreetype.so`, see its README).
 
 It has two levels: a `Font` with its `Atlas` and `Run`s, for drawing
 lines of text, and the engine under it, for everything else.

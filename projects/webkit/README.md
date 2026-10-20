@@ -3,7 +3,7 @@
 WPE WebKit and the libraries it needs, built with this repository's own
 toolchain alone: `./mlx build` (build.mlx, std.build) declares the steps,
 mlx-cc compiles every C and C++ file, mlx-ar makes the archives, the
-Mlx compiler's linker links, mlxlibcpp and mlx-unicode (compiler/capi/icu,
+Mlx compiler's linker links, mlxlibcpp and mlx-unicode (compiler/libc/icu,
 ICU's C API over std.unicode) are the libraries WebKit runs on. What WebKit's
 CMake build makes with Perl, Python, Ruby and gperf is made here by
 programs written in Mlx (generators/), and their output is that of
@@ -15,7 +15,7 @@ with `Source/`), by default /home/user/csrc/wpe/wpewebkit-2.54.1.
 Two of WebKit's ports are built, by the same steps from a description
 of each (`Port` in build.mlx): JSCOnly (JavaScriptCore alone, the
 generic event loop) and WPE, whose lower layers stand on GLib, GObject
-and GIO, here mlx-glib (compiler/capi/glib).
+and GIO, here mlx-glib (compiler/libc/glib).
 
     ./mlx build webkit-bmalloc        bmalloc and libpas (libbmalloc.a)
     ./mlx build webkit-wtf            WTF, the JSCOnly port, on mlx-unicode (libWTF.a)
@@ -131,7 +131,7 @@ check_wpe_jsc.sh still fails on it.
 | `WEBCORE.md` | WebCore for WPE: the libraries it needs and what this repository has of them, and how far mlx-cc compiles it |
 | `generators/` | WebKit's code generators in Mlx (below) |
 | `tests/` | Programs of the WPE port and what they print: `wtf-wpe.cpp` (WTF), `jsc-glib.c` (JavaScriptCore's GLib API), `wpe.js` (for its jsc); `jsc/`, scripts for the JSCOnly jsc on mlxlibc |
-| `PORT.md` | The Mlx port of WebKit (PlatformMlx): its design, milestones, and what of compiler/capi and the WPE port it retires |
+| `PORT.md` | The Mlx port of WebKit (PlatformMlx): its design, milestones, and what of the C API shims (compiler/libc) and the WPE port it retires |
 
 ## The generators
 
@@ -191,5 +191,5 @@ and libANGLE.a and libGLESv2.a are made. Four include `<zlib.h>`
 third_party/zlib/google/compression_utils_portable.cc use zlib's deflate
 and inflate streams): theirs are mlx-zlib's headers
 (mlx-out/include/mlx-zlib, made by the step zlib-headers;
-compiler/capi/zlib, over std.flate), and the program linking ANGLE
+compiler/libc/zlib, over std.flate), and the program linking ANGLE
 links mlx-out/lib/libmlxz.so.

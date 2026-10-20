@@ -148,10 +148,10 @@ alone.
 Since PulseAudio apps do not come through the bus, the session starts
 mlx-audiod with it (`mlx-ipcd --start org.mlx.Audio`). The libraries
 they load to speak the protocol are Mlx too
-([`compiler/capi/pulse`](../../../compiler/capi/pulse/README.md): libpulse.so.0,
+([`compiler/libc/pulse`](../../../compiler/libc/pulse/README.md): libpulse.so.0,
 libpulse-simple.so.0, libpulse-mainloop-glib.so.0). ALSA programs
 (aplay, arecord, games that open `default`) reach it through ALSA's
-pulse plugin, MLX Audio's own (`compiler/capi/pulse/alsa.mlx`):
+pulse plugin, MLX Audio's own (`compiler/libc/pulse/alsa.mlx`):
 [`asound.conf.in`](asound.conf.in) makes it ALSA's default device.
 
 ### Replacing PipeWire and PulseAudio

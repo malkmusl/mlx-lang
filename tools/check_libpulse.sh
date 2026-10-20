@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MLX Audio's client libraries (compiler/capi/pulse, built by
+# MLX Audio's client libraries (compiler/libc/pulse, built by
 # tools/build_libpulse.sh) as the stand-ins for PulseAudio's:
 #
 #   - each library exports what PulseAudio's does (when those are installed

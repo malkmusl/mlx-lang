@@ -301,7 +301,7 @@ native protocol (the version, the packet descriptor, the commands, the
 errors, the subscription facilities) and `std.pulse.tagstruct` writes and
 reads the tagstructs its commands are made of, into a buffer or (for a
 client library) into memory that grows; MLX Audio's server
-(`projects/desktop/audio`) and its libpulse (`compiler/capi/pulse`) are
+(`projects/desktop/audio`) and its libpulse (`compiler/libc/pulse`) are
 the two ends that use them.
 `std.pipewire` (`std/src/pipewire.mlx`) has the numbers of PipeWire's
 native protocol (the core's, client's, registry's and client node's
@@ -309,7 +309,7 @@ methods and events, SPA's params, IO areas, commands, formats, buffer
 data and struct pw_node_activation's layout) and `std.pipewire.pod`
 writes and reads the SPA pods its messages are made of; MLX Capture's
 server (`projects/desktop/capture`) and its libpipewire
-(`compiler/capi/pipewire`) are the two ends that use them.
+(`compiler/libc/pipewire`) are the two ends that use them.
 
 `std.jpeg` (`std/src/jpeg.mlx`) encodes premultiplied ARGB words as
 baseline JPEG (4:2:0, standard tables scaled by a quality of 1 to 100,
@@ -407,7 +407,7 @@ header it reads, and `message(&inflater.stream)` words what was wrong
 is 8 KiB of stack). `inflate` (raw data), `gunzip` and `gzipSize` are the
 earlier one-call forms. The engine itself (`std.flate.deflate`,
 `std.flate.inflate`, on a `Stream` with zlib's return codes) is what the
-zlib C API, `compiler/capi/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
+zlib C API, `compiler/libc/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
 programs), is made of. `tests/343_flate_runtime.mlx` checks zlib's bytes,
 round trips in every format and in pieces, and damaged data.
 
@@ -989,7 +989,7 @@ spaces and tabs, stops at the padding, and refuses (or, with
 `ignoreGarbage`, skips) bytes outside the alphabet. `hexEncode` writes
 lower-case hex, the way digests are printed, and `hexDecode` reads hex
 of either case. The coreutils `base64`, `base32` and `basenc` and GLib's
-`g_base64_*` (`compiler/capi/glib/strings.mlx`) use it.
+`g_base64_*` (`compiler/libc/glib/strings.mlx`) use it.
 
 ```mlx
 const base64 = @import("std.base64")
@@ -1214,7 +1214,7 @@ const length = spawn.capture(&options, true, &output, 4096, &status)
 
 **Implementation:** `std/src/fontconfig.mlx` and `std/src/fontconfig/`
 **Source tests:** `373_fontconfig_runtime.mlx` (run by `tests/run_std_modules.sh`);
-`tools/check_fontconfig.sh` for the C API over it (compiler/capi/fontconfig)
+`tools/check_fontconfig.sh` for the C API over it (compiler/libc/fontconfig)
 
 Fontconfig 2.15's font matching without a C library: `load.current()`
 reads fonts.conf and what it includes (or Fontconfig's fallback
@@ -1495,6 +1495,52 @@ a public std.Thread handle, stack policy, or error-propagation model." See
 above for what's actually exercised — `getTid`/`yield`/`futexWait`/
 `futexWake` through the raw syscall gateway, not a handle-based spawn/join
 API. No fixture calls `clone`/`clone3` to actually spawn an OS thread.
+
+## HTTP (`std.http.*`)
+
+**Normative source:** none yet (the modules follow libsoup's behaviour,
+which WebKit's network code expects; `tools/check_soup.sh` compares the C
+shim over them with libsoup 3.4)
+
+`std/src/http/` holds HTTP's pieces that do not depend on how bytes move:
+`std.http.headers` (header lists, q-values, parameters, the names libsoup
+knows), `std.http.date`, `std.http.status`, `std.http.form`,
+`std.http.chunked`, `std.http.sniff`, `std.http.psl` (the Public Suffix
+List), `std.http.cookie` and `std.http.websocket` (see `std/src/README.md`
+for each). Tests 370 and 371 cover them.
+
+### Authentication (`std.http.auth`)
+
+`std/src/http/auth.mlx` is HTTP authentication (RFC 7235) as libsoup does
+it, allocating nothing:
+
+- `challenges(header)` and `nextChallenge(&it, &challenge)` tell the
+  challenges of a `WWW-Authenticate` or `Proxy-Authenticate` value apart
+  (an item that is a scheme alone, or a scheme and its first parameter,
+  starts one); `schemeIs(challenge, "Digest")`, `paramsOf(challenge,
+  scheme)`, and `findParam(params, name, out, &length)` (the first of
+  that name, unquoted; `Found.bare` for a name alone).
+- Basic (RFC 7617): `basicToken(user, password, out)` (the base64 of
+  `user:password`, in ISO-8859-1 when every character has a code there,
+  as libsoup's `g_convert` makes it; `basicTokenRoom` sizes `out`),
+  `writeBasic(sink, token)`, `basicSpace(path)` (the directory a Basic
+  realm covers).
+- Digest (RFC 7616, MD5 and MD5-sess, `qop=auth`): `digestChallenge(params,
+  &d)` reads a `DigestChallenge` (realm, nonce, opaque, domain, algorithm,
+  the qop options, stale; false when it cannot be answered), `hexUrp`,
+  `hexA1`, `digestResponse(method, uri, &a1, qopAuth, nonce, cnonce, nc,
+  &out)` (RFC 2617's request-digest), `clientNonce`, `nonceCountHex` and
+  `nonceCountOf`, `writeDigest(sink, &credentials)` (the Authorization
+  value as libsoup writes it: `username`, `realm`, `nonce`, `uri`,
+  `algorithm`, `response`, `opaque`, `cnonce`, `nc`, `qop`),
+  `nextDomainItem` and `withoutTrailingSlash` for a challenge's `domain`.
+  A server checks a response with the same `digestResponse`.
+
+`tests/376_http_auth_runtime.mlx` checks RFC 2617's example (Mufasa's
+response `6629fae49393a05397450978507c4ef1`), RFC 7617's token, the
+challenge splitting and the written values; mlx-soup's `SoupAuthBasic`,
+`SoupAuthDigest`, auth manager and auth domains (compiler/libc/soup) are
+over it.
 
 ## Networking (`std.net`) — not yet normative
 

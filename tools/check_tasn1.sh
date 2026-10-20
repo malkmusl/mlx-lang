@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# mlx-tasn1, libtasn1's C API in Mlx (compiler/capi/tasn1):
+# mlx-tasn1, libtasn1's C API in Mlx (compiler/libc/tasn1):
 #
 #   - `./mlx build tasn1` builds the library (libmlxtasn1.so) and its
 #     header: mlx-cheaders makes mlx-out/include/mlx-tasn1/libtasn1.h of
-#     the API's Mlx module (compiler/capi/tasn1/api);
+#     the API's Mlx module (compiler/libc/tasn1/api);
 #   - every function the header declares is in the library;
 #   - the header compiles as C and as C++;
 #   - tests/tasn1.c, built by mlx-cc against the library, prints what
@@ -26,13 +26,13 @@ trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-tasn1
 library=mlx-out/lib/libmlxtasn1.so
-tests=compiler/capi/tasn1/tests
+tests=compiler/libc/tasn1/tests
 
 ./mlx build -j 1 cc tasn1 > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build tasn1"; }
 echo "ok   ./mlx build tasn1"
 
 # Every `pub extern("c") fn` of the API module is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/tasn1/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/tasn1/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the header declares are not in the library"; }

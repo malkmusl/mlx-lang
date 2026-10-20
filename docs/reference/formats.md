@@ -206,7 +206,7 @@ spa_log_level pw_log_level` in PipeWire's headers) to a word holding the
 value, which C code reads and may write. To Mlx the constant stays a
 compile-time value; a library that has to read the word as C sees it finds
 it through the dynamic linker (`tests/support/plugin_library.mlx`,
-`mlx_plugin_level_now`; `compiler/capi/pipewire` exports
+`mlx_plugin_level_now`; `compiler/libc/pipewire` exports
 `pw_log_level` and `PW_LOG_TOPIC_DEFAULT` this way). A dynamically linked
 executable gets the symbol too; a static one has no dynamic symbols.
 
@@ -254,7 +254,7 @@ every import unversioned (`.gnu.version`, `DT_VERSYM`, `DT_VERDEF`,
 `DT_VERDEFNUM`). A library standing in for another needs both: programs
 linked against a versioned library ask for its symbols at their version,
 and glibc's loader stops a program whose versioned reference lands on an
-unversioned definition. `compiler/capi/pulse` builds
+unversioned definition. `compiler/libc/pulse` builds
 `libpulse.so.0` with `--soname=libpulse.so.0 --symbol-version=PULSE_0`,
 as PulseAudio's. `tests/run_foreign.sh` finds a plugin's export at its
 version with `dlvsym` (and not at another).

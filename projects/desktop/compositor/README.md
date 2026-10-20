@@ -1429,7 +1429,7 @@ have its size, a no shares nothing, Share in the picker shares, and with
 Firefox (`FIREFOX=PATH`) a page's `getDisplayMedia` shows the screen.
 
 The library the apps take the frames with has an Mlx stand-in too:
-[`compiler/capi/pipewire`](../../../compiler/capi/pipewire/README.md) builds
+[`compiler/libc/pipewire`](../../../compiler/libc/pipewire/README.md) builds
 `libpipewire-0.3.so.0` (every function of libpipewire 1.0.5, PipeWire's
 protocol on the portal's socket), so PipeWire's `libpipewire-0.3-0` is not
 needed for sharing either; `tools/install_compositor_session.sh

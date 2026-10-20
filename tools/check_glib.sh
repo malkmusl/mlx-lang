@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# mlx-glib, GLib, GObject and GIO with GLib's C API in Mlx (compiler/capi/glib):
+# mlx-glib, GLib, GObject and GIO with GLib's C API in Mlx (compiler/libc/glib):
 #
 #   - `./mlx build glib` builds the library (libmlxglib.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-glib/**/*.h of the
-#     API's Mlx modules (compiler/capi/glib/api);
+#     API's Mlx modules (compiler/libc/glib/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++: glib.h, glib-object.h, glib-unix.h,
 #     glib/gstdio.h, gio/gio.h and gobject/gvaluecollector.h together;
@@ -62,7 +62,7 @@ library=mlx-out/lib/libmlxglib.so
 echo "ok   ./mlx build glib"
 
 # Every `pub extern("c") fn` of the API modules is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/glib/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/glib/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }
@@ -81,11 +81,11 @@ echo "ok   the headers together in C and C++"
 
 mkdir -p "$work/run"
 for test in strings mainloop variant uri gobject system gio collect options network tls streams extras; do
-    cc "compiler/capi/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
+    cc "compiler/libc/glib/tests/$test.c" -o "$work/$test" "$library" || fail "tests/$test.c does not build"
     status=0
     (cd "$work/run" && run "$work/$test") > "$work/$test.out" 2> "$work/$test.err" || status=$?
     echo "exit $status" >> "$work/$test.out"
-    diff -u "compiler/capi/glib/tests/$test.expected" "$work/$test.out" || { cat "$work/$test.err"; fail "tests/$test.c prints otherwise"; }
+    diff -u "compiler/libc/glib/tests/$test.expected" "$work/$test.out" || { cat "$work/$test.err"; fail "tests/$test.c prints otherwise"; }
     echo "ok   tests/$test.c"
 done
 
@@ -110,12 +110,12 @@ else
         sleep 0.05
     done
     status=0
-    cc compiler/capi/glib/tests/tls_handshake.c -o "$work/tls_handshake" "$library" || { kill "$tls13_server" "$tls12_server"; fail "tests/tls_handshake.c does not build"; }
+    cc compiler/libc/glib/tests/tls_handshake.c -o "$work/tls_handshake" "$library" || { kill "$tls13_server" "$tls12_server"; fail "tests/tls_handshake.c does not build"; }
     (cd "$work/run" && run timeout 120 "$work/tls_handshake" "$port" "$((port + 1))" "$work/certs") > "$work/tls_handshake.out" 2> "$work/tls_handshake.err" || status=$?
     echo "exit $status" >> "$work/tls_handshake.out"
     kill "$tls13_server" "$tls12_server" 2> /dev/null || true
     wait "$tls13_server" "$tls12_server" 2> /dev/null || true
-    diff -u compiler/capi/glib/tests/tls_handshake.expected "$work/tls_handshake.out" || { cat "$work/tls_handshake.err"; fail "tests/tls_handshake.c prints otherwise"; }
+    diff -u compiler/libc/glib/tests/tls_handshake.expected "$work/tls_handshake.out" || { cat "$work/tls_handshake.err"; fail "tests/tls_handshake.c prints otherwise"; }
     echo "ok   tests/tls_handshake.c"
 fi
 
@@ -132,7 +132,7 @@ else
     {
         echo '#ifndef CMAKECONFIG_H'
         echo '#define CMAKECONFIG_H'
-        sed 's/^/#define /' compiler/capi/glib/tests/wtf/wpe-config.txt
+        sed 's/^/#define /' compiler/libc/glib/tests/wtf/wpe-config.txt
         echo '#endif'
     } > "$work/config/cmakeconfig.h"
     wtf=$webkit/Source/WTF
@@ -153,7 +153,7 @@ else
             head -20 "$object.log" >&2
             failed=1
         fi
-    done < compiler/capi/glib/tests/wtf/files.txt
+    done < compiler/libc/glib/tests/wtf/files.txt
     [ "$failed" = 0 ] || fail "WTF's GLib sources do not all compile"
 fi
 

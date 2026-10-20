@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mlx-libwebp, libwebp's C API (compiler/capi/webp, over std.webp):
+# mlx-libwebp, libwebp's C API (compiler/libc/webp, over std.webp):
 #
 #   - `./mlx build webp` builds the library (libmlxwebp.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-webp/webp/decode.h,
 #     demux.h, encode.h, mux.h, mux_types.h and types.h of the API's Mlx
-#     modules (compiler/capi/webp/api);
+#     modules (compiler/libc/webp/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++, and the structures laid out as the
 #     system's headers lay them out (tests/layout.c, where there is gcc
@@ -45,12 +45,12 @@ trap '[ -n "${KEEP:-}" ] || rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-webp
 library=mlx-out/lib/libmlxwebp.so
-tests=compiler/capi/webp/tests
+tests=compiler/libc/webp/tests
 
 ./mlx build -j 1 cc webp > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build webp"; }
 echo "ok   ./mlx build webp"
 
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/webp/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/webp/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }
@@ -102,7 +102,7 @@ else
         echo "skip the larger corpus: no Python with Pillow"
     else
         gcc -O1 -w "$tests/corpus.c" -o "$work/corpus-make" -lwebpmux -lwebp || fail "tests/corpus.c does not build against the system's libwebp"
-        python3 "$tests/sources.py" "$work/sources" compiler/capi/jpeg/tests/images/progressive420.jpg || fail "tests/sources.py"
+        python3 "$tests/sources.py" "$work/sources" compiler/libc/jpeg/tests/images/progressive420.jpg || fail "tests/sources.py"
         mkdir -p "$work/corpus"
         for source in "$work"/sources/*.rgba; do
             name=$(basename "$source" .rgba)

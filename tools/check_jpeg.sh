@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mlx-libjpeg, libjpeg's C API (compiler/capi/jpeg, over std.jpeg):
+# mlx-libjpeg, libjpeg's C API (compiler/libc/jpeg, over std.jpeg):
 #
 #   - `./mlx build jpeg` builds the library (libmlxjpeg.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-jpeg/jpeglib.h,
 #     jerror.h, jconfig.h and jmorecfg.h of the API's Mlx modules
-#     (compiler/capi/jpeg/api);
+#     (compiler/libc/jpeg/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++, and the structures laid out as the
 #     system's jpeglib.h lays them out (tests/layout.c, where there is
@@ -38,13 +38,13 @@ trap '[ -n "${KEEP:-}" ] || rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-jpeg
 library=mlx-out/lib/libmlxjpeg.so
-tests=compiler/capi/jpeg/tests
+tests=compiler/libc/jpeg/tests
 runs=("webkit 0" "webkit 7" "rgba" "gray" "plain" "crop" "raw" "multi" "scale")
 
 ./mlx build -j 1 cc jpeg > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build jpeg"; }
 echo "ok   ./mlx build jpeg"
 
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/jpeg/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/jpeg/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }

@@ -15,7 +15,7 @@ uses `std.wayland` plus generated protocol modules.
 namespaces, libxml2's SAX2 push parser in Mlx (its events, errors and
 quirks; DTD entities and attribute defaults; UTF-8, UTF-16, Latin-1 and
 std.unicode.charmaps' encodings), on `xml/text.mlx`, `xml/encoding.mlx`
-and `xml/uri.mlx`; compiler/capi/xml2 is libxml2's C API made of it.
+and `xml/uri.mlx`; compiler/libc/xml2 is libxml2's C API made of it.
 `wayland.mlx` (`std.wayland`) and `wayland/` contain the protocol parser,
 the materializer, the wire format, the Linux transport, and the client and
 server runtimes. `wayland/generated/` holds the modules materialized from
@@ -70,14 +70,16 @@ the standards' vectors.
 
 `http/` (`std.http.*`) is HTTP's pieces that do not depend on how bytes
 move, written to answer as libsoup does for mlx-soup
-(compiler/capi/soup): `http/headers.mlx` (header lists, tokens,
+(compiler/libc/soup): `http/headers.mlx` (header lists, tokens,
 q-values, parameters with RFC 5987's form, the names libsoup knows),
 `http/date.mlx` (HTTP's and cookies' date forms), `http/cookie.mlx`
 (Set-Cookie's syntax, RFC 6265), `http/status.mlx` (reason phrases),
 `http/form.mlx` (application/x-www-form-urlencoded),
 `http/chunked.mlx` (the chunked coding's size lines),
 `http/sniff.mlx` (MIME sniffing, the WHATWG standard's rules),
-`http/websocket.mlx` (RFC 6455's keys, frame headers, masking, UTF-8)
+`http/websocket.mlx` (RFC 6455's keys, frame headers, masking, UTF-8),
+`http/auth.mlx` (RFC 7235's challenges told apart, Basic tokens, Digest
+responses and Authorization values; test 376)
 and `http/psl.mlx` with `http/psldata.mlx` (the Public Suffix List, made
 by `./mlx build http-psl` from `std/registry/publicsuffix`). Tests 370
 and 371 check them.
@@ -89,7 +91,7 @@ it read each other's files; SQL as SQLite parses, plans and evaluates it
 (values, affinities, collations, constraints, foreign keys, savepoints,
 the built-in functions, the authorizer); and connections and prepared
 statements as SQLite's C API presents them. mlx-sqlite3
-(compiler/capi/sqlite3) is that C API over it, for WebKit's databases;
+(compiler/libc/sqlite3) is that C API over it, for WebKit's databases;
 test 372 and `tools/check_sqlite.sh` check it.
 
 `crypt.mlx` (`std.crypt`) checks a password against the hashes of
@@ -114,7 +116,7 @@ queue, dma-buf and host-memory sharing), with `gpu/shaders.mlx`
 `truetype.mlx` (`std.truetype`) and `truetype/` are the font engine:
 TrueType and OpenType (CFF, CFF2) fonts, variable and color fonts, read
 and rendered as FreeType 2.13 does it; its `Font`, `Atlas` and `Run` lay
-out and draw lines of text. FreeType's C API (`compiler/capi/freetype`)
+out and draw lines of text. FreeType's C API (`compiler/libc/freetype`)
 is a layer over it; see `docs/reference/truetype.md`.
 
 `ui.mlx` (`std.ui`) has layout building blocks for pixel user interfaces:
@@ -135,7 +137,7 @@ locale data in Mlx: `std.unicode.utf` (UTF-8 and UTF-16, no tables),
 `collation/`), `.idna`, `.charsets`, `.locale` (with `locale/`),
 `.calendar` (with `calendar/`) and `.format` (`format/`: number, plural,
 date, list, reltime), each with a native API (UTF-8 slices, allocators,
-`unicode.Error`) beside ICU's functions, which `compiler/capi/icu` exports
+`unicode.Error`) beside ICU's functions, which `compiler/libc/icu` exports
 to C as `libmlxunicode.so`. `timezone/database.mlx`
 (`std.timezone.database`) is the IANA time zone database built in
 (`timezone/tzdata.mlx`). Their tables (`unicode/tables.mlx`,

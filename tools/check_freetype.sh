@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mlx-freetype, FreeType 2's C API in Mlx (compiler/capi/freetype) over
+# mlx-freetype, FreeType 2's C API in Mlx (compiler/libc/freetype) over
 # std.truetype's font engine (std/src/truetype):
 #
 #   - `./mlx build freetype` builds the library (libmlxfreetype.so) and
 #     the headers: mlx-cheaders makes mlx-out/include/mlx-freetype of the
-#     API's Mlx modules (compiler/capi/freetype/api), <ft2build.h> and
+#     API's Mlx modules (compiler/libc/freetype/api), <ft2build.h> and
 #     <freetype/...> as FreeType names them;
 #   - every function the headers declare is in the library;
 #   - the headers, every FT_*_H of them, in C and in C++;
@@ -64,7 +64,7 @@ trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-freetype
 library=mlx-out/lib/libmlxfreetype.so
-tests=compiler/capi/freetype/tests
+tests=compiler/libc/freetype/tests
 update=0
 [ "${1:-}" = "--update" ] && update=1
 
@@ -120,7 +120,7 @@ fi
 echo "ok   ./mlx build freetype"
 
 # Every `pub extern("c") fn` of the API modules is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/freetype/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/freetype/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# mlx-xml2, libxml2's C API (compiler/capi/xml2, over std.xml.sax):
+# mlx-xml2, libxml2's C API (compiler/libc/xml2, over std.xml.sax):
 #
 #   - `./mlx build xml2` builds the library (libmlxxml2.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-xml2/libxml/*.h of
-#     the API's Mlx modules (compiler/capi/xml2/api);
+#     the API's Mlx modules (compiler/libc/xml2/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++, and a program linked with the library;
 #   - tests/layout.c: the structures' sizes and the offsets WebKit reads
@@ -41,12 +41,12 @@ trap '[ -n "${KEEP:-}" ] || rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-xml2
 library=mlx-out/lib/libmlxxml2.so
-tests=compiler/capi/xml2/tests
+tests=compiler/libc/xml2/tests
 
 ./mlx build -j 1 cc xml2 > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build xml2"; }
 echo "ok   ./mlx build xml2"
 
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/xml2/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/xml2/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }

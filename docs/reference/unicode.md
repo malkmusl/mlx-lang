@@ -11,9 +11,9 @@ and the IDNA mapping table, its locale data from CLDR 48, its time zones
 (`std.timezone.database`) from the IANA database 2026c.
 
 The same implementation is ICU's C API for C and C++ programs:
-`compiler/capi/icu` exports each part's ICU functions as
+`compiler/libc/icu` exports each part's ICU functions as
 `libmlxunicode.so`, with headers made of Mlx modules
-([its README](../../compiler/capi/icu/README.md), which also has the
+([its README](../../compiler/libc/icu/README.md), which also has the
 conformance results and what is not done yet). WebKit's JavaScriptCore
 runs its `Intl` on it.
 
@@ -52,7 +52,7 @@ fn example(allocator: unicode.utf.Allocator) -> unicode.Error!void {
   `charsets.detect`).
 - Each part also keeps ICU's functions under ICU's names (`u_charType`,
   `ucol_strcoll`, `udat_format`...) with C's types: UTF-16 text and
-  `UErrorCode` by address, C strings. They are what `compiler/capi/icu`
+  `UErrorCode` by address, C strings. They are what `compiler/libc/icu`
   exports; Mlx programs use the native functions.
 - `std.unicode.utf` needs neither tables nor the C library. The other
   parts keep their working memory in the C library's heap, so a program
@@ -159,7 +159,7 @@ generated modules of it, as `std/registry/vulkan` does for `std.vulkan`:
 | `uca/` | The Collation Algorithm's table (DUCET) and its tests |
 | `idna/` | The IDNA mapping table and its tests |
 | `cldr/` | CLDR 48 (JSON): likely subtags, aliases, BCP 47 keys and types, ISO codes, available locales; `packages/`: CLDR's npm packages (core, dates, numbers, misc, locale names, units, the calendars other than the Gregorian); `collation/`: CLDR 48's collation data (XML) and the root's radical-stroke order of Han (`radicals.txt`) |
-| `generate.mlx` | `unicode-generate UCD TABLES API`: `std/src/unicode/tables.mlx` and `compiler/capi/icu/api/ugenerated.mlx` (the scripts and blocks C sees) |
+| `generate.mlx` | `unicode-generate UCD TABLES API`: `std/src/unicode/tables.mlx` and `compiler/libc/icu/api/ugenerated.mlx` (the scripts and blocks C sees) |
 | `cldrgenerate.mlx` | `cldr-generate CLDR OUT`: `std/src/unicode/locale/data.mlx` |
 | `collationgenerate.mlx` | `collation-generate OUT RADICALS XML...`: `std/src/unicode/collation/rules.mlx` |
 | `cldrdata.mlx` | `cldr-data PACKAGES OUT`: `mlx-out/share/mlx-unicode/cldr.dat`, the formatters' data: each locale's keys and values where they differ from its parent's |
