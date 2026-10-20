@@ -133,6 +133,7 @@ run 372_sql_runtime "SQLite's reals and numbers, WebKit's SQL parsed, GROUP BY, 
 run 373_colorprofile_runtime "ICC transforms as Little CMS makes them: BGRA to sRGB, grey, 16-bit, perceptual; the sRGB curve"
 run 374_xml_sax_runtime "XML parsed as libxml2's push parser parses it: SAX2 events, entities, errors, chunks, encodings"
 run 375_fontconfig_runtime "Fontconfig's case folding, names and substitutions; fonts read, cached, matched, sorted and listed as Fontconfig 2.15 does"
+run 376_http_auth_runtime "HTTP authentication: challenges told apart, Basic tokens, Digest responses (RFC 2617's example) and Authorization values"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
