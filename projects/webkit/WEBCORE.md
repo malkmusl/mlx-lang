@@ -322,6 +322,16 @@ compiler/cc/tests/cpp (the WebCore place that met it in the commit):
 | a reference member given `{ }` binds to a temporary living with the block (`.symbolTable = { }` of CSSCalc::EvaluationOptions) | refmemberbrace |
 | argument-dependent lookup sees the namespaces of base classes (`map(styleProperties, f)` finds WTF::map through RefCounted) | adlbase |
 | deduction from an overloaded function's name takes the one overload the pattern deduces from (`typeFromVector(values, addTypes)`) | overloadsetdeduce |
+| `V v(P(&x, y))` initializes v with a temporary, not a function declaration (CompositeEditCommand's VisiblePosition) | ctorparen |
+| a class with a constructor template declared is not default constructible (`RectEdges<K>() requires is_default_constructible_v<K>`) | requiresdefault2 |
+| std::reduce of a range alone, and with a binary operation (grid layout) | reducerange |
+| the copy deduction candidate of a class template whose constructors give no guide (`WeakHashSet registrations { m_registrations }`) | ctadcopy |
+| a conversion operator defined outside its class names its type in the class's scope (`ImageDataArray::operator DataVariant() const`) | conversionalias |
+| `if (T { a } != T { b })` declares nothing (InlineInvalidation) | bracedcompare |
+| a lambda capturing nothing names an outer local in decltype (RuleFeature's addMap) | unevaluatedcapture |
+| std::ranges::find_if with a pointer to member function; ranges::min and max with a comparison and a projection (Skia's texture atlas, text extraction) | rangesprojected |
+| a generic lambda names the static locals of the function around it (DocumentLoader's nextIconCallbackID) | localstaticlambda |
+| a braced default argument is read in the scope it was declared in (Layout::ElementBox's `{ ElementBoxFlag }`) | basedefaultenum |
 
 What the pass found and did not fix:
 
@@ -336,7 +346,37 @@ What the pass found and did not fix:
   (`std::forward<int>(n)`): std::make_tuple of integers computes nothing;
 - a member's `requires (decltype(f<T>(0))::value)` reads the member's
   body too early (`undeclared identifier`); WTF's traits are classes, so
-  WebCore does not meet it.
+  WebCore does not meet it;
+- a generic lambda's body read to deduce its return type does not see
+  its own statements: `component.percentage->value` on a
+  `std::optional` member fails there (`(*component.percentage).value`,
+  an explicit `-> T` return type, or a parameter of the class's type
+  compiles; CSSColorMixResolver.cpp);
+- nested braces given to an overloaded member function, `setFamilies({
+  { "system-ui"_s, FontFamilyKind::Generic } })` beside an overload
+  taking `Ref<RefCountedFixedVector<FontFamily>> &&`: the Ref overload
+  is tried and fails (a free function, or the Vector overload alone,
+  takes them; InspectorOverlayLabel, RenderListMarker);
+- the interpreter reads no bit-field of a class object: `static_assert(
+  RareDataBitFields { ... }.connectedSubframeCount == ...)` of Node.cpp;
+- `registerProperty<SVGNames::inAttr, &SVGFEConvolveMatrixElement::m_in1>()`
+  of the SVG elements (SVGPropertyOwnerRegistry's overloaded static
+  member templates, one with a type parameter between two values) is
+  "expected a type as the template argument"; a reduction with the same
+  shape compiles, so the cause is not found yet (four svg units);
+- VTTScanner's `collectWhile<isASCIIDigit>()`, a function-type template
+  parameter given a constrained function template and passed on to
+  `Latin1CharacterPredicateAdapter<characterPredicate>`: the same message,
+  the same state (html-42);
+- `for (auto [a, b] : zippedRange(...))` with placement new of an
+  Attribute (ElementData.cpp): "no matching constructor for Attribute"
+  (dom-9), unreduced;
+- and what is not the compiler's: TransformationMatrix.cpp's SSE
+  intrinsics (`_mm_load_pd`, no <emmintrin.h> in mlx-cc), ICUSearcher's
+  unorm2_getNFCInstance and LocaleToScriptMapping's USCRIPT_MANDAEAN
+  (mlx-unicode has neither), SharedMemoryUnix's <linux/memfd.h>
+  (config.MLX says HAVE_LINUX_MEMFD_H as JSCOnly does; mlxlibc has no
+  such header).
 
 ## What is next
 
