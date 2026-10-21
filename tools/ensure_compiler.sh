@@ -728,6 +728,9 @@ rebuild_with() {
         rm -f "$next" "$fixed"
         return 1
     fi
+    # The compiler it replaces stays as $canonical.previous: the
+    # compiler's sources must stay what it builds (tools/check_bootstrap.sh).
+    if [[ -x $canonical && "$seed" == "$canonical" ]]; then cp -f "$canonical" "$canonical.previous"; fi
     mv "$fixed" "$canonical"
     rm -f "$next"
     return 0
