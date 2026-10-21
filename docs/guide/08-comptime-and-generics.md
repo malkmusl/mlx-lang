@@ -8,10 +8,11 @@
 `109_comptime_argument_runtime_dependency.mlx`, `110_generic_dependent_type_range.mlx`,
 `111_generic_type_return_runtime.mlx`, `112_comptime_if_pruning_runtime.mlx`,
 `171_imported_generic_runtime.mlx`, `support/generic_identity.mlx`,
-`386_generic_aggregate_runtime.mlx`, `397_generic_containers_runtime.mlx`,
+`408_generic_aggregate_runtime.mlx`, `397_generic_containers_runtime.mlx`,
 `398_generic_imported_runtime.mlx`, `support/generic_stack.mlx`,
 `401_generic_signature_types_runtime.mlx`, `402_generic_type_argument_runtime.mlx`,
-`405_generic_type_argument_error.mlx`, `406_generic_local_alias_runtime.mlx`
+`405_generic_type_argument_error.mlx`, `406_generic_local_alias_runtime.mlx`,
+`407_generic_nested_types_runtime.mlx`
 
 Mlx has no separate template/macro system. Generics are ordinary functions
 whose parameters (or whose parameter *types*) are known at compile time,
@@ -161,7 +162,7 @@ fn main() -> u8 {
 }
 ```
 
-(`tests/386_generic_aggregate_runtime.mlx`, abridged; the file holds the
+(`tests/408_generic_aggregate_runtime.mlx`, abridged; the file holds the
 checks)
 
 The body of such a function is constants, `if`s whose condition is known
@@ -193,6 +194,16 @@ call need not be a name: `leaf(@childType(T), a[0], b[0])`, a constant
 bound to `@childType(T)`, `@typeOf(a[0])`, and locals declared `const x:
 @childType(T) = a[at]` all name the type they resolve to, evaluated in the
 caller's own instance (`tests/402_generic_type_argument_runtime.mlx`).
+
+An aggregate nested in the returned one (`pub const Entry = struct {
+key: *K, value: *V }`, an iterator `pub const Iterator = struct { ... }`)
+sees the parameters, and its own `Self` is itself; to name the outer type
+from inside it, give that a name first (`pub const Table = Self`, then
+`table: *Table`). Outside, the nested types are named through the
+instance, `Table(u8, u32).Iterator`. A method may return several values,
+`-> (bool, ?*V)`, and methods taking `self: *Self` are called on a `var`
+(`tests/407_generic_nested_types_runtime.mlx`; the standard containers,
+`std.HashMap` and `std.ArrayList`, are written this way).
 
 Not supported: a generic type naming itself through a call inside its own
 body (`next: ?*List(T)`; write `?*Self`), and `var` declarations among an
