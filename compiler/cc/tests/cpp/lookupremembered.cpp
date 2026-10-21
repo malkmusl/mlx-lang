@@ -67,8 +67,39 @@ int pick(Y) { return 40; }
 int callPick1() { return pick(Y { }); }
 int callPick2() { return pick(A::X { }); }
 
+// What a name meant is forgotten when the scope around changes: a
+// using-directive in a block is dropped with the block; a lambda or a
+// local class sees the function's types through the suspended scopes;
+// a namespace entered again after names were declared into it.
+namespace Q { int w(int) { return 50; } }
+int w(long) { return 60; }
+int blockUsing(int n)
+{
+    int a = w(n);
+    int b = 0;
+    int c = w(n + 1);
+    if (n > 0) {
+        using namespace Q;
+        b = w(n);
+    }
+    return a * 10000 + b * 100 + c;
+}
+namespace R { struct Local { int x; }; }
+int lambdaSees(int n)
+{
+    struct Local { int y; };
+    auto f = [](int m) { Local l { m }; return l.y + sizeof(Local); };
+    auto g = [](int m) { R::Local l { m }; return l.x; };
+    return f(n) + g(n);
+}
+namespace N {
+int later() { return f() + callF1(); }
+}
+int laterUse() { return N::later(); }
+
 int main(int argc, char **argv)
 {
+    printf("%d %d %d\n", blockUsing(argc), (int)lambdaSees(argc), laterUse());
     printf("%d %d %d\n", N::callF1(), N::callF2(), N::Inner::callF3());
     printf("%d %d\n", N::Inner::callG1(), N::Inner::callG2());
     printf("%d %d %d\n", useH1(), useH2(), useK());
