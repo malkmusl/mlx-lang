@@ -270,15 +270,26 @@ units (lever 5), brings a WebCore unit under 2 GB resident.
 
 ### What remains (stages 3–5)
 
-1. The WebCore unit's time, with the new profile: `pendingOuterOf`,
-   `definePendingInstance` and `cached` gone, what is left is the name
-   lookup (`qualifiedKnown`/`lookup`/`headOf` 15% each with calls:
-   the scope chains, `findJoined`/`hashOn` 10%: joined-name interning
-   while mangling and building instance keys), the expression parser
-   over the headers' inline bodies, and `putText` (5%: the instance
-   keys and mangled names built byte by byte). A per-scope hash of the
-   bindings instead of the chain walk, and instance keys hashed from
-   their arguments instead of built as text, are the next two.
+1. The WebCore unit's time, with the profile of the last row (10880
+   samples, `mlxcc-v5-O3-*.profile`): `pendingOuterOf`,
+   `definePendingInstance` and `cached` gone, a quarter of the self
+   time is **joined-name interning**: `hashOn` 12.6%, `findJoined`
+   8.6%, `hashOf` 3.6% (with calls `findJoined` 23%), called from
+   `scope.qualifiedKnown` (30% with calls, 5.7% itself) for every
+   qualified name resolved by `declspec`/`isTypename`/
+   `readQualifiedTypedef` (65–70% with calls: every identifier in the
+   headers is looked up to tell a type from a value, by joining the
+   scope's prefix and the name into a text and hashing it); then
+   `putText` 7.8% (the joined names, instance keys and mangled names
+   built byte by byte), the token tests of the parser (`tokens.is`,
+   `cursor.isToken` 5%), `ast.make` 2.7% (first touch of the nodes'
+   pages), `scope.lookup`/`headOf` (27–31% with calls: the scope
+   chains). Class template instantiation is 42% with calls
+   (`instantiateClass`), the class bodies 52%. Next: a (prefix, name)
+   table in scope.qualifiedKnown instead of joining and interning a
+   text per lookup, then a per-scope hash of the bindings instead of
+   the chain walk, and instance keys hashed from their arguments
+   instead of built as text.
 2. Code made per function when its definition ends, with free lists
    for nodes, tokens and bindings (above): halves the peak of a unit
    and would let `-j 4` hold for WebCore on 15 GB.
