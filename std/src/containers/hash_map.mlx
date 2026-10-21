@@ -1,0 +1,449 @@
+// std.HashMap(K, V, Context), std.AutoHashMap(K, V), std.StringHashMap(V)
+// and std.AutoHashSet(K): hash tables of the standard library, generic
+// over their key and value types, in an allocator's memory, freed by the
+// language's drop when they go out of scope (`@noncopy(struct)` with
+// `deinit`).
+//
+//     var names = std.StringHashMap(u32).init(std.heap.allocator())
+//     _ = names.put("one", 1)
+//     if names.get("one") != null { ... }
+//     var entries = names.iterator()
+//     while entries.next() != null { ... }
+//     // names.deinit() runs where `names` goes out of scope
+//
+// Open addressing with linear probing over a power-of-two number of
+// slots: a metadata byte per slot (EMPTY, TOMBSTONE, or the hash's top
+// seven bits with the high bit set, so that most keys that do not match
+// are told apart without touching the key), the keys and the values in
+// arrays of their own. A map is grown by doubling (and rehashing) when
+// four fifths of its slots are used or tombstones; a table that is mostly
+// tombstones is rehashed at the same size.
+//
+// The Context is a type with `hash(self, key) -> u64` and
+// `eql(self, a, b) -> bool` (std.hash.StringContext, AutoContext(K)); a
+// map made with initContext carries an instance of it, which a context
+// with state (keys that live in a table of their own) needs.
+//
+// Out of memory is answered, not trapped: put, putNoClobber,
+// ensureTotalCapacity, clone and getOrPut say so (false, null).
+const std = @import("std")
+const hash_module = @import("std.hash")
+
+pub const Allocator = std.allocator.Allocator
+
+const EMPTY: u8 = 0
+const TOMBSTONE: u8 = 1
+const MIN_SLOTS: usize = 8
+
+// A value of no size, for the sets.
+pub const Nothing = struct {}
+
+// Keys of type K, by std.hash's autoHash and autoEql.
+pub fn AutoContext(comptime K: type) -> type {
+    return struct {
+        pub fn hash(self: Self, key: K) -> u64 { return hash_module.autoHash(K, key) }
+
+        pub fn eql(self: Self, a: K, b: K) -> bool { return hash_module.autoEql(K, a, b) }
+    }
+}
+
+pub fn HashMap(comptime K: type, comptime V: type, comptime Context: type) -> type {
+    return @noncopy(struct) {
+        metadata: [*]u8
+        keys: [*]K
+        values: [*]V
+        // Entries in the map, slots that may still be taken before a
+        // rehash, tombstones, and the slots (a power of two; 0: nothing
+        // allocated yet).
+        size: usize
+        available: usize
+        tombstones: usize
+        slots: usize
+        allocator: Allocator
+        context: Context
+
+        // An entry, by pointers into the map (valid until it changes).
+        pub const Entry = struct {
+            key: *K
+            value: *V
+        }
+
+        pub const Iterator = struct {
+            map: *const Self
+            index: usize
+
+            pub fn next(self: *Iterator) -> ?Entry {
+                while self.*.index < self.*.map.*.slots {
+                    const at = self.*.index
+                    self.*.index += 1
+                    if self.*.map.*.metadata[at] >= 128 {
+                        return Entry.{ .key = &self.*.map.*.keys[at], .value = &self.*.map.*.values[at] }
+                    }
+                }
+                return null
+            }
+        }
+
+        pub const KeyIterator = struct {
+            map: *const Self
+            index: usize
+
+            pub fn next(self: *KeyIterator) -> ?*K {
+                while self.*.index < self.*.map.*.slots {
+                    const at = self.*.index
+                    self.*.index += 1
+                    if self.*.map.*.metadata[at] >= 128 { return &self.*.map.*.keys[at] }
+                }
+                return null
+            }
+        }
+
+        pub const ValueIterator = struct {
+            map: *const Self
+            index: usize
+
+            pub fn next(self: *ValueIterator) -> ?*V {
+                while self.*.index < self.*.map.*.slots {
+                    const at = self.*.index
+                    self.*.index += 1
+                    if self.*.map.*.metadata[at] >= 128 { return &self.*.map.*.values[at] }
+                }
+                return null
+            }
+        }
+
+        pub fn init(allocator: Allocator) -> Self {
+            return Self.initContext(allocator, Context.{})
+        }
+
+        pub fn initContext(allocator: Allocator, context: Context) -> Self {
+            var keys: [*]K = undefined
+            var values: [*]V = undefined
+            unsafe {
+                keys = @ptrCast([*]K, emptyBytes())
+                values = @ptrCast([*]V, emptyBytes())
+            }
+            return Self.{
+                .metadata = emptyBytes(),
+                .keys = keys,
+                .values = values,
+                .size = 0,
+                .available = 0,
+                .tombstones = 0,
+                .slots = 0,
+                .allocator = allocator,
+                .context = context,
+            }
+        }
+
+        fn emptyBytes() -> [*]u8 {
+            unsafe { return @ptrFromInt([*]u8, 16) }
+        }
+
+        // The map's memory given back; the map is empty and usable again.
+        pub fn deinit(self: *Self) -> void {
+            self.*.clearAndFree()
+        }
+
+        // How many entries the map holds.
+        pub fn count(self: *const Self) -> usize { return self.*.size }
+
+        // How many entries it holds before it grows.
+        pub fn capacity(self: *const Self) -> usize { return self.*.slots * 4 / 5 }
+
+        fn fingerprintOf(hash: u64) -> u8 {
+            return @intCast(u8, (hash >> 57) | 128)
+        }
+
+        // The slot of `key`, or `slots` when it is not in the map.
+        fn find(self: *const Self, key: K, hash: u64) -> usize {
+            if self.*.slots == 0 { return 0 }
+            const mask = self.*.slots - 1
+            const fingerprint = fingerprintOf(hash)
+            var index = @intCast(usize, hash) & mask
+            while true {
+                const tag = self.*.metadata[index]
+                if tag == EMPTY { return self.*.slots }
+                if tag == fingerprint && Context.eql(self.*.context, self.*.keys[index], key) { return index }
+                index = (index + 1) & mask
+            }
+            return self.*.slots
+        }
+
+        // Where `key` would go: the first tombstone on its way, else the
+        // empty slot that ends it (the key must not be in the map).
+        fn placeFor(self: *const Self, hash: u64) -> usize {
+            const mask = self.*.slots - 1
+            var index = @intCast(usize, hash) & mask
+            var tombstone = self.*.slots
+            while true {
+                const tag = self.*.metadata[index]
+                if tag == EMPTY { return if tombstone != self.*.slots { tombstone } else { index } }
+                if tag == TOMBSTONE && tombstone == self.*.slots { tombstone = index }
+                index = (index + 1) & mask
+            }
+            return index
+        }
+
+        // Memory for `slots` slots; false without.
+        fn allocate(self: *Self, slots: usize) -> bool {
+            const metadata = self.*.allocator.alloc(slots, 16)
+            if metadata == null { return false }
+            var keys: [*]K = undefined
+            var values: [*]V = undefined
+            const key_bytes = self.*.allocator.alloc(slots * @sizeOf(K), @alignOf(K))
+            if key_bytes == null {
+                self.*.allocator.free(metadata.?, slots, 16)
+                return false
+            }
+            unsafe { keys = @ptrCast([*]K, key_bytes.?) }
+            if @sizeOf(V) > 0 {
+                const value_bytes = self.*.allocator.alloc(slots * @sizeOf(V), @alignOf(V))
+                if value_bytes == null {
+                    self.*.allocator.free(metadata.?, slots, 16)
+                    self.*.allocator.free(key_bytes.?, slots * @sizeOf(K), @alignOf(K))
+                    return false
+                }
+                unsafe { values = @ptrCast([*]V, value_bytes.?) }
+            } else {
+                unsafe { values = @ptrCast([*]V, emptyBytes()) }
+            }
+            std.mem.set(metadata.?, EMPTY, slots)
+            self.*.metadata = metadata.?
+            self.*.keys = keys
+            self.*.values = values
+            self.*.slots = slots
+            self.*.size = 0
+            self.*.tombstones = 0
+            self.*.available = slots * 4 / 5
+            return true
+        }
+
+        fn release(self: *Self) -> void {
+            if self.*.slots == 0 { return }
+            self.*.allocator.free(self.*.metadata, self.*.slots, 16)
+            unsafe { self.*.allocator.free(@ptrCast([*]u8, self.*.keys), self.*.slots * @sizeOf(K), @alignOf(K)) }
+            if @sizeOf(V) > 0 {
+                unsafe { self.*.allocator.free(@ptrCast([*]u8, self.*.values), self.*.slots * @sizeOf(V), @alignOf(V)) }
+            }
+            self.*.metadata = emptyBytes()
+            self.*.slots = 0
+            self.*.size = 0
+            self.*.tombstones = 0
+            self.*.available = 0
+        }
+
+        // The entries moved into a table of `slots` slots; false without
+        // memory (the map is as it was).
+        fn rehash(self: *Self, slots: usize) -> bool {
+            const old_metadata = self.*.metadata
+            const old_keys = self.*.keys
+            const old_values = self.*.values
+            const old_slots = self.*.slots
+            if !self.*.allocate(slots) { return false }
+            var at: usize = 0
+            while at < old_slots {
+                if old_metadata[at] >= 128 {
+                    const hash = Context.hash(self.*.context, old_keys[at])
+                    const index = self.*.placeFor(hash)
+                    self.*.metadata[index] = fingerprintOf(hash)
+                    self.*.keys[index] = old_keys[at]
+                    if @sizeOf(V) > 0 { self.*.values[index] = old_values[at] }
+                    self.*.size += 1
+                    self.*.available -= 1
+                }
+                at += 1
+            }
+            if old_slots > 0 {
+                self.*.allocator.free(old_metadata, old_slots, 16)
+                unsafe { self.*.allocator.free(@ptrCast([*]u8, old_keys), old_slots * @sizeOf(K), @alignOf(K)) }
+                if @sizeOf(V) > 0 {
+                    unsafe { self.*.allocator.free(@ptrCast([*]u8, old_values), old_slots * @sizeOf(V), @alignOf(V)) }
+                }
+            }
+            return true
+        }
+
+        // Room for `wanted` entries without growing; false without memory.
+        pub fn ensureTotalCapacity(self: *Self, wanted: usize) -> bool {
+            if wanted <= self.*.capacity() { return true }
+            var slots: usize = MIN_SLOTS
+            while slots * 4 / 5 < wanted { slots *= 2 }
+            return self.*.rehash(slots)
+        }
+
+        // Room for one more entry: grown when the slots are used up (at
+        // the same size when it is tombstones that use them).
+        fn ensureRoom(self: *Self) -> bool {
+            if self.*.available > 0 { return true }
+            if self.*.slots == 0 { return self.*.allocate(MIN_SLOTS) }
+            if self.*.size * 2 < self.*.slots { return self.*.rehash(self.*.slots) }
+            return self.*.rehash(self.*.slots * 2)
+        }
+
+        // `key` with `value`, in place of what it had; false without memory.
+        pub fn put(self: *Self, key: K, value: V) -> bool {
+            const result = self.*.getOrPut(key)
+            if result.1 == null { return false }
+            if @sizeOf(V) > 0 { result.1.?.* = value }
+            return true
+        }
+
+        // `key` with `value` when the map has no such key: whether it was
+        // put (false: the key is there, or there is no memory).
+        pub fn putNoClobber(self: *Self, key: K, value: V) -> bool {
+            const hash = Context.hash(self.*.context, key)
+            if self.*.find(key, hash) < self.*.slots { return false }
+            if !self.*.ensureRoom() { return false }
+            const index = self.*.placeFor(hash)
+            if self.*.metadata[index] == TOMBSTONE { self.*.tombstones -= 1 } else { self.*.available -= 1 }
+            self.*.metadata[index] = fingerprintOf(hash)
+            self.*.keys[index] = key
+            if @sizeOf(V) > 0 { self.*.values[index] = value }
+            self.*.size += 1
+            return true
+        }
+
+        // The entry of `key`, made when it is not there (its value then
+        // undefined): whether it was found, and the value's pointer (null:
+        // no memory to make it).
+        pub fn getOrPut(self: *Self, key: K) -> (bool, ?*V) {
+            const hash = Context.hash(self.*.context, key)
+            const found = self.*.find(key, hash)
+            if found < self.*.slots { return -> (true, &self.*.values[found]) }
+            if !self.*.ensureRoom() { return -> (false, null) }
+            const index = self.*.placeFor(hash)
+            if self.*.metadata[index] == TOMBSTONE { self.*.tombstones -= 1 } else { self.*.available -= 1 }
+            self.*.metadata[index] = fingerprintOf(hash)
+            self.*.keys[index] = key
+            self.*.size += 1
+            return -> (false, &self.*.values[index])
+        }
+
+        pub fn get(self: *const Self, key: K) -> ?V {
+            const index = self.*.find(key, Context.hash(self.*.context, key))
+            if index >= self.*.slots { return null }
+            return self.*.values[index]
+        }
+
+        pub fn getPtr(self: *Self, key: K) -> ?*V {
+            const index = self.*.find(key, Context.hash(self.*.context, key))
+            if index >= self.*.slots { return null }
+            return &self.*.values[index]
+        }
+
+        pub fn contains(self: *const Self, key: K) -> bool {
+            return self.*.find(key, Context.hash(self.*.context, key)) < self.*.slots
+        }
+
+        // `key` taken out; whether it was there.
+        pub fn remove(self: *Self, key: K) -> bool {
+            const index = self.*.find(key, Context.hash(self.*.context, key))
+            if index >= self.*.slots { return false }
+            self.*.metadata[index] = TOMBSTONE
+            self.*.size -= 1
+            self.*.tombstones += 1
+            return true
+        }
+
+        // `key` taken out, with the value it had (null: it was not there).
+        pub fn fetchRemove(self: *Self, key: K) -> ?V {
+            const index = self.*.find(key, Context.hash(self.*.context, key))
+            if index >= self.*.slots { return null }
+            const value = self.*.values[index]
+            self.*.metadata[index] = TOMBSTONE
+            self.*.size -= 1
+            self.*.tombstones += 1
+            return value
+        }
+
+        // Every entry out; the memory stays for the next ones.
+        pub fn clearRetainingCapacity(self: *Self) -> void {
+            if self.*.slots == 0 { return }
+            std.mem.set(self.*.metadata, EMPTY, self.*.slots)
+            self.*.size = 0
+            self.*.tombstones = 0
+            self.*.available = self.*.slots * 4 / 5
+        }
+
+        // Every entry out and the memory given back.
+        pub fn clearAndFree(self: *Self) -> void {
+            self.*.release()
+        }
+
+        // A map with the same entries in the same allocator's memory
+        // (null without memory).
+        pub fn clone(self: *const Self) -> ?Self {
+            var copy = Self.initContext(self.*.allocator, self.*.context)
+            if self.*.size == 0 { return copy }
+            if !copy.ensureTotalCapacity(self.*.size) { return null }
+            var at: usize = 0
+            while at < self.*.slots {
+                if self.*.metadata[at] >= 128 {
+                    if !copy.putNoClobber(self.*.keys[at], self.*.values[at]) { return null }
+                }
+                at += 1
+            }
+            return copy
+        }
+
+        pub fn iterator(self: *const Self) -> Iterator {
+            return Iterator.{ .map = self, .index = 0 }
+        }
+
+        pub fn keyIterator(self: *const Self) -> KeyIterator {
+            return KeyIterator.{ .map = self, .index = 0 }
+        }
+
+        pub fn valueIterator(self: *const Self) -> ValueIterator {
+            return ValueIterator.{ .map = self, .index = 0 }
+        }
+    }
+}
+
+// Keys hashed and compared by their type (std.hash.autoHash, autoEql).
+pub fn AutoHashMap(comptime K: type, comptime V: type) -> type {
+    return HashMap(K, V, AutoContext(K))
+}
+
+// String keys ([]const u8), by content; the map keeps the slice, not a
+// copy of the bytes.
+pub fn StringHashMap(comptime V: type) -> type {
+    return HashMap([]const u8, V, hash_module.StringContext)
+}
+
+// A set of keys of type K: a map to nothing.
+pub fn AutoHashSet(comptime K: type) -> type {
+    return @noncopy(struct) {
+        map: AutoHashMap(K, Nothing)
+
+        pub const Iterator = AutoHashMap(K, Nothing).KeyIterator
+
+        pub fn init(allocator: Allocator) -> Self {
+            return Self.{ .map = AutoHashMap(K, Nothing).init(allocator) }
+        }
+
+        pub fn deinit(self: *Self) -> void { self.*.map.deinit() }
+
+        pub fn count(self: *const Self) -> usize { return self.*.map.count() }
+
+        pub fn capacity(self: *const Self) -> usize { return self.*.map.capacity() }
+
+        pub fn ensureTotalCapacity(self: *Self, wanted: usize) -> bool { return self.*.map.ensureTotalCapacity(wanted) }
+
+        // `key` in the set; false without memory.
+        pub fn insert(self: *Self, key: K) -> bool { return self.*.map.put(key, Nothing.{}) }
+
+        pub fn contains(self: *const Self, key: K) -> bool { return self.*.map.contains(key) }
+
+        // `key` out of the set; whether it was in it.
+        pub fn remove(self: *Self, key: K) -> bool { return self.*.map.remove(key) }
+
+        pub fn clearRetainingCapacity(self: *Self) -> void { self.*.map.clearRetainingCapacity() }
+
+        pub fn clearAndFree(self: *Self) -> void { self.*.map.clearAndFree() }
+
+        // The keys, by pointer.
+        pub fn iterator(self: *const Self) -> Iterator { return self.*.map.keyIterator() }
+    }
+}
