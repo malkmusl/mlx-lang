@@ -90,6 +90,21 @@ echo "ok   the statics of inline functions are one object across files"
 cmp -s "$tests/lambdaunits/expected" "$work/lambdaunits.out" || fail "lambdaunits prints otherwise (expected < > got): $(diff "$tests/lambdaunits/expected" "$work/lambdaunits.out" | head -6)"
 echo "ok   the lambdas of two files are classes of their own"
 
+# Lambdas of inline functions, templates, default member initializers and
+# inline variables, which two files read in different orders: one class
+# each for the program (a static local of its call operator one object,
+# a template's instance for it one instance), named as g++ names it.
+"$cc" -c -o "$work/lambdaodr_a.o" "$tests/lambdaodr/a.cpp" 2> "$work/lambdaodr.err" || fail "-c of lambdaodr/a.cpp: $(head -3 "$work/lambdaodr.err")"
+"$cc" -c -o "$work/lambdaodr_b.o" "$tests/lambdaodr/b.cpp" 2>> "$work/lambdaodr.err" || fail "-c of lambdaodr/b.cpp: $(head -3 "$work/lambdaodr.err")"
+"$cc" -x c++ -o "$work/lambdaodr" "$work/lambdaodr_a.o" "$work/lambdaodr_b.o" 2>> "$work/lambdaodr.err" || fail "linking lambdaodr: $(head -3 "$work/lambdaodr.err")"
+"$work/lambdaodr" > "$work/lambdaodr.out" || fail "lambdaodr exits with $?"
+cmp -s "$tests/lambdaodr/expected" "$work/lambdaodr.out" || fail "lambdaodr prints otherwise (expected < > got): $(diff "$tests/lambdaodr/expected" "$work/lambdaodr.out" | head -6)"
+symbols=$(nm "$work/lambdaodr_b.o" | awk '{ print $NF }' | sort | tr '\n' ' ')
+for name in _ZZ7countervENKUlvE_clEv _ZZZ7countervENKUlvE_clEvE1n _ZZZZ13nestedCountervENKUlvE_clEvENKUlvE_clEvE1s _ZZZ14mutableCountervENUlvE_clEvE1n _ZNK6Widget4makeMUlvE_clEv _ZNK12sharedLambdaMUlvE_clEv _ZZZ21counterThroughPointervENKUlvE_clEvE1n; do
+    [[ " $symbols" == *" $name "* ]] || fail "lambdaodr_b.o lacks $name"
+done
+echo "ok   the lambdas of inline functions and initializers are one class across files, named as g++ names them"
+
 # Unnamed classes a typedef names, in a header two files include after
 # different numbers of other unnamed classes: functions taking them have
 # the same names in both files.
