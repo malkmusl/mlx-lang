@@ -1605,6 +1605,49 @@ one removes the domain's; a changed one is told), `setSessionPolicy`,
 of mlx-soup's `tests/hsts.c` and the enforcer's answers; mlx-soup's
 SoupHSTSPolicy, SoupHSTSEnforcer and SoupHSTSEnforcerDB are over it.
 
+### Multipart bodies (`std.http.multipart`)
+
+`std/src/http/multipart.mlx` cuts and writes multipart bodies (RFC 2046)
+as libsoup does, allocating nothing: `boundaryOf(contentType, out)` (the
+boundary of a `multipart/...` Content-Type), `mediaType`, `paramOf`;
+`parts(body, boundary)` and `nextPart(&it, &part)` give each part's
+header lines (`headers`, and `raw` from the boundary line on) and bytes,
+the preamble skipped, `findBoundary` looking as libsoup looks (a body
+without a closing boundary is not `wellFormed`); `writePartStart`,
+`writeHeader`, `writeHeadersEnd`, `writeClose`, `writeFormDisposition`
+(`form-data; name="..."; filename="..."`), `writeContentType` and
+`makeBoundary` (the SHA-256 of 8 random bytes, in hex) write one.
+mlx-soup's SoupMultipart is over it (its part stream stays GIO's).
+
+### WebSockets (`std.http.websocket`, `std.http.websocket.deflate`)
+
+`std/src/http/websocket.mlx` has RFC 6455's pieces that do not depend on
+how bytes move: `makeKey` (16 random bytes to a Sec-WebSocket-Key),
+`validKey`, `acceptKey` and `acceptMatches` (the server's
+Sec-WebSocket-Accept, compared case aside), `protocolAsked` and
+`anyProtocolAsked` (a Sec-WebSocket-Protocol value split at commas and
+spaces, as libsoup splits it), `nextExtension` (the elements of a
+Sec-WebSocket-Extensions value: name and parameters), frame headers
+(`parseHeader`, `writeHeader`), `applyMask` and `validUtf8`.
+
+`std/src/http/websocket/deflate.mlx` is the permessage-deflate extension
+(RFC 7692) as libsoup's: an `Extension` (`init`, `deinit`) configured
+for a client or a server from an element's parameters
+(`server_no_context_takeover`, `client_no_context_takeover`,
+`server_max_window_bits`, `client_max_window_bits`; `parseParams`,
+`configure`, the `Error` naming what was wrong and `badName` which
+parameter), `REQUEST_PARAMS` and `writeResponseParams`; `outgoing`
+compresses a message (a sync flush, its 00 00 ff ff taken off, RSV1 set
+on the frame's first byte; control frames and empty payloads pass) and
+`incoming` inflates a frame (the tail put back at the message's end,
+fragments carried, context takeover or not), into `Bytes` of the
+extension's allocator (`freeBytes`).
+
+`tests/379_http_multipart_websocket_runtime.mlx` checks the bodies,
+keys (RFC 6455's example), headers and compressed messages; mlx-soup's
+SoupMultipart, handshake and SoupWebsocketExtensionDeflate are over
+them (SoupWebsocketConnection itself stays GIO's).
+
 ## Networking (`std.net`) — not yet normative
 
 **Normative source:** none (see gap below)

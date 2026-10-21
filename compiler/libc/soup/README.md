@@ -41,8 +41,8 @@ hand. Every function the headers declare is defined by the library
 | `decoder.mlx`, `sniffer.mlx` | `soup-content-decoder.h`, `soup-content-sniffer.h`: gzip and deflate; MIME sniffing (`std.http.sniff`) |
 | `hsts.mlx` | `soup-hsts-*.h`: SoupHSTSPolicy in libsoup's layout and SoupHSTSEnforcer as the GObject around `std.http.hsts` (the policies, which hosts go over https, the file) |
 | `logger.mlx` | `soup-logger.h`: SoupLogger's lines as libsoup writes them |
-| `multipart.mlx` | `soup-multipart*.h`: whole multipart bodies, and the stream of parts |
-| `websocket.mlx`, `wsext.mlx` | `soup-websocket*.h`: the handshake, SoupWebsocketConnection (`std.http.websocket`), the extensions with permessage-deflate, the session's WebSocket connections |
+| `multipart.mlx` | `soup-multipart*.h`: whole multipart bodies (cut and written by `std.http.multipart`), and the stream of parts |
+| `websocket.mlx`, `wsext.mlx` | `soup-websocket*.h`: the handshake (its keys, accepts, protocols and extensions read by `std.http.websocket`), SoupWebsocketConnection (frames by `std.http.websocket`), the extensions with permessage-deflate (`std.http.websocket.deflate`), the session's WebSocket connections |
 | `server.mlx`, `authdomain.mlx`, `pathmap.mlx` | `soup-server*.h`, `soup-auth-domain*.h`: SoupServer, SoupServerMessage, Basic and Digest auth domains; the path map handlers and domains are found in |
 | `cache.mlx` | `soup-cache.h` (below) |
 | `tests/` | C programs built by mlx-cc against the library, each with what it prints built by gcc against the system's libsoup 3.4 (`NAME.expected`, the exit status last) |

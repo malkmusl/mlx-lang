@@ -136,6 +136,7 @@ run 375_fontconfig_runtime "Fontconfig's case folding, names and substitutions; 
 run 376_http_auth_runtime "HTTP authentication: challenges told apart, Basic tokens, Digest responses (RFC 2617's example) and Authorization values"
 run 377_http_cookies_runtime "cookies read with libsoup's rules, written back and matched; a jar's policies, SameSite, prefixes, expiry, third parties and cookies.txt"
 run 378_http_hsts_runtime "HSTS: Strict-Transport-Security read strictly, policies and their expiry, an enforcer's hosts and subdomains, its changes and file"
+run 379_http_multipart_websocket_runtime "multipart bodies cut and written as libsoup does; WebSocket keys, accepts, protocols, extensions and permessage-deflate messages"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

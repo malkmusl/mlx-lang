@@ -80,7 +80,11 @@ cookies.txt file; test 377), `http/status.mlx` (reason phrases),
 `http/form.mlx` (application/x-www-form-urlencoded),
 `http/chunked.mlx` (the chunked coding's size lines),
 `http/sniff.mlx` (MIME sniffing, the WHATWG standard's rules),
-`http/websocket.mlx` (RFC 6455's keys, frame headers, masking, UTF-8),
+`http/websocket.mlx` (RFC 6455's keys, accepts, protocols and extensions
+of the handshake, frame headers, masking, UTF-8) with
+`http/websocket/deflate.mlx` (permessage-deflate, RFC 7692),
+`http/multipart.mlx` (multipart bodies cut and written as libsoup does;
+test 379),
 `http/auth.mlx` (RFC 7235's challenges told apart, Basic tokens, Digest
 responses and Authorization values; test 376), `http/hsts.mlx` (RFC
 6797: Strict-Transport-Security read strictly, an enforcer's policies
