@@ -112,6 +112,27 @@ for name in _ZZ7countervENKUlvE_clEv _ZZZ7countervENKUlvE_clEvE1n _ZZZZ13nestedC
 done
 echo "ok   the lambdas of inline functions and initializers are one class across files, named as g++ names them"
 
+# Explicit instantiation definitions make what they name, weak, though
+# nothing calls it (explicitinstance.cpp: a member function template's
+# instances, a class instance's members, its member class's, its static
+# data member; not its member templates nor what `extern template`
+# names); another file calls them (explicitinstanceunits: b.cpp holds the
+# definitions, a.cpp only declarations and `extern template`).
+"$cc" -c -o "$work/explicitinstance.o" "$tests/explicitinstance.cpp" 2> "$work/explicitinstance.err" || fail "-c of explicitinstance.cpp: $(head -3 "$work/explicitinstance.err")"
+nm "$work/explicitinstance.o" | awk '$2 == "W" || $2 == "V" { print $NF }' > "$work/explicitinstance.weak"
+for pattern in '5visit.*2V1' '5visit.*2V2' 'C(<3>|ILi3EE)1fEv' 'C(<3>|ILi3EE)1gEv' 'C(<3>|ILi3EE)1sE' 'C(<3>|ILi3EE)5Inner1hEv' '5twiceI.*i' '5twiceI.*d'; do
+    grep -Eq "^_Z.*$pattern" "$work/explicitinstance.weak" || fail "explicitinstance.o lacks a weak $pattern: $(tr '\n' ' ' < "$work/explicitinstance.weak")"
+done
+for pattern in 'same' 'C(<4>|ILi4EE)' '5twiceI.*l'; do
+    ! grep -Eq "$pattern" "$work/explicitinstance.weak" || fail "explicitinstance.o has $pattern: $(tr '\n' ' ' < "$work/explicitinstance.weak")"
+done
+"$cc" -c -o "$work/explicitinstanceunits_a.o" "$tests/explicitinstanceunits/a.cpp" 2> "$work/explicitinstanceunits.err" || fail "-c of explicitinstanceunits/a.cpp: $(head -3 "$work/explicitinstanceunits.err")"
+"$cc" -c -o "$work/explicitinstanceunits_b.o" "$tests/explicitinstanceunits/b.cpp" 2>> "$work/explicitinstanceunits.err" || fail "-c of explicitinstanceunits/b.cpp: $(head -3 "$work/explicitinstanceunits.err")"
+"$cc" -x c++ -o "$work/explicitinstanceunits" "$work/explicitinstanceunits_a.o" "$work/explicitinstanceunits_b.o" 2>> "$work/explicitinstanceunits.err" || fail "linking explicitinstanceunits: $(head -3 "$work/explicitinstanceunits.err")"
+"$work/explicitinstanceunits" > "$work/explicitinstanceunits.out" || fail "explicitinstanceunits exits with $?"
+cmp -s "$tests/explicitinstanceunits/expected" "$work/explicitinstanceunits.out" || fail "explicitinstanceunits prints otherwise (expected < > got): $(diff "$tests/explicitinstanceunits/expected" "$work/explicitinstanceunits.out" | head -6)"
+echo "ok   explicit instantiation definitions make the functions and members they name, for other files"
+
 # A WTF::Visitor of 16 lambdas (visitormanylambdas.cpp): the call
 # operators' overload set made of each base once, in a few thousand
 # allocations, not 2^16 lookups' 1.5 million (css-19's 25 filled the
