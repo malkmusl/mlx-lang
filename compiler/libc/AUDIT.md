@@ -51,7 +51,8 @@ a shim's behaviour must not change.
 | glib | `std.http.mime` (content types by extension and first bytes) | 383 | everything GObject and GIO shaped; the resolver, streams and TLS objects wrap std.net and std.tls |
 | xml2 | `std.xml.text`'s `writeEscaped` (content, ASCII-only, attribute, HTML) and `validName` (Name, NCName, QName, Nmtoken) | 383 | the trees, entities and parser contexts over std.xml.sax |
 | gcrypt | `std.crypto.mpi` (integers of any size, division, gcd, inverses, powm, primes), `std.crypto.rsa`'s private half (PKCS #1 v1.5 and PSS signing, PKCS #1 v1.5 and OAEP encryption and decryption by the CRT, key generation); the shim's limb arithmetic calls std's | 384 | libgcrypt's MPI records and quirks, S-expressions, handles |
-| zlib, png, pulse, pipewire, tasn1 | not yet (gzip files, libpng's writer with its ancillary chunks, the audio value helpers, the DER writer) | | all of it |
+| zlib | `std.flate.gzip` (gzip files read member after member or as they are, written, in pieces) | 385 | the gz* API's state, seeks, gzprintf and errno messages over C's descriptors (zlib's gzFile exposes its buffer, so the shim keeps its own) |
+| png, pulse, pipewire, tasn1 | not yet (libpng's writer with its ancillary chunks, the audio value helpers, the DER writer) | | all of it |
 | icu, freetype, harfbuzz, jpeg, webp, lcms2, sqlite3 | nothing to move: pure C shape over std | | all of it |
 
 ## What is C shape, in every library
@@ -483,7 +484,7 @@ pipewiresrc).
     std/src/net.mlx, net/dns.mlx  TCP and the resolver under std.http.client
     std/src/http/mime.mlx       content types by extension
     std/src/xml/text.mlx        escaping and name checks for XML written out
-    std/src/flate/gzip.mlx      gzip files (not yet)
+    std/src/flate/gzip.mlx      gzip files
     std/src/png/write.mlx       libpng's writer (not yet)
 
 The build targets keep their names (`./mlx build glib`, `soup`, `unicode`,

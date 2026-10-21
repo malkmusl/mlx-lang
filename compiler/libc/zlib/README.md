@@ -93,7 +93,7 @@ Here (the C API):
 | `checksum.mlx` | `adler32`, `crc32` and the rest, over std.crc |
 | `deflate.mlx`, `inflate.mlx` | The `deflate*` and `inflate*` functions over std.flate's |
 | `utility.mlx` | compress, uncompress, inflateBack, the version and error strings |
-| `gzip.mlx`, `varargs.mlx` | The gzip files; C's variable arguments for gzprintf |
+| `gzip.mlx`, `varargs.mlx` | The gzip files (zlib's state, buffering, seeks and errors over C's descriptors; std.flate.gzip is the same reading and writing for Mlx programs); C's variable arguments for gzprintf |
 | `tests/` | C programs built by mlx-cc against the library, each with the output the same program prints built by gcc against the system's zlib (`NAME.expected`, the exit status last); `corpus.h`, the data they compress; `interop.c`, the round trips |
 
 Each exported function copies the caller's z_stream into a std.flate

@@ -142,6 +142,7 @@ run 381_net_runtime "IPv4 and IPv6 addresses, socket addresses, a TCP connection
 run 382_http_client_runtime "an HTTP/1.1 session against a server in a child process: kept connections, cookies, redirects, POST, chunked, gzip, HEAD, Digest auth, errors"
 run 383_mime_xml_text_runtime "media types by a file's extension and first bytes as GIO guesses; XML text escaped four ways and names checked as Name, NCName, QName, Nmtoken"
 run 384_crypto_mpi_rsa_runtime "integers of any size: hex, signed division both ways, powm, gcd, inverses, primes; RSA private keys: PKCS #1 and PSS signatures, OAEP and PKCS #1 encryption against Python's values, a key generated"
+run 385_flate_gzip_runtime "gzip files written and read in pieces, two members as one, a plain file as it is, trailing data left, damaged and truncated members refused"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

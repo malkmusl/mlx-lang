@@ -55,6 +55,9 @@ process group.
 WPA2 needs (`tools/check_wifi.sh`); and AES-128/192/256 bitsliced in
 constant time, four blocks at once, for TLS.
 
+`flate/gzip.mlx` (`std.flate.gzip`) reads and writes gzip files in
+pieces for Mlx programs, what zlib's gz* functions do (test 385).
+
 `crypto/` (`std.crypto.*`) is what TLS and WebCrypto compute with, all
 in Mlx and constant time where a secret is involved: `crypto/hash.mlx`
 (SHA-1/2 behind one state, HMAC, HKDF), `crypto/gcm.mlx` (AES-GCM),

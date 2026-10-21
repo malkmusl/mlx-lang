@@ -419,6 +419,19 @@ zlib C API, `compiler/libc/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
 programs), is made of. `tests/343_flate_runtime.mlx` checks zlib's bytes,
 round trips in every format and in pieces, and damaged data.
 
+`std.flate.gzip` (`std/src/flate/gzip.mlx`) is gzip files, what zlib's
+gz* functions do, for Mlx programs: a `Reader` (`openRead` or
+`readerInit` over a file, `read` in pieces of any size, `readToEnd`,
+`readerClose`) gives the uncompressed bytes of a file's gzip members one
+after another, reads a file that is not gzip as it is, leaves alone what
+follows the last member and names what went wrong (`readerError`: a
+damaged member, a truncated one, the file); a `Writer` (`openWrite` or
+`writerInit` at a level, `write`, `flush`, `writerClose`, which finishes
+the member) writes one member; `readFile` and `writeFile` do a whole
+file at once. Each buffers 8 KiB in memory of the allocator.
+`tests/385_flate_gzip_runtime.mlx` writes and reads files in odd pieces,
+two members, a plain file, trailing data, damaged and truncated members.
+
 `std.crc` (`std/src/crc.mlx`) has the check values: `crc32(crc, data,
 length)` (the CRC-32 of gzip, zlib, PNG and ZIP, 0 to start),
 `adler32(adler, data, length)` (1 to start), `crc32Join` and `adler32Join`
