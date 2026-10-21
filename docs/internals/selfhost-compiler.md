@@ -451,7 +451,26 @@ machinery behind the spec's "Defer/errdefer do not survive into final LIR;
 Sema/lowering expands cleanup control flow before backend lowering"
 (`spec/02-compiler/lir.xml`). Generic function instantiation is memoized
 through a `GenericInstance` table keyed by a `GenericArgument` list,
-matching the monomorphization dedup rule in `spec/02-compiler/sema.xml`.
+matching the monomorphization dedup rule in `spec/02-compiler/sema.xml`;
+while an instance's signature is resolved the comptime parameters are
+bound as comptime bindings, so `[*]T`, `?T` and `Box(T)` resolve in it
+(`resolveTypeNode` builds compound types over bindings itself).
+
+Generic *types* (`fn Box(comptime T: type) -> type { return struct {...}
+}`, [docs/guide/08-comptime-and-generics.md](../guide/08-comptime-and-generics.md))
+are sema's: `declarations.instantiateType` makes one `types.Instance` per
+function and argument list, evaluates the body once in a scope of its own
+(the parameters, then the body's constants; `types.instanceSalt` tells
+the aggregates an instance declares from another's, in their identity),
+and records the aggregates it declared (`types.InstanceAggregate`);
+`functions.analyzeInstanceBodies` types their methods after every
+module's bodies, and `lower.lowerInstanceMethods` generates them in the
+instance's scope (`scopeOverride`), with the instance's salt, named
+`Box(u32).get` in the symbol table (`lir.setSymbolOwner`). A generic type
+named in a generic function's body is instantiated by the lowering
+(`instantiateTypeCall`) with the same table. The module registry sema
+reads another module's source, nodes and scope from is
+`symbols.ModuleContext`, filled by `modules.prepare`.
 
 `ir/optimize.mlx`'s `optimize.run` is the mandatory-canonicalization pass
 the README describes ("mandatory LIR canonicalization, constant and branch
