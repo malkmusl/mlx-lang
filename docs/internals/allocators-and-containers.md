@@ -132,6 +132,14 @@ expression chain `logicalAnd` ... `postfix`, `qualifiedTypedef` and
 show Observatory nothing of their memory: that, as much as the waste, is
 what the conversion is for.
 
+**After the heap** (std, tools and coreutils converted; the same runs):
+
+| Program, run | `memory` |
+|---|---|
+| `ls -lR projects std` | 22 blocks at the snapshot, 74 KiB asked, 74 KiB in their classes (0% wasted); below 256 B: 17 blocks, 851 B in 1376 B (38% wasted, the class rounding, where it was 82% of tiny pages); 12 mappings, 0 holes; 908 KiB resident (4.7 MiB before) |
+| `mlx-codemap unused` | a snapshot now (written at the end of the command): the index's 3 GiB arena as one block of `tools/codemap/index.mlx:704 create`, the command's 1268 KiB table from the heap, the 1 MiB output buffer; 551 MiB peak as before |
+| `mlx-cc -c wtf/text/WTFString.cpp` | 16 blocks: the 8 GiB arena as one block of `compiler/cc/base.mlx:43 init` (568 MiB resident), 13 tiny blocks of the compiler's own startup; the arena's fill by kind is still MLX_CC_STATS's, not the snapshot's |
+
 **The heap's lock, measured.** The notes asked whether one lock on the
 heap would cost more than today's tiny-page lock and one `mmap` per large
 block. Four threads, each 200 000 allocations and frees of random sizes
