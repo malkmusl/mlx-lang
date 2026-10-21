@@ -8,7 +8,7 @@
 `220_autodrop_parameter_runtime.mlx`, `221_autodrop_return_transfer_runtime.mlx`,
 `222_autodrop_loop_exit_runtime.mlx`, `223_noncopy_local_copy_error.mlx`,
 `224_noncopy_representation_copy_error.mlx`,
-`389_generic_noncopy_autodrop_runtime.mlx`, `390_noncopy_field_drop_runtime.mlx`
+`399_generic_noncopy_autodrop_runtime.mlx`, `400_noncopy_field_drop_runtime.mlx`
 
 Mlx has no garbage collector, reference counting, or implicit destructors.
 Instead, it tracks ownership of values whose type is wrapped with
@@ -315,7 +315,7 @@ fn main() -> u8 {
 }
 ```
 
-(`tests/389_generic_noncopy_autodrop_runtime.mlx`)
+(`tests/399_generic_noncopy_autodrop_runtime.mlx`)
 
 Inside a `@noncopy(struct)`, generic or not, `Self` is the non-copyable
 type itself: a method taking `self: *Self` is called on a value of the
@@ -346,7 +346,7 @@ const Careless = @noncopy(struct) {
 }
 ```
 
-(`tests/390_noncopy_field_drop_runtime.mlx`, with `Child` counting its
+(`tests/400_noncopy_field_drop_runtime.mlx`, with `Child` counting its
 drops and a generic `Holder(T)` whose `deinit` calls `self.*.inner.deinit()`)
 
 So a container holding non-copyable elements owns them: its `deinit`

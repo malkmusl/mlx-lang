@@ -202,7 +202,7 @@ payload's alignment), so a `?usize` holding 0 is not null and zeroed
 memory is null. An optional struct, union or array is a memory value like
 its payload: its address, the payload at offset 0 and the tag byte after
 it. `null` becomes the absent value wherever one is wanted, `== null`
-reads the tag, `.?` the payload (`tests/394_optional_zero_runtime.mlx`).
+reads the tag, `.?` the payload (`tests/404_optional_zero_runtime.mlx`).
 An optional pointer stays the pointer, null being 0.
 
 A local of several words (a slice, an optional slice, an error union)

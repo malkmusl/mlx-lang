@@ -8,10 +8,10 @@
 `109_comptime_argument_runtime_dependency.mlx`, `110_generic_dependent_type_range.mlx`,
 `111_generic_type_return_runtime.mlx`, `112_comptime_if_pruning_runtime.mlx`,
 `171_imported_generic_runtime.mlx`, `support/generic_identity.mlx`,
-`386_generic_aggregate_runtime.mlx`, `387_generic_containers_runtime.mlx`,
-`388_generic_imported_runtime.mlx`, `support/generic_stack.mlx`,
-`391_generic_signature_types_runtime.mlx`, `392_generic_type_argument_runtime.mlx`,
-`395_generic_type_argument_error.mlx`, `396_generic_local_alias_runtime.mlx`
+`386_generic_aggregate_runtime.mlx`, `397_generic_containers_runtime.mlx`,
+`398_generic_imported_runtime.mlx`, `support/generic_stack.mlx`,
+`401_generic_signature_types_runtime.mlx`, `402_generic_type_argument_runtime.mlx`,
+`405_generic_type_argument_error.mlx`, `406_generic_local_alias_runtime.mlx`
 
 Mlx has no separate template/macro system. Generics are ordinary functions
 whose parameters (or whose parameter *types*) are known at compile time,
@@ -166,7 +166,7 @@ checks)
 
 The body of such a function is constants, `if`s whose condition is known
 at compile time, and a `return` of a type; a runtime value as an argument
-is rejected with MLX-E5001 (`tests/395_generic_type_argument_error.mlx`).
+is rejected with MLX-E5001 (`tests/405_generic_type_argument_error.mlx`).
 A `comptime` `if` inside a method (`if @isInteger(T) { ... } else {
 @compileError(...) }`) is analyzed and generated for the branch taken
 alone, as the `if` expression of the previous section is. Instances are
@@ -177,22 +177,22 @@ An instance may be the element of another (`List(List(u8))`), the type of
 a field in a struct the body of another generic declares (`const Entry =
 struct { key: K, value: V }` and then `entries: List(Entry)`), and a
 method may return `?V` or `?*V` and take `[]const T`
-(`tests/387_generic_containers_runtime.mlx`, a list and a map over
+(`tests/397_generic_containers_runtime.mlx`, a list and a map over
 `std.allocator`). A generic type declared in one module is instantiated by
 the modules importing it, and a `comptime` integer parameter sizes an
-array field (`generic.Stack(u8, 4)`, `tests/388_generic_imported_runtime.mlx`
+array field (`generic.Stack(u8, 4)`, `tests/398_generic_imported_runtime.mlx`
 with `tests/support/generic_stack.mlx`). Inside a function, `const Small =
 Box(u8)` binds an instance to a local name
-(`tests/396_generic_local_alias_runtime.mlx`).
+(`tests/406_generic_local_alias_runtime.mlx`).
 
 A type written over a comptime type parameter resolves in a generic
 *function* too, in its parameters, its result and its locals: `p: [*]T`,
 `values: []const T`, `-> ?T`, `-> *T`, `var items: [*]T`
-(`tests/391_generic_signature_types_runtime.mlx`). The type argument of a
+(`tests/401_generic_signature_types_runtime.mlx`). The type argument of a
 call need not be a name: `leaf(@childType(T), a[0], b[0])`, a constant
 bound to `@childType(T)`, `@typeOf(a[0])`, and locals declared `const x:
 @childType(T) = a[at]` all name the type they resolve to, evaluated in the
-caller's own instance (`tests/392_generic_type_argument_runtime.mlx`).
+caller's own instance (`tests/402_generic_type_argument_runtime.mlx`).
 
 Not supported: a generic type naming itself through a call inside its own
 body (`next: ?*List(T)`; write `?*Self`), and `var` declarations among an
