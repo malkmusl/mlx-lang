@@ -105,6 +105,14 @@ for name in _ZZ7countervENKUlvE_clEv _ZZZ7countervENKUlvE_clEvE1n _ZZZZ13nestedC
 done
 echo "ok   the lambdas of inline functions and initializers are one class across files, named as g++ names them"
 
+# A WTF::Visitor of 16 lambdas (visitormanylambdas.cpp): the call
+# operators' overload set made of each base once, in a few thousand
+# allocations, not 2^16 lookups' 1.5 million (css-19's 25 filled the
+# arena).
+made=$(MLX_CC_STATS=1 "$cc" -c -o "$work/visitormanylambdas.o" "$tests/visitormanylambdas.cpp" 2>&1 | awk '/^  size [0-9]+: / { n += $3 } END { print n + 0 }')
+[[ "$made" -gt 0 && "$made" -lt 400000 ]] || fail "visitormanylambdas.cpp takes $made allocations"
+echo "ok   a Visitor of many lambdas makes its overload set in $made allocations"
+
 # Unnamed classes a typedef names, in a header two files include after
 # different numbers of other unnamed classes: functions taking them have
 # the same names in both files.

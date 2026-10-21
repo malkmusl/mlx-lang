@@ -571,6 +571,13 @@ instantiation; raising ARENA_SIZE would not help. Next step: count
 `memberOf`/`callOperator` calls per instance of `visitDerived` to find
 the loop.
 
+Found (branch m2-fixes2): Visitor's `using Visitor<A>::operator();
+using Visitor<B...>::operator();` name both bases by the template's
+name, and each using-declaration recorded both bases, so every level
+held each base twice and one lookup of operator() walked 2^n bases
+(16 lambdas: 1.5 million aliases; 25: the arena). Each base is now
+recorded once (cpp.usingKnown); css-19 compiles in 14 s.
+
 ### The gate
 
 tools/check_cpp.sh (471 programs after the merge, two new:
