@@ -99,6 +99,13 @@ echo "ok   the lambdas of two files are classes of their own"
 "$cc" -x c++ -o "$work/lambdaodr" "$work/lambdaodr_a.o" "$work/lambdaodr_b.o" 2>> "$work/lambdaodr.err" || fail "linking lambdaodr: $(head -3 "$work/lambdaodr.err")"
 "$work/lambdaodr" > "$work/lambdaodr.out" || fail "lambdaodr exits with $?"
 cmp -s "$tests/lambdaodr/expected" "$work/lambdaodr.out" || fail "lambdaodr prints otherwise (expected < > got): $(diff "$tests/lambdaodr/expected" "$work/lambdaodr.out" | head -6)"
+# A static data member defined constexpr outside its class, in a header
+# included by two files: inline, one object (constexprmemberunits).
+"$cc" -c -o "$work/constexprmemberunits_a.o" "$tests/constexprmemberunits/a.cpp" 2> "$work/constexprmemberunits.err" || fail "-c of constexprmemberunits/a.cpp: $(head -3 "$work/constexprmemberunits.err")"
+"$cc" -c -o "$work/constexprmemberunits_b.o" "$tests/constexprmemberunits/b.cpp" 2>> "$work/constexprmemberunits.err" || fail "-c of constexprmemberunits/b.cpp: $(head -3 "$work/constexprmemberunits.err")"
+"$cc" -x c++ -o "$work/constexprmemberunits" "$work/constexprmemberunits_a.o" "$work/constexprmemberunits_b.o" 2>> "$work/constexprmemberunits.err" || fail "linking constexprmemberunits: $(head -3 "$work/constexprmemberunits.err")"
+"$work/constexprmemberunits" > "$work/constexprmemberunits.out" || fail "constexprmemberunits exits with $?"
+cmp -s "$tests/constexprmemberunits/expected" "$work/constexprmemberunits.out" || fail "constexprmemberunits prints otherwise (expected < > got): $(diff "$tests/constexprmemberunits/expected" "$work/constexprmemberunits.out" | head -6)"
 symbols=$(nm "$work/lambdaodr_b.o" | awk '{ print $NF }' | sort | tr '\n' ' ')
 for name in _ZZ7countervENKUlvE_clEv _ZZZ7countervENKUlvE_clEvE1n _ZZZZ13nestedCountervENKUlvE_clEvENKUlvE_clEvE1s _ZZZ14mutableCountervENUlvE_clEvE1n _ZNK6Widget4makeMUlvE_clEv _ZNK12sharedLambdaMUlvE_clEv _ZZZ21counterThroughPointervENKUlvE_clEvE1n; do
     [[ " $symbols" == *" $name "* ]] || fail "lambdaodr_b.o lacks $name"
