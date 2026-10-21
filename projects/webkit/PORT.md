@@ -479,3 +479,30 @@ What M2 found, and how the port meets it without a patch:
   ChromeClient's three accessibility notification functions, which
   EmptyClients defines and the embedder will), and Pasteboard.h's
   members for GTK, WPE and Haiku: all WebKit asks PLATFORM(HAIKU) for.
+- **What the link needs of the port.** Linked whole (the program's
+  object, then the archives' members it needs), WebCore names functions
+  a port defines that no generic file does: `PlatformKeyboardEvent::
+  currentStateOfModifierKeys` and `disambiguateKeyDownEvent` (GTK's and
+  libWPE's: port/platform/mlx/PlatformKeyboardEventMlx.cpp, the modifiers
+  the embedder sets), `WTF::Persistence::Coder<CertificateInfo>`
+  (WebCorePersistentCoders.cpp has Cocoa's, soup's and Windows' only:
+  CertificateInfoMlx.cpp, the DER chain and the TLS errors in soup's
+  layout), SynchronousLoaderClient's `didReceiveAuthenticationChallenge`
+  and `platformBadResponseError` (soup's and curl's: a stub until M6), and
+  texmap's BitmapTexture (`~BitmapTexture`, `updateContents`,
+  `createSkiaBackendTexture`, which SkiaGPUAtlas names for its GL path:
+  BitmapTextureMlx.cpp, a stub until M8, as no texture is ever made
+  without a display). Skia's src/core/SkStrikeRef.cpp, which WebKit's
+  CMake list leaves out though SkFont::makeStrikeRef needs it (a shared
+  libWPEWebKit tolerates the name undefined), is in lists/skia.txt. The
+  sources lists/skia-skipped.txt leaves out (SkXMLParser for expat,
+  SkFontConfigInterface_direct for fontconfig) and those CMake's list
+  lacks (SkPathDump.cpp, GrGLAssembleWebGLInterfaceAutogen.cpp) are named
+  only by archive members the program never takes (SkDOM,
+  SkFontConfigInterface, SkPathOpsDebug, GrGLAssembleInterface): nothing
+  to add. mlxlibc gained `inet_pton` (WebCore's IPAddress::fromString);
+  the long double functions (`ldexpl` of WTF's Int128) are bound by
+  mlxlibc's loader itself (compiler/libc/x87_long.mlx), which
+  tools/check_webkit_mlx_port.sh counts as defined; mlx-unicode gained
+  `u_strToTitle` (RenderText's `text-transform: capitalize` with a
+  locale) and the `uset_` sets SmartReplace.cpp builds from patterns.

@@ -65,7 +65,10 @@ done
 echo "ok   webcore-test starts on mlxlibc's loader and needs ${needed[*]##*/}"
 
 # Every name the program imports, against the names its libraries define.
-nm -D --defined-only "${libraries[@]}" 2> /dev/null | awk 'NF >= 3 { sub(/@.*/, "", $3); print $3 }' | sort -u > "$work/defined"
+# (With the long double functions of <math.h>, which mlxlibc's loader
+# binds itself from a page of x87 code: compiler/libc/x87_long.mlx.)
+{ nm -D --defined-only "${libraries[@]}" 2> /dev/null | awk 'NF >= 3 { sub(/@.*/, "", $3); print $3 }'
+  sed -n 's/.*if index == [0-9]* { return "\([a-z0-9_]*\)" }.*/\1/p' compiler/libc/x87_long.mlx; } | sort -u > "$work/defined"
 nm -D --undefined-only "$program" | awk '$1 == "U" { sub(/@.*/, "", $2); print $2 }' | sort -u > "$work/imported"
 comm -23 "$work/imported" "$work/defined" > "$work/unresolved"
 if [[ -s "$work/unresolved" ]]; then
