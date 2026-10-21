@@ -48,12 +48,13 @@ Hidden=true
 ENTRY
 
 model=$(env -i HOME="$work/empty-home" XDG_DATA_HOME="$work/home" XDG_DATA_DIRS="$work/system" LANG=de_DE.UTF-8 "$work/model")
-expected=$(printf 'session Mlx Arbeitsfläche /opt/mlx/bin/mlx-session\nsession Other Desktop /opt/other/session\nusers alice Alice Example /home/alice /bin/mlx-sh\nsecret ******\nwiped yes')
+expected=$(printf 'session Mlx Arbeitsfläche /opt/mlx/bin/mlx-session\nsession Other Desktop /opt/other/session\nselected Mlx Arbeitsfläche /opt/mlx/bin/mlx-session\nselected-next Other Desktop /opt/other/session\nselected-wrap Mlx Arbeitsfläche /opt/mlx/bin/mlx-session\nusers alice Alice Example /home/alice /bin/mlx-sh\nsecret ******\nwiped yes')
 [[ "$model" == "$expected" ]] || {
     echo "FAIL greeter model:" >&2
     printf '%s\n' "$model" >&2
     exit 1
 }
 echo "ok   greeter discovers localized sessions, ignores duplicates and unsafe commands"
+echo "ok   greeter selects the preferred session and cycles through every discovered session"
 echo "ok   greeter parses ListUsers data and masks then wipes its password field"
 echo "all mlx-greeter checks passed"

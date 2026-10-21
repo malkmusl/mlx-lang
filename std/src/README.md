@@ -34,6 +34,10 @@ first use, wrapped in the debug allocator under MLX_LEAK_CHECK (test
 `hashWord` and `combine`, `autoHash`/`autoEql` derived from a value's
 type by reflection, and the `StringContext` the containers take (test
 386; aggregates in 391).
+`dbus.mlx` (`std.dbus`) is the D-Bus wire format and a client of a bus;
+`ipc.mlx` (`std.ipc`) is MLXIPC's native wire format (the same messages,
+compactly, with one round trip to connect), its client, and what carries
+a message between the two formats (`projects/desktop/ipc`).
 `netlink.mlx` (`std.netlink`) speaks netlink: route netlink (links, IPv4
 addresses, routes and their change groups) and generic netlink (families
 looked up by name, as nl80211).

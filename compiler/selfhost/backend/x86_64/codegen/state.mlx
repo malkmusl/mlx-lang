@@ -3,9 +3,13 @@ const vector = @import("../../../../../std/bootstrap/vector.mlx")
 const encoder = @import("../encoder.mlx")
 const target = @import("../target.mlx")
 const lir_module = @import("../../../ir/lir.mlx")
+const operands = @import("../../../ir/operands.mlx")
 const type_store = @import("../../../sema/types/store.mlx")
 
 const BLOCK_LABEL_STRIDE: usize = 32
+// How many lazy loads a block may hold at once; a further one takes its
+// slot at once.
+const LAZY_PENDING: usize = 32
 
 // Between Mlx functions a value of several words (a slice, an error union,
 // a tuple) comes back in these registers, a word each; the caller stores
@@ -52,6 +56,28 @@ pub const State = struct {
     frameAddressOffsets: [*]i32
     slotCapacity: usize
     componentStride: usize
+    // Values left out of their frame slot (lazy, while lazyEpochs holds
+    // the function's epoch): an integer constant that fits in 32 bits,
+    // rebuilt as an immediate wherever it is read, and a whole-word load
+    // of a local kept in a register (lir.registerHome), read from that
+    // register. A lazy load has to reach its slot before the register is
+    // stored to or its block ends while an instruction after that still
+    // reads it (lastUse, the index of its last reader); lazyPending lists
+    // the current block's lazy loads.
+    lastUse: [*]usize
+    lazyEpochs: [*]usize
+    lazyPending: [*]usize
+    lazyPendingCount: usize
+    lazyValueCount: usize
+    // The store an arithmetic instruction already did by updating the
+    // local's register in place (Arithmetic.emitInPlace).
+    storeDone: usize
+    inPlaceCount: usize
+    // A gep with a constant offset left to the load or store right after
+    // it, which reads [base + fusedOffset] (Memory.emitGep).
+    fusedGep: usize
+    fusedOffset: i32
+    fusedAddressCount: usize
     slotEpoch: usize
     addrSlots: *vector.Vector
     blockLabelLengths: [*]usize
@@ -105,6 +131,16 @@ pub const State = struct {
             state.*.componentCounts = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
             state.*.frameAddressEpochs = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
             state.*.frameAddressOffsets = @ptrCast([*]i32, alloc.alloc(state.*.slotCapacity * @sizeOf(i32), @alignOf(i32)).?)
+            state.*.lastUse = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.lazyEpochs = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.lazyPending = @ptrCast([*]usize, alloc.alloc(LAZY_PENDING * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.lazyPendingCount = 0
+            state.*.lazyValueCount = 0
+            state.*.storeDone = lir_module.NONE
+            state.*.inPlaceCount = 0
+            state.*.fusedGep = lir_module.NONE
+            state.*.fusedOffset = 0
+            state.*.fusedAddressCount = 0
             state.*.slotEpoch = 0
             state.*.addrSlots = Self.createVector(alloc, @sizeOf(VregMap), @alignOf(VregMap), 64)
             state.*.blockLabelCapacity = Self.maximumBlockLabel(lir) + 1
@@ -131,6 +167,7 @@ pub const State = struct {
             state.*.rodataOffset = 0
             state.*.allocator = alloc
             Self.initializeEpochs(state)
+            Self.initializeLastUses(state)
             Self.initializeBlockLabels(state)
             return state
         }
@@ -190,6 +227,21 @@ pub const State = struct {
             state.*.slotEpochs[index] = 0
             state.*.componentCounts[index] = 0
             state.*.frameAddressEpochs[index] = 0
+            state.*.lazyEpochs[index] = lir_module.NONE
+            index += 1
+        }
+    }
+
+    fn initializeLastUses(state: *Self) -> void {
+        const count = lir_module.instCount(state.*.lir)
+        var index: usize = 0
+        while index < state.*.slotCapacity {
+            state.*.lastUse[index] = lir_module.NONE
+            index += 1
+        }
+        index = 0
+        while index < count {
+            operands.visit(state.*.lir, index, lir_module.getInst(state.*.lir, index), state.*.lastUse, count, operands.LAST)
             index += 1
         }
     }
@@ -241,6 +293,9 @@ pub const State = struct {
             state.*.allocator.free(@ptrCast([*]u8, state.*.componentCounts), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
             state.*.allocator.free(@ptrCast([*]u8, state.*.frameAddressEpochs), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
             state.*.allocator.free(@ptrCast([*]u8, state.*.frameAddressOffsets), state.*.slotCapacity * @sizeOf(i32), @alignOf(i32))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.lastUse), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.lazyEpochs), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.lazyPending), LAZY_PENDING * @sizeOf(usize), @alignOf(usize))
             state.*.allocator.free(@ptrCast([*]u8, state.*.blockLabelLengths), state.*.blockLabelCapacity * @sizeOf(usize), @alignOf(usize))
             state.*.allocator.free(state.*.blockLabelStorage, state.*.blockLabelCapacity * BLOCK_LABEL_STRIDE, 1)
         }
@@ -270,7 +325,14 @@ pub const State = struct {
         unsafe { const appended = vector.Vector.appendAt(values, @ptrCast([*]const u8, &entry)) }
     }
 
+    // The slot a value is read from or written to; a lazy value read
+    // through it is put there first.
     pub fn allocateOp(state: *Self, vreg: usize) -> i32 {
+        if Self.isLazy(state, vreg) { return Self.materialize(state, vreg) }
+        return Self.allocateSlot(state, vreg)
+    }
+
+    fn allocateSlot(state: *Self, vreg: usize) -> i32 {
         if state.*.slotEpochs[vreg] == state.*.slotEpoch { return state.*.vregSlots[vreg] }
         const slot = state.*.nextStackSlot
         state.*.nextStackSlot = slot + 8
@@ -280,11 +342,120 @@ pub const State = struct {
         return slot
     }
 
+    pub fn isLazy(state: *Self, vreg: usize) -> bool {
+        return vreg < state.*.slotCapacity && state.*.lazyEpochs[vreg] == state.*.slotEpoch
+    }
+
+    // The register a lazy load reads (0 for a lazy constant).
+    fn lazyHome(state: *Self, vreg: usize) -> usize {
+        const instruction = lir_module.getInst(state.*.lir, vreg)
+        if instruction.opcode != lir_module.Opcode.load { return 0 }
+        return lir_module.registerHome(state.*.lir, instruction.arg0)
+    }
+
+    // A lazy constant's value.
+    pub fn constantValue(state: *Self, vreg: usize) -> (bool, i64) {
+        if !Self.isLazy(state, vreg) || Self.lazyHome(state, vreg) != 0 { return -> (false, 0) }
+        return -> (true, Self.lazyConstant(state, vreg))
+    }
+
+    fn lazyConstant(state: *Self, vreg: usize) -> i64 {
+        return @bitCast(i64, @intCast(u64, lir_module.getInst(state.*.lir, vreg).arg0))
+    }
+
+    // The register a lazy load can be read from where it is used.
+    pub fn lazyRegister(state: *Self, vreg: usize) -> (bool, target.Register) {
+        if !Self.isLazy(state, vreg) { return -> (false, target.Register.rax) }
+        const home = Self.lazyHome(state, vreg)
+        if home == 0 { return -> (false, target.Register.rax) }
+        return -> (true, Self.homeRegister(home))
+    }
+
+    fn deferrable(state: *Self, index: usize) -> bool {
+        const instruction = lir_module.getInst(state.*.lir, index)
+        return !Self.isFloatType(state, instruction.typeId) && Self.typeWordCount(state, instruction.typeId) == 1
+    }
+
+    // A const_i: true when it is left lazy (no code here).
+    pub fn deferConstant(state: *Self, index: usize, value: i64) -> bool {
+        if value < -2147483648 || value > 2147483647 || !Self.deferrable(state, index) { return false }
+        state.*.lazyEpochs[index] = state.*.slotEpoch
+        state.*.lazyValueCount += 1
+        return true
+    }
+
+    // A whole-word load of a local kept in a register: true when it is
+    // left lazy.
+    pub fn deferRegisterLoad(state: *Self, index: usize) -> bool {
+        if state.*.lazyPendingCount >= LAZY_PENDING || !Self.deferrable(state, index) { return false }
+        state.*.lazyEpochs[index] = state.*.slotEpoch
+        state.*.lazyPending[state.*.lazyPendingCount] = index
+        state.*.lazyPendingCount += 1
+        state.*.lazyValueCount += 1
+        return true
+    }
+
+    // Writes a lazy value into its slot. A constant stays lazy (each read
+    // through the slot writes it again, so every path to a read has it);
+    // a load does not, its register may change after this.
+    fn materialize(state: *Self, vreg: usize) -> i32 {
+        const slot = Self.allocateSlot(state, vreg)
+        const home = Self.lazyHome(state, vreg)
+        if home == 0 {
+            encoder.emitMovMemImm32(state.*.enc, slot, @intCast(i32, Self.lazyConstant(state, vreg)))
+            return slot
+        }
+        encoder.emitMovMemReg(state.*.enc, slot, Self.homeRegister(home))
+        state.*.lazyEpochs[vreg] = lir_module.NONE
+        return slot
+    }
+
+    // Before the instruction at `index`: a block ends at a label or a
+    // branch or return, and its lazy loads that a later instruction reads
+    // go to their slots (a later block may be reached on another path, or
+    // after the register changed). A function's label starts afresh.
+    pub fn settleLazy(state: *Self, index: usize, instruction: lir_module.Inst) -> void {
+        if state.*.lazyPendingCount == 0 { return }
+        const opcode = instruction.opcode
+        if opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE {
+            state.*.lazyPendingCount = 0
+            return
+        }
+        if opcode == lir_module.Opcode.label || opcode == lir_module.Opcode.br || opcode == lir_module.Opcode.condbr || opcode == lir_module.Opcode.icmp_br ||
+            opcode == lir_module.Opcode.ret || opcode == lir_module.Opcode.ret_slice || opcode == lir_module.Opcode.ret_error || opcode == lir_module.Opcode.ret_error_union ||
+            opcode == lir_module.Opcode.unreachable_inst {
+            Self.spillLazy(state, index, 0)
+        }
+    }
+
+    // Before a store into register `home` (0: before a block ends): the
+    // lazy loads of it that an instruction after `index` reads go to their
+    // slots; the rest are no longer pending (only `index` itself may still
+    // read them, before the register changes).
+    pub fn spillLazy(state: *Self, index: usize, home: usize) -> void {
+        var kept: usize = 0
+        var at: usize = 0
+        while at < state.*.lazyPendingCount {
+            const vreg = state.*.lazyPending[at]
+            const affected = home == 0 || Self.lazyHome(state, vreg) == home
+            if affected && Self.isLazy(state, vreg) && state.*.lastUse[vreg] != lir_module.NONE && state.*.lastUse[vreg] > index {
+                const slot = Self.materialize(state, vreg)
+            }
+            if !affected {
+                state.*.lazyPending[kept] = vreg
+                kept += 1
+            }
+            at += 1
+        }
+        state.*.lazyPendingCount = kept
+    }
+
     pub fn pendingRaxIs(state: *Self, vreg: usize) -> bool {
         return state.*.pendingRaxVreg == vreg || state.*.pendingImmediateVreg == vreg
     }
 
     pub fn takeImmediate32(state: *Self, vreg: usize) -> (bool, i32) {
+        if Self.isLazy(state, vreg) && Self.lazyHome(state, vreg) == 0 { return -> (true, @intCast(i32, Self.lazyConstant(state, vreg))) }
         if state.*.pendingImmediateVreg != vreg { return -> (false, 0) }
         const value = state.*.pendingImmediateValue
         if value < -2147483648 || value > 2147483647 { return -> (false, 0) }
@@ -314,6 +485,15 @@ pub const State = struct {
     }
 
     pub fn loadOp(state: *Self, destination: target.Register, vreg: usize) -> void {
+        if Self.isLazy(state, vreg) {
+            const home = Self.lazyHome(state, vreg)
+            if home == 0 {
+                encoder.emitMovRegImm64(state.*.enc, destination, Self.lazyConstant(state, vreg))
+            } else {
+                encoder.emitMovRegReg(state.*.enc, destination, Self.homeRegister(home))
+            }
+            return
+        }
         if state.*.pendingImmediateVreg == vreg {
             state.*.pendingImmediateVreg = lir_module.NONE
             state.*.retainedRaxUseCount += 1
@@ -525,6 +705,8 @@ pub const State = struct {
         state.*.pendingRaxVreg = lir_module.NONE
         state.*.pendingImmediateVreg = lir_module.NONE
         state.*.slotEpoch += 1
+        state.*.lazyPendingCount = 0
+        state.*.fusedGep = lir_module.NONE
         state.*.nextStackSlot = 8
         state.*.frameSize = frame_size
     }

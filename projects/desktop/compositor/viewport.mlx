@@ -1,0 +1,264 @@
+// Surfaces sized apart from their buffers:
+//
+//   - wp_viewporter (viewporter): a surface's buffer cropped (set_source)
+//     and scaled (set_destination) to the surface's size, as video
+//     players, browsers and games drawing at a lower resolution ask for.
+//     The requests land on the surface as pending state that buffers.mlx
+//     applies on commit (`viewport: crop` and `viewport: size` in the
+//     log);
+//   - wp_fractional_scale_manager_v1 (fractional-scale): the scale a
+//     surface should be drawn at, in 120ths. It is always 120 here (the
+//     output's scale is 1); GTK 4, Qt and Firefox then draw at 1 and size
+//     their surfaces through a viewport;
+//   - wp_single_pixel_buffer_manager_v1 (single-pixel-buffer): a 1 x 1
+//     buffer of one colour for a viewport to stretch (backgrounds,
+//     letterboxes). It is an ordinary shm buffer in memory of the
+//     compositor's own, so both renderers show it like any other.
+const wl = @import("std.wayland")
+const state = @import("./state.mlx")
+const shell = @import("./shell.mlx")
+
+const Compositor = state.Compositor
+const Extension = state.SurfaceExtension
+
+// A crop of -1 x -1 at -1, -1 (24.8 fixed): none.
+const UNSET: i32 = -256
+
+fn recordAt(address: usize) -> *Extension {
+    unsafe { return @ptrFromInt(*Extension, address) }
+}
+
+fn contextAt(address: usize) -> *anyopaque {
+    unsafe { return @ptrFromInt(*anyopaque, address) }
+}
+
+fn newRecord(compositor: *Compositor, resource: wl.server.Object, surface: usize) -> usize {
+    const address = @intFromPtr(state.allocate(compositor, @sizeOf(Extension)))
+    const record = recordAt(address)
+    record.*.compositor = compositor
+    record.*.resource = resource
+    record.*.surface = surface
+    return address
+}
+
+fn releaseRecord(address: usize) -> void {
+    const compositor = recordAt(address).*.compositor
+    unsafe { state.release(compositor, @ptrFromInt([*]u8, address), @sizeOf(Extension)) }
+}
+
+// ---------------------------------------------------------------------------
+// viewporter
+
+fn onViewportDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const address = @intFromPtr(context)
+    const record = recordAt(address)
+    // The crop and the size go with the next commit.
+    if record.*.surface != 0 {
+        const surface = state.surfaceAt(record.*.surface)
+        surface.*.viewport = 0
+        surface.*.pendingCrop = [4]i32{ UNSET, UNSET, UNSET, UNSET }
+        surface.*.pendingViewWidth = -1
+        surface.*.pendingViewHeight = -1
+    }
+    releaseRecord(address)
+}
+
+fn onViewport(context: *anyopaque, request: wl.server.Request) -> void {
+    const record = recordAt(@intFromPtr(context))
+    if request.opcode == wl.wp_viewport.REQUEST_DESTROY { return }
+    const resource = wl.wp_viewport.Resource.fromObject(request.object)
+    if record.*.surface == 0 {
+        resource.postError(@intFromEnum(wl.wp_viewport.Error.no_surface), "the surface is gone")
+        return
+    }
+    const surface = state.surfaceAt(record.*.surface)
+    const compositor = record.*.compositor
+    const decoded = wl.wp_viewport.decodeRequest(request)
+    if request.opcode == wl.wp_viewport.REQUEST_SET_SOURCE {
+        const source = decoded.set_source
+        const x = source.x.raw
+        const y = source.y.raw
+        const width = source.width.raw
+        const height = source.height.raw
+        const unset = x == UNSET && y == UNSET && width == UNSET && height == UNSET
+        if !unset && (x < 0 || y < 0 || width <= 0 || height <= 0) {
+            resource.postError(@intFromEnum(wl.wp_viewport.Error.bad_value), "a source rectangle needs a place and a size")
+            return
+        }
+        surface.*.pendingCrop = [4]i32{ x, y, width, height }
+        if compositor.*.verbose {
+            state.say("viewport: crop ")
+            if unset {
+                state.say("none")
+            } else {
+                state.sayInteger(width / 256)
+                state.say("x")
+                state.sayInteger(height / 256)
+                state.say(" at ")
+                state.sayInteger(x / 256)
+                state.say(",")
+                state.sayInteger(y / 256)
+            }
+            state.say("\n")
+        }
+    } else if request.opcode == wl.wp_viewport.REQUEST_SET_DESTINATION {
+        const width = decoded.set_destination.width
+        const height = decoded.set_destination.height
+        const unset = width == -1 && height == -1
+        if !unset && (width <= 0 || height <= 0) {
+            resource.postError(@intFromEnum(wl.wp_viewport.Error.bad_value), "a destination needs a size")
+            return
+        }
+        surface.*.pendingViewWidth = width
+        surface.*.pendingViewHeight = height
+        if compositor.*.verbose {
+            state.say("viewport: size ")
+            if unset {
+                state.say("none")
+            } else {
+                state.sayInteger(width)
+                state.say("x")
+                state.sayInteger(height)
+            }
+            state.say("\n")
+        }
+    }
+}
+
+fn onViewporter(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.wp_viewporter.REQUEST_GET_VIEWPORT { return }
+    const decoded = wl.wp_viewporter.decodeRequest(request).get_viewport
+    const surface = state.findSurface(compositor, decoded.surface.object)
+    if surface == 0 { return }
+    if state.surfaceAt(surface).*.viewport != 0 {
+        wl.wp_viewporter.Resource.fromObject(request.object).postError(@intFromEnum(wl.wp_viewporter.Error.viewport_exists), "the surface has a viewport already")
+        return
+    }
+    const address = newRecord(compositor, decoded.id.object, surface)
+    state.surfaceAt(surface).*.viewport = address
+    decoded.id.setHandler(onViewport, contextAt(address))
+    decoded.id.setDestroyHandler(onViewportDestroyed, contextAt(address))
+}
+
+fn bindViewporter(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.wp_viewporter.Resource.fromObject(object).setHandler(onViewporter, context)
+}
+
+// ---------------------------------------------------------------------------
+// fractional-scale
+
+fn onFractionalScaleDestroyed(context: *anyopaque, object: wl.server.Object) -> void {
+    const address = @intFromPtr(context)
+    const record = recordAt(address)
+    if record.*.surface != 0 { state.surfaceAt(record.*.surface).*.fractionalScale = 0 }
+    releaseRecord(address)
+}
+
+fn onFractionalScale(context: *anyopaque, request: wl.server.Request) -> void {}
+
+fn onFractionalManager(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.wp_fractional_scale_manager_v1.REQUEST_GET_FRACTIONAL_SCALE { return }
+    const decoded = wl.wp_fractional_scale_manager_v1.decodeRequest(request).get_fractional_scale
+    const surface = state.findSurface(compositor, decoded.surface.object)
+    if surface == 0 { return }
+    if state.surfaceAt(surface).*.fractionalScale != 0 {
+        wl.wp_fractional_scale_manager_v1.Resource.fromObject(request.object).postError(@intFromEnum(wl.wp_fractional_scale_manager_v1.Error.fractional_scale_exists), "the surface has a fractional scale already")
+        return
+    }
+    const address = newRecord(compositor, decoded.id.object, surface)
+    state.surfaceAt(surface).*.fractionalScale = address
+    decoded.id.setHandler(onFractionalScale, contextAt(address))
+    decoded.id.setDestroyHandler(onFractionalScaleDestroyed, contextAt(address))
+    decoded.id.sendPreferredScale(120)
+}
+
+fn bindFractionalManager(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.wp_fractional_scale_manager_v1.Resource.fromObject(object).setHandler(onFractionalManager, context)
+}
+
+// ---------------------------------------------------------------------------
+// single-pixel-buffer
+
+fn onSinglePixel(context: *anyopaque, request: wl.server.Request) -> void {
+    const compositor = state.compositorOf(context)
+    if request.opcode != wl.wp_single_pixel_buffer_manager_v1.REQUEST_CREATE_U32_RGBA_BUFFER { return }
+    const decoded = wl.wp_single_pixel_buffer_manager_v1.decodeRequest(request).create_u32_rgba_buffer
+    var memory: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&memory, 4096) {
+        wl.server.postError(request.object, 0, "no memory for the buffer")
+        return
+    }
+    // The channels come premultiplied, 0 to 0xFFFFFFFF: their top bytes
+    // are the pixel's.
+    const alpha = decoded.a >> 24
+    const pixel = (alpha << 24) | ((decoded.r >> 24) << 16) | ((decoded.g >> 24) << 8) | (decoded.b >> 24)
+    const word: *u32 = unsafe { @ptrFromInt(*u32, memory.address) }
+    word.* = pixel
+    const format = if alpha == 255 { wl.wl_shm.Format.xrgb8888 } else { wl.wl_shm.Format.argb8888 }
+    const pool = shell.newPool(compositor, memory, false)
+    shell.addBuffer(pool, decoded.id, 0, 1, 1, 4, @intFromEnum(format))
+    shell.releasePool(pool)
+}
+
+fn bindSinglePixel(context: *anyopaque, client: wl.server.Client, object: wl.server.Object, version: u32) -> void {
+    wl.wp_single_pixel_buffer_manager_v1.Resource.fromObject(object).setHandler(onSinglePixel, context)
+}
+
+// ---------------------------------------------------------------------------
+
+// A surface is going away: its viewport and fractional scale stay until
+// the client destroys them, attached to no surface.
+pub fn surfaceGone(surface: *state.Surface) -> void {
+    if surface.*.viewport != 0 { recordAt(surface.*.viewport).*.surface = 0 }
+    if surface.*.fractionalScale != 0 { recordAt(surface.*.fractionalScale).*.surface = 0 }
+    surface.*.viewport = 0
+    surface.*.fractionalScale = 0
+}
+
+pub fn createGlobals(compositor: *Compositor) -> bool {
+    const memory: [*]u8 = unsafe { @ptrCast([*]u8, compositor) }
+    const context = state.contextOf(memory)
+    if compositor.*.server.createGlobal(wl.Interface.wp_viewporter, 1, bindViewporter, context) == 0 { return false }
+    if compositor.*.server.createGlobal(wl.Interface.wp_fractional_scale_manager_v1, 1, bindFractionalManager, context) == 0 { return false }
+    return compositor.*.server.createGlobal(wl.Interface.wp_single_pixel_buffer_manager_v1, 1, bindSinglePixel, context) != 0
+}
+
+// ---------------------------------------------------------------------------
+// The handlers this file registers with the Wayland server, by name: when
+// the shell is loaded again (modules.mlx), each resource's handler is
+// replaced by the new code's function of the same name. Every function
+// passed to setHandler, setDestroyHandler, createGlobal or a client
+// handler here must be listed (tools/check_compositor_modules.py checks;
+// --fix rewrites this table).
+
+pub const HANDLER_COUNT: usize = 10
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(bindFractionalManager) }
+    if index == 1 { return @intFromPtr(bindSinglePixel) }
+    if index == 2 { return @intFromPtr(bindViewporter) }
+    if index == 3 { return @intFromPtr(onFractionalManager) }
+    if index == 4 { return @intFromPtr(onFractionalScale) }
+    if index == 5 { return @intFromPtr(onFractionalScaleDestroyed) }
+    if index == 6 { return @intFromPtr(onSinglePixel) }
+    if index == 7 { return @intFromPtr(onViewport) }
+    if index == 8 { return @intFromPtr(onViewportDestroyed) }
+    if index == 9 { return @intFromPtr(onViewporter) }
+    return 0
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "viewport.bindFractionalManager" }
+    if index == 1 { return "viewport.bindSinglePixel" }
+    if index == 2 { return "viewport.bindViewporter" }
+    if index == 3 { return "viewport.onFractionalManager" }
+    if index == 4 { return "viewport.onFractionalScale" }
+    if index == 5 { return "viewport.onFractionalScaleDestroyed" }
+    if index == 6 { return "viewport.onSinglePixel" }
+    if index == 7 { return "viewport.onViewport" }
+    if index == 8 { return "viewport.onViewportDestroyed" }
+    if index == 9 { return "viewport.onViewporter" }
+    return ""
+}
