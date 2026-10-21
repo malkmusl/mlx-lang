@@ -187,6 +187,22 @@ by that image) and no worse than today.
   its size class (not the heap's 256 KiB slabs); the page allocator stays
   watched for the backing sites.
 
+### The check
+
+`mlx-codemap workarounds` (and Observatory's findings, `query
+workaround:pages|tables|arrays`, `history`) counts the idiom's
+violations, so that the conversion is measured and does not come back
+([tools/codemap/workarounds.mlx](../../tools/codemap/workarounds.mlx)):
+a `page_allocator.init()` outside `BACKING_SITES` (the bootstrap,
+`std.heap` and `std.leaks`, `compiler/selfhost`, `compiler/libc`, the
+compilers' arenas in `compiler/cc/base.mlx` and `cheaders.mlx`,
+`tools/codemap/index.mlx`, the tests), an open-addressing probe in a
+function that speaks of a hash, a slot or a probe, and a struct with a
+`[*]T` field and a `capacity: usize` (both outside `CONTAINER_SITES`).
+On this tree before the conversion: 214 pages, 37 tables, 50 arrays.
+`mlx-codemap rewrite pages [PATH] --apply` makes
+`std.page_allocator.init()` into `std.heap.allocator()`.
+
 ### The order
 
 1. `std`: `std.hash`, the containers, `std.heap`; then the tables and
