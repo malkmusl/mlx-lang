@@ -16,6 +16,8 @@ namespaces, libxml2's SAX2 push parser in Mlx (its events, errors and
 quirks; DTD entities and attribute defaults; UTF-8, UTF-16, Latin-1 and
 std.unicode.charmaps' encodings), on `xml/text.mlx`, `xml/encoding.mlx`
 and `xml/uri.mlx`; compiler/libc/xml2 is libxml2's C API made of it.
+`xml/text.mlx` (`std.xml.text`) also escapes text for XML written out
+and checks names (Name, NCName, QName, Nmtoken; test 383).
 `wayland.mlx` (`std.wayland`) and `wayland/` contain the protocol parser,
 the materializer, the wire format, the Linux transport, and the client and
 server runtimes. `wayland/generated/` holds the modules materialized from
@@ -80,6 +82,8 @@ cookies.txt file; test 377), `http/status.mlx` (reason phrases),
 `http/form.mlx` (application/x-www-form-urlencoded),
 `http/chunked.mlx` (the chunked coding's size lines),
 `http/sniff.mlx` (MIME sniffing, the WHATWG standard's rules),
+`http/mime.mlx` (`std.http.mime`: a local file's media type from its
+name's extension or first bytes, as GIO guesses; test 383),
 `http/websocket.mlx` (RFC 6455's keys, accepts, protocols and extensions
 of the handshake, frame headers, masking, UTF-8) with
 `http/websocket/deflate.mlx` (permessage-deflate, RFC 7692),

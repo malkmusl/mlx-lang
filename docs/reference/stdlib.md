@@ -104,6 +104,14 @@ compiler-core std do not load the generated protocol modules. See
 [Wayland](wayland.md) for the pipeline, runtime and tests
 (`tests/240_std_xml_tokenizer_runtime.mlx` covers `std.xml`).
 
+`std.xml.sax` (`std/src/xml/sax.mlx`, test 374) is the streaming parser
+libxml2's C API is made of; `std.xml.text` beside it holds, for programs
+writing XML, text escaped for character data, an attribute's value,
+ASCII-only output and HTML (`writeEscaped(sink, text, mode)`, the escapes
+of xmlEncodeEntitiesReentrant and xmlEncodeSpecialChars) and names
+checked as Name, NCName, QName or Nmtoken (`validName`, `isName`,
+`isNCName`, `isQName`, `isNmtoken`, `nameEnd`; test 383).
+
 `std.json` (`std/src/json.mlx`), `std.vulkan` (`std/src/vulkan.mlx`,
 materialized from the Vulkan registry, with `std.vulkan.loader` and
 `std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
@@ -1527,7 +1535,12 @@ shim over them with libsoup 3.4)
 knows), `std.http.date`, `std.http.status`, `std.http.form`,
 `std.http.chunked`, `std.http.sniff`, `std.http.psl` (the Public Suffix
 List), `std.http.cookie` and `std.http.websocket` (see `std/src/README.md`
-for each). Tests 370 and 371 cover them.
+for each). Tests 370 and 371 cover them. `std.http.mime` is the other
+side of sniffing: the media type of a local file, guessed from the
+name's extension (the web's common types, as GIO answers from the
+shared-mime-info database, with whether it calls the answer uncertain;
+`byName`), from the first bytes (`byData`: signatures, tags, text) or
+both (`guess`, g_content_type_guess's rule); test 383.
 
 ### Message heads (`std.http.message`)
 

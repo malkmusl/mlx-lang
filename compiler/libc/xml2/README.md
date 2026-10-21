@@ -37,7 +37,9 @@ messages, lines and columns, the parser's state after them):
 - `uri.mlx`: URI references as uri.c parses them (namespace names and
   system identifiers are checked).
 - `text.mlx`: the dictionary of names, buffers, XML's character classes,
-  the printf subset of the messages.
+  the printf subset of the messages, text escaped and names checked
+  (xmlEncodeEntitiesReentrant, xmlEncodeSpecialChars, xmlValidateName
+  and its kin are its).
 
 This directory is the C layer: the headers (made by mlx-cheaders from
 `api/*.mlx`) and the exported functions over std.xml.sax. A parser
