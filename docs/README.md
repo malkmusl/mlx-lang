@@ -76,6 +76,11 @@ How the compiler itself works, normatively and concretely:
   written entirely in Mlx (lexer → parser → sema → comptime → LIR →
   x86_64 backend → ELF64), including where its current implementation is
   narrower than the normative spec
+- [`internals/allocators-and-containers.md`](internals/allocators-and-containers.md)
+  — the hand-written tables, arrays and arenas of the tree and the
+  `std.page_allocator` sites, what replaces each (`std.heap`, the generic
+  containers), the Observatory baseline before the conversion, and the
+  idiom
 
 ## Architecture notes
 
