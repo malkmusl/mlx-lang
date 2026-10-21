@@ -73,7 +73,10 @@ move, written to answer as libsoup does for mlx-soup
 (compiler/libc/soup): `http/headers.mlx` (header lists, tokens,
 q-values, parameters with RFC 5987's form, the names libsoup knows),
 `http/date.mlx` (HTTP's and cookies' date forms), `http/cookie.mlx`
-(Set-Cookie's syntax, RFC 6265), `http/status.mlx` (reason phrases),
+(cookies, RFC 6265: read from Set-Cookie with libsoup's rules, written
+back, matched) and `http/cookiejar.mlx` (the jar: domains, accept
+policies and third parties by the Public Suffix List, SameSite, the
+cookies.txt file; test 377), `http/status.mlx` (reason phrases),
 `http/form.mlx` (application/x-www-form-urlencoded),
 `http/chunked.mlx` (the chunked coding's size lines),
 `http/sniff.mlx` (MIME sniffing, the WHATWG standard's rules),

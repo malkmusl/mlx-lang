@@ -1542,6 +1542,50 @@ challenge splitting and the written values; mlx-soup's `SoupAuthBasic`,
 `SoupAuthDigest`, auth manager and auth domains (compiler/libc/soup) are
 over it.
 
+### Cookies (`std.http.cookie`, `std.http.cookiejar`)
+
+`std/src/http/cookie.mlx` is a cookie (RFC 6265) as libsoup reads,
+writes and matches one. A `Cookie` has a name, value, domain and path
+(the last two may be absent), an expiry in seconds since the Unix epoch
+(none for a session cookie), Secure, HttpOnly and `SameSite` (none, lax,
+strict); it owns its texts (one block of an allocator, `cookieFree`) or
+borrows them (`view`). `parseSetCookie(allocator, text, hasOrigin, host,
+path, now, &out)` reads a Set-Cookie value with libsoup's rules: Max-Age
+and Expires in order, the last one winning; a domain needing a dot past
+its first character and getting one before it unless it is an address;
+the origin's host having to be in the domain; the default path from the
+request's. `write`/`writeSetCookie`/`writeCookieHeader` write it back
+(`expires=` in the cookie date form, `path=`, `domain=`, `SameSite=`,
+`secure`, `HttpOnly`). `hostMatches`, `pathMatches`, `defaultPath`,
+`appliesTo(cookie, https, path, now)`, `equal` (name, value, path),
+`isExpired`, `setMaxAge`, `isIpAddress`; `nameAndValue`, `nextAttribute`
+and `value` are the syntax alone.
+
+`std/src/http/cookiejar.mlx` is the jar: `init(&jar, allocator)`,
+`setCookie(&jar, header, &origin, hasFirstParty, firstPartyHost, now)`
+and `addCookie` take a cookie by the jar's `policy` (`Policy.always`,
+`never`, `noThirdParty`, `grandfatheredThirdParty`: a third party is one
+whose registrable domain, by the Public Suffix List, is not the first
+party's; `baseDomain`) and libsoup's rules (no public suffixes, no
+Secure cookie from http, SameSite=None only with Secure, the `__Secure-`
+and `__Host-` prefixes, no control characters, 4096 bytes), replacing
+one of the same name and path or dropping an expired one; `cookiesFor(&jar,
+&request, now, &found)` gives those that go with a `Request` (host,
+normalized path, https, for HTTP or a script, a safe method, a top-level
+navigation, the top-level site and the site for cookies for SameSite),
+longest paths first then the oldest, as `writeCookieHeader` lists them;
+`deleteCookie`, `next` with an `Iterator`, `count`; `onChanged(&jar,
+callback, context)` is told of each change with the cookie before and
+after. The Mozilla cookies.txt form (`#HttpOnly_` lines, `TRUE`/`FALSE`
+flags, expiry, SameSite last): `loadText`, `writeText`, `parseTextLine`,
+`writeTextLine`, and `rewriteText` (what SoupCookieJarText writes after a
+change).
+
+`tests/377_http_cookies_runtime.mlx` feeds a jar what mlx-soup's
+`tests/cookies.c` feeds one and expects the headers libsoup gives;
+mlx-soup's SoupCookie, SoupCookieJar, SoupCookieJarText and
+SoupCookieJarDB are over these modules.
+
 ## Networking (`std.net`) — not yet normative
 
 **Normative source:** none (see gap below)
