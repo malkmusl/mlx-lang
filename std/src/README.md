@@ -60,7 +60,11 @@ in Mlx and constant time where a secret is involved: `crypto/hash.mlx`
 (SHA-1/2 behind one state, HMAC, HKDF), `crypto/gcm.mlx` (AES-GCM),
 `crypto/chacha.mlx` (ChaCha20, Poly1305, their AEAD),
 `crypto/bignum.mlx` (Montgomery arithmetic up to 4096 bits),
-`crypto/rsa.mlx` (PKCS #1 v1.5 and PSS verification), `crypto/ecc.mlx`
+`crypto/mpi.mlx` (`std.crypto.mpi`: signed integers of any size in an
+allocator's memory, division, gcd, inverses, `powm`, primes found; test
+384), `crypto/rsa.mlx` (PKCS #1 v1.5 and PSS verification; with a
+private key, both signatures, PKCS #1 v1.5 and OAEP encryption and
+decryption by the CRT, key generation; test 384), `crypto/ecc.mlx`
 (P-256 and P-384: ECDSA, ECDH) and `crypto/curve25519.mlx` (X25519,
 Ed25519). `asn1.mlx` (`std.asn1`) reads DER; `x509.mlx` (`std.x509`)
 parses certificates, verifies chains against a trust store (the system's

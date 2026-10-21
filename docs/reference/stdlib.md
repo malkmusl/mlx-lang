@@ -1524,6 +1524,38 @@ query's pairs (`nextPair`). It allocates nothing: a `Uri` borrows its
 text. `tests/380_uri_message_runtime.mlx` checks RFC 3986 5.4's
 examples among others.
 
+## Public-key arithmetic (`std.crypto.mpi`, `std.crypto.rsa`)
+
+**Normative source:** none yet (RFC 8017 for RSA; `tools/check_gcrypt.sh`
+compares the libgcrypt shim, whose limb arithmetic is this module's, with
+libgcrypt 1.10)
+
+`std/src/crypto/mpi.mlx` is signed integers of any size, 64-bit limbs in
+memory of an `Allocator` (`init`, `deinit`): read from and written as
+hexadecimal (`fromHex`, `writeHex`) or big-endian bytes (`fromBytes`,
+`toBytes`), `add`, `sub`, `mul` and their `U64` forms, `divRem`
+(truncating) and `floorDivRem`, `mod`, `remainderU64`, `compare`,
+bits (`bitLength`, `testBit`, `setBit`, `clearBit`, `clearHigh`,
+`shiftLeft`, `shiftRight`), `powm` (an odd modulus goes through
+std.crypto.bignum's constant-time ladder, so a secret exponent is safe;
+`powmPublic` is faster for one that is not), `gcd`, `invm`,
+`isProbablePrime` (trial division, then Miller-Rabin with random bases)
+and `generatePrime(p, bits, e)` with gcd(p - 1, e) = 1. An operand may
+be the result; every operation answers false when memory ran out. The
+limb routines (`addLimbs`, `mulLimbs`, `divLimbs`...) are public for
+code with limbs of its own.
+
+`std/src/crypto/rsa.mlx` adds to its verification a `PrivateKey`
+(`privateKeyInit` from n, e, d and optionally p and q, the CRT's values
+worked out and p q = n checked; 6 KB, kept where it was initialized):
+`signPkcs1`, `signPss` (a salt given) and `signPssRandom`,
+`encryptPkcs1` (`encryptPkcs1With` a padding given) and `decryptPkcs1`,
+`encryptOaep` (a seed given) and `encryptOaepRandom` and `decryptOaep`,
+and `generateKey(key, allocator, bits, e)`. The private operation runs
+by the CRT on std.crypto.bignum and its result is checked with e before
+it is given out. Test 384 checks the arithmetic and signatures and
+ciphers against values Python computed, and a generated key.
+
 ## HTTP (`std.http.*`)
 
 **Normative source:** none yet (the modules follow libsoup's behaviour,

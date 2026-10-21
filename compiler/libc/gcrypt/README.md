@@ -37,9 +37,10 @@ no headers written by hand.
   CBC, CTR (any piece size, the counter carried), GCM (AAD and text in
   pieces, IVs of any length, tags of 4 to 16 bytes, `checktag`) and the
   AES key wrap (RFC 3394), with libgcrypt's errors for misuse.
-- **MPIs** (mpi.mlx): signed numbers of 64-bit limbs; scanning and
-  printing in every format (STD, USG, PGP, SSH, HEX), arithmetic,
-  Knuth's division in both roundings, the modular operations, `powm`
+- **MPIs** (mpi.mlx): signed numbers of 64-bit limbs (the limb
+  arithmetic std.crypto.mpi's); scanning and printing in every format
+  (STD, USG, PGP, SSH, HEX), Knuth's division in both roundings, the
+  modular operations, `powm`
   (an odd modulus by std.crypto.bignum's constant-time Montgomery
   ladder), `gcd`, `invm`, bits and shifts, opaque values, the constants,
   flags. libgcrypt's quirks are kept: `gcry_mpi_cmp` answers the
@@ -64,7 +65,8 @@ no headers written by hand.
   encryption (OAEP, PKCS #1 v1.5), the private operation by the CRT with
   the key's p, q and u (checked with e after signing, as libgcrypt
   does), key generation (sieved random primes, Miller-Rabin, p < q,
-  `u = p^-1 mod q`, `d` modulo the lcm); ECDSA (sign and verify,
+  `u = p^-1 mod q`, `d` modulo the lcm; std.crypto.rsa has the same
+  operations for Mlx programs, on std.crypto.mpi); ECDSA (sign and verify,
   generated keys), ECDH through `gcry_pk_encrypt` as WebCore derives
   bits, EdDSA on Ed25519 (RFC 8032; generated keys); `get_nbits`,
   `testkey`. Data and results are libgcrypt's S-expressions:
