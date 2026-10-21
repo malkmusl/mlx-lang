@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compares MLX Capture's libpipewire (compiler/capi/pipewire) with
+"""Compares MLX Capture's libpipewire (compiler/libc/pipewire) with
 PipeWire's on the functions that work on values alone: the version and
 names, the state and direction strings, the properties (pw_properties_*:
 building, lookup, parsing, copying, updating, the dict C reads), the

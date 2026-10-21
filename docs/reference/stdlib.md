@@ -104,6 +104,14 @@ compiler-core std do not load the generated protocol modules. See
 [Wayland](wayland.md) for the pipeline, runtime and tests
 (`tests/240_std_xml_tokenizer_runtime.mlx` covers `std.xml`).
 
+`std.xml.sax` (`std/src/xml/sax.mlx`, test 374) is the streaming parser
+libxml2's C API is made of; `std.xml.text` beside it holds, for programs
+writing XML, text escaped for character data, an attribute's value,
+ASCII-only output and HTML (`writeEscaped(sink, text, mode)`, the escapes
+of xmlEncodeEntitiesReentrant and xmlEncodeSpecialChars) and names
+checked as Name, NCName, QName or Nmtoken (`validName`, `isName`,
+`isNCName`, `isQName`, `isNmtoken`, `nameEnd`; test 383).
+
 `std.json` (`std/src/json.mlx`), `std.vulkan` (`std/src/vulkan.mlx`,
 materialized from the Vulkan registry, with `std.vulkan.loader` and
 `std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
@@ -301,7 +309,7 @@ native protocol (the version, the packet descriptor, the commands, the
 errors, the subscription facilities) and `std.pulse.tagstruct` writes and
 reads the tagstructs its commands are made of, into a buffer or (for a
 client library) into memory that grows; MLX Audio's server
-(`projects/desktop/audio`) and its libpulse (`compiler/capi/pulse`) are
+(`projects/desktop/audio`) and its libpulse (`compiler/libc/pulse`) are
 the two ends that use them.
 `std.pipewire` (`std/src/pipewire.mlx`) has the numbers of PipeWire's
 native protocol (the core's, client's, registry's and client node's
@@ -309,7 +317,7 @@ methods and events, SPA's params, IO areas, commands, formats, buffer
 data and struct pw_node_activation's layout) and `std.pipewire.pod`
 writes and reads the SPA pods its messages are made of; MLX Capture's
 server (`projects/desktop/capture`) and its libpipewire
-(`compiler/capi/pipewire`) are the two ends that use them.
+(`compiler/libc/pipewire`) are the two ends that use them.
 
 `std.jpeg` (`std/src/jpeg.mlx`) encodes premultiplied ARGB words as
 baseline JPEG (4:2:0, standard tables scaled by a quality of 1 to 100,
@@ -407,9 +415,22 @@ header it reads, and `message(&inflater.stream)` words what was wrong
 is 8 KiB of stack). `inflate` (raw data), `gunzip` and `gzipSize` are the
 earlier one-call forms. The engine itself (`std.flate.deflate`,
 `std.flate.inflate`, on a `Stream` with zlib's return codes) is what the
-zlib C API, `compiler/capi/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
+zlib C API, `compiler/libc/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
 programs), is made of. `tests/343_flate_runtime.mlx` checks zlib's bytes,
 round trips in every format and in pieces, and damaged data.
+
+`std.flate.gzip` (`std/src/flate/gzip.mlx`) is gzip files, what zlib's
+gz* functions do, for Mlx programs: a `Reader` (`openRead` or
+`readerInit` over a file, `read` in pieces of any size, `readToEnd`,
+`readerClose`) gives the uncompressed bytes of a file's gzip members one
+after another, reads a file that is not gzip as it is, leaves alone what
+follows the last member and names what went wrong (`readerError`: a
+damaged member, a truncated one, the file); a `Writer` (`openWrite` or
+`writerInit` at a level, `write`, `flush`, `writerClose`, which finishes
+the member) writes one member; `readFile` and `writeFile` do a whole
+file at once. Each buffers 8 KiB in memory of the allocator.
+`tests/385_flate_gzip_runtime.mlx` writes and reads files in odd pieces,
+two members, a plain file, trailing data, damaged and truncated members.
 
 `std.crc` (`std/src/crc.mlx`) has the check values: `crc32(crc, data,
 length)` (the CRC-32 of gzip, zlib, PNG and ZIP, 0 to start),
@@ -989,7 +1010,7 @@ spaces and tabs, stops at the padding, and refuses (or, with
 `ignoreGarbage`, skips) bytes outside the alphabet. `hexEncode` writes
 lower-case hex, the way digests are printed, and `hexDecode` reads hex
 of either case. The coreutils `base64`, `base32` and `basenc` and GLib's
-`g_base64_*` (`compiler/capi/glib/strings.mlx`) use it.
+`g_base64_*` (`compiler/libc/glib/strings.mlx`) use it.
 
 ```mlx
 const base64 = @import("std.base64")
@@ -1214,7 +1235,7 @@ const length = spawn.capture(&options, true, &output, 4096, &status)
 
 **Implementation:** `std/src/fontconfig.mlx` and `std/src/fontconfig/`
 **Source tests:** `373_fontconfig_runtime.mlx` (run by `tests/run_std_modules.sh`);
-`tools/check_fontconfig.sh` for the C API over it (compiler/capi/fontconfig)
+`tools/check_fontconfig.sh` for the C API over it (compiler/libc/fontconfig)
 
 Fontconfig 2.15's font matching without a C library: `load.current()`
 reads fonts.conf and what it includes (or Fontconfig's fallback
@@ -1496,9 +1517,282 @@ above for what's actually exercised — `getTid`/`yield`/`futexWait`/
 `futexWake` through the raw syscall gateway, not a handle-based spawn/join
 API. No fixture calls `clone`/`clone3` to actually spawn an OS thread.
 
-## Networking (`std.net`) — not yet normative
+## URIs (`std.uri`)
 
-**Normative source:** none (see gap below)
+**Normative source:** none yet (RFC 3986)
+
+`std/src/uri.mlx` splits a URI reference into its parts (`parse(text,
+&uri)`: scheme, userinfo, host with an IPv6 literal's brackets, port,
+path, query, fragment, each with whether it is there; a port that is not
+digits, a space, a control character or a broken `%XX` is refused),
+resolves a reference against a base (`resolve(&base, reference, out)`,
+RFC 3986 5.2 with `removeDotSegments`; 0 when it does not fit), writes a
+URI back (`write`, `writeNormalized` with the scheme and host in lower
+case and a default port left out, `writeTarget` for a request's path and
+query, `writeHostHeader`), knows the default ports (`portOf`,
+`defaultPort`, `usesDefaultPort`, `hostName`, `sameOrigin`, `isHttp`,
+`isHttps`), percent-codes (`decode` with `+` as a space when asked,
+`encode` with what to keep, `PATH_ALLOWED`, `QUERY_ALLOWED`) and walks a
+query's pairs (`nextPair`). It allocates nothing: a `Uri` borrows its
+text. `tests/380_uri_message_runtime.mlx` checks RFC 3986 5.4's
+examples among others.
+
+## Public-key arithmetic (`std.crypto.mpi`, `std.crypto.rsa`)
+
+**Normative source:** none yet (RFC 8017 for RSA; `tools/check_gcrypt.sh`
+compares the libgcrypt shim, whose limb arithmetic is this module's, with
+libgcrypt 1.10)
+
+`std/src/crypto/mpi.mlx` is signed integers of any size, 64-bit limbs in
+memory of an `Allocator` (`init`, `deinit`): read from and written as
+hexadecimal (`fromHex`, `writeHex`) or big-endian bytes (`fromBytes`,
+`toBytes`), `add`, `sub`, `mul` and their `U64` forms, `divRem`
+(truncating) and `floorDivRem`, `mod`, `remainderU64`, `compare`,
+bits (`bitLength`, `testBit`, `setBit`, `clearBit`, `clearHigh`,
+`shiftLeft`, `shiftRight`), `powm` (an odd modulus goes through
+std.crypto.bignum's constant-time ladder, so a secret exponent is safe;
+`powmPublic` is faster for one that is not), `gcd`, `invm`,
+`isProbablePrime` (trial division, then Miller-Rabin with random bases)
+and `generatePrime(p, bits, e)` with gcd(p - 1, e) = 1. An operand may
+be the result; every operation answers false when memory ran out. The
+limb routines (`addLimbs`, `mulLimbs`, `divLimbs`...) are public for
+code with limbs of its own.
+
+`std/src/crypto/rsa.mlx` adds to its verification a `PrivateKey`
+(`privateKeyInit` from n, e, d and optionally p and q, the CRT's values
+worked out and p q = n checked; 6 KB, kept where it was initialized):
+`signPkcs1`, `signPss` (a salt given) and `signPssRandom`,
+`encryptPkcs1` (`encryptPkcs1With` a padding given) and `decryptPkcs1`,
+`encryptOaep` (a seed given) and `encryptOaepRandom` and `decryptOaep`,
+and `generateKey(key, allocator, bits, e)`. The private operation runs
+by the CRT on std.crypto.bignum and its result is checked with e before
+it is given out. Test 384 checks the arithmetic and signatures and
+ciphers against values Python computed, and a generated key.
+
+## HTTP (`std.http.*`)
+
+**Normative source:** none yet (the modules follow libsoup's behaviour,
+which WebKit's network code expects; `tools/check_soup.sh` compares the C
+shim over them with libsoup 3.4)
+
+`std/src/http/` holds HTTP's pieces that do not depend on how bytes move:
+`std.http.headers` (header lists, q-values, parameters, the names libsoup
+knows), `std.http.date`, `std.http.status`, `std.http.form`,
+`std.http.chunked`, `std.http.sniff`, `std.http.psl` (the Public Suffix
+List), `std.http.cookie` and `std.http.websocket` (see `std/src/README.md`
+for each). Tests 370 and 371 cover them. `std.http.mime` is the other
+side of sniffing: the media type of a local file, guessed from the
+name's extension (the web's common types, as GIO answers from the
+shared-mime-info database, with whether it calls the answer uncertain;
+`byName`), from the first bytes (`byData`: signatures, tags, text) or
+both (`guess`, g_content_type_guess's rule); test 383.
+
+### Message heads (`std.http.message`)
+
+`std/src/http/message.mlx` reads and writes HTTP/1.1 heads as libsoup
+does: `parseRequestLine` (the status a bad one deserves: 400, 505),
+`parseStatusLine` (HTTP/1.x and Shoutcast's ICY, the version said even
+when the code is bad), `headerLines`/`headerLinesFrom` with `nextHeader`
+(continuation lines folded to one space, trailing spaces off, carriage
+returns made spaces, lines that are not headers passed over, a head cut
+short told by `truncated`), `headEnd` (past the blank line);
+`writeRequestLine`, `writeStatusLine`, `writeHeader`, `writeHeadEnd`;
+`framingOf` (chunked, Content-Length, to the connection's end, or no
+body), `responseHasNoBody`; and the rules of redirects as libsoup
+follows them (`redirectOf`: 303, and 302 of an unsafe method, and 301 of
+a POST as a GET; 301, 302, 307 and 308 of a safe method as they are;
+`isSafeMethod`, `MAX_REDIRECTS`). mlx-soup's soup_headers_parse,
+soup_headers_parse_request, soup_headers_parse_status_line and the
+session's redirect handler are over it; test 380 checks it.
+
+### The client (`std.http.client`)
+
+`std/src/http/client.mlx` is an HTTP/1.1 client for Mlx programs (the
+browser Voyager's), on std.net, std.tls and the modules above. A
+`Session` (`init`, `deinit`) keeps up to eight connections by scheme,
+host and port and reuses them while they stay open; `request(&session,
+&req, &response)` (`get`, `post`) sends a `Request` (method, URL, extra
+header lines, a body) and gives a `Response`: the status, version and
+phrase, the head as it came (`header(&response, name, folded, &value)`
+finds one), the body with gzip or deflate undone (`body`), the URL it
+came from and how many redirects were followed (`freeResponse` gives the
+memory back). It follows redirects as libsoup does (`std.http.message`,
+up to `maxRedirects`), answers a 401's Basic or Digest challenge once
+with what the `setCredentials` callback gives for the host and realm and
+keeps the credentials for the host's later requests, sends the cookies
+of a jar and takes the ones set (`setCookieJar`), rewrites http:// to
+https:// for hosts an enforcer knows (`setHsts`), reads bodies framed by
+Content-Length, chunks (trailers passed over) or the connection's end,
+passes over informational responses, and reads no body for HEAD, 1xx,
+204 and 304. https:// runs on std.tls with ALPN http/1.1, the server's
+chain verified against the system's CA bundle
+(`/etc/ssl/certs/ca-certificates.crt`, loaded when first needed) or a
+trust store given (`setTrustStore`), and refused otherwise unless
+`insecure` is set. Each wait on the network takes at most `timeoutMs`
+(30 s); a body past `maxBody` (64 MiB) is `Error.tooLarge`. The errors
+name what went wrong: `badUrl`, `resolve`, `connect`, `tls`, `send`,
+`receive`, `malformed`, `tooManyRedirects`, `noMemory`. Everything is
+synchronous. `tests/382_http_client_runtime.mlx` runs a session against
+a server of its own in a child process on the loopback.
+
+### Authentication (`std.http.auth`)
+
+`std/src/http/auth.mlx` is HTTP authentication (RFC 7235) as libsoup does
+it, allocating nothing:
+
+- `challenges(header)` and `nextChallenge(&it, &challenge)` tell the
+  challenges of a `WWW-Authenticate` or `Proxy-Authenticate` value apart
+  (an item that is a scheme alone, or a scheme and its first parameter,
+  starts one); `schemeIs(challenge, "Digest")`, `paramsOf(challenge,
+  scheme)`, and `findParam(params, name, out, &length)` (the first of
+  that name, unquoted; `Found.bare` for a name alone).
+- Basic (RFC 7617): `basicToken(user, password, out)` (the base64 of
+  `user:password`, in ISO-8859-1 when every character has a code there,
+  as libsoup's `g_convert` makes it; `basicTokenRoom` sizes `out`),
+  `writeBasic(sink, token)`, `basicSpace(path)` (the directory a Basic
+  realm covers).
+- Digest (RFC 7616, MD5 and MD5-sess, `qop=auth`): `digestChallenge(params,
+  &d)` reads a `DigestChallenge` (realm, nonce, opaque, domain, algorithm,
+  the qop options, stale; false when it cannot be answered), `hexUrp`,
+  `hexA1`, `digestResponse(method, uri, &a1, qopAuth, nonce, cnonce, nc,
+  &out)` (RFC 2617's request-digest), `clientNonce`, `nonceCountHex` and
+  `nonceCountOf`, `writeDigest(sink, &credentials)` (the Authorization
+  value as libsoup writes it: `username`, `realm`, `nonce`, `uri`,
+  `algorithm`, `response`, `opaque`, `cnonce`, `nc`, `qop`),
+  `nextDomainItem` and `withoutTrailingSlash` for a challenge's `domain`.
+  A server checks a response with the same `digestResponse`.
+
+`tests/376_http_auth_runtime.mlx` checks RFC 2617's example (Mufasa's
+response `6629fae49393a05397450978507c4ef1`), RFC 7617's token, the
+challenge splitting and the written values; mlx-soup's `SoupAuthBasic`,
+`SoupAuthDigest`, auth manager and auth domains (compiler/libc/soup) are
+over it.
+
+### Cookies (`std.http.cookie`, `std.http.cookiejar`)
+
+`std/src/http/cookie.mlx` is a cookie (RFC 6265) as libsoup reads,
+writes and matches one. A `Cookie` has a name, value, domain and path
+(the last two may be absent), an expiry in seconds since the Unix epoch
+(none for a session cookie), Secure, HttpOnly and `SameSite` (none, lax,
+strict); it owns its texts (one block of an allocator, `cookieFree`) or
+borrows them (`view`). `parseSetCookie(allocator, text, hasOrigin, host,
+path, now, &out)` reads a Set-Cookie value with libsoup's rules: Max-Age
+and Expires in order, the last one winning; a domain needing a dot past
+its first character and getting one before it unless it is an address;
+the origin's host having to be in the domain; the default path from the
+request's. `write`/`writeSetCookie`/`writeCookieHeader` write it back
+(`expires=` in the cookie date form, `path=`, `domain=`, `SameSite=`,
+`secure`, `HttpOnly`). `hostMatches`, `pathMatches`, `defaultPath`,
+`appliesTo(cookie, https, path, now)`, `equal` (name, value, path),
+`isExpired`, `setMaxAge`, `isIpAddress`; `nameAndValue`, `nextAttribute`
+and `value` are the syntax alone.
+
+`std/src/http/cookiejar.mlx` is the jar: `init(&jar, allocator)`,
+`setCookie(&jar, header, &origin, hasFirstParty, firstPartyHost, now)`
+and `addCookie` take a cookie by the jar's `policy` (`Policy.always`,
+`never`, `noThirdParty`, `grandfatheredThirdParty`: a third party is one
+whose registrable domain, by the Public Suffix List, is not the first
+party's; `baseDomain`) and libsoup's rules (no public suffixes, no
+Secure cookie from http, SameSite=None only with Secure, the `__Secure-`
+and `__Host-` prefixes, no control characters, 4096 bytes), replacing
+one of the same name and path or dropping an expired one; `cookiesFor(&jar,
+&request, now, &found)` gives those that go with a `Request` (host,
+normalized path, https, for HTTP or a script, a safe method, a top-level
+navigation, the top-level site and the site for cookies for SameSite),
+longest paths first then the oldest, as `writeCookieHeader` lists them;
+`deleteCookie`, `next` with an `Iterator`, `count`; `onChanged(&jar,
+callback, context)` is told of each change with the cookie before and
+after. The Mozilla cookies.txt form (`#HttpOnly_` lines, `TRUE`/`FALSE`
+flags, expiry, SameSite last): `loadText`, `writeText`, `parseTextLine`,
+`writeTextLine`, and `rewriteText` (what SoupCookieJarText writes after a
+change).
+
+`tests/377_http_cookies_runtime.mlx` feeds a jar what mlx-soup's
+`tests/cookies.c` feeds one and expects the headers libsoup gives;
+mlx-soup's SoupCookie, SoupCookieJar, SoupCookieJarText and
+SoupCookieJarDB are over these modules.
+
+### Strict Transport Security (`std.http.hsts`)
+
+`std/src/http/hsts.mlx` is HSTS (RFC 6797) as libsoup's enforcer keeps
+it. A `Policy` is a domain, its max-age, its expiry (none for a session
+policy) and whether it covers subdomains (`policy(domain, maxAge,
+includeSubdomains, now)`, `sessionPolicy`, `policyWithExpiry`,
+`isSession`, `isExpired`, `equal`, `own`/`policyFree`);
+`parseHeader(value, host, now, &out)` reads a Strict-Transport-Security
+value strictly (max-age in digits, quoted or not; includeSubDomains
+without a value; no parameter twice). An `Enforcer` (`init`, `deinit`,
+`onChanged`) keeps host and session policies: `setPolicy` (an expired
+one removes the domain's; a changed one is told), `setSessionPolicy`,
+`hasValidPolicy`, `includesSubdomains`, `superDomain`, `mustEnforce`
+(the host or a domain above it with a policy covering subdomains),
+`policyAt`; its file is a line per host policy (`writeText`, `loadText`,
+`parseTextLine`). `tests/378_http_hsts_runtime.mlx` checks the headers
+of mlx-soup's `tests/hsts.c` and the enforcer's answers; mlx-soup's
+SoupHSTSPolicy, SoupHSTSEnforcer and SoupHSTSEnforcerDB are over it.
+
+### Multipart bodies (`std.http.multipart`)
+
+`std/src/http/multipart.mlx` cuts and writes multipart bodies (RFC 2046)
+as libsoup does, allocating nothing: `boundaryOf(contentType, out)` (the
+boundary of a `multipart/...` Content-Type), `mediaType`, `paramOf`;
+`parts(body, boundary)` and `nextPart(&it, &part)` give each part's
+header lines (`headers`, and `raw` from the boundary line on) and bytes,
+the preamble skipped, `findBoundary` looking as libsoup looks (a body
+without a closing boundary is not `wellFormed`); `writePartStart`,
+`writeHeader`, `writeHeadersEnd`, `writeClose`, `writeFormDisposition`
+(`form-data; name="..."; filename="..."`), `writeContentType` and
+`makeBoundary` (the SHA-256 of 8 random bytes, in hex) write one.
+mlx-soup's SoupMultipart is over it (its part stream stays GIO's).
+
+### WebSockets (`std.http.websocket`, `std.http.websocket.deflate`)
+
+`std/src/http/websocket.mlx` has RFC 6455's pieces that do not depend on
+how bytes move: `makeKey` (16 random bytes to a Sec-WebSocket-Key),
+`validKey`, `acceptKey` and `acceptMatches` (the server's
+Sec-WebSocket-Accept, compared case aside), `protocolAsked` and
+`anyProtocolAsked` (a Sec-WebSocket-Protocol value split at commas and
+spaces, as libsoup splits it), `nextExtension` (the elements of a
+Sec-WebSocket-Extensions value: name and parameters), frame headers
+(`parseHeader`, `writeHeader`), `applyMask` and `validUtf8`.
+
+`std/src/http/websocket/deflate.mlx` is the permessage-deflate extension
+(RFC 7692) as libsoup's: an `Extension` (`init`, `deinit`) configured
+for a client or a server from an element's parameters
+(`server_no_context_takeover`, `client_no_context_takeover`,
+`server_max_window_bits`, `client_max_window_bits`; `parseParams`,
+`configure`, the `Error` naming what was wrong and `badName` which
+parameter), `REQUEST_PARAMS` and `writeResponseParams`; `outgoing`
+compresses a message (a sync flush, its 00 00 ff ff taken off, RSV1 set
+on the frame's first byte; control frames and empty payloads pass) and
+`incoming` inflates a frame (the tail put back at the message's end,
+fragments carried, context takeover or not), into `Bytes` of the
+extension's allocator (`freeBytes`).
+
+`tests/379_http_multipart_websocket_runtime.mlx` checks the bodies,
+keys (RFC 6455's example), headers and compressed messages; mlx-soup's
+SoupMultipart, handshake and SoupWebsocketExtensionDeflate are over
+them (SoupWebsocketConnection itself stays GIO's).
+
+## Networking (`std.net`, `std.net.dns`)
+
+**Normative source:** none yet (see the gap below)
+
+`std/src/net.mlx` is TCP over IPv4 and IPv6 on std.linux's socket calls:
+an `Address` (family, bytes, port, an IPv6 scope) read from a literal
+(`parseAddress`, `parseIpv4`, `parseIpv6` with brackets, an IPv4 tail
+and a `%scope`) and written back as inet_ntop writes it
+(`writeAddress`), `ipv4(a, b, c, d, port)`, the `sockaddr` both ways;
+`connect(&address, timeoutMs)` (non-blocking until connected, then
+blocking, TCP_NODELAY set), `listen`, `accept`, `localAddress` (the port
+the system picked), `send` (all of it), `receive`, `readable` (with a
+timeout), `shutdownWrite`, `close`. `resolve(name, port, found, max,
+timeoutMs)` is `std/src/net/dns.mlx`'s: an address literal and
+"localhost" answered at once, then `/etc/hosts`, then the name servers
+of `/etc/resolv.conf` asked over UDP for A and AAAA records (RFC 1035
+messages written and read, compression pointers and CNAMEs followed),
+IPv4 addresses first. `tests/381_net_runtime.mlx` checks the addresses,
+a connection on the loopback and the DNS messages.
 
 `spec/04-stdlib/posix.xml` requires the raw syscalls a network stack would
 sit on (`socket bind listen accept connect send recv sendmsg recvmsg poll`),
@@ -1513,11 +1807,12 @@ particularly `os/linux/socket.mlx` and
 > specified. Raw `std.os.linux`/`std.posix` wrappers can follow the platform
 > ABI; a portable `std.net` interface requires an added normative contract.
 
-There is accordingly no `std.net` module, and this chapter does not describe
-one. Programs needing sockets today go directly through
-`std.os.linux.socket`/`std.os.linux.event` (Unix-domain sockets, raw
-`AF_INET`/`AF_INET6` constants, `epoll`, and a raw `io_uring` setup/enter/
-register gateway), as `tests/181_linux_socket_epoll_runtime.mlx` and
+`std.net` above is the first such module, without a normative contract
+yet (no event-loop API, no UDP beyond the resolver's own). Programs
+needing more go directly through `std.os.linux.socket`/`std.os.linux.event`
+(Unix-domain sockets, raw `AF_INET`/`AF_INET6` constants, `epoll`, and a
+raw `io_uring` setup/enter/register gateway), as
+`tests/181_linux_socket_epoll_runtime.mlx` and
 `tests/187_linux_io_uring_runtime.mlx` do.
 
 ## meta

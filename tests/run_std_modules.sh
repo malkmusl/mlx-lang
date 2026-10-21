@@ -133,6 +133,16 @@ run 372_sql_runtime "SQLite's reals and numbers, WebKit's SQL parsed, GROUP BY, 
 run 373_colorprofile_runtime "ICC transforms as Little CMS makes them: BGRA to sRGB, grey, 16-bit, perceptual; the sRGB curve"
 run 374_xml_sax_runtime "XML parsed as libxml2's push parser parses it: SAX2 events, entities, errors, chunks, encodings"
 run 375_fontconfig_runtime "Fontconfig's case folding, names and substitutions; fonts read, cached, matched, sorted and listed as Fontconfig 2.15 does"
+run 376_http_auth_runtime "HTTP authentication: challenges told apart, Basic tokens, Digest responses (RFC 2617's example) and Authorization values"
+run 377_http_cookies_runtime "cookies read with libsoup's rules, written back and matched; a jar's policies, SameSite, prefixes, expiry, third parties and cookies.txt"
+run 378_http_hsts_runtime "HSTS: Strict-Transport-Security read strictly, policies and their expiry, an enforcer's hosts and subdomains, its changes and file"
+run 379_http_multipart_websocket_runtime "multipart bodies cut and written as libsoup does; WebSocket keys, accepts, protocols, extensions and permessage-deflate messages"
+run 380_uri_message_runtime "URIs split, resolved (RFC 3986's examples), normalized and coded; HTTP heads read as libsoup reads them, written, framed, redirected"
+run 381_net_runtime "IPv4 and IPv6 addresses, socket addresses, a TCP connection on the loopback, DNS queries and answers, names answered without a server"
+run 382_http_client_runtime "an HTTP/1.1 session against a server in a child process: kept connections, cookies, redirects, POST, chunked, gzip, HEAD, Digest auth, errors"
+run 383_mime_xml_text_runtime "media types by a file's extension and first bytes as GIO guesses; XML text escaped four ways and names checked as Name, NCName, QName, Nmtoken"
+run 384_crypto_mpi_rsa_runtime "integers of any size: hex, signed division both ways, powm, gcd, inverses, primes; RSA private keys: PKCS #1 and PSS signatures, OAEP and PKCS #1 encryption against Python's values, a key generated"
+run 385_flate_gzip_runtime "gzip files written and read in pieces, two members as one, a plain file as it is, trailing data left, damaged and truncated members refused"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

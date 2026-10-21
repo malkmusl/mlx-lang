@@ -15,7 +15,9 @@ uses `std.wayland` plus generated protocol modules.
 namespaces, libxml2's SAX2 push parser in Mlx (its events, errors and
 quirks; DTD entities and attribute defaults; UTF-8, UTF-16, Latin-1 and
 std.unicode.charmaps' encodings), on `xml/text.mlx`, `xml/encoding.mlx`
-and `xml/uri.mlx`; compiler/capi/xml2 is libxml2's C API made of it.
+and `xml/uri.mlx`; compiler/libc/xml2 is libxml2's C API made of it.
+`xml/text.mlx` (`std.xml.text`) also escapes text for XML written out
+and checks names (Name, NCName, QName, Nmtoken; test 383).
 `wayland.mlx` (`std.wayland`) and `wayland/` contain the protocol parser,
 the materializer, the wire format, the Linux transport, and the client and
 server runtimes. `wayland/generated/` holds the modules materialized from
@@ -53,12 +55,19 @@ process group.
 WPA2 needs (`tools/check_wifi.sh`); and AES-128/192/256 bitsliced in
 constant time, four blocks at once, for TLS.
 
+`flate/gzip.mlx` (`std.flate.gzip`) reads and writes gzip files in
+pieces for Mlx programs, what zlib's gz* functions do (test 385).
+
 `crypto/` (`std.crypto.*`) is what TLS and WebCrypto compute with, all
 in Mlx and constant time where a secret is involved: `crypto/hash.mlx`
 (SHA-1/2 behind one state, HMAC, HKDF), `crypto/gcm.mlx` (AES-GCM),
 `crypto/chacha.mlx` (ChaCha20, Poly1305, their AEAD),
 `crypto/bignum.mlx` (Montgomery arithmetic up to 4096 bits),
-`crypto/rsa.mlx` (PKCS #1 v1.5 and PSS verification), `crypto/ecc.mlx`
+`crypto/mpi.mlx` (`std.crypto.mpi`: signed integers of any size in an
+allocator's memory, division, gcd, inverses, `powm`, primes found; test
+384), `crypto/rsa.mlx` (PKCS #1 v1.5 and PSS verification; with a
+private key, both signatures, PKCS #1 v1.5 and OAEP encryption and
+decryption by the CRT, key generation; test 384), `crypto/ecc.mlx`
 (P-256 and P-384: ECDSA, ECDH) and `crypto/curve25519.mlx` (X25519,
 Ed25519). `asn1.mlx` (`std.asn1`) reads DER; `x509.mlx` (`std.x509`)
 parses certificates, verifies chains against a trust store (the system's
@@ -70,14 +79,34 @@ the standards' vectors.
 
 `http/` (`std.http.*`) is HTTP's pieces that do not depend on how bytes
 move, written to answer as libsoup does for mlx-soup
-(compiler/capi/soup): `http/headers.mlx` (header lists, tokens,
+(compiler/libc/soup): `http/headers.mlx` (header lists, tokens,
 q-values, parameters with RFC 5987's form, the names libsoup knows),
 `http/date.mlx` (HTTP's and cookies' date forms), `http/cookie.mlx`
-(Set-Cookie's syntax, RFC 6265), `http/status.mlx` (reason phrases),
+(cookies, RFC 6265: read from Set-Cookie with libsoup's rules, written
+back, matched) and `http/cookiejar.mlx` (the jar: domains, accept
+policies and third parties by the Public Suffix List, SameSite, the
+cookies.txt file; test 377), `http/status.mlx` (reason phrases),
 `http/form.mlx` (application/x-www-form-urlencoded),
 `http/chunked.mlx` (the chunked coding's size lines),
 `http/sniff.mlx` (MIME sniffing, the WHATWG standard's rules),
-`http/websocket.mlx` (RFC 6455's keys, frame headers, masking, UTF-8)
+`http/mime.mlx` (`std.http.mime`: a local file's media type from its
+name's extension or first bytes, as GIO guesses; test 383),
+`http/websocket.mlx` (RFC 6455's keys, accepts, protocols and extensions
+of the handshake, frame headers, masking, UTF-8) with
+`http/websocket/deflate.mlx` (permessage-deflate, RFC 7692),
+`http/multipart.mlx` (multipart bodies cut and written as libsoup does;
+test 379), `http/message.mlx` (request and status lines, header lines
+folded, bodies' framing, the rules of redirects; test 380 with `uri.mlx`,
+`std.uri`: RFC 3986's parts, references resolved, percent-coding),
+`http/client.mlx` (`std.http.client`: an HTTP/1.1 client with sessions,
+kept connections, redirects, Basic and Digest auth, cookies, HSTS, gzip,
+https on std.tls; test 382 against a server in a child process) on
+`net.mlx` (`std.net`: TCP over IPv4 and IPv6, addresses, `std.net.dns`'s
+resolver over /etc/hosts and /etc/resolv.conf; test 381),
+`http/auth.mlx` (RFC 7235's challenges told apart, Basic tokens, Digest
+responses and Authorization values; test 376), `http/hsts.mlx` (RFC
+6797: Strict-Transport-Security read strictly, an enforcer's policies
+and which hosts go over https, their file; test 378)
 and `http/psl.mlx` with `http/psldata.mlx` (the Public Suffix List, made
 by `./mlx build http-psl` from `std/registry/publicsuffix`). Tests 370
 and 371 check them.
@@ -89,7 +118,7 @@ it read each other's files; SQL as SQLite parses, plans and evaluates it
 (values, affinities, collations, constraints, foreign keys, savepoints,
 the built-in functions, the authorizer); and connections and prepared
 statements as SQLite's C API presents them. mlx-sqlite3
-(compiler/capi/sqlite3) is that C API over it, for WebKit's databases;
+(compiler/libc/sqlite3) is that C API over it, for WebKit's databases;
 test 372 and `tools/check_sqlite.sh` check it.
 
 `crypt.mlx` (`std.crypt`) checks a password against the hashes of
@@ -114,7 +143,7 @@ queue, dma-buf and host-memory sharing), with `gpu/shaders.mlx`
 `truetype.mlx` (`std.truetype`) and `truetype/` are the font engine:
 TrueType and OpenType (CFF, CFF2) fonts, variable and color fonts, read
 and rendered as FreeType 2.13 does it; its `Font`, `Atlas` and `Run` lay
-out and draw lines of text. FreeType's C API (`compiler/capi/freetype`)
+out and draw lines of text. FreeType's C API (`compiler/libc/freetype`)
 is a layer over it; see `docs/reference/truetype.md`.
 
 `ui.mlx` (`std.ui`) has layout building blocks for pixel user interfaces:
@@ -135,7 +164,7 @@ locale data in Mlx: `std.unicode.utf` (UTF-8 and UTF-16, no tables),
 `collation/`), `.idna`, `.charsets`, `.locale` (with `locale/`),
 `.calendar` (with `calendar/`) and `.format` (`format/`: number, plural,
 date, list, reltime), each with a native API (UTF-8 slices, allocators,
-`unicode.Error`) beside ICU's functions, which `compiler/capi/icu` exports
+`unicode.Error`) beside ICU's functions, which `compiler/libc/icu` exports
 to C as `libmlxunicode.so`. `timezone/database.mlx`
 (`std.timezone.database`) is the IANA time zone database built in
 (`timezone/tzdata.mlx`). Their tables (`unicode/tables.mlx`,

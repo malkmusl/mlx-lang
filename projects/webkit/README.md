@@ -3,7 +3,7 @@
 WPE WebKit and the libraries it needs, built with this repository's own
 toolchain alone: `./mlx build` (build.mlx, std.build) declares the steps,
 mlx-cc compiles every C and C++ file, mlx-ar makes the archives, the
-Mlx compiler's linker links, mlxlibcpp and mlx-unicode (compiler/capi/icu,
+Mlx compiler's linker links, mlxlibcpp and mlx-unicode (compiler/libc/icu,
 ICU's C API over std.unicode) are the libraries WebKit runs on. What WebKit's
 CMake build makes with Perl, Python, Ruby and gperf is made here by
 programs written in Mlx (generators/), and their output is that of
@@ -15,7 +15,7 @@ with `Source/`), by default /home/user/csrc/wpe/wpewebkit-2.54.1.
 Two of WebKit's ports are built, by the same steps from a description
 of each (`Port` in build.mlx): JSCOnly (JavaScriptCore alone, the
 generic event loop) and WPE, whose lower layers stand on GLib, GObject
-and GIO, here mlx-glib (compiler/capi/glib). A third is this
+and GIO, here mlx-glib (compiler/libc/glib). A third is this
 repository's own, PlatformMlx (PORT.md): WebCore and PAL on JSCOnly's
 lower layers, with no GLib.
 
@@ -48,6 +48,16 @@ lower layers, with no GLib.
     tools/check_wpe_jsc.sh            JavaScriptCore (WPE) at work: jsc on tests/wpe.js, the GLib API's tests/jsc-glib.c
     tools/check_jsc_mlxlibc.sh        jsc (JSCOnly) on mlxlibc: tests/jsc/*.js as the glibc-linked jsc prints them, no glibc in the process
     tools/check_webkit_mlx_port.sh    the Mlx port linked whole on mlxlibc: nothing left unresolved, a Page made (PORT.md, M2)
+
+How many jobs (`-j N`) is decided by memory, not cores: mlx-cc keeps a
+whole unit in one arena until its end, and a WebCore unified source
+takes 3–4.5 GB resident there (the JSBindings ones more; a WTF file
+0.6 GB, a JSC unified source 1–2 GB). On a machine with 15 GB and four
+cores, `-j 4` holds for every target but `webkit-wpe-webcore`, which
+runs at `-j 2` (three of its largest units at once get one of them
+killed by the kernel, exit 137); 32 GB runs WebCore at `-j 4` too.
+Where the time and the memory go, and what was done about them, is in
+docs/internals/build-time-notes.md.
 
 The JSCOnly port's objects go to mlx-out/webkit/obj, its archives to
 mlx-out/webkit/lib, what is generated to mlx-out/webkit/generated
@@ -140,7 +150,7 @@ check_wpe_jsc.sh still fails on it.
 | `WEBCORE.md` | WebCore for WPE: the libraries it needs and what this repository has of them, and how far mlx-cc compiles it |
 | `generators/` | WebKit's code generators in Mlx (below) |
 | `tests/` | Programs of the WPE port and what they print: `wtf-wpe.cpp` (WTF), `jsc-glib.c` (JavaScriptCore's GLib API), `wpe.js` (for its jsc); `jsc/`, scripts for the JSCOnly jsc on mlxlibc |
-| `PORT.md` | The Mlx port of WebKit (PlatformMlx): its design, milestones, and what of compiler/capi and the WPE port it retires |
+| `PORT.md` | The Mlx port of WebKit (PlatformMlx): its design, milestones, and what of the C API shims (compiler/libc) and the WPE port it retires |
 
 ## The generators
 
@@ -200,5 +210,5 @@ and libANGLE.a and libGLESv2.a are made. Four include `<zlib.h>`
 third_party/zlib/google/compression_utils_portable.cc use zlib's deflate
 and inflate streams): theirs are mlx-zlib's headers
 (mlx-out/include/mlx-zlib, made by the step zlib-headers;
-compiler/capi/zlib, over std.flate), and the program linking ANGLE
+compiler/libc/zlib, over std.flate), and the program linking ANGLE
 links mlx-out/lib/libmlxz.so.

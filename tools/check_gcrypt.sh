@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# mlx-gcrypt, libgcrypt's C API in Mlx (compiler/capi/gcrypt):
+# mlx-gcrypt, libgcrypt's C API in Mlx (compiler/libc/gcrypt):
 #
 #   - `./mlx build gcrypt` builds the library (libmlxgcrypt.so) and its
 #     headers: mlx-cheaders makes mlx-out/include/mlx-gcrypt/gcrypt.h and
-#     gpg-error.h of the API's Mlx modules (compiler/capi/gcrypt/api);
+#     gpg-error.h of the API's Mlx modules (compiler/libc/gcrypt/api);
 #   - every function the headers declare is in the library;
 #   - the headers compile as C and as C++;
 #   - C programs built by mlx-cc against the library print what
@@ -32,13 +32,13 @@ trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-gcrypt
 library=mlx-out/lib/libmlxgcrypt.so
-tests=compiler/capi/gcrypt/tests
+tests=compiler/libc/gcrypt/tests
 
 ./mlx build -j 1 cc gcrypt > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build gcrypt"; }
 echo "ok   ./mlx build gcrypt"
 
 # Every `pub extern("c") fn` of the API modules is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/gcrypt/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/gcrypt/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }

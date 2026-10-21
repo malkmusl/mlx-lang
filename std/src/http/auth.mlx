@@ -1,0 +1,590 @@
+// std.http.auth: HTTP authentication (RFC 7235) as libsoup does it: the
+// challenges of a WWW-Authenticate or Proxy-Authenticate header told
+// apart and their parameters found, Basic (RFC 7617) and Digest (RFC 7616:
+// MD5 and MD5-sess with qop=auth) credentials computed and written as
+// Authorization values, the protection spaces each scheme claims. The
+// same functions serve a server checking a Digest response. Nothing here
+// allocates: a challenge's parameters are decoded into a record's own
+// storage, hashes into fixed buffers, header values to a Sink.
+//
+//     var it = auth.challenges(header)
+//     var challenge: []const u8 = ""
+//     while auth.nextChallenge(&it, &challenge) {
+//         if auth.schemeIs(challenge, "Digest") {
+//             var d: auth.DigestChallenge = undefined
+//             if auth.digestChallenge(auth.paramsOf(challenge, "Digest"), &d) { ... }
+//         }
+//     }
+const headers = @import("./headers.mlx")
+const md5 = @import("../md5.mlx")
+const base64 = @import("../base64.mlx")
+
+pub const Sink = headers.Sink
+
+// libsoup's strengths: a stronger scheme is preferred when a server
+// offers several.
+pub const BASIC_STRENGTH: u32 = 1
+pub const NTLM_STRENGTH: u32 = 3
+pub const DIGEST_STRENGTH: u32 = 5
+pub const NEGOTIATE_STRENGTH: u32 = 7
+
+fn isWhite(c: u8) -> bool { return c == 32 || c == 9 || c == 13 || c == 10 }
+
+// ---------------------------------------------------------------------------
+// Challenges
+
+// The challenges of a header, each the slice of it from the item that
+// starts it (a scheme alone, or a scheme followed by its first parameter
+// or token) to the item before the next such one.
+pub const Challenges = struct {
+    header: []const u8
+    items: headers.List
+    // The item that starts the next challenge, when one was read ahead.
+    pending: []const u8
+    hasPending: bool
+}
+
+// libsoup's next_challenge_start test: whether an item begins a challenge.
+fn startsChallenge(item: []const u8) -> bool {
+    const eq = headers.indexOf(item, 61, 0)
+    if eq == item.length { return true }
+    var sp = item.length
+    var i: usize = 0
+    while i < item.length {
+        if isWhite(item[i]) {
+            sp = i
+            break
+        }
+        i += 1
+    }
+    if sp == item.length || sp > eq { return false }
+    sp += 1
+    while sp < item.length && headers.isSpace(item[sp]) { sp += 1 }
+    return sp != eq
+}
+
+pub fn challenges(header: []const u8) -> Challenges {
+    return Challenges.{ .header = header, .items = headers.list(header, 44), .pending = header[0..0], .hasPending = false }
+}
+
+fn offsetOf(header: []const u8, item: []const u8) -> usize { return @intFromPtr(item.pointer) - @intFromPtr(header.pointer) }
+
+// The next challenge into `challenge`; false when there are no more.
+pub fn nextChallenge(it: *Challenges, challenge: *[]const u8) -> bool {
+    var item: []const u8 = ""
+    var first: []const u8 = ""
+    if it.*.hasPending {
+        first = it.*.pending
+        it.*.hasPending = false
+    } else {
+        var found = false
+        while headers.next(&it.*.items, &item) {
+            if startsChallenge(item) {
+                first = item
+                found = true
+                break
+            }
+        }
+        if !found { return false }
+    }
+    var last = first
+    while headers.next(&it.*.items, &item) {
+        if startsChallenge(item) {
+            it.*.pending = item
+            it.*.hasPending = true
+            break
+        }
+        last = item
+    }
+    const start = offsetOf(it.*.header, first)
+    const end = offsetOf(it.*.header, last) + last.length
+    challenge.* = it.*.header[start..end]
+    return true
+}
+
+// Whether a challenge is of `scheme` (case aside): the scheme's name, then
+// its end or white space.
+pub fn schemeIs(challenge: []const u8, scheme: []const u8) -> bool {
+    if challenge.length < scheme.length || !headers.equalsIgnoringCase(challenge[0..scheme.length], scheme) { return false }
+    return challenge.length == scheme.length || isWhite(challenge[scheme.length])
+}
+
+// What follows the scheme's name in a challenge of it: its parameters.
+pub fn paramsOf(challenge: []const u8, scheme: []const u8) -> []const u8 {
+    if challenge.length <= scheme.length { return challenge[challenge.length..challenge.length] }
+    return challenge[scheme.length..challenge.length]
+}
+
+pub const Found = enum(u8) {
+    absent,
+    // The name alone, with no value.
+    bare,
+    value
+}
+
+// The parameter `name` of a comma-separated parameter list (case aside),
+// as libsoup's soup_header_parse_param_list finds it: the first of that
+// name, unless a later RFC 5987 one overrides it; its value unquoted into
+// `out` (as long as the list at most), its length in `length`.
+pub fn findParam(params: []const u8, name: []const u8, out: []u8, length: *usize) -> Found {
+    var items = headers.list(params, 44)
+    var item: []const u8 = ""
+    var p: headers.Param = undefined
+    var result = Found.absent
+    length.* = 0
+    while headers.next(&items, &item) {
+        if !headers.param(item, &p) || !headers.equalsIgnoringCase(p.name, name) { continue }
+        if p.kind == headers.ParamKind.extended {
+            const decoded = headers.decodeExtended(p.value, out)
+            if decoded < 0 { continue }
+            length.* = @intCast(usize, decoded)
+            result = Found.value
+            continue
+        }
+        if result != Found.absent { continue }
+        if p.kind == headers.ParamKind.bare {
+            result = Found.bare
+        } else if p.kind == headers.ParamKind.quoted {
+            length.* = headers.decodeQuoted(p.value, out)
+            result = Found.value
+        } else {
+            var i: usize = 0
+            while i < p.value.length {
+                out[i] = p.value[i]
+                i += 1
+            }
+            length.* = p.value.length
+            result = Found.value
+        }
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Basic
+
+// ISO-8859-1 for a UTF-8 text whose every character has a code there
+// (what libsoup converts user:password to), else the bytes as they are.
+// `out` as long as the text; the length written.
+pub fn latin1OrUtf8(text: []const u8, out: []u8) -> usize {
+    var at: usize = 0
+    var length: usize = 0
+    while at < text.length {
+        const b = text[at]
+        if b < 128 {
+            out[length] = b
+            at += 1
+        } else if (b == 0xC2 || b == 0xC3) && at + 1 < text.length && (text[at + 1] & 0xC0) == 0x80 {
+            out[length] = @intCast(u8, ((@intCast(u32, b) & 3) << 6) | (@intCast(u32, text[at + 1]) & 63))
+            at += 2
+        } else {
+            // Not all of it has a code: the UTF-8 is kept whole.
+            var i: usize = 0
+            while i < text.length {
+                out[i] = text[i]
+                i += 1
+            }
+            return text.length
+        }
+        length += 1
+    }
+    return length
+}
+
+// The most bytes basicToken writes for a user and password of these
+// lengths.
+pub fn basicTokenRoom(userLength: usize, passwordLength: usize) -> usize {
+    return base64.encodedLength(base64.Encoding.base64, userLength + passwordLength + 1, true)
+}
+
+// The token after "Basic ": the base64 of user:password (ISO-8859-1 when
+// every character has a code there), into `out` (basicTokenRoom bytes);
+// the length written.
+pub fn basicToken(user: []const u8, password: []const u8, out: []u8) -> usize {
+    var encoder: base64.Encoder = undefined
+    base64.encoderInit(&encoder, base64.Encoding.base64)
+    var written: usize = 0
+    const colon: []const u8 = ":"
+    // The whole text is converted at once (its characters either all have
+    // codes in ISO-8859-1 or none are converted), so the pieces go through
+    // a buffer in turn only when each converts alone the same way; simpler
+    // to test the whole first.
+    var allLatin = latin1Possible(user) && latin1Possible(password)
+    var piece: usize = 0
+    while piece < 3 {
+        const text = if piece == 0 { user } else if piece == 1 { colon } else { password }
+        var at: usize = 0
+        while at < text.length {
+            var chunk: [96]u8 = undefined
+            var count: usize = 0
+            while at < text.length && count < 96 {
+                const b = text[at]
+                if allLatin && b >= 128 {
+                    chunk[count] = @intCast(u8, ((@intCast(u32, b) & 3) << 6) | (@intCast(u32, text[at + 1]) & 63))
+                    at += 2
+                } else {
+                    chunk[count] = b
+                    at += 1
+                }
+                count += 1
+            }
+            const rest: [*]u8 = unsafe { out.pointer + written }
+            written += base64.encodeUpdate(&encoder, chunk[0..count], rest)
+        }
+        piece += 1
+    }
+    const tail: [*]u8 = unsafe { out.pointer + written }
+    return written + base64.encodeFinal(&encoder, tail, true)
+}
+
+fn latin1Possible(text: []const u8) -> bool {
+    var at: usize = 0
+    while at < text.length {
+        const b = text[at]
+        if b < 128 {
+            at += 1
+        } else if (b == 0xC2 || b == 0xC3) && at + 1 < text.length && (text[at + 1] & 0xC0) == 0x80 {
+            at += 2
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+// "Basic TOKEN".
+pub fn writeBasic(sink: Sink, token: []const u8) -> void {
+    headers.put(sink, "Basic ")
+    headers.put(sink, token)
+}
+
+// The protection space Basic claims for a path: its directory ("/a/b" for
+// "/a/b/c", "/" for "/c", the path itself when it ends with a slash).
+pub fn basicSpace(path: []const u8) -> []const u8 {
+    var slash = path.length
+    var index: usize = 0
+    while index < path.length {
+        if path[index] == 47 { slash = index }
+        index += 1
+    }
+    if slash < path.length && slash + 1 < path.length {
+        return path[0..if slash == 0 { 1 } else { slash }]
+    }
+    return path
+}
+
+// ---------------------------------------------------------------------------
+// Digest
+
+pub const Algorithm = enum(u8) {
+    md5,
+    md5Sess
+}
+
+pub const QOP_AUTH: u32 = 1
+pub const QOP_AUTH_INT: u32 = 2
+
+// A Digest challenge's parameters, decoded into the record's own storage.
+pub const DigestChallenge = struct {
+    realm: []const u8
+    nonce: []const u8
+    opaque: []const u8
+    domain: []const u8
+    hasRealm: bool
+    hasOpaque: bool
+    hasDomain: bool
+    algorithm: Algorithm
+    // The qop options offered (QOP_* flags), 0 for none.
+    qopOptions: u32
+    // Whether the client's nonce is stale (its credentials still good).
+    stale: bool
+    storage: [1024]u8
+    used: usize
+}
+
+// Keeps the parameter `name` of `params` in the record's storage.
+fn keep(c: *DigestChallenge, params: []const u8, name: []const u8, into: *[]const u8, present: *bool) -> bool {
+    var length: usize = 0
+    var scratch: [1024]u8 = undefined
+    const found = findParam(params, name, scratch[0..1024], &length)
+    present.* = found == Found.value
+    if found != Found.value {
+        into.* = c.*.storage[0..0]
+        return true
+    }
+    if length > c.*.storage.length - c.*.used { return false }
+    var i: usize = 0
+    while i < length {
+        c.*.storage[c.*.used + i] = scratch[i]
+        i += 1
+    }
+    into.* = c.*.storage[c.*.used..c.*.used + length]
+    c.*.used += length
+    return true
+}
+
+// The algorithm named, as libsoup takes it: MD5 when none is named.
+pub fn algorithmOf(text: []const u8, present: bool, out: *Algorithm) -> bool {
+    if !present || headers.equalsIgnoringCase(text, "MD5") {
+        out.* = Algorithm.md5
+        return true
+    }
+    if headers.equalsIgnoringCase(text, "MD5-sess") {
+        out.* = Algorithm.md5Sess
+        return true
+    }
+    return false
+}
+
+// The qop options of a `qop` value ("auth, auth-int").
+pub fn qopOptionsOf(text: []const u8) -> u32 {
+    var items = headers.list(text, 44)
+    var item: []const u8 = ""
+    var out: u32 = 0
+    while headers.next(&items, &item) {
+        if headers.equalsIgnoringCase(item, "auth") { out |= QOP_AUTH }
+        if headers.equalsIgnoringCase(item, "auth-int") { out |= QOP_AUTH_INT }
+    }
+    return out
+}
+
+// Reads a Digest challenge's parameters (what follows "Digest"); false
+// when the challenge cannot be answered, as libsoup refuses it: no realm
+// or nonce, an algorithm other than MD5 or MD5-sess, a qop without auth,
+// or a value too long for the record (1 KiB in all).
+pub fn digestChallenge(params: []const u8, c: *DigestChallenge) -> bool {
+    c.*.used = 0
+    var ok = true
+    if !keep(c, params, "realm", &c.*.realm, &c.*.hasRealm) { ok = false }
+    var hasNonce = false
+    if !keep(c, params, "nonce", &c.*.nonce, &hasNonce) { ok = false }
+    if !keep(c, params, "opaque", &c.*.opaque, &c.*.hasOpaque) { ok = false }
+    if !keep(c, params, "domain", &c.*.domain, &c.*.hasDomain) { ok = false }
+    var qop: []const u8 = ""
+    var hasQop = false
+    if !keep(c, params, "qop", &qop, &hasQop) { ok = false }
+    var algorithm: []const u8 = ""
+    var hasAlgorithm = false
+    if !keep(c, params, "algorithm", &algorithm, &hasAlgorithm) { ok = false }
+    var stale: []const u8 = ""
+    var hasStale = false
+    if !keep(c, params, "stale", &stale, &hasStale) { ok = false }
+    if !ok { return false }
+    if !c.*.hasRealm || !hasNonce { return false }
+    c.*.qopOptions = 0
+    if hasQop {
+        c.*.qopOptions = qopOptionsOf(qop)
+        if (c.*.qopOptions & QOP_AUTH) == 0 { return false }
+    }
+    if !algorithmOf(algorithm, hasAlgorithm, &c.*.algorithm) { return false }
+    c.*.stale = hasStale && headers.equalsIgnoringCase(stale, "TRUE")
+    return true
+}
+
+// The MD5 of user:realm:password, in hex.
+pub fn hexUrp(user: []const u8, realm: []const u8, password: []const u8, out: *[32]u8) -> void {
+    var hashing: md5.Md5 = undefined
+    md5.md5Init(&hashing)
+    md5.md5Update(&hashing, user)
+    md5.md5Update(&hashing, ":")
+    md5.md5Update(&hashing, realm)
+    md5.md5Update(&hashing, ":")
+    md5.md5Update(&hashing, password)
+    finishHex(&hashing, out)
+}
+
+fn finishHex(hashing: *md5.Md5, out: *[32]u8) -> void {
+    var digest: [16]u8 = undefined
+    md5.md5Final(hashing, &digest)
+    const bytes: [*]const u8 = &digest
+    const text: [*]u8 = unsafe { @ptrCast([*]u8, out) }
+    _ = base64.hexEncode(bytes[0..16], text)
+}
+
+// A1 in hex: the user's hash itself for MD5; for MD5-sess, the MD5 of
+// that hash, the nonce and the client nonce.
+pub fn hexA1(algorithm: Algorithm, urp: *const [32]u8, nonce: []const u8, cnonce: []const u8, out: *[32]u8) -> void {
+    if algorithm == Algorithm.md5 {
+        out.* = urp.*
+        return
+    }
+    var hashing: md5.Md5 = undefined
+    md5.md5Init(&hashing)
+    md5.md5Update(&hashing, urp.*[0..32])
+    md5.md5Update(&hashing, ":")
+    md5.md5Update(&hashing, nonce)
+    md5.md5Update(&hashing, ":")
+    md5.md5Update(&hashing, cnonce)
+    finishHex(&hashing, out)
+}
+
+// The nonce count as it is written: eight hex digits.
+pub fn writeNonceCount(sink: Sink, nc: u32) -> void {
+    var text: [8]u8 = undefined
+    nonceCountHex(nc, &text)
+    headers.put(sink, text[0..8])
+}
+
+pub fn nonceCountHex(nc: u32, out: *[8]u8) -> void {
+    const digits = "0123456789abcdef"
+    var shift: u32 = 28
+    var index: usize = 0
+    while index < 8 {
+        out.*[index] = digits[@intCast(usize, (nc >> shift) & 15)]
+        if shift > 0 { shift -= 4 }
+        index += 1
+    }
+}
+
+// RFC 2617's request-digest: MD5(A1 : nonce [: nc : cnonce : auth] : MD5(method : uri)).
+pub fn digestResponse(method: []const u8, uri: []const u8, a1: *const [32]u8, qopAuth: bool, nonce: []const u8, cnonce: []const u8, nc: u32, out: *[32]u8) -> void {
+    var a2: md5.Md5 = undefined
+    md5.md5Init(&a2)
+    md5.md5Update(&a2, method)
+    md5.md5Update(&a2, ":")
+    md5.md5Update(&a2, uri)
+    var hexA2: [32]u8 = undefined
+    finishHex(&a2, &hexA2)
+    var kd: md5.Md5 = undefined
+    md5.md5Init(&kd)
+    md5.md5Update(&kd, a1.*[0..32])
+    md5.md5Update(&kd, ":")
+    md5.md5Update(&kd, nonce)
+    md5.md5Update(&kd, ":")
+    if qopAuth {
+        var count: [8]u8 = undefined
+        nonceCountHex(nc, &count)
+        md5.md5Update(&kd, count[0..8])
+        md5.md5Update(&kd, ":")
+        md5.md5Update(&kd, cnonce)
+        md5.md5Update(&kd, ":auth:")
+    }
+    md5.md5Update(&kd, hexA2[0..32])
+    finishHex(&kd, out)
+}
+
+fn putDecimal(out: []u8, at: usize, value: u64) -> usize {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var v = value
+    while true {
+        digits[count] = @intCast(u8, 48 + v % 10)
+        count += 1
+        v = v / 10
+        if v == 0 { break }
+    }
+    var i = at
+    while count > 0 {
+        count -= 1
+        out[i] = digits[count]
+        i += 1
+    }
+    return i
+}
+
+// A client nonce as libsoup makes one: the base64 of "0xSEED:PID:TIME"
+// (the seed written in hex), into `out`; its length (at most 64).
+pub fn clientNonce(seed: u64, pid: u64, time: i64, out: *[64]u8) -> usize {
+    var text: [48]u8 = undefined
+    text[0] = 48
+    text[1] = 120
+    var at: usize = 2
+    const digits = "0123456789abcdef"
+    var shift: u64 = 60
+    var started = false
+    while true {
+        const digit = (seed >> shift) & 15
+        if digit != 0 || started || shift == 0 {
+            started = true
+            text[at] = digits[@intCast(usize, digit)]
+            at += 1
+        }
+        if shift == 0 { break }
+        shift -= 4
+    }
+    text[at] = 58
+    at = putDecimal(text[0..48], at + 1, pid)
+    text[at] = 58
+    at = putDecimal(text[0..48], at + 1, @bitCast(u64, time))
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, out) }
+    return base64.encode(base64.Encoding.base64, text[0..at], bytes, true)
+}
+
+pub const DigestCredentials = struct {
+    user: []const u8
+    realm: []const u8
+    nonce: []const u8
+    uri: []const u8
+    algorithm: Algorithm
+    response: []const u8
+    opaque: []const u8
+    hasOpaque: bool
+    qopAuth: bool
+    cnonce: []const u8
+    nc: u32
+}
+
+// The Authorization value as libsoup writes it:
+// `Digest username="...", realm="...", nonce="...", uri="...",
+// algorithm=MD5, response="...", opaque="...", cnonce="...",
+// nc=00000001, qop=auth`.
+pub fn writeDigest(sink: Sink, credentials: *const DigestCredentials) -> void {
+    headers.put(sink, "Digest ")
+    headers.writeQuoted(sink, "username", credentials.*.user)
+    headers.put(sink, ", ")
+    headers.writeQuoted(sink, "realm", credentials.*.realm)
+    headers.put(sink, ", ")
+    headers.writeQuoted(sink, "nonce", credentials.*.nonce)
+    headers.put(sink, ", ")
+    headers.writeQuoted(sink, "uri", credentials.*.uri)
+    headers.put(sink, ", algorithm=")
+    headers.put(sink, if credentials.*.algorithm == Algorithm.md5 { "MD5" } else { "MD5-sess" })
+    headers.put(sink, ", ")
+    headers.writeQuoted(sink, "response", credentials.*.response)
+    if credentials.*.hasOpaque {
+        headers.put(sink, ", ")
+        headers.writeQuoted(sink, "opaque", credentials.*.opaque)
+    }
+    if credentials.*.qopAuth {
+        headers.put(sink, ", ")
+        headers.writeQuoted(sink, "cnonce", credentials.*.cnonce)
+        headers.put(sink, ", nc=")
+        writeNonceCount(sink, credentials.*.nc)
+        headers.put(sink, ", qop=auth")
+    }
+}
+
+// The nonce count of a Digest response's `nc` (hex), as a server reads
+// it: 0 for none, or one beyond 32 bits.
+pub fn nonceCountOf(text: []const u8) -> u64 {
+    var count: u64 = 0
+    for ch in text {
+        const v = base64.hexValue(ch)
+        if v > 15 { break }
+        if count < 0x100000000 { count = count * 16 + @intCast(u64, v) }
+    }
+    if count > 0xffffffff { return 0 }
+    return count
+}
+
+// The directories of a Digest challenge's `domain` (space-separated URIs
+// or absolute paths), each without its trailing slash, one at a time:
+// `at` moves on; false at the end. A URI item is given whole (the caller
+// compares its scheme, host and port with the challenge's before taking
+// its path).
+pub fn nextDomainItem(domain: []const u8, at: *usize, item: *[]const u8) -> bool {
+    var start = at.*
+    while start < domain.length && domain[start] == 32 { start += 1 }
+    if start >= domain.length { return false }
+    var end = start
+    while end < domain.length && domain[end] != 32 { end += 1 }
+    at.* = end
+    item.* = domain[start..end]
+    return true
+}
+
+// A path without its trailing slash (libsoup strips one).
+pub fn withoutTrailingSlash(path: []const u8) -> []const u8 {
+    if path.length > 0 && path[path.length - 1] == 47 { return path[0..path.length - 1] }
+    return path
+}

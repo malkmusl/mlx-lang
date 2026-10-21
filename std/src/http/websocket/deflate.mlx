@@ -1,0 +1,356 @@
+// std.http.websocket.deflate: the permessage-deflate extension (RFC 7692)
+// as libsoup's SoupWebsocketExtensionDeflate does it, on std.flate. The
+// parameters of a Sec-WebSocket-Extensions element are read
+// (server_no_context_takeover, client_no_context_takeover,
+// server_max_window_bits, client_max_window_bits), the extension set up
+// for a client or a server, and each message compressed with a sync
+// flush and its last four bytes (00 00 ff ff) taken off, or put back
+// before a received message is inflated; control frames pass as they
+// are. RSV1 of a frame's first byte marks a compressed message.
+//
+//     var extension: deflate.Extension = undefined
+//     deflate.init(&extension, allocator)
+//     if deflate.configure(&extension, true, "client_max_window_bits=15", true) != deflate.Error.none { ... }
+//     var out: deflate.Bytes = undefined
+//     if deflate.outgoing(&extension, &first, payload, &out) == deflate.Error.none { ... out.bytes[0..out.length] ... deflate.freeBytes(&extension, &out) }
+const flate = @import("../../flate.mlx")
+const headers = @import("../headers.mlx")
+const allocator_module = @import("../../../bootstrap/allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const NAME: []const u8 = "permessage-deflate"
+
+// What a client offers.
+pub const REQUEST_PARAMS: []const u8 = "; client_max_window_bits"
+
+pub const Error = enum(u8) {
+    none,
+    // A parameter not of this extension (`badName` says which).
+    invalidParameter,
+    // A parameter with a value it cannot have, or without one it needs.
+    invalidValue,
+    // The same parameter twice.
+    duplicateParameter,
+    compressFailed,
+    decompressFailed,
+    // A frame after the first of a message with RSV1 set.
+    nonFirstCompressed
+}
+
+const SERVER_NO_CONTEXT_TAKEOVER: u32 = 1
+const CLIENT_NO_CONTEXT_TAKEOVER: u32 = 2
+const SERVER_MAX_WINDOW_BITS: u32 = 4
+const CLIENT_MAX_WINDOW_BITS: u32 = 8
+
+pub const Extension = struct {
+    allocator: Allocator
+    flags: u32
+    serverBits: u32
+    clientBits: u32
+    enabled: bool
+    noTakeover: bool
+    // Whether a fragmented message is being inflated.
+    ongoing: bool
+    deflater: flate.Deflater
+    inflater: flate.Inflater
+}
+
+// Bytes of the extension's allocator (freeBytes gives them back); a
+// capacity of 0 means the payload was left as it was.
+pub const Bytes = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+}
+
+pub fn init(extension: *Extension, allocator: Allocator) -> void {
+    extension.*.allocator = allocator
+    extension.*.flags = 0
+    extension.*.serverBits = 0
+    extension.*.clientBits = 0
+    extension.*.enabled = false
+    extension.*.noTakeover = false
+    extension.*.ongoing = false
+}
+
+pub fn deinit(extension: *Extension) -> void {
+    if extension.*.enabled {
+        flate.deflaterEnd(&extension.*.deflater)
+        flate.inflaterEnd(&extension.*.inflater)
+    }
+    extension.*.enabled = false
+}
+
+pub fn freeBytes(extension: *Extension, out: *Bytes) -> void {
+    if out.*.capacity != 0 { extension.*.allocator.free(out.*.bytes, out.*.capacity, 16) }
+    out.*.capacity = 0
+    out.*.length = 0
+}
+
+// 8 to 15, digits only.
+fn parseWindowBits(text: []const u8, out: *u32) -> bool {
+    if text.length == 0 { return false }
+    var number: u64 = 0
+    for ch in text {
+        if ch < 48 || ch > 57 { return false }
+        if number < 1000 { number = number * 10 + @intCast(u64, ch - 48) }
+    }
+    if number < 8 || number > 15 { return false }
+    out.* = @intCast(u32, number)
+    return true
+}
+
+fn sameBytes(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// Reads the parameters of an element (what follows "permessage-deflate;"),
+// separated by `;`, none twice; `badName` names the one an error is
+// about.
+pub fn parseParams(extension: *Extension, params: []const u8, badName: *[]const u8) -> Error {
+    var items = headers.list(params, 59)
+    var item: []const u8 = ""
+    var p: headers.Param = undefined
+    var seen: [16][]const u8 = undefined
+    var seenCount: usize = 0
+    badName.* = params[0..0]
+    while headers.next(&items, &item) {
+        if !headers.param(item, &p) { continue }
+        var i: usize = 0
+        while i < seenCount {
+            if headers.equalsIgnoringCase(seen[i], p.name) { return Error.duplicateParameter }
+            i += 1
+        }
+        if seenCount < 16 {
+            seen[seenCount] = p.name
+            seenCount += 1
+        }
+        badName.* = p.name
+        const hasValue = p.kind != headers.ParamKind.bare
+        var unquoted: [64]u8 = undefined
+        var value = p.value
+        if p.kind == headers.ParamKind.quoted {
+            const n = headers.decodeQuoted(p.value, unquoted[0..64])
+            value = unquoted[0..n]
+        }
+        if sameBytes(p.name, "server_no_context_takeover") {
+            if hasValue { return Error.invalidValue }
+            extension.*.flags |= SERVER_NO_CONTEXT_TAKEOVER
+        } else if sameBytes(p.name, "client_no_context_takeover") {
+            if hasValue { return Error.invalidValue }
+            extension.*.flags |= CLIENT_NO_CONTEXT_TAKEOVER
+        } else if sameBytes(p.name, "server_max_window_bits") {
+            if !hasValue || !parseWindowBits(value, &extension.*.serverBits) { return Error.invalidValue }
+            extension.*.flags |= SERVER_MAX_WINDOW_BITS
+        } else if sameBytes(p.name, "client_max_window_bits") {
+            if hasValue {
+                if !parseWindowBits(value, &extension.*.clientBits) { return Error.invalidValue }
+            } else {
+                extension.*.clientBits = 15
+            }
+            extension.*.flags |= CLIENT_MAX_WINDOW_BITS
+        } else {
+            return Error.invalidParameter
+        }
+    }
+    badName.* = params[0..0]
+    return Error.none
+}
+
+// Sets the extension up for a client (`isClient`) or a server with the
+// parameters given (`hasParams`); an extension whose compressor cannot
+// be set up is accepted and left disabled.
+pub fn configure(extension: *Extension, isClient: bool, params: []const u8, hasParams: bool, badName: *[]const u8) -> Error {
+    if hasParams {
+        const result = parseParams(extension, params, badName)
+        if result != Error.none { return result }
+    }
+    var deflaterBits: u32 = 15
+    var inflaterBits: u32 = 15
+    const flags = extension.*.flags
+    if isClient {
+        extension.*.noTakeover = (flags & CLIENT_NO_CONTEXT_TAKEOVER) != 0
+        if (flags & CLIENT_MAX_WINDOW_BITS) != 0 { deflaterBits = extension.*.clientBits }
+        if (flags & SERVER_MAX_WINDOW_BITS) != 0 { inflaterBits = extension.*.serverBits }
+    } else {
+        extension.*.noTakeover = (flags & SERVER_NO_CONTEXT_TAKEOVER) != 0
+        if (flags & SERVER_MAX_WINDOW_BITS) != 0 { deflaterBits = extension.*.serverBits }
+        if (flags & CLIENT_MAX_WINDOW_BITS) != 0 { inflaterBits = extension.*.clientBits }
+    }
+    // Compression needs a window of at least 2^9 bytes (as zlib's); the
+    // inflater takes any window up to 2^15.
+    if deflaterBits < 9 { deflaterBits = 9 }
+    _ = inflaterBits
+    var settings = flate.options(-1, flate.Format.raw)
+    settings.windowBits = deflaterBits
+    if flate.deflaterInit(&extension.*.deflater, extension.*.allocator, settings) != flate.Status.ok { return Error.none }
+    if flate.inflaterInit(&extension.*.inflater, extension.*.allocator, flate.Format.raw) != flate.Status.ok {
+        flate.deflaterEnd(&extension.*.deflater)
+        return Error.none
+    }
+    extension.*.enabled = true
+    return Error.none
+}
+
+// The parameters a server answers with (false: none).
+pub fn writeResponseParams(sink: headers.Sink, extension: *const Extension) -> bool {
+    if !extension.*.enabled || extension.*.flags == 0 { return false }
+    const flags = extension.*.flags
+    if (flags & SERVER_NO_CONTEXT_TAKEOVER) != 0 { headers.put(sink, "; server_no_context_takeover") }
+    if (flags & CLIENT_NO_CONTEXT_TAKEOVER) != 0 { headers.put(sink, "; client_no_context_takeover") }
+    if (flags & SERVER_MAX_WINDOW_BITS) != 0 {
+        headers.put(sink, "; server_max_window_bits=")
+        putNumber(sink, extension.*.serverBits)
+    }
+    if (flags & CLIENT_MAX_WINDOW_BITS) != 0 {
+        headers.put(sink, "; client_max_window_bits=")
+        putNumber(sink, extension.*.clientBits)
+    }
+    return true
+}
+
+fn putNumber(sink: headers.Sink, value: u32) -> void {
+    var digits: [12]u8 = undefined
+    var n: usize = 0
+    var rest = value
+    while true {
+        digits[11 - n] = @intCast(u8, 48 + rest % 10)
+        n += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    headers.put(sink, digits[12 - n..12])
+}
+
+const BUFFER_SIZE: usize = 4096
+
+fn grow(extension: *Extension, out: *Bytes, capacity: usize) -> bool {
+    const memory = extension.*.allocator.alloc(capacity, 16)
+    if memory == null { return false }
+    var i: usize = 0
+    while i < out.*.length {
+        memory.?[i] = out.*.bytes[i]
+        i += 1
+    }
+    if out.*.capacity != 0 { extension.*.allocator.free(out.*.bytes, out.*.capacity, 16) }
+    out.*.bytes = memory.?
+    out.*.capacity = capacity
+    return true
+}
+
+fn resetDeflater(extension: *Extension) -> void {
+    if extension.*.noTakeover { _ = flate.deflaterReset(&extension.*.deflater) }
+}
+
+// Compresses a message to send: `first` is the frame's first byte (RSV1
+// is set on it), `payload` the message; `out` the compressed bytes
+// (capacity 0 when the payload is to go as it is: the extension disabled,
+// a control frame, an empty payload).
+pub fn outgoing(extension: *Extension, first: *u8, payload: []const u8, out: *Bytes) -> Error {
+    out.*.length = 0
+    out.*.capacity = 0
+    if !extension.*.enabled { return Error.none }
+    // Control frames are not compressed.
+    if (first.* & 0x08) != 0 { return Error.none }
+    if payload.length == 0 { return Error.none }
+    // RSV1 marks the message compressed.
+    first.* = first.* | 0x40
+    if !grow(extension, out, flate.deflaterBound(&extension.*.deflater, payload.length)) { return Error.compressFailed }
+    var taken: usize = 0
+    var status = flate.Status.ok
+    while true {
+        if out.*.length == out.*.capacity {
+            if !grow(extension, out, out.*.capacity + BUFFER_SIZE) {
+                freeBytes(extension, out)
+                return Error.compressFailed
+            }
+        }
+        // The input first, then a sync flush (an empty stored block).
+        const flush = if taken == payload.length { flate.Flush.sync } else { flate.Flush.none }
+        var progress: flate.Progress = undefined
+        const from: [*]const u8 = unsafe { payload.pointer + taken }
+        const into: [*]u8 = unsafe { out.*.bytes + out.*.length }
+        status = flate.deflaterRun(&extension.*.deflater, from, payload.length - taken, into, out.*.capacity - out.*.length, flush, &progress)
+        taken += progress.consumed
+        out.*.length += progress.produced
+        if status != flate.Status.ok { break }
+        if progress.consumed == 0 && progress.produced == 0 && taken == payload.length {
+            // Nothing more to give: what zlib reports as Z_BUF_ERROR.
+            status = flate.Status.stuck
+            break
+        }
+    }
+    resetDeflater(extension)
+    if status != flate.Status.stuck || out.*.length < 4 {
+        freeBytes(extension, out)
+        return Error.compressFailed
+    }
+    // The flush's 00 00 ff ff is left for the reader to put back.
+    out.*.length -= 4
+    return Error.none
+}
+
+// Inflates `data` onto `out`; false when the data is damaged. A stream's
+// end (a final block) starts the inflater over, unless `tail`.
+fn inflateInto(extension: *Extension, data: []const u8, tail: bool, out: *Bytes) -> bool {
+    var taken: usize = 0
+    while true {
+        if out.*.length == out.*.capacity {
+            if !grow(extension, out, out.*.capacity + BUFFER_SIZE) { return false }
+        }
+        var progress: flate.Progress = undefined
+        const room = out.*.capacity - out.*.length
+        const from: [*]const u8 = unsafe { data.pointer + taken }
+        const into: [*]u8 = unsafe { out.*.bytes + out.*.length }
+        const status = flate.inflaterRun(&extension.*.inflater, from, data.length - taken, into, room, &progress)
+        taken += progress.consumed
+        out.*.length += progress.produced
+        if status == flate.Status.damaged || status == flate.Status.noMemory || status == flate.Status.misuse || status == flate.Status.needDictionary { return false }
+        if status == flate.Status.done {
+            if tail { return true }
+            _ = flate.inflaterReset(&extension.*.inflater)
+        }
+        // Done when the input is taken and the output did not fill.
+        if taken == data.length && progress.produced < room { return true }
+        if status == flate.Status.stuck && progress.produced == 0 && progress.consumed == 0 && taken == data.length { return true }
+    }
+    return true
+}
+
+// Decompresses a frame received: `first` the frame's first byte (RSV1
+// read and cleared), `payload` its bytes; `out` the message's bytes so
+// far inflated (capacity 0 when the payload is to be taken as it is).
+pub fn incoming(extension: *Extension, first: *u8, payload: []const u8, out: *Bytes) -> Error {
+    out.*.length = 0
+    out.*.capacity = 0
+    if !extension.*.enabled { return Error.none }
+    if (first.* & 0x08) != 0 { return Error.none }
+    const compressed = (first.* & 0x40) != 0
+    const ongoing = extension.*.ongoing
+    if !ongoing && !compressed { return Error.none }
+    if ongoing && compressed { return Error.nonFirstCompressed }
+    first.* = first.* & 0xbf
+    const fin = (first.* & 0x80) != 0
+    if payload.length == 0 && ((!ongoing && fin) || (ongoing && !fin)) { return Error.none }
+    extension.*.ongoing = !fin
+    if !grow(extension, out, BUFFER_SIZE) { return Error.decompressFailed }
+    var good = inflateInto(extension, payload, false, out)
+    if good && fin {
+        // The 00 00 ff ff the sender took off.
+        const tail = [4]u8{ 0, 0, 255, 255 }
+        good = inflateInto(extension, tail[0..4], true, out)
+    }
+    if !good {
+        extension.*.ongoing = false
+        freeBytes(extension, out)
+        return Error.decompressFailed
+    }
+    return Error.none
+}

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # std.unicode (std/src/unicode) and mlx-unicode, its C layer with ICU's C
-# API (compiler/capi/icu):
+# API (compiler/libc/icu):
 #
 #   - `./mlx build unicode` builds unicode-generate, the tables, the
 #     library (libmlxunicode.so) and the headers: mlx-cheaders makes
 #     mlx-out/include/mlx-unicode/unicode/*.h of the API's Mlx modules
-#     (compiler/capi/icu/api);
+#     (compiler/libc/icu/api);
 #   - the tables in the tree are what the generators make of the data in
 #     std/registry/unicode and std/registry/tz now: std/src/unicode/tables.mlx
-#     and compiler/capi/icu/api/ugenerated.mlx of the UCD (ucd/),
+#     and compiler/libc/icu/api/ugenerated.mlx of the UCD (ucd/),
 #     std/src/unicode/locale/data.mlx of CLDR (cldr/),
 #     std/src/unicode/collation/rules.mlx of CLDR's collation data
 #     (cldr/collation/), std/src/unicode/charmaps/tables.mlx of the
@@ -19,12 +19,12 @@
 #     has them;
 #   - std.unicode's own tests, Mlx programs that exit 13
 #     (tests/*_unicode_*_runtime.mlx);
-#   - compiler/capi/icu/tests/api.mlx: the API modules compile as Mlx,
+#   - compiler/libc/icu/tests/api.mlx: the API modules compile as Mlx,
 #     and the macros, run as the Mlx they are written in, read UTF-8 and
 #     UTF-16 right;
 #   - tests/macros.c, compiled as C and as C++ by mlx-cc: every header
 #     together, the macros and initializers as C code uses them;
-#   - C programs (compiler/capi/icu/tests) built by mlx-cc against the
+#   - C programs (compiler/libc/icu/tests) built by mlx-cc against the
 #     library:
 #       tests/normalization.c  every line of NormalizationTest.txt
 #       tests/breaks.c         every line of the grapheme, word, sentence
@@ -63,14 +63,14 @@ work=$(mktemp -d /tmp/mlx-unicode.XXXXXX)
 trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-unicode
-tests=compiler/capi/icu/tests
+tests=compiler/libc/icu/tests
 
 ./mlx build cc unicode > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build unicode"; }
 echo "ok   ./mlx build unicode"
 
 mlx-out/bin/unicode-generate std/registry/unicode/ucd "$work/tables.mlx" "$work/ugenerated.mlx" || fail "unicode-generate"
 cmp -s "$work/tables.mlx" std/src/unicode/tables.mlx || fail "std/src/unicode/tables.mlx is not what the generator makes"
-cmp -s "$work/ugenerated.mlx" compiler/capi/icu/api/ugenerated.mlx || fail "compiler/capi/icu/api/ugenerated.mlx is not what the generator makes"
+cmp -s "$work/ugenerated.mlx" compiler/libc/icu/api/ugenerated.mlx || fail "compiler/libc/icu/api/ugenerated.mlx is not what the generator makes"
 echo "ok   the tables are what the generator makes of the UCD"
 
 mlx-out/bin/cldr-generate std/registry/unicode/cldr "$work/locales.mlx" || fail "cldr-generate"
@@ -97,7 +97,7 @@ else
     echo "skip the zones against zic's files: no /usr/share/zoneinfo here"
 fi
 
-./mlx --quiet compiler/capi/icu/tests/api.mlx -o "$work/api" || fail "the API modules do not compile as Mlx"
+./mlx --quiet compiler/libc/icu/tests/api.mlx -o "$work/api" || fail "the API modules do not compile as Mlx"
 "$work/api" || fail "tests/api.mlx exits $?"
 echo "ok   the API modules compile, their macros run as Mlx"
 

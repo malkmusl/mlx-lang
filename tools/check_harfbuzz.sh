@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# mlx-harfbuzz, HarfBuzz's C API in Mlx (compiler/capi/harfbuzz) over the
+# mlx-harfbuzz, HarfBuzz's C API in Mlx (compiler/libc/harfbuzz) over the
 # shaping engine std.shaping (std/src/shaping), hb-ft over mlx-freetype:
 #
 #   - `./mlx build harfbuzz` builds the library (libmlxharfbuzz.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-harfbuzz of the API's
-#     Mlx modules (compiler/capi/harfbuzz/api): <hb.h>, <hb-ot.h>,
+#     Mlx modules (compiler/libc/harfbuzz/api): <hb.h>, <hb-ot.h>,
 #     <hb-ft.h>, <hb-icu.h>, <hb-features.h> and the headers they include;
 #   - every function the headers declare is in the library (and every
-#     export of compiler/capi/harfbuzz/exports.mlx is one of std.shaping's
+#     export of compiler/libc/harfbuzz/exports.mlx is one of std.shaping's
 #     functions: tools/harfbuzz_exports.py --check);
 #   - the headers in C and in C++;
 #   - C programs built by mlx-cc against the library print what HarfBuzz
@@ -73,7 +73,7 @@ ft_headers=mlx-out/include/mlx-freetype
 icu_headers=mlx-out/include/mlx-unicode
 library=mlx-out/lib/libmlxharfbuzz.so
 ft_library=mlx-out/lib/libmlxfreetype.so
-tests=compiler/capi/harfbuzz/tests
+tests=compiler/libc/harfbuzz/tests
 update=0
 [ "${1:-}" = "--update" ] && update=1
 
@@ -138,7 +138,7 @@ fi
 echo "ok   ./mlx build harfbuzz"
 
 # Every `pub extern("c") fn` of the API modules is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/harfbuzz/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/harfbuzz/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }

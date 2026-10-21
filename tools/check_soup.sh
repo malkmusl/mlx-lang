@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks mlx-soup, libsoup 3's C API in Mlx (compiler/capi/soup):
+# Checks mlx-soup, libsoup 3's C API in Mlx (compiler/libc/soup):
 #   - ./mlx build soup builds the library and its headers
 #   - every function the headers declare is defined by the library
 #   - the headers (<libsoup/soup.h>) compile together as C and as C++
@@ -48,7 +48,7 @@ library=mlx-out/lib/libmlxsoup-3.0.so
 echo "ok   ./mlx build soup"
 
 # Every `pub extern("c") fn` of the API modules is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/soup/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/soup/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }
@@ -77,18 +77,18 @@ check() {
     local name=$1
     shift
     local status=0
-    cc "compiler/capi/soup/tests/$name.c" -o "$work/$name" "$library" mlx-out/lib/libmlxglib.so || fail "tests/$name.c does not build"
+    cc "compiler/libc/soup/tests/$name.c" -o "$work/$name" "$library" mlx-out/lib/libmlxglib.so || fail "tests/$name.c does not build"
     mkdir -p "$work/run-$name"
     (cd "$work/run-$name" && run timeout 120 "$work/$name" "$@") > "$work/$name.out" 2> "$work/$name.err" || status=$?
     echo "exit $status" >> "$work/$name.out"
-    diff -u "compiler/capi/soup/tests/$name.expected" "$work/$name.out" || { cat "$work/$name.err"; fail "tests/$name.c prints otherwise"; }
+    diff -u "compiler/libc/soup/tests/$name.expected" "$work/$name.out" || { cat "$work/$name.err"; fail "tests/$name.c prints otherwise"; }
     if [ "$compare_system" = 1 ]; then
         status=0
         # shellcheck disable=SC2046
-        gcc -O1 -w "compiler/capi/soup/tests/$name.c" -o "$work/$name-system" $(pkg-config --cflags --libs libsoup-3.0) || fail "tests/$name.c does not build against the system's libsoup"
+        gcc -O1 -w "compiler/libc/soup/tests/$name.c" -o "$work/$name-system" $(pkg-config --cflags --libs libsoup-3.0) || fail "tests/$name.c does not build against the system's libsoup"
         (cd "$work/run-$name" && timeout 120 "$work/$name-system" "$@") > "$work/$name-system.out" 2>&1 || status=$?
         echo "exit $status" >> "$work/$name-system.out"
-        diff -u "compiler/capi/soup/tests/$name.expected" "$work/$name-system.out" || fail "the system's libsoup prints otherwise for tests/$name.c"
+        diff -u "compiler/libc/soup/tests/$name.expected" "$work/$name-system.out" || fail "the system's libsoup prints otherwise for tests/$name.c"
     fi
     echo "ok   tests/$name.c"
 }

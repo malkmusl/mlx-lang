@@ -44,6 +44,22 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
 - **From Mlx**: `std` programs are static and need no libc; our `--plugin`
   objects (libpulse, libpipewire) can be loaded by either loader.
 
+## The C API shims beside it
+
+The subdirectories of compiler/libc other than `api/` and `tests/` are the C
+APIs of other libraries written in Mlx for the C and C++ code still
+compiled here (WebKit through mlx-cc; third-party clients of MLX Audio and
+MLX Capture), each a `--plugin` shared object: `glib`, `soup`, `icu`
+(`./mlx build unicode`), `freetype`, `harfbuzz`, `zlib`, `png`, `jpeg`,
+`webp`, `sqlite3`, `xml2`, `lcms2`, `gcrypt`, `tasn1`, `pulse` and
+`pipewire`, each with its README. They are shims: the functionality is
+std's (`std.unicode`, `std.http`, `std.flate`, `std.png`...) and a shim
+converts C's types and conventions to std's calls; `api/` in each declares
+the interface mlx-cheaders makes the headers of, `tests/` holds the C
+programs `tools/check_LIB.sh` compares with the system's library.
+[AUDIT.md](AUDIT.md) says, library by library, what logic each still holds
+and where it goes.
+
 ## The modules
 
 - **`sys.mlx`**: the system calls (`syscall0..6`, the `SYS_*` numbers, the
@@ -158,7 +174,7 @@ interpreter, so the kernel enters it directly. It runs programs three ways:
 
 mlx-cc's headers (compiler/cc/include) are mlxlibc's for what they
 declare. What mlxlibc added after them has its headers made of Mlx
-modules, as the libraries of compiler/capi have theirs: `api/` declares
+modules, as the C API shims beside it have theirs: `api/` declares
 the types and functions C sees, and `mlx-cheaders` writes the headers
 into `mlx-out/include/mlxlibc` (`./mlx build libc-headers`; `-I` that
 directory): `iconv.h` and `libintl.h`.

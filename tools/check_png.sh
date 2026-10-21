@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mlx-libpng, libpng's C API (compiler/capi/png, over std.png):
+# mlx-libpng, libpng's C API (compiler/libc/png, over std.png):
 #
 #   - `./mlx build png` builds the library (libmlxpng16.so) and the
 #     headers: mlx-cheaders makes mlx-out/include/mlx-png/png.h,
 #     pngconf.h and pnglibconf.h of the API's Mlx modules
-#     (compiler/capi/png/api);
+#     (compiler/libc/png/api);
 #   - every function the headers declare is in the library;
 #   - the headers in C and C++;
 #   - tests/corpus.py writes the test images (every colour type and bit
@@ -36,12 +36,12 @@ trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-png
 library=mlx-out/lib/libmlxpng16.so
-tests=compiler/capi/png/tests
+tests=compiler/libc/png/tests
 
 ./mlx build -j 1 cc png > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build png"; }
 echo "ok   ./mlx build png"
 
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/png/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/png/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the headers declare are not in the library"; }

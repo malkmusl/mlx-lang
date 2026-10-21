@@ -1,0 +1,380 @@
+// std.flate.gzip: gzip files read and written in pieces, for Mlx programs
+// (what zlib's gz* functions do, over std.flate's inflater and deflater
+// and std's files). A Reader gives the uncompressed bytes of a file of
+// gzip members one after another (as gzip itself reads them), reads a
+// file that is not gzip as it is, and leaves alone what follows the last
+// member; a Writer takes bytes and writes one member, finished when the
+// writer is closed. Each buffers 8 KiB in memory of the allocator.
+//
+//     var reader: gzip.Reader = undefined
+//     if !gzip.openRead(&reader, allocator, "log.gz".pointer) { ... }
+//     const got = gzip.read(&reader, into, room)     // 0 at the end, -1 on an error
+//     gzip.readerClose(&reader)
+//
+//     var writer: gzip.Writer = undefined
+//     if !gzip.openWrite(&writer, allocator, "out.gz".pointer, 6) { ... }
+//     _ = gzip.write(&writer, bytes)
+//     _ = gzip.writerClose(&writer)                  // the member finished
+const fs = @import("../../bootstrap/fs.mlx")
+const flate = @import("../flate.mlx")
+
+pub const Allocator = flate.Allocator
+pub const File = fs.File
+
+pub const BUFFER: usize = 8192
+
+pub const Error = enum(u8) {
+    none,
+    // The file could not be read or written (or opened).
+    file,
+    // The gzip data is damaged.
+    damaged,
+    // The file ends inside a member.
+    unexpectedEnd,
+    noMemory,
+}
+
+// How a file being read is read: its header looked for, copied as it
+// is, inflated.
+const How = enum(u8) {
+    look,
+    copy,
+    gzip,
+}
+
+pub const Reader = struct {
+    allocator: Allocator
+    file: File
+    ownsFile: bool
+    inflater: flate.Inflater
+    input: [*]u8
+    inputAt: usize
+    inputLength: usize
+    how: How
+    // Whether the file is read as it is (no gzip member found yet).
+    direct: bool
+    // The file is exhausted; the output is.
+    atEof: bool
+    finished: bool
+    err: Error
+    // The uncompressed bytes given so far.
+    position: u64
+}
+
+// A reader of `file` (closed with the reader when `ownsFile`).
+pub fn readerInit(reader: *Reader, allocator: Allocator, file: File, ownsFile: bool) -> bool {
+    reader.*.allocator = allocator
+    reader.*.file = file
+    reader.*.ownsFile = ownsFile
+    reader.*.inputAt = 0
+    reader.*.inputLength = 0
+    reader.*.how = How.look
+    reader.*.direct = true
+    reader.*.atEof = false
+    reader.*.finished = false
+    reader.*.err = Error.none
+    reader.*.position = 0
+    const memory = allocator.alloc(BUFFER, 16)
+    if memory == null { return false }
+    reader.*.input = memory.?
+    if flate.inflaterInit(&reader.*.inflater, allocator, flate.Format.gzip) != flate.Status.ok {
+        allocator.free(memory.?, BUFFER, 16)
+        return false
+    }
+    return true
+}
+
+// A reader of the file at `path`.
+pub fn openRead(reader: *Reader, allocator: Allocator, path: [*]const u8) -> bool {
+    const file = fs.open(path, fs.READ_ONLY, 0)
+    if !fs.isValid(file) { return false }
+    if !readerInit(reader, allocator, file, true) {
+        _ = fs.close(file)
+        return false
+    }
+    return true
+}
+
+pub fn readerError(reader: *const Reader) -> Error { return reader.*.err }
+
+pub fn readerClose(reader: *Reader) -> void {
+    flate.inflaterEnd(&reader.*.inflater)
+    reader.*.allocator.free(reader.*.input, BUFFER, 16)
+    if reader.*.ownsFile { _ = fs.close(reader.*.file) }
+}
+
+// More of the file into the input buffer, what is left of it moved
+// first; false on a read error.
+fn fill(reader: *Reader) -> bool {
+    if reader.*.atEof { return true }
+    const input = reader.*.input
+    const left = reader.*.inputLength - reader.*.inputAt
+    if reader.*.inputAt > 0 {
+        var index: usize = 0
+        while index < left {
+            input[index] = input[reader.*.inputAt + index]
+            index += 1
+        }
+        reader.*.inputAt = 0
+        reader.*.inputLength = left
+    }
+    const got = fs.read(reader.*.file, input + left, BUFFER - left)
+    if got < 0 {
+        reader.*.err = Error.file
+        return false
+    }
+    if got == 0 { reader.*.atEof = true }
+    reader.*.inputLength = left + @intCast(usize, got)
+    return true
+}
+
+// Looks for a gzip header: inflate when there is one, else copy (or,
+// after gzip data, take what follows as trailing garbage and stop).
+fn look(reader: *Reader) -> bool {
+    if reader.*.inputLength - reader.*.inputAt < 2 {
+        if !fill(reader) { return false }
+        if reader.*.inputLength - reader.*.inputAt == 0 {
+            reader.*.finished = true
+            return true
+        }
+    }
+    const input = reader.*.input
+    const at = reader.*.inputAt
+    if reader.*.inputLength - at > 1 && input[at] == 31 && input[at + 1] == 139 {
+        _ = flate.inflaterReset(&reader.*.inflater)
+        reader.*.how = How.gzip
+        reader.*.direct = false
+        return true
+    }
+    if !reader.*.direct {
+        reader.*.inputAt = reader.*.inputLength
+        reader.*.finished = true
+        return true
+    }
+    reader.*.how = How.copy
+    return true
+}
+
+// Inflates into `into` up to the end of the member or of the room: the
+// bytes made in `produced`.
+fn decompress(reader: *Reader, into: [*]u8, room: usize, produced: *usize) -> bool {
+    produced.* = 0
+    while produced.* < room {
+        if reader.*.inputAt == reader.*.inputLength {
+            if !fill(reader) { return false }
+            if reader.*.inputAt == reader.*.inputLength {
+                reader.*.err = Error.unexpectedEnd
+                return false
+            }
+        }
+        var progress: flate.Progress = undefined
+        const status = flate.inflaterRun(&reader.*.inflater, reader.*.input + reader.*.inputAt, reader.*.inputLength - reader.*.inputAt, into + produced.*, room - produced.*, &progress)
+        reader.*.inputAt += progress.consumed
+        produced.* += progress.produced
+        if status == flate.Status.done {
+            reader.*.how = How.look
+            return true
+        }
+        if status == flate.Status.damaged || status == flate.Status.needDictionary || status == flate.Status.misuse {
+            reader.*.err = Error.damaged
+            return false
+        }
+        if status == flate.Status.noMemory {
+            reader.*.err = Error.noMemory
+            return false
+        }
+    }
+    return true
+}
+
+// Up to `room` uncompressed bytes into `into`: how many (0 once the
+// file's data is at an end), or -1 for an error (`readerError`).
+pub fn read(reader: *Reader, into: [*]u8, room: usize) -> isize {
+    if reader.*.err != Error.none { return -1 }
+    var produced: usize = 0
+    while produced < room && !reader.*.finished {
+        if reader.*.how == How.look {
+            if !look(reader) { return -1 }
+        } else if reader.*.how == How.copy {
+            // What was looked at first, then the file itself.
+            const left = reader.*.inputLength - reader.*.inputAt
+            if left > 0 {
+                const count = if left < room - produced { left } else { room - produced }
+                var index: usize = 0
+                while index < count {
+                    into[produced + index] = reader.*.input[reader.*.inputAt + index]
+                    index += 1
+                }
+                reader.*.inputAt += count
+                produced += count
+            } else if reader.*.atEof {
+                reader.*.finished = true
+            } else {
+                const got = fs.read(reader.*.file, into + produced, room - produced)
+                if got < 0 {
+                    reader.*.err = Error.file
+                    return -1
+                }
+                if got == 0 { reader.*.atEof = true }
+                produced += @intCast(usize, got)
+            }
+        } else {
+            var made: usize = 0
+            if !decompress(reader, into + produced, room - produced, &made) { return -1 }
+            produced += made
+        }
+    }
+    reader.*.position += @intCast(u64, produced)
+    return @intCast(isize, produced)
+}
+
+// Everything the reader has left, into memory of `allocator`
+// (flate.freeBuffer gives it back); false on an error or no memory.
+pub fn readToEnd(reader: *Reader, allocator: Allocator, result: *flate.Buffer) -> bool {
+    var capacity: usize = 4 * BUFFER
+    var memory = allocator.alloc(capacity, 16)
+    if memory == null { return false }
+    var bytes = memory.?
+    var length: usize = 0
+    while true {
+        if length == capacity {
+            const grown = allocator.alloc(capacity * 2, 16)
+            if grown == null {
+                allocator.free(bytes, capacity, 16)
+                return false
+            }
+            var index: usize = 0
+            while index < length {
+                grown.?[index] = bytes[index]
+                index += 1
+            }
+            allocator.free(bytes, capacity, 16)
+            bytes = grown.?
+            capacity *= 2
+        }
+        const got = read(reader, bytes + length, capacity - length)
+        if got < 0 {
+            allocator.free(bytes, capacity, 16)
+            return false
+        }
+        if got == 0 { break }
+        length += @intCast(usize, got)
+    }
+    result.*.bytes = bytes
+    result.*.length = length
+    result.*.capacity = capacity
+    return true
+}
+
+// The whole file at `path` uncompressed, into memory of `allocator`.
+pub fn readFile(allocator: Allocator, path: [*]const u8, result: *flate.Buffer) -> bool {
+    var reader: Reader = undefined
+    if !openRead(&reader, allocator, path) { return false }
+    const ok = readToEnd(&reader, allocator, result)
+    readerClose(&reader)
+    return ok
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+pub const Writer = struct {
+    allocator: Allocator
+    file: File
+    ownsFile: bool
+    deflater: flate.Deflater
+    output: [*]u8
+    err: Error
+    // The uncompressed bytes taken so far.
+    position: u64
+}
+
+// A writer of one gzip member to `file` (closed with the writer when
+// `ownsFile`), compressing at `level` (0 to 9, -1 for 6).
+pub fn writerInit(writer: *Writer, allocator: Allocator, file: File, ownsFile: bool, level: i32) -> bool {
+    writer.*.allocator = allocator
+    writer.*.file = file
+    writer.*.ownsFile = ownsFile
+    writer.*.err = Error.none
+    writer.*.position = 0
+    const memory = allocator.alloc(BUFFER, 16)
+    if memory == null { return false }
+    writer.*.output = memory.?
+    if flate.deflaterInit(&writer.*.deflater, allocator, flate.options(level, flate.Format.gzip)) != flate.Status.ok {
+        allocator.free(memory.?, BUFFER, 16)
+        return false
+    }
+    return true
+}
+
+// A writer of the file at `path`, made or truncated.
+pub fn openWrite(writer: *Writer, allocator: Allocator, path: [*]const u8, level: i32) -> bool {
+    const file = fs.open(path, fs.WRITE_ONLY | fs.CREATE | fs.TRUNCATE, 420)
+    if !fs.isValid(file) { return false }
+    if !writerInit(writer, allocator, file, true, level) {
+        _ = fs.close(file)
+        return false
+    }
+    return true
+}
+
+pub fn writerError(writer: *const Writer) -> Error { return writer.*.err }
+
+// Runs the deflater over `data` with `flush` until it has taken all of
+// it and (for a flush) has nothing more to give, writing what it makes.
+fn run(writer: *Writer, data: []const u8, flush: flate.Flush) -> bool {
+    var consumed: usize = 0
+    while true {
+        var progress: flate.Progress = undefined
+        const status = flate.deflaterRun(&writer.*.deflater, data.pointer + consumed, data.length - consumed, writer.*.output, BUFFER, flush, &progress)
+        consumed += progress.consumed
+        if progress.produced > 0 && !fs.writeAllBytes(writer.*.file, writer.*.output, progress.produced) {
+            writer.*.err = Error.file
+            return false
+        }
+        if status == flate.Status.done { return true }
+        if status != flate.Status.ok && status != flate.Status.stuck {
+            writer.*.err = Error.damaged
+            if status == flate.Status.noMemory { writer.*.err = Error.noMemory }
+            return false
+        }
+        // Done when the input is taken and the last call had room left
+        // (a flush writes until then; a plain write stops at the input).
+        if consumed == data.length && (flush == flate.Flush.none || progress.produced < BUFFER) { break }
+    }
+    return true
+}
+
+// `data` into the member.
+pub fn write(writer: *Writer, data: []const u8) -> bool {
+    if writer.*.err != Error.none { return false }
+    if !run(writer, data, flate.Flush.none) { return false }
+    writer.*.position += @intCast(u64, data.length)
+    return true
+}
+
+// Everything given so far written out, readable up to here (zlib's sync
+// flush).
+pub fn flush(writer: *Writer) -> bool {
+    if writer.*.err != Error.none { return false }
+    return run(writer, "", flate.Flush.sync)
+}
+
+// Finishes the member (its trailer written) and gives the memory back;
+// false when the finish or a write failed.
+pub fn writerClose(writer: *Writer) -> bool {
+    var ok = writer.*.err == Error.none
+    if ok { ok = run(writer, "", flate.Flush.finish) }
+    flate.deflaterEnd(&writer.*.deflater)
+    writer.*.allocator.free(writer.*.output, BUFFER, 16)
+    if writer.*.ownsFile { ok = fs.close(writer.*.file) && ok }
+    return ok
+}
+
+// The bytes as one member in the file at `path`, at `level`.
+pub fn writeFile(allocator: Allocator, path: [*]const u8, data: []const u8, level: i32) -> bool {
+    var writer: Writer = undefined
+    if !openWrite(&writer, allocator, path, level) { return false }
+    const written = write(&writer, data)
+    return writerClose(&writer) && written
+}

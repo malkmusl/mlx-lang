@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# mlx-sqlite3, SQLite's C API in Mlx (compiler/capi/sqlite3, over std.sql):
+# mlx-sqlite3, SQLite's C API in Mlx (compiler/libc/sqlite3, over std.sql):
 #
 #   - `./mlx build sqlite3` builds the library (libmlxsqlite3.so) and its
 #     header: mlx-cheaders makes mlx-out/include/mlx-sqlite3/sqlite3.h of
-#     the API's Mlx module (compiler/capi/sqlite3/api);
+#     the API's Mlx module (compiler/libc/sqlite3/api);
 #   - every function the header declares is in the library;
 #   - the header compiles as C and as C++;
 #   - C programs built by mlx-cc against the library print what
@@ -43,13 +43,13 @@ trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-sqlite3
 library=mlx-out/lib/libmlxsqlite3.so
-tests=compiler/capi/sqlite3/tests
+tests=compiler/libc/sqlite3/tests
 
 ./mlx build -j 1 cc sqlite3 > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build sqlite3"; }
 echo "ok   ./mlx build sqlite3"
 
 # Every `pub extern("c") fn` of the API module is defined by the library.
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/sqlite3/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/sqlite3/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the header declares are not in the library"; }

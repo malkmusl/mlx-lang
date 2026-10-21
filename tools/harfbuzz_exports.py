@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Writes compiler/capi/harfbuzz/exports.mlx: for each function the API
-modules (compiler/capi/harfbuzz/api) declare, an exported function calling
+"""Writes compiler/libc/harfbuzz/exports.mlx: for each function the API
+modules (compiler/libc/harfbuzz/api) declare, an exported function calling
 the std.shaping function of the same name (hb_ dropped, camel case:
 hb_buffer_add_utf8 is bufferAddUtf8), found in std/src/shaping. Functions
 of the C layer itself (ft.mlx, icu.mlx) and the adapters below are left to
@@ -12,9 +12,9 @@ exits 1 if anything is.
 import glob, os, re, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-API = os.path.join(ROOT, 'compiler/capi/harfbuzz/api')
+API = os.path.join(ROOT, 'compiler/libc/harfbuzz/api')
 STD = os.path.join(ROOT, 'std/src/shaping')
-CAPI = os.path.join(ROOT, 'compiler/capi/harfbuzz')
+CAPI = os.path.join(ROOT, 'compiler/libc/harfbuzz')
 
 # C functions whose std.shaping counterpart takes other types.
 ADAPTERS = {

@@ -1,0 +1,413 @@
+// std.http.client against a small HTTP/1.1 server of its own, in a child
+// process on the loopback: a session's requests and their heads and
+// bodies, connections kept and reused, Content-Length, chunked and
+// to-the-end bodies, gzip undone, cookies set and sent back through a
+// jar, redirects followed with their method rules (302 as it is, 303 as
+// a GET), relative Locations resolved, a Digest challenge answered with
+// the credentials a callback gives, a loop of redirects refused, and the
+// errors of a host that is not there. Exits 13 when every check holds,
+// else the number of the first check that failed.
+const std = @import("std")
+const net = @import("std.net")
+const client = @import("std.http.client")
+const message = @import("std.http.message")
+const headers = @import("std.http.headers")
+const auth = @import("std.http.auth")
+const cookiejar = @import("std.http.cookiejar")
+const flate = @import("std.flate")
+const process = std.linux.process
+
+fn same(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var index: usize = 0
+    while index < a.length {
+        if a[index] != b[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn startsWith(a: []const u8, b: []const u8) -> bool {
+    if a.length < b.length { return false }
+    return same(a[0..b.length], b)
+}
+
+// ---------------------------------------------------------------------------
+// The server
+
+const Text = struct {
+    bytes: [65536]u8
+    length: usize
+}
+
+fn append(context: usize, bytes: []const u8) -> void {
+    const t: *Text = unsafe { @ptrFromInt(*Text, context) }
+    var index: usize = 0
+    while index < bytes.length {
+        if t.*.length < 65536 {
+            t.*.bytes[t.*.length] = bytes[index]
+            t.*.length += 1
+        }
+        index += 1
+    }
+}
+
+fn sinkOf(t: *Text) -> headers.Sink { return headers.Sink.{ .context = @intFromPtr(t), .write = append } }
+
+fn text(t: *Text) -> []const u8 { return t.*.bytes[0..t.*.length] }
+
+fn putNumber(sink: headers.Sink, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var v = value
+    while true {
+        digits[19 - count] = @intCast(u8, 48 + v % 10)
+        count += 1
+        v = v / 10
+        if v == 0 { break }
+    }
+    headers.put(sink, digits[20 - count..20])
+}
+
+// A response with a Content-Length body.
+fn respond(out: *Text, status: u32, phrase: []const u8, extra: []const u8, body: []const u8) -> void {
+    out.*.length = 0
+    const sink = sinkOf(out)
+    message.writeStatusLine(sink, message.Version.http11, status, phrase)
+    headers.put(sink, "Content-Length: ")
+    putNumber(sink, body.length)
+    headers.put(sink, "\r\n")
+    headers.put(sink, extra)
+    message.writeHeadEnd(sink)
+    headers.put(sink, body)
+}
+
+fn headerOf(head: []const u8, name: []const u8, folded: []u8, value: *[]const u8) -> bool {
+    var it = message.headerLines(head)
+    var n: []const u8 = ""
+    var v: []const u8 = ""
+    while message.nextHeader(&it, &n, &v, folded) {
+        if headers.equalsIgnoringCase(n, name) {
+            value.* = v
+            return true
+        }
+    }
+    return false
+}
+
+// Whether `data` holds a whole head: its blank line is in it.
+fn headComplete(data: []const u8, headEnd: usize) -> bool {
+    if headEnd < data.length { return true }
+    if data.length >= 4 && data[data.length - 4] == 13 && data[data.length - 3] == 10 && data[data.length - 2] == 13 && data[data.length - 1] == 10 { return true }
+    return data.length >= 2 && data[data.length - 2] == 10 && data[data.length - 1] == 10
+}
+
+// Whether a Digest Authorization answers the challenge for `user`.
+fn digestOk(authorization: []const u8, method: []const u8) -> bool {
+    if !auth.schemeIs(authorization, "Digest") { return false }
+    const params = auth.paramsOf(authorization, "Digest")
+    var user: [64]u8 = undefined
+    var userLength: usize = 0
+    var target: [256]u8 = undefined
+    var targetLength: usize = 0
+    var nc: [16]u8 = undefined
+    var ncLength: usize = 0
+    var cnonce: [128]u8 = undefined
+    var cnonceLength: usize = 0
+    var response: [64]u8 = undefined
+    var responseLength: usize = 0
+    if auth.findParam(params, "username", user[0..64], &userLength) != auth.Found.value || !same(user[0..userLength], "alice") { return false }
+    if auth.findParam(params, "uri", target[0..256], &targetLength) != auth.Found.value { return false }
+    if auth.findParam(params, "nc", nc[0..16], &ncLength) != auth.Found.value { return false }
+    if auth.findParam(params, "cnonce", cnonce[0..128], &cnonceLength) != auth.Found.value { return false }
+    if auth.findParam(params, "response", response[0..64], &responseLength) != auth.Found.value || responseLength != 32 { return false }
+    var urp: [32]u8 = undefined
+    auth.hexUrp("alice", "testrealm", "secret", &urp)
+    var expected: [32]u8 = undefined
+    auth.digestResponse(method, target[0..targetLength], &urp, true, "nonce123", cnonce[0..cnonceLength], @intCast(u32, auth.nonceCountOf(nc[0..ncLength])), &expected)
+    return same(expected[0..32], response[0..32])
+}
+
+// Serves connections until a request for /quit; 0 when it served them
+// as it should.
+fn serve(listener: isize, allocator: std.allocator.Allocator) -> u8 {
+    var out: Text = undefined
+    var folded: [4096]u8 = undefined
+    var buffer: [65536]u8 = undefined
+    const into: [*]u8 = &buffer
+    var quit = false
+    while !quit {
+        var peer: net.Address = undefined
+        const fd = net.accept(listener, &peer)
+        if fd < 0 { return 1 }
+        var held: usize = 0
+        while true {
+            // A request's head, and its body by Content-Length.
+            var headEnd = message.headEnd(buffer[0..held])
+            while !headComplete(buffer[0..held], headEnd) {
+                if held >= 65536 { break }
+                const more: [*]u8 = unsafe { into + held }
+                if !net.readable(fd, 5000) { break }
+                const got = net.receive(fd, more, 65536 - held)
+                if got <= 0 { break }
+                held += @intCast(usize, got)
+                headEnd = message.headEnd(buffer[0..held])
+            }
+            if !headComplete(buffer[0..held], headEnd) { break }
+            const head = buffer[0..headEnd]
+            var line: message.RequestLine = undefined
+            if !message.parseRequestLine(head, &line) { break }
+            var bodyLength: usize = 0
+            var value: []const u8 = ""
+            if headerOf(head, "Content-Length", folded[0..4096], &value) {
+                for c in value { bodyLength = bodyLength * 10 + @intCast(usize, c - 48) }
+            }
+            while held < headEnd + bodyLength {
+                const more: [*]u8 = unsafe { into + held }
+                if !net.readable(fd, 5000) { break }
+                const got = net.receive(fd, more, 65536 - held)
+                if got <= 0 { break }
+                held += @intCast(usize, got)
+            }
+            const body = buffer[headEnd..headEnd + bodyLength]
+            const target = line.target
+            var close = false
+            if same(target, "/") {
+                respond(&out, 200, "OK", "Content-Type: text/plain\r\nSet-Cookie: sid=42; Path=/\r\nSet-Cookie: other=1; Path=/elsewhere\r\n", "hello")
+            } else if same(target, "/cookie") {
+                var cookie: []const u8 = "none"
+                _ = headerOf(head, "Cookie", folded[0..4096], &cookie)
+                respond(&out, 200, "OK", "", cookie)
+            } else if same(target, "/method") {
+                respond(&out, 200, "OK", "", line.method)
+            } else if same(target, "/redirect") {
+                respond(&out, 302, "Found", "Location: /cookie\r\n", "")
+            } else if same(target, "/see-other") {
+                respond(&out, 303, "See Other", "Location: ../method\r\n", "")
+            } else if same(target, "/loop") {
+                respond(&out, 302, "Found", "Location: /loop\r\n", "")
+            } else if same(target, "/post") {
+                var echo: Text = undefined
+                echo.length = 0
+                headers.put(sinkOf(&echo), "len=")
+                putNumber(sinkOf(&echo), body.length)
+                headers.put(sinkOf(&echo), " ")
+                headers.put(sinkOf(&echo), body)
+                var kind: []const u8 = "?"
+                _ = headerOf(head, "Content-Type", folded[0..4096], &kind)
+                headers.put(sinkOf(&echo), " ")
+                headers.put(sinkOf(&echo), kind)
+                respond(&out, 200, "OK", "", text(&echo))
+            } else if same(target, "/chunked") {
+                out.length = 0
+                const sink = sinkOf(&out)
+                message.writeStatusLine(sink, message.Version.http11, 200, "OK")
+                headers.put(sink, "Transfer-Encoding: chunked\r\n\r\n2\r\nab\r\n4;ext=1\r\ncdef\r\n0\r\nTrailer: x\r\n\r\n")
+            } else if same(target, "/gzip") {
+                var squeezed: [256]u8 = undefined
+                const squeezedPointer: [*]u8 = &squeezed
+                const plain: []const u8 = "compressed text, compressed text, compressed text"
+                const n = flate.compress(plain.pointer, plain.length, squeezedPointer, 256, 6, flate.Format.gzip, allocator)
+                respond(&out, 200, "OK", "Content-Encoding: gzip\r\n", squeezed[0..n])
+            } else if same(target, "/auth") {
+                var authorization: []const u8 = ""
+                if headerOf(head, "Authorization", folded[0..4096], &authorization) {
+                    if digestOk(authorization, line.method) {
+                        respond(&out, 200, "OK", "", "welcome alice")
+                    } else {
+                        respond(&out, 403, "Forbidden", "", "bad digest")
+                    }
+                } else {
+                    respond(&out, 401, "Unauthorized", "WWW-Authenticate: Basic realm=\"other\", Digest realm=\"testrealm\", nonce=\"nonce123\", qop=\"auth\", algorithm=MD5\r\n", "")
+                }
+            } else if same(target, "/close") {
+                out.length = 0
+                const sink = sinkOf(&out)
+                message.writeStatusLine(sink, message.Version.http11, 200, "OK")
+                headers.put(sink, "Connection: close\r\n\r\nto the end")
+                close = true
+            } else if same(target, "/head") {
+                respond(&out, 200, "OK", "X-Head: yes\r\n", "")
+            } else if same(target, "/quit") {
+                respond(&out, 200, "OK", "", "bye")
+                quit = true
+                close = true
+            } else {
+                respond(&out, 404, "Not Found", "", "nothing here")
+            }
+            // A HEAD gets the head alone.
+            if same(line.method, "HEAD") { out.length = message.headEnd(text(&out)) }
+            if !net.send(fd, text(&out)) { break }
+            // The next request, if it came along.
+            const used = headEnd + bodyLength
+            var i: usize = 0
+            while used + i < held {
+                buffer[i] = buffer[used + i]
+                i += 1
+            }
+            held -= used
+            if close { break }
+        }
+        net.close(fd)
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// The client
+
+fn credentials(context: usize, host: []const u8, realm: []const u8, user: *[]const u8, password: *[]const u8) -> bool {
+    if !same(realm, "testrealm") { return false }
+    user.* = "alice"
+    password.* = "secret"
+    return true
+}
+
+fn url(base: []const u8, path: []const u8, out: *[128]u8) -> []const u8 {
+    var n: usize = 0
+    for c in base {
+        out.*[n] = c
+        n += 1
+    }
+    for c in path {
+        out.*[n] = c
+        n += 1
+    }
+    return out.*[0..n]
+}
+
+fn check(session: *client.Session, base: []const u8, path: []const u8, status: u32, body: []const u8, response: *client.Response) -> bool {
+    var text_: [128]u8 = undefined
+    const result = client.get(session, url(base, path, &text_), response)
+    if result != client.Error.none { return false }
+    if response.*.status != status { return false }
+    return same(client.body(response), body)
+}
+
+pub fn main() -> u8 {
+    const allocator: std.allocator.Allocator = std.page_allocator.init()
+    const loop = net.ipv4(127, 0, 0, 1, 0)
+    const listener = net.listen(&loop, 8)
+    if listener < 0 { return 1 }
+    var bound: net.Address = undefined
+    if !net.localAddress(listener, &bound) { return 2 }
+    const pid = process.fork()
+    if pid < 0 { return 3 }
+    if pid == 0 {
+        const status = serve(listener, allocator)
+        std.linux.exitGroup(@intCast(usize, status))
+    }
+    net.close(listener)
+    var base: [64]u8 = undefined
+    var n: usize = 0
+    for c in "http://127.0.0.1:" {
+        base[n] = c
+        n += 1
+    }
+    var digits: [8]u8 = undefined
+    var count: usize = 0
+    var port = @intCast(usize, bound.port)
+    while true {
+        digits[7 - count] = @intCast(u8, 48 + port % 10)
+        count += 1
+        port = port / 10
+        if port == 0 { break }
+    }
+    var d: usize = 8 - count
+    while d < 8 {
+        base[n] = digits[d]
+        n += 1
+        d += 1
+    }
+    const baseUrl = base[0..n]
+
+    var session: client.Session = undefined
+    client.init(&session, allocator)
+    var jar: cookiejar.Jar = undefined
+    cookiejar.init(&jar, allocator)
+    client.setCookieJar(&session, &jar)
+    client.setCredentials(&session, credentials, 0)
+    var response: client.Response = undefined
+    var failed: u8 = 0
+
+    // A plain GET: its status, phrase, headers and body; the cookies set.
+    if !check(&session, baseUrl, "/", 200, "hello", &response) { failed = 4 }
+    var folded: [1024]u8 = undefined
+    var value: []const u8 = ""
+    if failed == 0 && (!same(response.phrase, "OK") || !client.header(&response, "content-type", folded[0..1024], &value) || !same(value, "text/plain") || response.redirects != 0) { failed = 5 }
+    if failed == 0 && !same(response.url.bytes[0..response.url.length], url(baseUrl, "/", &folded_)) { failed = 6 }
+    client.freeResponse(&session, &response)
+    if failed == 0 && cookiejar.count(&jar) != 2 { failed = 7 }
+    // The cookie sent back (the one of /elsewhere not), on the same connection.
+    if failed == 0 && !check(&session, baseUrl, "/cookie", 200, "sid=42", &response) { failed = 8 }
+    client.freeResponse(&session, &response)
+    if failed == 0 && !session.connections[0].open { failed = 9 }
+    // Redirects: a relative Location, a 303 made a GET.
+    if failed == 0 && !check(&session, baseUrl, "/redirect", 200, "sid=42", &response) { failed = 10 }
+    if failed == 0 && (response.redirects != 1 || !same(response.url.bytes[0..response.url.length], url(baseUrl, "/cookie", &folded_))) { failed = 11 }
+    client.freeResponse(&session, &response)
+    if failed == 0 {
+        const result = client.post(&session, url(baseUrl, "/see-other", &folded_), "text/plain", "data", &response)
+        if result != client.Error.none || response.status != 200 || !same(client.body(&response), "GET") { failed = 12 }
+        client.freeResponse(&session, &response)
+    }
+    if failed == 0 {
+        const result = client.get(&session, url(baseUrl, "/loop", &folded_), &response)
+        if result != client.Error.tooManyRedirects { failed = 14 }
+    }
+    // A POST's body and Content-Type echoed.
+    if failed == 0 {
+        const result = client.post(&session, url(baseUrl, "/post", &folded_), "application/x-www-form-urlencoded", "a=1&b=2", &response)
+        if result != client.Error.none || response.status != 200 || !same(client.body(&response), "len=7 a=1&b=2 application/x-www-form-urlencoded") { failed = 15 }
+        client.freeResponse(&session, &response)
+    }
+    // Chunked, gzip, to the end (the connection closed and made again).
+    if failed == 0 && !check(&session, baseUrl, "/chunked", 200, "abcdef", &response) { failed = 16 }
+    client.freeResponse(&session, &response)
+    if failed == 0 && !check(&session, baseUrl, "/gzip", 200, "compressed text, compressed text, compressed text", &response) { failed = 17 }
+    client.freeResponse(&session, &response)
+    if failed == 0 && !check(&session, baseUrl, "/close", 200, "to the end", &response) { failed = 18 }
+    client.freeResponse(&session, &response)
+    if failed == 0 && session.connections[0].open { failed = 19 }
+    if failed == 0 && !check(&session, baseUrl, "/head", 200, "", &response) { failed = 20 }
+    if failed == 0 && (!client.header(&response, "X-Head", folded[0..1024], &value) || !same(value, "yes")) { failed = 21 }
+    client.freeResponse(&session, &response)
+    // A HEAD has no body.
+    if failed == 0 {
+        const req = client.Request.{ .method = "HEAD", .url = url(baseUrl, "/", &folded_), .headers = "", .body = "", .hasBody = false }
+        const result = client.request(&session, &req, &response)
+        if result != client.Error.none || response.status != 200 || response.body.length != 0 { failed = 22 }
+        client.freeResponse(&session, &response)
+    }
+    // Digest authentication: the challenge answered, and the credentials
+    // kept for the next request.
+    if failed == 0 && !check(&session, baseUrl, "/auth", 200, "welcome alice", &response) { failed = 23 }
+    client.freeResponse(&session, &response)
+    if failed == 0 && !check(&session, baseUrl, "/auth", 200, "welcome alice", &response) { failed = 24 }
+    client.freeResponse(&session, &response)
+    if failed == 0 && !check(&session, baseUrl, "/missing", 404, "nothing here", &response) { failed = 25 }
+    client.freeResponse(&session, &response)
+    // Errors.
+    if failed == 0 {
+        var result = client.get(&session, "ftp://127.0.0.1/", &response)
+        if result != client.Error.badUrl { failed = 26 }
+        result = client.get(&session, "http://127.0.0.1:1/", &response)
+        if result != client.Error.connect { failed = 27 }
+        result = client.get(&session, "http://name.invalid/", &response)
+        if result != client.Error.resolve { failed = 28 }
+    }
+    // The server told to stop.
+    if !check(&session, baseUrl, "/quit", 200, "bye", &response) {
+        if failed == 0 { failed = 29 }
+    }
+    client.freeResponse(&session, &response)
+    client.deinit(&session)
+    cookiejar.deinit(&jar)
+    var status: usize = 0
+    _ = process.waitProcess(pid, &status, 0)
+    if failed != 0 { return failed }
+    if !process.succeeded(status) { return 30 }
+    return 13
+}
+
+var folded_: [128]u8 = undefined

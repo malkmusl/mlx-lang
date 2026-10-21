@@ -1,18 +1,30 @@
-// std.crypto.rsa: RSA signature verification (RFC 8017): PKCS #1 v1.5
-// (what certificates are mostly signed with) and PSS (what TLS 1.3
-// servers sign their handshake with), keys of 1024 to 4096 bits.
+// std.crypto.rsa: RSA (RFC 8017) with keys of 1024 to 4096 bits:
+// signature verification with PKCS #1 v1.5 (what certificates are mostly
+// signed with) and PSS (what TLS 1.3 servers sign their handshake with)
+// on public values, and, with a private key, signing with both,
+// encryption and decryption with PKCS #1 v1.5 and OAEP, and key
+// generation.
 //
 //     var key: rsa.PublicKey = undefined
 //     if !rsa.publicKeyInit(&key, modulus, length, exponent, elength) { ... }
 //     rsa.verifyPkcs1(&key, hash.Algorithm.sha256, digest, signature, slength)
 //     rsa.verifyPss(&key, hash.Algorithm.sha256, digest, signature, slength, 32)
 //
+//     var secret: rsa.PrivateKey = undefined      // 6 KB: keep it on the heap
+//     if !rsa.privateKeyInit(&secret, allocator, n, e, d, p, q) { ... }
+//     rsa.signPkcs1(&secret, hash.Algorithm.sha256, digest, signature)
+//     rsa.decryptOaep(&secret, hash.Algorithm.sha256, "", cipher, out, &length)
+//
 // The digest is of the message, made by the caller (std.crypto.hash).
-// Verification works on public values only; the exponentiation is
-// std.crypto.bignum's all the same.
+// Every exponentiation is std.crypto.bignum's Montgomery ladder, constant
+// time; the private operation goes by the CRT when p and q are known and
+// its result is checked with e before it is given out. A key keeps
+// pointers into itself, so it stays where it was initialized.
 
 const bignum = @import("./bignum.mlx")
 const hash = @import("./hash.mlx")
+const mpi = @import("./mpi.mlx")
+const random = @import("../random.mlx")
 
 pub const PublicKey = struct {
     modulus: bignum.Modulus
@@ -210,4 +222,487 @@ pub fn verifyPss(key: *PublicKey, algorithm: hash.Algorithm, digest: [*]const u8
     const mine: [*]u8 = &computed
     hash.finish(&hashing, mine)
     return hash.equal(mine, h, hLength)
+}
+
+// ---------------------------------------------------------------------------
+// Private keys
+
+pub const PrivateKey = struct {
+    public: PublicKey
+    // The private exponent, big-endian without leading zeroes.
+    d: [512]u8
+    dLength: usize
+    // The CRT's values when p and q are known: the primes as moduli, d
+    // mod (p - 1) and d mod (q - 1), q^-1 mod p in Montgomery's form and
+    // q's limbs.
+    hasCrt: bool
+    p: bignum.Modulus
+    pStorage: [96]u64
+    q: bignum.Modulus
+    qStorage: [96]u64
+    dp: [256]u8
+    dpLength: usize
+    dq: [256]u8
+    dqLength: usize
+    qInverse: [32]u64
+    qLimbs: [32]u64
+}
+
+// `bytes` without its leading zeroes.
+fn trimmed(bytes: []const u8) -> []const u8 {
+    var start: usize = 0
+    while start < bytes.length && bytes[start] == 0 { start += 1 }
+    return bytes[start..bytes.length]
+}
+
+// The key from its parameters, big-endian: the modulus and public
+// exponent as `publicKeyInit` takes them, d, and p and q (each empty for
+// a key without them, which then works with d alone). With p and q the
+// CRT's values are worked out (std.crypto.mpi, in memory of the
+// allocator) and p q = n is checked. False for parameters that do not
+// fit or do not agree.
+pub fn privateKeyInit(key: *PrivateKey, allocator: mpi.Allocator, modulus: []const u8, exponent: []const u8, d: []const u8, p: []const u8, q: []const u8) -> bool {
+    if !publicKeyInit(&key.*.public, modulus.pointer, modulus.length, exponent.pointer, exponent.length) { return false }
+    const secret = trimmed(d)
+    if secret.length == 0 || secret.length > 512 { return false }
+    var index: usize = 0
+    while index < secret.length {
+        key.*.d[index] = secret[index]
+        index += 1
+    }
+    key.*.dLength = secret.length
+    key.*.hasCrt = false
+    if p.length == 0 || q.length == 0 { return true }
+    const pStorage: [*]u64 = &key.*.pStorage
+    const qStorage: [*]u64 = &key.*.qStorage
+    bignum.modulusStorage(&key.*.p, pStorage, 32)
+    bignum.modulusStorage(&key.*.q, qStorage, 32)
+    if !bignum.modulusInit(&key.*.p, p.pointer, p.length) || !bignum.modulusInit(&key.*.q, q.pointer, q.length) { return false }
+    if key.*.p.n + key.*.q.n > bignum.MAX_LIMBS { return false }
+    var bigP: mpi.Mpi = undefined
+    var bigQ: mpi.Mpi = undefined
+    var bigN: mpi.Mpi = undefined
+    var bigD: mpi.Mpi = undefined
+    var t: mpi.Mpi = undefined
+    var inverse: mpi.Mpi = undefined
+    mpi.init(&bigP, allocator)
+    mpi.init(&bigQ, allocator)
+    mpi.init(&bigN, allocator)
+    mpi.init(&bigD, allocator)
+    mpi.init(&t, allocator)
+    mpi.init(&inverse, allocator)
+    var ok = mpi.fromBytes(&bigP, p) && mpi.fromBytes(&bigQ, q) && mpi.fromBytes(&bigN, modulus) && mpi.fromBytes(&bigD, secret)
+    if ok { ok = mpi.mul(&t, &bigP, &bigQ) && mpi.compare(&t, &bigN) == 0 }
+    // d mod (p - 1), d mod (q - 1).
+    if ok { ok = mpi.subU64(&t, &bigP, 1) && mpi.mod(&t, &bigD, &t) && mpi.byteLength(&t) > 0 }
+    if ok {
+        key.*.dpLength = mpi.byteLength(&t)
+        mpi.toBytes(&t, key.*.dp[0..key.*.dpLength])
+        ok = mpi.subU64(&t, &bigQ, 1) && mpi.mod(&t, &bigD, &t) && mpi.byteLength(&t) > 0
+    }
+    if ok {
+        key.*.dqLength = mpi.byteLength(&t)
+        mpi.toBytes(&t, key.*.dq[0..key.*.dqLength])
+        ok = mpi.invm(&inverse, &bigQ, &bigP)
+    }
+    if ok {
+        var bytes: [256]u8 = undefined
+        mpi.toBytes(&inverse, bytes[0..256])
+        const limbs: [*]u64 = &key.*.qInverse
+        bignum.zero(limbs, 32)
+        const raw: [*]const u8 = &bytes
+        ok = bignum.fromBytes(limbs, key.*.p.n, raw + 256 - key.*.p.n * 8, key.*.p.n * 8)
+        if ok { bignum.toMontgomery(&key.*.p, limbs, limbs) }
+        const qLimbs: [*]u64 = &key.*.qLimbs
+        bignum.zero(qLimbs, 32)
+        bignum.copy(qLimbs, key.*.q.m, key.*.q.n)
+    }
+    mpi.deinit(&bigP)
+    mpi.deinit(&bigQ)
+    mpi.deinit(&bigN)
+    mpi.deinit(&bigD)
+    mpi.deinit(&t)
+    mpi.deinit(&inverse)
+    key.*.hasCrt = ok
+    return ok
+}
+
+// input^d mod n, `size` bytes both: by the CRT when the key has p and
+// q, and checked with e (a fault in the CRT would give the factors
+// away). False for an input not below n or a check that failed.
+fn privateOperation(key: *PrivateKey, input: [*]const u8, out: [*]u8) -> bool {
+    const public = &key.*.public
+    const n = public.*.modulus.n
+    const size = public.*.size
+    var cipher: [64]u64 = undefined
+    const c: [*]u64 = &cipher
+    if !bignum.fromBytes(c, n, input, size) { return false }
+    const m: [*]const u64 = public.*.modulus.m
+    if bignum.less(c, m, n) == 0 { return false }
+    var plain: [64]u64 = undefined
+    const result: [*]u64 = &plain
+    bignum.zero(result, 64)
+    if !key.*.hasCrt {
+        const d: [*]const u8 = &key.*.d
+        if !bignum.modExp(&public.*.modulus, result, c, d, key.*.dLength) { return false }
+    } else {
+        const pn = key.*.p.n
+        const qn = key.*.q.n
+        var first: [64]u64 = undefined
+        const m1: [*]u64 = &first
+        var second: [64]u64 = undefined
+        const m2: [*]u64 = &second
+        bignum.reduce(&key.*.p, m1, c, n)
+        bignum.reduce(&key.*.q, m2, c, n)
+        const dp: [*]const u8 = &key.*.dp
+        const dq: [*]const u8 = &key.*.dq
+        if !bignum.modExp(&key.*.p, m1, m1, dp, key.*.dpLength) { return false }
+        if !bignum.modExp(&key.*.q, m2, m2, dq, key.*.dqLength) { return false }
+        // h = (m1 - m2) q^-1 mod p; m = m2 + q h.
+        var reduced: [64]u64 = undefined
+        const m2p: [*]u64 = &reduced
+        bignum.reduce(&key.*.p, m2p, m2, qn)
+        var difference: [64]u64 = undefined
+        const h: [*]u64 = &difference
+        bignum.modSub(&key.*.p, h, m1, m2p)
+        const qInverse: [*]const u64 = &key.*.qInverse
+        bignum.montMul(&key.*.p, h, h, qInverse)
+        const qLimbs: [*]const u64 = &key.*.qLimbs
+        mpi.mulLimbs(result, qLimbs, qn, h, pn)
+        var carry: u64 = 0
+        var index: usize = 0
+        while index < pn + qn {
+            const addend: u64 = if index < qn { m2[index] } else { 0 }
+            const sum = @intCast(u128, result[index]) + @intCast(u128, addend) + @intCast(u128, carry)
+            result[index] = @intCast(u64, sum & 18446744073709551615)
+            carry = @intCast(u64, sum >> 64)
+            index += 1
+        }
+        hash.wipe(unsafe { @ptrCast([*]u8, m1) }, 512)
+        hash.wipe(unsafe { @ptrCast([*]u8, m2) }, 512)
+        hash.wipe(unsafe { @ptrCast([*]u8, h) }, 512)
+    }
+    bignum.toBytes(result, n, out, size)
+    hash.wipe(unsafe { @ptrCast([*]u8, result) }, 512)
+    var checked: [512]u8 = undefined
+    const check: [*]u8 = &checked
+    if !publicOperation(public, out, size, check) || !hash.equal(check, input, size) {
+        hash.wipe(out, size)
+        return false
+    }
+    return true
+}
+
+// EMSA-PKCS1-v1_5 of a digest: 00 01 FF..FF 00 DigestInfo, `size`
+// bytes; false when they do not fit.
+fn encodePkcs1(algorithm: hash.Algorithm, digest: [*]const u8, size: usize, em: [*]u8) -> bool {
+    var info: [19]u8 = undefined
+    const prefix: [*]u8 = &info
+    const prefixLength = digestInfoPrefix(algorithm, prefix)
+    const digestLength = hash.digestLength(algorithm)
+    if size < prefixLength + digestLength + 11 { return false }
+    const padding = size - prefixLength - digestLength - 3
+    em[0] = 0
+    em[1] = 1
+    var index: usize = 0
+    while index < padding {
+        em[2 + index] = 255
+        index += 1
+    }
+    var at = 2 + padding
+    em[at] = 0
+    at += 1
+    index = 0
+    while index < prefixLength {
+        em[at] = info[index]
+        at += 1
+        index += 1
+    }
+    index = 0
+    while index < digestLength {
+        em[at] = digest[index]
+        at += 1
+        index += 1
+    }
+    return true
+}
+
+// The PKCS #1 v1.5 signature of a digest: `size` bytes into `out`.
+pub fn signPkcs1(key: *PrivateKey, algorithm: hash.Algorithm, digest: [*]const u8, out: [*]u8) -> bool {
+    var encoded: [512]u8 = undefined
+    const em: [*]u8 = &encoded
+    if !encodePkcs1(algorithm, digest, key.*.public.size, em) { return false }
+    return privateOperation(key, em, out)
+}
+
+// The PSS signature of a digest with the salt given (RFC 8017, 9.1.1,
+// MGF1 of the same hash): `size` bytes into `out`.
+pub fn signPss(key: *PrivateKey, algorithm: hash.Algorithm, digest: [*]const u8, salt: []const u8, out: [*]u8) -> bool {
+    const size = key.*.public.size
+    const emBits = key.*.public.bits - 1
+    const emLength = (emBits + 7) / 8
+    const hLength = hash.digestLength(algorithm)
+    if emLength < hLength + salt.length + 2 { return false }
+    var encoded: [512]u8 = undefined
+    const whole: [*]u8 = &encoded
+    // With a modulus of 8k+1 bits the encoded message is a byte shorter
+    // than the signature, and that byte is zero.
+    whole[0] = 0
+    const em: [*]u8 = whole + (size - emLength)
+    const dbLength = emLength - hLength - 1
+    const h: [*]u8 = em + dbLength
+    // H = Hash(8 zeroes | mHash | salt).
+    var hashing: hash.Hash = undefined
+    hash.init(&hashing, algorithm)
+    var eight: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    const padding: [*]const u8 = &eight
+    hash.update(&hashing, padding[0..8])
+    hash.update(&hashing, digest[0..hLength])
+    hash.update(&hashing, salt)
+    hash.finish(&hashing, h)
+    // DB = zeroes | 01 | salt, masked.
+    var index: usize = 0
+    while index < dbLength {
+        em[index] = 0
+        index += 1
+    }
+    em[dbLength - salt.length - 1] = 1
+    index = 0
+    while index < salt.length {
+        em[dbLength - salt.length + index] = salt[index]
+        index += 1
+    }
+    mgf1Xor(algorithm, h, hLength, em, dbLength)
+    const unused = 8 * emLength - emBits
+    em[0] = em[0] & @intCast(u8, (255 >> @intCast(u64, unused)) & 255)
+    em[emLength - 1] = 188
+    return privateOperation(key, whole, out)
+}
+
+// The same with a random salt of `saltLength` bytes.
+pub fn signPssRandom(key: *PrivateKey, algorithm: hash.Algorithm, digest: [*]const u8, saltLength: usize, out: [*]u8) -> bool {
+    if saltLength > 256 { return false }
+    var bytes: [256]u8 = undefined
+    const salt: [*]u8 = &bytes
+    if !random.fill(salt, saltLength) { return false }
+    return signPss(key, algorithm, digest, salt[0..saltLength], out)
+}
+
+// RSAES-PKCS1-v1_5 encryption with the padding given (`size` - message
+// - 3 bytes, none zero): `size` bytes into `out`.
+pub fn encryptPkcs1With(key: *PublicKey, message: []const u8, padding: []const u8, out: [*]u8) -> bool {
+    const size = key.*.size
+    if message.length + 11 > size || padding.length != size - message.length - 3 { return false }
+    var encoded: [512]u8 = undefined
+    const em: [*]u8 = &encoded
+    em[0] = 0
+    em[1] = 2
+    var index: usize = 0
+    while index < padding.length {
+        if padding[index] == 0 { return false }
+        em[2 + index] = padding[index]
+        index += 1
+    }
+    em[2 + padding.length] = 0
+    index = 0
+    while index < message.length {
+        em[3 + padding.length + index] = message[index]
+        index += 1
+    }
+    return publicOperation(key, em, size, out)
+}
+
+// RSAES-PKCS1-v1_5 encryption with random padding.
+pub fn encryptPkcs1(key: *PublicKey, message: []const u8, out: [*]u8) -> bool {
+    const size = key.*.size
+    if message.length + 11 > size { return false }
+    var bytes: [512]u8 = undefined
+    const padding: [*]u8 = &bytes
+    const length = size - message.length - 3
+    if !random.fill(padding, length) { return false }
+    var index: usize = 0
+    while index < length {
+        while padding[index] == 0 {
+            if !random.fill(padding + index, 1) { return false }
+        }
+        index += 1
+    }
+    return encryptPkcs1With(key, message, padding[0..length], out)
+}
+
+// RSAES-PKCS1-v1_5 decryption of a `size`-byte cipher: the message into
+// `out` (room for `size` bytes), its length into `length`; false for a
+// cipher not of the key or padding not as it should be.
+pub fn decryptPkcs1(key: *PrivateKey, cipher: []const u8, out: [*]u8, length: *usize) -> bool {
+    const size = key.*.public.size
+    if cipher.length != size { return false }
+    var decoded: [512]u8 = undefined
+    const em: [*]u8 = &decoded
+    if !privateOperation(key, cipher.pointer, em) { return false }
+    var at: usize = 2
+    while at < size && em[at] != 0 { at += 1 }
+    if em[0] != 0 || em[1] != 2 || at >= size || at < 10 {
+        hash.wipe(em, size)
+        return false
+    }
+    const count = size - at - 1
+    var index: usize = 0
+    while index < count {
+        out[index] = em[at + 1 + index]
+        index += 1
+    }
+    length.* = count
+    hash.wipe(em, size)
+    return true
+}
+
+// RSAES-OAEP encryption (RFC 8017, 7.1.1) with the hash for both the
+// label and MGF1 and the `seed` given (a digest's length of bytes):
+// `size` bytes into `out`.
+pub fn encryptOaep(key: *PublicKey, algorithm: hash.Algorithm, label: []const u8, message: []const u8, seed: []const u8, out: [*]u8) -> bool {
+    const size = key.*.size
+    const h = hash.digestLength(algorithm)
+    if seed.length != h || size < 2 * h + 2 || message.length > size - 2 * h - 2 { return false }
+    var encoded: [512]u8 = undefined
+    const em: [*]u8 = &encoded
+    em[0] = 0
+    const seedAt: [*]u8 = em + 1
+    const db: [*]u8 = em + 1 + h
+    const dbLength = size - h - 1
+    hash.digest(algorithm, label, db)
+    var index: usize = h
+    while index < dbLength {
+        db[index] = 0
+        index += 1
+    }
+    db[dbLength - message.length - 1] = 1
+    index = 0
+    while index < message.length {
+        db[dbLength - message.length + index] = message[index]
+        index += 1
+    }
+    index = 0
+    while index < h {
+        seedAt[index] = seed[index]
+        index += 1
+    }
+    mgf1Xor(algorithm, seedAt, h, db, dbLength)
+    mgf1Xor(algorithm, db, dbLength, seedAt, h)
+    const ok = publicOperation(key, em, size, out)
+    hash.wipe(em, size)
+    return ok
+}
+
+// The same with a random seed.
+pub fn encryptOaepRandom(key: *PublicKey, algorithm: hash.Algorithm, label: []const u8, message: []const u8, out: [*]u8) -> bool {
+    var bytes: [64]u8 = undefined
+    const seed: [*]u8 = &bytes
+    const h = hash.digestLength(algorithm)
+    if !random.fill(seed, h) { return false }
+    return encryptOaep(key, algorithm, label, message, seed[0..h], out)
+}
+
+// RSAES-OAEP decryption of a `size`-byte cipher: the message into `out`
+// (room for `size` bytes), its length into `length`; false for a cipher
+// not of the key, the label or the padding, with the same work either
+// way as far as the checks go.
+pub fn decryptOaep(key: *PrivateKey, algorithm: hash.Algorithm, label: []const u8, cipher: []const u8, out: [*]u8, length: *usize) -> bool {
+    const size = key.*.public.size
+    const h = hash.digestLength(algorithm)
+    if cipher.length != size || size < 2 * h + 2 { return false }
+    var decoded: [512]u8 = undefined
+    const em: [*]u8 = &decoded
+    if !privateOperation(key, cipher.pointer, em) { return false }
+    const seedAt: [*]u8 = em + 1
+    const db: [*]u8 = em + 1 + h
+    const dbLength = size - h - 1
+    mgf1Xor(algorithm, db, dbLength, seedAt, h)
+    mgf1Xor(algorithm, seedAt, h, db, dbLength)
+    var expected: [64]u8 = undefined
+    const labelHash: [*]u8 = &expected
+    hash.digest(algorithm, label, labelHash)
+    var bad: u64 = @intCast(u64, em[0])
+    var index: usize = 0
+    while index < h {
+        bad = bad | @intCast(u64, db[index] ^ expected[index])
+        index += 1
+    }
+    // The 01 after the zeroes.
+    var at = h
+    while at < dbLength && db[at] == 0 { at += 1 }
+    if at >= dbLength || db[at] != 1 { bad = 1 }
+    var ok = false
+    if bad == 0 {
+        const count = dbLength - at - 1
+        index = 0
+        while index < count {
+            out[index] = db[at + 1 + index]
+            index += 1
+        }
+        length.* = count
+        ok = true
+    }
+    hash.wipe(em, size)
+    return ok
+}
+
+// A new key of `bits` bits (1024 to 4096) with the public exponent
+// `exponent` (odd, at least 3; 65537 is the usual), its primes of half
+// the bits each with their top two bits set (std.crypto.mpi finds them,
+// in memory of the allocator), d = e^-1 mod lcm(p - 1, q - 1), p < q.
+pub fn generateKey(key: *PrivateKey, allocator: mpi.Allocator, bits: usize, exponent: u64) -> bool {
+    if bits < 1024 || bits > 4096 || (exponent & 1) == 0 || exponent < 3 { return false }
+    var e: mpi.Mpi = undefined
+    var p: mpi.Mpi = undefined
+    var q: mpi.Mpi = undefined
+    var n: mpi.Mpi = undefined
+    var p1: mpi.Mpi = undefined
+    var q1: mpi.Mpi = undefined
+    var g: mpi.Mpi = undefined
+    var lcm: mpi.Mpi = undefined
+    var d: mpi.Mpi = undefined
+    mpi.init(&e, allocator)
+    mpi.init(&p, allocator)
+    mpi.init(&q, allocator)
+    mpi.init(&n, allocator)
+    mpi.init(&p1, allocator)
+    mpi.init(&q1, allocator)
+    mpi.init(&g, allocator)
+    mpi.init(&lcm, allocator)
+    mpi.init(&d, allocator)
+    var ok = mpi.setU64(&e, exponent) && mpi.generatePrime(&p, bits / 2, &e) && mpi.generatePrime(&q, bits - bits / 2, &e)
+    if ok && mpi.compare(&p, &q) > 0 {
+        ok = mpi.set(&g, &p) && mpi.set(&p, &q) && mpi.set(&q, &g)
+    }
+    if ok { ok = mpi.mul(&n, &p, &q) && mpi.subU64(&p1, &p, 1) && mpi.subU64(&q1, &q, 1) && mpi.gcd(&g, &p1, &q1) && mpi.mul(&lcm, &p1, &q1) && mpi.divRem(&lcm, null, &lcm, &g) && mpi.invm(&d, &e, &lcm) }
+    if ok {
+        var nBytes: [512]u8 = undefined
+        var dBytes: [512]u8 = undefined
+        var pBytes: [256]u8 = undefined
+        var qBytes: [256]u8 = undefined
+        var eBytes: [8]u8 = undefined
+        const nLength = mpi.byteLength(&n)
+        const dLength = mpi.byteLength(&d)
+        const pLength = mpi.byteLength(&p)
+        const qLength = mpi.byteLength(&q)
+        mpi.toBytes(&n, nBytes[0..nLength])
+        mpi.toBytes(&d, dBytes[0..dLength])
+        mpi.toBytes(&p, pBytes[0..pLength])
+        mpi.toBytes(&q, qBytes[0..qLength])
+        mpi.toBytes(&e, eBytes[0..8])
+        ok = privateKeyInit(key, allocator, nBytes[0..nLength], eBytes[0..8], dBytes[0..dLength], pBytes[0..pLength], qBytes[0..qLength])
+        hash.wipe(&dBytes, 512)
+        hash.wipe(&pBytes, 256)
+        hash.wipe(&qBytes, 256)
+    }
+    mpi.deinit(&e)
+    mpi.deinit(&p)
+    mpi.deinit(&q)
+    mpi.deinit(&n)
+    mpi.deinit(&p1)
+    mpi.deinit(&q1)
+    mpi.deinit(&g)
+    mpi.deinit(&lcm)
+    mpi.deinit(&d)
+    return ok
 }

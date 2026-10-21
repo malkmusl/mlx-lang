@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mlx-lcms2, Little CMS's C API (compiler/capi/lcms2, over
+# mlx-lcms2, Little CMS's C API (compiler/libc/lcms2, over
 # std.colorprofile):
 #
 #   - `./mlx build lcms2` builds the library (libmlxlcms2.so) and the
 #     header: mlx-cheaders makes mlx-out/include/mlx-lcms2/lcms2.h of the
-#     API's Mlx module (compiler/capi/lcms2/api/lcms2.mlx);
+#     API's Mlx module (compiler/libc/lcms2/api/lcms2.mlx);
 #   - every function the header declares is in the library;
 #   - the header in C and C++, and a program linked with the library;
 #   - tests/transform.c, built by mlx-cc against the library, opens the
@@ -37,12 +37,12 @@ trap '[ -n "${KEEP:-}" ] || rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 headers=mlx-out/include/mlx-lcms2
 library=mlx-out/lib/libmlxlcms2.so
-tests=compiler/capi/lcms2/tests
+tests=compiler/libc/lcms2/tests
 
 ./mlx build -j 1 cc lcms2 > "$work/build.log" 2>&1 || { cat "$work/build.log"; fail "./mlx build lcms2"; }
 echo "ok   ./mlx build lcms2"
 
-grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/capi/lcms2/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
+grep -ho 'pub extern("c") fn [A-Za-z0-9_]*' compiler/libc/lcms2/api/*.mlx | awk '{print $4}' | sort -u > "$work/declared"
 nm -D --defined-only "$library" | awk '{print $NF}' | sort -u > "$work/defined"
 comm -23 "$work/declared" "$work/defined" > "$work/missing"
 [ ! -s "$work/missing" ] || { cat "$work/missing"; fail "functions the header declares are not in the library"; }

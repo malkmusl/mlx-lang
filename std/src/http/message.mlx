@@ -1,0 +1,396 @@
+// std.http.message: HTTP/1.1 messages' heads as libsoup reads and writes
+// them: request lines, status lines, the header lines after them
+// (continuation lines folded, bad lines passed over), what a head says
+// of its body (Content-Length, chunked, to the connection's end), and
+// the rules of redirects (which statuses redirect, which change the
+// method to GET). Nothing here allocates: a head's lines are read in
+// place, a folded value is written into a buffer of the caller's.
+//
+//     var it = message.headerLines(head)
+//     var name: []const u8 = ""
+//     var value: []const u8 = ""
+//     var folded: [4096]u8 = undefined
+//     while message.nextHeader(&it, &name, &value, folded[0..4096]) { ... }
+const headers = @import("./headers.mlx")
+
+pub const Sink = headers.Sink
+
+// The HTTP versions libsoup tells apart.
+pub const Version = enum(u8) {
+    http10,
+    http11
+}
+
+// A request line read: the status to answer with when it is bad (400
+// for a malformed line, 505 for a version other than 1.x), else 200.
+pub const RequestLine = struct {
+    method: []const u8
+    target: []const u8
+    version: Version
+    status: u32
+    // Where the header lines start (past the request line's newline).
+    headersAt: usize
+}
+
+pub const StatusLine = struct {
+    version: Version
+    // Whether the version was read (it is, before the code: a line with a
+    // bad code still says its version, as libsoup's does).
+    hasVersion: bool
+    code: u32
+    phrase: []const u8
+}
+
+fn isDigit(c: u8) -> bool { return c >= 48 && c <= 57 }
+fn isBlank(c: u8) -> bool { return c == 32 || c == 9 }
+
+// C's strtoul of decimal digits at `at` (no spaces or sign).
+fn digitsAt(text: []const u8, at: usize, value: *u64) -> usize {
+    var i = at
+    var v: u64 = 0
+    while i < text.length && isDigit(text[i]) {
+        v = v *% 10 +% @intCast(u64, text[i] - 48)
+        i += 1
+    }
+    value.* = v
+    return i
+}
+
+// "HTTP/1.x" at `at`: the version, and where it ends (0: not one, or not
+// HTTP/1).
+fn versionAt(text: []const u8, at: usize, version: *Version, status: *u32) -> usize {
+    if at + 6 > text.length || !sameBytes(text[at..at + 5], "HTTP/") || !isDigit(text[at + 5]) {
+        status.* = 400
+        return 0
+    }
+    var major: u64 = 0
+    var p = digitsAt(text, at + 5, &major)
+    if p + 1 >= text.length || text[p] != 46 || !isDigit(text[p + 1]) {
+        status.* = 400
+        return 0
+    }
+    var minor: u64 = 0
+    p = digitsAt(text, p + 1, &minor)
+    if major != 1 || minor > 1 {
+        status.* = 505
+        return 0
+    }
+    version.* = if minor == 0 { Version.http10 } else { Version.http11 }
+    return p
+}
+
+pub fn sameBytes(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// libsoup's soup_headers_parse_request: the request line of a head
+// (leading line ends skipped), into `line`; `line.status` is 200 when it
+// is good, else what to answer.
+pub fn parseRequestLine(head: []const u8, line: *RequestLine) -> bool {
+    line.*.status = 400
+    var start: usize = 0
+    while start < head.length && (head[start] == 13 || head[start] == 10) { start += 1 }
+    if start >= head.length { return false }
+    var methodEnd = start
+    while methodEnd < head.length && !isBlank(head[methodEnd]) { methodEnd += 1 }
+    if methodEnd >= head.length { return false }
+    var target = methodEnd
+    while target < head.length && isBlank(head[target]) { target += 1 }
+    if target >= head.length { return false }
+    var targetEnd = target
+    while targetEnd < head.length && !isBlank(head[targetEnd]) { targetEnd += 1 }
+    if targetEnd >= head.length { return false }
+    var version = targetEnd
+    while version < head.length && isBlank(head[version]) { version += 1 }
+    if version + 8 >= head.length { return false }
+    var v = Version.http11
+    const p = versionAt(head, version, &v, &line.*.status)
+    if p == 0 { return false }
+    var after = p
+    while after < head.length && (head[after] == 13 || head[after] == 32) { after += 1 }
+    if after >= head.length || head[after] != 10 {
+        line.*.status = 400
+        return false
+    }
+    line.*.method = head[start..methodEnd]
+    line.*.target = head[target..targetEnd]
+    line.*.version = v
+    line.*.status = 200
+    line.*.headersAt = after + 1
+    return true
+}
+
+// libsoup's soup_headers_parse_status_line: "HTTP/1.x CODE phrase" (or
+// Shoutcast's "ICY CODE"); the line ends at a newline or the text's end.
+pub fn parseStatusLine(text: []const u8, line: *StatusLine) -> bool {
+    var p: usize = 0
+    var status: u32 = 0
+    line.*.hasVersion = false
+    if text.length >= 6 && sameBytes(text[0..5], "HTTP/") && isDigit(text[5]) {
+        p = versionAt(text, 0, &line.*.version, &status)
+        if p == 0 { return false }
+    } else if text.length >= 3 && sameBytes(text[0..3], "ICY") {
+        line.*.version = Version.http10
+        p = 3
+    } else {
+        return false
+    }
+    line.*.hasVersion = true
+    var codeStart = p
+    while codeStart < text.length && isBlank(text[codeStart]) { codeStart += 1 }
+    var codeEnd = codeStart
+    while codeEnd < text.length && isDigit(text[codeEnd]) { codeEnd += 1 }
+    if codeEnd != codeStart + 3 { return false }
+    var code: u64 = 0
+    _ = digitsAt(text, codeStart, &code)
+    if code < 100 || code > 999 { return false }
+    line.*.code = @intCast(u32, code)
+    var phrase = codeEnd
+    while phrase < text.length && isBlank(text[phrase]) { phrase += 1 }
+    var phraseEnd = phrase
+    while phraseEnd < text.length && text[phraseEnd] != 10 { phraseEnd += 1 }
+    while phraseEnd > phrase && (text[phraseEnd - 1] == 13 || isBlank(text[phraseEnd - 1])) { phraseEnd -= 1 }
+    line.*.phrase = text[phrase..phraseEnd]
+    return true
+}
+
+// Where a head's first line ends (its newline), head.length when it has
+// none.
+pub fn firstLineEnd(head: []const u8) -> usize {
+    var i: usize = 0
+    while i < head.length && head[i] != 10 { i += 1 }
+    return i
+}
+
+// ---------------------------------------------------------------------------
+// Header lines
+
+pub const HeaderLines = struct {
+    text: []const u8
+    at: usize
+    // Whether a line without its end was met (the head is cut short), as
+    // libsoup's soup_headers_parse fails on.
+    truncated: bool
+}
+
+// The header lines of `text` from `at` on (past the first line).
+pub fn headerLinesFrom(text: []const u8, at: usize) -> HeaderLines { return HeaderLines.{ .text = text, .at = at, .truncated = false } }
+
+// The header lines after a head's first line.
+pub fn headerLines(head: []const u8) -> HeaderLines {
+    const end = firstLineEnd(head)
+    return headerLinesFrom(head, if end < head.length { end + 1 } else { head.length })
+}
+
+// The next header: its name, and its value with continuation lines
+// folded to one space each, trailing spaces off and carriage returns
+// made spaces, written into `folded` (as long as the lines at most);
+// `value` is a slice of it. Lines that are not headers are passed over;
+// false at the end, or at a line without its end (`truncated`).
+pub fn nextHeader(it: *HeaderLines, name: *[]const u8, value: *[]const u8, folded: []u8) -> bool {
+    const lines = it.*.text
+    while it.*.at < lines.length {
+        const start = it.*.at
+        const colon = indexOf(lines, 58, start)
+        var space = start
+        while space < lines.length && lines[space] != 32 && lines[space] != 9 && lines[space] != 13 && lines[space] != 10 { space += 1 }
+        var lineEnd = indexOf(lines, 10, start)
+        if lineEnd >= lines.length {
+            it.*.truncated = true
+            it.*.at = lines.length
+            return false
+        }
+        if colon >= lines.length || colon == start || space < colon {
+            // Not a header: the line is skipped (its continuations too,
+            // as they start with spaces and are skipped as bad lines).
+            it.*.at = lineEnd + 1
+            continue
+        }
+        // The value runs over the lines that start with a space or tab.
+        while lineEnd + 1 < lines.length && (lines[lineEnd + 1] == 32 || lines[lineEnd + 1] == 9) {
+            lineEnd = indexOf(lines, 10, lineEnd + 1)
+            if lineEnd >= lines.length { break }
+        }
+        if lineEnd >= lines.length {
+            it.*.truncated = true
+            it.*.at = lines.length
+            return false
+        }
+        var v = colon + 1
+        while v < lineEnd && (lines[v] == 32 || lines[v] == 9 || lines[v] == 13 || lines[v] == 10) { v += 1 }
+        var length: usize = 0
+        var at = v
+        while at < lineEnd {
+            var eol = indexOf(lines[0..lineEnd], 10, at)
+            if eol >= lineEnd {
+                length = foldPut(folded, length, lines[at..lineEnd])
+                break
+            }
+            var e = eol
+            while e > at && (lines[e - 1] == 32 || lines[e - 1] == 9 || lines[e - 1] == 13) { e -= 1 }
+            length = foldPut(folded, length, lines[at..e])
+            length = foldPut(folded, length, " ")
+            at = eol + 1
+            while at < lineEnd && (lines[at] == 32 || lines[at] == 9) { at += 1 }
+        }
+        while length > 0 && (folded[length - 1] == 32 || folded[length - 1] == 9 || folded[length - 1] == 13) { length -= 1 }
+        var k: usize = 0
+        while k < length {
+            if folded[k] == 13 { folded[k] = 32 }
+            k += 1
+        }
+        name.* = lines[start..colon]
+        value.* = folded[0..length]
+        it.*.at = lineEnd + 1
+        return true
+    }
+    return false
+}
+
+fn foldPut(folded: []u8, length: usize, text: []const u8) -> usize {
+    var n = length
+    var i: usize = 0
+    while i < text.length && n < folded.length {
+        folded[n] = text[i]
+        n += 1
+        i += 1
+    }
+    return n
+}
+
+fn indexOf(text: []const u8, byte: u8, from: usize) -> usize {
+    var i = from
+    while i < text.length && text[i] != byte { i += 1 }
+    return i
+}
+
+// Where a head ends in `data`: past its blank line ("\r\n\r\n" or
+// "\n\n"), or data.length when it has not all arrived.
+pub fn headEnd(data: []const u8) -> usize {
+    var i: usize = 0
+    while i < data.length {
+        if data[i] == 10 {
+            if i + 1 < data.length && data[i + 1] == 10 { return i + 2 }
+            if i + 2 < data.length && data[i + 1] == 13 && data[i + 2] == 10 { return i + 3 }
+        }
+        i += 1
+    }
+    return data.length
+}
+
+// ---------------------------------------------------------------------------
+// Writing a head
+
+pub fn writeRequestLine(sink: Sink, method: []const u8, target: []const u8, version: Version) -> void {
+    headers.put(sink, method)
+    headers.putByte(sink, 32)
+    headers.put(sink, target)
+    headers.put(sink, if version == Version.http10 { " HTTP/1.0\r\n" } else { " HTTP/1.1\r\n" })
+}
+
+pub fn writeStatusLine(sink: Sink, version: Version, code: u32, phrase: []const u8) -> void {
+    headers.put(sink, if version == Version.http10 { "HTTP/1.0 " } else { "HTTP/1.1 " })
+    var digits: [3]u8 = undefined
+    digits[0] = @intCast(u8, 48 + (code / 100) % 10)
+    digits[1] = @intCast(u8, 48 + (code / 10) % 10)
+    digits[2] = @intCast(u8, 48 + code % 10)
+    headers.put(sink, digits[0..3])
+    headers.putByte(sink, 32)
+    headers.put(sink, phrase)
+    headers.put(sink, "\r\n")
+}
+
+pub fn writeHeader(sink: Sink, name: []const u8, value: []const u8) -> void {
+    headers.put(sink, name)
+    headers.put(sink, ": ")
+    headers.put(sink, value)
+    headers.put(sink, "\r\n")
+}
+
+pub fn writeHeadEnd(sink: Sink) -> void { headers.put(sink, "\r\n") }
+
+// ---------------------------------------------------------------------------
+// Bodies and their framing
+
+pub const Framing = enum(u8) {
+    // No body (a request without one; a response that has none).
+    none,
+    // Content-Length bytes.
+    length,
+    // The chunked transfer coding.
+    chunked,
+    // To the connection's end (a response without a length).
+    eof
+}
+
+// How a message's body is framed, from its head: Transfer-Encoding
+// chunked, else Content-Length (a bad one: `badLength`), else to the end
+// for a response and none for a request.
+pub fn framingOf(transferEncoding: []const u8, hasTransferEncoding: bool, contentLength: []const u8, hasContentLength: bool, isResponse: bool, length: *u64, badLength: *bool) -> Framing {
+    badLength.* = false
+    length.* = 0
+    if hasTransferEncoding && headers.contains(transferEncoding, "chunked") { return Framing.chunked }
+    if hasContentLength {
+        var value: u64 = 0
+        var any = false
+        for c in contentLength {
+            if !isDigit(c) {
+                badLength.* = true
+                return if isResponse { Framing.eof } else { Framing.none }
+            }
+            value = value *% 10 +% @intCast(u64, c - 48)
+            any = true
+        }
+        if !any {
+            badLength.* = true
+            return if isResponse { Framing.eof } else { Framing.none }
+        }
+        length.* = value
+        return Framing.length
+    }
+    return if isResponse { Framing.eof } else { Framing.none }
+}
+
+// Whether a response of `status` to `method` has no body (RFC 9112 6.3).
+pub fn responseHasNoBody(status: u32, method: []const u8) -> bool {
+    if sameBytes(method, "HEAD") { return true }
+    if status >= 100 && status < 200 { return true }
+    return status == 204 || status == 304
+}
+
+// ---------------------------------------------------------------------------
+// Redirects, as libsoup follows them
+
+pub const Redirect = enum(u8) {
+    // Not a redirect to follow.
+    none,
+    // Followed with the same method (301, 302, 307 and 308 of a safe
+    // method).
+    same,
+    // Followed as a GET without a body (303; 302 of an unsafe method;
+    // 301 of a POST).
+    asGet
+}
+
+pub fn isSafeMethod(method: []const u8) -> bool {
+    return sameBytes(method, "GET") || sameBytes(method, "HEAD") || sameBytes(method, "OPTIONS") || sameBytes(method, "PROPFIND") || sameBytes(method, "TRACE")
+}
+
+pub fn redirectOf(status: u32, method: []const u8) -> Redirect {
+    if status == 303 { return Redirect.asGet }
+    if status == 302 && !isSafeMethod(method) { return Redirect.asGet }
+    if status == 301 && sameBytes(method, "POST") { return Redirect.asGet }
+    if (status == 301 || status == 302 || status == 307 || status == 308) && isSafeMethod(method) { return Redirect.same }
+    // (A 307 or 308 of an unsafe method is left to the caller, as libsoup
+    // leaves it to WebKit.)
+    return Redirect.none
+}
+
+// libsoup's limit on redirects and other restarts of one message.
+pub const MAX_REDIRECTS: u32 = 20
