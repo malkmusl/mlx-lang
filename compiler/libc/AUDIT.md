@@ -43,6 +43,17 @@ library and whose output `tools/check_LIB.sh` compares with the system
 library's (`NAME.expected`); the checks keep passing whatever moves, since
 a shim's behaviour must not change.
 
+## What has moved (the state of this branch)
+
+| Library | Into std | Test | Still in the shim |
+|---|---|---|---|
+| soup | `std.http.auth` (Basic and Digest), `std.http.cookie` and `std.http.cookiejar` (policies, cookies.txt), `std.http.hsts` (policies, the file), `std.http.multipart`, `std.http.websocket` (handshake keys, protocols, extensions) and `std.http.websocket.deflate`, `std.uri` (RFC 3986), `std.http.message` (request and status lines, header lines, framing, the redirect rules), `std.http.client` on `std.net` and `std.net.dns` (sessions with kept connections, redirects, auth, cookies, HSTS, gzip, https on std.tls) | 376, 377, 378, 379, 380, 381, 382 | the GObject session, its queue and requeues, the server, logger, cache, content sniffer and decoder objects, ranges and content disposition |
+| glib | `std.http.mime` (content types by extension and first bytes) | 383 | everything GObject and GIO shaped; the resolver, streams and TLS objects wrap std.net and std.tls |
+| xml2 | `std.xml.text`'s `writeEscaped` (content, ASCII-only, attribute, HTML) and `validName` (Name, NCName, QName, Nmtoken) | 383 | the trees, entities and parser contexts over std.xml.sax |
+| gcrypt | `std.crypto.mpi` (integers of any size, division, gcd, inverses, powm, primes), `std.crypto.rsa`'s private half (PKCS #1 v1.5 and PSS signing, PKCS #1 v1.5 and OAEP encryption and decryption by the CRT, key generation); the shim's limb arithmetic calls std's | 384 | libgcrypt's MPI records and quirks, S-expressions, handles |
+| zlib, png, pulse, pipewire, tasn1 | not yet (gzip files, libpng's writer with its ancillary chunks, the audio value helpers, the DER writer) | | all of it |
+| icu, freetype, harfbuzz, jpeg, webp, lcms2, sqlite3 | nothing to move: pure C shape over std | | all of it |
+
 ## What is C shape, in every library
 
 The same things in each, and they stay in the shims:
@@ -469,8 +480,11 @@ pipewiresrc).
     compiler/libc/LIB/tests/    the C programs tools/check_LIB.sh compares with the system's library
     std/src/http/               auth, cookies, the jar, HSTS, multipart, the WebSocket handshake and deflate...
     std/src/crypto/             mpi, rsa with its private half
-    std/src/flate/gzip.mlx      gzip files
-    std/src/png/write.mlx       libpng's writer
+    std/src/net.mlx, net/dns.mlx  TCP and the resolver under std.http.client
+    std/src/http/mime.mlx       content types by extension
+    std/src/xml/text.mlx        escaping and name checks for XML written out
+    std/src/flate/gzip.mlx      gzip files (not yet)
+    std/src/png/write.mlx       libpng's writer (not yet)
 
 The build targets keep their names (`./mlx build glib`, `soup`, `unicode`,
 `zlib`, ...), as do the check scripts (`tools/check_LIB.sh`) and the
