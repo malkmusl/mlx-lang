@@ -3,7 +3,9 @@
 // a member function template's instance of a plain class, a function
 // template's (its arguments given or deduced), and every member of a
 // class template's instance (its static data members and member
-// classes' members too; not its member templates), weak as g++ makes
+// classes' members too; not its member templates), the members of a
+// class template's instance named one by one (constructors, destructors,
+// const ones: WebCore's GenericCachedHTMLCollection), weak as g++ makes
 // them. `extern template` makes nothing.
 #include <cstdio>
 
@@ -28,6 +30,25 @@ template<int N> int C<N>::f() { return N; }
 template<int N> int C<N>::s = N + 100;
 template struct C<3>;
 extern template struct C<4>;
+
+enum class Kind { A, B };
+template<Kind k> struct G {
+    G(int);
+    ~G();
+    int f() const;
+    int f(int);
+    static int s();
+    int v;
+};
+template<Kind k> G<k>::G(int x) : v(x) { }
+template<Kind k> G<k>::~G() { v = 0; }
+template<Kind k> int G<k>::f() const { return v + (int)k; }
+template<Kind k> int G<k>::f(int x) { return v + x; }
+template<Kind k> int G<k>::s() { return 5; }
+template G<Kind::A>::G(int);
+template G<Kind::B>::~G();
+template int G<Kind::B>::f() const;
+template int G<Kind::A>::s();
 
 template<class T> T twice(T t) { return t + t; }
 template int twice(int);

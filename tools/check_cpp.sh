@@ -120,10 +120,10 @@ echo "ok   the lambdas of inline functions and initializers are one class across
 # definitions, a.cpp only declarations and `extern template`).
 "$cc" -c -o "$work/explicitinstance.o" "$tests/explicitinstance.cpp" 2> "$work/explicitinstance.err" || fail "-c of explicitinstance.cpp: $(head -3 "$work/explicitinstance.err")"
 nm "$work/explicitinstance.o" | awk '$2 == "W" || $2 == "V" { print $NF }' > "$work/explicitinstance.weak"
-for pattern in '5visit.*2V1' '5visit.*2V2' 'C(<3>|ILi3EE)1fEv' 'C(<3>|ILi3EE)1gEv' 'C(<3>|ILi3EE)1sE' 'C(<3>|ILi3EE)5Inner1hEv' '5twiceI.*i' '5twiceI.*d'; do
+for pattern in '5visit.*2V1' '5visit.*2V2' 'C(<3>|ILi3EE)1fEv' 'C(<3>|ILi3EE)1gEv' 'C(<3>|ILi3EE)1sE' 'C(<3>|ILi3EE)5Inner1hEv' '5twiceI.*i' '5twiceI.*d' 'G(<0>|IL4Kind0EE)C1Ei' 'G(<1>|IL4Kind1EE)D1Ev' 'G(<1>|IL4Kind1EE)1fEv' 'G(<0>|IL4Kind0EE)1sEv'; do
     grep -Eq "^_Z.*$pattern" "$work/explicitinstance.weak" || fail "explicitinstance.o lacks a weak $pattern: $(tr '\n' ' ' < "$work/explicitinstance.weak")"
 done
-for pattern in 'same' 'C(<4>|ILi4EE)' '5twiceI.*l'; do
+for pattern in 'same' 'C(<4>|ILi4EE)' '5twiceI.*l' '1fEi' 'G(<0>|IL4Kind0EE)D1Ev'; do
     ! grep -Eq "$pattern" "$work/explicitinstance.weak" || fail "explicitinstance.o has $pattern: $(tr '\n' ' ' < "$work/explicitinstance.weak")"
 done
 "$cc" -c -o "$work/explicitinstanceunits_a.o" "$tests/explicitinstanceunits/a.cpp" 2> "$work/explicitinstanceunits.err" || fail "-c of explicitinstanceunits/a.cpp: $(head -3 "$work/explicitinstanceunits.err")"
