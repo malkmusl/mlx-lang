@@ -460,7 +460,9 @@ fn globalIndexFor(builder: *LirBuilder, symbol_index: usize) -> usize {
         const declaration = ast_store.Store.get(nodes, symbol.*.declaration)
         if declaration.tag == ast.Tag.variable_declaration && declaration.rhs != ast.NONE {
             const initializer = ast_store.Store.get(nodes, declaration.rhs)
-            if initializer.tag == ast.Tag.array_literal || initializer.tag == ast.Tag.aggregate_literal {
+            // (A tagged optional of a scalar is bytes too: the payload and
+            // then its tag, writeInitialBytes.)
+            if initializer.tag == ast.Tag.array_literal || initializer.tag == ast.Tag.aggregate_literal || (isTaggedOptional(builder, symbol.*.typeId) && initializer.tag != ast.Tag.undefined_literal && initializer.tag != ast.Tag.null_literal) {
                 // An aggregate of compile-time scalars: its bytes.
                 const image = builder.*.allocator.alloc(size, 8)
                 if image != null {
@@ -547,7 +549,8 @@ fn writeInitialBytes(builder: *LirBuilder, node_index: usize, type_id: usize, ta
     if !isScalarInitializer(node.tag) { return false }
     const scalar = lowerComptimeValue(builder, node_index)
     if scalar.kind != comptime_value.Kind.integer && scalar.kind != comptime_value.Kind.boolean { return false }
-    var width = types_store.Store.sizeOf(builder.*.typeStore, type_id)
+    const tagged = isTaggedOptional(builder, type_id)
+    var width = types_store.Store.sizeOf(builder.*.typeStore, if tagged { optionalPayloadType(builder, type_id) } else { type_id })
     if width == 0 || width > 8 { return false }
     const bits = @bitCast(u64, @intCast(i64, scalar.integer))
     var byte: usize = 0
@@ -555,6 +558,7 @@ fn writeInitialBytes(builder: *LirBuilder, node_index: usize, type_id: usize, ta
         target[byte] = @intCast(u8, (bits >> @intCast(u6, byte * 8)) & 255)
         byte += 1
     }
+    if tagged { target[width] = 1 }
     return true
 }
 
@@ -1582,6 +1586,12 @@ fn typeWordCount(builder: *LirBuilder, type_id: usize) -> usize {
     if value.*.kind == types_store.Kind.error_union { return 1 + typeWordCount(builder, value.*.rhs) }
     // An optional slice is the slice (null: pointer 0, length 0).
     if isOptionalSlice(builder, type_id) { return 2 }
+    // A tagged optional is its payload's words and the tag's (one word,
+    // the address, when the payload is a memory value).
+    if isTaggedOptional(builder, type_id) {
+        if aggregate_copy.isMemoryType(builder.*.typeStore, type_id) { return 1 }
+        return typeWordCount(builder, value.*.lhs) + 1
+    }
     if value.*.kind == types_store.Kind.tuple {
         var words: usize = 0
         var index: usize = 0
@@ -1814,7 +1824,12 @@ fn lowerNodeHere(builder: *LirBuilder, node_index: usize) -> usize {
     if n.tag == ast.Tag.boolean_literal {
         return lowerBoolLiteral(builder, n.mainToken)
     }
-    if n.tag == ast.Tag.null_literal || n.tag == ast.Tag.undefined_literal {
+    if n.tag == ast.Tag.null_literal {
+        // Typed, so that a tagged optional made from it is absent
+        // (coerceToTaggedOptional), where a 0 would be present.
+        return lir.addInst(builder.*.lir, lir.constI(types_store.Store.primitive(builder.*.typeStore, types_store.Kind.null_type), 0))
+    }
+    if n.tag == ast.Tag.undefined_literal {
         return lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
     }
     if n.tag == ast.Tag.string_literal {
@@ -2171,6 +2186,133 @@ fn isOptionalSlice(builder: *LirBuilder, type_id: usize) -> bool {
     return value.*.kind == types_store.Kind.optional && types_store.Store.get(builder.*.typeStore, value.*.lhs).*.kind == types_store.Kind.slice
 }
 
+// Optionals. Of a pointer, a function or a slice, the optional is the
+// payload itself (null: 0, or (0, 0)). Of anything else but a float it
+// is "tagged": the payload and then a tag, 1 when a value is present, a
+// word after the payload's words in registers and the byte after the
+// payload's bytes in memory (the type's size is the payload's plus one),
+// so that `?usize` holding 0 is not null. A tagged optional of a struct,
+// union or array is a memory value (aggregate_copy.isMemoryType), as its
+// payload is: its address, the payload at offset 0.
+fn isTaggedOptional(builder: *LirBuilder, type_id: usize) -> bool {
+    if type_id == 0 || type_id == lir.NONE { return false }
+    const value = types_store.Store.get(builder.*.typeStore, type_id)
+    if value.*.kind != types_store.Kind.optional || value.*.lhs == 0 { return false }
+    const child = types_store.Store.get(builder.*.typeStore, value.*.lhs)
+    return child.*.kind != types_store.Kind.pointer && child.*.kind != types_store.Kind.many_pointer && child.*.kind != types_store.Kind.function && child.*.kind != types_store.Kind.slice && child.*.kind != types_store.Kind.float && child.*.kind != types_store.Kind.comptime_float_type
+}
+
+fn optionalPayloadType(builder: *LirBuilder, type_id: usize) -> usize {
+    return types_store.Store.get(builder.*.typeStore, type_id).*.lhs
+}
+
+// The tag of a tagged optional value: the last word, or the byte after
+// the payload of a memory one.
+fn optionalTag(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
+    const bool_type = types_store.Store.primitive(builder.*.typeStore, types_store.Kind.bool_type)
+    if aggregate_copy.isMemoryType(builder.*.typeStore, type_id) {
+        const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, types_store.Store.sizeOf(builder.*.typeStore, optionalPayloadType(builder, type_id))))
+        var tag_address = lir.initInst(lir.Opcode.gep, lir.NONE)
+        tag_address.arg0 = value
+        tag_address.arg1 = offset
+        tag_address.arg2 = 1
+        const address = lir.addInst(builder.*.lir, tag_address)
+        var load = lir.initInst(lir.Opcode.load, bool_type)
+        load.arg0 = address
+        load.arg1 = 1
+        return lir.addInst(builder.*.lir, load)
+    }
+    var extract = lir.initInst(lir.Opcode.tuple_element, bool_type)
+    extract.arg0 = value
+    extract.arg1 = typeWordCount(builder, type_id) - 1
+    return lir.addInst(builder.*.lir, extract)
+}
+
+// The payload of a tagged optional value (its words, or its address).
+fn optionalPayload(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
+    if aggregate_copy.isMemoryType(builder.*.typeStore, type_id) { return value }
+    const payload_type = optionalPayloadType(builder, type_id)
+    const payload_words = typeWordCount(builder, payload_type)
+    if payload_words == 1 {
+        var extract = lir.initInst(lir.Opcode.tuple_element, payload_type)
+        extract.arg0 = value
+        extract.arg1 = 0
+        return lir.addInst(builder.*.lir, extract)
+    }
+    const extra_start = builder.*.lir.*.extraData.*.length
+    var word: usize = 0
+    while word < payload_words {
+        var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+        extract.arg0 = value
+        extract.arg1 = word
+        lir.addExtra(builder.*.lir, lir.addInst(builder.*.lir, extract))
+        word += 1
+    }
+    var payload = lir.initInst(lir.Opcode.tuple_literal, payload_type)
+    payload.arg0 = extra_start
+    payload.arg1 = payload_words
+    return lir.addInst(builder.*.lir, payload)
+}
+
+// `value` as the tagged optional `type_id`: a value of the type stays
+// one; `null` becomes the absent value; a payload becomes present.
+fn coerceToTaggedOptional(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
+    const given = valueType(builder, value)
+    if given == type_id { return value }
+    if given != 0 && given != lir.NONE && types_store.Store.get(builder.*.typeStore, given).*.kind == types_store.Kind.optional { return value }
+    const is_null = given == types_store.Store.primitive(builder.*.typeStore, types_store.Kind.null_type)
+    const payload_type = optionalPayloadType(builder, type_id)
+    if aggregate_copy.isMemoryType(builder.*.typeStore, type_id) {
+        var size = types_store.Store.sizeOf(builder.*.typeStore, type_id)
+        if size < 8 { size = 8 }
+        var allocation = lir.initInst(lir.Opcode.alloca, type_id)
+        allocation.arg0 = size
+        const block = lir.addInst(builder.*.lir, allocation)
+        if !is_null { aggregate_copy.emit(builder.*.lir, builder.*.typeStore, block, value, payload_type) }
+        const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, types_store.Store.sizeOf(builder.*.typeStore, payload_type)))
+        var tag_address = lir.initInst(lir.Opcode.gep, lir.NONE)
+        tag_address.arg0 = block
+        tag_address.arg1 = offset
+        tag_address.arg2 = 1
+        const address = lir.addInst(builder.*.lir, tag_address)
+        const tag = lir.addInst(builder.*.lir, lir.constI(types_store.Store.primitive(builder.*.typeStore, types_store.Kind.bool_type), if is_null { 0 } else { 1 }))
+        var tag_store = lir.initInst(lir.Opcode.store, lir.NONE)
+        tag_store.arg0 = address
+        tag_store.arg1 = tag
+        tag_store.arg2 = 1
+        lir.addInst(builder.*.lir, tag_store)
+        return block
+    }
+    const payload_words = typeWordCount(builder, payload_type)
+    const extra_start = builder.*.lir.*.extraData.*.length
+    var word: usize = 0
+    while word < payload_words {
+        var component = value
+        if is_null {
+            component = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+        } else if payload_words > 1 {
+            var extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
+            extract.arg0 = value
+            extract.arg1 = word
+            component = lir.addInst(builder.*.lir, extract)
+        }
+        lir.addExtra(builder.*.lir, component)
+        word += 1
+    }
+    lir.addExtra(builder.*.lir, lir.addInst(builder.*.lir, lir.constI(types_store.Store.primitive(builder.*.typeStore, types_store.Kind.bool_type), if is_null { 0 } else { 1 })))
+    var result = lir.initInst(lir.Opcode.tuple_literal, type_id)
+    result.arg0 = extra_start
+    result.arg1 = payload_words + 1
+    return lir.addInst(builder.*.lir, result)
+}
+
+// Whether a load of `type_id`'s first word sign-extends: an optional's
+// payload as the payload's type says.
+fn loadsSigned(builder: *LirBuilder, type_id: usize) -> bool {
+    if isTaggedOptional(builder, type_id) { return isSignedIntegerType(builder, optionalPayloadType(builder, type_id)) }
+    return isSignedIntegerType(builder, type_id)
+}
+
 // `value` as a `type_id`: a single-word constant (null, undefined) where
 // an optional slice (two words) is wanted becomes the pair (it, 0), so
 // the length word is written and arguments after it stay in their
@@ -2178,6 +2320,7 @@ fn isOptionalSlice(builder: *LirBuilder, type_id: usize) -> bool {
 fn widenToType(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
     if value == lir.NONE { return value }
     if isWideType(builder, type_id) { return wideOperand(builder, value, valueType(builder, value), type_id) }
+    if isTaggedOptional(builder, type_id) { return coerceToTaggedOptional(builder, value, type_id) }
     if !isOptionalSlice(builder, type_id) { return value }
     if lir.getInst(builder.*.lir, value).opcode != lir.Opcode.const_i { return value }
     const zero = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
@@ -2197,12 +2340,14 @@ fn storeAggregateValue(builder: *LirBuilder, address: usize, stored: usize, type
         return
     }
     const word_count = typeWordCount(builder, type_id)
+    const tagged = isTaggedOptional(builder, type_id)
     var component: usize = 0
     while component < word_count {
         var component_address = address
         var component_value = value
         if component > 0 {
-            const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, component * 8))
+            const byte_offset = if tagged && component == word_count - 1 { types_store.Store.sizeOf(builder.*.typeStore, optionalPayloadType(builder, type_id)) } else { component * 8 }
+            const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, byte_offset))
             var component_gep = lir.initInst(lir.Opcode.gep, lir.NONE)
             component_gep.arg0 = address
             component_gep.arg1 = offset
@@ -2216,7 +2361,7 @@ fn storeAggregateValue(builder: *LirBuilder, address: usize, stored: usize, type
         var store = lir.initInst(lir.Opcode.store, type_id)
         store.arg0 = component_address
         store.arg1 = component_value
-        store.arg2 = if component == 0 { storageWidth(builder, type_id) } else { 8 }
+        store.arg2 = if component == 0 { storageWidth(builder, type_id) } else if tagged && component == word_count - 1 { 1 } else { 8 }
         lir.addInst(builder.*.lir, store)
         component += 1
     }
@@ -2491,8 +2636,7 @@ fn lowerFlatTupleField(builder: *LirBuilder, base: usize, field_type: usize, wor
 }
 
 fn lowerMemoryValue(builder: *LirBuilder, address: usize, type_id: usize) -> usize {
-    const value_type = types_store.Store.get(builder.*.typeStore, type_id)
-    if value_type.*.kind == types_store.Kind.struct_type || value_type.*.kind == types_store.Kind.union_type || value_type.*.kind == types_store.Kind.array { return address }
+    if aggregate_copy.isMemoryType(builder.*.typeStore, type_id) { return address }
     const word_count = typeWordCount(builder, type_id)
     if word_count == 1 {
         var load = lir.initInst(lir.Opcode.load, type_id)
@@ -2501,12 +2645,15 @@ fn lowerMemoryValue(builder: *LirBuilder, address: usize, type_id: usize) -> usi
         load.arg2 = if isSignedIntegerType(builder, type_id) { 1 } else { 0 }
         return lir.addInst(builder.*.lir, load)
     }
+    const tagged = isTaggedOptional(builder, type_id)
     const extra_start = builder.*.lir.*.extraData.*.length
     var component: usize = 0
     while component < word_count {
         var component_address = address
+        const is_tag = tagged && component == word_count - 1
         if component > 0 {
-            const component_offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, component * 8))
+            const byte_offset = if is_tag { types_store.Store.sizeOf(builder.*.typeStore, optionalPayloadType(builder, type_id)) } else { component * 8 }
+            const component_offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, byte_offset))
             var component_gep = lir.initInst(lir.Opcode.gep, lir.NONE)
             component_gep.arg0 = address
             component_gep.arg1 = component_offset
@@ -2515,7 +2662,8 @@ fn lowerMemoryValue(builder: *LirBuilder, address: usize, type_id: usize) -> usi
         }
         var load = lir.initInst(lir.Opcode.load, lir.NONE)
         load.arg0 = component_address
-        load.arg1 = 8
+        load.arg1 = if is_tag { 1 } else if tagged && component == 0 { storageWidth(builder, type_id) } else { 8 }
+        if tagged && component == 0 && loadsSigned(builder, type_id) { load.arg2 = 1 }
         lir.addExtra(builder.*.lir, lir.addInst(builder.*.lir, load))
         component += 1
     }
@@ -3407,6 +3555,10 @@ fn storageWidth(builder: *LirBuilder, type_id: usize) -> usize {
     if type_id == 0 { return 8 }
     const value = types_store.Store.get(builder.*.typeStore, type_id)
     if value.*.kind == types_store.Kind.struct_type || value.*.kind == types_store.Kind.union_type || value.*.kind == types_store.Kind.tuple || value.*.kind == types_store.Kind.slice || value.*.kind == types_store.Kind.array || value.*.kind == types_store.Kind.vector { return 8 }
+    if isTaggedOptional(builder, type_id) {
+        if aggregate_copy.isMemoryType(builder.*.typeStore, type_id) { return 8 }
+        return storageWidth(builder, value.*.lhs)
+    }
     const size = types_store.Store.sizeOf(builder.*.typeStore, type_id)
     if size == 1 || size == 2 || size == 4 { return size }
     return 8
@@ -3596,7 +3748,7 @@ fn lowerIdentifier(builder: *LirBuilder, main_token: usize) -> usize {
             var load = lir.initInst(lir.Opcode.load, if component == 0 { type_id } else { lir.NONE })
             load.arg0 = component_address
             load.arg1 = if component == 0 { storageWidth(builder, type_id) } else { 8 }
-            if component == 0 && isSignedIntegerType(builder, type_id) { load.arg2 = 1 }
+            if component == 0 && loadsSigned(builder, type_id) { load.arg2 = 1 }
             const loaded = lir.addInst(builder.*.lir, load)
             if component == 0 { primary = loaded }
             lir.addExtra(builder.*.lir, loaded)
@@ -4296,6 +4448,20 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
         return lowerLogical(builder, n.lhs, n.rhs, false)
     }
 
+    // `optional == null`, `optional != null` of a tagged optional: its tag.
+    if kind == lexer.Kind.equal_equal || kind == lexer.Kind.bang_equal {
+        const left_null = ast_store.Store.get(nodes, n.lhs).tag == ast.Tag.null_literal
+        const right_null = ast_store.Store.get(nodes, n.rhs).tag == ast.Tag.null_literal
+        if left_null != right_null {
+            const other = if left_null { n.rhs } else { n.lhs }
+            const other_type = expressionType(builder, other)
+            if isTaggedOptional(builder, other_type) {
+                const tag = optionalTag(builder, lowerNode(builder, other), other_type)
+                const absent = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+                return emitComparison(builder, if kind == lexer.Kind.equal_equal { lir.CmpPredicate.eq } else { lir.CmpPredicate.ne }, tag, absent)
+            }
+        }
+    }
     const lhs_lowered = lowerNode(builder, n.lhs)
     const rhs_lowered = lowerNode(builder, n.rhs)
     const lhs_val = narrowFloat(builder, lhs_lowered, valueType(builder, rhs_lowered))
@@ -4454,6 +4620,8 @@ fn lowerCallArguments(builder: *LirBuilder, node: ast.Node, generic_instance: us
             const referenced = referencedSymbolIndex(builder, node.lhs)
             if referenced.0 { callee_type = symbols_store.Store.get(builder.*.symbolStore, referenced.1).*.typeId }
         }
+    } else {
+        callee_type = genericInstanceAt(builder, generic_instance).*.functionTypeId
     }
     if receiver != ast.NONE {
         lir.setExtra(builder.*.lir, args_start, lowerReceiver(builder, callee_type, receiver))
@@ -4462,12 +4630,10 @@ fn lowerCallArguments(builder: *LirBuilder, node: ast.Node, generic_instance: us
     // The callee's parameter types, when its type lists every argument.
     var parameters_start: usize = 0
     var parameters_known = false
-    if generic_instance == lir.NONE {
-        if callee_type != 0 && callee_type < builder.*.typeStore.*.types.*.length {
-            const function_type = types_store.Store.get(builder.*.typeStore, callee_type)
-            parameters_known = function_type.*.kind == types_store.Kind.function && function_type.*.extraLength == node.extra + implicit_count
-            parameters_start = function_type.*.extraStart
-        }
+    if callee_type != 0 && callee_type < builder.*.typeStore.*.types.*.length {
+        const function_type = types_store.Store.get(builder.*.typeStore, callee_type)
+        parameters_known = function_type.*.kind == types_store.Kind.function && function_type.*.extraLength == node.extra + implicit_count
+        parameters_start = function_type.*.extraStart
     }
     var child = node.rhs
     var source_argument_index: usize = 0
@@ -4539,7 +4705,8 @@ fn lowerSlotReturn(builder: *LirBuilder, value_node: usize) -> usize {
     builder.*.forwardCall = value_node
     builder.*.forwardModule = builder.*.currentModuleId
     builder.*.forwardedCall = ast.NONE
-    const value = lowerNode(builder, value_node)
+    var value = lowerNode(builder, value_node)
+    if value != lir.NONE && isTaggedOptional(builder, builder.*.currentReturnType) { value = widenToType(builder, value, builder.*.currentReturnType) }
     const forwarded = builder.*.forwardedCall == value_node
     builder.*.forwardCall = saved_call
     builder.*.forwardModule = saved_module
@@ -4674,7 +4841,7 @@ fn lowerIf(builder: *LirBuilder, node_index: usize) -> usize {
     var has_secondary_result = false
     if result_type_id != 0 {
         const result_type = types_store.Store.get(builder.*.typeStore, result_type_id)
-        has_secondary_result = result_type.*.kind == types_store.Kind.slice || result_type.*.kind == types_store.Kind.tuple || isOptionalSlice(builder, result_type_id)
+        has_secondary_result = result_type.*.kind == types_store.Kind.slice || result_type.*.kind == types_store.Kind.tuple || isOptionalSlice(builder, result_type_id) || (isTaggedOptional(builder, result_type_id) && typeWordCount(builder, result_type_id) == 2)
     }
     const result_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     var secondary_result_address = lir.NONE
@@ -4692,7 +4859,8 @@ fn lowerIf(builder: *LirBuilder, node_index: usize) -> usize {
 
     // Then block
     lir.addInst(builder.*.lir, lir.blockLabelInst(then_block))
-    const then_value = widenToType(builder, lowerNode(builder, n.rhs), result_type_id)
+    var then_value = widenToType(builder, lowerNode(builder, n.rhs), result_type_id)
+    if then_value != lir.NONE && has_secondary_result && typeWordCount(builder, valueType(builder, then_value)) == 1 && valueType(builder, then_value) != result_type_id { then_value = widenToType(builder, then_value, result_type_id) }
     if then_value != lir.NONE {
         var then_store = lir.initInst(lir.Opcode.store, lir.NONE)
         then_store.arg0 = result_address
@@ -4839,7 +5007,7 @@ fn lowerMatch(builder: *LirBuilder, node_index: usize) -> usize {
     var has_secondary_result = false
     if result_type_id != 0 {
         const result_type = types_store.Store.get(builder.*.typeStore, result_type_id)
-        has_secondary_result = result_type.*.kind == types_store.Kind.slice || result_type.*.kind == types_store.Kind.tuple || isOptionalSlice(builder, result_type_id)
+        has_secondary_result = result_type.*.kind == types_store.Kind.slice || result_type.*.kind == types_store.Kind.tuple || isOptionalSlice(builder, result_type_id) || (isTaggedOptional(builder, result_type_id) && typeWordCount(builder, result_type_id) == 2)
     }
     const result_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     var secondary_result_address = lir.NONE
@@ -5451,6 +5619,13 @@ fn lowerOptionalUnwrap(builder: *LirBuilder, node_index: usize, operand: usize) 
     const optional_type = types_store.Store.get(builder.*.typeStore, optional_type_id)
     if optional_type.*.kind != types_store.Kind.optional { return operand }
     const child_type = types_store.Store.get(builder.*.typeStore, optional_type.*.lhs)
+    if isTaggedOptional(builder, optional_type_id) {
+        if builder.*.runtimeSafety {
+            const absent = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+            emitTrapIf(builder, emitComparison(builder, lir.CmpPredicate.eq, optionalTag(builder, operand, optional_type_id), absent))
+        }
+        return optionalPayload(builder, operand, optional_type_id)
+    }
     if builder.*.runtimeSafety && (child_type.*.kind == types_store.Kind.pointer || child_type.*.kind == types_store.Kind.many_pointer) {
         const zero = lir.addInst(builder.*.lir, lir.constI(optional_type_id, 0))
         emitTrapIf(builder, emitComparison(builder, lir.CmpPredicate.eq, operand, zero))
