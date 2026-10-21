@@ -72,8 +72,6 @@ ExceptionOr<Vector<uint8_t>> CryptoAlgorithmAESKW::platformUnwrapKey(const Crypt
 std::optional<Vector<uint8_t>> CryptoAlgorithmECDH::platformDeriveBits(const CryptoKeyEC&, const CryptoKeyEC&) { return std::nullopt; }
 ExceptionOr<Vector<uint8_t>> CryptoAlgorithmECDSA::platformSign(const CryptoAlgorithmEcdsaParams&, const CryptoKeyEC&, const Vector<uint8_t>&) { return notSupported(); }
 ExceptionOr<bool> CryptoAlgorithmECDSA::platformVerify(const CryptoAlgorithmEcdsaParams&, const CryptoKeyEC&, const Vector<uint8_t>&, const Vector<uint8_t>&) { return notSupported(); }
-ExceptionOr<Vector<uint8_t>> CryptoAlgorithmEd25519::platformSign(const CryptoKeyOKP&, const Vector<uint8_t>&) { return notSupported(); }
-ExceptionOr<bool> CryptoAlgorithmEd25519::platformVerify(const CryptoKeyOKP&, const Vector<uint8_t>&, const Vector<uint8_t>&) { return notSupported(); }
 ExceptionOr<Vector<uint8_t>> CryptoAlgorithmHKDF::platformDeriveBits(const CryptoAlgorithmHkdfParams&, const CryptoKeyRaw&, size_t) { return notSupported(); }
 ExceptionOr<Vector<uint8_t>> CryptoAlgorithmHMAC::platformSign(const CryptoKeyHMAC&, const Vector<uint8_t>&) { return notSupported(); }
 ExceptionOr<bool> CryptoAlgorithmHMAC::platformVerify(const CryptoKeyHMAC&, const Vector<uint8_t>&, const Vector<uint8_t>&) { return notSupported(); }
@@ -86,7 +84,6 @@ ExceptionOr<Vector<uint8_t>> CryptoAlgorithmRSA_OAEP::platformDecrypt(const Cryp
 ExceptionOr<Vector<uint8_t>> CryptoAlgorithmRSA_PSS::platformSign(const CryptoAlgorithmRsaPssParams&, const CryptoKeyRSA&, const Vector<uint8_t>&) { return notSupported(); }
 ExceptionOr<bool> CryptoAlgorithmRSA_PSS::platformVerify(const CryptoAlgorithmRsaPssParams&, const CryptoKeyRSA&, const Vector<uint8_t>&, const Vector<uint8_t>&) { return notSupported(); }
 #endif
-std::optional<Vector<uint8_t>> CryptoAlgorithmX25519::platformDeriveBits(const CryptoKeyOKP&, const CryptoKeyOKP&) { return std::nullopt; }
 
 // Keys: none is made.
 
@@ -103,16 +100,10 @@ bool CryptoKeyEC::platformAddFieldElements(JsonWebKey&) const { return false; }
 Vector<uint8_t> CryptoKeyEC::platformExportSpki() const { return { }; }
 Vector<uint8_t> CryptoKeyEC::platformExportPkcs8() const { return { }; }
 
-bool CryptoKeyOKP::supportsNamedCurve() { return false; }
-std::optional<CryptoKeyPair> CryptoKeyOKP::platformGeneratePair(CryptoAlgorithmIdentifier, NamedCurve, bool, CryptoKeyUsageBitmap) { return std::nullopt; }
-bool CryptoKeyOKP::platformCheckPairedKeys(CryptoAlgorithmIdentifier, NamedCurve, const Vector<uint8_t>&, const Vector<uint8_t>&) { return false; }
-RefPtr<CryptoKeyOKP> CryptoKeyOKP::importSpki(CryptoAlgorithmIdentifier, NamedCurve, Vector<uint8_t>&&, bool, CryptoKeyUsageBitmap) { return nullptr; }
-RefPtr<CryptoKeyOKP> CryptoKeyOKP::importPkcs8(CryptoAlgorithmIdentifier, NamedCurve, Vector<uint8_t>&&, bool, CryptoKeyUsageBitmap) { return nullptr; }
-ExceptionOr<Vector<uint8_t>> CryptoKeyOKP::exportSpki() const { return notSupported(); }
-ExceptionOr<Vector<uint8_t>> CryptoKeyOKP::exportPkcs8() const { return notSupported(); }
-String CryptoKeyOKP::generateJwkD() const { return { }; }
-String CryptoKeyOKP::generateJwkX() const { return { }; }
-Vector<uint8_t> CryptoKeyOKP::platformExportRaw() const { return { }; }
+// (Ed25519's, X25519's and CryptoKeyOKP's platform functions are WebCore's
+// own for a port that is neither Cocoa nor GCrypt: crypto/keys/CryptoKeyOKP.cpp
+// and crypto/algorithms/CryptoAlgorithm{Ed25519,X25519}.cpp define them,
+// unsupported, under `!PLATFORM(COCOA) && !USE(GCRYPT)`.)
 
 CryptoKeyRSA::CryptoKeyRSA(CryptoAlgorithmIdentifier identifier, CryptoAlgorithmIdentifier hash, bool hasHash, CryptoKeyType type, PlatformRSAKeyContainer&& platformKey, bool extractable, CryptoKeyUsageBitmap usage)
     : CryptoKey(identifier, type, extractable, usage)
