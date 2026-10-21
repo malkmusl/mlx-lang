@@ -244,6 +244,65 @@ fn defineAggregateNamespace(source: []const u8, path: []const u8, tokens: Buffer
             const symbol_index = symbols_module.append(symbols, &method)
             if !symbols_module.define(aggregate_scope, name_pointer, name_token.length, symbol_index) { return false }
         }
+        // `const LIMIT = ...` among the members: a constant of the
+        // aggregate's namespace (`Self.LIMIT`, `Stack.LIMIT`, `LIMIT` in
+        // its methods), typed once the layout is complete
+        // (analyzeAggregateConstants).
+        if member.tag == ast.Tag.constant_declaration {
+            const name_token = lexer.tokenAt(tokens, member.mainToken)
+            const name_pointer = tokenPointer(source, tokens, member.mainToken)
+            if symbols_module.lookupCurrent(aggregate_scope, name_pointer, name_token.length).0 { return false }
+            var constant = symbols_module.create(name_pointer, name_token.length, member_index, 0, 0, symbols_module.FLAG_CONSTANT | symbols_module.FLAG_PUBLIC, symbols_module.State.declared)
+            constant.ownerTypeId = aggregate_id
+            const symbol_index = symbols_module.append(symbols, &constant)
+            if !symbols_module.define(aggregate_scope, name_pointer, name_token.length, symbol_index) { return false }
+        }
+        member_index = member.next
+        visited += 1
+    }
+    return true
+}
+
+// The constants among an aggregate's members typed and evaluated, in the
+// aggregate's scope (where `Self`, the methods and a generic type's
+// parameters are named).
+fn analyzeAggregateConstants(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, aggregate_scope: *Scope, aggregate_node: Node) -> bool {
+    var member_index = aggregate_node.lhs
+    var visited: usize = 0
+    while member_index != ast.NONE && visited < aggregate_node.rhs {
+        const member = ast_store.Store.get(nodes, member_index)
+        if member.tag == ast.Tag.constant_declaration {
+            const name_token = lexer.tokenAt(tokens, member.mainToken)
+            const found = symbols_module.lookupCurrent(aggregate_scope, tokenPointer(source, tokens, member.mainToken), name_token.length)
+            if !found.0 { return false }
+            symbols_module.symbolAt(symbols, found.1).*.state = symbols_module.State.initializing
+            var declared_type: TypeId = 0
+            if member.lhs != ast.NONE {
+                declared_type = resolveType(source, path, tokens, nodes, types, symbols, aggregate_scope, member.lhs)
+                if declared_type == 0 {
+                    reportOwnership(source, path, tokens, ast_store.Store.get(nodes, member.lhs), diagnostic.Code.type_mismatch, "this type could not be resolved")
+                    return false
+                }
+            }
+            const inferred = expression(source, path, tokens, nodes, types, symbols, aggregate_scope, member.rhs)
+            if inferred.0 == 0 {
+                const unknown = unknown_names.report(source, path, tokens, nodes, types, aggregate_scope, member.rhs)
+                reportOwnership(source, path, tokens, member, diagnostic.Code.type_mismatch, "this constant of the aggregate could not be resolved")
+                return false
+            }
+            if declared_type == 0 { declared_type = inferred.0 }
+            if mismatch.say(source, path, tokens, nodes, types, symbols, member.rhs, inferred.0, declared_type) { return false }
+            const known = comptime_module.evaluate(source, tokens, nodes, types, symbols, aggregate_scope, member.rhs, 1000000)
+            const symbol = symbols_module.symbolAt(symbols, found.1)
+            symbol.*.typeId = declared_type
+            symbol.*.valueTypeId = inferred.1
+            if comptime_module.isValid(known) {
+                symbol.*.comptimeTag = @intCast(u8, @intFromEnum(known.kind))
+                symbol.*.comptimeInteger = known.integer
+                if known.kind == comptime_module.Kind.type_value && symbol.*.valueTypeId == 0 { symbol.*.valueTypeId = known.typeId }
+            }
+            symbol.*.state = symbols_module.State.initialized
+        }
         member_index = member.next
         visited += 1
     }
@@ -262,15 +321,26 @@ fn analyzeAggregateFunctionTypes(source: []const u8, path: []const u8, tokens: B
     return true
 }
 
-fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, node_index: usize, kind: TypeKind) -> TypeId {
+// What tells one aggregate declaration from another: where its node is,
+// and in a generic type instance (types.instanceSalt) which instance, so
+// that `struct { value: T }` written once is another aggregate for every
+// T.
+fn aggregateIdentity(nodes: *NodeStore, types: *TypeStore, node_index: usize) -> usize {
+    return aggregate_names.identity(nodes, node_index) ^ (types.*.instanceSalt << 48)
+}
+
+// `copyability`: explicit_nocopy for the aggregate of `@noncopy(struct)
+// { ... }`, which is then that one type (its `Self`, its methods' owner,
+// and the binding's value are all the non-copyable aggregate).
+fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, node_index: usize, kind: TypeKind, declared_copyability: types_module.Copyability) -> TypeId {
     const node = ast_store.Store.get(nodes, node_index)
-    var identity = aggregate_names.identity(nodes, node_index)
-    var aggregate_id = types_module.aggregate(types, kind, identity, types_module.Copyability.copyable)
+    var identity = aggregateIdentity(nodes, types, node_index)
+    var aggregate_id = types_module.aggregate(types, kind, identity, declared_copyability)
     var aggregate = types_module.get(types, aggregate_id)
     while aggregate.*.flags & types_module.FLAG_LAYOUT_COMPLETE != 0 {
         if aggregate_names.fieldsMatch(source, tokens, nodes, types, node, aggregate_id) { return aggregate_id }
         identity += 1
-        aggregate_id = types_module.aggregate(types, kind, identity, types_module.Copyability.copyable)
+        aggregate_id = types_module.aggregate(types, kind, identity, declared_copyability)
         aggregate = types_module.get(types, aggregate_id)
     }
     var aggregate_scope = symbols_module.initChildScopeFromParent(scope, node.rhs + 4)
@@ -295,7 +365,7 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
     var ahead_visited: usize = 0
     while ahead != ast.NONE && ahead_visited < node.rhs {
         const member = ast_store.Store.get(nodes, ahead)
-        if member.tag != ast.Tag.function_declaration && kind != types_module.Kind.enum_type && kind != types_module.Kind.error_set { analyzeTypeAhead(source, path, tokens, nodes, types, symbols, &aggregate_scope, member.lhs) }
+        if member.tag != ast.Tag.function_declaration && member.tag != ast.Tag.constant_declaration && kind != types_module.Kind.enum_type && kind != types_module.Kind.error_set { analyzeTypeAhead(source, path, tokens, nodes, types, symbols, &aggregate_scope, member.lhs) }
         ahead = member.next
         ahead_visited += 1
     }
@@ -305,7 +375,7 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
     var visited: usize = 0
     var size: usize = 0
     var alignment: usize = 1
-    var copyability = types_module.Copyability.copyable
+    var copyability = declared_copyability
 
     if kind == types_module.Kind.enum_type || kind == types_module.Kind.error_set {
         var backing = types_module.integer(types, false, 16)
@@ -327,7 +397,7 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
         var next_value: usize = if kind == types_module.Kind.error_set { 1 } else { 0 }
         while field_node != ast.NONE && visited < node.rhs {
             const member = ast_store.Store.get(nodes, field_node)
-            if member.tag == ast.Tag.function_declaration {
+            if member.tag == ast.Tag.function_declaration || member.tag == ast.Tag.constant_declaration {
                 field_node = member.next
                 visited += 1
                 continue
@@ -369,15 +439,15 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
             return 0
         }
         types_module.completeAggregate(types, aggregate_id, fields_start, count, size, alignment, copyability)
-        const methods_valid = analyzeAggregateFunctionTypes(source, path, tokens, nodes, types, symbols, &aggregate_scope, node)
+        const members_valid = analyzeAggregateConstants(source, path, tokens, nodes, types, symbols, &aggregate_scope, node) && analyzeAggregateFunctionTypes(source, path, tokens, nodes, types, symbols, &aggregate_scope, node)
         symbols_module.deinitScope(&aggregate_scope)
-        if !methods_valid { return 0 }
+        if !members_valid { return 0 }
         return aggregate_id
     }
 
     while field_node != ast.NONE && visited < node.rhs {
         const member = ast_store.Store.get(nodes, field_node)
-        if member.tag == ast.Tag.function_declaration {
+        if member.tag == ast.Tag.function_declaration || member.tag == ast.Tag.constant_declaration {
             field_node = member.next
             visited += 1
             continue
@@ -392,6 +462,10 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
         var field_type = types_module.primitive(types, types_module.Kind.void_type)
         if member.lhs != ast.NONE { field_type = resolveType(source, path, tokens, nodes, types, symbols, &aggregate_scope, member.lhs) }
         if field_type == 0 {
+            if member.lhs != ast.NONE {
+                const unknown = unknown_names.report(source, path, tokens, nodes, types, &aggregate_scope, member.lhs)
+                reportOwnership(source, path, tokens, ast_store.Store.get(nodes, member.lhs), diagnostic.Code.type_mismatch, "the type of this field could not be resolved")
+            }
             symbols_module.deinitScope(&aggregate_scope)
             return 0
         }
@@ -405,7 +479,7 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
             size += field_size
         }
         if kind == types_module.Kind.union_type && field_size > size { size = field_size }
-        if types_module.get(types, field_type).*.copyability != types_module.Copyability.copyable { copyability = types_module.Copyability.contains_nocopy }
+        if copyability == types_module.Copyability.copyable && types_module.get(types, field_type).*.copyability != types_module.Copyability.copyable { copyability = types_module.Copyability.contains_nocopy }
         var field = types_module.Field.{ .nameToken = member.mainToken, .namePointer = tokenPointer(source, tokens, member.mainToken), .nameLength = member_token.length, .typeId = field_type, .offset = offset }
         if types_module.appendField(types, &field) == types_module.NONE {
             symbols_module.deinitScope(&aggregate_scope)
@@ -439,9 +513,9 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
     }
     size = alignForward(size, alignment)
     types_module.completeAggregate(types, aggregate_id, fields_start, count, size, alignment, copyability)
-    const methods_valid = analyzeAggregateFunctionTypes(source, path, tokens, nodes, types, symbols, &aggregate_scope, node)
+    const members_valid = analyzeAggregateConstants(source, path, tokens, nodes, types, symbols, &aggregate_scope, node) && analyzeAggregateFunctionTypes(source, path, tokens, nodes, types, symbols, &aggregate_scope, node)
     symbols_module.deinitScope(&aggregate_scope)
-    if !methods_valid { return 0 }
+    if !members_valid { return 0 }
     return aggregate_id
 }
 
@@ -451,7 +525,14 @@ fn pendingAggregate(nodes: *NodeStore, types: *TypeStore, declaration: usize) ->
     if declaration == ast.NONE { return 0 }
     const binding = ast_store.Store.get(nodes, declaration)
     if binding.tag != ast.Tag.constant_declaration || binding.rhs == ast.NONE { return 0 }
-    const tag = ast_store.Store.get(nodes, binding.rhs).tag
+    var aggregate_node = binding.rhs
+    var copyability = types_module.Copyability.copyable
+    if ast_store.Store.get(nodes, aggregate_node).tag == ast.Tag.nocopy_type {
+        aggregate_node = ast_store.Store.get(nodes, aggregate_node).lhs
+        copyability = types_module.Copyability.explicit_nocopy
+        if aggregate_node == ast.NONE { return 0 }
+    }
+    const tag = ast_store.Store.get(nodes, aggregate_node).tag
     var kind = types_module.Kind.struct_type
     if tag == ast.Tag.enum_type {
         kind = types_module.Kind.enum_type
@@ -462,11 +543,11 @@ fn pendingAggregate(nodes: *NodeStore, types: *TypeStore, declaration: usize) ->
     }
     // (As resolveAggregate chose it: the first of its identities whose
     // layout is not complete.)
-    var identity = aggregate_names.identity(nodes, binding.rhs)
-    var aggregate_id = types_module.aggregate(types, kind, identity, types_module.Copyability.copyable)
+    var identity = aggregateIdentity(nodes, types, aggregate_node)
+    var aggregate_id = types_module.aggregate(types, kind, identity, copyability)
     while types_module.get(types, aggregate_id).*.flags & types_module.FLAG_LAYOUT_COMPLETE != 0 {
         identity += 1
-        aggregate_id = types_module.aggregate(types, kind, identity, types_module.Copyability.copyable)
+        aggregate_id = types_module.aggregate(types, kind, identity, copyability)
     }
     return aggregate_id
 }
@@ -474,10 +555,19 @@ fn pendingAggregate(nodes: *NodeStore, types: *TypeStore, declaration: usize) ->
 pub fn resolveType(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, node_index: usize) -> TypeId {
     if node_index == ast.NONE { return 0 }
     const node = ast_store.Store.get(nodes, node_index)
-    if node.tag == ast.Tag.struct_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.struct_type) }
-    if node.tag == ast.Tag.enum_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.enum_type) }
-    if node.tag == ast.Tag.union_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.union_type) }
-    if node.tag == ast.Tag.error_set_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.error_set) }
+    if node.tag == ast.Tag.struct_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.struct_type, types_module.Copyability.copyable) }
+    if node.tag == ast.Tag.enum_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.enum_type, types_module.Copyability.copyable) }
+    if node.tag == ast.Tag.union_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.union_type, types_module.Copyability.copyable) }
+    if node.tag == ast.Tag.error_set_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node_index, types_module.Kind.error_set, types_module.Copyability.copyable) }
+    // `@noncopy(struct) { ... }`: the aggregate is made non-copyable, not
+    // wrapped, so that `Self` and the methods' owner are the type the
+    // binding gets.
+    if node.tag == ast.Tag.nocopy_type && node.lhs != ast.NONE {
+        const child_tag = ast_store.Store.get(nodes, node.lhs).tag
+        if child_tag == ast.Tag.struct_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node.lhs, types_module.Kind.struct_type, types_module.Copyability.explicit_nocopy) }
+        if child_tag == ast.Tag.enum_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node.lhs, types_module.Kind.enum_type, types_module.Copyability.explicit_nocopy) }
+        if child_tag == ast.Tag.union_type { return resolveAggregate(source, path, tokens, nodes, types, symbols, scope, node.lhs, types_module.Kind.union_type, types_module.Copyability.explicit_nocopy) }
+    }
     const direct = types_module.resolve(source, tokens, nodes, types, node_index)
     if direct != 0 { return direct }
     if node.tag == ast.Tag.field_expression {
@@ -568,6 +658,12 @@ pub fn resolveType(source: []const u8, path: []const u8, tokens: Buffer, nodes: 
         const child = resolveType(source, path, tokens, nodes, types, symbols, scope, node.lhs)
         if child == 0 { return 0 }
         return types_module.noCopy(types, child)
+    }
+    // `Box(u32)`: a generic type function applied (typeFunctionCall).
+    if node.tag == ast.Tag.call_expression {
+        const made = expression(source, path, tokens, nodes, types, symbols, scope, node_index)
+        if made.0 != types_module.primitive(types, types_module.Kind.type_type) { return 0 }
+        return made.1
     }
     return 0
 }
@@ -697,7 +793,70 @@ fn callArgumentAt(nodes: *NodeStore, first_argument: usize, wanted: usize) -> us
     return argument
 }
 
+// The annotated return type of a generic function (`-> ?T`, `-> []const
+// T`, `-> Box(T)`) resolved for one call, in a scope where the comptime
+// parameters are what the call gives them; 0 when it cannot be.
+fn derivedCallReturnType(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, call: Node, symbol: *symbols_module.Symbol, return_type: TypeId) -> usize {
+    if symbol.*.declaration == ast.NONE { return 0 }
+    const context = symbols_module.moduleContext(symbols, symbol.*.moduleId)
+    if context.nodesAddress == 0 || context.tokensAddress == 0 || context.scopeAddress == 0 { return 0 }
+    var function_nodes: *NodeStore = undefined
+    var function_tokens: Buffer = undefined
+    var module_scope: *Scope = undefined
+    unsafe {
+        function_nodes = @ptrFromInt(*NodeStore, context.nodesAddress)
+        function_tokens = @ptrFromInt(*Buffer, context.tokensAddress).*
+        module_scope = @ptrFromInt(*Scope, context.scopeAddress)
+    }
+    const function_source = context.sourcePointer[0..context.sourceLength]
+    const function_path = context.pathPointer[0..context.pathLength]
+    const function_node = ast_store.Store.get(function_nodes, symbol.*.declaration)
+    if function_node.extra == ast.NONE { return 0 }
+    if !isComptimeTypeParameterName(function_source, function_path, function_tokens, function_nodes, function_node, ast.NONE, function_node.extra) { return 0 }
+    var call_scope = symbols_module.initChildScopeFromParent(module_scope, 8)
+    const type_type = types_module.primitive(types, types_module.Kind.type_type)
+    var parameter = function_node.lhs
+    var index: usize = 0
+    var bound = true
+    while parameter != ast.NONE && bound {
+        const parameter_node = ast_store.Store.get(function_nodes, parameter)
+        if parameter_node.extra & 1 != 0 {
+            const argument = callArgumentAt(nodes, call.rhs, index)
+            if argument == ast.NONE {
+                bound = false
+            } else {
+                const name_token = lexer.tokenAt(function_tokens, parameter_node.mainToken)
+                const name_pointer = tokenPointer(function_source, function_tokens, parameter_node.mainToken)
+                const value = expressionWithReturn(source, path, tokens, nodes, types, symbols, scope, argument, return_type)
+                if value.0 == type_type && value.1 != 0 {
+                    var type_symbol = symbols_module.create(name_pointer, name_token.length, ast.NONE, type_type, value.1, symbols_module.FLAG_CONSTANT, symbols_module.State.initialized)
+                    type_symbol.comptimeTag = @intCast(u8, @intFromEnum(comptime_module.Kind.type_value))
+                    const defined = symbols_module.define(&call_scope, name_pointer, name_token.length, symbols_module.append(symbols, &type_symbol))
+                } else {
+                    const known = comptime_module.evaluate(source, tokens, nodes, types, symbols, scope, argument, 1000000)
+                    if known.kind == comptime_module.Kind.integer || known.kind == comptime_module.Kind.boolean {
+                        var value_symbol = symbols_module.create(name_pointer, name_token.length, ast.NONE, if value.0 != 0 { value.0 } else { types_module.primitive(types, types_module.Kind.comptime_int_type) }, 0, symbols_module.FLAG_CONSTANT, symbols_module.State.initialized)
+                        value_symbol.comptimeTag = @intCast(u8, @intFromEnum(known.kind))
+                        value_symbol.comptimeInteger = known.integer
+                        const defined = symbols_module.define(&call_scope, name_pointer, name_token.length, symbols_module.append(symbols, &value_symbol))
+                    } else {
+                        bound = false
+                    }
+                }
+            }
+        }
+        parameter = parameter_node.next
+        index += 1
+    }
+    var result: usize = 0
+    if bound { result = resolveType(function_source, function_path, function_tokens, function_nodes, types, symbols, &call_scope, function_node.extra) }
+    symbols_module.deinitScope(&call_scope)
+    return result
+}
+
 fn genericCallReturnType(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, call: Node, symbol: *symbols_module.Symbol, return_type: TypeId) -> usize {
+    const derived = derivedCallReturnType(source, path, tokens, nodes, types, symbols, scope, call, symbol, return_type)
+    if derived != 0 { return derived }
     if symbol.*.genericReturnKind == symbols_module.GENERIC_RETURN_NONE { return 0 }
     const primary_index = symbol.*.genericReturnParameter
     const primary_node = callArgumentAt(nodes, call.rhs, primary_index)
@@ -727,6 +886,297 @@ fn genericCallReturnType(source: []const u8, path: []const u8, tokens: Buffer, n
         if aggregate.*.kind == types_module.Kind.struct_type || aggregate.*.kind == types_module.Kind.union_type { return types_module.fieldAt(types, aggregate.*.extraStart + field_index).*.typeId }
     }
     return 0
+}
+
+// Generic type functions: `fn Box(comptime T: type) -> type { return
+// struct { value: T ... } }`. A call `Box(u32)` is an instance of the
+// function (types.Instance), one per distinct argument list: the body is
+// evaluated once, in a scope of its own holding the parameters and the
+// constants it declares, with the aggregates it declares told from every
+// other instance's (aggregateIdentity), and the type it returns is the
+// call's value. The lowering generates the methods of those aggregates
+// from the instance's scope (ir/lower.mlx, lowerInstanceMethods).
+
+// A function returning `type`.
+pub fn isTypeFunction(types: *TypeStore, symbol: *symbols_module.Symbol) -> bool {
+    if symbol.*.flags & symbols_module.FLAG_FUNCTION == 0 || symbol.*.declaration == ast.NONE || symbol.*.typeId == 0 { return false }
+    const function_type = types_module.get(types, symbol.*.typeId)
+    if function_type.*.kind != types_module.Kind.function { return false }
+    return types_module.get(types, function_type.*.lhs).*.kind == types_module.Kind.type_type
+}
+
+const TYPE_FUNCTION_ARGUMENT_LIMIT: usize = 8
+
+// `Box(u32)` typed: (type, the instance's type).
+fn typeFunctionCall(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, call: Node, symbol_index: usize, return_type: TypeId) -> (TypeId, TypeId) {
+    var arguments: [8]types_module.InstanceArgument = undefined
+    var count: usize = 0
+    var argument = call.rhs
+    while argument != ast.NONE && count < call.extra {
+        const argument_node = ast_store.Store.get(nodes, argument)
+        if count >= TYPE_FUNCTION_ARGUMENT_LIMIT {
+            reportOwnership(source, path, tokens, argument_node, diagnostic.Code.type_mismatch, "a generic type takes at most 8 arguments")
+            return -> (0, 0)
+        }
+        const value = expressionWithReturn(source, path, tokens, nodes, types, symbols, scope, argument, return_type)
+        if value.0 == types_module.primitive(types, types_module.Kind.type_type) && value.1 != 0 {
+            arguments[count] = types_module.InstanceArgument.{ .kind = @intCast(u8, @intFromEnum(comptime_module.Kind.type_value)), .typeId = value.1, .integer = 0 }
+        } else {
+            const known = comptime_module.evaluate(source, tokens, nodes, types, symbols, scope, argument, 1000000)
+            if known.kind == comptime_module.Kind.integer || known.kind == comptime_module.Kind.boolean {
+                arguments[count] = types_module.InstanceArgument.{ .kind = @intCast(u8, @intFromEnum(known.kind)), .typeId = 0, .integer = known.integer }
+            } else if known.kind == comptime_module.Kind.type_value && known.typeId != 0 {
+                arguments[count] = types_module.InstanceArgument.{ .kind = @intCast(u8, @intFromEnum(comptime_module.Kind.type_value)), .typeId = known.typeId, .integer = 0 }
+            } else {
+                const unknown = unknown_names.report(source, path, tokens, nodes, types, scope, argument)
+                reportOwnership(source, path, tokens, argument_node, diagnostic.Code.comptime_runtime_dependency, "an argument of a generic type is a type, or an integer or bool known at compile time")
+                return -> (0, 0)
+            }
+        }
+        argument = argument_node.next
+        count += 1
+    }
+    if count != call.extra { return -> (0, 0) }
+    const made = instantiateType(source, path, tokens, nodes, types, symbols, scope, symbol_index, &arguments, count, call)
+    if made == 0 { return -> (0, 0) }
+    return -> (types_module.primitive(types, types_module.Kind.type_type), made)
+}
+
+// The instance of the type function `symbol_index` applied to
+// `arguments`, made now when it is new: its type, or 0 (reported at `at`,
+// in the caller's source; what went wrong in the body is reported in
+// the function's).
+pub fn instantiateType(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, symbol_index: usize, arguments: [*]types_module.InstanceArgument, argument_count: usize, at: Node) -> TypeId {
+    const symbol = symbols_module.symbolAt(symbols, symbol_index)
+    if !isTypeFunction(types, symbol) { return 0 }
+    const module_id = symbol.*.moduleId
+    const declaration = symbol.*.declaration
+    const existing = types_module.findInstance(types, module_id, declaration, arguments, argument_count)
+    if existing != types_module.NONE {
+        const instance = types_module.instanceAt(types, existing)
+        if instance.*.state == types_module.INSTANCE_FAILED { return 0 }
+        if instance.*.resultType == 0 {
+            reportOwnership(source, path, tokens, at, diagnostic.Code.comptime_cycle, "this generic type is named inside its own body while it is being made; name it `Self` there")
+            return 0
+        }
+        return instance.*.resultType
+    }
+    const context = symbols_module.moduleContext(symbols, module_id)
+    if context.nodesAddress == 0 || context.scopeAddress == 0 || context.tokensAddress == 0 { return 0 }
+    var generic_nodes: *NodeStore = undefined
+    var generic_tokens: Buffer = undefined
+    var generic_scope: *Scope = undefined
+    unsafe {
+        generic_nodes = @ptrFromInt(*NodeStore, context.nodesAddress)
+        generic_tokens = @ptrFromInt(*Buffer, context.tokensAddress).*
+        generic_scope = @ptrFromInt(*Scope, context.scopeAddress)
+    }
+    const generic_source = context.sourcePointer[0..context.sourceLength]
+    const generic_path = context.pathPointer[0..context.pathLength]
+    const function_node = ast_store.Store.get(generic_nodes, declaration)
+    var parameter = function_node.lhs
+    var parameter_count: usize = 0
+    while parameter != ast.NONE {
+        parameter_count += 1
+        parameter = ast_store.Store.get(generic_nodes, parameter).next
+    }
+    if parameter_count != argument_count {
+        reportOwnership(source, path, tokens, at, diagnostic.Code.type_mismatch, "this generic type is given another number of arguments than it has parameters")
+        return 0
+    }
+    // The instance's scope, kept for the compilation: the parameters, then
+    // the body's constants.
+    const scope_memory = types.*.allocator.alloc(@sizeOf(Scope), @alignOf(Scope))
+    if scope_memory == null { return 0 }
+    var instance_scope: *Scope = undefined
+    unsafe { instance_scope = @ptrCast(*Scope, scope_memory.?) }
+    symbols_module.initRootScopeAt(instance_scope, types.*.allocator, parameter_count + 8)
+    instance_scope.*.parentAddress = @intFromPtr(generic_scope)
+    instance_scope.*.depth = generic_scope.*.depth + 1
+    var record = types_module.Instance.{
+        .moduleId = module_id,
+        .declaration = declaration,
+        .symbolId = symbol_index,
+        .argumentsStart = 0,
+        .argumentCount = 0,
+        .resultType = 0,
+        .scopeAddress = @intFromPtr(instance_scope),
+        .state = types_module.INSTANCE_MADE,
+    }
+    const index = types_module.addInstance(types, &record, arguments, argument_count)
+    const arguments_start = types_module.instanceAt(types, index).*.argumentsStart
+    const symbols_before = symbols.*.length
+    const type_type = types_module.primitive(types, types_module.Kind.type_type)
+    parameter = function_node.lhs
+    var position: usize = 0
+    while parameter != ast.NONE && position < argument_count {
+        const parameter_node = ast_store.Store.get(generic_nodes, parameter)
+        const name_token = lexer.tokenAt(generic_tokens, parameter_node.mainToken)
+        const name_pointer = tokenPointer(generic_source, generic_tokens, parameter_node.mainToken)
+        const argument = types_module.instanceArgumentAt(types, arguments_start + position)
+        var bound = symbols_module.create(name_pointer, name_token.length, parameter, type_type, argument.*.typeId, symbols_module.FLAG_CONSTANT, symbols_module.State.initialized)
+        if argument.*.kind != @intCast(u8, @intFromEnum(comptime_module.Kind.type_value)) {
+            var declared: TypeId = 0
+            if parameter_node.lhs != ast.NONE { declared = resolveType(generic_source, generic_path, generic_tokens, generic_nodes, types, symbols, instance_scope, parameter_node.lhs) }
+            if declared == 0 { declared = types_module.primitive(types, if argument.*.kind == @intCast(u8, @intFromEnum(comptime_module.Kind.boolean)) { types_module.Kind.bool_type } else { types_module.Kind.comptime_int_type }) }
+            bound = symbols_module.create(name_pointer, name_token.length, parameter, declared, 0, symbols_module.FLAG_CONSTANT, symbols_module.State.initialized)
+        }
+        bound.comptimeTag = argument.*.kind
+        bound.comptimeInteger = argument.*.integer
+        const bound_index = symbols_module.append(symbols, &bound)
+        const defined = symbols_module.define(instance_scope, name_pointer, name_token.length, bound_index)
+        parameter = parameter_node.next
+        position += 1
+    }
+    const salt = types_module.setInstanceSalt(types, index + 1)
+    const result = evaluateTypeBody(generic_source, generic_path, generic_tokens, generic_nodes, types, symbols, instance_scope, function_node.rhs, index)
+    const restored = types_module.setInstanceSalt(types, salt)
+    // The symbols made for the instance (its parameters and constants, the
+    // aggregates' Self and methods) belong to the function's module, where
+    // their declarations are.
+    var made_index = symbols_before
+    while made_index < symbols.*.length {
+        const made = symbols_module.symbolAt(symbols, made_index)
+        if made.*.flags & symbols_module.FLAG_MODULE_ASSIGNED == 0 {
+            made.*.moduleId = module_id
+            made.*.flags = made.*.flags | symbols_module.FLAG_MODULE_ASSIGNED
+        }
+        made_index += 1
+    }
+    const instance = types_module.instanceAt(types, index)
+    if result == 0 {
+        instance.*.state = types_module.INSTANCE_FAILED
+        reportOwnership(source, path, tokens, at, diagnostic.Code.type_mismatch, "this generic type could not be made")
+        return 0
+    }
+    instance.*.resultType = result
+    return result
+}
+
+// The body of a type function evaluated for one instance: its constants
+// bound in `scope`, its comptime `if`s decided, the type its `return`
+// gives (0 when none is reached, or something in it failed).
+fn evaluateTypeBody(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, body: usize, instance: usize) -> TypeId {
+    const result = evaluateTypeBlock(source, path, tokens, nodes, types, symbols, scope, body, instance)
+    if !result.0 {
+        if body != ast.NONE { reportOwnership(source, path, tokens, ast_store.Store.get(nodes, body), diagnostic.Code.type_mismatch, "a function returning `type` returns a type on every path") }
+        return 0
+    }
+    return result.1
+}
+
+// (reached a `return`, its type)
+fn evaluateTypeBlock(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, block_index: usize, instance: usize) -> (bool, TypeId) {
+    if block_index == ast.NONE { return -> (false, 0) }
+    const block = ast_store.Store.get(nodes, block_index)
+    if block.tag != ast.Tag.block { return evaluateTypeStatement(source, path, tokens, nodes, types, symbols, scope, block_index, instance) }
+    var statement = block.lhs
+    var count: usize = 0
+    while statement != ast.NONE && count < block.rhs {
+        const result = evaluateTypeStatement(source, path, tokens, nodes, types, symbols, scope, statement, instance)
+        if result.0 { return result }
+        statement = ast_store.Store.get(nodes, statement).next
+        count += 1
+    }
+    return -> (false, 0)
+}
+
+fn evaluateTypeStatement(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, statement_index: usize, instance: usize) -> (bool, TypeId) {
+    const node = ast_store.Store.get(nodes, statement_index)
+    if node.tag == ast.Tag.constant_declaration || node.tag == ast.Tag.variable_declaration {
+        if !bindInstanceConstant(source, path, tokens, nodes, types, symbols, scope, statement_index, instance) { return -> (true, 0) }
+        return -> (false, 0)
+    }
+    if node.tag == ast.Tag.return_statement {
+        if node.rhs == ast.NONE {
+            reportOwnership(source, path, tokens, node, diagnostic.Code.type_mismatch, "a function returning `type` returns a type")
+            return -> (true, 0)
+        }
+        const value = expression(source, path, tokens, nodes, types, symbols, scope, node.rhs)
+        if value.0 != types_module.primitive(types, types_module.Kind.type_type) || value.1 == 0 {
+            const unknown = unknown_names.report(source, path, tokens, nodes, types, scope, node.rhs)
+            reportOwnership(source, path, tokens, ast_store.Store.get(nodes, node.rhs), diagnostic.Code.type_mismatch, "a function returning `type` returns a type")
+            return -> (true, 0)
+        }
+        recordInstanceAggregate(nodes, types, node.rhs, value.1, instance)
+        return -> (true, value.1)
+    }
+    if node.tag == ast.Tag.if_statement {
+        const condition = comptime_module.evaluate(source, tokens, nodes, types, symbols, scope, node.lhs, 1000000)
+        if condition.kind != comptime_module.Kind.boolean {
+            const unknown = unknown_names.report(source, path, tokens, nodes, types, scope, node.lhs)
+            reportOwnership(source, path, tokens, ast_store.Store.get(nodes, node.lhs), diagnostic.Code.comptime_runtime_dependency, "the condition of an `if` in a function returning `type` is known at compile time")
+            return -> (true, 0)
+        }
+        const chosen = if condition.integer != 0 { node.rhs } else { node.extra }
+        if chosen == ast.NONE { return -> (false, 0) }
+        return evaluateTypeBlock(source, path, tokens, nodes, types, symbols, scope, chosen, instance)
+    }
+    if node.tag == ast.Tag.block { return evaluateTypeBlock(source, path, tokens, nodes, types, symbols, scope, statement_index, instance) }
+    if node.tag == ast.Tag.comptime_block { return evaluateTypeBlock(source, path, tokens, nodes, types, symbols, scope, node.lhs, instance) }
+    // Anything else (`@compileError("...")`, a value dropped) is typed, and
+    // fails the instance when it does not type.
+    const typed = expression(source, path, tokens, nodes, types, symbols, scope, statement_index)
+    if typed.0 == 0 {
+        const unknown = unknown_names.report(source, path, tokens, nodes, types, scope, statement_index)
+        reportOwnership(source, path, tokens, node, diagnostic.Code.type_mismatch, "a function returning `type` is constants, comptime `if`s and a `return` of a type")
+        return -> (true, 0)
+    }
+    return -> (false, 0)
+}
+
+// `const Entry = struct { ... }` (or any constant) in a type function's
+// body, bound in the instance's scope.
+fn bindInstanceConstant(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, declaration: usize, instance: usize) -> bool {
+    const node = ast_store.Store.get(nodes, declaration)
+    const token = lexer.tokenAt(tokens, node.mainToken)
+    const pointer = tokenPointer(source, tokens, node.mainToken)
+    if symbols_module.lookupCurrent(scope, pointer, token.length).0 {
+        reportOwnership(source, path, tokens, node, diagnostic.Code.duplicate_symbol, "this name is declared already in this function")
+        return false
+    }
+    var declared_type: TypeId = 0
+    if node.lhs != ast.NONE {
+        declared_type = resolveType(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+        if declared_type == 0 {
+            reportOwnership(source, path, tokens, ast_store.Store.get(nodes, node.lhs), diagnostic.Code.type_mismatch, "this type could not be resolved")
+            return false
+        }
+    }
+    const inferred = expression(source, path, tokens, nodes, types, symbols, scope, node.rhs)
+    if inferred.0 == 0 {
+        const unknown = unknown_names.report(source, path, tokens, nodes, types, scope, node.rhs)
+        reportOwnership(source, path, tokens, node, diagnostic.Code.type_mismatch, "this constant of the function returning `type` could not be resolved")
+        return false
+    }
+    if declared_type == 0 { declared_type = inferred.0 }
+    var value = symbols_module.create(pointer, token.length, declaration, declared_type, inferred.1, symbols_module.FLAG_CONSTANT, symbols_module.State.initialized)
+    const known = comptime_module.evaluate(source, tokens, nodes, types, symbols, scope, node.rhs, 1000000)
+    if comptime_module.isValid(known) {
+        value.comptimeTag = @intCast(u8, @intFromEnum(known.kind))
+        value.comptimeInteger = known.integer
+        if known.kind == comptime_module.Kind.type_value && value.valueTypeId == 0 { value.valueTypeId = known.typeId }
+    }
+    const symbol_index = symbols_module.append(symbols, &value)
+    if !symbols_module.define(scope, pointer, token.length, symbol_index) { return false }
+    if inferred.1 != 0 { recordInstanceAggregate(nodes, types, node.rhs, inferred.1, instance) }
+    return true
+}
+
+// An aggregate an instance's body declares (returned, or a constant's):
+// noted for the lowering to generate its methods.
+fn recordInstanceAggregate(nodes: *NodeStore, types: *TypeStore, node_index: usize, type_id: TypeId, instance: usize) -> void {
+    if node_index == ast.NONE || type_id == 0 { return }
+    var aggregate_index = node_index
+    var aggregate = ast_store.Store.get(nodes, aggregate_index)
+    if aggregate.tag == ast.Tag.nocopy_type {
+        if aggregate.lhs == ast.NONE { return }
+        aggregate_index = aggregate.lhs
+        aggregate = ast_store.Store.get(nodes, aggregate_index)
+    }
+    if aggregate.tag != ast.Tag.struct_type && aggregate.tag != ast.Tag.enum_type && aggregate.tag != ast.Tag.union_type { return }
+    var record = types_module.InstanceAggregate.{ .instance = instance, .node = aggregate_index, .typeId = type_id, .lowered = false }
+    types_module.addInstanceAggregate(types, &record)
 }
 
 pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, node_index: usize, return_type: TypeId) -> (TypeId, TypeId) {
@@ -846,6 +1296,17 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
             return -> (union_type.*.backing, 0)
         }
         return builtins.result(builtin_kind, first_type, first_value_type, second_type, second_value_type, types)
+    }
+    // A name the type parser wrote (`generic` in `generic.Wrapper(T)` of a
+    // type position) is whatever symbol it names, as an identifier is.
+    if node.tag == ast.Tag.named_type {
+        const name_token = lexer.tokenAt(tokens, node.mainToken)
+        const named = symbols_module.lookup(scope, tokenPointer(source, tokens, node.mainToken), name_token.length)
+        if named.0 {
+            analyzeAhead(source, path, tokens, nodes, types, symbols, scope, named.1)
+            const named_symbol = symbols_module.symbolAt(symbols, named.1)
+            if named_symbol.*.typeId != 0 && named_symbol.*.typeId != types_module.primitive(types, types_module.Kind.type_type) { return -> (named_symbol.*.typeId, named_symbol.*.valueTypeId) }
+        }
     }
     if node.tag == ast.Tag.named_type || node.tag == ast.Tag.pointer_type || node.tag == ast.Tag.many_pointer_type || node.tag == ast.Tag.slice_type || node.tag == ast.Tag.array_type || node.tag == ast.Tag.optional_type || node.tag == ast.Tag.error_union_type || node.tag == ast.Tag.nocopy_type || node.tag == ast.Tag.function_type || node.tag == ast.Tag.tuple_type || node.tag == ast.Tag.struct_type || node.tag == ast.Tag.enum_type || node.tag == ast.Tag.union_type || node.tag == ast.Tag.error_set_type {
         const value_type = resolveType(source, path, tokens, nodes, types, symbols, scope, node_index)
@@ -1169,6 +1630,9 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
     }
     if node.tag == ast.Tag.call_expression {
         const callee_symbol = referencedFunctionSymbol(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+        if callee_symbol.0 && isTypeFunction(types, symbols_module.symbolAt(symbols, callee_symbol.1)) {
+            return typeFunctionCall(source, path, tokens, nodes, types, symbols, scope, node, callee_symbol.1, return_type)
+        }
         const callee = expressionWithReturn(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type)
         if callee.0 == 0 { return -> (0, 0) }
         const function_type = types_module.get(types, callee.0)
@@ -1314,6 +1778,11 @@ fn analyzeTypeAhead(source: []const u8, path: []const u8, tokens: Buffer, nodes:
         if node.tag == ast.Tag.function_type { analyzeTypeAhead(source, path, tokens, nodes, types, symbols, scope, node.extra) }
     } else if node.tag == ast.Tag.pointer_type || node.tag == ast.Tag.many_pointer_type || node.tag == ast.Tag.slice_type || node.tag == ast.Tag.optional_type || node.tag == ast.Tag.nocopy_type {
         analyzeTypeAhead(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+    } else if node.tag == ast.Tag.call_expression || node.tag == ast.Tag.struct_type || node.tag == ast.Tag.union_type || node.tag == ast.Tag.enum_type {
+        // A generic type applied (`List(V)`, made now when it is new) or
+        // an aggregate written in place: resolved ahead, as either appends
+        // the fields of an aggregate of its own.
+        const resolved = resolveType(source, path, tokens, nodes, types, symbols, scope, node_index)
     }
 }
 
@@ -1390,9 +1859,30 @@ fn bindingErrors(source: []const u8, path: []const u8, tokens: Buffer, nodes: *N
     return errors
 }
 
+// Whether the type written at `type_node_index` names a comptime type
+// parameter of the function anywhere in it: `T`, `[*]T`, `?*T`,
+// `[]const T`, `[4]T`, `Box(T)`. Such a type is concrete per instance
+// (the lowering resolves it with the instance's arguments bound,
+// ir/lower.mlx resolveTypeNode; sema types the call's result with them,
+// genericCallReturnType) and `anytype` in the function's own type.
 fn isComptimeTypeParameterName(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, function_node: Node, stop_parameter: usize, type_node_index: usize) -> bool {
     if type_node_index == ast.NONE { return false }
     const type_node = ast_store.Store.get(nodes, type_node_index)
+    if type_node.tag == ast.Tag.pointer_type || type_node.tag == ast.Tag.many_pointer_type || type_node.tag == ast.Tag.slice_type || type_node.tag == ast.Tag.optional_type || type_node.tag == ast.Tag.nocopy_type {
+        return isComptimeTypeParameterName(source, path, tokens, nodes, function_node, stop_parameter, type_node.lhs)
+    }
+    if type_node.tag == ast.Tag.array_type || type_node.tag == ast.Tag.error_union_type {
+        return isComptimeTypeParameterName(source, path, tokens, nodes, function_node, stop_parameter, type_node.rhs) || isComptimeTypeParameterName(source, path, tokens, nodes, function_node, stop_parameter, type_node.lhs)
+    }
+    if type_node.tag == ast.Tag.function_type || type_node.tag == ast.Tag.tuple_type || type_node.tag == ast.Tag.call_expression {
+        var child = if type_node.tag == ast.Tag.call_expression { type_node.rhs } else { type_node.lhs }
+        while child != ast.NONE {
+            if isComptimeTypeParameterName(source, path, tokens, nodes, function_node, stop_parameter, child) { return true }
+            child = ast_store.Store.get(nodes, child).next
+        }
+        if type_node.tag == ast.Tag.function_type { return isComptimeTypeParameterName(source, path, tokens, nodes, function_node, stop_parameter, type_node.extra) }
+        return false
+    }
     if type_node.tag != ast.Tag.named_type && type_node.tag != ast.Tag.identifier { return false }
     const type_token = lexer.tokenAt(tokens, type_node.mainToken)
     var parameter = function_node.lhs
@@ -1480,11 +1970,11 @@ fn analyzeFunction(source: []const u8, path: []const u8, tokens: Buffer, nodes: 
     var count: usize = 0
     while parameter != ast.NONE && count < expected_count {
         const parameter_node = ast_store.Store.get(nodes, parameter)
+        // A type over a comptime type parameter (`T`, `[*]T`, `Box(T)`) is
+        // concrete per instance: `anytype` here, and not tried (the
+        // parameter is no name of this scope).
         var parameter_type = types_module.primitive(types, types_module.Kind.anytype_type)
-        if parameter_node.lhs != ast.NONE { parameter_type = resolveType(source, path, tokens, nodes, types, symbols, scope, parameter_node.lhs) }
-        if parameter_type == 0 && isComptimeTypeParameterName(source, path, tokens, nodes, node, parameter, parameter_node.lhs) {
-            parameter_type = types_module.primitive(types, types_module.Kind.anytype_type)
-        }
+        if parameter_node.lhs != ast.NONE && !isComptimeTypeParameterName(source, path, tokens, nodes, node, parameter, parameter_node.lhs) { parameter_type = resolveType(source, path, tokens, nodes, types, symbols, scope, parameter_node.lhs) }
         if parameter_type == 0 {
             if parameter_node.lhs != ast.NONE { reportOwnership(source, path, tokens, ast_store.Store.get(nodes, parameter_node.lhs), diagnostic.Code.type_mismatch, "this type could not be resolved") }
             return 1
@@ -1493,9 +1983,11 @@ fn analyzeFunction(source: []const u8, path: []const u8, tokens: Buffer, nodes: 
         parameter = parameter_node.next
         count += 1
     }
-    var return_type = resolveType(source, path, tokens, nodes, types, symbols, scope, node.extra)
-    if return_type == 0 && isComptimeTypeParameterName(source, path, tokens, nodes, node, ast.NONE, node.extra) {
+    var return_type: TypeId = 0
+    if isComptimeTypeParameterName(source, path, tokens, nodes, node, ast.NONE, node.extra) {
         return_type = types_module.primitive(types, types_module.Kind.anytype_type)
+    } else {
+        return_type = resolveType(source, path, tokens, nodes, types, symbols, scope, node.extra)
     }
     if return_type == 0 && node.extra != ast.NONE { reportOwnership(source, path, tokens, ast_store.Store.get(nodes, node.extra), diagnostic.Code.type_mismatch, "this type could not be resolved") }
     if return_type == 0 || count != expected_count { return 1 }

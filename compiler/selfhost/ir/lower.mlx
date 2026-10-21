@@ -19,6 +19,7 @@ const scope_module = @import("../sema/symbols/scope.mlx")
 const comptime_value = @import("../sema/comptime/value.mlx")
 const comptime_module = @import("../comptime.mlx")
 const declarations = @import("../sema/declarations.mlx")
+const type_names = @import("../sema/type_names.mlx")
 const builtins = @import("../builtins.mlx")
 const atomics = @import("../sema/builtins/atomics.mlx")
 const loader_module = @import("../modules/loader.mlx")
@@ -60,6 +61,12 @@ const GenericInstance = struct {
     argumentsStart: usize
     argumentCount: usize
     functionTypeId: usize
+    // A method of a generic type instance's aggregate: the instance's
+    // scope (its parameters and constants), the aggregate it is a method
+    // of, and the instance's salt (types.instanceSalt); 0 otherwise.
+    scopeAddress: usize
+    ownerTypeId: usize
+    salt: usize
 }
 
 const LoopTarget = struct {
@@ -173,6 +180,15 @@ pub const LirBuilder = struct {
     runtimeSafety: bool
     currentGenericInstance: usize
     currentMethodOwner: usize
+    // The scope names resolve in instead of the module's: a generic type
+    // instance's, while its methods are lowered (0: the module's).
+    scopeOverride: usize
+    // How many of the generic instances have been generated.
+    generatedGenericInstances: usize
+    // The owner's name a function symbol made now gets in the executable's
+    // symbol table (`Box(u32).get`); none when ownerNameLength is 0.
+    ownerNamePointer: [*]const u8
+    ownerNameLength: usize
     blockCounter: usize
     breakTarget: usize
     continueTarget: usize
@@ -263,6 +279,10 @@ pub fn init(
             .runtimeSafety = runtime_safety,
             .currentGenericInstance = lir.NONE,
             .currentMethodOwner = lir.NONE,
+            .scopeOverride = 0,
+            .generatedGenericInstances = 0,
+            .ownerNamePointer = @ptrFromInt([*]const u8, 0),
+            .ownerNameLength = 0,
             .blockCounter = 0,
             .breakTarget = lir.NONE,
             .continueTarget = lir.NONE,
@@ -547,10 +567,9 @@ fn globalAddress(builder: *LirBuilder, symbol_index: usize) -> usize {
 // The module-level var called `name`, when there is one (the function's
 // bindings are looked up first by the callers).
 fn globalSymbolNamed(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize) -> (bool, usize) {
-    const module = loader_module.Loader.moduleAt(builder.*.loader, builder.*.currentModuleId)
-    if module.*.scopeAddress == 0 { return -> (false, 0) }
+    if !hasScope(builder) { return -> (false, 0) }
     unsafe {
-        const scope = @ptrFromInt(*scope_module.Scope, module.*.scopeAddress)
+        const scope = currentScope(builder)
         const found = scope_module.Scope.lookup(scope, name_ptr, name_len)
         if !found.0 { return -> (false, 0) }
         if !isGlobalSymbol(symbols_store.Store.get(builder.*.symbolStore, found.1)) { return -> (false, 0) }
@@ -762,6 +781,9 @@ fn ensureGenericInstance(builder: *LirBuilder, call_index: usize, symbol_index: 
         const target_nodes = @ptrFromInt(*ast_store.Store, target.*.nodesAddress)
         if !isGenericDeclaration(target_nodes, symbol.*.declaration) { return lir.NONE }
     }
+    // A function returning `type` has no body to generate: its calls are
+    // types (instantiateTypeCall).
+    if declarations.isTypeFunction(builder.*.typeStore, symbol) { return lir.NONE }
 
     const arguments_start = builder.*.genericArguments.*.length
     var argument_node = call.rhs
@@ -807,6 +829,39 @@ fn ensureGenericInstance(builder: *LirBuilder, call_index: usize, symbol_index: 
     switchToModule(builder, target_module)
     const nodes = getNodes(builder)
     const declaration = ast_store.Store.get(nodes, symbol.*.declaration)
+    // The instance's context while its signature is resolved: a method of
+    // a generic type instance's aggregate resolves names in that instance's
+    // scope, with that aggregate as `Self`.
+    var instance_scope: usize = 0
+    var instance_salt: usize = 0
+    var owner_type: usize = symbol.*.ownerTypeId
+    if owner_type != 0 {
+        const declaring = types_store.Store.instanceDeclaring(builder.*.typeStore, owner_type)
+        if declaring != types_store.NONE {
+            instance_scope = types_store.Store.instanceAt(builder.*.typeStore, declaring).*.scopeAddress
+            instance_salt = declaring + 1
+        }
+    }
+    const saved_scope = builder.*.scopeOverride
+    const saved_owner = builder.*.currentMethodOwner
+    const saved_salt = types_store.Store.setInstanceSalt(builder.*.typeStore, instance_salt)
+    if instance_scope != 0 { builder.*.scopeOverride = instance_scope }
+    if owner_type != 0 { builder.*.currentMethodOwner = owner_type }
+    // The comptime parameters bound to their arguments while the parameter
+    // and return types are resolved, so that `[*]T`, `?T`, `[]const T` and
+    // `Box(T)` are concrete in the instance's function type.
+    const bindings_length = builder.*.bindings.*.length
+    var bound = declaration.lhs
+    var bound_index: usize = 0
+    while bound != ast.NONE && bound_index < argument_count {
+        const bound_node = ast_store.Store.get(nodes, bound)
+        if bound_node.extra & 1 != 0 {
+            const argument = genericArgumentAt(builder, arguments_start + bound_index)
+            pushComptimeBinding(builder, tokenPointer(builder, bound_node.mainToken), tokenLength(builder, bound_node.mainToken), argument.*.typeId, argument.*.valueTypeId, argument.*.comptimeTag, argument.*.comptimeInteger)
+        }
+        bound = bound_node.next
+        bound_index += 1
+    }
     const parameter_start = builder.*.typeStore.*.extraIds.*.length
     var parameter = declaration.lhs
     var parameter_index: usize = 0
@@ -823,12 +878,19 @@ fn ensureGenericInstance(builder: *LirBuilder, call_index: usize, symbol_index: 
     }
     const generic_function = types_store.Store.get(builder.*.typeStore, symbol.*.typeId)
     var return_type = generic_function.*.lhs
-    const annotated_return = genericAnnotatedReturnType(builder, declaration, arguments_start, argument_count)
+    var annotated_return = genericAnnotatedReturnType(builder, declaration, arguments_start, argument_count)
+    if annotated_return == 0 && declaration.extra != ast.NONE && types_store.Store.get(builder.*.typeStore, return_type).*.kind == types_store.Kind.anytype_type {
+        annotated_return = resolveTypeNode(builder, declaration.extra)
+    }
     if annotated_return != 0 { return_type = annotated_return }
     if types_store.Store.get(builder.*.typeStore, return_type).*.kind == types_store.Kind.anytype_type {
         const inferred_return = genericBodyReturnType(builder, declaration, arguments_start, argument_count)
         if inferred_return != 0 { return_type = inferred_return }
     }
+    builder.*.bindings.*.length = bindings_length
+    builder.*.scopeOverride = saved_scope
+    builder.*.currentMethodOwner = saved_owner
+    const restored_salt = types_store.Store.setInstanceSalt(builder.*.typeStore, saved_salt)
     const function_type = types_store.Store.function(builder.*.typeStore, return_type, parameter_start, argument_count)
     const instance_id = builder.*.genericInstances.*.length
     const symbol_id = lir.addGenericModuleSymbol(builder.*.lir, target_module, symbol.*.namePointer, symbol.*.nameLength, instance_id)
@@ -839,21 +901,100 @@ fn ensureGenericInstance(builder: *LirBuilder, call_index: usize, symbol_index: 
         .argumentsStart = arguments_start,
         .argumentCount = argument_count,
         .functionTypeId = function_type,
+        .scopeAddress = instance_scope,
+        .ownerTypeId = owner_type,
+        .salt = instance_salt,
     }
     appendGenericInstance(builder, &instance)
     switchToModule(builder, caller_module)
     return instance_id
 }
 
+// The methods of the aggregates the generic type instances declared
+// (types.InstanceAggregate), those not generated yet: each in its
+// instance's module and scope, with the aggregate as `Self`. Whether any
+// was generated.
+fn lowerInstanceMethods(builder: *LirBuilder) -> bool {
+    var generated = false
+    var index: usize = 0
+    while index < types_store.Store.instanceAggregateCount(builder.*.typeStore) {
+        const record = types_store.Store.instanceAggregateAt(builder.*.typeStore, index)
+        index += 1
+        if record.*.lowered { continue }
+        record.*.lowered = true
+        generated = true
+        const instance = types_store.Store.instanceAt(builder.*.typeStore, record.*.instance)
+        const saved_module = builder.*.currentModuleId
+        const saved_scope = builder.*.scopeOverride
+        const saved_owner = builder.*.currentMethodOwner
+        const saved_generic = builder.*.currentGenericInstance
+        const saved_salt = types_store.Store.setInstanceSalt(builder.*.typeStore, record.*.instance + 1)
+        const saved_owner_name = builder.*.ownerNamePointer
+        const saved_owner_name_length = builder.*.ownerNameLength
+        switchToModule(builder, instance.*.moduleId)
+        builder.*.scopeOverride = instance.*.scopeAddress
+        builder.*.currentMethodOwner = record.*.typeId
+        builder.*.currentGenericInstance = lir.NONE
+        setOwnerName(builder, record.*.typeId)
+        const nodes = getNodes(builder)
+        const aggregate = ast_store.Store.get(nodes, record.*.node)
+        var member = aggregate.lhs
+        var visited: usize = 0
+        while member != ast.NONE && visited < aggregate.rhs {
+            const value = ast_store.Store.get(nodes, member)
+            if value.tag == ast.Tag.function_declaration && !isGenericDeclaration(nodes, member) { lowerFunction(builder, member) }
+            member = value.next
+            visited += 1
+        }
+        builder.*.ownerNamePointer = saved_owner_name
+        builder.*.ownerNameLength = saved_owner_name_length
+        builder.*.scopeOverride = saved_scope
+        builder.*.currentMethodOwner = saved_owner
+        builder.*.currentGenericInstance = saved_generic
+        const restored = types_store.Store.setInstanceSalt(builder.*.typeStore, saved_salt)
+        switchToModule(builder, saved_module)
+    }
+    return generated
+}
+
+// The name the methods of `type_id` carry in the executable's symbol
+// table (`Box(u32).get`): written once, kept for the compilation.
+fn setOwnerName(builder: *LirBuilder, type_id: usize) -> void {
+    const limit: usize = 120
+    const memory = builder.*.allocator.alloc(limit, 1)
+    if memory == null {
+        builder.*.ownerNameLength = 0
+        return
+    }
+    const text = memory.?
+    var length: usize = 0
+    type_names.write(builder.*.typeStore, builder.*.symbolStore, type_id, text, &length, limit)
+    builder.*.ownerNamePointer = text
+    builder.*.ownerNameLength = length
+}
+
 pub fn generateGenericInstances(builder: *LirBuilder) -> void {
     const saved_module = builder.*.currentModuleId
-    var instance_index: usize = 0
-    while instance_index < builder.*.genericInstances.*.length {
-        const instance = genericInstanceAt(builder, instance_index)
-        switchToModule(builder, instance.*.moduleId)
-        builder.*.currentGenericInstance = instance_index
-        lowerFunction(builder, instance.*.declaration)
-        instance_index += 1
+    var progress = true
+    while progress {
+        progress = lowerInstanceMethods(builder)
+        while builder.*.generatedGenericInstances < builder.*.genericInstances.*.length {
+            const instance_index = builder.*.generatedGenericInstances
+            builder.*.generatedGenericInstances += 1
+            progress = true
+            const instance = genericInstanceAt(builder, instance_index)
+            switchToModule(builder, instance.*.moduleId)
+            builder.*.currentGenericInstance = instance_index
+            const saved_scope = builder.*.scopeOverride
+            const saved_owner = builder.*.currentMethodOwner
+            const saved_salt = types_store.Store.setInstanceSalt(builder.*.typeStore, instance.*.salt)
+            if instance.*.scopeAddress != 0 { builder.*.scopeOverride = instance.*.scopeAddress }
+            if instance.*.ownerTypeId != 0 { builder.*.currentMethodOwner = instance.*.ownerTypeId }
+            lowerFunction(builder, instance.*.declaration)
+            builder.*.scopeOverride = saved_scope
+            builder.*.currentMethodOwner = saved_owner
+            const restored = types_store.Store.setInstanceSalt(builder.*.typeStore, saved_salt)
+        }
     }
     builder.*.currentGenericInstance = lir.NONE
     switchToModule(builder, saved_module)
@@ -1182,8 +1323,16 @@ fn emitDefersTo(builder: *LirBuilder, depth: usize) -> void {
 }
 
 fn currentScope(builder: *LirBuilder) -> *scope_module.Scope {
+    if builder.*.scopeOverride != 0 {
+        unsafe { return @ptrFromInt(*scope_module.Scope, builder.*.scopeOverride) }
+    }
     const module = loader_module.Loader.moduleAt(builder.*.loader, builder.*.currentModuleId)
     unsafe { return @ptrFromInt(*scope_module.Scope, module.*.scopeAddress) }
+}
+
+fn hasScope(builder: *LirBuilder) -> bool {
+    if builder.*.scopeOverride != 0 { return true }
+    return loader_module.Loader.moduleAt(builder.*.loader, builder.*.currentModuleId).*.scopeAddress != 0
 }
 
 fn resolveCurrentMethodType(builder: *LirBuilder, node_index: usize) -> usize {
@@ -1242,6 +1391,43 @@ fn resolveTypeNodeUncached(builder: *LirBuilder, node_index: usize) -> usize {
             return 0
         }
     }
+    // A type written over names bound here (`[*]T`, `?*T`, `[]const T`,
+    // `[N]T` with T a comptime type parameter): built from its parts,
+    // each resolved the same way.
+    if node.tag == ast.Tag.pointer_type || node.tag == ast.Tag.many_pointer_type {
+        const child = resolveTypeNode(builder, node.lhs)
+        if child == 0 { return 0 }
+        return types_store.Store.pointer(builder.*.typeStore, child, node.extra & 1 != 0, node.extra & 2 != 0, node.tag == ast.Tag.many_pointer_type)
+    }
+    if node.tag == ast.Tag.slice_type {
+        const child = resolveTypeNode(builder, node.lhs)
+        if child == 0 { return 0 }
+        return types_store.Store.slice(builder.*.typeStore, child, node.extra & 1 != 0)
+    }
+    if node.tag == ast.Tag.optional_type {
+        const child = resolveTypeNode(builder, node.lhs)
+        if child == 0 { return 0 }
+        return types_store.Store.optional(builder.*.typeStore, child)
+    }
+    if node.tag == ast.Tag.nocopy_type && node.lhs != ast.NONE && ast_store.Store.get(getNodes(builder), node.lhs).tag != ast.Tag.struct_type && ast_store.Store.get(getNodes(builder), node.lhs).tag != ast.Tag.enum_type && ast_store.Store.get(getNodes(builder), node.lhs).tag != ast.Tag.union_type {
+        const child = resolveTypeNode(builder, node.lhs)
+        if child == 0 { return 0 }
+        return types_store.Store.noCopy(builder.*.typeStore, child)
+    }
+    if node.tag == ast.Tag.array_type && node.lhs != ast.NONE {
+        const child = resolveTypeNode(builder, node.rhs)
+        if child == 0 { return 0 }
+        const length = lowerComptimeValue(builder, node.lhs)
+        if length.kind != comptime_value.Kind.integer || length.integer < 0 { return 0 }
+        return types_store.Store.array(builder.*.typeStore, child, @intCast(usize, length.integer))
+    }
+    if node.tag == ast.Tag.error_union_type && node.lhs != ast.NONE {
+        const payload = resolveTypeNode(builder, node.rhs)
+        const errors = resolveTypeNode(builder, node.lhs)
+        if payload == 0 || errors == 0 { return 0 }
+        return types_store.Store.errorUnion(builder.*.typeStore, errors, payload)
+    }
+    if node.tag == ast.Tag.call_expression { return instantiateTypeCall(builder, node_index) }
     unsafe {
         return declarations.resolveType(
             builder.*.sourcePointer[0..builder.*.sourceLength],
@@ -1252,6 +1438,55 @@ fn resolveTypeNodeUncached(builder: *LirBuilder, node_index: usize) -> usize {
             builder.*.symbolStore,
             currentScope(builder),
             node_index,
+        )
+    }
+}
+
+// `Box(u32)` where the lowering resolves a type (a generic function's
+// body, whose comptime parameters are bindings here, not symbols): the
+// arguments evaluated here, the instance made by sema's rules
+// (declarations.instantiateType), found again when it exists.
+fn instantiateTypeCall(builder: *LirBuilder, node_index: usize) -> usize {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    const referenced = referencedSymbolIndex(builder, node.lhs)
+    if !referenced.0 { return 0 }
+    const symbol = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
+    if !declarations.isTypeFunction(builder.*.typeStore, symbol) { return 0 }
+    var arguments: [8]types_store.InstanceArgument = undefined
+    var count: usize = 0
+    var argument = node.rhs
+    while argument != ast.NONE && count < node.extra {
+        if count >= 8 { return 0 }
+        const type_value = resolveTypeNode(builder, argument)
+        if type_value != 0 {
+            arguments[count] = types_store.InstanceArgument.{ .kind = @intCast(u8, @intFromEnum(comptime_value.Kind.type_value)), .typeId = type_value, .integer = 0 }
+        } else {
+            const known = lowerComptimeValue(builder, argument)
+            if known.kind == comptime_value.Kind.integer || known.kind == comptime_value.Kind.boolean {
+                arguments[count] = types_store.InstanceArgument.{ .kind = @intCast(u8, @intFromEnum(known.kind)), .typeId = 0, .integer = known.integer }
+            } else if known.kind == comptime_value.Kind.type_value && known.typeId != 0 {
+                arguments[count] = types_store.InstanceArgument.{ .kind = @intCast(u8, @intFromEnum(comptime_value.Kind.type_value)), .typeId = known.typeId, .integer = 0 }
+            } else {
+                return 0
+            }
+        }
+        argument = ast_store.Store.get(getNodes(builder), argument).next
+        count += 1
+    }
+    if count != node.extra { return 0 }
+    unsafe {
+        return declarations.instantiateType(
+            builder.*.sourcePointer[0..builder.*.sourceLength],
+            "",
+            getTokens(builder).*,
+            getNodes(builder),
+            builder.*.typeStore,
+            builder.*.symbolStore,
+            currentScope(builder),
+            referenced.1,
+            &arguments,
+            count,
+            node,
         )
     }
 }
@@ -1431,6 +1666,7 @@ fn addFunctionSymbol(builder: *LirBuilder, symbol_index: usize, name_ptr: [*]con
     } else {
         lir.addMethodSymbol(builder.*.lir, builder.*.currentModuleId, owner_type, name_ptr, name_len)
     }
+    if owner_type != 0 && builder.*.ownerNameLength != 0 { lir.setSymbolOwner(builder.*.lir, lir_symbol, builder.*.ownerNamePointer, builder.*.ownerNameLength) }
     if symbol_index != lir.NONE { recordLinkage(builder, lir_symbol, symbols_store.Store.get(builder.*.symbolStore, symbol_index)) }
     if symbol_index != lir.NONE && symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] = lir_symbol }
     return lir_symbol
@@ -2645,9 +2881,20 @@ fn extendAsType(builder: *LirBuilder, value: usize, source_type_id: usize, resul
     if source_type_id == 0 || result_type_id == 0 { return value }
     const source_type = types_store.Store.get(builder.*.typeStore, source_type_id)
     const result_type = types_store.Store.get(builder.*.typeStore, result_type_id)
-    if source_type.*.kind != types_store.Kind.integer || result_type.*.kind != types_store.Kind.integer { return value }
+    if result_type.*.kind != types_store.Kind.integer { return value }
     const bits = integerBitWidth(builder, result_type_id)
     const result_signed = result_type.*.flags & types_store.FLAG_SIGNED != 0
+    // The bits of a float moved to a general register (`@bitCast(u32,
+    // f32_value)`) come with whatever the register's high half held: a
+    // narrow result is extended as its type says.
+    if source_type.*.kind == types_store.Kind.float || source_type.*.kind == types_store.Kind.comptime_float_type {
+        if bits >= 64 { return value }
+        if !result_signed { return maskInteger(builder, value, result_type_id) }
+        const float_shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 64 - bits))
+        const float_raised = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shl, result_type_id, value, float_shift))
+        return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, result_type_id, float_raised, float_shift))
+    }
+    if source_type.*.kind != types_store.Kind.integer { return value }
     if bits >= 64 || bits > integerBitWidth(builder, source_type_id) || result_signed == (source_type.*.flags & types_store.FLAG_SIGNED != 0) { return value }
     if !result_signed { return maskInteger(builder, value, result_type_id) }
     const shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 64 - bits))
@@ -2768,11 +3015,16 @@ fn referencedSymbolIndex(builder: *LirBuilder, node_index: usize) -> (bool, usiz
     if node_index == ast.NONE { return -> (false, 0) }
     const nodes = getNodes(builder)
     const node = ast_store.Store.get(nodes, node_index)
-    const module = loader_module.Loader.moduleAt(builder.*.loader, builder.*.currentModuleId)
-    if module.*.scopeAddress == 0 { return -> (false, 0) }
+    if !hasScope(builder) { return -> (false, 0) }
     unsafe {
-        const scope = @ptrFromInt(*scope_module.Scope, module.*.scopeAddress)
+        const scope = currentScope(builder)
         if node.tag == ast.Tag.identifier || node.tag == ast.Tag.named_type {
+            // In a method, a bare name is first a member of the owner (a
+            // helper function, a constant), as its scope has it.
+            if builder.*.currentMethodOwner != lir.NONE {
+                const member_index = aggregateMethodIndex(builder, builder.*.currentMethodOwner, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+                if member_index != lir.NONE { return -> (true, member_index) }
+            }
             return scope_module.Scope.lookup(scope, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
         }
         if node.tag == ast.Tag.field_expression && node.lhs != ast.NONE {
@@ -2782,6 +3034,22 @@ fn referencedSymbolIndex(builder: *LirBuilder, node_index: usize) -> (bool, usiz
                 const base_length = tokenLength(builder, base_node.mainToken)
                 if base_length == 4 && mem.eql(base_pointer, @ptrCast([*]const u8, "Self"), 4) {
                     const method_index = aggregateMethodIndex(builder, builder.*.currentMethodOwner, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+                    return -> (method_index != lir.NONE, method_index)
+                }
+            }
+            // `Box(u32).init(...)`, and `T.init(...)` on a comptime type
+            // parameter: a method of the type the base stands for.
+            var base_type_value: usize = 0
+            if base_node.tag == ast.Tag.call_expression {
+                base_type_value = resolveTypeNode(builder, node.lhs)
+            } else if base_node.tag == ast.Tag.identifier || base_node.tag == ast.Tag.named_type {
+                const base_binding = findBindingRecord(builder, tokenPointer(builder, base_node.mainToken), tokenLength(builder, base_node.mainToken))
+                if @intFromPtr(base_binding) != 0 && base_binding.*.valueTypeId != 0 { base_type_value = base_binding.*.valueTypeId }
+            }
+            if base_type_value != 0 {
+                const base_value = types_store.Store.get(builder.*.typeStore, base_type_value)
+                if base_value.*.kind == types_store.Kind.struct_type || base_value.*.kind == types_store.Kind.enum_type || base_value.*.kind == types_store.Kind.union_type {
+                    const method_index = aggregateMethodIndex(builder, base_type_value, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
                     return -> (method_index != lir.NONE, method_index)
                 }
             }
@@ -2865,7 +3133,7 @@ fn aggregateTypeFromPrefix(builder: *LirBuilder, node_index: usize) -> usize {
         }
     }
     const referenced = referencedSymbolIndex(builder, node_index)
-    if !referenced.0 { return 0 }
+    if !referenced.0 { return resolveTypeNode(builder, node_index) }
     return symbols_store.Store.get(builder.*.symbolStore, referenced.1).*.valueTypeId
 }
 
@@ -2894,7 +3162,10 @@ fn fieldMetadata(builder: *LirBuilder, type_id: usize, field_token: usize) -> Fi
 fn expressionType(builder: *LirBuilder, node_index: usize) -> usize {
     if node_index == ast.NONE { return 0 }
     builder.*.expressionTypeQueries += 1
-    const cacheable = builder.*.currentGenericInstance == lir.NONE && node_index < builder.*.typeCacheCapacity
+    // A node's type is the same wherever it is lowered, except in a
+    // generic function's instances and in a generic type instance's methods
+    // (scopeOverride): the same nodes, another T.
+    const cacheable = builder.*.currentGenericInstance == lir.NONE && builder.*.scopeOverride == 0 && node_index < builder.*.typeCacheCapacity
     const cache = typeCacheEntry(builder, node_index)
     const module_key = @intCast(u32, builder.*.currentModuleId + 1)
     if cacheable && cache.*.expressionModule == module_key {
@@ -2951,6 +3222,9 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
     if node.tag == ast.Tag.call_expression {
         const referenced = referencedSymbolIndex(builder, node.lhs)
         var function_type_id: usize = 0
+        if referenced.0 && declarations.isTypeFunction(builder.*.typeStore, symbols_store.Store.get(builder.*.symbolStore, referenced.1)) {
+            return types_store.Store.primitive(builder.*.typeStore, types_store.Kind.type_type)
+        }
         if referenced.0 {
             const instance_id = ensureGenericInstance(builder, node_index, referenced.1)
             if instance_id != lir.NONE {
@@ -3230,10 +3504,9 @@ fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
     if base_node.tag == ast.Tag.identifier || base_node.tag == ast.Tag.named_type {
         const name_pointer = tokenPointer(builder, base_node.mainToken)
         const name_length = tokenLength(builder, base_node.mainToken)
-        const module = loader_module.Loader.moduleAt(builder.*.loader, builder.*.currentModuleId)
-        if module.*.scopeAddress != 0 {
+        if hasScope(builder) {
             unsafe {
-                const scope = @ptrFromInt(*scope_module.Scope, module.*.scopeAddress)
+                const scope = currentScope(builder)
                 const base_found = scope_module.Scope.lookup(scope, name_pointer, name_length)
                 if base_found.0 {
                     const base_symbol = symbols_store.Store.get(builder.*.symbolStore, base_found.1)
@@ -3338,10 +3611,17 @@ fn lowerIdentifier(builder: *LirBuilder, main_token: usize) -> usize {
         return primary
     }
 
-    const module = loader_module.Loader.moduleAt(builder.*.loader, builder.*.currentModuleId)
-    if module.*.scopeAddress != 0 {
+    if builder.*.currentMethodOwner != lir.NONE {
+        const member_index = aggregateMethodIndex(builder, builder.*.currentMethodOwner, name_ptr, name_len)
+        if member_index != lir.NONE {
+            const member = symbols_store.Store.get(builder.*.symbolStore, member_index)
+            const value = lowerSymbolValue(builder, member_index, member, moduleForSymbol(builder, member_index))
+            if value != lir.NONE { return value }
+        }
+    }
+    if hasScope(builder) {
         unsafe {
-            const scope = @ptrFromInt(*scope_module.Scope, module.*.scopeAddress)
+            const scope = currentScope(builder)
             const found_symbol = scope_module.Scope.lookup(scope, name_ptr, name_len)
             if found_symbol.0 {
                 const symbol = symbols_store.Store.get(builder.*.symbolStore, found_symbol.1)
@@ -4090,6 +4370,18 @@ fn expandInlineCall(builder: *LirBuilder, candidate: inline_module.Candidate, sy
     const function_type = symbol.*.typeId
     switchToModule(builder, candidate.moduleId)
     builder.*.currentMethodOwner = if symbol.*.ownerTypeId != 0 { symbol.*.ownerTypeId } else { lir.NONE }
+    // A method of a generic type instance's aggregate expands in that
+    // instance's scope, with its salt.
+    const saved_scope = builder.*.scopeOverride
+    var inline_salt: usize = 0
+    if symbol.*.ownerTypeId != 0 {
+        const declaring = types_store.Store.instanceDeclaring(builder.*.typeStore, symbol.*.ownerTypeId)
+        if declaring != types_store.NONE {
+            builder.*.scopeOverride = types_store.Store.instanceAt(builder.*.typeStore, declaring).*.scopeAddress
+            inline_salt = declaring + 1
+        }
+    }
+    const saved_salt = types_store.Store.setInstanceSalt(builder.*.typeStore, inline_salt)
     pushInlineSymbol(builder, symbol_index)
     const declaration = ast_store.Store.get(getNodes(builder), candidate.declaration)
     var parameter = declaration.lhs
@@ -4105,6 +4397,8 @@ fn expandInlineCall(builder: *LirBuilder, candidate: inline_module.Candidate, sy
     builder.*.bindingComponents.*.length = saved_components
     builder.*.inlineStack.*.length -= 1
     builder.*.currentMethodOwner = saved_owner
+    builder.*.scopeOverride = saved_scope
+    const restored_salt = types_store.Store.setInstanceSalt(builder.*.typeStore, saved_salt)
     switchToModule(builder, caller_module)
     builder.*.inlinedCallCount += 1
     return result
@@ -5099,9 +5393,40 @@ fn lowerLocalBinding(builder: *LirBuilder, node_index: usize) -> usize {
         findBindingRecord(builder, name_ptr, name_len).*.frameStorage = true
         builder.*.frameStorageCount += 1
     }
+    // A `const` bool made of literals, of such constants and of the type
+    // predicates (`const boxed = @isInteger(T)`) is known at compile time
+    // here as sema knows it: an `if` on it takes one branch in both.
+    if n.tag == ast.Tag.constant_declaration && component_count == 1 && types_store.Store.get(builder.*.typeStore, local_type).*.kind == types_store.Kind.bool_type && isLocalComptimeExpression(builder, n.rhs) {
+        const known = lowerComptimeValue(builder, n.rhs)
+        if known.kind == comptime_value.Kind.boolean {
+            const record = findBindingRecord(builder, name_ptr, name_len)
+            record.*.comptimeTag = @intCast(u8, @intFromEnum(known.kind))
+            record.*.comptimeInteger = known.integer
+        }
+    }
     if component_count > 0 { appendAutoDrop(builder, node_index, bindingComponentAt(builder, components_start), local_type) }
 
     return lir.NONE
+}
+
+// An expression of literals, of locals known at compile time and of the
+// type reflection builtins alone: its value is the same here as sema has
+// it (a name of the module's scope could be shadowed by a local).
+fn isLocalComptimeExpression(builder: *LirBuilder, node_index: usize) -> bool {
+    if node_index == ast.NONE { return false }
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.integer_literal || node.tag == ast.Tag.boolean_literal || node.tag == ast.Tag.character_literal { return true }
+    if node.tag == ast.Tag.identifier {
+        const binding = findBindingRecord(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+        return @intFromPtr(binding) != 0 && (binding.*.comptimeTag == @intCast(u8, @intFromEnum(comptime_value.Kind.integer)) || binding.*.comptimeTag == @intCast(u8, @intFromEnum(comptime_value.Kind.boolean)))
+    }
+    if node.tag == ast.Tag.unary_expression { return isLocalComptimeExpression(builder, node.lhs) }
+    if node.tag == ast.Tag.binary_expression { return isLocalComptimeExpression(builder, node.lhs) && isLocalComptimeExpression(builder, node.rhs) }
+    if node.tag == ast.Tag.builtin_call {
+        const kind = builtins.lookup(builder.*.sourcePointer[0..builder.*.sourceLength], getTokens(builder).*, node.mainToken)
+        return kind == builtins.Kind.sizeOf || kind == builtins.Kind.alignOf || kind == builtins.Kind.bitSizeOf || kind == builtins.Kind.fieldCount || kind == builtins.Kind.isInteger || kind == builtins.Kind.isFloat || kind == builtins.Kind.isBool || kind == builtins.Kind.isSigned || kind == builtins.Kind.isStruct || kind == builtins.Kind.isTuple || kind == builtins.Kind.isEnum || kind == builtins.Kind.isUnion || kind == builtins.Kind.isPointer || kind == builtins.Kind.isSlice || kind == builtins.Kind.isArray || kind == builtins.Kind.isOptional || kind == builtins.Kind.isErrorUnion || kind == builtins.Kind.isCopyable
+    }
+    return false
 }
 
 fn lowerAddressOf(builder: *LirBuilder, node_index: usize) -> usize {
