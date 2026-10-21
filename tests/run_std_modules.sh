@@ -135,6 +135,7 @@ run 374_xml_sax_runtime "XML parsed as libxml2's push parser parses it: SAX2 eve
 run 375_fontconfig_runtime "Fontconfig's case folding, names and substitutions; fonts read, cached, matched, sorted and listed as Fontconfig 2.15 does"
 run 376_http_auth_runtime "HTTP authentication: challenges told apart, Basic tokens, Digest responses (RFC 2617's example) and Authorization values"
 run 377_http_cookies_runtime "cookies read with libsoup's rules, written back and matched; a jar's policies, SameSite, prefixes, expiry, third parties and cookies.txt"
+run 378_http_hsts_runtime "HSTS: Strict-Transport-Security read strictly, policies and their expiry, an enforcer's hosts and subdomains, its changes and file"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

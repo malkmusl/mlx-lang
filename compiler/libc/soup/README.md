@@ -39,7 +39,7 @@ hand. Every function the headers declare is defined by the library
 | `feature.mlx` | `soup-session-feature.h`: the feature interface and content processors |
 | `auth.mlx`, `authmanager.mlx` | `soup-auth.h`, `soup-auth-manager.h`: SoupAuth's objects over `std.http.auth` (Basic and Digest: MD5, MD5-sess, qop auth; the challenges told apart), the manager's cache, retries and pausing for an answer |
 | `decoder.mlx`, `sniffer.mlx` | `soup-content-decoder.h`, `soup-content-sniffer.h`: gzip and deflate; MIME sniffing (`std.http.sniff`) |
-| `hsts.mlx` | `soup-hsts-*.h`: policies, the enforcer, its file |
+| `hsts.mlx` | `soup-hsts-*.h`: SoupHSTSPolicy in libsoup's layout and SoupHSTSEnforcer as the GObject around `std.http.hsts` (the policies, which hosts go over https, the file) |
 | `logger.mlx` | `soup-logger.h`: SoupLogger's lines as libsoup writes them |
 | `multipart.mlx` | `soup-multipart*.h`: whole multipart bodies, and the stream of parts |
 | `websocket.mlx`, `wsext.mlx` | `soup-websocket*.h`: the handshake, SoupWebsocketConnection (`std.http.websocket`), the extensions with permessage-deflate, the session's WebSocket connections |

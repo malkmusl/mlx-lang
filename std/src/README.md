@@ -82,7 +82,9 @@ cookies.txt file; test 377), `http/status.mlx` (reason phrases),
 `http/sniff.mlx` (MIME sniffing, the WHATWG standard's rules),
 `http/websocket.mlx` (RFC 6455's keys, frame headers, masking, UTF-8),
 `http/auth.mlx` (RFC 7235's challenges told apart, Basic tokens, Digest
-responses and Authorization values; test 376)
+responses and Authorization values; test 376), `http/hsts.mlx` (RFC
+6797: Strict-Transport-Security read strictly, an enforcer's policies
+and which hosts go over https, their file; test 378)
 and `http/psl.mlx` with `http/psldata.mlx` (the Public Suffix List, made
 by `./mlx build http-psl` from `std/registry/publicsuffix`). Tests 370
 and 371 check them.

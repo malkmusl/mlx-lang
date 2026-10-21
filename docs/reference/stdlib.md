@@ -1586,6 +1586,25 @@ change).
 mlx-soup's SoupCookie, SoupCookieJar, SoupCookieJarText and
 SoupCookieJarDB are over these modules.
 
+### Strict Transport Security (`std.http.hsts`)
+
+`std/src/http/hsts.mlx` is HSTS (RFC 6797) as libsoup's enforcer keeps
+it. A `Policy` is a domain, its max-age, its expiry (none for a session
+policy) and whether it covers subdomains (`policy(domain, maxAge,
+includeSubdomains, now)`, `sessionPolicy`, `policyWithExpiry`,
+`isSession`, `isExpired`, `equal`, `own`/`policyFree`);
+`parseHeader(value, host, now, &out)` reads a Strict-Transport-Security
+value strictly (max-age in digits, quoted or not; includeSubDomains
+without a value; no parameter twice). An `Enforcer` (`init`, `deinit`,
+`onChanged`) keeps host and session policies: `setPolicy` (an expired
+one removes the domain's; a changed one is told), `setSessionPolicy`,
+`hasValidPolicy`, `includesSubdomains`, `superDomain`, `mustEnforce`
+(the host or a domain above it with a policy covering subdomains),
+`policyAt`; its file is a line per host policy (`writeText`, `loadText`,
+`parseTextLine`). `tests/378_http_hsts_runtime.mlx` checks the headers
+of mlx-soup's `tests/hsts.c` and the enforcer's answers; mlx-soup's
+SoupHSTSPolicy, SoupHSTSEnforcer and SoupHSTSEnforcerDB are over it.
+
 ## Networking (`std.net`) — not yet normative
 
 **Normative source:** none (see gap below)
