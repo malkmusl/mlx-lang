@@ -1,23 +1,20 @@
-// A null pointer constant `0` bound to `T *const &` (a temporary), so
-// `fill(const T &)` is viable beside `fill(const T &, size_t)`: WTF's
-// Vector<RenderTableCell *>::fill(0) in AutoTableLayout.
+// A null pointer constant binds a const reference to a pointer (through
+// the null pointer it makes): Vector<RenderTableCell *>::fill(0) is
+// fill(const T &), not fill(const T &, size_t) (WebCore's AutoTableLayout).
 #include <cstdio>
 #include <cstddef>
+struct Cell { int v; };
 template<typename T> struct Vec {
     T items[3];
-    void fill(const T&, size_t);
-    void fill(const T& val) { fill(val, 3); }
+    size_t m_size = 3;
+    size_t size() const { return m_size; }
+    void fill(const T& val, size_t newSize) { for (size_t i = 0; i < newSize; ++i) items[i] = val; }
+    void fill(const T& val) { fill(val, size()); }
 };
-template<typename T> void Vec<T>::fill(const T& val, size_t n) { for (size_t i = 0; i < n; ++i) items[i] = val; }
-struct Cell { };
-void take(Cell* const& p) { std::printf("%d\n", p == nullptr); }
 int main() {
+    Cell c { 1 };
     Vec<Cell*> v;
-    Cell c;
     v.fill(&c);
-    std::printf("%d\n", v.items[2] == &c);
     v.fill(0);
-    std::printf("%d\n", v.items[2] == nullptr);
-    take(0);
-    return 0;
+    printf("%d\n", v.items[2] == nullptr);
 }
