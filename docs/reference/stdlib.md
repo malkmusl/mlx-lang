@@ -161,8 +161,19 @@ compositor's shell module is, is named through `/proc/self/fd`) and keeps
 the crash in
 `$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
 way for a failure it cannot go on after. The report goes to stderr. Every
-desktop program, every coreutil and mlxlibc (for the programs its loader
-starts) install it. `std.wayland.crash.watch(display)`
+program `build.mlx` declares installs it first thing in `main` (the
+desktop, the services, the tools and examples, the toolchain: `mlx-cc`,
+`mlx-ar`, `mlx-cheaders`, the Mlx compiler `mlx4` itself and the `mlx
+build` runner, the generators; every coreutil), and mlxlibc for the
+programs its loader starts; `tools/check_crash_report.sh` holds every
+program to it (the Android packages are the exception: their entry is the
+activity's, and the handler is x86-64's). `context(text)` and
+`contextAt(what, path, line)` say what the program is doing, and the
+report says it after the reason ("  while compiling src/foo.c:12", and
+", while ..." with the reason in `crashes.log`): `mlx-cc` says the file
+and the line of the declaration it reads, `mlx4` the phase and the module
+it lowers, the build runner the step it checks, starts or finishes.
+`std.wayland.crash.watch(display)`
 (`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
 such a failure (`tools/check_crash_report.sh` holds every client to it).
 The handler's own values come from the compiler's value arena too: when a
