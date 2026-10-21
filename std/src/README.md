@@ -25,6 +25,11 @@ server runtimes. `wayland/generated/` holds the modules materialized from
 name and are not re-exported from `std.mlx`.
 
 `json.mlx` (`std.json`) is the allocation-free JSON pull tokenizer.
+`heap.mlx` (`std.heap`) is the program's heap: `std.heap.allocator()`,
+one general-purpose allocator over the page allocator for the whole
+process (its state in the tiny-page region every image shares), made on
+first use, wrapped in the debug allocator under MLX_LEAK_CHECK (test
+390).
 `hash.mlx` (`std.hash`) has wyhash (final version 4.3) for bytes,
 `hashWord` and `combine`, `autoHash`/`autoEql` derived from a value's
 type by reflection, and the `StringContext` the containers take (test
