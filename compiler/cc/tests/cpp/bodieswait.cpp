@@ -49,6 +49,16 @@ struct Derived : Base {
     int helper() const { return 2; }
 };
 
+// A static member of a class template's instance only a body nothing
+// uses would have made whole: made whole for its definition.
+template <class T> struct Wrap { T v; };
+struct Options {
+    enum class Kind : unsigned short { A = 1, B = 2 };
+    using Set = Wrap<Kind>;
+    static constexpr Set defaults = { Kind::B };
+    int kind() const { Set s = defaults; return (int)s.v; }
+};
+
 inline int recursive(int n) { return n <= 1 ? 1 : n * recursive(n - 1); }
 inline int mutualB(int);
 inline int mutualA(int n) { return n == 0 ? 0 : 1 + mutualB(n - 1); }
