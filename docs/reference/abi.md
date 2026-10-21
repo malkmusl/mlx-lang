@@ -193,6 +193,18 @@ none) and an optional slice was one word, so its length was lost on the way
 generated Wayland requests (`wl_data_offer.accept`) are such optional
 slices.
 
+An optional of anything but a pointer, a function, a slice or a float is
+tagged: the payload and then a tag, 1 when a value is present. In
+registers the tag is the word after the payload's (`?u32` and `?usize`
+are two words, returned in `rax` and `rdx`); in memory it is the byte
+after the payload's bytes (`@sizeOf(?u32)` is 5, `@sizeOf(?u8)` 2, at the
+payload's alignment), so a `?usize` holding 0 is not null and zeroed
+memory is null. An optional struct, union or array is a memory value like
+its payload: its address, the payload at offset 0 and the tag byte after
+it. `null` becomes the absent value wherever one is wanted, `== null`
+reads the tag, `.?` the payload (`tests/394_optional_zero_runtime.mlx`).
+An optional pointer stays the pointer, null being 0.
+
 A local of several words (a slice, an optional slice, an error union)
 normally lives in one frame slot per word, which the optimizer forwards
 and promotes to registers. When the module takes the local's address

@@ -7,7 +7,11 @@
 `107_comptime_type_generic_runtime.mlx`, `108_comptime_value_generic_runtime.mlx`,
 `109_comptime_argument_runtime_dependency.mlx`, `110_generic_dependent_type_range.mlx`,
 `111_generic_type_return_runtime.mlx`, `112_comptime_if_pruning_runtime.mlx`,
-`171_imported_generic_runtime.mlx`, `support/generic_identity.mlx`
+`171_imported_generic_runtime.mlx`, `support/generic_identity.mlx`,
+`386_generic_aggregate_runtime.mlx`, `387_generic_containers_runtime.mlx`,
+`388_generic_imported_runtime.mlx`, `support/generic_stack.mlx`,
+`391_generic_signature_types_runtime.mlx`, `392_generic_type_argument_runtime.mlx`,
+`395_generic_type_argument_error.mlx`, `396_generic_local_alias_runtime.mlx`
 
 Mlx has no separate template/macro system. Generics are ordinary functions
 whose parameters (or whose parameter *types*) are known at compile time,
@@ -96,6 +100,103 @@ fn main() u8 {
 ```
 
 (`tests/111_generic_type_return_runtime.mlx`)
+
+## Generic aggregate types
+
+A function returning `type` may return a `struct`, `union`, `enum` or
+`@noncopy(struct)` written in its body. Each distinct list of comptime
+arguments is one instance of it: `Box(u32)` named anywhere is the same
+type, `Box(u8)` another. The function's parameters are in scope in the
+aggregate's fields, constants and methods, so are the constants the body
+declares before `return`:
+
+```mlx
+fn Box(comptime T: type) -> type {
+    return struct {
+        value: T
+        count: usize
+
+        const WIDTH: usize = @sizeOf(T)
+
+        fn double(value: T) -> T { return value * 2 }
+
+        pub fn init(value: T) -> Self { return Self.{ .value = value, .count = 1 } }
+        pub fn get(self: Self) -> T { return self.value }
+        pub fn bump(self: *Self) -> void { self.*.count += 1 }
+        pub fn doubled(self: *Self) -> T { return double(self.*.value) }
+
+        pub fn describe(self: *Self) -> u8 {
+            if @isInteger(T) { return 1 } else { return @compileError("only integers are boxed here") }
+        }
+
+        pub fn as(self: *Self, comptime U: type) -> U { return @intCast(U, self.*.value) }
+    }
+}
+
+const Pair = struct {
+    small: Box(u8)
+    wide: Box(u32)
+}
+
+fn sum(boxes: [2]Box(u8)) -> u8 { return boxes[0].get() + boxes[1].get() }
+
+fn through(box: *Box(u32)) -> *Box(u32) {
+    box.bump()
+    return box
+}
+
+fn maybe(present: bool) -> ?Box(u8) {
+    if present { return Box(u8).init(3) }
+    return null
+}
+
+fn make(comptime T: type, value: T) -> Box(T) { return Box(T).init(value) }
+
+fn main() -> u8 {
+    const Wide = Box(u32)
+    var a = Wide.init(20)
+    a.bump()
+    Box(u32).bump(&a)
+    ...
+}
+```
+
+(`tests/386_generic_aggregate_runtime.mlx`, abridged; the file holds the
+checks)
+
+The body of such a function is constants, `if`s whose condition is known
+at compile time, and a `return` of a type; a runtime value as an argument
+is rejected with MLX-E5001 (`tests/395_generic_type_argument_error.mlx`).
+A `comptime` `if` inside a method (`if @isInteger(T) { ... } else {
+@compileError(...) }`) is analyzed and generated for the branch taken
+alone, as the `if` expression of the previous section is. Instances are
+named for diagnostics by the call that made them, `Box(u32)`, and their
+methods in the executable's symbol table as `Box(u32).get`.
+
+An instance may be the element of another (`List(List(u8))`), the type of
+a field in a struct the body of another generic declares (`const Entry =
+struct { key: K, value: V }` and then `entries: List(Entry)`), and a
+method may return `?V` or `?*V` and take `[]const T`
+(`tests/387_generic_containers_runtime.mlx`, a list and a map over
+`std.allocator`). A generic type declared in one module is instantiated by
+the modules importing it, and a `comptime` integer parameter sizes an
+array field (`generic.Stack(u8, 4)`, `tests/388_generic_imported_runtime.mlx`
+with `tests/support/generic_stack.mlx`). Inside a function, `const Small =
+Box(u8)` binds an instance to a local name
+(`tests/396_generic_local_alias_runtime.mlx`).
+
+A type written over a comptime type parameter resolves in a generic
+*function* too, in its parameters, its result and its locals: `p: [*]T`,
+`values: []const T`, `-> ?T`, `-> *T`, `var items: [*]T`
+(`tests/391_generic_signature_types_runtime.mlx`). The type argument of a
+call need not be a name: `leaf(@childType(T), a[0], b[0])`, a constant
+bound to `@childType(T)`, `@typeOf(a[0])`, and locals declared `const x:
+@childType(T) = a[at]` all name the type they resolve to, evaluated in the
+caller's own instance (`tests/392_generic_type_argument_runtime.mlx`).
+
+Not supported: a generic type naming itself through a call inside its own
+body (`next: ?*List(T)`; write `?*Self`), and `var` declarations among an
+aggregate's members.
 
 ## `anytype`
 
