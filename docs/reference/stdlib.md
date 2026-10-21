@@ -1496,6 +1496,26 @@ above for what's actually exercised — `getTid`/`yield`/`futexWait`/
 `futexWake` through the raw syscall gateway, not a handle-based spawn/join
 API. No fixture calls `clone`/`clone3` to actually spawn an OS thread.
 
+## URIs (`std.uri`)
+
+**Normative source:** none yet (RFC 3986)
+
+`std/src/uri.mlx` splits a URI reference into its parts (`parse(text,
+&uri)`: scheme, userinfo, host with an IPv6 literal's brackets, port,
+path, query, fragment, each with whether it is there; a port that is not
+digits, a space, a control character or a broken `%XX` is refused),
+resolves a reference against a base (`resolve(&base, reference, out)`,
+RFC 3986 5.2 with `removeDotSegments`; 0 when it does not fit), writes a
+URI back (`write`, `writeNormalized` with the scheme and host in lower
+case and a default port left out, `writeTarget` for a request's path and
+query, `writeHostHeader`), knows the default ports (`portOf`,
+`defaultPort`, `usesDefaultPort`, `hostName`, `sameOrigin`, `isHttp`,
+`isHttps`), percent-codes (`decode` with `+` as a space when asked,
+`encode` with what to keep, `PATH_ALLOWED`, `QUERY_ALLOWED`) and walks a
+query's pairs (`nextPair`). It allocates nothing: a `Uri` borrows its
+text. `tests/380_uri_message_runtime.mlx` checks RFC 3986 5.4's
+examples among others.
+
 ## HTTP (`std.http.*`)
 
 **Normative source:** none yet (the modules follow libsoup's behaviour,
@@ -1508,6 +1528,24 @@ knows), `std.http.date`, `std.http.status`, `std.http.form`,
 `std.http.chunked`, `std.http.sniff`, `std.http.psl` (the Public Suffix
 List), `std.http.cookie` and `std.http.websocket` (see `std/src/README.md`
 for each). Tests 370 and 371 cover them.
+
+### Message heads (`std.http.message`)
+
+`std/src/http/message.mlx` reads and writes HTTP/1.1 heads as libsoup
+does: `parseRequestLine` (the status a bad one deserves: 400, 505),
+`parseStatusLine` (HTTP/1.x and Shoutcast's ICY, the version said even
+when the code is bad), `headerLines`/`headerLinesFrom` with `nextHeader`
+(continuation lines folded to one space, trailing spaces off, carriage
+returns made spaces, lines that are not headers passed over, a head cut
+short told by `truncated`), `headEnd` (past the blank line);
+`writeRequestLine`, `writeStatusLine`, `writeHeader`, `writeHeadEnd`;
+`framingOf` (chunked, Content-Length, to the connection's end, or no
+body), `responseHasNoBody`; and the rules of redirects as libsoup
+follows them (`redirectOf`: 303, and 302 of an unsafe method, and 301 of
+a POST as a GET; 301, 302, 307 and 308 of a safe method as they are;
+`isSafeMethod`, `MAX_REDIRECTS`). mlx-soup's soup_headers_parse,
+soup_headers_parse_request, soup_headers_parse_status_line and the
+session's redirect handler are over it; test 380 checks it.
 
 ### Authentication (`std.http.auth`)
 

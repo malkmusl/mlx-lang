@@ -84,7 +84,9 @@ cookies.txt file; test 377), `http/status.mlx` (reason phrases),
 of the handshake, frame headers, masking, UTF-8) with
 `http/websocket/deflate.mlx` (permessage-deflate, RFC 7692),
 `http/multipart.mlx` (multipart bodies cut and written as libsoup does;
-test 379),
+test 379), `http/message.mlx` (request and status lines, header lines
+folded, bodies' framing, the rules of redirects; test 380 with `uri.mlx`,
+`std.uri`: RFC 3986's parts, references resolved, percent-coding),
 `http/auth.mlx` (RFC 7235's challenges told apart, Basic tokens, Digest
 responses and Authorization values; test 376), `http/hsts.mlx` (RFC
 6797: Strict-Transport-Security read strictly, an enforcer's policies

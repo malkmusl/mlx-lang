@@ -28,7 +28,7 @@ hand. Every function the headers declare is defined by the library
 | `soup.mlx` | The library's root (`--plugin --stack-arena`), importing the parts |
 | `g.mlx`, `common.mlx` | mlx-glib's functions as the parts call them; types, properties, signals, errors made easy |
 | `version.mlx`, `enumtypes.mlx` | `soup-version.h`; the GTypes of libsoup's enums and flags (`soup-enum-types.h`) |
-| `headers.mlx` | `soup-message-headers.h`, `soup-headers.h`: headers kept in order with libsoup's names, parsing of requests, responses and header lists, parameters, ranges, encodings and expectations (on `std.http.headers`) |
+| `headers.mlx` | `soup-message-headers.h`, `soup-headers.h`: headers kept in order with libsoup's names, parsing of requests, responses and header lists (`std.http.message`), parameters, ranges, encodings and expectations (on `std.http.headers`) |
 | `body.mlx` | `soup-message-body.h`: bodies of chunks, accumulated or not |
 | `misc.mlx` | `soup-date-utils.h`, `soup-form.h`, `soup-uri-utils.h`, `soup-status.h`, `soup-method.h`: dates, forms (and multipart forms), URI helpers, status phrases |
 | `cookie.mlx`, `cookiejar.mlx`, `tld.mlx` | `soup-cookie.h`, `soup-cookie-jar*.h`, `soup-tld.h`: SoupCookie in libsoup's layout over `std.http.cookie` (RFC 6265: domains, paths, SameSite, prefixes, expiry), SoupCookieJar as the GObject around `std.http.cookiejar` (libsoup's policies and third-party rules, the text form); the Public Suffix List (`std.http.psl`) |

@@ -137,6 +137,7 @@ run 376_http_auth_runtime "HTTP authentication: challenges told apart, Basic tok
 run 377_http_cookies_runtime "cookies read with libsoup's rules, written back and matched; a jar's policies, SameSite, prefixes, expiry, third parties and cookies.txt"
 run 378_http_hsts_runtime "HSTS: Strict-Transport-Security read strictly, policies and their expiry, an enforcer's hosts and subdomains, its changes and file"
 run 379_http_multipart_websocket_runtime "multipart bodies cut and written as libsoup does; WebSocket keys, accepts, protocols, extensions and permessage-deflate messages"
+run 380_uri_message_runtime "URIs split, resolved (RFC 3986's examples), normalized and coded; HTTP heads read as libsoup reads them, written, framed, redirected"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
