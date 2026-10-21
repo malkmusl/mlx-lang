@@ -156,7 +156,9 @@ byte, when the older one still had a bug the new sources fixed).
 `std.build`, compiles it once into `mlx-out/build/runner`, and runs that
 with the arguments. From then on the runner keeps itself current: when
 `build.mlx`, `std.build` or the compiler changed it compiles `build.mlx`
-again and runs the new runner.
+again and runs the new runner. Like every program it installs the crash
+report first (`std.crash`), and says the step it is checking, starting
+or finishing, so a crash of the runner names its function and the step.
 
 ### `build.mlx`
 

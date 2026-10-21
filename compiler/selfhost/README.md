@@ -54,9 +54,10 @@ runtime foundation remain independent of libc and Zig dependencies:
   is declared, `path:line:name` (for example
   `projects/desktop/files/main.mlx:1234:drawRow`), and the runtime's routines
   keep theirs (`_start`, `__mlx_*`). `nm`, `gdb` and `perf` show them, and the
-  crash handler of the desktop programs
-  (`std/src/crash.mlx`) names the functions a crash went
-  through with them. The lowering keeps each function's module and name
+  crash handler of every program, the compiler itself among them
+  (`std/src/crash.mlx`, installed first thing in `main.mlx`; the driver
+  says the phase and the module it is at with `crash.contextAt`) names
+  the functions a crash went through with them. The lowering keeps each function's module and name
   offset on its LIR symbol for this. It also adds a line table
   (`.mlx_lines`): the lowering notes on every LIR instruction where in the
   source it comes from (`lir.setSource`), the backend notes where its

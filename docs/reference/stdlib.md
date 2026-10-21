@@ -161,8 +161,19 @@ compositor's shell module is, is named through `/proc/self/fd`) and keeps
 the crash in
 `$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
 way for a failure it cannot go on after. The report goes to stderr. Every
-desktop program, every coreutil and mlxlibc (for the programs its loader
-starts) install it. `std.wayland.crash.watch(display)`
+program `build.mlx` declares installs it first thing in `main` (the
+desktop, the services, the tools and examples, the toolchain: `mlx-cc`,
+`mlx-ar`, `mlx-cheaders`, the Mlx compiler `mlx4` itself and the `mlx
+build` runner, the generators; every coreutil), and mlxlibc for the
+programs its loader starts; `tools/check_crash_report.sh` holds every
+program to it (the Android packages are the exception: their entry is the
+activity's, and the handler is x86-64's). `context(text)` and
+`contextAt(what, path, line)` say what the program is doing, and the
+report says it after the reason ("  while compiling src/foo.c:12", and
+", while ..." with the reason in `crashes.log`): `mlx-cc` says the file
+and the line of the declaration it reads, `mlx4` the phase and the module
+it lowers, the build runner the step it checks, starts or finishes.
+`std.wayland.crash.watch(display)`
 (`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
 such a failure (`tools/check_crash_report.sh` holds every client to it).
 The handler's own values come from the compiler's value arena too: when a
@@ -516,6 +527,50 @@ slept on through the kernel when contended, covers the lists.
 alignments, resizing, deinit and four threads allocating and freeing
 through one heap. mlxlibc's `malloc`/`free`/`realloc` sit on it.
 
+### The program's heap: `std.heap`
+
+**Implementation:** `std/src/heap.mlx`
+**Source tests:** `390_heap_runtime.mlx` (`tests/run_std_modules.sh`)
+
+A program takes its memory from one heap, `std.heap.allocator()`: a
+`general_purpose_allocator` over the page allocator, made on first use,
+and passed to what needs memory. `std.page_allocator.init()` is for
+mappings and the backing of other allocators only (`mlx-codemap
+workarounds` says where it is used otherwise; `rewrite pages` converts
+such a site).
+
+```mlx
+const allocator = std.heap.allocator()
+var names = std.StringHashMap(u32).init(allocator)
+const block = allocator.alloc(100, 8).?   // zeroed, as the page allocator's blocks are
+allocator.free(block, 100, 8)
+```
+
+There is one heap for the process, not one per image: its state lives
+in the tiny-page region's header page (`std.tinypage_allocator.shared()`,
+from `SHARED_AT` on), which the program and every shared object and
+plugin it loads find at the same address, so a block taken in one image
+is freed in another; where the region cannot be had, each image has a
+heap of its own. Blocks come zeroed, as the page allocator's do (a block
+the free list gives back again is cleared, and what a resize adds).
+Under `MLX_LEAK_CHECK`, `std.leaks` puts the debug allocator over the
+heap (`std.heap.watch`): `allocator()` hands it out from then on, every
+block is seen with the functions that asked for it and the size class
+it took (`general_purpose_allocator.footprint`), and the heap's slabs,
+taken through `std.page_allocator.backing()`, are not blocks of the
+program's. `liveBytes`, `slabCount`, `largeCount`, `owns(address)` and
+`footprint(address, length, alignment)` report its state; `deinit()`
+gives the slabs back where a program ends on purpose. The page allocator
+maps a block of `RESERVE_FROM` (256 MiB) and more with `MAP_NORESERVE`,
+so an arena's reservation of gigabytes costs the pages it touches (that
+is how mlx-cc's 8 GiB arena is a `std.arena_allocator` over it).
+
+Measured with four threads each allocating and freeing 200 000 blocks of
+random sizes, the heap takes 288 ms where the page allocator (tiny
+pages with their lock, `mmap` for the rest) takes 2053 ms for blocks up
+to 2000 bytes, and 5238 ms against 10 636 ms for blocks up to 60 000
+bytes ([docs/internals/allocators-and-containers.md](../internals/allocators-and-containers.md)).
+
 ### Leak checks: `std.debug_allocator` and `std.leaks`
 
 `std.debug_allocator` is Zig's `DebugAllocator` (the `GeneralPurposeAllocator`
@@ -759,6 +814,109 @@ show allocator-backed collections feeding the compiler's own ELF emission.
 usize }` with `eql`, `startsWith`, `endsWith`, `slice`, `compare`
 (lexicographic), and `hash` (FNV-1a, seen above) — the key type `HashMap` is
 specialized over.
+
+### Generic containers: `std.HashMap`, `std.AutoHashMap`, `std.StringHashMap`, `std.AutoHashSet`, `std.ArrayList`
+
+**Implementation:** `std/src/containers/hash_map.mlx`,
+`std/src/containers/array_list.mlx`
+**Source tests:** `387_hash_map_runtime.mlx`, `388_array_list_runtime.mlx`,
+`389_hash_set_runtime.mlx`
+
+The containers of the standard library, generic over their key, value and
+element types, in an allocator's memory, and freed by the language's drop
+where they go out of scope: each is a `@noncopy(struct)` with `fn
+deinit(self: *Self) -> void` ([Ownership](../guide/06-ownership.md)). The
+bootstrap specializations above stay for the self-hosted compiler and
+`std/bootstrap`, which the bootstrap compiler must build.
+
+```mlx
+const allocator = std.heap.allocator()
+var names = std.StringHashMap(u32).init(allocator)
+_ = names.put("one", 1)
+const one = names.get("one")                      // ?u32
+var entries = names.iterator()
+while true {
+    const entry = entries.next()                  // ?Entry: key and value by pointer
+    if entry == null { break }
+    entry.?.value.* += 1
+}
+var words = std.ArrayList([]const u8).init(allocator)
+_ = words.append("one")
+for word in words.items() { ... }
+// names.deinit() and words.deinit() run where they go out of scope
+```
+
+`HashMap(K, V, Context)` is open addressing with linear probing over a
+power-of-two number of slots: a metadata byte per slot (empty, tombstone,
+or the hash's top seven bits with the high bit set, so that most keys
+that do not match are told apart without touching the key), the keys
+and the values in arrays of their own, growth by doubling and rehashing
+at four fifths load (a table that is mostly tombstones is rehashed at the
+same size). The `Context` is a type with `hash(self, key) -> u64` and
+`eql(self, a, b) -> bool`: `std.hash.StringContext` for `[]const u8`,
+`AutoContext(K)` (hash and equality derived from `K` by `std.hash`), or
+the caller's own, carried as an instance when it has state
+(`initContext`; a map over keys that are indexes into a table of the
+caller's, as a code index keeps). `AutoHashMap(K, V)` and
+`StringHashMap(V)` are `HashMap` over those contexts; `AutoHashSet(K)` is
+an `AutoHashMap(K, Nothing)` with `insert`, `contains`, `remove`,
+`count` and an iterator over the keys.
+
+| `HashMap` | |
+|---|---|
+| `init(allocator)`, `initContext(allocator, context)`, `deinit` | the map's memory given back by `deinit`, or by the drop |
+| `put(key, value) -> bool`, `putNoClobber(key, value) -> bool` | false without memory (`putNoClobber`: or with the key there) |
+| `get(key) -> ?V`, `getPtr(key) -> ?*V`, `contains(key)` | |
+| `getOrPut(key) -> (bool, ?*V)` | whether it was found, and the value's pointer (undefined when made; null without memory) |
+| `remove(key) -> bool`, `fetchRemove(key) -> ?V` | |
+| `count()`, `capacity()`, `ensureTotalCapacity(n) -> bool` | `capacity`: entries before the next rehash |
+| `clearRetainingCapacity()`, `clearAndFree()`, `clone() -> ?Self` | |
+| `iterator()`, `keyIterator()`, `valueIterator()` | `next()` answers `?Entry` (`key: *K, value: *V`), `?*K`, `?*V` |
+
+| `ArrayList(T)` | |
+|---|---|
+| `init(allocator)`, `initCapacity(allocator, n)`, `fromOwnedSlice(allocator, slice)`, `deinit` | |
+| `items() -> []T`, `count()`, `last() -> ?T` | the slice is valid until the list grows |
+| `append(value)`, `appendSlice(values)`, `appendNTimes(value, n)`, `insert(index, value)` | false without memory |
+| `orderedRemove(index) -> T`, `swapRemove(index) -> T`, `pop() -> ?T` | |
+| `ensureTotalCapacity(n)`, `ensureUnusedCapacity(n)`, `resize(n)` | grown by half and a little more; `resize` leaves new elements undefined |
+| `clearRetainingCapacity()`, `clearAndFree()`, `toOwnedSlice() -> []T` | `toOwnedSlice`: the block at its size, the list's no more |
+
+Out of memory is answered (false, null), not trapped. Tests 387 to 389
+put and take 100 000 entries each under `MLX_LEAK_CHECK` and show every
+block given back; they run once the compiler takes a struct type in a
+function body (`fn HashMap(...) -> type { return @noncopy(struct) { ... } }`).
+
+## Hashing (`std.hash`)
+
+**Implementation:** `std/src/hash.mlx`
+**Source tests:** `386_hash_runtime.mlx` (`tests/run_std_modules.sh`),
+`391_hash_aggregates_runtime.mlx`
+
+```mlx
+const hash = @import("std.hash")
+const h = hash.wyhash("message digest", 3)        // 0x786d1f1df3801df4
+const w = hash.hashWord(42)
+const both = hash.combine(hash.combine(0, hash.hashWord(1)), hash.hashWord(2))
+const p = hash.autoHash(Point, Point.{ .x = 1, .y = -2 })
+const same = hash.autoEql([]const u8, copied, "abc")
+```
+
+`wyhash(bytes, seed)` is wyhash, final version 4.3, with its default
+secret, checked against the values the reference's `test_vector.cpp`
+prints; `hashBytes` is it with seed 0, `hashWord` hashes one 64-bit
+word, and `combine(seed, hash)` folds a hash into a running one, in
+order. `autoHash(T, value)` and `autoEql(T, a, b)` derive a hash and an
+equality from the type by reflection: integers (masked to their width and
+sign-extended, so a value hashes alike at every width), bools, enums,
+floats by their bits, pointers by address, optionals (null apart from
+any value), slices and arrays (plain elements as bytes in one wyhash
+call, others element by element), structs and tuples field by field.
+`StringContext` is the context `std.StringHashMap` takes;
+`AutoContext(K)` is in `std/src/containers/hash_map.mlx` until the
+compiler takes a struct type in a function body. The arithmetic is
+wrapping throughout (`*%`, `+%`, `<<%`); the 64 x 64 -> 128 multiply is
+done in 32-bit halves.
 
 ## Filesystem & process
 
