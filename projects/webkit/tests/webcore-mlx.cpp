@@ -50,6 +50,8 @@ int main()
         page->settings().setScriptEnabled(false);
         page->settings().setAcceleratedCompositingEnabled(false);
         say("page: created"_s);
+        // (The port's own setting, port/MlxSettings.yaml: there, off.)
+        say(makeString("hardware acceleration: "_s, yesNo(page->settings().hardwareAccelerationEnabled())));
 
         RefPtr frame = page->localMainFrame();
         say(makeString("main frame: "_s, yesNo(!!frame)));
