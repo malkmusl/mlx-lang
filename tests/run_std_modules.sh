@@ -143,6 +143,8 @@ run 382_http_client_runtime "an HTTP/1.1 session against a server in a child pro
 run 383_mime_xml_text_runtime "media types by a file's extension and first bytes as GIO guesses; XML text escaped four ways and names checked as Name, NCName, QName, Nmtoken"
 run 384_crypto_mpi_rsa_runtime "integers of any size: hex, signed division both ways, powm, gcd, inverses, primes; RSA private keys: PKCS #1 and PSS signatures, OAEP and PKCS #1 encryption against Python's values, a key generated"
 run 385_flate_gzip_runtime "gzip files written and read in pieces, two members as one, a plain file as it is, trailing data left, damaged and truncated members refused"
+run 386_hash_runtime "wyhash against its reference's vectors, words combined, autoHash and autoEql by type (integers, bools, enums, floats, pointers, optionals, slices, arrays), the string context"
+run 390_heap_runtime "the program's heap: one wherever it is asked for, in the shared region, blocks and their footprints, a GiB reserved, the debug allocator over it under the leak check, deinit"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
