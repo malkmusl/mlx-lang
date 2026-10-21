@@ -1,6 +1,8 @@
 // Raw poll/epoll entry points. Event buffers retain the kernel ABI layout;
 // the portable event-loop layer owns typed decoding.
 
+const mem = @import("../../mem.mlx")
+
 pub extern("syscall") fn syscall1(number: usize, a1: usize) -> isize {}
 pub extern("syscall") fn syscall2(number: usize, a1: usize, a2: usize) -> isize {}
 pub extern("syscall") fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {}
@@ -53,4 +55,205 @@ pub fn ioUringEnter(ring: isize, submit_count: u32, minimum_complete: u32, flags
 
 pub fn ioUringRegister(ring: isize, operation: usize, argument: usize, argument_count: u32) -> isize {
     return syscall4(SYS_io_uring_register, @bitCast(usize, ring), operation, argument, @intCast(usize, argument_count))
+}
+
+// ---------------------------------------------------------------------------
+// poll(2) records: struct pollfd is 8 bytes (i32 descriptor, i16 events,
+// i16 returned events), kept in byte arrays so a program can poll any
+// number of descriptors with one buffer.
+
+pub const POLLIN: u16 = 1
+pub const POLLPRI: u16 = 2
+pub const POLLOUT: u16 = 4
+pub const POLLERR: u16 = 8
+pub const POLLHUP: u16 = 16
+pub const POLLNVAL: u16 = 32
+pub const POLL_ENTRY_SIZE: usize = 8
+
+const EINTR: isize = -4
+
+// Entry `index` of `entries` asks about `descriptor` (`events`: POLLIN,
+// POLLOUT); what came back is cleared.
+pub fn pollSet(entries: [*]u8, index: usize, descriptor: isize, events: u16) -> void {
+    const at = index * POLL_ENTRY_SIZE
+    mem.writeU32Little(entries, at, @intCast(u32, descriptor & 4294967295))
+    entries[at + 4] = @intCast(u8, events & 255)
+    entries[at + 5] = @intCast(u8, (events >> 8) & 255)
+    entries[at + 6] = 0
+    entries[at + 7] = 0
+}
+
+// The events entry `index` returned (POLLIN, POLLHUP, ...; 0: none).
+pub fn pollResult(entries: [*]const u8, index: usize) -> u16 {
+    const at = index * POLL_ENTRY_SIZE + 6
+    return @intCast(u16, entries[at]) | (@intCast(u16, entries[at + 1]) << 8)
+}
+
+// Waits until `descriptor` is readable (or writable): 1 when it is, 0
+// when `timeout_milliseconds` passed first (negative: no limit), -errno.
+pub fn waitReady(descriptor: isize, writable: bool, timeout_milliseconds: isize) -> isize {
+    var record: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    const bytes: [*]u8 = &record
+    pollSet(bytes, 0, descriptor, if writable { POLLOUT } else { POLLIN })
+    return poll(@intFromPtr(bytes), 1, timeout_milliseconds)
+}
+
+// ---------------------------------------------------------------------------
+// An event loop: an epoll set whose descriptors each carry a token of the
+// caller's (an index, an address) that comes back with their readiness.
+
+pub const MAX_EVENTS: usize = 32
+// An epoll_event is packed on x86_64: the flags (u32), then the token (u64).
+pub const EVENT_SIZE: usize = 12
+
+// What one wait returned.
+pub const Events = struct {
+    records: [384]u8
+    count: usize
+}
+
+// A new loop (close-on-exec): its descriptor, or -errno.
+pub fn createEventLoop() -> isize {
+    return epollCreate(EPOLL_CLOEXEC)
+}
+
+fn control(event_loop: isize, operation: usize, descriptor: isize, flags: u32, token: usize) -> bool {
+    var record: [12]u8 = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    const bytes: [*]u8 = &record
+    mem.writeU32Little(bytes, 0, flags)
+    mem.writeU32Little(bytes, 4, @intCast(u32, token & 4294967295))
+    mem.writeU32Little(bytes, 8, @intCast(u32, token >> 32))
+    return epollControl(event_loop, operation, descriptor, @intFromPtr(bytes)) == 0
+}
+
+// Watches `descriptor` for input (and output too when `writable`).
+pub fn watch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool {
+    return control(event_loop, EPOLL_CTL_ADD, descriptor, if writable { EPOLLIN | EPOLLOUT } else { EPOLLIN }, token)
+}
+
+// Changes what a watched descriptor is watched for.
+pub fn rewatch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool {
+    return control(event_loop, EPOLL_CTL_MOD, descriptor, if writable { EPOLLIN | EPOLLOUT } else { EPOLLIN }, token)
+}
+
+pub fn unwatch(event_loop: isize, descriptor: isize) -> bool {
+    return control(event_loop, EPOLL_CTL_DEL, descriptor, 0, 0)
+}
+
+// Waits for readiness (again after a signal interrupts it): the number
+// of records, 0 when `timeout_milliseconds` passed (negative: no limit),
+// or -errno.
+pub fn waitEvents(event_loop: isize, events: *Events, timeout_milliseconds: isize) -> isize {
+    var result: isize = EINTR
+    while result == EINTR {
+        result = epollWait(event_loop, @intFromPtr(events), MAX_EVENTS, timeout_milliseconds)
+    }
+    events.*.count = if result > 0 { @bitCast(usize, result) } else { 0 }
+    return result
+}
+
+// Record `index`'s flags (EPOLLIN, EPOLLHUP, ...) and token.
+pub fn eventFlags(events: *const Events, index: usize) -> u32 {
+    const records: [*]const u8 = &events.*.records
+    return mem.readU32Little(records, index * EVENT_SIZE)
+}
+
+pub fn eventToken(events: *const Events, index: usize) -> usize {
+    const records: [*]const u8 = &events.*.records
+    const offset = index * EVENT_SIZE + 4
+    return @intCast(usize, mem.readU32Little(records, offset)) | (@intCast(usize, mem.readU32Little(records, offset + 4)) << 32)
+}
+
+// ---------------------------------------------------------------------------
+// Signals as a descriptor (signalfd): the signals of a mask (bit signal -
+// 1) are blocked and then read from it, so a loop takes them with the rest
+// of its input.
+
+const SYS_rt_sigprocmask: usize = 14
+const SYS_signalfd4: usize = 289
+const SYS_timerfd_create: usize = 283
+const SYS_timerfd_settime: usize = 286
+const SYS_eventfd2: usize = 290
+const SYS_inotify_init1: usize = 294
+const SYS_inotify_add_watch: usize = 254
+const SYS_read: usize = 0
+const SYS_write: usize = 1
+
+// SFD_, TFD_, EFD_ and IN_NONBLOCK, _CLOEXEC are O_NONBLOCK, O_CLOEXEC.
+pub const NONBLOCK: usize = 2048
+pub const CLOEXEC: usize = 524288
+// The size of a signalfd_siginfo.
+pub const SIGNAL_RECORD_SIZE: usize = 128
+
+// Blocks the signals of `mask` and returns a non-blocking, close-on-exec
+// descriptor that reads them, or -errno.
+pub fn signalDescriptor(mask: usize) -> isize {
+    var blocked: usize = mask
+    const result = syscall4(SYS_rt_sigprocmask, 0, @intFromPtr(&blocked), 0, 8)
+    if result != 0 { return result }
+    return syscall4(SYS_signalfd4, 18446744073709551615, @intFromPtr(&blocked), 8, NONBLOCK | CLOEXEC)
+}
+
+// The next signal waiting on a signal descriptor (its number), or 0.
+pub fn readSignal(descriptor: isize) -> u32 {
+    var record: [128]u8 = undefined
+    const bytes: [*]u8 = &record
+    if syscall3(SYS_read, @bitCast(usize, descriptor), @intFromPtr(bytes), SIGNAL_RECORD_SIZE) != 128 { return 0 }
+    return mem.readU32Little(bytes, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Timers and counters as descriptors
+
+// A non-blocking, close-on-exec timer on `clock` (CLOCK_MONOTONIC 1):
+// its descriptor, or -errno. It is readable when it fired.
+pub fn createTimer(clock: usize) -> isize {
+    return syscall2(SYS_timerfd_create, clock, NONBLOCK | CLOEXEC)
+}
+
+// Arms a timer to fire in `initial` nanoseconds and then every `interval`
+// (0: once); `initial` 0 disarms it.
+pub fn setTimer(descriptor: isize, initial: usize, interval: usize) -> isize {
+    var spec: [4]usize = [4]usize{ interval / 1000000000, interval % 1000000000, initial / 1000000000, initial % 1000000000 }
+    return syscall4(SYS_timerfd_settime, @bitCast(usize, descriptor), 0, @intFromPtr(&spec), 0)
+}
+
+// A non-blocking, close-on-exec event counter (eventfd) starting at 0.
+pub fn createCounter() -> isize {
+    return syscall2(SYS_eventfd2, 0, NONBLOCK | CLOEXEC)
+}
+
+// Adds `amount` to a counter (it is readable while not 0).
+pub fn addToCounter(descriptor: isize, amount: usize) -> void {
+    var value: usize = amount
+    const ignored = syscall3(SYS_write, @bitCast(usize, descriptor), @intFromPtr(&value), 8)
+}
+
+// Reads a counter or a timer, resetting it: what was added, or how often
+// the timer fired; 0 when nothing was.
+pub fn readCounter(descriptor: isize) -> usize {
+    var value: usize = 0
+    if syscall3(SYS_read, @bitCast(usize, descriptor), @intFromPtr(&value), 8) != 8 { return 0 }
+    return value
+}
+
+// inotify: a non-blocking, close-on-exec instance, and a watch on a
+// NUL-terminated path for the IN_ events of `mask`.
+pub const IN_MODIFY: u32 = 2
+pub const IN_ATTRIB: u32 = 4
+pub const IN_CLOSE_WRITE: u32 = 8
+pub const IN_MOVED_FROM: u32 = 64
+pub const IN_MOVED_TO: u32 = 128
+pub const IN_CREATE: u32 = 256
+pub const IN_DELETE: u32 = 512
+pub const IN_DELETE_SELF: u32 = 1024
+pub const IN_MOVE_SELF: u32 = 2048
+pub const IN_ONLYDIR: u32 = 16777216
+
+pub fn createWatcher() -> isize {
+    return syscall1(SYS_inotify_init1, NONBLOCK | CLOEXEC)
+}
+
+pub fn addWatch(watcher: isize, path: [*]const u8, mask: u32) -> isize {
+    return syscall3(SYS_inotify_add_watch, @bitCast(usize, watcher), @intFromPtr(path), @intCast(usize, mask))
 }

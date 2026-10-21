@@ -146,7 +146,7 @@ else
 fi
 
 # A plugin with a soname and a symbol version (--soname, --symbol-version):
-# what a library standing in for another needs (projects/desktop/libpulse,
+# what a library standing in for another needs (compiler/libc/pulse,
 # libpulse.so.0 with PULSE_0), since glibc's loader insists that a program
 # linked against a versioned library find that version. The host asks for
 # the export at its version (dlvsym).

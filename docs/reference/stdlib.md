@@ -104,6 +104,14 @@ compiler-core std do not load the generated protocol modules. See
 [Wayland](wayland.md) for the pipeline, runtime and tests
 (`tests/240_std_xml_tokenizer_runtime.mlx` covers `std.xml`).
 
+`std.xml.sax` (`std/src/xml/sax.mlx`, test 374) is the streaming parser
+libxml2's C API is made of; `std.xml.text` beside it holds, for programs
+writing XML, text escaped for character data, an attribute's value,
+ASCII-only output and HTML (`writeEscaped(sink, text, mode)`, the escapes
+of xmlEncodeEntitiesReentrant and xmlEncodeSpecialChars) and names
+checked as Name, NCName, QName or Nmtoken (`validName`, `isName`,
+`isNCName`, `isQName`, `isNmtoken`, `nameEnd`; test 383).
+
 `std.json` (`std/src/json.mlx`), `std.vulkan` (`std/src/vulkan.mlx`,
 materialized from the Vulkan registry, with `std.vulkan.loader` and
 `std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
@@ -113,7 +121,7 @@ and `std.gpu.swapchain` (`std/src/gpu.mlx`, `std/src/gpu/`) are Stage-1
 extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 
-`std.truetype` (`std/src/truetype.mlx`, see [TrueType fonts](truetype.md))
+`std.truetype` (`std/src/truetype.mlx` and `std/src/truetype/`, see [Fonts](truetype.md))
 and `std.ui` (`std/src/ui.mlx` and `std/src/ui/`: layout, a canvas on the
 CPU or the GPU, and widgets for any platform, see
 [User interfaces](ui.md)) are extensions for drawing text and building
@@ -165,9 +173,18 @@ the crash in
 `$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
 way for a failure it cannot go on after. The report goes to stderr. Every
 program `build.mlx` declares installs it first thing in `main` (the
-desktop, the services, the tools, the examples, every coreutil), and
-mlxlibc for the programs its loader starts; `tools/check_crash_report.sh`
-holds every program to it. `std.wayland.crash.watch(display)`
+desktop, the services, the tools and examples, the toolchain: `mlx-cc`,
+`mlx-ar`, `mlx-cheaders`, the Mlx compiler `mlx4` itself and the `mlx
+build` runner, the generators; every coreutil), and mlxlibc for the
+programs its loader starts; `tools/check_crash_report.sh` holds every
+program to it (the Android packages are the exception: their entry is the
+activity's, and the handler is x86-64's). `context(text)` and
+`contextAt(what, path, line)` say what the program is doing, and the
+report says it after the reason ("  while compiling src/foo.c:12", and
+", while ..." with the reason in `crashes.log`): `mlx-cc` says the file
+and the line of the declaration it reads, `mlx4` the phase and the module
+it lowers, the build runner the step it checks, starts or finishes.
+`std.wayland.crash.watch(display)`
 (`std/src/wayland/crash.mlx`) makes a Wayland client's failed connection
 such a failure (`tools/check_crash_report.sh` holds every client to it).
 The handler's own values come from the compiler's value arena too: when a
@@ -218,11 +235,17 @@ GPU's time goes on the frame the program was drawing when it began.
 `std.timezone` (`std/src/timezone.mlx`) gives local time: `load` reads the
 zone from `$TZ` (a zone name, a path or a POSIX rule) or `/etc/localtime`
 (TZif, RFC 8536, with the POSIX rule past its last transition),
-`offsetAt` gives the offset from UTC at a moment, `civil` and
+`loadSetting` takes such a setting itself, `offsetAt` gives the offset
+from UTC at a moment and `abbreviationAt` the zone's name for it
+("CEST"; `tests/358_timezone_names_runtime.mlx`), `civil` and
 `daysFromCivil` convert between seconds and the proleptic Gregorian
 calendar (`tests/279_timezone_runtime.mlx`).
 `std.process.environmentFrom(entries, name)` looks a name up in any
-NUL-terminated environment list, which `load` uses.
+NUL-terminated environment list, which `load` uses. `std.timezone.database`
+is the whole IANA database built in, by zone ID, reckoned with the same
+civil calendar; `std.unicode` is Unicode and CLDR's locale data
+(collation, normalization, IDNA, calendars, formatting): see
+[Unicode and locales](unicode.md).
 
 `std.xkb` (`std/src/xkb.mlx`, with `std/src/xkb/`) is XKB without
 libxkbcommon, behaving as libxkbcommon 1.6 does. `std.xkb.parse` reads
@@ -277,10 +300,17 @@ transport), and a client: `connectSession` (or `connectClient` with a
 socket path) authenticates with EXTERNAL, negotiates descriptor passing
 and says Hello; `send`, `call` and `reply` write messages, `next` waits
 for the next one (its body at `bodyOf`, its descriptors at
-`descriptorOf`) and `waitReply` for the reply to a call. MLXIPC's bus
-(`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use it;
-`tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl and
-dbus-monitor.
+`descriptorOf`) and `waitReply` for the reply to a call; after
+`keepSignals` the signals that come while `waitReply` waits are kept, with
+their descriptors, for `next` to return first (a logind client must not
+lose a PauseDevice that arrived during a call). `addressPath` takes the
+socket path out of a bus address list and `systemPath` is the system
+bus's (DBUS_SYSTEM_BUS_ADDRESS, else `MLX_SYSTEM_BUS` or `SYSTEM_BUS`).
+MLXIPC's bus (`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use
+it, as do the compositor's logind session and the desktop's system bus
+clients; `tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl
+and dbus-monitor, and `tests/361_dbus_keep_signals_runtime.mlx` keeps a
+signal across a call against a bus played by a child.
 
 `std.ipc` (`std/src/ipc.mlx`) is MLXIPC's native wire format, what Mlx
 programs speak to the bus and to each other over direct channels, next
@@ -331,6 +361,20 @@ desktop names apps: `identify` gives a Flatpak app's id (from
 `/proc/PID/root/.flatpak-info`, then sandboxed) or its program's name
 (`/proc/PID/exe`, without a `-bin` at its end). MLXIPC's permissions and
 MLX Audio's PulseAudio socket name apps with it.
+`std.pulse` (`std/src/pulse.mlx`) has the numbers of PulseAudio's
+native protocol (the version, the packet descriptor, the commands, the
+errors, the subscription facilities) and `std.pulse.tagstruct` writes and
+reads the tagstructs its commands are made of, into a buffer or (for a
+client library) into memory that grows; MLX Audio's server
+(`projects/desktop/audio`) and its libpulse (`compiler/libc/pulse`) are
+the two ends that use them.
+`std.pipewire` (`std/src/pipewire.mlx`) has the numbers of PipeWire's
+native protocol (the core's, client's, registry's and client node's
+methods and events, SPA's params, IO areas, commands, formats, buffer
+data and struct pw_node_activation's layout) and `std.pipewire.pod`
+writes and reads the SPA pods its messages are made of; MLX Capture's
+server (`projects/desktop/capture`) and its libpipewire
+(`compiler/libc/pipewire`) are the two ends that use them.
 
 `std.jpeg` (`std/src/jpeg.mlx`) encodes premultiplied ARGB words as
 baseline JPEG (4:2:0, standard tables scaled by a quality of 1 to 100,
@@ -377,10 +421,79 @@ file that is not a PNG, finds a truncated one corrupt, and checks
 `saveFile(path, pixels, width, height, stride, alpha, allocator)` writes
 premultiplied ARGB words (rows `stride` words apart) as an 8-bit RGBA PNG,
 or RGB with `alpha` false, and returns whether it was written: each row
-with the filter that leaves the smallest differences, deflated with fixed
-Huffman codes and LZ77 matches over a 32 KiB window. `mlx-capture`
+with the filter that leaves the smallest differences, compressed by
+`std.flate` (zlib's level 6), the chunk CRCs by `std.crc`. `mlx-capture`
 saves captures with it. `tests/292_png_encode_runtime.mlx` writes an image
 both ways and reads it back with `loadFile`.
+
+`std.flate` (`std/src/flate.mlx`, its parts in `std/src/flate/`) is the
+repository's one DEFLATE implementation: raw deflate data (RFC 1951), zlib
+streams (RFC 1950) and gzip members (RFC 1952), compressed and
+decompressed. The compressor is zlib's (1.3.1) step for step, every level
+(0 stored, 1 to 3 fast, 4 to 9 lazy matching) and strategy, so its bytes
+are zlib's; the decompressor is zlib's state machine, taking input and
+output in pieces of any size and checking the check values.
+
+```mlx
+const flate = @import("std.flate")
+
+// All at once, into the caller's buffer (0: did not fit, or damaged):
+const room = flate.compressBound(length, flate.Format.zlib)
+const made = flate.compress(data, length, output, room, 6, flate.Format.zlib, allocator)
+const size = flate.decompress(input, count, buffer, capacity, flate.Format.gzip)
+
+// All at once, into an allocator's memory, growing as needed:
+var result: flate.Buffer = undefined
+if flate.decompressAlloc(allocator, input, count, flate.Format.detect, &result) == flate.Status.done {
+    // result.bytes[0..result.length]
+    flate.freeBuffer(allocator, &result)
+}
+
+// In pieces:
+var deflater: flate.Deflater = undefined
+if flate.deflaterInit(&deflater, allocator, flate.options(9, flate.Format.gzip)) == flate.Status.ok {
+    var progress: flate.Progress = undefined
+    const status = flate.deflaterRun(&deflater, piece, pieceLength, out, 4096, flate.Flush.finish, &progress)
+    // progress.consumed taken, progress.produced written; again until Status.done
+    flate.deflaterEnd(&deflater)
+}
+```
+
+`Format` is `raw`, `zlib`, `gzip` or `detect` (decompression: zlib or
+gzip, as the header says); `Status` is `ok`, `done`, `needDictionary`,
+`damaged`, `noMemory`, `stuck` (no progress without more input or room)
+or `misuse`; `Flush` and `Strategy` are zlib's flushes and strategies, and
+`options(level, format)` gives a compressor's `Options` with zlib's
+defaults for the rest (a 32 KiB window, memory level 8). The deflater
+also takes a dictionary, a gzip `Header`, new parameters on the way and
+`deflaterBound`; the inflater a dictionary and a place for the gzip
+header it reads, and `message(&inflater.stream)` words what was wrong
+("incorrect header check"...). `decompress` needs no allocator (its state
+is 8 KiB of stack). `inflate` (raw data), `gunzip` and `gzipSize` are the
+earlier one-call forms. The engine itself (`std.flate.deflate`,
+`std.flate.inflate`, on a `Stream` with zlib's return codes) is what the
+zlib C API, `compiler/libc/zlib` (`libmlxz.so`, `<zlib.h>` for C and C++
+programs), is made of. `tests/343_flate_runtime.mlx` checks zlib's bytes,
+round trips in every format and in pieces, and damaged data.
+
+`std.flate.gzip` (`std/src/flate/gzip.mlx`) is gzip files, what zlib's
+gz* functions do, for Mlx programs: a `Reader` (`openRead` or
+`readerInit` over a file, `read` in pieces of any size, `readToEnd`,
+`readerClose`) gives the uncompressed bytes of a file's gzip members one
+after another, reads a file that is not gzip as it is, leaves alone what
+follows the last member and names what went wrong (`readerError`: a
+damaged member, a truncated one, the file); a `Writer` (`openWrite` or
+`writerInit` at a level, `write`, `flush`, `writerClose`, which finishes
+the member) writes one member; `readFile` and `writeFile` do a whole
+file at once. Each buffers 8 KiB in memory of the allocator.
+`tests/385_flate_gzip_runtime.mlx` writes and reads files in odd pieces,
+two members, a plain file, trailing data, damaged and truncated members.
+
+`std.crc` (`std/src/crc.mlx`) has the check values: `crc32(crc, data,
+length)` (the CRC-32 of gzip, zlib, PNG and ZIP, 0 to start),
+`adler32(adler, data, length)` (1 to start), `crc32Join` and `adler32Join`
+(the value of two pieces put together), and `cksum(data, length)` with
+`cksumUpdate` and `cksumFinish` (the CRC of POSIX cksum).
 
 ## Core: allocators
 
@@ -459,6 +572,50 @@ slept on through the kernel when contended, covers the lists.
 `296_general_purpose_allocator_runtime.mlx` exercises every class, the
 alignments, resizing, deinit and four threads allocating and freeing
 through one heap. mlxlibc's `malloc`/`free`/`realloc` sit on it.
+
+### The program's heap: `std.heap`
+
+**Implementation:** `std/src/heap.mlx`
+**Source tests:** `390_heap_runtime.mlx` (`tests/run_std_modules.sh`)
+
+A program takes its memory from one heap, `std.heap.allocator()`: a
+`general_purpose_allocator` over the page allocator, made on first use,
+and passed to what needs memory. `std.page_allocator.init()` is for
+mappings and the backing of other allocators only (`mlx-codemap
+workarounds` says where it is used otherwise; `rewrite pages` converts
+such a site).
+
+```mlx
+const allocator = std.heap.allocator()
+var names = std.StringHashMap(u32).init(allocator)
+const block = allocator.alloc(100, 8).?   // zeroed, as the page allocator's blocks are
+allocator.free(block, 100, 8)
+```
+
+There is one heap for the process, not one per image: its state lives
+in the tiny-page region's header page (`std.tinypage_allocator.shared()`,
+from `SHARED_AT` on), which the program and every shared object and
+plugin it loads find at the same address, so a block taken in one image
+is freed in another; where the region cannot be had, each image has a
+heap of its own. Blocks come zeroed, as the page allocator's do (a block
+the free list gives back again is cleared, and what a resize adds).
+Under `MLX_LEAK_CHECK`, `std.leaks` puts the debug allocator over the
+heap (`std.heap.watch`): `allocator()` hands it out from then on, every
+block is seen with the functions that asked for it and the size class
+it took (`general_purpose_allocator.footprint`), and the heap's slabs,
+taken through `std.page_allocator.backing()`, are not blocks of the
+program's. `liveBytes`, `slabCount`, `largeCount`, `owns(address)` and
+`footprint(address, length, alignment)` report its state; `deinit()`
+gives the slabs back where a program ends on purpose. The page allocator
+maps a block of `RESERVE_FROM` (256 MiB) and more with `MAP_NORESERVE`,
+so an arena's reservation of gigabytes costs the pages it touches (that
+is how mlx-cc's 8 GiB arena is a `std.arena_allocator` over it).
+
+Measured with four threads each allocating and freeing 200 000 blocks of
+random sizes, the heap takes 288 ms where the page allocator (tiny
+pages with their lock, `mmap` for the rest) takes 2053 ms for blocks up
+to 2000 bytes, and 5238 ms against 10 636 ms for blocks up to 60 000
+bytes ([docs/internals/allocators-and-containers.md](../internals/allocators-and-containers.md)).
 
 ### Leak checks: `std.debug_allocator` and `std.leaks`
 
@@ -616,13 +773,15 @@ const arena_interface = bootstrap.arena_allocator.interface(&arena)
 
 `std/bootstrap/mem.mlx` implements the raw memory ops (`copy`,
 `copyBackwards`, `set`, `zero`, `eql`, all over `[*]u8`/length pairs, 8-byte
-unrolled) plus little-endian read/write helpers specialized to 16/32/64 bits
-(`readU16Little`, `readU32Little`, `readU64Little`,
-`writeU16Little`/`writeU32Little`/`writeU64Little`). This covers the
-`MemoryOps` half of `mem.xml` but is narrower than its `EndianHelpers`
-surface: there is no generic `readInt`/`writeInt`, `byteSwap`, or
+unrolled) plus little- and big-endian read/write helpers specialized to
+16/32/64 bits (`readU16Little`, `readU32Little`, `readU64Little`,
+`writeU16Little`/`writeU32Little`/`writeU64Little`, and the network-order
+`readU16Big`/`readU32Big`/`readU64Big`, `writeU16Big`/`writeU32Big`/
+`writeU64Big`). This covers the `MemoryOps` half of `mem.xml` but is
+narrower than its `EndianHelpers` surface: there is no generic
+`readInt`/`writeInt`, `byteSwap`, or
 `nativeToLittle`/`nativeToBig`/`littleToNative`/`bigToNative` — only the
-concrete little-endian read/write pairs above. `132_page_allocator_runtime.mlx`
+concrete read/write pairs above. `132_page_allocator_runtime.mlx`
 and `131_bootstrap_allocator_runtime.mlx` exercise the page allocator and a
 custom `fakeAlloc` plugged into the `Allocator` interface directly;
 `120_bootstrap_mem_runtime.mlx` exercises `copy`/`set`/`eql` over fixed byte
@@ -702,6 +861,109 @@ usize }` with `eql`, `startsWith`, `endsWith`, `slice`, `compare`
 (lexicographic), and `hash` (FNV-1a, seen above) — the key type `HashMap` is
 specialized over.
 
+### Generic containers: `std.HashMap`, `std.AutoHashMap`, `std.StringHashMap`, `std.AutoHashSet`, `std.ArrayList`
+
+**Implementation:** `std/src/containers/hash_map.mlx`,
+`std/src/containers/array_list.mlx`
+**Source tests:** `387_hash_map_runtime.mlx`, `388_array_list_runtime.mlx`,
+`389_hash_set_runtime.mlx`
+
+The containers of the standard library, generic over their key, value and
+element types, in an allocator's memory, and freed by the language's drop
+where they go out of scope: each is a `@noncopy(struct)` with `fn
+deinit(self: *Self) -> void` ([Ownership](../guide/06-ownership.md)). The
+bootstrap specializations above stay for the self-hosted compiler and
+`std/bootstrap`, which the bootstrap compiler must build.
+
+```mlx
+const allocator = std.heap.allocator()
+var names = std.StringHashMap(u32).init(allocator)
+_ = names.put("one", 1)
+const one = names.get("one")                      // ?u32
+var entries = names.iterator()
+while true {
+    const entry = entries.next()                  // ?Entry: key and value by pointer
+    if entry == null { break }
+    entry.?.value.* += 1
+}
+var words = std.ArrayList([]const u8).init(allocator)
+_ = words.append("one")
+for word in words.items() { ... }
+// names.deinit() and words.deinit() run where they go out of scope
+```
+
+`HashMap(K, V, Context)` is open addressing with linear probing over a
+power-of-two number of slots: a metadata byte per slot (empty, tombstone,
+or the hash's top seven bits with the high bit set, so that most keys
+that do not match are told apart without touching the key), the keys
+and the values in arrays of their own, growth by doubling and rehashing
+at four fifths load (a table that is mostly tombstones is rehashed at the
+same size). The `Context` is a type with `hash(self, key) -> u64` and
+`eql(self, a, b) -> bool`: `std.hash.StringContext` for `[]const u8`,
+`AutoContext(K)` (hash and equality derived from `K` by `std.hash`), or
+the caller's own, carried as an instance when it has state
+(`initContext`; a map over keys that are indexes into a table of the
+caller's, as a code index keeps). `AutoHashMap(K, V)` and
+`StringHashMap(V)` are `HashMap` over those contexts; `AutoHashSet(K)` is
+an `AutoHashMap(K, Nothing)` with `insert`, `contains`, `remove`,
+`count` and an iterator over the keys.
+
+| `HashMap` | |
+|---|---|
+| `init(allocator)`, `initContext(allocator, context)`, `deinit` | the map's memory given back by `deinit`, or by the drop |
+| `put(key, value) -> bool`, `putNoClobber(key, value) -> bool` | false without memory (`putNoClobber`: or with the key there) |
+| `get(key) -> ?V`, `getPtr(key) -> ?*V`, `contains(key)` | |
+| `getOrPut(key) -> (bool, ?*V)` | whether it was found, and the value's pointer (undefined when made; null without memory) |
+| `remove(key) -> bool`, `fetchRemove(key) -> ?V` | |
+| `count()`, `capacity()`, `ensureTotalCapacity(n) -> bool` | `capacity`: entries before the next rehash |
+| `clearRetainingCapacity()`, `clearAndFree()`, `clone() -> ?Self` | |
+| `iterator()`, `keyIterator()`, `valueIterator()` | `next()` answers `?Entry` (`key: *K, value: *V`), `?*K`, `?*V` |
+
+| `ArrayList(T)` | |
+|---|---|
+| `init(allocator)`, `initCapacity(allocator, n)`, `fromOwnedSlice(allocator, slice)`, `deinit` | |
+| `items() -> []T`, `count()`, `last() -> ?T` | the slice is valid until the list grows |
+| `append(value)`, `appendSlice(values)`, `appendNTimes(value, n)`, `insert(index, value)` | false without memory |
+| `orderedRemove(index) -> T`, `swapRemove(index) -> T`, `pop() -> ?T` | |
+| `ensureTotalCapacity(n)`, `ensureUnusedCapacity(n)`, `resize(n)` | grown by half and a little more; `resize` leaves new elements undefined |
+| `clearRetainingCapacity()`, `clearAndFree()`, `toOwnedSlice() -> []T` | `toOwnedSlice`: the block at its size, the list's no more |
+
+Out of memory is answered (false, null), not trapped. Tests 387 to 389
+put and take 100 000 entries each under `MLX_LEAK_CHECK` and show every
+block given back; they run once the compiler takes a struct type in a
+function body (`fn HashMap(...) -> type { return @noncopy(struct) { ... } }`).
+
+## Hashing (`std.hash`)
+
+**Implementation:** `std/src/hash.mlx`
+**Source tests:** `386_hash_runtime.mlx` (`tests/run_std_modules.sh`),
+`391_hash_aggregates_runtime.mlx`
+
+```mlx
+const hash = @import("std.hash")
+const h = hash.wyhash("message digest", 3)        // 0x786d1f1df3801df4
+const w = hash.hashWord(42)
+const both = hash.combine(hash.combine(0, hash.hashWord(1)), hash.hashWord(2))
+const p = hash.autoHash(Point, Point.{ .x = 1, .y = -2 })
+const same = hash.autoEql([]const u8, copied, "abc")
+```
+
+`wyhash(bytes, seed)` is wyhash, final version 4.3, with its default
+secret, checked against the values the reference's `test_vector.cpp`
+prints; `hashBytes` is it with seed 0, `hashWord` hashes one 64-bit
+word, and `combine(seed, hash)` folds a hash into a running one, in
+order. `autoHash(T, value)` and `autoEql(T, a, b)` derive a hash and an
+equality from the type by reflection: integers (masked to their width and
+sign-extended, so a value hashes alike at every width), bools, enums,
+floats by their bits, pointers by address, optionals (null apart from
+any value), slices and arrays (plain elements as bytes in one wyhash
+call, others element by element), structs and tuples field by field.
+`StringContext` is the context `std.StringHashMap` takes;
+`AutoContext(K)` is in `std/src/containers/hash_map.mlx` until the
+compiler takes a struct type in a function body. The arithmetic is
+wrapping throughout (`*%`, `+%`, `<<%`); the 64 x 64 -> 128 multiply is
+done in 32-bit halves.
+
 ## Filesystem & process
 
 **Normative source:** `spec/04-stdlib/fs.xml`
@@ -710,7 +972,8 @@ specialized over.
 **Source tests:** `134_bootstrap_fs_runtime.mlx`,
 `142_bootstrap_process_arguments_runtime.mlx`,
 `204_process_environment_runtime.mlx`, `205_bootstrap_fs_status_runtime.mlx`,
-`139_bootstrap_elf_file_runtime.mlx`, `277_fs_entries_runtime.mlx`
+`139_bootstrap_elf_file_runtime.mlx`, `277_fs_entries_runtime.mlx`,
+`353_fs_whole_files_runtime.mlx` (run by `tests/run_std_modules.sh`)
 
 `fs.xml` names a portable filesystem API (`open create read write seek stat
 iterateDirectory makeDir delete rename`) "over std.os/std.posix backends,"
@@ -737,6 +1000,30 @@ while std.fs.nextEntry(&reader, &entry) {
     ...
 }
 if reader.failed { ... }
+```
+
+Whole files, by path, the way a program reads a setting or a /proc value
+and writes a cache (`tests/353_fs_whole_files_runtime.mlx`):
+`readFile(path, into, capacity)` reads all of a file or its first
+`capacity` bytes and returns how many (0 when it could not be opened;
+`readFileResult` returns -1 then), `readFileAlloc(path, allocator)` reads
+one of any length into an `ArrayList` (null when it could not be opened),
+`writeFile(path, bytes, length, mode)` writes one (made or emptied first),
+and `replaceFile(path, bytes, length, mode)` writes one whole or not at
+all: into `PATH.new`, made anew with `mode`, then renamed over `PATH`.
+`makeDirectories(path, mode)` is `mkdir -p` (for a slice),
+`makeParents(path, mode)` makes the folders a file goes in, `isDirectory`
+follows links, and `executablePath(into, capacity)` is /proc/self/exe's
+target, NUL-terminated. The desktop's settings files, the coreutils'
+operands, mlx-init, mlx-netd, mlx-sh, the generators under std/registry
+and the compiler's own output use them.
+
+```mlx
+var line: [256]u8 = undefined
+const bytes: [*]u8 = &line
+const length = std.fs.readFile("/proc/sys/kernel/hostname".pointer, bytes, 256)
+// `path` a slice, `c_path` the same path NUL-terminated.
+if !std.fs.makeParents(path, 493) || !std.fs.replaceFile(c_path, text.pointer, text.length, 420) { ... }
 ```
 
 A round-trip open/write/seek/read/close/delete over `/tmp`:
@@ -864,7 +1151,8 @@ pub fn main() -> u8 {
 ## math (`std.math`)
 
 **Implementation:** `std/src/math.mlx`
-**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`
+**Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`,
+`350_math_helpers_runtime.mlx`
 
 Floating-point math in Mlx on the doubles' bits, without libm. Import it as
 `@import("std.math")`; it imports nothing itself, so a `--plugin` library
@@ -874,7 +1162,16 @@ can use it too.
   `infinity()`, `negativeInfinity()`, `nan()`, `isNan(x)`, `abs(x)`.
 - Whole numbers: `floor`, `ceil`, `trunc` are the builtins `@floor`,
   `@ceil`, `@trunc` (one instruction); `round(x)` rounds halves away from
-  zero. The square root is `@sqrt`.
+  zero.
+- `min(a, b)`, `max(a, b)`, `clamp(x, low, high)` and `absolute(x)` on
+  `f64`, and `minOf`, `maxOf`, `clampOf`, `absoluteOf` for any number type
+  named first (`math.minOf(u32, version, 4)`); an `anytype` parameter
+  would take a literal's type from the literal, so the type is given.
+  `sqrt(x)` is `@sqrt` but 0 from 0 down (NaN stays NaN), what lengths
+  want; `smoothstep(from, to, x)` is 0 up to `from`, 1 from `to` on and
+  3t² − 2t³ between. The splash, MLX Observatory, `std.ui.vector`, the
+  compositor and the Android runtime use these instead of copies of
+  their own.
 - `sin(x)`, `cos(x)`: argument reduction by pi/2 in three parts, then
   fdlibm's minimax kernels; within an ulp of the exact value for |x| up to
   about 2^20 pi, 0 past 2^52 (NaN for the infinities and NaN).
@@ -899,6 +1196,278 @@ pub fn main() -> u8 {
 ```
 
 (`tests/325_standard_math_runtime.mlx`)
+
+## Encodings (`std.base64`)
+
+**Implementation:** `std/src/base64.mlx`
+**Source tests:** `347_base64_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The encodings of RFC 4648 — `Encoding.base64`, `base64url`, `base32`,
+`base32hex` and `base16` — without allocating: the caller sizes the
+output with `encodedLength(encoding, length, padded)` and
+`decodedLength(encoding, length)`. `encode(encoding, bytes, out, padded)`
+and `decode(encoding, text, out, ignoreGarbage)` work in one call; an
+`Encoder` (`encoderInit`, `encodeUpdate`, `encodeFinal`) and a `Decoder`
+(`decoderInit`, `decodeUpdate`) take the data in pieces and keep the bits
+of an unfinished symbol or byte between them. Decoding skips line breaks,
+spaces and tabs, stops at the padding, and refuses (or, with
+`ignoreGarbage`, skips) bytes outside the alphabet. `hexEncode` writes
+lower-case hex, the way digests are printed, and `hexDecode` reads hex
+of either case. The coreutils `base64`, `base32` and `basenc` and GLib's
+`g_base64_*` (`compiler/libc/glib/strings.mlx`) use it.
+
+```mlx
+const base64 = @import("std.base64")
+
+pub fn main() -> u8 {
+    var out: [8]u8 = undefined
+    const bytes: [*]u8 = &out
+    const count = base64.encode(base64.Encoding.base64, "foo", bytes, true)   // "Zm9v"
+    const back = base64.decode(base64.Encoding.base64, bytes[0..count], bytes, false)
+    return if back.ok && back.length == 3 { 13 } else { 1 }
+}
+```
+
+## Digests (`std.md5`, `std.blake2`, `std.sha1`, `std.sha2`)
+
+**Implementation:** `std/src/md5.mlx`, `std/src/blake2.mlx`,
+`std/src/sha1.mlx`, `std/src/sha2.mlx`
+**Source tests:** `348_md5_blake2_runtime.mlx`, `349_sha2_runtime.mlx`
+(run by `tests/run_std_modules.sh`); `tools/check_wifi.sh` for SHA-1's
+HMAC and PBKDF2
+
+Each digest has a state that takes the message in pieces (`…Init`,
+`…Update`, `…Final`, which wipes the state) and a one-call function;
+`std.base64.hexEncode` prints a digest the way the `…sum` tools do.
+
+- `std.md5`: `Md5`, `md5Init`, `md5Update`, `md5Final(&state, *[16]u8)`,
+  `md5(bytes, *[16]u8)` and `md5Hex(bytes, *[32]u8)` (RFC 1321; for the
+  formats that still use it, not for security). md5sum, the thumbnail
+  cache's file names (`projects/desktop/shared/thumbs.mlx`) and GLib's
+  `GChecksum` use it.
+- `std.blake2`: BLAKE2b (RFC 7693) with digests of 1 to 64 bytes, keyed
+  with up to 64 bytes or not: `Blake2b`, `blake2bInit(&state, length,
+  key)`, `blake2bUpdate`, `blake2bFinal(&state, out)`, `blake2b(bytes,
+  *[64]u8)` (512 bits, unkeyed, what b2sum prints) and
+  `blake2bWith(bytes, key, out, length)`.
+- `std.sha1`: SHA-1, HMAC-SHA1 and PBKDF2-HMAC-SHA1 (what WPA2 needs).
+- `std.sha2`: SHA-256 and SHA-512 (`Sha256`, `Sha512`, `sha256Init`,
+  `sha256Update`, `sha256Final`, `sha256`, and the same for 512), SHA-224
+  and SHA-384 on the same states from their own initial words
+  (`sha224Init` and `sha224Final(&state, *[28]u8)` on a `Sha256`,
+  `sha384Init` and `sha384Final(&state, *[48]u8)` on a `Sha512`;
+  `sha224`, `sha384` in one call), HMAC-SHA256 and PBKDF2-HMAC-SHA256.
+
+```mlx
+const md5 = @import("std.md5")
+const blake2 = @import("std.blake2")
+
+pub fn main() -> u8 {
+    var text: [32]u8 = undefined
+    md5.md5Hex("abc", &text)                  // 900150983cd24fb0d6963f7d28e17f72
+    var digest: [64]u8 = undefined
+    blake2.blake2b("abc", &digest)            // ba80a53f...
+    return if text[0] == 57 && digest[0] == 186 { 13 } else { 1 }
+}
+```
+
+## Random numbers (`std.random`)
+
+**Implementation:** `std/src/random.mlx`
+**Source tests:** `351_random_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+- From the kernel (getrandom(2)): `fill(into, length)` (false only on a
+  kernel without getrandom), `random64()` and `random32()` (mixed from the
+  monotonic clock if the kernel gives nothing, so they never fail), and
+  `getrandom(into, length, flags)` as the kernel answers it. Keys,
+  nonces and ids come from these: mlx-netd's DHCP transaction ids and
+  WPA nonces, MLXIPC's bus id, libpipewire's `pw_getrandom`/`pw_random`
+  and shuf without `--random-source`.
+- Seeded, for numbers that repeat with their seed: `Xoshiro256`
+  (xoshiro256**, its 256-bit state filled from the seed by splitmix64)
+  with `seed(&g, value)`, `seedFromKernel(&g)`, `next(&g)`,
+  `below(&g, bound)` (unbiased) and `unit(&g)` (a double in [0, 1));
+  `splitmix64(&state)` itself; and `Xorshift64Star` (Marsaglia's
+  xorshift64*) with `xorshift64StarNext` and `xorshift64StarUnit`, the
+  sequence the boot splash draws its stars from. None of these is for
+  secrets.
+
+```mlx
+const random = @import("std.random")
+
+pub fn main() -> u8 {
+    var generator: random.Xoshiro256 = undefined
+    random.seed(&generator, 42)
+    const roll = random.below(&generator, 6)       // 0 to 5, the same for seed 42
+    var key: [16]u8 = undefined
+    if !random.fill(&key, 16) { return 1 }
+    return if roll < 6 { 13 } else { 2 }
+}
+```
+
+## Terminals (`std.terminal.tty`)
+
+**Implementation:** `std/src/terminal/tty.mlx`
+**Source tests:** `352_terminal_tty_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The terminal a program runs on, on Linux: `isTerminal(descriptor)`;
+`windowSize(descriptor, &size)`, `columns(descriptor)` and
+`rows(descriptor)` (0 when unknown); the modes as a `Termios`
+(`getAttributes`, `setAttributes`) and `makeRaw(&cooked, &raw)` for a line
+editor (no echo, no canonical input, no signals from keys, no CR
+translation or flow control, reads of one byte); and job control:
+`foregroundGroup`, `setForegroundGroup`, `setProcessGroup` and
+`processGroup`. mlx-sh's line editor and job control and ls's column
+width use it; the test runs it on a pseudo-terminal of its own.
+
+## Base directories (`std.xdg`)
+
+**Implementation:** `std/src/xdg.mlx`
+**Source tests:** `354_xdg_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+Where a program keeps its files, by the XDG Base Directory
+Specification, from an environment list (`[*][*]const u8`, the program's
+or a child's). `home(environment, kind, into, capacity)` writes the
+user's directory of `kind` — `CONFIG` (`$XDG_CONFIG_HOME`, else
+`~/.config`), `DATA` (`~/.local/share`), `CACHE` (`~/.cache`) or `STATE`
+(`~/.local/state`) — NUL-terminated and returns its length, 0 when there
+is no home or it does not fit; `path(environment, kind, rest, into,
+capacity)` is the same with `rest` after it, all of it or nothing.
+`runtimeDirectory` is `$XDG_RUNTIME_DIR`; `dataDirectories` and
+`configDirectories` are the system's colon-separated lists (with the
+specification's defaults), walked by `nextDirectory(list, &at,
+&directory)`. As the specification asks, an empty or relative variable is
+ignored, and so is a `$HOME` that is not absolute. The desktop's settings
+and caches (the audio server, the compositor, the settings app, the dock's
+pins, the clock, the top bar, the trash, the thumbnails, MLXIPC's policy,
+service files and prompts, the greeter's sessions), std.ui's appearance,
+std.xkb, std.vulkan's loader and the code map use it.
+
+```mlx
+const xdg = @import("std.xdg")
+
+var path: [512]u8 = undefined
+const bytes: [*]u8 = &path
+const length = xdg.path(environment, xdg.CONFIG, "/mlx/audio.conf", bytes, 512)
+if length == 0 { ... }                          // no home, or too long
+```
+
+## Accounts and groups (`std.passwd`)
+
+**Implementation:** `std/src/passwd.mlx`
+**Source tests:** `355_passwd_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The accounts of /etc/passwd (`User`: `name`, `password`, `id`, `group`,
+`gecos`, `home`, `shell`) and the groups of /etc/group (`Group`: `name`,
+`password`, `id`, `members`), their fields slices of the file's text.
+`parseUser` and `parseGroup` read one line (false for a line with too
+few or too many fields or a number that is not one); `findUserNamed`,
+`findUserById`, `findGroupNamed` and `findGroupById` search a file's text;
+`userById`, `userNamed`, `groupById` and `groupNamed` read the file into
+the caller's buffer first. Nothing allocates. chown, chgrp and ls (the
+coreutils), libpulse's user name and home and libpipewire's user name use
+it.
+
+## Settings files (`std.conf`)
+
+**Implementation:** `std/src/conf.mlx`
+**Source tests:** `356_conf_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The "key = value" files the desktop and its services keep: blanks around
+keys and values, `#` comment lines, `[Group]` lines. `parseLine(line,
+&entry)` says what a line is (`BLANK`, `ENTRY`, `GROUP` or `OTHER`, a line
+without `=`); `lines(text)` and `next(&lines, &entry)` walk a file's
+entries, each with the group it is in; `find(text, key)` is the first
+value of a key; `parseSwitch(value, &on)` reads on/off, yes/no, true/false
+and 1/0.
+
+```mlx
+const conf = @import("std.conf")
+
+var lines = conf.lines(text)
+var entry: conf.Entry = undefined
+while conf.next(&lines, &entry) {
+    if std.text.same(entry.key, "volume") { ... entry.value ... }
+}
+```
+
+## Patterns (`std.glob`)
+
+**Implementation:** `std/src/glob.mlx`
+**Source tests:** `357_glob_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+The shell's patterns, as fnmatch has them: `*`, `?` and sets (`[a-z]`,
+`[!...]` or `[^...]`, a `]` first a member, a `[` without its `]` itself),
+over whole byte strings. `matches(pattern, text)` takes a backslash as
+making the next byte stand for itself; `matchesQuoted(pattern, literal,
+text)` takes the bytes a shell quoted instead (`literal[i] & 1`). mlx-sh's
+pathname expansion, `case` and `${...#...}`, and ls's `--ignore` and
+`--hide` use it.
+
+## Starting programs (`std.spawn`)
+
+**Implementation:** `std/src/spawn.mlx`
+**Source tests:** `360_spawn_runtime.mlx` (run by `tests/run_std_modules.sh`)
+
+A child is described by `Options` (`options(program, arguments,
+environment)` changes nothing else): `searchPath` looks a name without a
+slash up in the environment's PATH (`defaultPath` when it has none),
+`input`/`output`/`errors` become its standard descriptors, `extra` is
+handed over at `extraAt`, `keep`/`keepAlso` stay open across execve and
+`closing`/`closingAlso` are closed in it, `directory` is its working
+directory, `newSession` gives it a session of its own, `unblockSignals`
+clears the mask a parent with a signal descriptor left, `detach` starts
+the program from an intermediate child reaped at once, and `shareMemory`
+vforks (for large parents). `start` returns the pid (or -errno);
+`startReading` hands back the read end of a pipe the child writes to;
+`capture` runs it to its end with its output kept; `wait` and `ended`
+give the exit code or 128 plus the signal; `execute` and `executeIn` are
+the PATH lookup for children that fork themselves, and `find` is where a
+name would run from. A program that cannot run exits with 127.
+
+```mlx
+const spawn = @import("std.spawn")
+
+var options = spawn.options(program, argv, envp)
+options.searchPath = true
+var output: [4096]u8 = undefined
+var status: usize = 0
+const length = spawn.capture(&options, true, &output, 4096, &status)
+```
+
+## Finding fonts (`std.fontconfig`)
+
+**Implementation:** `std/src/fontconfig.mlx` and `std/src/fontconfig/`
+**Source tests:** `373_fontconfig_runtime.mlx` (run by `tests/run_std_modules.sh`);
+`tools/check_fontconfig.sh` for the C API over it (compiler/libc/fontconfig)
+
+Fontconfig 2.15's font matching without a C library: `load.current()`
+reads fonts.conf and what it includes (or Fontconfig's fallback
+configuration) and the fonts of its directories, each face read by
+`std.truetype` into a pattern of Fontconfig's objects and kept in a
+cache of the module's own under `$XDG_CACHE_HOME/mlx-fontconfig`.
+`pattern.parseName` makes a pattern of a name ("sans-serif:bold"),
+`config.substitute` and `config.defaultSubstitute` apply the rules and
+the defaults, and `matching.fontMatch`, `matching.fontSort` and
+`matching.fontList` match, sort and list as Fontconfig does. Patterns,
+character sets, language sets and the configuration are records reached
+by their addresses, as the C API hands them out; strings compare with
+Fontconfig's case folding (`strings`, of CaseFolding.txt). The languages'
+orthographies (`std/registry/fontconfig`, Fontconfig's fc-lang) and the
+folding are made into `std/src/fontconfig/data.mlx` by
+`std/registry/fontconfig/generate.mlx`.
+
+```mlx
+const fc = @import("std.fontconfig")
+
+const config = fc.load.current()
+const p = fc.pattern.parseName(name)
+_ = fc.config.substitute(config, p, fc.config.MATCH_PATTERN)
+fc.config.defaultSubstitute(p)
+var result: i64 = 0
+const font = fc.matching.fontMatch(config, p, &result)
+const file = fc.pattern.firstString(font, fc.objects.FILE)
+```
 
 ## fmt
 
@@ -1009,7 +1578,9 @@ What exists today is the **Linux raw syscall gateway** (Stage-1 Core), not
 yet a portable `std.posix` facade abstracting over multiple backends.
 `std/bootstrap/os/linux.mlx` defines the `syscall0`..`syscall6` extern
 gateway (`extern("syscall")`, arguments loaded per the x86_64 Linux ABI) plus
-`SYS_*` numeric constants for the file/process syscalls it wraps in `fs.mlx`:
+the `SYS_*` numbers of every system call the repository makes (x86_64's;
+the aarch64 backend translates them, so programs keep no table of their
+own):
 
 ```mlx
 pub extern("syscall") fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {}
@@ -1021,7 +1592,21 @@ pub const SYS_open: usize = 2
 
 (`std/bootstrap/os/linux.mlx`)
 
-It re-exports five sub-namespaces, each a thin syscall wrapper module:
+Beside them it has the kernel's constants as the system calls take them:
+errors negated (`EINTR`, `EAGAIN`, ... as `isize`), `O_*`, `AT_FDCWD`,
+`F_*`, `S_IF*`, `PROT_*`/`MAP_*`/`MFD_*`, the signal numbers (`SIGHUP` ...
+`SIGWINCH`), `SIG_BLOCK`..., `WNOHANG`..., `CLOCK_*`; and thin wrappers
+over raw descriptors (`isize`, -errno on failure): `read`, `write`,
+`writeAll` (again after `EINTR`), `close` (a negative descriptor is left
+alone), `open`, `openAt`, `ioctl`, `fcntl`, `keepOnExec` (clears
+`FD_CLOEXEC` for a child), `setNonBlocking`, `dup`, `dup2`, `pipe`,
+`seek`, `truncate`, `getdents`, `unlink`, `makeDirectory`, `chmod`,
+`chdir`, `mmap`, `mapShared`/`mapAnonymous`/`munmap`, `memfdCreate`, `getpid`,
+`exitGroup`, `sleepMilliseconds`, and `failed` (whether a raw result is
+an error rather than an address).
+
+It re-exports nine sub-namespaces, each a thin syscall wrapper module or
+the kernel's definitions for one kind of device:
 
 - `os/linux/thread.mlx` — `clone`/`clone3`/`futex` numbers and `CLONE_*`
   flags, plus `futex`/`futexWait`/`futexWake`, `getTid`, `yield`, `exit`,
@@ -1033,16 +1618,43 @@ It re-exports five sub-namespaces, each a thin syscall wrapper module:
   `SOCK_STREAM`/`SOCK_DGRAM`, and syscall wrappers `open` (socket),
   `bind`/`listen`/`connect`/`accept`/`accept4`, `send`/`receive`/`sendTo`/
   `receiveFrom`/`sendMessage`/`receiveMessage`, `setOption`/`getOption`,
-  `setNonBlocking` (via `fcntl`).
+  `setNonBlocking` (via `fcntl`); Unix sockets by path or abstract name
+  (`unixAddress`, `connectUnix`, `listenUnix`), `peerCredentials`
+  (`SO_PEERCRED`), and descriptors passed along (`sendWithDescriptors`,
+  `receiveWithDescriptors`: `SCM_RIGHTS`, `EINTR` retried, descriptors
+  beyond the caller's room closed).
 - `os/linux/event.mlx` — raw `poll`, `epollCreate`/`epollControl`/
-  `epollWait`, and `io_uring` setup/enter/register wrappers, with kernel ABI
-  event-buffer layouts left to a future portable event-loop layer.
+  `epollWait`, and `io_uring` setup/enter/register wrappers; `poll` records
+  in byte arrays (`pollSet`, `pollResult`, `waitReady`); the event loop the
+  services share: an epoll set whose descriptors carry a token of the
+  caller's (`createEventLoop`, `watch`/`rewatch`/`unwatch`, `waitEvents`
+  into `Events`, `eventFlags`, `eventToken`; std.wayland's and std.dbus's
+  loops are this one); signals as a descriptor (`signalDescriptor(mask)`
+  blocks them, `readSignal`), timers (`createTimer`, `setTimer`), event
+  counters (`createCounter`, `addToCounter`, `readCounter`) and inotify
+  (`createWatcher`, `addWatch`).
 - `os/linux/system.mlx` — `getSystemInfo` (`uname`, filling a `UtsName` of
   six 65-byte fields) and `availableProcessorCount` (via
   `sched_getaffinity`'s returned CPU mask, popcounted by hand).
 - `os/linux/process.mlx` — `execve`, `ignoreSignal`/`defaultSignal`
   (`rt_sigaction`), `blockSignals`/`unblockSignals`, `isAlive` (`kill(pid,
-  0)`).
+  0)`); `fork`, `waitProcess` (`wait4`, `EINTR` retried) with `exitStatus`
+  (the code, or 128 plus the signal), `succeeded`, `stopped`,
+  `stopSignal`, `continued`; `kill`, `setSession`, `prctl`; signal sets as
+  a word (`signalBit`, `changeSignalMask`, `unblockAllSignals`,
+  `setSignalHandler`).
+- `os/linux/tty.mlx`, `os/linux/fbdev.mlx`, `os/linux/evdev.mlx`,
+  `os/linux/drm.mlx` — the kernel's definitions for terminals and virtual
+  consoles (`TCGETS`, `TIOCSCTTY`, `KDSETMODE`, `VT_ACTIVATE`, ...), the
+  framebuffer (`query` fills a `Screen`), input devices (event records,
+  `EV_*`/`KEY_*`/`BTN_*`, the `EVIOCG*` request numbers, `isKeyboard`) and
+  KMS (the mode-setting ioctls, PRIME flags, capabilities, formats), which
+  mlx-console, mlx-splash and the compositor share.
+
+`tests/359_linux_descriptors_runtime.mlx` (run by
+`tests/run_std_modules.sh`) takes a pipe, a timer, a signal and an event
+counter through the event loop and poll, passes descriptors over a socket
+pair, connects to a Unix socket by path and forks and waits for a child.
 
 A socketpair + non-blocking + epoll round-trip:
 
@@ -1109,9 +1721,282 @@ above for what's actually exercised — `getTid`/`yield`/`futexWait`/
 `futexWake` through the raw syscall gateway, not a handle-based spawn/join
 API. No fixture calls `clone`/`clone3` to actually spawn an OS thread.
 
-## Networking (`std.net`) — not yet normative
+## URIs (`std.uri`)
 
-**Normative source:** none (see gap below)
+**Normative source:** none yet (RFC 3986)
+
+`std/src/uri.mlx` splits a URI reference into its parts (`parse(text,
+&uri)`: scheme, userinfo, host with an IPv6 literal's brackets, port,
+path, query, fragment, each with whether it is there; a port that is not
+digits, a space, a control character or a broken `%XX` is refused),
+resolves a reference against a base (`resolve(&base, reference, out)`,
+RFC 3986 5.2 with `removeDotSegments`; 0 when it does not fit), writes a
+URI back (`write`, `writeNormalized` with the scheme and host in lower
+case and a default port left out, `writeTarget` for a request's path and
+query, `writeHostHeader`), knows the default ports (`portOf`,
+`defaultPort`, `usesDefaultPort`, `hostName`, `sameOrigin`, `isHttp`,
+`isHttps`), percent-codes (`decode` with `+` as a space when asked,
+`encode` with what to keep, `PATH_ALLOWED`, `QUERY_ALLOWED`) and walks a
+query's pairs (`nextPair`). It allocates nothing: a `Uri` borrows its
+text. `tests/380_uri_message_runtime.mlx` checks RFC 3986 5.4's
+examples among others.
+
+## Public-key arithmetic (`std.crypto.mpi`, `std.crypto.rsa`)
+
+**Normative source:** none yet (RFC 8017 for RSA; `tools/check_gcrypt.sh`
+compares the libgcrypt shim, whose limb arithmetic is this module's, with
+libgcrypt 1.10)
+
+`std/src/crypto/mpi.mlx` is signed integers of any size, 64-bit limbs in
+memory of an `Allocator` (`init`, `deinit`): read from and written as
+hexadecimal (`fromHex`, `writeHex`) or big-endian bytes (`fromBytes`,
+`toBytes`), `add`, `sub`, `mul` and their `U64` forms, `divRem`
+(truncating) and `floorDivRem`, `mod`, `remainderU64`, `compare`,
+bits (`bitLength`, `testBit`, `setBit`, `clearBit`, `clearHigh`,
+`shiftLeft`, `shiftRight`), `powm` (an odd modulus goes through
+std.crypto.bignum's constant-time ladder, so a secret exponent is safe;
+`powmPublic` is faster for one that is not), `gcd`, `invm`,
+`isProbablePrime` (trial division, then Miller-Rabin with random bases)
+and `generatePrime(p, bits, e)` with gcd(p - 1, e) = 1. An operand may
+be the result; every operation answers false when memory ran out. The
+limb routines (`addLimbs`, `mulLimbs`, `divLimbs`...) are public for
+code with limbs of its own.
+
+`std/src/crypto/rsa.mlx` adds to its verification a `PrivateKey`
+(`privateKeyInit` from n, e, d and optionally p and q, the CRT's values
+worked out and p q = n checked; 6 KB, kept where it was initialized):
+`signPkcs1`, `signPss` (a salt given) and `signPssRandom`,
+`encryptPkcs1` (`encryptPkcs1With` a padding given) and `decryptPkcs1`,
+`encryptOaep` (a seed given) and `encryptOaepRandom` and `decryptOaep`,
+and `generateKey(key, allocator, bits, e)`. The private operation runs
+by the CRT on std.crypto.bignum and its result is checked with e before
+it is given out. Test 384 checks the arithmetic and signatures and
+ciphers against values Python computed, and a generated key.
+
+## HTTP (`std.http.*`)
+
+**Normative source:** none yet (the modules follow libsoup's behaviour,
+which WebKit's network code expects; `tools/check_soup.sh` compares the C
+shim over them with libsoup 3.4)
+
+`std/src/http/` holds HTTP's pieces that do not depend on how bytes move:
+`std.http.headers` (header lists, q-values, parameters, the names libsoup
+knows), `std.http.date`, `std.http.status`, `std.http.form`,
+`std.http.chunked`, `std.http.sniff`, `std.http.psl` (the Public Suffix
+List), `std.http.cookie` and `std.http.websocket` (see `std/src/README.md`
+for each). Tests 370 and 371 cover them. `std.http.mime` is the other
+side of sniffing: the media type of a local file, guessed from the
+name's extension (the web's common types, as GIO answers from the
+shared-mime-info database, with whether it calls the answer uncertain;
+`byName`), from the first bytes (`byData`: signatures, tags, text) or
+both (`guess`, g_content_type_guess's rule); test 383.
+
+### Message heads (`std.http.message`)
+
+`std/src/http/message.mlx` reads and writes HTTP/1.1 heads as libsoup
+does: `parseRequestLine` (the status a bad one deserves: 400, 505),
+`parseStatusLine` (HTTP/1.x and Shoutcast's ICY, the version said even
+when the code is bad), `headerLines`/`headerLinesFrom` with `nextHeader`
+(continuation lines folded to one space, trailing spaces off, carriage
+returns made spaces, lines that are not headers passed over, a head cut
+short told by `truncated`), `headEnd` (past the blank line);
+`writeRequestLine`, `writeStatusLine`, `writeHeader`, `writeHeadEnd`;
+`framingOf` (chunked, Content-Length, to the connection's end, or no
+body), `responseHasNoBody`; and the rules of redirects as libsoup
+follows them (`redirectOf`: 303, and 302 of an unsafe method, and 301 of
+a POST as a GET; 301, 302, 307 and 308 of a safe method as they are;
+`isSafeMethod`, `MAX_REDIRECTS`). mlx-soup's soup_headers_parse,
+soup_headers_parse_request, soup_headers_parse_status_line and the
+session's redirect handler are over it; test 380 checks it.
+
+### The client (`std.http.client`)
+
+`std/src/http/client.mlx` is an HTTP/1.1 client for Mlx programs (the
+browser Voyager's), on std.net, std.tls and the modules above. A
+`Session` (`init`, `deinit`) keeps up to eight connections by scheme,
+host and port and reuses them while they stay open; `request(&session,
+&req, &response)` (`get`, `post`) sends a `Request` (method, URL, extra
+header lines, a body) and gives a `Response`: the status, version and
+phrase, the head as it came (`header(&response, name, folded, &value)`
+finds one), the body with gzip or deflate undone (`body`), the URL it
+came from and how many redirects were followed (`freeResponse` gives the
+memory back). It follows redirects as libsoup does (`std.http.message`,
+up to `maxRedirects`), answers a 401's Basic or Digest challenge once
+with what the `setCredentials` callback gives for the host and realm and
+keeps the credentials for the host's later requests, sends the cookies
+of a jar and takes the ones set (`setCookieJar`), rewrites http:// to
+https:// for hosts an enforcer knows (`setHsts`), reads bodies framed by
+Content-Length, chunks (trailers passed over) or the connection's end,
+passes over informational responses, and reads no body for HEAD, 1xx,
+204 and 304. https:// runs on std.tls with ALPN http/1.1, the server's
+chain verified against the system's CA bundle
+(`/etc/ssl/certs/ca-certificates.crt`, loaded when first needed) or a
+trust store given (`setTrustStore`), and refused otherwise unless
+`insecure` is set. Each wait on the network takes at most `timeoutMs`
+(30 s); a body past `maxBody` (64 MiB) is `Error.tooLarge`. The errors
+name what went wrong: `badUrl`, `resolve`, `connect`, `tls`, `send`,
+`receive`, `malformed`, `tooManyRedirects`, `noMemory`. Everything is
+synchronous. `tests/382_http_client_runtime.mlx` runs a session against
+a server of its own in a child process on the loopback.
+
+### Authentication (`std.http.auth`)
+
+`std/src/http/auth.mlx` is HTTP authentication (RFC 7235) as libsoup does
+it, allocating nothing:
+
+- `challenges(header)` and `nextChallenge(&it, &challenge)` tell the
+  challenges of a `WWW-Authenticate` or `Proxy-Authenticate` value apart
+  (an item that is a scheme alone, or a scheme and its first parameter,
+  starts one); `schemeIs(challenge, "Digest")`, `paramsOf(challenge,
+  scheme)`, and `findParam(params, name, out, &length)` (the first of
+  that name, unquoted; `Found.bare` for a name alone).
+- Basic (RFC 7617): `basicToken(user, password, out)` (the base64 of
+  `user:password`, in ISO-8859-1 when every character has a code there,
+  as libsoup's `g_convert` makes it; `basicTokenRoom` sizes `out`),
+  `writeBasic(sink, token)`, `basicSpace(path)` (the directory a Basic
+  realm covers).
+- Digest (RFC 7616, MD5 and MD5-sess, `qop=auth`): `digestChallenge(params,
+  &d)` reads a `DigestChallenge` (realm, nonce, opaque, domain, algorithm,
+  the qop options, stale; false when it cannot be answered), `hexUrp`,
+  `hexA1`, `digestResponse(method, uri, &a1, qopAuth, nonce, cnonce, nc,
+  &out)` (RFC 2617's request-digest), `clientNonce`, `nonceCountHex` and
+  `nonceCountOf`, `writeDigest(sink, &credentials)` (the Authorization
+  value as libsoup writes it: `username`, `realm`, `nonce`, `uri`,
+  `algorithm`, `response`, `opaque`, `cnonce`, `nc`, `qop`),
+  `nextDomainItem` and `withoutTrailingSlash` for a challenge's `domain`.
+  A server checks a response with the same `digestResponse`.
+
+`tests/376_http_auth_runtime.mlx` checks RFC 2617's example (Mufasa's
+response `6629fae49393a05397450978507c4ef1`), RFC 7617's token, the
+challenge splitting and the written values; mlx-soup's `SoupAuthBasic`,
+`SoupAuthDigest`, auth manager and auth domains (compiler/libc/soup) are
+over it.
+
+### Cookies (`std.http.cookie`, `std.http.cookiejar`)
+
+`std/src/http/cookie.mlx` is a cookie (RFC 6265) as libsoup reads,
+writes and matches one. A `Cookie` has a name, value, domain and path
+(the last two may be absent), an expiry in seconds since the Unix epoch
+(none for a session cookie), Secure, HttpOnly and `SameSite` (none, lax,
+strict); it owns its texts (one block of an allocator, `cookieFree`) or
+borrows them (`view`). `parseSetCookie(allocator, text, hasOrigin, host,
+path, now, &out)` reads a Set-Cookie value with libsoup's rules: Max-Age
+and Expires in order, the last one winning; a domain needing a dot past
+its first character and getting one before it unless it is an address;
+the origin's host having to be in the domain; the default path from the
+request's. `write`/`writeSetCookie`/`writeCookieHeader` write it back
+(`expires=` in the cookie date form, `path=`, `domain=`, `SameSite=`,
+`secure`, `HttpOnly`). `hostMatches`, `pathMatches`, `defaultPath`,
+`appliesTo(cookie, https, path, now)`, `equal` (name, value, path),
+`isExpired`, `setMaxAge`, `isIpAddress`; `nameAndValue`, `nextAttribute`
+and `value` are the syntax alone.
+
+`std/src/http/cookiejar.mlx` is the jar: `init(&jar, allocator)`,
+`setCookie(&jar, header, &origin, hasFirstParty, firstPartyHost, now)`
+and `addCookie` take a cookie by the jar's `policy` (`Policy.always`,
+`never`, `noThirdParty`, `grandfatheredThirdParty`: a third party is one
+whose registrable domain, by the Public Suffix List, is not the first
+party's; `baseDomain`) and libsoup's rules (no public suffixes, no
+Secure cookie from http, SameSite=None only with Secure, the `__Secure-`
+and `__Host-` prefixes, no control characters, 4096 bytes), replacing
+one of the same name and path or dropping an expired one; `cookiesFor(&jar,
+&request, now, &found)` gives those that go with a `Request` (host,
+normalized path, https, for HTTP or a script, a safe method, a top-level
+navigation, the top-level site and the site for cookies for SameSite),
+longest paths first then the oldest, as `writeCookieHeader` lists them;
+`deleteCookie`, `next` with an `Iterator`, `count`; `onChanged(&jar,
+callback, context)` is told of each change with the cookie before and
+after. The Mozilla cookies.txt form (`#HttpOnly_` lines, `TRUE`/`FALSE`
+flags, expiry, SameSite last): `loadText`, `writeText`, `parseTextLine`,
+`writeTextLine`, and `rewriteText` (what SoupCookieJarText writes after a
+change).
+
+`tests/377_http_cookies_runtime.mlx` feeds a jar what mlx-soup's
+`tests/cookies.c` feeds one and expects the headers libsoup gives;
+mlx-soup's SoupCookie, SoupCookieJar, SoupCookieJarText and
+SoupCookieJarDB are over these modules.
+
+### Strict Transport Security (`std.http.hsts`)
+
+`std/src/http/hsts.mlx` is HSTS (RFC 6797) as libsoup's enforcer keeps
+it. A `Policy` is a domain, its max-age, its expiry (none for a session
+policy) and whether it covers subdomains (`policy(domain, maxAge,
+includeSubdomains, now)`, `sessionPolicy`, `policyWithExpiry`,
+`isSession`, `isExpired`, `equal`, `own`/`policyFree`);
+`parseHeader(value, host, now, &out)` reads a Strict-Transport-Security
+value strictly (max-age in digits, quoted or not; includeSubDomains
+without a value; no parameter twice). An `Enforcer` (`init`, `deinit`,
+`onChanged`) keeps host and session policies: `setPolicy` (an expired
+one removes the domain's; a changed one is told), `setSessionPolicy`,
+`hasValidPolicy`, `includesSubdomains`, `superDomain`, `mustEnforce`
+(the host or a domain above it with a policy covering subdomains),
+`policyAt`; its file is a line per host policy (`writeText`, `loadText`,
+`parseTextLine`). `tests/378_http_hsts_runtime.mlx` checks the headers
+of mlx-soup's `tests/hsts.c` and the enforcer's answers; mlx-soup's
+SoupHSTSPolicy, SoupHSTSEnforcer and SoupHSTSEnforcerDB are over it.
+
+### Multipart bodies (`std.http.multipart`)
+
+`std/src/http/multipart.mlx` cuts and writes multipart bodies (RFC 2046)
+as libsoup does, allocating nothing: `boundaryOf(contentType, out)` (the
+boundary of a `multipart/...` Content-Type), `mediaType`, `paramOf`;
+`parts(body, boundary)` and `nextPart(&it, &part)` give each part's
+header lines (`headers`, and `raw` from the boundary line on) and bytes,
+the preamble skipped, `findBoundary` looking as libsoup looks (a body
+without a closing boundary is not `wellFormed`); `writePartStart`,
+`writeHeader`, `writeHeadersEnd`, `writeClose`, `writeFormDisposition`
+(`form-data; name="..."; filename="..."`), `writeContentType` and
+`makeBoundary` (the SHA-256 of 8 random bytes, in hex) write one.
+mlx-soup's SoupMultipart is over it (its part stream stays GIO's).
+
+### WebSockets (`std.http.websocket`, `std.http.websocket.deflate`)
+
+`std/src/http/websocket.mlx` has RFC 6455's pieces that do not depend on
+how bytes move: `makeKey` (16 random bytes to a Sec-WebSocket-Key),
+`validKey`, `acceptKey` and `acceptMatches` (the server's
+Sec-WebSocket-Accept, compared case aside), `protocolAsked` and
+`anyProtocolAsked` (a Sec-WebSocket-Protocol value split at commas and
+spaces, as libsoup splits it), `nextExtension` (the elements of a
+Sec-WebSocket-Extensions value: name and parameters), frame headers
+(`parseHeader`, `writeHeader`), `applyMask` and `validUtf8`.
+
+`std/src/http/websocket/deflate.mlx` is the permessage-deflate extension
+(RFC 7692) as libsoup's: an `Extension` (`init`, `deinit`) configured
+for a client or a server from an element's parameters
+(`server_no_context_takeover`, `client_no_context_takeover`,
+`server_max_window_bits`, `client_max_window_bits`; `parseParams`,
+`configure`, the `Error` naming what was wrong and `badName` which
+parameter), `REQUEST_PARAMS` and `writeResponseParams`; `outgoing`
+compresses a message (a sync flush, its 00 00 ff ff taken off, RSV1 set
+on the frame's first byte; control frames and empty payloads pass) and
+`incoming` inflates a frame (the tail put back at the message's end,
+fragments carried, context takeover or not), into `Bytes` of the
+extension's allocator (`freeBytes`).
+
+`tests/379_http_multipart_websocket_runtime.mlx` checks the bodies,
+keys (RFC 6455's example), headers and compressed messages; mlx-soup's
+SoupMultipart, handshake and SoupWebsocketExtensionDeflate are over
+them (SoupWebsocketConnection itself stays GIO's).
+
+## Networking (`std.net`, `std.net.dns`)
+
+**Normative source:** none yet (see the gap below)
+
+`std/src/net.mlx` is TCP over IPv4 and IPv6 on std.linux's socket calls:
+an `Address` (family, bytes, port, an IPv6 scope) read from a literal
+(`parseAddress`, `parseIpv4`, `parseIpv6` with brackets, an IPv4 tail
+and a `%scope`) and written back as inet_ntop writes it
+(`writeAddress`), `ipv4(a, b, c, d, port)`, the `sockaddr` both ways;
+`connect(&address, timeoutMs)` (non-blocking until connected, then
+blocking, TCP_NODELAY set), `listen`, `accept`, `localAddress` (the port
+the system picked), `send` (all of it), `receive`, `readable` (with a
+timeout), `shutdownWrite`, `close`. `resolve(name, port, found, max,
+timeoutMs)` is `std/src/net/dns.mlx`'s: an address literal and
+"localhost" answered at once, then `/etc/hosts`, then the name servers
+of `/etc/resolv.conf` asked over UDP for A and AAAA records (RFC 1035
+messages written and read, compression pointers and CNAMEs followed),
+IPv4 addresses first. `tests/381_net_runtime.mlx` checks the addresses,
+a connection on the loopback and the DNS messages.
 
 `spec/04-stdlib/posix.xml` requires the raw syscalls a network stack would
 sit on (`socket bind listen accept connect send recv sendmsg recvmsg poll`),
@@ -1126,11 +2011,12 @@ particularly `os/linux/socket.mlx` and
 > specified. Raw `std.os.linux`/`std.posix` wrappers can follow the platform
 > ABI; a portable `std.net` interface requires an added normative contract.
 
-There is accordingly no `std.net` module, and this chapter does not describe
-one. Programs needing sockets today go directly through
-`std.os.linux.socket`/`std.os.linux.event` (Unix-domain sockets, raw
-`AF_INET`/`AF_INET6` constants, `epoll`, and a raw `io_uring` setup/enter/
-register gateway), as `tests/181_linux_socket_epoll_runtime.mlx` and
+`std.net` above is the first such module, without a normative contract
+yet (no event-loop API, no UDP beyond the resolver's own). Programs
+needing more go directly through `std.os.linux.socket`/`std.os.linux.event`
+(Unix-domain sockets, raw `AF_INET`/`AF_INET6` constants, `epoll`, and a
+raw `io_uring` setup/enter/register gateway), as
+`tests/181_linux_socket_epoll_runtime.mlx` and
 `tests/187_linux_io_uring_runtime.mlx` do.
 
 ## meta

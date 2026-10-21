@@ -1,0 +1,486 @@
+// GSocket, GIOStream and GSocketConnection (gsocket.h, giostream.h,
+// gsocketconnection.h), as GIO keeps them: the socket's descriptor is
+// always non-blocking, and a blocking GSocket waits (poll, with its
+// timeout and the cancellable's descriptor) and tries again. Errors are
+// GIO's ("Error receiving data: ...", the code errno maps to).
+//
+// A GSocket: a GObject, then (24) a record of the descriptor (0), family
+// (4), type (8), protocol (12), blocking (16), keepalive (20), timeout in
+// seconds (24), connected (28), closed (32). A GIOStream: a GObject and
+// (24) a record of closed (0), pending (4) and the input (8) and output
+// (16) streams of a stream that keeps them (a connection's socket streams
+// made when first asked for, GSimpleIOStream's); a GSocketConnection adds
+// its socket (32), GUnixConnection and GTCPConnection (what the factory
+// makes for those families) nothing. A socket's source: a GSource (96 bytes), the socket
+// (96), the condition (104), the descriptor's tag (112).
+const m = @import("./memory.mlx")
+const sys = @import("./sys.mlx")
+const threads = @import("./threads.mlx")
+const errors = @import("./errors.mlx")
+const types = @import("./types.mlx")
+const ioerrors = @import("./ioerrors.mlx")
+const cancellable = @import("./cancellable.mlx")
+const streams = @import("./streams.mlx")
+
+extern("c") fn g_object_new(t: usize, first: usize) -> usize
+extern("c") fn g_object_ref(object: usize) -> usize
+extern("c") fn g_object_unref(object: usize) -> void
+extern("c") fn socket(domain: i32, kind: i32, protocol: i32) -> i32
+extern("c") fn recv(fd: i32, buffer: usize, size: usize, flags: i32) -> isize
+extern("c") fn send(fd: i32, buffer: usize, size: usize, flags: i32) -> isize
+extern("c") fn shutdown(fd: i32, how: i32) -> i32
+extern("c") fn getsockopt(fd: i32, level: i32, name: i32, value: usize, length: usize) -> i32
+extern("c") fn setsockopt(fd: i32, level: i32, name: i32, value: usize, length: u32) -> i32
+extern("c") fn getsockname(fd: i32, address: usize, length: usize) -> i32
+extern("c") fn getpeername(fd: i32, address: usize, length: usize) -> i32
+extern("c") fn ioctl(fd: i32, request: u64, argument: usize) -> i32
+extern("c") fn g_source_new(funcs: usize, size: u32) -> usize
+extern("c") fn g_source_add_unix_fd(source: usize, fd: i32, events: i32) -> usize
+extern("c") fn g_source_query_unix_fd(source: usize, tag: usize) -> i32
+extern("c") fn g_source_set_static_name(source: usize, name: usize) -> void
+extern("c") fn g_source_add_child_source(source: usize, child: usize) -> void
+extern("c") fn g_source_set_callback(source: usize, func: usize, data: usize, notify: usize) -> void
+extern("c") fn g_source_unref(source: usize) -> void
+extern("c") fn g_cancellable_source_new(c: usize) -> usize
+extern("c") fn g_cancellable_release_fd(c: usize) -> void
+extern("c") fn g_get_monotonic_time() -> i64
+
+const S_FD: usize = 0
+const S_FAMILY: usize = 4
+const S_TYPE: usize = 8
+const S_PROTOCOL: usize = 12
+const S_BLOCKING: usize = 16
+const S_KEEPALIVE: usize = 20
+const S_TIMEOUT: usize = 24
+const S_CONNECTED: usize = 28
+const S_CLOSED: usize = 32
+const S_SIZE: usize = 40
+
+const G_IO_IN: i32 = 1
+const G_IO_OUT: i32 = 4
+const G_IO_ERR: i32 = 8
+const G_IO_HUP: i32 = 16
+
+const SOL_SOCKET: i32 = 1
+const SO_TYPE: i32 = 3
+const SO_KEEPALIVE: i32 = 9
+const SO_PROTOCOL: i32 = 38
+const SOCK_CLOEXEC: i32 = 524288
+const O_NONBLOCK: i32 = 2048
+const MSG_NOSIGNAL: i32 = 0x4000
+const FIONREAD: u64 = 0x541b
+
+pub const SocketSourceFunc = fn(usize, i32, usize) -> i32
+pub const CloseFunc = fn(usize, usize, usize) -> i32
+
+var socketType: usize = 0
+var socketOnce: u64 = 0
+var streamType: usize = 0
+var connectionType: usize = 0
+var unixConnectionType: usize = 0
+var tcpConnectionType: usize = 0
+var streamOnce: u64 = 0
+var sourceFuncs: [6]usize = undefined
+
+fn rec(s: usize) -> usize { return m.getWord(s + 24) }
+fn fdOf(s: usize) -> i32 { return m.getI32(rec(s) + S_FD) }
+
+// ---------------------------------------------------------------------------
+// GSocket
+
+export fn __mlx_glib_socket_init(s: usize, class: usize) -> void {
+    const r = m.alloc(S_SIZE)
+    m.putI32(r + S_FD, -1)
+    m.put32(r + S_BLOCKING, 1)
+    m.putWord(s + 24, r)
+}
+
+export fn __mlx_glib_socket_finalize(s: usize) -> void {
+    const r = rec(s)
+    if m.get32(r + S_CLOSED) == 0 && m.getI32(r + S_FD) >= 0 { _ = sys.close(m.getI32(r + S_FD)) }
+    m.release(r)
+    ioerrors.chainUp(types.T_OBJECT, 48, s)
+}
+
+export fn __mlx_glib_socket_class_init(class: usize, data: usize) -> void { m.putWord(class + 48, @intFromPtr(__mlx_glib_socket_finalize)) }
+
+export fn __mlx_glib_socket_dummy(data: usize) -> i32 { return 1 }
+
+export fn __mlx_glib_socket_source_dispatch(source: usize, callback: usize, user_data: usize) -> i32 {
+    const s = m.getWord(source + 96)
+    const condition = m.getI32(source + 104)
+    const events = g_source_query_unix_fd(source, m.getWord(source + 112))
+    if callback == 0 { return 0 }
+    const call: SocketSourceFunc = unsafe { @ptrFromInt(SocketSourceFunc, callback) }
+    return call(s, events & condition, user_data)
+}
+
+export fn __mlx_glib_socket_source_finalize(source: usize) -> void { g_object_unref(m.getWord(source + 96)) }
+
+pub fn socketGType() -> usize {
+    if threads.onceEnter(@intFromPtr(&socketOnce)) {
+        types.ensureInit()
+        socketType = ioerrors.defineType(types.T_OBJECT, "GSocket", 136 + 80, @intFromPtr(__mlx_glib_socket_class_init), 32, @intFromPtr(__mlx_glib_socket_init), 0)
+        sourceFuncs[0] = 0
+        sourceFuncs[1] = 0
+        sourceFuncs[2] = @intFromPtr(__mlx_glib_socket_source_dispatch)
+        sourceFuncs[3] = @intFromPtr(__mlx_glib_socket_source_finalize)
+        sourceFuncs[4] = 0
+        sourceFuncs[5] = 0
+        threads.onceLeave(@intFromPtr(&socketOnce), 1)
+    }
+    return socketType
+}
+
+export fn g_socket_get_type() -> usize { return socketGType() }
+
+fn errnoError(err: usize, prefix: []const u8) -> void { ioerrors.setErrno(err, prefix, sys.errno()) }
+
+fn makeNonBlocking(fd: i32) -> void {
+    const flags = sys.fcntl(fd, 3, 0)
+    if flags >= 0 { _ = sys.fcntl(fd, 4, @intCast(usize, flags | O_NONBLOCK)) }
+}
+
+fn wrap(fd: i32) -> usize {
+    const s = g_object_new(socketGType(), 0)
+    m.putI32(rec(s) + S_FD, fd)
+    makeNonBlocking(fd)
+    return s
+}
+
+export fn g_socket_new(family: i32, kind: i32, protocol: i32, err: usize) -> usize {
+    const fd = socket(family, kind | SOCK_CLOEXEC, if protocol < 0 { 0 } else { protocol })
+    if fd < 0 {
+        errnoError(err, "Unable to create socket: ")
+        return 0
+    }
+    const s = wrap(fd)
+    const r = rec(s)
+    m.putI32(r + S_FAMILY, family)
+    m.putI32(r + S_TYPE, kind)
+    m.putI32(r + S_PROTOCOL, protocol)
+    return s
+}
+
+export fn g_socket_new_from_fd(fd: i32, err: usize) -> usize {
+    const cells = m.alloc(160)
+    m.put32(cells + 8, 4)
+    if getsockopt(fd, SOL_SOCKET, SO_TYPE, cells, cells + 8) != 0 {
+        errnoError(err, "creating GSocket from fd: ")
+        m.release(cells)
+        return 0
+    }
+    const kind = m.getI32(cells)
+    m.put32(cells + 8, 4)
+    const protocol = if getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, cells, cells + 8) == 0 { m.getI32(cells) } else { 0 }
+    m.put32(cells + 8, 128)
+    var family: i32 = 0
+    if getsockname(fd, cells + 16, cells + 8) == 0 { family = @intCast(i32, m.get16(cells + 16)) }
+    m.put32(cells + 8, 128)
+    const connected = getpeername(fd, cells + 16, cells + 8) == 0
+    m.release(cells)
+    const s = wrap(fd)
+    const r = rec(s)
+    m.putI32(r + S_FAMILY, family)
+    m.putI32(r + S_TYPE, kind)
+    m.putI32(r + S_PROTOCOL, protocol)
+    m.put32(r + S_CONNECTED, if connected { 1 } else { 0 })
+    return s
+}
+
+export fn g_socket_get_fd(s: usize) -> i32 { return fdOf(s) }
+export fn g_socket_get_family(s: usize) -> i32 { return m.getI32(rec(s) + S_FAMILY) }
+export fn g_socket_get_socket_type(s: usize) -> i32 { return m.getI32(rec(s) + S_TYPE) }
+export fn g_socket_get_protocol(s: usize) -> i32 { return m.getI32(rec(s) + S_PROTOCOL) }
+export fn g_socket_set_blocking(s: usize, blocking: i32) -> void { m.put32(rec(s) + S_BLOCKING, if blocking != 0 { 1 } else { 0 }) }
+export fn g_socket_get_blocking(s: usize) -> i32 { return @bitCast(i32, m.get32(rec(s) + S_BLOCKING)) }
+
+export fn g_socket_set_keepalive(s: usize, keepalive: i32) -> void {
+    const value = m.alloc(8)
+    m.putI32(value, if keepalive != 0 { 1 } else { 0 })
+    _ = setsockopt(fdOf(s), SOL_SOCKET, SO_KEEPALIVE, value, 4)
+    m.release(value)
+    m.put32(rec(s) + S_KEEPALIVE, if keepalive != 0 { 1 } else { 0 })
+}
+
+export fn g_socket_get_keepalive(s: usize) -> i32 { return @bitCast(i32, m.get32(rec(s) + S_KEEPALIVE)) }
+export fn g_socket_set_timeout(s: usize, timeout: u32) -> void { m.put32(rec(s) + S_TIMEOUT, timeout) }
+export fn g_socket_get_timeout(s: usize) -> u32 { return m.get32(rec(s) + S_TIMEOUT) }
+export fn g_socket_is_connected(s: usize) -> i32 { return @bitCast(i32, m.get32(rec(s) + S_CONNECTED)) }
+export fn g_socket_is_closed(s: usize) -> i32 { return @bitCast(i32, m.get32(rec(s) + S_CLOSED)) }
+
+export fn g_socket_get_available_bytes(s: usize) -> i64 {
+    const value = m.alloc(8)
+    var available: i64 = -1
+    if ioctl(fdOf(s), FIONREAD, value) == 0 { available = @intCast(i64, m.getI32(value)) }
+    m.release(value)
+    return available
+}
+
+fn checkClosed(s: usize, err: usize) -> bool {
+    if m.get32(rec(s) + S_CLOSED) == 0 { return false }
+    ioerrors.set(err, ioerrors.CLOSED, "Socket is already closed")
+    return true
+}
+
+export fn g_socket_condition_check(s: usize, condition: i32) -> i32 {
+    const pfd = m.alloc(8)
+    m.putI32(pfd, fdOf(s))
+    m.put16(pfd + 4, @intCast(u16, condition & 0xffff))
+    var result: i32 = 0
+    while true {
+        const n = sys.poll(pfd, 1, 0)
+        if n < 0 && sys.errno() == sys.EINTR { continue }
+        if n > 0 { result = @intCast(i32, m.get16(pfd + 6)) & (condition | G_IO_ERR | G_IO_HUP) }
+        break
+    }
+    m.release(pfd)
+    return result
+}
+
+// Waits for the condition, the cancellable or the timeout (µs, -1 for
+// none).
+fn waitFor(s: usize, condition: i32, timeoutUs: i64, c: usize, err: usize) -> bool {
+    if checkClosed(s, err) { return false }
+    if cancellable.setErrorIfCancelled(c, err) { return false }
+    const pfds = m.alloc(16)
+    m.putI32(pfds, fdOf(s))
+    m.put16(pfds + 4, @intCast(u16, condition & 0xffff))
+    var count: u64 = 1
+    if c != 0 {
+        m.putI32(pfds + 8, cancellable.fdOf(c))
+        m.put16(pfds + 12, 1)
+        count = 2
+    }
+    const start = g_get_monotonic_time()
+    var good = true
+    while true {
+        var wait: i32 = -1
+        if timeoutUs >= 0 {
+            const left = timeoutUs - (g_get_monotonic_time() - start)
+            wait = if left <= 0 { 0 } else { @intCast(i32, (left + 999) / 1000) }
+        }
+        m.put16(pfds + 6, 0)
+        m.put16(pfds + 14, 0)
+        const n = sys.poll(pfds, count, wait)
+        if n < 0 {
+            if sys.errno() == sys.EINTR { continue }
+            errnoError(err, "Error waiting for socket: ")
+            good = false
+            break
+        }
+        if n == 0 {
+            ioerrors.set(err, ioerrors.TIMED_OUT, "Socket I/O timed out")
+            good = false
+            break
+        }
+        break
+    }
+    if c != 0 { g_cancellable_release_fd(c) }
+    m.release(pfds)
+    if good && cancellable.setErrorIfCancelled(c, err) { return false }
+    return good
+}
+
+fn socketTimeout(s: usize) -> i64 {
+    const seconds = m.get32(rec(s) + S_TIMEOUT)
+    return if seconds == 0 { -1 } else { @intCast(i64, seconds) * 1000000 }
+}
+
+export fn g_socket_condition_wait(s: usize, condition: i32, c: usize, err: usize) -> i32 { return if waitFor(s, condition, socketTimeout(s), c, err) { 1 } else { 0 } }
+export fn g_socket_condition_timed_wait(s: usize, condition: i32, timeout_us: i64, c: usize, err: usize) -> i32 { return if waitFor(s, condition, timeout_us, c, err) { 1 } else { 0 } }
+
+export fn g_socket_receive_with_blocking(s: usize, buffer: usize, size: usize, blocking: i32, c: usize, err: usize) -> i64 {
+    if checkClosed(s, err) { return -1 }
+    while true {
+        if cancellable.setErrorIfCancelled(c, err) { return -1 }
+        const n = recv(fdOf(s), buffer, size, 0)
+        if n >= 0 { return @intCast(i64, n) }
+        const errnum = sys.errno()
+        if errnum == sys.EINTR { continue }
+        if errnum == sys.EAGAIN && blocking != 0 {
+            if !waitFor(s, G_IO_IN, socketTimeout(s), c, err) { return -1 }
+            continue
+        }
+        // GIO reports a socket that would block with the bare message.
+        ioerrors.setErrno(err, if errnum == sys.EAGAIN { "" } else { "Error receiving data: " }, errnum)
+        return -1
+    }
+    return -1
+}
+
+export fn g_socket_receive(s: usize, buffer: usize, size: usize, c: usize, err: usize) -> i64 { return g_socket_receive_with_blocking(s, buffer, size, @bitCast(i32, m.get32(rec(s) + S_BLOCKING)), c, err) }
+
+export fn g_socket_send_with_blocking(s: usize, buffer: usize, size: usize, blocking: i32, c: usize, err: usize) -> i64 {
+    if checkClosed(s, err) { return -1 }
+    while true {
+        if cancellable.setErrorIfCancelled(c, err) { return -1 }
+        const n = send(fdOf(s), buffer, size, MSG_NOSIGNAL)
+        if n >= 0 { return @intCast(i64, n) }
+        const errnum = sys.errno()
+        if errnum == sys.EINTR { continue }
+        if errnum == sys.EAGAIN && blocking != 0 {
+            if !waitFor(s, G_IO_OUT, socketTimeout(s), c, err) { return -1 }
+            continue
+        }
+        // GIO reports a socket that would block with the bare message.
+        ioerrors.setErrno(err, if errnum == sys.EAGAIN { "" } else { "Error sending data: " }, errnum)
+        return -1
+    }
+    return -1
+}
+
+export fn g_socket_send(s: usize, buffer: usize, size: usize, c: usize, err: usize) -> i64 { return g_socket_send_with_blocking(s, buffer, size, @bitCast(i32, m.get32(rec(s) + S_BLOCKING)), c, err) }
+
+export fn g_socket_close(s: usize, err: usize) -> i32 {
+    const r = rec(s)
+    if m.get32(r + S_CLOSED) != 0 { return 1 }
+    while true {
+        if sys.close(m.getI32(r + S_FD)) == 0 { break }
+        if sys.errno() == sys.EINTR { continue }
+        errnoError(err, "Error closing socket: ")
+        return 0
+    }
+    m.put32(r + S_CLOSED, 1)
+    m.put32(r + S_CONNECTED, 0)
+    return 1
+}
+
+export fn g_socket_shutdown(s: usize, shutdown_read: i32, shutdown_write: i32, err: usize) -> i32 {
+    if checkClosed(s, err) { return 0 }
+    if shutdown_read == 0 && shutdown_write == 0 { return 1 }
+    const how: i32 = if shutdown_read != 0 && shutdown_write != 0 { 2 } else if shutdown_read != 0 { 0 } else { 1 }
+    if shutdown(fdOf(s), how) != 0 {
+        errnoError(err, "Unable to shutdown socket: ")
+        return 0
+    }
+    if shutdown_read != 0 && shutdown_write != 0 { m.put32(rec(s) + S_CONNECTED, 0) }
+    return 1
+}
+
+export fn g_socket_create_source(s: usize, condition: i32, c: usize) -> usize {
+    _ = socketGType()
+    const source = g_source_new(@intFromPtr(&sourceFuncs), 120)
+    g_source_set_static_name(source, m.literal("GSocket"))
+    m.putWord(source + 96, g_object_ref(s))
+    m.putI32(source + 104, condition | G_IO_HUP | G_IO_ERR)
+    m.putWord(source + 112, g_source_add_unix_fd(source, fdOf(s), condition))
+    if c != 0 {
+        const child = g_cancellable_source_new(c)
+        g_source_add_child_source(source, child)
+        g_source_set_callback(child, @intFromPtr(__mlx_glib_socket_dummy), 0, 0)
+        g_source_unref(child)
+    }
+    return source
+}
+
+// ---------------------------------------------------------------------------
+// GIOStream and GSocketConnection
+
+export fn __mlx_glib_stream_init(stream: usize, class: usize) -> void { m.putWord(stream + 24, m.alloc(32)) }
+
+export fn __mlx_glib_stream_finalize(stream: usize) -> void {
+    const r = m.getWord(stream + 24)
+    if m.getWord(r + 8) != 0 { g_object_unref(m.getWord(r + 8)) }
+    if m.getWord(r + 16) != 0 { g_object_unref(m.getWord(r + 16)) }
+    m.release(r)
+    ioerrors.chainUp(types.T_OBJECT, 48, stream)
+}
+
+export fn __mlx_glib_stream_class_init(class: usize, data: usize) -> void {
+    m.putWord(class + 48, @intFromPtr(__mlx_glib_stream_finalize))
+    m.putWord(class + 152, @intFromPtr(__mlx_glib_io_stream_real_close))
+}
+
+extern("c") fn __mlx_glib_io_stream_real_close(stream: usize, c: usize, err: usize) -> i32
+
+// GIO's: the connection's streams marked closed (closing a socket stream
+// does nothing more), then the socket closed.
+export fn __mlx_glib_connection_close(stream: usize, c: usize, err: usize) -> i32 {
+    const r = m.getWord(stream + 24)
+    if m.getWord(r + 8) != 0 { _ = streams.inputClose(m.getWord(r + 8), c, 0) }
+    if m.getWord(r + 16) != 0 { _ = streams.outputClose(m.getWord(r + 16), c, 0) }
+    const s = m.getWord(stream + 32)
+    return if s == 0 { 1 } else { g_socket_close(s, err) }
+}
+
+export fn __mlx_glib_connection_input(stream: usize) -> usize {
+    const r = m.getWord(stream + 24)
+    if m.getWord(r + 8) == 0 { m.putWord(r + 8, streams.socketInputStream(m.getWord(stream + 32))) }
+    return m.getWord(r + 8)
+}
+
+export fn __mlx_glib_connection_output(stream: usize) -> usize {
+    const r = m.getWord(stream + 24)
+    if m.getWord(r + 16) == 0 { m.putWord(r + 16, streams.socketOutputStream(m.getWord(stream + 32))) }
+    return m.getWord(r + 16)
+}
+
+export fn __mlx_glib_connection_finalize(stream: usize) -> void {
+    const s = m.getWord(stream + 32)
+    if s != 0 { g_object_unref(s) }
+    ioerrors.chainUp(streamType, 48, stream)
+}
+
+export fn __mlx_glib_connection_class_init(class: usize, data: usize) -> void {
+    m.putWord(class + 48, @intFromPtr(__mlx_glib_connection_finalize))
+    m.putWord(class + 136, @intFromPtr(__mlx_glib_connection_input))
+    m.putWord(class + 144, @intFromPtr(__mlx_glib_connection_output))
+    m.putWord(class + 152, @intFromPtr(__mlx_glib_connection_close))
+}
+
+fn ensureStreams() -> void {
+    if threads.onceEnter(@intFromPtr(&streamOnce)) {
+        types.ensureInit()
+        streamType = ioerrors.defineType(types.T_OBJECT, "GIOStream", 256, @intFromPtr(__mlx_glib_stream_class_init), 32, @intFromPtr(__mlx_glib_stream_init), types.ABSTRACT)
+        connectionType = ioerrors.defineType(streamType, "GSocketConnection", 256, @intFromPtr(__mlx_glib_connection_class_init), 40, 0, 0)
+        unixConnectionType = ioerrors.defineType(connectionType, "GUnixConnection", 256, 0, 48, 0, 0)
+        tcpConnectionType = ioerrors.defineType(connectionType, "GTcpConnection", 256, 0, 48, 0, 0)
+        threads.onceLeave(@intFromPtr(&streamOnce), 1)
+    }
+}
+
+export fn g_io_stream_get_type() -> usize {
+    ensureStreams()
+    return streamType
+}
+
+export fn g_socket_connection_get_type() -> usize {
+    ensureStreams()
+    return connectionType
+}
+
+export fn g_io_stream_close(stream: usize, c: usize, err: usize) -> i32 {
+    const r = m.getWord(stream + 24)
+    if m.get32(r) != 0 { return 1 }
+    if m.get32(r + 4) != 0 {
+        ioerrors.set(err, ioerrors.PENDING, "Stream has outstanding operation")
+        return 0
+    }
+    m.put32(r + 4, 1)
+    var result: i32 = 1
+    const close = m.getWord(m.getWord(stream) + 152)
+    if close != 0 {
+        const call: CloseFunc = unsafe { @ptrFromInt(CloseFunc, close) }
+        result = call(stream, c, err)
+    }
+    m.put32(r + 4, 0)
+    m.put32(r, 1)
+    return result
+}
+
+export fn g_io_stream_is_closed(stream: usize) -> i32 { return @bitCast(i32, m.get32(m.getWord(stream + 24))) }
+export fn g_io_stream_has_pending(stream: usize) -> i32 { return @bitCast(i32, m.get32(m.getWord(stream + 24) + 4)) }
+
+export fn g_socket_connection_get_socket(connection: usize) -> usize { return m.getWord(connection + 32) }
+export fn g_socket_connection_is_connected(connection: usize) -> i32 { return g_socket_is_connected(m.getWord(connection + 32)) }
+
+export fn g_socket_connection_factory_create_connection(s: usize) -> usize {
+    ensureStreams()
+    // (As GIO's factory: a Unix or TCP connection by the socket's family.)
+    const family = m.getI32(rec(s) + S_FAMILY)
+    const kind = if family == 1 { unixConnectionType } else if family == 2 || family == 10 { tcpConnectionType } else { connectionType }
+    const connection = g_object_new(kind, 0)
+    m.putWord(connection + 32, g_object_ref(s))
+    return connection
+}

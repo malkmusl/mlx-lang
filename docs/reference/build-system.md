@@ -140,6 +140,8 @@ implemented: this repository has no packages from elsewhere.
 ./mlx build --force mlx-sh       # build it even when it is current
 ./mlx build --keep-going         # go on after a step failed
 ./mlx build --clean              # forget what was built
+./mlx build --cache-stats        # what the result cache holds
+./mlx build --cache-clear        # empty the result cache
 ```
 
 `./mlx` (the root script) runs this checkout's compiler,
@@ -148,13 +150,21 @@ of `compiler/selfhost` or `std/bootstrap` changed (`tools/ensure_compiler.sh`:
 from an older `mlx4`, else from the bootstrap compiler, which needs zig; in
 two stages, and one or two more until the compiler builds itself byte for
 byte, when the older one still had a bug the new sources fixed).
+The compiler it replaces stays as `mlx-out/bin/compiler/mlx4.previous`:
+the compiler's sources, and everything they import, must stay what that
+previous compiler and mlx0 build, so they never import the std root and
+use no language feature the previous compiler lacks
+(`compiler/selfhost/README.md`, "Bootstrapping"; `tools/check_bootstrap.sh`
+checks it, and `codemap.layers` states it for `mlx-codemap layers`).
 `mlx build ARGS` is a subcommand of the compiler
 (`compiler/selfhost/driver/build_command.mlx`): it writes
 `mlx-out/build/runner.mlx`, a main that imports `../../build.mlx` and
 `std.build`, compiles it once into `mlx-out/build/runner`, and runs that
 with the arguments. From then on the runner keeps itself current: when
 `build.mlx`, `std.build` or the compiler changed it compiles `build.mlx`
-again and runs the new runner.
+again and runs the new runner. Like every program it installs the crash
+report first (`std.crash`), and says the step it is checking, starting
+or finishing, so a crash of the runner names its function and the step.
 
 ### `build.mlx`
 
@@ -191,7 +201,10 @@ name.) The steps:
 
 and what changes them: `option` (a compiler option), `output` (another
 place for the file), `input` and `inputTree` (the files a command reads),
-`dependOn` and `add` (order and membership), `byDefault`, `describe`,
+`depfile` (the make-style dependency file a command writes, as
+`mlx-cc -MD -MF` does), `cacheable` (a command's output may come from the
+result cache, below), `dependOn` and `add` (order and membership),
+`byDefault`, `describe`,
 `step(b, name)` (a step declared before) and `concat` (a string made from
 two). Host I/O happens only through these (`<BuildHostAccess>`): `build()`
 declares, the runner does the work.
@@ -218,6 +231,77 @@ when it is complete, so an interrupted build is never taken for a current
 one, and a running program is never written over. A step whose dependency
 was built now is looked at again then (a command that reads another step's
 output).
+
+### The result cache
+
+The manifests only know the last build of each step. Switching branches,
+bisecting the compiler, reverting a change or building in another checkout
+of the repository (the agents' worktrees under `.claude/worktrees`) would
+make every step whose inputs differ from that last build again, although
+the same file was made before: for WebKit, about 1250 compiles of 25 to 60
+seconds each. So std.build keeps what steps made in a result cache
+(`std/src/build/store.mlx`), shared by all of the user's checkouts, as
+ccache's direct mode does:
+
+- **Where:** `$MLX_BUILD_CACHE`, else `$XDG_CACHE_HOME/mlx/build`
+  (`~/.cache/mlx/build`); `MLX_BUILD_CACHE=off` turns it off.
+- **What:** the output of every Mlx step (program, shared object,
+  plugin; not an APK, signed with a key no depfile names), and of every
+  command that names a depfile (`depfile`, as the compiles with
+  `mlx-cc -MD -MF` and WebKit's archives do) or is marked `cacheable`
+  (`libmlxcpp.a`'s archive): steps whose one output file is all they make.
+  A command that writes more than its output (a generator of a directory
+  of headers, named by one of them) is never cached, since only the output
+  would come back.
+- **Keys:** a step's entries are kept under its key: the manifest key
+  (kind, command line or root module, output path, options, the Mlx
+  compiler's contents, the input trees' file names) and, for a command,
+  the contents' hash of the program it runs (`mlx-out/bin/mlx-cc`, by its
+  bytes, not its path or time). Under it, an entry for each set of inputs
+  it was built from: every file the build read (its manifest's inputs:
+  the depfile's, the declared inputs, the input trees') with its
+  contents' hash, the paths in the checkout relative to its root (mlx-cc
+  names its own headers by absolute paths), and the object it made.
+- **Hits:** a step that is not current, before its command runs, looks at
+  the entries of its key; when all of one entry's inputs have the
+  recorded hashes now (sizes and times first, the contents when those
+  differ, each file hashed once a run), its output is that entry's file:
+  linked into place (copied when the cache is on another file system)
+  and checked against its name (size and hash), and the step's manifest
+  is written as if it had been built. The progress line says so,
+  `[12/1108] cached jsc/UnifiedSource-runtime-3.cpp`, and the summary
+  counts it (`3 built, 1105 cached, 0 current`). Since each set of inputs
+  keeps its entry, going back to a branch (A, B, A) finds its files again.
+  `--force` builds instead of looking, `--dry-run` does not look.
+- **Files:** `objects/HH/HASH-SIZE-MODE`, named by their contents, so
+  identical outputs (of other steps, of other inputs) are kept once; an
+  object shares its inode with the outputs it was linked to, so it costs
+  no room while they are there. `--cache-stats` shows how much is shared.
+- **Safety:** a file goes into the cache under a name of its own in
+  `tmp/` and is then renamed into place, so concurrent builds (the main
+  checkout and agent worktrees at once) never see one half written, and
+  two builds storing the same entry store the same bytes. Because an
+  output may be the cache's own inode, the output of a cached command is
+  removed before the command runs: mlx-cc and mlx-ar truncate what they
+  write to, and would otherwise write into the cache (Mlx steps and copies
+  already make a new file beside it and rename it over the old one). An
+  object that does not match its name (damaged) is removed and the step
+  built.
+- **Size:** `MLX_BUILD_CACHE_SIZE` (bytes, or with `K`, `M` or `G`; `6G`
+  by default). After a build that stored something, when the objects
+  pass the limit, the least recently used go (by the time their inode
+  last changed, which a hit's link renews) down to four fifths of it, and
+  the entries naming them; below the limit that costs one status call per
+  object.
+
+A hit is only as right as the inputs a step names: like ccache's direct
+mode it assumes that a step reading the same bytes makes the same file.
+A header that appears earlier on the include path than the one the build
+read, without any file it read changing, is not noticed (nor is it by the
+manifests). The compilers here are reproducible: `mlx4` makes the same
+binary from the same sources in any directory (mlx-cc built in a worktree
+is byte for byte the main checkout's), and mlx-cc's `__DATE__` and
+`__TIME__` are fixed.
 
 ### Jobs
 

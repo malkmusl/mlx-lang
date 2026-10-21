@@ -1,0 +1,268 @@
+// A TLS client for tools/check_tls.sh: connects to 127.0.0.1:PORT with
+// std.tls, verifies the server's chain against CAFILE for SERVERNAME,
+// sends a request and prints what was negotiated and what came back.
+//
+//   client PORT SERVERNAME CAFILE [--alpn LIST] [--tls12] [--accept]
+//          [--time SECONDS] [--keylog FILE] [--request TEXT]
+//
+// LIST is the protocols separated by commas; --accept goes on with a
+// chain that does not verify (its flags are printed either way); the
+// request (by default "GET / HTTP/1.0\r\n\r\n", the \r\n written as such)
+// is sent once connected, and the answer is printed whole.
+const std = @import("std")
+const tls = @import("std.tls")
+const x509 = @import("std.x509")
+const socket = std.linux.socket
+
+fn cString(text: [*]const u8) -> []const u8 {
+    var length: usize = 0
+    while text[length] != 0 { length += 1 }
+    return text[0..length]
+}
+
+fn print(text: []const u8) -> void {
+    const ok = std.io.writeAll(std.io.stdout(), text)
+}
+
+fn printNumber(value: u64) -> void {
+    const ok = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, value))
+}
+
+fn number(text: []const u8) -> u64 {
+    var value: u64 = 0
+    var index: usize = 0
+    while index < text.length {
+        value = value * 10 + @intCast(u64, text[index] - 48)
+        index += 1
+    }
+    return value
+}
+
+const Connection = struct {
+    descriptor: isize
+}
+
+fn receiveFrom(context: *anyopaque, into: [*]u8, length: usize) -> isize {
+    const connection: *Connection = unsafe { @ptrCast(*Connection, context) }
+    return socket.receive(connection.*.descriptor, into, length, 0)
+}
+
+fn sendTo(context: *anyopaque, from: [*]const u8, length: usize) -> isize {
+    const connection: *Connection = unsafe { @ptrCast(*Connection, context) }
+    return socket.send(connection.*.descriptor, from, length, socket.MSG_NOSIGNAL)
+}
+
+fn failureName(failure: tls.Failure) -> []const u8 {
+    return match failure {
+        tls.Failure.none => "none",
+        tls.Failure.protocol => "protocol",
+        tls.Failure.handshake => "handshake",
+        tls.Failure.badRecord => "bad record",
+        tls.Failure.badSignature => "bad signature",
+        tls.Failure.badCertificate => "bad certificate",
+        tls.Failure.alertReceived => "alert received",
+        tls.Failure.internal => "internal",
+        tls.Failure.eof => "end of input",
+    }
+}
+
+// Turns the two characters "\r" and "\n" of an argument into the bytes.
+fn unescape(text: []const u8, out: [*]u8) -> usize {
+    var written: usize = 0
+    var index: usize = 0
+    while index < text.length {
+        if text[index] == 92 && index + 1 < text.length && (text[index + 1] == 114 || text[index + 1] == 110) {
+            out[written] = if text[index + 1] == 114 { 13 } else { 10 }
+            index += 2
+        } else {
+            out[written] = text[index]
+            index += 1
+        }
+        written += 1
+    }
+    return written
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if arguments.length < 4 {
+        print("usage: client PORT SERVERNAME CAFILE [options]\n")
+        return 2
+    }
+    const allocator = std.heap.allocator()
+    const port = number(cString(arguments[1]))
+    const name = cString(arguments[2])
+    var alpn: [128]u8 = undefined
+    var alpnLength: usize = 0
+    var request: [512]u8 = undefined
+    const requestBytes: [*]u8 = &request
+    var requestLength = unescape("GET / HTTP/1.0\\r\\n\\r\\n", requestBytes)
+    var tls12 = false
+    var accept = false
+    var moment: i64 = 0
+    var keylogPath: [*]const u8 = arguments[0]
+    var keylog = false
+    var index: usize = 4
+    while index < arguments.length {
+        const option = cString(arguments[index])
+        if std.text.same(option, "--tls12") { tls12 = true }
+        if std.text.same(option, "--accept") { accept = true }
+        if index + 1 < arguments.length {
+            const value = cString(arguments[index + 1])
+            if std.text.same(option, "--alpn") {
+                // "h2,http/1.1" as the wire list.
+                var start: usize = 0
+                var at: usize = 0
+                while at <= value.length {
+                    if at == value.length || value[at] == 44 {
+                        alpn[alpnLength] = @intCast(u8, at - start)
+                        alpnLength += 1
+                        var copied = start
+                        while copied < at {
+                            alpn[alpnLength] = value[copied]
+                            alpnLength += 1
+                            copied += 1
+                        }
+                        start = at + 1
+                    }
+                    at += 1
+                }
+                index += 1
+            } else if std.text.same(option, "--time") {
+                moment = @intCast(i64, number(value))
+                index += 1
+            } else if std.text.same(option, "--keylog") {
+                keylogPath = arguments[index + 1]
+                keylog = true
+                index += 1
+            } else if std.text.same(option, "--request") {
+                requestLength = unescape(value, requestBytes)
+                index += 1
+            }
+        }
+        index += 1
+    }
+
+    var store: x509.TrustStore = undefined
+    x509.storeInit(&store, allocator)
+    const anchors = x509.storeLoadFile(&store, arguments[3])
+
+    const descriptor = socket.open(socket.AF_INET, socket.SOCK_STREAM | socket.SOCK_CLOEXEC, 0)
+    if descriptor < 0 {
+        print("no socket\n")
+        return 1
+    }
+    var address: [16]u8 = [16]u8{ 2, 0, 0, 0, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 }
+    address[2] = @intCast(u8, (port >> 8) & 255)
+    address[3] = @intCast(u8, port & 255)
+    if socket.connect(descriptor, @intFromPtr(&address), 16) != 0 {
+        print("connect failed\n")
+        return 1
+    }
+    var connection = Connection.{ .descriptor = descriptor }
+    const context: *anyopaque = unsafe { @ptrCast(*anyopaque, &connection) }
+
+    const memory = allocator.alloc(@sizeOf(tls.Client), 16)
+    if memory == null { return 1 }
+    const client: *tls.Client = unsafe { @ptrCast(*tls.Client, memory.?) }
+    if !tls.clientInit(client, allocator) { return 1 }
+    tls.setServerName(client, name)
+    if alpnLength > 0 {
+        const list: [*]const u8 = &alpn
+        tls.setAlpn(client, list[0..alpnLength])
+    }
+    if anchors > 0 { tls.setTrustStore(client, &store) }
+    if tls12 { tls.setMaxVersion(client, tls.VERSION_12) }
+    client.*.time = moment
+
+    // The handshake by hand, to print the flags and decide on them.
+    var state = tls.start(client)
+    var buffer: [16384]u8 = undefined
+    const bytes: [*]u8 = &buffer
+    while state == tls.State.handshaking || state == tls.State.checkCertificate {
+        const out = tls.pendingOutput(client)
+        if out.length > 0 {
+            const sent = sendTo(context, out.pointer, out.length)
+            if sent <= 0 { break }
+            tls.outputSent(client, @intCast(usize, sent))
+            continue
+        }
+        if state == tls.State.checkCertificate {
+            print("flags: ")
+            printNumber(@intCast(u64, client.*.peerFlags))
+            print("\n")
+            state = tls.acceptCertificate(client, accept)
+            continue
+        }
+        const count = receiveFrom(context, tls.inputSpace(client), tls.inputRoom(client))
+        if count <= 0 {
+            state = tls.endOfInput(client)
+            break
+        }
+        tls.inputAdded(client, @intCast(usize, count))
+        state = tls.process(client)
+    }
+    const rest = tls.pendingOutput(client)
+    if rest.length > 0 {
+        const sent = sendTo(context, rest.pointer, rest.length)
+        if sent > 0 { tls.outputSent(client, @intCast(usize, sent)) }
+    }
+    if keylog {
+        const log = tls.keyLog(client)
+        const written = std.fs.writeFile(keylogPath, log.pointer, log.length, 420)
+    }
+    if state != tls.State.connected {
+        print("failed: ")
+        print(failureName(client.*.failure))
+        if client.*.failure == tls.Failure.alertReceived {
+            print(" ")
+            printNumber(client.*.peerAlert)
+        }
+        print("\n")
+        return 1
+    }
+    print("version: ")
+    print(if tls.negotiatedVersion(client) == tls.VERSION_13 { "TLSv1.3" } else { "TLSv1.2" })
+    print("\ncipher: ")
+    print(tls.cipherSuiteName(tls.cipherSuite(client)))
+    print("\ngroup: ")
+    print(tls.groupName(tls.negotiatedGroup(client)))
+    print("\nalpn: ")
+    print(tls.alpnProtocol(client))
+    print("\nchain: ")
+    printNumber(@intCast(u64, tls.peerCertificateCount(client)))
+    var text: [512]u8 = undefined
+    const textBytes: [*]u8 = &text
+    const subjectLength = x509.nameText(tls.peerCertificate(client, 0), tls.peerCertificate(client, 0).*.subject, textBytes, 512)
+    print("\nsubject: ")
+    print(textBytes[0..subjectLength])
+    print("\nflags: ")
+    printNumber(@intCast(u64, client.*.peerFlags))
+    print("\n")
+    if !tls.send(client, context, sendTo, requestBytes, requestLength) {
+        print("send failed\n")
+        return 1
+    }
+    var total: usize = 0
+    while true {
+        const count = tls.receive(client, context, receiveFrom, sendTo, bytes, 16384)
+        if count <= 0 {
+            if count < 0 {
+                print("receive failed: ")
+                print(failureName(client.*.failure))
+                print("\n")
+            }
+            break
+        }
+        print(bytes[0..@intCast(usize, count)])
+        total += @intCast(usize, count)
+    }
+    tls.close(client)
+    const closing = tls.pendingOutput(client)
+    if closing.length > 0 {
+        const sent = sendTo(context, closing.pointer, closing.length)
+    }
+    const closed = socket.close(descriptor)
+    tls.clientFree(client)
+    x509.storeFree(&store)
+    return 0
+}

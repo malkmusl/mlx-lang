@@ -1,0 +1,1797 @@
+// std.sql.write: INSERT, UPDATE and DELETE.
+//
+// The rows a statement changes are found first and the changes made after
+// (an UPDATE's or DELETE's rowids by a SELECT of the table's rowid with its
+// WHERE, ORDER BY and LIMIT; an INSERT's rows by its VALUES or SELECT), so
+// that a statement never sees its own changes. Each row is checked as
+// SQLite checks it: NOT NULL, then the rowid's and each UNIQUE index's
+// uniqueness, then foreign keys (with PRAGMA foreign_keys on); a violation
+// is resolved by the statement's OR clause or else the constraint's ON
+// CONFLICT: ABORT (the default: the statement's changes undone), FAIL (they
+// stay), IGNORE (the row is skipped), REPLACE (the rows in the way are
+// deleted; a NULL for NOT NULL takes the column's default), ROLLBACK (the
+// transaction undone). Indexes are kept in step with every row, foreign
+// keys' ON DELETE and ON UPDATE actions (CASCADE, SET NULL, SET DEFAULT,
+// RESTRICT, NO ACTION) are carried out, and AUTOINCREMENT keeps
+// sqlite_sequence.
+const mem = @import("./mem.mlx")
+const value = @import("./value.mlx")
+const record = @import("./record.mlx")
+const ast = @import("./ast.mlx")
+const schema = @import("./schema.mlx")
+const core = @import("./core.mlx")
+const query = @import("./query.mlx")
+const eval = @import("./eval.mlx")
+const bt = @import("./btree.mlx")
+const lexer = @import("./lexer.mlx")
+const pg = @import("./pager.mlx")
+const os = @import("./os.mlx")
+const parser = @import("./parser.mlx")
+
+const Value = value.Value
+
+fn databaseOf(st: *core.Statement) -> *core.Database { return core.database(st.*.db) }
+
+pub const Dml = struct {
+    kind: u8
+    table: usize
+    conflict: u8
+    // INSERT: the rows' query, and for each table column the place of its
+    // value in a row (-1: its default); the rowid's place (-1: none).
+    source: usize
+    columnMap: usize
+    rowidPlace: i64
+    sourceWidth: usize
+    // UPDATE and DELETE: the query of the rowids, its target source; the
+    // SET expressions per column (0: unchanged) and for the rowid.
+    scan: usize
+    target: usize
+    sets: usize
+    rowidSet: usize
+    // A row's values (old and new), and the rowids gathered.
+    values: usize
+    old: usize
+    rowids: mem.Words
+    // Cursors: the table's, and one per index (by its place in the
+    // table's list).
+    cursor: usize
+    indexCursors: mem.Words
+    key: mem.Buffer
+    data: mem.Buffer
+    // CHECK constraints: their expressions (resolved against `checkScope`,
+    // a scope over the row being written) and per constraint the name its
+    // error gives (address, length).
+    checks: mem.Words
+    checkNames: mem.Words
+    checkScope: usize
+    // Per index (by its place in the table's list), a partial index's
+    // WHERE resolved against the same row (0: the index holds every row).
+    partials: mem.Words
+    // INSERT's ON CONFLICT clauses: the ast's, their SET expressions per
+    // column (a block of words per clause, 0: unchanged) resolved in a
+    // scope of the existing row and `excluded` (the row not inserted).
+    upsert: usize
+    upsertSets: mem.Words
+    upsertScope: usize
+    excluded: usize
+}
+
+pub inline fn dmlOf(address: usize) -> *Dml { unsafe { return @ptrFromInt(*Dml, address) } }
+
+fn newValues(count: usize) -> usize {
+    const block = mem.alloc((count + 1) * @sizeOf(Value))
+    var i: usize = 0
+    while i < count + 1 {
+        value.init(record.valueAt(block, i))
+        i += 1
+    }
+    return block
+}
+
+fn newDml(st: *core.Statement, kind: u8, t: usize) -> usize {
+    const address = mem.alloc(@sizeOf(Dml))
+    const d = dmlOf(address)
+    d.*.kind = kind
+    d.*.table = t
+    d.*.rowidPlace = -1
+    mem.initWords(&d.*.rowids)
+    mem.initWords(&d.*.indexCursors)
+    mem.initWords(&d.*.checks)
+    mem.initWords(&d.*.checkNames)
+    mem.initWords(&d.*.partials)
+    mem.initWords(&d.*.upsertSets)
+    mem.initBuffer(&d.*.key)
+    mem.initBuffer(&d.*.data)
+    const n = schema.table(t).*.columnCount
+    d.*.values = newValues(n)
+    d.*.old = newValues(n)
+    st.*.dml = address
+    return address
+}
+
+pub fn freeDml(address: usize) -> void {
+    if address == 0 { return }
+    const d = dmlOf(address)
+    const n = schema.table(d.*.table).*.columnCount
+    core.freeRow(d.*.values, n + 1)
+    core.freeRow(d.*.old, n + 1)
+    mem.free(d.*.columnMap)
+    mem.free(d.*.sets)
+    mem.freeWords(&d.*.rowids)
+    bt.closeCursor(d.*.cursor)
+    var i: usize = 0
+    while i < d.*.indexCursors.length {
+        bt.closeCursor(@intCast(usize, mem.at(&d.*.indexCursors, i)))
+        i += 1
+    }
+    mem.freeWords(&d.*.indexCursors)
+    mem.freeWords(&d.*.checks)
+    mem.freeWords(&d.*.checkNames)
+    mem.freeWords(&d.*.partials)
+    var u: usize = 0
+    while u < d.*.upsertSets.length {
+        mem.free(@intCast(usize, mem.at(&d.*.upsertSets, u)))
+        u += 1
+    }
+    mem.freeWords(&d.*.upsertSets)
+    if d.*.excluded != 0 { core.freeRow(d.*.excluded, n + 1) }
+    mem.freeBuffer(&d.*.key)
+    mem.freeBuffer(&d.*.data)
+    mem.free(address)
+}
+
+fn fail(st: *core.Statement, message: []const u8) -> i32 { return core.setError(databaseOf(st), core.ERROR, message) }
+
+// The table's CHECK constraints and its partial indexes' WHEREs compiled
+// for the statement: each expression parsed again from the schema's text
+// into the statement's arena and resolved against a row of the table.
+fn compileChecks(st: *core.Statement, d: *Dml) -> i32 {
+    const t = schema.table(d.*.table)
+    var partial = false
+    var i: usize = 0
+    while i < t.*.indexes.length {
+        if schema.index(@intCast(usize, mem.at(&t.*.indexes, i))).*.partial != 0 { partial = true }
+        i += 1
+    }
+    if t.*.checks.length == 0 && !partial { return core.OK }
+    d.*.checkScope = query.rowScope(st, t)
+    i = 0
+    while i < t.*.checks.length {
+        const start = @intCast(usize, mem.at(&t.*.checks, i))
+        const end = @intCast(usize, mem.at(&t.*.checks, i + 1))
+        const e = query.rowExpression(st, d.*.checkScope, t.*.sql + start, end - start)
+        if e == 0 { return databaseOf(st).*.errorCode }
+        _ = mem.push(&d.*.checks, @intCast(u64, e))
+        // The error names the constraint, or shows its expression.
+        if mem.at(&t.*.checks, i + 3) != 0 {
+            _ = mem.push(&d.*.checkNames, mem.at(&t.*.checks, i + 2))
+            _ = mem.push(&d.*.checkNames, mem.at(&t.*.checks, i + 3))
+        } else {
+            _ = mem.push(&d.*.checkNames, @intCast(u64, ast.copyText(&st.*.arena, t.*.sql + start, end - start)))
+            _ = mem.push(&d.*.checkNames, @intCast(u64, end - start))
+        }
+        i += 4
+    }
+    i = 0
+    while i < t.*.indexes.length {
+        const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
+        var e: usize = 0
+        if x.*.partial != 0 {
+            const w = ast.expr(x.*.partial)
+            e = query.rowExpression(st, d.*.checkScope, x.*.sql + w.*.start, w.*.end - w.*.start)
+            if e == 0 { return databaseOf(st).*.errorCode }
+        }
+        _ = mem.push(&d.*.partials, @intCast(u64, e))
+        i += 1
+    }
+    return core.OK
+}
+
+// The ON CONFLICT clauses of an INSERT: each target's columns checked,
+// the DO UPDATE's SET and WHERE resolved where the table's columns are
+// the existing row's and excluded.* the new row's.
+fn compileUpsert(st: *core.Statement, d: *Dml, first: usize) -> i32 {
+    const t = schema.table(d.*.table)
+    const db = databaseOf(st)
+    d.*.upsert = first
+    d.*.upsertScope = query.rowScope(st, t)
+    _ = query.addRowSource(st, d.*.upsertScope, t, "excluded")
+    d.*.excluded = newValues(t.*.columnCount)
+    var at = first
+    while at != 0 {
+        const u = ast.upsert(at)
+        if u.*.target != 0 {
+            var i: usize = 0
+            while i < ast.count(u.*.target) {
+                const it = ast.itemAt(u.*.target, i)
+                const name = mem.view(it.*.name, it.*.nameLength)
+                if schema.findColumn(t, name) < 0 && !schema.isRowidName(name) {
+                    return core.setError2(db, core.ERROR, "no such column: ", name)
+                }
+                i += 1
+            }
+            if targetIndex(t, u) == -2 {
+                return core.setError(db, core.ERROR, "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint")
+            }
+        } else if u.*.next != 0 {
+            return core.setError(db, core.ERROR, "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint")
+        }
+        const sets = mem.alloc(t.*.columnCount * 8 + 8)
+        _ = mem.push(&d.*.upsertSets, @intCast(u64, sets))
+        if u.*.update {
+            var i: usize = 0
+            while i < ast.count(u.*.sets) {
+                const it = ast.itemAt(u.*.sets, i)
+                const name = mem.view(it.*.name, it.*.nameLength)
+                const c = schema.findColumn(t, name)
+                if c < 0 { return core.setError2(db, core.ERROR, "no such column: ", name) }
+                const rc = query.resolve(st, d.*.upsertScope, it.*.expr)
+                if rc != core.OK { return rc }
+                mem.put64(sets + @intCast(usize, c) * 8, @intCast(u64, it.*.expr))
+                i += 1
+            }
+            if u.*.where != 0 {
+                const rc = query.resolve(st, d.*.upsertScope, u.*.where)
+                if rc != core.OK { return rc }
+            }
+        }
+        at = u.*.next
+    }
+    return core.OK
+}
+
+// The constraint an ON CONFLICT target names: -1 the rowid, an index's
+// place, -2 none.
+fn targetIndex(t: *schema.Table, u: *ast.Upsert) -> i64 {
+    const n = ast.count(u.*.target)
+    if n == 1 {
+        const it = ast.itemAt(u.*.target, 0)
+        const name = mem.view(it.*.name, it.*.nameLength)
+        const c = schema.findColumn(t, name)
+        if (c >= 0 && c == t.*.rowidColumn) || (c < 0 && schema.isRowidName(name)) { return -1 }
+    }
+    var x: usize = 0
+    while x < t.*.indexes.length {
+        const ix = schema.index(@intCast(usize, mem.at(&t.*.indexes, x)))
+        if ix.*.unique && ix.*.columnCount == n {
+            var all = true
+            var i: usize = 0
+            while i < n && all {
+                const it = ast.itemAt(u.*.target, i)
+                const c = schema.findColumn(t, mem.view(it.*.name, it.*.nameLength))
+                // The columns in any order.
+                var found = false
+                var k: usize = 0
+                while k < n {
+                    if schema.indexColumn(ix, k) == c { found = true }
+                    k += 1
+                }
+                all = found
+                i += 1
+            }
+            if all { return @intCast(i64, x) }
+        }
+        x += 1
+    }
+    return -2
+}
+
+// The clause for a conflict with the rowid (-1) or the index at `place`:
+// its address and number, or 0.
+fn upsertFor(d: *Dml, place: i64, number: *usize) -> usize {
+    const t = schema.table(d.*.table)
+    var at = d.*.upsert
+    var k: usize = 0
+    while at != 0 {
+        const u = ast.upsert(at)
+        if u.*.target == 0 || targetIndex(t, u) == place {
+            number.* = k
+            return at
+        }
+        at = u.*.next
+        k += 1
+    }
+    return 0
+}
+
+// The conflicting row's upsert: DO NOTHING, or the existing row `other`
+// updated by the clause's SET (where its WHERE holds). The new row is not
+// inserted either way.
+fn doUpsert(st: *core.Statement, d: *Dml, clause: usize, number: usize, other: i64) -> i32 {
+    const t = schema.table(d.*.table)
+    const u = ast.upsert(clause)
+    if !u.*.update { return core.OK }
+    // excluded.* is the row not inserted; the table's columns, the row
+    // there is.
+    var i: usize = 0
+    while i < t.*.columnCount {
+        _ = value.copy(record.valueAt(d.*.excluded, i), record.valueAt(d.*.values, i))
+        i += 1
+    }
+    var found = false
+    var rc = readRow(st, t, tableCursor(st, d), other, d.*.old, &found)
+    if rc != core.OK || !found { return rc }
+    query.rowSource(d.*.upsertScope).*.row = d.*.old
+    const excludedSource = core.sourceState(@intCast(usize, mem.at(&query.queryOf(query.scopeOf(d.*.upsertScope).*.query).*.levels, 1)))
+    excludedSource.*.row = d.*.excluded
+    if u.*.where != 0 {
+        var truth: i8 = 0
+        rc = eval.condition(st, u.*.where, &truth)
+        if rc != core.OK || truth != 1 { return rc }
+    }
+    const sets = @intCast(usize, mem.at(&d.*.upsertSets, number))
+    i = 0
+    while i < t.*.columnCount && rc == core.OK {
+        const set = @intCast(usize, mem.get64(sets + i * 8))
+        const v = record.valueAt(d.*.values, i)
+        if set != 0 {
+            rc = eval.evaluate(st, set, v)
+        } else {
+            _ = value.copy(v, record.valueAt(d.*.old, i))
+        }
+        i += 1
+    }
+    if rc != core.OK { return rc }
+    i = 0
+    while i < t.*.columnCount {
+        value.applyAffinity(record.valueAt(d.*.values, i), schema.column(t, i).*.affinity)
+        i += 1
+    }
+    var newRowid = other
+    if t.*.rowidColumn >= 0 {
+        const v = record.valueAt(d.*.values, @intCast(usize, t.*.rowidColumn))
+        value.applyAffinity(v, value.AFF_INTEGER)
+        if v.*.kind != value.INTEGER { return core.setError(databaseOf(st), core.MISMATCH, "datatype mismatch") }
+        newRowid = v.*.i
+    }
+    // As an UPDATE does it (its conflicts are errors: the clause is used).
+    const saved = d.*.conflict
+    d.*.conflict = ast.OE_ABORT
+    var skip = false
+    rc = checkNotNull(st, d, d.*.values, &skip)
+    if rc == core.OK { rc = checkChecks(st, d, d.*.values, &skip) }
+    if rc == core.OK { rc = checkUnique(st, d, d.*.values, newRowid, other, true, &skip) }
+    if rc == core.OK { rc = checkParents(st, d, d.*.values, d.*.old) }
+    if rc == core.OK { rc = actOnChildren(st, d, d.*.old, other, false, d.*.values, newRowid) }
+    if rc == core.OK { rc = rewriteRow(st, d, other, newRowid) }
+    d.*.conflict = saved
+    if rc == core.OK { st.*.changes += 1 }
+    return rc
+}
+
+// Whether the row about to be inserted (`values`, `rowid`) clashes with a
+// constraint an ON CONFLICT clause is for, the first such constraint in
+// the order SQLite checks them: the clause (0 when none) and the other
+// row.
+fn upsertClash(st: *core.Statement, d: *Dml, values: usize, rowid: i64, clause: *usize, number: *usize, other: *i64) -> i32 {
+    const t = schema.table(d.*.table)
+    clause.* = 0
+    if bt.seekRowid(tableCursor(st, d), rowid) {
+        const c = upsertFor(d, -1, number)
+        if c == 0 { return core.OK }
+        clause.* = c
+        other.* = rowid
+        return core.OK
+    }
+    var i: usize = 0
+    while i < t.*.indexes.length {
+        const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
+        if x.*.unique {
+            var holds = true
+            var rc = partialHolds(st, d, i, values, &holds)
+            if rc != core.OK { return rc }
+            if holds {
+                var found: i64 = 0
+                rc = uniqueClash(st, d, i, values, rowid, &found)
+                if rc != core.OK { return rc }
+                if found != 0 || clashWithZero(st, d, i, values, rowid) {
+                    const c = upsertFor(d, @intCast(i64, i), number)
+                    if c == 0 { return core.OK }
+                    clause.* = c
+                    other.* = found
+                    return core.OK
+                }
+            }
+        }
+        i += 1
+    }
+    return core.OK
+}
+
+// CHECK constraints over the row's values: each must not be false (NULL
+// passes); `skip` set for IGNORE.
+fn checkChecks(st: *core.Statement, d: *Dml, values: usize, skip: *bool) -> i32 {
+    if d.*.checks.length == 0 { return core.OK }
+    query.rowSource(d.*.checkScope).*.row = values
+    var i: usize = 0
+    while i < d.*.checks.length {
+        var truth: i8 = 0
+        const rc = eval.condition(st, @intCast(usize, mem.at(&d.*.checks, i)), &truth)
+        if rc != core.OK { return rc }
+        if truth == 0 {
+            // (REPLACE is ABORT for a CHECK, as in SQLite.)
+            var how = resolution(d, ast.OE_NONE)
+            if how == ast.OE_IGNORE {
+                skip.* = true
+                return core.OK
+            }
+            if how == ast.OE_REPLACE { how = ast.OE_ABORT }
+            const name = mem.view(@intCast(usize, mem.at(&d.*.checkNames, i * 2)), @intCast(usize, mem.at(&d.*.checkNames, i * 2 + 1)))
+            return violation(st, 275, how, "CHECK constraint failed: ", name)
+        }
+        i += 1
+    }
+    return core.OK
+}
+
+// The table a DML statement names, writable.
+fn targetTable(st: *core.Statement, node: *ast.Statement, out: *usize) -> i32 {
+    const db = databaseOf(st)
+    const name = mem.view(node.*.name, node.*.nameLength)
+    const t = schema.findTable(&db.*.schema, name)
+    if t == 0 && schema.findView(&db.*.schema, name) != 0 {
+        return core.setError3(db, core.ERROR, "cannot modify ", name, " because it is a view")
+    }
+    if t == 0 { return core.setError2(db, core.ERROR, "no such table: ", name) }
+    if schema.table(t).*.isSchema || mem.sameNoCase(name, "sqlite_master") {
+        return core.setError3(db, core.ERROR, "table ", name, " may not be modified")
+    }
+    out.* = t
+    return core.OK
+}
+
+fn authorizeTable(st: *core.Statement, action: i32, t: *schema.Table) -> i32 {
+    const answer = eval.authorize(st, action, schema.tableName(t), mem.view(0, 0))
+    if answer == core.AUTH_DENY { return core.setError(databaseOf(st), core.AUTH, "not authorized") }
+    return core.OK
+}
+
+// ---------------------------------------------------------------------------
+// Compiling.
+
+pub fn compileInsert(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    var t: usize = 0
+    var rc = targetTable(st, node, &t)
+    if rc != core.OK { return rc }
+    const table = schema.table(t)
+    rc = authorizeTable(st, core.AUTH_INSERT, table)
+    if rc != core.OK { return rc }
+    const dml = newDml(st, ast.S_INSERT, t)
+    const d = dmlOf(dml)
+    d.*.conflict = node.*.conflict
+    rc = compileChecks(st, d)
+    if rc != core.OK { return rc }
+    if node.*.upsert != 0 {
+        rc = compileUpsert(st, d, node.*.upsert)
+        if rc != core.OK { return rc }
+    }
+    const n = table.*.columnCount
+    d.*.columnMap = mem.alloc(n * 8 + 8)
+    var i: usize = 0
+    while i < n {
+        mem.put64(d.*.columnMap + i * 8, @bitCast(u64, @intCast(i64, -1)))
+        i += 1
+    }
+    var width: usize = 0
+    if node.*.columns != 0 {
+        width = ast.count(node.*.columns)
+        i = 0
+        while i < width {
+            const it = ast.itemAt(node.*.columns, i)
+            const name = mem.view(it.*.name, it.*.nameLength)
+            const c = schema.findColumn(table, name)
+            if c < 0 {
+                if schema.isRowidName(name) {
+                    d.*.rowidPlace = @intCast(i64, i)
+                } else {
+                    return core.setError3(db, core.ERROR, "table ", schema.tableName(table), core3(" has no column named ", name))
+                }
+            } else {
+                mem.put64(d.*.columnMap + @intCast(usize, c) * 8, @intCast(u64, i))
+                if c == table.*.rowidColumn { d.*.rowidPlace = @intCast(i64, i) }
+            }
+            i += 1
+        }
+    } else {
+        width = n
+        i = 0
+        while i < n {
+            mem.put64(d.*.columnMap + i * 8, @intCast(u64, i))
+            i += 1
+        }
+        if table.*.rowidColumn >= 0 { d.*.rowidPlace = table.*.rowidColumn }
+    }
+    d.*.sourceWidth = width
+    if node.*.defaultValues { return core.OK }
+    const q = query.compile(st, node.*.source, 0)
+    if q == 0 { return db.*.errorCode }
+    const got = query.queryOf(q).*.width
+    if got != width {
+        if node.*.columns != 0 {
+            return valuesMessage(st, got, width)
+        }
+        return tableColumnsMessage(st, table, n, got)
+    }
+    d.*.source = q
+    return core.OK
+}
+
+var messageBuffer: mem.Buffer = undefined
+var messageReady: bool = false
+
+// The pieces of a message joined (kept until the next message).
+fn core3(a: []const u8, b: []const u8) -> []const u8 {
+    if !messageReady {
+        mem.initBuffer(&messageBuffer)
+        messageReady = true
+    }
+    messageBuffer.length = 0
+    _ = mem.appendText(&messageBuffer, a)
+    _ = mem.appendText(&messageBuffer, b)
+    return mem.bufferText(&messageBuffer)
+}
+
+fn valuesMessage(st: *core.Statement, got: usize, wanted: usize) -> i32 {
+    const db = databaseOf(st)
+    db.*.errorCode = core.ERROR
+    db.*.message.length = 0
+    _ = mem.appendDecimal(&db.*.message, @intCast(i64, got))
+    _ = mem.appendText(&db.*.message, " values for ")
+    _ = mem.appendDecimal(&db.*.message, @intCast(i64, wanted))
+    _ = mem.appendText(&db.*.message, " columns")
+    return core.ERROR
+}
+
+fn tableColumnsMessage(st: *core.Statement, t: *schema.Table, n: usize, got: usize) -> i32 {
+    const db = databaseOf(st)
+    db.*.errorCode = core.ERROR
+    db.*.message.length = 0
+    _ = mem.appendText(&db.*.message, "table ")
+    _ = mem.appendText(&db.*.message, schema.tableName(t))
+    _ = mem.appendText(&db.*.message, " has ")
+    _ = mem.appendDecimal(&db.*.message, @intCast(i64, n))
+    _ = mem.appendText(&db.*.message, " columns but ")
+    _ = mem.appendDecimal(&db.*.message, @intCast(i64, got))
+    _ = mem.appendText(&db.*.message, " values were supplied")
+    return core.ERROR
+}
+
+// The SELECT of the rowids an UPDATE or DELETE changes: `SELECT rowid
+// FROM table WHERE ... ORDER BY ... LIMIT ...`.
+fn scanSelect(st: *core.Statement, node: *ast.Statement) -> usize {
+    const a = &st.*.arena
+    const s = ast.newSelect(a)
+    const x = ast.select(s)
+    const src = ast.alloc(a, @sizeOf(ast.Source))
+    ast.source(src).*.name = node.*.name
+    ast.source(src).*.nameLength = node.*.nameLength
+    ast.source(src).*.alias = node.*.name2
+    ast.source(src).*.aliasLength = node.*.name2Length
+    _ = ast.push(a, x.*.from, @intCast(u64, src))
+    const rowid = ast.newExpr(a, ast.E_COLUMN)
+    ast.expr(rowid).*.name = @intFromPtr("rowid".pointer)
+    ast.expr(rowid).*.nameLength = 5
+    // (The statement's own reference: not one the authorizer is asked
+    // about.)
+    ast.expr(rowid).*.distinct = true
+    ast.expr(rowid).*.table = if node.*.name2Length > 0 { node.*.name2 } else { node.*.name }
+    ast.expr(rowid).*.tableLength = if node.*.name2Length > 0 { node.*.name2Length } else { node.*.nameLength }
+    x.*.columns = ast.newList(a)
+    _ = ast.addItem(a, x.*.columns, rowid)
+    x.*.where = node.*.where
+    x.*.orderBy = node.*.orderBy
+    x.*.limit = node.*.limit
+    x.*.offset = node.*.offset
+    return s
+}
+
+pub fn compileDelete(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    var t: usize = 0
+    var rc = targetTable(st, node, &t)
+    if rc != core.OK { return rc }
+    rc = authorizeTable(st, core.AUTH_DELETE, schema.table(t))
+    if rc != core.OK { return rc }
+    const dml = newDml(st, ast.S_DELETE, t)
+    st.*.quietSelect = true
+    const q = query.compile(st, scanSelect(st, node), 0)
+    if q == 0 { return db.*.errorCode }
+    dmlOf(dml).*.scan = q
+    dmlOf(dml).*.target = @intCast(usize, mem.at(&query.queryOf(q).*.levels, 0))
+    return core.OK
+}
+
+pub fn compileUpdate(st: *core.Statement, address: usize) -> i32 {
+    const node = ast.statement(address)
+    const db = databaseOf(st)
+    var t: usize = 0
+    var rc = targetTable(st, node, &t)
+    if rc != core.OK { return rc }
+    const table = schema.table(t)
+    const dml = newDml(st, ast.S_UPDATE, t)
+    const d = dmlOf(dml)
+    d.*.conflict = node.*.conflict
+    rc = compileChecks(st, d)
+    if rc != core.OK { return rc }
+    // The WHERE's READs are asked about after the SET columns.
+    st.*.quietSelect = true
+    st.*.holdReads = true
+    const held = st.*.heldReads.length
+    const q = query.compile(st, scanSelect(st, node), 0)
+    st.*.holdReads = false
+    // (Reads held before are the WHERE's; the SETs' are asked at once.)
+    var where: mem.Words = undefined
+    mem.initWords(&where)
+    var w = held
+    while w < st.*.heldReads.length {
+        _ = mem.push(&where, mem.at(&st.*.heldReads, w))
+        w += 1
+    }
+    st.*.heldReads.length = held
+    if q == 0 { return db.*.errorCode }
+    d.*.scan = q
+    d.*.target = @intCast(usize, mem.at(&query.queryOf(q).*.levels, 0))
+    d.*.sets = mem.alloc(table.*.columnCount * 8 + 8)
+    // The SET expressions see the target's row, as the WHERE does.
+    const scope = mem.alloc(@sizeOf(query.Scope))
+    _ = mem.push(&st.*.scopes, @intCast(u64, scope))
+    query.scopeOf(scope).*.query = q
+    var i: usize = 0
+    while i < ast.count(node.*.columns) {
+        const it = ast.itemAt(node.*.columns, i)
+        const name = mem.view(it.*.name, it.*.nameLength)
+        const c = schema.findColumn(table, name)
+        rc = query.resolve(st, scope, it.*.expr)
+        if rc != core.OK { return rc }
+        if c < 0 {
+            if schema.isRowidName(name) {
+                d.*.rowidSet = it.*.expr
+            } else {
+                return core.setError2(db, core.ERROR, "no such column: ", name)
+            }
+        } else {
+            mem.put64(d.*.sets + @intCast(usize, c) * 8, @intCast(u64, it.*.expr))
+            if c == table.*.rowidColumn { d.*.rowidSet = it.*.expr }
+        }
+        i += 1
+    }
+    // SQLITE_UPDATE per column set (IGNORE leaves the column as it was).
+    i = 0
+    while i < ast.count(node.*.columns) {
+        const it = ast.itemAt(node.*.columns, i)
+        const c = schema.findColumn(table, mem.view(it.*.name, it.*.nameLength))
+        const column = if c >= 0 { schema.columnName(schema.column(table, @intCast(usize, c))) } else { "ROWID" }
+        const answer = eval.authorize(st, core.AUTH_UPDATE, schema.tableName(table), column)
+        if answer == core.AUTH_DENY {
+            mem.freeWords(&where)
+            return core.setError(db, core.AUTH, "not authorized")
+        }
+        if answer == core.AUTH_IGNORE && c >= 0 { mem.put64(d.*.sets + @intCast(usize, c) * 8, 0) }
+        i += 1
+    }
+    w = 0
+    while w < where.length {
+        _ = mem.push(&st.*.heldReads, mem.at(&where, w))
+        w += 1
+    }
+    mem.freeWords(&where)
+    return query.authorizeHeldReads(st)
+}
+
+// ---------------------------------------------------------------------------
+// Rows and their index entries.
+
+fn pagerOf(st: *core.Statement) -> *pg.Pager { return &databaseOf(st).*.pager }
+
+fn tableCursor(st: *core.Statement, d: *Dml) -> usize {
+    if d.*.cursor == 0 { d.*.cursor = bt.openCursor(pagerOf(st), schema.table(d.*.table).*.root, true, 0) }
+    return d.*.cursor
+}
+
+fn indexCursor(st: *core.Statement, d: *Dml, i: usize) -> usize {
+    const t = schema.table(d.*.table)
+    while d.*.indexCursors.length < t.*.indexes.length { _ = mem.push(&d.*.indexCursors, 0) }
+    var c = @intCast(usize, mem.at(&d.*.indexCursors, i))
+    if c == 0 {
+        const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
+        c = bt.openCursor(pagerOf(st), x.*.root, false, @intFromPtr(&x.*.info))
+        mem.set(&d.*.indexCursors, i, @intCast(u64, c))
+    }
+    return c
+}
+
+// A row's columns (the rowid's column holds the rowid; columns the record
+// lacks their defaults) into `values`; false when there is no such row.
+fn readRow(st: *core.Statement, t: *schema.Table, cursor: usize, rowid: i64, values: usize, found: *bool) -> i32 {
+    found.* = bt.seekRowid(cursor, rowid)
+    if !found.* { return core.OK }
+    const h = bt.header(cursor)
+    var i: usize = 0
+    while i < t.*.columnCount {
+        const v = record.valueAt(values, i)
+        if @intCast(i64, i) == t.*.rowidColumn {
+            value.setInt(v, rowid)
+        } else if i < h.*.count {
+            record.column(h, i, v)
+            if schema.column(t, i).*.affinity == value.AFF_REAL && v.*.kind == value.INTEGER { value.setReal(v, @floatFromInt(f64, v.*.i)) }
+        } else {
+            const rc = eval.columnDefault(st, t, i, v)
+            if rc != core.OK { return rc }
+        }
+        i += 1
+    }
+    return core.OK
+}
+
+// An index's entry for a row: its columns' values and the rowid.
+fn indexEntry(x: *schema.Index, values: usize, rowid: i64, out: *mem.Buffer) -> bool {
+    const n = x.*.columnCount
+    const block = newValues(n + 1)
+    var i: usize = 0
+    while i < n {
+        const c = schema.indexColumn(x, i)
+        if c < 0 {
+            value.setInt(record.valueAt(block, i), rowid)
+        } else {
+            _ = value.copy(record.valueAt(block, i), record.valueAt(values, @intCast(usize, c)))
+        }
+        i += 1
+    }
+    value.setInt(record.valueAt(block, n), rowid)
+    out.*.length = 0
+    const ok = record.encode(block, n + 1, out)
+    core.freeRow(block, n + 2)
+    return ok
+}
+
+// The index's columns of a row as key values (a block the caller frees
+// with `n + 1` Values).
+fn indexKeys(x: *schema.Index, t: *schema.Table, values: usize, rowid: i64) -> usize {
+    const n = x.*.columnCount
+    const block = newValues(n + 1)
+    var i: usize = 0
+    while i < n {
+        const c = schema.indexColumn(x, i)
+        if c < 0 || c == t.*.rowidColumn {
+            value.setInt(record.valueAt(block, i), rowid)
+        } else {
+            _ = value.copy(record.valueAt(block, i), record.valueAt(values, @intCast(usize, c)))
+        }
+        i += 1
+    }
+    return block
+}
+
+fn writeIndexes(st: *core.Statement, d: *Dml, values: usize, rowid: i64, insert: bool) -> i32 {
+    const t = schema.table(d.*.table)
+    var i: usize = 0
+    while i < t.*.indexes.length {
+        const rc = writeIndex(st, d, i, values, rowid, insert)
+        if rc != core.OK { return rc }
+        i += 1
+    }
+    return core.OK
+}
+
+// The entry of the row in `values` put into (or taken out of) the index at
+// `place`, when the index holds the row.
+fn writeIndex(st: *core.Statement, d: *Dml, place: usize, values: usize, rowid: i64, insert: bool) -> i32 {
+    const t = schema.table(d.*.table)
+    const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, place)))
+    var rc = eval.resolveIndex(st, x)
+    if rc != core.OK { return rc }
+    if x.*.partial != 0 {
+        // A partial index holds the rows its WHERE holds for.
+        var holds = false
+        rc = partialHolds(st, d, place, values, &holds)
+        if rc != core.OK || !holds { return rc }
+    }
+    if !indexEntry(x, values, rowid, &d.*.key) { return core.NOMEM }
+    const cursor = indexCursor(st, d, place)
+    rc = if insert { bt.insertEntry(cursor, d.*.key.data, d.*.key.length) } else { bt.deleteEntry(cursor, d.*.key.data, d.*.key.length) }
+    if rc != core.OK { return storageError(st, rc) }
+    return core.OK
+}
+
+// Whether the index at `place` has the same entry for the old row and the
+// new one (an UPDATE that keeps the rowid then leaves it alone).
+fn sameEntry(st: *core.Statement, d: *Dml, place: usize, rowid: i64, same: *bool) -> i32 {
+    same.* = false
+    const t = schema.table(d.*.table)
+    const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, place)))
+    var rc = eval.resolveIndex(st, x)
+    if rc != core.OK { return rc }
+    var holdsOld = true
+    var holdsNew = true
+    rc = partialHolds(st, d, place, d.*.old, &holdsOld)
+    if rc == core.OK { rc = partialHolds(st, d, place, d.*.values, &holdsNew) }
+    if rc != core.OK || holdsOld != holdsNew { return rc }
+    if !holdsOld {
+        same.* = true
+        return core.OK
+    }
+    var old: mem.Buffer = undefined
+    mem.initBuffer(&old)
+    if !indexEntry(x, d.*.old, rowid, &old) {
+        mem.freeBuffer(&old)
+        return core.NOMEM
+    }
+    if !indexEntry(x, d.*.values, rowid, &d.*.key) {
+        mem.freeBuffer(&old)
+        return core.NOMEM
+    }
+    same.* = old.length == d.*.key.length && mem.compare(old.data, old.length, d.*.key.data, d.*.key.length) == 0
+    mem.freeBuffer(&old)
+    return core.OK
+}
+
+// Whether the partial index at `place` holds the row in `values` (its
+// WHERE is true for it).
+fn partialHolds(st: *core.Statement, d: *Dml, place: usize, values: usize, holds: *bool) -> i32 {
+    holds.* = true
+    if place >= d.*.partials.length || mem.at(&d.*.partials, place) == 0 { return core.OK }
+    query.rowSource(d.*.checkScope).*.row = values
+    var truth: i8 = 0
+    const rc = eval.condition(st, @intCast(usize, mem.at(&d.*.partials, place)), &truth)
+    holds.* = truth == 1
+    return rc
+}
+
+fn storageError(st: *core.Statement, rc: i32) -> i32 {
+    if rc == core.CORRUPT { return core.setError(databaseOf(st), core.CORRUPT, "database disk image is malformed") }
+    if rc == core.NOMEM { return core.setError(databaseOf(st), core.NOMEM, "out of memory") }
+    return core.setError(databaseOf(st), rc, core.errorText(rc))
+}
+
+fn writeRecord(st: *core.Statement, d: *Dml, values: usize, rowid: i64) -> i32 {
+    const t = schema.table(d.*.table)
+    // The rowid's column is NULL in the record.
+    var saved: Value = undefined
+    value.init(&saved)
+    if t.*.rowidColumn >= 0 {
+        value.move(&saved, record.valueAt(values, @intCast(usize, t.*.rowidColumn)))
+    }
+    d.*.data.length = 0
+    const ok = record.encode(values, t.*.columnCount, &d.*.data)
+    if t.*.rowidColumn >= 0 {
+        value.move(record.valueAt(values, @intCast(usize, t.*.rowidColumn)), &saved)
+    }
+    if !ok { return core.NOMEM }
+    const rc = bt.insertRow(tableCursor(st, d), rowid, d.*.data.data, d.*.data.length)
+    if rc != core.OK { return storageError(st, rc) }
+    return core.OK
+}
+
+// ---------------------------------------------------------------------------
+// Constraints.
+
+fn resolution(d: *Dml, constraint: u8) -> u8 {
+    if d.*.conflict != ast.OE_NONE { return d.*.conflict }
+    if constraint != ast.OE_NONE { return constraint }
+    return ast.OE_ABORT
+}
+
+// A constraint violation: the statement fails (how it leaves its changes
+// follows the resolution).
+fn violation(st: *core.Statement, code: i32, how: u8, message: []const u8, detail: []const u8) -> i32 {
+    st.*.failMode = how
+    const db = databaseOf(st)
+    db.*.errorCode = code
+    db.*.message.length = 0
+    _ = mem.appendText(&db.*.message, message)
+    _ = mem.appendText(&db.*.message, detail)
+    return code
+}
+
+fn columnsText(t: *schema.Table, x: *schema.Index, out: *mem.Buffer) -> void {
+    out.*.length = 0
+    var i: usize = 0
+    while i < x.*.columnCount {
+        if i > 0 { _ = mem.appendText(out, ", ") }
+        _ = mem.appendText(out, schema.tableName(t))
+        _ = mem.appendText(out, ".")
+        const c = schema.indexColumn(x, i)
+        if c >= 0 {
+            _ = mem.appendText(out, schema.columnName(schema.column(t, @intCast(usize, c))))
+        } else {
+            _ = mem.appendText(out, "rowid")
+        }
+        i += 1
+    }
+}
+
+// NOT NULL: each NULL resolved (REPLACE takes the default); `skip` set
+// for IGNORE.
+fn checkNotNull(st: *core.Statement, d: *Dml, values: usize, skip: *bool) -> i32 {
+    const t = schema.table(d.*.table)
+    var i: usize = 0
+    while i < t.*.columnCount {
+        const c = schema.column(t, i)
+        const v = record.valueAt(values, i)
+        if c.*.notNull && v.*.kind == value.NULL && @intCast(i64, i) != t.*.rowidColumn {
+            var how = resolution(d, c.*.notNullConflict)
+            if how == ast.OE_REPLACE {
+                if c.*.defaultExpr != 0 {
+                    const rc = eval.columnDefault(st, t, i, v)
+                    if rc != core.OK { return rc }
+                }
+                if v.*.kind != value.NULL {
+                    i += 1
+                    continue
+                }
+                how = ast.OE_ABORT
+            }
+            if how == ast.OE_IGNORE {
+                skip.* = true
+                return core.OK
+            }
+            var text: mem.Buffer = undefined
+            mem.initBuffer(&text)
+            _ = mem.appendText(&text, schema.tableName(t))
+            _ = mem.appendText(&text, ".")
+            _ = mem.appendText(&text, schema.columnName(c))
+            const rc = violation(st, core.CONSTRAINT_NOTNULL, how, "NOT NULL constraint failed: ", mem.bufferText(&text))
+            mem.freeBuffer(&text)
+            return rc
+        }
+        i += 1
+    }
+    return core.OK
+}
+
+// The rowid of another row an index's unique key clashes with (0 and
+// false when none).
+fn uniqueClash(st: *core.Statement, d: *Dml, place: usize, values: usize, rowid: i64, other: *i64) -> i32 {
+    const t = schema.table(d.*.table)
+    const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, place)))
+    other.* = 0
+    var i: usize = 0
+    while i < x.*.columnCount {
+        const c = schema.indexColumn(x, i)
+        if c >= 0 && c != t.*.rowidColumn && record.valueAt(values, @intCast(usize, c)).*.kind == value.NULL { return core.OK }
+        i += 1
+    }
+    var rc = eval.resolveIndex(st, x)
+    if rc != core.OK { return rc }
+    const keys = indexKeys(x, t, values, rowid)
+    const cursor = indexCursor(st, d, place)
+    rc = bt.seekKey(cursor, keys, x.*.columnCount, false)
+    while rc == core.OK && bt.isValid(cursor) {
+        var length: usize = 0
+        const data = bt.payload(cursor, &length)
+        if record.compareWithKeys(data, length, keys, x.*.columnCount, &x.*.info) != 0 { break }
+        const found = record.lastInteger(data, length)
+        if found != rowid {
+            other.* = found
+            break
+        }
+        rc = bt.next(cursor)
+    }
+    core.freeRow(keys, x.*.columnCount + 1)
+    if rc != core.OK { return storageError(st, rc) }
+    return core.OK
+}
+
+// Rowid and UNIQUE checks for a row about to be written with `rowid`
+// (`oldRowid` its rowid before, for an UPDATE): REPLACE deletes the rows
+// in the way; `skip` set for IGNORE.
+fn checkUnique(st: *core.Statement, d: *Dml, values: usize, rowid: i64, oldRowid: i64, isUpdate: bool, skip: *bool) -> i32 {
+    const t = schema.table(d.*.table)
+    var rc = core.OK
+    if !isUpdate || rowid != oldRowid {
+        if bt.seekRowid(tableCursor(st, d), rowid) {
+            const how = resolution(d, t.*.rowidConflict)
+            if how == ast.OE_REPLACE {
+                rc = deleteRow(st, d, rowid, true)
+                if rc != core.OK { return rc }
+            } else if how == ast.OE_IGNORE {
+                skip.* = true
+                return core.OK
+            } else {
+                var text: mem.Buffer = undefined
+                mem.initBuffer(&text)
+                _ = mem.appendText(&text, schema.tableName(t))
+                _ = mem.appendText(&text, ".")
+                if t.*.rowidColumn >= 0 {
+                    _ = mem.appendText(&text, schema.columnName(schema.column(t, @intCast(usize, t.*.rowidColumn))))
+                } else {
+                    _ = mem.appendText(&text, "rowid")
+                }
+                rc = violation(st, if t.*.rowidColumn >= 0 { core.CONSTRAINT_PRIMARYKEY } else { core.CONSTRAINT_ROWID }, how, "UNIQUE constraint failed: ", mem.bufferText(&text))
+                mem.freeBuffer(&text)
+                return rc
+            }
+        }
+    }
+    var i: usize = 0
+    while i < t.*.indexes.length {
+        const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, i)))
+        if !x.*.unique {
+            i += 1
+            continue
+        }
+        var holds = true
+        rc = partialHolds(st, d, i, values, &holds)
+        if rc != core.OK { return rc }
+        if !holds {
+            i += 1
+            continue
+        }
+        var other: i64 = 0
+        rc = uniqueClash(st, d, i, values, if isUpdate { oldRowid } else { rowid }, &other)
+        if rc != core.OK { return rc }
+        if other != 0 || (other == 0 && clashWithZero(st, d, i, values, if isUpdate { oldRowid } else { rowid })) {
+            if other == 0 { other = 0 }
+            const how = resolution(d, x.*.onError)
+            if how == ast.OE_REPLACE {
+                rc = deleteRow(st, d, other, true)
+                if rc != core.OK { return rc }
+                continue
+            }
+            if how == ast.OE_IGNORE {
+                skip.* = true
+                return core.OK
+            }
+            var text: mem.Buffer = undefined
+            mem.initBuffer(&text)
+            columnsText(t, x, &text)
+            rc = violation(st, if x.*.origin == 2 { core.CONSTRAINT_PRIMARYKEY } else { core.CONSTRAINT_UNIQUE }, how, "UNIQUE constraint failed: ", mem.bufferText(&text))
+            mem.freeBuffer(&text)
+            return rc
+        }
+        i += 1
+    }
+    return core.OK
+}
+
+// A clash with the row whose rowid is 0 (uniqueClash reports 0 as none).
+fn clashWithZero(st: *core.Statement, d: *Dml, place: usize, values: usize, rowid: i64) -> bool {
+    if rowid == 0 { return false }
+    const t = schema.table(d.*.table)
+    const x = schema.index(@intCast(usize, mem.at(&t.*.indexes, place)))
+    var i: usize = 0
+    while i < x.*.columnCount {
+        const c = schema.indexColumn(x, i)
+        if c >= 0 && c != t.*.rowidColumn && record.valueAt(values, @intCast(usize, c)).*.kind == value.NULL { return false }
+        i += 1
+    }
+    const keys = indexKeys(x, t, values, rowid)
+    value.setInt(record.valueAt(keys, x.*.columnCount), 0)
+    const cursor = indexCursor(st, d, place)
+    var found = false
+    if bt.seekKey(cursor, keys, x.*.columnCount + 1, false) == core.OK && bt.isValid(cursor) {
+        var length: usize = 0
+        const data = bt.payload(cursor, &length)
+        found = record.compareWithKeys(data, length, keys, x.*.columnCount + 1, &x.*.info) == 0
+    }
+    core.freeRow(keys, x.*.columnCount + 1)
+    return found
+}
+
+// ---------------------------------------------------------------------------
+// Foreign keys.
+
+// The parent table of a foreign key and the columns it references (in a
+// Words of column indexes, -1 the rowid): false (an error set) when they
+// are no key of it.
+fn parentKey(st: *core.Statement, f: *schema.ForeignKey, parent: *usize, columns: *mem.Words, index: *usize) -> i32 {
+    const db = databaseOf(st)
+    const p = schema.findTable(&db.*.schema, mem.view(f.*.parent, f.*.parentLength))
+    if p == 0 { return core.setError2(db, core.ERROR, "no such table: main.", mem.view(f.*.parent, f.*.parentLength)) }
+    parent.* = p
+    const pt = schema.table(p)
+    columns.*.length = 0
+    if f.*.parentNames == 0 {
+        if pt.*.rowidColumn >= 0 {
+            _ = mem.push(columns, @bitCast(u64, @intCast(i64, -1)))
+        } else {
+            var i: usize = 0
+            while i < pt.*.primaryKey.length {
+                _ = mem.push(columns, mem.at(&pt.*.primaryKey, i))
+                i += 1
+            }
+        }
+    } else {
+        var i: usize = 0
+        while i < f.*.columnCount {
+            const name = schema.foreignKeyParentName(f, i)
+            var c = schema.findColumn(pt, name)
+            if c == pt.*.rowidColumn && c >= 0 { c = -1 }
+            if c < -1 || (c == -1 && pt.*.rowidColumn < 0 && !schema.isRowidName(name)) {
+                return mismatch(st, f)
+            }
+            _ = mem.push(columns, @bitCast(u64, c))
+            i += 1
+        }
+    }
+    if columns.*.length != f.*.columnCount { return mismatch(st, f) }
+    // The rowid alone needs no index; else a UNIQUE index on exactly them.
+    index.* = 0
+    if columns.*.length == 1 && @bitCast(i64, mem.at(columns, 0)) == -1 { return core.OK }
+    var k: usize = 0
+    while k < pt.*.indexes.length {
+        const x = schema.index(@intCast(usize, mem.at(&pt.*.indexes, k)))
+        if x.*.unique && x.*.columnCount == columns.*.length && x.*.partial == 0 {
+            var same = true
+            var i: usize = 0
+            while i < x.*.columnCount {
+                if schema.indexColumn(x, i) != @bitCast(i64, mem.at(columns, i)) { same = false }
+                i += 1
+            }
+            if same {
+                index.* = @intFromPtr(x)
+                return eval.resolveIndex(st, x)
+            }
+        }
+        k += 1
+    }
+    return mismatch(st, f)
+}
+
+fn mismatch(st: *core.Statement, f: *schema.ForeignKey) -> i32 {
+    const db = databaseOf(st)
+    db.*.errorCode = core.ERROR
+    db.*.message.length = 0
+    _ = mem.appendText(&db.*.message, "foreign key mismatch - \"")
+    _ = mem.appendText(&db.*.message, schema.tableName(schema.table(f.*.table)))
+    _ = mem.appendText(&db.*.message, "\" referencing \"")
+    _ = mem.appendText(&db.*.message, mem.view(f.*.parent, f.*.parentLength))
+    _ = mem.appendText(&db.*.message, "\"")
+    return core.ERROR
+}
+
+// Whether the parent has a row with the key `keys` (the child's values).
+fn parentExists(st: *core.Statement, parent: usize, columns: *mem.Words, index: usize, keys: usize, exists: *bool) -> i32 {
+    const pt = schema.table(parent)
+    const db = databaseOf(st)
+    exists.* = false
+    if index == 0 {
+        const v = record.valueAt(keys, 0)
+        var number: Value = undefined
+        value.init(&number)
+        _ = value.copy(&number, v)
+        value.applyComparisonNumeric(&number)
+        if number.kind == value.INTEGER {
+            const cursor = bt.openCursor(&db.*.pager, pt.*.root, true, 0)
+            exists.* = bt.seekRowid(cursor, number.i)
+            bt.closeCursor(cursor)
+        }
+        value.release(&number)
+        return core.OK
+    }
+    const x = schema.index(index)
+    // The parent's column affinities applied to the child's values.
+    var i: usize = 0
+    while i < x.*.columnCount {
+        const c = schema.indexColumn(x, i)
+        if c >= 0 {
+            const affinity = schema.column(pt, @intCast(usize, c)).*.affinity
+            if affinity >= value.AFF_NUMERIC {
+                value.applyComparisonNumeric(record.valueAt(keys, i))
+            } else if affinity == value.AFF_TEXT {
+                const v = record.valueAt(keys, i)
+                if v.*.kind == value.INTEGER || v.*.kind == value.REAL { _ = value.toText(v) }
+            }
+        }
+        i += 1
+    }
+    const cursor = bt.openCursor(&db.*.pager, x.*.root, false, @intFromPtr(&x.*.info))
+    const rc = bt.seekKey(cursor, keys, x.*.columnCount, false)
+    if rc == core.OK && bt.isValid(cursor) {
+        var length: usize = 0
+        const data = bt.payload(cursor, &length)
+        exists.* = record.compareWithKeys(data, length, keys, x.*.columnCount, &x.*.info) == 0
+    }
+    bt.closeCursor(cursor)
+    _ = columns
+    return rc
+}
+
+// A row being written must have its parents (child side of each foreign
+// key, when its columns are not NULL).
+fn checkParents(st: *core.Statement, d: *Dml, values: usize, old: usize) -> i32 {
+    const db = databaseOf(st)
+    if !db.*.foreignKeys { return core.OK }
+    const t = schema.table(d.*.table)
+    var columns: mem.Words = undefined
+    mem.initWords(&columns)
+    var rc = core.OK
+    var k: usize = 0
+    while k < t.*.foreignKeys.length && rc == core.OK {
+        const f = schema.foreignKey(@intCast(usize, mem.at(&t.*.foreignKeys, k)))
+        k += 1
+        // Unchanged keys of an UPDATE need no check.
+        var anyNull = false
+        var changed = old == 0
+        var i: usize = 0
+        while i < f.*.columnCount {
+            const c = schema.foreignKeyColumn(f, i)
+            const v = record.valueAt(values, c)
+            if v.*.kind == value.NULL { anyNull = true }
+            if old != 0 && value.compare(v, record.valueAt(old, c), 0) != 0 { changed = true }
+            i += 1
+        }
+        if anyNull || !changed { continue }
+        var parent: usize = 0
+        var index: usize = 0
+        rc = parentKey(st, f, &parent, &columns, &index)
+        if rc != core.OK { break }
+        const keys = newValues(f.*.columnCount + 1)
+        i = 0
+        while i < f.*.columnCount {
+            _ = value.copy(record.valueAt(keys, i), record.valueAt(values, schema.foreignKeyColumn(f, i)))
+            i += 1
+        }
+        var exists = false
+        rc = parentExists(st, parent, &columns, index, keys, &exists)
+        core.freeRow(keys, f.*.columnCount + 1)
+        if rc == core.OK && !exists {
+            rc = violation(st, core.CONSTRAINT_FOREIGNKEY, ast.OE_ABORT, "FOREIGN KEY constraint failed", "")
+        }
+    }
+    mem.freeWords(&columns)
+    return rc
+}
+
+// The rowids of child rows whose key equals the parent row's key.
+fn childRows(st: *core.Statement, child: *schema.Table, f: *schema.ForeignKey, parentValues: usize, parentColumns: *mem.Words, parentRowid: i64, out: *mem.Words) -> i32 {
+    const db = databaseOf(st)
+    out.*.length = 0
+    // The key's values, from the parent row.
+    const keys = newValues(f.*.columnCount + 1)
+    var i: usize = 0
+    while i < f.*.columnCount {
+        const c = @bitCast(i64, mem.at(parentColumns, i))
+        if c < 0 {
+            value.setInt(record.valueAt(keys, i), parentRowid)
+        } else {
+            _ = value.copy(record.valueAt(keys, i), record.valueAt(parentValues, @intCast(usize, c)))
+        }
+        if record.valueAt(keys, i).*.kind == value.NULL {
+            core.freeRow(keys, f.*.columnCount + 1)
+            return core.OK
+        }
+        i += 1
+    }
+    // A full scan of the child table, comparing (an index on the child's
+    // columns would do it faster).
+    const cursor = bt.openCursor(&db.*.pager, child.*.root, true, 0)
+    var rc = bt.first(cursor)
+    const row = newValues(child.*.columnCount)
+    while rc == core.OK && bt.isValid(cursor) {
+        const h = bt.header(cursor)
+        const rowid = bt.rowid(cursor)
+        var matches = true
+        i = 0
+        while i < f.*.columnCount {
+            const c = schema.foreignKeyColumn(f, i)
+            const v = record.valueAt(row, 0)
+            if @intCast(i64, c) == child.*.rowidColumn {
+                value.setInt(v, rowid)
+            } else if c < h.*.count {
+                record.column(h, c, v)
+            } else {
+                value.setNull(v)
+            }
+            if v.*.kind == value.NULL {
+                matches = false
+                break
+            }
+            var k: Value = undefined
+            value.init(&k)
+            _ = value.copy(&k, record.valueAt(keys, i))
+            const affinity = schema.column(child, c).*.affinity
+            if affinity >= value.AFF_NUMERIC { value.applyComparisonNumeric(&k) }
+            const equal = value.compare(v, &k, 0) == 0
+            value.release(&k)
+            if !equal {
+                matches = false
+                break
+            }
+            i += 1
+        }
+        if matches { _ = mem.push(out, @bitCast(u64, rowid)) }
+        rc = bt.next(cursor)
+    }
+    core.freeRow(row, child.*.columnCount)
+    bt.closeCursor(cursor)
+    core.freeRow(keys, f.*.columnCount + 1)
+    return rc
+}
+
+// The child side of deleting (or changing the key of) a parent row: each
+// foreign key referencing the table acts (`deleting`: ON DELETE, else ON
+// UPDATE with the row's new values in `newValues`).
+fn actOnChildren(st: *core.Statement, d: *Dml, values: usize, rowid: i64, deleting: bool, newValuesBlock: usize, newRowid: i64) -> i32 {
+    const db = databaseOf(st)
+    if !db.*.foreignKeys { return core.OK }
+    const t = schema.table(d.*.table)
+    var columns: mem.Words = undefined
+    mem.initWords(&columns)
+    var rowids: mem.Words = undefined
+    mem.initWords(&rowids)
+    var rc = core.OK
+    var ti: usize = 0
+    while ti < db.*.schema.tables.length && rc == core.OK {
+        const child = schema.table(@intCast(usize, mem.at(&db.*.schema.tables, ti)))
+        ti += 1
+        var k: usize = 0
+        while k < child.*.foreignKeys.length && rc == core.OK {
+            const f = schema.foreignKey(@intCast(usize, mem.at(&child.*.foreignKeys, k)))
+            k += 1
+            if !mem.sameNoCase(mem.view(f.*.parent, f.*.parentLength), schema.tableName(t)) { continue }
+            var parent: usize = 0
+            var index: usize = 0
+            rc = parentKey(st, f, &parent, &columns, &index)
+            if rc != core.OK { break }
+            if !deleting {
+                // Only a changed key matters.
+                var changed = false
+                var i: usize = 0
+                while i < columns.length {
+                    const c = @bitCast(i64, mem.at(&columns, i))
+                    if c < 0 {
+                        if rowid != newRowid { changed = true }
+                    } else if value.compare(record.valueAt(values, @intCast(usize, c)), record.valueAt(newValuesBlock, @intCast(usize, c)), 0) != 0 {
+                        changed = true
+                    }
+                    i += 1
+                }
+                if !changed { continue }
+            }
+            rc = childRows(st, child, f, values, &columns, rowid, &rowids)
+            if rc != core.OK || rowids.length == 0 { continue }
+            const action = if deleting { f.*.onDelete } else { f.*.onUpdate }
+            if action == ast.FK_CASCADE || action == ast.FK_SET_NULL || action == ast.FK_SET_DEFAULT {
+                rc = childAction(st, child, f, &rowids, action, deleting, &columns, newValuesBlock, newRowid)
+            } else {
+                rc = violation(st, core.CONSTRAINT_FOREIGNKEY, ast.OE_ABORT, "FOREIGN KEY constraint failed", "")
+            }
+        }
+    }
+    mem.freeWords(&columns)
+    mem.freeWords(&rowids)
+    return rc
+}
+
+// CASCADE (delete the children, or give them the new key), SET NULL, SET
+// DEFAULT, on rows of `child` by rowid.
+fn childAction(st: *core.Statement, child: *schema.Table, f: *schema.ForeignKey, rowids: *mem.Words, action: u8, deleting: bool, parentColumns: *mem.Words, newValuesBlock: usize, newRowid: i64) -> i32 {
+    // A Dml of its own for the child table.
+    const saved = st.*.dml
+    const address = newDml(st, ast.S_UPDATE, @intFromPtr(child))
+    st.*.dml = saved
+    const c = dmlOf(address)
+    c.*.conflict = ast.OE_ABORT
+    var rc = core.OK
+    var i: usize = 0
+    while i < rowids.*.length && rc == core.OK {
+        const rowid = @bitCast(i64, mem.at(rowids, i))
+        i += 1
+        if action == ast.FK_CASCADE && deleting {
+            rc = deleteRow(st, c, rowid, false)
+            continue
+        }
+        var found = false
+        rc = readRow(st, child, tableCursor(st, c), rowid, c.*.values, &found)
+        if rc != core.OK || !found { continue }
+        var k: usize = 0
+        while k < child.*.columnCount {
+            _ = value.copy(record.valueAt(c.*.old, k), record.valueAt(c.*.values, k))
+            k += 1
+        }
+        k = 0
+        while k < f.*.columnCount {
+            const column = schema.foreignKeyColumn(f, k)
+            const v = record.valueAt(c.*.values, column)
+            if action == ast.FK_SET_NULL {
+                value.setNull(v)
+            } else if action == ast.FK_SET_DEFAULT {
+                rc = eval.columnDefault(st, child, column, v)
+            } else {
+                const pc = @bitCast(i64, mem.at(parentColumns, k))
+                if pc < 0 {
+                    value.setInt(v, newRowid)
+                } else {
+                    _ = value.copy(v, record.valueAt(newValuesBlock, @intCast(usize, pc)))
+                }
+                value.applyAffinity(v, schema.column(child, column).*.affinity)
+            }
+            k += 1
+        }
+        if rc == core.OK { rc = rewriteRow(st, c, rowid, rowid) }
+    }
+    freeDml(address)
+    return rc
+}
+
+// ---------------------------------------------------------------------------
+// The changes.
+
+// Deletes a row: its children acted on, its index entries, the row.
+// `replace`: a row deleted by REPLACE (not counted).
+fn deleteRow(st: *core.Statement, d: *Dml, rowid: i64, replace: bool) -> i32 {
+    const t = schema.table(d.*.table)
+    // The row's values (a separate block: `values` may hold the new row).
+    const old = newValues(t.*.columnCount)
+    var found = false
+    var rc = readRow(st, t, tableCursor(st, d), rowid, old, &found)
+    if rc == core.OK && found {
+        rc = actOnChildren(st, d, old, rowid, true, 0, 0)
+        if rc == core.OK { rc = writeIndexes(st, d, old, rowid, false) }
+        if rc == core.OK {
+            rc = bt.deleteRow(tableCursor(st, d), rowid)
+            if rc != core.OK { rc = storageError(st, rc) }
+        }
+        if rc == core.OK && !replace { st.*.changes += 1 }
+    }
+    core.freeRow(old, t.*.columnCount + 1)
+    return rc
+}
+
+// Writes the row in `values` (changed from `old`) at `newRowid`.
+fn rewriteRow(st: *core.Statement, d: *Dml, oldRowid: i64, newRowid: i64) -> i32 {
+    // The indexes whose entry changes (all when the rowid does).
+    const t = schema.table(d.*.table)
+    var changed: mem.Words = undefined
+    mem.initWords(&changed)
+    var rc = core.OK
+    var i: usize = 0
+    while i < t.*.indexes.length && rc == core.OK {
+        var same = false
+        if newRowid == oldRowid { rc = sameEntry(st, d, i, oldRowid, &same) }
+        if !same { _ = mem.push(&changed, @intCast(u64, i)) }
+        i += 1
+    }
+    i = 0
+    while i < changed.length && rc == core.OK {
+        rc = writeIndex(st, d, @intCast(usize, mem.at(&changed, i)), d.*.old, oldRowid, false)
+        i += 1
+    }
+    if rc == core.OK && newRowid != oldRowid {
+        rc = bt.deleteRow(tableCursor(st, d), oldRowid)
+        if rc != core.OK { rc = storageError(st, rc) }
+    }
+    if rc == core.OK { rc = writeRecord(st, d, d.*.values, newRowid) }
+    i = 0
+    while i < changed.length && rc == core.OK {
+        rc = writeIndex(st, d, @intCast(usize, mem.at(&changed, i)), d.*.values, newRowid, true)
+        i += 1
+    }
+    mem.freeWords(&changed)
+    return rc
+}
+
+// A new rowid: one past the largest (AUTOINCREMENT: past the largest ever
+// used too), or a free one at random once the largest is taken.
+fn newRowid(st: *core.Statement, d: *Dml, out: *i64) -> i32 {
+    const t = schema.table(d.*.table)
+    var largest: i64 = 0
+    var rc = bt.maxRowid(tableCursor(st, d), &largest)
+    if rc != core.OK { return storageError(st, rc) }
+    if t.*.autoincrement {
+        var seq: i64 = 0
+        rc = sequence(st, t, &seq, false, 0)
+        if rc != core.OK { return rc }
+        if seq > largest { largest = seq }
+        if largest == 9223372036854775807 { return core.setError(databaseOf(st), core.FULL, "database or disk is full") }
+    }
+    if largest < 9223372036854775807 {
+        out.* = largest + 1
+        return core.OK
+    }
+    // Random rowids until a free one.
+    var tries: usize = 0
+    const block = mem.alloc(8)
+    while tries < 100 {
+        os.randomBytes(block, 8)
+        const candidate = @bitCast(i64, mem.get64(block) & 0x7fffffffffffffff)
+        if candidate > 0 && !bt.seekRowid(tableCursor(st, d), candidate) {
+            mem.free(block)
+            out.* = candidate
+            return core.OK
+        }
+        tries += 1
+    }
+    mem.free(block)
+    return core.setError(databaseOf(st), core.FULL, "database or disk is full")
+}
+
+// sqlite_sequence's value for an AUTOINCREMENT table (`write`: set it to
+// `seq` when that is larger).
+fn sequence(st: *core.Statement, t: *schema.Table, seq: *i64, write: bool, newValue: i64) -> i32 {
+    const db = databaseOf(st)
+    const s = schema.findTable(&db.*.schema, "sqlite_sequence")
+    if s == 0 { return core.OK }
+    const seqTable = schema.table(s)
+    const cursor = bt.openCursor(&db.*.pager, seqTable.*.root, true, 0)
+    var rc = bt.first(cursor)
+    var rowid: i64 = 0
+    var current: i64 = 0
+    var found = false
+    var v: Value = undefined
+    value.init(&v)
+    while rc == core.OK && bt.isValid(cursor) {
+        const h = bt.header(cursor)
+        record.column(h, 0, &v)
+        if v.kind == value.TEXT && mem.same(value.bytesOf(&v), schema.tableName(t)) {
+            record.column(h, 1, &v)
+            current = value.toInt(&v)
+            rowid = bt.rowid(cursor)
+            found = true
+            break
+        }
+        rc = bt.next(cursor)
+    }
+    seq.* = current
+    if rc == core.OK && write && (!found || newValue > current) {
+        const block = newValues(2)
+        _ = value.setString(record.valueAt(block, 0), schema.tableName(t))
+        value.setInt(record.valueAt(block, 1), newValue)
+        var data: mem.Buffer = undefined
+        mem.initBuffer(&data)
+        _ = record.encode(block, 2, &data)
+        if !found {
+            var largest: i64 = 0
+            rc = bt.maxRowid(cursor, &largest)
+            rowid = largest + 1
+        }
+        if rc == core.OK { rc = bt.insertRow(cursor, rowid, data.data, data.length) }
+        mem.freeBuffer(&data)
+        core.freeRow(block, 3)
+    }
+    value.release(&v)
+    bt.closeCursor(cursor)
+    if rc != core.OK { return storageError(st, rc) }
+    return core.OK
+}
+
+// Inserts the row in d.values (the rowid at `rowidValue`, NULL for a new
+// one).
+fn insertRow(st: *core.Statement, d: *Dml, rowidValue: *Value) -> i32 {
+    const t = schema.table(d.*.table)
+    const db = databaseOf(st)
+    var rc = core.OK
+    // Affinities.
+    var i: usize = 0
+    while i < t.*.columnCount {
+        value.applyAffinity(record.valueAt(d.*.values, i), schema.column(t, i).*.affinity)
+        i += 1
+    }
+    var skip = false
+    rc = checkNotNull(st, d, d.*.values, &skip)
+    if rc != core.OK || skip { return rc }
+    var rowid: i64 = 0
+    if rowidValue.*.kind != value.NULL {
+        value.applyAffinity(rowidValue, value.AFF_INTEGER)
+        if rowidValue.*.kind != value.INTEGER {
+            return core.setError(db, core.MISMATCH, "datatype mismatch")
+        }
+        rowid = rowidValue.*.i
+    } else {
+        rc = newRowid(st, d, &rowid)
+        if rc != core.OK { return rc }
+    }
+    if t.*.rowidColumn >= 0 { value.setInt(record.valueAt(d.*.values, @intCast(usize, t.*.rowidColumn)), rowid) }
+    rc = checkChecks(st, d, d.*.values, &skip)
+    if rc != core.OK || skip { return rc }
+    if d.*.upsert != 0 {
+        var clause: usize = 0
+        var number: usize = 0
+        var other: i64 = 0
+        rc = upsertClash(st, d, d.*.values, rowid, &clause, &number, &other)
+        if rc != core.OK { return rc }
+        if clause != 0 { return doUpsert(st, d, clause, number, other) }
+    }
+    rc = checkUnique(st, d, d.*.values, rowid, 0, false, &skip)
+    if rc != core.OK || skip { return rc }
+    rc = checkParents(st, d, d.*.values, 0)
+    if rc != core.OK { return rc }
+    rc = writeRecord(st, d, d.*.values, rowid)
+    if rc != core.OK { return rc }
+    rc = writeIndexes(st, d, d.*.values, rowid, true)
+    if rc != core.OK { return rc }
+    if t.*.autoincrement {
+        var seq: i64 = 0
+        rc = sequence(st, t, &seq, true, rowid)
+        if rc != core.OK { return rc }
+    }
+    db.*.lastInsertRowid = rowid
+    st.*.changes += 1
+    return core.OK
+}
+
+fn runInsert(st: *core.Statement, d: *Dml) -> i32 {
+    const t = schema.table(d.*.table)
+    var rc = core.OK
+    var rowidValue: Value = undefined
+    value.init(&rowidValue)
+    if d.*.source == 0 {
+        // DEFAULT VALUES.
+        var i: usize = 0
+        while i < t.*.columnCount && rc == core.OK {
+            rc = eval.columnDefault(st, t, i, record.valueAt(d.*.values, i))
+            i += 1
+        }
+        if rc == core.OK { rc = insertRow(st, d, &rowidValue) }
+        value.release(&rowidValue)
+        return rc
+    }
+    // The rows first (an INSERT reading its own table sees the table as it
+    // was).
+    const rows = core.newRows(d.*.sourceWidth)
+    rc = eval.runSubquery(st, d.*.source, rows)
+    var r: usize = 0
+    while rc == core.OK && r < core.rowCount(rows) {
+        const row = core.rowAt(rows, r)
+        r += 1
+        var i: usize = 0
+        while i < t.*.columnCount && rc == core.OK {
+            const place = @bitCast(i64, mem.get64(d.*.columnMap + i * 8))
+            const v = record.valueAt(d.*.values, i)
+            if place >= 0 {
+                _ = value.copy(v, record.valueAt(row, @intCast(usize, place)))
+            } else {
+                rc = eval.columnDefault(st, t, i, v)
+            }
+            i += 1
+        }
+        if rc != core.OK { break }
+        if d.*.rowidPlace >= 0 {
+            _ = value.copy(&rowidValue, record.valueAt(row, @intCast(usize, d.*.rowidPlace)))
+        } else {
+            value.setNull(&rowidValue)
+        }
+        rc = insertRow(st, d, &rowidValue)
+    }
+    core.freeRows(rows)
+    value.release(&rowidValue)
+    return rc
+}
+
+// The rowids of the rows an UPDATE or DELETE changes.
+fn gatherRowids(st: *core.Statement, d: *Dml) -> i32 {
+    d.*.rowids.length = 0
+    query.reset(st, d.*.scan)
+    while true {
+        const rc = query.step(st, d.*.scan)
+        if rc == core.DONE { return core.OK }
+        if rc != core.ROW { return rc }
+        _ = mem.push(&d.*.rowids, @bitCast(u64, value.toInt(query.output(d.*.scan, 0))))
+    }
+    return core.OK
+}
+
+fn runDelete(st: *core.Statement, d: *Dml) -> i32 {
+    var rc = gatherRowids(st, d)
+    var i: usize = 0
+    while rc == core.OK && i < d.*.rowids.length {
+        rc = deleteRow(st, d, @bitCast(i64, mem.at(&d.*.rowids, i)), false)
+        i += 1
+    }
+    return rc
+}
+
+fn runUpdate(st: *core.Statement, d: *Dml) -> i32 {
+    const t = schema.table(d.*.table)
+    const db = databaseOf(st)
+    var rc = gatherRowids(st, d)
+    // The target source reads the row being updated from the table (its
+    // access path is given back after: the statement runs again).
+    const s = core.sourceState(d.*.target)
+    const plan = s.*.plan
+    const covering = s.*.covering
+    const index = s.*.index
+    var i: usize = 0
+    while rc == core.OK && i < d.*.rowids.length {
+        const rowid = @bitCast(i64, mem.at(&d.*.rowids, i))
+        i += 1
+        var found = false
+        rc = readRow(st, t, tableCursor(st, d), rowid, d.*.old, &found)
+        if rc != core.OK { break }
+        if !found { continue }
+        // Position the scan's source on the row for the SET expressions.
+        s.*.plan = core.PLAN_SCAN
+        s.*.covering = false
+        s.*.index = 0
+        s.*.nullRow = false
+        s.*.rowLoaded = false
+        if s.*.cursor == 0 { s.*.cursor = bt.openCursor(&db.*.pager, t.*.root, true, 0) }
+        _ = bt.seekRowid(s.*.cursor, rowid)
+        var c: usize = 0
+        while c < t.*.columnCount && rc == core.OK {
+            const set = @intCast(usize, mem.get64(d.*.sets + c * 8))
+            const v = record.valueAt(d.*.values, c)
+            if set != 0 {
+                rc = eval.evaluate(st, set, v)
+            } else {
+                _ = value.copy(v, record.valueAt(d.*.old, c))
+            }
+            c += 1
+        }
+        if rc != core.OK { break }
+        var updatedRowid = rowid
+        if d.*.rowidSet != 0 {
+            const rv = value.create()
+            rc = eval.evaluate(st, d.*.rowidSet, rv)
+            if rc == core.OK {
+                value.applyAffinity(rv, value.AFF_INTEGER)
+                if rv.*.kind != value.INTEGER {
+                    rc = core.setError(db, core.MISMATCH, "datatype mismatch")
+                } else {
+                    updatedRowid = rv.*.i
+                }
+            }
+            value.destroy(rv)
+            if rc != core.OK { break }
+        }
+        c = 0
+        while c < t.*.columnCount {
+            value.applyAffinity(record.valueAt(d.*.values, c), schema.column(t, c).*.affinity)
+            c += 1
+        }
+        if t.*.rowidColumn >= 0 { value.setInt(record.valueAt(d.*.values, @intCast(usize, t.*.rowidColumn)), updatedRowid) }
+        var skip = false
+        rc = checkNotNull(st, d, d.*.values, &skip)
+        if rc != core.OK { break }
+        if skip { continue }
+        rc = checkChecks(st, d, d.*.values, &skip)
+        if rc != core.OK { break }
+        if skip { continue }
+        rc = checkUnique(st, d, d.*.values, updatedRowid, rowid, true, &skip)
+        if rc != core.OK { break }
+        if skip { continue }
+        rc = checkParents(st, d, d.*.values, d.*.old)
+        if rc != core.OK { break }
+        rc = actOnChildren(st, d, d.*.old, rowid, false, d.*.values, updatedRowid)
+        if rc != core.OK { break }
+        // REPLACE may have deleted rows: the old row is still there (it is
+        // excluded from the clashes).
+        rc = rewriteRow(st, d, rowid, updatedRowid)
+        if rc != core.OK { break }
+        st.*.changes += 1
+    }
+    s.*.plan = plan
+    s.*.covering = covering
+    s.*.index = index
+    s.*.rowLoaded = false
+    return rc
+}
+
+// Runs a compiled INSERT, UPDATE or DELETE: OK, or an error.
+pub fn run(st: *core.Statement) -> i32 {
+    const d = dmlOf(st.*.dml)
+    if d.*.kind == ast.S_INSERT { return runInsert(st, d) }
+    if d.*.kind == ast.S_DELETE { return runDelete(st, d) }
+    return runUpdate(st, d)
+}
+
+// The rows of a table cleared (DELETE without WHERE where nothing needs
+// each row: no foreign keys involved): how many there were.
+pub fn truncate(st: *core.Statement, t: *schema.Table, count: *i64) -> i32 {
+    const db = databaseOf(st)
+    count.* = 0
+    var rc = bt.countEntries(&db.*.pager, t.*.root, count)
+    if rc != core.OK { return storageError(st, rc) }
+    rc = bt.clearTree(&db.*.pager, t.*.root)
+    var i: usize = 0
+    while rc == core.OK && i < t.*.indexes.length {
+        rc = bt.clearTree(&db.*.pager, schema.index(@intCast(usize, mem.at(&t.*.indexes, i))).*.root)
+        i += 1
+    }
+    if rc != core.OK { return storageError(st, rc) }
+    return core.OK
+}
+
+pub fn canTruncate(st: *core.Statement, address: usize) -> bool {
+    const node = ast.statement(address)
+    if node.*.where != 0 || node.*.limit != 0 { return false }
+    const db = databaseOf(st)
+    const t = schema.findTable(&db.*.schema, mem.view(node.*.name, node.*.nameLength))
+    if t == 0 || schema.table(t).*.isSchema { return false }
+    if db.*.foreignKeys { return false }
+    return db.*.authorizer == 0
+}

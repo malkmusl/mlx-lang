@@ -35,6 +35,7 @@ Implemented Stage-1 compiler-core std:
   signed/unsigned integers. The bootstrap argument adapter keeps the runtime
   independent of unfinished generic reflection.
 - `fs.mlx` and `io.mlx`: raw file operations, slice reads/writes, complete writes,
+  whole files by path (read, written, replaced; mkdir -p),
   standard streams, direct string/line output, allocation-free integer output,
   and formatted stdout/stderr output.
 - `process.mlx`: Linux process arguments exposed as borrowed bootstrap strings.

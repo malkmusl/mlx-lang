@@ -1,0 +1,870 @@
+// libpng's writer (pngwrite.c, pngwutil.c, pngwtran.c), what Skia's PNG
+// encoder uses: the signature and the chunks of the info (IHDR, gAMA,
+// iCCP or sRGB, sBIT, cHRM, PLTE, tRNS, bKGD, pHYs, text, the
+// application's unknown chunks where it put them), the rows filtered as
+// libpng chooses (the filter whose bytes sum least) and deflated by
+// std.flate with libpng's zlib settings (the window made small for small
+// images, the stream's header told so), in IDAT chunks of 8192 bytes,
+// then IEND. std.flate deflates as zlib does, so the bytes are libpng's.
+// The data goes to the application's write function.
+const c = @import("./common.mlx")
+const reader = @import("./reader.mlx")
+const infoModule = @import("./info.mlx")
+const read = @import("std.png.read")
+const rows = @import("std.png.rows")
+const flate = @import("std.flate")
+const crc = @import("std.crc")
+const zs = @import("std.flate.stream")
+
+const Png = c.Png
+
+const ZBUF: usize = 8192
+
+const Writer = struct {
+    // The image as written (png_write_IHDR) and as the application gives
+    // it (usr_*).
+    width: usize
+    height: usize
+    bitDepth: usize
+    colorType: usize
+    channels: usize
+    pixelDepth: usize
+    rowbytes: usize
+    usrChannels: usize
+    usrBitDepth: usize
+    numPalette: usize
+    // Settings.
+    doFilter: usize
+    level: i32
+    memLevel: u32
+    strategy: i32
+    customStrategy: bool
+    windowBits: u32
+    fillerAfter: bool
+    // Progress.
+    wroteBeforePLTE: bool
+    wroteInfo: bool
+    haveIDAT: bool
+    afterIDAT: bool
+    rowNumber: usize
+    started: bool
+    // The rows: the one given (filter byte first), the one before, the
+    // filtered tries.
+    rowBuf: usize
+    prevRow: usize
+    tryRow: usize
+    tstRow: usize
+    bufSize: usize
+    // The compressor and its output.
+    deflater: flate.Deflater
+    deflating: bool
+    zfill: usize
+    zbuf: [8192]u8
+}
+
+fn writerOf(png: *Png) -> *Writer { return unsafe { @ptrFromInt(*Writer, png.*.writer) } }
+
+pub fn create(version: usize, errorPtr: usize, errorFn: usize, warnFn: usize, memPtr: usize, mallocFn: usize, freeFn: usize) -> usize {
+    const address = reader.createStruct(version, errorPtr, errorFn, warnFn, memPtr, mallocFn, freeFn, c.WRITE_MAGIC)
+    if address == 0 { return 0 }
+    const png = c.pngOf(address)
+    const memory = c.rawAlloc(png, @sizeOf(Writer))
+    if memory == 0 {
+        reader.freeReader(png)
+        c.rawFree(png, address)
+        return 0
+    }
+    c.zero(memory, @sizeOf(Writer))
+    png.*.writer = memory
+    const w = writerOf(png)
+    w.*.level = -1
+    w.*.memLevel = 8
+    w.*.windowBits = 15
+    return address
+}
+
+fn freeWriter(png: *Png) -> void {
+    if png.*.writer == 0 { return }
+    const w = writerOf(png)
+    if w.*.deflating { flate.deflaterEnd(&w.*.deflater) }
+    c.rawFree(png, w.*.rowBuf)
+    c.rawFree(png, w.*.prevRow)
+    c.rawFree(png, w.*.tryRow)
+    c.rawFree(png, w.*.tstRow)
+    c.rawFree(png, png.*.writer)
+    png.*.writer = 0
+}
+
+pub fn destroy(pngPointer: usize, infoPointer: usize) -> void {
+    if pngPointer == 0 { return }
+    const address = c.getWord(pngPointer)
+    if !c.isWriter(address) { return }
+    reader.destroyInfo(address, infoPointer)
+    c.putWord(pngPointer, 0)
+    const png = c.pngOf(address)
+    freeWriter(png)
+    reader.freeReader(png)
+    png.*.magic = 0
+    c.rawFree(png, address)
+}
+
+pub fn interlaced(png: *Png) -> usize { return 0 }
+
+// png_set_packing, png_set_swap and png_set_filler for a writer.
+pub fn setPacking(png: *Png) -> void {
+    const w = writerOf(png)
+    if w.*.bitDepth < 8 {
+        png.*.transformations |= c.T_PACK
+        w.*.usrBitDepth = 8
+    }
+}
+
+pub fn setSwap(png: *Png) -> void {
+    if writerOf(png).*.bitDepth == 16 { png.*.transformations |= c.T_SWAP_BYTES }
+}
+
+pub fn setFiller(png: *Png, flags: i32) -> void {
+    const w = writerOf(png)
+    if w.*.colorType == 2 {
+        w.*.usrChannels = 4
+    } else if w.*.colorType == 0 {
+        if w.*.bitDepth < 8 {
+            c.appError(png, c.literal("png_set_filler is invalid for low bit depth gray output"))
+            return
+        }
+        w.*.usrChannels = 2
+    } else {
+        c.appError(png, c.literal("png_set_filler: inappropriate color type"))
+        return
+    }
+    w.*.fillerAfter = flags == 1
+    png.*.transformations |= c.T_FILLER
+}
+
+pub fn setFilter(png: *Png, method: i32, filters: i32) -> void {
+    if method != 0 {
+        c.pngError(png, c.literal("Unknown custom filter method"))
+        return
+    }
+    const w = writerOf(png)
+    var mask = @intCast(usize, filters) & 0xff
+    if filters >= 0 && filters <= 4 {
+        // A filter value: that filter alone.
+        mask = @intCast(usize, 8) << @intCast(usize, filters)
+    }
+    if mask & 0xf8 == 0 { mask = 0x08 }
+    w.*.doFilter = mask & 0xf8
+}
+
+pub fn setCompression(png: *Png, which: usize, value: i32) -> void {
+    const w = writerOf(png)
+    if which == 0 { w.*.level = value }
+    if which == 1 { w.*.memLevel = @intCast(u32, value) }
+    if which == 2 {
+        w.*.strategy = value
+        w.*.customStrategy = true
+    }
+    if which == 3 {
+        var bits = value
+        if bits > 15 {
+            c.pngWarning(png, c.literal("Only compression windows <= 32k supported by PNG"))
+            bits = 15
+        } else if bits < 8 {
+            c.pngWarning(png, c.literal("Only compression windows >= 256 supported by PNG"))
+            bits = 8
+        }
+        w.*.windowBits = @intCast(u32, bits)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data and chunks
+
+fn writeData(png: *Png, data: usize, length: usize) -> void {
+    if png.*.writeFn == 0 {
+        c.pngError(png, c.literal("Call to NULL write function"))
+        return
+    }
+    const call: c.WriteFn = unsafe { @ptrFromInt(c.WriteFn, png.*.writeFn) }
+    call(@intFromPtr(png), data, length)
+}
+
+fn chunkHeader(png: *Png, name: usize, length: usize) -> u64 {
+    var header: [8]u8 = undefined
+    const at = @intFromPtr(&header)
+    c.put8(at, (length >> 24) & 255)
+    c.put8(at + 1, (length >> 16) & 255)
+    c.put8(at + 2, (length >> 8) & 255)
+    c.put8(at + 3, length & 255)
+    c.put8(at + 4, (name >> 24) & 255)
+    c.put8(at + 5, (name >> 16) & 255)
+    c.put8(at + 6, (name >> 8) & 255)
+    c.put8(at + 7, name & 255)
+    writeData(png, at, 8)
+    return crc.crc32Update(0, at + 4, 4)
+}
+
+fn chunkEnd(png: *Png, value: u64) -> void {
+    var tail: [4]u8 = undefined
+    const at = @intFromPtr(&tail)
+    const sum = @intCast(usize, value & 0xffffffff)
+    c.put8(at, sum >> 24)
+    c.put8(at + 1, (sum >> 16) & 255)
+    c.put8(at + 2, (sum >> 8) & 255)
+    c.put8(at + 3, sum & 255)
+    writeData(png, at, 4)
+}
+
+// png_write_complete_chunk.
+fn chunk(png: *Png, name: usize, data: usize, length: usize) -> void {
+    var value = chunkHeader(png, name, length)
+    if length > 0 {
+        writeData(png, data, length)
+        value = crc.crc32Update(value, data, length)
+    }
+    chunkEnd(png, value)
+}
+
+// png_image_size: the bytes of the filtered image (for the window).
+fn imageSize(w: *Writer) -> usize {
+    if w.*.rowbytes < 32768 && w.*.height < 32768 { return (w.*.rowbytes + 1) * w.*.height }
+    return 0xffffffff
+}
+
+// optimize_cmf: the zlib header's window size made as small as the data
+// needs.
+fn optimizeCmf(data: usize, size: usize) -> void {
+    if size > 16384 { return }
+    var cmf = c.get8(data)
+    if cmf & 0x0f != 8 || cmf & 0xf0 > 0x70 { return }
+    var cinfo = cmf >> 4
+    var half = @intCast(usize, 1) << (cinfo + 7)
+    if size > half { return }
+    while true {
+        half = half >> 1
+        cinfo -= 1
+        if !(cinfo > 0 && size <= half) { break }
+    }
+    cmf = (cmf & 0x0f) | (cinfo << 4)
+    c.put8(data, cmf)
+    var tmp = c.get8(data + 1) & 0xe0
+    tmp += 0x1f - ((cmf << 8) + tmp) % 0x1f
+    c.put8(data + 1, tmp)
+}
+
+// The window bits for SIZE bytes (png_deflate_claim).
+fn windowFor(bits: u32, size: usize) -> u32 {
+    var windowBits = bits
+    if size <= 16384 {
+        var half = @intCast(usize, 1) << @intCast(usize, windowBits - 1)
+        while size + 262 <= half {
+            half = half >> 1
+            windowBits -= 1
+        }
+    }
+    return windowBits
+}
+
+fn strategyOf(value: i32) -> flate.Strategy {
+    if value == 1 { return flate.Strategy.filtered }
+    if value == 2 { return flate.Strategy.huffmanOnly }
+    if value == 3 { return flate.Strategy.rle }
+    if value == 4 { return flate.Strategy.fixed }
+    return flate.Strategy.normal
+}
+
+// Compresses LENGTH bytes at DATA with libpng's text settings (zlib's
+// defaults, the window for the data) into memory of the structure's;
+// the size made, the address in `out`.
+fn compressText(png: *Png, data: usize, length: usize, out: *usize) -> usize {
+    var settings = flate.options(-1, flate.Format.zlib)
+    settings.windowBits = windowFor(15, length)
+    const capacity = flate.compressBound(length, flate.Format.zlib) + 64
+    const target = c.allocate(png, capacity)
+    var deflater: flate.Deflater = undefined
+    if flate.deflaterInit(&deflater, c.allocatorOf(png), settings) != flate.Status.ok {
+        c.rawFree(png, target)
+        c.pngError(png, c.literal("zlib failed to initialize compressor"))
+        return 0
+    }
+    var progress: flate.Progress = undefined
+    _ = flate.deflaterRun(&deflater, zs.bytes(data), length, zs.bytes(target), capacity, flate.Flush.finish, &progress)
+    flate.deflaterEnd(&deflater)
+    optimizeCmf(target, length)
+    out.* = target
+    return progress.produced
+}
+
+// ---------------------------------------------------------------------------
+// The info
+
+fn unknownChunks(png: *Png, info: *c.PngInfo, place: usize) -> void {
+    var index: usize = 0
+    while index < info.*.unknownCount {
+        const entry = info.*.unknowns + index * 32
+        if c.getWord(entry + 24) & place != 0 {
+            const name = read.read32(entry)
+            const keep = read.keepOf(&png.*.reader, name)
+            const safe = c.get8(entry + 3) & 0x20 != 0
+            if keep != read.HANDLE_CHUNK_NEVER && (safe || keep == read.HANDLE_CHUNK_ALWAYS || (keep == read.HANDLE_CHUNK_AS_DEFAULT && png.*.reader.unknownDefault == read.HANDLE_CHUNK_ALWAYS)) {
+                const size = c.getWord(entry + 16)
+                if size == 0 { c.pngWarning(png, c.literal("Writing zero-length unknown chunk")) }
+                chunk(png, name, c.getWord(entry + 8), size)
+            }
+        }
+        index += 1
+    }
+}
+
+fn put32At(at: usize, value: usize) -> void {
+    c.put8(at, (value >> 24) & 255)
+    c.put8(at + 1, (value >> 16) & 255)
+    c.put8(at + 2, (value >> 8) & 255)
+    c.put8(at + 3, value & 255)
+}
+
+fn put16At(at: usize, value: usize) -> void {
+    c.put8(at, (value >> 8) & 255)
+    c.put8(at + 1, value & 255)
+}
+
+// png_write_info_before_PLTE.
+pub fn writeInfoBeforePLTE(png: *Png, info: *c.PngInfo) -> void {
+    const w = writerOf(png)
+    if w.*.wroteBeforePLTE { return }
+    const data = &info.*.data
+    const signature = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }
+    writeData(png, @intFromPtr(&signature), 8)
+    // IHDR (png_write_IHDR; an interlaced image is written without
+    // interlacing here).
+    w.*.width = data.*.width
+    w.*.height = data.*.height
+    w.*.bitDepth = data.*.bitDepth
+    w.*.colorType = data.*.colorType
+    w.*.channels = data.*.channels
+    w.*.pixelDepth = data.*.pixelDepth
+    w.*.rowbytes = data.*.rowBytes
+    w.*.usrChannels = data.*.channels
+    w.*.usrBitDepth = data.*.bitDepth
+    w.*.numPalette = data.*.numPalette
+    if data.*.interlace != 0 { c.pngWarning(png, c.literal("mlx-libpng writes images without interlacing")) }
+    if w.*.doFilter == 0 {
+        if w.*.colorType == 3 || w.*.bitDepth < 8 { w.*.doFilter = 0x08 } else { w.*.doFilter = 0xf8 }
+    }
+    var header: [13]u8 = undefined
+    const at = @intFromPtr(&header)
+    put32At(at, w.*.width)
+    put32At(at + 4, w.*.height)
+    c.put8(at + 8, w.*.bitDepth)
+    c.put8(at + 9, w.*.colorType)
+    c.put8(at + 10, 0)
+    c.put8(at + 11, 0)
+    c.put8(at + 12, 0)
+    chunk(png, read.IHDR, at, 13)
+    const space = data.*.colorspace
+    if space & read.CS_INVALID == 0 && space & read.CS_FROM_gAMA != 0 && data.*.valid & read.INFO_gAMA != 0 {
+        var value: [4]u8 = undefined
+        put32At(@intFromPtr(&value), @intCast(usize, data.*.gamma) & 0xffffffff)
+        chunk(png, read.gAMA, @intFromPtr(&value), 4)
+    }
+    if space & read.CS_INVALID == 0 {
+        if data.*.valid & read.INFO_iCCP != 0 {
+            if data.*.valid & read.INFO_sRGB != 0 { c.appWarning(png, c.literal("profile matches sRGB but writing iCCP instead")) }
+            writeICCP(png, data)
+        } else if data.*.valid & read.INFO_sRGB != 0 {
+            var intent: [1]u8 = undefined
+            intent[0] = @intCast(u8, data.*.intent & 255)
+            chunk(png, read.sRGB, @intFromPtr(&intent), 1)
+        }
+    }
+    if data.*.valid & read.INFO_sBIT != 0 { writeSBIT(png, data) }
+    if space & read.CS_INVALID == 0 && space & read.CS_FROM_cHRM != 0 && data.*.valid & read.INFO_cHRM != 0 {
+        var points: [32]u8 = undefined
+        var index: usize = 0
+        while index < 8 {
+            put32At(@intFromPtr(&points) + index * 4, @bitCast(usize, data.*.endpoints[index]) & 0xffffffff)
+            index += 1
+        }
+        chunk(png, read.cHRM, @intFromPtr(&points), 32)
+    }
+    unknownChunks(png, info, 1)
+    w.*.wroteBeforePLTE = true
+}
+
+fn writeICCP(png: *Png, data: *read.Info) -> void {
+    const profile = data.*.iccpProfile
+    const length = read.read32(profile)
+    if length < 132 { c.pngError(png, c.literal("ICC profile too short")) }
+    if c.get8(profile + 8) > 3 && length & 3 != 0 { c.pngError(png, c.literal("ICC profile length invalid (not a multiple of 4)")) }
+    if length != data.*.iccpLength { c.pngError(png, c.literal("Profile length does not match profile")) }
+    const nameLength = c.cLength(@intFromPtr(&data.*.iccpName))
+    if nameLength == 0 { c.pngError(png, c.literal("iCCP: invalid keyword")) }
+    var compressed: usize = 0
+    const size = compressText(png, profile, length, &compressed)
+    var value = chunkHeader(png, read.iCCP, nameLength + 2 + size)
+    var prefix: [81]u8 = undefined
+    c.copy(@intFromPtr(&prefix), @intFromPtr(&data.*.iccpName), nameLength)
+    prefix[nameLength] = 0
+    prefix[nameLength + 1] = 0
+    writeData(png, @intFromPtr(&prefix), nameLength + 2)
+    value = crc.crc32Update(value, @intFromPtr(&prefix), nameLength + 2)
+    writeData(png, compressed, size)
+    value = crc.crc32Update(value, compressed, size)
+    chunkEnd(png, value)
+    c.rawFree(png, compressed)
+}
+
+fn writeSBIT(png: *Png, data: *read.Info) -> void {
+    const w = writerOf(png)
+    var buffer: [4]u8 = undefined
+    var size: usize = 0
+    if w.*.colorType & 2 != 0 {
+        const most = if w.*.colorType == 3 { 8 } else { w.*.usrBitDepth }
+        var index: usize = 0
+        while index < 3 {
+            const value = @intCast(usize, data.*.sigBit[index])
+            if value == 0 || value > most {
+                c.pngWarning(png, c.literal("Invalid sBIT depth specified"))
+                return
+            }
+            buffer[index] = data.*.sigBit[index]
+            index += 1
+        }
+        size = 3
+    } else {
+        const gray = @intCast(usize, data.*.sigBit[3])
+        if gray == 0 || gray > w.*.usrBitDepth {
+            c.pngWarning(png, c.literal("Invalid sBIT depth specified"))
+            return
+        }
+        buffer[0] = data.*.sigBit[3]
+        size = 1
+    }
+    if w.*.colorType & 4 != 0 {
+        const alpha = @intCast(usize, data.*.sigBit[4])
+        if alpha == 0 || alpha > w.*.usrBitDepth {
+            c.pngWarning(png, c.literal("Invalid sBIT depth specified"))
+            return
+        }
+        buffer[size] = data.*.sigBit[4]
+        size += 1
+    }
+    chunk(png, read.sBIT, @intFromPtr(&buffer), size)
+}
+
+// png_write_info.
+pub fn writeInfo(png: *Png, info: *c.PngInfo) -> void {
+    const w = writerOf(png)
+    writeInfoBeforePLTE(png, info)
+    const data = &info.*.data
+    if data.*.valid & read.INFO_PLTE != 0 {
+        chunk(png, read.PLTE, @intFromPtr(&data.*.palette), data.*.numPalette * 3)
+    } else if w.*.colorType == 3 {
+        c.pngError(png, c.literal("Valid palette required for paletted images"))
+    }
+    if data.*.valid & read.INFO_tRNS != 0 {
+        if w.*.colorType == 3 {
+            if data.*.numTrans == 0 || data.*.numTrans > data.*.numPalette {
+                c.appWarning(png, c.literal("Invalid number of transparent colors specified"))
+            } else {
+                chunk(png, read.tRNS, @intFromPtr(&data.*.transAlpha), data.*.numTrans)
+            }
+        } else if w.*.colorType == 0 {
+            if data.*.transGray >= (@intCast(usize, 1) << w.*.bitDepth) {
+                c.appWarning(png, c.literal("Ignoring attempt to write tRNS chunk out-of-range for bit_depth"))
+            } else {
+                var buffer: [2]u8 = undefined
+                put16At(@intFromPtr(&buffer), data.*.transGray)
+                chunk(png, read.tRNS, @intFromPtr(&buffer), 2)
+            }
+        } else if w.*.colorType == 2 {
+            var buffer: [6]u8 = undefined
+            const at = @intFromPtr(&buffer)
+            put16At(at, data.*.transRed)
+            put16At(at + 2, data.*.transGreen)
+            put16At(at + 4, data.*.transBlue)
+            if w.*.bitDepth == 8 && (c.get8(at) | c.get8(at + 2) | c.get8(at + 4)) != 0 {
+                c.appWarning(png, c.literal("Ignoring attempt to write 16-bit tRNS chunk when bit_depth is 8"))
+            } else {
+                chunk(png, read.tRNS, at, 6)
+            }
+        } else {
+            c.appWarning(png, c.literal("Can't write tRNS with an alpha channel"))
+        }
+    }
+    if data.*.valid & read.INFO_bKGD != 0 {
+        var buffer: [6]u8 = undefined
+        const at = @intFromPtr(&buffer)
+        if w.*.colorType == 3 {
+            c.put8(at, data.*.background[0])
+            chunk(png, read.bKGD, at, 1)
+        } else if w.*.colorType & 2 != 0 {
+            put16At(at, data.*.background[1])
+            put16At(at + 2, data.*.background[2])
+            put16At(at + 4, data.*.background[3])
+            chunk(png, read.bKGD, at, 6)
+        } else {
+            put16At(at, data.*.background[4])
+            chunk(png, read.bKGD, at, 2)
+        }
+    }
+    if data.*.valid & read.INFO_pHYs != 0 {
+        var buffer: [9]u8 = undefined
+        const at = @intFromPtr(&buffer)
+        put32At(at, data.*.xPixelsPerUnit)
+        put32At(at + 4, data.*.yPixelsPerUnit)
+        c.put8(at + 8, data.*.physUnit)
+        chunk(png, read.pHYs, at, 9)
+    }
+    writeTexts(png, info)
+    unknownChunks(png, info, 2)
+    w.*.wroteInfo = true
+}
+
+// The texts not yet written (tEXt, or zTXt when asked).
+fn writeTexts(png: *Png, info: *c.PngInfo) -> void {
+    var index: usize = 0
+    while index < info.*.textCount {
+        const slot = info.*.texts + index * 16
+        const compression = @bitCast(i64, c.getWord(slot + 8))
+        const copyAt = c.getWord(slot)
+        const keyLength = c.cLength(copyAt)
+        const textLength = c.cLength(copyAt + keyLength + 1)
+        if compression == -1 {
+            chunk(png, read.tEXt, copyAt, keyLength + 1 + textLength)
+            c.putWord(slot + 8, @bitCast(usize, @intCast(i64, -3)))
+        } else if compression == 0 {
+            var compressed: usize = 0
+            const size = compressText(png, copyAt + keyLength + 1, textLength, &compressed)
+            var value = chunkHeader(png, read.zTXt, keyLength + 2 + size)
+            var prefix: [81]u8 = undefined
+            c.copy(@intFromPtr(&prefix), copyAt, keyLength)
+            prefix[keyLength] = 0
+            prefix[keyLength + 1] = 0
+            writeData(png, @intFromPtr(&prefix), keyLength + 2)
+            value = crc.crc32Update(value, @intFromPtr(&prefix), keyLength + 2)
+            writeData(png, compressed, size)
+            value = crc.crc32Update(value, compressed, size)
+            chunkEnd(png, value)
+            c.rawFree(png, compressed)
+            c.putWord(slot + 8, @bitCast(usize, @intCast(i64, -2)))
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rows
+
+fn startRows(png: *Png) -> void {
+    const w = writerOf(png)
+    if !w.*.wroteBeforePLTE { c.pngError(png, c.literal("png_write_info was never called before png_write_row")) }
+    const usrDepth = w.*.usrChannels * w.*.usrBitDepth
+    var bufSize = rows.rowBytes(usrDepth, w.*.width) + 1
+    // (Room for the row as the transformations leave it, too.)
+    if bufSize < w.*.rowbytes + 1 { bufSize = w.*.rowbytes + 1 }
+    w.*.bufSize = bufSize
+    w.*.rowBuf = c.allocate(png, bufSize)
+    c.put8(w.*.rowBuf, 0)
+    var filters = w.*.doFilter
+    if w.*.height == 1 { filters &= 0xff & ~@intCast(usize, 0x20 | 0x40 | 0x80) }
+    if w.*.width == 1 { filters &= 0xff & ~@intCast(usize, 0x10 | 0x40 | 0x80) }
+    if filters == 0 { filters = 0x08 }
+    w.*.doFilter = filters
+    if filters & 0xf0 != 0 {
+        w.*.tryRow = c.allocate(png, bufSize)
+        w.*.tstRow = c.allocate(png, bufSize)
+    }
+    if filters & (0x20 | 0x40 | 0x80) != 0 {
+        w.*.prevRow = c.allocate(png, bufSize)
+        c.zero(w.*.prevRow, bufSize)
+    }
+    // The compressor (png_deflate_claim for IDAT).
+    var settings = flate.options(w.*.level, flate.Format.zlib)
+    settings.memoryLevel = w.*.memLevel
+    settings.windowBits = windowFor(w.*.windowBits, imageSize(w))
+    if settings.windowBits < 9 { settings.windowBits = 9 }
+    if w.*.customStrategy {
+        settings.strategy = strategyOf(w.*.strategy)
+    } else if w.*.doFilter != 0x08 {
+        settings.strategy = flate.Strategy.filtered
+    }
+    if flate.deflaterInit(&w.*.deflater, c.allocatorOf(png), settings) != flate.Status.ok { c.pngError(png, c.literal("zlib failed to initialize compressor")) }
+    w.*.deflating = true
+    w.*.started = true
+}
+
+// png_compress_IDAT: the bytes deflated; each full buffer an IDAT.
+fn compressIDAT(png: *Png, input: usize, length: usize, finish: bool) -> void {
+    const w = writerOf(png)
+    var at = input
+    var left = length
+    const buffer = @intFromPtr(&w.*.zbuf)
+    while true {
+        var progress: flate.Progress = undefined
+        const flush = if finish { flate.Flush.finish } else { flate.Flush.none }
+        const status = flate.deflaterRun(&w.*.deflater, zs.bytes(at), left, zs.bytes(buffer + w.*.zfill), ZBUF - w.*.zfill, flush, &progress)
+        at += progress.consumed
+        left -= progress.consumed
+        w.*.zfill = w.*.zfill + progress.produced
+        if w.*.zfill == ZBUF {
+            if !w.*.haveIDAT { optimizeCmf(buffer, imageSize(w)) }
+            chunk(png, read.IDAT, buffer, ZBUF)
+            w.*.haveIDAT = true
+            w.*.zfill = 0
+            if finish && status != flate.Status.done { continue }
+        }
+        if status == flate.Status.damaged || status == flate.Status.misuse || status == flate.Status.noMemory {
+            c.pngError(png, c.literal("zlib error"))
+        }
+        if finish && status == flate.Status.done {
+            if w.*.zfill > 0 {
+                if !w.*.haveIDAT { optimizeCmf(buffer, imageSize(w)) }
+                chunk(png, read.IDAT, buffer, w.*.zfill)
+            }
+            w.*.zfill = 0
+            w.*.haveIDAT = true
+            w.*.afterIDAT = true
+            flate.deflaterEnd(&w.*.deflater)
+            w.*.deflating = false
+            return
+        }
+        if !finish && left == 0 { return }
+    }
+}
+
+// The sum libpng judges a filtered byte by: its distance from 0 as a
+// signed byte.
+inline fn weight(value: usize) -> usize { return if value < 128 { value } else { 256 - value } }
+
+// The row in rowBuf filtered with FILTER (1 sub, 2 up, 3 average, 4
+// Paeth) into tryRow; the running sum, stopping once it passes LIMIT.
+fn tryFilter(w: *Writer, filter: usize, bpp: usize, count: usize, limit: usize) -> usize {
+    const source = w.*.rowBuf + 1
+    const previous = w.*.prevRow + 1
+    const target = w.*.tryRow + 1
+    c.put8(w.*.tryRow, filter)
+    var sum: usize = 0
+    var index: usize = 0
+    while index < count {
+        const value = c.get8(source + index)
+        var left: usize = 0
+        var up: usize = 0
+        var corner: usize = 0
+        if index >= bpp { left = c.get8(source + index - bpp) }
+        if filter >= 2 {
+            up = c.get8(previous + index)
+            if index >= bpp { corner = c.get8(previous + index - bpp) }
+        }
+        var predicted: usize = 0
+        if filter == 1 { predicted = left }
+        if filter == 2 { predicted = up }
+        if filter == 3 { predicted = (left + up) / 2 }
+        if filter == 4 { predicted = paeth(left, up, corner) }
+        const out = (value + 256 - predicted) & 255
+        c.put8(target + index, out)
+        sum += weight(out)
+        // (libpng stops early only past the first pixel, except for Up.)
+        if (index >= bpp || filter == 2) && sum > limit { break }
+        index += 1
+    }
+    return sum
+}
+
+fn paeth(a: usize, b: usize, cc: usize) -> usize {
+    const p = @intCast(i64, a) + @intCast(i64, b) - @intCast(i64, cc)
+    var pa = p - @intCast(i64, a)
+    var pb = p - @intCast(i64, b)
+    var pc = p - @intCast(i64, cc)
+    if pa < 0 { pa = -pa }
+    if pb < 0 { pb = -pb }
+    if pc < 0 { pc = -pc }
+    if pa <= pb && pa <= pc { return a }
+    if pb <= pc { return b }
+    return cc
+}
+
+// png_write_find_filter: the filter whose bytes sum least (the first of
+// equals, None first), or the one filter allowed.
+fn findFilter(png: *Png, count: usize, pixelDepth: usize) -> void {
+    const w = writerOf(png)
+    const filters = w.*.doFilter
+    const bpp = (pixelDepth + 7) >> 3
+    var best = w.*.rowBuf
+    var mins: usize = 0xffffffffffffffff - 256
+    if filters & 0x08 != 0 && filters != 0x08 {
+        var sum: usize = 0
+        var index: usize = 0
+        while index < count {
+            sum += weight(c.get8(w.*.rowBuf + 1 + index))
+            index += 1
+        }
+        mins = sum
+    }
+    var filter: usize = 1
+    while filter <= 4 {
+        const bit = @intCast(usize, 8) << filter
+        if filters == bit {
+            _ = tryFilter(w, filter, bpp, count, 0xffffffffffffffff)
+            best = w.*.tryRow
+        } else if filters & bit != 0 {
+            const sum = tryFilter(w, filter, bpp, count, mins)
+            if sum < mins {
+                mins = sum
+                best = w.*.tryRow
+                // The best so far kept aside (libpng swaps its buffers).
+                const keep = w.*.tstRow
+                w.*.tstRow = w.*.tryRow
+                w.*.tryRow = keep
+                best = w.*.tstRow
+            }
+        }
+        filter += 1
+    }
+    compressIDAT(png, best, count + 1, false)
+    if w.*.prevRow != 0 {
+        const keep = w.*.prevRow
+        w.*.prevRow = w.*.rowBuf
+        w.*.rowBuf = keep
+    }
+    w.*.rowNumber += 1
+    if w.*.rowNumber >= w.*.height { compressIDAT(png, 0, 0, true) }
+}
+
+// png_write_row: the application's row, transformed (png_do_write_
+// transformations: filler stripped, samples packed, bytes swapped),
+// filtered, deflated.
+pub fn writeRow(png: *Png, row: usize) -> void {
+    const w = writerOf(png)
+    if !w.*.started { startRows(png) }
+    if w.*.rowNumber >= w.*.height {
+        c.pngWarning(png, c.literal("Too many rows written"))
+        return
+    }
+    var info: rows.RowInfo = undefined
+    info.colorType = w.*.colorType
+    info.width = w.*.width
+    info.channels = w.*.usrChannels
+    info.bitDepth = w.*.usrBitDepth
+    info.pixelDepth = info.bitDepth * info.channels
+    info.rowBytes = rows.rowBytes(info.pixelDepth, info.width)
+    const line = w.*.rowBuf + 1
+    c.copy(line, row, info.rowBytes)
+    const t = png.*.transformations
+    if t & c.T_FILLER != 0 {
+        // (The filler is the channel to drop: the last, or the first.)
+        rows.stripChannel(&info, line, !w.*.fillerAfter)
+        info.colorType = w.*.colorType
+    }
+    if t & c.T_PACK != 0 && w.*.bitDepth < 8 {
+        // png_do_pack: one sample a byte to BITDEPTH bits.
+        var index: usize = 0
+        while index < info.width {
+            const value = c.get8(line + index)
+            rows.setPixel(line, index, w.*.bitDepth, false, value)
+            index += 1
+        }
+        info.bitDepth = w.*.bitDepth
+        info.pixelDepth = info.bitDepth * info.channels
+        info.rowBytes = rows.rowBytes(info.pixelDepth, info.width)
+    }
+    if t & c.T_SWAP_BYTES != 0 { rows.swapBytes(&info, line) }
+    if info.pixelDepth != w.*.pixelDepth { c.pngError(png, c.literal("internal write transform logic error")) }
+    findFilter(png, info.rowBytes, info.pixelDepth)
+}
+
+// png_write_end: the chunks after the image, IEND.
+pub fn writeEnd(png: *Png, infoAddress: usize) -> void {
+    const w = writerOf(png)
+    if !w.*.haveIDAT { c.pngError(png, c.literal("No IDATs written into file")) }
+    if infoAddress != 0 {
+        const info = c.infoOf(infoAddress)
+        writeTexts(png, info)
+        unknownChunks(png, info, 8)
+    }
+    w.*.afterIDAT = true
+    chunk(png, read.IEND, 0, 0)
+}
+
+// ---------------------------------------------------------------------------
+// The functions
+
+fn writerPng(address: usize) -> *Png { return c.pngOf(address) }
+
+export fn png_set_write_fn(png_ptr: usize, io_ptr: usize, write_data_fn: usize, output_flush_fn: usize) -> void {
+    if !c.isWriter(png_ptr) { return }
+    const png = writerPng(png_ptr)
+    png.*.ioPtr = io_ptr
+    png.*.writeFn = write_data_fn
+    png.*.flushFn = output_flush_fn
+}
+
+export fn png_write_info_before_PLTE(png_ptr: usize, info_ptr: usize) -> void {
+    if !c.isWriter(png_ptr) || info_ptr == 0 { return }
+    writeInfoBeforePLTE(writerPng(png_ptr), c.infoOf(info_ptr))
+}
+
+export fn png_write_info(png_ptr: usize, info_ptr: usize) -> void {
+    if !c.isWriter(png_ptr) || info_ptr == 0 { return }
+    writeInfo(writerPng(png_ptr), c.infoOf(info_ptr))
+}
+
+export fn png_write_row(png_ptr: usize, row: usize) -> void {
+    if !c.isWriter(png_ptr) { return }
+    writeRow(writerPng(png_ptr), row)
+}
+
+export fn png_write_rows(png_ptr: usize, row: usize, num_rows: u32) -> void {
+    if !c.isWriter(png_ptr) || row == 0 { return }
+    var index: usize = 0
+    while index < @intCast(usize, num_rows) {
+        writeRow(writerPng(png_ptr), c.getWord(row + index * 8))
+        index += 1
+    }
+}
+
+export fn png_write_image(png_ptr: usize, image: usize) -> void {
+    if !c.isWriter(png_ptr) || image == 0 { return }
+    const png = writerPng(png_ptr)
+    var index: usize = 0
+    while index < writerOf(png).*.height {
+        writeRow(png, c.getWord(image + index * 8))
+        index += 1
+    }
+}
+
+export fn png_write_end(png_ptr: usize, info_ptr: usize) -> void {
+    if !c.isWriter(png_ptr) { return }
+    writeEnd(writerPng(png_ptr), info_ptr)
+}
+
+export fn png_write_flush(png_ptr: usize) -> void {
+    if !c.isWriter(png_ptr) { return }
+    const png = writerPng(png_ptr)
+    if png.*.flushFn != 0 {
+        const call: c.FlushFn = unsafe { @ptrFromInt(c.FlushFn, png.*.flushFn) }
+        call(png_ptr)
+    }
+}
+
+export fn png_set_flush(png_ptr: usize, nrows: i32) -> void {}
+
+export fn png_set_filter(png_ptr: usize, method: i32, filters: i32) -> void {
+    if c.isWriter(png_ptr) { setFilter(writerPng(png_ptr), method, filters) }
+}
+
+export fn png_set_compression_level(png_ptr: usize, level: i32) -> void {
+    if c.isWriter(png_ptr) { setCompression(writerPng(png_ptr), 0, level) }
+}
+
+export fn png_set_compression_mem_level(png_ptr: usize, mem_level: i32) -> void {
+    if c.isWriter(png_ptr) { setCompression(writerPng(png_ptr), 1, mem_level) }
+}
+
+export fn png_set_compression_strategy(png_ptr: usize, strategy: i32) -> void {
+    if c.isWriter(png_ptr) { setCompression(writerPng(png_ptr), 2, strategy) }
+}
+
+export fn png_set_compression_window_bits(png_ptr: usize, window_bits: i32) -> void {
+    if c.isWriter(png_ptr) { setCompression(writerPng(png_ptr), 3, window_bits) }
+}

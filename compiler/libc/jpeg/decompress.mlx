@@ -1,0 +1,806 @@
+// The decompressor: libjpeg's jdapimin.c and jdapistd.c over std.jpeg
+// (std.jpeg.read reads the file as libjpeg's input side reads it,
+// std.jpeg.output makes the rows as its output side makes them): the
+// global states and their checks, the data source (its bytes taken as
+// they come, fill_input_buffer called when the decoder wants more, a
+// FALSE answer a suspension), the public fields of the object kept as
+// libjpeg keeps them, buffered-image mode, raw data, skipping and
+// cropping, saved markers and the ICC profile.
+const zs = @import("std.flate.stream")
+const read = @import("std.jpeg.read")
+const output = @import("std.jpeg.output")
+const rec = @import("./records.mlx")
+const c = @import("./common.mlx")
+
+pub const SUSPENDED: i32 = 0
+pub const HEADER_OK: i32 = 1
+pub const HEADER_TABLES_ONLY: i32 = 2
+
+pub const DECOMPRESS_SIZE: usize = 656
+pub const JPEG_LIB_VERSION: i32 = 80
+
+// The decompressor's own state.
+pub const Engine = struct {
+    decoder: read.Decoder
+    output: output.Output
+    outputReady: bool
+}
+
+pub fn engineOf(cinfo: usize) -> *Engine {
+    unsafe { return @ptrFromInt(*Engine, c.stateOf(cinfo).*.engine) }
+}
+
+fn decoderOf(cinfo: usize) -> *read.Decoder { return &engineOf(cinfo).*.decoder }
+fn outputOf(cinfo: usize) -> *output.Output { return &engineOf(cinfo).*.output }
+
+// libjpeg's natural order (jutils.c's jpeg_natural_order with the 16
+// entries after), for cinfo->natural_order.
+var naturalOrder: usize = 0
+
+fn naturalTable() -> usize {
+    if naturalOrder == 0 {
+        const address = c.malloc(80 * 4)
+        var k: usize = 0
+        while k < 80 {
+            zs.put32(address + k * 4, read.natural(k))
+            k += 1
+        }
+        naturalOrder = address
+    }
+    return naturalOrder
+}
+
+pub fn destroyEngine(engine: usize) -> void {
+    const e: *Engine = unsafe { @ptrFromInt(*Engine, engine) }
+    if e.*.outputReady { output.deinit(&e.*.output) }
+    read.deinit(&e.*.decoder)
+}
+
+export fn mlxjpeg_destroy_decompressor(engine: usize) -> void { destroyEngine(engine) }
+
+// ---------------------------------------------------------------------------
+// The source and the decoder's messages
+
+// Takes the bytes the source has (all of them: the decoder keeps what it
+// has not used).
+fn pull(cinfo: usize) -> void { pullAs(cinfo, false) }
+
+// REFILL: the bytes are a buffer fill_input_buffer has just given.
+fn pullAs(cinfo: usize, refill: bool) -> void {
+    const d = rec.decompress(cinfo)
+    if d.*.src == 0 { return }
+    const src = rec.source(d.*.src)
+    const count = src.*.bytes_in_buffer
+    if count != 0 && src.*.next_input_byte != 0 {
+        if !read.giveAs(decoderOf(cinfo), src.*.next_input_byte, count, refill) {
+            c.raise1(cinfo, c.JERR_OUT_OF_MEMORY, 2)
+            return
+        }
+        src.*.next_input_byte += count
+        src.*.bytes_in_buffer = 0
+    }
+}
+
+// fill_input_buffer: more bytes, or FALSE (suspend).
+fn fill(cinfo: usize) -> bool {
+    const d = rec.decompress(cinfo)
+    if d.*.src == 0 { return false }
+    const src = rec.source(d.*.src)
+    if src.*.fill_input_buffer == 0 { return false }
+    const call: c.FillFn = unsafe { @ptrFromInt(c.FillFn, src.*.fill_input_buffer) }
+    if call(cinfo) == 0 { return false }
+    pullAs(cinfo, true)
+    return true
+}
+
+// The decoder's warnings through emit_message, then its error through
+// error_exit; false after an error.
+fn report(cinfo: usize) -> bool {
+    const d = decoderOf(cinfo)
+    // (The fields as they are when libjpeg raises the error.)
+    if d.*.failed { inputFields(cinfo) }
+    var message: read.Message = undefined
+    while read.takeWarning(d, &message) { c.warn(cinfo, message.code, message.parameters[0], message.parameters[1]) }
+    if d.*.failed {
+        const p = &d.*.failure.parameters
+        c.raise(cinfo, d.*.failure.code, p.*[0], p.*[1], p.*[2], p.*[3])
+        return false
+    }
+    return true
+}
+
+// The decoder's consume_input, filling the source as long as it gives.
+fn consume(cinfo: usize) -> i32 {
+    const d = decoderOf(cinfo)
+    pull(cinfo)
+    while true {
+        const result = read.consumeInput(d)
+        if !report(cinfo) { return SUSPENDED }
+        if result == read.SUSPENDED && d.*.starved && fill(cinfo) { continue }
+        inputFields(cinfo)
+        return result
+    }
+    return SUSPENDED
+}
+
+// ---------------------------------------------------------------------------
+// The public fields
+
+fn componentAt(cinfo: usize, ci: usize) -> *rec.ComponentInfo {
+    return rec.component(rec.decompress(cinfo).*.comp_info + ci * @sizeOf(rec.ComponentInfo))
+}
+
+// What the header gives (get_soi, get_sof, initial_setup).
+fn headerFields(cinfo: usize) -> void {
+    const info = rec.decompress(cinfo)
+    const d = decoderOf(cinfo)
+    info.*.image_width = @intCast(u32, d.*.imageWidth)
+    info.*.image_height = @intCast(u32, d.*.imageHeight)
+    info.*.num_components = @intCast(i32, d.*.numComponents)
+    info.*.data_precision = d.*.dataPrecision
+    info.*.progressive_mode = if d.*.progressive { 1 } else { 0 }
+    info.*.arith_code = if d.*.arithmetic { 1 } else { 0 }
+    info.*.saw_JFIF_marker = if d.*.sawJFIF { 1 } else { 0 }
+    info.*.JFIF_major_version = @intCast(u8, d.*.jfifMajor & 255)
+    info.*.JFIF_minor_version = @intCast(u8, d.*.jfifMinor & 255)
+    info.*.density_unit = @intCast(u8, d.*.densityUnit & 255)
+    info.*.X_density = @intCast(u16, d.*.xDensity & 0xffff)
+    info.*.Y_density = @intCast(u16, d.*.yDensity & 0xffff)
+    info.*.saw_Adobe_marker = if d.*.sawAdobe { 1 } else { 0 }
+    info.*.Adobe_transform = @intCast(u8, d.*.adobeTransform & 255)
+    info.*.CCIR601_sampling = 0
+    var i: usize = 0
+    while i < 16 {
+        info.*.arith_dc_L[i] = d.*.arithDcL[i]
+        info.*.arith_dc_U[i] = d.*.arithDcU[i]
+        info.*.arith_ac_K[i] = d.*.arithAcK[i]
+        i += 1
+    }
+    info.*.max_h_samp_factor = @intCast(i32, d.*.maxHSamp)
+    info.*.max_v_samp_factor = @intCast(i32, d.*.maxVSamp)
+    info.*.min_DCT_h_scaled_size = 8
+    info.*.min_DCT_v_scaled_size = 8
+    info.*.total_iMCU_rows = @intCast(u32, d.*.totalIMCURows)
+    info.*.block_size = 8
+    info.*.natural_order = naturalTable()
+    info.*.lim_Se = 63
+    // The components, in the image's memory (libjpeg's comp_info).
+    const count = d.*.numComponents
+    info.*.comp_info = c.allocSmall(cinfo, c.JPOOL_IMAGE, count * @sizeOf(rec.ComponentInfo))
+    if info.*.comp_info == 0 { return }
+    zs.zero(info.*.comp_info, count * @sizeOf(rec.ComponentInfo))
+    var ci: usize = 0
+    while ci < count {
+        const from = &d.*.components[ci]
+        const to = componentAt(cinfo, ci)
+        to.*.component_id = from.*.id
+        to.*.component_index = @intCast(i32, ci)
+        to.*.h_samp_factor = @intCast(i32, from.*.hSamp)
+        to.*.v_samp_factor = @intCast(i32, from.*.vSamp)
+        to.*.quant_tbl_no = from.*.quantTableNumber
+        to.*.width_in_blocks = @intCast(u32, from.*.widthInBlocks)
+        to.*.height_in_blocks = @intCast(u32, from.*.heightInBlocks)
+        to.*.DCT_h_scaled_size = 8
+        to.*.DCT_v_scaled_size = 8
+        to.*.downsampled_width = @intCast(u32, from.*.downsampledWidth)
+        to.*.downsampled_height = @intCast(u32, from.*.downsampledHeight)
+        to.*.component_needed = 1
+        ci += 1
+    }
+}
+
+// What the input side changes as it goes: the scan, the counters, the
+// markers saved.
+fn inputFields(cinfo: usize) -> void {
+    const info = rec.decompress(cinfo)
+    const d = decoderOf(cinfo)
+    info.*.input_scan_number = d.*.inputScanNumber
+    info.*.input_iMCU_row = @intCast(u32, d.*.inputIMCURow)
+    info.*.output_scan_number = d.*.outputScanNumber
+    info.*.output_iMCU_row = @intCast(u32, d.*.outputIMCURow)
+    info.*.unread_marker = @intCast(i32, d.*.unreadMarker)
+    info.*.marker_list = d.*.markerList
+    info.*.restart_interval = d.*.restartInterval
+    if info.*.comp_info == 0 || d.*.inHeaders { return }
+    info.*.comps_in_scan = @intCast(i32, d.*.compsInScan)
+    var i: usize = 0
+    while i < 4 {
+        info.*.cur_comp_info[i] = 0
+        if i < d.*.compsInScan { info.*.cur_comp_info[i] = info.*.comp_info + d.*.scanComponents[i] * @sizeOf(rec.ComponentInfo) }
+        i += 1
+    }
+    info.*.Ss = d.*.ss
+    info.*.Se = d.*.se
+    info.*.Ah = d.*.ah
+    info.*.Al = d.*.al
+    info.*.MCUs_per_row = @intCast(u32, d.*.mcusPerRow)
+    info.*.MCU_rows_in_scan = @intCast(u32, d.*.mcuRowsInScan)
+    info.*.blocks_in_MCU = @intCast(i32, d.*.blocksInMCU)
+    i = 0
+    while i < 10 {
+        info.*.MCU_membership[i] = @intCast(i32, d.*.membership[i])
+        i += 1
+    }
+    if d.*.started && d.*.progressive { info.*.coef_bits = @intFromPtr(&d.*.coefBits) }
+    i = 0
+    while i < d.*.compsInScan {
+        const ci = d.*.scanComponents[i]
+        const from = &d.*.components[ci]
+        const to = componentAt(cinfo, ci)
+        to.*.dc_tbl_no = @intCast(i32, from.*.dcTable)
+        to.*.ac_tbl_no = @intCast(i32, from.*.acTable)
+        to.*.MCU_width = @intCast(i32, from.*.mcuWidth)
+        to.*.MCU_height = @intCast(i32, from.*.mcuHeight)
+        to.*.MCU_blocks = @intCast(i32, from.*.mcuBlocks)
+        to.*.MCU_sample_width = @intCast(i32, from.*.mcuWidth * 8)
+        to.*.last_col_width = @intCast(i32, from.*.lastColWidth)
+        to.*.last_row_height = @intCast(i32, from.*.lastRowHeight)
+        i += 1
+    }
+}
+
+// What the output parameters give (jpeg_calc_output_dimensions).
+fn outputFields(cinfo: usize) -> void {
+    const info = rec.decompress(cinfo)
+    const d = decoderOf(cinfo)
+    const o = outputOf(cinfo)
+    info.*.output_width = @intCast(u32, o.*.width)
+    info.*.output_height = @intCast(u32, o.*.height)
+    info.*.out_color_components = @intCast(i32, o.*.components)
+    info.*.output_components = @intCast(i32, o.*.components)
+    info.*.rec_outbuf_height = @intCast(i32, o.*.recommendedRows)
+    if info.*.comp_info == 0 { return }
+    var ci: usize = 0
+    while ci < d.*.numComponents {
+        const from = &d.*.components[ci]
+        const to = componentAt(cinfo, ci)
+        to.*.downsampled_width = @intCast(u32, from.*.downsampledWidth)
+        to.*.downsampled_height = @intCast(u32, from.*.downsampledHeight)
+        to.*.component_needed = if from.*.needed { 1 } else { 0 }
+        ci += 1
+    }
+}
+
+// The application's output parameters into the decoder.
+fn takeParameters(cinfo: usize) -> void {
+    const info = rec.decompress(cinfo)
+    const o = outputOf(cinfo)
+    o.*.colorSpace = info.*.out_color_space
+    o.*.scaleNum = info.*.scale_num
+    o.*.scaleDenom = info.*.scale_denom
+    o.*.fancy = info.*.do_fancy_upsampling != 0
+    o.*.smoothing = info.*.do_block_smoothing != 0
+    o.*.bufferedImage = info.*.buffered_image != 0
+    o.*.rawData = info.*.raw_data_out != 0
+}
+
+// default_decompress_parms.
+fn defaultParameters(cinfo: usize) -> void {
+    const info = rec.decompress(cinfo)
+    const e = engineOf(cinfo)
+    const d = &e.*.decoder
+    read.defaultColorSpaces(d)
+    info.*.jpeg_color_space = d.*.jpegColorSpace
+    info.*.out_color_space = d.*.outColorSpace
+    info.*.scale_num = 1
+    info.*.scale_denom = 1
+    info.*.output_gamma = 1.0
+    info.*.buffered_image = 0
+    info.*.raw_data_out = 0
+    info.*.dct_method = 0
+    info.*.do_fancy_upsampling = 1
+    info.*.do_block_smoothing = 1
+    info.*.quantize_colors = 0
+    info.*.dither_mode = 2
+    info.*.two_pass_quantize = 1
+    info.*.desired_number_of_colors = 256
+    info.*.colormap = 0
+    info.*.enable_1pass_quant = 0
+    info.*.enable_external_quant = 0
+    info.*.enable_2pass_quant = 0
+    if e.*.outputReady { output.deinit(&e.*.output) }
+    output.init(&e.*.output, d)
+    e.*.outputReady = true
+}
+
+// ---------------------------------------------------------------------------
+// Creating, aborting, destroying (jdapimin.c)
+
+export fn jpeg_CreateDecompress(cinfo: usize, version: i32, structsize: usize) -> void {
+    const info = rec.decompress(cinfo)
+    info.*.mem = 0
+    if version != JPEG_LIB_VERSION {
+        c.raise(cinfo, c.JERR_BAD_LIB_VERSION, JPEG_LIB_VERSION, version, 0, 0)
+        return
+    }
+    if structsize != DECOMPRESS_SIZE {
+        c.raise(cinfo, c.JERR_BAD_STRUCT_SIZE, @intCast(i32, DECOMPRESS_SIZE), @intCast(i32, structsize & 0x7fffffff), 0, 0)
+        return
+    }
+    const err = info.*.err
+    const clientData = info.*.client_data
+    zs.zero(cinfo, DECOMPRESS_SIZE)
+    info.*.err = err
+    info.*.client_data = clientData
+    info.*.is_decompressor = 1
+    if !c.createState(cinfo, @sizeOf(Engine)) {
+        c.raise1(cinfo, c.JERR_OUT_OF_MEMORY, 0)
+        return
+    }
+    const state = c.stateOf(cinfo)
+    state.*.destroyEngine = @intFromPtr(mlxjpeg_destroy_decompressor)
+    read.init(decoderOf(cinfo), c.allocator())
+    info.*.global_state = c.DSTATE_START
+}
+
+// The image's memory and the decoder's image state given back
+// (jpeg_abort for a decompressor).
+pub fn abortImage(cinfo: usize) -> void {
+    if rec.common(cinfo).*.mem == 0 { return }
+    const e = engineOf(cinfo)
+    if e.*.outputReady {
+        output.deinit(&e.*.output)
+        e.*.outputReady = false
+    }
+    read.reset(&e.*.decoder)
+    c.abort(cinfo)
+    rec.decompress(cinfo).*.comp_info = 0
+}
+
+export fn jpeg_destroy_decompress(cinfo: usize) -> void { c.destroy(cinfo) }
+
+export fn jpeg_abort_decompress(cinfo: usize) -> void { abortImage(cinfo) }
+
+// ---------------------------------------------------------------------------
+// The header and the input (jdapimin.c)
+
+fn badState(cinfo: usize) -> void { c.raise1(cinfo, c.JERR_BAD_STATE, rec.common(cinfo).*.global_state) }
+
+fn consumeInput(cinfo: usize) -> i32 {
+    const info = rec.decompress(cinfo)
+    const state = info.*.global_state
+    if state == c.DSTATE_START {
+        // reset_input_controller, init_source.
+        const d = decoderOf(cinfo)
+        read.reset(d)
+        const err = rec.errorMgr(info.*.err)
+        const resetCall: c.SourceFn = unsafe { @ptrFromInt(c.SourceFn, err.*.reset_error_mgr) }
+        resetCall(cinfo)
+        if info.*.src != 0 {
+            const src = rec.source(info.*.src)
+            if src.*.init_source != 0 {
+                const initCall: c.SourceFn = unsafe { @ptrFromInt(c.SourceFn, src.*.init_source) }
+                initCall(cinfo)
+            }
+        }
+        info.*.comp_info = 0
+        info.*.global_state = c.DSTATE_INHEADER
+    }
+    const now = info.*.global_state
+    if now == c.DSTATE_INHEADER {
+        const result = consume(cinfo)
+        if result == read.REACHED_SOS {
+            headerFields(cinfo)
+            inputFields(cinfo)
+            defaultParameters(cinfo)
+            if !report(cinfo) { return SUSPENDED }
+            info.*.global_state = c.DSTATE_READY
+        }
+        return result
+    }
+    if now == c.DSTATE_READY { return read.REACHED_SOS }
+    if now >= c.DSTATE_PRELOAD && now <= c.DSTATE_STOPPING && now != c.DSTATE_RDCOEFS { return consume(cinfo) }
+    badState(cinfo)
+    return SUSPENDED
+}
+
+export fn jpeg_consume_input(cinfo: usize) -> i32 { return consumeInput(cinfo) }
+
+export fn jpeg_read_header(cinfo: usize, require_image: i32) -> i32 {
+    const state = rec.common(cinfo).*.global_state
+    if state != c.DSTATE_START && state != c.DSTATE_INHEADER {
+        badState(cinfo)
+        return SUSPENDED
+    }
+    const result = consumeInput(cinfo)
+    if result == read.REACHED_SOS { return HEADER_OK }
+    if result == read.REACHED_EOI {
+        if require_image != 0 {
+            c.raise0(cinfo, c.JERR_NO_IMAGE)
+            return SUSPENDED
+        }
+        abortImage(cinfo)
+        return HEADER_TABLES_ONLY
+    }
+    return SUSPENDED
+}
+
+export fn jpeg_input_complete(cinfo: usize) -> i32 {
+    const state = rec.common(cinfo).*.global_state
+    if state < c.DSTATE_START || state > c.DSTATE_STOPPING {
+        badState(cinfo)
+        return 0
+    }
+    return if decoderOf(cinfo).*.eoiReached { 1 } else { 0 }
+}
+
+export fn jpeg_has_multiple_scans(cinfo: usize) -> i32 {
+    const state = rec.common(cinfo).*.global_state
+    if state < c.DSTATE_READY || state > c.DSTATE_STOPPING {
+        badState(cinfo)
+        return 0
+    }
+    return if decoderOf(cinfo).*.hasMultipleScans { 1 } else { 0 }
+}
+
+export fn jpeg_save_markers(cinfo: usize, marker_code: i32, length_limit: u32) -> void {
+    if marker_code < 0 || marker_code > 255 {
+        c.raise1(cinfo, read.JERR_UNKNOWN_MARKER, marker_code)
+        return
+    }
+    _ = read.saveMarkers(decoderOf(cinfo), @intCast(u32, marker_code), length_limit)
+    _ = report(cinfo)
+}
+
+export fn jpeg_set_marker_processor(cinfo: usize, marker_code: i32, routine: usize) -> void {
+    c.raise0(cinfo, c.JERR_NOT_COMPILED)
+}
+
+// The default resynchronization is the decoder's own; called directly it
+// leaves the marker for the reader (libjpeg's action 3).
+export fn jpeg_resync_to_restart(cinfo: usize, desired: i32) -> i32 { return 1 }
+
+export fn jpeg_finish_decompress(cinfo: usize) -> i32 {
+    const info = rec.decompress(cinfo)
+    const state = info.*.global_state
+    if (state == c.DSTATE_SCANNING || state == c.DSTATE_RAW_OK) && info.*.buffered_image == 0 {
+        if info.*.output_scanline < info.*.output_height {
+            c.raise0(cinfo, c.JERR_TOO_LITTLE_DATA)
+            return 0
+        }
+        info.*.global_state = c.DSTATE_STOPPING
+    } else if state == c.DSTATE_BUFIMAGE {
+        info.*.global_state = c.DSTATE_STOPPING
+    } else if state != c.DSTATE_STOPPING {
+        badState(cinfo)
+        return 0
+    }
+    while !decoderOf(cinfo).*.eoiReached {
+        if consume(cinfo) == SUSPENDED { return 0 }
+    }
+    if info.*.src != 0 {
+        const src = rec.source(info.*.src)
+        if src.*.term_source != 0 {
+            const call: c.SourceFn = unsafe { @ptrFromInt(c.SourceFn, src.*.term_source) }
+            call(cinfo)
+        }
+    }
+    abortImage(cinfo)
+    return 1
+}
+
+// ---------------------------------------------------------------------------
+// The output (jdapistd.c, jdmaster.c)
+
+fn calcOutput(cinfo: usize) -> void {
+    takeParameters(cinfo)
+    output.calcDimensions(outputOf(cinfo))
+    outputFields(cinfo)
+}
+
+export fn jpeg_calc_output_dimensions(cinfo: usize) -> void {
+    if rec.common(cinfo).*.global_state != c.DSTATE_READY {
+        badState(cinfo)
+        return
+    }
+    calcOutput(cinfo)
+}
+
+export fn jpeg_core_output_dimensions(cinfo: usize) -> void {
+    if rec.common(cinfo).*.global_state != c.DSTATE_READY {
+        badState(cinfo)
+        return
+    }
+    calcOutput(cinfo)
+}
+
+// output_pass_setup: the start of an output pass.
+fn outputPassSetup(cinfo: usize) -> i32 {
+    const info = rec.decompress(cinfo)
+    if info.*.global_state != c.DSTATE_PRESCAN {
+        output.startPass(outputOf(cinfo))
+        info.*.output_scanline = 0
+        info.*.global_state = c.DSTATE_PRESCAN
+    }
+    info.*.global_state = if info.*.raw_data_out != 0 { c.DSTATE_RAW_OK } else { c.DSTATE_SCANNING }
+    inputFields(cinfo)
+    return 1
+}
+
+export fn jpeg_start_decompress(cinfo: usize) -> i32 {
+    const info = rec.decompress(cinfo)
+    const d = decoderOf(cinfo)
+    if info.*.global_state == c.DSTATE_READY {
+        // master_selection.
+        if info.*.quantize_colors != 0 {
+            c.raise0(cinfo, c.JERR_NOT_COMPILED)
+            return 0
+        }
+        takeParameters(cinfo)
+        const started = output.start(outputOf(cinfo))
+        outputFields(cinfo)
+        if !report(cinfo) || !started { return 0 }
+        inputFields(cinfo)
+        if info.*.buffered_image != 0 {
+            info.*.global_state = c.DSTATE_BUFIMAGE
+            return 1
+        }
+        info.*.global_state = c.DSTATE_PRELOAD
+    }
+    if info.*.global_state == c.DSTATE_PRELOAD {
+        if d.*.hasMultipleScans {
+            while true {
+                const result = consume(cinfo)
+                if result == SUSPENDED { return 0 }
+                if result == read.REACHED_EOI { break }
+            }
+        }
+        d.*.outputScanNumber = d.*.inputScanNumber
+        info.*.output_scan_number = d.*.inputScanNumber
+    } else if info.*.global_state != c.DSTATE_PRESCAN {
+        badState(cinfo)
+        return 0
+    }
+    return outputPassSetup(cinfo)
+}
+
+export fn jpeg_read_scanlines(cinfo: usize, scanlines: usize, max_lines: u32) -> u32 {
+    const info = rec.decompress(cinfo)
+    if info.*.global_state != c.DSTATE_SCANNING {
+        badState(cinfo)
+        return 0
+    }
+    if info.*.output_scanline >= info.*.output_height {
+        c.warn(cinfo, c.JWRN_TOO_MUCH_DATA, 0, 0)
+        return 0
+    }
+    const o = outputOf(cinfo)
+    const d = decoderOf(cinfo)
+    o.*.scanline = @intCast(usize, info.*.output_scanline)
+    pull(cinfo)
+    const rows: [*]usize = unsafe { @ptrFromInt([*]usize, scanlines) }
+    var count: usize = 0
+    while true {
+        count = output.readScanlines(o, rows, @intCast(usize, max_lines))
+        if !report(cinfo) { return 0 }
+        if count == 0 && d.*.starved && fill(cinfo) { continue }
+        break
+    }
+    info.*.output_scanline += @intCast(u32, count)
+    inputFields(cinfo)
+    return @intCast(u32, count)
+}
+
+export fn jpeg_skip_scanlines(cinfo: usize, num_lines: u32) -> u32 {
+    const info = rec.decompress(cinfo)
+    if info.*.global_state != c.DSTATE_SCANNING {
+        badState(cinfo)
+        return 0
+    }
+    const d = decoderOf(cinfo)
+    const o = outputOf(cinfo)
+    if info.*.output_scanline + num_lines >= info.*.output_height {
+        // The rest skipped: libjpeg ends the input there too.
+        const skipped = info.*.output_height - info.*.output_scanline
+        info.*.output_scanline = info.*.output_height
+        d.*.eoiReached = true
+        return skipped
+    }
+    if num_lines == 0 { return 0 }
+    o.*.scanline = @intCast(usize, info.*.output_scanline)
+    pull(cinfo)
+    var done: usize = 0
+    var left = @intCast(usize, num_lines)
+    while left > 0 {
+        const count = output.skipScanlines(o, left)
+        if !report(cinfo) { return 0 }
+        done += count
+        left -= count
+        if left > 0 && !(d.*.starved && fill(cinfo)) { break }
+    }
+    info.*.output_scanline = @intCast(u32, o.*.scanline)
+    inputFields(cinfo)
+    // libjpeg answers the number asked even when the data ran out
+    // (its skipping does not suspend).
+    return num_lines
+}
+
+export fn jpeg_crop_scanline(cinfo: usize, xoffset: usize, width: usize) -> void {
+    const info = rec.decompress(cinfo)
+    if (info.*.global_state != c.DSTATE_SCANNING && info.*.global_state != c.DSTATE_BUFIMAGE) || info.*.output_scanline != 0 {
+        badState(cinfo)
+        return
+    }
+    if xoffset == 0 || width == 0 {
+        c.raise0(cinfo, c.JERR_BAD_CROP_SPEC)
+        return
+    }
+    var x = @intCast(usize, zs.get32(xoffset))
+    var w = @intCast(usize, zs.get32(width))
+    if !output.crop(outputOf(cinfo), &x, &w) {
+        _ = report(cinfo)
+        return
+    }
+    zs.put32(xoffset, x)
+    zs.put32(width, w)
+    outputFields(cinfo)
+}
+
+export fn jpeg_read_raw_data(cinfo: usize, data: usize, max_lines: u32) -> u32 {
+    const info = rec.decompress(cinfo)
+    if info.*.global_state != c.DSTATE_RAW_OK {
+        badState(cinfo)
+        return 0
+    }
+    if info.*.output_scanline >= info.*.output_height {
+        c.warn(cinfo, c.JWRN_TOO_MUCH_DATA, 0, 0)
+        return 0
+    }
+    const d = decoderOf(cinfo)
+    const lines = d.*.maxVSamp * 8
+    if @intCast(usize, max_lines) < lines {
+        c.raise0(cinfo, c.JERR_BUFFER_SIZE)
+        return 0
+    }
+    const o = outputOf(cinfo)
+    o.*.scanline = @intCast(usize, info.*.output_scanline)
+    pull(cinfo)
+    const planes: [*]usize = unsafe { @ptrFromInt([*]usize, data) }
+    var count: usize = 0
+    while true {
+        count = output.readRaw(o, planes)
+        if !report(cinfo) { return 0 }
+        if count == 0 && d.*.starved && fill(cinfo) { continue }
+        break
+    }
+    info.*.output_scanline += @intCast(u32, count)
+    inputFields(cinfo)
+    return @intCast(u32, count)
+}
+
+export fn jpeg_start_output(cinfo: usize, scan_number: i32) -> i32 {
+    const info = rec.decompress(cinfo)
+    if info.*.global_state != c.DSTATE_BUFIMAGE && info.*.global_state != c.DSTATE_PRESCAN {
+        badState(cinfo)
+        return 0
+    }
+    const d = decoderOf(cinfo)
+    var scan = scan_number
+    if scan <= 0 { scan = 1 }
+    if d.*.eoiReached && scan > d.*.inputScanNumber { scan = d.*.inputScanNumber }
+    d.*.outputScanNumber = scan
+    info.*.output_scan_number = scan
+    return outputPassSetup(cinfo)
+}
+
+export fn jpeg_finish_output(cinfo: usize) -> i32 {
+    const info = rec.decompress(cinfo)
+    const state = info.*.global_state
+    if (state == c.DSTATE_SCANNING || state == c.DSTATE_RAW_OK) && info.*.buffered_image != 0 {
+        info.*.global_state = c.DSTATE_BUFPOST
+    } else if state != c.DSTATE_BUFPOST {
+        badState(cinfo)
+        return 0
+    }
+    const d = decoderOf(cinfo)
+    while d.*.inputScanNumber <= d.*.outputScanNumber && !d.*.eoiReached {
+        if consume(cinfo) == SUSPENDED { return 0 }
+    }
+    info.*.global_state = c.DSTATE_BUFIMAGE
+    return 1
+}
+
+export fn jpeg_new_colormap(cinfo: usize) -> void {
+    if rec.common(cinfo).*.global_state != c.DSTATE_BUFIMAGE {
+        badState(cinfo)
+        return
+    }
+    c.raise0(cinfo, c.JERR_MODE_CHANGE)
+}
+
+// Transcoding: not supported.
+export fn jpeg_read_coefficients(cinfo: usize) -> usize {
+    c.raise0(cinfo, c.JERR_NOT_COMPILED)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// The ICC profile (jdicc.c)
+
+fn isICC(marker: usize) -> bool {
+    if c.get8(marker + read.SAVED_MARKER) != 0xe2 { return false }
+    if zs.get32(marker + read.SAVED_DATA_LENGTH) < 14 { return false }
+    const data = @intCast(usize, zs.get64(marker + read.SAVED_DATA))
+    const name = "ICC_PROFILE"
+    var i: usize = 0
+    while i < 11 {
+        if c.get8(data + i) != @intCast(usize, name[i]) { return false }
+        i += 1
+    }
+    return c.get8(data + 11) == 0
+}
+
+export fn jpeg_read_icc_profile(cinfo: usize, icc_data_ptr: usize, icc_data_len: usize) -> i32 {
+    if icc_data_ptr == 0 || icc_data_len == 0 {
+        c.raise0(cinfo, c.JERR_BUFFER_SIZE)
+        return 0
+    }
+    if rec.common(cinfo).*.global_state < c.DSTATE_READY {
+        badState(cinfo)
+        return 0
+    }
+    c.putWord(icc_data_ptr, 0)
+    zs.put32(icc_data_len, 0)
+    var present: [256]bool = undefined
+    var lengths: [256]usize = undefined
+    var offsets: [256]usize = undefined
+    var i: usize = 0
+    while i < 256 {
+        present[i] = false
+        i += 1
+    }
+    var count: usize = 0
+    var marker = rec.decompress(cinfo).*.marker_list
+    while marker != 0 {
+        if isICC(marker) {
+            const data = @intCast(usize, zs.get64(marker + read.SAVED_DATA))
+            if count == 0 {
+                count = c.get8(data + 13)
+            } else if count != c.get8(data + 13) {
+                c.warn(cinfo, c.JWRN_BOGUS_ICC, 0, 0)
+                return 0
+            }
+            const sequence = c.get8(data + 12)
+            if sequence == 0 || sequence > count || present[sequence] {
+                c.warn(cinfo, c.JWRN_BOGUS_ICC, 0, 0)
+                return 0
+            }
+            present[sequence] = true
+            lengths[sequence] = @intCast(usize, zs.get32(marker + read.SAVED_DATA_LENGTH)) - 14
+        }
+        marker = @intCast(usize, zs.get64(marker + read.SAVED_NEXT))
+    }
+    if count == 0 { return 0 }
+    var total: usize = 0
+    var sequence: usize = 1
+    while sequence <= count {
+        if !present[sequence] {
+            c.warn(cinfo, c.JWRN_BOGUS_ICC, 0, 0)
+            return 0
+        }
+        offsets[sequence] = total
+        total += lengths[sequence]
+        sequence += 1
+    }
+    if total == 0 {
+        c.warn(cinfo, c.JWRN_BOGUS_ICC, 0, 0)
+        return 0
+    }
+    const profile = c.malloc(total)
+    if profile == 0 {
+        c.raise1(cinfo, c.JERR_OUT_OF_MEMORY, 11)
+        return 0
+    }
+    marker = rec.decompress(cinfo).*.marker_list
+    while marker != 0 {
+        if isICC(marker) {
+            const data = @intCast(usize, zs.get64(marker + read.SAVED_DATA))
+            const at = c.get8(data + 12)
+            zs.copy(profile + offsets[at], data + 14, lengths[at])
+        }
+        marker = @intCast(usize, zs.get64(marker + read.SAVED_NEXT))
+    }
+    c.putWord(icc_data_ptr, profile)
+    zs.put32(icc_data_len, total)
+    return 1
+}

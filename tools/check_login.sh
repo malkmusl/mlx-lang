@@ -38,9 +38,14 @@ work=$(mktemp -d)
 chmod 755 "$work"
 bus_pid=""
 login_pid=""
+init_pid=""
 cleanup() {
     [[ -n "$login_pid" ]] && kill "$login_pid" 2> /dev/null || true
     [[ -n "$bus_pid" ]] && kill "$bus_pid" 2> /dev/null || true
+    if [[ -n "$init_pid" ]]; then
+        kill "$init_pid" 2> /dev/null || true
+        wait "$init_pid" 2> /dev/null || true
+    fi
     rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -109,7 +114,12 @@ bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$work/bus" ]] && break; sleep 0.1; done
 [[ -S "$work/bus" ]] || { echo "FAIL the system bus did not come up" >&2; cat "$work/bus.log" >&2; exit 1; }
 
-"$work/mlx-login" --verbose --passwd "$work/passwd" --shadow "$work/shadow" --group "$work/group" --runtime-dir "$work/runtime" --tty none --test-device-null \
+python3 tools/login-test/fake-init.py "$work/init" "$work/power.log" > "$work/init.log" 2>&1 &
+init_pid=$!
+for _ in $(seq 1 50); do [[ -S "$work/init" ]] && break; sleep 0.1; done
+[[ -S "$work/init" ]] || { echo "FAIL the private mlx-init control socket did not come up" >&2; cat "$work/init.log" >&2; exit 1; }
+
+MLX_INIT_CONTROL="$work/init" "$work/mlx-login" --verbose --passwd "$work/passwd" --shadow "$work/shadow" --group "$work/group" --runtime-dir "$work/runtime" --tty none --test-device-null \
     --greeter "$work/greeter-compositor" "$work/mlx-greeter" --greeter-uid 65534 --greeter-gid 65534 > "$work/login.log" 2>&1 &
 login_pid=$!
 # Wait until it owns the name.
@@ -136,6 +146,23 @@ greeter_session=$(gdbus call --address "$address" --dest org.freedesktop.login1 
 grep -q '/org/freedesktop/login1/session/seat0' <<< "$greeter_session" || { echo "FAIL login1 did not expose the greeter compositor as the seat" >&2; echo "$greeter_session" >&2; exit 1; }
 echo "ok   mlx-login starts the greeter compositor unprivileged and exposes its seat"
 
+# login1's standard power methods are authorized by MLXIPC before they
+# reach mlx-init's root-only control socket. The Can* queries reflect
+# whether that socket accepts connections.
+can_power=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.CanPowerOff 2>&1 || true)
+grep -q "'yes'" <<< "$can_power" || { echo "FAIL login1 did not report mlx-init power-off support:" >&2; echo "$can_power" >&2; exit 1; }
+invalid_power=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.PowerOff 2>&1 || true)
+grep -q 'org.freedesktop.DBus.Error.InvalidArgs' <<< "$invalid_power" || { echo "FAIL login1 accepted PowerOff without its boolean:" >&2; echo "$invalid_power" >&2; exit 1; }
+printf 'deny gdbus use login.power\n' > "$work/none.conf"
+sleep 0.3
+power_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.PowerOff false 2>&1 || true)
+grep -q 'org.freedesktop.DBus.Error.AccessDenied' <<< "$power_out" || { echo "FAIL login1 powered off without login.power:" >&2; echo "$power_out" >&2; exit 1; }
+[[ ! -e "$work/power.log" ]] || { echo "FAIL a denied login1 power call reached mlx-init" >&2; cat "$work/power.log" >&2; exit 1; }
+echo "ok   login1 requires MLXIPC's login.power permission"
+
 # ListUsers comes only from the fixture passed with --passwd.
 users=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
     --method org.mlx.Login.ListUsers 2>&1)
@@ -160,8 +187,31 @@ login_out=$(login_call mlx-test test-password)
 grep -q "org.freedesktop.DBus.Error.AccessDenied" <<< "$login_out" || { echo "FAIL Login handled a password without login.session:" >&2; echo "$login_out" >&2; exit 1; }
 echo "ok   Login requires login.session before checking a password"
 
-printf 'allow gdbus use login.session\nallow login1-client use login.device\n' > "$work/none.conf"
+printf 'allow gdbus use login.session\nallow gdbus use login.power\nallow login1-client use login.device\n' > "$work/none.conf"
 sleep 0.3
+
+power_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.PowerOff false 2>&1 || true)
+grep -q '()' <<< "$power_out" || { echo "FAIL login1 PowerOff did not succeed:" >&2; echo "$power_out" >&2; exit 1; }
+reboot_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.Reboot false 2>&1 || true)
+grep -q '()' <<< "$reboot_out" || { echo "FAIL login1 Reboot did not succeed:" >&2; echo "$reboot_out" >&2; exit 1; }
+for _ in $(seq 1 30); do [[ -s "$work/power.log" ]] && [[ $(wc -l < "$work/power.log") -eq 2 ]] && break; sleep 0.1; done
+[[ "$(cat "$work/power.log" 2> /dev/null)" == $'poweroff\nreboot' ]] || { echo "FAIL login1 did not forward power requests to mlx-init:" >&2; cat "$work/power.log" >&2; exit 1; }
+echo "ok   login1 PowerOff and Reboot reach mlx-init's control socket"
+
+# A socket pathname can outlive its listener. Can* must not promise an
+# operation in that state, and an authorized action must return an error.
+kill "$init_pid"
+wait "$init_pid" 2> /dev/null || true
+init_pid=""
+can_reboot=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.CanReboot 2>&1 || true)
+grep -q "'no'" <<< "$can_reboot" || { echo "FAIL login1 reported a stale mlx-init socket as usable:" >&2; echo "$can_reboot" >&2; exit 1; }
+reboot_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
+    --method org.freedesktop.login1.Manager.Reboot false 2>&1 || true)
+grep -q 'org.freedesktop.DBus.Error.Failed' <<< "$reboot_out" || { echo "FAIL login1 hid an unavailable mlx-init control socket:" >&2; echo "$reboot_out" >&2; exit 1; }
+echo "ok   login1 reports and returns an unavailable mlx-init control socket"
 
 # The unprivileged greeter compositor uses its distinct session id before a
 # user session exists. It must receive devices through mlx-login's login1

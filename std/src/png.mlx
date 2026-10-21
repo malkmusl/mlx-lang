@@ -8,16 +8,23 @@
 //
 // Supported: every colour type (greyscale, RGB, palette, greyscale with
 // alpha, RGBA) at every bit depth PNG allows for it (1, 2, 4, 8, 16),
-// palette transparency (tRNS), all five row filters, and zlib streams with
-// stored, fixed and dynamic Huffman blocks. Not supported: interlaced
-// (Adam7) images (Status.unsupported). Chunk CRCs and the zlib checksum are
-// not checked; malformed data gives Status.corrupt, never a trap.
+// transparency (tRNS) of each, interlaced (Adam7) images, all five row
+// filters. The file is read by std.png.read, libpng's reader in Mlx (the
+// same checks of chunks and CRCs); malformed data gives Status.corrupt,
+// never a trap. decodeRgba gives 8-bit RGBA instead of premultiplied
+// words. The libpng C API (compiler/libc/png) is made of the same parts.
 //
 // scale() resizes an image by area averaging (box filtering), which suits
 // shrinking icons to the size they are shown at.
 
+const std = @import("std")
 const allocator_module = @import("../bootstrap/allocator.mlx")
 const fs = @import("../bootstrap/fs.mlx")
+const flate = @import("./flate.mlx")
+const crc = @import("./crc.mlx")
+const zs = @import("./flate/stream.mlx")
+pub const read = @import("./png/read.mlx")
+pub const rows = @import("./png/rows.mlx")
 
 pub const Allocator = allocator_module.Allocator
 
@@ -34,7 +41,7 @@ pub fn statusMessage(status: Status) -> []const u8 {
     if status == Status.ok { return "ok" }
     if status == Status.unreadable { return "cannot read the file" }
     if status == Status.notPng { return "not a PNG image" }
-    if status == Status.unsupported { return "an interlaced or otherwise unsupported PNG" }
+    if status == Status.unsupported { return "a PNG larger than 16384 pixels across" }
     if status == Status.corrupt { return "a damaged PNG" }
     return "out of memory"
 }
@@ -58,10 +65,9 @@ pub fn deinit(image: *Image) -> void {
 pub fn loadFile(image: *Image, path: [*]const u8, allocator: Allocator) -> Status {
     image.*.width = 0
     image.*.height = 0
-    const file = fs.open(path, fs.READ_ONLY, 0)
-    if !fs.isValid(file) { return Status.unreadable }
-    const contents = fs.readToEndAlloc(file, allocator)
-    _ = fs.close(file)
+    const loaded = fs.readFileAlloc(path, allocator)
+    if loaded == null { return Status.unreadable }
+    const contents = loaded.?
     if contents.length == 0 {
         fs.ArrayList.deinit(contents)
         return Status.unreadable
@@ -73,323 +79,11 @@ pub fn loadFile(image: *Image, path: [*]const u8, allocator: Allocator) -> Statu
 }
 
 // ---------------------------------------------------------------------------
-// Inflate (RFC 1951), after zlib's puff.c
-
-const MAX_BITS: u32 = 15
-
-const Huffman = struct {
-    counts: [16]u32
-    symbols: [320]u32
-}
-
-const Inflater = struct {
-    input: [*]const u8
-    inputLength: usize
-    position: usize
-    bits: u32
-    bitCount: u32
-    output: [*]u8
-    outputLength: usize
-    outputCapacity: usize
-    failed: bool
-}
-
-fn bits(inflater: *Inflater, count: u32) -> u32 {
-    var value = inflater.*.bits
-    while inflater.*.bitCount < count {
-        if inflater.*.position >= inflater.*.inputLength {
-            inflater.*.failed = true
-            return 0
-        }
-        value = value | (@intCast(u32, inflater.*.input[inflater.*.position]) << inflater.*.bitCount)
-        inflater.*.position += 1
-        inflater.*.bitCount += 8
-    }
-    inflater.*.bits = if count >= 32 { 0 } else { value >> count }
-    inflater.*.bitCount -= count
-    if count == 0 { return 0 }
-    return value & ((@intCast(u32, 1) << count) - 1)
-}
-
-// Builds a canonical Huffman table from code lengths; false when the
-// lengths over-subscribe the code.
-fn construct(table: *Huffman, lengths: [*]const u32, count: usize) -> bool {
-    var length: usize = 0
-    while length <= 15 {
-        table.*.counts[length] = 0
-        length += 1
-    }
-    var symbol: usize = 0
-    while symbol < count {
-        if lengths[symbol] > 15 { return false }
-        table.*.counts[lengths[symbol]] += 1
-        symbol += 1
-    }
-    if table.*.counts[0] == @intCast(u32, count) { return true }
-    var left: i32 = 1
-    length = 1
-    while length <= 15 {
-        left = left * 2 - @intCast(i32, table.*.counts[length])
-        if left < 0 { return false }
-        length += 1
-    }
-    var offsets: [16]u32 = undefined
-    offsets[1] = 0
-    length = 1
-    while length < 15 {
-        offsets[length + 1] = offsets[length] + table.*.counts[length]
-        length += 1
-    }
-    symbol = 0
-    while symbol < count {
-        const code_length = lengths[symbol]
-        if code_length != 0 {
-            if offsets[code_length] >= 320 { return false }
-            table.*.symbols[offsets[code_length]] = @intCast(u32, symbol)
-            offsets[code_length] += 1
-        }
-        symbol += 1
-    }
-    return true
-}
-
-fn decodeSymbol(inflater: *Inflater, table: *const Huffman) -> i32 {
-    var code: i32 = 0
-    var first: i32 = 0
-    var index: i32 = 0
-    var length: usize = 1
-    while length <= 15 {
-        code = code | @intCast(i32, bits(inflater, 1))
-        if inflater.*.failed { return -1 }
-        const count = @intCast(i32, table.*.counts[length])
-        if code < first + count {
-            const at = index + code - first
-            if at < 0 || at >= 320 { return -1 }
-            return @intCast(i32, table.*.symbols[@intCast(usize, at)])
-        }
-        index += count
-        first = (first + count) * 2
-        code = code * 2
-        length += 1
-    }
-    return -1
-}
-
-fn put(inflater: *Inflater, byte: u8) -> bool {
-    if inflater.*.outputLength >= inflater.*.outputCapacity { return false }
-    inflater.*.output[inflater.*.outputLength] = byte
-    inflater.*.outputLength += 1
-    return true
-}
-
-fn lengthBase(symbol: u32) -> u32 {
-    if symbol < 8 { return symbol + 3 }
-    if symbol == 28 { return 258 }
-    const extra = (symbol - 4) / 4
-    return ((4 + (symbol - 4) % 4) << extra) + 3
-}
-
-fn lengthExtra(symbol: u32) -> u32 {
-    if symbol < 8 || symbol == 28 { return 0 }
-    return (symbol - 4) / 4
-}
-
-fn distanceBase(symbol: u32) -> u32 {
-    if symbol < 4 { return symbol + 1 }
-    const extra = (symbol - 2) / 2
-    return ((2 + symbol % 2) << extra) + 1
-}
-
-fn distanceExtra(symbol: u32) -> u32 {
-    if symbol < 4 { return 0 }
-    return (symbol - 2) / 2
-}
-
-fn codes(inflater: *Inflater, lengths: *const Huffman, distances: *const Huffman) -> bool {
-    while true {
-        const symbol = decodeSymbol(inflater, lengths)
-        if symbol < 0 { return false }
-        if symbol < 256 {
-            if !put(inflater, @intCast(u8, symbol)) { return false }
-        } else if symbol == 256 {
-            return true
-        } else {
-            const length_symbol = @intCast(u32, symbol - 257)
-            if length_symbol >= 29 { return false }
-            const length = lengthBase(length_symbol) + bits(inflater, lengthExtra(length_symbol))
-            const distance_symbol = decodeSymbol(inflater, distances)
-            if distance_symbol < 0 || distance_symbol >= 30 { return false }
-            const distance = distanceBase(@intCast(u32, distance_symbol)) + bits(inflater, distanceExtra(@intCast(u32, distance_symbol)))
-            if inflater.*.failed || @intCast(usize, distance) > inflater.*.outputLength { return false }
-            var copied: u32 = 0
-            while copied < length {
-                if !put(inflater, inflater.*.output[inflater.*.outputLength - @intCast(usize, distance)]) { return false }
-                copied += 1
-            }
-        }
-    }
-    return false
-}
-
-fn stored(inflater: *Inflater) -> bool {
-    inflater.*.bits = 0
-    inflater.*.bitCount = 0
-    if inflater.*.position + 4 > inflater.*.inputLength { return false }
-    const low = @intCast(usize, inflater.*.input[inflater.*.position]) | (@intCast(usize, inflater.*.input[inflater.*.position + 1]) << 8)
-    const check = @intCast(usize, inflater.*.input[inflater.*.position + 2]) | (@intCast(usize, inflater.*.input[inflater.*.position + 3]) << 8)
-    if low != (check ^ 65535) { return false }
-    inflater.*.position += 4
-    if inflater.*.position + low > inflater.*.inputLength { return false }
-    var index: usize = 0
-    while index < low {
-        if !put(inflater, inflater.*.input[inflater.*.position + index]) { return false }
-        index += 1
-    }
-    inflater.*.position += low
-    return true
-}
-
-fn fixedTables(lengths: *Huffman, distances: *Huffman) -> bool {
-    var code_lengths: [288]u32 = undefined
-    var symbol: usize = 0
-    while symbol < 288 {
-        code_lengths[symbol] = if symbol < 144 { 8 } else if symbol < 256 { 9 } else if symbol < 280 { 7 } else { 8 }
-        symbol += 1
-    }
-    var ok = false
-    ok = construct(lengths, &code_lengths, 288)
-    symbol = 0
-    while symbol < 30 {
-        code_lengths[symbol] = 5
-        symbol += 1
-    }
-    var distance_ok = false
-    distance_ok = construct(distances, &code_lengths, 30)
-    return ok && distance_ok
-}
-
-fn codeLengthOrder(index: usize) -> usize {
-    return match index {
-        0 => 16, 1 => 17, 2 => 18, 3 => 0, 4 => 8, 5 => 7, 6 => 9, 7 => 6, 8 => 10, 9 => 5,
-        10 => 11, 11 => 4, 12 => 12, 13 => 3, 14 => 13, 15 => 2, 16 => 14, 17 => 1,
-        else => 15
-    }
-}
-
-fn dynamicTables(inflater: *Inflater, lengths: *Huffman, distances: *Huffman) -> bool {
-    const literal_count = @intCast(usize, bits(inflater, 5)) + 257
-    const distance_count = @intCast(usize, bits(inflater, 5)) + 1
-    const code_count = @intCast(usize, bits(inflater, 4)) + 4
-    if inflater.*.failed || literal_count > 286 || distance_count > 30 { return false }
-    var code_lengths: [320]u32 = undefined
-    var index: usize = 0
-    while index < 19 {
-        code_lengths[index] = 0
-        index += 1
-    }
-    index = 0
-    while index < code_count {
-        code_lengths[codeLengthOrder(index)] = bits(inflater, 3)
-        index += 1
-    }
-    var code_table: Huffman = undefined
-    var built = false
-    built = construct(&code_table, &code_lengths, 19)
-    if !built || inflater.*.failed { return false }
-    index = 0
-    while index < literal_count + distance_count {
-        const symbol = decodeSymbol(inflater, &code_table)
-        if symbol < 0 { return false }
-        if symbol < 16 {
-            code_lengths[index] = @intCast(u32, symbol)
-            index += 1
-        } else {
-            var length: u32 = 0
-            var repeat: usize = 0
-            if symbol == 16 {
-                if index == 0 { return false }
-                length = code_lengths[index - 1]
-                repeat = 3 + @intCast(usize, bits(inflater, 2))
-            } else if symbol == 17 {
-                repeat = 3 + @intCast(usize, bits(inflater, 3))
-            } else {
-                repeat = 11 + @intCast(usize, bits(inflater, 7))
-            }
-            if index + repeat > literal_count + distance_count { return false }
-            while repeat > 0 {
-                code_lengths[index] = length
-                index += 1
-                repeat -= 1
-            }
-        }
-    }
-    if code_lengths[256] == 0 { return false }
-    var ok = false
-    var distance_ok = false
-    unsafe {
-        ok = construct(lengths, &code_lengths, literal_count)
-        distance_ok = construct(distances, @ptrFromInt([*]const u32, @intFromPtr(&code_lengths) + literal_count * 4), distance_count)
-    }
-    return ok && distance_ok
-}
-
-// Inflates a raw deflate stream into `output` (exactly `capacity` bytes are
-// expected); false when it is damaged or does not fit.
-fn inflate(input: [*]const u8, length: usize, output: [*]u8, capacity: usize) -> usize {
-    var inflater: Inflater = undefined
-    inflater.input = input
-    inflater.inputLength = length
-    inflater.position = 0
-    inflater.bits = 0
-    inflater.bitCount = 0
-    inflater.output = output
-    inflater.outputLength = 0
-    inflater.outputCapacity = capacity
-    inflater.failed = false
-    var lengths: Huffman = undefined
-    var distances: Huffman = undefined
-    var last: u32 = 0
-    while last == 0 {
-        last = bits(&inflater, 1)
-        const kind = bits(&inflater, 2)
-        if inflater.failed { return 0 }
-        var ok = false
-        if kind == 0 {
-            ok = stored(&inflater)
-        } else if kind == 1 {
-            ok = fixedTables(&lengths, &distances) && codes(&inflater, &lengths, &distances)
-        } else if kind == 2 {
-            ok = dynamicTables(&inflater, &lengths, &distances) && codes(&inflater, &lengths, &distances)
-        }
-        if !ok || inflater.failed { return 0 }
-    }
-    return inflater.outputLength
-}
-
-// ---------------------------------------------------------------------------
-// PNG
-
-fn load32(data: [*]const u8, at: usize) -> u32 {
-    return (@intCast(u32, data[at]) << 24) | (@intCast(u32, data[at + 1]) << 16) | (@intCast(u32, data[at + 2]) << 8) | @intCast(u32, data[at + 3])
-}
-
-fn isChunk(data: [*]const u8, at: usize, a: u8, b: u8, c: u8, d: u8) -> bool {
-    return data[at] == a && data[at + 1] == b && data[at + 2] == c && data[at + 3] == d
-}
-
-fn channelsOf(color_type: u8) -> usize {
-    if color_type == 0 || color_type == 3 { return 1 }
-    if color_type == 4 { return 2 }
-    if color_type == 2 { return 3 }
-    return 4
-}
-
-fn validDepth(color_type: u8, depth: u8) -> bool {
-    if color_type == 0 { return depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16 }
-    if color_type == 3 { return depth == 1 || depth == 2 || depth == 4 || depth == 8 }
-    if color_type == 2 || color_type == 4 || color_type == 6 { return depth == 8 || depth == 16 }
-    return false
-}
+// Decoding: std.png.read reads the file (as libpng does, with the same
+// checks), std.png.rows undoes the filters and makes each row 8-bit RGBA:
+// palettes and transparency expanded, grey made RGB, 16-bit samples cut
+// to their high byte. Interlaced (Adam7) rows go straight to their
+// places. An APNG gives its default image.
 
 fn paeth(left: u8, up: u8, corner: u8) -> u8 {
     const a = @intCast(i32, left)
@@ -404,55 +98,196 @@ fn paeth(left: u8, up: u8, corner: u8) -> u8 {
     return corner
 }
 
-// Undoes the row filters in place; rows are 1 + `row_bytes` long (the
-// filter type first).
-fn unfilter(data: [*]u8, height: usize, row_bytes: usize, pixel_bytes: usize) -> bool {
-    var row: usize = 0
-    while row < height {
-        const start = row * (row_bytes + 1)
-        const filter = data[start]
-        const line = start + 1
-        const previous = if row > 0 { line - row_bytes - 1 } else { 0 }
-        if filter > 4 { return false }
-        var column: usize = 0
-        while column < row_bytes {
-            const left = if column >= pixel_bytes { data[line + column - pixel_bytes] } else { 0 }
-            const up = if row > 0 { data[previous + column] } else { 0 }
-            const corner = if row > 0 && column >= pixel_bytes { data[previous + column - pixel_bytes] } else { 0 }
-            const raw = data[line + column]
-            var value = raw
-            if filter == 1 { value = raw +% left }
-            if filter == 2 { value = raw +% up }
-            if filter == 3 { value = raw +% @intCast(u8, (@intCast(u32, left) + @intCast(u32, up)) / 2) }
-            if filter == 4 { value = raw +% paeth(left, up, corner) }
-            data[line + column] = value
-            column += 1
+// An image as 8-bit RGBA, not premultiplied: 4 bytes a pixel, `width`
+// pixels a row.
+pub const Picture = struct {
+    pixels: [*]u8
+    width: usize
+    height: usize
+    allocator: Allocator
+}
+
+pub fn deinitPicture(picture: *Picture) -> void {
+    if picture.*.width * picture.*.height == 0 { return }
+    picture.*.allocator.free(picture.*.pixels, picture.*.width * picture.*.height * 4, 16)
+    picture.*.width = 0
+    picture.*.height = 0
+}
+
+// The state of a decoding (on the heap: the reader is large).
+const Decoding = struct {
+    reader: read.Reader
+    info: read.Info
+    rowBuffer: usize
+    previous: usize
+    rowCapacity: usize
+    pixels: usize
+    pass: usize
+    row: usize
+    passRows: usize
+    passWidth: usize
+    complete: bool
+}
+
+// The first pass from FIRST on with pixels, or 7.
+fn firstPass(width: usize, height: usize, first: usize) -> usize {
+    var pass = first
+    while pass < 7 {
+        if rows.passWidth(pass, width) != 0 && rows.passHeight(pass, height) != 0 { return pass }
+        pass += 1
+    }
+    return 7
+}
+
+// Sets the reader up for the rows of the current pass.
+fn startPass(d: *Decoding) -> void {
+    const info = &d.*.info
+    if info.*.interlace == 0 {
+        d.*.passWidth = info.*.width
+        d.*.passRows = info.*.height
+    } else {
+        d.*.passWidth = rows.passWidth(d.*.pass, info.*.width)
+        d.*.passRows = rows.passHeight(d.*.pass, info.*.height)
+    }
+    d.*.row = 0
+    zs.zero(d.*.previous, d.*.rowCapacity)
+    d.*.reader.rowSize = rows.rowBytes(info.*.pixelDepth, d.*.passWidth) + 1
+}
+
+fn startImage(d: *Decoding, allocator: Allocator) -> Status {
+    const info = &d.*.info
+    if info.*.width > 16384 || info.*.height > 16384 { return Status.unsupported }
+    // A row at its widest: 8 bytes a pixel, rounded up to 8 pixels.
+    d.*.rowCapacity = ((info.*.width + 7) & ~@intCast(usize, 7)) * 8 + 64
+    const total = d.*.rowCapacity * 2 + info.*.width * info.*.height * 4
+    const memory = allocator.alloc(total, 16)
+    if memory == null { return Status.noMemory }
+    const base = @intFromPtr(memory.?)
+    zs.zero(base, total)
+    d.*.rowBuffer = base
+    d.*.previous = base + d.*.rowCapacity
+    d.*.pixels = base + d.*.rowCapacity * 2
+    d.*.reader.rowBuffer = d.*.rowBuffer
+    d.*.pass = 0
+    if info.*.interlace != 0 { d.*.pass = firstPass(info.*.width, info.*.height, 0) }
+    startPass(d)
+    return Status.ok
+}
+
+// A row inflated: the filter undone, the row made RGBA, put in place.
+fn takeRow(d: *Decoding) -> bool {
+    const info = &d.*.info
+    const bytes = rows.rowBytes(info.*.pixelDepth, d.*.passWidth)
+    const filter = @intCast(usize, zs.get8(d.*.rowBuffer))
+    if filter > 4 { return false }
+    var pixelBytes = info.*.pixelDepth >> 3
+    if pixelBytes == 0 { pixelBytes = 1 }
+    rows.unfilter(filter, d.*.rowBuffer + 1, d.*.previous + 1, bytes, pixelBytes)
+    zs.copy(d.*.previous, d.*.rowBuffer, bytes + 1)
+    var row: rows.RowInfo = undefined
+    row.width = d.*.passWidth
+    row.rowBytes = bytes
+    row.colorType = info.*.colorType
+    row.bitDepth = info.*.bitDepth
+    row.channels = info.*.channels
+    row.pixelDepth = info.*.pixelDepth
+    const line = d.*.rowBuffer + 1
+    if row.colorType == 3 {
+        rows.expandPalette(&row, line, @intFromPtr(&info.*.palette), @intFromPtr(&info.*.transAlpha), info.*.numTrans)
+    } else {
+        rows.expand(&row, line, info.*.numTrans != 0, info.*.transGray, info.*.transRed, info.*.transGreen, info.*.transBlue)
+    }
+    rows.chop16(&row, line)
+    rows.grayToRgb(&row, line)
+    if row.channels == 3 { rows.filler(&row, line, 255, true) }
+    // Where the row's pixels go.
+    var y = d.*.row
+    var x0: usize = 0
+    var step: usize = 1
+    if info.*.interlace != 0 {
+        y = rows.passStartRow(d.*.pass) + d.*.row * rows.passRowStep(d.*.pass)
+        x0 = rows.passStartColumn(d.*.pass)
+        step = rows.passColumnStep(d.*.pass)
+    }
+    var index: usize = 0
+    while index < d.*.passWidth {
+        zs.copy(d.*.pixels + (y * info.*.width + x0 + index * step) * 4, line + index * 4, 4)
+        index += 1
+    }
+    d.*.row += 1
+    if d.*.row >= d.*.passRows {
+        if info.*.interlace != 0 { d.*.pass = firstPass(info.*.width, info.*.height, d.*.pass + 1) } else { d.*.pass = 7 }
+        if d.*.pass >= 7 {
+            d.*.complete = true
+            d.*.reader.imageComplete = true
+        } else {
+            startPass(d)
         }
-        row += 1
     }
     return true
 }
 
-// Sample `index` (a channel value scaled to 0..255) of a row.
-fn sample(line: [*]const u8, index: usize, depth: u8) -> u32 {
-    if depth == 8 { return @intCast(u32, line[index]) }
-    if depth == 16 { return @intCast(u32, line[index * 2]) }
-    const per_byte = 8 / @intCast(usize, depth)
-    const byte = line[index / per_byte]
-    const shift = @intCast(u32, 8 - @intCast(usize, depth) * (index % per_byte + 1))
-    const mask = (@intCast(u32, 1) << @intCast(u32, depth)) - 1
-    const value = (@intCast(u32, byte) >> shift) & mask
-    return value * 255 / mask
-}
-
-// The raw index into the palette (bit depths below 8 are not scaled).
-fn paletteIndex(line: [*]const u8, index: usize, depth: u8) -> usize {
-    if depth == 8 { return @intCast(usize, line[index]) }
-    const per_byte = 8 / @intCast(usize, depth)
-    const byte = line[index / per_byte]
-    const shift = @intCast(u32, 8 - @intCast(usize, depth) * (index % per_byte + 1))
-    const mask = (@intCast(u32, 1) << @intCast(u32, depth)) - 1
-    return @intCast(usize, (@intCast(u32, byte) >> shift) & mask)
+// Decodes a PNG held in memory into 8-bit RGBA.
+pub fn decodeRgba(picture: *Picture, data: [*]const u8, length: usize, allocator: Allocator) -> Status {
+    picture.*.width = 0
+    picture.*.height = 0
+    picture.*.allocator = allocator
+    if length < 8 { return Status.notPng }
+    const signature = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }
+    var index: usize = 0
+    while index < 8 {
+        if data[index] != signature[index] { return Status.notPng }
+        index += 1
+    }
+    const memory = allocator.alloc(@sizeOf(Decoding), 16)
+    if memory == null { return Status.noMemory }
+    const d: *Decoding = unsafe { @ptrCast(*Decoding, memory.?) }
+    read.init(&d.*.reader, &d.*.info, allocator)
+    d.*.rowBuffer = 0
+    d.*.complete = false
+    read.give(&d.*.reader, @intFromPtr(data), length)
+    var status = Status.corrupt
+    var ended = false
+    while true {
+        const event = read.next(&d.*.reader)
+        if event == read.Event.more || event == read.Event.failed { break }
+        if event == read.Event.info {
+            status = startImage(d, allocator)
+            if status != Status.ok { break }
+            status = Status.corrupt
+        } else if event == read.Event.row {
+            if !takeRow(d) { break }
+        } else if event == read.Event.unknown {
+            // An unknown critical chunk cannot be passed over.
+            if d.*.reader.chunkName & 0x20000000 == 0 { break }
+        } else if event == read.Event.end {
+            ended = true
+            break
+        }
+    }
+    if ended && d.*.complete { status = Status.ok }
+    const info = &d.*.info
+    const width = info.*.width
+    const height = info.*.height
+    if d.*.rowBuffer != 0 {
+        const total = d.*.rowCapacity * 2 + width * height * 4
+        if status == Status.ok {
+            // The pixels move to memory of their own.
+            const pixels = allocator.alloc(width * height * 4, 16)
+            if pixels == null {
+                status = Status.noMemory
+            } else {
+                zs.copy(@intFromPtr(pixels.?), d.*.pixels, width * height * 4)
+                picture.*.pixels = pixels.?
+                picture.*.width = width
+                picture.*.height = height
+            }
+        }
+        allocator.free(zs.bytes(d.*.rowBuffer), total, 16)
+    }
+    read.deinit(&d.*.reader)
+    allocator.free(memory.?, @sizeOf(Decoding), 16)
+    return status
 }
 
 fn premultiply(alpha: u32, red: u32, green: u32, blue: u32) -> u32 {
@@ -463,139 +298,30 @@ fn premultiply(alpha: u32, red: u32, green: u32, blue: u32) -> u32 {
     return (alpha << 24) | (r << 16) | (g << 8) | b
 }
 
-// Decodes a PNG held in memory.
+// Decodes a PNG held in memory into premultiplied ARGB words.
 pub fn decode(image: *Image, data: [*]const u8, length: usize, allocator: Allocator) -> Status {
     image.*.width = 0
     image.*.height = 0
     image.*.allocator = allocator
-    if length < 33 { return Status.notPng }
-    if data[0] != 137 || data[1] != 80 || data[2] != 78 || data[3] != 71 || data[4] != 13 || data[5] != 10 || data[6] != 26 || data[7] != 10 { return Status.notPng }
-    if !isChunk(data, 12, 73, 72, 68, 82) || load32(data, 8) != 13 { return Status.corrupt }
-    const width = @intCast(usize, load32(data, 16))
-    const height = @intCast(usize, load32(data, 20))
-    const depth = data[24]
-    const color_type = data[25]
-    if data[26] != 0 || data[27] != 0 { return Status.unsupported }
-    if data[28] != 0 { return Status.unsupported }
-    if width == 0 || height == 0 || width > 16384 || height > 16384 { return Status.unsupported }
-    if !validDepth(color_type, depth) { return Status.corrupt }
-    const channels = channelsOf(color_type)
-    const bits_per_pixel = channels * @intCast(usize, depth)
-    const row_bytes = (width * bits_per_pixel + 7) / 8
-    const pixel_bytes = if bits_per_pixel < 8 { 1 } else { bits_per_pixel / 8 }
-
-    // The chunks: the palette, its transparency, and the image data (all
-    // IDAT chunks, gathered in order).
-    var palette: [768]u8 = undefined
-    var alphas: [256]u8 = undefined
+    var picture: Picture = undefined
+    const status = decodeRgba(&picture, data, length, allocator)
+    if status != Status.ok { return status }
+    const count = picture.width * picture.height
+    // The words take the place of the bytes, one for four.
+    const words: [*]u32 = unsafe { @ptrCast([*]u32, picture.pixels) }
     var index: usize = 0
-    while index < 256 {
-        alphas[index] = 255
+    while index < count {
+        const at = index * 4
+        const red = @intCast(u32, picture.pixels[at])
+        const green = @intCast(u32, picture.pixels[at + 1])
+        const blue = @intCast(u32, picture.pixels[at + 2])
+        const alpha = @intCast(u32, picture.pixels[at + 3])
+        words[index] = premultiply(alpha, red, green, blue)
         index += 1
     }
-    var palette_count: usize = 0
-    var compressed_length: usize = 0
-    var at: usize = 8
-    while at + 12 <= length {
-        const size = @intCast(usize, load32(data, at))
-        if at + 12 + size > length { return Status.corrupt }
-        if isChunk(data, at + 4, 73, 68, 65, 84) { compressed_length += size }
-        if isChunk(data, at + 4, 80, 76, 84, 69) {
-            if size % 3 != 0 || size > 768 { return Status.corrupt }
-            palette_count = size / 3
-            index = 0
-            while index < size {
-                palette[index] = data[at + 8 + index]
-                index += 1
-            }
-        }
-        if isChunk(data, at + 4, 116, 82, 78, 83) && color_type == 3 {
-            index = 0
-            while index < size && index < 256 {
-                alphas[index] = data[at + 8 + index]
-                index += 1
-            }
-        }
-        if isChunk(data, at + 4, 73, 69, 78, 68) { break }
-        at += 12 + size
-    }
-    if compressed_length < 6 { return Status.corrupt }
-    if color_type == 3 && palette_count == 0 { return Status.corrupt }
-    const compressed_memory = allocator.alloc(compressed_length, 16)
-    if compressed_memory == null { return Status.noMemory }
-    const compressed = compressed_memory.?
-    var filled: usize = 0
-    at = 8
-    while at + 12 <= length {
-        const size = @intCast(usize, load32(data, at))
-        if isChunk(data, at + 4, 73, 68, 65, 84) {
-            index = 0
-            while index < size {
-                compressed[filled + index] = data[at + 8 + index]
-                index += 1
-            }
-            filled += size
-        }
-        if isChunk(data, at + 4, 73, 69, 78, 68) { break }
-        at += 12 + size
-    }
-    // zlib: deflate (method 8), no preset dictionary.
-    if compressed[0] & 15 != 8 || compressed[1] & 32 != 0 || ((@intCast(u32, compressed[0]) << 8) | @intCast(u32, compressed[1])) % 31 != 0 {
-        allocator.free(compressed, compressed_length, 16)
-        return Status.corrupt
-    }
-    const raw_length = height * (row_bytes + 1)
-    const raw_memory = allocator.alloc(raw_length, 16)
-    if raw_memory == null {
-        allocator.free(compressed, compressed_length, 16)
-        return Status.noMemory
-    }
-    const raw = raw_memory.?
-    const stream: [*]const u8 = compressed + 2
-    const inflated = inflate(stream, compressed_length - 2, raw, raw_length)
-    allocator.free(compressed, compressed_length, 16)
-    if inflated != raw_length || !unfilter(raw, height, row_bytes, pixel_bytes) {
-        allocator.free(raw, raw_length, 16)
-        return Status.corrupt
-    }
-
-    const pixel_memory = allocator.alloc(width * height * 4, 16)
-    if pixel_memory == null {
-        allocator.free(raw, raw_length, 16)
-        return Status.noMemory
-    }
-    const pixels: [*]u32 = unsafe { @ptrCast([*]u32, pixel_memory.?) }
-    var row: usize = 0
-    while row < height {
-        const line: [*]const u8 = raw + row * (row_bytes + 1) + 1
-        var column: usize = 0
-        while column < width {
-            var color: u32 = 0
-            if color_type == 0 {
-                const grey = sample(line, column, depth)
-                color = premultiply(255, grey, grey, grey)
-            } else if color_type == 2 {
-                color = premultiply(255, sample(line, column * 3, depth), sample(line, column * 3 + 1, depth), sample(line, column * 3 + 2, depth))
-            } else if color_type == 3 {
-                const entry = paletteIndex(line, column, depth)
-                if entry < palette_count {
-                    color = premultiply(@intCast(u32, alphas[entry]), @intCast(u32, palette[entry * 3]), @intCast(u32, palette[entry * 3 + 1]), @intCast(u32, palette[entry * 3 + 2]))
-                }
-            } else if color_type == 4 {
-                const grey = sample(line, column * 2, depth)
-                color = premultiply(sample(line, column * 2 + 1, depth), grey, grey, grey)
-            } else {
-                color = premultiply(sample(line, column * 4 + 3, depth), sample(line, column * 4, depth), sample(line, column * 4 + 1, depth), sample(line, column * 4 + 2, depth))
-            }
-            pixels[row * width + column] = color
-            column += 1
-        }
-        row += 1
-    }
-    allocator.free(raw, raw_length, 16)
-    image.*.pixels = pixels
-    image.*.width = width
-    image.*.height = height
+    image.*.pixels = words
+    image.*.width = picture.width
+    image.*.height = picture.height
     return Status.ok
 }
 
@@ -654,159 +380,19 @@ pub fn scale(target: *Image, source: *const Image, width: usize, height: usize, 
 // ---------------------------------------------------------------------------
 // Encoding: saveFile writes premultiplied 0xAARRGGBB words as an 8-bit RGBA
 // (or, opaque, RGB) PNG: each row filtered with the filter that leaves the
-// smallest differences, deflated with fixed Huffman codes and LZ77 matches
-// (hash chains over a 32 KiB window).
-
-const Deflater = struct {
-    output: [*]u8
-    length: usize
-    capacity: usize
-    value: u64
-    count: u32
-}
-
-fn putBits(deflater: *Deflater, value: u32, count: u32) -> void {
-    deflater.*.value = deflater.*.value | (@intCast(u64, value) << @intCast(u64, deflater.*.count))
-    deflater.*.count += count
-    while deflater.*.count >= 8 {
-        if deflater.*.length < deflater.*.capacity {
-            deflater.*.output[deflater.*.length] = @intCast(u8, deflater.*.value & 255)
-            deflater.*.length += 1
-        }
-        deflater.*.value = deflater.*.value >> 8
-        deflater.*.count -= 8
-    }
-}
-
-// A Huffman code (most significant bit first in the stream).
-fn putCode(deflater: *Deflater, code: u32, length: u32) -> void {
-    var reversed: u32 = 0
-    var index: u32 = 0
-    while index < length {
-        reversed = (reversed << 1) | ((code >> index) & 1)
-        index += 1
-    }
-    putBits(deflater, reversed, length)
-}
-
-// A literal/length symbol in the fixed code.
-fn putSymbol(deflater: *Deflater, symbol: u32) -> void {
-    if symbol < 144 {
-        putCode(deflater, 48 + symbol, 8)
-    } else if symbol < 256 {
-        putCode(deflater, 400 + symbol - 144, 9)
-    } else if symbol < 280 {
-        putCode(deflater, symbol - 256, 7)
-    } else {
-        putCode(deflater, 192 + symbol - 280, 8)
-    }
-}
-
-fn putMatch(deflater: *Deflater, length: u32, distance: u32) -> void {
-    var symbol: u32 = 28
-    while lengthBase(symbol) > length { symbol -= 1 }
-    putSymbol(deflater, 257 + symbol)
-    putBits(deflater, length - lengthBase(symbol), lengthExtra(symbol))
-    var code: u32 = 29
-    while distanceBase(code) > distance { code -= 1 }
-    putCode(deflater, code, 5)
-    putBits(deflater, distance - distanceBase(code), distanceExtra(code))
-}
-
-const HASH_SIZE: usize = 65536
-const WINDOW: usize = 32768
-const CHAIN: u32 = 12
-
-fn hashAt(data: [*]const u8, at: usize) -> usize {
-    const value = (@intCast(usize, data[at]) << 16) | (@intCast(usize, data[at + 1]) << 8) | @intCast(usize, data[at + 2])
-    return ((value *% 2654435761) >> 8) & (HASH_SIZE - 1)
-}
-
-// One final fixed-Huffman block of `data`. `head` (HASH_SIZE) and `previous`
-// (WINDOW) hold positions plus one (0: none).
-fn deflateFixed(deflater: *Deflater, data: [*]const u8, length: usize, head: [*]u32, previous: [*]u32) -> void {
-    var index: usize = 0
-    while index < HASH_SIZE {
-        head[index] = 0
-        index += 1
-    }
-    putBits(deflater, 1, 1)
-    putBits(deflater, 1, 2)
-    var at: usize = 0
-    while at < length {
-        var best_length: usize = 0
-        var best_distance: usize = 0
-        if at + 3 <= length {
-            const hash = hashAt(data, at)
-            var candidate = @intCast(usize, head[hash])
-            var tries: u32 = 0
-            const most = if length - at < 258 { length - at } else { 258 }
-            while candidate != 0 && tries < CHAIN {
-                const from = candidate - 1
-                if at - from > WINDOW - 1 { break }
-                var matched: usize = 0
-                while matched < most && data[from + matched] == data[at + matched] { matched += 1 }
-                if matched > best_length {
-                    best_length = matched
-                    best_distance = at - from
-                    if matched == most { break }
-                }
-                candidate = @intCast(usize, previous[from % WINDOW])
-                tries += 1
-            }
-        }
-        var step: usize = 1
-        if best_length >= 3 {
-            putMatch(deflater, @intCast(u32, best_length), @intCast(u32, best_distance))
-            step = best_length
-        } else {
-            putSymbol(deflater, @intCast(u32, data[at]))
-        }
-        var inserted: usize = 0
-        while inserted < step {
-            const position = at + inserted
-            if position + 3 <= length {
-                const hash = hashAt(data, position)
-                previous[position % WINDOW] = head[hash]
-                head[hash] = @intCast(u32, position + 1)
-            }
-            inserted += 1
-        }
-        at += step
-    }
-    putSymbol(deflater, 256)
-    if deflater.*.count > 0 { putBits(deflater, 0, 8 - deflater.*.count) }
-}
-
-fn crcUpdate(table: [*]const u32, crc: u32, data: [*]const u8, length: usize) -> u32 {
-    var value = crc
-    var index: usize = 0
-    while index < length {
-        value = table[@intCast(usize, (value ^ @intCast(u32, data[index])) & 255)] ^ (value >> 8)
-        index += 1
-    }
-    return value
-}
-
-fn store32(target: [*]u8, at: usize, value: u32) -> void {
-    target[at] = @intCast(u8, value >> 24)
-    target[at + 1] = @intCast(u8, (value >> 16) & 255)
-    target[at + 2] = @intCast(u8, (value >> 8) & 255)
-    target[at + 3] = @intCast(u8, value & 255)
-}
+// smallest differences, compressed by std.flate (zlib's level 6).
 
 // A chunk: its length, type, data (already at `at` + 8) and CRC; returns
 // where the next one starts.
-fn sealChunk(file: [*]u8, at: usize, kind: []const u8, length: usize, table: [*]const u32) -> usize {
-    store32(file, at, @intCast(u32, length))
+fn sealChunk(file: [*]u8, at: usize, kind: []const u8, length: usize) -> usize {
+    std.mem.writeU32Big(file, at, @intCast(u32, length))
     var index: usize = 0
     while index < 4 {
         file[at + 4 + index] = kind[index]
         index += 1
     }
     const start: [*]const u8 = file + at + 4
-    const crc = crcUpdate(table, 4294967295, start, length + 4) ^ 4294967295
-    store32(file, at + 8 + length, crc)
+    std.mem.writeU32Big(file, at + 8 + length, crc.crc32(0, start, length + 4))
     return at + 12 + length
 }
 
@@ -842,31 +428,21 @@ pub fn saveFile(path: [*]const u8, pixels: [*]const u32, width: usize, height: u
     const row_bytes = width * pixel_bytes
     const raw_length = height * row_bytes
     const filtered_length = height * (row_bytes + 1)
-    // Worst case of fixed codes: 9 bits a byte.
-    const deflate_capacity = filtered_length + filtered_length / 8 + 64
+    const deflate_capacity = flate.compressBound(filtered_length, flate.Format.zlib)
     const file_capacity = deflate_capacity + 128
-    const table_bytes: usize = 1024
-    const head_bytes = HASH_SIZE * 4
-    const previous_bytes = WINDOW * 4
-    const total = raw_length + filtered_length + file_capacity + table_bytes + head_bytes + previous_bytes + row_bytes
+    const total = raw_length + filtered_length + file_capacity + row_bytes
     const memory = allocator.alloc(total, 16)
     if memory == null { return false }
     const base = memory.?
     var raw: [*]u8 = undefined
     var filtered: [*]u8 = undefined
     var file: [*]u8 = undefined
-    var table: [*]u32 = undefined
-    var head: [*]u32 = undefined
-    var previous: [*]u32 = undefined
     var scratch: [*]u8 = undefined
     unsafe {
         raw = base
         filtered = base + raw_length
-        table = @ptrFromInt([*]u32, @intFromPtr(base) + raw_length + filtered_length)
-        head = @ptrFromInt([*]u32, @intFromPtr(base) + raw_length + filtered_length + table_bytes)
-        previous = @ptrFromInt([*]u32, @intFromPtr(base) + raw_length + filtered_length + table_bytes + head_bytes)
-        scratch = base + raw_length + filtered_length + table_bytes + head_bytes + previous_bytes
-        file = base + raw_length + filtered_length + table_bytes + head_bytes + previous_bytes + row_bytes
+        scratch = base + raw_length + filtered_length
+        file = base + raw_length + filtered_length + row_bytes
     }
     // Straight (not premultiplied) RGB(A) bytes.
     var y: usize = 0
@@ -917,18 +493,6 @@ pub fn saveFile(path: [*]const u8, pixels: [*]const u32, width: usize, height: u
         _ = filterRow(raw, y, row_bytes, pixel_bytes, best_filter, target)
         y += 1
     }
-    // CRC-32 table.
-    var entry: u32 = 0
-    while entry < 256 {
-        var value = entry
-        var bit: u32 = 0
-        while bit < 8 {
-            value = if value & 1 != 0 { 3988292384 ^ (value >> 1) } else { value >> 1 }
-            bit += 1
-        }
-        table[@intCast(usize, entry)] = value
-        entry += 1
-    }
     // Signature, IHDR.
     const signature = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 }
     var at: usize = 0
@@ -936,32 +500,23 @@ pub fn saveFile(path: [*]const u8, pixels: [*]const u32, width: usize, height: u
         file[at] = signature[at]
         at += 1
     }
-    store32(file, 16, @intCast(u32, width))
-    store32(file, 20, @intCast(u32, height))
+    std.mem.writeU32Big(file, 16, @intCast(u32, width))
+    std.mem.writeU32Big(file, 20, @intCast(u32, height))
     file[24] = 8
     file[25] = if alpha { 6 } else { 2 }
     file[26] = 0
     file[27] = 0
     file[28] = 0
-    at = sealChunk(file, 8, "IHDR", 13, table)
-    // IDAT: zlib (deflate, 32 KiB window, no dictionary) and its Adler-32.
+    at = sealChunk(file, 8, "IHDR", 13)
+    // IDAT: a zlib stream.
     const data_start = at + 8
-    file[data_start] = 120
-    file[data_start + 1] = 1
-    var deflater = Deflater.{ .output = file, .length = data_start + 2, .capacity = data_start + 2 + deflate_capacity, .value = 0, .count = 0 }
-    deflateFixed(&deflater, filtered, filtered_length, head, previous)
-    var low: u32 = 1
-    var high: u32 = 0
-    var index: usize = 0
-    while index < filtered_length {
-        low = (low + @intCast(u32, filtered[index])) % 65521
-        high = (high + low) % 65521
-        index += 1
+    const data_length = flate.compress(filtered, filtered_length, file + data_start, deflate_capacity, 6, flate.Format.zlib, allocator)
+    if data_length == 0 {
+        allocator.free(base, total, 16)
+        return false
     }
-    store32(file, deflater.length, (high << 16) | low)
-    const data_length = deflater.length + 4 - data_start
-    at = sealChunk(file, at, "IDAT", data_length, table)
-    at = sealChunk(file, at, "IEND", 0, table)
+    at = sealChunk(file, at, "IDAT", data_length)
+    at = sealChunk(file, at, "IEND", 0)
     const output = fs.open(path, fs.WRITE_ONLY | fs.CREATE | fs.TRUNCATE, 420)
     var written = false
     if fs.isValid(output) {

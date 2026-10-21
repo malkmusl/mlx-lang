@@ -1,0 +1,518 @@
+// What the parts of mlx-libjpeg share: the state behind a compressor or
+// decompressor object (found from its `mem`, the memory manager, which
+// is the state's first field), libjpeg's memory manager with its two
+// pools (memory for the object's life and for the image's), and the
+// error manager: jpeg_std_error's functions, the messages they format,
+// and how an error or warning reaches the application's functions.
+//
+// An error leaves the library by the application's error_exit, which
+// longjmps (WebKit's and Skia's do): the frames of Mlx between are
+// dropped (the library is built with --stack-arena, so their arenas are
+// on the stack the longjmp gives back), and nothing a later call needs is
+// kept in them: whatever is allocated hangs off the state, which
+// jpeg_destroy frees.
+const zs = @import("std.flate.stream")
+const rec = @import("./records.mlx")
+const messages = @import("./messages.mlx")
+
+pub const Allocator = zs.Allocator
+
+pub extern("c") fn malloc(size: usize) -> usize
+pub extern("c") fn free(address: usize) -> void
+extern("c") fn write(descriptor: i32, buffer: usize, count: usize) -> isize
+extern("c") fn exit(status: i32) -> void
+
+// libjpeg's global states (jpegint.h).
+pub const CSTATE_START: i32 = 100
+pub const CSTATE_SCANNING: i32 = 101
+pub const CSTATE_RAW_OK: i32 = 102
+pub const CSTATE_WRCOEFS: i32 = 103
+pub const DSTATE_START: i32 = 200
+pub const DSTATE_INHEADER: i32 = 201
+pub const DSTATE_READY: i32 = 202
+pub const DSTATE_PRELOAD: i32 = 203
+pub const DSTATE_PRESCAN: i32 = 204
+pub const DSTATE_SCANNING: i32 = 205
+pub const DSTATE_RAW_OK: i32 = 206
+pub const DSTATE_BUFIMAGE: i32 = 207
+pub const DSTATE_BUFPOST: i32 = 208
+pub const DSTATE_RDCOEFS: i32 = 209
+pub const DSTATE_STOPPING: i32 = 210
+
+// Message codes the C layer raises itself (jerror.h).
+pub const JERR_BAD_LIB_VERSION: i32 = 13
+pub const JERR_BAD_POOL_ID: i32 = 15
+pub const JERR_BAD_STATE: i32 = 21
+pub const JERR_BAD_STRUCT_SIZE: i32 = 22
+pub const JERR_BUFFER_SIZE: i32 = 24
+pub const JERR_BAD_CROP_SPEC: i32 = 5
+pub const JERR_INPUT_EMPTY: i32 = 43
+pub const JERR_MODE_CHANGE: i32 = 47
+pub const JERR_NOTIMPL: i32 = 48
+pub const JERR_NOT_COMPILED: i32 = 49
+pub const JERR_NO_IMAGE: i32 = 53
+pub const JERR_OUT_OF_MEMORY: i32 = 56
+pub const JERR_TOO_LITTLE_DATA: i32 = 69
+pub const JWRN_JPEG_EOF: i32 = 123
+pub const JWRN_TOO_MUCH_DATA: i32 = 126
+pub const JWRN_BOGUS_ICC: i32 = 127
+
+pub const JPOOL_PERMANENT: i32 = 0
+pub const JPOOL_IMAGE: i32 = 1
+
+// The C functions the application gives.
+pub const ErrorExitFn = fn(usize) -> void
+pub const EmitMessageFn = fn(usize, i32) -> void
+pub const FormatMessageFn = fn(usize, usize) -> void
+pub const SourceFn = fn(usize) -> void
+pub const FillFn = fn(usize) -> i32
+pub const SkipFn = fn(usize, i64) -> void
+pub const SelfDestructFn = fn(usize) -> void
+pub const FreePoolFn = fn(usize, i32) -> void
+
+pub const STATE_MAGIC: usize = 0x4a50454753544154
+
+// The state of an object: the memory manager the object's `mem` points
+// to (first, so that the state is found from it), the pools, and the
+// compressor's or decompressor's own state.
+pub const State = struct {
+    memory: rec.MemoryMgr
+    magic: usize
+    cinfo: usize
+    pools: [2]usize
+    engine: usize
+    engineSize: usize
+    destroyEngine: usize
+}
+
+pub inline fn get8(address: usize) -> usize { return @intCast(usize, zs.get8(address)) }
+pub inline fn put8(address: usize, value: usize) -> void { zs.put8(address, value) }
+pub fn getWord(address: usize) -> usize { unsafe { return @ptrFromInt(*usize, address).* } }
+pub fn putWord(address: usize, value: usize) -> void { unsafe { @ptrFromInt(*usize, address).* = value } }
+pub fn literal(text: []const u8) -> usize { return @intFromPtr(text.pointer) }
+
+pub fn cLength(text: usize) -> usize {
+    var length: usize = 0
+    while get8(text + length) != 0 { length += 1 }
+    return length
+}
+
+pub fn stateOf(cinfo: usize) -> *State {
+    unsafe { return @ptrFromInt(*State, rec.common(cinfo).*.mem) }
+}
+
+// The memory std's parts allocate from: the C library's.
+fn allocatorAlloc(context: *anyopaque, length: usize, alignment: usize) -> ?[*]u8 {
+    const address = malloc(if length == 0 { 1 } else { length })
+    if address == 0 { return null }
+    return zs.bytes(address)
+}
+
+fn allocatorResize(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, newLength: usize) -> bool { return false }
+
+fn allocatorRemap(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize, newLength: usize) -> ?[*]u8 {
+    const address = malloc(if newLength == 0 { 1 } else { newLength })
+    if address == 0 { return null }
+    zs.copy(address, @intFromPtr(memory), if length < newLength { length } else { newLength })
+    free(@intFromPtr(memory))
+    return zs.bytes(address)
+}
+
+fn allocatorFree(context: *anyopaque, memory: [*]u8, length: usize, alignment: usize) -> void {
+    free(@intFromPtr(memory))
+}
+
+pub fn allocator() -> Allocator {
+    unsafe {
+        return Allocator.{
+            .context = @ptrFromInt(*anyopaque, 16),
+            .allocFn = allocatorAlloc,
+            .resizeFn = allocatorResize,
+            .remapFn = allocatorRemap,
+            .freeFn = allocatorFree
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors and warnings (jerror.c)
+
+// ERREXIT: the code and parameters into the error manager, then its
+// error_exit (which does not come back when it longjmps).
+pub fn raise(cinfo: usize, code: i32, a: i32, b: i32, c: i32, d: i32) -> void {
+    const err = rec.errorMgr(rec.common(cinfo).*.err)
+    err.*.msg_code = code
+    err.*.msg_parm[0] = a
+    err.*.msg_parm[1] = b
+    err.*.msg_parm[2] = c
+    err.*.msg_parm[3] = d
+    const call: ErrorExitFn = unsafe { @ptrFromInt(ErrorExitFn, err.*.error_exit) }
+    call(cinfo)
+}
+
+pub fn raise0(cinfo: usize, code: i32) -> void { raise(cinfo, code, 0, 0, 0, 0) }
+pub fn raise1(cinfo: usize, code: i32, a: i32) -> void { raise(cinfo, code, a, 0, 0, 0) }
+
+// WARNMS: through emit_message at level -1.
+pub fn warn(cinfo: usize, code: i32, a: i32, b: i32) -> void {
+    const err = rec.errorMgr(rec.common(cinfo).*.err)
+    err.*.msg_code = code
+    err.*.msg_parm[0] = a
+    err.*.msg_parm[1] = b
+    const call: EmitMessageFn = unsafe { @ptrFromInt(EmitMessageFn, err.*.emit_message) }
+    call(cinfo, -1)
+}
+
+// The table of messages jpeg_message_table points to (made once).
+var messageTable: usize = 0
+
+fn table() -> usize {
+    if messageTable == 0 {
+        const address = malloc(8 * (messages.LAST_MESSAGE + 1))
+        var code: usize = 0
+        while code <= messages.LAST_MESSAGE {
+            putWord(address + code * 8, messages.text(code))
+            code += 1
+        }
+        messageTable = address
+    }
+    return messageTable
+}
+
+// A decimal or hexadecimal number into the text at TARGET (at most
+// LIMIT bytes there), at least WIDTH wide, padded with zeros or spaces.
+fn formatNumber(target: usize, at: *usize, limit: usize, value: u64, negative: bool, base: u64, width: usize, zeros: bool) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        const digit = @intCast(usize, rest % base)
+        digits[count] = @intCast(u8, if digit < 10 { 48 + digit } else { 87 + digit })
+        count += 1
+        rest = rest / base
+        if rest == 0 { break }
+    }
+    var length = count
+    if negative { length += 1 }
+    if negative && zeros { emit(target, at, limit, 45) }
+    var pad = length
+    while pad < width {
+        emit(target, at, limit, if zeros { 48 } else { 32 })
+        pad += 1
+    }
+    if negative && !zeros { emit(target, at, limit, 45) }
+    while count > 0 {
+        count -= 1
+        emit(target, at, limit, @intCast(usize, digits[count]))
+    }
+}
+
+fn emit(target: usize, at: *usize, limit: usize, c: usize) -> void {
+    if at.* + 1 < limit {
+        put8(target + at.*, c)
+        at.* += 1
+    }
+}
+
+// format_message: the message of the error manager's code with its
+// parameters, as libjpeg formats it with snprintf (the formats of
+// jerror.h: %d, %u, %x, %c, %s, widths and zero padding).
+pub fn formatMessage(cinfo: usize, buffer: usize) -> void {
+    const err = rec.errorMgr(rec.common(cinfo).*.err)
+    const code = err.*.msg_code
+    var text: usize = 0
+    if code > 0 && code <= err.*.last_jpeg_message {
+        text = getWord(err.*.jpeg_message_table + @intCast(usize, code) * 8)
+    } else if err.*.addon_message_table != 0 && code >= err.*.first_addon_message && code <= err.*.last_addon_message {
+        text = getWord(err.*.addon_message_table + @intCast(usize, code - err.*.first_addon_message) * 8)
+    }
+    if text == 0 {
+        err.*.msg_parm[0] = code
+        text = getWord(err.*.jpeg_message_table)
+    }
+    const parameters = @intFromPtr(&err.*.msg_parm)
+    // A message with %s takes the string parameter.
+    var isString = false
+    var scan = text
+    while get8(scan) != 0 {
+        if get8(scan) == 37 {
+            isString = get8(scan + 1) == 115
+            break
+        }
+        scan += 1
+    }
+    var at: usize = 0
+    var next: usize = 0
+    var p = text
+    while get8(p) != 0 {
+        const c = get8(p)
+        p += 1
+        if c != 37 {
+            emit(buffer, &at, 200, c)
+            continue
+        }
+        var zeros = false
+        var width: usize = 0
+        if get8(p) == 48 {
+            zeros = true
+            p += 1
+        }
+        while get8(p) >= 48 && get8(p) <= 57 {
+            width = width * 10 + get8(p) - 48
+            p += 1
+        }
+        if get8(p) == 108 { p += 1 }
+        const conversion = get8(p)
+        p += 1
+        if conversion == 115 {
+            var s = parameters
+            while get8(s) != 0 && s < parameters + 80 {
+                emit(buffer, &at, 200, get8(s))
+                s += 1
+            }
+            continue
+        }
+        if conversion == 37 {
+            emit(buffer, &at, 200, 37)
+            continue
+        }
+        var value: i32 = 0
+        if !isString && next < 8 { value = err.*.msg_parm[next] }
+        next += 1
+        if conversion == 100 {
+            const negative = value < 0
+            const magnitude = if negative { @intCast(u64, 0 - @intCast(i64, value)) } else { @intCast(u64, value) }
+            formatNumber(buffer, &at, 200, magnitude, negative, 10, width, zeros)
+        } else if conversion == 117 {
+            formatNumber(buffer, &at, 200, @intCast(u64, @bitCast(u32, value)), false, 10, width, zeros)
+        } else if conversion == 120 {
+            formatNumber(buffer, &at, 200, @intCast(u64, @bitCast(u32, value)), false, 16, width, zeros)
+        } else if conversion == 99 {
+            emit(buffer, &at, 200, @intCast(usize, @bitCast(u32, value) & 255))
+        }
+    }
+    put8(buffer + at, 0)
+}
+
+// output_message: the formatted message on stderr.
+pub fn outputMessage(cinfo: usize) -> void {
+    var buffer: [200]u8 = undefined
+    const view: [*]u8 = &buffer
+    const err = rec.errorMgr(rec.common(cinfo).*.err)
+    const call: FormatMessageFn = unsafe { @ptrFromInt(FormatMessageFn, err.*.format_message) }
+    call(cinfo, @intFromPtr(view))
+    _ = write(2, @intFromPtr(view), cLength(@intFromPtr(view)))
+    _ = write(2, literal("\n"), 1)
+}
+
+// emit_message: a warning (level -1) shown the first time only (or
+// always from trace level 3), a trace message from its level.
+pub fn emitMessage(cinfo: usize, level: i32) -> void {
+    const err = rec.errorMgr(rec.common(cinfo).*.err)
+    if level < 0 {
+        if err.*.num_warnings == 0 || err.*.trace_level >= 3 { callOutput(cinfo) }
+        err.*.num_warnings += 1
+    } else if err.*.trace_level >= level {
+        callOutput(cinfo)
+    }
+}
+
+fn callOutput(cinfo: usize) -> void {
+    const err = rec.errorMgr(rec.common(cinfo).*.err)
+    const call: SourceFn = unsafe { @ptrFromInt(SourceFn, err.*.output_message) }
+    call(cinfo)
+}
+
+// error_exit: the message, the object destroyed, the program ended.
+pub fn errorExit(cinfo: usize) -> void {
+    callOutput(cinfo)
+    destroy(cinfo)
+    exit(1)
+}
+
+pub fn resetErrorMgr(cinfo: usize) -> void {
+    const err = rec.errorMgr(rec.common(cinfo).*.err)
+    err.*.num_warnings = 0
+    err.*.msg_code = 0
+}
+
+export fn mlxjpeg_error_exit(cinfo: usize) -> void { errorExit(cinfo) }
+export fn mlxjpeg_emit_message(cinfo: usize, level: i32) -> void { emitMessage(cinfo, level) }
+export fn mlxjpeg_output_message(cinfo: usize) -> void { outputMessage(cinfo) }
+export fn mlxjpeg_format_message(cinfo: usize, buffer: usize) -> void { formatMessage(cinfo, buffer) }
+export fn mlxjpeg_reset_error_mgr(cinfo: usize) -> void { resetErrorMgr(cinfo) }
+
+pub fn stdError(address: usize) -> usize {
+    const err = rec.errorMgr(address)
+    err.*.error_exit = @intFromPtr(mlxjpeg_error_exit)
+    err.*.emit_message = @intFromPtr(mlxjpeg_emit_message)
+    err.*.output_message = @intFromPtr(mlxjpeg_output_message)
+    err.*.format_message = @intFromPtr(mlxjpeg_format_message)
+    err.*.reset_error_mgr = @intFromPtr(mlxjpeg_reset_error_mgr)
+    err.*.trace_level = 0
+    err.*.num_warnings = 0
+    err.*.msg_code = 0
+    err.*.jpeg_message_table = table()
+    err.*.last_jpeg_message = @intCast(i32, messages.LAST_MESSAGE)
+    err.*.addon_message_table = 0
+    err.*.first_addon_message = 0
+    err.*.last_addon_message = 0
+    return address
+}
+
+// ---------------------------------------------------------------------------
+// The memory manager (jmemmgr.c): blocks of the C library's memory, each
+// after a 16-byte header that links it into its pool.
+
+fn poolBlock(cinfo: usize, pool: i32, size: usize) -> usize {
+    if pool < 0 || pool > 1 {
+        raise1(cinfo, JERR_BAD_POOL_ID, pool)
+        return 0
+    }
+    const state = stateOf(cinfo)
+    const block = malloc(size + 16)
+    if block == 0 {
+        raise1(cinfo, JERR_OUT_OF_MEMORY, 1)
+        return 0
+    }
+    putWord(block, state.*.pools[@intCast(usize, pool)])
+    putWord(block + 8, size)
+    state.*.pools[@intCast(usize, pool)] = block
+    return block + 16
+}
+
+pub fn allocSmall(cinfo: usize, pool: i32, size: usize) -> usize { return poolBlock(cinfo, pool, size) }
+
+// Rows of samples (alloc_sarray): the row addresses, then the rows, each
+// rounded up to 32 bytes as libjpeg-turbo rounds them.
+pub fn allocSarray(cinfo: usize, pool: i32, samples: u32, rows: u32) -> usize {
+    const width = ((@intCast(usize, samples) + 31) / 32) * 32
+    const count = @intCast(usize, rows)
+    const block = poolBlock(cinfo, pool, count * 8 + count * width + 32)
+    if block == 0 { return 0 }
+    const first = ((block + count * 8 + 31) / 32) * 32
+    var row: usize = 0
+    while row < count {
+        putWord(block + row * 8, first + row * width)
+        row += 1
+    }
+    return block
+}
+
+// Rows of coefficient blocks (alloc_barray).
+pub fn allocBarray(cinfo: usize, pool: i32, blocks: u32, rows: u32) -> usize {
+    const width = @intCast(usize, blocks) * 128
+    const count = @intCast(usize, rows)
+    const block = poolBlock(cinfo, pool, count * 8 + count * width + 32)
+    if block == 0 { return 0 }
+    const first = ((block + count * 8 + 31) / 32) * 32
+    var row: usize = 0
+    while row < count {
+        putWord(block + row * 8, first + row * width)
+        row += 1
+    }
+    return block
+}
+
+pub fn freePool(cinfo: usize, pool: i32) -> void {
+    if pool < 0 || pool > 1 {
+        raise1(cinfo, JERR_BAD_POOL_ID, pool)
+        return
+    }
+    const state = stateOf(cinfo)
+    var block = state.*.pools[@intCast(usize, pool)]
+    while block != 0 {
+        const next = getWord(block)
+        free(block)
+        block = next
+    }
+    state.*.pools[@intCast(usize, pool)] = 0
+}
+
+pub fn selfDestruct(cinfo: usize) -> void {
+    freePool(cinfo, JPOOL_IMAGE)
+    freePool(cinfo, JPOOL_PERMANENT)
+    const state = stateOf(cinfo)
+    if state.*.destroyEngine != 0 {
+        const call: SourceFn = unsafe { @ptrFromInt(SourceFn, state.*.destroyEngine) }
+        call(state.*.engine)
+    }
+    if state.*.engine != 0 { free(state.*.engine) }
+    state.*.magic = 0
+    free(@intFromPtr(state))
+}
+
+// Virtual arrays (for transcoding and libjpeg's own buffers): not here.
+fn virtualArrays(cinfo: usize) -> usize {
+    raise0(cinfo, JERR_NOT_COMPILED)
+    return 0
+}
+
+export fn mlxjpeg_alloc_small(cinfo: usize, pool: i32, size: usize) -> usize { return allocSmall(cinfo, pool, size) }
+export fn mlxjpeg_alloc_large(cinfo: usize, pool: i32, size: usize) -> usize { return allocSmall(cinfo, pool, size) }
+export fn mlxjpeg_alloc_sarray(cinfo: usize, pool: i32, samples: u32, rows: u32) -> usize { return allocSarray(cinfo, pool, samples, rows) }
+export fn mlxjpeg_alloc_barray(cinfo: usize, pool: i32, blocks: u32, rows: u32) -> usize { return allocBarray(cinfo, pool, blocks, rows) }
+export fn mlxjpeg_request_virt_array(cinfo: usize, pool: i32, zero: i32, width: u32, rows: u32, access: u32) -> usize { return virtualArrays(cinfo) }
+export fn mlxjpeg_realize_virt_arrays(cinfo: usize) -> void { _ = virtualArrays(cinfo) }
+export fn mlxjpeg_access_virt_array(cinfo: usize, array: usize, start: u32, rows: u32, writable: i32) -> usize { return virtualArrays(cinfo) }
+export fn mlxjpeg_free_pool(cinfo: usize, pool: i32) -> void { freePool(cinfo, pool) }
+export fn mlxjpeg_self_destruct(cinfo: usize) -> void { selfDestruct(cinfo) }
+
+// jinit_memory_mgr: the state with its memory manager, for the object at
+// CINFO; ENGINE_SIZE bytes for the compressor's or decompressor's own
+// state (zeroed). False when there is no memory.
+pub fn createState(cinfo: usize, engineSize: usize) -> bool {
+    const address = malloc(@sizeOf(State))
+    if address == 0 { return false }
+    zs.zero(address, @sizeOf(State))
+    const state: *State = unsafe { @ptrFromInt(*State, address) }
+    state.*.memory.alloc_small = @intFromPtr(mlxjpeg_alloc_small)
+    state.*.memory.alloc_large = @intFromPtr(mlxjpeg_alloc_large)
+    state.*.memory.alloc_sarray = @intFromPtr(mlxjpeg_alloc_sarray)
+    state.*.memory.alloc_barray = @intFromPtr(mlxjpeg_alloc_barray)
+    state.*.memory.request_virt_sarray = @intFromPtr(mlxjpeg_request_virt_array)
+    state.*.memory.request_virt_barray = @intFromPtr(mlxjpeg_request_virt_array)
+    state.*.memory.realize_virt_arrays = @intFromPtr(mlxjpeg_realize_virt_arrays)
+    state.*.memory.access_virt_sarray = @intFromPtr(mlxjpeg_access_virt_array)
+    state.*.memory.access_virt_barray = @intFromPtr(mlxjpeg_access_virt_array)
+    state.*.memory.free_pool = @intFromPtr(mlxjpeg_free_pool)
+    state.*.memory.self_destruct = @intFromPtr(mlxjpeg_self_destruct)
+    state.*.memory.max_memory_to_use = 0
+    state.*.memory.max_alloc_chunk = 1000000000
+    state.*.magic = STATE_MAGIC
+    state.*.cinfo = cinfo
+    state.*.engine = malloc(engineSize)
+    if state.*.engine == 0 {
+        free(address)
+        return false
+    }
+    zs.zero(state.*.engine, engineSize)
+    state.*.engineSize = engineSize
+    rec.common(cinfo).*.mem = address
+    return true
+}
+
+// jpeg_abort: the image's memory freed, the object back at its start.
+pub fn abort(cinfo: usize) -> void {
+    const common = rec.common(cinfo)
+    if common.*.mem == 0 { return }
+    const freeCall: FreePoolFn = unsafe { @ptrFromInt(FreePoolFn, stateOf(cinfo).*.memory.free_pool) }
+    freeCall(cinfo, JPOOL_IMAGE)
+    if common.*.is_decompressor != 0 {
+        common.*.global_state = DSTATE_START
+        rec.decompress(cinfo).*.marker_list = 0
+    } else {
+        common.*.global_state = CSTATE_START
+    }
+}
+
+// jpeg_destroy: everything freed.
+pub fn destroy(cinfo: usize) -> void {
+    const common = rec.common(cinfo)
+    if common.*.mem != 0 {
+        const call: SourceFn = unsafe { @ptrFromInt(SourceFn, stateOf(cinfo).*.memory.self_destruct) }
+        call(cinfo)
+    }
+    common.*.mem = 0
+    common.*.global_state = 0
+}

@@ -1,0 +1,1146 @@
+// Signals (gsignal.h), as GLib's gsignal.c emits them.
+//
+// A signal is a record: its name (canonical, '-' for '_'), the type it
+// belongs to, flags, its class closures (the type's and those of the
+// subtypes that override it), accumulator, C marshaller, return and
+// parameter types, emission hooks. Its id is its place in the list (from
+// 1). A handler is a record of an id (counted from 1 over the program),
+// the signal and detail, the closure, whether it runs after the class
+// closure, how often it is blocked and whether it is gone; each
+// instance's handlers are a list in a table keyed by the instance.
+//
+// An emission runs the RUN_FIRST class closure, the emission hooks, the
+// handlers connected before, the RUN_LAST class closure, the handlers
+// connected after and the RUN_CLEANUP class closure, each with the
+// return value through the accumulator when there is one (else the last
+// one written stays); g_signal_stop_emission ends it before the next
+// handler. Emissions are kept per thread (for the invocation hint, stop
+// and chaining up from an overriding class closure). One recursive lock
+// guards the signals and handlers and is let go while closures run.
+const m = @import("./memory.mlx")
+const sys = @import("./sys.mlx")
+const threads = @import("./threads.mlx")
+const messages = @import("./messages.mlx")
+const varargs = @import("./varargs.mlx")
+const errors = @import("./errors.mlx")
+const hash = @import("./hash.mlx")
+const types = @import("./types.mlx")
+const values = @import("./values.mlx")
+const closures = @import("./closures.mlx")
+
+extern("c") fn snprintf(buffer: usize, size: usize, format: usize, a: usize) -> i32
+
+const RUN_FIRST: u32 = 1
+const RUN_LAST: u32 = 2
+const RUN_CLEANUP: u32 = 4
+const NO_RECURSE: u32 = 8
+const DETAILED: u32 = 16
+const ACTION: u32 = 32
+const NO_HOOKS: u32 = 64
+const ACCUMULATOR_FIRST_RUN: u32 = 131072
+const STATIC_SCOPE: usize = 1
+
+const MATCH_ID: u32 = 1
+const MATCH_DETAIL: u32 = 2
+const MATCH_CLOSURE: u32 = 4
+const MATCH_FUNC: u32 = 8
+const MATCH_DATA: u32 = 16
+const MATCH_UNBLOCKED: u32 = 32
+
+// The signal.
+const S_NAME: usize = 0
+const S_ITYPE: usize = 8
+const S_FLAGS: usize = 16
+const S_QUARK: usize = 20
+const S_CLASS_CLOSURES: usize = 24
+const S_ACCUMULATOR: usize = 48
+const S_ACCU_DATA: usize = 56
+const S_MARSHALLER: usize = 64
+const S_RETURN: usize = 72
+const S_N_PARAMS: usize = 80
+const S_PARAMS: usize = 88
+const S_HOOKS: usize = 96
+const S_SIZE: usize = 120
+
+// The handler.
+const H_ID: usize = 0
+const H_SIGNAL: usize = 8
+const H_DETAIL: usize = 12
+const H_CLOSURE: usize = 16
+const H_AFTER: usize = 24
+const H_BLOCKED: usize = 28
+const H_REFS: usize = 32
+const H_GONE: usize = 36
+const H_INSTANCE: usize = 40
+const H_SIZE: usize = 48
+
+// The emission: the instance, the invocation hint (signal id, detail,
+// run type), stopped, the type whose class closure runs, the thread.
+const E_INSTANCE: usize = 0
+const E_HINT: usize = 8
+const E_STATE: usize = 20
+const E_CHAIN_TYPE: usize = 24
+const E_THREAD: usize = 32
+const E_SIZE: usize = 40
+
+pub const Accumulator = fn(usize, usize, usize, usize) -> i32
+pub const Hook = fn(usize, u32, usize, usize) -> i32
+pub const Notify = fn(usize) -> void
+
+var lockRecord: usize = 0
+var lockOnce: u64 = 0
+var signalList: usize = 0
+var handlersByInstance: usize = 0
+var handlersById: usize = 0
+var nextHandlerId: u64 = 1
+var nextHookId: u64 = 1
+var emissions: usize = 0
+
+fn wordsAt(address: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, address) } }
+
+export fn __mlx_glib_pointer_hash(p: usize) -> u32 { return @intCast(u32, ((p >> 4) ^ (p >> 20)) & 0xffffffff) }
+
+fn ensure() -> void {
+    if threads.onceEnter(@intFromPtr(&lockOnce)) {
+        lockRecord = m.alloc(16)
+        signalList = m.alloc(24)
+        emissions = m.alloc(24)
+        handlersByInstance = hash.newTable(@intFromPtr(__mlx_glib_pointer_hash), 0, 0, 0)
+        handlersById = hash.newTable(@intFromPtr(__mlx_glib_pointer_hash), 0, 0, 0)
+        threads.onceLeave(@intFromPtr(&lockOnce), 1)
+    }
+}
+
+fn lock() -> void {
+    ensure()
+    threads.recursiveLock(lockRecord)
+}
+
+fn unlock() -> void { threads.recursiveUnlock(lockRecord) }
+
+fn signalAt(id: u32) -> usize {
+    const list = wordsAt(signalList)
+    if id == 0 || @intCast(usize, id) > list.*.length { return 0 }
+    return m.wordAt(list, @intCast(usize, id) - 1)
+}
+
+fn warn(t: *m.Text) -> void {
+    messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, t.*.address)
+    m.dispose(t)
+}
+
+fn critical(t: *m.Text) -> void {
+    messages.log(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, t.*.address)
+    m.dispose(t)
+}
+
+fn pushPointer(t: *m.Text, p: usize) -> void {
+    const buffer = m.alloc(32)
+    _ = snprintf(buffer, 32, m.literal("%p"), p)
+    m.pushC(t, buffer)
+    m.release(buffer)
+}
+
+// ---------------------------------------------------------------------------
+// Names
+
+fn isValidName(name: usize) -> bool {
+    if name == 0 || !m.isAlpha(m.get8(name)) { return false }
+    var p = name + 1
+    while m.get8(p) != 0 {
+        const c = m.get8(p)
+        if !(m.isAlnum(c) || c == '-' || c == '_') { return false }
+        p += 1
+    }
+    return true
+}
+
+export fn g_signal_is_valid_name(name: usize) -> i32 { return if isValidName(name) { 1 } else { 0 } }
+
+fn canonical(start: usize, length: usize) -> usize {
+    const copy = m.dupBytes(start, length)
+    var i: usize = 0
+    while i < length {
+        if m.get8(copy + i) == '_' { m.put8(copy + i, '-') }
+        i += 1
+    }
+    const interned = errors.intern(copy)
+    m.release(copy)
+    return interned
+}
+
+// The signal of the name (canonical) for `itype`: on it, an ancestor or
+// an interface it has.
+fn find(name: usize, itype: usize) -> u32 {
+    const list = wordsAt(signalList)
+    var k: usize = 0
+    var best: u32 = 0
+    while k < list.*.length {
+        const s = m.wordAt(list, k)
+        if m.getWord(s + S_NAME) == name && types.isA(itype, m.getWord(s + S_ITYPE)) {
+            best = @intCast(u32, k + 1)
+            break
+        }
+        k += 1
+    }
+    return best
+}
+
+fn lookupName(text: usize, itype: usize) -> u32 {
+    if text == 0 { return 0 }
+    const name = canonical(text, m.cLength(text))
+    lock()
+    const id = find(name, itype)
+    unlock()
+    return id
+}
+
+export fn g_signal_lookup(name: usize, itype: usize) -> u32 { return lookupName(name, itype) }
+
+export fn g_signal_name(signal_id: u32) -> usize {
+    lock()
+    const s = signalAt(signal_id)
+    unlock()
+    return if s == 0 { 0 } else { m.getWord(s + S_NAME) }
+}
+
+// "name" or "name::detail" for `itype`; whether it names a signal (and
+// a detail only for a detailed one).
+fn parse(detailed: usize, itype: usize, idOut: usize, detailOut: usize, forceQuark: bool) -> bool {
+    var p = detailed
+    var colon: usize = 0
+    while m.get8(p) != 0 {
+        if m.get8(p) == ':' && m.get8(p + 1) == ':' {
+            colon = p
+            break
+        }
+        p += 1
+    }
+    const length = if colon != 0 { colon - detailed } else { m.cLength(detailed) }
+    if length == 0 { return false }
+    const name = canonical(detailed, length)
+    lock()
+    const id = find(name, itype)
+    const s = signalAt(id)
+    var good = id != 0
+    var detail: u32 = 0
+    if good && colon != 0 {
+        const detailText = colon + 2
+        if m.get8(detailText) == 0 || (m.get32(s + S_FLAGS) & DETAILED) == 0 {
+            good = false
+        } else {
+            detail = errors.quarkOf(detailText, true, forceQuark)
+            if detail == 0 && !forceQuark { detail = errors.quarkOf(detailText, true, true) }
+        }
+    }
+    unlock()
+    if !good { return false }
+    if idOut != 0 { m.put32(idOut, id) }
+    if detailOut != 0 { m.put32(detailOut, detail) }
+    return true
+}
+
+export fn g_signal_parse_name(detailed_signal: usize, itype: usize, signal_id_p: usize, detail_p: usize, force_detail_quark: i32) -> i32 {
+    return if parse(detailed_signal, itype, signal_id_p, detail_p, force_detail_quark != 0) { 1 } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Making signals
+
+pub fn newSignal(name: usize, itype: usize, flags: u32, classClosure: usize, accumulator: usize, accuData: usize, marshaller: usize, returnType: usize, nParams: u32, params: usize) -> u32 {
+    if !isValidName(name) {
+        var t = m.text()
+        m.pushText(&t, "g_signal_newv: assertion 'g_signal_is_valid_name (signal_name)' failed")
+        critical(&t)
+        return 0
+    }
+    const canonicalName = canonical(name, m.cLength(name))
+    lock()
+    if find(canonicalName, itype) != 0 {
+        const existing = signalAt(find(canonicalName, itype))
+        if m.getWord(existing + S_ITYPE) == itype {
+            var t = m.text()
+            m.pushText(&t, "signal \"")
+            m.pushC(&t, name)
+            m.pushText(&t, "\" already exists in the '")
+            m.pushC(&t, types.describe(itype))
+            m.pushText(&t, "' class ancestry")
+            warn(&t)
+            unlock()
+            return 0
+        }
+    }
+    const s = m.alloc(S_SIZE)
+    m.putWord(s + S_NAME, canonicalName)
+    m.putWord(s + S_ITYPE, itype)
+    m.put32(s + S_FLAGS, flags)
+    m.put32(s + S_QUARK, errors.quarkOf(canonicalName, false, true))
+    m.putWord(s + S_ACCUMULATOR, accumulator)
+    m.putWord(s + S_ACCU_DATA, accuData)
+    m.putWord(s + S_MARSHALLER, if marshaller != 0 { marshaller } else { closures.genericAddress() })
+    m.putWord(s + S_RETURN, returnType)
+    m.put32(s + S_N_PARAMS, nParams)
+    const copied = m.alloc(@intCast(usize, nParams + 1) * 8)
+    m.copy(copied, params, @intCast(usize, nParams) * 8)
+    m.putWord(s + S_PARAMS, copied)
+    m.pushWord(wordsAt(signalList), s)
+    const id = @intCast(u32, wordsAt(signalList).*.length)
+    if classClosure != 0 { addClassClosure(s, itype, classClosure) }
+    unlock()
+    return id
+}
+
+fn addClassClosure(s: usize, itype: usize, closure: usize) -> void {
+    _ = closures.ref(closure)
+    closures.sink(closure)
+    if m.getWord(closure + 8) == 0 { m.putWord(closure + 8, m.getWord(s + S_MARSHALLER)) }
+    const list = wordsAt(s + S_CLASS_CLOSURES)
+    var k: usize = 0
+    while k < list.*.length {
+        if m.wordAt(list, k) == itype {
+            closures.unref(m.wordAt(list, k + 1))
+            m.putWord(list.*.address + (k + 1) * 8, closure)
+            return
+        }
+        k += 2
+    }
+    m.pushWord(list, itype)
+    m.pushWord(list, closure)
+}
+
+export fn g_signal_newv(signal_name: usize, itype: usize, signal_flags: u32, class_closure: usize, accumulator: usize, accu_data: usize, c_marshaller: usize, return_type: usize, n_params: u32, param_types: usize) -> u32 {
+    return newSignal(signal_name, itype, signal_flags, class_closure, accumulator, accu_data, c_marshaller, return_type, n_params, param_types)
+}
+
+fn newFromList(name: usize, itype: usize, flags: u32, classClosure: usize, accumulator: usize, accuData: usize, marshaller: usize, returnType: usize, nParams: u32, list: usize) -> u32 {
+    const params = m.alloc(@intCast(usize, nParams + 1) * 8)
+    var i: u32 = 0
+    while i < nParams {
+        m.putWord(params + @intCast(usize, i) * 8, varargs.nextPointer(list))
+        i += 1
+    }
+    const id = newSignal(name, itype, flags, classClosure, accumulator, accuData, marshaller, returnType, nParams, params)
+    m.release(params)
+    return id
+}
+
+export fn g_signal_new_valist(signal_name: usize, itype: usize, signal_flags: u32, class_closure: usize, accumulator: usize, accu_data: usize, c_marshaller: usize, return_type: usize, n_params: u32, args: usize) -> u32 {
+    return newFromList(signal_name, itype, signal_flags, class_closure, accumulator, accu_data, c_marshaller, return_type, n_params, args)
+}
+
+// g_signal_new's nine fixed arguments: six in the registers, three on
+// the stack (the frame's words 2 to 4), the parameter types after them.
+export fn g_signal_new(signal_name: usize, itype: usize, signal_flags: u32, class_offset: u32, accumulator: usize, accu_data: usize, c_marshaller: usize, return_type: usize, n_params: u32) -> u32 {
+    const frame = @frameAddress()
+    const list = m.alloc(24)
+    m.put32(list, 48)
+    m.put32(list + 4, 176)
+    m.putWord(list + 8, frame + 16 + 3 * 8)
+    m.putWord(list + 16, 0)
+    const closure = if class_offset != 0 { closures.typeClosure(itype, class_offset) } else { 0 }
+    const id = newFromList(signal_name, itype, signal_flags, closure, accumulator, accu_data, c_marshaller, return_type, n_params, list)
+    m.release(list)
+    return id
+}
+
+export fn g_signal_new_class_handler(signal_name: usize, itype: usize, signal_flags: u32, class_handler: usize, accumulator: usize, accu_data: usize, c_marshaller: usize, return_type: usize, n_params: u32) -> u32 {
+    const frame = @frameAddress()
+    const list = m.alloc(24)
+    m.put32(list, 48)
+    m.put32(list + 4, 176)
+    m.putWord(list + 8, frame + 16 + 3 * 8)
+    m.putWord(list + 16, 0)
+    const closure = if class_handler != 0 { closures.newC(class_handler, 0, 0, false) } else { 0 }
+    const id = newFromList(signal_name, itype, signal_flags, closure, accumulator, accu_data, c_marshaller, return_type, n_params, list)
+    m.release(list)
+    return id
+}
+
+export fn g_signal_override_class_closure(signal_id: u32, instance_type: usize, class_closure: usize) -> void {
+    lock()
+    const s = signalAt(signal_id)
+    if s != 0 { addClassClosure(s, instance_type, class_closure) }
+    unlock()
+}
+
+// GSignalQuery: signal_id 0, signal_name 8, itype 16, signal_flags 24,
+// return_type 32, n_params 40, param_types 48.
+export fn g_signal_query(signal_id: u32, query: usize) -> void {
+    lock()
+    const s = signalAt(signal_id)
+    if s == 0 {
+        m.zero(query, 56)
+    } else {
+        m.put32(query, signal_id)
+        m.putWord(query + 8, m.getWord(s + S_NAME))
+        m.putWord(query + 16, m.getWord(s + S_ITYPE))
+        m.put32(query + 24, m.get32(s + S_FLAGS))
+        m.putWord(query + 32, m.getWord(s + S_RETURN))
+        m.put32(query + 40, m.get32(s + S_N_PARAMS))
+        m.putWord(query + 48, m.getWord(s + S_PARAMS))
+    }
+    unlock()
+}
+
+export fn g_signal_list_ids(itype: usize, n_ids: usize) -> usize {
+    lock()
+    var ids = m.words()
+    const list = wordsAt(signalList)
+    var k: usize = 0
+    while k < list.*.length {
+        if m.getWord(m.wordAt(list, k) + S_ITYPE) == itype { m.pushWord(&ids, k + 1) }
+        k += 1
+    }
+    unlock()
+    const result = m.alloc((ids.length + 1) * 4)
+    k = 0
+    while k < ids.length {
+        m.put32(result + k * 4, @intCast(u32, m.wordAt(&ids, k)))
+        k += 1
+    }
+    if n_ids != 0 { m.put32(n_ids, @intCast(u32, ids.length)) }
+    m.disposeWords(&ids)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+
+fn handlersOf(instance: usize, create: bool) -> usize {
+    var list = hash.lookup(handlersByInstance, instance)
+    if list == 0 && create {
+        list = m.alloc(24)
+        _ = hash.insert(handlersByInstance, instance, list, true)
+    }
+    return list
+}
+
+export fn __mlx_glib_handler_closure_invalid(handler: usize, closure: usize) -> void {
+    lock()
+    const gone = m.get32(handler + H_GONE) != 0
+    unlock()
+    if !gone { disconnect(handler) }
+}
+
+fn connect(instance: usize, signalId: u32, detail: u32, closure: usize, after: bool) -> u64 {
+    lock()
+    const s = signalAt(signalId)
+    const handler = m.alloc(H_SIZE)
+    const id = nextHandlerId
+    nextHandlerId += 1
+    m.put64(handler + H_ID, id)
+    m.put32(handler + H_SIGNAL, signalId)
+    m.put32(handler + H_DETAIL, detail)
+    m.putWord(handler + H_CLOSURE, closures.ref(closure))
+    closures.sink(closure)
+    m.put32(handler + H_AFTER, if after { 1 } else { 0 })
+    m.put32(handler + H_REFS, 1)
+    m.putWord(handler + H_INSTANCE, instance)
+    if m.getWord(closure + 8) == 0 { m.putWord(closure + 8, m.getWord(s + S_MARSHALLER)) }
+    m.pushWord(wordsAt(handlersOf(instance, true)), handler)
+    _ = hash.insert(handlersById, @intCast(usize, id), handler, true)
+    closures.addInvalidateNotifier(closure, handler, @intFromPtr(__mlx_glib_handler_closure_invalid))
+    unlock()
+    return id
+}
+
+fn handlerUnref(handler: usize) -> void {
+    if threads.refDec(handler + H_REFS) {
+        closures.unref(m.getWord(handler + H_CLOSURE))
+        m.release(handler)
+    }
+}
+
+// Takes the handler out of its instance's list and lets its closure go.
+fn disconnect(handler: usize) -> void {
+    lock()
+    if m.get32(handler + H_GONE) != 0 {
+        unlock()
+        return
+    }
+    m.put32(handler + H_GONE, 1)
+    const instance = m.getWord(handler + H_INSTANCE)
+    const list = wordsAt(handlersOf(instance, false))
+    var k: usize = 0
+    while k < list.*.length {
+        if m.wordAt(list, k) == handler {
+            var i = k
+            while i + 1 < list.*.length {
+                m.putWord(list.*.address + i * 8, m.wordAt(list, i + 1))
+                i += 1
+            }
+            list.*.length -= 1
+            break
+        }
+        k += 1
+    }
+    _ = hash.remove(handlersById, @intCast(usize, m.get64(handler + H_ID)), false)
+    closures.removeInvalidateNotifier(m.getWord(handler + H_CLOSURE), handler, @intFromPtr(__mlx_glib_handler_closure_invalid))
+    unlock()
+    handlerUnref(handler)
+}
+
+fn invalidSignal(function: []const u8, detailed: usize, instance: usize) -> void {
+    var t = m.text()
+    m.pushText(&t, function)
+    m.pushText(&t, ": signal '")
+    m.pushC(&t, detailed)
+    m.pushText(&t, "' is invalid for instance '")
+    pushPointer(&t, instance)
+    m.pushText(&t, "' of type '")
+    m.pushC(&t, types.describe(types.instanceType(instance)))
+    m.pushText(&t, "'")
+    warn(&t)
+}
+
+pub fn connectData(instance: usize, detailed: usize, handler: usize, data: usize, destroy: usize, flags: u32) -> u64 {
+    if instance == 0 || handler == 0 { return 0 }
+    const cells = m.alloc(8)
+    if !parse(detailed, types.instanceType(instance), cells, cells + 4, true) {
+        m.release(cells)
+        invalidSignal("g_signal_connect_data", detailed, instance)
+        return 0
+    }
+    const closure = closures.newC(handler, data, destroy, (flags & 2) != 0)
+    const id = connect(instance, m.get32(cells), m.get32(cells + 4), closure, (flags & 1) != 0)
+    m.release(cells)
+    return id
+}
+
+export fn g_signal_connect_data(instance: usize, detailed_signal: usize, c_handler: usize, data: usize, destroy_data: usize, connect_flags: u32) -> u64 {
+    return connectData(instance, detailed_signal, c_handler, data, destroy_data, connect_flags)
+}
+
+export fn g_signal_connect_closure_by_id(instance: usize, signal_id: u32, detail: u32, closure: usize, after: i32) -> u64 {
+    lock()
+    const s = signalAt(signal_id)
+    unlock()
+    if s == 0 || !types.isA(types.instanceType(instance), m.getWord(s + S_ITYPE)) {
+        var t = m.text()
+        m.pushText(&t, "g_signal_connect_closure_by_id: signal id '")
+        m.pushDecimal(&t, @intCast(u64, signal_id))
+        m.pushText(&t, "' is invalid for instance '")
+        pushPointer(&t, instance)
+        m.pushText(&t, "'")
+        warn(&t)
+        return 0
+    }
+    return connect(instance, signal_id, detail, closure, after != 0)
+}
+
+export fn g_signal_connect_closure(instance: usize, detailed_signal: usize, closure: usize, after: i32) -> u64 {
+    const cells = m.alloc(8)
+    if !parse(detailed_signal, types.instanceType(instance), cells, cells + 4, true) {
+        m.release(cells)
+        invalidSignal("g_signal_connect_closure", detailed_signal, instance)
+        return 0
+    }
+    const id = connect(instance, m.get32(cells), m.get32(cells + 4), closure, after != 0)
+    m.release(cells)
+    return id
+}
+
+fn handlerById(instance: usize, id: u64) -> usize {
+    lock()
+    const handler = hash.lookup(handlersById, @intCast(usize, id))
+    unlock()
+    if handler == 0 || m.getWord(handler + H_INSTANCE) != instance { return 0 }
+    return handler
+}
+
+fn noHandler(function: []const u8, instance: usize, id: u64) -> void {
+    var t = m.text()
+    m.pushText(&t, function)
+    m.pushText(&t, ": instance '")
+    pushPointer(&t, instance)
+    m.pushText(&t, "' has no handler with id '")
+    m.pushDecimal(&t, id)
+    m.pushText(&t, "'")
+    critical(&t)
+}
+
+export fn g_signal_handler_disconnect(instance: usize, handler_id: u64) -> void {
+    const handler = handlerById(instance, handler_id)
+    if handler == 0 {
+        noHandler("g_signal_handler_disconnect", instance, handler_id)
+        return
+    }
+    disconnect(handler)
+}
+
+export fn g_signal_handler_block(instance: usize, handler_id: u64) -> void {
+    const handler = handlerById(instance, handler_id)
+    if handler == 0 {
+        noHandler("g_signal_handler_block", instance, handler_id)
+        return
+    }
+    _ = @atomicRmw(u32, m.word32(handler + H_BLOCKED), add, 1, acq_rel)
+}
+
+export fn g_signal_handler_unblock(instance: usize, handler_id: u64) -> void {
+    const handler = handlerById(instance, handler_id)
+    if handler == 0 {
+        noHandler("g_signal_handler_unblock", instance, handler_id)
+        return
+    }
+    if m.get32(handler + H_BLOCKED) > 0 {
+        _ = @atomicRmw(u32, m.word32(handler + H_BLOCKED), sub, 1, acq_rel)
+    } else {
+        var t = m.text()
+        m.pushText(&t, "g_signal_handler_unblock: assertion 'handler->block_count > 0' failed")
+        critical(&t)
+    }
+}
+
+export fn g_signal_handler_is_connected(instance: usize, handler_id: u64) -> i32 { return if handlerById(instance, handler_id) != 0 { 1 } else { 0 } }
+
+export fn g_clear_signal_handler(handler_id_ptr: usize, instance: usize) -> void {
+    const id = m.get64(handler_id_ptr)
+    if id != 0 {
+        m.put64(handler_id_ptr, 0)
+        g_signal_handler_disconnect(instance, id)
+    }
+}
+
+fn matches(handler: usize, mask: u32, signalId: u32, detail: u32, closure: usize, func: usize, data: usize) -> bool {
+    if m.get32(handler + H_GONE) != 0 { return false }
+    if (mask & MATCH_ID) != 0 && m.get32(handler + H_SIGNAL) != signalId { return false }
+    if (mask & MATCH_DETAIL) != 0 && m.get32(handler + H_DETAIL) != detail { return false }
+    const c = m.getWord(handler + H_CLOSURE)
+    if (mask & MATCH_CLOSURE) != 0 && c != closure { return false }
+    if (mask & MATCH_FUNC) != 0 && m.getWord(c + 32) != func { return false }
+    if (mask & MATCH_DATA) != 0 && m.getWord(c + 16) != data { return false }
+    if (mask & MATCH_UNBLOCKED) != 0 && m.get32(handler + H_BLOCKED) != 0 { return false }
+    return true
+}
+
+// The handlers of the instance matching, each with a reference.
+fn matching(instance: usize, mask: u32, signalId: u32, detail: u32, closure: usize, func: usize, data: usize) -> m.Words {
+    var found = m.words()
+    lock()
+    const list = handlersOf(instance, false)
+    if list != 0 {
+        const handlers = wordsAt(list)
+        var k: usize = 0
+        while k < handlers.*.length {
+            const handler = m.wordAt(handlers, k)
+            if matches(handler, mask, signalId, detail, closure, func, data) {
+                threads.refInc(handler + H_REFS)
+                m.pushWord(&found, handler)
+            }
+            k += 1
+        }
+    }
+    unlock()
+    return found
+}
+
+export fn g_signal_handler_find(instance: usize, mask: u32, signal_id: u32, detail: u32, closure: usize, func: usize, data: usize) -> u64 {
+    if (mask & 63) == 0 { return 0 }
+    var found = matching(instance, mask, signal_id, detail, closure, func, data)
+    var id: u64 = 0
+    var k: usize = 0
+    while k < found.length {
+        if id == 0 { id = m.get64(m.wordAt(&found, k) + H_ID) }
+        handlerUnref(m.wordAt(&found, k))
+        k += 1
+    }
+    m.disposeWords(&found)
+    return id
+}
+
+fn eachMatched(instance: usize, mask: u32, signalId: u32, detail: u32, closure: usize, func: usize, data: usize, action: u32) -> u32 {
+    if (mask & 31) == 0 { return 0 }
+    var found = matching(instance, mask, signalId, detail, closure, func, data)
+    var k: usize = 0
+    while k < found.length {
+        const handler = m.wordAt(&found, k)
+        if action == 0 {
+            _ = @atomicRmw(u32, m.word32(handler + H_BLOCKED), add, 1, acq_rel)
+        } else if action == 1 {
+            if m.get32(handler + H_BLOCKED) > 0 { _ = @atomicRmw(u32, m.word32(handler + H_BLOCKED), sub, 1, acq_rel) }
+        } else {
+            disconnect(handler)
+        }
+        handlerUnref(handler)
+        k += 1
+    }
+    const n = @intCast(u32, found.length)
+    m.disposeWords(&found)
+    return n
+}
+
+export fn g_signal_handlers_block_matched(instance: usize, mask: u32, signal_id: u32, detail: u32, closure: usize, func: usize, data: usize) -> u32 { return eachMatched(instance, mask, signal_id, detail, closure, func, data, 0) }
+export fn g_signal_handlers_unblock_matched(instance: usize, mask: u32, signal_id: u32, detail: u32, closure: usize, func: usize, data: usize) -> u32 { return eachMatched(instance, mask, signal_id, detail, closure, func, data, 1) }
+export fn g_signal_handlers_disconnect_matched(instance: usize, mask: u32, signal_id: u32, detail: u32, closure: usize, func: usize, data: usize) -> u32 { return eachMatched(instance, mask, signal_id, detail, closure, func, data, 2) }
+
+// Every handler of an instance gone (when the instance is).
+pub fn destroyHandlers(instance: usize) -> void {
+    lock()
+    const list = handlersOf(instance, false)
+    unlock()
+    if list == 0 { return }
+    while true {
+        lock()
+        const handlers = wordsAt(list)
+        const handler = if handlers.*.length > 0 { m.wordAt(handlers, handlers.*.length - 1) } else { 0 }
+        unlock()
+        if handler == 0 { break }
+        disconnect(handler)
+    }
+    lock()
+    _ = hash.remove(handlersByInstance, instance, false)
+    m.disposeWords(wordsAt(list))
+    m.release(list)
+    unlock()
+}
+
+export fn g_signal_handlers_destroy(instance: usize) -> void { destroyHandlers(instance) }
+
+export fn g_signal_has_handler_pending(instance: usize, signal_id: u32, detail: u32, may_be_blocked: i32) -> i32 {
+    var found = matching(instance, MATCH_ID | (if may_be_blocked != 0 { 0 } else { MATCH_UNBLOCKED }), signal_id, 0, 0, 0, 0)
+    var pending = false
+    var k: usize = 0
+    while k < found.length {
+        const handler = m.wordAt(&found, k)
+        const d = m.get32(handler + H_DETAIL)
+        if d == 0 || d == detail { pending = true }
+        handlerUnref(handler)
+        k += 1
+    }
+    m.disposeWords(&found)
+    return if pending { 1 } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Emission hooks: the hook id, function, data and destroy notify.
+
+export fn g_signal_add_emission_hook(signal_id: u32, detail: u32, hook_func: usize, hook_data: usize, data_destroy: usize) -> u64 {
+    lock()
+    const s = signalAt(signal_id)
+    if s == 0 || (m.get32(s + S_FLAGS) & NO_HOOKS) != 0 {
+        unlock()
+        var t = m.text()
+        m.pushText(&t, "g_signal_add_emission_hook: assertion 'node->flags & G_SIGNAL_NO_HOOKS == 0' failed")
+        critical(&t)
+        return 0
+    }
+    const id = nextHookId
+    nextHookId += 1
+    const hooks = wordsAt(s + S_HOOKS)
+    m.pushWord(hooks, @intCast(usize, id))
+    m.pushWord(hooks, @intCast(usize, detail))
+    m.pushWord(hooks, hook_func)
+    m.pushWord(hooks, hook_data)
+    m.pushWord(hooks, data_destroy)
+    unlock()
+    return id
+}
+
+fn removeHook(s: usize, at: usize) -> void {
+    const hooks = wordsAt(s + S_HOOKS)
+    const data = m.wordAt(hooks, at + 3)
+    const destroy = m.wordAt(hooks, at + 4)
+    var i = at
+    while i + 5 < hooks.*.length {
+        m.putWord(hooks.*.address + i * 8, m.wordAt(hooks, i + 5))
+        i += 1
+    }
+    hooks.*.length -= 5
+    if destroy != 0 {
+        unlock()
+        const call: Notify = unsafe { @ptrFromInt(Notify, destroy) }
+        call(data)
+        lock()
+    }
+}
+
+export fn g_signal_remove_emission_hook(signal_id: u32, hook_id: u64) -> void {
+    lock()
+    const s = signalAt(signal_id)
+    if s != 0 {
+        const hooks = wordsAt(s + S_HOOKS)
+        var k: usize = 0
+        while k < hooks.*.length {
+            if m.wordAt(hooks, k) == @intCast(usize, hook_id) {
+                removeHook(s, k)
+                break
+            }
+            k += 5
+        }
+    }
+    unlock()
+}
+
+fn runHooks(s: usize, hint: usize, n: u32, params: usize, detail: u32) -> void {
+    lock()
+    const hooks = wordsAt(s + S_HOOKS)
+    var snapshot = m.words()
+    var k: usize = 0
+    while k < hooks.*.length {
+        const d = m.wordAt(hooks, k + 1)
+        if d == 0 || d == @intCast(usize, detail) {
+            m.pushWord(&snapshot, m.wordAt(hooks, k))
+            m.pushWord(&snapshot, m.wordAt(hooks, k + 2))
+            m.pushWord(&snapshot, m.wordAt(hooks, k + 3))
+        }
+        k += 5
+    }
+    unlock()
+    k = 0
+    while k < snapshot.length {
+        const call: Hook = unsafe { @ptrFromInt(Hook, m.wordAt(&snapshot, k + 1)) }
+        if call(hint, n, params, m.wordAt(&snapshot, k + 2)) == 0 {
+            g_signal_remove_emission_hook(m.get32(hint), @intCast(u64, m.wordAt(&snapshot, k)))
+        }
+        k += 3
+    }
+    m.disposeWords(&snapshot)
+}
+
+// ---------------------------------------------------------------------------
+// Emission
+
+// The class closure for an instance type: that of the type or its
+// nearest ancestor that has one; 0 when none. `chainType` gets its type.
+fn classClosureFor(s: usize, t: usize, chainType: usize) -> usize {
+    const list = wordsAt(s + S_CLASS_CLOSURES)
+    var current = t
+    while current != 0 {
+        var k: usize = 0
+        while k < list.*.length {
+            if m.wordAt(list, k) == current {
+                if chainType != 0 { m.putWord(chainType, current) }
+                return m.wordAt(list, k + 1)
+            }
+            k += 2
+        }
+        current = types.parentOf(current)
+    }
+    // An interface's signal: the class closure of the interface.
+    var k: usize = 0
+    while k < list.*.length {
+        if types.isA(t, m.wordAt(list, k)) {
+            if chainType != 0 { m.putWord(chainType, m.wordAt(list, k)) }
+            return m.wordAt(list, k + 1)
+        }
+        k += 2
+    }
+    return 0
+}
+
+fn pushEmission(instance: usize, signalId: u32, detail: u32) -> usize {
+    const e = m.alloc(E_SIZE)
+    m.putWord(e + E_INSTANCE, instance)
+    m.put32(e + E_HINT, signalId)
+    m.put32(e + E_HINT + 4, detail)
+    m.put32(e + E_THREAD, sys.tid())
+    m.putWord(e + E_CHAIN_TYPE, types.T_NONE)
+    lock()
+    m.pushWord(wordsAt(emissions), e)
+    unlock()
+    return e
+}
+
+fn popEmission(e: usize) -> void {
+    lock()
+    const list = wordsAt(emissions)
+    var k = list.*.length
+    while k > 0 {
+        k -= 1
+        if m.wordAt(list, k) == e {
+            var i = k
+            while i + 1 < list.*.length {
+                m.putWord(list.*.address + i * 8, m.wordAt(list, i + 1))
+                i += 1
+            }
+            list.*.length -= 1
+            break
+        }
+    }
+    unlock()
+    m.release(e)
+}
+
+fn innermost(instance: usize) -> usize {
+    lock()
+    const list = wordsAt(emissions)
+    const me = sys.tid()
+    var k = list.*.length
+    var found: usize = 0
+    while k > 0 {
+        k -= 1
+        const e = m.wordAt(list, k)
+        if m.getWord(e + E_INSTANCE) == instance && m.get32(e + E_THREAD) == me {
+            found = e
+            break
+        }
+    }
+    unlock()
+    return found
+}
+
+fn stopped(e: usize) -> bool { return m.get32(e + E_STATE) != 0 }
+
+// Runs a closure of the emission; with an accumulator the result goes
+// through it (whether to go on), else into the return value.
+fn runClosure(s: usize, e: usize, closure: usize, returnValue: usize, scratch: usize, n: u32, params: usize) -> bool {
+    const accumulator = m.getWord(s + S_ACCUMULATOR)
+    if accumulator == 0 || scratch == 0 {
+        closures.invoke(closure, returnValue, n, params, e + E_HINT)
+        return true
+    }
+    closures.invoke(closure, scratch, n, params, e + E_HINT)
+    const call: Accumulator = unsafe { @ptrFromInt(Accumulator, accumulator) }
+    const goOn = call(e + E_HINT, returnValue, scratch, m.getWord(s + S_ACCU_DATA)) != 0
+    values.reset(scratch)
+    m.put32(e + E_HINT + 8, m.get32(e + E_HINT + 8) & (0xffffffff ^ ACCUMULATOR_FIRST_RUN))
+    return goOn
+}
+
+fn runHandlers(s: usize, e: usize, instance: usize, signalId: u32, detail: u32, after: bool, returnValue: usize, scratch: usize, n: u32, params: usize) -> bool {
+    var found = matching(instance, MATCH_ID, signalId, 0, 0, 0, 0)
+    var goOn = true
+    var k: usize = 0
+    while k < found.length {
+        const handler = m.wordAt(&found, k)
+        const d = m.get32(handler + H_DETAIL)
+        const isAfter = m.get32(handler + H_AFTER) != 0
+        if goOn && !stopped(e) && isAfter == after && (d == 0 || d == detail) && m.get32(handler + H_BLOCKED) == 0 && m.get32(handler + H_GONE) == 0 {
+            if !runClosure(s, e, m.getWord(handler + H_CLOSURE), returnValue, scratch, n, params) { goOn = false }
+        }
+        handlerUnref(handler)
+        k += 1
+    }
+    m.disposeWords(&found)
+    return goOn
+}
+
+// GLib's signal_emit_unlocked_R: `params` the instance and the arguments
+// as GValues, `returnValue` initialized to the return type (or 0).
+pub fn emit(params: usize, signalId: u32, detail: u32, returnValue: usize) -> void {
+    const instance = m.getWord(params + 8)
+    lock()
+    const s = signalAt(signalId)
+    unlock()
+    if s == 0 { return }
+    const flags = m.get32(s + S_FLAGS)
+    const n = m.get32(s + S_N_PARAMS) + 1
+    const e = pushEmission(instance, signalId, detail)
+    const returnType = m.getWord(s + S_RETURN) & (0 - 1 - STATIC_SCOPE)
+    var scratch: usize = 0
+    var accu = returnValue
+    var ownAccu = false
+    if returnType != types.T_NONE && returnType != 0 {
+        if accu == 0 {
+            accu = m.alloc(24)
+            _ = values.init(accu, returnType)
+            ownAccu = true
+        }
+        if m.getWord(s + S_ACCUMULATOR) != 0 {
+            scratch = m.alloc(24)
+            _ = values.init(scratch, returnType)
+        }
+    }
+    const chainType = m.alloc(8)
+    lock()
+    const classClosure = classClosureFor(s, types.instanceType(instance), chainType)
+    unlock()
+    var goOn = true
+    m.put32(e + E_HINT + 8, RUN_FIRST | ACCUMULATOR_FIRST_RUN)
+    if (flags & RUN_FIRST) != 0 && classClosure != 0 {
+        m.putWord(e + E_CHAIN_TYPE, m.getWord(chainType))
+        goOn = runClosure(s, e, classClosure, accu, scratch, n, params)
+        m.putWord(e + E_CHAIN_TYPE, types.T_NONE)
+    }
+    if goOn && !stopped(e) && (flags & NO_HOOKS) == 0 { runHooks(s, e + E_HINT, n, params, detail) }
+    if goOn && !stopped(e) { goOn = runHandlers(s, e, instance, signalId, detail, false, accu, scratch, n, params) }
+    if goOn && !stopped(e) && (flags & RUN_LAST) != 0 && classClosure != 0 {
+        m.put32(e + E_HINT + 8, RUN_LAST | (m.get32(e + E_HINT + 8) & ACCUMULATOR_FIRST_RUN))
+        m.putWord(e + E_CHAIN_TYPE, m.getWord(chainType))
+        goOn = runClosure(s, e, classClosure, accu, scratch, n, params)
+        m.putWord(e + E_CHAIN_TYPE, types.T_NONE)
+    }
+    if goOn && !stopped(e) {
+        m.put32(e + E_HINT + 8, RUN_LAST | (m.get32(e + E_HINT + 8) & ACCUMULATOR_FIRST_RUN))
+        _ = runHandlers(s, e, instance, signalId, detail, true, accu, scratch, n, params)
+    }
+    if (flags & RUN_CLEANUP) != 0 && classClosure != 0 {
+        m.put32(e + E_HINT + 8, RUN_CLEANUP)
+        m.putWord(e + E_CHAIN_TYPE, m.getWord(chainType))
+        closures.invoke(classClosure, 0, n, params, e + E_HINT)
+    }
+    m.release(chainType)
+    if scratch != 0 {
+        values.unset(scratch)
+        m.release(scratch)
+    }
+    if ownAccu {
+        values.unset(accu)
+        m.release(accu)
+    }
+    popEmission(e)
+}
+
+export fn g_signal_emitv(instance_and_params: usize, signal_id: u32, detail: u32, return_value: usize) -> void { emit(instance_and_params, signal_id, detail, return_value) }
+
+fn emitFromList(instance: usize, signalId: u32, detail: u32, list: usize) -> void {
+    lock()
+    const s = signalAt(signalId)
+    unlock()
+    if s == 0 {
+        var t = m.text()
+        m.pushText(&t, "g_signal_emit_valist: signal id '")
+        m.pushDecimal(&t, @intCast(u64, signalId))
+        m.pushText(&t, "' is invalid for instance '")
+        pushPointer(&t, instance)
+        m.pushText(&t, "'")
+        warn(&t)
+        return
+    }
+    const nParams = @intCast(usize, m.get32(s + S_N_PARAMS))
+    const params = m.alloc((nParams + 1) * 24)
+    _ = values.init(params, types.instanceType(instance))
+    m.putWord(params + 8, instance)
+    var i: usize = 0
+    while i < nParams {
+        const pt = m.getWord(m.getWord(s + S_PARAMS) + i * 8)
+        const value = params + (i + 1) * 24
+        _ = values.init(value, pt & (0 - 1 - STATIC_SCOPE))
+        const err = values.collect(value, list, if (pt & STATIC_SCOPE) != 0 { values.NOCOPY_CONTENTS } else { 0 })
+        if err != 0 {
+            messages.log(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, err)
+            m.release(err)
+        }
+        i += 1
+    }
+    // The instance's GValue holds no reference of its own.
+    const returnType = m.getWord(s + S_RETURN)
+    var returnValue: usize = 0
+    if (returnType & (0 - 1 - STATIC_SCOPE)) != types.T_NONE {
+        returnValue = m.alloc(24)
+        _ = values.init(returnValue, returnType & (0 - 1 - STATIC_SCOPE))
+    }
+    emit(params, signalId, detail, returnValue)
+    if returnValue != 0 {
+        const err = values.lcopy(returnValue, list, if (returnType & STATIC_SCOPE) != 0 { values.NOCOPY_CONTENTS } else { 0 })
+        if err != 0 { m.release(err) }
+        values.unset(returnValue)
+        m.release(returnValue)
+    }
+    i = 0
+    while i < nParams {
+        values.unset(params + (i + 1) * 24)
+        i += 1
+    }
+    m.release(params)
+}
+
+export fn g_signal_emit_valist(instance: usize, signal_id: u32, detail: u32, var_args: usize) -> void { emitFromList(instance, signal_id, detail, var_args) }
+
+export fn g_signal_emit(instance: usize, signal_id: u32, detail: u32, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> void {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ instance, @intCast(usize, signal_id), @intCast(usize, detail), a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 3, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    emitFromList(instance, signal_id, detail, list)
+}
+
+export fn g_signal_emit_by_name(instance: usize, detailed_signal: usize, a2: usize, a3: usize, a4: usize, a5: usize, x0: f64, x1: f64, x2: f64, x3: f64, x4: f64, x5: f64, x6: f64, x7: f64) -> void {
+    var call: varargs.CallList = undefined
+    var words: [6]usize = [6]usize{ instance, detailed_signal, a2, a3, a4, a5 }
+    var doubles: [8]f64 = [8]f64{ x0, x1, x2, x3, x4, x5, x6, x7 }
+    const list = varargs.start(&call, 2, @frameAddress(), @intFromPtr(&words), @intFromPtr(&doubles))
+    const cells = m.alloc(8)
+    if !parse(detailed_signal, types.instanceType(instance), cells, cells + 4, true) {
+        m.release(cells)
+        invalidSignal("g_signal_emit_by_name", detailed_signal, instance)
+        return
+    }
+    emitFromList(instance, m.get32(cells), m.get32(cells + 4), list)
+    m.release(cells)
+}
+
+export fn g_signal_get_invocation_hint(instance: usize) -> usize {
+    const e = innermost(instance)
+    return if e == 0 { 0 } else { e + E_HINT }
+}
+
+export fn g_signal_stop_emission(instance: usize, signal_id: u32, detail: u32) -> void {
+    lock()
+    const list = wordsAt(emissions)
+    const me = sys.tid()
+    var k = list.*.length
+    var found = false
+    while k > 0 {
+        k -= 1
+        const e = m.wordAt(list, k)
+        if m.getWord(e + E_INSTANCE) == instance && m.get32(e + E_HINT) == signal_id && m.get32(e + E_HINT + 4) == detail && m.get32(e + E_THREAD) == me {
+            m.put32(e + E_STATE, 1)
+            found = true
+            break
+        }
+    }
+    unlock()
+    if !found {
+        var t = m.text()
+        m.pushText(&t, "g_signal_stop_emission: no emission of signal \"")
+        m.pushC(&t, g_signal_name(signal_id))
+        m.pushText(&t, "\" to stop for instance '")
+        pushPointer(&t, instance)
+        m.pushText(&t, "'")
+        warn(&t)
+    }
+}
+
+export fn g_signal_stop_emission_by_name(instance: usize, detailed_signal: usize) -> void {
+    const cells = m.alloc(8)
+    if parse(detailed_signal, types.instanceType(instance), cells, cells + 4, false) {
+        g_signal_stop_emission(instance, m.get32(cells), m.get32(cells + 4))
+    } else {
+        invalidSignal("g_signal_stop_emission_by_name", detailed_signal, instance)
+    }
+    m.release(cells)
+}
+
+export fn g_signal_chain_from_overridden(instance_and_params: usize, return_value: usize) -> void {
+    const instance = m.getWord(instance_and_params + 8)
+    const e = innermost(instance)
+    if e == 0 { return }
+    lock()
+    const s = signalAt(m.get32(e + E_HINT))
+    const current = m.getWord(e + E_CHAIN_TYPE)
+    var closure: usize = 0
+    const chainType = m.alloc(8)
+    if current != types.T_NONE {
+        const parent = types.parentOf(current)
+        if parent != 0 {
+            closure = classClosureFor(s, parent, chainType)
+            if closure != 0 && m.getWord(chainType) == current { closure = 0 }
+        }
+    } else {
+        var t = m.text()
+        m.pushText(&t, "g_signal_chain_from_overridden: signal cannot be chained from current emission stage for instance '")
+        pushPointer(&t, instance)
+        m.pushText(&t, "'")
+        critical(&t)
+    }
+    unlock()
+    if closure != 0 {
+        m.putWord(e + E_CHAIN_TYPE, m.getWord(chainType))
+        closures.invoke(closure, return_value, m.get32(s + S_N_PARAMS) + 1, instance_and_params, e + E_HINT)
+        m.putWord(e + E_CHAIN_TYPE, current)
+    }
+    m.release(chainType)
+}
+
+export fn g_signal_accumulator_true_handled(ihint: usize, return_accu: usize, handler_return: usize, data: usize) -> i32 {
+    const handled = m.getI32(handler_return + 8) != 0
+    m.putWord(return_accu + 8, if handled { 1 } else { 0 })
+    return if handled { 0 } else { 1 }
+}
+
+export fn g_signal_accumulator_first_wins(ihint: usize, return_accu: usize, handler_return: usize, data: usize) -> i32 {
+    values.copy(handler_return, return_accu)
+    return 0
+}

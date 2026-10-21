@@ -261,18 +261,27 @@ each group are joined by magenta lines in space.
   | float literals with 12 decimals and more | now float literals fold, and `std.math` has pi and the like |
   | `sqrt`, `sin`, `exp`, ... written in Mlx | now `std.math`, `@sqrt`, `@floor`, `@ceil`, `@trunc` |
   | comments: workaround, miscompilation, "does not yet", TODO, FIXME, HACK | what the comment names |
+  | `page_allocator.init()` outside the backing sites (`BACKING_SITES`: the bootstrap, `std.heap` and `std.leaks`, the self-hosted compiler, the C libraries, the compilers' arenas, codemap's index, the tests) | now `std.heap.allocator()`, the program's heap; pages for backing only |
+  | an open-addressing probe, `slot = (slot + 1) & (N - 1)` or `% N`, in a function that speaks of a hash, a slot or a probe | now `std.HashMap`, `std.AutoHashMap`, `std.StringHashMap` |
+  | a struct with a `[*]T` field and a `capacity: usize` next to it | now `std.ArrayList(T)` |
 
-  Three kinds can be rewritten away, now that the compiler does without
-  them: dropped results (`const ignored = call(...)` becomes `_ =
-  call(...)`), counted lengths (`for byte in text { length += 1 }`
-  becomes `length += text.length`) and values set in unsafe (`var x: T =
-  undefined` with `unsafe { x = v }` becomes `const x: T = unsafe { v }`)
+  (The last two leave out `CONTAINER_SITES`: the bootstrap library and
+  the containers themselves, the leak checker, the self-hosted compiler,
+  the C libraries, the tests.)
+
+  Four kinds can be rewritten away, now that the compiler and the
+  library do without them: dropped results (`const ignored = call(...)`
+  becomes `_ = call(...)`), counted lengths (`for byte in text { length
+  += 1 }` becomes `length += text.length`), values set in unsafe (`var x:
+  T = undefined` with `unsafe { x = v }` becomes `const x: T = unsafe { v
+  }`) and pages taken as the allocator (`std.page_allocator.init()`
+  becomes `std.heap.allocator()`)
   ([`tools/codemap/rewrite.mlx`](../../tools/codemap/rewrite.mlx)). In the
   panel, *Rewrite ...* under the kind shows each line before and after;
   *Apply* writes them and reads the code again. It can only when the
   compiler (`$MLX_COMPILER`, else `mlx-out/bin/compiler/mlx4`, else
   `mlx4`) builds a program with what they need. On the command line:
-  `mlx-codemap rewrite dropped|counted|unsafe [PATH] [--apply]`. Files under `compiler/`,
+  `mlx-codemap rewrite dropped|counted|unsafe|pages [PATH] [--apply]`. Files under `compiler/`,
   `std/bootstrap/` (the bootstrap compiler builds them) and `tests/` are
   left as they are.
 
@@ -280,7 +289,7 @@ each group are joined by magenta lines in space.
   each; *Count the history* counts the commits not counted yet in the
   background ([`tools/codemap/trend.mlx`](../../tools/codemap/trend.mlx)).
   Each commit is taken out with `git archive` and counted once; the counts
-  are kept in `~/.cache/mlx/codemap/workarounds-v1`. `mlx-codemap history
+  are kept in `~/.cache/mlx/codemap/workarounds-v2`. `mlx-codemap history
   [N]` does the same on the command line, with a row of bars per kind.
 
 - **Crashes:** what the desktop programs kept when they crashed, newest
@@ -688,8 +697,8 @@ of popping up.
   For the whole repository (47,000 nodes) that takes about a second.
 - [`main.mlx`](main.mlx) holds the app's state and its frame loop; its
   parts each take one area: [`map_view.mlx`](map_view.mlx) projects the
-  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx): sin, cos, ln
-  and exp written out, the square root `@sqrt`), makes the frame's primitives and places labels
+  nodes with an orbit camera ([`math3d.mlx`](math3d.mlx), with
+  std.math's sines, roots and clamping), makes the frame's primitives and places labels
   so none covers another; [`navigation.mlx`](navigation.mlx) (reading,
   selecting, searching), [`input.mlx`](input.mlx), [`drawing.mlx`](drawing.mlx)
   and [`detail.mlx`](detail.mlx) (the panels), [`tabs.mlx`](tabs.mlx),
@@ -732,7 +741,7 @@ hold, `-` before one turns it around.
 | `uses:NAME`, `calls:NAME` | uses (any way) or calls something named NAME |
 | `by:NAME` | is called by something named NAME |
 | `crashed` | a kept crash stopped in it or went through it |
-| `workaround`, `workaround:KIND` | works around something (`dropped`, `counted`, `pointers`, `casts`, `unsafe`, `arena`, `floats`, `math`, `comments`) |
+| `workaround`, `workaround:KIND` | works around something (`dropped`, `counted`, `pointers`, `casts`, `unsafe`, `arena`, `floats`, `math`, `comments`, `pages`, `tables`, `arrays`) |
 | `unused`, `unreachable`, `untested`, `complex`, `risky`, `hot`, `copy` | is one of that finding's |
 | `changed`, `added` | changed or added since the base (`since:REV`, else HEAD) |
 

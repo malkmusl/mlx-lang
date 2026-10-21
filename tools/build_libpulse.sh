@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds MLX Audio's client libraries (projects/desktop/libpulse): Mlx
+# Builds MLX Audio's client libraries (compiler/libc/pulse): Mlx
 # stand-ins for PulseAudio's libpulse0 and libpulse-mainloop-glib0 and for
 # alsa-plugins' pulse plugin (libasound2-plugins), so that neither package
 # is needed for programs to reach MLX Audio.
@@ -41,7 +41,7 @@ mkdir -p "$out"
 
 libraries=(libpulse.so.0 libpulse-simple.so.0 libpulse-mainloop-glib.so.0 libasound_module_pcm_pulse.so libasound_module_ctl_pulse.so)
 if [[ -n "$compiler" ]]; then
-    source=projects/desktop/libpulse
+    source=compiler/libc/pulse
     "$compiler" --quiet --plugin --soname=libpulse.so.0 --symbol-version=PULSE_0 "$source/libpulse.mlx" -o "$out/libpulse.so.0"
     "$compiler" --quiet --plugin --library libpulse.so.0 --soname=libpulse-simple.so.0 --symbol-version=PULSE_0 "$source/simple.mlx" -o "$out/libpulse-simple.so.0"
     "$compiler" --quiet --plugin --library libglib-2.0.so.0 --soname=libpulse-mainloop-glib.so.0 --symbol-version=PULSE_0 "$source/glib.mlx" -o "$out/libpulse-mainloop-glib.so.0"
@@ -83,7 +83,7 @@ ctl.pulse {
 }
 CONF
 cat > "$staged/usr/share/doc/mlx-audio-libs/copyright" <<'TEXT'
-MLX Audio's client libraries, written in Mlx (projects/desktop/libpulse in
+MLX Audio's client libraries, written in Mlx (compiler/libc/pulse in
 the mlx-lang repository). They implement the interfaces of PulseAudio's
 libpulse and of alsa-plugins' pulse plugin, whose behavior they follow.
 TEXT

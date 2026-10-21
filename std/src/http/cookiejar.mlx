@@ -1,0 +1,719 @@
+// std.http.cookiejar: a cookie jar as libsoup's SoupCookieJar keeps one:
+// cookies by domain in the order they came, the ones that go with a
+// request (RFC 6265 5.4: longest paths first, then the oldest; SameSite
+// as libsoup applies it, with the top-level site and whether the request
+// is a top-level navigation by a safe method), the ones a response sets
+// taken by the jar's accept policy and libsoup's rules (no public
+// suffixes, no secure cookies from http, SameSite=None only with Secure,
+// the __Secure- and __Host- prefixes, no control characters, at most 4096
+// bytes a name or value), and the Mozilla cookies.txt file a jar is kept
+// in. Each change is told to a callback with the cookie before and after
+// (none for one added or removed).
+//
+//     var jar: cookiejar.Jar = undefined
+//     cookiejar.init(&jar, allocator)
+//     cookiejar.setCookie(&jar, "id=7; Path=/", origin, false, firstParty, now)
+//     var found: cookiejar.Found = undefined
+//     cookiejar.cookiesFor(&jar, &request, now, &found)
+//     cookiejar.writeCookieHeader(sink, &found)      // id=7
+//     cookiejar.freeFound(&jar, &found)
+//     cookiejar.deinit(&jar)
+const headers = @import("./headers.mlx")
+const cookie = @import("./cookie.mlx")
+const psl = @import("./psl.mlx")
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const Cookie = cookie.Cookie
+
+// SoupCookieJarAcceptPolicy, in libsoup's order.
+pub const Policy = enum(u8) {
+    always,
+    never,
+    noThirdParty,
+    // Third-party cookies from a domain the jar already has cookies of.
+    grandfatheredThirdParty
+}
+
+// Told of each change: the cookie as it was (null for one added) and as
+// it is (null for one removed); both are the jar's and live through the
+// call only.
+pub const ChangedFn = fn(context: usize, old: ?*const Cookie, new: ?*const Cookie) -> void
+
+const Entry = struct {
+    cookie: Cookie
+    // The order it came in (a replaced cookie counts as new).
+    serial: u32
+}
+
+const Domain = struct {
+    name: []const u8
+    nameStorage: [*]u8
+    entries: [*]Entry
+    count: usize
+    capacity: usize
+}
+
+pub const Jar = struct {
+    allocator: Allocator
+    domains: [*]Domain
+    count: usize
+    capacity: usize
+    serial: u32
+    policy: Policy
+    onChanged: ChangedFn
+    context: usize
+    hasChanged: bool
+}
+
+// A request, for the cookies that go with it.
+pub const Request = struct {
+    host: []const u8
+    // The request's path, normalized.
+    path: []const u8
+    https: bool
+    // Whether the cookies go in a header (else to a script: no HttpOnly ones).
+    forHttp: bool
+    // Whether the method is safe (GET, HEAD, OPTIONS, PROPFIND, TRACE).
+    safeMethod: bool
+    topLevelNavigation: bool
+    // The top-level document's host (none for a first-party request).
+    hasTopLevel: bool
+    topLevelHost: []const u8
+    // The site for cookies' host (libsoup's site-for-cookies), if known.
+    hasSiteForCookies: bool
+    siteForCookiesHost: []const u8
+}
+
+// Where a response came from: the request's host, normalized path and
+// scheme.
+pub const Origin = struct {
+    host: []const u8
+    path: []const u8
+    https: bool
+}
+
+// The cookies found for a request, in the order they are sent.
+pub const Found = struct {
+    items: [*]*Cookie
+    count: usize
+    capacity: usize
+}
+
+fn noChange(context: usize, old: ?*const Cookie, new: ?*const Cookie) -> void {}
+
+pub fn init(jar: *Jar, allocator: Allocator) -> void {
+    jar.*.allocator = allocator
+    jar.*.count = 0
+    jar.*.capacity = 0
+    jar.*.serial = 0
+    jar.*.policy = Policy.always
+    jar.*.onChanged = noChange
+    jar.*.context = 0
+    jar.*.hasChanged = false
+}
+
+// Sets the callback told of each change.
+pub fn onChanged(jar: *Jar, callback: ChangedFn, context: usize) -> void {
+    jar.*.onChanged = callback
+    jar.*.context = context
+    jar.*.hasChanged = true
+}
+
+pub fn deinit(jar: *Jar) -> void {
+    var d: usize = 0
+    while d < jar.*.count {
+        const domain = &jar.*.domains[d]
+        var i: usize = 0
+        while i < domain.*.count {
+            cookie.cookieFree(jar.*.allocator, &domain.*.entries[i].cookie)
+            i += 1
+        }
+        if domain.*.capacity != 0 { jar.*.allocator.free(unsafe { @ptrCast([*]u8, domain.*.entries) }, domain.*.capacity * @sizeOf(Entry), 8) }
+        if domain.*.name.length != 0 { jar.*.allocator.free(domain.*.nameStorage, domain.*.name.length, 1) }
+        d += 1
+    }
+    if jar.*.capacity != 0 { jar.*.allocator.free(unsafe { @ptrCast([*]u8, jar.*.domains) }, jar.*.capacity * @sizeOf(Domain), 8) }
+    jar.*.count = 0
+    jar.*.capacity = 0
+}
+
+fn changed(jar: *Jar, old: ?*const Cookie, new: ?*const Cookie) -> void {
+    if jar.*.hasChanged { jar.*.onChanged(jar.*.context, old, new) }
+}
+
+// ---------------------------------------------------------------------------
+// The domains
+
+fn findDomain(jar: *Jar, name: []const u8) -> usize {
+    var d: usize = 0
+    while d < jar.*.count {
+        if headers.equalsIgnoringCase(jar.*.domains[d].name, name) { return d }
+        d += 1
+    }
+    return jar.*.count
+}
+
+fn growDomains(jar: *Jar) -> bool {
+    if jar.*.count < jar.*.capacity { return true }
+    const capacity = if jar.*.capacity == 0 { 8 } else { jar.*.capacity * 2 }
+    const memory = jar.*.allocator.alloc(capacity * @sizeOf(Domain), 8)
+    if memory == null { return false }
+    const domains: [*]Domain = unsafe { @ptrCast([*]Domain, memory.?) }
+    var d: usize = 0
+    while d < jar.*.count {
+        domains[d] = jar.*.domains[d]
+        d += 1
+    }
+    if jar.*.capacity != 0 { jar.*.allocator.free(unsafe { @ptrCast([*]u8, jar.*.domains) }, jar.*.capacity * @sizeOf(Domain), 8) }
+    jar.*.domains = domains
+    jar.*.capacity = capacity
+    return true
+}
+
+fn addDomain(jar: *Jar, name: []const u8) -> usize {
+    if !growDomains(jar) { return jar.*.count }
+    var storage: [*]u8 = undefined
+    if name.length > 0 {
+        const memory = jar.*.allocator.alloc(name.length, 1)
+        if memory == null { return jar.*.count }
+        storage = memory.?
+        var i: usize = 0
+        while i < name.length {
+            storage[i] = name[i]
+            i += 1
+        }
+    }
+    const d = jar.*.count
+    jar.*.domains[d].name = if name.length > 0 { storage[0..name.length] } else { name }
+    jar.*.domains[d].nameStorage = storage
+    jar.*.domains[d].count = 0
+    jar.*.domains[d].capacity = 0
+    jar.*.count += 1
+    return d
+}
+
+fn growEntries(jar: *Jar, domain: *Domain) -> bool {
+    if domain.*.count < domain.*.capacity { return true }
+    const capacity = if domain.*.capacity == 0 { 4 } else { domain.*.capacity * 2 }
+    const memory = jar.*.allocator.alloc(capacity * @sizeOf(Entry), 8)
+    if memory == null { return false }
+    const entries: [*]Entry = unsafe { @ptrCast([*]Entry, memory.?) }
+    var i: usize = 0
+    while i < domain.*.count {
+        entries[i] = domain.*.entries[i]
+        i += 1
+    }
+    if domain.*.capacity != 0 { jar.*.allocator.free(unsafe { @ptrCast([*]u8, domain.*.entries) }, domain.*.capacity * @sizeOf(Entry), 8) }
+    domain.*.entries = entries
+    domain.*.capacity = capacity
+    return true
+}
+
+// Takes entry `index` out of its domain (the cookie freed).
+fn removeEntry(jar: *Jar, domain: *Domain, index: usize) -> void {
+    cookie.cookieFree(jar.*.allocator, &domain.*.entries[index].cookie)
+    var i = index
+    while i + 1 < domain.*.count {
+        domain.*.entries[i] = domain.*.entries[i + 1]
+        i += 1
+    }
+    domain.*.count -= 1
+}
+
+fn nextSerial(jar: *Jar) -> u32 {
+    jar.*.serial += 1
+    return jar.*.serial
+}
+
+// ---------------------------------------------------------------------------
+// The cookies of a request
+
+fn growFound(jar: *Jar, found: *Found) -> bool {
+    if found.*.count < found.*.capacity { return true }
+    const capacity = if found.*.capacity == 0 { 8 } else { found.*.capacity * 2 }
+    const memory = jar.*.allocator.alloc(capacity * 8, 8)
+    if memory == null { return false }
+    const items: [*]*Cookie = unsafe { @ptrCast([*]*Cookie, memory.?) }
+    var i: usize = 0
+    while i < found.*.count {
+        items[i] = found.*.items[i]
+        i += 1
+    }
+    if found.*.capacity != 0 { jar.*.allocator.free(unsafe { @ptrCast([*]u8, found.*.items) }, found.*.capacity * 8, 8) }
+    found.*.items = items
+    found.*.capacity = capacity
+    return true
+}
+
+pub fn freeFound(jar: *Jar, found: *Found) -> void {
+    if found.*.capacity != 0 { jar.*.allocator.free(unsafe { @ptrCast([*]u8, found.*.items) }, found.*.capacity * 8, 8) }
+    found.*.count = 0
+    found.*.capacity = 0
+}
+
+// libsoup's SameSite check for a cookie against a request.
+fn validForSameSite(ck: *const Cookie, request: *const Request) -> bool {
+    if ck.*.sameSite == cookie.SameSite.none { return true }
+    if !request.*.hasTopLevel { return true }
+    if ck.*.sameSite == cookie.SameSite.lax && request.*.topLevelNavigation && (request.*.safeMethod || !request.*.forHttp) { return true }
+    if request.*.topLevelNavigation && !request.*.hasSiteForCookies { return false }
+    const other = if request.*.hasSiteForCookies { request.*.siteForCookiesHost } else { request.*.topLevelHost }
+    return cookie.hostMatches(other, request.*.host)
+}
+
+fn serialOf(jar: *Jar, ck: *Cookie) -> u32 {
+    // (A found cookie is an entry's; its serial sits right after it.)
+    const entry: *Entry = unsafe { @ptrCast(*Entry, ck) }
+    return entry.*.serial
+}
+
+// RFC 6265 5.4: longer paths first, then the cookies that came first.
+fn before(jar: *Jar, a: *Cookie, b: *Cookie) -> bool {
+    if a.*.path.length != b.*.path.length { return a.*.path.length > b.*.path.length }
+    return serialOf(jar, a) < serialOf(jar, b)
+}
+
+fn sortFound(jar: *Jar, found: *Found) -> void {
+    var i: usize = 1
+    while i < found.*.count {
+        var j = i
+        while j > 0 && before(jar, found.*.items[j], found.*.items[j - 1]) {
+            const t = found.*.items[j]
+            found.*.items[j] = found.*.items[j - 1]
+            found.*.items[j - 1] = t
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+fn collect(jar: *Jar, domainName: []const u8, request: *const Request, now: i64, found: *Found) -> void {
+    const d = findDomain(jar, domainName)
+    if d == jar.*.count { return }
+    const domain = &jar.*.domains[d]
+    var i: usize = 0
+    while i < domain.*.count {
+        const ck = &domain.*.entries[i].cookie
+        if cookie.isExpired(ck, now) {
+            // (Told after the cookie is gone, as libsoup tells it.)
+            var gone: Cookie = undefined
+            const kept = cookie.copy(jar.*.allocator, ck, &gone)
+            removeEntry(jar, domain, i)
+            if kept {
+                changed(jar, &gone, null)
+                cookie.cookieFree(jar.*.allocator, &gone)
+            }
+            continue
+        }
+        if cookie.appliesTo(ck, request.*.https, request.*.path, now) && validForSameSite(ck, request) && (request.*.forHttp || !ck.*.httpOnly) {
+            if growFound(jar, found) {
+                found.*.items[found.*.count] = ck
+                found.*.count += 1
+            }
+        }
+        i += 1
+    }
+}
+
+// The cookies that go with `request`, as the jar's own (valid until the
+// jar changes): those of ".host", of "host", and of each parent domain
+// with its dot, expired ones dropped on the way, sorted as the Cookie
+// header lists them. `found` is the caller's, freed with freeFound.
+pub fn cookiesFor(jar: *Jar, request: *const Request, now: i64, found: *Found) -> void {
+    found.*.count = 0
+    found.*.capacity = 0
+    const host = request.*.host
+    if host.length == 0 { return }
+    // ".host" needs a byte before the host: a copy of it.
+    var dotted: [256]u8 = undefined
+    if host.length + 1 <= dotted.length {
+        dotted[0] = 46
+        var i: usize = 0
+        while i < host.length {
+            dotted[1 + i] = host[i]
+            i += 1
+        }
+        collect(jar, dotted[0..host.length + 1], request, now, found)
+    }
+    collect(jar, host, request, now, found)
+    // Then each parent domain with its dot: ".example.com", ".com".
+    var at: usize = 1
+    while at < host.length {
+        if host[at] == 46 { collect(jar, host[at..host.length], request, now, found) }
+        at += 1
+    }
+    sortFound(jar, found)
+}
+
+// The Cookie header's value of the cookies found: `a=1; b=2`.
+pub fn writeCookieHeader(sink: headers.Sink, found: *const Found) -> void {
+    var i: usize = 0
+    var first = true
+    while i < found.*.count {
+        const ck = found.*.items[i]
+        if ck.*.name.length != 0 || ck.*.value.length != 0 {
+            cookie.write(sink, ck, false, first)
+            first = false
+        }
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adding
+
+fn hasControl(text: []const u8) -> bool {
+    for ch in text {
+        if (ch < 32 && ch != 9) || ch == 127 { return true }
+    }
+    return false
+}
+
+fn hasPrefixIgnoringCase(text: []const u8, prefix: []const u8) -> bool {
+    if text.length < prefix.length { return false }
+    return headers.equalsIgnoringCase(text[0..prefix.length], prefix)
+}
+
+// libsoup's soup_tld_get_base_domain: the registrable domain of a host,
+// or the host itself when it has none (an address, a public suffix...).
+pub fn baseDomain(host: []const u8) -> []const u8 {
+    if host.length > 0 && host[0] == 46 { return host }
+    if cookie.isIpAddress(host) { return host }
+    const suffix = psl.suffixStart(host)
+    if !psl.isPublicSuffix(host[suffix..host.length], true) { return host }
+    const registrable = psl.registrableStart(host)
+    if registrable == host.length { return host }
+    return host[registrable..host.length]
+}
+
+fn withoutDot(domain: []const u8) -> []const u8 {
+    if domain.length > 0 && domain[0] == 46 { return domain[1..domain.length] }
+    return domain
+}
+
+// Whether a cookie is a third party's for the first-party host, by the
+// policy: not when their base domains match; with the grandfathered
+// policy, not when the jar has the cookie's domain already.
+fn isThirdParty(jar: *Jar, ck: *const Cookie, hasFirstParty: bool, firstPartyHost: []const u8) -> bool {
+    if jar.*.policy != Policy.noThirdParty && jar.*.policy != Policy.grandfatheredThirdParty { return false }
+    if !hasFirstParty || firstPartyHost.length == 0 { return true }
+    const cookieBase = baseDomain(withoutDot(ck.*.domain))
+    const firstBase = baseDomain(firstPartyHost)
+    if cookie.hostMatches(cookieBase, firstBase) { return false }
+    if jar.*.policy == Policy.noThirdParty { return true }
+    return findDomain(jar, ck.*.domain) == jar.*.count
+}
+
+// libsoup's soup_cookie_jar_add_cookie_full: `ck` (owning its texts, or
+// a view that is copied) is taken into the jar by the policy and the
+// rules above, replacing one of the same name and path, or dropped; the
+// cookie given is the jar's or freed after. `hasOrigin`: whether it came
+// over https (a secure cookie is refused from http); `hasFirstParty`: the
+// first-party host for the policy.
+pub fn addCookie(jar: *Jar, given: *Cookie, hasOrigin: bool, https: bool, hasFirstParty: bool, firstPartyHost: []const u8, now: i64) -> void {
+    var ck = given.*
+    if ck.capacity == 0 {
+        if !cookie.own(jar.*.allocator, &ck) { return }
+    }
+    const domainName = ck.domain
+    if !cookie.isIpAddress(domainName) && psl.isPublicSuffix(domainName, true) {
+        cookie.cookieFree(jar.*.allocator, &ck)
+        return
+    }
+    if hasFirstParty {
+        if jar.*.policy == Policy.never || isThirdParty(jar, &ck, hasFirstParty, firstPartyHost) {
+            cookie.cookieFree(jar.*.allocator, &ck)
+            return
+        }
+    }
+    if hasOrigin && !https && ck.secure {
+        cookie.cookieFree(jar.*.allocator, &ck)
+        return
+    }
+    if ck.sameSite == cookie.SameSite.none && !ck.secure {
+        cookie.cookieFree(jar.*.allocator, &ck)
+        return
+    }
+    if hasPrefixIgnoringCase(ck.name, "__Secure-") && !ck.secure {
+        cookie.cookieFree(jar.*.allocator, &ck)
+        return
+    }
+    if hasPrefixIgnoringCase(ck.name, "__Host-") {
+        if !ck.secure || !cookie.sameText(ck.path, "/") || (domainName.length > 0 && domainName[0] == 46) {
+            cookie.cookieFree(jar.*.allocator, &ck)
+            return
+        }
+    }
+    if hasControl(ck.name) || hasControl(ck.value) || ck.name.length > 4096 || ck.value.length > 4096 {
+        cookie.cookieFree(jar.*.allocator, &ck)
+        return
+    }
+    var d = findDomain(jar, domainName)
+    if d == jar.*.count {
+        d = addDomain(jar, domainName)
+        if d == jar.*.count {
+            cookie.cookieFree(jar.*.allocator, &ck)
+            return
+        }
+    }
+    const domain = &jar.*.domains[d]
+    var i: usize = 0
+    while i < domain.*.count {
+        const old = &domain.*.entries[i].cookie
+        if cookie.sameText(ck.name, old.*.name) && old.*.hasPath == ck.hasPath && cookie.sameText(ck.path, old.*.path) {
+            if old.*.secure && hasOrigin && !https {
+                cookie.cookieFree(jar.*.allocator, &ck)
+            } else if cookie.isExpired(&ck, now) {
+                var gone: Cookie = undefined
+                const kept = cookie.copy(jar.*.allocator, old, &gone)
+                removeEntry(jar, domain, i)
+                if kept {
+                    changed(jar, &gone, null)
+                    cookie.cookieFree(jar.*.allocator, &gone)
+                }
+                cookie.cookieFree(jar.*.allocator, &ck)
+            } else {
+                const was = old.*
+                domain.*.entries[i].cookie = ck
+                domain.*.entries[i].serial = nextSerial(jar)
+                changed(jar, &was, &domain.*.entries[i].cookie)
+                var free = was
+                cookie.cookieFree(jar.*.allocator, &free)
+            }
+            return
+        }
+        i += 1
+    }
+    if cookie.isExpired(&ck, now) {
+        cookie.cookieFree(jar.*.allocator, &ck)
+        return
+    }
+    if !growEntries(jar, domain) {
+        cookie.cookieFree(jar.*.allocator, &ck)
+        return
+    }
+    domain.*.entries[domain.*.count].cookie = ck
+    domain.*.entries[domain.*.count].serial = nextSerial(jar)
+    domain.*.count += 1
+    changed(jar, null, &domain.*.entries[domain.*.count - 1].cookie)
+}
+
+// libsoup's soup_cookie_jar_set_cookie_with_first_party: a Set-Cookie
+// value from `origin` taken into the jar (`hasFirstParty`: by the policy
+// for that first party).
+pub fn setCookie(jar: *Jar, header: []const u8, origin: *const Origin, hasFirstParty: bool, firstPartyHost: []const u8, now: i64) -> void {
+    if origin.*.host.length == 0 { return }
+    var ck: Cookie = undefined
+    if !cookie.parseSetCookie(jar.*.allocator, header, true, origin.*.host, origin.*.path, now, &ck) { return }
+    addCookie(jar, &ck, true, origin.*.https, hasFirstParty, firstPartyHost, now)
+}
+
+// Removes the cookie equal to `ck` (name, value, path) of its domain.
+pub fn deleteCookie(jar: *Jar, ck: *const Cookie) -> void {
+    const d = findDomain(jar, ck.*.domain)
+    if d == jar.*.count { return }
+    const domain = &jar.*.domains[d]
+    var i: usize = 0
+    while i < domain.*.count {
+        const old = &domain.*.entries[i].cookie
+        if cookie.equal(ck, old) {
+            var gone: Cookie = undefined
+            const kept = cookie.copy(jar.*.allocator, old, &gone)
+            removeEntry(jar, domain, i)
+            if kept {
+                changed(jar, &gone, null)
+                cookie.cookieFree(jar.*.allocator, &gone)
+            }
+            return
+        }
+        i += 1
+    }
+}
+
+// Every cookie of the jar, one at a time (`it` starts at zero; false at
+// the end).
+pub const Iterator = struct {
+    domain: usize
+    index: usize
+}
+
+pub fn iterator() -> Iterator { return Iterator.{ .domain = 0, .index = 0 } }
+
+pub fn next(jar: *Jar, it: *Iterator, out: **Cookie) -> bool {
+    while it.*.domain < jar.*.count {
+        const domain = &jar.*.domains[it.*.domain]
+        if it.*.index < domain.*.count {
+            out.* = &domain.*.entries[it.*.index].cookie
+            it.*.index += 1
+            return true
+        }
+        it.*.domain += 1
+        it.*.index = 0
+    }
+    return false
+}
+
+// How many cookies the jar holds.
+pub fn count(jar: *Jar) -> usize {
+    var total: usize = 0
+    var d: usize = 0
+    while d < jar.*.count {
+        total += jar.*.domains[d].count
+        d += 1
+    }
+    return total
+}
+
+// ---------------------------------------------------------------------------
+// cookies.txt (Mozilla's format, as SoupCookieJarText keeps it)
+
+pub const TEXT_HEADER: []const u8 = "# HTTP Cookie File\n# http://www.netscape.com/newsref/std/cookie_spec.html\n# This is a generated file!  Do not edit.\n# To delete cookies, use the Cookie Manager.\n\n"
+
+fn sameSiteOf(text: []const u8) -> cookie.SameSite {
+    if cookie.sameText(text, "Lax") { return cookie.SameSite.lax }
+    if cookie.sameText(text, "Strict") { return cookie.SameSite.strict }
+    return cookie.SameSite.none
+}
+
+fn sameSiteName(policy: cookie.SameSite) -> []const u8 {
+    if policy == cookie.SameSite.strict { return "Strict" }
+    if policy == cookie.SameSite.lax { return "Lax" }
+    return "None"
+}
+
+fn field(line: []const u8, index: usize) -> []const u8 {
+    var at: usize = 0
+    var n: usize = 0
+    while n < index {
+        while at < line.length && line[at] != 9 { at += 1 }
+        if at >= line.length { return line[line.length..line.length] }
+        at += 1
+        n += 1
+    }
+    var end = at
+    while end < line.length && line[end] != 9 { end += 1 }
+    return line[at..end]
+}
+
+fn fieldCount(line: []const u8) -> usize {
+    var n: usize = 1
+    for ch in line {
+        if ch == 9 { n += 1 }
+    }
+    return n
+}
+
+// The cookie of a cookies.txt line (a view into the line; false for a
+// comment, a line that is not one, or an expired cookie at `now`).
+pub fn parseTextLine(lineIn: []const u8, now: i64, out: *Cookie) -> bool {
+    var line = lineIn
+    var httpOnly = false
+    if line.length >= 10 && cookie.sameText(line[0..10], "#HttpOnly_") {
+        httpOnly = true
+        line = line[10..line.length]
+    } else if line.length == 0 || line[0] == 35 || headers.isSpace(line[0]) {
+        return false
+    }
+    const n = fieldCount(line)
+    if n < 7 { return false }
+    var expire: i64 = 0
+    for ch in field(line, 4) {
+        if ch < 48 || ch > 57 { break }
+        expire = expire * 10 + @intCast(i64, ch - 48)
+    }
+    if now >= expire { return false }
+    const maxAge: i32 = if expire - now <= 2147483647 { @intCast(i32, expire - now) } else { 2147483647 }
+    var ck = cookie.view(field(line, 5), field(line, 6), field(line, 0), true, field(line, 2), true)
+    cookie.setMaxAge(&ck, maxAge, now)
+    if n == 8 { ck.sameSite = sameSiteOf(field(line, 7)) }
+    if !cookie.sameText(field(line, 3), "FALSE") { ck.secure = true }
+    ck.httpOnly = httpOnly
+    out.* = ck
+    return true
+}
+
+// A cookie's cookies.txt line (with its newline).
+pub fn writeTextLine(sink: headers.Sink, ck: *const Cookie) -> void {
+    if ck.*.httpOnly { headers.put(sink, "#HttpOnly_") }
+    headers.put(sink, ck.*.domain)
+    headers.put(sink, if ck.*.domain.length > 0 && ck.*.domain[0] == 46 { "\tTRUE\t" } else { "\tFALSE\t" })
+    headers.put(sink, ck.*.path)
+    headers.put(sink, if ck.*.secure { "\tTRUE\t" } else { "\tFALSE\t" })
+    putDecimal(sink, ck.*.expires)
+    headers.putByte(sink, 9)
+    headers.put(sink, ck.*.name)
+    headers.putByte(sink, 9)
+    headers.put(sink, ck.*.value)
+    headers.putByte(sink, 9)
+    headers.put(sink, sameSiteName(ck.*.sameSite))
+    headers.putByte(sink, 10)
+}
+
+fn putDecimal(sink: headers.Sink, value: i64) -> void {
+    var digits: [24]u8 = undefined
+    var n: usize = 0
+    var rest: u64 = if value < 0 { @bitCast(u64, 0 -% value) } else { @bitCast(u64, value) }
+    while true {
+        digits[23 - n] = @intCast(u8, 48 + rest % 10)
+        n += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    if value < 0 { headers.putByte(sink, 45) }
+    headers.put(sink, digits[24 - n..24])
+}
+
+// The lines of a cookies.txt file, one at a time (`at` moves on; a line
+// ends at a newline or a carriage return).
+pub fn nextTextLine(contents: []const u8, at: *usize, line: *[]const u8) -> bool {
+    if at.* > contents.length { return false }
+    var end = at.*
+    while end < contents.length && contents[end] != 10 && contents[end] != 13 { end += 1 }
+    line.* = contents[at.*..end]
+    at.* = end + 1
+    return true
+}
+
+// Takes the cookies of a cookies.txt file into the jar (with no origin
+// and no first party, as libsoup loads them).
+pub fn loadText(jar: *Jar, contents: []const u8, now: i64) -> void {
+    var at: usize = 0
+    var line: []const u8 = ""
+    while nextTextLine(contents, &at, &line) {
+        var ck: Cookie = undefined
+        if parseTextLine(line, now, &ck) { addCookie(jar, &ck, false, false, false, "", now) }
+    }
+}
+
+// What SoupCookieJarText writes after a change: the file's lines but the
+// cookie that was (`old`, when there is one), then the new cookie when it
+// has an expiry; the header first when there was no file (`hasExisting`
+// false).
+pub fn rewriteText(sink: headers.Sink, existing: []const u8, hasExisting: bool, old: ?*const Cookie, new: ?*const Cookie, now: i64) -> void {
+    if hasExisting {
+        if old == null {
+            headers.put(sink, existing)
+        } else {
+            var at: usize = 0
+            var line: []const u8 = ""
+            while nextTextLine(existing, &at, &line) {
+                var ck: Cookie = undefined
+                if parseTextLine(line, now, &ck) && !cookie.equal(old.?, &ck) { writeTextLine(sink, &ck) }
+            }
+        }
+    } else {
+        headers.put(sink, TEXT_HEADER)
+    }
+    if new != null && new.?.*.hasExpires { writeTextLine(sink, new.?) }
+}
+
+// Every cookie of the jar with an expiry as a cookies.txt file.
+pub fn writeText(sink: headers.Sink, jar: *Jar) -> void {
+    headers.put(sink, TEXT_HEADER)
+    var it = iterator()
+    var ck: *Cookie = undefined
+    while next(jar, &it, &ck) {
+        if ck.*.hasExpires { writeTextLine(sink, ck) }
+    }
+}

@@ -1,0 +1,1702 @@
+// The main loop (gmain.h), as GLib's gmain.c runs it.
+//
+// A context holds its sources in a list ordered by priority (the
+// GSource's own prev and next words), its poll records (a GPollFD and
+// a priority each) ordered by descriptor, the sources found ready by
+// check() until dispatch() runs them, an eventfd that wakes it, and a
+// recursive lock (owner, depth) that is let go around every call out to
+// C (a source's prepare, check, dispatch and finalize, callbacks,
+// notifications). One thread at a time owns (acquires) a context to
+// iterate it: prepare finds the sources ready already and the poll
+// timeout (the nearest ready time), query lists the descriptors to
+// poll, the poll function waits, check finds what is ready then, and
+// dispatch calls the sources of the best priority, each blocked from
+// recursing unless it may.
+//
+// A GSource: GLib's public words (callback_data 0, callback_funcs 8,
+// source_funcs 16, ref_count 24, context 32, priority 40, flags 44,
+// source_id 48, poll_fds 56, prev 64, next 72, name 80, priv 88), the
+// private part a record of the library's own (the ready time, the unix
+// descriptors' GPollFDs, the parent and child sources, the dispose
+// function). Its flags: 1 active (not destroyed), 2 in a call, 16
+// ready, 32 may recurse, 64 blocked.
+//
+// Everything that runs while a loop runs keeps its state in C memory
+// (no aggregates of its own): a loop runs for the program's life within
+// one call of the library.
+const m = @import("./memory.mlx")
+const sys = @import("./sys.mlx")
+const threads = @import("./threads.mlx")
+const hash = @import("./hash.mlx")
+const messages = @import("./messages.mlx")
+
+// ---------------------------------------------------------------------------
+// Layouts
+
+const S_CALLBACK_DATA: usize = 0
+const S_CALLBACK_FUNCS: usize = 8
+const S_FUNCS: usize = 16
+const S_REFS: usize = 24
+const S_CONTEXT: usize = 32
+const S_PRIORITY: usize = 40
+const S_FLAGS: usize = 44
+const S_ID: usize = 48
+const S_POLL_FDS: usize = 56
+const S_PREV: usize = 64
+const S_NEXT: usize = 72
+const S_NAME: usize = 80
+const S_PRIV: usize = 88
+pub const SOURCE_SIZE: usize = 96
+
+const ACTIVE: u32 = 1
+const IN_CALL: u32 = 2
+const READY: u32 = 16
+const CAN_RECURSE: u32 = 32
+const BLOCKED: u32 = 64
+
+// The private record: ready time, unix fds (words), parent, children
+// (words), dispose function, whether the name is static.
+const P_READY_TIME: usize = 0
+const P_FDS: usize = 8
+const P_PARENT: usize = 32
+const P_CHILDREN: usize = 40
+const P_DISPOSE: usize = 64
+const P_STATIC_NAME: usize = 72
+const P_SIZE: usize = 80
+
+// GSourceFuncs: prepare 0, check 8, dispatch 16, finalize 24.
+const F_PREPARE: usize = 0
+const F_CHECK: usize = 8
+const F_DISPATCH: usize = 16
+const F_FINALIZE: usize = 24
+
+// A context.
+const C_LOCK: usize = 0
+const C_REFS: usize = 16
+const C_FIRST: usize = 24
+const C_LAST: usize = 32
+const C_NEXT_ID: usize = 40
+const C_IN_CHECK: usize = 44
+const C_IDS: usize = 48
+const C_POLLS: usize = 56
+const C_PENDING: usize = 80
+const C_TIMEOUT: usize = 104
+const C_TIME: usize = 112
+const C_TIME_FRESH: usize = 120
+const C_POLL_CHANGED: usize = 124
+const C_WAKE_FD: usize = 128
+const C_WAKE_REC: usize = 136
+const C_POLL_FUNC: usize = 144
+const C_OWNER: usize = 152
+const C_OWNER_COUNT: usize = 156
+const C_COND: usize = 160
+const C_POLL_ARRAY: usize = 168
+const C_POLL_ARRAY_SIZE: usize = 176
+const C_WAITERS: usize = 184
+const C_SIZE: usize = 192
+
+pub const PrepareFunc = fn(usize, usize) -> i32
+pub const CheckFunc = fn(usize) -> i32
+pub const DispatchFunc = fn(usize, usize, usize) -> i32
+pub const FinalizeFunc = fn(usize) -> void
+pub const SourceFunc = fn(usize) -> i32
+pub const OnceFunc = fn(usize) -> void
+pub const Notify = fn(usize) -> void
+pub const PollFunc = fn(usize, u32, i32) -> i32
+pub const CallbackRef = fn(usize) -> void
+pub const CallbackGet = fn(usize, usize, usize, usize) -> void
+
+fn priv(source: usize) -> usize { return m.getWord(source + S_PRIV) }
+fn flags(source: usize) -> u32 { return m.get32(source + S_FLAGS) }
+fn setFlags(source: usize, value: u32) -> void { m.put32(source + S_FLAGS, value) }
+fn destroyed(source: usize) -> bool { return (flags(source) & ACTIVE) == 0 }
+fn blocked(source: usize) -> bool { return (flags(source) & BLOCKED) != 0 }
+fn priority(source: usize) -> i32 { return m.getI32(source + S_PRIORITY) }
+fn readyTime(source: usize) -> i64 { return m.getI64(priv(source) + P_READY_TIME) }
+fn wordsAt(address: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, address) } }
+
+// ---------------------------------------------------------------------------
+// The context's lock: a recursive one (see threads.mlx), let go wholly
+// around calls out.
+
+fn lock(c: usize) -> void { threads.recursiveLock(c + C_LOCK) }
+fn unlock(c: usize) -> void { threads.recursiveUnlock(c + C_LOCK) }
+
+// The depth this thread holds the lock with, released wholly.
+fn releaseAll(c: usize) -> u32 {
+    const depth = m.get32(c + C_LOCK + 12)
+    var k: u32 = 0
+    while k < depth {
+        threads.recursiveUnlock(c + C_LOCK)
+        k += 1
+    }
+    return depth
+}
+
+fn relock(c: usize, depth: u32) -> void {
+    var k: u32 = 0
+    while k < depth {
+        threads.recursiveLock(c + C_LOCK)
+        k += 1
+    }
+}
+
+// Waits for the context's condition (a sequence word), the lock let go.
+fn waitCondition(c: usize) -> void {
+    const sequence = @atomicLoad(u32, m.word32(c + C_COND), acquire)
+    const depth = releaseAll(c)
+    _ = sys.futexWait(c + C_COND, sequence, 0)
+    relock(c, depth)
+}
+
+fn signalCondition(c: usize) -> void { threads.broadcast(c + C_COND) }
+
+fn wakeup(c: usize) -> void {
+    const value = m.alloc(8)
+    m.put64(value, 1)
+    _ = sys.write(m.getI32(c + C_WAKE_FD), value, 8)
+    m.release(value)
+}
+
+fn acknowledge(c: usize) -> void {
+    const value = m.alloc(8)
+    _ = sys.read(m.getI32(c + C_WAKE_FD), value, 8)
+    m.release(value)
+}
+
+// ---------------------------------------------------------------------------
+// Per thread: the stack of thread-default contexts, the source being
+// dispatched, the dispatch depth.
+
+const T_STACK: usize = 0
+const T_SOURCE: usize = 24
+const T_DEPTH: usize = 32
+const T_SIZE: usize = 40
+
+var threadKey: u32 = 0
+var threadKeyMade: u64 = 0
+
+export fn __mlx_glib_main_thread_gone(record: usize) -> void {
+    m.disposeWords(wordsAt(record + T_STACK))
+    m.release(record)
+}
+
+fn threadRecord() -> usize {
+    if threads.onceEnter(@intFromPtr(&threadKeyMade)) {
+        threadKey = threads.newKey(@intFromPtr(__mlx_glib_main_thread_gone))
+        threads.onceLeave(@intFromPtr(&threadKeyMade), 1)
+    }
+    var record = sys.pthread_getspecific(threadKey)
+    if record == 0 {
+        record = m.alloc(T_SIZE)
+        _ = sys.pthread_setspecific(threadKey, record)
+    }
+    return record
+}
+
+// ---------------------------------------------------------------------------
+// Contexts
+
+var defaultContext: usize = 0
+var defaultMade: u64 = 0
+
+export fn g_poll(fds: usize, nfds: u32, timeout: i32) -> i32 { return sys.poll(fds, @intCast(u64, nfds), timeout) }
+
+pub fn newContext() -> usize {
+    const c = m.alloc(C_SIZE)
+    m.put32(c + C_REFS, 1)
+    m.put32(c + C_NEXT_ID, 1)
+    m.putWord(c + C_IDS, hash.newTable(0, 0, 0, 0))
+    m.putI64(c + C_TIMEOUT, -1)
+    m.putWord(c + C_POLL_FUNC, @intFromPtr(g_poll))
+    // EFD_CLOEXEC | EFD_NONBLOCK
+    const fd = sys.eventfd(0, 524288 | 2048)
+    m.putI32(c + C_WAKE_FD, fd)
+    m.putI32(c + C_WAKE_REC, fd)
+    m.put16(c + C_WAKE_REC + 4, 1)
+    addPollRecord(c, c + C_WAKE_REC, 0)
+    return c
+}
+
+pub fn defaultMain() -> usize {
+    if threads.onceEnter(@intFromPtr(&defaultMade)) {
+        defaultContext = newContext()
+        threads.onceLeave(@intFromPtr(&defaultMade), 1)
+    }
+    return defaultContext
+}
+
+pub fn orDefault(c: usize) -> usize { return if c == 0 { defaultMain() } else { c } }
+
+pub fn contextRef(c: usize) -> usize {
+    threads.refInc(c + C_REFS)
+    return c
+}
+
+pub fn contextUnref(c: usize) -> void {
+    if !threads.refDec(c + C_REFS) { return }
+    // The sources still there are destroyed; their last references go
+    // when their owners drop them.
+    lock(c)
+    var source = m.getWord(c + C_FIRST)
+    while source != 0 {
+        const next = m.getWord(source + S_NEXT)
+        m.putWord(source + S_CONTEXT, 0)
+        if !destroyed(source) { setFlags(source, flags(source) & ~ACTIVE) }
+        m.putWord(source + S_PREV, 0)
+        m.putWord(source + S_NEXT, 0)
+        source = next
+    }
+    unlock(c)
+    _ = sys.close(m.getI32(c + C_WAKE_FD))
+    hash.unref(m.getWord(c + C_IDS))
+    m.disposeWords(wordsAt(c + C_POLLS))
+    m.disposeWords(wordsAt(c + C_PENDING))
+    m.release(m.getWord(c + C_POLL_ARRAY))
+    m.release(c)
+}
+
+export fn g_main_context_new() -> usize { return newContext() }
+export fn g_main_context_new_with_flags(flags_: i32) -> usize { return newContext() }
+export fn g_main_context_ref(c: usize) -> usize { return contextRef(c) }
+export fn g_main_context_unref(c: usize) -> void { contextUnref(c) }
+export fn g_main_context_default() -> usize { return defaultMain() }
+
+// ---------------------------------------------------------------------------
+// Poll records: (GPollFD, priority) word pairs, ordered by descriptor.
+
+fn addPollRecord(c: usize, fd: usize, priority_: i32) -> void {
+    const polls = wordsAt(c + C_POLLS)
+    m.pushWord(polls, 0)
+    m.pushWord(polls, 0)
+    const count = polls.*.length / 2
+    var at = count - 1
+    const descriptor = m.getI32(fd)
+    while at > 0 && m.getI32(m.wordAt(polls, (at - 1) * 2)) > descriptor {
+        m.putWord(polls.*.address + at * 16, m.wordAt(polls, (at - 1) * 2))
+        m.putWord(polls.*.address + at * 16 + 8, m.wordAt(polls, (at - 1) * 2 + 1))
+        at -= 1
+    }
+    m.putWord(polls.*.address + at * 16, fd)
+    m.putWord(polls.*.address + at * 16 + 8, @intCast(usize, @bitCast(u32, priority_)))
+    m.putI32(c + C_POLL_CHANGED, 1)
+}
+
+fn removePollRecord(c: usize, fd: usize) -> void {
+    const polls = wordsAt(c + C_POLLS)
+    var index: usize = 0
+    while index < polls.*.length / 2 {
+        if m.wordAt(polls, index * 2) == fd {
+            m.copy(polls.*.address + index * 16, polls.*.address + (index + 1) * 16, (polls.*.length / 2 - index - 1) * 16)
+            polls.*.length -= 2
+            m.putI32(c + C_POLL_CHANGED, 1)
+            return
+        }
+        index += 1
+    }
+}
+
+fn setPollPriority(c: usize, fd: usize, priority_: i32) -> void {
+    const polls = wordsAt(c + C_POLLS)
+    var index: usize = 0
+    while index < polls.*.length / 2 {
+        if m.wordAt(polls, index * 2) == fd { m.putWord(polls.*.address + index * 16 + 8, @intCast(usize, @bitCast(u32, priority_))) }
+        index += 1
+    }
+}
+
+fn pollPriority(polls: *m.Words, index: usize) -> i32 { return @bitCast(i32, @intCast(u32, m.wordAt(polls, index * 2 + 1) & 0xffffffff)) }
+
+// A source's descriptors (its unix fds and its legacy poll fds) added
+// to or removed from its context.
+fn addSourcePolls(c: usize, source: usize) -> void {
+    const fds = wordsAt(priv(source) + P_FDS)
+    var index: usize = 0
+    while index < fds.*.length {
+        addPollRecord(c, m.wordAt(fds, index), priority(source))
+        index += 1
+    }
+    var link = m.getWord(source + S_POLL_FDS)
+    while link != 0 {
+        addPollRecord(c, m.getWord(link), priority(source))
+        link = m.getWord(link + 8)
+    }
+}
+
+fn removeSourcePolls(c: usize, source: usize) -> void {
+    const fds = wordsAt(priv(source) + P_FDS)
+    var index: usize = 0
+    while index < fds.*.length {
+        removePollRecord(c, m.wordAt(fds, index))
+        index += 1
+    }
+    var link = m.getWord(source + S_POLL_FDS)
+    while link != 0 {
+        removePollRecord(c, m.getWord(link))
+        link = m.getWord(link + 8)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The sources' list
+
+fn insertSource(c: usize, source: usize) -> void {
+    // After the last source of a priority not above this one's.
+    var after = m.getWord(c + C_LAST)
+    while after != 0 && priority(after) > priority(source) { after = m.getWord(after + S_PREV) }
+    const before = if after == 0 { m.getWord(c + C_FIRST) } else { m.getWord(after + S_NEXT) }
+    m.putWord(source + S_PREV, after)
+    m.putWord(source + S_NEXT, before)
+    if after == 0 { m.putWord(c + C_FIRST, source) } else { m.putWord(after + S_NEXT, source) }
+    if before == 0 { m.putWord(c + C_LAST, source) } else { m.putWord(before + S_PREV, source) }
+}
+
+fn unlinkSource(c: usize, source: usize) -> void {
+    const prev = m.getWord(source + S_PREV)
+    const next = m.getWord(source + S_NEXT)
+    if prev == 0 { m.putWord(c + C_FIRST, next) } else { m.putWord(prev + S_NEXT, next) }
+    if next == 0 { m.putWord(c + C_LAST, prev) } else { m.putWord(next + S_PREV, prev) }
+    m.putWord(source + S_PREV, 0)
+    m.putWord(source + S_NEXT, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Sources
+
+pub fn newSource(funcs: usize, size: u32) -> usize {
+    const total = if @intCast(usize, size) < SOURCE_SIZE { SOURCE_SIZE } else { @intCast(usize, size) }
+    const source = m.alloc(total)
+    m.putWord(source + S_FUNCS, funcs)
+    m.put32(source + S_REFS, 1)
+    m.putI32(source + S_PRIORITY, 0)
+    setFlags(source, ACTIVE)
+    const p = m.alloc(P_SIZE)
+    m.putI64(p + P_READY_TIME, -1)
+    m.putWord(source + S_PRIV, p)
+    return source
+}
+
+export fn g_source_new(funcs: usize, struct_size: u32) -> usize { return newSource(funcs, struct_size) }
+
+export fn g_source_set_dispose_function(source: usize, dispose: usize) -> void { m.putWord(priv(source) + P_DISPOSE, dispose) }
+
+pub fn sourceRef(source: usize) -> usize {
+    threads.refInc(source + S_REFS)
+    return source
+}
+
+export fn g_source_ref(source: usize) -> usize { return sourceRef(source) }
+
+// Drops a reference; at the last the source leaves its context and is
+// finalized. `haveLock`: the caller holds the context's lock.
+fn sourceUnrefInternal(source: usize, c: usize, haveLock: bool) -> void {
+    if c != 0 && !haveLock { lock(c) }
+    const old = @atomicRmw(u32, m.word32(source + S_REFS), sub, 1, acq_rel)
+    if old == 1 {
+        const dispose = m.getWord(priv(source) + P_DISPOSE)
+        if dispose != 0 {
+            // (The dispose function may take a reference again.)
+            threads.refInc(source + S_REFS)
+            const depth = if c != 0 { releaseAll(c) } else { 0 }
+            const call: Notify = unsafe { @ptrFromInt(Notify, dispose) }
+            call(source)
+            if c != 0 { relock(c, depth) }
+            if @atomicRmw(u32, m.word32(source + S_REFS), sub, 1, acq_rel) != 1 {
+                if c != 0 && !haveLock { unlock(c) }
+                return
+            }
+        }
+        if c != 0 {
+            if !destroyed(source) { messages.warning("g_source_unref_internal: assertion 'ref_count == 0, but source was still attached to a context!' failed") }
+            unlinkSource(c, source)
+            _ = hash.remove(m.getWord(c + C_IDS), @intCast(usize, m.get32(source + S_ID)), false)
+        }
+        const callbackFuncs = m.getWord(source + S_CALLBACK_FUNCS)
+        const callbackData = m.getWord(source + S_CALLBACK_DATA)
+        m.putWord(source + S_CALLBACK_FUNCS, 0)
+        m.putWord(source + S_CALLBACK_DATA, 0)
+        const depth = if c != 0 { releaseAll(c) } else { 0 }
+        if callbackFuncs != 0 {
+            const unrefCall: CallbackRef = unsafe { @ptrFromInt(CallbackRef, m.getWord(callbackFuncs + 8)) }
+            unrefCall(callbackData)
+        }
+        const funcs = m.getWord(source + S_FUNCS)
+        if funcs != 0 && m.getWord(funcs + F_FINALIZE) != 0 {
+            const finalize: FinalizeFunc = unsafe { @ptrFromInt(FinalizeFunc, m.getWord(funcs + F_FINALIZE)) }
+            finalize(source)
+        }
+        if c != 0 { relock(c, depth) }
+        if m.get8(priv(source) + P_STATIC_NAME) == 0 { m.release(m.getWord(source + S_NAME)) }
+        const fds = wordsAt(priv(source) + P_FDS)
+        var index: usize = 0
+        while index < fds.*.length {
+            m.release(m.wordAt(fds, index))
+            index += 1
+        }
+        m.disposeWords(fds)
+        const children = wordsAt(priv(source) + P_CHILDREN)
+        index = 0
+        while index < children.*.length {
+            const child = m.wordAt(children, index)
+            m.putWord(priv(child) + P_PARENT, 0)
+            sourceUnrefInternal(child, if c != 0 && m.getWord(child + S_CONTEXT) == c { c } else { m.getWord(child + S_CONTEXT) }, c != 0 && m.getWord(child + S_CONTEXT) == c)
+            index += 1
+        }
+        m.disposeWords(children)
+        var link = m.getWord(source + S_POLL_FDS)
+        while link != 0 {
+            const next = m.getWord(link + 8)
+            m.release(link)
+            link = next
+        }
+        m.release(priv(source))
+        m.release(source)
+    }
+    if c != 0 && !haveLock { unlock(c) }
+}
+
+export fn g_source_unref(source: usize) -> void { sourceUnrefInternal(source, m.getWord(source + S_CONTEXT), false) }
+
+fn attachUnlocked(source: usize, c: usize, doWakeup: bool) -> u32 {
+    m.putWord(source + S_CONTEXT, c)
+    // An id not in use (the counter wraps past G_MAXUINT).
+    var id = m.get32(c + C_NEXT_ID)
+    while id == 0 || hash.find(m.getWord(c + C_IDS), @intCast(usize, id)) >= 0 { id +%= 1 }
+    m.put32(c + C_NEXT_ID, id +% 1)
+    m.put32(source + S_ID, id)
+    _ = hash.insert(m.getWord(c + C_IDS), @intCast(usize, id), source, true)
+    _ = sourceRef(source)
+    insertSource(c, source)
+    if !blocked(source) { addSourcePolls(c, source) }
+    const children = wordsAt(priv(source) + P_CHILDREN)
+    var index: usize = 0
+    while index < children.*.length {
+        _ = attachUnlocked(m.wordAt(children, index), c, false)
+        index += 1
+    }
+    if doWakeup { wakeup(c) }
+    return id
+}
+
+pub fn attach(source: usize, context: usize) -> u32 {
+    const c = orDefault(context)
+    if m.getWord(source + S_CONTEXT) != 0 {
+        messages.critical("g_source_attach: assertion 'source->context == NULL' failed")
+        return 0
+    }
+    if destroyed(source) {
+        messages.critical("g_source_attach: assertion '!SOURCE_DESTROYED (source)' failed")
+        return 0
+    }
+    lock(c)
+    const id = attachUnlocked(source, c, true)
+    unlock(c)
+    return id
+}
+
+export fn g_source_attach(source: usize, context: usize) -> u32 { return attach(source, context) }
+
+fn destroyInternal(source: usize, c: usize, haveLock: bool) -> void {
+    if !haveLock { lock(c) }
+    if !destroyed(source) {
+        setFlags(source, flags(source) & ~ACTIVE)
+        const callbackFuncs = m.getWord(source + S_CALLBACK_FUNCS)
+        const callbackData = m.getWord(source + S_CALLBACK_DATA)
+        m.putWord(source + S_CALLBACK_FUNCS, 0)
+        m.putWord(source + S_CALLBACK_DATA, 0)
+        if callbackFuncs != 0 {
+            const depth = releaseAll(c)
+            const unrefCall: CallbackRef = unsafe { @ptrFromInt(CallbackRef, m.getWord(callbackFuncs + 8)) }
+            unrefCall(callbackData)
+            relock(c, depth)
+        }
+        if !blocked(source) { removeSourcePolls(c, source) }
+        const children = wordsAt(priv(source) + P_CHILDREN)
+        while children.*.length > 0 {
+            const child = m.wordAt(children, children.*.length - 1)
+            children.*.length -= 1
+            m.putWord(priv(child) + P_PARENT, 0)
+            destroyInternal(child, c, true)
+            sourceUnrefInternal(child, c, true)
+        }
+        sourceUnrefInternal(source, c, true)
+    }
+    if !haveLock { unlock(c) }
+}
+
+pub fn destroy(source: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c == 0 {
+        setFlags(source, flags(source) & ~ACTIVE)
+        return
+    }
+    destroyInternal(source, c, false)
+}
+
+export fn g_source_destroy(source: usize) -> void { destroy(source) }
+
+export fn g_source_is_destroyed(source: usize) -> i32 { return if destroyed(source) { 1 } else { 0 } }
+
+fn setPriorityUnlocked(source: usize, c: usize, priority_: i32) -> void {
+    m.putI32(source + S_PRIORITY, priority_)
+    if c != 0 {
+        unlinkSource(c, source)
+        insertSource(c, source)
+        const fds = wordsAt(priv(source) + P_FDS)
+        var index: usize = 0
+        while index < fds.*.length {
+            setPollPriority(c, m.wordAt(fds, index), priority_)
+            index += 1
+        }
+    }
+    const children = wordsAt(priv(source) + P_CHILDREN)
+    var index: usize = 0
+    while index < children.*.length {
+        setPriorityUnlocked(m.wordAt(children, index), c, priority_)
+        index += 1
+    }
+}
+
+export fn g_source_set_priority(source: usize, priority_: i32) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    setPriorityUnlocked(source, c, priority_)
+    if c != 0 { unlock(c) }
+}
+
+export fn g_source_get_priority(source: usize) -> i32 { return priority(source) }
+
+export fn g_source_set_can_recurse(source: usize, can_recurse: i32) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    setFlags(source, if can_recurse != 0 { flags(source) | CAN_RECURSE } else { flags(source) & ~CAN_RECURSE })
+    if c != 0 { unlock(c) }
+}
+
+export fn g_source_get_can_recurse(source: usize) -> i32 { return if (flags(source) & CAN_RECURSE) != 0 { 1 } else { 0 } }
+export fn g_source_get_id(source: usize) -> u32 { return m.get32(source + S_ID) }
+export fn g_source_get_context(source: usize) -> usize { return if destroyed(source) { 0 } else { m.getWord(source + S_CONTEXT) } }
+
+export fn g_source_set_name(source: usize, name: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    if m.get8(priv(source) + P_STATIC_NAME) == 0 { m.release(m.getWord(source + S_NAME)) }
+    m.putWord(source + S_NAME, m.dup(name))
+    m.put8(priv(source) + P_STATIC_NAME, 0)
+    if c != 0 { unlock(c) }
+}
+
+export fn g_source_set_static_name(source: usize, name: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    if m.get8(priv(source) + P_STATIC_NAME) == 0 { m.release(m.getWord(source + S_NAME)) }
+    m.putWord(source + S_NAME, name)
+    m.put8(priv(source) + P_STATIC_NAME, 1)
+    if c != 0 { unlock(c) }
+}
+
+export fn g_source_get_name(source: usize) -> usize { return m.getWord(source + S_NAME) }
+
+export fn g_source_set_name_by_id(tag: u32, name: usize) -> void {
+    const source = findById(defaultMain(), tag)
+    if source != 0 { g_source_set_name(source, name) }
+}
+
+export fn g_source_set_ready_time(source: usize, ready_time: i64) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    if readyTime(source) == ready_time {
+        if c != 0 { unlock(c) }
+        return
+    }
+    m.putI64(priv(source) + P_READY_TIME, ready_time)
+    if c != 0 {
+        // (Quite likely the poll's timeout changes.)
+        if !blocked(source) { wakeup(c) }
+        unlock(c)
+    }
+}
+
+export fn g_source_get_ready_time(source: usize) -> i64 { return readyTime(source) }
+
+export fn g_source_get_time(source: usize) -> i64 {
+    const c = m.getWord(source + S_CONTEXT)
+    if c == 0 { return sys.monotonicMicroseconds() }
+    lock(c)
+    if m.get32(c + C_TIME_FRESH) == 0 {
+        m.putI64(c + C_TIME, sys.monotonicMicroseconds())
+        m.put32(c + C_TIME_FRESH, 1)
+    }
+    const result = m.getI64(c + C_TIME)
+    unlock(c)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Callbacks: GLib's GSourceCallback (references, function, data, its
+// notification) behind the three functions of GSourceCallbackFuncs.
+
+var callbackFuncs: [3]usize = undefined
+var callbackFuncsMade: u64 = 0
+
+export fn __mlx_glib_source_callback_ref(cb: usize) -> void { threads.refInc(cb) }
+
+export fn __mlx_glib_source_callback_unref(cb: usize) -> void {
+    if threads.refDec(cb) {
+        const notify = m.getWord(cb + 24)
+        if notify != 0 {
+            const call: Notify = unsafe { @ptrFromInt(Notify, notify) }
+            call(m.getWord(cb + 16))
+        }
+        m.release(cb)
+    }
+}
+
+export fn __mlx_glib_source_callback_get(cb: usize, source: usize, func: usize, data: usize) -> void {
+    m.putWord(func, m.getWord(cb + 8))
+    m.putWord(data, m.getWord(cb + 16))
+}
+
+fn callbackTable() -> usize {
+    if threads.onceEnter(@intFromPtr(&callbackFuncsMade)) {
+        callbackFuncs[0] = @intFromPtr(__mlx_glib_source_callback_ref)
+        callbackFuncs[1] = @intFromPtr(__mlx_glib_source_callback_unref)
+        callbackFuncs[2] = @intFromPtr(__mlx_glib_source_callback_get)
+        threads.onceLeave(@intFromPtr(&callbackFuncsMade), 1)
+    }
+    return @intFromPtr(&callbackFuncs)
+}
+
+pub fn setCallbackIndirect(source: usize, data: usize, funcs: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    const oldFuncs = m.getWord(source + S_CALLBACK_FUNCS)
+    const oldData = m.getWord(source + S_CALLBACK_DATA)
+    m.putWord(source + S_CALLBACK_DATA, data)
+    m.putWord(source + S_CALLBACK_FUNCS, funcs)
+    if c != 0 { unlock(c) }
+    if oldFuncs != 0 {
+        const unrefCall: CallbackRef = unsafe { @ptrFromInt(CallbackRef, m.getWord(oldFuncs + 8)) }
+        unrefCall(oldData)
+    }
+}
+
+pub fn setCallback(source: usize, func: usize, data: usize, notify: usize) -> void {
+    const cb = m.alloc(32)
+    m.put32(cb, 1)
+    m.putWord(cb + 8, func)
+    m.putWord(cb + 16, data)
+    m.putWord(cb + 24, notify)
+    setCallbackIndirect(source, cb, callbackTable())
+}
+
+export fn g_source_set_callback(source: usize, func: usize, data: usize, notify: usize) -> void { setCallback(source, func, data, notify) }
+export fn g_source_set_callback_indirect(source: usize, callback_data: usize, callback_funcs: usize) -> void { setCallbackIndirect(source, callback_data, callback_funcs) }
+
+export fn g_source_set_funcs(source: usize, funcs: usize) -> void { m.putWord(source + S_FUNCS, funcs) }
+
+// The user data of a source's callback (for the find_by_user_data forms).
+fn callbackUserData(source: usize) -> usize {
+    const funcs = m.getWord(source + S_CALLBACK_FUNCS)
+    if funcs == 0 { return 0 }
+    const cells = m.alloc(16)
+    const getCall: CallbackGet = unsafe { @ptrFromInt(CallbackGet, m.getWord(funcs + 16)) }
+    getCall(m.getWord(source + S_CALLBACK_DATA), source, cells, cells + 8)
+    const data = m.getWord(cells + 8)
+    m.release(cells)
+    return data
+}
+
+// ---------------------------------------------------------------------------
+// Descriptors of a source
+
+export fn g_source_add_unix_fd(source: usize, fd: i32, events: i32) -> usize {
+    const tag = m.alloc(8)
+    m.putI32(tag, fd)
+    m.put16(tag + 4, @intCast(u16, events & 0xffff))
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    m.pushWord(wordsAt(priv(source) + P_FDS), tag)
+    if c != 0 {
+        if !blocked(source) { addPollRecord(c, tag, priority(source)) }
+        unlock(c)
+    }
+    return tag
+}
+
+export fn g_source_modify_unix_fd(source: usize, tag: usize, new_events: i32) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    m.put16(tag + 4, @intCast(u16, new_events & 0xffff))
+    if c != 0 {
+        m.putI32(c + C_POLL_CHANGED, 1)
+        wakeup(c)
+        unlock(c)
+    }
+}
+
+export fn g_source_remove_unix_fd(source: usize, tag: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    const fds = wordsAt(priv(source) + P_FDS)
+    var index: usize = 0
+    while index < fds.*.length {
+        if m.wordAt(fds, index) == tag {
+            m.copy(fds.*.address + index * 8, fds.*.address + (index + 1) * 8, (fds.*.length - index - 1) * 8)
+            fds.*.length -= 1
+            if c != 0 && !blocked(source) { removePollRecord(c, tag) }
+            m.release(tag)
+            break
+        }
+        index += 1
+    }
+    if c != 0 { unlock(c) }
+}
+
+export fn g_source_query_unix_fd(source: usize, tag: usize) -> i32 { return @intCast(i32, m.get16(tag + 6)) }
+
+export fn g_source_add_poll(source: usize, fd: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    const link = m.alloc(16)
+    m.putWord(link, fd)
+    m.putWord(link + 8, m.getWord(source + S_POLL_FDS))
+    m.putWord(source + S_POLL_FDS, link)
+    if c != 0 {
+        if !blocked(source) { addPollRecord(c, fd, priority(source)) }
+        unlock(c)
+    }
+}
+
+export fn g_source_remove_poll(source: usize, fd: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    var place = source + S_POLL_FDS
+    while m.getWord(place) != 0 {
+        const link = m.getWord(place)
+        if m.getWord(link) == fd {
+            m.putWord(place, m.getWord(link + 8))
+            m.release(link)
+            if c != 0 && !blocked(source) { removePollRecord(c, fd) }
+            break
+        }
+        place = link + 8
+    }
+    if c != 0 { unlock(c) }
+}
+
+export fn g_source_add_child_source(source: usize, child: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    m.pushWord(wordsAt(priv(source) + P_CHILDREN), sourceRef(child))
+    m.putWord(priv(child) + P_PARENT, source)
+    setPriorityUnlocked(child, 0, priority(source))
+    if (flags(source) & BLOCKED) != 0 { setFlags(child, flags(child) | BLOCKED) }
+    if c != 0 {
+        _ = attachUnlocked(child, c, true)
+        unlock(c)
+    }
+}
+
+export fn g_source_remove_child_source(source: usize, child: usize) -> void {
+    const c = m.getWord(source + S_CONTEXT)
+    if c != 0 { lock(c) }
+    const children = wordsAt(priv(source) + P_CHILDREN)
+    var index: usize = 0
+    while index < children.*.length {
+        if m.wordAt(children, index) == child {
+            m.copy(children.*.address + index * 8, children.*.address + (index + 1) * 8, (children.*.length - index - 1) * 8)
+            children.*.length -= 1
+            m.putWord(priv(child) + P_PARENT, 0)
+            if c != 0 { destroyInternal(child, c, true) }
+            sourceUnrefInternal(child, c, c != 0)
+            break
+        }
+        index += 1
+    }
+    if c != 0 { unlock(c) }
+}
+
+// Blocking a source (while it is dispatched): its descriptors leave the
+// poll, and so do its children's.
+fn blockSource(c: usize, source: usize) -> void {
+    setFlags(source, flags(source) | BLOCKED)
+    removeSourcePolls(c, source)
+    const children = wordsAt(priv(source) + P_CHILDREN)
+    var index: usize = 0
+    while index < children.*.length {
+        blockSource(c, m.wordAt(children, index))
+        index += 1
+    }
+}
+
+fn unblockSource(c: usize, source: usize) -> void {
+    setFlags(source, flags(source) & ~BLOCKED)
+    addSourcePolls(c, source)
+    const children = wordsAt(priv(source) + P_CHILDREN)
+    var index: usize = 0
+    while index < children.*.length {
+        unblockSource(c, m.wordAt(children, index))
+        index += 1
+    }
+}
+
+// A source found ready marks its parents ready too.
+fn markReady(source: usize) -> void {
+    var s = source
+    while s != 0 {
+        setFlags(s, flags(s) | READY)
+        s = m.getWord(priv(s) + P_PARENT)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One iteration's stages
+
+fn currentTime(c: usize) -> i64 {
+    if m.get32(c + C_TIME_FRESH) == 0 {
+        m.putI64(c + C_TIME, sys.monotonicMicroseconds())
+        m.put32(c + C_TIME_FRESH, 1)
+    }
+    return m.getI64(c + C_TIME)
+}
+
+pub fn prepare(context: usize, priorityOut: usize) -> bool {
+    const c = orDefault(context)
+    lock(c)
+    m.put32(c + C_TIME_FRESH, 0)
+    if m.get32(c + C_IN_CHECK) != 0 {
+        unlock(c)
+        messages.warning("g_main_context_prepare() called recursively from within a source's check() or prepare() member.")
+        return false
+    }
+    // (Recursing: the pending dispatches of the outer iteration are
+    // dropped.)
+    const pending = wordsAt(c + C_PENDING)
+    var index: usize = 0
+    while index < pending.*.length {
+        const source = m.wordAt(pending, index)
+        if source != 0 { sourceUnrefInternal(source, c, true) }
+        index += 1
+    }
+    pending.*.length = 0
+    m.putI64(c + C_TIMEOUT, -1)
+    var ready: u32 = 0
+    var currentPriority: i32 = 2147483647
+    var source = m.getWord(c + C_FIRST)
+    // (A reference held while the lock is let go around prepare().)
+    while source != 0 {
+        if destroyed(source) || blocked(source) {
+            source = m.getWord(source + S_NEXT)
+            continue
+        }
+        if ready > 0 && priority(source) > currentPriority { break }
+        if (flags(source) & READY) == 0 {
+            var result: i32 = 0
+            var sourceTimeout: i64 = -1
+            const funcs = m.getWord(source + S_FUNCS)
+            if m.getWord(funcs + F_PREPARE) != 0 {
+                const timeoutCell = m.alloc(8)
+                m.putI32(timeoutCell, -1)
+                m.put32(c + C_IN_CHECK, m.get32(c + C_IN_CHECK) + 1)
+                _ = sourceRef(source)
+                const depth = releaseAll(c)
+                const call: PrepareFunc = unsafe { @ptrFromInt(PrepareFunc, m.getWord(funcs + F_PREPARE)) }
+                result = call(source, timeoutCell)
+                relock(c, depth)
+                m.put32(c + C_IN_CHECK, m.get32(c + C_IN_CHECK) - 1)
+                const given = m.getI32(timeoutCell)
+                m.release(timeoutCell)
+                if given >= 0 { sourceTimeout = @intCast(i64, given) * 1000 }
+                if m.get32(source + S_REFS) == 1 {
+                    // (Its last reference was ours: it went away meanwhile.)
+                    const next = m.getWord(source + S_NEXT)
+                    sourceUnrefInternal(source, c, true)
+                    source = next
+                    continue
+                }
+                sourceUnrefInternal(source, c, true)
+            }
+            if result == 0 && readyTime(source) != -1 {
+                const now = currentTime(c)
+                if readyTime(source) <= now {
+                    sourceTimeout = 0
+                    result = 1
+                } else if sourceTimeout < 0 || readyTime(source) < now + sourceTimeout {
+                    sourceTimeout = readyTime(source) - now
+                }
+            }
+            if result != 0 { markReady(source) }
+            if sourceTimeout >= 0 {
+                const timeout = m.getI64(c + C_TIMEOUT)
+                if timeout < 0 || sourceTimeout < timeout { m.putI64(c + C_TIMEOUT, sourceTimeout) }
+            }
+        }
+        if (flags(source) & READY) != 0 {
+            ready += 1
+            currentPriority = priority(source)
+            m.putI64(c + C_TIMEOUT, 0)
+        }
+        source = m.getWord(source + S_NEXT)
+    }
+    unlock(c)
+    if priorityOut != 0 { m.putI32(priorityOut, currentPriority) }
+    return ready > 0
+}
+
+export fn g_main_context_prepare(context: usize, priority_: usize) -> i32 { return if prepare(context, priority_) { 1 } else { 0 } }
+
+pub fn query(context: usize, maxPriority: i32, timeout: usize, fds: usize, nFds: i32) -> i32 {
+    const c = orDefault(context)
+    lock(c)
+    const polls = wordsAt(c + C_POLLS)
+    var count: i32 = 0
+    var lastFd: i32 = -1
+    var haveLast = false
+    var index: usize = 0
+    while index < polls.*.length / 2 {
+        if pollPriority(polls, index) <= maxPriority {
+            const record = m.wordAt(polls, index * 2)
+            const fd = m.getI32(record)
+            const events = m.get16(record + 4) & ~@intCast(u16, 8 | 16 | 32)
+            if haveLast && fd == lastFd {
+                if count - 1 < nFds {
+                    const slot = fds + @intCast(usize, count - 1) * 8
+                    m.put16(slot + 4, m.get16(slot + 4) | events)
+                }
+            } else {
+                if count < nFds {
+                    const slot = fds + @intCast(usize, count) * 8
+                    m.putI32(slot, fd)
+                    m.put16(slot + 4, events)
+                    m.put16(slot + 6, 0)
+                }
+                count += 1
+            }
+            lastFd = fd
+            haveLast = true
+        }
+        index += 1
+    }
+    m.putI32(c + C_POLL_CHANGED, 0)
+    if timeout != 0 {
+        const usec = m.getI64(c + C_TIMEOUT)
+        var ms: i64 = -1
+        if usec >= 0 {
+            ms = (usec + 999) / 1000
+            if ms > 2147483647 { ms = 2147483647 }
+        }
+        m.putI32(timeout, @intCast(i32, ms))
+    }
+    unlock(c)
+    return count
+}
+
+export fn g_main_context_query(context: usize, max_priority: i32, timeout: usize, fds: usize, n_fds: i32) -> i32 { return query(context, max_priority, timeout, fds, n_fds) }
+
+pub fn check(context: usize, maxPriorityIn: i32, fds: usize, nFds: i32) -> bool {
+    const c = orDefault(context)
+    var maxPriority = maxPriorityIn
+    lock(c)
+    if m.get32(c + C_IN_CHECK) != 0 {
+        unlock(c)
+        messages.warning("g_main_context_check() called recursively from within a source's check() or prepare() member.")
+        return false
+    }
+    var index: usize = 0
+    const wakeFd = m.getI32(c + C_WAKE_FD)
+    while index < @intCast(usize, nFds) {
+        if m.getI32(fds + index * 8) == wakeFd {
+            if m.get16(fds + index * 8 + 6) != 0 { acknowledge(c) }
+            break
+        }
+        index += 1
+    }
+    // (When the descriptors changed meanwhile, the loop runs again.)
+    if m.getI32(c + C_POLL_CHANGED) != 0 {
+        unlock(c)
+        return false
+    }
+    const polls = wordsAt(c + C_POLLS)
+    var record: usize = 0
+    index = 0
+    while record < polls.*.length / 2 && index < @intCast(usize, nFds) {
+        const fd = m.getI32(fds + index * 8)
+        while record < polls.*.length / 2 && m.getI32(m.wordAt(polls, record * 2)) != fd { record += 1 }
+        while record < polls.*.length / 2 && m.getI32(m.wordAt(polls, record * 2)) == fd {
+            if pollPriority(polls, record) <= maxPriority {
+                const pollfd = m.wordAt(polls, record * 2)
+                const revents = m.get16(fds + index * 8 + 6) & (m.get16(pollfd + 4) | 8 | 16 | 32)
+                m.put16(pollfd + 6, revents)
+            }
+            record += 1
+        }
+        index += 1
+    }
+    var ready: u32 = 0
+    const pending = wordsAt(c + C_PENDING)
+    var source = m.getWord(c + C_FIRST)
+    while source != 0 {
+        if destroyed(source) || blocked(source) {
+            source = m.getWord(source + S_NEXT)
+            continue
+        }
+        if ready > 0 && priority(source) > maxPriority { break }
+        if (flags(source) & READY) == 0 {
+            var result: i32 = 0
+            const funcs = m.getWord(source + S_FUNCS)
+            if m.getWord(funcs + F_CHECK) != 0 {
+                m.put32(c + C_IN_CHECK, m.get32(c + C_IN_CHECK) + 1)
+                _ = sourceRef(source)
+                const depth = releaseAll(c)
+                const call: CheckFunc = unsafe { @ptrFromInt(CheckFunc, m.getWord(funcs + F_CHECK)) }
+                result = call(source)
+                relock(c, depth)
+                m.put32(c + C_IN_CHECK, m.get32(c + C_IN_CHECK) - 1)
+                if m.get32(source + S_REFS) == 1 {
+                    const next = m.getWord(source + S_NEXT)
+                    sourceUnrefInternal(source, c, true)
+                    source = next
+                    continue
+                }
+                sourceUnrefInternal(source, c, true)
+            }
+            if result == 0 {
+                const tags = wordsAt(priv(source) + P_FDS)
+                var t: usize = 0
+                while t < tags.*.length {
+                    if m.get16(m.wordAt(tags, t) + 6) != 0 {
+                        result = 1
+                        break
+                    }
+                    t += 1
+                }
+            }
+            if result == 0 && readyTime(source) != -1 {
+                if readyTime(source) <= currentTime(c) { result = 1 }
+            }
+            if result != 0 { markReady(source) }
+        }
+        if (flags(source) & READY) != 0 {
+            m.pushWord(pending, sourceRef(source))
+            ready += 1
+            // (Nothing of a lower priority than the first one ready.)
+            maxPriority = priority(source)
+        }
+        source = m.getWord(source + S_NEXT)
+    }
+    unlock(c)
+    return ready > 0
+}
+
+export fn g_main_context_check(context: usize, max_priority: i32, fds: usize, n_fds: i32) -> i32 { return if check(context, max_priority, fds, n_fds) { 1 } else { 0 } }
+
+fn dispatchPending(c: usize) -> void {
+    const record = threadRecord()
+    const pending = wordsAt(c + C_PENDING)
+    var index: usize = 0
+    while index < pending.*.length {
+        const source = m.wordAt(pending, index)
+        m.putWord(pending.*.address + index * 8, 0)
+        index += 1
+        if source == 0 { continue }
+        setFlags(source, flags(source) & ~READY)
+        if !destroyed(source) {
+            const wasInCall = (flags(source) & IN_CALL) != 0
+            const funcs = m.getWord(source + S_FUNCS)
+            const cbFuncs = m.getWord(source + S_CALLBACK_FUNCS)
+            const cbData = m.getWord(source + S_CALLBACK_DATA)
+            if cbFuncs != 0 {
+                const refCall: CallbackRef = unsafe { @ptrFromInt(CallbackRef, m.getWord(cbFuncs)) }
+                refCall(cbData)
+            }
+            if (flags(source) & CAN_RECURSE) == 0 { blockSource(c, source) }
+            setFlags(source, flags(source) | IN_CALL)
+            const cells = m.alloc(16)
+            if cbFuncs != 0 {
+                const getCall: CallbackGet = unsafe { @ptrFromInt(CallbackGet, m.getWord(cbFuncs + 16)) }
+                getCall(cbData, source, cells, cells + 8)
+            }
+            const callback = m.getWord(cells)
+            const userData = m.getWord(cells + 8)
+            m.release(cells)
+            const depth = releaseAll(c)
+            const previous = m.getWord(record + T_SOURCE)
+            m.putWord(record + T_SOURCE, source)
+            m.put32(record + T_DEPTH, m.get32(record + T_DEPTH) + 1)
+            var keep: i32 = 0
+            if m.getWord(funcs + F_DISPATCH) != 0 {
+                const call: DispatchFunc = unsafe { @ptrFromInt(DispatchFunc, m.getWord(funcs + F_DISPATCH)) }
+                keep = call(source, callback, userData)
+            }
+            m.putWord(record + T_SOURCE, previous)
+            m.put32(record + T_DEPTH, m.get32(record + T_DEPTH) - 1)
+            if cbFuncs != 0 {
+                const unrefCall: CallbackRef = unsafe { @ptrFromInt(CallbackRef, m.getWord(cbFuncs + 8)) }
+                unrefCall(cbData)
+            }
+            relock(c, depth)
+            if !wasInCall { setFlags(source, flags(source) & ~IN_CALL) }
+            if (flags(source) & CAN_RECURSE) == 0 && !destroyed(source) { unblockSource(c, source) }
+            if keep == 0 && !destroyed(source) { destroyInternal(source, c, true) }
+        }
+        sourceUnrefInternal(source, c, true)
+    }
+    pending.*.length = 0
+}
+
+pub fn dispatch(context: usize) -> void {
+    const c = orDefault(context)
+    lock(c)
+    if wordsAt(c + C_PENDING).*.length > 0 { dispatchPending(c) }
+    unlock(c)
+}
+
+export fn g_main_context_dispatch(context: usize) -> void { dispatch(context) }
+
+export fn g_main_context_set_poll_func(context: usize, func: usize) -> void {
+    const c = orDefault(context)
+    lock(c)
+    m.putWord(c + C_POLL_FUNC, if func == 0 { @intFromPtr(g_poll) } else { func })
+    unlock(c)
+}
+
+export fn g_main_context_get_poll_func(context: usize) -> usize {
+    const c = orDefault(context)
+    lock(c)
+    const result = m.getWord(c + C_POLL_FUNC)
+    unlock(c)
+    return result
+}
+
+export fn g_main_context_add_poll(context: usize, fd: usize, priority_: i32) -> void {
+    const c = orDefault(context)
+    lock(c)
+    addPollRecord(c, fd, priority_)
+    wakeup(c)
+    unlock(c)
+}
+
+export fn g_main_context_remove_poll(context: usize, fd: usize) -> void {
+    const c = orDefault(context)
+    lock(c)
+    removePollRecord(c, fd)
+    wakeup(c)
+    unlock(c)
+}
+
+// ---------------------------------------------------------------------------
+// Owning a context
+
+pub fn acquire(context: usize) -> bool {
+    const c = orDefault(context)
+    const me = sys.tid()
+    lock(c)
+    var result = false
+    if m.get32(c + C_OWNER) == 0 {
+        m.put32(c + C_OWNER, me)
+        m.put32(c + C_OWNER_COUNT, 0)
+    }
+    if m.get32(c + C_OWNER) == me {
+        m.put32(c + C_OWNER_COUNT, m.get32(c + C_OWNER_COUNT) + 1)
+        result = true
+    }
+    unlock(c)
+    return result
+}
+
+pub fn release(context: usize) -> void {
+    const c = orDefault(context)
+    lock(c)
+    if m.get32(c + C_OWNER) == sys.tid() {
+        const count = m.get32(c + C_OWNER_COUNT) - 1
+        m.put32(c + C_OWNER_COUNT, count)
+        if count == 0 {
+            m.put32(c + C_OWNER, 0)
+            signalCondition(c)
+        }
+    }
+    unlock(c)
+}
+
+// Waits until this thread can own the context (another owns it now).
+fn acquireWaiting(c: usize) -> void {
+    lock(c)
+    while !acquire(c) { waitCondition(c) }
+    unlock(c)
+}
+
+export fn g_main_context_acquire(context: usize) -> i32 { return if acquire(context) { 1 } else { 0 } }
+export fn g_main_context_release(context: usize) -> void { release(context) }
+
+export fn g_main_context_is_owner(context: usize) -> i32 {
+    const c = orDefault(context)
+    return if m.get32(c + C_OWNER) == sys.tid() { 1 } else { 0 }
+}
+
+export fn g_main_context_wakeup(context: usize) -> void { wakeup(orDefault(context)) }
+
+// One iteration: prepare, query, poll, check and (when `doDispatch`)
+// dispatch; whether something was ready.
+pub fn iterate(c: usize, block: bool, doDispatch: bool) -> bool {
+    if !acquire(c) {
+        if !block { return false }
+        acquireWaiting(c)
+    }
+    const priorityCell = m.alloc(8)
+    const timeoutCell = m.alloc(8)
+    _ = prepare(c, priorityCell)
+    const maxPriority = m.getI32(priorityCell)
+    lock(c)
+    var size = m.getWord(c + C_POLL_ARRAY_SIZE)
+    if m.getWord(c + C_POLL_ARRAY) == 0 {
+        size = 16
+        m.putWord(c + C_POLL_ARRAY, m.alloc(size * 8))
+        m.putWord(c + C_POLL_ARRAY_SIZE, size)
+    }
+    unlock(c)
+    var count = query(c, maxPriority, timeoutCell, m.getWord(c + C_POLL_ARRAY), @intCast(i32, size))
+    while @intCast(usize, count) > size {
+        size = @intCast(usize, count)
+        lock(c)
+        m.release(m.getWord(c + C_POLL_ARRAY))
+        m.putWord(c + C_POLL_ARRAY, m.alloc(size * 8))
+        m.putWord(c + C_POLL_ARRAY_SIZE, size)
+        unlock(c)
+        count = query(c, maxPriority, timeoutCell, m.getWord(c + C_POLL_ARRAY), @intCast(i32, size))
+    }
+    var timeout = m.getI32(timeoutCell)
+    if !block { timeout = 0 }
+    const fds = m.getWord(c + C_POLL_ARRAY)
+    if count > 0 || timeout != 0 {
+        const poll: PollFunc = unsafe { @ptrFromInt(PollFunc, m.getWord(c + C_POLL_FUNC)) }
+        const result = poll(fds, @intCast(u32, count), timeout)
+        if result < 0 && sys.errno() != sys.EINTR { messages.warning("poll(2) failed due to: an error.") }
+    }
+    const someReady = check(c, maxPriority, fds, count)
+    if doDispatch { dispatch(c) }
+    release(c)
+    m.release(priorityCell)
+    m.release(timeoutCell)
+    return someReady
+}
+
+export fn g_main_context_iteration(context: usize, may_block: i32) -> i32 { return if iterate(orDefault(context), may_block != 0, true) { 1 } else { 0 } }
+export fn g_main_context_pending(context: usize) -> i32 { return if iterate(orDefault(context), false, false) { 1 } else { 0 } }
+
+// ---------------------------------------------------------------------------
+// Finding sources
+
+fn findById(c: usize, id: u32) -> usize {
+    lock(c)
+    var result = hash.lookup(m.getWord(c + C_IDS), @intCast(usize, id))
+    if result != 0 && destroyed(result) { result = 0 }
+    unlock(c)
+    return result
+}
+
+export fn g_main_context_find_source_by_id(context: usize, source_id: u32) -> usize { return findById(orDefault(context), source_id) }
+
+fn findByData(c: usize, funcs: usize, user_data: usize) -> usize {
+    lock(c)
+    var source = m.getWord(c + C_FIRST)
+    while source != 0 {
+        if !destroyed(source) && (funcs == 0 || m.getWord(source + S_FUNCS) == funcs) && callbackUserData(source) == user_data { break }
+        source = m.getWord(source + S_NEXT)
+    }
+    unlock(c)
+    return source
+}
+
+export fn g_main_context_find_source_by_user_data(context: usize, user_data: usize) -> usize { return findByData(orDefault(context), 0, user_data) }
+export fn g_main_context_find_source_by_funcs_user_data(context: usize, funcs: usize, user_data: usize) -> usize { return findByData(orDefault(context), funcs, user_data) }
+
+export fn g_source_remove(tag: u32) -> i32 {
+    const source = findById(defaultMain(), tag)
+    if source == 0 {
+        var t = m.text()
+        m.pushText(&t, "Source ID ")
+        m.pushDecimal(&t, @intCast(u64, tag))
+        m.pushText(&t, " was not found when attempting to remove it")
+        messages.log(m.literal("GLib"), messages.LEVEL_CRITICAL, t.address)
+        m.dispose(&t)
+        return 0
+    }
+    destroy(source)
+    return 1
+}
+
+export fn g_source_remove_by_user_data(user_data: usize) -> i32 {
+    const source = findByData(defaultMain(), 0, user_data)
+    if source == 0 { return 0 }
+    destroy(source)
+    return 1
+}
+
+export fn g_source_remove_by_funcs_user_data(funcs: usize, user_data: usize) -> i32 {
+    const source = findByData(defaultMain(), funcs, user_data)
+    if source == 0 { return 0 }
+    destroy(source)
+    return 1
+}
+
+export fn g_clear_handle_id(tag_ptr: usize, clear_func: usize) -> void {
+    const tag = m.get32(tag_ptr)
+    if tag == 0 { return }
+    m.put32(tag_ptr, 0)
+    const call: Notify = unsafe { @ptrFromInt(Notify, clear_func) }
+    call(@intCast(usize, tag))
+}
+
+export fn g_main_depth() -> i32 { return @intCast(i32, m.get32(threadRecord() + T_DEPTH)) }
+export fn g_main_current_source() -> usize { return m.getWord(threadRecord() + T_SOURCE) }
+
+// ---------------------------------------------------------------------------
+// Thread-default contexts
+
+pub fn threadDefault() -> usize {
+    const stack = wordsAt(threadRecord() + T_STACK)
+    if stack.*.length == 0 { return 0 }
+    const top = m.wordAt(stack, stack.*.length - 1)
+    // (The global default reads as NULL.)
+    return if top == defaultContext { 0 } else { top }
+}
+
+export fn g_main_context_get_thread_default() -> usize { return threadDefault() }
+
+export fn g_main_context_ref_thread_default() -> usize { return contextRef(orDefault(threadDefault())) }
+
+export fn g_main_context_push_thread_default(context: usize) -> void {
+    const c = orDefault(context)
+    if !acquire(c) {
+        messages.critical("g_main_context_push_thread_default: assertion 'acquired_context' failed")
+        return
+    }
+    _ = contextRef(c)
+    m.pushWord(wordsAt(threadRecord() + T_STACK), c)
+}
+
+export fn g_main_context_pop_thread_default(context: usize) -> void {
+    const c = orDefault(context)
+    const stack = wordsAt(threadRecord() + T_STACK)
+    if stack.*.length == 0 || m.wordAt(stack, stack.*.length - 1) != c {
+        messages.critical("g_main_context_pop_thread_default: assertion 'stack != NULL' failed")
+        return
+    }
+    stack.*.length -= 1
+    release(c)
+    contextUnref(c)
+}
+
+// ---------------------------------------------------------------------------
+// Main loops: the context, the references, whether running.
+
+export fn g_main_loop_new(context: usize, is_running: i32) -> usize {
+    const loop = m.alloc(16)
+    m.putWord(loop, contextRef(orDefault(context)))
+    m.put32(loop + 8, 1)
+    m.putI32(loop + 12, if is_running != 0 { 1 } else { 0 })
+    return loop
+}
+
+export fn g_main_loop_ref(loop: usize) -> usize {
+    threads.refInc(loop + 8)
+    return loop
+}
+
+pub fn loopUnref(loop: usize) -> void {
+    if threads.refDec(loop + 8) {
+        contextUnref(m.getWord(loop))
+        m.release(loop)
+    }
+}
+
+export fn g_main_loop_unref(loop: usize) -> void { loopUnref(loop) }
+
+pub fn loopRun(loop: usize) -> void {
+    const c = m.getWord(loop)
+    if !acquire(c) { acquireWaiting(c) }
+    threads.refInc(loop + 8)
+    @atomicStore(u32, m.word32(loop + 12), 1, seq_cst)
+    while @atomicLoad(u32, m.word32(loop + 12), seq_cst) != 0 { _ = iterate(c, true, true) }
+    release(c)
+    loopUnref(loop)
+}
+
+export fn g_main_loop_run(loop: usize) -> void { loopRun(loop) }
+
+pub fn loopQuit(loop: usize) -> void {
+    const c = m.getWord(loop)
+    lock(c)
+    @atomicStore(u32, m.word32(loop + 12), 0, seq_cst)
+    wakeup(c)
+    signalCondition(c)
+    unlock(c)
+}
+
+export fn g_main_loop_quit(loop: usize) -> void { loopQuit(loop) }
+export fn g_main_loop_is_running(loop: usize) -> i32 { return @bitCast(i32, @atomicLoad(u32, m.word32(loop + 12), seq_cst)) }
+export fn g_main_loop_get_context(loop: usize) -> usize { return m.getWord(loop) }
+
+// ---------------------------------------------------------------------------
+// Timeouts and idles. A timeout source: the GSource, then its interval
+// (milliseconds), whether in seconds, whether its callback is a
+// GSourceOnceFunc.
+
+const TIMEOUT_INTERVAL: usize = 96
+const TIMEOUT_SECONDS: usize = 100
+const TIMEOUT_ONCE: usize = 104
+const TIMEOUT_SIZE: u32 = 112
+
+var timeoutFuncs: [6]usize = undefined
+var idleFuncs: [6]usize = undefined
+var funcsMade: u64 = 0
+
+fn setExpiration(source: usize, now: i64) -> void {
+    var expiration = now + @intCast(i64, m.get32(source + TIMEOUT_INTERVAL)) * 1000
+    if m.get32(source + TIMEOUT_SECONDS) != 0 {
+        // (Whole seconds, as GLib rounds them up.)
+        const remainder = expiration % 1000000
+        if remainder != 0 { expiration = expiration - remainder + 1000000 }
+    }
+    g_source_set_ready_time(source, expiration)
+}
+
+export fn __mlx_glib_timeout_dispatch(source: usize, callback: usize, user_data: usize) -> i32 {
+    if callback == 0 {
+        messages.warning("Timeout source dispatched without callback. You must call g_source_set_callback().")
+        return 0
+    }
+    if m.get32(source + TIMEOUT_ONCE) != 0 {
+        const once: OnceFunc = unsafe { @ptrFromInt(OnceFunc, callback) }
+        once(user_data)
+        return 0
+    }
+    const call: SourceFunc = unsafe { @ptrFromInt(SourceFunc, callback) }
+    const again = call(user_data)
+    if again != 0 { setExpiration(source, g_source_get_time(source)) }
+    return again
+}
+
+export fn __mlx_glib_idle_prepare(source: usize, timeout: usize) -> i32 {
+    m.putI32(timeout, 0)
+    return 1
+}
+
+export fn __mlx_glib_idle_check(source: usize) -> i32 { return 1 }
+
+export fn __mlx_glib_idle_dispatch(source: usize, callback: usize, user_data: usize) -> i32 {
+    if callback == 0 {
+        messages.warning("Idle source dispatched without callback. You must call g_source_set_callback().")
+        return 0
+    }
+    if m.get32(source + TIMEOUT_ONCE) != 0 {
+        const once: OnceFunc = unsafe { @ptrFromInt(OnceFunc, callback) }
+        once(user_data)
+        return 0
+    }
+    const call: SourceFunc = unsafe { @ptrFromInt(SourceFunc, callback) }
+    return call(user_data)
+}
+
+fn makeFuncs() -> void {
+    if threads.onceEnter(@intFromPtr(&funcsMade)) {
+        var index: usize = 0
+        while index < 6 {
+            timeoutFuncs[index] = 0
+            idleFuncs[index] = 0
+            index += 1
+        }
+        timeoutFuncs[2] = @intFromPtr(__mlx_glib_timeout_dispatch)
+        idleFuncs[0] = @intFromPtr(__mlx_glib_idle_prepare)
+        idleFuncs[1] = @intFromPtr(__mlx_glib_idle_check)
+        idleFuncs[2] = @intFromPtr(__mlx_glib_idle_dispatch)
+        threads.onceLeave(@intFromPtr(&funcsMade), 1)
+    }
+}
+
+pub fn timeoutSource(interval: u32, seconds: bool) -> usize {
+    makeFuncs()
+    const source = newSource(@intFromPtr(&timeoutFuncs), TIMEOUT_SIZE)
+    m.put32(source + TIMEOUT_INTERVAL, if seconds { interval * 1000 } else { interval })
+    m.put32(source + TIMEOUT_SECONDS, if seconds { 1 } else { 0 })
+    setExpiration(source, sys.monotonicMicroseconds())
+    return source
+}
+
+pub fn idleSource() -> usize {
+    makeFuncs()
+    const source = newSource(@intFromPtr(&idleFuncs), TIMEOUT_SIZE)
+    m.putI32(source + S_PRIORITY, 200)
+    g_source_set_static_name(source, m.literal("GIdleSource"))
+    return source
+}
+
+export fn g_timeout_source_new(interval: u32) -> usize { return timeoutSource(interval, false) }
+export fn g_timeout_source_new_seconds(interval: u32) -> usize { return timeoutSource(interval, true) }
+export fn g_idle_source_new() -> usize { return idleSource() }
+
+fn addSource(source: usize, priority_: i32, function: usize, data: usize, notify: usize) -> u32 {
+    if priority_ != priority(source) { g_source_set_priority(source, priority_) }
+    setCallback(source, function, data, notify)
+    const id = attach(source, 0)
+    g_source_unref(source)
+    return id
+}
+
+export fn g_timeout_add_full(priority_: i32, interval: u32, function: usize, data: usize, notify: usize) -> u32 { return addSource(timeoutSource(interval, false), priority_, function, data, notify) }
+export fn g_timeout_add(interval: u32, function: usize, data: usize) -> u32 { return addSource(timeoutSource(interval, false), 0, function, data, 0) }
+export fn g_timeout_add_seconds_full(priority_: i32, interval: u32, function: usize, data: usize, notify: usize) -> u32 { return addSource(timeoutSource(interval, true), priority_, function, data, notify) }
+export fn g_timeout_add_seconds(interval: u32, function: usize, data: usize) -> u32 { return addSource(timeoutSource(interval, true), 0, function, data, 0) }
+
+export fn g_timeout_add_once(interval: u32, function: usize, data: usize) -> u32 {
+    const source = timeoutSource(interval, false)
+    m.put32(source + TIMEOUT_ONCE, 1)
+    return addSource(source, 0, function, data, 0)
+}
+
+export fn g_idle_add_full(priority_: i32, function: usize, data: usize, notify: usize) -> u32 { return addSource(idleSource(), priority_, function, data, notify) }
+export fn g_idle_add(function: usize, data: usize) -> u32 { return addSource(idleSource(), 200, function, data, 0) }
+
+export fn g_idle_add_once(function: usize, data: usize) -> u32 {
+    const source = idleSource()
+    m.put32(source + TIMEOUT_ONCE, 1)
+    return addSource(source, 200, function, data, 0)
+}
+
+export fn g_idle_remove_by_data(data: usize) -> i32 {
+    makeFuncs()
+    return g_source_remove_by_funcs_user_data(@intFromPtr(&idleFuncs), data)
+}
+
+// ---------------------------------------------------------------------------
+// Invoking a function in a context
+
+export fn g_main_context_invoke_full(context: usize, priority_: i32, function: usize, data: usize, notify: usize) -> void {
+    const c = orDefault(context)
+    const call: SourceFunc = unsafe { @ptrFromInt(SourceFunc, function) }
+    if g_main_context_is_owner(c) != 0 {
+        while call(data) != 0 {}
+        if notify != 0 {
+            const n: Notify = unsafe { @ptrFromInt(Notify, notify) }
+            n(data)
+        }
+        return
+    }
+    const threadContext = orDefault(threadDefault())
+    if threadContext == c && acquire(c) {
+        while call(data) != 0 {}
+        release(c)
+        if notify != 0 {
+            const n: Notify = unsafe { @ptrFromInt(Notify, notify) }
+            n(data)
+        }
+        return
+    }
+    const source = idleSource()
+    g_source_set_priority(source, priority_)
+    setCallback(source, function, data, notify)
+    _ = attach(source, c)
+    g_source_unref(source)
+}
+
+export fn g_main_context_invoke(context: usize, function: usize, data: usize) -> void { g_main_context_invoke_full(context, 0, function, data, 0) }
+
+// ---------------------------------------------------------------------------
+// Unix descriptor sources (glib-unix.h): the descriptor polled; the
+// callback gets it with what happened. The GSource, then the tag.
+
+const FD_TAG: usize = 96
+const FD_SIZE: u32 = 104
+var fdFuncs: [6]usize = undefined
+var fdFuncsMade: u64 = 0
+
+pub const FdFunc = fn(i32, i32, usize) -> i32
+
+export fn __mlx_glib_fd_dispatch(source: usize, callback: usize, user_data: usize) -> i32 {
+    if callback == 0 {
+        messages.warning("GUnixFDSource dispatched without callback. You must call g_source_set_callback().")
+        return 0
+    }
+    const tag = m.getWord(source + FD_TAG)
+    const call: FdFunc = unsafe { @ptrFromInt(FdFunc, callback) }
+    return call(m.getI32(tag), @intCast(i32, m.get16(tag + 6)), user_data)
+}
+
+export fn g_unix_fd_source_new(fd: i32, condition: i32) -> usize {
+    if threads.onceEnter(@intFromPtr(&fdFuncsMade)) {
+        var index: usize = 0
+        while index < 6 {
+            fdFuncs[index] = 0
+            index += 1
+        }
+        fdFuncs[2] = @intFromPtr(__mlx_glib_fd_dispatch)
+        threads.onceLeave(@intFromPtr(&fdFuncsMade), 1)
+    }
+    const source = newSource(@intFromPtr(&fdFuncs), FD_SIZE)
+    g_source_set_static_name(source, m.literal("GUnixFDSource"))
+    m.putWord(source + FD_TAG, g_source_add_unix_fd(source, fd, condition))
+    return source
+}
+
+export fn g_unix_fd_add_full(priority_: i32, fd: i32, condition: i32, function: usize, user_data: usize, notify: usize) -> u32 { return addSource(g_unix_fd_source_new(fd, condition), priority_, function, user_data, notify) }
+export fn g_unix_fd_add(fd: i32, condition: i32, function: usize, user_data: usize) -> u32 { return addSource(g_unix_fd_source_new(fd, condition), 0, function, user_data, 0) }
+
+// ---------------------------------------------------------------------------
+// Child watches: a pidfd (pidfd_open) polled; when it is readable the
+// child is reaped (waitpid) and the callback gets its wait status.
+
+const CHILD_PID: usize = 96
+const CHILD_TAG: usize = 104
+const CHILD_FD: usize = 112
+const CHILD_SIZE: u32 = 120
+var childFuncs: [6]usize = undefined
+var childFuncsMade: u64 = 0
+
+pub const ChildFunc = fn(i32, i32, usize) -> void
+
+extern("c") fn waitpid(pid: i32, status: usize, options: i32) -> i32
+
+export fn __mlx_glib_child_dispatch(source: usize, callback: usize, user_data: usize) -> i32 {
+    const status = m.alloc(8)
+    const pid = m.getI32(source + CHILD_PID)
+    const reaped = waitpid(pid, status, 1)
+    if reaped != pid {
+        m.release(status)
+        return 1
+    }
+    const waitStatus = m.getI32(status)
+    m.release(status)
+    if callback != 0 {
+        const call: ChildFunc = unsafe { @ptrFromInt(ChildFunc, callback) }
+        call(pid, waitStatus, user_data)
+    }
+    return 0
+}
+
+export fn __mlx_glib_child_finalize(source: usize) -> void {
+    if m.getI32(source + CHILD_FD) >= 0 { _ = sys.close(m.getI32(source + CHILD_FD)) }
+}
+
+export fn g_child_watch_source_new(pid: i32) -> usize {
+    if threads.onceEnter(@intFromPtr(&childFuncsMade)) {
+        var index: usize = 0
+        while index < 6 {
+            childFuncs[index] = 0
+            index += 1
+        }
+        childFuncs[2] = @intFromPtr(__mlx_glib_child_dispatch)
+        childFuncs[3] = @intFromPtr(__mlx_glib_child_finalize)
+        threads.onceLeave(@intFromPtr(&childFuncsMade), 1)
+    }
+    const source = newSource(@intFromPtr(&childFuncs), CHILD_SIZE)
+    g_source_set_static_name(source, m.literal("GChildWatchSource"))
+    m.putI32(source + CHILD_PID, pid)
+    const fd = @intCast(i32, sys.syscall2(434, @intCast(usize, pid), 0))
+    m.putI32(source + CHILD_FD, fd)
+    if fd >= 0 { m.putWord(source + CHILD_TAG, g_source_add_unix_fd(source, fd, 1)) }
+    return source
+}
+
+export fn g_child_watch_add_full(priority_: i32, pid: i32, function: usize, data: usize, notify: usize) -> u32 { return addSource(g_child_watch_source_new(pid), priority_, function, data, notify) }
+export fn g_child_watch_add(pid: i32, function: usize, data: usize) -> u32 { return addSource(g_child_watch_source_new(pid), 0, function, data, 0) }

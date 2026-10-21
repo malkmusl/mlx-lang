@@ -1,0 +1,2087 @@
+// std.sql.parser: SQL statements into ASTs (std.sql.ast), by recursive
+// descent over std.sql.lexer's tokens: the SQL SQLite understands, as
+// far as WebKit and the tests use it: SELECT (joins, subqueries in FROM,
+// compound SELECTs, GROUP BY, HAVING, ORDER BY, LIMIT and OFFSET, VALUES),
+// INSERT (OR conflict, column lists, VALUES rows, SELECT, DEFAULT VALUES),
+// REPLACE, UPDATE and DELETE (with ORDER BY and LIMIT), CREATE and DROP
+// TABLE and INDEX with every column and table constraint, ALTER TABLE
+// (RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN), transactions and
+// savepoints, PRAGMA, VACUUM, REINDEX and ANALYZE.
+//
+// Expressions follow SQLite's precedence: OR, AND, NOT, the equality
+// operators (= == != <> IS IN LIKE GLOB MATCH REGEXP BETWEEN ISNULL
+// NOTNULL), the relational ones (< <= > >=), the bit operators (& | << >>),
+// + -, * / %, ||, COLLATE, and the unary - + ~.
+//
+// Errors are SQLite's messages: `near "X": syntax error`, `incomplete
+// input`, `unrecognized token: "X"`.
+const mem = @import("./mem.mlx")
+const lexer = @import("./lexer.mlx")
+const ast = @import("./ast.mlx")
+const value = @import("./value.mlx")
+const numbers = @import("./numbers.mlx")
+
+const Token = lexer.Token
+
+pub const Parser = struct {
+    arena: usize
+    lex: lexer.Lexer
+    tok: Token
+    failed: bool
+    message: mem.Buffer
+    // Parameters: the largest number used, and the named ones (pairs of
+    // the name's address and length, then its number).
+    variables: i64
+    names: mem.Words
+    depth: usize
+    // Where the last token taken ends.
+    lastEnd: usize
+}
+
+fn arenaOf(p: *Parser) -> *ast.Arena { unsafe { return @ptrFromInt(*ast.Arena, p.*.arena) } }
+
+pub fn init(p: *Parser, arena: *ast.Arena, text: usize, length: usize) -> void {
+    p.*.arena = @intFromPtr(arena)
+    lexer.init(&p.*.lex, text, length)
+    p.*.failed = false
+    mem.initBuffer(&p.*.message)
+    p.*.variables = 0
+    mem.initWords(&p.*.names)
+    p.*.depth = 0
+    p.*.lastEnd = 0
+    p.*.tok.start = 0
+    p.*.tok.length = 0
+    advance(p)
+}
+
+pub fn deinit(p: *Parser) -> void {
+    mem.freeBuffer(&p.*.message)
+    mem.freeWords(&p.*.names)
+}
+
+fn advance(p: *Parser) -> void {
+    p.*.lastEnd = p.*.tok.start + p.*.tok.length
+    lexer.next(&p.*.lex, &p.*.tok)
+}
+
+fn tokText(p: *Parser) -> []const u8 { return lexer.text(&p.*.lex, &p.*.tok) }
+
+fn at(p: *Parser, kind: u8) -> bool { return p.*.tok.kind == kind }
+
+fn atWord(p: *Parser, word: []const u8) -> bool { return lexer.isWord(&p.*.lex, &p.*.tok, word) }
+
+fn takeWord(p: *Parser, word: []const u8) -> bool {
+    if !atWord(p, word) { return false }
+    advance(p)
+    return true
+}
+
+fn take(p: *Parser, kind: u8) -> bool {
+    if p.*.tok.kind != kind { return false }
+    advance(p)
+    return true
+}
+
+// Fails with SQLite's message for the current token.
+fn syntaxError(p: *Parser) -> void {
+    if p.*.failed { return }
+    p.*.failed = true
+    p.*.message.length = 0
+    if p.*.tok.kind == lexer.END {
+        _ = mem.appendText(&p.*.message, "incomplete input")
+    } else if p.*.tok.kind == lexer.ILLEGAL {
+        _ = mem.appendText(&p.*.message, "unrecognized token: \"")
+        _ = mem.appendText(&p.*.message, tokText(p))
+        _ = mem.appendText(&p.*.message, "\"")
+    } else {
+        _ = mem.appendText(&p.*.message, "near \"")
+        _ = mem.appendText(&p.*.message, tokText(p))
+        _ = mem.appendText(&p.*.message, "\": syntax error")
+    }
+}
+
+fn fail(p: *Parser, message: []const u8) -> void {
+    if p.*.failed { return }
+    p.*.failed = true
+    p.*.message.length = 0
+    _ = mem.appendText(&p.*.message, message)
+}
+
+fn expect(p: *Parser, kind: u8) -> bool {
+    if take(p, kind) { return true }
+    syntaxError(p)
+    return false
+}
+
+fn expectWord(p: *Parser, word: []const u8) -> bool {
+    if takeWord(p, word) { return true }
+    syntaxError(p)
+    return false
+}
+
+fn alloc(p: *Parser, size: usize) -> usize { return ast.alloc(arenaOf(p), size) }
+
+fn newExpr(p: *Parser, op: u8) -> usize {
+    const e = ast.newExpr(arenaOf(p), op)
+    ast.expr(e).*.start = p.*.tok.start
+    return e
+}
+
+// A name token's text, unquoted, copied into the arena.
+fn nameOf(p: *Parser, t: *Token, length: *usize) -> usize {
+    const raw = lexer.text(&p.*.lex, t)
+    if t.*.kind != lexer.QUOTED {
+        length.* = raw.length
+        return ast.copyText(arenaOf(p), @intFromPtr(raw.pointer), raw.length)
+    }
+    const quote = @intCast(u64, raw[0])
+    const close = if quote == 91 { 93 } else { quote }
+    const out = alloc(p, raw.length)
+    var n: usize = 0
+    var i: usize = 1
+    while i + 1 < raw.length {
+        const c = @intCast(u64, raw[i])
+        mem.put8(out + n, c)
+        n += 1
+        if c == close && close != 93 && i + 2 < raw.length && @intCast(u64, raw[i + 1]) == close { i += 1 }
+        i += 1
+    }
+    mem.put8(out + n, 0)
+    length.* = n
+    return out
+}
+
+// Whether the current token may be a name: a quoted identifier, a word
+// that is not reserved, or (`strings`) a string literal, which SQLite takes
+// for a name in some places.
+fn atName(p: *Parser) -> bool {
+    if p.*.tok.kind == lexer.QUOTED { return true }
+    if p.*.tok.kind == lexer.WORD { return !lexer.isReserved(tokText(p)) }
+    return false
+}
+
+// Takes a name (unquoted) into `name` and `length`; false (and fails) when
+// there is none.
+fn takeName(p: *Parser, name: *usize, length: *usize) -> bool {
+    if !atName(p) && !(p.*.tok.kind == lexer.STRING) {
+        // Reserved words are names after a dot and in some other places
+        // SQLite allows; not here.
+        syntaxError(p)
+        return false
+    }
+    if p.*.tok.kind == lexer.STRING {
+        name.* = stringValue(p, length)
+    } else {
+        name.* = nameOf(p, &p.*.tok, length)
+    }
+    advance(p)
+    return true
+}
+
+// Any word or quoted name (after a dot, a reserved word is a name too).
+fn takeAnyName(p: *Parser, name: *usize, length: *usize) -> bool {
+    if p.*.tok.kind != lexer.WORD && p.*.tok.kind != lexer.QUOTED && p.*.tok.kind != lexer.STRING {
+        syntaxError(p)
+        return false
+    }
+    if p.*.tok.kind == lexer.STRING {
+        name.* = stringValue(p, length)
+    } else {
+        name.* = nameOf(p, &p.*.tok, length)
+    }
+    advance(p)
+    return true
+}
+
+// A string literal's value ('' is one quote), copied.
+fn stringValue(p: *Parser, length: *usize) -> usize {
+    const raw = tokText(p)
+    const out = alloc(p, raw.length)
+    var n: usize = 0
+    var i: usize = 1
+    while i + 1 < raw.length {
+        const c = @intCast(u64, raw[i])
+        mem.put8(out + n, c)
+        n += 1
+        if c == 39 && i + 2 < raw.length && raw[i + 1] == 39 { i += 1 }
+        i += 1
+    }
+    length.* = n
+    return out
+}
+
+fn hexValue(c: u64) -> u64 {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 { return c - 87 }
+    return c - 55
+}
+
+// ---------------------------------------------------------------------------
+// Expressions.
+
+pub fn parseExpr(p: *Parser) -> usize {
+    p.*.depth += 1
+    if p.*.depth > 1000 {
+        fail(p, "Expression tree is too large (maximum depth 1000)")
+        return 0
+    }
+    const e = parseOr(p)
+    p.*.depth -= 1
+    return e
+}
+
+fn finish(p: *Parser, e: usize) -> usize {
+    if e != 0 { ast.expr(e).*.end = p.*.lastEnd }
+    return e
+}
+
+fn binary(p: *Parser, op: u8, sub: u8, left: usize, right: usize) -> usize {
+    const e = ast.newExpr(arenaOf(p), op)
+    const x = ast.expr(e)
+    x.*.sub = sub
+    x.*.left = left
+    x.*.right = right
+    x.*.start = ast.expr(left).*.start
+    x.*.end = if right != 0 { ast.expr(right).*.end } else { ast.expr(left).*.end }
+    return e
+}
+
+fn parseOr(p: *Parser) -> usize {
+    var left = parseAnd(p)
+    while !p.*.failed && atWord(p, "OR") {
+        advance(p)
+        const right = parseAnd(p)
+        if p.*.failed { return 0 }
+        left = binary(p, ast.E_OR, 0, left, right)
+    }
+    return left
+}
+
+fn parseAnd(p: *Parser) -> usize {
+    var left = parseNot(p)
+    while !p.*.failed && atWord(p, "AND") {
+        advance(p)
+        const right = parseNot(p)
+        if p.*.failed { return 0 }
+        left = binary(p, ast.E_AND, 0, left, right)
+    }
+    return left
+}
+
+fn parseNot(p: *Parser) -> usize {
+    if atWord(p, "NOT") {
+        const start = p.*.tok.start
+        advance(p)
+        const operand = parseNot(p)
+        if p.*.failed { return 0 }
+        const e = ast.newExpr(arenaOf(p), ast.E_UNARY)
+        ast.expr(e).*.sub = ast.U_NOT
+        ast.expr(e).*.left = operand
+        ast.expr(e).*.start = start
+        ast.expr(e).*.end = ast.expr(operand).*.end
+        return e
+    }
+    return parseEquality(p)
+}
+
+// Whether the next tokens are NOT followed by `word` (NOT IN, NOT LIKE...).
+fn atNotThen(p: *Parser, word: []const u8) -> bool {
+    if !atWord(p, "NOT") { return false }
+    var l = p.*.lex
+    var t: Token = undefined
+    lexer.next(&l, &t)
+    return lexer.isWord(&l, &t, word)
+}
+
+fn parseEquality(p: *Parser) -> usize {
+    var left = parseRelational(p)
+    while !p.*.failed {
+        const start = ast.expr(left).*.start
+        if at(p, lexer.EQ) || at(p, lexer.NE) {
+            const sub = p.*.tok.kind
+            advance(p)
+            const right = parseRelational(p)
+            if p.*.failed { return 0 }
+            left = binary(p, ast.E_BINARY, sub, left, right)
+        } else if atWord(p, "IS") {
+            advance(p)
+            var negated = false
+            if takeWord(p, "NOT") { negated = true }
+            if takeWord(p, "DISTINCT") {
+                if !expectWord(p, "FROM") { return 0 }
+                negated = !negated
+            }
+            const right = parseRelational(p)
+            if p.*.failed { return 0 }
+            left = binary(p, ast.E_IS, 0, left, right)
+            ast.expr(left).*.negated = negated
+        } else if atWord(p, "ISNULL") || atWord(p, "NOTNULL") {
+            const negated = atWord(p, "NOTNULL")
+            advance(p)
+            left = binary(p, ast.E_ISNULL, 0, left, 0)
+            ast.expr(left).*.negated = negated
+            ast.expr(left).*.end = p.*.lastEnd
+        } else if atWord(p, "NOT") && notNullFollows(p) {
+            advance(p)
+            advance(p)
+            left = binary(p, ast.E_ISNULL, 0, left, 0)
+            ast.expr(left).*.negated = true
+            ast.expr(left).*.end = p.*.lastEnd
+        } else if atWord(p, "IN") || atNotThen(p, "IN") {
+            const negated = takeWord(p, "NOT")
+            advance(p)
+            left = parseIn(p, left)
+            if p.*.failed { return 0 }
+            ast.expr(left).*.negated = negated
+            ast.expr(left).*.start = start
+        } else if atWord(p, "LIKE") || atWord(p, "GLOB") || atWord(p, "REGEXP") || atWord(p, "MATCH") || atNotThen(p, "LIKE") || atNotThen(p, "GLOB") || atNotThen(p, "REGEXP") || atNotThen(p, "MATCH") {
+            const negated = takeWord(p, "NOT")
+            var kind = ast.L_LIKE
+            if atWord(p, "GLOB") { kind = ast.L_GLOB }
+            if atWord(p, "REGEXP") { kind = ast.L_REGEXP }
+            if atWord(p, "MATCH") { kind = ast.L_MATCH }
+            advance(p)
+            const pattern = parseRelational(p)
+            if p.*.failed { return 0 }
+            left = binary(p, ast.E_LIKE, kind, left, pattern)
+            ast.expr(left).*.negated = negated
+            if takeWord(p, "ESCAPE") {
+                const escape = parseRelational(p)
+                if p.*.failed { return 0 }
+                ast.expr(left).*.third = escape
+                ast.expr(left).*.end = ast.expr(escape).*.end
+            }
+        } else if atWord(p, "BETWEEN") || atNotThen(p, "BETWEEN") {
+            const negated = takeWord(p, "NOT")
+            advance(p)
+            const low = parseRelational(p)
+            if p.*.failed { return 0 }
+            if !expectWord(p, "AND") { return 0 }
+            const high = parseRelational(p)
+            if p.*.failed { return 0 }
+            left = binary(p, ast.E_BETWEEN, 0, left, low)
+            ast.expr(left).*.third = high
+            ast.expr(left).*.negated = negated
+            ast.expr(left).*.end = ast.expr(high).*.end
+        } else {
+            break
+        }
+    }
+    return left
+}
+
+fn notNullFollows(p: *Parser) -> bool { return atNotThen(p, "NULL") }
+
+fn parseIn(p: *Parser, left: usize) -> usize {
+    if at(p, lexer.LPAREN) {
+        advance(p)
+        if atWord(p, "SELECT") || atWord(p, "VALUES") || atWord(p, "WITH") {
+            const s = parseSelect(p)
+            if p.*.failed || !expect(p, lexer.RPAREN) { return 0 }
+            const e = binary(p, ast.E_IN_SELECT, 0, left, 0)
+            ast.expr(e).*.select = s
+            ast.expr(e).*.end = p.*.lastEnd
+            return e
+        }
+        const l = ast.newList(arenaOf(p))
+        if !at(p, lexer.RPAREN) {
+            while true {
+                const x = parseExpr(p)
+                if p.*.failed { return 0 }
+                _ = ast.addItem(arenaOf(p), l, x)
+                if !take(p, lexer.COMMA) { break }
+            }
+        }
+        if !expect(p, lexer.RPAREN) { return 0 }
+        const e = binary(p, ast.E_IN_LIST, 0, left, 0)
+        ast.expr(e).*.list = l
+        ast.expr(e).*.end = p.*.lastEnd
+        return e
+    }
+    // IN table: every row of the table's one column.
+    var name: usize = 0
+    var length: usize = 0
+    if !takeName(p, &name, &length) { return 0 }
+    const s = ast.newSelect(arenaOf(p))
+    const src = alloc(p, @sizeOf(ast.Source))
+    ast.source(src).*.name = name
+    ast.source(src).*.nameLength = length
+    _ = ast.push(arenaOf(p), ast.select(s).*.from, @intCast(u64, src))
+    const star = ast.newExpr(arenaOf(p), ast.E_STAR)
+    ast.select(s).*.columns = ast.newList(arenaOf(p))
+    _ = ast.addItem(arenaOf(p), ast.select(s).*.columns, star)
+    const e = binary(p, ast.E_IN_SELECT, 0, left, 0)
+    ast.expr(e).*.select = s
+    ast.expr(e).*.end = p.*.lastEnd
+    return e
+}
+
+fn parseRelational(p: *Parser) -> usize {
+    var left = parseBits(p)
+    while !p.*.failed && (at(p, lexer.LT) || at(p, lexer.LE) || at(p, lexer.GT) || at(p, lexer.GE)) {
+        const sub = p.*.tok.kind
+        advance(p)
+        const right = parseBits(p)
+        if p.*.failed { return 0 }
+        left = binary(p, ast.E_BINARY, sub, left, right)
+    }
+    return left
+}
+
+fn parseBits(p: *Parser) -> usize {
+    var left = parseAdditive(p)
+    while !p.*.failed && (at(p, lexer.BITAND) || at(p, lexer.BITOR) || at(p, lexer.LSHIFT) || at(p, lexer.RSHIFT)) {
+        const sub = p.*.tok.kind
+        advance(p)
+        const right = parseAdditive(p)
+        if p.*.failed { return 0 }
+        left = binary(p, ast.E_BINARY, sub, left, right)
+    }
+    return left
+}
+
+fn parseAdditive(p: *Parser) -> usize {
+    var left = parseMultiplicative(p)
+    while !p.*.failed && (at(p, lexer.PLUS) || at(p, lexer.MINUS)) {
+        const sub = p.*.tok.kind
+        advance(p)
+        const right = parseMultiplicative(p)
+        if p.*.failed { return 0 }
+        left = binary(p, ast.E_BINARY, sub, left, right)
+    }
+    return left
+}
+
+fn parseMultiplicative(p: *Parser) -> usize {
+    var left = parseConcat(p)
+    while !p.*.failed && (at(p, lexer.STAR) || at(p, lexer.SLASH) || at(p, lexer.PERCENT)) {
+        const sub = p.*.tok.kind
+        advance(p)
+        const right = parseConcat(p)
+        if p.*.failed { return 0 }
+        left = binary(p, ast.E_BINARY, sub, left, right)
+    }
+    return left
+}
+
+fn parseConcat(p: *Parser) -> usize {
+    var left = parseCollate(p)
+    while !p.*.failed && at(p, lexer.CONCAT) {
+        advance(p)
+        const right = parseCollate(p)
+        if p.*.failed { return 0 }
+        left = binary(p, ast.E_BINARY, lexer.CONCAT, left, right)
+    }
+    if !p.*.failed && at(p, lexer.PTR) {
+        fail(p, "no such function: ->")
+        return 0
+    }
+    return left
+}
+
+fn parseCollate(p: *Parser) -> usize {
+    var left = parseUnary(p)
+    while !p.*.failed && atWord(p, "COLLATE") {
+        advance(p)
+        var name: usize = 0
+        var length: usize = 0
+        if !takeAnyName(p, &name, &length) { return 0 }
+        left = binary(p, ast.E_COLLATE, 0, left, 0)
+        ast.expr(left).*.name = name
+        ast.expr(left).*.nameLength = length
+        ast.expr(left).*.end = p.*.lastEnd
+    }
+    return left
+}
+
+fn parseUnary(p: *Parser) -> usize {
+    if at(p, lexer.MINUS) || at(p, lexer.PLUS) || at(p, lexer.BITNOT) {
+        const kind = p.*.tok.kind
+        const start = p.*.tok.start
+        advance(p)
+        const operand = parseUnary(p)
+        if p.*.failed { return 0 }
+        const e = ast.newExpr(arenaOf(p), ast.E_UNARY)
+        ast.expr(e).*.sub = if kind == lexer.MINUS { ast.U_NEG } else if kind == lexer.PLUS { ast.U_POS } else { ast.U_BITNOT }
+        ast.expr(e).*.left = operand
+        ast.expr(e).*.start = start
+        ast.expr(e).*.end = ast.expr(operand).*.end
+        return e
+    }
+    return parsePrimary(p)
+}
+
+// An integer literal's value; one too large is a REAL (as SQLite reads
+// 9223372036854775808).
+fn integerLiteral(p: *Parser, e: usize) -> void {
+    const raw = tokText(p)
+    const x = ast.expr(e)
+    if raw.length > 2 && raw[0] == 48 && (raw[1] == 120 || raw[1] == 88) {
+        var v: u64 = 0
+        var i: usize = 2
+        var overflow = false
+        while i < raw.length {
+            if (v >> 60) != 0 { overflow = true }
+            v = (v << 4) | hexValue(@intCast(u64, raw[i]))
+            i += 1
+        }
+        if overflow {
+            fail(p, "hex literal too big: ")
+            _ = mem.appendText(&p.*.message, raw)
+            return
+        }
+        x.*.op = ast.E_INTEGER
+        x.*.i = @bitCast(i64, v)
+        return
+    }
+    var parsed: numbers.Parsed = undefined
+    numbers.parse(@intFromPtr(raw.pointer), raw.length, &parsed)
+    if parsed.fits {
+        x.*.op = ast.E_INTEGER
+        x.*.i = parsed.integer
+    } else {
+        x.*.op = ast.E_REAL
+        x.*.r = parsed.real
+    }
+}
+
+fn parsePrimary(p: *Parser) -> usize {
+    const kind = p.*.tok.kind
+    if kind == lexer.INTEGER {
+        const e = newExpr(p, ast.E_INTEGER)
+        integerLiteral(p, e)
+        if ast.expr(e).*.op == ast.E_REAL {
+            // "9223372036854775808" right after a minus is the smallest
+            // integer: the unary minus makes it so (see U_NEG's
+            // evaluation), which needs the digits.
+            ast.expr(e).*.name = ast.copyText(arenaOf(p), @intFromPtr(tokText(p).pointer), tokText(p).length)
+            ast.expr(e).*.nameLength = tokText(p).length
+        }
+        advance(p)
+        return finish(p, e)
+    }
+    if kind == lexer.REAL {
+        const e = newExpr(p, ast.E_REAL)
+        var parsed: numbers.Parsed = undefined
+        numbers.parse(@intFromPtr(tokText(p).pointer), tokText(p).length, &parsed)
+        ast.expr(e).*.r = parsed.real
+        advance(p)
+        return finish(p, e)
+    }
+    if kind == lexer.STRING {
+        const e = newExpr(p, ast.E_STRING)
+        var length: usize = 0
+        ast.expr(e).*.name = stringValue(p, &length)
+        ast.expr(e).*.nameLength = length
+        advance(p)
+        return finish(p, e)
+    }
+    if kind == lexer.BLOB {
+        const e = newExpr(p, ast.E_BLOB)
+        const raw = tokText(p)
+        const n = (raw.length - 3) / 2
+        const out = alloc(p, n + 1)
+        var i: usize = 0
+        while i < n {
+            mem.put8(out + i, hexValue(@intCast(u64, raw[2 + i * 2])) * 16 + hexValue(@intCast(u64, raw[3 + i * 2])))
+            i += 1
+        }
+        ast.expr(e).*.name = out
+        ast.expr(e).*.nameLength = n
+        advance(p)
+        return finish(p, e)
+    }
+    if kind == lexer.VARIABLE {
+        const e = newExpr(p, ast.E_VARIABLE)
+        variable(p, e)
+        advance(p)
+        return finish(p, e)
+    }
+    if kind == lexer.LPAREN {
+        const start = p.*.tok.start
+        advance(p)
+        if atWord(p, "SELECT") || atWord(p, "VALUES") || atWord(p, "WITH") {
+            const s = parseSelect(p)
+            if p.*.failed || !expect(p, lexer.RPAREN) { return 0 }
+            const e = ast.newExpr(arenaOf(p), ast.E_SUBQUERY)
+            ast.expr(e).*.select = s
+            ast.expr(e).*.start = start
+            return finish(p, e)
+        }
+        const inner = parseExpr(p)
+        if p.*.failed { return 0 }
+        if at(p, lexer.COMMA) {
+            fail(p, "row value misused")
+            return 0
+        }
+        if !expect(p, lexer.RPAREN) { return 0 }
+        // Its text (a result column's name) takes in the parentheses.
+        ast.expr(inner).*.start = start
+        ast.expr(inner).*.end = p.*.lastEnd
+        return inner
+    }
+    if kind == lexer.STAR {
+        // COUNT(*)'s star is taken by the function call; a bare star here
+        // is an error.
+        syntaxError(p)
+        return 0
+    }
+    if kind == lexer.QUOTED {
+        return parseNameExpr(p)
+    }
+    if kind != lexer.WORD {
+        syntaxError(p)
+        return 0
+    }
+    if atWord(p, "NULL") {
+        const e = newExpr(p, ast.E_NULL)
+        advance(p)
+        return finish(p, e)
+    }
+    if atWord(p, "CAST") {
+        const e = newExpr(p, ast.E_CAST)
+        advance(p)
+        if !expect(p, lexer.LPAREN) { return 0 }
+        const operand = parseExpr(p)
+        if p.*.failed || !expectWord(p, "AS") { return 0 }
+        var typeStart: usize = 0
+        var typeLength: usize = 0
+        typeName(p, &typeStart, &typeLength)
+        if p.*.failed || !expect(p, lexer.RPAREN) { return 0 }
+        ast.expr(e).*.left = operand
+        ast.expr(e).*.affinity = value.affinityOfType(mem.view(p.*.lex.text + typeStart, typeLength))
+        ast.expr(e).*.name = ast.copyText(arenaOf(p), p.*.lex.text + typeStart, typeLength)
+        ast.expr(e).*.nameLength = typeLength
+        return finish(p, e)
+    }
+    if atWord(p, "CASE") {
+        const e = newExpr(p, ast.E_CASE)
+        advance(p)
+        if !atWord(p, "WHEN") {
+            ast.expr(e).*.left = parseExpr(p)
+            if p.*.failed { return 0 }
+        }
+        const l = ast.newList(arenaOf(p))
+        while takeWord(p, "WHEN") {
+            const when = parseExpr(p)
+            if p.*.failed || !expectWord(p, "THEN") { return 0 }
+            const then = parseExpr(p)
+            if p.*.failed { return 0 }
+            _ = ast.addItem(arenaOf(p), l, when)
+            _ = ast.addItem(arenaOf(p), l, then)
+        }
+        if ast.count(l) == 0 {
+            syntaxError(p)
+            return 0
+        }
+        if takeWord(p, "ELSE") {
+            ast.expr(e).*.third = parseExpr(p)
+            if p.*.failed { return 0 }
+        }
+        if !expectWord(p, "END") { return 0 }
+        ast.expr(e).*.list = l
+        return finish(p, e)
+    }
+    if atWord(p, "EXISTS") {
+        const e = newExpr(p, ast.E_EXISTS)
+        advance(p)
+        if !expect(p, lexer.LPAREN) { return 0 }
+        ast.expr(e).*.select = parseSelect(p)
+        if p.*.failed || !expect(p, lexer.RPAREN) { return 0 }
+        return finish(p, e)
+    }
+    if atWord(p, "CURRENT_TIMESTAMP") || atWord(p, "CURRENT_DATE") || atWord(p, "CURRENT_TIME") {
+        const e = newExpr(p, ast.E_FUNCTION)
+        var length: usize = 0
+        ast.expr(e).*.name = nameOf(p, &p.*.tok, &length)
+        ast.expr(e).*.nameLength = length
+        ast.expr(e).*.list = ast.newList(arenaOf(p))
+        advance(p)
+        return finish(p, e)
+    }
+    if atWord(p, "RAISE") {
+        fail(p, "RAISE() may only be used within a trigger-program")
+        return 0
+    }
+    if lexer.isReserved(tokText(p)) && !atWord(p, "REPLACE") && !atWord(p, "LIKE") && !atWord(p, "GLOB") {
+        syntaxError(p)
+        return 0
+    }
+    return parseNameExpr(p)
+}
+
+// A ?NNN, ?, :name, @name or $name parameter: its number.
+fn variable(p: *Parser, e: usize) -> void {
+    const raw = tokText(p)
+    var number: i64 = 0
+    if raw[0] == 63 {
+        if raw.length == 1 {
+            p.*.variables += 1
+            number = p.*.variables
+        } else {
+            var i: usize = 1
+            while i < raw.length {
+                number = number * 10 + @intCast(i64, raw[i] - 48)
+                if number > 32766 { break }
+                i += 1
+            }
+            if number < 1 || number > 32766 {
+                fail(p, "variable number must be between ?1 and ?32766")
+                return
+            }
+            if number > p.*.variables { p.*.variables = number }
+            // ?NNN is named as first written, unless the number has a name.
+            var named = false
+            var k: usize = 0
+            while k < p.*.names.length {
+                if @bitCast(i64, mem.at(&p.*.names, k + 2)) == number { named = true }
+                k += 3
+            }
+            if !named {
+                const copied = ast.copyText(arenaOf(p), @intFromPtr(raw.pointer), raw.length)
+                _ = mem.push(&p.*.names, @intCast(u64, copied))
+                _ = mem.push(&p.*.names, @intCast(u64, raw.length))
+                _ = mem.push(&p.*.names, @bitCast(u64, number))
+            }
+        }
+    } else {
+        // The same name is the same parameter.
+        var i: usize = 0
+        while i < p.*.names.length {
+            const nameAt = @intCast(usize, mem.at(&p.*.names, i))
+            const nameLength = @intCast(usize, mem.at(&p.*.names, i + 1))
+            if mem.same(mem.view(nameAt, nameLength), raw) {
+                number = @bitCast(i64, mem.at(&p.*.names, i + 2))
+                break
+            }
+            i += 3
+        }
+        if number == 0 {
+            p.*.variables += 1
+            number = p.*.variables
+            const copied = ast.copyText(arenaOf(p), @intFromPtr(raw.pointer), raw.length)
+            _ = mem.push(&p.*.names, @intCast(u64, copied))
+            _ = mem.push(&p.*.names, @intCast(u64, raw.length))
+            _ = mem.push(&p.*.names, @bitCast(u64, number))
+        }
+    }
+    ast.expr(e).*.i = number
+}
+
+// A name: a column (name, table.name, schema.table.name) or a function
+// call.
+fn parseNameExpr(p: *Parser) -> usize {
+    const start = p.*.tok.start
+    const quoted = p.*.tok.kind == lexer.QUOTED
+    var first: usize = 0
+    var firstLength: usize = 0
+    first = nameOf(p, &p.*.tok, &firstLength)
+    advance(p)
+    if at(p, lexer.LPAREN) && !quoted {
+        return parseFunction(p, start, first, firstLength)
+    }
+    const e = ast.newExpr(arenaOf(p), ast.E_COLUMN)
+    ast.expr(e).*.start = start
+    ast.expr(e).*.quoted = quoted
+    if take(p, lexer.DOT) {
+        var second: usize = 0
+        var secondLength: usize = 0
+        if !takeAnyName(p, &second, &secondLength) { return 0 }
+        if take(p, lexer.DOT) {
+            // schema.table.column: the schema is main (or temp).
+            var third: usize = 0
+            var thirdLength: usize = 0
+            if !takeAnyName(p, &third, &thirdLength) { return 0 }
+            ast.expr(e).*.table = second
+            ast.expr(e).*.tableLength = secondLength
+            ast.expr(e).*.name = third
+            ast.expr(e).*.nameLength = thirdLength
+        } else {
+            ast.expr(e).*.table = first
+            ast.expr(e).*.tableLength = firstLength
+            ast.expr(e).*.name = second
+            ast.expr(e).*.nameLength = secondLength
+        }
+    } else {
+        ast.expr(e).*.name = first
+        ast.expr(e).*.nameLength = firstLength
+    }
+    return finish(p, e)
+}
+
+fn parseFunction(p: *Parser, start: usize, name: usize, length: usize) -> usize {
+    const e = ast.newExpr(arenaOf(p), ast.E_FUNCTION)
+    ast.expr(e).*.start = start
+    ast.expr(e).*.name = name
+    ast.expr(e).*.nameLength = length
+    advance(p)
+    const l = ast.newList(arenaOf(p))
+    ast.expr(e).*.list = l
+    if take(p, lexer.STAR) {
+        ast.expr(e).*.star = true
+    } else if !at(p, lexer.RPAREN) {
+        if takeWord(p, "DISTINCT") {
+            ast.expr(e).*.distinct = true
+        } else {
+            _ = takeWord(p, "ALL")
+        }
+        while true {
+            const x = parseExpr(p)
+            if p.*.failed { return 0 }
+            _ = ast.addItem(arenaOf(p), l, x)
+            if !take(p, lexer.COMMA) { break }
+        }
+        if atWord(p, "ORDER") {
+            fail(p, "ORDER BY may not be used with non-aggregate functions")
+            return 0
+        }
+    }
+    if !expect(p, lexer.RPAREN) { return 0 }
+    if atWord(p, "FILTER") || atWord(p, "OVER") {
+        fail(p, "window functions are not supported")
+        return 0
+    }
+    return finish(p, e)
+}
+
+// A type name: words, then (n) or (n, m). Its text's place.
+fn typeName(p: *Parser, start: *usize, length: *usize) -> void {
+    start.* = p.*.tok.start
+    length.* = 0
+    var end = p.*.tok.start
+    while (p.*.tok.kind == lexer.WORD || p.*.tok.kind == lexer.QUOTED) && !isConstraintWord(p) {
+        end = p.*.tok.start + p.*.tok.length
+        advance(p)
+    }
+    if end > start.* && at(p, lexer.LPAREN) {
+        advance(p)
+        if !signedNumber(p) { return }
+        if take(p, lexer.COMMA) {
+            if !signedNumber(p) { return }
+        }
+        end = p.*.tok.start + p.*.tok.length
+        if !expect(p, lexer.RPAREN) { return }
+    }
+    length.* = end - start.*
+}
+
+fn signedNumber(p: *Parser) -> bool {
+    if at(p, lexer.PLUS) || at(p, lexer.MINUS) { advance(p) }
+    if at(p, lexer.INTEGER) || at(p, lexer.REAL) {
+        advance(p)
+        return true
+    }
+    syntaxError(p)
+    return false
+}
+
+fn isConstraintWord(p: *Parser) -> bool {
+    return atWord(p, "CONSTRAINT") || atWord(p, "PRIMARY") || atWord(p, "NOT") || atWord(p, "NULL") || atWord(p, "UNIQUE") || atWord(p, "CHECK") || atWord(p, "DEFAULT") || atWord(p, "COLLATE") || atWord(p, "REFERENCES") || atWord(p, "GENERATED") || atWord(p, "AS")
+}
+
+// ---------------------------------------------------------------------------
+// SELECT.
+
+pub fn parseSelect(p: *Parser) -> usize {
+    var with: usize = 0
+    if takeWord(p, "WITH") {
+        _ = takeWord(p, "RECURSIVE")
+        with = ast.newList(arenaOf(p))
+        while true {
+            const address = alloc(p, @sizeOf(ast.Cte))
+            const c = ast.cte(address)
+            if !takeName(p, &c.*.name, &c.*.nameLength) { return 0 }
+            if take(p, lexer.LPAREN) {
+                const l = ast.newList(arenaOf(p))
+                while true {
+                    var name: usize = 0
+                    var length: usize = 0
+                    if !takeAnyName(p, &name, &length) { return 0 }
+                    const it = ast.item(ast.addItem(arenaOf(p), l, 0))
+                    it.*.name = name
+                    it.*.nameLength = length
+                    if !take(p, lexer.COMMA) { break }
+                }
+                if !expect(p, lexer.RPAREN) { return 0 }
+                c.*.columns = l
+            }
+            if !expectWord(p, "AS") { return 0 }
+            if takeWord(p, "NOT") {
+                if !expectWord(p, "MATERIALIZED") { return 0 }
+            } else {
+                _ = takeWord(p, "MATERIALIZED")
+            }
+            if !expect(p, lexer.LPAREN) { return 0 }
+            c.*.text = p.*.lex.text
+            c.*.start = p.*.tok.start
+            c.*.variables = p.*.variables
+            c.*.select = parseSelect(p)
+            if p.*.failed { return 0 }
+            c.*.end = p.*.tok.start
+            if !expect(p, lexer.RPAREN) { return 0 }
+            _ = ast.push(arenaOf(p), with, @intCast(u64, address))
+            if !take(p, lexer.COMMA) { break }
+        }
+    }
+    const s = parseCompound(p)
+    if s != 0 { ast.select(s).*.with = with }
+    return s
+}
+
+fn parseCompound(p: *Parser) -> usize {
+    var s = parseSelectCore(p)
+    while !p.*.failed {
+        var op = ast.C_NONE
+        if atWord(p, "UNION") {
+            advance(p)
+            op = if takeWord(p, "ALL") { ast.C_UNION_ALL } else { ast.C_UNION }
+        } else if takeWord(p, "INTERSECT") {
+            op = ast.C_INTERSECT
+        } else if takeWord(p, "EXCEPT") {
+            op = ast.C_EXCEPT
+        } else {
+            break
+        }
+        const right = parseSelectCore(p)
+        if p.*.failed { return 0 }
+        ast.select(right).*.op = op
+        ast.select(right).*.prior = s
+        s = right
+    }
+    if p.*.failed { return 0 }
+    // ORDER BY and LIMIT belong to the whole compound: the last SELECT.
+    if atWord(p, "ORDER") {
+        advance(p)
+        if !expectWord(p, "BY") { return 0 }
+        ast.select(s).*.orderBy = parseOrderList(p)
+        if p.*.failed { return 0 }
+    }
+    if takeWord(p, "LIMIT") {
+        ast.select(s).*.limit = parseExpr(p)
+        if p.*.failed { return 0 }
+        if takeWord(p, "OFFSET") {
+            ast.select(s).*.offset = parseExpr(p)
+        } else if take(p, lexer.COMMA) {
+            // LIMIT offset, count.
+            ast.select(s).*.offset = ast.select(s).*.limit
+            ast.select(s).*.limit = parseExpr(p)
+        }
+    }
+    return s
+}
+
+fn parseOrderList(p: *Parser) -> usize {
+    const l = ast.newList(arenaOf(p))
+    while true {
+        const e = parseExpr(p)
+        if p.*.failed { return 0 }
+        const it = ast.item(ast.addItem(arenaOf(p), l, e))
+        if takeWord(p, "DESC") {
+            it.*.descending = true
+        } else {
+            _ = takeWord(p, "ASC")
+        }
+        if takeWord(p, "NULLS") {
+            if takeWord(p, "FIRST") {
+                it.*.nulls = 1
+            } else if takeWord(p, "LAST") {
+                it.*.nulls = 2
+            } else {
+                syntaxError(p)
+                return 0
+            }
+        }
+        if !take(p, lexer.COMMA) { break }
+    }
+    return l
+}
+
+fn parseSelectCore(p: *Parser) -> usize {
+    if atWord(p, "VALUES") {
+        advance(p)
+        var s: usize = 0
+        while true {
+            if !expect(p, lexer.LPAREN) { return 0 }
+            const row = ast.newSelect(arenaOf(p))
+            ast.select(row).*.values = true
+            const l = ast.newList(arenaOf(p))
+            while true {
+                const e = parseExpr(p)
+                if p.*.failed { return 0 }
+                _ = ast.addItem(arenaOf(p), l, e)
+                if !take(p, lexer.COMMA) { break }
+            }
+            if !expect(p, lexer.RPAREN) { return 0 }
+            ast.select(row).*.columns = l
+            if s != 0 {
+                if ast.count(ast.select(s).*.columns) != ast.count(l) {
+                    fail(p, "all VALUES must have the same number of terms")
+                    return 0
+                }
+                ast.select(row).*.op = ast.C_UNION_ALL
+                ast.select(row).*.prior = s
+            }
+            s = row
+            if !take(p, lexer.COMMA) { break }
+        }
+        return s
+    }
+    if !expectWord(p, "SELECT") { return 0 }
+    const s = ast.newSelect(arenaOf(p))
+    if takeWord(p, "DISTINCT") {
+        ast.select(s).*.distinct = true
+    } else {
+        _ = takeWord(p, "ALL")
+    }
+    const columns = ast.newList(arenaOf(p))
+    ast.select(s).*.columns = columns
+    while true {
+        if at(p, lexer.STAR) {
+            const e = newExpr(p, ast.E_STAR)
+            advance(p)
+            _ = ast.addItem(arenaOf(p), columns, finish(p, e))
+        } else if (p.*.tok.kind == lexer.WORD || p.*.tok.kind == lexer.QUOTED) && dotStarFollows(p) {
+            const e = newExpr(p, ast.E_STAR)
+            var length: usize = 0
+            const name = nameOf(p, &p.*.tok, &length)
+            advance(p)
+            advance(p)
+            advance(p)
+            const it = ast.item(ast.addItem(arenaOf(p), columns, finish(p, e)))
+            it.*.table = name
+            it.*.tableLength = length
+        } else {
+            const e = parseExpr(p)
+            if p.*.failed { return 0 }
+            const it = ast.item(ast.addItem(arenaOf(p), columns, e))
+            if takeWord(p, "AS") {
+                if !takeAnyName(p, &it.*.name, &it.*.nameLength) { return 0 }
+            } else if atName(p) {
+                _ = takeName(p, &it.*.name, &it.*.nameLength)
+            } else if at(p, lexer.STRING) {
+                it.*.name = stringValue(p, &it.*.nameLength)
+                advance(p)
+            }
+        }
+        if !take(p, lexer.COMMA) { break }
+    }
+    if takeWord(p, "FROM") {
+        parseFrom(p, s)
+        if p.*.failed { return 0 }
+    }
+    if takeWord(p, "WHERE") {
+        ast.select(s).*.where = parseExpr(p)
+        if p.*.failed { return 0 }
+    }
+    if atWord(p, "GROUP") {
+        advance(p)
+        if !expectWord(p, "BY") { return 0 }
+        const l = ast.newList(arenaOf(p))
+        while true {
+            const e = parseExpr(p)
+            if p.*.failed { return 0 }
+            _ = ast.addItem(arenaOf(p), l, e)
+            if !take(p, lexer.COMMA) { break }
+        }
+        ast.select(s).*.groupBy = l
+        if takeWord(p, "HAVING") {
+            ast.select(s).*.having = parseExpr(p)
+            if p.*.failed { return 0 }
+        }
+    } else if takeWord(p, "HAVING") {
+        ast.select(s).*.having = parseExpr(p)
+        if p.*.failed { return 0 }
+    }
+    if atWord(p, "WINDOW") {
+        fail(p, "window functions are not supported")
+        return 0
+    }
+    return s
+}
+
+// Whether the tokens are `name . *`.
+fn dotStarFollows(p: *Parser) -> bool {
+    var l = p.*.lex
+    var t: Token = undefined
+    lexer.next(&l, &t)
+    if t.kind != lexer.DOT { return false }
+    lexer.next(&l, &t)
+    return t.kind == lexer.STAR
+}
+
+fn joinKeyword(p: *Parser) -> bool {
+    return atWord(p, "JOIN") || atWord(p, "LEFT") || atWord(p, "RIGHT") || atWord(p, "FULL") || atWord(p, "INNER") || atWord(p, "CROSS") || atWord(p, "NATURAL") || atWord(p, "OUTER")
+}
+
+fn parseFrom(p: *Parser, s: usize) -> void {
+    var join = ast.J_INNER
+    var firstSource = true
+    while true {
+        const src = alloc(p, @sizeOf(ast.Source))
+        const x = ast.source(src)
+        x.*.join = if firstSource { 0 } else { join }
+        if at(p, lexer.LPAREN) {
+            advance(p)
+            if atWord(p, "SELECT") || atWord(p, "VALUES") || atWord(p, "WITH") {
+                x.*.subquery = parseSelect(p)
+                if p.*.failed || !expect(p, lexer.RPAREN) { return }
+            } else {
+                fail(p, "parenthesized joins are not supported")
+                return
+            }
+        } else {
+            var name: usize = 0
+            var length: usize = 0
+            if !takeName(p, &name, &length) { return }
+            if take(p, lexer.DOT) {
+                // schema.table
+                x.*.alias = 0
+                if !takeAnyName(p, &name, &length) { return }
+            }
+            x.*.name = name
+            x.*.nameLength = length
+            if at(p, lexer.LPAREN) {
+                // A table-valued function.
+                advance(p)
+                const l = ast.newList(arenaOf(p))
+                if !at(p, lexer.RPAREN) {
+                    while true {
+                        const e = parseExpr(p)
+                        if p.*.failed { return }
+                        _ = ast.addItem(arenaOf(p), l, e)
+                        if !take(p, lexer.COMMA) { break }
+                    }
+                }
+                if !expect(p, lexer.RPAREN) { return }
+                x.*.arguments = l
+            }
+        }
+        if takeWord(p, "AS") {
+            if !takeAnyName(p, &x.*.alias, &x.*.aliasLength) { return }
+        } else if atName(p) && !joinKeyword(p) {
+            _ = takeName(p, &x.*.alias, &x.*.aliasLength)
+        }
+        if atWord(p, "INDEXED") {
+            advance(p)
+            if !expectWord(p, "BY") { return }
+            if !takeAnyName(p, &x.*.indexedBy, &x.*.indexedByLength) { return }
+        } else if atWord(p, "NOT") {
+            advance(p)
+            if !expectWord(p, "INDEXED") { return }
+            x.*.notIndexed = true
+        }
+        if takeWord(p, "ON") {
+            x.*.on = parseExpr(p)
+            if p.*.failed { return }
+        } else if takeWord(p, "USING") {
+            if !expect(p, lexer.LPAREN) { return }
+            const l = ast.newList(arenaOf(p))
+            while true {
+                var name: usize = 0
+                var length: usize = 0
+                if !takeAnyName(p, &name, &length) { return }
+                const it = ast.item(ast.addItem(arenaOf(p), l, 0))
+                it.*.name = name
+                it.*.nameLength = length
+                if !take(p, lexer.COMMA) { break }
+            }
+            if !expect(p, lexer.RPAREN) { return }
+            x.*.using = l
+        }
+        _ = ast.push(arenaOf(p), ast.select(s).*.from, @intCast(u64, src))
+        firstSource = false
+        // The next source, and how it joins.
+        if take(p, lexer.COMMA) {
+            join = ast.J_INNER
+            continue
+        }
+        join = 0
+        var any = false
+        while true {
+            if takeWord(p, "NATURAL") {
+                join = join | ast.J_NATURAL
+            } else if takeWord(p, "LEFT") {
+                join = join | ast.J_LEFT
+            } else if takeWord(p, "RIGHT") {
+                join = join | ast.J_RIGHT
+            } else if takeWord(p, "FULL") {
+                join = join | ast.J_LEFT | ast.J_RIGHT
+            } else if takeWord(p, "OUTER") {
+                any = true
+            } else if takeWord(p, "INNER") {
+                join = join | ast.J_INNER
+            } else if takeWord(p, "CROSS") {
+                join = join | ast.J_CROSS | ast.J_INNER
+            } else {
+                break
+            }
+            any = true
+        }
+        if takeWord(p, "JOIN") {
+            if (join & ast.J_RIGHT) != 0 {
+                fail(p, "RIGHT and FULL OUTER JOINs are not supported")
+                return
+            }
+            if (join & ast.J_LEFT) == 0 { join = join | ast.J_INNER }
+            continue
+        }
+        if any {
+            syntaxError(p)
+            return
+        }
+        break
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statements.
+
+fn conflictClause(p: *Parser) -> u8 {
+    // ON CONFLICT action (the ON is taken by the caller).
+    if !expectWord(p, "CONFLICT") { return 0 }
+    return resolution(p)
+}
+
+fn resolution(p: *Parser) -> u8 {
+    if takeWord(p, "ROLLBACK") { return ast.OE_ROLLBACK }
+    if takeWord(p, "ABORT") { return ast.OE_ABORT }
+    if takeWord(p, "FAIL") { return ast.OE_FAIL }
+    if takeWord(p, "IGNORE") { return ast.OE_IGNORE }
+    if takeWord(p, "REPLACE") { return ast.OE_REPLACE }
+    syntaxError(p)
+    return 0
+}
+
+fn newStatement(p: *Parser, kind: u8) -> usize {
+    const address = alloc(p, @sizeOf(ast.Statement))
+    ast.statement(address).*.kind = kind
+    return address
+}
+
+// The statement at the lexer's position: 0 (and not failed) when there
+// is none before the end (only spaces, comments and semicolons).
+pub fn parseStatement(p: *Parser) -> usize {
+    while at(p, lexer.SEMICOLON) { advance(p) }
+    if at(p, lexer.END) { return 0 }
+    var explain: u8 = 0
+    if takeWord(p, "EXPLAIN") {
+        explain = 1
+        if takeWord(p, "QUERY") {
+            if !expectWord(p, "PLAN") { return 0 }
+            explain = 2
+        }
+    }
+    var st: usize = 0
+    if atWord(p, "SELECT") || atWord(p, "VALUES") || atWord(p, "WITH") {
+        st = newStatement(p, ast.S_SELECT)
+        ast.statement(st).*.select = parseSelect(p)
+    } else if atWord(p, "INSERT") || atWord(p, "REPLACE") {
+        st = parseInsert(p)
+    } else if atWord(p, "UPDATE") {
+        st = parseUpdate(p)
+    } else if atWord(p, "DELETE") {
+        st = parseDelete(p)
+    } else if atWord(p, "CREATE") {
+        st = parseCreate(p)
+    } else if atWord(p, "DROP") {
+        st = parseDrop(p)
+    } else if atWord(p, "ALTER") {
+        st = parseAlter(p)
+    } else if atWord(p, "BEGIN") {
+        advance(p)
+        st = newStatement(p, ast.S_BEGIN)
+        if takeWord(p, "DEFERRED") {
+            ast.statement(st).*.transaction = ast.T_DEFERRED
+        } else if takeWord(p, "IMMEDIATE") {
+            ast.statement(st).*.transaction = ast.T_IMMEDIATE
+        } else if takeWord(p, "EXCLUSIVE") {
+            ast.statement(st).*.transaction = ast.T_EXCLUSIVE
+        }
+        if takeWord(p, "TRANSACTION") {
+            if atName(p) { advance(p) }
+        }
+    } else if atWord(p, "COMMIT") || atWord(p, "END") {
+        advance(p)
+        st = newStatement(p, ast.S_COMMIT)
+        if takeWord(p, "TRANSACTION") {
+            if atName(p) { advance(p) }
+        }
+    } else if atWord(p, "ROLLBACK") {
+        advance(p)
+        st = newStatement(p, ast.S_ROLLBACK)
+        if takeWord(p, "TRANSACTION") {
+            if atName(p) && !atWord(p, "TO") { advance(p) }
+        }
+        if takeWord(p, "TO") {
+            _ = takeWord(p, "SAVEPOINT")
+            const x = ast.statement(st)
+            _ = takeAnyName(p, &x.*.name, &x.*.nameLength)
+        }
+    } else if atWord(p, "SAVEPOINT") {
+        advance(p)
+        st = newStatement(p, ast.S_SAVEPOINT)
+        const x = ast.statement(st)
+        _ = takeAnyName(p, &x.*.name, &x.*.nameLength)
+    } else if atWord(p, "RELEASE") {
+        advance(p)
+        st = newStatement(p, ast.S_RELEASE)
+        _ = takeWord(p, "SAVEPOINT")
+        const x = ast.statement(st)
+        _ = takeAnyName(p, &x.*.name, &x.*.nameLength)
+    } else if atWord(p, "PRAGMA") {
+        st = parsePragma(p)
+    } else if atWord(p, "VACUUM") {
+        advance(p)
+        st = newStatement(p, ast.S_VACUUM)
+        ast.statement(st).*.writes = true
+        if atName(p) { advance(p) }
+        if atWord(p, "INTO") {
+            fail(p, "VACUUM INTO is not supported")
+        }
+    } else if atWord(p, "REINDEX") || atWord(p, "ANALYZE") {
+        const kind = if atWord(p, "REINDEX") { ast.S_REINDEX } else { ast.S_ANALYZE }
+        advance(p)
+        st = newStatement(p, kind)
+        const x = ast.statement(st)
+        if atName(p) {
+            _ = takeName(p, &x.*.name, &x.*.nameLength)
+            if take(p, lexer.DOT) { _ = takeAnyName(p, &x.*.name, &x.*.nameLength) }
+        }
+        x.*.writes = kind == ast.S_REINDEX
+    } else if atWord(p, "ATTACH") || atWord(p, "DETACH") {
+        fail(p, "ATTACH and DETACH are not supported")
+        return 0
+    } else {
+        syntaxError(p)
+        return 0
+    }
+    if p.*.failed || st == 0 { return 0 }
+    ast.statement(st).*.explain = explain
+    // The statement's text ends with its last token.
+    ast.statement(st).*.textEnd = p.*.lastEnd
+    if !at(p, lexer.SEMICOLON) && !at(p, lexer.END) {
+        syntaxError(p)
+        return 0
+    }
+    if at(p, lexer.SEMICOLON) { advance(p) }
+    return st
+}
+
+fn qualifiedName(p: *Parser, st: usize) -> bool {
+    const x = ast.statement(st)
+    x.*.nameStart = p.*.tok.start
+    if !takeName(p, &x.*.name, &x.*.nameLength) { return false }
+    if take(p, lexer.DOT) {
+        x.*.schema = x.*.name
+        x.*.schemaLength = x.*.nameLength
+        x.*.nameStart = p.*.tok.start
+        if !takeAnyName(p, &x.*.name, &x.*.nameLength) { return false }
+    }
+    return true
+}
+
+fn parseInsert(p: *Parser) -> usize {
+    const st = newStatement(p, ast.S_INSERT)
+    const x = ast.statement(st)
+    x.*.writes = true
+    x.*.conflict = ast.OE_NONE
+    if takeWord(p, "REPLACE") {
+        x.*.conflict = ast.OE_REPLACE
+    } else {
+        advance(p)
+        if takeWord(p, "OR") { x.*.conflict = resolution(p) }
+    }
+    if !expectWord(p, "INTO") { return 0 }
+    if !qualifiedName(p, st) { return 0 }
+    if takeWord(p, "AS") {
+        var alias: usize = 0
+        var aliasLength: usize = 0
+        if !takeAnyName(p, &alias, &aliasLength) { return 0 }
+        x.*.name2 = alias
+        x.*.name2Length = aliasLength
+    }
+    if take(p, lexer.LPAREN) {
+        const l = ast.newList(arenaOf(p))
+        while true {
+            var name: usize = 0
+            var length: usize = 0
+            if !takeAnyName(p, &name, &length) { return 0 }
+            const it = ast.item(ast.addItem(arenaOf(p), l, 0))
+            it.*.name = name
+            it.*.nameLength = length
+            if !take(p, lexer.COMMA) { break }
+        }
+        if !expect(p, lexer.RPAREN) { return 0 }
+        x.*.columns = l
+    }
+    if atWord(p, "DEFAULT") {
+        advance(p)
+        if !expectWord(p, "VALUES") { return 0 }
+        x.*.defaultValues = true
+    } else if atWord(p, "VALUES") || atWord(p, "SELECT") || atWord(p, "WITH") {
+        x.*.source = parseSelect(p)
+        if p.*.failed { return 0 }
+    } else {
+        syntaxError(p)
+        return 0
+    }
+    var last: usize = 0
+    while atWord(p, "ON") {
+        advance(p)
+        if !expectWord(p, "CONFLICT") { return 0 }
+        const address = alloc(p, @sizeOf(ast.Upsert))
+        const u = ast.upsert(address)
+        if take(p, lexer.LPAREN) {
+            u.*.target = parseIndexedColumns(p)
+            if p.*.failed { return 0 }
+            if takeWord(p, "WHERE") {
+                u.*.targetWhere = parseExpr(p)
+                if p.*.failed { return 0 }
+            }
+        }
+        if !expectWord(p, "DO") { return 0 }
+        if takeWord(p, "NOTHING") {
+            u.*.update = false
+        } else {
+            if !expectWord(p, "UPDATE") || !expectWord(p, "SET") { return 0 }
+            u.*.update = true
+            u.*.sets = parseSetList(p)
+            if p.*.failed { return 0 }
+            if takeWord(p, "WHERE") {
+                u.*.where = parseExpr(p)
+                if p.*.failed { return 0 }
+            }
+        }
+        if last == 0 {
+            x.*.upsert = address
+        } else {
+            ast.upsert(last).*.next = address
+        }
+        last = address
+        // (A clause for any conflict is the last.)
+        if u.*.target == 0 && atWord(p, "ON") {
+            syntaxError(p)
+            return 0
+        }
+    }
+    if atWord(p, "RETURNING") {
+        fail(p, "RETURNING is not supported")
+        return 0
+    }
+    return st
+}
+
+// UPDATE's (and an upsert's) SET items: Items with the column's name.
+fn parseSetList(p: *Parser) -> usize {
+    const l = ast.newList(arenaOf(p))
+    while true {
+        var name: usize = 0
+        var length: usize = 0
+        if at(p, lexer.LPAREN) {
+            fail(p, "row values in SET are not supported")
+            return 0
+        }
+        if !takeAnyName(p, &name, &length) { return 0 }
+        if !expect(p, lexer.EQ) { return 0 }
+        const e = parseExpr(p)
+        if p.*.failed { return 0 }
+        const it = ast.item(ast.addItem(arenaOf(p), l, e))
+        it.*.name = name
+        it.*.nameLength = length
+        if !take(p, lexer.COMMA) { break }
+    }
+    return l
+}
+
+fn parseUpdate(p: *Parser) -> usize {
+    advance(p)
+    const st = newStatement(p, ast.S_UPDATE)
+    const x = ast.statement(st)
+    x.*.writes = true
+    if takeWord(p, "OR") { x.*.conflict = resolution(p) }
+    if !qualifiedName(p, st) { return 0 }
+    if takeWord(p, "AS") {
+        if !takeAnyName(p, &x.*.name2, &x.*.name2Length) { return 0 }
+    } else if atName(p) && !atWord(p, "SET") {
+        _ = takeName(p, &x.*.name2, &x.*.name2Length)
+    }
+    if atWord(p, "INDEXED") || atWord(p, "NOT") {
+        // INDEXED BY / NOT INDEXED: taken and ignored.
+        if takeWord(p, "INDEXED") {
+            if !expectWord(p, "BY") { return 0 }
+            advance(p)
+        } else {
+            advance(p)
+            if !expectWord(p, "INDEXED") { return 0 }
+        }
+    }
+    if !expectWord(p, "SET") { return 0 }
+    const l = ast.newList(arenaOf(p))
+    while true {
+        var name: usize = 0
+        var length: usize = 0
+        if at(p, lexer.LPAREN) {
+            fail(p, "row values in SET are not supported")
+            return 0
+        }
+        if !takeAnyName(p, &name, &length) { return 0 }
+        if !expect(p, lexer.EQ) { return 0 }
+        const e = parseExpr(p)
+        if p.*.failed { return 0 }
+        const it = ast.item(ast.addItem(arenaOf(p), l, e))
+        it.*.name = name
+        it.*.nameLength = length
+        if !take(p, lexer.COMMA) { break }
+    }
+    x.*.columns = l
+    if atWord(p, "FROM") {
+        fail(p, "UPDATE FROM is not supported")
+        return 0
+    }
+    if takeWord(p, "WHERE") {
+        x.*.where = parseExpr(p)
+        if p.*.failed { return 0 }
+    }
+    parseOrderLimit(p, st)
+    return st
+}
+
+fn parseOrderLimit(p: *Parser, st: usize) -> void {
+    const x = ast.statement(st)
+    if atWord(p, "ORDER") {
+        advance(p)
+        if !expectWord(p, "BY") { return }
+        x.*.orderBy = parseOrderList(p)
+        if p.*.failed { return }
+    }
+    if takeWord(p, "LIMIT") {
+        x.*.limit = parseExpr(p)
+        if p.*.failed { return }
+        if takeWord(p, "OFFSET") {
+            x.*.offset = parseExpr(p)
+        } else if take(p, lexer.COMMA) {
+            x.*.offset = x.*.limit
+            x.*.limit = parseExpr(p)
+        }
+    }
+}
+
+fn parseDelete(p: *Parser) -> usize {
+    advance(p)
+    const st = newStatement(p, ast.S_DELETE)
+    const x = ast.statement(st)
+    x.*.writes = true
+    if !expectWord(p, "FROM") { return 0 }
+    if !qualifiedName(p, st) { return 0 }
+    if takeWord(p, "AS") {
+        if !takeAnyName(p, &x.*.name2, &x.*.name2Length) { return 0 }
+    } else if atName(p) {
+        _ = takeName(p, &x.*.name2, &x.*.name2Length)
+    }
+    if takeWord(p, "INDEXED") {
+        if !expectWord(p, "BY") { return 0 }
+        advance(p)
+    } else if atWord(p, "NOT") {
+        advance(p)
+        if !expectWord(p, "INDEXED") { return 0 }
+    }
+    if takeWord(p, "WHERE") {
+        x.*.where = parseExpr(p)
+        if p.*.failed { return 0 }
+    }
+    parseOrderLimit(p, st)
+    return st
+}
+
+fn parseCreate(p: *Parser) -> usize {
+    advance(p)
+    var temp = false
+    if takeWord(p, "TEMP") || takeWord(p, "TEMPORARY") { temp = true }
+    var unique = false
+    if takeWord(p, "UNIQUE") { unique = true }
+    if !unique && takeWord(p, "TABLE") {
+        const st = newStatement(p, ast.S_CREATE_TABLE)
+        const x = ast.statement(st)
+        x.*.writes = true
+        x.*.temp = temp
+        if atWord(p, "IF") {
+            advance(p)
+            if !expectWord(p, "NOT") || !expectWord(p, "EXISTS") { return 0 }
+            x.*.ifNotExists = true
+        }
+        if !qualifiedName(p, st) { return 0 }
+        x.*.tableDef = parseTableDef(p)
+        if p.*.failed { return 0 }
+        return st
+    }
+    if takeWord(p, "INDEX") {
+        const st = newStatement(p, ast.S_CREATE_INDEX)
+        const x = ast.statement(st)
+        x.*.writes = true
+        x.*.unique = unique
+        if atWord(p, "IF") {
+            advance(p)
+            if !expectWord(p, "NOT") || !expectWord(p, "EXISTS") { return 0 }
+            x.*.ifNotExists = true
+        }
+        if !qualifiedName(p, st) { return 0 }
+        if !expectWord(p, "ON") { return 0 }
+        if !takeName(p, &x.*.name2, &x.*.name2Length) { return 0 }
+        if !expect(p, lexer.LPAREN) { return 0 }
+        x.*.columns = parseIndexedColumns(p)
+        if p.*.failed { return 0 }
+        if takeWord(p, "WHERE") {
+            x.*.where = parseExpr(p)
+            if p.*.failed { return 0 }
+        }
+        return st
+    }
+    if !unique && takeWord(p, "VIEW") {
+        const st = newStatement(p, ast.S_CREATE_VIEW)
+        const x = ast.statement(st)
+        x.*.writes = true
+        x.*.temp = temp
+        if atWord(p, "IF") {
+            advance(p)
+            if !expectWord(p, "NOT") || !expectWord(p, "EXISTS") { return 0 }
+            x.*.ifNotExists = true
+        }
+        if !qualifiedName(p, st) { return 0 }
+        // Its columns' names, when they are given.
+        if take(p, lexer.LPAREN) {
+            const l = ast.newList(arenaOf(p))
+            while true {
+                var name: usize = 0
+                var length: usize = 0
+                if !takeAnyName(p, &name, &length) { return 0 }
+                const it = ast.item(ast.addItem(arenaOf(p), l, 0))
+                it.*.name = name
+                it.*.nameLength = length
+                if !take(p, lexer.COMMA) { break }
+            }
+            if !expect(p, lexer.RPAREN) { return 0 }
+            x.*.columns = l
+        }
+        if !expectWord(p, "AS") { return 0 }
+        x.*.selectStart = p.*.tok.start
+        x.*.select = parseSelect(p)
+        if p.*.failed { return 0 }
+        return st
+    }
+    if atWord(p, "TRIGGER") || atWord(p, "VIRTUAL") {
+        fail(p, "triggers and virtual tables are not supported")
+        return 0
+    }
+    syntaxError(p)
+    return 0
+}
+
+// Indexed columns up to the closing parenthesis: a name or an expression,
+// COLLATE, ASC or DESC.
+fn parseIndexedColumns(p: *Parser) -> usize {
+    const l = ast.newList(arenaOf(p))
+    while true {
+        const e = parseExpr(p)
+        if p.*.failed { return 0 }
+        const it = ast.item(ast.addItem(arenaOf(p), l, e))
+        // A COLLATE parsed into the expression is the column's collation.
+        var inner = e
+        if ast.expr(inner).*.op == ast.E_COLLATE {
+            it.*.collation = ast.expr(inner).*.name
+            it.*.collationLength = ast.expr(inner).*.nameLength
+            inner = ast.expr(inner).*.left
+        }
+        if ast.expr(inner).*.op == ast.E_COLUMN && ast.expr(inner).*.table == 0 {
+            it.*.name = ast.expr(inner).*.name
+            it.*.nameLength = ast.expr(inner).*.nameLength
+        } else if ast.expr(inner).*.op == ast.E_STRING {
+            it.*.name = ast.expr(inner).*.name
+            it.*.nameLength = ast.expr(inner).*.nameLength
+        }
+        if takeWord(p, "DESC") {
+            it.*.descending = true
+        } else {
+            _ = takeWord(p, "ASC")
+        }
+        if !take(p, lexer.COMMA) { break }
+    }
+    if !expect(p, lexer.RPAREN) { return 0 }
+    return l
+}
+
+fn parseTableDef(p: *Parser) -> usize {
+    const address = alloc(p, @sizeOf(ast.TableDef))
+    const d = ast.tableDef(address)
+    d.*.columns = ast.newList(arenaOf(p))
+    d.*.constraints = ast.newList(arenaOf(p))
+    if takeWord(p, "AS") {
+        d.*.asSelect = parseSelect(p)
+        return address
+    }
+    if !expect(p, lexer.LPAREN) { return 0 }
+    var constraints = false
+    var comma: usize = 0
+    while true {
+        if atWord(p, "CONSTRAINT") || atWord(p, "PRIMARY") || atWord(p, "UNIQUE") || atWord(p, "CHECK") || atWord(p, "FOREIGN") {
+            // ADD COLUMN puts a column at the comma before the constraints.
+            if !constraints { d.*.end = comma }
+            constraints = true
+            const c = parseTableConstraint(p)
+            if p.*.failed { return 0 }
+            if c != 0 { _ = ast.push(arenaOf(p), d.*.constraints, @intCast(u64, c)) }
+        } else {
+            if constraints {
+                syntaxError(p)
+                return 0
+            }
+            const c = parseColumnDef(p)
+            if p.*.failed { return 0 }
+            _ = ast.push(arenaOf(p), d.*.columns, @intCast(u64, c))
+        }
+        comma = p.*.tok.start
+        if !take(p, lexer.COMMA) { break }
+    }
+    if !constraints { d.*.end = p.*.tok.start }
+    if !expect(p, lexer.RPAREN) { return 0 }
+    while true {
+        if takeWord(p, "WITHOUT") {
+            if !atWord(p, "ROWID") {
+                syntaxError(p)
+                return 0
+            }
+            advance(p)
+            d.*.withoutRowid = true
+        } else if takeWord(p, "STRICT") {
+            d.*.strict = true
+        } else {
+            break
+        }
+        if !take(p, lexer.COMMA) { break }
+    }
+    if d.*.withoutRowid {
+        fail(p, "WITHOUT ROWID tables are not supported")
+        return 0
+    }
+    return address
+}
+
+pub fn parseColumnDef(p: *Parser) -> usize {
+    const address = alloc(p, @sizeOf(ast.ColumnDef))
+    const c = ast.columnDef(address)
+    c.*.start = p.*.tok.start
+    if !takeAnyName(p, &c.*.name, &c.*.nameLength) { return 0 }
+    typeName(p, &c.*.typeStart, &c.*.typeLength)
+    if p.*.failed { return 0 }
+    c.*.end = p.*.lastEnd
+    var constraintName: usize = 0
+    var constraintLength: usize = 0
+    while !p.*.failed {
+        if takeWord(p, "CONSTRAINT") {
+            if !takeAnyName(p, &constraintName, &constraintLength) { return 0 }
+            continue
+        }
+        if takeWord(p, "PRIMARY") {
+            if !expectWord(p, "KEY") { return 0 }
+            c.*.primaryKey = true
+            if takeWord(p, "DESC") {
+                c.*.primaryKeyDescending = true
+            } else {
+                _ = takeWord(p, "ASC")
+            }
+            if takeWord(p, "ON") { c.*.primaryKeyConflict = conflictClause(p) }
+            if takeWord(p, "AUTOINCREMENT") { c.*.autoincrement = true }
+        } else if atWord(p, "NOT") {
+            advance(p)
+            if !expectWord(p, "NULL") { return 0 }
+            c.*.notNull = true
+            if takeWord(p, "ON") { c.*.notNullConflict = conflictClause(p) }
+        } else if takeWord(p, "NULL") {
+            if takeWord(p, "ON") { _ = conflictClause(p) }
+        } else if takeWord(p, "UNIQUE") {
+            c.*.unique = true
+            if takeWord(p, "ON") { c.*.uniqueConflict = conflictClause(p) }
+        } else if takeWord(p, "CHECK") {
+            if !expect(p, lexer.LPAREN) { return 0 }
+            const e = parseExpr(p)
+            if p.*.failed || !expect(p, lexer.RPAREN) { return 0 }
+            if c.*.checks == 0 { c.*.checks = ast.newList(arenaOf(p)) }
+            const it = ast.item(ast.addItem(arenaOf(p), c.*.checks, e))
+            it.*.name = constraintName
+            it.*.nameLength = constraintLength
+        } else if takeWord(p, "DEFAULT") {
+            c.*.defaultStart = p.*.tok.start
+            if take(p, lexer.LPAREN) {
+                c.*.defaultExpr = parseExpr(p)
+                if p.*.failed || !expect(p, lexer.RPAREN) { return 0 }
+            } else if at(p, lexer.PLUS) || at(p, lexer.MINUS) {
+                c.*.defaultExpr = parseUnary(p)
+            } else if at(p, lexer.INTEGER) || at(p, lexer.REAL) || at(p, lexer.STRING) || at(p, lexer.BLOB) || atWord(p, "NULL") || atWord(p, "CURRENT_TIME") || atWord(p, "CURRENT_DATE") || atWord(p, "CURRENT_TIMESTAMP") {
+                c.*.defaultExpr = parsePrimary(p)
+            } else if p.*.tok.kind == lexer.WORD || p.*.tok.kind == lexer.QUOTED {
+                // An identifier default is its name as text (TRUE and
+                // FALSE are the numbers).
+                const e = newExpr(p, ast.E_STRING)
+                var length: usize = 0
+                ast.expr(e).*.name = nameOf(p, &p.*.tok, &length)
+                ast.expr(e).*.nameLength = length
+                if p.*.tok.kind == lexer.WORD && (atWord(p, "TRUE") || atWord(p, "FALSE")) {
+                    ast.expr(e).*.op = ast.E_INTEGER
+                    ast.expr(e).*.i = if atWord(p, "TRUE") { 1 } else { 0 }
+                }
+                advance(p)
+                c.*.defaultExpr = finish(p, e)
+            } else {
+                syntaxError(p)
+                return 0
+            }
+            if p.*.failed { return 0 }
+            c.*.defaultEnd = p.*.lastEnd
+        } else if takeWord(p, "COLLATE") {
+            if !takeAnyName(p, &c.*.collation, &c.*.collationLength) { return 0 }
+        } else if takeWord(p, "REFERENCES") {
+            c.*.foreignKey = parseForeignKeyClause(p, 0)
+        } else if atWord(p, "GENERATED") || atWord(p, "AS") {
+            fail(p, "generated columns are not supported")
+            return 0
+        } else {
+            break
+        }
+        c.*.end = p.*.lastEnd
+    }
+    return address
+}
+
+// REFERENCES table [(columns)] [ON DELETE/UPDATE action] [MATCH name]
+// [[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]] (after REFERENCES).
+fn parseForeignKeyClause(p: *Parser, columns: usize) -> usize {
+    const address = alloc(p, @sizeOf(ast.ForeignKey))
+    const f = ast.foreignKey(address)
+    f.*.columns = columns
+    if !takeAnyName(p, &f.*.parent, &f.*.parentLength) { return 0 }
+    if take(p, lexer.LPAREN) {
+        const l = ast.newList(arenaOf(p))
+        while true {
+            var name: usize = 0
+            var length: usize = 0
+            if !takeAnyName(p, &name, &length) { return 0 }
+            const it = ast.item(ast.addItem(arenaOf(p), l, 0))
+            it.*.name = name
+            it.*.nameLength = length
+            if !take(p, lexer.COMMA) { break }
+        }
+        if !expect(p, lexer.RPAREN) { return 0 }
+        f.*.parentColumns = l
+    }
+    while !p.*.failed {
+        if takeWord(p, "ON") {
+            const onDelete = atWord(p, "DELETE")
+            if !takeWord(p, "DELETE") && !takeWord(p, "UPDATE") {
+                syntaxError(p)
+                return 0
+            }
+            var action = ast.FK_NO_ACTION
+            if takeWord(p, "SET") {
+                if takeWord(p, "NULL") {
+                    action = ast.FK_SET_NULL
+                } else if takeWord(p, "DEFAULT") {
+                    action = ast.FK_SET_DEFAULT
+                } else {
+                    syntaxError(p)
+                    return 0
+                }
+            } else if takeWord(p, "CASCADE") {
+                action = ast.FK_CASCADE
+            } else if takeWord(p, "RESTRICT") {
+                action = ast.FK_RESTRICT
+            } else if takeWord(p, "NO") {
+                if !expectWord(p, "ACTION") { return 0 }
+                action = ast.FK_NO_ACTION
+            } else {
+                syntaxError(p)
+                return 0
+            }
+            if onDelete {
+                f.*.onDelete = action
+            } else {
+                f.*.onUpdate = action
+            }
+        } else if takeWord(p, "MATCH") {
+            advance(p)
+        } else if atWord(p, "NOT") && deferrableFollows(p) {
+            advance(p)
+            advance(p)
+            if takeWord(p, "INITIALLY") { advance(p) }
+        } else if takeWord(p, "DEFERRABLE") {
+            if takeWord(p, "INITIALLY") {
+                if takeWord(p, "DEFERRED") {
+                    f.*.deferred = true
+                } else {
+                    _ = takeWord(p, "IMMEDIATE")
+                }
+            }
+        } else {
+            break
+        }
+    }
+    return address
+}
+
+fn deferrableFollows(p: *Parser) -> bool { return atNotThen(p, "DEFERRABLE") }
+
+fn parseTableConstraint(p: *Parser) -> usize {
+    var name: usize = 0
+    var length: usize = 0
+    if takeWord(p, "CONSTRAINT") {
+        if !takeAnyName(p, &name, &length) { return 0 }
+    }
+    const address = alloc(p, @sizeOf(ast.TableConstraint))
+    const c = ast.tableConstraint(address)
+    c.*.name = name
+    c.*.nameLength = length
+    if takeWord(p, "PRIMARY") || takeWord(p, "UNIQUE") {
+        // (PRIMARY was taken: KEY follows.)
+        if takeWord(p, "KEY") {
+            c.*.kind = ast.K_PRIMARY_KEY
+        } else {
+            c.*.kind = ast.K_UNIQUE
+        }
+        if !expect(p, lexer.LPAREN) { return 0 }
+        c.*.columns = parseIndexedColumns(p)
+        if p.*.failed { return 0 }
+        if takeWord(p, "AUTOINCREMENT") { c.*.autoincrement = true }
+        if takeWord(p, "ON") { c.*.conflict = conflictClause(p) }
+        return address
+    }
+    if takeWord(p, "CHECK") {
+        c.*.kind = ast.K_CHECK
+        if !expect(p, lexer.LPAREN) { return 0 }
+        c.*.check = parseExpr(p)
+        if p.*.failed || !expect(p, lexer.RPAREN) { return 0 }
+        return address
+    }
+    if takeWord(p, "FOREIGN") {
+        if !expectWord(p, "KEY") || !expect(p, lexer.LPAREN) { return 0 }
+        const l = ast.newList(arenaOf(p))
+        while true {
+            var name: usize = 0
+            var length: usize = 0
+            if !takeAnyName(p, &name, &length) { return 0 }
+            const it = ast.item(ast.addItem(arenaOf(p), l, 0))
+            it.*.name = name
+            it.*.nameLength = length
+            if !take(p, lexer.COMMA) { break }
+        }
+        if !expect(p, lexer.RPAREN) || !expectWord(p, "REFERENCES") { return 0 }
+        c.*.kind = ast.K_FOREIGN_KEY
+        c.*.foreignKey = parseForeignKeyClause(p, l)
+        return address
+    }
+    syntaxError(p)
+    return 0
+}
+
+fn parseDrop(p: *Parser) -> usize {
+    advance(p)
+    var kind: u8 = 0
+    if takeWord(p, "TABLE") {
+        kind = ast.S_DROP_TABLE
+    } else if takeWord(p, "INDEX") {
+        kind = ast.S_DROP_INDEX
+    } else if takeWord(p, "VIEW") {
+        kind = ast.S_DROP_VIEW
+    } else if takeWord(p, "TRIGGER") {
+        kind = ast.S_DROP_TRIGGER
+    } else {
+        syntaxError(p)
+        return 0
+    }
+    const st = newStatement(p, kind)
+    const x = ast.statement(st)
+    x.*.writes = true
+    if atWord(p, "IF") {
+        advance(p)
+        if !expectWord(p, "EXISTS") { return 0 }
+        x.*.ifExists = true
+    }
+    if !qualifiedName(p, st) { return 0 }
+    return st
+}
+
+fn parseAlter(p: *Parser) -> usize {
+    advance(p)
+    if !expectWord(p, "TABLE") { return 0 }
+    const st = newStatement(p, ast.S_ALTER_RENAME)
+    const x = ast.statement(st)
+    x.*.writes = true
+    if !qualifiedName(p, st) { return 0 }
+    if takeWord(p, "RENAME") {
+        if takeWord(p, "TO") {
+            x.*.kind = ast.S_ALTER_RENAME
+            if !takeAnyName(p, &x.*.name2, &x.*.name2Length) { return 0 }
+            return st
+        }
+        _ = takeWord(p, "COLUMN")
+        x.*.kind = ast.S_ALTER_RENAME_COLUMN
+        var old: usize = 0
+        var oldLength: usize = 0
+        if !takeAnyName(p, &old, &oldLength) { return 0 }
+        if !expectWord(p, "TO") { return 0 }
+        if !takeAnyName(p, &x.*.name2, &x.*.name2Length) { return 0 }
+        x.*.schema = old
+        x.*.schemaLength = oldLength
+        return st
+    }
+    if takeWord(p, "ADD") {
+        _ = takeWord(p, "COLUMN")
+        x.*.kind = ast.S_ALTER_ADD
+        x.*.column = parseColumnDef(p)
+        return st
+    }
+    if takeWord(p, "DROP") {
+        _ = takeWord(p, "COLUMN")
+        x.*.kind = ast.S_ALTER_DROP_COLUMN
+        if !takeAnyName(p, &x.*.name2, &x.*.name2Length) { return 0 }
+        return st
+    }
+    syntaxError(p)
+    return 0
+}
+
+fn parsePragma(p: *Parser) -> usize {
+    advance(p)
+    const st = newStatement(p, ast.S_PRAGMA)
+    const x = ast.statement(st)
+    if !takeAnyName(p, &x.*.name, &x.*.nameLength) { return 0 }
+    if take(p, lexer.DOT) {
+        x.*.schema = x.*.name
+        x.*.schemaLength = x.*.nameLength
+        if !takeAnyName(p, &x.*.name, &x.*.nameLength) { return 0 }
+    }
+    var close = false
+    if take(p, lexer.EQ) {
+        close = false
+    } else if take(p, lexer.LPAREN) {
+        close = true
+    } else {
+        return st
+    }
+    // A value: a signed number, a name, a string, ON/OFF...
+    if at(p, lexer.MINUS) || at(p, lexer.PLUS) {
+        x.*.pragmaValue = parseUnary(p)
+    } else if at(p, lexer.INTEGER) || at(p, lexer.REAL) || at(p, lexer.STRING) {
+        x.*.pragmaValue = parsePrimary(p)
+    } else if p.*.tok.kind == lexer.WORD || p.*.tok.kind == lexer.QUOTED {
+        const e = newExpr(p, ast.E_STRING)
+        var length: usize = 0
+        ast.expr(e).*.name = nameOf(p, &p.*.tok, &length)
+        ast.expr(e).*.nameLength = length
+        advance(p)
+        x.*.pragmaValue = finish(p, e)
+    } else {
+        syntaxError(p)
+        return 0
+    }
+    if p.*.failed { return 0 }
+    if close && !expect(p, lexer.RPAREN) { return 0 }
+    return st
+}

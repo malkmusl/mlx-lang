@@ -127,8 +127,25 @@ extends_signed_results() {
     return $ok
 }
 
+# Whether programs $1 builds give the wrapping operators on a narrow
+# signed type a sign-extended result (tests/359_signed_wrapping_runtime.mlx
+# exits 13); older compilers only masked it to the type's width, so a
+# negative i32 from `a -% b` compared as large and positive.
+extends_signed_wrapping() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/359_signed_wrapping_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 gives a plugin a soname and its exports a symbol version
-# (--soname, --symbol-version; projects/desktop/libpulse needs them).
+# (--soname, --symbol-version; compiler/libc/pulse needs them).
 writes_symbol_versions() {
     local probe
     probe=$(mktemp -d mlx-out/probe.XXXXXX)
@@ -176,7 +193,7 @@ keeps_slice_lengths() {
 
 # Whether $1 makes an `export const` a data symbol of a plugin
 # (tests/support/plugin_library.mlx's mlx_plugin_level, read as a C global
-# from python3; projects/desktop/libpipewire needs it for pw_log_level).
+# from python3; compiler/libc/pipewire needs it for pw_log_level).
 exports_data() {
     command -v python3 > /dev/null || return 0
     local probe
@@ -240,7 +257,7 @@ lowers_thread_builtins() {
     return $ok
 }
 
-# What mlxlibc (projects/libc) needs: @frameAddress, a narrow signed value
+# What mlxlibc (compiler/libc) needs: @frameAddress, a narrow signed value
 # read through a pointer kept signed, a module var with an array
 # initializer, and a plugin with --entry and --init that runs as a program.
 builds_mlxlibc() {
@@ -649,6 +666,7 @@ probes=(
     "has_large_arena|the 1 GiB arena"
     "keeps_match_widths|match values stored at their width"
     "extends_signed_results|signed results sign-extended"
+    "extends_signed_wrapping|signed wrapping arithmetic sign-extended"
     "writes_symbol_versions|symbol versions"
     "resolves_named_array_lengths|array lengths from named constants"
     "exports_data|data symbols for export const"
@@ -745,6 +763,9 @@ rebuild_with() {
         rm -f "$next" "$fixed"
         return 1
     fi
+    # The compiler it replaces stays as $canonical.previous: the
+    # compiler's sources must stay what it builds (tools/check_bootstrap.sh).
+    if [[ -x $canonical && "$seed" == "$canonical" ]]; then cp -f "$canonical" "$canonical.previous"; fi
     mv "$fixed" "$canonical"
     rm -f "$next"
     return 0

@@ -1,0 +1,963 @@
+// Faces: opening one of a font in memory or in a file by the driver its
+// format asks for ("truetype" for glyf outlines and embedded bitmaps,
+// "cff" for CFF and CFF2) as FreeType's FT_Open_Face does; its sizes
+// (their requests, FreeType's FT_Request_Size and the functions made of
+// it) and glyph slots; its transform and properties; closing it.
+//
+//     const opened = face.newFace(library, face.SOURCE_PATH, 0, 0, path)
+//     if opened.0 != r.OK { ... }
+//     const err = face.openFace(opened.1, 0, 0, 2)
+//
+// A face opened with an index of 0 or more has a glyph slot and a size;
+// one opened with a negative index tells the number of faces of the
+// file only.
+const m = @import("./memory.mlx")
+const r = @import("./records.mlx")
+const o = @import("./objects.mlx")
+const calc = @import("./calc.mlx")
+const library = @import("./library.mlx")
+const sfnt = @import("./sfnt.mlx")
+const cmap = @import("./cmap.mlx")
+const cff = @import("./cff.mlx")
+const truetype = @import("./glyf.mlx")
+const variations = @import("./variations.mlx")
+const sbit = @import("./sbit.mlx")
+const color = @import("./color.mlx")
+const load = @import("./load.mlx")
+const render = @import("./render.mlx")
+const psnames = @import("./psnames.mlx")
+const fs = @import("../../bootstrap/fs.mlx")
+const linux = @import("../../bootstrap/os/linux.mlx")
+
+const Face = o.Face
+
+// ---------------------------------------------------------------------------
+// The font's bytes.
+
+// Where a face's bytes come from: the caller's memory (which must outlive
+// the face), a file (mapped), or bytes of the library's memory that the
+// face frees.
+pub const SOURCE_MEMORY: i64 = 1
+pub const SOURCE_PATH: i64 = 2
+pub const SOURCE_OWNED: i64 = 3
+
+// The options of opening a face (FreeType's parameters of FT_Open_Face):
+// the typographic family and subfamily names left out, `sbix` left out.
+pub const OPEN_IGNORE_TYPOGRAPHIC_FAMILY: i64 = 1
+pub const OPEN_IGNORE_TYPOGRAPHIC_SUBFAMILY: i64 = 2
+pub const OPEN_IGNORE_SBIX: i64 = 4
+
+// The bytes of the font into `f` (FreeType's FT_Stream_New for memory and
+// a path).
+fn openData(f: *Face, kind: i64, data: usize, size: u64, path: usize) -> i32 {
+    if kind == SOURCE_MEMORY || kind == SOURCE_OWNED {
+        f.*.data = data
+        f.*.size = size
+        f.*.dataKind = if kind == SOURCE_OWNED { o.DATA_ALLOCATED } else { o.DATA_CALLER }
+        return r.OK
+    }
+    if kind == SOURCE_PATH {
+        if path == 0 { return r.ERR_CANNOT_OPEN_RESOURCE }
+        f.*.fromPath = true
+        const file = unsafe { fs.open(@ptrFromInt([*]const u8, path), fs.READ_ONLY, 0) }
+        if !fs.isValid(file) { return r.ERR_CANNOT_OPEN_RESOURCE }
+        const length = fs.seek(file, 0, fs.SEEK_END)
+        if length <= 0 {
+            _ = fs.close(file)
+            return r.ERR_CANNOT_OPEN_STREAM
+        }
+        const mapped = linux.syscall6(linux.SYS_mmap, 0, @intCast(usize, length), 1, 2, @bitCast(usize, file.descriptor), 0)
+        _ = fs.close(file)
+        if mapped <= 0 { return r.ERR_CANNOT_OPEN_STREAM }
+        f.*.data = @bitCast(usize, mapped)
+        f.*.size = @intCast(u64, length)
+        f.*.dataKind = o.DATA_MAPPED
+        return r.OK
+    }
+    return r.ERR_INVALID_ARGUMENT
+}
+
+fn releaseData(f: *Face) -> void {
+    if f.*.dataKind == o.DATA_MAPPED {
+        _ = linux.syscall2(linux.SYS_munmap, f.*.data, @intCast(usize, f.*.size))
+    } else if f.*.dataKind == o.DATA_ALLOCATED {
+        m.release(f.*.memory, f.*.data)
+    }
+    f.*.data = 0
+}
+
+// ---------------------------------------------------------------------------
+// Opening.
+
+fn startFace(f: *Face, library_: usize, memory: usize) -> void {
+    f.*.library = library_
+    f.*.memory = memory
+    f.*.refcount = 1
+    f.*.txx = 0x10000
+    f.*.tyy = 0x10000
+    f.*.noStemDarkening = -1
+    f.*.randomSeed = -1
+    f.*.varDefaultNamedInstance = 0
+}
+
+// A new face of the library and the font's bytes, not yet read (openFace
+// reads them): the error and the face. Bytes of SOURCE_OWNED are the
+// face's once it is made.
+pub fn newFace(library_: usize, kind: i64, data: usize, size: u64, path: usize) -> (i32, usize) {
+    const memory = library.lib(library_).*.memory
+    const face = m.alloc(memory, @sizeOf(Face))
+    if face == 0 { return -> (r.ERR_OUT_OF_MEMORY, 0) }
+    const f = o.faceOf(face)
+    startFace(f, library_, memory)
+    const err = openData(f, kind, data, size, path)
+    if err != r.OK {
+        m.release(memory, face)
+        return -> (err, 0)
+    }
+    return -> (r.OK, face)
+}
+
+// Frees a face newFace made that openFace did not read.
+pub fn discardFace(face: usize) -> void {
+    const f = o.faceOf(face)
+    releaseData(f)
+    m.release(f.*.memory, face)
+}
+
+// The SFNT part of opening (FreeType's sfnt_init_face): the collection,
+// the directory, the named instances; the face's number of faces, index
+// and the named instances in its style flags.
+fn initSfnt(face: usize, faceIndex: i64) -> i32 {
+    const f = o.faceRecord(face)
+    const opened = sfnt.openCollection(f, faceIndex)
+    if opened.2 != r.OK { return opened.2 }
+    const err = sfnt.loadDirectory(f, opened.1)
+    if err != r.OK { return err }
+    var instances = sfnt.namedInstances(f).0
+    const instanceIndex = calc.abs(faceIndex) >> 16
+    if instanceIndex > instances {
+        if faceIndex >= 0 { return r.ERR_INVALID_ARGUMENT }
+        instances = 0
+    }
+    f.*.styleFlags = instances << 16
+    f.*.numFaces = opened.0
+    f.*.faceIndex = faceIndex
+    return r.OK
+}
+
+// What FreeType answers when no driver opens a file and it looks for the
+// Macintosh's formats in it (load_mac_face: MacBinary, a resource fork
+// in the data, a resource fork beside a file), formats the library does
+// not read: Unknown_File_Format, or the error of reading the headers of
+// data too short for them, or of a resource fork with no font. (A fork
+// that has fonts is taken for none.)
+fn macFontsError(f: *Face, isPath: bool) -> i32 {
+    var err = r.ERR_UNKNOWN_FILE_FORMAT
+    // MacBinary (IsMacBinary): a header of 128 bytes, then the data fork.
+    if f.*.size < 128 {
+        err = r.ERR_INVALID_STREAM_OPERATION
+    } else {
+        const h = f.*.data
+        const nameLength = @intCast(usize, m.get8(h + 1))
+        const isMacBinary = m.get8(h) == 0 && m.get8(h + 74) == 0 && m.get8(h + 82) == 0 && nameLength != 0 && nameLength <= 33 && m.get8(h + 63) == 0 && m.get8(h + 2 + nameLength) == 0 && m.get8(h + 0x53) <= 0x7F
+        if isMacBinary {
+            const dataLength = @intCast(i64, m.u32be(h + 0x53))
+            err = resourceForkError(f, 128 + (dataLength + 127) / 128 * 128)
+        }
+    }
+    // A resource fork of the data itself (IsMacResource at 0).
+    if err == r.ERR_UNKNOWN_FILE_FORMAT { err = resourceForkError(f, 0) }
+    // (The resource forks of a file's own, beside it, are not there.)
+    if (err == r.ERR_UNKNOWN_FILE_FORMAT || err == r.ERR_INVALID_STREAM_OPERATION) && isPath { err = r.ERR_UNKNOWN_FILE_FORMAT }
+    return err
+}
+
+// The error of the header of a resource fork at `offset` (FreeType's
+// FT_Raccess_Get_HeaderInfo).
+fn resourceForkError(f: *Face, offset: i64) -> i32 {
+    const size = @intCast(i64, f.*.size)
+    if offset > size || offset + 16 > size { return r.ERR_INVALID_STREAM_OPERATION }
+    const head = f.*.data + @intCast(usize, offset)
+    // (C's ints, as FreeType reads them.)
+    const rdataPos = @intCast(i64, m.i32be(head))
+    const mapPos = @intCast(i64, m.i32be(head + 4))
+    const rdataLength = @intCast(i64, m.i32be(head + 8))
+    const mapLength = @intCast(i64, m.i32be(head + 12))
+    if mapPos == 0 { return r.ERR_UNKNOWN_FILE_FORMAT }
+    if rdataPos < mapPos {
+        if rdataPos > mapPos - rdataLength { return r.ERR_UNKNOWN_FILE_FORMAT }
+    } else {
+        if mapPos > rdataPos - mapLength { return r.ERR_UNKNOWN_FILE_FORMAT }
+    }
+    const rdataEnd = offset + rdataPos + rdataLength
+    const mapEnd = offset + mapPos + mapLength
+    if rdataEnd < 0 || mapEnd < 0 || rdataEnd > size || mapEnd > size { return r.ERR_UNKNOWN_FILE_FORMAT }
+    const map = offset + mapPos
+    if map < 0 || map > size || map + 16 > size { return r.ERR_INVALID_STREAM_OPERATION }
+    // The map starts with a copy of the header, or with zeros.
+    var allZeros = true
+    var allMatch = true
+    var i: usize = 0
+    while i < 16 {
+        const b = m.get8(f.*.data + @intCast(usize, map) + i)
+        if b != 0 { allZeros = false }
+        if b != m.get8(head + i) { allMatch = false }
+        i += 1
+    }
+    if !allZeros && !allMatch { return r.ERR_UNKNOWN_FILE_FORMAT }
+    // Its list of types (FT_Raccess_Get_DataOffsets): a font has `POST`
+    // or `sfnt` resources.
+    if map + 26 > size { return r.ERR_INVALID_STREAM_OPERATION }
+    const typeList = @intCast(i64, m.i16be(f.*.data + @intCast(usize, map) + 24))
+    if typeList < 0 { return r.ERR_UNKNOWN_FILE_FORMAT }
+    const types = map + typeList
+    if types > size || types + 2 > size { return r.ERR_INVALID_STREAM_OPERATION }
+    const count = @intCast(i64, m.i16be(f.*.data + @intCast(usize, types))) + 1
+    var n: i64 = 0
+    while n < count {
+        const entry = types + 2 + n * 8
+        if entry + 8 > size { return r.ERR_INVALID_STREAM_OPERATION }
+        const tag = m.u32be(f.*.data + @intCast(usize, entry))
+        if tag == 0x504F5354 || tag == 0x73666E74 { return r.ERR_UNKNOWN_FILE_FORMAT }
+        n += 1
+    }
+    return r.ERR_CANNOT_OPEN_RESOURCE
+}
+
+// The face's charmaps with their encodings, as FreeType's SFNT driver
+// makes them: with no Unicode (or symbol) charmap, one made of the glyph
+// names of `post` when the font has them. The error.
+fn setCharmaps(face: usize) -> i32 {
+    cmap.buildCharmaps(face)
+    const f = o.faceRecord(face)
+    var hasUnicode = false
+    var i: i32 = 0
+    while i < f.*.numCharmaps {
+        const c = o.charMap(m.getWord(f.*.charmaps + @intCast(usize, i) * 8))
+        c.*.encoding = cmap.encodingOf(@intCast(i64, c.*.platformId), @intCast(i64, c.*.encodingId))
+        if c.*.encoding == r.ENCODING_UNICODE || c.*.encoding == r.ENCODING_MS_SYMBOL { hasUnicode = true }
+        i += 1
+    }
+    if hasUnicode || (f.*.faceFlags & r.FACE_GLYPH_NAMES) == 0 { return r.OK }
+    const count = if f.*.numGlyphs > 0 { @intCast(u64, f.*.numGlyphs) } else { 0 }
+    const names = m.alloc(f.*.memory, @intCast(usize, count) * 8 + 8)
+    if names == 0 { return r.ERR_OUT_OF_MEMORY }
+    var g: u64 = 0
+    while g < count {
+        m.putWord(names + @intCast(usize, g) * 8, sfnt.postGlyphName(f, @intCast(i64, g)))
+        g += 1
+    }
+    const err = cmap.addNamesCharmap(face, names, count)
+    m.release(f.*.memory, names)
+    if err != r.OK && err != psnames.ERR_NO_UNICODE_GLYPH_NAME { return err }
+    return r.OK
+}
+
+// The rest of the SFNT part (FreeType's sfnt_load_face): tables, names,
+// flags, charmaps, strikes, metrics.
+fn loadSfnt(face: usize, options: i64) -> i32 {
+    const f = o.faceRecord(face)
+    const err = sfnt.loadFace(face, (options & OPEN_IGNORE_TYPOGRAPHIC_FAMILY) != 0, (options & OPEN_IGNORE_TYPOGRAPHIC_SUBFAMILY) != 0, (options & OPEN_IGNORE_SBIX) != 0)
+    if err != r.OK { return err }
+    sbit.load(face)
+    color.load(face)
+    render.colorRender = @intFromPtr(renderColorLayers)
+    if f.*.sbitKind == sbit.KIND_CBLC || f.*.sbitKind == sbit.KIND_SBIX || f.*.colrSize != 0 { f.*.faceFlags |= r.FACE_COLOR }
+    const charmapsErr = setCharmaps(face)
+    if charmapsErr != r.OK { return charmapsErr }
+    sbit.setStrikes(face)
+    sfnt.setMetrics(face)
+    return r.OK
+}
+
+// The TrueType driver's part (FreeType's tt_face_init).
+fn initTrueType(face: usize, faceIndex: i64, options: i64) -> i32 {
+    const f = o.faceRecord(face)
+    var err = initSfnt(face, faceIndex)
+    if err != r.OK { return err }
+    const tag = f.*.formatTag
+    if tag != 0x00010000 && tag != 0x00020000 && tag != o.TAG_true && tag != 0xA56B6264 && tag != 0xA56C7374 { return r.ERR_UNKNOWN_FILE_FORMAT }
+    f.*.driver = library.TRUETYPE
+    if faceIndex < 0 { return r.OK }
+    err = loadSfnt(face, options)
+    if err != r.OK { return err }
+    if (f.*.faceFlags & r.FACE_SCALABLE) != 0 || (f.*.faceFlags & r.FACE_SBIX) != 0 {
+        err = truetype.loadLocations(f, f)
+        if err != r.OK { return err }
+        if f.*.numFixedSizes != 0 && f.*.locaSize != 0 && truetype.singleNotdef(face) { f.*.faceFlags &= ~r.FACE_SCALABLE }
+    }
+    f.*.outlines = if o.hasTable(f, o.TAG_glyf) { o.OUTLINES_GLYF } else { o.OUTLINES_NONE }
+    const instance = faceIndex >> 16
+    if (f.*.faceFlags & r.FACE_MULTIPLE_MASTERS) != 0 && instance > 0 {
+        err = variations.setNamedInstance(face, instance)
+        if err != r.OK { return err }
+    }
+    return r.OK
+}
+
+// The CFF driver's part (FreeType's cff_face_init): CFF or CFF2 in an
+// SFNT (OpenType's `OTTO`), or a CFF font of its own ("pure": data that
+// is no SFNT, or an OpenType font without `head`, which has the charmaps
+// of no `cmap` but its own).
+fn initCff(face: usize, faceIndex: i64, options: i64) -> i32 {
+    const f = o.faceRecord(face)
+    var err = initSfnt(face, faceIndex)
+    var sfntFormat = false
+    var pure = true
+    var offset: u64 = 0
+    var isCff2 = false
+    if err == r.OK {
+        if f.*.formatTag != o.TAG_OTTO { return r.ERR_UNKNOWN_FILE_FORMAT }
+        f.*.driver = library.CFF
+        if faceIndex < 0 { return r.OK }
+        sfntFormat = true
+        if o.hasTable(f, o.TAG_head) {
+            pure = false
+            err = loadSfnt(face, options)
+            if err != r.OK { return err }
+        } else {
+            // (`cmap` is loaded, and no charmap made of it.)
+            if !o.hasTable(f, o.TAG_cmap) { return r.ERR_TABLE_MISSING }
+            err = sfnt.newTables(f)
+            if err != r.OK { return err }
+        }
+        var t = o.table(f, o.TAG_CFF2)
+        if t.1 != 0 {
+            isCff2 = true
+        } else {
+            t = o.table(f, o.TAG_CFF)
+            if t.1 == 0 { return r.ERR_TABLE_MISSING }
+        }
+        offset = t.0
+    } else {
+        // (A CFF font of its own: the data from its start.)
+        resetFace(face)
+        f.*.driver = library.CFF
+    }
+    f.*.outlines = if isCff2 { o.OUTLINES_CFF2 } else { o.OUTLINES_CFF }
+    err = cff.load(face, offset, isCff2, pure, faceIndex)
+    if err != r.OK { return err }
+    if faceIndex < 0 {
+        f.*.numFaces = @intCast(i64, cff.numFaces(face))
+        return r.OK
+    }
+    if !sfntFormat {
+        err = sfnt.newTables(f)
+        if err != r.OK { return err }
+    }
+    f.*.faceIndex = faceIndex & 0xFFFF
+    f.*.numGlyphs = cff.numGlyphs(face)
+    const instance = faceIndex >> 16
+    if (f.*.faceFlags & r.FACE_MULTIPLE_MASTERS) != 0 && instance > 0 {
+        err = variations.setNamedInstance(face, instance)
+        if err != r.OK { return err }
+    }
+    return cff.finishFace(face, pure, sfntFormat, faceIndex)
+}
+
+// What the drivers made of the face, freed (for the next one to try, or
+// before the face is).
+fn doneDriver(face: usize) -> void {
+    const f = o.faceRecord(face)
+    const memory = f.*.memory
+    var i: i32 = 0
+    while i < f.*.numCharmaps {
+        cmap.doneCharmap(m.getWord(f.*.charmaps + @intCast(usize, i) * 8), memory)
+        i += 1
+    }
+    m.release(memory, f.*.charmaps)
+    f.*.charmaps = 0
+    f.*.numCharmaps = 0
+}
+
+// Frees what a face holds and the face (FreeType's destroy_face): its
+// slots, its sizes, what its drivers made, its bytes.
+pub fn doneFace(face: usize) -> void {
+    const f = o.faceRecord(face)
+    const memory = f.*.memory
+    while f.*.glyph != 0 { doneSlot(f.*.glyph) }
+    while f.*.sizes != 0 { _ = doneSize(f.*.sizes) }
+    f.*.activeSize = 0
+    doneDriver(face)
+    cff.done(face)
+    variations.done(face)
+    color.done(face)
+    sbit.done(face)
+    sfnt.doneFace(f)
+    m.release(memory, f.*.familyName)
+    m.release(memory, f.*.styleName)
+    m.release(memory, f.*.availableSizes)
+    releaseData(f)
+    m.release(memory, face)
+}
+
+// Reads the face newFace made (FreeType's FT_Open_Face past its stream):
+// the font of a collection `faceIndex` names (its named instance in the
+// high 16 bits; a negative index only counts the faces), by the first of
+// the `drivers` drivers (TrueType, then CFF) that reads it, with the
+// options (OPEN_...). On an error the face is freed. A face of an index
+// of 0 or more has a glyph slot and a size, and the Unicode charmap
+// selected when it has one.
+pub fn openFace(face: usize, faceIndex_: i64, options: i64, drivers: i64) -> i32 {
+    var faceIndex = faceIndex_
+    if faceIndex > 0 {
+        faceIndex &= 0x7FFFFFFF
+    } else {
+        faceIndex = 0 - ((0 - faceIndex) & 0x7FFFFFFF)
+    }
+    const f = o.faceRecord(face)
+    var err = r.ERR_MISSING_MODULE
+    if drivers > library.TRUETYPE {
+        err = initTrueType(face, faceIndex, options)
+        // (An SFNT without the tables of TrueType FreeType reads as a
+        // Type 1 or CID font in an SFNT when it is one, a `typ1` with
+        // their tables, which the library does not read.)
+        if err == r.ERR_TABLE_MISSING { err = r.ERR_UNKNOWN_FILE_FORMAT }
+    }
+    if err == r.ERR_UNKNOWN_FILE_FORMAT && drivers > library.CFF {
+        // (Each driver starts from a face of its own.)
+        resetFace(face)
+        err = initCff(face, faceIndex, options)
+    }
+    if drivers <= library.TRUETYPE { err = r.ERR_MISSING_MODULE }
+    if err == r.ERR_UNKNOWN_FILE_FORMAT || err == r.ERR_INVALID_STREAM_OPERATION || err == r.ERR_CANNOT_OPEN_STREAM {
+        err = macFontsError(f, f.*.fromPath)
+    }
+    if err != r.OK {
+        doneFace(face)
+        return err
+    }
+    // (The Unicode charmap, as FreeType's find_unicode_charmap picks it.)
+    _ = selectUnicode(face)
+    if faceIndex >= 0 {
+        err = newSlot(face)
+        if err == r.OK {
+            const size = newSize(face)
+            if size == 0 {
+                err = r.ERR_OUT_OF_MEMORY
+            } else {
+                f.*.activeSize = size
+            }
+        }
+        if err != r.OK {
+            doneFace(face)
+            return err
+        }
+    }
+    if (f.*.faceFlags & r.FACE_SCALABLE) != 0 {
+        if f.*.height < 0 { f.*.height = 0 - f.*.height }
+        if (f.*.faceFlags & r.FACE_VERTICAL) == 0 { f.*.maxAdvanceHeight = f.*.height }
+    }
+    return r.OK
+}
+
+// The face as before a driver tried it (for the next one).
+fn resetFace(face: usize) -> void {
+    const f = o.faceRecord(face)
+    const memory = f.*.memory
+    doneDriver(face)
+    sfnt.doneFace(f)
+    m.release(memory, f.*.familyName)
+    m.release(memory, f.*.styleName)
+    m.release(memory, f.*.availableSizes)
+    const data = f.*.data
+    const size = f.*.size
+    const kind = f.*.dataKind
+    const fromPath = f.*.fromPath
+    const library_ = f.*.library
+    const user = f.*.user
+    m.zero(face, @sizeOf(Face))
+    startFace(f, library_, memory)
+    f.*.data = data
+    f.*.size = size
+    f.*.dataKind = kind
+    f.*.fromPath = fromPath
+    f.*.user = user
+}
+
+// Selects the face's Unicode charmap: a full one (platform 3 encoding
+// 10, or platform 0 encoding 4) first, the last of them, then the last
+// Unicode one.
+pub fn selectUnicode(face: usize) -> i32 {
+    const f = o.faceRecord(face)
+    if f.*.charmaps == 0 { return r.ERR_INVALID_CHARMAP_HANDLE }
+    var i = f.*.numCharmaps
+    while i > 0 {
+        i -= 1
+        const c = o.charMap(m.getWord(f.*.charmaps + @intCast(usize, i) * 8))
+        if c.*.encoding == r.ENCODING_UNICODE {
+            if (c.*.platformId == 3 && c.*.encodingId == 10) || (c.*.platformId == 0 && c.*.encodingId == 4) {
+                f.*.charmap = m.getWord(f.*.charmaps + @intCast(usize, i) * 8)
+                return r.OK
+            }
+        }
+    }
+    i = f.*.numCharmaps
+    while i > 0 {
+        i -= 1
+        const c = o.charMap(m.getWord(f.*.charmaps + @intCast(usize, i) * 8))
+        if c.*.encoding == r.ENCODING_UNICODE {
+            f.*.charmap = m.getWord(f.*.charmaps + @intCast(usize, i) * 8)
+            return r.OK
+        }
+    }
+    return r.ERR_INVALID_CHARMAP_HANDLE
+}
+
+// ---------------------------------------------------------------------------
+// The glyph slot.
+
+// A color glyph of `COLR` version 0 rendered (FreeType's
+// FT_Render_Glyph_Internal with FT_LOAD_COLOR): each layer loaded and
+// rendered in a slot of its own, then blended in its color into the
+// slot's BGRA bitmap. -1 when the glyph has no layers.
+fn renderColorLayers(slot: usize) -> i32 {
+    const s = o.slotRecord(slot)
+    const face = s.*.face
+    const f = o.faceRecord(face)
+    var iterator: [2]u64 = undefined
+    iterator[1] = 0
+    const it = @intFromPtr(&iterator)
+    var glyph: u32 = 0
+    var colorIndex: u32 = 0
+    const base = @intCast(u64, s.*.glyphIndex)
+    if !color.colrLayer(face, base, @intFromPtr(&glyph), @intFromPtr(&colorIndex), it) { return -1 }
+    var err = newSlot(face)
+    if err != r.OK { return err }
+    while true {
+        var flags = o.slotRecord(slot).*.loadFlags
+        flags &= ~r.LOAD_COLOR
+        flags |= r.LOAD_RENDER
+        err = load.loadGlyph(face, @intCast(i64, glyph), flags)
+        if err != r.OK { break }
+        err = color.blendLayer(face, @intCast(u64, colorIndex), slot, f.*.glyph)
+        if err != r.OK { break }
+        if !color.colrLayer(face, base, @intFromPtr(&glyph), @intFromPtr(&colorIndex), it) { break }
+    }
+    if err == r.OK { s.*.format = r.FORMAT_BITMAP }
+    doneSlot(f.*.glyph)
+    return err
+}
+
+// A new slot of the face, first in its list: the face's glyph slot.
+pub fn newSlot(face: usize) -> i32 {
+    const f = o.faceRecord(face)
+    const slot = m.alloc(f.*.memory, @sizeOf(o.Slot))
+    if slot == 0 { return r.ERR_OUT_OF_MEMORY }
+    const s = o.slotRecord(slot)
+    s.*.face = face
+    s.*.library = f.*.library
+    s.*.next = f.*.glyph
+    f.*.glyph = slot
+    return r.OK
+}
+
+pub fn doneSlot(slot: usize) -> void {
+    const s = o.slotRecord(slot)
+    const face = s.*.face
+    const f = o.faceRecord(face)
+    const memory = f.*.memory
+    // (Off the face's list of slots.)
+    if f.*.glyph == slot {
+        f.*.glyph = s.*.next
+    } else {
+        var cur = f.*.glyph
+        while cur != 0 {
+            if o.slotRecord(cur).*.next == slot {
+                o.slotRecord(cur).*.next = s.*.next
+                break
+            }
+            cur = o.slotRecord(cur).*.next
+        }
+    }
+    truetype.doneLoader(slot, memory)
+    if s.*.ownBitmap { m.release(memory, s.*.bitmap.buffer) }
+    m.release(memory, s.*.points)
+    m.release(memory, s.*.tags)
+    m.release(memory, s.*.contours)
+    m.release(memory, s.*.subglyphStore)
+    m.release(memory, slot)
+}
+
+// ---------------------------------------------------------------------------
+// Sizes.
+
+// A new size of the face, last in its list (0 when out of memory).
+pub fn newSize(face: usize) -> usize {
+    const f = o.faceRecord(face)
+    const size = m.alloc(f.*.memory, @sizeOf(o.Size))
+    if size == 0 { return 0 }
+    const s = o.sizeRecord(size)
+    s.*.face = face
+    s.*.strikeIndex = -1
+    if f.*.sizes == 0 {
+        f.*.sizes = size
+    } else {
+        var last = f.*.sizes
+        while o.sizeRecord(last).*.next != 0 { last = o.sizeRecord(last).*.next }
+        o.sizeRecord(last).*.next = size
+    }
+    return size
+}
+
+// Frees a size (the face's first one becomes the active size when it
+// was).
+pub fn doneSize(size: usize) -> i32 {
+    if size == 0 { return r.ERR_INVALID_SIZE_HANDLE }
+    const face = o.sizeRecord(size).*.face
+    if face == 0 { return r.ERR_INVALID_FACE_HANDLE }
+    const f = o.faceRecord(face)
+    if f.*.sizes == size {
+        f.*.sizes = o.sizeRecord(size).*.next
+    } else {
+        var cur = f.*.sizes
+        while cur != 0 && o.sizeRecord(cur).*.next != size { cur = o.sizeRecord(cur).*.next }
+        if cur == 0 { return r.ERR_INVALID_SIZE_HANDLE }
+        o.sizeRecord(cur).*.next = o.sizeRecord(size).*.next
+    }
+    if f.*.activeSize == size { f.*.activeSize = f.*.sizes }
+    m.release(f.*.memory, size)
+    return r.OK
+}
+
+// Makes `size` the one glyphs are loaded at.
+pub fn activateSize(face: usize, size: usize) -> void { o.faceRecord(face).*.activeSize = size }
+
+// FreeType's ft_recompute_scaled_metrics: the size's global metrics, on
+// the pixel grid.
+fn recomputeScaledMetrics(face: usize, size: usize) -> void {
+    const f = o.faceRecord(face)
+    const s = o.sizeRecord(size)
+    s.*.ascender = calc.pixCeil(calc.mulFix(@intCast(i64, f.*.ascender), s.*.yScale))
+    s.*.descender = calc.pixFloor(calc.mulFix(@intCast(i64, f.*.descender), s.*.yScale))
+    s.*.height = calc.pixRound(calc.mulFix(@intCast(i64, f.*.height), s.*.yScale))
+    s.*.maxAdvance = calc.pixRound(calc.mulFix(@intCast(i64, f.*.maxAdvanceWidth), s.*.xScale))
+}
+
+// FreeType's FT_Request_Metrics.
+fn requestMetrics(face: usize, size: usize, req: *r.SizeRequest) -> i32 {
+    const f = o.faceRecord(face)
+    const s = o.sizeRecord(size)
+    if (f.*.faceFlags & r.FACE_SCALABLE) == 0 {
+        s.*.xPpem = 0
+        s.*.yPpem = 0
+        s.*.ascender = 0
+        s.*.descender = 0
+        s.*.height = 0
+        s.*.maxAdvance = 0
+        s.*.xScale = 0x10000
+        s.*.yScale = 0x10000
+        return r.OK
+    }
+    const kind = req.*.kind
+    const reqWidth = req.*.width
+    const reqHeight = req.*.height
+    const horiRes = @intCast(i64, req.*.horiResolution)
+    const vertRes = @intCast(i64, req.*.vertResolution)
+    var w: i64 = 0
+    var h: i64 = 0
+    var scaledW: i64 = 0
+    var scaledH: i64 = 0
+    var ppemOnly = false
+    if kind == r.SIZE_REQUEST_NOMINAL {
+        w = @intCast(i64, f.*.unitsPerEm)
+        h = w
+    } else if kind == r.SIZE_REQUEST_REAL_DIM {
+        w = @intCast(i64, f.*.ascender) - @intCast(i64, f.*.descender)
+        h = w
+    } else if kind == r.SIZE_REQUEST_BBOX {
+        w = f.*.bbox.xMax - f.*.bbox.xMin
+        h = f.*.bbox.yMax - f.*.bbox.yMin
+    } else if kind == r.SIZE_REQUEST_CELL {
+        w = @intCast(i64, f.*.maxAdvanceWidth)
+        h = @intCast(i64, f.*.ascender) - @intCast(i64, f.*.descender)
+    } else if kind == r.SIZE_REQUEST_SCALES {
+        s.*.xScale = reqWidth
+        s.*.yScale = reqHeight
+        if s.*.xScale == 0 {
+            s.*.xScale = s.*.yScale
+        } else if s.*.yScale == 0 {
+            s.*.yScale = s.*.xScale
+        }
+        ppemOnly = true
+    }
+    if !ppemOnly {
+        if w < 0 { w = 0 - w }
+        if h < 0 { h = 0 - h }
+        scaledW = if horiRes != 0 { (reqWidth * horiRes + 36) / 72 } else { reqWidth }
+        scaledH = if vertRes != 0 { (reqHeight * vertRes + 36) / 72 } else { reqHeight }
+        if reqHeight != 0 || reqWidth == 0 {
+            if h == 0 { return r.ERR_DIVIDE_BY_ZERO }
+            s.*.yScale = calc.divFix(scaledH, h)
+        }
+        if reqWidth != 0 {
+            if w == 0 { return r.ERR_DIVIDE_BY_ZERO }
+            s.*.xScale = calc.divFix(scaledW, w)
+        } else {
+            s.*.xScale = s.*.yScale
+            scaledW = calc.mulDiv(scaledH, w, h)
+        }
+        if reqHeight == 0 {
+            s.*.yScale = s.*.xScale
+            scaledH = calc.mulDiv(scaledW, h, w)
+        }
+        if kind == r.SIZE_REQUEST_CELL {
+            if s.*.yScale > s.*.xScale {
+                s.*.yScale = s.*.xScale
+            } else {
+                s.*.xScale = s.*.yScale
+            }
+        }
+    }
+    if kind != r.SIZE_REQUEST_NOMINAL {
+        scaledW = calc.mulFix(@intCast(i64, f.*.unitsPerEm), s.*.xScale)
+        scaledH = calc.mulFix(@intCast(i64, f.*.unitsPerEm), s.*.yScale)
+    }
+    scaledW = (scaledW + 32) >> 6
+    scaledH = (scaledH + 32) >> 6
+    if scaledW > 0xFFFF || scaledH > 0xFFFF { return r.ERR_INVALID_PIXEL_SIZE }
+    s.*.xPpem = @intCast(u16, scaledW & 0xFFFF)
+    s.*.yPpem = @intCast(u16, scaledH & 0xFFFF)
+    recomputeScaledMetrics(face, size)
+    return r.OK
+}
+
+// FreeType's FT_Select_Metrics.
+pub fn selectMetrics(face: usize, size: usize, strike: i64) -> void {
+    const f = o.faceRecord(face)
+    const s = o.sizeRecord(size)
+    const bsize = f.*.availableSizes + @intCast(usize, strike) * @sizeOf(r.BitmapSize)
+    const xPpem = m.getI64(bsize + 16)
+    const yPpem = m.getI64(bsize + 24)
+    s.*.xPpem = @intCast(u16, ((xPpem + 32) >> 6) & 0xFFFF)
+    s.*.yPpem = @intCast(u16, ((yPpem + 32) >> 6) & 0xFFFF)
+    if (f.*.faceFlags & r.FACE_SCALABLE) != 0 {
+        s.*.xScale = calc.divFix(xPpem, @intCast(i64, f.*.unitsPerEm))
+        s.*.yScale = calc.divFix(yPpem, @intCast(i64, f.*.unitsPerEm))
+        recomputeScaledMetrics(face, size)
+    } else {
+        s.*.xScale = 0x10000
+        s.*.yScale = 0x10000
+        s.*.ascender = yPpem
+        s.*.descender = 0
+        s.*.height = @intCast(i64, m.getI16(bsize)) << 6
+        s.*.maxAdvance = xPpem
+    }
+}
+
+// TrueType's metrics of a size for loading glyphs (FreeType's
+// tt_size_reset): the scales of the rounded ppem when `head` asks for
+// integer ppems.
+fn resetTrueType(face: usize, size: usize) -> i32 {
+    const f = o.faceRecord(face)
+    const s = o.sizeRecord(size)
+    s.*.ttValid = false
+    s.*.tt_x_ppem = @intCast(i64, s.*.xPpem)
+    s.*.tt_y_ppem = @intCast(i64, s.*.yPpem)
+    s.*.tt_x_scale = s.*.xScale
+    s.*.tt_y_scale = s.*.yScale
+    s.*.tt_ascender = s.*.ascender
+    s.*.tt_descender = s.*.descender
+    s.*.tt_height = s.*.height
+    s.*.tt_max_advance = s.*.maxAdvance
+    if s.*.xPpem < 1 || s.*.yPpem < 1 { return r.ERR_INVALID_PPEM }
+    if (sfnt.headFlags(f) & 8) != 0 {
+        s.*.tt_ascender = calc.pixRound(calc.mulFix(@intCast(i64, f.*.ascender), s.*.yScale))
+        s.*.tt_descender = calc.pixRound(calc.mulFix(@intCast(i64, f.*.descender), s.*.yScale))
+        s.*.tt_height = calc.pixRound(calc.mulFix(@intCast(i64, f.*.height), s.*.yScale))
+    }
+    s.*.ttValid = true
+    if (sfnt.headFlags(f) & 8) != 0 {
+        s.*.tt_x_scale = calc.divFix(s.*.tt_x_ppem << 6, @intCast(i64, f.*.unitsPerEm))
+        s.*.tt_y_scale = calc.divFix(s.*.tt_y_ppem << 6, @intCast(i64, f.*.unitsPerEm))
+        s.*.tt_max_advance = calc.pixRound(calc.mulFix(@intCast(i64, f.*.maxAdvanceWidth), s.*.tt_x_scale))
+    }
+    return r.OK
+}
+
+fn selectStrike(face: usize, size: usize, strike: i64) -> i32 {
+    const f = o.faceRecord(face)
+    const t = o.sizeRecord(size)
+    t.*.strikeIndex = strike
+    if (f.*.faceFlags & r.FACE_SCALABLE) != 0 {
+        selectMetrics(face, size, strike)
+        if f.*.driver == library.TRUETYPE { _ = resetTrueType(face, size) }
+        return r.OK
+    }
+    const err = sbit.strikeMetrics(face, size, strike)
+    if err != r.OK { t.*.strikeIndex = -1 }
+    return err
+}
+
+// Sets the active size of the face as the request asks (FreeType's
+// FT_Request_Size): a strike of embedded bitmaps when one matches, the
+// scales of the request otherwise.
+pub fn requestSize(face: usize, req: *r.SizeRequest) -> i32 {
+    if face == 0 { return r.ERR_INVALID_FACE_HANDLE }
+    const f = o.faceRecord(face)
+    const size = f.*.activeSize
+    if size == 0 { return r.ERR_INVALID_SIZE_HANDLE }
+    if req.*.width < 0 || req.*.height < 0 || req.*.kind < 0 || req.*.kind >= 5 { return r.ERR_INVALID_ARGUMENT }
+    const t = o.sizeRecord(size)
+    // (The TrueType driver keeps the error of matching a strike when the
+    // face is not scalable; the CFF driver forgets it.)
+    var err = r.OK
+    if (f.*.faceFlags & r.FACE_FIXED_SIZES) != 0 {
+        const strike = sbit.matchStrike(face, req)
+        if strike.0 == r.OK { return selectStrike(face, size, strike.1) }
+        t.*.strikeIndex = -1
+        if f.*.driver == library.TRUETYPE { err = strike.0 }
+    }
+    const metricsErr = requestMetrics(face, size, req)
+    if metricsErr != r.OK { return metricsErr }
+    if f.*.driver == library.TRUETYPE && (f.*.faceFlags & r.FACE_SCALABLE) != 0 { err = resetTrueType(face, size) }
+    return err
+}
+
+// Selects strike `strikeIndex` of the face's embedded bitmaps for the
+// active size (FreeType's FT_Select_Size).
+pub fn selectSize(face: usize, strikeIndex: i32) -> i32 {
+    if face == 0 || (o.faceRecord(face).*.faceFlags & r.FACE_FIXED_SIZES) == 0 { return r.ERR_INVALID_FACE_HANDLE }
+    const f = o.faceRecord(face)
+    if strikeIndex < 0 || strikeIndex >= f.*.numFixedSizes { return r.ERR_INVALID_ARGUMENT }
+    return selectStrike(face, f.*.activeSize, @intCast(i64, strikeIndex))
+}
+
+// A nominal size of `charWidth` by `charHeight` (26.6 points) at the
+// resolutions given (FreeType's FT_Set_Char_Size: a missing value is the
+// other one's, 72 dpi without either).
+pub fn setCharSize(face: usize, char_width_: i64, char_height_: i64, horz_resolution_: u32, vert_resolution_: u32) -> i32 {
+    var charWidth = char_width_
+    var charHeight = char_height_
+    var horz = horz_resolution_
+    var vert = vert_resolution_
+    if charWidth == 0 {
+        charWidth = charHeight
+    } else if charHeight == 0 {
+        charHeight = charWidth
+    }
+    if horz == 0 {
+        horz = vert
+    } else if vert == 0 {
+        vert = horz
+    }
+    if charWidth < 64 { charWidth = 64 }
+    if charHeight < 64 { charHeight = 64 }
+    if horz == 0 {
+        horz = 72
+        vert = 72
+    }
+    var req: r.SizeRequest = undefined
+    req.kind = r.SIZE_REQUEST_NOMINAL
+    req.width = charWidth
+    req.height = charHeight
+    req.horiResolution = horz
+    req.vertResolution = vert
+    return requestSize(face, &req)
+}
+
+// A nominal size of `w` by `h` pixels per em (FreeType's
+// FT_Set_Pixel_Sizes).
+pub fn setPixelSizes(face: usize, pixel_width_: u32, pixel_height_: u32) -> i32 {
+    var w = pixel_width_
+    var h = pixel_height_
+    if w == 0 {
+        w = h
+    } else if h == 0 {
+        h = w
+    }
+    if w < 1 { w = 1 }
+    if h < 1 { h = 1 }
+    if w >= 0xFFFF { w = 0xFFFF }
+    if h >= 0xFFFF { h = 0xFFFF }
+    var req: r.SizeRequest = undefined
+    req.kind = r.SIZE_REQUEST_NOMINAL
+    req.width = @intCast(i64, w) << 6
+    req.height = @intCast(i64, h) << 6
+    req.horiResolution = 0
+    req.vertResolution = 0
+    return requestSize(face, &req)
+}
+
+// ---------------------------------------------------------------------------
+// The transform and the properties of a face.
+
+// The transform applied to glyphs as they are loaded: a matrix (a Matrix
+// record, 0 for none) and a delta (a Vector, 26.6; 0 for none).
+pub fn setTransform(face: usize, matrix: usize, delta: usize) -> void {
+    if face == 0 { return }
+    const f = o.faceRecord(face)
+    f.*.transformFlags = 0
+    if matrix == 0 {
+        f.*.txx = 0x10000
+        f.*.txy = 0
+        f.*.tyx = 0
+        f.*.tyy = 0x10000
+    } else {
+        f.*.txx = m.getI64(matrix)
+        f.*.txy = m.getI64(matrix + 8)
+        f.*.tyx = m.getI64(matrix + 16)
+        f.*.tyy = m.getI64(matrix + 24)
+    }
+    if (f.*.txy | f.*.tyx) != 0 || f.*.txx != 0x10000 || f.*.tyy != 0x10000 { f.*.transformFlags |= 1 }
+    if delta == 0 {
+        f.*.tdx = 0
+        f.*.tdy = 0
+    } else {
+        f.*.tdx = m.getI64(delta)
+        f.*.tdy = m.getI64(delta + 8)
+    }
+    if (f.*.tdx | f.*.tdy) != 0 { f.*.transformFlags |= 2 }
+}
+
+pub fn getTransform(face: usize, matrix: usize, delta: usize) -> void {
+    if face == 0 { return }
+    const f = o.faceRecord(face)
+    if matrix != 0 {
+        m.putI64(matrix, f.*.txx)
+        m.putI64(matrix + 8, f.*.txy)
+        m.putI64(matrix + 16, f.*.tyx)
+        m.putI64(matrix + 24, f.*.tyy)
+    }
+    if delta != 0 {
+        m.putI64(delta, f.*.tdx)
+        m.putI64(delta + 8, f.*.tdy)
+    }
+}
+
+// The properties of a face (FreeType's FT_Face_Properties): records of a
+// tag and the address of its value (16 bytes each): stem darkening
+// ("dark"), the LCD filter's weights ("lcdf"), the random seed ("seed").
+pub fn setProperties(face: usize, num_properties: u32, properties: usize) -> i32 {
+    if num_properties > 0 && properties == 0 { return r.ERR_INVALID_ARGUMENT }
+    const f = o.faceRecord(face)
+    var i: u32 = 0
+    while i < num_properties {
+        const p = properties + @intCast(usize, i) * 16
+        const tag = m.get64(p)
+        const data = m.getWord(p + 8)
+        if tag == 0x6461726B {
+            if data != 0 {
+                f.*.noStemDarkening = if m.get8(data) == 1 { 0 } else { 1 }
+            } else {
+                f.*.noStemDarkening = -1
+            }
+        } else if tag == 0x6C636466 {
+            if data != 0 {
+                f.*.lcdWeights = library.packWeights(data)
+                f.*.hasLcdWeights = true
+            }
+        } else if tag == 0x73656564 {
+            if data != 0 {
+                f.*.randomSeed = @intCast(i64, m.getI32(data))
+                if f.*.randomSeed < 0 { f.*.randomSeed = 0 }
+            } else {
+                f.*.randomSeed = -1
+            }
+        } else {
+            return r.ERR_INVALID_ARGUMENT
+        }
+        i += 1
+    }
+    return r.OK
+}

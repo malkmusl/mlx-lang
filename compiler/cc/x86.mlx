@@ -1,0 +1,670 @@
+// The x86_64 instructions mlx-cc's code generator uses, written into the
+// Mlx compiler's own encoder (compiler/selfhost/backend/x86_64): its code
+// buffer, labels and fixups, imported functions called through the GOT,
+// and the writable data area that holds the C program's globals.
+// Registers are numbered as the hardware does (rax 0 ... r15 15).
+const base = @import("./base.mlx")
+const encoder = @import("../../compiler/selfhost/backend/x86_64/encoder.mlx")
+const target = @import("../../compiler/selfhost/backend/x86_64/target.mlx")
+const heap = @import("std.heap")
+
+pub const RAX: u8 = 0
+pub const RCX: u8 = 1
+pub const RDX: u8 = 2
+pub const RBX: u8 = 3
+pub const RSP: u8 = 4
+pub const RBP: u8 = 5
+pub const RSI: u8 = 6
+pub const RDI: u8 = 7
+pub const R8: u8 = 8
+pub const R9: u8 = 9
+pub const R10: u8 = 10
+pub const R11: u8 = 11
+
+// Condition codes (the low nibble of jcc and setcc).
+pub const CC_B: u8 = 2
+pub const CC_AE: u8 = 3
+pub const CC_E: u8 = 4
+pub const CC_NE: u8 = 5
+pub const CC_BE: u8 = 6
+pub const CC_A: u8 = 7
+pub const CC_S: u8 = 8
+pub const CC_NS: u8 = 9
+pub const CC_P: u8 = 10
+pub const CC_NP: u8 = 11
+pub const CC_L: u8 = 12
+pub const CC_GE: u8 = 13
+pub const CC_LE: u8 = 14
+pub const CC_G: u8 = 15
+
+var encoderAddress: usize = 0
+
+pub fn init() -> void {
+    const allocator = heap.allocator()
+    encoderAddress = base.alloc(@sizeOf(encoder.Encoder))
+    enc().* = encoder.init(allocator)
+}
+
+pub fn enc() -> *encoder.Encoder {
+    unsafe { return @ptrFromInt(*encoder.Encoder, encoderAddress) }
+}
+
+fn reg(r: u8) -> target.Register { return @enumFromInt(target.Register, r) }
+
+pub fn position() -> usize { return encoder.pos(enc()) }
+
+pub fn byte(b: u8) -> void { encoder.emit1(enc(), b) }
+
+pub fn imm32(v: i64) -> void {
+    const low = @bitCast(u64, v) & 4294967295
+    encoder.emitImm32(enc(), @bitCast(i32, @intCast(u32, low)))
+}
+
+fn rex(w: bool, r: u8, b: u8) -> u8 {
+    var value: u8 = 64
+    if w { value = value | 8 }
+    if r >= 8 { value = value | 4 }
+    if b >= 8 { value = value | 1 }
+    return value
+}
+
+fn modrm(mode: u8, r: u8, m: u8) -> u8 { return ((mode & 3) << 6) | ((r & 7) << 3) | (m & 7) }
+
+// [base + disp32]; rsp and r12 as the base need a SIB byte.
+fn memoryOperand(r: u8, baseRegister: u8, disp: i64) -> void {
+    byte(modrm(2, r, baseRegister))
+    if baseRegister & 7 == 4 { byte(36) }
+    imm32(disp)
+}
+
+// ---------------------------------------------------------------------------
+// Labels and symbols: a name is its text's address and length.
+
+// The text of label `n` (.L<n>); its address and length.
+pub fn label(n: u32) -> (usize, usize) {
+    const digits = base.decimal(@intCast(u64, n))
+    const at = base.alloc(digits.length + 3)
+    base.putText(at, ".L")
+    base.putText(at + 2, digits)
+    return -> (at, digits.length + 2)
+}
+
+pub fn defineLabel(n: u32) -> void {
+    const name = label(n)
+    encoder.defineSymbol(enc(), base.pointer(name.0), name.1)
+}
+
+pub fn defineSymbol(address: usize, length: usize) -> void {
+    encoder.defineSymbol(enc(), base.pointer(address), length)
+}
+
+pub fn jump(n: u32) -> void {
+    const name = label(n)
+    encoder.emitJmpRel(enc(), base.pointer(name.0), name.1)
+}
+
+// jmp *r.
+pub fn jumpRegister(r: u8) -> void {
+    if r >= 8 { byte(65) }
+    byte(255)
+    byte(modrm(3, 4, r))
+}
+
+// jcc to label `n`.
+pub fn jumpIf(condition: u8, n: u32) -> void {
+    const name = label(n)
+    byte(15)
+    byte(128 + condition)
+    encoder.addFixup(enc(), encoder.FixupKind.jmp_rel32, base.pointer(name.0), name.1)
+}
+
+// jmp to a symbol (a tail call).
+pub fn jumpSymbol(address: usize, length: usize) -> void {
+    encoder.emitJmpRel(enc(), base.pointer(address), length)
+}
+
+pub fn callSymbol(address: usize, length: usize) -> void {
+    encoder.emitCallRel(enc(), base.pointer(address), length)
+}
+
+// call through the GOT slot of an imported function; al = the number of
+// vector registers used (variadic callees read it).
+pub fn callImport(address: usize, length: usize, vectors: u32) -> void {
+    encoder.emitImportCall(enc(), base.pointer(address), length, @intCast(usize, vectors))
+}
+
+// dst = the address of an imported function or variable (its GOT slot).
+pub fn importAddress(dst: u8, address: usize, length: usize) -> void {
+    encoder.emitImportAddress(enc(), reg(dst), base.pointer(address), length)
+}
+
+// dst = the address of a symbol in the code.
+pub fn symbolAddress(dst: u8, address: usize, length: usize) -> void {
+    encoder.emitLeaRipRel(enc(), reg(dst), base.pointer(address), length)
+}
+
+// The code's references to thread-local variables: cells of the place
+// of a 32-bit offset from the thread pointer, the variable, the next
+// (the object's R_X86_64_TPOFF32 relocations).
+pub var tlsReferences: usize = 0
+
+// dst = the address of the thread-local `variable` (local exec):
+// mov dst, fs:[0]; lea dst, [dst + its offset from the thread pointer].
+pub fn threadLocalAddress(dst: u8, variable: usize) -> void {
+    const high: u8 = if dst >= 8 { 1 } else { 0 }
+    const low = dst & 7
+    byte(100)
+    byte(72 | (high << 2))
+    byte(139)
+    byte((low << 3) | 4)
+    byte(37)
+    imm32(0)
+    byte(72 | (high << 2) | high)
+    byte(141)
+    byte(128 | (low << 3) | low)
+    if low == 4 { byte(36) }
+    const cell = base.alloc(24)
+    base.putWord(cell, position())
+    base.putWord(cell + 8, variable)
+    base.putWord(cell + 16, tlsReferences)
+    tlsReferences = cell
+    imm32(0)
+    if dst == RAX { enc().*.raxStackSlot = 0 }
+}
+
+// dst = the address of a place in the data area.
+pub fn dataAddress(dst: u8, offset: usize) -> void {
+    encoder.emitLeaData(enc(), reg(dst), offset)
+}
+
+// ---------------------------------------------------------------------------
+// Moves, loads and stores
+
+pub fn push(r: u8) -> void {
+    if r >= 8 { byte(65) }
+    byte(80 + (r & 7))
+}
+
+pub fn pop(r: u8) -> void {
+    if r >= 8 { byte(65) }
+    byte(88 + (r & 7))
+}
+
+pub fn moveImmediate(dst: u8, v: i64) -> void { encoder.emitMovRegImm64(enc(), reg(dst), v) }
+
+pub fn move(dst: u8, src: u8) -> void {
+    if dst == src { return }
+    byte(rex(true, src, dst))
+    byte(137)
+    byte(modrm(3, src, dst))
+}
+
+// dst = rbp + disp
+pub fn leaFrame(dst: u8, disp: i64) -> void {
+    byte(rex(true, dst, RBP))
+    byte(141)
+    memoryOperand(dst, RBP, disp)
+}
+
+// dst = src + disp
+pub fn leaOffset(dst: u8, src: u8, disp: i64) -> void {
+    byte(rex(true, dst, src))
+    byte(141)
+    memoryOperand(dst, src, disp)
+}
+
+// dst = [src + disp], `size` bytes, sign- or zero-extended to 64 bits.
+pub fn load(dst: u8, src: u8, disp: i64, size: i64, signed: bool) -> void {
+    if size == 1 || size == 2 {
+        byte(rex(true, dst, src))
+        byte(15)
+        var opcode: u8 = if size == 1 { 182 } else { 183 }
+        if signed { opcode += 8 }
+        byte(opcode)
+        memoryOperand(dst, src, disp)
+        return
+    }
+    if size == 4 && signed {
+        byte(rex(true, dst, src))
+        byte(99)
+        memoryOperand(dst, src, disp)
+        return
+    }
+    byte(rex(size == 8, dst, src))
+    byte(139)
+    memoryOperand(dst, src, disp)
+}
+
+// [dst + disp] = the low `size` bytes of src.
+pub fn store(dst: u8, disp: i64, src: u8, size: i64) -> void {
+    if size == 2 { byte(102) }
+    byte(rex(size == 8, src, dst))
+    byte(if size == 1 { 136 } else { 137 })
+    memoryOperand(src, dst, disp)
+}
+
+// ---------------------------------------------------------------------------
+// Atomics: the locked read-modify-write instructions on [base].
+
+fn lockPrefix() -> void { byte(240) }
+
+// lock xadd [base], src: src takes the old value, [base] the sum.
+pub fn lockXadd(baseRegister: u8, src: u8, size: i64) -> void {
+    lockPrefix()
+    if size == 2 { byte(102) }
+    byte(rex(size == 8, src, baseRegister))
+    byte(15)
+    byte(if size == 1 { 192 } else { 193 })
+    memoryOperand(src, baseRegister, 0)
+}
+
+// xchg [base], src (locked by itself): src takes the old value.
+pub fn xchg(baseRegister: u8, src: u8, size: i64) -> void {
+    if size == 2 { byte(102) }
+    byte(rex(size == 8, src, baseRegister))
+    byte(if size == 1 { 134 } else { 135 })
+    memoryOperand(src, baseRegister, 0)
+}
+
+// lock cmpxchg [base], src: when [base] is rax, src is stored (ZF set);
+// else rax takes [base].
+pub fn lockCmpxchg(baseRegister: u8, src: u8, size: i64) -> void {
+    lockPrefix()
+    if size == 2 { byte(102) }
+    byte(rex(size == 8, src, baseRegister))
+    byte(15)
+    byte(if size == 1 { 176 } else { 177 })
+    memoryOperand(src, baseRegister, 0)
+}
+
+// lock cmpxchg16b [base]: when [base] is rdx:rax, rcx:rbx is stored
+// (ZF set); else rdx:rax takes [base].
+pub fn lockCmpxchg16b(baseRegister: u8) -> void {
+    lockPrefix()
+    byte(rex(true, 1, baseRegister))
+    byte(15)
+    byte(199)
+    memoryOperand(1, baseRegister, 0)
+}
+
+pub fn mfence() -> void {
+    byte(15)
+    byte(174)
+    byte(240)
+}
+
+pub fn lfence() -> void {
+    byte(15)
+    byte(174)
+    byte(232)
+}
+
+pub fn sfence() -> void {
+    byte(15)
+    byte(174)
+    byte(248)
+}
+
+pub fn pause() -> void {
+    byte(243)
+    byte(144)
+}
+
+pub fn nop() -> void { byte(144) }
+pub fn int3() -> void { byte(204) }
+
+pub fn ud2() -> void {
+    byte(15)
+    byte(11)
+}
+
+// ---------------------------------------------------------------------------
+// Bit instructions (64-bit)
+
+// dst = the index of the highest (reverse) or lowest set bit of src;
+// undefined when src is 0 (ZF set).
+pub fn bitScan(dst: u8, src: u8, reverse: bool) -> void {
+    byte(rex(true, dst, src))
+    byte(15)
+    byte(if reverse { 189 } else { 188 })
+    byte(modrm(3, dst, src))
+}
+
+pub fn popcount(dst: u8, src: u8) -> void {
+    byte(243)
+    byte(rex(true, dst, src))
+    byte(15)
+    byte(184)
+    byte(modrm(3, dst, src))
+}
+
+// Reverses the bytes of r (the low 32 bits, zero-extended, or all 64).
+pub fn bswap(r: u8, wide: bool) -> void {
+    byte(rex(wide, 0, r))
+    byte(15)
+    byte(200 + (r & 7))
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic on two registers (64-bit)
+
+fn alu(opcode: u8, dst: u8, src: u8) -> void {
+    byte(rex(true, src, dst))
+    byte(opcode)
+    byte(modrm(3, src, dst))
+}
+
+pub fn add(dst: u8, src: u8) -> void { alu(1, dst, src) }
+pub fn sub(dst: u8, src: u8) -> void { alu(41, dst, src) }
+pub fn andRegisters(dst: u8, src: u8) -> void { alu(33, dst, src) }
+pub fn orRegisters(dst: u8, src: u8) -> void { alu(9, dst, src) }
+pub fn xorRegisters(dst: u8, src: u8) -> void { alu(49, dst, src) }
+pub fn compare(dst: u8, src: u8) -> void { alu(57, dst, src) }
+pub fn testRegisters(dst: u8, src: u8) -> void { alu(133, dst, src) }
+
+pub fn multiply(dst: u8, src: u8) -> void {
+    byte(rex(true, dst, src))
+    byte(15)
+    byte(175)
+    byte(modrm(3, dst, src))
+}
+
+// dst op= imm (op: 0 add, 1 or, 4 and, 5 sub, 6 xor, 7 cmp).
+pub fn immediate(op: u8, dst: u8, v: i64) -> void {
+    byte(rex(true, 0, dst))
+    byte(129)
+    byte(modrm(3, op, dst))
+    imm32(v)
+}
+
+pub fn negate(r: u8) -> void {
+    byte(rex(true, 0, r))
+    byte(247)
+    byte(modrm(3, 3, r))
+}
+
+pub fn complement(r: u8) -> void {
+    byte(rex(true, 0, r))
+    byte(247)
+    byte(modrm(3, 2, r))
+}
+
+// rdx:rax / src: signed (cqo; idiv) or unsigned (xor edx, edx; div).
+pub fn divide(src: u8, signed: bool) -> void {
+    if signed {
+        byte(72)
+        byte(153)
+    } else {
+        byte(49)
+        byte(210)
+    }
+    byte(rex(true, 0, src))
+    byte(247)
+    byte(modrm(3, if signed { 7 } else { 6 }, src))
+}
+
+// dst shifted by cl: left, logical right or arithmetic right.
+pub fn shiftByCl(dst: u8, left: bool, arithmetic: bool) -> void {
+    byte(rex(true, 0, dst))
+    byte(211)
+    var extension: u8 = 5
+    if left { extension = 4 }
+    if !left && arithmetic { extension = 7 }
+    byte(modrm(3, extension, dst))
+}
+
+pub fn shiftImmediate(dst: u8, amount: i64, left: bool, arithmetic: bool) -> void {
+    byte(rex(true, 0, dst))
+    byte(193)
+    var extension: u8 = 5
+    if left { extension = 4 }
+    if !left && arithmetic { extension = 7 }
+    byte(modrm(3, extension, dst))
+    byte(@intCast(u8, @bitCast(u64, amount) & 63))
+}
+
+// dst = condition ? 1 : 0
+pub fn setIf(condition: u8, dst: u8) -> void {
+    encoder.emitSetcc(enc(), reg(dst), @enumFromInt(encoder.Condition, condition))
+}
+
+// Canonicalizes a value narrower than 64 bits in `r` (sign- or
+// zero-extends its low `bits`).
+pub fn extend(r: u8, bits: usize, signed: bool) -> void {
+    encoder.emitExtend(enc(), reg(r), bits, signed)
+}
+
+// Canonicalizes a value of `bits` bits in `r`, any width up to 64
+// (_BitInt): the standard widths by extension, the rest by two shifts.
+pub fn extendBits(r: u8, bits: usize, signed: bool) -> void {
+    if bits >= 64 { return }
+    if bits == 8 || bits == 16 || bits == 32 {
+        extend(r, bits, signed)
+        return
+    }
+    shiftImmediate(r, @intCast(i64, 64 - bits), true, false)
+    shiftImmediate(r, @intCast(i64, 64 - bits), false, signed)
+}
+
+pub fn subtractStack(amount: i64) -> void { encoder.emitSubRspImm32(enc(), @intCast(u32, amount)) }
+pub fn addStack(amount: i64) -> void { encoder.emitAddRspImm32(enc(), @intCast(u32, amount)) }
+
+pub fn callRegister(r: u8) -> void { encoder.emitCallReg(enc(), reg(r)) }
+
+// rep stosb: rcx bytes of al at rdi.
+pub fn repStoreBytes() -> void {
+    byte(243)
+    byte(170)
+}
+
+pub fn prologue() -> void {
+    encoder.emitPushRbp(enc())
+    encoder.emitMovRbpRsp(enc())
+}
+
+pub fn epilogue() -> void {
+    encoder.emitLeave(enc())
+    encoder.emitRet(enc())
+}
+
+// mov dword [rbp + disp], imm
+pub fn storeImmediate32(disp: i64, v: i64) -> void {
+    byte(199)
+    memoryOperand(0, RBP, disp)
+    imm32(v)
+}
+
+// ---------------------------------------------------------------------------
+// SSE: xmm registers by number; `double` says the width.
+
+fn sse(prefix: u8, opcode: u8, r: u8, m: u8) -> void {
+    byte(prefix)
+    if r >= 8 || m >= 8 { byte(rex(false, r, m)) }
+    byte(15)
+    byte(opcode)
+    byte(modrm(3, r, m))
+}
+
+fn sseMemory(prefix: u8, opcode: u8, x: u8, baseRegister: u8, disp: i64) -> void {
+    byte(prefix)
+    if x >= 8 || baseRegister >= 8 { byte(rex(false, x, baseRegister)) }
+    byte(15)
+    byte(opcode)
+    memoryOperand(x, baseRegister, disp)
+}
+
+// xmm = [base + disp]
+pub fn loadFloat(x: u8, baseRegister: u8, disp: i64, isDouble: bool) -> void {
+    sseMemory(if isDouble { 242 } else { 243 }, 16, x, baseRegister, disp)
+}
+
+// [base + disp] = xmm
+pub fn storeFloat(baseRegister: u8, disp: i64, x: u8, isDouble: bool) -> void {
+    sseMemory(if isDouble { 242 } else { 243 }, 17, x, baseRegister, disp)
+}
+
+// add 88, sub 92, mul 89, div 94 (ss/sd).
+pub fn floatArithmetic(opcode: u8, dst: u8, src: u8, isDouble: bool) -> void {
+    sse(if isDouble { 242 } else { 243 }, opcode, dst, src)
+}
+
+// ucomiss/ucomisd first, second
+pub fn floatCompare(first: u8, second: u8, isDouble: bool) -> void {
+    if isDouble { byte(102) }
+    if first >= 8 || second >= 8 { byte(rex(false, first, second)) }
+    byte(15)
+    byte(46)
+    byte(modrm(3, first, second))
+}
+
+// xorps dst, src
+pub fn floatXor(dst: u8, src: u8) -> void {
+    if dst >= 8 || src >= 8 { byte(rex(false, dst, src)) }
+    byte(15)
+    byte(87)
+    byte(modrm(3, dst, src))
+}
+
+// movq xmm, gp (64 bits)
+pub fn floatFromBits(x: u8, r: u8) -> void {
+    byte(102)
+    byte(rex(true, x, r))
+    byte(15)
+    byte(110)
+    byte(modrm(3, x, r))
+}
+
+// movq gp, xmm (64 bits)
+pub fn bitsFromFloat(r: u8, x: u8) -> void {
+    byte(102)
+    byte(rex(true, x, r))
+    byte(15)
+    byte(126)
+    byte(modrm(3, x, r))
+}
+
+// cvtsi2ss/sd xmm, r64
+pub fn floatFromInteger(x: u8, r: u8, isDouble: bool) -> void {
+    byte(if isDouble { 242 } else { 243 })
+    byte(rex(true, x, r))
+    byte(15)
+    byte(42)
+    byte(modrm(3, x, r))
+}
+
+// cvttss2si/cvttsd2si r64, xmm
+pub fn integerFromFloat(r: u8, x: u8, isDouble: bool) -> void {
+    byte(if isDouble { 242 } else { 243 })
+    byte(rex(true, r, x))
+    byte(15)
+    byte(44)
+    byte(modrm(3, r, x))
+}
+
+// cvtss2sd (fromDouble false) or cvtsd2ss (fromDouble true) xmm, xmm
+pub fn convertFloat(dst: u8, src: u8, fromDouble: bool) -> void {
+    sse(if fromDouble { 242 } else { 243 }, 90, dst, src)
+}
+
+// movaps dst, src
+pub fn moveFloat(dst: u8, src: u8) -> void {
+    if dst >= 8 || src >= 8 { byte(rex(false, dst, src)) }
+    byte(15)
+    byte(40)
+    byte(modrm(3, dst, src))
+}
+
+// ---------------------------------------------------------------------------
+// x87: long double values on the floating-point stack (st0 the top).
+
+fn x87Memory(opcode: u8, extension: u8, baseRegister: u8, disp: i64) -> void {
+    if baseRegister >= 8 { byte(rex(false, 0, baseRegister)) }
+    byte(opcode)
+    memoryOperand(extension, baseRegister, disp)
+}
+
+// fld tbyte [base + disp]: push the 80-bit value.
+pub fn fldExtended(baseRegister: u8, disp: i64) -> void { x87Memory(219, 5, baseRegister, disp) }
+// fstp tbyte [base + disp]: store st0 as 80 bits and pop.
+pub fn fstpExtended(baseRegister: u8, disp: i64) -> void { x87Memory(219, 7, baseRegister, disp) }
+// fld qword / fstp qword: a double.
+pub fn fldDouble(baseRegister: u8, disp: i64) -> void { x87Memory(221, 0, baseRegister, disp) }
+pub fn fstpDouble(baseRegister: u8, disp: i64) -> void { x87Memory(221, 3, baseRegister, disp) }
+// fld dword / fstp dword: a float.
+pub fn fldSingle(baseRegister: u8, disp: i64) -> void { x87Memory(217, 0, baseRegister, disp) }
+pub fn fstpSingle(baseRegister: u8, disp: i64) -> void { x87Memory(217, 3, baseRegister, disp) }
+// fild qword: push a signed 64-bit integer.
+pub fn fildQuad(baseRegister: u8, disp: i64) -> void { x87Memory(223, 5, baseRegister, disp) }
+// fisttp qword: store st0 truncated to a 64-bit integer and pop.
+pub fn fisttpQuad(baseRegister: u8, disp: i64) -> void { x87Memory(221, 1, baseRegister, disp) }
+// fadd qword / fsub qword: st0 op= the double in memory.
+pub fn faddDouble(baseRegister: u8, disp: i64) -> void { x87Memory(220, 0, baseRegister, disp) }
+pub fn fsubDouble(baseRegister: u8, disp: i64) -> void { x87Memory(220, 4, baseRegister, disp) }
+// faddp, fsubp, fmulp, fdivp st1, st0: st1 = st1 op st0, then pop.
+pub fn faddp() -> void {
+    byte(222)
+    byte(193)
+}
+pub fn fsubp() -> void {
+    byte(222)
+    byte(233)
+}
+pub fn fmulp() -> void {
+    byte(222)
+    byte(201)
+}
+pub fn fdivp() -> void {
+    byte(222)
+    byte(249)
+}
+// fchs: st0 = -st0.
+pub fn fchs() -> void {
+    byte(217)
+    byte(224)
+}
+// fld st0: push a copy of the top.
+pub fn fldTop() -> void {
+    byte(217)
+    byte(192)
+}
+// fstp st0: pop the top.
+pub fn fstpTop() -> void {
+    byte(221)
+    byte(216)
+}
+// fucomip st0, st1: the flags of st0 compared with st1 (CF: below,
+// ZF: equal, PF: unordered), st0 popped.
+pub fn fucomip() -> void {
+    byte(223)
+    byte(233)
+}
+// fldz: push 0.
+pub fn fldz() -> void {
+    byte(217)
+    byte(238)
+}
+
+// ---------------------------------------------------------------------------
+// Data area
+
+// Reserves `size` bytes of the data area at `alignment`, holding `count`
+// bytes from `bytes` (0: zeros); its offset.
+// The same for an alignment over the data section's own (16): aligned
+// from the section's start, `sectionStart` in the data area (the
+// runtime's words come first).
+pub fn reserveInSection(size: usize, alignment: usize, bytes: usize, count: usize, sectionStart: usize) -> usize {
+    if alignment <= 16 { return reserve(size, alignment, bytes, count) }
+    var name: [*]const u8 = undefined
+    unsafe { name = @ptrCast([*]const u8, "") }
+    const current = encoder.dataSize(enc())
+    const target = sectionStart + (current - sectionStart + alignment - 1) / alignment * alignment
+    if target > current { const padding = encoder.reserveData(enc(), name, 0, target - current, 1, 0, base.pointer(0), 0, false) }
+    encoder.noteDataAlignment(alignment)
+    return encoder.reserveData(enc(), name, 0, size, 1, 0, base.pointer(bytes), count, false)
+}
+
+pub fn reserve(size: usize, alignment: usize, bytes: usize, count: usize) -> usize {
+    var name: [*]const u8 = undefined
+    unsafe { name = @ptrCast([*]const u8, "") }
+    return encoder.reserveData(enc(), name, 0, size, alignment, 0, base.pointer(bytes), count, false)
+}

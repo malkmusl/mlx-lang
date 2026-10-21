@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mlxlibc (projects/libc, built by tools/build_mlxlibc.sh) against glibc:
+# mlxlibc (compiler/libc, built by tools/build_mlxlibc.sh) against glibc:
 #
 #   - the image: soname libmlxc.so.1, no library needed (no DT_NEEDED at
 #     all), the C names exported, stdin/stdout/stderr, environ and the
@@ -7,7 +7,7 @@
 #   - tools/mlxlibc_check.py: the same calls through ctypes into both
 #     libraries answer the same (strings, ctype, malloc, stdlib, unistd,
 #     signals, printf, stdio, time, pthread);
-#   - tools/libm_check.py: libm.so.6 (projects/libc/libm.mlx, built next
+#   - tools/libm_check.py: libm.so.6 (compiler/libc/libm.mlx, built next
 #     to it) answers as the system's libm does, bit for bit or within a
 #     few ulps;
 #   - tools/mlxlibc_check.c: a C program gcc links twice, against

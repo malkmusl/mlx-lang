@@ -1,0 +1,355 @@
+// std.sql.mem: the memory every part of std.sql takes from, and bytes by
+// address. The database works on addresses (usize) for its pages, cells,
+// records and texts, as SQLite's C does on pointers; the blocks come from
+// one Allocator the program gives once (`use`), which must be safe to
+// call from several threads when connections are used from several
+// (the C API gives the C library's malloc). Each block carries its
+// length in the 16 bytes before it, so that it is freed and grown by its
+// address alone.
+//
+// Arithmetic is done in 64-bit words and values are narrowed only where
+// memory holds them narrower: a shifted or complemented narrow integer is
+// masked before it is compared or stored.
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const mem = @import("../../bootstrap/mem.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+// (A plain variable and a flag: an optional struct variable would keep
+// where the struct it was given lives, not a copy of it.)
+var heap: Allocator = undefined
+var heapReady: bool = false
+var liveBlocks: usize = 0
+
+// The allocator std.sql takes its memory from, from now on.
+pub fn use(allocator: Allocator) -> void {
+    heap.context = allocator.context
+    heap.allocFn = allocator.allocFn
+    heap.resizeFn = allocator.resizeFn
+    heap.remapFn = allocator.remapFn
+    heap.freeFn = allocator.freeFn
+    heapReady = true
+}
+
+pub fn ready() -> bool { return heapReady }
+
+// How many blocks are taken and not yet given back (the tests' leak check).
+pub fn blocks() -> usize { return liveBlocks }
+
+// `size` bytes, zeroed (0 when there is no memory).
+pub fn alloc(size: usize) -> usize {
+    const address = allocRaw(size)
+    if address != 0 { zero(address, size) }
+    return address
+}
+
+// `size` bytes as they come (for blocks about to be copied into).
+fn allocRaw(size: usize) -> usize {
+    const total = size + 16
+    const got = heap.alloc(total, 16)
+    if got == null { return 0 }
+    const base = @intFromPtr(got.?)
+    put64(base, size)
+    put64(base + 8, 0)
+    _ = @atomicRmw(usize, &liveBlocks, add, 1, monotonic)
+    return base + 16
+}
+
+pub fn free(address: usize) -> void {
+    if address == 0 { return }
+    const base = address - 16
+    const size = get64(base)
+    _ = @atomicRmw(usize, &liveBlocks, sub, 1, monotonic)
+    heap.free(bytes(base), size + 16, 16)
+}
+
+// The length a block was taken with.
+pub fn sizeOf(address: usize) -> usize {
+    if address == 0 { return 0 }
+    return get64(address - 16)
+}
+
+// The block at `address` grown (or shrunk) to `size` bytes, its contents
+// kept as far as they go and the rest zeroed; 0 when there is no memory
+// (the old block is then still there).
+pub fn grow(address: usize, size: usize) -> usize {
+    if address == 0 { return alloc(size) }
+    const old = sizeOf(address)
+    const fresh = allocRaw(size)
+    if fresh == 0 { return 0 }
+    copy(fresh, address, if old < size { old } else { size })
+    if size > old { zero(fresh + old, size - old) }
+    free(address)
+    return fresh
+}
+
+// A copy of `length` bytes at `address`, with a 0 after them.
+pub fn dup(address: usize, length: usize) -> usize {
+    const copied = allocRaw(length + 1)
+    if copied == 0 { return 0 }
+    if length > 0 { copy(copied, address, length) }
+    put8(copied + length, 0)
+    return copied
+}
+
+pub fn dupText(text: []const u8) -> usize { return dup(@intFromPtr(text.pointer), text.length) }
+
+// ---------------------------------------------------------------------------
+// Bytes by address.
+
+pub inline fn bytes(address: usize) -> [*]u8 { unsafe { return @ptrFromInt([*]u8, address) } }
+
+pub inline fn view(address: usize, length: usize) -> []const u8 {
+    unsafe { return @ptrFromInt([*]const u8, address)[0..length] }
+}
+
+pub inline fn get8(address: usize) -> u64 { unsafe { return @intCast(u64, @ptrFromInt(*u8, address).*) } }
+pub inline fn put8(address: usize, value: u64) -> void { unsafe { @ptrFromInt(*u8, address).* = @intCast(u8, value & 255) } }
+pub inline fn get64(address: usize) -> u64 { unsafe { return @ptrFromInt(*u64, address).* } }
+pub inline fn put64(address: usize, value: u64) -> void { unsafe { @ptrFromInt(*u64, address).* = value } }
+pub inline fn get32(address: usize) -> u64 { unsafe { return @intCast(u64, @ptrFromInt(*u32, address).*) } }
+pub inline fn put32(address: usize, value: u64) -> void { unsafe { @ptrFromInt(*u32, address).* = @intCast(u32, value & 0xffffffff) } }
+
+// Big-endian fields, as the file format has them.
+pub fn get16be(address: usize) -> u64 { return (get8(address) << 8) | get8(address + 1) }
+
+pub fn put16be(address: usize, value: u64) -> void {
+    put8(address, (value >> 8) & 255)
+    put8(address + 1, value & 255)
+}
+
+pub fn get32be(address: usize) -> u64 {
+    return (get8(address) << 24) | (get8(address + 1) << 16) | (get8(address + 2) << 8) | get8(address + 3)
+}
+
+pub fn put32be(address: usize, value: u64) -> void {
+    put8(address, (value >> 24) & 255)
+    put8(address + 1, (value >> 16) & 255)
+    put8(address + 2, (value >> 8) & 255)
+    put8(address + 3, value & 255)
+}
+
+pub fn get64be(address: usize) -> u64 { return (get32be(address) << 32) | get32be(address + 4) }
+
+pub fn put64be(address: usize, value: u64) -> void {
+    put32be(address, value >> 32)
+    put32be(address + 4, value & 0xffffffff)
+}
+
+pub fn copy(target: usize, source: usize, count: usize) -> void {
+    if count == 0 || target == source { return }
+    if target > source && target < source + count {
+        mem.copyBackwards(bytes(target), bytes(source), count)
+    } else {
+        mem.copy(bytes(target), bytes(source), count)
+    }
+}
+
+pub fn zero(target: usize, count: usize) -> void {
+    if count == 0 { return }
+    mem.set(bytes(target), 0, count)
+}
+
+pub fn fill(target: usize, value: u8, count: usize) -> void {
+    if count == 0 { return }
+    mem.set(bytes(target), value, count)
+}
+
+// memcmp's order of two runs of bytes, the shorter first when one starts
+// the other.
+pub fn compare(a: usize, aLength: usize, b: usize, bLength: usize) -> i64 {
+    const n = if aLength < bLength { aLength } else { bLength }
+    var i: usize = 0
+    while i < n {
+        const x = get8(a + i)
+        const y = get8(b + i)
+        if x != y { return if x < y { -1 } else { 1 } }
+        i += 1
+    }
+    if aLength == bLength { return 0 }
+    return if aLength < bLength { -1 } else { 1 }
+}
+
+pub fn same(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+pub inline fn lower(c: u64) -> u64 { return if c >= 65 && c <= 90 { c + 32 } else { c } }
+pub inline fn upper(c: u64) -> u64 { return if c >= 97 && c <= 122 { c - 32 } else { c } }
+
+// ASCII letters' case ignored, as SQLite compares names.
+pub fn sameNoCase(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        if lower(@intCast(u64, a[i])) != lower(@intCast(u64, b[i])) { return false }
+        i += 1
+    }
+    return true
+}
+
+pub fn startsNoCase(text: []const u8, prefix: []const u8) -> bool {
+    if text.length < prefix.length { return false }
+    return sameNoCase(text[0..prefix.length], prefix)
+}
+
+pub fn cLength(text: usize) -> usize {
+    if text == 0 { return 0 }
+    var length: usize = 0
+    while get8(text + length) != 0 { length += 1 }
+    return length
+}
+
+pub fn cText(text: usize) -> []const u8 {
+    if text == 0 { return view(0, 0) }
+    return view(text, cLength(text))
+}
+
+// ---------------------------------------------------------------------------
+// A growing run of bytes: the address of its block, how many bytes are
+// used and how many there is room for.
+pub const Buffer = struct {
+    data: usize
+    length: usize
+    capacity: usize
+}
+
+pub fn initBuffer(b: *Buffer) -> void {
+    b.*.data = 0
+    b.*.length = 0
+    b.*.capacity = 0
+}
+
+pub fn freeBuffer(b: *Buffer) -> void {
+    free(b.*.data)
+    initBuffer(b)
+}
+
+// Room for `more` bytes past the used ones (false when there is no memory).
+pub fn reserve(b: *Buffer, more: usize) -> bool {
+    const need = b.*.length + more
+    if need + 1 <= b.*.capacity { return true }
+    var room = if b.*.capacity < 64 { 64 } else { b.*.capacity * 2 }
+    while room < need + 1 { room = room * 2 }
+    const grown = grow(b.*.data, room)
+    if grown == 0 { return false }
+    b.*.data = grown
+    b.*.capacity = room
+    return true
+}
+
+pub fn append(b: *Buffer, address: usize, count: usize) -> bool {
+    if !reserve(b, count) { return false }
+    copy(b.*.data + b.*.length, address, count)
+    b.*.length += count
+    put8(b.*.data + b.*.length, 0)
+    return true
+}
+
+pub fn appendText(b: *Buffer, text: []const u8) -> bool { return append(b, @intFromPtr(text.pointer), text.length) }
+
+pub fn appendByte(b: *Buffer, value: u64) -> bool {
+    if !reserve(b, 1) { return false }
+    put8(b.*.data + b.*.length, value)
+    b.*.length += 1
+    put8(b.*.data + b.*.length, 0)
+    return true
+}
+
+pub fn appendDecimal(b: *Buffer, value: i64) -> bool {
+    if !reserve(b, 24) { return false }
+    var magnitude: u64 = if value < 0 { @bitCast(u64, 0 -% value) } else { @bitCast(u64, value) }
+    if value < 0 {
+        put8(b.*.data + b.*.length, 45)
+        b.*.length += 1
+    }
+    const start = b.*.length
+    while true {
+        put8(b.*.data + b.*.length, 48 + magnitude % 10)
+        b.*.length += 1
+        magnitude = magnitude / 10
+        if magnitude == 0 { break }
+    }
+    // The digits came last first.
+    var i = start
+    var j = b.*.length - 1
+    while i < j {
+        const t = get8(b.*.data + i)
+        put8(b.*.data + i, get8(b.*.data + j))
+        put8(b.*.data + j, t)
+        i += 1
+        j -= 1
+    }
+    put8(b.*.data + b.*.length, 0)
+    return true
+}
+
+pub fn bufferText(b: *Buffer) -> []const u8 { return view(b.*.data, b.*.length) }
+
+// The buffer's bytes as a block of their own (with a 0 after them), the
+// buffer left empty.
+pub fn takeBuffer(b: *Buffer) -> usize {
+    if b.*.data == 0 { return dup(0, 0) }
+    const taken = b.*.data
+    initBuffer(b)
+    return taken
+}
+
+// ---------------------------------------------------------------------------
+// A growing list of words.
+pub const Words = struct {
+    data: usize
+    length: usize
+    capacity: usize
+}
+
+pub fn initWords(w: *Words) -> void {
+    w.*.data = 0
+    w.*.length = 0
+    w.*.capacity = 0
+}
+
+pub fn freeWords(w: *Words) -> void {
+    free(w.*.data)
+    initWords(w)
+}
+
+pub fn push(w: *Words, value: u64) -> bool {
+    if w.*.length == w.*.capacity {
+        const room = if w.*.capacity < 8 { 8 } else { w.*.capacity * 2 }
+        const grown = grow(w.*.data, room * 8)
+        if grown == 0 { return false }
+        w.*.data = grown
+        w.*.capacity = room
+    }
+    put64(w.*.data + w.*.length * 8, value)
+    w.*.length += 1
+    return true
+}
+
+pub inline fn at(w: *Words, index: usize) -> u64 { return get64(w.*.data + index * 8) }
+pub inline fn set(w: *Words, index: usize, value: u64) -> void { put64(w.*.data + index * 8, value) }
+
+pub fn pop(w: *Words) -> u64 {
+    w.*.length -= 1
+    return get64(w.*.data + w.*.length * 8)
+}
+
+// The word at `index` taken out, those after it moved down.
+pub fn removeAt(w: *Words, index: usize) -> void {
+    copy(w.*.data + index * 8, w.*.data + index * 8 + 8, (w.*.length - index - 1) * 8)
+    w.*.length -= 1
+}
+
+pub fn insertAt(w: *Words, index: usize, value: u64) -> bool {
+    if !push(w, 0) { return false }
+    copy(w.*.data + index * 8 + 8, w.*.data + index * 8, (w.*.length - 1 - index) * 8)
+    put64(w.*.data + index * 8, value)
+    return true
+}

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Writes projects/cc/names.mlx: the names mlx-cc interns first, in a fixed
+"""Writes compiler/cc/names.mlx: the names mlx-cc interns first, in a fixed
 order, so each has a constant id (punctuators P_*, keywords K_*, the
 preprocessor's words D_*).
 
-    python3 tools/cc/gen_names.py > projects/cc/names.mlx
+    python3 tools/cc/gen_names.py > compiler/cc/names.mlx
 """
 puncts = [
     ("ELLIPSIS", "..."), ("SHL_ASSIGN", "<<="), ("SHR_ASSIGN", ">>="),

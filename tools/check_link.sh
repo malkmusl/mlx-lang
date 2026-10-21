@@ -21,7 +21,7 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 
 "$compiler" --quiet compiler/selfhost/object/relocatable_check.mlx -o "$work/relocatable_check" || fail "relocatable_check does not build"
 "$compiler" --quiet compiler/selfhost/object/link_check.mlx -o "$work/link_check" || fail "link_check does not build"
-"$compiler" --quiet projects/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
+"$compiler" --quiet compiler/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
 echo "ok   relocatable_check, link_check and mlx-ar build"
 
 (cd "$work" && ./relocatable_check > roundtrip.out) || fail "relocatable_check exited $?: $(tail -3 "$work/roundtrip.out")"

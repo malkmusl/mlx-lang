@@ -1,0 +1,230 @@
+// std.http.multipart: multipart bodies (RFC 2046 5.1) as libsoup cuts
+// and writes them: a body split at its boundary lines into parts (each
+// its header lines and its bytes), and parts written out with a
+// boundary (form-data parts with their Content-Disposition). Nothing
+// here allocates: parts are slices of the body, writing goes to a Sink.
+//
+//     var boundary: [128]u8 = undefined
+//     const n = multipart.boundaryOf("multipart/form-data; boundary=xyz", boundary[0..128])
+//     var it = multipart.parts(body, boundary[0..n])
+//     var part: multipart.Part = undefined
+//     while multipart.nextPart(&it, &part) { ... part.headers, part.body ... }
+const headers = @import("./headers.mlx")
+const sha2 = @import("../sha2.mlx")
+const base64 = @import("../base64.mlx")
+
+pub const Sink = headers.Sink
+
+// A part: its header lines (from after the boundary line to the blank
+// line, each ending in CRLF) and its bytes; `raw` is the header block
+// from the boundary line on (what libsoup hands soup_headers_parse, which
+// skips the first line).
+pub const Part = struct {
+    raw: []const u8
+    headers: []const u8
+    body: []const u8
+}
+
+pub const Parts = struct {
+    body: []const u8
+    boundary: []const u8
+    // Where the next part's boundary line starts (body.length: none).
+    at: usize
+    done: bool
+}
+
+fn sameBytes(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// Where "--boundary" starts a line in [start, body.length) and is
+// followed by "--" or a line end (body.length: nowhere), looked for as
+// libsoup looks (two bytes on after a "-" that is not it).
+pub fn findBoundary(body: []const u8, start: usize, boundary: []const u8) -> usize {
+    var b = start
+    const length = boundary.length
+    while b + length + 4 < body.length {
+        if body[b] == 45 && body[b + 1] == 45 && sameBytes(body[b + 2..b + 2 + length], boundary) {
+            const atLineStart = b == start || (b - start >= 2 && body[b - 1] == 10 && body[b - 2] == 13)
+            const after0 = body[b + length + 2]
+            const after1 = body[b + length + 3]
+            if atLineStart && ((after0 == 45 && after1 == 45) || (after0 == 13 && after1 == 10)) { return b }
+            b += 2
+        } else if body[b] == 45 {
+            b += 2
+        } else {
+            b += 1
+        }
+    }
+    return body.length
+}
+
+// The first "\r\n\r\n" at or after `start` (body.length: none).
+pub fn findBlankLine(body: []const u8, start: usize) -> usize {
+    var p = start
+    while p + 4 <= body.length {
+        if body[p] == 13 && body[p + 1] == 10 && body[p + 2] == 13 && body[p + 3] == 10 { return p }
+        p += 1
+    }
+    return body.length
+}
+
+// The parts of `body` with `boundary` (the parameter's value, without
+// "--"); the preamble is skipped.
+pub fn parts(body: []const u8, boundary: []const u8) -> Parts {
+    const first = findBoundary(body, 0, boundary)
+    return Parts.{ .body = body, .boundary = boundary, .at = first, .done = first == body.length }
+}
+
+// The next part into `part`; false at the closing boundary, or when the
+// body is not well formed (`it.done` says which: a body without a part
+// is `done` from the start). As libsoup, a part whose end or blank line
+// is missing ends the parts with an error (`malformed`).
+pub fn nextPart(it: *Parts, part: *Part) -> bool {
+    if it.*.done { return false }
+    const body = it.*.body
+    const start = it.*.at
+    const length = it.*.boundary.length
+    // The closing boundary: "--boundary--".
+    if body[start + 2 + length] == 45 {
+        it.*.done = true
+        return false
+    }
+    const end = findBoundary(body, start + 2 + length, it.*.boundary)
+    if end == body.length {
+        it.*.done = true
+        it.*.at = body.length
+        return false
+    }
+    var split = findBlankLine(body, start)
+    if split == body.length || split > end {
+        it.*.done = true
+        it.*.at = body.length
+        return false
+    }
+    split += 4
+    var lineEnd = start
+    while lineEnd < split && body[lineEnd] != 10 { lineEnd += 1 }
+    part.*.raw = body[start..split - 2]
+    part.*.headers = body[if lineEnd < split { lineEnd + 1 } else { split }..split - 2]
+    // The body ends before the line end that comes before the boundary.
+    part.*.body = if end - 2 >= split { body[split..end - 2] } else { body[split..split] }
+    it.*.at = end
+    return true
+}
+
+// Whether the parts ended at a closing boundary (true) or at a body that
+// was not well formed (false); meaningful once nextPart returned false.
+pub fn wellFormed(it: *const Parts) -> bool { return it.*.at < it.*.body.length }
+
+// The value of the parameter `name` of a `type/subtype; name=value;
+// ...` header value (the first of that name, unquoted), into `out`; its
+// length, or -1 when there is none.
+pub fn paramOf(contentType: []const u8, name: []const u8, out: []u8) -> isize {
+    var items = headers.list(contentType, 59)
+    var item: []const u8 = ""
+    var p: headers.Param = undefined
+    var first = true
+    while headers.next(&items, &item) {
+        if first {
+            first = false
+            continue
+        }
+        if !headers.param(item, &p) || !headers.equalsIgnoringCase(p.name, name) || p.kind == headers.ParamKind.bare { continue }
+        if p.kind == headers.ParamKind.quoted { return @intCast(isize, headers.decodeQuoted(p.value, out)) }
+        if p.kind == headers.ParamKind.extended {
+            const decoded = headers.decodeExtended(p.value, out)
+            if decoded < 0 { continue }
+            return decoded
+        }
+        var i: usize = 0
+        while i < p.value.length && i < out.length {
+            out[i] = p.value[i]
+            i += 1
+        }
+        return @intCast(isize, p.value.length)
+    }
+    return -1
+}
+
+// The media type of a Content-Type value (before any `;`, spaces off).
+pub fn mediaType(contentType: []const u8) -> []const u8 {
+    var end = headers.indexOf(contentType, 59, 0)
+    const start = headers.skipLws(contentType, 0)
+    end = headers.unskipLws(contentType, end, start)
+    return contentType[start..end]
+}
+
+// Whether a Content-Type is a multipart one with a boundary: the
+// boundary into `out`, its length (0: not multipart, or no boundary).
+pub fn boundaryOf(contentType: []const u8, out: []u8) -> usize {
+    const kind = mediaType(contentType)
+    if kind.length < 10 || !headers.equalsIgnoringCase(kind[0..10], "multipart/") { return 0 }
+    const length = paramOf(contentType, "boundary", out)
+    if length <= 0 { return 0 }
+    return @intCast(usize, length)
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// A boundary as libsoup makes one: the SHA-256, in hex, of 8 random
+// bytes (64 hex digits into `out`).
+pub fn makeBoundary(random: *const [8]u8, out: *[64]u8) -> void {
+    var digest: [32]u8 = undefined
+    sha2.sha256(random.*[0..8], &digest)
+    const bytes: [*]const u8 = &digest
+    const text: [*]u8 = unsafe { @ptrCast([*]u8, out) }
+    _ = base64.hexEncode(bytes[0..32], text)
+}
+
+// Opens a part: "--boundary\r\n" (after "\r\n" when a part came before).
+pub fn writePartStart(sink: Sink, boundary: []const u8, first: bool) -> void {
+    if !first { headers.put(sink, "\r\n") }
+    headers.put(sink, "--")
+    headers.put(sink, boundary)
+    headers.put(sink, "\r\n")
+}
+
+// A part's header line.
+pub fn writeHeader(sink: Sink, name: []const u8, value: []const u8) -> void {
+    headers.put(sink, name)
+    headers.put(sink, ": ")
+    headers.put(sink, value)
+    headers.put(sink, "\r\n")
+}
+
+// The blank line before a part's body.
+pub fn writeHeadersEnd(sink: Sink) -> void { headers.put(sink, "\r\n") }
+
+// The closing boundary: "\r\n--boundary--\r\n" (a line end after the
+// close delimiter, as everyone sends it).
+pub fn writeClose(sink: Sink, boundary: []const u8) -> void {
+    headers.put(sink, "\r\n--")
+    headers.put(sink, boundary)
+    headers.put(sink, "--\r\n")
+}
+
+// The Content-Disposition value of a form-data part:
+// `form-data; name="..."` and `; filename="..."` when there is one.
+pub fn writeFormDisposition(sink: Sink, name: []const u8, hasFilename: bool, filename: []const u8) -> void {
+    headers.put(sink, "form-data; ")
+    headers.writeParam(sink, "name", name, false)
+    if hasFilename {
+        headers.put(sink, "; ")
+        headers.writeParam(sink, "filename", filename, false)
+    }
+}
+
+// The Content-Type value of the whole body: `type; boundary=...`.
+pub fn writeContentType(sink: Sink, mime: []const u8, boundary: []const u8) -> void {
+    headers.put(sink, mime)
+    headers.put(sink, "; ")
+    headers.writeParam(sink, "boundary", boundary, true)
+}
