@@ -1547,6 +1547,36 @@ a POST as a GET; 301, 302, 307 and 308 of a safe method as they are;
 soup_headers_parse_request, soup_headers_parse_status_line and the
 session's redirect handler are over it; test 380 checks it.
 
+### The client (`std.http.client`)
+
+`std/src/http/client.mlx` is an HTTP/1.1 client for Mlx programs (the
+browser Voyager's), on std.net, std.tls and the modules above. A
+`Session` (`init`, `deinit`) keeps up to eight connections by scheme,
+host and port and reuses them while they stay open; `request(&session,
+&req, &response)` (`get`, `post`) sends a `Request` (method, URL, extra
+header lines, a body) and gives a `Response`: the status, version and
+phrase, the head as it came (`header(&response, name, folded, &value)`
+finds one), the body with gzip or deflate undone (`body`), the URL it
+came from and how many redirects were followed (`freeResponse` gives the
+memory back). It follows redirects as libsoup does (`std.http.message`,
+up to `maxRedirects`), answers a 401's Basic or Digest challenge once
+with what the `setCredentials` callback gives for the host and realm and
+keeps the credentials for the host's later requests, sends the cookies
+of a jar and takes the ones set (`setCookieJar`), rewrites http:// to
+https:// for hosts an enforcer knows (`setHsts`), reads bodies framed by
+Content-Length, chunks (trailers passed over) or the connection's end,
+passes over informational responses, and reads no body for HEAD, 1xx,
+204 and 304. https:// runs on std.tls with ALPN http/1.1, the server's
+chain verified against the system's CA bundle
+(`/etc/ssl/certs/ca-certificates.crt`, loaded when first needed) or a
+trust store given (`setTrustStore`), and refused otherwise unless
+`insecure` is set. Each wait on the network takes at most `timeoutMs`
+(30 s); a body past `maxBody` (64 MiB) is `Error.tooLarge`. The errors
+name what went wrong: `badUrl`, `resolve`, `connect`, `tls`, `send`,
+`receive`, `malformed`, `tooManyRedirects`, `noMemory`. Everything is
+synchronous. `tests/382_http_client_runtime.mlx` runs a session against
+a server of its own in a child process on the loopback.
+
 ### Authentication (`std.http.auth`)
 
 `std/src/http/auth.mlx` is HTTP authentication (RFC 7235) as libsoup does
@@ -1686,9 +1716,25 @@ keys (RFC 6455's example), headers and compressed messages; mlx-soup's
 SoupMultipart, handshake and SoupWebsocketExtensionDeflate are over
 them (SoupWebsocketConnection itself stays GIO's).
 
-## Networking (`std.net`) — not yet normative
+## Networking (`std.net`, `std.net.dns`)
 
-**Normative source:** none (see gap below)
+**Normative source:** none yet (see the gap below)
+
+`std/src/net.mlx` is TCP over IPv4 and IPv6 on std.linux's socket calls:
+an `Address` (family, bytes, port, an IPv6 scope) read from a literal
+(`parseAddress`, `parseIpv4`, `parseIpv6` with brackets, an IPv4 tail
+and a `%scope`) and written back as inet_ntop writes it
+(`writeAddress`), `ipv4(a, b, c, d, port)`, the `sockaddr` both ways;
+`connect(&address, timeoutMs)` (non-blocking until connected, then
+blocking, TCP_NODELAY set), `listen`, `accept`, `localAddress` (the port
+the system picked), `send` (all of it), `receive`, `readable` (with a
+timeout), `shutdownWrite`, `close`. `resolve(name, port, found, max,
+timeoutMs)` is `std/src/net/dns.mlx`'s: an address literal and
+"localhost" answered at once, then `/etc/hosts`, then the name servers
+of `/etc/resolv.conf` asked over UDP for A and AAAA records (RFC 1035
+messages written and read, compression pointers and CNAMEs followed),
+IPv4 addresses first. `tests/381_net_runtime.mlx` checks the addresses,
+a connection on the loopback and the DNS messages.
 
 `spec/04-stdlib/posix.xml` requires the raw syscalls a network stack would
 sit on (`socket bind listen accept connect send recv sendmsg recvmsg poll`),
@@ -1703,11 +1749,12 @@ particularly `os/linux/socket.mlx` and
 > specified. Raw `std.os.linux`/`std.posix` wrappers can follow the platform
 > ABI; a portable `std.net` interface requires an added normative contract.
 
-There is accordingly no `std.net` module, and this chapter does not describe
-one. Programs needing sockets today go directly through
-`std.os.linux.socket`/`std.os.linux.event` (Unix-domain sockets, raw
-`AF_INET`/`AF_INET6` constants, `epoll`, and a raw `io_uring` setup/enter/
-register gateway), as `tests/181_linux_socket_epoll_runtime.mlx` and
+`std.net` above is the first such module, without a normative contract
+yet (no event-loop API, no UDP beyond the resolver's own). Programs
+needing more go directly through `std.os.linux.socket`/`std.os.linux.event`
+(Unix-domain sockets, raw `AF_INET`/`AF_INET6` constants, `epoll`, and a
+raw `io_uring` setup/enter/register gateway), as
+`tests/181_linux_socket_epoll_runtime.mlx` and
 `tests/187_linux_io_uring_runtime.mlx` do.
 
 ## meta

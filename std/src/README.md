@@ -87,6 +87,11 @@ of the handshake, frame headers, masking, UTF-8) with
 test 379), `http/message.mlx` (request and status lines, header lines
 folded, bodies' framing, the rules of redirects; test 380 with `uri.mlx`,
 `std.uri`: RFC 3986's parts, references resolved, percent-coding),
+`http/client.mlx` (`std.http.client`: an HTTP/1.1 client with sessions,
+kept connections, redirects, Basic and Digest auth, cookies, HSTS, gzip,
+https on std.tls; test 382 against a server in a child process) on
+`net.mlx` (`std.net`: TCP over IPv4 and IPv6, addresses, `std.net.dns`'s
+resolver over /etc/hosts and /etc/resolv.conf; test 381),
 `http/auth.mlx` (RFC 7235's challenges told apart, Basic tokens, Digest
 responses and Authorization values; test 376), `http/hsts.mlx` (RFC
 6797: Strict-Transport-Security read strictly, an enforcer's policies

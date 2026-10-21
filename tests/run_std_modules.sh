@@ -138,6 +138,8 @@ run 377_http_cookies_runtime "cookies read with libsoup's rules, written back an
 run 378_http_hsts_runtime "HSTS: Strict-Transport-Security read strictly, policies and their expiry, an enforcer's hosts and subdomains, its changes and file"
 run 379_http_multipart_websocket_runtime "multipart bodies cut and written as libsoup does; WebSocket keys, accepts, protocols, extensions and permessage-deflate messages"
 run 380_uri_message_runtime "URIs split, resolved (RFC 3986's examples), normalized and coded; HTTP heads read as libsoup reads them, written, framed, redirected"
+run 381_net_runtime "IPv4 and IPv6 addresses, socket addresses, a TCP connection on the loopback, DNS queries and answers, names answered without a server"
+run 382_http_client_runtime "an HTTP/1.1 session against a server in a child process: kept connections, cookies, redirects, POST, chunked, gzip, HEAD, Digest auth, errors"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
