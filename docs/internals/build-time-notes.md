@@ -302,3 +302,85 @@ units (lever 5), brings a WebCore unit under 2 GB resident.
    measured did. The three above together are the rest of the path:
    the snapshot removes the prefix from every WebCore unit, the lookups
    and keys a third of what is left, and `-j 4` doubles the throughput.
+
+## Allocators (notes, 2026-10-21; nothing changed yet)
+
+docs/reference/stdlib.md says a program's blocks come from
+`std.general_purpose_allocator` (size classes out of 256 KiB slabs,
+free lists, one lock) over `std.page_allocator` (mmap), with
+`std.tinypage_allocator` for blocks up to 2 KiB and
+`std.debug_allocator`/`std.leaks` watching every block under
+MLX_LEAK_CHECK. What the tree does, by `mlx-codemap refs
+page_allocator.mlx:init` and `importers` at 48a2f10:
+
+| Allocator | Who | Count |
+|---|---|---|
+| `std.page_allocator.init()` as the program's allocator | 230 files, 345 call sites | tests 85, coreutils 44 (ls 7, ownership 2, one each in 35 others), desktop 28 (capture 7; splash, notifications, lock, ipc, greeter, audio 2 each; topbar, terminal, settings, permissions, login, launcher, files, dock, compositor), tools 25 (codemap 7, network-test 4, 14 others), std 16 (src 9, registry 3, bootstrap 3, protocols 1), compiler 11 (selfhost 5, cc 4, libc 2), experiments 8, examples 6, other projects 8 |
+| `std/bootstrap/page_allocator.mlx` imported directly (not as `std.page_allocator`) | 44 modules | 27 tests, selfhost 5, cc 4, std 8 (bootstrap 5, src 3) |
+| `std.general_purpose_allocator.init()` | 5 call sites | compiler/libc/heap.mlx (mlxlibc's `malloc`) and 4 tests; imported only by std's two roots |
+| `std.arena_allocator.init()` | 3 call sites | compiler/selfhost/driver/pipeline.mlx, tools/codemap/index.mlx (one arena of 3 GiB reserved), a test |
+| `std.debug_allocator.init()` | 2 | std.leaks and its test; `page_allocator.watch` is called by the debug allocator alone |
+| `std.tinypage_allocator` | 1 | page_allocator.mlx (every block up to 2 KiB) |
+
+So the general-purpose heap serves C programs through mlxlibc and no
+Mlx program: every program's heap is the page allocator, which puts
+small blocks on tiny pages (64-byte runs) and gives whole pages to the
+others. A program takes it where it needs memory (`const allocator =
+std.page_allocator.init()`, 345 times) rather than passing one
+allocator around; nothing is `deinit`ed. Two of the three programs
+measured below are not watched at all: `mlx-codemap`'s commands
+return before `crash.install()` (projects/observatory/main.mlx:1107,
+the command path; the panel installs it), and mlx-cc installs nothing
+(the diagnostics-everywhere branch adds these lines).
+
+**Observatory's numbers** (MLX_LEAK_CHECK=1, then `mlx-codemap memory
+PROGRAM`; the resident peak is VmHWM polled from /proc while the
+program ran without the check; ls from the 2026-10-18 build,
+mlx-observatory built from 48a2f10, mlx-cc from the 2026-10-21 build):
+
+| Program, run | Blocks, bytes asked, in pages | Tiny pages | Waste per size class | Address space | Resident |
+|---|---|---|---|---|---|
+| `ls -lR projects std` (coreutils) | 118 blocks, 41 KiB asked, 51 KiB in pages (18% wasted); 4939 allocations, 4821 frees | 113 blocks on 5 pages, 37% full | below 256 B: 112 blocks, 1735 B in 7616 B (77% wasted); below 4 KiB: 4 blocks, 12 KiB in 16 KiB (25%); below 64 KiB: 2 blocks, 28 KiB (0%) | 13 mappings, 1 hole of 20 KiB, fragmentation 0.000 | 9616 KiB in the snapshot; 7.8 MiB peak; `values` (the compiler's value arena) 22 MiB |
+| `mlx-codemap unused` (the whole tree, 4.0 s) | no snapshot: not watched (above); and its index is one `std.arena_allocator` over the page allocator reserving 3 GiB (tools/codemap/index.mlx `ARENA_BYTES`), so watched it would show one block | — | — | — | 550 MiB peak |
+| `mlx-cc -c wtf/text/WTFString.cpp` (2.7 s) | no snapshot: not watched, and its arena is a raw `mmap` of 8 GiB MAP_NORESERVE (compiler/cc/base.mlx:41) bump-allocated in 16-byte steps, never freed; MLX_CC_STATS at the end: 1234 MiB arena bytes, of which 406 MB in 502 allocations of 4 KiB and more (the fixed tables, largely untouched), 185 MB 2.89 M tokens (64 B), 154 MB 738 k nodes (208 B), 35 MB objects, 26 MB cells of 48 B, 25 MB types | — | — | — | 587 MiB peak |
+| `tests/support/leaks_program` (the fixture; the machinery works) | 5 blocks, 24 KiB asked, 24 KiB in pages (0% wasted) | — | below 64 KiB: 5 blocks (0%) | 9 mappings, 0 holes, fragmentation 0.000 | 560 KiB |
+
+What the ls row says about the page allocator as a heap: the blocks
+under 256 bytes are where the waste is (112 of 118 blocks, 77% of
+their tiny pages unused, since a 20-byte path takes a 64-byte run),
+the few larger blocks waste a quarter, and nothing is fragmented
+because nothing is freed and reused. The general-purpose heap's
+16-byte classes would put those 112 blocks in about 2.3 KiB of a slab
+(about 25% wasted by the class rounding instead of 77%), and its free
+lists would reuse what ls frees (4821 of 4939 blocks); resident memory
+would not move, since a slab is touched a page at a time.
+
+**The idiom proposed (not done; "not yet"):** one heap per program,
+`std.heap`: `std.heap.allocator()` returns the Allocator interface of
+one `general_purpose_allocator` over `std.page_allocator`, made on
+first use so that a program keeps taking it where it needs memory (the
+345 `std.page_allocator.init()` sites become `std.heap.allocator()`,
+a mechanical `mlx-codemap rewrite`), `std.heap.deinit()` gives the
+slabs back where a program ends on purpose, and under MLX_LEAK_CHECK
+`std.leaks` wraps the heap in the debug allocator instead of watching
+pages, so the leak check and Observatory see every block with its
+place and not the heap's 256 KiB slabs (tiny pages then hold only the
+heap's own small blocks, if any). What stays on raw pages: the
+compiler's bootstrap (std/bootstrap's own files and the selfhost
+driver, which the heap is built on), the loader, large mappings (files
+read whole, framebuffers), and the arenas' backing, which should go
+through `std.page_allocator`'s interface rather than their own `mmap`
+so a snapshot lists them: for mlx-cc, `arena_allocator` over the page
+allocator keeps the bump semantics and zeroed fresh pages if the
+reservation stays one 8 GiB MAP_NORESERVE block (the page allocator
+would have to pass MAP_NORESERVE above some size, or the arena grow in
+chunks, which costs a bound check it already makes), and its fill
+reported through std.diagnostics as std.gpu reports device memory, so
+`memory mlx-cc` shows the arena's bytes by kind as MLX_CC_STATS does.
+Two things to settle first: a block taken in one image and freed in
+another (the compositor's modules, plugins; tiny pages solve it with
+one region at a fixed address shared by every image, a per-image heap
+does not), and the heap's one lock, which every block of every thread
+would take, against today's one mmap per large block and the tiny
+pages' own lock for the small ones (the tinypage test's four threads,
+the GPA test's four).
