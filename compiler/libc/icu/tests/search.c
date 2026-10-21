@@ -228,5 +228,14 @@ int main(void)
         printf("\n");
         usearch_close(random);
     }
+    {
+        /* unorm2.h comes with usearch.h (ICU's ucol.h includes unorm.h,
+           which includes it): WebKit's ICUSearcher normalizes so. */
+        UErrorCode status = U_ZERO_ERROR;
+        const UNormalizer2 *nfc = unorm2_getNFCInstance(&status);
+        UChar decomposed[2] = { 0x65, 0x301 }, composed[4];
+        int32_t length = unorm2_normalize(nfc, decomposed, 2, composed, 4, &status);
+        printf("nfc %d %x %s\n", (int)length, composed[0], u_errorName(status));
+    }
     return 0;
 }

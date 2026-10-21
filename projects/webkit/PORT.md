@@ -462,6 +462,12 @@ What M2 found, and how the port meets it without a patch:
   (NetworkStorageSessionMlx.cpp). FontCache.h's Skia members are kept;
   `FontSetCache`, which only FontCacheSkia.cpp defines, is the port's
   own class in FontCacheMlx.cpp.
+- **Settings a generic file reads that WebKit generates for some ports
+  only.** Page.cpp reads `settings().hardwareAccelerationEnabled()` for
+  any Skia port, but UnifiedWebPreferences.yaml has the setting for GTK
+  and the WPE platform only: the port's port/MlxSettings.yaml, read by
+  webkit-settings after WebKit's preferences (webcore.mlx's
+  `Derived.settings`), has it for the Mlx port, off.
 - **Bundles too big for mlx-cc.** The dense JSBindings bundle of
   bindings/js (64 sources) exceeds mlx-cc's 8 GB arena: the Mlx port
   bundles bindings/js by directory (webcore.mlx, `Derived.dense`).

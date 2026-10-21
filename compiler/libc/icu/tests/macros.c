@@ -51,6 +51,16 @@
 #include <unicode/ucnv.h>
 #include <unicode/ucnv_cb.h>
 
+#ifdef __cplusplus
+/* ICU's namespace, as C++ over its C headers names it (WebKit's
+   LocaleICU: `using namespace icu;`). */
+using namespace icu;
+U_NAMESPACE_BEGIN
+static const int inIcuNamespace = 1;
+U_NAMESPACE_END
+static_assert(U_NAMESPACE_QUALIFIER inIcuNamespace == 1, "icu_74");
+#endif
+
 int main(void)
 {
     const char text[] = "a\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\xff" "b";
