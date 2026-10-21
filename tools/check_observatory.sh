@@ -142,8 +142,8 @@ if command -v git > /dev/null; then
     # The workarounds at both commits (each counted from git archive and
     # kept in the cache, where the app finds them).
     HOME="$work" XDG_CACHE_HOME= "$work/mlx-observatory" -C "$tree" history > "$work/history.txt" 2> /dev/null
-    [[ $(grep -c "^20[0-9-]* [0-9a-f]\{7\}  2 0 1 1 0 0 0 0 0 0$" "$work/history.txt") -eq 2 ]] \
-        && grep -q "^▄▄ 1 Array casts$" "$work/history.txt" && [[ $(wc -l < "$work/.cache/mlx/codemap/workarounds-v1") -eq 2 ]] \
+    [[ $(grep -c "^20[0-9-]* [0-9a-f]\{7\}  2 0 1 1 0 0 0 0 0 0 0 0 0$" "$work/history.txt") -eq 2 ]] \
+        && grep -q "^▄▄ 1 Array casts$" "$work/history.txt" && [[ $(wc -l < "$work/.cache/mlx/codemap/workarounds-v2") -eq 2 ]] \
         || fail "history should count the two workarounds at both commits and keep them" "$work/history.txt"
     echo "ok   the command line: history (workarounds per commit)"
     "$work/mlx-observatory" -C "$tree" diff HEAD~1 > "$work/diff.txt"
