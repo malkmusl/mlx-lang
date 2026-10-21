@@ -42,6 +42,16 @@ and GIO, here mlx-glib (compiler/libc/glib).
     tools/check_wpe_jsc.sh            JavaScriptCore (WPE) at work: jsc on tests/wpe.js, the GLib API's tests/jsc-glib.c
     tools/check_jsc_mlxlibc.sh        jsc (JSCOnly) on mlxlibc: tests/jsc/*.js as the glibc-linked jsc prints them, no glibc in the process
 
+How many jobs (`-j N`) is decided by memory, not cores: mlx-cc keeps a
+whole unit in one arena until its end, and a WebCore unified source
+takes 3–4.5 GB resident there (the JSBindings ones more; a WTF file
+0.6 GB, a JSC unified source 1–2 GB). On a machine with 15 GB and four
+cores, `-j 4` holds for every target but `webkit-wpe-webcore`, which
+runs at `-j 2` (three of its largest units at once get one of them
+killed by the kernel, exit 137); 32 GB runs WebCore at `-j 4` too.
+Where the time and the memory go, and what was done about them, is in
+docs/internals/build-time-notes.md.
+
 The JSCOnly port's objects go to mlx-out/webkit/obj, its archives to
 mlx-out/webkit/lib, what is generated to mlx-out/webkit/generated
 (JavaScriptCore/ for JSC's, WebCore/ for WebCore's); the WPE port's to
