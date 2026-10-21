@@ -3,7 +3,9 @@
    compiler has no vector registers): _mm_set_sd and _mm_cvttsd_si32/64
    (a double truncated to an integer, the "integer indefinite" value when
    it does not fit), the float forms, the integer loads and stores,
-   _mm_pause. <xmmintrin.h> is the same. */
+   _mm_pause; the packed double arithmetic WebCore's TransformationMatrix
+   multiplies with (_mm_load_pd, _mm_add_pd, _mm_mul_pd, _mm_store_pd...).
+   <xmmintrin.h> includes it. */
 #ifndef _MLXCC_EMMINTRIN_H
 #define _MLXCC_EMMINTRIN_H
 #include <stdint.h>
@@ -17,6 +19,18 @@ static inline __m128d _mm_set_sd(double w) { __m128d r; r.__d[0] = w; r.__d[1] =
 static inline __m128d _mm_set1_pd(double w) { __m128d r; r.__d[0] = w; r.__d[1] = w; return r; }
 static inline __m128d _mm_setzero_pd(void) { __m128d r; r.__d[0] = 0.0; r.__d[1] = 0.0; return r; }
 static inline double _mm_cvtsd_f64(__m128d a) { return a.__d[0]; }
+static inline __m128d _mm_set_pd(double hi, double lo) { __m128d r; r.__d[0] = lo; r.__d[1] = hi; return r; }
+static inline __m128d _mm_setr_pd(double lo, double hi) { __m128d r; r.__d[0] = lo; r.__d[1] = hi; return r; }
+static inline __m128d _mm_load_pd(const double *p) { __m128d r; r.__d[0] = p[0]; r.__d[1] = p[1]; return r; }
+static inline __m128d _mm_loadu_pd(const double *p) { __m128d r; memcpy(&r, p, 16); return r; }
+static inline __m128d _mm_load1_pd(const double *p) { return _mm_set1_pd(*p); }
+#define _mm_load_pd1 _mm_load1_pd
+static inline void _mm_store_pd(double *p, __m128d a) { p[0] = a.__d[0]; p[1] = a.__d[1]; }
+static inline void _mm_storeu_pd(double *p, __m128d a) { memcpy(p, &a, 16); }
+static inline __m128d _mm_add_pd(__m128d a, __m128d b) { a.__d[0] += b.__d[0]; a.__d[1] += b.__d[1]; return a; }
+static inline __m128d _mm_sub_pd(__m128d a, __m128d b) { a.__d[0] -= b.__d[0]; a.__d[1] -= b.__d[1]; return a; }
+static inline __m128d _mm_mul_pd(__m128d a, __m128d b) { a.__d[0] *= b.__d[0]; a.__d[1] *= b.__d[1]; return a; }
+static inline __m128d _mm_div_pd(__m128d a, __m128d b) { a.__d[0] /= b.__d[0]; a.__d[1] /= b.__d[1]; return a; }
 static inline __m128 _mm_set_ss(float w) { __m128 r; r.__f[0] = w; r.__f[1] = 0.0f; r.__f[2] = 0.0f; r.__f[3] = 0.0f; return r; }
 static inline __m128 _mm_setzero_ps(void) { __m128 r; r.__f[0] = 0.0f; r.__f[1] = 0.0f; r.__f[2] = 0.0f; r.__f[3] = 0.0f; return r; }
 static inline float _mm_cvtss_f32(__m128 a) { return a.__f[0]; }
