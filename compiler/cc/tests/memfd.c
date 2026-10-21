@@ -1,7 +1,9 @@
 /* <linux/memfd.h>: an anonymous shared memory file as WebCore's
    SharedMemoryUnix makes one (syscall(__NR_memfd_create, name,
-   MFD_CLOEXEC)), sized, written, mapped and read back. */
+   MFD_CLOEXEC)), sized, written, mapped and read back; and a POSIX shared
+   memory object (shm_open, shm_unlink) as it makes one otherwise. */
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -22,5 +24,15 @@ int main(void) {
     munmap(map, 4096);
     close(fd);
     printf("flags %u %u %u\n", MFD_CLOEXEC, MFD_ALLOW_SEALING, MFD_HUGE_2MB >> MFD_HUGE_SHIFT);
+    int shm = shm_open("/MlxSharedMemoryTest", O_CREAT | O_EXCL | O_RDWR, 0600);
+    printf("shm_open %d", shm >= 0);
+    if (shm >= 0) {
+        printf(" write %d", (int)write(shm, "abc", 3));
+        int first = shm_unlink("/MlxSharedMemoryTest");
+        int again = shm_unlink("/MlxSharedMemoryTest");
+        printf(" unlink %d again %d", first, again == -1 && errno == ENOENT);
+        close(shm);
+    }
+    printf(" bad %d\n", shm_open("/a/b", O_RDWR, 0) == -1 && errno == EINVAL);
     return 0;
 }

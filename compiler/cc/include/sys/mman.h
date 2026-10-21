@@ -40,4 +40,6 @@ int mincore(void *, size_t, unsigned char *);
 int msync(void *, size_t, int);
 int mlock(const void *, size_t);
 int munlock(const void *, size_t);
+int shm_open(const char *, int, mode_t);
+int shm_unlink(const char *);
 #endif
