@@ -189,6 +189,11 @@ pub const LirBuilder = struct {
     // symbol table (`Box(u32).get`); none when ownerNameLength is 0.
     ownerNamePointer: [*]const u8
     ownerNameLength: usize
+    // The aggregates enclosing the one whose methods are lowered (a nested
+    // `pub const Iterator = struct { ... }` names the members of the
+    // aggregate it is in), the innermost last.
+    enclosingOwners: [8]usize
+    enclosingOwnerCount: usize
     blockCounter: usize
     breakTarget: usize
     continueTarget: usize
@@ -283,6 +288,8 @@ pub fn init(
             .generatedGenericInstances = 0,
             .ownerNamePointer = @ptrFromInt([*]const u8, 0),
             .ownerNameLength = 0,
+            .enclosingOwners = undefined,
+            .enclosingOwnerCount = 0,
             .blockCounter = 0,
             .breakTarget = lir.NONE,
             .continueTarget = lir.NONE,
@@ -638,13 +645,47 @@ fn lowerAggregateDeclarations(builder: *LirBuilder, declaration: usize) -> void 
     if !binding_symbol.0 { return }
     const owner_type = symbols_store.Store.get(builder.*.symbolStore, binding_symbol.1).*.valueTypeId
     if owner_type == 0 { return }
+    lowerAggregateMembers(builder, aggregate_index, owner_type)
+}
+
+// The methods of the aggregate at `aggregate_index`, whose type is
+// `owner_type`, and of the aggregates its constants declare (`pub const
+// Iterator = struct { ... }`), with each as `Self` of its own.
+fn lowerAggregateMembers(builder: *LirBuilder, aggregate_index: usize, owner_type: usize) -> void {
+    const nodes = getNodes(builder)
+    const aggregate = ast_store.Store.get(nodes, aggregate_index)
     const saved_owner = builder.*.currentMethodOwner
+    const saved_owner_name = builder.*.ownerNamePointer
+    const saved_owner_name_length = builder.*.ownerNameLength
     builder.*.currentMethodOwner = owner_type
     var member = aggregate.lhs
     var visited: usize = 0
     while member != ast.NONE && visited < aggregate.rhs {
         const value = ast_store.Store.get(nodes, member)
         if value.tag == ast.Tag.function_declaration && !isGenericDeclaration(nodes, member) { lowerFunction(builder, member) }
+        if value.tag == ast.Tag.constant_declaration && value.rhs != ast.NONE {
+            var nested_index = value.rhs
+            var nested = ast_store.Store.get(nodes, nested_index)
+            if nested.tag == ast.Tag.nocopy_type && nested.lhs != ast.NONE {
+                nested_index = nested.lhs
+                nested = ast_store.Store.get(nodes, nested_index)
+            }
+            if nested.tag == ast.Tag.struct_type || nested.tag == ast.Tag.enum_type || nested.tag == ast.Tag.union_type {
+                const constant = aggregateMethodIndex(builder, owner_type, tokenPointer(builder, value.mainToken), tokenLength(builder, value.mainToken))
+                if constant != lir.NONE {
+                    const nested_type = symbols_store.Store.get(builder.*.symbolStore, constant).*.valueTypeId
+                    if nested_type != 0 && builder.*.enclosingOwnerCount < 8 {
+                        if builder.*.ownerNameLength != 0 { setOwnerName(builder, nested_type) }
+                        builder.*.enclosingOwners[builder.*.enclosingOwnerCount] = owner_type
+                        builder.*.enclosingOwnerCount += 1
+                        lowerAggregateMembers(builder, nested_index, nested_type)
+                        builder.*.enclosingOwnerCount -= 1
+                        builder.*.ownerNamePointer = saved_owner_name
+                        builder.*.ownerNameLength = saved_owner_name_length
+                    }
+                }
+            }
+        }
         member = value.next
         visited += 1
     }
@@ -940,16 +981,7 @@ fn lowerInstanceMethods(builder: *LirBuilder) -> bool {
         builder.*.currentMethodOwner = record.*.typeId
         builder.*.currentGenericInstance = lir.NONE
         setOwnerName(builder, record.*.typeId)
-        const nodes = getNodes(builder)
-        const aggregate = ast_store.Store.get(nodes, record.*.node)
-        var member = aggregate.lhs
-        var visited: usize = 0
-        while member != ast.NONE && visited < aggregate.rhs {
-            const value = ast_store.Store.get(nodes, member)
-            if value.tag == ast.Tag.function_declaration && !isGenericDeclaration(nodes, member) { lowerFunction(builder, member) }
-            member = value.next
-            visited += 1
-        }
+        lowerAggregateMembers(builder, record.*.node, record.*.typeId)
         builder.*.ownerNamePointer = saved_owner_name
         builder.*.ownerNameLength = saved_owner_name_length
         builder.*.scopeOverride = saved_scope
@@ -3172,11 +3204,10 @@ fn referencedSymbolIndex(builder: *LirBuilder, node_index: usize) -> (bool, usiz
         const scope = currentScope(builder)
         if node.tag == ast.Tag.identifier || node.tag == ast.Tag.named_type {
             // In a method, a bare name is first a member of the owner (a
-            // helper function, a constant), as its scope has it.
-            if builder.*.currentMethodOwner != lir.NONE {
-                const member_index = aggregateMethodIndex(builder, builder.*.currentMethodOwner, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
-                if member_index != lir.NONE { return -> (true, member_index) }
-            }
+            // helper function, a constant) or of an aggregate enclosing
+            // it, as its scope has it.
+            const member_index = ownerMemberIndex(builder, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+            if member_index != lir.NONE { return -> (true, member_index) }
             return scope_module.Scope.lookup(scope, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
         }
         if node.tag == ast.Tag.field_expression && node.lhs != ast.NONE {
@@ -3265,6 +3296,21 @@ fn aggregateMethodIndex(builder: *LirBuilder, owner_type: usize, pointer: [*]con
         const candidate_owner = types_store.Store.get(builder.*.typeStore, symbols_store.Store.get(store, index).*.ownerTypeId)
         if candidate_owner.*.kind == owner.*.kind && candidate_owner.*.bits == owner.*.bits { return index }
         at = symbols_store.Store.nextNamed(store, index)
+    }
+    return lir.NONE
+}
+
+// A member (a method, a constant) of the aggregate whose method is being
+// lowered, or of one enclosing it, by name: its symbol, or NONE.
+fn ownerMemberIndex(builder: *LirBuilder, pointer: [*]const u8, length: usize) -> usize {
+    if builder.*.currentMethodOwner == lir.NONE { return lir.NONE }
+    const direct = aggregateMethodIndex(builder, builder.*.currentMethodOwner, pointer, length)
+    if direct != lir.NONE { return direct }
+    var level = builder.*.enclosingOwnerCount
+    while level > 0 {
+        level -= 1
+        const enclosing = aggregateMethodIndex(builder, builder.*.enclosingOwners[level], pointer, length)
+        if enclosing != lir.NONE { return enclosing }
     }
     return lir.NONE
 }
@@ -3763,13 +3809,11 @@ fn lowerIdentifier(builder: *LirBuilder, main_token: usize) -> usize {
         return primary
     }
 
-    if builder.*.currentMethodOwner != lir.NONE {
-        const member_index = aggregateMethodIndex(builder, builder.*.currentMethodOwner, name_ptr, name_len)
-        if member_index != lir.NONE {
-            const member = symbols_store.Store.get(builder.*.symbolStore, member_index)
-            const value = lowerSymbolValue(builder, member_index, member, moduleForSymbol(builder, member_index))
-            if value != lir.NONE { return value }
-        }
+    const member_index = ownerMemberIndex(builder, name_ptr, name_len)
+    if member_index != lir.NONE {
+        const member = symbols_store.Store.get(builder.*.symbolStore, member_index)
+        const value = lowerSymbolValue(builder, member_index, member, moduleForSymbol(builder, member_index))
+        if value != lir.NONE { return value }
     }
     if hasScope(builder) {
         unsafe {
@@ -4818,6 +4862,10 @@ fn lowerBlock(builder: *LirBuilder, node_index: usize) -> usize {
     var child = n.lhs
     var last_val = lir.NONE
     const defer_depth = builder.*.deferredNodes.*.length
+    // The block's names are its own: gone after it, as sema has them,
+    // so a name declared before it is seen again after it.
+    const bindings_length = builder.*.bindings.*.length
+    const components_length = builder.*.bindingComponents.*.length
     while child != ast.NONE {
         const cn = ast_store.Store.get(nodes, child)
         last_val = lowerNode(builder, child)
@@ -4825,6 +4873,8 @@ fn lowerBlock(builder: *LirBuilder, node_index: usize) -> usize {
     }
     emitDefersTo(builder, defer_depth)
     builder.*.deferredNodes.*.length = defer_depth
+    builder.*.bindings.*.length = bindings_length
+    builder.*.bindingComponents.*.length = components_length
     return last_val
 }
 
