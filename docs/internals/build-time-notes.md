@@ -302,3 +302,174 @@ units (lever 5), brings a WebCore unit under 2 GB resident.
    measured did. The three above together are the rest of the path:
    the snapshot removes the prefix from every WebCore unit, the lookups
    and keys a third of what is left, and `-j 4` doubles the throughput.
+
+## Results: frontend (branch mlxcc-speed-frontend, 2026-10-21)
+
+Stages 3 and 4 of the list, worked on beside mlxcc-speed (above) from
+the same baseline (30ca2d6) and merged into it at the end. Measured as
+above (bash `time`'s user time of the one compile, nothing heavy
+beside it), each row after the previous; every row made the same
+objects as the baseline, byte for byte.
+
+| mlx-cc (built as the baseline was: default level, no `inline`) | WTF `WTFString.cpp` user | WebCore `UnifiedSource-workers-2.cpp` user |
+|---|---|---|
+| baseline (30ca2d6) | 4.77 s | 150.9 s |
+| 1. a (prefix, name) memo of `findJoined`'s answer, misses included; NRVO choices per function | 3.11 s | 113.6 s |
+| 2. a template's instances by key, waiting bodies and outer parameters by object | 3.25 s | 57.6 s |
+| 3. + 4. qualified names made from the pair, not from the text; the include search's answers remembered | 2.80 s | 50.8 s |
+| 5. what a lookup found remembered by name; directives and inline namespaces by prefix | 2.65 s | 46.4 s |
+| 6. a class's line of bases kept by class | 2.86 s | 45.3 s |
+| 7. the mangled code of a class name kept by name | 2.63 s | – |
+| **merged with mlxcc-speed (48a2f10: `inline` accessors, `-O3`, its own forms of 1b, 2, 4, 6)** | **2.21 s** (48a2f10 alone: 3.07 s) | **35.6 s** (48a2f10 alone: 50.4 s) |
+| 8. texts written by the word (`putText`, 15% of the merged profile's self time) | 2.0 s | 32.7 s |
+
+Against the first baseline, then: WTF's file 4.77 s → 2.0 s (2.4×),
+the WebCore unit 150.9 s → 32.7 s (4.6×), the two branches together.
+
+Rows 1b (NRVO), 2, 4 and 6 were done on both branches in the same
+week; the merge keeps mlxcc-speed's forms (fields of Obj and Class, one
+table of instances, its include-path cache) with one difference kept
+from here: the bases' version moves on *after* a base is added, not
+before `completeIfNeeded` of the base, which may ask for the class's
+line meanwhile and would keep it without the base.
+
+### What changed, algorithmically
+
+All of it is the same answer found without the walk; nothing changes
+what a name means (the gate below).
+
+- **Qualified-name misses remembered** (base.findJoined, table.mlx for
+  the tables). `scope.lookup` asks `prefix::name` for every prefix
+  around and every namespace a using-directive names, and almost every
+  such pair misses; each miss hashed the joined text and probed the
+  names. base now keeps a (prefix, name) → id table with the misses in
+  it. A remembered miss must be corrected when the name is made later
+  by any route: `intern` splits a new name at its last "::" and, when
+  both halves are names, writes the pair; misses are remembered only
+  for a `name` without "::" of its own (an instance key with a
+  qualified argument, `Vector<WTF::String>`, is asked whole each time),
+  so that the last split is always the pair asked. `scope.qualify`,
+  which *makes* the name, goes through `base.internJoined`: the hash
+  continues from the prefix's stored hash, the text is written once,
+  the pair is written into the table without a scan.
+- **Lookups remembered by name** (scope.mlx). What `lookupOutward`
+  found for a name (the walk over the prefixes and the directives) is
+  kept in a per-name slot with a stamp of the context; the stamp moves
+  on with the prefix stack, a using-directive, a block left that had
+  directives, suspend/resume, and a parent set on an existing name.
+  A binding made at file scope forgets its own name's slot (and, for a
+  name with "::" in it, everything). Lambdas and local classes, which
+  see the function's types through the suspended scopes
+  (`exposeSuspended`), keep the walk. The local fast path (a binding
+  at depth > 0) comes first, as before.
+- **Directives and inline namespaces by prefix**: `findQualified`
+  walked every namespace's using-directives and inline namespaces to
+  find the prefix's own; both are chains per prefix now.
+- **The mangled code of a class name by name** (mangle.classCode):
+  every instance key spells its arguments' types, and `emitType`
+  split the qualified name at each "::" and spelt the components each
+  time; the code is a function of the name's text.
+- Per-function NRVO lists, instances by key, pending bodies and outer
+  parameters by object, the class line and the include search: as in
+  mlxcc-speed's stage 1 (see above; both branches found the same
+  walks from the same profile).
+
+### What the counts say (MLX_CC_STATS plus a temporary counter per function, the WebCore unit, after row 5)
+
+| Calls | Function | |
+|---|---|---|
+| 22.9 M | `cpp.classAndBases` | a fresh list each: 355 MB (row 6 keeps it) |
+| 12.5 M | `scope.findQualified` | mostly from `findInherited` (1.7 M) over the bases |
+| 11.4 M | `decl.isTypename` | 9.4 M `qualifiedTypedef`: 3.7 M memo hits, 5.7 M real readings |
+| 4.9 M | `cpp.injectedClass` | asked at the end of nearly every unqualified name that is no type |
+| 4.3 M | `base.intern` | 645 k new names; 1.62 M names in all |
+| 4.2 M | `cpp.completeIfNeeded` | |
+| 3.4 M | `scope.lookupOutward` | the walks left after the memo (before: every lookup) |
+| 1.76 M | `cpp.convertible` | overload resolution: 708 k `chooseInstance`, 434 k `bestOverload` |
+| 821 k | `template.instanceKey` | 728 k `classTypeHere`, 400 k `instantiateClassAt` of which 59 k new |
+| 392 k | `template.instantiateFunction` | 95 k new, 73.5 k constraints evaluated |
+
+### Stage 4, measured: where instantiation's time is
+
+Instance bodies are not re-lexed: the pattern's tokens are kept and
+`cursor.restore` walks them; what `ensureDefinedNow` (23% with calls
+after row 6) and `instantiateClass` (77%, nested) spend is the parse of
+the instance (`declspec`/`isTypename`/`readQualifiedTypedef`, 100%+
+with calls, recursive), which is the semantic work, and whose lookup
+side the rows above made cheap. What is left per mention of an
+instance is `instanceKey` (15%: the key built as text from the
+arguments' mangled types, then interned: 821 k texts of 50–150 bytes)
+and `readArguments`/`parseArguments` (48% with calls, mostly the
+nested instantiations they cause). Per new function instance,
+`constraintHolds` is 31% with calls (requires-clauses evaluated with
+their own instantiations), `chooseInstance` 45% (deduction and scoring
+per candidate per call), `convertible` 37%. A parsed-once pattern AST
+would replace the parse per instance with a substitution per instance;
+it is a rewrite of the template reader (the parser reads tokens
+everywhere), not done. Caching a constraint's or a conversion's answer
+per (template, arguments) would be the next cut, but mlx-cc resolves
+names at the point of use, so an answer can change as declarations
+are read: not exact, not done.
+
+### The gate (merged compiler against 48a2f10 built the same way)
+
+- tools/check_cpp.sh (380 programs, with three new: `lookupremembered`
+  — names declared after a lookup missed them under a prefix, through
+  namespaces, classes, using-declarations and -directives, ADL, a
+  directive in a block, lambdas and a local class, a namespace
+  reopened; `nrvochoices` — returns of a local in place, per function
+  around lambdas, local classes and instances; `instancesbykey` —
+  instances named many times, members defined after them, bodies that
+  wait), tools/check_cc.sh and tools/check_glib.sh pass (380 C++ programs on glibc and on mlxlibc).
+- `jsc/UnifiedSource-runtime-1.cpp`, `-bytecode-1`, `-dfg-1`, `-b3-1`
+  and `wtf/text/WTFString.cpp`, `text/StringImpl.cpp`, `HashTable.cpp`
+  (the flags as projects/webkit/build.mlx composes them) are byte-identical to 48a2f10's objects, their dependency files too; the WebCore unit's object is identical for every row.
+- The WTF probes w.cpp, y.cpp, z.cpp print what the baseline's builds
+  print (sorted 1 2 3).
+
+Observatory on the result: `unused compiler/cc` names nothing new
+(table.mlx's per-template helpers, left over by the merge, were
+removed on its word); `copies` found `hasScope` twice (now one, in
+base); `callees scope.mlx:lookup` is the memo and `lookupOutward`;
+`complex` is as in stage 1 (`readQualifiedTypedef` 130 branches is
+untouched: the memo sits in front of it).
+
+### What remains, and the prefix snapshot (stage 5)
+
+The WebCore unit's profile after the merge, before row 8 (4349 samples; self time: `putText` 15%, `joinedEntry` 11.5% — the memo's probes, cache misses on a table of millions of pairs —, `tokens.is` 8%, `ast.make` 7.5%, `putWord` 7%, `cursor.isToken` 5%, `hashOf` 4.4%, `probeJoined` 4%, `completeNestedScope` 4% — the deferred nested classes, a list walked by name for every `N::` step) is now
+spread: the accessors' loads (`get32`, `getWord`, `putText`: cache
+misses on a 4 GB arena), `instanceKey`, the overload machinery, the
+constraint evaluations. None is a walk any more. The large constant
+left is the prefix: 25.8 s and 1.7 GB of every WebCore unit (stage 2
+above). A design for the snapshot, not done:
+
+1. **Make the arena's address fixed** (base.init: `mmap` with a hint
+   and `MAP_FIXED_NOREPLACE`, failing the run if taken), so that every
+   address kept in it — tokens, nodes, types, bindings, the name table
+   — is valid in a later process. mlx-cc's state is the arena plus the
+   module-level `var`s of its ~30 modules (base's table addresses,
+   scope's heads and stacks, cpp's `classByPrefix`, template's lists,
+   preprocess's macros and once-marks, the counters), all words or
+   small structs; the only addresses that point outside the arena are
+   the program's own literals copied into it, which are at the same
+   place in the same binary.
+2. **Snapshot after the prefix**: a run with `-include` files and an
+   empty main file (`--prefix-snapshot FILE`) stops when the main
+   file's first token is reached and writes the arena's used part and
+   every module's `var`s (a `save`/`restore` pair per module,
+   mechanical; a check compiles a unit with and without the snapshot
+   and compares the objects). The file is keyed by the compiler
+   binary's hash, the flags (`-D`, `-I`, `-std`, `-include`) and the
+   dependency list the prefix produced (paths, sizes, mtimes).
+3. **Restore**: `mmap` the file at the fixed address, `MAP_PRIVATE`:
+   the 1.7 GB is read from the page cache and shared between the
+   parallel units until written (copy-on-write), so the unit's own
+   resident set starts near 0 and the prefix's parse costs nothing.
+   The dependency list restored keeps `-MD` right.
+4. **What it buys**: ~26 s of every WebCore unit's time and 1.7 GB of
+   its peak (so `-j 4` on 15 GB), one snapshot per flag set (WebCore,
+   JSC and WTF differ in their defines; the build makes it as a step
+   the units depend on, 30 s and 1.7 GB of disk each). With the units
+   at ~20 s of processor time after it and `-j 4`, 1250 WebCore units
+   are ~1.7 h; the 40-minute build needs stage 2's code-per-function
+   (the peak) and the instance keys and overload work above as well.
