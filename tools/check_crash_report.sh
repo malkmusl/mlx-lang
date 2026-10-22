@@ -127,6 +127,7 @@ echo "ok   every program build.mlx declares installs the crash report"
 # report of a compiler crash is what the probe above checked.
 mkdir -p "$work/cc"
 "$compiler" --quiet compiler/cc/main.mlx -o "$work/cc/mlx-cc" || fail "mlx-cc does not build"
+"$compiler" --quiet compiler/ld/main.mlx -o "$work/cc/mlx-ld" || fail "mlx-ld does not build"
 ln -s "$repo_root/compiler/cc/include" "$work/cc/include"
 printf 'typedef struct { char buffer[65536]; int n; } Async;\nint main(void) { Async a = { 0 }; return a.n; }\n' > "$work/async.c"
 set +e

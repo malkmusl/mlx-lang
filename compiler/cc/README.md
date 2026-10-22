@@ -7,10 +7,13 @@ x86_64 ELF itself through the Mlx compiler's own encoder, object writer
 and linker (`compiler/selfhost/backend/x86_64/encoder.mlx`,
 `compiler/selfhost/object/relocatable.mlx`, `link.mlx`,
 `elf64_dynamic.mlx`): there is no assembler and no GNU linker in
-between. The programs call the C library through `libc.so.6`, which is
+between. The linker is a program of its own, `mlx-ld`
+(`compiler/ld/main.mlx`), which mlx-cc runs for every link as cc runs
+ld (below). The programs call the C library through `libc.so.6`, which is
 mlxlibc (`compiler/libc`) on MLX/Linux and glibc elsewhere.
 
     mlx-out/bin/compiler/mlx4 compiler/cc/main.mlx -o mlx-cc
+    mlx-out/bin/compiler/mlx4 compiler/ld/main.mlx -o mlx-ld   # beside it
     MLX_CC_INCLUDE=compiler/cc/include ./mlx-cc -o hello hello.c
     ./hello                                   # on the system's loader
     mlx-out/libc/libmlxc.so.1 ./hello         # on mlxlibc alone
@@ -23,6 +26,8 @@ mlxlibc (`compiler/libc`) on MLX/Linux and glibc elsewhere.
            [-L DIR] [-lNAME] [--dynamic-linker PATH] [-MD|-MMD] [-MF DEP] [-MT TARGET]
            [-s] [-Wl,-Map=FILE] FILE.c... [FILE.o...] [LIB.a...]
     mlx-ar rcs LIB.a FILE.o...  |  mlx-ar t LIB.a  |  mlx-ar x LIB.a
+    mlx-ld [-o OUT] [--dynamic-linker PATH] [-s] [-Map FILE] [-L DIR] [-lNAME] [-l:FILE]
+           FILE.o... LIB.a... LIB.so...
 
 The `.c` files given together are compiled as one, each a translation
 unit of its own (its own macros and scope), their names linked by name,
@@ -36,13 +41,61 @@ ordinary C compiler made with `-fPIE` link too, in either direction
 (`tools/check_link.sh`). `-lNAME` takes `libNAME.a` from a `-L`
 directory when there is one, else the shared `libNAME.so`; `-lm` is
 `libm.so.6` (glibc's, or the one built next to mlxlibc) and
-`-lpthread`, `-ldl` and `-lrt` are part of the C library. `-E` writes
+`-lpthread`, `-ldl` and `-lrt` are part of the C library.
+
+The link is mlx-ld's: mlx-cc compiles the `.c` files into the one
+object, resolves `-L`/`-l` (and adds mlxlibcpp for C++), and then
+runs `mlx-ld` in its own place (execve: the compiler's memory is gone
+before the link starts), handing it the object as it is in memory
+(`compiler/selfhost/object/unit.mlx`, in a memfd: the linker sees the
+same sections, symbols and relocations in the same order, so the
+program is byte for byte what the linker inside mlx-cc made) followed
+by the `.o` and `.a` files in order, `-l:SONAME` for each library the
+program needs, `--dynamic-linker`, `-s` and `-Map`. mlx-ld is `$MLX_LD`,
+else `mlx-ld` beside mlx-cc (`mlx build cc` puts both in mlx-out/bin).
+`mlx-cc -c` never runs it. Being two programs is what lets `mlx build`
+keep them apart: an object step's result depends on mlx-cc alone, a link
+step names mlx-ld as an input, so a change to the linker relinks the
+programs and compiles no object again. `-E` writes
 the preprocessed tokens instead. `-MD` (or `-MMD`) writes make's rule of
 the source and every file it included and embedded, at `-MF`'s path
 (else the output's with `.d`) naming `-MT`'s target (else the output):
 what `mlx build` reads to rebuild an object when a header changed. Options of other compilers that change
 nothing here (`-O2`, `-g`, `-Wall`, `-fPIC`, `-pthread` ...) are
 accepted silently.
+
+## The code generation epoch
+
+`mlx build` keys mlx-cc's objects not by mlx-cc's bytes but by
+`CODEGEN_EPOCH` (`epoch.mlx`; `mlx-cc --codegen-epoch` prints it,
+`--codegen-epoch=FILE` writes the stamp the `mlx-cc-epoch` step of
+build.mlx makes; docs/reference/build-system.md, "Programs keyed by an
+epoch"). A change to mlx-cc that keeps it keeps every object of every
+checkout's cache valid; only units that failed before compile again.
+
+**Bump `CODEGEN_EPOCH` in the commit of any change that can change an
+object's bytes (or its `-MD` file) for a source that compiled before**:
+code generation, the ABI and layouts, vtables, mangling, the symbols
+and what an object holds or leaves out and their order, constant
+evaluation and the choices it feeds (sizeof, constexpr results,
+overloads, templates), the predefined macros, the object format, the
+line-table symbols. **No bump** for a change that only makes failing
+code compile, makes compiling faster or leaner with the same objects,
+or touches diagnostics, warnings, the crash report's wiring, the
+driver's options, `-E`, `MLX_CC_STATS` or the linker (mlx-ld is keyed by
+its bytes). When in doubt, bump: a bump costs a rebuild, a missing one
+stale objects in every cache.
+
+A forgotten bump is caught by `mlx build --verify-epoch N` (N cached
+objects compiled again and compared; `tools/check_codegen_epoch.sh`
+runs it on 20 of WTF's units). A check that fails when codegen files
+change without a bump is not there on purpose: which files decide the
+bytes is most of compiler/cc (the parser's overload and template
+choices, interp.mlx's constant evaluation, the headers' semantics), and
+most changes to them (the speed and memory work, the features that made
+WebKit compile) changed no object; such a check would cry wolf on nearly
+every commit, and an alarm that is always on gets bumped through. The
+comparison of real objects does not.
 
 ## The C variants
 
@@ -130,8 +183,9 @@ in `/usr/local/lib/mlx-cc/include`.
 | Types and syntax tree | `types.mlx`, `ast.mlx` |
 | Parser | `cursor.mlx`, `state.mlx`, `scope.mlx`, `decl.mlx`, `initializer.mlx`, `expr.mlx`, `stmt.mlx`, `typing.mlx`, `eval.mlx` |
 | Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
-| Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through `compiler/selfhost/object/link.mlx`), `ar.mlx` (mlx-ar) |
+| Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through mlx-ld), `compiler/ld/main.mlx` (mlx-ld: `compiler/selfhost/object/link.mlx` as a program, the link map), `ar.mlx` (mlx-ar) |
 | The C variant | `standard.mlx` (`-std=`: the macros, the keywords) |
+| Prefix snapshots | `snapshot.mlx` (below) |
 | Driver | `main.mlx` |
 
 The code generator is a stack machine on rax (xmm0 for floating values),
@@ -169,6 +223,45 @@ each frame's function. (A line table of every statement's line is not
 written yet; the marks are where it would come from.) `-s` (or
 `--strip-all`, `-Wl,-s`) leaves the tables out. `-Wl,-Map=FILE` writes
 the functions by their offsets in the code.
+
+### Prefix snapshots
+
+    mlx-cc --write-prefix-snapshot P.snap FLAGS -include P.h [-MD -MF P.snap.d]
+    mlx-cc --prefix-snapshot P.snap FLAGS -include P.h -c unit.cpp -o unit.o
+
+A unit's `-include` files (WebKit's `WebCorePrefix.h` and what it
+includes: thousands of headers, the same in every unit of a target) are
+read before the file, preprocessed and parsed, and the file is read
+after them, always in these two parts. `--write-prefix-snapshot` writes
+the compiler's whole state at that point: the arena's used pages (it
+lies at a fixed address, `base.ARENA_BASE`, so every address in it is
+valid in another run of the same binary; zero pages are holes in the
+file) and every module-level variable of the compiler's modules (each
+module's `keepState()`, which `tools/cc_snapshot_state.py` writes from
+the declarations; a variable marked `// (per run)` is left out, as the
+run's own memory is: the command line's texts, the link's inputs and the
+object writer's buffers are in a side region after the arena). With
+`--prefix-snapshot` a run maps the pages back where they were
+(`MAP_PRIVATE`: the page cache's copy, shared by every unit built at the
+same time until a unit writes to a page) and reads only its file. The
+object is the one the run would have made without the snapshot, byte for
+byte (tools/check_cpp.sh compares them), and so is the `-MD` file.
+
+A snapshot is taken only when it is the state the run would have
+reached; otherwise the run reads the prefix and says why: the key (a
+hash of the compiler's binary and its path, the working directory, the
+language, `MLX_CC_INCLUDE` and `MLX_CC_READ_ALL_BODIES`, and the options
+that change the compilation in their order: all but `-o`, `-c`, `-MD`
+and its kind, the link's and the files), the variables' layout, every
+file the prefix read (its size and a hash of its contents; one written
+again with the same contents keeps its `#pragma once` mark), and, for
+every directory searched whose time changed since, that the search
+would still find what it found (no name it missed there is there now).
+Nothing of the prefix depends on the file that reads it: the file's
+path is given to the compiler after the prefix, and the prefix's
+lambdas and unnamed namespace are named after the prefix's identity (its
+options) in every run, with a snapshot or without. The prefix's
+warnings are said again by a run that takes the snapshot.
 
 ## What is there
 
