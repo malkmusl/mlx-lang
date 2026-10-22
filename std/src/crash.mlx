@@ -26,6 +26,18 @@
 // the frame pointers for the callers. Without a name an address is shown
 // as the file and the offset in it.
 //
+// A C or C++ program mlx-cc linked has the functions' own names in its
+// symbol table, a C++ one's mangled; the report says the C++ spelling
+// after it (std.demangle), and where the function was defined from the
+// line table the linker made of mlx-cc's marks:
+//
+//     webcore-dump: crashed: segmentation fault touching 0x0
+//       at _ZN7WebCore4Node11appendChildERS0_+0x1f (WebCore::Node::appendChild(WebCore::Node&)) defined at Source/WebCore/dom/Node.cpp:812
+//
+// The file is mapped (read-only) once for all the frames in it, and its
+// functions sorted by address once into memory the handler maps, so a
+// program of a few hundred thousand functions is named by binary search.
+//
 // It also keeps the crash: a line in $XDG_STATE_HOME/mlx/crashes.log
 // (~/.local/state/mlx/crashes.log) through std.diagnostics, which MLX
 // Observatory reads to flag the functions that crashed (std.gpu keeps the
@@ -43,6 +55,7 @@ const std = @import("std")
 const diagnostics = @import("std.diagnostics")
 const leaks = @import("std.leaks")
 const turns = @import("std.turns")
+const demangle = @import("std.demangle")
 
 const SA_SIGINFO: usize = 4
 const SA_ONSTACK: usize = 134217728
@@ -545,10 +558,61 @@ fn memfdPath(path: [*]const u8, into: [*]u8) -> bool {
     return found
 }
 
+// The file the last address was named from: mapped read-only, with its
+// functions sorted by address (pairs of words: the address, the symbol's
+// offset in the file), both kept for the next frame in the same file.
+var cachedPath: [4096]u8 = undefined
+var cachedPathLength: usize = 0
+var cachedImage: usize = 0
+var cachedSize: usize = 0
+var cachedIndex: usize = 0
+var cachedIndexBytes: usize = 0
+var cachedCount: usize = 0
+// The symbol table the index is of, and its strings.
+var cachedSymbols: usize = 0
+var cachedSymbolsSize: usize = 0
+var cachedStrings: usize = 0
+var cachedStringsSize: usize = 0
+const STT_FUNC: usize = 2
+const SHT_SYMTAB: usize = 2
+const SHT_DYNSYM: usize = 11
+
 // Looks `in_file` (an offset in the ELF file at `path`) up in its symbol
 // table, or its dynamic symbols; writes name+0xOFFSET when found. A memfd
 // module is read through the descriptor that holds it.
 fn nameInFile(path: [*]const u8, in_file: usize, exact: bool, out: [*]u8, out_length: *usize) -> bool {
+    var length: usize = 0
+    while path[length] != 0 && length < 4095 { length += 1 }
+    var same = length == cachedPathLength && cachedImage != 0
+    var index: usize = 0
+    while same && index < length {
+        if cachedPath[index] != path[index] { same = false }
+        index += 1
+    }
+    if !same {
+        forgetFile()
+        if !mapFile(path) { return false }
+        index = 0
+        while index < length {
+            cachedPath[index] = path[index]
+            index += 1
+        }
+        cachedPathLength = length
+    }
+    return nameInImage(cachedImage, cachedSize, in_file, exact, out, out_length)
+}
+
+fn forgetFile() -> void {
+    if cachedImage != 0 { _ = std.linux.syscall2(std.linux.SYS_munmap, cachedImage, cachedSize) }
+    if cachedIndex != 0 { _ = std.linux.syscall2(std.linux.SYS_munmap, cachedIndex, cachedIndexBytes) }
+    cachedImage = 0
+    cachedIndex = 0
+    cachedCount = 0
+    cachedSymbols = 0
+    cachedPathLength = 0
+}
+
+fn mapFile(path: [*]const u8) -> bool {
     var descriptor_path: [32]u8 = undefined
     var opened = path
     if memfdPath(path, &descriptor_path) {
@@ -557,16 +621,115 @@ fn nameInFile(path: [*]const u8, in_file: usize, exact: bool, out: [*]u8, out_le
     const file = std.linux.syscall3(std.linux.SYS_open, @intFromPtr(opened), 0, 0)
     if file < 0 { return false }
     const size = std.linux.syscall3(std.linux.SYS_lseek, @bitCast(usize, file), 0, 2)
-    var found = false
-    if size > 64 {
-        const mapped = std.linux.syscall6(std.linux.SYS_mmap, 0, @bitCast(usize, size), 1, 2, @bitCast(usize, file), 0)
-        if mapped >= 0 {
-            found = nameInImage(@bitCast(usize, mapped), @bitCast(usize, size), in_file, exact, out, out_length)
-            _ = std.linux.syscall2(std.linux.SYS_munmap, @bitCast(usize, mapped), @bitCast(usize, size))
-        }
-    }
+    var mapped: isize = -1
+    if size > 64 { mapped = std.linux.syscall6(std.linux.SYS_mmap, 0, @bitCast(usize, size), 1, 2, @bitCast(usize, file), 0) }
     std.linux.close(file)
-    return found
+    if mapped < 0 { return false }
+    cachedImage = @bitCast(usize, mapped)
+    cachedSize = @bitCast(usize, size)
+    indexImage(cachedImage, cachedSize)
+    return true
+}
+
+// The functions of the image's symbol table (else its dynamic symbols:
+// a C library's), sorted by address into memory of the handler's own.
+fn indexImage(image: usize, size: usize) -> void {
+    const magic = bytesAt(image)
+    if magic[0] != 127 || magic[1] != 69 || magic[2] != 76 || magic[3] != 70 || magic[4] != 2 { return }
+    const section_offset = read64(image, 40)
+    const section_count = read16(image, 60)
+    if section_offset + section_count * 64 > size { return }
+    var kind = SHT_SYMTAB
+    while kind != 0 && cachedSymbols == 0 {
+        var index: usize = 0
+        while index < section_count {
+            const header = section_offset + index * 64
+            if read32(image, header + 4) == kind {
+                const strings_header = section_offset + read32(image, header + 40) * 64
+                const symbols = read64(image, header + 24)
+                const symbols_size = read64(image, header + 32)
+                const strings = read64(image, strings_header + 24)
+                const strings_size = read64(image, strings_header + 32)
+                if symbols + symbols_size <= size && strings + strings_size <= size && symbols_size >= 24 {
+                    cachedSymbols = symbols
+                    cachedSymbolsSize = symbols_size
+                    cachedStrings = strings
+                    cachedStringsSize = strings_size
+                }
+                break
+            }
+            index += 1
+        }
+        kind = if kind == SHT_SYMTAB { SHT_DYNSYM } else { 0 }
+    }
+    if cachedSymbols == 0 { return }
+    // The defined functions.
+    var count: usize = 0
+    var at = cachedSymbols
+    while at + 24 <= cachedSymbols + cachedSymbolsSize {
+        if isFunction(image, at) { count += 1 }
+        at += 24
+    }
+    if count == 0 { return }
+    cachedIndexBytes = (count * 16 + 4095) & 18446744073709547520
+    const memory = std.linux.mapAnonymous(cachedIndexBytes)
+    if memory == 0 { return }
+    const list: [*]usize = unsafe { @ptrFromInt([*]usize, memory) }
+    var entry: usize = 0
+    at = cachedSymbols
+    while at + 24 <= cachedSymbols + cachedSymbolsSize {
+        if isFunction(image, at) {
+            list[entry * 2] = read64(image, at + 8)
+            list[entry * 2 + 1] = at
+            entry += 1
+        }
+        at += 24
+    }
+    sortPairs(list, count)
+    cachedIndex = memory
+    cachedCount = count
+}
+
+// A defined function (STT_FUNC with a section: not an import).
+fn isFunction(image: usize, at: usize) -> bool {
+    const kind = @intCast(usize, bytesAt(image + at + 4)[0] & 15)
+    return kind == STT_FUNC && read16(image, at + 6) != 0 && read64(image, at + 8) != 0
+}
+
+// Heap sort of `count` pairs of words by their first.
+fn sortPairs(list: [*]usize, count: usize) -> void {
+    if count < 2 { return }
+    var start = count / 2
+    while start > 0 {
+        start -= 1
+        siftPairs(list, start, count)
+    }
+    var end = count
+    while end > 1 {
+        end -= 1
+        swapPairs(list, 0, end)
+        siftPairs(list, 0, end)
+    }
+}
+
+fn swapPairs(list: [*]usize, first: usize, second: usize) -> void {
+    const value = list[first * 2]
+    const symbol = list[first * 2 + 1]
+    list[first * 2] = list[second * 2]
+    list[first * 2 + 1] = list[second * 2 + 1]
+    list[second * 2] = value
+    list[second * 2 + 1] = symbol
+}
+
+fn siftPairs(list: [*]usize, start: usize, end: usize) -> void {
+    var root = start
+    while root * 2 + 1 < end {
+        var child = root * 2 + 1
+        if child + 1 < end && list[(child + 1) * 2] > list[child * 2] { child += 1 }
+        if list[root * 2] >= list[child * 2] { return }
+        swapPairs(list, root, child)
+        root = child
+    }
 }
 
 fn read16(image: usize, at: usize) -> usize {
@@ -602,33 +765,57 @@ fn nameInImage(image: usize, size: usize, in_file: usize, exact: bool, out: [*]u
         }
         index += 1
     }
-    if !placed { return false }
-    const section_offset = read64(image, 40)
-    const section_count = read16(image, 60)
-    if section_offset + section_count * 64 > size { return false }
-    // The symbol table, else the dynamic symbols (C libraries).
-    var kind: usize = 2
-    while kind != 0 {
-        index = 0
-        while index < section_count {
-            const header = section_offset + index * 64
-            if read32(image, header + 4) == kind {
-                const strings_header = section_offset + read32(image, header + 40) * 64
-                if nameInSymbols(image, size, read64(image, header + 24), read64(image, header + 32), read64(image, strings_header + 24), read64(image, strings_header + 32), address, exact, out, out_length) {
-                    lineInImage(image, size, address, out, out_length)
-                    return true
-                }
-            }
-            index += 1
-        }
-        kind = if kind == 2 { 11 } else { 0 }
+    if !placed || cachedCount == 0 { return false }
+    // The last function starting at or before the address (binary
+    // search), back past those that end before it.
+    const list: [*]const usize = unsafe { @ptrFromInt([*]const usize, cachedIndex) }
+    var low: usize = 0
+    var high = cachedCount
+    while low < high {
+        const middle = (low + high) / 2
+        if list[middle * 2] <= address { low = middle + 1 } else { high = middle }
     }
-    return false
+    var found = false
+    var steps: usize = 0
+    var start: usize = 0
+    var symbol: usize = 0
+    while low > 0 && steps < 16 && !found {
+        low -= 1
+        steps += 1
+        start = list[low * 2]
+        symbol = list[low * 2 + 1]
+        const extent = read64(image, symbol + 16)
+        if extent == 0 || address < start + extent { found = true }
+    }
+    if !found { return false }
+    const name_offset = read32(image, symbol)
+    if name_offset >= cachedStringsSize { return false }
+    const name = bytesAt(image + cachedStrings + name_offset)
+    var length: usize = 0
+    while name_offset + length < cachedStringsSize && name[length] != 0 { length += 1 }
+    putBytes(out, out_length, name, length)
+    put(out, out_length, "+")
+    putHex(out, out_length, if exact { address - start } else { address + 1 - start })
+    // A C++ name: as it is written.
+    if demangle.isMangled(name[0..length]) {
+        var text: [1024]u8 = undefined
+        const text_bytes: [*]u8 = &text
+        const written = demangle.demangle(name[0..length], text_bytes, 1024)
+        if written > 0 {
+            put(out, out_length, " (")
+            putBytes(out, out_length, text_bytes, written)
+            put(out, out_length, ")")
+        }
+    }
+    lineInImage(image, size, address, start, out, out_length)
+    return true
 }
 
 // The line `address` is on, from the compiler's line table (.mlx_lines):
-// " at path:line" after the function's name.
-fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length: *usize) -> void {
+// " at path:line" after the function's name. A table of where each
+// function was defined (MLXFUNCS, the one the linker makes of mlx-cc's
+// marks) says " defined at path:line", for the function at `start` only.
+fn lineInImage(image: usize, size: usize, address: usize, start: usize, out: [*]u8, out_length: *usize) -> void {
     const section_offset = read64(image, 40)
     const section_count = read16(image, 60)
     const names_index = read16(image, 62)
@@ -648,7 +835,9 @@ fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length
         }
         index += 1
     }
-    if table == 0 || table + table_size > size || table_size < 16 || address < text_address { return }
+    if table == 0 || table + table_size > size || table_size < 16 || address < text_address || start < text_address { return }
+    // "MLXFUNCS" or "MLXLINES".
+    const functions = bytesAt(image + table)[3] == 70
     const entries = read32(image, table + 8)
     const files = read32(image, table + 12)
     if 16 + entries * 12 > table_size { return }
@@ -660,8 +849,14 @@ fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length
         const middle = (low + high) / 2
         if read32(image, table + 16 + middle * 12) <= offset { low = middle + 1 } else { high = middle }
     }
-    if low == 0 { return }
-    const entry = table + 16 + (low - 1) * 12
+    // (An entry before the function's start is another function's: in
+    // its first instructions, before the first line's, the address is on
+    // the function's first line.)
+    var entry = table + 16 + (if low == 0 { 0 } else { low - 1 }) * 12
+    if low == 0 || read32(image, entry) < start - text_address {
+        if functions || low >= entries { return }
+        entry = table + 16 + low * 12
+    }
     const file = read32(image, entry + 4)
     const line = read32(image, entry + 8)
     if file >= files { return }
@@ -674,37 +869,10 @@ fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length
     }
     var length: usize = 0
     while at + length < table + table_size && bytesAt(image + at)[length] != 0 { length += 1 }
-    put(out, out_length, " at ")
+    put(out, out_length, if functions { " defined at " } else { " at " })
     putBytes(out, out_length, bytesAt(image + at), length)
     put(out, out_length, ":")
     putNumber(out, out_length, line)
-}
-
-fn nameInSymbols(image: usize, size: usize, symbols: usize, symbols_size: usize, strings: usize, strings_size: usize, address: usize, exact: bool, out: [*]u8, out_length: *usize) -> bool {
-    if symbols + symbols_size > size || strings + strings_size > size { return false }
-    var best_value: usize = 0
-    var best_name: usize = 0
-    var found = false
-    var at = symbols
-    while at + 24 <= symbols + symbols_size {
-        const kind = bytesAt(image + at + 4)[0] & 15
-        const value = read64(image, at + 8)
-        const extent = read64(image, at + 16)
-        if kind == 2 && value <= address && (address < value + extent || extent == 0) && (!found || value > best_value) {
-            best_value = value
-            best_name = read32(image, at)
-            found = true
-        }
-        at += 24
-    }
-    if !found || best_name >= strings_size { return false }
-    const name = bytesAt(image + strings + best_name)
-    var length: usize = 0
-    while best_name + length < strings_size && name[length] != 0 { length += 1 }
-    putBytes(out, out_length, name, length)
-    put(out, out_length, "+")
-    putHex(out, out_length, if exact { address - best_value } else { address + 1 - best_value })
-    return true
 }
 
 // Whether the page holding `address` is mapped (the stack ends somewhere

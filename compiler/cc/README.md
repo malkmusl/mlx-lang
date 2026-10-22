@@ -21,7 +21,7 @@ mlxlibc (`compiler/libc`) on MLX/Linux and glibc elsewhere.
 
     mlx-cc [-o OUT] [-std=VARIANT] [-E] [-c] [-I DIR] [-D NAME[=VALUE]] [-U NAME]
            [-L DIR] [-lNAME] [--dynamic-linker PATH] [-MD|-MMD] [-MF DEP] [-MT TARGET]
-           FILE.c... [FILE.o...] [LIB.a...]
+           [-s] [-Wl,-Map=FILE] FILE.c... [FILE.o...] [LIB.a...]
     mlx-ar rcs LIB.a FILE.o...  |  mlx-ar t LIB.a  |  mlx-ar x LIB.a
 
 The `.c` files given together are compiled as one, each a translation
@@ -154,6 +154,21 @@ such as `stdout` alike), and makes `_start` and `__mlxcc_init`, which
 writes the addresses held by data and runs the init functions before
 `main(argc, argv, envp)`. Static functions nothing refers to are left
 out.
+
+A program carries its symbol table (`.symtab`, `.strtab`): every
+function and variable of the objects linked, local and global, with
+the objects' types, bindings and sizes (a function without a size gets
+the distance to the next one), section symbols for `.text` and `.data`,
+and the linker's own `_start`, `__mlxcc_init` and `NAME@plt` stubs, so
+`nm`, `readelf`, `perf` and gdb name the functions, and the crash
+report (std.crash) names a crash's frames with them (demangled for
+C++). Each function's object marks where it was defined (a local
+`@at PATH:LINE` symbol), and the linker makes the line table
+`.mlx_lines` of those marks: the crash report says the file and line of
+each frame's function. (A line table of every statement's line is not
+written yet; the marks are where it would come from.) `-s` (or
+`--strip-all`, `-Wl,-s`) leaves the tables out. `-Wl,-Map=FILE` writes
+the functions by their offsets in the code.
 
 ## What is there
 

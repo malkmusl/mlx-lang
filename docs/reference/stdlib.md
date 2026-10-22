@@ -159,7 +159,13 @@ function and its callers (from the symbol table the compiler writes, see
 [formats](formats.md); a frame in a module loaded from a memfd, as the
 compositor's shell module is, is named through `/proc/self/fd`) and keeps
 the crash in
-`$XDG_STATE_HOME/mlx/crashes.log`; `fail(reason)` ends the program the same
+`$XDG_STATE_HOME/mlx/crashes.log`. A C or C++ program mlx-cc linked is
+named from the symbol table its linker writes (the file mapped once, its
+functions sorted by address once, then a binary search per frame): a
+C++ frame says the mangled name and, from `std.demangle` (an Itanium
+demangler that allocates nothing, `demangle(name, out, capacity)`), the
+name as it is written, then "defined at FILE:LINE" from the line table
+the linker makes of mlx-cc's marks. `fail(reason)` ends the program the same
 way for a failure it cannot go on after. The report goes to stderr. Every
 program `build.mlx` declares installs it first thing in `main` (the
 desktop, the services, the tools and examples, the toolchain: `mlx-cc`,

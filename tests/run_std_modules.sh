@@ -79,6 +79,8 @@
 #   tests/375_fontconfig_runtime.mlx    std.fontconfig: case folding, names,
 #                                       languages; fonts of the tree read,
 #                                       cached, matched, sorted, listed
+#   tests/392_demangle_runtime.mlx     std.demangle: C++ names as c++filt
+#                                       writes them, and mlx-cc's own
 #
 #   tests/run_std_modules.sh [compiler]
 set -euo pipefail
@@ -145,6 +147,7 @@ run 384_crypto_mpi_rsa_runtime "integers of any size: hex, signed division both 
 run 385_flate_gzip_runtime "gzip files written and read in pieces, two members as one, a plain file as it is, trailing data left, damaged and truncated members refused"
 run 386_hash_runtime "wyhash against its reference's vectors, words combined, autoHash and autoEql by type (integers, bools, enums, floats, pointers, optionals, slices, arrays), the string context"
 run 390_heap_runtime "the program's heap: one wherever it is asked for, in the shared region, blocks and their footprints, a GiB reserved, the debug allocator over it under the leak check, deinit"
+run 392_demangle_runtime "C++ names as c++filt writes them (g++'s and clang++'s manglings) and mlx-cc's own spellings; names it cannot read; a cut text"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
