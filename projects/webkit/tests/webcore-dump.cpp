@@ -1,8 +1,10 @@
 // webcore-dump: a page loaded and laid out headless, its render tree
 // printed (PORT.md, M3), as WebKit's test runners print a layout test's
-// (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp).
+// (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
+// painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS] FILE|URL
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS]
+//                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
 // strategies and loader; WebCore's empty clients for the rest) with a main
@@ -15,6 +17,15 @@
 // runner's test fonts (Ahem); fonts are matched by std.fontconfig with the environment's
 // configuration (FONTCONFIG_FILE). Exit status: 0, 1 when the page did not
 // load (still dumped), 2 for a bad command line.
+//
+// --png paints the view (the frame's whole viewport, scrollbars included)
+// into a Skia raster surface (CPU, N32 premultiplied, on white) through
+// GraphicsContextSkia and writes it as a PNG (std.png, the port's
+// mlxweb_image_write_png). --reference compares the painting with a PNG
+// (decoded by the port's decoder): a pixel differs when a channel of it
+// differs by more than CHANNEL (2 by default); more than PIXELS such
+// pixels (0 by default) make the exit status 3. The count and the largest
+// difference go to standard error.
 //
 // Built by ./mlx build webkit-mlx-webcore-dump (mlx-out/webkit/mlx/bin);
 // tools/check_webkit_mlx_layout.sh runs it on WebKit's layout tests.
@@ -33,6 +44,7 @@
 #include "EmptyClients.h"
 #include "FrameLoadRequest.h"
 #include "FontRenderOptions.h"
+#include "GraphicsContextSkia.h"
 #include "FrameLoader.h"
 #include "LocalFrame.h"
 #include "LocalFrameInlines.h"
@@ -52,6 +64,9 @@
 #include "port/embed/MlxFrameLoaderClient.h"
 #include "port/embed/MlxPlatformStrategies.h"
 #include <JavaScriptCore/InitializeThreading.h>
+#include <memory>
+#include <skia/core/SkCanvas.h>
+#include <skia/core/SkSurface.h>
 #include <pal/SessionID.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,26 +79,6 @@
 #include <wtf/text/MakeString.h>
 
 using namespace WebCore;
-
-// TEMPORARY DEBUG: a deep backtrace on SIGTRAP/SIGABRT/SIGSEGV/SIGILL.
-#include <signal.h>
-#include <ucontext.h>
-static void debugBacktrace(int signal, siginfo_t*, void* context)
-{
-    auto* uc = static_cast<ucontext_t*>(context);
-    uintptr_t rip = uc->uc_mcontext.gregs[REG_RIP];
-    uintptr_t* rbp = reinterpret_cast<uintptr_t*>(uc->uc_mcontext.gregs[REG_RBP]);
-    fprintf(stderr, "DEBUG signal %d at %lx\n", signal, (unsigned long)rip);
-    for (int i = 0; i < 400 && rbp; ++i) {
-        uintptr_t next = rbp[0];
-        uintptr_t ret = rbp[1];
-        fprintf(stderr, "DEBUG frame %lx\n", (unsigned long)ret);
-        if (next <= reinterpret_cast<uintptr_t>(rbp) || next - reinterpret_cast<uintptr_t>(rbp) > 8 * 1024 * 1024)
-            break;
-        rbp = reinterpret_cast<uintptr_t*>(next);
-    }
-    _exit(99);
-}
 
 // --boxes: after the tree, each inline's boxes and each text's boxes as
 // the inline layout made them, unrounded (where the tree's integers come
@@ -111,8 +106,67 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
+}
+
+// The view painted into PIXELS (WIDTH x HEIGHT words, 0xAARRGGBB
+// premultiplied): white, then the frame view as a window paints it.
+static bool paintView(LocalFrame& frame, IntSize size, uint32_t* pixels)
+{
+    RefPtr view = frame.view();
+    if (!view)
+        return false;
+    view->updateLayoutAndStyleIfNeededRecursive();
+    auto info = SkImageInfo::MakeN32Premul(size.width(), size.height());
+    auto surface = SkSurfaces::WrapPixels(info, pixels, size.width() * sizeof(uint32_t));
+    if (!surface)
+        return false;
+    surface->getCanvas()->clear(SK_ColorWHITE);
+    GraphicsContextSkia context(*surface->getCanvas(), RenderingMode::Unaccelerated, RenderingPurpose::Snapshot);
+    view->paint(context, IntRect({ }, size));
+    return true;
+}
+
+// The pixels that differ from the PNG at PATH by more than TOLERANCE in a
+// channel; -1 when it cannot be read or is of another size. LARGEST: the
+// largest difference of a channel.
+static long differingPixels(const char* path, IntSize size, const uint32_t* pixels, int tolerance, int& largest)
+{
+    largest = 0;
+    FILE* file = fopen(path, "rb");
+    if (!file)
+        return -1;
+    Vector<uint8_t> bytes;
+    uint8_t chunk[65536];
+    size_t count;
+    while ((count = fread(chunk, 1, sizeof(chunk), file)) > 0)
+        bytes.append(std::span<const uint8_t> { chunk, count });
+    fclose(file);
+    auto image = mlxweb_image_decode(MLXWEB_IMAGE_PNG, bytes.span().data(), bytes.size());
+    if (!image)
+        return -1;
+    long differing = -1;
+    if (mlxweb_image_width(image) == static_cast<size_t>(size.width()) && mlxweb_image_height(image) == static_cast<size_t>(size.height())) {
+        differing = 0;
+        auto* reference = mlxweb_image_pixels(image);
+        for (int i = 0; i < size.width() * size.height(); ++i) {
+            // (The painting is opaque; the reference's pixels over white.)
+            uint32_t pixel = pixels[i];
+            int ours[3] = { static_cast<int>((pixel >> 16) & 255), static_cast<int>((pixel >> 8) & 255), static_cast<int>(pixel & 255) };
+            int alpha = reference[i * 4 + 3];
+            int worst = 0;
+            for (int c = 0; c < 3; ++c) {
+                int theirs = (reference[i * 4 + c] * alpha + 255 * (255 - alpha) + 127) / 255;
+                worst = std::max(worst, std::abs(theirs - ours[c]));
+            }
+            largest = std::max(largest, worst);
+            if (worst > tolerance)
+                ++differing;
+        }
+    }
+    mlxweb_image_destroy(image);
+    return differing;
 }
 
 // The page's state as the loop sees it.
@@ -170,6 +224,10 @@ int main(int argc, char** argv)
     bool script = true;
     bool subpixel = false;
     bool boxes = false;
+    const char* pngPath = nullptr;
+    const char* referencePath = nullptr;
+    int tolerance = 2;
+    long allowed = 0;
     double timeout = 60;
     Vector<const char*> fonts;
     const char* target = nullptr;
@@ -188,6 +246,14 @@ int main(int argc, char** argv)
             subpixel = true;
         else if (!strcmp(argv[i], "--boxes"))
             boxes = true;
+        else if (!strcmp(argv[i], "--png") && i + 1 < argc)
+            pngPath = argv[++i];
+        else if (!strcmp(argv[i], "--reference") && i + 1 < argc)
+            referencePath = argv[++i];
+        else if (!strcmp(argv[i], "--tolerance") && i + 1 < argc)
+            tolerance = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--allow") && i + 1 < argc)
+            allowed = atol(argv[++i]);
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
             timeout = atof(argv[++i]);
         else if (argv[i][0] == '-' || target)
@@ -195,16 +261,9 @@ int main(int argc, char** argv)
         else
             target = argv[i];
     }
-    if (!target)
+    if (!target || (referencePath && !pngPath))
         return usage();
 
-    if (getenv("MLX_DEBUG_BACKTRACE")) {
-        struct sigaction action { };
-        action.sa_sigaction = debugBacktrace;
-        action.sa_flags = SA_SIGINFO;
-        for (int sig : { SIGTRAP, SIGABRT, SIGSEGV, SIGILL, SIGBUS })
-            sigaction(sig, &action, nullptr);
-    }
     JSC::initialize();
     WTF::initializeMainThread();
     initializeCommonAtomStrings();
@@ -314,6 +373,24 @@ int main(int argc, char** argv)
         if (boxes && run.frame->contentRenderer())
             dumpInlineBoxes(*run.frame->contentRenderer());
         fflush(stdout);
+        if (pngPath) {
+            auto pixels = std::make_unique<uint32_t[]>(static_cast<size_t>(viewSize.width()) * viewSize.height());
+            if (!paintView(*run.frame, viewSize, pixels.get()) || !mlxweb_image_write_png(pngPath, pixels.get(), viewSize.width(), viewSize.height(), viewSize.width(), 0)) {
+                fprintf(stderr, "webcore-dump: cannot paint the view into %s\n", pngPath);
+                status = 1;
+            } else if (referencePath) {
+                int largest = 0;
+                long differing = differingPixels(referencePath, viewSize, pixels.get(), tolerance, largest);
+                if (differing < 0) {
+                    fprintf(stderr, "webcore-dump: %s is no PNG of %dx%d\n", referencePath, viewSize.width(), viewSize.height());
+                    status = 3;
+                } else {
+                    fprintf(stderr, "webcore-dump: %ld pixels differ from %s by more than %d (largest difference %d)\n", differing, referencePath, tolerance, largest);
+                    if (differing > allowed)
+                        status = 3;
+                }
+            }
+        }
         mainClient->setLoadFinishedCallback(nullptr);
         run.frame = nullptr;
     }
