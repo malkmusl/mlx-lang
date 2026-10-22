@@ -201,7 +201,25 @@ for pair in shared:shared.h lambdaunits:units.h lambdaodr:lambdas.h constexprmem
     "$s/program" > "$s/out" 2>&1 || fail "$dir from the snapshot exits with $?"
     cmp -s "$tests/$dir/expected" "$s/out" || fail "$dir from the snapshot prints otherwise (expected < > got): $(diff "$tests/$dir/expected" "$s/out" | head -6)"
 done
-echo "ok   prefix snapshots: the objects of 6 tests of two files are those made without one"
+# Programs of one file cut before main: what precedes it (classes with
+# virtual and deleting destructors, explicit instantiations, generic
+# lambdas, member templates) as the prefix.
+for name in deletingdestructor explicitinstance genericlambdatypes lambdamembertemplate; do
+    s="$work/snap/$name"
+    mkdir -p "$s"
+    line=$(grep -n '^int main' "$tests/$name.cpp" | head -1 | cut -d: -f1)
+    head -n $((line - 1)) "$tests/$name.cpp" > "$s/prefix.h"
+    tail -n +"$line" "$tests/$name.cpp" > "$s/unit.cpp"
+    "$cc" --write-prefix-snapshot "$s/prefix.snap" -include "$s/prefix.h" -x c++ 2> "$s/write.err" || fail "$name: the snapshot of its prefix is not written: $(head -3 "$s/write.err")"
+    "$cc" -include "$s/prefix.h" -c -o "$s/plain.o" "$s/unit.cpp" 2> "$s/unit.err" || fail "$name with -include: $(head -3 "$s/unit.err")"
+    "$cc" --prefix-snapshot "$s/prefix.snap" -include "$s/prefix.h" -c -o "$s/unit.o" "$s/unit.cpp" 2> "$s/unit.err" || fail "$name from the snapshot: $(head -3 "$s/unit.err")"
+    [[ ! -s "$s/unit.err" ]] || fail "$name from the snapshot: the compiler said: $(head -3 "$s/unit.err")"
+    cmp -s "$s/plain.o" "$s/unit.o" || fail "$name: the object made from the snapshot differs"
+    "$cc" -x c++ -o "$s/program" "$s/unit.o" 2> "$s/link.err" || fail "linking $name from the snapshot: $(head -3 "$s/link.err")"
+    run "$name" "$s/program" "$s/out"
+    cmp -s "$tests/$name.expected" "$s/out" || fail "$name from the snapshot prints otherwise (expected < > got): $(diff "$tests/$name.expected" "$s/out" | head -6)"
+done
+echo "ok   prefix snapshots: the objects of 6 tests of two files and of 4 cut before main are those made without one"
 s="$work/snap/stale"
 mkdir -p "$s/first" "$s/second"
 printf '#pragma once\nstruct Dep { int v = 7; };\n' > "$s/second/dep.h"
