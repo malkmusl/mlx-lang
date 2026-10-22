@@ -64,6 +64,33 @@ what `mlx build` reads to rebuild an object when a header changed. Options of ot
 nothing here (`-O2`, `-g`, `-Wall`, `-fPIC`, `-pthread` ...) are
 accepted silently.
 
+## The code index
+
+`--index=DIR` (or `MLX_CC_INDEX=DIR` in the environment, which leaves
+the command line, and so `mlx build`'s cache keys, as they are) writes
+what the compiler resolved while compiling into DIR, for MLX Codemap
+(`mlx-codemap`, tools/codemap/cpp.mlx): every declaration (functions,
+variables, classes and their data members, macros; with the class it is
+in, its linker name, where its definition and body are) and every use
+(calls, reads, writes, types, base classes, overrides, macro
+expansions, definitions apart from their declaration, `#include`s),
+each use naming the declaration it resolved to. The index is a shard
+per file read, named by its path and contents (`index.mlx` describes
+the text): a header indexed by one unit is not written again by the
+next, so indexing a whole build costs each header once. A template's
+instances are read from its tokens, so their uses are the template's.
+The objects are byte for byte the same with and without `--index`
+(tools/check_codemap_cpp.sh compares them; all of compiler/cc/tests
+compile alike both ways). The cost: a WebCore unit whose headers are
+indexed already takes about 3% more processor time (the walk over its
+bodies and its own file's records; what is in a header with a shard is
+not even kept), the first unit to read 2,000 headers about 13% (it
+writes their shards); mlx-cc's tests together 1%. `MLX_CC_INDEX_MAP=
+OLD=NEW` writes paths under OLD as under NEW (a tree compiled in one
+checkout, indexed for another). tools/codemap_index.sh and `mlx build
+codemap-cpp-index` make the index of the repository's C and C++
+(projects/observatory/README.md, "C and C++").
+
 ## The code generation epoch
 
 `mlx build` keys mlx-cc's objects not by mlx-cc's bytes but by
