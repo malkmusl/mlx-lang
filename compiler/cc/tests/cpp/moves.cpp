@@ -5,8 +5,9 @@
 // partial specialization with a dependent member type in a signature;
 // decltype of calls and members; declval declared only, called where
 // nothing is evaluated.
-// (The expected output is g++ -fno-elide-constructors': mlx-cc elides no
-// copy either.)
+// (The expected output is g++'s: makeBuffer's `b`, a class returned in
+// memory, is made in the caller's object (the named return value), and
+// no other copy is elided.)
 #include <cstdio>
 namespace my {
 template <class T> struct remove_reference { typedef T type; };

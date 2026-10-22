@@ -164,6 +164,16 @@ if command -v g++ > /dev/null; then
     "$work/vbaselink" > "$work/vbaselink.out" 2>&1 || fail "vbaselink exits with $?: $(tail -3 "$work/vbaselink.out")"
     cmp -s "$link/expected" "$work/vbaselink.out" || fail "vbaselink prints otherwise (expected < > got): $(diff "$link/expected" "$work/vbaselink.out" | head -6)"
     echo "ok   classes with virtual bases work across objects of g++'s and ours"
+    # Classes returned by value across objects of g++'s and ours: one not
+    # trivially copyable in memory whatever its size, a small trivially
+    # copyable one in registers (returnlink).
+    link=$tests/returnlink
+    g++ -std=c++20 -fno-rtti -fno-exceptions -fno-sized-deallocation -fPIE -O1 -c -o "$work/returnlink_gpp.o" "$link/gpp.cpp" 2> "$work/returnlink.err" || fail "g++ does not compile returnlink/gpp.cpp: $(head -3 "$work/returnlink.err")"
+    "$cc" -c -o "$work/returnlink_mlx.o" "$link/mlx.cpp" 2>> "$work/returnlink.err" || fail "-c of returnlink/mlx.cpp: $(head -3 "$work/returnlink.err")"
+    "$cc" -x c++ -o "$work/returnlink" "$work/returnlink_mlx.o" "$work/returnlink_gpp.o" 2>> "$work/returnlink.err" || fail "linking returnlink: $(head -3 "$work/returnlink.err")"
+    "$work/returnlink" > "$work/returnlink.out" 2>&1 || fail "returnlink exits with $?: $(tail -3 "$work/returnlink.out")"
+    cmp -s "$link/expected" "$work/returnlink.out" || fail "returnlink prints otherwise (expected < > got): $(diff "$link/expected" "$work/returnlink.out" | head -6)"
+    echo "ok   classes returned by value across objects of g++'s and ours, as the ABI passes them"
 fi
 
 # The same programs on mlxlibc alone.
