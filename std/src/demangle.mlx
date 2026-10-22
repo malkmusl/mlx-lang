@@ -1,0 +1,1353 @@
+// std.demangle: C++ names as the linker sees them (the Itanium C++ ABI's
+// mangling, as g++, clang++ and mlx-cc write it) as they are written in
+// C++:
+//
+//     _ZN7WebCore4Node11appendChildERNS_4NodeE
+//         WebCore::Node::appendChild(WebCore::Node&)
+//
+// The crash report (std.crash) names a C++ program's frames with it, and
+// MLX Codemap shows the names it keeps. It allocates nothing and calls
+// nothing that could (a signal handler uses it): the text goes into the
+// caller's buffer, and its tables (the substitutions, the template
+// arguments) are on the stack.
+//
+// Read: nested and local names, templates and their arguments,
+// substitutions (S_, S0_, St, Sa, Sb, Ss, Si, So, Sd), template parameters
+// (T_), operators, conversions, constructors and destructors, lambdas and
+// unnamed types, ABI tags, the builtin types, pointers, references,
+// const, volatile and restrict, arrays, functions, pointers to functions
+// and to members, pack expansions, literals as template arguments,
+// vtables, VTTs, typeinfo, guard variables, thunks, and a clone's suffix
+// (.cold, .isra.0, .constprop.0). mlx-cc's own spellings too: a class
+// template's instance is named with its arguments' codes (`9Holder<i>`
+// is `Holder<int>`), a function template's arguments may be separated by
+// commas, and values are plain numbers. Not read: expressions in template
+// arguments (X...E, decltype), vendor qualifiers, vector types; such a
+// name gives 0, and the caller shows the mangled name alone.
+//
+//     var text: [1024]u8 = undefined
+//     const length = demangle.demangle(name, &text, 1024)   // 0: not read
+
+const MAX_SUBSTITUTIONS: usize = 256
+const MAX_ARGUMENTS: usize = 32
+const MAX_DEPTH: usize = 64
+// Template argument lists open at once (each keeps where its arguments
+// are until it is read): deeper names are not read.
+const ARGUMENT_LEVELS: usize = 24
+const KIND_TYPE: u8 = 1
+const KIND_PREFIX: u8 = 2
+// A function's qualifiers (nested names: NK..., NR...).
+const QUALIFIED_CONST: usize = 1
+const QUALIFIED_VOLATILE: usize = 2
+const QUALIFIED_RESTRICT: usize = 4
+const QUALIFIED_LVALUE: usize = 8
+const QUALIFIED_RVALUE: usize = 16
+
+// The operators: their two letters, then the text after `operator`, one
+// a line.
+const OPERATORS: []const u8 = "nw new\nna new[]\ndl delete\nda delete[]\nps+\nng-\nad&\nde*\nco~\npl+\nmi-\nml*\ndv/\nrm%\nan&\nor|\neo^\naS=\npL+=\nmI-=\nmL*=\ndV/=\nrM%=\naN&=\noR|=\neO^=\nls<<\nrs>>\nlS<<=\nrS>>=\neq==\nne!=\nlt<\ngt>\nle<=\nge>=\nss<=>\nnt!\naa&&\noo||\npp++\nmm--\ncm,\npm->*\npt->\ncl()\nix[]\nqu?\naw co_await\n"
+
+const State = struct {
+    input: [*]const u8
+    // Where reading stops now, and at the name's end.
+    end: usize
+    fullEnd: usize
+    pos: usize
+    out: [*]u8
+    capacity: usize
+    length: usize
+    failed: bool
+    // Whether substitutions are recorded (not while one is read again).
+    recording: bool
+    depth: usize
+    // The substitutions: where each starts in the name (and a prefix's
+    // end), and whether it is a type or a prefix.
+    subStart: [*]usize
+    subEnd: [*]usize
+    subKind: [*]u8
+    subCount: usize
+    // The template arguments T_ names: where each is in the name.
+    argStart: [*]usize
+    argEnd: [*]usize
+    argCount: usize
+    // Where the arguments of the lists being read are: a stack of
+    // ARGUMENT_LEVELS lists of MAX_ARGUMENTS starts and ends, `argTop`
+    // words in use. (Every array a function of this module declares is a
+    // value the program keeps until its loop's turn ends: a crash handler
+    // naming many frames would run out. This module allocates its tables
+    // once a call, in demangle.)
+    argStack: [*]usize
+    argTop: usize
+    owner: [*]u8
+    ownerBusy: bool
+    // The last name read (a constructor's is its class's).
+    lastName: [*]const u8
+    lastNameLength: usize
+    // What the last name read was: its qualifiers (a member function's),
+    // whether it ended with template arguments, whether it named a
+    // constructor, a destructor or a conversion.
+    qualifiers: usize
+    endedTemplate: bool
+    endedStructor: bool
+    // Whether the name has a form only g++'s and clang++'s have (St, a
+    // substitution, a literal ended by E): a function template's
+    // result type is then in it.
+    itanium: bool
+    // Whether the name is read as mlx-cc's where the two differ (the
+    // reading tried when the other fails): a literal argument ends
+    // without an E (`auto` values: L TYPE VALUE), digits before an E are
+    // a value.
+    mlxLiterals: bool
+    // Whether the text did not fit (it is cut, with "...").
+    overflowed: bool
+}
+
+// ---------------------------------------------------------------------------
+// Reading and writing
+
+fn peek(s: *State) -> u8 {
+    if s.*.pos < s.*.end { return s.*.input[s.*.pos] }
+    return 0
+}
+
+fn peekAt(s: *State, ahead: usize) -> u8 {
+    if s.*.pos + ahead < s.*.end { return s.*.input[s.*.pos + ahead] }
+    return 0
+}
+
+fn failed(s: *State) -> bool {
+    s.*.failed = true
+    return false
+}
+
+fn putByte(s: *State, byte: u8) -> void {
+    if s.*.length < s.*.capacity {
+        s.*.out[s.*.length] = byte
+        s.*.length += 1
+    } else {
+        s.*.failed = true
+        s.*.overflowed = true
+    }
+}
+
+fn put(s: *State, text: []const u8) -> void {
+    for byte in text { putByte(s, byte) }
+}
+
+fn putBytes(s: *State, bytes: [*]const u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        putByte(s, bytes[index])
+        index += 1
+    }
+}
+
+fn putNumber(s: *State, value: usize) -> void {
+    var divisor: usize = 1
+    while value / divisor >= 10 { divisor *= 10 }
+    while divisor > 0 {
+        putByte(s, @intCast(u8, 48 + (value / divisor) % 10))
+        divisor /= 10
+    }
+}
+
+fn isDigit(byte: u8) -> bool { return byte >= 48 && byte <= 57 }
+fn isUpper(byte: u8) -> bool { return byte >= 65 && byte <= 90 }
+fn isLower(byte: u8) -> bool { return byte >= 97 && byte <= 122 }
+fn isWordByte(byte: u8) -> bool { return isDigit(byte) || isUpper(byte) || isLower(byte) || byte == 95 || byte == 36 }
+
+// A decimal number; NONE-like (false) when there is none.
+fn number(s: *State) -> (bool, usize) {
+    if !isDigit(peek(s)) { return -> (false, 0) }
+    var value: usize = 0
+    while isDigit(peek(s)) {
+        if value > 100000000 { return -> (false, 0) }
+        value = value * 10 + @intCast(usize, peek(s) - 48)
+        s.*.pos += 1
+    }
+    return -> (true, value)
+}
+
+fn expect(s: *State, byte: u8) -> bool {
+    if peek(s) != byte { return failed(s) }
+    s.*.pos += 1
+    return true
+}
+
+fn record(s: *State, start: usize, end: usize, kind: u8) -> void {
+    if !s.*.recording || s.*.subCount >= MAX_SUBSTITUTIONS { return }
+    s.*.subStart[s.*.subCount] = start
+    s.*.subEnd[s.*.subCount] = end
+    s.*.subKind[s.*.subCount] = kind
+    s.*.subCount += 1
+}
+
+fn reverse(s: *State, from: usize, to: usize) -> void {
+    var low = from
+    var high = to
+    while low + 1 < high {
+        high -= 1
+        const kept = s.*.out[low]
+        s.*.out[low] = s.*.out[high]
+        s.*.out[high] = kept
+        low += 1
+    }
+}
+
+// The text at [middle, end) moved before the text at [start, middle).
+fn rotate(s: *State, start: usize, middle: usize, end: usize) -> void {
+    reverse(s, start, middle)
+    reverse(s, middle, end)
+    reverse(s, start, end)
+}
+
+fn insertByte(s: *State, at: usize, byte: u8) -> void {
+    if s.*.length >= s.*.capacity {
+        s.*.failed = true
+        return
+    }
+    var index = s.*.length
+    while index > at {
+        s.*.out[index] = s.*.out[index - 1]
+        index -= 1
+    }
+    s.*.out[at] = byte
+    s.*.length += 1
+}
+
+// `>`, apart from one before it (`vector<allocator<int> >`, as c++filt
+// writes it).
+fn closeAngle(s: *State) -> void {
+    if s.*.length > 0 && s.*.out[s.*.length - 1] == 62 { putByte(s, 32) }
+    putByte(s, 62)
+}
+
+fn setLastName(s: *State, text: []const u8) -> void {
+    s.*.lastName = text.pointer
+    s.*.lastNameLength = text.length
+}
+
+// ---------------------------------------------------------------------------
+// The whole name
+
+// Writes the C++ spelling of the mangled `name` into `out` (`capacity`
+// bytes); its length, 0 when `name` is no mangled name this reads or the
+// text does not fit.
+pub fn demangle(name: []const u8, out: [*]u8, capacity: usize) -> usize {
+    var tables: Tables = undefined
+    return demangleWith(name, out, capacity, &tables)
+}
+
+// demangle() with its tables in `tables` (about 17 KiB): the crash
+// handler keeps one in its data, so naming a frame takes nothing of the
+// value arena, which may be what ran out.
+pub fn demangleWith(name: []const u8, out: [*]u8, capacity: usize, tables: *Tables) -> usize {
+    if name.length < 3 || name[0] != 95 || name[1] != 90 || capacity < 8 { return 0 }
+    const length = attempt(name, out, capacity, false, tables)
+    if length != 0 { return length }
+    return attempt(name, out, capacity, true, tables)
+}
+
+// A call's tables (one value, for both readings).
+pub const Tables = struct {
+    subStart: [256]usize
+    subEnd: [256]usize
+    subKind: [256]u8
+    argStart: [32]usize
+    argEnd: [32]usize
+    argStack: [1536]usize
+    // A pointer to a member's class, kept while its member is read.
+    owner: [256]u8
+}
+
+fn attempt(name: []const u8, out: [*]u8, capacity: usize, mlx_literals: bool, tables: *Tables) -> usize {
+    // A clone's suffix: from the first '.'.
+    var dot: usize = 2
+    while dot < name.length && name[dot] != 46 { dot += 1 }
+    var s = State.{ .input = name.pointer, .end = dot, .fullEnd = dot, .pos = 2, .out = out, .capacity = capacity, .length = 0, .failed = false, .recording = true, .depth = 0, .subStart = &tables.*.subStart, .subEnd = &tables.*.subEnd, .subKind = &tables.*.subKind, .subCount = 0, .argStart = &tables.*.argStart, .argEnd = &tables.*.argEnd, .argCount = 0, .argStack = &tables.*.argStack, .argTop = 0, .owner = &tables.*.owner, .ownerBusy = false, .lastName = name.pointer, .lastNameLength = 0, .qualifiers = 0, .endedTemplate = false, .endedStructor = false, .itanium = false, .mlxLiterals = mlx_literals, .overflowed = false }
+    var ok = false
+    if peek(&s) == 84 || peek(&s) == 71 {
+        ok = special(&s)
+    } else {
+        ok = encoding(&s)
+    }
+    if s.overflowed {
+        // Too long for the buffer: as much as fits, cut.
+        out[capacity - 3] = 46
+        out[capacity - 2] = 46
+        out[capacity - 1] = 46
+        return capacity
+    }
+    if !ok || s.failed || s.pos != s.end || s.length == 0 { return 0 }
+    if dot < name.length {
+        put(&s, " [clone ")
+        putBytes(&s, name.pointer + dot, name.length - dot)
+        put(&s, "]")
+    }
+    if s.failed { return 0 }
+    return s.length
+}
+
+// Whether `name` is a mangled C++ name (_Z...).
+pub fn isMangled(name: []const u8) -> bool {
+    return name.length > 2 && name[0] == 95 && name[1] == 90
+}
+
+// The vtables, typeinfo, guard variables and thunks.
+fn special(s: *State) -> bool {
+    const first = peek(s)
+    const second = peekAt(s, 1)
+    s.*.pos += 2
+    if first == 84 {
+        if second == 86 {
+            put(s, "vtable for ")
+            return type_(s)
+        }
+        if second == 84 {
+            put(s, "VTT for ")
+            return type_(s)
+        }
+        if second == 73 {
+            put(s, "typeinfo for ")
+            return type_(s)
+        }
+        if second == 83 {
+            put(s, "typeinfo name for ")
+            return type_(s)
+        }
+        if second == 72 {
+            put(s, "TLS init function for ")
+            return name_(s, false)
+        }
+        if second == 87 {
+            put(s, "TLS wrapper function for ")
+            return name_(s, false)
+        }
+        if second == 104 {
+            put(s, "non-virtual thunk to ")
+            if !callOffset(s) { return false }
+            return encoding(s)
+        }
+        if second == 118 {
+            put(s, "virtual thunk to ")
+            if !callOffset(s) || !callOffset(s) { return false }
+            return encoding(s)
+        }
+        if second == 99 {
+            put(s, "covariant return thunk to ")
+            if !skipCallOffset(s) || !skipCallOffset(s) { return false }
+            return encoding(s)
+        }
+        return failed(s)
+    }
+    if second == 86 {
+        put(s, "guard variable for ")
+        return name_(s, false)
+    }
+    if second == 82 {
+        put(s, "reference temporary for ")
+        if !name_(s, false) { return false }
+        while isDigit(peek(s)) || isUpper(peek(s)) { s.*.pos += 1 }
+        if peek(s) == 95 { s.*.pos += 1 }
+        return true
+    }
+    return failed(s)
+}
+
+// A thunk's offset: [n]NUMBER _ .
+fn callOffset(s: *State) -> bool {
+    if peek(s) == 110 { s.*.pos += 1 }
+    const offset = number(s)
+    if !offset.0 { return failed(s) }
+    return expect(s, 95)
+}
+
+// h OFFSET _ or v OFFSET _ OFFSET _ (a covariant thunk's).
+fn skipCallOffset(s: *State) -> bool {
+    const kind = peek(s)
+    s.*.pos += 1
+    if kind == 104 { return callOffset(s) }
+    if kind == 118 { return callOffset(s) && callOffset(s) }
+    return failed(s)
+}
+
+// A function's or variable's name and, for a function, its parameters.
+fn encoding(s: *State) -> bool {
+    s.*.depth += 1
+    const ok = s.*.depth < MAX_DEPTH && encodingInner(s)
+    s.*.depth -= 1
+    return ok
+}
+
+fn encodingInner(s: *State) -> bool {
+    const name_start = s.*.length
+    if !name_(s, false) { return false }
+    // mlx-cc: a function template's arguments after its nested name
+    // (_ZN2ns3maxEIiEii).
+    if peek(s) == 73 && s.*.input[s.*.pos - 1] == 69 {
+        const qualified = s.*.qualifiers
+        const structor = s.*.endedStructor
+        if !templateArguments(s, true) { return false }
+        s.*.qualifiers = qualified
+        s.*.endedTemplate = true
+        s.*.endedStructor = structor
+    }
+    const qualifiers = s.*.qualifiers
+    const has_result = s.*.endedTemplate && !s.*.endedStructor
+    // A variable: the name alone.
+    if s.*.pos >= s.*.end || peek(s) == 69 { return true }
+    // A function template's result type comes first; mlx-cc writes none.
+    const result_start = s.*.length
+    if has_result && (withResult(s) || (peek(s) == 118 && s.*.pos + 1 < s.*.end && peekAt(s, 1) != 69)) {
+        if !type_(s) { return false }
+    }
+    const result_end = s.*.length
+    if !parameters(s) { return false }
+    if qualifiers & QUALIFIED_CONST != 0 { put(s, " const") }
+    if qualifiers & QUALIFIED_VOLATILE != 0 { put(s, " volatile") }
+    if qualifiers & QUALIFIED_RESTRICT != 0 { put(s, " restrict") }
+    if qualifiers & QUALIFIED_LVALUE != 0 { put(s, " &") }
+    if qualifiers & QUALIFIED_RVALUE != 0 { put(s, " &&") }
+    if result_end > result_start && !s.*.failed {
+        rotate(s, name_start, result_start, result_end)
+        insertByte(s, name_start + result_end - result_start, 32)
+    }
+    return !s.*.failed
+}
+
+// Whether a function template's name carries its result type, as g++'s
+// and clang++'s do and mlx-cc's do not. The name does not say; theirs
+// nearly always have a form mlx-cc's (which spell every type out) never
+// do: std as St, a substitution, a literal ended by
+// E, in the name read or in the parameters to come.
+fn withResult(s: *State) -> bool {
+    if s.*.itanium { return true }
+    var at = s.*.pos
+    while at + 1 < s.*.fullEnd {
+        const byte = s.*.input[at]
+        if byte == 83 {
+            var next = at + 1
+            while next < s.*.fullEnd && (isDigit(s.*.input[next]) || isUpper(s.*.input[next])) { next += 1 }
+            if next < s.*.fullEnd && s.*.input[next] == 95 { return true }
+            if next == at + 1 && (s.*.input[next] == 116 || s.*.input[next] == 97 || s.*.input[next] == 115) { return true }
+        }
+        at += 1
+    }
+    return false
+}
+
+// `(TYPES)`: a function's parameters up to the end or an E; `v` alone is
+// none.
+fn parameters(s: *State) -> bool {
+    putByte(s, 40)
+    if peek(s) == 118 && (s.*.pos + 1 >= s.*.end || peekAt(s, 1) == 69) {
+        s.*.pos += 1
+    } else {
+        var first = true
+        while s.*.pos < s.*.end && peek(s) != 69 {
+            if !first { put(s, ", ") }
+            if !type_(s) { return false }
+            first = false
+        }
+    }
+    putByte(s, 41)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Names
+
+// A name: nested (N...E), local (Z...E), a substitution, std::, or an
+// unqualified name, each with template arguments maybe. `in_type`: the
+// name of a type (its template arguments are not the function's).
+fn name_(s: *State, in_type: bool) -> bool {
+    s.*.depth += 1
+    const ok = s.*.depth < MAX_DEPTH && nameInner(s, in_type)
+    s.*.depth -= 1
+    return ok
+}
+
+fn nameInner(s: *State, in_type: bool) -> bool {
+    const first = peek(s)
+    if first == 78 { return nested(s, in_type) }
+    if first == 90 { return local(s) }
+    const start = s.*.pos
+    const is_substitution = first == 83 && peekAt(s, 1) != 116
+    var structor = false
+    if first == 83 && peekAt(s, 1) == 116 {
+        s.*.pos += 2
+        put(s, "std::")
+        s.*.itanium = true
+        if !unqualified(s) { return false }
+        structor = s.*.endedStructor
+    } else if first == 83 {
+        if !substitution(s) { return false }
+    } else {
+        if !unqualified(s) { return false }
+        structor = s.*.endedStructor
+    }
+    var with_arguments = false
+    if peek(s) == 73 {
+        if !is_substitution { record(s, start, s.*.pos, KIND_PREFIX) }
+        if !templateArguments(s, !in_type) { return false }
+        with_arguments = true
+    }
+    s.*.qualifiers = 0
+    s.*.endedTemplate = with_arguments
+    s.*.endedStructor = structor
+    return true
+}
+
+// N [r][V][K][R|O] components E.
+fn nested(s: *State, in_type: bool) -> bool {
+    s.*.pos += 1
+    var qualifiers: usize = 0
+    if peek(s) == 114 {
+        qualifiers |= QUALIFIED_RESTRICT
+        s.*.pos += 1
+    }
+    if peek(s) == 86 {
+        qualifiers |= QUALIFIED_VOLATILE
+        s.*.pos += 1
+    }
+    if peek(s) == 75 {
+        qualifiers |= QUALIFIED_CONST
+        s.*.pos += 1
+    }
+    if peek(s) == 82 {
+        qualifiers |= QUALIFIED_LVALUE
+        s.*.pos += 1
+    } else if peek(s) == 79 {
+        qualifiers |= QUALIFIED_RVALUE
+        s.*.pos += 1
+    }
+    const start = s.*.pos
+    var first = true
+    var ended_template = false
+    var structor = false
+    while peek(s) != 69 {
+        if s.*.pos >= s.*.end { return failed(s) }
+        // (A substitution alone is one already, and std alone none: not
+        // recorded.)
+        var was_substitution = false
+        if peek(s) == 73 {
+            if first { return failed(s) }
+            if !templateArguments(s, !in_type) { return false }
+            ended_template = true
+        } else {
+            if !first { put(s, "::") }
+            ended_template = false
+            was_substitution = first && peek(s) == 83
+            if !component(s) { return false }
+            structor = s.*.endedStructor
+        }
+        first = false
+        if peek(s) != 69 && !was_substitution { record(s, start, s.*.pos, KIND_PREFIX) }
+    }
+    s.*.pos += 1
+    s.*.qualifiers = qualifiers
+    s.*.endedTemplate = ended_template
+    s.*.endedStructor = structor
+    return true
+}
+
+// One component of a nested name or a prefix: a substitution, std, a
+// template parameter, or an unqualified name.
+fn component(s: *State) -> bool {
+    s.*.endedStructor = false
+    const first = peek(s)
+    if first == 83 && peekAt(s, 1) == 116 {
+        s.*.pos += 2
+        put(s, "std")
+        s.*.itanium = true
+        return true
+    }
+    if first == 83 { return substitution(s) }
+    if first == 84 { return templateParameter(s) }
+    return unqualified(s)
+}
+
+// A prefix read again (a substitution's): its components up to `stop`.
+fn prefixUpTo(s: *State, stop: usize) -> bool {
+    var first = true
+    while s.*.pos < stop {
+        if peek(s) == 73 {
+            if !templateArguments(s, false) { return false }
+        } else {
+            if !first { put(s, "::") }
+            if !component(s) { return false }
+        }
+        first = false
+    }
+    return s.*.pos == stop
+}
+
+// Z ENCODING E (NAME | s) [discriminator].
+fn local(s: *State) -> bool {
+    s.*.pos += 1
+    if !encoding(s) { return false }
+    if !expect(s, 69) { return false }
+    put(s, "::")
+    if peek(s) == 115 {
+        s.*.pos += 1
+        put(s, "string literal")
+        s.*.qualifiers = 0
+        s.*.endedTemplate = false
+        s.*.endedStructor = false
+    } else {
+        if !name_(s, false) { return false }
+    }
+    // _N or __N_: which of the same name.
+    if peek(s) == 95 {
+        s.*.pos += 1
+        if peek(s) == 95 {
+            s.*.pos += 1
+            const which = number(s)
+            if !which.0 { return failed(s) }
+            if !expect(s, 95) { return false }
+        } else if isDigit(peek(s)) {
+            s.*.pos += 1
+        } else {
+            return failed(s)
+        }
+    }
+    return true
+}
+
+// A source name, an operator, a constructor or destructor, a lambda or
+// an unnamed type; ABI tags after it.
+fn unqualified(s: *State) -> bool {
+    s.*.endedStructor = false
+    var first = peek(s)
+    // (A name of internal linkage, as some compilers write it.)
+    if first == 76 {
+        s.*.pos += 1
+        first = peek(s)
+    }
+    const second = peekAt(s, 1)
+    if isDigit(first) {
+        if !sourceName(s) { return false }
+    } else if first == 67 && ((second >= 49 && second <= 53) || second == 73) {
+        s.*.pos += 2
+        if second == 73 {
+            // An inheriting constructor: CI1 or CI2 and the base.
+            s.*.pos += 1
+            const at = s.*.length
+            if !type_(s) { return false }
+            s.*.length = at
+        }
+        putBytes(s, s.*.lastName, s.*.lastNameLength)
+        s.*.endedStructor = true
+    } else if first == 68 && second >= 48 && second <= 53 {
+        s.*.pos += 2
+        putByte(s, 126)
+        putBytes(s, s.*.lastName, s.*.lastNameLength)
+        s.*.endedStructor = true
+    } else if first == 85 && second == 116 {
+        s.*.pos += 2
+        const which = number(s)
+        if !expect(s, 95) { return false }
+        put(s, "{unnamed type#")
+        putNumber(s, if which.0 { which.1 + 2 } else { 1 })
+        putByte(s, 125)
+    } else if first == 85 && second == 108 {
+        s.*.pos += 2
+        put(s, "{lambda")
+        if !parameters(s) { return false }
+        if !expect(s, 69) { return false }
+        const which = number(s)
+        if !expect(s, 95) { return false }
+        putByte(s, 35)
+        putNumber(s, if which.0 { which.1 + 2 } else { 1 })
+        putByte(s, 125)
+    } else if isLower(first) {
+        if !operatorName(s) { return false }
+    } else {
+        return failed(s)
+    }
+    // ABI tags: B NAME.
+    while peek(s) == 66 {
+        s.*.pos += 1
+        const length = number(s)
+        if !length.0 || s.*.pos + length.1 > s.*.end { return failed(s) }
+        put(s, "[abi:")
+        putBytes(s, s.*.input + s.*.pos, length.1)
+        putByte(s, 93)
+        s.*.pos += length.1
+    }
+    return true
+}
+
+// LENGTH TEXT; the anonymous namespace's is (anonymous namespace), an
+// mlx-cc class template instance's `Name<codes>` is read as its
+// arguments.
+fn sourceName(s: *State) -> bool {
+    const length = number(s)
+    if !length.0 || length.1 == 0 || s.*.pos + length.1 > s.*.end { return failed(s) }
+    const start = s.*.pos
+    const text = s.*.input + start
+    const end = start + length.1
+    s.*.pos = end
+    if length.1 > 10 && text[0] == 95 && text[1] == 71 && text[2] == 76 && text[3] == 79 && text[4] == 66 && text[5] == 65 && text[6] == 76 && text[7] == 95 && text[8] == 95 && text[9] == 78 {
+        put(s, "(anonymous namespace)")
+        return true
+    }
+    var open: usize = 0
+    while open < length.1 && text[open] != 60 { open += 1 }
+    s.*.lastName = text
+    s.*.lastNameLength = open
+    putBytes(s, text, open)
+    if open == length.1 { return true }
+    // mlx-cc: Name<codes, ...>, read as template arguments.
+    if text[length.1 - 1] == 62 && open + 1 < length.1 {
+        const out_at = s.*.length
+        const arg_top = s.*.argTop
+        const outer_end = s.*.end
+        const recording = s.*.recording
+        s.*.recording = false
+        s.*.pos = start + open + 1
+        s.*.end = end - 1
+        putByte(s, 60)
+        var first = true
+        var ok = true
+        while ok && s.*.pos < s.*.end {
+            if peek(s) == 44 {
+                s.*.pos += 1
+            } else {
+                if !first { put(s, ", ") }
+                ok = templateArgument(s)
+                first = false
+            }
+        }
+        closeAngle(s)
+        s.*.recording = recording
+        s.*.end = outer_end
+        s.*.pos = end
+        if ok && !s.*.failed {
+            s.*.lastName = text
+            s.*.lastNameLength = open
+            return true
+        }
+        // Not read: the name as it is (unless it did not fit).
+        if s.*.overflowed { return false }
+        s.*.failed = false
+        s.*.argTop = arg_top
+        s.*.length = out_at
+        s.*.lastName = text
+        s.*.lastNameLength = open
+    }
+    putBytes(s, text + open, length.1 - open)
+    return true
+}
+
+// An operator's name: `operator+`, `operator new`, a conversion
+// `operator int`, a literal operator `operator"" _x`.
+fn operatorName(s: *State) -> bool {
+    const first = peek(s)
+    const second = peekAt(s, 1)
+    if first == 99 && second == 118 {
+        s.*.pos += 2
+        put(s, "operator ")
+        if !type_(s) { return false }
+        s.*.endedStructor = true
+        return true
+    }
+    if first == 108 && second == 105 {
+        s.*.pos += 2
+        put(s, "operator\"\" ")
+        return sourceName(s)
+    }
+    if first == 118 && isDigit(second) {
+        s.*.pos += 2
+        put(s, "operator ")
+        return sourceName(s)
+    }
+    var at: usize = 0
+    while at + 2 < OPERATORS.length {
+        var end = at + 2
+        while end < OPERATORS.length && OPERATORS[end] != 10 { end += 1 }
+        if OPERATORS[at] == first && OPERATORS[at + 1] == second {
+            s.*.pos += 2
+            put(s, "operator")
+            put(s, OPERATORS[at + 2..end])
+            return true
+        }
+        at = end + 1
+    }
+    return failed(s)
+}
+
+// S_, S<seq>_ (base 36), St, Sa, Sb, Ss, Si, So, Sd: read again.
+fn substitution(s: *State) -> bool {
+    s.*.itanium = true
+    const second = peekAt(s, 1)
+    if second == 97 || second == 98 || second == 115 || second == 105 || second == 111 || second == 100 {
+        s.*.pos += 2
+        if second == 97 {
+            put(s, "std::allocator")
+            setLastName(s, "allocator")
+        } else if second == 98 {
+            put(s, "std::basic_string")
+            setLastName(s, "basic_string")
+        } else if second == 115 {
+            put(s, "std::string")
+            setLastName(s, "basic_string")
+        } else if second == 105 {
+            put(s, "std::istream")
+            setLastName(s, "basic_istream")
+        } else if second == 111 {
+            put(s, "std::ostream")
+            setLastName(s, "basic_ostream")
+        } else {
+            put(s, "std::iostream")
+            setLastName(s, "basic_iostream")
+        }
+        return true
+    }
+    s.*.pos += 1
+    var index: usize = 0
+    if peek(s) != 95 {
+        var seq: usize = 0
+        while isDigit(peek(s)) || isUpper(peek(s)) {
+            const byte = peek(s)
+            seq = seq * 36 + (if isDigit(byte) { @intCast(usize, byte - 48) } else { @intCast(usize, byte - 65) + 10 })
+            s.*.pos += 1
+            if seq > 100000 { return failed(s) }
+        }
+        index = seq + 1
+    }
+    if !expect(s, 95) { return false }
+    if index >= s.*.subCount { return failed(s) }
+    // Read again where it was, recording nothing.
+    const pos = s.*.pos
+    const end = s.*.end
+    const recording = s.*.recording
+    s.*.recording = false
+    s.*.pos = s.*.subStart[index]
+    s.*.end = s.*.fullEnd
+    var ok = false
+    if s.*.subKind[index] == KIND_TYPE {
+        ok = type_(s)
+    } else {
+        ok = prefixUpTo(s, s.*.subEnd[index])
+    }
+    s.*.recording = recording
+    s.*.pos = pos
+    s.*.end = end
+    return ok
+}
+
+// T_ or T<n>_: a template argument of the function's (or its class's).
+fn templateParameter(s: *State) -> bool {
+    s.*.pos += 1
+    var index: usize = 0
+    if peek(s) != 95 {
+        const value = number(s)
+        if !value.0 { return failed(s) }
+        index = value.1 + 1
+    }
+    if !expect(s, 95) { return false }
+    if index >= s.*.argCount {
+        put(s, "auto")
+        return true
+    }
+    const pos = s.*.pos
+    const end = s.*.end
+    const recording = s.*.recording
+    s.*.recording = false
+    s.*.pos = s.*.argStart[index]
+    s.*.end = s.*.argEnd[index]
+    const ok = templateArgument(s)
+    s.*.recording = recording
+    s.*.pos = pos
+    s.*.end = end
+    return ok
+}
+
+// I ARGUMENT... E as <...>; `for_function`: they are the arguments T_
+// names from here on.
+fn templateArguments(s: *State, for_function: bool) -> bool {
+    s.*.pos += 1
+    // (`operator<< <T>`, as c++filt writes it.)
+    if s.*.length > 0 && s.*.out[s.*.length - 1] == 60 { putByte(s, 32) }
+    putByte(s, 60)
+    // (The names in the arguments are not the class's a constructor
+    // after them names.)
+    const last_name = s.*.lastName
+    const last_name_length = s.*.lastNameLength
+    const level = s.*.argTop
+    if level + 2 * MAX_ARGUMENTS > ARGUMENT_LEVELS * 2 * MAX_ARGUMENTS { return failed(s) }
+    s.*.argTop = level + 2 * MAX_ARGUMENTS
+    var count: usize = 0
+    while peek(s) != 69 {
+        if s.*.pos >= s.*.end { return failed(s) }
+        if peek(s) == 44 {
+            s.*.pos += 1
+        } else {
+            if count > 0 { put(s, ", ") }
+            const start = s.*.pos
+            if !templateArgument(s) { return false }
+            if count < MAX_ARGUMENTS {
+                s.*.argStack[level + count] = start
+                s.*.argStack[level + MAX_ARGUMENTS + count] = s.*.pos
+            }
+            count += 1
+        }
+    }
+    s.*.pos += 1
+    closeAngle(s)
+    s.*.lastName = last_name
+    s.*.lastNameLength = last_name_length
+    s.*.argTop = level
+    if for_function {
+        var index: usize = 0
+        while index < count && index < MAX_ARGUMENTS {
+            s.*.argStart[index] = s.*.argStack[level + index]
+            s.*.argEnd[index] = s.*.argStack[level + MAX_ARGUMENTS + index]
+            index += 1
+        }
+        s.*.argCount = if count < MAX_ARGUMENTS { count } else { MAX_ARGUMENTS }
+    }
+    return true
+}
+
+// Whether the digits here are a value (mlx-cc writes `3` for <3>), not a
+// class's name's length.
+fn isValue(s: *State) -> bool {
+    var at = s.*.pos
+    var value: usize = 0
+    while at < s.*.end && isDigit(s.*.input[at]) {
+        value = value * 10 + @intCast(usize, s.*.input[at] - 48)
+        if value > 100000000 { return true }
+        at += 1
+    }
+    if at >= s.*.end || value == 0 { return true }
+    // (After a comma: mlx-cc's list of arguments; read as mlx-cc's
+    // name, a number before an E too.)
+    var before = s.*.pos - 1
+    if s.*.input[before] == 110 { before -= 1 }
+    if s.*.input[before] == 44 || s.*.mlxLiterals { return true }
+    const next = s.*.input[at]
+    if next == 44 || next == 62 { return true }
+    if next != 69 { return false }
+    // `3E`: the end of the arguments unless a name of 3 bytes fits.
+    if at + value > s.*.end { return true }
+    var index: usize = 0
+    while index < value {
+        if !isWordByte(s.*.input[at + index]) && s.*.input[at + index] != 60 && s.*.input[at + index] != 62 && s.*.input[at + index] != 44 { return true }
+        index += 1
+    }
+    return false
+}
+
+// One template argument: a type, a literal (L...E), a pack (J...E), or
+// mlx-cc's forms: a number, `(...)` a pack, `?(...)` a dependent value,
+// `#name`, `&symbol`, `TYPE...`.
+fn templateArgument(s: *State) -> bool {
+    s.*.depth += 1
+    const ok = s.*.depth < MAX_DEPTH && templateArgumentInner(s)
+    s.*.depth -= 1
+    return ok
+}
+
+fn templateArgumentInner(s: *State) -> bool {
+    const first = peek(s)
+    if first == 76 { return literal(s) }
+    if first == 88 { return failed(s) }
+    if first == 74 || first == 40 {
+        const closing: u8 = if first == 74 { 69 } else { 41 }
+        s.*.pos += 1
+        var count: usize = 0
+        while peek(s) != closing {
+            if s.*.pos >= s.*.end { return failed(s) }
+            if peek(s) == 44 {
+                s.*.pos += 1
+            } else {
+                if count > 0 { put(s, ", ") }
+                if !templateArgument(s) { return false }
+                count += 1
+            }
+        }
+        s.*.pos += 1
+        return true
+    }
+    if first == 63 {
+        // mlx-cc: a value known only in the instance, as its tokens.
+        s.*.pos += 1
+        if peek(s) != 40 {
+            putByte(s, 63)
+            return true
+        }
+        var level: usize = 0
+        while s.*.pos < s.*.end {
+            const byte = peek(s)
+            if byte == 40 { level += 1 }
+            if byte == 41 {
+                level -= 1
+                if level == 0 {
+                    s.*.pos += 1
+                    return true
+                }
+            }
+            if level > 1 || byte != 40 { putByte(s, byte) }
+            s.*.pos += 1
+        }
+        return failed(s)
+    }
+    if first == 35 || first == 38 {
+        s.*.pos += 1
+        if first == 38 {
+            putByte(s, 38)
+            if (peek(s) == 109 || peek(s) == 111) && !(peekAt(s, 1) == 90 && peek(s) == 95) { s.*.pos += 1 }
+        }
+        while s.*.pos < s.*.end && isWordByte(peek(s)) {
+            putByte(s, peek(s))
+            s.*.pos += 1
+        }
+        return true
+    }
+    if isDigit(first) && isValue(s) {
+        const value = number(s)
+        putNumber(s, value.1)
+        return value.0
+    }
+    if first == 110 && isDigit(peekAt(s, 1)) {
+        s.*.pos += 1
+        if isValue(s) {
+            putByte(s, 45)
+            const value = number(s)
+            putNumber(s, value.1)
+            return value.0
+        }
+        s.*.pos -= 1
+    }
+    if !type_(s) { return false }
+    // mlx-cc: a pack's expansion, TYPE... .
+    if peek(s) == 46 && peekAt(s, 1) == 46 && peekAt(s, 2) == 46 {
+        s.*.pos += 3
+        put(s, "...")
+    }
+    return true
+}
+
+// L TYPE VALUE E (mlx-cc may leave the E out), L _Z ENCODING E.
+fn literal(s: *State) -> bool {
+    s.*.pos += 1
+    if peek(s) == 95 && peekAt(s, 1) == 90 {
+        s.*.pos += 2
+        if !encoding(s) { return false }
+        return expect(s, 69)
+    }
+    const kind = peek(s)
+    var suffix: []const u8 = ""
+    var boolean = false
+    if kind == 98 {
+        boolean = true
+        s.*.pos += 1
+    } else if kind == 105 || kind == 115 || kind == 99 || kind == 97 || kind == 104 || kind == 116 || kind == 110 || kind == 111 {
+        s.*.pos += 1
+    } else if kind == 106 {
+        suffix = "u"
+        s.*.pos += 1
+    } else if kind == 108 {
+        suffix = "l"
+        s.*.pos += 1
+    } else if kind == 109 {
+        suffix = "ul"
+        s.*.pos += 1
+    } else if kind == 120 {
+        suffix = "ll"
+        s.*.pos += 1
+    } else if kind == 121 {
+        suffix = "ull"
+        s.*.pos += 1
+    } else {
+        putByte(s, 40)
+        if !type_(s) { return false }
+        putByte(s, 41)
+    }
+    if peek(s) == 88 {
+        // mlx-cc: a class's value, as its bytes.
+        while s.*.pos < s.*.end && peek(s) != 69 { s.*.pos += 1 }
+        put(s, "{...}")
+        return expect(s, 69)
+    }
+    var negative = false
+    if peek(s) == 110 {
+        negative = true
+        s.*.pos += 1
+    }
+    const value = number(s)
+    if !value.0 { return failed(s) }
+    if boolean {
+        put(s, if value.1 == 0 { "false" } else { "true" })
+    } else {
+        if negative { putByte(s, 45) }
+        putNumber(s, value.1)
+        put(s, suffix)
+    }
+    if peek(s) == 69 && !s.*.mlxLiterals {
+        s.*.pos += 1
+        s.*.itanium = true
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Types
+
+fn builtin(byte: u8) -> []const u8 {
+    if byte == 118 { return "void" }
+    if byte == 119 { return "wchar_t" }
+    if byte == 98 { return "bool" }
+    if byte == 99 { return "char" }
+    if byte == 97 { return "signed char" }
+    if byte == 104 { return "unsigned char" }
+    if byte == 115 { return "short" }
+    if byte == 116 { return "unsigned short" }
+    if byte == 105 { return "int" }
+    if byte == 106 { return "unsigned int" }
+    if byte == 108 { return "long" }
+    if byte == 109 { return "unsigned long" }
+    if byte == 120 { return "long long" }
+    if byte == 121 { return "unsigned long long" }
+    if byte == 110 { return "__int128" }
+    if byte == 111 { return "unsigned __int128" }
+    if byte == 102 { return "float" }
+    if byte == 100 { return "double" }
+    if byte == 101 { return "long double" }
+    if byte == 103 { return "__float128" }
+    if byte == 122 { return "..." }
+    return ""
+}
+
+fn type_(s: *State) -> bool {
+    s.*.depth += 1
+    const ok = s.*.depth < MAX_DEPTH && typeInner(s)
+    s.*.depth -= 1
+    return ok
+}
+
+fn typeInner(s: *State) -> bool {
+    const start = s.*.pos
+    const first = peek(s)
+    const simple = builtin(first)
+    if simple.length > 0 {
+        s.*.pos += 1
+        put(s, simple)
+        return true
+    }
+    if first == 68 { return dType(s) }
+    if first == 117 {
+        s.*.pos += 1
+        if !sourceName(s) { return false }
+        record(s, start, s.*.pos, KIND_TYPE)
+        return true
+    }
+    if first == 75 || first == 86 || first == 114 {
+        var qualifiers: usize = 0
+        while peek(s) == 75 || peek(s) == 86 || peek(s) == 114 {
+            if peek(s) == 75 { qualifiers |= QUALIFIED_CONST }
+            if peek(s) == 86 { qualifiers |= QUALIFIED_VOLATILE }
+            if peek(s) == 114 { qualifiers |= QUALIFIED_RESTRICT }
+            s.*.pos += 1
+        }
+        if !type_(s) { return false }
+        if qualifiers & QUALIFIED_CONST != 0 { put(s, " const") }
+        if qualifiers & QUALIFIED_VOLATILE != 0 { put(s, " volatile") }
+        if qualifiers & QUALIFIED_RESTRICT != 0 { put(s, " restrict") }
+        record(s, start, s.*.pos, KIND_TYPE)
+        return true
+    }
+    if first == 80 || first == 82 || first == 79 {
+        s.*.pos += 1
+        const declarator: []const u8 = if first == 80 { "*" } else if first == 82 { "&" } else { "&&" }
+        if peek(s) == 70 {
+            if !functionType(s, declarator, "") { return false }
+        } else if peek(s) == 65 {
+            // To an array: `int (&) [10]`.
+            s.*.pos += 1
+            const size = number(s)
+            if !expect(s, 95) { return false }
+            if !type_(s) { return false }
+            put(s, " (")
+            put(s, declarator)
+            put(s, ") [")
+            if size.0 { putNumber(s, size.1) }
+            putByte(s, 93)
+        } else {
+            if !type_(s) { return false }
+            // References collapse: T& & and T& && are T&, T&& & is T&.
+            if first != 80 && s.*.length > 0 && s.*.out[s.*.length - 1] == 38 {
+                if first == 82 && s.*.length > 1 && s.*.out[s.*.length - 2] == 38 { s.*.length -= 1 }
+            } else {
+                put(s, declarator)
+            }
+        }
+        record(s, start, s.*.pos, KIND_TYPE)
+        return true
+    }
+    if first == 70 {
+        if !functionType(s, "", "") { return false }
+        record(s, start, s.*.pos, KIND_TYPE)
+        return true
+    }
+    if first == 65 {
+        s.*.pos += 1
+        const size = number(s)
+        if !expect(s, 95) { return false }
+        if !type_(s) { return false }
+        put(s, " [")
+        if size.0 { putNumber(s, size.1) }
+        putByte(s, 93)
+        record(s, start, s.*.pos, KIND_TYPE)
+        return true
+    }
+    if first == 77 { return memberPointer(s, start) }
+    if first == 84 {
+        if !templateParameter(s) { return false }
+        record(s, start, s.*.pos, KIND_TYPE)
+        if peek(s) == 73 {
+            if !templateArguments(s, false) { return false }
+            record(s, start, s.*.pos, KIND_TYPE)
+        }
+        return true
+    }
+    if first == 78 || first == 90 || first == 83 || isDigit(first) {
+        const bare_substitution = first == 83 && peekAt(s, 1) != 116
+        if !name_(s, true) { return false }
+        if !bare_substitution || s.*.endedTemplate { record(s, start, s.*.pos, KIND_TYPE) }
+        return true
+    }
+    return failed(s)
+}
+
+// The D types: decltype(nullptr), char16_t, char32_t, char8_t, auto,
+// decltype(auto), _BitInt, _FloatN, pack expansions.
+fn dType(s: *State) -> bool {
+    const start = s.*.pos
+    const second = peekAt(s, 1)
+    s.*.pos += 2
+    if second == 110 {
+        put(s, "decltype(nullptr)")
+        return true
+    }
+    if second == 115 {
+        put(s, "char16_t")
+        return true
+    }
+    if second == 105 {
+        put(s, "char32_t")
+        return true
+    }
+    if second == 117 {
+        put(s, "char8_t")
+        return true
+    }
+    if second == 97 {
+        put(s, "auto")
+        return true
+    }
+    if second == 99 {
+        put(s, "decltype(auto)")
+        return true
+    }
+    if second == 66 || second == 85 || second == 70 {
+        const bits = number(s)
+        if !bits.0 { return failed(s) }
+        if !expect(s, 95) { return false }
+        put(s, if second == 66 { "_BitInt(" } else if second == 85 { "unsigned _BitInt(" } else { "_Float" })
+        putNumber(s, bits.1)
+        if second != 70 { putByte(s, 41) }
+        return true
+    }
+    if second == 112 {
+        if !type_(s) { return false }
+        put(s, "...")
+        record(s, start, s.*.pos, KIND_TYPE)
+        return true
+    }
+    return failed(s)
+}
+
+// F [Y] RESULT PARAMETERS [R|O] E as `RESULT (DECLARATOR)(PARAMETERS)`
+// (`void (*)(int)`), the class's `C::*` before the declarator for a
+// pointer to a member function.
+fn functionType(s: *State, declarator: []const u8, owner: []const u8) -> bool {
+    s.*.pos += 1
+    if peek(s) == 89 { s.*.pos += 1 }
+    if !type_(s) { return false }
+    putByte(s, 32)
+    if declarator.length > 0 || owner.length > 0 {
+        putByte(s, 40)
+        put(s, owner)
+        put(s, declarator)
+        putByte(s, 41)
+    }
+    putByte(s, 40)
+    var first = true
+    if peek(s) == 118 && (peekAt(s, 1) == 69 || ((peekAt(s, 1) == 82 || peekAt(s, 1) == 79) && peekAt(s, 2) == 69)) {
+        s.*.pos += 1
+    } else {
+        while peek(s) != 69 && !((peek(s) == 82 || peek(s) == 79) && peekAt(s, 1) == 69) {
+            if s.*.pos >= s.*.end { return failed(s) }
+            if !first { put(s, ", ") }
+            if !type_(s) { return false }
+            first = false
+        }
+    }
+    putByte(s, 41)
+    if peek(s) == 82 {
+        put(s, " &")
+        s.*.pos += 1
+    } else if peek(s) == 79 {
+        put(s, " &&")
+        s.*.pos += 1
+    }
+    return expect(s, 69)
+}
+
+// M CLASS MEMBER: `MEMBER CLASS::*`, `RESULT (CLASS::*)(PARAMETERS)`.
+fn memberPointer(s: *State, start: usize) -> bool {
+    s.*.pos += 1
+    const class_at = s.*.length
+    if !type_(s) { return false }
+    // The class's text, kept while the member's is written.
+    // (One buffer: a member pointer within its own member is not read.)
+    if s.*.ownerBusy { return failed(s) }
+    const owner = s.*.owner
+    const owner_length = s.*.length - class_at
+    if owner_length + 2 > 256 { return failed(s) }
+    var index: usize = 0
+    while index < owner_length {
+        owner[index] = s.*.out[class_at + index]
+        index += 1
+    }
+    owner[owner_length] = 58
+    owner[owner_length + 1] = 58
+    s.*.length = class_at
+    const owner_bytes: [*]const u8 = owner
+    const owner_text = owner_bytes[0..owner_length + 2]
+    // (A member function's qualifiers come before its F: KF...E.)
+    var qualifiers: usize = 0
+    while peek(s) == 75 || peek(s) == 86 {
+        if peek(s) == 75 { qualifiers |= QUALIFIED_CONST }
+        if peek(s) == 86 { qualifiers |= QUALIFIED_VOLATILE }
+        s.*.pos += 1
+    }
+    s.*.ownerBusy = true
+    if peek(s) == 70 {
+        if !functionType(s, "*", owner_text) { return false }
+        if qualifiers & QUALIFIED_CONST != 0 { put(s, " const") }
+        if qualifiers & QUALIFIED_VOLATILE != 0 { put(s, " volatile") }
+    } else {
+        if !type_(s) { return false }
+        if qualifiers & QUALIFIED_CONST != 0 { put(s, " const") }
+        putByte(s, 32)
+        put(s, owner_text)
+        putByte(s, 42)
+    }
+    s.*.ownerBusy = false
+    record(s, start, s.*.pos, KIND_TYPE)
+    return true
+}

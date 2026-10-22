@@ -48,6 +48,7 @@ const eval = @import("./eval.mlx")
 const literal = @import("./literal.mlx")
 const template = @import("./template.mlx")
 const lambda = @import("./lambda.mlx")
+const codeIndex = @import("./index.mlx")
 
 pub const Class = struct {
     ty: usize
@@ -1800,6 +1801,13 @@ pub fn construct(address: usize, ty: usize, args: usize, count: usize, token: us
             if made != 0 && ast.obj(tmp).*.isMadeTemporary && sameClass(types.unqualified(ast.obj(tmp).*.ty), types.unqualified(ty)) && types.size(ast.obj(tmp).*.ty) == types.size(ty) {
                 ast.obj(tmp).*.madeFrom = 0
                 state.removeTemporary(tmp)
+                // (Nor the temporaries its construction made, `T(5)` of a
+                // constructor taking a `const S &`: made again below.)
+                var dropped = base.getWord(made + 16)
+                while dropped != 0 {
+                    state.removeTemporary(state.cellNode(dropped))
+                    dropped = state.cellNext(dropped)
+                }
                 pendingVtt = vtt
                 return construct(address, ty, base.getWord(made), base.getWord(made + 8), token)
             }
@@ -2328,11 +2336,13 @@ fn classNewAhead(args: usize) -> bool {
 pub fn temporaryObject(ty: usize, args: usize, count: usize, token: usize) -> usize {
     const tmp = newTemp(ty, token)
     ast.obj(tmp).*.isMadeTemporary = true
+    const before = state.currentTemporaries()
     const init = construct(addressOf(variable(tmp, token), token), ty, args, count, token)
-    if hasDestructor(ty) { state.addTemporary(tmp) }
-    const made = base.alloc(16)
+    const made = base.alloc(24)
     base.putWord(made, args)
     base.putWord(made + 8, count)
+    base.putWord(made + 16, state.temporariesSince(before))
+    if hasDestructor(ty) { state.addTemporary(tmp) }
     ast.obj(tmp).*.madeFrom = made
     const result = variable(tmp, token)
     if isNothing(init) { return result }
@@ -2348,8 +2358,22 @@ pub fn bracedTemporary(ty: usize, token: usize) -> usize {
     const completed = completeIfNeeded(ty)
     const tmp = newTemp(ty, token)
     ast.obj(tmp).*.isMadeTemporary = true
-    const init = braceInitializer(addressOf(variable(tmp, token), token), ty, token)
+    const address = addressOf(variable(tmp, token), token)
+    const before = state.currentTemporaries()
+    const init = braceInitializer(address, ty, token)
+    const madeTemporaries = state.temporariesSince(before)
     if hasDestructor(ty) { state.addTemporary(tmp) }
+    // (Made by a constructor of the braces' arguments: an object of the
+    // class initialized from it is made from them instead, as of `T(args)`
+    // (C++17: no copy; `auto t = TextBoxTrimmer { *this };` of WebCore,
+    // whose destructor is not run for a moved-from temporary).)
+    if lastBraceConstruct != 0 && base.getWord(lastBraceConstruct) == address {
+        const made = base.alloc(24)
+        base.putWord(made, base.getWord(lastBraceConstruct + 8))
+        base.putWord(made + 8, base.getWord(lastBraceConstruct + 16))
+        base.putWord(made + 16, madeTemporaries)
+        ast.obj(tmp).*.madeFrom = made
+    }
     const result = variable(tmp, token)
     if isNothing(init) { return result }
     const n = ast.binary(ast.COMMA, init, result, token)
@@ -2603,6 +2627,18 @@ pub fn braceAssignedType(classTy: usize, open: usize) -> usize {
     while f != 0 {
         if parameterCount(f) >= count { return classTy }
         f = ast.obj(f).*.nextOverload
+    }
+    // (Nor when a constructor template takes that many: LayoutSize's
+    // `template<T, U> LayoutSize(T, U)` for `size = { width, height }`,
+    // not its `LayoutSize(const IntSize &)` from an IntSize made of the
+    // two, which drops their fractions. A variadic one is not counted:
+    // optional's `optional(in_place_t, Args &&...)` takes no `{ days,
+    // year, month, day }`.)
+    var t = at(c).*.ctorTemplates
+    while t != 0 {
+        const most = template.patternParamCount(t)
+        if most >= count && most < 1000 && template.patternRequiredCount(t) <= count && !template.declaredExplicit(t) { return classTy }
+        t = template.nextTemplate(t)
     }
     // (The class's own initializer_list constructor taking the elements
     // first, as C++'s list-initialization does: `hitType = { A, B, C }` of
@@ -2913,13 +2949,37 @@ pub fn flushStatement(token: usize) -> usize {
     return statementOf(e, token)
 }
 
+// The destruction of the object `o` (a temporary, or one on the cleanup
+// stack); one made in a branch only when its flag says it was made.
+fn destroyTemporary(o: usize, token: usize) -> usize {
+    const d = destroy(addressOf(variable(o, token), token), ast.obj(o).*.ty, true, token)
+    const guard = ast.obj(o).*.destroyGuard
+    if guard == 0 || isNothing(d) { return d }
+    const c = ast.make(ast.COND, token)
+    ast.node(c).*.cond = variable(guard, token)
+    ast.node(c).*.then = typing.cast(d, types.voidOf())
+    ast.node(c).*.els = typing.cast(number(0, types.intOf(), token), types.voidOf())
+    ast.node(c).*.ty = types.voidOf()
+    return c
+}
+
+// A flag for the temporaries of a branch (destroyGuard): a local int.
+pub fn branchFlag(token: usize) -> usize {
+    return newTemp(types.intOf(), token)
+}
+
+// `flag = value`, an expression.
+pub fn setFlag(flag: usize, value: i64, token: usize) -> usize {
+    return typed(ast.binary(ast.ASSIGN, variable(flag, token), number(value, types.intOf(), token), token))
+}
+
 fn destroyTemporaries(token: usize) -> usize {
     var c = state.takeTemporaries()
     var n = nothing(token)
     while c != 0 {
         const o = state.cellNode(c)
         if !ast.obj(o).*.noDestroy {
-            n = sequence(n, destroy(addressOf(variable(o, token), token), ast.obj(o).*.ty, true, token), token)
+            n = sequence(n, destroyTemporary(o, token), token)
         }
         c = state.cellNext(c)
     }
@@ -2993,7 +3053,11 @@ pub fn movedConditional(n: usize, ty: usize, token: usize) -> usize {
 pub fn convertedConditional(n: usize, els: usize, outer: usize, ty: usize, token: usize) -> usize {
     const result = newTemp(ty, token)
     ast.node(n).*.then = construct(addressOf(variable(result, token), token), ty, argumentList(ast.node(n).*.then, 0), 1, token)
-    if movableTemporary(els) {
+    // (A temporary made by a constructor, `c ? shape : Shape(rect)` of
+    // WebCore's Region::unite: made at the result itself, not moved there
+    // by its bytes, which an object pointing into itself (a Vector's
+    // inline buffer) would not survive.)
+    if movableTemporary(els) && !madeByConstructor(els) {
         const moved = movedBranch(els, outer)
         ast.node(n).*.els = typed(ast.binary(ast.ASSIGN, variable(result, token), moved.0, token))
     } else {
@@ -3007,6 +3071,17 @@ pub fn convertedConditional(n: usize, els: usize, outer: usize, ty: usize, token
     const whole = ast.binary(ast.COMMA, n, variable(result, token), token)
     ast.node(whole).*.ty = ty
     return whole
+}
+
+// Whether `value` is a temporary made by a constructor of its arguments
+// (temporaryObject, bracedTemporary): construct makes it at an object
+// initialized from it instead.
+fn madeByConstructor(value: usize) -> bool {
+    var holder = value
+    if ast.kindOf(holder) == ast.COMMA { holder = ast.node(holder).*.rhs }
+    if ast.kindOf(holder) != ast.VAR { return false }
+    const tmp = ast.node(holder).*.variable
+    return ast.obj(tmp).*.isMadeTemporary && ast.obj(tmp).*.madeFrom != 0
 }
 
 // `const T &r = f();` (or `= c ? a : T()`): the temporary the reference
@@ -3093,7 +3168,7 @@ fn destroyAbove(height: usize, skip: usize, token: usize) -> usize {
         index -= 1
         const o = state.cleanupAt(index)
         if o == skip { continue }
-        appendStatement(block, statementOf(destroy(addressOf(variable(o, token), token), ast.obj(o).*.ty, true, token), token))
+        appendStatement(block, statementOf(destroyTemporary(o, token), token))
     }
     if ast.node(block).*.body == 0 { return 0 }
     return block
@@ -3363,6 +3438,7 @@ pub fn beginClass(ty: usize, tag: u32, written: u32, token: usize) -> void {
     // parameters are bound there (`struct is_enum : bc<__is_enum(T)>`).
     scope.enterPrefix(at(c).*.prefix)
     if cursor.consume(names.P_COLON) {
+        codeIndex.baseClause = codeIndex.enabled
         while true {
             var isVirtualBase = false
             while cursor.is(names.K_PUBLIC) || cursor.is(names.K_PRIVATE) || cursor.is(names.K_PROTECTED) || cursor.is(names.K_VIRTUAL) {
@@ -3395,6 +3471,7 @@ pub fn beginClass(ty: usize, tag: u32, written: u32, token: usize) -> void {
             scope.packSeen = outerSeen
             if !cursor.consume(names.P_COMMA) { break }
         }
+        codeIndex.baseClause = false
     }
     classDepth += 1
     if state.currentFunction() != 0 {
@@ -3563,11 +3640,24 @@ pub fn setTemplateOrigin(ty: usize, record: usize, args: usize) -> void {
 // Completes `ty` when it is a class template's instance named without
 // being instantiated (template.complete), for what needs it whole: a
 // member, its size, an object of it, a base class, a qualified name.
+// (Not through a reference while an argument is a class declared only:
+// a reference needs no complete type, and made now the instance would
+// lay out nothing of that class. BorderPainter.h's member `const
+// BorderEdges &edges`, BorderEdge declared only, made RectEdges<
+// BorderEdge> of no size, and borderEdgesForOutline returned it in
+// registers where its callers passed a buffer.)
 pub fn completeIfNeeded(ty: usize) -> bool {
     var t = ty
-    while types.kind(t) == types.ARRAY || types.kind(t) == types.REF { t = types.baseOf(t) }
+    var throughReference = false
+    while types.kind(t) == types.ARRAY || types.kind(t) == types.REF {
+        if types.kind(t) == types.REF { throughReference = true }
+        t = types.baseOf(t)
+    }
     const u = types.unqualified(t)
-    if (types.kind(u) == types.STRUCT || types.kind(u) == types.UNION) && types.at(u).*.incomplete { template.complete(u) }
+    if (types.kind(u) == types.STRUCT || types.kind(u) == types.UNION) && types.at(u).*.incomplete {
+        if throughReference && template.incompleteArgumentsOf(templateArgsOf(u)) { return false }
+        template.complete(u)
+    }
     return false
 }
 
@@ -4552,6 +4642,7 @@ fn bindReference(name: u32, value: usize, token: usize) -> usize {
 pub fn pendBody(fnObj: usize, classTy: usize) -> void {
     ast.obj(fnObj).*.pendingBody = cursor.save()
     ast.obj(fnObj).*.pendingClass = classTy
+    if codeIndex.enabled { codeIndex.noteDefinition(fnObj, cursor.peek()) }
     template.notePended(fnObj)
     skipBody()
     // (Called before its definition was read, `WriteBarrierBase<T>::set`
@@ -4695,6 +4786,7 @@ pub fn memberInitializerTokens(m: usize) -> void {
 
 // Remembers a function body to read after the class, and passes it.
 fn deferBody(fnObj: usize, classTy: usize) -> void {
+    if codeIndex.enabled { codeIndex.noteDefinition(fnObj, cursor.peek()) }
     const c = base.alloc(32)
     base.putWord(c, fnObj)
     base.putWord(c + 8, cursor.save())
@@ -5494,21 +5586,24 @@ pub fn constructorPrologue(fnObj: usize) -> usize {
             // (After each base: a later one sets its own vtable pointer.)
             if at(c).*.hasVirtual { n = sequence(n, setVptr(self, c, token), token) }
         } else if types.member(m).*.name == 0 && (types.kind(mt) == types.UNION || types.kind(mt) == types.STRUCT) && (!isClassType(mt) || isAnonymousClass(mt)) {
-            // An anonymous union or struct: the member the list names,
-            // else the default initializers of its members (a union's
-            // first that has one).
-            if given != 0 && base.getWord(given + 32) != 0 {
-                const inner = base.getWord(given + 32)
-                n = sequence(n, construct(memberAddress(where, inner, token), types.member(inner).*.ty, base.getWord(given + 8), base.getWord(given + 16), token), token)
-            } else {
-                var im = types.at(mt).*.members
-                while im != 0 {
-                    if types.member(im).*.init != 0 {
-                        n = sequence(n, initializeMember(memberAddress(where, im, token), im, token), token)
-                        if types.kind(mt) == types.UNION { break }
-                    }
-                    im = types.member(im).*.next
+            // An anonymous union or struct: each member the list names
+            // (a struct's several, `: fPackedID{id}, fIndex{index}` of
+            // Skia's SkGlyphDigest), the others by their default
+            // initializers, in their order; a union's member the list
+            // names, else its first that has a default initializer.
+            const named = given != 0 && base.getWord(given + 32) != 0
+            var im = types.at(mt).*.members
+            while im != 0 {
+                var entry = inits
+                while entry != 0 && !(base.getWord(entry) == m && base.getWord(entry + 32) == im) { entry = base.getWord(entry + 24) }
+                if entry != 0 {
+                    n = sequence(n, construct(memberAddress(where, im, token), types.member(im).*.ty, base.getWord(entry + 8), base.getWord(entry + 16), token), token)
+                    if types.kind(mt) == types.UNION { break }
+                } else if types.member(im).*.init != 0 && !(named && types.kind(mt) == types.UNION) {
+                    n = sequence(n, initializeMember(memberAddress(where, im, token), im, token), token)
+                    if types.kind(mt) == types.UNION { break }
                 }
+                im = types.member(im).*.next
             }
         } else if types.member(m).*.name == 0 && !isClassType(mt) {
             // The vtable pointer.
@@ -6120,6 +6215,10 @@ fn bracesExpandPack() -> bool {
     return false
 }
 
+// The last construction braceInitializer made by a constructor of the
+// arguments in the braces: the address, the arguments and their number.
+var lastBraceConstruct: usize = 0
+
 fn braceInitializer(address: usize, ty: usize, token: usize) -> usize {
     cursor.expect(names.P_LBRACE)
     const k = types.kind(ty)
@@ -6186,6 +6285,12 @@ fn braceInitializer(address: usize, ty: usize, token: usize) -> usize {
         const zeroFirst = cursor.is(names.P_RBRACE) && zeroedByValueInit(ty)
         const args = readArguments(names.P_RBRACE)
         if zeroFirst && args.1 == 0 { return sequence(zeroAt(address, types.size(ty), token), construct(address, ty, 0, 0, token), token) }
+        // (The arguments kept for bracedTemporary: `T { args }` is then
+        // made at the object it initializes.)
+        lastBraceConstruct = base.alloc(24)
+        base.putWord(lastBraceConstruct, address)
+        base.putWord(lastBraceConstruct + 8, args.0)
+        base.putWord(lastBraceConstruct + 16, args.1)
         return construct(address, ty, args.0, args.1, token)
     }
     if (k == types.STRUCT || k == types.UNION) && standard.cpp && bracesExpandPack() {
@@ -7879,7 +7984,10 @@ pub fn explicitDestructor(address: usize, token: usize) -> usize {
     }
     if !fits { tokens.errorAt(name, "not the destructor of this class") }
     const call = if c != 0 { destroy(address, ty, false, token) } else { nothing(token) }
-    if isNothing(call) { return typing.cast(number(0, types.intOf(), token), types.voidOf()) }
+    // (Nothing to destroy, a scalar's or a trivial destructor: the
+    // object's expression still evaluated, `(--iter)->~T()` of Skia's
+    // AutoSTArray::reset stepping back over pointers.)
+    if isNothing(call) { return typing.cast(address, types.voidOf()) }
     return call
 }
 
@@ -10730,3 +10838,87 @@ fn baseExpansionAhead() -> (usize, i64, usize) {
     if !tokens.is(after, names.P_ELLIPSIS) { return -> (0, 0, 0) }
     return -> (start, types.packCount(scope.at(binding).*.obj), tokens.next(after))
 }
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepState() -> void {
+    base.keepState(@intFromPtr(&classByPrefix), @sizeOf(@typeOf(classByPrefix)))
+    base.keepState(@intFromPtr(&deferred), @sizeOf(@typeOf(deferred)))
+    base.keepState(@intFromPtr(&deferredTail), @sizeOf(@typeOf(deferredTail)))
+    base.keepState(@intFromPtr(&classDepth), @sizeOf(@typeOf(classDepth)))
+    base.keepState(@intFromPtr(&anonymousCount), @sizeOf(@typeOf(anonymousCount)))
+    base.keepState(@intFromPtr(&overrideName), @sizeOf(@typeOf(overrideName)))
+    base.keepState(@intFromPtr(&finalName), @sizeOf(@typeOf(finalName)))
+    base.keepState(@intFromPtr(&conversionType), @sizeOf(@typeOf(conversionType)))
+    base.keepState(@intFromPtr(&pendBodies), @sizeOf(@typeOf(pendBodies)))
+    base.keepState(@intFromPtr(&lazyBodies), @sizeOf(@typeOf(lazyBodies)))
+    base.keepState(@intFromPtr(&newFunction), @sizeOf(@typeOf(newFunction)))
+    base.keepState(@intFromPtr(&newArrayFunction), @sizeOf(@typeOf(newArrayFunction)))
+    base.keepState(@intFromPtr(&deleteFunction), @sizeOf(@typeOf(deleteFunction)))
+    base.keepState(@intFromPtr(&deleteArrayFunction), @sizeOf(@typeOf(deleteArrayFunction)))
+    base.keepState(@intFromPtr(&char8Name), @sizeOf(@typeOf(char8Name)))
+    base.keepState(@intFromPtr(&basesVersion), @sizeOf(@typeOf(basesVersion)))
+    base.keepState(@intFromPtr(&finalClasses), @sizeOf(@typeOf(finalClasses)))
+    base.keepState(@intFromPtr(&userConversion), @sizeOf(@typeOf(userConversion)))
+    base.keepState(@intFromPtr(&signatureConversions), @sizeOf(@typeOf(signatureConversions)))
+    base.keepState(@intFromPtr(&initOwnerClass), @sizeOf(@typeOf(initOwnerClass)))
+    base.keepState(@intFromPtr(&initWhere), @sizeOf(@typeOf(initWhere)))
+    base.keepState(@intFromPtr(&initOffset), @sizeOf(@typeOf(initOffset)))
+    base.keepState(@intFromPtr(&bracedType), @sizeOf(@typeOf(bracedType)))
+    base.keepState(@intFromPtr(&bracedManyType), @sizeOf(@typeOf(bracedManyType)))
+    base.keepState(@intFromPtr(&keptTemporary), @sizeOf(@typeOf(keptTemporary)))
+    base.keepState(@intFromPtr(&movedOut), @sizeOf(@typeOf(movedOut)))
+    base.keepState(@intFromPtr(&memberAccessHidden), @sizeOf(@typeOf(memberAccessHidden)))
+    base.keepState(@intFromPtr(&memberAccessClass), @sizeOf(@typeOf(memberAccessClass)))
+    base.keepState(@intFromPtr(&defaultedMade), @sizeOf(@typeOf(defaultedMade)))
+    base.keepState(@intFromPtr(&trailingRef), @sizeOf(@typeOf(trailingRef)))
+    base.keepState(@intFromPtr(&trailingFinal), @sizeOf(@typeOf(trailingFinal)))
+    base.keepState(@intFromPtr(&declaringConstexpr), @sizeOf(@typeOf(declaringConstexpr)))
+    base.keepState(@intFromPtr(&pendingExplicit), @sizeOf(@typeOf(pendingExplicit)))
+    base.keepState(@intFromPtr(&pendingInline), @sizeOf(@typeOf(pendingInline)))
+    base.keepState(@intFromPtr(&assignName), @sizeOf(@typeOf(assignName)))
+    base.keepState(@intFromPtr(&generatedCount), @sizeOf(@typeOf(generatedCount)))
+    base.keepState(@intFromPtr(&comparedNames), @sizeOf(@typeOf(comparedNames)))
+    base.keepState(@intFromPtr(&comparedCount), @sizeOf(@typeOf(comparedCount)))
+    base.keepState(@intFromPtr(&comparedFloating), @sizeOf(@typeOf(comparedFloating)))
+    base.keepState(@intFromPtr(&defaultedCount), @sizeOf(@typeOf(defaultedCount)))
+    base.keepState(@intFromPtr(&memberwiseCopy), @sizeOf(@typeOf(memberwiseCopy)))
+    base.keepState(@intFromPtr(&braceCount), @sizeOf(@typeOf(braceCount)))
+    base.keepState(@intFromPtr(&initializerListName), @sizeOf(@typeOf(initializerListName)))
+    base.keepState(@intFromPtr(&staticListArrays), @sizeOf(@typeOf(staticListArrays)))
+    base.keepState(@intFromPtr(&lastBraceConstruct), @sizeOf(@typeOf(lastBraceConstruct)))
+    base.keepState(@intFromPtr(&staticGuardName), @sizeOf(@typeOf(staticGuardName)))
+    base.keepState(@intFromPtr(&guardAcquireFunction), @sizeOf(@typeOf(guardAcquireFunction)))
+    base.keepState(@intFromPtr(&guardReleaseFunction), @sizeOf(@typeOf(guardReleaseFunction)))
+    base.keepState(@intFromPtr(&deducedType), @sizeOf(@typeOf(deducedType)))
+    base.keepState(@intFromPtr(&bindingCount), @sizeOf(@typeOf(bindingCount)))
+    base.keepState(@intFromPtr(&defaultSite), @sizeOf(@typeOf(defaultSite)))
+    base.keepState(@intFromPtr(&boundName), @sizeOf(@typeOf(boundName)))
+    base.keepState(@intFromPtr(&templateInstance), @sizeOf(@typeOf(templateInstance)))
+    base.keepState(@intFromPtr(&makingImplicitDestructor), @sizeOf(@typeOf(makingImplicitDestructor)))
+    base.keepState(@intFromPtr(&firstNearlyEmpty), @sizeOf(@typeOf(firstNearlyEmpty)))
+    base.keepState(@intFromPtr(&laySize), @sizeOf(@typeOf(laySize)))
+    base.keepState(@intFromPtr(&layData), @sizeOf(@typeOf(layData)))
+    base.keepState(@intFromPtr(&layAlign), @sizeOf(@typeOf(layAlign)))
+    base.keepState(@intFromPtr(&layVBases), @sizeOf(@typeOf(layVBases)))
+    base.keepState(@intFromPtr(&layVisited), @sizeOf(@typeOf(layVisited)))
+    base.keepState(@intFromPtr(&layIndirect), @sizeOf(@typeOf(layIndirect)))
+    base.keepState(@intFromPtr(&layEmpties), @sizeOf(@typeOf(layEmpties)))
+    base.keepState(@intFromPtr(&layInfos), @sizeOf(@typeOf(layInfos)))
+    base.keepState(@intFromPtr(&prefixHead), @sizeOf(@typeOf(prefixHead)))
+    base.keepState(@intFromPtr(&prefixTail), @sizeOf(@typeOf(prefixTail)))
+    base.keepState(@intFromPtr(&prefixCount), @sizeOf(@typeOf(prefixCount)))
+    base.keepState(@intFromPtr(&prefixVisited), @sizeOf(@typeOf(prefixVisited)))
+    base.keepState(@intFromPtr(&prefixMethods), @sizeOf(@typeOf(prefixMethods)))
+    base.keepState(@intFromPtr(&prefixLayout), @sizeOf(@typeOf(prefixLayout)))
+    base.keepState(@intFromPtr(&prefixWalk), @sizeOf(@typeOf(prefixWalk)))
+    base.keepState(@intFromPtr(&prefixSlotsOf), @sizeOf(@typeOf(prefixSlotsOf)))
+    base.keepState(@intFromPtr(&walkHead), @sizeOf(@typeOf(walkHead)))
+    base.keepState(@intFromPtr(&walkTail), @sizeOf(@typeOf(walkTail)))
+    base.keepState(@intFromPtr(&walkSeen), @sizeOf(@typeOf(walkSeen)))
+    base.keepState(@intFromPtr(&walkLayout), @sizeOf(@typeOf(walkLayout)))
+    base.keepState(@intFromPtr(&overriderOffset), @sizeOf(@typeOf(overriderOffset)))
+    base.keepState(@intFromPtr(&pendingVtt), @sizeOf(@typeOf(pendingVtt)))
+    base.keepState(@intFromPtr(&pendingDtorVtt), @sizeOf(@typeOf(pendingDtorVtt)))
+    base.keepState(@intFromPtr(&destructorArgument), @sizeOf(@typeOf(destructorArgument)))
+}
+// --- end of prefix snapshot state ---

@@ -87,7 +87,7 @@ Four ways to choose without patching, in this order of preference:
 - WebCore: about 35 of 52 sampled files compile with WPE's flags
   (WEBCORE.md); the WPE targets (`webkit-wpe-*`) build WTF and
   JavaScriptCore on mlx-glib.
-- **M2, under way**: the port is described and builds. `config.MLX`
+- **M2, done**: the port is described and builds. `config.MLX`
   (JSCOnly's configuration with WebCore's choices above), the source
   selection (webcore.mlx's `mlx()`: Sources.txt, the Skia and Adwaita
   lists, lists/webcore-mlx-sources.txt of other ports' files that fit,
@@ -103,6 +103,50 @@ Four ways to choose without patching, in this order of preference:
   a `// STUB (Mn: ...)` line, which the check lists. What remains is
   mlx-cc's: the units it does not compile yet are listed in WEBCORE.md,
   each with its first error.
+- **M3, done**: webcore-dump (tests/webcore-dump.cpp,
+  `./mlx build webkit-mlx-webcore-dump`) loads a page with the port's
+  clients and WebKitTestRunner's settings (hinting off, mock scrollbars,
+  its GLib fonts.conf over Liberation and DejaVu, Ahem as a test font),
+  lays it out at 800x600 and prints the render tree. 37 of the 44 layout
+  tests of tests/layout pass against the GLib/WPE baselines at 2.54.1
+  (tools/check_webkit_mlx_layout.sh); the 7 others are listed with their
+  causes in tests/layout/failures.txt, all mlx-cc bugs already fixed in
+  epoch 5 (a braced assignment `p = { x, y }` through the wrong
+  constructor, an enum argument not promoted to int) and to pass after
+  the next full rebuild. The bugs M3 found were mlx-cc's code generation
+  (CODEGEN_EPOCH 3 to 5: casts to classes, branch temporaries, elided
+  braced temporaries, 128-bit constants, constexpr pointers into
+  globals), mlx-unicode's UText API, and the port's font cache. A full
+  rebuild of WebCore, the port and webcore-dump takes about 18 minutes
+  (`-j 4`, memory-aware); a port-only change relinks. With epoch 5 and 6
+  all 44 pass.
+- **M4, done**: `webcore-dump --png OUT.png` paints the view into a Skia
+  raster surface (CPU, N32) through GraphicsContextSkia and writes it
+  with std.png (the port's `mlxweb_image_write_png`); `--reference`
+  compares it with a PNG. tools/check_webkit_mlx_paint.sh paints the
+  pages of tests/paint (boxes and a translucent background, borders and
+  an outline, Ahem text, linear gradients, a PNG image through the port's
+  std.png decoder at its size and scaled) against references that
+  make_references.py computes from what each page draws: 4 of 5 match to
+  the pixel (a channel off by 1 at most); the gradient page is known to
+  crash (pages.txt says why). M4 found mlx-cc's class template instance
+  made through a reference while its argument was only declared (no size:
+  BorderEdges returned in registers, epoch 6).
+- **M5, done**: Voyager (projects/voyager, `./mlx build
+  webkit-mlx-voyager`, mlx-out/webkit/mlx/bin/voyager). engine.cpp is
+  WebCore in the process (the port's clients, a chrome client that notes
+  repaints, an editor client that lets text be edited, the keys' editing
+  commands) and calls libvoyager.so (voyager.mlx), a std.ui.host window on
+  the compositor drawn into wl_shm buffers: each frame the engine paints
+  the view into the buffer's pixels; the pointer, the wheel, keys with
+  their text, the window's size and a 15 ms tick (WTF's RunLoop cycle and
+  the page's rendering update) go to the engine; Ctrl+C and Ctrl+V go
+  through the compositor's clipboard. tools/check_voyager.sh runs it
+  under tools/wayland-test-host: the page shows, the wheel scrolls it, a
+  click focuses a text field and keys type into it, a word copied and
+  pasted, a link followed to another file: page, and the screenshot shows
+  that page as painted. mlx-cc now refuses a call whose result is a class
+  only declared (Voyager's first engine took EventHandler's results so).
 
 ## The shape of the port
 
@@ -133,6 +177,7 @@ port in the tarball that builds WebCore without GLib).
 | Images | WebCore's `ScalableImageDecoder`, with our PNG, JPEG and WebP decoders; WebKit's BMP, GIF, ICO as they are | WebCore's decoders call libpng, libjpeg, libwebp; ours call std.png, std.jpeg, std.webp |
 | Colour | `USE_LCMS` off, colour management in our decoders (std.colorprofile) | Little CMS is only the decoders' |
 | Fonts | Skia's typefaces and our font manager over std.fontconfig | below |
+| Text paths | `USE_FONT_VARIANT_VIA_FEATURES` off (GTK and WPE: on) | Kerned and shaped text goes to the complex (HarfBuzz) path through FontCascade::codePath, since GTK's and WPE's own branch for it is under `PLATFORM()`; GLib's layout tests expect it kerned |
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (RenderThemeAdwaita, ScrollbarThemeAdwaita: GraphicsContext drawing; their GLib resources under `USE(GLIB)`) | WebKit's own non-native theme |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), registers the digests only and refuses the rest until M7 (`port/crypto/CryptoMlx.cpp`), then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
@@ -352,11 +397,16 @@ exports what the port's C++ needs in its shapes (a decoder object with
 `append`/`frame` functions, an HTTP request with callbacks): std's own
 APIs are Mlx slices and structs, not C. Rules of exports apply: an
 exported function cannot be called from Mlx (a `pub fn` and an `export`
-beside it), its 64 KB stack arena lives until it returns (state on the
-heap, no slices of locals that escape), and callbacks into C++ are C
+beside it), its arena lives until it returns (state on the heap, no
+slices of locals that escape), and callbacks into C++ are C
 function pointers with a context pointer, called on the main thread
 (through `RunLoop::dispatch`) or on the I/O thread when the C++ side says
-it is thread-safe.
+it is thread-safe. The plugin's exports have mapped arenas, not
+`--stack-arena`'s 64 KB of the caller's stack: the first font match reads
+std.fontconfig's fonts and cache in one call, with more aggregates than
+that holds. Its C header, `port/MlxWebPort.h`, is made by mlx-cheaders of
+port/mlx/api/MlxWebPort.mlx into the port's generated directory
+(`webkit-mlx-port-headers`), as every C header of the repository is.
 
 ## Milestones
 

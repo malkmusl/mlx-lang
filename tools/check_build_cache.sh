@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Checks std.build's result cache (std/src/build/store.mlx) on a small
-# project of C and Mlx steps (mlx-cc and mlx-ar built as in build.mlx,
+# project of C and Mlx steps (mlx-cc, mlx-ld and mlx-ar built as in build.mlx,
 # objects with depfiles, an archive, a link, an Mlx program, a command
 # that is not cached) in copies of its tree, with a cache of its own in a
 # temporary directory:
@@ -46,6 +46,9 @@ fail() {
 
 export MLX_BUILD_CACHE="$work/cache"
 unset MLX_BUILD_CACHE_SIZE
+# (What a step's turn gives back is overwritten: a value the runner kept
+# by mistake shows; std/src/build.mlx.)
+export MLX_ARENA_POISON=1
 
 # The project's tree (without mlx-out): std/ and compiler/ are this
 # repository's.
@@ -112,6 +115,7 @@ pub fn build(b: *Build.Builder) -> void {
     const all = Build.group(b, "all", "everything")
     const cc = Build.program(b, "mlx-cc", "compiler/cc/main.mlx")
     const ar = Build.program(b, "mlx-ar", "compiler/cc/ar.mlx")
+    const ld = Build.program(b, "mlx-ld", "compiler/ld/main.mlx")
     const include = Build.link(b, "mlx-cc-include", "../../compiler/cc/include")
     Build.output(b, include, "mlx-out/include/mlx-cc")
     const main = object(b, cc, include, "main", "src/main.c")
@@ -129,6 +133,8 @@ pub fn build(b: *Build.Builder) -> void {
     Build.input(b, hello, "mlx-out/bin/mlx-cc")
     Build.input(b, hello, "mlx-out/obj/main.o")
     Build.input(b, hello, "mlx-out/lib/libutil.a")
+    Build.input(b, hello, "mlx-out/bin/mlx-ld")
+    Build.dependOn(b, hello, ld)
     Build.dependOn(b, hello, main)
     Build.dependOn(b, hello, library)
     Build.add(b, all, hello)
@@ -165,23 +171,23 @@ objects_in() {
     find "$1/objects" -type f 2> /dev/null | wc -l
 }
 
-cached_files="mlx-out/bin/mlx-cc mlx-out/bin/mlx-ar mlx-out/bin/greet mlx-out/obj/main.o mlx-out/obj/util.o mlx-out/obj/other.o mlx-out/lib/libutil.a"
-cached_steps="greet libutil.a mlx-ar mlx-cc obj/main obj/other obj/util"
+cached_files="mlx-out/bin/mlx-cc mlx-out/bin/mlx-ld mlx-out/bin/mlx-ar mlx-out/bin/greet mlx-out/obj/main.o mlx-out/obj/util.o mlx-out/obj/other.o mlx-out/lib/libutil.a"
+cached_steps="greet libutil.a mlx-ar mlx-cc mlx-ld obj/main obj/other obj/util"
 
 copy a
 build a "$work/a.log" -j 2 || fail "the first build failed" "$work/a.log"
-[[ "$(built "$work/a.log")" == "greet hello libutil.a mlx-ar mlx-cc mlx-cc-include obj/main obj/other obj/util text" && -z "$(cached "$work/a.log")" ]] \
+[[ "$(built "$work/a.log")" == "greet hello libutil.a mlx-ar mlx-cc mlx-cc-include mlx-ld obj/main obj/other obj/util text" && -z "$(cached "$work/a.log")" ]] \
     || fail "the first build (an empty cache) did not build every step" "$work/a.log"
 [[ "$("$work/a/mlx-out/bin/hello")" == "result 41" && "$("$work/a/mlx-out/bin/greet")" == hello ]] || fail "the first build's programs are wrong"
-# 7 steps, and the runner the compiler made for build.mlx.
-[[ $(objects_in "$work/cache") -eq 8 ]] || fail "the cache does not hold the 7 cached steps' files and the runner ($(objects_in "$work/cache"))"
+# 8 steps, and the runner the compiler made for build.mlx.
+[[ $(objects_in "$work/cache") -eq 9 ]] || fail "the cache does not hold the 8 cached steps' files and the runner ($(objects_in "$work/cache"))"
 echo "ok   a first build fills the cache (Mlx steps, objects with depfiles, an archive marked cacheable)"
 
 copy b
 build b "$work/b.log" -j 2 || fail "the build of the second copy failed" "$work/b.log"
 [[ "$(cached "$work/b.log")" == "$cached_steps" && "$(built "$work/b.log")" == "hello mlx-cc-include text" ]] \
     || fail "the second copy did not take exactly the cached steps from the cache" "$work/b.log"
-grep -q "^mlx build: 3 built, 7 cached, 0 current" "$work/b.log" || fail "the summary does not count what was cached" "$work/b.log"
+grep -q "^mlx build: 3 built, 8 cached, 0 current" "$work/b.log" || fail "the summary does not count what was cached" "$work/b.log"
 for file in $cached_files mlx-out/bin/hello; do
     cmp -s "$work/a/$file" "$work/b/$file" || fail "$file in the second copy is not the first's"
 done
@@ -192,7 +198,7 @@ done
 grep -rq "$work/a" "$work/cache/entries" && fail "an entry names a path in the first copy"
 grep -q '^input [0-9a-f]* mlx-out/include/mlx-cc/stdio.h$' "$work/cache/entries"/*/* || fail "no entry names mlx-cc's stdio.h relative to the root"
 build b "$work/b-again.log" || fail "the build after the cached one failed" "$work/b-again.log"
-grep -qx 'mlx build: all 10 steps current ([0-9.]* s)' "$work/b-again.log" || fail "steps taken from the cache were not current afterwards" "$work/b-again.log"
+grep -qx 'mlx build: all 11 steps current ([0-9.]* s)' "$work/b-again.log" || fail "steps taken from the cache were not current afterwards" "$work/b-again.log"
 echo "ok   another copy of the tree takes them from the cache, the same bytes, linked; then they are current"
 
 sed -i 's/FACTOR 2/FACTOR 3/' "$work/b/src/util.h"
@@ -236,10 +242,10 @@ cp "$compiler" "$work/other-compiler"
 printf '\n' >> "$work/other-compiler"
 status=0
 (cd "$work/b" && mlx-out/build/runner --compiler="$work/other-compiler") > "$work/compiler.log" 2>&1 || status=$?
-[[ $status -eq 0 && "$(built "$work/compiler.log")" == "greet mlx-ar mlx-cc" && -z "$(cached "$work/compiler.log")" ]] \
+[[ $status -eq 0 && "$(built "$work/compiler.log")" == "greet mlx-ar mlx-cc mlx-ld" && -z "$(cached "$work/compiler.log")" ]] \
     || fail "another Mlx compiler did not build the Mlx steps" "$work/compiler.log"
 build b "$work/compiler-back.log" || fail "the build back on the compiler failed" "$work/compiler-back.log"
-[[ "$(cached "$work/compiler-back.log")" == "greet mlx-ar mlx-cc" ]] || fail "the compiler back did not take the Mlx steps from the cache" "$work/compiler-back.log"
+[[ "$(cached "$work/compiler-back.log")" == "greet mlx-ar mlx-cc mlx-ld" ]] || fail "the compiler back did not take the Mlx steps from the cache" "$work/compiler-back.log"
 echo "ok   another mlx-cc or Mlx compiler builds (the cache's files untouched); back again, it is cached"
 
 # Damaged: every file of the cache replaced by as many zeros (new files:
@@ -283,7 +289,7 @@ build h "$work/h.log" -j 2 || fail "the build after two at once failed" "$work/h
 echo "ok   two builds at once share the cache"
 
 (cd "$work/h" && "$compiler" build --cache-stats) > "$work/stats.log" 2>&1 || fail "--cache-stats failed" "$work/stats.log"
-grep -q "^result cache: $work/cache$" "$work/stats.log" && grep -q '^  8 files, ' "$work/stats.log" && grep -q '^  8 entries for 8 steps$' "$work/stats.log" \
+grep -q "^result cache: $work/cache$" "$work/stats.log" && grep -q '^  9 files, ' "$work/stats.log" && grep -q '^  9 entries for 9 steps$' "$work/stats.log" \
     || fail "--cache-stats is wrong" "$work/stats.log"
 (cd "$work/h" && MLX_BUILD_CACHE_SIZE=2M "$compiler" build --force) > "$work/trim.log" 2>&1 || fail "the build with a small limit failed" "$work/trim.log"
 grep -q '^mlx build: the result cache passed its limit; removed [0-9]* of its files' "$work/trim.log" || fail "a cache over its limit was not trimmed" "$work/trim.log"

@@ -25,6 +25,7 @@
 //     ./mlx build webkit-mlx-pal      the Mlx port's (PORT.md): PAL, WebCore,
 //     ./mlx build webkit-mlx-webcore  its Mlx side (webkit-mlx-port) and the
 //     ./mlx build webkit-mlx-webcore-test  program linking them all
+//     ./mlx build webkit-mlx-webcore-dump  a page's render tree (M3)
 //     ./mlx build webkit              all of it
 //
 // Where the sources are: WEBKIT_SOURCE (WPE WebKit's tree, the one with
@@ -43,12 +44,20 @@ const angleModule = @import("./angle.mlx")
 const skiaModule = @import("./skia.mlx")
 
 pub const Toolchain = struct {
-    // mlx-cc, its headers and mlxlibcpp; mlx-ar.
+    // mlx-cc, its headers and mlxlibcpp; mlx-ld, which mlx-cc runs for a
+    // link (a link step names it as an input, an object step does not);
+    // mlx-ar.
     compiler: Build.Step
+    // `mlx-cc-epoch`: mlx-cc's code generation epoch (epochFile), which
+    // the objects are keyed by instead of mlx-cc's bytes.
+    epoch: Build.Step
+    linker: Build.Step
     headers: Build.Step
     library: Build.Step
     archiver: Build.Step
     cc: []const u8
+    epochFile: []const u8
+    ld: []const u8
     ar: []const u8
 }
 
@@ -285,6 +294,11 @@ const Objects = struct {
     list: []const u8
     chunkList: []const u8
     count: usize
+    // The prefix snapshot of the sources compiled with prefixFlags (the
+    // same text: its address and length), its path ("" for none) and step.
+    prefixFlags: []const u8
+    prefixPath: []const u8
+    prefixStep: Build.Step
 }
 
 // The objects of the port's library LIBRARY (bmalloc, wtf, jsc...): in
@@ -294,7 +308,7 @@ fn objects(b: *Build.Builder, port: Port, library: []const u8, needs: []const u8
     const name = Build.concat(b, port.tag, library)
     const all = Build.group(b, Build.concat(b, name, "-objects"), Build.concat(b, "the objects of ", name))
     const directory = join3(b, port.objects, library, "/")
-    return Objects.{ .name = name, .directory = directory, .needs = needs, .all = all, .chunk = all, .inChunk = 100, .chunks = 0, .list = "", .chunkList = "", .count = 0 }
+    return Objects.{ .name = name, .directory = directory, .needs = needs, .all = all, .chunk = all, .inChunk = 100, .chunks = 0, .list = "", .chunkList = "", .count = 0, .prefixFlags = "", .prefixPath = "", .prefixStep = all }
 }
 
 // SET's list with the objects of its last group.
@@ -325,6 +339,25 @@ fn compile(b: *Build.Builder, tc: Toolchain, set: *Objects, root: []const u8, pa
     _ = compileAs(b, tc, set, join3(b, root, "/", path), path, flags)
 }
 
+// The memory (MB) a unit of the library NAME is expected to take at its
+// peak until a build of it says (std/src/build/memory.mlx keeps what
+// each one took): WebCore's 2.5-4 GB, JavaScriptCore's 1-2 GB, the
+// others' under 1 GB (docs/internals/build-time-notes.md).
+fn unitMemory(name: []const u8) -> usize {
+    if contains(name, "webcore") { return 4096 }
+    if contains(name, "jsc") { return 2048 }
+    return 1024
+}
+
+fn contains(text: []const u8, part: []const u8) -> bool {
+    var at: usize = 0
+    while at + part.length <= text.length {
+        if std.text.same(text[at..at + part.length], part) { return true }
+        at += 1
+    }
+    return false
+}
+
 // The object of the file SOURCE compiled with FLAGS into SET's directory
 // as NAME.o, gathered into SET.
 fn compileAs(b: *Build.Builder, tc: Toolchain, set: *Objects, source: []const u8, name: []const u8, flags: []const u8) -> Build.Step {
@@ -332,17 +365,51 @@ fn compileAs(b: *Build.Builder, tc: Toolchain, set: *Objects, source: []const u8
     const depfile = Build.concat(b, object, ".d")
     // (The flags, tens of kilobytes for WebCore, copied once: every
     // concatenation stays in the build graph's text.)
-    const head = join3(b, join3(b, tc.cc, " -MD -MF ", depfile), " ", "")
+    var head = join3(b, join3(b, tc.cc, " -MD -MF ", depfile), " ", "")
+    const prefixed = set.*.prefixPath.length > 0 && flags.length == set.*.prefixFlags.length && @intFromPtr(flags.pointer) == @intFromPtr(set.*.prefixFlags.pointer)
+    if prefixed { head = join3(b, head, "--prefix-snapshot ", Build.concat(b, set.*.prefixPath, " ")) }
     const tail = join3(b, join3(b, " -c ", source, " -o "), object, "")
     const line = join3(b, head, flags, tail)
     const step = Build.command(b, join3(b, set.*.name, "/", name), object, line)
     Build.depfile(b, step, depfile)
-    Build.input(b, step, tc.cc)
+    if prefixed { Build.dependOn(b, step, set.*.prefixStep) }
+    Build.programEpoch(b, step, tc.epochFile)
+    Build.memory(b, step, unitMemory(set.*.name))
     Build.dependOn(b, step, tc.compiler)
+    Build.dependOn(b, step, tc.epoch)
     Build.dependOn(b, step, tc.headers)
     dependOnAll(b, step, set.*.needs)
     collect(b, set, step, object)
     return step
+}
+
+// SET's sources compiled with FLAGS (the same text, as compileAs is given
+// it) start from a prefix snapshot: mlx-cc's state after FLAGS' -include
+// files (compiler/cc/snapshot.mlx), written once by a step of its own and
+// mapped by each of them instead of reading the prefix again. An object
+// made with it is the object made without it, so it is in no object's
+// key (the step is ordered before them, and out of the result cache); a
+// compiler or a header of the prefix changed makes it again (the
+// compiler is its input, the headers are in its depfile), and a unit
+// whose state would differ (a header changed since) reads the prefix
+// itself.
+fn usePrefixSnapshot(b: *Build.Builder, tc: Toolchain, set: *Objects, flags: []const u8) -> void {
+    const path = Build.concat(b, set.*.directory, "prefix.snapshot")
+    const depfile = Build.concat(b, path, ".d")
+    const head = join3(b, join3(b, tc.cc, " --write-prefix-snapshot ", path), " -MD -MF ", Build.concat(b, depfile, " "))
+    const line = join3(b, head, flags, " -x c++")
+    const step = Build.command(b, Build.concat(b, set.*.name, "/prefix-snapshot"), path, line)
+    Build.describe(b, step, Build.concat(b, "the prefix snapshot of ", set.*.name))
+    Build.depfile(b, step, depfile)
+    Build.uncached(b, step)
+    Build.memory(b, step, unitMemory(set.*.name))
+    Build.input(b, step, tc.cc)
+    Build.dependOn(b, step, tc.compiler)
+    Build.dependOn(b, step, tc.headers)
+    dependOnAll(b, step, set.*.needs)
+    set.*.prefixFlags = flags
+    set.*.prefixPath = path
+    set.*.prefixStep = step
 }
 
 // The archive OUTPUT of SET's objects in the port's libraries (made again
@@ -847,6 +914,7 @@ fn javaScriptCore(b: *Build.Builder, tc: Toolchain, port: Port) -> Build.Step {
     const library = Build.concat(b, common, port.jscLibraryDefines)
     const cpp = join3(b, library, " -std=c++23 -include ", Build.concat(b, jsc, "/JavaScriptCorePrefix.h"))
     var set = objects(b, port, "jsc", join3(b, sourceNeeds(b, port), groupName(b, port, "jsc-derived"), "\n"))
+    usePrefixSnapshot(b, tc, &set, cpp)
     const sources = jscUnifiedSources(b, port, jsc)
     var at: usize = 0
     while at < sources.length {
@@ -935,6 +1003,8 @@ fn linkProgram(b: *Build.Builder, tc: Toolchain, port: Port, name: []const u8, p
     dependOnAll(b, step, port.needs)
     Build.dependOn(b, step, compiled)
     Build.dependOn(b, step, tc.library)
+    Build.input(b, step, tc.ld)
+    Build.dependOn(b, step, tc.linker)
     return step
 }
 
@@ -1129,6 +1199,9 @@ pub fn mlxPort() -> Port {
     port.objects = "mlx-out/webkit/mlx/obj/"
     port.libraries = "mlx-out/webkit/mlx/lib/"
     port.programs = "mlx-out/webkit/mlx/bin/"
+    // (The header of the port's Mlx side, port/MlxWebPort.h, is made in
+    // its generated directory before the port's sources compile.)
+    port.needs = "webkit-mlx-port-headers\n"
     return port
 }
 
@@ -1301,6 +1374,7 @@ fn pal(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step {
     const sources = unified.bundle(b, copies, Build.concat(b, directory, "/unified-sources"), palRoot, directory, options)
     const flags = palFlags(b, wc, root)
     var set = objects(b, port, "pal", sourceNeeds(b, port))
+    usePrefixSnapshot(b, tc, &set, flags)
     at = 0
     while at < sources.length {
         const path = Build.nextLine(sources, &at)
@@ -1346,6 +1420,7 @@ fn webCore(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step {
     const c = webcoreFlags(b, wc, root)
     const cpp = webcoreCppFlags(b, wc, c, w)
     var set = objects(b, port, "webcore", needs)
+    usePrefixSnapshot(b, tc, &set, cpp)
     const sources = webcore.unifiedSources(b, wc.derived, w)
     var at: usize = 0
     while at < sources.length {
@@ -1373,11 +1448,22 @@ fn webCore(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step {
 
 // The Mlx port's Mlx side (PORT.md): libmlxwebport.so of
 // projects/webkit/port/mlx/webport.mlx, std's functions with the C ABI the
-// port's C++ calls (projects/webkit/port/MlxWebPort.h).
+// port's C++ calls, and their header, port/MlxWebPort.h in the port's
+// generated directory (on its sources' include path), made by mlx-cheaders
+// of projects/webkit/port/mlx/api/MlxWebPort.mlx.
 fn mlxPortLibrary(b: *Build.Builder) -> Build.Step {
     const group = Build.group(b, "webkit-mlx-port", "libmlxwebport.so: the Mlx side of the Mlx port, std for its C++")
+    const generated = mlxPort().generated
+    const api = "projects/webkit/port/mlx/api/MlxWebPort.mlx"
+    const headers = Build.command(b, "webkit-mlx-port-headers", Build.concat(b, generated, "port/MlxWebPort.h"), join3(b, "mlx-out/bin/mlx-cheaders ", generated, Build.concat(b, " ", api)))
+    Build.input(b, headers, api)
+    Build.input(b, headers, "mlx-out/bin/mlx-cheaders")
+    Build.dependOn(b, headers, Build.step(b, "mlx-cheaders"))
+    Build.add(b, group, headers)
+    // (Each export's arena is mapped for its call, not --stack-arena's 64
+    // KB of the caller's stack: the first font match reads std.fontconfig's
+    // fonts and cache in one call, with more aggregates than that holds.)
     const library = Build.plugin(b, "libmlxwebport.so", "projects/webkit/port/mlx/webport.mlx")
-    Build.option(b, library, "--stack-arena")
     Build.option(b, library, "--soname=libmlxwebport.so")
     Build.add(b, group, library)
     return group
@@ -1390,17 +1476,48 @@ fn mlxPortLibrary(b: *Build.Builder) -> Build.Step {
 // WebCore's configuration), on mlxlibc's loader with mlxlibcpp and the
 // libraries in Mlx (mlx-out/webkit/mlx/bin/webcore-test).
 // tools/check_webkit_mlx_port.sh checks that nothing it needs is left
-// undefined and runs it.
+// undefined and runs it. The same for webcore-dump (PORT.md, M3), the
+// program of projects/webkit/tests/webcore-dump.cpp: a page loaded, laid
+// out and its render tree printed (tools/check_webkit_mlx_layout.sh).
 fn webcoreTest(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step {
+    return webcoreProgram(b, tc, wc, "webcore-test", "webcore-mlx.cpp", "a WebCore Page of the Mlx port, linked whole")
+}
+
+fn webcoreDump(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step {
+    return webcoreProgram(b, tc, wc, "webcore-dump", "webcore-dump.cpp", "a page loaded and laid out headless, its render tree printed")
+}
+
+// Voyager (PORT.md, M5): the engine of projects/voyager/engine.cpp (WebCore
+// in the process, as webcore-dump has it) linked with libvoyager.so, its
+// window on the compositor (projects/voyager/voyager.mlx: std.ui.host),
+// mlx-out/webkit/mlx/bin/voyager (tools/check_voyager.sh).
+fn voyager(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step {
+    const window = Build.group(b, "voyager-window", "libvoyager.so: Voyager's window (std.ui.host) for its engine")
+    const library = Build.plugin(b, "libvoyager.so", "projects/voyager/library.mlx")
+    Build.option(b, library, "--soname=libvoyager.so")
+    Build.add(b, window, library)
+    const program = webcoreProgramOf(b, tc, wc, "voyager", "projects/voyager/", "engine.cpp", "Voyager: a page in a window on the compositor", "libvoyager.so", "voyager-window")
+    return program
+}
+
+// The program NAME (mlx-out/webkit/mlx/bin/NAME, the step group
+// webkit-mlx-NAME) of projects/webkit/tests/SOURCE, linked whole.
+fn webcoreProgram(b: *Build.Builder, tc: Toolchain, wc: WebCorePort, name: []const u8, source: []const u8, description: []const u8) -> Build.Step {
+    return webcoreProgramOf(b, tc, wc, name, "projects/webkit/tests/", source, description, "", "")
+}
+
+// The same of DIRECTORY's SOURCE, also linked with the Mlx library
+// mlx-out/lib/LIBRARY of the group GROUP (none: "").
+fn webcoreProgramOf(b: *Build.Builder, tc: Toolchain, wc: WebCorePort, name: []const u8, directory: []const u8, source: []const u8, description: []const u8, library: []const u8, libraryGroup: []const u8) -> Build.Step {
     const port = wc.port
-    const group = Build.group(b, groupName(b, port, "webcore-test"), "a WebCore Page of the Mlx port, linked whole")
+    const group = Build.group(b, groupName(b, port, name), description)
     const w = Build.concat(b, webkitSource(b), "/Source/WebCore")
     const root = Build.concat(b, webkitSource(b), "/Source")
     // (Compiled once WebCore is: all it generates is there.)
-    var set = objects(b, port, "webcore-test", Build.concat(b, port.tag, "libWebCore.a\n"))
-    const compiled = compileAs(b, tc, &set, "projects/webkit/tests/webcore-mlx.cpp", "webcore-mlx.cpp", webcoreCppFlags(b, wc, webcoreFlags(b, wc, root), w))
-    const program = Build.concat(b, port.programs, "webcore-test")
-    const object = Build.concat(b, set.directory, "webcore-mlx.cpp.o")
+    var set = objects(b, port, name, Build.concat(b, port.tag, "libWebCore.a\n"))
+    const compiled = compileAs(b, tc, &set, Build.concat(b, directory, source), source, webcoreCppFlags(b, wc, webcoreFlags(b, wc, root), w))
+    const program = Build.concat(b, port.programs, name)
+    const object = join3(b, set.directory, source, ".o")
     const lower = wc.lower
     // The archives (the linker takes from each archive the members any
     // object needs, whatever their order) and the step of each.
@@ -1425,8 +1542,13 @@ fn webcoreTest(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step 
         line = join3(b, line, " -l:", join3(b, checkout, "/mlx-out/lib/", shared[index]))
         index += 1
     }
+    if library.length > 0 { line = join3(b, line, " -l:", join3(b, checkout, "/mlx-out/lib/", library)) }
     line = Build.concat(b, line, " -Lmlx-out/lib -lmlxcpp -lm")
-    const step = Build.command(b, Build.concat(b, port.tag, "webcore-test"), program, line)
+    const step = Build.command(b, Build.concat(b, port.tag, name), program, line)
+    if library.length > 0 {
+        Build.input(b, step, Build.concat(b, "mlx-out/lib/", library))
+        Build.dependOn(b, step, Build.step(b, libraryGroup))
+    }
     Build.input(b, step, object)
     Build.dependOn(b, step, compiled)
     index = 0
@@ -1444,6 +1566,8 @@ fn webcoreTest(b: *Build.Builder, tc: Toolchain, wc: WebCorePort) -> Build.Step 
     }
     Build.dependOn(b, step, Build.step(b, "libc"))
     Build.dependOn(b, step, tc.library)
+    Build.input(b, step, tc.ld)
+    Build.dependOn(b, step, tc.linker)
     Build.add(b, group, step)
     return group
 }
@@ -1481,5 +1605,7 @@ pub fn webkit(b: *Build.Builder, tc: Toolchain) -> Build.Step {
     _ = pal(b, tc, mlx)
     _ = webCore(b, tc, mlx)
     _ = webcoreTest(b, tc, mlx)
+    _ = webcoreDump(b, tc, mlx)
+    _ = voyager(b, tc, mlx)
     return group
 }

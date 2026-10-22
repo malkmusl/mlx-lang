@@ -26,6 +26,18 @@
 // the frame pointers for the callers. Without a name an address is shown
 // as the file and the offset in it.
 //
+// A C or C++ program mlx-cc linked has the functions' own names in its
+// symbol table, a C++ one's mangled; the report says the C++ spelling
+// after it (std.demangle), and where the function was defined from the
+// line table the linker made of mlx-cc's marks:
+//
+//     webcore-dump: crashed: segmentation fault touching 0x0
+//       at _ZN7WebCore4Node11appendChildERS0_+0x1f (WebCore::Node::appendChild(WebCore::Node&)) defined at Source/WebCore/dom/Node.cpp:812
+//
+// The file is mapped (read-only) once for all the frames in it, and its
+// functions sorted by address once into memory the handler maps, so a
+// program of a few hundred thousand functions is named by binary search.
+//
 // It also keeps the crash: a line in $XDG_STATE_HOME/mlx/crashes.log
 // (~/.local/state/mlx/crashes.log) through std.diagnostics, which MLX
 // Observatory reads to flag the functions that crashed (std.gpu keeps the
@@ -36,7 +48,15 @@
 //
 // The handler runs on a stack of its own, so a stack overflow is reported
 // too, and allocates nothing (it maps what it needs), so an exhausted
-// arena is reported as well. Freestanding, the message is the last line of
+// arena is reported as well. Naming a frame takes nothing of the
+// compiler's value arena (the demangler's tables and text are in the
+// data here), and what describing it takes is given back after each frame
+// where the arena is found: in mlxlibc, whose exports run on a 64 KiB
+// arena of their own frame (--stack-arena), the handler has those 64 KiB
+// for its whole run, and a deep stack of long C++ names took them all. Should naming a frame fail (a
+// fault in the handler itself), the handler runs again, says what it had
+// so far, the original crash's reason and the rest of the frames as bare
+// addresses, and ends the program as the original crash would have. Freestanding, the message is the last line of
 // the session log.
 
 // (No import of the std root: this module is in the compiler's own
@@ -49,10 +69,14 @@ const text_module = @import("../bootstrap/text.mlx")
 const diagnostics = @import("./diagnostics.mlx")
 const leaks = @import("./leaks.mlx")
 const turns = @import("./turns.mlx")
+const demangle = @import("./demangle.mlx")
 
 const SA_SIGINFO: usize = 4
 const SA_ONSTACK: usize = 134217728
 const SA_RESTORER: usize = 67108864
+// A fault in the handler runs it again (it knows it is in there: the
+// second time it says what it had and ends).
+const SA_NODEFER: usize = 1073741824
 // The handler's own stack: a stack overflow is one of the crashes to
 // report, and the handler could not run on the stack that overflowed.
 const HANDLER_STACK_SIZE: usize = 262144
@@ -64,6 +88,13 @@ const SI_ADDR_OFFSET: usize = 16
 const SI_QUEUE: usize = 4294967295
 // ucontext_t: uc_flags, uc_link, uc_stack (24 bytes), then uc_mcontext,
 // whose gregs hold rbp at 10, rsp at 15 and rip at 16.
+const GREGS_OFFSET: usize = 40
+// The general registers in gregs' order (r8 to r15, rdi, rsi, rbp, rbx,
+// rdx, rax, rcx, rsp; rip at 16).
+const REGISTER_NAMES = [16][]const u8{ "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rdi", "rsi", "rbp", "rbx", "rdx", "rax", "rcx", "rsp" }
+// siginfo_t's si_code of a fault the kernel raised without an address
+// (a general protection fault).
+const SI_KERNEL: usize = 128
 const RBP_OFFSET: usize = 40 + 10 * 8
 const RSP_OFFSET: usize = 40 + 15 * 8
 const RIP_OFFSET: usize = 40 + 16 * 8
@@ -92,6 +123,31 @@ const RECORD_AT: usize = 655360
 const PATH_AT: usize = 786432
 const TEXT_SIZE: usize = 131072
 const MAX_FRAMES: usize = 24
+
+// What a run of the handler that faults has done so far, for the run
+// that follows (failedWhileNaming): how many runs there are, the message
+// and record with every frame named until then, the frames, the next to
+// name, the exit status the crash has, the handler's room in the arena.
+var entered: usize = 0
+var reportMessage: usize = 0
+var reportMessageLength: usize = 0
+var reportRecord: usize = 0
+var reportRecordLength: usize = 0
+var reportFrames: [24]usize = undefined
+var reportFrameCount: usize = 0
+var reportFirstFrame: usize = 0
+var reportNext: usize = 0
+var reportStatus: usize = 0
+var reportRoom: usize = 0
+// The scratch memory and /proc/self/maps read into it: the run that
+// follows says the frames as files and offsets, naming nothing
+// (describe without names).
+var reportScratch: usize = 0
+var reportMapsLength: usize = 0
+var withoutNames: bool = false
+// tools/check_crash_report.sh: a fault while naming the first frame, to
+// see the report survive it.
+pub var faultWhileNaming: bool = false
 
 const SignalAction = struct {
     handler: usize
@@ -162,6 +218,9 @@ fn hexValue(byte: u8) -> usize { return @intCast(usize, text_module.hexValue(byt
 // The C-ABI handler (the kernel calls it with the signal, siginfo_t and
 // ucontext_t, on the handler stack). It never returns.
 export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void {
+    entered += 1
+    if entered > 1 { failedWhileNaming(signal, wordsAt(context)[RIP_OFFSET / 8]) }
+    reportStatus = 128 + @intCast(usize, signal)
     const registers = wordsAt(context)
     const rip = registers[RIP_OFFSET / 8]
     const rsp = registers[RSP_OFFSET / 8]
@@ -180,14 +239,19 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
         const room = mapped + SCRATCH_SIZE
         if room + ARENA_ROOM <= turns.end(arenaBase) { turns.moveFill(arenaBase, room) }
     }
+    reportRoom = mapped + SCRATCH_SIZE
     var scratch: [*]u8 = undefined
     unsafe { scratch = @ptrFromInt([*]u8, mapped) }
     const maps = offsetPointer(scratch, MAPS_AT)
     const maps_length = fs.readFile("/proc/self/maps".pointer, maps, MAPS_SIZE - 1)
+    reportScratch = mapped
+    reportMapsLength = maps_length
     const message = offsetPointer(scratch, MESSAGE_AT)
     const record = offsetPointer(scratch, RECORD_AT)
     var message_length: usize = 0
     var record_length: usize = 0
+    reportMessage = @intFromPtr(message)
+    reportRecord = @intFromPtr(record)
 
     // The program's name (the dock uses this too), from /proc/self/comm.
     var name: [32]u8 = undefined
@@ -223,6 +287,27 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
         put(message, &message_length, "illegal instruction (the values' arena is full: 1 GiB of values never given back, a loop that does not release its turns with std.turns)")
     } else if signal == 4 {
         put(message, &message_length, "illegal instruction (a failed runtime check: an index out of range, an unsigned subtraction below zero, an overflow)")
+    } else if signal == 11 && info != 0 && wordsAt(info)[1] & 4294967295 == SI_KERNEL {
+        // A general protection fault: an address no page can have (bits
+        // above the 47th not all equal; the kernel says 0). The registers
+        // show which (a pointer with mlx-cc's evaluator's tags in its top
+        // bits, 0x4000... or 0x2000..., is a constant's address that was
+        // never relocated).
+        put(message, &message_length, "segmentation fault touching an address outside the address space")
+        var index: usize = 0
+        var opened = false
+        while index < 16 {
+            const value = registers[GREGS_OFFSET / 8 + index]
+            if value >> 47 != 0 && value >> 47 != 131071 {
+                put(message, &message_length, if opened { ", " } else { " (" })
+                opened = true
+                put(message, &message_length, REGISTER_NAMES[index])
+                put(message, &message_length, " ")
+                putHex(message, &message_length, value)
+            }
+            index += 1
+        }
+        if opened { put(message, &message_length, ")") }
     } else if signal == 11 {
         put(message, &message_length, "segmentation fault touching ")
         putHex(message, &message_length, fault)
@@ -291,11 +376,27 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
     }
     // A failure: from where fail() was called (fail itself is no news).
     const first_frame: usize = if failed_text != 0 && frame_count > 1 { 1 } else { 0 }
+    if failed_text != 0 { reportStatus = 1 }
+    var kept: usize = 0
+    while kept < frame_count {
+        reportFrames[kept] = frames[kept]
+        kept += 1
+    }
+    reportFrameCount = frame_count
+    reportFirstFrame = first_frame
     var index = first_frame
     while index < frame_count {
+        // (Should this frame's naming fail, the report so far.)
+        reportNext = index
+        reportMessageLength = message_length
+        reportRecordLength = record_length
+        // The values the naming makes are given back after it.
+        const fill = if arenaBase != 0 { turns.fillWord(arenaBase).* } else { 0 }
         put(message, &message_length, if index == first_frame { "  at " } else { "  from " })
         const shown_from = message_length
+        if faultWhileNaming && index == first_frame { storeAt(8) }
         describe(frames[index], index == 0, maps, maps_length, scratch, message, &message_length)
+        if arenaBase != 0 { turns.moveFill(arenaBase, fill) }
         put(record, &record_length, "\t")
         putBytes(record, &record_length, offsetPointer(message, shown_from), message_length - shown_from)
         // A recursion: the same call again and again, said once.
@@ -314,8 +415,67 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
     }
     _ = io.writeAllBytes(io.stderr(), message, message_length)
     diagnostics.keepCrash(diagnostics.Source.processor, record, record_length)
-    const status: usize = if failed_text != 0 { 1 } else { 128 + @intCast(usize, signal) }
-    linux.exitGroup(status)
+    linux.exitGroup(reportStatus)
+}
+
+fn storeAt(address: usize) -> void {
+    unsafe { @ptrFromInt(*usize, address).* = 1 }
+}
+
+// The handler faulted (`signal`) while naming a frame, and runs again:
+// the report as it was before that frame, the frames from there as their
+// addresses, what went wrong, then the end the crash itself has. A fault
+// here too ends the program at once.
+fn failedWhileNaming(signal: i32, rip: usize) -> void {
+    if entered > 2 || reportMessage == 0 {
+        if entered == 2 {
+            // Before the report had begun (no memory, no values left):
+            // the signal alone.
+            var line: [96]u8 = undefined
+            const bytes: [*]u8 = &line
+            var length: usize = 0
+            put(bytes, &length, "mlx: crashed: signal ")
+            putNumber(bytes, &length, if reportStatus > 128 { reportStatus - 128 } else { reportStatus })
+            put(bytes, &length, " (and the crash report failed before it could say more)\n")
+            _ = io.writeAllBytes(io.stderr(), bytes, length)
+        }
+        linux.exitGroup(if reportStatus != 0 { reportStatus } else { 128 + @intCast(usize, signal) })
+    }
+    // The handler's own room again (values the failed run left).
+    if arenaBase != 0 && reportRoom != 0 { turns.moveFill(arenaBase, reportRoom) }
+    var message: [*]u8 = undefined
+    unsafe { message = @ptrFromInt([*]u8, reportMessage) }
+    var record: [*]u8 = undefined
+    unsafe { record = @ptrFromInt([*]u8, reportRecord) }
+    var message_length = reportMessageLength
+    var record_length = reportRecordLength
+    // The frames as files and offsets (the maps the failed run read).
+    withoutNames = true
+    var scratch: [*]u8 = undefined
+    unsafe { scratch = @ptrFromInt([*]u8, reportScratch) }
+    const maps = offsetPointer(scratch, MAPS_AT)
+    if reportFrameCount == 0 {
+        // Before the frames: the reason line is all there is.
+        put(message, &message_length, "\n")
+    }
+    var index = reportNext
+    while index < reportFrameCount {
+        put(message, &message_length, if index == reportFirstFrame { "  at " } else { "  from " })
+        const shown_from = message_length
+        describe(reportFrames[index], index == 0, maps, reportMapsLength, scratch, message, &message_length)
+        put(record, &record_length, "\t")
+        putBytes(record, &record_length, offsetPointer(message, shown_from), message_length - shown_from)
+        put(message, &message_length, "\n")
+        index += 1
+    }
+    put(message, &message_length, "  (the report failed naming the frames: signal ")
+    putNumber(message, &message_length, @intCast(usize, signal))
+    put(message, &message_length, " at ")
+    describe(rip, true, maps, reportMapsLength, scratch, message, &message_length)
+    put(message, &message_length, " in the crash handler; the frames from there are unnamed)\n")
+    _ = io.writeAllBytes(io.stderr(), message, message_length)
+    diagnostics.keepCrash(diagnostics.Source.processor, record, record_length)
+    linux.exitGroup(reportStatus)
 }
 
 // What the program is doing, for the report: a crash (or a failure,
@@ -447,7 +607,7 @@ fn describe(address: usize, exact: bool, maps: [*]const u8, maps_length: usize, 
                     index += 1
                 }
                 path[index] = 0
-                if nameInFile(path, in_file, exact, out, out_length) { return }
+                if !withoutNames && nameInFile(path, in_file, exact, out, out_length) { return }
                 // The file's name and the offset in it.
                 var base = at
                 var scan = at
@@ -555,10 +715,66 @@ fn memfdPath(path: [*]const u8, into: [*]u8) -> bool {
     return found
 }
 
+// The file the last address was named from: mapped read-only, with its
+// functions sorted by address (pairs of words: the address, the symbol's
+// offset in the file), both kept for the next frame in the same file.
+var cachedPath: [4096]u8 = undefined
+var cachedPathLength: usize = 0
+var cachedImage: usize = 0
+var cachedSize: usize = 0
+var cachedIndex: usize = 0
+var cachedIndexBytes: usize = 0
+var cachedCount: usize = 0
+// The symbol table the index is of, and its strings.
+var cachedSymbols: usize = 0
+var cachedSymbolsSize: usize = 0
+var cachedStrings: usize = 0
+var cachedStringsSize: usize = 0
+const STT_FUNC: usize = 2
+// The demangler's tables and text: in the data, not values of the arena
+// (a crash may be the arena running out; a C++ program's long names
+// would take much of what the handler has).
+var demangleTables: demangle.Tables = undefined
+var demangledText: [1024]u8 = undefined
+const SHT_SYMTAB: usize = 2
+const SHT_DYNSYM: usize = 11
+
 // Looks `in_file` (an offset in the ELF file at `path`) up in its symbol
 // table, or its dynamic symbols; writes name+0xOFFSET when found. A memfd
 // module is read through the descriptor that holds it.
 fn nameInFile(path: [*]const u8, in_file: usize, exact: bool, out: [*]u8, out_length: *usize) -> bool {
+    var length: usize = 0
+    while path[length] != 0 && length < 4095 { length += 1 }
+    var same = length == cachedPathLength && cachedImage != 0
+    var index: usize = 0
+    while same && index < length {
+        if cachedPath[index] != path[index] { same = false }
+        index += 1
+    }
+    if !same {
+        forgetFile()
+        if !mapFile(path) { return false }
+        index = 0
+        while index < length {
+            cachedPath[index] = path[index]
+            index += 1
+        }
+        cachedPathLength = length
+    }
+    return nameInImage(cachedImage, cachedSize, in_file, exact, out, out_length)
+}
+
+fn forgetFile() -> void {
+    if cachedImage != 0 { _ = linux.syscall2(linux.SYS_munmap, cachedImage, cachedSize) }
+    if cachedIndex != 0 { _ = linux.syscall2(linux.SYS_munmap, cachedIndex, cachedIndexBytes) }
+    cachedImage = 0
+    cachedIndex = 0
+    cachedCount = 0
+    cachedSymbols = 0
+    cachedPathLength = 0
+}
+
+fn mapFile(path: [*]const u8) -> bool {
     var descriptor_path: [32]u8 = undefined
     var opened = path
     if memfdPath(path, &descriptor_path) {
@@ -567,16 +783,116 @@ fn nameInFile(path: [*]const u8, in_file: usize, exact: bool, out: [*]u8, out_le
     const file = linux.syscall3(linux.SYS_open, @intFromPtr(opened), 0, 0)
     if file < 0 { return false }
     const size = linux.syscall3(linux.SYS_lseek, @bitCast(usize, file), 0, 2)
-    var found = false
-    if size > 64 {
-        const mapped = linux.syscall6(linux.SYS_mmap, 0, @bitCast(usize, size), 1, 2, @bitCast(usize, file), 0)
-        if mapped >= 0 {
-            found = nameInImage(@bitCast(usize, mapped), @bitCast(usize, size), in_file, exact, out, out_length)
-            _ = linux.syscall2(linux.SYS_munmap, @bitCast(usize, mapped), @bitCast(usize, size))
-        }
-    }
+    var mapped: isize = -1
+    if size > 64 { mapped = linux.syscall6(linux.SYS_mmap, 0, @bitCast(usize, size), 1, 2, @bitCast(usize, file), 0) }
     linux.close(file)
-    return found
+    if mapped < 0 { return false }
+    cachedImage = @bitCast(usize, mapped)
+    cachedSize = @bitCast(usize, size)
+    indexImage(cachedImage, cachedSize)
+    return true
+}
+
+// The functions of the image's symbol table (else its dynamic symbols:
+// a C library's), sorted by address into memory of the handler's own.
+fn indexImage(image: usize, size: usize) -> void {
+    const magic = bytesAt(image)
+    if magic[0] != 127 || magic[1] != 69 || magic[2] != 76 || magic[3] != 70 || magic[4] != 2 { return }
+    const section_offset = read64(image, 40)
+    const section_count = read16(image, 60)
+    if section_offset + section_count * 64 > size { return }
+    var kind = SHT_SYMTAB
+    while kind != 0 && cachedSymbols == 0 {
+        var index: usize = 0
+        while index < section_count {
+            const header = section_offset + index * 64
+            if read32(image, header + 4) == kind {
+                const strings_header = section_offset + read32(image, header + 40) * 64
+                const symbols = read64(image, header + 24)
+                const symbols_size = read64(image, header + 32)
+                const strings = read64(image, strings_header + 24)
+                const strings_size = read64(image, strings_header + 32)
+                if symbols + symbols_size <= size && strings + strings_size <= size && symbols_size >= 24 {
+                    cachedSymbols = symbols
+                    cachedSymbolsSize = symbols_size
+                    cachedStrings = strings
+                    cachedStringsSize = strings_size
+                }
+                break
+            }
+            index += 1
+        }
+        kind = if kind == SHT_SYMTAB { SHT_DYNSYM } else { 0 }
+    }
+    if cachedSymbols == 0 { return }
+    // The defined functions.
+    var count: usize = 0
+    var at = cachedSymbols
+    while at + 24 <= cachedSymbols + cachedSymbolsSize {
+        if isFunction(image, at) { count += 1 }
+        at += 24
+    }
+    if count == 0 { return }
+    cachedIndexBytes = (count * 16 + 4095) & 18446744073709547520
+    const memory = linux.mapAnonymous(cachedIndexBytes)
+    if memory == 0 { return }
+    var list: [*]usize = undefined
+    unsafe { list = @ptrFromInt([*]usize, memory) }
+    var entry: usize = 0
+    at = cachedSymbols
+    while at + 24 <= cachedSymbols + cachedSymbolsSize {
+        if isFunction(image, at) {
+            list[entry * 2] = read64(image, at + 8)
+            list[entry * 2 + 1] = at
+            entry += 1
+        }
+        at += 24
+    }
+    sortPairs(list, count)
+    cachedIndex = memory
+    cachedCount = count
+}
+
+// A defined function (STT_FUNC with a section: not an import).
+fn isFunction(image: usize, at: usize) -> bool {
+    const kind = @intCast(usize, bytesAt(image + at + 4)[0] & 15)
+    return kind == STT_FUNC && read16(image, at + 6) != 0 && read64(image, at + 8) != 0
+}
+
+// Heap sort of `count` pairs of words by their first.
+fn sortPairs(list: [*]usize, count: usize) -> void {
+    if count < 2 { return }
+    var start = count / 2
+    while start > 0 {
+        start -= 1
+        siftPairs(list, start, count)
+    }
+    var end = count
+    while end > 1 {
+        end -= 1
+        swapPairs(list, 0, end)
+        siftPairs(list, 0, end)
+    }
+}
+
+fn swapPairs(list: [*]usize, first: usize, second: usize) -> void {
+    const value = list[first * 2]
+    const symbol = list[first * 2 + 1]
+    list[first * 2] = list[second * 2]
+    list[first * 2 + 1] = list[second * 2 + 1]
+    list[second * 2] = value
+    list[second * 2 + 1] = symbol
+}
+
+fn siftPairs(list: [*]usize, start: usize, end: usize) -> void {
+    var root = start
+    while root * 2 + 1 < end {
+        var child = root * 2 + 1
+        if child + 1 < end && list[(child + 1) * 2] > list[child * 2] { child += 1 }
+        if list[root * 2] >= list[child * 2] { return }
+        swapPairs(list, root, child)
+        root = child
+    }
 }
 
 fn read16(image: usize, at: usize) -> usize {
@@ -612,33 +928,58 @@ fn nameInImage(image: usize, size: usize, in_file: usize, exact: bool, out: [*]u
         }
         index += 1
     }
-    if !placed { return false }
-    const section_offset = read64(image, 40)
-    const section_count = read16(image, 60)
-    if section_offset + section_count * 64 > size { return false }
-    // The symbol table, else the dynamic symbols (C libraries).
-    var kind: usize = 2
-    while kind != 0 {
-        index = 0
-        while index < section_count {
-            const header = section_offset + index * 64
-            if read32(image, header + 4) == kind {
-                const strings_header = section_offset + read32(image, header + 40) * 64
-                if nameInSymbols(image, size, read64(image, header + 24), read64(image, header + 32), read64(image, strings_header + 24), read64(image, strings_header + 32), address, exact, out, out_length) {
-                    lineInImage(image, size, address, out, out_length)
-                    return true
-                }
-            }
-            index += 1
-        }
-        kind = if kind == 2 { 11 } else { 0 }
+    if !placed || cachedCount == 0 { return false }
+    // The last function starting at or before the address (binary
+    // search), back past those that end before it.
+    var list: [*]const usize = undefined
+    unsafe { list = @ptrFromInt([*]const usize, cachedIndex) }
+    var low: usize = 0
+    var high = cachedCount
+    while low < high {
+        const middle = (low + high) / 2
+        if list[middle * 2] <= address { low = middle + 1 } else { high = middle }
     }
-    return false
+    var found = false
+    var steps: usize = 0
+    var start: usize = 0
+    var symbol: usize = 0
+    while low > 0 && steps < 16 && !found {
+        low -= 1
+        steps += 1
+        start = list[low * 2]
+        symbol = list[low * 2 + 1]
+        const extent = read64(image, symbol + 16)
+        if extent == 0 || address < start + extent { found = true }
+    }
+    if !found { return false }
+    const name_offset = read32(image, symbol)
+    if name_offset >= cachedStringsSize { return false }
+    const name = bytesAt(image + cachedStrings + name_offset)
+    var length: usize = 0
+    while name_offset + length < cachedStringsSize && name[length] != 0 { length += 1 }
+    putBytes(out, out_length, name, length)
+    put(out, out_length, "+")
+    putHex(out, out_length, if exact { address - start } else { address + 1 - start })
+    // A C++ name: as it is written.
+    if demangle.isMangled(name[0..length]) {
+        const text_bytes: [*]u8 = &demangledText
+        const written = demangle.demangleWith(name[0..length], text_bytes, 1024, &demangleTables)
+        if written > 0 {
+            put(out, out_length, " (")
+            putBytes(out, out_length, text_bytes, written)
+            put(out, out_length, ")")
+        }
+    }
+    lineInImage(image, size, address, start, read64(image, symbol + 16), out, out_length)
+    return true
 }
 
 // The line `address` is on, from the compiler's line table (.mlx_lines):
-// " at path:line" after the function's name.
-fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length: *usize) -> void {
+// " at path:line" after the function's name. A table of where each
+// function was defined (MLXFUNCS, the one the linker makes of mlx-cc's
+// marks) says " defined at path:line", for the function at `start` only
+// (`extent` bytes long).
+fn lineInImage(image: usize, size: usize, address: usize, start: usize, extent: usize, out: [*]u8, out_length: *usize) -> void {
     const section_offset = read64(image, 40)
     const section_count = read16(image, 60)
     const names_index = read16(image, 62)
@@ -658,7 +999,9 @@ fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length
         }
         index += 1
     }
-    if table == 0 || table + table_size > size || table_size < 16 || address < text_address { return }
+    if table == 0 || table + table_size > size || table_size < 16 || address < text_address || start < text_address { return }
+    // "MLXFUNCS" or "MLXLINES".
+    const functions = bytesAt(image + table)[3] == 70
     const entries = read32(image, table + 8)
     const files = read32(image, table + 12)
     if 16 + entries * 12 > table_size { return }
@@ -670,8 +1013,15 @@ fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length
         const middle = (low + high) / 2
         if read32(image, table + 16 + middle * 12) <= offset { low = middle + 1 } else { high = middle }
     }
-    if low == 0 { return }
-    const entry = table + 16 + (low - 1) * 12
+    // (An entry before the function's start is another function's: in
+    // its first instructions, before the first line's, the address is on
+    // the function's first line.)
+    var entry = table + 16 + (if low == 0 { 0 } else { low - 1 }) * 12
+    if low == 0 || read32(image, entry) < start - text_address {
+        if functions || low >= entries { return }
+        entry = table + 16 + low * 12
+        if extent == 0 || read32(image, entry) >= start + extent - text_address { return }
+    }
     const file = read32(image, entry + 4)
     const line = read32(image, entry + 8)
     if file >= files { return }
@@ -684,37 +1034,10 @@ fn lineInImage(image: usize, size: usize, address: usize, out: [*]u8, out_length
     }
     var length: usize = 0
     while at + length < table + table_size && bytesAt(image + at)[length] != 0 { length += 1 }
-    put(out, out_length, " at ")
+    put(out, out_length, if functions { " defined at " } else { " at " })
     putBytes(out, out_length, bytesAt(image + at), length)
     put(out, out_length, ":")
     putNumber(out, out_length, line)
-}
-
-fn nameInSymbols(image: usize, size: usize, symbols: usize, symbols_size: usize, strings: usize, strings_size: usize, address: usize, exact: bool, out: [*]u8, out_length: *usize) -> bool {
-    if symbols + symbols_size > size || strings + strings_size > size { return false }
-    var best_value: usize = 0
-    var best_name: usize = 0
-    var found = false
-    var at = symbols
-    while at + 24 <= symbols + symbols_size {
-        const kind = bytesAt(image + at + 4)[0] & 15
-        const value = read64(image, at + 8)
-        const extent = read64(image, at + 16)
-        if kind == 2 && value <= address && (address < value + extent || extent == 0) && (!found || value > best_value) {
-            best_value = value
-            best_name = read32(image, at)
-            found = true
-        }
-        at += 24
-    }
-    if !found || best_name >= strings_size { return false }
-    const name = bytesAt(image + strings + best_name)
-    var length: usize = 0
-    while best_name + length < strings_size && name[length] != 0 { length += 1 }
-    putBytes(out, out_length, name, length)
-    put(out, out_length, "+")
-    putHex(out, out_length, if exact { address - best_value } else { address + 1 - best_value })
-    return true
 }
 
 // Whether the page holding `address` is mapped (the stack ends somewhere
@@ -745,8 +1068,9 @@ pub fn install() -> bool {
         handler = @intFromPtr(mlxCompositorCrashed)
         restorer = @intFromPtr(mlxCompositorSignalReturn)
     }
-    // Not SA_NODEFER: a handler that crashes must not run again.
-    var action = SignalAction.{ .handler = handler, .flags = SA_SIGINFO | SA_ONSTACK | SA_RESTORER, .restorer = restorer, .mask = 0 }
+    // SA_NODEFER: a handler that faults runs again, and knows it
+    // (failedWhileNaming).
+    var action = SignalAction.{ .handler = handler, .flags = SA_SIGINFO | SA_ONSTACK | SA_RESTORER | SA_NODEFER, .restorer = restorer, .mask = 0 }
     var ok = true
     const signals: [7]usize = [7]usize{ linux.SIGILL, linux.SIGSEGV, linux.SIGBUS, linux.SIGFPE, linux.SIGABRT, linux.SIGTRAP, linux.SIGUSR2 }
     for signal in signals {
@@ -755,7 +1079,6 @@ pub fn install() -> bool {
     arenaBase = turns.locate()
     // The rest of the runtime's diagnostics: with MLX_LEAK_CHECK the
     // program's memory is watched from here on (std.leaks).
-    leaks.describeWith(describeReturn)
     _ = leaks.watch()
     return ok
 }

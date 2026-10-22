@@ -783,8 +783,69 @@ mlx-codemap [-C ROOT] stats | files [TEXT] | outline FILE | find TEXT |
     unresolved [FILE] | json
 ```
 
-SYMBOL is `name`, `Container.name`, `path:name` or `FILE:LINE:COL`. The
-answers are `path:line:col: kind Qualified.name` lines.
+SYMBOL is `name`, `Container.name`, `path:name` or `FILE:LINE:COL`; for
+C and C++ also `Namespace::Class::name` (any tail of it, `.` for `::`
+too) and the mangled name. The answers are `path:line:col: kind
+Qualified.name` lines.
+
+## C and C++
+
+The map holds the repository's C and C++ too (the WebKit port and
+WebKit's sources as compiled for it, mlxlibcpp, the C tests of
+compiler/libc, mlx-cc's tests), read not by a parser of its own but from
+what mlx-cc resolved while it compiled them: `mlx-cc --index=DIR` (or
+`MLX_CC_INDEX=DIR`, which leaves the command line and so `mlx build`'s
+cache keys alone) writes a shard per file a unit read, with every
+declaration and every use each name resolved to
+([`compiler/cc/index.mlx`](../../compiler/cc/index.mlx) describes the
+text). [`tools/codemap/cpp.mlx`](../../tools/codemap/cpp.mlx) joins the
+shards of `ROOT/mlx-out/codemap/cpp` and of the directories in
+`MLX_CODEMAP_CPP` to the index: a C or C++ file is a file of the map,
+its functions, variables, classes, data members and macros symbols, its
+calls, reads, writes, types, base classes, overrides, macro expansions
+and `#include`s uses. So every command works across the languages:
+
+```
+mlx-codemap callers WebCore::FontCache::createFontPlatformData
+mlx-codemap show FontCache::createFontPlatformData   # its definition's source
+mlx-codemap outline projects/webkit/port/embed/MlxFrameLoaderClient.cpp
+mlx-codemap importers FontCache.h                    # who includes it
+mlx-codemap callers scale.mlx:shapes_scale           # an Mlx export's C++ callers
+```
+
+- A function is one symbol however many headers and units declare it
+  (they join by the name the linker knows); its place is its first
+  declaration, `show` prints its definition (the body, with line
+  numbers) wherever it is, and `outline` of a source file lists the
+  definitions of what is declared elsewhere (`definition Class::name`).
+- A template is one symbol: its instances are read from its text, so
+  their uses are the template's.
+- Across the languages: a C declaration (mlx-cheaders' headers) of a
+  function an Mlx `export fn` defines is that function, so its C and C++
+  calls are its callers; an Mlx `extern fn` a C file defines is the C
+  function.
+- `callers`/`callees` find the function around a use by its body's
+  extent; `crashes` and `hot` name C and C++ frames by linker name.
+
+Where the shards come from:
+
+- `./mlx build codemap-cpp-index` (tools/codemap_index.sh): the
+  repository's own C and C++, compiled to /dev/null with the index on.
+- `tools/codemap_index.sh --build webkit-mlx-webcore` (any build steps):
+  their C and C++ units from the build's own command lines (`mlx build
+  --dry-run --verbose` prints them), two at a time while 5 GB are free.
+- A build with `MLX_CC_INDEX=$PWD/mlx-out/codemap/cpp` in its environment
+  indexes each unit it compiles (not those the cache gave).
+
+A shard is written once: a header another unit indexed (unchanged) is
+not indexed again, which keeps a WebCore unit's cost to about 3% of its
+time once its headers are indexed (the first unit to read a header
+writes its shard). Not in it: locals and parameters, enumerators and
+typedefs as declarations of their own, templates no unit instantiated,
+the bodies of inline functions no unit used (mlx-cc reads those only
+when used; their place and extent are there), implicit calls
+(destructors, conversions). A use inside a macro's expansion is at the
+macro's text.
 
 ## Pictures
 
@@ -841,6 +902,13 @@ committed).
    the saved files again; completion after `std.fs.` offers the public
    functions of a std of the tree's own; a local typed and not saved is
    in the hover, with its type, a moment after.
+
+`tools/check_codemap_cpp.sh` checks the C and C++ part on a project of
+its own (tools/codemap/tests/cpp: classes, a template, overloads,
+namespaces, macros, an override, C beside C++, an Mlx export the C and
+C++ call): the objects are the same with and without the index, a shard
+is written once, and find, refs, callers, callees, outline, def, show,
+members, imports and importers answer as `expected/` says.
 
 `tools/check_crash_report.sh` checks the crash reports themselves: the
 symbol table, the functions a crash names and the kept log.

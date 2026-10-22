@@ -295,7 +295,7 @@ units (lever 5), brings a WebCore unit under 2 GB resident.
    and would let `-j 4` hold for WebCore on 15 GB.
 3. The prefix snapshot (lever 5): 1.7 GB and 26 s (before this branch;
    now less) of every WebCore unit's 4.15 GB and 53 s are the same
-   prefix.
+   prefix. (Done: "Results: prefix snapshot" below.)
 4. For a 40-minute full build on four cores (1250 units): the average
    unit must take ~8 s of processor time; the average was ~30 s (6.4 h
    at `-j 2`) and is ~12 s now if the units gained what the two
@@ -441,7 +441,8 @@ spread: the accessors' loads (`get32`, `getWord`, `putText`: cache
 misses on a 4 GB arena), `instanceKey`, the overload machinery, the
 constraint evaluations. None is a walk any more. The large constant
 left is the prefix: 25.8 s and 1.7 GB of every WebCore unit (stage 2
-above). A design for the snapshot, not done:
+above). A design for the snapshot (done, with the changes "Results: prefix
+snapshot" below says):
 
 1. **Make the arena's address fixed** (base.init: `mmap` with a hint
    and `MAP_FIXED_NOREPLACE`, failing the run if taken), so that every
@@ -597,6 +598,255 @@ in reading order, so a lambda in an inline function has another number
 in its mangled name than before (as before, the number is the unit's,
 not the program's).
 
+## Results: prefix snapshot (branch mlxcc-prefix, 2026-10-22)
+
+Stage 5 of the list above, done: `mlx-cc --write-prefix-snapshot SNAP
+FLAGS -include P.h` writes the compiler's state after the `-include`
+files; `mlx-cc --prefix-snapshot SNAP FLAGS -include P.h -c unit.cpp`
+maps it back and reads only the unit's own file
+(compiler/cc/snapshot.mlx, compiler/cc/README.md "Prefix snapshots").
+Measured as the memory branch did (the child's `getrusage`: user and
+system time, peak resident set; MLX_CC_STATS, which now also prints the
+peak and the private and file-backed resident sets at the end), one
+compile at a time, beside a full WebKit build at `-j 3` on the same
+machine, with the Mlx port's flags and the generated headers of that
+build (scratchpad `pfx/`: flags.py, one.sh, final.sh, mem2.sh).
+
+### What a snapshot is
+
+- **The arena** (every token, node, type, object, binding, macro,
+  name, file text and table of the compilation): it is now mapped at a
+  fixed address, 0x300000000000, with MAP_FIXED_NOREPLACE (anywhere,
+  and no snapshots, when that is taken), so the addresses it holds are
+  valid in another run of the same binary. The file holds its used
+  pages, zero pages left as holes; a reader maps them MAP_PRIVATE and
+  MAP_FIXED over its own arena, so they come from the page cache, shared
+  by the units built at once, and are copied only where a unit writes.
+- **Every module-level variable** of the compiler's 28 modules with
+  state (about 470: the name table's and file table's addresses, scope
+  heads and stacks, the macro table, pending and deferred bodies, the
+  template instance tables, the lambda and instance counters and
+  per-context lambda numbers, the include search's remembered answers,
+  `#pragma once` marks, `-MD`'s list), by address and size: each module
+  has a `keepState()` that tools/cc_snapshot_state.py writes from its
+  declarations, and check_cc.sh fails when one is out of date, so a new
+  variable is in the snapshot unless its line says `// (per run)`.
+  The per-run ones: the arena's own bookkeeping, the object writer's
+  encoder (its buffers are the process's heap), the link's inputs and
+  libraries, -s and the map path, the MLX_CC_STATS counts, the
+  constexpr trace switch.
+- **Not the run's own memory.** Everything the command line makes (the
+  file names, -D and -I texts, the link's inputs) is allocated in a side
+  region after the arena (base.beginSide), and the include directories
+  and macros are given to the compiler after the command line was read.
+  So the arena when the prefix starts is the same in every run with the
+  same options, whatever `-o`, `-MF` or the file are, which is what makes
+  a snapshot valid for every unit of a target.
+
+What changed in the compiler to make that true, in every run (with a
+snapshot or without, so the objects are the same either way):
+
+- **The unit is read in two parts**: the -include files are
+  preprocessed and parsed, then the file is preprocessed and parsed
+  (before, the whole unit was preprocessed, then parsed). A snapshot is
+  the state between the two; the writer refuses when the prefix ends
+  inside a namespace, `extern "C"` or a block.
+- **The prefix does not depend on the unit**: the file's path is given
+  to the compiler after the prefix (decl.startUnit), and while the
+  prefix is read the unit's hash, which names its lambdas' closure
+  classes and its unnamed namespace (`_GLOBAL__N_...`), is the hash of
+  the prefix's identity (its options in order, the language). A prefix
+  lambda's class is then the same class in every unit of the target,
+  which is right: it is the same lambda of the same header. Lambdas
+  numbered in their context (the Itanium `UlvE_` numbers) continue from
+  the restored tables; the unnamed namespace is named when first opened.
+  The unit's globals made by the prefix carry file 0 (a message about
+  one names the unit). The prefix's warnings are kept and said again by
+  a reader.
+- **`-MD`'s text is made in the side memory, at once.** It was joined a
+  name at a time, the whole text again for each of a WebCore unit's
+  ~3000 headers: 2.3 GB of arena for JSDOMWindow.cpp (peak 5.8 → 3.5 GB)
+  — and its size, which the object's name changes, moved everything
+  after it in the arena. That mattered because **objects hold compiler
+  addresses**: words of data the constant evaluator filled and a
+  relocation then names (JSDOMWindowTable's `values`) keep the
+  evaluator's own pointer (a tagged arena address). The linker
+  overwrites them (RELA), so programs are right, but two runs whose
+  arenas differ make objects that differ there (JSDOMWindow.cpp with
+  `-o x.plain.o` and `-o x.snap.o` did, before the fix). Zeroing those
+  words in program.mlx broke tests/gnuforms.c, so some path reads them:
+  left as it is, to look at (it is why the arena layout must be
+  identical, not just equivalent).
+
+### How a reader checks it (else it reads the prefix and says why)
+
+- **The key**, compared as text: a hash of the compiler's binary and its
+  path (which finds the system headers), the working directory, the
+  language, `MLX_CC_INCLUDE` and `MLX_CC_READ_ALL_BODIES`, and every
+  option that changes the compilation in its order (-I, -isystem, -D, -U,
+  -include, -std=, and any option mlx-cc does not know); not -o, -c, -E,
+  -MD/-MMD/-MF/-MT/-MQ, -x (the file's language is in the key), -L, -l,
+  the link's options or the files. The note names the first line that
+  differs (`another command line or compiler: option -std=c++17`; the
+  measurement scripts' first memory runs were refused for `in <another
+  directory>`).
+- **The variables' layout**: the same addresses and sizes.
+- **Every file the prefix read**: read again, its size and a hash of its
+  contents compared. A file written again with the same contents has
+  another inode: its `#pragma once` mark follows it (a regenerated
+  header that did not change does not cost the snapshot).
+- **The include search's answers**: for each include directory (and
+  each directory a quoted #include looked next to its file in), its
+  modification time and identity. Where one changed, every name the
+  search did not find there, before where it was found, is looked for
+  again (a header new there would now be found first), the one found
+  there must still be there, and a quoted include's miss next to its
+  file must still miss. (Clang's PCH checks the files read, not the
+  misses.)
+
+tools/check_cpp.sh: the six tests of two files (lambda names in inline
+functions and initializers, explicit instantiations in another file,
+statics of inline functions, typedef names of unnamed classes, constexpr
+members) compiled with their header as the prefix, from a snapshot and
+without, objects compared and the program run; four programs cut before
+`main` (deleting destructors, explicit instantiation definitions,
+generic lambdas, member templates in the prefix) likewise; a changed
+header, a header the search would now find first, and other options are
+refused (and the object is the one made without), while a header written
+again with the same contents and a new header in a directory the search
+never reaches are not.
+
+### The build
+
+projects/webkit/build.mlx `usePrefixSnapshot(set, flags)`: for JSC's,
+PAL's and WebCore's C++ flags, one step per (target, flag set) runs
+`mlx-cc --write-prefix-snapshot OBJDIR/prefix.snapshot -MD -MF ...
+FLAGS -x c++`; it names mlx-cc as its input (the snapshot is the
+compiler's memory: any change of the binary makes it again) and the
+prefix's headers by its depfile. Every unit compiled with those flags
+(the same flags text) gets `--prefix-snapshot` and runs after the step
+(`dependOn`), but the snapshot is not one of the unit's inputs: an
+object made with it is the object made without it, so it is in no
+object's key, and a unit whose snapshot is stale reads its prefix itself.
+std.build gets `uncached(step)` (a command with a depfile stays out of
+the result cache): the snapshots are 0.8–1.7 GB each (sparse: 0.1–1 GB
+on disk) and would push the objects out of its 6 GB. WTF has no
+`-include` in its flags (its prefix, config.h, is 0.26 s of a 1.6 s
+unit) and Skia and bmalloc have no common prefix: unchanged.
+
+`./mlx build -j 2 webkit-jsc` in a fresh checkout of the branch (the
+generators from the result cache, mlx-cc new so every object made
+again): 333 steps in 2 min 44 s (4 min 0 s user, 1 min 9 s system),
+the snapshot step before the units, no unit refusing it; one unit's
+command line taken from the running build and run again without
+`--prefix-snapshot` makes the build's object byte for byte. With
+branch build-incremental's codegen epoch: this branch changes objects
+(the prefix's lambda names, the arena's layout in the words above), so
+the epoch must be bumped when the two meet; the snapshot step should
+keep keying on mlx-cc's bytes, not the epoch.
+
+### The numbers
+
+The snapshots (written by the step above; their `-MD` file lists the
+prefix's headers):
+
+| Prefix | Read and written | Size (on disk) | Taken up (an empty unit) | Read (an empty unit, no snapshot) |
+|---|---|---|---|---|
+| WTF `-include config.h` | 0.3 s user, 0.4 s sys | 817 MB (96 MiB) | 0.01 s, 0.03 s | 0.16 s, 0.10 s |
+| JSC `JavaScriptCorePrefix.h` | 3.4 s, 3.3 s | 1.40 GB (703 MiB) | 0.27 s user, 0.22 s sys | 4.1 s, 0.6 s |
+| WebCore `WebCorePrefix.h` + `MlxPrefix.h` | 6.2 s, 5.1 s | 1.68 GB (981 MiB) | 0.33 s, 0.31 s | 5.8 s, 1.1 s |
+
+(Taking one up is mostly the check: reading and hashing the prefix's
+~1000 headers. Writing is the prefix read once more plus the pages
+written.)
+
+The units, user time / peak resident set, without and with the snapshot;
+every object byte for byte the same, and the `-MD` files the same
+(compiler 6ba601c; 8cf4046, which only names a snapshot's first
+-include file once in its `-MD` file, rechecked on WTFString, JSC
+runtime-1, WebCore css-1 and workers-2: the same):
+
+| Unit | Without | With | |
+|---|---|---|---|
+| WTF `wtf/text/WTFString.cpp` (`-include config.h`) | 1.33 s / 399 MiB | 1.07 s / 391 MiB | |
+| JSC, 11 units (runtime-1, -20, API-1, bytecode-1, dfg-1, b3-1, heap-1, jit-1, parser-1, wasm-1, yarr-1) | 4.21 s / 849 MiB (mean; 3.6–5.2 s) | 0.86 s / 579 MiB (0.23–1.98 s) | 4.9× |
+| WebCore `UnifiedSource-workers-2.cpp` | 17.4 s / 2526 MiB | 12.6 s / 2208 MiB | |
+| `css-1` | 9.5 s / 1539 MiB | 4.9 s / 1193 MiB | |
+| `html-3` | 10.0 s / 1388 MiB | 3.2 s / 1061 MiB | |
+| `rendering-5` | 12.7 s / 1709 MiB | 6.6 s / 1384 MiB | |
+| `page-2` | 15.5 s / 2224 MiB | 11.3 s / 1907 MiB | |
+| `loader-1` | 8.9 s / 1356 MiB | 2.7 s / 1024 MiB | |
+| `platform-10` | 7.5 s / 1113 MiB | 0.9 s / 758 MiB | |
+| `JSBindings-5` | 19.4 s / 2568 MiB | 13.2 s / 2393 MiB | |
+| `svg-2` | 15.0 s / 2077 MiB | 9.6 s / 1754 MiB | |
+| `dom-7` (the largest) | 33.9 s / 4014 MiB | 29.4 s / 3708 MiB | |
+| `JSDOMWindow.cpp` | 27.9 s / 3508 MiB | 20.2 s / 3338 MiB | |
+| WebCore, the 11: mean user + sys | 18.3 s | 11.7 s | 1.6× |
+
+So a WebCore unit saves 4–8 s of user time (5.7 s on average, the
+prefix being 5.8 s) and 0.9 s of system time, and a JSC unit 3.4 s of
+its 4.8 s; what is left of a small unit (platform-10, most JSC units) is
+its own code. The peak drops
+by the part of the prefix the unit never touches; the private memory
+(MLX_CC_STATS at the end) by more, since the pages a unit only reads stay
+the page cache's, one copy for all the units built at once:
+
+| Unit | Without: peak (private) | With: peak (private + snapshot pages) |
+|---|---|---|
+| WTFString.cpp | 399 MiB (398) | 390 MiB (361 + 29) |
+| JSC runtime-1 | 1011 MiB (1009) | 748 MiB (520 + 228) |
+| WebCore workers-2 | 2528 MiB (2527) | 2198 MiB (1852 + 346) |
+| JSDOMWindow.cpp | 3512 MiB (3510) | 3336 MiB (2838 + 498) |
+| dom-7 | 4020 MiB (4018) | 3707 MiB (3351 + 356) |
+
+### What it gives the full build
+
+The Mlx port's library objects: WebCore 584, JSC 207, PAL 5 (snapshot
+steps), WTF 172, bmalloc 168, Skia 835 (no common prefix, unchanged).
+From the sample's means (user + system per unit; the WebCore sample
+holds the two largest units, so it is if anything heavy):
+
+| | Units | Without | With |
+|---|---|---|---|
+| WebCore | 584 | 18.3 s each: 10 690 s | 11.7 s: 6 830 s (+ 11 s for the snapshot) |
+| JavaScriptCore | 207 | 4.8 s: 1 000 s | 1.2 s: 240 s (+ 7 s) |
+| together, CPU | | 3.25 h | 1.97 h (−39%) |
+| at `-j 3` | | 65 min | 39 min |
+| at `-j 4` | | 49 min | 30 min |
+
+(WTF, bmalloc, Skia and the links come on top of both columns, as they
+are.) Whether `-j 4` holds is the memory: with the snapshot a WebCore
+unit's private memory is about 0.67 GB less than without it (workers-2
+1.8 GB, dom-7 3.3 GB; the sample's peaks 0.76–3.7 GB, ~1.7 GB typical)
+plus the snapshot's pages once for all of them (≤ 0.5 GB), so four units
+fit in 15 GB unless three of the largest (dom-7, JSDOMWindow,
+inspector-6, css-19) run together.
+
+### Found on the way
+
+- **mlx4's inliner captured names** (fixed): a function inlined into its
+  caller read the caller's local where its own module has a variable of
+  the same name. `other.mlx`: `var dirs: usize = 7` and `pub fn
+  get(index: usize) -> usize { return dirs + index }`; a caller with
+  `const dirs = arguments.length` and `other.get(0)` got 1, not 7, at
+  every level (a function marked `inline` even at -O0). snapshot.mlx's
+  first version crashed on it (`paths.directoryName` inlined into a
+  function with a local `dirs`). The inlined expression is lowered with
+  the caller's bindings in place, and the lookups by name walked them
+  all; they now stop at a floor the expansion sets
+  (ir/lower.mlx `bindingFloor`), so a name in the callee is its
+  parameter or its module's. tests/393_inline_own_names_runtime.mlx
+  (tests/run_inline.sh: default level, -O3, -O0) and a probe in
+  tools/ensure_compiler.sh, which rebuilds an mlx4 without the fix. A
+  compiler counting the names the old one would have read wrong found
+  none in mlx4 itself, mlx-ld, mlx-ar or mlx-cheaders, and 10 lookups in
+  mlx-cc at -O3 (`at` 9 times, `node` once: names of functions the
+  inlined bodies call, which the callers also have as locals); the
+  objects of the six units below are the same with the mlx-cc the old
+  mlx4 built.
+- The `-MD` text and the compiler addresses in relocated data words
+  (above).
+
 ## Allocators (notes, 2026-10-21; nothing changed yet)
 
 docs/reference/stdlib.md says a program's blocks come from
@@ -678,3 +928,265 @@ does not), and the heap's one lock, which every block of every thread
 would take, against today's one mmap per large block and the tiny
 pages' own lock for the small ones (the tinypage test's four threads,
 the GPA test's four).
+
+## Proposal: the linker as a program of its own, mlx-ld (2026-10-22; done on branch build-incremental, see "Incremental builds" below)
+
+Every WebKit object step names `mlx-out/bin/mlx-cc` as an input
+(`Build.input(b, step, tc.cc)` in projects/webkit/build.mlx), and an
+input's key is its contents: any change to the mlx-cc binary compiles
+all of WebKit again (about 2000 objects, hours). The linker
+(compiler/selfhost/object/link.mlx, archive.mlx, elf64_dynamic.mlx) is
+compiled into mlx-cc (compiler/cc/program.mlx calls `link.writeProgram`
+in the same process), so a change that only touches linking (the symbol
+table of branch linker-symtab, a link map, a relocation kind) still
+changes mlx-cc's bytes and throws away every object it never affected.
+
+The split:
+
+- **mlx-ld** (compiler/ld/main.mlx): link.mlx, archive.mlx,
+  elf64_dynamic.mlx and the options that are the linker's: `-o`, the
+  objects and archives, `-L`/`-l`/`-l:`, `--dynamic-linker`,
+  `-Wl,-Map=`, `-s`/`--strip-all`. It reads relocatable objects only,
+  as it does now.
+- **mlx-cc** keeps the driver: `mlx-cc -o prog a.c b.o -lfoo` writes the
+  object of the `.c` files as now (`program.buildObject`), to a file in
+  `$TMPDIR` instead of handing it over in memory, and runs mlx-ld on it
+  and the other inputs (posix_spawn, the arguments passed through), as
+  `cc` runs `ld`. `-c` never involves mlx-ld. The C++ library it adds
+  (`-lmlxcpp`, `addCppLibraries`) becomes an argument like any other.
+  mlx-cc finds mlx-ld next to itself (as it finds `include/`), or by
+  MLX_LD.
+- The build: `cc()` in build.mlx declares a third program of the group,
+  `mlx-ld` (compiler/ld/main.mlx), and `webkit.Toolchain` gets `.ld`.
+  Object steps keep `Build.input(step, tc.cc)` and depend on mlx-cc
+  only. Link steps (the archives' programs, webcore-test, webcore-dump,
+  the tools') add `Build.input(step, tc.ld)` and depend on the mlx-ld
+  step; better still, they call mlx-ld themselves with the objects (the
+  driver adds nothing to a link of objects alone but `-lmlxcpp`).
+
+What the cache keys would then depend on:
+
+| Step | Key (besides the step's line and sources, headers by -MD) |
+| --- | --- |
+| an object (`mlx-cc -c`) | the bytes of mlx-cc: preprocessor, parser, code generator, object writer (relocatable.mlx) |
+| an archive (`mlx-ar`) | the objects, mlx-ar |
+| a program or shared library | the objects and archives, mlx-ld (and mlx-cc while the step goes through the driver) |
+
+So a change to link.mlx, elf64_dynamic.mlx or archive.mlx relinks the
+programs (seconds to a minute each for WebKit's) and compiles nothing.
+A change to relocatable.mlx (the object format, which both read)
+changes both binaries, and objects are rebuilt, which is right: their
+bytes change. The Mlx compiler (mlx4) is untouched: it links its own
+programs in-process and keys its steps on its own hash as now
+(cache.mlx `compilerHash`).
+
+A finer key for objects, independent of the split and complementary:
+mlx-cc could print a code generation version (a hash of the modules
+that decide an object's bytes, computed when mlx-cc is built), and
+object steps would key on that instead of the binary, so that a
+diagnostic's wording or a `--version` string changes nothing either.
+That needs the build to read a tool's version rather than hash a file
+(a `Build.inputVersion(step, tool, "--codegen-hash")`), which it cannot
+yet.
+
+Costs: one more process per link (nothing next to a WebKit link's
+seconds); the in-memory object of `mlx-cc -o prog x.c` is written and
+read back (the size of one unit's object); mlx-cc and mlx-ld must agree
+on the object format, which they share by source (relocatable.mlx), and
+`tools/check_link.sh`, `check_cc.sh` and `check_cpp.sh` cover both
+paths as they do now.
+
+## Incremental builds (branch build-incremental, 2026-10-22)
+
+### 1. mlx-ld
+
+Done as proposed above, with one change of plan: the unit mlx-cc
+compiles for `mlx-cc -o prog x.c` is not handed over as a `.o` file. An
+ELF object read back (relocatable.read) is not the object mlx-cc had in
+memory: the reader adds the four section symbols, puts the locals
+before the globals and gives every object all of its sections, and the
+linker lays out what it is given in that order, so `mlx-cc -o p x.c`
+and `mlx-cc -c x.c && mlx-cc -o p x.o` already made different programs
+(24 bytes more data in `arith`, for one). mlx-cc writes the object as it
+is in memory instead (`compiler/selfhost/object/unit.mlx`: the
+sections, symbols and relocations in order, a dozen lines of format)
+into a memfd and `execve`s mlx-ld on `/proc/self/fd/N`, the objects and
+archives of the command line in order, `-l:SONAME` for each library and
+`--dynamic-linker`/`-s`/`-Map`; no temporary file, the compiler's arena
+is gone before the link starts, and mlx-cc's exit status is mlx-ld's.
+
+- `compiler/ld/main.mlx` (mlx-ld: link.mlx, archive.mlx,
+  elf64_dynamic.mlx, the link map moved out of program.mlx); `-L`/`-l`
+  with mlx-cc's rules (and `-lmlxcpp` where mlx-cc finds it), `-Wl,`
+  forms spread. mlx-cc finds it as `$MLX_LD`, else beside itself.
+- build.mlx's `cc` group builds `mlx-ld` (-O3) beside mlx-cc;
+  `webkit.Toolchain` has `.linker`/`.ld`; the link steps of the WebKit
+  build (`linkProgram`, the WebCore test programs) name mlx-ld as an
+  input and depend on its step. Object steps name mlx-cc only.
+- mlx-cc no longer imports link.mlx, archive.mlx or elf64_dynamic.mlx
+  (2.49 MB; mlx-ld 0.38 MB).
+- The gate: 623 files (the C test programs linked whole and from
+  objects and archives, their objects, the C++ test programs, the
+  separate-compilation C++ programs, two link maps, a stripped program
+  with an interpreter and `-l` libraries) made by the old mlx-cc and by
+  the new mlx-cc + mlx-ld are byte-identical (`cmp`), and check_cc,
+  check_cpp, check_link, check_crash_report, check_build_cache (with
+  mlx-ld in its probe project), check_build and the std modules pass.
+
+Found on the way: objects carry the absolute paths of the headers they
+were compiled against in their `@at PATH:LINE` line-table symbols
+(mlx-out/include/mlx-cc is a link into the checkout), so an object the
+shared result cache took from another worktree names that worktree's
+headers (`libcpp/new.o` from agent-a9ab5... in this one). The cache's
+entries already make the paths relative; the objects do not. Harmless
+for the code (the crash report names a path that may not exist here),
+not changed.
+
+### 2. The code generation epoch
+
+`compiler/cc/epoch.mlx` holds `CODEGEN_EPOCH` and the rule for bumping
+it (also in compiler/cc/README.md); `mlx-cc --codegen-epoch` prints it
+and `--codegen-epoch=FILE` writes the stamp `mlx-out/bin/mlx-cc.epoch`
+(`mlx-cc codegen epoch 1`) that build.mlx's `mlx-cc-epoch` step makes
+whenever mlx-cc is built. std.build's `Build.programEpoch(b, step,
+STAMP)` makes the stamp an input of the step and the key of its result
+cache entries in place of the program's bytes; build.mlx's `cObject` and
+projects/webkit's `compileAs` use it instead of naming mlx-cc as an
+input. mlx-ld, mlx-ar and the Mlx programs stay keyed by their bytes.
+
+`mlx build --verify-epoch N` makes N of the wanted epoch-keyed steps
+again after the build (random, those not made by this run first) and
+compares each new file with the one it replaced: `[verify i/N] same` or
+`DIFFERS`, and a loud failure asking for the bump.
+`tools/check_codegen_epoch.sh` checks the whole on a probe project (a
+new mlx-cc of the same epoch: only the stamp is written again; another
+copy takes the objects from the cache; a moved epoch rebuilds, moved
+back is cached; MLX_CC_READ_ALL_BODIES=1 stands in for a forgotten bump
+and is caught) and, with the WebKit sources there, verifies 20 of WTF's
+units. A check that fails when codegen files change without a bump was
+not made: which files decide an object's bytes is most of compiler/cc,
+and most commits to them (all the speed and memory work above, the
+features that made WebKit compile) changed no object; it would alarm on
+nearly every commit. The rule is documented and the real objects are
+compared instead.
+
+### 3. Failures remembered
+
+What existed: a failed step has no manifest, so the next build runs it
+again, and runs again every step whose inputs changed; nothing else. What
+is new: the result cache remembers failures too (`failures/KEY/INPUTS`:
+the exit status, the files the failing run read from its depfile with
+their hashes, the last 64 KiB of the log), keyed by the program's
+**bytes**, not its epoch. A step not current and not cached whose
+failure is remembered for the same program and files fails at once with
+its log, without a job (`FAILED NAME (exit 1, remembered: ...)`;
+`--retry-failed` or `--force` runs it). So a `--keep-going` rebuild for
+an unrelated reason does not spend a minute per known-failing unit, and,
+with the epoch, a non-bumping fix of mlx-cc runs exactly the units that
+failed before. Remembered only: exit 1-127 (not a signal, so not the
+memory killer's 137) of a command whose depfile this run wrote (its
+time is taken when the job starts; so a failure before preprocessing
+ended, a missing header, is not remembered: what it read is not known).
+A first version removed the depfile before the job instead, which broke
+projects/webkit's archives, whose depfile (the object list) build.mlx
+writes itself: `libJavaScriptCore.a` failed in the measurement below
+with an empty log, and was the one step the build after the fix ran. Failures not told for two weeks are removed by the trim.
+
+### 4. Memory-aware jobs
+
+`std/src/build/memory.mlx`: before a job starts, the step's expected
+peak (its `ru_maxrss` of its last run, kept as `took MS PEAK_KIB` in the
+manifest and the cache entry — the old readers parse only the first
+number, so the formats stay compatible — plus an eighth; else
+`Build.memory`, which projects/webkit sets to 4096/2048/1024 MB for
+WebCore/JSC/other units) must fit in MemAvailable (or the cgroup's room,
+v1 or v2) less a margin of max(1 GiB, an eighth of the memory) less what
+the running jobs are still expected to grow by (expectation less
+/proc/PID/statm's resident set). A step that does not fit waits for a
+job to end; with nothing running it starts anyway. Because MemAvailable
+is measured, another build beside this one (the full WebKit rebuild of
+another agent ran beside every measurement here) is taken into account
+as it is now, though not its future growth (the margin is for that).
+`--no-memory-limit` turns it off; `tools/check_build_memory.sh` checks it
+with steps that declare more than the machine has (one at a time at
+-j 3, side by side with the flag) and the peak kept in the manifest.
+Found while testing: jobs start by vfork, so a child's `ru_maxrss`
+includes the runner's ~280 MB until its execve; jobs smaller than that
+are recorded as that (harmless; documented).
+
+### Measured: JSC + PAL + Skia (JSCOnly JSC, the Mlx port's PAL, Skia)
+
+`./mlx build -j 4 --keep-going webkit-jsc webkit-mlx-pal webkit-skia`
+with a result cache of its own (empty), 1182 steps of which 1154 mlx-cc
+objects, while another agent's full WebKit rebuild ran beside it in the
+same 15 GB / 4-core container (its three WebCore units took up to 12.2
+GB resident between them; MemAvailable went down to 1.36 GB):
+
+| | |
+|---|---|
+| wall | 16 min 19 s (977 s of scheduling; 2842 s of job time, 21 min user) |
+| our mlx-cc jobs at once (5 s samples) | 4: 76, 3: 40, 2: 36, 1: 38 samples |
+| steps that waited for memory | 353 times |
+| largest job / average | 2021 MiB / 483 MiB (the JSC units) |
+| killed (exit 137) | none, on our side or the other build's |
+
+At `-j 4` without the limit the four JSC units of up to 2 GB beside
+the other build's 12 GB would have passed the 15 GB; with it, the build
+ran four at a time while there was room and down to one when the other
+build's WebCore units peaked. (The three archives failed in this run, by
+the depfile bug described under 3.)
+
+**A non-bumping change of mlx-cc, then the same build** (the `--version`
+text changed: other bytes, the same epoch):
+
+| | steps run | wall |
+|---|---|---|
+| keyed by mlx-cc's bytes (before; every object names mlx-cc as an input) | the 1154 objects (their archives then current, the objects coming out the same) | ~16 min here (2842 s of jobs) |
+| keyed by the epoch (now) | `./mlx build cc`: mlx-cc and the stamp, 3.0 s; then **0 steps**: `all 1186 steps current (1.0 s)` | 2.7 s |
+
+**After the fix of the failed steps** (std.build changed, the runner
+recompiled): `3 built, 1183 current (3.4 s)`, exactly the three archives
+that had failed. `./mlx build -j 4 webkit-jsc --verify-epoch 20` with the
+changed mlx-cc: 20 JSC units compiled again (1 min 5 s), all the same
+byte for byte.
+
+### 5. Building the compiler itself
+
+`./mlx build cc` after a one-line change in compiler/cc: **3.0 s** wall
+(2.4 s user), of which mlx4 compiling mlx-cc at -O3 is 1.1 s alone and
+1.4-1.5 s beside four other jobs; by phase (`--progress`, under load):
+load and parse 266 ms, declarations 53 ms, bodies 196 ms, lowering 369
+ms, the optimizer 399 ms, code generation 175 ms, writing 55 ms; 235 MB
+of compiler arena. mlx-ld takes 0.23 s. The rest is the runner, the
+stamp and mlx-cc's own steps.
+
+mlx4 has no separate compilation: a program is one run over the whole
+module graph (load → resolve → analyze → lower to LIR → optimize →
+x86_64 → one ELF), with no object per module and no `-c`
+(compiler/selfhost/driver/pipeline.mlx, options.mlx). At ~1.5 s for
+mlx-cc's 60k lines it does not need one: the compiler's own build is
+not where the time goes; what made a compiler change cost hours was the
+key of the objects, which the epoch takes care of. What a module-object
+system would take, for the record (not done):
+
+1. A per-module interface: the public declarations' types (structs,
+   function signatures, constants, comptime values) serialized after
+   analysis, so that an importer can be analyzed without the module's
+   bodies; and a hash of it, so a body-only change does not re-analyze
+   the importers.
+2. Code generation per module into a relocatable object (mlx4's backend
+   writes one executable from one encoder now; relocatable.mlx and
+   link.mlx already exist and mlx-ld links mlx-cc's objects), with
+   cross-module calls as relocations, and the program linked by mlx-ld.
+3. What whole-program compilation gives up: the inliner across modules
+   (base.mlx's `inline` accessors, the 10% of mlx-cc's time from -O3)
+   needs the inlined bodies in the interface (or LTO over LIR), and the
+   optimizer's whole-program facts (unused functions dropped, generic
+   instances made once) need a link-time step.
+4. In std.build, a step per module (or mlx4 driving a cache of module
+   objects by interface hashes itself, as the depfile already lists the
+   modules).
+
+For a 1.5 s build that is a large change for at most ~1 s; not worth it
+now. -O1 or -O0 for a quick try would be the cheaper lever (mlx-cc's
+objects do not depend on how mlx-cc was optimized, so its epoch stays).

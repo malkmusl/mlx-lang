@@ -2,7 +2,8 @@
 # mlx-cc, the C compiler in Mlx (compiler/cc):
 #
 #   - it builds with the Mlx compiler, and finds its own headers next to
-#     the program (include/);
+#     the program (include/); its modules' variables are all in the
+#     prefix snapshot's lists (tools/cc_snapshot_state.py --check);
 #   - -E: compiler/cc/tests/preprocess.c (C11 6.10.3.5's examples and
 #     more directives) preprocesses to preprocess.expected;
 #   - every test program in compiler/cc/tests (NAME.c, with NAME2.c as its
@@ -37,8 +38,12 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 "$compiler" --quiet compiler/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
 cp -r compiler/cc/include "$work/include"
 cc="$work/mlx-cc"
+"$compiler" --quiet compiler/ld/main.mlx -o "$work/mlx-ld" || fail "mlx-ld does not build"
 "$compiler" --quiet compiler/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
-echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ar"
+echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ld and mlx-ar"
+# Every module-level variable is in a prefix snapshot or marked `(per run)`.
+python3 tools/cc_snapshot_state.py --check || fail "the prefix snapshot's lists of variables are out of date"
+echo "ok   the prefix snapshot's lists name every variable of the compiler's modules"
 
 tests=compiler/cc/tests
 (cd "$tests" && "$cc" -E preprocess.c) > "$work/preprocess.out" 2> "$work/preprocess.err" || fail "-E: $(head -3 "$work/preprocess.err")"

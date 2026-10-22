@@ -8,13 +8,18 @@
 #include "FrameLoader.h"
 #include "LoaderStrategy.h"
 #include "LocalFrame.h"
+#include "MIMETypeRegistry.h"
 #include "MediaStrategy.h"
 #include "NetworkLoadMetrics.h"
 #include "ResourceError.h"
 #include "ResourceHandle.h"
 #include "ResourceLoader.h"
 #include "ResourceResponse.h"
+#include "SharedBuffer.h"
 #include "SubresourceLoader.h"
+#include "port/MlxWebPort.h"
+#include <wtf/RunLoop.h>
+#include <wtf/text/CString.h>
 
 namespace WebCore {
 
@@ -34,14 +39,75 @@ static ResourceError errorFor(const URL& url, int code, ASCIILiteral description
     return ResourceError(errorDomainWebKitInternal, code, url, description, type);
 }
 
-// Each load a SubresourceLoader, started at once: WebCore's ResourceLoader
-// loads data: URLs itself and the others through ResourceHandle (the port's,
-// ResourceHandleMlx.cpp). No scheduling by priority yet.
+// A file: URL's file, read whole by the Mlx side (std.fs) and given to the
+// loader as WebKit2's WebResourceLoader gives the network process's: the
+// response (typed by the file's extension, MIMETypeRegistryMlx.cpp), once
+// WebCore has decided on it the data, then the end.
+static void loadFile(ResourceLoader& loader)
+{
+    if (loader.reachedTerminalState())
+        return;
+    URL url = loader.request().url();
+    String path = url.fileSystemPath();
+    uint32_t reason = 0;
+    size_t contents = mlxweb_file_read(path.utf8().data(), &reason);
+    if (!contents) {
+        loader.didFail(reason == MLXWEB_FILE_NOT_FOUND
+            ? errorFor(url, fileDoesNotExistCode, "The file does not exist"_s)
+            : errorFor(url, cannotShowURLCode, "The file cannot be read"_s));
+        return;
+    }
+    size_t length = mlxweb_file_length(contents);
+    Ref data = SharedBuffer::create(std::span<const uint8_t>(mlxweb_file_bytes(contents), length));
+    mlxweb_file_release(contents);
+
+    String mimeType = MIMETypeRegistry::mimeTypeForPath(path);
+    if (mimeType.isEmpty())
+        mimeType = "application/octet-stream"_s;
+    ResourceResponse response(WTF::move(url), WTF::move(mimeType), static_cast<long long>(length), String());
+    loader.didReceiveResponse(WTF::move(response), [loader = Ref { loader }, data = WTF::move(data)] {
+        if (!loader->reachedTerminalState() && data->size() && loader->request().httpMethod() != "HEAD"_s)
+            loader->didReceiveBuffer(data, data->size(), DataPayloadWholeResource);
+        if (!loader->reachedTerminalState())
+            loader->didFinishLoading(NetworkLoadMetrics { });
+    });
+}
+
+// Each load a SubresourceLoader (the main resource's too), run as WebKit2's
+// WebLoaderStrategy runs them, from the main loop: data: URLs by WebCore
+// itself (ResourceLoader::start, DataURLDecoder), file: URLs by the port
+// (loadFile, std.fs). No scheduling by priority yet.
+//
+// STUB (M6: http and https over std.http and std.tls): other schemes fail
+// as URLs that cannot be shown.
 class MlxLoaderStrategy final : public LoaderStrategy {
 public:
     void loadResource(LocalFrame& frame, CachedResource& resource, ResourceRequest&& request, const ResourceLoaderOptions& options, CompletionHandler<void(RefPtr<SubresourceLoader>&&)>&& completionHandler) override
     {
-        SubresourceLoader::create(frame, resource, WTF::move(request), options, WTF::move(completionHandler));
+        SubresourceLoader::create(frame, resource, WTF::move(request), options, [completionHandler = WTF::move(completionHandler)](RefPtr<SubresourceLoader>&& loader) mutable {
+            if (loader)
+                schedule(*loader);
+            completionHandler(WTF::move(loader));
+        });
+    }
+
+    static void schedule(ResourceLoader& loader)
+    {
+        const URL& url = loader.request().url();
+        if (url.protocolIsData()) {
+            loader.start();
+            return;
+        }
+        if (url.protocolIsFile()) {
+            RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
+                loadFile(loader);
+            });
+            return;
+        }
+        RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
+            if (!loader->reachedTerminalState())
+                loader->didFail(errorFor(loader->request().url(), cannotShowURLCode, "The port does not load this URL yet"_s));
+        });
     }
 
     void loadResourceSynchronously(FrameLoader& frameLoader, ResourceLoaderIdentifier, const ResourceRequest& request, ClientCredentialPolicy, const FetchOptions&, const HTTPHeaderMap&, ResourceError& error, ResourceResponse& response, Vector<uint8_t>& data) override

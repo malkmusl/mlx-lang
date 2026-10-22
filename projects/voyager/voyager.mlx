@@ -1,0 +1,265 @@
+// Voyager's window (PORT.md, M5): libvoyager.so, which the engine
+// (projects/voyager/engine.cpp, WebCore in the same process) calls with
+// voyager_run once the page is loading. A std.ui.host window on the
+// compositor, drawn on the CPU into its wl_shm buffers: each frame the
+// engine paints the view straight into the buffer's pixels (Skia's N32
+// words are the desktop's ARGB). The window's events go to the engine:
+// the pointer (motion, buttons; a link clicked loads its page), the wheel
+// (scrolls), keys with what they type (into the focused text field) and
+// the window's size; a tick runs WebCore's loop (loads, timers, the
+// caret) and draws again what it changed. Ctrl+C copies the selection's
+// text to the compositor's clipboard, Ctrl+V types the clipboard's text.
+// The title follows the page's; each new title and URL is written to
+// standard error ("voyager: title ...", "voyager: url ..."), which
+// tools/check_voyager.sh reads.
+//
+//     ./mlx build webkit-mlx-voyager       mlx-out/webkit/mlx/bin/voyager (and libvoyager.so)
+//     voyager [--font FILE]... [--size WIDTHxHEIGHT] FILE|URL
+const std = @import("std")
+const app = @import("std.ui.app")
+const host = @import("std.ui.host")
+const keys = @import("std.ui.keys")
+const canvas_module = @import("std.ui.canvas")
+
+extern("c") fn free(address: usize) -> void
+
+// The engine's functions (engine.cpp's VoyagerEngine, in its order).
+const Table = struct {
+    engine: usize
+    load: usize
+    resize: usize
+    cycle: usize
+    paint: usize
+    pointer: usize
+    wheel: usize
+    key: usize
+    selectedText: usize
+    insertText: usize
+    title: usize
+    url: usize
+    release: usize
+}
+
+const ResizeFn = fn(usize, i32, i32) -> void
+const CycleFn = fn(usize) -> i32
+const PaintFn = fn(usize, [*]u32, i32, i32, i32) -> void
+const PointerFn = fn(usize, i32, i32, i32, i32, u32) -> void
+const WheelFn = fn(usize, i32, i32, i32, i32) -> void
+const KeyFn = fn(usize, i32, u32, [*]const u8, u32) -> void
+const TextFn = fn(usize) -> usize
+const InsertFn = fn(usize, [*]const u8) -> void
+const ReleaseFn = fn(usize) -> void
+
+const Failure = error { NoMemory }
+
+fn noMemory() -> Failure!void { return Failure.NoMemory }
+
+// Milliseconds between two turns of WebCore's loop.
+const TICK: usize = 15
+const TEXT_CAPACITY: usize = 64
+const CLIPBOARD_CAPACITY: usize = 65536
+
+const State = struct {
+    table: *const Table
+    host: *host.Host
+    pointerX: i32
+    pointerY: i32
+    // The button held (0: none), for motion with it (selecting).
+    button: u32
+    // The modifier keys held (std.ui.keys' bits), as their keys said.
+    held: u32
+    width: i32
+    height: i32
+    // What a key typed, as a C string for the engine.
+    typed: [TEXT_CAPACITY]u8
+    // The clipboard's text, as a C string for the engine.
+    pasted: [CLIPBOARD_CAPACITY]u8
+    // The title and URL last written.
+    title: [256]u8
+    titleLength: usize
+    url: [1024]u8
+    urlLength: usize
+}
+
+fn stateOf(context: *anyopaque) -> *State { unsafe { return @ptrCast(*State, context) } }
+
+fn cLength(address: usize) -> usize {
+    if address == 0 { return 0 }
+    const bytes: [*]const u8 = unsafe { @ptrFromInt([*]const u8, address) }
+    var length: usize = 0
+    while bytes[length] != 0 { length += 1 }
+    return length
+}
+
+fn bytesAt(address: usize, length: usize) -> []const u8 {
+    const bytes: [*]const u8 = unsafe { @ptrFromInt([*]const u8, address) }
+    return bytes[0..length]
+}
+
+fn release(state: *State, address: usize) -> void {
+    if address == 0 { return }
+    const function: ReleaseFn = unsafe { @ptrFromInt(ReleaseFn, state.*.table.*.release) }
+    function(address)
+}
+
+// TEXT as a C string in TO (cut to its capacity).
+fn terminated(to: [*]u8, capacity: usize, text: []const u8) -> [*]const u8 {
+    var length = if text.length < capacity - 1 { text.length } else { capacity - 1 }
+    var index: usize = 0
+    while index < length {
+        to[index] = text[index]
+        index += 1
+    }
+    to[length] = 0
+    unsafe { return @ptrCast([*]const u8, to) }
+}
+
+// Whether TEXT is what SAVED (LENGTH bytes) holds; it holds TEXT after.
+fn changed(saved: [*]u8, capacity: usize, length: *usize, text: []const u8) -> bool {
+    var same = text.length == length.* || (text.length >= capacity && length.* == capacity)
+    var index: usize = 0
+    while same && index < length.* {
+        if saved[index] != text[index] { same = false }
+        index += 1
+    }
+    if same { return false }
+    length.* = if text.length < capacity { text.length } else { capacity }
+    index = 0
+    while index < length.* {
+        saved[index] = text[index]
+        index += 1
+    }
+    return true
+}
+
+fn say(prefix: []const u8, text: []const u8) -> void {
+    _ = std.io.eprint(prefix)
+    _ = std.io.eprintln(text)
+}
+
+// The page's title and URL: the window's title, and a line each when new.
+fn follow(state: *State) -> void {
+    const titleFn: TextFn = unsafe { @ptrFromInt(TextFn, state.*.table.*.title) }
+    const title = titleFn(state.*.table.*.engine)
+    const titleText = bytesAt(title, cLength(title))
+    if changed(unsafe { @ptrCast([*]u8, &state.*.title) }, 256, &state.*.titleLength, titleText) {
+        say("voyager: title ", titleText)
+        host.setTitle(state.*.host, if titleText.length > 0 { titleText } else { "Voyager" })
+    }
+    release(state, title)
+    const urlFn: TextFn = unsafe { @ptrFromInt(TextFn, state.*.table.*.url) }
+    const url = urlFn(state.*.table.*.engine)
+    const urlText = bytesAt(url, cLength(url))
+    if urlText.length > 0 && changed(unsafe { @ptrCast([*]u8, &state.*.url) }, 1024, &state.*.urlLength, urlText) { say("voyager: url ", urlText) }
+    release(state, url)
+}
+
+fn draw(context: *anyopaque, canvas: *app.Canvas) -> void {
+    const state = stateOf(context)
+    if canvas.*.width == 0 || canvas.*.height == 0 { return }
+    if canvas.*.device != 0 {
+        // (The GPU's canvas has no pixels: Voyager asks for the CPU's.)
+        canvas_module.clear(canvas, 0xFFFFFFFF)
+        return
+    }
+    const paint: PaintFn = unsafe { @ptrFromInt(PaintFn, state.*.table.*.paint) }
+    paint(state.*.table.*.engine, canvas.*.pixels, @intCast(i32, canvas.*.width), @intCast(i32, canvas.*.height), @intCast(i32, canvas.*.stride))
+}
+
+fn copy(state: *State) -> void {
+    const selected: TextFn = unsafe { @ptrFromInt(TextFn, state.*.table.*.selectedText) }
+    const text = selected(state.*.table.*.engine)
+    if text == 0 { return }
+    const bytes = bytesAt(text, cLength(text))
+    host.beginClipboard(state.*.host)
+    _ = host.addClipboard(state.*.host, "text/plain;charset=utf-8", bytes)
+    _ = host.addClipboard(state.*.host, "text/plain", bytes)
+    _ = host.addClipboard(state.*.host, "UTF8_STRING", bytes)
+    _ = host.publishClipboard(state.*.host)
+    release(state, text)
+}
+
+fn paste(state: *State) -> void {
+    var text = host.readClipboard(state.*.host, "text/plain;charset=utf-8")
+    if text.length == 0 { text = host.readClipboard(state.*.host, "UTF8_STRING") }
+    if text.length == 0 { text = host.readClipboard(state.*.host, "text/plain") }
+    if text.length == 0 { return }
+    const insert: InsertFn = unsafe { @ptrFromInt(InsertFn, state.*.table.*.insertText) }
+    insert(state.*.table.*.engine, terminated(unsafe { @ptrCast([*]u8, &state.*.pasted) }, CLIPBOARD_CAPACITY, text))
+}
+
+fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
+    const state = stateOf(context)
+    const engine = state.*.table.*.engine
+    // (The keys' own state as well: the compositor's modifiers event may
+    // come after the next key.)
+    if kind == app.EVENT_KEY {
+        const bit: u32 = if a == 29 || a == 97 { keys.CONTROL } else if a == 42 || a == 54 { keys.SHIFT } else if a == 56 || a == 100 { keys.ALT } else { 0 }
+        if bit != 0 { state.*.held = if b != 0 { state.*.held | bit } else { state.*.held & ~bit } }
+    }
+    const modifiers = host.modifiers(state.*.host) | state.*.held
+    if kind == app.EVENT_MOTION {
+        state.*.pointerX = @bitCast(i32, a)
+        state.*.pointerY = b
+        const pointer: PointerFn = unsafe { @ptrFromInt(PointerFn, state.*.table.*.pointer) }
+        pointer(engine, 0, state.*.pointerX, state.*.pointerY, @intCast(i32, state.*.button), modifiers)
+    } else if kind == app.EVENT_BUTTON {
+        state.*.button = if b == 1 { a } else { 0 }
+        const pointer: PointerFn = unsafe { @ptrFromInt(PointerFn, state.*.table.*.pointer) }
+        pointer(engine, if b == 1 { 1 } else { 2 }, state.*.pointerX, state.*.pointerY, @intCast(i32, a), modifiers)
+    } else if kind == app.EVENT_WHEEL {
+        var pixels = host.wheelPixels(state.*.host)
+        if pixels == 0 { pixels = b * 40 }
+        const wheel: WheelFn = unsafe { @ptrFromInt(WheelFn, state.*.table.*.wheel) }
+        if a == 0 { wheel(engine, state.*.pointerX, state.*.pointerY, 0, pixels) } else { wheel(engine, state.*.pointerX, state.*.pointerY, pixels, 0) }
+    } else if kind == app.EVENT_KEY {
+        if b != 0 && modifiers & keys.CONTROL != 0 && (a == keys.C || a == keys.V) {
+            if a == keys.C { copy(state) } else { paste(state) }
+        } else {
+            const text = if b != 0 { host.typed(state.*.host) } else { "" }
+            const key: KeyFn = unsafe { @ptrFromInt(KeyFn, state.*.table.*.key) }
+            key(engine, if b != 0 { 1 } else { 0 }, a, terminated(unsafe { @ptrCast([*]u8, &state.*.typed) }, TEXT_CAPACITY, text), modifiers)
+        }
+    } else if kind == app.EVENT_CONFIGURED {
+        state.*.width = @bitCast(i32, a)
+        state.*.height = b
+        const resize: ResizeFn = unsafe { @ptrFromInt(ResizeFn, state.*.table.*.resize) }
+        resize(engine, state.*.width, state.*.height)
+    } else if kind == app.EVENT_CLOSED {
+        host.quit(state.*.host)
+        return
+    } else if kind == app.EVENT_TICK {
+        const cycle: CycleFn = unsafe { @ptrFromInt(CycleFn, state.*.table.*.cycle) }
+        if cycle(engine) != 0 { host.redraw(state.*.host) }
+        follow(state)
+        return
+    }
+    host.redraw(state.*.host)
+}
+
+// The window, until it is closed: TABLE is the engine's, ARGUMENTS main's
+// (followed by the environment, as a process's are). An error: no window
+// (no compositor), or its connection failed.
+pub fn run(table: usize, count: usize, arguments: usize) -> !void {
+    const allocator = std.heap.allocator()
+    const memory = allocator.alloc(@sizeOf(State), 16)
+    if memory == null { return noMemory() }
+    const state: *State = unsafe { @ptrCast(*State, memory.?) }
+    state.*.table = unsafe { @ptrFromInt(*const Table, table) }
+    state.*.pointerX = 0
+    state.*.pointerY = 0
+    state.*.button = 0
+    state.*.held = 0
+    state.*.titleLength = 0
+    state.*.urlLength = 0
+    state.*.width = 800
+    state.*.height = 600
+    const list: [*][*]const u8 = unsafe { @ptrFromInt([*][*]const u8, arguments) }
+    const options = host.Options.{ .title = "Voyager", .appId = "org.mlx.voyager", .width = 800, .height = 600, .minWidth = 200, .minHeight = 150 }
+    const created = host.create(options, state, draw, onEvent)
+    if created == null { return noMemory() }
+    state.*.host = created.?
+    try host.open(state.*.host, list[0..count])
+    host.setTick(state.*.host, TICK)
+    try host.run(state.*.host)
+}

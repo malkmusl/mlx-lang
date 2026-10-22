@@ -656,6 +656,21 @@ runs_build() {
     [[ $status -eq 2 ]]
 }
 
+# Whether $1's inliner keeps an inlined function's names its own: a
+# module variable it reads is not the caller's local of the same name
+# (tests/393_inline_own_names_runtime.mlx exits 13).
+inlines_with_own_names() {
+    local probe status=0
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    if "$1" --quiet tests/393_inline_own_names_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+    else
+        status=1
+    fi
+    rm -rf -- "$probe"
+    [[ $status -eq 13 ]]
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -702,6 +717,7 @@ probes=(
     "holds_large_programs|an arena with room for the largest programs"
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
+    "inlines_with_own_names|inlined functions reading their own module's variables, not the caller's locals"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
