@@ -133,6 +133,7 @@ port in the tarball that builds WebCore without GLib).
 | Images | WebCore's `ScalableImageDecoder`, with our PNG, JPEG and WebP decoders; WebKit's BMP, GIF, ICO as they are | WebCore's decoders call libpng, libjpeg, libwebp; ours call std.png, std.jpeg, std.webp |
 | Colour | `USE_LCMS` off, colour management in our decoders (std.colorprofile) | Little CMS is only the decoders' |
 | Fonts | Skia's typefaces and our font manager over std.fontconfig | below |
+| Text paths | `USE_FONT_VARIANT_VIA_FEATURES` off (GTK and WPE: on) | Kerned and shaped text goes to the complex (HarfBuzz) path through FontCascade::codePath, since GTK's and WPE's own branch for it is under `PLATFORM()`; GLib's layout tests expect it kerned |
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (RenderThemeAdwaita, ScrollbarThemeAdwaita: GraphicsContext drawing; their GLib resources under `USE(GLIB)`) | WebKit's own non-native theme |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), registers the digests only and refuses the rest until M7 (`port/crypto/CryptoMlx.cpp`), then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
@@ -352,11 +353,16 @@ exports what the port's C++ needs in its shapes (a decoder object with
 `append`/`frame` functions, an HTTP request with callbacks): std's own
 APIs are Mlx slices and structs, not C. Rules of exports apply: an
 exported function cannot be called from Mlx (a `pub fn` and an `export`
-beside it), its 64 KB stack arena lives until it returns (state on the
-heap, no slices of locals that escape), and callbacks into C++ are C
+beside it), its arena lives until it returns (state on the heap, no
+slices of locals that escape), and callbacks into C++ are C
 function pointers with a context pointer, called on the main thread
 (through `RunLoop::dispatch`) or on the I/O thread when the C++ side says
-it is thread-safe.
+it is thread-safe. The plugin's exports have mapped arenas, not
+`--stack-arena`'s 64 KB of the caller's stack: the first font match reads
+std.fontconfig's fonts and cache in one call, with more aggregates than
+that holds. Its C header, `port/MlxWebPort.h`, is made by mlx-cheaders of
+port/mlx/api/MlxWebPort.mlx into the port's generated directory
+(`webkit-mlx-port-headers`), as every C header of the repository is.
 
 ## Milestones
 
