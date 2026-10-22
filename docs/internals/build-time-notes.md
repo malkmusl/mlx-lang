@@ -474,6 +474,129 @@ above). A design for the snapshot, not done:
    are ~1.7 h; the 40-minute build needs stage 2's code-per-function
    (the peak) and the instance keys and overload work above as well.
 
+## Results: memory (branch mlxcc-memory, 2026-10-21)
+
+The goal was the four WebCore units over the 8 GiB arena
+(`JSDOMWindow.cpp`, `UnifiedSource-css-19.cpp`, `-inspector-6.cpp`,
+`-dom-7.cpp`) and a WebCore unit well under ~5 GB, for `-j 3`/`-j 4`.
+Measured as above: the child's `getrusage` (user time, peak resident
+set = VmHWM), MLX_CC_STATS for the arena, one compile at a time, with
+the Mlx port's WebCore flags (scratchpad `mem/unit.sh`).
+
+### Where the bytes went: not the finished functions, the unused ones
+
+The plan was stage 2's: make each function's code when its body ends
+and give its nodes back. MLX_CC_STATS now also counts the node bytes of
+every function's body by what became of the function (made or not;
+external, static/weak, constexpr, inline; read in place, a function
+template's instance, a member whose body waited), and the largest
+bodies. It changed the plan:
+
+| Unit | Body nodes | In functions made | In functions never made |
+|---|---|---|---|
+| WTF `WTFString.cpp` | 124 MB | 8.5 MB (63 external, 771 inline/static) | 115 MB (7952 inline functions; 104 MB read in place: simde's `static inline`, WTF's inline free functions) |
+| `JSDOMWindow.cpp` | 2098 MB | 454 MB | 1644 MB (79904 functions; 1383 MB of all are constexpr: the mpark variant's `visit_alt`/`step_at` instances, 1–2.7 MB each) |
+
+So freeing a function's nodes after its code is made would have given
+back a fifth of the body nodes at most: four fifths belong to inline
+functions of headers that no code of the unit uses, read only because
+C++ makes an inline function's code where it is used and mlx-cc read
+every body where it stands. The fix is not to read them.
+
+### What changed
+
+1. **Inline bodies wait for a use** (cpp.lazyBodies, decl.waitsForUse,
+   template.pendDefinition). An inline member defined in its class, an
+   inline or static function at namespace scope and an inline member
+   defined outside its class keep their body's tokens, as class
+   template instances' members already did (cpp.pendBody), and the
+   body is read when a call or an address needs it
+   (template.ensureDefined: at the end of the unit with the instances,
+   or at once when the call is computed or its result type deduced),
+   under the prefix it stood in, with the definition's type (its
+   default arguments and parameter names given to the function at
+   once). The bodies nothing uses are never read: no nodes, objects,
+   types, instances or literals for them. Not: virtual functions (the
+   vtable names them), constructors and destructors with a VTT entry,
+   a local class's members, C.
+2. **constexpr bodies wait until computed**: a call names the function
+   and its body waits like the others; the constant evaluator reads it
+   when it computes a call (template.defineForEvaluation from
+   interp.call, interp's nested calls, isConstantCall, eval.wholeCall).
+3. Fixes the units needed, two of them old: a static data member of a
+   class template instance's type with an initializer makes the
+   instance whole (only an unread body made it so:
+   SVGBoundingBoxComputation in inspector-6); std::optional's `operator=
+   (U &&)` constrained as the standard's (a Markable<WallTime> goes
+   through its conversion to optional: dom-7's Document::lastModified
+   failed with the baseline too); memberOf links the alias chain a
+   nested WTF::Visitor level made instead of copying it at every level
+   (n × n aliases of 408 bytes per lookup before).
+
+`MLX_CC_READ_ALL_BODIES=1` reads every body where it stands, as before;
+with it WTFString.cpp's object is the baseline's byte for byte.
+
+### The table
+
+| Unit | Peak before | Peak after | User time before | User time after |
+|---|---|---|---|---|
+| WTF `WTFString.cpp` | 603 MiB (arena 1296 MB) | 397 MiB (1091 MB) | 2.1 s | 1.4 s |
+| `UnifiedSource-workers-2.cpp` | 4348 MiB (arena 5057 MB) | 2472 MiB (3112 MB) | 32.9 s | 19.9 s |
+| `JSDOMWindow.cpp` | 7461 MiB (arena 8194 MB of 8590) | 3456 MiB (4095 MB; change 1 alone) | 103.8 s | 29.8 s |
+| `UnifiedSource-inspector-6.cpp` | 7272 MiB (arena 8040 MB) | 3577 MiB (4216 MB) | 56.6 s | 31.8 s |
+| `UnifiedSource-dom-7.cpp` | failed at 46 s, 5953 MiB (the optional error above) | 3935 MiB (4565 MB) | – | 35.1 s |
+| `UnifiedSource-css-19.cpp` | arena full in 16 s | arena full in ~30 s | – | – |
+
+(The "after" rows of the units are commit 5d8ee1b's compiler, before
+the merge of webkit-port-m2 at 51d882c; WTFString.cpp and workers-2
+are the merged compiler's.)
+
+So three of the four compile, at half the peak and a third to a half
+of the time. A WebCore unit now peaks at 2.5–4 GB instead of 4.3–7.5
+GB: WebCore can build at `-j 3` on 15 GB (three of the largest at once
+are 12 GB) and mostly at `-j 4` (the average unit is ~2.5 GB; four of
+the largest at once would not fit).
+
+**css-19 is not a memory problem**: its arena fills with 13–16 million
+allocations of 408 bytes in 16–30 s with the baseline and with this
+branch alike, a runaway, not a unit too big. Sampled with gdb, they are
+overload-set aliases (cpp.aliasChain) made by memberOf for the call
+operator of a 25-lambda WTF::Visitor (StyleRule.cpp's
+`StyleRuleBase::visitDerived(WTF::makeVisitor(...))`, 25 cases each
+through `std::invoke`), 24 levels deep, from `callOperator` in the
+instances' bodies. The n × n copying is gone (change 3) and a chain
+kept per class (tried, not kept) did not stop it: the lookups that
+allocate are not repeated ones from outside but something within the
+instantiation; raising ARENA_SIZE would not help. Next step: count
+`memberOf`/`callOperator` calls per instance of `visitDerived` to find
+the loop.
+
+Found (branch m2-fixes2): Visitor's `using Visitor<A>::operator();
+using Visitor<B...>::operator();` name both bases by the template's
+name, and each using-declaration recorded both bases, so every level
+held each base twice and one lookup of operator() walked 2^n bases
+(16 lambdas: 1.5 million aliases; 25: the arena). Each base is now
+recorded once (cpp.usingKnown); css-19 compiles in 14 s.
+
+### The gate
+
+tools/check_cpp.sh (471 programs after the merge, two new:
+`bodieswait` — bodies called before and after their definitions, by
+address, through pointers, from constant expressions, with default
+arguments the definition gives, members in and out of their class,
+namespaces with using-directives, virtual members, recursion, `__func__`
+and static locals, a static member only an unused body made whole;
+`optionalfromconversion`) and tools/check_cc.sh pass. WTFString.cpp
+makes the same 814 functions (815 before the merge) with the same
+instructions (compared function by function, lambda numbers and
+addresses aside: scratchpad `mem/objdiff.py`); they are in another
+order, the data is smaller (the literals and static locals of the
+unread bodies are gone), and `__mlxcc_init_unit`'s frame is smaller
+(the temporaries of those bodies' initializers). Lambdas are numbered
+in reading order, so a lambda in an inline function has another number
+in its mangled name than before (as before, the number is the unit's,
+not the program's).
+
 ## Allocators (notes, 2026-10-21; nothing changed yet)
 
 docs/reference/stdlib.md says a program's blocks come from
