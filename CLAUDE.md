@@ -3,15 +3,21 @@
 ## Navigate and change code through the code graph
 
 `mlx-out/bin/mlx-codemap` (tools/codemap, Observatory's index) knows every
-declaration and every use in the repository's Mlx code: files, symbols,
-references, callers and callees, imports, layers, sizes, hot spots, memory
-and crashes. Use it for all development, not only for debugging: before
+declaration and every use in the repository's Mlx, C and C++ code: files,
+symbols, references, callers and callees, imports and includes, layers,
+sizes, hot spots, memory and crashes, across the languages (an Mlx
+`export fn` and its C++ callers are one symbol). C and C++ come from
+mlx-cc's index: `./mlx build codemap-cpp-index` for the repository's own
+C/C++, `tools/codemap_index.sh --build webkit-mlx-webcore` (or any build
+step) for what a build compiles, or `MLX_CC_INDEX=$PWD/mlx-out/codemap/cpp`
+during a build; the objects stay byte-identical. Use it for all development, not only for debugging: before
 reading a file to find something, before changing a function, before
 renaming or deleting, and to check what a change touches.
 
 - Find a symbol: `mlx-codemap find NAME`; its source: `mlx-codemap show SYMBOL`
   (qualify it as `path:name` when a name exists twice, e.g.
-  `compiler/cc/scope.mlx:findKind`); the definition at a place:
+  `compiler/cc/scope.mlx:findKind`; for C++ also `Ns::Class::name`, any
+  tail of it, or the mangled name); the definition at a place:
   `mlx-codemap def FILE:LINE:COL`.
 - Who uses it, and what it uses: `refs SYMBOL`, `callers SYMBOL`,
   `callees SYMBOL`, `members SYMBOL`; files: `imports FILE`,
@@ -26,8 +32,8 @@ renaming or deleting, and to check what a change touches.
   PROGRAM` (with MLX_LEAK_CHECK=1), `frames`, `crashes` (std.crash's
   reports, C and C++ frames named and demangled).
 
-grep is for text that is not code (logs, generated output, C/C++ sources
-the graph does not cover yet). Do not hunt through Mlx code with grep when
+grep is for text that is not code (logs, generated output, C/C++ not yet
+indexed: index it instead when you work on it). Do not hunt through Mlx code with grep when
 the graph answers the question.
 
 ## Diagnose with the repository's own tools
