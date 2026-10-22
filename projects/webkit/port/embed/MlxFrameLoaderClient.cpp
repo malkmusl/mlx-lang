@@ -28,17 +28,14 @@ namespace WebCore {
 
 // MLX_WEBCORE_TRACE=1 in the environment: the client's calls on standard
 // error, a load's steps as WebCore takes them.
-// TEMPORARY DEBUG
-WEBCORE_EXPORT void (*mlxDebugHook)(const char*) = nullptr;
-
 static bool tracing()
 {
     static bool on = !!getenv("MLX_WEBCORE_TRACE");
     return on;
 }
 
-extern void (*mlxDebugHook)(const char*);
-#define MLX_TRACE(...) do { if (tracing()) { fprintf(stderr, "frame loader client: " __VA_ARGS__); fputc('\n', stderr); } if (mlxDebugHook) mlxDebugHook(#__VA_ARGS__); } while (0)
+// MLX_WEBCORE_TRACE: what the client is told, on standard error.
+#define MLX_TRACE(...) do { if (tracing()) { fprintf(stderr, "frame loader client: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 
 // The frame's networking context: the frame, and no storage session of
@@ -240,9 +237,7 @@ void MlxFrameLoaderClient::transitionToCommittedForNewPage(InitializingIframe)
     MLX_TRACE("new page: a view for %p", m_loader->documentLoader());
     RefPtr oldView = frame->view();
     IntSize size = !frame->isMainFrame() && oldView ? oldView->size() : m_viewSize;
-    if (mlxDebugHook) mlxDebugHook("before createView");
     frame->createView(size, std::nullopt, { }, false, ScrollbarMode::Auto, false, ScrollbarMode::Auto, false);
-    if (mlxDebugHook) mlxDebugHook("after createView");
 }
 
 void MlxFrameLoaderClient::didRestoreFromBackForwardCache() { }

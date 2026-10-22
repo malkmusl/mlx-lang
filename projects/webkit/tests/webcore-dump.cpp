@@ -78,78 +78,6 @@ static void debugBacktrace(int signal, siginfo_t*, void* context)
     _exit(99);
 }
 
-namespace WebCore { extern void (*mlxDebugHook)(const char*); }
-static LocalFrame* debugFrame;
-static void dumpObservers(const char* where)
-{
-    fprintf(stderr, "DEBUG observers %s:\n", where);
-    static bool watching;
-    if (!watching && !strcmp(where, "never")) {
-        for (auto& weak : debugFrame->m_destructionObservers.m_set) {
-            auto* impl = weak.m_impl.get();
-            if (impl && impl->template get<FrameDestructionObserver>() == static_cast<FrameDestructionObserver*>(debugFrame->loader().provisionalDocumentLoader())) {
-                watching = true;
-                watch(impl);
-            }
-        }
-    }
-    auto& table = debugFrame->m_destructionObservers.m_set.m_impl;
-    fprintf(stderr, "DEBUG   table %p size %u keys %u deleted %u ops %u\n", table.m_table, table.tableSize(), table.keyCount(), table.m_table ? table.deletedCount() : 0, debugFrame->m_destructionObservers.m_operationCountSinceLastCleanup);
-    for (unsigned i = 0; i < table.tableSize(); ++i)
-        fprintf(stderr, "DEBUG   bucket %u: %p\n", i, reinterpret_cast<void**>(table.m_table)[i]);
-    for (auto& weak : debugFrame->m_destructionObservers.m_set) {
-        auto* impl = weak.m_impl.get();
-        fprintf(stderr, "DEBUG   impl %p refs %u object %p\n", impl, impl ? impl->refCount() : 0, impl ? impl->template get<FrameDestructionObserver>() : nullptr);
-    }
-}
-
-#include <fcntl.h>
-struct RawPerfAttr {
-    uint32_t type, size;
-    uint64_t config, samplePeriod, sampleType, readFormat, flags;
-    uint32_t wakeupEvents, bpType;
-    uint64_t bpAddr, bpLen;
-    uint64_t rest[8];
-};
-static unsigned* watched;
-static void watchHit(int, siginfo_t*, void* context)
-{
-    auto* uc = static_cast<ucontext_t*>(context);
-    fprintf(stderr, "WATCH value %u\n", watched ? *watched : 0);
-    uintptr_t* rbp = reinterpret_cast<uintptr_t*>(uc->uc_mcontext.gregs[REG_RBP]);
-    fprintf(stderr, "WATCH hit at %lx\n", (unsigned long)uc->uc_mcontext.gregs[REG_RIP]);
-    for (int i = 0; i < 60 && rbp; ++i) {
-        uintptr_t next = rbp[0];
-        fprintf(stderr, "WATCH frame %lx\n", (unsigned long)rbp[1]);
-        if (next <= reinterpret_cast<uintptr_t>(rbp) || next - reinterpret_cast<uintptr_t>(rbp) > 8 * 1024 * 1024)
-            break;
-        rbp = reinterpret_cast<uintptr_t*>(next);
-    }
-}
-static void watch(void* address)
-{
-    struct sigaction action { };
-    action.sa_sigaction = watchHit;
-    action.sa_flags = SA_SIGINFO | SA_RESTART;
-    sigaction(SIGRTMIN + 5, &action, nullptr);
-    RawPerfAttr attr { };
-    attr.type = 5;
-    attr.size = 128;
-    attr.bpType = 2;
-    attr.bpAddr = reinterpret_cast<uintptr_t>(address);
-    watched = static_cast<unsigned*>(address);
-    attr.bpLen = 4;
-    attr.samplePeriod = 1;
-    attr.flags = (1 << 5) | (1 << 6);
-    int fd = syscall(298, &attr, 0, -1, -1, 0);
-    if (fd < 0) { perror("WATCH perf_event_open"); return; }
-    fcntl(fd, F_SETFL, 020000);
-    fcntl(fd, 10, SIGRTMIN + 5);
-    struct { int type; pid_t pid; } owner { 0, (pid_t)syscall(186) };
-    fcntl(fd, 15, &owner);
-    fprintf(stderr, "WATCH set on %p\n", address);
-}
-
 static int usage()
 {
     fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--timeout SECONDS] FILE|URL\n");
@@ -305,6 +233,10 @@ int main(int argc, char** argv)
         settings.setAllowUniversalAccessFromFileURLs(true);
         settings.setAllowFileAccessFromFileURLs(true);
         settings.setUsesBackForwardCache(false);
+        // (WebKit's defaults where WebCore's differ and a render tree shows
+        // it: images loaded, text areas resizable.)
+        settings.setLoadsImagesAutomatically(true);
+        settings.setTextAreasAreResizable(true);
 
         Run run;
         run.frame = page->localMainFrame();
@@ -312,26 +244,13 @@ int main(int argc, char** argv)
             fprintf(stderr, "webcore-dump: the page has no main frame\n");
             return 1;
         }
-        debugFrame = run.frame.get();
-        mlxDebugHook = dumpObservers;
-        dumpObservers("before init");
         run.frame->init();
-        dumpObservers("after init");
         mainClient->setLoadFinishedCallback([&run](bool succeeded) {
             run.loadFinished = true;
             run.loadSucceeded = succeeded;
         });
 
-        {
-            FrameLoadRequest frameLoadRequest(*run.frame, ResourceRequest(URL { url }));
-            auto* impl = frameLoadRequest.resourceRequest().url().string().impl();
-            fprintf(stderr, "WATCH url string impl %p refs %u\n", impl, impl->refCount());
-            auto* victim = reinterpret_cast<StringImpl*>((reinterpret_cast<uintptr_t>(impl) & ~uintptr_t(0xffffff)) + 0x33a90);
-            fprintf(stderr, "WATCH victim %p refs %u length %u text %.40s\n", victim, *reinterpret_cast<unsigned*>(victim), victim->length(), victim->is8Bit() ? reinterpret_cast<const char*>(victim->span8().data()) : "(16-bit)");
-            watch(victim);
-            run.frame->loader().load(WTF::move(frameLoadRequest));
-            fprintf(stderr, "WATCH after load\n");
-        }
+        run.frame->loader().load(FrameLoadRequest(*run.frame, ResourceRequest(URL { url })));
         run.deadline = MonotonicTime::now() + Seconds(timeout);
         RunLoop::mainSingleton().dispatch([&run] {
             check(run);
