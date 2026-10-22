@@ -1,0 +1,852 @@
+// The code index mlx-cc writes while it compiles (`--index=DIR`, or
+// MLX_CC_INDEX=DIR in the environment so that a whole build indexes
+// without its commands, and so its result cache's keys, changing): every
+// declaration and every use the compiler resolved, for MLX Codemap
+// (tools/codemap/cpp.mlx), which joins them to its graph of the Mlx code.
+//
+// What is written is a shard per source file the unit read (its own file
+// and every header), named by the file's path and contents:
+//
+//     DIR/<hash of the absolute path>-<hash of the contents>.cxi
+//
+// A shard that is there already is not written again: a header indexed
+// by one unit is not indexed by the next (nor by the next build, as long
+// as it is unchanged), which keeps the cost of indexing a WebCore unit to
+// its own file and the headers no unit read before. A shard is written
+// whole to a temporary name and renamed, so units side by side never see
+// half of one. The text (one record a line; a PLACE is LINE:COLUMN, both
+// from 1, the column in bytes; FI is a file of the shard's F lines, 0 its
+// own; a reference to a declaration is FI:LINE:COLUMN of its name):
+//
+//     mlx-cc index 1
+//     file HASH PATH                      the shard's file
+//     D PLACE LENGTH KIND PARENT LINK BODY DEF QNAME NAME
+//         a declaration whose name is at PLACE: KIND f function,
+//         v variable, c class (struct), u union, d data member, m macro;
+//         PARENT its class (the class's name, - none);
+//         LINK the name the linker knows (mangled for C++, - none);
+//         BODY where its definition's body starts (the `{`);
+//         DEF where its definition names it, when that is elsewhere;
+//         QNAME the qualified name of a class (- for the others: Codemap
+//         reads them from LINK); NAME the name as written
+//     R PLACE LENGTH USE TARGET           a use: USE c call, r read,
+//         w write, t type, b base class, x a macro's expansion, d the
+//         name of a definition apart from the declaration, o a virtual
+//         function's name overriding a base's; TARGET the
+//         declaration's name
+//     I PLACE LENGTH PATH                 an #include of PATH here
+//     F FI PATH                           the files the records name
+//
+// Declarations are known by where their name is. A template's instances
+// are read from the template's own tokens, so a use in an instance's body
+// is at the template's text and names the template's declaration: the
+// template has one entry, its instances' uses its own. A function
+// declared in a header and defined in a source file is one declaration
+// (the first), its definition's place in DEF and BODY; the same function
+// declared in several units joins by LINK in Codemap.
+//
+// What is not indexed: locals and parameters, enumerators, typedefs and
+// namespaces as declarations of their own (a typedef's use is its type's),
+// templates no unit instantiated, implicit calls (destructors at the end
+// of a scope, conversions), and uses inside an expansion of a macro are at
+// the macro's text (as the compiler sees them).
+//
+// The objects are the same with or without an index: nothing here
+// changes what the parser decides (no CODEGEN_EPOCH bump).
+const std = @import("std")
+const base = @import("./base.mlx")
+const tokens = @import("./tokens.mlx")
+const types = @import("./types.mlx")
+const ast = @import("./ast.mlx")
+const table = @import("./table.mlx")
+const cpp = @import("./cpp.mlx")
+
+pub var enabled = false
+var directoryAt: usize = 0
+var directoryLength: usize = 0
+
+// Kinds of target.
+const T_OBJ: u8 = 1
+const T_TYPE: u8 = 2
+const T_MEMBER: u8 = 3
+const T_MACRO: u8 = 4
+const T_POSITION: u8 = 5
+
+// Kinds of use.
+pub const USE_CALL: u8 = 99
+pub const USE_READ: u8 = 114
+pub const USE_WRITE: u8 = 119
+pub const USE_TYPE: u8 = 116
+pub const USE_BASE: u8 = 98
+pub const USE_MACRO: u8 = 120
+pub const USE_DEFINITION: u8 = 100
+pub const USE_OVERRIDE: u8 = 111
+
+// A use: where (a token), what (a target), how.
+const Use = struct {
+    token: usize
+    target: usize
+    kind: u8
+    use: u8
+}
+
+// A class: its type, the token of its name, its body's `{`.
+const ClassNote = struct {
+    ty: usize
+    tag: usize
+    open: usize
+}
+
+// A growing array of records in the arena.
+const List = struct {
+    items: usize
+    length: usize
+    capacity: usize
+    size: usize
+}
+
+fn push(list: *List) -> usize {
+    if list.*.length == list.*.capacity {
+        const capacity = if list.*.capacity == 0 { 1024 } else { list.*.capacity * 2 }
+        const items = base.alloc(capacity * list.*.size)
+        if list.*.length > 0 { base.copy(items, list.*.items, list.*.length * list.*.size) }
+        list.*.items = items
+        list.*.capacity = capacity
+    }
+    const at = list.*.items + list.*.length * list.*.size
+    list.*.length += 1
+    return at
+}
+
+var uses: List = List.{ .items = 0, .length = 0, .capacity = 0, .size = 24 }
+var classes: List = List.{ .items = 0, .length = 0, .capacity = 0, .size = 24 }
+var macroDefinitions: List = List.{ .items = 0, .length = 0, .capacity = 0, .size = 8 }
+var includes: List = List.{ .items = 0, .length = 0, .capacity = 0, .size = 16 }
+// type -> its ClassNote's address; function -> its definition's name.
+var classOf: table.Table = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+var definitionName: table.Table = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+// The name of the class whose body is read next (decl.structUnionRest).
+pub var pendingTag: usize = 0
+// The function whose declarator was read last, and its name.
+var lastDeclared: usize = 0
+var lastDeclarator: usize = 0
+
+// `--index=DIR` or MLX_CC_INDEX=DIR.
+pub fn enable(path: []const u8) -> void {
+    if path.length == 0 { return }
+    enabled = true
+    directoryAt = base.keep(path)
+    directoryLength = path.length
+}
+
+// ---------------------------------------------------------------------------
+// What the parser tells (each call costs nothing unless enabled)
+
+fn addUse(token: usize, kind: u8, target: usize, use: u8) -> void {
+    if token == 0 || target == 0 { return }
+    const at = push(&uses)
+    base.putWord(at, token)
+    base.putWord(at + 8, target)
+    base.put8(at + 16, kind)
+    base.put8(at + 17, use)
+}
+
+// A macro defined at its name `token`.
+pub fn noteMacro(token: usize) -> void {
+    base.putWord(push(&macroDefinitions), token)
+}
+
+// A macro whose name is at `defined` expanded at `token`.
+pub fn noteExpansion(token: usize, defined: usize) -> void {
+    if defined == 0 { return }
+    addUse(token, T_POSITION, defined, USE_MACRO)
+}
+
+// `#include` (its directive's token) of the file at `path`.
+pub fn noteInclude(directive: usize, path: []const u8) -> void {
+    const at = push(&includes)
+    base.putWord(at, directive)
+    base.putWord(at + 8, @intCast(usize, base.intern(path)))
+}
+
+// A class defined: its type, its name's token (0: none), its `{`.
+pub fn noteClass(ty: usize, tag: usize, open: usize) -> void {
+    if tag == 0 { return }
+    const at = push(&classes)
+    base.putWord(at, ty)
+    base.putWord(at + 8, tag)
+    base.putWord(at + 16, open)
+    table.set(&classOf, ty, at)
+}
+
+// A type named in a declaration's specifiers, from `first` to `end` (the
+// token after the name): the use is the last name before `end` outside
+// template arguments (`WTF::Vector<int>` names Vector).
+pub fn noteTypeName(first: usize, end: usize, ty: usize) -> void {
+    var at = first
+    var depth: u32 = 0
+    var last: usize = 0
+    var steps: usize = 0
+    while at != 0 && at != end && steps < 256 && !tokens.isEof(at) {
+        const t = tokens.at(at)
+        if t.*.kind == tokens.PUNCT {
+            const text = tokens.text(at)
+            if text.length == 1 && text[0] == 60 { depth += 1 }
+            if text.length == 1 && text[0] == 62 && depth > 0 { depth -= 1 }
+            if text.length == 2 && text[0] == 62 && text[1] == 62 { depth = if depth >= 2 { depth - 2 } else { 0 } }
+        } else if t.*.kind == tokens.IDENT && depth == 0 {
+            last = at
+        }
+        at = t.*.next
+        steps += 1
+    }
+    if at != end { return }
+    if last != 0 { addUse(last, T_TYPE, ty, if baseClause { USE_BASE } else { USE_TYPE }) }
+}
+
+// Whether the specifiers read are a base clause's (cpp.beginClass).
+pub var baseClause = false
+
+// A base class named at `token`.
+pub fn noteBase(token: usize, ty: usize) -> void { addUse(token, T_TYPE, ty, USE_BASE) }
+
+// A call the tree does not show by its callee (a virtual one).
+pub fn noteCall(token: usize, function: usize) -> void {
+    if spells(token, ast.obj(function).*.name) { addUse(token, T_OBJ, function, USE_CALL) }
+}
+
+// A function's declarator named at `token` (its definition may follow).
+pub fn noteDeclarator(function: usize, token: usize) -> void {
+    lastDeclared = function
+    lastDeclarator = token
+}
+
+// The definition of `function` begins: named by the last declarator.
+pub fn noteDefinition(function: usize) -> void {
+    if lastDeclared == function && lastDeclarator != 0 { table.set(&definitionName, function, lastDeclarator) }
+    lastDeclared = 0
+}
+
+// ---------------------------------------------------------------------------
+// Positions
+
+// The text each file was lexed from (lexer.splice's: lines joined where
+// a backslash ended them), by file: its address and length.
+var spliced: usize = 0
+
+pub fn noteSpliced(file: u32, text: usize, length: usize) -> void {
+    if spliced == 0 { spliced = base.alloc(base.MAX_FILES * 16) }
+    base.putWord(spliced + @intCast(usize, file) * 16, text)
+    base.putWord(spliced + @intCast(usize, file) * 16 + 8, length)
+}
+
+// The file (its path's name id) and place of `token`'s text, its line
+// (from 1) and byte column (from 0) as line << 20 | column; false when
+// it is not in a file (a token the compiler made). (The line is the
+// token's own; the column counts from the start of its line in the text
+// lexed, which is the file's but on a line a backslash continued.)
+fn positionOf(token: usize, path: *u32, offset: *usize) -> bool {
+    if token == 0 || spliced == 0 { return false }
+    const t = tokens.at(token)
+    const file = @intCast(u32, t.*.file)
+    if file == 0 { return false }
+    const data = base.getWord(spliced + @intCast(usize, file) * 16)
+    const length = base.getWord(spliced + @intCast(usize, file) * 16 + 8)
+    if data == 0 || t.*.start < data || t.*.start + @intCast(usize, t.*.length) > data + length { return false }
+    var lineStart = t.*.start
+    while lineStart > data && base.get8(lineStart - 1) != 10 { lineStart -= 1 }
+    const column = t.*.start - lineStart
+    if column >= 1048576 { return false }
+    path.* = base.fileName(file)
+    offset.* = (@intCast(usize, t.*.line) << 20) | column
+    return true
+}
+
+// "LINE:COLUMN" of a place positionOf made (both from 1).
+fn putPlace(buffer: *Buffer, place: usize) -> void {
+    putNumber(buffer, @intCast(u64, place >> 20))
+    putByte(buffer, 58)
+    putNumber(buffer, @intCast(u64, (place & 1048575) + 1))
+}
+
+// Whether `token`'s text is `name`'s.
+fn spells(token: usize, name: u32) -> bool {
+    if token == 0 || name == 0 { return false }
+    if tokens.kind(token) != tokens.IDENT { return false }
+    return base.same(tokens.text(token), base.nameOf(name))
+}
+
+// The class a type is (its noted definition), 0 for none.
+fn classNote(ty: usize) -> usize {
+    var t = ty
+    var steps: usize = 0
+    while t != 0 && steps < 16 {
+        const kind = types.at(t).*.kind
+        if kind == types.PTR || kind == types.REF || kind == types.ARRAY {
+            t = types.at(t).*.base
+        } else {
+            const note = table.get(&classOf, t)
+            if note != 0 { return note }
+            t = types.at(t).*.origin
+        }
+        steps += 1
+    }
+    return 0
+}
+
+// Where the declaration a use names is: its name's token, 0 when it is
+// not indexed.
+fn targetToken(kind: u8, target: usize) -> usize {
+    if kind == T_POSITION { return target }
+    if kind == T_OBJ {
+        const o = ast.obj(target)
+        if o.*.isLocal || o.*.isLiteral || o.*.isTable { return 0 }
+        if !spells(o.*.token, o.*.name) { return 0 }
+        return o.*.token
+    }
+    if kind == T_MEMBER {
+        const m = types.member(target)
+        if !spells(m.*.token, m.*.name) { return 0 }
+        return m.*.token
+    }
+    if kind == T_TYPE {
+        const note = classNote(target)
+        if note == 0 { return 0 }
+        return base.getWord(note + 8)
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// The uses in the functions' bodies
+
+var seen: table.Table = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+
+fn walk(start: usize, given: u8) -> void {
+    var n = start
+    var how = given
+    while n != 0 {
+        if table.get(&seen, n) != 0 { return }
+        table.set(&seen, n, 1)
+        const node = ast.node(n)
+        const kind = node.*.kind
+        if kind == ast.VAR {
+            const o = node.*.variable
+            if o != 0 && !ast.obj(o).*.isLocal && spells(node.*.token, ast.obj(o).*.name) { addUse(node.*.token, T_OBJ, o, how) }
+            walk(node.*.lhs, USE_READ)
+        } else if kind == ast.MEMBER {
+            const m = node.*.member
+            if m != 0 && spells(node.*.token, types.member(m).*.name) { addUse(node.*.token, T_MEMBER, m, how) }
+            walk(node.*.lhs, USE_READ)
+        } else if kind == ast.FUNCALL {
+            const callee = node.*.lhs
+            if callee != 0 && ast.kindOf(callee) == ast.VAR && table.get(&seen, callee) == 0 {
+                table.set(&seen, callee, 1)
+                const o = ast.node(callee).*.variable
+                const token = ast.node(callee).*.token
+                if o != 0 && spells(token, ast.obj(o).*.name) { addUse(token, T_OBJ, o, USE_CALL) }
+                walk(ast.node(callee).*.lhs, USE_READ)
+            } else {
+                walk(callee, USE_READ)
+            }
+            walk(node.*.args, USE_READ)
+        } else if kind == ast.ASSIGN {
+            walk(node.*.lhs, USE_WRITE)
+            walk(node.*.rhs, USE_READ)
+        } else {
+            walk(node.*.lhs, USE_READ)
+            walk(node.*.rhs, USE_READ)
+            walk(node.*.cond, USE_READ)
+            walk(node.*.then, USE_READ)
+            walk(node.*.els, USE_READ)
+            walk(node.*.init, USE_READ)
+            walk(node.*.inc, USE_READ)
+            walk(node.*.body, USE_READ)
+            if kind != ast.DEFAULT_ARG && kind != ast.BRACED { walk(node.*.args, USE_READ) }
+        }
+        // The next statement (a block's) or argument: a loop, not a call.
+        n = node.*.next
+        how = USE_READ
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The shards
+
+const Buffer = struct {
+    data: usize
+    length: usize
+    capacity: usize
+}
+
+fn grow(buffer: *Buffer, more: usize) -> void {
+    if buffer.*.length + more <= buffer.*.capacity { return }
+    var capacity = if buffer.*.capacity == 0 { 4096 } else { buffer.*.capacity * 2 }
+    while capacity < buffer.*.length + more { capacity *= 2 }
+    const data = base.alloc(capacity)
+    if buffer.*.length > 0 { base.copy(data, buffer.*.data, buffer.*.length) }
+    buffer.*.data = data
+    buffer.*.capacity = capacity
+}
+
+fn put(buffer: *Buffer, text: []const u8) -> void {
+    grow(buffer, text.length)
+    base.putText(buffer.*.data + buffer.*.length, text)
+    buffer.*.length += text.length
+}
+
+fn putByte(buffer: *Buffer, byte: u8) -> void {
+    grow(buffer, 1)
+    base.put8(buffer.*.data + buffer.*.length, byte)
+    buffer.*.length += 1
+}
+
+fn putNumber(buffer: *Buffer, value: u64) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[23 - count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    const bytes: [*]u8 = &digits
+    put(buffer, bytes[24 - count..24])
+}
+
+fn putHex(buffer: *Buffer, value: u64) -> void {
+    var shift: u64 = 60
+    var at: usize = 0
+    while at < 16 {
+        const digit = @intCast(u8, (value >> shift) & 15)
+        putByte(buffer, if digit < 10 { 48 + digit } else { 87 + digit })
+        if shift >= 4 { shift -= 4 }
+        at += 1
+    }
+}
+
+fn fnv(seed: u64, text: []const u8) -> u64 {
+    var value = seed
+    for byte in text {
+        value = (value ^ @intCast(u64, byte)) *% 1099511628211
+    }
+    return value
+}
+
+// A shard being made: its file (the path's name id), the absolute path,
+// its records, its files (name id -> number + 1) in order.
+const Shard = struct {
+    path: u32
+    absolute: []const u8
+    hash: u64
+    skip: bool
+    records: Buffer
+    files: table.Table
+    order: List
+}
+
+var shards: table.Table = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+var shardList: List = List.{ .items = 0, .length = 0, .capacity = 0, .size = 8 }
+var workingAt: usize = 0
+var workingLength: usize = 0
+
+fn shardAt(address: usize) -> *Shard {
+    unsafe { return @ptrFromInt(*Shard, address) }
+}
+
+// `path` made absolute ("." and ".." folded).
+fn absolutePath(path: []const u8) -> []const u8 {
+    if workingLength == 0 {
+        var buffer: [4096]u8 = undefined
+        const bytes: [*]u8 = &buffer
+        _ = std.fs.getWorkingDirectory(bytes, 4096)
+        var length: usize = 0
+        while length < 4096 && bytes[length] != 0 { length += 1 }
+        workingAt = base.keep(bytes[0..length])
+        workingLength = length
+    }
+    const whole = if path.length > 0 && path[0] == 47 { path } else { base.join(base.join(base.bytes(workingAt, workingLength), "/"), path) }
+    const out = base.alloc(whole.length + 2)
+    var length: usize = 0
+    var at: usize = 0
+    while at < whole.length {
+        var end = at
+        while end < whole.length && whole[end] != 47 { end += 1 }
+        const part = whole[at..end]
+        const skipped = part.length == 0 || (part.length == 1 && part[0] == 46)
+        if skipped {
+            at = end + 1
+            continue
+        }
+        if part.length == 2 && part[0] == 46 && part[1] == 46 {
+            while length > 0 && base.get8(out + length - 1) != 47 { length -= 1 }
+            if length > 0 { length -= 1 }
+        } else {
+            base.put8(out + length, 47)
+            length += 1
+            base.putText(out + length, part)
+            length += part.length
+        }
+        at = end + 1
+    }
+    if length == 0 {
+        base.put8(out, 47)
+        length = 1
+    }
+    return base.bytes(out, length)
+}
+
+// The shard of the file whose path is name `path`, made when first asked
+// for: skipped when its file is no real one or its shard is there.
+fn shardOf(path: u32, file: u32) -> usize {
+    const known = table.get(&shards, @intCast(usize, path))
+    if known != 0 { return known }
+    const address = base.alloc(@sizeOf(Shard))
+    const shard = shardAt(address)
+    shard.*.path = path
+    shard.*.order = List.{ .items = 0, .length = 0, .capacity = 0, .size = 4 }
+    const name = base.nameOf(path)
+    shard.*.skip = name.length == 0 || name[0] == 60
+    if !shard.*.skip {
+        shard.*.absolute = absolutePath(name)
+        shard.*.hash = fnv(14695981039346656037, base.bytes(base.fileData(file), base.fileLength(file)))
+        shard.*.skip = exists(shardPath(shard, false))
+    }
+    table.set(&shards, @intCast(usize, path), address)
+    base.putWord(push(&shardList), address)
+    return address
+}
+
+fn shardPath(shard: *Shard, temporary: bool) -> []const u8 {
+    var buffer = Buffer.{ .data = 0, .length = 0, .capacity = 0 }
+    put(&buffer, base.bytes(directoryAt, directoryLength))
+    putByte(&buffer, 47)
+    putHex(&buffer, fnv(14695981039346656037, shard.*.absolute))
+    putByte(&buffer, 45)
+    putHex(&buffer, shard.*.hash)
+    put(&buffer, ".cxi")
+    if temporary {
+        putByte(&buffer, 46)
+        putNumber(&buffer, @intCast(u64, std.linux.syscall0(39)))
+    }
+    putByte(&buffer, 0)
+    return base.bytes(buffer.data, buffer.length - 1)
+}
+
+fn exists(path: []const u8) -> bool {
+    return std.linux.syscall2(21, base.cPath(path), 0) == 0
+}
+
+// The shard's number for the file named `path` (0: its own).
+fn fileNumber(shard: *Shard, path: u32) -> usize {
+    if path == shard.*.path { return 0 }
+    const known = table.get(&shard.*.files, @intCast(usize, path))
+    if known != 0 { return known }
+    base.put32(push(&shard.*.order), path)
+    const number = shard.*.order.length
+    table.set(&shard.*.files, @intCast(usize, path), number)
+    return number
+}
+
+// " FI:OFFSET" of `token`, " -" for none.
+fn putRef(shard: *Shard, token: usize) -> void {
+    var path: u32 = 0
+    var offset: usize = 0
+    if token == 0 || !positionOf(token, &path, &offset) {
+        put(&shard.*.records, " -")
+        return
+    }
+    putByte(&shard.*.records, 32)
+    putNumber(&shard.*.records, @intCast(u64, fileNumber(shard, path)))
+    putByte(&shard.*.records, 58)
+    putPlace(&shard.*.records, offset)
+}
+
+// The shard a token's record goes to (0: none, or skipped) and its
+// offset there.
+fn recordShard(token: usize, offset: *usize) -> usize {
+    var path: u32 = 0
+    if !positionOf(token, &path, offset) { return 0 }
+    const shard = shardOf(path, @intCast(u32, tokens.at(token).*.file))
+    if shardAt(shard).*.skip { return 0 }
+    return shard
+}
+
+var declared: table.Table = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+var recorded: table.Table = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+
+// A key of a place (the path's name id and the offset).
+fn placeKey(token: usize) -> usize {
+    var path: u32 = 0
+    var offset: usize = 0
+    if !positionOf(token, &path, &offset) { return 0 }
+    return (@intCast(usize, path) << 40) | offset
+}
+
+fn declaration(token: usize, kind: u8, parent: usize, link: u32, body: usize, definition: usize, qualified: []const u8, name: u32) -> void {
+    const key = placeKey(token)
+    if key == 0 || table.get(&declared, key) != 0 { return }
+    table.set(&declared, key, 1)
+    var offset: usize = 0
+    const address = recordShard(token, &offset)
+    if address == 0 { return }
+    const shard = shardAt(address)
+    const records = &shard.*.records
+    put(records, "D ")
+    putPlace(records, offset)
+    putByte(records, 32)
+    putNumber(records, @intCast(u64, tokens.at(token).*.length))
+    putByte(records, 32)
+    putByte(records, kind)
+    putRef(shard, parent)
+    if link != 0 {
+        putByte(records, 32)
+        put(records, base.nameOf(link))
+    } else {
+        put(records, " -")
+    }
+    putRef(shard, body)
+    putRef(shard, if definition != 0 && placeKey(definition) != key { definition } else { 0 })
+    putByte(records, 32)
+    if qualified.length > 0 { put(records, qualified) } else { putByte(records, 45) }
+    putByte(records, 32)
+    put(records, base.nameOf(name))
+    putByte(records, 10)
+}
+
+fn useRecord(token: usize, use: u8, target: usize) -> void {
+    const where = placeKey(token)
+    const key = where ^ (placeKey(target) *% 11400714819323198485) ^ @intCast(usize, use)
+    if where == 0 || table.get(&recorded, key) != 0 { return }
+    table.set(&recorded, key, 1)
+    var offset: usize = 0
+    const address = recordShard(token, &offset)
+    if address == 0 { return }
+    const shard = shardAt(address)
+    const records = &shard.*.records
+    put(records, "R ")
+    putPlace(records, offset)
+    putByte(records, 32)
+    putNumber(records, @intCast(u64, tokens.at(token).*.length))
+    putByte(records, 32)
+    putByte(records, use)
+    putRef(shard, target)
+    putByte(records, 10)
+}
+
+// A class's name as written in its declarations: its qualified name with
+// template arguments left out (`WTF::Vector`).
+fn className(ty: usize) -> []const u8 {
+    const name = types.at(ty).*.name
+    if name == 0 { return "" }
+    const text = base.nameOf(name)
+    var buffer = Buffer.{ .data = 0, .length = 0, .capacity = 0 }
+    var depth: u32 = 0
+    for byte in text {
+        if byte == 60 {
+            depth += 1
+        } else if byte == 62 {
+            if depth > 0 { depth -= 1 }
+        } else if depth == 0 && byte != 32 {
+            putByte(&buffer, byte)
+        }
+    }
+    if buffer.length == 0 { return "" }
+    return base.bytes(buffer.data, buffer.length)
+}
+
+fn classToken(ty: usize) -> usize {
+    if ty == 0 { return 0 }
+    const note = classNote(types.unqualified(ty))
+    if note == 0 { return 0 }
+    return base.getWord(note + 8)
+}
+
+// The name of the function `name` of a base of `classTy` (the nearest),
+// which a virtual function of the name overrides; 0 for none.
+fn overriddenIn(classTy: usize, name: u32, depth: usize) -> usize {
+    if depth > 16 || classTy == 0 { return 0 }
+    var m = types.at(classTy).*.members
+    while m != 0 {
+        const member = types.member(m)
+        if member.*.isBase {
+            const baseTy = types.unqualified(member.*.ty)
+            const c = cpp.info(baseTy)
+            if c != 0 {
+                const k: *cpp.Class = unsafe { @ptrFromInt(*cpp.Class, c) }
+                var cell = k.*.methods
+                while cell != 0 {
+                    const method = base.getWord(cell)
+                    if ast.obj(method).*.name == name && ast.obj(method).*.isVirtual && spells(ast.obj(method).*.token, name) { return ast.obj(method).*.token }
+                    cell = base.getWord(cell + 8)
+                }
+            }
+            const further = overriddenIn(baseTy, name, depth + 1)
+            if further != 0 { return further }
+        }
+        m = member.*.next
+    }
+    return 0
+}
+
+// Everything the unit `globals` (its objects) declares and uses into the
+// shards; written, then forgotten.
+pub fn writeUnit(globals: usize) -> void {
+    // The functions' bodies.
+    var o = globals
+    while o != 0 {
+        const obj = ast.obj(o)
+        if obj.*.isFunction && obj.*.body != 0 { walk(obj.*.body, USE_READ) }
+        o = obj.*.next
+    }
+    // Declarations: classes and their members.
+    var at: usize = 0
+    while at < classes.length {
+        const note = classes.items + at * classes.size
+        const ty = base.getWord(note)
+        const tag = base.getWord(note + 8)
+        if spells(tag, tokens.name(tag)) {
+            declaration(tag, if types.at(ty).*.kind == types.UNION { 117 } else { 99 }, 0, 0, base.getWord(note + 16), 0, className(ty), tokens.name(tag))
+            var m = types.at(ty).*.members
+            while m != 0 {
+                const member = types.member(m)
+                if member.*.isBase {
+                    const baseTag = classToken(member.*.ty)
+                    if baseTag != 0 && member.*.token != 0 && tokens.kind(member.*.token) == tokens.IDENT { useRecord(member.*.token, USE_BASE, baseTag) }
+                } else if spells(member.*.token, member.*.name) {
+                    declaration(member.*.token, 100, tag, 0, 0, 0, "", member.*.name)
+                }
+                m = member.*.next
+            }
+        }
+        at += 1
+    }
+    // Functions and variables.
+    o = globals
+    while o != 0 {
+        const obj = ast.obj(o)
+        if !obj.*.isLocal && !obj.*.isLiteral && !obj.*.isTable && spells(obj.*.token, obj.*.name) {
+            var body: usize = 0
+            if obj.*.isFunction && obj.*.body != 0 { body = ast.node(obj.*.body).*.token }
+            const definition = if obj.*.isFunction { table.get(&definitionName, o) } else { 0 }
+            const link = if obj.*.linkName != 0 { obj.*.linkName } else if obj.*.isStatic { 0 } else { obj.*.name }
+            declaration(obj.*.token, if obj.*.isFunction { 102 } else { 118 }, classToken(obj.*.classType), link, body, definition, "", obj.*.name)
+            if definition != 0 && placeKey(definition) != placeKey(obj.*.token) { useRecord(definition, USE_DEFINITION, obj.*.token) }
+            if obj.*.isFunction && obj.*.isVirtual && obj.*.classType != 0 {
+                const overridden = overriddenIn(types.unqualified(obj.*.classType), obj.*.name, 0)
+                if overridden != 0 { useRecord(obj.*.token, USE_OVERRIDE, overridden) }
+            }
+        }
+        o = obj.*.next
+    }
+    // Macros.
+    at = 0
+    while at < macroDefinitions.length {
+        const token = base.getWord(macroDefinitions.items + at * 8)
+        declaration(token, 109, 0, 0, 0, 0, "", tokens.name(token))
+        at += 1
+    }
+    // Uses.
+    at = 0
+    while at < uses.length {
+        const record = uses.items + at * uses.size
+        const token = base.getWord(record)
+        const target = targetToken(base.get8(record + 16), base.getWord(record + 8))
+        if target != 0 { useRecord(token, base.get8(record + 17), target) }
+        at += 1
+    }
+    // Includes.
+    at = 0
+    while at < includes.length {
+        const record = includes.items + at * includes.size
+        const token = base.getWord(record)
+        var offset: usize = 0
+        const address = recordShard(token, &offset)
+        if address != 0 {
+            const records = &shardAt(address).*.records
+            put(records, "I ")
+            putPlace(records, offset)
+            putByte(records, 32)
+            putNumber(records, @intCast(u64, tokens.at(token).*.length))
+            putByte(records, 32)
+            put(records, absolutePath(base.nameOf(@intCast(u32, base.getWord(record + 8)))))
+            putByte(records, 10)
+        }
+        at += 1
+    }
+    // Every file the unit read has a shard, empty or not.
+    var file: u32 = 1
+    while @intCast(usize, file) < 65536 && base.fileData(file) != 0 {
+        const name = base.fileName(file)
+        if name != 0 { const made = shardOf(name, file) }
+        file += 1
+    }
+    writeShards()
+    forget()
+}
+
+fn makeDirectories(path: []const u8) -> void {
+    var at: usize = 1
+    while at <= path.length {
+        if at == path.length || path[at] == 47 {
+            const made = std.linux.syscall2(83, base.cPath(path[0..at]), 493)
+        }
+        at += 1
+    }
+}
+
+fn writeShards() -> void {
+    makeDirectories(base.bytes(directoryAt, directoryLength))
+    var at: usize = 0
+    while at < shardList.length {
+        const shard = shardAt(base.getWord(shardList.items + at * 8))
+        if !shard.*.skip {
+            var text = Buffer.{ .data = 0, .length = 0, .capacity = 0 }
+            put(&text, "mlx-cc index 1\nfile ")
+            putHex(&text, shard.*.hash)
+            putByte(&text, 32)
+            put(&text, shard.*.absolute)
+            putByte(&text, 10)
+            if shard.*.records.length > 0 { put(&text, base.bytes(shard.*.records.data, shard.*.records.length)) }
+            var number: usize = 0
+            while number < shard.*.order.length {
+                const path = base.get32(shard.*.order.items + number * 4)
+                put(&text, "F ")
+                putNumber(&text, @intCast(u64, number + 1))
+                putByte(&text, 32)
+                put(&text, absolutePath(base.nameOf(path)))
+                putByte(&text, 10)
+                number += 1
+            }
+            const temporary = shardPath(shard, true)
+            const final = shardPath(shard, false)
+            const descriptor = std.linux.syscall3(2, base.keep(temporary), 577 | 524288, 420)
+            if descriptor >= 0 {
+                var written: usize = 0
+                while written < text.length {
+                    const count = std.linux.syscall3(1, @bitCast(usize, descriptor), text.data + written, text.length - written)
+                    if count <= 0 { break }
+                    written += @intCast(usize, count)
+                }
+                const closed = std.linux.syscall1(3, @bitCast(usize, descriptor))
+                const renamed = std.linux.syscall2(82, base.keep(temporary), base.keep(final))
+            }
+        }
+        at += 1
+    }
+}
+
+fn forget() -> void {
+    uses.length = 0
+    classes.length = 0
+    macroDefinitions.length = 0
+    includes.length = 0
+    shardList.length = 0
+    classOf = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+    definitionName = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+    seen = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+    shards = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+    declared = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+    recorded = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+}
