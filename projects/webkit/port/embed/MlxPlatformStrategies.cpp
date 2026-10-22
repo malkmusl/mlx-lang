@@ -43,10 +43,8 @@ static ResourceError errorFor(const URL& url, int code, ASCIILiteral description
 // loader as WebKit2's WebResourceLoader gives the network process's: the
 // response (typed by the file's extension, MIMETypeRegistryMlx.cpp), once
 // WebCore has decided on it the data, then the end.
-extern void (*mlxDebugHook)(const char*);
 static void loadFile(ResourceLoader& loader)
 {
-    if (mlxDebugHook) mlxDebugHook("loadFile start");
     if (loader.reachedTerminalState())
         return;
     URL url = loader.request().url();
@@ -68,7 +66,6 @@ static void loadFile(ResourceLoader& loader)
         mimeType = "application/octet-stream"_s;
     ResourceResponse response(WTF::move(url), WTF::move(mimeType), static_cast<long long>(length), String());
     loader.didReceiveResponse(WTF::move(response), [loader = Ref { loader }, data = WTF::move(data)] {
-        if (mlxDebugHook) mlxDebugHook("response delivered");
         if (!loader->reachedTerminalState() && data->size() && loader->request().httpMethod() != "HEAD"_s)
             loader->didReceiveBuffer(data, data->size(), DataPayloadWholeResource);
         if (!loader->reachedTerminalState())
@@ -102,7 +99,6 @@ public:
             return;
         }
         if (url.protocolIsFile()) {
-            if (mlxDebugHook) mlxDebugHook("schedule file");
             RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
                 loadFile(loader);
             });
