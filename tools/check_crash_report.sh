@@ -74,6 +74,16 @@ echo "ok   a failure the program cannot go on after (crash.fail) is reported wit
 
 # The handler's own values come from the value arena too: when the program
 # filled it, the handler takes room of its own and says so.
+# The handler itself faulting while it names the frames (made to): it
+# runs again, says the original crash, the frames as files and offsets,
+# and what failed, and ends as the original crash would have.
+run broken 132
+grep -q '^crashy: crashed: illegal instruction (a failed runtime check' "$work/broken.out" || fail "a fault in the handler loses the original crash" "$work/broken.out"
+grep -q '^  at crashy+0x[0-9a-f]*$' "$work/broken.out" || fail "a fault in the handler does not give the frames as file and offset" "$work/broken.out"
+grep -q '^  from crashy+0x[0-9a-f]*$' "$work/broken.out" || fail "a fault in the handler drops the callers" "$work/broken.out"
+grep -q '^  (the report failed naming the frames: signal 11 at [^ ]* in the crash handler; the frames from there are unnamed)$' "$work/broken.out" || fail "a fault in the handler is not said" "$work/broken.out"
+echo "ok   a fault in the crash handler itself still reports the original crash, its frames unnamed"
+
 run values 132
 grep -q "^crashy: crashed: illegal instruction (the values' arena is full" "$work/values.out" || fail "a full value arena is not said" "$work/values.out"
 grep -q '^  at tests/support/crash_report.mlx:[0-9]*:hoard+0x' "$work/values.out" || fail "the full arena does not name hoard" "$work/values.out"
@@ -98,7 +108,7 @@ echo "ok   a context whose memory is gone is left out of the report"
 
 log="$work/state/mlx/crashes.log"
 [[ -f "$log" ]] || fail "no crashes.log"
-[[ $(wc -l < "$log") -eq 8 ]] || fail "crashes.log does not hold eight crashes" "$log"
+[[ $(wc -l < "$log") -eq 9 ]] || fail "crashes.log does not hold nine crashes" "$log"
 awk -F'\t' '$1 != "crash" || $2 !~ /^[0-9]+$/ || $3 != "crashy" || NF < 5 { bad = 1 } END { exit bad }' "$log" || fail "crashes.log lines are not crash/time/program/reason/frames" "$log"
 grep -q "	tests/support/crash_report.mlx:16:middle+0x[0-9a-f]* at tests/support/crash_report.mlx:13	" "$log" || fail "the kept crash has no frames" "$log"
 grep -q "	illegal instruction ([^	]*), while compiling src/widget.c:12	tests/support/crash_report.mlx:16:middle" "$log" || fail "the kept crash does not have the context with its reason" "$log"
@@ -195,6 +205,40 @@ echo "ok   a crash of mlx-cc's C++ program names its functions mangled and as wr
 run_cc crash_cpp_stripped
 grep -q '^  at crash_cpp_stripped+0x[0-9a-f]*$' "$work/crash_cpp_stripped.out" || fail "the stripped program's frames are not named by the file and offset" "$work/crash_cpp_stripped.out"
 echo "ok   a stripped program's frames are the file and the offset"
+
+# An inline function's copy in an object whose definition another
+# object's replaced is still called by its own object, and still named
+# (a local of the same name).
+"$work/cc/mlx-cc" -c tests/support/crash_report_inline_a.cpp -o "$work/cc/inline_a.o" 2> "$work/inline.err" || fail "the inline probe does not compile" "$work/inline.err"
+"$work/cc/mlx-cc" -c tests/support/crash_report_inline_b.cpp -o "$work/cc/inline_b.o" 2>> "$work/inline.err" || fail "the inline probe does not compile" "$work/inline.err"
+"$work/cc/mlx-cc" "$work/cc/inline_a.o" "$work/cc/inline_b.o" -o "$work/cc/crash_inline" --dynamic-linker="$loader" 2>> "$work/inline.err" || fail "the inline probe does not link" "$work/inline.err"
+run_cc crash_inline
+grep -q '^  at _Z5twicePi+0x[0-9a-f]* (twice(int\*)) defined at tests/support/crash_report_inline_b.cpp:5$' "$work/crash_inline.out" || fail "the crash in an object's own copy of an inline function is not named" "$work/crash_inline.out"
+echo "ok   an object's own copy of an inline function, replaced as the program's, is named"
+
+# At scale: a C++ program of a million and more functions (a generated
+# object of 1,000,000 beside tests/support/crash_report_scale.cpp) that
+# crashes 21 calls deep in functions with long template names, as
+# webcore-dump did. mlxlibc's handler has the 64 KiB value arena of a
+# --stack-arena export for its whole run: naming every frame (C++ names
+# demangled) must not run it out, and the handler died of exactly that
+# before (a failed check in nameInImage).
+awk -v n=1000000 'BEGIN { for (i = 0; i < n; i++) printf "int many_%d(int x) { return x + %d; }\n", i, i; printf "int many_functions(int x) { return many_%d(x) - %d; }\n", n - 1, n - 1 }' > "$work/many.c"
+"$work/cc/mlx-cc" -c "$work/many.c" -o "$work/many.o" 2> "$work/many.err" || fail "the million functions do not compile" "$work/many.err"
+rm -f "$work/many.c"
+"$work/cc/mlx-cc" -c tests/support/crash_report_scale.cpp -o "$work/cc/scale.o" 2> "$work/scale.err" || fail "the scale probe does not compile" "$work/scale.err"
+"$work/cc/mlx-cc" "$work/cc/scale.o" "$work/many.o" -o "$work/cc/crash_scale" --dynamic-linker="$loader" 2>> "$work/scale.err" || fail "the scale probe does not link" "$work/scale.err"
+rm -f "$work/many.o"
+if command -v readelf > /dev/null; then
+    symbols=$(readelf -SW "$work/cc/crash_scale" | awk '$2 == ".symtab" { print $6 }')
+    (( 16#$symbols / 24 > 1000000 )) || fail "the scale probe's symbol table has fewer than a million symbols"
+fi
+run_cc crash_scale
+[[ $(grep -c '^  from _ZN5scale[0-9]*Level<[0-9]*>4downE.*+0x[0-9a-f]* (scale::Level<[0-9]*>::down(_IO_FILE\*, scale::Nest<scale::Box<scale::Nest<scale::Box<scale::Nest<scale::Box<int>, 1> >, 2> >, [0-9]*>\*, long))' "$work/crash_scale.out") -eq 20 ]] || fail "the deep C++ frames of the scale probe are not all named and demangled" "$work/crash_scale.out"
+grep -q '^  at _ZN5scale8Level<0>4downE.*(scale::Level<0>::down(' "$work/crash_scale.out" || fail "the scale probe's crash is not placed in Level<0>::down" "$work/crash_scale.out"
+grep -q '^  from main+0x[0-9a-f]* defined at tests/support/crash_report_scale.cpp:[0-9]*$' "$work/crash_scale.out" || fail "main is not among the scale probe's callers" "$work/crash_scale.out"
+grep -q 'the report failed' "$work/crash_scale.out" && fail "the handler failed naming the scale probe's frames" "$work/crash_scale.out"
+echo "ok   a crash among a million functions, 21 frames of long C++ names deep, is named in full"
 
 # mlx-codemap crashes (tools/codemap, installed also as mlx-codemap) lists
 # the kept crashes on the functions of this tree.
