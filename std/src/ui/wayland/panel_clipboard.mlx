@@ -1,0 +1,321 @@
+// The clipboard (part of panel.mlx, split from it): wl_data_device's
+// selection in both directions. A client sets it with entries, each a
+// MIME type and its bytes (beginClipboard, addClipboard,
+// publishClipboard), which the panel serves to whoever reads them; the
+// selection another client set comes as an offer whose types are kept,
+// and readClipboard takes one type's bytes from it through a pipe.
+const std = @import("std")
+const wl = @import("std.wayland")
+const panel_module = @import("./panel.mlx")
+const panel_drag_module = @import("./panel_drag.mlx")
+
+const SYS_READ: usize = 0
+const SYS_WRITE: usize = 1
+const SYS_POLL: usize = 7
+const SYS_RT_SIGPROCMASK: usize = 14
+const SYS_RT_SIGTIMEDWAIT: usize = 128
+const SYS_PIPE2: usize = 293
+const O_CLOEXEC: usize = 524288
+const POLLIN: i32 = 1
+const POLLOUT: i32 = 4
+const SIG_BLOCK: usize = 0
+const SIG_SETMASK: usize = 2
+// SIGPIPE (13) in a signal set.
+const PIPE_SIGNAL: usize = 4096
+// A peer that lets a chunk wait longer than this is given up on: a
+// client that never reads (or never writes) must not hang this one.
+const WAIT_MILLISECONDS: usize = 1000
+// Writes after a poll said the pipe has room stay within one pipe
+// buffer page, so they never block.
+const CHUNK: usize = 4096
+// The most one read of the clipboard takes in.
+const READ_LIMIT: usize = 16777216
+
+// Writes `data` into a pipe a reader holds, then leaves the descriptor
+// open (the caller closes it). A reader that went away raises SIGPIPE,
+// which would end the program: it stays blocked while writing and is
+// taken back before the mask is restored.
+pub fn writeAll(descriptor: isize, data: []const u8) -> void {
+    var blocked: usize = PIPE_SIGNAL
+    var previous: usize = 0
+    _ = std.linux.syscall4(SYS_RT_SIGPROCMASK, SIG_BLOCK, @intFromPtr(&blocked), @intFromPtr(&previous), 8)
+    var poll: [2]i32 = [2]i32{ @intCast(i32, descriptor), POLLOUT }
+    var at: usize = 0
+    while at < data.length {
+        if std.linux.syscall3(SYS_POLL, @intFromPtr(&poll), 1, WAIT_MILLISECONDS) <= 0 { break }
+        var count = data.length - at
+        if count > CHUNK { count = CHUNK }
+        const written = std.linux.syscall3(SYS_WRITE, @bitCast(usize, descriptor), @intFromPtr(data.pointer) + at, count)
+        if written <= 0 { break }
+        at += @intCast(usize, written)
+    }
+    if previous & PIPE_SIGNAL == 0 {
+        var now: [2]usize = [2]usize{ 0, 0 }
+        _ = std.linux.syscall4(SYS_RT_SIGTIMEDWAIT, @intFromPtr(&blocked), 0, @intFromPtr(&now), 8)
+        _ = std.linux.syscall4(SYS_RT_SIGPROCMASK, SIG_SETMASK, @intFromPtr(&previous), 0, 8)
+    }
+}
+
+// The size `capacity` (0: none yet) doubles to for `wanted` bytes.
+fn capacityFor(capacity: usize, wanted: usize) -> usize {
+    var size = if capacity == 0 { 4096 } else { capacity }
+    while size < wanted { size = size * 2 }
+    return size
+}
+
+// `memory` (`capacity` bytes) grown to hold `wanted`, or null when there
+// is no memory to be had.
+fn grown(panel: *panel_module.Panel, memory: [*]u8, capacity: usize, wanted: usize) -> ?[*]u8 {
+    if wanted <= capacity { return memory }
+    const size = capacityFor(capacity, wanted)
+    if capacity == 0 { return panel.*.allocator.alloc(size, 16) }
+    return panel.*.allocator.resize(memory, capacity, size, 16)
+}
+
+fn reserveStore(panel: *panel_module.Panel, extra: usize) -> bool {
+    const wanted = panel.*.clipLength + extra
+    const memory = grown(panel, panel.*.clipStore, panel.*.clipCapacity, wanted)
+    if memory == null { return false }
+    panel.*.clipStore = memory.?
+    if wanted > panel.*.clipCapacity { panel.*.clipCapacity = capacityFor(panel.*.clipCapacity, wanted) }
+    return true
+}
+
+fn reserveRead(panel: *panel_module.Panel, extra: usize) -> bool {
+    const wanted = panel.*.clipReadLength + extra
+    const memory = grown(panel, panel.*.clipRead, panel.*.clipReadCapacity, wanted)
+    if memory == null { return false }
+    panel.*.clipRead = memory.?
+    if wanted > panel.*.clipReadCapacity { panel.*.clipReadCapacity = capacityFor(panel.*.clipReadCapacity, wanted) }
+    return true
+}
+
+// One entry of clipStore: its type, its data, and where the next starts.
+const Entry = struct {
+    mime: []const u8
+    data: []const u8
+    next: usize
+}
+
+fn entryAt(panel: *panel_module.Panel, at: usize) -> Entry {
+    const store = panel.*.clipStore
+    const mime_length = @intCast(usize, store[at])
+    const data_at = at + 1 + mime_length + 4
+    const length_at = at + 1 + mime_length
+    const data_length = @intCast(usize, store[length_at]) | (@intCast(usize, store[length_at + 1]) << 8) | (@intCast(usize, store[length_at + 2]) << 16) | (@intCast(usize, store[length_at + 3]) << 24)
+    return Entry.{ .mime = store[at + 1..at + 1 + mime_length], .data = store[data_at..data_at + data_length], .next = data_at + data_length }
+}
+
+// Where the entry of `mime` starts in clipStore, or clipLength for none.
+fn findEntry(panel: *panel_module.Panel, mime: []const u8) -> usize {
+    var at: usize = 0
+    while at < panel.*.clipLength {
+        const entry = entryAt(panel, at)
+        if std.text.same(entry.mime, mime) { return at }
+        at = entry.next
+    }
+    return panel.*.clipLength
+}
+
+// Whether `mime` is one of the newline-ended types in `types`.
+fn listed(types: []const u8, mime: []const u8) -> bool {
+    var start: usize = 0
+    var index: usize = 0
+    while index < types.length {
+        if types[index] == 10 {
+            if std.text.same(types[start..index], mime) { return true }
+            start = index + 1
+        }
+        index += 1
+    }
+    return false
+}
+
+fn offerTypesOf(panel: *panel_module.Panel) -> [*]u8 { return panel_drag_module.bytesAt(panel, @offsetOf(panel_module.Panel, "offerTypes")) }
+fn selectionTypesOf(panel: *panel_module.Panel) -> []const u8 { return panel_drag_module.bytesAt(panel, @offsetOf(panel_module.Panel, "selectionTypes"))[0..panel.*.selectionTypesLength] }
+
+// A type the offer made last lists (its offer events), kept for when it
+// becomes the selection. Types past the room there are dropped.
+pub fn noteOfferType(panel: *panel_module.Panel, mime: []const u8) -> void {
+    if panel.*.offerTypesLength + mime.length + 1 > 1024 { return }
+    const types = offerTypesOf(panel)
+    for byte in mime {
+        types[panel.*.offerTypesLength] = byte
+        panel.*.offerTypesLength += 1
+    }
+    types[panel.*.offerTypesLength] = 10
+    panel.*.offerTypesLength += 1
+}
+
+fn forgetSelection(panel: *panel_module.Panel) -> void {
+    if !panel.*.hasSelectionOffer { return }
+    panel.*.selectionOffer.destroy()
+    panel.*.hasSelectionOffer = false
+    panel.*.selectionTypesLength = 0
+}
+
+// The data device's selection event: `offer` (the offer made last) is
+// the clipboard now, or there is none (a null offer).
+pub fn selectionChanged(panel: *panel_module.Panel, offer: wl.wl_data_offer.Proxy) -> void {
+    forgetSelection(panel)
+    if offer.isNull() || !panel.*.hasLastOffer || offer.id() != panel.*.lastOffer.id() { return }
+    panel.*.selectionOffer = panel.*.lastOffer
+    panel.*.hasSelectionOffer = true
+    panel.*.hasLastOffer = false
+    const types = offerTypesOf(panel)
+    const kept = panel_drag_module.bytesAt(panel, @offsetOf(panel_module.Panel, "selectionTypes"))
+    var index: usize = 0
+    while index < panel.*.offerTypesLength {
+        kept[index] = types[index]
+        index += 1
+    }
+    panel.*.selectionTypesLength = panel.*.offerTypesLength
+}
+
+fn dropSource(panel: *panel_module.Panel) -> void {
+    if !panel.*.hasClipSource { return }
+    panel.*.clipSource.destroy()
+    panel.*.hasClipSource = false
+}
+
+fn onClipSource(context: *anyopaque, event: wl.client.Event) -> void {
+    const panel = panel_module.panelOf(context)
+    const decoded = wl.wl_data_source.decodeEvent(event)
+    const ours = panel.*.hasClipSource && event.object.id == panel.*.clipSource.id()
+    if event.opcode == wl.wl_data_source.EVENT_SEND {
+        const descriptor = decoded.send.fd.descriptor
+        if ours {
+            const mime = decoded.send.mime_type
+            const at = findEntry(panel, mime.pointer[0..mime.length])
+            if at < panel.*.clipLength { writeAll(descriptor, entryAt(panel, at).data) }
+        }
+        panel_drag_module.closeDescriptor(descriptor)
+    } else if event.opcode == wl.wl_data_source.EVENT_CANCELLED {
+        // Another client's selection replaced it.
+        if ours { dropSource(panel) }
+    }
+}
+
+// Starts the entries a publishClipboard offers.
+pub fn beginClipboard(panel: *panel_module.Panel) -> void { panel.*.clipLength = 0 }
+
+// Adds `data` as `mime` to the entries begun. False when it does not fit.
+pub fn addClipboard(panel: *panel_module.Panel, mime: []const u8, data: []const u8) -> bool {
+    if mime.length == 0 || mime.length > 255 || data.length > 4294967295 { return false }
+    if !reserveStore(panel, 1 + mime.length + 4 + data.length) { return false }
+    const store = panel.*.clipStore
+    var at = panel.*.clipLength
+    store[at] = @intCast(u8, mime.length)
+    at += 1
+    for byte in mime {
+        store[at] = byte
+        at += 1
+    }
+    store[at] = @intCast(u8, data.length & 255)
+    store[at + 1] = @intCast(u8, (data.length >> 8) & 255)
+    store[at + 2] = @intCast(u8, (data.length >> 16) & 255)
+    store[at + 3] = @intCast(u8, (data.length >> 24) & 255)
+    at += 4
+    for byte in data {
+        store[at] = byte
+        at += 1
+    }
+    panel.*.clipLength = at
+    return true
+}
+
+// Makes the entries the clipboard (the selection, named by the last key
+// or button press). The source before goes first, so the compositor
+// never offers both. False without a data device or entries.
+pub fn publishClipboard(panel: *panel_module.Panel) -> bool {
+    if !panel.*.hasDataDevice || panel.*.clipLength == 0 { return false }
+    dropSource(panel)
+    const source = panel.*.dataManager.createDataSource()
+    source.setHandler(onClipSource, panel_module.contextOf(panel))
+    var at: usize = 0
+    while at < panel.*.clipLength {
+        const entry = entryAt(panel, at)
+        source.offer(entry.mime)
+        at = entry.next
+    }
+    panel.*.clipSource = source
+    panel.*.hasClipSource = true
+    panel.*.dataDevice.setSelection(&source, panel.*.inputSerial)
+    return true
+}
+
+// Empties the clipboard when it is this client's.
+pub fn clearClipboard(panel: *panel_module.Panel) -> void {
+    if !panel.*.hasClipSource { return }
+    dropSource(panel)
+    panel.*.clipLength = 0
+    panel.*.dataDevice.setSelection(null, panel.*.inputSerial)
+}
+
+// Whether the clipboard is this client's (what it published last).
+pub fn clipboardIsOurs(panel: *panel_module.Panel) -> bool { return panel.*.hasClipSource }
+
+// Whether the clipboard holds `mime`.
+pub fn clipboardHas(panel: *panel_module.Panel, mime: []const u8) -> bool {
+    if panel.*.hasClipSource { return findEntry(panel, mime) < panel.*.clipLength }
+    return panel.*.hasSelectionOffer && listed(selectionTypesOf(panel), mime)
+}
+
+// The clipboard's bytes as `mime` ("" when it has none), valid until the
+// next read. Another client's are read through a pipe it writes into;
+// waits a second at most for each part.
+pub fn readClipboard(panel: *panel_module.Panel, mime: []const u8) -> []const u8 {
+    if panel.*.hasClipSource {
+        const at = findEntry(panel, mime)
+        if at < panel.*.clipLength { return entryAt(panel, at).data }
+        return ""
+    }
+    if !clipboardHas(panel, mime) { return "" }
+    var reader: isize = -1
+    var writer: isize = -1
+    if !openPipe(&reader, &writer) { return "" }
+    panel.*.selectionOffer.receive(mime, wl.Handle.fromDescriptor(writer))
+    return readPipe(panel, reader, writer)
+}
+
+// What another client writes into the pipe whose ends are `reader` and
+// `writer` (the receive request just sent it the writer, which is closed
+// here): read until it closes its end, into clipRead (valid until the
+// next read). Waits a second at most for each part.
+pub fn readPipe(panel: *panel_module.Panel, reader: isize, writer: isize) -> []const u8 {
+    panel.*.clipReadLength = 0
+    const flushed = panel.*.display.flush()
+    panel_drag_module.closeDescriptor(writer)
+    var poll: [2]i32 = [2]i32{ @intCast(i32, reader), POLLIN }
+    while panel.*.clipReadLength < READ_LIMIT {
+        if std.linux.syscall3(SYS_POLL, @intFromPtr(&poll), 1, WAIT_MILLISECONDS) <= 0 { break }
+        if !reserveRead(panel, CHUNK * 4) { break }
+        const count = std.linux.syscall3(SYS_READ, @bitCast(usize, reader), @intFromPtr(panel.*.clipRead) + panel.*.clipReadLength, CHUNK * 4)
+        if count <= 0 { break }
+        panel.*.clipReadLength += @intCast(usize, count)
+    }
+    panel_drag_module.closeDescriptor(reader)
+    if panel.*.clipReadLength == 0 { return "" }
+    return panel.*.clipRead[0..panel.*.clipReadLength]
+}
+
+// A pipe for a receive request: its read end into `reader`, its write end
+// into `writer`. False when there is none to be had.
+pub fn openPipe(reader: *isize, writer: *isize) -> bool {
+    var descriptors: [2]i32 = [2]i32{ -1, -1 }
+    if std.linux.syscall2(SYS_PIPE2, @intFromPtr(&descriptors), O_CLOEXEC) != 0 { return false }
+    reader.* = @intCast(isize, descriptors[0])
+    writer.* = @intCast(isize, descriptors[1])
+    return true
+}
+
+// Lets go of the clipboard's memory and source (close).
+pub fn release(panel: *panel_module.Panel) -> void {
+    dropSource(panel)
+    forgetSelection(panel)
+    if panel.*.clipCapacity > 0 { panel.*.allocator.free(panel.*.clipStore, panel.*.clipCapacity, 16) }
+    if panel.*.clipReadCapacity > 0 { panel.*.allocator.free(panel.*.clipRead, panel.*.clipReadCapacity, 16) }
+    panel.*.clipCapacity = 0
+    panel.*.clipReadCapacity = 0
+    panel.*.clipLength = 0
+}

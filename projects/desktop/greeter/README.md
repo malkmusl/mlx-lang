@@ -13,13 +13,16 @@ there is no external D-Bus daemon or library. Sessions come from the freedesktop
 command is passed as data to `mlx-login`, never to a shell.
 
 It looks like the lock screen (`projects/desktop/lock`), fullscreen: one
-card with the account mark, the account's name, the password and the
-button. The arrows beside the mark go through the people's accounts;
-root and accounts without a login shell are not among them. A click on
+card with the account mark, the account's name, the session choice, the
+password and the button. The arrows beside the mark go through the
+people's accounts; root and accounts without a login shell are not among
+them. A click on
 the name turns it into a field for any account name, root's too (Escape
-or an arrow goes back). There is no session choice: `mlx-login` starts
-the Mlx desktop, so the entry running `mlx-session` is taken (the first
-one when it is not installed).
+or an arrow goes back). The session row below the account has arrows for
+all valid `wayland-sessions` entries. It initially chooses the entry
+running `mlx-session` (or the first entry when that is not installed),
+and sends the executable belonging to the visibly selected name to
+`mlx-login`.
 
 The password field displays stars. On every accepted, rejected, failed,
 or closed attempt, the entire fixed password buffer and its display copy

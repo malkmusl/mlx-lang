@@ -153,6 +153,12 @@ of `compiler/selfhost` or `std/bootstrap` changed (`tools/ensure_compiler.sh`:
 from an older `mlx4`, else from the bootstrap compiler, which needs zig; in
 two stages, and one or two more until the compiler builds itself byte for
 byte, when the older one still had a bug the new sources fixed).
+The compiler it replaces stays as `mlx-out/bin/compiler/mlx4.previous`:
+the compiler's sources, and everything they import, must stay what that
+previous compiler and mlx0 build, so they never import the std root and
+use no language feature the previous compiler lacks
+(`compiler/selfhost/README.md`, "Bootstrapping"; `tools/check_bootstrap.sh`
+checks it, and `codemap.layers` states it for `mlx-codemap layers`).
 `mlx build ARGS` is a subcommand of the compiler
 (`compiler/selfhost/driver/build_command.mlx`): it writes
 `mlx-out/build/runner.mlx`, a main that imports `../../build.mlx` and

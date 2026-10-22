@@ -148,12 +148,17 @@ if unshare --user --map-root-user --pid --fork --mount-proc --uts true 2> /dev/n
     ns="$work/ns"
     mkdir -p "$ns/services" "$ns/run" "$ns/log" "$ns/mnt"
     echo mlxtest > "$ns/hostname"
-    echo "tmpfs $ns/mnt tmpfs mode=755,size=1m" > "$ns/mounts"
+    cat > "$ns/fsck" <<FSCK
+#!/bin/sh
+printf '%s\n' "\$*" >> "$ns/fsck.log"
+FSCK
+    chmod 755 "$ns/fsck"
+    echo "mlx-init-test-root $ns/mnt tmpfs mode=755,size=1m 0 1" > "$ns/mounts"
     cat > "$ns/services/probe.service" <<SERVICE
 description = looks around inside the namespace
 exec = /bin/sh -c "echo comm=\$(cat /proc/1/comm); echo host=\$(cat /proc/sys/kernel/hostname); echo mnt=\$(grep ' $ns/mnt ' /proc/self/mounts | cut -d' ' -f3); exec sleep 1000"
 SERVICE
-    unshare --user --map-root-user --pid --fork --mount-proc --uts "$work/mlx-init" --services "$ns/services" --mounts "$ns/mounts" --hostname "$ns/hostname" --control "$ns/run/init" --log "$ns/log" --verbose 2> "$ns/init.err" &
+    unshare --user --map-root-user --pid --fork --mount-proc --uts "$work/mlx-init" --services "$ns/services" --mounts "$ns/mounts" --fsck "$ns/fsck" --hostname "$ns/hostname" --control "$ns/run/init" --log "$ns/log" --verbose 2> "$ns/init.err" &
     init_pid=$!
     wait_socket "$ns/run/init" "$ns/init.err"
     nsctl() { "$work/mlx-initctl" --control "$ns/run/init" "$@"; }
@@ -167,7 +172,8 @@ SERVICE
     grep -q '^comm=mlx-init$' "$ns/log/probe.log" || fail "PID 1 of the namespace is not mlx-init" "$ns/log/probe.log"
     grep -q '^host=mlxtest$' "$ns/log/probe.log" || fail "the hostname was not set from the file" "$ns/log/probe.log"
     grep -q '^mnt=tmpfs$' "$ns/log/probe.log" || fail "the mounts file was not applied" "$ns/log/probe.log"
-    echo "ok   as PID 1: the hostname, the mounts file and the services"
+    grep -qx -- '-a -t tmpfs mlx-init-test-root' "$ns/fsck.log" || fail "the fstab check pass did not invoke the configured fsck" "$ns/fsck.log"
+    echo "ok   as PID 1: the hostname, all fstab fields, fsck, mounts and services"
     nsctl poweroff > /dev/null || fail "poweroff was refused" "$ns/init.err"
     tries=0
     while kill -0 "$init_pid" 2> /dev/null; do
@@ -182,5 +188,10 @@ SERVICE
 else
     echo "skip as PID 1 (unshare with a user and PID namespace does not work here)"
 fi
+
+"$repo_root/tools/check_init_devices.sh" "$compiler"
+"$repo_root/tools/check_init_readiness.sh" "$compiler"
+"$repo_root/tools/check_init_accounts_shutdown_logs.sh" "$compiler"
+"$repo_root/tools/check_init_fstab.sh" "$compiler"
 
 echo "PASS mlx-init"

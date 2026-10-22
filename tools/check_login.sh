@@ -15,6 +15,10 @@ cd "$repo_root"
 compiler=${1:-$(tools/ensure_compiler.sh)}
 command -v gdbus > /dev/null || { echo "check_login.sh: needs gdbus (glib2.0-bin)" >&2; exit 2; }
 command -v unshare > /dev/null || { echo "check_login.sh: needs unshare (util-linux)" >&2; exit 2; }
+# The login1 bridge hands out seat devices through /dev/char/MAJOR:MINOR
+# (the test takes 1:3, /dev/null); a container's minimal /dev has no
+# /dev/char, and the check cannot run there.
+[[ -e /dev/char/1:3 ]] || { echo "check_login.sh: needs /dev/char/1:3 (devtmpfs's device links; a minimal /dev has none)" >&2; exit 2; }
 
 # Both the MLXIPC system bus and mlx-login use root credentials as a
 # security boundary. Keep those credentials inside a private user
@@ -186,8 +190,6 @@ echo "ok   Login requires login.session before checking a password"
 printf 'allow gdbus use login.session\nallow gdbus use login.power\nallow login1-client use login.device\n' > "$work/none.conf"
 sleep 0.3
 
-<<<<<<< Updated upstream
-=======
 power_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.PowerOff false 2>&1 || true)
 grep -q '()' <<< "$power_out" || { echo "FAIL login1 PowerOff did not succeed:" >&2; echo "$power_out" >&2; exit 1; }
@@ -222,7 +224,6 @@ XDG_SESSION_ID=mlx-greeter XDG_SEAT=seat0 "$work/login1-client" > "$work/greeter
 grep -q 'login1 client passed' "$work/greeter-login1.log" || { echo "FAIL greeter login1 client did not finish" >&2; cat "$work/greeter-login1.log" >&2; exit 1; }
 echo "ok   the greeter session receives devices through mlx-login login1"
 
->>>>>>> Stashed changes
 login_out=$(login_call mlx-missing test-password)
 grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not refuse an unknown account:" >&2; echo "$login_out" >&2; exit 1; }
 echo "ok   Login refuses an unknown account"

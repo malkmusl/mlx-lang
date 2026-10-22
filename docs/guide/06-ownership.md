@@ -7,7 +7,8 @@
 `218_autodrop_conditional_move_runtime.mlx`, `219_autodrop_reinitialize_runtime.mlx`,
 `220_autodrop_parameter_runtime.mlx`, `221_autodrop_return_transfer_runtime.mlx`,
 `222_autodrop_loop_exit_runtime.mlx`, `223_noncopy_local_copy_error.mlx`,
-`224_noncopy_representation_copy_error.mlx`
+`224_noncopy_representation_copy_error.mlx`,
+`399_generic_noncopy_autodrop_runtime.mlx`, `400_noncopy_field_drop_runtime.mlx`
 
 Mlx has no garbage collector, reference counting, or implicit destructors.
 Instead, it tracks ownership of values whose type is wrapped with
@@ -279,3 +280,75 @@ fn main() -> u8 {
 ```
 
 (`tests/222_autodrop_loop_exit_runtime.mlx`)
+
+### Generic @noncopy types
+
+A `@noncopy(struct)` returned by a function returning `type` (see
+"Generic aggregate types" in the [comptime chapter](08-comptime-and-generics.md))
+is dropped exactly as a non-generic one: at scope exit, in LIFO order,
+not after a move, once after a conditional move, on return through
+`@move`, as a moved-in parameter, and at `continue` and `break`:
+
+```mlx
+fn Owned(comptime T: type) -> type {
+    return @noncopy(struct) {
+        value: T
+        drops: *u8
+
+        pub fn init(drops: *u8, value: T) -> Self {
+            return Self.{ .value = value, .drops = drops }
+        }
+
+        fn deinit(self: *Self) -> void {
+            self.*.drops.* += 1
+        }
+    }
+}
+
+fn main() -> u8 {
+    var drops: u8 = 0
+    {
+        var owned = Owned(u32).init(&drops, 40)
+        const other = Owned(u8).init(&drops, 2)
+    }   // both drop: drops == 2
+    ...
+}
+```
+
+(`tests/399_generic_noncopy_autodrop_runtime.mlx`)
+
+Inside a `@noncopy(struct)`, generic or not, `Self` is the non-copyable
+type itself: a method taking `self: *Self` is called on a value of the
+binding's type, and `init() -> Self` returns one that is dropped.
+
+### A @noncopy field is its parent's to drop
+
+The compiler drops the *bindings* that go out of scope. It never drops
+the fields of what it drops: there is no implicit destructor chain, as
+there is no implicit destructor. A `@noncopy` field of a `@noncopy` parent
+is dropped when, and only when, the parent's `deinit` calls the field's:
+
+```mlx
+const Parent = @noncopy(struct) {
+    child: Child
+    drops: *u8
+
+    fn deinit(self: *Self) -> void {
+        self.*.drops.* += 10
+        self.*.child.deinit()   // the field's drop is the parent's doing
+    }
+}
+
+const Careless = @noncopy(struct) {
+    child: Child
+
+    fn deinit(self: *Self) -> void {}   // the field is never dropped
+}
+```
+
+(`tests/400_noncopy_field_drop_runtime.mlx`, with `Child` counting its
+drops and a generic `Holder(T)` whose `deinit` calls `self.*.inner.deinit()`)
+
+So a container holding non-copyable elements owns them: its `deinit`
+drops the elements it still holds, and an element handed out through
+`@move` is no longer its to drop.

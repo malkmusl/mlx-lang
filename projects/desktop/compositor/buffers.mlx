@@ -1,0 +1,353 @@
+// What a commit does with the surface's buffer (part of windows.mlx,
+// split from it): the CPU renderer copies it into the surface and releases
+// it, the Vulkan renderer shows it in place until the next one; then the
+// viewport (wp_viewport, viewport.mlx) crops and scales it to the
+// surface's size. On the CPU the scaled pixels are made here, each the
+// mean of 4x4 samples spread over the part of the crop it covers, as the
+// Vulkan renderer's shrink shader takes them (vulkan.mlx), so both show
+// the same pixels.
+const wl = @import("std.wayland")
+const ui = @import("std.ui")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const shell = @import("./shell.mlx")
+
+const Surface = state.Surface
+
+// The viewport state of a new surface: none.
+pub fn initSurface(surface: *Surface) -> void {
+    surface.*.viewport = 0
+    surface.*.pendingCrop = [4]i32{ -256, -256, -256, -256 }
+    surface.*.pendingViewWidth = -1
+    surface.*.pendingViewHeight = -1
+    surface.*.crop = ui.rect(0, 0, 0, 0)
+    surface.*.viewWidth = 0
+    surface.*.viewHeight = 0
+    surface.*.bufferWidth = 0
+    surface.*.bufferHeight = 0
+    surface.*.scaledCopy = false
+    surface.*.sourceCapacity = 0
+    surface.*.scaled = 0
+    surface.*.scaledSize = 0
+    surface.*.scaledSerial = 0
+    surface.*.fractionalScale = 0
+}
+
+pub fn releaseSurface(surface: *Surface) -> void {
+    if surface.*.sourceCapacity > 0 { state.release(surface.*.compositor, surface.*.sourcePixels, surface.*.sourceCapacity) }
+    surface.*.sourceCapacity = 0
+}
+
+// The buffer a commit attaches (a null one windows.mlx handles: the
+// surface is unmapped), then the viewport state it carries.
+pub fn commitContent(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    var attached = false
+    if surface.*.hasPendingAttach && surface.*.pendingBuffer != 0 {
+        surface.*.fpsFrames +%= 1
+        if compositor.*.renderer != 0 {
+            holdBuffer(surface, surface.*.pendingBuffer)
+        } else {
+            copyBuffer(surface, shell.bufferAt(surface.*.pendingBuffer))
+            compositor.*.commits += 1
+            surface.*.contentSerial = compositor.*.commits
+        }
+        attached = true
+    }
+    surface.*.hasPendingAttach = false
+    surface.*.pendingBuffer = 0
+    applyView(surface, attached)
+}
+
+// The crop and size asked for, applied: checked against the buffer as the
+// protocol asks (out_of_buffer for a crop reaching outside it, bad_size
+// for a crop of a fraction of a pixel and no size), then the surface's
+// size and, on the CPU, its pixels for them.
+fn applyView(surface: *Surface, attached: bool) -> void {
+    const compositor = surface.*.compositor
+    const pending = surface.*.pendingCrop
+    var crop = ui.rect(0, 0, 0, 0)
+    var width: i32 = 0
+    var height: i32 = 0
+    if pending[2] != -256 {
+        const outside = pending[0] + pending[2] > surface.*.bufferWidth * 256 || pending[1] + pending[3] > surface.*.bufferHeight * 256
+        if surface.*.hasContent && outside {
+            viewportError(surface, wl.wp_viewport.Error.out_of_buffer, "the source rectangle reaches outside the buffer")
+            return
+        }
+        if surface.*.pendingViewWidth <= 0 && (pending[2] % 256 != 0 || pending[3] % 256 != 0) {
+            viewportError(surface, wl.wp_viewport.Error.bad_size, "a source rectangle of a fraction of a pixel needs a destination size")
+            return
+        }
+        // In whole pixels: the crop's top left corner down, its bottom
+        // right one up.
+        const left = pending[0] / 256
+        const top = pending[1] / 256
+        crop = ui.rect(left, top, (pending[0] + pending[2] + 255) / 256 - left, (pending[1] + pending[3] + 255) / 256 - top)
+        width = pending[2] / 256
+        height = pending[3] / 256
+    }
+    if surface.*.pendingViewWidth > 0 {
+        width = surface.*.pendingViewWidth
+        height = surface.*.pendingViewHeight
+    }
+    const same_crop = crop.x == surface.*.crop.x && crop.y == surface.*.crop.y && crop.width == surface.*.crop.width && crop.height == surface.*.crop.height
+    const changed = attached || !same_crop || width != surface.*.viewWidth || height != surface.*.viewHeight
+    surface.*.crop = crop
+    surface.*.viewWidth = width
+    surface.*.viewHeight = height
+    if !changed || !surface.*.hasContent { return }
+    if !attached {
+        compositor.*.commits += 1
+        surface.*.contentSerial = compositor.*.commits
+    }
+    if compositor.*.renderer != 0 {
+        surface.*.pixelWidth = @intCast(usize, if width > 0 { width } else { surface.*.bufferWidth })
+        surface.*.pixelHeight = @intCast(usize, if width > 0 { height } else { surface.*.bufferHeight })
+        return
+    }
+    if width > 0 {
+        showView(surface)
+    } else if surface.*.scaledCopy {
+        // No viewport any more: the buffer's own copy is shown again.
+        swapPixels(surface)
+        surface.*.pixelWidth = @intCast(usize, surface.*.bufferWidth)
+        surface.*.pixelHeight = @intCast(usize, surface.*.bufferHeight)
+        surface.*.scaledCopy = false
+    }
+}
+
+fn viewportError(surface: *Surface, code: wl.wp_viewport.Error, message: []const u8) -> void {
+    const record: *state.SurfaceExtension = unsafe { @ptrFromInt(*state.SurfaceExtension, surface.*.viewport) }
+    wl.wp_viewport.Resource.fromObject(record.*.resource).postError(@intFromEnum(code), message)
+}
+
+// The surface's pixels and its buffer's copy change places.
+fn swapPixels(surface: *Surface) -> void {
+    const pixels = surface.*.pixels
+    const capacity = surface.*.pixelCapacity
+    surface.*.pixels = surface.*.sourcePixels
+    surface.*.pixelCapacity = surface.*.sourceCapacity
+    surface.*.sourcePixels = pixels
+    surface.*.sourceCapacity = capacity
+}
+
+// CPU: the buffer's copy (moved to sourcePixels the first time) cropped
+// and scaled into `pixels`, the view's size.
+fn showView(surface: *Surface) -> void {
+    const compositor = surface.*.compositor
+    if !surface.*.scaledCopy {
+        swapPixels(surface)
+        surface.*.scaledCopy = true
+    }
+    const width = @intCast(usize, surface.*.viewWidth)
+    const height = @intCast(usize, surface.*.viewHeight)
+    const needed = width * height * 4
+    if needed > surface.*.pixelCapacity {
+        if surface.*.pixelCapacity > 0 { state.release(compositor, surface.*.pixels, surface.*.pixelCapacity) }
+        surface.*.pixels = state.allocate(compositor, needed)
+        surface.*.pixelCapacity = needed
+    }
+    const crop = state.viewCrop(surface)
+    const stride = @intCast(usize, surface.*.bufferWidth)
+    var from: [*]const u32 = undefined
+    var to: [*]u32 = undefined
+    unsafe {
+        from = @ptrCast([*]const u32, surface.*.sourcePixels)
+        to = @ptrCast([*]u32, surface.*.pixels)
+    }
+    const crop_x = @intCast(usize, crop.x)
+    const crop_y = @intCast(usize, crop.y)
+    const crop_width = @intCast(usize, crop.width)
+    const crop_height = @intCast(usize, crop.height)
+    if crop_width == width && crop_height == height {
+        // Only cropped: rows as they are.
+        var row: usize = 0
+        while row < height {
+            state.copyPixels(@intFromPtr(surface.*.pixels) + row * width * 4, @intFromPtr(surface.*.sourcePixels) + ((crop_y + row) * stride + crop_x) * 4, width)
+            row += 1
+        }
+    } else if crop_width > 0 && crop_height > 0 {
+        // Sample k (0-3) across: crop column (x * 8 + 2k + 1) * crop width
+        // / (width * 8), and down alike.
+        const columns_size = width * 4 * @sizeOf(usize)
+        const columns_memory = state.allocate(compositor, columns_size)
+        const columns: [*]usize = unsafe { @ptrCast([*]usize, columns_memory) }
+        var x: usize = 0
+        while x < width {
+            var k: usize = 0
+            while k < 4 {
+                columns[x * 4 + k] = crop_x + (x * 8 + 2 * k + 1) * crop_width / (width * 8)
+                k += 1
+            }
+            x += 1
+        }
+        var rows: [4]usize = undefined
+        var y: usize = 0
+        while y < height {
+            var k: usize = 0
+            while k < 4 {
+                rows[k] = (crop_y + (y * 8 + 2 * k + 1) * crop_height / (height * 8)) * stride
+                k += 1
+            }
+            x = 0
+            while x < width {
+                var alpha: u32 = 0
+                var red: u32 = 0
+                var green: u32 = 0
+                var blue: u32 = 0
+                var row: usize = 0
+                while row < 4 {
+                    var column: usize = 0
+                    while column < 4 {
+                        const pixel = from[rows[row] + columns[x * 4 + column]]
+                        alpha += pixel >> 24
+                        red += (pixel >> 16) & 255
+                        green += (pixel >> 8) & 255
+                        blue += pixel & 255
+                        column += 1
+                    }
+                    row += 1
+                }
+                to[y * width + x] = (((alpha + 8) >> 4) << 24) | (((red + 8) >> 4) << 16) | (((green + 8) >> 4) << 8) | ((blue + 8) >> 4)
+                x += 1
+            }
+            y += 1
+        }
+        state.release(compositor, columns_memory, columns_size)
+    }
+    surface.*.pixelWidth = width
+    surface.*.pixelHeight = height
+}
+
+// Copies an attached shm buffer into the surface and releases it.
+fn copyBuffer(surface: *Surface, buffer: *shell.Buffer) -> void {
+    const compositor = surface.*.compositor
+    surface.*.bufferWidth = buffer.*.width
+    surface.*.bufferHeight = buffer.*.height
+    surface.*.scaledCopy = false
+    const width = @intCast(usize, buffer.*.width)
+    const height = @intCast(usize, buffer.*.height)
+    const needed = width * height * 4
+    if needed > surface.*.pixelCapacity {
+        if surface.*.pixelCapacity > 0 { state.release(compositor, surface.*.pixels, surface.*.pixelCapacity) }
+        surface.*.pixels = state.allocate(compositor, needed)
+        surface.*.pixelCapacity = needed
+    }
+    if buffer.*.pool.*.memory.address == 0 {
+        // A dma-buf the CPU cannot map (only the Vulkan renderer reads
+        // those): black instead.
+        var index: usize = 0
+        while index < needed {
+            surface.*.pixels[index] = if index % 4 == 3 { 255 } else { 0 }
+            index += 1
+        }
+        surface.*.pixelWidth = width
+        surface.*.pixelHeight = height
+        surface.*.hasContent = true
+        surface.*.opaque = true
+        wl.wl_buffer.Resource.fromObject(buffer.*.resource).sendRelease()
+        return
+    }
+    const source = buffer.*.pool.*.memory.bytes()
+    const offset = @intCast(usize, buffer.*.offset)
+    const stride = @intCast(usize, buffer.*.stride)
+    const xrgb = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
+    // XRGB: the alpha byte is set to 255 on the way. All alpha bytes seen
+    // are ANDed to find out whether an ARGB buffer is opaque throughout.
+    const alpha_or: u32 = if xrgb { 4278190080 } else { 0 }
+    var alpha_and: u32 = 4278190080
+    if offset % 4 == 0 && stride % 4 == 0 {
+        var from: [*]const u32 = undefined
+        var to: [*]u32 = undefined
+        unsafe {
+            from = @ptrFromInt([*]const u32, @intFromPtr(source) + offset)
+            to = @ptrCast([*]u32, surface.*.pixels)
+        }
+        const stride_pixels = stride / 4
+        var row: usize = 0
+        while row < height {
+            const from_row = row * stride_pixels
+            const to_row = row * width
+            var column: usize = 0
+            while column < width {
+                const pixel = from[from_row + column] | alpha_or
+                alpha_and = alpha_and & pixel
+                to[to_row + column] = pixel
+                column += 1
+            }
+            row += 1
+        }
+    } else {
+        var row: usize = 0
+        while row < height {
+            var column: usize = 0
+            const from = offset + row * stride
+            const to = row * width * 4
+            while column < width * 4 {
+                surface.*.pixels[to + column] = source[from + column]
+                column += 1
+            }
+            column = 3
+            while column < width * 4 {
+                if xrgb { surface.*.pixels[to + column] = 255 }
+                alpha_and = alpha_and & (@intCast(u32, surface.*.pixels[to + column]) << 24)
+                column += 4
+            }
+            row += 1
+        }
+    }
+    surface.*.pixelWidth = width
+    surface.*.pixelHeight = height
+    surface.*.hasContent = true
+    surface.*.opaque = alpha_and == 4278190080
+    wl.wl_buffer.Resource.fromObject(buffer.*.resource).sendRelease()
+}
+
+// Vulkan: shows an attached buffer in place, releasing the one it replaces.
+fn holdBuffer(surface: *Surface, address: usize) -> void {
+    if surface.*.current != 0 && surface.*.current != address {
+        wl.wl_buffer.Resource.fromObject(shell.bufferAt(surface.*.current).*.resource).sendRelease()
+    }
+    surface.*.current = address
+    const compositor = surface.*.compositor
+    compositor.*.commits += 1
+    surface.*.contentSerial = compositor.*.commits
+    const buffer = shell.bufferAt(address)
+    surface.*.bufferWidth = buffer.*.width
+    surface.*.bufferHeight = buffer.*.height
+    // A buffer attached without damage counts as changed everywhere.
+    const changed = if ui.isEmpty(surface.*.pendingDamage) { ui.rect(0, 0, buffer.*.width, buffer.*.height) } else { surface.*.pendingDamage }
+    surface.*.uploadDamage = scene.unionRect(surface.*.uploadDamage, changed)
+    surface.*.pixelWidth = @intCast(usize, buffer.*.width)
+    surface.*.pixelHeight = @intCast(usize, buffer.*.height)
+    surface.*.hasContent = true
+    surface.*.opaque = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
+}
+
+// Leaves the Vulkan renderer for the CPU one (it failed to compose a
+// frame): the buffers surfaces show in place are copied into them and
+// released, as the CPU renderer does on commit.
+pub fn adoptCpuRenderer(compositor: *shell.Compositor) -> void {
+    compositor.*.renderer = 0
+    compositor.*.readsTiled = false
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const surface = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        if surface.*.current != 0 {
+            const address = surface.*.current
+            surface.*.current = 0
+            copyBuffer(surface, shell.bufferAt(address))
+            if surface.*.viewWidth > 0 { showView(surface) }
+        }
+        index += 1
+    }
+    scene.damageAll(compositor)
+}
+
+pub fn releaseCurrent(surface: *Surface) -> void {
+    if surface.*.current != 0 {
+        wl.wl_buffer.Resource.fromObject(shell.bufferAt(surface.*.current).*.resource).sendRelease()
+        surface.*.current = 0
+    }
+}

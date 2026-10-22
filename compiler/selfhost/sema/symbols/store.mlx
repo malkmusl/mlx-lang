@@ -5,15 +5,40 @@ const symbol_module = @import("./symbol.mlx")
 pub const Allocator = allocator_module.Allocator
 pub const Symbol = symbol_module.Symbol
 
+// A module as sema reaches it from another module's analysis: its source,
+// path, tokens, nodes and root scope (modules/analyze.mlx registers every
+// loaded module), for a generic type function instantiated where it is
+// used but evaluated where it is declared.
+pub const ModuleContext = struct {
+    sourcePointer: [*]const u8
+    sourceLength: usize
+    pathPointer: [*]const u8
+    pathLength: usize
+    tokensAddress: usize
+    nodesAddress: usize
+    scopeAddress: usize
+}
+
 pub const Store = struct {
     items: [*]u8
     length: usize
     capacity: usize
+    // The registered modules by id (ModuleContext), one with no nodes for
+    // an id never registered.
+    modules: [*]u8
+    moduleCapacity: usize
+    moduleCount: usize
     methodBuckets: [*]usize
     // The same methods by name alone (whatever their owner), the same
     // capacity: a method looked up on an equal type with another id is
-    // looked for among its namesakes, not among every symbol.
+    // looked for among its namesakes, not among every symbol. A name has
+    // one bucket, the first symbol of that name (+1), and the symbols of
+    // a name chain through nameNext (symbol index to the next + 1, 0 at
+    // the end), in the order they were made; nameTails has each name's
+    // last (+1), where the next is appended.
     nameBuckets: [*]usize
+    nameTails: [*]usize
+    nameNext: [*]usize
     methodCapacity: usize
     methodCount: usize
     methodLookupQueries: usize
@@ -30,12 +55,25 @@ pub const Store = struct {
         var name_buckets: [*]usize = undefined
         unsafe { name_buckets = @ptrCast([*]usize, allocator.alloc(method_capacity * @sizeOf(usize), @alignOf(usize)).?) }
         unsafe { mem.zero(@ptrCast([*]u8, name_buckets), method_capacity * @sizeOf(usize)) }
+        var name_tails: [*]usize = undefined
+        unsafe { name_tails = @ptrCast([*]usize, allocator.alloc(method_capacity * @sizeOf(usize), @alignOf(usize)).?) }
+        unsafe { mem.zero(@ptrCast([*]u8, name_tails), method_capacity * @sizeOf(usize)) }
+        var name_next: [*]usize = undefined
+        unsafe { name_next = @ptrCast([*]usize, allocator.alloc(capacity * @sizeOf(usize), @alignOf(usize)).?) }
+        unsafe { mem.zero(@ptrCast([*]u8, name_next), capacity * @sizeOf(usize)) }
+        var modules: [*]u8 = undefined
+        unsafe { modules = @ptrFromInt([*]u8, 0) }
         return Self.{
             .items = allocator.alloc(capacity * @sizeOf(Symbol), @alignOf(Symbol)).?,
             .length = 0,
             .capacity = capacity,
+            .modules = modules,
+            .moduleCapacity = 0,
+            .moduleCount = 0,
             .methodBuckets = method_buckets,
             .nameBuckets = name_buckets,
+            .nameTails = name_tails,
+            .nameNext = name_next,
             .methodCapacity = method_capacity,
             .methodCount = 0,
             .methodLookupQueries = 0,
@@ -50,6 +88,14 @@ pub const Store = struct {
         var capacity = store.*.capacity * 2
         while capacity < minimum { capacity *= 2 }
         store.*.items = store.*.allocator.resize(store.*.items, store.*.capacity * @sizeOf(Symbol), capacity * @sizeOf(Symbol), @alignOf(Symbol)).?
+        var name_next: [*]usize = undefined
+        unsafe {
+            name_next = @ptrCast([*]usize, store.*.allocator.alloc(capacity * @sizeOf(usize), @alignOf(usize)).?)
+            mem.zero(@ptrCast([*]u8, name_next), capacity * @sizeOf(usize))
+            mem.copy(@ptrCast([*]u8, name_next), @ptrCast([*]const u8, store.*.nameNext), store.*.capacity * @sizeOf(usize))
+            store.*.allocator.free(@ptrCast([*]u8, store.*.nameNext), store.*.capacity * @sizeOf(usize), @alignOf(usize))
+        }
+        store.*.nameNext = name_next
         store.*.capacity = capacity
     }
 
@@ -61,12 +107,15 @@ pub const Store = struct {
         Self.ensureCapacity(store, store.*.length + 1)
         const index = store.*.length
         unsafe { mem.copy(@ptrCast([*]u8, Self.get(store, index)), @ptrCast([*]const u8, symbol), @sizeOf(Symbol)) }
-        store.*.length += 1
+        // Indexed once: a growth of the index re-indexes the symbols
+        // before this one (`length` does not count it yet), and this one
+        // goes in after (twice would link it to itself in its name chain).
         if symbol.*.ownerTypeId != 0 {
             Self.ensureMethodCapacity(store)
             Self.indexMethod(store, index)
             store.*.methodCount += 1
         }
+        store.*.length += 1
         return index
     }
 
@@ -85,21 +134,35 @@ pub const Store = struct {
         var slot = Self.methodHash(symbol.*.ownerTypeId, symbol.*.namePointer, symbol.*.nameLength) & (store.*.methodCapacity - 1)
         while store.*.methodBuckets[slot] != 0 { slot = (slot + 1) & (store.*.methodCapacity - 1) }
         store.*.methodBuckets[slot] = symbol_index + 1
-        var name_slot = Self.methodHash(0, symbol.*.namePointer, symbol.*.nameLength) & (store.*.methodCapacity - 1)
-        while store.*.nameBuckets[name_slot] != 0 { name_slot = (name_slot + 1) & (store.*.methodCapacity - 1) }
-        store.*.nameBuckets[name_slot] = symbol_index + 1
+        store.*.nameNext[symbol_index] = 0
+        const name_slot = Self.nameSlot(store, symbol.*.namePointer, symbol.*.nameLength)
+        if store.*.nameBuckets[name_slot] == 0 {
+            store.*.nameBuckets[name_slot] = symbol_index + 1
+        } else {
+            store.*.nameNext[store.*.nameTails[name_slot] - 1] = symbol_index + 1
+        }
+        store.*.nameTails[name_slot] = symbol_index + 1
     }
 
-    // The methods named so: start at firstNamed, then nextNamed until it
-    // gives 0; each is a symbol index + 1 whose name may still differ (a
-    // hash's neighbour).
+    // The bucket of the name: its own, or the free one it goes in.
+    fn nameSlot(store: *Self, pointer: [*]const u8, length: usize) -> usize {
+        var slot = Self.methodHash(0, pointer, length) & (store.*.methodCapacity - 1)
+        while store.*.nameBuckets[slot] != 0 {
+            const head = Self.get(store, store.*.nameBuckets[slot] - 1)
+            if head.*.nameLength == length && mem.eql(head.*.namePointer, pointer, length) { return slot }
+            slot = (slot + 1) & (store.*.methodCapacity - 1)
+        }
+        return slot
+    }
+
+    // The methods and constants named so, whatever their owner, in the
+    // order they were made: the first's index + 1 (0 for none), then
+    // nextNamed of each for the one after it.
     pub fn firstNamed(store: *Self, pointer: [*]const u8, length: usize) -> usize {
-        return Self.methodHash(0, pointer, length) & (store.*.methodCapacity - 1)
+        return store.*.nameBuckets[Self.nameSlot(store, pointer, length)]
     }
 
-    pub fn namedAt(store: *Self, slot: usize) -> usize { return store.*.nameBuckets[slot] }
-
-    pub fn nextNamed(store: *Self, slot: usize) -> usize { return (slot + 1) & (store.*.methodCapacity - 1) }
+    pub fn nextNamed(store: *Self, symbol_index: usize) -> usize { return store.*.nameNext[symbol_index] }
 
     fn ensureMethodCapacity(store: *Self) -> void {
         if (store.*.methodCount + 1) * 10 < store.*.methodCapacity * 7 { return }
@@ -111,6 +174,9 @@ pub const Store = struct {
         unsafe { mem.zero(@ptrCast([*]u8, store.*.methodBuckets), store.*.methodCapacity * @sizeOf(usize)) }
         unsafe { store.*.nameBuckets = @ptrCast([*]usize, store.*.allocator.alloc(store.*.methodCapacity * @sizeOf(usize), @alignOf(usize)).?) }
         unsafe { mem.zero(@ptrCast([*]u8, store.*.nameBuckets), store.*.methodCapacity * @sizeOf(usize)) }
+        const old_tails = store.*.nameTails
+        unsafe { store.*.nameTails = @ptrCast([*]usize, store.*.allocator.alloc(store.*.methodCapacity * @sizeOf(usize), @alignOf(usize)).?) }
+        unsafe { mem.zero(@ptrCast([*]u8, store.*.nameTails), store.*.methodCapacity * @sizeOf(usize)) }
         var index: usize = 0
         while index < store.*.length {
             if Self.get(store, index).*.ownerTypeId != 0 { Self.indexMethod(store, index) }
@@ -118,6 +184,7 @@ pub const Store = struct {
         }
         unsafe { store.*.allocator.free(@ptrCast([*]u8, old_buckets), old_capacity * @sizeOf(usize), @alignOf(usize)) }
         unsafe { store.*.allocator.free(@ptrCast([*]u8, old_names), old_capacity * @sizeOf(usize), @alignOf(usize)) }
+        unsafe { store.*.allocator.free(@ptrCast([*]u8, old_tails), old_capacity * @sizeOf(usize), @alignOf(usize)) }
     }
 
     fn sameMethod(symbol: *Symbol, owner_type: usize, pointer: [*]const u8, length: usize) -> bool {
@@ -147,6 +214,37 @@ pub const Store = struct {
         if probes > store.*.maximumMethodLookupProbes { store.*.maximumMethodLookupProbes = probes }
     }
 
+    // Registers module `id` (ids are dense from 0) so that sema can read
+    // its source, nodes and scope from another module's analysis.
+    pub fn registerModule(store: *Self, id: usize, context: *ModuleContext) -> void {
+        if id >= store.*.moduleCapacity {
+            var capacity = if store.*.moduleCapacity == 0 { 16 } else { store.*.moduleCapacity }
+            while capacity <= id { capacity *= 2 }
+            var grown: [*]u8 = undefined
+            unsafe { grown = store.*.allocator.alloc(capacity * @sizeOf(ModuleContext), @alignOf(ModuleContext)).? }
+            unsafe { mem.zero(grown, capacity * @sizeOf(ModuleContext)) }
+            if store.*.moduleCapacity != 0 {
+                unsafe { mem.copy(grown, store.*.modules, store.*.moduleCapacity * @sizeOf(ModuleContext)) }
+                store.*.allocator.free(store.*.modules, store.*.moduleCapacity * @sizeOf(ModuleContext), @alignOf(ModuleContext))
+            }
+            store.*.modules = grown
+            store.*.moduleCapacity = capacity
+        }
+        unsafe { mem.copy(@ptrFromInt([*]u8, @intFromPtr(store.*.modules) + id * @sizeOf(ModuleContext)), @ptrCast([*]const u8, context), @sizeOf(ModuleContext)) }
+        if id >= store.*.moduleCount { store.*.moduleCount = id + 1 }
+    }
+
+    // The registered module `id`; one with no nodes (nodesAddress 0) when
+    // there is none.
+    pub fn moduleContext(store: *Self, id: usize) -> ModuleContext {
+        if id >= store.*.moduleCount {
+            unsafe {
+                return ModuleContext.{ .sourcePointer = @ptrFromInt([*]const u8, 0), .sourceLength = 0, .pathPointer = @ptrFromInt([*]const u8, 0), .pathLength = 0, .tokensAddress = 0, .nodesAddress = 0, .scopeAddress = 0 }
+            }
+        }
+        unsafe { return @ptrFromInt(*ModuleContext, @intFromPtr(store.*.modules) + id * @sizeOf(ModuleContext)).* }
+    }
+
     pub fn methodQueryCount(store: *Self) -> usize { return store.*.methodLookupQueries }
     pub fn methodProbeCount(store: *Self) -> usize { return store.*.methodLookupProbes }
     pub fn maxMethodProbeCount(store: *Self) -> usize { return store.*.maximumMethodLookupProbes }
@@ -155,6 +253,8 @@ pub const Store = struct {
         store.*.allocator.free(store.*.items, store.*.capacity * @sizeOf(Symbol), @alignOf(Symbol))
         unsafe { store.*.allocator.free(@ptrCast([*]u8, store.*.methodBuckets), store.*.methodCapacity * @sizeOf(usize), @alignOf(usize)) }
         unsafe { store.*.allocator.free(@ptrCast([*]u8, store.*.nameBuckets), store.*.methodCapacity * @sizeOf(usize), @alignOf(usize)) }
+        unsafe { store.*.allocator.free(@ptrCast([*]u8, store.*.nameTails), store.*.methodCapacity * @sizeOf(usize), @alignOf(usize)) }
+        unsafe { store.*.allocator.free(@ptrCast([*]u8, store.*.nameNext), store.*.capacity * @sizeOf(usize), @alignOf(usize)) }
         store.*.length = 0
     }
 }
