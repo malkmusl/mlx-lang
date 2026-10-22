@@ -824,16 +824,26 @@ inspector-6, css-19) run together.
 
 ### Found on the way
 
-- **mlx4's inliner captures names**: a function inlined into its caller
-  reads the caller's local where its own module has a variable of the
-  same name. `other.mlx`: `var dirs: usize = 7` and `pub fn get(index:
-  usize) -> usize { return dirs + index }`; a caller with `const dirs =
-  arguments.length` and `other.get(0)` gets 1, not 7, at the default
-  level and at -O3 (scratchpad `inl/`). snapshot.mlx's first version
-  crashed on it (`paths.directoryName` inlined into a function with a
-  local `dirs`); its names are now apart. Any caller in mlx-cc with a
-  local named like an inlined callee's module variable is affected:
-  worth fixing in ir/inline.mlx before it bites silently.
+- **mlx4's inliner captured names** (fixed): a function inlined into its
+  caller read the caller's local where its own module has a variable of
+  the same name. `other.mlx`: `var dirs: usize = 7` and `pub fn
+  get(index: usize) -> usize { return dirs + index }`; a caller with
+  `const dirs = arguments.length` and `other.get(0)` got 1, not 7, at
+  every level (a function marked `inline` even at -O0). snapshot.mlx's
+  first version crashed on it (`paths.directoryName` inlined into a
+  function with a local `dirs`). The inlined expression is lowered with
+  the caller's bindings in place, and the lookups by name walked them
+  all; they now stop at a floor the expansion sets
+  (ir/lower.mlx `bindingFloor`), so a name in the callee is its
+  parameter or its module's. tests/393_inline_own_names_runtime.mlx
+  (tests/run_inline.sh: default level, -O3, -O0) and a probe in
+  tools/ensure_compiler.sh, which rebuilds an mlx4 without the fix. A
+  compiler counting the names the old one would have read wrong found
+  none in mlx4 itself, mlx-ld, mlx-ar or mlx-cheaders, and 10 lookups in
+  mlx-cc at -O3 (`at` 9 times, `node` once: names of functions the
+  inlined bodies call, which the callers also have as locals); the
+  objects of the six units below are the same with the mlx-cc the old
+  mlx4 built.
 - The `-MD` text and the compiler addresses in relocated data words
   (above).
 
