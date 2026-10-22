@@ -146,6 +146,9 @@ pub const Class = struct {
     // The classes defined in its body (cells of type, next): an explicit
     // instantiation of the class makes their members too.
     nested: usize
+    // Its deleting destructor (deletingDestructor), when its destructor
+    // is virtual.
+    deleting: usize
 }
 
 fn at(c: usize) -> *Class {
@@ -4865,6 +4868,14 @@ fn buildVirtuals(c: usize) -> void {
             base.putWord(slot, o)
             obj.*.isVirtual = true
             obj.*.slot = index
+            // (A destructor's next slot is its deleting destructor's, the
+            // base's taken over by the class's own.)
+            const following = state.cellNext(slot)
+            if obj.*.isDestructor && following != 0 && isDeletingDestructor(state.cellNode(following)) {
+                const deleting = deletingDestructor(c, o)
+                base.putWord(following, deleting)
+                ast.obj(deleting).*.slot = index + 1
+            }
         } else if obj.*.isVirtual || overridesBaseVirtual(c, o) {
             // (New, or overriding a function of a base not first: a slot
             // of its own here, the base's vtable taking it too.)
@@ -4874,6 +4885,17 @@ fn buildVirtuals(c: usize) -> void {
             tail = made
             obj.*.slot = count
             count += 1
+            if obj.*.isDestructor {
+                // A virtual destructor's two slots, as the Itanium ABI has
+                // them: the complete object's (D1), then the deleting one
+                // (D0), which `delete` through a base calls.
+                const deleting = deletingDestructor(c, o)
+                const second = cell(deleting, 0)
+                base.putWord(tail + 8, second)
+                tail = second
+                ast.obj(deleting).*.slot = count
+                count += 1
+            }
         }
         m = state.cellNext(m)
     }
@@ -5081,9 +5103,70 @@ fn makeSecondaryVtables(c: usize) -> void {
     }
 }
 
+// The deleting destructor (the Itanium ABI's D0) of the class `c` whose
+// virtual destructor is `dtor`: an entry (genstmt.genEntry) that runs the
+// complete object's destructor and frees the object with the operator
+// delete of the class (its own or a base's, `operator delete(void *)` or
+// `operator delete(void *, size_t)`), else the global one. In the
+// vtable after the destructor; `delete p` through a pointer to a class
+// with a virtual destructor calls it, so the object's dynamic class frees
+// it (WebCore's DummyStorageProvider, TZone-allocated, deleted as a
+// StorageProvider, was freed by the global operator delete).
+fn deletingDestructor(c: usize, dtor: usize) -> usize {
+    if at(c).*.deleting != 0 { return at(c).*.deleting }
+    const e = ast.newObj(base.intern("__mlxcc_deleting_destructor"), ast.obj(dtor).*.ty, ast.obj(dtor).*.token)
+    const obj = ast.obj(e)
+    obj.*.isFunction = true
+    obj.*.isVirtual = true
+    obj.*.classType = ast.obj(dtor).*.classType
+    obj.*.entryOf = dtor
+    // (Its operator delete in `entry`; kind 4 when it takes the size.)
+    const freeing = deletingOperator(at(c).*.ty)
+    obj.*.entry = freeing.0
+    obj.*.entryKind = if freeing.1 { 4 } else { 3 }
+    // (Its symbol the destructor's with D0: `_ZN7DerivedD1Ev` makes
+    // `_ZN7DerivedD0Ev`.)
+    const text = base.nameOf(ast.obj(dtor).*.linkName)
+    var name = text
+    if text.length > 4 && text[text.length - 4] == 68 { name = base.join(base.join(text[0..text.length - 3], "0"), text[text.length - 2..text.length]) }
+    obj.*.linkName = base.intern(name)
+    obj.*.symbol = obj.*.linkName
+    obj.*.isDefinition = true
+    obj.*.isWeak = true
+    obj.*.isInline = true
+    state.addGlobal(e)
+    at(c).*.deleting = e
+    return e
+}
+
+pub fn isDeletingDestructor(o: usize) -> bool { return o != 0 && ast.obj(o).*.entryKind >= 3 }
+
+// The operator delete a deleting destructor of the class `classTy` frees
+// with, and whether it takes the size too: the class's own (or a base's)
+// `operator delete(void *)`, else `operator delete(void *, size_t)`, else
+// the global one.
+pub fn deletingOperator(classTy: usize) -> (usize, bool) {
+    const own = classDelete(classTy, false)
+    if own != 0 { return -> (own, false) }
+    if info(classTy) != 0 {
+        var o = memberOf(classTy, base.intern("operatordelete"))
+        while o != 0 {
+            var p = types.at(ast.obj(o).*.ty).*.params
+            if p != 0 && types.param(p).*.name == names.K_THIS { p = types.param(p).*.next }
+            if p != 0 && types.kind(types.param(p).*.ty) == types.PTR {
+                const second = types.param(p).*.next
+                if second != 0 && types.param(second).*.next == 0 && types.isInteger(types.param(second).*.ty) { return -> (o, true) }
+            }
+            o = ast.obj(o).*.nextOverload
+        }
+    }
+    return -> (deallocator(false), false)
+}
+
 // The member function of the class `k` itself overriding `f` (the same
 // name and parameters, or both destructors), 0 for none.
 fn ownOverride(k: usize, f: usize) -> usize {
+    if isDeletingDestructor(f) { return at(k).*.deleting }
     var m = at(k).*.methods
     while m != 0 {
         const o = state.cellNode(m)
@@ -9061,7 +9144,15 @@ pub fn deleteExpression(token: usize) -> usize {
         }
         const destroying = classDelete(ty, true)
         const own = classDelete(ty, false)
-        if destroying != 0 {
+        const deleting = if info(ty) != 0 { at(info(ty)).*.deleting } else { 0 }
+        if destroying == 0 && deleting != 0 {
+            // A class with a virtual destructor: its deleting destructor
+            // through the vtable, which destroys the object and frees it
+            // as its dynamic class says.
+            const args = argumentList(variable(tmp, token), 0)
+            const callee = virtualCallee(deleting, args, token)
+            appendStatement(then, ast.unary(ast.EXPR_STMT, expr.buildCall(callee, args, 1, token), token))
+        } else if destroying != 0 {
             // A destroying delete (`operator delete(T *, destroying_delete_t,
             // size_t)`): it destroys and frees.
             const tag = types.unqualified(types.referenced(types.param(types.param(types.at(ast.obj(destroying).*.ty).*.params).*.next).*.ty))
@@ -9175,6 +9266,15 @@ fn tableFilled(table: usize) -> void {
             useTable(t)
         } else if ast.obj(t).*.isFunction {
             var f = t
+            if isDeletingDestructor(f) {
+                // (The operator delete a deleting destructor calls: an
+                // inline one's body read.)
+                const freeing = ast.obj(f).*.entry
+                if !ast.obj(freeing).*.isReferenced {
+                    ast.obj(freeing).*.isReferenced = true
+                    template.ensureDefined(freeing)
+                }
+            }
             if ast.obj(f).*.entryOf != 0 {
                 ast.obj(f).*.isReferenced = true
                 f = ast.obj(f).*.entryOf
@@ -9960,6 +10060,12 @@ fn prefixedEntry(table: usize, head: usize, index: i64, fnObj: usize, delta: i64
     if !ast.obj(fnObj).*.madeWhenUsed {
         ast.obj(fnObj).*.isReferenced = true
         ast.obj(target).*.isReferenced = true
+    }
+    if isDeletingDestructor(fnObj) {
+        // (The operator delete it calls: an inline one's body read.)
+        const freeing = ast.obj(fnObj).*.entry
+        ast.obj(freeing).*.isReferenced = true
+        template.ensureDefined(freeing)
     }
     const r = base.alloc(@sizeOf(ast.Relocation))
     ast.relocation(r).*.offset = point + 8 + index * 16
