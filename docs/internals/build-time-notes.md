@@ -678,3 +678,70 @@ does not), and the heap's one lock, which every block of every thread
 would take, against today's one mmap per large block and the tiny
 pages' own lock for the small ones (the tinypage test's four threads,
 the GPA test's four).
+
+## Proposal: the linker as a program of its own, mlx-ld (2026-10-22; not done)
+
+Every WebKit object step names `mlx-out/bin/mlx-cc` as an input
+(`Build.input(b, step, tc.cc)` in projects/webkit/build.mlx), and an
+input's key is its contents: any change to the mlx-cc binary compiles
+all of WebKit again (about 2000 objects, hours). The linker
+(compiler/selfhost/object/link.mlx, archive.mlx, elf64_dynamic.mlx) is
+compiled into mlx-cc (compiler/cc/program.mlx calls `link.writeProgram`
+in the same process), so a change that only touches linking (the symbol
+table of branch linker-symtab, a link map, a relocation kind) still
+changes mlx-cc's bytes and throws away every object it never affected.
+
+The split:
+
+- **mlx-ld** (compiler/ld/main.mlx): link.mlx, archive.mlx,
+  elf64_dynamic.mlx and the options that are the linker's: `-o`, the
+  objects and archives, `-L`/`-l`/`-l:`, `--dynamic-linker`,
+  `-Wl,-Map=`, `-s`/`--strip-all`. It reads relocatable objects only,
+  as it does now.
+- **mlx-cc** keeps the driver: `mlx-cc -o prog a.c b.o -lfoo` writes the
+  object of the `.c` files as now (`program.buildObject`), to a file in
+  `$TMPDIR` instead of handing it over in memory, and runs mlx-ld on it
+  and the other inputs (posix_spawn, the arguments passed through), as
+  `cc` runs `ld`. `-c` never involves mlx-ld. The C++ library it adds
+  (`-lmlxcpp`, `addCppLibraries`) becomes an argument like any other.
+  mlx-cc finds mlx-ld next to itself (as it finds `include/`), or by
+  MLX_LD.
+- The build: `cc()` in build.mlx declares a third program of the group,
+  `mlx-ld` (compiler/ld/main.mlx), and `webkit.Toolchain` gets `.ld`.
+  Object steps keep `Build.input(step, tc.cc)` and depend on mlx-cc
+  only. Link steps (the archives' programs, webcore-test, webcore-dump,
+  the tools') add `Build.input(step, tc.ld)` and depend on the mlx-ld
+  step; better still, they call mlx-ld themselves with the objects (the
+  driver adds nothing to a link of objects alone but `-lmlxcpp`).
+
+What the cache keys would then depend on:
+
+| Step | Key (besides the step's line and sources, headers by -MD) |
+| --- | --- |
+| an object (`mlx-cc -c`) | the bytes of mlx-cc: preprocessor, parser, code generator, object writer (relocatable.mlx) |
+| an archive (`mlx-ar`) | the objects, mlx-ar |
+| a program or shared library | the objects and archives, mlx-ld (and mlx-cc while the step goes through the driver) |
+
+So a change to link.mlx, elf64_dynamic.mlx or archive.mlx relinks the
+programs (seconds to a minute each for WebKit's) and compiles nothing.
+A change to relocatable.mlx (the object format, which both read)
+changes both binaries, and objects are rebuilt, which is right: their
+bytes change. The Mlx compiler (mlx4) is untouched: it links its own
+programs in-process and keys its steps on its own hash as now
+(cache.mlx `compilerHash`).
+
+A finer key for objects, independent of the split and complementary:
+mlx-cc could print a code generation version (a hash of the modules
+that decide an object's bytes, computed when mlx-cc is built), and
+object steps would key on that instead of the binary, so that a
+diagnostic's wording or a `--version` string changes nothing either.
+That needs the build to read a tool's version rather than hash a file
+(a `Build.inputVersion(step, tool, "--codegen-hash")`), which it cannot
+yet.
+
+Costs: one more process per link (nothing next to a WebKit link's
+seconds); the in-memory object of `mlx-cc -o prog x.c` is written and
+read back (the size of one unit's object); mlx-cc and mlx-ld must agree
+on the object format, which they share by source (relocatable.mlx), and
+`tools/check_link.sh`, `check_cc.sh` and `check_cpp.sh` cover both
+paths as they do now.
