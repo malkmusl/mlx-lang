@@ -57,6 +57,8 @@
 //                           a forgotten bump of mlx-cc's CODEGEN_EPOCH
 const std = @import("std")
 const crash = @import("std.crash")
+const leaks = @import("std.leaks")
+const turns = @import("std.turns")
 const graph = @import("./build/graph.mlx")
 const cache = @import("./build/cache.mlx")
 const jobs = @import("./build/jobs.mlx")
@@ -412,8 +414,33 @@ fn sayFailure(b: *Builder, item: *graph.Node, status: u8) -> void {
     jobs.showLog(b, item, 40)
 }
 
+// The compiler's value arena (std/src/turns.mlx), found once by run(): the
+// struct, array and tuple values a step's look, start and end make (a stat
+// for each of a WebKit unit's thousand headers, the manifest's lines, the
+// job's spawn options) are never given back by themselves, and a build of
+// thousands of steps filled the 1 GiB arena (the runner died after ~1370
+// of WebKit's 2037 steps). So each step's work is a turn (std.turns): the
+// arena's fill is noted before and put back after. What outlives a step is
+// in the builder (graph.keep, its node's fields) or the heap, never in the
+// arena. MLX_ARENA_RELEASE=0 keeps every value (as before); with
+// MLX_ARENA_POISON=1 what is given back is overwritten, so a value kept by
+// mistake shows (tools/check_build_runner.sh).
+var arenaBase: usize = 0
+var arenaPoison = false
+
+fn findArena(b: *Builder) -> void {
+    const release = std.process.environmentFrom(b.*.environment, "MLX_ARENA_RELEASE")
+    if release != null && std.string.asSlice(release.?).length > 0 && std.string.asSlice(release.?)[0] == 48 { return }
+    const poison = std.process.environmentFrom(b.*.environment, "MLX_ARENA_POISON")
+    arenaPoison = poison != null && std.string.asSlice(poison.?).length > 0 && std.string.asSlice(poison.?)[0] == 49
+    arenaBase = turns.locate()
+}
+
 // Runs the wanted steps; 0 when every one is done.
 fn schedule(b: *Builder) -> u8 {
+    // (Declared first: the turns' marks are after them.)
+    var loopTurn: turns.Turns = undefined
+    var stepTurn: turns.Turns = undefined
     var counts = Counts.{ .built = 0, .cached = 0, .current = 0, .failed = 0, .remembered = 0, .skipped = 0, .started = 0, .stale = 0 }
     const began = std.time.milliseconds()
     var wanted: usize = 0
@@ -423,17 +450,22 @@ fn schedule(b: *Builder) -> u8 {
     while index < b.*.nodeCount {
         const item = graph.node(b, index)
         if item.*.wanted && item.*.kind != graph.KIND_GROUP {
+            turns.beginAt(&stepTurn, arenaBase, arenaPoison)
             wanted += 1
             item.*.checked = true
             crash.contextAt("checking step", item.*.name, 0)
             item.*.stale = b.*.force || !cache.isCurrent(b, item)
             if item.*.stale { counts.stale += 1 }
+            turns.turn(&stepTurn)
         }
         index += 1
     }
     var running: usize = 0
     var stopped = false
+    turns.beginAt(&loopTurn, arenaBase, arenaPoison)
     while true {
+        // What the last turn's starts and end made goes back.
+        turns.turn(&loopTurn)
         // Settle what can be settled without a job.
         var progress = true
         while progress {
@@ -441,6 +473,7 @@ fn schedule(b: *Builder) -> u8 {
             index = 0
             while index < b.*.nodeCount {
                 const item = graph.node(b, index)
+                turns.beginAt(&stepTurn, arenaBase, arenaPoison)
                 if item.*.wanted && item.*.state == graph.STATE_WAITING {
                     var rebuilt = false
                     const ready = dependencies(b, item, &rebuilt)
@@ -503,6 +536,7 @@ fn schedule(b: *Builder) -> u8 {
                         }
                     }
                 }
+                turns.turn(&stepTurn)
                 index += 1
             }
         }
@@ -631,6 +665,7 @@ fn schedule(b: *Builder) -> u8 {
         if item.*.wanted && item.*.kind != graph.KIND_GROUP && item.*.state == graph.STATE_WAITING { left += 1 }
         index += 1
     }
+    turns.turn(&loopTurn)
     if !b.*.dryRun { store.trim(b) }
     const took = std.time.milliseconds() - began
     say("mlx build: ")
@@ -854,9 +889,15 @@ pub fn run(arguments: [][*]const u8, package: Package, configure: fn(*Builder) -
             index += 1
         }
     }
-    const status = schedule(b)
-    if status != 0 || b.*.verifyCount == 0 || b.*.dryRun { return status }
-    return verifyEpoch(b)
+    // (With MLX_LEAK_CHECK, std.leaks reports what the build took and did
+    // not give back, the value arena's growth included, and writes the
+    // snapshot `mlx-codemap memory runner` reads.)
+    findArena(b)
+    leaks.mark()
+    var status = schedule(b)
+    if status == 0 && b.*.verifyCount != 0 && !b.*.dryRun { status = verifyEpoch(b) }
+    _ = leaks.report()
+    return status
 }
 
 // --verify-epoch N: N of the wanted steps keyed by their program's epoch
@@ -873,7 +914,13 @@ fn verifyEpoch(b: *Builder) -> u8 {
         say("mlx build: out of memory\n")
         return 1
     }
-    const words: [*]usize = unsafe { @ptrCast([*]usize, memory.?) }
+    const status = verifyWith(b, unsafe { @ptrCast([*]usize, memory.?) })
+    allocator.free(memory.?, (b.*.nodeCount + 1) * 24, 16)
+    return status
+}
+
+// verifyEpoch with WORDS, three for each step.
+fn verifyWith(b: *Builder, words: [*]usize) -> u8 {
     // Candidates: those not made now first, then the others.
     var count: usize = 0
     var older: usize = 0
@@ -939,7 +986,10 @@ fn verifyEpoch(b: *Builder) -> u8 {
     var finished: usize = 0
     var differing: usize = 0
     var failed: usize = 0
+    var loopTurn: turns.Turns = undefined
+    turns.beginAt(&loopTurn, arenaBase, arenaPoison)
     while finished < total {
+        turns.turn(&loopTurn)
         while running < b.*.jobs && next < total {
             const item = graph.node(b, words[next])
             item.*.state = graph.STATE_RUNNING

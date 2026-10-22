@@ -47,6 +47,9 @@ fail() {
 user_cache=${MLX_BUILD_CACHE-}
 export MLX_BUILD_CACHE="$work/cache"
 unset MLX_BUILD_CACHE_SIZE
+# (What a step's turn gives back is overwritten: a value the runner kept
+# by mistake shows; std/src/build.mlx.)
+export MLX_ARENA_POISON=1
 
 tree="$work/tree"
 mkdir -p "$tree/src"
