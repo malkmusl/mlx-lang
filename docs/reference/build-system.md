@@ -197,7 +197,8 @@ and what changes them: `option` (a compiler option), `output` (another
 place for the file), `input` and `inputTree` (the files a command reads),
 `depfile` (the make-style dependency file a command writes, as
 `mlx-cc -MD -MF` does), `cacheable` (a command's output may come from the
-result cache, below), `dependOn` and `add` (order and membership),
+result cache, below), `uncached` (it never does, though the command names
+a depfile), `dependOn` and `add` (order and membership),
 `byDefault`, `describe`,
 `step(b, name)` (a step declared before) and `concat` (a string made from
 two). Host I/O happens only through these (`<BuildHostAccess>`): `build()`
@@ -246,7 +247,9 @@ ccache's direct mode does:
   (`libmlxcpp.a`'s archive): steps whose one output file is all they make.
   A command that writes more than its output (a generator of a directory
   of headers, named by one of them) is never cached, since only the output
-  would come back.
+  would come back; nor is one marked `uncached` (mlx-cc's prefix
+  snapshots: a gigabyte each, made again in seconds, and in no object's
+  key, since an object made with one is the object made without it).
 - **Keys:** a step's entries are kept under its key: the manifest key
   (kind, command line or root module, output path, options, the Mlx
   compiler's contents, the input trees' file names) and, for a command,
