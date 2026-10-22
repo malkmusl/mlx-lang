@@ -176,6 +176,65 @@ if command -v g++ > /dev/null; then
     echo "ok   classes returned by value across objects of g++'s and ours, as the ABI passes them"
 fi
 
+# Prefix snapshots (compiler/cc/snapshot.mlx): the files of each test of
+# two files above, their common header given by -include (the #include of
+# it taken out), compiled from a snapshot of the header and without one:
+# the objects are the same, byte for byte, and the program runs as
+# before. Then a snapshot whose header changed, whose include search
+# would find another file, or whose options differ is not taken (the
+# compiler says why and reads the prefix itself: the same object again);
+# one whose header was only written again is.
+mkdir -p "$work/snap"
+for pair in shared:shared.h lambdaunits:units.h lambdaodr:lambdas.h constexprmemberunits:units.h explicitinstanceunits:instances.h typedefunits:units.h; do
+    dir=${pair%%:*} header=${pair#*:}
+    s="$work/snap/$dir"
+    mkdir -p "$s"
+    "$cc" --write-prefix-snapshot "$s/prefix.snap" -include "$tests/$dir/$header" -x c++ 2> "$s/write.err" || fail "$dir: the snapshot of $header is not written: $(head -3 "$s/write.err")"
+    for unit in a b; do
+        sed "s|^#include \"$header\"\$||" "$tests/$dir/$unit.cpp" > "$s/$unit.cpp"
+        "$cc" -include "$tests/$dir/$header" -c -o "$s/$unit.plain.o" "$s/$unit.cpp" 2> "$s/$unit.err" || fail "$dir/$unit.cpp with -include: $(head -3 "$s/$unit.err")"
+        "$cc" --prefix-snapshot "$s/prefix.snap" -include "$tests/$dir/$header" -c -o "$s/$unit.o" "$s/$unit.cpp" 2> "$s/$unit.err" || fail "$dir/$unit.cpp from the snapshot: $(head -3 "$s/$unit.err")"
+        [[ ! -s "$s/$unit.err" ]] || fail "$dir/$unit.cpp from the snapshot: the compiler said: $(head -3 "$s/$unit.err")"
+        cmp -s "$s/$unit.plain.o" "$s/$unit.o" || fail "$dir/$unit.cpp: the object made from the snapshot differs"
+    done
+    "$cc" -x c++ -o "$s/program" "$s/a.o" "$s/b.o" 2> "$s/link.err" || fail "linking $dir from the snapshot: $(head -3 "$s/link.err")"
+    "$s/program" > "$s/out" 2>&1 || fail "$dir from the snapshot exits with $?"
+    cmp -s "$tests/$dir/expected" "$s/out" || fail "$dir from the snapshot prints otherwise (expected < > got): $(diff "$tests/$dir/expected" "$s/out" | head -6)"
+done
+echo "ok   prefix snapshots: the objects of 6 tests of two files are those made without one"
+s="$work/snap/stale"
+mkdir -p "$s/first" "$s/second"
+printf '#pragma once\nstruct Dep { int v = 7; };\n' > "$s/second/dep.h"
+printf '#pragma once\n#include <dep.h>\n#include "local.h"\ninline int prefixed() { return Dep().v + LOCAL; }\n' > "$s/prefix.h"
+printf '#pragma once\n#define LOCAL 1\n' > "$s/local.h"
+printf '#include "prefix.h"\nint use() { return prefixed(); }\n' > "$s/unit.cpp"
+stale() { # WHAT: the snapshot not taken, the object as without it
+    "$cc" -I "$s/first" -I "$s/second" -include "$s/prefix.h" -c -o "$s/plain.o" "$s/unit.cpp" 2> "$s/plain.err" || fail "stale snapshot ($1): $(head -3 "$s/plain.err")"
+    "$cc" --prefix-snapshot "$s/prefix.snap" -I "$s/first" -I "$s/second" -include "$s/prefix.h" -c -o "$s/unit.o" "$s/unit.cpp" 2> "$s/unit.err" || fail "stale snapshot ($1): $(head -3 "$s/unit.err")"
+    grep -q "not used ($2" "$s/unit.err" || fail "a snapshot is taken though $1: $(head -3 "$s/unit.err")"
+    cmp -s "$s/plain.o" "$s/unit.o" || fail "stale snapshot ($1): the object differs"
+}
+write() {
+    "$cc" --write-prefix-snapshot "$s/prefix.snap" -I "$s/first" -I "$s/second" -include "$s/prefix.h" -x c++ 2> "$s/write.err" || fail "the snapshot of prefix.h: $(head -3 "$s/write.err")"
+}
+write
+cp "$s/second/dep.h" "$s/dep.h.new" && mv "$s/dep.h.new" "$s/second/dep.h"
+"$cc" --prefix-snapshot "$s/prefix.snap" -I "$s/first" -I "$s/second" -include "$s/prefix.h" -c -o "$s/unit.o" "$s/unit.cpp" 2> "$s/unit.err" || fail "a snapshot whose header was written again: $(head -3 "$s/unit.err")"
+[[ ! -s "$s/unit.err" ]] || fail "a snapshot whose header was only written again is not taken: $(head -3 "$s/unit.err")"
+printf '#pragma once\nstruct Dep { int v = 8; };\n' > "$s/second/dep.h"
+stale "a header changed" "$s/second/dep.h changed"
+write
+printf '#pragma once\nstruct Dep { int v = 9; };\n' > "$s/first/dep.h"
+stale "the search finds another header" "$s/first/dep.h is new"
+rm "$s/first/dep.h"
+write
+printf '#pragma once\n#define LOCAL 2\n' > "$s/second/local.h"
+"$cc" --prefix-snapshot "$s/prefix.snap" -I "$s/first" -I "$s/second" -include "$s/prefix.h" -c -o "$s/unit.o" "$s/unit.cpp" 2> "$s/unit.err" || fail "a snapshot with a header beside it in a later directory: $(head -3 "$s/unit.err")"
+[[ ! -s "$s/unit.err" ]] || fail "a snapshot is not taken for a header the search never reaches: $(head -3 "$s/unit.err")"
+"$cc" --prefix-snapshot "$s/prefix.snap" -DOTHER -I "$s/first" -I "$s/second" -include "$s/prefix.h" -c -o "$s/unit.o" "$s/unit.cpp" 2> "$s/unit.err" || fail "a snapshot of other options: $(head -3 "$s/unit.err")"
+grep -q "not used (another command line" "$s/unit.err" || fail "a snapshot of other options is taken: $(head -3 "$s/unit.err")"
+echo "ok   prefix snapshots: not taken when a header changed, the include search would find another or the options differ"
+
 # The same programs on mlxlibc alone.
 tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/lib" > /dev/null
 lib="$work/lib/libmlxc.so.1"

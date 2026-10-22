@@ -132,6 +132,7 @@ in `/usr/local/lib/mlx-cc/include`.
 | Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
 | Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through `compiler/selfhost/object/link.mlx`), `ar.mlx` (mlx-ar) |
 | The C variant | `standard.mlx` (`-std=`: the macros, the keywords) |
+| Prefix snapshots | `snapshot.mlx` (below) |
 | Driver | `main.mlx` |
 
 The code generator is a stack machine on rax (xmm0 for floating values),
@@ -169,6 +170,45 @@ each frame's function. (A line table of every statement's line is not
 written yet; the marks are where it would come from.) `-s` (or
 `--strip-all`, `-Wl,-s`) leaves the tables out. `-Wl,-Map=FILE` writes
 the functions by their offsets in the code.
+
+### Prefix snapshots
+
+    mlx-cc --write-prefix-snapshot P.snap FLAGS -include P.h [-MD -MF P.snap.d]
+    mlx-cc --prefix-snapshot P.snap FLAGS -include P.h -c unit.cpp -o unit.o
+
+A unit's `-include` files (WebKit's `WebCorePrefix.h` and what it
+includes: thousands of headers, the same in every unit of a target) are
+read before the file, preprocessed and parsed, and the file is read
+after them, always in these two parts. `--write-prefix-snapshot` writes
+the compiler's whole state at that point: the arena's used pages (it
+lies at a fixed address, `base.ARENA_BASE`, so every address in it is
+valid in another run of the same binary; zero pages are holes in the
+file) and every module-level variable of the compiler's modules (each
+module's `keepState()`, which `tools/cc_snapshot_state.py` writes from
+the declarations; a variable marked `// (per run)` is left out, as the
+run's own memory is: the command line's texts, the link's inputs and the
+object writer's buffers are in a side region after the arena). With
+`--prefix-snapshot` a run maps the pages back where they were
+(`MAP_PRIVATE`: the page cache's copy, shared by every unit built at the
+same time until a unit writes to a page) and reads only its file. The
+object is the one the run would have made without the snapshot, byte for
+byte (tools/check_cpp.sh compares them), and so is the `-MD` file.
+
+A snapshot is taken only when it is the state the run would have
+reached; otherwise the run reads the prefix and says why: the key (a
+hash of the compiler's binary and its path, the working directory, the
+language, `MLX_CC_INCLUDE` and `MLX_CC_READ_ALL_BODIES`, and the options
+that change the compilation in their order: all but `-o`, `-c`, `-MD`
+and its kind, the link's and the files), the variables' layout, every
+file the prefix read (its size and a hash of its contents; one written
+again with the same contents keeps its `#pragma once` mark), and, for
+every directory searched whose time changed since, that the search
+would still find what it found (no name it missed there is there now).
+Nothing of the prefix depends on the file that reads it: the file's
+path is given to the compiler after the prefix, and the prefix's
+lambdas and unnamed namespace are named after the prefix's identity (its
+options) in every run, with a snapshot or without. The prefix's
+warnings are said again by a run that takes the snapshot.
 
 ## What is there
 
