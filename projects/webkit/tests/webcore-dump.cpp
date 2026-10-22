@@ -28,6 +28,7 @@
 #undef protected
 #include "CachedResourceLoader.h"
 #include "CommonAtomStrings.h"
+#include "DeprecatedGlobalSettings.h"
 #include "Document.h"
 #include "EmptyClients.h"
 #include "FrameLoadRequest.h"
@@ -178,6 +179,9 @@ int main(int argc, char** argv)
     // Glyphs unhinted, at whole pixels, as the test runner has them
     // (WebKitTestRunner's web process, for the GLib ports' expected trees).
     FontRenderOptions::singleton().disableHintingForTesting();
+    // Mock scrollbars (15 pixels, never overlaid), as WebKitTestRunner has
+    // them for every port's render trees.
+    DeprecatedGlobalSettings::setMockScrollbarsEnabled(true);
 
     for (auto* font : fonts) {
         if (!mlxweb_font_add_file(font)) {
