@@ -19,6 +19,7 @@
 #include <link.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <arpa/inet.h>
 #include <libgen.h>
 #include <limits.h>
 #include <malloc.h>
@@ -455,6 +456,27 @@ static void check_unistd(const char *work) {
     printf("%d %d\n", first, (int)signaled);
 }
 
+static void check_inet(void) {
+    section("inet");
+    static const char *const v4[] = { "127.0.0.1", "0.0.0.0", "255.255.255.255", "256.1.1.1", "1.2.3", "1.2.3.4.5", "01.2.3.4", "1.2.3.4 ", "", "a.b.c.d" };
+    static const char *const v6[] = { "::", "::1", "1::", "fe80::1:2", "2001:db8:0:0:0:0:2:1", "2001:db8::2:1", "::ffff:192.168.1.1", "1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8:9", "1::2::3", ":1", "1:", "12345::", "1:2:3:4:5:6:1.2.3.4", "g::" };
+    unsigned char out[16];
+    for (unsigned i = 0; i < sizeof v4 / sizeof *v4; i++) {
+        memset(out, 0, sizeof out);
+        int r = inet_pton(AF_INET, v4[i], out);
+        printf("[%s] %d %02x%02x%02x%02x\n", v4[i], r, out[0], out[1], out[2], out[3]);
+    }
+    for (unsigned i = 0; i < sizeof v6 / sizeof *v6; i++) {
+        memset(out, 0, sizeof out);
+        int r = inet_pton(AF_INET6, v6[i], out);
+        printf("[%s] %d", v6[i], r);
+        for (int j = 0; j < 16; j++) printf("%02x", out[j]);
+        printf("\n");
+    }
+    errno = 0;
+    printf("other family %d %d\n", inet_pton(12345, "1.2.3.4", out), errno == EAFNOSUPPORT);
+}
+
 static int saw_plugin = 0;
 static int note_module(struct dl_phdr_info *info, size_t size, void *data) {
     (void)size;
@@ -520,6 +542,7 @@ int main(int argc, char **argv) {
     check_time();
     check_pthread();
     check_unistd(argv[1]);
+    check_inet();
     if (argc > 3) check_dl(argv[3]);
     // exit, not a return from main: glibc's start code calls its own exit,
     // which knows nothing of mlxlibc's atexit handlers and stdout buffer.

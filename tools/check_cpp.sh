@@ -59,6 +59,19 @@ run stdlib "$work/stdlib_sep" "$work/stdlib_sep.out"
 cmp -s "$tests/stdlib.expected" "$work/stdlib_sep.out" || fail "stdlib from an object prints otherwise"
 echo "ok   a C++ object links with the library and runs"
 
+# What an object holds: the inline, static and template functions and the
+# vtables its code or data refers to, not those only named by functions
+# never made (inlinereach.cpp).
+"$cc" -c -o "$work/inlinereach.o" "$tests/inlinereach.cpp" 2> "$work/reach.err" || fail "-c of inlinereach.cpp: $(head -3 "$work/reach.err")"
+symbols=$(nm "$work/inlinereach.o" | awk '{ print $NF }' | sort | tr '\n' ' ')
+for name in _Z7tripledi _Z12unusedInlinei _ZTV6Unused _ZN6Unused5valueEv; do
+    [[ " $symbols" != *" $name "* ]] || fail "inlinereach.o has $name, which nothing made refers to"
+done
+for name in _ZTV4Used _ZN4Used5valueEv _Z7doubledi _Z9quarteredi _Z6halvedIiEi; do
+    [[ " $symbols" == *" $name "* ]] || fail "inlinereach.o lacks $name"
+done
+echo "ok   an object holds the inline functions and vtables its code and data refer to, no others"
+
 # Statics of inline functions and templates, and inline variables: one
 # object for the program across separately compiled files.
 "$cc" -c -o "$work/shared_a.o" "$tests/shared/a.cpp" 2> "$work/shared.err" || fail "-c of shared/a.cpp: $(head -3 "$work/shared.err")"
@@ -76,6 +89,57 @@ echo "ok   the statics of inline functions are one object across files"
 "$work/lambdaunits" > "$work/lambdaunits.out" || fail "lambdaunits exits with $?"
 cmp -s "$tests/lambdaunits/expected" "$work/lambdaunits.out" || fail "lambdaunits prints otherwise (expected < > got): $(diff "$tests/lambdaunits/expected" "$work/lambdaunits.out" | head -6)"
 echo "ok   the lambdas of two files are classes of their own"
+
+# Lambdas of inline functions, templates, default member initializers and
+# inline variables, which two files read in different orders: one class
+# each for the program (a static local of its call operator one object,
+# a template's instance for it one instance), named as g++ names it.
+"$cc" -c -o "$work/lambdaodr_a.o" "$tests/lambdaodr/a.cpp" 2> "$work/lambdaodr.err" || fail "-c of lambdaodr/a.cpp: $(head -3 "$work/lambdaodr.err")"
+"$cc" -c -o "$work/lambdaodr_b.o" "$tests/lambdaodr/b.cpp" 2>> "$work/lambdaodr.err" || fail "-c of lambdaodr/b.cpp: $(head -3 "$work/lambdaodr.err")"
+"$cc" -x c++ -o "$work/lambdaodr" "$work/lambdaodr_a.o" "$work/lambdaodr_b.o" 2>> "$work/lambdaodr.err" || fail "linking lambdaodr: $(head -3 "$work/lambdaodr.err")"
+"$work/lambdaodr" > "$work/lambdaodr.out" || fail "lambdaodr exits with $?"
+cmp -s "$tests/lambdaodr/expected" "$work/lambdaodr.out" || fail "lambdaodr prints otherwise (expected < > got): $(diff "$tests/lambdaodr/expected" "$work/lambdaodr.out" | head -6)"
+# A static data member defined constexpr outside its class, in a header
+# included by two files: inline, one object (constexprmemberunits).
+"$cc" -c -o "$work/constexprmemberunits_a.o" "$tests/constexprmemberunits/a.cpp" 2> "$work/constexprmemberunits.err" || fail "-c of constexprmemberunits/a.cpp: $(head -3 "$work/constexprmemberunits.err")"
+"$cc" -c -o "$work/constexprmemberunits_b.o" "$tests/constexprmemberunits/b.cpp" 2>> "$work/constexprmemberunits.err" || fail "-c of constexprmemberunits/b.cpp: $(head -3 "$work/constexprmemberunits.err")"
+"$cc" -x c++ -o "$work/constexprmemberunits" "$work/constexprmemberunits_a.o" "$work/constexprmemberunits_b.o" 2>> "$work/constexprmemberunits.err" || fail "linking constexprmemberunits: $(head -3 "$work/constexprmemberunits.err")"
+"$work/constexprmemberunits" > "$work/constexprmemberunits.out" || fail "constexprmemberunits exits with $?"
+cmp -s "$tests/constexprmemberunits/expected" "$work/constexprmemberunits.out" || fail "constexprmemberunits prints otherwise (expected < > got): $(diff "$tests/constexprmemberunits/expected" "$work/constexprmemberunits.out" | head -6)"
+symbols=$(nm "$work/lambdaodr_b.o" | awk '{ print $NF }' | sort | tr '\n' ' ')
+for name in _ZZ7countervENKUlvE_clEv _ZZZ7countervENKUlvE_clEvE1n _ZZZZ13nestedCountervENKUlvE_clEvENKUlvE_clEvE1s _ZZZ14mutableCountervENUlvE_clEvE1n _ZNK6Widget4makeMUlvE_clEv _ZNK12sharedLambdaMUlvE_clEv _ZZZ21counterThroughPointervENKUlvE_clEvE1n; do
+    [[ " $symbols" == *" $name "* ]] || fail "lambdaodr_b.o lacks $name"
+done
+echo "ok   the lambdas of inline functions and initializers are one class across files, named as g++ names them"
+
+# Explicit instantiation definitions make what they name, weak, though
+# nothing calls it (explicitinstance.cpp: a member function template's
+# instances, a class instance's members, its member class's, its static
+# data member; not its member templates nor what `extern template`
+# names); another file calls them (explicitinstanceunits: b.cpp holds the
+# definitions, a.cpp only declarations and `extern template`).
+"$cc" -c -o "$work/explicitinstance.o" "$tests/explicitinstance.cpp" 2> "$work/explicitinstance.err" || fail "-c of explicitinstance.cpp: $(head -3 "$work/explicitinstance.err")"
+nm "$work/explicitinstance.o" | awk '$2 == "W" || $2 == "V" { print $NF }' > "$work/explicitinstance.weak"
+for pattern in '5visit.*2V1' '5visit.*2V2' 'C(<3>|ILi3EE)1fEv' 'C(<3>|ILi3EE)1gEv' 'C(<3>|ILi3EE)1sE' 'C(<3>|ILi3EE)5Inner1hEv' '5twiceI.*i' '5twiceI.*d' 'G(<0>|IL4Kind0EE)C1Ei' 'G(<1>|IL4Kind1EE)D1Ev' 'G(<1>|IL4Kind1EE)1fEv' 'G(<0>|IL4Kind0EE)1sEv'; do
+    grep -Eq "^_Z.*$pattern" "$work/explicitinstance.weak" || fail "explicitinstance.o lacks a weak $pattern: $(tr '\n' ' ' < "$work/explicitinstance.weak")"
+done
+for pattern in 'same' 'C(<4>|ILi4EE)' '5twiceI.*l' '1fEi' 'G(<0>|IL4Kind0EE)D1Ev'; do
+    ! grep -Eq "$pattern" "$work/explicitinstance.weak" || fail "explicitinstance.o has $pattern: $(tr '\n' ' ' < "$work/explicitinstance.weak")"
+done
+"$cc" -c -o "$work/explicitinstanceunits_a.o" "$tests/explicitinstanceunits/a.cpp" 2> "$work/explicitinstanceunits.err" || fail "-c of explicitinstanceunits/a.cpp: $(head -3 "$work/explicitinstanceunits.err")"
+"$cc" -c -o "$work/explicitinstanceunits_b.o" "$tests/explicitinstanceunits/b.cpp" 2>> "$work/explicitinstanceunits.err" || fail "-c of explicitinstanceunits/b.cpp: $(head -3 "$work/explicitinstanceunits.err")"
+"$cc" -x c++ -o "$work/explicitinstanceunits" "$work/explicitinstanceunits_a.o" "$work/explicitinstanceunits_b.o" 2>> "$work/explicitinstanceunits.err" || fail "linking explicitinstanceunits: $(head -3 "$work/explicitinstanceunits.err")"
+"$work/explicitinstanceunits" > "$work/explicitinstanceunits.out" || fail "explicitinstanceunits exits with $?"
+cmp -s "$tests/explicitinstanceunits/expected" "$work/explicitinstanceunits.out" || fail "explicitinstanceunits prints otherwise (expected < > got): $(diff "$tests/explicitinstanceunits/expected" "$work/explicitinstanceunits.out" | head -6)"
+echo "ok   explicit instantiation definitions make the functions and members they name, for other files"
+
+# A WTF::Visitor of 16 lambdas (visitormanylambdas.cpp): the call
+# operators' overload set made of each base once, in a few thousand
+# allocations, not 2^16 lookups' 1.5 million (css-19's 25 filled the
+# arena).
+made=$(MLX_CC_STATS=1 "$cc" -c -o "$work/visitormanylambdas.o" "$tests/visitormanylambdas.cpp" 2>&1 | awk '/^  size [0-9]+: / { n += $3 } END { print n + 0 }')
+[[ "$made" -gt 0 && "$made" -lt 400000 ]] || fail "visitormanylambdas.cpp takes $made allocations"
+echo "ok   a Visitor of many lambdas makes its overload set in $made allocations"
 
 # Unnamed classes a typedef names, in a header two files include after
 # different numbers of other unnamed classes: functions taking them have
@@ -100,6 +164,16 @@ if command -v g++ > /dev/null; then
     "$work/vbaselink" > "$work/vbaselink.out" 2>&1 || fail "vbaselink exits with $?: $(tail -3 "$work/vbaselink.out")"
     cmp -s "$link/expected" "$work/vbaselink.out" || fail "vbaselink prints otherwise (expected < > got): $(diff "$link/expected" "$work/vbaselink.out" | head -6)"
     echo "ok   classes with virtual bases work across objects of g++'s and ours"
+    # Classes returned by value across objects of g++'s and ours: one not
+    # trivially copyable in memory whatever its size, a small trivially
+    # copyable one in registers (returnlink).
+    link=$tests/returnlink
+    g++ -std=c++20 -fno-rtti -fno-exceptions -fno-sized-deallocation -fPIE -O1 -c -o "$work/returnlink_gpp.o" "$link/gpp.cpp" 2> "$work/returnlink.err" || fail "g++ does not compile returnlink/gpp.cpp: $(head -3 "$work/returnlink.err")"
+    "$cc" -c -o "$work/returnlink_mlx.o" "$link/mlx.cpp" 2>> "$work/returnlink.err" || fail "-c of returnlink/mlx.cpp: $(head -3 "$work/returnlink.err")"
+    "$cc" -x c++ -o "$work/returnlink" "$work/returnlink_mlx.o" "$work/returnlink_gpp.o" 2>> "$work/returnlink.err" || fail "linking returnlink: $(head -3 "$work/returnlink.err")"
+    "$work/returnlink" > "$work/returnlink.out" 2>&1 || fail "returnlink exits with $?: $(tail -3 "$work/returnlink.out")"
+    cmp -s "$link/expected" "$work/returnlink.out" || fail "returnlink prints otherwise (expected < > got): $(diff "$link/expected" "$work/returnlink.out" | head -6)"
+    echo "ok   classes returned by value across objects of g++'s and ours, as the ABI passes them"
 fi
 
 # The same programs on mlxlibc alone.

@@ -32,7 +32,8 @@ hand.
 | `icu.mlx` | The library's root (`--plugin --stack-arena`): `libmlxunicode.so.1`, importing the export modules |
 | `api/` | The interface in Mlx, a module per header (ICU's names and API level, 74); `ugenerated.mlx` (scripts, blocks) is made by `unicode-generate` (std/registry/unicode/generate.mlx) |
 | `properties.mlx` | `uchar.h`, `uscript.h` (std.unicode.properties) |
-| `casing.mlx`, `strings.mlx` | `ustring.h`: case mapping and folding (std.unicode.casing); lengths, copies, comparisons, conversions (std.unicode.strings) |
+| `casing.mlx`, `strings.mlx` | `ustring.h`: case mapping, titlecasing and folding (std.unicode.casing); lengths, copies, comparisons, conversions (std.unicode.strings) |
+| `sets.mlx` | `uset.h`: sets of code points from ranges and patterns (std.unicode.sets) |
 | `normalize.mlx` | `unorm2.h` (std.unicode.normalize) |
 | `breaks.mlx` | `ubrk.h`, `utext.h` (std.unicode.breaks) |
 | `collation.mlx` | `ucol.h`, `uiter.h` (std.unicode.collation) |
@@ -160,7 +161,10 @@ from C programs compiled by mlx-cc:
     Chinese calendars;
   - detecting single-byte charsets other than Latin-1 and windows-1252
     (ICU rates them by n-gram statistics of their languages);
-  - sets (`uset`).
+  - of sets (`uset`, `sets.mlx`: code points from ranges, other sets and
+    patterns with nested sets, ranges, escapes and properties), strings
+    in a set, the `&` and `-` operators of patterns, and the functions
+    beyond making, adding, complementing and testing.
   They come next, in Mlx, from the Unicode and CLDR data.
 - Of the converters (`ucnv.h`): the East Asian multi-byte charsets
   (Shift_JIS, EUC-JP, GBK, gb18030, Big5, EUC-KR: WebKit has its own),

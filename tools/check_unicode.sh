@@ -51,7 +51,8 @@
 #       tests/zonenames.c      zones' names by ucal_getTimeZoneDisplayName
 #       tests/properties.c, tests/strings.c, tests/calendar.c,
 #       tests/charsets.c, tests/locales.c, tests/bundles.c (over
-#       cldr.dat), ... tests/numbers.c, tests/units.c (measure units)
+#       cldr.dat), ... tests/numbers.c, tests/units.c (measure units),
+#       tests/sets.c (uset.h's sets from patterns, u_strToTitle)
 #                                       print what NAME.expected says
 #
 #   tools/check_unicode.sh
@@ -139,7 +140,7 @@ cc $tests/idna.c -o "$work/idna" || fail "tests/idna.c does not build"
 run "$work/idna" > "$work/idna.out" || { cat "$work/idna.out"; fail "IdnaTestV2.txt"; }
 echo "ok   $(cat "$work/idna.out")"
 
-for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom search converters; do
+for test in properties strings calendar calendars charsets locales bundles lists displaynames dates calendarformats zonenames numbers units tailoring bidirandom search converters sets; do
     cc "$tests/$test.c" -o "$work/$test" || fail "tests/$test.c does not build"
     run "$work/$test" > "$work/$test.out" || fail "tests/$test.c fails"
     diff -u "$tests/$test.expected" "$work/$test.out" || fail "tests/$test.c prints otherwise"

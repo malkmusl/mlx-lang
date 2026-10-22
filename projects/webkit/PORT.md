@@ -87,6 +87,22 @@ Four ways to choose without patching, in this order of preference:
 - WebCore: about 35 of 52 sampled files compile with WPE's flags
   (WEBCORE.md); the WPE targets (`webkit-wpe-*`) build WTF and
   JavaScriptCore on mlx-glib.
+- **M2, under way**: the port is described and builds. `config.MLX`
+  (JSCOnly's configuration with WebCore's choices above), the source
+  selection (webcore.mlx's `mlx()`: Sources.txt, the Skia and Adwaita
+  lists, lists/webcore-mlx-sources.txt of other ports' files that fit,
+  port/SourcesMlx.txt, without lists/webcore-mlx-skipped.txt), what
+  WebCore's build generates for those feature defines
+  (`webkit-mlx-webcore-derived`), and the targets: `webkit-mlx-pal`
+  (libPAL.a, built), `webkit-mlx-webcore` (libWebCore.a),
+  `webkit-mlx-port` (libmlxwebport.so, built) and
+  `webkit-mlx-webcore-test`, the program of tests/webcore-mlx.cpp
+  linked with all of them on mlxlibc (tools/check_webkit_mlx_port.sh).
+  The port's sources are in projects/webkit/port (below: what each
+  replaces); those that only stand in for later milestones say so with
+  a `// STUB (Mn: ...)` line, which the check lists. What remains is
+  mlx-cc's: the units it does not compile yet are listed in WEBCORE.md,
+  each with its first error.
 
 ## The shape of the port
 
@@ -119,7 +135,7 @@ port in the tarball that builds WebCore without GLib).
 | Fonts | Skia's typefaces and our font manager over std.fontconfig | below |
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (RenderThemeAdwaita, ScrollbarThemeAdwaita: GraphicsContext drawing; their GLib resources under `USE(GLIB)`) | WebKit's own non-native theme |
-| Crypto | PAL's digests ours (std.sha1, std.sha2, std.md5); `ENABLE_WEB_CRYPTO` off until M7, then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
+| Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), registers the digests only and refuses the rest until M7 (`port/crypto/CryptoMlx.cpp`), then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBGL`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
 
@@ -150,7 +166,7 @@ WTF, JavaScriptCore and WebCore call ICU's C API in hundreds of places
 `ubidi_*`, `ucnv_*` for TextCodecICU, `usearch_*`, `uidna_*`, the
 `u_*` character properties, Intl's formatters). Wrapping them means
 patching all of them; the API they call is already Mlx: mlx-unicode
-(compiler/capi/icu) is ICU's C API implemented over std.unicode and
+(compiler/libc/icu) is ICU's C API implemented over std.unicode and
 std.timezone, its Intl output identical to node's. So **mlx-unicode is
 the port's ICU**, kept as it is: it is an export surface of std.unicode
 in ICU's names, not an emulation of a C library underneath. What WebCore
@@ -180,9 +196,11 @@ graphics, which is WebKit2's; for a single process our own
 Encoding images (`toDataURL`, `toBlob`): `ImageUtilitiesSkia.cpp` is not
 compiled (it calls Skia's encoders, which call libpng, libjpeg and libwebp,
 and includes GLContext.h); `ImageUtilitiesMlx.cpp` defines
-`platformEncodeData` over std.png, std.jpeg and std.webp. Skia is built
-for the port without its codecs and encoders (lists/skia-mlx.txt), so
-Skia needs no image library at all.
+`platformEncodeData` over std.png, std.jpeg and std.webp (a stub until
+M4). Skia is to be built for the port without its codecs and encoders
+(lists/skia-mlx.txt, M4), so that Skia needs no image library at all; M2
+links webkit-skia's libSkia.a as it is, whose codecs the port's sources
+do not reach.
 
 ### Images
 
@@ -259,7 +277,7 @@ neither, PlatformMlx defines the platform half itself:
 
 WebCore's `SQLiteDatabase` and `SQLiteStatement` are written on
 SQLite's C API (`sqlite3*` members in SQLiteDatabase.h, which every
-storage file includes). **mlx-sqlite3** (compiler/capi/sqlite3, over
+storage file includes). **mlx-sqlite3** (compiler/libc/sqlite3, over
 std.sql) stays the port's SQLite: a minimal ABI of 59 functions WebKit
 calls, implemented in Mlx; replacing the class means replacing a header
 WebKit shares. IndexedDB, local storage and the cache come at M7.
@@ -288,11 +306,11 @@ and std.x509, as crypto/gcrypt and crypto/openssl are for their ports.
 | MIME types | `MIMETypeRegistryMlx.cpp` (a table, std.xdg's shared-mime-info later), not xdgmime |
 | Screen, user agent | `PlatformScreenMlx.cpp`, `UserAgentMlx.cpp` (as PlayStation's PlatformScreenPlayStation.cpp, UserAgentPlayStation.cpp) |
 | Input events | `PlatformKeyboardEvent`, `PlatformMouseEvent`, `PlatformWheelEvent` made by the embedder from Wayland's events (std.xkb for key symbols); `PlatformKeyboardEventMlx.cpp` for the key names and codes |
-| Clipboard | `Pasteboard` through the embedder's `PasteboardStrategy` over the Wayland data device (M5); drag and drop off until then |
-| Cursors | `CursorMlx.cpp`: the compositor's cursor shapes |
+| Clipboard | `Pasteboard` through the embedder's `PasteboardStrategy` over the Wayland data device (M5); until then `PasteboardMlx.cpp`, a clipboard of the process's own (plain text, HTML, URLs, custom data); drag and drop off until then |
+| Cursors | WebCore's generic `Cursor` (no platform cursor) until the embedder sets the compositor's shapes (M5) |
 | Accessibility | off: `accessibility/playstation/*.cpp` (the stubs PlatformHaiku.cmake compiles too) |
 | Logging, shared memory | `platform/unix/LoggingUnix.cpp`, `SharedMemoryUnix.cpp` (memfd on mlxlibc) |
-| Editing | `editing/glib/EditorGLib.cpp` (no GLib in it, as Haiku compiles it) or the port's |
+| Editing | the port's `EditorMlx.cpp` (`Editor`'s pasteboard functions over the port's Pasteboard: plain text, and the selection as text and HTML); EditorGLib.cpp's `WebContentReader` is GTK's and WPE's |
 | Localized strings | `LocalizedStringsMlx.cpp` (English first) |
 | Memory pressure | WTF's Unix handler; the compositor's memory notices later |
 
@@ -359,25 +377,25 @@ compiles alone.
 
 ## What is retired, and when
 
-The C API layers of compiler/capi and the WPE targets were made for the
+The C API layers of compiler/libc and the WPE targets were made for the
 WPE plan. They go when PlatformMlx does what they did, not before:
 
 | | Made for | Retired at | Because |
 |---|---|---|---|
 | `webkit-wpe-*` targets, `config.WPE`, lists/`*-wpe*`, lists/jsc-glib*, tests/wtf-wpe.cpp, tests/jsc-glib.c, tests/wpe.js, tools/check_wpe_wtf.sh, tools/check_wpe_jsc.sh | WTF, JavaScriptCore and WebCore of WPE | M2 | WTF and JavaScriptCore run on mlxlibc (M1), WebCore builds for PlatformMlx (M2). The generators stay (PlatformMlx's derived sources are made by them; tools/check_webcore_generators.sh compares with the Mlx port's feature defines) |
-| compiler/capi/glib (mlx-glib) | WTF's GLib loop, WebCore's GIO, the GObject API | M2, with the WPE targets | No GLib anywhere in PlatformMlx (libpulse-mainloop-glib binds the system's GLib, not mlx-glib) |
-| compiler/capi/soup (mlx-soup) | WebCore's and NetworkProcess's soup code | M2 (WebCore no longer compiles soup code); its HTTP is std.http's, which M6 uses directly | |
-| compiler/capi/png, jpeg, webp (libpng, libjpeg, libwebp) | WebCore's decoders, Skia's codecs | M4 | the port's decoders and encoders call std.png, std.jpeg, std.webp; Skia is built without codecs |
-| compiler/capi/lcms2 | WebCore's decoders (USE_LCMS) | M4 | colour management in the port's decoders (std.colorprofile) |
-| compiler/capi/gcrypt, compiler/capi/tasn1 | WebCrypto, PAL's digests | M2 for PAL's digests (CryptoDigestMlx), M7 for WebCrypto (`crypto/mlx`) | std.crypto, std.asn1, std.x509 |
-| compiler/capi/freetype | Skia's typefaces | after M5, with the port's `SkTypeface` over std.truetype | |
-| compiler/capi/harfbuzz | WebCore's Skia text code, hb-icu | after M5, if the shaping replacement meets the open point below | |
+| compiler/libc/glib (mlx-glib) | WTF's GLib loop, WebCore's GIO, the GObject API | M2, with the WPE targets | No GLib anywhere in PlatformMlx (libpulse-mainloop-glib binds the system's GLib, not mlx-glib) |
+| compiler/libc/soup (mlx-soup) | WebCore's and NetworkProcess's soup code | M2 (WebCore no longer compiles soup code); its HTTP is std.http's, which M6 uses directly | |
+| compiler/libc/png, jpeg, webp (libpng, libjpeg, libwebp) | WebCore's decoders, Skia's codecs | M4 | the port's decoders and encoders call std.png, std.jpeg, std.webp; Skia is built without codecs |
+| compiler/libc/lcms2 | WebCore's decoders (USE_LCMS) | M4 | colour management in the port's decoders (std.colorprofile) |
+| compiler/libc/gcrypt, compiler/libc/tasn1 | WebCrypto, PAL's digests | M2 for PAL's digests (CryptoDigestMlx), M7 for WebCrypto (`crypto/mlx`) | std.crypto, std.asn1, std.x509 |
+| compiler/libc/freetype | Skia's typefaces | after M5, with the port's `SkTypeface` over std.truetype | |
+| compiler/libc/harfbuzz | WebCore's Skia text code, hb-icu | after M5, if the shaping replacement meets the open point below | |
 | Fontconfig (no C layer was made; std.fontconfig is Mlx) | FontCacheSkia | never needed: `FontCacheMlx.cpp` calls std.fontconfig from M3 | |
-| compiler/capi/sqlite3 | WebCore's SQLite wrapper | stays for the WebKit stage | SQLiteDatabase.h is shared by all storage code |
-| compiler/capi/xml2 | XMLDocumentParserLibxml2 | stays for the WebKit stage | XMLDocumentParser.h includes libxml2 |
-| compiler/capi/zlib | ZStream, WebSocket deflate, WOFF, ANGLE | stays for the WebKit stage | WebKit's files call zlib |
-| compiler/capi/icu (mlx-unicode) | ICU everywhere | stays: it is the port's ICU | |
-| compiler/capi/pulse, compiler/capi/pipewire | MLX Audio's and MLX Capture's client libraries | not the port's to retire | WebKit's media (M8) uses std.audio directly |
+| compiler/libc/sqlite3 | WebCore's SQLite wrapper | stays for the WebKit stage | SQLiteDatabase.h is shared by all storage code |
+| compiler/libc/xml2 | XMLDocumentParserLibxml2 | stays for the WebKit stage | XMLDocumentParser.h includes libxml2 |
+| compiler/libc/zlib | ZStream, WebSocket deflate, WOFF, ANGLE | stays for the WebKit stage | WebKit's files call zlib |
+| compiler/libc/icu (mlx-unicode) | ICU everywhere | stays: it is the port's ICU | |
+| compiler/libc/pulse, compiler/libc/pipewire | MLX Audio's and MLX Capture's client libraries | not the port's to retire | WebKit's media (M8) uses std.audio directly |
 | ANGLE (`webkit-angle`) | WebGL | stays built, unused until WebGL (M8) | |
 
 ## Open points
@@ -417,3 +435,74 @@ none is solved by a patch.
   `mlx-out/libc/libmlxc.so.1` and mlx-unicode by absolute paths of the
   checkout (mlx-cc writes no runpath); installed, they are
   /lib/mlx/libmlxc.so.1 and a library found in /lib/mlx.
+
+What M2 found, and how the port meets it without a patch:
+
+- **Types a port's configuration must name.** CryptoKeyRSA.h and
+  CryptoKeyEC.h declare their key containers for Darwin, GCrypt and
+  OpenSSL only, and WebCrypto is always compiled: the port's prefix
+  header (port/MlxPrefix.h, included after WebCorePrefix.h as a CMake
+  port's prefix header is) names `PlatformRSAKey`,
+  `PlatformRSAKeyContainer` and `PlatformECKeyContainer`.
+  DNSResolveQueue.cpp makes its singleton of `DNSResolveQueuePlatform`,
+  which only GLib's, curl's and CFNetwork's headers name: the port's
+  DNSResolveQueueMlx.cpp defines its class and compiles WebKit's file
+  after it (the file is skipped from its unified source).
+  SharedMemory.h has a handle type only with `USE_UNIX_DOMAIN_SOCKETS`
+  (GTK's and WPE's, set in config.MLX) or Darwin's and Windows'.
+- **GL in the Skia sources.** GraphicsContextSkia, NativeImageSkia,
+  SkiaUtilities and the others include GLContext.h, GLFence.h and
+  texmap's BitmapTexture.h for their accelerated paths, compiled whatever
+  the configuration: Khronos's headers (ANGLE's copy in the tree) and
+  platform/graphics/texmap are on the include path, no GL library is
+  linked, and PlatformDisplayMlx.cpp answers that there is no display.
+- **Generic headers with a member for one backend.** The generic branch
+  of NetworkStorageSession.h is enough (a session and its networking
+  context); the cookie functions are the port's
+  (NetworkStorageSessionMlx.cpp). FontCache.h's Skia members are kept;
+  `FontSetCache`, which only FontCacheSkia.cpp defines, is the port's
+  own class in FontCacheMlx.cpp.
+- **Settings a generic file reads that WebKit generates for some ports
+  only.** Page.cpp reads `settings().hardwareAccelerationEnabled()` for
+  any Skia port, but UnifiedWebPreferences.yaml has the setting for GTK
+  and the WPE platform only: the port's port/MlxSettings.yaml, read by
+  webkit-settings after WebKit's preferences (webcore.mlx's
+  `Derived.settings`), has it for the Mlx port, off.
+- **Bundles too big for mlx-cc.** The dense JSBindings bundle of
+  bindings/js (64 sources) exceeds mlx-cc's 8 GB arena: the Mlx port
+  bundles bindings/js by directory (webcore.mlx, `Derived.dense`).
+- **Accessibility's platform shape.** AXCoreObject's wrapper member
+  exists for Cocoa, Windows, PlayStation, Haiku and ATSPI only, and
+  accessibility is always compiled: config.MLX sets `WTF_PLATFORM_HAIKU`,
+  the Haiku port's shape of it (an AccessibilityObjectWrapper that is a
+  RefCounted nothing, which the PlayStation stubs the port compiles make;
+  ChromeClient's three accessibility notification functions, which
+  EmptyClients defines and the embedder will), and Pasteboard.h's
+  members for GTK, WPE and Haiku: all WebKit asks PLATFORM(HAIKU) for.
+- **What the link needs of the port.** Linked whole (the program's
+  object, then the archives' members it needs), WebCore names functions
+  a port defines that no generic file does: `PlatformKeyboardEvent::
+  currentStateOfModifierKeys` and `disambiguateKeyDownEvent` (GTK's and
+  libWPE's: port/platform/mlx/PlatformKeyboardEventMlx.cpp, the modifiers
+  the embedder sets), `WTF::Persistence::Coder<CertificateInfo>`
+  (WebCorePersistentCoders.cpp has Cocoa's, soup's and Windows' only:
+  CertificateInfoMlx.cpp, the DER chain and the TLS errors in soup's
+  layout), SynchronousLoaderClient's `didReceiveAuthenticationChallenge`
+  and `platformBadResponseError` (soup's and curl's: a stub until M6), and
+  texmap's BitmapTexture (`~BitmapTexture`, `updateContents`,
+  `createSkiaBackendTexture`, which SkiaGPUAtlas names for its GL path:
+  BitmapTextureMlx.cpp, a stub until M8, as no texture is ever made
+  without a display). Skia's src/core/SkStrikeRef.cpp, which WebKit's
+  CMake list leaves out though SkFont::makeStrikeRef needs it (a shared
+  libWPEWebKit tolerates the name undefined), is in lists/skia.txt. The
+  sources lists/skia-skipped.txt leaves out (SkXMLParser for expat,
+  SkFontConfigInterface_direct for fontconfig) and those CMake's list
+  lacks (SkPathDump.cpp, GrGLAssembleWebGLInterfaceAutogen.cpp) are named
+  only by archive members the program never takes (SkDOM,
+  SkFontConfigInterface, SkPathOpsDebug, GrGLAssembleInterface): nothing
+  to add. mlxlibc gained `inet_pton` (WebCore's IPAddress::fromString);
+  the long double functions (`ldexpl` of WTF's Int128) are bound by
+  mlxlibc's loader itself (compiler/libc/x87_long.mlx), which
+  tools/check_webkit_mlx_port.sh counts as defined; mlx-unicode gained
+  `u_strToTitle` (RenderText's `text-transform: capitalize` with a
+  locale) and the `uset_` sets SmartReplace.cpp builds from patterns.

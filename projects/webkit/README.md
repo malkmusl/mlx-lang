@@ -15,7 +15,9 @@ with `Source/`), by default /home/user/csrc/wpe/wpewebkit-2.54.1.
 Two of WebKit's ports are built, by the same steps from a description
 of each (`Port` in build.mlx): JSCOnly (JavaScriptCore alone, the
 generic event loop) and WPE, whose lower layers stand on GLib, GObject
-and GIO, here mlx-glib (compiler/libc/glib).
+and GIO, here mlx-glib (compiler/libc/glib). A third is this
+repository's own, PlatformMlx (PORT.md): WebCore and PAL on JSCOnly's
+lower layers, with no GLib.
 
     ./mlx build webkit-bmalloc        bmalloc and libpas (libbmalloc.a)
     ./mlx build webkit-wtf            WTF, the JSCOnly port, on mlx-unicode (libWTF.a)
@@ -33,6 +35,10 @@ and GIO, here mlx-glib (compiler/libc/glib).
     ./mlx build webkit-wpe-wtf-test   mlx-out/webkit/wpe/bin/wtf-test (tests/wtf-wpe.cpp)
     ./mlx build webkit-wpe-jsc-glib-test  mlx-out/webkit/wpe/bin/jsc-glib (tests/jsc-glib.c)
     ./mlx build webkit-wpe-webcore    WebCore for WPE (libWebCore.a); not all of it compiles yet, see WEBCORE.md
+    ./mlx build webkit-mlx-port       libmlxwebport.so, the Mlx side of the Mlx port (port/mlx)
+    ./mlx build webkit-mlx-pal        PAL for the Mlx port (mlx-out/webkit/mlx/lib/libPAL.a)
+    ./mlx build webkit-mlx-webcore    WebCore for the Mlx port (libWebCore.a); see PORT.md for what compiles
+    ./mlx build webkit-mlx-webcore-test  mlx-out/webkit/mlx/bin/webcore-test (tests/webcore-mlx.cpp): all of it linked
 
     ./mlx build webkit                all of it (but WebCore)
 
@@ -41,6 +47,7 @@ and GIO, here mlx-glib (compiler/libc/glib).
     tools/check_wpe_wtf.sh            WTF (WPE) at work: run loop, timers, work queues, strings, URLs
     tools/check_wpe_jsc.sh            JavaScriptCore (WPE) at work: jsc on tests/wpe.js, the GLib API's tests/jsc-glib.c
     tools/check_jsc_mlxlibc.sh        jsc (JSCOnly) on mlxlibc: tests/jsc/*.js as the glibc-linked jsc prints them, no glibc in the process
+    tools/check_webkit_mlx_port.sh    the Mlx port linked whole on mlxlibc: nothing left unresolved, a Page made (PORT.md, M2)
 
 How many jobs (`-j N`) is decided by memory, not cores: mlx-cc keeps a
 whole unit in one arena until its end, and a WebCore unified source
@@ -55,7 +62,9 @@ docs/internals/build-time-notes.md.
 The JSCOnly port's objects go to mlx-out/webkit/obj, its archives to
 mlx-out/webkit/lib, what is generated to mlx-out/webkit/generated
 (JavaScriptCore/ for JSC's, WebCore/ for WebCore's); the WPE port's to
-mlx-out/webkit/wpe/obj, lib, generated and bin.
+mlx-out/webkit/wpe/obj, lib, generated and bin; the Mlx port's to
+mlx-out/webkit/mlx/ (its archives in lib, beside which it links
+JSCOnly's libJavaScriptCore.a, libWTF.a, libbmalloc.a and libSkia.a).
 
 ## The ports
 
