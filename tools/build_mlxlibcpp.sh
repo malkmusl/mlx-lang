@@ -10,7 +10,8 @@
 #   libmlxcpp.a    the library (new and delete, std::string, iostream),
 #                  found by mlx-cc through MLX_CC_LIB=DIR, next to the
 #                  compiler as lib/, or in /usr/local/lib/mlx-cc/lib
-#   mlx-cc, mlx-ar the tools that built it
+#   mlx-cc, mlx-ld, mlx-ar the tools that built it (mlx-ld, which
+#                  mlx-cc runs for its links, beside it)
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,6 +32,7 @@ done
 mkdir -p "$out/obj"
 
 "$compiler" --quiet compiler/cc/main.mlx -o "$out/mlx-cc"
+"$compiler" --quiet compiler/ld/main.mlx -o "$out/mlx-ld"
 "$compiler" --quiet compiler/cc/ar.mlx -o "$out/mlx-ar"
 export MLX_CC_INCLUDE="$repo_root/compiler/cc/include"
 objects=()

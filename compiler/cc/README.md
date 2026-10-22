@@ -7,10 +7,13 @@ x86_64 ELF itself through the Mlx compiler's own encoder, object writer
 and linker (`compiler/selfhost/backend/x86_64/encoder.mlx`,
 `compiler/selfhost/object/relocatable.mlx`, `link.mlx`,
 `elf64_dynamic.mlx`): there is no assembler and no GNU linker in
-between. The programs call the C library through `libc.so.6`, which is
+between. The linker is a program of its own, `mlx-ld`
+(`compiler/ld/main.mlx`), which mlx-cc runs for every link as cc runs
+ld (below). The programs call the C library through `libc.so.6`, which is
 mlxlibc (`compiler/libc`) on MLX/Linux and glibc elsewhere.
 
     mlx-out/bin/compiler/mlx4 compiler/cc/main.mlx -o mlx-cc
+    mlx-out/bin/compiler/mlx4 compiler/ld/main.mlx -o mlx-ld   # beside it
     MLX_CC_INCLUDE=compiler/cc/include ./mlx-cc -o hello hello.c
     ./hello                                   # on the system's loader
     mlx-out/libc/libmlxc.so.1 ./hello         # on mlxlibc alone
@@ -23,6 +26,8 @@ mlxlibc (`compiler/libc`) on MLX/Linux and glibc elsewhere.
            [-L DIR] [-lNAME] [--dynamic-linker PATH] [-MD|-MMD] [-MF DEP] [-MT TARGET]
            [-s] [-Wl,-Map=FILE] FILE.c... [FILE.o...] [LIB.a...]
     mlx-ar rcs LIB.a FILE.o...  |  mlx-ar t LIB.a  |  mlx-ar x LIB.a
+    mlx-ld [-o OUT] [--dynamic-linker PATH] [-s] [-Map FILE] [-L DIR] [-lNAME] [-l:FILE]
+           FILE.o... LIB.a... LIB.so...
 
 The `.c` files given together are compiled as one, each a translation
 unit of its own (its own macros and scope), their names linked by name,
@@ -36,7 +41,22 @@ ordinary C compiler made with `-fPIE` link too, in either direction
 (`tools/check_link.sh`). `-lNAME` takes `libNAME.a` from a `-L`
 directory when there is one, else the shared `libNAME.so`; `-lm` is
 `libm.so.6` (glibc's, or the one built next to mlxlibc) and
-`-lpthread`, `-ldl` and `-lrt` are part of the C library. `-E` writes
+`-lpthread`, `-ldl` and `-lrt` are part of the C library.
+
+The link is mlx-ld's: mlx-cc compiles the `.c` files into the one
+object, resolves `-L`/`-l` (and adds mlxlibcpp for C++), and then
+runs `mlx-ld` in its own place (execve: the compiler's memory is gone
+before the link starts), handing it the object as it is in memory
+(`compiler/selfhost/object/unit.mlx`, in a memfd: the linker sees the
+same sections, symbols and relocations in the same order, so the
+program is byte for byte what the linker inside mlx-cc made) followed
+by the `.o` and `.a` files in order, `-l:SONAME` for each library the
+program needs, `--dynamic-linker`, `-s` and `-Map`. mlx-ld is `$MLX_LD`,
+else `mlx-ld` beside mlx-cc (`mlx build cc` puts both in mlx-out/bin).
+`mlx-cc -c` never runs it. Being two programs is what lets `mlx build`
+keep them apart: an object step's result depends on mlx-cc's bytes
+alone, a link step names mlx-ld as an input, so a change to the linker
+relinks the programs and compiles no object again. `-E` writes
 the preprocessed tokens instead. `-MD` (or `-MMD`) writes make's rule of
 the source and every file it included and embedded, at `-MF`'s path
 (else the output's with `.d`) naming `-MT`'s target (else the output):
@@ -130,7 +150,7 @@ in `/usr/local/lib/mlx-cc/include`.
 | Types and syntax tree | `types.mlx`, `ast.mlx` |
 | Parser | `cursor.mlx`, `state.mlx`, `scope.mlx`, `decl.mlx`, `initializer.mlx`, `expr.mlx`, `stmt.mlx`, `typing.mlx`, `eval.mlx` |
 | Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
-| Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through `compiler/selfhost/object/link.mlx`), `ar.mlx` (mlx-ar) |
+| Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through mlx-ld), `compiler/ld/main.mlx` (mlx-ld: `compiler/selfhost/object/link.mlx` as a program, the link map), `ar.mlx` (mlx-ar) |
 | The C variant | `standard.mlx` (`-std=`: the macros, the keywords) |
 | Driver | `main.mlx` |
 

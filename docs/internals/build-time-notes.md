@@ -679,7 +679,7 @@ would take, against today's one mmap per large block and the tiny
 pages' own lock for the small ones (the tinypage test's four threads,
 the GPA test's four).
 
-## Proposal: the linker as a program of its own, mlx-ld (2026-10-22; not done)
+## Proposal: the linker as a program of its own, mlx-ld (2026-10-22; done on branch build-incremental, see "Incremental builds" below)
 
 Every WebKit object step names `mlx-out/bin/mlx-cc` as an input
 (`Build.input(b, step, tc.cc)` in projects/webkit/build.mlx), and an
@@ -745,3 +745,49 @@ read back (the size of one unit's object); mlx-cc and mlx-ld must agree
 on the object format, which they share by source (relocatable.mlx), and
 `tools/check_link.sh`, `check_cc.sh` and `check_cpp.sh` cover both
 paths as they do now.
+
+## Incremental builds (branch build-incremental, 2026-10-22)
+
+### 1. mlx-ld
+
+Done as proposed above, with one change of plan: the unit mlx-cc
+compiles for `mlx-cc -o prog x.c` is not handed over as a `.o` file. An
+ELF object read back (relocatable.read) is not the object mlx-cc had in
+memory: the reader adds the four section symbols, puts the locals
+before the globals and gives every object all of its sections, and the
+linker lays out what it is given in that order, so `mlx-cc -o p x.c`
+and `mlx-cc -c x.c && mlx-cc -o p x.o` already made different programs
+(24 bytes more data in `arith`, for one). mlx-cc writes the object as it
+is in memory instead (`compiler/selfhost/object/unit.mlx`: the
+sections, symbols and relocations in order, a dozen lines of format)
+into a memfd and `execve`s mlx-ld on `/proc/self/fd/N`, the objects and
+archives of the command line in order, `-l:SONAME` for each library and
+`--dynamic-linker`/`-s`/`-Map`; no temporary file, the compiler's arena
+is gone before the link starts, and mlx-cc's exit status is mlx-ld's.
+
+- `compiler/ld/main.mlx` (mlx-ld: link.mlx, archive.mlx,
+  elf64_dynamic.mlx, the link map moved out of program.mlx); `-L`/`-l`
+  with mlx-cc's rules (and `-lmlxcpp` where mlx-cc finds it), `-Wl,`
+  forms spread. mlx-cc finds it as `$MLX_LD`, else beside itself.
+- build.mlx's `cc` group builds `mlx-ld` (-O3) beside mlx-cc;
+  `webkit.Toolchain` has `.linker`/`.ld`; the link steps of the WebKit
+  build (`linkProgram`, the WebCore test programs) name mlx-ld as an
+  input and depend on its step. Object steps name mlx-cc only.
+- mlx-cc no longer imports link.mlx, archive.mlx or elf64_dynamic.mlx
+  (2.49 MB; mlx-ld 0.38 MB).
+- The gate: 623 files (the C test programs linked whole and from
+  objects and archives, their objects, the C++ test programs, the
+  separate-compilation C++ programs, two link maps, a stripped program
+  with an interpreter and `-l` libraries) made by the old mlx-cc and by
+  the new mlx-cc + mlx-ld are byte-identical (`cmp`), and check_cc,
+  check_cpp, check_link, check_crash_report, check_build_cache (with
+  mlx-ld in its probe project), check_build and the std modules pass.
+
+Found on the way: objects carry the absolute paths of the headers they
+were compiled against in their `@at PATH:LINE` line-table symbols
+(mlx-out/include/mlx-cc is a link into the checkout), so an object the
+shared result cache took from another worktree names that worktree's
+headers (`libcpp/new.o` from agent-a9ab5... in this one). The cache's
+entries already make the paths relative; the objects do not. Harmless
+for the code (the crash report names a path that may not exist here),
+not changed.

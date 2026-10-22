@@ -37,8 +37,9 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 "$compiler" --quiet compiler/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
 cp -r compiler/cc/include "$work/include"
 cc="$work/mlx-cc"
+"$compiler" --quiet compiler/ld/main.mlx -o "$work/mlx-ld" || fail "mlx-ld does not build"
 "$compiler" --quiet compiler/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
-echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ar"
+echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ld and mlx-ar"
 
 tests=compiler/cc/tests
 (cd "$tests" && "$cc" -E preprocess.c) > "$work/preprocess.out" 2> "$work/preprocess.err" || fail "-E: $(head -3 "$work/preprocess.err")"
