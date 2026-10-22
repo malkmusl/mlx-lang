@@ -791,3 +791,152 @@ headers (`libcpp/new.o` from agent-a9ab5... in this one). The cache's
 entries already make the paths relative; the objects do not. Harmless
 for the code (the crash report names a path that may not exist here),
 not changed.
+
+### 2. The code generation epoch
+
+`compiler/cc/epoch.mlx` holds `CODEGEN_EPOCH` and the rule for bumping
+it (also in compiler/cc/README.md); `mlx-cc --codegen-epoch` prints it
+and `--codegen-epoch=FILE` writes the stamp `mlx-out/bin/mlx-cc.epoch`
+(`mlx-cc codegen epoch 1`) that build.mlx's `mlx-cc-epoch` step makes
+whenever mlx-cc is built. std.build's `Build.programEpoch(b, step,
+STAMP)` makes the stamp an input of the step and the key of its result
+cache entries in place of the program's bytes; build.mlx's `cObject` and
+projects/webkit's `compileAs` use it instead of naming mlx-cc as an
+input. mlx-ld, mlx-ar and the Mlx programs stay keyed by their bytes.
+
+`mlx build --verify-epoch N` makes N of the wanted epoch-keyed steps
+again after the build (random, those not made by this run first) and
+compares each new file with the one it replaced: `[verify i/N] same` or
+`DIFFERS`, and a loud failure asking for the bump.
+`tools/check_codegen_epoch.sh` checks the whole on a probe project (a
+new mlx-cc of the same epoch: only the stamp is written again; another
+copy takes the objects from the cache; a moved epoch rebuilds, moved
+back is cached; MLX_CC_READ_ALL_BODIES=1 stands in for a forgotten bump
+and is caught) and, with the WebKit sources there, verifies 20 of WTF's
+units. A check that fails when codegen files change without a bump was
+not made: which files decide an object's bytes is most of compiler/cc,
+and most commits to them (all the speed and memory work above, the
+features that made WebKit compile) changed no object; it would alarm on
+nearly every commit. The rule is documented and the real objects are
+compared instead.
+
+### 3. Failures remembered
+
+What existed: a failed step has no manifest, so the next build runs it
+again, and runs again every step whose inputs changed; nothing else. What
+is new: the result cache remembers failures too (`failures/KEY/INPUTS`:
+the exit status, the files the failing run read from its depfile with
+their hashes, the last 64 KiB of the log), keyed by the program's
+**bytes**, not its epoch. A step not current and not cached whose
+failure is remembered for the same program and files fails at once with
+its log, without a job (`FAILED NAME (exit 1, remembered: ...)`;
+`--retry-failed` or `--force` runs it). So a `--keep-going` rebuild for
+an unrelated reason does not spend a minute per known-failing unit, and,
+with the epoch, a non-bumping fix of mlx-cc runs exactly the units that
+failed before. Remembered only: exit 1-127 (not a signal, so not the
+memory killer's 137) of a command whose depfile this run wrote (its
+time is taken when the job starts; so a failure before preprocessing
+ended, a missing header, is not remembered: what it read is not known).
+A first version removed the depfile before the job instead, which broke
+projects/webkit's archives, whose depfile (the object list) build.mlx
+writes itself: `libJavaScriptCore.a` failed in the measurement below
+with an empty log, and was the one step the build after the fix ran. Failures not told for two weeks are removed by the trim.
+
+### 4. Memory-aware jobs
+
+`std/src/build/memory.mlx`: before a job starts, the step's expected
+peak (its `ru_maxrss` of its last run, kept as `took MS PEAK_KIB` in the
+manifest and the cache entry — the old readers parse only the first
+number, so the formats stay compatible — plus an eighth; else
+`Build.memory`, which projects/webkit sets to 4096/2048/1024 MB for
+WebCore/JSC/other units) must fit in MemAvailable (or the cgroup's room,
+v1 or v2) less a margin of max(1 GiB, an eighth of the memory) less what
+the running jobs are still expected to grow by (expectation less
+/proc/PID/statm's resident set). A step that does not fit waits for a
+job to end; with nothing running it starts anyway. Because MemAvailable
+is measured, another build beside this one (the full WebKit rebuild of
+another agent ran beside every measurement here) is taken into account
+as it is now, though not its future growth (the margin is for that).
+`--no-memory-limit` turns it off; `tools/check_build_memory.sh` checks it
+with steps that declare more than the machine has (one at a time at
+-j 3, side by side with the flag) and the peak kept in the manifest.
+Found while testing: jobs start by vfork, so a child's `ru_maxrss`
+includes the runner's ~280 MB until its execve; jobs smaller than that
+are recorded as that (harmless; documented).
+
+### Measured: JSC + PAL + Skia (JSCOnly JSC, the Mlx port's PAL, Skia)
+
+`./mlx build -j 4 --keep-going webkit-jsc webkit-mlx-pal webkit-skia`
+with a result cache of its own (empty), 1182 steps of which 1154 mlx-cc
+objects, while another agent's full WebKit rebuild ran beside it in the
+same 15 GB / 4-core container (its three WebCore units took up to 12.2
+GB resident between them; MemAvailable went down to 1.36 GB):
+
+| | |
+|---|---|
+| wall | 16 min 19 s (977 s of scheduling; 2842 s of job time, 21 min user) |
+| our mlx-cc jobs at once (5 s samples) | 4: 76, 3: 40, 2: 36, 1: 38 samples |
+| steps that waited for memory | 353 times |
+| largest job / average | 2021 MiB / 483 MiB (the JSC units) |
+| killed (exit 137) | none, on our side or the other build's |
+
+At `-j 4` without the limit the four JSC units of up to 2 GB beside
+the other build's 12 GB would have passed the 15 GB; with it, the build
+ran four at a time while there was room and down to one when the other
+build's WebCore units peaked. (The three archives failed in this run, by
+the depfile bug described under 3.)
+
+**A non-bumping change of mlx-cc, then the same build** (the `--version`
+text changed: other bytes, the same epoch):
+
+| | steps run | wall |
+|---|---|---|
+| keyed by mlx-cc's bytes (before; every object names mlx-cc as an input) | the 1154 objects (their archives then current, the objects coming out the same) | ~16 min here (2842 s of jobs) |
+| keyed by the epoch (now) | `./mlx build cc`: mlx-cc and the stamp, 3.0 s; then **0 steps**: `all 1186 steps current (1.0 s)` | 2.7 s |
+
+**After the fix of the failed steps** (std.build changed, the runner
+recompiled): `3 built, 1183 current (3.4 s)`, exactly the three archives
+that had failed. `./mlx build -j 4 webkit-jsc --verify-epoch 20` with the
+changed mlx-cc: 20 JSC units compiled again (1 min 5 s), all the same
+byte for byte.
+
+### 5. Building the compiler itself
+
+`./mlx build cc` after a one-line change in compiler/cc: **3.0 s** wall
+(2.4 s user), of which mlx4 compiling mlx-cc at -O3 is 1.1 s alone and
+1.4-1.5 s beside four other jobs; by phase (`--progress`, under load):
+load and parse 266 ms, declarations 53 ms, bodies 196 ms, lowering 369
+ms, the optimizer 399 ms, code generation 175 ms, writing 55 ms; 235 MB
+of compiler arena. mlx-ld takes 0.23 s. The rest is the runner, the
+stamp and mlx-cc's own steps.
+
+mlx4 has no separate compilation: a program is one run over the whole
+module graph (load → resolve → analyze → lower to LIR → optimize →
+x86_64 → one ELF), with no object per module and no `-c`
+(compiler/selfhost/driver/pipeline.mlx, options.mlx). At ~1.5 s for
+mlx-cc's 60k lines it does not need one: the compiler's own build is
+not where the time goes; what made a compiler change cost hours was the
+key of the objects, which the epoch takes care of. What a module-object
+system would take, for the record (not done):
+
+1. A per-module interface: the public declarations' types (structs,
+   function signatures, constants, comptime values) serialized after
+   analysis, so that an importer can be analyzed without the module's
+   bodies; and a hash of it, so a body-only change does not re-analyze
+   the importers.
+2. Code generation per module into a relocatable object (mlx4's backend
+   writes one executable from one encoder now; relocatable.mlx and
+   link.mlx already exist and mlx-ld links mlx-cc's objects), with
+   cross-module calls as relocations, and the program linked by mlx-ld.
+3. What whole-program compilation gives up: the inliner across modules
+   (base.mlx's `inline` accessors, the 10% of mlx-cc's time from -O3)
+   needs the inlined bodies in the interface (or LTO over LIR), and the
+   optimizer's whole-program facts (unused functions dropped, generic
+   instances made once) need a link-time step.
+4. In std.build, a step per module (or mlx4 driving a cache of module
+   objects by interface hashes itself, as the depfile already lists the
+   modules).
+
+For a 1.5 s build that is a large change for at most ~1 s; not worth it
+now. -O1 or -O0 for a quick try would be the cheaper lever (mlx-cc's
+objects do not depend on how mlx-cc was optimized, so its epoch stays).
