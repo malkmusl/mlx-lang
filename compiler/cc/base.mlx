@@ -15,16 +15,31 @@ const O_RDONLY: usize = 0
 const O_CLOEXEC: usize = 524288
 
 // The arena: 8 GiB of address space, reserved without committing it
-// (std.page_allocator maps a block that large with MAP_NORESERVE): only
-// what is touched counts, and fresh pages are zero. It is a std arena
-// over the page allocator, so that it is one block of the program's to
-// the leak check and `mlx-codemap memory` (its interface, `allocator()`,
-// is what std's containers in the compiler take); alloc() bumps it
-// directly, as the arena's own alloc would.
+// (MAP_NORESERVE): only what is touched counts, and fresh pages are
+// zero. Its interface is a std arena's (`allocator()`, what std's
+// containers in the compiler take); alloc() bumps it directly, as the
+// arena's own alloc would.
+//
+// It lies at a fixed address (MAP_FIXED_NOREPLACE), so that the state a
+// run keeps in it is valid in another run of the same compiler: a
+// prefix snapshot (snapshot.mlx) is the arena's used part and the
+// modules' variables after the -include files, mapped back at the same
+// place. When the address is taken (or the kernel cannot be asked for
+// it) the arena is anywhere and no snapshot is written or read.
 const ARENA_SIZE: usize = 8589934592
+pub const ARENA_BASE: usize = 52776558133248
+// After the arena, the run's own memory while its command line is read
+// (beginSide to endSide): the files, -o, -D and -I texts and the link's
+// inputs, which a snapshot does not hold and a snapshot read must not
+// overwrite. Nothing of the compilation proper is made there.
+const SIDE_SIZE: usize = 1073741824
+const PAGE_SIZE: usize = 4096
 
-var arena: std.arena_allocator.Arena = undefined
-var arenaBase: usize = 0
+var arena: std.arena_allocator.Arena = undefined // (per run)
+var arenaBase: usize = 0 // (per run)
+pub var fixedArena = false // (per run)
+var sideOffset: usize = 0 // (per run)
+var onSide = false // (per run)
 
 // The names: an open-addressed table of ids and, by id, where each name's
 // bytes are.
@@ -41,21 +56,37 @@ var fileEntries: usize = 0
 var fileCount: u32 = 0
 
 pub fn init() -> bool {
-    const pages = std.page_allocator.init()
-    const reserved = pages.alloc(ARENA_SIZE, 16)
-    if reserved == null { return false }
-    arena = std.arena_allocator.Arena.{ .memory = reserved.?, .capacity = ARENA_SIZE, .offset = 0, .child = pages }
-    arenaBase = @intFromPtr(reserved.?)
+    // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, with MAP_FIXED_NOREPLACE.
+    const anywhere: usize = 16418
+    const all: usize = 18446744073709551615
+    var at = std.linux.syscall6(9, ARENA_BASE, ARENA_SIZE + SIDE_SIZE, 3, anywhere | 1048576, all, 0)
+    if at == @bitCast(isize, ARENA_BASE) {
+        fixedArena = true
+    } else {
+        // (A kernel before 4.17 takes the address as a hint.)
+        if at >= 0 { const dropped = std.linux.syscall2(11, @bitCast(usize, at), ARENA_SIZE + SIDE_SIZE) }
+        at = std.linux.syscall6(9, 0, ARENA_SIZE + SIDE_SIZE, 3, anywhere, all, 0)
+        if at < 0 { return false }
+    }
+    arenaBase = @bitCast(usize, at)
+    var memory: [*]u8 = undefined
+    unsafe { memory = @ptrFromInt([*]u8, arenaBase) }
+    arena = std.arena_allocator.Arena.{ .memory = memory, .capacity = ARENA_SIZE, .offset = 0, .child = std.page_allocator.init() }
     nameSlots = alloc(NAME_SLOTS * 4)
     nameEntries = alloc(MAX_NAMES * 16)
     nameCount = 1
     fileEntries = alloc(MAX_FILES * 24)
     fileCount = 1
+    // (Made now, not when first used: used first while the command line
+    // is read, they would be in the side memory.)
+    pathBuffer = alloc(PATH_BUFFER)
+    statBuffer = alloc(144)
     return true
 }
 
 // `size` bytes of zeroed memory, 16-byte aligned; its address.
 pub fn alloc(size: usize) -> usize {
+    if onSide { return sideAlloc(size) }
     const at = (arena.offset + 15) / 16 * 16
     if at + size > ARENA_SIZE {
         // (MLX_CC_STATS: what filled it.)
@@ -67,19 +98,71 @@ pub fn alloc(size: usize) -> usize {
     return arenaBase + at
 }
 
+// `size` bytes of the side memory (above).
+pub fn sideAlloc(size: usize) -> usize {
+    const at = (sideOffset + 15) / 16 * 16
+    if at + size > SIDE_SIZE { fatal("out of memory (the command line's)") }
+    sideOffset = at + size
+    return arenaBase + ARENA_SIZE + at
+}
+
+// While the command line is read: alloc() takes the side memory.
+pub fn beginSide() -> void { onSide = true }
+pub fn endSide() -> void { onSide = false }
+pub fn isSide(address: usize) -> bool { return address >= arenaBase + ARENA_SIZE && address < arenaBase + ARENA_SIZE + SIDE_SIZE }
+
+// The arena's used bytes (a snapshot's image), and the arena continued
+// from a snapshot's.
+pub fn arenaUsed() -> usize { return arena.offset }
+pub fn arenaStart() -> usize { return arenaBase }
+pub fn continueArena(used: usize) -> void { arena.offset = used }
+
+// The variables of the modules that a snapshot holds: (address, size)
+// pairs, each module's keepState() naming its own (the variables marked
+// `(per run)` aside: the arena's place, the side memory, the command
+// line's options, the counts of MLX_CC_STATS).
+var stateCells: usize = 0 // (per run)
+var stateCount: usize = 0 // (per run)
+const MAX_STATE: usize = 4096
+
+pub fn keepState(address: usize, size: usize) -> void {
+    if stateCells == 0 { stateCells = sideAlloc(MAX_STATE * 16) }
+    if stateCount >= MAX_STATE { fatal("too many variables for a snapshot") }
+    putWord(stateCells + stateCount * 16, address)
+    putWord(stateCells + stateCount * 16 + 8, size)
+    stateCount += 1
+}
+pub fn stateCellCount() -> usize { return stateCount }
+pub fn stateCell(index: usize) -> usize { return stateCells + index * 16 }
+
+// A hash of `length` bytes at `address` (a file's contents, the
+// compiler's own): by the word, not cryptographic.
+pub fn contentHash(address: usize, length: usize) -> u64 {
+    var hash: u64 = 14695981039346656037 ^ @intCast(u64, length)
+    var index: usize = 0
+    while index + 8 <= length {
+        hash = (hash ^ @intCast(u64, getWord(address + index))) *% 11400714819323198485
+        hash = hash ^ (hash >> 29)
+        index += 8
+    }
+    while index < length {
+        hash = (hash ^ @intCast(u64, get8(address + index))) *% 1099511628211
+        index += 1
+    }
+    return hash ^ (hash >> 32)
+}
+
 // The arena as an Allocator (std's containers in the compiler): freed
 // blocks stay, as everything in the arena does.
 pub fn allocator() -> std.allocator.Allocator { return std.arena_allocator.interface(&arena) }
 
 // (MLX_CC_STATS: the arena's allocations by size, below 4096 bytes one
 // bucket per size, above in one.)
-var sizeBytes: usize = 0
+var sizeBytes: usize = 0 // (per run)
 fn countSize(size: usize) -> void {
     if sizeBytes == 0 {
         // (Its own memory, outside the counts.)
-        stats = false
-        sizeBytes = alloc(4097 * 16)
-        stats = true
+        sizeBytes = sideAlloc(4097 * 16)
     }
     const bucket = if size < 4096 { size } else { 4096 }
     putWord(sizeBytes + bucket * 16, getWord(sizeBytes + bucket * 16) + size)
@@ -118,7 +201,7 @@ pub fn scratch(size: usize) -> usize {
 pub fn releaseScratch(mark: usize) -> void { scratchTop = mark }
 
 // MLX_CC_STATS: the arena's use by kind of thing, shown at the end.
-pub var stats = false
+pub var stats = false // (per run)
 pub const STAT_TOKENS: usize = 0
 pub const STAT_NODES: usize = 1
 pub const STAT_OBJS: usize = 2
@@ -132,8 +215,8 @@ pub const STAT_SCRATCH: usize = 7
 pub const STAT_TOKENS_COPIED: usize = 8
 pub const STAT_NODES_IN_FUNCTION: usize = 9
 pub const STAT_COUNT: usize = 10
-var statBytes: [10]u64 = undefined
-var statCounts: [10]u64 = undefined
+var statBytes: [10]u64 = undefined // (per run)
+var statCounts: [10]u64 = undefined // (per run)
 // Whether a function's body is being read (state.startFunction), for
 // the counts.
 pub var inFunction = false
@@ -615,6 +698,7 @@ fn fileAddress(id: u32) -> usize { return fileEntries + @intCast(usize, id) * 24
 pub fn fileName(id: u32) -> u32 { return get32(fileAddress(id)) }
 pub fn fileData(id: u32) -> usize { return getWord(fileAddress(id) + 8) }
 pub fn fileLength(id: u32) -> usize { return getWord(fileAddress(id) + 16) }
+pub fn files() -> u32 { return fileCount }
 
 // A path as the system calls take it (NUL-ended), in a buffer of its
 // own that the next call reuses; a copy kept in the arena when it is too
@@ -779,6 +863,19 @@ pub fn nameTrace(name: u32) -> void {
 pub fn popTrace() -> void { if traceTop > 0 { traceTop -= 1 } }
 
 pub fn warnAt(file: u32, line: u32, message: []const u8) -> void {
+    if recordWarnings {
+        // (Kept as one text, said again by a run that reads the snapshot.)
+        var text = join(if file != 0 { nameOf(fileName(file)) } else { "mlx-cc" }, ":")
+        text = join(join(join(text, decimal(@intCast(u64, line))), ": warning: "), message)
+        text = join(text, "\n")
+        const cell = alloc(24)
+        putWord(cell, @intFromPtr(text.pointer))
+        putWord(cell + 8, text.length)
+        putWord(cell + 16, warnings)
+        warnings = cell
+        say(text)
+        return
+    }
     if file != 0 { say(nameOf(fileName(file))) } else { say("mlx-cc") }
     say(":")
     sayNumber(@intCast(u64, line))
@@ -786,3 +883,50 @@ pub fn warnAt(file: u32, line: u32, message: []const u8) -> void {
     say(message)
     say("\n")
 }
+
+// The warnings of the -include files (while recordWarnings): cells of
+// (text, length, next), the last first.
+pub var recordWarnings = false
+pub var warnings: usize = 0
+
+// They said again, in their order (a snapshot read).
+pub fn sayWarnings() -> void {
+    var reversed: usize = 0
+    var cell = warnings
+    while cell != 0 {
+        const c = sideAlloc(16)
+        putWord(c, cell)
+        putWord(c + 8, reversed)
+        reversed = c
+        cell = getWord(cell + 16)
+    }
+    while reversed != 0 {
+        const at = getWord(reversed)
+        say(bytes(getWord(at), getWord(at + 8)))
+        reversed = getWord(reversed + 8)
+    }
+}
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepBaseState() -> void {
+    keepState(@intFromPtr(&nameSlots), @sizeOf(@typeOf(nameSlots)))
+    keepState(@intFromPtr(&nameEntries), @sizeOf(@typeOf(nameEntries)))
+    keepState(@intFromPtr(&nameCount), @sizeOf(@typeOf(nameCount)))
+    keepState(@intFromPtr(&fileEntries), @sizeOf(@typeOf(fileEntries)))
+    keepState(@intFromPtr(&fileCount), @sizeOf(@typeOf(fileCount)))
+    keepState(@intFromPtr(&scratchBase), @sizeOf(@typeOf(scratchBase)))
+    keepState(@intFromPtr(&scratchTop), @sizeOf(@typeOf(scratchTop)))
+    keepState(@intFromPtr(&inFunction), @sizeOf(@typeOf(inFunction)))
+    keepState(@intFromPtr(&buildBase), @sizeOf(@typeOf(buildBase)))
+    keepState(@intFromPtr(&buildTop), @sizeOf(@typeOf(buildTop)))
+    keepState(@intFromPtr(&joinedSlots), @sizeOf(@typeOf(joinedSlots)))
+    keepState(@intFromPtr(&joinedCapacity), @sizeOf(@typeOf(joinedCapacity)))
+    keepState(@intFromPtr(&joinedCount), @sizeOf(@typeOf(joinedCount)))
+    keepState(@intFromPtr(&pathBuffer), @sizeOf(@typeOf(pathBuffer)))
+    keepState(@intFromPtr(&statBuffer), @sizeOf(@typeOf(statBuffer)))
+    keepState(@intFromPtr(&traceStack), @sizeOf(@typeOf(traceStack)))
+    keepState(@intFromPtr(&traceTop), @sizeOf(@typeOf(traceTop)))
+    keepState(@intFromPtr(&recordWarnings), @sizeOf(@typeOf(recordWarnings)))
+    keepState(@intFromPtr(&warnings), @sizeOf(@typeOf(warnings)))
+}
+// --- end of prefix snapshot state ---
