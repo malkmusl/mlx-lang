@@ -732,7 +732,14 @@ std.build gets `uncached(step)` (a command with a depfile stays out of
 the result cache): the snapshots are 0.8–1.7 GB each (sparse: 0.1–1 GB
 on disk) and would push the objects out of its 6 GB. WTF has no
 `-include` in its flags (its prefix, config.h, is 0.26 s of a 1.6 s
-unit) and Skia and bmalloc have no common prefix: unchanged. With
+unit) and Skia and bmalloc have no common prefix: unchanged.
+
+`./mlx build -j 2 webkit-jsc` in a fresh checkout of the branch (the
+generators from the result cache, mlx-cc new so every object made
+again): 333 steps in 2 min 44 s (4 min 0 s user, 1 min 9 s system),
+the snapshot step before the units, no unit refusing it; one unit's
+command line taken from the running build and run again without
+`--prefix-snapshot` makes the build's object byte for byte. With
 branch build-incremental's codegen epoch: this branch changes objects
 (the prefix's lambda names, the arena's layout in the words above), so
 the epoch must be bumped when the two meet; the snapshot step should
