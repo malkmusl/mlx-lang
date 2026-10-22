@@ -139,6 +139,8 @@ implemented: this repository has no packages from elsewhere.
 ./mlx build --dry-run            # what would be built
 ./mlx build --force mlx-sh       # build it even when it is current
 ./mlx build --keep-going         # go on after a step failed
+./mlx build --retry-failed       # run steps whose failure is remembered
+./mlx build --verify-epoch 20    # then compile 20 cached objects again, compare
 ./mlx build --clean              # forget what was built
 ./mlx build --cache-stats        # what the result cache holds
 ./mlx build --cache-clear        # empty the result cache
@@ -197,7 +199,9 @@ and what changes them: `option` (a compiler option), `output` (another
 place for the file), `input` and `inputTree` (the files a command reads),
 `depfile` (the make-style dependency file a command writes, as
 `mlx-cc -MD -MF` does), `cacheable` (a command's output may come from the
-result cache, below), `dependOn` and `add` (order and membership),
+result cache, below), `programEpoch` (the command's program is known by
+an epoch stamp, not its bytes; below), `dependOn` and `add` (order and
+membership),
 `byDefault`, `describe`,
 `step(b, name)` (a step declared before) and `concat` (a string made from
 two). Host I/O happens only through these (`<BuildHostAccess>`): `build()`
@@ -287,6 +291,56 @@ ccache's direct mode does:
   last changed, which a hit's link renews) down to four fifths of it, and
   the entries naming them; below the limit that costs one status call per
   object.
+
+### Programs keyed by an epoch
+
+A command's entries are kept under the bytes of the program it runs, so
+a new build of a compiler would make every object it made again,
+although almost all of them come out the same: for WebKit, a change to
+mlx-cc anywhere (a diagnostic, the crash report's wiring, a faster
+lookup) meant ~1800 compiles, hours. `Build.programEpoch(b, step, STAMP)`
+says the step's program is known by the contents of STAMP instead, a
+file the program's build writes, which names its *code generation
+epoch*: a number the program's authors move whenever a change can make
+another file from the same inputs (compiler/cc/epoch.mlx states mlx-cc's
+rule). STAMP is an input of the step; the program's bytes are not. So a
+new mlx-cc that writes the same stamp leaves every object current, every
+cached object valid in every checkout, and a moved epoch builds them all.
+
+In build.mlx: the `mlx-cc-epoch` step runs `mlx-cc
+--codegen-epoch=mlx-out/bin/mlx-cc.epoch` whenever mlx-cc is built (it
+says `mlx-cc codegen epoch N`), and every object step (`cObject`,
+projects/webkit's `compileAs`) names that file with `programEpoch` and
+depends on the step. mlx-ld and mlx-ar steps, and Mlx programs (mlx4's
+own hash), are keyed by bytes as before.
+
+An epoch is a promise; `--verify-epoch N` checks it: after the build, N
+of the wanted steps keyed by an epoch whose files are there (a random
+sample, those taken from the cache or current before those made now)
+are made again by the program as it is, and each new file is compared
+with the one it replaces. A step whose file differs means the program
+changed what it makes under the same epoch: the run says `[verify 3/20]
+DIFFERS NAME` and asks for the epoch to be bumped, and fails.
+`tools/check_codegen_epoch.sh` does this on a probe project and on 20 of
+WTF's objects (with the WebKit sources there).
+
+### Failures remembered
+
+A command that failed (exit status 1 to 127, not a signal: a unit the
+memory killer stopped is not remembered) after writing its depfile is
+remembered too, under `failures/KEY/INPUTS`: the key with the program
+**by its bytes** (never its epoch), the files the failing run read (its
+depfile) and the declared inputs with their hashes, the exit status and
+the last 64 KiB of its log. When the step is next not current and not
+cached, and the program and every file are as they were, it fails at
+once without a job: `FAILED NAME (exit 1, remembered: ...)` and its log,
+back in mlx-out/build/logs. `--retry-failed` runs such steps instead,
+`--force` too. Since a failure's key has the compiler's bytes and a
+success's the epoch, a fix of mlx-cc that keeps the epoch runs exactly
+the steps that failed before (and those whose files changed) and takes
+everything else from the manifests or the cache. A failure before the
+depfile is written (a missing header) is not remembered: what it read
+is not known. Remembered failures go after two weeks unused.
 
 A hit is only as right as the inputs a step names: like ccache's direct
 mode it assumes that a step reading the same bytes makes the same file.

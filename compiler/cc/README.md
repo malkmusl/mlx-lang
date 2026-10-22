@@ -54,15 +54,48 @@ by the `.o` and `.a` files in order, `-l:SONAME` for each library the
 program needs, `--dynamic-linker`, `-s` and `-Map`. mlx-ld is `$MLX_LD`,
 else `mlx-ld` beside mlx-cc (`mlx build cc` puts both in mlx-out/bin).
 `mlx-cc -c` never runs it. Being two programs is what lets `mlx build`
-keep them apart: an object step's result depends on mlx-cc's bytes
-alone, a link step names mlx-ld as an input, so a change to the linker
-relinks the programs and compiles no object again. `-E` writes
+keep them apart: an object step's result depends on mlx-cc alone, a link
+step names mlx-ld as an input, so a change to the linker relinks the
+programs and compiles no object again. `-E` writes
 the preprocessed tokens instead. `-MD` (or `-MMD`) writes make's rule of
 the source and every file it included and embedded, at `-MF`'s path
 (else the output's with `.d`) naming `-MT`'s target (else the output):
 what `mlx build` reads to rebuild an object when a header changed. Options of other compilers that change
 nothing here (`-O2`, `-g`, `-Wall`, `-fPIC`, `-pthread` ...) are
 accepted silently.
+
+## The code generation epoch
+
+`mlx build` keys mlx-cc's objects not by mlx-cc's bytes but by
+`CODEGEN_EPOCH` (`epoch.mlx`; `mlx-cc --codegen-epoch` prints it,
+`--codegen-epoch=FILE` writes the stamp the `mlx-cc-epoch` step of
+build.mlx makes; docs/reference/build-system.md, "Programs keyed by an
+epoch"). A change to mlx-cc that keeps it keeps every object of every
+checkout's cache valid; only units that failed before compile again.
+
+**Bump `CODEGEN_EPOCH` in the commit of any change that can change an
+object's bytes (or its `-MD` file) for a source that compiled before**:
+code generation, the ABI and layouts, vtables, mangling, the symbols
+and what an object holds or leaves out and their order, constant
+evaluation and the choices it feeds (sizeof, constexpr results,
+overloads, templates), the predefined macros, the object format, the
+line-table symbols. **No bump** for a change that only makes failing
+code compile, makes compiling faster or leaner with the same objects,
+or touches diagnostics, warnings, the crash report's wiring, the
+driver's options, `-E`, `MLX_CC_STATS` or the linker (mlx-ld is keyed by
+its bytes). When in doubt, bump: a bump costs a rebuild, a missing one
+stale objects in every cache.
+
+A forgotten bump is caught by `mlx build --verify-epoch N` (N cached
+objects compiled again and compared; `tools/check_codegen_epoch.sh`
+runs it on 20 of WTF's units). A check that fails when codegen files
+change without a bump is not there on purpose: which files decide the
+bytes is most of compiler/cc (the parser's overload and template
+choices, interp.mlx's constant evaluation, the headers' semantics), and
+most changes to them (the speed and memory work, the features that made
+WebKit compile) changed no object; such a check would cry wolf on nearly
+every commit, and an alarm that is always on gets bumped through. The
+comparison of real objects does not.
 
 ## The C variants
 
