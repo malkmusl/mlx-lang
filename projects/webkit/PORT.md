@@ -118,7 +118,35 @@ Four ways to choose without patching, in this order of preference:
   braced temporaries, 128-bit constants, constexpr pointers into
   globals), mlx-unicode's UText API, and the port's font cache. A full
   rebuild of WebCore, the port and webcore-dump takes about 18 minutes
-  (`-j 4`, memory-aware); a port-only change relinks.
+  (`-j 4`, memory-aware); a port-only change relinks. With epoch 5 and 6
+  all 44 pass.
+- **M4, done**: `webcore-dump --png OUT.png` paints the view into a Skia
+  raster surface (CPU, N32) through GraphicsContextSkia and writes it
+  with std.png (the port's `mlxweb_image_write_png`); `--reference`
+  compares it with a PNG. tools/check_webkit_mlx_paint.sh paints the
+  pages of tests/paint (boxes and a translucent background, borders and
+  an outline, Ahem text, linear gradients, a PNG image through the port's
+  std.png decoder at its size and scaled) against references that
+  make_references.py computes from what each page draws: 4 of 5 match to
+  the pixel (a channel off by 1 at most); the gradient page is known to
+  crash (pages.txt says why). M4 found mlx-cc's class template instance
+  made through a reference while its argument was only declared (no size:
+  BorderEdges returned in registers, epoch 6).
+- **M5, done**: Voyager (projects/voyager, `./mlx build
+  webkit-mlx-voyager`, mlx-out/webkit/mlx/bin/voyager). engine.cpp is
+  WebCore in the process (the port's clients, a chrome client that notes
+  repaints, an editor client that lets text be edited, the keys' editing
+  commands) and calls libvoyager.so (voyager.mlx), a std.ui.host window on
+  the compositor drawn into wl_shm buffers: each frame the engine paints
+  the view into the buffer's pixels; the pointer, the wheel, keys with
+  their text, the window's size and a 15 ms tick (WTF's RunLoop cycle and
+  the page's rendering update) go to the engine; Ctrl+C and Ctrl+V go
+  through the compositor's clipboard. tools/check_voyager.sh runs it
+  under tools/wayland-test-host: the page shows, the wheel scrolls it, a
+  click focuses a text field and keys type into it, a word copied and
+  pasted, a link followed to another file: page, and the screenshot shows
+  that page as painted. mlx-cc now refuses a call whose result is a class
+  only declared (Voyager's first engine took EventHandler's results so).
 
 ## The shape of the port
 

@@ -21,14 +21,25 @@
 #include "Chrome.h"
 #include "DeprecatedGlobalSettings.h"
 #include "Document.h"
+#include "Element.h"
+#include "FrameSelection.h"
+#include "HitTestResult.h"
+#include "HitTestRequest.h"
 #include "Editor.h"
+#include "EditorClient.h"
 #include "EmptyClients.h"
+#include "KeyboardEvent.h"
+#include "SpellChecker.h"
+#include "TextCheckerClient.h"
+#include "UndoStep.h"
 #include "EventHandler.h"
+#include "EventNames.h"
 #include "FocusController.h"
 #include "FontRenderOptions.h"
 #include "FrameLoadRequest.h"
 #include "FrameLoader.h"
 #include "GraphicsContextSkia.h"
+#include "HandleUserInputEventResult.h"
 #include "LocalFrame.h"
 #include "LocalFrameInlines.h"
 #include "LocalFrameView.h"
@@ -107,6 +118,172 @@ private:
     bool& m_dirty;
 };
 
+// A key that types nothing: its DOM key, its Windows key code (WebCore's
+// key codes are Windows'), and the editing command it is in an editable
+// element (none: the page's).
+struct EditingKey {
+    unsigned code;
+    ASCIILiteral key;
+    int windowsKeyCode;
+    ASCIILiteral command;
+};
+
+constexpr EditingKey editingKeys[] = {
+    { 14, "Backspace"_s, 0x08, "DeleteBackward"_s },
+    { 15, "Tab"_s, 0x09, ""_s },
+    { 28, "Enter"_s, 0x0D, "InsertNewline"_s },
+    { 1, "Escape"_s, 0x1B, ""_s },
+    { 111, "Delete"_s, 0x2E, "DeleteForward"_s },
+    { 105, "ArrowLeft"_s, 0x25, "MoveLeft"_s },
+    { 103, "ArrowUp"_s, 0x26, "MoveUp"_s },
+    { 106, "ArrowRight"_s, 0x27, "MoveRight"_s },
+    { 108, "ArrowDown"_s, 0x28, "MoveDown"_s },
+    { 102, "Home"_s, 0x24, "MoveToBeginningOfLine"_s },
+    { 107, "End"_s, 0x23, "MoveToEndOfLine"_s },
+    { 104, "PageUp"_s, 0x21, "ScrollPageBackward"_s },
+    { 109, "PageDown"_s, 0x22, "ScrollPageForward"_s },
+};
+
+// The editor client: editing allowed (WebCore's empty one refuses every
+// selection and insertion), and the keys' default actions in an editable
+// element, as WPE's WebEditorClient has them: a key down runs its editing
+// command, a key press types its text. No undo, no spell checking yet.
+class VoyagerEditorClient final : public EditorClient {
+    WTF_MAKE_TZONE_ALLOCATED_INLINE(VoyagerEditorClient);
+    WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(VoyagerEditorClient);
+private:
+    bool shouldDeleteRange(const std::optional<SimpleRange>&) final { return true; }
+    bool smartInsertDeleteEnabled() final { return false; }
+    bool isSelectTrailingWhitespaceEnabled() const final { return false; }
+    bool isContinuousSpellCheckingEnabled() final { return false; }
+    void toggleContinuousSpellChecking() final { }
+    bool isGrammarCheckingEnabled() final { return false; }
+    void toggleGrammarChecking() final { }
+    int spellCheckerDocumentTag() final { return -1; }
+
+    bool shouldBeginEditing(const SimpleRange&) final { return true; }
+    bool shouldEndEditing(const SimpleRange&) final { return true; }
+    bool shouldInsertNode(Node&, const std::optional<SimpleRange>&, EditorInsertAction) final { return true; }
+    bool shouldInsertText(const String&, const std::optional<SimpleRange>&, EditorInsertAction) final { return true; }
+    bool shouldChangeSelectedRange(const std::optional<SimpleRange>&, const std::optional<SimpleRange>&, Affinity, bool) final { return true; }
+
+    bool shouldApplyStyle(const StyleProperties&, const std::optional<SimpleRange>&) final { return true; }
+    void didApplyStyle() final { }
+    bool shouldMoveRangeAfterDelete(const SimpleRange&, const SimpleRange&) final { return true; }
+
+    void didBeginEditing() final { }
+    void respondToChangedContents() final { }
+    void respondToChangedSelection(LocalFrame*) final { }
+    void updateEditorStateAfterLayoutIfEditabilityChanged() final { }
+    void discardedComposition(const Document&) final { }
+    void canceledComposition() final { }
+    void didUpdateComposition() final { }
+    void didEndEditing() final { }
+    void didEndUserTriggeredSelectionChanges() final { }
+    void willWriteSelectionToPasteboard(const std::optional<SimpleRange>&) final { }
+    void didWriteSelectionToPasteboard() final { }
+    void getClientPasteboardData(const std::optional<SimpleRange>&, Vector<std::pair<String, RefPtr<SharedBuffer>>>&) final { }
+    void requestCandidatesForSelection(const VisibleSelection&) final { }
+    void handleAcceptedCandidateWithSoftSpaces(TextCheckingResult) final { }
+
+    void registerUndoStep(UndoStep&) final { }
+    void registerRedoStep(UndoStep&) final { }
+    void clearUndoRedoOperations() final { }
+
+    DOMPasteAccessResponse requestDOMPasteAccess(DOMPasteAccessCategory, FrameIdentifier, const String&) final { return DOMPasteAccessResponse::DeniedForGesture; }
+
+    bool canCopyCut(LocalFrame*, bool defaultValue) const final { return defaultValue; }
+    bool canPaste(LocalFrame*, bool defaultValue) const final { return defaultValue; }
+    bool canUndo() const final { return false; }
+    bool canRedo() const final { return false; }
+    void undo() final { }
+    void redo() final { }
+
+    void handleKeyboardEvent(KeyboardEvent& event) final
+    {
+        auto* platformEvent = event.underlyingPlatformEvent();
+        RefPtr node = dynamicDowncast<Node>(event.target());
+        RefPtr frame = node ? node->document().frame() : nullptr;
+        if (!platformEvent || !frame)
+            return;
+        auto& editor = frame->editor();
+        if (event.type() == eventNames().keydownEvent) {
+            for (auto& key : editingKeys) {
+                if (key.windowsKeyCode == platformEvent->windowsVirtualKeyCode() && !key.command.isEmpty() && String(key.key) == platformEvent->key()) {
+                    if (editor.command(String(key.command)).execute(&event))
+                        event.setDefaultHandled();
+                    return;
+                }
+            }
+            return;
+        }
+        if (event.type() != eventNames().keypressEvent || platformEvent->controlKey() || platformEvent->altKey() || platformEvent->metaKey())
+            return;
+        // (A key's control character, a Backspace's or an Enter's, is its
+        // key down's command, not text.)
+        auto text = platformEvent->text();
+        if (text.isEmpty() || text[0] < 0x20 || text[0] == 0x7F)
+            return;
+        if (editor.insertText(text, &event))
+            event.setDefaultHandled();
+    }
+    void handleInputMethodKeydown(KeyboardEvent&) final { }
+
+    void textFieldDidBeginEditing(Element&) final { }
+    void textFieldDidEndEditing(Element&) final { }
+    void textDidChangeInTextField(Element&) final { }
+    bool doTextFieldCommandFromEvent(Element&, KeyboardEvent*) final { return false; }
+    void textWillBeDeletedInTextField(Element&) final { }
+    void textDidChangeInTextArea(Element&) final { }
+    void overflowScrollPositionChanged() final { }
+    void subFrameScrollPositionChanged() final { }
+
+    bool performTwoStepDrop(DocumentFragment&, const SimpleRange&, bool) final { return false; }
+
+#if USE(AUTOMATIC_TEXT_REPLACEMENT)
+    void showSubstitutionsPanel(bool) final { }
+    bool substitutionsPanelIsShowing() final { return false; }
+    void toggleSmartInsertDelete() final { }
+    bool isAutomaticQuoteSubstitutionEnabled() final { return false; }
+    void toggleAutomaticQuoteSubstitution() final { }
+    bool isAutomaticLinkDetectionEnabled() final { return false; }
+    void toggleAutomaticLinkDetection() final { }
+    bool isAutomaticDashSubstitutionEnabled() final { return false; }
+    void toggleAutomaticDashSubstitution() final { }
+    bool isAutomaticTextReplacementEnabled() final { return false; }
+    void toggleAutomaticTextReplacement() final { }
+    bool isAutomaticSpellingCorrectionEnabled() final { return false; }
+    void toggleAutomaticSpellingCorrection() final { }
+    bool isSmartListsEnabled() final { return false; }
+    void toggleSmartLists() { }
+#endif
+
+    TextCheckerClient* textChecker() final { return &m_textCheckerClient; }
+
+    void updateSpellingUIWithGrammarString(const String&, const GrammarDetail&) final { }
+    void updateSpellingUIWithMisspelledWord(const String&) final { }
+    void showSpellingUI(bool) final { }
+    bool spellingUIIsShowing() final { return false; }
+
+    void setInputMethodState(Element*) final { }
+
+    class NoTextChecker final : public TextCheckerClient {
+        bool shouldEraseMarkersAfterChangeSelection(TextCheckingType) const final { return true; }
+        void ignoreWordInSpellDocument(const String&) final { }
+        void learnWord(const String&) final { }
+        void checkSpellingOfString(StringView, int*, int*) final { }
+        void checkGrammarOfString(StringView, Vector<GrammarDetail>&, int*, int*) final { }
+#if USE(UNIFIED_TEXT_CHECKING)
+        Vector<TextCheckingResult> checkTextOfParagraph(StringView, OptionSet<TextCheckingType>, const VisibleSelection&) final { return { }; }
+#endif
+        void getGuessesForWord(const String&, const String&, const VisibleSelection&, Vector<String>&) final { }
+        void requestCheckingOfString(TextCheckingRequest& request, const VisibleSelection&) final { request.didCancel(); }
+        void requestExtendedCheckingOfString(TextCheckingRequest& request, const VisibleSelection&) final { request.didCancel(); }
+    };
+
+    NoTextChecker m_textCheckerClient;
+};
+
 struct Engine {
     RefPtr<Page> page;
     RefPtr<LocalFrame> frame;
@@ -118,6 +295,9 @@ struct Engine {
     IntPoint lastPressPosition;
     IntPoint pointerPosition;
     MouseButton pressedButton { MouseButton::None };
+    MonotonicTime lastUpdate;
+    // VOYAGER_TRACE in the environment: each event on standard error.
+    bool trace { false };
 };
 
 OptionSet<PlatformEvent::Modifier> modifiersOf(unsigned modifiers)
@@ -182,6 +362,14 @@ void engineResize(Engine* engine, int width, int height)
 int engineCycle(Engine* engine)
 {
     RunLoop::cycle();
+    // The page's rendering update (WebKit's display link: scroll and
+    // resize events, animation frames, intersection observers), at most
+    // every 30 ms.
+    auto now = MonotonicTime::now();
+    if (now - engine->lastUpdate >= 30_ms) {
+        engine->lastUpdate = now;
+        engine->page->isolatedUpdateRendering();
+    }
     if (RefPtr view = engine->frame->view()) {
         if (view->needsLayout())
             engine->dirty = true;
@@ -219,6 +407,8 @@ void enginePointer(Engine* engine, int kind, int x, int y, int button, unsigned 
 {
     IntPoint position(x, y);
     engine->pointerPosition = position;
+    if (engine->trace && kind != pointerMotion)
+        fprintf(stderr, "voyager: pointer %s %d at %d,%d\n", kind == pointerPress ? "press" : "release", button, x, y);
     auto& handler = engine->frame->eventHandler();
     auto now = MonotonicTime::now();
     if (kind == pointerPress) {
@@ -234,45 +424,27 @@ void enginePointer(Engine* engine, int kind, int x, int y, int button, unsigned 
         handler.handleMousePressEvent(PlatformMouseEvent(position, position, pressed, PlatformEvent::Type::MousePressed, engine->clickCount, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
     } else if (kind == pointerRelease)
         handler.handleMouseReleaseEvent(PlatformMouseEvent(position, position, buttonOf(button), PlatformEvent::Type::MouseReleased, engine->clickCount, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
-    else if (kind == pointerMotion)
+    if (engine->trace && kind == pointerRelease) {
+        auto& selection = engine->frame->selection().selection();
+        auto result = engine->frame->eventHandler().hitTestResultAtPoint(LayoutPoint(position), { HitTestRequest::Type::ReadOnly, HitTestRequest::Type::Active });
+        RefPtr node = result.innerNode();
+        fprintf(stderr, "voyager: selection none %d caret %d editable %d; hit %s\n", selection.isNone(), selection.isCaret(), !!selection.rootEditableElement(), node ? node->nodeName().utf8().data() : "nothing");
+    }
+    if (kind == pointerMotion)
         handler.handleMouseMoveEvent(PlatformMouseEvent(position, position, button ? buttonOf(button) : MouseButton::None, PlatformEvent::Type::MouseMoved, 0, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
     engine->dirty = true;
 }
 
 void engineWheel(Engine* engine, int x, int y, int deltaX, int deltaY)
 {
+    if (engine->trace)
+        fprintf(stderr, "voyager: wheel %d,%d at %d,%d\n", deltaX, deltaY, x, y);
     IntPoint position(x, y);
     // (WebCore's wheel deltas point the other way: positive scrolls up.)
     PlatformWheelEvent event(position, position, -deltaX, -deltaY, -deltaX / 40.0f, -deltaY / 40.0f, PlatformWheelEventGranularity::ScrollByPixelWheelEvent, false, false, false, false);
     engine->frame->eventHandler().handleWheelEvent(event, { WheelEventProcessingSteps::SynchronousScrolling, WheelEventProcessingSteps::BlockingDOMEventDispatch });
     engine->dirty = true;
 }
-
-// A key that types nothing: its DOM key, its Windows key code (WebCore's
-// key codes are Windows'), and the editing command it is in an editable
-// element (none: the page's).
-struct EditingKey {
-    unsigned code;
-    ASCIILiteral key;
-    int windowsKeyCode;
-    ASCIILiteral command;
-};
-
-constexpr EditingKey editingKeys[] = {
-    { 14, "Backspace"_s, 0x08, "DeleteBackward"_s },
-    { 15, "Tab"_s, 0x09, ""_s },
-    { 28, "Enter"_s, 0x0D, "InsertNewline"_s },
-    { 1, "Escape"_s, 0x1B, ""_s },
-    { 111, "Delete"_s, 0x2E, "DeleteForward"_s },
-    { 105, "ArrowLeft"_s, 0x25, "MoveLeft"_s },
-    { 103, "ArrowUp"_s, 0x26, "MoveUp"_s },
-    { 106, "ArrowRight"_s, 0x27, "MoveRight"_s },
-    { 108, "ArrowDown"_s, 0x28, "MoveDown"_s },
-    { 102, "Home"_s, 0x24, "MoveToBeginningOfLine"_s },
-    { 107, "End"_s, 0x23, "MoveToEndOfLine"_s },
-    { 104, "PageUp"_s, 0x21, "ScrollPageBackward"_s },
-    { 109, "PageDown"_s, 0x22, "ScrollPageForward"_s },
-};
 
 // A key pressed (DOWN 1) or released (0): CODE is its Linux key code, TEXT
 // what it types (UTF-8, empty for none). The page sees it first (keydown,
@@ -281,6 +453,8 @@ constexpr EditingKey editingKeys[] = {
 void engineKey(Engine* engine, int down, unsigned code, const char* text, unsigned modifiers)
 {
     String typed = text ? String::fromUTF8(text) : String();
+    if (engine->trace)
+        fprintf(stderr, "voyager: key %u %s \"%s\" modifiers %u\n", code, down ? "down" : "up", text ? text : "", modifiers);
     const EditingKey* editing = nullptr;
     for (auto& candidate : editingKeys) {
         if (candidate.code == code)
@@ -296,6 +470,12 @@ void engineKey(Engine* engine, int down, unsigned code, const char* text, unsign
     PlatformKeyboardEvent event(type, down ? typed : String(), down ? typed : String(), key, key, key, windowsKeyCode, false, false, false, modifiersOf(modifiers), MonotonicTime::now());
     bool handled = engine->frame->eventHandler().keyEvent(event);
     engine->dirty = true;
+    if (engine->trace && down) {
+        RefPtr focusedFrame = engine->page->focusController().focusedOrMainFrame();
+        RefPtr document = focusedFrame ? focusedFrame->document() : nullptr;
+        RefPtr element = document ? document->focusedElement() : nullptr;
+        fprintf(stderr, "voyager: key handled %d, focus %s, editable %d\n", handled, element ? element->localName().string().utf8().data() : "none", focusedFrame ? focusedFrame->editor().canEdit() : -1);
+    }
     if (!down || handled)
         return;
     RefPtr focused = engine->page->focusController().focusedOrMainFrame();
@@ -394,8 +574,10 @@ int main(int argc, char** argv)
 
     static Engine engine;
     engine.size = size;
+    engine.trace = getenv("VOYAGER_TRACE");
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
     configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine.dirty);
+    configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [size](auto&, auto& frameLoader) {
             auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, size);
@@ -444,7 +626,7 @@ int main(int argc, char** argv)
     arguments.append(canvas);
     arguments.append(nullptr);
     if (voyager_run(&table, argc, arguments.mutableSpan().data())) {
-        fprintf(stderr, "voyager: no window (is a Wayland compositor running? WAYLAND_DISPLAY)\n");
+        fprintf(stderr, "voyager: no window, or its connection ended (is a Wayland compositor running? WAYLAND_DISPLAY)\n");
         return 1;
     }
     return 0;

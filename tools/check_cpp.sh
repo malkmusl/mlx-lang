@@ -59,6 +59,20 @@ run stdlib "$work/stdlib_sep" "$work/stdlib_sep.out"
 cmp -s "$tests/stdlib.expected" "$work/stdlib_sep.out" || fail "stdlib from an object prints otherwise"
 echo "ok   a C++ object links with the library and runs"
 
+# A call whose result is a class declared only is an error (its size,
+# and so how the result comes back, is not known), but not in decltype.
+cat > "$work/incompleteresult.cpp" << 'EOF'
+class Result;
+Result handle(int);
+struct Holder { decltype(handle(1)) *pointer; };
+int use() { handle(2); return 0; }
+EOF
+if "$cc" -c -o "$work/incompleteresult.o" "$work/incompleteresult.cpp" 2> "$work/incompleteresult.err"; then
+    fail "a call whose result type is incomplete compiled"
+fi
+grep -q "incompleteresult.cpp:4: error: calling a function whose result type is incomplete" "$work/incompleteresult.err" || fail "a call whose result type is incomplete: $(head -3 "$work/incompleteresult.err")"
+echo "ok   a call whose result type is a class declared only is an error"
+
 # What an object holds: the inline, static and template functions and the
 # vtables its code or data refers to, not those only named by functions
 # never made (inlinereach.cpp).

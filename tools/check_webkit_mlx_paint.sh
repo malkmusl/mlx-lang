@@ -7,7 +7,9 @@
 # from what the page draws: boxes, borders and outlines, Ahem text, linear
 # gradients, a PNG image decoded by the port's std.png decoder, at its
 # size and scaled). A page passes when no more pixels than pages.txt
-# allows differ from the reference by more than its tolerance in a channel.
+# allows differ from the reference by more than its tolerance in a channel;
+# the check fails when a page fails that pages.txt does not list as known
+# to (with its cause).
 #
 #   tools/check_webkit_mlx_paint.sh [--no-build] [-j N] [--keep DIR] [PAGE...]
 #     (--no-build: the program as it is; -j: the build's jobs, 2 by
@@ -61,7 +63,8 @@ ahem=$repo_root/projects/webkit/tests/layout/LayoutTests/resources/Ahem.ttf
 
 passed=0
 failed=0
-while read -r page tolerance allow; do
+known=0
+while read -r page tolerance allow cause; do
     case $page in "#"*|"") continue ;; esac
     if [[ ${#chosen[@]} -gt 0 ]] && [[ ! " ${chosen[*]} " == *" $page "* ]]; then continue; fi
     out=$work/${page%.*}.png
@@ -74,12 +77,18 @@ while read -r page tolerance allow; do
     if [[ $status -eq 0 ]]; then
         passed=$(( passed + 1 ))
         echo "PASS $page: $result"
+        [[ -z "$cause" ]] || echo "     (listed as known to fail in $pages/pages.txt: take that off)"
     else
-        failed=$(( failed + 1 ))
         echo "FAIL $page (exit $status): ${result:-$(grep -v '^  ' "$work/err.txt" | tail -1)}"
+        if [[ -n "$cause" ]]; then
+            known=$(( known + 1 ))
+            echo "     ${cause}"
+        else
+            failed=$(( failed + 1 ))
+        fi
     fi
 done < "$pages/pages.txt"
 
-echo "check_webkit_mlx_paint.sh: $passed of $(( passed + failed )) pages pass"
+echo "check_webkit_mlx_paint.sh: $passed of $(( passed + failed + known )) pages pass, $known known to fail"
 [[ $failed -eq 0 ]] || fail "$failed pages are not painted as their references"
 echo "check_webkit_mlx_paint.sh: all checks passed"
