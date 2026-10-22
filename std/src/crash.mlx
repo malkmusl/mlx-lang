@@ -48,7 +48,15 @@
 //
 // The handler runs on a stack of its own, so a stack overflow is reported
 // too, and allocates nothing (it maps what it needs), so an exhausted
-// arena is reported as well. Freestanding, the message is the last line of
+// arena is reported as well. Naming a frame takes nothing of the
+// compiler's value arena (the demangler's tables and text are in the
+// data here), and what describing it takes is given back after each frame
+// where the arena is found: in mlxlibc, whose exports run on a 64 KiB
+// arena of their own frame (--stack-arena), the handler has those 64 KiB
+// for its whole run, and a deep stack of long C++ names took them all. Should naming a frame fail (a
+// fault in the handler itself), the handler runs again, says what it had
+// so far, the original crash's reason and the rest of the frames as bare
+// addresses, and ends the program as the original crash would have. Freestanding, the message is the last line of
 // the session log.
 
 // (No import of the std root: this module is in the compiler's own
@@ -66,6 +74,9 @@ const demangle = @import("./demangle.mlx")
 const SA_SIGINFO: usize = 4
 const SA_ONSTACK: usize = 134217728
 const SA_RESTORER: usize = 67108864
+// A fault in the handler runs it again (it knows it is in there: the
+// second time it says what it had and ends).
+const SA_NODEFER: usize = 1073741824
 // The handler's own stack: a stack overflow is one of the crashes to
 // report, and the handler could not run on the stack that overflowed.
 const HANDLER_STACK_SIZE: usize = 262144
@@ -105,6 +116,31 @@ const RECORD_AT: usize = 655360
 const PATH_AT: usize = 786432
 const TEXT_SIZE: usize = 131072
 const MAX_FRAMES: usize = 24
+
+// What a run of the handler that faults has done so far, for the run
+// that follows (failedWhileNaming): how many runs there are, the message
+// and record with every frame named until then, the frames, the next to
+// name, the exit status the crash has, the handler's room in the arena.
+var entered: usize = 0
+var reportMessage: usize = 0
+var reportMessageLength: usize = 0
+var reportRecord: usize = 0
+var reportRecordLength: usize = 0
+var reportFrames: [24]usize = undefined
+var reportFrameCount: usize = 0
+var reportFirstFrame: usize = 0
+var reportNext: usize = 0
+var reportStatus: usize = 0
+var reportRoom: usize = 0
+// The scratch memory and /proc/self/maps read into it: the run that
+// follows says the frames as files and offsets, naming nothing
+// (describe without names).
+var reportScratch: usize = 0
+var reportMapsLength: usize = 0
+var withoutNames: bool = false
+// tools/check_crash_report.sh: a fault while naming the first frame, to
+// see the report survive it.
+pub var faultWhileNaming: bool = false
 
 const SignalAction = struct {
     handler: usize
@@ -175,6 +211,9 @@ fn hexValue(byte: u8) -> usize { return @intCast(usize, text_module.hexValue(byt
 // The C-ABI handler (the kernel calls it with the signal, siginfo_t and
 // ucontext_t, on the handler stack). It never returns.
 export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void {
+    entered += 1
+    if entered > 1 { failedWhileNaming(signal, wordsAt(context)[RIP_OFFSET / 8]) }
+    reportStatus = 128 + @intCast(usize, signal)
     const registers = wordsAt(context)
     const rip = registers[RIP_OFFSET / 8]
     const rsp = registers[RSP_OFFSET / 8]
@@ -193,14 +232,19 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
         const room = mapped + SCRATCH_SIZE
         if room + ARENA_ROOM <= turns.end(arenaBase) { turns.moveFill(arenaBase, room) }
     }
+    reportRoom = mapped + SCRATCH_SIZE
     var scratch: [*]u8 = undefined
     unsafe { scratch = @ptrFromInt([*]u8, mapped) }
     const maps = offsetPointer(scratch, MAPS_AT)
     const maps_length = fs.readFile("/proc/self/maps".pointer, maps, MAPS_SIZE - 1)
+    reportScratch = mapped
+    reportMapsLength = maps_length
     const message = offsetPointer(scratch, MESSAGE_AT)
     const record = offsetPointer(scratch, RECORD_AT)
     var message_length: usize = 0
     var record_length: usize = 0
+    reportMessage = @intFromPtr(message)
+    reportRecord = @intFromPtr(record)
 
     // The program's name (the dock uses this too), from /proc/self/comm.
     var name: [32]u8 = undefined
@@ -304,11 +348,27 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
     }
     // A failure: from where fail() was called (fail itself is no news).
     const first_frame: usize = if failed_text != 0 && frame_count > 1 { 1 } else { 0 }
+    if failed_text != 0 { reportStatus = 1 }
+    var kept: usize = 0
+    while kept < frame_count {
+        reportFrames[kept] = frames[kept]
+        kept += 1
+    }
+    reportFrameCount = frame_count
+    reportFirstFrame = first_frame
     var index = first_frame
     while index < frame_count {
+        // (Should this frame's naming fail, the report so far.)
+        reportNext = index
+        reportMessageLength = message_length
+        reportRecordLength = record_length
+        // The values the naming makes are given back after it.
+        const fill = if arenaBase != 0 { turns.fillWord(arenaBase).* } else { 0 }
         put(message, &message_length, if index == first_frame { "  at " } else { "  from " })
         const shown_from = message_length
+        if faultWhileNaming && index == first_frame { storeAt(8) }
         describe(frames[index], index == 0, maps, maps_length, scratch, message, &message_length)
+        if arenaBase != 0 { turns.moveFill(arenaBase, fill) }
         put(record, &record_length, "\t")
         putBytes(record, &record_length, offsetPointer(message, shown_from), message_length - shown_from)
         // A recursion: the same call again and again, said once.
@@ -327,8 +387,67 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
     }
     _ = io.writeAllBytes(io.stderr(), message, message_length)
     diagnostics.keepCrash(diagnostics.Source.processor, record, record_length)
-    const status: usize = if failed_text != 0 { 1 } else { 128 + @intCast(usize, signal) }
-    linux.exitGroup(status)
+    linux.exitGroup(reportStatus)
+}
+
+fn storeAt(address: usize) -> void {
+    unsafe { @ptrFromInt(*usize, address).* = 1 }
+}
+
+// The handler faulted (`signal`) while naming a frame, and runs again:
+// the report as it was before that frame, the frames from there as their
+// addresses, what went wrong, then the end the crash itself has. A fault
+// here too ends the program at once.
+fn failedWhileNaming(signal: i32, rip: usize) -> void {
+    if entered > 2 || reportMessage == 0 {
+        if entered == 2 {
+            // Before the report had begun (no memory, no values left):
+            // the signal alone.
+            var line: [96]u8 = undefined
+            const bytes: [*]u8 = &line
+            var length: usize = 0
+            put(bytes, &length, "mlx: crashed: signal ")
+            putNumber(bytes, &length, if reportStatus > 128 { reportStatus - 128 } else { reportStatus })
+            put(bytes, &length, " (and the crash report failed before it could say more)\n")
+            _ = io.writeAllBytes(io.stderr(), bytes, length)
+        }
+        linux.exitGroup(if reportStatus != 0 { reportStatus } else { 128 + @intCast(usize, signal) })
+    }
+    // The handler's own room again (values the failed run left).
+    if arenaBase != 0 && reportRoom != 0 { turns.moveFill(arenaBase, reportRoom) }
+    var message: [*]u8 = undefined
+    unsafe { message = @ptrFromInt([*]u8, reportMessage) }
+    var record: [*]u8 = undefined
+    unsafe { record = @ptrFromInt([*]u8, reportRecord) }
+    var message_length = reportMessageLength
+    var record_length = reportRecordLength
+    // The frames as files and offsets (the maps the failed run read).
+    withoutNames = true
+    var scratch: [*]u8 = undefined
+    unsafe { scratch = @ptrFromInt([*]u8, reportScratch) }
+    const maps = offsetPointer(scratch, MAPS_AT)
+    if reportFrameCount == 0 {
+        // Before the frames: the reason line is all there is.
+        put(message, &message_length, "\n")
+    }
+    var index = reportNext
+    while index < reportFrameCount {
+        put(message, &message_length, if index == reportFirstFrame { "  at " } else { "  from " })
+        const shown_from = message_length
+        describe(reportFrames[index], index == 0, maps, reportMapsLength, scratch, message, &message_length)
+        put(record, &record_length, "\t")
+        putBytes(record, &record_length, offsetPointer(message, shown_from), message_length - shown_from)
+        put(message, &message_length, "\n")
+        index += 1
+    }
+    put(message, &message_length, "  (the report failed naming the frames: signal ")
+    putNumber(message, &message_length, @intCast(usize, signal))
+    put(message, &message_length, " at ")
+    describe(rip, true, maps, reportMapsLength, scratch, message, &message_length)
+    put(message, &message_length, " in the crash handler; the frames from there are unnamed)\n")
+    _ = io.writeAllBytes(io.stderr(), message, message_length)
+    diagnostics.keepCrash(diagnostics.Source.processor, record, record_length)
+    linux.exitGroup(reportStatus)
 }
 
 // What the program is doing, for the report: a crash (or a failure,
@@ -460,7 +579,7 @@ fn describe(address: usize, exact: bool, maps: [*]const u8, maps_length: usize, 
                     index += 1
                 }
                 path[index] = 0
-                if nameInFile(path, in_file, exact, out, out_length) { return }
+                if !withoutNames && nameInFile(path, in_file, exact, out, out_length) { return }
                 // The file's name and the offset in it.
                 var base = at
                 var scan = at
@@ -584,6 +703,11 @@ var cachedSymbolsSize: usize = 0
 var cachedStrings: usize = 0
 var cachedStringsSize: usize = 0
 const STT_FUNC: usize = 2
+// The demangler's tables and text: in the data, not values of the arena
+// (a crash may be the arena running out; a C++ program's long names
+// would take much of what the handler has).
+var demangleTables: demangle.Tables = undefined
+var demangledText: [1024]u8 = undefined
 const SHT_SYMTAB: usize = 2
 const SHT_DYNSYM: usize = 11
 
@@ -810,24 +934,24 @@ fn nameInImage(image: usize, size: usize, in_file: usize, exact: bool, out: [*]u
     putHex(out, out_length, if exact { address - start } else { address + 1 - start })
     // A C++ name: as it is written.
     if demangle.isMangled(name[0..length]) {
-        var text: [1024]u8 = undefined
-        const text_bytes: [*]u8 = &text
-        const written = demangle.demangle(name[0..length], text_bytes, 1024)
+        const text_bytes: [*]u8 = &demangledText
+        const written = demangle.demangleWith(name[0..length], text_bytes, 1024, &demangleTables)
         if written > 0 {
             put(out, out_length, " (")
             putBytes(out, out_length, text_bytes, written)
             put(out, out_length, ")")
         }
     }
-    lineInImage(image, size, address, start, out, out_length)
+    lineInImage(image, size, address, start, read64(image, symbol + 16), out, out_length)
     return true
 }
 
 // The line `address` is on, from the compiler's line table (.mlx_lines):
 // " at path:line" after the function's name. A table of where each
 // function was defined (MLXFUNCS, the one the linker makes of mlx-cc's
-// marks) says " defined at path:line", for the function at `start` only.
-fn lineInImage(image: usize, size: usize, address: usize, start: usize, out: [*]u8, out_length: *usize) -> void {
+// marks) says " defined at path:line", for the function at `start` only
+// (`extent` bytes long).
+fn lineInImage(image: usize, size: usize, address: usize, start: usize, extent: usize, out: [*]u8, out_length: *usize) -> void {
     const section_offset = read64(image, 40)
     const section_count = read16(image, 60)
     const names_index = read16(image, 62)
@@ -868,6 +992,7 @@ fn lineInImage(image: usize, size: usize, address: usize, start: usize, out: [*]
     if low == 0 || read32(image, entry) < start - text_address {
         if functions || low >= entries { return }
         entry = table + 16 + low * 12
+        if extent == 0 || read32(image, entry) >= start + extent - text_address { return }
     }
     const file = read32(image, entry + 4)
     const line = read32(image, entry + 8)
@@ -915,8 +1040,9 @@ pub fn install() -> bool {
         handler = @intFromPtr(mlxCompositorCrashed)
         restorer = @intFromPtr(mlxCompositorSignalReturn)
     }
-    // Not SA_NODEFER: a handler that crashes must not run again.
-    var action = SignalAction.{ .handler = handler, .flags = SA_SIGINFO | SA_ONSTACK | SA_RESTORER, .restorer = restorer, .mask = 0 }
+    // SA_NODEFER: a handler that faults runs again, and knows it
+    // (failedWhileNaming).
+    var action = SignalAction.{ .handler = handler, .flags = SA_SIGINFO | SA_ONSTACK | SA_RESTORER | SA_NODEFER, .restorer = restorer, .mask = 0 }
     var ok = true
     const signals: [7]usize = [7]usize{ linux.SIGILL, linux.SIGSEGV, linux.SIGBUS, linux.SIGFPE, linux.SIGABRT, linux.SIGTRAP, linux.SIGUSR2 }
     for signal in signals {
