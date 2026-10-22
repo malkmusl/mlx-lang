@@ -26,6 +26,9 @@ fail() {
     exit 1
 }
 export MLX_BUILD_CACHE=off
+# (What a step's turn gives back is overwritten: a value the runner kept
+# by mistake shows; std/src/build.mlx.)
+export MLX_ARENA_POISON=1
 
 tree="$work/tree"
 mkdir -p "$tree"
