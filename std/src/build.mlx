@@ -34,7 +34,11 @@
 // limits it (6G by default).
 //
 //     mlx build [STEP...]   build them (and what they need)
-//       -j N, --jobs=N      at most N jobs at once
+//       -j N, --jobs=N      at most N jobs at once, and only as many as
+//                           the memory has room for (each step expected
+//                           to take what it took last time, or what
+//                           build.mlx declared: std/src/build/memory.mlx)
+//       --no-memory-limit   -j jobs whatever the memory
 //       --force             build them even when current
 //       --dry-run           say what would be built
 //       --keep-going        go on after a step failed
@@ -57,6 +61,7 @@ const graph = @import("./build/graph.mlx")
 const cache = @import("./build/cache.mlx")
 const jobs = @import("./build/jobs.mlx")
 const store = @import("./build/store.mlx")
+const memory_module = @import("./build/memory.mlx")
 
 pub const Package = graph.Package
 pub const Builder = graph.Builder
@@ -78,6 +83,7 @@ pub fn setLine(b: *Builder, step: Step, line: []const u8) -> void { graph.setLin
 pub fn inputTree(b: *Builder, step: Step, directory: []const u8, suffix: []const u8) -> void { graph.inputTree(b, step, directory, suffix) }
 pub fn dependOn(b: *Builder, step: Step, other: Step) -> void { graph.dependOn(b, step, other) }
 pub fn cacheable(b: *Builder, step: Step) -> void { graph.cacheable(b, step) }
+pub fn memory(b: *Builder, step: Step, megabytes: usize) -> void { graph.memory(b, step, megabytes) }
 pub fn programEpoch(b: *Builder, step: Step, stamp: []const u8) -> void { graph.programEpoch(b, step, stamp) }
 pub fn add(b: *Builder, group_step: Step, step: Step) -> void { graph.addTo(b, group_step, step) }
 pub fn byDefault(b: *Builder, step: Step) -> void { graph.byDefault(b, step) }
@@ -252,8 +258,9 @@ fn renew(b: *Builder, arguments: [][*]const u8) -> u8 {
             return 1
         }
         var status: u8 = 0
-        var pid = jobs.waitAny(&status)
-        while pid != 0 && pid != runner.*.pid { pid = jobs.waitAny(&status) }
+        var peak: usize = 0
+        var pid = jobs.waitAny(&status, &peak)
+        while pid != 0 && pid != runner.*.pid { pid = jobs.waitAny(&status, &peak) }
         if !jobs.finish(b, runner, status) {
             jobs.showLog(b, runner, 40)
             say("mlx build: build.mlx did not compile (its log: mlx-out/build/logs/build.mlx.log)\n")
@@ -498,22 +505,39 @@ fn schedule(b: *Builder) -> u8 {
                 index += 1
             }
         }
-        // Start what is ready, the longest last build first.
+        // Start what is ready, the longest last build first, when its
+        // memory fits beside the running jobs' (memory.mlx); a step that
+        // does not fit waits for one to end.
         var settled = false
         while running < b.*.jobs && !stopped {
+            const room = memory_module.budget(b, running)
             var best = graph.NONE
+            var ready = false
             index = 0
             while index < b.*.nodeCount {
                 const item = graph.node(b, index)
                 if item.*.wanted && item.*.state == graph.STATE_WAITING && item.*.stale {
                     var rebuilt = false
                     if dependencies(b, item, &rebuilt) == 1 {
-                        if best == graph.NONE || item.*.took > graph.node(b, best).*.took { best = index }
+                        ready = true
+                        if memory_module.expected(item) <= room && (best == graph.NONE || item.*.took > graph.node(b, best).*.took) { best = index }
                     }
                 }
                 index += 1
             }
-            if best == graph.NONE { break }
+            if best == graph.NONE {
+                if ready {
+                    b.*.heldForMemory += 1
+                    if b.*.verbose {
+                        say("waiting: the ready steps' memory does not fit beside the ")
+                        sayNumber(running)
+                        say(" running (")
+                        sayNumber(room / 1024)
+                        say(" MiB left)\n")
+                    }
+                }
+                break
+            }
             const item = graph.node(b, best)
             crash.contextAt("starting step", item.*.name, 0)
             sayStart(item, &counts, false)
@@ -569,13 +593,16 @@ fn schedule(b: *Builder) -> u8 {
             continue
         }
         var status: u8 = 0
-        const pid = jobs.waitAny(&status)
+        var peak: usize = 0
+        const pid = jobs.waitAny(&status, &peak)
         if pid == 0 { break }
         index = 0
         while index < b.*.nodeCount {
             const item = graph.node(b, index)
             if item.*.state == graph.STATE_RUNNING && item.*.pid == pid {
                 running -= 1
+                if peak > 0 { item.*.peak = peak }
+                if peak > b.*.peakSeen { b.*.peakSeen = peak }
                 crash.contextAt("finishing step", item.*.name, 0)
                 if jobs.finish(b, item, status) {
                     item.*.state = graph.STATE_DONE
@@ -643,6 +670,16 @@ fn schedule(b: *Builder) -> u8 {
     }
     say(" (")
     saySeconds(took)
+    if b.*.heldForMemory > 0 {
+        say("; steps waited for memory ")
+        sayNumber(b.*.heldForMemory)
+        say(" times")
+    }
+    if b.*.peakSeen > 0 && counts.built > 0 {
+        say("; largest job ")
+        sayNumber(b.*.peakSeen / 1024)
+        say(" MiB")
+    }
     say(")\n")
     return if counts.failed == 0 && counts.skipped + left == 0 { 0 } else { 1 }
 }
@@ -694,6 +731,8 @@ pub fn run(arguments: [][*]const u8, package: Package, configure: fn(*Builder) -
             b.*.dryRun = true
         } else if std.text.same(argument, "--keep-going") || std.text.same(argument, "-k") {
             b.*.keepGoing = true
+        } else if std.text.same(argument, "--no-memory-limit") {
+            b.*.memoryAware = false
         } else if std.text.same(argument, "--retry-failed") {
             b.*.retryFailed = true
         } else if std.text.same(argument, "--verbose") || std.text.same(argument, "-v") {
@@ -915,7 +954,8 @@ fn verifyEpoch(b: *Builder) -> u8 {
         }
         if running == 0 { continue }
         var status: u8 = 0
-        const pid = jobs.waitAny(&status)
+        var peak: usize = 0
+        const pid = jobs.waitAny(&status, &peak)
         if pid == 0 { break }
         var at: usize = 0
         while at < total {

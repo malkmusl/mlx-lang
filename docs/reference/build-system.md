@@ -136,6 +136,7 @@ implemented: this repository has no packages from elsewhere.
 ./mlx build desktop login        # groups or single steps by name
 ./mlx build --list               # the groups and steps
 ./mlx build -j 8 --verbose       # eight jobs; name the current steps too
+./mlx build --no-memory-limit    # -j jobs whatever the memory
 ./mlx build --dry-run            # what would be built
 ./mlx build --force mlx-sh       # build it even when it is current
 ./mlx build --keep-going         # go on after a step failed
@@ -354,7 +355,28 @@ is byte for byte the main checkout's), and mlx-cc's `__DATE__` and
 ### Jobs
 
 Jobs run side by side, as many as there are processors unless `-j` says
-otherwise, the step whose last build took longest first. Each job's output
+otherwise, the step whose last build took longest first, and only as many
+as the memory has room for (`std/src/build/memory.mlx`): a step is
+expected to take its peak resident memory of the last time it ran (the
+child's `ru_maxrss` from `wait4`, kept in its manifest and its result
+cache entry beside the time it took, `took MS PEAK_KIB`), an eighth more,
+or, before it ever ran, what build.mlx declared with `Build.memory(b,
+step, MEGABYTES)` (projects/webkit declares 4 GB for a WebCore unit, 2 GB
+for JavaScriptCore's, 1 GB for the others'); nothing known, no limit. A
+job starts only when that fits in what is available now: MemAvailable
+(what other processes take, another build beside this one included, is
+out of it already), or less when the cgroup's limit says so, less a
+margin of an eighth of the memory (at least 1 GiB), less what the running
+jobs are still expected to grow by (their expectation less their
+resident memory now). A ready step that does not fit waits for a running
+job to end; with none running it starts anyway. So `-j 4` (the default
+on four processors) is safe for WebKit, whose units take 1 to 4 GB: the
+build runs as many as fit instead of being killed (exit 137) or being
+held at `-j 2` throughout. The summary says how often steps waited for
+memory and the largest job's peak; `--no-memory-limit` starts `-j` jobs
+whatever the memory. (Jobs are started by vfork, and a child's
+`ru_maxrss` counts the runner's resident memory until its execve, about
+280 MB: a job smaller than that is recorded as that.) Each job's output
 goes to `mlx-out/build/logs/NAME.log`, shown when the step fails. After a
 failure no new job starts (the running ones finish) unless `--keep-going`.
 
