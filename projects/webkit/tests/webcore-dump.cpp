@@ -2,7 +2,7 @@
 // printed (PORT.md, M3), as WebKit's test runners print a layout test's
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--timeout SECONDS] FILE|URL
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--timeout SECONDS] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
 // strategies and loader; WebCore's empty clients for the rest) with a main
@@ -80,7 +80,7 @@ static void debugBacktrace(int signal, siginfo_t*, void* context)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--timeout SECONDS] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--timeout SECONDS] FILE|URL\n");
     return 2;
 }
 
@@ -137,6 +137,7 @@ int main(int argc, char** argv)
 {
     IntSize viewSize(800, 600);
     bool script = true;
+    bool subpixel = false;
     double timeout = 60;
     Vector<const char*> fonts;
     const char* target = nullptr;
@@ -151,6 +152,8 @@ int main(int argc, char** argv)
             viewSize = IntSize(width, height);
         } else if (!strcmp(argv[i], "--no-script"))
             script = false;
+        else if (!strcmp(argv[i], "--subpixel"))
+            subpixel = true;
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
             timeout = atof(argv[++i]);
         else if (argv[i][0] == '-' || target)
@@ -237,6 +240,10 @@ int main(int argc, char** argv)
         // it: images loaded, text areas resizable.)
         settings.setLoadsImagesAutomatically(true);
         settings.setTextAreasAreResizable(true);
+        // --subpixel: the boxes' sizes as they are, not enclosing integer
+        // rectangles (RenderTreeAsText does so with the layer-based SVG
+        // engine on, for a page with an <svg> root).
+        settings.setLayerBasedSVGEngineEnabled(subpixel);
 
         Run run;
         run.frame = page->localMainFrame();
