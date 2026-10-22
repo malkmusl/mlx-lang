@@ -295,7 +295,7 @@ units (lever 5), brings a WebCore unit under 2 GB resident.
    and would let `-j 4` hold for WebCore on 15 GB.
 3. The prefix snapshot (lever 5): 1.7 GB and 26 s (before this branch;
    now less) of every WebCore unit's 4.15 GB and 53 s are the same
-   prefix.
+   prefix. (Done: "Results: prefix snapshot" below.)
 4. For a 40-minute full build on four cores (1250 units): the average
    unit must take ~8 s of processor time; the average was ~30 s (6.4 h
    at `-j 2`) and is ~12 s now if the units gained what the two
@@ -441,7 +441,8 @@ spread: the accessors' loads (`get32`, `getWord`, `putText`: cache
 misses on a 4 GB arena), `instanceKey`, the overload machinery, the
 constraint evaluations. None is a walk any more. The large constant
 left is the prefix: 25.8 s and 1.7 GB of every WebCore unit (stage 2
-above). A design for the snapshot, not done:
+above). A design for the snapshot (done, with the changes "Results: prefix
+snapshot" below says):
 
 1. **Make the arena's address fixed** (base.init: `mmap` with a hint
    and `MAP_FIXED_NOREPLACE`, failing the run if taken), so that every
@@ -596,6 +597,238 @@ unread bodies are gone), and `__mlxcc_init_unit`'s frame is smaller
 in reading order, so a lambda in an inline function has another number
 in its mangled name than before (as before, the number is the unit's,
 not the program's).
+
+## Results: prefix snapshot (branch mlxcc-prefix, 2026-10-22)
+
+Stage 5 of the list above, done: `mlx-cc --write-prefix-snapshot SNAP
+FLAGS -include P.h` writes the compiler's state after the `-include`
+files; `mlx-cc --prefix-snapshot SNAP FLAGS -include P.h -c unit.cpp`
+maps it back and reads only the unit's own file
+(compiler/cc/snapshot.mlx, compiler/cc/README.md "Prefix snapshots").
+Measured as the memory branch did (the child's `getrusage`: user and
+system time, peak resident set; MLX_CC_STATS, which now also prints the
+peak and the private and file-backed resident sets at the end), one
+compile at a time, beside a full WebKit build at `-j 3` on the same
+machine, with the Mlx port's flags and the generated headers of that
+build (scratchpad `pfx/`: flags.py, one.sh, final.sh, mem2.sh).
+
+### What a snapshot is
+
+- **The arena** (every token, node, type, object, binding, macro,
+  name, file text and table of the compilation): it is now mapped at a
+  fixed address, 0x300000000000, with MAP_FIXED_NOREPLACE (anywhere,
+  and no snapshots, when that is taken), so the addresses it holds are
+  valid in another run of the same binary. The file holds its used
+  pages, zero pages left as holes; a reader maps them MAP_PRIVATE and
+  MAP_FIXED over its own arena, so they come from the page cache, shared
+  by the units built at once, and are copied only where a unit writes.
+- **Every module-level variable** of the compiler's 28 modules with
+  state (about 470: the name table's and file table's addresses, scope
+  heads and stacks, the macro table, pending and deferred bodies, the
+  template instance tables, the lambda and instance counters and
+  per-context lambda numbers, the include search's remembered answers,
+  `#pragma once` marks, `-MD`'s list), by address and size: each module
+  has a `keepState()` that tools/cc_snapshot_state.py writes from its
+  declarations, and check_cc.sh fails when one is out of date, so a new
+  variable is in the snapshot unless its line says `// (per run)`.
+  The per-run ones: the arena's own bookkeeping, the object writer's
+  encoder (its buffers are the process's heap), the link's inputs and
+  libraries, -s and the map path, the MLX_CC_STATS counts, the
+  constexpr trace switch.
+- **Not the run's own memory.** Everything the command line makes (the
+  file names, -D and -I texts, the link's inputs) is allocated in a side
+  region after the arena (base.beginSide), and the include directories
+  and macros are given to the compiler after the command line was read.
+  So the arena when the prefix starts is the same in every run with the
+  same options, whatever `-o`, `-MF` or the file are, which is what makes
+  a snapshot valid for every unit of a target.
+
+What changed in the compiler to make that true, in every run (with a
+snapshot or without, so the objects are the same either way):
+
+- **The unit is read in two parts**: the -include files are
+  preprocessed and parsed, then the file is preprocessed and parsed
+  (before, the whole unit was preprocessed, then parsed). A snapshot is
+  the state between the two; the writer refuses when the prefix ends
+  inside a namespace, `extern "C"` or a block.
+- **The prefix does not depend on the unit**: the file's path is given
+  to the compiler after the prefix (decl.startUnit), and while the
+  prefix is read the unit's hash, which names its lambdas' closure
+  classes and its unnamed namespace (`_GLOBAL__N_...`), is the hash of
+  the prefix's identity (its options in order, the language). A prefix
+  lambda's class is then the same class in every unit of the target,
+  which is right: it is the same lambda of the same header. Lambdas
+  numbered in their context (the Itanium `UlvE_` numbers) continue from
+  the restored tables; the unnamed namespace is named when first opened.
+  The unit's globals made by the prefix carry file 0 (a message about
+  one names the unit). The prefix's warnings are kept and said again by
+  a reader.
+- **`-MD`'s text is made in the side memory, at once.** It was joined a
+  name at a time, the whole text again for each of a WebCore unit's
+  ~3000 headers: 2.3 GB of arena for JSDOMWindow.cpp (peak 5.8 → 3.5 GB)
+  — and its size, which the object's name changes, moved everything
+  after it in the arena. That mattered because **objects hold compiler
+  addresses**: words of data the constant evaluator filled and a
+  relocation then names (JSDOMWindowTable's `values`) keep the
+  evaluator's own pointer (a tagged arena address). The linker
+  overwrites them (RELA), so programs are right, but two runs whose
+  arenas differ make objects that differ there (JSDOMWindow.cpp with
+  `-o x.plain.o` and `-o x.snap.o` did, before the fix). Zeroing those
+  words in program.mlx broke tests/gnuforms.c, so some path reads them:
+  left as it is, to look at (it is why the arena layout must be
+  identical, not just equivalent).
+
+### How a reader checks it (else it reads the prefix and says why)
+
+- **The key**, compared as text: a hash of the compiler's binary and its
+  path (which finds the system headers), the working directory, the
+  language, `MLX_CC_INCLUDE` and `MLX_CC_READ_ALL_BODIES`, and every
+  option that changes the compilation in its order (-I, -isystem, -D, -U,
+  -include, -std=, and any option mlx-cc does not know); not -o, -c, -E,
+  -MD/-MMD/-MF/-MT/-MQ, -x (the file's language is in the key), -L, -l,
+  the link's options or the files. The note names the first line that
+  differs (`another command line or compiler: option -std=c++17`; the
+  measurement scripts' first memory runs were refused for `in <another
+  directory>`).
+- **The variables' layout**: the same addresses and sizes.
+- **Every file the prefix read**: read again, its size and a hash of its
+  contents compared. A file written again with the same contents has
+  another inode: its `#pragma once` mark follows it (a regenerated
+  header that did not change does not cost the snapshot).
+- **The include search's answers**: for each include directory (and
+  each directory a quoted #include looked next to its file in), its
+  modification time and identity. Where one changed, every name the
+  search did not find there, before where it was found, is looked for
+  again (a header new there would now be found first), the one found
+  there must still be there, and a quoted include's miss next to its
+  file must still miss. (Clang's PCH checks the files read, not the
+  misses.)
+
+tools/check_cpp.sh: the six tests of two files (lambda names in inline
+functions and initializers, explicit instantiations in another file,
+statics of inline functions, typedef names of unnamed classes, constexpr
+members) compiled with their header as the prefix, from a snapshot and
+without, objects compared and the program run; four programs cut before
+`main` (deleting destructors, explicit instantiation definitions,
+generic lambdas, member templates in the prefix) likewise; a changed
+header, a header the search would now find first, and other options are
+refused (and the object is the one made without), while a header written
+again with the same contents and a new header in a directory the search
+never reaches are not.
+
+### The build
+
+projects/webkit/build.mlx `usePrefixSnapshot(set, flags)`: for JSC's,
+PAL's and WebCore's C++ flags, one step per (target, flag set) runs
+`mlx-cc --write-prefix-snapshot OBJDIR/prefix.snapshot -MD -MF ...
+FLAGS -x c++`; it names mlx-cc as its input (the snapshot is the
+compiler's memory: any change of the binary makes it again) and the
+prefix's headers by its depfile. Every unit compiled with those flags
+(the same flags text) gets `--prefix-snapshot` and runs after the step
+(`dependOn`), but the snapshot is not one of the unit's inputs: an
+object made with it is the object made without it, so it is in no
+object's key, and a unit whose snapshot is stale reads its prefix itself.
+std.build gets `uncached(step)` (a command with a depfile stays out of
+the result cache): the snapshots are 0.8–1.7 GB each (sparse: 0.1–1 GB
+on disk) and would push the objects out of its 6 GB. WTF has no
+`-include` in its flags (its prefix, config.h, is 0.26 s of a 1.6 s
+unit) and Skia and bmalloc have no common prefix: unchanged. With
+branch build-incremental's codegen epoch: this branch changes objects
+(the prefix's lambda names, the arena's layout in the words above), so
+the epoch must be bumped when the two meet; the snapshot step should
+keep keying on mlx-cc's bytes, not the epoch.
+
+### The numbers
+
+The snapshots (written by the step above; their `-MD` file lists the
+prefix's headers):
+
+| Prefix | Read and written | Size (on disk) | Taken up (an empty unit) | Read (an empty unit, no snapshot) |
+|---|---|---|---|---|
+| WTF `-include config.h` | 0.3 s user, 0.4 s sys | 817 MB (96 MiB) | 0.01 s, 0.03 s | 0.16 s, 0.10 s |
+| JSC `JavaScriptCorePrefix.h` | 3.4 s, 3.3 s | 1.40 GB (703 MiB) | 0.27 s user, 0.22 s sys | 4.1 s, 0.6 s |
+| WebCore `WebCorePrefix.h` + `MlxPrefix.h` | 6.2 s, 5.1 s | 1.68 GB (981 MiB) | 0.33 s, 0.31 s | 5.8 s, 1.1 s |
+
+(Taking one up is mostly the check: reading and hashing the prefix's
+~1000 headers. Writing is the prefix read once more plus the pages
+written.)
+
+The units, user time / peak resident set, without and with the snapshot;
+every object byte for byte the same, and the `-MD` files the same
+(compiler 6ba601c; 8cf4046, which only names a snapshot's first
+-include file once in its `-MD` file, rechecked on WTFString, JSC
+runtime-1, WebCore css-1 and workers-2: the same):
+
+| Unit | Without | With | |
+|---|---|---|---|
+| WTF `wtf/text/WTFString.cpp` (`-include config.h`) | 1.33 s / 399 MiB | 1.07 s / 391 MiB | |
+| JSC, 11 units (runtime-1, -20, API-1, bytecode-1, dfg-1, b3-1, heap-1, jit-1, parser-1, wasm-1, yarr-1) | 4.21 s / 849 MiB (mean; 3.6–5.2 s) | 0.86 s / 579 MiB (0.23–1.98 s) | 4.9× |
+| WebCore `UnifiedSource-workers-2.cpp` | 17.4 s / 2526 MiB | 12.6 s / 2208 MiB | |
+| `css-1` | 9.5 s / 1539 MiB | 4.9 s / 1193 MiB | |
+| `html-3` | 10.0 s / 1388 MiB | 3.2 s / 1061 MiB | |
+| `rendering-5` | 12.7 s / 1709 MiB | 6.6 s / 1384 MiB | |
+| `page-2` | 15.5 s / 2224 MiB | 11.3 s / 1907 MiB | |
+| `loader-1` | 8.9 s / 1356 MiB | 2.7 s / 1024 MiB | |
+| `platform-10` | 7.5 s / 1113 MiB | 0.9 s / 758 MiB | |
+| `JSBindings-5` | 19.4 s / 2568 MiB | 13.2 s / 2393 MiB | |
+| `svg-2` | 15.0 s / 2077 MiB | 9.6 s / 1754 MiB | |
+| `dom-7` (the largest) | 33.9 s / 4014 MiB | 29.4 s / 3708 MiB | |
+| `JSDOMWindow.cpp` | 27.9 s / 3508 MiB | 20.2 s / 3338 MiB | |
+| WebCore, the 11: mean user + sys | 18.3 s | 11.7 s | 1.6× |
+
+So a WebCore unit saves 4–8 s of user time (5.7 s on average, the
+prefix being 5.8 s) and 0.9 s of system time, and a JSC unit 3.4 s of
+its 4.8 s; what is left of a small unit (platform-10, most JSC units) is
+its own code. The peak drops
+by the part of the prefix the unit never touches; the private memory
+(MLX_CC_STATS at the end) by more, since the pages a unit only reads stay
+the page cache's, one copy for all the units built at once:
+
+| Unit | Without: peak (private) | With: peak (private + snapshot pages) |
+|---|---|---|
+| WTFString.cpp | 399 MiB (398) | 390 MiB (361 + 29) |
+| JSC runtime-1 | 1011 MiB (1009) | 748 MiB (520 + 228) |
+| WebCore workers-2 | 2528 MiB (2527) | 2198 MiB (1852 + 346) |
+| JSDOMWindow.cpp | 3512 MiB (3510) | 3336 MiB (2838 + 498) |
+| dom-7 | 4020 MiB (4018) | 3707 MiB (3351 + 356) |
+
+### What it gives the full build
+
+The Mlx port's library objects: WebCore 584, JSC 207, PAL 5 (snapshot
+steps), WTF 172, bmalloc 168, Skia 835 (no common prefix, unchanged).
+From the sample's means (user + system per unit; the WebCore sample
+holds the two largest units, so it is if anything heavy):
+
+| | Units | Without | With |
+|---|---|---|---|
+| WebCore | 584 | 18.3 s each: 10 690 s | 11.7 s: 6 830 s (+ 11 s for the snapshot) |
+| JavaScriptCore | 207 | 4.8 s: 1 000 s | 1.2 s: 240 s (+ 7 s) |
+| together, CPU | | 3.25 h | 1.97 h (−39%) |
+| at `-j 3` | | 65 min | 39 min |
+| at `-j 4` | | 49 min | 30 min |
+
+(WTF, bmalloc, Skia and the links come on top of both columns, as they
+are.) Whether `-j 4` holds is the memory: with the snapshot a WebCore
+unit's private memory is about 0.67 GB less than without it (workers-2
+1.8 GB, dom-7 3.3 GB; the sample's peaks 0.76–3.7 GB, ~1.7 GB typical)
+plus the snapshot's pages once for all of them (≤ 0.5 GB), so four units
+fit in 15 GB unless three of the largest (dom-7, JSDOMWindow,
+inspector-6, css-19) run together.
+
+### Found on the way
+
+- **mlx4's inliner captures names**: a function inlined into its caller
+  reads the caller's local where its own module has a variable of the
+  same name. `other.mlx`: `var dirs: usize = 7` and `pub fn get(index:
+  usize) -> usize { return dirs + index }`; a caller with `const dirs =
+  arguments.length` and `other.get(0)` gets 1, not 7, at the default
+  level and at -O3 (scratchpad `inl/`). snapshot.mlx's first version
+  crashed on it (`paths.directoryName` inlined into a function with a
+  local `dirs`); its names are now apart. Any caller in mlx-cc with a
+  local named like an inlined callee's module variable is affected:
+  worth fixing in ir/inline.mlx before it bites silently.
+- The `-MD` text and the compiler addresses in relocated data words
+  (above).
 
 ## Allocators (notes, 2026-10-21; nothing changed yet)
 
