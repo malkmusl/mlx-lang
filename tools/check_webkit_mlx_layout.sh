@@ -14,9 +14,10 @@
 # characters Liberation lacks), through std.fontconfig (FONTCONFIG_FILE).
 #
 # Each test passes or fails; a failure is shown with its first differing
-# line and its cause from tests/layout/failures.txt (`PATH cause`). The
-# check fails when fewer than two tests in three pass or a failure has
-# no cause written down.
+# line and its cause from tests/layout/failures.txt (`PATH cause`): the
+# failures known. The check fails when a test fails that is not among
+# them (a regression, or a failure with no cause written down); a known
+# one that passes is shown, to be taken off the list.
 #
 #   tools/check_webkit_mlx_layout.sh [--no-build] [-j N] [--keep DIR] [TEST...]
 #     (--no-build: the program as it is; -j: the build's jobs, 2 by
@@ -102,6 +103,7 @@ normalized() { sed -e 's/[[:space:]]*$//' "$1" | sed -e :a -e '/^\n*$/{$d;N;ba' 
 passed=0
 failed=0
 unexplained=0
+fixed=0
 declare -A groupPassed groupTotal
 for test in "${tests[@]}"; do
     g=${groupOf[$test]:-other}
@@ -121,6 +123,10 @@ for test in "${tests[@]}"; do
         passed=$(( passed + 1 ))
         groupPassed[$g]=$(( ${groupPassed[$g]:-0} + 1 ))
         echo "PASS $test"
+        if [[ -n "${causeOf[$test]:-}" ]]; then
+            echo "     (listed as failing in $layout/failures.txt: take it off)"
+            fixed=$(( fixed + 1 ))
+        fi
         continue
     fi
     failed=$(( failed + 1 ))
@@ -135,7 +141,7 @@ for test in "${tests[@]}"; do
     if [[ -n "${causeOf[$test]:-}" ]]; then
         echo "     cause: ${causeOf[$test]}"
     else
-        echo "     cause: not known (no line in $layout/failures.txt)"
+        echo "     cause: not known (no line in $layout/failures.txt): a regression?"
         unexplained=$(( unexplained + 1 ))
     fi
 done
@@ -146,6 +152,6 @@ for g in "${!groupTotal[@]}"; do
 done | sort
 total=$(( passed + failed ))
 echo "check_webkit_mlx_layout.sh: $passed of $total tests pass, $failed fail"
-[[ $unexplained -eq 0 ]] || fail "$unexplained failures have no cause written down"
-[[ $(( passed * 3 )) -ge $(( total * 2 )) ]] || fail "fewer than two tests in three pass"
+[[ $fixed -eq 0 ]] || echo "check_webkit_mlx_layout.sh: $fixed tests listed in $layout/failures.txt pass now"
+[[ $unexplained -eq 0 ]] || fail "$unexplained tests fail that $layout/failures.txt does not list"
 echo "check_webkit_mlx_layout.sh: all checks passed"

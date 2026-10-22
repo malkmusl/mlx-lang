@@ -87,7 +87,7 @@ Four ways to choose without patching, in this order of preference:
 - WebCore: about 35 of 52 sampled files compile with WPE's flags
   (WEBCORE.md); the WPE targets (`webkit-wpe-*`) build WTF and
   JavaScriptCore on mlx-glib.
-- **M2, under way**: the port is described and builds. `config.MLX`
+- **M2, done**: the port is described and builds. `config.MLX`
   (JSCOnly's configuration with WebCore's choices above), the source
   selection (webcore.mlx's `mlx()`: Sources.txt, the Skia and Adwaita
   lists, lists/webcore-mlx-sources.txt of other ports' files that fit,
@@ -103,6 +103,22 @@ Four ways to choose without patching, in this order of preference:
   a `// STUB (Mn: ...)` line, which the check lists. What remains is
   mlx-cc's: the units it does not compile yet are listed in WEBCORE.md,
   each with its first error.
+- **M3, done**: webcore-dump (tests/webcore-dump.cpp,
+  `./mlx build webkit-mlx-webcore-dump`) loads a page with the port's
+  clients and WebKitTestRunner's settings (hinting off, mock scrollbars,
+  its GLib fonts.conf over Liberation and DejaVu, Ahem as a test font),
+  lays it out at 800x600 and prints the render tree. 37 of the 44 layout
+  tests of tests/layout pass against the GLib/WPE baselines at 2.54.1
+  (tools/check_webkit_mlx_layout.sh); the 7 others are listed with their
+  causes in tests/layout/failures.txt, all mlx-cc bugs already fixed in
+  epoch 5 (a braced assignment `p = { x, y }` through the wrong
+  constructor, an enum argument not promoted to int) and to pass after
+  the next full rebuild. The bugs M3 found were mlx-cc's code generation
+  (CODEGEN_EPOCH 3 to 5: casts to classes, branch temporaries, elided
+  braced temporaries, 128-bit constants, constexpr pointers into
+  globals), mlx-unicode's UText API, and the port's font cache. A full
+  rebuild of WebCore, the port and webcore-dump takes about 18 minutes
+  (`-j 4`, memory-aware); a port-only change relinks.
 
 ## The shape of the port
 

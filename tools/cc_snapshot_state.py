@@ -19,8 +19,9 @@ import sys
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "compiler", "cc")
 # Programs of their own (mlx-cheaders, mlx-ar) and the two that hold no
-# state of the compilation.
-SKIP = {"cheaders.mlx", "ar.mlx", "main.mlx", "snapshot.mlx"}
+# state of the compilation; the code index's, which belongs to an
+# indexing run (main.mlx reads no snapshot while indexing).
+SKIP = {"cheaders.mlx", "ar.mlx", "main.mlx", "snapshot.mlx", "index.mlx"}
 BEGIN = "// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---"
 END = "// --- end of prefix snapshot state ---"
 VAR = re.compile(r"^(?:pub )?var ([A-Za-z_][A-Za-z0-9_]*)\b")
