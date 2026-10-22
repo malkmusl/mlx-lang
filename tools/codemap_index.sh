@@ -73,7 +73,7 @@ own() {
 # them), each run to /dev/null with the index on.
 build() {
   local lines
-  lines=$(./mlx build --dry-run --verbose --force "$@" 2>/dev/null | grep '^    ' | grep -E '(^|/)mlx-cc ' | grep -e ' -c ')
+   lines=$(./mlx build --dry-run --verbose --force "$@" 2>&1 | grep '^    ' | grep -E '(^|/)mlx-cc ' | grep -e ' -c ')
   [[ -n "$lines" ]] || { echo "codemap_index.sh: no compile commands in $*" >&2; return; }
   local running=0
   local line
