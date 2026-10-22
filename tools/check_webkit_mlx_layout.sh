@@ -10,7 +10,8 @@
 #
 # The fonts are WebKitTestRunner's: Ahem as a test font (--font), the
 # families of its GLib fonts.conf (tests/layout/fonts.conf) over the
-# system's Liberation fonts, through std.fontconfig (FONTCONFIG_FILE).
+# system's Liberation and DejaVu fonts (DejaVu Sans the fallback for
+# characters Liberation lacks), through std.fontconfig (FONTCONFIG_FILE).
 #
 # Each test passes or fails; a failure is shown with its first differing
 # line and its cause from tests/layout/failures.txt (`PATH cause`). The
@@ -56,10 +57,13 @@ program=$repo_root/mlx-out/webkit/mlx/bin/webcore-dump
 # The fonts: Liberation's directory, WebKitTestRunner's families, Ahem.
 serif=$(find /usr/share/fonts /usr/local/share/fonts -name LiberationSerif-Regular.ttf 2> /dev/null | head -1)
 [[ -n "$serif" ]] || fail "no Liberation fonts (LiberationSerif-Regular.ttf) in /usr/share/fonts"
+dejavu=$(find /usr/share/fonts /usr/local/share/fonts -name DejaVuSans.ttf 2> /dev/null | head -1)
+[[ -n "$dejavu" ]] || fail "no DejaVu fonts (DejaVuSans.ttf) in /usr/share/fonts: the test runner's fallback"
 cat > "$work/fonts.conf" << EOF
 <?xml version="1.0"?>
 <fontconfig>
     <dir>$(dirname "$serif")</dir>
+    <dir>$(dirname "$dejavu")</dir>
     <include>$repo_root/$layout/fonts.conf</include>
 </fontconfig>
 EOF

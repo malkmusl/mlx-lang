@@ -2,7 +2,7 @@
 // printed (PORT.md, M3), as WebKit's test runners print a layout test's
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--timeout SECONDS] FILE|URL
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
 // strategies and loader; WebCore's empty clients for the rest) with a main
@@ -39,7 +39,13 @@
 #include "LocalFrameView.h"
 #include "Page.h"
 #include "PageConfiguration.h"
+#include "InlineIteratorInlineBox.h"
+#include "InlineIteratorTextBox.h"
+#include "LayoutIntegrationLineLayout.h"
+#include "RenderInline.h"
+#include "RenderText.h"
 #include "RenderTreeAsText.h"
+#include "RenderView.h"
 #include "ResourceRequest.h"
 #include "Settings.h"
 #include "port/MlxWebPort.h"
@@ -79,9 +85,33 @@ static void debugBacktrace(int signal, siginfo_t*, void* context)
     _exit(99);
 }
 
+// --boxes: after the tree, each inline's boxes and each text's boxes as
+// the inline layout made them, unrounded (where the tree's integers come
+// from).
+static void dumpInlineBoxes(const RenderElement& root)
+{
+    for (CheckedPtr renderer = root.firstChild(); renderer; renderer = renderer->nextInPreOrder(&root)) {
+        if (auto* inlineRenderer = dynamicDowncast<RenderInline>(*renderer)) {
+            if (auto* layout = LayoutIntegration::LineLayout::containing(*inlineRenderer)) {
+                auto rect = layout->enclosingBorderBoxRectFor(*inlineRenderer);
+                printf("border box %s: x %.6f y %.6f width %.6f height %.6f\n", inlineRenderer->renderName().characters(), rect.x().toFloat(), rect.y().toFloat(), rect.width().toFloat(), rect.height().toFloat());
+            }
+            for (auto box = InlineIterator::lineLeftmostInlineBoxFor(*inlineRenderer); box; box.traverseInlineBoxLineRightward()) {
+                auto rect = box->visualRectIgnoringBlockDirection();
+                printf("inline box %s: x %.6f y %.6f width %.6f height %.6f\n", inlineRenderer->renderName().characters(), rect.x(), rect.y(), rect.width(), rect.height());
+            }
+        } else if (auto* text = dynamicDowncast<RenderText>(*renderer)) {
+            for (auto& box : InlineIterator::textBoxesFor(*text)) {
+                auto rect = box.visualRectIgnoringBlockDirection();
+                printf("text box \"%s\": x %.6f y %.6f width %.6f height %.6f\n", box.originalText().substring(box.start(), box.end() - box.start()).toString().utf8().data(), rect.x(), rect.y(), rect.width(), rect.height());
+            }
+        }
+    }
+}
+
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--timeout SECONDS] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS] FILE|URL\n");
     return 2;
 }
 
@@ -139,6 +169,7 @@ int main(int argc, char** argv)
     IntSize viewSize(800, 600);
     bool script = true;
     bool subpixel = false;
+    bool boxes = false;
     double timeout = 60;
     Vector<const char*> fonts;
     const char* target = nullptr;
@@ -155,6 +186,8 @@ int main(int argc, char** argv)
             script = false;
         else if (!strcmp(argv[i], "--subpixel"))
             subpixel = true;
+        else if (!strcmp(argv[i], "--boxes"))
+            boxes = true;
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
             timeout = atof(argv[++i]);
         else if (argv[i][0] == '-' || target)
@@ -278,6 +311,8 @@ int main(int argc, char** argv)
         String tree = externalRepresentation(run.frame.get());
         auto utf8 = tree.utf8();
         fwrite(utf8.data(), 1, utf8.length(), stdout);
+        if (boxes && run.frame->contentRenderer())
+            dumpInlineBoxes(*run.frame->contentRenderer());
         fflush(stdout);
         mainClient->setLoadFinishedCallback(nullptr);
         run.frame = nullptr;
