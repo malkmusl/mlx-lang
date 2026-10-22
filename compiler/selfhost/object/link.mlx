@@ -18,8 +18,11 @@
 const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
 const mem = @import("../../../std/bootstrap/mem.mlx")
 const vector = @import("../../../std/bootstrap/vector.mlx")
+const fs = @import("../../../std/bootstrap/fs.mlx")
+const elf = @import("../../../std/bootstrap/elf.mlx")
 const encoder_module = @import("../backend/x86_64/encoder.mlx")
 const x86 = @import("../backend/x86_64/target.mlx")
+const elf64 = @import("./elf64.mlx")
 const elf64_dynamic = @import("./elf64_dynamic.mlx")
 const relocatable = @import("./relocatable.mlx")
 const archive = @import("./archive.mlx")
@@ -79,6 +82,10 @@ pub const Linker = struct {
     errorLength: usize
     errorNamePointer: [*]const u8
     errorNameLength: usize
+    // Whether the program goes without its symbol table (-s,
+    // --strip-all), and where _start's code ends.
+    stripped: bool
+    startEnd: usize
 }
 
 fn newVector(allocator: Allocator, element_size: usize, element_alignment: usize, capacity: usize) -> *vector.Vector {
@@ -105,7 +112,13 @@ pub fn initAt(linker: *Linker, allocator: Allocator, enc: *encoder_module.Encode
     linker.*.inits = newVector(allocator, 8, 8, 8)
     linker.*.errorLength = 0
     linker.*.errorNameLength = 0
+    linker.*.stripped = false
+    linker.*.startEnd = 0
 }
+
+// -s, --strip-all: the program is written without .symtab, .strtab and
+// .mlx_lines.
+pub fn setStripped(linker: *Linker, stripped: bool) -> void { linker.*.stripped = stripped }
 
 fn fail(linker: *Linker, message: []const u8, name: [*]const u8, name_length: usize) -> bool {
     if linker.*.errorLength != 0 { return false }
@@ -706,6 +719,7 @@ fn genStart(linker: *Linker) -> void {
 pub fn link(linker: *Linker) -> bool {
     if !resolve(linker) { return false }
     genStart(linker)
+    linker.*.startEnd = encoder_module.pos(linker.*.enc)
     place(linker)
     if !relocate(linker) { return false }
     if !genInit(linker) { return false }
@@ -726,8 +740,609 @@ pub fn writeProgram(linker: *Linker, needed: [*]const [*]const u8, needed_count:
     var naming = elf64_dynamic.noNaming()
     naming.interpreterPointer = interpreter
     naming.interpreterLength = interpreter_length
-    if !elf64_dynamic.writeExecutableNamed(linker.*.allocator, linker.*.enc, needed, needed_count, naming, output) {
-        return fail(linker, "cannot write", output, 0)
+    if linker.*.stripped {
+        if !elf64_dynamic.writeExecutableNamed(linker.*.allocator, linker.*.enc, needed, needed_count, naming, output) {
+            return fail(linker, "cannot write", output, 0)
+        }
+        return true
+    }
+    const image = elf64_dynamic.build(linker.*.allocator, linker.*.enc, needed, needed_count, false, naming)
+    if !image.valid { return fail(linker, "out of memory writing", output, 0) }
+    const shape = elf64_dynamic.layout(linker.*.enc, needed, needed_count, naming)
+    var tables: Tables = undefined
+    if !buildTables(linker, &tables, elf64.LOAD_VADDR + shape.textOffset, elf64.LOAD_VADDR + shape.mlxDataOffset) { return false }
+    const wrote = writeWithTables(linker, image.buffer, image.size, shape.sectionOffset, &tables, output)
+    linker.*.allocator.free(image.buffer, image.size, 8)
+    freeTables(linker, &tables)
+    if !wrote { return fail(linker, "cannot write", output, 0) }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The symbol table
+//
+// The program's .symtab and .strtab, written with it (unless -s): every
+// function and variable (STT_FUNC, STT_OBJECT) the objects linked define,
+// local and global, with its binding, type and size, at its address in
+// the program; a section symbol for .text and one for .data; the linker's
+// own code (_start, __mlxcc_init, NAME@plt for each import's stub). The
+// locals come first (sh_info is the first global's index). A global is
+// the definition the program uses: a weak one another object's strong one
+// replaced is left out (its code is never called). A function its object
+// gives no size (mlx-cc's do not) gets the distance to the next function
+// of its section. Each name is kept once in .strtab (a table by the
+// names' hashes, which the objects' symbols carry already): one pass over
+// the objects' symbols, then a sort of the line table.
+//
+// .mlx_lines, the line table the Mlx compiler writes too (see
+// symbol_table.mlx for its form), comes from the objects' `@at PATH:LINE`
+// symbols: mlx-cc marks the start of each function it compiles with one
+// (where the function was defined), so the table has an entry at each
+// function's start and the crash report (std.crash) says the file and
+// line of the function. The hook for a line table of each statement: an
+// object would carry more marks (the first instruction of each line),
+// and they would come in here the same way.
+
+const STT_OBJECT: u8 = 1
+const STT_FUNC: u8 = 2
+const STT_SECTION: u8 = 3
+const SYMBOL_SIZE: usize = 24
+const SECTION_HEADER_SIZE: usize = 64
+// elf64_dynamic's sections: .text is the sixth, .data (the data area)
+// the ninth.
+const TEXT_SECTION: usize = 6
+const DATA_SECTION: usize = 9
+// A stub: jmp [rip + slot], two int3.
+const STUB_SIZE: usize = 8
+const MARK_PREFIX_LENGTH: usize = 4
+const OFFSET_BITS: usize = 40
+const OFFSET_MASK: usize = 1099511627775
+
+pub const Tables = struct {
+    // The symbols' records: the null one and the locals from the start,
+    // the globals from the end of the room, moved after the locals once
+    // all are in.
+    symbols: [*]u8
+    room: usize
+    localCount: usize
+    globalCount: usize
+    strings: [*]u8
+    stringLength: usize
+    stringCapacity: usize
+    // The names in .strtab: open addressing by hash; a slot holds the
+    // hash and the name's offset + 1 (0: free).
+    hashes: [*]usize
+    offsets: [*]usize
+    slots: usize
+    // The line table's entries, two words each (the code offset, then
+    // file << 32 | line), and the files: their paths (each ended by a
+    // NUL), where each starts, and a table by hash (file + 1; 0: free).
+    entries: [*]usize
+    entryCount: usize
+    entryRoom: usize
+    paths: [*]u8
+    pathLength: usize
+    pathCapacity: usize
+    fileStarts: [*]usize
+    fileCount: usize
+    fileHashes: [*]usize
+    fileSlots: [*]usize
+    fileSlotCount: usize
+    // .mlx_lines as written (0 bytes: none).
+    lines: [*]u8
+    lineLength: usize
+    // The starts of the functions of the object being looked through
+    // (section << OFFSET_BITS | offset), sorted, for their sizes.
+    starts: [*]usize
+    startRoom: usize
+}
+
+fn words(linker: *Linker, count: usize) -> [*]usize {
+    const memory = linker.*.allocator.alloc(count * 8 + 8, 8)
+    unsafe {
+        if memory == null { return @ptrFromInt([*]usize, 0) }
+        return @ptrCast([*]usize, memory.?)
+    }
+}
+
+fn freeWords(linker: *Linker, memory: [*]usize, count: usize) -> void {
+    unsafe { linker.*.allocator.free(@ptrCast([*]u8, memory), count * 8 + 8, 8) }
+}
+
+fn powerAbove(count: usize) -> usize {
+    var capacity: usize = 16
+    while capacity < count * 2 + 2 { capacity *= 2 }
+    return capacity
+}
+
+// Whether `symbol` is mlx-cc's mark of where a function was defined:
+// a local `@at PATH:LINE` (no C or C++ name has a space).
+fn isMark(symbol: *relocatable.Symbol) -> bool {
+    if symbol.*.binding != relocatable.LOCAL || symbol.*.nameLength <= MARK_PREFIX_LENGTH { return false }
+    const text = symbol.*.namePointer
+    return text[0] == 64 && text[1] == 97 && text[2] == 116 && text[3] == 32
+}
+
+// Heap sort of `count` elements of `stride` words, by their first word.
+fn swapElements(list: [*]usize, stride: usize, first: usize, second: usize) -> void {
+    var word: usize = 0
+    while word < stride {
+        const kept = list[first * stride + word]
+        list[first * stride + word] = list[second * stride + word]
+        list[second * stride + word] = kept
+        word += 1
+    }
+}
+
+fn siftDown(list: [*]usize, stride: usize, start: usize, end: usize) -> void {
+    var root = start
+    while root * 2 + 1 < end {
+        var child = root * 2 + 1
+        if child + 1 < end && list[(child + 1) * stride] > list[child * stride] { child += 1 }
+        if list[root * stride] >= list[child * stride] { return }
+        swapElements(list, stride, root, child)
+        root = child
+    }
+}
+
+fn sortElements(list: [*]usize, count: usize, stride: usize) -> void {
+    if count < 2 { return }
+    var start = count / 2
+    while start > 0 {
+        start -= 1
+        siftDown(list, stride, start, count)
+    }
+    var end = count
+    while end > 1 {
+        end -= 1
+        swapElements(list, stride, 0, end)
+        siftDown(list, stride, 0, end)
+    }
+}
+
+fn growStrings(linker: *Linker, t: *Tables, more: usize) -> bool {
+    if t.*.stringLength + more <= t.*.stringCapacity { return true }
+    var capacity = t.*.stringCapacity * 2
+    while capacity < t.*.stringLength + more { capacity *= 2 }
+    const memory = linker.*.allocator.alloc(capacity, 8)
+    if memory == null { return false }
+    mem.copy(memory.?, t.*.strings, t.*.stringLength)
+    linker.*.allocator.free(t.*.strings, t.*.stringCapacity, 8)
+    t.*.strings = memory.?
+    t.*.stringCapacity = capacity
+    return true
+}
+
+// Appends `length` bytes of `text`, `suffix` and a NUL to .strtab;
+// where they start (NONE: out of memory).
+fn appendName(linker: *Linker, t: *Tables, text: [*]const u8, length: usize, suffix: []const u8) -> usize {
+    if !growStrings(linker, t, length + suffix.length + 1) { return NONE }
+    const start = t.*.stringLength
+    mem.copy(t.*.strings + start, text, length)
+    var index = length
+    for byte in suffix {
+        t.*.strings[start + index] = byte
+        index += 1
+    }
+    t.*.strings[start + index] = 0
+    t.*.stringLength = start + index + 1
+    return start
+}
+
+// The offset of the name `text` in .strtab, added the first time (NONE:
+// out of memory).
+fn nameOffset(linker: *Linker, t: *Tables, text: [*]const u8, length: usize, hash: usize) -> usize {
+    const mask = t.*.slots - 1
+    var slot = hash & mask
+    while t.*.offsets[slot] != 0 {
+        const known = t.*.offsets[slot] - 1
+        if t.*.hashes[slot] == hash && known + length < t.*.stringLength && t.*.strings[known + length] == 0 && mem.eql(t.*.strings + known, text, length) { return known }
+        slot = (slot + 1) & mask
+    }
+    const start = appendName(linker, t, text, length, "")
+    if start == NONE { return NONE }
+    t.*.hashes[slot] = hash
+    t.*.offsets[slot] = start + 1
+    return start
+}
+
+fn putSymbol(t: *Tables, local: bool, name_offset: usize, info: u8, section: usize, value: usize, size: usize) -> void {
+    var index: usize = 0
+    if local {
+        t.*.localCount += 1
+        index = t.*.localCount
+    } else {
+        t.*.globalCount += 1
+        index = t.*.room - t.*.globalCount
+    }
+    const at = index * SYMBOL_SIZE
+    elf.writeU32(t.*.symbols, at, @intCast(u32, name_offset))
+    t.*.symbols[at + 4] = info
+    t.*.symbols[at + 5] = 0
+    elf.writeU16(t.*.symbols, at + 6, @intCast(u16, section))
+    elf.writeU64(t.*.symbols, at + 8, @intCast(u64, value))
+    elf.writeU64(t.*.symbols, at + 16, @intCast(u64, size))
+}
+
+// The line table's entry for a mark `@at PATH:LINE` at `offset` in the
+// code. False when out of memory.
+fn addMark(linker: *Linker, t: *Tables, symbol: *relocatable.Symbol, offset: usize) -> bool {
+    const text = symbol.*.namePointer
+    const length = symbol.*.nameLength
+    var colon = length
+    while colon > MARK_PREFIX_LENGTH && text[colon - 1] != 58 { colon -= 1 }
+    if colon <= MARK_PREFIX_LENGTH + 1 { return true }
+    var line: usize = 0
+    var at = colon
+    while at < length {
+        if text[at] < 48 || text[at] > 57 { return true }
+        line = line * 10 + @intCast(usize, text[at] - 48)
+        at += 1
+    }
+    const path_length = colon - 1 - MARK_PREFIX_LENGTH
+    const path = text + MARK_PREFIX_LENGTH
+    const hash = relocatable.hashName(path, path_length)
+    // The file: known by its path, else added.
+    const mask = t.*.fileSlotCount - 1
+    var slot = hash & mask
+    var file = NONE
+    while t.*.fileSlots[slot] != 0 && file == NONE {
+        const candidate = t.*.fileSlots[slot] - 1
+        const known = t.*.fileStarts[candidate]
+        if t.*.fileHashes[slot] == hash && known + path_length < t.*.pathLength && t.*.paths[known + path_length] == 0 && mem.eql(t.*.paths + known, path, path_length) {
+            file = candidate
+        } else {
+            slot = (slot + 1) & mask
+        }
+    }
+    if file == NONE {
+        if t.*.pathLength + path_length + 1 > t.*.pathCapacity {
+            var capacity = t.*.pathCapacity * 2
+            while capacity < t.*.pathLength + path_length + 1 { capacity *= 2 }
+            const memory = linker.*.allocator.alloc(capacity, 8)
+            if memory == null { return false }
+            mem.copy(memory.?, t.*.paths, t.*.pathLength)
+            linker.*.allocator.free(t.*.paths, t.*.pathCapacity, 8)
+            t.*.paths = memory.?
+            t.*.pathCapacity = capacity
+        }
+        file = t.*.fileCount
+        t.*.fileStarts[file] = t.*.pathLength
+        mem.copy(t.*.paths + t.*.pathLength, path, path_length)
+        t.*.paths[t.*.pathLength + path_length] = 0
+        t.*.pathLength += path_length + 1
+        t.*.fileCount += 1
+        t.*.fileHashes[slot] = hash
+        t.*.fileSlots[slot] = file + 1
+    }
+    t.*.entries[t.*.entryCount * 2] = offset
+    t.*.entries[t.*.entryCount * 2 + 1] = (file << 32) | (line & 4294967295)
+    t.*.entryCount += 1
+    return true
+}
+
+// The first function start after `key` (NONE: none) of the `count`
+// sorted ones.
+fn startAfter(starts: [*]usize, count: usize, key: usize) -> usize {
+    var low: usize = 0
+    var high = count
+    while low < high {
+        const middle = (low + high) / 2
+        if starts[middle] <= key { low = middle + 1 } else { high = middle }
+    }
+    return if low < count { starts[low] } else { NONE }
+}
+
+fn outOfMemory(linker: *Linker) -> bool { return fail(linker, "out of memory for the symbol table", name(""), 0) }
+
+// Builds the tables of the program the linker made, its code at
+// `text_base` and its data area at `data_base`. False with the error set.
+fn buildTables(linker: *Linker, t: *Tables, text_base: usize, data_base: usize) -> bool {
+    const allocator = linker.*.allocator
+    // How many symbols can go in, how many marks, the most symbols of an
+    // object.
+    var defined: usize = 0
+    var marks: usize = 0
+    var name_bytes: usize = 0
+    var largest: usize = 0
+    var index: usize = 0
+    while index < objectCount(linker) {
+        const object = objectAt(linker, index)
+        index += 1
+        if !object.*.included { continue }
+        const count = relocatable.symbolCount(object)
+        if count > largest { largest = count }
+        var s: usize = 0
+        while s < count {
+            const symbol = relocatable.symbolAt(object, s)
+            s += 1
+            if symbol.*.section == NONE || symbol.*.section == relocatable.ABSOLUTE { continue }
+            if isMark(symbol) {
+                marks += 1
+            } else {
+                defined += 1
+                name_bytes += symbol.*.nameLength + 1
+            }
+        }
+    }
+    const stubs = linker.*.stubs.*.length
+    // The null symbol, two section symbols, _start and __mlxcc_init.
+    t.*.room = defined + stubs + 5
+    t.*.localCount = 0
+    t.*.globalCount = 0
+    // (Room for every name once: .strtab does not grow but for the
+    // stubs' names.)
+    t.*.stringCapacity = name_bytes + 65536
+    t.*.stringLength = 1
+    t.*.slots = powerAbove(defined + 8)
+    t.*.entryRoom = marks + 1
+    t.*.entryCount = 0
+    t.*.pathCapacity = 4096
+    t.*.pathLength = 0
+    t.*.fileCount = 0
+    t.*.fileSlotCount = powerAbove(marks + 1)
+    t.*.lineLength = 0
+    t.*.startRoom = largest + 1
+    const symbols_memory = allocator.alloc(t.*.room * SYMBOL_SIZE, 8)
+    const strings_memory = allocator.alloc(t.*.stringCapacity, 8)
+    const paths_memory = allocator.alloc(t.*.pathCapacity, 8)
+    if symbols_memory == null || strings_memory == null || paths_memory == null { return outOfMemory(linker) }
+    t.*.symbols = symbols_memory.?
+    t.*.strings = strings_memory.?
+    t.*.paths = paths_memory.?
+    t.*.hashes = words(linker, t.*.slots)
+    t.*.offsets = words(linker, t.*.slots)
+    t.*.entries = words(linker, t.*.entryRoom * 2)
+    t.*.fileStarts = words(linker, t.*.entryRoom)
+    t.*.fileHashes = words(linker, t.*.fileSlotCount)
+    t.*.fileSlots = words(linker, t.*.fileSlotCount)
+    t.*.starts = words(linker, t.*.startRoom)
+    if @intFromPtr(t.*.hashes) == 0 || @intFromPtr(t.*.offsets) == 0 || @intFromPtr(t.*.entries) == 0 || @intFromPtr(t.*.fileStarts) == 0 || @intFromPtr(t.*.fileHashes) == 0 || @intFromPtr(t.*.fileSlots) == 0 || @intFromPtr(t.*.starts) == 0 { return outOfMemory(linker) }
+    mem.zero(t.*.symbols, SYMBOL_SIZE)
+    t.*.strings[0] = 0
+    var slot: usize = 0
+    while slot < t.*.slots {
+        t.*.offsets[slot] = 0
+        slot += 1
+    }
+    slot = 0
+    while slot < t.*.fileSlotCount {
+        t.*.fileSlots[slot] = 0
+        slot += 1
+    }
+    // The sections, then the linker's own code.
+    putSymbol(t, true, 0, STT_SECTION, TEXT_SECTION, text_base, 0)
+    putSymbol(t, true, 0, STT_SECTION, DATA_SECTION, data_base, 0)
+    const code_length = encoder_module.pos(linker.*.enc)
+    const start_name = nameOffset(linker, t, name("_start"), 6, relocatable.hashName(name("_start"), 6))
+    if start_name == NONE { return outOfMemory(linker) }
+    putSymbol(t, false, start_name, (relocatable.GLOBAL << 4) | STT_FUNC, TEXT_SECTION, text_base, linker.*.startEnd)
+    const init = encoder_module.findSymbol(linker.*.enc, name("__mlxcc_init"), 12)
+    if init.0 {
+        const init_name = nameOffset(linker, t, name("__mlxcc_init"), 12, relocatable.hashName(name("__mlxcc_init"), 12))
+        if init_name == NONE { return outOfMemory(linker) }
+        putSymbol(t, true, init_name, STT_FUNC, TEXT_SECTION, text_base + init.1, code_length - init.1)
+    }
+    index = 0
+    while index < stubs {
+        unsafe {
+            const stub = @ptrCast(*Stub, vector.Vector.at(linker.*.stubs.*, index))
+            const stub_name = appendName(linker, t, stub.*.namePointer, stub.*.nameLength, "@plt")
+            if stub_name == NONE { return outOfMemory(linker) }
+            putSymbol(t, true, stub_name, STT_FUNC, TEXT_SECTION, text_base + stub.*.offset, STUB_SIZE)
+        }
+        index += 1
+    }
+    // The objects' functions and variables, and the marks.
+    index = 0
+    while index < objectCount(linker) {
+        const object = objectAt(linker, index)
+        const object_index = index
+        index += 1
+        if !object.*.included { continue }
+        const count = relocatable.symbolCount(object)
+        // Where its functions start, for the sizes it does not give.
+        var starts: usize = 0
+        var s: usize = 0
+        while s < count {
+            const symbol = relocatable.symbolAt(object, s)
+            s += 1
+            if symbol.*.section == NONE || symbol.*.section == relocatable.ABSOLUTE { continue }
+            if symbol.*.kind != STT_FUNC && !isMark(symbol) { continue }
+            if relocatable.sectionAt(object, symbol.*.section).*.kind != relocatable.TEXT { continue }
+            t.*.starts[starts] = (symbol.*.section << OFFSET_BITS) | symbol.*.value
+            starts += 1
+        }
+        sortElements(t.*.starts, starts, 1)
+        s = 0
+        while s < count {
+            const symbol_index = s
+            const symbol = relocatable.symbolAt(object, s)
+            s += 1
+            if symbol.*.section == NONE || symbol.*.section == relocatable.ABSOLUTE || symbol.*.nameLength == 0 { continue }
+            const section = relocatable.sectionAt(object, symbol.*.section)
+            if isMark(symbol) {
+                if section.*.kind == relocatable.TEXT && !addMark(linker, t, symbol, section.*.placed + symbol.*.value) { return outOfMemory(linker) }
+                continue
+            }
+            if symbol.*.kind != STT_FUNC && symbol.*.kind != STT_OBJECT { continue }
+            var shndx: usize = 0
+            var address: usize = 0
+            if section.*.kind == relocatable.TEXT {
+                shndx = TEXT_SECTION
+                address = text_base + section.*.placed + symbol.*.value
+            } else if section.*.kind == relocatable.DATA || section.*.kind == relocatable.BSS {
+                shndx = DATA_SECTION
+                address = data_base + section.*.placed + symbol.*.value
+            } else {
+                continue
+            }
+            const global = isGlobal(symbol)
+            if global {
+                // Only the definition the program uses.
+                const known = tableFind(linker, symbol.*.namePointer, symbol.*.nameLength, symbol.*.nameHash)
+                if known.0 != object_index || known.1 != symbol_index { continue }
+            }
+            var size = symbol.*.size
+            if size == 0 && symbol.*.kind == STT_FUNC && section.*.kind == relocatable.TEXT {
+                const next = startAfter(t.*.starts, starts, (symbol.*.section << OFFSET_BITS) | symbol.*.value)
+                if next != NONE && next >> OFFSET_BITS == symbol.*.section {
+                    size = (next & OFFSET_MASK) - symbol.*.value
+                } else if section.*.length > symbol.*.value {
+                    size = section.*.length - symbol.*.value
+                }
+            }
+            const name_offset = nameOffset(linker, t, symbol.*.namePointer, symbol.*.nameLength, symbol.*.nameHash)
+            if name_offset == NONE { return outOfMemory(linker) }
+            putSymbol(t, !global, name_offset, (symbol.*.binding << 4) | symbol.*.kind, shndx, address, size)
+        }
+    }
+    // The globals after the locals.
+    const first_global = t.*.localCount + 1
+    if t.*.globalCount > 0 && first_global < t.*.room - t.*.globalCount {
+        mem.copy(t.*.symbols + first_global * SYMBOL_SIZE, t.*.symbols + (t.*.room - t.*.globalCount) * SYMBOL_SIZE, t.*.globalCount * SYMBOL_SIZE)
+    }
+    // The line table: the entries by offset, then the files' paths.
+    if t.*.entryCount > 0 {
+        sortElements(t.*.entries, t.*.entryCount, 2)
+        t.*.lineLength = 16 + t.*.entryCount * 12 + t.*.pathLength
+        const memory = allocator.alloc(t.*.lineLength, 8)
+        if memory == null { return outOfMemory(linker) }
+        t.*.lines = memory.?
+        var magic_index: usize = 0
+        for byte in "MLXLINES" {
+            t.*.lines[magic_index] = byte
+            magic_index += 1
+        }
+        elf.writeU32(t.*.lines, 8, @intCast(u32, t.*.entryCount))
+        elf.writeU32(t.*.lines, 12, @intCast(u32, t.*.fileCount))
+        var entry: usize = 0
+        while entry < t.*.entryCount {
+            const at = 16 + entry * 12
+            elf.writeU32(t.*.lines, at, @intCast(u32, t.*.entries[entry * 2] & 4294967295))
+            elf.writeU32(t.*.lines, at + 4, @intCast(u32, t.*.entries[entry * 2 + 1] >> 32))
+            elf.writeU32(t.*.lines, at + 8, @intCast(u32, t.*.entries[entry * 2 + 1] & 4294967295))
+            entry += 1
+        }
+        mem.copy(t.*.lines + 16 + t.*.entryCount * 12, t.*.paths, t.*.pathLength)
     }
     return true
+}
+
+fn freeTables(linker: *Linker, t: *Tables) -> void {
+    const allocator = linker.*.allocator
+    allocator.free(t.*.symbols, t.*.room * SYMBOL_SIZE, 8)
+    allocator.free(t.*.strings, t.*.stringCapacity, 8)
+    allocator.free(t.*.paths, t.*.pathCapacity, 8)
+    if t.*.lineLength > 0 { allocator.free(t.*.lines, t.*.lineLength, 8) }
+    freeWords(linker, t.*.hashes, t.*.slots)
+    freeWords(linker, t.*.offsets, t.*.slots)
+    freeWords(linker, t.*.entries, t.*.entryRoom * 2)
+    freeWords(linker, t.*.fileStarts, t.*.entryRoom)
+    freeWords(linker, t.*.fileHashes, t.*.fileSlotCount)
+    freeWords(linker, t.*.fileSlots, t.*.fileSlotCount)
+    freeWords(linker, t.*.starts, t.*.startRoom)
+}
+
+fn writePadding(file: fs.File, count: usize) -> bool {
+    var zeros: [8]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }
+    const zero_bytes: [*]const u8 = &zeros
+    return count == 0 || fs.writeAllBytes(file, zero_bytes, count)
+}
+
+fn read64(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var index: usize = 8
+    while index > 0 {
+        index -= 1
+        value = (value << 8) | @intCast(usize, bytes[at + index])
+    }
+    return value
+}
+
+// Writes the image elf64_dynamic built (its section headers last, from
+// `section_offset`) with the tables after it: a .shstrtab that names them
+// too, .symtab, .strtab, .mlx_lines (when it has entries), then the
+// section headers. The image's own .shstrtab stays where it was, unused.
+fn writeWithTables(linker: *Linker, image: [*]u8, size: usize, section_offset: usize, t: *Tables, output: [*]const u8) -> bool {
+    const section_count = (size - section_offset) / SECTION_HEADER_SIZE
+    const names_index = @intCast(usize, image[62]) | (@intCast(usize, image[63]) << 8)
+    const names_header = section_offset + names_index * SECTION_HEADER_SIZE
+    const names_offset = read64(image, names_header + 24)
+    const names_size = read64(image, names_header + 32)
+    const added = ".symtab|.strtab|.mlx_lines|"
+    const with_lines = t.*.lineLength > 0
+    const new_count = section_count + (if with_lines { 3 } else { 2 })
+    const symbol_count = t.*.localCount + t.*.globalCount + 1
+    // Where everything goes.
+    const names_at = section_offset
+    const new_names_size = names_size + added.length
+    const symbols_at = elf64.alignUp(names_at + new_names_size, 8)
+    const symbols_size = symbol_count * SYMBOL_SIZE
+    const strings_at = symbols_at + symbols_size
+    const lines_at = elf64.alignUp(strings_at + t.*.stringLength, 8)
+    const lines_end = if with_lines { lines_at + t.*.lineLength } else { strings_at + t.*.stringLength }
+    const headers_at = elf64.alignUp(lines_end, 8)
+    // The new .shstrtab and the section headers.
+    const tail_size = new_names_size + new_count * SECTION_HEADER_SIZE
+    const memory = linker.*.allocator.alloc(tail_size, 8)
+    if memory == null { return false }
+    const tail = memory.?
+    mem.copy(tail, image + names_offset, names_size)
+    var at = names_size
+    for byte in added {
+        tail[at] = if byte == 124 { 0 } else { byte }
+        at += 1
+    }
+    const headers = tail + new_names_size
+    mem.copy(headers, image + section_offset, section_count * SECTION_HEADER_SIZE)
+    mem.zero(headers + section_count * SECTION_HEADER_SIZE, (new_count - section_count) * SECTION_HEADER_SIZE)
+    elf.writeU64(headers, names_index * SECTION_HEADER_SIZE + 24, @intCast(u64, names_at))
+    elf.writeU64(headers, names_index * SECTION_HEADER_SIZE + 32, @intCast(u64, new_names_size))
+    // .symtab: linked to .strtab, sh_info the first global.
+    var header = section_count * SECTION_HEADER_SIZE
+    elf.writeU32(headers, header, @intCast(u32, names_size))
+    elf.writeU32(headers, header + 4, 2)
+    elf.writeU64(headers, header + 24, @intCast(u64, symbols_at))
+    elf.writeU64(headers, header + 32, @intCast(u64, symbols_size))
+    elf.writeU32(headers, header + 40, @intCast(u32, section_count + 1))
+    elf.writeU32(headers, header + 44, @intCast(u32, t.*.localCount + 1))
+    elf.writeU64(headers, header + 48, 8)
+    elf.writeU64(headers, header + 56, @intCast(u64, SYMBOL_SIZE))
+    header += SECTION_HEADER_SIZE
+    elf.writeU32(headers, header, @intCast(u32, names_size + 8))
+    elf.writeU32(headers, header + 4, 3)
+    elf.writeU64(headers, header + 24, @intCast(u64, strings_at))
+    elf.writeU64(headers, header + 32, @intCast(u64, t.*.stringLength))
+    elf.writeU64(headers, header + 48, 1)
+    if with_lines {
+        header += SECTION_HEADER_SIZE
+        elf.writeU32(headers, header, @intCast(u32, names_size + 16))
+        elf.writeU32(headers, header + 4, 1)
+        elf.writeU64(headers, header + 24, @intCast(u64, lines_at))
+        elf.writeU64(headers, header + 32, @intCast(u64, t.*.lineLength))
+        elf.writeU64(headers, header + 48, 4)
+    }
+    // The ELF header: where the section headers are now, and how many.
+    elf.writeU64(image, 40, @intCast(u64, headers_at))
+    elf.writeU16(image, 60, @intCast(u16, new_count))
+    const file = fs.open(output, fs.WRITE_ONLY | fs.CREATE | fs.TRUNCATE, 493)
+    var wrote = fs.isValid(file)
+    if wrote {
+        wrote = fs.writeAllBytes(file, image, section_offset)
+        wrote = wrote && fs.writeAllBytes(file, tail, new_names_size)
+        wrote = wrote && writePadding(file, symbols_at - names_at - new_names_size)
+        wrote = wrote && fs.writeAllBytes(file, t.*.symbols, symbols_size)
+        wrote = wrote && fs.writeAllBytes(file, t.*.strings, t.*.stringLength)
+        if with_lines {
+            wrote = wrote && writePadding(file, lines_at - strings_at - t.*.stringLength)
+            wrote = wrote && fs.writeAllBytes(file, t.*.lines, t.*.lineLength)
+        }
+        wrote = wrote && writePadding(file, headers_at - lines_end)
+        wrote = wrote && fs.writeAllBytes(file, headers, new_count * SECTION_HEADER_SIZE)
+        wrote = fs.close(file) && wrote
+        wrote = wrote && fs.chmod(output, 493)
+    }
+    linker.*.allocator.free(tail, tail_size, 8)
+    return wrote
 }
