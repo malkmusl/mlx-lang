@@ -64,8 +64,12 @@ int main()
 
         RefPtr document = frame->document();
         say(makeString("document: "_s, yesNo(!!document)));
+        // (Its URL as document.URL gives it: about:blank. The initial
+        // empty document's own url() is empty, FrameLoader::init loading
+        // it while the state machine is creatingInitialEmptyDocument, so
+        // that DocumentLoader::maybeLoadEmpty gives it no about:blank.)
         if (document)
-            say(makeString("url: "_s, document->url().string()));
+            say(makeString("url: "_s, document->urlForBindings().string()));
     }
     say("page: destroyed"_s);
     say("exit 0"_s);
