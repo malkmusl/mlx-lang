@@ -55,6 +55,7 @@ fetch luatests.tar.gz https://www.lua.org/tests/lua-5.4.7-tests.tar.gz 8a4898ffe
 fetch sqlite.tar.gz https://www.sqlite.org/2024/sqlite-autoconf-3460100.tar.gz 67d3fe6d268e6eaddcae3727fce58fcc8e9c53869bdd07a0c61e38ddf2965071
 
 "$compiler" --quiet compiler/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
+"$compiler" --quiet compiler/ld/main.mlx -o "$work/mlx-ld" || fail "mlx-ld does not build"
 cp -r compiler/cc/include "$work/include"
 cc="$work/mlx-cc"
 tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/lib" > /dev/null

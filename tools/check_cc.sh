@@ -38,8 +38,9 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 "$compiler" --quiet compiler/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
 cp -r compiler/cc/include "$work/include"
 cc="$work/mlx-cc"
+"$compiler" --quiet compiler/ld/main.mlx -o "$work/mlx-ld" || fail "mlx-ld does not build"
 "$compiler" --quiet compiler/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
-echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ar"
+echo "ok   mlx-cc builds ($(stat -c %s "$cc") bytes), and mlx-ld and mlx-ar"
 # Every module-level variable is in a prefix snapshot or marked `(per run)`.
 python3 tools/cc_snapshot_state.py --check || fail "the prefix snapshot's lists of variables are out of date"
 echo "ok   the prefix snapshot's lists name every variable of the compiler's modules"
