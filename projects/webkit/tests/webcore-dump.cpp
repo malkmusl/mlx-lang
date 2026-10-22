@@ -11,8 +11,8 @@
 // and no load is pending (subresources, fonts), the view is laid out and
 // its render tree written to standard output. The settings are those
 // WebKitTestRunner gives a test (its fonts' families, sizes and file
-// access); --font adds the fonts of a file as the test runner's test fonts
-// (Ahem); fonts are matched by std.fontconfig with the environment's
+// access, glyphs unhinted); --font adds the fonts of a file as the test
+// runner's test fonts (Ahem); fonts are matched by std.fontconfig with the environment's
 // configuration (FONTCONFIG_FILE). Exit status: 0, 1 when the page did not
 // load (still dumped), 2 for a bad command line.
 //
@@ -31,6 +31,7 @@
 #include "Document.h"
 #include "EmptyClients.h"
 #include "FrameLoadRequest.h"
+#include "FontRenderOptions.h"
 #include "FrameLoader.h"
 #include "LocalFrame.h"
 #include "LocalFrameInlines.h"
@@ -243,6 +244,9 @@ int main(int argc, char** argv)
     WTF::initializeMainThread();
     initializeCommonAtomStrings();
     MlxPlatformStrategies::initialize();
+    // Glyphs unhinted, at whole pixels, as the test runner has them
+    // (WebKitTestRunner's web process, for the GLib ports' expected trees).
+    FontRenderOptions::singleton().disableHintingForTesting();
 
     for (auto* font : fonts) {
         if (!mlxweb_font_add_file(font)) {
