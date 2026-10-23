@@ -317,30 +317,27 @@ public:
     static Ref<Transfer> create(ResourceLoader* loader) { return adoptRef(*new Transfer(loader)); }
 
     // The reading thread's (or a whole body's): false stops the read.
+    // (A receiver gets its pieces under the lock: those that came before
+    // it, which divert gives it, first.)
     bool take(std::span<const uint8_t> bytes)
     {
-        RefPtr<MlxNetwork::BodyReceiver> receiver;
-        {
-            Locker locker { m_lock };
-            if (m_stopped)
-                return false;
-            if (!m_receiver) {
-                if (!m_toLoader) {
-                    m_pending.append(bytes);
-                    return true;
-                }
-                RunLoop::mainSingleton().dispatch([transfer = Ref { *this }, piece = Vector<uint8_t>(bytes)]() mutable {
-                    transfer->deliverToLoader(WTF::move(piece));
-                });
-                return true;
-            }
-            receiver = m_receiver;
-        }
-        if (!receiver->receive(bytes)) {
-            Locker locker { m_lock };
-            m_stopped = true;
+        Locker locker { m_lock };
+        if (m_stopped)
             return false;
+        if (m_receiver) {
+            if (!m_receiver->receive(bytes)) {
+                m_stopped = true;
+                return false;
+            }
+            return true;
         }
+        if (!m_toLoader) {
+            m_pending.append(bytes);
+            return true;
+        }
+        RunLoop::mainSingleton().dispatch([transfer = Ref { *this }, piece = Vector<uint8_t>(bytes)]() mutable {
+            transfer->deliverToLoader(WTF::move(piece));
+        });
         return true;
     }
 
@@ -365,19 +362,16 @@ public:
     // came before first); false when the loader took some already.
     bool divert(Ref<MlxNetwork::BodyReceiver>&& receiver)
     {
-        Vector<uint8_t> pending;
         {
             Locker locker { m_lock };
             if (m_toLoader || m_receiver || m_stopped)
                 return false;
             m_receiver = receiver.copyRef();
-            pending = std::exchange(m_pending, { });
+            if (!m_pending.isEmpty() && !receiver->receive(m_pending.span()))
+                m_stopped = true;
+            m_pending = { };
         }
         m_loader = nullptr;
-        if (!pending.isEmpty() && !receiver->receive(pending.span())) {
-            Locker locker { m_lock };
-            m_stopped = true;
-        }
         if (m_ended)
             finishReceiver();
         return true;
