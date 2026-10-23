@@ -52,6 +52,7 @@ struct Outgoing {
     CString headers;
     Vector<uint8_t> body;
     bool hasBody { false };
+    uint32_t cacheMode { MLXWEB_CACHE_DEFAULT };
 };
 
 // What the Mlx side answered, for the main thread.
@@ -60,6 +61,7 @@ struct Answer {
     unsigned status { 0 };
     Vector<uint8_t> head;
     Vector<uint8_t> body;
+    uint32_t source { MLXWEB_SOURCE_NETWORK };
 };
 
 }
@@ -76,9 +78,31 @@ static bool clientWritesHeader(const String& name)
         || equalLettersIgnoringASCIICase(name, "cookie"_s);
 }
 
+// The HTTP cache's mode of a request (the profile's cache on disk,
+// port/mlx/httpcache.mlx), from WebCore's cache policy.
+static uint32_t cacheModeFor(const ResourceRequest& request)
+{
+    switch (request.cachePolicy()) {
+    case ResourceRequestCachePolicy::UseProtocolCachePolicy:
+        return MLXWEB_CACHE_DEFAULT;
+    case ResourceRequestCachePolicy::ReloadIgnoringCacheData:
+        return MLXWEB_CACHE_RELOAD;
+    case ResourceRequestCachePolicy::ReturnCacheDataElseLoad:
+        return MLXWEB_CACHE_PREFER;
+    case ResourceRequestCachePolicy::ReturnCacheDataDontLoad:
+        return MLXWEB_CACHE_ONLY;
+    case ResourceRequestCachePolicy::DoNotUseAnyCache:
+        return MLXWEB_CACHE_BYPASS;
+    case ResourceRequestCachePolicy::RefreshAnyCacheData:
+        return MLXWEB_CACHE_REVALIDATE;
+    }
+    return MLXWEB_CACHE_DEFAULT;
+}
+
 static Outgoing outgoingFor(const ResourceRequest& request)
 {
     Outgoing outgoing;
+    outgoing.cacheMode = cacheModeFor(request);
     String method = request.httpMethod();
     outgoing.method = (method.isEmpty() ? "GET"_s : method).utf8();
     outgoing.url = request.url().string().utf8();
@@ -101,11 +125,12 @@ static Outgoing outgoingFor(const ResourceRequest& request)
 static Answer run(const Outgoing& outgoing)
 {
     Answer answer;
-    size_t handle = mlxweb_http_request(outgoing.method.data(), outgoing.url.data(), outgoing.headers.data(), outgoing.body.span().data(), outgoing.body.size(), outgoing.hasBody ? 1 : 0);
+    size_t handle = mlxweb_http_request(outgoing.method.data(), outgoing.url.data(), outgoing.headers.data(), outgoing.body.span().data(), outgoing.body.size(), outgoing.hasBody ? 1 : 0, outgoing.cacheMode);
     if (!handle)
         return answer;
     answer.error = mlxweb_http_error(handle);
     answer.status = mlxweb_http_status(handle);
+    answer.source = mlxweb_http_source(handle);
     if (auto* head = mlxweb_http_head(handle))
         answer.head.append(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(head), mlxweb_http_head_length(handle)));
     if (auto* body = mlxweb_http_body(handle))
@@ -125,6 +150,8 @@ static ResourceError errorFor(const URL& url, uint32_t error)
         return ResourceError(String(errorDomain), static_cast<int>(error), url, "The secure connection failed (the server's certificate did not verify)"_s);
     case MLXWEB_HTTP_RECEIVE:
         return ResourceError(String(errorDomain), static_cast<int>(error), url, "The connection ended before the response was whole"_s);
+    case MLXWEB_HTTP_NOT_CACHED:
+        return ResourceError(String(errorDomain), static_cast<int>(error), url, "The response is not in the cache"_s);
     default:
         return ResourceError(String(errorDomain), static_cast<int>(error), url, "The load failed"_s);
     }
@@ -237,7 +264,7 @@ static void start(Ref<ResourceLoader>&&, const ResourceRequest&, unsigned redire
 static void deliver(Ref<ResourceLoader>&& loader, const ResourceRequest& request, Answer&& answer, unsigned redirects)
 {
     if (networkTracing())
-        fprintf(stderr, "network: %s %s: %s %u (%zu bytes)%s\n", request.httpMethod().utf8().data(), request.url().string().utf8().data(), answer.error ? "error" : "status", answer.error ? answer.error : answer.status, answer.body.size(), loader->reachedTerminalState() ? ", the load ended already" : "");
+        fprintf(stderr, "network: %s %s: %s %u (%zu bytes)%s%s\n", request.httpMethod().utf8().data(), request.url().string().utf8().data(), answer.error ? "error" : "status", answer.error ? answer.error : answer.status, answer.body.size(), answer.source == MLXWEB_SOURCE_CACHE ? ", from the cache" : answer.source == MLXWEB_SOURCE_REVALIDATED ? ", from the cache after a 304" : "", loader->reachedTerminalState() ? ", the load ended already" : "");
     if (loader->reachedTerminalState())
         return;
     if (answer.error) {

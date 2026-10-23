@@ -10,6 +10,11 @@
 // Redirects are not followed here: a 3xx response comes back as it is,
 // for WebCore to decide on (ResourceLoader::willSendRequest).
 //
+// The profile (MlxProfile.cpp, openProfile): the jar is kept in an SQLite
+// database (cookies.mlx) and GET responses in the HTTP cache on disk
+// (httpcache.mlx), which a request consults by its cache mode before it
+// goes to the server.
+//
 // MLXWEB_CA_FILE=PATH in the environment adds the certificates of a PEM
 // file to the anchors (a test CA).
 const std = @import("std")
@@ -18,6 +23,8 @@ const cookiejar = @import("std.http.cookiejar")
 const headers = @import("std.http.headers")
 const uri = @import("std.uri")
 const x509 = @import("std.x509")
+const httpcache = @import("./httpcache.mlx")
+const cookies = @import("./cookies.mlx")
 
 extern("c") fn malloc(size: usize) -> usize
 extern("c") fn free(address: usize) -> void
@@ -31,18 +38,6 @@ pub const ERROR_TLS: u32 = 3
 pub const ERROR_RECEIVE: u32 = 4
 pub const ERROR_OTHER: u32 = 5
 
-// A response on the C heap: the status, the head as it came (status line
-// and header lines), the body with its content coding undone.
-const Answer = struct {
-    failure: u32
-    status: u32
-    head: usize
-    headLength: usize
-    body: usize
-    bodyLength: usize
-}
-
-fn answerAt(address: usize) -> *Answer { return unsafe { @ptrFromInt(*Answer, address) } }
 
 var session: client.Session = undefined
 var jar: cookiejar.Jar = undefined
@@ -102,11 +97,37 @@ fn failureOf(result: client.Error) -> u32 {
     return ERROR_OTHER
 }
 
-// Runs a request: METHOD, URL and HEADERS ("Name: value\r\n" lines) are C
-// strings, BODY has BODY_LENGTH bytes (HAS_BODY 0: none). The answer, or 0
-// without memory.
-pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyLength: usize, hasBody: bool) -> usize {
-    prepare()
+// The cache modes of a request (MlxWebPort.h's MLXWEB_CACHE_*, from
+// WebCore's ResourceRequestCachePolicy).
+pub const CACHE_DEFAULT: u32 = 0
+pub const CACHE_RELOAD: u32 = 1
+pub const CACHE_PREFER: u32 = 2
+pub const CACHE_ONLY: u32 = 3
+pub const CACHE_BYPASS: u32 = 4
+pub const CACHE_REVALIDATE: u32 = 5
+pub const ERROR_NOT_CACHED: u32 = 6
+
+// Where an answer came from: the network, the cache with no request sent,
+// the cache after the server's 304.
+pub const SOURCE_NETWORK: u32 = 0
+pub const SOURCE_CACHE: u32 = 1
+pub const SOURCE_REVALIDATED: u32 = 2
+
+// A response on the C heap: the status, the head as it came (status line
+// and header lines), the body with its content coding undone.
+const Answer = struct {
+    failure: u32
+    status: u32
+    head: usize
+    headLength: usize
+    body: usize
+    bodyLength: usize
+    source: u32
+}
+
+fn answerAt(address: usize) -> *Answer { return unsafe { @ptrFromInt(*Answer, address) } }
+
+fn newAnswer() -> usize {
     const address = malloc(@sizeOf(Answer))
     if address == 0 { return 0 }
     const answer = answerAt(address)
@@ -116,20 +137,125 @@ pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyL
     answer.*.headLength = 0
     answer.*.body = 0
     answer.*.bodyLength = 0
-    const req = client.Request.{ .method = cText(method), .url = cText(url), .headers = cText(headerLines), .body = bytesAt(body, bodyLength), .hasBody = hasBody }
-    var response: client.Response = undefined
-    const result = client.request(&session, &req, &response)
-    if result != client.Error.none {
-        answer.*.failure = failureOf(result)
+    answer.*.source = SOURCE_NETWORK
+    return address
+}
+
+fn fill(address: usize, status: u32, head: []const u8, body: []const u8, source: u32) -> void {
+    const answer = answerAt(address)
+    answer.*.status = status
+    answer.*.head = copied(head)
+    answer.*.headLength = head.length
+    answer.*.body = copied(body)
+    answer.*.bodyLength = body.length
+    answer.*.source = source
+}
+
+fn isSafe(method: []const u8) -> bool {
+    return std.text.same(method, "GET") || std.text.same(method, "HEAD") || std.text.same(method, "OPTIONS") || std.text.same(method, "TRACE")
+}
+
+// The status of a stored head's status line ("HTTP/1.1 200 OK").
+fn statusOf(head: []const u8) -> u32 {
+    var at: usize = 0
+    while at < head.length && head[at] != 32 { at += 1 }
+    var status: u32 = 0
+    at += 1
+    while at < head.length && head[at] >= 48 && head[at] <= 57 {
+        status = status * 10 + @intCast(u32, head[at] - 48)
+        at += 1
+    }
+    return status
+}
+
+// Runs a request: METHOD, URL and HEADERS ("Name: value\r\n" lines) are C
+// strings, BODY has BODY_LENGTH bytes (HAS_BODY 0: none), MODE the cache's
+// (CACHE_*: the profile's HTTP cache, httpcache.mlx, answers a GET from
+// disk when it may, revalidates, stores). The answer, or 0 without memory.
+pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyLength: usize, hasBody: bool, mode: u32) -> usize {
+    prepare()
+    const address = newAnswer()
+    if address == 0 { return 0 }
+    const methodText = cText(method)
+    const urlText = cText(url)
+    const lines = cText(headerLines)
+    const cached = httpcache.enabled() && mode != CACHE_BYPASS && std.text.same(methodText, "GET") && !httpcache.forbidsStoring(lines)
+    if !cached || httpcache.isConditional(lines) {
+        const requestTime = httpcache.now()
+        var response: client.Response = undefined
+        const result = send(methodText, urlText, lines, bytesAt(body, bodyLength), hasBody, &response)
+        if result != client.Error.none {
+            answerAt(address).*.failure = failureOf(result)
+            return address
+        }
+        const head = response.head.bytes[0..response.head.length]
+        const got = response.body.bytes[0..response.body.length]
+        if cached && response.status != 304 { httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now()) }
+        if !isSafe(methodText) && response.status < 400 { httpcache.invalidate(urlText, lines) }
+        fill(address, response.status, head, got, SOURCE_NETWORK)
+        client.freeResponse(&session, &response)
         return address
     }
-    answer.*.status = response.status
-    answer.*.head = copied(response.head.bytes[0..response.head.length])
-    answer.*.headLength = response.head.length
-    answer.*.body = copied(response.body.bytes[0..response.body.length])
-    answer.*.bodyLength = response.body.length
+    var stored = httpcache.Stored.init()
+    const found = mode != CACHE_RELOAD && httpcache.find(methodText, urlText, lines, &stored)
+    if found {
+        const now = httpcache.now()
+        if mode == CACHE_PREFER || mode == CACHE_ONLY || (mode != CACHE_REVALIDATE && httpcache.isFresh(&stored, lines, now)) {
+            httpcache.touch(&stored)
+            fill(address, statusOf(stored.head()), stored.head(), stored.body(), SOURCE_CACHE)
+            return address
+        }
+    } else if mode == CACHE_ONLY {
+        answerAt(address).*.failure = ERROR_NOT_CACHED
+        return address
+    }
+    // To the server, with the stored response's validators.
+    var conditional = std.ArrayList(u8).init(std.heap.allocator())
+    _ = conditional.appendSlice(lines)
+    const validating = found && httpcache.validators(&stored, &conditional)
+    const requestTime = httpcache.now()
+    var response: client.Response = undefined
+    var sent: []const u8 = lines
+    if validating { sent = conditional.items() }
+    const result = send(methodText, urlText, sent, bytesAt(body, bodyLength), hasBody, &response)
+    if result != client.Error.none {
+        answerAt(address).*.failure = failureOf(result)
+        return address
+    }
+    const head = response.head.bytes[0..response.head.length]
+    const got = response.body.bytes[0..response.body.length]
+    if validating && response.status == 304 {
+        var merged = std.ArrayList(u8).init(std.heap.allocator())
+        httpcache.merge(&stored, head, &merged)
+        httpcache.refresh(&stored, merged.items(), requestTime, httpcache.now())
+        fill(address, statusOf(stored.head()), merged.items(), stored.body(), SOURCE_REVALIDATED)
+        client.freeResponse(&session, &response)
+        return address
+    }
+    httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now())
+    fill(address, response.status, head, got, SOURCE_NETWORK)
     client.freeResponse(&session, &response)
     return address
+}
+
+fn send(method: []const u8, url: []const u8, lines: []const u8, body: []const u8, hasBody: bool, response: *client.Response) -> client.Error {
+    const req = client.Request.{ .method = method, .url = url, .headers = lines, .body = body, .hasBody = hasBody }
+    return client.request(&session, &req, response)
+}
+
+pub fn source(answer: usize) -> u32 { return if answer == 0 { SOURCE_NETWORK } else { answerAt(answer).*.source } }
+
+// The profile's files (MlxProfile.cpp): the cookie database and the HTTP
+// cache's directory, C strings (empty: none).
+pub fn openProfile(cookiePath: usize, cacheDirectory: usize) -> void {
+    prepare()
+    cookies.open(cText(cookiePath), &jar, x509.now())
+    httpcache.open(cText(cacheDirectory))
+}
+
+pub fn closeProfile() -> void {
+    cookies.close()
+    httpcache.close()
 }
 
 pub fn failure(answer: usize) -> u32 { return if answer == 0 { ERROR_OTHER } else { answerAt(answer).*.failure } }

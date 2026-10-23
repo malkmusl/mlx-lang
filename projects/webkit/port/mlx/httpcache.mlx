@@ -1,0 +1,694 @@
+// The HTTP cache on disk of the port's loader (http.mlx, PORT.md M7): a
+// private cache as RFC 9111 has one, in a directory of the profile's
+// (MlxProfile.cpp: $XDG_CACHE_HOME/voyager/http), used on the network
+// thread only. WebCore's memory cache stays in front of it; this one is
+// what outlives the process.
+//
+// What is stored: the responses to GET requests with a status that may be
+// cached (200, 203, 300, 301, 308, 404, 410), with a lifetime (max-age,
+// Expires) or a validator (ETag, Last-Modified) to make use of, and none of
+// `no-store` (the request's or the response's) or `Vary: *`; a response to
+// a request with credentials (Authorization) only when its Cache-Control
+// allows a shared one (`public`, `s-maxage`, `must-revalidate`). An entry
+// is the response's head and body (its content coding undone, as the
+// client gives it) with the times of the request and the response, under
+// a key of the method, the URL and the values the request had of the
+// headers the response's Vary names (so a URL has an entry for each set
+// of them): a file a key, named by the key's hash, and a `.vary` file
+// beside it of the URL's that tells which headers make its key.
+//
+// A request finds its entry, then (by the cache mode, what WebCore's
+// ResourceRequestCachePolicy asks): a fresh one is the answer with no
+// request sent (fresh: its age, RFC 9111 4.2.3, below its lifetime: the
+// response's max-age, else Expires less Date, else a tenth of the time
+// since Last-Modified, as WebCore's heuristic is; never with `no-cache`);
+// a stale one is revalidated (If-None-Match with the ETag,
+// If-Modified-Since with Last-Modified): a 304 updates the entry's head
+// and times and the stored response is the answer, anything else replaces
+// it. An unsafe method (POST, PUT, DELETE...) that succeeds takes the
+// URL's entries away.
+//
+// The directory's size is kept under a limit (64 MiB, or
+// MLXWEB_HTTP_CACHE_LIMIT bytes in the environment): the entries used
+// longest ago go first (their files' modification times are when they
+// were last used, and the index of the entries is read from the directory
+// at start).
+const std = @import("std")
+const headers = @import("std.http.headers")
+const date = @import("std.http.date")
+const hashing = @import("std.hash")
+const x509 = @import("std.x509")
+
+extern("c") fn getenv(name: [*]const u8) -> usize
+
+const MAGIC: []const u8 = "MLXHC001"
+const HEADER_SIZE: usize = 48
+const DEFAULT_LIMIT: u64 = 67108864
+const PATH_CAPACITY: usize = 1024
+
+// An entry of the index: its file's size and when it was last used (the
+// realtime clock's nanoseconds).
+const Record = struct {
+    size: u64
+    used: i64
+}
+
+var directory: [PATH_CAPACITY]u8 = undefined
+var directoryLength: usize = 0
+var ready = false
+var limit: u64 = DEFAULT_LIMIT
+var total: u64 = 0
+var index: std.AutoHashMap(u64, Record) = undefined
+
+// An entry read from its file: the file's bytes and where its parts are.
+pub const Stored = @noncopy(struct) {
+    data: std.ArrayList(u8)
+    requestTime: i64
+    responseTime: i64
+    keyAt: usize
+    keyLength: usize
+    headAt: usize
+    headLength: usize
+    bodyAt: usize
+    bodyLength: usize
+    name: u64
+
+    pub fn init() -> Self {
+        return Self.{ .data = std.ArrayList(u8).init(std.heap.allocator()), .requestTime = 0, .responseTime = 0, .keyAt = 0, .keyLength = 0, .headAt = 0, .headLength = 0, .bodyAt = 0, .bodyLength = 0, .name = 0 }
+    }
+
+    pub fn deinit(self: *Self) -> void {
+        self.*.data.deinit()
+    }
+
+    pub fn head(self: *const Self) -> []const u8 { return self.*.data.items()[self.*.headAt..self.*.headAt + self.*.headLength] }
+    pub fn body(self: *const Self) -> []const u8 { return self.*.data.items()[self.*.bodyAt..self.*.bodyAt + self.*.bodyLength] }
+}
+
+fn nowNanoseconds() -> i64 {
+    const moment = std.time.realtime()
+    return @intCast(i64, moment.seconds) * 1000000000 + @intCast(i64, moment.nanoseconds)
+}
+
+pub fn enabled() -> bool { return ready }
+
+// ---------------------------------------------------------------------------
+// Paths
+
+const Path = struct {
+    bytes: [PATH_CAPACITY]u8
+    length: usize
+}
+
+fn hexDigit(value: u64) -> u8 {
+    const digit = @intCast(u8, value & 15)
+    return if digit < 10 { 48 + digit } else { 87 + digit }
+}
+
+// The directory's file of the key hash NAME (SUFFIX after it), as a C
+// string in PATH.
+fn pathOf(name: u64, suffix: []const u8, path: *Path) -> bool {
+    if directoryLength + 18 + suffix.length >= PATH_CAPACITY { return false }
+    var at: usize = 0
+    while at < directoryLength {
+        path.*.bytes[at] = directory[at]
+        at += 1
+    }
+    path.*.bytes[at] = 47
+    at += 1
+    var shift: u64 = 60
+    var digits: usize = 0
+    while digits < 16 {
+        path.*.bytes[at] = hexDigit(name >> shift)
+        at += 1
+        digits += 1
+        if shift >= 4 { shift -= 4 }
+    }
+    for byte in suffix {
+        path.*.bytes[at] = byte
+        at += 1
+    }
+    path.*.bytes[at] = 0
+    path.*.length = at
+    return true
+}
+
+fn pathText(path: *const Path) -> [*]const u8 { return &path.*.bytes }
+
+// The hash of a file name of 16 hex digits; false for another name.
+fn nameOf(text: []const u8, out: *u64) -> bool {
+    if text.length != 16 { return false }
+    var value: u64 = 0
+    for c in text {
+        var digit: u64 = 0
+        if c >= 48 && c <= 57 {
+            digit = @intCast(u64, c - 48)
+        } else if c >= 97 && c <= 102 {
+            digit = @intCast(u64, c - 87)
+        } else {
+            return false
+        }
+        value = (value << 4) | digit
+    }
+    out.* = value
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The index
+
+// Opens the cache in DIRECTORY (made when missing); an empty one: no
+// cache. The index is read from the directory's files.
+pub fn open(path: []const u8) -> void {
+    if ready { close() }
+    if path.length == 0 || path.length + 20 >= PATH_CAPACITY { return }
+    var at: usize = 0
+    while at < path.length {
+        directory[at] = path[at]
+        at += 1
+    }
+    directory[at] = 0
+    directoryLength = path.length
+    if !std.fs.makeDirectories(path, 448) { return }
+    limit = DEFAULT_LIMIT
+    const given = getenv("MLXWEB_HTTP_CACHE_LIMIT".pointer)
+    if given != 0 {
+        const text: [*]const u8 = unsafe { @ptrFromInt([*]const u8, given) }
+        var value: u64 = 0
+        var i: usize = 0
+        while text[i] >= 48 && text[i] <= 57 {
+            value = value * 10 + @intCast(u64, text[i] - 48)
+            i += 1
+        }
+        if value > 0 { limit = value }
+    }
+    index = std.AutoHashMap(u64, Record).init(std.heap.allocator())
+    total = 0
+    ready = true
+    const folder = std.fs.open(&directory, std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(folder) { return }
+    var buffer: [8192]u8 = undefined
+    var reader = std.fs.entries(folder, &buffer, 8192)
+    var entry: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &entry) {
+        var name: u64 = 0
+        if !nameOf(entry.name.pointer[0..entry.name.length], &name) { continue }
+        var path: Path = undefined
+        if !pathOf(name, "", &path) { continue }
+        var status: std.fs.Stat = undefined
+        if std.fs.status(pathText(&path), &status) != 0 { continue }
+        const size = @bitCast(u64, @intCast(i64, status.size))
+        const used = @intCast(i64, status.modifiedSeconds) * 1000000000 + @intCast(i64, status.modifiedNanoseconds)
+        _ = index.put(name, Record.{ .size = size, .used = used })
+        total += size
+    }
+    _ = std.fs.close(folder)
+    evict()
+}
+
+pub fn close() -> void {
+    if !ready { return }
+    index.deinit()
+    ready = false
+}
+
+// The entries used longest ago removed until the cache is under its limit.
+fn evict() -> void {
+    while total > limit && index.count() > 0 {
+        var oldest: u64 = 0
+        var oldestUsed: i64 = 0
+        var found = false
+        var entries = index.iterator()
+        while true {
+            const e = entries.next()
+            if e == null { break }
+            if !found || e.?.value.*.used < oldestUsed {
+                oldest = e.?.key.*
+                oldestUsed = e.?.value.*.used
+                found = true
+            }
+        }
+        if !found { break }
+        forget(oldest)
+    }
+}
+
+// The entry NAME taken away (its file and its record).
+fn forget(name: u64) -> void {
+    var path: Path = undefined
+    if pathOf(name, "", &path) { _ = std.fs.delete(pathText(&path)) }
+    const record = index.fetchRemove(name)
+    if record != null {
+        total = if total >= record.?.size { total - record.?.size } else { 0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headers
+
+fn trimmed(text: []const u8) -> []const u8 {
+    var start: usize = 0
+    var end = text.length
+    while start < end && headers.isSpace(text[start]) { start += 1 }
+    while end > start && headers.isSpace(text[end - 1]) { end -= 1 }
+    return text[start..end]
+}
+
+// The value of the first header NAME of TEXT (header lines, each ending
+// with "\n"; a status line first is no header and is passed by).
+pub fn headerValue(text: []const u8, name: []const u8, value: *[]const u8) -> bool {
+    var at: usize = 0
+    while at < text.length {
+        var end = at
+        while end < text.length && text[end] != 10 { end += 1 }
+        const line = text[at..end]
+        at = end + 1
+        if line.length > name.length && line[name.length] == 58 && headers.equalsIgnoringCase(line[0..name.length], name) {
+            value.* = trimmed(line[name.length + 1..line.length])
+            return true
+        }
+    }
+    return false
+}
+
+// A directive of a Cache-Control value: whether it is there, and its
+// number (NUMBER: -1 when it has none).
+fn directive(control: []const u8, name: []const u8, number: *i64) -> bool {
+    number.* = -1
+    var items = headers.list(control, 44)
+    var item: []const u8 = control[0..0]
+    while headers.next(&items, &item) {
+        const word = trimmed(item)
+        if word.length < name.length || !headers.equalsIgnoringCase(word[0..name.length], name) { continue }
+        if word.length == name.length { return true }
+        if word[name.length] != 61 { continue }
+        var at = name.length + 1
+        if at < word.length && word[at] == 34 { at += 1 }
+        var value: i64 = 0
+        var digits = false
+        while at < word.length && word[at] >= 48 && word[at] <= 57 {
+            if value < 1000000000000 { value = value * 10 + @intCast(i64, word[at] - 48) }
+            digits = true
+            at += 1
+        }
+        if digits { number.* = value }
+        return true
+    }
+    return false
+}
+
+fn hasDirective(control: []const u8, name: []const u8) -> bool {
+    var number: i64 = 0
+    return directive(control, name, &number)
+}
+
+// The seconds since the epoch of an HTTP date header of TEXT; false when
+// there is none or it is no date.
+fn dateHeader(text: []const u8, name: []const u8, out: *i64) -> bool {
+    var value: []const u8 = text[0..0]
+    if !headerValue(text, name, &value) { return false }
+    var d: date.Date = undefined
+    if !date.parse(value, &d) { return false }
+    out.* = date.toUnix(&d)
+    return true
+}
+
+fn cacheControl(text: []const u8) -> []const u8 {
+    var value: []const u8 = text[0..0]
+    if headerValue(text, "Cache-Control", &value) { return value }
+    return text[0..0]
+}
+
+// ---------------------------------------------------------------------------
+// Keys
+
+fn putLower(key: *std.ArrayList(u8), text: []const u8) -> void {
+    for c in text { _ = key.*.append(headers.lower(c)) }
+}
+
+// The key of a request: the method and the URL, then each header VARY
+// names with the request's value of it.
+fn makeKey(key: *std.ArrayList(u8), method: []const u8, url: []const u8, requestHeaders: []const u8, vary: []const u8) -> void {
+    _ = key.*.appendSlice(method)
+    _ = key.*.append(32)
+    _ = key.*.appendSlice(url)
+    var items = headers.list(vary, 44)
+    var item: []const u8 = vary[0..0]
+    while headers.next(&items, &item) {
+        const name = trimmed(item)
+        _ = key.*.append(10)
+        putLower(key, name)
+        _ = key.*.append(58)
+        var value: []const u8 = name[0..0]
+        if headerValue(requestHeaders, name, &value) { _ = key.*.appendSlice(value) }
+    }
+}
+
+fn hashOf(bytes: []const u8) -> u64 { return hashing.wyhash(bytes, 0x6d6c7863616368) }
+
+// The Vary value an URL's entries were stored with (the `.vary` file of
+// the method and URL); empty when there is none.
+fn varyOf(base: u64, out: *std.ArrayList(u8)) -> void {
+    var path: Path = undefined
+    if !pathOf(base, ".vary", &path) { return }
+    var buffer: [1024]u8 = undefined
+    const length = std.fs.readFile(pathText(&path), &buffer, 1024)
+    _ = out.*.appendSlice(buffer[0..length])
+}
+
+fn readU64(bytes: []const u8, at: usize) -> u64 {
+    var value: u64 = 0
+    var i: usize = 8
+    while i > 0 {
+        i -= 1
+        value = (value << 8) | @intCast(u64, bytes[at + i])
+    }
+    return value
+}
+
+fn putU64(list: *std.ArrayList(u8), value: u64) -> void {
+    var i: usize = 0
+    while i < 8 {
+        _ = list.*.append(@intCast(u8, (value >> @intCast(u6, i * 8)) & 255))
+        i += 1
+    }
+}
+
+// A file's bytes to its end, into LIST.
+fn readAll(file: std.fs.File, list: *std.ArrayList(u8)) -> void {
+    var status: std.fs.Stat = undefined
+    if std.fs.fileStatus(file, &status) == 0 && status.size > 0 { _ = list.*.ensureTotalCapacity(@intCast(usize, status.size)) }
+    var chunk: [16384]u8 = undefined
+    while true {
+        const amount = std.fs.read(file, &chunk, 16384)
+        if amount <= 0 { break }
+        _ = list.*.appendSlice(chunk[0..@bitCast(usize, amount)])
+    }
+}
+
+// The entry of a request (the method, the URL, the request's header
+// lines), read into STORED; false when there is none.
+pub fn find(method: []const u8, url: []const u8, requestHeaders: []const u8, stored: *Stored) -> bool {
+    if !ready { return false }
+    var base = std.ArrayList(u8).init(std.heap.allocator())
+    makeKey(&base, method, url, requestHeaders, "")
+    var vary = std.ArrayList(u8).init(std.heap.allocator())
+    varyOf(hashOf(base.items()), &vary)
+    var key = std.ArrayList(u8).init(std.heap.allocator())
+    makeKey(&key, method, url, requestHeaders, vary.items())
+    const name = hashOf(key.items())
+    if index.get(name) == null { return false }
+    var path: Path = undefined
+    if !pathOf(name, "", &path) { return false }
+    const file = std.fs.open(pathText(&path), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) {
+        forget(name)
+        return false
+    }
+    var list = std.ArrayList(u8).init(std.heap.allocator())
+    readAll(file, &list)
+    _ = std.fs.close(file)
+    const bytes = list.items()
+    var good = bytes.length >= HEADER_SIZE && std.text.same(bytes[0..8], MAGIC)
+    if good {
+        const keyLength = @intCast(usize, readU64(bytes, 24))
+        const headLength = @intCast(usize, readU64(bytes, 32))
+        const bodyLength = @intCast(usize, readU64(bytes, 40))
+        good = HEADER_SIZE + keyLength + headLength + bodyLength == bytes.length && std.text.same(bytes[HEADER_SIZE..HEADER_SIZE + keyLength], key.items())
+        if good {
+            stored.*.requestTime = @bitCast(i64, readU64(bytes, 8))
+            stored.*.responseTime = @bitCast(i64, readU64(bytes, 16))
+            stored.*.keyAt = HEADER_SIZE
+            stored.*.keyLength = keyLength
+            stored.*.headAt = HEADER_SIZE + keyLength
+            stored.*.headLength = headLength
+            stored.*.bodyAt = HEADER_SIZE + keyLength + headLength
+            stored.*.bodyLength = bodyLength
+            stored.*.name = name
+            _ = stored.*.data.appendSlice(bytes)
+        }
+    }
+    if !good {
+        forget(name)
+        return false
+    }
+    return true
+}
+
+// The entry used now (its time of last use, for the order of eviction).
+pub fn touch(stored: *const Stored) -> void {
+    var path: Path = undefined
+    if !pathOf(stored.*.name, "", &path) { return }
+    _ = std.fs.updateTimes(pathText(&path))
+    const record = index.getPtr(stored.*.name)
+    if record != null { record.?.*.used = nowNanoseconds() }
+}
+
+// ---------------------------------------------------------------------------
+// Freshness (RFC 9111 4.2)
+
+// How long a response stays fresh after its Date, in seconds.
+fn lifetime(head: []const u8, responseTime: i64) -> i64 {
+    const control = cacheControl(head)
+    var maxAge: i64 = 0
+    if directive(control, "max-age", &maxAge) && maxAge >= 0 { return maxAge }
+    var served = responseTime
+    _ = dateHeader(head, "Date", &served)
+    var expires: i64 = 0
+    var value: []const u8 = head[0..0]
+    if headerValue(head, "Expires", &value) {
+        // (An Expires that is no date is a time in the past.)
+        if !dateHeader(head, "Expires", &expires) { return 0 }
+        return if expires > served { expires - served } else { 0 }
+    }
+    var modified: i64 = 0
+    if dateHeader(head, "Last-Modified", &modified) && served > modified { return (served - modified) / 10 }
+    return 0
+}
+
+// How old the stored response is now (RFC 9111 4.2.3), in seconds.
+fn age(stored: *const Stored, now: i64) -> i64 {
+    const head = stored.*.head()
+    var served = stored.*.responseTime
+    _ = dateHeader(head, "Date", &served)
+    var ageValue: i64 = 0
+    var value: []const u8 = head[0..0]
+    if headerValue(head, "Age", &value) {
+        for c in value {
+            if c < 48 || c > 57 { break }
+            ageValue = ageValue * 10 + @intCast(i64, c - 48)
+        }
+    }
+    const apparent = if stored.*.responseTime > served { stored.*.responseTime - served } else { 0 }
+    const corrected = ageValue + (stored.*.responseTime - stored.*.requestTime)
+    const initial = if apparent > corrected { apparent } else { corrected }
+    return initial + (now - stored.*.responseTime)
+}
+
+// Whether the stored response may be the answer without asking the
+// server: fresh, and nothing (the request's no-cache or max-age=0, the
+// response's no-cache) asks for it to be validated.
+pub fn isFresh(stored: *const Stored, requestHeaders: []const u8, now: i64) -> bool {
+    const head = stored.*.head()
+    const control = cacheControl(head)
+    if hasDirective(control, "no-cache") { return false }
+    const asked = cacheControl(requestHeaders)
+    var maxAge: i64 = 0
+    if hasDirective(asked, "no-cache") { return false }
+    var pragma: []const u8 = requestHeaders[0..0]
+    if headerValue(requestHeaders, "Pragma", &pragma) && headers.contains(pragma, "no-cache") { return false }
+    const current = age(stored, now)
+    if directive(asked, "max-age", &maxAge) && maxAge >= 0 && (maxAge == 0 || current > maxAge) { return false }
+    return lifetime(head, stored.*.responseTime) > current
+}
+
+// The conditional headers that revalidate the stored response (ETag's
+// If-None-Match, Last-Modified's If-Modified-Since), appended to LINES;
+// false when it has no validator.
+pub fn validators(stored: *const Stored, lines: *std.ArrayList(u8)) -> bool {
+    const head = stored.*.head()
+    var any = false
+    var value: []const u8 = head[0..0]
+    if headerValue(head, "ETag", &value) {
+        _ = lines.*.appendSlice("If-None-Match: ")
+        _ = lines.*.appendSlice(value)
+        _ = lines.*.appendSlice("\r\n")
+        any = true
+    }
+    if headerValue(head, "Last-Modified", &value) {
+        _ = lines.*.appendSlice("If-Modified-Since: ")
+        _ = lines.*.appendSlice(value)
+        _ = lines.*.appendSlice("\r\n")
+        any = true
+    }
+    return any
+}
+
+// Whether the request asks for a validation of its own (conditional
+// headers WebCore's memory cache sent, a range).
+pub fn isConditional(requestHeaders: []const u8) -> bool {
+    var value: []const u8 = requestHeaders[0..0]
+    return headerValue(requestHeaders, "If-None-Match", &value) || headerValue(requestHeaders, "If-Modified-Since", &value) || headerValue(requestHeaders, "Range", &value) || headerValue(requestHeaders, "If-Match", &value) || headerValue(requestHeaders, "If-Unmodified-Since", &value)
+}
+
+// Whether the request forbids storing (its Cache-Control's no-store).
+pub fn forbidsStoring(requestHeaders: []const u8) -> bool {
+    return hasDirective(cacheControl(requestHeaders), "no-store")
+}
+
+// ---------------------------------------------------------------------------
+// Storing
+
+fn storableStatus(status: u32) -> bool {
+    return status == 200 || status == 203 || status == 300 || status == 301 || status == 308 || status == 404 || status == 410
+}
+
+// Whether a response may be stored (RFC 9111 3, for a private cache).
+fn storable(requestHeaders: []const u8, status: u32, head: []const u8, bodyLength: usize) -> bool {
+    if !storableStatus(status) { return false }
+    const control = cacheControl(head)
+    if hasDirective(control, "no-store") || forbidsStoring(requestHeaders) { return false }
+    var value: []const u8 = head[0..0]
+    if headerValue(head, "Vary", &value) && trimmed(value).length == 1 && trimmed(value)[0] == 42 { return false }
+    if headerValue(requestHeaders, "Authorization", &value) && !hasDirective(control, "public") && !hasDirective(control, "s-maxage") && !hasDirective(control, "must-revalidate") { return false }
+    if @intCast(u64, bodyLength) > limit / 8 { return false }
+    var number: i64 = 0
+    const explicit = directive(control, "max-age", &number) || headerValue(head, "Expires", &value)
+    const validator = headerValue(head, "ETag", &value) || headerValue(head, "Last-Modified", &value)
+    return explicit || validator
+}
+
+// Writes an entry's file (whole or not at all) and notes it in the index.
+fn writeEntry(name: u64, key: []const u8, head: []const u8, body: []const u8, requestTime: i64, responseTime: i64) -> void {
+    var bytes = std.ArrayList(u8).init(std.heap.allocator())
+    if !bytes.ensureTotalCapacity(HEADER_SIZE + key.length + head.length + body.length) { return }
+    _ = bytes.appendSlice(MAGIC)
+    putU64(&bytes, @bitCast(u64, requestTime))
+    putU64(&bytes, @bitCast(u64, responseTime))
+    putU64(&bytes, @intCast(u64, key.length))
+    putU64(&bytes, @intCast(u64, head.length))
+    putU64(&bytes, @intCast(u64, body.length))
+    _ = bytes.appendSlice(key)
+    _ = bytes.appendSlice(head)
+    _ = bytes.appendSlice(body)
+    var path: Path = undefined
+    if !pathOf(name, "", &path) { return }
+    const old = index.fetchRemove(name)
+    if old != null { total = if total >= old.?.size { total - old.?.size } else { 0 } }
+    const written = bytes.items()
+    if !std.fs.replaceFile(pathText(&path), written.pointer, written.length, 384) { return }
+    _ = index.put(name, Record.{ .size = @intCast(u64, written.length), .used = nowNanoseconds() })
+    total += @intCast(u64, written.length)
+    evict()
+}
+
+// Stores the response to a request, or takes away the entry it replaces
+// when it may not be stored.
+pub fn store(method: []const u8, url: []const u8, requestHeaders: []const u8, status: u32, head: []const u8, body: []const u8, requestTime: i64, responseTime: i64) -> void {
+    if !ready { return }
+    var base = std.ArrayList(u8).init(std.heap.allocator())
+    makeKey(&base, method, url, requestHeaders, "")
+    const baseName = hashOf(base.items())
+    var vary: []const u8 = head[0..0]
+    const hasVary = headerValue(head, "Vary", &vary)
+    var key = std.ArrayList(u8).init(std.heap.allocator())
+    makeKey(&key, method, url, requestHeaders, vary)
+    const name = hashOf(key.items())
+    if !storable(requestHeaders, status, head, body.length) {
+        if index.contains(name) { forget(name) }
+        return
+    }
+    // The URL's Vary, for the keys of its next requests.
+    var varyPath: Path = undefined
+    if pathOf(baseName, ".vary", &varyPath) {
+        if hasVary {
+            _ = std.fs.replaceFile(pathText(&varyPath), vary.pointer, vary.length, 384)
+        } else {
+            _ = std.fs.delete(pathText(&varyPath))
+        }
+    }
+    writeEntry(name, key.items(), head, body, requestTime, responseTime)
+}
+
+// Whether the header line LINE's name is NAME.
+fn lineNamed(line: []const u8, name: []const u8) -> bool {
+    return line.length > name.length && line[name.length] == 58 && headers.equalsIgnoringCase(line[0..name.length], name)
+}
+
+fn lineName(line: []const u8) -> []const u8 {
+    var end: usize = 0
+    while end < line.length && line[end] != 58 { end += 1 }
+    return line[0..end]
+}
+
+// Whether a 304's header updates the stored head's (RFC 9111 3.2: all
+// but those of the body's framing).
+fn updates(name: []const u8) -> bool {
+    return !headers.equalsIgnoringCase(name, "Content-Length") && !headers.equalsIgnoringCase(name, "Content-Encoding") && !headers.equalsIgnoringCase(name, "Transfer-Encoding") && !headers.equalsIgnoringCase(name, "Content-Range")
+}
+
+// The head of a stored response after a 304 (FRESH: the 304's head):
+// its status line and headers, those the 304 has replaced by the 304's.
+// Into MERGED.
+pub fn merge(stored: *const Stored, fresh: []const u8, merged: *std.ArrayList(u8)) -> void {
+    const head = stored.*.head()
+    var at: usize = 0
+    var first = true
+    while at < head.length {
+        var end = at
+        while end < head.length && head[end] != 10 { end += 1 }
+        var line = head[at..end]
+        at = end + 1
+        if line.length > 0 && line[line.length - 1] == 13 { line = line[0..line.length - 1] }
+        if line.length == 0 { continue }
+        if !first {
+            const name = lineName(line)
+            var replaced: []const u8 = name[0..0]
+            if updates(name) && headerValue(fresh, name, &replaced) { continue }
+        }
+        first = false
+        _ = merged.*.appendSlice(line)
+        _ = merged.*.appendSlice("\r\n")
+    }
+    at = 0
+    first = true
+    while at < fresh.length {
+        var end = at
+        while end < fresh.length && fresh[end] != 10 { end += 1 }
+        var line = fresh[at..end]
+        at = end + 1
+        if line.length > 0 && line[line.length - 1] == 13 { line = line[0..line.length - 1] }
+        if first {
+            first = false
+            continue
+        }
+        if line.length == 0 || !updates(lineName(line)) { continue }
+        _ = merged.*.appendSlice(line)
+        _ = merged.*.appendSlice("\r\n")
+    }
+    _ = merged.*.appendSlice("\r\n")
+}
+
+// The stored entry after a 304: its new head and times written.
+pub fn refresh(stored: *const Stored, merged: []const u8, requestTime: i64, responseTime: i64) -> void {
+    if !ready { return }
+    const bytes = stored.*.data.items()
+    writeEntry(stored.*.name, bytes[stored.*.keyAt..stored.*.keyAt + stored.*.keyLength], merged, stored.*.body(), requestTime, responseTime)
+}
+
+// An unsafe method's success: the URL's entries for GET go.
+pub fn invalidate(url: []const u8, requestHeaders: []const u8) -> void {
+    if !ready { return }
+    var base = std.ArrayList(u8).init(std.heap.allocator())
+    makeKey(&base, "GET", url, requestHeaders, "")
+    const baseName = hashOf(base.items())
+    var vary = std.ArrayList(u8).init(std.heap.allocator())
+    varyOf(baseName, &vary)
+    var key = std.ArrayList(u8).init(std.heap.allocator())
+    makeKey(&key, "GET", url, requestHeaders, vary.items())
+    const name = hashOf(key.items())
+    if index.contains(name) { forget(name) }
+    if index.contains(baseName) { forget(baseName) }
+}
+
+pub fn now() -> i64 { return x509.now() }
