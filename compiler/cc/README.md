@@ -803,7 +803,10 @@ and the outputs stored after (the callee-saved registers the text
 clobbers kept around it). The assembler knows the integer, string, bit,
 SSE and fence instructions with every addressing form, local labels
 (`1:` with `1b` and `1f`, and named ones) for the jumps inside the
-text, and the data directives (`tests/inlineasm.c` against gcc's build;
+text, a call (or jump) of a symbol out of the text, a relocation as
+GNU as makes it, the stack 16-byte aligned at a call (libpas's
+double-free check), and the data directives (`tests/inlineasm.c`
+against gcc's build;
 `tests/asmencoding.c` prints each instruction's bytes, which are GNU
 as's). JavaScriptCore's copy loops for the garbage collector
 (`movups` through `xmm0`-`xmm3` with local labels), `rep stosq`, `divq`
@@ -904,9 +907,9 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   thread-local variable is the program's own (local exec): one in a
   shared library, or a C++ `thread_local` object constructed per
   thread, is not supported (the main thread's is constructed at start). Inline
-  `asm` has no floating-point register operands (`x`, `t`), no jumps
-  out of its text (`asm goto`, a call of a symbol) and no other
-  sections; the x87 and AVX instructions are not assembled.
+  `asm` has no floating-point register operands (`x`, `t`), no `asm
+  goto`, no data naming a symbol and no other sections; the x87 and AVX
+  instructions are not assembled.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where
   only larger ones are.
 - No optimization: the code is correct and slow.

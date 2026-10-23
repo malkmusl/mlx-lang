@@ -50,6 +50,17 @@ static uint64_t divide(uint64_t high, uint64_t low, uint64_t divisor, uint64_t *
 
 struct Regs { uint64_t rbx, r12; };
 
+/* A call of a symbol out of the text (libpas's double-free check in
+   pas_segregated_page_inlines.h: btrl, jc over a call). */
+int asm_calls;
+void asm_note(void) { asm_calls += 1; }
+
+static unsigned clear_bit(unsigned word, unsigned bit) {
+    __asm__ volatile("btrl %1, %0\n\tjc 0f\n\tcall asm_note\n\t0:"
+                     : "+r"(word) : "r"(bit) : "memory");
+    return word;
+}
+
 int main(void) {
     uint64_t src[37], dst[37];
     for (int i = 0; i < 37; i++) { src[i] = i * 3 + 1; dst[i] = 0; }
@@ -95,5 +106,10 @@ int main(void) {
     int k = 1 << 20;
     asm("bsrl %1, %0" : "=r"(k) : "r"(k));
     printf("%d\n", k);
+    unsigned cleared = clear_bit(6, 2);
+    printf("%u %d\n", cleared, asm_calls);
+    clear_bit(6, 0);
+    asm volatile("call asm_note" ::: "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory");
+    printf("%d\n", asm_calls);
     return 0;
 }
