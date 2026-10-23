@@ -54,6 +54,7 @@
 #include "CommonAtomStrings.h"
 #include "port/MlxWebPort.h"
 #include "port/embed/MlxFrameLoaderClient.h"
+#include "UserAgent.h"
 #include "CookieJar.h"
 #include "port/embed/MlxNetwork.h"
 #include "port/embed/MlxWebSocket.h"
@@ -579,6 +580,11 @@ int main(int argc, char** argv)
     static Engine engine;
     engine.size = size;
     engine.trace = getenv("VOYAGER_TRACE");
+    // The user agent: WebKit's compatibility string, Voyager's name and
+    // version, the engine's token.
+    MlxFrameLoaderClient::setApplicationNameForUserAgent("Voyager"_s, "0.1"_s);
+    if (engine.trace)
+        fprintf(stderr, "voyager: user agent %s\n", standardUserAgent("Voyager"_s, "0.1"_s).utf8().data());
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
     configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine.dirty);
     configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();

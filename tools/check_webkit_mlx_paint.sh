@@ -69,7 +69,7 @@ while read -r page tolerance allow cause; do
     if [[ ${#chosen[@]} -gt 0 ]] && [[ ! " ${chosen[*]} " == *" $page "* ]]; then continue; fi
     out=$work/${page%.*}.png
     status=0
-    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" timeout 300 "$program" --font "$ahem" \
+    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" timeout 300 "$program" --size 800x600 --font "$ahem" \
         --png "$out" --reference "$pages/${page%.*}-expected.png" --tolerance "$tolerance" --allow "$allow" \
         "$repo_root/$pages/$page" > /dev/null 2> "$work/err.txt" || status=$?
     [[ -n "$keep" && -f "$out" ]] && cp "$out" "$keep/"

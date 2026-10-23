@@ -8,10 +8,11 @@
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
 // strategies and loader; WebCore's empty clients for the rest) with a main
-// frame of 800x600 (--size) loads the file (a path) or the URL (file: or
-// data:), WTF's generic RunLoop runs until the frame has finished loading
-// and no load is pending (subresources, fonts), the view is laid out and
-// its render tree written to standard output. The settings are those
+// frame of 1280x800 (--size; the layout and paint checks give 800x600)
+// loads the file (a path) or the URL (file: or data:), WTF's generic
+// RunLoop runs until the frame has finished loading and no load is
+// pending (subresources, fonts), the view is laid out and its render tree
+// written to standard output. The settings are those
 // WebKitTestRunner gives a test (its fonts' families, sizes and file
 // access, glyphs unhinted); --font adds the fonts of a file as the test
 // runner's test fonts (Ahem); fonts are matched by std.fontconfig with the environment's
@@ -54,6 +55,7 @@
 #include "FontRenderOptions.h"
 #include "GraphicsContextSkia.h"
 #include "FrameLoader.h"
+#include "NavigationScheduler.h"
 #include "LocalFrame.h"
 #include "LocalFrameInlines.h"
 #include "LocalFrameView.h"
@@ -196,7 +198,7 @@ struct Run {
 
 // Whether the frame's document has loaded with nothing pending: its load
 // finished, the parser done, no request of its resource loader (images,
-// style sheets, fonts) outstanding.
+// style sheets, fonts) outstanding, no navigation queued or provisional.
 static bool isQuiet(Run& run)
 {
     if (!run.loadFinished)
@@ -207,6 +209,10 @@ static bool isQuiet(Run& run)
     if (document->parsing() || document->cachedResourceLoader().requestCount())
         return false;
     if (!run.waitTitle.isNull() && document->title() != run.waitTitle)
+        return false;
+    // (Nor a navigation on its way: a form a script submitted, a
+    // redirect the page scheduled, a load not committed yet.)
+    if (run.frame->navigationScheduler().hasQueuedNavigation() || run.frame->loader().provisionalDocumentLoader())
         return false;
     return run.frame->loader().isComplete();
 }
@@ -237,7 +243,7 @@ static void check(Run& run)
 
 int main(int argc, char** argv)
 {
-    IntSize viewSize(800, 600);
+    IntSize viewSize(1280, 800);
     bool script = true;
     bool subpixel = false;
     bool boxes = false;
@@ -323,6 +329,9 @@ int main(int argc, char** argv)
     }
 
     static MlxFrameLoaderClient* mainClient;
+    // Its user agent: the port's with its own name (as Voyager's has
+    // "Voyager/0.1").
+    MlxFrameLoaderClient::setApplicationNameForUserAgent("webcore-dump"_s, "0.1"_s);
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
     configuration.cookieJar = MlxNetwork::cookieJar();
     configuration.socketProvider = MlxWebSocket::socketProvider();

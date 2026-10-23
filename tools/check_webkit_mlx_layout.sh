@@ -112,7 +112,7 @@ for test in "${tests[@]}"; do
     [[ -n "$expected" ]] || fail "$test has no -expected.txt"
     out=$work/out.txt
     status=0
-    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" timeout 300 "$program" --font "$ahem" "$repo_root/$layout/LayoutTests/$test" > "$out" 2> "$work/err.txt" || status=$?
+    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" timeout 300 "$program" --size 800x600 --font "$ahem" "$repo_root/$layout/LayoutTests/$test" > "$out" 2> "$work/err.txt" || status=$?
     if [[ -n "$keep" ]]; then
         mkdir -p "$keep/$(dirname "$test")"
         cp "$out" "$keep/${test%.*}-actual.txt"

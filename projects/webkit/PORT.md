@@ -127,9 +127,9 @@ Four ways to choose without patching, in this order of preference:
   pages of tests/paint (boxes and a translucent background, borders and
   an outline, Ahem text, linear gradients, a PNG image through the port's
   std.png decoder at its size and scaled) against references that
-  make_references.py computes from what each page draws: 4 of 5 match to
-  the pixel (a channel off by 1 at most); the gradient page is known to
-  crash (pages.txt says why). M4 found mlx-cc's class template instance
+  make_references.py computes from what each page draws: 5 of 5 match to
+  the pixel (a channel off by 1 at most; the gradient page crashed until
+  mlx-cc's decltype(auto) fix of epoch 8). M4 found mlx-cc's class template instance
   made through a reference while its argument was only declared (no size:
   BorderEdges returned in registers, epoch 6).
 - **M5, done**: Voyager (projects/voyager, `./mlx build
@@ -169,12 +169,51 @@ Four ways to choose without patching, in this order of preference:
   and the same over https from std.tls's new server side,
   std/src/tls/server.mlx, with a test root and certificate it makes at
   start with std.asn1's DER writer and Ed25519) and compares what
-  webcore-dump prints of 15 pages, then that an unknown root is refused:
-  16 of 16. tools/check_voyager.sh types an address and goes back and
+  webcore-dump prints of 16 pages (the user agent's among them), then
+  that an unknown root is refused: 17 of 17. tools/check_voyager.sh types an address and goes back and
   forward. https://example.com loads headless (its text printed) when
   this machine reaches it; no check depends on the network. M6 found
   mlx-cc's generic lambda converted to a function pointer (the closure's
   address taken: epoch 7).
+- **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
+  www.wikipedia.org, info.cern.ch, example.com, google.com and
+  lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
+  layout and paint checks give `--size 800x600`), and Voyager shows
+  example.com. They found in mlx-cc (epochs 8 and 9, each with a test in
+  compiler/cc/tests/cpp): a class returned from a `decltype(auto)`
+  function copied by its bytes (WTF::switchOn, std::apply: a gradient's
+  color stops pointing into a dead temporary; decltypeautoclass);
+  `c ? f() : g()` of a class moved into its result by its bytes (a
+  GlyphBuffer cached with its inline vectors pointing at the stack;
+  conditionalselfpointer); `Vector<T> v { n }` taken as a list of one
+  element (pagination's line adjustments; listctornumber); `++it` of a
+  class whose only increment is its `operator unsigned &()` (GridSpan's
+  range-for ran past its span; conversionincrement); in mlxlibcpp, a
+  ranges projection's reference copied (a WebAnimation destroyed while
+  referenced; rangesprojectionref). std.crash's report now has 64 frames
+  with long C++ names shortened on stderr (whole in crashes.log), and an
+  abort says abort() was called.
+
+### The user agent
+
+`Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like
+Gecko) Version/60.5 Safari/605.1.15 Voyager/0.1 WebKit/2.54.1`: WebKit's
+compatibility string exactly as the GLib ports build it (UserAgentGLib.cpp's
+buildUserAgentString, Version/60.5 on purpose: sites turn away low and some
+high Safari versions), then the embedder's name and version
+(`MlxFrameLoaderClient::setApplicationNameForUserAgent`: Voyager's
+"Voyager/0.1", webcore-dump's "webcore-dump/0.1"), then the engine's token,
+the one constant `ENGINE_TOKEN` in port/platform/mlx/UserAgentMlx.cpp
+(Lattice makes it "Lattice/0.0.1"). navigator.userAgent and the requests'
+User-Agent header are the same string (the client's userAgent(); std.http's
+client sends the request's own User-Agent instead of its default).
+Per-site quirks are WebKit's platform/glib/UserAgentQuirks.cpp, compiled
+unmodified (lists/webcore-mlx-sources.txt; the port defines
+WTF::chassisType(), desktop, which GLib's reads from /etc/machine-info):
+a quirk's string is built as buildUserAgentString builds it, without the
+embedder's and the engine's tokens. tools/check_webkit_mlx_network.sh's
+user-agent page checks the header and navigator.userAgent;
+tools/check_voyager.sh Voyager's string.
 
 ## The shape of the port
 
@@ -509,6 +548,12 @@ none is solved by a patch.
 - **mlx-cc**: M2's pace is the C++ compiler's (WEBCORE.md); WebCore's
   units need 2 to 4 GB each, so they build with `-j 2` in this
   machine's memory.
+- **Classes moved by their bytes in mlx-cc.** A class value moved into
+  a temporary is still copied by its bytes where it is no call's result
+  (a conditional branch whose own temporaries end first:
+  `c ? f(String("x")) : g()`): an object pointing into itself (a Vector's
+  inline buffer) would point into the dead one. The calls' results are
+  made in place (epoch 8); the rest is open.
 - **Absolute paths of the build tree.** jsc names
   `mlx-out/libc/libmlxc.so.1` and mlx-unicode by absolute paths of the
   checkout (mlx-cc writes no runpath); installed, they are

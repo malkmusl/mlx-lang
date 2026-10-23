@@ -65,14 +65,14 @@ struct Answer {
 }
 
 // The headers WebCore's request has that the client writes itself (the
-// connection's, the body's length, the cookies of the jar).
+// connection's, the body's length, the cookies of the jar). WebCore's
+// User-Agent is sent: std.http's client then leaves out its own.
 static bool clientWritesHeader(const String& name)
 {
     return equalLettersIgnoringASCIICase(name, "host"_s)
         || equalLettersIgnoringASCIICase(name, "connection"_s)
         || equalLettersIgnoringASCIICase(name, "content-length"_s)
         || equalLettersIgnoringASCIICase(name, "accept-encoding"_s)
-        || equalLettersIgnoringASCIICase(name, "user-agent"_s)
         || equalLettersIgnoringASCIICase(name, "cookie"_s);
 }
 
