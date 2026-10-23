@@ -79,6 +79,7 @@ run tests/343_flate_runtime.mlx
 run tests/264_ui_layout_runtime.mlx
 run tests/284_ui_widgets_runtime.mlx
 run tests/409_ui_field_long_runtime.mlx
+run tests/412_ui_chooser_runtime.mlx
 
 # The builder's module passes the Khronos validator, and modules from
 # glslang pass std.spirv.module.
