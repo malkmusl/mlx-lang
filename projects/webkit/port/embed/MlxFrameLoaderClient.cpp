@@ -2,6 +2,7 @@
 #include "config.h"
 #include "MlxFrameLoaderClient.h"
 
+#include "Chrome.h"
 #include "Document.h"
 #include "DocumentLoader.h"
 #include "FormState.h"
@@ -13,6 +14,9 @@
 #include "LocalFrame.h"
 #include "LocalFrameView.h"
 #include "MIMETypeRegistry.h"
+#include "NavigationAction.h"
+#include "Page.h"
+#include "WindowFeatures.h"
 #include "ResourceError.h"
 #include "ResourceRequest.h"
 #include "ResourceResponse.h"
@@ -143,20 +147,33 @@ void MlxFrameLoaderClient::dispatchDidFinishLoad()
 void MlxFrameLoaderClient::dispatchDidReachLayoutMilestone(OptionSet<LayoutMilestone>) { }
 void MlxFrameLoaderClient::dispatchDidReachVisuallyNonEmptyState() { }
 
-LocalFrame* MlxFrameLoaderClient::dispatchCreatePage(const NavigationAction&, NewFrameOpenerPolicy, const String&) { return nullptr; }
+// A new page for a link's or a form's target (`target=_blank`): the one
+// the page's chrome client makes for window.open too (an embedder with
+// tabs gives a new tab; WebCore's empty chrome client none).
+LocalFrame* MlxFrameLoaderClient::dispatchCreatePage(const NavigationAction& action, NewFrameOpenerPolicy, const String& name)
+{
+    Ref frame = m_loader->frame();
+    RefPtr page = frame->page();
+    if (!page)
+        return nullptr;
+    RefPtr newPage = page->chrome().createWindow(frame, name, { }, action);
+    return newPage ? newPage->localMainFrame() : nullptr;
+}
 void MlxFrameLoaderClient::dispatchShow() { }
 
 // What the embedder allows: every navigation of the frame itself and every
-// response it can show; no new window.
+// response it can show; a new window where its chrome client makes one
+// (dispatchCreatePage).
 void MlxFrameLoaderClient::dispatchDecidePolicyForResponse(const ResourceResponse& response, const ResourceRequest&, const String&, FramePolicyFunction&& function)
 {
     MLX_TRACE("response %s (%s): %s", response.url().string().utf8().data(), response.mimeType().utf8().data(), canShowMIMEType(response.mimeType()) ? "shown" : "ignored");
     function(canShowMIMEType(response.mimeType()) ? PolicyAction::Use : PolicyAction::Ignore);
 }
 
-void MlxFrameLoaderClient::dispatchDecidePolicyForNewWindowAction(const NavigationAction&, const ResourceRequest&, FormState*, const String&, std::optional<HitTestResult>&&, FramePolicyFunction&& function)
+void MlxFrameLoaderClient::dispatchDecidePolicyForNewWindowAction(const NavigationAction&, const ResourceRequest& request, FormState*, const String&, std::optional<HitTestResult>&&, FramePolicyFunction&& function)
 {
-    function(PolicyAction::Ignore);
+    MLX_TRACE("new window for %s", request.url().string().utf8().data());
+    function(PolicyAction::Use);
 }
 
 void MlxFrameLoaderClient::dispatchDecidePolicyForNavigationAction(const NavigationAction&, const ResourceRequest& request, const ResourceResponse&, FormState*, const String&, std::optional<NavigationIdentifier>, std::optional<HitTestResult>&&, bool, NavigationUpgradeToHTTPSBehavior, SandboxFlags, PolicyDecisionMode, FramePolicyFunction&& function)
