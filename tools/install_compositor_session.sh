@@ -40,6 +40,10 @@
 #   PREFIX/share/icons/hicolor/128x128/apps/org.mlx.files.png,
 #                                     org.mlx.settings.png,
 #                                     org.mlx.observatory.png
+#   PREFIX/bin/mlx/voyager, PREFIX/share/applications/org.mlx.voyager.desktop,
+#   PREFIX/share/icons/hicolor/128x128/apps/org.mlx.voyager.png
+#                                     (the browser, when its WebKit build is
+#                                     there: ./mlx build webkit-mlx-voyager)
 #   PREFIX/lib/mlx-audio/libpulse.so.0, libpulse-simple.so.0,
 #                                     libpulse-mainloop-glib.so.0,
 #                                     libasound_module_pcm_pulse.so,
@@ -303,7 +307,7 @@ if [[ $uninstall -eq 1 ]]; then
     path="$destdir$capture_libs/libpipewire-0.3.so.0"
     [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     [[ -d "$destdir$capture_libs" ]] && as_owner "$destdir$capture_libs" rmdir --ignore-fail-on-non-empty -- "$destdir$capture_libs"
-    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.settings.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service" "$destdir$services/org.freedesktop.Notifications.service"; do
+    for path in "$destdir$applications/mlx-settings.desktop" "$destdir$applications/org.mlx.files.desktop" "$destdir$applications/org.mlx.observatory.desktop" "$destdir$icons/org.mlx.files.png" "$destdir$icons/org.mlx.settings.png" "$destdir$icons/org.mlx.observatory.png" "$destdir$bindir/voyager" "$destdir$applications/org.mlx.voyager.desktop" "$destdir$icons/org.mlx.voyager.png" "$destdir$services/org.mlx.Audio.service" "$destdir$services/org.mlx.PermissionAgent.service" "$destdir$services/org.freedesktop.portal.Desktop.service" "$destdir$services/org.freedesktop.Notifications.service"; do
         [[ -e "$path" ]] && as_owner "$path" rm -f -- "$path" && echo "removed $path"
     done
     mlx_remove_path_files "$destdir" "$bindir" "$(owner_runner "$destdir/etc")"
@@ -359,6 +363,7 @@ sed "s|@BINDIR@|$bindir|g" projects/desktop/settings/mlx-settings.desktop.in > "
 sed "s|@BINDIR@|$bindir|g" projects/desktop/files/org.mlx.files.desktop.in > "$build/org.mlx.files.desktop"
 sed "s|@BINDIR@|$bindir|g; s|@ROOT@|$repo_root|g" projects/observatory/org.mlx.observatory.desktop.in > "$build/org.mlx.observatory.desktop"
 sed "s|@BINDIR@|$bindir|g" projects/desktop/compositor/session/mlx-compositor.desktop.in > "$build/mlx-compositor.desktop"
+sed "s|@BINDIR@|$bindir|g" projects/voyager/org.mlx.voyager.desktop.in > "$build/org.mlx.voyager.desktop"
 echo "built $build/mlx-compositor, mlx-terminal, mlx-sh, mlx-console, mlx-dock, mlx-topbar, mlx-launcher, mlx-settings, mlx-files, mlx-observatory, mlx-profile, mlx-capture and its OBS plugin, mlx-ipcd and mlx-ipc, mlx-audiod and mlx-audio, mlx-permissions, mlx-notifyd and mlx-notify"
 echo "built $build/libpulse: MLX Audio's libpulse, libpulse-simple, libpulse-mainloop-glib and ALSA plugin${deb:+, the package mlx-audio-libs}"
 echo "built $build/libpipewire: MLX Capture's libpipewire${deb:+, the package mlx-capture-libs}"
@@ -375,6 +380,16 @@ as_owner "$destdir$applications" install -d "$destdir$applications"
 as_owner "$destdir$applications" install -m 644 "$build/mlx-settings.desktop" "$build/org.mlx.files.desktop" "$build/org.mlx.observatory.desktop" "$destdir$applications/"
 as_owner "$destdir$icons" install -d "$destdir$icons"
 as_owner "$destdir$icons" install -m 644 projects/desktop/files/org.mlx.files.png projects/desktop/settings/org.mlx.settings.png projects/observatory/org.mlx.observatory.png "$destdir$icons/"
+# Voyager, the browser, when its WebKit build is there (it takes a while:
+# ./mlx build webkit-mlx-voyager, PORT.md).
+voyager=mlx-out/webkit/mlx/bin/voyager
+if [[ -x "$voyager" ]]; then
+    as_owner "$destdir$bindir" install -m 755 "$voyager" "$destdir$bindir/"
+    as_owner "$destdir$applications" install -m 644 "$build/org.mlx.voyager.desktop" "$destdir$applications/"
+    as_owner "$destdir$icons" install -m 644 projects/voyager/org.mlx.voyager.png "$destdir$icons/"
+else
+    echo "Voyager is not built (./mlx build webkit-mlx-voyager): not installed"
+fi
 as_owner "$destdir$services" install -d "$destdir$services"
 as_owner "$destdir$services" install -m 644 "$build/org.mlx.Audio.service" "$build/org.mlx.PermissionAgent.service" "$build/org.freedesktop.portal.Desktop.service" "$build/org.freedesktop.Notifications.service" "$destdir$services/"
 as_owner "$destdir$audio_libs" install -d "$destdir$audio_libs"

@@ -48,6 +48,11 @@ settings_entry="$work/root/usr/share/applications/mlx-settings.desktop"
 grep -qx "Icon=org.mlx.settings" "$settings_entry" && grep -qx "StartupWMClass=org.mlx.settings" "$settings_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.settings.png" ]] || { echo "the settings' entry or icon is missing" >&2; exit 1; }
 observatory_entry="$work/root/usr/share/applications/org.mlx.observatory.desktop"
 grep -qx "Exec=/usr/bin/mlx/mlx-observatory $repo_root" "$observatory_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.observatory.png" ]] || { echo "MLX Observatory's entry or icon is missing" >&2; exit 1; }
+# Voyager, when its WebKit build is there.
+if [[ -x mlx-out/webkit/mlx/bin/voyager ]]; then
+    voyager_entry="$work/root/usr/share/applications/org.mlx.voyager.desktop"
+    grep -qx "Exec=/usr/bin/mlx/voyager %U" "$voyager_entry" && grep -qx "StartupWMClass=org.mlx.voyager" "$voyager_entry" && [[ -x "$work/root/usr/bin/mlx/voyager" && -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.voyager.png" ]] || { echo "Voyager's entry, icon or program is missing" >&2; exit 1; }
+fi
 echo "ok   staged install: programs in PREFIX/bin/mlx, MLX Audio's libraries in PREFIX/lib/mlx-audio, session entry in wayland-sessions; the sound servers replaced and restored"
 
 # A systemctl that has PipeWire's user units and logs what it is told:
