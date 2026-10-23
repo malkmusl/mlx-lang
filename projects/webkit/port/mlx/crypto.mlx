@@ -1,0 +1,974 @@
+// WebCrypto's platform half (the port's crypto/mlx, PORT.md "Crypto"):
+// what WebKit's algorithm classes ask of a crypto library, over std's
+// own: digests, HMAC, HKDF and PBKDF2 (std.crypto.hash), AES-CBC, CFB-8,
+// CTR, GCM and KW (std.aes, std.crypto.gcm), ECDSA and ECDH on P-256,
+// P-384 and P-521 (std.crypto.ecc), Ed25519 and X25519
+// (std.crypto.curve25519), RSASSA-PKCS1-v1_5, RSA-PSS and RSA-OAEP
+// (std.crypto.rsa, keys made with std.crypto.mpi), the keys' SPKI and
+// PKCS #8 forms (std.asn1), and the kernel's random bytes (std.random)
+// for getRandomValues, randomUUID and every key made.
+//
+// The C++ side (port/crypto/mlx) keeps a key's bytes; each function here
+// takes them as pointers and lengths and writes into buffers the caller
+// sized. What has no size known beforehand (an RSA key made, a key read
+// from DER, a key written as DER) comes back as Parts: byte strings in
+// order, which the caller reads and releases. An RSA key in use is a
+// handle (RsaKey) made once from its parts.
+const std = @import("std")
+const hash = @import("std.crypto.hash")
+const aes = @import("std.aes")
+const gcm = @import("std.crypto.gcm")
+const ecc = @import("std.crypto.ecc")
+const curve25519 = @import("std.crypto.curve25519")
+const rsa = @import("std.crypto.rsa")
+const mpi = @import("std.crypto.mpi")
+const bignum = @import("std.crypto.bignum")
+const asn1 = @import("std.asn1")
+const random = @import("std.random")
+
+// The hashes as MlxWebPort.h numbers them (their bits; 1 for SHA-1).
+pub const SHA1: u32 = 1
+pub const SHA256: u32 = 256
+pub const SHA384: u32 = 384
+pub const SHA512: u32 = 512
+
+// The kinds of keys in SPKI and PKCS #8 (Parts' first part says which).
+pub const KIND_RSA: u8 = 1
+pub const KIND_EC: u8 = 2
+pub const KIND_ED25519: u8 = 3
+pub const KIND_X25519: u8 = 4
+// (An EC key named for ECDH alone, id-ecDH: read, never written.)
+pub const KIND_ECDH: u8 = 5
+
+// The NIST curves by their bits; P-521's coordinates are 66 bytes.
+pub const P256: u32 = 256
+pub const P384: u32 = 384
+pub const P521: u32 = 521
+
+fn bytesAt(address: usize) -> [*]u8 { return unsafe { @ptrFromInt([*]u8, address) } }
+
+// LENGTH bytes at ADDRESS ("" for none: a null pointer of an empty
+// vector is not read).
+fn view(address: usize, length: usize) -> []const u8 {
+    if length == 0 || address == 0 { return "" }
+    return bytesAt(address)[0..length]
+}
+
+fn algorithmOf(identifier: u32, out: *hash.Algorithm) -> bool {
+    if identifier == SHA1 { out.* = hash.Algorithm.sha1 } else if identifier == SHA256 { out.* = hash.Algorithm.sha256 } else if identifier == SHA384 { out.* = hash.Algorithm.sha384 } else if identifier == SHA512 { out.* = hash.Algorithm.sha512 } else { return false }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Parts
+
+pub const Parts = @noncopy(struct) {
+    bytes: std.ArrayList(u8)
+    ends: std.ArrayList(usize)
+    good: bool
+
+    pub fn init() -> Self {
+        return Self.{ .bytes = std.ArrayList(u8).init(std.heap.allocator()), .ends = std.ArrayList(usize).init(std.heap.allocator()), .good = true }
+    }
+
+    pub fn deinit(self: *Self) -> void {
+        hash.wipe(self.*.bytes.items().pointer, self.*.bytes.count())
+        self.*.bytes.deinit()
+        self.*.ends.deinit()
+    }
+
+    pub fn add(self: *Self, part: []const u8) -> void {
+        if !self.*.bytes.appendSlice(part) { self.*.good = false }
+        if !self.*.ends.append(self.*.bytes.count()) { self.*.good = false }
+    }
+
+    pub fn count(self: *const Self) -> usize { return self.*.ends.count() }
+
+    pub fn at(self: *const Self, index: usize) -> []const u8 {
+        if index >= self.*.ends.count() { return "" }
+        const ends = self.*.ends.items()
+        const start = if index == 0 { 0 } else { ends[index - 1] }
+        return self.*.bytes.items()[start..ends[index]]
+    }
+}
+
+fn partsAt(address: usize) -> *Parts { return unsafe { @ptrFromInt(*Parts, address) } }
+
+// New parts on the heap (0 for no memory); the C++ side adds to them and
+// reads them by index.
+pub fn partsCreate() -> usize {
+    const memory = std.heap.allocator().alloc(@sizeOf(Parts), 16)
+    if memory == null { return 0 }
+    const parts: *Parts = unsafe { @ptrCast(*Parts, memory.?) }
+    parts.* = Parts.init()
+    return @intFromPtr(parts)
+}
+
+pub fn partsRelease(address: usize) -> void {
+    if address == 0 { return }
+    partsAt(address).*.deinit()
+    std.heap.allocator().free(bytesAt(address), @sizeOf(Parts), 16)
+}
+
+pub fn partsAdd(address: usize, bytes: usize, length: usize) -> void {
+    if address != 0 { partsAt(address).*.add(view(bytes, length)) }
+}
+
+pub fn partsCount(address: usize) -> usize { return if address == 0 { 0 } else { partsAt(address).*.count() } }
+
+// Part INDEX: its bytes (0 when empty) and length.
+pub fn partsPart(address: usize, index: usize, length: *usize) -> usize {
+    length.* = 0
+    if address == 0 { return 0 }
+    const part = partsAt(address).*.at(index)
+    length.* = part.length
+    return if part.length == 0 { 0 } else { @intFromPtr(part.pointer) }
+}
+
+// The parts made, or 0 when they ran out of memory (released then).
+fn handed(address: usize) -> usize {
+    if address != 0 && !partsAt(address).*.good {
+        partsRelease(address)
+        return 0
+    }
+    return address
+}
+
+// ---------------------------------------------------------------------------
+// Random bytes, digests, MACs and key derivation
+
+pub fn randomBytes(out: usize, length: usize) -> bool {
+    if length == 0 { return true }
+    return random.fill(bytesAt(out), length)
+}
+
+// The digest of DATA into OUT (room for 64 bytes); its length, 0 for an
+// unknown hash.
+pub fn digest(identifier: u32, data: usize, length: usize, out: usize) -> usize {
+    var algorithm = hash.Algorithm.sha256
+    if !algorithmOf(identifier, &algorithm) { return 0 }
+    hash.digest(algorithm, view(data, length), bytesAt(out))
+    return hash.digestLength(algorithm)
+}
+
+pub fn hmac(identifier: u32, key: usize, keyLength: usize, data: usize, length: usize, out: usize) -> usize {
+    var algorithm = hash.Algorithm.sha256
+    if !algorithmOf(identifier, &algorithm) { return 0 }
+    hash.hmac(algorithm, view(key, keyLength), view(data, length), bytesAt(out))
+    return hash.digestLength(algorithm)
+}
+
+pub fn hkdf(identifier: u32, key: usize, keyLength: usize, salt: usize, saltLength: usize, info: usize, infoLength: usize, out: usize, length: usize) -> bool {
+    var algorithm = hash.Algorithm.sha256
+    if !algorithmOf(identifier, &algorithm) { return false }
+    var prkBytes: [64]u8 = undefined
+    const prk: [*]u8 = &prkBytes
+    hash.hkdfExtract(algorithm, view(salt, saltLength), view(key, keyLength), prk)
+    const made = hash.hkdfExpand(algorithm, prk[0..hash.digestLength(algorithm)], view(info, infoLength), bytesAt(out), length)
+    hash.wipe(prk, 64)
+    return made
+}
+
+pub fn pbkdf2(identifier: u32, password: usize, passwordLength: usize, salt: usize, saltLength: usize, iterations: u64, out: usize, length: usize) -> bool {
+    var algorithm = hash.Algorithm.sha256
+    if !algorithmOf(identifier, &algorithm) { return false }
+    return hash.pbkdf2(algorithm, view(password, passwordLength), view(salt, saltLength), iterations, bytesAt(out), length)
+}
+
+// ---------------------------------------------------------------------------
+// AES
+
+fn xorBlock(into: [*]u8, from: [*]const u8) -> void {
+    var index: usize = 0
+    while index < 16 {
+        into[index] = into[index] ^ from[index]
+        index += 1
+    }
+}
+
+// AES-CBC of LENGTH bytes under KEY with the 16-byte IV into OUT (room
+// for LENGTH + 16), PKCS #7 padding added on encryption and checked and
+// taken off on decryption when PADDING; the result's length in WRITTEN.
+// False for a key of another length, data that is not whole blocks
+// where it must be, or padding that is not.
+pub fn aesCbc(encrypt: bool, padding: bool, key: usize, keyLength: usize, iv: usize, data: usize, length: usize, out: usize, written: *usize) -> bool {
+    written.* = 0
+    var cipher: aes.Aes = undefined
+    if !aes.aesInit(&cipher, bytesAt(key), keyLength) { return false }
+    const input = bytesAt(data)
+    const output = bytesAt(out)
+    var chain: [16]u8 = undefined
+    const previous: [*]u8 = &chain
+    var index: usize = 0
+    while index < 16 {
+        chain[index] = bytesAt(iv)[index]
+        index += 1
+    }
+    var ok = true
+    if encrypt {
+        if !padding && length % 16 != 0 {
+            ok = false
+        } else {
+            const total = if padding { (length / 16 + 1) * 16 } else { length }
+            const pad = @intCast(u8, total - length)
+            var at: usize = 0
+            while at < total {
+                index = 0
+                while index < 16 {
+                    output[at + index] = if at + index < length { input[at + index] } else { pad }
+                    index += 1
+                }
+                const block: [*]u8 = unsafe { output + at }
+                xorBlock(block, previous)
+                aes.aesEncrypt(&cipher, block)
+                index = 0
+                while index < 16 {
+                    chain[index] = block[index]
+                    index += 1
+                }
+                at += 16
+            }
+            written.* = total
+        }
+    } else {
+        if length % 16 != 0 || (padding && length == 0) {
+            ok = false
+        } else {
+            var saved: [16]u8 = undefined
+            var at: usize = 0
+            while at < length {
+                index = 0
+                while index < 16 {
+                    saved[index] = input[at + index]
+                    output[at + index] = input[at + index]
+                    index += 1
+                }
+                const block: [*]u8 = unsafe { output + at }
+                aes.aesDecrypt(&cipher, block)
+                xorBlock(block, previous)
+                index = 0
+                while index < 16 {
+                    chain[index] = saved[index]
+                    index += 1
+                }
+                at += 16
+            }
+            written.* = length
+            if padding {
+                const pad = @intCast(usize, output[length - 1])
+                if pad == 0 || pad > 16 {
+                    ok = false
+                } else {
+                    index = length - pad
+                    while index < length {
+                        if @intCast(usize, output[index]) != pad { ok = false }
+                        index += 1
+                    }
+                }
+                if ok { written.* = length - pad }
+            }
+        }
+    }
+    aes.aesFinish(&cipher)
+    hash.wipe(previous, 16)
+    return ok
+}
+
+// AES-CFB-8 (each byte through a shift register of the last 16 cipher
+// bytes) of LENGTH bytes into OUT.
+pub fn aesCfb8(encrypt: bool, key: usize, keyLength: usize, iv: usize, data: usize, length: usize, out: usize) -> bool {
+    var cipher: aes.Aes = undefined
+    if !aes.aesInit(&cipher, bytesAt(key), keyLength) { return false }
+    var register: [16]u8 = undefined
+    var stream: [16]u8 = undefined
+    const block: [*]u8 = &stream
+    var index: usize = 0
+    while index < 16 {
+        register[index] = bytesAt(iv)[index]
+        index += 1
+    }
+    const input = bytesAt(data)
+    const output = bytesAt(out)
+    var at: usize = 0
+    while at < length {
+        index = 0
+        while index < 16 {
+            stream[index] = register[index]
+            index += 1
+        }
+        aes.aesEncrypt(&cipher, block)
+        const byte = input[at]
+        const result = byte ^ stream[0]
+        output[at] = result
+        index = 0
+        while index < 15 {
+            register[index] = register[index + 1]
+            index += 1
+        }
+        register[15] = if encrypt { result } else { byte }
+        at += 1
+    }
+    aes.aesFinish(&cipher)
+    hash.wipe(block, 16)
+    return true
+}
+
+// AES-CTR with the 16-byte counter block whose last COUNTER_BITS bits
+// count (and wrap within them), into OUT.
+pub fn aesCtr(key: usize, keyLength: usize, counter: usize, counterBits: usize, data: usize, length: usize, out: usize) -> bool {
+    if counterBits == 0 || counterBits > 128 { return false }
+    var cipher: aes.Aes = undefined
+    if !aes.aesInit(&cipher, bytesAt(key), keyLength) { return false }
+    var current: [16]u8 = undefined
+    var stream: [16]u8 = undefined
+    const block: [*]u8 = &stream
+    var index: usize = 0
+    while index < 16 {
+        current[index] = bytesAt(counter)[index]
+        index += 1
+    }
+    const input = bytesAt(data)
+    const output = bytesAt(out)
+    var at: usize = 0
+    while at < length {
+        index = 0
+        while index < 16 {
+            stream[index] = current[index]
+            index += 1
+        }
+        aes.aesEncrypt(&cipher, block)
+        index = 0
+        while index < 16 && at < length {
+            output[at] = input[at] ^ stream[index]
+            at += 1
+            index += 1
+        }
+        // The counter's bits incremented, from the last byte up; the bits
+        // above them stay (a byte shared by both keeps its high bits).
+        var bits = counterBits
+        var position: usize = 16
+        var carry: u16 = 1
+        while bits > 0 && position > 0 && carry != 0 {
+            position -= 1
+            const width: usize = if bits >= 8 { 8 } else { bits }
+            const mask: u16 = (@intCast(u16, 1) << @intCast(u16, width)) - 1
+            const value = @intCast(u16, current[position])
+            const sum = (value & mask) + carry
+            carry = sum >> @intCast(u16, width)
+            current[position] = @intCast(u8, (value & (255 ^ mask)) | (sum & mask))
+            bits -= width
+        }
+    }
+    aes.aesFinish(&cipher)
+    hash.wipe(block, 16)
+    return true
+}
+
+// AES-GCM: on encryption LENGTH bytes into OUT followed by a TAG_LENGTH-
+// byte tag; on decryption DATA ends with the tag, and OUT gets LENGTH -
+// TAG_LENGTH bytes when the tag is right.
+pub fn aesGcm(encrypt: bool, key: usize, keyLength: usize, iv: usize, ivLength: usize, aad: usize, aadLength: usize, tagLength: usize, data: usize, length: usize, out: usize) -> bool {
+    var aead: gcm.Gcm = undefined
+    if !gcm.init(&aead, bytesAt(key), keyLength) { return false }
+    var ok = false
+    if encrypt {
+        ok = gcm.sealIv(&aead, view(iv, ivLength), view(aad, aadLength), bytesAt(data), length, bytesAt(out), unsafe { bytesAt(out) + length }, tagLength)
+    } else if length >= tagLength {
+        const sealed = length - tagLength
+        ok = gcm.openIv(&aead, view(iv, ivLength), view(aad, aadLength), bytesAt(data), sealed, unsafe { bytesAt(data) + sealed }, tagLength, bytesAt(out))
+    }
+    gcm.finish(&aead)
+    return ok
+}
+
+// The AES key wrap (RFC 3394): LENGTH + 8 bytes out when wrapping,
+// LENGTH - 8 when unwrapping (false when the check fails).
+pub fn aesKw(wrap: bool, key: usize, keyLength: usize, data: usize, length: usize, out: usize) -> bool {
+    if wrap { return aes.wrapWith(bytesAt(key), keyLength, bytesAt(data), length, bytesAt(out)) }
+    return aes.unwrapWith(bytesAt(key), keyLength, bytesAt(data), length, bytesAt(out))
+}
+
+// ---------------------------------------------------------------------------
+// The NIST curves
+
+fn curveOf(bits: u32, curve: *ecc.Curve) -> bool {
+    if bits == P256 { ecc.curveInit(curve, ecc.CurveName.p256) } else if bits == P384 { ecc.curveInit(curve, ecc.CurveName.p384) } else if bits == P521 { ecc.curveInit(curve, ecc.CurveName.p521) } else { return false }
+    return true
+}
+
+// The bytes of a coordinate (and of a private scalar) of the curve.
+pub fn ecSize(bits: u32) -> usize {
+    return if bits == P256 { 32 } else if bits == P384 { 48 } else if bits == P521 { 66 } else { 0 }
+}
+
+// A new key pair: the scalar (ecSize bytes) and the public point,
+// uncompressed (1 + 2 * ecSize bytes).
+pub fn ecGenerate(bits: u32, scalar: usize, point: usize) -> bool {
+    var curve: ecc.Curve = undefined
+    if !curveOf(bits, &curve) { return false }
+    return ecc.generatePrivate(&curve, bytesAt(scalar)) && ecc.publicKey(&curve, bytesAt(scalar), bytesAt(point))
+}
+
+// The public point of a scalar.
+pub fn ecPublic(bits: u32, scalar: usize, point: usize) -> bool {
+    var curve: ecc.Curve = undefined
+    if !curveOf(bits, &curve) { return false }
+    return ecc.publicKey(&curve, bytesAt(scalar), bytesAt(point))
+}
+
+// A point of the curve (uncompressed or compressed) written uncompressed
+// into OUT; false for one that is not on the curve.
+pub fn ecPoint(bits: u32, point: usize, length: usize, out: usize) -> bool {
+    var curve: ecc.Curve = undefined
+    if !curveOf(bits, &curve) || length == 0 { return false }
+    var decoded: ecc.Point = undefined
+    if !ecc.decodePoint(&curve, bytesAt(point), length, &decoded) { return false }
+    return ecc.encodePoint(&curve, &decoded, bytesAt(out))
+}
+
+// ECDSA with the hash IDENTIFIER of DATA: r | s (2 * ecSize bytes).
+pub fn ecdsaSign(bits: u32, identifier: u32, scalar: usize, data: usize, length: usize, out: usize) -> bool {
+    var curve: ecc.Curve = undefined
+    var algorithm = hash.Algorithm.sha256
+    if !curveOf(bits, &curve) || !algorithmOf(identifier, &algorithm) { return false }
+    var digestBytes: [64]u8 = undefined
+    const digested: [*]u8 = &digestBytes
+    hash.digest(algorithm, view(data, length), digested)
+    const size = curve.size
+    return ecc.ecdsaSign(&curve, bytesAt(scalar), digested, hash.digestLength(algorithm), bytesAt(out), unsafe { bytesAt(out) + size })
+}
+
+pub fn ecdsaVerify(bits: u32, identifier: u32, point: usize, pointLength: usize, data: usize, length: usize, signature: usize, signatureLength: usize) -> bool {
+    var curve: ecc.Curve = undefined
+    var algorithm = hash.Algorithm.sha256
+    if !curveOf(bits, &curve) || !algorithmOf(identifier, &algorithm) { return false }
+    const size = curve.size
+    if signatureLength != 2 * size { return false }
+    var digestBytes: [64]u8 = undefined
+    const digested: [*]u8 = &digestBytes
+    hash.digest(algorithm, view(data, length), digested)
+    return ecc.ecdsaVerify(&curve, bytesAt(point), pointLength, digested, hash.digestLength(algorithm), bytesAt(signature), size, unsafe { bytesAt(signature) + size }, size)
+}
+
+// ECDH: the shared x coordinate (ecSize bytes).
+pub fn ecdh(bits: u32, scalar: usize, point: usize, pointLength: usize, out: usize) -> bool {
+    var curve: ecc.Curve = undefined
+    if !curveOf(bits, &curve) { return false }
+    return ecc.ecdh(&curve, bytesAt(scalar), bytesAt(point), pointLength, bytesAt(out))
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 and X25519
+
+pub fn ed25519Public(seed: usize, out: usize) -> void { curve25519.ed25519Public(bytesAt(seed), bytesAt(out)) }
+
+pub fn ed25519Sign(seed: usize, data: usize, length: usize, out: usize) -> void {
+    curve25519.ed25519Sign(bytesAt(seed), view(data, length), bytesAt(out))
+}
+
+pub fn ed25519Verify(key: usize, data: usize, length: usize, signature: usize, signatureLength: usize) -> bool {
+    if signatureLength != 64 { return false }
+    return curve25519.ed25519Verify(bytesAt(key), view(data, length), bytesAt(signature))
+}
+
+// X25519 of the scalar with U (the base point's 9 when U is 0): false
+// when the result is all zeroes (a peer's point of small order).
+pub fn x25519(scalar: usize, u: usize, out: usize) -> bool {
+    if u == 0 {
+        curve25519.x25519Base(bytesAt(scalar), bytesAt(out))
+        return true
+    }
+    return curve25519.x25519Shared(bytesAt(scalar), bytesAt(u), bytesAt(out))
+}
+
+// ---------------------------------------------------------------------------
+// RSA
+
+const RsaKey = struct {
+    isPrivate: bool
+    key: rsa.PrivateKey
+}
+
+fn rsaAt(address: usize) -> *RsaKey { return unsafe { @ptrFromInt(*RsaKey, address) } }
+
+// A key from parts n, e (a public one) or n, e, d, p, q (a private one;
+// p and q may be empty): a handle, 0 when the numbers do not make a key
+// std.crypto.rsa takes (1024 to 4096 bits).
+pub fn rsaKey(parts: usize) -> usize {
+    if parts == 0 { return 0 }
+    const p = partsAt(parts)
+    if p.*.count() != 2 && p.*.count() != 5 { return 0 }
+    const memory = std.heap.allocator().alloc(@sizeOf(RsaKey), 16)
+    if memory == null { return 0 }
+    const key: *RsaKey = unsafe { @ptrCast(*RsaKey, memory.?) }
+    const n = p.*.at(0)
+    const e = p.*.at(1)
+    var ok = false
+    if p.*.count() == 2 {
+        key.*.isPrivate = false
+        ok = rsa.publicKeyInit(&key.*.key.public, n.pointer, n.length, e.pointer, e.length)
+    } else {
+        key.*.isPrivate = true
+        ok = rsa.privateKeyInit(&key.*.key, std.heap.allocator(), n, e, p.*.at(2), p.*.at(3), p.*.at(4))
+    }
+    if !ok {
+        std.heap.allocator().free(memory.?, @sizeOf(RsaKey), 16)
+        return 0
+    }
+    return @intFromPtr(key)
+}
+
+pub fn rsaRelease(key: usize) -> void {
+    if key == 0 { return }
+    hash.wipe(bytesAt(key), @sizeOf(RsaKey))
+    std.heap.allocator().free(bytesAt(key), @sizeOf(RsaKey), 16)
+}
+
+pub fn rsaBits(key: usize) -> usize { return if key == 0 { 0 } else { rsaAt(key).*.key.public.bits } }
+
+fn put(parts: *Parts, number: *mpi.Mpi) -> void {
+    var bytes: [512]u8 = undefined
+    const length = mpi.byteLength(number)
+    if length > 512 {
+        parts.*.good = false
+        return
+    }
+    mpi.toBytes(number, bytes[0..length])
+    parts.*.add(bytes[0..length])
+    hash.wipe(&bytes, 512)
+}
+
+// A new key of BITS bits with the public exponent (big-endian, at most 8
+// bytes): parts n, e, d, p, q, d mod (p - 1), d mod (q - 1), q^-1 mod p;
+// 0 when it cannot be made.
+pub fn rsaGenerate(bits: usize, exponent: usize, exponentLength: usize) -> usize {
+    if bits < 1024 || bits > 4096 || exponentLength == 0 || exponentLength > 8 { return 0 }
+    var value: u64 = 0
+    var index: usize = 0
+    while index < exponentLength {
+        value = (value << 8) | @intCast(u64, bytesAt(exponent)[index])
+        index += 1
+    }
+    if (value & 1) == 0 || value < 3 { return 0 }
+    const allocator = std.heap.allocator()
+    var e: mpi.Mpi = undefined
+    var p: mpi.Mpi = undefined
+    var q: mpi.Mpi = undefined
+    var n: mpi.Mpi = undefined
+    var p1: mpi.Mpi = undefined
+    var q1: mpi.Mpi = undefined
+    var g: mpi.Mpi = undefined
+    var lcm: mpi.Mpi = undefined
+    var d: mpi.Mpi = undefined
+    var dp: mpi.Mpi = undefined
+    var dq: mpi.Mpi = undefined
+    var qi: mpi.Mpi = undefined
+    mpi.init(&e, allocator)
+    mpi.init(&p, allocator)
+    mpi.init(&q, allocator)
+    mpi.init(&n, allocator)
+    mpi.init(&p1, allocator)
+    mpi.init(&q1, allocator)
+    mpi.init(&g, allocator)
+    mpi.init(&lcm, allocator)
+    mpi.init(&d, allocator)
+    mpi.init(&dp, allocator)
+    mpi.init(&dq, allocator)
+    mpi.init(&qi, allocator)
+    var ok = mpi.setU64(&e, value) && mpi.generatePrime(&p, bits / 2, &e) && mpi.generatePrime(&q, bits - bits / 2, &e)
+    // (p > q, as PKCS #1's examples have it: q^-1 mod p.)
+    if ok && mpi.compare(&p, &q) < 0 { ok = mpi.set(&g, &p) && mpi.set(&p, &q) && mpi.set(&q, &g) }
+    // (Each prime's top two bits set: n has all BITS bits.)
+    if ok { ok = mpi.mul(&n, &p, &q) }
+    if ok { ok = mpi.subU64(&p1, &p, 1) && mpi.subU64(&q1, &q, 1) && mpi.gcd(&g, &p1, &q1) && mpi.mul(&lcm, &p1, &q1) && mpi.divRem(&lcm, null, &lcm, &g) && mpi.invm(&d, &e, &lcm) }
+    if ok { ok = mpi.mod(&dp, &d, &p1) && mpi.mod(&dq, &d, &q1) && mpi.invm(&qi, &q, &p) }
+    var result: usize = 0
+    if ok {
+        result = partsCreate()
+        if result != 0 {
+            const parts = partsAt(result)
+            put(parts, &n)
+            put(parts, &e)
+            put(parts, &d)
+            put(parts, &p)
+            put(parts, &q)
+            put(parts, &dp)
+            put(parts, &dq)
+            put(parts, &qi)
+        }
+    }
+    mpi.deinit(&e)
+    mpi.deinit(&p)
+    mpi.deinit(&q)
+    mpi.deinit(&n)
+    mpi.deinit(&p1)
+    mpi.deinit(&q1)
+    mpi.deinit(&g)
+    mpi.deinit(&lcm)
+    mpi.deinit(&d)
+    mpi.deinit(&dp)
+    mpi.deinit(&dq)
+    mpi.deinit(&qi)
+    return handed(result)
+}
+
+pub const PKCS1: u32 = 1
+pub const PSS: u32 = 2
+
+// A signature of DATA hashed with IDENTIFIER (PKCS1, or PSS with a salt
+// of SALT_LENGTH bytes) into OUT (the modulus's bytes); its length, 0
+// when it cannot be made.
+pub fn rsaSign(key: usize, scheme: u32, identifier: u32, saltLength: usize, data: usize, length: usize, out: usize) -> usize {
+    var algorithm = hash.Algorithm.sha256
+    if key == 0 || !rsaAt(key).*.isPrivate || !algorithmOf(identifier, &algorithm) { return 0 }
+    const k = &rsaAt(key).*.key
+    var digestBytes: [64]u8 = undefined
+    const digested: [*]u8 = &digestBytes
+    hash.digest(algorithm, view(data, length), digested)
+    // (PSS: a salt no longer than the digest, as WebKit's other ports
+    // have it, and one that fits, RFC 8017 9.1.1 step 3.)
+    if scheme == PSS && (saltLength > hash.digestLength(algorithm) || saltLength + hash.digestLength(algorithm) + 2 > (k.*.public.bits - 1 + 7) / 8) { return 0 }
+    const made = if scheme == PKCS1 { rsa.signPkcs1(k, algorithm, digested, bytesAt(out)) } else { rsa.signPssRandom(k, algorithm, digested, saltLength, bytesAt(out)) }
+    return if made { k.*.public.size } else { 0 }
+}
+
+pub fn rsaVerify(key: usize, scheme: u32, identifier: u32, saltLength: usize, data: usize, length: usize, signature: usize, signatureLength: usize) -> bool {
+    var algorithm = hash.Algorithm.sha256
+    if key == 0 || !algorithmOf(identifier, &algorithm) { return false }
+    const k = &rsaAt(key).*.key.public
+    if signatureLength != k.*.size { return false }
+    if scheme == PSS && saltLength > hash.digestLength(algorithm) { return false }
+    var digestBytes: [64]u8 = undefined
+    const digested: [*]u8 = &digestBytes
+    hash.digest(algorithm, view(data, length), digested)
+    if scheme == PKCS1 { return rsa.verifyPkcs1(k, algorithm, digested, bytesAt(signature), signatureLength) }
+    return rsa.verifyPss(k, algorithm, digested, bytesAt(signature), signatureLength, saltLength)
+}
+
+// RSA-OAEP with IDENTIFIER's hash and LABEL: on encryption the modulus's
+// bytes into OUT, on decryption the message (its length in WRITTEN).
+pub fn rsaOaep(encrypt: bool, key: usize, identifier: u32, label: usize, labelLength: usize, data: usize, length: usize, out: usize, written: *usize) -> bool {
+    written.* = 0
+    var algorithm = hash.Algorithm.sha256
+    if key == 0 || !algorithmOf(identifier, &algorithm) { return false }
+    const k = &rsaAt(key).*.key
+    if encrypt {
+        if !rsa.encryptOaepRandom(&k.*.public, algorithm, view(label, labelLength), view(data, length), bytesAt(out)) { return false }
+        written.* = k.*.public.size
+        return true
+    }
+    if !rsaAt(key).*.isPrivate { return false }
+    var count: usize = 0
+    if !rsa.decryptOaep(k, algorithm, view(label, labelLength), view(data, length), bytesAt(out), &count) { return false }
+    written.* = count
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// SPKI (RFC 5280's SubjectPublicKeyInfo) and PKCS #8 (RFC 5208's
+// PrivateKeyInfo, RFC 5915's ECPrivateKey, RFC 8410's for the Edwards and
+// Montgomery curves)
+
+const OID_RSA = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+const OID_EC = "\x2a\x86\x48\xce\x3d\x02\x01"
+const OID_ECDH = "\x2b\x81\x04\x01\x0c"
+const OID_P256 = "\x2a\x86\x48\xce\x3d\x03\x01\x07"
+const OID_P384 = "\x2b\x81\x04\x00\x22"
+const OID_P521 = "\x2b\x81\x04\x00\x23"
+const OID_ED25519 = "\x2b\x65\x70"
+const OID_X25519 = "\x2b\x65\x6e"
+
+fn curveOid(bits: u32) -> []const u8 {
+    return if bits == P256 { OID_P256 } else if bits == P384 { OID_P384 } else if bits == P521 { OID_P521 } else { "" }
+}
+
+fn curveOfOid(data: []const u8, element: *asn1.Element) -> u32 {
+    if element.*.tag != asn1.TAG_OID { return 0 }
+    if asn1.contentsAre(data, element, OID_P256) { return P256 }
+    if asn1.contentsAre(data, element, OID_P384) { return P384 }
+    if asn1.contentsAre(data, element, OID_P521) { return P521 }
+    return 0
+}
+
+// The AlgorithmIdentifier at the reader: the kind and (EC) the curve.
+fn readAlgorithm(data: []const u8, reader: *asn1.Reader, kind: *u8, curve: *u32) -> bool {
+    var identifier: asn1.Element = undefined
+    if !asn1.nextIf(reader, asn1.TAG_SEQUENCE, &identifier) { return false }
+    var inside: asn1.Reader = undefined
+    asn1.readerInit(&inside, data, &identifier)
+    var oid: asn1.Element = undefined
+    if !asn1.nextIf(&inside, asn1.TAG_OID, &oid) { return false }
+    var parameters: asn1.Element = undefined
+    const hasParameters = asn1.next(&inside, &parameters)
+    if !asn1.atEnd(&inside) { return false }
+    curve.* = 0
+    if asn1.contentsAre(data, &oid, OID_RSA) {
+        kind.* = KIND_RSA
+        // (NULL parameters, or none.)
+        return !hasParameters || (parameters.tag == asn1.TAG_NULL && parameters.length == 0)
+    }
+    if asn1.contentsAre(data, &oid, OID_EC) || asn1.contentsAre(data, &oid, OID_ECDH) {
+        kind.* = if asn1.contentsAre(data, &oid, OID_ECDH) { KIND_ECDH } else { KIND_EC }
+        if !hasParameters { return false }
+        curve.* = curveOfOid(data, &parameters)
+        return curve.* != 0
+    }
+    if asn1.contentsAre(data, &oid, OID_ED25519) {
+        kind.* = KIND_ED25519
+        return !hasParameters
+    }
+    if asn1.contentsAre(data, &oid, OID_X25519) {
+        kind.* = KIND_X25519
+        return !hasParameters
+    }
+    return false
+}
+
+fn addInteger(parts: *Parts, data: []const u8, reader: *asn1.Reader) -> bool {
+    var element: asn1.Element = undefined
+    if !asn1.nextIf(reader, asn1.TAG_INTEGER, &element) { return false }
+    var start: usize = 0
+    var length: usize = 0
+    if !asn1.unsignedInteger(data, &element, &start, &length) { return false }
+    parts.*.add(data[start..start + length])
+    return true
+}
+
+fn header(parts: *Parts, kind: u8, curve: u32) -> void {
+    var bytes: [3]u8 = undefined
+    bytes[0] = kind
+    bytes[1] = @intCast(u8, (curve >> 8) & 255)
+    bytes[2] = @intCast(u8, curve & 255)
+    parts.*.add(bytes[0..3])
+}
+
+// An SPKI read: parts [kind, curve's two bytes], then n and e (RSA), the
+// point as it is (EC: the caller checks it), or the key (32 bytes); 0
+// for DER that is not one of those.
+pub fn spkiRead(der: usize, length: usize) -> usize {
+    const data = view(der, length)
+    var top: asn1.Element = undefined
+    if data.length == 0 || !asn1.read(data, 0, &top) || top.end != data.length || top.tag != asn1.TAG_SEQUENCE { return 0 }
+    var reader: asn1.Reader = undefined
+    asn1.readerInit(&reader, data, &top)
+    var kind: u8 = 0
+    var curve: u32 = 0
+    if !readAlgorithm(data, &reader, &kind, &curve) { return 0 }
+    var bits: asn1.Element = undefined
+    if !asn1.nextIf(&reader, asn1.TAG_BIT_STRING, &bits) || !asn1.atEnd(&reader) { return 0 }
+    var start: usize = 0
+    var keyLength: usize = 0
+    if !asn1.bitStringBytes(data, &bits, &start, &keyLength) { return 0 }
+    const key = data[start..start + keyLength]
+    const result = partsCreate()
+    if result == 0 { return 0 }
+    const parts = partsAt(result)
+    header(parts, kind, curve)
+    var ok = true
+    if kind == KIND_RSA {
+        var inner: asn1.Element = undefined
+        ok = asn1.read(key, 0, &inner) && inner.end == key.length && inner.tag == asn1.TAG_SEQUENCE
+        if ok {
+            var numbers: asn1.Reader = undefined
+            asn1.readerInit(&numbers, key, &inner)
+            ok = addInteger(parts, key, &numbers) && addInteger(parts, key, &numbers) && asn1.atEnd(&numbers)
+        }
+    } else {
+        if kind != KIND_EC && kind != KIND_ECDH && key.length != 32 { ok = false }
+        parts.*.add(key)
+    }
+    if !ok {
+        partsRelease(result)
+        return 0
+    }
+    return handed(result)
+}
+
+// A PKCS #8 key read: parts [kind, curve], then n, e, d, p, q, dp, dq, qi
+// (RSA), the scalar and the public point or nothing (EC), or the seed or
+// scalar (32 bytes); 0 for DER that is not one of those.
+pub fn pkcs8Read(der: usize, length: usize) -> usize {
+    const data = view(der, length)
+    var top: asn1.Element = undefined
+    if data.length == 0 || !asn1.read(data, 0, &top) || top.end != data.length || top.tag != asn1.TAG_SEQUENCE { return 0 }
+    var reader: asn1.Reader = undefined
+    asn1.readerInit(&reader, data, &top)
+    var version: asn1.Element = undefined
+    var number: u64 = 9
+    if !asn1.nextIf(&reader, asn1.TAG_INTEGER, &version) || !asn1.smallInteger(data, &version, &number) || number > 1 { return 0 }
+    var kind: u8 = 0
+    var curve: u32 = 0
+    if !readAlgorithm(data, &reader, &kind, &curve) { return 0 }
+    var octets: asn1.Element = undefined
+    if !asn1.nextIf(&reader, asn1.TAG_OCTET_STRING, &octets) { return 0 }
+    // (Attributes and a v2 public key may follow: not read.)
+    const key = asn1.contents(data, &octets)
+    var inner: asn1.Element = undefined
+    if !asn1.read(key, 0, &inner) || inner.end != key.length { return 0 }
+    const result = partsCreate()
+    if result == 0 { return 0 }
+    const parts = partsAt(result)
+    header(parts, kind, curve)
+    var ok = true
+    if kind == KIND_RSA {
+        var numbers: asn1.Reader = undefined
+        ok = inner.tag == asn1.TAG_SEQUENCE
+        if ok {
+            asn1.readerInit(&numbers, key, &inner)
+            var keyVersion: asn1.Element = undefined
+            var v: u64 = 9
+            ok = asn1.nextIf(&numbers, asn1.TAG_INTEGER, &keyVersion) && asn1.smallInteger(key, &keyVersion, &v) && v == 0
+            var index: usize = 0
+            while ok && index < 8 {
+                ok = addInteger(parts, key, &numbers)
+                index += 1
+            }
+            // (Other primes, version 1: not taken.)
+            ok = ok && asn1.atEnd(&numbers)
+        }
+    } else if kind == KIND_EC || kind == KIND_ECDH {
+        var fields: asn1.Reader = undefined
+        ok = inner.tag == asn1.TAG_SEQUENCE
+        if ok {
+            asn1.readerInit(&fields, key, &inner)
+            var keyVersion: asn1.Element = undefined
+            var v: u64 = 9
+            var scalar: asn1.Element = undefined
+            ok = asn1.nextIf(&fields, asn1.TAG_INTEGER, &keyVersion) && asn1.smallInteger(key, &keyVersion, &v) && v == 1 && asn1.nextIf(&fields, asn1.TAG_OCTET_STRING, &scalar)
+            if ok {
+                parts.*.add(asn1.contents(key, &scalar))
+                var point: []const u8 = ""
+                var field: asn1.Element = undefined
+                while ok && asn1.next(&fields, &field) {
+                    if field.tag == asn1.contextTag(0, true) {
+                        // The curve again: it must be the same.
+                        var named: asn1.Element = undefined
+                        ok = asn1.read(key, field.contentStart, &named) && curveOfOid(key, &named) == curve
+                    } else if field.tag == asn1.contextTag(1, true) {
+                        var bits: asn1.Element = undefined
+                        var start: usize = 0
+                        var count: usize = 0
+                        ok = asn1.read(key, field.contentStart, &bits) && asn1.bitStringBytes(key, &bits, &start, &count)
+                        if ok { point = key[start..start + count] }
+                    }
+                }
+                parts.*.add(point)
+            }
+        }
+    } else {
+        ok = inner.tag == asn1.TAG_OCTET_STRING && inner.length == 32
+        if ok { parts.*.add(asn1.contents(key, &inner)) }
+    }
+    if !ok {
+        partsRelease(result)
+        return 0
+    }
+    return handed(result)
+}
+
+fn putUnsigned(w: *asn1.Writer, bytes: []const u8) -> void {
+    var start: usize = 0
+    while start + 1 < bytes.length && bytes[start] == 0 { start += 1 }
+    const mark = asn1.open(w, asn1.TAG_INTEGER)
+    if bytes.length == 0 || bytes[start] >= 128 { asn1.putRaw(w, "\x00") }
+    asn1.putRaw(w, bytes[start..bytes.length])
+    asn1.close(w, mark)
+}
+
+fn putAlgorithm(w: *asn1.Writer, kind: u8, curve: u32) -> void {
+    const identifier = asn1.open(w, asn1.TAG_SEQUENCE)
+    if kind == KIND_RSA {
+        asn1.put(w, asn1.TAG_OID, OID_RSA)
+        asn1.put(w, asn1.TAG_NULL, "")
+    } else if kind == KIND_EC {
+        asn1.put(w, asn1.TAG_OID, OID_EC)
+        asn1.put(w, asn1.TAG_OID, curveOid(curve))
+    } else if kind == KIND_ED25519 {
+        asn1.put(w, asn1.TAG_OID, OID_ED25519)
+    } else {
+        asn1.put(w, asn1.TAG_OID, OID_X25519)
+    }
+    asn1.close(w, identifier)
+}
+
+// The DER written of W's buffer as parts of one, or 0.
+fn writtenParts(w: *asn1.Writer) -> usize {
+    if !w.*.ok { return 0 }
+    const result = partsCreate()
+    if result == 0 { return 0 }
+    partsAt(result).*.add(w.*.data[0..w.*.at])
+    return handed(result)
+}
+
+// An SPKI of KEY's parts: n and e (RSA), the point (EC), the key (OKP).
+pub fn spkiWrite(kind: u8, curve: u32, key: usize) -> usize {
+    if key == 0 { return 0 }
+    const p = partsAt(key)
+    var buffer = std.ArrayList(u8).init(std.heap.allocator())
+    defer buffer.deinit()
+    if !buffer.resize(4096) { return 0 }
+    var w = asn1.writer(buffer.items().pointer, 4096)
+    const top = asn1.open(&w, asn1.TAG_SEQUENCE)
+    putAlgorithm(&w, kind, curve)
+    if kind == KIND_RSA {
+        if p.*.count() < 2 { return 0 }
+        var inner: [1200]u8 = undefined
+        var numbers = asn1.writer(&inner, 1200)
+        const sequence = asn1.open(&numbers, asn1.TAG_SEQUENCE)
+        putUnsigned(&numbers, p.*.at(0))
+        putUnsigned(&numbers, p.*.at(1))
+        asn1.close(&numbers, sequence)
+        if !numbers.ok { return 0 }
+        asn1.putBitString(&w, inner[0..numbers.at])
+    } else {
+        if p.*.count() < 1 { return 0 }
+        asn1.putBitString(&w, p.*.at(0))
+    }
+    asn1.close(&w, top)
+    return writtenParts(&w)
+}
+
+// A PKCS #8 key of KEY's parts: n, e, d, p, q, dp, dq, qi (RSA), the
+// scalar and the point (EC), the seed or scalar (OKP).
+pub fn pkcs8Write(kind: u8, curve: u32, key: usize) -> usize {
+    if key == 0 { return 0 }
+    const p = partsAt(key)
+    var buffer = std.ArrayList(u8).init(std.heap.allocator())
+    defer buffer.deinit()
+    if !buffer.resize(8192) { return 0 }
+    var w = asn1.writer(buffer.items().pointer, 8192)
+    const top = asn1.open(&w, asn1.TAG_SEQUENCE)
+    asn1.putSmallInteger(&w, 0)
+    putAlgorithm(&w, kind, curve)
+    const octets = asn1.open(&w, asn1.TAG_OCTET_STRING)
+    if kind == KIND_RSA {
+        if p.*.count() < 8 { return 0 }
+        const sequence = asn1.open(&w, asn1.TAG_SEQUENCE)
+        asn1.putSmallInteger(&w, 0)
+        var index: usize = 0
+        while index < 8 {
+            putUnsigned(&w, p.*.at(index))
+            index += 1
+        }
+        asn1.close(&w, sequence)
+    } else if kind == KIND_EC {
+        if p.*.count() < 2 { return 0 }
+        const sequence = asn1.open(&w, asn1.TAG_SEQUENCE)
+        asn1.putSmallInteger(&w, 1)
+        asn1.put(&w, asn1.TAG_OCTET_STRING, p.*.at(0))
+        // (The curve is the AlgorithmIdentifier's: no [0] parameters, as
+        // WebKit's other ports write it.)
+        const point = asn1.open(&w, asn1.contextTag(1, true))
+        asn1.putBitString(&w, p.*.at(1))
+        asn1.close(&w, point)
+        asn1.close(&w, sequence)
+    } else {
+        if p.*.count() < 1 { return 0 }
+        asn1.put(&w, asn1.TAG_OCTET_STRING, p.*.at(0))
+    }
+    asn1.close(&w, octets)
+    asn1.close(&w, top)
+    const result = writtenParts(&w)
+    hash.wipe(buffer.items().pointer, 8192)
+    return result
+}
