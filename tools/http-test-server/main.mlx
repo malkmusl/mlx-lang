@@ -18,7 +18,12 @@
 //                      when asked for, and answers a close
 //   /quit              the server stops
 //
-//     http-test-server ROOT
+//   https: with CA_FILE, a second port (the second line) serves the same
+//   over TLS 1.3 (std.tls.server), with a certificate for localhost and
+//   127.0.0.1 signed by a test root made at start (certs.mlx), whose PEM
+//   goes to CA_FILE.
+//
+//     http-test-server ROOT [CA_FILE]
 const std = @import("std")
 const net = @import("std.net")
 const message = @import("std.http.message")
@@ -26,7 +31,33 @@ const headers = @import("std.http.headers")
 const flate = @import("std.flate")
 const ws = @import("std.http.websocket")
 const deflate = @import("std.http.websocket.deflate")
+const tls = @import("std.tls.server")
+const certs = @import("./certs.mlx")
+const random = @import("std.random")
 const process = std.linux.process
+
+// A connection: its socket, and TLS over it when it came to the https
+// port.
+const Conn = struct {
+    fd: isize
+    secure: bool
+    server: *tls.Server
+}
+
+fn connSend(c: *Conn, bytes: []const u8) -> bool {
+    if c.*.secure { return tls.send(c.*.server, bytes) }
+    return net.send(c.*.fd, bytes)
+}
+
+fn connReceive(c: *Conn, into: [*]u8, room: usize) -> isize {
+    if c.*.secure { return tls.receive(c.*.server, into, room) }
+    return net.receive(c.*.fd, into, room)
+}
+
+fn connReadable(c: *Conn, timeoutMs: isize) -> bool {
+    if c.*.secure && tls.pending(c.*.server) { return true }
+    return net.readable(c.*.fd, timeoutMs)
+}
 
 const CAPACITY: usize = 1048576
 
@@ -175,7 +206,7 @@ fn readFile(root: []const u8, path: []const u8, into: *Text) -> bool {
 const PAGE_HEAD: []const u8 = "<!DOCTYPE html><html><head><title>"
 
 // A frame to the client (unmasked), compressed when the extension is on.
-fn sendFrame(fd: isize, extension: *deflate.Extension, opcode: u8, payload: []const u8) -> bool {
+fn sendFrame(c: *Conn, extension: *deflate.Extension, opcode: u8, payload: []const u8) -> bool {
     var first: u8 = 0x80 | opcode
     var compressed: deflate.Bytes = undefined
     if deflate.outgoing(extension, &first, payload, &compressed) != deflate.Error.none { return false }
@@ -183,14 +214,14 @@ fn sendFrame(fd: isize, extension: *deflate.Extension, opcode: u8, payload: []co
     var head: [14]u8 = undefined
     var noMask: [4]u8 = undefined
     const headLength = ws.writeHeader(&head, first, @intCast(u64, body.length), false, noMask)
-    const sent = net.send(fd, head[0..headLength]) && net.send(fd, body)
+    const sent = connSend(c, head[0..headLength]) && connSend(c, body)
     if compressed.capacity > 0 { deflate.freeBytes(extension, &compressed) }
     return sent
 }
 
 // The WebSocket of /ws once its handshake is answered: messages echoed
 // until a close.
-fn echoSocket(fd: isize, extension: *deflate.Extension, held: [*]u8, heldLength: usize) -> void {
+fn echoSocket(c: *Conn, extension: *deflate.Extension, held: [*]u8, heldLength: usize) -> void {
     var buffer: [65536]u8 = undefined
     var end: usize = 0
     while end < heldLength {
@@ -205,7 +236,7 @@ fn echoSocket(fd: isize, extension: *deflate.Extension, held: [*]u8, heldLength:
         var parsed = ws.parseHeader(buffer[0..end], &header)
         while parsed == ws.Parse.needMore || (parsed == ws.Parse.ok && end < header.length + @intCast(usize, header.payloadLength)) {
             if end == 65536 { return }
-            const got = net.receive(fd, unsafe { @ptrCast([*]u8, &buffer) + end }, 65536 - end)
+            const got = connReceive(c, unsafe { @ptrCast([*]u8, &buffer) + end }, 65536 - end)
             if got <= 0 { return }
             end += @intCast(usize, got)
             parsed = ws.parseHeader(buffer[0..end], &header)
@@ -215,11 +246,11 @@ fn echoSocket(fd: isize, extension: *deflate.Extension, held: [*]u8, heldLength:
         if header.masked { ws.applyMask(header.mask, unsafe { @ptrCast([*]u8, &buffer) + header.length }, length) }
         const payload = buffer[header.length..header.length + length]
         if header.opcode == ws.CLOSE {
-            _ = sendFrame(fd, extension, ws.CLOSE, payload[0..if length >= 2 { 2 } else { 0 }])
+            _ = sendFrame(c, extension, ws.CLOSE, payload[0..if length >= 2 { 2 } else { 0 }])
             return
         }
         if header.opcode == ws.PING {
-            _ = sendFrame(fd, extension, ws.PONG, payload)
+            _ = sendFrame(c, extension, ws.PONG, payload)
         } else if header.opcode != ws.PONG {
             if header.opcode != ws.CONTINUATION {
                 textMessage = header.opcode == ws.TEXT
@@ -242,7 +273,7 @@ fn echoSocket(fd: isize, extension: *deflate.Extension, held: [*]u8, heldLength:
                 }
             }
             if inflated.capacity > 0 { deflate.freeBytes(extension, &inflated) }
-            if header.fin && !sendFrame(fd, extension, if textMessage { ws.TEXT } else { ws.BINARY }, reply[0..replyLength]) { return }
+            if header.fin && !sendFrame(c, extension, if textMessage { ws.TEXT } else { ws.BINARY }, reply[0..replyLength]) { return }
         }
         // The frame taken.
         const used = header.length + length
@@ -256,7 +287,7 @@ fn echoSocket(fd: isize, extension: *deflate.Extension, held: [*]u8, heldLength:
 }
 
 // Serves the requests of one connection.
-fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> void {
+fn serve(c: *Conn, root: []const u8, allocator: std.allocator.Allocator) -> void {
     var out: Text = undefined
     var page: Text = undefined
     var folded: [4096]u8 = undefined
@@ -267,8 +298,8 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
         var headEnd = message.headEnd(buffer[0..held])
         while !headComplete(buffer[0..held], headEnd) {
             if held >= 65536 { return }
-            if !net.readable(fd, 30000) { return }
-            const got = net.receive(fd, unsafe { into + held }, 65536 - held)
+            if !connReadable(c, 30000) { return }
+            const got = connReceive(c, unsafe { into + held }, 65536 - held)
             if got <= 0 { return }
             held += @intCast(usize, got)
             headEnd = message.headEnd(buffer[0..held])
@@ -283,8 +314,8 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
         }
         if headEnd + bodyLength > 65536 { return }
         while held < headEnd + bodyLength {
-            if !net.readable(fd, 30000) { return }
-            const got = net.receive(fd, unsafe { into + held }, 65536 - held)
+            if !connReadable(c, 30000) { return }
+            const got = connReceive(c, unsafe { into + held }, 65536 - held)
             if got <= 0 { return }
             held += @intCast(usize, got)
         }
@@ -385,15 +416,15 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
                 }
             }
             headers.put(sink, "\r\n")
-            if !net.send(fd, text(&page)) { return }
+            if !connSend(c, text(&page)) { return }
             const used = headEnd + bodyLength
-            echoSocket(fd, &extension, unsafe { into + used }, held - used)
+            echoSocket(c, &extension, unsafe { into + used }, held - used)
             return
         } else if same(target, "/quit") {
             respond(&out, 200, "OK", "", "bye")
             close = true
-            _ = net.send(fd, text(&out))
-            net.close(fd)
+            _ = connSend(c, text(&out))
+            net.close(c.*.fd)
             // (The parent's process group ends with it: the check kills it.)
             std.linux.exitGroup(0)
         } else if readFile(root, target, &page) {
@@ -418,7 +449,7 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
             respond(&out, 404, "Not Found", "Content-Type: text/plain\r\n", "nothing here")
         }
         if same(line.method, "HEAD") { out.length = message.headEnd(text(&out)) }
-        if !net.send(fd, text(&out)) { return }
+        if !connSend(c, text(&out)) { return }
         const used = headEnd + bodyLength
         var i: usize = 0
         while used + i < held {
@@ -430,25 +461,9 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
     }
 }
 
-pub fn main(arguments: [][*]const u8) -> u8 {
-    if arguments.length < 2 {
-        _ = std.io.eprintln("usage: http-test-server ROOT")
-        return 2
-    }
-    const rootPointer = arguments[1]
-    var rootLength: usize = 0
-    while rootPointer[rootLength] != 0 { rootLength += 1 }
-    const root = rootPointer[0..rootLength]
-    const allocator: std.allocator.Allocator = std.page_allocator.init()
-    const loop = net.ipv4(127, 0, 0, 1, 0)
-    const listener = net.listen(&loop, 16)
-    if listener < 0 { return 1 }
-    var bound: net.Address = undefined
-    if !net.localAddress(listener, &bound) { return 1 }
-    var line: Text = undefined
-    line.length = 0
-    putNumber(sinkOf(&line), @intCast(usize, bound.port))
-    _ = std.io.println(text(&line))
+// Accepts connections on LISTENER for good, each served by a child
+// process; over TLS with CHAIN's certificate when SECURE.
+fn acceptLoop(listener: isize, root: []const u8, allocator: std.allocator.Allocator, secure: bool, chain: [*]const tls.Certificate, seed: [*]const u8) -> void {
     while true {
         var peer: net.Address = undefined
         const fd = net.accept(listener, &peer)
@@ -456,11 +471,70 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         const pid = process.fork()
         if pid == 0 {
             net.close(listener)
-            serve(fd, root, allocator)
+            var server: tls.Server = undefined
+            var c = Conn.{ .fd = fd, .secure = secure, .server = &server }
+            if !secure || tls.accept(&server, fd, chain, 1, seed) {
+                serve(&c, root, allocator)
+                if secure { tls.close(&server) }
+            }
             net.close(fd)
             std.linux.exitGroup(0)
         }
         net.close(fd)
     }
+}
+
+fn listenLoopback(line: *Text) -> isize {
+    const loop = net.ipv4(127, 0, 0, 1, 0)
+    const listener = net.listen(&loop, 16)
+    if listener < 0 { return -1 }
+    var bound: net.Address = undefined
+    if !net.localAddress(listener, &bound) { return -1 }
+    putNumber(sinkOf(line), @intCast(usize, bound.port))
+    headers.put(sinkOf(line), "\n")
+    return listener
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if arguments.length < 2 {
+        _ = std.io.eprintln("usage: http-test-server ROOT [CA_FILE]")
+        return 2
+    }
+    const rootPointer = arguments[1]
+    var rootLength: usize = 0
+    while rootPointer[rootLength] != 0 { rootLength += 1 }
+    const root = rootPointer[0..rootLength]
+    const allocator: std.allocator.Allocator = std.page_allocator.init()
+    var line: Text = undefined
+    line.length = 0
+    const listener = listenLoopback(&line)
+    if listener < 0 { return 1 }
+    // https: a root and the server's certificate made now, the root's
+    // PEM into CA_FILE, a listener of its own (its port the second line).
+    var rootSeed: [32]u8 = undefined
+    var serverSeed: [32]u8 = undefined
+    var serverDer: [certs.ROOM]u8 = undefined
+    var chain: [1]tls.Certificate = undefined
+    if arguments.length > 2 {
+        if !random.fill(unsafe { @ptrCast([*]u8, &rootSeed) }, 32) || !random.fill(unsafe { @ptrCast([*]u8, &serverSeed) }, 32) { return 1 }
+        var rootDer: [certs.ROOM]u8 = undefined
+        const rootLength = certs.make("mlx test root", unsafe { @ptrCast([*]const u8, &rootSeed) }, "mlx test root", unsafe { @ptrCast([*]const u8, &rootSeed) }, 1, true, unsafe { @ptrCast([*]u8, &rootDer) })
+        const serverLength = certs.make("localhost", unsafe { @ptrCast([*]const u8, &serverSeed) }, "mlx test root", unsafe { @ptrCast([*]const u8, &rootSeed) }, 2, false, unsafe { @ptrCast([*]u8, &serverDer) })
+        if rootLength == 0 || serverLength == 0 { return 1 }
+        var pemText: [2 * certs.ROOM + 128]u8 = undefined
+        const pemLength = certs.pem(rootDer[0..rootLength], unsafe { @ptrCast([*]u8, &pemText) })
+        if !std.fs.writeFile(arguments[2], unsafe { @ptrCast([*]const u8, &pemText) }, pemLength, 420) { return 1 }
+        chain[0] = tls.Certificate.{ .der = unsafe { @ptrCast([*]const u8, &serverDer) }, .length = serverLength }
+        const secureListener = listenLoopback(&line)
+        if secureListener < 0 { return 1 }
+        if process.fork() == 0 {
+            net.close(listener)
+            acceptLoop(secureListener, root, allocator, true, unsafe { @ptrCast([*]const tls.Certificate, &chain) }, unsafe { @ptrCast([*]const u8, &serverSeed) })
+            std.linux.exitGroup(0)
+        }
+        net.close(secureListener)
+    }
+    _ = std.io.print(text(&line))
+    acceptLoop(listener, root, allocator, false, unsafe { @ptrCast([*]const tls.Certificate, &chain) }, unsafe { @ptrCast([*]const u8, &serverSeed) })
     return 0
 }

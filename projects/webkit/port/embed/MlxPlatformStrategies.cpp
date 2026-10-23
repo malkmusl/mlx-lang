@@ -132,7 +132,8 @@ public:
     void suspendPendingRequests() override { }
     void resumePendingRequests() override { }
 
-    // Pings (beacons, hyperlink auditing) go out with the network (M6).
+    // STUB (later: pings, beacons and hyperlink auditing, sent through
+    // MlxNetwork without waiting for the answer): a ping is refused.
     void startPingLoad(LocalFrame&, ResourceRequest& request, const HTTPHeaderMap&, const FetchOptions&, ContentSecurityPolicyImposition, PingLoadCompletionHandler&& completionHandler) override
     {
         if (completionHandler)

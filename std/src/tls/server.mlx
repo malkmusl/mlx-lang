@@ -1,0 +1,382 @@
+// std.tls.server: the server side of TLS 1.3 (RFC 8446), the least of it
+// that serves a client of today: the ClientHello's X25519 key share (no
+// HelloRetryRequest), TLS_AES_128_GCM_SHA256 or
+// TLS_CHACHA20_POLY1305_SHA256, a certificate chain with an Ed25519 key
+// (CertificateVerify by std.crypto's ed25519Sign), no client
+// certificates, no resumption or early data, no TLS 1.2. It runs over a
+// blocking stream socket (std.net), the handshake in accept, then records
+// of application data both ways. Test servers use it (tools/http-test-server:
+// https and wss for the WebKit port's network check); the chains std.tls's
+// client verifies.
+//
+//     var server: tls_server.Server = undefined
+//     if tls_server.accept(&server, fd, chain, chainCount, &seed) {
+//         const got = tls_server.receive(&server, buffer, room)
+//         _ = tls_server.send(&server, response)
+//         tls_server.close(&server)
+//     }
+const std = @import("std")
+const net = @import("../net.mlx")
+const hash = @import("../crypto/hash.mlx")
+const curve25519 = @import("../crypto/curve25519.mlx")
+const random = @import("../random.mlx")
+const record = @import("./record.mlx")
+const wire = @import("./wire.mlx")
+const schedule = @import("./schedule.mlx")
+
+const VERSION_13: u64 = 0x0304
+const GROUP_X25519: u64 = 29
+const SUITE_AES128: u64 = 4865
+const SUITE_CHACHA: u64 = 4867
+const ED25519: u64 = 0x0807
+const ROOM: usize = 32768
+const MAX_CHAIN: usize = 4
+
+// A certificate of a chain: its DER.
+pub const Certificate = struct {
+    der: [*]const u8
+    length: usize
+}
+
+pub const Server = struct {
+    fd: isize
+    cipher: record.Cipher
+    algorithm: hash.Algorithm
+    transcript: hash.Hash
+    readKeys: record.Protection
+    writeKeys: record.Protection
+    // Bytes received and not yet taken; application data opened and not
+    // yet read (where, how much, and where its record ends).
+    input: [ROOM]u8
+    inputLength: usize
+    dataStart: usize
+    dataLength: usize
+    dataRecordEnd: usize
+    // A handshake message gathered from records.
+    message: [ROOM]u8
+    messageLength: usize
+    closed: bool
+}
+
+// One whole record into the input's start; false at the end or an error.
+fn readRecord(server: *Server) -> bool {
+    while true {
+        if server.*.inputLength >= record.HEADER {
+            const length = (@intCast(usize, server.*.input[3]) << 8) | @intCast(usize, server.*.input[4])
+            if length > record.MAX_PLAINTEXT + 2048 { return false }
+            if server.*.inputLength >= record.HEADER + length { return true }
+        }
+        if server.*.inputLength == ROOM { return false }
+        const got = net.receive(server.*.fd, unsafe { @ptrCast([*]u8, &server.*.input) + server.*.inputLength }, ROOM - server.*.inputLength)
+        if got <= 0 { return false }
+        server.*.inputLength += @intCast(usize, got)
+    }
+    return false
+}
+
+fn dropInput(server: *Server, count: usize) -> void {
+    const input: [*]u8 = unsafe { @ptrCast([*]u8, &server.*.input) }
+    std.mem.copy(input, input + count, server.*.inputLength - count)
+    server.*.inputLength -= count
+}
+
+// The next handshake message (type and body, gathered from records,
+// ChangeCipherSpec passed over) into server.message; false when none came.
+fn readMessage(server: *Server) -> bool {
+    server.*.messageLength = 0
+    while true {
+        if server.*.messageLength >= 4 {
+            const bodyLength = (@intCast(usize, server.*.message[1]) << 16) | (@intCast(usize, server.*.message[2]) << 8) | @intCast(usize, server.*.message[3])
+            if server.*.messageLength >= 4 + bodyLength { return server.*.messageLength == 4 + bodyLength }
+        }
+        if !readRecord(server) { return false }
+        const input: [*]u8 = unsafe { @ptrCast([*]u8, &server.*.input) }
+        const length = (@intCast(usize, input[3]) << 8) | @intCast(usize, input[4])
+        if input[0] == 20 && length == 1 {
+            dropInput(server, record.HEADER + 1)
+            continue
+        }
+        var start: usize = 0
+        var plainLength: usize = 0
+        var contentType: u8 = 0
+        if !record.open(&server.*.readKeys, input, length, &start, &plainLength, &contentType) || contentType != 22 { return false }
+        if server.*.messageLength + plainLength > ROOM { return false }
+        std.mem.copy(unsafe { @ptrCast([*]u8, &server.*.message) + server.*.messageLength }, input + start, plainLength)
+        server.*.messageLength += plainLength
+        dropInput(server, record.HEADER + length)
+    }
+    return false
+}
+
+// A handshake message out (into the transcript too).
+fn sendHandshake(server: *Server, message: [*]const u8, length: usize) -> bool {
+    hash.update(&server.*.transcript, message[0..length])
+    return sendRecord(server, 22, message, length)
+}
+
+fn sendRecord(server: *Server, contentType: u8, bytes: [*]const u8, length: usize) -> bool {
+    var sealed: [ROOM]u8 = undefined
+    var at: usize = 0
+    while at < length || (length == 0 && at == 0) {
+        var piece = length - at
+        if piece > record.MAX_PLAINTEXT { piece = record.MAX_PLAINTEXT }
+        const written = record.seal(&server.*.writeKeys, contentType, bytes + at, piece, unsafe { @ptrCast([*]u8, &sealed) })
+        if !net.send(server.*.fd, sealed[0..written]) { return false }
+        at += piece
+        if length == 0 { break }
+    }
+    return true
+}
+
+fn installTraffic(server: *Server, protection: *record.Protection, secret: [*]const u8) -> void {
+    var key: [32]u8 = undefined
+    var iv: [12]u8 = undefined
+    schedule.trafficKeys(server.*.algorithm, secret, record.keyLength(server.*.cipher), unsafe { @ptrCast([*]u8, &key) }, unsafe { @ptrCast([*]u8, &iv) })
+    record.install(protection, server.*.cipher, true, unsafe { @ptrCast([*]const u8, &key) }, unsafe { @ptrCast([*]const u8, &iv) })
+    hash.wipe(unsafe { @ptrCast([*]u8, &key) }, 32)
+}
+
+// The handshake on the connected socket FD, presenting CHAIN (COUNT
+// certificates, the server's first) and proving it with the Ed25519 key
+// of SEED (32 bytes): true when the client finished it.
+pub fn accept(server: *Server, fd: isize, chain: [*]const Certificate, count: usize, seed: [*]const u8) -> bool {
+    server.*.fd = fd
+    server.*.inputLength = 0
+    server.*.dataStart = 0
+    server.*.dataLength = 0
+    server.*.dataRecordEnd = 0
+    server.*.closed = false
+    record.clear(&server.*.readKeys)
+    record.clear(&server.*.writeKeys)
+    // The ClientHello.
+    if !readMessage(server) || server.*.message[0] != 1 { return false }
+    const hello: [*]const u8 = unsafe { @ptrCast([*]const u8, &server.*.message) }
+    var p = wire.parser(hello, 4, server.*.messageLength)
+    _ = wire.uint16(&p)
+    _ = wire.bytes(&p, 32)
+    var session = wire.vector(&p, 1)
+    var suites = wire.vector(&p, 2)
+    _ = wire.vector(&p, 1)
+    var suite: u64 = 0
+    while wire.remaining(&suites) >= 2 {
+        const offered = wire.uint16(&suites)
+        if offered == SUITE_AES128 || (offered == SUITE_CHACHA && suite == 0) { suite = offered }
+    }
+    var tls13 = false
+    var signsEd25519 = false
+    var shareAt: usize = 0
+    var extensions = wire.vector(&p, 2)
+    while wire.remaining(&extensions) > 0 {
+        const kind = wire.uint16(&extensions)
+        var data = wire.vector(&extensions, 2)
+        if kind == 43 {
+            var versions = wire.vector(&data, 1)
+            while wire.remaining(&versions) >= 2 {
+                if wire.uint16(&versions) == VERSION_13 { tls13 = true }
+            }
+        } else if kind == 13 {
+            var schemes = wire.vector(&data, 2)
+            while wire.remaining(&schemes) >= 2 {
+                if wire.uint16(&schemes) == ED25519 { signsEd25519 = true }
+            }
+        } else if kind == 51 {
+            var shares = wire.vector(&data, 2)
+            while wire.remaining(&shares) > 0 {
+                const group = wire.uint16(&shares)
+                var key = wire.vector(&shares, 2)
+                if group == GROUP_X25519 && wire.remaining(&key) == 32 { shareAt = key.at }
+            }
+        }
+    }
+    if !p.ok || !tls13 || !signsEd25519 || suite == 0 || shareAt == 0 { return false }
+    server.*.cipher = if suite == SUITE_AES128 { record.Cipher.aes128Gcm } else { record.Cipher.chacha20Poly1305 }
+    server.*.algorithm = hash.Algorithm.sha256
+    hash.init(&server.*.transcript, server.*.algorithm)
+    hash.update(&server.*.transcript, hello[0..server.*.messageLength])
+    // The key exchange.
+    var secret: [32]u8 = undefined
+    var public: [32]u8 = undefined
+    if !random.fill(unsafe { @ptrCast([*]u8, &secret) }, 32) { return false }
+    curve25519.x25519Base(unsafe { @ptrCast([*]const u8, &secret) }, unsafe { @ptrCast([*]u8, &public) })
+    var shared: [32]u8 = undefined
+    if !curve25519.x25519Shared(unsafe { @ptrCast([*]const u8, &secret) }, hello + shareAt, unsafe { @ptrCast([*]u8, &shared) }) { return false }
+    // ServerHello, in the clear.
+    var buffer: [ROOM]u8 = undefined
+    const out: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var w = wire.writer(out, ROOM)
+    wire.put8(&w, 2)
+    var body = wire.begin(&w, 3)
+    wire.put16(&w, 0x0303)
+    var serverRandom: [32]u8 = undefined
+    if !random.fill(unsafe { @ptrCast([*]u8, &serverRandom) }, 32) { return false }
+    wire.putBytes(&w, unsafe { @ptrCast([*]const u8, &serverRandom) }, 32)
+    wire.put8(&w, @intCast(u64, wire.remaining(&session)))
+    wire.putBytes(&w, hello + session.at, wire.remaining(&session))
+    wire.put16(&w, suite)
+    wire.put8(&w, 0)
+    const helloExtensions = wire.begin(&w, 2)
+    wire.put16(&w, 43)
+    wire.put16(&w, 2)
+    wire.put16(&w, VERSION_13)
+    wire.put16(&w, 51)
+    wire.put16(&w, 36)
+    wire.put16(&w, GROUP_X25519)
+    wire.put16(&w, 32)
+    wire.putBytes(&w, unsafe { @ptrCast([*]const u8, &public) }, 32)
+    wire.finish(&w, helloExtensions, 2)
+    wire.finish(&w, body, 3)
+    if !w.ok || !sendHandshake(server, out, w.at) { return false }
+    // (A ChangeCipherSpec for middleboxes, as the client's compatibility
+    // mode expects.)
+    var change: [1]u8 = undefined
+    change[0] = 1
+    if !sendRecord(server, 20, unsafe { @ptrCast([*]const u8, &change) }, 1) { return false }
+    // The handshake secrets.
+    const algorithm = server.*.algorithm
+    const size = hash.digestLength(algorithm)
+    var zeroes: [64]u8 = undefined
+    hash.wipe(unsafe { @ptrCast([*]u8, &zeroes) }, 64)
+    var early: [64]u8 = undefined
+    hash.hkdfExtract(algorithm, zeroes[0..size], zeroes[0..size], unsafe { @ptrCast([*]u8, &early) })
+    var salt: [64]u8 = undefined
+    schedule.derived(algorithm, unsafe { @ptrCast([*]const u8, &early) }, unsafe { @ptrCast([*]u8, &salt) })
+    var handshakeSecret: [64]u8 = undefined
+    hash.hkdfExtract(algorithm, salt[0..size], shared[0..32], unsafe { @ptrCast([*]u8, &handshakeSecret) })
+    hash.wipe(unsafe { @ptrCast([*]u8, &shared) }, 32)
+    var digest: [64]u8 = undefined
+    hash.peek(&server.*.transcript, unsafe { @ptrCast([*]u8, &digest) })
+    var clientSecret: [64]u8 = undefined
+    var serverSecret: [64]u8 = undefined
+    schedule.deriveSecret(algorithm, unsafe { @ptrCast([*]const u8, &handshakeSecret) }, "c hs traffic", unsafe { @ptrCast([*]const u8, &digest) }, unsafe { @ptrCast([*]u8, &clientSecret) })
+    schedule.deriveSecret(algorithm, unsafe { @ptrCast([*]const u8, &handshakeSecret) }, "s hs traffic", unsafe { @ptrCast([*]const u8, &digest) }, unsafe { @ptrCast([*]u8, &serverSecret) })
+    schedule.derived(algorithm, unsafe { @ptrCast([*]const u8, &handshakeSecret) }, unsafe { @ptrCast([*]u8, &salt) })
+    var masterSecret: [64]u8 = undefined
+    hash.hkdfExtract(algorithm, salt[0..size], zeroes[0..size], unsafe { @ptrCast([*]u8, &masterSecret) })
+    installTraffic(server, &server.*.writeKeys, unsafe { @ptrCast([*]const u8, &serverSecret) })
+    installTraffic(server, &server.*.readKeys, unsafe { @ptrCast([*]const u8, &clientSecret) })
+    // EncryptedExtensions: none.
+    w = wire.writer(out, ROOM)
+    wire.put8(&w, 8)
+    wire.put24(&w, 2)
+    wire.put16(&w, 0)
+    if !sendHandshake(server, out, w.at) { return false }
+    // Certificate.
+    w = wire.writer(out, ROOM)
+    wire.put8(&w, 11)
+    body = wire.begin(&w, 3)
+    wire.put8(&w, 0)
+    const list = wire.begin(&w, 3)
+    var index: usize = 0
+    while index < count && index < MAX_CHAIN {
+        wire.put24(&w, @intCast(u64, chain[index].length))
+        wire.putBytes(&w, chain[index].der, chain[index].length)
+        wire.put16(&w, 0)
+        index += 1
+    }
+    wire.finish(&w, list, 3)
+    wire.finish(&w, body, 3)
+    if !w.ok || !sendHandshake(server, out, w.at) { return false }
+    // CertificateVerify: 64 spaces, the context string, a zero, the
+    // transcript's digest, signed.
+    var content: [200]u8 = undefined
+    index = 0
+    while index < 64 {
+        content[index] = 32
+        index += 1
+    }
+    const label: []const u8 = "TLS 1.3, server CertificateVerify"
+    index = 0
+    while index < label.length {
+        content[64 + index] = label[index]
+        index += 1
+    }
+    content[64 + label.length] = 0
+    hash.peek(&server.*.transcript, unsafe { @ptrCast([*]u8, &content) + 65 + label.length })
+    var signature: [64]u8 = undefined
+    curve25519.ed25519Sign(seed, content[0..65 + label.length + size], unsafe { @ptrCast([*]u8, &signature) })
+    w = wire.writer(out, ROOM)
+    wire.put8(&w, 15)
+    wire.put24(&w, 2 + 2 + 64)
+    wire.put16(&w, ED25519)
+    wire.put16(&w, 64)
+    wire.putBytes(&w, unsafe { @ptrCast([*]const u8, &signature) }, 64)
+    if !sendHandshake(server, out, w.at) { return false }
+    // Finished.
+    hash.peek(&server.*.transcript, unsafe { @ptrCast([*]u8, &digest) })
+    buffer[0] = 20
+    buffer[1] = 0
+    buffer[2] = 0
+    buffer[3] = @intCast(u8, size)
+    schedule.finishedData(algorithm, unsafe { @ptrCast([*]const u8, &serverSecret) }, unsafe { @ptrCast([*]const u8, &digest) }, out + 4)
+    if !sendHandshake(server, out, 4 + size) { return false }
+    // The application secrets, from the transcript to here; ours now.
+    hash.peek(&server.*.transcript, unsafe { @ptrCast([*]u8, &digest) })
+    var clientApplication: [64]u8 = undefined
+    var serverApplication: [64]u8 = undefined
+    schedule.deriveSecret(algorithm, unsafe { @ptrCast([*]const u8, &masterSecret) }, "c ap traffic", unsafe { @ptrCast([*]const u8, &digest) }, unsafe { @ptrCast([*]u8, &clientApplication) })
+    schedule.deriveSecret(algorithm, unsafe { @ptrCast([*]const u8, &masterSecret) }, "s ap traffic", unsafe { @ptrCast([*]const u8, &digest) }, unsafe { @ptrCast([*]u8, &serverApplication) })
+    installTraffic(server, &server.*.writeKeys, unsafe { @ptrCast([*]const u8, &serverApplication) })
+    // The client's Finished, over the transcript to our Finished.
+    var expected: [64]u8 = undefined
+    schedule.finishedData(algorithm, unsafe { @ptrCast([*]const u8, &clientSecret) }, unsafe { @ptrCast([*]const u8, &digest) }, unsafe { @ptrCast([*]u8, &expected) })
+    if !readMessage(server) || server.*.message[0] != 20 || server.*.messageLength != 4 + size { return false }
+    if !hash.equal(unsafe { @ptrCast([*]const u8, &expected) }, unsafe { @ptrCast([*]const u8, &server.*.message) + 4 }, size) { return false }
+    installTraffic(server, &server.*.readKeys, unsafe { @ptrCast([*]const u8, &clientApplication) })
+    hash.wipe(unsafe { @ptrCast([*]u8, &handshakeSecret) }, 64)
+    hash.wipe(unsafe { @ptrCast([*]u8, &masterSecret) }, 64)
+    return true
+}
+
+// Received application data into OUT (at most ROOM bytes): how many; 0
+// when the client closed, -1 at an error.
+pub fn receive(server: *Server, out: [*]u8, room: usize) -> isize {
+    while server.*.dataLength == 0 {
+        if server.*.dataRecordEnd > 0 {
+            dropInput(server, server.*.dataRecordEnd)
+            server.*.dataRecordEnd = 0
+        }
+        if server.*.closed { return 0 }
+        if !readRecord(server) { return -1 }
+        const input: [*]u8 = unsafe { @ptrCast([*]u8, &server.*.input) }
+        const length = (@intCast(usize, input[3]) << 8) | @intCast(usize, input[4])
+        var start: usize = 0
+        var plainLength: usize = 0
+        var contentType: u8 = 0
+        if !record.open(&server.*.readKeys, input, length, &start, &plainLength, &contentType) { return -1 }
+        if contentType == 23 {
+            server.*.dataStart = start
+            server.*.dataLength = plainLength
+            server.*.dataRecordEnd = record.HEADER + length
+        } else {
+            // An alert (close_notify or worse) ends it; tickets and the
+            // like are passed over.
+            if contentType == 21 { server.*.closed = true }
+            dropInput(server, record.HEADER + length)
+        }
+    }
+    var count = server.*.dataLength
+    if count > room { count = room }
+    std.mem.copy(out, unsafe { @ptrCast([*]u8, &server.*.input) + server.*.dataStart }, count)
+    server.*.dataStart += count
+    server.*.dataLength -= count
+    return @intCast(isize, count)
+}
+
+// Whether bytes came that receive has not given yet (opened or not): a
+// caller that waits for the socket to be readable asks this first.
+pub fn pending(server: *Server) -> bool {
+    return server.*.dataLength > 0 || server.*.inputLength > server.*.dataRecordEnd
+}
+
+// Sends DATA as application data records.
+pub fn send(server: *Server, data: []const u8) -> bool {
+    return sendRecord(server, 23, data.pointer, data.length)
+}
+
+// close_notify.
+pub fn close(server: *Server) -> void {
+    var alert: [2]u8 = undefined
+    alert[0] = 1
+    alert[1] = 0
+    _ = sendRecord(server, 21, unsafe { @ptrCast([*]const u8, &alert) }, 2)
+}

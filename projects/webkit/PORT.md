@@ -147,6 +147,34 @@ Four ways to choose without patching, in this order of preference:
   pasted, a link followed to another file: page, and the screenshot shows
   that page as painted. mlx-cc now refuses a call whose result is a class
   only declared (Voyager's first engine took EventHandler's results so).
+- **M6, done**: http and https. The port's loader (embed/MlxNetwork.cpp,
+  a work queue of its own) runs each request with std.http's client on
+  the Mlx side (port/mlx/http.mlx: keep-alive, chunked, gzip and deflate;
+  https with std.tls, the chain checked by std.x509 against the system's
+  CA bundle and `MLXWEB_CA_FILE`) and gives the response, the data and
+  the end to WebCore's ResourceLoader on the main thread; redirects are
+  WebCore's (`willSendRequest`, 303 and a POST's 301/302 made GETs), the
+  cookie jar std.http's (with its public suffix list) behind
+  NetworkStorageSessionMlx and the page's CookieJar. Forms (GET, POST,
+  urlencoded and multipart), `fetch` and XHR go the same way;
+  synchronous loads too. Caching is WebCore's memory cache with the
+  response's headers (no disk cache: M7). WebSockets (embed/MlxWebSocket.cpp,
+  the page's SocketProvider; port/mlx/websocket.mlx) do the handshake,
+  frames, permessage-deflate and wss: (std.tls) on a reading thread of
+  their own. Voyager has a toolbar: an address field (Ctrl+L or a click,
+  Enter loads, http: when no scheme is typed), back and forward (the
+  buttons, Alt+Left and Alt+Right). tools/check_webkit_mlx_network.sh
+  starts tools/http-test-server (Mlx: a redirect chain, cookies set and
+  echoed, a form's POST echoed, JSON, gzip, chunked, a WebSocket echo,
+  and the same over https from std.tls's new server side,
+  std/src/tls/server.mlx, with a test root and certificate it makes at
+  start with std.asn1's DER writer and Ed25519) and compares what
+  webcore-dump prints of 15 pages, then that an unknown root is refused:
+  16 of 16. tools/check_voyager.sh types an address and goes back and
+  forward. https://example.com loads headless (its text printed) when
+  this machine reaches it; no check depends on the network. M6 found
+  mlx-cc's generic lambda converted to a function pointer (the closure's
+  address taken: epoch 7).
 
 ## The shape of the port
 
@@ -310,7 +338,7 @@ neither, PlatformMlx defines the platform half itself:
   `pageLoadCompleted`, ...), as WebKit2's WebLoaderStrategy and
   WebKitLegacy's WebResourceLoadScheduler are theirs: it makes the
   `SubresourceLoader`, runs the request on the Mlx side with std.http and
-  std.tls (HTTP/1.1, then HTTP/2), cookies
+  std.tls (HTTP/1.1; HTTP/2 later), cookies
   with std.http's cookie jar and public suffix list, and gives the
   response and the data back through `ResourceLoader::didReceiveResponse`,
   `didReceiveData`, `didFinishLoading` on the main thread. `data:` URLs
@@ -417,7 +445,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M3 | A page loaded and laid out headless | `mlx-out/webkit/bin/webcore-dump FILE.html` makes a Page with the port's clients, loads a `file:` or `data:` URL, lays it out at 800x600 and prints `externalRepresentation()` (rendering/RenderTreeAsText.cpp: DumpRenderTree's render tree) | render trees of LayoutTests pages that use the Ahem font (metrics independent of the system's fonts) compared with LayoutTests' `-expected.txt` of WebKit's repository at 2.54.1's revision (`platform/wpe` and `platform/glib` baselines first), and with a WPE build's WebKitTestRunner where one can be built |
 | M4 | Painting into a buffer | the same program paints the view into a Skia raster surface and writes a PNG (std.png); images decoded by the port's decoders | pixel tests: reference PNGs of simple pages (Ahem text, boxes, borders, gradients, images) within a small tolerance |
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
-| M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | a local std.http server's pages; the TLS checks of std.tls's tests; then real sites by hand |
+| M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
 | M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process |
 | M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | |
 
@@ -556,3 +584,22 @@ What M2 found, and how the port meets it without a patch:
   tools/check_webkit_mlx_port.sh counts as defined; mlx-unicode gained
   `u_strToTitle` (RenderText's `text-transform: capitalize` with a
   locale) and the `uset_` sets SmartReplace.cpp builds from patterns.
+- **Binding integrity and mlx-cc's vtables.** mlx-cc's vtable pointer is
+  the `_ZTV` symbol's address itself, where the Itanium ABI's points two
+  slots in (`&_ZTV[2]`, past the offset to top and the type info).
+  WebCore's generated bindings check a wrapped object's vtable against
+  `&_ZTV[2]` (`ENABLE_BINDING_INTEGRITY`, verifyVTable) and crashed on
+  XMLHttpRequest, FetchResponse and WebSocket; config.mlx sets
+  `ENABLE_BINDING_INTEGRITY 0` for MLX (and JSC_ONLY) until mlx-cc lays
+  vtables out as the ABI does. Open: the layout, then the define back to
+  WebKit's default.
+- **What M6 leaves.** A `text/plain` document crashes in
+  TextDocumentParser (its fake `<meta>`'s QualifiedName is null in its
+  unified unit: mlx-cc's static initialization order, to be found); the
+  test server's echo answers in HTML meanwhile. Pings and beacons are
+  refused, a Blob is not sent over a WebSocket, DNS prefetch and the
+  network state notifier are stubs (their `STUB` lines). mlx-cc gaps
+  M6 met and went around: two `static` functions of one name in one
+  unified unit are merged silently (MlxNetwork's `tracing` renamed), and
+  a `std::span<const char>` was taken as a `const char*`
+  (`String::fromLatin1(span)` compiled; the loader parses bytes itself).

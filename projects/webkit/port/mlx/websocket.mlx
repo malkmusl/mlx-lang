@@ -6,7 +6,10 @@
 // (receive blocks until a whole message, or the end) and another's
 // writing (send, close).
 //
-// STUB (later: wss: over std.tls): only ws: URLs connect.
+// wss: runs over std.tls's client, the chain checked against the system's
+// CA bundle and MLXWEB_CA_FILE as http.mlx's are; the reading thread and
+// the senders share the TLS client under a lock (never held while the
+// reader waits for the socket).
 const std = @import("std")
 const net = @import("std.net")
 const uri = @import("std.uri")
@@ -15,9 +18,12 @@ const deflate = @import("std.http.websocket.deflate")
 const message = @import("std.http.message")
 const headers = @import("std.http.headers")
 const random = @import("std.random")
+const tls = @import("std.tls")
+const x509 = @import("std.x509")
 
 extern("c") fn malloc(size: usize) -> usize
 extern("c") fn free(address: usize) -> void
+extern("c") fn getenv(name: [*]const u8) -> usize
 
 const ROOM: usize = 65536
 
@@ -29,6 +35,10 @@ pub const KIND_CLOSE: u32 = 8
 
 const Socket = struct {
     fd: isize
+    secure: bool
+    tlsClient: *tls.Client
+    // The TLS client's lock (0 free, 1 held).
+    tlsLock: u32
     // Bytes received and not yet taken.
     buffer: [ROOM]u8
     start: usize
@@ -97,6 +107,100 @@ fn keep(into: *[256]u8, value: []const u8) -> void {
     into.*[n] = 0
 }
 
+// The trust store of wss: loaded once, by the first to ask.
+var store: x509.TrustStore = undefined
+var storeState: u32 = 0
+
+fn trustStore() -> *x509.TrustStore {
+    if @cmpxchgStrong(u32, &storeState, 0, 1, acquire, monotonic).0 {
+        x509.storeInit(&store, allocator())
+        _ = x509.storeLoadFile(&store, "/etc/ssl/certs/ca-certificates.crt".pointer)
+        const extra = getenv("MLXWEB_CA_FILE".pointer)
+        if extra != 0 { _ = x509.storeLoadFile(&store, unsafe { @ptrFromInt([*]const u8, extra) }) }
+        @atomicStore(u32, &storeState, 2, release)
+    }
+    while @atomicLoad(u32, &storeState, acquire) != 2 { }
+    return &store
+}
+
+fn lockTls(socket: *Socket) -> void {
+    while true {
+        if @cmpxchgStrong(u32, &socket.*.tlsLock, 0, 1, acquire, monotonic).0 { return }
+    }
+}
+
+fn unlockTls(socket: *Socket) -> void { @atomicStore(u32, &socket.*.tlsLock, 0, release) }
+
+// The TLS client's output onto the socket (its lock held).
+fn flushTls(socket: *Socket) -> bool {
+    const pending = tls.pendingOutput(socket.*.tlsClient)
+    if pending.length == 0 { return true }
+    if !net.send(socket.*.fd, pending) { return false }
+    tls.outputSent(socket.*.tlsClient, pending.length)
+    return true
+}
+
+// More of the socket into the TLS client's input (the reading thread's
+// alone: no lock).
+fn fillTls(socket: *Socket) -> bool {
+    const room = tls.inputRoom(socket.*.tlsClient)
+    if room == 0 { return false }
+    const got = net.receive(socket.*.fd, tls.inputSpace(socket.*.tlsClient), room)
+    if got <= 0 {
+        lockTls(socket)
+        _ = tls.endOfInput(socket.*.tlsClient)
+        unlockTls(socket)
+        return false
+    }
+    tls.inputAdded(socket.*.tlsClient, @intCast(usize, got))
+    return true
+}
+
+// The TLS handshake on the connected socket, for HOST.
+fn handshake(socket: *Socket, host: []const u8) -> bool {
+    const memory = allocator().alloc(@sizeOf(tls.Client), 16)
+    if memory == null { return false }
+    socket.*.tlsClient = unsafe { @ptrCast(*tls.Client, memory.?) }
+    if !tls.clientInit(socket.*.tlsClient, allocator()) {
+        allocator().free(memory.?, @sizeOf(tls.Client), 16)
+        return false
+    }
+    socket.*.secure = true
+    tls.setServerName(socket.*.tlsClient, host)
+    tls.setAlpn(socket.*.tlsClient, "\x08http/1.1")
+    tls.setTrustStore(socket.*.tlsClient, trustStore())
+    _ = tls.start(socket.*.tlsClient)
+    while true {
+        if !flushTls(socket) { return false }
+        const state = tls.process(socket.*.tlsClient)
+        if state == tls.State.connected { return true }
+        if state == tls.State.checkCertificate {
+            _ = tls.acceptCertificate(socket.*.tlsClient, false)
+            _ = flushTls(socket)
+            return false
+        }
+        if state != tls.State.handshaking { return false }
+        if !net.readable(socket.*.fd, 10000) || !fillTls(socket) { return false }
+    }
+    return false
+}
+
+// BYTES onto the connection; false when it failed.
+fn transmit(socket: *Socket, bytes: []const u8) -> bool {
+    if !socket.*.secure { return net.send(socket.*.fd, bytes) }
+    lockTls(socket)
+    var taken: usize = 0
+    var sent = true
+    while sent && taken < bytes.length {
+        const now = tls.write(socket.*.tlsClient, unsafe { bytes.pointer + taken }, bytes.length - taken)
+        if now == 0 && !tls.hasPendingOutput(socket.*.tlsClient) { sent = false }
+        taken += now
+        if !flushTls(socket) { sent = false }
+    }
+    unlockTls(socket)
+    return sent
+}
+
 // More bytes into the socket's buffer; false at the connection's end.
 fn fill(socket: *Socket) -> bool {
     if socket.*.start > 0 {
@@ -109,7 +213,24 @@ fn fill(socket: *Socket) -> bool {
         socket.*.start = 0
     }
     if socket.*.end == ROOM { return false }
-    const got = net.receive(socket.*.fd, unsafe { @ptrCast([*]u8, &socket.*.buffer) + socket.*.end }, ROOM - socket.*.end)
+    const into: [*]u8 = unsafe { @ptrCast([*]u8, &socket.*.buffer) + socket.*.end }
+    if socket.*.secure {
+        while true {
+            lockTls(socket)
+            const state = tls.process(socket.*.tlsClient)
+            const flushed = flushTls(socket)
+            var got: usize = 0
+            if tls.readable(socket.*.tlsClient) > 0 { got = tls.read(socket.*.tlsClient, into, ROOM - socket.*.end) }
+            unlockTls(socket)
+            if got > 0 {
+                socket.*.end += got
+                return true
+            }
+            if !flushed || state != tls.State.connected || !fillTls(socket) { return false }
+        }
+        return false
+    }
+    const got = net.receive(socket.*.fd, into, ROOM - socket.*.end)
     if got <= 0 { return false }
     socket.*.end += @intCast(usize, got)
     return true
@@ -127,7 +248,9 @@ fn headComplete(data: []const u8, headEnd: usize) -> bool {
 // string, comma separated, empty for none): the socket, or 0.
 pub fn connect(url: usize, protocols: usize) -> usize {
     var u: uri.Uri = undefined
-    if !uri.parse(cText(url), &u) || !u.hasAuthority || !uri.equalsIgnoringCase(u.scheme, "ws") { return 0 }
+    if !uri.parse(cText(url), &u) || !u.hasAuthority { return 0 }
+    const secure = uri.equalsIgnoringCase(u.scheme, "wss")
+    if !secure && !uri.equalsIgnoringCase(u.scheme, "ws") { return 0 }
     var addresses: [4]net.Address = undefined
     const found = net.resolve(uri.hostName(&u), uri.portOf(&u), unsafe { @ptrCast([*]net.Address, &addresses) }, 4, 10000)
     if found == 0 { return 0 }
@@ -145,12 +268,18 @@ pub fn connect(url: usize, protocols: usize) -> usize {
         allocator().free(memory.?, @sizeOf(Socket), 16)
         return 0
     }
+    socket.*.secure = false
+    socket.*.tlsLock = 0
     socket.*.start = 0
     socket.*.end = 0
     socket.*.closeSent = false
+    deflate.init(&socket.*.extension, allocator())
+    if secure && !handshake(socket, uri.hostName(&u)) {
+        release(@intFromPtr(socket))
+        return 0
+    }
     socket.*.protocol[0] = 0
     socket.*.extensions[0] = 0
-    deflate.init(&socket.*.extension, allocator())
     // The request.
     var nonce: [16]u8 = undefined
     _ = random.fill(unsafe { @ptrCast([*]u8, &nonce) }, 16)
@@ -183,14 +312,14 @@ pub fn connect(url: usize, protocols: usize) -> usize {
         put(&request, "\r\n")
     }
     put(&request, "\r\n")
-    if !net.send(socket.*.fd, request.bytes[0..request.length]) {
+    if !transmit(socket, request.bytes[0..request.length]) {
         release(@intFromPtr(socket))
         return 0
     }
     // The response's head.
     var headLength = message.headEnd(socket.*.buffer[0..socket.*.end])
     while !headComplete(socket.*.buffer[0..socket.*.end], headLength) {
-        if !net.readable(socket.*.fd, 10000) || !fill(socket) {
+        if (!socket.*.secure && !net.readable(socket.*.fd, 10000)) || !fill(socket) {
             release(@intFromPtr(socket))
             return 0
         }
@@ -263,7 +392,7 @@ fn sendFrame(socket: *Socket, opcode: u8, payload: []const u8) -> bool {
         i += 1
     }
     ws.applyMask(mask, unsafe { bytes + headLength }, body.length)
-    const sent = net.send(socket.*.fd, bytes[0..total])
+    const sent = transmit(socket, bytes[0..total])
     allocator().free(frame.?, if total == 0 { 1 } else { total }, 16)
     if compressed.capacity > 0 { deflate.freeBytes(&socket.*.extension, &compressed) }
     return sent
@@ -408,6 +537,12 @@ pub fn releaseMessage(m: usize) -> void {
 pub fn release(socket: usize) -> void {
     if socket == 0 { return }
     const s = socketAt(socket)
+    if s.*.secure {
+        tls.close(s.*.tlsClient)
+        _ = flushTls(s)
+        tls.clientFree(s.*.tlsClient)
+        allocator().free(unsafe { @ptrCast([*]u8, s.*.tlsClient) }, @sizeOf(tls.Client), 16)
+    }
     if s.*.fd >= 0 { net.close(s.*.fd) }
     deflate.deinit(&s.*.extension)
     allocator().free(unsafe { @ptrFromInt([*]u8, socket) }, @sizeOf(Socket), 16)

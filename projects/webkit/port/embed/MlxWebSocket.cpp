@@ -39,7 +39,7 @@ private:
 
     ConnectStatus connect(const URL& url, const String& protocol) final
     {
-        if (!url.protocolIs("ws"_s))
+        if (!url.protocolIs("ws"_s) && !url.protocolIs("wss"_s))
             return ConnectStatus::KO;
         m_url = url;
         m_handshakeCreated = true;

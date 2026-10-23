@@ -9,10 +9,12 @@
 # (cookies, fetch and XMLHttpRequest results, the WebSocket's messages);
 # the output, its port written PORT, must be expected/NAME.txt.
 #
-# https: openssl s_server (when openssl is installed) serves secure.html
-# with a chain of tools/tls-test/make_certs.sh, whose root webcore-dump
-# trusts through MLXWEB_CA_FILE; the page must come, and a server whose
-# chain the root did not sign must not.
+# https: the same server serves the same over TLS 1.3 (std.tls.server) on a
+# second port, with a certificate signed by a test root it makes at start
+# (tools/http-test-server/certs.mlx: std.asn1, Ed25519) and writes as PEM;
+# webcore-dump trusts that root through MLXWEB_CA_FILE. Pages whose path
+# is written https:/PATH come that way (wss: for their WebSockets); then,
+# without the root, the page must not come.
 #
 #   tools/check_webkit_mlx_network.sh [--no-build] [PAGE...]
 set -uo pipefail
@@ -34,10 +36,8 @@ done
 
 work=$(mktemp -d /tmp/mlx-webkit-network.XXXXXX)
 server_pid=
-tls_pid=
 cleanup() {
     [[ -n "$server_pid" ]] && kill -- -"$server_pid" 2> /dev/null
-    [[ -n "$tls_pid" ]] && kill "$tls_pid" 2> /dev/null
     [[ -n "${MLX_NETWORK_KEEP:-}" ]] && mkdir -p "$MLX_NETWORK_KEEP" && cp "$work"/*.txt "$MLX_NETWORK_KEEP"/ 2> /dev/null
     rm -rf -- "$work"
 }
@@ -64,25 +64,29 @@ mkdir -p "$work/home"
 
 # The server, in a process group of its own (its children serve the
 # connections).
-setsid "$work/http-test-server" "$repo_root/$network/site" > "$work/port" 2> "$work/server.log" &
+setsid "$work/http-test-server" "$repo_root/$network/site" "$work/ca.pem" > "$work/port" 2> "$work/server.log" &
 server_pid=$!
-for _ in $(seq 1 50); do [[ -s "$work/port" ]] && break; sleep 0.1; done
-port=$(head -1 "$work/port")
-[[ -n "$port" ]] || fail "the test server did not start: $(cat "$work/server.log")"
-echo "ok   the test server listens on 127.0.0.1:$port"
+for _ in $(seq 1 50); do [[ $(wc -l < "$work/port") -ge 2 ]] && break; sleep 0.1; done
+port=$(sed -n 1p "$work/port")
+tls_port=$(sed -n 2p "$work/port")
+[[ -n "$port" && -n "$tls_port" && -s "$work/ca.pem" ]] || fail "the test server did not start: $(cat "$work/server.log")"
+echo "ok   the test server listens on 127.0.0.1:$port (http) and :$tls_port (https)"
 
 dump() {
     local url=$1
     shift
-    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" ${MLXWEB_CA_FILE:+MLXWEB_CA_FILE=$MLXWEB_CA_FILE} timeout 120 "$program" --timeout 60 --text "$@" "$url" 2> "$work/err.txt"
+    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" ${trusted:+MLXWEB_CA_FILE=$work/ca.pem} timeout 120 "$program" --timeout 60 --text "$@" "$url" 2> "$work/err.txt"
 }
 
 failed=0
 passed=0
+trusted=1
 while read -r name path wait; do
     case $name in "#"*|"") continue ;; esac
     if [[ ${#chosen[@]} -gt 0 ]] && [[ ! " ${chosen[*]} " == *" $name "* ]]; then continue; fi
-    dump "http://127.0.0.1:$port$path" ${wait:+--wait-title "$wait"} | sed -e "s/127\.0\.0\.1:$port/127.0.0.1:PORT/g" -e 's/WebKitFormBoundary[A-Za-z0-9]*/WebKitFormBoundary/g' -e 's/[[:space:]]*$//' > "$work/$name.txt"
+    url="http://127.0.0.1:$port$path"
+    [[ $path == https:* ]] && url="https://127.0.0.1:$tls_port${path#https:}"
+    dump "$url" ${wait:+--wait-title "$wait"} | sed -e "s/127\.0\.0\.1:\($port\|$tls_port\)/127.0.0.1:PORT/g" -e 's/WebKitFormBoundary[A-Za-z0-9]*/WebKitFormBoundary/g' -e 's/[[:space:]]*$//' > "$work/$name.txt"
     if cmp -s "$work/$name.txt" "$network/expected/$name.txt"; then
         passed=$(( passed + 1 ))
         echo "PASS $name ($path)"
@@ -94,26 +98,9 @@ while read -r name path wait; do
     fi
 done < "$network/pages.txt"
 
-# https against openssl s_server, with a test CA.
-if command -v openssl > /dev/null && [[ ${#chosen[@]} -eq 0 ]]; then
-    tools/tls-test/make_certs.sh "$work/certs" > /dev/null 2>&1 || fail "tools/tls-test/make_certs.sh"
-    mkdir -p "$work/www"
-    cp "$network/site/secure.html" "$work/www/"
-    tls_port=$(( 20000 + RANDOM % 20000 ))
-    (cd "$work/www" && exec openssl s_server -quiet -accept "$tls_port" -cert "$work/certs/p256.pem" -key "$work/certs/p256.key" -cert_chain "$work/certs/intermediate.pem" -WWW) > "$work/tls.log" 2>&1 &
-    tls_pid=$!
-    sleep 1
-    MLXWEB_CA_FILE=$work/certs/ca.pem dump "https://127.0.0.1:$tls_port/secure.html" | sed -e "s/127\.0\.0\.1:$tls_port/127.0.0.1:PORT/g" -e 's/[[:space:]]*$//' > "$work/secure.txt"
-    if cmp -s "$work/secure.txt" "$network/expected/secure.txt"; then
-        passed=$(( passed + 1 ))
-        echo "PASS secure (https, the test CA trusted)"
-    else
-        failed=$(( failed + 1 ))
-        echo "FAIL secure (https, the test CA trusted):"
-        diff "$network/expected/secure.txt" "$work/secure.txt" | head -10 | sed 's/^/     /'
-        grep -v '^  ' "$work/err.txt" | tail -2 | sed 's/^/     /'
-    fi
-    # Without the test CA the chain does not verify: no page.
+# Without the test root the https server's chain does not verify: no page.
+if [[ ${#chosen[@]} -eq 0 ]]; then
+    trusted=
     dump "https://127.0.0.1:$tls_port/secure.html" > "$work/untrusted.txt"
     if grep -q "^title secure" "$work/untrusted.txt"; then
         failed=$(( failed + 1 ))
@@ -122,8 +109,6 @@ if command -v openssl > /dev/null && [[ ${#chosen[@]} -eq 0 ]]; then
         passed=$(( passed + 1 ))
         echo "PASS untrusted (https: a chain of an unknown root is refused)"
     fi
-else
-    echo "skip https: no openssl"
 fi
 
 echo "check_webkit_mlx_network.sh: $passed of $(( passed + failed )) pass"
