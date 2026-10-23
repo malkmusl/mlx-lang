@@ -24,6 +24,18 @@
 # location: none asked); the scheme's own page (a path written test:...,
 # loaded as it is) loads and fetches its own URLs, a 404 among them.
 #
+# What a profile keeps (M7, PORT.md "Network"): webcore-dump runs twice
+# with the same --profile. The HTTP cache on disk: site/cache.html fetches
+# a response fresh for an hour (max-age), one validated each time (an ETag,
+# no-cache) and one never stored (no-store), and shows what the server saw
+# (/cache/requests: the server notes every request); the second run gets
+# the first from the disk with no request, revalidates the second (a 304)
+# and fetches the third again (expected/cache-first.txt,
+# cache-second.txt). The cookie jar: site/persist-set.html is sent a
+# cookie for a day, one for a second and a session cookie; two seconds
+# later persist-read.html, in a second run, sends only the first
+# (cookies-set.txt, cookies-kept.txt).
+#
 #   tools/check_webkit_mlx_network.sh [--no-build] [PAGE...]
 set -uo pipefail
 
@@ -120,6 +132,34 @@ if [[ ${#chosen[@]} -eq 0 ]]; then
         passed=$(( passed + 1 ))
         echo "PASS untrusted (https: a chain of an unknown root is refused)"
     fi
+fi
+
+# Two runs of one profile each: the HTTP cache, the cookies.
+compare() { # NAME (the output in $work/NAME.txt)
+    if cmp -s "$work/$1.txt" "$network/expected/$1.txt"; then
+        passed=$(( passed + 1 ))
+        echo "PASS $1 ($2)"
+    else
+        failed=$(( failed + 1 ))
+        echo "FAIL $1 ($2):"
+        diff "$network/expected/$1.txt" "$work/$1.txt" | head -10 | sed 's/^/     /'
+        grep -v '^  ' "$work/err.txt" | tail -2 | sed 's/^/     /'
+    fi
+}
+persist() { # NAME PATH PROFILE [WAIT]
+    dump "http://127.0.0.1:$port$2" --profile "$work/$3" ${4:+--wait-title "$4"} | sed -e "s/127\.0\.0\.1:$port/127.0.0.1:PORT/g" -e 's/[[:space:]]*$//' > "$work/$1.txt"
+}
+if [[ ${#chosen[@]} -eq 0 ]]; then
+    trusted=1
+    persist cache-first /cache.html profile-cache "cache done"
+    compare cache-first "the HTTP cache: a first run stores"
+    persist cache-second /cache.html profile-cache "cache done"
+    compare cache-second "the HTTP cache: a second run of the profile: max-age from the disk, a 304, no-store fetched"
+    persist cookies-set /persist-set.html profile-cookies
+    compare cookies-set "cookies: a day's, a second's and a session's set"
+    sleep 2
+    persist cookies-kept /persist-read.html profile-cookies
+    compare cookies-kept "cookies: a second run of the profile sends the day's only"
 fi
 
 echo "check_webkit_mlx_network.sh: $passed of $(( passed + failed )) pass"
