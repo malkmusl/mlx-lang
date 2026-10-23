@@ -8,8 +8,11 @@
 # gradients, a PNG image decoded by the port's std.png decoder, at its
 # size and scaled, the desktop's colour scheme: a page that allows dark
 # painted light and, as PAGE@dark, with --dark: its canvas, a
-# prefers-color-scheme rule, system colours and a text field of the
-# theme in the dark variant). A page passes when no more pixels than pages.txt
+# prefers-color-scheme rule, system colours and the form controls and
+# selection of the port's theme in the dark variant; as PAGE@forcedark,
+# with --dark --force-dark: forced dark mode, a light page's colours
+# inverted and its image's pixels kept, pages with dark designs of their
+# own left as they are). A page passes when no more pixels than pages.txt
 # allows differ from the reference by more than its tolerance in a channel;
 # the check fails when a page fails that pages.txt does not list as known
 # to (with its cause).
@@ -70,13 +73,18 @@ known=0
 while read -r page tolerance allow cause; do
     case $page in "#"*|"") continue ;; esac
     if [[ ${#chosen[@]} -gt 0 ]] && [[ ! " ${chosen[*]} " == *" $page "* ]]; then continue; fi
-    # (PAGE@dark: PAGE with the dark appearance.)
+    # (PAGE@dark: PAGE with the dark appearance; PAGE@forcedark: with
+    # forced dark mode as well.)
     file=${page%@dark}
+    file=${file%@forcedark}
     name=${file%.*}
     flags=()
     if [[ "$page" == *@dark ]]; then
         name=$name-dark
         flags=(--dark)
+    elif [[ "$page" == *@forcedark ]]; then
+        name=$name-forcedark
+        flags=(--dark --force-dark)
     fi
     out=$work/$name.png
     status=0
