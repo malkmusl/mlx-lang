@@ -4,7 +4,7 @@
 // painted (M4).
 //
 //     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test]
-//                  [--downloads DIR] [--upload PATH]...
+//                  [--downloads DIR [--download-pause-at BYTES] [--download-cancel-at BYTES]] [--upload PATH]...
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -48,7 +48,12 @@
 // an attachment, a link's download attribute, a blob or data: URL, a
 // type no frame shows) into DIR, unique names kept apart ("NAME (1).EXT");
 // the run waits for them, and --text lists each after the text
-// ("download NAME BYTES bytes done", or "failed: WHY").
+// ("download NAME BYTES bytes done", or "failed: WHY"; those the
+// profile kept from a run before too). --download-pause-at BYTES pauses
+// a download once it has BYTES (its partial file then looked at and
+// noted), then resumes it; --download-cancel-at BYTES cancels it there
+// (whether its partial file is left noted): "note ..." lines after the
+// list.
 //
 // --upload PATH (repeatable) answers the page's file chooser: once the
 // page has loaded, its first <input type=file> is clicked as by the user
@@ -146,6 +151,7 @@
 #include <wtf/RunLoop.h>
 #include <wtf/text/CString.h>
 #include <wtf/text/MakeString.h>
+#include <wtf/text/StringBuilder.h>
 
 using namespace WebCore;
 
@@ -175,7 +181,7 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test] [--downloads DIR] [--upload PATH]... [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test] [--downloads DIR [--download-pause-at BYTES] [--download-cancel-at BYTES]] [--upload PATH]... [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
@@ -506,6 +512,51 @@ static void clickFileInput(Run& run)
 // Whether the frame's document has loaded with nothing pending: its load
 // finished, the parser done, no request of its resource loader (images,
 // style sheets, fonts) outstanding, no navigation queued or provisional.
+// --download-pause-at's and --download-cancel-at's: the byte counts,
+// whether each was done, and what was seen (the notes); the run waits
+// while a pause has not been resumed.
+static uint64_t downloadPauseAt;
+static uint64_t downloadCancelAt;
+static bool downloadPaused;
+static bool downloadCancelled;
+static bool downloadControlPending;
+static StringBuilder downloadNotes;
+static String downloadCancelledPartial;
+
+static void watchDownload(const MlxDownloads::Download* download)
+{
+    if (!download)
+        return;
+    using State = MlxDownloads::State;
+    if (downloadPauseAt && !downloadPaused && download->state == State::Running && download->received >= downloadPauseAt) {
+        downloadPaused = true;
+        downloadControlPending = true;
+        MlxDownloads::pause(download->id);
+        return;
+    }
+    if (downloadPaused && downloadControlPending && download->state == State::Paused) {
+        auto size = FileSystem::fileSize(download->path);
+        downloadNotes.append("note paused: "_s, FileSystem::pathFileName(download->path), size && *size == download->received && *size > 0 && (!download->expected || *size < download->expected) ? " holds what came so far"_s : " is not what came"_s, '\n');
+        RunLoop::mainSingleton().dispatchAfter(50_ms, [id = download->id] {
+            MlxDownloads::resume(id);
+            downloadControlPending = false;
+        });
+        return;
+    }
+    if (downloadCancelAt && !downloadCancelled && download->state == State::Running && download->received >= downloadCancelAt) {
+        downloadCancelled = true;
+        downloadNotes.append("note cancelling: the partial file "_s, FileSystem::fileExists(download->path) ? "is there"_s : "is not there"_s, '\n');
+        downloadCancelledPartial = download->path;
+        downloadControlPending = true;
+        MlxDownloads::cancel(download->id);
+        return;
+    }
+    if (download->state == State::Cancelled && downloadCancelled && downloadControlPending) {
+        downloadControlPending = false;
+        downloadNotes.append("note cancelled: the partial file "_s, FileSystem::fileExists(downloadCancelledPartial) ? "is left"_s : "is gone"_s, '\n');
+    }
+}
+
 static bool isQuiet(Run& run)
 {
     if (testMode) {
@@ -530,7 +581,7 @@ static bool isQuiet(Run& run)
         return false;
     if (!run.waitTitle.isNull() && document->title() != run.waitTitle && !run.uploadPending)
         return false;
-    if (MlxDownloads::running())
+    if (MlxDownloads::running() || downloadControlPending)
         return false;
     // (Nor a navigation on its way: a form a script submitted, a
     // redirect the page scheduled, a load not committed yet.)
@@ -628,6 +679,10 @@ int main(int argc, char** argv)
             timeout = atof(argv[++i]);
         else if (!strcmp(argv[i], "--downloads") && i + 1 < argc)
             downloads = argv[++i];
+        else if (!strcmp(argv[i], "--download-pause-at") && i + 1 < argc)
+            downloadPauseAt = strtoull(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--download-cancel-at") && i + 1 < argc)
+            downloadCancelAt = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--upload") && i + 1 < argc) {
             String path = String::fromUTF8(argv[++i]);
             char directory[4096];
@@ -729,6 +784,7 @@ int main(int argc, char** argv)
         if (!directory.startsWith('/') && getcwd(cwd, sizeof(cwd)))
             directory = FileSystem::pathByAppendingComponent(String::fromUTF8(cwd), directory);
         MlxDownloads::setDirectory(directory);
+        MlxDownloads::setObserver(watchDownload);
     }
 
     static MlxFrameLoaderClient* mainClient;
@@ -795,14 +851,22 @@ int main(int argc, char** argv)
             StringBuilder list;
             for (auto& download : MlxDownloads::list()) {
                 String name = download.path.isEmpty() ? download.name : FileSystem::pathFileName(download.path);
-                list.append("download "_s, name, ' ', download.received, " bytes "_s);
+                // (A cancelled one's bytes are where it stopped: not told.)
+                list.append("download "_s, name, ' ');
+                if (download.state != MlxDownloads::State::Cancelled)
+                    list.append(download.received, " bytes "_s);
                 if (download.state == MlxDownloads::State::Done)
                     list.append("done\n"_s);
                 else if (download.state == MlxDownloads::State::Failed)
                     list.append("failed: "_s, download.error, '\n');
+                else if (download.state == MlxDownloads::State::Cancelled)
+                    list.append("cancelled\n"_s);
+                else if (download.state == MlxDownloads::State::Paused)
+                    list.append("paused\n"_s);
                 else
                     list.append("unfinished\n"_s);
             }
+            list.append(downloadNotes.toString());
             tree = makeString(tree, list.toString());
         }
         if (textOnly && scheme) {

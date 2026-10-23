@@ -93,11 +93,12 @@ void MlxFrameLoaderClient::forceLayoutForNonHTML() { }
 void MlxFrameLoaderClient::setCopiesOnScroll() { }
 void MlxFrameLoaderClient::detachedFromParent2() { }
 void MlxFrameLoaderClient::detachedFromParent3() { }
-// (Fetched again by MlxDownloads: the frame's load stops here.)
-void MlxFrameLoaderClient::convertMainResourceLoadToDownload(DocumentLoader*, const ResourceRequest& request, const ResourceResponse& response)
+// (The frame's load stops here; its body goes on into the download's
+// file, MlxDownloads::convert.)
+void MlxFrameLoaderClient::convertMainResourceLoadToDownload(DocumentLoader* documentLoader, const ResourceRequest& request, const ResourceResponse& response)
 {
     m_downloadStarted = true;
-    MlxDownloads::start(request, &response, std::exchange(m_downloadName, String()));
+    MlxDownloads::convert(documentLoader ? documentLoader->mainResourceLoader() : nullptr, request, response, std::exchange(m_downloadName, String()));
 }
 
 void MlxFrameLoaderClient::assignIdentifierToInitialRequest(ResourceLoaderIdentifier, DocumentLoader*, const ResourceRequest&) { MLX_TRACE("assignIdentifierToInitialRequest"); }

@@ -1166,7 +1166,10 @@ int main(int argc, char** argv)
     gatherFacts(argc, argv);
     MlxSchemeHandler::registerScheme("voyager"_s, answerInternal);
     // Each download's end, on standard error (tools/check_voyager.sh).
-    MlxDownloads::setObserver([](const MlxDownloads::Download& download) {
+    MlxDownloads::setObserver([](const MlxDownloads::Download* changed) {
+        if (!changed)
+            return;
+        auto& download = *changed;
         if (download.state == MlxDownloads::State::Done)
             fprintf(stderr, "voyager: download done %s (%llu bytes)\n", download.path.utf8().data(), static_cast<unsigned long long>(download.received));
         else if (download.state == MlxDownloads::State::Failed)

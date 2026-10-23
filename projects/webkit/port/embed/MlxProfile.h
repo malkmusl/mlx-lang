@@ -7,6 +7,7 @@
 //   IndexedDB/      IndexedDB's databases (MlxIndexedDB.h)
 //   cookies.sqlite  the cookie jar's cookies that outlive the session
 //                   (port/mlx/cookies.mlx: libsoup's moz_cookies table)
+//   downloads.sqlite  the downloads' list (MlxDownloads.h)
 // CACHE (Voyager's: $XDG_CACHE_HOME/voyager, ~/.cache/voyager):
 //   http/           the HTTP cache (port/mlx/httpcache.mlx)
 //

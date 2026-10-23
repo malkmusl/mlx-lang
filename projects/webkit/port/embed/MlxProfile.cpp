@@ -9,6 +9,7 @@
 #include "SerializedScriptValue.h"
 #include "WrappedCryptoKey.h"
 #include "MlxIndexedDB.h"
+#include "MlxDownloads.h"
 #include "MlxNetwork.h"
 #include "MlxStorage.h"
 #include "MlxWebSocket.h"
@@ -52,6 +53,9 @@ void open(const String& dataDirectory, const String& cacheDirectory)
         FileSystem::makeAllDirectories(p.cache);
     p.storage = MlxStorageNamespaceProvider::create(under(p.data, "LocalStorage"_s));
     p.databases = MlxDatabaseProvider::create(under(p.data, "IndexedDB"_s));
+    // The downloads' list (MlxDownloads: a restart finds it).
+    if (!p.data.isEmpty())
+        MlxDownloads::openDatabase(under(p.data, "downloads.sqlite"_s));
     // The network's: the cookies and the HTTP cache (on the network queue,
     // which every call of the Mlx side's network functions runs on).
     auto cookies = under(p.data, "cookies.sqlite"_s).utf8();

@@ -183,7 +183,12 @@ public:
 
     void pageLoadCompleted(Page&) override { }
     void browsingContextRemoved(LocalFrame&) override { }
-    void remove(ResourceLoader*) override { }
+    // (A load gone: a body still coming is read no further.)
+    void remove(ResourceLoader* loader) override
+    {
+        if (loader)
+            MlxNetwork::loaderGone(*loader);
+    }
     void setDefersLoading(ResourceLoader&, bool) override { }
     void crossOriginRedirectReceived(ResourceLoader*, const URL&) override { }
     void servePendingRequests(ResourceLoadPriority) override { }
