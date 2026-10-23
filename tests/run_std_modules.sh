@@ -148,6 +148,7 @@ run 385_flate_gzip_runtime "gzip files written and read in pieces, two members a
 run 386_hash_runtime "wyhash against its reference's vectors, words combined, autoHash and autoEql by type (integers, bools, enums, floats, pointers, optionals, slices, arrays), the string context"
 run 390_heap_runtime "the program's heap: one wherever it is asked for, in the shared region, blocks and their footprints, a GiB reserved, the debug allocator over it under the leak check, deinit"
 run 392_demangle_runtime "C++ names as c++filt writes them (g++'s and clang++'s manglings) and mlx-cc's own spellings; names it cannot read; a cut text"
+run 410_crypto_rsa_sizes_runtime "RSA keys of any size: a 64-bit modulus, 512 bits made and verified in its frame, 4160 bits (numbers and work on the heap) signed, verified and OAEP both ways, d alone, three primes; out of range refused"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
