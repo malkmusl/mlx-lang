@@ -15,10 +15,15 @@
 # Every test listed must pass; the tests of those directories that do not
 # yet are in PORT.md ("Storage"), with why.
 #
-#   tools/check_webkit_mlx_storage.sh [--no-build] [-j N] [--keep DIR] [TEST...]
+# The same runs WebKit's crypto tests (M7, PORT.md "Crypto": crypto/subtle
+# and crypto's getRandomValues) with --list crypto.txt, as
+# tools/check_webkit_mlx_crypto.sh does.
+#
+#   tools/check_webkit_mlx_storage.sh [--no-build] [-j N] [--keep DIR] [--list NAME] [TEST...]
 #     (--no-build: the program as it is; -j: the build's jobs, 2 by
-#     default; --keep: what each test printed, kept in DIR; TEST: paths of
-#     storage.txt, all by default)
+#     default; --keep: what each test printed, kept in DIR; --list: the
+#     list of tests/layout, storage.txt by default; TEST: paths of the
+#     list, all by default)
 set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,12 +36,14 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 build=1
 jobs=2
 keep=""
+list=storage.txt
 chosen=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-build) build=0 ;;
         -j) jobs=$2; shift ;;
         --keep) keep=$2; shift ;;
+        --list) list=$2; shift ;;
         -*) fail "unknown argument $1" ;;
         *) chosen+=("$1") ;;
     esac
@@ -56,7 +63,7 @@ tests=()
 while IFS= read -r line; do
     case $line in "#"*|"") continue ;; esac
     tests+=("$line")
-done < "$layout/storage.txt"
+done < "$layout/$list"
 [[ ${#chosen[@]} -gt 0 ]] && tests=("${chosen[@]}")
 
 expectedFor() {
@@ -101,6 +108,6 @@ done
 leftover=$(find "$work/tmp" -mindepth 1 -maxdepth 1 | wc -l)
 [[ $leftover -eq 0 ]] || fail "$leftover temporary profiles left in TMPDIR"
 total=$(( passed + failed ))
-echo "check_webkit_mlx_storage.sh: $passed of $total tests pass, $failed fail"
-[[ $failed -eq 0 ]] || fail "$failed of the listed storage tests fail"
+echo "check_webkit_mlx_storage.sh: $passed of $total tests of $list pass, $failed fail"
+[[ $failed -eq 0 ]] || fail "$failed of the tests of $list fail"
 echo "check_webkit_mlx_storage.sh: all checks passed"

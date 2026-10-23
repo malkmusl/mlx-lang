@@ -26,3 +26,10 @@ those fonts and compares its render tree with the expected one.
 text, taken from the same revision; tools/check_webkit_mlx_storage.sh
 runs them with `webcore-dump --test` (WebKitTestRunner's testRunner,
 dumpAsText) and compares the text.
+
+`crypto.txt` lists tests of `crypto/subtle` and `crypto/` (M7's
+WebCrypto and getRandomValues), with `crypto/resources/common.js`,
+`crypto/subtle/resources/` and their expected text (`platform/glib/`'s
+where WebKit's GLib ports have their own), taken from the same
+revision; tools/check_webkit_mlx_crypto.sh runs them as the storage
+check runs its own.

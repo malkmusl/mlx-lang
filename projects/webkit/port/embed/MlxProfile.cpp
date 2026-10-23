@@ -3,6 +3,11 @@
 #include "MlxProfile.h"
 
 #include "CookieJar.h"
+#include "CryptoClient.h"
+#include "CryptoKey.h"
+#include "SerializedCryptoKeyWrap.h"
+#include "SerializedScriptValue.h"
+#include "WrappedCryptoKey.h"
 #include "MlxIndexedDB.h"
 #include "MlxNetwork.h"
 #include "MlxStorage.h"
@@ -66,6 +71,35 @@ const String& cacheDirectory()
     return profile().cache;
 }
 
+// CryptoKeys kept in IndexedDB and passed by postMessage: serialized and
+// wrapped as WebKit2's UI process does it (WebPageProxy's
+// serializeAndWrapCryptoKey and unwrapCryptoKey) with the port's master
+// key (crypto/mlx's SerializedCryptoKeyWrap functions), in the process.
+class MlxCryptoClient final : public CryptoClient {
+public:
+    std::optional<Vector<uint8_t>> serializeAndWrapCryptoKey(CryptoKeyData&& keyData) const final
+    {
+        RefPtr key = CryptoKey::create(WTF::move(keyData));
+        if (!key || !key->isValid())
+            return std::nullopt;
+        auto serialized = SerializedScriptValue::serializeCryptoKey(*key);
+        auto masterKey = defaultWebCryptoMasterKey();
+        Vector<uint8_t> wrapped;
+        if (!masterKey || !wrapSerializedCryptoKey(*masterKey, serialized, wrapped))
+            return std::nullopt;
+        return wrapped;
+    }
+
+    std::optional<Vector<uint8_t>> unwrapCryptoKey(const Vector<uint8_t>& wrappedKey) const final
+    {
+        auto wrapped = readSerializedCryptoKey(wrappedKey);
+        auto masterKey = defaultWebCryptoMasterKey();
+        if (!wrapped || !masterKey)
+            return std::nullopt;
+        return WebCore::unwrapCryptoKey(*masterKey, *wrapped);
+    }
+};
+
 void configure(PageConfiguration& configuration)
 {
     auto& p = profile();
@@ -75,6 +109,7 @@ void configure(PageConfiguration& configuration)
     configuration.socketProvider = MlxWebSocket::socketProvider();
     configuration.storageNamespaceProvider = p.storage;
     configuration.databaseProvider = p.databases;
+    configuration.cryptoClient = makeUniqueRef<MlxCryptoClient>();
 }
 
 void pageOpened(Page& opener, Page& page)
