@@ -10,7 +10,10 @@
 // window's pixels (Skia raster through GraphicsContextSkia), and the
 // pointer's, the wheel's and the keyboard's events (WebCore's
 // EventHandler; text typed into an editable element through the Editor,
-// editing keys as its commands), the selection's text and pasting.
+// editing keys as its commands), the selection's text and pasting,
+// reloading and stopping, and the desktop's colour scheme (dark: the
+// Page's dark appearance, so `prefers-color-scheme: dark` matches and a
+// page that allows it is drawn dark, the theme's controls too).
 //
 //     voyager [--font FILE]... [--size WIDTHxHEIGHT] FILE|URL
 //
@@ -96,6 +99,10 @@ struct VoyagerEngine {
     char* (*title)(Engine*);
     char* (*url)(Engine*);
     void (*release)(char*);
+    void (*reload)(Engine*);
+    void (*stop)(Engine*);
+    int (*loading)(Engine*);
+    void (*setDark)(Engine*, int dark);
 };
 
 // The modifiers as voyager.mlx gives them.
@@ -532,6 +539,35 @@ void engineRelease(char* string)
     free(string);
 }
 
+void engineReload(Engine* engine)
+{
+    engine->frame->loader().reload();
+    engine->dirty = true;
+}
+
+void engineStop(Engine* engine)
+{
+    engine->frame->loader().stopAllLoaders();
+    engine->dirty = true;
+}
+
+// 1 while the page (or what it loads) is loading.
+int engineLoading(Engine* engine)
+{
+    return engine->frame->loader().isLoading() ? 1 : 0;
+}
+
+// The desktop's scheme: the page's appearance follows it at once (its
+// media queries evaluated again, its styles and the view's background
+// resolved again), no reload.
+void engineSetDark(Engine* engine, int dark)
+{
+    if (engine->trace)
+        fprintf(stderr, "voyager: appearance %s\n", dark ? "dark" : "light");
+    engine->page->setUseColorAppearance(dark, false);
+    engine->dirty = true;
+}
+
 } // namespace
 
 // (Its result is the tag of voyager.mlx's error union: 0 when the window
@@ -623,7 +659,8 @@ int main(int argc, char** argv)
 
     VoyagerEngine table {
         &engine, engineLoad, engineResize, engineCycle, enginePaint, enginePointer, engineWheel, engineKey,
-        engineSelectedText, engineInsertText, engineTitle, engineUrl, engineRelease
+        engineSelectedText, engineInsertText, engineTitle, engineUrl, engineRelease,
+        engineReload, engineStop, engineLoading, engineSetDark
     };
     // main's arguments, then the environment with MLX_CANVAS=cpu (the
     // window drawn into wl_shm buffers on the CPU, which the engine

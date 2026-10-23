@@ -193,6 +193,34 @@ Four ways to choose without patching, in this order of preference:
   referenced; rangesprojectionref). std.crash's report now has 64 frames
   with long C++ names shortened on stderr (whole in crashes.log), and an
   abort says abort() was called.
+- **Voyager's chrome on std.ui, dark pages** (after real sites):
+  Voyager's toolbar is std.ui's widgets (std.ui.view laid out each
+  frame): back and forward as std.ui.controls' chevron buttons, reload
+  (stop while the page loads) as plain icon buttons with std.ui.glyphs'
+  marks (a circular arrow, new there; the cross), the address field
+  std.ui.field (its editing, selection, caret; Ctrl+C, Ctrl+X, Ctrl+V
+  with the compositor's clipboard; a first click selects all of it), its
+  colours std.ui.theme's for the desktop's scheme (std.ui.appearance:
+  the panel's Watch, std.ui.host.lightness), fading with it. The page
+  gets the scheme too: `ENABLE_DARK_MODE_CSS` is on (config.MLX; GTK and
+  WPE have it on: the `color-scheme` property, `<meta
+  name="color-scheme">`, the Page's dark appearance), and the engine's
+  setDark calls `Page::setUseColorAppearance` as the GLib ports' web
+  views do when the desktop prefers dark, at once when it changes (the
+  media queries evaluated again, the styles and the view's background
+  resolved again, no reload). `prefers-color-scheme: dark` matches then,
+  and a page that allows dark (`color-scheme: light dark`) is drawn in
+  its dark variant: RenderThemeAdwaita's system colours for dark
+  (Canvas, CanvasText, Field, FieldText, ButtonText, GrayText), its form
+  controls, ScrollbarThemeAdwaita's scrollbars and the view's base
+  background (Window, the dark Canvas). `MLX_COLOR_SCHEME=dark|light`
+  overrides the desktop's. `webcore-dump --dark` paints a page so;
+  tools/check_webkit_mlx_paint.sh paints tests/paint/scheme.html light
+  and dark (`scheme.html@dark` in pages.txt), and tools/check_voyager.sh
+  starts Voyager on a dark desktop once (the toolbar, the page's canvas,
+  its prefers-color-scheme box and its text field dark) and switches a
+  light one to dark while it runs (both follow, the page is not loaded
+  again).
 
 ### The user agent
 
@@ -251,7 +279,7 @@ port in the tarball that builds WebCore without GLib).
 | Fonts | Skia's typefaces and our font manager over std.fontconfig | below |
 | Text paths | `USE_FONT_VARIANT_VIA_FEATURES` off (GTK and WPE: on) | Kerned and shaped text goes to the complex (HarfBuzz) path through FontCascade::codePath, since GTK's and WPE's own branch for it is under `PLATFORM()`; GLib's layout tests expect it kerned |
 | Text | `USE_ICU` through mlx-unicode | below |
-| Theme | `USE_THEME_ADWAITA` (RenderThemeAdwaita, ScrollbarThemeAdwaita: GraphicsContext drawing; their GLib resources under `USE(GLIB)`) | WebKit's own non-native theme |
+| Theme | `USE_THEME_ADWAITA` (RenderThemeAdwaita, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), registers the digests only and refuses the rest until M7 (`port/crypto/CryptoMlx.cpp`), then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBGL`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
@@ -525,6 +553,17 @@ WPE plan. They go when PlatformMlx does what they did, not before:
 Where WebKit's abstractions may not be met by configuration, selection
 or same-name replacement alone. Each is checked when its milestone comes;
 none is solved by a patch.
+
+- **Dark pages that have no dark styles.** The desktop's dark scheme
+  reaches a page as WebKit has it: `prefers-color-scheme: dark`, and the
+  dark variant of the theme where the page allows it (`color-scheme`).
+  A page that says nothing stays light; darkening such pages (as other
+  browsers' forced dark modes do: colours inverted or remapped at
+  paint) is a later feature of Voyager's of its own. RenderTheme's
+  generic system colours that RenderThemeAdwaita does not give for dark
+  (ButtonFace, ButtonBorder, SelectedItem, Mark) stay the light ones:
+  RenderTheme::singleton() is RenderThemeAdwaita's, so a port theme of
+  its own would replace that file.
 
 - **Unknown platforms in WebCore.** WebCore was never built without a
   `PLATFORM()`: some generic files may `#error` or assume

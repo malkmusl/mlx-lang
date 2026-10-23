@@ -19,7 +19,16 @@
 #   6. the screenshot shows second.html as webcore-dump paints it: blue
 #      with a white square of 100 pixels at (50, 50) of the page;
 #   7. Alt+Left goes back to start.html, Alt+Right forward to second.html;
-#   8. Ctrl+L, an address typed and Enter load it.
+#   8. Ctrl+L, an address typed and Enter load it;
+#   9. the toolbar (std.ui's widgets) is drawn in the desktop's colour
+#      scheme: light in the scenarios above (appearance.conf), dark with
+#      MLX_COLOR_SCHEME=dark, where projects/voyager/tests/scheme.html,
+#      which allows dark (color-scheme), is drawn dark: its canvas, its
+#      prefers-color-scheme box, its text field (the theme's), its title
+#      "scheme:dark";
+#  10. the desktop switched from light to dark while Voyager runs
+#      (appearance.conf rewritten): the toolbar and the page follow, the
+#      page without a reload.
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -70,21 +79,31 @@ cat > "$work/fonts.conf" << EOF
     <include>$repo_root/projects/webkit/tests/layout/fonts.conf</include>
 </fontconfig>
 EOF
-cat > "$work/voyager-run" << EOF
+# The desktop's scheme: light (std.ui.appearance reads it; without the
+# file it would be dark).
+echo "color-scheme = light" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
+# RUNNER: Voyager on PAGE (a file of projects/voyager/tests), with the
+# assignments after it in its environment.
+write_runner() {
+    local runner=$1 page=$2
+    shift 2
+    cat > "$runner" << EOF
 #!/bin/sh
 export HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf"
-export VOYAGER_TRACE=1
-exec "$voyager" "$repo_root/projects/voyager/tests/start.html" 2>> "$work/voyager.log"
+export VOYAGER_TRACE=1 $*
+exec "$voyager" "$repo_root/projects/voyager/tests/$page" 2>> "$work/voyager.log"
 EOF
-chmod +x "$work/voyager-run"
+    chmod +x "$runner"
+}
+write_runner "$work/voyager-run" start.html
 
 run_scenario() {
-    local name=$1 script=$2
+    local name=$1 script=$2 runner=${3:-$work/voyager-run}
     : > "$work/voyager.log"
     "$work/test-host" "host-$name" "$work/us.xkb" "$script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" timeout 180 "$work/mlx-compositor" --verbose --renderer cpu --socket "nested-$name" --run "$work/voyager-run" > "$work/$name-compositor.log" 2>&1
+    WAYLAND_DISPLAY="host-$name" timeout 180 "$work/mlx-compositor" --verbose --renderer cpu --socket "nested-$name" --run "$runner" > "$work/$name-compositor.log" 2>&1
     wait "$host_pid" || { cat "$work/$name-host.log" >&2; fail "the test host failed ($name)"; }
 }
 
@@ -123,6 +142,28 @@ if xs:
 EOF
 }
 
+# The colour of pixel (X, Y) of a PPM screenshot, as hex ("1e1e1e").
+pixel_of() {
+    python3 -I - "$1" "$2" "$3" << 'EOF'
+import sys
+data = open(sys.argv[1], "rb").read()
+parts = data.split(maxsplit=4)
+width = int(parts[1])
+x, y = int(sys.argv[2]), int(sys.argv[3])
+at = (y * width + x) * 3
+print(parts[4][at:at + 3].hex())
+EOF
+}
+
+# Whether a hex colour is light (every channel above 0xc0) or dark (every
+# channel below 0x40): "light", "dark" or "neither".
+lightness_of() {
+    local r=$((16#${1:0:2})) g=$((16#${1:2:2})) b=$((16#${1:4:2}))
+    if (( r > 0xc0 && g > 0xc0 && b > 0xc0 )); then echo light
+    elif (( r < 0x40 && g < 0x40 && b < 0x40 )); then echo dark
+    else echo neither; fi
+}
+
 # 1: where the page is (its link box, 200x40 at (20, 20) of the page).
 cat > "$work/show.script" << EOF
 wait 12000
@@ -137,6 +178,11 @@ read -r link_x link_y link_width link_height <<< "$(box_of "$work/start.ppm" 336
 x0=$(( link_x - 20 ))
 y0=$(( link_y - 20 ))
 echo "ok   Voyager shows start.html (the page at $x0,$y0 of the screen)"
+# The toolbar above the page: its background (under the window's top,
+# right of the buttons, above the address field) light.
+toolbar=$(pixel_of "$work/start.ppm" $(( x0 + 300 )) $(( y0 - 38 )))
+[[ $(lightness_of "$toolbar") == light ]] || fail "the toolbar is not drawn light for a light desktop (found #$toolbar)"
+echo "ok   the toolbar is drawn in the desktop's light scheme"
 
 # 2-6: the session.
 field_x=$(( x0 + 60 ))
@@ -233,4 +279,63 @@ titles=$(grep "^voyager: title \(start\|second\)$" "$log" | sed 's/^voyager: tit
 echo "ok   Alt+Left goes back, Alt+Right forward"
 grep -q "^voyager: url file://.*/projects/voyager/tests/start.html?typed$" "$log" || { cat "$log" >&2; fail "an address typed into the address field did not load"; }
 echo "ok   an address typed into the address field loads"
+
+# 9: a dark desktop (MLX_COLOR_SCHEME=dark), a page that allows dark.
+write_runner "$work/voyager-dark" scheme.html MLX_COLOR_SCHEME=dark
+cat > "$work/dark.script" << EOF
+wait 12000
+shot $work/dark.ppm
+close
+EOF
+run_scenario dark "$work/dark.script" "$work/voyager-dark"
+log=$work/voyager.log
+read -r link_x link_y link_width link_height <<< "$(box_of "$work/dark.ppm" 3366cc)"
+[[ "${link_width:-0}x${link_height:-0}" == "200x40" ]] || { cat "$log" >&2; fail "the dark screenshot has no 200x40 box of scheme.html (found: ${link_x:-} ${link_y:-} ${link_width:-}x${link_height:-})"; }
+x0=$(( link_x - 20 ))
+y0=$(( link_y - 20 ))
+grep -q "^voyager: title scheme:dark$" "$log" || { cat "$log" >&2; fail "the page does not see prefers-color-scheme: dark"; }
+toolbar=$(pixel_of "$work/dark.ppm" $(( x0 + 300 )) $(( y0 - 38 )))
+[[ $(lightness_of "$toolbar") == dark ]] || fail "the toolbar is not drawn dark for a dark desktop (found #$toolbar)"
+canvas=$(pixel_of "$work/dark.ppm" $(( x0 + 500 )) $(( y0 + 300 )))
+[[ $canvas == 1e1e1e ]] || fail "the page's canvas is not the dark Canvas #1e1e1e (found #$canvas)"
+scheme=$(pixel_of "$work/dark.ppm" $(( x0 + 70 )) $(( y0 + 100 )))
+[[ $scheme == 0080ff ]] || fail "the page's prefers-color-scheme: dark box is not #0080ff (found #$scheme)"
+input=$(pixel_of "$work/dark.ppm" $(( x0 + 250 )) $(( y0 + 155 )))
+[[ $(lightness_of "$input") == dark ]] || fail "the page's text field is not drawn dark (found #$input)"
+echo "ok   a dark desktop: the toolbar and the page (canvas, prefers-color-scheme, text field) are dark"
+
+# 10: the desktop switched to dark while Voyager shows the page.
+write_runner "$work/voyager-live" scheme.html
+echo "color-scheme = light" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
+cat > "$work/live.script" << EOF
+wait 12000
+shot $work/live-light.ppm
+wait 4000
+shot $work/live-dark.ppm
+close
+EOF
+( for _ in $(seq 1 600); do [[ -f "$work/live-light.ppm" ]] && break; sleep 0.1; done
+  sleep 0.5
+  echo "color-scheme = dark" > "$XDG_CONFIG_HOME/mlx/appearance.conf" ) &
+switcher=$!
+run_scenario live "$work/live.script" "$work/voyager-live"
+wait "$switcher"
+log=$work/voyager.log
+titles=$(grep "^voyager: title scheme:" "$log" | sed 's/^voyager: title //' | tr '\n' ' ')
+[[ "$titles" == "scheme:light scheme:dark " ]] || { cat "$log" >&2; fail "the page did not see the scheme change from light to dark (titles: $titles)"; }
+[[ $(grep -c "^voyager: url " "$log") -eq 1 ]] || { cat "$log" >&2; fail "the page was loaded again for the scheme change"; }
+read -r link_x link_y link_width link_height <<< "$(box_of "$work/live-light.ppm" 3366cc)"
+[[ "${link_width:-0}x${link_height:-0}" == "200x40" ]] || fail "the screenshot has no 200x40 box of scheme.html (found: ${link_x:-} ${link_y:-} ${link_width:-}x${link_height:-})"
+x0=$(( link_x - 20 ))
+y0=$(( link_y - 20 ))
+for shot in light dark; do
+    file=$work/live-$shot.ppm
+    canvas=$(pixel_of "$file" $(( x0 + 500 )) $(( y0 + 300 )))
+    toolbar=$(pixel_of "$file" $(( x0 + 300 )) $(( y0 - 38 )))
+    scheme=$(pixel_of "$file" $(( x0 + 70 )) $(( y0 + 100 )))
+    [[ $(lightness_of "$canvas") == "$shot" && $(lightness_of "$toolbar") == "$shot" ]] || fail "the page's canvas (#$canvas) and the toolbar (#$toolbar) are not $shot"
+    expected=$([[ $shot == dark ]] && echo 0080ff || echo ff8000)
+    [[ $scheme == "$expected" ]] || fail "the prefers-color-scheme box is #$scheme, not #$expected, when $shot"
+done
+echo "ok   a switch of the desktop's scheme: the toolbar and the page follow it, without a reload"
 echo "check_voyager.sh: all checks passed"
