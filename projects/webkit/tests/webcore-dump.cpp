@@ -3,7 +3,7 @@
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
 // painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS]
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark]
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -18,6 +18,12 @@
 // runner's test fonts (Ahem); fonts are matched by std.fontconfig with the environment's
 // configuration (FONTCONFIG_FILE). Exit status: 0, 1 when the page did not
 // load (still dumped), 2 for a bad command line.
+//
+// --dark gives the page the desktop's dark appearance (WebCore's
+// Page::setUseColorAppearance, as the GLib ports' web views do when the
+// desktop prefers dark): `prefers-color-scheme: dark` matches, and a page
+// whose color-scheme allows dark (`color-scheme: light dark`) is drawn in
+// its dark variant, the theme's controls, scrollbars and canvas too.
 //
 // --wait-title TITLE waits, after the load, until the page's title is
 // TITLE (what its scripts set when done: a WebSocket's messages, timers).
@@ -120,7 +126,7 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
@@ -248,6 +254,7 @@ int main(int argc, char** argv)
     bool subpixel = false;
     bool boxes = false;
     bool textOnly = false;
+    bool dark = false;
     const char* waitTitle = nullptr;
     const char* pngPath = nullptr;
     const char* referencePath = nullptr;
@@ -275,6 +282,8 @@ int main(int argc, char** argv)
             waitTitle = argv[++i];
         else if (!strcmp(argv[i], "--text"))
             textOnly = true;
+        else if (!strcmp(argv[i], "--dark"))
+            dark = true;
         else if (!strcmp(argv[i], "--png") && i + 1 < argc)
             pngPath = argv[++i];
         else if (!strcmp(argv[i], "--reference") && i + 1 < argc)
@@ -374,6 +383,8 @@ int main(int argc, char** argv)
         // rectangles (RenderTreeAsText does so with the layer-based SVG
         // engine on, for a page with an <svg> root).
         settings.setLayerBasedSVGEngineEnabled(subpixel);
+        if (dark)
+            page->setUseColorAppearance(true, false);
 
         Run run;
         run.frame = page->localMainFrame();

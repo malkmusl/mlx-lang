@@ -34,8 +34,8 @@ def write_png(path, width, height, rows, alpha):
 
 
 class Canvas:
-    def __init__(self):
-        self.pixels = [[(255, 255, 255)] * WIDTH for _ in range(HEIGHT)]
+    def __init__(self, background=(255, 255, 255)):
+        self.pixels = [[background] * WIDTH for _ in range(HEIGHT)]
 
     def fill(self, x, y, w, h, colour, alpha=1.0):
         for row in range(y, y + h):
@@ -121,6 +121,25 @@ def image():
     c.save("image-expected.png")
 
 
+def scheme(dark):
+    """scheme.html light (as a page is drawn by default) and with the
+    desktop's dark appearance (webcore-dump --dark): RenderThemeAdwaita's
+    Canvas and CanvasText, the prefers-color-scheme box, and its text
+    field: Field (Adwaita's text field background) inside a 1-pixel border
+    of its translucent border colour over the page's canvas (the corners,
+    rounded by 5 pixels, are the pixels pages.txt allows)."""
+    canvas, text, field, border = ((30, 30, 30), (255, 255, 255), (45, 45, 45), ((255, 255, 255), 50 / 255)) if dark \
+        else ((255, 255, 255), (0, 0, 0), (255, 255, 255), ((0, 0, 0), 50 / 255))
+    c = Canvas(canvas)
+    c.fill(10, 10, 100, 100, (0, 128, 255) if dark else (255, 128, 0))
+    c.fill(130, 10, 100, 100, text)
+    c.fill(11, 131, 198, 38, field)
+    colour, alpha = border
+    for x, y, w, h in ((10, 130, 200, 1), (10, 169, 200, 1), (10, 131, 1, 38), (209, 131, 1, 38)):
+        c.fill(x, y, w, h, colour, alpha)
+    c.save("scheme-dark-expected.png" if dark else "scheme-expected.png")
+
+
 if __name__ == "__main__":
     write_png(os.path.join(HERE, "support", "quadrants.png"), 40, 40, QUADRANTS, True)
     boxes()
@@ -128,3 +147,5 @@ if __name__ == "__main__":
     ahem()
     gradient()
     image()
+    scheme(False)
+    scheme(True)

@@ -6,7 +6,10 @@
 # page's reference painting, PAGE-expected.png (made by make_references.py
 # from what the page draws: boxes, borders and outlines, Ahem text, linear
 # gradients, a PNG image decoded by the port's std.png decoder, at its
-# size and scaled). A page passes when no more pixels than pages.txt
+# size and scaled, the desktop's colour scheme: a page that allows dark
+# painted light and, as PAGE@dark, with --dark: its canvas, a
+# prefers-color-scheme rule, system colours and a text field of the
+# theme in the dark variant). A page passes when no more pixels than pages.txt
 # allows differ from the reference by more than its tolerance in a channel;
 # the check fails when a page fails that pages.txt does not list as known
 # to (with its cause).
@@ -67,11 +70,19 @@ known=0
 while read -r page tolerance allow cause; do
     case $page in "#"*|"") continue ;; esac
     if [[ ${#chosen[@]} -gt 0 ]] && [[ ! " ${chosen[*]} " == *" $page "* ]]; then continue; fi
-    out=$work/${page%.*}.png
+    # (PAGE@dark: PAGE with the dark appearance.)
+    file=${page%@dark}
+    name=${file%.*}
+    flags=()
+    if [[ "$page" == *@dark ]]; then
+        name=$name-dark
+        flags=(--dark)
+    fi
+    out=$work/$name.png
     status=0
-    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" timeout 300 "$program" --size 800x600 --font "$ahem" \
-        --png "$out" --reference "$pages/${page%.*}-expected.png" --tolerance "$tolerance" --allow "$allow" \
-        "$repo_root/$pages/$page" > /dev/null 2> "$work/err.txt" || status=$?
+    env -i HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" timeout 300 "$program" --size 800x600 --font "$ahem" "${flags[@]}" \
+        --png "$out" --reference "$pages/$name-expected.png" --tolerance "$tolerance" --allow "$allow" \
+        "$repo_root/$pages/$file" > /dev/null 2> "$work/err.txt" || status=$?
     [[ -n "$keep" && -f "$out" ]] && cp "$out" "$keep/"
     result=$(grep "pixels differ" "$work/err.txt" | sed 's/^webcore-dump: //')
     if [[ $status -eq 0 ]]; then
