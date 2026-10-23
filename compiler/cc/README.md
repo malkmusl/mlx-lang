@@ -467,11 +467,17 @@ builtins that are
 plain C as predefined macros (`__builtin_memcpy`, `__builtin_expect`,
 `__builtin_isnan`, `__builtin_inf`, `__builtin_constant_p` as 0, ...;
 `tests/builtins.c` against gcc; `__builtin_frame_address(n)` and
-`__builtin_return_address(n)` walk the rbp chain every function keeps). `<emmintrin.h>` (and `xmmintrin.h`,
-`smmintrin.h`, `immintrin.h`, `x86intrin.h`) gives the few SSE
-intrinsics programs use for scalar conversions (`_mm_cvttsd_si64`,
-`_mm_set_sd`, the 128-bit loads and stores, `_mm_pause`) as plain
-functions over a 16-byte struct. C++20's three-way comparison `<=>`
+`__builtin_return_address(n)` walk the rbp chain every function keeps).
+`<mmintrin.h>`, `<xmmintrin.h>` and `<emmintrin.h>` (and
+`smmintrin.h`, `immintrin.h`, `x86intrin.h` over them) give all of
+x86-64's baseline intrinsics, MMX's, SSE's and SSE2's, as plain
+functions over unions of lanes (`__m64`, `__m128`, `__m128d`,
+`__m128i`, 16-byte aligned), with the instructions' results
+(`tests/ssebaseline.c` against gcc's build, `tests/cpp/ssebaseline.cpp`):
+SIMDe's native x86 path compiles on them (`SIMDE_X86_SSE2_NATIVE`,
+which WebKit's port defines). `__SSE__` and `__SSE2__` are not
+predefined, there being no GCC vector types, which code testing them
+takes to come with the intrinsics. C++20's three-way comparison `<=>`
 (`tests/cpp/compare.cpp`) gives a class's operator function or, between
 numbers and pointers, a `std::strong_ordering` (`partial_ordering` for
 floating point) from `<compare>`; `a < b` of a class with only
@@ -909,7 +915,9 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   thread, is not supported (the main thread's is constructed at start). Inline
   `asm` has no floating-point register operands (`x`, `t`), no `asm
   goto`, no data naming a symbol and no other sections; the x87 and AVX
-  instructions are not assembled.
+  instructions are not assembled. No `_Float16`; and with no GCC vector
+  types `__SSE__` and `__SSE2__` are not predefined, though the
+  intrinsics are there.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where
   only larger ones are.
 - No optimization: the code is correct and slow.
