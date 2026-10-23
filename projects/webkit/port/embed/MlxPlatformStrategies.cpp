@@ -17,6 +17,7 @@
 #include "ResourceResponse.h"
 #include "SharedBuffer.h"
 #include "SubresourceLoader.h"
+#include "port/embed/MlxNetwork.h"
 #include "port/MlxWebPort.h"
 #include <wtf/RunLoop.h>
 #include <wtf/text/CString.h>
@@ -76,10 +77,9 @@ static void loadFile(ResourceLoader& loader)
 // Each load a SubresourceLoader (the main resource's too), run as WebKit2's
 // WebLoaderStrategy runs them, from the main loop: data: URLs by WebCore
 // itself (ResourceLoader::start, DataURLDecoder), file: URLs by the port
-// (loadFile, std.fs). No scheduling by priority yet.
-//
-// STUB (M6: http and https over std.http and std.tls): other schemes fail
-// as URLs that cannot be shown.
+// (loadFile, std.fs), http: and https: by the port's network (MlxNetwork:
+// std.http and std.tls on a thread of their own); other schemes fail as
+// URLs that cannot be shown. No scheduling by priority yet.
 class MlxLoaderStrategy final : public LoaderStrategy {
 public:
     void loadResource(LocalFrame& frame, CachedResource& resource, ResourceRequest&& request, const ResourceLoaderOptions& options, CompletionHandler<void(RefPtr<SubresourceLoader>&&)>&& completionHandler) override
@@ -104,6 +104,10 @@ public:
             });
             return;
         }
+        if (MlxNetwork::handles(url)) {
+            MlxNetwork::load(loader);
+            return;
+        }
         RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
             if (!loader->reachedTerminalState())
                 loader->didFail(errorFor(loader->request().url(), cannotShowURLCode, "The port does not load this URL yet"_s));
@@ -112,6 +116,10 @@ public:
 
     void loadResourceSynchronously(FrameLoader& frameLoader, ResourceLoaderIdentifier, const ResourceRequest& request, ClientCredentialPolicy, const FetchOptions&, const HTTPHeaderMap&, ResourceError& error, ResourceResponse& response, Vector<uint8_t>& data) override
     {
+        if (MlxNetwork::handles(request.url())) {
+            MlxNetwork::loadSynchronously(request, error, response, data);
+            return;
+        }
         ResourceHandle::loadResourceSynchronously(frameLoader.networkingContext(), request, StoredCredentialsPolicy::Use, nullptr, error, response, data);
     }
 

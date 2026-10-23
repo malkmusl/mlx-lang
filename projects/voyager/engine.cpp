@@ -54,6 +54,8 @@
 #include "CommonAtomStrings.h"
 #include "port/MlxWebPort.h"
 #include "port/embed/MlxFrameLoaderClient.h"
+#include "CookieJar.h"
+#include "port/embed/MlxNetwork.h"
 #include "port/embed/MlxPlatformStrategies.h"
 #include <JavaScriptCore/InitializeThreading.h>
 #include <pal/SessionID.h>
@@ -328,7 +330,7 @@ char* copied(const String& string)
 URL urlOf(const char* target)
 {
     String argument = String::fromUTF8(target);
-    if (argument.startsWith("file:"_s) || argument.startsWith("data:"_s))
+    if (argument.startsWith("file:"_s) || argument.startsWith("data:"_s) || argument.startsWith("http:"_s) || argument.startsWith("https:"_s))
         return URL { argument };
     String path = argument;
     char directory[4096];
@@ -578,6 +580,7 @@ int main(int argc, char** argv)
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
     configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine.dirty);
     configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();
+    configuration.cookieJar = MlxNetwork::cookieJar();
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [size](auto&, auto& frameLoader) {
             auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, size);

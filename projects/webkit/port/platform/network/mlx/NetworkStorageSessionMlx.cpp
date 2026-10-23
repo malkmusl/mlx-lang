@@ -4,9 +4,12 @@
 // CookieJarDB), with the generic constructor (a session and the networking
 // context it belongs to) WebCore names for a port without one.
 //
-// STUB (M6: the cookie jar of std.http, kept by the Mlx side): no cookie
-// is kept yet; a cookie set is dropped, a lookup finds none. Nothing loads
-// over http before M6, so no cookie can come from a response either.
+// The cookies are the Mlx side's jar (port/mlx/http.mlx: std.http's
+// cookiejar, which the client sends from and takes Set-Cookie into),
+// reached on the network queue (MlxNetwork.h) the jar belongs to:
+// document.cookie reads and writes it, the Cookie header of a request is
+// the client's. STUB (later: the cookie lists of the inspector and the
+// cookie store API, deleting cookies): those see no cookie.
 #include "config.h"
 #include "NetworkStorageSession.h"
 
@@ -15,7 +18,11 @@
 #include "CookieStoreGetOptions.h"
 #include "HTTPCookieAcceptPolicy.h"
 #include "NetworkingContext.h"
+#include "port/MlxWebPort.h"
+#include "port/embed/MlxNetwork.h"
 #include <wtf/CompletionHandler.h>
+#include <wtf/WorkQueue.h>
+#include <wtf/text/CString.h>
 
 namespace WebCore {
 
@@ -37,7 +44,23 @@ NetworkingContext* NetworkStorageSession::context() const
 
 HTTPCookieAcceptPolicy NetworkStorageSession::cookieAcceptPolicy() const
 {
-    return HTTPCookieAcceptPolicy::Never;
+    return HTTPCookieAcceptPolicy::AlwaysAccept;
+}
+
+// The jar's cookies for URL (FOR_HTTP false: none of the HttpOnly ones),
+// as a Cookie header lists them.
+static String jarCookies(const URL& url, bool forHttp)
+{
+    String cookies;
+    CString target = url.string().utf8();
+    MlxNetwork::queue().dispatchSync([&] {
+        char* text = mlxweb_cookies_for(target.data(), forHttp ? 1 : 0);
+        if (text) {
+            cookies = String::fromUTF8(text);
+            mlxweb_text_release(text);
+        }
+    });
+    return cookies.isNull() ? emptyString() : cookies;
 }
 
 void NetworkStorageSession::setCookie(const Cookie&)
@@ -52,8 +75,13 @@ void NetworkStorageSession::setCookies(const Vector<Cookie>&, const URL&, const 
 {
 }
 
-void NetworkStorageSession::setCookiesFromDOM(const URL&, const SameSiteInfo&, const URL&, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, ApplyTrackingPrevention, RequiresScriptTrackingPrivacy, const String&, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker) const
+void NetworkStorageSession::setCookiesFromDOM(const URL&, const SameSiteInfo&, const URL& url, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, ApplyTrackingPrevention, RequiresScriptTrackingPrivacy, const String& cookieString, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker) const
 {
+    CString target = url.string().utf8();
+    CString line = cookieString.utf8();
+    MlxNetwork::queue().dispatchSync([&] {
+        mlxweb_cookie_set(target.data(), line.data());
+    });
 }
 
 bool NetworkStorageSession::setCookieFromDOM(const URL&, const SameSiteInfo&, const URL&, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, ApplyTrackingPrevention, RequiresScriptTrackingPrivacy, const Cookie&, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker) const
@@ -111,9 +139,9 @@ void NetworkStorageSession::getHostnamesWithCookies(HashSet<String>&)
 {
 }
 
-std::pair<String, bool> NetworkStorageSession::cookiesForDOM(const URL&, const SameSiteInfo&, const URL&, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, IncludeSecureCookies, ApplyTrackingPrevention, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker) const
+std::pair<String, bool> NetworkStorageSession::cookiesForDOM(const URL&, const SameSiteInfo&, const URL& url, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, IncludeSecureCookies, ApplyTrackingPrevention, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker) const
 {
-    return { emptyString(), false };
+    return { jarCookies(url, false), false };
 }
 
 std::optional<Vector<Cookie>> NetworkStorageSession::cookiesForDOMAsVector(const URL&, const SameSiteInfo&, const URL&, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, IncludeSecureCookies, ApplyTrackingPrevention, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker, CookieStoreGetOptions&&) const
@@ -121,9 +149,9 @@ std::optional<Vector<Cookie>> NetworkStorageSession::cookiesForDOMAsVector(const
     return Vector<Cookie> { };
 }
 
-std::pair<String, bool> NetworkStorageSession::cookieRequestHeaderFieldValue(const URL&, const SameSiteInfo&, const URL&, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, IncludeSecureCookies, ApplyTrackingPrevention, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker) const
+std::pair<String, bool> NetworkStorageSession::cookieRequestHeaderFieldValue(const URL&, const SameSiteInfo&, const URL& url, std::optional<FrameIdentifier>, std::optional<PageIdentifier>, IncludeSecureCookies, ApplyTrackingPrevention, ShouldRelaxThirdPartyCookieBlocking, IsKnownCrossSiteTracker) const
 {
-    return { emptyString(), false };
+    return { jarCookies(url, true), false };
 }
 
 std::pair<String, bool> NetworkStorageSession::cookieRequestHeaderFieldValue(const CookieRequestHeaderFieldProxy&) const

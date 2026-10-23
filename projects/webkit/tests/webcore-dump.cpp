@@ -3,7 +3,7 @@
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
 // painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS]
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--timeout SECONDS]
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -17,6 +17,10 @@
 // runner's test fonts (Ahem); fonts are matched by std.fontconfig with the environment's
 // configuration (FONTCONFIG_FILE). Exit status: 0, 1 when the page did not
 // load (still dumped), 2 for a bad command line.
+//
+// --text prints the page's URL and title and its body's text
+// (HTMLElement::innerText) instead of the render tree: what a page's
+// scripts found, for the network check.
 //
 // --png paints the view (the frame's whole viewport, scrollbars included)
 // into a Skia raster surface (CPU, N32 premultiplied, on white) through
@@ -41,6 +45,7 @@
 #include "CommonAtomStrings.h"
 #include "DeprecatedGlobalSettings.h"
 #include "Document.h"
+#include "HTMLElement.h"
 #include "EmptyClients.h"
 #include "FrameLoadRequest.h"
 #include "FontRenderOptions.h"
@@ -62,6 +67,8 @@
 #include "Settings.h"
 #include "port/MlxWebPort.h"
 #include "port/embed/MlxFrameLoaderClient.h"
+#include "CookieJar.h"
+#include "port/embed/MlxNetwork.h"
 #include "port/embed/MlxPlatformStrategies.h"
 #include <JavaScriptCore/InitializeThreading.h>
 #include <memory>
@@ -106,7 +113,7 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--timeout SECONDS] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--timeout SECONDS] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
@@ -224,6 +231,7 @@ int main(int argc, char** argv)
     bool script = true;
     bool subpixel = false;
     bool boxes = false;
+    bool textOnly = false;
     const char* pngPath = nullptr;
     const char* referencePath = nullptr;
     int tolerance = 2;
@@ -246,6 +254,8 @@ int main(int argc, char** argv)
             subpixel = true;
         else if (!strcmp(argv[i], "--boxes"))
             boxes = true;
+        else if (!strcmp(argv[i], "--text"))
+            textOnly = true;
         else if (!strcmp(argv[i], "--png") && i + 1 < argc)
             pngPath = argv[++i];
         else if (!strcmp(argv[i], "--reference") && i + 1 < argc)
@@ -285,7 +295,7 @@ int main(int argc, char** argv)
     // The URL: a scheme's (file:, data:) as it is, else a file's path.
     String argument = String::fromUTF8(target);
     URL url;
-    if (argument.startsWith("file:"_s) || argument.startsWith("data:"_s))
+    if (argument.startsWith("file:"_s) || argument.startsWith("data:"_s) || argument.startsWith("http:"_s) || argument.startsWith("https:"_s))
         url = URL { argument };
     else {
         char directory[4096];
@@ -301,6 +311,7 @@ int main(int argc, char** argv)
 
     static MlxFrameLoaderClient* mainClient;
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
+    configuration.cookieJar = MlxNetwork::cookieJar();
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [viewSize](auto&, auto& frameLoader) {
             auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, viewSize);
@@ -367,7 +378,13 @@ int main(int argc, char** argv)
         if (run.timedOut || !run.loadSucceeded)
             status = 1;
 
-        String tree = externalRepresentation(run.frame.get());
+        String tree;
+        if (textOnly) {
+            RefPtr document = run.frame->document();
+            RefPtr body = document ? document->bodyOrFrameset() : nullptr;
+            tree = makeString("url "_s, document ? document->url().string() : String(), "\ntitle "_s, document ? document->title() : String(), "\n"_s, body ? body->innerText() : String(), "\n"_s);
+        } else
+            tree = externalRepresentation(run.frame.get());
         auto utf8 = tree.utf8();
         fwrite(utf8.data(), 1, utf8.length(), stdout);
         if (boxes && run.frame->contentRenderer())

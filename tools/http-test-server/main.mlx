@@ -1,0 +1,317 @@
+// http-test-server: the HTTP/1.1 server of tools/check_webkit_mlx_network.sh,
+// on 127.0.0.1 (a port the system picks, written to standard output as a
+// line), each connection served by a child process of its own, requests
+// on it kept alive. It serves the files of ROOT (Content-Length bodies)
+// and these paths of its own:
+//
+//   /redirect/N        302 to /redirect/N-1, /redirect/0 to /redirected.html
+//   /see-other         303 to /echo (a POST then comes back as a GET)
+//   /set-cookie        sets "session=abc123; Path=/" and "pref=dark;
+//                      Path=/; HttpOnly", then a page
+//   /cookies           a plain text body: the request's Cookie header
+//   /echo              the request's method, Content-Type and body as text
+//   /json              application/json {"answer": 42, "items": [1, 2, 3]}
+//   /gzip.html         a page sent gzip-compressed
+//   /chunked.html      a page sent in chunks
+//   /quit              the server stops
+//
+//     http-test-server ROOT
+const std = @import("std")
+const net = @import("std.net")
+const message = @import("std.http.message")
+const headers = @import("std.http.headers")
+const flate = @import("std.flate")
+const process = std.linux.process
+
+const CAPACITY: usize = 1048576
+
+fn same(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var index: usize = 0
+    while index < a.length {
+        if a[index] != b[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn startsWith(a: []const u8, b: []const u8) -> bool { return a.length >= b.length && same(a[0..b.length], b) }
+
+fn endsWith(a: []const u8, b: []const u8) -> bool { return a.length >= b.length && same(a[a.length - b.length..a.length], b) }
+
+const Text = struct {
+    bytes: [CAPACITY]u8
+    length: usize
+}
+
+fn append(context: usize, bytes: []const u8) -> void {
+    const t: *Text = unsafe { @ptrFromInt(*Text, context) }
+    for byte in bytes {
+        if t.*.length < CAPACITY {
+            t.*.bytes[t.*.length] = byte
+            t.*.length += 1
+        }
+    }
+}
+
+fn sinkOf(t: *Text) -> headers.Sink { return headers.Sink.{ .context = @intFromPtr(t), .write = append } }
+
+fn text(t: *Text) -> []const u8 { return t.*.bytes[0..t.*.length] }
+
+fn putNumber(sink: headers.Sink, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var v = value
+    while true {
+        digits[19 - count] = @intCast(u8, 48 + v % 10)
+        count += 1
+        v = v / 10
+        if v == 0 { break }
+    }
+    headers.put(sink, digits[20 - count..20])
+}
+
+// A response with a Content-Length body.
+fn respond(out: *Text, status: u32, phrase: []const u8, extra: []const u8, body: []const u8) -> void {
+    out.*.length = 0
+    const sink = sinkOf(out)
+    message.writeStatusLine(sink, message.Version.http11, status, phrase)
+    headers.put(sink, "Content-Length: ")
+    putNumber(sink, body.length)
+    headers.put(sink, "\r\n")
+    headers.put(sink, extra)
+    message.writeHeadEnd(sink)
+    headers.put(sink, body)
+}
+
+fn headerOf(head: []const u8, name: []const u8, folded: []u8, value: *[]const u8) -> bool {
+    var it = message.headerLines(head)
+    var n: []const u8 = ""
+    var v: []const u8 = ""
+    while message.nextHeader(&it, &n, &v, folded) {
+        if headers.equalsIgnoringCase(n, name) {
+            value.* = v
+            return true
+        }
+    }
+    return false
+}
+
+fn headComplete(data: []const u8, headEnd: usize) -> bool {
+    if headEnd < data.length { return true }
+    if data.length >= 4 && data[data.length - 4] == 13 && data[data.length - 3] == 10 && data[data.length - 2] == 13 && data[data.length - 1] == 10 { return true }
+    return data.length >= 2 && data[data.length - 2] == 10 && data[data.length - 1] == 10
+}
+
+fn typeOf(path: []const u8) -> []const u8 {
+    if endsWith(path, ".html") { return "text/html; charset=utf-8" }
+    if endsWith(path, ".js") { return "text/javascript" }
+    if endsWith(path, ".css") { return "text/css" }
+    if endsWith(path, ".json") { return "application/json" }
+    if endsWith(path, ".png") { return "image/png" }
+    return "text/plain"
+}
+
+// The file ROOT/PATH into OUT's body; false when there is none.
+fn readFile(root: []const u8, path: []const u8, into: *Text) -> bool {
+    into.*.length = 0
+    if path.length == 0 || path[0] != 47 { return false }
+    // (Nothing outside ROOT.)
+    var i: usize = 0
+    while i + 1 < path.length {
+        if path[i] == 46 && path[i + 1] == 46 { return false }
+        i += 1
+    }
+    var name: [4096]u8 = undefined
+    var n: usize = 0
+    for c in root {
+        if n < 4000 {
+            name[n] = c
+            n += 1
+        }
+    }
+    for c in path {
+        if c == 63 { break }
+        if n < 4094 {
+            name[n] = c
+            n += 1
+        }
+    }
+    name[n] = 0
+    const file = std.fs.open(unsafe { @ptrCast([*]const u8, &name) }, std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return false }
+    while into.*.length < CAPACITY {
+        const got = std.fs.read(file, unsafe { @ptrCast([*]u8, &into.*.bytes) + into.*.length }, CAPACITY - into.*.length)
+        if got <= 0 { break }
+        into.*.length += @intCast(usize, got)
+    }
+    _ = std.fs.close(file)
+    return true
+}
+
+const PAGE_HEAD: []const u8 = "<!DOCTYPE html><html><head><title>"
+
+// Serves the requests of one connection.
+fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> void {
+    var out: Text = undefined
+    var page: Text = undefined
+    var folded: [4096]u8 = undefined
+    var buffer: [65536]u8 = undefined
+    const into: [*]u8 = &buffer
+    var held: usize = 0
+    while true {
+        var headEnd = message.headEnd(buffer[0..held])
+        while !headComplete(buffer[0..held], headEnd) {
+            if held >= 65536 { return }
+            if !net.readable(fd, 30000) { return }
+            const got = net.receive(fd, unsafe { into + held }, 65536 - held)
+            if got <= 0 { return }
+            held += @intCast(usize, got)
+            headEnd = message.headEnd(buffer[0..held])
+        }
+        const head = buffer[0..headEnd]
+        var line: message.RequestLine = undefined
+        if !message.parseRequestLine(head, &line) { return }
+        var bodyLength: usize = 0
+        var value: []const u8 = ""
+        if headerOf(head, "Content-Length", folded[0..4096], &value) {
+            for c in value { bodyLength = bodyLength * 10 + @intCast(usize, c - 48) }
+        }
+        if headEnd + bodyLength > 65536 { return }
+        while held < headEnd + bodyLength {
+            if !net.readable(fd, 30000) { return }
+            const got = net.receive(fd, unsafe { into + held }, 65536 - held)
+            if got <= 0 { return }
+            held += @intCast(usize, got)
+        }
+        const body = buffer[headEnd..headEnd + bodyLength]
+        const target = line.target
+        var close = false
+        if startsWith(target, "/redirect/") {
+            const rest = target[10..target.length]
+            var n: usize = 0
+            for c in rest { n = n * 10 + @intCast(usize, c - 48) }
+            page.length = 0
+            if n == 0 {
+                headers.put(sinkOf(&page), "Location: /redirected.html\r\n")
+            } else {
+                headers.put(sinkOf(&page), "Location: /redirect/")
+                putNumber(sinkOf(&page), n - 1)
+                headers.put(sinkOf(&page), "\r\n")
+            }
+            respond(&out, 302, "Found", text(&page), "")
+        } else if same(target, "/see-other") {
+            respond(&out, 303, "See Other", "Location: /echo\r\n", "")
+        } else if same(target, "/set-cookie") {
+            respond(&out, 200, "OK", "Content-Type: text/html\r\nSet-Cookie: session=abc123; Path=/\r\nSet-Cookie: pref=dark; Path=/; HttpOnly\r\n", "<!DOCTYPE html><title>cookies set</title><p>cookies set</p>")
+        } else if same(target, "/cookies") {
+            var cookie: []const u8 = "(none)"
+            _ = headerOf(head, "Cookie", folded[0..4096], &cookie)
+            respond(&out, 200, "OK", "Content-Type: text/plain\r\n", cookie)
+        } else if same(target, "/echo") {
+            page.length = 0
+            const sink = sinkOf(&page)
+            headers.put(sink, "method ")
+            headers.put(sink, line.method)
+            var kind: []const u8 = "(none)"
+            _ = headerOf(head, "Content-Type", folded[0..4096], &kind)
+            headers.put(sink, "\ntype ")
+            // (A multipart type's boundary changes each time: its kind only.)
+            var kindEnd: usize = 0
+            while kindEnd < kind.length && kind[kindEnd] != 59 { kindEnd += 1 }
+            headers.put(sink, kind[0..kindEnd])
+            headers.put(sink, "\nbody ")
+            putNumber(sink, body.length)
+            headers.put(sink, " bytes\n")
+            headers.put(sink, body)
+            respond(&out, 200, "OK", "Content-Type: text/plain\r\n", text(&page))
+        } else if same(target, "/json") {
+            respond(&out, 200, "OK", "Content-Type: application/json\r\n", "{\"answer\": 42, \"items\": [1, 2, 3]}")
+        } else if same(target, "/gzip.html") {
+            const plain: []const u8 = "<!DOCTYPE html><title>gzip</title><p>This page came gzip-compressed, and was undone on the way in.</p>"
+            var squeezed: [1024]u8 = undefined
+            const n = flate.compress(plain.pointer, plain.length, unsafe { @ptrCast([*]u8, &squeezed) }, 1024, 6, flate.Format.gzip, allocator)
+            respond(&out, 200, "OK", "Content-Type: text/html\r\nContent-Encoding: gzip\r\n", squeezed[0..n])
+        } else if same(target, "/chunked.html") {
+            out.length = 0
+            const sink = sinkOf(&out)
+            message.writeStatusLine(sink, message.Version.http11, 200, "OK")
+            headers.put(sink, "Content-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n")
+            headers.put(sink, "22\r\n<!DOCTYPE html><title>chunked</ti\r\n")
+            headers.put(sink, "28\r\ntle><p>This page came in three chunks.</\r\n")
+            headers.put(sink, "3\r\np>\n\r\n0\r\n\r\n")
+        } else if same(target, "/quit") {
+            respond(&out, 200, "OK", "", "bye")
+            close = true
+            _ = net.send(fd, text(&out))
+            net.close(fd)
+            // (The parent's process group ends with it: the check kills it.)
+            std.linux.exitGroup(0)
+        } else if readFile(root, target, &page) {
+            var path = target
+            var q: usize = 0
+            while q < path.length && path[q] != 63 { q += 1 }
+            path = path[0..q]
+            var extra: [256]u8 = undefined
+            var e: usize = 0
+            for c in "Content-Type: " {
+                extra[e] = c
+                e += 1
+            }
+            for c in typeOf(if same(path, "/") { "/index.html" } else { path }) {
+                extra[e] = c
+                e += 1
+            }
+            extra[e] = 13
+            extra[e + 1] = 10
+            respond(&out, 200, "OK", extra[0..e + 2], text(&page))
+        } else {
+            respond(&out, 404, "Not Found", "Content-Type: text/plain\r\n", "nothing here")
+        }
+        if same(line.method, "HEAD") { out.length = message.headEnd(text(&out)) }
+        if !net.send(fd, text(&out)) { return }
+        const used = headEnd + bodyLength
+        var i: usize = 0
+        while used + i < held {
+            buffer[i] = buffer[used + i]
+            i += 1
+        }
+        held -= used
+        if close { return }
+    }
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if arguments.length < 2 {
+        _ = std.io.eprintln("usage: http-test-server ROOT")
+        return 2
+    }
+    const rootPointer = arguments[1]
+    var rootLength: usize = 0
+    while rootPointer[rootLength] != 0 { rootLength += 1 }
+    const root = rootPointer[0..rootLength]
+    const allocator: std.allocator.Allocator = std.page_allocator.init()
+    const loop = net.ipv4(127, 0, 0, 1, 0)
+    const listener = net.listen(&loop, 16)
+    if listener < 0 { return 1 }
+    var bound: net.Address = undefined
+    if !net.localAddress(listener, &bound) { return 1 }
+    var line: Text = undefined
+    line.length = 0
+    putNumber(sinkOf(&line), @intCast(usize, bound.port))
+    _ = std.io.println(text(&line))
+    while true {
+        var peer: net.Address = undefined
+        const fd = net.accept(listener, &peer)
+        if fd < 0 { continue }
+        const pid = process.fork()
+        if pid == 0 {
+            net.close(listener)
+            serve(fd, root, allocator)
+            net.close(fd)
+            std.linux.exitGroup(0)
+        }
+        net.close(fd)
+    }
+    return 0
+}
