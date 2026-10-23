@@ -3,7 +3,7 @@
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
 // painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--timeout SECONDS]
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS]
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -17,6 +17,9 @@
 // runner's test fonts (Ahem); fonts are matched by std.fontconfig with the environment's
 // configuration (FONTCONFIG_FILE). Exit status: 0, 1 when the page did not
 // load (still dumped), 2 for a bad command line.
+//
+// --wait-title TITLE waits, after the load, until the page's title is
+// TITLE (what its scripts set when done: a WebSocket's messages, timers).
 //
 // --text prints the page's URL and title and its body's text
 // (HTMLElement::innerText) instead of the render tree: what a page's
@@ -69,6 +72,8 @@
 #include "port/embed/MlxFrameLoaderClient.h"
 #include "CookieJar.h"
 #include "port/embed/MlxNetwork.h"
+#include "port/embed/MlxWebSocket.h"
+#include "SocketProvider.h"
 #include "port/embed/MlxPlatformStrategies.h"
 #include <JavaScriptCore/InitializeThreading.h>
 #include <memory>
@@ -113,7 +118,7 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--timeout SECONDS] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
@@ -184,6 +189,9 @@ struct Run {
     unsigned quietChecks { 0 };
     MonotonicTime deadline;
     bool timedOut { false };
+    // --wait-title: the title the page's scripts give it when they are
+    // done (null: none to wait for).
+    String waitTitle;
 };
 
 // Whether the frame's document has loaded with nothing pending: its load
@@ -197,6 +205,8 @@ static bool isQuiet(Run& run)
     if (!document)
         return true;
     if (document->parsing() || document->cachedResourceLoader().requestCount())
+        return false;
+    if (!run.waitTitle.isNull() && document->title() != run.waitTitle)
         return false;
     return run.frame->loader().isComplete();
 }
@@ -232,6 +242,7 @@ int main(int argc, char** argv)
     bool subpixel = false;
     bool boxes = false;
     bool textOnly = false;
+    const char* waitTitle = nullptr;
     const char* pngPath = nullptr;
     const char* referencePath = nullptr;
     int tolerance = 2;
@@ -254,6 +265,8 @@ int main(int argc, char** argv)
             subpixel = true;
         else if (!strcmp(argv[i], "--boxes"))
             boxes = true;
+        else if (!strcmp(argv[i], "--wait-title") && i + 1 < argc)
+            waitTitle = argv[++i];
         else if (!strcmp(argv[i], "--text"))
             textOnly = true;
         else if (!strcmp(argv[i], "--png") && i + 1 < argc)
@@ -312,6 +325,7 @@ int main(int argc, char** argv)
     static MlxFrameLoaderClient* mainClient;
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
     configuration.cookieJar = MlxNetwork::cookieJar();
+    configuration.socketProvider = MlxWebSocket::socketProvider();
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [viewSize](auto&, auto& frameLoader) {
             auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, viewSize);
@@ -354,6 +368,8 @@ int main(int argc, char** argv)
 
         Run run;
         run.frame = page->localMainFrame();
+        if (waitTitle)
+            run.waitTitle = String::fromUTF8(waitTitle);
         if (!run.frame || !mainClient) {
             fprintf(stderr, "webcore-dump: the page has no main frame\n");
             return 1;

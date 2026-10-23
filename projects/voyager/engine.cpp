@@ -56,6 +56,8 @@
 #include "port/embed/MlxFrameLoaderClient.h"
 #include "CookieJar.h"
 #include "port/embed/MlxNetwork.h"
+#include "port/embed/MlxWebSocket.h"
+#include "SocketProvider.h"
 #include "port/embed/MlxPlatformStrategies.h"
 #include <JavaScriptCore/InitializeThreading.h>
 #include <pal/SessionID.h>
@@ -581,6 +583,7 @@ int main(int argc, char** argv)
     configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine.dirty);
     configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();
     configuration.cookieJar = MlxNetwork::cookieJar();
+    configuration.socketProvider = MlxWebSocket::socketProvider();
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [size](auto&, auto& frameLoader) {
             auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, size);

@@ -16,7 +16,9 @@
 #      compositor's clipboard, End and Ctrl+V paste it ("typed:hellohello");
 #   5. a click on the link loads second.html (its title, its file: URL);
 #   6. the screenshot shows second.html as webcore-dump paints it: blue
-#      with a white square of 100 pixels at (50, 50) of the page.
+#      with a white square of 100 pixels at (50, 50) of the page;
+#   7. Alt+Left goes back to start.html, Alt+Right forward to second.html;
+#   8. Ctrl+L, an address typed and Enter load it.
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -176,6 +178,24 @@ wait 6000
 pointer $(( x0 + 700 )) $(( y0 + 550 ))
 wait 500
 shot $work/second.ppm
+down 56
+down 105
+up 105
+up 56
+wait 4000
+down 56
+down 106
+up 106
+up 56
+wait 4000
+down 29
+down 38
+up 38
+up 29
+wait 300
+type file://$repo_root/projects/voyager/tests/start.html?typed
+enter
+wait 5000
 close
 EOF
 run_scenario session "$work/session.script"
@@ -206,4 +226,9 @@ around = all(pixel(x, y) == b"\x33\x66\xcc" for x, y in ((x0 - 1, y0), (x0 + 100
 sys.exit(0 if inside and around else 1)
 EOF
 echo "ok   the screenshot shows second.html as it is painted"
+titles=$(grep "^voyager: title \(start\|second\)$" "$log" | sed 's/^voyager: title //' | tr '\n' ' ')
+[[ "$titles" == "start second start second start "* ]] || { cat "$log" >&2; fail "back and forward did not go back to start.html and forward to second.html (titles: $titles)"; }
+echo "ok   Alt+Left goes back, Alt+Right forward"
+grep -q "^voyager: url file://.*/projects/voyager/tests/start.html?typed$" "$log" || { cat "$log" >&2; fail "an address typed into the address field did not load"; }
+echo "ok   an address typed into the address field loads"
 echo "check_voyager.sh: all checks passed"

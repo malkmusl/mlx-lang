@@ -1,0 +1,421 @@
+// WebSockets (ws:) for the port's socket provider (MlxWebSocket.cpp): the
+// opening handshake on a std.net connection, frames written and read with
+// std.http.websocket (masked, fragmented messages joined, pings answered,
+// the closing handshake), and permessage-deflate (std.http.websocket's
+// deflate) when the server takes it. A socket is one thread's reading
+// (receive blocks until a whole message, or the end) and another's
+// writing (send, close).
+//
+// STUB (later: wss: over std.tls): only ws: URLs connect.
+const std = @import("std")
+const net = @import("std.net")
+const uri = @import("std.uri")
+const ws = @import("std.http.websocket")
+const deflate = @import("std.http.websocket.deflate")
+const message = @import("std.http.message")
+const headers = @import("std.http.headers")
+const random = @import("std.random")
+
+extern("c") fn malloc(size: usize) -> usize
+extern("c") fn free(address: usize) -> void
+
+const ROOM: usize = 65536
+
+// A message's kind, as MlxWebPort.h numbers them.
+pub const KIND_ERROR: u32 = 0
+pub const KIND_TEXT: u32 = 1
+pub const KIND_BINARY: u32 = 2
+pub const KIND_CLOSE: u32 = 8
+
+const Socket = struct {
+    fd: isize
+    // Bytes received and not yet taken.
+    buffer: [ROOM]u8
+    start: usize
+    end: usize
+    extension: deflate.Extension
+    // The server's choices, as C strings.
+    protocol: [256]u8
+    extensions: [256]u8
+    closeSent: bool
+}
+
+// A message on the C heap.
+const Message = struct {
+    kind: u32
+    code: u32
+    bytes: usize
+    length: usize
+}
+
+fn socketAt(address: usize) -> *Socket { return unsafe { @ptrFromInt(*Socket, address) } }
+fn messageAt(address: usize) -> *Message { return unsafe { @ptrFromInt(*Message, address) } }
+
+fn allocator() -> std.allocator.Allocator { return std.page_allocator.init() }
+
+fn cText(address: usize) -> []const u8 {
+    if address == 0 { return "" }
+    const view: [*]const u8 = unsafe { @ptrFromInt([*]const u8, address) }
+    var n: usize = 0
+    while view[n] != 0 { n += 1 }
+    return view[0..n]
+}
+
+const Text = struct {
+    bytes: [4096]u8
+    length: usize
+}
+
+fn put(text: *Text, bytes: []const u8) -> void {
+    for byte in bytes {
+        if text.*.length < 4096 {
+            text.*.bytes[text.*.length] = byte
+            text.*.length += 1
+        }
+    }
+}
+
+fn putNumber(text: *Text, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var v = value
+    while true {
+        digits[19 - count] = @intCast(u8, 48 + v % 10)
+        count += 1
+        v = v / 10
+        if v == 0 { break }
+    }
+    put(text, digits[20 - count..20])
+}
+
+fn keep(into: *[256]u8, value: []const u8) -> void {
+    var n: usize = 0
+    while n < value.length && n < 255 {
+        into.*[n] = value[n]
+        n += 1
+    }
+    into.*[n] = 0
+}
+
+// More bytes into the socket's buffer; false at the connection's end.
+fn fill(socket: *Socket) -> bool {
+    if socket.*.start > 0 {
+        var i: usize = 0
+        while socket.*.start + i < socket.*.end {
+            socket.*.buffer[i] = socket.*.buffer[socket.*.start + i]
+            i += 1
+        }
+        socket.*.end -= socket.*.start
+        socket.*.start = 0
+    }
+    if socket.*.end == ROOM { return false }
+    const got = net.receive(socket.*.fd, unsafe { @ptrCast([*]u8, &socket.*.buffer) + socket.*.end }, ROOM - socket.*.end)
+    if got <= 0 { return false }
+    socket.*.end += @intCast(usize, got)
+    return true
+}
+
+// Whether DATA holds a whole head (headEnd past its blank line, or the
+// blank line ends DATA).
+fn headComplete(data: []const u8, headEnd: usize) -> bool {
+    if headEnd < data.length { return true }
+    if data.length >= 4 && data[data.length - 4] == 13 && data[data.length - 3] == 10 && data[data.length - 2] == 13 && data[data.length - 1] == 10 { return true }
+    return data.length >= 2 && data[data.length - 2] == 10 && data[data.length - 1] == 10
+}
+
+// Opens a WebSocket to URL (a C string, ws:) asking for PROTOCOLS (a C
+// string, comma separated, empty for none): the socket, or 0.
+pub fn connect(url: usize, protocols: usize) -> usize {
+    var u: uri.Uri = undefined
+    if !uri.parse(cText(url), &u) || !u.hasAuthority || !uri.equalsIgnoringCase(u.scheme, "ws") { return 0 }
+    var addresses: [4]net.Address = undefined
+    const found = net.resolve(uri.hostName(&u), uri.portOf(&u), unsafe { @ptrCast([*]net.Address, &addresses) }, 4, 10000)
+    if found == 0 { return 0 }
+    const memory = allocator().alloc(@sizeOf(Socket), 16)
+    if memory == null { return 0 }
+    const socket: *Socket = unsafe { @ptrCast(*Socket, memory.?) }
+    socket.*.fd = -1
+    var i: usize = 0
+    while i < found && socket.*.fd < 0 {
+        const fd = net.connect(&addresses[i], 10000)
+        if fd >= 0 { socket.*.fd = fd }
+        i += 1
+    }
+    if socket.*.fd < 0 {
+        allocator().free(memory.?, @sizeOf(Socket), 16)
+        return 0
+    }
+    socket.*.start = 0
+    socket.*.end = 0
+    socket.*.closeSent = false
+    socket.*.protocol[0] = 0
+    socket.*.extensions[0] = 0
+    deflate.init(&socket.*.extension, allocator())
+    // The request.
+    var nonce: [16]u8 = undefined
+    _ = random.fill(unsafe { @ptrCast([*]u8, &nonce) }, 16)
+    var key: [24]u8 = undefined
+    ws.makeKey(&nonce, &key)
+    var request: Text = undefined
+    request.length = 0
+    put(&request, "GET ")
+    put(&request, if u.path.length == 0 { "/" } else { u.path })
+    if u.hasQuery {
+        put(&request, "?")
+        put(&request, u.query)
+    }
+    put(&request, " HTTP/1.1\r\nHost: ")
+    put(&request, u.host)
+    if u.hasPort {
+        put(&request, ":")
+        put(&request, u.port)
+    }
+    put(&request, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ")
+    put(&request, key[0..24])
+    put(&request, "\r\nSec-WebSocket-Extensions: ")
+    put(&request, deflate.NAME)
+    put(&request, deflate.REQUEST_PARAMS)
+    put(&request, "\r\n")
+    const asked = cText(protocols)
+    if asked.length > 0 {
+        put(&request, "Sec-WebSocket-Protocol: ")
+        put(&request, asked)
+        put(&request, "\r\n")
+    }
+    put(&request, "\r\n")
+    if !net.send(socket.*.fd, request.bytes[0..request.length]) {
+        release(@intFromPtr(socket))
+        return 0
+    }
+    // The response's head.
+    var headLength = message.headEnd(socket.*.buffer[0..socket.*.end])
+    while !headComplete(socket.*.buffer[0..socket.*.end], headLength) {
+        if !net.readable(socket.*.fd, 10000) || !fill(socket) {
+            release(@intFromPtr(socket))
+            return 0
+        }
+        headLength = message.headEnd(socket.*.buffer[0..socket.*.end])
+    }
+    const head = socket.*.buffer[0..headLength]
+    var status: message.StatusLine = undefined
+    if !message.parseStatusLine(head[0..message.firstLineEnd(head)], &status) || status.code != 101 {
+        release(@intFromPtr(socket))
+        return 0
+    }
+    var folded: [4096]u8 = undefined
+    var it = message.headerLines(head)
+    var name: []const u8 = ""
+    var value: []const u8 = ""
+    var accepted = false
+    while message.nextHeader(&it, &name, &value, folded[0..4096]) {
+        if headers.equalsIgnoringCase(name, "Sec-WebSocket-Accept") {
+            accepted = ws.acceptMatches(key[0..24], value)
+        } else if headers.equalsIgnoringCase(name, "Sec-WebSocket-Protocol") {
+            keep(&socket.*.protocol, value)
+        } else if headers.equalsIgnoringCase(name, "Sec-WebSocket-Extensions") {
+            keep(&socket.*.extensions, value)
+            // "permessage-deflate; params..."
+            if value.length >= deflate.NAME.length && headers.equalsIgnoringCase(value[0..deflate.NAME.length], deflate.NAME) {
+                var params = value[deflate.NAME.length..value.length]
+                while params.length > 0 && (params[0] == 59 || params[0] == 32) { params = params[1..params.length] }
+                var bad: []const u8 = ""
+                _ = deflate.configure(&socket.*.extension, true, params, params.length > 0, &bad)
+            }
+        }
+    }
+    if !accepted {
+        release(@intFromPtr(socket))
+        return 0
+    }
+    socket.*.start = headLength
+    return @intFromPtr(socket)
+}
+
+pub fn protocol(socket: usize) -> usize { return if socket == 0 { 0 } else { @intFromPtr(&socketAt(socket).*.protocol) } }
+pub fn extensions(socket: usize) -> usize { return if socket == 0 { 0 } else { @intFromPtr(&socketAt(socket).*.extensions) } }
+
+// Sends a frame of OPCODE with LENGTH bytes at BYTES (compressed when
+// the extension is on and the frame is data); false when it failed.
+fn sendFrame(socket: *Socket, opcode: u8, payload: []const u8) -> bool {
+    var first: u8 = 0x80 | opcode
+    var compressed: deflate.Bytes = undefined
+    if deflate.outgoing(&socket.*.extension, &first, payload, &compressed) != deflate.Error.none { return false }
+    const body = if compressed.capacity > 0 { compressed.bytes[0..compressed.length] } else { payload }
+    var mask: [4]u8 = undefined
+    _ = random.fill(unsafe { @ptrCast([*]u8, &mask) }, 4)
+    var head: [14]u8 = undefined
+    const headLength = ws.writeHeader(&head, first, @intCast(u64, body.length), true, mask)
+    const total = headLength + body.length
+    const frame = allocator().alloc(if total == 0 { 1 } else { total }, 16)
+    if frame == null {
+        if compressed.capacity > 0 { deflate.freeBytes(&socket.*.extension, &compressed) }
+        return false
+    }
+    const bytes: [*]u8 = frame.?
+    var i: usize = 0
+    while i < headLength {
+        bytes[i] = head[i]
+        i += 1
+    }
+    i = 0
+    while i < body.length {
+        bytes[headLength + i] = body[i]
+        i += 1
+    }
+    ws.applyMask(mask, unsafe { bytes + headLength }, body.length)
+    const sent = net.send(socket.*.fd, bytes[0..total])
+    allocator().free(frame.?, if total == 0 { 1 } else { total }, 16)
+    if compressed.capacity > 0 { deflate.freeBytes(&socket.*.extension, &compressed) }
+    return sent
+}
+
+pub fn send(socket: usize, binary: bool, bytes: usize, length: usize) -> bool {
+    if socket == 0 { return false }
+    const payload: []const u8 = if length == 0 { "" } else { unsafe { @ptrFromInt([*]const u8, bytes) }[0..length] }
+    return sendFrame(socketAt(socket), if binary { ws.BINARY } else { ws.TEXT }, payload)
+}
+
+// Starts the closing handshake with CODE (0: none) and REASON (a C string).
+pub fn close(socket: usize, code: u32, reason: usize) -> void {
+    if socket == 0 || socketAt(socket).*.closeSent { return }
+    socketAt(socket).*.closeSent = true
+    var body: [125]u8 = undefined
+    var n: usize = 0
+    if code != 0 {
+        body[0] = @intCast(u8, (code >> 8) & 0xff)
+        body[1] = @intCast(u8, code & 0xff)
+        n = 2
+        for c in cText(reason) {
+            if n < 125 {
+                body[n] = c
+                n += 1
+            }
+        }
+    }
+    _ = sendFrame(socketAt(socket), ws.CLOSE, body[0..n])
+}
+
+fn made(kind: u32, code: u32, bytes: []const u8) -> usize {
+    const address = malloc(@sizeOf(Message))
+    if address == 0 { return 0 }
+    const m = messageAt(address)
+    m.*.kind = kind
+    m.*.code = code
+    m.*.length = bytes.length
+    m.*.bytes = malloc(bytes.length + 1)
+    if m.*.bytes != 0 {
+        const to: [*]u8 = unsafe { @ptrFromInt([*]u8, m.*.bytes) }
+        var i: usize = 0
+        while i < bytes.length {
+            to[i] = bytes[i]
+            i += 1
+        }
+        to[bytes.length] = 0
+    }
+    return address
+}
+
+// The next message (blocking): text, binary, the server's close (its code
+// and reason), or an error at the connection's end. 0 without memory.
+pub fn receive(socket: usize) -> usize {
+    if socket == 0 { return made(KIND_ERROR, 1006, "") }
+    const s = socketAt(socket)
+    var whole: deflate.Bytes = undefined
+    whole.length = 0
+    whole.capacity = 0
+    var collected: [*]u8 = undefined
+    var collectedLength: usize = 0
+    var collectedCapacity: usize = 0
+    var kind: u32 = 0
+    while true {
+        var header: ws.Header = undefined
+        var parsed = ws.parseHeader(s.*.buffer[s.*.start..s.*.end], &header)
+        while parsed == ws.Parse.needMore || (parsed == ws.Parse.ok && s.*.end - s.*.start < header.length + @intCast(usize, header.payloadLength)) {
+            if !fill(s) { return made(KIND_ERROR, 1006, "") }
+            parsed = ws.parseHeader(s.*.buffer[s.*.start..s.*.end], &header)
+        }
+        if parsed != ws.Parse.ok { return made(KIND_ERROR, 1002, "") }
+        const payloadStart = s.*.start + header.length
+        const payloadLength = @intCast(usize, header.payloadLength)
+        const payload = s.*.buffer[payloadStart..payloadStart + payloadLength]
+        if header.masked { ws.applyMask(header.mask, unsafe { @ptrCast([*]u8, &s.*.buffer) + payloadStart }, payloadLength) }
+        s.*.start = payloadStart + payloadLength
+        if header.opcode == ws.PING {
+            _ = sendFrame(s, ws.PONG, payload)
+            continue
+        }
+        if header.opcode == ws.PONG { continue }
+        if header.opcode == ws.CLOSE {
+            var code: u32 = 1005
+            var reason: []const u8 = ""
+            if payload.length >= 2 {
+                code = (@intCast(u32, payload[0]) << 8) | @intCast(u32, payload[1])
+                reason = payload[2..payload.length]
+            }
+            const answer = made(KIND_CLOSE, code, reason)
+            if !s.*.closeSent {
+                s.*.closeSent = true
+                _ = sendFrame(s, ws.CLOSE, payload[0..if payload.length >= 2 { 2 } else { 0 }])
+            }
+            return answer
+        }
+        if header.opcode == ws.TEXT || header.opcode == ws.BINARY { kind = @intCast(u32, header.opcode) }
+        var first: u8 = header.opcode | header.reserved | (if header.fin { 0x80 } else { 0 })
+        var inflated: deflate.Bytes = undefined
+        if deflate.incoming(&s.*.extension, &first, payload, &inflated) != deflate.Error.none { return made(KIND_ERROR, 1007, "") }
+        const part = if inflated.capacity > 0 { inflated.bytes[0..inflated.length] } else { payload }
+        if collectedLength + part.length > collectedCapacity {
+            const capacity = (collectedLength + part.length) * 2 + 64
+            const grown = allocator().alloc(capacity, 16)
+            if grown == null { return 0 }
+            var i: usize = 0
+            while i < collectedLength {
+                grown.?[i] = collected[i]
+                i += 1
+            }
+            if collectedCapacity > 0 { allocator().free(collected, collectedCapacity, 16) }
+            collected = grown.?
+            collectedCapacity = capacity
+        }
+        var i: usize = 0
+        while i < part.length {
+            collected[collectedLength + i] = part[i]
+            i += 1
+        }
+        collectedLength += part.length
+        if inflated.capacity > 0 { deflate.freeBytes(&s.*.extension, &inflated) }
+        if header.fin {
+            const answer = made(kind, 0, if collectedLength == 0 { "" } else { collected[0..collectedLength] })
+            if collectedCapacity > 0 { allocator().free(collected, collectedCapacity, 16) }
+            return answer
+        }
+    }
+    return 0
+}
+
+pub fn messageKind(m: usize) -> u32 { return if m == 0 { KIND_ERROR } else { messageAt(m).*.kind } }
+pub fn messageCode(m: usize) -> u32 { return if m == 0 { 1006 } else { messageAt(m).*.code } }
+pub fn messageBytes(m: usize) -> usize { return if m == 0 { 0 } else { messageAt(m).*.bytes } }
+pub fn messageLength(m: usize) -> usize { return if m == 0 { 0 } else { messageAt(m).*.length } }
+
+pub fn releaseMessage(m: usize) -> void {
+    if m == 0 { return }
+    if messageAt(m).*.bytes != 0 { free(messageAt(m).*.bytes) }
+    free(m)
+}
+
+// Ends the connection (after the reading thread has stopped).
+pub fn release(socket: usize) -> void {
+    if socket == 0 { return }
+    const s = socketAt(socket)
+    if s.*.fd >= 0 { net.close(s.*.fd) }
+    deflate.deinit(&s.*.extension)
+    allocator().free(unsafe { @ptrFromInt([*]u8, socket) }, @sizeOf(Socket), 16)
+}
+
+// Shuts the connection so a blocked receive returns (the reading thread
+// then ends, and the owner releases it).
+pub fn shutdown(socket: usize) -> void {
+    if socket == 0 { return }
+    _ = std.linux.syscall2(std.linux.SYS_shutdown, @bitCast(usize, socketAt(socket).*.fd), 2)
+}

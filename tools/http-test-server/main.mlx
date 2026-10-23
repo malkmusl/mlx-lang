@@ -9,10 +9,13 @@
 //   /set-cookie        sets "session=abc123; Path=/" and "pref=dark;
 //                      Path=/; HttpOnly", then a page
 //   /cookies           a plain text body: the request's Cookie header
-//   /echo              the request's method, Content-Type and body as text
+//   /echo              a page of the request's method, Content-Type and body
 //   /json              application/json {"answer": 42, "items": [1, 2, 3]}
 //   /gzip.html         a page sent gzip-compressed
 //   /chunked.html      a page sent in chunks
+//   /ws                a WebSocket that sends back each message it gets
+//                      ("echo: " before a text's), permessage-deflate
+//                      when asked for, and answers a close
 //   /quit              the server stops
 //
 //     http-test-server ROOT
@@ -21,6 +24,8 @@ const net = @import("std.net")
 const message = @import("std.http.message")
 const headers = @import("std.http.headers")
 const flate = @import("std.flate")
+const ws = @import("std.http.websocket")
+const deflate = @import("std.http.websocket.deflate")
 const process = std.linux.process
 
 const CAPACITY: usize = 1048576
@@ -69,6 +74,24 @@ fn putNumber(sink: headers.Sink, value: usize) -> void {
         if v == 0 { break }
     }
     headers.put(sink, digits[20 - count..20])
+}
+
+// A chunk of a chunked body: its length in hex, the bytes.
+fn putChunk(sink: headers.Sink, bytes: []const u8) -> void {
+    const hex: []const u8 = "0123456789abcdef"
+    var digits: [16]u8 = undefined
+    var count: usize = 0
+    var v = bytes.length
+    while true {
+        digits[15 - count] = hex[v % 16]
+        count += 1
+        v = v / 16
+        if v == 0 { break }
+    }
+    headers.put(sink, digits[16 - count..16])
+    headers.put(sink, "\r\n")
+    headers.put(sink, bytes)
+    headers.put(sink, "\r\n")
 }
 
 // A response with a Content-Length body.
@@ -151,6 +174,87 @@ fn readFile(root: []const u8, path: []const u8, into: *Text) -> bool {
 
 const PAGE_HEAD: []const u8 = "<!DOCTYPE html><html><head><title>"
 
+// A frame to the client (unmasked), compressed when the extension is on.
+fn sendFrame(fd: isize, extension: *deflate.Extension, opcode: u8, payload: []const u8) -> bool {
+    var first: u8 = 0x80 | opcode
+    var compressed: deflate.Bytes = undefined
+    if deflate.outgoing(extension, &first, payload, &compressed) != deflate.Error.none { return false }
+    const body = if compressed.capacity > 0 { compressed.bytes[0..compressed.length] } else { payload }
+    var head: [14]u8 = undefined
+    var noMask: [4]u8 = undefined
+    const headLength = ws.writeHeader(&head, first, @intCast(u64, body.length), false, noMask)
+    const sent = net.send(fd, head[0..headLength]) && net.send(fd, body)
+    if compressed.capacity > 0 { deflate.freeBytes(extension, &compressed) }
+    return sent
+}
+
+// The WebSocket of /ws once its handshake is answered: messages echoed
+// until a close.
+fn echoSocket(fd: isize, extension: *deflate.Extension, held: [*]u8, heldLength: usize) -> void {
+    var buffer: [65536]u8 = undefined
+    var end: usize = 0
+    while end < heldLength {
+        buffer[end] = held[end]
+        end += 1
+    }
+    var reply: [65536]u8 = undefined
+    var replyLength: usize = 0
+    var textMessage = true
+    while true {
+        var header: ws.Header = undefined
+        var parsed = ws.parseHeader(buffer[0..end], &header)
+        while parsed == ws.Parse.needMore || (parsed == ws.Parse.ok && end < header.length + @intCast(usize, header.payloadLength)) {
+            if end == 65536 { return }
+            const got = net.receive(fd, unsafe { @ptrCast([*]u8, &buffer) + end }, 65536 - end)
+            if got <= 0 { return }
+            end += @intCast(usize, got)
+            parsed = ws.parseHeader(buffer[0..end], &header)
+        }
+        if parsed != ws.Parse.ok { return }
+        const length = @intCast(usize, header.payloadLength)
+        if header.masked { ws.applyMask(header.mask, unsafe { @ptrCast([*]u8, &buffer) + header.length }, length) }
+        const payload = buffer[header.length..header.length + length]
+        if header.opcode == ws.CLOSE {
+            _ = sendFrame(fd, extension, ws.CLOSE, payload[0..if length >= 2 { 2 } else { 0 }])
+            return
+        }
+        if header.opcode == ws.PING {
+            _ = sendFrame(fd, extension, ws.PONG, payload)
+        } else if header.opcode != ws.PONG {
+            if header.opcode != ws.CONTINUATION {
+                textMessage = header.opcode == ws.TEXT
+                replyLength = 0
+                if textMessage {
+                    for c in "echo: " {
+                        reply[replyLength] = c
+                        replyLength += 1
+                    }
+                }
+            }
+            var first: u8 = header.opcode | header.reserved | (if header.fin { 0x80 } else { 0 })
+            var inflated: deflate.Bytes = undefined
+            if deflate.incoming(extension, &first, payload, &inflated) != deflate.Error.none { return }
+            const part = if inflated.capacity > 0 { inflated.bytes[0..inflated.length] } else { payload }
+            for c in part {
+                if replyLength < 65536 {
+                    reply[replyLength] = c
+                    replyLength += 1
+                }
+            }
+            if inflated.capacity > 0 { deflate.freeBytes(extension, &inflated) }
+            if header.fin && !sendFrame(fd, extension, if textMessage { ws.TEXT } else { ws.BINARY }, reply[0..replyLength]) { return }
+        }
+        // The frame taken.
+        const used = header.length + length
+        var i: usize = 0
+        while used + i < end {
+            buffer[i] = buffer[used + i]
+            i += 1
+        }
+        end -= used
+    }
+}
+
 // Serves the requests of one connection.
 fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> void {
     var out: Text = undefined
@@ -209,9 +313,10 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
             _ = headerOf(head, "Cookie", folded[0..4096], &cookie)
             respond(&out, 200, "OK", "Content-Type: text/plain\r\n", cookie)
         } else if same(target, "/echo") {
+            // (A page, its text in a <pre>: what the request was.)
             page.length = 0
             const sink = sinkOf(&page)
-            headers.put(sink, "method ")
+            headers.put(sink, "<!DOCTYPE html><title>echo</title><pre>method ")
             headers.put(sink, line.method)
             var kind: []const u8 = "(none)"
             _ = headerOf(head, "Content-Type", folded[0..4096], &kind)
@@ -223,8 +328,22 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
             headers.put(sink, "\nbody ")
             putNumber(sink, body.length)
             headers.put(sink, " bytes\n")
-            headers.put(sink, body)
-            respond(&out, 200, "OK", "Content-Type: text/plain\r\n", text(&page))
+            // (The body's text, escaped; a multipart boundary's line as
+            // "--boundary".)
+            var at: usize = 0
+            while at < body.length {
+                const c = body[at]
+                if c == 60 {
+                    headers.put(sink, "&lt;")
+                } else if c == 38 {
+                    headers.put(sink, "&amp;")
+                } else if c != 13 {
+                    headers.put(sink, body[at..at + 1])
+                }
+                at += 1
+            }
+            headers.put(sink, "</pre>")
+            respond(&out, 200, "OK", "Content-Type: text/html\r\n", text(&page))
         } else if same(target, "/json") {
             respond(&out, 200, "OK", "Content-Type: application/json\r\n", "{\"answer\": 42, \"items\": [1, 2, 3]}")
         } else if same(target, "/gzip.html") {
@@ -237,9 +356,39 @@ fn serve(fd: isize, root: []const u8, allocator: std.allocator.Allocator) -> voi
             const sink = sinkOf(&out)
             message.writeStatusLine(sink, message.Version.http11, 200, "OK")
             headers.put(sink, "Content-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n")
-            headers.put(sink, "22\r\n<!DOCTYPE html><title>chunked</ti\r\n")
-            headers.put(sink, "28\r\ntle><p>This page came in three chunks.</\r\n")
-            headers.put(sink, "3\r\np>\n\r\n0\r\n\r\n")
+            putChunk(sink, "<!DOCTYPE html><title>chunked</ti")
+            putChunk(sink, "tle><p>This page came in three chunks.</")
+            putChunk(sink, "p>\n")
+            headers.put(sink, "0\r\n\r\n")
+        } else if same(target, "/ws") {
+            var key: []const u8 = ""
+            if !headerOf(head, "Sec-WebSocket-Key", folded[0..4096], &key) { return }
+            var accept: [28]u8 = undefined
+            ws.acceptKey(key, &accept)
+            var extension: deflate.Extension = undefined
+            deflate.init(&extension, allocator)
+            page.length = 0
+            const sink = sinkOf(&page)
+            headers.put(sink, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+            headers.put(sink, accept[0..28])
+            headers.put(sink, "\r\n")
+            var offered: []const u8 = ""
+            if headerOf(head, "Sec-WebSocket-Extensions", folded[0..4096], &offered) && startsWith(offered, deflate.NAME) {
+                var params = offered[deflate.NAME.length..offered.length]
+                while params.length > 0 && (params[0] == 59 || params[0] == 32) { params = params[1..params.length] }
+                var bad: []const u8 = ""
+                if deflate.configure(&extension, false, params, params.length > 0, &bad) == deflate.Error.none && extension.enabled {
+                    headers.put(sink, "Sec-WebSocket-Extensions: ")
+                    headers.put(sink, deflate.NAME)
+                    _ = deflate.writeResponseParams(sink, &extension)
+                    headers.put(sink, "\r\n")
+                }
+            }
+            headers.put(sink, "\r\n")
+            if !net.send(fd, text(&page)) { return }
+            const used = headEnd + bodyLength
+            echoSocket(fd, &extension, unsafe { into + used }, held - used)
+            return
         } else if same(target, "/quit") {
             respond(&out, 200, "OK", "", "bye")
             close = true
