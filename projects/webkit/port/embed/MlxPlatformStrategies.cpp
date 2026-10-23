@@ -255,11 +255,6 @@ public:
 
 static MlxBlobRegistry* processBlobRegistry;
 
-BlobRegistryImpl* MlxPlatformStrategies::blobRegistryImpl()
-{
-    return processBlobRegistry ? &processBlobRegistry->m_registry : nullptr;
-}
-
 BlobData* MlxPlatformStrategies::blobData(const URL& url)
 {
     return processBlobRegistry ? processBlobRegistry->m_registry.blobDataFromURL(url) : nullptr;

@@ -283,9 +283,7 @@ ExceptionOr<Vector<uint8_t>> CryptoAlgorithmPBKDF2::platformDeriveBits(const Cry
 
 std::optional<Vector<uint8_t>> defaultWebCryptoMasterKey()
 {
-    Vector<uint8_t> key(16);
-    key.fill(0);
-    return key;
+    return Vector<uint8_t>(FillWith { }, 16, 0);
 }
 
 bool wrapSerializedCryptoKey(const Vector<uint8_t>&, const Vector<uint8_t>& key, Vector<uint8_t>& result)

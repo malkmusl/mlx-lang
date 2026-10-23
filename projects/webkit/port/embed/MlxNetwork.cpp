@@ -2,6 +2,7 @@
 #include "config.h"
 #include "MlxNetwork.h"
 
+#include "BlobRegistry.h"
 #include "BlobRegistryImpl.h"
 #include "CookieJar.h"
 #include "FormData.h"
@@ -17,7 +18,6 @@
 #include "SharedBuffer.h"
 #include "StorageSessionProvider.h"
 #include "port/MlxWebPort.h"
-#include "port/embed/MlxPlatformStrategies.h"
 #include <pal/SessionID.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,7 +107,7 @@ static uint32_t cacheModeFor(const ResourceRequest& request)
 // to theirs (BlobRegistryImpl).
 static Vector<uint8_t> bodyBytes(FormData& formData)
 {
-    Ref resolved = formData.resolveBlobReferences(MlxPlatformStrategies::blobRegistryImpl());
+    Ref resolved = formData.resolveBlobReferences(blobRegistry()->blobRegistryImpl());
     Vector<uint8_t> bytes;
     for (auto& element : resolved->elements()) {
         WTF::switchOn(element.data,
