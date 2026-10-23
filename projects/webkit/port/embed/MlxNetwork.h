@@ -13,6 +13,7 @@
 // MlxNetwork::cookieJar() (PageConfiguration::cookieJar).
 #pragma once
 
+#include <wtf/CompletionHandler.h>
 #include <wtf/Forward.h>
 #include <wtf/Ref.h>
 
@@ -42,6 +43,12 @@ public:
     // A load run to its end on the calling thread (synchronous XHR):
     // redirects followed, the response and the data, or the error.
     static void loadSynchronously(const ResourceRequest&, ResourceError&, ResourceResponse&, Vector<uint8_t>& data);
+
+    // A request run on the network queue with no loader (a download):
+    // redirects followed, the response and its whole body, or the error,
+    // given to the handler on the main thread.
+    using FetchHandler = CompletionHandler<void(const ResourceError&, ResourceResponse&&, Vector<uint8_t>&&)>;
+    static void fetch(const ResourceRequest&, FetchHandler&&);
 
     // The page's cookie jar over the Mlx side's (document.cookie).
     WEBCORE_EXPORT static Ref<CookieJar> cookieJar();

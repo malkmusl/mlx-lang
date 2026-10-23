@@ -4,6 +4,7 @@
 
 #include "BlobRegistry.h"
 #include "BlobRegistryImpl.h"
+#include "BlobResourceHandle.h"
 #include "CachedResource.h"
 #include "FrameLoader.h"
 #include "LoaderStrategy.h"
@@ -78,10 +79,37 @@ static void loadFile(ResourceLoader& loader)
     });
 }
 
+// A blob: URL's bytes (a File's, a Blob's: the process's blob registry),
+// read whole by WebCore's BlobResourceHandle and given to the loader as a
+// file's are (FileReader, fetch() of a blob URL, a blob URL's page).
+static void loadBlob(ResourceLoader& loader)
+{
+    if (loader.reachedTerminalState())
+        return;
+    const auto& request = loader.request();
+    auto* blobData = MlxPlatformStrategies::blobData(request.url());
+    ResourceError error;
+    ResourceResponse response;
+    Vector<uint8_t> bytes;
+    BlobResourceHandle::loadResourceSynchronously(blobData, request, error, response, bytes);
+    if (!error.isNull()) {
+        loader.didFail(error);
+        return;
+    }
+    Ref data = SharedBuffer::create(WTF::move(bytes));
+    loader.didReceiveResponse(WTF::move(response), [loader = Ref { loader }, data = WTF::move(data)] {
+        if (!loader->reachedTerminalState() && data->size() && loader->request().httpMethod() != "HEAD"_s)
+            loader->didReceiveBuffer(data, data->size(), DataPayloadWholeResource);
+        if (!loader->reachedTerminalState())
+            loader->didFinishLoading(NetworkLoadMetrics { });
+    });
+}
+
 // Each load a SubresourceLoader (the main resource's too), run as WebKit2's
 // WebLoaderStrategy runs them, from the main loop: data: URLs by WebCore
 // itself (ResourceLoader::start, DataURLDecoder), file: URLs by the port
-// (loadFile, std.fs), http: and https: by the port's network (MlxNetwork:
+// (loadFile, std.fs), blob: URLs from the process's blob registry
+// (loadBlob), http: and https: by the port's network (MlxNetwork:
 // std.http and std.tls on a thread of their own), the embedder's schemes
 // by its callbacks (MlxSchemeHandler: Voyager's voyager:); other schemes
 // fail as URLs that cannot be shown. No scheduling by priority yet.
@@ -109,6 +137,12 @@ public:
             });
             return;
         }
+        if (url.protocolIsBlob()) {
+            RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
+                loadBlob(loader);
+            });
+            return;
+        }
         if (MlxNetwork::handles(url)) {
             MlxNetwork::load(loader);
             return;
@@ -127,6 +161,10 @@ public:
     {
         if (MlxNetwork::handles(request.url())) {
             MlxNetwork::loadSynchronously(request, error, response, data);
+            return;
+        }
+        if (request.url().protocolIsBlob()) {
+            BlobResourceHandle::loadResourceSynchronously(MlxPlatformStrategies::blobData(request.url()), request, error, response, data);
             return;
         }
         if (MlxSchemeHandler::handles(request.url())) {
@@ -211,8 +249,21 @@ private:
     void writeBlobsToTemporaryFilesForIndexedDB(const Vector<String>& blobURLs, CompletionHandler<void(Vector<String>&& filePaths)>&& completionHandler) override { m_registry.writeBlobsToTemporaryFilesForIndexedDB(blobURLs, WTF::move(completionHandler)); }
     BlobRegistryImpl* blobRegistryImpl() override { return &m_registry; }
 
+public:
     BlobRegistryImpl m_registry;
 };
+
+static MlxBlobRegistry* processBlobRegistry;
+
+BlobRegistryImpl* MlxPlatformStrategies::blobRegistryImpl()
+{
+    return processBlobRegistry ? &processBlobRegistry->m_registry : nullptr;
+}
+
+BlobData* MlxPlatformStrategies::blobData(const URL& url)
+{
+    return processBlobRegistry ? processBlobRegistry->m_registry.blobDataFromURL(url) : nullptr;
+}
 
 void MlxPlatformStrategies::initialize()
 {
@@ -237,7 +288,8 @@ MediaStrategy* MlxPlatformStrategies::createMediaStrategy()
 
 BlobRegistry* MlxPlatformStrategies::createBlobRegistry()
 {
-    return new MlxBlobRegistry;
+    processBlobRegistry = new MlxBlobRegistry;
+    return processBlobRegistry;
 }
 
 } // namespace WebCore

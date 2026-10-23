@@ -4,6 +4,7 @@
 // painted (M4).
 //
 //     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test]
+//                  [--downloads DIR] [--upload PATH]...
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -42,6 +43,18 @@
 // HTTP cache in DIR/cache); a second run with the same DIR finds them.
 // Without it the profile is a temporary directory, removed at the end, so
 // that each run starts from nothing (the checks stay hermetic).
+//
+// --downloads DIR saves what the page downloads (the port's MlxDownloads:
+// an attachment, a link's download attribute, a blob or data: URL, a
+// type no frame shows) into DIR, unique names kept apart ("NAME (1).EXT");
+// the run waits for them, and --text lists each after the text
+// ("download NAME BYTES bytes done", or "failed: WHY").
+//
+// --upload PATH (repeatable) answers the page's file chooser: once the
+// page has loaded, its first <input type=file> is clicked as by the user
+// (a gesture), and the chooser gets PATH (each PATH when the input takes
+// several files), as Voyager's chooser would; the page's scripts then do
+// what they do with the files (a form sent, FileReader, FormData).
 //
 // --test runs the page as WebKitTestRunner runs a layout test of its own
 // (the testRunner object below: dumpAsText, waitUntilDone, notifyDone),
@@ -103,6 +116,11 @@
 #include "Settings.h"
 #include "port/MlxWebPort.h"
 #include "port/embed/MlxFrameLoaderClient.h"
+#include "port/embed/MlxDownloads.h"
+#include "FileChooser.h"
+#include "HTMLInputElement.h"
+#include "TypedElementDescendantIteratorInlines.h"
+#include "UserGestureIndicator.h"
 #include "CookieJar.h"
 #include "port/embed/MlxNetwork.h"
 #include "port/embed/MlxWebSocket.h"
@@ -157,7 +175,7 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test] [--downloads DIR] [--upload PATH]... [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
@@ -312,6 +330,9 @@ static RefPtr<Page> makePage(IntSize, MlxFrameLoaderClient** client, LocalFrame*
 
 // The chrome client of --test's pages: the console and the dialogs
 // printed, window.open given a page of its own.
+// --upload's files, given to the page's file chooser.
+static Vector<String> uploads;
+
 class TestChromeClient final : public EmptyChromeClient {
 public:
     explicit TestChromeClient(IntSize size)
@@ -339,6 +360,18 @@ private:
         result = defaultValue;
         return true;
     }
+    void runOpenPanel(LocalFrame&, FileChooser& chooser) final
+    {
+        if (uploads.isEmpty()) {
+            chooser.cancelFileChoosing();
+            return;
+        }
+        if (chooser.settings().allowsMultipleFiles)
+            chooser.chooseFiles(uploads);
+        else
+            chooser.chooseFiles({ uploads[0] });
+    }
+
     RefPtr<Page> createWindow(LocalFrame& opener, const String&, const WindowFeatures&, const NavigationAction&) final
     {
         MlxFrameLoaderClient* client = nullptr;
@@ -369,7 +402,8 @@ static RefPtr<Page> makePage(IntSize viewSize, MlxFrameLoaderClient** client, Lo
     MlxProfile::configure(configuration);
     // (A window.open's page: its opener the frame that opened it.)
     configuration.mainFrameOpener = opener;
-    if (testMode)
+    // (--upload's answer to the file chooser is the test client's.)
+    if (testMode || !uploads.isEmpty())
         configuration.chromeClient = makeUniqueRef<TestChromeClient>(viewSize);
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [viewSize, client](auto&, auto& frameLoader) {
@@ -384,6 +418,8 @@ static RefPtr<Page> makePage(IntSize viewSize, MlxFrameLoaderClient** client, Lo
     auto& settings = page->settings();
     settings.setScriptEnabled(pageScript);
     settings.setAcceleratedCompositingEnabled(false);
+    // (A link's download attribute, as WebKit2's ports have it on.)
+    settings.setDownloadAttributeEnabled(true);
     // (WebKitTestRunner's: TestController::resetPreferencesToConsistentValues.)
     settings.setStandardFontFamily("Times"_s);
     settings.setFixedFontFamily("Courier"_s);
@@ -447,7 +483,25 @@ struct Run {
     // --wait-title: the title the page's scripts give it when they are
     // done (null: none to wait for).
     String waitTitle;
+    // --upload: the page's file input not clicked yet.
+    bool uploadPending { false };
 };
+
+// --upload: the page's first <input type=file> clicked as by the user.
+static void clickFileInput(Run& run)
+{
+    RefPtr document = run.frame->document();
+    if (!document)
+        return;
+    for (Ref input : descendantsOfType<HTMLInputElement>(*document)) {
+        if (!input->isFileUpload())
+            continue;
+        UserGestureIndicator gesture(IsProcessingUserGesture::Yes, document.get());
+        input->click();
+        return;
+    }
+    fprintf(stderr, "webcore-dump: --upload: the page has no <input type=file>\n");
+}
 
 // Whether the frame's document has loaded with nothing pending: its load
 // finished, the parser done, no request of its resource loader (images,
@@ -474,7 +528,9 @@ static bool isQuiet(Run& run)
         return true;
     if (document->parsing() || document->cachedResourceLoader().requestCount())
         return false;
-    if (!run.waitTitle.isNull() && document->title() != run.waitTitle)
+    if (!run.waitTitle.isNull() && document->title() != run.waitTitle && !run.uploadPending)
+        return false;
+    if (MlxDownloads::running())
         return false;
     // (Nor a navigation on its way: a form a script submitted, a
     // redirect the page scheduled, a load not committed yet.)
@@ -493,7 +549,11 @@ static void check(Run& run)
         RunLoop::mainSingleton().stop();
         return;
     }
-    if (isQuiet(run)) {
+    if (isQuiet(run) && run.uploadPending) {
+        run.uploadPending = false;
+        run.quietChecks = 0;
+        clickFileInput(run);
+    } else if (isQuiet(run)) {
         if (RefPtr document = run.frame->document())
             document->updateLayoutIgnorePendingStylesheets();
         if (isQuiet(run) && ++run.quietChecks >= 3) {
@@ -526,6 +586,7 @@ int main(int argc, char** argv)
     const char* target = nullptr;
     const char* scheme = nullptr;
     const char* profile = nullptr;
+    const char* downloads = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--font") && i + 1 < argc)
             fonts.append(argv[++i]);
@@ -565,6 +626,15 @@ int main(int argc, char** argv)
             profile = argv[++i];
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
             timeout = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--downloads") && i + 1 < argc)
+            downloads = argv[++i];
+        else if (!strcmp(argv[i], "--upload") && i + 1 < argc) {
+            String path = String::fromUTF8(argv[++i]);
+            char directory[4096];
+            if (!path.startsWith('/') && getcwd(directory, sizeof(directory)))
+                path = FileSystem::pathByAppendingComponent(String::fromUTF8(directory), path);
+            uploads.append(path);
+        }
         else if (argv[i][0] == '-' || target)
             return usage();
         else
@@ -653,6 +723,14 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    if (downloads) {
+        String directory = String::fromUTF8(downloads);
+        char cwd[4096];
+        if (!directory.startsWith('/') && getcwd(cwd, sizeof(cwd)))
+            directory = FileSystem::pathByAppendingComponent(String::fromUTF8(cwd), directory);
+        MlxDownloads::setDirectory(directory);
+    }
+
     static MlxFrameLoaderClient* mainClient;
     // Its user agent: the port's with its own name (as Voyager's has
     // "Voyager/0.1").
@@ -673,6 +751,7 @@ int main(int argc, char** argv)
         run.frame = page->localMainFrame();
         if (waitTitle)
             run.waitTitle = String::fromUTF8(waitTitle);
+        run.uploadPending = !uploads.isEmpty();
         if (!run.frame || !mainClient) {
             fprintf(stderr, "webcore-dump: the page has no main frame\n");
             return 1;
@@ -712,6 +791,20 @@ int main(int argc, char** argv)
             tree = makeString("url "_s, document ? document->url().string() : String(), "\ntitle "_s, document ? document->title() : String(), "\n"_s, body ? body->innerText() : String(), "\n"_s);
         } else
             tree = externalRepresentation(run.frame.get());
+        if (textOnly && !MlxDownloads::list().isEmpty()) {
+            StringBuilder list;
+            for (auto& download : MlxDownloads::list()) {
+                String name = download.path.isEmpty() ? download.name : FileSystem::pathFileName(download.path);
+                list.append("download "_s, name, ' ', download.received, " bytes "_s);
+                if (download.state == MlxDownloads::State::Done)
+                    list.append("done\n"_s);
+                else if (download.state == MlxDownloads::State::Failed)
+                    list.append("failed: "_s, download.error, '\n');
+                else
+                    list.append("unfinished\n"_s);
+            }
+            tree = makeString(tree, list.toString());
+        }
         if (textOnly && scheme) {
             StringBuilder list;
             list.append("scheme "_s, schemeName, ": "_s, schemeRequests.size(), " requests\n"_s);

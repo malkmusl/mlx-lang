@@ -11,10 +11,10 @@
 //     PageConfiguration::LocalMainFrameCreationParameters {
 //         [](auto&, auto& frameLoader) { return makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, IntSize(800, 600)); }, ... }
 //
-// STUB (M5: frames in frames, plug-ins, history, downloads, forms' policy):
+// STUB (M5: frames in frames, plug-ins, history, forms' policy):
 // createFrame makes no frame (an iframe stays empty), there is no back and
-// forward list and no download; a new window is the chrome client's
-// (createWindow: a tab of Voyager's).
+// forward list; a new window is the chrome client's (createWindow: a tab
+// of Voyager's). Downloads are MlxDownloads' (M7).
 #pragma once
 
 #include "IntSize.h"
@@ -168,6 +168,12 @@ private:
     void loadFinished(bool succeeded);
 
     IntSize m_viewSize;
+    // The download attribute of the response decided to be downloaded
+    // (dispatchDecidePolicyForResponse), for convertMainResourceLoadToDownload.
+    String m_downloadName;
+    // A provisional load just turned into a download (its failure is not
+    // the frame's).
+    bool m_downloadStarted { false };
     Function<void(bool)> m_loadFinished;
 };
 

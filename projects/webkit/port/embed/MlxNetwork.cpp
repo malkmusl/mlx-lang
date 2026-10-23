@@ -2,6 +2,7 @@
 #include "config.h"
 #include "MlxNetwork.h"
 
+#include "BlobRegistryImpl.h"
 #include "CookieJar.h"
 #include "FormData.h"
 #include "HTTPHeaderMap.h"
@@ -16,9 +17,11 @@
 #include "SharedBuffer.h"
 #include "StorageSessionProvider.h"
 #include "port/MlxWebPort.h"
+#include "port/embed/MlxPlatformStrategies.h"
 #include <pal/SessionID.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <wtf/FileSystem.h>
 #include <wtf/NeverDestroyed.h>
 #include <wtf/RunLoop.h>
 #include <wtf/WorkQueue.h>
@@ -99,6 +102,31 @@ static uint32_t cacheModeFor(const ResourceRequest& request)
     return MLXWEB_CACHE_DEFAULT;
 }
 
+// A request's body as it is sent: its bytes, the files' contents (a
+// form's <input type=file>, a File in a FormData) read in, blobs resolved
+// to theirs (BlobRegistryImpl).
+static Vector<uint8_t> bodyBytes(FormData& formData)
+{
+    Ref resolved = formData.resolveBlobReferences(MlxPlatformStrategies::blobRegistryImpl());
+    Vector<uint8_t> bytes;
+    for (auto& element : resolved->elements()) {
+        WTF::switchOn(element.data,
+            [&](const Vector<uint8_t>& data) {
+                bytes.append(data.span());
+            },
+            [&](const FormDataElement::EncodedFileData& file) {
+                auto contents = FileSystem::readEntireFile(file.filename);
+                if (!contents)
+                    return;
+                size_t start = std::min<size_t>(std::max<int64_t>(file.fileStart, 0), contents->size());
+                size_t length = file.fileLength < 0 ? contents->size() - start : std::min<size_t>(file.fileLength, contents->size() - start);
+                bytes.append(contents->subspan(start, length));
+            },
+            [&](const FormDataElement::EncodedBlobData&) { });
+    }
+    return bytes;
+}
+
 static Outgoing outgoingFor(const ResourceRequest& request)
 {
     Outgoing outgoing;
@@ -114,7 +142,7 @@ static Outgoing outgoingFor(const ResourceRequest& request)
     }
     outgoing.headers = headers.toString().utf8();
     if (RefPtr body = request.httpBody()) {
-        outgoing.body = body->flatten();
+        outgoing.body = bodyBytes(*body);
         outgoing.hasBody = true;
     } else
         outgoing.hasBody = method == "POST"_s || method == "PUT"_s;
@@ -336,6 +364,36 @@ void MlxNetwork::loadSynchronously(const ResourceRequest& original, ResourceErro
         }
         request = WTF::move(next);
     }
+}
+
+static void fetchFrom(ResourceRequest&& request, unsigned redirects, MlxNetwork::FetchHandler&& handler)
+{
+    auto outgoing = outgoingFor(request);
+    MlxNetwork::queue().dispatch([request = request.isolatedCopy(), outgoing = WTF::move(outgoing), redirects, handler = WTF::move(handler)]() mutable {
+        auto answer = run(outgoing);
+        RunLoop::mainSingleton().dispatch([request = WTF::move(request), answer = WTF::move(answer), redirects, handler = WTF::move(handler)]() mutable {
+            if (answer.error) {
+                handler(errorFor(request.url(), answer.error), { }, { });
+                return;
+            }
+            auto response = responseFor(request.url(), answer);
+            auto next = redirected(request, response);
+            if (next.isNull()) {
+                handler({ }, WTF::move(response), WTF::move(answer.body));
+                return;
+            }
+            if (redirects >= maximumRedirects) {
+                handler(ResourceError(String(errorDomain), 6, request.url(), "Too many redirects"_s), { }, { });
+                return;
+            }
+            fetchFrom(WTF::move(next), redirects + 1, WTF::move(handler));
+        });
+    });
+}
+
+void MlxNetwork::fetch(const ResourceRequest& request, FetchHandler&& handler)
+{
+    fetchFrom(ResourceRequest { request }, 0, WTF::move(handler));
 }
 
 namespace {

@@ -26,6 +26,7 @@
 #include "SubstituteData.h"
 #include "UserAgent.h"
 #include "UserAgentMlx.h"
+#include "port/embed/MlxDownloads.h"
 #include <wtf/NeverDestroyed.h>
 #include "Widget.h"
 #include <stdio.h>
@@ -92,7 +93,12 @@ void MlxFrameLoaderClient::forceLayoutForNonHTML() { }
 void MlxFrameLoaderClient::setCopiesOnScroll() { }
 void MlxFrameLoaderClient::detachedFromParent2() { }
 void MlxFrameLoaderClient::detachedFromParent3() { }
-void MlxFrameLoaderClient::convertMainResourceLoadToDownload(DocumentLoader*, const ResourceRequest&, const ResourceResponse&) { }
+// (Fetched again by MlxDownloads: the frame's load stops here.)
+void MlxFrameLoaderClient::convertMainResourceLoadToDownload(DocumentLoader*, const ResourceRequest& request, const ResourceResponse& response)
+{
+    m_downloadStarted = true;
+    MlxDownloads::start(request, &response, std::exchange(m_downloadName, String()));
+}
 
 void MlxFrameLoaderClient::assignIdentifierToInitialRequest(ResourceLoaderIdentifier, DocumentLoader*, const ResourceRequest&) { MLX_TRACE("assignIdentifierToInitialRequest"); }
 bool MlxFrameLoaderClient::shouldUseCredentialStorage(DocumentLoader*, ResourceLoaderIdentifier) { return false; }
@@ -129,6 +135,10 @@ void MlxFrameLoaderClient::dispatchDidCommitLoad(std::optional<HasInsecureConten
 void MlxFrameLoaderClient::dispatchDidFailProvisionalLoad(const ResourceError& error, WillContinueLoading willContinueLoading, WillInternallyHandleFailure)
 {
     MLX_TRACE("provisional load failed: %s", error.localizedDescription().utf8().data());
+    // (A load turned into a download, its policy changed, is no failure of
+    // the frame's: the page shown stays.)
+    if (std::exchange(m_downloadStarted, false))
+        return;
     if (willContinueLoading == WillContinueLoading::No)
         loadFinished(false);
 }
@@ -165,11 +175,18 @@ void MlxFrameLoaderClient::dispatchShow() { }
 
 // What the embedder allows: every navigation of the frame itself and every
 // response it can show; a new window where its chrome client makes one
-// (dispatchCreatePage).
-void MlxFrameLoaderClient::dispatchDecidePolicyForResponse(const ResourceResponse& response, const ResourceRequest&, const String&, FramePolicyFunction&& function)
+// (dispatchCreatePage). Downloaded (MlxDownloads): a link with a download
+// attribute, a response that is an attachment (Content-Disposition) or
+// of a type no frame shows; one in error that cannot be shown is
+// ignored.
+void MlxFrameLoaderClient::dispatchDecidePolicyForResponse(const ResourceResponse& response, const ResourceRequest&, const String& downloadAttribute, FramePolicyFunction&& function)
 {
-    MLX_TRACE("response %s (%s): %s", response.url().string().utf8().data(), response.mimeType().utf8().data(), canShowMIMEType(response.mimeType()) ? "shown" : "ignored");
-    function(canShowMIMEType(response.mimeType()) ? PolicyAction::Use : PolicyAction::Ignore);
+    bool shown = canShowMIMEType(response.mimeType());
+    bool download = !downloadAttribute.isNull() || response.isAttachment() || (!shown && response.httpStatusCode() < 400);
+    MLX_TRACE("response %s (%s): %s", response.url().string().utf8().data(), response.mimeType().utf8().data(), download ? "downloaded" : shown ? "shown" : "ignored");
+    if (download)
+        m_downloadName = downloadAttribute;
+    function(download ? PolicyAction::Download : shown ? PolicyAction::Use : PolicyAction::Ignore);
 }
 
 void MlxFrameLoaderClient::dispatchDecidePolicyForNewWindowAction(const NavigationAction&, const ResourceRequest& request, FormState*, const String&, std::optional<HitTestResult>&&, FramePolicyFunction&& function)
@@ -178,10 +195,12 @@ void MlxFrameLoaderClient::dispatchDecidePolicyForNewWindowAction(const Navigati
     function(PolicyAction::Use);
 }
 
-void MlxFrameLoaderClient::dispatchDecidePolicyForNavigationAction(const NavigationAction&, const ResourceRequest& request, const ResourceResponse&, FormState*, const String&, std::optional<NavigationIdentifier>, std::optional<HitTestResult>&&, bool, NavigationUpgradeToHTTPSBehavior, SandboxFlags, PolicyDecisionMode, FramePolicyFunction&& function)
+// (A link with a download attribute is downloaded at once, before any
+// load: WebCore's startDownload, its blob still registered.)
+void MlxFrameLoaderClient::dispatchDecidePolicyForNavigationAction(const NavigationAction& action, const ResourceRequest& request, const ResourceResponse&, FormState*, const String&, std::optional<NavigationIdentifier>, std::optional<HitTestResult>&&, bool, NavigationUpgradeToHTTPSBehavior, SandboxFlags, PolicyDecisionMode, FramePolicyFunction&& function)
 {
-    MLX_TRACE("navigation to %s", request.url().string().utf8().data());
-    function(PolicyAction::Use);
+    MLX_TRACE("navigation to %s%s", request.url().string().utf8().data(), action.downloadAttribute().isNull() ? "" : " (a download)");
+    function(action.downloadAttribute().isNull() ? PolicyAction::Use : PolicyAction::Download);
 }
 
 void MlxFrameLoaderClient::updateSandboxFlags(SandboxFlags) { }
@@ -200,7 +219,10 @@ void MlxFrameLoaderClient::dispatchWillSubmitForm(FormState&, URL&&, String&&, C
 void MlxFrameLoaderClient::revertToProvisionalState(DocumentLoader*) { }
 void MlxFrameLoaderClient::setMainDocumentError(DocumentLoader*, const ResourceError&) { }
 void MlxFrameLoaderClient::setMainFrameDocumentReady(bool) { }
-void MlxFrameLoaderClient::startDownload(const ResourceRequest&, const String&, FromDownloadAttribute) { }
+void MlxFrameLoaderClient::startDownload(const ResourceRequest& request, const String& suggestedName, FromDownloadAttribute)
+{
+    MlxDownloads::start(request, nullptr, suggestedName);
+}
 void MlxFrameLoaderClient::willChangeTitle(DocumentLoader*) { }
 void MlxFrameLoaderClient::didChangeTitle(DocumentLoader*) { }
 void MlxFrameLoaderClient::willReplaceMultipartContent() { }

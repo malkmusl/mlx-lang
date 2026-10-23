@@ -24,6 +24,19 @@
 # location: none asked); the scheme's own page (a path written test:...,
 # loaded as it is) loads and fetches its own URLs, a 404 among them.
 #
+# Downloads and uploads (M7, PORT.md "Downloads", "Uploads"): pages named
+# download* run with --downloads DIR of their own: site/download.html's
+# links (a download attribute twice: the second file kept apart as
+# "note (1).txt"; a Blob's URL; a data: URL; then /download/attachment,
+# Content-Disposition: attachment) and site/download-type.html
+# (application/octet-stream, which no frame shows) land there, and the
+# files are listed after the text with what is in them. Pages named
+# upload* answer the page's file chooser with uploads/upload-a.txt (and
+# upload-b.txt where it takes several: --upload): a form sent as
+# multipart/form-data (the server's echo shows the file's part, its
+# name, type and bytes), several files at once, and a script's
+# File, FileReader, Blob.slice and a FormData of the file fetched.
+#
 # What a profile keeps (M7, PORT.md "Network"): webcore-dump runs twice
 # with the same --profile. The HTTP cache on disk: site/cache.html fetches
 # a response fresh for an hour (max-age), one validated each time (an ETag,
@@ -109,7 +122,23 @@ while read -r name path wait; do
     [[ $path == test:* ]] && url=$path
     scheme=()
     [[ $name == scheme* ]] && scheme=(--scheme test)
-    dump "$url" "${scheme[@]}" ${wait:+--wait-title "$wait"} | sed -e "s/127\.0\.0\.1:\($port\|$tls_port\)/127.0.0.1:PORT/g" -e 's/WebKitFormBoundary[A-Za-z0-9]*/WebKitFormBoundary/g' -e 's/[[:space:]]*$//' > "$work/$name.txt"
+    extra=()
+    saved=""
+    if [[ $name == download* ]]; then
+        saved=$work/downloads-$name
+        rm -rf -- "$saved"
+        extra=(--downloads "$saved")
+    fi
+    case $name in
+        upload) extra=(--upload "$network/uploads/upload-a.txt") ;;
+        upload-*) extra=(--upload "$network/uploads/upload-a.txt" --upload "$network/uploads/upload-b.txt") ;;
+    esac
+    dump "$url" "${scheme[@]}" "${extra[@]}" ${wait:+--wait-title "$wait"} | sed -e "s/127\.0\.0\.1:\($port\|$tls_port\)/127.0.0.1:PORT/g" -e 's/WebKitFormBoundary[A-Za-z0-9]*/WebKitFormBoundary/g' -e 's/[[:space:]]*$//' > "$work/$name.txt"
+    if [[ -n "$saved" ]]; then
+        for file in "$saved"/*; do
+            [[ -f "$file" ]] && echo "saved $(basename "$file"): $(cat "$file")" >> "$work/$name.txt"
+        done
+    fi
     if cmp -s "$work/$name.txt" "$network/expected/$name.txt"; then
         passed=$(( passed + 1 ))
         echo "PASS $name ($path)"
