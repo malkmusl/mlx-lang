@@ -28,7 +28,10 @@
 #      "scheme:dark";
 #  10. the desktop switched from light to dark while Voyager runs
 #      (appearance.conf rewritten): the toolbar and the page follow, the
-#      page without a reload.
+#      page without a reload;
+#  11. a URL of more than 512 bytes (std.ui.field has no fixed size) is
+#      loaded whole, and the address field, focused by Ctrl+L, holds all
+#      of it, scrolled so that its end is in view.
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -279,6 +282,31 @@ titles=$(grep "^voyager: title \(start\|second\)$" "$log" | sed 's/^voyager: tit
 echo "ok   Alt+Left goes back, Alt+Right forward"
 grep -q "^voyager: url file://.*/projects/voyager/tests/start.html?typed$" "$log" || { cat "$log" >&2; fail "an address typed into the address field did not load"; }
 echo "ok   an address typed into the address field loads"
+
+# 11: a URL longer than 512 bytes: second.html with a long query.
+long_query=$(printf 'segment%04d/' $(seq 1 64))end
+long_url="file://$repo_root/projects/voyager/tests/second.html?$long_query"
+cat > "$work/voyager-long" << EOF
+#!/bin/sh
+export HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf" VOYAGER_TRACE=1
+exec "$voyager" "$long_url" 2>> "$work/voyager.log"
+EOF
+chmod +x "$work/voyager-long"
+cat > "$work/long.script" << EOF
+wait 10000
+down 29
+down 38
+up 38
+up 29
+wait 1500
+shot $work/long.ppm
+close
+EOF
+run_scenario long "$work/long.script" "$work/voyager-long"
+log=$work/voyager.log
+grep -qxF "voyager: url $long_url" "$log" || { cat "$log" >&2; fail "the URL of ${#long_url} bytes was not loaded whole"; }
+grep -qxF "voyager: address focused, ${#long_url} bytes, its end in view" "$log" || { cat "$log" >&2; fail "the address field does not hold the URL of ${#long_url} bytes with its end in view"; }
+echo "ok   a URL of ${#long_url} bytes: loaded whole, the address field holds it and shows its end"
 
 # 9: a dark desktop (MLX_COLOR_SCHEME=dark), a page that allows dark.
 write_runner "$work/voyager-dark" scheme.html MLX_COLOR_SCHEME=dark
