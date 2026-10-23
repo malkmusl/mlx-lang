@@ -19,6 +19,7 @@
 #include "SharedBuffer.h"
 #include "SubstituteData.h"
 #include "UserAgent.h"
+#include "UserAgentMlx.h"
 #include <wtf/NeverDestroyed.h>
 #include "Widget.h"
 #include <stdio.h>
@@ -235,13 +236,20 @@ static String& applicationVersion()
     return version;
 }
 
-void MlxFrameLoaderClient::setApplicationNameForUserAgent(const String& name, const String& version)
+static String& windowSystem()
+{
+    static NeverDestroyed<String> system;
+    return system;
+}
+
+void MlxFrameLoaderClient::setApplicationNameForUserAgent(const String& name, const String& version, const String& system)
 {
     applicationName() = name;
     applicationVersion() = version;
+    windowSystem() = system;
 }
 
-// The port's user agent (UserAgentMlx.cpp) with the embedder's name, a
+// The port's user agent (UserAgentMlx.cpp) with the embedder's part, a
 // site's quirk instead when it has one (UserAgentQuirks). navigator's
 // and the requests' User-Agent are both this.
 String MlxFrameLoaderClient::userAgent(const URL& url) const
@@ -249,7 +257,7 @@ String MlxFrameLoaderClient::userAgent(const URL& url) const
     auto forURL = standardUserAgentForURL(url);
     if (!forURL.isNull())
         return forURL;
-    return standardUserAgent(applicationName(), applicationVersion());
+    return mlxUserAgent(applicationName(), applicationVersion(), windowSystem());
 }
 
 void MlxFrameLoaderClient::savePlatformDataToCachedFrame(CachedFrame*) { }

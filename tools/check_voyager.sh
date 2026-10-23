@@ -10,7 +10,7 @@
 #
 #   1. the page is shown: the screenshot has the page's blue link box
 #      (which also says where the page is on the screen), its user agent
-#      WebKit's with "Voyager/0.1 WebKit/2.54.1" after it;
+#      WebKit's with "Voyager/0.1 (WebKit 2.54.1; Wayland)" after it;
 #   2. the wheel scrolls it ("scrolled:N", then back to "scrolled:0");
 #   3. a click focuses the text field and typing goes in ("typed:hello");
 #   4. a double click selects the word, Ctrl+C copies it to the
@@ -131,7 +131,7 @@ close
 EOF
 run_scenario show "$work/show.script"
 grep -q "^voyager: title start$" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "Voyager did not show start.html"; }
-grep -q "^voyager: user agent Mozilla/5.0 (X11; Linux [^)]*) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15 Voyager/0.1 WebKit/2.54.1$" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "Voyager's user agent is not WebKit's with Voyager/0.1 WebKit/2.54.1 after it"; }
+grep -q "^voyager: user agent Mozilla/5.0 (X11; Linux [^)]*) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15 Voyager/0.1 (WebKit 2.54.1; Wayland)$" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "Voyager's user agent is not WebKit's with Voyager/0.1 (WebKit 2.54.1; Wayland) after it"; }
 read -r link_x link_y link_width link_height <<< "$(box_of "$work/start.ppm" 3366cc)"
 [[ "${link_width:-0}x${link_height:-0}" == "200x40" ]] || fail "the screenshot has no 200x40 link box of start.html (found: ${link_x:-} ${link_y:-} ${link_width:-}x${link_height:-})"
 x0=$(( link_x - 20 ))

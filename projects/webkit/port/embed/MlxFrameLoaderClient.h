@@ -30,10 +30,11 @@ public:
     // frame's dispatchDidFinishLoad or dispatchDidFailLoad.
     void setLoadFinishedCallback(Function<void(bool succeeded)>&& callback) { m_loadFinished = WTF::move(callback); }
 
-    // The embedder's name and version in every frame's user agent
-    // ("Voyager", "0.1"): after WebKit's compatibility string, before the
-    // engine's token (UserAgentMlx.cpp).
-    WEBCORE_EXPORT static void setApplicationNameForUserAgent(const String& name, const String& version);
+    // The embedder's name, version and window system in every frame's
+    // user agent ("Voyager", "0.1", "Wayland"): after WebKit's
+    // compatibility string, as "Voyager/0.1 (WebKit 2.54.1; Wayland)"
+    // (UserAgentMlx.cpp).
+    WEBCORE_EXPORT static void setApplicationNameForUserAgent(const String& name, const String& version, const String& windowSystem = String());
 
 private:
     Ref<DocumentLoader> createDocumentLoader(ResourceRequest&&, SubstituteData&&, ResourceRequest&&) override;

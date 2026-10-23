@@ -3,12 +3,14 @@
 // buildUserAgentString: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/
 // 605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15", Version/60.5
 // on purpose: sites turn away low and some high Safari versions), then
-// the embedder's name and version ("Voyager/0.1") and the engine's token
-// (ENGINE_TOKEN). Per-site quirks are WebKit's UserAgentQuirks.cpp
+// the embedder's name and version with a comment naming the engine and
+// the window system ("Voyager/0.1 (WebKit 2.54.1; Wayland)"; ENGINE is the
+// one place the engine is named). Per-site quirks are WebKit's UserAgentQuirks.cpp
 // (platform/glib, compiled as it is), the quirk's string built the same
-// way, without the embedder's and the engine's tokens.
+// way, without the embedder's part.
 #include "config.h"
 #include "UserAgent.h"
+#include "UserAgentMlx.h"
 
 #include "HTTPParsers.h"
 #include "platform/glib/UserAgentQuirks.h"
@@ -32,9 +34,9 @@ ChassisType chassisType()
 
 namespace WebCore {
 
-// The engine's token, last in the user agent: the one place it is named
-// (Lattice makes it "Lattice/0.0.1").
-static constexpr auto ENGINE_TOKEN = "WebKit/2.54.1"_s;
+// The engine and its version, first in the embedder's comment: the one
+// place it is named (Lattice makes it "Lattice 0.0.1").
+static constexpr auto ENGINE = "WebKit 2.54.1"_s;
 
 // "Linux x86_64": the system's name and machine, as GLib's.
 static const String& platformVersionForUAString()
@@ -80,15 +82,24 @@ static const String& standardUserAgentStatic()
     return userAgent;
 }
 
+String mlxUserAgent(const String& name, const String& version, const String& windowSystem)
+{
+    StringBuilder userAgent;
+    userAgent.append(standardUserAgentStatic());
+    if (!name.isEmpty()) {
+        userAgent.append(' ', name, '/', version.isEmpty() ? "0"_s : version, " ("_s, ENGINE);
+        if (!windowSystem.isEmpty())
+            userAgent.append("; "_s, windowSystem);
+        userAgent.append(')');
+    }
+    auto result = userAgent.toString();
+    RELEASE_ASSERT_WITH_MESSAGE(isValidHTTPHeaderValue(result), "%s is not a valid user agent header", result.utf8().data());
+    return result;
+}
+
 String standardUserAgent(const String& applicationName, const String& applicationVersion)
 {
-    String userAgent;
-    if (applicationName.isEmpty())
-        userAgent = makeString(standardUserAgentStatic(), ' ', ENGINE_TOKEN);
-    else
-        userAgent = makeString(standardUserAgentStatic(), ' ', applicationName, '/', applicationVersion.isEmpty() ? "605.1.15"_s : applicationVersion, ' ', ENGINE_TOKEN);
-    RELEASE_ASSERT_WITH_MESSAGE(isValidHTTPHeaderValue(userAgent), "%s is not a valid user agent header", userAgent.utf8().data());
-    return userAgent;
+    return mlxUserAgent(applicationName, applicationVersion, String());
 }
 
 // A site's quirk (UserAgentQuirks): its own string; the null string for

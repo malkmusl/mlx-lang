@@ -197,21 +197,25 @@ Four ways to choose without patching, in this order of preference:
 ### The user agent
 
 `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like
-Gecko) Version/60.5 Safari/605.1.15 Voyager/0.1 WebKit/2.54.1`: WebKit's
-compatibility string exactly as the GLib ports build it (UserAgentGLib.cpp's
-buildUserAgentString, Version/60.5 on purpose: sites turn away low and some
-high Safari versions), then the embedder's name and version
-(`MlxFrameLoaderClient::setApplicationNameForUserAgent`: Voyager's
-"Voyager/0.1", webcore-dump's "webcore-dump/0.1"), then the engine's token,
-the one constant `ENGINE_TOKEN` in port/platform/mlx/UserAgentMlx.cpp
-(Lattice makes it "Lattice/0.0.1"). navigator.userAgent and the requests'
+Gecko) Version/60.5 Safari/605.1.15 Voyager/0.1 (WebKit 2.54.1; Wayland)`:
+WebKit's compatibility string exactly as the GLib ports build it
+(UserAgentGLib.cpp's buildUserAgentString, Version/60.5 on purpose: sites
+turn away low and some high Safari versions; the first parentheses stay
+"X11; Linux ..." whatever shows the windows, as servers read the platform
+there), then the embedder's product with a comment naming the engine and
+the window system (`MlxFrameLoaderClient::setApplicationNameForUserAgent`:
+Voyager's "Voyager", "0.1", "Wayland"; webcore-dump's "webcore-dump/0.1
+(WebKit 2.54.1)", no windows). The engine is the one constant `ENGINE` in
+port/platform/mlx/UserAgentMlx.cpp: Lattice makes it "Lattice 0.0.1", the
+compatibility string staying as it is (as Blink kept "AppleWebKit/537.36").
+navigator.userAgent and the requests'
 User-Agent header are the same string (the client's userAgent(); std.http's
 client sends the request's own User-Agent instead of its default).
 Per-site quirks are WebKit's platform/glib/UserAgentQuirks.cpp, compiled
 unmodified (lists/webcore-mlx-sources.txt; the port defines
 WTF::chassisType(), desktop, which GLib's reads from /etc/machine-info):
 a quirk's string is built as buildUserAgentString builds it, without the
-embedder's and the engine's tokens. tools/check_webkit_mlx_network.sh's
+embedder's part. tools/check_webkit_mlx_network.sh's
 user-agent page checks the header and navigator.userAgent;
 tools/check_voyager.sh Voyager's string.
 
