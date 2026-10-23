@@ -199,7 +199,34 @@ Four ways to choose without patching, in this order of preference:
   `enum class : bool` read back sign-extended (ScriptElement's
   ParserInserted: no external script blocked the parser, so a page's
   inline scripts ran before the scripts they use; boolenumbitfield).
-  Part 2 (WebCrypto, downloads, uploads) is to come.
+- **M7, part 2, done** (WebCrypto, downloads, uploads): WebCrypto's
+  platform half is the port's `crypto/mlx` over std.crypto, std.aes,
+  std.asn1 and std.random (port/mlx/crypto.mlx): SHA-1 and the SHA-2s,
+  HMAC, AES-CBC, AES-CTR, AES-GCM, AES-KW, PBKDF2, HKDF, ECDSA and ECDH
+  on P-256, P-384 and P-521, Ed25519, X25519, RSASSA-PKCS1-v1_5,
+  RSA-PSS and RSA-OAEP, keys imported and exported raw, as JWK, SPKI and
+  PKCS #8 ("Crypto" below); getRandomValues and randomUUID take the
+  kernel's random bytes. Downloads (embed/MlxDownloads: an attachment, a
+  link's download attribute, a blob:, data: or file: URL, a type no frame
+  shows) go to the embedder's folder, Voyager's XDG_DOWNLOAD_DIR, listed
+  in its sidebar and on voyager://downloads; `<input type=file>` opens
+  std.ui.chooser in Voyager (webcore-dump `--upload PATH`), and the files
+  reach forms (multipart bodies read from the files), FormData, File,
+  FileReader and Blob (blob: URLs are loaded now: "Downloads and
+  uploads" below). Checks: tools/check_webkit_mlx_crypto.sh (152 layout
+  tests of crypto/subtle and crypto/, a third of each large group: 354
+  of the 355 that need no worker pass), check_webkit_mlx_network.sh (30
+  of 30: Ed25519, X25519 and ECDSA known answers, downloads of each kind
+  with the files' contents, uploads by form, several files, script),
+  check_voyager.sh (a download into a temporary XDG_DOWNLOAD_DIR shown on
+  voyager://downloads; an upload through the chooser), storage 63 of 63:
+  keypath-basics's abort was mlx-cc's (epoch 13, datamemberhides): a
+  data member named unqualified in a member function was taken for a
+  base's member function of the same name, so ConcurrentPtrHashSet's
+  Table read TrailingArray's `size()` as its size, never grew, and the
+  collector found its opaque roots' table full. std.crash now reports
+  one thread's crash while another thread crashes (the collector's
+  markers both failed the check: two half reports, no frame named).
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -335,7 +362,7 @@ port in the tarball that builds WebCore without GLib).
 | Text paths | `USE_FONT_VARIANT_VIA_FEATURES` off (GTK and WPE: on) | Kerned and shaped text goes to the complex (HarfBuzz) path through FontCascade::codePath, since GTK's and WPE's own branch for it is under `PLATFORM()`; GLib's layout tests expect it kerned |
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
-| Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), registers the digests only and refuses the rest until M7 (`port/crypto/CryptoMlx.cpp`), then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
+| Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBGL`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
 
@@ -563,6 +590,45 @@ neither, PlatformMlx defines the platform half itself:
   times, read into the index at start). `MLX_NETWORK_TRACE` says which
   answers came from the cache.
 
+### Downloads and uploads
+
+**Downloads** are embed/MlxDownloads' (M7). MlxFrameLoaderClient decides
+on them: a navigation of a link with a download attribute is downloaded
+at once (PolicyAction::Download: WebCore's startDownload, while a Blob's
+URL is still registered), a response is when it is an attachment
+(Content-Disposition), a link's download attribute asked for it, or no
+frame shows its type (application/octet-stream) and it is no error (the
+load turned into a download is no failure of the frame's). MlxDownloads
+fetches an http: or https: URL again on the network queue
+(MlxNetwork::fetch: cookies, redirects), reads a blob: URL's bytes from
+the process's blob registry (BlobResourceHandle), decodes a data: URL,
+reads a file: one, and the Mlx side writes the file
+(port/mlx/download.mlx, std.fs): in the embedder's folder, under the
+name the page or the response suggests (sanitized; the type's extension
+when it has none), never over another file ("NAME (1).EXT", made with
+O_EXCL), removed when the download fails. The embedder sees each change
+(MlxDownloads::setObserver) and the list. Voyager's folder is the
+user's download folder (std.xdg.userDirectory: $XDG_DOWNLOAD_DIR, else
+user-dirs.dirs' XDG_DOWNLOAD_DIR, else ~/Downloads); its sidebar shows
+the latest five under "Downloads" (the progress while one runs, the size
+when done), and voyager://downloads all of them, done or failed, each
+file's path and URL. webcore-dump's `--downloads DIR` saves into DIR and
+lists them after its text.
+
+**Uploads**: `<input type=file>` asks the page's chrome client
+(runOpenPanel). Voyager shows std.ui.chooser over the page (new in
+std.ui: a folder's entries, folders first, those the input's `accept`
+does not take dim; one file or several; keys: Up, Down, Enter,
+Backspace, Escape), from the home folder, then the folder last chosen
+in; webcore-dump's `--upload PATH` answers the chooser (clicking the
+page's first file input with a user gesture). The files chosen are
+File objects of WebCore's; the port's network sends a form's or a
+FormData's files read from disk (MlxNetwork's body: FormData's files
+and blobs resolved and read, where it sent only the data elements), and
+blob: URLs, which the port did not load before, are loaded from the
+blob registry (MlxPlatformStrategies' loadBlob: FileReader, fetch() of
+a blob URL, Blob.text()).
+
 ### Internal pages
 
 WebCore itself knows only about:blank and about:srcdoc; a browser's own
@@ -699,17 +765,15 @@ when the window object is made (MlxFrameLoaderClient's window-cleared
 callback, where WebKitTestRunner's injected bundle puts its own), the
 console's messages, alerts and window.open (a page of its own); the text
 is compared with the test's -expected.txt as the layout check compares
-trees, in US/Pacific's time zone as run-webkit-tests has it: 62 of 62
+trees, in US/Pacific's time zone as run-webkit-tests has it: 63 of 63
 pass (21 of storage/domstorage: clear, quota, complex keys and values,
 the localstorage and sessionstorage tests with window.open, storage
-events in frames; 41 of storage/indexeddb: basics, object stores,
+events in frames; 42 of storage/indexeddb: basics, object stores,
 indexes, cursors, key ranges, key generators, transactions, Mozilla's
 and the modern ones). Known failures, left out of the list:
-storage/indexeddb/keypath-basics.html aborts in JavaScriptCore's
-collector (a RELEASE_ASSERT of WTF::ConcurrentPtrHashSet::addImpl, its
-table found full, adding IDBTransaction's object stores as opaque roots:
-IDBTransaction::visitReferencedObjectStoresInGCThread; the same with one
-marker), to be found in mlx-cc or mlxlibcpp; the tests that need
+storage/indexeddb/keypath-basics.html (63 of 63 with it) aborted in
+JavaScriptCore's collector until mlx-cc's epoch 13 (a data member
+hiding a base's function: "Where it stands", M7); the tests that need
 `internals` (storage-close-database-on-idle and the like) or a second
 process are not taken.
 tools/check_voyager.sh restarts Voyager on a page that counts its visits
@@ -730,9 +794,50 @@ behind libxml2's API) stays for the WebKit stage; XSLT is off.
 WOFFFileFormat.cpp call zlib's streams: mlx-zlib (std.flate) stays while
 those files are WebKit's. PAL's `CryptoDigest` is the port's
 (`CryptoDigestMlx.cpp` over std.sha1, std.sha2, std.md5, in place of
-`pal/crypto/gcrypt`). WebCrypto (M7): `crypto/mlx/*` of the port, the
-`CryptoAlgorithm*::platform*` functions over std.crypto, std.aes, std.asn1
-and std.x509, as crypto/gcrypt and crypto/openssl are for their ports.
+`pal/crypto/gcrypt`). WebCrypto (M7) is the port's `port/crypto/mlx`,
+the `CryptoAlgorithm*::platform*` functions and the keys' platform
+halves, as crypto/gcrypt and crypto/openssl are for their ports, over
+the Mlx side's port/mlx/crypto.mlx (MlxWebPort.h's `mlxweb_crypto_*`):
+
+- **Digests, MACs, key derivation**: std.crypto.hash's SHA-1 and
+  SHA-2s, HMAC, HKDF and PBKDF2 (new in std.crypto.hash, with RFC 6070's
+  vectors in tests/362; its keyed state is copied word by word, as an
+  assignment of the struct takes a temporary of an export's value arena
+  each of a hundred thousand rounds).
+- **AES**: CBC (PKCS #7 padding), CTR (the counter's bits as given, a
+  counter that would be used twice refused), GCM (std.crypto.gcm, which
+  now takes an IV of any length and tags of 4 to 16 bytes: the GCM
+  specification's cases 5 and 6), KW (std.aes's key wrap, now under
+  128, 192 and 256-bit KEKs: RFC 3394's 4.2 and 4.3), on std.aes's
+  constant-time cipher. AES-CFB-8's platform functions are there, the
+  algorithm is not registered (WebKit deprecated it; its Linux ports
+  register none).
+- **EC**: std.crypto.ecc on P-256, P-384 and P-521: keys (a scalar and
+  the uncompressed point; compressed points taken), ECDSA (r | s), ECDH.
+- **Ed25519, X25519** (std.crypto.curve25519): WebKit's CryptoKeyOKP.cpp
+  and its two algorithms define their platform functions, unsupported,
+  for a port that is neither Cocoa nor GCrypt; the port's
+  CryptoKeyOKPMlx.cpp compiles those three files apart with
+  USE(GCRYPT)'s selection (nothing they include depends on it;
+  lists/webcore-mlx-skipped.txt leaves them out of the bundles) and
+  defines the platform half.
+- **RSA**: std.crypto.rsa (1024 to 4096 bits), keys made with
+  std.crypto.mpi, the numbers kept for export (JWK's, PKCS #8's CRT
+  values). RSA-PSS needs HAVE(RSA_PSS), which Platform.h sets only with
+  a named crypto library: CryptoKeyRSAMlx.cpp, compiled apart, sets it
+  and compiles WebKit's CryptoAlgorithmRSA_PSS.cpp, and registers the
+  algorithms. As WebKit's other ports, a PSS salt longer than the digest
+  is refused.
+- **DER**: SPKI and PKCS #8 of every kind (rsaEncryption, id-ecPublicKey
+  and ECDH's id-ecDH, Ed25519, X25519), read and written with std.asn1.
+- **Keys kept** (IndexedDB, postMessage): the profile's CryptoClient
+  (embed/MlxProfile) serializes and wraps them as WebKit2's UI process
+  does, the serialized key as it is (crypto/gcrypt's choice: WebKit's bug
+  173883).
+- **Random values**: page/Crypto.cpp is the port's (port/page/CryptoMlx.cpp:
+  getRandomValues and randomUUID over the kernel's getrandom through
+  std.random, where WebKit's reads WTF's ARC4 stream; WebKit's file is
+  skipped).
 
 ### Everything else a port supplies
 
@@ -808,7 +913,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M4 | Painting into a buffer | the same program paints the view into a Skia raster surface and writes a PNG (std.png); images decoded by the port's decoders | pixel tests: reference PNGs of simple pages (Ahem text, boxes, borders, gradients, images) within a small tolerance |
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
-| M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh (part 1 done: storage, IndexedDB, the HTTP cache, cookies kept; part 2: WebCrypto, downloads, uploads) |
+| M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh and check_webkit_mlx_crypto.sh, the network check's downloads and uploads, check_voyager.sh's (done, both parts) |
 | M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
@@ -827,7 +932,7 @@ WPE plan. They go when PlatformMlx does what they did, not before:
 | compiler/libc/soup (mlx-soup) | WebCore's and NetworkProcess's soup code | M2 (WebCore no longer compiles soup code); its HTTP is std.http's, which M6 uses directly | |
 | compiler/libc/png, jpeg, webp (libpng, libjpeg, libwebp) | WebCore's decoders, Skia's codecs | M4 | the port's decoders and encoders call std.png, std.jpeg, std.webp; Skia is built without codecs |
 | compiler/libc/lcms2 | WebCore's decoders (USE_LCMS) | M4 | colour management in the port's decoders (std.colorprofile) |
-| compiler/libc/gcrypt, compiler/libc/tasn1 | WebCrypto, PAL's digests | M2 for PAL's digests (CryptoDigestMlx), M7 for WebCrypto (`crypto/mlx`) | std.crypto, std.asn1, std.x509 |
+| compiler/libc/gcrypt, compiler/libc/tasn1 | WebCrypto, PAL's digests | M2 for PAL's digests (CryptoDigestMlx), M7 for WebCrypto (`crypto/mlx`): retired, nothing of the Mlx port's build uses them | std.crypto, std.aes, std.asn1, std.random |
 | compiler/libc/freetype | Skia's typefaces | after M5, with the port's `SkTypeface` over std.truetype | |
 | compiler/libc/harfbuzz | WebCore's Skia text code, hb-icu | after M5, if the shaping replacement meets the open point below | |
 | Fontconfig (no C layer was made; std.fontconfig is Mlx) | FontCacheSkia | never needed: `FontCacheMlx.cpp` calls std.fontconfig from M3 | |
@@ -889,7 +994,8 @@ What M2 found, and how the port meets it without a patch:
   OpenSSL only, and WebCrypto is always compiled: the port's prefix
   header (port/MlxPrefix.h, included after WebCorePrefix.h as a CMake
   port's prefix header is) names `PlatformRSAKey`,
-  `PlatformRSAKeyContainer` and `PlatformECKeyContainer`.
+  `PlatformRSAKeyContainer` and `PlatformECKeyContainer` (an
+  `MlxCryptoKey` of crypto/mlx's MlxCryptoUtilities.h).
   DNSResolveQueue.cpp makes its singleton of `DNSResolveQueuePlatform`,
   which only GLib's, curl's and CFNetwork's headers name: the port's
   DNSResolveQueueMlx.cpp defines its class and compiles WebKit's file
@@ -973,8 +1079,7 @@ What M2 found, and how the port meets it without a patch:
   (`String::fromLatin1(span)` compiled; the loader parses bytes itself).
 - **What M7's first part leaves.** IndexedDB counts no quota (the IDB
   server's space requester grants every request) and its server is never
-  shut down, only drained at exit (`MlxProfile::close`); keypath-basics
-  aborts in the collector (above, "Storage"). Local storage is written a
+  shut down, only drained at exit (`MlxProfile::close`). Local storage is written a
   second after a change and at a clean exit: a process killed in that
   second loses it. The HTTP cache keeps one response a key (no partial
   content, no Range requests, no stale-while-revalidate, no serving a
@@ -985,3 +1090,20 @@ What M2 found, and how the port meets it without a patch:
   private (ephemeral) profile, though an ephemeral session already keeps
   local storage in memory. Storage events reach other pages of the
   process only (one process: Voyager's tabs).
+- **What M7's second part leaves.** RSA keys of fewer than 1024 bits
+  (or more than 4096) are refused (std.crypto.rsa's range:
+  rsa-import-spki-small-key's 64-bit modulus) and RSA keys with other
+  primes (JWK's `oth`, PKCS #1 v2's multi-prime) too; key generation
+  runs on the main thread (a 4096-bit key takes seconds); the
+  crypto/workers tests are not run (no worker in webcore-dump's tests
+  yet). A download is fetched again whole, not resumed from the load
+  WebCore made, so a POST that answers with an attachment is fetched as
+  a GET, and its bytes are written once they are all there (the
+  sidebar's progress is a step); there is no dialog to choose a name or
+  a folder, no cancel or open from the sidebar. The file chooser has no
+  path field, no places (home, the download folder) and no previews.
+  mlx-cc refused `Vector<uint8_t>(16, 0)` ("no matching constructor")
+  and a call through `blobRegistry().blobRegistryImpl()` ("no such
+  member") in the port's units, which went around both (`fill`, an
+  accessor of MlxPlatformStrategies); neither came back in a small
+  program, to be found.
