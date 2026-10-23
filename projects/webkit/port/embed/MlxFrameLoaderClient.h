@@ -31,6 +31,11 @@ public:
     // frame's dispatchDidFinishLoad or dispatchDidFailLoad.
     void setLoadFinishedCallback(Function<void(bool succeeded)>&& callback) { m_loadFinished = WTF::move(callback); }
 
+    // The size of the views made for the frame's next documents (the
+    // embedder's window resized: the view shown is resized by the
+    // embedder, a page loaded after it gets the new size too).
+    void setViewSize(IntSize size) { m_viewSize = size; }
+
     // The embedder's name, version and window system in every frame's
     // user agent ("Voyager", "0.1", "Wayland"): in WebKit's compatibility
     // string after the platform, as "Voyager/0.1 (WebKit 2.54.1; Wayland)"

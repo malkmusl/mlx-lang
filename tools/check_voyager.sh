@@ -44,7 +44,17 @@
 #      setting for it): on a dark desktop second.html, which has no dark
 #      design of its own, is painted dark (its white square dark, its blue
 #      kept a blue); the desktop switched to light while it runs, it is
-#      painted as it is again (the square white).
+#      painted as it is again (the square white);
+#  14. Voyager's internal pages (the voyager: scheme): voyager://about,
+#      started with, is "About Voyager" on the theme's light background,
+#      with Voyager's version and the engine's; about:version typed into
+#      the address field is voyager://version, "Voyager Version", whose
+#      text has the versions and the whole user agent (with VOYAGER_TRACE
+#      the engine writes an internal page's text); about:about is
+#      voyager://about again, an unknown voyager://nothing a 404 page
+#      ("Not Found"), voyager:// the index ("Voyager Pages"); on a dark
+#      desktop voyager://about is in its own dark design (the theme's dark
+#      background), not forced dark.
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -103,11 +113,14 @@ echo "color-scheme = light" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
 write_runner() {
     local runner=$1 page=$2
     shift 2
+    # (A URL with a scheme, voyager://about, as it is.)
+    local target=$repo_root/projects/voyager/tests/$page
+    [[ $page == *:* ]] && target=$page
     cat > "$runner" << EOF
 #!/bin/sh
 export HOME="$work/home" FONTCONFIG_FILE="$work/fonts.conf"
 export VOYAGER_TRACE=1 $*
-exec "$voyager" "$repo_root/projects/voyager/tests/$page" 2>> "$work/voyager.log"
+exec "$voyager" "$target" 2>> "$work/voyager.log"
 EOF
     chmod +x "$runner"
 }
@@ -465,4 +478,41 @@ grep -q "^voyager: tab 1 forced dark no$" "$log" || { cat "$log" >&2; fail "the 
 square=$(pixel_of "$work/unforced.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
 [[ $square == ffffff ]] || fail "the square is not white again on a light desktop (#$square)"
 echo "ok   the desktop switched to light: the page is painted as it is again"
+# 14: the internal pages.
+write_runner "$work/voyager-internal" voyager://about
+address_script() {
+    printf 'down 29\ndown 38\nup 38\nup 29\nwait 300\ntype %s\nenter\nwait 4000\n' "$1"
+}
+{
+    printf 'wait 10000\nshot %s\n' "$work/about.ppm"
+    address_script about:version
+    address_script about:about
+    address_script voyager://nothing
+    address_script voyager://
+    printf 'close\n'
+} > "$work/internal.script"
+run_scenario internal "$work/internal.script" "$work/voyager-internal"
+log=$work/voyager.log
+grep -q "^voyager: title About Voyager$" "$log" && grep -q "^voyager: url voyager://about$" "$log" || { cat "$log" >&2; fail "voyager://about was not shown as About Voyager"; }
+grep -q "^voyager: tab 1 text Version 0.1$" "$log" && grep -q "^voyager: tab 1 text WebKit 2.54.1$" "$log" || { cat "$log" >&2; fail "voyager://about does not show Voyager's version and engine"; }
+background=$(pixel_of "$work/about.ppm" $(( page_x0 + 5 )) $(( page_y0 + 5 )))
+[[ $background == f6f6f8 ]] || fail "voyager://about is not on the theme's light background (found #$background)"
+echo "ok   voyager://about: About Voyager, its version and engine, in the theme's light colours"
+grep -q "^voyager: url voyager://version$" "$log" && grep -q "^voyager: title Voyager Version$" "$log" || { cat "$log" >&2; fail "about:version did not load voyager://version"; }
+user_agent=$(sed -n 's/^voyager: user agent //p' "$log" | head -1)
+grep -qxF "voyager: tab 1 text User agent	$user_agent" "$log" || { cat "$log" >&2; fail "voyager://version does not show the user agent ($user_agent)"; }
+grep -qx "voyager: tab 1 text Engine	WebKit 2.54.1" "$log" && grep -qx "voyager: tab 1 text Voyager	0.1" "$log" || { cat "$log" >&2; fail "voyager://version does not show Voyager's and the engine's versions"; }
+echo "ok   about:version is voyager://version: Voyager Version, the versions and the whole user agent"
+[[ $(grep -c "^voyager: url voyager://about$" "$log") -ge 2 ]] || { cat "$log" >&2; fail "about:about did not load voyager://about"; }
+echo "ok   about:about is voyager://about"
+grep -q "^voyager: url voyager://nothing$" "$log" && grep -q "^voyager: title Not Found$" "$log" || { cat "$log" >&2; fail "an unknown voyager: page is no 404 page"; }
+grep -q "^voyager: title Voyager Pages$" "$log" || { cat "$log" >&2; fail "voyager:// is not the index of the pages"; }
+echo "ok   voyager://nothing is a 404 page, voyager:// the index"
+write_runner "$work/voyager-internal-dark" voyager://about MLX_COLOR_SCHEME=dark
+printf 'wait 10000\nshot %s\nclose\n' "$work/about-dark.ppm" > "$work/internal-dark.script"
+run_scenario internal-dark "$work/internal-dark.script" "$work/voyager-internal-dark"
+grep -q "^voyager: tab 1 forced dark no$" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "voyager://about was painted in forced dark"; }
+background=$(pixel_of "$work/about-dark.ppm" $(( page_x0 + 5 )) $(( page_y0 + 5 )))
+[[ $background == 1a1c24 ]] || fail "voyager://about is not on the theme's dark background on a dark desktop (found #$background)"
+echo "ok   a dark desktop: voyager://about in its own dark design (not forced dark)"
 echo "check_voyager.sh: all checks passed"

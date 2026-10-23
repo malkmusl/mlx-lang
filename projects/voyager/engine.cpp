@@ -19,7 +19,12 @@
 // dark appearance, so `prefers-color-scheme: dark` matches and a page that
 // allows it is drawn dark, the theme's controls too, and a page without a
 // dark design of its own is painted dark: the port's forced dark mode,
-// MlxDarkMode.h).
+// MlxDarkMode.h). Its internal pages are the voyager: scheme (the port's
+// MlxSchemeHandler: no web page can reach them): voyager://, voyager://about
+// and voyager://version, made by pages.mlx (voyager_page) from the facts
+// gathered here; voyager://about/icon.png is the icon the build put in
+// (VoyagerBuild.h). about:about and about:version (any about: but blank
+// and srcdoc) are voyager://about and voyager://version.
 //
 //     voyager [--font FILE]... [--size WIDTHxHEIGHT] FILE|URL
 //
@@ -31,6 +36,7 @@
 #include "DeprecatedGlobalSettings.h"
 #include "Document.h"
 #include "Element.h"
+#include "HTMLElement.h"
 #include "FrameSelection.h"
 #include "HitTestResult.h"
 #include "HitTestRequest.h"
@@ -73,6 +79,23 @@
 #include "port/embed/MlxWebSocket.h"
 #include "SocketProvider.h"
 #include "port/embed/MlxPlatformStrategies.h"
+#include "port/embed/MlxSchemeHandler.h"
+#include <hb-version.h>
+#include <libxml/xmlversion.h>
+#include <skia/core/SkMilestone.h>
+#include <sqlite3.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
+#include <time.h>
+#include <unicode/uvernum.h>
+#include <zlib.h>
+#if __has_include("voyager/VoyagerBuild.h")
+#include "voyager/VoyagerBuild.h"
+#else
+#define VOYAGER_GIT_COMMIT ""
+#define VOYAGER_CODEGEN_EPOCH ""
+static const unsigned char voyagerIcon[] = { 0 };
+#endif
 #include <JavaScriptCore/InitializeThreading.h>
 #include <pal/SessionID.h>
 #include <skia/core/SkCanvas.h>
@@ -85,6 +108,7 @@
 #include <wtf/FileSystem.h>
 #include <wtf/HashMap.h>
 #include <wtf/MainThread.h>
+#include <wtf/NeverDestroyed.h>
 #include <wtf/RunLoop.h>
 #include <wtf/text/CString.h>
 
@@ -392,8 +416,20 @@ char* copied(const String& string)
 URL urlOf(const char* target)
 {
     String argument = String::fromUTF8(target);
+    // about: pages but WebCore's own (blank, srcdoc) are Voyager's: about:about
+    // is voyager://about, about:version voyager://version (as Chrome's
+    // about:version is chrome://version).
+    if (argument.startsWithIgnoringASCIICase("about:"_s)) {
+        String name = argument.substring(6);
+        if (!equalLettersIgnoringASCIICase(name, "blank"_s) && !equalLettersIgnoringASCIICase(name, "srcdoc"_s))
+            return URL { makeString("voyager://"_s, name) };
+        return URL { argument };
+    }
     if (argument.startsWith("file:"_s) || argument.startsWith("data:"_s) || argument.startsWith("http:"_s) || argument.startsWith("https:"_s))
         return URL { argument };
+    URL schemeURL { argument };
+    if (schemeURL.isValid() && MlxSchemeHandler::handles(schemeURL))
+        return schemeURL;
     String path = argument;
     char directory[4096];
     if (!argument.startsWith('/') && getcwd(directory, sizeof(directory)))
@@ -436,6 +472,21 @@ Tab* makeTab(Engine& engine)
         return nullptr;
     tab->frame->init();
     tab->page->setUseColorAppearance(engine.dark, false);
+    // With VOYAGER_TRACE, an internal page's text once it has loaded
+    // ("voyager: tab N text LINE", each line): what tools/check_voyager.sh
+    // reads of voyager://version.
+    if (engine.trace) {
+        tab->client->setLoadFinishedCallback([tab](bool) {
+            RefPtr document = tab->frame->document();
+            RefPtr body = document ? document->bodyOrFrameset() : nullptr;
+            if (!body || !document->url().protocolIs("voyager"_s))
+                return;
+            for (auto line : StringView(body->innerText()).split('\n')) {
+                if (!line.isEmpty())
+                    fprintf(stderr, "voyager: tab %d text %s\n", tab->id, line.utf8().data());
+            }
+        });
+    }
     engine.tabs.add(tab->id, WTF::move(owned));
     if (engine.trace)
         fprintf(stderr, "voyager: engine made tab %d\n", tab->id);
@@ -535,6 +586,7 @@ void engineResize(Engine* engine, int width, int height)
         return;
     engine->size = IntSize(width, height);
     for (auto& tab : engine->tabs.values()) {
+        tab->client->setViewSize(engine->size);
         if (RefPtr view = tab->frame->view())
             view->resize(engine->size);
         tab->dirty = true;
@@ -815,6 +867,104 @@ int engineForcedDark(Engine* engine, int id)
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// The internal pages (voyager:)
+
+// Voyager's version and window system, as its user agent has them.
+constexpr auto voyagerVersion = "0.1"_s;
+constexpr auto windowSystem = "Wayland"_s;
+
+// The facts voyager://version shows, label and value, in its order (the
+// about page takes "Voyager" and "Engine" of them).
+Vector<std::pair<CString, CString>>& facts()
+{
+    static NeverDestroyed<Vector<std::pair<CString, CString>>> facts;
+    return facts;
+}
+
+void addFact(ASCIILiteral label, const String& value)
+{
+    facts().append({ CString(label.characters()), value.utf8() });
+}
+
+// When the program's file was made (its link: the build's date), in UTC.
+String buildDate()
+{
+    struct stat status;
+    if (stat("/proc/self/exe", &status))
+        return "unknown"_s;
+    struct tm time;
+    gmtime_r(&status.st_mtime, &time);
+    char text[64];
+    strftime(text, sizeof(text), "%Y-%m-%d %H:%M UTC", &time);
+    return String::fromUTF8(text);
+}
+
+void gatherFacts(int argc, char** argv)
+{
+    String engineName = mlxEngine();
+    String engineVersion = engineName.startsWith("WebKit "_s) ? engineName.substring(7) : engineName;
+    addFact("Voyager"_s, voyagerVersion);
+    addFact("Engine"_s, engineName);
+    addFact("JavaScriptCore"_s, makeString(engineVersion, " (WebKit's, with the engine)"_s));
+    addFact("Skia"_s, makeString("milestone "_s, SK_MILESTONE));
+    addFact("mlx-unicode"_s, makeString("ICU "_s, unsafeSpan(U_ICU_VERSION), " API, in Mlx (std.unicode)"_s));
+    addFact("mlx-harfbuzz"_s, makeString("HarfBuzz "_s, unsafeSpan(HB_VERSION_STRING), " API, in Mlx (std.shaping)"_s));
+    addFact("mlx-zlib"_s, makeString("zlib "_s, unsafeSpan(ZLIB_VERSION), " API, in Mlx (std.flate)"_s));
+    addFact("mlx-sqlite3"_s, makeString("SQLite "_s, unsafeSpan(SQLITE_VERSION), " API, in Mlx (std.sql)"_s));
+    addFact("mlx-xml2"_s, makeString("libxml2 "_s, unsafeSpan(LIBXML_DOTTED_VERSION), " API, in Mlx (std.xml)"_s));
+    String epoch = String::fromUTF8(VOYAGER_CODEGEN_EPOCH);
+    addFact("Toolchain"_s, makeString("mlx4 (Mlx), mlx-cc (C and C++"_s, epoch.isEmpty() ? ""_s : ", code generation epoch "_s, epoch, "), mlx-ld; mlxlibc, mlxlibcpp"_s));
+    String commit = String::fromUTF8(VOYAGER_GIT_COMMIT);
+    addFact("Git commit"_s, commit.isEmpty() ? "not recorded by the build"_s : commit);
+    addFact("Built"_s, buildDate());
+    addFact("User agent"_s, mlxUserAgent("Voyager"_s, voyagerVersion, windowSystem));
+    struct utsname name;
+    if (!uname(&name)) {
+        addFact("OS"_s, makeString(unsafeSpan(name.sysname), ' ', unsafeSpan(name.release)));
+        addFact("Architecture"_s, String::fromUTF8(name.machine));
+    }
+    addFact("Window system"_s, makeString(windowSystem, " (std.ui.host)"_s));
+    StringBuilder line;
+    for (int i = 0; i < argc; ++i)
+        line.append(i ? " "_s : ""_s, String::fromUTF8(argv[i]));
+    addFact("Command line"_s, line.toString());
+    char executable[4096];
+    ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (length > 0)
+        executable[length] = 0;
+    addFact("Executable"_s, length > 0 ? String::fromUTF8(executable) : "unknown"_s);
+    const char* configHome = getenv("XDG_CONFIG_HOME");
+    const char* home = getenv("HOME");
+    String settings = configHome && *configHome ? String::fromUTF8(configHome) : makeString(String::fromUTF8(home ? home : ""), "/.config"_s);
+    addFact("Settings"_s, makeString(settings, "/mlx/appearance.conf (the desktop's colour scheme)"_s));
+    addFact("Profile"_s, "none: cookies and history are kept in memory only"_s);
+}
+
+extern "C" void voyager_page(const char* url, const char* const* facts, size_t count, void (*deliver)(void*, uint32_t, const uint8_t*, size_t), void* context);
+
+// A request of voyager:: the icon from the build, every other page made by
+// pages.mlx.
+void answerInternal(MlxSchemeTask& task)
+{
+    const URL& url = task.url();
+    if (equalLettersIgnoringASCIICase(url.host(), "about"_s) && url.path() == "/icon.png"_s) {
+        task.respond(200, "image/png"_s, String(), Vector<uint8_t>(std::span<const uint8_t>(voyagerIcon, sizeof(voyagerIcon))));
+        return;
+    }
+    Vector<const char*> pairs;
+    for (auto& fact : facts()) {
+        pairs.append(fact.first.data());
+        pairs.append(fact.second.data());
+    }
+    auto target = url.string().utf8();
+    voyager_page(target.data(), pairs.span().data(), facts().size(), [](void* context, uint32_t status, const uint8_t* bytes, size_t length) {
+        static_cast<MlxSchemeTask*>(context)->respond(status, "text/html"_s, "utf-8"_s, Vector<uint8_t>(std::span<const uint8_t>(bytes, length)));
+    }, &task);
+    if (!task.answered())
+        task.fail("No memory for the page"_s);
+}
+
 // (Its result is the tag of voyager.mlx's error union: 0 when the window
 // was closed, another value when there was none or its connection failed.)
 extern "C" long voyager_run(const VoyagerEngine*, int argc, char** arguments);
@@ -865,9 +1015,12 @@ int main(int argc, char** argv)
     // The user agent: WebKit's compatibility string, then Voyager's name
     // and version with the engine and the window system (std.ui's Linux
     // host shows windows on Wayland).
-    MlxFrameLoaderClient::setApplicationNameForUserAgent("Voyager"_s, "0.1"_s, "Wayland"_s);
+    MlxFrameLoaderClient::setApplicationNameForUserAgent("Voyager"_s, voyagerVersion, windowSystem);
     if (engine.trace)
-        fprintf(stderr, "voyager: user agent %s\n", mlxUserAgent("Voyager"_s, "0.1"_s, "Wayland"_s).utf8().data());
+        fprintf(stderr, "voyager: user agent %s\n", mlxUserAgent("Voyager"_s, voyagerVersion, windowSystem).utf8().data());
+    // The internal pages.
+    gatherFacts(argc, argv);
+    MlxSchemeHandler::registerScheme("voyager"_s, answerInternal);
     // The first tab, opened by the engine (the window shows it).
     Tab* first = openTab(engine, true);
     if (!first) {

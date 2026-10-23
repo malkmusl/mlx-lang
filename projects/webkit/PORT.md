@@ -515,6 +515,77 @@ neither, PlatformMlx defines the platform half itself:
 - Not soup, not curl: platform/network/soup is not compiled, nor
   `platform/soup`, `platform/network/glib`.
 
+### Internal pages
+
+WebCore itself knows only about:blank and about:srcdoc; a browser's own
+pages are the embedder's (Epiphany registers `ephy-about:` through
+WebKit's URI scheme API, Chrome has chrome://). The port's equivalent is
+`embed/MlxSchemeHandler` (WebKit2's WebURLSchemeHandler in small): the
+embedder registers a scheme and a callback, and every load of a URL of it
+(the main resource, subresources, fetch and XHR, synchronous ones too)
+goes to the callback instead of the network, which answers with a status,
+a MIME type, a charset and the bytes, at once or later on the main
+thread (`MlxSchemeTask::respond`, `fail`). The loader strategy
+(MlxPlatformStrategies.cpp) routes the URLs of registered schemes there.
+
+The scheme is registered with WebCore's `LegacySchemeRegistry` as:
+
+- **display-isolated**: `SecurityOrigin::canDisplay` lets only documents
+  of the same scheme display it, so an http:, https:, file: or data:
+  page can neither navigate to it (a link, a form, location: refused in
+  `FrameLoader::loadFrameRequest`), frame it, load it as an image, a
+  script or a style sheet (`CachedResourceLoader::canRequest`,
+  `ResourceLoader::init`), fetch it or XHR it, nor redirect there
+  (`DocumentLoader::willSendRequest`); a synchronous XHR is checked by the
+  strategy itself. A load the embedder starts (`FrameLoader::load`: the
+  address bar) belongs to no page and is not checked;
+- **secure** (its pages are secure contexts);
+- **handled by a scheme handler**, as WebKit2's custom schemes are: its
+  URLs get a tuple origin (scheme, host, port), not an opaque one, so a
+  page of it fetches its own URLs same-origin;
+- not **local**: its pages get no access to file: URLs.
+
+Voyager registers `voyager:` (projects/voyager/engine.cpp): its pages
+are made by projects/voyager/pages.mlx (`voyager_page` of
+libvoyager.so) from the facts the engine gathers, in std.ui.theme's
+colours for light and dark through `prefers-color-scheme` (a design of
+their own, so forced dark mode leaves them alone):
+
+- `voyager://`: the index of the pages;
+- `voyager://about` ("About Voyager"): the icon
+  (`voyager://about/icon.png`, projects/voyager/org.mlx.voyager.png put
+  into the program by the build), Voyager's version, the engine's
+  (UserAgentMlx.cpp's `ENGINE`, `mlxEngine()`), a line on what it is and
+  a link to the details;
+- `voyager://version` ("Voyager Version", as chrome://version): Voyager,
+  the engine and JavaScriptCore, Skia's milestone, the Mlx libraries
+  WebKit sees as ICU, HarfBuzz, zlib, SQLite and libxml2 with the API
+  versions their headers declare, std.unicode's Unicode and CLDR data,
+  the toolchain with mlx-cc's code generation epoch, the git commit
+  (both read at build time by projects/webkit/build.mlx into
+  `voyager/VoyagerBuild.h`, the commit from .git without running git),
+  the build's date (the program file's), the whole user agent, the
+  kernel and the architecture (uname), the window system, the command
+  line, the executable, the settings file;
+- anything else: a 404 page ("Not Found").
+
+`about:` URLs typed in the address bar (or given on the command line)
+other than about:blank and about:srcdoc are Voyager's pages, as Chrome
+maps about:version to chrome://version: about:about is voyager://about,
+about:version voyager://version.
+
+Checks: tools/check_webkit_mlx_network.sh registers a test scheme
+(`webcore-dump --scheme test`, which lists every URL the scheme was
+asked for) and has an http page try fetch, XHR (asynchronous and
+synchronous), an image, a script, a style sheet, an iframe, a redirect
+(the test server's /to-scheme), a link, a form and location on it: all
+refused, the scheme asked nothing; the scheme's own page loads and
+fetches its own URLs, a 404 among them. tools/check_voyager.sh opens
+voyager://about, about:version (the versions and the user agent in its
+text, which VOYAGER_TRACE writes for internal pages), about:about,
+voyager://nothing and voyager://, and voyager://about on a dark desktop
+(its own dark design, not forced dark).
+
 ### Storage
 
 WebCore's `SQLiteDatabase` and `SQLiteStatement` are written on

@@ -95,6 +95,11 @@ String mlxUserAgent(const String& name, const String& version, const String& win
     return result;
 }
 
+String mlxEngine()
+{
+    return ENGINE;
+}
+
 String standardUserAgent(const String& applicationName, const String& applicationVersion)
 {
     return mlxUserAgent(applicationName, applicationVersion, String());

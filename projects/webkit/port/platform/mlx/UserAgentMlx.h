@@ -13,4 +13,8 @@ namespace WebCore {
 // without windows).
 String mlxUserAgent(const String& name, const String& version, const String& windowSystem);
 
+// The engine and its version as the user agent names it ("WebKit 2.54.1"),
+// for an embedder's own pages (Voyager's voyager://about).
+String mlxEngine();
+
 } // namespace WebCore
