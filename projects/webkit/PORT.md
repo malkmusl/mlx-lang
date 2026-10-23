@@ -175,6 +175,31 @@ Four ways to choose without patching, in this order of preference:
   this machine reaches it; no check depends on the network. M6 found
   mlx-cc's generic lambda converted to a function pointer (the closure's
   address taken: epoch 7).
+- **M7, part 1, done** (storage and the HTTP cache): a profile
+  (embed/MlxProfile: Voyager's ~/.local/share/voyager and
+  ~/.cache/voyager, `--profile DIR`; webcore-dump's a temporary one unless
+  `--profile` is given), localStorage persisted per origin in SQLite and
+  sessionStorage per tab (embed/MlxStorage), WebKit's IDB server in the
+  process over SQLiteIDBBackingStore (embed/MlxIndexedDB), the HTTP cache
+  on disk (port/mlx/httpcache.mlx) and the cookie jar kept in SQLite
+  (port/mlx/cookies.mlx): "Storage" and "Network" below. Frames are made
+  now (MlxFrameLoaderClient::createFrame, as WebKit2's
+  WebFrame::createSubframe), window.open's page has its opener and a copy
+  of its session storage, and webcore-dump runs WebKit's dumpAsText tests
+  (`--test`). Checks: tools/check_webkit_mlx_storage.sh (62 of 62 layout
+  tests of storage/domstorage and storage/indexeddb),
+  check_webkit_mlx_network.sh (24 of 24: the cache's max-age, ETag and
+  no-store across two runs of a profile, cookies kept with their expiry),
+  check_voyager.sh (localStorage across a restart, the profile on
+  voyager://version). M7 found in mlx-cc (epochs 11 and 12, each with a
+  test in compiler/cc/tests/cpp): a scoped enum converted implicitly to
+  an integer in overload ranking (WTF::Persistence::Encoder wrote an
+  enum's tag as one byte where the decoder reads eight: no IndexedDB key
+  path could be read back; scopedenumoverload), and a bit-field of an
+  `enum class : bool` read back sign-extended (ScriptElement's
+  ParserInserted: no external script blocked the parser, so a page's
+  inline scripts ran before the scripts they use; boolenumbitfield).
+  Part 2 (WebCrypto, downloads, uploads) is to come.
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -514,6 +539,29 @@ neither, PlatformMlx defines the platform half itself:
   are WebCore's (DataURLDecoder), `file:` the port's (std.fs), first.
 - Not soup, not curl: platform/network/soup is not compiled, nor
   `platform/soup`, `platform/network/glib`.
+- **The HTTP cache on disk** (M7; port/mlx/httpcache.mlx, on the network
+  thread, behind WebCore's memory cache): a private cache as RFC 9111
+  has one, in the profile's cache directory (http/). GET responses of a
+  cacheable status with a lifetime (max-age, Expires) or a validator
+  (ETag, Last-Modified) are stored, never with `no-store` (the request's
+  or the response's) or `Vary: *`, and a response to a request with
+  credentials only when its Cache-Control allows a shared one; an entry
+  is the head, the body and the request's and response's times, under a
+  key of the method, the URL and the request's values of the headers the
+  response's Vary names (each URL's Vary in a file beside its entries).
+  A request (its cache mode from WebCore's ResourceRequestCachePolicy:
+  MlxNetwork's `cacheModeFor`) is answered from a fresh entry with no
+  request sent (RFC 9111's age against the lifetime: max-age, else
+  Expires less Date, else a tenth of the time since Last-Modified, as
+  WebCore's heuristic; never with `no-cache`, the request's `no-cache`,
+  `max-age=0` or `Pragma: no-cache`), a stale one is revalidated
+  (If-None-Match, If-Modified-Since) and a 304 updates its head and
+  times, anything else replaces it; WebCore's own conditional requests
+  pass through. An unsafe method that succeeds takes the URL's entries
+  away. The directory stays under 64 MiB (`MLXWEB_HTTP_CACHE_LIMIT`
+  bytes): the entries used longest ago go first (the files' modification
+  times, read into the index at start). `MLX_NETWORK_TRACE` says which
+  answers came from the cache.
 
 ### Internal pages
 
@@ -593,7 +641,81 @@ SQLite's C API (`sqlite3*` members in SQLiteDatabase.h, which every
 storage file includes). **mlx-sqlite3** (compiler/libc/sqlite3, over
 std.sql) stays the port's SQLite: a minimal ABI of 59 functions WebKit
 calls, implemented in Mlx; replacing the class means replacing a header
-WebKit shares. IndexedDB, local storage and the cache come at M7.
+WebKit shares.
+
+What a browser keeps is in a **profile** (embed/MlxProfile, M7), whose
+providers every page of the process shares (`MlxProfile::configure` of
+a PageConfiguration): a data directory (Voyager's
+`$XDG_DATA_HOME/voyager`, ~/.local/share/voyager) and a cache directory
+(`$XDG_CACHE_HOME/voyager`, ~/.cache/voyager). `voyager --profile DIR`
+and `webcore-dump --profile DIR` take DIR for both (the cache in
+DIR/cache); webcore-dump without it makes a temporary profile and removes
+it at the end, so the checks stay hermetic. voyager://version shows the
+two directories.
+
+- **Web storage** (embed/MlxStorage, WebKit2's WebStorageNamespaceProvider
+  and the network process's storage managers in one):
+  `MlxStorageNamespaceProvider`. localStorage is one area an origin,
+  shared by the process's pages and frames, read from its database the
+  first time a script uses it and written back a second after a change
+  and when the profile is closed: LocalStorage/<the origin's database
+  identifier>.localstorage, with WebKit's `ItemTable` (WebKit2's
+  SQLiteStorageArea: values as UTF-16 blobs). sessionStorage is a
+  namespace a page (a tab) and top-level origin, in memory, copied into a
+  page window.open makes. Quotas are WebKit's: 5 MB an origin (WebCore's
+  localStorageDatabaseQuotaInBytes) and the page's SessionStorageQuota.
+  Each change fires `storage` at the origin's other windows
+  (StorageEventDispatcher): every page's for local storage (other tabs),
+  the same page's for session storage. WebCore's settings have both off
+  (`LocalStorageEnabled`, `SessionStorageEnabled`): the embedders turn
+  them on.
+- **IndexedDB** (embed/MlxIndexedDB): WebKit's IDB server in the process,
+  as WebKitLegacy's InProcessIDBServer had it (that file is not in the
+  tarball; the port's is its equivalent). `IDBServer::IDBServer` with
+  its UniqueIDBDatabases and SQLiteIDBBackingStore over SQLiteDatabase
+  (on mlx-sqlite3) runs on a WorkQueue of its own; the pages'
+  `IDBConnectionToServer` (the PageConfiguration's DatabaseProvider)
+  sends each call there with its data copied for that thread
+  (`crossThreadCopy`), and the server's IDBConnectionToClient sends each
+  answer back to the main thread the same way (WebKit2 sends both
+  through IPC). The databases are in IndexedDB/ (IDBServer's v1/ layout);
+  without a profile, in memory (MemoryIDBBackingStore). No quota is
+  counted yet (the space requester grants every request).
+- **Cookies**: http.mlx's jar (std.http.cookiejar) is kept in
+  cookies.sqlite through std.sql's engine (port/mlx/cookies.mlx), as
+  libsoup's SoupCookieJarDB keeps one: its `moz_cookies` table, read at
+  start (the expired rows dropped), each change of the jar written as it
+  happens (the jar's change callback); session cookies are not kept.
+- **The HTTP cache** is in "Network".
+
+Checks: tools/check_webkit_mlx_storage.sh runs WebKit's layout tests of
+storage/domstorage and storage/indexeddb that tests/layout/storage.txt
+lists (copied with their resources and expectations into
+tests/layout/LayoutTests, as the layout tests are) with `webcore-dump
+--test`, as WebKitTestRunner runs them: a `testRunner` in every frame's
+window (dumpAsText, dumpChildFramesAsText, waitUntilDone, notifyDone;
+any other method does nothing), made by a script the embedding puts in
+when the window object is made (MlxFrameLoaderClient's window-cleared
+callback, where WebKitTestRunner's injected bundle puts its own), the
+console's messages, alerts and window.open (a page of its own); the text
+is compared with the test's -expected.txt as the layout check compares
+trees, in US/Pacific's time zone as run-webkit-tests has it: 62 of 62
+pass (21 of storage/domstorage: clear, quota, complex keys and values,
+the localstorage and sessionstorage tests with window.open, storage
+events in frames; 41 of storage/indexeddb: basics, object stores,
+indexes, cursors, key ranges, key generators, transactions, Mozilla's
+and the modern ones). Known failures, left out of the list:
+storage/indexeddb/keypath-basics.html aborts in JavaScriptCore's
+collector (a RELEASE_ASSERT of WTF::ConcurrentPtrHashSet::addImpl, its
+table found full, adding IDBTransaction's object stores as opaque roots:
+IDBTransaction::visitReferencedObjectStoresInGCThread; the same with one
+marker), to be found in mlx-cc or mlxlibcpp; the tests that need
+`internals` (storage-close-database-on-idle and the like) or a second
+process are not taken.
+tools/check_voyager.sh restarts Voyager on a page that counts its visits
+in localStorage (the count goes on, sessionStorage's note is gone), and
+tools/check_webkit_mlx_network.sh runs pages twice in one profile for the
+HTTP cache and the cookies (below).
 
 ### XML
 
@@ -686,7 +808,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M4 | Painting into a buffer | the same program paints the view into a Skia raster surface and writes a PNG (std.png); images decoded by the port's decoders | pixel tests: reference PNGs of simple pages (Ahem text, boxes, borders, gradients, images) within a small tolerance |
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
-| M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process |
+| M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh (part 1 done: storage, IndexedDB, the HTTP cache, cookies kept; part 2: WebCrypto, downloads, uploads) |
 | M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
@@ -849,3 +971,17 @@ What M2 found, and how the port meets it without a patch:
   unified unit are merged silently (MlxNetwork's `tracing` renamed), and
   a `std::span<const char>` was taken as a `const char*`
   (`String::fromLatin1(span)` compiled; the loader parses bytes itself).
+- **What M7's first part leaves.** IndexedDB counts no quota (the IDB
+  server's space requester grants every request) and its server is never
+  shut down, only drained at exit (`MlxProfile::close`); keypath-basics
+  aborts in the collector (above, "Storage"). Local storage is written a
+  second after a change and at a clean exit: a process killed in that
+  second loses it. The HTTP cache keeps one response a key (no partial
+  content, no Range requests, no stale-while-revalidate, no serving a
+  stale entry when the network fails) and has no index file (the
+  directory is listed at start, which a cache of many thousand entries
+  would feel); a request's cache mode is the one WebCore gives, Voyager
+  has no way yet to clear the cache, the cookies or the storage, nor a
+  private (ephemeral) profile, though an ephemeral session already keeps
+  local storage in memory. Storage events reach other pages of the
+  process only (one process: Voyager's tabs).
