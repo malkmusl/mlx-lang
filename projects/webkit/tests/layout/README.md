@@ -27,9 +27,11 @@ text, taken from the same revision; tools/check_webkit_mlx_storage.sh
 runs them with `webcore-dump --test` (WebKitTestRunner's testRunner,
 dumpAsText) and compares the text.
 
-`crypto.txt` lists tests of `crypto/subtle` and `crypto/` (M7's
-WebCrypto and getRandomValues), with `crypto/resources/common.js`,
-`crypto/subtle/resources/` and their expected text (`platform/glib/`'s
+`crypto.txt` lists tests of `crypto/subtle`, `crypto/` and
+`crypto/workers` (M7's WebCrypto and getRandomValues, in pages and in
+workers), with `crypto/resources/common.js`, `crypto/subtle/resources/`,
+`crypto/workers/resources/`, `crypto/workers/subtle/resources/` and their
+expected text (`platform/glib/`'s
 where WebKit's GLib ports have their own), taken from the same
 revision; tools/check_webkit_mlx_crypto.sh runs them as the storage
 check runs its own.

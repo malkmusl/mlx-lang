@@ -40,7 +40,10 @@
 #include "CryptoKeyRSA.h"
 #include "CryptoKeyRSAComponents.h"
 #include "ExceptionOr.h"
+#include "ScriptExecutionContext.h"
 #include <JavaScriptCore/TypedArrayInlines.h>
+#include <wtf/NeverDestroyed.h>
+#include <wtf/WorkQueue.h>
 
 #include "crypto/algorithms/CryptoAlgorithmRSA_PSS.cpp"
 
@@ -71,18 +74,32 @@ void CryptoAlgorithmRegistry::platformRegisterAlgorithms()
 }
 
 enum RSANumber : size_t { Modulus, Exponent, PrivateExponent, FirstPrime, SecondPrime, FirstExponent, SecondExponent, Coefficient, NumberCount };
+// Each prime after the second (a multi-prime key, RFC 8017 3.2): its
+// r, d and t after the eight.
+constexpr size_t OtherPrimeNumbers = 3;
 
-// The platform key of NUMBERS (n and e, or all eight; the primes and the
-// CRT's values may be empty), with the Mlx side's key made of them.
+static bool isPrivate(const Vector<Vector<uint8_t>>& numbers)
+{
+    return numbers.size() >= NumberCount && !((numbers.size() - NumberCount) % OtherPrimeNumbers);
+}
+
+// The platform key of NUMBERS (n and e, or the eight and the others'
+// three each; the primes and the CRT's values may be empty), with the
+// Mlx side's key made of them (a multi-prime one works with d alone, its
+// primes' product checked).
 static PlatformRSAKeyContainer makeKey(Vector<Vector<uint8_t>>&& numbers)
 {
+    if (numbers.size() != 2 && !isPrivate(numbers))
+        return nullptr;
     MlxCrypto::Parts parts;
     parts.add(numbers[Modulus].span());
     parts.add(numbers[Exponent].span());
-    if (numbers.size() == NumberCount) {
+    if (isPrivate(numbers)) {
         parts.add(numbers[PrivateExponent].span());
         parts.add(numbers[FirstPrime].span());
         parts.add(numbers[SecondPrime].span());
+        for (size_t index = NumberCount; index < numbers.size(); index += OtherPrimeNumbers)
+            parts.add(numbers[index].span());
     }
     auto rsa = mlxweb_crypto_rsa_key(parts.handle());
     if (!rsa)
@@ -95,7 +112,7 @@ static PlatformRSAKeyContainer makeKey(Vector<Vector<uint8_t>>&& numbers)
 
 static CryptoKeyType typeOf(const Vector<Vector<uint8_t>>& numbers)
 {
-    return numbers.size() == NumberCount ? CryptoKeyType::Private : CryptoKeyType::Public;
+    return isPrivate(numbers) ? CryptoKeyType::Private : CryptoKeyType::Public;
 }
 
 CryptoKeyRSA::CryptoKeyRSA(CryptoAlgorithmIdentifier identifier, CryptoAlgorithmIdentifier hash, bool hasHash, CryptoKeyType type, PlatformRSAKeyContainer&& platformKey, bool extractable, CryptoKeyUsageBitmap usage)
@@ -108,8 +125,6 @@ CryptoKeyRSA::CryptoKeyRSA(CryptoAlgorithmIdentifier identifier, CryptoAlgorithm
 
 RefPtr<CryptoKeyRSA> CryptoKeyRSA::create(CryptoAlgorithmIdentifier identifier, CryptoAlgorithmIdentifier hash, bool hasHash, const CryptoKeyRSAComponents& keyData, bool extractable, CryptoKeyUsageBitmap usages)
 {
-    if (keyData.type() == CryptoKeyRSAComponents::Type::Private && !keyData.otherPrimeInfos().isEmpty())
-        return nullptr;
     Vector<Vector<uint8_t>> numbers;
     numbers.append(keyData.modulus());
     numbers.append(keyData.exponent());
@@ -120,6 +135,13 @@ RefPtr<CryptoKeyRSA> CryptoKeyRSA::create(CryptoAlgorithmIdentifier identifier, 
         numbers.append(keyData.firstPrimeInfo().factorCRTExponent);
         numbers.append(keyData.secondPrimeInfo().factorCRTExponent);
         numbers.append(keyData.secondPrimeInfo().factorCRTCoefficient);
+        for (auto& info : keyData.otherPrimeInfos()) {
+            if (info.primeFactor.isEmpty())
+                return nullptr;
+            numbers.append(info.primeFactor);
+            numbers.append(info.factorCRTExponent);
+            numbers.append(info.factorCRTCoefficient);
+        }
     }
     auto type = typeOf(numbers);
     auto key = makeKey(WTF::move(numbers));
@@ -141,18 +163,11 @@ size_t CryptoKeyRSA::keySizeInBits() const
     return mlxweb_crypto_rsa_bits(m_platformKey->rsa);
 }
 
-void CryptoKeyRSA::generatePair(CryptoAlgorithmIdentifier algorithm, CryptoAlgorithmIdentifier hash, bool hasHash, unsigned modulusLength, const Vector<uint8_t>& publicExponent, bool extractable, CryptoKeyUsageBitmap usages, KeyPairCallback&& callback, VoidCallback&& failureCallback, ScriptExecutionContext*)
+// The keys of a pair the Mlx side made (parts n, e, d, p, q, dp, dq, qi).
+static std::optional<CryptoKeyPair> pairOf(MlxCrypto::Parts& made, CryptoAlgorithmIdentifier algorithm, CryptoAlgorithmIdentifier hash, bool hasHash, bool extractable, CryptoKeyUsageBitmap usages)
 {
-    // (The exponent's leading zeroes off: [0, 1, 0, 1] is 65537.)
-    size_t start = 0;
-    while (start < publicExponent.size() && !publicExponent[start])
-        ++start;
-    auto exponent = publicExponent.span().subspan(start);
-    MlxCrypto::Parts made(mlxweb_crypto_rsa_generate(modulusLength, exponent.data(), exponent.size()));
-    if (!made || made.size() != NumberCount) {
-        failureCallback();
-        return;
-    }
+    if (!made || made.size() != NumberCount)
+        return std::nullopt;
     Vector<Vector<uint8_t>> publicNumbers;
     publicNumbers.append(made.vectorAt(Modulus));
     publicNumbers.append(made.vectorAt(Exponent));
@@ -161,13 +176,69 @@ void CryptoKeyRSA::generatePair(CryptoAlgorithmIdentifier algorithm, CryptoAlgor
         privateNumbers.append(made.vectorAt(index));
     auto publicPlatformKey = makeKey(WTF::move(publicNumbers));
     auto privatePlatformKey = makeKey(WTF::move(privateNumbers));
-    if (!publicPlatformKey || !privatePlatformKey) {
-        failureCallback();
-        return;
-    }
+    if (!publicPlatformKey || !privatePlatformKey)
+        return std::nullopt;
     auto publicKey = CryptoKeyRSA::create(algorithm, hash, hasHash, CryptoKeyType::Public, WTF::move(publicPlatformKey), true, usages);
     auto privateKey = CryptoKeyRSA::create(algorithm, hash, hasHash, CryptoKeyType::Private, WTF::move(privatePlatformKey), extractable, usages);
-    callback(CryptoKeyPair { WTF::move(publicKey), WTF::move(privateKey) });
+    return CryptoKeyPair { WTF::move(publicKey), WTF::move(privateKey) };
+}
+
+// A pair's callbacks, kept for the context's thread while the numbers
+// are made.
+struct KeyPairCallbacks {
+    WTF_DEPRECATED_MAKE_STRUCT_FAST_ALLOCATED(KeyPairCallbacks);
+    CryptoKeyRSA::KeyPairCallback success;
+    CryptoKeyRSA::VoidCallback failure;
+};
+
+// The queue keys are made on: the primes of a 4096-bit key take seconds,
+// of a 16384-bit one minutes, which the page's thread does not wait for.
+static WorkQueue& keyGenerationQueue()
+{
+    static NeverDestroyed<Ref<WorkQueue>> queue(WorkQueue::create("org.mlx.WebKit.RSAKeyGeneration"_s));
+    return queue.get();
+}
+
+// The numbers are made on keyGenerationQueue and the keys from them on
+// the context's thread, where the callbacks are called (as WebKit's
+// Cocoa port does: a pair made on a global queue, handed back with
+// ScriptExecutionContext::postTaskTo). Without a context, made at once.
+void CryptoKeyRSA::generatePair(CryptoAlgorithmIdentifier algorithm, CryptoAlgorithmIdentifier hash, bool hasHash, unsigned modulusLength, const Vector<uint8_t>& publicExponent, bool extractable, CryptoKeyUsageBitmap usages, KeyPairCallback&& callback, VoidCallback&& failureCallback, ScriptExecutionContext* context)
+{
+    // (The exponent's leading zeroes off: [0, 1, 0, 1] is 65537.)
+    size_t start = 0;
+    while (start < publicExponent.size() && !publicExponent[start])
+        ++start;
+    Vector<uint8_t> exponent(publicExponent.span().subspan(start));
+    if (!context) {
+        MlxCrypto::Parts made(mlxweb_crypto_rsa_generate(modulusLength, exponent.span().data(), exponent.size()));
+        auto pair = pairOf(made, algorithm, hash, hasHash, extractable, usages);
+        if (!pair) {
+            failureCallback();
+            return;
+        }
+        callback(WTF::move(*pair));
+        return;
+    }
+    // (The callbacks hold the page's objects: they never leave its
+    // thread. Should the context be gone when the numbers are, they are
+    // left, as Cocoa's are, not destroyed on the queue.)
+    auto callbacks = makeUnique<KeyPairCallbacks>(KeyPairCallbacks { WTF::move(callback), WTF::move(failureCallback) });
+    keyGenerationQueue().dispatch([identifier = context->identifier(), algorithm, hash, hasHash, modulusLength, exponent = WTF::move(exponent), extractable, usages, callbacks = callbacks.release()]() mutable {
+        uintptr_t made = mlxweb_crypto_rsa_generate(modulusLength, exponent.span().data(), exponent.size());
+        bool posted = ScriptExecutionContext::postTaskTo(identifier, [made, algorithm, hash, hasHash, extractable, usages, callbacks](ScriptExecutionContext&) {
+            std::unique_ptr<KeyPairCallbacks> owned(callbacks);
+            MlxCrypto::Parts parts(made);
+            auto pair = pairOf(parts, algorithm, hash, hasHash, extractable, usages);
+            if (!pair) {
+                owned->failure();
+                return;
+            }
+            owned->success(WTF::move(*pair));
+        });
+        if (!posted)
+            MlxCrypto::Parts released(made);
+    });
 }
 
 RefPtr<CryptoKeyRSA> CryptoKeyRSA::importSpki(CryptoAlgorithmIdentifier identifier, std::optional<CryptoAlgorithmIdentifier> hash, Vector<uint8_t>&& keyData, bool extractable, CryptoKeyUsageBitmap usages)
@@ -187,11 +258,11 @@ RefPtr<CryptoKeyRSA> CryptoKeyRSA::importSpki(CryptoAlgorithmIdentifier identifi
 RefPtr<CryptoKeyRSA> CryptoKeyRSA::importPkcs8(CryptoAlgorithmIdentifier identifier, std::optional<CryptoAlgorithmIdentifier> hash, Vector<uint8_t>&& keyData, bool extractable, CryptoKeyUsageBitmap usages)
 {
     MlxCrypto::Parts parts(mlxweb_crypto_pkcs8_read(keyData.span().data(), keyData.size()));
-    if (!parts || parts.size() != 1 + NumberCount || parts.at(0)[0] != MLXWEB_CRYPTO_KIND_RSA)
+    if (!parts || parts.size() < 1 + NumberCount || (parts.size() - 1 - NumberCount) % OtherPrimeNumbers || parts.at(0)[0] != MLXWEB_CRYPTO_KIND_RSA)
         return nullptr;
     Vector<Vector<uint8_t>> numbers;
-    for (size_t index = 0; index < NumberCount; ++index)
-        numbers.append(parts.vectorAt(1 + index));
+    for (size_t index = 1; index < parts.size(); ++index)
+        numbers.append(parts.vectorAt(index));
     auto key = makeKey(WTF::move(numbers));
     if (!key)
         return nullptr;
@@ -263,7 +334,15 @@ std::unique_ptr<CryptoKeyRSAComponents> CryptoKeyRSA::exportData() const
     secondPrimeInfo.primeFactor = numbers[SecondPrime];
     secondPrimeInfo.factorCRTExponent = numbers[SecondExponent];
     secondPrimeInfo.factorCRTCoefficient = numbers[Coefficient];
-    return CryptoKeyRSAComponents::createPrivateWithAdditionalData(numbers[Modulus], numbers[Exponent], numbers[PrivateExponent], WTF::move(firstPrimeInfo), WTF::move(secondPrimeInfo), Vector<CryptoKeyRSAComponents::PrimeInfo> { });
+    Vector<CryptoKeyRSAComponents::PrimeInfo> otherPrimeInfos;
+    for (size_t index = NumberCount; index + OtherPrimeNumbers <= numbers.size(); index += OtherPrimeNumbers) {
+        CryptoKeyRSAComponents::PrimeInfo info;
+        info.primeFactor = numbers[index];
+        info.factorCRTExponent = numbers[index + 1];
+        info.factorCRTCoefficient = numbers[index + 2];
+        otherPrimeInfos.append(WTF::move(info));
+    }
+    return CryptoKeyRSAComponents::createPrivateWithAdditionalData(numbers[Modulus], numbers[Exponent], numbers[PrivateExponent], WTF::move(firstPrimeInfo), WTF::move(secondPrimeInfo), WTF::move(otherPrimeInfos));
 }
 
 // Signatures and OAEP, with the key's hash.
