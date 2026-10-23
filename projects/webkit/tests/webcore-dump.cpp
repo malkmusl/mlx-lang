@@ -3,7 +3,7 @@
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
 // painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME]
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test]
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -36,6 +36,17 @@
 // what it got; any other URL of it is a 404 page. With --text, every URL
 // the scheme was asked for is listed after the text ("scheme NAME: N
 // requests", then each), which shows that a web page could not reach it.
+//
+// --profile DIR keeps what a browser keeps between runs in DIR (the
+// port's MlxProfile: local storage, IndexedDB and the cookies in DIR, the
+// HTTP cache in DIR/cache); a second run with the same DIR finds them.
+// Without it the profile is a temporary directory, removed at the end, so
+// that each run starts from nothing (the checks stay hermetic).
+//
+// --test runs the page as WebKitTestRunner runs a layout test of its own
+// (the testRunner object below: dumpAsText, waitUntilDone, notifyDone),
+// and prints what it prints: the console's messages, then the text of the
+// page (dumpAsText) or its render tree.
 //
 // --wait-title TITLE waits, after the load, until the page's title is
 // TITLE (what its scripts set when done: a WebSocket's messages, timers).
@@ -98,6 +109,11 @@
 #include "SocketProvider.h"
 #include "port/embed/MlxPlatformStrategies.h"
 #include "port/embed/MlxSchemeHandler.h"
+#include "port/embed/MlxProfile.h"
+#include "DOMWrapperWorld.h"
+#include "FrameTree.h"
+#include "ScriptController.h"
+#include <JavaScriptCore/JSCJSValueInlines.h>
 #include <JavaScriptCore/InitializeThreading.h>
 #include <memory>
 #include <skia/core/SkCanvas.h>
@@ -141,7 +157,7 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
@@ -214,6 +230,212 @@ static long differingPixels(const char* path, IntSize size, const uint32_t* pixe
     return differing;
 }
 
+// --test: what WebKitTestRunner gives a layout test of its own
+// (LayoutTests' dumpAsText tests: js-test.js's, the storage tests): a
+// `testRunner` in every frame's window, made by a script of ours when the
+// window object is made (MlxFrameLoaderClient's window-cleared callback,
+// where WebKitTestRunner's injected bundle puts its own), its state kept
+// here across the main frame's navigations: dumpAsText (the text, not the
+// render tree), dumpChildFramesAsText, waitUntilDone and notifyDone (the
+// dump waits for notifyDone); any other method of it does nothing. The
+// console's messages ("CONSOLE MESSAGE: "), alerts, confirms and prompts
+// are printed before the dump, as the test runner prints them.
+enum TestFlag : int {
+    TestDumpAsText = 1,
+    TestWaitUntilDone = 2,
+    TestDone = 4,
+    TestDumpChildFrames = 8,
+};
+
+static bool testMode;
+static int testFlags;
+static StringBuilder testOutput;
+
+static String testRunnerSource()
+{
+    return makeString(
+        "(function () {"
+        "  try { if (window.top !== window && window.top.testRunner && window.top.testRunner.__mlx) { window.testRunner = window.top.testRunner; return; } } catch (e) { }"
+        "  var flags = "_s, testFlags, ";"
+        "  var runner = { __mlx: true,"
+        "    __flags: function () { return flags; },"
+        "    dumpAsText: function () { flags |= 1; },"
+        "    dumpChildFramesAsText: function () { flags |= 9; },"
+        "    waitUntilDone: function () { flags |= 2; },"
+        "    notifyDone: function () { flags |= 4; } };"
+        "  window.testRunner = new Proxy(runner, { get: function (target, name) {"
+        "    if (name in target || typeof name === 'symbol') return target[name];"
+        "    return function () { return undefined; }; } });"
+        "})();"_s);
+}
+
+// The flags of the main frame's testRunner (what its scripts asked so far).
+static int pollTestFlags(LocalFrame& frame)
+{
+    auto value = frame.script().executeScriptIgnoringException("window.testRunner && window.testRunner.__mlx ? window.testRunner.__flags() : -1"_s, JSC::SourceTaintedOrigin::Untainted);
+    if (value.isInt32() && value.asInt32() >= 0)
+        testFlags |= value.asInt32();
+    return testFlags;
+}
+
+// A message's file: URLs as their last component, as the test runner
+// prints them (the expected text has no paths of the machine it ran on).
+static String withoutFileURLs(const String& message)
+{
+    StringBuilder result;
+    StringView rest = message;
+    while (true) {
+        size_t start = rest.find("file://"_s);
+        if (start == notFound) {
+            result.append(rest);
+            break;
+        }
+        result.append(rest.left(start));
+        size_t end = start + 7;
+        while (end < rest.length() && !isASCIIWhitespace(rest[end]) && rest[end] != '\'' && rest[end] != '"' && rest[end] != ')' && rest[end] != ':')
+            ++end;
+        auto url = rest.substring(start, end - start);
+        size_t slash = url.reverseFind('/');
+        result.append(slash == notFound ? url : url.substring(slash + 1));
+        rest = rest.substring(end);
+    }
+    return result.toString();
+}
+
+static Vector<Ref<Page>>& openedPages()
+{
+    static NeverDestroyed<Vector<Ref<Page>>> pages;
+    return pages;
+}
+
+static RefPtr<Page> makePage(IntSize, MlxFrameLoaderClient** client, LocalFrame* opener = nullptr);
+
+// The chrome client of --test's pages: the console and the dialogs
+// printed, window.open given a page of its own.
+class TestChromeClient final : public EmptyChromeClient {
+public:
+    explicit TestChromeClient(IntSize size)
+        : m_size(size)
+    {
+    }
+
+private:
+    void addMessageToConsole(JSC::MessageSource, JSC::MessageLevel, const String& message, unsigned, unsigned, const String&) final
+    {
+        testOutput.append("CONSOLE MESSAGE: "_s, withoutFileURLs(message), '\n');
+    }
+    void runJavaScriptAlert(LocalFrame&, const String& message) final
+    {
+        testOutput.append("ALERT: "_s, message, '\n');
+    }
+    bool runJavaScriptConfirm(LocalFrame&, const String& message) final
+    {
+        testOutput.append("CONFIRM: "_s, message, '\n');
+        return true;
+    }
+    bool runJavaScriptPrompt(LocalFrame&, const String& message, const String& defaultValue, String& result) final
+    {
+        testOutput.append("PROMPT: "_s, message, ", default text: "_s, defaultValue, '\n');
+        result = defaultValue;
+        return true;
+    }
+    RefPtr<Page> createWindow(LocalFrame& opener, const String&, const WindowFeatures&, const NavigationAction&) final
+    {
+        MlxFrameLoaderClient* client = nullptr;
+        RefPtr page = makePage(m_size, &client, &opener);
+        if (!page)
+            return nullptr;
+        if (RefPtr frame = page->localMainFrame())
+            frame->init();
+        if (RefPtr openerPage = opener.page())
+            MlxProfile::pageOpened(*openerPage, *page);
+        openedPages().append(*page);
+        return page;
+    }
+
+    IntSize m_size;
+};
+
+// What --no-script, --subpixel and --dark ask of every page.
+static bool pageScript = true;
+static bool pageSubpixel;
+static bool pageDark;
+
+// A page of the port's clients with WebKitTestRunner's settings (CLIENT:
+// its main frame's loader client).
+static RefPtr<Page> makePage(IntSize viewSize, MlxFrameLoaderClient** client, LocalFrame* opener)
+{
+    auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
+    MlxProfile::configure(configuration);
+    // (A window.open's page: its opener the frame that opened it.)
+    configuration.mainFrameOpener = opener;
+    if (testMode)
+        configuration.chromeClient = makeUniqueRef<TestChromeClient>(viewSize);
+    configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
+        CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [viewSize, client](auto&, auto& frameLoader) {
+            auto made = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, viewSize);
+            *client = made.ptr();
+            return made;
+        } },
+        SandboxFlags { },
+        ReferrerPolicy::EmptyString
+    };
+    Ref page = Page::create(WTF::move(configuration));
+    auto& settings = page->settings();
+    settings.setScriptEnabled(pageScript);
+    settings.setAcceleratedCompositingEnabled(false);
+    // (WebKitTestRunner's: TestController::resetPreferencesToConsistentValues.)
+    settings.setStandardFontFamily("Times"_s);
+    settings.setFixedFontFamily("Courier"_s);
+    settings.setSerifFontFamily("Times"_s);
+    settings.setSansSerifFontFamily("Helvetica"_s);
+    settings.setCursiveFontFamily("Apple Chancery"_s);
+    settings.setFantasyFontFamily("Papyrus"_s);
+    settings.setPictographFontFamily("Apple Color Emoji"_s);
+    settings.setDefaultFontSize(16);
+    settings.setDefaultFixedFontSize(13);
+    settings.setMinimumFontSize(0);
+    settings.setMinimumLogicalFontSize(9);
+    settings.setAllowUniversalAccessFromFileURLs(true);
+    settings.setAllowFileAccessFromFileURLs(true);
+    settings.setUsesBackForwardCache(false);
+    // (Web storage is the embedder's to allow: the port's, MlxStorage.)
+    settings.setLocalStorageEnabled(true);
+    settings.setSessionStorageEnabled(true);
+    // (WebKit's defaults where WebCore's differ and a render tree shows
+    // it: images loaded, text areas resizable.)
+    settings.setLoadsImagesAutomatically(true);
+    settings.setTextAreasAreResizable(true);
+    // --subpixel: the boxes' sizes as they are, not enclosing integer
+    // rectangles (RenderTreeAsText does so with the layer-based SVG
+    // engine on, for a page with an <svg> root).
+    settings.setLayerBasedSVGEngineEnabled(pageSubpixel);
+    // (--test: window.open without a click, as the test runner allows it.)
+    if (testMode)
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+    if (pageDark)
+        page->setUseColorAppearance(true, false);
+    return page;
+}
+
+// A frame's text and its subframes (dumpChildFramesAsText), as the test
+// runner writes them.
+static void appendFrameText(StringBuilder& text, LocalFrame& frame, bool children)
+{
+    RefPtr document = frame.document();
+    RefPtr element = document ? document->documentElement() : nullptr;
+    text.append(element ? element->innerText() : String(), '\n');
+    if (!children)
+        return;
+    for (RefPtr child = frame.tree().firstChild(); child; child = child->tree().nextSibling()) {
+        RefPtr local = dynamicDowncast<LocalFrame>(child.get());
+        if (!local)
+            continue;
+        text.append("\n--------\nFrame: '"_s, local->tree().specifiedName(), "'\n--------\n"_s);
+        appendFrameText(text, *local, true);
+    }
+}
+
 // The page's state as the loop sees it.
 struct Run {
     RefPtr<LocalFrame> frame;
@@ -232,6 +454,19 @@ struct Run {
 // style sheets, fonts) outstanding, no navigation queued or provisional.
 static bool isQuiet(Run& run)
 {
+    if (testMode) {
+        // (A window the test opened has a testRunner of its own, whose
+        // notifyDone counts too.)
+        for (auto& page : openedPages()) {
+            if (RefPtr frame = page->localMainFrame())
+                pollTestFlags(*frame);
+        }
+        int flags = pollTestFlags(*run.frame);
+        if (flags & TestDone)
+            return true;
+        if (flags & TestWaitUntilDone)
+            return false;
+    }
     if (!run.loadFinished)
         return false;
     RefPtr document = run.frame->document();
@@ -290,6 +525,7 @@ int main(int argc, char** argv)
     Vector<const char*> fonts;
     const char* target = nullptr;
     const char* scheme = nullptr;
+    const char* profile = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--font") && i + 1 < argc)
             fonts.append(argv[++i]);
@@ -323,6 +559,10 @@ int main(int argc, char** argv)
             allowed = atol(argv[++i]);
         else if (!strcmp(argv[i], "--scheme") && i + 1 < argc)
             scheme = argv[++i];
+        else if (!strcmp(argv[i], "--test"))
+            testMode = true;
+        else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
+            profile = argv[++i];
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
             timeout = atof(argv[++i]);
         else if (argv[i][0] == '-' || target)
@@ -350,6 +590,27 @@ int main(int argc, char** argv)
             return 2;
         }
     }
+
+    // The profile: --profile's directory (its cache in DIR/cache), else a
+    // temporary one, removed at the end, so that a run keeps nothing.
+    String profileDirectory;
+    bool temporaryProfile = false;
+    if (profile) {
+        profileDirectory = String::fromUTF8(profile);
+        char directory[4096];
+        if (!profileDirectory.startsWith('/') && getcwd(directory, sizeof(directory)))
+            profileDirectory = FileSystem::pathByAppendingComponent(String::fromUTF8(directory), profileDirectory);
+    } else {
+        const char* temporary = getenv("TMPDIR");
+        CString pattern = makeString(String::fromUTF8(temporary && *temporary ? temporary : "/tmp"), "/webcore-dump.XXXXXX"_s).utf8();
+        Vector<char> name(pattern.span());
+        name.append(0);
+        if (mkdtemp(name.mutableSpan().data())) {
+            profileDirectory = String::fromUTF8(name.span().data());
+            temporaryProfile = true;
+        }
+    }
+    MlxProfile::open(profileDirectory, profileDirectory.isEmpty() ? String() : FileSystem::pathByAppendingComponent(profileDirectory, "cache"_s));
 
     // --scheme: the test scheme, every URL asked of it noted.
     static Vector<String> schemeRequests;
@@ -396,51 +657,18 @@ int main(int argc, char** argv)
     // Its user agent: the port's with its own name (as Voyager's has
     // "Voyager/0.1").
     MlxFrameLoaderClient::setApplicationNameForUserAgent("webcore-dump"_s, "0.1"_s);
-    auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
-    configuration.cookieJar = MlxNetwork::cookieJar();
-    configuration.socketProvider = MlxWebSocket::socketProvider();
-    configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
-        CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [viewSize](auto&, auto& frameLoader) {
-            auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, viewSize);
-            mainClient = client.ptr();
-            return client;
-        } },
-        SandboxFlags { },
-        ReferrerPolicy::EmptyString
-    };
+    pageScript = script;
+    pageSubpixel = subpixel;
+    pageDark = dark;
+    if (testMode) {
+        MlxFrameLoaderClient::setWindowObjectClearedCallback([](LocalFrame& frame) {
+            frame.script().executeScriptIgnoringException(testRunnerSource(), JSC::SourceTaintedOrigin::Untainted);
+        });
+    }
 
     int status = 0;
     {
-        Ref page = Page::create(WTF::move(configuration));
-        auto& settings = page->settings();
-        settings.setScriptEnabled(script);
-        settings.setAcceleratedCompositingEnabled(false);
-        // (WebKitTestRunner's: TestController::resetPreferencesToConsistentValues.)
-        settings.setStandardFontFamily("Times"_s);
-        settings.setFixedFontFamily("Courier"_s);
-        settings.setSerifFontFamily("Times"_s);
-        settings.setSansSerifFontFamily("Helvetica"_s);
-        settings.setCursiveFontFamily("Apple Chancery"_s);
-        settings.setFantasyFontFamily("Papyrus"_s);
-        settings.setPictographFontFamily("Apple Color Emoji"_s);
-        settings.setDefaultFontSize(16);
-        settings.setDefaultFixedFontSize(13);
-        settings.setMinimumFontSize(0);
-        settings.setMinimumLogicalFontSize(9);
-        settings.setAllowUniversalAccessFromFileURLs(true);
-        settings.setAllowFileAccessFromFileURLs(true);
-        settings.setUsesBackForwardCache(false);
-        // (WebKit's defaults where WebCore's differ and a render tree shows
-        // it: images loaded, text areas resizable.)
-        settings.setLoadsImagesAutomatically(true);
-        settings.setTextAreasAreResizable(true);
-        // --subpixel: the boxes' sizes as they are, not enclosing integer
-        // rectangles (RenderTreeAsText does so with the layer-based SVG
-        // engine on, for a page with an <svg> root).
-        settings.setLayerBasedSVGEngineEnabled(subpixel);
-        if (dark)
-            page->setUseColorAppearance(true, false);
-
+        RefPtr page = makePage(viewSize, &mainClient);
         Run run;
         run.frame = page->localMainFrame();
         if (waitTitle)
@@ -470,7 +698,15 @@ int main(int argc, char** argv)
             status = 1;
 
         String tree;
-        if (textOnly) {
+        if (testMode) {
+            StringBuilder text;
+            text.append(testOutput.toString());
+            if (testFlags & TestDumpAsText)
+                appendFrameText(text, *run.frame, testFlags & TestDumpChildFrames);
+            else
+                text.append(externalRepresentation(run.frame.get()));
+            tree = text.toString();
+        } else if (textOnly) {
             RefPtr document = run.frame->document();
             RefPtr body = document ? document->bodyOrFrameset() : nullptr;
             tree = makeString("url "_s, document ? document->url().string() : String(), "\ntitle "_s, document ? document->title() : String(), "\n"_s, body ? body->innerText() : String(), "\n"_s);
@@ -509,5 +745,8 @@ int main(int argc, char** argv)
         mainClient->setLoadFinishedCallback(nullptr);
         run.frame = nullptr;
     }
+    MlxProfile::close();
+    if (temporaryProfile)
+        FileSystem::deleteNonEmptyDirectory(profileDirectory);
     return status;
 }

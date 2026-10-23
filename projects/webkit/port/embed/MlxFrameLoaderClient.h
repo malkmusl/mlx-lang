@@ -40,6 +40,12 @@ public:
     // user agent ("Voyager", "0.1", "Wayland"): in WebKit's compatibility
     // string after the platform, as "Voyager/0.1 (WebKit 2.54.1; Wayland)"
     // (UserAgentMlx.cpp).
+    // Called when a frame's window object is made anew for its normal
+    // world (each document's, before its scripts run): where an embedder
+    // puts objects of its own into the page (webcore-dump's testRunner,
+    // as WebKitTestRunner's injected bundle does).
+    WEBCORE_EXPORT static void setWindowObjectClearedCallback(Function<void(LocalFrame&)>&&);
+
     WEBCORE_EXPORT static void setApplicationNameForUserAgent(const String& name, const String& version, const String& windowSystem = String());
 
 private:

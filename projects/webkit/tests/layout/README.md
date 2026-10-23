@@ -19,3 +19,10 @@ system's fonts); the `liberation` ones use WebKitTestRunner's GLib fonts
 
 tools/check_webkit_mlx_layout.sh runs `webcore-dump` on each test with
 those fonts and compares its render tree with the expected one.
+
+`storage.txt` lists the tests of `storage/domstorage` and
+`storage/indexeddb` (M7), with the resources they load
+(`resources/js-test*.js`, their own `resources/`) and their expected
+text, taken from the same revision; tools/check_webkit_mlx_storage.sh
+runs them with `webcore-dump --test` (WebKitTestRunner's testRunner,
+dumpAsText) and compares the text.

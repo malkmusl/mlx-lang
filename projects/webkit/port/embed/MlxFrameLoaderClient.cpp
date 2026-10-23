@@ -3,7 +3,9 @@
 #include "MlxFrameLoaderClient.h"
 
 #include "Chrome.h"
+#include "DOMWrapperWorld.h"
 #include "Document.h"
+#include "FrameTreeSyncData.h"
 #include "DocumentLoader.h"
 #include "FormState.h"
 #include "FrameLoader.h"
@@ -307,7 +309,33 @@ void MlxFrameLoaderClient::dispatchEnqueueHistoryTraversalDelta(int) { }
 void MlxFrameLoaderClient::saveViewStateToItem(HistoryItem&) { }
 bool MlxFrameLoaderClient::canCachePage() const { return false; }
 
-RefPtr<LocalFrame> MlxFrameLoaderClient::createFrame(const AtomString&, HTMLFrameOwnerElement&) { return nullptr; }
+// A frame of an <iframe> (or <frame>, <object>) of the frame's document:
+// a subframe of the page with a client of its own, as WebKit2's
+// WebFrame::createSubframe makes one (its sandbox flags the owner's and
+// the parent's, its referrer policy the owner's, else the top document's).
+RefPtr<LocalFrame> MlxFrameLoaderClient::createFrame(const AtomString& name, HTMLFrameOwnerElement& ownerElement)
+{
+    Ref parent = m_loader->frame();
+    RefPtr page = parent->page();
+    if (!page)
+        return nullptr;
+    auto sandboxFlags = ownerElement.sandboxFlags();
+    sandboxFlags.add(parent->effectiveSandboxFlags());
+    auto referrerPolicy = ownerElement.referrerPolicy();
+    if (RefPtr topDocument = page->localTopDocument(); referrerPolicy == ReferrerPolicy::EmptyString && topDocument)
+        referrerPolicy = topDocument->referrerPolicy();
+    IntSize size = m_viewSize;
+    Ref frame = LocalFrame::createSubframe(*page, [size](auto&, auto& frameLoader) {
+        return makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, size);
+    }, generateFrameIdentifier(), sandboxFlags, referrerPolicy, ownerElement, FrameTreeSyncData::create());
+    frame->tree().setSpecifiedName(name);
+    frame->init();
+    // (Its creation may have run a script that took it out of the page.)
+    if (!frame->page())
+        return nullptr;
+    MLX_TRACE("subframe %s", name.string().utf8().data());
+    return frame;
+}
 RefPtr<Widget> MlxFrameLoaderClient::createPlugin(HTMLPlugInElement&, const URL&, const Vector<AtomString>&, const Vector<AtomString>&, const String&, bool) { return nullptr; }
 void MlxFrameLoaderClient::redirectDataToPlugin(Widget&) { }
 
@@ -333,7 +361,23 @@ ObjectContentType MlxFrameLoaderClient::objectContentType(const URL& url, const 
 }
 
 AtomString MlxFrameLoaderClient::overrideMediaType() const { return nullAtom(); }
-void MlxFrameLoaderClient::dispatchDidClearWindowObjectInWorld(DOMWrapperWorld&) { }
+static Function<void(LocalFrame&)>& windowObjectClearedCallback()
+{
+    static NeverDestroyed<Function<void(LocalFrame&)>> callback;
+    return callback;
+}
+
+void MlxFrameLoaderClient::setWindowObjectClearedCallback(Function<void(LocalFrame&)>&& callback)
+{
+    windowObjectClearedCallback() = WTF::move(callback);
+}
+
+void MlxFrameLoaderClient::dispatchDidClearWindowObjectInWorld(DOMWrapperWorld& world)
+{
+    if (!world.isNormal() || !windowObjectClearedCallback())
+        return;
+    windowObjectClearedCallback()(m_loader->frame());
+}
 
 Ref<FrameNetworkingContext> MlxFrameLoaderClient::createNetworkingContext()
 {
