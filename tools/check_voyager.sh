@@ -60,7 +60,17 @@
 #  15. the profile: projects/voyager/tests/storage.html counts its visits
 #      in localStorage and notes one in sessionStorage; Voyager closed and
 #      started again on it, the count goes on ("visits:2", read from the
-#      profile's local storage database) and the session's note is gone.
+#      profile's local storage database) and the session's note is gone;
+#  16. downloads: projects/voyager/tests/download.html saves a Blob and a
+#      file's link (download attributes) into the download folder
+#      (XDG_DOWNLOAD_DIR, a temporary one), each kept with what it holds;
+#      the sidebar lists them under "Downloads", and voyager://downloads
+#      (typed into the address field) shows each one done, its size and
+#      where it is;
+#  17. an upload: a click on projects/voyager/tests/upload.html's
+#      <input type=file> opens the file chooser (std.ui.chooser) over the
+#      page in the home folder; Down chooses the only file there, Enter
+#      opens it, and the page reads it (FileReader: "uploaded:NAME:TEXT").
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -532,4 +542,33 @@ grep -q "^voyager: title visits:1 session:none$" "$work/voyager.log" || { cat "$
 run_scenario storage-second "$work/storage.script" "$work/voyager-storage"
 grep -q "^voyager: title visits:2 session:none$" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "localStorage did not survive Voyager's restart with the same profile"; }
 echo "ok   localStorage survives a restart of Voyager with the same profile, sessionStorage does not"
+# 16: downloads, into a download folder of the check's.
+downloads=$work/downloads
+write_runner "$work/voyager-downloads" download.html XDG_DOWNLOAD_DIR="$downloads"
+{
+    printf 'wait 10000\nshot %s\n' "$work/downloads-sidebar.ppm"
+    address_script voyager://downloads
+    printf 'wait 1000\nshot %s\nclose\n' "$work/downloads-page.ppm"
+} > "$work/downloads.script"
+run_scenario downloads "$work/downloads.script" "$work/voyager-downloads"
+log=$work/voyager.log
+grep -qxF "voyager: downloads go to $downloads" "$log" || { cat "$log" >&2; fail "Voyager's downloads do not go to XDG_DOWNLOAD_DIR ($downloads)"; }
+grep -qxF "voyager: download done $downloads/voyager-blob.txt (29 bytes)" "$log" && grep -qxF "voyager: download done $downloads/voyager-note.txt (44 bytes)" "$log" || { cat "$log" >&2; fail "download.html's two downloads were not saved"; }
+[[ "$(cat "$downloads/voyager-blob.txt")" == "saved from a Blob by Voyager" ]] && cmp -s "$downloads/voyager-note.txt" projects/voyager/tests/download-note.txt || fail "the downloaded files do not hold what was downloaded"
+echo "ok   a Blob and a file's link (download attributes) are saved into XDG_DOWNLOAD_DIR"
+grep -q "^voyager: title Voyager Downloads$" "$log" && grep -qxF "voyager: tab 1 text voyager-note.txt	done, 44 bytes" "$log" && grep -qxF "voyager: tab 1 text voyager-blob.txt	done, 29 bytes" "$log" && grep -qxF "voyager: tab 1 text $downloads/voyager-blob.txt" "$log" || { cat "$log" >&2; fail "voyager://downloads does not list the downloads"; }
+echo "ok   voyager://downloads lists them: done, their sizes, where they are"
+# 17: an upload through the file chooser, from a home of one file.
+mkdir -p "$work/upload-home"
+echo "hello from the chooser" > "$work/upload-home/upload-me.txt"
+write_runner "$work/voyager-upload" upload.html HOME="$work/upload-home"
+{
+    printf 'wait 10000\npointer %d %d\npress 272\nrelease 272\nwait 2000\nshot %s\n' $(( x0 + 120 )) $(( y0 + 50 )) "$work/chooser.ppm"
+    printf 'down 108\nup 108\nwait 500\ndown 28\nup 28\nwait 3000\nclose\n'
+} > "$work/upload.script"
+run_scenario upload "$work/upload.script" "$work/voyager-upload"
+log=$work/voyager.log
+grep -qxF "voyager: file chooser in $work/upload-home" "$log" || { cat "$log" >&2; fail "a click on the page's <input type=file> did not open the file chooser in the home folder"; }
+grep -qx "voyager: chose 1 files" "$log" && grep -qxF "voyager: title uploaded:upload-me.txt:hello from the chooser" "$log" || { cat "$log" >&2; fail "the file chosen did not reach the page"; }
+echo "ok   the file chooser (std.ui.chooser) gives the file chosen to the page, which reads it"
 echo "check_voyager.sh: all checks passed"

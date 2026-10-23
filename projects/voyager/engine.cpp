@@ -81,6 +81,8 @@
 #include "port/embed/MlxPlatformStrategies.h"
 #include "port/embed/MlxSchemeHandler.h"
 #include "port/embed/MlxProfile.h"
+#include "port/embed/MlxDownloads.h"
+#include "FileChooser.h"
 #include <wtf/FileSystem.h>
 #include <hb-version.h>
 #include <libxml/xmlversion.h>
@@ -147,6 +149,19 @@ struct VoyagerEngine {
     int (*loading)(Engine*, int tab);
     void (*setDark)(Engine*, int dark);
     int (*forcedDark)(Engine*, int tab);
+    // A page's file chooser waiting (<input type=file>): what it accepts
+    // (its MIME types and extensions, comma-separated; "" for anything),
+    // MULTIPLE set when it takes several files; null when none waits.
+    // choose answers it: PATHS one a line, or null to cancel.
+    char* (*chooser)(Engine*, int* multiple);
+    void (*choose)(Engine*, const char* paths);
+    // Where downloads are saved (Voyager's XDG_DOWNLOAD_DIR), and the
+    // downloads: how many, and each one's name (released), its bytes so
+    // far and expected (0: not known), its state (0 running, 1 done, 2
+    // failed).
+    void (*setDownloads)(Engine*, const char* directory);
+    int (*downloadCount)(Engine*);
+    char* (*download)(Engine*, int index, uint64_t* received, uint64_t* expected, int* state);
 };
 
 // The modifiers as voyager.mlx gives them.
@@ -178,6 +193,7 @@ public:
 private:
     void invalidateContentsAndRootView(const IntRect&) final { m_dirty = true; }
     RefPtr<Page> createWindow(LocalFrame&, const String&, const WindowFeatures&, const NavigationAction&) final;
+    void runOpenPanel(LocalFrame&, FileChooser&) final;
 
     Engine& m_engine;
     bool& m_dirty;
@@ -380,6 +396,8 @@ struct Engine {
     bool dark { false };
     // VOYAGER_TRACE in the environment: each event on standard error.
     bool trace { false };
+    // A page's file chooser waiting for the window's (chooser, choose).
+    RefPtr<FileChooser> chooser;
 };
 
 Tab* tabOf(Engine* engine, int id)
@@ -473,6 +491,7 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     settings.setUsesBackForwardCache(false);
     settings.setLocalStorageEnabled(true);
     settings.setSessionStorageEnabled(true);
+    settings.setDownloadAttributeEnabled(true);
     tab->frame = tab->page->localMainFrame();
     if (!tab->frame || !tab->client)
         return nullptr;
@@ -515,6 +534,16 @@ RefPtr<Page> VoyagerChromeClient::createWindow(LocalFrame& opener, const String&
     if (m_engine.trace)
         fprintf(stderr, "voyager: new window for %s: tab %d\n", action.url().string().utf8().data(), tab ? tab->id : 0);
     return tab ? tab->page : nullptr;
+}
+
+// A page asks for files: the window shows its chooser (one at a time:
+// a page asking again cancels the one before).
+void VoyagerChromeClient::runOpenPanel(LocalFrame&, FileChooser& chooser)
+{
+    if (RefPtr waiting = std::exchange(m_engine.chooser, &chooser))
+        waiting->cancelFileChoosing();
+    if (m_engine.trace)
+        fprintf(stderr, "voyager: file chooser (%s)\n", chooser.settings().allowsMultipleFiles ? "several files" : "one file");
 }
 
 int loadInto(Tab* tab, const char* target)
@@ -874,6 +903,64 @@ int engineForcedDark(Engine* engine, int id)
     return isForcedDark(engine, tabOf(engine, id)) ? 1 : 0;
 }
 
+char* engineChooser(Engine* engine, int* multiple)
+{
+    if (!engine->chooser)
+        return nullptr;
+    auto& settings = engine->chooser->settings();
+    *multiple = settings.allowsMultipleFiles ? 1 : 0;
+    StringBuilder accept;
+    for (auto& type : settings.acceptMIMETypes)
+        accept.append(accept.isEmpty() ? ""_s : ","_s, type);
+    for (auto& extension : settings.acceptFileExtensions)
+        accept.append(accept.isEmpty() ? ""_s : ","_s, extension);
+    return copied(accept.toString());
+}
+
+void engineChoose(Engine* engine, const char* paths)
+{
+    RefPtr chooser = std::exchange(engine->chooser, nullptr);
+    if (!chooser)
+        return;
+    if (!paths) {
+        if (engine->trace)
+            fprintf(stderr, "voyager: file chooser cancelled\n");
+        chooser->cancelFileChoosing();
+        return;
+    }
+    Vector<String> chosen;
+    for (auto line : String::fromUTF8(paths).split('\n')) {
+        if (!line.isEmpty())
+            chosen.append(line);
+    }
+    fprintf(stderr, "voyager: chose %zu files\n", chosen.size());
+    chooser->chooseFiles(chosen);
+    if (engine->shown)
+        engine->shown->dirty = true;
+}
+
+void engineSetDownloads(Engine*, const char* directory)
+{
+    MlxDownloads::setDirectory(String::fromUTF8(directory));
+}
+
+int engineDownloadCount(Engine*)
+{
+    return MlxDownloads::list().size();
+}
+
+char* engineDownload(Engine*, int index, uint64_t* received, uint64_t* expected, int* state)
+{
+    auto& list = MlxDownloads::list();
+    if (index < 0 || static_cast<size_t>(index) >= list.size())
+        return nullptr;
+    auto& download = list[index];
+    *received = download.received;
+    *expected = download.expected;
+    *state = download.state == MlxDownloads::State::Running ? 0 : download.state == MlxDownloads::State::Done ? 1 : 2;
+    return copied(download.path.isEmpty() ? download.name : FileSystem::pathFileName(download.path));
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -976,13 +1063,31 @@ void answerInternal(MlxSchemeTask& task)
         task.respond(200, "image/png"_s, String(), Vector<uint8_t>(std::span<const uint8_t>(voyagerIcon, sizeof(voyagerIcon))));
         return;
     }
+    // (voyager://downloads: the downloads, each its name and what it is.)
+    Vector<std::pair<CString, CString>> downloadFacts;
+    bool downloadsPage = equalLettersIgnoringASCIICase(url.host(), "downloads"_s);
+    if (downloadsPage) {
+        downloadFacts.append({ CString("Directory"), MlxDownloads::directory().utf8() });
+        for (auto& download : MlxDownloads::list()) {
+            String name = download.path.isEmpty() ? download.name : FileSystem::pathFileName(download.path);
+            String what;
+            if (download.state == MlxDownloads::State::Done)
+                what = makeString("done\t"_s, download.received, "\t"_s, download.path, '\t', download.url);
+            else if (download.state == MlxDownloads::State::Failed)
+                what = makeString("failed\t"_s, download.received, "\t"_s, download.error, '\t', download.url);
+            else
+                what = makeString("running\t"_s, download.received, '/', download.expected, "\t\t"_s, download.url);
+            downloadFacts.append({ name.utf8(), what.utf8() });
+        }
+    }
+    auto& shownFacts = downloadsPage ? downloadFacts : facts();
     Vector<const char*> pairs;
-    for (auto& fact : facts()) {
+    for (auto& fact : shownFacts) {
         pairs.append(fact.first.data());
         pairs.append(fact.second.data());
     }
     auto target = url.string().utf8();
-    voyager_page(target.data(), pairs.span().data(), facts().size(), [](void* context, uint32_t status, const uint8_t* bytes, size_t length) {
+    voyager_page(target.data(), pairs.span().data(), shownFacts.size(), [](void* context, uint32_t status, const uint8_t* bytes, size_t length) {
         static_cast<MlxSchemeTask*>(context)->respond(status, "text/html"_s, "utf-8"_s, Vector<uint8_t>(std::span<const uint8_t>(bytes, length)));
     }, &task);
     if (!task.answered())
@@ -1060,6 +1165,15 @@ int main(int argc, char** argv)
     // The internal pages.
     gatherFacts(argc, argv);
     MlxSchemeHandler::registerScheme("voyager"_s, answerInternal);
+    // Each download's end, on standard error (tools/check_voyager.sh).
+    MlxDownloads::setObserver([](const MlxDownloads::Download& download) {
+        if (download.state == MlxDownloads::State::Done)
+            fprintf(stderr, "voyager: download done %s (%llu bytes)\n", download.path.utf8().data(), static_cast<unsigned long long>(download.received));
+        else if (download.state == MlxDownloads::State::Failed)
+            fprintf(stderr, "voyager: download failed %s: %s\n", download.name.utf8().data(), download.error.utf8().data());
+        else if (!download.received && download.path.isEmpty())
+            fprintf(stderr, "voyager: download of %s as %s\n", download.url.utf8().data(), download.name.utf8().data());
+    });
     // The first tab, opened by the engine (the window shows it).
     Tab* first = openTab(engine, true);
     if (!first) {
@@ -1074,7 +1188,8 @@ int main(int argc, char** argv)
     VoyagerEngine table {
         &engine, engineOpen, engineClose, engineSelect, engineOpened, engineLoad, engineResize, engineCycle, enginePaint,
         enginePointer, engineWheel, engineKey, engineSelectedText, engineInsertText, engineTitle, engineUrl, engineRelease,
-        engineReload, engineStop, engineLoading, engineSetDark, engineForcedDark
+        engineReload, engineStop, engineLoading, engineSetDark, engineForcedDark,
+        engineChooser, engineChoose, engineSetDownloads, engineDownloadCount, engineDownload
     };
     // main's arguments, then the environment with MLX_CANVAS=cpu (the
     // window drawn into wl_shm buffers on the CPU, which the engine
