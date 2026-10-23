@@ -139,7 +139,7 @@ PYTHON
     fi
 fi
 
-webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+webkit=${WEBKIT_SOURCE:-projects/webkit/upstream}
 if [ ! -d "$webkit/Source/ThirdParty/skia" ]; then
     echo "skip Skia's sources that use libwebp: no WebKit source at $webkit (WEBKIT_SOURCE)"
 else

@@ -225,7 +225,7 @@ else
     fi
 fi
 
-webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+webkit=${WEBKIT_SOURCE:-projects/webkit/upstream}
 skia=$webkit/Source/ThirdParty/skia
 cxx=${CXX:-g++}
 if [ ! -d "$skia/modules/skshaper" ]; then

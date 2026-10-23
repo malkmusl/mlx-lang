@@ -198,7 +198,7 @@ build f "$work/fixed.log" -j 2 failing || fail "the fixed source did not build" 
 [[ "$(built "$work/fixed.log")" == "obj/bad" ]] || fail "the fixed source built more than its step" "$work/fixed.log"
 echo "ok   a failure is remembered (told again at once, --retry-failed runs it); a new mlx-cc runs exactly the failed step"
 
-source_dir=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+source_dir=${WEBKIT_SOURCE:-projects/webkit/upstream}
 if [[ $webkit -eq 1 && -d "$source_dir/Source/WTF" ]]; then
     # (The checkout's own result cache, the one its builds use.)
     if [[ -n "$user_cache" ]]; then export MLX_BUILD_CACHE="$user_cache"; else unset MLX_BUILD_CACHE; fi

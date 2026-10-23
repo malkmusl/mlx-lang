@@ -156,7 +156,7 @@ else
     echo "ok   sax.c built by gcc against the system's libxml2 prints the same for tests/runs and $count more runs (chunks of 2 to 13 bytes, options, WebKit's)"
 fi
 
-webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+webkit=${WEBKIT_SOURCE:-projects/webkit/upstream}
 unified=mlx-out/webkit/generated/WebCore/unified-sources
 if [ ! -d "$webkit/Source/WebCore" ]; then
     echo "skip WebCore's XML document parser: no WebKit source at $webkit (WEBKIT_SOURCE)"

@@ -4,8 +4,8 @@ Voyager, our browser, first runs on WebKit, the reference engine. Our
 own engine, Lattice, comes later: WebKit translated to Mlx by the C++ to
 Mlx translator, then reshaped. This page is the design of the WebKit port
 that comes first, **PlatformMlx**: what WebKit 2.54.1's sources
-(`WEBKIT_SOURCE`, by default /home/user/csrc/wpe/wpewebkit-2.54.1) are
-built as, what the port supplies, in what order, and what of this
+(`WEBKIT_SOURCE`, by default projects/webkit/upstream, the release as
+it is: UPSTREAM.md) are built as, what the port supplies, in what order, and what of this
 repository's older plan (the WPE port on C library emulations) it retires.
 
 ## The principle: not a fork
@@ -52,6 +52,47 @@ Four ways to choose without patching, in this order of preference:
    WebKit's whenever other WebKit files include it.
 4. **An open point**, written below, where an abstraction cannot be met
    that way. Nothing is patched to get past it.
+
+### The toolchain, not WebKit
+
+The tree is projects/webkit/upstream, the release tarball as it is
+(UPSTREAM.md; tools/check_webkit_upstream.sh fails on any change to it).
+What WebKit's sources need of a compiler that ours lacks is added to the
+toolchain, never patched around in them. The tree used until M8,
+/home/user/csrc/wpe/wpewebkit-2.54.1, had two headers patched by hand;
+mlx-cc compiles both as released now:
+
+- **libpas's double-free check** (pas_segregated_page_inlines.h,
+  `pas_segregated_page_deallocate_with_page`): x86-64 inline assembly
+  that clears the bit and, when it was clear, calls
+  `pas_segregated_page_deallocation_did_fail` (`btrl; jc 0f; movq ...,
+  %rdi; call ...; 0:`). The patch left the check out for `__mlxcc__`
+  (the C fallback of ARM and RISC-V instead). mlx-cc's inline assembler
+  now calls a symbol out of the text as GNU as does (a relocation for
+  the linker, the stack 16-byte aligned at the call):
+  compiler/cc/tests/inlineasm.c.
+- **WTF's SIMD helpers** (SIMDHelpers.h: `isNonZero`,
+  `findFirstNonZeroIndex`, `findLastNonZeroIndex`): on `CPU(X86_64)`
+  they convert SIMDe's NEON-style vectors to `__m128i` and test them with
+  SSE2 (`simde_uint8x16_to_m128i`, `_mm_test_all_zeros`,
+  `_mm_movemask_epi8`), which SIMDe defines only on its native x86 path
+  (`SIMDE_X86_SSE2_NATIVE`). The patch took the generic code unless that
+  path was there. SSE2 is x86-64's baseline: every compiler for it has
+  the intrinsics and SIMDe takes that path, as WebKit expects. mlx-cc's
+  <mmintrin.h>, <xmmintrin.h> and <emmintrin.h> now have all of MMX's,
+  SSE's and SSE2's intrinsics (unions of lanes, the compiler having no
+  vector registers; compiler/cc/tests/ssebaseline.c and
+  tests/cpp/ssebaseline.cpp), and the port tells SIMDe so with
+  `-DSIMDE_X86_SSE2_NATIVE` beside `-DSIMDE_NO_VECTOR` (build.mlx): a
+  command-line define of SIMDe's own configuration that turns a code
+  path on, to what it is with any x86-64 compiler. mlx-cc does not
+  predefine `__SSE2__` itself: it has no GCC vector types, and code that
+  tests `__SSE__` or `__SSE2__` takes them to come with the intrinsics
+  (Skia's SkSwizzler_opts.inc divides and compares `__m128` values with
+  the operators), so that would turn on code mlx-cc cannot compile.
+  Without `__SSE2__` SIMDe's half floats are its portable ones (GCC 12's
+  `_Float16` on SSE2 being another of mlx-cc's gaps), which WebKit does
+  not use.
 
 ## Where it stands
 
