@@ -54,7 +54,13 @@
 #      voyager://about again, an unknown voyager://nothing a 404 page
 #      ("Not Found"), voyager:// the index ("Voyager Pages"); on a dark
 #      desktop voyager://about is in its own dark design (the theme's dark
-#      background), not forced dark.
+#      background), not forced dark; voyager://version shows the
+#      profile Voyager keeps its data in ($XDG_DATA_HOME/voyager, here
+#      ~/.local/share/voyager of the check's home) and its cache;
+#  15. the profile: projects/voyager/tests/storage.html counts its visits
+#      in localStorage and notes one in sessionStorage; Voyager closed and
+#      started again on it, the count goes on ("visits:2", read from the
+#      profile's local storage database) and the session's note is gone.
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -503,6 +509,8 @@ user_agent=$(sed -n 's/^voyager: user agent //p' "$log" | head -1)
 grep -qxF "voyager: tab 1 text User agent	$user_agent" "$log" || { cat "$log" >&2; fail "voyager://version does not show the user agent ($user_agent)"; }
 grep -qx "voyager: tab 1 text Engine	WebKit 2.54.1" "$log" && grep -qx "voyager: tab 1 text Voyager	0.1" "$log" || { cat "$log" >&2; fail "voyager://version does not show Voyager's and the engine's versions"; }
 echo "ok   about:version is voyager://version: Voyager Version, the versions and the whole user agent"
+grep -qxF "voyager: tab 1 text Profile	$work/home/.local/share/voyager (local storage, IndexedDB, cookies)" "$log" && grep -qxF "voyager: tab 1 text Cache	$work/home/.cache/voyager (the HTTP cache)" "$log" || { cat "$log" >&2; fail "voyager://version does not show the profile's directories"; }
+echo "ok   voyager://version shows the profile: ~/.local/share/voyager and ~/.cache/voyager"
 [[ $(grep -c "^voyager: url voyager://about$" "$log") -ge 2 ]] || { cat "$log" >&2; fail "about:about did not load voyager://about"; }
 echo "ok   about:about is voyager://about"
 grep -q "^voyager: url voyager://nothing$" "$log" && grep -q "^voyager: title Not Found$" "$log" || { cat "$log" >&2; fail "an unknown voyager: page is no 404 page"; }
@@ -515,4 +523,13 @@ grep -q "^voyager: tab 1 forced dark no$" "$work/voyager.log" || { cat "$work/vo
 background=$(pixel_of "$work/about-dark.ppm" $(( page_x0 + 5 )) $(( page_y0 + 5 )))
 [[ $background == 1a1c24 ]] || fail "voyager://about is not on the theme's dark background on a dark desktop (found #$background)"
 echo "ok   a dark desktop: voyager://about in its own dark design (not forced dark)"
+# 15: the profile kept between runs.
+write_runner "$work/voyager-storage" storage.html
+printf 'wait 8000\nclose\n' > "$work/storage.script"
+run_scenario storage-first "$work/storage.script" "$work/voyager-storage"
+grep -q "^voyager: title visits:1 session:none$" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "storage.html did not count its first visit"; }
+[[ -f "$work/home/.local/share/voyager/LocalStorage/file__0.localstorage" ]] || fail "no local storage database in the profile (~/.local/share/voyager/LocalStorage)"
+run_scenario storage-second "$work/storage.script" "$work/voyager-storage"
+grep -q "^voyager: title visits:2 session:none$" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "localStorage did not survive Voyager's restart with the same profile"; }
+echo "ok   localStorage survives a restart of Voyager with the same profile, sessionStorage does not"
 echo "check_voyager.sh: all checks passed"

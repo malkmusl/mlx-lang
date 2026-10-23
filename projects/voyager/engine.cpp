@@ -80,6 +80,8 @@
 #include "SocketProvider.h"
 #include "port/embed/MlxPlatformStrategies.h"
 #include "port/embed/MlxSchemeHandler.h"
+#include "port/embed/MlxProfile.h"
+#include <wtf/FileSystem.h>
 #include <hb-version.h>
 #include <libxml/xmlversion.h>
 #include <skia/core/SkMilestone.h>
@@ -159,7 +161,7 @@ constexpr int pointerPress = 1;
 constexpr int pointerRelease = 2;
 
 struct Tab;
-Tab* openTab(Engine&, bool foreground);
+Tab* openTab(Engine&, bool foreground, LocalFrame* opener = nullptr);
 
 // The chrome client of a tab: what WebCore repaints marks the tab dirty
 // (the window paints it again on its next frame if it is shown); a new
@@ -440,7 +442,7 @@ URL urlOf(const char* target)
 // A new tab (its page made, its main frame showing nothing yet), noted for
 // the window as opened when the engine opened it itself (FOREGROUND: to be
 // shown at once).
-Tab* makeTab(Engine& engine)
+Tab* makeTab(Engine& engine, LocalFrame* opener)
 {
     auto owned = std::make_unique<Tab>();
     Tab* tab = owned.get();
@@ -448,8 +450,10 @@ Tab* makeTab(Engine& engine)
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
     configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine, tab->dirty);
     configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();
-    configuration.cookieJar = MlxNetwork::cookieJar();
-    configuration.socketProvider = MlxWebSocket::socketProvider();
+    // The profile's: the cookie jar, web sockets, web storage, IndexedDB.
+    MlxProfile::configure(configuration);
+    // (A window.open's tab: its opener the frame that opened it.)
+    configuration.mainFrameOpener = opener;
     IntSize size = engine.size;
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [tab, size](auto&, auto& frameLoader) {
@@ -467,6 +471,8 @@ Tab* makeTab(Engine& engine)
     settings.setLoadsImagesAutomatically(true);
     settings.setAllowFileAccessFromFileURLs(true);
     settings.setUsesBackForwardCache(false);
+    settings.setLocalStorageEnabled(true);
+    settings.setSessionStorageEnabled(true);
     tab->frame = tab->page->localMainFrame();
     if (!tab->frame || !tab->client)
         return nullptr;
@@ -493,17 +499,19 @@ Tab* makeTab(Engine& engine)
     return tab;
 }
 
-Tab* openTab(Engine& engine, bool foreground)
+Tab* openTab(Engine& engine, bool foreground, LocalFrame* opener)
 {
-    Tab* tab = makeTab(engine);
+    Tab* tab = makeTab(engine, opener);
     if (tab)
         engine.opened.append({ tab->id, foreground });
     return tab;
 }
 
-RefPtr<Page> VoyagerChromeClient::createWindow(LocalFrame&, const String&, const WindowFeatures&, const NavigationAction& action)
+RefPtr<Page> VoyagerChromeClient::createWindow(LocalFrame& opener, const String&, const WindowFeatures&, const NavigationAction& action)
 {
-    Tab* tab = openTab(m_engine, true);
+    Tab* tab = openTab(m_engine, true, &opener);
+    if (RefPtr openerPage = opener.page(); tab && openerPage)
+        MlxProfile::pageOpened(*openerPage, *tab->page);
     if (m_engine.trace)
         fprintf(stderr, "voyager: new window for %s: tab %d\n", action.url().string().utf8().data(), tab ? tab->id : 0);
     return tab ? tab->page : nullptr;
@@ -523,7 +531,7 @@ int loadInto(Tab* tab, const char* target)
 // when it could not be made.
 int engineOpen(Engine* engine, const char* target)
 {
-    Tab* tab = makeTab(*engine);
+    Tab* tab = makeTab(*engine, nullptr);
     if (!tab)
         return 0;
     if (target && *target)
@@ -542,6 +550,7 @@ void engineClose(Engine* engine, int id)
         engine->shown = nullptr;
     tab->frame->loader().stopAllLoaders();
     tab->frame->loader().detachFromParent();
+    MlxProfile::pageClosed(*tab->page);
     tab->frame = nullptr;
     tab->page = nullptr;
     engine->tabs.remove(id);
@@ -938,7 +947,22 @@ void gatherFacts(int argc, char** argv)
     const char* home = getenv("HOME");
     String settings = configHome && *configHome ? String::fromUTF8(configHome) : makeString(String::fromUTF8(home ? home : ""), "/.config"_s);
     addFact("Settings"_s, makeString(settings, "/mlx/appearance.conf (the desktop's colour scheme)"_s));
-    addFact("Profile"_s, "none: cookies and history are kept in memory only"_s);
+    addFact("Profile"_s, makeString(MlxProfile::dataDirectory(), " (local storage, IndexedDB, cookies)"_s));
+    addFact("Cache"_s, makeString(MlxProfile::cacheDirectory(), " (the HTTP cache)"_s));
+}
+
+// Voyager's directory of a user's XDG directory (VARIABLE, else
+// $HOME/FALLBACK, as the XDG Base Directory Specification has it: a
+// relative path is ignored).
+static String userDirectory(const char* variable, ASCIILiteral fallback)
+{
+    const char* value = getenv(variable);
+    if (value && value[0] == '/')
+        return makeString(String::fromUTF8(value), "/voyager"_s);
+    const char* home = getenv("HOME");
+    if (!home || home[0] != '/')
+        return String();
+    return makeString(String::fromUTF8(home), fallback, "/voyager"_s);
 }
 
 extern "C" void voyager_page(const char* url, const char* const* facts, size_t count, void (*deliver)(void*, uint32_t, const uint8_t*, size_t), void* context);
@@ -972,7 +996,7 @@ extern char** environ;
 
 static int usage()
 {
-    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] FILE|URL\n");
+    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] FILE|URL\n");
     return 2;
 }
 
@@ -981,9 +1005,12 @@ int main(int argc, char** argv)
     IntSize size(800, 600);
     Vector<const char*> fonts;
     const char* target = nullptr;
+    const char* profile = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--font") && i + 1 < argc)
             fonts.append(argv[++i]);
+        else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
+            profile = argv[++i];
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             int width = 0;
             int height = 0;
@@ -1018,6 +1045,18 @@ int main(int argc, char** argv)
     MlxFrameLoaderClient::setApplicationNameForUserAgent("Voyager"_s, voyagerVersion, windowSystem);
     if (engine.trace)
         fprintf(stderr, "voyager: user agent %s\n", mlxUserAgent("Voyager"_s, voyagerVersion, windowSystem).utf8().data());
+    // The profile: --profile's directory (the cache in DIR/cache), else
+    // the XDG directories' voyager/ (MlxProfile.h).
+    if (profile) {
+        String directory = String::fromUTF8(profile);
+        char cwd[4096];
+        if (!directory.startsWith('/') && getcwd(cwd, sizeof(cwd)))
+            directory = FileSystem::pathByAppendingComponent(String::fromUTF8(cwd), directory);
+        MlxProfile::open(directory, FileSystem::pathByAppendingComponent(directory, "cache"_s));
+    } else
+        MlxProfile::open(userDirectory("XDG_DATA_HOME", "/.local/share"_s), userDirectory("XDG_CACHE_HOME", "/.cache"_s));
+    if (engine.trace)
+        fprintf(stderr, "voyager: profile %s, cache %s\n", MlxProfile::dataDirectory().utf8().data(), MlxProfile::cacheDirectory().utf8().data());
     // The internal pages.
     gatherFacts(argc, argv);
     MlxSchemeHandler::registerScheme("voyager"_s, answerInternal);
@@ -1051,7 +1090,10 @@ int main(int argc, char** argv)
     static char canvas[] = "MLX_CANVAS=cpu";
     arguments.append(canvas);
     arguments.append(nullptr);
-    if (voyager_run(&table, argc, arguments.mutableSpan().data())) {
+    long failed = voyager_run(&table, argc, arguments.mutableSpan().data());
+    // (What the profile has pending written: local storage's changes.)
+    MlxProfile::close();
+    if (failed) {
         fprintf(stderr, "voyager: no window, or its connection ended (is a Wayland compositor running? WAYLAND_DISPLAY)\n");
         return 1;
     }
