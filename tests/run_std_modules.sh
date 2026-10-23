@@ -16,6 +16,8 @@
 #                                       on the way and executablePath
 #   tests/354_xdg_runtime.mlx           std.xdg (the base directories over
 #                                       environments of its own)
+#   tests/411_xdg_open_runtime.mlx      std.xdg.open (default applications,
+#                                       desktop entries' Exec lines)
 #   tests/355_passwd_runtime.mlx        std.passwd (accounts and groups, by
 #                                       name and by number)
 #   tests/356_conf_runtime.mlx          std.conf ("key = value" files)
@@ -116,6 +118,7 @@ run 351_random_runtime "getrandom, xoshiro256**, splitmix64 and xorshift64*"
 run 352_terminal_tty_runtime "a pty's size, raw mode and process groups"
 run 353_fs_whole_files_runtime "files read and written whole, mkdir -p and the program's path"
 run 354_xdg_runtime "the XDG base directories, their defaults and lists"
+run 411_xdg_open_runtime "a file opened with the desktop's application for it: its type, mimeapps.list's default, a desktop entry's MimeType, its Exec line, run"
 run 355_passwd_runtime "accounts and groups by name and number, malformed lines passed over"
 run 356_conf_runtime "settings lines, comments, groups and switches"
 run 357_glob_runtime "stars, sets, ranges, escapes and quoted bytes"
