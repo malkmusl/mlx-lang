@@ -73,6 +73,18 @@ fi
 grep -q "incompleteresult.cpp:4: error: calling a function whose result type is incomplete" "$work/incompleteresult.err" || fail "a call whose result type is incomplete: $(head -3 "$work/incompleteresult.err")"
 echo "ok   a call whose result type is a class declared only is an error"
 
+# Diagnostics (compiler/cc/tests/cpp/diagnostics): each NAME.cpp is
+# refused with the message of NAME.error, its types spelled as C++ writes
+# them.
+diagnosed=()
+for source in "$tests"/diagnostics/*.cpp; do
+    name=$(basename "$source" .cpp)
+    (cd "$tests/diagnostics" && "$cc" -std=c++20 -c -o /dev/null "$name.cpp") 2> "$work/$name.err" && fail "$name compiled"
+    grep -qxF "$(cat "$tests/diagnostics/$name.error")" "$work/$name.err" || fail "$name says otherwise: $(head -3 "$work/$name.err")"
+    diagnosed+=("$name")
+done
+echo "ok   ${#diagnosed[@]} programs refused with their messages: ${diagnosed[*]}"
+
 # What an object holds: the inline, static and template functions and the
 # vtables its code or data refers to, not those only named by functions
 # never made (inlinereach.cpp).
