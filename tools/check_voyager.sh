@@ -325,7 +325,7 @@ grep -q "^voyager: title scheme:dark$" "$log" || { cat "$log" >&2; fail "the pag
 toolbar=$(pixel_of "$work/dark.ppm" $(( x0 + 300 )) $(( y0 - 38 )))
 [[ $(lightness_of "$toolbar") == dark ]] || fail "the toolbar is not drawn dark for a dark desktop (found #$toolbar)"
 canvas=$(pixel_of "$work/dark.ppm" $(( x0 + 500 )) $(( y0 + 300 )))
-[[ $canvas == 1e1e1e ]] || fail "the page's canvas is not the dark Canvas #1e1e1e (found #$canvas)"
+[[ $canvas == 1a1c24 ]] || fail "the page's canvas is not the dark Canvas #1a1c24 (std.ui.theme's dark background; found #$canvas)"
 scheme=$(pixel_of "$work/dark.ppm" $(( x0 + 70 )) $(( y0 + 100 )))
 [[ $scheme == 0080ff ]] || fail "the page's prefers-color-scheme: dark box is not #0080ff (found #$scheme)"
 input=$(pixel_of "$work/dark.ppm" $(( x0 + 250 )) $(( y0 + 155 )))

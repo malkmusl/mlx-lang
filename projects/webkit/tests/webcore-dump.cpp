@@ -59,6 +59,7 @@
 #include "EmptyClients.h"
 #include "FrameLoadRequest.h"
 #include "FontRenderOptions.h"
+#include "FrameSelection.h"
 #include "GraphicsContextSkia.h"
 #include "FrameLoader.h"
 #include "NavigationScheduler.h"
@@ -138,6 +139,8 @@ static bool paintView(LocalFrame& frame, IntSize size, uint32_t* pixels)
     if (!view)
         return false;
     view->updateLayoutAndStyleIfNeededRecursive();
+    // (The selection's highlight, as a rendering update gives it.)
+    frame.selection().updateAppearance();
     auto info = SkImageInfo::MakeN32Premul(size.width(), size.height());
     auto surface = SkSurfaces::WrapPixels(info, pixels, size.width() * sizeof(uint32_t));
     if (!surface)

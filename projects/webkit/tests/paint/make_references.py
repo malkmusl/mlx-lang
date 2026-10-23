@@ -121,22 +121,38 @@ def image():
     c.save("image-expected.png")
 
 
+# std.ui.theme's palettes (std/src/ui/theme.mlx), as the port's theme
+# (RenderThemeMlx.cpp, ControlFactoryMlx.cpp) gives them to pages (a
+# light page's text black, as pages expect it).
+LIGHT = dict(canvas=(255, 255, 255), text=(0, 0, 0), field=(255, 255, 255), control=(150, 154, 166), button=(226, 228, 234))
+DARK = dict(canvas=(26, 28, 36), text=(235, 238, 245), field=(40, 43, 54), control=(96, 101, 118), button=(52, 56, 68))
+ACCENT = (90, 160, 255)
+SELECTION_ALPHA = round(0.38 * 255) / 255
+
+
 def scheme(dark):
     """scheme.html light (as a page is drawn by default) and with the
-    desktop's dark appearance (webcore-dump --dark): RenderThemeAdwaita's
-    Canvas and CanvasText, the prefers-color-scheme box, and its text
-    field: Field (Adwaita's text field background) inside a 1-pixel border
-    of its translucent border colour over the page's canvas (the corners,
-    rounded by 5 pixels, are the pixels pages.txt allows)."""
-    canvas, text, field, border = ((30, 30, 30), (255, 255, 255), (45, 45, 45), ((255, 255, 255), 50 / 255)) if dark \
-        else ((255, 255, 255), (0, 0, 0), (255, 255, 255), ((0, 0, 0), 50 / 255))
-    c = Canvas(canvas)
+    desktop's dark appearance (webcore-dump --dark), in the port's theme:
+    the Canvas, CanvasText and ButtonFace colours, the prefers-color-scheme
+    box; the text field (Field inside a 1-pixel outline of the control
+    colour), the button (ButtonFace), the checked check box (the accent)
+    and the select (ButtonFace); the selected Ahem text, its glyphs
+    CanvasText on the accent's translucent selection. The rounded corners,
+    the check mark and the select's chevron are the pixels pages.txt
+    allows."""
+    p = DARK if dark else LIGHT
+    c = Canvas(p["canvas"])
     c.fill(10, 10, 100, 100, (0, 128, 255) if dark else (255, 128, 0))
-    c.fill(130, 10, 100, 100, text)
-    c.fill(11, 131, 198, 38, field)
-    colour, alpha = border
-    for x, y, w, h in ((10, 130, 200, 1), (10, 169, 200, 1), (10, 131, 1, 38), (209, 131, 1, 38)):
-        c.fill(x, y, w, h, colour, alpha)
+    c.fill(130, 10, 100, 100, p["text"])
+    c.fill(250, 10, 100, 100, p["button"])
+    c.fill(10, 130, 200, 40, p["field"])
+    c.frame(10, 130, 200, 40, 1, 1, 1, 1, p["control"])
+    c.fill(250, 130, 100, 40, p["button"])
+    c.fill(370, 130, 20, 20, ACCENT)
+    c.fill(250, 190, 120, 30, p["button"])
+    c.fill(10, 190, 60, 20, ACCENT, SELECTION_ALPHA)
+    c.fill(10, 190, 20, 20, p["text"])
+    c.fill(50, 190, 20, 20, p["text"])
     c.save("scheme-dark-expected.png" if dark else "scheme-expected.png")
 
 
