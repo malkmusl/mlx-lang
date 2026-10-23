@@ -3,7 +3,7 @@
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
 // painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]]
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME]
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -28,6 +28,14 @@
 // (no color-scheme allowing dark, no prefers-color-scheme: dark rule)
 // dark, as Voyager's forced dark mode does (the port's MlxDarkMode.h: the
 // colours' lightness inverted, raster images as they are).
+//
+// --scheme NAME registers the internal scheme NAME (the port's
+// MlxSchemeHandler, as Voyager registers voyager:) for the network check:
+// NAME://page is a page of it (title "scheme page") whose script fetches
+// NAME://page/data.txt (text) and NAME://page/missing (a 404) and writes
+// what it got; any other URL of it is a 404 page. With --text, every URL
+// the scheme was asked for is listed after the text ("scheme NAME: N
+// requests", then each), which shows that a web page could not reach it.
 //
 // --wait-title TITLE waits, after the load, until the page's title is
 // TITLE (what its scripts set when done: a WebSocket's messages, timers).
@@ -89,6 +97,7 @@
 #include "port/embed/MlxWebSocket.h"
 #include "SocketProvider.h"
 #include "port/embed/MlxPlatformStrategies.h"
+#include "port/embed/MlxSchemeHandler.h"
 #include <JavaScriptCore/InitializeThreading.h>
 #include <memory>
 #include <skia/core/SkCanvas.h>
@@ -132,7 +141,7 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
@@ -280,6 +289,7 @@ int main(int argc, char** argv)
     double timeout = 60;
     Vector<const char*> fonts;
     const char* target = nullptr;
+    const char* scheme = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--font") && i + 1 < argc)
             fonts.append(argv[++i]);
@@ -311,6 +321,8 @@ int main(int argc, char** argv)
             tolerance = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--allow") && i + 1 < argc)
             allowed = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--scheme") && i + 1 < argc)
+            scheme = argv[++i];
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
             timeout = atof(argv[++i]);
         else if (argv[i][0] == '-' || target)
@@ -339,10 +351,34 @@ int main(int argc, char** argv)
         }
     }
 
+    // --scheme: the test scheme, every URL asked of it noted.
+    static Vector<String> schemeRequests;
+    String schemeName = scheme ? String::fromUTF8(scheme) : String();
+    if (scheme) {
+        MlxSchemeHandler::registerScheme(schemeName, [schemeName](MlxSchemeTask& task) {
+            schemeRequests.append(task.url().string());
+            String base = makeString(schemeName, "://page"_s);
+            String url = task.url().string();
+            auto bytes = [](const String& text) {
+                auto utf8 = text.utf8();
+                return Vector<uint8_t>(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(utf8.data()), utf8.length()));
+            };
+            if (url == base) {
+                task.respond(200, "text/html"_s, "utf-8"_s, bytes(makeString(
+                    "<!DOCTYPE html><title>scheme page</title><p id=out>loading</p><script>const out = []; fetch('"_s, base,
+                    "/data.txt').then(r => r.text()).then(t => { out.push('data: ' + t.trim()); return fetch('"_s, base,
+                    "/missing'); }).then(r => { out.push('missing: ' + r.status); }, e => { out.push('failed: ' + e); }).then(() => { document.getElementById('out').textContent = out.join(', '); document.title = 'scheme page done'; });</script>"_s)));
+            } else if (url == makeString(base, "/data.txt"_s))
+                task.respond(200, "text/plain"_s, "utf-8"_s, bytes("the scheme's own data\n"_s));
+            else
+                task.respond(404, "text/html"_s, "utf-8"_s, bytes("<!DOCTYPE html><title>not found</title><p>No such page.</p>"_s));
+        });
+    }
+
     // The URL: a scheme's (file:, data:) as it is, else a file's path.
     String argument = String::fromUTF8(target);
     URL url;
-    if (argument.startsWith("file:"_s) || argument.startsWith("data:"_s) || argument.startsWith("http:"_s) || argument.startsWith("https:"_s))
+    if (argument.startsWith("file:"_s) || argument.startsWith("data:"_s) || argument.startsWith("http:"_s) || argument.startsWith("https:"_s) || (scheme && argument.startsWith(makeString(schemeName, ':'))))
         url = URL { argument };
     else {
         char directory[4096];
@@ -440,6 +476,13 @@ int main(int argc, char** argv)
             tree = makeString("url "_s, document ? document->url().string() : String(), "\ntitle "_s, document ? document->title() : String(), "\n"_s, body ? body->innerText() : String(), "\n"_s);
         } else
             tree = externalRepresentation(run.frame.get());
+        if (textOnly && scheme) {
+            StringBuilder list;
+            list.append("scheme "_s, schemeName, ": "_s, schemeRequests.size(), " requests\n"_s);
+            for (auto& request : schemeRequests)
+                list.append("  "_s, request, '\n');
+            tree = makeString(tree, list.toString());
+        }
         auto utf8 = tree.utf8();
         fwrite(utf8.data(), 1, utf8.length(), stdout);
         if (boxes && run.frame->contentRenderer())

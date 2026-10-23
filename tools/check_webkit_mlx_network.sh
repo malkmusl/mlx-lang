@@ -16,6 +16,14 @@
 # is written https:/PATH come that way (wss: for their WebSockets); then,
 # without the root, the page must not come.
 #
+# Internal schemes (the port's MlxSchemeHandler, Voyager's voyager:):
+# pages whose name starts with "scheme" run with webcore-dump --scheme test,
+# which serves test://page and lists what the scheme was asked. An http
+# page (site/scheme.html) must reach it in no way (fetch, XMLHttpRequest,
+# an image, a script, a style sheet, an iframe, a redirect, a link, a form,
+# location: none asked); the scheme's own page (a path written test:...,
+# loaded as it is) loads and fetches its own URLs, a 404 among them.
+#
 #   tools/check_webkit_mlx_network.sh [--no-build] [PAGE...]
 set -uo pipefail
 
@@ -86,7 +94,10 @@ while read -r name path wait; do
     if [[ ${#chosen[@]} -gt 0 ]] && [[ ! " ${chosen[*]} " == *" $name "* ]]; then continue; fi
     url="http://127.0.0.1:$port$path"
     [[ $path == https:* ]] && url="https://127.0.0.1:$tls_port${path#https:}"
-    dump "$url" ${wait:+--wait-title "$wait"} | sed -e "s/127\.0\.0\.1:\($port\|$tls_port\)/127.0.0.1:PORT/g" -e 's/WebKitFormBoundary[A-Za-z0-9]*/WebKitFormBoundary/g' -e 's/[[:space:]]*$//' > "$work/$name.txt"
+    [[ $path == test:* ]] && url=$path
+    scheme=()
+    [[ $name == scheme* ]] && scheme=(--scheme test)
+    dump "$url" "${scheme[@]}" ${wait:+--wait-title "$wait"} | sed -e "s/127\.0\.0\.1:\($port\|$tls_port\)/127.0.0.1:PORT/g" -e 's/WebKitFormBoundary[A-Za-z0-9]*/WebKitFormBoundary/g' -e 's/[[:space:]]*$//' > "$work/$name.txt"
     if cmp -s "$work/$name.txt" "$network/expected/$name.txt"; then
         passed=$(( passed + 1 ))
         echo "PASS $name ($path)"

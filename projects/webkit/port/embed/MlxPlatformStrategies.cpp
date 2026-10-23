@@ -18,6 +18,10 @@
 #include "SharedBuffer.h"
 #include "SubresourceLoader.h"
 #include "port/embed/MlxNetwork.h"
+#include "port/embed/MlxSchemeHandler.h"
+#include "Document.h"
+#include "OriginAccessPatterns.h"
+#include "SecurityOrigin.h"
 #include "port/MlxWebPort.h"
 #include <wtf/RunLoop.h>
 #include <wtf/text/CString.h>
@@ -78,8 +82,9 @@ static void loadFile(ResourceLoader& loader)
 // WebLoaderStrategy runs them, from the main loop: data: URLs by WebCore
 // itself (ResourceLoader::start, DataURLDecoder), file: URLs by the port
 // (loadFile, std.fs), http: and https: by the port's network (MlxNetwork:
-// std.http and std.tls on a thread of their own); other schemes fail as
-// URLs that cannot be shown. No scheduling by priority yet.
+// std.http and std.tls on a thread of their own), the embedder's schemes
+// by its callbacks (MlxSchemeHandler: Voyager's voyager:); other schemes
+// fail as URLs that cannot be shown. No scheduling by priority yet.
 class MlxLoaderStrategy final : public LoaderStrategy {
 public:
     void loadResource(LocalFrame& frame, CachedResource& resource, ResourceRequest&& request, const ResourceLoaderOptions& options, CompletionHandler<void(RefPtr<SubresourceLoader>&&)>&& completionHandler) override
@@ -108,6 +113,10 @@ public:
             MlxNetwork::load(loader);
             return;
         }
+        if (MlxSchemeHandler::handles(url)) {
+            MlxSchemeHandler::load(loader);
+            return;
+        }
         RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
             if (!loader->reachedTerminalState())
                 loader->didFail(errorFor(loader->request().url(), cannotShowURLCode, "The port does not load this URL yet"_s));
@@ -118,6 +127,17 @@ public:
     {
         if (MlxNetwork::handles(request.url())) {
             MlxNetwork::loadSynchronously(request, error, response, data);
+            return;
+        }
+        if (MlxSchemeHandler::handles(request.url())) {
+            // (WebCore's asynchronous loads check this in ResourceLoader::init;
+            // a synchronous one is checked here: only the scheme's own pages.)
+            RefPtr document = frameLoader.frame().document();
+            if (!document || !document->securityOrigin().canDisplay(request.url(), OriginAccessPatternsForWebProcess::singleton())) {
+                error = cannotShowURLError(request);
+                return;
+            }
+            MlxSchemeHandler::loadSynchronously(request, error, response, data);
             return;
         }
         ResourceHandle::loadResourceSynchronously(frameLoader.networkingContext(), request, StoredCredentialsPolicy::Use, nullptr, error, response, data);
