@@ -3,7 +3,7 @@
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
 // painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark]
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]]
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
 // A Page of the port's clients (MlxFrameLoaderClient, the port's platform
@@ -24,6 +24,10 @@
 // desktop prefers dark): `prefers-color-scheme: dark` matches, and a page
 // whose color-scheme allows dark (`color-scheme: light dark`) is drawn in
 // its dark variant, the theme's controls, scrollbars and canvas too.
+// --force-dark with it paints a page that has no dark design of its own
+// (no color-scheme allowing dark, no prefers-color-scheme: dark rule)
+// dark, as Voyager's forced dark mode does (the port's MlxDarkMode.h: the
+// colours' lightness inverted, raster images as they are).
 //
 // --wait-title TITLE waits, after the load, until the page's title is
 // TITLE (what its scripts set when done: a WebSocket's messages, timers).
@@ -59,7 +63,9 @@
 #include "EmptyClients.h"
 #include "FrameLoadRequest.h"
 #include "FontRenderOptions.h"
+#include "FrameSelection.h"
 #include "GraphicsContextSkia.h"
+#include "port/platform/graphics/mlx/MlxDarkMode.h"
 #include "FrameLoader.h"
 #include "NavigationScheduler.h"
 #include "LocalFrame.h"
@@ -126,22 +132,32 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
 // The view painted into PIXELS (WIDTH x HEIGHT words, 0xAARRGGBB
 // premultiplied): white, then the frame view as a window paints it.
-static bool paintView(LocalFrame& frame, IntSize size, uint32_t* pixels)
+static bool paintView(LocalFrame& frame, IntSize size, uint32_t* pixels, bool forceDark)
 {
     RefPtr view = frame.view();
     if (!view)
         return false;
     view->updateLayoutAndStyleIfNeededRecursive();
+    // (The selection's highlight, as a rendering update gives it.)
+    frame.selection().updateAppearance();
     auto info = SkImageInfo::MakeN32Premul(size.width(), size.height());
     auto surface = SkSurfaces::WrapPixels(info, pixels, size.width() * sizeof(uint32_t));
     if (!surface)
         return false;
+    RefPtr document = frame.document();
+    if (forceDark && document && !mlxPageHasDarkDesign(*document)) {
+        surface->getCanvas()->clear(mlxForcedDarkColor(SkColors::kWhite));
+        MlxDarkModeCanvas dark(*surface->getCanvas());
+        GraphicsContextSkia context(dark, RenderingMode::Unaccelerated, RenderingPurpose::Snapshot);
+        view->paint(context, IntRect({ }, size));
+        return true;
+    }
     surface->getCanvas()->clear(SK_ColorWHITE);
     GraphicsContextSkia context(*surface->getCanvas(), RenderingMode::Unaccelerated, RenderingPurpose::Snapshot);
     view->paint(context, IntRect({ }, size));
@@ -255,6 +271,7 @@ int main(int argc, char** argv)
     bool boxes = false;
     bool textOnly = false;
     bool dark = false;
+    bool forceDark = false;
     const char* waitTitle = nullptr;
     const char* pngPath = nullptr;
     const char* referencePath = nullptr;
@@ -284,6 +301,8 @@ int main(int argc, char** argv)
             textOnly = true;
         else if (!strcmp(argv[i], "--dark"))
             dark = true;
+        else if (!strcmp(argv[i], "--force-dark"))
+            forceDark = true;
         else if (!strcmp(argv[i], "--png") && i + 1 < argc)
             pngPath = argv[++i];
         else if (!strcmp(argv[i], "--reference") && i + 1 < argc)
@@ -428,7 +447,7 @@ int main(int argc, char** argv)
         fflush(stdout);
         if (pngPath) {
             auto pixels = std::make_unique<uint32_t[]>(static_cast<size_t>(viewSize.width()) * viewSize.height());
-            if (!paintView(*run.frame, viewSize, pixels.get()) || !mlxweb_image_write_png(pngPath, pixels.get(), viewSize.width(), viewSize.height(), viewSize.width(), 0)) {
+            if (!paintView(*run.frame, viewSize, pixels.get(), dark && forceDark) || !mlxweb_image_write_png(pngPath, pixels.get(), viewSize.width(), viewSize.height(), viewSize.width(), 0)) {
                 fprintf(stderr, "webcore-dump: cannot paint the view into %s\n", pngPath);
                 status = 1;
             } else if (referencePath) {

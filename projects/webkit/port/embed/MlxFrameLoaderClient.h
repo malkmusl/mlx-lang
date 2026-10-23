@@ -13,7 +13,8 @@
 //
 // STUB (M5: frames in frames, plug-ins, history, downloads, forms' policy):
 // createFrame makes no frame (an iframe stays empty), there is no back and
-// forward list and no download; new windows are refused.
+// forward list and no download; a new window is the chrome client's
+// (createWindow: a tab of Voyager's).
 #pragma once
 
 #include "IntSize.h"

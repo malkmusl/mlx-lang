@@ -1,19 +1,25 @@
 // Voyager's engine (PORT.md, M5): WebCore in Voyager's process, as the
 // port's single-process embedding has it. This is the program's main: it
-// makes a Page of the port's clients (MlxFrameLoaderClient, the port's
-// platform strategies; a chrome client that notes what needs painting;
-// WebCore's empty clients for the rest) and hands the window to
+// keeps the tabs, each a Page of the port's clients (MlxFrameLoaderClient,
+// the port's platform strategies; a chrome client that notes what needs
+// painting and opens new tabs for window.open and `target=_blank`;
+// WebCore's empty clients for the rest), and hands the window to
 // voyager_run (projects/voyager/voyager.mlx, libvoyager.so), which owns the
 // Wayland window (std.ui.host: wl_shm buffers, keys, clipboard) and calls
-// back through the table of functions below: load a URL, run WebCore's
-// pending work (WTF's generic RunLoop, one cycle), paint the view into the
-// window's pixels (Skia raster through GraphicsContextSkia), and the
-// pointer's, the wheel's and the keyboard's events (WebCore's
-// EventHandler; text typed into an editable element through the Editor,
-// editing keys as its commands), the selection's text and pasting,
-// reloading and stopping, and the desktop's colour scheme (dark: the
-// Page's dark appearance, so `prefers-color-scheme: dark` matches and a
-// page that allows it is drawn dark, the theme's controls too).
+// back through the table of functions below: open, close and show a tab;
+// load a URL in one; run WebCore's pending work (WTF's generic RunLoop,
+// one cycle, every tab's: background tabs keep running); paint the shown
+// tab into the window's pixels (Skia raster through GraphicsContextSkia,
+// the only tab painted), and the pointer's, the wheel's and the keyboard's
+// events to it (WebCore's EventHandler; text typed into an editable
+// element through the Editor, editing keys as its commands; a link
+// clicked with the middle button or Ctrl opens in a new tab behind), the
+// selection's text and pasting, each tab's title, URL and loading,
+// reloading and stopping, the desktop's colour scheme (dark: the Pages'
+// dark appearance, so `prefers-color-scheme: dark` matches and a page that
+// allows it is drawn dark, the theme's controls too, and a page without a
+// dark design of its own is painted dark: the port's forced dark mode,
+// MlxDarkMode.h).
 //
 //     voyager [--font FILE]... [--size WIDTHxHEIGHT] FILE|URL
 //
@@ -46,6 +52,9 @@
 #include "LocalFrame.h"
 #include "LocalFrameInlines.h"
 #include "LocalFrameView.h"
+#include "NavigationAction.h"
+#include "WindowFeatures.h"
+#include "port/platform/graphics/mlx/MlxDarkMode.h"
 #include "Page.h"
 #include "PageConfiguration.h"
 #include "PlatformKeyboardEvent.h"
@@ -72,7 +81,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <utility>
 #include <wtf/FileSystem.h>
+#include <wtf/HashMap.h>
 #include <wtf/MainThread.h>
 #include <wtf/RunLoop.h>
 #include <wtf/text/CString.h>
@@ -82,12 +93,18 @@ using namespace WebCore;
 namespace {
 
 // What Voyager's window asks of the engine: the functions of
-// VoyagerEngine (voyager.mlx declares the same table).
+// VoyagerEngine (voyager.mlx declares the same table). TAB is a tab's id
+// (from open, or from opened for a tab the engine opened itself); the
+// events and paint go to the tab shown (select).
 struct Engine;
 
 struct VoyagerEngine {
     Engine* engine;
-    int (*load)(Engine*, const char* url);
+    int (*open)(Engine*, const char* url);
+    void (*close)(Engine*, int tab);
+    void (*select)(Engine*, int tab);
+    int (*opened)(Engine*, int* foreground);
+    int (*load)(Engine*, int tab, const char* url);
     void (*resize)(Engine*, int width, int height);
     int (*cycle)(Engine*);
     void (*paint)(Engine*, uint32_t* pixels, int width, int height, int stride);
@@ -96,13 +113,14 @@ struct VoyagerEngine {
     void (*key)(Engine*, int down, unsigned code, const char* text, unsigned modifiers);
     char* (*selectedText)(Engine*);
     void (*insertText)(Engine*, const char* text);
-    char* (*title)(Engine*);
-    char* (*url)(Engine*);
+    char* (*title)(Engine*, int tab);
+    char* (*url)(Engine*, int tab);
     void (*release)(char*);
-    void (*reload)(Engine*);
-    void (*stop)(Engine*);
-    int (*loading)(Engine*);
+    void (*reload)(Engine*, int tab);
+    void (*stop)(Engine*, int tab);
+    int (*loading)(Engine*, int tab);
     void (*setDark)(Engine*, int dark);
+    int (*forcedDark)(Engine*, int tab);
 };
 
 // The modifiers as voyager.mlx gives them.
@@ -116,18 +134,26 @@ constexpr int pointerMotion = 0;
 constexpr int pointerPress = 1;
 constexpr int pointerRelease = 2;
 
-// The chrome client: what WebCore repaints marks the view dirty (the
-// window paints it again on its next frame).
+struct Tab;
+Tab* openTab(Engine&, bool foreground);
+
+// The chrome client of a tab: what WebCore repaints marks the tab dirty
+// (the window paints it again on its next frame if it is shown); a new
+// window (window.open, a `target=_blank` link: MlxFrameLoaderClient's
+// dispatchCreatePage) is a new tab, shown.
 class VoyagerChromeClient final : public EmptyChromeClient {
 public:
-    explicit VoyagerChromeClient(bool& dirty)
-        : m_dirty(dirty)
+    VoyagerChromeClient(Engine& engine, bool& dirty)
+        : m_engine(engine)
+        , m_dirty(dirty)
     {
     }
 
 private:
     void invalidateContentsAndRootView(const IntRect&) final { m_dirty = true; }
+    RefPtr<Page> createWindow(LocalFrame&, const String&, const WindowFeatures&, const NavigationAction&) final;
 
+    Engine& m_engine;
     bool& m_dirty;
 };
 
@@ -297,21 +323,46 @@ private:
     NoTextChecker m_textCheckerClient;
 };
 
-struct Engine {
+// A tab: its page, the clicks counted on it, and whether it is to be
+// painted again.
+struct Tab {
+    int id { 0 };
     RefPtr<Page> page;
     RefPtr<LocalFrame> frame;
     MlxFrameLoaderClient* client { nullptr };
-    IntSize size;
     bool dirty { true };
     int clickCount { 0 };
     MonotonicTime lastPress;
     IntPoint lastPressPosition;
-    IntPoint pointerPosition;
     MouseButton pressedButton { MouseButton::None };
     MonotonicTime lastUpdate;
+    // A link pressed with the middle button or Ctrl: opened in a tab
+    // behind on the release (the page sees neither).
+    URL heldLink;
+    MouseButton heldLinkButton { MouseButton::None };
+};
+
+struct Engine {
+    HashMap<int, std::unique_ptr<Tab>> tabs;
+    // The tab shown (null: none yet, or it was closed).
+    Tab* shown { nullptr };
+    int nextId { 1 };
+    // The tabs the engine opened itself, for the window: id, and whether
+    // shown at once.
+    Vector<std::pair<int, bool>> opened;
+    IntSize size;
+    bool dark { false };
     // VOYAGER_TRACE in the environment: each event on standard error.
     bool trace { false };
 };
+
+Tab* tabOf(Engine* engine, int id)
+{
+    if (id <= 0)
+        return nullptr;
+    auto found = engine->tabs.find(id);
+    return found == engine->tabs.end() ? nullptr : found->value.get();
+}
 
 OptionSet<PlatformEvent::Modifier> modifiersOf(unsigned modifiers)
 {
@@ -350,14 +401,132 @@ URL urlOf(const char* target)
     return URL::fileURLWithFileSystemPath(path);
 }
 
-int engineLoad(Engine* engine, const char* target)
+// A new tab (its page made, its main frame showing nothing yet), noted for
+// the window as opened when the engine opened it itself (FOREGROUND: to be
+// shown at once).
+Tab* makeTab(Engine& engine)
+{
+    auto owned = std::make_unique<Tab>();
+    Tab* tab = owned.get();
+    tab->id = engine.nextId++;
+    auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
+    configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine, tab->dirty);
+    configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();
+    configuration.cookieJar = MlxNetwork::cookieJar();
+    configuration.socketProvider = MlxWebSocket::socketProvider();
+    IntSize size = engine.size;
+    configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
+        CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [tab, size](auto&, auto& frameLoader) {
+            auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, size);
+            tab->client = client.ptr();
+            return client;
+        } },
+        SandboxFlags { },
+        ReferrerPolicy::EmptyString
+    };
+    tab->page = Page::create(WTF::move(configuration));
+    auto& settings = tab->page->settings();
+    settings.setScriptEnabled(true);
+    settings.setAcceleratedCompositingEnabled(false);
+    settings.setLoadsImagesAutomatically(true);
+    settings.setAllowFileAccessFromFileURLs(true);
+    settings.setUsesBackForwardCache(false);
+    tab->frame = tab->page->localMainFrame();
+    if (!tab->frame || !tab->client)
+        return nullptr;
+    tab->frame->init();
+    tab->page->setUseColorAppearance(engine.dark, false);
+    engine.tabs.add(tab->id, WTF::move(owned));
+    if (engine.trace)
+        fprintf(stderr, "voyager: engine made tab %d\n", tab->id);
+    return tab;
+}
+
+Tab* openTab(Engine& engine, bool foreground)
+{
+    Tab* tab = makeTab(engine);
+    if (tab)
+        engine.opened.append({ tab->id, foreground });
+    return tab;
+}
+
+RefPtr<Page> VoyagerChromeClient::createWindow(LocalFrame&, const String&, const WindowFeatures&, const NavigationAction& action)
+{
+    Tab* tab = openTab(m_engine, true);
+    if (m_engine.trace)
+        fprintf(stderr, "voyager: new window for %s: tab %d\n", action.url().string().utf8().data(), tab ? tab->id : 0);
+    return tab ? tab->page : nullptr;
+}
+
+int loadInto(Tab* tab, const char* target)
 {
     URL url = urlOf(target);
-    if (!url.isValid())
+    if (!tab || !url.isValid())
         return 0;
-    engine->frame->loader().load(FrameLoadRequest(*engine->frame, ResourceRequest(URL { url })));
-    engine->dirty = true;
+    tab->frame->loader().load(FrameLoadRequest(*tab->frame, ResourceRequest(URL { url })));
+    tab->dirty = true;
     return 1;
+}
+
+// A tab of its own (TARGET loaded in it, none when empty): its id, 0
+// when it could not be made.
+int engineOpen(Engine* engine, const char* target)
+{
+    Tab* tab = makeTab(*engine);
+    if (!tab)
+        return 0;
+    if (target && *target)
+        loadInto(tab, target);
+    return tab->id;
+}
+
+void engineClose(Engine* engine, int id)
+{
+    Tab* tab = tabOf(engine, id);
+    if (!tab)
+        return;
+    if (engine->trace)
+        fprintf(stderr, "voyager: engine closes tab %d\n", id);
+    if (engine->shown == tab)
+        engine->shown = nullptr;
+    tab->frame->loader().stopAllLoaders();
+    tab->frame->loader().detachFromParent();
+    tab->frame = nullptr;
+    tab->page = nullptr;
+    engine->tabs.remove(id);
+}
+
+// The tab shown: the one painted, given the events, active and focused.
+void engineSelect(Engine* engine, int id)
+{
+    Tab* tab = tabOf(engine, id);
+    if (!tab)
+        return;
+    for (auto& other : engine->tabs.values()) {
+        other->page->focusController().setActive(other.get() == tab);
+        other->page->focusController().setFocused(other.get() == tab);
+    }
+    engine->shown = tab;
+    tab->dirty = true;
+}
+
+// A tab the engine opened itself since the last call (window.open, a
+// link's target, a link clicked with the middle button or Ctrl): its id,
+// FOREGROUND whether to show it; 0 when there is none.
+int engineOpened(Engine* engine, int* foreground)
+{
+    if (engine->opened.isEmpty())
+        return 0;
+    auto entry = engine->opened.first();
+    engine->opened.removeAt(0);
+    if (foreground)
+        *foreground = entry.second ? 1 : 0;
+    return entry.first;
+}
+
+int engineLoad(Engine* engine, int id, const char* target)
+{
+    return loadInto(tabOf(engine, id), target);
 }
 
 void engineResize(Engine* engine, int width, int height)
@@ -365,35 +534,57 @@ void engineResize(Engine* engine, int width, int height)
     if (width <= 0 || height <= 0 || IntSize(width, height) == engine->size)
         return;
     engine->size = IntSize(width, height);
-    if (RefPtr view = engine->frame->view())
-        view->resize(engine->size);
-    engine->dirty = true;
+    for (auto& tab : engine->tabs.values()) {
+        if (RefPtr view = tab->frame->view())
+            view->resize(engine->size);
+        tab->dirty = true;
+    }
 }
 
-// One turn of WebCore's loop (timers, loads, tasks); 1 when the view is
-// to be painted again.
+// One turn of WebCore's loop (timers, loads, tasks: every tab's); 1 when
+// the tab shown is to be painted again.
 int engineCycle(Engine* engine)
 {
     RunLoop::cycle();
-    // The page's rendering update (WebKit's display link: scroll and
+    // Each page's rendering update (WebKit's display link: scroll and
     // resize events, animation frames, intersection observers), at most
-    // every 30 ms.
+    // every 30 ms; a tab behind, every 200 ms.
     auto now = MonotonicTime::now();
-    if (now - engine->lastUpdate >= 30_ms) {
-        engine->lastUpdate = now;
-        engine->page->isolatedUpdateRendering();
+    for (auto& tab : engine->tabs.values()) {
+        auto interval = tab.get() == engine->shown ? 30_ms : 200_ms;
+        if (now - tab->lastUpdate >= interval) {
+            tab->lastUpdate = now;
+            tab->page->isolatedUpdateRendering();
+        }
     }
-    if (RefPtr view = engine->frame->view()) {
+    Tab* shown = engine->shown;
+    if (!shown)
+        return 0;
+    if (RefPtr view = shown->frame->view()) {
         if (view->needsLayout())
-            engine->dirty = true;
+            shown->dirty = true;
     }
-    return engine->dirty ? 1 : 0;
+    return shown->dirty ? 1 : 0;
+}
+
+// Whether the tab is painted in forced dark: the desktop dark, its page
+// without a dark design of its own (always: Voyager has no setting for
+// it, it follows the desktop).
+bool isForcedDark(Engine* engine, Tab* tab)
+{
+    if (!engine->dark || !tab)
+        return false;
+    RefPtr document = tab->frame->document();
+    return document && !mlxPageHasDarkDesign(*document);
 }
 
 void enginePaint(Engine* engine, uint32_t* pixels, int width, int height, int stride)
 {
-    engine->dirty = false;
-    RefPtr view = engine->frame->view();
+    Tab* tab = engine->shown;
+    if (!tab)
+        return;
+    tab->dirty = false;
+    RefPtr view = tab->frame->view();
     if (!view)
         return;
     view->updateLayoutAndStyleIfNeededRecursive();
@@ -401,6 +592,13 @@ void enginePaint(Engine* engine, uint32_t* pixels, int width, int height, int st
     auto surface = SkSurfaces::WrapPixels(info, pixels, static_cast<size_t>(stride) * sizeof(uint32_t));
     if (!surface)
         return;
+    if (isForcedDark(engine, tab)) {
+        surface->getCanvas()->clear(mlxForcedDarkColor(SkColors::kWhite));
+        MlxDarkModeCanvas dark(*surface->getCanvas());
+        GraphicsContextSkia context(dark, RenderingMode::Unaccelerated, RenderingPurpose::DOM);
+        view->paint(context, IntRect(0, 0, width, height));
+        return;
+    }
     surface->getCanvas()->clear(SK_ColorWHITE);
     GraphicsContextSkia context(*surface->getCanvas(), RenderingMode::Unaccelerated, RenderingPurpose::DOM);
     view->paint(context, IntRect(0, 0, width, height));
@@ -418,45 +616,71 @@ MouseButton buttonOf(int button)
 
 void enginePointer(Engine* engine, int kind, int x, int y, int button, unsigned modifiers)
 {
+    Tab* tab = engine->shown;
+    if (!tab)
+        return;
     IntPoint position(x, y);
-    engine->pointerPosition = position;
     if (engine->trace && kind != pointerMotion)
         fprintf(stderr, "voyager: pointer %s %d at %d,%d\n", kind == pointerPress ? "press" : "release", button, x, y);
-    auto& handler = engine->frame->eventHandler();
+    auto& handler = tab->frame->eventHandler();
     auto now = MonotonicTime::now();
+    // A link pressed with the middle button, or with Ctrl: a tab behind
+    // for it once the button is let go (the page sees neither).
+    if (kind == pointerPress && (buttonOf(button) == MouseButton::Middle || (buttonOf(button) == MouseButton::Left && (modifiers & modifierControl)))) {
+        auto result = handler.hitTestResultAtPoint(LayoutPoint(position), { HitTestRequest::Type::ReadOnly, HitTestRequest::Type::Active, HitTestRequest::Type::DisallowUserAgentShadowContent });
+        URL link = result.absoluteLinkURL();
+        if (!link.isEmpty()) {
+            tab->heldLink = link;
+            tab->heldLinkButton = buttonOf(button);
+            return;
+        }
+    }
+    if (kind == pointerRelease && tab->heldLinkButton != MouseButton::None && buttonOf(button) == tab->heldLinkButton) {
+        URL link = std::exchange(tab->heldLink, URL { });
+        tab->heldLinkButton = MouseButton::None;
+        if (Tab* behind = openTab(*engine, false)) {
+            behind->frame->loader().load(FrameLoadRequest(*behind->frame, ResourceRequest(URL { link })));
+            if (engine->trace)
+                fprintf(stderr, "voyager: link %s in tab %d behind\n", link.string().utf8().data(), behind->id);
+        }
+        return;
+    }
     if (kind == pointerPress) {
         auto pressed = buttonOf(button);
         // A press near the last one, soon after: a double (triple) click.
-        if (pressed == engine->pressedButton && now - engine->lastPress < 400_ms && (position - engine->lastPressPosition).diagonalLengthSquared() <= 25)
-            engine->clickCount++;
+        if (pressed == tab->pressedButton && now - tab->lastPress < 400_ms && (position - tab->lastPressPosition).diagonalLengthSquared() <= 25)
+            tab->clickCount++;
         else
-            engine->clickCount = 1;
-        engine->lastPress = now;
-        engine->lastPressPosition = position;
-        engine->pressedButton = pressed;
-        handler.handleMousePressEvent(PlatformMouseEvent(position, position, pressed, PlatformEvent::Type::MousePressed, engine->clickCount, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
+            tab->clickCount = 1;
+        tab->lastPress = now;
+        tab->lastPressPosition = position;
+        tab->pressedButton = pressed;
+        handler.handleMousePressEvent(PlatformMouseEvent(position, position, pressed, PlatformEvent::Type::MousePressed, tab->clickCount, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
     } else if (kind == pointerRelease)
-        handler.handleMouseReleaseEvent(PlatformMouseEvent(position, position, buttonOf(button), PlatformEvent::Type::MouseReleased, engine->clickCount, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
+        handler.handleMouseReleaseEvent(PlatformMouseEvent(position, position, buttonOf(button), PlatformEvent::Type::MouseReleased, tab->clickCount, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
     if (engine->trace && kind == pointerRelease) {
-        auto& selection = engine->frame->selection().selection();
-        auto result = engine->frame->eventHandler().hitTestResultAtPoint(LayoutPoint(position), { HitTestRequest::Type::ReadOnly, HitTestRequest::Type::Active });
+        auto& selection = tab->frame->selection().selection();
+        auto result = tab->frame->eventHandler().hitTestResultAtPoint(LayoutPoint(position), { HitTestRequest::Type::ReadOnly, HitTestRequest::Type::Active });
         RefPtr node = result.innerNode();
         fprintf(stderr, "voyager: selection none %d caret %d editable %d; hit %s\n", selection.isNone(), selection.isCaret(), !!selection.rootEditableElement(), node ? node->nodeName().utf8().data() : "nothing");
     }
     if (kind == pointerMotion)
         handler.handleMouseMoveEvent(PlatformMouseEvent(position, position, button ? buttonOf(button) : MouseButton::None, PlatformEvent::Type::MouseMoved, 0, modifiersOf(modifiers), now, 0, SyntheticClickType::NoTap, MouseEventInputSource::UserDriven));
-    engine->dirty = true;
+    tab->dirty = true;
 }
 
 void engineWheel(Engine* engine, int x, int y, int deltaX, int deltaY)
 {
+    Tab* tab = engine->shown;
+    if (!tab)
+        return;
     if (engine->trace)
         fprintf(stderr, "voyager: wheel %d,%d at %d,%d\n", deltaX, deltaY, x, y);
     IntPoint position(x, y);
     // (WebCore's wheel deltas point the other way: positive scrolls up.)
     PlatformWheelEvent event(position, position, -deltaX, -deltaY, -deltaX / 40.0f, -deltaY / 40.0f, PlatformWheelEventGranularity::ScrollByPixelWheelEvent, false, false, false, false);
-    engine->frame->eventHandler().handleWheelEvent(event, { WheelEventProcessingSteps::SynchronousScrolling, WheelEventProcessingSteps::BlockingDOMEventDispatch });
-    engine->dirty = true;
+    tab->frame->eventHandler().handleWheelEvent(event, { WheelEventProcessingSteps::SynchronousScrolling, WheelEventProcessingSteps::BlockingDOMEventDispatch });
+    tab->dirty = true;
 }
 
 // A key pressed (DOWN 1) or released (0): CODE is its Linux key code, TEXT
@@ -465,6 +689,9 @@ void engineWheel(Engine* engine, int x, int y, int deltaX, int deltaY)
 // typed into the focused editable element, an editing key's command.
 void engineKey(Engine* engine, int down, unsigned code, const char* text, unsigned modifiers)
 {
+    Tab* tab = engine->shown;
+    if (!tab)
+        return;
     String typed = text ? String::fromUTF8(text) : String();
     if (engine->trace)
         fprintf(stderr, "voyager: key %u %s \"%s\" modifiers %u\n", code, down ? "down" : "up", text ? text : "", modifiers);
@@ -481,17 +708,17 @@ void engineKey(Engine* engine, int down, unsigned code, const char* text, unsign
         windowsKeyCode = toASCIIUpper(typed[0]);
     auto type = down ? PlatformEvent::Type::KeyDown : PlatformEvent::Type::KeyUp;
     PlatformKeyboardEvent event(type, down ? typed : String(), down ? typed : String(), key, key, key, windowsKeyCode, false, false, false, modifiersOf(modifiers), MonotonicTime::now());
-    bool handled = engine->frame->eventHandler().keyEvent(event);
-    engine->dirty = true;
+    bool handled = tab->frame->eventHandler().keyEvent(event);
+    tab->dirty = true;
     if (engine->trace && down) {
-        RefPtr focusedFrame = engine->page->focusController().focusedOrMainFrame();
+        RefPtr focusedFrame = tab->page->focusController().focusedOrMainFrame();
         RefPtr document = focusedFrame ? focusedFrame->document() : nullptr;
         RefPtr element = document ? document->focusedElement() : nullptr;
         fprintf(stderr, "voyager: key handled %d, focus %s, editable %d\n", handled, element ? element->localName().string().utf8().data() : "none", focusedFrame ? focusedFrame->editor().canEdit() : -1);
     }
     if (!down || handled)
         return;
-    RefPtr focused = engine->page->focusController().focusedOrMainFrame();
+    RefPtr focused = tab->page->focusController().focusedOrMainFrame();
     if (!focused)
         return;
     auto& editor = focused->editor();
@@ -506,31 +733,35 @@ void engineKey(Engine* engine, int down, unsigned code, const char* text, unsign
 
 char* engineSelectedText(Engine* engine)
 {
-    RefPtr focused = engine->page->focusController().focusedOrMainFrame();
+    Tab* tab = engine->shown;
+    RefPtr focused = tab ? tab->page->focusController().focusedOrMainFrame() : nullptr;
     String text = focused ? focused->editor().selectedText() : String();
     return text.isEmpty() ? nullptr : copied(text);
 }
 
 void engineInsertText(Engine* engine, const char* text)
 {
-    RefPtr focused = engine->page->focusController().focusedOrMainFrame();
+    Tab* tab = engine->shown;
+    RefPtr focused = tab ? tab->page->focusController().focusedOrMainFrame() : nullptr;
     if (!focused || !text)
         return;
     auto& editor = focused->editor();
     if (editor.canEdit())
         editor.insertText(String::fromUTF8(text), nullptr);
-    engine->dirty = true;
+    tab->dirty = true;
 }
 
-char* engineTitle(Engine* engine)
+char* engineTitle(Engine* engine, int id)
 {
-    RefPtr document = engine->frame->document();
+    Tab* tab = tabOf(engine, id);
+    RefPtr document = tab ? tab->frame->document() : nullptr;
     return copied(document ? document->title() : String());
 }
 
-char* engineUrl(Engine* engine)
+char* engineUrl(Engine* engine, int id)
 {
-    RefPtr document = engine->frame->document();
+    Tab* tab = tabOf(engine, id);
+    RefPtr document = tab ? tab->frame->document() : nullptr;
     return copied(document ? document->url().string() : String());
 }
 
@@ -539,33 +770,47 @@ void engineRelease(char* string)
     free(string);
 }
 
-void engineReload(Engine* engine)
+void engineReload(Engine* engine, int id)
 {
-    engine->frame->loader().reload();
-    engine->dirty = true;
+    if (Tab* tab = tabOf(engine, id)) {
+        tab->frame->loader().reload();
+        tab->dirty = true;
+    }
 }
 
-void engineStop(Engine* engine)
+void engineStop(Engine* engine, int id)
 {
-    engine->frame->loader().stopAllLoaders();
-    engine->dirty = true;
+    if (Tab* tab = tabOf(engine, id)) {
+        tab->frame->loader().stopAllLoaders();
+        tab->dirty = true;
+    }
 }
 
-// 1 while the page (or what it loads) is loading.
-int engineLoading(Engine* engine)
+// 1 while the tab's page (or what it loads) is loading.
+int engineLoading(Engine* engine, int id)
 {
-    return engine->frame->loader().isLoading() ? 1 : 0;
+    Tab* tab = tabOf(engine, id);
+    return tab && tab->frame->loader().isLoading() ? 1 : 0;
 }
 
-// The desktop's scheme: the page's appearance follows it at once (its
+// The desktop's scheme: every page's appearance follows it at once (its
 // media queries evaluated again, its styles and the view's background
 // resolved again), no reload.
 void engineSetDark(Engine* engine, int dark)
 {
     if (engine->trace)
         fprintf(stderr, "voyager: appearance %s\n", dark ? "dark" : "light");
-    engine->page->setUseColorAppearance(dark, false);
-    engine->dirty = true;
+    engine->dark = dark;
+    for (auto& tab : engine->tabs.values()) {
+        tab->page->setUseColorAppearance(dark, false);
+        tab->dirty = true;
+    }
+}
+
+// 1 when the tab is painted in forced dark now.
+int engineForcedDark(Engine* engine, int id)
+{
+    return isForcedDark(engine, tabOf(engine, id)) ? 1 : 0;
 }
 
 } // namespace
@@ -623,44 +868,21 @@ int main(int argc, char** argv)
     MlxFrameLoaderClient::setApplicationNameForUserAgent("Voyager"_s, "0.1"_s, "Wayland"_s);
     if (engine.trace)
         fprintf(stderr, "voyager: user agent %s\n", mlxUserAgent("Voyager"_s, "0.1"_s, "Wayland"_s).utf8().data());
-    auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
-    configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine.dirty);
-    configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();
-    configuration.cookieJar = MlxNetwork::cookieJar();
-    configuration.socketProvider = MlxWebSocket::socketProvider();
-    configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
-        CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [size](auto&, auto& frameLoader) {
-            auto client = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, size);
-            engine.client = client.ptr();
-            return client;
-        } },
-        SandboxFlags { },
-        ReferrerPolicy::EmptyString
-    };
-    engine.page = Page::create(WTF::move(configuration));
-    auto& settings = engine.page->settings();
-    settings.setScriptEnabled(true);
-    settings.setAcceleratedCompositingEnabled(false);
-    settings.setLoadsImagesAutomatically(true);
-    settings.setAllowFileAccessFromFileURLs(true);
-    settings.setUsesBackForwardCache(false);
-    engine.frame = engine.page->localMainFrame();
-    if (!engine.frame || !engine.client) {
+    // The first tab, opened by the engine (the window shows it).
+    Tab* first = openTab(engine, true);
+    if (!first) {
         fprintf(stderr, "voyager: the page has no main frame\n");
         return 1;
     }
-    engine.frame->init();
-    engine.page->focusController().setActive(true);
-    engine.page->focusController().setFocused(true);
-    if (!engineLoad(&engine, target)) {
+    if (!loadInto(first, target)) {
         fprintf(stderr, "voyager: %s is no URL\n", target);
         return 2;
     }
 
     VoyagerEngine table {
-        &engine, engineLoad, engineResize, engineCycle, enginePaint, enginePointer, engineWheel, engineKey,
-        engineSelectedText, engineInsertText, engineTitle, engineUrl, engineRelease,
-        engineReload, engineStop, engineLoading, engineSetDark
+        &engine, engineOpen, engineClose, engineSelect, engineOpened, engineLoad, engineResize, engineCycle, enginePaint,
+        enginePointer, engineWheel, engineKey, engineSelectedText, engineInsertText, engineTitle, engineUrl, engineRelease,
+        engineReload, engineStop, engineLoading, engineSetDark, engineForcedDark
     };
     // main's arguments, then the environment with MLX_CANVAS=cpu (the
     // window drawn into wl_shm buffers on the CPU, which the engine

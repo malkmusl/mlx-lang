@@ -221,6 +221,36 @@ Four ways to choose without patching, in this order of preference:
   its prefers-color-scheme box and its text field dark) and switches a
   light one to dark while it runs (both follow, the page is not loaded
   again).
+- **Tabs, the port's theme, forced dark** (Voyager as a browser):
+  std.ui.field holds text of any length (a block of std.heap that grows,
+  wiped when given up; found by halving where a click or the view falls,
+  so a field of kilobytes stays quick), so the address field takes long
+  URLs whole and scrolls to the caret. Voyager has tabs, each a Page of
+  its own in the engine (the bridge's functions take a tab's id: open,
+  close, select, and each tab's title, URL, loading, reload and stop;
+  only the tab shown is painted and gets the events, every tab's loads,
+  timers and rendering updates go on), in a sidebar of std.ui.sidebar
+  (title, a dot while loading, close button; a row for a new tab) that
+  folds to a strip of the tabs' initials, gliding (Ctrl+Shift+B);
+  Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1 to 9; window.open and
+  `target=_blank` (MlxFrameLoaderClient's dispatchCreatePage, then the
+  chrome client's createWindow) open a tab shown, a middle click or
+  Ctrl+click a link's tab behind; closing the last tab closes the window.
+  The port's theme ("The theme") and forced dark mode ("Forced dark
+  mode") are below; Voyager has no setting of its own for the scheme, it
+  follows the desktop's (std.ui.appearance; MLX_COLOR_SCHEME, std.ui's
+  override, for tests). They found in
+  mlx-cc (epoch 10, condreference): a condition declaring a reference
+  (`if (auto& entry = cache[key])`, SystemFontDatabase's cache of a
+  std::optional) tested the reference, never null, instead of the object
+  (its `operator bool`): the system font of every form control was the
+  empty one of 0px, so text fields, buttons and selects had no size and
+  no text. tools/check_voyager.sh opens, shows and closes tabs (a
+  `target=_blank` link, window.open, a middle click whose tab loads
+  behind, the keys), folds the sidebar, loads a URL of 875 bytes and
+  checks forced dark following the desktop; check_webkit_mlx_paint.sh paints a
+  button, a check box, a select and selected text in both schemes, and
+  forced dark.
 
 ### The user agent
 
@@ -279,7 +309,7 @@ port in the tarball that builds WebCore without GLib).
 | Fonts | Skia's typefaces and our font manager over std.fontconfig | below |
 | Text paths | `USE_FONT_VARIANT_VIA_FEATURES` off (GTK and WPE: on) | Kerned and shaped text goes to the complex (HarfBuzz) path through FontCascade::codePath, since GTK's and WPE's own branch for it is under `PLATFORM()`; GLib's layout tests expect it kerned |
 | Text | `USE_ICU` through mlx-unicode | below |
-| Theme | `USE_THEME_ADWAITA` (RenderThemeAdwaita, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
+| Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), registers the digests only and refuses the rest until M7 (`port/crypto/CryptoMlx.cpp`), then `crypto/mlx` ours over std.crypto, std.asn1, std.x509 | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBGL`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
@@ -346,6 +376,73 @@ M4). Skia is to be built for the port without its codecs and encoders
 (lists/skia-mlx.txt, M4), so that Skia needs no image library at all; M2
 links webkit-skia's libSkia.a as it is, whose codecs the port's sources
 do not reach.
+
+### The theme
+
+Pages look like the desktop: their system colours, form controls and
+selection are std.ui.theme's light and dark palettes, which the port's
+C++ asks of the Mlx side (`mlxweb_theme_color`, port/mlx/theme.mlx:
+std.ui.theme's colours in their order, `MlxThemeColors.h`).
+RenderTheme.h declares `RenderTheme::singleton()` as a
+`RenderThemeAdwaita&` and that class's members are `final`, so a theme of
+the port's own cannot be another class: `port/rendering/RenderThemeMlx.cpp`
+defines RenderThemeAdwaita's members (WebKit's RenderThemeAdwaita.cpp,
+which lists/webcore-mlx-skipped.txt leaves out, with its geometry and
+sizes as they are, so layout does not move) with the desktop's colours:
+Canvas (light white, dark the desktop's background), CanvasText and
+FieldText (light black, as pages and WebKit's tests expect; dark the
+desktop's text), Field, ButtonFace, ButtonText, ButtonBorder, GrayText,
+Highlight, Mark, SelectedItem, AccentColor and LinkText (dark: the
+accent), the selection (the accent at 38%, so std.ui's selection colour
+over the canvas, focused or not), the controls' accent and focus rings
+(ThemeAdwaita's accent set to std.ui's). Its style sheet adds a meter's
+colours (RenderThemeAdwaita.h has no `supportsMeter`, so a meter is its
+shadow tree, whose own style sheet only an `!important` rule of the user
+agent's comes before: a page's own meter styles lose to it). The
+controls are drawn by `ControlFactoryMlx.cpp` (ControlFactory::create(),
+WebKit's Adwaita control parts skipped): buttons and selects of the
+button colour with a chevron, check boxes and radio buttons of the
+control colours and the accent, text fields of the field colour in a
+control-coloured outline (the accent's with the focus), progress bars and
+slider tracks of a switch's off colour filled with the accent, a white knob,
+spin buttons; Adwaita's focus rings. Scrollbars stay
+ScrollbarThemeAdwaita's (overlay scrollbars in the scheme's grey).
+
+### Forced dark mode
+
+A page with no dark design of its own is painted dark on a dark desktop,
+always (Voyager has no button, key or setting for it: it follows the
+desktop's scheme, as it does for its toolbar and for the pages'
+`prefers-color-scheme`; on a light desktop pages are painted as they
+are), as Chrome's "Auto Dark Mode for Web Contents" does, by the port's
+painting layer (`MlxDarkMode.h`), not by WebKit: the embedder paints the
+view through `MlxDarkModeCanvas`, a Skia canvas (an `SkNWayCanvas` in
+front of the target) whose draws change their paint: a solid colour
+(boxes, borders, text, SVG's paths) gets its OKLab lightness inverted
+between the desktop's dark background's (0.215) and its text's (0.945),
+its hue and chroma kept (less chroma where it leaves sRGB), so white
+pages turn #1b1b1b, black text light and brand colours stay what they
+are; a gradient or other shader goes through a colour matrix of the same
+inversion in sRGB's luma (chroma kept); raster images (images, image
+backgrounds, canvases, video frames: drawn as images, or as image
+shaders) are drawn as they are. A user style sheet was the other way:
+it cannot reach colours in images of SVG, gradients, `!important` author
+rules and inline styles without rewriting a page's CSS, and it would
+take a page's media queries and computed styles for its own; at paint
+time every colour that reaches the canvas is covered, by one function,
+and nothing of the page changes (scripts read their own colours).
+Whether a page designs for dark (`mlxPageHasDarkDesign`): its root's or
+its meta `color-scheme` allowing dark (`Document::resolvedColorScheme`),
+or a media query on `prefers-color-scheme` with `dark` in a style sheet
+of it, in one it imports or in a rule nested in another (WebCore keeps
+which rules a dynamic media query affects, but not by feature: the
+sheets' rules are read). `webcore-dump --dark --force-dark` paints so (flags for the tests);
+tools/check_webkit_mlx_paint.sh paints `forcedark.html@forcedark` (a
+light page: its canvas, Ahem text and boxes inverted, its image's pixels
+kept), and pages with designs of their own (`scheme.html@forcedark`,
+color-scheme; `mediadark.html@forcedark`, a media query alone) left as
+they are. Content WebCore paints into an image buffer of its own first
+(CSS filters, masks) is composited as an image: not darkened.
 
 ### Images
 
@@ -553,17 +650,6 @@ WPE plan. They go when PlatformMlx does what they did, not before:
 Where WebKit's abstractions may not be met by configuration, selection
 or same-name replacement alone. Each is checked when its milestone comes;
 none is solved by a patch.
-
-- **Dark pages that have no dark styles.** The desktop's dark scheme
-  reaches a page as WebKit has it: `prefers-color-scheme: dark`, and the
-  dark variant of the theme where the page allows it (`color-scheme`).
-  A page that says nothing stays light; darkening such pages (as other
-  browsers' forced dark modes do: colours inverted or remapped at
-  paint) is a later feature of Voyager's of its own. RenderTheme's
-  generic system colours that RenderThemeAdwaita does not give for dark
-  (ButtonFace, ButtonBorder, SelectedItem, Mark) stay the light ones:
-  RenderTheme::singleton() is RenderThemeAdwaita's, so a port theme of
-  its own would replace that file.
 
 - **Unknown platforms in WebCore.** WebCore was never built without a
   `PLATFORM()`: some generic files may `#error` or assume

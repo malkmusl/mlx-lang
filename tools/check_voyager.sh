@@ -31,7 +31,20 @@
 #      page without a reload;
 #  11. a URL of more than 512 bytes (std.ui.field has no fixed size) is
 #      loaded whole, and the address field, focused by Ctrl+L, holds all
-#      of it, scrolled so that its end is in view.
+#      of it, scrolled so that its end is in view;
+#  12. tabs (projects/voyager/tests/tabs.html): a `target=_blank` link and
+#      window.open each open second.html in a new tab, shown; a middle
+#      click on the link opens it in a tab behind, which loads while
+#      another is shown; Ctrl+1, Ctrl+Tab, Ctrl+Shift+Tab and Ctrl+9 show
+#      tabs, Ctrl+T opens one with the address field taking the keys,
+#      Ctrl+W closes them, the last one closing the window; Ctrl+Shift+B
+#      folds the sidebar to its narrow strip and opens it again (the page
+#      moves left by the difference and back);
+#  13. forced dark mode, which follows the desktop (Voyager has no
+#      setting for it): on a dark desktop second.html, which has no dark
+#      design of its own, is painted dark (its white square dark, its blue
+#      kept a blue); the desktop switched to light while it runs, it is
+#      painted as it is again (the square white).
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -180,6 +193,8 @@ read -r link_x link_y link_width link_height <<< "$(box_of "$work/start.ppm" 336
 [[ "${link_width:-0}x${link_height:-0}" == "200x40" ]] || fail "the screenshot has no 200x40 link box of start.html (found: ${link_x:-} ${link_y:-} ${link_width:-}x${link_height:-})"
 x0=$(( link_x - 20 ))
 y0=$(( link_y - 20 ))
+page_x0=$x0
+page_y0=$y0
 echo "ok   Voyager shows start.html (the page at $x0,$y0 of the screen)"
 # The toolbar above the page: its background (under the window's top,
 # right of the buttons, above the address field) light.
@@ -261,7 +276,7 @@ echo "ok   Ctrl+C copies the selection to the clipboard, Ctrl+V pastes it"
 grep -q "^voyager: title second$" "$log" && grep -q "^voyager: url file://.*/projects/voyager/tests/second.html$" "$log" || { cat "$log" >&2; fail "the link was not followed"; }
 echo "ok   a click on the link loads second.html"
 read -r page_x page_y page_width page_height <<< "$(box_of "$work/second.ppm" 3366cc)"
-[[ "${page_x:-}" == "$x0" && "${page_y:-}" == "$y0" && "${page_width:-0}" -ge 790 && "${page_height:-0}" -ge 590 ]] || fail "the screenshot does not show second.html's blue page at $x0,$y0 (found: ${page_x:-} ${page_y:-} ${page_width:-}x${page_height:-})"
+[[ "${page_x:-}" == "$x0" && "${page_y:-}" == "$y0" && "${page_width:-0}" -ge 730 && "${page_height:-0}" -ge 590 ]] || fail "the screenshot does not show second.html's blue page at $x0,$y0 (found: ${page_x:-} ${page_y:-} ${page_width:-}x${page_height:-})"
 python3 -I - "$work/second.ppm" "$(( x0 + 50 ))" "$(( y0 + 50 ))" << 'EOF' || fail "the screenshot does not show second.html's white square at (50, 50)"
 import sys
 data = open(sys.argv[1], "rb").read()
@@ -308,6 +323,60 @@ grep -qxF "voyager: url $long_url" "$log" || { cat "$log" >&2; fail "the URL of 
 grep -qxF "voyager: address focused, ${#long_url} bytes, its end in view" "$log" || { cat "$log" >&2; fail "the address field does not hold the URL of ${#long_url} bytes with its end in view"; }
 echo "ok   a URL of ${#long_url} bytes: loaded whole, the address field holds it and shows its end"
 
+# 12: tabs.
+write_runner "$work/voyager-tabs" tabs.html
+x0=$page_x0
+y0=$page_y0
+ctrl() { printf 'down 29\n'; for key in "$@"; do printf 'down %s\n' "$key"; done; for key in "$@"; do printf 'up %s\n' "$key"; done; printf 'up 29\nwait 1500\n'; }
+{
+    echo "wait 10000"
+    echo "pointer $(( x0 + 120 )) $(( y0 + 40 ))"
+    echo "press 272"; echo "release 272"; echo "wait 5000"
+    ctrl 2
+    echo "pointer $(( x0 + 120 )) $(( y0 + 100 ))"
+    echo "press 272"; echo "release 272"; echo "wait 5000"
+    ctrl 2
+    echo "pointer $(( x0 + 120 )) $(( y0 + 40 ))"
+    echo "press 274"; echo "release 274"; echo "wait 5000"
+    echo "shot $work/tabs.ppm"
+    ctrl 15
+    ctrl 42 15
+    ctrl 20
+    echo "type file://$repo_root/projects/voyager/tests/second.html?typed"
+    echo "enter"; echo "wait 4000"
+    ctrl 17
+    ctrl 42 48
+    echo "shot $work/folded.ppm"
+    ctrl 42 48
+    echo "shot $work/unfolded.ppm"
+    ctrl 10
+    ctrl 17; ctrl 17; ctrl 17; ctrl 17
+    echo "wait 2000"
+    echo "close"
+} > "$work/tabs.script"
+run_scenario tabs "$work/tabs.script" "$work/voyager-tabs"
+log=$work/voyager.log
+grep -q "^voyager: tab 2 title second$" "$log" && grep -q "^voyager: tab 2 shown$" "$log" || { cat "$log" >&2; fail "a target=_blank link did not open second.html in a new tab, shown"; }
+echo "ok   a target=_blank link opens a new tab, shown"
+grep -q "^voyager: tab 3 url file://.*/projects/voyager/tests/second.html?opened$" "$log" && grep -q "^voyager: tab 3 shown$" "$log" || { cat "$log" >&2; fail "window.open did not open a new tab, shown"; }
+echo "ok   window.open opens a new tab, shown"
+loaded=$(grep -n "^voyager: tab 4 title second$" "$log" | head -1 | cut -d: -f1)
+shown=$(grep -n "^voyager: tab 4 shown$" "$log" | head -1 | cut -d: -f1)
+[[ -n "$loaded" && -n "$shown" && "$loaded" -lt "$shown" ]] || { cat "$log" >&2; fail "a middle click on the link did not open it in a tab behind that loads while another is shown"; }
+echo "ok   a middle click opens the link in a tab behind, which loads (background tabs keep running)"
+# (A new tab is shown before its page has a title: the empty ones left out.)
+titles=$(grep "^voyager: title ." "$log" | sed 's/^voyager: title //' | tr '\n' '|')
+[[ "$titles" == "tabs|second|tabs|second|tabs|second|tabs|second|"* ]] || { cat "$log" >&2; fail "Ctrl+1, Ctrl+Tab, Ctrl+Shift+Tab and Ctrl+T did not show the tabs expected (titles: $titles)"; }
+grep -q "^voyager: tab 5 url file://.*/projects/voyager/tests/second.html?typed$" "$log" && grep -q "^voyager: tab 5 closed$" "$log" || { cat "$log" >&2; fail "Ctrl+T and an address typed did not load in a new tab, or Ctrl+W did not close it"; }
+echo "ok   Ctrl+1, Ctrl+Tab, Ctrl+Shift+Tab show tabs; Ctrl+T opens one for an address, Ctrl+W closes it"
+grep -q "^voyager: sidebar width 48$" "$log" && grep -q "^voyager: sidebar width 220$" "$log" || { cat "$log" >&2; fail "Ctrl+Shift+B did not fold the sidebar and open it again"; }
+read -r folded_x _ <<< "$(box_of "$work/folded.ppm" 3366cc)"
+read -r unfolded_x _ <<< "$(box_of "$work/unfolded.ppm" 3366cc)"
+[[ -n "${folded_x:-}" && -n "${unfolded_x:-}" && $(( unfolded_x - folded_x )) -eq 172 ]] || fail "the page did not move with the sidebar (folded at ${folded_x:-?}, open at ${unfolded_x:-?})"
+echo "ok   Ctrl+Shift+B folds the sidebar to its strip (the page 172 pixels further left) and opens it again"
+grep -q "^voyager: the last tab was closed$" "$log" || { cat "$log" >&2; fail "closing every tab did not close the window"; }
+echo "ok   closing the last tab closes the window"
+
 # 9: a dark desktop (MLX_COLOR_SCHEME=dark), a page that allows dark.
 write_runner "$work/voyager-dark" scheme.html MLX_COLOR_SCHEME=dark
 cat > "$work/dark.script" << EOF
@@ -325,7 +394,7 @@ grep -q "^voyager: title scheme:dark$" "$log" || { cat "$log" >&2; fail "the pag
 toolbar=$(pixel_of "$work/dark.ppm" $(( x0 + 300 )) $(( y0 - 38 )))
 [[ $(lightness_of "$toolbar") == dark ]] || fail "the toolbar is not drawn dark for a dark desktop (found #$toolbar)"
 canvas=$(pixel_of "$work/dark.ppm" $(( x0 + 500 )) $(( y0 + 300 )))
-[[ $canvas == 1e1e1e ]] || fail "the page's canvas is not the dark Canvas #1e1e1e (found #$canvas)"
+[[ $canvas == 1a1c24 ]] || fail "the page's canvas is not the dark Canvas #1a1c24 (std.ui.theme's dark background; found #$canvas)"
 scheme=$(pixel_of "$work/dark.ppm" $(( x0 + 70 )) $(( y0 + 100 )))
 [[ $scheme == 0080ff ]] || fail "the page's prefers-color-scheme: dark box is not #0080ff (found #$scheme)"
 input=$(pixel_of "$work/dark.ppm" $(( x0 + 250 )) $(( y0 + 155 )))
@@ -366,4 +435,34 @@ for shot in light dark; do
     [[ $scheme == "$expected" ]] || fail "the prefers-color-scheme box is #$scheme, not #$expected, when $shot"
 done
 echo "ok   a switch of the desktop's scheme: the toolbar and the page follow it, without a reload"
+# 13: forced dark mode, following the desktop.
+write_runner "$work/voyager-forced" second.html
+echo "color-scheme = dark" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
+x0=$page_x0
+y0=$page_y0
+cat > "$work/forced.script" << EOF
+wait 12000
+shot $work/forced.ppm
+wait 4000
+shot $work/unforced.ppm
+close
+EOF
+( for _ in $(seq 1 600); do [[ -f "$work/forced.ppm" ]] && break; sleep 0.1; done
+  sleep 0.5
+  echo "color-scheme = light" > "$XDG_CONFIG_HOME/mlx/appearance.conf" ) &
+switcher=$!
+run_scenario forced "$work/forced.script" "$work/voyager-forced"
+wait "$switcher"
+log=$work/voyager.log
+grep -q "^voyager: tab 1 forced dark yes$" "$log" || { cat "$log" >&2; fail "second.html, which has no dark design, was not painted in forced dark on a dark desktop"; }
+square=$(pixel_of "$work/forced.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
+blue=$(pixel_of "$work/forced.ppm" $(( x0 + 10 )) $(( y0 + 10 )))
+[[ $(lightness_of "$square") == dark ]] || fail "the white square of second.html is not dark in forced dark (#$square)"
+r=$((16#${blue:0:2})); b=$((16#${blue:4:2}))
+(( b > r + 40 )) || fail "the blue of second.html is not kept a blue in forced dark (#$blue)"
+echo "ok   forced dark: on a dark desktop a page without a dark design is painted dark (white #$square, its blue #$blue)"
+grep -q "^voyager: tab 1 forced dark no$" "$log" || { cat "$log" >&2; fail "the page stayed in forced dark when the desktop turned light"; }
+square=$(pixel_of "$work/unforced.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
+[[ $square == ffffff ]] || fail "the square is not white again on a light desktop (#$square)"
+echo "ok   the desktop switched to light: the page is painted as it is again"
 echo "check_voyager.sh: all checks passed"
