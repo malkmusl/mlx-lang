@@ -16,6 +16,8 @@
 #                                       on the way and executablePath
 #   tests/354_xdg_runtime.mlx           std.xdg (the base directories over
 #                                       environments of its own)
+#   tests/411_xdg_open_runtime.mlx      std.xdg.open (default applications,
+#                                       desktop entries' Exec lines)
 #   tests/355_passwd_runtime.mlx        std.passwd (accounts and groups, by
 #                                       name and by number)
 #   tests/356_conf_runtime.mlx          std.conf ("key = value" files)
@@ -116,6 +118,7 @@ run 351_random_runtime "getrandom, xoshiro256**, splitmix64 and xorshift64*"
 run 352_terminal_tty_runtime "a pty's size, raw mode and process groups"
 run 353_fs_whole_files_runtime "files read and written whole, mkdir -p and the program's path"
 run 354_xdg_runtime "the XDG base directories, their defaults and lists"
+run 411_xdg_open_runtime "a file opened with the desktop's application for it: its type, mimeapps.list's default, a desktop entry's MimeType, its Exec line, run"
 run 355_passwd_runtime "accounts and groups by name and number, malformed lines passed over"
 run 356_conf_runtime "settings lines, comments, groups and switches"
 run 357_glob_runtime "stars, sets, ranges, escapes and quoted bytes"
@@ -148,6 +151,7 @@ run 385_flate_gzip_runtime "gzip files written and read in pieces, two members a
 run 386_hash_runtime "wyhash against its reference's vectors, words combined, autoHash and autoEql by type (integers, bools, enums, floats, pointers, optionals, slices, arrays), the string context"
 run 390_heap_runtime "the program's heap: one wherever it is asked for, in the shared region, blocks and their footprints, a GiB reserved, the debug allocator over it under the leak check, deinit"
 run 392_demangle_runtime "C++ names as c++filt writes them (g++'s and clang++'s manglings) and mlx-cc's own spellings; names it cannot read; a cut text"
+run 410_crypto_rsa_sizes_runtime "RSA keys of any size: a 64-bit modulus, 512 bits made and verified in its frame, 4160 bits (numbers and work on the heap) signed, verified and OAEP both ways, d alone, three primes; out of range refused"
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"

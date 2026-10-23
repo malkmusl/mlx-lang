@@ -227,6 +227,25 @@ Four ways to choose without patching, in this order of preference:
   collector found its opaque roots' table full. std.crash now reports
   one thread's crash while another thread crashes (the collector's
   markers both failed the check: two half reports, no frame named).
+- **M7, part 3, done** (its open points closed): mlx-cc's two "gaps" of
+  part 2 were the port's own mistakes (WTF's Vector has a
+  `(FillWith, size, value)` constructor, no `(size, value)` one;
+  `blobRegistry()` gives a CheckedRef, reached with `->`), found by
+  compiling the unit with the original lines; the workarounds are gone
+  and mlx-cc's messages now say so (the class and the arguments' types
+  spelled as C++ writes them, "did you mean '->'?";
+  compiler/cc/tests/cpp/diagnostics). RSA takes keys of up to 16384 bits
+  and of a few (rsa-import-spki-small-key), and of more primes; pairs
+  are made off the main thread; the crypto check runs crypto/workers'
+  78 tests too (231 of 231). Downloads come from the load WebCore made
+  (a POST's attachment with one request), streamed to
+  "NAME.EXT.download", paused and resumed with Range, cancelled, and
+  kept in the profile; Voyager shows them as Safari does (the toolbar's
+  button, its ring and popover; the sidebar's list is gone), and its
+  file chooser has a path field and places, opening where the app last
+  chose. Checks: network 37 of 37 (a POST's attachment, a large
+  download paused, resumed and cancelled, the list across two runs),
+  check_voyager.sh's scenarios 18 to 21.
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -598,29 +617,72 @@ at once (PolicyAction::Download: WebCore's startDownload, while a Blob's
 URL is still registered), a response is when it is an attachment
 (Content-Disposition), a link's download attribute asked for it, or no
 frame shows its type (application/octet-stream) and it is no error (the
-load turned into a download is no failure of the frame's). MlxDownloads
-fetches an http: or https: URL again on the network queue
-(MlxNetwork::fetch: cookies, redirects), reads a blob: URL's bytes from
-the process's blob registry (BlobResourceHandle), decodes a data: URL,
-reads a file: one, and the Mlx side writes the file
-(port/mlx/download.mlx, std.fs): in the embedder's folder, under the
-name the page or the response suggests (sanitized; the type's extension
-when it has none), never over another file ("NAME (1).EXT", made with
-O_EXCL), removed when the download fails. The embedder sees each change
-(MlxDownloads::setObserver) and the list. Voyager's folder is the
-user's download folder (std.xdg.userDirectory: $XDG_DOWNLOAD_DIR, else
-user-dirs.dirs' XDG_DOWNLOAD_DIR, else ~/Downloads); its sidebar shows
-the latest five under "Downloads" (the progress while one runs, the size
-when done), and voyager://downloads all of them, done or failed, each
-file's path and URL. webcore-dump's `--downloads DIR` saves into DIR and
-lists them after its text.
+load turned into a download is no failure of the frame's).
+
+The network streams: a load's head reaches its loader as soon as it is
+in, and a body that is long (more than 64 KiB) or of no known length
+stays on its connection, which leaves the session (std.http.client's
+requestHead), and is read on a thread of its own (readBody, through
+`mlxweb_http_stream_read`) while the network queue goes on; each piece
+reaches the loader on the main thread (such a body is not stored in the
+HTTP cache). A frame's load turned into a download
+(convertMainResourceLoadToDownload) is diverted (MlxNetwork::divert):
+the body of that one request goes on into the download's file, so a
+POST answered with an attachment and a URL good once download right;
+the loader strategy's `remove` stops a body nobody takes. A link's
+download attribute (WebCore's startDownload) and a download resumed
+make a request of their own (MlxNetwork::fetch: cookies, redirects);
+a blob: URL's bytes come from the process's blob registry
+(BlobResourceHandle), a data: URL is decoded, a file: one read.
+
+MlxDownloads writes the bytes as they come, on the reading thread, into
+"NAME.EXT.download" (port/mlx/download.mlx, std.fs: Safari's partial
+file) in the embedder's folder, NAME.EXT the name the page or the
+response suggests (sanitized; the type's extension when it has none),
+one free with its partial file ("NAME (1).EXT", made with O_EXCL);
+once all came it is renamed (RENAME_NOREPLACE, another free name if
+NAME.EXT was taken meanwhile). Pause stops the reading and keeps the
+partial file; resume asks for the rest (`Range: bytes=N-`, If-Range
+the response's ETag or Last-Modified): a 206 goes on, a 200 starts
+again; a download that is no GET cannot be resumed and pausing it
+cancels it; cancel (and a failure) removes the partial file. Each
+download has its rate, start and end, type and state (running,
+paused, done, failed, cancelled), and the list is kept in the profile
+(`downloads.sqlite`, WebCore's SQLiteDatabase): a restart lists it, a
+download that was running paused with its partial file. The embedder
+sees each change (MlxDownloads::setObserver) and the list.
+
+Voyager's folder is the user's download folder (std.xdg.userDirectory:
+$XDG_DOWNLOAD_DIR, else user-dirs.dirs' XDG_DOWNLOAD_DIR, else
+~/Downloads). Its downloads are Safari's: once there is one, a button
+at the toolbar's right end (std.ui.glyphs' download mark), a progress
+ring round it while anything downloads, the mark dropping into it when
+one starts; its popover (std.ui.popup) lists them newest first, each
+its file's mark by type (std.ui.glyphs.fileKind), name, progress bar
+and "12.3 MB of 45.6 MB — 20 s remaining", then its size and "Done"
+(or Paused, Failed, Cancelled), a stop button while it runs, resume and
+cancel once paused, a magnifier once done that shows it in the
+desktop's Files (std.xdg.open with org.mlx.files.desktop, which selects
+a file it is given; else the folder with the folders' application); a
+double click on a finished one opens it with its application
+(std.xdg.open: mimeapps.list's default, else a desktop entry whose
+MimeType lists the type); Clear takes the finished ones off the list.
+voyager://downloads is the full list with the same actions
+(voyager://downloads/ACTION?ID). webcore-dump's `--downloads DIR` saves
+into DIR and lists them after its text; `--download-pause-at` and
+`--download-cancel-at` pause (then resume) or cancel one at a byte
+count, for the network check.
 
 **Uploads**: `<input type=file>` asks the page's chrome client
 (runOpenPanel). Voyager shows std.ui.chooser over the page (new in
 std.ui: a folder's entries, folders first, those the input's `accept`
 does not take dim; one file or several; keys: Up, Down, Enter,
-Backspace, Escape), from the home folder, then the folder last chosen
-in; webcore-dump's `--upload PATH` answers the chooser (clicking the
+Backspace, Escape; a path field: a path typed or pasted, Tab completing
+a name as far as the folder's entries agree, Enter going to a folder or
+opening a file, "/" or "~" over the list starting one; the places on
+the left: Home, the user's folders that exist by std.xdg's user-dirs,
+the root), in the folder Voyager last chose in (the chooser keeps it
+per app in $XDG_STATE_HOME/mlx/chooser/APP_ID), else the home folder; webcore-dump's `--upload PATH` answers the chooser (clicking the
 page's first file input with a user gesture). The files chosen are
 File objects of WebCore's; the port's network sends a form's or a
 FormData's files read from disk (MlxNetwork's body: FormData's files
@@ -821,9 +883,17 @@ the Mlx side's port/mlx/crypto.mlx (MlxWebPort.h's `mlxweb_crypto_*`):
   USE(GCRYPT)'s selection (nothing they include depends on it;
   lists/webcore-mlx-skipped.txt leaves them out of the bundles) and
   defines the platform half.
-- **RSA**: std.crypto.rsa (1024 to 4096 bits), keys made with
-  std.crypto.mpi, the numbers kept for export (JWK's, PKCS #8's CRT
-  values). RSA-PSS needs HAVE(RSA_PSS), which Platform.h sets only with
+- **RSA**: std.crypto.rsa (up to 16384 bits, and a modulus of a few:
+  rsa-import-spki-small-key's 64; a key of more than 4096 bits keeps its
+  numbers and work on the heap), keys made with std.crypto.mpi on a work
+  queue of their own (CryptoKeyRSA::generatePair; the keys made and
+  handed back on the context's thread with
+  ScriptExecutionContext::postTaskTo, as WebKit's Cocoa port does: the
+  other operations are on SubtleCrypto's queue already), the numbers
+  kept for export (JWK's, PKCS #8's CRT values). A key of more than two
+  primes is taken and given back (JWK's `oth`, PKCS #8's version 1 with
+  OtherPrimeInfos), its primes' product checked to be n; it works with d
+  alone (no CRT over more than two primes). RSA-PSS needs HAVE(RSA_PSS), which Platform.h sets only with
   a named crypto library: CryptoKeyRSAMlx.cpp, compiled apart, sets it
   and compiles WebKit's CryptoAlgorithmRSA_PSS.cpp, and registers the
   algorithms. As WebKit's other ports, a PSS salt longer than the digest
@@ -1090,20 +1160,12 @@ What M2 found, and how the port meets it without a patch:
   private (ephemeral) profile, though an ephemeral session already keeps
   local storage in memory. Storage events reach other pages of the
   process only (one process: Voyager's tabs).
-- **What M7's second part leaves.** RSA keys of fewer than 1024 bits
-  (or more than 4096) are refused (std.crypto.rsa's range:
-  rsa-import-spki-small-key's 64-bit modulus) and RSA keys with other
-  primes (JWK's `oth`, PKCS #1 v2's multi-prime) too; key generation
-  runs on the main thread (a 4096-bit key takes seconds); the
-  crypto/workers tests are not run (no worker in webcore-dump's tests
-  yet). A download is fetched again whole, not resumed from the load
-  WebCore made, so a POST that answers with an attachment is fetched as
-  a GET, and its bytes are written once they are all there (the
-  sidebar's progress is a step); there is no dialog to choose a name or
-  a folder, no cancel or open from the sidebar. The file chooser has no
-  path field, no places (home, the download folder) and no previews.
-  mlx-cc refused `Vector<uint8_t>(16, 0)` ("no matching constructor")
-  and a call through `blobRegistry().blobRegistryImpl()` ("no such
-  member") in the port's units, which went around both (`fill`, an
-  accessor of MlxPlatformStrategies); neither came back in a small
-  program, to be found.
+- **What M7 leaves** (after its third part). A key of more than two
+  primes works with d alone (std.crypto.rsa's CRT takes two). A gzip or
+  deflate body is read whole and given decoded at its end (std.flate
+  undoes a whole stream), so such a download shows no progress until
+  then; a streamed body (more than 64 KiB, or of no known length) is not
+  stored in the HTTP cache, and each has a thread of its own while it is
+  read. A download that is no GET cannot be resumed (pausing it cancels
+  it); there is no dialog to choose a name or a folder (Safari's default
+  has none either). The file chooser has no previews.

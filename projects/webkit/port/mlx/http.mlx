@@ -10,6 +10,13 @@
 // Redirects are not followed here: a 3xx response comes back as it is,
 // for WebCore to decide on (ResourceLoader::willSendRequest).
 //
+// A streamed request (STREAMED: the loads of pages, downloads) comes back
+// after the head when its body is long or of a length not known: the body
+// stays on its connection, out of the session (std.http.client's
+// requestHead), and the C++ side reads it on a thread of its own with
+// streamRead, piece by piece, while the network queue goes on with other
+// requests. Such a body is not stored in the HTTP cache.
+//
 // The profile (MlxProfile.cpp, openProfile): the jar is kept in an SQLite
 // database (cookies.mlx) and GET responses in the HTTP cache on disk
 // (httpcache.mlx), which a request consults by its cache mode before it
@@ -123,7 +130,16 @@ const Answer = struct {
     body: usize
     bodyLength: usize
     source: u32
+    // The body still on its connection (a client.Body on the heap; 0:
+    // none, the body is whole above) and the length its head gave (-1:
+    // none).
+    stream: usize
+    streamLength: i64
 }
+
+// A body this long or shorter is read whole even when streamed (and may
+// be cached).
+const WHOLE_BODY: i64 = 65536
 
 fn answerAt(address: usize) -> *Answer { return unsafe { @ptrFromInt(*Answer, address) } }
 
@@ -138,6 +154,8 @@ fn newAnswer() -> usize {
     answer.*.body = 0
     answer.*.bodyLength = 0
     answer.*.source = SOURCE_NETWORK
+    answer.*.stream = 0
+    answer.*.streamLength = -1
     return address
 }
 
@@ -172,7 +190,7 @@ fn statusOf(head: []const u8) -> u32 {
 // strings, BODY has BODY_LENGTH bytes (HAS_BODY 0: none), MODE the cache's
 // (CACHE_*: the profile's HTTP cache, httpcache.mlx, answers a GET from
 // disk when it may, revalidates, stores). The answer, or 0 without memory.
-pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyLength: usize, hasBody: bool, mode: u32) -> usize {
+pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyLength: usize, hasBody: bool, mode: u32, streamed: bool) -> usize {
     prepare()
     const address = newAnswer()
     if address == 0 { return 0 }
@@ -183,14 +201,14 @@ pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyL
     if !cached || httpcache.isConditional(lines) {
         const requestTime = httpcache.now()
         var response: client.Response = undefined
-        const result = send(methodText, urlText, lines, bytesAt(body, bodyLength), hasBody, &response)
+        const result = send(methodText, urlText, lines, bytesAt(body, bodyLength), hasBody, &response, if streamed { address } else { 0 })
         if result != client.Error.none {
             answerAt(address).*.failure = failureOf(result)
             return address
         }
         const head = response.head.bytes[0..response.head.length]
         const got = response.body.bytes[0..response.body.length]
-        if cached && response.status != 304 { httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now()) }
+        if cached && response.status != 304 && answerAt(address).*.stream == 0 { httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now()) }
         if !isSafe(methodText) && response.status < 400 { httpcache.invalidate(urlText, lines) }
         fill(address, response.status, head, got, SOURCE_NETWORK)
         client.freeResponse(&session, &response)
@@ -217,7 +235,7 @@ pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyL
     var response: client.Response = undefined
     var sent: []const u8 = lines
     if validating { sent = conditional.items() }
-    const result = send(methodText, urlText, sent, bytesAt(body, bodyLength), hasBody, &response)
+    const result = send(methodText, urlText, sent, bytesAt(body, bodyLength), hasBody, &response, if streamed { address } else { 0 })
     if result != client.Error.none {
         answerAt(address).*.failure = failureOf(result)
         return address
@@ -232,15 +250,112 @@ pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyL
         client.freeResponse(&session, &response)
         return address
     }
-    httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now())
+    if answerAt(address).*.stream == 0 { httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now()) }
     fill(address, response.status, head, got, SOURCE_NETWORK)
     client.freeResponse(&session, &response)
     return address
 }
 
-fn send(method: []const u8, url: []const u8, lines: []const u8, body: []const u8, hasBody: bool, response: *client.Response) -> client.Error {
+// Sends a request; for a streamed one (ANSWER not 0) a body that is long
+// or of no known length stays on its connection, in the answer's stream,
+// and one that is short is read now into the response.
+fn send(method: []const u8, url: []const u8, lines: []const u8, body: []const u8, hasBody: bool, response: *client.Response, answer: usize) -> client.Error {
     const req = client.Request.{ .method = method, .url = url, .headers = lines, .body = body, .hasBody = hasBody }
-    return client.request(&session, &req, response)
+    if answer == 0 { return client.request(&session, &req, response) }
+    const memory = std.heap.allocator().alloc(@sizeOf(client.Body), 16)
+    if memory == null { return client.Error.noMemory }
+    const left: *client.Body = unsafe { @ptrCast(*client.Body, memory.?) }
+    const result = client.requestHead(&session, &req, response, left)
+    if result != client.Error.none {
+        std.heap.allocator().free(memory.?, @sizeOf(client.Body), 16)
+        return result
+    }
+    const length = client.bodyLength(left)
+    if length >= 0 && length <= WHOLE_BODY {
+        // (Short: read now, as request reads it.)
+        var whole = Whole.{ .response = response, .failed = false }
+        const read = client.readBody(left, client.BodySink.{ .context = @intFromPtr(&whole), .write = wholeWrite })
+        std.heap.allocator().free(memory.?, @sizeOf(client.Body), 16)
+        if read != client.Error.none || whole.failed {
+            client.freeResponse(&session, response)
+            return if read != client.Error.none { read } else { client.Error.noMemory }
+        }
+        return client.Error.none
+    }
+    answerAt(answer).*.stream = @intFromPtr(left)
+    answerAt(answer).*.streamLength = length
+    return client.Error.none
+}
+
+const Whole = struct {
+    response: *client.Response
+    failed: bool
+}
+
+fn wholeWrite(context: usize, data: []const u8) -> bool {
+    const whole: *Whole = unsafe { @ptrFromInt(*Whole, context) }
+    const into = &whole.*.response.*.body
+    const needed = into.*.length + data.length
+    if needed > into.*.capacity {
+        var capacity = if into.*.capacity == 0 { 4096 } else { into.*.capacity * 2 }
+        while capacity < needed { capacity *= 2 }
+        const memory = session.allocator.alloc(capacity, 16)
+        if memory == null {
+            whole.*.failed = true
+            return false
+        }
+        var i: usize = 0
+        while i < into.*.length {
+            memory.?[i] = into.*.bytes[i]
+            i += 1
+        }
+        if into.*.capacity != 0 { session.allocator.free(into.*.bytes, into.*.capacity, 16) }
+        into.*.bytes = memory.?
+        into.*.capacity = capacity
+    }
+    var i: usize = 0
+    while i < data.length {
+        into.*.bytes[into.*.length + i] = data[i]
+        i += 1
+    }
+    into.*.length = needed
+    return true
+}
+
+// The length the head gave a streamed body (-1: none; 0 when there is
+// no stream).
+pub fn streamLength(answer: usize) -> i64 { return if answer == 0 || answerAt(answer).*.stream == 0 { 0 } else { answerAt(answer).*.streamLength } }
+pub fn hasStream(answer: usize) -> bool { return answer != 0 && answerAt(answer).*.stream != 0 }
+
+// The C++ side's sink of a streamed body: called with each piece, 0 to
+// stop.
+const PieceFn = fn(usize, usize, usize) -> u32
+
+const Piece = struct {
+    callback: usize
+    context: usize
+}
+
+fn pieceWrite(context: usize, data: []const u8) -> bool {
+    const piece: *Piece = unsafe { @ptrFromInt(*Piece, context) }
+    const target: PieceFn = unsafe { @ptrFromInt(PieceFn, piece.*.callback) }
+    return target(piece.*.context, @intFromPtr(data.pointer), data.length) != 0
+}
+
+// Reads the answer's streamed body to its end into CALLBACK(CONTEXT,
+// bytes, length) on the calling thread (any one: the body is no longer
+// the session's); 0 when it was all read, 1 when the callback stopped
+// it, 2 when the connection failed. The stream is gone after.
+pub fn streamRead(answer: usize, callback: usize, context: usize) -> u32 {
+    if answer == 0 || answerAt(answer).*.stream == 0 { return 0 }
+    const left: *client.Body = unsafe { @ptrFromInt(*client.Body, answerAt(answer).*.stream) }
+    var piece = Piece.{ .callback = callback, .context = context }
+    const result = client.readBody(left, client.BodySink.{ .context = @intFromPtr(&piece), .write = pieceWrite })
+    std.heap.allocator().free(unsafe { @ptrFromInt([*]u8, answerAt(answer).*.stream) }, @sizeOf(client.Body), 16)
+    answerAt(answer).*.stream = 0
+    if result == client.Error.none { return 0 }
+    if result == client.Error.stopped { return 1 }
+    return 2
 }
 
 pub fn source(answer: usize) -> u32 { return if answer == 0 { SOURCE_NETWORK } else { answerAt(answer).*.source } }
@@ -267,6 +382,12 @@ pub fn bodyLength(answer: usize) -> usize { return if answer == 0 { 0 } else { a
 
 pub fn release(answer: usize) -> void {
     if answer == 0 { return }
+    if answerAt(answer).*.stream != 0 {
+        // (A body never read: its connection closed.)
+        const left: *client.Body = unsafe { @ptrFromInt(*client.Body, answerAt(answer).*.stream) }
+        client.freeBody(left)
+        std.heap.allocator().free(unsafe { @ptrFromInt([*]u8, answerAt(answer).*.stream) }, @sizeOf(client.Body), 16)
+    }
     if answerAt(answer).*.head != 0 { free(answerAt(answer).*.head) }
     if answerAt(answer).*.body != 0 { free(answerAt(answer).*.body) }
     free(answer)

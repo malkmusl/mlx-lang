@@ -64,13 +64,30 @@
 #  16. downloads: projects/voyager/tests/download.html saves a Blob and a
 #      file's link (download attributes) into the download folder
 #      (XDG_DOWNLOAD_DIR, a temporary one), each kept with what it holds;
-#      the sidebar lists them under "Downloads", and voyager://downloads
-#      (typed into the address field) shows each one done, its size and
-#      where it is;
+#      voyager://downloads (typed into the address field) shows each one
+#      done, its size and where it is;
 #  17. an upload: a click on projects/voyager/tests/upload.html's
 #      <input type=file> opens the file chooser (std.ui.chooser) over the
 #      page in the home folder; Down chooses the only file there, Enter
-#      opens it, and the page reads it (FileReader: "uploaded:NAME:TEXT").
+#      opens it, and the page reads it (FileReader: "uploaded:NAME:TEXT");
+#  18. the downloads button and popover (Safari's): a page of the
+#      network check's test server (tools/http-test-server, here too)
+#      starts a slow download (2 MiB in 8 s): the toolbar's downloads
+#      button appears with a progress ring round it (the screenshot has
+#      the accent there) and the download drops into it; a click opens
+#      the popover, which lists it with its progress ("... of 2.0 MB —
+#      ... remaining"), then "2.0 MB — Done" (traced, and the popover's
+#      screenshots); the file is whole;
+#  19. the list survives a restart (the profile's downloads.sqlite):
+#      Voyager started again on another page shows the button at once (no
+#      drop), its popover the download done; Clear empties it (the button
+#      hides, the file stays);
+#  20. on a dark desktop the popover of finished downloads is dark;
+#  21. the file chooser's places and path field: from a home of folders,
+#      a click on the place "Downloads" goes there, "~/Docu" typed and Tab
+#      complete "~/Documents/", Enter goes there, Down and Enter choose
+#      its file, which the page reads; the chooser started again opens in
+#      Documents (the folder Voyager last chose in, kept).
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -571,4 +588,84 @@ log=$work/voyager.log
 grep -qxF "voyager: file chooser in $work/upload-home" "$log" || { cat "$log" >&2; fail "a click on the page's <input type=file> did not open the file chooser in the home folder"; }
 grep -qx "voyager: chose 1 files" "$log" && grep -qxF "voyager: title uploaded:upload-me.txt:hello from the chooser" "$log" || { cat "$log" >&2; fail "the file chosen did not reach the page"; }
 echo "ok   the file chooser (std.ui.chooser) gives the file chosen to the page, which reads it"
+# 18-21: the server of the network check's pages (their slow download).
+"$compiler" --quiet tools/http-test-server/main.mlx -o "$work/http-test-server" || fail "tools/http-test-server does not compile"
+setsid "$work/http-test-server" "$repo_root/projects/webkit/tests/network/site" > "$work/server.port" 2> "$work/server.log" &
+server_pid=$!
+trap '[[ -n "$keep" ]] && mkdir -p "$keep" && cp "$work"/*.ppm "$work"/voyager.log "$keep"/ 2> /dev/null; kill -- -"$server_pid" 2> /dev/null; rm -rf -- "$work"' EXIT
+for _ in $(seq 1 50); do [[ -s "$work/server.port" ]] && break; sleep 0.1; done
+port=$(head -1 "$work/server.port")
+[[ -n "$port" ]] || fail "the test server did not start: $(cat "$work/server.log")"
+# The button at the toolbar's right end, the popover under it (the
+# window 960 wide: the page 740), its Clear.
+button_x=$(( x0 + 720 )); button_y=$(( y0 - 21 ))
+clear_x=$(( x0 + 697 )); clear_y=$(( y0 + 88 ))
+# 18: a slow download, the button's ring, the popover running then done.
+mkdir -p "$work/dl-home"
+dl_downloads=$work/dl-downloads
+write_runner "$work/voyager-dl" "http://127.0.0.1:$port/download-slow.html" HOME="$work/dl-home" XDG_DOWNLOAD_DIR="$dl_downloads"
+printf 'wait 4500\nshot %s\npointer %d %d\npress 272\nrelease 272\nwait 800\nshot %s\nwait 9000\nshot %s\nclose\n' "$work/downloads-ring.ppm" $button_x $button_y "$work/downloads-popover-running.ppm" "$work/downloads-popover-done.ppm" > "$work/dl.script"
+run_scenario dl "$work/dl.script" "$work/voyager-dl"
+log=$work/voyager.log
+grep -qx "voyager: downloads button shown" "$log" && grep -qx "voyager: download dropped into the button" "$log" || { cat "$log" >&2; fail "the downloads button did not appear with the download dropping into it"; }
+accent=$(python3 -I -c '
+import sys
+data = open(sys.argv[1], "rb").read()
+parts = data.split(maxsplit=4)
+width = int(parts[1])
+x0, y0 = int(sys.argv[2]), int(sys.argv[3])
+count = 0
+for y in range(y0, y0 + 28):
+    for x in range(x0, x0 + 28):
+        r, g, b = parts[4][(y * width + x) * 3:(y * width + x) * 3 + 3]
+        if b > 180 and r < 140 and b > r + 60:
+            count += 1
+print(count)' "$work/downloads-ring.ppm" $(( button_x - 14 )) $(( button_y - 14 )))
+(( accent >= 8 )) || fail "no progress ring round the downloads button while it downloads ($accent pixels of the accent)"
+echo "ok   a download shows the toolbar's downloads button, a progress ring round it ($accent pixels), the download dropped into it"
+grep -q "^voyager: downloads popover open$" "$log" && grep -Eq "^voyager: download row slow.bin: [0-9.]+ [kM]?B of 2.0 MB — [0-9]+ (s|min) remaining$" "$log" && grep -qx "voyager: download row slow.bin: 2.0 MB — Done" "$log" || { cat "$log" >&2; fail "the popover does not list the download with its progress, then done"; }
+popover=$(pixel_of "$work/downloads-popover-done.ppm" $(( x0 + 400 )) $(( y0 + 20 )))
+[[ $(lightness_of "$popover") == light ]] || fail "the popover is not shown under the button (found #$popover)"
+[[ $(stat -c %s "$dl_downloads/slow.bin") == 2097152 && ! -e "$dl_downloads/slow.bin.download" ]] || fail "the slow download is not whole in $dl_downloads"
+echo "ok   the popover lists the download with its progress, then 2.0 MB — Done; the file is whole"
+# 19: the list after a restart; Clear.
+write_runner "$work/voyager-dl-again" start.html HOME="$work/dl-home" XDG_DOWNLOAD_DIR="$dl_downloads"
+printf 'wait 9000\npointer %d %d\npress 272\nrelease 272\nwait 800\nshot %s\npointer %d %d\npress 272\nrelease 272\nwait 1000\nshot %s\nclose\n' $button_x $button_y "$work/downloads-popover-kept.ppm" $clear_x $clear_y "$work/downloads-cleared.ppm" > "$work/dl-again.script"
+run_scenario dl-again "$work/dl-again.script" "$work/voyager-dl-again"
+log=$work/voyager.log
+grep -qx "voyager: downloads button shown" "$log" && ! grep -q "dropped into the button" "$log" && grep -qx "voyager: download row slow.bin: 2.0 MB — Done" "$log" || { cat "$log" >&2; fail "the downloads were not listed after a restart"; }
+echo "ok   the downloads' list survives a restart: the button and its popover show the download done"
+grep -qx "voyager: downloads cleared" "$log" && grep -qx "voyager: downloads button hidden" "$log" && [[ -f "$dl_downloads/slow.bin" ]] || { cat "$log" >&2; fail "Clear did not empty the list (or took the file)"; }
+echo "ok   Clear takes the finished downloads off the list (the button hides), their files stay"
+# 20: the popover on a dark desktop.
+mkdir -p "$work/dark-dl-home"
+write_runner "$work/voyager-dl-dark" download.html HOME="$work/dark-dl-home" XDG_DOWNLOAD_DIR="$work/dark-downloads" MLX_COLOR_SCHEME=dark
+printf 'wait 7000\npointer %d %d\npress 272\nrelease 272\nwait 800\nshot %s\nclose\n' $button_x $button_y "$work/downloads-popover-dark.ppm" > "$work/dl-dark.script"
+run_scenario dl-dark "$work/dl-dark.script" "$work/voyager-dl-dark"
+grep -qx "voyager: download row voyager-note.txt: 44 B — Done" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "the dark popover does not list the downloads done"; }
+popover=$(pixel_of "$work/downloads-popover-dark.ppm" $(( x0 + 400 )) $(( y0 + 20 )))
+[[ $(lightness_of "$popover") == dark ]] || fail "the popover is not dark on a dark desktop (found #$popover)"
+echo "ok   on a dark desktop the popover is dark (#$popover)"
+# 21: the chooser's places and path field.
+chooser_home=$work/chooser-home
+mkdir -p "$chooser_home/Documents" "$chooser_home/Downloads" "$chooser_home/Pictures"
+echo "a report for the chooser" > "$chooser_home/Documents/report.txt"
+echo "hello" > "$chooser_home/hello.txt"
+write_runner "$work/voyager-chooser" upload.html HOME="$chooser_home" XDG_STATE_HOME="$work/chooser-state"
+{
+    printf 'wait 9000\npointer %d %d\npress 272\nrelease 272\nwait 2000\nshot %s\n' $(( x0 + 120 )) $(( y0 + 50 )) "$work/chooser-places.ppm"
+    printf 'pointer %d %d\npress 272\nrelease 272\nwait 800\n' $(( x0 + 76 )) $(( y0 + 201 ))
+    printf 'type ~/Docu\nwait 300\ndown 15\nup 15\nwait 500\nshot %s\n' "$work/chooser-path.ppm"
+    printf 'down 28\nup 28\nwait 800\ndown 108\nup 108\nwait 300\ndown 28\nup 28\nwait 3000\nclose\n'
+} > "$work/chooser.script"
+run_scenario chooser "$work/chooser.script" "$work/voyager-chooser"
+log=$work/voyager.log
+grep -qxF "voyager: file chooser in $chooser_home" "$log" && grep -qxF "voyager: chooser in $chooser_home/Downloads" "$log" || { cat "$log" >&2; fail "a click on the chooser's place Downloads did not go there"; }
+echo "ok   the chooser's places: a click on Downloads goes there"
+grep -qxF "voyager: chooser in $chooser_home/Documents" "$log" && grep -qxF "voyager: title uploaded:report.txt:a report for the chooser" "$log" || { cat "$log" >&2; fail "~/Docu, Tab and Enter in the path field did not go to Documents, or its file was not chosen"; }
+echo "ok   the chooser's path field: ~/Docu and Tab complete ~/Documents/, Enter goes there, its file is chosen"
+printf 'wait 9000\npointer %d %d\npress 272\nrelease 272\nwait 2000\ndown 1\nup 1\nwait 800\nclose\n' $(( x0 + 120 )) $(( y0 + 50 )) > "$work/chooser-again.script"
+run_scenario chooser-again "$work/chooser-again.script" "$work/voyager-chooser"
+grep -qxF "voyager: file chooser in $chooser_home/Documents" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "the chooser did not open in the folder Voyager last chose in"; }
+echo "ok   the chooser opens in the folder the app last chose in (kept in XDG_STATE_HOME)"
 echo "check_voyager.sh: all checks passed"

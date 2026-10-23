@@ -16,7 +16,6 @@
 namespace WebCore {
 
 class BlobData;
-class BlobRegistryImpl;
 
 class MlxPlatformStrategies final : public PlatformStrategies {
 public:
@@ -24,7 +23,6 @@ public:
 
     // The blob of a blob: URL in the process's registry (null: none).
     static BlobData* blobData(const URL&);
-    static BlobRegistryImpl* blobRegistryImpl();
 
 private:
     MlxPlatformStrategies() = default;

@@ -82,6 +82,7 @@
 #include "port/embed/MlxSchemeHandler.h"
 #include "port/embed/MlxProfile.h"
 #include "port/embed/MlxDownloads.h"
+#include <wtf/text/StringToIntegerConversion.h>
 #include "FileChooser.h"
 #include <wtf/FileSystem.h>
 #include <hb-version.h>
@@ -126,6 +127,22 @@ namespace {
 // events and paint go to the tab shown (select).
 struct Engine;
 
+// A download's facts for the window (voyager.mlx's DownloadFacts): its
+// bytes so far and expected (0: not known), bytes a second lately, its
+// id, its state (0 running, 1 done, 2 failed, 3 paused, 4 cancelled),
+// whether it can be resumed after a pause.
+struct VoyagerDownload {
+    uint64_t received;
+    uint64_t expected;
+    uint64_t rate;
+    uint32_t id;
+    int32_t state;
+    int32_t resumable;
+    int32_t reserved;
+};
+
+enum : int { DownloadPause, DownloadResume, DownloadCancel, DownloadClear };
+
 struct VoyagerEngine {
     Engine* engine;
     int (*open)(Engine*, const char* url);
@@ -156,12 +173,18 @@ struct VoyagerEngine {
     char* (*chooser)(Engine*, int* multiple);
     void (*choose)(Engine*, const char* paths);
     // Where downloads are saved (Voyager's XDG_DOWNLOAD_DIR), and the
-    // downloads: how many, and each one's name (released), its bytes so
-    // far and expected (0: not known), its state (0 running, 1 done, 2
-    // failed).
+    // downloads (in the order they started): how many, and each one's
+    // name (released) and facts (VoyagerDownload).
     void (*setDownloads)(Engine*, const char* directory);
     int (*downloadCount)(Engine*);
-    char* (*download)(Engine*, int index, uint64_t* received, uint64_t* expected, int* state);
+    char* (*download)(Engine*, int index, VoyagerDownload*);
+    // A download's path (the file's once done, its partial file's while
+    // it runs; released) and MIME type (released), by index.
+    char* (*downloadPath)(Engine*, int index);
+    char* (*downloadType)(Engine*, int index);
+    // A download paused (DOWNLOAD_PAUSE), resumed, cancelled, by its id;
+    // the finished ones cleared off the list (DOWNLOAD_CLEAR, no id).
+    void (*downloadAction)(Engine*, unsigned id, int action);
 };
 
 // The modifiers as voyager.mlx gives them.
@@ -949,16 +972,52 @@ int engineDownloadCount(Engine*)
     return MlxDownloads::list().size();
 }
 
-char* engineDownload(Engine*, int index, uint64_t* received, uint64_t* expected, int* state)
+static const MlxDownloads::Download* downloadAt(int index)
 {
     auto& list = MlxDownloads::list();
     if (index < 0 || static_cast<size_t>(index) >= list.size())
         return nullptr;
-    auto& download = list[index];
-    *received = download.received;
-    *expected = download.expected;
-    *state = download.state == MlxDownloads::State::Running ? 0 : download.state == MlxDownloads::State::Done ? 1 : 2;
-    return copied(download.path.isEmpty() ? download.name : FileSystem::pathFileName(download.path));
+    return &list[index];
+}
+
+char* engineDownload(Engine*, int index, VoyagerDownload* facts)
+{
+    auto* download = downloadAt(index);
+    if (!download)
+        return nullptr;
+    using State = MlxDownloads::State;
+    facts->received = download->received;
+    facts->expected = download->expected;
+    facts->rate = static_cast<uint64_t>(download->rate);
+    facts->id = download->id;
+    facts->state = download->state == State::Running ? 0 : download->state == State::Done ? 1 : download->state == State::Failed ? 2 : download->state == State::Paused ? 3 : 4;
+    facts->resumable = download->resumable;
+    facts->reserved = 0;
+    return copied(download->name);
+}
+
+char* engineDownloadPath(Engine*, int index)
+{
+    auto* download = downloadAt(index);
+    return download ? copied(download->path) : nullptr;
+}
+
+char* engineDownloadType(Engine*, int index)
+{
+    auto* download = downloadAt(index);
+    return download ? copied(download->mimeType) : nullptr;
+}
+
+void engineDownloadAction(Engine*, unsigned id, int action)
+{
+    if (action == DownloadPause)
+        MlxDownloads::pause(id);
+    else if (action == DownloadResume)
+        MlxDownloads::resume(id);
+    else if (action == DownloadCancel)
+        MlxDownloads::cancel(id);
+    else if (action == DownloadClear)
+        MlxDownloads::clearFinished();
 }
 
 } // namespace
@@ -1053,6 +1112,9 @@ static String userDirectory(const char* variable, ASCIILiteral fallback)
 }
 
 extern "C" void voyager_page(const char* url, const char* const* facts, size_t count, void (*deliver)(void*, uint32_t, const uint8_t*, size_t), void* context);
+// Opens a file with its application (SHOW: its folder in Files, the file
+// selected), voyager.mlx's over std.xdg.open; 0 when nothing could be.
+extern "C" uint32_t voyager_open_file(const char* path, uint32_t show);
 
 // A request of voyager:: the icon from the build, every other page made by
 // pages.mlx.
@@ -1063,21 +1125,34 @@ void answerInternal(MlxSchemeTask& task)
         task.respond(200, "image/png"_s, String(), Vector<uint8_t>(std::span<const uint8_t>(voyagerIcon, sizeof(voyagerIcon))));
         return;
     }
-    // (voyager://downloads: the downloads, each its name and what it is.)
+    // (voyager://downloads: the downloads, each its name and what it is:
+    // its state, bytes, expected bytes, path or error, URL, id and whether
+    // it can be resumed. voyager://downloads/ACTION?ID does ACTION to
+    // one (pause, resume, cancel, open, show; clear: the finished ones
+    // off the list), then shows the list.)
     Vector<std::pair<CString, CString>> downloadFacts;
     bool downloadsPage = equalLettersIgnoringASCIICase(url.host(), "downloads"_s);
     if (downloadsPage) {
+        auto action = url.path();
+        unsigned id = parseInteger<unsigned>(url.query()).value_or(0);
+        if (action == "/pause"_s)
+            MlxDownloads::pause(id);
+        else if (action == "/resume"_s)
+            MlxDownloads::resume(id);
+        else if (action == "/cancel"_s)
+            MlxDownloads::cancel(id);
+        else if (action == "/clear"_s)
+            MlxDownloads::clearFinished();
+        else if ((action == "/open"_s || action == "/show"_s) && MlxDownloads::find(id) && MlxDownloads::find(id)->state == MlxDownloads::State::Done) {
+            auto path = MlxDownloads::find(id)->path.utf8();
+            voyager_open_file(path.data(), action == "/show"_s);
+        }
         downloadFacts.append({ CString("Directory"), MlxDownloads::directory().utf8() });
         for (auto& download : MlxDownloads::list()) {
-            String name = download.path.isEmpty() ? download.name : FileSystem::pathFileName(download.path);
-            String what;
-            if (download.state == MlxDownloads::State::Done)
-                what = makeString("done\t"_s, download.received, "\t"_s, download.path, '\t', download.url);
-            else if (download.state == MlxDownloads::State::Failed)
-                what = makeString("failed\t"_s, download.received, "\t"_s, download.error, '\t', download.url);
-            else
-                what = makeString("running\t"_s, download.received, '/', download.expected, "\t\t"_s, download.url);
-            downloadFacts.append({ name.utf8(), what.utf8() });
+            using State = MlxDownloads::State;
+            ASCIILiteral state = download.state == State::Done ? "done"_s : download.state == State::Failed ? "failed"_s : download.state == State::Paused ? "paused"_s : download.state == State::Cancelled ? "cancelled"_s : "running"_s;
+            String what = makeString(state, '\t', download.received, '\t', download.expected, '\t', download.state == State::Failed ? download.error : download.path, '\t', download.url, '\t', download.id, '\t', download.resumable ? "1"_s : "0"_s);
+            downloadFacts.append({ download.name.utf8(), what.utf8() });
         }
     }
     auto& shownFacts = downloadsPage ? downloadFacts : facts();
@@ -1166,7 +1241,10 @@ int main(int argc, char** argv)
     gatherFacts(argc, argv);
     MlxSchemeHandler::registerScheme("voyager"_s, answerInternal);
     // Each download's end, on standard error (tools/check_voyager.sh).
-    MlxDownloads::setObserver([](const MlxDownloads::Download& download) {
+    MlxDownloads::setObserver([](const MlxDownloads::Download* changed) {
+        if (!changed)
+            return;
+        auto& download = *changed;
         if (download.state == MlxDownloads::State::Done)
             fprintf(stderr, "voyager: download done %s (%llu bytes)\n", download.path.utf8().data(), static_cast<unsigned long long>(download.received));
         else if (download.state == MlxDownloads::State::Failed)
@@ -1189,7 +1267,8 @@ int main(int argc, char** argv)
         &engine, engineOpen, engineClose, engineSelect, engineOpened, engineLoad, engineResize, engineCycle, enginePaint,
         enginePointer, engineWheel, engineKey, engineSelectedText, engineInsertText, engineTitle, engineUrl, engineRelease,
         engineReload, engineStop, engineLoading, engineSetDark, engineForcedDark,
-        engineChooser, engineChoose, engineSetDownloads, engineDownloadCount, engineDownload
+        engineChooser, engineChoose, engineSetDownloads, engineDownloadCount, engineDownload,
+        engineDownloadPath, engineDownloadType, engineDownloadAction
     };
     // main's arguments, then the environment with MLX_CANVAS=cpu (the
     // window drawn into wl_shm buffers on the CPU, which the engine

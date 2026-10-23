@@ -25,7 +25,8 @@
 # loaded as it is) loads and fetches its own URLs, a 404 among them.
 #
 # Downloads and uploads (M7, PORT.md "Downloads", "Uploads"): pages named
-# download* run with --downloads DIR of their own: site/download.html's
+# download* run with --downloads DIR of their own (a partial file
+# NAME.download never left there): site/download.html's
 # links (a download attribute twice: the second file kept apart as
 # "note (1).txt"; a Blob's URL; a data: URL; then /download/attachment,
 # Content-Disposition: attachment) and site/download-type.html
@@ -130,13 +131,20 @@ while read -r name path wait; do
         extra=(--downloads "$saved")
     fi
     case $name in
+        download-large) extra+=(--download-pause-at 1048576) ;;
+        download-cancel) extra+=(--download-cancel-at 1048576) ;;
         upload) extra=(--upload "$network/uploads/upload-a.txt") ;;
         upload-*) extra=(--upload "$network/uploads/upload-a.txt" --upload "$network/uploads/upload-b.txt") ;;
     esac
     dump "$url" "${scheme[@]}" "${extra[@]}" ${wait:+--wait-title "$wait"} | sed -e "s/127\.0\.0\.1:\($port\|$tls_port\)/127.0.0.1:PORT/g" -e 's/WebKitFormBoundary[A-Za-z0-9]*/WebKitFormBoundary/g' -e 's/[[:space:]]*$//' > "$work/$name.txt"
     if [[ -n "$saved" ]]; then
         for file in "$saved"/*; do
-            [[ -f "$file" ]] && echo "saved $(basename "$file"): $(cat "$file")" >> "$work/$name.txt"
+            [[ -f "$file" ]] || continue
+            if [[ $(stat -c %s "$file") -gt 4096 ]]; then
+                echo "saved $(basename "$file"): $(stat -c %s "$file") bytes, cksum $(cksum < "$file" | cut -d' ' -f1)" >> "$work/$name.txt"
+            else
+                echo "saved $(basename "$file"): $(cat "$file")" >> "$work/$name.txt"
+            fi
         done
     fi
     if cmp -s "$work/$name.txt" "$network/expected/$name.txt"; then
@@ -163,7 +171,9 @@ if [[ ${#chosen[@]} -eq 0 ]]; then
     fi
 fi
 
-# Two runs of one profile each: the HTTP cache, the cookies.
+# Two runs of one profile each: the HTTP cache, the cookies, the
+# downloads' list (a POST's attachment downloaded, then listed by the
+# second run, which downloads nothing).
 compare() { # NAME (the output in $work/NAME.txt)
     if cmp -s "$work/$1.txt" "$network/expected/$1.txt"; then
         passed=$(( passed + 1 ))
@@ -175,8 +185,10 @@ compare() { # NAME (the output in $work/NAME.txt)
         grep -v '^  ' "$work/err.txt" | tail -2 | sed 's/^/     /'
     fi
 }
-persist() { # NAME PATH PROFILE [WAIT]
-    dump "http://127.0.0.1:$port$2" --profile "$work/$3" ${4:+--wait-title "$4"} | sed -e "s/127\.0\.0\.1:$port/127.0.0.1:PORT/g" -e 's/[[:space:]]*$//' > "$work/$1.txt"
+persist() { # NAME PATH PROFILE [WAIT [OPTION...]]
+    local name=$1 path=$2 profile=$3 wait=${4:-}
+    shift 4 2> /dev/null || shift $#
+    dump "http://127.0.0.1:$port$path" --profile "$work/$profile" ${wait:+--wait-title "$wait"} "$@" | sed -e "s/127\.0\.0\.1:$port/127.0.0.1:PORT/g" -e 's/[[:space:]]*$//' > "$work/$name.txt"
 }
 if [[ ${#chosen[@]} -eq 0 ]]; then
     trusted=1
@@ -189,6 +201,10 @@ if [[ ${#chosen[@]} -eq 0 ]]; then
     sleep 2
     persist cookies-kept /persist-read.html profile-cookies
     compare cookies-kept "cookies: a second run of the profile sends the day's only"
+    persist downloads-first /download-post.html profile-downloads "" --downloads "$work/downloads-profile"
+    compare downloads-first "downloads: a first run downloads"
+    persist downloads-kept /index.html profile-downloads "" --downloads "$work/downloads-profile"
+    compare downloads-kept "downloads: a second run of the profile lists what the first downloaded"
 fi
 
 echo "check_webkit_mlx_network.sh: $passed of $(( passed + failed )) pass"
