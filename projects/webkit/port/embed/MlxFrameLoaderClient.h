@@ -31,8 +31,8 @@ public:
     void setLoadFinishedCallback(Function<void(bool succeeded)>&& callback) { m_loadFinished = WTF::move(callback); }
 
     // The embedder's name, version and window system in every frame's
-    // user agent ("Voyager", "0.1", "Wayland"): after WebKit's
-    // compatibility string, as "Voyager/0.1 (WebKit 2.54.1; Wayland)"
+    // user agent ("Voyager", "0.1", "Wayland"): in WebKit's compatibility
+    // string after the platform, as "Voyager/0.1 (WebKit 2.54.1; Wayland)"
     // (UserAgentMlx.cpp).
     WEBCORE_EXPORT static void setApplicationNameForUserAgent(const String& name, const String& version, const String& windowSystem = String());
 

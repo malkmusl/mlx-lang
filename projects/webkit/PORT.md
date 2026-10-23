@@ -196,13 +196,14 @@ Four ways to choose without patching, in this order of preference:
 
 ### The user agent
 
-`Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like
-Gecko) Version/60.5 Safari/605.1.15 Voyager/0.1 (WebKit 2.54.1; Wayland)`:
+`Mozilla/5.0 (X11; Linux x86_64) Voyager/0.1 (WebKit 2.54.1; Wayland)
+AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15`:
 WebKit's compatibility string exactly as the GLib ports build it
 (UserAgentGLib.cpp's buildUserAgentString, Version/60.5 on purpose: sites
 turn away low and some high Safari versions; the first parentheses stay
 "X11; Linux ..." whatever shows the windows, as servers read the platform
-there), then the embedder's product with a comment naming the engine and
+there), with the embedder's product right after the platform, as
+Ladybird puts its own, and a comment naming the engine and
 the window system (`MlxFrameLoaderClient::setApplicationNameForUserAgent`:
 Voyager's "Voyager", "0.1", "Wayland"; webcore-dump's "webcore-dump/0.1
 (WebKit 2.54.1)", no windows). The engine is the one constant `ENGINE` in

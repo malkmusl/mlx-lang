@@ -2,12 +2,13 @@
 // compatibility string as the GLib ports build it (UserAgentGLib.cpp's
 // buildUserAgentString: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/
 // 605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15", Version/60.5
-// on purpose: sites turn away low and some high Safari versions), then
-// the embedder's name and version with a comment naming the engine and
+// on purpose: sites turn away low and some high Safari versions) with the
+// embedder's product right after the platform's parentheses, as Ladybird
+// puts its own: its name and version and a comment naming the engine and
 // the window system ("Voyager/0.1 (WebKit 2.54.1; Wayland)"; ENGINE is the
-// one place the engine is named). Per-site quirks are WebKit's UserAgentQuirks.cpp
-// (platform/glib, compiled as it is), the quirk's string built the same
-// way, without the embedder's part.
+// one place the engine is named). Per-site quirks are WebKit's
+// UserAgentQuirks.cpp (platform/glib, compiled as it is), the quirk's
+// string built the same way, without the embedder's product.
 #include "config.h"
 #include "UserAgent.h"
 #include "UserAgentMlx.h"
@@ -49,8 +50,9 @@ static const String& platformVersionForUAString()
     return version;
 }
 
-// UserAgentGLib.cpp's buildUserAgentString on a desktop, without branding.
-static String buildUserAgentString(const UserAgentQuirks& quirks)
+// UserAgentGLib.cpp's buildUserAgentString on a desktop, without branding,
+// the embedder's product (if any) right after the platform's parentheses.
+static String buildUserAgentString(const UserAgentQuirks& quirks, const String& product = String())
 {
     StringBuilder uaString;
     uaString.append("Mozilla/5.0 ("_s);
@@ -67,7 +69,10 @@ static String buildUserAgentString(const UserAgentQuirks& quirks)
         return uaString.toString();
     }
 
-    uaString.append(") AppleWebKit/605.1.15 (KHTML, like Gecko) "_s);
+    uaString.append(") "_s);
+    if (!product.isEmpty())
+        uaString.append(product, ' ');
+    uaString.append("AppleWebKit/605.1.15 (KHTML, like Gecko) "_s);
     if (quirks.contains(UserAgentQuirks::NeedsChromeBrowser))
         uaString.append(UserAgentQuirks::stringForQuirk(UserAgentQuirks::NeedsChromeBrowser), ' ');
     else
@@ -76,23 +81,16 @@ static String buildUserAgentString(const UserAgentQuirks& quirks)
     return uaString.toString();
 }
 
-static const String& standardUserAgentStatic()
-{
-    static NeverDestroyed<const String> userAgent(buildUserAgentString(UserAgentQuirks()));
-    return userAgent;
-}
-
 String mlxUserAgent(const String& name, const String& version, const String& windowSystem)
 {
-    StringBuilder userAgent;
-    userAgent.append(standardUserAgentStatic());
+    StringBuilder product;
     if (!name.isEmpty()) {
-        userAgent.append(' ', name, '/', version.isEmpty() ? "0"_s : version, " ("_s, ENGINE);
+        product.append(name, '/', version.isEmpty() ? "0"_s : version, " ("_s, ENGINE);
         if (!windowSystem.isEmpty())
-            userAgent.append("; "_s, windowSystem);
-        userAgent.append(')');
+            product.append("; "_s, windowSystem);
+        product.append(')');
     }
-    auto result = userAgent.toString();
+    auto result = buildUserAgentString(UserAgentQuirks(), product.toString());
     RELEASE_ASSERT_WITH_MESSAGE(isValidHTTPHeaderValue(result), "%s is not a valid user agent header", result.utf8().data());
     return result;
 }

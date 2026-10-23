@@ -6,7 +6,8 @@
 
 namespace WebCore {
 
-// WebKit's compatibility string, then "NAME/VERSION (ENGINE; WINDOW_SYSTEM)":
+// WebKit's compatibility string with "NAME/VERSION (ENGINE; WINDOW_SYSTEM)"
+// after the platform's parentheses:
 // the embedder's name and version, the engine and its version, and the
 // window system its windows are shown by ("Wayland"; none for a program
 // without windows).
