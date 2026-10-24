@@ -29,7 +29,7 @@ Each is imported by its own name and is not part of `std.mlx`.
 
 ## Canonical sources and materialization
 
-`std/registry/vulkan/vk.xml` is Vulkan-Headers 1.3.275 and
+`std/registry/vulkan/vk.xml` is Vulkan-Headers 1.4.362 and
 `std/registry/spirv/spirv.core.grammar.json` is SPIRV-Headers
 vulkan-sdk-1.4.309.0 (SPIR-V 1.6 revision 4); each directory's `SOURCES`
 records the upstream URL and SHA-256, and its `materialize.sh` refuses a
@@ -48,8 +48,11 @@ The Vulkan selection (in `std/registry/vulkan/materialize.mlx`) is
 `VK_EXT_queue_family_foreign`, `VK_EXT_external_memory_host` and
 `VK_EXT_headless_surface`. `std.vulkan.registry` records every
 definition for the `vulkan` API (skipping `vulkansc` variants), the
-requirements of the selected features and extensions (evaluating `depends`
-expressions and computing extension enumerant values from
+requirements of the selected features (`VK_VERSION_1_n` with its
+`VK_BASE_`, `VK_COMPUTE_` and `VK_GRAPHICS_` parts) and extensions, or of
+every extension a platform-neutral header has (`Selection.everyExtension`:
+mlx-vulkan's vulkan_core.h, compiler/libc/vulkan), evaluating `depends`
+expressions (`,` or, `+` and, parentheses) and computing extension enumerant values from
 `1000000000 + (extension - 1) * 1000 + offset`), and resolves the closure of
 types the required commands and structures use.
 

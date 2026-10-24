@@ -122,6 +122,10 @@ together with the rejected escapes in `tests/support/escapes_invalid`)
 
 ## Core reflection/cast builtins
 
+`@bitCast(u32, f)` of an `f32` is exactly the float's 32 bits, also from a
+local and from a generic instantiated with `f64` before
+(`tests/403_bitcast_float_narrow_runtime.mlx`).
+
 A handful of builtins are used throughout the test suite for compile-time
 introspection; see [Comptime and generics](08-comptime-and-generics.md) for
 the full list. The essentials:

@@ -836,6 +836,7 @@ inspector-6, css-19) run together.
   all; they now stop at a floor the expansion sets
   (ir/lower.mlx `bindingFloor`), so a name in the callee is its
   parameter or its module's. tests/393_inline_own_names_runtime.mlx
+  (its callees in tests/support/inline_names.mlx)
   (tests/run_inline.sh: default level, -O3, -O0) and a probe in
   tools/ensure_compiler.sh, which rebuilds an mlx4 without the fix. A
   compiler counting the names the old one would have read wrong found

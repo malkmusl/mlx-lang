@@ -656,6 +656,12 @@ runs_build() {
     [[ $status -eq 2 ]]
 }
 
+# Whether $1 says its version (mlx4 --version: "mlx4 MAJOR.MINOR.BUILD",
+# from mlx-out/version.mlx).
+says_its_version() {
+    "$1" --version 2> /dev/null | grep -q '^mlx4 [0-9]'
+}
+
 # Whether $1's inliner keeps an inlined function's names its own: a
 # module variable it reads is not the caller's local of the same name
 # (tests/393_inline_own_names_runtime.mlx exits 13).
@@ -718,6 +724,7 @@ probes=(
     "writes_depfiles|--depfile"
     "runs_build|the build command (mlx build)"
     "inlines_with_own_names|inlined functions reading their own module's variables, not the caller's locals"
+    "says_its_version|its version (mlx4 --version)"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
@@ -744,6 +751,9 @@ rebuild_with() {
     local seed=$1
     local next=$canonical.next fixed=$canonical.fixed
     rm -f "$next" "$fixed"
+    # The version the compiler says (mlx4 --version): VERSION and the git
+    # history now, written by mlx-build-number built by the seed.
+    tools/version_module.sh "$seed" >&2 || true
     if ! build_stage "$seed" "$next" "stage 1 of 2: $seed builds the compiler from the current sources"; then
         echo "ensure_compiler.sh: $seed cannot build the current compiler sources" >&2
         rm -f "$next"
@@ -802,6 +812,7 @@ bootstrap_seed() {
             zig build-exe compiler/bootstrap/main.zig --name mlx0 -femit-bin=zig-out/bin/mlx0 >&2 || return 1
         fi
         echo "building the bootstrap compiler zig-out/bin/mlx1 with mlx0" >&2
+        tools/version_module.sh >&2 || return 1
         zig-out/bin/mlx0 compiler/selfhost/main.mlx -o zig-out/bin/mlx1 >&2 || return 1
     fi
     echo zig-out/bin/mlx1

@@ -21,7 +21,9 @@ of each (`Port` in build.mlx): JSCOnly (JavaScriptCore alone, the
 generic event loop) and WPE, whose lower layers stand on GLib, GObject
 and GIO, here mlx-glib (compiler/libc/glib). A third is this
 repository's own, PlatformMlx (PORT.md): WebCore and PAL on JSCOnly's
-lower layers, with no GLib.
+lower layers, with no GLib. Voyager, the browser of the Mlx desktop,
+runs on it: [projects/voyager/README.md](../voyager/README.md), with
+pictures.
 
     ./mlx build webkit-bmalloc        bmalloc and libpas (libbmalloc.a)
     ./mlx build webkit-wtf            WTF, the JSCOnly port, on mlx-unicode (libWTF.a)
@@ -43,6 +45,7 @@ lower layers, with no GLib.
     ./mlx build webkit-mlx-pal        PAL for the Mlx port (mlx-out/webkit/mlx/lib/libPAL.a)
     ./mlx build webkit-mlx-webcore    WebCore for the Mlx port (libWebCore.a); see PORT.md for what compiles
     ./mlx build webkit-mlx-webcore-test  mlx-out/webkit/mlx/bin/webcore-test (tests/webcore-mlx.cpp): all of it linked
+    ./mlx build webkit-mlx-voyager    mlx-out/webkit/mlx/bin/voyager, the browser (projects/voyager)
 
     ./mlx build webkit                all of it (but WebCore)
 

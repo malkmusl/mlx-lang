@@ -103,6 +103,8 @@
 #if __has_include("voyager/VoyagerBuild.h")
 #include "voyager/VoyagerBuild.h"
 #else
+#define VOYAGER_VERSION "0.1"
+#define VOYAGER_BUILD "dev"
 #define VOYAGER_GIT_COMMIT ""
 #define VOYAGER_CODEGEN_EPOCH ""
 static const unsigned char voyagerIcon[] = { 0 };
@@ -1196,9 +1198,14 @@ void engineDownloadAction(Engine*, unsigned id, int action)
 // ---------------------------------------------------------------------------
 // The internal pages (voyager:)
 
-// Voyager's version and window system, as its user agent has them.
-constexpr auto voyagerVersion = "0.1"_s;
+// Voyager's MAJOR.MINOR (projects/voyager/VERSION) and window system, as
+// its user agent has them: without the build number, which would tell
+// one build from another (fingerprinting).
+constexpr auto voyagerVersion = ASCIILiteral::fromLiteralUnsafe(VOYAGER_VERSION);
 constexpr auto windowSystem = "Wayland"_s;
+// Voyager's whole version, MAJOR.MINOR.BUILD ("0.1.1234"; "0.1.dev" built
+// outside a git repository), as the about and version pages show it.
+constexpr auto voyagerFullVersion = ASCIILiteral::fromLiteralUnsafe(VOYAGER_VERSION "." VOYAGER_BUILD);
 
 // The facts voyager://version shows, label and value, in its order (the
 // about page takes "Voyager" and "Engine" of them).
@@ -1230,7 +1237,9 @@ void gatherFacts(int argc, char** argv)
 {
     String engineName = mlxEngine();
     String engineVersion = engineName.startsWith("WebKit "_s) ? engineName.substring(7) : engineName;
-    addFact("Voyager"_s, voyagerVersion);
+    addFact("Voyager"_s, voyagerFullVersion);
+    String commit = String::fromUTF8(VOYAGER_GIT_COMMIT);
+    addFact("Build"_s, makeString(voyagerFullVersion, " ("_s, commit.isEmpty() ? "no git commit recorded"_s : commit, ')'));
     addFact("Engine"_s, engineName);
     addFact("JavaScriptCore"_s, makeString(engineVersion, " (WebKit's, with the engine)"_s));
     addFact("Skia"_s, makeString("milestone "_s, SK_MILESTONE));
@@ -1241,8 +1250,6 @@ void gatherFacts(int argc, char** argv)
     addFact("mlx-xml2"_s, makeString("libxml2 "_s, unsafeSpan(LIBXML_DOTTED_VERSION), " API, in Mlx (std.xml)"_s));
     String epoch = String::fromUTF8(VOYAGER_CODEGEN_EPOCH);
     addFact("Toolchain"_s, makeString("mlx4 (Mlx), mlx-cc (C and C++"_s, epoch.isEmpty() ? ""_s : ", code generation epoch "_s, epoch, "), mlx-ld; mlxlibc, mlxlibcpp"_s));
-    String commit = String::fromUTF8(VOYAGER_GIT_COMMIT);
-    addFact("Git commit"_s, commit.isEmpty() ? "not recorded by the build"_s : commit);
     addFact("Built"_s, buildDate());
     addFact("User agent"_s, mlxUserAgent("Voyager"_s, voyagerVersion, windowSystem));
     struct utsname name;

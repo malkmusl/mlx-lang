@@ -125,6 +125,8 @@ for test in "${tests[@]}"; do
         echo "FAIL $test: webcore-dump exits with $status: $(grep -v '^  ' "$work/err.txt" | tail -1)"
     else
         line=$(diff "$work/expected.n" "$work/actual.n" | sed -n '1s/^\([0-9]*\).*/\1/p')
+        # (Lines printed before the expected ones: diff's "0a1".)
+        [[ $line == 0 ]] && line=1
         echo "FAIL $test: line ${line:-?} (exit $status)"
         echo "     expected: $(sed -n "${line:-1}p" "$work/expected.n")"
         echo "     printed:  $(sed -n "${line:-1}p" "$work/actual.n")"

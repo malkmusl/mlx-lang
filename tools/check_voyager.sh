@@ -47,9 +47,12 @@
 #      painted as it is again (the square white);
 #  14. Voyager's internal pages (the voyager: scheme): voyager://about,
 #      started with, is "About Voyager" on the theme's light background,
-#      with Voyager's version and the engine's; about:version typed into
-#      the address field is voyager://version, "Voyager Version", whose
-#      text has the versions and the whole user agent (with VOYAGER_TRACE
+#      with Voyager's version (0.1.BUILD: projects/voyager/VERSION and the
+#      build number, docs/reference/build-system.md) and the engine's;
+#      about:version typed into the address field is voyager://version,
+#      "Voyager Version", whose text has the versions, a Build row
+#      "0.1.BUILD (COMMIT)" of HEAD's commit, and the whole user agent
+#      (which keeps Voyager/0.1, no build number) (with VOYAGER_TRACE
 #      the engine writes an internal page's text); about:about is
 #      voyager://about again, an unknown voyager://nothing a 404 page
 #      ("Not Found"), voyager:// the index ("Voyager Pages"); on a dark
@@ -99,7 +102,16 @@
 #  23. accelerated animations (M8): projects/voyager/tests/animation.html's
 #      CSS animations of transform and opacity composed at the display's
 #      rate on the compositor thread (its frames a second, 90% of the rate
-#      at least) with no paint; requestAnimationFrame at the same rate.
+#      at least) with no paint; requestAnimationFrame at the same rate;
+#  24. WebGL (M8): projects/voyager/tests/webgl.html's canvas, a triangle
+#      turning on green drawn from requestAnimationFrame (ANGLE on Vulkan,
+#      the drawing buffer read back into the canvas' layer each frame),
+#      runs on the frame clock, at half the display's rate at least (its
+#      title; on lavapipe and the CPU compositor about 38 of 60 frames a
+#      second, PORT.md "WebGL"), each frame composed; the screenshot has
+#      the canvas (its green, 300x300 where the page puts it) and the
+#      triangle's red in it. Skipped, said, on a machine without a Vulkan
+#      driver.
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -539,14 +551,16 @@ address_script() {
 run_scenario internal "$work/internal.script" "$work/voyager-internal"
 log=$work/voyager.log
 grep -q "^voyager: title About Voyager$" "$log" && grep -q "^voyager: url voyager://about$" "$log" || { cat "$log" >&2; fail "voyager://about was not shown as About Voyager"; }
-grep -q "^voyager: tab 1 text Version 0.1$" "$log" && grep -q "^voyager: tab 1 text WebKit 2.54.1$" "$log" || { cat "$log" >&2; fail "voyager://about does not show Voyager's version and engine"; }
+voyager_version=$(sed -n 's/^voyager: tab 1 text Version //p' "$log" | head -1)
+[[ $voyager_version =~ ^0\.1\.[0-9]+$ ]] && grep -q "^voyager: tab 1 text WebKit 2.54.1$" "$log" || { cat "$log" >&2; fail "voyager://about does not show Voyager's version and engine"; }
 background=$(pixel_of "$work/about.ppm" $(( page_x0 + 5 )) $(( page_y0 + 5 )))
 [[ $background == f6f6f8 ]] || fail "voyager://about is not on the theme's light background (found #$background)"
-echo "ok   voyager://about: About Voyager, its version and engine, in the theme's light colours"
+echo "ok   voyager://about: About Voyager, its version ($voyager_version) and engine, in the theme's light colours"
 grep -q "^voyager: url voyager://version$" "$log" && grep -q "^voyager: title Voyager Version$" "$log" || { cat "$log" >&2; fail "about:version did not load voyager://version"; }
 user_agent=$(sed -n 's/^voyager: user agent //p' "$log" | head -1)
 grep -qxF "voyager: tab 1 text User agent	$user_agent" "$log" || { cat "$log" >&2; fail "voyager://version does not show the user agent ($user_agent)"; }
-grep -qx "voyager: tab 1 text Engine	WebKit 2.54.1" "$log" && grep -qx "voyager: tab 1 text Voyager	0.1" "$log" || { cat "$log" >&2; fail "voyager://version does not show Voyager's and the engine's versions"; }
+grep -qx "voyager: tab 1 text Engine	WebKit 2.54.1" "$log" && grep -qxF "voyager: tab 1 text Voyager	$voyager_version" "$log" || { cat "$log" >&2; fail "voyager://version does not show Voyager's ($voyager_version) and the engine's versions"; }
+grep -qxF "voyager: tab 1 text Build	$voyager_version ($(git rev-parse HEAD))" "$log" || { cat "$log" >&2; fail "voyager://version does not show the build $voyager_version of HEAD's commit"; }
 echo "ok   about:version is voyager://version: Voyager Version, the versions and the whole user agent"
 grep -qxF "voyager: tab 1 text Profile	$work/home/.local/share/voyager (local storage, IndexedDB, cookies)" "$log" && grep -qxF "voyager: tab 1 text Cache	$work/home/.cache/voyager (the HTTP cache)" "$log" || { cat "$log" >&2; fail "voyager://version does not show the profile's directories"; }
 echo "ok   voyager://version shows the profile: ~/.local/share/voyager and ~/.cache/voyager"
@@ -752,4 +766,30 @@ awk -v fps="$slowest" -v rate="$rate" 'BEGIN { exit !(fps >= rate * 0.9) }' || {
 raf=$(grep -o "^voyager: title raf:[0-9]*" "$log" | tail -1 | cut -d: -f3)
 (( ${raf:-0} >= rate * 9 / 10 )) || { cat "$log" >&2; fail "requestAnimationFrame did not run at the display's rate (${raf:-no} frames a second)"; }
 echo "ok   CSS animations of transform and opacity run on the compositor thread: $frames frames in the last counts, no paint, at least $slowest frames a second; requestAnimationFrame $raf a second"
+# 24: WebGL on the frame clock (no Vulkan driver manifest: said, and skipped).
+if [[ -z "$(ls /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json 2> /dev/null)" && -z "${VK_DRIVER_FILES:-}" ]]; then
+    echo "skip WebGL: no Vulkan driver manifest (install mesa-vulkan-drivers for lavapipe)"
+else
+    write_runner "$work/voyager-webgl" webgl.html
+    printf 'wait 7000\nshot %s\nwait 3000\nclose\n' "$work/webgl.ppm" > "$work/webgl.script"
+    run_scenario webgl "$work/webgl.script" "$work/voyager-webgl"
+    log=$work/voyager.log
+    lines=$(grep "^voyager: compositor paints " "$log")
+    count=$(wc -l <<< "$lines")
+    (( count >= 4 )) || { cat "$log" >&2; fail "the engine wrote too few compositor counts for the WebGL page ($count)"; }
+    rate=${MLX_REFRESH_RATE:-60}
+    drawn=$(grep -o "^voyager: title webgl:[0-9]*" "$log" | tail -1 | cut -d: -f3)
+    (( ${drawn:-0} >= rate / 2 )) || { cat "$log" >&2; fail "the WebGL page did not draw at half the display's rate at least (${drawn:-no} frames a second)"; }
+    # (The compositor's frames a second in the last counts: each frame
+    # drawn composed.)
+    composed=$(tail -3 <<< "$lines" | awk '{ print $NF }' | sort -n | head -1)
+    awk -v fps="$composed" -v rate="$rate" 'BEGIN { exit !(fps >= rate / 2) }' || { cat "$log" >&2; fail "the WebGL page's frames were not composed ($composed frames a second, $drawn drawn)"; }
+    canvas=$(box_of "$work/webgl.ppm" 10a040)
+    read -r cx cy cw ch <<< "$canvas"
+    [[ -n "$canvas" ]] && (( cw == 300 && ch == 300 )) || fail "the screenshot has no WebGL canvas of 300x300 (its green: ${canvas:-none})"
+    triangle=$(box_of "$work/webgl.ppm" ff0000)
+    read -r tx ty tw th <<< "$triangle"
+    [[ -n "$triangle" ]] && (( tx > cx && ty > cy && tx + tw < cx + cw && ty + th < cy + ch )) || fail "the screenshot has no triangle in the WebGL canvas (its red: ${triangle:-none})"
+    echo "ok   WebGL draws a frame each animation frame, $drawn a second, composed ($composed frames a second): the canvas at $cx,$cy, the triangle in it"
+fi
 echo "check_voyager.sh: all checks passed"

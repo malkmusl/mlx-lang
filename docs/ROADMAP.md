@@ -211,6 +211,20 @@ takes Mesa out of the picture for that hardware.
    (or a chain from one), and the system rebuilds itself on itself.
 3. An installable image: MLX/Linux on a USB stick, installed from there.
 
+## After Lattice runs: the whole codebase cleaned up
+
+Once Voyager runs on Lattice (projects/webkit/LATTICE.md), the whole
+repository is untangled, not only the translated engine: the compilers
+(mlx4, mlx-cc, mlx-ld), std, mlxlibc and mlxlibcpp, the desktop,
+the tools and the projects. The code map is the guide (`mlx-codemap
+complex`, `copies`, `unused`, `cycles`, `layers`, `workarounds`,
+`untested`, `hot`), and the conversion to std's containers, std.heap and
+`@noncopy` auto-drop (std → tools → projects → compiler/cc) is finished
+on the way. Each cleanup is its own change with every check passing
+before and after; workarounds for compiler gaps go once the gap is
+fixed, and the shims of the bootstrap (the C libraries WebKit needed,
+the GLib and WPE pieces) go once nothing uses them.
+
 ## How we work
 
 - Every step lands with a check under `tools/` and a README next to its

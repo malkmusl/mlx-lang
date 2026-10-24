@@ -59,6 +59,28 @@ run stdlib "$work/stdlib_sep" "$work/stdlib_sep.out"
 cmp -s "$tests/stdlib.expected" "$work/stdlib_sep.out" || fail "stdlib from an object prints otherwise"
 echo "ok   a C++ object links with the library and runs"
 
+# Two files of one -include prefix that opens an unnamed namespace (as
+# ANGLE's does) each have a class of the same name in theirs: two classes
+# (the files' unnamed namespaces are named after their paths), the
+# prefix's names seen in both.
+cat > "$work/anonprefix.h" << 'EOF'
+namespace { inline int prefixed() { return 40; } }
+struct Visitor { virtual ~Visitor() {} virtual int visit() = 0; };
+EOF
+for part in first second; do
+    value=1
+    [[ $part == second ]] && value=2
+    cat > "$work/anon_$part.cpp" << EOF
+namespace { struct Traverser : Visitor { int visit() override; }; int Traverser::visit() { return prefixed() + $value; } }
+int $part() { Traverser t; Visitor &v = t; return v.visit(); }
+EOF
+    "$cc" -include "$work/anonprefix.h" -c -o "$work/anon_$part.o" "$work/anon_$part.cpp" 2> "$work/anon.err" || fail "anon_$part.cpp with a prefix: $(head -3 "$work/anon.err")"
+done
+printf '#include <stdio.h>\nint first();\nint second();\nint main() { printf("%%d %%d\\n", first(), second()); return 0; }\n' > "$work/anon_main.cpp"
+"$cc" -o "$work/anon" "$work/anon_main.cpp" "$work/anon_first.o" "$work/anon_second.o" 2> "$work/anon.err" || fail "the files of one prefix's unnamed namespace do not link: $(head -3 "$work/anon.err")"
+[[ "$("$work/anon")" == "41 42" ]] || fail "the files' unnamed namespaces: $("$work/anon")"
+echo "ok   the unnamed namespaces of two files of one prefix are apart"
+
 # A call whose result is a class declared only is an error (its size,
 # and so how the result comes back, is not known), but not in decltype.
 cat > "$work/incompleteresult.cpp" << 'EOF'
