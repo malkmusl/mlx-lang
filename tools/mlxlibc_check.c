@@ -395,6 +395,8 @@ static void on_signal(int number) { signaled = number; }
 static void check_unistd(const char *work) {
     section("unistd");
     printf("%d %d %d %ld %ld\n", getpid() == getpid(), getpid() != getppid(), getuid() == geteuid(), sysconf(_SC_PAGESIZE), (long)getpagesize());
+    // (The machine's pages: lavapipe sizes its heap by them.)
+    printf("physical pages %ld\n", sysconf(_SC_PHYS_PAGES));
     int pipes[2];
     int piped = pipe(pipes);
     ssize_t wrote = write(pipes[1], "through the pipe", 16);
