@@ -649,10 +649,21 @@ port takes:
   clears only what it covers to the page's white and has TextureMapper
   compose there, Y flipped, into a framebuffer of the view's size (a
   colour texture, depth and stencil for TextureMapper's clips and 3D).
-  The damage's bounds are then read back (`glReadPixels`, one read: each
-  waits for the GPU; RGBA swapped on the CPU, since ANGLE converts a BGRA
-  read on the GPU, 10 ms of a frame on lavapipe) into the raster frame,
-  which goes to the wl_shm buffer as before. Forced dark: tiles and
+  The damage's bounds are then read back into the raster frame, which
+  goes to the wl_shm buffer as before: in the Threaded mode without
+  waiting (GLES 3's pixel pack buffers, ANGLE's contexts being 3.1: the
+  rectangle read into a buffer on the GPU's queue, a fence after it, at
+  most three reads going), the frame composed without the frame's lock,
+  and each read taken into the raster frame with its damage once its
+  fence has signalled (at the next frame, or by a poll of the compositor
+  thread every millisecond), a frame ready then; `MLX_COMPOSITOR_READ=sync`
+  reads as webcore-dump's Synchronous mode does, `glReadPixels` waiting
+  for the GPU. RGBA is swapped on the CPU, since ANGLE converts a BGRA
+  read on the GPU (10 ms of a frame on lavapipe). On lavapipe the
+  compositor thread's frame went from 5.4 to 2.5 ms (the animation page),
+  12.1 to 4.7 ms (a page scrolled by whole views) and 6.0 to 2.2 ms
+  (WebGL's), the read's part from 3.9, 8.4 and 4.6 ms to 0.8, 1.2 and
+  0.6. Forced dark: tiles and
   images were darkened when recorded; a layer's solid colour is given to
   its TextureMapperLayer darkened after each flush (`darkenSolidColors`:
   CoordinatedPlatformLayer keeps the colour private, read through a
@@ -1592,20 +1603,26 @@ What M2 found, and how the port meets it without a patch:
     text in dumpAsText, and layers WebKit2's drawing area adds.
 - **What M8's third part leaves** (compositing on the GPU):
   - Presenting copies: the frame's damage is read back from the GPU
-    (each read waits for it) into the host's raster frame, which the
-    embedder copies into its wl_shm buffer. Zero copy (the framebuffer a
-    dmabuf the Wayland compositor takes, linux-dmabuf, or a Vulkan
-    swapchain of std.ui.gpu_canvas's that ANGLE's images go to) is open;
-    an asynchronous read (a pixel buffer read the frame after) would end
-    the wait at the cost of a frame of latency. (On lavapipe, where a
-    frame whose whole view changes is slower than the CPU's compositor,
-    the port composes on the CPU unless `MLX_COMPOSITING=gpu`.)
+    (asynchronously, the compositor thread not waiting) into the host's
+    raster frame, which the embedder copies into its wl_shm buffer. Zero
+    copy is open. A dmabuf the Wayland compositor takes (linux-dmabuf:
+    projects/desktop/compositor accepts one linear ARGB8888 plane) needs
+    ANGLE's framebuffer in exportable memory of a DRM device
+    (VK_EXT_external_memory_dma_buf with DRM format modifiers; the port
+    has no GBM, `USE_GBM` off), which lavapipe without a render node
+    cannot give, so nothing here could test it. A Vulkan swapchain of
+    std.ui.gpu_canvas's (VK_KHR_wayland_surface) needs ANGLE's image and
+    std.ui's device to meet (std.vulkan's instance is not ANGLE's: an
+    image exported as an opaque fd, VK_KHR_external_memory_fd, imported by
+    ANGLE through GL_EXT_memory_object_fd, a semaphore the same way), and
+    the page its own surface: Voyager's window is one wl_shm surface std.ui
+    draws, chrome and page, so the page would be a wl_subsurface std.ui's
+    panel does not make yet. On lavapipe a swapchain's present is itself a
+    copy into wl_shm.
   - Tiles, images and 2D canvases are painted on the CPU and uploaded;
     Ganesh over ANGLE (PlatformDisplaySkia.cpp, SkiaPaintingEngine.cpp's
     GPU path, a GL context per painting thread) would paint them on the
     GPU.
-  - The host holds its frame's lock while the GPU composes and the frame
-    is read back, so the embedder's take of the frame waits for it.
   - Forced dark's solid colour layers are darkened through a pointer to
     CoordinatedPlatformLayer's private `m_contentsColor` (taken in an
     explicit instantiation): legal C++, but WebKit's layout of the class,

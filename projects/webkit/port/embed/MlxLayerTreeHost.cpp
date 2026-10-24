@@ -34,6 +34,7 @@
 #include "SkiaPaintingEngine.h"
 #include "TextureMapper.h"
 #include "TextureMapperGLHeaders.h"
+#include <GLES3/gl3.h>
 #include "TextureMapperLayer.h"
 #include "ThreadedScrollingCoordinator.h"
 #include "ThreadedScrollingTree.h"
@@ -418,8 +419,13 @@ public:
         auto compositor = makeUnique<GPUCompositor>();
         compositor->context = WTF::move(context);
         compositor->textureMapper = TextureMapper::create();
+        // (Reads asynchronous on GLES 3, as ANGLE's contexts are, unless
+        // MLX_COMPOSITOR_READ=sync.)
+        auto* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        const char* readMode = getenv("MLX_COMPOSITOR_READ");
+        compositor->asynchronous = version && strstr(version, "OpenGL ES 3") && !(readMode && !strcmp(readMode, "sync"));
         if (getenv("MLX_TRACE_COMPOSITOR"))
-            fprintf(stderr, "compositor on the GPU: %s\n", reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+            fprintf(stderr, "compositor on the GPU: %s (%s, %s reads)\n", reinterpret_cast<const char*>(glGetString(GL_RENDERER)), version ? version : "", compositor->asynchronous ? "asynchronous" : "synchronous");
         return compositor;
     }
 
@@ -429,6 +435,12 @@ public:
             return;
         textureMapper = nullptr;
         deleteTarget();
+        for (auto& read : reads) {
+            if (read.fence)
+                glDeleteSync(read.fence);
+            if (read.buffer)
+                glDeleteBuffers(1, &read.buffer);
+        }
     }
 
     void deleteTarget()
@@ -473,6 +485,106 @@ public:
         return true;
     }
 
+    // Asynchronous reads (GLES 3's pixel pack buffers and fences: ANGLE's
+    // contexts are 3.x, its Vulkan backend copying the framebuffer into a
+    // buffer on the GPU's queue): a frame's changed rectangle read into a
+    // buffer, a fence after it, and the pixels taken once the fence has
+    // signalled, while the compositor thread goes on (the next frame, or
+    // nothing); in the order they were made, at most three at once.
+    struct Read {
+        GLuint buffer { 0 };
+        size_t capacity { 0 };
+        GLsync fence { nullptr };
+        IntRect rect;
+        IntSize frameSize;
+        bool full { false };
+        Vector<IntRect> damage;
+    };
+    static constexpr unsigned maximumReads = 3;
+    std::array<Read, maximumReads> reads;
+    unsigned firstRead { 0 };
+    unsigned readCount { 0 };
+    bool asynchronous { false };
+
+    bool readsPending() const { return readCount; }
+
+    // Starts reading RECT of the frame (FRAME_SIZE) composed last;
+    // false when a read is still to be taken first (all buffers busy).
+    bool startRead(const IntRect& wanted, const IntSize& frameSize, bool full, Vector<IntRect>&& damage)
+    {
+        if (readCount == maximumReads)
+            return false;
+        auto& read = reads[(firstRead + readCount) % maximumReads];
+        read.rect = intersection(wanted, IntRect({ }, size));
+        read.frameSize = frameSize;
+        read.full = full;
+        read.damage = WTF::move(damage);
+        size_t bytes = static_cast<size_t>(read.rect.width()) * read.rect.height() * 4;
+        if (!read.buffer)
+            glGenBuffers(1, &read.buffer);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, read.buffer);
+        if (bytes > read.capacity) {
+            read.capacity = bytes;
+            glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+        }
+        if (bytes) {
+            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            glReadPixels(read.rect.x(), read.rect.y(), read.rect.width(), read.rect.height(), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        read.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+        ++readCount;
+        return true;
+    }
+
+    // The oldest read, when its fence has signalled (WAIT: waiting for it),
+    // handed to TAKE (the read, its pixels: RGBA rows of its width) and
+    // its buffer free again; false when there is none or it is not done.
+    template<typename Take>
+    bool finishRead(bool wait, const Take& take)
+    {
+        if (!readCount)
+            return false;
+        auto& read = reads[firstRead];
+        GLenum status = glClientWaitSync(read.fence, wait ? GL_SYNC_FLUSH_COMMANDS_BIT : 0, wait ? 1000000000 : 0);
+        if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED && !(wait && status == GL_WAIT_FAILED))
+            return false;
+        glDeleteSync(read.fence);
+        read.fence = nullptr;
+        size_t bytes = static_cast<size_t>(read.rect.width()) * read.rect.height() * 4;
+        const uint32_t* pixels = nullptr;
+        if (bytes) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, read.buffer);
+            pixels = static_cast<const uint32_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
+        }
+        take(read, pixels);
+        if (bytes) {
+            if (pixels)
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        }
+        firstRead = (firstRead + 1) % maximumReads;
+        --readCount;
+        return true;
+    }
+
+    // RGBA rows (SOURCE, WIDTH words a row) into PIXELS (STRIDE words a
+    // row, BGRA as Skia's N32) at RECT.
+    static void copySwapped(const uint32_t* source, const IntRect& rect, uint32_t* pixels, int stride)
+    {
+        size_t width = rect.width();
+        for (int y = 0; y < rect.height(); ++y) {
+            uint32_t* row = pixels + static_cast<size_t>(rect.y() + y) * stride + rect.x();
+            const uint32_t* from = source + y * width;
+            for (size_t x = 0; x < width; ++x) {
+                uint32_t pixel = from[x];
+                row[x] = (pixel & 0xFF00FF00) | ((pixel & 0xFF) << 16) | ((pixel >> 16) & 0xFF);
+            }
+        }
+    }
+
     // RECT of the framebuffer into PIXELS (STRIDE words a row, BGRA as
     // Skia's N32), one read for the rectangle. (Read as RGBA, the
     // framebuffer's own order, and swapped here: ANGLE's Vulkan backend
@@ -488,14 +600,7 @@ public:
         rows.resize(width * rect.height());
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
         glReadPixels(rect.x(), rect.y(), rect.width(), rect.height(), GL_RGBA, GL_UNSIGNED_BYTE, rows.mutableSpan().data());
-        for (int y = 0; y < rect.height(); ++y) {
-            uint32_t* row = pixels + static_cast<size_t>(rect.y() + y) * stride + rect.x();
-            const uint32_t* source = rows.span().data() + y * width;
-            for (size_t x = 0; x < width; ++x) {
-                uint32_t pixel = source[x];
-                row[x] = (pixel & 0xFF00FF00) | ((pixel & 0xFF) << 16) | ((pixel >> 16) & 0xFF);
-            }
-        }
+        copySwapped(rows.span().data(), rect, pixels, stride);
     }
 };
 
@@ -529,6 +634,7 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
             m_gpu = GPUCompositor::create();
         });
         m_onGPU = !!m_gpu;
+        m_asynchronousReads = m_onGPU && m_mode == Mode::Threaded && m_gpu->asynchronous;
         if (!m_onGPU)
             m_compositingReason = "no GL context on ANGLE's display"_s;
         if (!m_onGPU && m_mode == Mode::Synchronous)
@@ -1197,7 +1303,9 @@ void MlxLayerTreeHost::renderFrame()
     bool running = false;
     MonotonicTime locked;
     MonotonicTime composed;
-    {
+    if (m_asynchronousReads)
+        renderFrameOnGPU(running, locked, composed);
+    else {
         Locker locker { m_frameLock };
         locked = MonotonicTime::now();
         IntSize size = m_size;
@@ -1209,6 +1317,7 @@ void MlxLayerTreeHost::renderFrame()
             m_frameSize = size;
             m_framePixels = Vector<uint32_t>(FillWith { }, static_cast<size_t>(size.width()) * size.height(), 0u);
             m_frameValid = false;
+            m_frameReadable = false;
         }
         if (!size.isEmpty()) {
             std::optional<Damage> damage = Damage(size);
@@ -1228,6 +1337,7 @@ void MlxLayerTreeHost::renderFrame()
                 running = paintFrame(*surface->getCanvas(), damage, valid);
             }
             m_frameValid = true;
+            m_frameReadable = true;
             if (!valid)
                 m_frameDamageFull = true;
             else if (damage) {
@@ -1267,9 +1377,11 @@ void MlxLayerTreeHost::renderFrame()
             fprintf(stderr, "compositor frame (cpu) flush %.1f wait %.1f paint %.1f ms\n", (flushed - started).milliseconds(), (locked - flushed).milliseconds(), (painted - locked).milliseconds());
     }
     countFrame();
-    m_newFrame = true;
-    if (m_frameReady)
-        m_frameReady();
+    if (!m_asynchronousReads) {
+        m_newFrame = true;
+        if (m_frameReady)
+            m_frameReady();
+    }
     {
         Locker locker { m_stateLock };
         m_frameInProgress = false;
@@ -1286,6 +1398,112 @@ void MlxLayerTreeHost::renderFrame()
     }
 }
 
+// A frame on the GPU with asynchronous reads: composed without the
+// frame's lock (the embedder's take of the last frame does not wait for
+// it), what changed read into a buffer (the whole when the framebuffer did
+// not hold the last frame), and the reads the GPU is done with taken into
+// the frame, each a frame ready; those still going taken the next frame,
+// or by a poll of the compositor thread every millisecond until they are.
+void MlxLayerTreeHost::renderFrameOnGPU(bool& running, MonotonicTime& locked, MonotonicTime& composed)
+{
+    takeReads(false);
+    IntSize size;
+    bool valid;
+    {
+        Locker locker { m_frameLock };
+        size = m_size;
+        if (size.isEmpty()) {
+            Locker root { m_rootLayer->lock() };
+            size = IntSize(m_rootLayer->size());
+        }
+        if (size != m_frameSize) {
+            m_frameSize = size;
+            m_framePixels = Vector<uint32_t>(FillWith { }, static_cast<size_t>(size.width()) * size.height(), 0u);
+            m_frameValid = false;
+            m_frameReadable = false;
+        }
+        valid = m_frameValid;
+        m_frameValid = true;
+    }
+    locked = MonotonicTime::now();
+    composed = locked;
+    if (size.isEmpty() || !m_gpu)
+        return;
+    std::optional<Damage> damage = Damage(size);
+    if (!paintFrameOnGPU(size, damage, valid, running))
+        valid = false;
+    composed = MonotonicTime::now();
+    bool full = !valid || !damage;
+    Vector<IntRect> rects;
+    if (!full) {
+        for (const auto& rect : *damage) {
+            if (rects.size() >= 32) {
+                full = true;
+                break;
+            }
+            if (!rect.isEmpty())
+                rects.append(rect);
+        }
+    }
+    IntRect changed = full ? IntRect({ }, size) : damage->bounds();
+    // (Every buffer busy: the oldest read waited for.)
+    if (m_gpu->readCount == GPUCompositor::maximumReads)
+        takeReads(true);
+    m_gpu->startRead(changed, size, full, WTF::move(rects));
+    takeReads(false);
+    if (m_gpu->readsPending())
+        scheduleReadPoll();
+}
+
+// The reads done taken into the frame, oldest first (WAIT: the oldest
+// waited for).
+void MlxLayerTreeHost::takeReads(bool wait)
+{
+    if (!m_gpu)
+        return;
+    auto take = [this](const GPUCompositor::Read& read, const uint32_t* pixels) {
+        Locker locker { m_frameLock };
+        if (read.frameSize != m_frameSize)
+            return;
+        if (pixels)
+            GPUCompositor::copySwapped(pixels, read.rect, m_framePixels.mutableSpan().data(), m_frameSize.width());
+        if (read.full)
+            m_frameDamageFull = true;
+        else {
+            for (const auto& rect : read.damage) {
+                if (m_frameDamage.size() >= 32) {
+                    m_frameDamageFull = true;
+                    break;
+                }
+                m_frameDamage.append(rect);
+            }
+        }
+        m_frameReadable = true;
+        m_hasFrame = true;
+    };
+    while (m_gpu->finishRead(std::exchange(wait, false), take)) {
+        m_newFrame = true;
+        if (m_frameReady)
+            m_frameReady();
+    }
+}
+
+void MlxLayerTreeHost::scheduleReadPoll()
+{
+    if (std::exchange(m_readPollScheduled, true))
+        return;
+    m_compositorQueue->dispatchAfter(1_ms, [this, alive = m_alive] {
+        if (!alive->load())
+            return;
+        m_readPollScheduled = false;
+        if (!m_gpu || !m_gpu->context->makeContextCurrent())
+            return;
+        takeReads(false);
+        if (m_gpu->readsPending())
+            scheduleReadPoll();
+    });
+}
+
 void MlxLayerTreeHost::setFrameReadyCallback(Function<void()>&& callback)
 {
     m_frameReady = WTF::move(callback);
@@ -1295,7 +1513,7 @@ bool MlxLayerTreeHost::takeFrame(uint32_t* pixels, int width, int height, int st
 {
     Locker locker { m_frameLock };
     m_newFrame = false;
-    if (!m_frameValid || m_frameSize.isEmpty())
+    if (!(m_asynchronousReads ? m_frameReadable : m_frameValid) || m_frameSize.isEmpty())
         return false;
     int copyWidth = std::min(width, m_frameSize.width());
     int copyHeight = std::min(height, m_frameSize.height());

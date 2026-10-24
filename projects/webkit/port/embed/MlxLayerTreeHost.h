@@ -18,8 +18,9 @@
 // context of ANGLE's surfaceless EGL display (PlatformDisplayMlx.h), the
 // layers' targets are TextureMapperLayers, their tiles textures, and
 // WebKit's TextureMapper composes them into a framebuffer of the view's
-// size, of which each frame's damage is read back into the raster frame.
-// On the CPU (no Vulkan device, setGPUCompositingAllowed(false),
+// size, of which each frame's damage is read back into the raster frame
+// (Threaded: asynchronously, the frame ready when its read is done).
+// On the CPU (no Vulkan device or a CPU's, setGPUCompositingAllowed(false),
 // MLX_COMPOSITING=cpu): SkiaCompositingLayer composes the layers straight
 // into the raster frame.
 //
@@ -199,6 +200,9 @@ private:
     void requestCompositionForRenderingUpdate();
     void scheduleFrameLocked() WTF_REQUIRES_LOCK(m_stateLock);
     void renderFrame();
+    void renderFrameOnGPU(bool& running, MonotonicTime& locked, MonotonicTime& composed);
+    void takeReads(bool wait);
+    void scheduleReadPoll();
     bool paintFrame(SkCanvas&, std::optional<Damage>& frameDamage, bool targetValid);
     // The GPU's compositor (its GL context, TextureMapper and framebuffer,
     // on the compositor thread): the frame of SIZE composed (only its
@@ -264,6 +268,9 @@ private:
     std::atomic<bool> m_animationsRunning { false };
     std::unique_ptr<GPUCompositor> m_gpu;
     bool m_onGPU { false };
+    // (On the GPU, Threaded: frames read back asynchronously.)
+    bool m_asynchronousReads { false };
+    bool m_readPollScheduled { false };
     String m_compositingReason;
     // (On the GPU: the damage the layers' TextureMapperLayers infer in the
     // view's coordinates, shared by all, as LayerTreeHost's.)
@@ -275,6 +282,8 @@ private:
     Vector<uint32_t> m_framePixels WTF_GUARDED_BY_LOCK(m_frameLock);
     IntSize m_frameSize WTF_GUARDED_BY_LOCK(m_frameLock);
     bool m_frameValid WTF_GUARDED_BY_LOCK(m_frameLock) { false };
+    // (Asynchronous reads: whether a frame of its size has been read.)
+    bool m_frameReadable WTF_GUARDED_BY_LOCK(m_frameLock) { false };
     Vector<IntRect> m_frameDamage WTF_GUARDED_BY_LOCK(m_frameLock);
     bool m_frameDamageFull WTF_GUARDED_BY_LOCK(m_frameLock) { true };
     std::atomic<bool> m_newFrame { false };
