@@ -158,7 +158,17 @@ and where it goes.
   stack the 64-bit significand `stdlib.mlx` reads with `extended.mlx`,
   decimal and hexadecimal, rounded as glibc rounds) as machine code in a
   page of their own, the long double functions of libm in another,
-  and the names glibc gives twice (`__environ`, `__progname`, `error`).
+  and the names glibc gives twice (`__environ`, `__progname`, `error`,
+  `__timezone`, `__tzname`, a large-file `foo64` as `foo`). A `dlopen`
+  without `RTLD_NOW` binds a function nobody defines to a stub that says
+  which and whose when it is called (glibc's lazy binding fails then); a
+  `dlopen` that fails takes the modules it added away again.
+- **`gnu.mlx`**: what libraries built for glibc call besides the C
+  library (lavapipe, LLVM and the system's libstdc++, which WebGL's
+  Vulkan driver brings): the C locale as glibc's `struct __locale_struct`
+  with `__newlocale` and the `_l` functions, the wide-character stream
+  functions, `_FORTIFY_SOURCE`'s `__*_chk`, `__cxa_thread_atexit_impl`,
+  `arc4random`, termios, `<mntent.h>`, System V shared memory.
 - **`start.mlx`**: `__mlx_start`, the entry: the main thread's control
   block and thread pointer (the stack protector's guard at `fs:0x28`), the
   aux vector, this library relocated against itself, the standard streams,
