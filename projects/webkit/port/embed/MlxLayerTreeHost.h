@@ -1,4 +1,4 @@
-// A page's composited layers on the CPU (PORT.md, "Compositing"): what
+// A page's composited layers (PORT.md, "Compositing"): what
 // WebKit2's LayerTreeHost, CoordinatedSceneState and ThreadedCompositor
 // (Source/WebKit, which the port does not build) are to WPE, for the
 // port's single process. WebCore's coordinated graphics make the layers
@@ -14,6 +14,15 @@
 // display's rate) and composes frames into a raster frame of the view's
 // size, with the damage of each.
 //
+// On the GPU when it can (WPE's way): the compositor thread owns a GL
+// context of ANGLE's surfaceless EGL display (PlatformDisplayMlx.h), the
+// layers' targets are TextureMapperLayers, their tiles textures, and
+// WebKit's TextureMapper composes them into a framebuffer of the view's
+// size, of which each frame's damage is read back into the raster frame.
+// On the CPU (no Vulkan device, setGPUCompositingAllowed(false),
+// MLX_COMPOSITING=cpu): SkiaCompositingLayer composes the layers straight
+// into the raster frame.
+//
 // Threaded (Voyager): a compositor thread composes when something asks for
 // a frame (a rendering update, a scroll of the scrolling thread, a running
 // animation), on the ticks of MlxDisplayLink, the process's frame clock;
@@ -23,8 +32,9 @@
 // as WebKit2's EventDispatcher sends them), which scrolls the layers
 // without the main thread; what it cannot handle goes to the main thread.
 //
-// Synchronous (webcore-dump): composite() composes on the calling thread,
-// after the painting of the tiles is done.
+// Synchronous (webcore-dump): composite() composes on the calling thread
+// (on the GPU: on the compositor's thread, waited for), after the painting
+// of the tiles is done.
 #pragma once
 
 #include "CoordinatedPlatformLayer.h"
@@ -78,6 +88,13 @@ public:
     // fixed elements composited, frames and overflow scrolled
     // asynchronously, damage propagated for compositing from it.
     static void configure(Settings&);
+
+    // Whether hosts made from now on compose on the GPU when a display
+    // exists (true unless MLX_COMPOSITING=cpu); false is the CPU's
+    // compositor (an embedder's --no-gpu-compositing).
+    static void setGPUCompositingAllowed(bool);
+    // Whether this host composes on the GPU.
+    bool composesOnGPU() const { return m_onGPU; }
 
     // The host of LAYER's page (the client of its platform layer).
     static MlxLayerTreeHost& of(const GraphicsLayerCoordinated&);
@@ -173,6 +190,13 @@ private:
     void scheduleFrameLocked() WTF_REQUIRES_LOCK(m_stateLock);
     void renderFrame();
     bool paintFrame(SkCanvas&, std::optional<Damage>& frameDamage, bool targetValid);
+    // The GPU's compositor (its GL context, TextureMapper and framebuffer,
+    // on the compositor thread): the frame of SIZE composed (only its
+    // damage when TARGETVALID), the damage in FRAMEDAMAGE; false when its
+    // context is lost.
+    struct GPUCompositor;
+    bool paintFrameOnGPU(const IntSize&, std::optional<Damage>& frameDamage, bool targetValid, bool& running);
+    void darkenSolidColors();
     void didCompositeRenderingUpdate();
     void countFrame();
     RefPtr<ScrollingTree> mainThreadScrollingTree();
@@ -228,6 +252,11 @@ private:
     RefPtr<ScrollingTree> m_scrollingTree WTF_GUARDED_BY_LOCK(m_stateLock);
     Function<void()> m_frameReady;
     std::atomic<bool> m_animationsRunning { false };
+    std::unique_ptr<GPUCompositor> m_gpu;
+    bool m_onGPU { false };
+    // (On the GPU: the damage the layers' TextureMapperLayers infer in the
+    // view's coordinates, shared by all, as LayerTreeHost's.)
+    std::shared_ptr<Damage> m_globalDamage;
 
     // The frame (the compositor's target): its pixels, whether they hold
     // the last frame, the damage not yet taken.

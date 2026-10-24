@@ -11,8 +11,9 @@
 // one cycle, every tab's: background tabs keep running); hand the shown
 // tab's latest frame to the window's pixels with its damage (each tab's
 // MlxLayerTreeHost composites its layers on a compositor thread at the
-// display's rate and scrolls on the scrolling thread, PORT.md
-// "Compositing"; with --no-compositing the view is painted whole through
+// display's rate, on the GPU when there is a Vulkan device (else, or with
+// --no-gpu-compositing, on the CPU), and scrolls on the scrolling thread,
+// PORT.md "Compositing"; with --no-compositing the view is painted whole through
 // GraphicsContextSkia, as before M8), and the pointer's, the wheel's and the keyboard's
 // events to it (WebCore's EventHandler; text typed into an editable
 // element through the Editor, editing keys as its commands; a link
@@ -29,7 +30,7 @@
 // (VoyagerBuild.h). about:about and about:version (any about: but blank
 // and srcdoc) are voyager://about and voyager://version.
 //
-//     voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] FILE|URL
+//     voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] [--no-gpu-compositing] FILE|URL
 //
 // Built by ./mlx build webkit-mlx-voyager (mlx-out/webkit/mlx/bin/voyager);
 // tools/check_voyager.sh runs it on the compositor.
@@ -1354,7 +1355,7 @@ extern char** environ;
 
 static int usage()
 {
-    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] FILE|URL\n");
+    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] [--no-gpu-compositing] FILE|URL\n");
     return 2;
 }
 
@@ -1372,6 +1373,8 @@ int main(int argc, char** argv)
             profile = argv[++i];
         else if (!strcmp(argv[i], "--no-compositing"))
             compositing = false;
+        else if (!strcmp(argv[i], "--no-gpu-compositing"))
+            MlxLayerTreeHost::setGPUCompositingAllowed(false);
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             int width = 0;
             int height = 0;

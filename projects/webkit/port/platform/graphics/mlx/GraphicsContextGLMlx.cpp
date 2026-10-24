@@ -8,7 +8,14 @@
 // ANGLE's own on Vulkan without a window system (EGL_PLATFORM_SURFACELESS_
 // MESA: DisplayVkOffscreen), a context needs no surface.
 //
-// The port composites on the CPU (PORT.md, "Compositing"): at each frame
+// On the GPU compositor (PORT.md, "Compositing": PlatformDisplay's shared
+// display exists), as WPE's: the context shares its textures with the
+// display's sharing context, which every compositor's context shares
+// with, and each frame WebGL presents swaps the drawing buffer's texture
+// with the compositor's (m_compositorTexture), which the canvas' layer
+// shows (CoordinatedPlatformLayerBufferRGB, after a fence): no read back.
+//
+// On the CPU compositor: at each frame
 // WebGL presents (prepareForDisplay), the drawing buffer is read back
 // into a raster image (BGRA, premultiplied: the compositor's format),
 // flipped to the page's orientation, and handed to
@@ -22,10 +29,16 @@
 #include "ANGLEHeaders.h"
 #include "ANGLEUtilities.h"
 #include "CoordinatedPlatformLayerBufferNativeImage.h"
+#include "CoordinatedPlatformLayerBufferRGB.h"
+#include "GLContext.h"
+#include "GLFence.h"
 #include "GraphicsContextGLANGLE.h"
 #include "GraphicsLayerContentsDisplayDelegateCoordinated.h"
 #include "NativeImage.h"
 #include "PixelBuffer.h"
+#include "PlatformDisplay.h"
+#include "PlatformDisplayMlx.h"
+#include "TextureMapperFlags.h"
 #include <wtf/StdLibExtras.h>
 
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
@@ -66,12 +79,24 @@ private:
     bool platformInitializeContext() final;
     bool platformInitialize() final;
 
+    ~GraphicsContextGLMlx()
+    {
+        if (m_compositorTexture && makeContextCurrent())
+            GL_DeleteTextures(1, &m_compositorTexture);
+    }
+
+    void swapCompositorTexture();
+
     RefPtr<GraphicsLayerContentsDisplayDelegate> m_layerContentsDisplayDelegate;
+    // (The GPU compositor's: the texture it shows, in the shared group.)
+    GCGLuint m_compositorTexture { 0 };
+    bool m_sharesWithCompositor { false };
 };
 
 // ANGLE's display on Vulkan, initialized once for the process (each
-// context its own of it).
-static EGLDisplay angleDisplay()
+// context its own of it; the GPU compositor's contexts too:
+// PlatformDisplayMlx.h).
+void* mlxANGLEDisplay()
 {
     static EGLDisplay display = [] {
         const EGLAttrib attributes[] = {
@@ -85,7 +110,7 @@ static EGLDisplay angleDisplay()
         EGLint major = 0;
         EGLint minor = 0;
         if (!EGL_Initialize(made, &major, &minor)) {
-            WTFLogAlways("WebGL: no Vulkan device for ANGLE (EGL error 0x%x)", EGL_GetError());
+            WTFLogAlways("ANGLE: no Vulkan device (EGL error 0x%x)", EGL_GetError());
             return EGL_NO_DISPLAY;
         }
         return made;
@@ -143,7 +168,7 @@ RefPtr<GraphicsContextGL> createWebProcessGraphicsContextGL(const GraphicsContex
 bool GraphicsContextGLMlx::platformInitializeContext()
 {
     m_isForWebGL2 = contextAttributes().isWebGL2;
-    m_displayObj = angleDisplay();
+    m_displayObj = static_cast<EGLDisplay>(mlxANGLEDisplay());
     if (m_displayObj == EGL_NO_DISPLAY)
         return false;
 
@@ -183,7 +208,18 @@ bool GraphicsContextGLMlx::platformInitializeContext()
     contextAttributes.append(EGL_CONTEXT_BIND_GENERATES_RESOURCE_CHROMIUM);
     contextAttributes.append(EGL_FALSE);
     contextAttributes.append(EGL_NONE);
-    m_contextObj = EGL_CreateContext(m_displayObj, m_configObj, EGL_NO_CONTEXT, contextAttributes.span().data());
+    // (Sharing the compositor's textures when it composes on the GPU.)
+    EGLContext sharing = EGL_NO_CONTEXT;
+    if (auto* display = PlatformDisplay::sharedDisplayIfExists()) {
+        if (auto* context = display->sharingGLContext())
+            sharing = context->platformContext();
+    }
+    m_contextObj = EGL_CreateContext(m_displayObj, m_configObj, sharing, contextAttributes.span().data());
+    if (m_contextObj == EGL_NO_CONTEXT && sharing != EGL_NO_CONTEXT) {
+        WTFLogAlways("WebGL: no context sharing the compositor's (EGL error 0x%x): read back", EGL_GetError());
+        m_contextObj = EGL_CreateContext(m_displayObj, m_configObj, EGL_NO_CONTEXT, contextAttributes.span().data());
+    } else
+        m_sharesWithCompositor = sharing != EGL_NO_CONTEXT;
     if (m_contextObj == EGL_NO_CONTEXT)
         return false;
     return makeContextCurrent();
@@ -192,6 +228,15 @@ bool GraphicsContextGLMlx::platformInitializeContext()
 bool GraphicsContextGLMlx::platformInitialize()
 {
     m_layerContentsDisplayDelegate = GraphicsLayerContentsDisplayDelegateCoordinated::create();
+    if (m_sharesWithCompositor) {
+        ScopedRestoreTextureBinding restoreBinding(TEXTURE_BINDING_2D, TEXTURE_2D);
+        GL_GenTextures(1, &m_compositorTexture);
+        GL_BindTexture(GL_TEXTURE_2D, m_compositorTexture);
+        GL_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        GL_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        GL_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        GL_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     return true;
 }
 
@@ -203,7 +248,73 @@ bool GraphicsContextGLMlx::reshapeDrawingBuffer()
     ScopedRestoreTextureBinding restoreBinding(TEXTURE_BINDING_2D, TEXTURE_2D);
     GL_BindTexture(GL_TEXTURE_2D, m_texture);
     GL_TexImage2D(GL_TEXTURE_2D, 0, format, size.width(), size.height(), 0, format, GL_UNSIGNED_BYTE, nullptr);
+    if (m_compositorTexture) {
+        GL_BindTexture(GL_TEXTURE_2D, m_compositorTexture);
+        GL_TexImage2D(GL_TEXTURE_2D, 0, format, size.width(), size.height(), 0, format, GL_UNSIGNED_BYTE, nullptr);
+    }
     return true;
+}
+
+// The fence after a frame WebGL presents, which the compositor waits for
+// on the GPU before it draws the frame's texture (an EGL fence sync of
+// ANGLE's: made, it submits what the context recorded, the open render
+// pass too, which glFlush leaves open). WebKit's GLFence::create gives
+// none here: its fences are HAVE(GL_FENCE)'s, and a WebGL 1 context has
+// no GL sync objects.
+class MlxEGLFence final : public GLFence {
+public:
+    static std::unique_ptr<GLFence> create(EGLDisplay display)
+    {
+        EGLSync sync = EGL_CreateSync(display, EGL_SYNC_FENCE_KHR, nullptr);
+        if (sync == EGL_NO_SYNC)
+            return nullptr;
+        return std::unique_ptr<GLFence>(new MlxEGLFence(display, sync));
+    }
+
+    ~MlxEGLFence() final
+    {
+        EGL_DestroySync(m_display, m_sync);
+    }
+
+private:
+    MlxEGLFence(EGLDisplay display, EGLSync sync)
+        : m_display(display)
+        , m_sync(sync)
+    {
+    }
+
+    void clientWait() final
+    {
+        EGL_ClientWaitSync(m_display, m_sync, 0, EGL_FOREVER);
+    }
+
+    void serverWait() final
+    {
+        EGL_WaitSync(m_display, m_sync, 0);
+    }
+
+    EGLDisplay m_display;
+    EGLSync m_sync;
+};
+
+// The drawing buffer's texture and the compositor's swapped (WPE's
+// GraphicsContextGLTextureMapperANGLE::swapCompositorTexture): the frame
+// presented goes to the compositor, WebGL draws into the other.
+void GraphicsContextGLMlx::swapCompositorTexture()
+{
+    std::swap(m_texture, m_compositorTexture);
+    if (m_preserveDrawingBufferTexture) {
+        GL_FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_preserveDrawingBufferTexture, 0);
+        GL_BindFramebuffer(GL_FRAMEBUFFER, m_preserveDrawingBufferFBO);
+        GL_FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture, 0);
+        GL_BindFramebuffer(GL_FRAMEBUFFER, m_fbo);
+    } else {
+        GL_BindFramebuffer(GL_FRAMEBUFFER, m_fbo);
+        GL_FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture, 0);
+    }
+    GL_Flush();
+    if (m_state.boundDrawFBO != m_fbo)
+        GL_BindFramebuffer(GraphicsContextGL::FRAMEBUFFER, m_state.boundDrawFBO);
 }
 
 void GraphicsContextGLMlx::prepareForDisplay()
@@ -211,6 +322,15 @@ void GraphicsContextGLMlx::prepareForDisplay()
     if (!makeContextCurrent())
         return;
     prepareTexture();
+    if (m_compositorTexture) {
+        swapCompositorTexture();
+        OptionSet<TextureMapperFlags> flags = TextureMapperFlags::ShouldFlipTexture;
+        if (contextAttributes().alpha)
+            flags.add(TextureMapperFlags::ShouldBlend);
+        auto fence = MlxEGLFence::create(m_displayObj);
+        m_layerContentsDisplayDelegate->setDisplayBuffer(CoordinatedPlatformLayerBufferRGB::create(m_compositorTexture, getInternalFramebufferSize(), flags, WTF::move(fence)));
+        return;
+    }
     RefPtr pixels = readRenderingResultsForPainting();
     if (!pixels || pixels->size().isEmpty())
         return;

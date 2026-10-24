@@ -1,37 +1,67 @@
-// The Mlx port's PlatformDisplay, GLContext and GLFence: what WebCore's
-// Skia sources ask of the GPU when an image or a canvas is accelerated
-// (PlatformDisplaySkia.cpp, GLContext.cpp and GLFence.cpp over EGL; not
-// compiled, lists/webcore-mlx-skipped.txt). The port paints on the CPU
-// (PORT.md, "Graphics"): there is no display, so nothing is accelerated,
-// and WebCore asks for one only where an accelerated image or buffer
-// exists.
+// The Mlx port's PlatformDisplay: ANGLE's surfaceless EGL display on Vulkan
+// (PlatformDisplayMlx.h), what WebKit's TextureMapper, BitmapTexturePool and
+// GLContext (platform/graphics/egl, texmap: compiled as they are) are given
+// when the compositor composes on the GPU (MlxLayerTreeHost). WebKit's
+// PlatformDisplay.cpp keeps the shared display; it exists only once the
+// GPU compositor asked for it (sharedDisplayIfExists() is null otherwise,
+// and nothing is accelerated: ProcessCapabilities says no accelerated
+// buffers).
 //
-// STUB (M8 and after: Skia's Ganesh over the compositor's GPU, std.gpu):
-// no display exists; sharedDisplayIfExists() says so, and asking for the
-// display itself is a crash.
+// What PlatformDisplaySkia.cpp gives (Ganesh on the display: GPU painting
+// of images, canvases and tiles) is not taken: the layers' tiles are
+// painted on the CPU (SkiaPaintingEngineMlx.cpp) and uploaded into
+// textures.
+// STUB (Ganesh over ANGLE: tiles and canvases painted on the GPU): no
+// Skia GL context, no GrDirectContext.
+
 #include "config.h"
-#include "PlatformDisplay.h"
+#include "PlatformDisplayMlx.h"
 
 #include "GLContext.h"
-#include "GLFence.h"
+#include "GLDisplay.h"
+#include "PlatformDisplay.h"
+#include <wtf/MainThread.h>
 
 namespace WebCore {
 
-PlatformDisplay* PlatformDisplay::sharedDisplayIfExists()
-{
-    return nullptr;
-}
+class PlatformDisplayMlx final : public PlatformDisplay {
+public:
+    explicit PlatformDisplayMlx(Ref<GLDisplay>&& display)
+        : PlatformDisplay(WTF::move(display))
+    {
+    }
 
-PlatformDisplay& PlatformDisplay::sharedDisplay()
+private:
+    Type type() const final { return Type::Surfaceless; }
+};
+
+bool mlxEnsureSharedDisplay()
 {
-    PlatformDisplay* display = sharedDisplayIfExists();
-    RELEASE_ASSERT(display);
-    return *display;
+    static bool usable = [] {
+        RELEASE_ASSERT(isMainThread());
+        if (PlatformDisplay::sharedDisplayIfExists())
+            return true;
+        auto* angle = mlxANGLEDisplay();
+        if (!angle)
+            return false;
+        RefPtr display = GLDisplay::create(angle);
+        if (!display)
+            return false;
+        PlatformDisplay::setSharedDisplay(makeUnique<PlatformDisplayMlx>(display.releaseNonNull()));
+        // (The sharing context: every compositor's context shares its
+        // textures, as BitmapTexturePool's are, with it.)
+        return !!PlatformDisplay::sharedDisplay().sharingGLContext();
+    }();
+    return usable;
 }
 
 GLContext* PlatformDisplay::skiaGLContext()
 {
     return nullptr;
+}
+
+void PlatformDisplay::clearSkiaGLContext()
+{
 }
 
 GrDirectContext* PlatformDisplay::skiaGrContext() const
@@ -47,21 +77,6 @@ unsigned PlatformDisplay::msaaSampleCount() const
 size_t PlatformDisplay::maxSkiaResourceCacheBytes() const
 {
     return 0;
-}
-
-bool GLContext::makeContextCurrent()
-{
-    return false;
-}
-
-bool GLFence::isSupported(const GLDisplay&)
-{
-    return false;
-}
-
-std::unique_ptr<GLFence> GLFence::create(const GLDisplay&)
-{
-    return nullptr;
 }
 
 } // namespace WebCore
