@@ -257,6 +257,8 @@ clicks, a split button, a disabled back button, a crumb, a link, a
 swatch, a value row, a column header, a thin indicator, events through
 `std.ui.app.feed`, a text field edited by keys, a list scrolled by the
 wheel and by its bar, a tab closed, clipping, wrapping).
+`tests/412_ui_chooser_runtime.mlx` drives `std.ui.chooser` without a window
+(places, the path field, Tab completion, the last folder kept).
 `tests/409_ui_field_long_runtime.mlx` edits a text field of 4 KB and more
 (set, typed into the middle, grown past 8 KB, selected, deleted), draws it
 scrolled so the caret at its end is in view, places the caret by a click

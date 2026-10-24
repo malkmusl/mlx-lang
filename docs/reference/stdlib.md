@@ -104,7 +104,7 @@ compiler-core std do not load the generated protocol modules. See
 [Wayland](wayland.md) for the pipeline, runtime and tests
 (`tests/240_std_xml_tokenizer_runtime.mlx` covers `std.xml`).
 
-`std.xml.sax` (`std/src/xml/sax.mlx`, test 374) is the streaming parser
+`std.xml.sax` (`std/src/xml/sax.mlx`, `tests/374_xml_sax_runtime.mlx`) is the streaming parser
 libxml2's C API is made of; `std.xml.text` beside it holds, for programs
 writing XML, text escaped for character data, an attribute's value,
 ASCII-only output and HTML (`writeEscaped(sink, text, mode)`, the escapes
@@ -174,7 +174,8 @@ the crash in
 named from the symbol table its linker writes (the file mapped once, its
 functions sorted by address once, then a binary search per frame): a
 C++ frame says the mangled name and, from `std.demangle` (an Itanium
-demangler that allocates nothing, `demangle(name, out, capacity)`), the
+demangler that allocates nothing, `demangle(name, out, capacity)`;
+`tests/392_demangle_runtime.mlx`), the
 name as it is written, then "defined at FILE:LINE" from the line table
 the linker makes of mlx-cc's marks. `fail(reason)` ends the program the same
 way for a failure it cannot go on after. The report goes to stderr. Every
@@ -389,7 +390,13 @@ code again only the rows a frame changed. `std.matroska`
 (`std/src/matroska.mlx`) writes Matroska files: Motion JPEG and 16-bit
 PCM tracks, blocks with their own times, clusters, Cues and a SeekHead
 for seeking. mlx-capture's recordings use both
-(`tools/check_capture_record.sh`).
+(`tools/check_capture_record.sh`). The decoders the WebKit port's images
+go through are checked against the system's libraries' pixels:
+`tests/365_png_decode_runtime.mlx` (std.png), `tests/366_jpeg_decode_runtime.mlx`
+(std.jpeg's decoder, against libjpeg-turbo), `tests/367_webp_decode_runtime.mlx`
+(std.webp: lossy, lossless, alpha, animation, against libwebp) and
+`tests/373_colorprofile_runtime.mlx` (std.colorprofile's transforms, against
+Little CMS).
 
 `std.png` (`std/src/png.mlx`) decodes PNG images into premultiplied ARGB
 words (`0xAARRGGBB`, the `wl_shm` and compositor convention), for icons
@@ -1329,7 +1336,9 @@ width use it; the test runs it on a pseudo-terminal of its own.
 ## Base directories (`std.xdg`)
 
 **Implementation:** `std/src/xdg.mlx`
-**Source tests:** `354_xdg_runtime.mlx` (run by `tests/run_std_modules.sh`)
+**Source tests:** `354_xdg_runtime.mlx`, and `411_xdg_open_runtime.mlx` for
+`std.xdg.open` (a file opened with the desktop's application for its type)
+(run by `tests/run_std_modules.sh`)
 
 Where a program keeps its files, by the XDG Base Directory
 Specification, from an environment list (`[*][*]const u8`, the program's
@@ -1518,7 +1527,7 @@ submodule, VERSION files changed directly and by a merge.
 ## Finding fonts (`std.fontconfig`)
 
 **Implementation:** `std/src/fontconfig.mlx` and `std/src/fontconfig/`
-**Source tests:** `373_fontconfig_runtime.mlx` (run by `tests/run_std_modules.sh`);
+**Source tests:** `375_fontconfig_runtime.mlx` (run by `tests/run_std_modules.sh`);
 `tools/check_fontconfig.sh` for the C API over it (compiler/libc/fontconfig)
 
 Fontconfig 2.15's font matching without a C library: `load.current()`
@@ -1823,6 +1832,15 @@ examples among others.
 
 ## Public-key arithmetic (`std.crypto.mpi`, `std.crypto.rsa`)
 
+**Source tests:** `384_crypto_mpi_rsa_runtime.mlx` and
+`410_crypto_rsa_sizes_runtime.mlx` (keys of a few bits to 16384); the rest of
+std.crypto against its standards' vectors in `362_crypto_symmetric_runtime.mlx`
+(HMAC, HKDF, PBKDF2, AES, GCM, key wrap, ChaCha20-Poly1305) and
+`363_crypto_public_key_runtime.mlx` (X25519, Ed25519, ECDSA and ECDH on P-256,
+P-384 and P-521); std.asn1 and std.x509 on a small PKI in
+`364_x509_runtime.mlx`; std.sql, the SQLite-compatible engine under
+mlx-sqlite3, in `372_sql_runtime.mlx`
+
 **Normative source:** none yet (RFC 8017 for RSA; `tools/check_gcrypt.sh`
 compares the libgcrypt shim, whose limb arithmetic is this module's, with
 libgcrypt 1.10)
@@ -1864,7 +1882,10 @@ shim over them with libsoup 3.4)
 knows), `std.http.date`, `std.http.status`, `std.http.form`,
 `std.http.chunked`, `std.http.sniff`, `std.http.psl` (the Public Suffix
 List), `std.http.cookie` and `std.http.websocket` (see `std/src/README.md`
-for each). Tests 370 and 371 cover them. `std.http.mime` is the other
+for each). `tests/370_http_headers_runtime.mlx` and
+`tests/371_http_protocol_runtime.mlx` cover them; `std.http.mime` and
+`std.xml.text`'s writing side are `tests/383_mime_xml_text_runtime.mlx`'s.
+`std.http.mime` is the other
 side of sniffing: the media type of a local file, guessed from the
 name's extension (the web's common types, as GIO answers from the
 shared-mime-info database, with whether it calls the answer uncertain;

@@ -6,6 +6,7 @@
 `89_checked_overflow_comptime.mlx`, `91_wrapping_saturating_runtime.mlx`,
 `92_saturating_shift_runtime.mlx`, `93_checked_overflow_runtime.mlx`,
 `94_wrapping_shift_count_runtime.mlx`, `113_signed_integer_runtime.mlx`,
+`359_signed_wrapping_runtime.mlx`,
 `114_unsigned_comparison_runtime.mlx`, `183_float_exponent_runtime.mlx`,
 `184_signed_right_shift_runtime.mlx`, `203_immediate_alu_gep_runtime.mlx`,
 `207_popcount_runtime.mlx`, `322_float_literal_arithmetic_runtime.mlx`,
