@@ -26,6 +26,7 @@
 #include "GraphicsLayerContentsDisplayDelegateCoordinated.h"
 #include "NativeImage.h"
 #include "PixelBuffer.h"
+#include "PlatformDisplayMlx.h"
 #include <wtf/StdLibExtras.h>
 
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
@@ -70,8 +71,9 @@ private:
 };
 
 // ANGLE's display on Vulkan, initialized once for the process (each
-// context its own of it).
-static EGLDisplay angleDisplay()
+// context its own of it; the GPU compositor's contexts too:
+// PlatformDisplayMlx.h).
+void* mlxANGLEDisplay()
 {
     static EGLDisplay display = [] {
         const EGLAttrib attributes[] = {
@@ -85,7 +87,7 @@ static EGLDisplay angleDisplay()
         EGLint major = 0;
         EGLint minor = 0;
         if (!EGL_Initialize(made, &major, &minor)) {
-            WTFLogAlways("WebGL: no Vulkan device for ANGLE (EGL error 0x%x)", EGL_GetError());
+            WTFLogAlways("ANGLE: no Vulkan device (EGL error 0x%x)", EGL_GetError());
             return EGL_NO_DISPLAY;
         }
         return made;
@@ -143,7 +145,7 @@ RefPtr<GraphicsContextGL> createWebProcessGraphicsContextGL(const GraphicsContex
 bool GraphicsContextGLMlx::platformInitializeContext()
 {
     m_isForWebGL2 = contextAttributes().isWebGL2;
-    m_displayObj = angleDisplay();
+    m_displayObj = static_cast<EGLDisplay>(mlxANGLEDisplay());
     if (m_displayObj == EGL_NO_DISPLAY)
         return false;
 
