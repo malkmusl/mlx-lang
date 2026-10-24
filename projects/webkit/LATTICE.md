@@ -99,6 +99,18 @@ The order:
 | L3 | The plan for WebKit | from L0–L2's experience: the order of WTF, JavaScriptCore, WebCore and the port, what is translated and what is rewritten, written here |
 | L4 and on | WebKit, layer by layer | each layer as ANGLE was: at parity, then the default, then the C++ retired; `ENGINE` becomes Lattice with the first layer in a shipping build |
 
+## After parity: cleaning up
+
+Once Lattice runs on its own, the translated code is untangled, layer by
+layer, with the code map as the guide: `mlx-codemap complex` (the
+functions to split), `copies` (code that exists twice), `unused`,
+`cycles` and `layers` (imports that cross the layers codemap.layers
+sets), `workarounds` (hand-written tables and allocators), `hot` (where
+the time goes). Each cleanup is its own change with the browser's checks
+passing before and after, so behaviour stays what the parity tests
+proved; what WebKit's history left behind (ports, platforms and switches
+Lattice does not have) goes first.
+
 ## Open questions
 
 - How templates become Mlx: generic functions with `comptime` types
