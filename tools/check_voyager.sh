@@ -99,7 +99,16 @@
 #  23. accelerated animations (M8): projects/voyager/tests/animation.html's
 #      CSS animations of transform and opacity composed at the display's
 #      rate on the compositor thread (its frames a second, 90% of the rate
-#      at least) with no paint; requestAnimationFrame at the same rate.
+#      at least) with no paint; requestAnimationFrame at the same rate;
+#  24. WebGL (M8): projects/voyager/tests/webgl.html's canvas, a triangle
+#      turning on green drawn from requestAnimationFrame (ANGLE on Vulkan,
+#      the drawing buffer read back into the canvas' layer each frame),
+#      runs on the frame clock, at half the display's rate at least (its
+#      title; on lavapipe and the CPU compositor about 38 of 60 frames a
+#      second, PORT.md "WebGL"), each frame composed; the screenshot has
+#      the canvas (its green, 300x300 where the page puts it) and the
+#      triangle's red in it. Skipped, said, on a machine without a Vulkan
+#      driver.
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -752,4 +761,30 @@ awk -v fps="$slowest" -v rate="$rate" 'BEGIN { exit !(fps >= rate * 0.9) }' || {
 raf=$(grep -o "^voyager: title raf:[0-9]*" "$log" | tail -1 | cut -d: -f3)
 (( ${raf:-0} >= rate * 9 / 10 )) || { cat "$log" >&2; fail "requestAnimationFrame did not run at the display's rate (${raf:-no} frames a second)"; }
 echo "ok   CSS animations of transform and opacity run on the compositor thread: $frames frames in the last counts, no paint, at least $slowest frames a second; requestAnimationFrame $raf a second"
+# 24: WebGL on the frame clock (no Vulkan driver manifest: said, and skipped).
+if [[ -z "$(ls /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json 2> /dev/null)" && -z "${VK_DRIVER_FILES:-}" ]]; then
+    echo "skip WebGL: no Vulkan driver manifest (install mesa-vulkan-drivers for lavapipe)"
+else
+    write_runner "$work/voyager-webgl" webgl.html
+    printf 'wait 7000\nshot %s\nwait 3000\nclose\n' "$work/webgl.ppm" > "$work/webgl.script"
+    run_scenario webgl "$work/webgl.script" "$work/voyager-webgl"
+    log=$work/voyager.log
+    lines=$(grep "^voyager: compositor paints " "$log")
+    count=$(wc -l <<< "$lines")
+    (( count >= 4 )) || { cat "$log" >&2; fail "the engine wrote too few compositor counts for the WebGL page ($count)"; }
+    rate=${MLX_REFRESH_RATE:-60}
+    drawn=$(grep -o "^voyager: title webgl:[0-9]*" "$log" | tail -1 | cut -d: -f3)
+    (( ${drawn:-0} >= rate / 2 )) || { cat "$log" >&2; fail "the WebGL page did not draw at half the display's rate at least (${drawn:-no} frames a second)"; }
+    # (The compositor's frames a second in the last counts: each frame
+    # drawn composed.)
+    composed=$(tail -3 <<< "$lines" | awk '{ print $NF }' | sort -n | head -1)
+    awk -v fps="$composed" -v rate="$rate" 'BEGIN { exit !(fps >= rate / 2) }' || { cat "$log" >&2; fail "the WebGL page's frames were not composed ($composed frames a second, $drawn drawn)"; }
+    canvas=$(box_of "$work/webgl.ppm" 10a040)
+    read -r cx cy cw ch <<< "$canvas"
+    [[ -n "$canvas" ]] && (( cw == 300 && ch == 300 )) || fail "the screenshot has no WebGL canvas of 300x300 (its green: ${canvas:-none})"
+    triangle=$(box_of "$work/webgl.ppm" ff0000)
+    read -r tx ty tw th <<< "$triangle"
+    [[ -n "$triangle" ]] && (( tx > cx && ty > cy && tx + tw < cx + cw && ty + th < cy + ch )) || fail "the screenshot has no triangle in the WebGL canvas (its red: ${triangle:-none})"
+    echo "ok   WebGL draws a frame each animation frame, $drawn a second, composed ($composed frames a second): the canvas at $cx,$cy, the triangle in it"
+fi
 echo "check_voyager.sh: all checks passed"

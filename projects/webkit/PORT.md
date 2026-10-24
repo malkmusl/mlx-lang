@@ -321,6 +321,43 @@ mlx-cc compiles both as released now:
   composited.html@forcedark), check_webkit_mlx_compositing.sh 103 of
   103 (WebKit's compositing/ layer trees), check_voyager.sh's
   scenarios 22 and 23.
+- **M8, part 2, done** (WebGL; "WebGL" below): WebGL 1 and 2 on ANGLE's
+  Vulkan backend (`webkit-angle`, as WebKit's Linux ports configure it,
+  with its SPIR-V translator, no GL or EGL library of the system), whose
+  Vulkan is the port's own libmlxvulkan.so (compiler/libc/vulkan: Vulkan's
+  C API over std.vulkan's loader, its headers by mlx-cheaders from
+  Vulkan-Headers' registry) over the system's driver, lavapipe where there
+  is no GPU. The port's GraphicsContextGLMlx draws into a texture of a
+  context without a window and reads each frame back into the canvas'
+  layer for the CPU compositor. What it took: in mlx-cc (epochs 17 to
+  25, each with its test in compiler/cc/tests/cpp) decltype through
+  qualified template arguments, a data member hiding a type, anonymous
+  structs in unions, a specialized conversion operator, `{}` for a union,
+  piecewise pairs, a partial specialization's members defined late, the
+  address of an overloaded function template's instance, a file's own
+  unnamed namespace, unions copied as bytes (bison's YYSTYPE in ANGLE's
+  GLSL parser), a class template's copy constructor defaulted outside the
+  class (ANGLE's FixedVector copied empty: lavapipe drew with garbage
+  image views), rvalue streams (`(std::ostringstream() << x).str()`),
+  `std::min<double>` as a pointer, a conversion to a base through `Ref`'s
+  `operator T &`, class template argument deduction beside a
+  constructor template's pack, and a braced pointer for one of two
+  initializer_list constructors (ANGLE's SeparateDeclarations: `float c
+  = a, s = b;` crashed its translator); in mlxlibc, `RTLD_LAZY` and
+  glibc's names for lavapipe's libraries (LLVM, libstdc++), a failed
+  dlopen unloaded, `sysconf(_SC_PHYS_PAGES)`, which read the wrong fields
+  of `struct sysinfo` (lavapipe's heap was 48 KiB), and its loader's own
+  hash index of the Mlx compiler's libraries' symbols, which they chain
+  in one bucket (a WebGL context's first start, LLVM's relocations
+  looked up, took 13 s; 2.5 s now). MlxLayerTreeHost composes a rendering
+  update as soon as it is committed, as WebKit2's ThreadedCompositor
+  does (left to the clock's next tick, a page changing each frame ran at
+  a quarter of the display's rate). Checks: tools/check_mlx_vulkan.sh,
+  tools/check_webkit_mlx_webgl.sh 62 of 62 (WebKit's fast/canvas/webgl and
+  webgl tests, conformance wrappers among them), check_webkit_mlx_paint.sh's
+  WebGL pages (a triangle, a texture from an image, uniforms, WebGL 2's
+  instancing), check_voyager.sh's scenario 24 (a WebGL canvas animated
+  on the frame clock: about 38 frames a second on lavapipe in Voyager).
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -449,6 +486,7 @@ port in the tarball that builds WebCore without GLib).
 | Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
 | Graphics | `USE_SKIA`, CPU raster; no `USE_CAIRO` | Skia compiles here already (`webkit-skia`); WebCore's only living 2D back end besides Cairo (GTK/WPE moved to Skia); CPU first, no EGL |
 | Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the CPU by `SkiaCompositingLayer`; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles and scrolling tree as they are; only TextureMapper's GL painter is left out ("Compositing") |
+| WebGL | `ENABLE_WEBGL` and `USE_ANGLE` (since M8): `GraphicsContextGLANGLE` with the port's GraphicsContextGLMlx, ANGLE on Vulkan (libmlxvulkan.so) | ANGLE is WebKit's WebGL everywhere; Vulkan is what std.gpu speaks, and lavapipe runs it without a GPU ("WebGL") |
 | Network | neither `USE_SOUP` nor `USE_CURL` | A load is the embedder's (`LoaderStrategy`), over std.http and std.tls |
 | Images | WebCore's `ScalableImageDecoder`, with our PNG, JPEG and WebP decoders; WebKit's BMP, GIF, ICO as they are | WebCore's decoders call libpng, libjpeg, libwebp; ours call std.png, std.jpeg, std.webp |
 | Colour | `USE_LCMS` off, colour management in our decoders (std.colorprofile) | Little CMS is only the decoders' |
@@ -457,7 +495,7 @@ port in the tarball that builds WebCore without GLib).
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
-| Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBGL`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
+| Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
 
 ### WTF, bmalloc, JavaScriptCore
@@ -631,6 +669,74 @@ M4). Skia is to be built for the port without its codecs and encoders
 (lists/skia-mlx.txt, M4), so that Skia needs no image library at all; M2
 links webkit-skia's libSkia.a as it is, whose codecs the port's sources
 do not reach.
+
+### WebGL
+
+Since M8 WebGL 1 and 2 are on (`ENABLE_WEBGL`, `USE_ANGLE`; the
+`WebGLEnabled` setting on in the port's MlxSettings.yaml), on ANGLE,
+WebKit's copy of it built by `webkit-angle` (projects/webkit/angle.mlx,
+lists/angle*.txt) as WebKit's Linux ports configure it, but with its
+Vulkan backend and SPIR-V translator in place of the GL backend over the
+system's EGL:
+
+- **Vulkan: libmlxvulkan.so, no Khronos loader.** ANGLE calls Vulkan's
+  functions directly (not `ANGLE_SHARED_LIBVULKAN`). compiler/libc/vulkan
+  makes `vulkan/vulkan.h` (mlx-cheaders of modules generated from
+  std/registry/vulkan/vk.xml, Vulkan-Headers 1.4.362, the revision of
+  ANGLE's DEPS) and libmlxvulkan.so, which opens the system's driver with
+  std.vulkan's loader (VK_DRIVER_FILES and the icd.d directories, the
+  first driver with a device) and dispatches each command to it through
+  a table the dispatchable object's first word points to (the loader's
+  word of the driver interface); `MLX_VULKAN_TRACE=1` says each command.
+  SPIR-V's headers (spirv.hpp, GLSL.std.450.h) are mlx-cheaders' of
+  std/registry/spirv's grammar (SPIRV-Headers' revision of ANGLE's DEPS).
+  WebKit's ANGLE copy leaves out the third-party libraries its Vulkan
+  backend uses: the port's projects/webkit/port/angle has its own
+  `vma::` (vk_mem_alloc_wrapper.cpp: dedicated allocations, virtual
+  blocks first fit; no Vulkan Memory Allocator), SPIR-V validation off
+  (angle_spirv_utils.cpp, as ANGLE's release builds have it; no
+  SPIRV-Tools), and libvulkan_loader.cpp (OpenLibVulkan: the
+  libmlxvulkan.so the program links). The driver lavapipe is the
+  system's (Mesa's), loaded at run time, never built: its libraries
+  (LLVM, libstdc++) are glibc's, which mlxlibc's loader binds lazily
+  (`RTLD_LAZY`, as the Khronos loader opens drivers) with the glibc names
+  they call (compiler/libc/gnu.mlx).
+- **The context: GraphicsContextGLMlx.** WebKit's `GraphicsContextGLANGLE`
+  (its drawing buffer a texture of a framebuffer object, multisampled or
+  not, preserved or not) with the platform part GTK's and WPE's
+  GraphicsContextGLTextureMapperANGLE has, as the port's
+  port/platform/graphics/mlx/GraphicsContextGLMlx.cpp: ANGLE's EGL display
+  on Vulkan without a window system (`EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE`,
+  `EGL_PLATFORM_SURFACELESS_MESA`: DisplayVkOffscreen), one for the
+  process; each context surfaceless, made with WebGL's attributes
+  (WebGL compatibility, robust resource initialization, no client arrays).
+  ANGLE's Vulkan backend says what costs it time as debug messages
+  ("GPU stall due to ReadPixels"), which WebGL writes on the console;
+  other ports' GL backend says none, so they are turned off (errors stay).
+- **Presenting: read back into the canvas' layer.** The compositor is on
+  the CPU, so at each frame WebGL presents (`prepareForDisplay`) the
+  drawing buffer, resolved from its samples, is read back (`ReadPixels`),
+  flipped to the page's way up and made a raster image in the
+  compositor's format (BGRA, premultiplied: drawn by the port's row
+  blends, not Skia's portable pipeline a pixel at a time, which took the
+  compositor 90 ms a frame for a 300x300 canvas) and handed to the canvas'
+  layer (`CoordinatedPlatformLayerBufferNativeImage` through the
+  coordinated contents display delegate), which SkiaCompositingLayer draws.
+  The read is before WebGL clears a drawing buffer it does not preserve,
+  so the layer keeps the frame presented; `preserveDrawingBuffer`,
+  `toDataURL`, `readPixels`, `drawImage` of a WebGL canvas and textures
+  from images are WebKit's own code over the context. A 300x300 canvas
+  animated by requestAnimationFrame draws on the frame clock, about 38
+  frames a second in Voyager on lavapipe ("What M8's second part
+  leaves").
+
+tools/check_webkit_mlx_webgl.sh runs WebKit's tests of fast/canvas/webgl
+and webgl (tests/layout/webgl.txt; webcore-dump's `internals.settings`
+has `setWebGLErrorsToConsoleEnabled` for them, and synchronous XHR reads
+file: URLs, as their shaders are read), check_webkit_mlx_paint.sh paints
+four WebGL pages against references, and check_voyager.sh's scenario 24
+animates one in Voyager; each says so and skips them where there is no
+Vulkan driver manifest.
 
 ### The theme
 
@@ -1178,7 +1284,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
 | M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh and check_webkit_mlx_crypto.sh, the network check's downloads and uploads, check_voyager.sh's (done, both parts) |
-| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done) |
+| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done) |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
 compile); the port's sources for M2 can be written beside it, since each
@@ -1205,7 +1311,7 @@ WPE plan. They go when PlatformMlx does what they did, not before:
 | compiler/libc/zlib | ZStream, WebSocket deflate, WOFF, ANGLE | stays for the WebKit stage | WebKit's files call zlib |
 | compiler/libc/icu (mlx-unicode) | ICU everywhere | stays: it is the port's ICU | |
 | compiler/libc/pulse, compiler/libc/pipewire | MLX Audio's and MLX Capture's client libraries | not the port's to retire | WebKit's media (M8) uses std.audio directly |
-| ANGLE (`webkit-angle`) | WebGL | stays built, unused until WebGL (M8) | |
+| ANGLE (`webkit-angle`) | WebGL | stays: it is the port's WebGL since M8, on its Vulkan backend over libmlxvulkan.so; the GL backend over the system's EGL and GL libraries is retired with it (lists/angle.txt has no GL backend, no `USE_SYSTEM_EGL`) | WebKit's WebGL is ANGLE on every port |
 
 ## Open points
 
@@ -1395,3 +1501,47 @@ What M2 found, and how the port meets it without a patch:
     expectations' layer sizes from macOS's fonts, tile coverage and
     visible rects (`LAYER_TREE_INCLUDES_*` WebKit2 fills), iframes'
     text in dumpAsText, and layers WebKit2's drawing area adds.
+- **What M8's second part leaves** (WebGL):
+  - Voyager's WebGL page runs at about 38 of the display's 60 frames a
+    second on lavapipe: a frame's main thread is the script and ANGLE's
+    draw, the read back (about 3 ms waiting for lavapipe's fence), the
+    image made (1.5 ms) and Voyager's window drawn again, its translucent
+    sidebar blended (std.ui's fills, 4 ms), past the frame's 16 ms. The
+    window's chrome drawn only where it changed, and the read back
+    asynchronous (a pixel buffer read the frame after), would make it.
+  - The Mlx compiler's shared libraries chain their symbols in one
+    System V bucket (compiler/selfhost/object/elf64_dynamic.mlx); the
+    loader indexes them itself. Real buckets (or a GNU hash) belong in
+    the compiler, with its next canonical build.
+  - The drawing buffer is read back each frame and copied into a raster
+    image (a 300x300 canvas: about 0.4 MB a frame); a texture shared
+    with the compositor waits for compositing on the GPU (Ganesh over
+    std.gpu's Vulkan, the same device ANGLE's).
+  - WebGL runs in the web process's main thread, as WebKitLegacy had it
+    (no GPU process); a context's ANGLE work, lavapipe's draws included,
+    is the main thread's time.
+  - vk_helpers.cpp of WebKit's ANGLE calls a computeRowDepthSkipBytes
+    of seven arguments that ANGLE's own copy does not declare (WebKit's
+    changes.diff); projects/webkit/port/angle/VkHelpersMlx.h, included
+    before it, maps that call to the declared one. The port's `vma::`
+    (no Vulkan Memory Allocator in WebKit's copy) allocates each image
+    and buffer memory of its own, first fit in ANGLE's pools' blocks: no
+    defragmentation, no budget.
+  - The tests of fast/canvas/webgl and webgl that do not pass yet (not in
+    tests/layout/webgl.txt): out-of-range draws that ANGLE's Vulkan
+    backend allows with robust buffer access where the expectations
+    (other backends) have INVALID_OPERATION (draw-elements-out-of-bounds,
+    index-validation-with-resized-buffer, oes-element-index-uint),
+    webgl-compressed-texture-size-limit's INVALID_VALUE for the expected
+    INVALID_OPERATION, WEBGL_depth_texture present where the GLib
+    expectation has none, the draft extensions of base vertex and base
+    instance not offered (webgl-draft-extensions-flag-*), a blank line
+    more in the text of pages whose canvases are inline
+    (copy-tex-image-and-sub-image-2d, tex-sub-image-2d-bad-args),
+    uninitialized-test past webcore-dump's minute on lavapipe,
+    OffscreenCanvas and SharedArrayBuffer (off in the port), and two
+    conformance tests not looked into yet: buffer-preserve-test (driven
+    by requestAnimationFrame; its harness' buffered messages come out on
+    the console) and conformance2's instanced-arrays (a pixel of an
+    instanced draw not the expected red; the paint check's instanced
+    page is drawn right).

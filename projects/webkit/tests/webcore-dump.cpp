@@ -309,6 +309,8 @@ static String testRunnerSource()
         "    var names = ['VISIBLE_RECTS', 'TILE_CACHES', 'REPAINT_RECTS', 'PAINTING_PHASES', 'CONTENT_LAYERS', 'ACCELERATES_DRAWING', 'CLIPPING', 'BACKING_STORE_ATTACHED', 'ROOT_LAYER_PROPERTIES', 'EVENT_REGION', 'EXTENDED_COLOR', 'DEVICE_SCALE', 'ROOT_LAYERS'];"
         "    var internals = { layerTreeAsText: function (document, flags) { return layerTree(document, flags || 0); } };"
         "    names.forEach(function (name, index) { internals['LAYER_TREE_INCLUDES_' + name] = 1 << index; });"
+        "    var setWebGLErrorsToConsole = window.__mlxSetWebGLErrorsToConsoleEnabled;"
+        "    internals.settings = { setWebGLErrorsToConsoleEnabled: function (enabled) { setWebGLErrorsToConsole(!!enabled); } };"
         "    window.internals = internals;"
         "  }"
         "})();"_s);
@@ -354,6 +356,19 @@ JSC_DEFINE_HOST_FUNCTION(layerTreeAsTextFunction, (JSC::JSGlobalObject* globalOb
     return JSC::JSValue::encode(JSC::jsString(vm, text));
 }
 
+// window.internals.settings.setWebGLErrorsToConsoleEnabled(enabled) of
+// --test's pages (WebGL's tests turn the errors' console messages off
+// before they make their contexts): the page's setting.
+static JSC_DECLARE_HOST_FUNCTION(setWebGLErrorsToConsoleEnabledFunction);
+JSC_DEFINE_HOST_FUNCTION(setWebGLErrorsToConsoleEnabledFunction, (JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame))
+{
+    bool enabled = callFrame->argumentCount() > 0 && callFrame->uncheckedArgument(0).toBoolean(globalObject);
+    RefPtr frame = layerTreeFrame;
+    if (frame && frame->page())
+        frame->page()->settings().setWebGLErrorsToConsoleEnabled(enabled);
+    return JSC::JSValue::encode(JSC::jsUndefined());
+}
+
 static void addLayerTreeFunction(LocalFrame& frame)
 {
     auto* globalObject = frame.script().globalObject(mainThreadNormalWorldSingleton());
@@ -363,6 +378,8 @@ static void addLayerTreeFunction(LocalFrame& frame)
     JSC::JSLockHolder lock(vm);
     auto* function = JSC::JSFunction::create(vm, globalObject, 2, "__mlxLayerTreeAsText"_s, layerTreeAsTextFunction, JSC::ImplementationVisibility::Public);
     globalObject->putDirect(vm, JSC::Identifier::fromString(vm, "__mlxLayerTreeAsText"_s), function);
+    auto* setting = JSC::JSFunction::create(vm, globalObject, 1, "__mlxSetWebGLErrorsToConsoleEnabled"_s, setWebGLErrorsToConsoleEnabledFunction, JSC::ImplementationVisibility::Public);
+    globalObject->putDirect(vm, JSC::Identifier::fromString(vm, "__mlxSetWebGLErrorsToConsoleEnabled"_s), setting);
 }
 
 // The flags of the main frame's testRunner (what its scripts asked so far).

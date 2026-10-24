@@ -675,6 +675,15 @@ void MlxLayerTreeHost::requestCompositionForRenderingUpdate()
     m_notifyRenderingUpdate = true;
     if (m_pendingTiles.load())
         m_waitingForTiles = true;
+    // (Composed at once, as WebKit2's ThreadedCompositor composes a
+    // rendering update when it is committed: left to the clock's next tick,
+    // an update and its frame took two ticks at least, and a page changing
+    // each frame, a WebGL canvas drawn from requestAnimationFrame, ran at
+    // a quarter of the display's rate.)
+    if (!m_waitingForTiles && m_visible.load() && !m_frameScheduled && !m_frameInProgress) {
+        m_frameScheduled = true;
+        m_compositorQueue->dispatch([this] { renderFrame(); });
+    }
     scheduleFrameLocked();
 }
 

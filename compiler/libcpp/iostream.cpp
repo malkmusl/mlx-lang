@@ -8,10 +8,10 @@
 
 namespace std {
 
-ostream cout = { 1, 6, false, 0, 0, 0, 0 };
-ostream cerr = { 2, 6, false, 0, 0, 0, 0 };
-ostream clog = { 2, 6, false, 0, 0, 0, 0 };
-istream cin = { 0, false, false };
+ostream cout = { {}, 1, 6, false, 0, 0, 0, 0 };
+ostream cerr = { {}, 2, 6, false, 0, 0, 0, 0 };
+ostream clog = { {}, 2, 6, false, 0, 0, 0, 0 };
+istream cin = { {}, 0, false, false };
 
 static FILE *fileOf(int which) {
     if (which == 1) return stdout;

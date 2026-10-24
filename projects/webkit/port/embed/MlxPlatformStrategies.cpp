@@ -81,6 +81,29 @@ static void loadFile(ResourceLoader& loader)
     });
 }
 
+// A file: URL read for a synchronous load (XMLHttpRequest's, as WebGL's
+// tests read their shaders' sources), as loadFile reads it.
+static void loadFileSynchronously(const ResourceRequest& request, ResourceError& error, ResourceResponse& response, Vector<uint8_t>& data)
+{
+    URL url = request.url();
+    String path = url.fileSystemPath();
+    uint32_t reason = 0;
+    size_t contents = mlxweb_file_read(path.utf8().data(), &reason);
+    if (!contents) {
+        error = reason == MLXWEB_FILE_NOT_FOUND
+            ? errorFor(url, fileDoesNotExistCode, "The file does not exist"_s)
+            : errorFor(url, cannotShowURLCode, "The file cannot be read"_s);
+        return;
+    }
+    size_t length = mlxweb_file_length(contents);
+    data.append(std::span<const uint8_t>(mlxweb_file_bytes(contents), length));
+    mlxweb_file_release(contents);
+    String mimeType = MIMETypeRegistry::mimeTypeForPath(path);
+    if (mimeType.isEmpty())
+        mimeType = "application/octet-stream"_s;
+    response = ResourceResponse(WTF::move(url), WTF::move(mimeType), static_cast<long long>(length), String());
+}
+
 // A blob: URL's bytes (a File's, a Blob's: the process's blob registry),
 // read whole by WebCore's BlobResourceHandle and given to the loader as a
 // file's are (FileReader, fetch() of a blob URL, a blob URL's page).
@@ -167,6 +190,10 @@ public:
         }
         if (request.url().protocolIsBlob()) {
             BlobResourceHandle::loadResourceSynchronously(MlxPlatformStrategies::blobData(request.url()), request, error, response, data);
+            return;
+        }
+        if (request.url().protocolIsFile()) {
+            loadFileSynchronously(request, error, response, data);
             return;
         }
         if (MlxSchemeHandler::handles(request.url())) {
