@@ -3,7 +3,7 @@
 // (DumpRenderTree's externalRepresentation, RenderTreeAsText.cpp), and
 // painted (M4).
 //
-//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test]
+//     webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--no-compositing] [--layers] [--scheme NAME] [--profile DIR] [--test]
 //                  [--downloads DIR [--download-pause-at BYTES] [--download-cancel-at BYTES]] [--upload PATH]...
 //                  [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL
 //
@@ -133,10 +133,15 @@
 #include "port/embed/MlxPlatformStrategies.h"
 #include "port/embed/MlxSchemeHandler.h"
 #include "port/embed/MlxProfile.h"
+#include "port/embed/MlxLayerTreeHost.h"
+#include "Chrome.h"
+#include "RenderLayerCompositor.h"
+#include "ScrollingCoordinator.h"
 #include "DOMWrapperWorld.h"
 #include "FrameTree.h"
 #include "ScriptController.h"
 #include <JavaScriptCore/JSCJSValueInlines.h>
+#include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/InitializeThreading.h>
 #include <memory>
 #include <skia/core/SkCanvas.h>
@@ -181,13 +186,16 @@ static void dumpInlineBoxes(const RenderElement& root)
 
 static int usage()
 {
-    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--scheme NAME] [--profile DIR] [--test] [--downloads DIR [--download-pause-at BYTES] [--download-cancel-at BYTES]] [--upload PATH]... [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
+    fprintf(stderr, "usage: webcore-dump [--font FILE]... [--size WIDTHxHEIGHT] [--no-script] [--subpixel] [--boxes] [--text] [--wait-title TITLE] [--timeout SECONDS] [--dark [--force-dark]] [--no-compositing] [--layers] [--scheme NAME] [--profile DIR] [--test] [--downloads DIR [--download-pause-at BYTES] [--download-cancel-at BYTES]] [--upload PATH]... [--png OUT.png [--reference REF.png [--tolerance CHANNEL] [--allow PIXELS]]] FILE|URL\n");
     return 2;
 }
 
 // The view painted into PIXELS (WIDTH x HEIGHT words, 0xAARRGGBB
-// premultiplied): white, then the frame view as a window paints it.
-static bool paintView(LocalFrame& frame, IntSize size, uint32_t* pixels, bool forceDark)
+// premultiplied): white, then the frame view as a window paints it. A
+// composited page (HOST) is composed by its layer tree host: a rendering
+// update (the layers' contents painted, forced dark when asked, on the
+// port's painting threads), then the layers composited on the CPU.
+static bool paintView(LocalFrame& frame, IntSize size, uint32_t* pixels, bool forceDark, MlxLayerTreeHost* host)
 {
     RefPtr view = frame.view();
     if (!view)
@@ -200,6 +208,12 @@ static bool paintView(LocalFrame& frame, IntSize size, uint32_t* pixels, bool fo
     if (!surface)
         return false;
     RefPtr document = frame.document();
+    if (host) {
+        host->setForcedDark(forceDark && document && !mlxPageHasDarkDesign(*document));
+        host->updateRendering();
+        host->composite(*surface->getCanvas());
+        return true;
+    }
     if (forceDark && document && !mlxPageHasDarkDesign(*document)) {
         surface->getCanvas()->clear(mlxForcedDarkColor(SkColors::kWhite));
         MlxDarkModeCanvas dark(*surface->getCanvas());
@@ -290,7 +304,65 @@ static String testRunnerSource()
         "  window.testRunner = new Proxy(runner, { get: function (target, name) {"
         "    if (name in target || typeof name === 'symbol') return target[name];"
         "    return function () { return undefined; }; } });"
+        "  if (window.__mlxLayerTreeAsText) {"
+        "    var layerTree = window.__mlxLayerTreeAsText;"
+        "    var names = ['VISIBLE_RECTS', 'TILE_CACHES', 'REPAINT_RECTS', 'PAINTING_PHASES', 'CONTENT_LAYERS', 'ACCELERATES_DRAWING', 'CLIPPING', 'BACKING_STORE_ATTACHED', 'ROOT_LAYER_PROPERTIES', 'EVENT_REGION', 'EXTENDED_COLOR', 'DEVICE_SCALE', 'ROOT_LAYERS'];"
+        "    var internals = { layerTreeAsText: function (document, flags) { return layerTree(document, flags || 0); } };"
+        "    names.forEach(function (name, index) { internals['LAYER_TREE_INCLUDES_' + name] = 1 << index; });"
+        "    window.internals = internals;"
+        "  }"
         "})();"_s);
+}
+
+// window.internals.layerTreeAsText(document, flags) of --test's pages:
+// the layer tree of the frame as WebKit's Internals dumps it
+// (RenderLayerCompositor::layerTreeAsText, Internals' flags), without
+// WebCore's testing library (internals-free: the one function compositing
+// tests read, made here in C++ and given to the script above as
+// window.__mlxLayerTreeAsText).
+static OptionSet<LayerTreeAsTextOptions> layerTreeOptions(unsigned flags)
+{
+    static constexpr LayerTreeAsTextOptions options[] = {
+        LayerTreeAsTextOptions::IncludeVisibleRects, LayerTreeAsTextOptions::IncludeTileCaches, LayerTreeAsTextOptions::IncludeRepaintRects,
+        LayerTreeAsTextOptions::IncludePaintingPhases, LayerTreeAsTextOptions::IncludeContentLayers, LayerTreeAsTextOptions::IncludeAcceleratesDrawing,
+        LayerTreeAsTextOptions::IncludeClipping, LayerTreeAsTextOptions::IncludeBackingStoreAttached, LayerTreeAsTextOptions::IncludeRootLayerProperties,
+        LayerTreeAsTextOptions::IncludeEventRegion, LayerTreeAsTextOptions::IncludeExtendedColor, LayerTreeAsTextOptions::IncludeDeviceScale,
+        LayerTreeAsTextOptions::IncludeRootLayers
+    };
+    OptionSet<LayerTreeAsTextOptions> result;
+    for (unsigned bit = 0; bit < std::size(options); ++bit) {
+        if (flags & (1u << bit))
+            result.add(options[bit]);
+    }
+    return result;
+}
+
+// (The test's frame: the main frame's, which a test's script dumps.)
+static LocalFrame* layerTreeFrame;
+
+static JSC_DECLARE_HOST_FUNCTION(layerTreeAsTextFunction);
+JSC_DEFINE_HOST_FUNCTION(layerTreeAsTextFunction, (JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    unsigned flags = callFrame->argumentCount() > 1 ? callFrame->uncheckedArgument(1).toUInt32(globalObject) : 0;
+    RefPtr frame = layerTreeFrame;
+    RefPtr document = frame ? frame->document() : nullptr;
+    if (!document || !frame->contentRenderer())
+        return JSC::JSValue::encode(JSC::jsEmptyString(vm));
+    document->updateLayoutIgnorePendingStylesheets();
+    String text = frame->contentRenderer()->compositor().layerTreeAsText(layerTreeOptions(flags));
+    return JSC::JSValue::encode(JSC::jsString(vm, text));
+}
+
+static void addLayerTreeFunction(LocalFrame& frame)
+{
+    auto* globalObject = frame.script().globalObject(mainThreadNormalWorldSingleton());
+    if (!globalObject)
+        return;
+    auto& vm = globalObject->vm();
+    JSC::JSLockHolder lock(vm);
+    auto* function = JSC::JSFunction::create(vm, globalObject, 2, "__mlxLayerTreeAsText"_s, layerTreeAsTextFunction, JSC::ImplementationVisibility::Public);
+    globalObject->putDirect(vm, JSC::Identifier::fromString(vm, "__mlxLayerTreeAsText"_s), function);
 }
 
 // The flags of the main frame's testRunner (what its scripts asked so far).
@@ -346,7 +418,46 @@ public:
     {
     }
 
+    // The page's layers composited on the CPU (synchronously: composed
+    // when the view is painted), unless --no-compositing.
+    void attach(Page& page)
+    {
+        m_host = makeUnique<MlxLayerTreeHost>(page, MlxLayerTreeHost::Mode::Synchronous);
+        m_host->setSize(m_size);
+    }
+    MlxLayerTreeHost* host() const { return m_host.get(); }
+
 private:
+    GraphicsLayerFactory* graphicsLayerFactory() const final { return m_host ? m_host->graphicsLayerFactory() : nullptr; }
+    DisplayRefreshMonitorFactory* displayRefreshMonitorFactory() const final { return m_host ? m_host->displayRefreshMonitorFactory() : nullptr; }
+    void attachRootGraphicsLayer(LocalFrame&, GraphicsLayer* layer) final
+    {
+        if (m_host)
+            m_host->attachRootGraphicsLayer(layer);
+    }
+    void attachViewOverlayGraphicsLayer(GraphicsLayer* layer) final
+    {
+        if (m_host)
+            m_host->attachViewOverlayGraphicsLayer(layer);
+    }
+    void setNeedsOneShotDrawingSynchronization() final { }
+    void triggerRenderingUpdate() final
+    {
+        if (m_host)
+            m_host->triggerRenderingUpdate();
+    }
+    void ensureScrollbarsController(Page& page, ScrollableArea& area, bool update) const final
+    {
+        if (m_host)
+            MlxLayerTreeHost::ensureScrollbarsController(page, area);
+        else
+            EmptyChromeClient::ensureScrollbarsController(page, area, update);
+    }
+    RefPtr<ScrollingCoordinator> createScrollingCoordinator(Page& page) const final
+    {
+        return m_host ? MlxLayerTreeHost::createScrollingCoordinator(page) : nullptr;
+    }
+
     void addMessageToConsole(JSC::MessageSource, JSC::MessageLevel, const String& message, unsigned, unsigned, const String&) final
     {
         testOutput.append("CONSOLE MESSAGE: "_s, withoutFileURLs(message), '\n');
@@ -393,12 +504,20 @@ private:
     }
 
     IntSize m_size;
+    std::unique_ptr<MlxLayerTreeHost> m_host;
 };
 
-// What --no-script, --subpixel and --dark ask of every page.
+// What --no-script, --subpixel, --dark and --no-compositing ask of every
+// page.
 static bool pageScript = true;
 static bool pageSubpixel;
 static bool pageDark;
+static bool pageCompositing = true;
+
+static MlxLayerTreeHost* hostOf(Page& page)
+{
+    return static_cast<TestChromeClient&>(page.chrome().client()).host();
+}
 
 // A page of the port's clients with WebKitTestRunner's settings (CLIENT:
 // its main frame's loader client).
@@ -408,9 +527,9 @@ static RefPtr<Page> makePage(IntSize viewSize, MlxFrameLoaderClient** client, Lo
     MlxProfile::configure(configuration);
     // (A window.open's page: its opener the frame that opened it.)
     configuration.mainFrameOpener = opener;
-    // (--upload's answer to the file chooser is the test client's.)
-    if (testMode || !uploads.isEmpty())
-        configuration.chromeClient = makeUniqueRef<TestChromeClient>(viewSize);
+    // (The test client: --test's console and dialogs, --upload's answer to
+    // the file chooser, the layers' compositing.)
+    configuration.chromeClient = makeUniqueRef<TestChromeClient>(viewSize);
     configuration.mainFrameCreationParameters = PageConfiguration::LocalMainFrameCreationParameters {
         CompletionHandler<UniqueRef<LocalFrameLoaderClient>(LocalFrame&, FrameLoader&)> { [viewSize, client](auto&, auto& frameLoader) {
             auto made = makeUniqueRefWithoutRefCountedCheck<MlxFrameLoaderClient>(frameLoader, viewSize);
@@ -423,7 +542,11 @@ static RefPtr<Page> makePage(IntSize viewSize, MlxFrameLoaderClient** client, Lo
     Ref page = Page::create(WTF::move(configuration));
     auto& settings = page->settings();
     settings.setScriptEnabled(pageScript);
-    settings.setAcceleratedCompositingEnabled(false);
+    if (pageCompositing) {
+        static_cast<TestChromeClient&>(page->chrome().client()).attach(page);
+        MlxLayerTreeHost::configure(settings);
+    } else
+        settings.setAcceleratedCompositingEnabled(false);
     // (A link's download attribute, as WebKit2's ports have it on.)
     settings.setDownloadAttributeEnabled(true);
     // (WebKitTestRunner's: TestController::resetPreferencesToConsistentValues.)
@@ -627,6 +750,7 @@ int main(int argc, char** argv)
     bool textOnly = false;
     bool dark = false;
     bool forceDark = false;
+    bool layers = false;
     const char* waitTitle = nullptr;
     const char* pngPath = nullptr;
     const char* referencePath = nullptr;
@@ -661,6 +785,10 @@ int main(int argc, char** argv)
             dark = true;
         else if (!strcmp(argv[i], "--force-dark"))
             forceDark = true;
+        else if (!strcmp(argv[i], "--no-compositing"))
+            pageCompositing = false;
+        else if (!strcmp(argv[i], "--layers"))
+            layers = true;
         else if (!strcmp(argv[i], "--png") && i + 1 < argc)
             pngPath = argv[++i];
         else if (!strcmp(argv[i], "--reference") && i + 1 < argc)
@@ -796,6 +924,8 @@ int main(int argc, char** argv)
     pageDark = dark;
     if (testMode) {
         MlxFrameLoaderClient::setWindowObjectClearedCallback([](LocalFrame& frame) {
+            if (pageCompositing)
+                addLayerTreeFunction(frame);
             frame.script().executeScriptIgnoringException(testRunnerSource(), JSC::SourceTaintedOrigin::Untainted);
         });
     }
@@ -805,6 +935,7 @@ int main(int argc, char** argv)
         RefPtr page = makePage(viewSize, &mainClient);
         Run run;
         run.frame = page->localMainFrame();
+        layerTreeFrame = run.frame.get();
         if (waitTitle)
             run.waitTitle = String::fromUTF8(waitTitle);
         run.uploadPending = !uploads.isEmpty();
@@ -876,6 +1007,13 @@ int main(int argc, char** argv)
                 list.append("  "_s, request, '\n');
             tree = makeString(tree, list.toString());
         }
+        // --layers: the layer tree after the dump (a rendering update first,
+        // as the page would be shown), as Internals' layerTreeAsText gives it.
+        if (layers && run.frame->contentRenderer()) {
+            if (auto* host = hostOf(*page))
+                host->updateRendering();
+            tree = makeString(tree, run.frame->contentRenderer()->compositor().layerTreeAsText());
+        }
         auto utf8 = tree.utf8();
         fwrite(utf8.data(), 1, utf8.length(), stdout);
         if (boxes && run.frame->contentRenderer())
@@ -883,7 +1021,7 @@ int main(int argc, char** argv)
         fflush(stdout);
         if (pngPath) {
             auto pixels = std::make_unique<uint32_t[]>(static_cast<size_t>(viewSize.width()) * viewSize.height());
-            if (!paintView(*run.frame, viewSize, pixels.get(), dark && forceDark) || !mlxweb_image_write_png(pngPath, pixels.get(), viewSize.width(), viewSize.height(), viewSize.width(), 0)) {
+            if (!paintView(*run.frame, viewSize, pixels.get(), dark && forceDark, hostOf(*page)) || !mlxweb_image_write_png(pngPath, pixels.get(), viewSize.width(), viewSize.height(), viewSize.width(), 0)) {
                 fprintf(stderr, "webcore-dump: cannot paint the view into %s\n", pngPath);
                 status = 1;
             } else if (referencePath) {
@@ -900,6 +1038,7 @@ int main(int argc, char** argv)
             }
         }
         mainClient->setLoadFinishedCallback(nullptr);
+        layerTreeFrame = nullptr;
         run.frame = nullptr;
     }
     MlxProfile::close();

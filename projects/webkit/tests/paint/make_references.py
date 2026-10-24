@@ -223,6 +223,48 @@ def mediadark():
     c.save("mediadark-forcedark-expected.png")
 
 
+def composited(dark=False):
+    """composited.html: layers translated, scaled, turned, translucent;
+    with --dark --force-dark (DARK) each layer's colours in forced dark's
+    (the layers' contents painted dark), composited over the darkened
+    canvas."""
+    colour = forced_dark_colour if dark else (lambda c: c)
+    c = Canvas(colour((255, 255, 255)))
+    c.fill(10, 20, 100, 50, colour((255, 0, 0)))
+    c.fill(150, 10, 100, 80, colour((0, 160, 0)))
+    c.fill(330, 10, 40, 100, colour((0, 0, 255)))
+    c.fill(10, 200, 100, 100, colour((0, 0, 255)), 0.5)
+    # (The group composited at half: the green box over the red one.)
+    c.fill(200, 200, 80, 100, colour((255, 0, 0)), 0.5)
+    c.fill(280, 200, 120, 100, colour((0, 128, 0)), 0.5)
+    c.save("composited-forcedark-expected.png" if dark else "composited-expected.png")
+
+
+def fixed():
+    """fixed.html: the bands scrolled up by 250, the fixed box over them."""
+    c = Canvas()
+    c.fill(0, 50, 800, 100, (0, 0, 255))
+    c.fill(0, 250, 800, 100, (0, 160, 0))
+    c.fill(20, 20, 200, 60, (255, 0, 0))
+    c.save("fixed-expected.png")
+
+
+def overflow():
+    """overflow.html: the box's rows from 150 to 350 of its contents."""
+    c = Canvas()
+    c.fill(50, 50, 300, 50, (0, 160, 0))
+    c.fill(50, 100, 300, 100, (0, 0, 255))
+    c.fill(50, 200, 300, 50, (255, 255, 0))
+    c.save("overflow-expected.png")
+
+
+def perspective():
+    """perspective.html: the card twice its size about the stage's centre."""
+    c = Canvas()
+    c.fill(300, 200, 200, 200, (0, 0, 255))
+    c.save("perspective-expected.png")
+
+
 if __name__ == "__main__":
     write_png(os.path.join(HERE, "support", "quadrants.png"), 40, 40, QUADRANTS, True)
     boxes()
@@ -235,3 +277,8 @@ if __name__ == "__main__":
     scheme(True, "scheme-forcedark-expected.png")
     forcedark()
     mediadark()
+    composited()
+    composited(True)
+    fixed()
+    overflow()
+    perspective()

@@ -35,3 +35,12 @@ expected text (`platform/glib/`'s
 where WebKit's GLib ports have their own), taken from the same
 revision; tools/check_webkit_mlx_crypto.sh runs them as the storage
 check runs its own.
+
+`compositing.txt` lists tests of `compositing/` (M8's composited layers)
+that dump their layer tree with `internals.layerTreeAsText`, with the
+support files they load (`resources/ui-helper.js`,
+`compositing/resources/`, `compositing/iframes/resources/`) and their
+expected text (`platform/glib/`'s where WebKit's GLib ports have their
+own), taken from the same revision; tools/check_webkit_mlx_compositing.sh
+runs them as the storage check runs its own, with the test runner's
+fonts.

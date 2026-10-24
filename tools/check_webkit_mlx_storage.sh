@@ -17,13 +17,17 @@
 #
 # The same runs WebKit's crypto tests (M7, PORT.md "Crypto": crypto/subtle
 # and crypto's getRandomValues) with --list crypto.txt, as
-# tools/check_webkit_mlx_crypto.sh does.
+# tools/check_webkit_mlx_crypto.sh does, and its compositing tests (M8:
+# layer trees, internals.layerTreeAsText) with --list compositing.txt
+# --fonts, as tools/check_webkit_mlx_compositing.sh does.
 #
-#   tools/check_webkit_mlx_storage.sh [--no-build] [-j N] [--keep DIR] [--list NAME] [TEST...]
+#   tools/check_webkit_mlx_storage.sh [--no-build] [-j N] [--keep DIR] [--list NAME] [--fonts] [TEST...]
 #     (--no-build: the program as it is; -j: the build's jobs, 2 by
 #     default; --keep: what each test printed, kept in DIR; --list: the
-#     list of tests/layout, storage.txt by default; TEST: paths of the
-#     list, all by default)
+#     list of tests/layout, storage.txt by default; --fonts:
+#     WebKitTestRunner's fonts, as tools/check_webkit_mlx_layout.sh gives
+#     them, for tests whose text's sizes show; TEST: paths of the list,
+#     all by default)
 set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -37,6 +41,7 @@ build=1
 jobs=2
 keep=""
 list=storage.txt
+fonts=0
 chosen=()
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -44,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         -j) jobs=$2; shift ;;
         --keep) keep=$2; shift ;;
         --list) list=$2; shift ;;
+        --fonts) fonts=1 ;;
         -*) fail "unknown argument $1" ;;
         *) chosen+=("$1") ;;
     esac
@@ -58,6 +64,26 @@ fi
 program=$repo_root/mlx-out/webkit/mlx/bin/webcore-dump
 [[ -x "$program" ]] || fail "$program is missing"
 mkdir -p "$work/home" "$work/tmp"
+# --fonts: Liberation's directory, WebKitTestRunner's families, DejaVu (its
+# fallback) and Ahem (tools/check_webkit_mlx_layout.sh's).
+fontOptions=()
+fontEnvironment=()
+if [[ $fonts -eq 1 ]]; then
+    serif=$(find /usr/share/fonts /usr/local/share/fonts -name LiberationSerif-Regular.ttf 2> /dev/null | head -1)
+    [[ -n "$serif" ]] || fail "no Liberation fonts (LiberationSerif-Regular.ttf) in /usr/share/fonts"
+    dejavu=$(find /usr/share/fonts /usr/local/share/fonts -name DejaVuSans.ttf 2> /dev/null | head -1)
+    [[ -n "$dejavu" ]] || fail "no DejaVu fonts (DejaVuSans.ttf) in /usr/share/fonts: the test runner's fallback"
+    cat > "$work/fonts.conf" << EOF
+<?xml version="1.0"?>
+<fontconfig>
+    <dir>$(dirname "$serif")</dir>
+    <dir>$(dirname "$dejavu")</dir>
+    <include>$repo_root/$layout/fonts.conf</include>
+</fontconfig>
+EOF
+    fontOptions=(--font "$repo_root/$layout/LayoutTests/resources/Ahem.ttf")
+    fontEnvironment=(FONTCONFIG_FILE="$work/fonts.conf")
+fi
 
 tests=()
 while IFS= read -r line; do
@@ -82,7 +108,7 @@ for test in "${tests[@]}"; do
     [[ -n "$expected" ]] || fail "$test has no -expected.txt"
     out=$work/out.txt
     status=0
-    env -i HOME="$work/home" TMPDIR="$work/tmp" TZ=US/Pacific timeout 120 "$program" --test --size 800x600 --timeout 60 "$repo_root/$layout/LayoutTests/$test" > "$out" 2> "$work/err.txt" || status=$?
+    env -i HOME="$work/home" TMPDIR="$work/tmp" TZ=US/Pacific "${fontEnvironment[@]}" timeout 120 "$program" --test --size 800x600 --timeout 60 "${fontOptions[@]}" "$repo_root/$layout/LayoutTests/$test" > "$out" 2> "$work/err.txt" || status=$?
     if [[ -n "$keep" ]]; then
         mkdir -p "$keep/$(dirname "$test")"
         cp "$out" "$keep/${test%.*}-actual.txt"
