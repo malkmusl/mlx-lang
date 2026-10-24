@@ -16,6 +16,9 @@
 #   4. mlx-codemap layers finds no import against codemap.layers (which
 #      says the same as 2 for each module of the closure).
 #
+# The toolchain's version module the sources import (mlx-out/version.mlx,
+# self-contained) is written first (tools/version_module.sh).
+#
 #   tools/check_bootstrap.sh [previous-compiler] [mlx0]
 set -euo pipefail
 
@@ -45,6 +48,9 @@ fail() {
     failures=$((failures + 1))
 }
 pass() { echo "ok   $1"; }
+
+# The toolchain's version module the sources import (mlx-out/version.mlx).
+tools/version_module.sh "$previous" || { echo "check_bootstrap.sh: no mlx-out/version.mlx" >&2; exit 1; }
 
 # 1. The previous canonical compiler builds the sources.
 if "$previous" --quiet --depfile="$work/closure.d" compiler/selfhost/main.mlx -o "$work/mlx-stage1" > "$work/stage1.log" 2>&1; then

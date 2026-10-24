@@ -389,6 +389,48 @@ whatever the memory. (Jobs are started by vfork, and a child's
 goes to `mlx-out/build/logs/NAME.log`, shown when the step fails. After a
 failure no new job starts (the running ones finish) unless `--keep-going`.
 
+## Versions and build numbers
+
+A version is `MAJOR.MINOR.BUILD`, for the toolchain as for a project
+(Voyager 0.1.1228):
+
+- `MAJOR.MINOR` is the first line of the project's `VERSION` file at its
+  root (`0.1`; the repository's own `VERSION` is the toolchain's), as
+  HEAD's tree holds it: a change is made by committing it.
+- `BUILD` is the number of commits reachable from HEAD that are not
+  reachable from the commit that last changed `VERSION`'s content, that
+  commit counted: `git rev-list --count HEAD ^CHANGED` + 1. The commit
+  setting `0.2` is 0.2.1, the next ones 0.2.2, 0.2.3... Until `VERSION`
+  first changes (the commit that adds it is not a change), `BUILD` is
+  every commit reachable from HEAD, `git rev-list --count HEAD`. The
+  changing commit is the first one on HEAD's first-parent line whose
+  first parent's `VERSION` has other bytes (a branch changing it and
+  merged: the merge).
+- A tree without `.git` (an archive) is `MAJOR.MINOR.dev`. A shallow clone
+  counts to its boundary (`.git/shallow`), as git does.
+
+They are found by `std.git` ([stdlib.md](stdlib.md#git-repositories-stdgit)),
+without the git program: `git.buildNumberOf(directory, "VERSION",
+&number)`. A git submodule (its `.git` file leading into the
+superproject's `.git/modules/NAME`) is counted on its own, so a project
+moved into a submodule keeps its own numbers. For scripts,
+`mlx-out/bin/mlx-build-number [DIRECTORY] [--file=PATH]`
+(tools/build-number) prints `VERSION.BUILD COMMIT` (`0.1.1211 5d1c...`),
+`MAJOR.MINOR.dev` alone without a repository.
+
+The toolchain says its version: `mlx4 --version`, `mlx-cc --version`
+and `mlx-ld --version` print `NAME MAJOR.MINOR.BUILD (COMMIT)`. It is
+built into them from `mlx-out/version.mlx`, a module of two constants
+(`VERSION`, `COMMIT`; no import, so the compiler's closure stays off the
+std root) that build.mlx (`toolchainVersion`) writes each time the build
+is declared, from `std.git`, and only when it changed: a new HEAD makes
+mlx-cc and mlx-ld again (a second or two; their objects are keyed by the
+code generation epoch, which does not change). mlx4 is built by
+`tools/ensure_compiler.sh`, which writes the module first
+(`tools/version_module.sh`, with mlx-build-number built by the compiler
+it starts from): its version is that of the HEAD it was last built at.
+Without a compiler (mlx0's bootstrap) the module is a `dev` one.
+
 ## What is implemented
 
 | Spec concept | Status |
