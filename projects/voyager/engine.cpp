@@ -586,6 +586,7 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     settings.setScriptEnabled(true);
     if (engine.compositing) {
         tab->host = makeUnique<MlxLayerTreeHost>(*tab->page, MlxLayerTreeHost::Mode::Threaded);
+        tab->host->setCountsTextures(engine.trace);
         // (With VOYAGER_TRACE, where the first tab composes and why: a
         // software Vulkan device composes on the CPU unless
         // MLX_COMPOSITING=gpu.)
@@ -760,8 +761,9 @@ bool isForcedDark(Engine*, Tab*);
 // rendering update runs on the frame clock: its compositor's
 // MlxLayerTreeHost.) With VOYAGER_TRACE, the shown tab's compositor's
 // counts when they change, twice a second at most ("voyager: compositor
-// paints P frames F fps R": the layers painted on the main thread, the
-// frames composed, the frames a second on the compositor thread).
+// paints P frames F [textures T] fps R": the layers painted on the main
+// thread, the frames composed, on the GPU the textures of the compositors'
+// share group, the frames a second on the compositor thread).
 int engineCycle(Engine* engine)
 {
     RunLoop::cycle();
@@ -798,7 +800,10 @@ int engineCycle(Engine* engine)
             engine->lastTrace = now;
             engine->tracedPaints = paints;
             engine->tracedFrames = frames;
-            fprintf(stderr, "voyager: compositor paints %u frames %u fps %.1f\n", paints, frames, shown->host->framesPerSecond());
+            if (shown->host->composesOnGPU())
+                fprintf(stderr, "voyager: compositor paints %u frames %u textures %u fps %.1f\n", paints, frames, shown->host->textures(), shown->host->framesPerSecond());
+            else
+                fprintf(stderr, "voyager: compositor paints %u frames %u fps %.1f\n", paints, frames, shown->host->framesPerSecond());
         }
     }
     return shown->host->hasNewFrame() ? 1 : 0;

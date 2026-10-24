@@ -1244,6 +1244,20 @@ void MlxLayerTreeHost::renderFrame()
         }
     }
     m_animationsRunning = running;
+    if (m_onGPU && m_countsTextures.load() && MonotonicTime::now() - m_texturesCounted >= 500_ms) {
+        // (Texture names are handed out lowest first and reused: the
+        // count ends after a run of names that are none.)
+        m_texturesCounted = MonotonicTime::now();
+        unsigned count = 0;
+        for (GLuint name = 1, misses = 0; misses < 1024; ++name) {
+            if (glIsTexture(name)) {
+                ++count;
+                misses = 0;
+            } else
+                ++misses;
+        }
+        m_textures = count;
+    }
     static bool traceFrames = getenv("MLX_TRACE_COMPOSITOR");
     if (traceFrames) {
         auto painted = MonotonicTime::now();

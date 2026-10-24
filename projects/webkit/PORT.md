@@ -638,7 +638,11 @@ port takes:
 - **On the GPU** (ThreadedCompositor's TextureMapper path, WPE's): the
   compositor thread owns a GL context of ANGLE's display (surfaceless,
   sharing textures with the display's sharing context as every
-  compositor's does: BitmapTexturePool's are the process's), the layers'
+  compositor's does: BitmapTexturePool's are the process's, outliving
+  any page: WebKit's pool releases the textures unused for 3 seconds on
+  the main thread's run loop, with the sharing context current, whichever
+  host asked for them; Voyager's `VOYAGER_TRACE` counts the share group's
+  textures, check_voyager.sh's 25 sees them come back after tabs close), the layers'
   targets are `TextureMapperLayer`s, and a frame (`paintFrameOnGPU`)
   applies the animations, collects the damage (the layers' damage in the
   view's coordinates, one `Damage` shared by all, as LayerTreeHost's),
@@ -1610,9 +1614,6 @@ What M2 found, and how the port meets it without a patch:
     rebuilds WebCore whole): WebKit's `GLFence::create` gives no fence,
     so the WebGL frame's fence is the port's (an EGL fence sync); tile
     uploads need none (the compositor's own context).
-  - BitmapTexturePool's release timer runs on the run loop of the thread
-    that first asked for a texture (the first host's compositor): when
-    that host goes, the pool's unused textures are no longer released.
 - **What M8's second part leaves** (WebGL):
   - Voyager's WebGL page runs at about 38 of the display's 60 frames a
     second on lavapipe: a frame's main thread is the script and ANGLE's

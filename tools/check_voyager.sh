@@ -112,6 +112,12 @@
 #      the canvas (its green, 300x300 where the page puts it) and the
 #      triangle's red in it. Skipped, said, on a machine without a Vulkan
 #      driver.
+#  25. on the GPU's compositor (MLX_COMPOSITING=gpu, the check's default),
+#      tabs of the animation page opened, then closed (the first of them
+#      too): the textures of the compositors' share group (the engine's
+#      "textures T") come back to one tab's (BitmapTexturePool's unused
+#      textures released on the main thread's run loop, whichever page
+#      asked for them first).
 #
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
@@ -795,5 +801,27 @@ else
     read -r tx ty tw th <<< "$triangle"
     [[ -n "$triangle" ]] && (( tx > cx && ty > cy && tx + tw < cx + cw && ty + th < cy + ch )) || fail "the screenshot has no triangle in the WebGL canvas (its red: ${triangle:-none})"
     echo "ok   WebGL draws a frame each animation frame, $drawn a second, composed ($composed frames a second): the canvas at $cx,$cy, the triangle in it"
+    # 25: on the GPU's compositor, BitmapTexturePool's textures outlive no
+    # page: three more tabs of the animation page opened, then the first
+    # (whose compositor asked for textures first) and two others closed;
+    # the textures in the share group ("textures T" in the engine's
+    # counts) come back to the one tab's.
+    if [[ $MLX_COMPOSITING == gpu ]]; then
+        write_runner "$work/voyager-pool" animation.html
+        {
+            echo "wait 8000"
+            for _ in 1 2 3; do ctrl 20; echo "type file://$repo_root/projects/voyager/tests/animation.html"; echo "enter"; echo "wait 5000"; done
+            ctrl 2
+            for _ in 1 2 3; do ctrl 17; echo "wait 1000"; done
+            echo "wait 8000"; echo "close"
+        } > "$work/pool.script"
+        run_scenario pool "$work/pool.script" "$work/voyager-pool"
+        log=$work/voyager.log
+        idle=$(awk '/^voyager: tab 2 opened/ { exit } /^voyager: compositor paints .* textures / { for (i = 1; i < NF; i++) if ($i == "textures") t = $(i + 1) } END { print t }' "$log")
+        most=$(grep -o " textures [0-9]*" "$log" | awk '$2 > m { m = $2 } END { print m + 0 }')
+        last=$(grep -o " textures [0-9]*" "$log" | tail -1 | awk '{ print $2 }')
+        [[ -n "$idle" && -n "$last" ]] && (( most > idle && last <= idle )) || { cat "$log" >&2; fail "the textures did not come back to one tab's after its others closed (${idle:-none} with one tab, $most with four, ${last:-none} after)"; }
+        echo "ok   tabs of layers opened and closed (the first among them): the share group's textures $idle, $most, then $last again"
+    fi
 fi
 echo "check_voyager.sh: all checks passed"

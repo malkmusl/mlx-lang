@@ -157,6 +157,12 @@ public:
     unsigned frames() const { return m_frames.load(); }
     double framesPerSecond() const;
     void didPaintLayer() { ++m_paints; }
+    // On the GPU, with counting asked for (setCountsTextures): the GL
+    // textures in the compositors' share group (BitmapTexturePool's,
+    // WebGL's, the frames' targets), counted by the compositor thread
+    // twice a second at most while it composes.
+    void setCountsTextures(bool counts) { m_countsTextures = counts; }
+    unsigned textures() const { return m_textures.load(); }
 
     // The page goes away: the layers let go, the compositor stopped.
     void invalidate();
@@ -276,6 +282,9 @@ private:
 
     std::atomic<unsigned> m_paints { 0 };
     std::atomic<unsigned> m_frames { 0 };
+    std::atomic<bool> m_countsTextures { false };
+    std::atomic<unsigned> m_textures { 0 };
+    MonotonicTime m_texturesCounted;
     Lock m_fpsLock;
     Vector<MonotonicTime> m_frameTimes WTF_GUARDED_BY_LOCK(m_fpsLock);
 };
