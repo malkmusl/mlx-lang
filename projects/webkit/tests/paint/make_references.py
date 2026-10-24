@@ -265,6 +265,59 @@ def perspective():
     c.save("perspective-expected.png")
 
 
+def webgl_triangle():
+    """webgl-triangle.html: the canvas (200x200 at 20, 20) blue, the pixels
+    whose centres are inside the triangle (-0.8, -0.8), (0.8, -0.8),
+    (0, 0.8) in clip space red (GL's rows go up)."""
+    c = Canvas()
+    c.fill(20, 20, 200, 200, (0, 0, 255))
+    corners = [(-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)]
+
+    def side(a, b, x, y):
+        return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+
+    for row in range(200):
+        for column in range(200):
+            x = (column + 0.5) / 100 - 1
+            y = 1 - (row + 0.5) / 100
+            sides = [side(corners[i], corners[(i + 1) % 3], x, y) for i in range(3)]
+            if all(s > 0 for s in sides):
+                c.pixels[20 + row][20 + column] = (255, 0, 0)
+    c.save("webgl-triangle-expected.png")
+
+
+def webgl_texture():
+    """webgl-texture.html: support/quadrants.png at four times its size
+    (160x160 at 20, 20), its colours opaque."""
+    c = Canvas()
+    for y in range(40):
+        for x in range(40):
+            r, g, b, a = QUADRANTS[y][x]
+            c.fill(20 + x * 4, 20 + y * 4, 4, 4, (r, g, b))
+    c.save("webgl-texture-expected.png")
+
+
+def webgl_uniforms():
+    """webgl-uniforms.html: a grey canvas (240x120 at 20, 20), four
+    rectangles placed and coloured by uniforms."""
+    c = Canvas()
+    c.fill(20, 20, 240, 120, (204, 204, 204))
+    for (x, y, w, h), colour in (((10, 10, 100, 40), (255, 0, 0)), ((130, 10, 60, 100), (0, 255, 0)),
+                                 ((10, 60, 40, 50), (0, 0, 255)), ((70, 70, 40, 20), (255, 255, 0))):
+        c.fill(20 + x, 20 + y, w, h, colour)
+    c.save("webgl-uniforms-expected.png")
+
+
+def webgl2_instancing():
+    """webgl2-instancing.html: a black canvas (220x60 at 20, 20), five
+    30x30 squares 40 apart, one colour each."""
+    c = Canvas()
+    c.fill(20, 20, 220, 60, (0, 0, 0))
+    for index, colour in enumerate(((255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255))):
+        c.fill(20 + 10 + 40 * index, 20 + 15, 30, 30, colour)
+    c.save("webgl2-instancing-expected.png")
+
+
 if __name__ == "__main__":
     write_png(os.path.join(HERE, "support", "quadrants.png"), 40, 40, QUADRANTS, True)
     boxes()
@@ -282,3 +335,7 @@ if __name__ == "__main__":
     fixed()
     overflow()
     perspective()
+    webgl_triangle()
+    webgl_texture()
+    webgl_uniforms()
+    webgl2_instancing()

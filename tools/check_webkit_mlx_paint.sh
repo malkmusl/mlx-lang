@@ -12,7 +12,9 @@
 # selection of the port's theme in the dark variant; as PAGE@forcedark,
 # with --dark --force-dark: forced dark mode, a light page's colours
 # inverted and its image's pixels kept, pages with dark designs of their
-# own left as they are). A page passes when no more pixels than pages.txt
+# own left as they are; WebGL's canvases, M8: a triangle, a texture from
+# an image, uniforms, WebGL 2's instanced drawing, skipped without a
+# Vulkan driver). A page passes when no more pixels than pages.txt
 # allows differ from the reference by more than its tolerance in a channel;
 # the check fails when a page fails that pages.txt does not list as known
 # to (with its cause).
@@ -66,6 +68,10 @@ EOF2
 mkdir -p "$work/home"
 ahem=$repo_root/projects/webkit/tests/layout/LayoutTests/resources/Ahem.ttf
 [[ -n "$keep" ]] && mkdir -p "$keep"
+# (The WebGL pages, webgl*.html, need a Vulkan driver: without a manifest
+# they are said to be skipped.)
+vulkan=1
+[[ -z "$(ls /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json 2> /dev/null)" && -z "${VK_DRIVER_FILES:-}" ]] && vulkan=0
 
 passed=0
 failed=0
@@ -78,6 +84,10 @@ while read -r page tolerance allow cause; do
     file=${page%@dark}
     file=${file%@forcedark}
     name=${file%.*}
+    if [[ $file == webgl* && $vulkan -eq 0 ]]; then
+        echo "skip $page: no Vulkan driver manifest (install mesa-vulkan-drivers for lavapipe)"
+        continue
+    fi
     flags=()
     if [[ "$page" == *@dark ]]; then
         name=$name-dark
