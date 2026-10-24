@@ -10,7 +10,8 @@
 //
 // The port composites on the CPU (PORT.md, "Compositing"): at each frame
 // WebGL presents (prepareForDisplay), the drawing buffer is read back
-// into a raster image, flipped to the page's orientation, and handed to
+// into a raster image (BGRA, premultiplied: the compositor's format),
+// flipped to the page's orientation, and handed to
 // the canvas' layer as its contents (CoordinatedPlatformLayerBufferNative
 // Image, which SkiaCompositingLayer draws). The read happens before
 // WebGL clears a drawing buffer it does not preserve (preserveDrawingBuffer
@@ -26,6 +27,12 @@
 #include "NativeImage.h"
 #include "PixelBuffer.h"
 #include <wtf/StdLibExtras.h>
+
+WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+#include <skia/core/SkColorSpace.h>
+#include <skia/core/SkData.h>
+#include <skia/core/SkImage.h>
+WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
 
 namespace WebCore {
 
@@ -207,20 +214,42 @@ void GraphicsContextGLMlx::prepareForDisplay()
     RefPtr pixels = readRenderingResultsForPainting();
     if (!pixels || pixels->size().isEmpty())
         return;
-    // (GL's rows go up from the bottom; the layer's image is the page's
-    // way up.)
-    size_t rowBytes = pixels->size().width() * 4;
-    auto bytes = pixels->bytes();
-    Vector<uint8_t> row(rowBytes);
-    for (size_t top = 0, bottom = pixels->size().height() - 1; top < bottom; ++top, --bottom) {
-        memcpySpan(row.mutableSpan(), bytes.subspan(top * rowBytes, rowBytes));
-        memcpySpan(bytes.subspan(top * rowBytes, rowBytes), bytes.subspan(bottom * rowBytes, rowBytes));
-        memcpySpan(bytes.subspan(bottom * rowBytes, rowBytes), row.span());
+    // The layer's image in the compositor's own format, BGRA premultiplied
+    // (opaque without alpha), so that SkiaCompositingLayer draws it with
+    // the port's row blends (SkiaRoutinesMlx.cpp) and not Skia's portable
+    // pipeline a pixel at a time (swapping, unpremultiplying: a 300x300
+    // canvas took the compositor 90 ms a frame); its rows the page's way
+    // up (GL's go up from the bottom).
+    auto attributes = contextAttributes();
+    int width = pixels->size().width();
+    int height = pixels->size().height();
+    size_t rowBytes = static_cast<size_t>(width) * 4;
+    auto data = SkData::MakeUninitialized(rowBytes * height);
+    auto source = pixels->bytes();
+    auto* target = static_cast<uint8_t*>(data->writable_data());
+    bool premultiply = attributes.alpha && !attributes.premultipliedAlpha;
+    for (int row = 0; row < height; ++row) {
+        const uint8_t* from = source.data() + (height - 1 - row) * rowBytes;
+        uint8_t* to = target + row * rowBytes;
+        for (int column = 0; column < width; ++column, from += 4, to += 4) {
+            uint8_t alpha = attributes.alpha ? from[3] : 255;
+            if (premultiply) {
+                to[0] = (from[2] * alpha + 127) / 255;
+                to[1] = (from[1] * alpha + 127) / 255;
+                to[2] = (from[0] * alpha + 127) / 255;
+            } else {
+                to[0] = from[2];
+                to[1] = from[1];
+                to[2] = from[0];
+            }
+            to[3] = alpha;
+        }
     }
-    RefPtr image = createNativeImageFromPixelBuffer(contextAttributes(), pixels.releaseNonNull());
+    auto info = SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, attributes.alpha ? kPremul_SkAlphaType : kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
+    auto image = SkImages::RasterFromData(info, WTF::move(data), rowBytes);
     if (!image)
         return;
-    m_layerContentsDisplayDelegate->setDisplayBuffer(CoordinatedPlatformLayerBufferNativeImage::create(image.releaseNonNull(), nullptr));
+    m_layerContentsDisplayDelegate->setDisplayBuffer(CoordinatedPlatformLayerBufferNativeImage::create(NativeImage::create(WTF::move(image)).releaseNonNull(), nullptr));
 }
 
 } // namespace WebCore
