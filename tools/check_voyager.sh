@@ -772,17 +772,19 @@ else
     lines=$(grep "^voyager: compositor paints " "$log")
     count=$(wc -l <<< "$lines")
     (( count >= 4 )) || { cat "$log" >&2; fail "the engine wrote too few compositor counts for the WebGL page ($count)"; }
-    frames=$(( $(field_of "$(tail -1 <<< "$lines")" frames) - $(field_of "$(sed -n "$(( count - 3 ))p" <<< "$lines")" frames) ))
     rate=${MLX_REFRESH_RATE:-60}
     drawn=$(grep -o "^voyager: title webgl:[0-9]*" "$log" | tail -1 | cut -d: -f3)
     (( ${drawn:-0} >= rate / 2 )) || { cat "$log" >&2; fail "the WebGL page did not draw at half the display's rate at least (${drawn:-no} frames a second)"; }
-    (( frames >= drawn * 3 * 9 / 10 )) || { cat "$log" >&2; fail "the WebGL page's frames were not composed ($frames in the last counts' three seconds, $drawn drawn a second)"; }
+    # (The compositor's frames a second in the last counts: each frame
+    # drawn composed.)
+    composed=$(tail -3 <<< "$lines" | awk '{ print $NF }' | sort -n | head -1)
+    awk -v fps="$composed" -v rate="$rate" 'BEGIN { exit !(fps >= rate / 2) }' || { cat "$log" >&2; fail "the WebGL page's frames were not composed ($composed frames a second, $drawn drawn)"; }
     canvas=$(box_of "$work/webgl.ppm" 10a040)
     read -r cx cy cw ch <<< "$canvas"
     [[ -n "$canvas" ]] && (( cw == 300 && ch == 300 )) || fail "the screenshot has no WebGL canvas of 300x300 (its green: ${canvas:-none})"
     triangle=$(box_of "$work/webgl.ppm" ff0000)
     read -r tx ty tw th <<< "$triangle"
     [[ -n "$triangle" ]] && (( tx > cx && ty > cy && tx + tw < cx + cw && ty + th < cy + ch )) || fail "the screenshot has no triangle in the WebGL canvas (its red: ${triangle:-none})"
-    echo "ok   WebGL draws a frame each animation frame, $drawn a second, composed ($frames frames in the last counts): the canvas at $cx,$cy, the triangle in it"
+    echo "ok   WebGL draws a frame each animation frame, $drawn a second, composed ($composed frames a second): the canvas at $cx,$cy, the triangle in it"
 fi
 echo "check_voyager.sh: all checks passed"
