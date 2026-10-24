@@ -8,9 +8,12 @@
 // Wayland window (std.ui.host: wl_shm buffers, keys, clipboard) and calls
 // back through the table of functions below: open, close and show a tab;
 // load a URL in one; run WebCore's pending work (WTF's generic RunLoop,
-// one cycle, every tab's: background tabs keep running); paint the shown
-// tab into the window's pixels (Skia raster through GraphicsContextSkia,
-// the only tab painted), and the pointer's, the wheel's and the keyboard's
+// one cycle, every tab's: background tabs keep running); hand the shown
+// tab's latest frame to the window's pixels with its damage (each tab's
+// MlxLayerTreeHost composites its layers on a compositor thread at the
+// display's rate and scrolls on the scrolling thread, PORT.md
+// "Compositing"; with --no-compositing the view is painted whole through
+// GraphicsContextSkia, as before M8), and the pointer's, the wheel's and the keyboard's
 // events to it (WebCore's EventHandler; text typed into an editable
 // element through the Editor, editing keys as its commands; a link
 // clicked with the middle button or Ctrl opens in a new tab behind), the
@@ -26,7 +29,7 @@
 // (VoyagerBuild.h). about:about and about:version (any about: but blank
 // and srcdoc) are voyager://about and voyager://version.
 //
-//     voyager [--font FILE]... [--size WIDTHxHEIGHT] FILE|URL
+//     voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] FILE|URL
 //
 // Built by ./mlx build webkit-mlx-voyager (mlx-out/webkit/mlx/bin/voyager);
 // tools/check_voyager.sh runs it on the compositor.
@@ -67,6 +70,7 @@
 #include "PlatformMouseEvent.h"
 #include "PlatformWheelEvent.h"
 #include "ResourceRequest.h"
+#include "ScrollingCoordinator.h"
 #include "ScrollingCoordinatorTypes.h"
 #include "Settings.h"
 #include "CommonAtomStrings.h"
@@ -82,6 +86,7 @@
 #include "port/embed/MlxSchemeHandler.h"
 #include "port/embed/MlxProfile.h"
 #include "port/embed/MlxDownloads.h"
+#include "port/embed/MlxLayerTreeHost.h"
 #include <wtf/text/StringToIntegerConversion.h>
 #include "FileChooser.h"
 #include <wtf/FileSystem.h>
@@ -89,6 +94,7 @@
 #include <libxml/xmlversion.h>
 #include <skia/core/SkMilestone.h>
 #include <sqlite3.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -185,6 +191,15 @@ struct VoyagerEngine {
     // A download paused (DOWNLOAD_PAUSE), resumed, cancelled, by its id;
     // the finished ones cleared off the list (DOWNLOAD_CLEAR, no id).
     void (*downloadAction)(Engine*, unsigned id, int action);
+    // The descriptor the window watches (readable: the engine has work
+    // for the main thread, or the compositor composed a frame); wake does
+    // that work and answers 1 when a frame of the tab shown is ready.
+    int (*descriptor)(Engine*);
+    int (*wake)(Engine*);
+    // The rectangles of the page that changed in the frame last painted
+    // (x, y, width, height each, from the page's origin), at most
+    // CAPACITY: how many.
+    int (*damage)(Engine*, int* rects, int capacity);
 };
 
 // The modifiers as voyager.mlx gives them.
@@ -201,25 +216,56 @@ constexpr int pointerRelease = 2;
 struct Tab;
 Tab* openTab(Engine&, bool foreground, LocalFrame* opener = nullptr);
 
-// The chrome client of a tab: what WebCore repaints marks the tab dirty
-// (the window paints it again on its next frame if it is shown); a new
-// window (window.open, a `target=_blank` link: MlxFrameLoaderClient's
+// The chrome client of a tab: its layers are its compositor's (the tab's
+// MlxLayerTreeHost: the layer factory, the root layer, the rendering
+// update on the frame clock, asynchronous scrolling); a new window
+// (window.open, a `target=_blank` link: MlxFrameLoaderClient's
 // dispatchCreatePage) is a new tab, shown.
 class VoyagerChromeClient final : public EmptyChromeClient {
 public:
-    VoyagerChromeClient(Engine& engine, bool& dirty)
+    VoyagerChromeClient(Engine& engine, bool& dirty, std::unique_ptr<MlxLayerTreeHost>& host)
         : m_engine(engine)
         , m_dirty(dirty)
+        , m_host(host)
     {
     }
 
 private:
+    // (--no-compositing: the view painted whole, again where it changed.)
     void invalidateContentsAndRootView(const IntRect&) final { m_dirty = true; }
     RefPtr<Page> createWindow(LocalFrame&, const String&, const WindowFeatures&, const NavigationAction&) final;
     void runOpenPanel(LocalFrame&, FileChooser&) final;
 
+    GraphicsLayerFactory* graphicsLayerFactory() const final { return m_host ? m_host->graphicsLayerFactory() : nullptr; }
+    DisplayRefreshMonitorFactory* displayRefreshMonitorFactory() const final { return m_host ? m_host->displayRefreshMonitorFactory() : nullptr; }
+    void attachRootGraphicsLayer(LocalFrame&, GraphicsLayer* layer) final
+    {
+        if (m_host)
+            m_host->attachRootGraphicsLayer(layer);
+    }
+    void attachViewOverlayGraphicsLayer(GraphicsLayer* layer) final
+    {
+        if (m_host)
+            m_host->attachViewOverlayGraphicsLayer(layer);
+    }
+    void setNeedsOneShotDrawingSynchronization() final { }
+    void triggerRenderingUpdate() final
+    {
+        if (m_host)
+            m_host->triggerRenderingUpdate();
+    }
+    void ensureScrollbarsController(Page& page, ScrollableArea& area, bool update) const final
+    {
+        if (m_host)
+            MlxLayerTreeHost::ensureScrollbarsController(page, area);
+        else
+            EmptyChromeClient::ensureScrollbarsController(page, area, update);
+    }
+    RefPtr<ScrollingCoordinator> createScrollingCoordinator(Page& page) const final { return MlxLayerTreeHost::createScrollingCoordinator(page); }
+
     Engine& m_engine;
     bool& m_dirty;
+    std::unique_ptr<MlxLayerTreeHost>& m_host;
 };
 
 // A key that types nothing: its DOM key, its Windows key code (WebCore's
@@ -395,6 +441,8 @@ struct Tab {
     RefPtr<Page> page;
     RefPtr<LocalFrame> frame;
     MlxFrameLoaderClient* client { nullptr };
+    // Its compositor (made after the page, let go after it).
+    std::unique_ptr<MlxLayerTreeHost> host;
     bool dirty { true };
     int clickCount { 0 };
     MonotonicTime lastPress;
@@ -419,9 +467,32 @@ struct Engine {
     bool dark { false };
     // VOYAGER_TRACE in the environment: each event on standard error.
     bool trace { false };
+    // Composited (each tab's MlxLayerTreeHost); --no-compositing: each
+    // frame the view painted whole on the main thread, as before M8 (for
+    // comparison, profiles).
+    bool compositing { true };
     // A page's file chooser waiting for the window's (chooser, choose).
     RefPtr<FileChooser> chooser;
+    // The pipe whose reading end the window watches: written when the
+    // main thread's run loop has work (RunLoop's wake-up) or a frame is
+    // composed.
+    int wakeDescriptor { -1 };
+    int wakeWriter { -1 };
+    // The damage of the frame last painted, for the window.
+    Vector<IntRect> damage;
+    // VOYAGER_TRACE: the shown tab's compositor's counts last written.
+    unsigned tracedPaints { 0 };
+    unsigned tracedFrames { 0 };
+    MonotonicTime lastTrace;
 };
+
+void signalWindow(Engine& engine)
+{
+    // (A full pipe already wakes the window.)
+    char one = 1;
+    if (engine.wakeWriter >= 0)
+        (void)!write(engine.wakeWriter, &one, 1);
+}
 
 Tab* tabOf(Engine* engine, int id)
 {
@@ -489,7 +560,7 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     Tab* tab = owned.get();
     tab->id = engine.nextId++;
     auto configuration = pageConfigurationWithEmptyClients(std::nullopt, PAL::SessionID::defaultSessionID());
-    configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine, tab->dirty);
+    configuration.chromeClient = makeUniqueRef<VoyagerChromeClient>(engine, tab->dirty, tab->host);
     configuration.editorClient = makeUniqueRef<VoyagerEditorClient>();
     // The profile's: the cookie jar, web sockets, web storage, IndexedDB.
     MlxProfile::configure(configuration);
@@ -508,7 +579,15 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     tab->page = Page::create(WTF::move(configuration));
     auto& settings = tab->page->settings();
     settings.setScriptEnabled(true);
-    settings.setAcceleratedCompositingEnabled(false);
+    if (engine.compositing) {
+        tab->host = makeUnique<MlxLayerTreeHost>(*tab->page, MlxLayerTreeHost::Mode::Threaded);
+        tab->host->setSize(size);
+        tab->host->setFrameReadyCallback([&engine] {
+            signalWindow(engine);
+        });
+        MlxLayerTreeHost::configure(settings);
+    } else
+        settings.setAcceleratedCompositingEnabled(false);
     settings.setLoadsImagesAutomatically(true);
     settings.setAllowFileAccessFromFileURLs(true);
     settings.setUsesBackForwardCache(false);
@@ -600,11 +679,14 @@ void engineClose(Engine* engine, int id)
         fprintf(stderr, "voyager: engine closes tab %d\n", id);
     if (engine->shown == tab)
         engine->shown = nullptr;
+    if (tab->host)
+        tab->host->invalidate();
     tab->frame->loader().stopAllLoaders();
     tab->frame->loader().detachFromParent();
     MlxProfile::pageClosed(*tab->page);
     tab->frame = nullptr;
     tab->page = nullptr;
+    tab->host = nullptr;
     engine->tabs.remove(id);
 }
 
@@ -617,6 +699,9 @@ void engineSelect(Engine* engine, int id)
     for (auto& other : engine->tabs.values()) {
         other->page->focusController().setActive(other.get() == tab);
         other->page->focusController().setFocused(other.get() == tab);
+        // (Only the tab shown is composed.)
+        if (other->host)
+            other->host->setVisible(other.get() == tab);
     }
     engine->shown = tab;
     tab->dirty = true;
@@ -650,34 +735,90 @@ void engineResize(Engine* engine, int width, int height)
         tab->client->setViewSize(engine->size);
         if (RefPtr view = tab->frame->view())
             view->resize(engine->size);
+        if (tab->host)
+            tab->host->setSize(engine->size);
         tab->dirty = true;
     }
 }
 
+bool isForcedDark(Engine*, Tab*);
+
 // One turn of WebCore's loop (timers, loads, tasks: every tab's); 1 when
-// the tab shown is to be painted again.
+// the compositor of the tab shown has a frame to show. (Each page's
+// rendering update runs on the frame clock: its compositor's
+// MlxLayerTreeHost.) With VOYAGER_TRACE, the shown tab's compositor's
+// counts when they change, twice a second at most ("voyager: compositor
+// paints P frames F fps R": the layers painted on the main thread, the
+// frames composed, the frames a second on the compositor thread).
 int engineCycle(Engine* engine)
 {
     RunLoop::cycle();
-    // Each page's rendering update (WebKit's display link: scroll and
-    // resize events, animation frames, intersection observers), at most
-    // every 30 ms; a tab behind, every 200 ms.
-    auto now = MonotonicTime::now();
-    for (auto& tab : engine->tabs.values()) {
-        auto interval = tab.get() == engine->shown ? 30_ms : 200_ms;
-        if (now - tab->lastUpdate >= interval) {
-            tab->lastUpdate = now;
-            tab->page->isolatedUpdateRendering();
+    if (!engine->compositing) {
+        // Each page's rendering update (scroll and resize events,
+        // animation frames, intersection observers), at most every 30 ms;
+        // a tab behind, every 200 ms.
+        auto now = MonotonicTime::now();
+        for (auto& tab : engine->tabs.values()) {
+            auto interval = tab.get() == engine->shown ? 30_ms : 200_ms;
+            if (now - tab->lastUpdate >= interval) {
+                tab->lastUpdate = now;
+                tab->page->isolatedUpdateRendering();
+            }
         }
+        Tab* shown = engine->shown;
+        if (!shown)
+            return 0;
+        if (RefPtr view = shown->frame->view()) {
+            if (view->needsLayout())
+                shown->dirty = true;
+        }
+        return shown->dirty ? 1 : 0;
     }
     Tab* shown = engine->shown;
     if (!shown)
         return 0;
-    if (RefPtr view = shown->frame->view()) {
-        if (view->needsLayout())
-            shown->dirty = true;
+    shown->host->setForcedDark(isForcedDark(engine, shown));
+    auto now = MonotonicTime::now();
+    if (engine->trace && now - engine->lastTrace >= 500_ms) {
+        unsigned paints = shown->host->paints();
+        unsigned frames = shown->host->frames();
+        if (paints != engine->tracedPaints || frames != engine->tracedFrames) {
+            engine->lastTrace = now;
+            engine->tracedPaints = paints;
+            engine->tracedFrames = frames;
+            fprintf(stderr, "voyager: compositor paints %u frames %u fps %.1f\n", paints, frames, shown->host->framesPerSecond());
+        }
     }
-    return shown->dirty ? 1 : 0;
+    return shown->host->hasNewFrame() ? 1 : 0;
+}
+
+int engineDescriptor(Engine* engine)
+{
+    return engine->wakeDescriptor;
+}
+
+// The window's descriptor was readable: what the main thread was handed
+// done; 1 when a frame is ready.
+int engineWake(Engine* engine)
+{
+    char drained[256];
+    while (read(engine->wakeDescriptor, drained, sizeof(drained)) > 0) { }
+    return engineCycle(engine);
+}
+
+int engineDamage(Engine* engine, int* rects, int capacity)
+{
+    int count = 0;
+    for (auto& rect : engine->damage) {
+        if (count >= capacity)
+            break;
+        rects[count * 4] = rect.x();
+        rects[count * 4 + 1] = rect.y();
+        rects[count * 4 + 2] = rect.width();
+        rects[count * 4 + 3] = rect.height();
+        ++count;
+    }
+    return count;
 }
 
 // Whether the tab is painted in forced dark: the desktop dark, its page
@@ -691,12 +832,11 @@ bool isForcedDark(Engine* engine, Tab* tab)
     return document && !mlxPageHasDarkDesign(*document);
 }
 
-void enginePaint(Engine* engine, uint32_t* pixels, int width, int height, int stride)
+// --no-compositing: the view painted whole into the window's pixels on
+// the main thread (Skia raster through GraphicsContextSkia; forced dark
+// through MlxDarkModeCanvas).
+void paintWhole(Engine* engine, Tab* tab, uint32_t* pixels, int width, int height, int stride)
 {
-    Tab* tab = engine->shown;
-    if (!tab)
-        return;
-    tab->dirty = false;
     RefPtr view = tab->frame->view();
     if (!view)
         return;
@@ -715,6 +855,32 @@ void enginePaint(Engine* engine, uint32_t* pixels, int width, int height, int st
     surface->getCanvas()->clear(SK_ColorWHITE);
     GraphicsContextSkia context(*surface->getCanvas(), RenderingMode::Unaccelerated, RenderingPurpose::DOM);
     view->paint(context, IntRect(0, 0, width, height));
+}
+
+// The tab shown into the window's pixels: the last frame its compositor
+// composed (the page's own painting is the compositor's layers'), and its
+// damage for the window (engineDamage). Until the first frame, the
+// page's background.
+void enginePaint(Engine* engine, uint32_t* pixels, int width, int height, int stride)
+{
+    Tab* tab = engine->shown;
+    engine->damage.clear();
+    if (!tab)
+        return;
+    tab->dirty = false;
+    if (!tab->host) {
+        paintWhole(engine, tab, pixels, width, height, stride);
+        engine->damage.append(IntRect(0, 0, width, height));
+        return;
+    }
+    if (tab->host->takeFrame(pixels, width, height, stride, engine->damage))
+        return;
+    uint32_t background = isForcedDark(engine, tab) ? mlxForcedDarkColor(SkColors::kWhite).toSkColor() : 0xFFFFFFFF;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x)
+            pixels[static_cast<size_t>(y) * stride + x] = background;
+    }
+    engine->damage.append(IntRect(0, 0, width, height));
 }
 
 MouseButton buttonOf(int button)
@@ -792,7 +958,12 @@ void engineWheel(Engine* engine, int x, int y, int deltaX, int deltaY)
     IntPoint position(x, y);
     // (WebCore's wheel deltas point the other way: positive scrolls up.)
     PlatformWheelEvent event(position, position, -deltaX, -deltaY, -deltaX / 40.0f, -deltaY / 40.0f, PlatformWheelEventGranularity::ScrollByPixelWheelEvent, false, false, false, false);
-    tab->frame->eventHandler().handleWheelEvent(event, { WheelEventProcessingSteps::SynchronousScrolling, WheelEventProcessingSteps::BlockingDOMEventDispatch });
+    // (To the scrolling thread first: it scrolls the layers, the main
+    // thread does not paint.)
+    if (tab->host)
+        tab->host->handleWheelEvent(*tab->frame, event);
+    else
+        tab->frame->eventHandler().handleWheelEvent(event, { WheelEventProcessingSteps::SynchronousScrolling, WheelEventProcessingSteps::BlockingDOMEventDispatch });
     tab->dirty = true;
 }
 
@@ -1176,7 +1347,7 @@ extern char** environ;
 
 static int usage()
 {
-    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] FILE|URL\n");
+    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] FILE|URL\n");
     return 2;
 }
 
@@ -1186,11 +1357,14 @@ int main(int argc, char** argv)
     Vector<const char*> fonts;
     const char* target = nullptr;
     const char* profile = nullptr;
+    bool compositing = true;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--font") && i + 1 < argc)
             fonts.append(argv[++i]);
         else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
             profile = argv[++i];
+        else if (!strcmp(argv[i], "--no-compositing"))
+            compositing = false;
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             int width = 0;
             int height = 0;
@@ -1219,6 +1393,23 @@ int main(int argc, char** argv)
     static Engine engine;
     engine.size = size;
     engine.trace = getenv("VOYAGER_TRACE");
+    engine.compositing = compositing;
+    // The window wakes for the main thread's work and for each frame: the
+    // run loop's wake-up (a task dispatched to it from another thread: the
+    // frame clock's rendering update, the network's data) and the
+    // compositors' frames write to one descriptor it watches.
+    int ends[2];
+    if (!pipe(ends)) {
+        for (int end : ends) {
+            fcntl(end, F_SETFL, fcntl(end, F_GETFL) | O_NONBLOCK);
+            fcntl(end, F_SETFD, FD_CLOEXEC);
+        }
+        engine.wakeDescriptor = ends[0];
+        engine.wakeWriter = ends[1];
+    }
+    RunLoop::setWakeUpCallback([] {
+        signalWindow(engine);
+    });
     // The user agent: WebKit's compatibility string, then Voyager's name
     // and version with the engine and the window system (std.ui's Linux
     // host shows windows on Wayland).
@@ -1268,7 +1459,8 @@ int main(int argc, char** argv)
         enginePointer, engineWheel, engineKey, engineSelectedText, engineInsertText, engineTitle, engineUrl, engineRelease,
         engineReload, engineStop, engineLoading, engineSetDark, engineForcedDark,
         engineChooser, engineChoose, engineSetDownloads, engineDownloadCount, engineDownload,
-        engineDownloadPath, engineDownloadType, engineDownloadAction
+        engineDownloadPath, engineDownloadType, engineDownloadAction,
+        engineDescriptor, engineWake, engineDamage
     };
     // main's arguments, then the environment with MLX_CANVAS=cpu (the
     // window drawn into wl_shm buffers on the CPU, which the engine

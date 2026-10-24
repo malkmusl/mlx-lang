@@ -89,6 +89,18 @@
 #      its file, which the page reads; the chooser started again opens in
 #      Documents (the folder Voyager last chose in, kept).
 #
+#  22. composited scrolling (M8): projects/voyager/tests/long.html scrolled
+#      by the wheel: frames composed (the scrolling thread moves the
+#      layers), no layer painted again on the main thread (VOYAGER_TRACE's
+#      "voyager: compositor paints P frames F fps R"), the page's scroll
+#      events seen (its title); then by a drag of the scrollbar and
+#      Page Down: far down, only what comes into view painted (the layers'
+#      recordings, MLX_TRACE_LAYER_PAINTS);
+#  23. accelerated animations (M8): projects/voyager/tests/animation.html's
+#      CSS animations of transform and opacity composed at the display's
+#      rate on the compositor thread (its frames a second, 90% of the rate
+#      at least) with no paint; requestAnimationFrame at the same rate.
+#
 #   tools/check_voyager.sh [--no-build] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
 set -uo pipefail
@@ -668,4 +680,76 @@ printf 'wait 9000\npointer %d %d\npress 272\nrelease 272\nwait 2000\ndown 1\nup 
 run_scenario chooser-again "$work/chooser-again.script" "$work/voyager-chooser"
 grep -qxF "voyager: file chooser in $chooser_home/Documents" "$work/voyager.log" || { cat "$work/voyager.log" >&2; fail "the chooser did not open in the folder Voyager last chose in"; }
 echo "ok   the chooser opens in the folder the app last chose in (kept in XDG_STATE_HOME)"
+# 22 and 23: compositing (M8). The engine writes its compositor's counts
+# ("voyager: compositor paints P frames F fps R": the layers painted on the
+# main thread, the frames composed, the frames a second on the compositor
+# thread) when they change.
+counts_at() { # LOG [PATTERN]: the last counts line (before PATTERN's first line, when given)
+    awk -v stop="${2:-}" 'stop != "" && index($0, stop) == 1 { exit } /^voyager: compositor paints / { line = $0 } END { print line }' "$1"
+}
+field_of() { # LINE NAME: the number after NAME
+    awk -v name="$2" '{ for (i = 1; i < NF; i++) if ($i == name) print $(i + 1) }' <<< "$1"
+}
+# 22: the wheel scrolls a long page on the scrolling thread: frames are
+# composed, nothing is painted again on the main thread, which hears of
+# the scroll (the title). Then a drag of the overlay scrollbar's thumb (at
+# the page's right edge, 740 pixels wide) and Page Down twice: the page goes far
+# down, and what is painted meanwhile (MLX_TRACE_LAYER_PAINTS: each layer's
+# recording and its rectangle) is only what comes into view, below what
+# had been painted, never again what was (nor the scrollbar's layer).
+write_runner "$work/voyager-longpage" long.html MLX_TRACE_LAYER_PAINTS=1
+{
+    printf 'wait 9000\npointer %d %d\n' $(( x0 + 400 )) $(( y0 + 300 ))
+    for delta in 5120 5120 5120 5120 -5120 -5120; do printf 'scroll %d\nwait 300\n' $delta; done
+    printf 'wait 1500\npointer %d %d\nwait 300\npress 272\nwait 100\n' $(( x0 + 733 )) $(( y0 + 16 ))
+    for y in 56 96 136; do printf 'pointer %d %d\nwait 100\n' $(( x0 + 733 )) $(( y0 + y )); done
+    printf 'wait 200\nrelease 272\nwait 1000\n'
+    printf 'down 109\nup 109\nwait 800\ndown 109\nup 109\nwait 2000\nshot %s\nclose\n' "$work/longpage.ppm"
+} > "$work/longpage.script"
+run_scenario longpage "$work/longpage.script" "$work/voyager-longpage"
+log=$work/voyager.log
+before=$(counts_at "$log" "voyager: wheel ")
+after=$(counts_at "$log" "voyager: pointer press ")
+[[ -n "$before" && -n "$after" ]] || { cat "$log" >&2; fail "the engine wrote no compositor counts for the long page"; }
+paints_before=$(field_of "$before" paints); frames_before=$(field_of "$before" frames)
+paints_after=$(field_of "$after" paints); frames_after=$(field_of "$after" frames)
+grep -q "^voyager: title long:[1-9]" "$log" || { cat "$log" >&2; fail "the wheel did not scroll the long page (the page's scroll events)"; }
+(( frames_after >= frames_before + 4 )) || { cat "$log" >&2; fail "scrolling composed no frames ($frames_before, then $frames_after)"; }
+(( paints_after == paints_before )) || { cat "$log" >&2; fail "scrolling painted on the main thread ($paints_before layer paints before, $paints_after after)"; }
+echo "ok   the wheel scrolls a long page on the scrolling thread: $(( frames_after - frames_before )) frames composed, no layer painted again on the main thread ($paints_after paints in all)"
+scrolled=$(grep -o "^voyager: title long:[0-9]*" "$log" | tail -1 | cut -d: -f3)
+(( ${scrolled:-0} >= 2000 )) || { cat "$log" >&2; fail "the scrollbar's drag and Page Down did not scroll the long page (to ${scrolled:-nothing})"; }
+# (The recordings after the click: each below the bottom of all painted
+# before it, the page's layer only.)
+again=$(awk '
+    /^voyager: pointer press / { keys = 1 }
+    /^layer paint / {
+        split($(NF - 1), at, ","); split($NF, size, "x")
+        top = at[2] + 0; bottom = top + size[2]
+        if (keys && ($3 != "RenderView" || top < painted)) { print; exit }
+        if ($3 == "RenderView" && bottom > painted) painted = bottom
+    }' "$log")
+[[ -z "$again" ]] || { cat "$log" >&2; fail "the scrollbar's drag or the keys painted again what was painted ($again)"; }
+echo "ok   a drag of the scrollbar and Page Down scroll the page to $scrolled: only what comes into view is painted, nothing again"
+# 23: CSS animations of transform and opacity run on the compositor's
+# clock: frames at the display's rate, no paint; requestAnimationFrame on
+# the same clock (the page's title: animation frames a second).
+write_runner "$work/voyager-animation" animation.html
+printf 'wait 7000\nshot %s\nwait 4000\nclose\n' "$work/animation.ppm" > "$work/animation.script"
+run_scenario animation "$work/animation.script" "$work/voyager-animation"
+log=$work/voyager.log
+lines=$(grep "^voyager: compositor paints " "$log")
+count=$(wc -l <<< "$lines")
+(( count >= 8 )) || { cat "$log" >&2; fail "the engine wrote too few compositor counts for the animation ($count)"; }
+# (The counts of the last four seconds: past the load.)
+first=$(sed -n "$(( count - 7 ))p" <<< "$lines")
+last=$(tail -1 <<< "$lines")
+frames=$(( $(field_of "$last" frames) - $(field_of "$first" frames) ))
+(( $(field_of "$last" paints) == $(field_of "$first" paints) )) || { cat "$log" >&2; fail "the animation painted on the main thread"; }
+rate=${MLX_REFRESH_RATE:-60}
+slowest=$(sed -n "$(( count - 7 )),\$p" <<< "$lines" | awk '{ print $NF }' | sort -n | head -1)
+awk -v fps="$slowest" -v rate="$rate" 'BEGIN { exit !(fps >= rate * 0.9) }' || { cat "$log" >&2; fail "the compositor thread fell below the frame rate ($slowest frames a second, the display's $rate)"; }
+raf=$(grep -o "^voyager: title raf:[0-9]*" "$log" | tail -1 | cut -d: -f3)
+(( ${raf:-0} >= rate * 9 / 10 )) || { cat "$log" >&2; fail "requestAnimationFrame did not run at the display's rate (${raf:-no} frames a second)"; }
+echo "ok   CSS animations of transform and opacity run on the compositor thread: $frames frames in the last counts, no paint, at least $slowest frames a second; requestAnimationFrame $raf a second"
 echo "check_voyager.sh: all checks passed"
