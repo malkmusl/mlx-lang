@@ -1,0 +1,412 @@
+// libmlxvulkan.so: Vulkan's C API for C and C++ programs (ANGLE's Vulkan
+// backend, which WebKit's WebGL runs on), declared by the modules of api/
+// (vulkan/vulkan.h, made by mlx-cheaders), over std.vulkan.loader: the
+// driver is the first whose ICD manifest loads and has a device, found as the Khronos
+// loader finds them (VK_DRIVER_FILES, VK_ICD_FILENAMES, VK_ADD_DRIVER_FILES,
+// the icd.d directories of XDG's configuration and data directories and
+// /etc/vulkan), opened with RTLD_LAZY as that loader opens drivers. No
+// layers: an instance asking for one is refused with
+// VK_ERROR_LAYER_NOT_PRESENT.
+//
+//     ./mlx build vulkan
+//
+// The driver's objects are given out as they are (one driver, nothing to
+// tell apart); the first word of each dispatchable one, the loader's,
+// points to its instance's or device's dispatch table (dispatch.mlx).
+// commands.mlx (generated from the registry) has every command's
+// function of its C name, calling through the table; this module the
+// commands that make, find or end dispatchable objects and those only a
+// loader answers. vkGetInstanceProcAddr and vkGetDeviceProcAddr give the
+// driver's own functions but for those.
+const std = @import("std")
+const loader = @import("std.vulkan.loader")
+const commands = @import("./commands.mlx")
+const dispatch = @import("./dispatch.mlx")
+
+extern("c") fn malloc(size: usize) -> usize
+extern("c") fn free(address: usize) -> void
+extern("c") fn dlsym(handle: usize, name: [*]const u8) -> usize
+extern("c") fn strcmp(first: usize, second: usize) -> i32
+
+const VK_SUCCESS: i32 = 0
+const VK_INCOMPLETE: i32 = 5
+const VK_ERROR_OUT_OF_HOST_MEMORY: i32 = -1
+const VK_ERROR_INITIALIZATION_FAILED: i32 = -3
+const VK_ERROR_LAYER_NOT_PRESENT: i32 = -6
+const VK_ERROR_INCOMPATIBLE_DRIVER: i32 = -9
+
+const LEVEL_INSTANCE: u8 = 1
+const LEVEL_DEVICE: u8 = 2
+
+const ProcAddr = fn(usize, [*]const u8) -> usize
+
+// ---------------------------------------------------------------------------
+// The driver, opened at the first command that needs it.
+
+var driver: loader.Driver = undefined
+var driverState: u32 = 0      // 0 not tried, 1 open, 2 none
+var driverLock: u32 = 0
+
+fn lock(word: *u32) -> void {
+    while true {
+        const taken = @cmpxchgStrong(u32, word, 0, 1, acquire, monotonic)
+        if taken.0 { return }
+    }
+}
+
+fn unlock(word: *u32) -> void { @atomicStore(u32, word, 0, release) }
+
+// The process's environment as std's `arguments` would carry it: none,
+// then a NULL, then environ's entries.
+fn environmentArguments() -> [][*]const u8 {
+    var entries: usize = 0
+    const place = dlsym(0, "environ".pointer)
+    if place != 0 { entries = dispatch.word(place) }
+    var count: usize = 0
+    if entries != 0 {
+        while dispatch.word(entries + count * 8) != 0 { count += 1 }
+    }
+    const block = malloc((count + 2) * 8)
+    dispatch.setWord(block, 0)
+    var index: usize = 0
+    while index < count {
+        dispatch.setWord(block + 8 + index * 8, dispatch.word(entries + index * 8))
+        index += 1
+    }
+    dispatch.setWord(block + 8 + count * 8, 0)
+    var arguments: [*][*]const u8 = undefined
+    unsafe { arguments = @ptrFromInt([*][*]const u8, block) }
+    return arguments[0..0]
+}
+
+// The driver: the first, in search order, that loads and has a device
+// (Mesa's drivers all load, each finding only its own hardware).
+fn haveDriver() -> bool {
+    if @atomicLoad(u32, &driverState, acquire) == 1 { return true }
+    lock(&driverLock)
+    if driverState == 0 {
+        var manifests: loader.Manifests = undefined
+        const count = loader.findDrivers(&manifests, environmentArguments(), std.heap.allocator())
+        var state: u32 = 2
+        var index: usize = 0
+        while index < count && state == 2 {
+            if loader.openDriver(&driver, loader.manifestAt(&manifests, index), std.heap.allocator()) == loader.Status.ok {
+                if hasDevice() { state = 1 } else { loader.closeDriver(&driver) }
+            }
+            index += 1
+        }
+        @atomicStore(u32, &driverState, state, release)
+    }
+    unlock(&driverLock)
+    return driverState == 1
+}
+
+fn driverProcAddr(instance: usize, name: [*]const u8) -> usize {
+    const function = unsafe { @ptrFromInt(ProcAddr, driver.getInstanceProcAddr) }
+    return function(instance, name)
+}
+
+const DestroyInstanceProbe = fn(usize, usize) -> void
+const EnumerateDevicesProbe = fn(usize, *u32, usize) -> i32
+const CreateInstanceProbe = fn(usize, usize, *usize) -> i32
+
+// Whether the driver just opened has a physical device: an instance of
+// no extension (VkInstanceCreateInfo, 64 bytes, zero but its sType) asked.
+fn hasDevice() -> bool {
+    const create = driverProcAddr(0, "vkCreateInstance".pointer)
+    if create == 0 { return false }
+    var info: [8]usize = [8]usize{ 1, 0, 0, 0, 0, 0, 0, 0 }
+    var instance: usize = 0
+    const createFunction = unsafe { @ptrFromInt(CreateInstanceProbe, create) }
+    if createFunction(@intFromPtr(&info), 0, &instance) != VK_SUCCESS { return false }
+    var devices: u32 = 0
+    const enumerate = driverProcAddr(instance, "vkEnumeratePhysicalDevices".pointer)
+    if enumerate != 0 {
+        const enumerateFunction = unsafe { @ptrFromInt(EnumerateDevicesProbe, enumerate) }
+        _ = enumerateFunction(instance, &devices, 0)
+    }
+    const destroy = driverProcAddr(instance, "vkDestroyInstance".pointer)
+    if destroy != 0 {
+        const destroyFunction = unsafe { @ptrFromInt(DestroyInstanceProbe, destroy) }
+        destroyFunction(instance, 0)
+    }
+    return devices > 0
+}
+
+// ---------------------------------------------------------------------------
+// The commands' names and positions (commands.NAMES: name, alias target).
+
+fn nameAt(offset: usize) -> [*]const u8 { return commands.NAMES.pointer + offset }
+
+fn lengthAt(offset: usize) -> usize {
+    var length: usize = 0
+    while commands.NAMES[offset + length] != 0 { length += 1 }
+    return length
+}
+
+// The position of the command `name` (a C string), or COUNT.
+fn positionOf(name: usize) -> usize {
+    var offset: usize = 0
+    var position: usize = 0
+    while position < commands.COUNT {
+        if strcmp(@intFromPtr(nameAt(offset)), name) == 0 { return position }
+        offset += lengthAt(offset) + 1
+        offset += lengthAt(offset) + 1
+        position += 1
+    }
+    return commands.COUNT
+}
+
+fn positionNamed(name: []const u8) -> usize { return positionOf(@intFromPtr(name.pointer)) }
+
+// A table of the commands of `level` from `procAddr(handle, name)` (the
+// alias's target when the name has none).
+fn makeTable(level: u8, procAddr: usize, handle: usize) -> usize {
+    const table = malloc(commands.COUNT * 8)
+    if table == 0 { return 0 }
+    const function = unsafe { @ptrFromInt(ProcAddr, procAddr) }
+    var offset: usize = 0
+    var position: usize = 0
+    while position < commands.COUNT {
+        const nameOffset = offset
+        offset += lengthAt(offset) + 1
+        const aliasOffset = offset
+        const aliasLength = lengthAt(offset)
+        offset += aliasLength + 1
+        var address: usize = 0
+        if commands.LEVELS[position] == level {
+            address = function(handle, nameAt(nameOffset))
+            if address == 0 && aliasLength > 0 { address = function(handle, nameAt(aliasOffset)) }
+        }
+        dispatch.setWord(table + position * 8, address)
+        position += 1
+    }
+    return table
+}
+
+fn tableEntry(table: usize, name: []const u8) -> usize { return dispatch.word(table + positionNamed(name) * 8) }
+
+// ---------------------------------------------------------------------------
+// Global commands
+
+const EnumerateExtensions = fn(usize, *u32, usize) -> i32
+const EnumerateVersion = fn(*u32) -> i32
+const CreateInstance = fn(usize, usize, *usize) -> i32
+const DestroyInstance = fn(usize, usize) -> void
+
+export fn vkEnumerateInstanceVersion(version: *u32) -> i32 {
+    if !haveDriver() { return VK_ERROR_INCOMPATIBLE_DRIVER }
+    version.* = driver.apiVersion
+    return VK_SUCCESS
+}
+
+export fn vkEnumerateInstanceLayerProperties(count: *u32, properties: usize) -> i32 {
+    count.* = 0
+    return VK_SUCCESS
+}
+
+export fn vkEnumerateInstanceExtensionProperties(layer: usize, count: *u32, properties: usize) -> i32 {
+    if layer != 0 { return VK_ERROR_LAYER_NOT_PRESENT }
+    if !haveDriver() { return VK_ERROR_INCOMPATIBLE_DRIVER }
+    const address = driverProcAddr(0, "vkEnumerateInstanceExtensionProperties".pointer)
+    if address == 0 { return VK_ERROR_INITIALIZATION_FAILED }
+    const function = unsafe { @ptrFromInt(EnumerateExtensions, address) }
+    return function(layer, count, properties)
+}
+
+// VkInstanceCreateInfo: sType, pNext, flags, pApplicationInfo (at 24),
+// enabledLayerCount at 32.
+export fn vkCreateInstance(info: usize, allocator: usize, instance: *usize) -> i32 {
+    if !haveDriver() { return VK_ERROR_INCOMPATIBLE_DRIVER }
+    var layers: u32 = 0
+    unsafe { layers = @ptrFromInt(*u32, info + 32).* }
+    if layers > 0 { return VK_ERROR_LAYER_NOT_PRESENT }
+    const address = driverProcAddr(0, "vkCreateInstance".pointer)
+    if address == 0 { return VK_ERROR_INITIALIZATION_FAILED }
+    const create = unsafe { @ptrFromInt(CreateInstance, address) }
+    const result = create(info, allocator, instance)
+    if result != VK_SUCCESS { return result }
+    const table = makeTable(LEVEL_INSTANCE, driver.getInstanceProcAddr, instance.*)
+    if table == 0 {
+        const destroy = unsafe { @ptrFromInt(DestroyInstance, driverProcAddr(instance.*, "vkDestroyInstance".pointer)) }
+        destroy(instance.*, allocator)
+        return VK_ERROR_OUT_OF_HOST_MEMORY
+    }
+    dispatch.setWord(instance.*, table)
+    return VK_SUCCESS
+}
+
+export fn vkDestroyInstance(instance: usize, allocator: usize) -> void {
+    if instance == 0 { return }
+    const table = dispatch.word(instance)
+    const destroy = unsafe { @ptrFromInt(DestroyInstance, tableEntry(table, "vkDestroyInstance")) }
+    destroy(instance, allocator)
+    free(table)
+}
+
+// ---------------------------------------------------------------------------
+// Physical devices: their instance's table.
+
+const EnumerateDevices = fn(usize, *u32, usize) -> i32
+
+export fn vkEnumeratePhysicalDevices(instance: usize, count: *u32, devices: usize) -> i32 {
+    const table = dispatch.word(instance)
+    const function = unsafe { @ptrFromInt(EnumerateDevices, tableEntry(table, "vkEnumeratePhysicalDevices")) }
+    const result = function(instance, count, devices)
+    if devices != 0 && (result == VK_SUCCESS || result == VK_INCOMPLETE) {
+        var index: usize = 0
+        while index < @intCast(usize, count.*) {
+            dispatch.setWord(dispatch.word(devices + index * 8), table)
+            index += 1
+        }
+    }
+    return result
+}
+
+// VkPhysicalDeviceGroupProperties (288 bytes): physicalDeviceCount at 16,
+// physicalDevices[32] at 24.
+fn enumerateGroups(instance: usize, count: *u32, groups: usize, name: []const u8) -> i32 {
+    const table = dispatch.word(instance)
+    var address = tableEntry(table, name)
+    if address == 0 { address = tableEntry(table, "vkEnumeratePhysicalDeviceGroups") }
+    const function = unsafe { @ptrFromInt(EnumerateDevices, address) }
+    const result = function(instance, count, groups)
+    if groups != 0 && (result == VK_SUCCESS || result == VK_INCOMPLETE) {
+        var index: usize = 0
+        while index < @intCast(usize, count.*) {
+            const group = groups + index * 288
+            var members: u32 = 0
+            unsafe { members = @ptrFromInt(*u32, group + 16).* }
+            var member: usize = 0
+            while member < @intCast(usize, members) {
+                dispatch.setWord(dispatch.word(group + 24 + member * 8), table)
+                member += 1
+            }
+            index += 1
+        }
+    }
+    return result
+}
+
+export fn vkEnumeratePhysicalDeviceGroups(instance: usize, count: *u32, groups: usize) -> i32 { return enumerateGroups(instance, count, groups, "vkEnumeratePhysicalDeviceGroups") }
+export fn vkEnumeratePhysicalDeviceGroupsKHR(instance: usize, count: *u32, groups: usize) -> i32 { return enumerateGroups(instance, count, groups, "vkEnumeratePhysicalDeviceGroupsKHR") }
+
+export fn vkEnumerateDeviceLayerProperties(physicalDevice: usize, count: *u32, properties: usize) -> i32 {
+    count.* = 0
+    return VK_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Devices, queues and command buffers: their device's table.
+
+const CreateDevice = fn(usize, usize, usize, *usize) -> i32
+const DestroyDevice = fn(usize, usize) -> void
+const GetQueue = fn(usize, u32, u32, *usize) -> void
+const GetQueue2 = fn(usize, usize, *usize) -> void
+const AllocateBuffers = fn(usize, usize, usize) -> i32
+
+export fn vkCreateDevice(physicalDevice: usize, info: usize, allocator: usize, device: *usize) -> i32 {
+    const instanceTable = dispatch.word(physicalDevice)
+    const create = unsafe { @ptrFromInt(CreateDevice, tableEntry(instanceTable, "vkCreateDevice")) }
+    const result = create(physicalDevice, info, allocator, device)
+    if result != VK_SUCCESS { return result }
+    const getDeviceProcAddr = tableEntry(instanceTable, "vkGetDeviceProcAddr")
+    const table = makeTable(LEVEL_DEVICE, getDeviceProcAddr, device.*)
+    if table == 0 {
+        const function = unsafe { @ptrFromInt(ProcAddr, getDeviceProcAddr) }
+        const destroy = unsafe { @ptrFromInt(DestroyDevice, function(device.*, "vkDestroyDevice".pointer)) }
+        destroy(device.*, allocator)
+        return VK_ERROR_OUT_OF_HOST_MEMORY
+    }
+    // (The device's own vkGetDeviceProcAddr, for vkGetDeviceProcAddr.)
+    dispatch.setWord(table + positionNamed("vkGetDeviceProcAddr") * 8, getDeviceProcAddr)
+    dispatch.setWord(device.*, table)
+    return VK_SUCCESS
+}
+
+export fn vkDestroyDevice(device: usize, allocator: usize) -> void {
+    if device == 0 { return }
+    const table = dispatch.word(device)
+    const destroy = unsafe { @ptrFromInt(DestroyDevice, tableEntry(table, "vkDestroyDevice")) }
+    destroy(device, allocator)
+    free(table)
+}
+
+export fn vkGetDeviceQueue(device: usize, family: u32, index: u32, queue: *usize) -> void {
+    const table = dispatch.word(device)
+    const function = unsafe { @ptrFromInt(GetQueue, tableEntry(table, "vkGetDeviceQueue")) }
+    function(device, family, index, queue)
+    if queue.* != 0 { dispatch.setWord(queue.*, table) }
+}
+
+export fn vkGetDeviceQueue2(device: usize, info: usize, queue: *usize) -> void {
+    const table = dispatch.word(device)
+    const function = unsafe { @ptrFromInt(GetQueue2, tableEntry(table, "vkGetDeviceQueue2")) }
+    function(device, info, queue)
+    if queue.* != 0 { dispatch.setWord(queue.*, table) }
+}
+
+// VkCommandBufferAllocateInfo: commandBufferCount at 28.
+export fn vkAllocateCommandBuffers(device: usize, info: usize, buffers: usize) -> i32 {
+    const table = dispatch.word(device)
+    const function = unsafe { @ptrFromInt(AllocateBuffers, tableEntry(table, "vkAllocateCommandBuffers")) }
+    const result = function(device, info, buffers)
+    if result != VK_SUCCESS { return result }
+    var count: u32 = 0
+    unsafe { count = @ptrFromInt(*u32, info + 28).* }
+    var index: usize = 0
+    while index < @intCast(usize, count) {
+        dispatch.setWord(dispatch.word(buffers + index * 8), table)
+        index += 1
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Finding functions
+
+fn same(name: usize, text: []const u8) -> bool { return strcmp(name, @intFromPtr(text.pointer)) == 0 }
+
+// This library's function for a command it must see, or 0.
+fn ownFunction(name: usize) -> usize {
+    if same(name, "vkGetInstanceProcAddr") { return @intFromPtr(vkGetInstanceProcAddr) }
+    if same(name, "vkGetDeviceProcAddr") { return @intFromPtr(vkGetDeviceProcAddr) }
+    if same(name, "vkCreateInstance") { return @intFromPtr(vkCreateInstance) }
+    if same(name, "vkDestroyInstance") { return @intFromPtr(vkDestroyInstance) }
+    if same(name, "vkEnumerateInstanceVersion") { return @intFromPtr(vkEnumerateInstanceVersion) }
+    if same(name, "vkEnumerateInstanceLayerProperties") { return @intFromPtr(vkEnumerateInstanceLayerProperties) }
+    if same(name, "vkEnumerateInstanceExtensionProperties") { return @intFromPtr(vkEnumerateInstanceExtensionProperties) }
+    if same(name, "vkEnumeratePhysicalDevices") { return @intFromPtr(vkEnumeratePhysicalDevices) }
+    if same(name, "vkEnumeratePhysicalDeviceGroups") { return @intFromPtr(vkEnumeratePhysicalDeviceGroups) }
+    if same(name, "vkEnumeratePhysicalDeviceGroupsKHR") { return @intFromPtr(vkEnumeratePhysicalDeviceGroupsKHR) }
+    if same(name, "vkEnumerateDeviceLayerProperties") { return @intFromPtr(vkEnumerateDeviceLayerProperties) }
+    if same(name, "vkCreateDevice") { return @intFromPtr(vkCreateDevice) }
+    if same(name, "vkDestroyDevice") { return @intFromPtr(vkDestroyDevice) }
+    if same(name, "vkGetDeviceQueue") { return @intFromPtr(vkGetDeviceQueue) }
+    if same(name, "vkGetDeviceQueue2") { return @intFromPtr(vkGetDeviceQueue2) }
+    if same(name, "vkAllocateCommandBuffers") { return @intFromPtr(vkAllocateCommandBuffers) }
+    return 0
+}
+
+fn isGlobal(name: usize) -> bool {
+    return same(name, "vkCreateInstance") || same(name, "vkEnumerateInstanceVersion") || same(name, "vkEnumerateInstanceLayerProperties") || same(name, "vkEnumerateInstanceExtensionProperties") || same(name, "vkGetInstanceProcAddr")
+}
+
+export fn vkGetInstanceProcAddr(instance: usize, name: usize) -> usize {
+    if name == 0 { return 0 }
+    const own = ownFunction(name)
+    if instance == 0 { return if isGlobal(name) { own } else { 0 } }
+    if own != 0 { return own }
+    var address: usize = 0
+    unsafe { address = driverProcAddr(instance, @ptrFromInt([*]const u8, name)) }
+    return address
+}
+
+export fn vkGetDeviceProcAddr(device: usize, name: usize) -> usize {
+    if device == 0 || name == 0 { return 0 }
+    if same(name, "vkGetDeviceProcAddr") || same(name, "vkDestroyDevice") || same(name, "vkGetDeviceQueue") || same(name, "vkGetDeviceQueue2") || same(name, "vkAllocateCommandBuffers") { return ownFunction(name) }
+    const function = unsafe { @ptrFromInt(ProcAddr, tableEntry(dispatch.word(device), "vkGetDeviceProcAddr")) }
+    var address: usize = 0
+    unsafe { address = function(device, @ptrFromInt([*]const u8, name)) }
+    return address
+}
