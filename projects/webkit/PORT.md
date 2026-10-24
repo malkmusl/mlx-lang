@@ -606,7 +606,9 @@ port takes:
   is ANGLE's surfaceless display on Vulkan, the one WebGL's contexts are
   made on (`mlxANGLEDisplay`), made the shared display only when a host
   composes on the GPU. `ProcessCapabilities::setCanUseAcceleratedBuffers(false)`:
-  nothing is painted on the GPU (no Ganesh context).
+  no canvas or image buffer is painted on the GPU; layers' tiles only
+  with `MLX_PAINTING=gpu` (Ganesh over ANGLE, a GL context per painting
+  thread: "What M8's third part leaves").
 - **The tiles' painting, the port's** (WebKit's files take GL for
   granted): `SkiaPaintingEngineMlx.cpp` records a layer's dirty region on
   the main thread (`GraphicsContextSkia` over an `SkPictureRecorder`) and
@@ -1619,14 +1621,39 @@ What M2 found, and how the port meets it without a patch:
     draws, chrome and page, so the page would be a wl_subsurface std.ui's
     panel does not make yet. On lavapipe a swapchain's present is itself a
     copy into wl_shm.
-  - Tiles, images and 2D canvases are painted on the CPU and uploaded;
-    Ganesh over ANGLE (PlatformDisplaySkia.cpp, SkiaPaintingEngine.cpp's
-    GPU path, a GL context per painting thread) would paint them on the
-    GPU.
+  - Tiles, images and 2D canvases are painted on the CPU and uploaded.
+    Painting tiles with Ganesh over ANGLE's GLES is in place but off:
+    `MLX_PAINTING=gpu` (with the GPU compositor) has the host give its
+    painting engine the proxy of the main thread's Skia context, and
+    SkiaPaintingEngineMlx.cpp plays each recording (forced dark applied
+    when it was recorded, images as they are) back on a GPU painting
+    thread (`WEBKIT_SKIA_GPU_PAINTING_THREADS`, 2 by default) into a
+    texture of BitmapTexturePool's (CoordinatedAcceleratedTileBuffer),
+    each thread with its own GL context and GrDirectContext
+    (PlatformDisplayMlx.cpp); the tile takes the texture, no upload. What
+    blocks it is Skia's SkSL compiler as mlx-cc compiles it: loading the
+    `sksl_gpu` module (the first text drawn: the long page) reaches
+    `SkUNREACHABLE` in `TProgramVisitor::visitProgramElement`, a module
+    element of no kind it knows, on one painting thread as on two (the
+    animation and WebGL pages, whose tiles have no text, ran without it). An earlier failure there, the module's numbers read as
+    garbage, was mlxlibcpp's: `std::stringstream` was an `ostringstream`
+    and Skia's `SkSL::stod` read nothing (fixed: it reads now). No GPU
+    atlases of images, no deferred display lists, and 2D canvases stay on
+    the CPU (ProcessCapabilities says no accelerated buffers).
   - Forced dark's solid colour layers are darkened through a pointer to
     CoordinatedPlatformLayer's private `m_contentsColor` (taken in an
-    explicit instantiation): legal C++, but WebKit's layout of the class,
-    not an interface; a `GraphicsLayer` client hook would be cleaner.
+    explicit instantiation). A hook the port owns needs one upstream
+    does not offer: the colour RenderLayerBacking gives
+    `GraphicsLayer::setContentsToSolidColor` is kept privately by
+    `GraphicsLayerCoordinated` (a `final` class, so no port subclass from
+    the layer factory), by `CoordinatedPlatformLayer` (whose setter is
+    public, no getter; its client is told only that something changed)
+    and by `TextureMapperLayer` (setter only); the colour is drawn by
+    `TextureMapperSolidColorLayer`, inline in TextureMapperLayer.cpp, through
+    `TextureMapper::drawSolidColor`, neither virtual nor the port's. A
+    `contentsColor()` getter on CoordinatedPlatformLayer upstream (or a
+    colour filter of the TextureMapper's, as MlxDarkModeCanvas is the
+    CPU compositor's) would let the trick go.
   - `HAVE(GL_FENCE)` is off in the port's configuration (turning it on
     rebuilds WebCore whole): WebKit's `GLFence::create` gives no fence,
     so the WebGL frame's fence is the port's (an EGL fence sync); tile

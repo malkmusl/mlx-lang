@@ -44,6 +44,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
 #include <skia/core/SkCanvas.h>
 #include <skia/core/SkImage.h>
 #include <skia/core/SkSurface.h>
+#include <skia/gpu/ganesh/GrDirectContext.h>
 #include <skia/utils/SkNWayCanvas.h>
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
 #include <stdlib.h>
@@ -639,6 +640,19 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
             m_compositingReason = "no GL context on ANGLE's display"_s;
         if (!m_onGPU && m_mode == Mode::Synchronous)
             m_compositorQueue = nullptr;
+    }
+    // (On the GPU with MLX_PAINTING=gpu, the tiles painted there too, by
+    // Ganesh over ANGLE's GLES: the painting engine has the main thread's
+    // Skia context's proxy. Not by default: Ganesh's SkSL compiler, as
+    // mlx-cc compiles it, fails on its GPU module; PORT.md.)
+    if (m_onGPU) {
+        const char* painting = getenv("MLX_PAINTING");
+        auto& display = PlatformDisplay::sharedDisplay();
+        bool onGPU = painting && !strcmp(painting, "gpu") && display.skiaGLContext() && display.skiaGrContext();
+        if (onGPU)
+            m_paintingEngine = SkiaPaintingEngine::create(display.skiaGrContext()->threadSafeProxy());
+        if (getenv("MLX_TRACE_COMPOSITOR"))
+            fprintf(stderr, "compositor's tiles painted on the %s\n", onGPU ? "GPU" : "CPU");
     }
     if (!m_onGPU && getenv("MLX_TRACE_COMPOSITOR"))
         fprintf(stderr, "compositor on the CPU: %s\n", m_compositingReason.utf8().data());
