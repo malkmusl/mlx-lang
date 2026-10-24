@@ -44,3 +44,12 @@ expected text (`platform/glib/`'s where WebKit's GLib ports have their
 own), taken from the same revision; tools/check_webkit_mlx_compositing.sh
 runs them as the storage check runs its own, with the test runner's
 fonts.
+
+`webgl.txt` lists tests of `fast/canvas/webgl` and `webgl` (M8's WebGL
+on ANGLE's Vulkan backend: the GL calls, shaders, textures, readPixels,
+the WebGL 2 context, wrappers of Khronos's conformance tests), with what
+they load (`fast/canvas/webgl/resources/`, `webgl/resources/` and its
+`webgl_test_files/`) and their expected text (`platform/glib/`'s where
+the GLib ports have their own), taken from the same revision;
+tools/check_webkit_mlx_webgl.sh runs them as the storage check runs its
+own, and skips them where there is no Vulkan driver.
