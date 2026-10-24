@@ -119,6 +119,10 @@ set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
+# The GPU's compositor, also on a software Vulkan device (lavapipe), where
+# the port composes on the CPU by default; MLX_COMPOSITING=cpu checks the
+# CPU's.
+export MLX_COMPOSITING=${MLX_COMPOSITING:-gpu}
 fail() { echo "FAIL $1" >&2; exit 1; }
 build=1
 keep=""

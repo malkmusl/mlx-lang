@@ -56,6 +56,7 @@
 #include <wtf/Vector.h>
 #include <wtf/WeakPtr.h>
 #include <wtf/WorkQueue.h>
+#include <wtf/text/WTFString.h>
 
 class SkCanvas;
 
@@ -89,12 +90,15 @@ public:
     // asynchronously, damage propagated for compositing from it.
     static void configure(Settings&);
 
-    // Whether hosts made from now on compose on the GPU when a display
-    // exists (true unless MLX_COMPOSITING=cpu); false is the CPU's
-    // compositor (an embedder's --no-gpu-compositing).
+    // Whether hosts made from now on may compose on the GPU (true by
+    // default: on the GPU when a display exists and its Vulkan device is
+    // not a CPU's, or MLX_COMPOSITING=gpu; MLX_COMPOSITING=cpu never);
+    // false is the CPU's compositor (an embedder's --no-gpu-compositing).
     static void setGPUCompositingAllowed(bool);
     // Whether this host composes on the GPU.
     bool composesOnGPU() const { return m_onGPU; }
+    // Why the host composes where it does (the device, or what chose).
+    const String& compositingReason() const { return m_compositingReason; }
 
     // The host of LAYER's page (the client of its platform layer).
     static MlxLayerTreeHost& of(const GraphicsLayerCoordinated&);
@@ -254,6 +258,7 @@ private:
     std::atomic<bool> m_animationsRunning { false };
     std::unique_ptr<GPUCompositor> m_gpu;
     bool m_onGPU { false };
+    String m_compositingReason;
     // (On the GPU: the damage the layers' TextureMapperLayers infer in the
     // view's coordinates, shared by all, as LayerTreeHost's.)
     std::shared_ptr<Damage> m_globalDamage;

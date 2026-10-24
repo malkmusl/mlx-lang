@@ -514,7 +514,7 @@ port in the tarball that builds WebCore without GLib).
 |---|---|---|
 | Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
 | Graphics | `USE_SKIA`, CPU raster; no `USE_CAIRO` | Skia compiles here already (`webkit-skia`); WebCore's only living 2D back end besides Cairo (GTK/WPE moved to Skia); CPU first, no EGL |
-| Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the GPU by TextureMapper over ANGLE's GLES (since M8's third part), on the CPU by `SkiaCompositingLayer` without a Vulkan device; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles, TextureMapper and scrolling tree as they are ("Compositing") |
+| Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the GPU by TextureMapper over ANGLE's GLES (since M8's third part), on the CPU by `SkiaCompositingLayer` without a Vulkan device or on a CPU's (lavapipe), unless `MLX_COMPOSITING=gpu`; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles, TextureMapper and scrolling tree as they are ("Compositing") |
 | WebGL | `ENABLE_WEBGL` and `USE_ANGLE` (since M8): `GraphicsContextGLANGLE` with the port's GraphicsContextGLMlx, ANGLE on Vulkan (libmlxvulkan.so) | ANGLE is WebKit's WebGL everywhere; Vulkan is what std.gpu speaks, and lavapipe runs it without a GPU ("WebGL") |
 | Network | neither `USE_SOUP` nor `USE_CURL` | A load is the embedder's (`LoaderStrategy`), over std.http and std.tls |
 | Images | WebCore's `ScalableImageDecoder`, with our PNG, JPEG and WebP decoders; WebKit's BMP, GIF, ICO as they are | WebCore's decoders call libpng, libjpeg, libwebp; ours call std.png, std.jpeg, std.webp |
@@ -578,7 +578,7 @@ Since M8 accelerated compositing is on (`MlxLayerTreeHost::configure`:
 accelerated compositing, forced compositing mode, fixed position layers,
 asynchronous frame and overflow scrolling, damage propagation), on the
 GPU since its third part ("On the GPU" below), on the CPU where there is
-no Vulkan device or when asked. What WebKit has for it, and what the
+no Vulkan device, where the device is a CPU's, or when asked. What WebKit has for it, and what the
 port takes:
 
 - **The layers: WebKit's coordinated graphics, as they are.**
@@ -655,10 +655,23 @@ port takes:
   pointer to the member taken in an explicit instantiation), the
   background cleared darkened. WebGL canvases are textures in the same
   share group ("WebGL"). The CPU's compositor stays: no Vulkan device
-  (no display or no context), `MLX_COMPOSITING=cpu`, or an embedder's
-  `MlxLayerTreeHost::setGPUCompositingAllowed(false)` (Voyager's
-  `--no-gpu-compositing`). `MLX_TRACE_COMPOSITOR` names the renderer and
-  each frame's path.
+  (no display or no context), a software one (ANGLE's EGL device's
+  `VkPhysicalDevice`, EGL_ANGLE_device_vulkan, whose
+  `VkPhysicalDeviceProperties::deviceType` is
+  `VK_PHYSICAL_DEVICE_TYPE_CPU`: lavapipe, llvmpipe, SwiftShader;
+  port/angle/vulkan_device_type.cpp), `MLX_COMPOSITING=cpu`, or an
+  embedder's `MlxLayerTreeHost::setGPUCompositingAllowed(false)`
+  (Voyager's `--no-gpu-compositing`). `MLX_COMPOSITING=gpu` composes on
+  the GPU on any device: the checks (tools/check_webkit_mlx_*.sh,
+  check_voyager.sh) set it unless told otherwise, so the GPU's path stays
+  tested on lavapipe. On lavapipe the CPU's compositor is the faster
+  (a frame of the animation page 4.5 against 5.4 ms, of a page scrolled
+  by whole views 4.8 against 12.1 ms, half the memory), WebGL's pages
+  aside (the drawing buffer read back each frame on the main thread:
+  about 35 frames a second against 55). WebGL uses ANGLE on whatever
+  device there is either way. `MLX_TRACE_COMPOSITOR` names the renderer
+  (or why the CPU's) and each frame's path; Voyager's `VOYAGER_TRACE`
+  says where its tabs compose and why.
 - **The frame clock: `MlxDisplayLink`**, a thread ticking at the
   display's rate (60 Hz; `MLX_REFRESH_RATE` 1 to 240), started only while
   someone wants frames: the compositor while animations run or a
@@ -1580,9 +1593,9 @@ What M2 found, and how the port meets it without a patch:
     dmabuf the Wayland compositor takes, linux-dmabuf, or a Vulkan
     swapchain of std.ui.gpu_canvas's that ANGLE's images go to) is open;
     an asynchronous read (a pixel buffer read the frame after) would end
-    the wait at the cost of a frame of latency. On lavapipe a frame whose
-    whole view changes (a scroll) is slower than the CPU's compositor
-    (15 against 6.6 ms): its GPU is the CPU.
+    the wait at the cost of a frame of latency. (On lavapipe, where a
+    frame whose whole view changes is slower than the CPU's compositor,
+    the port composes on the CPU unless `MLX_COMPOSITING=gpu`.)
   - Tiles, images and 2D canvases are painted on the CPU and uploaded;
     Ganesh over ANGLE (PlatformDisplaySkia.cpp, SkiaPaintingEngine.cpp's
     GPU path, a GL context per painting thread) would paint them on the

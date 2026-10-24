@@ -118,6 +118,26 @@ void* mlxANGLEDisplay()
     return display;
 }
 
+// (port/angle/vulkan_device_type.cpp: compiled with vulkan/vulkan.h.)
+extern "C" bool mlxVulkanDeviceIsCPU(void* physicalDevice, char* name, size_t);
+
+bool mlxANGLEDeviceIsCPU(const char** name)
+{
+    static char deviceName[256];
+    static bool isCPU = [] {
+        auto display = static_cast<EGLDisplay>(mlxANGLEDisplay());
+        EGLAttrib device = 0;
+        EGLAttrib physicalDevice = 0;
+        if (!display || !EGL_QueryDisplayAttribEXT(display, EGL_DEVICE_EXT, &device) || !device
+            || !EGL_QueryDeviceAttribEXT(reinterpret_cast<EGLDeviceEXT>(device), EGL_VULKAN_PHYSICAL_DEVICE_ANGLE, &physicalDevice) || !physicalDevice)
+            return false;
+        return mlxVulkanDeviceIsCPU(reinterpret_cast<void*>(physicalDevice), deviceName, sizeof(deviceName));
+    }();
+    if (name)
+        *name = deviceName;
+    return isCPU;
+}
+
 GraphicsContextGLANGLE::~GraphicsContextGLANGLE()
 {
     if (!makeContextCurrent())

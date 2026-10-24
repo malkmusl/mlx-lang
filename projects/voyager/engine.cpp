@@ -11,8 +11,9 @@
 // one cycle, every tab's: background tabs keep running); hand the shown
 // tab's latest frame to the window's pixels with its damage (each tab's
 // MlxLayerTreeHost composites its layers on a compositor thread at the
-// display's rate, on the GPU when there is a Vulkan device (else, or with
-// --no-gpu-compositing, on the CPU), and scrolls on the scrolling thread,
+// display's rate, on the GPU when there is a Vulkan device that is not a
+// CPU's (else, or with --no-gpu-compositing or MLX_COMPOSITING=cpu, on the
+// CPU; MLX_COMPOSITING=gpu on any device), and scrolls on the scrolling thread,
 // PORT.md "Compositing"; with --no-compositing the view is painted whole through
 // GraphicsContextSkia, as before M8), and the pointer's, the wheel's and the keyboard's
 // events to it (WebCore's EventHandler; text typed into an editable
@@ -486,6 +487,7 @@ struct Engine {
     // VOYAGER_TRACE: the shown tab's compositor's counts last written.
     unsigned tracedPaints { 0 };
     unsigned tracedFrames { 0 };
+    bool tracedCompositing { false };
     MonotonicTime lastTrace;
 };
 
@@ -584,6 +586,13 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     settings.setScriptEnabled(true);
     if (engine.compositing) {
         tab->host = makeUnique<MlxLayerTreeHost>(*tab->page, MlxLayerTreeHost::Mode::Threaded);
+        // (With VOYAGER_TRACE, where the first tab composes and why: a
+        // software Vulkan device composes on the CPU unless
+        // MLX_COMPOSITING=gpu.)
+        if (engine.trace && !engine.tracedCompositing) {
+            engine.tracedCompositing = true;
+            fprintf(stderr, "voyager: compositing on the %s (%s)\n", tab->host->composesOnGPU() ? "GPU" : "CPU", tab->host->compositingReason().utf8().data());
+        }
         tab->host->setSize(size);
         tab->host->setFrameReadyCallback([&engine] {
             signalWindow(engine);

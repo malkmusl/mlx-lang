@@ -11,6 +11,12 @@ namespace WebCore {
 // (null) when there is no Vulkan device.
 void* mlxANGLEDisplay();
 
+// Whether ANGLE's Vulkan device is a CPU's (its VkPhysicalDeviceProperties'
+// deviceType VK_PHYSICAL_DEVICE_TYPE_CPU: lavapipe, llvmpipe,
+// SwiftShader), and its name (NAME, when given: "" without a device).
+// False without a display.
+bool mlxANGLEDeviceIsCPU(const char** name = nullptr);
+
 // PlatformDisplay::sharedDisplay() made over mlxANGLEDisplay() (once, on
 // the main thread: WebKit's GLDisplay is made there): what
 // TextureMapper, BitmapTexturePool and GLContext ask for. False when there

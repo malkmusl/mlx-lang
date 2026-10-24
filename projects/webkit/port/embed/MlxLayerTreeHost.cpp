@@ -50,6 +50,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
 #include <wtf/NeverDestroyed.h>
 #include <wtf/RunLoop.h>
 #include <wtf/SetForScope.h>
+#include <wtf/text/MakeString.h>
 #include <wtf/Threading.h>
 
 namespace WebCore {
@@ -355,12 +356,39 @@ void MlxLayerTreeHost::setGPUCompositingAllowed(bool allowed)
     s_gpuCompositingAllowed = allowed;
 }
 
-static bool gpuCompositingWanted()
+// Whether a host is to compose on the GPU, and why (compositingChoice):
+// MLX_COMPOSITING=cpu, or the embedder's setGPUCompositingAllowed(false),
+// the CPU; MLX_COMPOSITING=gpu, the GPU whatever the device; otherwise
+// the GPU unless ANGLE's Vulkan device is a CPU's (lavapipe, llvmpipe,
+// SwiftShader: TextureMapper's frames and their read back cost more there
+// than the CPU's compositor). WebGL uses ANGLE on whatever device there
+// is either way.
+static bool gpuCompositingWanted(String& reason)
 {
-    if (!s_gpuCompositingAllowed.load())
-        return false;
     const char* mode = getenv("MLX_COMPOSITING");
-    return !mode || strcmp(mode, "cpu");
+    if (mode && !strcmp(mode, "cpu")) {
+        reason = "MLX_COMPOSITING=cpu"_s;
+        return false;
+    }
+    if (!s_gpuCompositingAllowed.load()) {
+        reason = "the embedder's choice"_s;
+        return false;
+    }
+    if (mode && !strcmp(mode, "gpu")) {
+        reason = "MLX_COMPOSITING=gpu"_s;
+        return true;
+    }
+    if (!mlxANGLEDisplay()) {
+        reason = "no Vulkan device"_s;
+        return false;
+    }
+    const char* device = "";
+    if (mlxANGLEDeviceIsCPU(&device)) {
+        reason = makeString("a software Vulkan device, "_s, String::fromLatin1(device), "; MLX_COMPOSITING=gpu composes there"_s);
+        return false;
+    }
+    reason = makeString("Vulkan device "_s, String::fromLatin1(device));
+    return true;
 }
 
 // The compositor thread's GL context (ANGLE's, surfaceless, sharing its
@@ -489,7 +517,11 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
     }
     // On the GPU: the compositor's thread (in both modes) owns its GL
     // context; without one, the CPU's compositor.
-    bool gpu = gpuCompositingWanted() && mlxEnsureSharedDisplay();
+    bool gpu = gpuCompositingWanted(m_compositingReason);
+    if (gpu && !mlxEnsureSharedDisplay()) {
+        gpu = false;
+        m_compositingReason = "no GL context on ANGLE's display"_s;
+    }
     if (m_mode == Mode::Threaded || gpu)
         m_compositorQueue = WorkQueue::create("MlxCompositor"_s);
     if (gpu) {
@@ -497,9 +529,13 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
             m_gpu = GPUCompositor::create();
         });
         m_onGPU = !!m_gpu;
+        if (!m_onGPU)
+            m_compositingReason = "no GL context on ANGLE's display"_s;
         if (!m_onGPU && m_mode == Mode::Synchronous)
             m_compositorQueue = nullptr;
     }
+    if (!m_onGPU && getenv("MLX_TRACE_COMPOSITOR"))
+        fprintf(stderr, "compositor on the CPU: %s\n", m_compositingReason.utf8().data());
     if (m_onGPU) {
         m_globalDamage = std::make_shared<Damage>(IntSize(1, 1));
         m_rootLayer->setDamageInGlobalCoordinateSpace(m_globalDamage);
