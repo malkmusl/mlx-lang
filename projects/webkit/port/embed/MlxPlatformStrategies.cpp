@@ -22,8 +22,10 @@
 #include "port/embed/MlxSchemeHandler.h"
 #include "Document.h"
 #include "OriginAccessPatterns.h"
+#include "ProcessCapabilities.h"
 #include "SecurityOrigin.h"
 #include "port/MlxWebPort.h"
+#include "port/platform/graphics/mlx/MlxSkiaRoutines.h"
 #include <wtf/RunLoop.h>
 #include <wtf/text/CString.h>
 
@@ -269,6 +271,11 @@ void MlxPlatformStrategies::initialize()
 {
     static MlxPlatformStrategies* strategies = new MlxPlatformStrategies;
     setPlatformStrategies(strategies);
+    // (Every buffer of the process on the CPU: no GPU is used, so the
+    // layers' tiles and images are raster ones, PORT.md "Compositing".)
+    ProcessCapabilities::setCanUseAcceleratedBuffers(false);
+    // (Skia's row blends and fills, the port's: SkiaRoutinesMlx.cpp.)
+    installMlxSkiaRoutines();
 }
 
 LoaderStrategy* MlxPlatformStrategies::createLoaderStrategy()

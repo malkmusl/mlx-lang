@@ -44,6 +44,11 @@ unsigned PlatformDisplay::msaaSampleCount() const
     return 0;
 }
 
+size_t PlatformDisplay::maxSkiaResourceCacheBytes() const
+{
+    return 0;
+}
+
 bool GLContext::makeContextCurrent()
 {
     return false;
