@@ -287,6 +287,40 @@ mlx-cc compiles both as released now:
   chose. Checks: network 37 of 37 (a POST's attachment, a large
   download paused, resumed and cancelled, the list across two runs),
   check_voyager.sh's scenarios 18 to 21.
+- **M8, part 1, done** (composited layers on the CPU: scrolling,
+  animations; "Compositing" below): accelerated compositing on, with
+  WebKit's coordinated graphics (GraphicsLayerCoordinated, tiled backing
+  stores painted on demand, SkiaCompositingLayer) and its threaded
+  scrolling tree; the port's MlxLayerTreeHost composites on a thread of
+  its own at the display's rate (synchronously in webcore-dump), with
+  damage passed down to the wl_shm buffer's; wheel, Page Down and a
+  scrollbar's drag scroll without painting again; CSS animations of
+  transform and opacity run on the compositor's clock, as
+  requestAnimationFrame does (MlxDisplayRefreshMonitor); forced dark
+  and the port's theme as before. mlx-cc (epochs 15 and 16, tests
+  nestedfriendadl and implicitcopyvptr): argument-dependent lookup for
+  an operand of a nested class started in the class around it
+  (ScrollingStateNode's Variant comparisons), and an implicit copy
+  constructor did not store the class's vtable pointer (a copied
+  GraphicsLayerKeyframeValueList's values called through address 0 when
+  an animation started). mlx-profile samples a thread by name
+  (`--thread MlxCompositor`), lets the program run while it names a
+  sample's addresses, and names them by a binary search of an index of
+  each file's functions (Voyager, 1.5 GB: seconds an address before).
+  Its profiles: the compositor painted an animated 200x200 layer in
+  90 ms a frame (Skia's portable blends and its raster pipeline for a
+  tile's damaged parts); with the port's row blends and fills
+  (SkiaRoutinesMlx.cpp) and the compositing canvas's sprites, 3.5 ms
+  (60 frames a second). Scrolling a saved copy of
+  en.wikipedia.org/wiki/WebKit by 40 wheel events of 60 pixels, the
+  main thread (mlx-profile, from 60 s on, once laid out): without
+  compositing busy 3.2 s of the 5.5 s, 89% of it painting the view
+  again; composited 1.1 s, 33% of it recording the 10 tiles that come
+  into view, 31 frames composed. Checks: check_webkit_mlx_paint.sh 15 of
+  15 (composited.html, fixed.html, overflow.html, perspective.html,
+  composited.html@forcedark), check_webkit_mlx_compositing.sh 103 of
+  103 (WebKit's compositing/ layer trees), check_voyager.sh's
+  scenarios 22 and 23.
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -414,7 +448,7 @@ port in the tarball that builds WebCore without GLib).
 |---|---|---|
 | Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
 | Graphics | `USE_SKIA`, CPU raster; no `USE_CAIRO` | Skia compiles here already (`webkit-skia`); WebCore's only living 2D back end besides Cairo (GTK/WPE moved to Skia); CPU first, no EGL |
-| Compositing | `USE_TEXTURE_MAPPER` and `USE_COORDINATED_GRAPHICS` off; accelerated compositing off in the Page's settings | TextureMapper is GL; a view painted whole into a buffer needs no layers at first |
+| Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the CPU by `SkiaCompositingLayer`; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles and scrolling tree as they are; only TextureMapper's GL painter is left out ("Compositing") |
 | Network | neither `USE_SOUP` nor `USE_CURL` | A load is the embedder's (`LoaderStrategy`), over std.http and std.tls |
 | Images | WebCore's `ScalableImageDecoder`, with our PNG, JPEG and WebP decoders; WebKit's BMP, GIF, ICO as they are | WebCore's decoders call libpng, libjpeg, libwebp; ours call std.png, std.jpeg, std.webp |
 | Colour | `USE_LCMS` off, colour management in our decoders (std.colorprofile) | Little CMS is only the decoders' |
@@ -461,24 +495,133 @@ asks of it beyond JavaScriptCore (`u_strToTitle`, the `uset_*` of
 SmartReplace) is added there. It goes away with WebKit, when the
 translator turns those calls into std.unicode calls in Lattice.
 
-### Graphics: Skia on the CPU, a page painted whole
+### Graphics: Skia on the CPU
 
 WebCore paints through `GraphicsContext`, here `GraphicsContextSkia`
-(platform/graphics/skia, compiled as WebKit has it), into a Skia raster
-`SkSurface`. The embedder paints the `LocalFrameView` into a surface
-made over the pixels of a wl_shm buffer of our compositor's surface
-(std/src/wayland's client), then damages and commits it.
+(platform/graphics/skia, compiled as WebKit has it), into Skia raster
+surfaces. Without compositing (`webcore-dump --no-compositing`,
+`voyager --no-compositing`, as the port was until M8) the embedder paints
+the `LocalFrameView` whole into a surface made over the pixels of a
+wl_shm buffer of our compositor's surface (std/src/wayland's client),
+then damages and commits it.
 
-With accelerated compositing off in the Page's settings, the
-`RenderLayerCompositor` makes no `GraphicsLayer`s and the view paints
-through the layer tree in software, as WebKitLegacy's non-composited
-ports did. WebCore still links a `GraphicsLayer::create` (each port has
-one: GraphicsLayerTextureMapper.cpp, GraphicsLayerCoordinated.cpp); the
-port's is `GraphicsLayerMlx.cpp`, a layer that composites nothing. Later,
-for scrolling and animation off the main thread, layers composited by
-Skia on the CPU: 2.54's `SkiaCompositingLayer` does this for coordinated
-graphics, which is WebKit2's; for a single process our own
-`GraphicsLayer` over Skia (M8).
+### Compositing
+
+Since M8 accelerated compositing is on (`MlxLayerTreeHost::configure`:
+accelerated compositing, forced compositing mode, fixed position layers,
+asynchronous frame and overflow scrolling, damage propagation), on the
+CPU. What WebKit has for it, and what the port takes:
+
+- **The layers: WebKit's coordinated graphics, as they are.**
+  `GraphicsLayerCoordinated`, `CoordinatedPlatformLayer` (a layer's state
+  for the compositor, double-buffered under a lock),
+  `CoordinatedBackingStoreProxy` (256-pixel tiles over the visible rect
+  and a margin, painted when dirty or uncovered), the image backing
+  stores, `TextureMapperAnimation` (animations of transform, opacity and
+  filters played by the compositor) and `SkiaCompositingLayer` (2.54's
+  compositor of a layer tree on a Skia canvas: transforms, opacity,
+  clips, masks, preserve-3D's planes, and damage per frame) are compiled
+  from upstream (lists/webcore-mlx-sources-apart.txt,
+  `USE_COORDINATED_GRAPHICS`, `USE_TEXTURE_MAPPER` for TextureMapper's
+  animation and geometry sources, `ENABLE_DAMAGE_TRACKING`). WPE and GTK
+  use them in WebKit2's web process; a `GraphicsLayer` of the port's own
+  would have repeated their tiling, their animations and their
+  scrolling tree glue, and only coordinated graphics have
+  `SkiaCompositingLayer`. TextureMapper itself (its GL painter) is not
+  used: TextureMapperMlx.cpp, BitmapTextureMlx.cpp and
+  CoordinatedPlatformLayerBufferNativeImageMlx.cpp define what is named
+  of it, STUBs (`RELEASE_ASSERT_NOT_REACHED`) where only GL calls them.
+  `ProcessCapabilities::setCanUseAcceleratedBuffers(false)`: no display.
+- **The tiles' painting, the port's** (WebKit's files take GL for
+  granted): `SkiaPaintingEngineMlx.cpp` records a layer's dirty region on
+  the main thread (`GraphicsContextSkia` over an `SkPictureRecorder`) and
+  plays the recording back into each dirty tile's raster buffer on a
+  `WorkerPool` (half the cores, 1 to 8, `WEBKIT_SKIA_CPU_PAINTING_THREADS`
+  as WebKit reads it); `SkiaBackingStoreMlx.cpp` keeps the tiles as raster
+  `SkSurface`s on the compositor's side, copying in a buffer's dirty
+  rectangle when its painting is complete, and draws them (with the
+  damage's culling) for `SkiaCompositingLayer`.
+- **The host: `port/embed/MlxLayerTreeHost`**, what WebKit2's
+  `LayerTreeHost`, `ThreadedCompositor` and `DrawingArea` are to WPE, in
+  one process: the chrome client's `GraphicsLayerFactory`,
+  `attachRootGraphicsLayer`, `triggerRenderingUpdate`,
+  `displayRefreshMonitorFactory`, `createScrollingCoordinator` and
+  `ensureScrollbarsController` go to it; it is the layers'
+  `CoordinatedPlatformLayer::Client` and keeps the scene
+  (`CoordinatedSceneState`'s committed layers). A rendering update
+  (`Page::updateRendering`, the layers' flush, the scene committed) is on
+  the main thread; the compositor (a `WorkQueue`, "MlxCompositor") paints
+  the committed scene into the frame's pixels (`SkSurfaces::WrapPixels`)
+  with `SkiaCompositingLayer::paint` and the frame's damage, and tells
+  the embedder a frame is ready. Two modes: **Threaded** (Voyager) and
+  **Synchronous** (webcore-dump: `composite()` flushes and paints on the
+  calling thread, for tests).
+- **The frame clock: `MlxDisplayLink`**, a thread ticking at the
+  display's rate (60 Hz; `MLX_REFRESH_RATE` 1 to 240), started only while
+  someone wants frames: the compositor while animations run or a
+  scroll animates, and the port's `DisplayRefreshMonitor`
+  (`MlxDisplayRefreshMonitor`), which dispatches `displayDidRefresh` to
+  the main thread, so `requestAnimationFrame` and the rendering updates
+  follow the compositor's frames, not timers.
+- **Scrolling off the main thread**: `ThreadedScrollingCoordinator` with
+  `ScrollingTreeCoordinated` (WebKit's, `ENABLE_ASYNC_SCROLLING`,
+  `ENABLE_SCROLLING_THREAD`, `ENABLE_WHEEL_EVENT_REGIONS`,
+  `ENABLE_KINETIC_SCROLLING`): the frame and `overflow: scroll` boxes are
+  scrolling nodes; `MlxLayerTreeHost::handleWheelEvent` does what
+  WebKit2's `EventDispatcher` does (the scrolling tree asked on the
+  scrolling thread whether it takes the event, the main thread's
+  handlers only when a wheel event region or a non-fast-scrollable area
+  needs them), and the scrolling tree moves the layers'
+  positions in the compositor's scene, with fixed and sticky nodes kept
+  in place, without a rendering update: no tile is painted for a scroll
+  unless new tiles come into view. Keys and a scrollbar's drag go
+  through the main thread (EventHandler, the scroll animators), which
+  hands the new position to the scrolling tree: the layers move, and
+  only what comes into view is painted.
+  Scrollbars are layers: `MlxScrollbarsController` (WebKit2's
+  `ScrollbarsControllerCoordinated`, on `ScrollbarsController`: the
+  generic controller's `create` would be a second definition) and
+  `ScrollerCoordinatedMlx.cpp` (WebKit's ScrollerCoordinated.cpp draws
+  with GL textures; the port's draws the Adwaita overlay scrollbar into a
+  raster image, the layer's contents).
+- **Damage**: each frame's damage (`SkiaCompositingLayer`'s, the layers'
+  changed and moved rectangles) goes with the frame
+  (`MlxLayerTreeHost::takeFrame`: up to 32 rectangles, else the whole
+  view), and Voyager passes it on: std.ui's panel damages only those
+  rectangles of the wl_shm buffer (`ui.host.damage`, at most 16, else the
+  whole), so a blinking caret or an animated box uploads only itself.
+
+Skia's portable paths (projects/webkit/skia.mlx) are slow under mlx-cc
+where they go a pixel at a time through SkVx's arrays or the raster
+pipeline: the port sets SkOpts's row blends and fills to plain integer
+versions (SkiaRoutinesMlx.cpp, the same results), and the compositor
+paints through `MlxCompositingCanvas`, which draws a damaged part of a
+tile at whole pixels as the whole tile under a clip (a sprite: rows
+copied or blended) rather than as an image shader. `MLX_TRACE_COMPOSITOR`
+prints each frame's times (the flush, the wait for the frame's pixels,
+the paint), `MLX_TRACE_LAYER_PAINTS` each recording of a layer.
+
+Voyager presents frames as they come: the compositor wakes the window's
+loop through a pipe (`RunLoop::setWakeUpCallback`, `ui.host.watchDescriptor`),
+and the window copies the frame and commits it. `VOYAGER_TRACE=1` prints
+`voyager: compositor paints N frames M fps F`: N the layers' recordings
+on the main thread, M the frames composited, F the compositor's frames in
+the last second; tools/check_voyager.sh scrolls a long page (frames
+composited, no recording) and runs a CSS animation (no recording, the
+compositor at the display's rate, `requestAnimationFrame` at it too).
+
+webcore-dump composites too, synchronously (`--no-compositing`: the view
+painted whole, as before M8): `--png` is the composited frame, `--layers`
+prints the layer tree after the render tree
+(`RenderLayerCompositor::layerTreeAsText`), and with `--test` a page has
+`internals.layerTreeAsText(document, flags)` and its `LAYER_TREE_*`
+flags (a shim of the test runner's: WebCore's testing library, with the
+rest of `internals`, is not built). tools/check_webkit_mlx_paint.sh paints
+composited pages (transforms and opacity on their own layers, fixed
+positions over a scrolled page, an `overflow: scroll` box scrolled,
+perspective without 3D) against references, and
+tools/check_webkit_mlx_compositing.sh compares WebKit's compositing/
+tests' layer trees (tests/layout/compositing.txt).
 
 Encoding images (`toDataURL`, `toBlob`): `ImageUtilitiesSkia.cpp` is not
 compiled (it calls Skia's encoders, which call libpng, libjpeg and libwebp,
@@ -554,7 +697,17 @@ light page: its canvas, Ahem text and boxes inverted, its image's pixels
 kept), and pages with designs of their own (`scheme.html@forcedark`,
 color-scheme; `mediadark.html@forcedark`, a media query alone) left as
 they are. Content WebCore paints into an image buffer of its own first
-(CSS filters, masks) is composited as an image: not darkened.
+(CSS filters, masks) is composited as an image: not darkened. With
+compositing (M8) the filter is where the layers are painted: a layer's
+contents are recorded through `MlxDarkModeCanvas` (SkiaPaintingEngineMlx.cpp,
+when the host is told the page is forced dark: `setForcedDark` repaints
+every layer), so its tiles hold darkened colours and its images as they
+are, and the compositor paints through one too, for what it draws itself
+(a layer's solid colour, the view's background); the tiles and image
+layers it draws are images, untouched. tools/check_webkit_mlx_paint.sh
+paints composited now (webcore-dump's default): `forcedark.html@forcedark`
+keeps its image's pixels through the layers, `composited.html@forcedark`
+darkens layers with transforms and opacity.
 
 ### Images
 
@@ -1025,7 +1178,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
 | M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh and check_webkit_mlx_crypto.sh, the network check's downloads and uploads, check_voyager.sh's (done, both parts) |
-| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | |
+| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done) |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
 compile); the port's sources for M2 can be written beside it, since each
@@ -1071,10 +1224,6 @@ none is solved by a patch.
   with neither without members or functions it needs. The port's
   `platform/network/mlx` headers supply what an include path can;
   a member declared only under one backend's `#if` cannot be added.
-- **`GraphicsLayer` without compositing.** Whether WebCore paints
-  correctly with accelerated compositing off in 2.54 (fixed and sticky
-  positioning, transforms, opacity, `will-change`) is to be seen at M4;
-  if not, the port's `GraphicsLayer` over Skia comes forward from M8.
 - **Shaping without HarfBuzz's API.** `SkiaHarfBuzzFont.h` (with
   `hb_font_t`) is part of FontPlatformData's Skia half: our shaping can
   replace ComplexTextControllerSkia.cpp, but the header keeps HarfBuzz's
@@ -1154,8 +1303,8 @@ What M2 found, and how the port meets it without a patch:
   and `platformBadResponseError` (soup's and curl's: a stub until M6), and
   texmap's BitmapTexture (`~BitmapTexture`, `updateContents`,
   `createSkiaBackendTexture`, which SkiaGPUAtlas names for its GL path:
-  BitmapTextureMlx.cpp, a stub until M8, as no texture is ever made
-  without a display). Skia's src/core/SkStrikeRef.cpp, which WebKit's
+  BitmapTextureMlx.cpp, stubs, as no texture is ever made
+  without a display: M8's compositing paints raster tiles). Skia's src/core/SkStrikeRef.cpp, which WebKit's
   CMake list leaves out though SkFont::makeStrikeRef needs it (a shared
   libWPEWebKit tolerates the name undefined), is in lists/skia.txt. The
   sources lists/skia-skipped.txt leaves out (SkXMLParser for expat,
@@ -1210,3 +1359,39 @@ What M2 found, and how the port meets it without a patch:
   read. A download that is no GET cannot be resumed (pausing it cancels
   it); there is no dialog to choose a name or a folder (Safari's default
   has none either). The file chooser has no previews.
+- **What M8's first part leaves** (composited layers on the CPU):
+  - Voyager presents a frame on its window's thread, which is WebCore's
+    main thread: the compositor composites, scrolls and animates on its
+    own, but a long script or layout on the main thread holds the frame
+    until it ends (WebKit2's compositor presents to the UI process
+    itself). std.ui's window on a thread of its own, the engine's main
+    thread beside it, would end that.
+  - The frame clock is 60 Hz (`MLX_REFRESH_RATE`), not the output's
+    (wl_output's mode, wp_presentation's feedback).
+  - The chrome clients (Voyager's, webcore-dump's) derive from WebCore's
+    EmptyChromeClient and override members it declares `final`
+    (`attachRootGraphicsLayer`, `triggerRenderingUpdate`,
+    `displayRefreshMonitorFactory` and others, as `createWindow` already
+    was): mlx-cc accepts it, a conforming compiler would not. A
+    ChromeClient of the port's own, whole, is the way out.
+  - Overlay scrollbars are not shown (as before M8: no
+    ScrollbarsControllerGeneric to fade them in, whose `create` is a
+    second definition of ScrollbarsController's), though a drag of one
+    scrolls; their layers' contents are drawn on the CPU
+    (ScrollerCoordinatedMlx.cpp) once they show.
+  - TextureMapper's GL painter, BitmapTexture and the GPU's tile and
+    image buffers are STUBs: compositing on the GPU (Ganesh over
+    std.gpu's Vulkan) is later.
+  - Skia under mlx-cc takes its portable paths (no vector registers):
+    the port's row blends and fills (SkiaRoutinesMlx.cpp) and the
+    compositor's sprites (MlxCompositingCanvas) make translated layers
+    cheap (an animated layer of 200x200 in 3.5 ms a frame, was 90 ms),
+    but a scaled or rotated layer's tiles, filters and masks still go
+    through the raster pipeline a pixel at a time.
+  - 103 of the 374 tests of compositing/ that dump a layer tree pass
+    (tests/layout/compositing.txt). The others: functions of
+    `internals` webcore-dump's shim does not have (its settings,
+    repaint tracking, `setUsesOverlayScrollbars`), the generic
+    expectations' layer sizes from macOS's fonts, tile coverage and
+    visible rects (`LAYER_TREE_INCLUDES_*` WebKit2 fills), iframes'
+    text in dumpAsText, and layers WebKit2's drawing area adds.
