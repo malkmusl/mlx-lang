@@ -8,7 +8,7 @@ function keeps. The compiler's symbol table names each function
 `path:line:name`; C libraries are named by their own symbols.
 
 ```
-mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
+mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] [--thread NAME] PROGRAM [ARGUMENT...]
 ```
 
 - `--every`: how often to stop the program (default 5 ms).
@@ -22,6 +22,13 @@ mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall
   `PTRACE_INTERRUPT` of the main thread alone: a stop signal would halt
   every thread, and a program waiting on a thread of its own (a Vulkan
   driver's) would stand still.
+- `--thread`: the thread of that name is sampled instead (its
+  `/proc/PID/task/TID/comm`, as `pthread_setname_np` set it: WebKit's
+  threads have their names, a compositor's "MlxCompositor", 15 bytes at
+  most), seized once it is there; the main thread runs on, its signals
+  passed on. The thread runs on while a sample's addresses are named
+  (the symbol tables of a large program take a while the first time an
+  address is seen): `mlx-profile --thread MlxCompositor voyager PAGE`.
 
 At the end it prints the functions most of the time went to, then what the
 program took as its main thread ended: processor time of every thread
