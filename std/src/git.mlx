@@ -1,0 +1,1174 @@
+// std.git: a repository of git's read without the git program: found from
+// a directory, its references resolved, its objects read (loose and
+// packed, deltas applied), its commits parsed, and the commits reachable
+// from one counted, as `git rev-list --count` counts them. What the build
+// numbers of the toolchain are made of (build.mlx, mlx-build-number):
+//
+//     const git = @import("std.git")
+//
+//     var number: git.BuildNumber = undefined
+//     const status = git.buildNumberOf(".", "VERSION", &number)
+//     ... number.version() "0.1", number.build 1211, number.commit
+//     (Status.noRepository: a tree without .git, "0.1.dev") ...
+//
+//     var repository = git.Repository.init()
+//     if git.open(&repository, ".") != git.Status.ok { ... "dev": no repository }
+//     var head: git.Id = undefined
+//     if git.headCommit(&repository, &head) != git.Status.ok { ... }
+//     var count: git.Count = undefined
+//     if git.commitCount(&repository, head, &count) != git.Status.ok { ... }
+//     ... count.commits, count.shallow (the history stops at a shallow
+//     clone's boundary), git.writeHex(&head, bytes) ...
+//     // repository.deinit() runs where it goes out of scope
+//
+//     var object = git.Object.init()
+//     if git.readObject(&repository, head, &object) == git.Status.ok && object.kind == git.Kind.commit {
+//         var commit: git.Commit = undefined
+//         if git.parseCommit(object.bytes(), &commit) { ... commit.author.name, git.parent(&commit, 0) ... }
+//     }
+//
+// open finds the repository as git does: DIRECTORY or the nearest one
+// above it with a .git directory, or a .git file ("gitdir: PATH", a
+// worktree's or a submodule's), or that is a bare repository itself. A
+// worktree's git directory names the main repository's in `commondir`:
+// the objects, the branches (refs/...) and packed-refs are there, HEAD
+// and the worktree's own refs (refs/bisect, refs/worktree...) in its own.
+// The objects are the loose ones (objects/XX/..., zlib's data, std.flate)
+// and those of every pack (std/src/git/pack.mlx: the index looked up by
+// binary search, the pack mapped, a delta's base found by offset or by
+// name), and those of the alternates (objects/info/alternates).
+//
+// A shallow clone's .git/shallow names the commits whose parents it does
+// not have: the count stops there, as git's does, and says so
+// (Count.shallow). What this reader does not read is Status.unsupported:
+// the reftable format of refs, and repositories of SHA-256 names.
+const std = @import("std")
+const flate = @import("./flate.mlx")
+const pack = @import("./git/pack.mlx")
+
+// O_CLOEXEC, for the files opened.
+const CLOSE_ON_EXEC: usize = 524288
+
+// What a call answers.
+pub const Status = enum(u8) {
+    ok,
+    // No repository in the directory or any above it (a program says
+    // "dev" for its version then).
+    noRepository,
+    // The reference names no object (a branch without commits yet).
+    noReference,
+    // An object asked for is in no pack and no loose file.
+    missingObject,
+    // A file of the repository is not what git writes.
+    damaged,
+    // The reftable format, SHA-256 names.
+    unsupported,
+    // A tree has no entry of that path.
+    noEntry,
+    noMemory,
+}
+
+// What STATUS means, for a message.
+pub fn describe(status: Status) -> []const u8 {
+    if status == Status.ok { return "ok" }
+    if status == Status.noRepository { return "not in a git repository" }
+    if status == Status.noReference { return "the reference names no object" }
+    if status == Status.missingObject { return "an object is missing" }
+    if status == Status.damaged { return "the repository is damaged" }
+    if status == Status.unsupported { return "the repository's format is not supported (reftable, SHA-256)" }
+    if status == Status.noEntry { return "no such path in the tree" }
+    return "out of memory"
+}
+
+// An object's name: the SHA-1 of its contents.
+pub const Id = struct {
+    bytes: [20]u8
+}
+
+// The kinds of object.
+pub const Kind = enum(u8) { none, commit, tree, blob, tag }
+
+// TEXT (40 hexadecimal digits) as a name into *ID; false when it is not one.
+pub fn parseId(text: []const u8, id: *Id) -> bool {
+    if text.length != 40 { return false }
+    var index: usize = 0
+    while index < 20 {
+        const high = digit(text[index * 2])
+        const low = digit(text[index * 2 + 1])
+        if high > 15 || low > 15 { return false }
+        id.*.bytes[index] = (high << 4) | low
+        index += 1
+    }
+    return true
+}
+
+fn digit(c: u8) -> u8 {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return 255
+}
+
+// ID's 40 hexadecimal digits (lowercase) into INTO (40 bytes).
+pub fn writeHex(id: *const Id, into: [*]u8) -> void {
+    const digits = "0123456789abcdef"
+    var index: usize = 0
+    while index < 20 {
+        into[index * 2] = digits[@intCast(usize, id.*.bytes[index] >> 4)]
+        into[index * 2 + 1] = digits[@intCast(usize, id.*.bytes[index] & 15)]
+        index += 1
+    }
+}
+
+pub fn same(left: *const Id, right: *const Id) -> bool {
+    var index: usize = 0
+    while index < 20 {
+        if left.*.bytes[index] != right.*.bytes[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// A link of a chain of deltas: the delta at DATA_AT of pack PACK_INDEX,
+// SIZE bytes once inflated.
+const Link = struct {
+    packIndex: usize
+    // Where its entry starts (what the object made of it is cached by).
+    offset: usize
+    dataAt: usize
+    size: usize
+}
+
+// The longest chain of deltas followed (git makes them 50 long, 4095 at
+// the most).
+const CHAIN_LIMIT: usize = 10000
+
+// A repository opened (open), and what reading it keeps: its packs
+// mapped, the shallow commits, buffers. Its deinit gives all back.
+pub const Repository = @noncopy(struct) {
+    // The git directory: DIR/.git, a worktree's (.git/worktrees/NAME),
+    // or a bare repository.
+    gitDirectory: std.ArrayList(u8)
+    // Where the objects, refs and packed-refs are (`commondir`; the git
+    // directory itself without one).
+    commonDirectory: std.ArrayList(u8)
+    // The directory checked out (empty for a bare repository).
+    workTree: std.ArrayList(u8)
+    // The object directories, a line each: the repository's, then its
+    // alternates'.
+    objectDirectories: std.ArrayList(u8)
+    packs: std.ArrayList(pack.Pack)
+    // The commits of .git/shallow.
+    shallow: std.AutoHashSet(Id)
+    // Buffers kept from one read to the next.
+    path: std.ArrayList(u8)
+    scratch: std.ArrayList(u8)
+    delta: std.ArrayList(u8)
+    target: std.ArrayList(u8)
+    chain: std.ArrayList(Link)
+    // The objects made of deltas lately (readPacked).
+    cache: std.ArrayList(Slot)
+    cacheBytes: usize
+
+    pub fn init() -> Self {
+        const allocator = std.heap.allocator()
+        return Self.{
+            .gitDirectory = std.ArrayList(u8).init(allocator),
+            .commonDirectory = std.ArrayList(u8).init(allocator),
+            .workTree = std.ArrayList(u8).init(allocator),
+            .objectDirectories = std.ArrayList(u8).init(allocator),
+            .packs = std.ArrayList(pack.Pack).init(allocator),
+            .shallow = std.AutoHashSet(Id).init(allocator),
+            .path = std.ArrayList(u8).init(allocator),
+            .scratch = std.ArrayList(u8).init(allocator),
+            .delta = std.ArrayList(u8).init(allocator),
+            .target = std.ArrayList(u8).init(allocator),
+            .chain = std.ArrayList(Link).init(allocator),
+            .cache = std.ArrayList(Slot).init(allocator),
+            .cacheBytes = 0,
+        }
+    }
+
+    pub fn deinit(self: *Self) -> void {
+        closePacks(self)
+        self.*.gitDirectory.deinit()
+        self.*.commonDirectory.deinit()
+        self.*.workTree.deinit()
+        self.*.objectDirectories.deinit()
+        self.*.packs.deinit()
+        self.*.shallow.deinit()
+        self.*.path.deinit()
+        self.*.scratch.deinit()
+        self.*.delta.deinit()
+        self.*.target.deinit()
+        self.*.chain.deinit()
+        self.*.cache.deinit()
+    }
+
+    // Whether the repository is a shallow clone (.git/shallow).
+    pub fn isShallow(self: *const Self) -> bool { return self.*.shallow.count() > 0 }
+}
+
+fn closePacks(repository: *Repository) -> void {
+    cacheClear(repository)
+    var index: usize = 0
+    const packs = repository.*.packs.items()
+    while index < packs.length {
+        pack.close(&packs[index])
+        index += 1
+    }
+    repository.*.packs.clearRetainingCapacity()
+}
+
+// An object read: its kind and its bytes (without git's "KIND SIZE\0"
+// header), kept until the next read into it.
+pub const Object = @noncopy(struct) {
+    kind: Kind
+    data: std.ArrayList(u8)
+
+    pub fn init() -> Self {
+        return Self.{ .kind = Kind.none, .data = std.ArrayList(u8).init(std.heap.allocator()) }
+    }
+
+    pub fn deinit(self: *Self) -> void { self.*.data.deinit() }
+
+    pub fn bytes(self: *const Self) -> []const u8 { return self.*.data.items() }
+}
+
+// ---------------------------------------------------------------------------
+// Files and paths
+
+// LEFT and RIGHT into INTO with a NUL after them (INTO's items are the
+// path and its NUL, for cPath); false without memory.
+fn joinPath(into: *std.ArrayList(u8), left: []const u8, right: []const u8) -> bool {
+    into.*.clearRetainingCapacity()
+    return into.*.appendSlice(left) && into.*.appendSlice(right) && into.*.append(0)
+}
+
+// The path made by joinPath, for a call that wants a C string.
+fn cPath(list: *const std.ArrayList(u8)) -> [*]const u8 {
+    return list.*.items().pointer
+}
+
+// The file PATH whole into INTO; false when it cannot be read (missing,
+// a directory) or there is no memory.
+fn readFile(path: [*]const u8, into: *std.ArrayList(u8)) -> bool {
+    into.*.clearRetainingCapacity()
+    const file = std.fs.open(path, std.fs.READ_ONLY | CLOSE_ON_EXEC, 0)
+    if !std.fs.isValid(file) { return false }
+    var ok = true
+    while true {
+        const length = into.*.count()
+        if !into.*.resize(length + 65536) {
+            ok = false
+            break
+        }
+        const got = std.fs.read(file, into.*.items()[length..length + 65536].pointer, 65536)
+        if got < 0 {
+            _ = into.*.resize(length)
+            ok = false
+            break
+        }
+        _ = into.*.resize(length + @intCast(usize, got))
+        if got == 0 { break }
+    }
+    _ = std.fs.close(file)
+    return ok
+}
+
+// TEXT without the spaces and line ends around it.
+fn trimmed(text: []const u8) -> []const u8 {
+    var start: usize = 0
+    var end = text.length
+    while start < end && (text[start] == 32 || text[start] == 10 || text[start] == 13 || text[start] == 9) { start += 1 }
+    while end > start && (text[end - 1] == 32 || text[end - 1] == 10 || text[end - 1] == 13 || text[end - 1] == 9) { end -= 1 }
+    return text[start..end]
+}
+
+// The line of TEXT at *AT (without its line feed), *AT moved past it.
+fn nextLine(text: []const u8, position: *usize) -> []const u8 {
+    const start = position.*
+    var end = start
+    while end < text.length && text[end] != 10 { end += 1 }
+    position.* = if end < text.length { end + 1 } else { end }
+    return text[start..end]
+}
+
+// PATH with its "." and ".." taken out and no slash at its end ("/"
+// alone stays), into INTO; PATH is absolute.
+fn normalize(path: []const u8, into: *std.ArrayList(u8)) -> bool {
+    into.*.clearRetainingCapacity()
+    var position: usize = 0
+    while position < path.length {
+        while position < path.length && path[position] == 47 { position += 1 }
+        const start = position
+        while position < path.length && path[position] != 47 { position += 1 }
+        const part = path[start..position]
+        if part.length == 0 || (part.length == 1 && part[0] == 46) { continue }
+        if part.length == 2 && part[0] == 46 && part[1] == 46 {
+            var length = into.*.count()
+            while length > 0 && into.*.items()[length - 1] != 47 { length -= 1 }
+            if length > 0 { length -= 1 }
+            _ = into.*.resize(length)
+            continue
+        }
+        if !into.*.append(47) || !into.*.appendSlice(part) { return false }
+    }
+    if into.*.count() == 0 { return into.*.append(47) }
+    return true
+}
+
+// PATH made absolute (relative to BASE when it is not) and normalized
+// into INTO.
+fn absoluteFrom(base: []const u8, path: []const u8, into: *std.ArrayList(u8)) -> bool {
+    if path.length > 0 && path[0] == 47 { return normalize(path, into) }
+    var joined = std.ArrayList(u8).init(std.heap.allocator())
+    if !joined.appendSlice(base) || !joined.append(47) || !joined.appendSlice(path) { return false }
+    return normalize(joined.items(), into)
+}
+
+// The directory the program runs in, into INTO.
+fn workingDirectory(into: *std.ArrayList(u8)) -> bool {
+    into.*.clearRetainingCapacity()
+    if !into.*.resize(4096) { return false }
+    if std.fs.getWorkingDirectory(into.*.items().pointer, 4096) <= 0 { return false }
+    var length: usize = 0
+    while length < 4096 && into.*.items()[length] != 0 { length += 1 }
+    return into.*.resize(length)
+}
+
+fn isDirectory(list: *const std.ArrayList(u8)) -> bool { return std.fs.isDirectory(cPath(list)) }
+
+fn exists(list: *const std.ArrayList(u8)) -> bool { return std.fs.exists(cPath(list)) }
+
+// ---------------------------------------------------------------------------
+// Opening a repository
+
+// The repository of DIRECTORY (or the nearest directory above it that has
+// one) into REPOSITORY, which is emptied first: Status.ok,
+// noRepository, damaged (a .git file that names no git directory),
+// unsupported (reftable refs).
+pub fn open(repository: *Repository, directory: []const u8) -> Status {
+    closePacks(repository)
+    repository.*.gitDirectory.clearRetainingCapacity()
+    repository.*.commonDirectory.clearRetainingCapacity()
+    repository.*.workTree.clearRetainingCapacity()
+    repository.*.objectDirectories.clearRetainingCapacity()
+    repository.*.shallow.clearRetainingCapacity()
+    const allocator = std.heap.allocator()
+    var current = std.ArrayList(u8).init(allocator)
+    var base = std.ArrayList(u8).init(allocator)
+    if !workingDirectory(&base) { return Status.noMemory }
+    if !absoluteFrom(base.items(), if directory.length == 0 { "." } else { directory }, &current) { return Status.noMemory }
+    const path = &repository.*.path
+    var found = false
+    while !found {
+        const here = current.items()
+        // (The root "/" is "" before the name.)
+        if !joinPath(path, if here.length == 1 { "" } else { here }, "/.git") { return Status.noMemory }
+        if isDirectory(path) {
+            _ = repository.*.gitDirectory.appendSlice(path.*.items()[0..path.*.count() - 1])
+            _ = repository.*.workTree.appendSlice(here)
+            found = true
+        } else if exists(path) {
+            // A .git file: "gitdir: PATH", relative to the directory it is in.
+            if !readFile(cPath(path), &repository.*.scratch) { return Status.damaged }
+            const text = trimmed(repository.*.scratch.items())
+            if text.length < 9 || !std.text.same(text[0..8], "gitdir: ") { return Status.damaged }
+            var named = std.ArrayList(u8).init(allocator)
+            if !named.appendSlice(trimmed(text[8..text.length])) { return Status.noMemory }
+            if !absoluteFrom(here, named.items(), &repository.*.gitDirectory) { return Status.noMemory }
+            _ = repository.*.workTree.appendSlice(here)
+            found = true
+        } else if isBare(path, here) {
+            _ = repository.*.gitDirectory.appendSlice(here)
+            found = true
+        } else {
+            if here.length == 1 { return Status.noRepository }
+            var length = here.length
+            while length > 1 && here[length - 1] != 47 { length -= 1 }
+            if length > 1 { length -= 1 }
+            _ = current.resize(length)
+        }
+    }
+    const git = repository.*.gitDirectory.items()
+    if !joinPath(path, git, "/HEAD") { return Status.noMemory }
+    if !exists(path) { return Status.noRepository }
+    // A worktree's commondir: the main repository's git directory.
+    if !joinPath(path, git, "/commondir") { return Status.noMemory }
+    if readFile(cPath(path), &repository.*.scratch) {
+        var named = std.ArrayList(u8).init(allocator)
+        if !named.appendSlice(trimmed(repository.*.scratch.items())) { return Status.noMemory }
+        if !absoluteFrom(git, named.items(), &repository.*.commonDirectory) { return Status.noMemory }
+    } else {
+        if !repository.*.commonDirectory.appendSlice(git) { return Status.noMemory }
+    }
+    const common = repository.*.commonDirectory.items()
+    if !joinPath(path, common, "/reftable") { return Status.noMemory }
+    if isDirectory(path) { return Status.unsupported }
+    // The objects: the repository's and its alternates' (theirs too).
+    if !joinPath(path, common, "/objects") { return Status.noMemory }
+    var directories = std.ArrayList(u8).init(allocator)
+    if !directories.appendSlice(path.*.items()[0..path.*.count() - 1]) || !directories.append(10) { return Status.noMemory }
+    var position: usize = 0
+    var seen: usize = 0
+    while position < directories.count() && seen < 16 {
+        var objects = std.ArrayList(u8).init(allocator)
+        if !objects.appendSlice(nextLine(directories.items(), &position)) { return Status.noMemory }
+        seen += 1
+        if !repository.*.objectDirectories.appendSlice(objects.items()) || !repository.*.objectDirectories.append(10) { return Status.noMemory }
+        const status = openPacks(repository, objects.items())
+        if status != Status.ok { return status }
+        if !joinPath(path, objects.items(), "/info/alternates") { return Status.noMemory }
+        if readFile(cPath(path), &repository.*.scratch) {
+            var at: usize = 0
+            const text = repository.*.scratch.items()
+            while at < text.length {
+                const line = trimmed(nextLine(text, &at))
+                if line.length == 0 || line[0] == 35 { continue }
+                var absolute = std.ArrayList(u8).init(allocator)
+                if !absoluteFrom(objects.items(), line, &absolute) { return Status.noMemory }
+                if !directories.appendSlice(absolute.items()) || !directories.append(10) { return Status.noMemory }
+            }
+        }
+    }
+    // A shallow clone's boundary.
+    if !joinPath(path, common, "/shallow") { return Status.noMemory }
+    if readFile(cPath(path), &repository.*.scratch) {
+        var at: usize = 0
+        const text = repository.*.scratch.items()
+        while at < text.length {
+            const line = trimmed(nextLine(text, &at))
+            if line.length == 0 { continue }
+            var id: Id = undefined
+            if !parseId(line, &id) { return Status.damaged }
+            if !repository.*.shallow.insert(id) { return Status.noMemory }
+        }
+    }
+    return Status.ok
+}
+
+// Whether HERE is a bare repository (HEAD, objects and refs in it); PATH
+// is a buffer.
+fn isBare(path: *std.ArrayList(u8), here: []const u8) -> bool {
+    for name in [3][]const u8{ "/HEAD", "/objects", "/refs" } {
+        if !joinPath(path, here, name) || !exists(path) { return false }
+    }
+    if !joinPath(path, here, "/objects") { return false }
+    return isDirectory(path)
+}
+
+// The packs of the object directory OBJECTS (OBJECTS/pack/*.idx and their
+// .pack), mapped.
+fn openPacks(repository: *Repository, objects: []const u8) -> Status {
+    const allocator = std.heap.allocator()
+    var directory = std.ArrayList(u8).init(allocator)
+    if !joinPath(&directory, objects, "/pack") { return Status.noMemory }
+    const handle = std.fs.open(cPath(&directory), std.fs.READ_ONLY | std.fs.DIRECTORY | CLOSE_ON_EXEC, 0)
+    if !std.fs.isValid(handle) { return Status.ok }
+    var names = std.ArrayList(u8).init(allocator)
+    var buffer: [8192]u8 = undefined
+    const bytes: [*]u8 = &buffer
+    var reader = std.fs.entries(handle, bytes, 8192)
+    var entry: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &entry) {
+        const name: []const u8 = unsafe { entry.name.pointer[0..entry.name.length] }
+        if name.length > 4 && std.text.same(name[name.length - 4..name.length], ".idx") {
+            if !names.appendSlice(name[0..name.length - 4]) || !names.append(10) {
+                _ = std.fs.close(handle)
+                return Status.noMemory
+            }
+        }
+    }
+    _ = std.fs.close(handle)
+    var index = std.ArrayList(u8).init(allocator)
+    var data = std.ArrayList(u8).init(allocator)
+    var at: usize = 0
+    while at < names.count() {
+        const stem = nextLine(names.items(), &at)
+        index.clearRetainingCapacity()
+        if !index.appendSlice(directory.items()[0..directory.count() - 1]) || !index.append(47) || !index.appendSlice(stem) || !index.appendSlice(".idx") || !index.append(0) { return Status.noMemory }
+        data.clearRetainingCapacity()
+        if !data.appendSlice(directory.items()[0..directory.count() - 1]) || !data.append(47) || !data.appendSlice(stem) || !data.appendSlice(".pack") || !data.append(0) { return Status.noMemory }
+        var opened: pack.Pack = undefined
+        // (A pack being written has its .idx last; one that does not open
+        // is passed over, as git does.)
+        if pack.open(cPath(&index), cPath(&data), &opened) {
+            if !repository.*.packs.append(opened) {
+                pack.close(&opened)
+                return Status.noMemory
+            }
+        }
+    }
+    return Status.ok
+}
+
+// ---------------------------------------------------------------------------
+// References
+
+// Whether the reference NAME is a worktree's own (in its git directory,
+// not the common one): HEAD and the other pseudo-references, refs/bisect,
+// refs/worktree, refs/rewritten.
+fn isWorktreeOwn(name: []const u8) -> bool {
+    if !std.text.startsWith(name, "refs/") { return true }
+    return std.text.startsWith(name, "refs/bisect/") || std.text.startsWith(name, "refs/worktree/") || std.text.startsWith(name, "refs/rewritten/")
+}
+
+// The object the reference NAME ("HEAD", "refs/heads/main") names, symbolic
+// references followed ("ref: refs/heads/main"), a loose file before a line
+// of packed-refs: Status.ok, noReference, damaged, noMemory.
+pub fn resolveReference(repository: *Repository, name: []const u8, id: *Id) -> Status {
+    var current = std.ArrayList(u8).init(std.heap.allocator())
+    if !current.appendSlice(name) { return Status.noMemory }
+    const path = &repository.*.path
+    var depth: usize = 0
+    while depth < 10 {
+        depth += 1
+        const reference = current.items()
+        if reference.length == 0 { return Status.noReference }
+        // (A name of ".." would leave the repository.)
+        if std.text.contains(reference, "..") { return Status.noReference }
+        const directory = if isWorktreeOwn(reference) { repository.*.gitDirectory.items() } else { repository.*.commonDirectory.items() }
+        path.*.clearRetainingCapacity()
+        if !path.*.appendSlice(directory) || !path.*.append(47) || !path.*.appendSlice(reference) || !path.*.append(0) { return Status.noMemory }
+        if readFile(cPath(path), &repository.*.scratch) {
+            const text = trimmed(repository.*.scratch.items())
+            if text.length > 5 && std.text.same(text[0..5], "ref: ") {
+                var target = std.ArrayList(u8).init(std.heap.allocator())
+                if !target.appendSlice(trimmed(text[5..text.length])) { return Status.noMemory }
+                current.clearRetainingCapacity()
+                if !current.appendSlice(target.items()) { return Status.noMemory }
+                continue
+            }
+            if text.length == 64 { return Status.unsupported }
+            if parseId(text, id) { return Status.ok }
+            return Status.damaged
+        }
+        return packedReference(repository, reference, id)
+    }
+    return Status.damaged
+}
+
+// NAME's line in packed-refs ("NAME_HEX NAME"; "^HEX" lines are the
+// objects tags peel to).
+fn packedReference(repository: *Repository, name: []const u8, id: *Id) -> Status {
+    if !joinPath(&repository.*.path, repository.*.commonDirectory.items(), "/packed-refs") { return Status.noMemory }
+    if !readFile(cPath(&repository.*.path), &repository.*.scratch) { return Status.noReference }
+    const text = repository.*.scratch.items()
+    var at: usize = 0
+    while at < text.length {
+        const line = trimmed(nextLine(text, &at))
+        if line.length != 41 + name.length || line[40] != 32 { continue }
+        if !std.text.same(line[41..line.length], name) { continue }
+        if parseId(line[0..40], id) { return Status.ok }
+        return Status.damaged
+    }
+    return Status.noReference
+}
+
+// The commit HEAD names (a tag it names peeled): Status.ok, noReference
+// (a branch without commits yet), and the others of resolveReference and
+// readObject.
+pub fn headCommit(repository: *Repository, id: *Id) -> Status {
+    const status = resolveReference(repository, "HEAD", id)
+    if status != Status.ok { return status }
+    return peelToCommit(repository, id)
+}
+
+// *ID, a tag (or tags in turn), replaced by the commit it names.
+pub fn peelToCommit(repository: *Repository, id: *Id) -> Status {
+    var object = Object.init()
+    var depth: usize = 0
+    while depth < 16 {
+        depth += 1
+        const status = readObject(repository, id.*, &object)
+        if status != Status.ok { return status }
+        if object.kind == Kind.commit { return Status.ok }
+        if object.kind != Kind.tag { return Status.noReference }
+        const text = object.bytes()
+        if text.length < 48 || !std.text.same(text[0..7], "object ") || text[47] != 10 { return Status.damaged }
+        if !parseId(text[7..47], id) { return Status.damaged }
+    }
+    return Status.damaged
+}
+
+// ---------------------------------------------------------------------------
+// Objects
+
+// The object ID into OBJECT: from a pack when one has it, else its loose
+// file. Status.ok, missingObject, damaged, noMemory.
+pub fn readObject(repository: *Repository, id: Id, object: *Object) -> Status {
+    var name = id
+    const bytes: [*]const u8 = &name.bytes
+    var index: usize = 0
+    while index < repository.*.packs.count() {
+        const offset = pack.find(&repository.*.packs.items()[index], bytes)
+        if offset != pack.NOT_FOUND { return readPacked(repository, index, offset, object) }
+        index += 1
+    }
+    return readLoose(repository, &name, object)
+}
+
+// Where the object NAME is in the packs: *PACK_INDEX and *OFFSET; false
+// when in none.
+fn findPacked(repository: *Repository, name: [*]const u8, packIndex: *usize, offset: *usize) -> bool {
+    var index: usize = 0
+    while index < repository.*.packs.count() {
+        const found = pack.find(&repository.*.packs.items()[index], name)
+        if found != pack.NOT_FOUND {
+            packIndex.* = index
+            offset.* = found
+            return true
+        }
+        index += 1
+    }
+    return false
+}
+
+fn kindOf(code: u8) -> Kind {
+    if code == pack.COMMIT { return Kind.commit }
+    if code == pack.TREE { return Kind.tree }
+    if code == pack.BLOB { return Kind.blob }
+    if code == pack.TAG { return Kind.tag }
+    return Kind.none
+}
+
+// The packed object at OFFSET of pack PACK_INDEX into OBJECT: its chain of
+// deltas followed down to a base (in the cache of bases, in a pack, or a
+// loose object), then applied from the base up, each object made on the
+// way kept in the cache (the next object of a chain is mostly made from
+// the same bases).
+fn readPacked(repository: *Repository, packIndex: usize, offset: usize, object: *Object) -> Status {
+    repository.*.chain.clearRetainingCapacity()
+    var current = packIndex
+    var position = offset
+    while true {
+        if repository.*.chain.count() > CHAIN_LIMIT { return Status.damaged }
+        if cacheTake(repository, cacheKey(current, position), object) { break }
+        const packs = repository.*.packs.items()
+        var header: pack.Header = undefined
+        if !pack.readHeader(&packs[current], position, &header) { return Status.damaged }
+        if header.kind == pack.OFS_DELTA || header.kind == pack.REF_DELTA {
+            if !repository.*.chain.append(Link.{ .packIndex = current, .offset = position, .dataAt = header.dataAt, .size = header.size }) { return Status.noMemory }
+            if header.kind == pack.OFS_DELTA {
+                position = header.baseOffset
+                continue
+            }
+            const base: [*]const u8 = unsafe { @ptrFromInt([*]const u8, header.baseName) }
+            if findPacked(repository, base, &current, &position) { continue }
+            var name: Id = undefined
+            std.mem.copy(&name.bytes, base, 20)
+            const status = readLoose(repository, &name, object)
+            if status != Status.ok { return status }
+            break
+        }
+        object.*.kind = kindOf(header.kind)
+        if !pack.inflate(&packs[current], header.dataAt, header.size, &object.*.data) { return Status.damaged }
+        if repository.*.chain.count() > 0 { cachePut(repository, cacheKey(current, position), object) }
+        break
+    }
+    var link = repository.*.chain.count()
+    while link > 0 {
+        link -= 1
+        const step = repository.*.chain.items()[link]
+        if !pack.inflate(&repository.*.packs.items()[step.packIndex], step.dataAt, step.size, &repository.*.delta) { return Status.damaged }
+        if !pack.applyDelta(object.*.data.items(), repository.*.delta.items(), &repository.*.target) { return Status.damaged }
+        object.*.data.clearRetainingCapacity()
+        if !object.*.data.appendSlice(repository.*.target.items()) { return Status.noMemory }
+        cachePut(repository, cacheKey(step.packIndex, step.offset), object)
+    }
+    return Status.ok
+}
+
+// The cache of objects made of deltas (and their bases): a slot for each
+// of CACHE_SLOTS keys (a pack and an offset), objects up to CACHE_LARGEST
+// bytes, emptied when it holds more than CACHE_BYTES.
+const CACHE_SLOTS: usize = 512
+const CACHE_LARGEST: usize = 1048576
+const CACHE_BYTES: usize = 67108864
+
+const Slot = struct {
+    // (0: empty.)
+    key: u64
+    kind: Kind
+    bytes: usize
+    length: usize
+}
+
+fn cacheKey(packIndex: usize, offset: usize) -> u64 {
+    return (@intCast(u64, packIndex + 1) << 48) | @intCast(u64, offset)
+}
+
+fn slotOf(key: u64) -> usize {
+    return @intCast(usize, (key *% 0x9e3779b97f4a7c15) >> 55)
+}
+
+// The object of KEY from the cache into OBJECT; false when it is not there.
+fn cacheTake(repository: *Repository, key: u64, object: *Object) -> bool {
+    if repository.*.cache.count() != CACHE_SLOTS { return false }
+    const slot = repository.*.cache.items()[slotOf(key)]
+    if slot.key != key { return false }
+    object.*.kind = slot.kind
+    object.*.data.clearRetainingCapacity()
+    const bytes: [*]const u8 = unsafe { @ptrFromInt([*]const u8, slot.bytes) }
+    return object.*.data.appendSlice(bytes[0..slot.length])
+}
+
+// OBJECT kept in the cache as the object of KEY (when there is memory).
+fn cachePut(repository: *Repository, key: u64, object: *const Object) -> void {
+    const data = object.*.data.items()
+    if data.length > CACHE_LARGEST || data.length == 0 { return }
+    if repository.*.cache.count() != CACHE_SLOTS {
+        if !repository.*.cache.resize(CACHE_SLOTS) { return }
+        var index: usize = 0
+        while index < CACHE_SLOTS {
+            repository.*.cache.items()[index] = Slot.{ .key = 0, .kind = Kind.none, .bytes = 0, .length = 0 }
+            index += 1
+        }
+    }
+    if repository.*.cacheBytes + data.length > CACHE_BYTES { cacheClear(repository) }
+    const allocator = std.heap.allocator()
+    const slot = &repository.*.cache.items()[slotOf(key)]
+    if slot.*.key != 0 {
+        allocator.free(unsafe { @ptrFromInt([*]u8, slot.*.bytes) }, slot.*.length, 1)
+        repository.*.cacheBytes -= slot.*.length
+        slot.*.key = 0
+    }
+    const memory = allocator.alloc(data.length, 1)
+    if memory == null { return }
+    std.mem.copy(memory.?, data.pointer, data.length)
+    slot.*.key = key
+    slot.*.kind = object.*.kind
+    slot.*.bytes = @intFromPtr(memory.?)
+    slot.*.length = data.length
+    repository.*.cacheBytes += data.length
+}
+
+// Every object of the cache given back.
+fn cacheClear(repository: *Repository) -> void {
+    const allocator = std.heap.allocator()
+    const slots = repository.*.cache.items()
+    var index: usize = 0
+    while index < slots.length {
+        if slots[index].key != 0 {
+            allocator.free(unsafe { @ptrFromInt([*]u8, slots[index].bytes) }, slots[index].length, 1)
+            slots[index].key = 0
+        }
+        index += 1
+    }
+    repository.*.cacheBytes = 0
+}
+
+// The loose object NAME (OBJECTS/XX/REST, zlib's data of "KIND SIZE\0"
+// and the bytes) into OBJECT, from the first object directory that has it.
+fn readLoose(repository: *Repository, name: *const Id, object: *Object) -> Status {
+    var hex: [41]u8 = undefined
+    const digits: [*]u8 = &hex
+    writeHex(name, digits)
+    const directories = repository.*.objectDirectories.items()
+    var at: usize = 0
+    while at < directories.length {
+        const directory = nextLine(directories, &at)
+        const path = &repository.*.path
+        path.*.clearRetainingCapacity()
+        if !path.*.appendSlice(directory) || !path.*.append(47) || !path.*.appendSlice(digits[0..2]) || !path.*.append(47) || !path.*.appendSlice(digits[2..40]) || !path.*.append(0) { return Status.noMemory }
+        if !readFile(cPath(path), &repository.*.scratch) { continue }
+        const compressed = repository.*.scratch.items()
+        var inflated: flate.Buffer = undefined
+        const status = flate.decompressAlloc(std.heap.allocator(), compressed.pointer, compressed.length, flate.Format.zlib, &inflated)
+        if status == flate.Status.noMemory { return Status.noMemory }
+        if status != flate.Status.done { return Status.damaged }
+        const whole = inflated.bytes[0..inflated.length]
+        var result = Status.damaged
+        var space: usize = 0
+        while space < whole.length && whole[space] != 32 { space += 1 }
+        var end = space
+        while end < whole.length && whole[end] != 0 { end += 1 }
+        if space < whole.length && end < whole.length {
+            const kind = whole[0..space]
+            object.*.kind = Kind.none
+            if std.text.same(kind, "commit") { object.*.kind = Kind.commit }
+            if std.text.same(kind, "tree") { object.*.kind = Kind.tree }
+            if std.text.same(kind, "blob") { object.*.kind = Kind.blob }
+            if std.text.same(kind, "tag") { object.*.kind = Kind.tag }
+            var size: usize = 0
+            var digit_at = space + 1
+            while digit_at < end && whole[digit_at] >= 48 && whole[digit_at] <= 57 {
+                size = size * 10 + @intCast(usize, whole[digit_at] - 48)
+                digit_at += 1
+            }
+            if object.*.kind != Kind.none && digit_at == end && size == whole.length - end - 1 {
+                object.*.data.clearRetainingCapacity()
+                result = if object.*.data.appendSlice(whole[end + 1..whole.length]) { Status.ok } else { Status.noMemory }
+            }
+        }
+        flate.freeBuffer(std.heap.allocator(), &inflated)
+        return result
+    }
+    return Status.missingObject
+}
+
+// ---------------------------------------------------------------------------
+// Commits
+
+// A person and a time of a commit: "NAME <EMAIL> SECONDS ZONE".
+pub const Person = struct {
+    name: []const u8
+    email: []const u8
+    // Seconds since 1970-01-01 UTC, and the zone as written ("+0200").
+    time: i64
+    zone: []const u8
+}
+
+// A commit parsed: slices of the object's bytes, valid while they are.
+pub const Commit = struct {
+    tree: Id
+    parentCount: usize
+    // The "parent NAME" lines, PARENT_LINE bytes each (parent() reads one).
+    parentLines: []const u8
+    author: Person
+    committer: Person
+    // What follows the header and its empty line.
+    message: []const u8
+}
+
+const PARENT_LINE: usize = 48
+
+// The commit DATA (a commit object's bytes) into *COMMIT; false when it is
+// not one.
+pub fn parseCommit(data: []const u8, commit: *Commit) -> bool {
+    var at: usize = 0
+    var haveTree = false
+    var parentsAt: usize = 0
+    var parentsEnd: usize = 0
+    commit.*.parentCount = 0
+    commit.*.author = Person.{ .name = "", .email = "", .time = 0, .zone = "" }
+    commit.*.committer = commit.*.author
+    commit.*.message = ""
+    while at < data.length {
+        const start = at
+        const line = nextLine(data, &at)
+        if line.length == 0 {
+            commit.*.message = data[at..data.length]
+            break
+        }
+        if std.text.startsWith(line, "tree ") {
+            if haveTree || !parseId(line[5..line.length], &commit.*.tree) { return false }
+            haveTree = true
+        } else if std.text.startsWith(line, "parent ") {
+            var id: Id = undefined
+            if !haveTree || !parseId(line[7..line.length], &id) { return false }
+            if commit.*.parentCount == 0 { parentsAt = start }
+            // (The parents follow one another.)
+            if commit.*.parentCount > 0 && start != parentsEnd { return false }
+            parentsEnd = at
+            commit.*.parentCount += 1
+        } else if std.text.startsWith(line, "author ") {
+            if !parsePerson(line[7..line.length], &commit.*.author) { return false }
+        } else if std.text.startsWith(line, "committer ") {
+            if !parsePerson(line[10..line.length], &commit.*.committer) { return false }
+        }
+        // (Other headers, and the lines that continue one (gpgsig), are
+        // passed over.)
+    }
+    commit.*.parentLines = data[parentsAt..parentsEnd]
+    return haveTree
+}
+
+// The parent INDEX of COMMIT (below its parentCount).
+pub fn parent(commit: *const Commit, index: usize) -> Id {
+    var id: Id = undefined
+    const line = commit.*.parentLines[index * PARENT_LINE..index * PARENT_LINE + 47]
+    _ = parseId(line[7..47], &id)
+    return id
+}
+
+// "NAME <EMAIL> SECONDS ZONE" into *PERSON.
+fn parsePerson(text: []const u8, person: *Person) -> bool {
+    var open: usize = 0
+    while open < text.length && text[open] != 60 { open += 1 }
+    var close = open
+    while close < text.length && text[close] != 62 { close += 1 }
+    if close >= text.length { return false }
+    var nameEnd = open
+    while nameEnd > 0 && text[nameEnd - 1] == 32 { nameEnd -= 1 }
+    person.*.name = text[0..nameEnd]
+    person.*.email = text[open + 1..close]
+    var at = close + 1
+    while at < text.length && text[at] == 32 { at += 1 }
+    var seconds: i64 = 0
+    var negative = false
+    if at < text.length && text[at] == 45 {
+        negative = true
+        at += 1
+    }
+    while at < text.length && text[at] >= 48 && text[at] <= 57 {
+        seconds = seconds * 10 + @intCast(i64, text[at] - 48)
+        at += 1
+    }
+    person.*.time = if negative { -seconds } else { seconds }
+    while at < text.length && text[at] == 32 { at += 1 }
+    person.*.zone = text[at..text.length]
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Counting
+
+// What commitCount counted.
+pub const Count = struct {
+    // The commits reachable from the one asked about, it included.
+    commits: usize
+    // Whether the walk met a commit of a shallow clone's boundary, whose
+    // parents the repository does not have: the history goes on further
+    // back than what was counted.
+    shallow: bool
+}
+
+// The number of distinct commits reachable from ID (a commit, or a tag
+// that names one) through all their parents, as `git rev-list --count ID`
+// prints it, into *COUNT. Each commit is read once (a set of those seen).
+pub fn commitCount(repository: *Repository, id: Id, count: *Count) -> Status {
+    var seen = std.AutoHashSet(Id).init(std.heap.allocator())
+    return walk(repository, id, &seen, count)
+}
+
+// The number of commits reachable from ID that are not reachable from
+// EXCLUDED, as `git rev-list --count ID ^EXCLUDED` prints it, into *COUNT.
+pub fn commitCountExcluding(repository: *Repository, id: Id, excluded: Id, count: *Count) -> Status {
+    var seen = std.AutoHashSet(Id).init(std.heap.allocator())
+    var before: Count = undefined
+    const status = walk(repository, excluded, &seen, &before)
+    if status != Status.ok { return status }
+    return walk(repository, id, &seen, count)
+}
+
+// The commits reachable from ID that are not in SEEN, put in it and
+// counted into *COUNT.
+fn walk(repository: *Repository, id: Id, seen: *std.AutoHashSet(Id), count: *Count) -> Status {
+    count.*.commits = 0
+    count.*.shallow = false
+    var start = id
+    const peeled = peelToCommit(repository, &start)
+    if peeled != Status.ok { return peeled }
+    if seen.*.contains(start) { return Status.ok }
+    var pending = std.ArrayList(Id).init(std.heap.allocator())
+    var object = Object.init()
+    if !seen.*.insert(start) || !pending.append(start) { return Status.noMemory }
+    while true {
+        const next = pending.pop()
+        if next == null { break }
+        const commitId = next.?
+        const status = readObject(repository, commitId, &object)
+        if status != Status.ok { return status }
+        if object.kind != Kind.commit { return Status.damaged }
+        count.*.commits += 1
+        if repository.*.shallow.contains(commitId) {
+            count.*.shallow = true
+            continue
+        }
+        var commit: Commit = undefined
+        if !parseCommit(object.bytes(), &commit) { return Status.damaged }
+        var index: usize = 0
+        while index < commit.parentCount {
+            const parentId = parent(&commit, index)
+            if !seen.*.contains(parentId) {
+                if !seen.*.insert(parentId) || !pending.append(parentId) { return Status.noMemory }
+            }
+            index += 1
+        }
+    }
+    return Status.ok
+}
+
+// The commit checked out in DIRECTORY's repository and the number of
+// commits reachable from it, at once: *COMMIT and *COUNT.
+// Status.noRepository when there is none.
+pub fn headCount(directory: []const u8, commit: *Id, count: *Count) -> Status {
+    var repository = Repository.init()
+    var status = open(&repository, directory)
+    if status != Status.ok { return status }
+    status = headCommit(&repository, commit)
+    if status != Status.ok { return status }
+    return commitCount(&repository, commit.*, count)
+}
+
+// ---------------------------------------------------------------------------
+// Trees
+
+// The entry NAME of the tree DATA (a tree object's bytes: "MODE NAME\0"
+// and 20 bytes of name, sorted) into *ID; false when it has none.
+pub fn treeEntry(data: []const u8, name: []const u8, id: *Id) -> bool {
+    var at: usize = 0
+    while at < data.length {
+        var space = at
+        while space < data.length && data[space] != 32 { space += 1 }
+        var end = space
+        while end < data.length && data[end] != 0 { end += 1 }
+        if end + 21 > data.length { return false }
+        if std.text.same(data[space + 1..end], name) {
+            std.mem.copy(&id.*.bytes, data[end + 1..end + 21].pointer, 20)
+            return true
+        }
+        at = end + 21
+    }
+    return false
+}
+
+// The object at PATH ("VERSION", "projects/voyager/VERSION") of the tree
+// TREE into *ID: Status.ok, noEntry, and those of readObject.
+pub fn treePath(repository: *Repository, tree: Id, path: []const u8, id: *Id) -> Status {
+    var object = Object.init()
+    var current = tree
+    var at: usize = 0
+    while true {
+        const start = at
+        while at < path.length && path[at] != 47 { at += 1 }
+        const name = path[start..at]
+        const status = readObject(repository, current, &object)
+        if status != Status.ok { return status }
+        if object.kind != Kind.tree { return Status.noEntry }
+        if name.length == 0 || !treeEntry(object.bytes(), name, &current) { return Status.noEntry }
+        if at >= path.length {
+            id.* = current
+            return Status.ok
+        }
+        at += 1
+    }
+    return Status.noEntry
+}
+
+// ---------------------------------------------------------------------------
+// Build numbers
+
+// A build number: MAJOR.MINOR as the project's VERSION file says, and the
+// build, the number of commits since that file last changed.
+pub const BuildNumber = struct {
+    // VERSION's first line ("0.1"; "0.0" without the file), versionLength
+    // bytes of versionBytes (version() is the slice).
+    versionBytes: [32]u8
+    versionLength: usize
+    // The commits reachable from HEAD that are not reachable from the
+    // commit that last changed VERSION's content, that commit counted:
+    // the commit changing the version is build 1, the next ones 2, 3...
+    // Until VERSION's content changes (its first commit does not count as
+    // a change), every commit reachable from HEAD (`git rev-list --count
+    // HEAD`).
+    build: usize
+    // HEAD's commit.
+    commit: Id
+    // Whether a commit changed VERSION's content, and which (the last one
+    // before HEAD on its first-parent line).
+    changed: bool
+    versionCommit: Id
+    // Whether the count stopped at a shallow clone's boundary.
+    shallow: bool
+
+    // The version, "0.1".
+    pub fn version(self: *const Self) -> []const u8 { return self.*.versionBytes[0..self.*.versionLength] }
+}
+
+// HEAD's build number in REPOSITORY with the version of its VERSION_PATH
+// ("VERSION", at the root of HEAD's tree) into *NUMBER. The commit that
+// last changed the version is found on HEAD's first-parent line: the
+// first commit whose first parent's VERSION has other bytes (one where
+// the file is missing is where it was made, not changed).
+pub fn buildNumber(repository: *Repository, versionPath: []const u8, number: *BuildNumber) -> Status {
+    number.*.versionLength = 0
+    number.*.build = 0
+    number.*.changed = false
+    number.*.shallow = false
+    var status = headCommit(repository, &number.*.commit)
+    if status != Status.ok { return status }
+    var object = Object.init()
+    // HEAD's VERSION, and its bytes.
+    var current = number.*.commit
+    var blob: Id = undefined
+    var haveVersion = false
+    status = versionOf(repository, current, versionPath, &object, &blob)
+    if status == Status.ok {
+        haveVersion = true
+        status = readObject(repository, blob, &object)
+        if status != Status.ok { return status }
+        var line = object.bytes()
+        var end: usize = 0
+        while end < line.length && line[end] != 10 { end += 1 }
+        line = trimmed(line[0..end])
+        if line.length > 32 { line = line[0..32] }
+        std.mem.copy(&number.*.versionBytes, line.pointer, line.length)
+        number.*.versionLength = line.length
+    } else if status != Status.noEntry {
+        return status
+    } else {
+        std.mem.copy(&number.*.versionBytes, "0.0".pointer, 3)
+        number.*.versionLength = 3
+    }
+    // Down the first parents while VERSION stays the same.
+    while haveVersion {
+        if repository.*.shallow.contains(current) { break }
+        status = readObject(repository, current, &object)
+        if status != Status.ok { return status }
+        var commit: Commit = undefined
+        if object.kind != Kind.commit || !parseCommit(object.bytes(), &commit) { return Status.damaged }
+        if commit.parentCount == 0 { break }
+        const first = parent(&commit, 0)
+        var before: Id = undefined
+        status = versionOf(repository, first, versionPath, &object, &before)
+        if status == Status.noEntry { break }
+        if status != Status.ok { return status }
+        if !same(&before, &blob) {
+            number.*.changed = true
+            number.*.versionCommit = current
+            break
+        }
+        current = first
+    }
+    var count: Count = undefined
+    if number.*.changed {
+        status = commitCountExcluding(repository, number.*.commit, number.*.versionCommit, &count)
+        number.*.build = count.commits + 1
+    } else {
+        status = commitCount(repository, number.*.commit, &count)
+        number.*.build = count.commits
+    }
+    number.*.shallow = count.shallow
+    return status
+}
+
+// The name of PATH in the tree of the commit COMMIT into *BLOB (OBJECT a
+// buffer).
+fn versionOf(repository: *Repository, commit: Id, path: []const u8, object: *Object, blob: *Id) -> Status {
+    const status = readObject(repository, commit, object)
+    if status != Status.ok { return status }
+    var parsed: Commit = undefined
+    if object.*.kind != Kind.commit || !parseCommit(object.*.bytes(), &parsed) { return Status.damaged }
+    return treePath(repository, parsed.tree, path, blob)
+}
+
+// DIRECTORY's repository opened and its build number made (buildNumber)
+// into *NUMBER. Without a repository (Status.noRepository), the version is
+// still the one of DIRECTORY/VERSION_PATH when there is that file (the
+// build of a tree without .git is "dev").
+pub fn buildNumberOf(directory: []const u8, versionPath: []const u8, number: *BuildNumber) -> Status {
+    var repository = Repository.init()
+    const status = open(&repository, directory)
+    if status == Status.ok { return buildNumber(&repository, versionPath, number) }
+    number.*.build = 0
+    number.*.changed = false
+    number.*.shallow = false
+    std.mem.copy(&number.*.versionBytes, "0.0".pointer, 3)
+    number.*.versionLength = 3
+    var path = std.ArrayList(u8).init(std.heap.allocator())
+    var text = std.ArrayList(u8).init(std.heap.allocator())
+    if joinPath(&path, directory, "/") && path.resize(path.count() - 1) && path.appendSlice(versionPath) && path.append(0) && readFile(cPath(&path), &text) {
+        var line: []const u8 = text.items()
+        var end: usize = 0
+        while end < line.length && line[end] != 10 { end += 1 }
+        line = trimmed(line[0..end])
+        if line.length > 0 && line.length <= 32 {
+            std.mem.copy(&number.*.versionBytes, line.pointer, line.length)
+            number.*.versionLength = line.length
+        }
+    }
+    return status
+}

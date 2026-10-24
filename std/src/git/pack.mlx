@@ -1,0 +1,334 @@
+// std.git's packs: a pack file and its index mapped whole (read-only), an
+// object found by its name in the index (binary search in the range of
+// its first byte), an object's header in the pack read, its compressed
+// bytes inflated, and a delta applied to its base. std/src/git.mlx
+// resolves the chains of deltas (OFS_DELTA in the same pack, REF_DELTA by
+// name in any pack or a loose object) with these.
+//
+// The formats are git's (Documentation/gitformat-pack.txt): an index of
+// version 2 ("\377tOc", 2, the fan-out table, the names sorted, their
+// CRCs, 31-bit offsets and the 64-bit offsets they point to) or version 1
+// (the fan-out table, then offset and name side by side); a pack ("PACK",
+// version 2 or 3, the count), each object a header (its type and size in
+// a variable-length number), the base of a delta (a negative offset or a
+// name), and zlib's data.
+const std = @import("std")
+const flate = @import("../flate.mlx")
+
+// O_CLOEXEC, for the files opened.
+const CLOSE_ON_EXEC: usize = 524288
+
+// The kinds of a pack's entries (the 3-bit type of its header).
+pub const COMMIT: u8 = 1
+pub const TREE: u8 = 2
+pub const BLOB: u8 = 3
+pub const TAG: u8 = 4
+pub const OFS_DELTA: u8 = 6
+pub const REF_DELTA: u8 = 7
+
+// What find answers for a name the index does not have.
+pub const NOT_FOUND: usize = 18446744073709551615
+
+// A pack and its index, mapped.
+pub const Pack = struct {
+    index: usize
+    indexLength: usize
+    data: usize
+    dataLength: usize
+    // The objects, and where the index's tables start.
+    count: usize
+    version: u32
+    names: usize
+    offsets: usize
+    large: usize
+}
+
+// The header of the entry at an offset of a pack.
+pub const Header = struct {
+    kind: u8
+    // The size of the object (of the delta, for a delta) once inflated.
+    size: usize
+    // Where its zlib data starts.
+    dataAt: usize
+    // OFS_DELTA: the offset of its base in the same pack.
+    baseOffset: usize
+    // REF_DELTA: the address of its base's 20-byte name in the pack.
+    baseName: usize
+}
+
+fn at(address: usize) -> [*]const u8 {
+    unsafe { return @ptrFromInt([*]const u8, address) }
+}
+
+fn big32(address: usize) -> usize {
+    const bytes = at(address)
+    return (@intCast(usize, bytes[0]) << 24) | (@intCast(usize, bytes[1]) << 16) | (@intCast(usize, bytes[2]) << 8) | @intCast(usize, bytes[3])
+}
+
+// PATH (NUL-terminated) mapped read-only whole: its address and length
+// in *ADDRESS and *LENGTH; false when it cannot be opened or mapped.
+fn mapFile(path: [*]const u8, address: *usize, length: *usize) -> bool {
+    const file = std.fs.open(path, std.fs.READ_ONLY | CLOSE_ON_EXEC, 0)
+    if !std.fs.isValid(file) { return false }
+    var status: std.fs.Stat = undefined
+    if std.fs.fileStatus(file, &status) != 0 || status.size <= 0 {
+        _ = std.fs.close(file)
+        return false
+    }
+    const size = @intCast(usize, status.size)
+    const mapped = std.linux.mmap(0, size, std.linux.PROT_READ, std.linux.MAP_PRIVATE, file.descriptor, 0)
+    _ = std.fs.close(file)
+    if std.linux.failed(mapped) { return false }
+    address.* = @bitCast(usize, mapped)
+    length.* = size
+    return true
+}
+
+// The pack whose index is INDEX_PATH and whose data is DATA_PATH (both
+// NUL-terminated) into *PACK, mapped; false when either cannot be read or
+// is not what git writes (close gives the mappings back).
+pub fn open(indexPath: [*]const u8, dataPath: [*]const u8, pack: *Pack) -> bool {
+    pack.*.index = 0
+    pack.*.data = 0
+    if !mapFile(indexPath, &pack.*.index, &pack.*.indexLength) { return false }
+    if !mapFile(dataPath, &pack.*.data, &pack.*.dataLength) {
+        close(pack)
+        return false
+    }
+    const index = at(pack.*.index)
+    const data = at(pack.*.data)
+    // The pack: "PACK", version 2 or 3, the number of objects.
+    if pack.*.dataLength < 32 || data[0] != 80 || data[1] != 65 || data[2] != 67 || data[3] != 75 {
+        close(pack)
+        return false
+    }
+    // The index: version 2 starts "\377tOc" 2; version 1 with the table.
+    var table = pack.*.index
+    pack.*.version = 1
+    if pack.*.indexLength >= 8 && index[0] == 255 && index[1] == 116 && index[2] == 79 && index[3] == 99 {
+        if big32(pack.*.index + 4) != 2 {
+            close(pack)
+            return false
+        }
+        pack.*.version = 2
+        table = pack.*.index + 8
+    }
+    if table + 1024 > pack.*.index + pack.*.indexLength {
+        close(pack)
+        return false
+    }
+    pack.*.count = big32(table + 1020)
+    const count = pack.*.count
+    const start = table + 1024
+    if pack.*.version == 2 {
+        pack.*.names = start
+        pack.*.offsets = start + count * 24
+        pack.*.large = start + count * 28
+        if pack.*.large + 40 > pack.*.index + pack.*.indexLength {
+            close(pack)
+            return false
+        }
+    } else {
+        pack.*.names = start + 4
+        pack.*.offsets = start
+        pack.*.large = 0
+        if start + count * 24 + 40 > pack.*.index + pack.*.indexLength {
+            close(pack)
+            return false
+        }
+    }
+    if big32(pack.*.data + 8) != count {
+        close(pack)
+        return false
+    }
+    return true
+}
+
+// Gives back the mappings of PACK.
+pub fn close(pack: *Pack) -> void {
+    if pack.*.index != 0 { std.linux.munmap(pack.*.index, pack.*.indexLength) }
+    if pack.*.data != 0 { std.linux.munmap(pack.*.data, pack.*.dataLength) }
+    pack.*.index = 0
+    pack.*.data = 0
+}
+
+// The name of the index's entry POSITION (its address).
+fn nameAt(pack: *const Pack, position: usize) -> usize {
+    if pack.*.version == 2 { return pack.*.names + position * 20 }
+    return pack.*.names + position * 24
+}
+
+// The offset in the pack of the object whose 20-byte name is at NAME,
+// NOT_FOUND when the index has no such object.
+pub fn find(pack: *const Pack, name: [*]const u8) -> usize {
+    const table = if pack.*.version == 2 { pack.*.index + 8 } else { pack.*.index }
+    const first = @intCast(usize, name[0])
+    var low: usize = if first == 0 { 0 } else { big32(table + (first - 1) * 4) }
+    var high = big32(table + first * 4)
+    if high > pack.*.count { return NOT_FOUND }
+    while low < high {
+        const middle = low + (high - low) / 2
+        const candidate = at(nameAt(pack, middle))
+        var order: i32 = 0
+        var byte: usize = 0
+        while byte < 20 {
+            if candidate[byte] != name[byte] {
+                order = if candidate[byte] < name[byte] { -1 } else { 1 }
+                break
+            }
+            byte += 1
+        }
+        if order == 0 { return offsetAt(pack, middle) }
+        if order < 0 { low = middle + 1 } else { high = middle }
+    }
+    return NOT_FOUND
+}
+
+fn offsetAt(pack: *const Pack, position: usize) -> usize {
+    if pack.*.version == 1 { return big32(pack.*.offsets + position * 24) }
+    const small = big32(pack.*.offsets + position * 4)
+    if small & 0x80000000 == 0 { return small }
+    // An index into the table of 64-bit offsets.
+    const entry = pack.*.large + (small & 0x7fffffff) * 8
+    if entry + 8 > pack.*.index + pack.*.indexLength { return NOT_FOUND }
+    return (big32(entry) << 32) | big32(entry + 4)
+}
+
+// The header of the entry at OFFSET into *HEADER; false when it is not
+// one (out of the pack, or damaged).
+pub fn readHeader(pack: *const Pack, offset: usize, header: *Header) -> bool {
+    // (The last 20 bytes of a pack are its checksum.)
+    const end = pack.*.dataLength - 20
+    if offset < 12 || offset >= end { return false }
+    const data = at(pack.*.data)
+    var position = offset
+    var byte = data[position]
+    position += 1
+    header.*.kind = (byte >> 4) & 7
+    var size = @intCast(usize, byte & 15)
+    var shift: usize = 4
+    while byte & 128 != 0 {
+        if position >= end || shift > 57 { return false }
+        byte = data[position]
+        position += 1
+        size = size | (@intCast(usize, byte & 127) << shift)
+        shift += 7
+    }
+    header.*.size = size
+    header.*.baseOffset = 0
+    header.*.baseName = 0
+    if header.*.kind == OFS_DELTA {
+        if position >= end { return false }
+        byte = data[position]
+        position += 1
+        var distance = @intCast(usize, byte & 127)
+        while byte & 128 != 0 {
+            if position >= end || distance > 0x00ffffffffffffff { return false }
+            byte = data[position]
+            position += 1
+            distance = ((distance + 1) << 7) | @intCast(usize, byte & 127)
+        }
+        if distance == 0 || distance > offset { return false }
+        header.*.baseOffset = offset - distance
+    } else if header.*.kind == REF_DELTA {
+        if position + 20 > end { return false }
+        header.*.baseName = pack.*.data + position
+        position += 20
+    } else if header.*.kind == 0 || header.*.kind == 5 {
+        return false
+    }
+    header.*.dataAt = position
+    return true
+}
+
+// The SIZE bytes of the zlib data at DATA_AT of the pack inflated into
+// OUT (in place of what it held); false when they do not inflate to that.
+pub fn inflate(pack: *const Pack, dataAt: usize, size: usize, out: *std.ArrayList(u8)) -> bool {
+    out.*.clearRetainingCapacity()
+    // (One byte more: zlib wants room to tell the end, and an empty
+    // object still has a stream.)
+    if !out.*.resize(size + 1) { return false }
+    const end = pack.*.dataLength - 20
+    if dataAt >= end { return false }
+    var length = end - dataAt
+    if length > 0xffffffff { length = 0xffffffff }
+    if size == 0 {
+        // decompress answers 0 for an empty stream and a damaged one alike.
+        var inflater: flate.Inflater = undefined
+        if flate.inflaterInit(&inflater, std.heap.allocator(), flate.Format.zlib) != flate.Status.ok { return false }
+        var progress: flate.Progress = undefined
+        const status = flate.inflaterRun(&inflater, at(pack.*.data + dataAt), length, out.*.items().pointer, 1, &progress)
+        flate.inflaterEnd(&inflater)
+        _ = out.*.resize(0)
+        return status == flate.Status.done && progress.produced == 0
+    }
+    const made = flate.decompress(at(pack.*.data + dataAt), length, out.*.items().pointer, size + 1, flate.Format.zlib)
+    if made != size { return false }
+    _ = out.*.resize(size)
+    return true
+}
+
+// The variable-length number of a delta at *POSITION (moved past it).
+fn deltaSize(delta: []const u8, position: *usize) -> usize {
+    var value: usize = 0
+    var shift: usize = 0
+    while position.* < delta.length && shift < 64 {
+        const byte = delta[position.*]
+        position.* += 1
+        value = value | (@intCast(usize, byte & 127) << shift)
+        shift += 7
+        if byte & 128 == 0 { break }
+    }
+    return value
+}
+
+// BASE with DELTA applied (git's copy and insert instructions) into OUT;
+// false when the delta is damaged or is not BASE's.
+pub fn applyDelta(base: []const u8, delta: []const u8, out: *std.ArrayList(u8)) -> bool {
+    var position: usize = 0
+    const sourceSize = deltaSize(delta, &position)
+    const targetSize = deltaSize(delta, &position)
+    if sourceSize != base.length { return false }
+    out.*.clearRetainingCapacity()
+    if !out.*.ensureTotalCapacity(targetSize) { return false }
+    while position < delta.length {
+        const instruction = delta[position]
+        position += 1
+        if instruction & 128 != 0 {
+            // Copy: up to four bytes of offset, three of size, those whose
+            // bits are set; a size of 0 is 65536.
+            var offset: usize = 0
+            var size: usize = 0
+            var bit: usize = 0
+            while bit < 4 {
+                if instruction & (@intCast(u8, 1) << @intCast(u8, bit)) != 0 {
+                    if position >= delta.length { return false }
+                    offset = offset | (@intCast(usize, delta[position]) << (bit * 8))
+                    position += 1
+                }
+                bit += 1
+            }
+            bit = 0
+            while bit < 3 {
+                if instruction & (@intCast(u8, 16) << @intCast(u8, bit)) != 0 {
+                    if position >= delta.length { return false }
+                    size = size | (@intCast(usize, delta[position]) << (bit * 8))
+                    position += 1
+                }
+                bit += 1
+            }
+            if size == 0 { size = 65536 }
+            if offset + size > base.length || out.*.count() + size > targetSize { return false }
+            if !out.*.appendSlice(base[offset..offset + size]) { return false }
+        } else if instruction != 0 {
+            // Insert the next INSTRUCTION bytes.
+            const size = @intCast(usize, instruction)
+            if position + size > delta.length || out.*.count() + size > targetSize { return false }
+            if !out.*.appendSlice(delta[position..position + size]) { return false }
+            position += size
+        } else {
+            return false
+        }
+    }
+    return out.*.count() == targetSize
+}

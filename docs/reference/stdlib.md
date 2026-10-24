@@ -1441,6 +1441,80 @@ var status: usize = 0
 const length = spawn.capture(&options, true, &output, 4096, &status)
 ```
 
+## Git repositories (`std.git`)
+
+**Implementation:** `std/src/git.mlx`, `std/src/git/pack.mlx`
+**Source tests:** `413_git_runtime.mlx` (run by `tests/run_std_modules.sh`,
+and by `tools/check_git_reader.sh` against git itself)
+
+A git repository read without the git program, for the build numbers of
+the toolchain and of projects (`mlx-build-number`, build.mlx;
+[build-system.md](build-system.md#versions-and-build-numbers)).
+
+- `open(&repository, directory)` finds the repository as git does: the
+  directory or the nearest one above it with a `.git` directory, a `.git`
+  file (`gitdir: PATH`: a worktree's, or a submodule's, which leads into
+  the superproject's `.git/modules/NAME` and is read on its own), or a
+  bare repository. A worktree's `commondir` names where the objects,
+  `refs/` and `packed-refs` are; HEAD and the worktree's own refs
+  (`refs/bisect`, `refs/worktree`, `refs/rewritten`) are in its own
+  directory. Alternates (`objects/info/alternates`) add object
+  directories, and `shallow` the commits whose parents a shallow clone
+  does not have. `Status.noRepository` when there is none (a program's
+  version says `dev` then).
+- `resolveReference(&repository, name, &id)` follows symbolic references
+  (`ref: refs/heads/main`), a loose file before a line of `packed-refs`;
+  `headCommit` is HEAD's commit (a tag peeled, `peelToCommit`).
+- `readObject(&repository, id, &object)` reads an object into an
+  `Object` (its `kind` and `bytes()`, kept across reads): from a pack
+  when one has it (the index, version 2 or 1, looked up by binary search
+  in its first byte's range of the fan-out table; the pack mapped whole;
+  `OFS_DELTA` and `REF_DELTA` chains followed to their base, in any pack
+  or loose, and applied from it up, the objects made on the way kept in a
+  cache of 512 slots), else its loose file (zlib's data, `std.flate`).
+- `parseCommit(bytes, &commit)` gives a `Commit`: `tree`, `parentCount`
+  and `parent(&commit, index)`, `author` and `committer` (`Person`: name,
+  email, time, zone), `message`; `treeEntry` and `treePath(&repository,
+  tree, "projects/x/VERSION", &id)` look names up in trees.
+- `commitCount(&repository, id, &count)` is `git rev-list --count ID`:
+  the distinct commits reachable through all parents, each read once (a
+  hash set of those seen); `commitCountExcluding(.., id, excluded, ..)`
+  is `git rev-list --count ID ^EXCLUDED`. `Count.shallow` says the walk
+  met a shallow clone's boundary and stopped there, as git does.
+- `buildNumber(&repository, "VERSION", &number)` and
+  `buildNumberOf(directory, "VERSION", &number)`: `number.version()`
+  (the first line of VERSION in HEAD's tree, "0.0" without one),
+  `number.build` (the commits since the commit that last changed
+  VERSION's bytes, that commit counted as 1; every commit until it first
+  changes), `number.commit` (HEAD), `number.versionCommit` when
+  `number.changed`.
+
+```mlx
+const git = @import("std.git")
+
+var number: git.BuildNumber = undefined
+const status = git.buildNumberOf(".", "VERSION", &number)
+if status == git.Status.noRepository { ... }   // "dev": number.version() alone
+
+var repository = git.Repository.init()       // its deinit unmaps the packs
+if git.open(&repository, ".") == git.Status.ok {
+    var head: git.Id = undefined
+    var count: git.Count = undefined
+    if git.headCommit(&repository, &head) == git.Status.ok && git.commitCount(&repository, head, &count) == git.Status.ok {
+        ... count.commits, count.shallow ...
+    }
+}
+```
+
+What it does not read is `Status.unsupported`: refs in the reftable
+format and repositories of SHA-256 names. Counting this repository's
+1210 commits takes about 50 ms; `tools/check_git_reader.sh` compares
+HEADs, counts, build numbers and every object (kind, size, and the SHA-1
+of its bytes) with git's on repositories it makes: loose objects, a pack
+of `OFS_DELTA` deltas and one of `REF_DELTA` ones, a merge,
+`packed-refs`, worktrees, a bare clone, alternates, a shallow clone, a
+submodule, VERSION files changed directly and by a merge.
+
 ## Finding fonts (`std.fontconfig`)
 
 **Implementation:** `std/src/fontconfig.mlx` and `std/src/fontconfig/`
