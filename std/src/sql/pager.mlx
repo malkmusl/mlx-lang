@@ -1,0 +1,925 @@
+// std.sql.pager: a database file as numbered pages, cached, changed in
+// transactions that either reach the file whole or not at all.
+//
+// The file is SQLite's: page 1 starts with the 100-byte database header
+// (page size, change counter, size in pages, freelist, schema cookie,
+// ...). A write transaction keeps each changed page's original in memory;
+// at commit the originals go to a rollback journal next to the database
+// (`NAME-journal`, SQLite's format: a header with a random checksum seed,
+// then each original page with its number and checksum), the journal is
+// synced, the database is locked EXCLUSIVE, the changed pages are written
+// and synced, and the journal is deleted: a crash before the deletion
+// leaves a "hot" journal, which the next connection to open the file
+// (this library or SQLite) plays back. A rollback puts the originals back
+// in the cache.
+//
+// Savepoints (and each statement, so that a failing one leaves no part of
+// itself behind) nest inside a transaction: a page changed while a
+// savepoint is the innermost one has its image from before kept with it,
+// so rolling back to the savepoint puts those images back.
+//
+// A database ":memory:" (or "") has no file: its pages live in the cache
+// only, never evicted.
+const mem = @import("./mem.mlx")
+const os = @import("./os.mlx")
+
+pub const OK: i32 = 0
+pub const ERROR: i32 = 1
+pub const BUSY: i32 = 5
+pub const NOMEM: i32 = 7
+pub const READONLY: i32 = 8
+pub const IOERR: i32 = 10
+pub const CORRUPT: i32 = 11
+pub const FULL: i32 = 13
+pub const CANTOPEN: i32 = 14
+pub const NOTADB: i32 = 26
+
+pub const NO_TRANSACTION: u8 = 0
+pub const READ_TRANSACTION: u8 = 1
+pub const WRITE_TRANSACTION: u8 = 2
+
+// Journal modes, numbered as PRAGMA journal_mode answers them.
+pub const JOURNAL_DELETE: u8 = 0
+pub const JOURNAL_PERSIST: u8 = 1
+pub const JOURNAL_OFF: u8 = 2
+pub const JOURNAL_TRUNCATE: u8 = 3
+pub const JOURNAL_MEMORY: u8 = 4
+pub const JOURNAL_WAL: u8 = 5
+
+pub const DEFAULT_PAGE_SIZE: usize = 4096
+
+pub const Page = struct {
+    number: u64
+    data: usize
+    dirty: bool
+    // The page as the transaction found it (0 until it is changed).
+    original: usize
+    // The innermost savepoint level its image was kept for.
+    savedLevel: usize
+    next: usize
+}
+
+// What one savepoint level keeps: the size of the database when it
+// began, and per page changed while it was the innermost one the page's
+// number, its image from before and the level that had its image before.
+const Level = struct {
+    size: u64
+    entries: mem.Words
+}
+
+pub const Pager = struct {
+    memory: bool
+    readOnly: bool
+    inode: usize
+    fd: isize
+    path: usize
+    journalPath: usize
+    pageSize: usize
+    // Bytes reserved at the end of each page (header byte 20).
+    reserved: usize
+    // Pages in the database as this transaction sees it, and when the
+    // write transaction began.
+    size: u64
+    startSize: u64
+    // Whole pages in the file (those past it read as zeros).
+    filePages: u64
+    lockLevel: u8
+    transaction: u8
+    // The change counter of the file when the cache was filled; the cache
+    // is thrown away when another connection has changed the file since.
+    changeCounter: u64
+    cacheValid: bool
+    // The page cache: a hash table of pages by number.
+    buckets: usize
+    bucketCount: usize
+    cached: usize
+    cacheLimit: usize
+    dirty: mem.Words
+    // Savepoint levels (addresses of Levels), the transaction's own being
+    // the originals of the pages.
+    levels: mem.Words
+    journalMode: u8
+    synchronous: u8
+    lockingExclusive: bool
+    // The page size asked for before the database has any page.
+    wantPageSize: usize
+    // Counts every change to the pages a cursor may be positioned on (a
+    // B-tree changed, a rollback, the cache thrown away): a cursor that
+    // saw another number finds its place again by its key.
+    generation: u64
+}
+
+pub fn pageOf(address: usize) -> *Page { unsafe { return @ptrFromInt(*Page, address) } }
+fn levelOf(address: usize) -> *Level { unsafe { return @ptrFromInt(*Level, address) } }
+
+fn journalPathOf(path: []const u8) -> usize {
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    _ = mem.appendText(&b, path)
+    _ = mem.appendText(&b, "-journal")
+    return mem.takeBuffer(&b)
+}
+
+pub fn isMemoryPath(path: []const u8) -> bool {
+    return path.length == 0 || mem.same(path, ":memory:")
+}
+
+// Opens the pager of the file at `path` (read only or not, made when
+// `create`): OK, CANTOPEN.
+pub fn open(p: *Pager, path: []const u8, readOnly: bool, create: bool) -> i32 {
+    p.*.memory = isMemoryPath(path)
+    p.*.readOnly = readOnly
+    p.*.inode = 0
+    p.*.fd = -1
+    p.*.path = mem.dupText(path)
+    p.*.journalPath = journalPathOf(path)
+    p.*.pageSize = DEFAULT_PAGE_SIZE
+    p.*.reserved = 0
+    p.*.size = 0
+    p.*.startSize = 0
+    p.*.filePages = 0
+    p.*.lockLevel = os.NO_LOCK
+    p.*.transaction = NO_TRANSACTION
+    p.*.changeCounter = 0
+    p.*.cacheValid = false
+    p.*.bucketCount = 256
+    p.*.buckets = mem.alloc(256 * 8)
+    p.*.cached = 0
+    p.*.cacheLimit = 2000
+    mem.initWords(&p.*.dirty)
+    mem.initWords(&p.*.levels)
+    p.*.journalMode = if p.*.memory { JOURNAL_MEMORY } else { JOURNAL_DELETE }
+    p.*.synchronous = 2
+    p.*.lockingExclusive = false
+    p.*.wantPageSize = DEFAULT_PAGE_SIZE
+    p.*.generation = 1
+    if p.*.memory {
+        p.*.cacheValid = true
+        return OK
+    }
+    var failure: i32 = 0
+    p.*.inode = os.acquire(p.*.path, !readOnly, create, &failure)
+    if p.*.inode == 0 { return CANTOPEN }
+    p.*.fd = os.inodeOf(p.*.inode).*.fd
+    if !os.inodeOf(p.*.inode).*.writable { p.*.readOnly = true }
+    return OK
+}
+
+pub fn close(p: *Pager) -> void {
+    if p.*.transaction == WRITE_TRANSACTION { rollback(p) }
+    if p.*.inode != 0 {
+        os.lowerLock(p.*.inode, &p.*.lockLevel, os.NO_LOCK)
+        os.releaseInode(p.*.inode)
+        p.*.inode = 0
+    }
+    dropCache(p, true)
+    mem.free(p.*.buckets)
+    mem.freeWords(&p.*.dirty)
+    mem.freeWords(&p.*.levels)
+    mem.free(p.*.path)
+    mem.free(p.*.journalPath)
+}
+
+pub fn usableSize(p: *Pager) -> usize { return p.*.pageSize - p.*.reserved }
+
+// ---------------------------------------------------------------------------
+// The cache.
+
+fn bucketOf(p: *Pager, number: u64) -> usize {
+    return p.*.buckets + @intCast(usize, (number *% 2654435761) & @intCast(u64, p.*.bucketCount - 1)) * 8
+}
+
+fn lookup(p: *Pager, number: u64) -> usize {
+    var at = mem.get64(bucketOf(p, number))
+    while at != 0 {
+        const page = pageOf(at)
+        if page.*.number == number { return at }
+        at = page.*.next
+    }
+    return 0
+}
+
+fn insert(p: *Pager, address: usize) -> void {
+    if p.*.cached >= p.*.bucketCount * 2 { rehash(p) }
+    const bucket = bucketOf(p, pageOf(address).*.number)
+    pageOf(address).*.next = mem.get64(bucket)
+    mem.put64(bucket, address)
+    p.*.cached += 1
+}
+
+fn rehash(p: *Pager) -> void {
+    const oldBuckets = p.*.buckets
+    const oldCount = p.*.bucketCount
+    const fresh = mem.alloc(oldCount * 2 * 8)
+    if fresh == 0 { return }
+    p.*.buckets = fresh
+    p.*.bucketCount = oldCount * 2
+    var i: usize = 0
+    while i < oldCount {
+        var at = mem.get64(oldBuckets + i * 8)
+        while at != 0 {
+            const next = pageOf(at).*.next
+            const bucket = bucketOf(p, pageOf(at).*.number)
+            pageOf(at).*.next = mem.get64(bucket)
+            mem.put64(bucket, at)
+            at = next
+        }
+        i += 1
+    }
+    mem.free(oldBuckets)
+}
+
+fn freePage(address: usize) -> void {
+    const page = pageOf(address)
+    mem.free(page.*.data)
+    mem.free(page.*.original)
+    mem.free(address)
+}
+
+// Every page given back (`all`), or the clean ones only.
+fn dropCache(p: *Pager, all: bool) -> void {
+    var i: usize = 0
+    while i < p.*.bucketCount {
+        var link = p.*.buckets + i * 8
+        while mem.get64(link) != 0 {
+            const at = mem.get64(link)
+            const page = pageOf(at)
+            if all || (!page.*.dirty && page.*.original == 0) {
+                mem.put64(link, page.*.next)
+                freePage(at)
+                p.*.cached -= 1
+            } else {
+                link = at + @offsetOf(Page, "next")
+            }
+        }
+        i += 1
+    }
+}
+
+// Called where no page address is held (between B-tree operations): the
+// clean pages are let go when there are too many.
+pub fn shrink(p: *Pager) -> void {
+    if p.*.memory { return }
+    if p.*.cached > p.*.cacheLimit { dropCache(p, false) }
+}
+
+fn newPage(p: *Pager, number: u64) -> usize {
+    const address = mem.alloc(@sizeOf(Page))
+    if address == 0 { return 0 }
+    const page = pageOf(address)
+    page.*.number = number
+    page.*.data = mem.alloc(p.*.pageSize)
+    if page.*.data == 0 {
+        mem.free(address)
+        return 0
+    }
+    page.*.dirty = false
+    page.*.original = 0
+    page.*.savedLevel = 0
+    insert(p, address)
+    return address
+}
+
+// Page `number` (1 = the first), read when it is not cached; 0 when it
+// cannot be read.
+pub fn get(p: *Pager, number: u64) -> usize {
+    const found = lookup(p, number)
+    if found != 0 { return found }
+    const address = newPage(p, number)
+    if address == 0 { return 0 }
+    if !p.*.memory && number <= p.*.filePages {
+        if !os.readAt(p.*.fd, pageOf(address).*.data, p.*.pageSize, (number - 1) * @intCast(u64, p.*.pageSize)) { return 0 }
+    }
+    return address
+}
+
+pub inline fn data(address: usize) -> usize { return pageOf(address).*.data }
+
+// ---------------------------------------------------------------------------
+// The database header (on page 1).
+
+pub const HEADER_MAGIC = "SQLite format 3\x00"
+
+fn pageSizeField(size: usize) -> u64 { return if size == 65536 { 1 } else { @intCast(u64, size) } }
+
+// Page 1 of a new database: the header and an empty table B-tree, the
+// schema's.
+fn initFirstPage(p: *Pager, d: usize) -> void {
+    mem.zero(d, p.*.pageSize)
+    const magic: []const u8 = HEADER_MAGIC
+    mem.copy(d, @intFromPtr(magic.pointer), 16)
+    mem.put16be(d + 16, pageSizeField(p.*.pageSize))
+    mem.put8(d + 18, 1)
+    mem.put8(d + 19, 1)
+    mem.put8(d + 20, 0)
+    mem.put8(d + 21, 64)
+    mem.put8(d + 22, 32)
+    mem.put8(d + 23, 32)
+    mem.put32be(d + 28, 1)
+    // Schema format 4, UTF-8.
+    mem.put32be(d + 44, 4)
+    mem.put32be(d + 56, 1)
+    mem.put32be(d + 96, 3045001)
+    // The schema table's root: an empty table leaf.
+    mem.put8(d + 100, 13)
+    mem.put16be(d + 105, @intCast(u64, p.*.pageSize & 65535))
+}
+
+pub fn headerGet(p: *Pager, offset: usize) -> u64 {
+    if p.*.size == 0 { return 0 }
+    const one = get(p, 1)
+    if one == 0 { return 0 }
+    return mem.get32be(data(one) + offset)
+}
+
+// Sets a 32-bit header field (a write transaction must be open).
+pub fn headerSet(p: *Pager, offset: usize, v: u64) -> bool {
+    const one = get(p, 1)
+    if one == 0 || !write(p, one) { return false }
+    mem.put32be(data(one) + offset, v)
+    return true
+}
+
+// Reads what the file says about itself into the pager, after another
+// connection may have changed it: the page size, the size, whether the
+// file is a database at all.
+fn loadHeader(p: *Pager) -> i32 {
+    const head = mem.alloc(100)
+    const fileSize = os.sizeOf(p.*.fd)
+    if fileSize == 0 {
+        mem.free(head)
+        p.*.size = 0
+        p.*.filePages = 0
+        p.*.pageSize = p.*.wantPageSize
+        p.*.reserved = 0
+        p.*.changeCounter = 0
+        return OK
+    }
+    if !os.readAt(p.*.fd, head, 100, 0) {
+        mem.free(head)
+        return IOERR
+    }
+    const magic: []const u8 = HEADER_MAGIC
+    if fileSize < 100 || mem.compare(head, 16, @intFromPtr(magic.pointer), 16) != 0 {
+        mem.free(head)
+        return NOTADB
+    }
+    var pageSize = @intCast(usize, mem.get16be(head + 16))
+    if pageSize == 1 { pageSize = 65536 }
+    if pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) != 0 {
+        mem.free(head)
+        return NOTADB
+    }
+    if mem.get8(head + 18) > 2 || mem.get8(head + 19) > 2 {
+        mem.free(head)
+        return NOTADB
+    }
+    const counter = mem.get32be(head + 24)
+    if pageSize != p.*.pageSize {
+        dropCache(p, true)
+        p.*.pageSize = pageSize
+    }
+    p.*.reserved = @intCast(usize, mem.get8(head + 20))
+    var size = mem.get32be(head + 28)
+    const fromFile = (fileSize + @intCast(u64, pageSize) - 1) / @intCast(u64, pageSize)
+    if size == 0 || mem.get32be(head + 92) != counter || size > fromFile { size = fromFile }
+    p.*.size = size
+    p.*.filePages = fileSize / @intCast(u64, pageSize)
+    p.*.changeCounter = counter
+    mem.free(head)
+    return OK
+}
+
+// ---------------------------------------------------------------------------
+// Transactions.
+
+// The pager's file has a hot journal: one left by a writer that did not
+// finish, with no writer holding the database now.
+fn hasHotJournal(p: *Pager) -> bool {
+    if p.*.memory || !os.exists(p.*.journalPath) { return false }
+    if os.reservedByAnyone(p.*.inode) { return false }
+    const fd = os.openFile(p.*.journalPath, false, false)
+    if fd < 0 { return false }
+    const size = os.sizeOf(fd)
+    var hot = false
+    if size >= 28 {
+        const first = mem.alloc(8)
+        _ = os.readAt(fd, first, 8, 0)
+        hot = mem.get64be(first) == 0xd9d505f920a163d7
+        mem.free(first)
+    }
+    os.closeFile(fd)
+    if !hot && size == 0 && !p.*.readOnly {
+        // An empty journal is no journal (SQLite deletes it too).
+        _ = os.remove(p.*.journalPath)
+    }
+    return hot
+}
+
+// SQLite's journal checksum of a page: the seed plus every 200th byte
+// from the end.
+fn journalChecksum(seed: u64, page: usize, pageSize: usize) -> u64 {
+    var sum = seed
+    var i: isize = @intCast(isize, pageSize) - 200
+    while i > 0 {
+        sum = (sum + mem.get8(page + @bitCast(usize, i))) & 0xffffffff
+        i -= 200
+    }
+    return sum
+}
+
+// Plays the journal back into the database file (the lock is EXCLUSIVE),
+// then removes it.
+fn playback(p: *Pager) -> i32 {
+    const fd = os.openFile(p.*.journalPath, false, false)
+    if fd < 0 { return IOERR }
+    const fileSize = os.sizeOf(fd)
+    const head = mem.alloc(512)
+    var rc = OK
+    var offset: u64 = 0
+    var originalSize: u64 = 0
+    var played = false
+    // A journal may hold several headers, each a sector apart: play each
+    // segment until one is not valid.
+    while offset + 28 <= fileSize {
+        if !os.readAt(fd, head, 28, offset) { break }
+        if mem.get64be(head) != 0xd9d505f920a163d7 { break }
+        var records = mem.get32be(head + 8)
+        const seed = mem.get32be(head + 12)
+        const segmentSize = mem.get32be(head + 16)
+        var sector = mem.get32be(head + 20)
+        const pageSize = mem.get32be(head + 24)
+        if sector < 512 || sector > 65536 { sector = 512 }
+        if pageSize < 512 || pageSize > 65536 { break }
+        if !played {
+            originalSize = segmentSize
+            played = true
+        }
+        offset += sector
+        const recordSize = pageSize + 8
+        if records == 0xffffffff {
+            records = (fileSize - offset) / recordSize
+        }
+        if records == 0 && offset == sector {
+            // SQLite (journal_mode=PERSIST or a crash before the header's
+            // count was written) treats a zero count as "to the end".
+            records = (fileSize - offset) / recordSize
+        }
+        const page = mem.alloc(@intCast(usize, pageSize) + 8)
+        var k: u64 = 0
+        while k < records {
+            if offset + recordSize > fileSize { break }
+            if !os.readAt(fd, page, @intCast(usize, recordSize), offset) { break }
+            const number = mem.get32be(page)
+            const sum = mem.get32be(page + 4 + @intCast(usize, pageSize))
+            if number == 0 || sum != journalChecksum(seed, page + 4, @intCast(usize, pageSize)) { break }
+            if !os.writeAt(p.*.fd, page + 4, @intCast(usize, pageSize), (number - 1) * pageSize) {
+                rc = IOERR
+                break
+            }
+            offset += recordSize
+            k += 1
+        }
+        mem.free(page)
+        // The next header starts at a sector boundary.
+        offset = (offset + sector - 1) / sector * sector
+        if rc != OK { break }
+    }
+    mem.free(head)
+    os.closeFile(fd)
+    if rc == OK && played {
+        const pageSize = p.*.pageSize
+        _ = pageSize
+        const head1 = mem.alloc(100)
+        _ = os.readAt(p.*.fd, head1, 100, 0)
+        var size = mem.get16be(head1 + 16)
+        if size == 1 { size = 65536 }
+        mem.free(head1)
+        if size >= 512 {
+            if !os.truncate(p.*.fd, originalSize * size) { rc = IOERR }
+        }
+        _ = os.sync(p.*.fd)
+    }
+    if rc == OK { _ = os.remove(p.*.journalPath) }
+    dropCache(p, true)
+    return rc
+}
+
+// Begins a read transaction: a SHARED lock, a hot journal played back,
+// the cache thrown away when the file changed. OK, BUSY or an error.
+pub fn beginRead(p: *Pager) -> i32 {
+    if p.*.transaction != NO_TRANSACTION { return OK }
+    if p.*.memory {
+        p.*.transaction = READ_TRANSACTION
+        return OK
+    }
+    var rc = os.raiseLock(p.*.inode, &p.*.lockLevel, os.SHARED_LOCK)
+    if rc != OK { return rc }
+    if hasHotJournal(p) {
+        rc = os.raiseLock(p.*.inode, &p.*.lockLevel, os.EXCLUSIVE_LOCK)
+        if rc != OK {
+            if !p.*.lockingExclusive { os.lowerLock(p.*.inode, &p.*.lockLevel, os.NO_LOCK) }
+            return BUSY
+        }
+        rc = playback(p)
+        os.lowerLock(p.*.inode, &p.*.lockLevel, os.SHARED_LOCK)
+        if rc != OK {
+            os.lowerLock(p.*.inode, &p.*.lockLevel, os.NO_LOCK)
+            return rc
+        }
+        p.*.cacheValid = false
+    }
+    const oldCounter = p.*.changeCounter
+    const oldSize = p.*.size
+    rc = loadHeader(p)
+    if rc != OK {
+        if !p.*.lockingExclusive { os.lowerLock(p.*.inode, &p.*.lockLevel, os.NO_LOCK) }
+        return rc
+    }
+    if !p.*.cacheValid || p.*.changeCounter != oldCounter || p.*.size != oldSize {
+        dropCache(p, true)
+        p.*.cacheValid = true
+        p.*.generation += 1
+    }
+    p.*.transaction = READ_TRANSACTION
+    return OK
+}
+
+// Upgrades to a write transaction: a RESERVED lock. OK, BUSY, READONLY.
+pub fn beginWrite(p: *Pager) -> i32 {
+    if p.*.transaction == WRITE_TRANSACTION { return OK }
+    if p.*.readOnly { return READONLY }
+    var rc = beginRead(p)
+    if rc != OK { return rc }
+    if !p.*.memory {
+        rc = os.raiseLock(p.*.inode, &p.*.lockLevel, os.RESERVED_LOCK)
+        if rc != OK { return rc }
+        if p.*.lockingExclusive {
+            rc = os.raiseLock(p.*.inode, &p.*.lockLevel, os.EXCLUSIVE_LOCK)
+            if rc != OK { return rc }
+        }
+    }
+    p.*.transaction = WRITE_TRANSACTION
+    p.*.startSize = p.*.size
+    if p.*.size == 0 {
+        // The first page of a new database.
+        p.*.pageSize = p.*.wantPageSize
+        const one = get(p, 1)
+        if one == 0 { return NOMEM }
+        p.*.size = 1
+        if !write(p, one) { return NOMEM }
+        initFirstPage(p, data(one))
+    }
+    return OK
+}
+
+// Ends a read transaction (none is written): the lock let go, unless the
+// connection keeps it (locking_mode=EXCLUSIVE).
+pub fn endRead(p: *Pager) -> void {
+    if p.*.transaction != READ_TRANSACTION { return }
+    p.*.transaction = NO_TRANSACTION
+    if !p.*.memory && !p.*.lockingExclusive { os.lowerLock(p.*.inode, &p.*.lockLevel, os.NO_LOCK) }
+}
+
+// Makes a page writable in the open write transaction: its original kept
+// (for the journal and a rollback) and its image for the innermost
+// savepoint. False when there is no memory.
+pub fn write(p: *Pager, address: usize) -> bool {
+    const page = pageOf(address)
+    if !page.*.dirty {
+        page.*.dirty = true
+        if !mem.push(&p.*.dirty, @intCast(u64, address)) { return false }
+    }
+    if page.*.original == 0 && page.*.number <= p.*.startSize {
+        page.*.original = mem.dup(page.*.data, p.*.pageSize)
+        if page.*.original == 0 { return false }
+    }
+    const depth = p.*.levels.length
+    if depth > 0 && page.*.savedLevel < depth {
+        const level = levelOf(mem.at(&p.*.levels, depth - 1))
+        const image = mem.dup(page.*.data, p.*.pageSize)
+        if image == 0 { return false }
+        if !mem.push(&level.*.entries, page.*.number) { return false }
+        if !mem.push(&level.*.entries, @intCast(u64, image)) { return false }
+        if !mem.push(&level.*.entries, @intCast(u64, page.*.savedLevel)) { return false }
+        page.*.savedLevel = depth
+    }
+    return true
+}
+
+// A new page at the end of the database, writable and zeroed.
+pub fn append(p: *Pager) -> usize {
+    const number = p.*.size + 1
+    // A page past the end may still be cached from before a truncation.
+    var address = lookup(p, number)
+    if address == 0 { address = get(p, number) }
+    if address == 0 { return 0 }
+    p.*.size = number
+    if !write(p, address) { return 0 }
+    mem.zero(data(address), p.*.pageSize)
+    return address
+}
+
+// The database cut to `size` pages (at commit).
+pub fn truncateTo(p: *Pager, size: u64) -> void {
+    if size < p.*.size { p.*.size = size }
+}
+
+fn sortDirty(p: *Pager) -> void {
+    // Insertion sort by page number: commits change few pages.
+    var i: usize = 1
+    while i < p.*.dirty.length {
+        const at = mem.at(&p.*.dirty, i)
+        const number = pageOf(@intCast(usize, at)).*.number
+        var j = i
+        while j > 0 && pageOf(@intCast(usize, mem.at(&p.*.dirty, j - 1))).*.number > number {
+            mem.set(&p.*.dirty, j, mem.at(&p.*.dirty, j - 1))
+            j -= 1
+        }
+        mem.set(&p.*.dirty, j, at)
+        i += 1
+    }
+}
+
+// Writes the journal: a header and each changed page's original.
+fn writeJournal(p: *Pager) -> i32 {
+    const fd = os.openFile(p.*.journalPath, true, true)
+    if fd < 0 { return CANTOPEN }
+    _ = os.truncate(fd, 0)
+    const seedBlock = mem.alloc(8)
+    os.randomBytes(seedBlock, 4)
+    const seed = mem.get32(seedBlock)
+    mem.free(seedBlock)
+    const pageSize = p.*.pageSize
+    const record = mem.alloc(pageSize + 8)
+    var count: u64 = 0
+    var offset: u64 = 512
+    var ok = true
+    var i: usize = 0
+    while i < p.*.dirty.length {
+        const page = pageOf(@intCast(usize, mem.at(&p.*.dirty, i)))
+        if page.*.original != 0 {
+            mem.put32be(record, page.*.number)
+            mem.copy(record + 4, page.*.original, pageSize)
+            mem.put32be(record + 4 + pageSize, journalChecksum(seed, page.*.original, pageSize))
+            if !os.writeAt(fd, record, pageSize + 8, offset) { ok = false }
+            offset += @intCast(u64, pageSize + 8)
+            count += 1
+        }
+        i += 1
+    }
+    mem.free(record)
+    if ok && p.*.synchronous >= 2 { ok = os.sync(fd) }
+    const head = mem.alloc(512)
+    mem.put64be(head, 0xd9d505f920a163d7)
+    mem.put32be(head + 8, count)
+    mem.put32be(head + 12, seed)
+    mem.put32be(head + 16, p.*.startSize)
+    mem.put32be(head + 20, 512)
+    mem.put32be(head + 24, @intCast(u64, pageSize))
+    if ok { ok = os.writeAt(fd, head, 512, 0) }
+    mem.free(head)
+    if ok && p.*.synchronous >= 1 { ok = os.sync(fd) }
+    os.closeFile(fd)
+    return if ok { OK } else { IOERR }
+}
+
+// Commits the write transaction: OK, BUSY (readers keep the EXCLUSIVE lock
+// away: try again later; nothing is lost), or an I/O error.
+pub fn commit(p: *Pager) -> i32 {
+    if p.*.transaction != WRITE_TRANSACTION {
+        endRead(p)
+        return OK
+    }
+    if p.*.dirty.length > 0 || p.*.size != p.*.startSize {
+        if !p.*.memory {
+            // The header: one more change, the size, the version.
+            const one = get(p, 1)
+            if one == 0 || !write(p, one) { return NOMEM }
+            const counter = (mem.get32be(data(one) + 24) + 1) & 0xffffffff
+            mem.put32be(data(one) + 24, counter)
+            mem.put32be(data(one) + 28, p.*.size)
+            mem.put32be(data(one) + 92, counter)
+            mem.put32be(data(one) + 96, 3045001)
+            sortDirty(p)
+            var rc = OK
+            const journaling = p.*.journalMode != JOURNAL_OFF && p.*.journalMode != JOURNAL_MEMORY && p.*.startSize > 0
+            if journaling {
+                rc = writeJournal(p)
+                if rc != OK { return rc }
+            }
+            rc = os.raiseLock(p.*.inode, &p.*.lockLevel, os.EXCLUSIVE_LOCK)
+            if rc != OK {
+                // Keep the transaction: the caller may try again.
+                return BUSY
+            }
+            var ok = true
+            var i: usize = 0
+            while i < p.*.dirty.length {
+                const page = pageOf(@intCast(usize, mem.at(&p.*.dirty, i)))
+                if page.*.number <= p.*.size {
+                    if !os.writeAt(p.*.fd, page.*.data, p.*.pageSize, (page.*.number - 1) * @intCast(u64, p.*.pageSize)) { ok = false }
+                }
+                i += 1
+            }
+            if ok && os.sizeOf(p.*.fd) > p.*.size * @intCast(u64, p.*.pageSize) {
+                ok = os.truncate(p.*.fd, p.*.size * @intCast(u64, p.*.pageSize))
+            }
+            if ok && p.*.synchronous >= 1 { ok = os.sync(p.*.fd) }
+            if !ok { return IOERR }
+            if journaling {
+                if p.*.journalMode == JOURNAL_TRUNCATE {
+                    const jfd = os.openFile(p.*.journalPath, true, false)
+                    if jfd >= 0 {
+                        _ = os.truncate(jfd, 0)
+                        os.closeFile(jfd)
+                    }
+                } else if p.*.journalMode == JOURNAL_PERSIST {
+                    const jfd = os.openFile(p.*.journalPath, true, false)
+                    if jfd >= 0 {
+                        const zeros = mem.alloc(28)
+                        _ = os.writeAt(jfd, zeros, 28, 0)
+                        mem.free(zeros)
+                        os.closeFile(jfd)
+                    }
+                } else {
+                    _ = os.remove(p.*.journalPath)
+                }
+            }
+            p.*.changeCounter = counter
+            p.*.filePages = p.*.size
+        }
+    }
+    finishTransaction(p)
+    return OK
+}
+
+// The changed pages made clean (their originals and images let go), the
+// savepoints closed, the locks lowered.
+fn finishTransaction(p: *Pager) -> void {
+    var i: usize = 0
+    while i < p.*.dirty.length {
+        const page = pageOf(@intCast(usize, mem.at(&p.*.dirty, i)))
+        page.*.dirty = false
+        mem.free(page.*.original)
+        page.*.original = 0
+        page.*.savedLevel = 0
+        i += 1
+    }
+    p.*.dirty.length = 0
+    clearLevels(p, 0)
+    // Pages past the end (the database shrank) are dropped.
+    dropBeyond(p, p.*.size)
+    p.*.transaction = NO_TRANSACTION
+    if !p.*.memory {
+        if p.*.lockingExclusive {
+            os.lowerLock(p.*.inode, &p.*.lockLevel, os.EXCLUSIVE_LOCK)
+        } else {
+            os.lowerLock(p.*.inode, &p.*.lockLevel, os.NO_LOCK)
+        }
+    }
+}
+
+fn dropBeyond(p: *Pager, size: u64) -> void {
+    var i: usize = 0
+    while i < p.*.bucketCount {
+        var link = p.*.buckets + i * 8
+        while mem.get64(link) != 0 {
+            const at = mem.get64(link)
+            const page = pageOf(at)
+            if page.*.number > size && !page.*.dirty {
+                mem.put64(link, page.*.next)
+                freePage(at)
+                p.*.cached -= 1
+            } else {
+                link = at + @offsetOf(Page, "next")
+            }
+        }
+        i += 1
+    }
+}
+
+// Rolls the write transaction back: every changed page as it was.
+pub fn rollback(p: *Pager) -> void {
+    if p.*.transaction != WRITE_TRANSACTION {
+        endRead(p)
+        return
+    }
+    var i: usize = 0
+    while i < p.*.dirty.length {
+        const page = pageOf(@intCast(usize, mem.at(&p.*.dirty, i)))
+        if page.*.original != 0 {
+            mem.copy(page.*.data, page.*.original, p.*.pageSize)
+        } else {
+            // A page the transaction added: gone with it.
+            mem.zero(page.*.data, p.*.pageSize)
+        }
+        i += 1
+    }
+    p.*.size = p.*.startSize
+    p.*.generation += 1
+    finishTransaction(p)
+    if p.*.memory {
+        dropBeyond(p, p.*.size)
+    }
+    if p.*.startSize == 0 && !p.*.memory {
+        dropCache(p, true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Savepoints.
+
+pub fn depth(p: *Pager) -> usize { return p.*.levels.length }
+
+// Opens a savepoint level; its number (1 = the outermost).
+pub fn openSavepoint(p: *Pager) -> usize {
+    const address = mem.alloc(@sizeOf(Level))
+    const level = levelOf(address)
+    level.*.size = p.*.size
+    mem.initWords(&level.*.entries)
+    _ = mem.push(&p.*.levels, @intCast(u64, address))
+    return p.*.levels.length
+}
+
+fn freeLevel(address: usize) -> void {
+    const level = levelOf(address)
+    var i: usize = 0
+    while i < level.*.entries.length {
+        mem.free(@intCast(usize, mem.at(&level.*.entries, i + 1)))
+        i += 3
+    }
+    mem.freeWords(&level.*.entries)
+    mem.free(address)
+}
+
+// Closes levels deeper than `keep`, their images let go.
+fn clearLevels(p: *Pager, keep: usize) -> void {
+    while p.*.levels.length > keep {
+        freeLevel(@intCast(usize, mem.pop(&p.*.levels)))
+    }
+}
+
+// Rolls back to the start of savepoint level `number`, which stays open.
+pub fn rollbackTo(p: *Pager, number: usize) -> void {
+    if number == 0 || number > p.*.levels.length { return }
+    p.*.generation += 1
+    var d = p.*.levels.length
+    while d >= number {
+        const level = levelOf(@intCast(usize, mem.at(&p.*.levels, d - 1)))
+        var i: usize = 0
+        while i < level.*.entries.length {
+            const pageNumber = mem.at(&level.*.entries, i)
+            const image = @intCast(usize, mem.at(&level.*.entries, i + 1))
+            const address = lookup(p, pageNumber)
+            if address != 0 {
+                mem.copy(pageOf(address).*.data, image, p.*.pageSize)
+                pageOf(address).*.savedLevel = number - 1
+            }
+            mem.free(image)
+            i += 3
+        }
+        level.*.entries.length = 0
+        if d == number { p.*.size = level.*.size }
+        d -= 1
+    }
+    clearLevels(p, number)
+    // Pages the savepoint appended are past the end now: zero them, so
+    // that a later append starts clean.
+}
+
+// Releases savepoint level `number` and those inside it: their changes
+// become the enclosing level's.
+pub fn release(p: *Pager, number: usize) -> void {
+    if number == 0 || number > p.*.levels.length { return }
+    const parent = number - 1
+    var d = number
+    while d <= p.*.levels.length {
+        const level = levelOf(@intCast(usize, mem.at(&p.*.levels, d - 1)))
+        var i: usize = 0
+        while i < level.*.entries.length {
+            const pageNumber = mem.at(&level.*.entries, i)
+            const image = @intCast(usize, mem.at(&level.*.entries, i + 1))
+            const before = @intCast(usize, mem.at(&level.*.entries, i + 2))
+            const address = lookup(p, pageNumber)
+            if before < parent && parent > 0 {
+                // The enclosing level has no image of the page: this one,
+                // the oldest after `before`, becomes its.
+                const up = levelOf(@intCast(usize, mem.at(&p.*.levels, parent - 1)))
+                _ = mem.push(&up.*.entries, pageNumber)
+                _ = mem.push(&up.*.entries, @intCast(u64, image))
+                _ = mem.push(&up.*.entries, @intCast(u64, before))
+            } else {
+                mem.free(image)
+            }
+            if address != 0 && pageOf(address).*.savedLevel >= number {
+                pageOf(address).*.savedLevel = if before < parent { parent } else { before }
+                if parent == 0 { pageOf(address).*.savedLevel = 0 }
+            }
+            i += 3
+        }
+        level.*.entries.length = 0
+        d += 1
+    }
+    clearLevels(p, parent)
+}

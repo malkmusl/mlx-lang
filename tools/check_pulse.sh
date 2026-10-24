@@ -2,7 +2,7 @@
 # MLX Audio's PulseAudio server (projects/desktop/audio/pulse.mlx) end to
 # end, with PulseAudio's own programs as the apps (pactl, pacat, paplay,
 # parec from pulseaudio-utils; there is no PulseAudio server) on MLXIPC,
-# and MLX Audio's client libraries (projects/desktop/libpulse, built by
+# and MLX Audio's client libraries (compiler/libc/pulse, built by
 # tools/build_libpulse.sh) as theirs: pulseaudio-utils' programs get its
 # libpulse.so.0 preloaded (they also link PulseAudio's libpulsecommon,
 # which has some of the same functions), Firefox finds it first, ALSA

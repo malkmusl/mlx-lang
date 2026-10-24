@@ -1,0 +1,668 @@
+// Relocatable objects (ELF64 ET_REL, x86_64): what a C compiler writes
+// for -c and what a linker reads, one file per translation unit.
+//
+// An object here is its sections (code, initialized data, zero data, and
+// the list of functions to run at start: .text, .data, .bss and
+// .init_array), its symbols (a name with a binding and a kind, defined
+// at an offset of a section or undefined), and its relocations (a place
+// in a section that holds a symbol's address, or its distance from the
+// place, with an addend). The writer makes the standard file from them
+// and the reader takes it (or one an ordinary C compiler wrote) apart
+// again; link.mlx puts objects together into a program.
+//
+// The relocation kinds are the x86_64 ABI's: R_X86_64_64 (an address in
+// data), R_X86_64_PC32 and R_X86_64_PLT32 (a rip-relative reference, a
+// call), R_X86_64_GOTPCREL and its relaxable forms (the address of a
+// symbol read from a GOT slot).
+const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
+const mem = @import("../../../std/bootstrap/mem.mlx")
+const vector = @import("../../../std/bootstrap/vector.mlx")
+const fs = @import("../../../std/bootstrap/fs.mlx")
+const elf = @import("../../../std/bootstrap/elf.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+// The address `offset` bytes into `base`.
+fn pointerAt(base: [*]const u8, offset: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(base) + offset) }
+}
+
+// Section kinds.
+pub const TEXT: u8 = 1
+pub const DATA: u8 = 2
+pub const BSS: u8 = 3
+pub const INIT: u8 = 4
+// Thread-local data (.tdata, .tbss): the initial bytes of each thread's
+// copy (none: zeros).
+pub const TDATA: u8 = 5
+
+// Symbol bindings (STB_*) and kinds (STT_*).
+pub const LOCAL: u8 = 0
+pub const GLOBAL: u8 = 1
+pub const WEAK: u8 = 2
+pub const NOTYPE: u8 = 0
+pub const OBJECT: u8 = 1
+pub const FUNC: u8 = 2
+pub const SECTION: u8 = 3
+pub const TLS: u8 = 6
+
+// Relocation kinds (R_X86_64_*).
+pub const R_64: u8 = 1
+pub const R_PC32: u8 = 2
+pub const R_PLT32: u8 = 4
+pub const R_GOTPCREL: u8 = 9
+pub const R_32: u8 = 10
+pub const R_32S: u8 = 11
+// A thread-local variable's offset from the thread pointer (local exec).
+pub const R_TPOFF32: u8 = 23
+pub const R_GOTPCRELX: u8 = 41
+pub const R_REX_GOTPCRELX: u8 = 42
+
+// A symbol's section when it has none (undefined), or when its value is
+// absolute.
+pub const NONE: usize = 18446744073709551615
+pub const ABSOLUTE: usize = 18446744073709551614
+
+pub const Section = struct {
+    kind: u8
+    bytes: [*]const u8
+    length: usize
+    alignment: usize
+    // Where the linker placed it: an offset in the program's code (TEXT)
+    // or data area (DATA, BSS).
+    placed: usize
+}
+
+pub const Symbol = struct {
+    namePointer: [*]const u8
+    nameLength: usize
+    nameHash: usize
+    binding: u8
+    kind: u8
+    // The section it is defined in (NONE: undefined; ABSOLUTE: `value`
+    // itself), and its offset in it.
+    section: usize
+    value: usize
+    size: usize
+}
+
+pub const Relocation = struct {
+    section: usize
+    offset: usize
+    kind: u8
+    symbol: usize
+    addend: i64
+}
+
+pub const Object = struct {
+    allocator: Allocator
+    pathPointer: [*]const u8
+    pathLength: usize
+    sections: *vector.Vector
+    symbols: *vector.Vector
+    relocations: *vector.Vector
+    // The linker's: whether the object is part of the program (an
+    // archive's member is once a symbol of its is needed).
+    included: bool
+}
+
+pub fn hashName(pointer: [*]const u8, length: usize) -> usize {
+    var result: usize = 14695981039346656037
+    var index: usize = 0
+    while index < length {
+        result = (result ^ @intCast(usize, pointer[index])) *% 1099511628211
+        index += 1
+    }
+    return result
+}
+
+fn newVector(allocator: Allocator, element_size: usize, element_alignment: usize, capacity: usize) -> *vector.Vector {
+    unsafe {
+        const v = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        vector.Vector.initAt(v, allocator, element_size, element_alignment, capacity)
+        return v
+    }
+}
+
+// Makes `object` an empty object (its vectors allocated from `allocator`).
+pub fn initAt(object: *Object, allocator: Allocator, path: [*]const u8, path_length: usize) -> void {
+    object.*.allocator = allocator
+    object.*.pathPointer = path
+    object.*.pathLength = path_length
+    object.*.sections = newVector(allocator, @sizeOf(Section), @alignOf(Section), 8)
+    object.*.symbols = newVector(allocator, @sizeOf(Symbol), @alignOf(Symbol), 64)
+    object.*.relocations = newVector(allocator, @sizeOf(Relocation), @alignOf(Relocation), 64)
+    object.*.included = true
+}
+
+pub fn sectionCount(object: *Object) -> usize { return object.*.sections.*.length }
+pub fn symbolCount(object: *Object) -> usize { return object.*.symbols.*.length }
+pub fn relocationCount(object: *Object) -> usize { return object.*.relocations.*.length }
+
+pub fn sectionAt(object: *Object, index: usize) -> *Section {
+    unsafe { return @ptrCast(*Section, vector.Vector.at(object.*.sections.*, index)) }
+}
+
+pub fn symbolAt(object: *Object, index: usize) -> *Symbol {
+    unsafe { return @ptrCast(*Symbol, vector.Vector.at(object.*.symbols.*, index)) }
+}
+
+pub fn relocationAt(object: *Object, index: usize) -> *Relocation {
+    unsafe { return @ptrCast(*Relocation, vector.Vector.at(object.*.relocations.*, index)) }
+}
+
+// Adds a section; its index.
+pub fn addSection(object: *Object, kind: u8, bytes: [*]const u8, length: usize, alignment: usize) -> usize {
+    const section = Section.{ .kind = kind, .bytes = bytes, .length = length, .alignment = if alignment == 0 { 1 } else { alignment }, .placed = 0 }
+    unsafe { const appended = vector.Vector.appendAt(object.*.sections, @ptrCast([*]const u8, &section)) }
+    return object.*.sections.*.length - 1
+}
+
+// Adds a symbol; its index.
+pub fn addSymbol(object: *Object, name: [*]const u8, name_length: usize, binding: u8, kind: u8, section: usize, value: usize, size: usize) -> usize {
+    const symbol = Symbol.{ .namePointer = name, .nameLength = name_length, .nameHash = hashName(name, name_length), .binding = binding, .kind = kind, .section = section, .value = value, .size = size }
+    unsafe { const appended = vector.Vector.appendAt(object.*.symbols, @ptrCast([*]const u8, &symbol)) }
+    return object.*.symbols.*.length - 1
+}
+
+pub fn addRelocation(object: *Object, section: usize, offset: usize, kind: u8, symbol: usize, addend: i64) -> void {
+    const relocation = Relocation.{ .section = section, .offset = offset, .kind = kind, .symbol = symbol, .addend = addend }
+    unsafe { const appended = vector.Vector.appendAt(object.*.relocations, @ptrCast([*]const u8, &relocation)) }
+}
+
+// The index of the symbol named so (the first), NONE for none.
+pub fn findSymbol(object: *Object, name: [*]const u8, name_length: usize) -> usize {
+    const hash = hashName(name, name_length)
+    var index: usize = 0
+    while index < object.*.symbols.*.length {
+        const symbol = symbolAt(object, index)
+        if symbol.*.nameHash == hash && symbol.*.nameLength == name_length && mem.eql(symbol.*.namePointer, name, name_length) { return index }
+        index += 1
+    }
+    return NONE
+}
+
+// The first section of `kind`, NONE for none.
+pub fn sectionOfKind(object: *Object, kind: u8) -> usize {
+    var index: usize = 0
+    while index < object.*.sections.*.length {
+        if sectionAt(object, index).*.kind == kind { return index }
+        index += 1
+    }
+    return NONE
+}
+
+pub fn isDefined(symbol: *Symbol) -> bool { return symbol.*.section != NONE }
+
+pub fn alignUp(value: usize, alignment: usize) -> usize {
+    if alignment <= 1 { return value }
+    return (value + alignment - 1) / alignment * alignment
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+const SECTION_HEADER_SIZE: usize = 64
+const SYMBOL_SIZE: usize = 24
+const RELA_SIZE: usize = 24
+
+// The section names, each ended by a NUL (written for every "|"), in
+// header order after the null section: .text .rela.text .data
+// .rela.data .bss .init_array .rela.init_array .symtab .strtab .shstrtab
+// (.tdata after them, when there is thread-local data)
+const SHSTRTAB: []const u8 = "|.text|.rela.text|.data|.rela.data|.bss|.init_array|.rela.init_array|.symtab|.strtab|.shstrtab|"
+const TDATA_NAME: []const u8 = ".tdata|"
+const NAME_TEXT: u32 = 1
+const NAME_RELA_TEXT: u32 = 7
+const NAME_DATA: u32 = 18
+const NAME_RELA_DATA: u32 = 24
+const NAME_BSS: u32 = 35
+const NAME_INIT: u32 = 40
+const NAME_RELA_INIT: u32 = 52
+const NAME_SYMTAB: u32 = 69
+const NAME_STRTAB: u32 = 77
+const NAME_SHSTRTAB: u32 = 85
+const NAME_TDATA: u32 = 95
+
+const SH_TEXT: usize = 1
+const SH_RELA_TEXT: usize = 2
+const SH_DATA: usize = 3
+const SH_RELA_DATA: usize = 4
+const SH_BSS: usize = 5
+const SH_INIT: usize = 6
+const SH_RELA_INIT: usize = 7
+const SH_SYMTAB: usize = 8
+const SH_STRTAB: usize = 9
+const SH_SHSTRTAB: usize = 10
+const SECTION_HEADERS: usize = 11
+const SH_TDATA: usize = 11
+
+const SHT_PROGBITS: usize = 1
+const SHT_SYMTAB: usize = 2
+const SHT_STRTAB: usize = 3
+const SHT_RELA: usize = 4
+const SHT_NOBITS: usize = 8
+const SHT_INIT_ARRAY: usize = 14
+const SHF_WRITE: usize = 1
+const SHF_ALLOC: usize = 2
+const SHF_EXECINSTR: usize = 4
+const SHF_INFO_LINK: usize = 64
+const SHF_TLS: usize = 1024
+
+const SHN_UNDEF: u16 = 0
+const SHN_ABS: usize = 65521
+const SHN_COMMON: usize = 65522
+
+// The file section a section kind goes to.
+fn headerOfKind(kind: u8) -> usize {
+    if kind == TEXT { return SH_TEXT }
+    if kind == DATA { return SH_DATA }
+    if kind == BSS { return SH_BSS }
+    if kind == TDATA { return SH_TDATA }
+    return SH_INIT
+}
+
+fn relaOfKind(kind: u8) -> usize {
+    if kind == TEXT { return SH_RELA_TEXT }
+    if kind == DATA { return SH_RELA_DATA }
+    return SH_RELA_INIT
+}
+
+fn sectionHeader(buffer: [*]u8, index: usize, headers_at: usize, name: u32, kind: usize, flags: usize, offset: usize, size: usize, link: u32, info: u32, alignment: u64, entry_size: u64) -> void {
+    const at = headers_at + index * SECTION_HEADER_SIZE
+    elf.writeU32(buffer, at, name)
+    elf.writeU32(buffer, at + 4, @intCast(u32, kind))
+    elf.writeU64(buffer, at + 8, @intCast(u64, flags))
+    elf.writeU64(buffer, at + 16, 0)
+    elf.writeU64(buffer, at + 24, @intCast(u64, offset))
+    elf.writeU64(buffer, at + 32, @intCast(u64, size))
+    elf.writeU32(buffer, at + 40, link)
+    elf.writeU32(buffer, at + 44, info)
+    elf.writeU64(buffer, at + 48, alignment)
+    elf.writeU64(buffer, at + 56, entry_size)
+}
+
+fn writeSymbol(buffer: [*]u8, at: usize, name: u32, binding: u8, kind: u8, section: u16, value: u64, size: u64) -> void {
+    elf.writeU32(buffer, at, name)
+    buffer[at + 4] = (binding << 4) | kind
+    buffer[at + 5] = 0
+    elf.writeU16(buffer, at + 6, section)
+    elf.writeU64(buffer, at + 8, value)
+    elf.writeU64(buffer, at + 16, size)
+}
+
+// Writes the object to `path`: one file section per kind (the first
+// section of a kind in the object; mlx-cc makes one of each), the symbol
+// table with the locals first (the four section symbols, then the
+// object's local ones), the relocations by section.
+pub fn write(object: *Object, path: [*]const u8) -> bool {
+    const allocator = object.*.allocator
+    const text = sectionOfKind(object, TEXT)
+    const data = sectionOfKind(object, DATA)
+    const bss = sectionOfKind(object, BSS)
+    const init = sectionOfKind(object, INIT)
+    const tdata = sectionOfKind(object, TDATA)
+    // (The .tdata section and its section symbol only with thread-local
+    // data: an object without stays as it was.)
+    const sections = if tdata == NONE { SECTION_HEADERS } else { SECTION_HEADERS + 1 }
+    const section_symbols: usize = if tdata == NONE { 4 } else { 5 }
+    // The symbols' order in the table: the section symbols (1 to 4), the
+    // locals, then the globals; `table_index` maps the object's symbols.
+    const count = object.*.symbols.*.length
+    const table_memory = allocator.alloc((count + 1) * 8, 8)
+    if table_memory == null { return false }
+    var table_index: [*]usize = undefined
+    unsafe { table_index = @ptrCast([*]usize, table_memory.?) }
+    var next: usize = section_symbols + 1
+    var strtab_size: usize = 1
+    var pass: usize = 0
+    while pass < 2 {
+        var index: usize = 0
+        while index < count {
+            const symbol = symbolAt(object, index)
+            const is_local = symbol.*.binding == LOCAL
+            if (pass == 0) == is_local {
+                table_index[index] = next
+                next += 1
+                strtab_size += symbol.*.nameLength + 1
+            }
+            index += 1
+        }
+        pass += 1
+    }
+    var first_global: usize = section_symbols + 1
+    var index: usize = 0
+    while index < count {
+        if symbolAt(object, index).*.binding == LOCAL { first_global += 1 }
+        index += 1
+    }
+    const symbol_entries = next
+    // The relocations of each section.
+    var rela_text: usize = 0
+    var rela_data: usize = 0
+    var rela_init: usize = 0
+    index = 0
+    while index < object.*.relocations.*.length {
+        const relocation = relocationAt(object, index)
+        const kind = sectionAt(object, relocation.*.section).*.kind
+        if kind == TEXT { rela_text += 1 } else if kind == DATA { rela_data += 1 } else if kind == INIT { rela_init += 1 }
+        index += 1
+    }
+    // The layout: the header, the sections' contents, the headers last.
+    var at: usize = elf.ELF_HEADER_SIZE
+    const text_offset = alignUp(at, 16)
+    const text_length = if text == NONE { 0 } else { sectionAt(object, text).*.length }
+    at = text_offset + text_length
+    const rela_text_offset = alignUp(at, 8)
+    at = rela_text_offset + rela_text * RELA_SIZE
+    const data_offset = alignUp(at, 16)
+    const data_length = if data == NONE { 0 } else { sectionAt(object, data).*.length }
+    at = data_offset + data_length
+    const rela_data_offset = alignUp(at, 8)
+    at = rela_data_offset + rela_data * RELA_SIZE
+    const bss_length = if bss == NONE { 0 } else { sectionAt(object, bss).*.length }
+    const init_offset = alignUp(at, 8)
+    const init_length = if init == NONE { 0 } else { sectionAt(object, init).*.length }
+    at = init_offset + init_length
+    const tdata_align: usize = if tdata == NONE { 1 } else { sectionAt(object, tdata).*.alignment }
+    const tdata_offset = alignUp(at, if tdata_align > 8 { tdata_align } else { 8 })
+    const tdata_length = if tdata == NONE { 0 } else { sectionAt(object, tdata).*.length }
+    at = tdata_offset + tdata_length
+    const rela_init_offset = alignUp(at, 8)
+    at = rela_init_offset + rela_init * RELA_SIZE
+    const symtab_offset = alignUp(at, 8)
+    at = symtab_offset + symbol_entries * SYMBOL_SIZE
+    const strtab_offset = at
+    at = strtab_offset + strtab_size
+    const shstrtab_offset = at
+    const shstrtab_length = SHSTRTAB.length + (if tdata == NONE { 0 } else { TDATA_NAME.length })
+    at = shstrtab_offset + shstrtab_length
+    const headers_offset = alignUp(at, 8)
+    const total = headers_offset + sections * SECTION_HEADER_SIZE
+    const memory = allocator.alloc(total, 8)
+    if memory == null { return false }
+    const buffer = memory.?
+    mem.zero(buffer, total)
+    // The ELF header.
+    buffer[0] = 127
+    buffer[1] = 69
+    buffer[2] = 76
+    buffer[3] = 70
+    buffer[4] = 2
+    buffer[5] = 1
+    buffer[6] = 1
+    elf.writeU16(buffer, 16, 1)
+    elf.writeU16(buffer, 18, 62)
+    elf.writeU32(buffer, 20, 1)
+    elf.writeU64(buffer, 40, @intCast(u64, headers_offset))
+    elf.writeU16(buffer, 52, @intCast(u16, elf.ELF_HEADER_SIZE))
+    elf.writeU16(buffer, 58, @intCast(u16, SECTION_HEADER_SIZE))
+    elf.writeU16(buffer, 60, @intCast(u16, sections))
+    elf.writeU16(buffer, 62, @intCast(u16, SH_SHSTRTAB))
+    // The contents.
+    if text_length > 0 { mem.copy(pointerAt(buffer, text_offset), sectionAt(object, text).*.bytes, text_length) }
+    if data_length > 0 { mem.copy(pointerAt(buffer, data_offset), sectionAt(object, data).*.bytes, data_length) }
+    if init_length > 0 { mem.copy(pointerAt(buffer, init_offset), sectionAt(object, init).*.bytes, init_length) }
+    if tdata_length > 0 && @intFromPtr(sectionAt(object, tdata).*.bytes) != 0 { mem.copy(pointerAt(buffer, tdata_offset), sectionAt(object, tdata).*.bytes, tdata_length) }
+    var name_index: usize = 0
+    while name_index < SHSTRTAB.length {
+        buffer[shstrtab_offset + name_index] = if SHSTRTAB[name_index] == 124 { 0 } else { SHSTRTAB[name_index] }
+        name_index += 1
+    }
+    if tdata != NONE {
+        var tdata_index: usize = 0
+        while tdata_index < TDATA_NAME.length {
+            buffer[shstrtab_offset + name_index + tdata_index] = if TDATA_NAME[tdata_index] == 124 { 0 } else { TDATA_NAME[tdata_index] }
+            tdata_index += 1
+        }
+    }
+    // The symbols: the section symbols first.
+    var section_index: usize = 1
+    while section_index <= section_symbols {
+        const file_section: u16 = if section_index == 1 { @intCast(u16, SH_TEXT) } else if section_index == 2 { @intCast(u16, SH_DATA) } else if section_index == 3 { @intCast(u16, SH_BSS) } else if section_index == 4 { @intCast(u16, SH_INIT) } else { @intCast(u16, SH_TDATA) }
+        writeSymbol(buffer, symtab_offset + section_index * SYMBOL_SIZE, 0, LOCAL, SECTION, file_section, 0, 0)
+        section_index += 1
+    }
+    var string_at: usize = 1
+    index = 0
+    while index < count {
+        const symbol = symbolAt(object, index)
+        const entry = symtab_offset + table_index[index] * SYMBOL_SIZE
+        var file_section: u16 = SHN_UNDEF
+        if symbol.*.section == ABSOLUTE {
+            file_section = @intCast(u16, SHN_ABS)
+        } else if symbol.*.section != NONE {
+            file_section = @intCast(u16, headerOfKind(sectionAt(object, symbol.*.section).*.kind))
+        }
+        writeSymbol(buffer, entry, @intCast(u32, string_at), symbol.*.binding, symbol.*.kind, file_section, @intCast(u64, symbol.*.value), @intCast(u64, symbol.*.size))
+        mem.copy(pointerAt(buffer, strtab_offset + string_at), symbol.*.namePointer, symbol.*.nameLength)
+        string_at += symbol.*.nameLength + 1
+        index += 1
+    }
+    // The relocations.
+    var text_at: usize = rela_text_offset
+    var data_at: usize = rela_data_offset
+    var init_at: usize = rela_init_offset
+    index = 0
+    while index < object.*.relocations.*.length {
+        const relocation = relocationAt(object, index)
+        const kind = sectionAt(object, relocation.*.section).*.kind
+        var entry: usize = 0
+        if kind == TEXT {
+            entry = text_at
+            text_at += RELA_SIZE
+        } else if kind == DATA {
+            entry = data_at
+            data_at += RELA_SIZE
+        } else if kind == INIT {
+            entry = init_at
+            init_at += RELA_SIZE
+        } else {
+            index += 1
+            continue
+        }
+        // A relocation against a section symbol names the file's section
+        // symbol (1 to 4).
+        var symbol_entry = table_index[relocation.*.symbol]
+        const target = symbolAt(object, relocation.*.symbol)
+        if target.*.kind == SECTION && target.*.section != NONE {
+            const target_kind = sectionAt(object, target.*.section).*.kind
+            symbol_entry = if target_kind == TEXT { 1 } else if target_kind == DATA { 2 } else if target_kind == BSS { 3 } else if target_kind == TDATA { 5 } else { 4 }
+        }
+        elf.writeU64(buffer, entry, @intCast(u64, relocation.*.offset))
+        elf.writeU64(buffer, entry + 8, (@intCast(u64, symbol_entry) << 32) | @intCast(u64, relocation.*.kind))
+        elf.writeU64(buffer, entry + 16, @bitCast(u64, relocation.*.addend))
+        index += 1
+    }
+    // The section headers.
+    const text_align: u64 = if text == NONE { 16 } else { @intCast(u64, sectionAt(object, text).*.alignment) }
+    const data_align: u64 = if data == NONE { 8 } else { @intCast(u64, sectionAt(object, data).*.alignment) }
+    const bss_align: u64 = if bss == NONE { 8 } else { @intCast(u64, sectionAt(object, bss).*.alignment) }
+    sectionHeader(buffer, SH_TEXT, headers_offset, NAME_TEXT, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, text_offset, text_length, 0, 0, text_align, 0)
+    sectionHeader(buffer, SH_RELA_TEXT, headers_offset, NAME_RELA_TEXT, SHT_RELA, SHF_INFO_LINK, rela_text_offset, rela_text * RELA_SIZE, @intCast(u32, SH_SYMTAB), @intCast(u32, SH_TEXT), 8, RELA_SIZE)
+    sectionHeader(buffer, SH_DATA, headers_offset, NAME_DATA, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, data_offset, data_length, 0, 0, data_align, 0)
+    sectionHeader(buffer, SH_RELA_DATA, headers_offset, NAME_RELA_DATA, SHT_RELA, SHF_INFO_LINK, rela_data_offset, rela_data * RELA_SIZE, @intCast(u32, SH_SYMTAB), @intCast(u32, SH_DATA), 8, RELA_SIZE)
+    sectionHeader(buffer, SH_BSS, headers_offset, NAME_BSS, SHT_NOBITS, SHF_ALLOC | SHF_WRITE, data_offset + data_length, bss_length, 0, 0, bss_align, 0)
+    sectionHeader(buffer, SH_INIT, headers_offset, NAME_INIT, SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE, init_offset, init_length, 0, 0, 8, 8)
+    sectionHeader(buffer, SH_RELA_INIT, headers_offset, NAME_RELA_INIT, SHT_RELA, SHF_INFO_LINK, rela_init_offset, rela_init * RELA_SIZE, @intCast(u32, SH_SYMTAB), @intCast(u32, SH_INIT), 8, RELA_SIZE)
+    sectionHeader(buffer, SH_SYMTAB, headers_offset, NAME_SYMTAB, SHT_SYMTAB, 0, symtab_offset, symbol_entries * SYMBOL_SIZE, @intCast(u32, SH_STRTAB), @intCast(u32, first_global), 8, SYMBOL_SIZE)
+    sectionHeader(buffer, SH_STRTAB, headers_offset, NAME_STRTAB, SHT_STRTAB, 0, strtab_offset, strtab_size, 0, 0, 1, 0)
+    sectionHeader(buffer, SH_SHSTRTAB, headers_offset, NAME_SHSTRTAB, SHT_STRTAB, 0, shstrtab_offset, shstrtab_length, 0, 0, 1, 0)
+    if tdata != NONE { sectionHeader(buffer, SH_TDATA, headers_offset, NAME_TDATA, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS, tdata_offset, tdata_length, 0, 0, @intCast(u64, tdata_align), 0) }
+    const wrote = writeFile(path, buffer, total)
+    allocator.free(buffer, total, 8)
+    allocator.free(table_memory.?, (count + 1) * 8, 8)
+    return wrote
+}
+
+pub fn writeFile(path: [*]const u8, buffer: [*]const u8, size: usize) -> bool { return fs.writeFile(path, buffer, size, 420) }
+
+// ---------------------------------------------------------------------------
+// Reading
+
+// Little-endian fields, read into whole words.
+fn wordAt(bytes: [*]const u8, place: usize, width: usize) -> usize {
+    var value: usize = 0
+    var remaining: usize = width
+    while remaining > 0 {
+        remaining -= 1
+        value = (value << 8) | @intCast(usize, bytes[place + remaining])
+    }
+    return value
+}
+
+fn u16At(bytes: [*]const u8, place: usize) -> usize { return wordAt(bytes, place, 2) }
+fn u32At(bytes: [*]const u8, place: usize) -> usize { return wordAt(bytes, place, 4) }
+fn u64At(bytes: [*]const u8, place: usize) -> usize { return wordAt(bytes, place, 8) }
+
+fn nameIs(bytes: [*]const u8, at: usize, limit: usize, text: []const u8) -> bool {
+    if at + text.length >= limit { return false }
+    var index: usize = 0
+    while index < text.length {
+        if bytes[at + index] != text[index] { return false }
+        index += 1
+    }
+    return bytes[at + text.length] == 0
+}
+
+fn nameStartsWith(bytes: [*]const u8, at: usize, limit: usize, text: []const u8) -> bool {
+    if at + text.length > limit { return false }
+    var index: usize = 0
+    while index < text.length {
+        if bytes[at + index] != text[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Whether `bytes` is a relocatable x86_64 object.
+pub fn isObject(bytes: [*]const u8, length: usize) -> bool {
+    if length < elf.ELF_HEADER_SIZE { return false }
+    if bytes[0] != 127 || bytes[1] != 69 || bytes[2] != 76 || bytes[3] != 70 || bytes[4] != 2 { return false }
+    return u16At(bytes, 16) == 1 && u16At(bytes, 18) == 62
+}
+
+// Reads the object in `bytes` (kept: the sections' contents point into
+// it) into `result`, an empty object (initAt). The sections loaded into
+// a program are kept by kind: code, data (read-only data too), zero
+// data, the init functions; .eh_frame and the notes are dropped. A
+// common symbol gets a zero-data section of its own. False when the
+// bytes are not such an object.
+pub fn read(result: *Object, bytes: [*]const u8, length: usize) -> bool {
+    if !isObject(bytes, length) { return false }
+    const headers_offset = u64At(bytes, 40)
+    const header_size = u16At(bytes, 58)
+    const header_count = u16At(bytes, 60)
+    const names_index = u16At(bytes, 62)
+    if header_size != SECTION_HEADER_SIZE || headers_offset + header_count * header_size > length { return false }
+    const names_offset = u64At(bytes, headers_offset + names_index * SECTION_HEADER_SIZE + 24)
+    const names_size = u64At(bytes, headers_offset + names_index * SECTION_HEADER_SIZE + 32)
+    // The file's sections to the object's (NONE: dropped).
+    const map_memory = result.*.allocator.alloc((header_count + 1) * 8, 8)
+    if map_memory == null { return false }
+    var map: [*]usize = undefined
+    unsafe { map = @ptrCast([*]usize, map_memory.?) }
+    var index: usize = 0
+    while index < header_count {
+        map[index] = NONE
+        const at = headers_offset + index * SECTION_HEADER_SIZE
+        const name = u32At(bytes, at)
+        const kind = u32At(bytes, at + 4)
+        const flags = u64At(bytes, at + 8)
+        const offset = u64At(bytes, at + 24)
+        const size = u64At(bytes, at + 32)
+        const alignment = u64At(bytes, at + 48)
+        const name_at = names_offset + name
+        const dropped = nameStartsWith(bytes, name_at, names_offset + names_size, ".eh_frame") || nameStartsWith(bytes, name_at, names_offset + names_size, ".note")
+        if flags & SHF_ALLOC != 0 && !dropped {
+            var section_kind: u8 = 0
+            if flags & SHF_TLS != 0 {
+                section_kind = TDATA
+            } else if kind == SHT_INIT_ARRAY {
+                section_kind = INIT
+            } else if kind == SHT_NOBITS {
+                section_kind = BSS
+            } else if kind == SHT_PROGBITS && flags & SHF_EXECINSTR != 0 {
+                section_kind = TEXT
+            } else if kind == SHT_PROGBITS {
+                section_kind = DATA
+            }
+            if section_kind != 0 {
+                const nobits = kind == SHT_NOBITS
+                if !nobits && offset + size > length { return false }
+                // (.tbss: no bytes, zeros.)
+                const contents: usize = if section_kind == TDATA && nobits { 0 } else { @intFromPtr(bytes) + offset }
+                unsafe { map[index] = addSection(result, section_kind, @ptrFromInt([*]const u8, contents), size, alignment) }
+            }
+        }
+        index += 1
+    }
+    // The symbols.
+    var symtab: usize = NONE
+    index = 0
+    while index < header_count {
+        if u32At(bytes, headers_offset + index * SECTION_HEADER_SIZE + 4) == SHT_SYMTAB { symtab = index }
+        index += 1
+    }
+    var symbol_base: usize = 0
+    if symtab != NONE {
+        const at = headers_offset + symtab * SECTION_HEADER_SIZE
+        const offset = u64At(bytes, at + 24)
+        const size = u64At(bytes, at + 32)
+        const strings = u32At(bytes, at + 40)
+        const strings_offset = u64At(bytes, headers_offset + strings * SECTION_HEADER_SIZE + 24)
+        if offset + size > length { return false }
+        symbol_base = result.*.symbols.*.length
+        var entry: usize = 1
+        while entry * SYMBOL_SIZE < size {
+            const symbol_at = offset + entry * SYMBOL_SIZE
+            const name = u32At(bytes, symbol_at)
+            const info = bytes[symbol_at + 4]
+            const shndx = u16At(bytes, symbol_at + 6)
+            const value = u64At(bytes, symbol_at + 8)
+            const symbol_size = u64At(bytes, symbol_at + 16)
+            var name_length: usize = 0
+            while strings_offset + name + name_length < length && bytes[strings_offset + name + name_length] != 0 { name_length += 1 }
+            var section: usize = NONE
+            var symbol_value = value
+            if shndx == SHN_ABS {
+                section = ABSOLUTE
+            } else if shndx == SHN_COMMON {
+                // Zero data of its own: `value` is the alignment.
+                unsafe { section = addSection(result, BSS, @ptrFromInt([*]const u8, 0), symbol_size, value) }
+                symbol_value = 0
+            } else if shndx != 0 && shndx < header_count {
+                section = map[shndx]
+            }
+            unsafe { const added = addSymbol(result, @ptrFromInt([*]const u8, @intFromPtr(bytes) + strings_offset + name), name_length, info >> 4, info & 15, section, symbol_value, symbol_size) }
+            entry += 1
+        }
+    }
+    // The relocations of the sections kept.
+    index = 0
+    while index < header_count {
+        const at = headers_offset + index * SECTION_HEADER_SIZE
+        if u32At(bytes, at + 4) == SHT_RELA {
+            const target = u32At(bytes, at + 44)
+            if target < header_count && map[target] != NONE {
+                const offset = u64At(bytes, at + 24)
+                const size = u64At(bytes, at + 32)
+                if offset + size > length { return false }
+                var entry: usize = 0
+                while entry * RELA_SIZE < size {
+                    const rela_at = offset + entry * RELA_SIZE
+                    const place = u64At(bytes, rela_at)
+                    const info = u64At(bytes, rela_at + 8)
+                    const addend = @bitCast(i64, u64At(bytes, rela_at + 16))
+                    const symbol = info >> 32
+                    if symbol == 0 || symbol_base + symbol - 1 >= result.*.symbols.*.length { return false }
+                    addRelocation(result, map[target], place, @intCast(u8, info & 255), symbol_base + symbol - 1, addend)
+                    entry += 1
+                }
+            }
+        }
+        index += 1
+    }
+    result.*.allocator.free(map_memory.?, (header_count + 1) * 8, 8)
+    return true
+}

@@ -1,0 +1,526 @@
+// std.flate: DEFLATE (RFC 1951), the repository's one implementation of
+// it: compression and decompression of raw deflate data, zlib streams
+// (RFC 1950) and gzip members (RFC 1952).
+//
+//     const flate = @import("std.flate")
+//
+//     // All at once, into a buffer of the caller's:
+//     const room = flate.compressBound(length, flate.Format.zlib)
+//     const packed_length = flate.compress(data, length, output, room, 6, flate.Format.zlib, allocator)
+//     const made = flate.decompress(input, count, output, capacity, flate.Format.gzip)
+//
+//     // All at once, into memory of an allocator:
+//     var result: flate.Buffer = undefined
+//     if flate.decompressAlloc(allocator, input, count, flate.Format.detect, &result) == flate.Status.done { ... flate.freeBuffer(allocator, &result) }
+//
+//     // In pieces:
+//     var deflater: flate.Deflater = undefined
+//     if flate.deflaterInit(&deflater, allocator, flate.options(9, flate.Format.gzip)) != flate.Status.ok { ... }
+//     var progress: flate.Progress = undefined
+//     const status = flate.deflaterRun(&deflater, piece, pieceLength, buffer, 4096, flate.Flush.none, &progress)
+//     ... progress.consumed bytes of the piece were taken, progress.produced written ...
+//     flate.deflaterEnd(&deflater)
+//
+// The compressor is zlib's (1.3.1) step for step: its hash chains, the
+// lazy matching and configuration table of each level (0 stored, 1 to 3
+// fast, 4 to 9 lazy), the strategies (filtered, Huffman only, run-length,
+// fixed codes), its Huffman trees and block choices, so its bytes are
+// zlib's for the same input and parameters. The decompressor is zlib's
+// state machine, with its decoding tables and fast loop; it takes input
+// and output in pieces of any size, checks the check values, and tells
+// damaged data apart (Status.damaged, and the stream's message).
+//
+// The parts: flate/stream.mlx (the stream, the codes, memory),
+// flate/trees.mlx and flate/deflate.mlx (compression), flate/inflate.mlx
+// (decompression); the check values are std.crc's. The engine's own
+// functions (std.flate.deflate, std.flate.inflate, on a Stream, with
+// zlib's return codes) are what the zlib C API (compiler/libc/zlib) is
+// made of; the functions here are for Mlx programs.
+//
+// Arithmetic on narrow integers is done in 64-bit words, and narrowed
+// values are masked first (see flate/stream.mlx).
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const fixed_buffer = @import("../bootstrap/fixed_buffer_allocator.mlx")
+const crc = @import("./crc.mlx")
+const zs = @import("./flate/stream.mlx")
+const engine_deflate = @import("./flate/deflate.mlx")
+const engine_inflate = @import("./flate/inflate.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const Stream = zs.Stream
+pub const Header = zs.Header
+
+// What the compressed data is wrapped in.
+pub const Format = enum(u8) {
+    // Raw deflate data, nothing around it.
+    raw,
+    // A zlib stream: a two-byte header, the Adler-32 of the data last.
+    zlib,
+    // A gzip member: a header (Header), the CRC-32 and the size last.
+    gzip,
+    // Decompression only: a zlib stream or a gzip member, as its header
+    // says.
+    detect
+}
+
+// How a call went.
+pub const Status = enum(u8) {
+    // Progress was made; there is more to do.
+    ok,
+    // The end of the stream: all of it written (compression), or read
+    // and its check value right (decompression).
+    done,
+    // The zlib stream needs the preset dictionary (setDictionary).
+    needDictionary,
+    // The data is not a valid stream, or its check value is wrong.
+    damaged,
+    noMemory,
+    // No progress was possible: more input or more room is needed.
+    stuck,
+    // The parameters or the state are not usable.
+    misuse
+}
+
+// What a compression call is to flush (zlib's flushes).
+pub const Flush = enum(u8) {
+    // Nothing: compress as much as is best.
+    none,
+    // All output so far, and an empty fixed block (zlib's partial flush).
+    partial,
+    // All output so far, ending on a byte boundary with an empty stored
+    // block: a reader can decode everything given so far.
+    sync,
+    // As sync, and the history forgotten: a reader can start here.
+    full,
+    // The end: all input, the trailer; call until Status.done.
+    finish,
+    // Up to the end of the current block.
+    block,
+    // Decompression only: stop at the end of a block's header.
+    trees
+}
+
+pub const Strategy = enum(u8) {
+    normal,
+    // For data of small values with some randomness (filtered images):
+    // fewer short matches.
+    filtered,
+    // No matches, Huffman codes only.
+    huffmanOnly,
+    // Matches at distance one only (run lengths).
+    rle,
+    // No dynamic Huffman codes.
+    fixed
+}
+
+// The parameters of a compressor.
+pub const Options = struct {
+    // 0 (stored, no compression) to 9 (smallest); -1 for 6.
+    level: i32
+    format: Format
+    // The window: 2^windowBits bytes, 9 to 15.
+    windowBits: u32
+    // The memory of the matcher: 1 to 9 (8 is zlib's default).
+    memoryLevel: u32
+    strategy: Strategy
+}
+
+// Options of LEVEL and FORMAT, the rest zlib's defaults (a 32 KiB window,
+// memory level 8, the normal strategy).
+pub fn options(level: i32, format: Format) -> Options {
+    return Options.{ .level = level, .format = format, .windowBits = 15, .memoryLevel = 8, .strategy = Strategy.normal }
+}
+
+pub const Deflater = struct {
+    stream: Stream
+}
+
+pub const Inflater = struct {
+    stream: Stream
+}
+
+// What a call to deflaterRun or inflaterRun took and gave.
+pub const Progress = struct {
+    consumed: usize
+    produced: usize
+}
+
+// Bytes of an allocator (decompressAlloc, compressAlloc): `length` of
+// them made, `capacity` allocated (what freeBuffer gives back).
+pub const Buffer = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+}
+
+// The most one call gives the engine (its counts are 32-bit, as zlib's).
+const PIECE: usize = 0xffffffff
+
+pub fn statusOf(code: i32) -> Status {
+    if code == zs.OK { return Status.ok }
+    if code == zs.STREAM_END { return Status.done }
+    if code == zs.NEED_DICT { return Status.needDictionary }
+    if code == zs.DATA_ERROR { return Status.damaged }
+    if code == zs.MEM_ERROR { return Status.noMemory }
+    if code == zs.BUF_ERROR { return Status.stuck }
+    return Status.misuse
+}
+
+// The message of the last error of a stream ("incorrect header check",
+// "invalid distance too far back"...), empty when there is none.
+pub fn message(stream: *const Stream) -> []const u8 {
+    if stream.*.msg == 0 { return "" }
+    var length: usize = 0
+    while zs.get8(stream.*.msg + length) != 0 { length += 1 }
+    const text: [*]const u8 = unsafe { @ptrFromInt([*]const u8, stream.*.msg) }
+    return unsafe { text[0..length] }
+}
+
+fn windowBitsOf(format: Format, bits: u32) -> i32 {
+    const value = @intCast(i32, bits)
+    if format == Format.raw { return -value }
+    if format == Format.gzip { return value + 16 }
+    if format == Format.detect { return value + 32 }
+    return value
+}
+
+fn clear(stream: *Stream, allocator: Allocator) -> void {
+    stream.*.next_in = 0
+    stream.*.avail_in = 0
+    stream.*.total_in = 0
+    stream.*.next_out = 0
+    stream.*.avail_out = 0
+    stream.*.total_out = 0
+    stream.*.msg = 0
+    stream.*.state = 0
+    stream.*.data_type = 0
+    stream.*.adler = 0
+    stream.*.allocator = allocator
+    stream.*.owner = 0
+}
+
+// Gives the stream INPUT and OUTPUT, as much of each as one call takes.
+fn setPieces(stream: *Stream, input: [*]const u8, length: usize, output: [*]u8, capacity: usize) -> void {
+    stream.*.next_in = @intFromPtr(input)
+    stream.*.avail_in = @intCast(u32, if length > PIECE { PIECE } else { length })
+    stream.*.next_out = @intFromPtr(output)
+    stream.*.avail_out = @intCast(u32, if capacity > PIECE { PIECE } else { capacity })
+}
+
+// Tells what the call took and made of what setPieces gave.
+fn tell(stream: *Stream, length: usize, capacity: usize, progress: *Progress) -> void {
+    const given_in = if length > PIECE { PIECE } else { length }
+    const given_out = if capacity > PIECE { PIECE } else { capacity }
+    progress.*.consumed = given_in - @intCast(usize, stream.*.avail_in)
+    progress.*.produced = given_out - @intCast(usize, stream.*.avail_out)
+    stream.*.next_in = 0
+    stream.*.avail_in = 0
+}
+
+// ---------------------------------------------------------------------------
+// Compression in pieces
+
+// Sets up DEFLATER with OPTIONS, its memory from ALLOCATOR (about 256 KiB
+// with the default options); Status.ok, or noMemory or misuse.
+pub fn deflaterInit(deflater: *Deflater, allocator: Allocator, settings: Options) -> Status {
+    clear(&deflater.*.stream, allocator)
+    const code = engine_deflate.init2(&deflater.*.stream, settings.level, zs.DEFLATED, windowBitsOf(settings.format, settings.windowBits), @intCast(i32, settings.memoryLevel), @intCast(i32, @intFromEnum(settings.strategy)))
+    return statusOf(code)
+}
+
+// Compresses what it can of LENGTH bytes at INPUT into OUTPUT (CAPACITY
+// bytes); PROGRESS tells how many were taken and written. With
+// Flush.finish, calls go on (with the rest of the input and more room)
+// until Status.done. Status.stuck: nothing could be done (no room, or no
+// input and nothing to flush).
+pub fn deflaterRun(deflater: *Deflater, input: [*]const u8, length: usize, output: [*]u8, capacity: usize, flush: Flush, progress: *Progress) -> Status {
+    const stream = &deflater.*.stream
+    setPieces(stream, input, length, output, capacity)
+    const code = engine_deflate.run(stream, @intCast(i32, @intFromEnum(flush)))
+    tell(stream, length, capacity, progress)
+    return statusOf(code)
+}
+
+// Starts a new stream with the same options (and memory).
+pub fn deflaterReset(deflater: *Deflater) -> Status {
+    return statusOf(engine_deflate.reset(&deflater.*.stream))
+}
+
+// The preset dictionary: before the first data (zlib and raw formats).
+pub fn deflaterSetDictionary(deflater: *Deflater, dictionary: [*]const u8, length: usize) -> Status {
+    return statusOf(engine_deflate.setDictionary(&deflater.*.stream, @intFromPtr(dictionary), length))
+}
+
+// The gzip header to write (gzip format, before the first data); it must
+// stay where it is until the header is written.
+pub fn deflaterSetHeader(deflater: *Deflater, header: *const Header) -> Status {
+    return statusOf(engine_deflate.setHeader(&deflater.*.stream, @intFromPtr(header)))
+}
+
+// Another level and strategy from here on.
+pub fn deflaterParams(deflater: *Deflater, level: i32, strategy: Strategy) -> Status {
+    return statusOf(engine_deflate.params(&deflater.*.stream, level, @intCast(i32, @intFromEnum(strategy))))
+}
+
+// The most LENGTH bytes compress to with this deflater's options (in one
+// go, with Flush.finish).
+pub fn deflaterBound(deflater: *Deflater, length: usize) -> usize {
+    return @intCast(usize, engine_deflate.bound(&deflater.*.stream, @intCast(u64, length)))
+}
+
+// Gives back the deflater's memory.
+pub fn deflaterEnd(deflater: *Deflater) -> void {
+    _ = engine_deflate.end(&deflater.*.stream)
+}
+
+// ---------------------------------------------------------------------------
+// Decompression in pieces
+
+// Sets up INFLATER for data of FORMAT (with a window of up to 32 KiB),
+// its memory from ALLOCATOR (about 7 KiB, and the window, 32 KiB, once
+// output is given in pieces).
+pub fn inflaterInit(inflater: *Inflater, allocator: Allocator, format: Format) -> Status {
+    clear(&inflater.*.stream, allocator)
+    return statusOf(engine_inflate.init2(&inflater.*.stream, windowBitsOf(format, 15)))
+}
+
+// Decompresses what it can of LENGTH bytes at INPUT into OUTPUT (CAPACITY
+// bytes); PROGRESS tells how many were taken and written. Status.done at
+// the stream's end (input after it is left), Status.stuck when more input
+// or more room is needed and none was given.
+pub fn inflaterRun(inflater: *Inflater, input: [*]const u8, length: usize, output: [*]u8, capacity: usize, progress: *Progress) -> Status {
+    const stream = &inflater.*.stream
+    setPieces(stream, input, length, output, capacity)
+    const code = engine_inflate.run(stream, zs.NO_FLUSH)
+    tell(stream, length, capacity, progress)
+    return statusOf(code)
+}
+
+// Starts on a new stream of the same format.
+pub fn inflaterReset(inflater: *Inflater) -> Status {
+    return statusOf(engine_inflate.reset(&inflater.*.stream))
+}
+
+// The preset dictionary, when a call gave Status.needDictionary (or
+// before the first one, raw format).
+pub fn inflaterSetDictionary(inflater: *Inflater, dictionary: [*]const u8, length: usize) -> Status {
+    return statusOf(engine_inflate.setDictionary(&inflater.*.stream, @intFromPtr(dictionary), length))
+}
+
+// Where the gzip header read is to go (its done field is 1 once it is
+// complete); it must stay where it is until then.
+pub fn inflaterGetHeader(inflater: *Inflater, header: *Header) -> Status {
+    return statusOf(engine_inflate.getHeader(&inflater.*.stream, @intFromPtr(header)))
+}
+
+// Gives back the inflater's memory.
+pub fn inflaterEnd(inflater: *Inflater) -> void {
+    _ = engine_inflate.end(&inflater.*.stream)
+}
+
+// ---------------------------------------------------------------------------
+// All at once
+
+// The most LENGTH bytes compress to with compress() (any level, the
+// default window and memory level).
+pub fn compressBound(length: usize, format: Format) -> usize {
+    const bound = length + (length >> 12) + (length >> 14) + (length >> 25) + 13
+    return if format == Format.gzip { bound + 12 } else { bound }
+}
+
+// Compresses LENGTH bytes at INPUT into OUTPUT (CAPACITY bytes, at most
+// compressBound's), at LEVEL (0 to 9, -1 for 6), the compressor's memory
+// from ALLOCATOR: the bytes written, 0 when they did not fit or memory
+// failed.
+pub fn compress(input: [*]const u8, length: usize, output: [*]u8, capacity: usize, level: i32, format: Format, allocator: Allocator) -> usize {
+    var deflater: Deflater = undefined
+    if format == Format.detect || deflaterInit(&deflater, allocator, options(level, format)) != Status.ok { return 0 }
+    var consumed: usize = 0
+    var produced: usize = 0
+    var status = Status.ok
+    while status == Status.ok {
+        var progress: Progress = undefined
+        const rest = length - consumed
+        const flush = if rest > PIECE { Flush.none } else { Flush.finish }
+        var into: [*]u8 = undefined
+        var from: [*]const u8 = undefined
+        unsafe {
+            into = @ptrFromInt([*]u8, @intFromPtr(output) + produced)
+            from = @ptrFromInt([*]const u8, @intFromPtr(input) + consumed)
+        }
+        status = deflaterRun(&deflater, from, rest, into, capacity - produced, flush, &progress)
+        consumed += progress.consumed
+        produced += progress.produced
+        if status == Status.ok && progress.consumed == 0 && progress.produced == 0 { status = Status.stuck }
+    }
+    deflaterEnd(&deflater)
+    return if status == Status.done { produced } else { 0 }
+}
+
+// Decompresses LENGTH bytes at INPUT (one stream of FORMAT; what follows
+// it is left) into OUTPUT (CAPACITY bytes): the bytes made, 0 when the
+// data is damaged, its check value wrong, or it does not fit. Needs no
+// allocator (its state is on the stack, 8 KiB); input and output under 4
+// GiB (decompressAlloc and the Inflater take any).
+pub fn decompress(input: [*]const u8, length: usize, output: [*]u8, capacity: usize, format: Format) -> usize {
+    if length > PIECE || capacity > PIECE { return 0 }
+    if @sizeOf(engine_inflate.InflateState) + 32 > 8192 { return 0 }
+    var space: [8192]u8 = undefined
+    var fixed = fixed_buffer.init(&space, 8192)
+    var stream: Stream = undefined
+    clear(&stream, fixed_buffer.interface(&fixed))
+    if engine_inflate.init2(&stream, windowBitsOf(format, 15)) != zs.OK { return 0 }
+    setPieces(&stream, input, length, output, capacity)
+    // (All at once: the window is not needed, finishing in this call.)
+    const code = engine_inflate.run(&stream, zs.FINISH)
+    const made = @intCast(usize, stream.total_out)
+    _ = engine_inflate.end(&stream)
+    return if code == zs.STREAM_END { made } else { 0 }
+}
+
+// Compresses LENGTH bytes at INPUT into memory of ALLOCATOR (*RESULT,
+// freed with freeBuffer): Status.done, or noMemory or misuse (and nothing
+// to free).
+pub fn compressAlloc(allocator: Allocator, input: [*]const u8, length: usize, level: i32, format: Format, result: *Buffer) -> Status {
+    result.*.length = 0
+    result.*.capacity = 0
+    if format == Format.detect { return Status.misuse }
+    const capacity = compressBound(length, format)
+    const memory = allocator.alloc(capacity, 16)
+    if memory == null { return Status.noMemory }
+    const made = compress(input, length, memory.?, capacity, level, format, allocator)
+    if made == 0 {
+        allocator.free(memory.?, capacity, 16)
+        return Status.noMemory
+    }
+    result.*.bytes = memory.?
+    result.*.length = made
+    result.*.capacity = capacity
+    return Status.done
+}
+
+// Decompresses LENGTH bytes at INPUT (one stream of FORMAT) into memory
+// of ALLOCATOR, made larger as needed (*RESULT, freed with freeBuffer):
+// Status.done, or damaged (also for data that ends early),
+// needDictionary, noMemory (and nothing to free).
+pub fn decompressAlloc(allocator: Allocator, input: [*]const u8, length: usize, format: Format, result: *Buffer) -> Status {
+    result.*.length = 0
+    result.*.capacity = 0
+    var inflater: Inflater = undefined
+    var status = inflaterInit(&inflater, allocator, format)
+    if status != Status.ok { return status }
+    var capacity: usize = if length < 256 { 1024 } else { length * 4 }
+    if format == Format.gzip {
+        const hint = gzipSize(input, length)
+        if hint > 0 { capacity = hint }
+    }
+    var memory = allocator.alloc(capacity, 16)
+    if memory == null {
+        inflaterEnd(&inflater)
+        return Status.noMemory
+    }
+    var bytes = memory.?
+    var consumed: usize = 0
+    var produced: usize = 0
+    while true {
+        if produced == capacity {
+            const grown = allocator.resize(bytes, capacity, capacity * 2, 16)
+            if grown == null {
+                status = Status.noMemory
+                break
+            }
+            bytes = grown.?
+            capacity = capacity * 2
+        }
+        var progress: Progress = undefined
+        var into: [*]u8 = undefined
+        var from: [*]const u8 = undefined
+        unsafe {
+            into = @ptrFromInt([*]u8, @intFromPtr(bytes) + produced)
+            from = @ptrFromInt([*]const u8, @intFromPtr(input) + consumed)
+        }
+        status = inflaterRun(&inflater, from, length - consumed, into, capacity - produced, &progress)
+        consumed += progress.consumed
+        produced += progress.produced
+        if status == Status.done { break }
+        if status != Status.ok && status != Status.stuck { break }
+        if produced < capacity && consumed == length {
+            // The input ended before the stream did.
+            status = Status.damaged
+            break
+        }
+    }
+    inflaterEnd(&inflater)
+    if status != Status.done {
+        allocator.free(bytes, capacity, 16)
+        return status
+    }
+    result.*.bytes = bytes
+    result.*.length = produced
+    result.*.capacity = capacity
+    return Status.done
+}
+
+// Gives back the memory of compressAlloc or decompressAlloc.
+pub fn freeBuffer(allocator: Allocator, buffer: *Buffer) -> void {
+    if buffer.*.capacity != 0 { allocator.free(buffer.*.bytes, buffer.*.capacity, 16) }
+    buffer.*.length = 0
+    buffer.*.capacity = 0
+}
+
+// ---------------------------------------------------------------------------
+// The check values (std.crc's)
+
+// The CRC-32 of LENGTH bytes at DATA, continuing CRC (0 to start).
+pub fn crc32(value: u32, data: [*]const u8, length: usize) -> u32 { return crc.crc32(value, data, length) }
+
+// The Adler-32 of LENGTH bytes at DATA, continuing ADLER (1 to start).
+pub fn adler32(value: u32, data: [*]const u8, length: usize) -> u32 { return crc.adler32(value, data, length) }
+
+// ---------------------------------------------------------------------------
+// Earlier names, kept
+
+// Inflates a raw deflate stream into `output` (at most `capacity` bytes):
+// the bytes it made, 0 when the stream is damaged or does not fit.
+pub fn inflate(input: [*]const u8, length: usize, output: [*]u8, capacity: usize) -> usize {
+    return decompress(input, length, output, capacity, Format.raw)
+}
+
+// The size a gzip file unpacks to (its trailer's, modulo 2^32), 0 when it
+// is not one.
+pub fn gzipSize(data: [*]const u8, length: usize) -> usize {
+    if length < 18 || data[0] != 31 || data[1] != 139 { return 0 }
+    return @intCast(usize, data[length - 4]) | (@intCast(usize, data[length - 3]) << 8) | (@intCast(usize, data[length - 2]) << 16) | (@intCast(usize, data[length - 1]) << 24)
+}
+
+// Unpacks the gzip file DATA (its first member) into OUTPUT: the bytes
+// made, 0 when it is not one, is damaged or its CRC is wrong.
+pub fn gunzip(data: [*]const u8, length: usize, output: [*]u8, capacity: usize) -> usize {
+    if length < 18 || data[0] != 31 || data[1] != 139 { return 0 }
+    return decompress(data, length, output, capacity, Format.gzip)
+}
+
+// The base length and extra bits of length symbol SYMBOL (0..28), the
+// base distance and extra bits of distance symbol SYMBOL (0..29).
+pub fn lengthBase(symbol: u32) -> u32 {
+    if symbol < 8 { return symbol + 3 }
+    if symbol == 28 { return 258 }
+    const extra = (symbol - 4) / 4
+    return ((4 + (symbol - 4) % 4) << extra) + 3
+}
+
+pub fn lengthExtra(symbol: u32) -> u32 {
+    if symbol < 8 || symbol == 28 { return 0 }
+    return (symbol - 4) / 4
+}
+
+pub fn distanceBase(symbol: u32) -> u32 {
+    if symbol < 4 { return symbol + 1 }
+    const extra = (symbol - 2) / 2
+    return ((2 + symbol % 2) << extra) + 1
+}
+
+pub fn distanceExtra(symbol: u32) -> u32 {
+    if symbol < 4 { return 0 }
+    return (symbol - 2) / 2
+}

@@ -1,0 +1,851 @@
+// HTTP/1.1 on a connection for one message (libsoup's
+// soup-client-message-io-http1.c): the request's headers and body
+// written, the response's headers read and parsed, its body handed out as
+// a stream. Both sides are state machines pushed forward by runUntil, at
+// once (blocking) or without blocking: a step that cannot go on says
+// G_IO_ERROR_WOULD_BLOCK and a source on the connection (or on the body's
+// stream) runs it again when it can, in the thread-default main context.
+//
+// The record:
+//   0 references (u32)        8 the queue item       16 the message
+//  24 the connection          32 the read state, 36 the write state
+//  40 the header text written (C heap), 48 its length, 56 how much is out
+//  64 the write encoding, 68 the read encoding
+//  72 the bytes left to write (Content-Length), 80 to read
+//  88 the body's stream (the chain the client stream reads)
+//  96 whether paused, 100 waiting on the request body's read
+// 104 the source that runs it again
+// 112 the error of the request body's read
+// 120 the completion callback, 128 its data
+// 136 the request body block being written, 144 its length,
+// 152 how much of it is out, 160 its payload's length
+// 168 whether the request body ended
+// 176 the task of runUntilReadAsync, 184 what a source runs (RUN_*)
+// 192 the client stream given out
+// 200 whether any header byte arrived
+const m = @import("../glib/memory.mlx")
+const g = @import("./g.mlx")
+const c = @import("./common.mlx")
+const conn = @import("./conn.mlx")
+const item = @import("./item.mlx")
+const message = @import("./message.mlx")
+const metrics = @import("./metrics.mlx")
+const misc = @import("./misc.mlx")
+const headers = @import("./headers.mlx")
+const bodystream = @import("./bodystream.mlx")
+const chunked = @import("std.http.chunked")
+const http = @import("std.http.headers")
+
+extern("c") fn soup_message_headers_get_encoding(h: usize) -> i32
+extern("c") fn soup_message_headers_get_content_length(h: usize) -> i64
+extern("c") fn soup_message_headers_get_expectations(h: usize) -> i32
+extern("c") fn soup_message_headers_append(h: usize, name: usize, value: usize) -> void
+extern("c") fn g_pollable_source_new_full(stream: usize, child: usize, cancellable: usize) -> usize
+extern("c") fn g_cancellable_source_new(cancellable: usize) -> usize
+extern("c") fn soup_session_error_quark() -> u32
+
+// SoupMessageIOState.
+pub const NOT_STARTED: i32 = 0
+pub const ANY: i32 = 0
+pub const HEADERS: i32 = 1
+pub const BLOCKING: i32 = 2
+pub const BODY_START: i32 = 3
+pub const BODY: i32 = 4
+pub const BODY_DATA: i32 = 5
+pub const BODY_FLUSH: i32 = 6
+pub const BODY_DONE: i32 = 7
+pub const FINISHING: i32 = 8
+pub const DONE: i32 = 9
+
+// SoupMessageIOCompletion.
+pub const COMPLETE: i32 = 0
+pub const INTERRUPTED: i32 = 1
+pub const STOLEN: i32 = 2
+
+const RUN_NONE: i32 = 0
+const RUN_ALL: i32 = 1
+const RUN_UNTIL_READ: i32 = 2
+
+const R_REFS: usize = 0
+const R_ITEM: usize = 8
+const R_MSG: usize = 16
+const R_CONN: usize = 24
+const R_READ: usize = 32
+const R_WRITE: usize = 36
+const R_WBUF: usize = 40
+const R_WLEN: usize = 48
+const R_WRITTEN: usize = 56
+const R_WENC: usize = 64
+const R_RENC: usize = 68
+const R_WLENGTH: usize = 72
+const R_RLENGTH: usize = 80
+const R_BODY: usize = 88
+const R_PAUSED: usize = 96
+const R_ASYNC_WAIT: usize = 100
+const R_SOURCE: usize = 104
+const R_ASYNC_ERROR: usize = 112
+const R_COMPLETION: usize = 120
+const R_COMPLETION_DATA: usize = 128
+const R_CHUNK: usize = 136
+const R_CHUNK_LEN: usize = 144
+const R_CHUNK_SENT: usize = 152
+const R_CHUNK_DATA: usize = 160
+const R_REQ_EOF: usize = 168
+const R_TASK: usize = 176
+const R_MODE: usize = 184
+const R_CLIENT: usize = 192
+const R_GOT_BYTES: usize = 200
+const R_LOGGER: usize = 208
+const R_SIZE: usize = 216
+
+// SoupEncoding.
+const ENCODING_UNRECOGNIZED: i32 = 0
+const ENCODING_NONE: i32 = 1
+const ENCODING_CONTENT_LENGTH: i32 = 2
+const ENCODING_EOF: i32 = 3
+const ENCODING_CHUNKED: i32 = 4
+
+extern("c") fn soup_session_get_feature_for_message(session: usize, t: usize, msg: usize) -> usize
+extern("c") fn soup_logger_get_type() -> usize
+extern("c") fn __mlx_soup_logger_log_request_data(logger: usize, msg: usize, data: usize, length: usize) -> void
+
+const BLOCK: usize = 8192
+const HEADER_SIZE_LIMIT: usize = 65536
+
+pub const CompletionFn = fn(usize, i32, usize) -> void
+// What the session does with a response's body stream: its features'
+// processors (the content decoder, the sniffer) wrapped around it.
+pub const SetupFn = fn(usize, usize) -> usize
+// The content sniffer run on the bytes held: emits "content-sniffed".
+pub const SniffFn = fn(usize, usize) -> void
+
+var setupBody: usize = 0
+var sniffContent: usize = 0
+
+pub fn setHooks(setup: usize, sniff: usize) -> void {
+    setupBody = setup
+    sniffContent = sniff
+}
+
+fn active(state: i32) -> bool { return state != NOT_STARTED && state != BLOCKING && state != DONE }
+fn pollable(state: i32) -> bool { return active(state) && state != BODY_DONE }
+
+fn msgOf(io: usize) -> usize { return m.getWord(io + R_MSG) }
+fn connOf(io: usize) -> usize { return m.getWord(io + R_CONN) }
+fn itemOf(io: usize) -> usize { return m.getWord(io + R_ITEM) }
+
+// Whether `io` is still the message's I/O.
+fn current(io: usize) -> bool { return item.io(itemOf(io)) == io }
+
+pub fn new(it: usize, connection: usize, completion: usize, data: usize) -> usize {
+    const io = m.alloc(R_SIZE)
+    m.put32(io + R_REFS, 1)
+    m.putWord(io + R_ITEM, item.ref(it))
+    m.putWord(io + R_MSG, g.g_object_ref(item.msg(it)))
+    m.putWord(io + R_CONN, conn.ref(connection))
+    m.putI32(io + R_READ, NOT_STARTED)
+    m.putI32(io + R_WRITE, HEADERS)
+    m.putWord(io + R_COMPLETION, completion)
+    m.putWord(io + R_COMPLETION_DATA, data)
+    item.setIo(it, io)
+    conn.setReusable(connection, false)
+    return io
+}
+
+fn ref(io: usize) -> usize {
+    m.put32(io + R_REFS, m.get32(io + R_REFS) + 1)
+    return io
+}
+
+fn unref(io: usize) -> void {
+    const refs = m.get32(io + R_REFS) - 1
+    m.put32(io + R_REFS, refs)
+    if refs != 0 { return }
+    destroySource(io)
+    m.release(m.getWord(io + R_WBUF))
+    m.release(m.getWord(io + R_CHUNK))
+    c.clearObject(io + R_BODY)
+    if m.getWord(io + R_ASYNC_ERROR) != 0 { g.g_error_free(m.getWord(io + R_ASYNC_ERROR)) }
+    item.unref(m.getWord(io + R_ITEM))
+    g.g_object_unref(m.getWord(io + R_MSG))
+    conn.unref(m.getWord(io + R_CONN))
+    m.release(io)
+}
+
+fn destroySource(io: usize) -> void {
+    const source = m.getWord(io + R_SOURCE)
+    if source == 0 { return }
+    m.putWord(io + R_SOURCE, 0)
+    g.g_source_destroy(source)
+    g.g_source_unref(source)
+}
+
+fn setError(err: usize, domain: u32, code: i32, text: []const u8) -> bool {
+    c.setError(err, domain, code, text)
+    return false
+}
+
+fn ioError(err: usize, code: i32, text: []const u8) -> bool { return setError(err, g.g_io_error_quark(), code, text) }
+
+fn errorIs(e: usize, code: i32) -> bool { return e != 0 && g.g_error_matches(e, g.g_io_error_quark(), code) != 0 }
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// The request line and headers, as libsoup writes them.
+fn writeHeaders(io: usize) -> void {
+    const msg = msgOf(io)
+    const u = message.uri(msg)
+    var t = m.text()
+    m.pushC(&t, message.method(msg))
+    m.pushByte(&t, 32)
+    if message.methodIs(msg, "CONNECT") {
+        const host = misc.hostForHeaders(u)
+        m.pushC(&t, host)
+        m.pushByte(&t, 58)
+        m.pushDecimal(&t, @intCast(u64, g.g_uri_get_port(u)))
+        m.release(host)
+    } else if message.isOptionsPing(msg) {
+        m.pushByte(&t, 42)
+    } else {
+        const path = misc.pathAndQuery(u)
+        m.pushC(&t, path)
+        m.release(path)
+    }
+    m.pushText(&t, if message.httpVersion(msg) == message.HTTP_1_0 { " HTTP/1.0\r\n" } else { " HTTP/1.1\r\n" })
+    const hdrs = message.requestHeaders(msg)
+    m.putI32(io + R_WENC, soup_message_headers_get_encoding(hdrs))
+    const iter = m.alloc(24)
+    const cells = m.alloc(16)
+    headers.iterInit(iter, hdrs)
+    while headers.iterNext(iter, cells, cells + 8) {
+        m.pushC(&t, m.getWord(cells))
+        m.pushText(&t, ": ")
+        m.pushC(&t, m.getWord(cells + 8))
+        m.pushText(&t, "\r\n")
+    }
+    m.release(cells)
+    m.release(iter)
+    m.pushText(&t, "\r\n")
+    m.putWord(io + R_WLEN, t.length)
+    m.putWord(io + R_WBUF, m.finish(&t))
+    m.putWord(io + R_WRITTEN, 0)
+}
+
+// Writes what is left of `buffer` (`sent` bytes already out): false when
+// it must wait or failed.
+fn writeOut(io: usize, buffer: usize, length: usize, sentField: usize, blocking: bool, cancellable: usize, err: usize, countField: usize) -> bool {
+    while m.getWord(io + sentField) < length {
+        const sent = m.getWord(io + sentField)
+        const n = conn.write(connOf(io), buffer + sent, length - sent, blocking, cancellable, err)
+        if n < 0 { return false }
+        m.putWord(io + sentField, sent + @intCast(usize, n))
+        metrics.add(message.metricsOf(msgOf(io)), countField, @intCast(u64, n))
+    }
+    return true
+}
+
+// The request body's next block, framed (a chunk of the chunked coding,
+// or as it is), into the block buffer.
+fn frameBlock(io: usize, data: usize, length: usize) -> void {
+    if m.getWord(io + R_CHUNK) == 0 { m.putWord(io + R_CHUNK, m.raw(BLOCK + 32)) }
+    const block = m.getWord(io + R_CHUNK)
+    var at: usize = 0
+    if m.getI32(io + R_WENC) == ENCODING_CHUNKED {
+        var t = m.text()
+        chunked.writeSizeLine(c.sinkOf(&t), @intCast(u64, length))
+        m.copy(block, t.address, t.length)
+        at = t.length
+        m.dispose(&t)
+    }
+    if data != block + at { m.copy(block + at, data, length) }
+    at += length
+    if m.getI32(io + R_WENC) == ENCODING_CHUNKED {
+        m.put8(block + at, 13)
+        m.put8(block + at + 1, 10)
+        at += 2
+    }
+    m.putWord(io + R_CHUNK_LEN, at)
+    m.putWord(io + R_CHUNK_SENT, 0)
+    m.putWord(io + R_CHUNK_DATA, length)
+}
+
+// The request body's read finished (asynchronously): the block is framed
+// and the I/O goes on.
+export fn __mlx_soup_io_body_read(stream: usize, result: usize, io: usize) -> void {
+    const cell = m.alloc(8)
+    const n = g.g_input_stream_read_finish(stream, result, cell)
+    m.putI32(io + R_ASYNC_WAIT, 0)
+    if n < 0 {
+        m.putWord(io + R_ASYNC_ERROR, m.getWord(cell))
+    } else if n == 0 {
+        m.putI32(io + R_REQ_EOF, 1)
+    } else {
+        const raw = m.getWord(io + R_CHUNK)
+        // The data was read past where the size line goes.
+        const scratch = m.raw(@intCast(usize, n))
+        m.copy(scratch, raw + 16, @intCast(usize, n))
+        frameBlock(io, scratch, @intCast(usize, n))
+        m.release(scratch)
+    }
+    m.release(cell)
+    resume(io)
+    unref(io)
+}
+
+fn ioWrite(io: usize, blocking: bool, cancellable: usize, err: usize) -> bool {
+    const msg = msgOf(io)
+    if m.getWord(io + R_ASYNC_ERROR) != 0 {
+        g.g_propagate_error(err, m.getWord(io + R_ASYNC_ERROR))
+        m.putWord(io + R_ASYNC_ERROR, 0)
+        return false
+    }
+    if m.getI32(io + R_ASYNC_WAIT) != 0 { return ioError(err, conn.WOULD_BLOCK, "Operation would block") }
+    const state = m.getI32(io + R_WRITE)
+    if state == HEADERS {
+        if m.getWord(io + R_WBUF) == 0 { writeHeaders(io) }
+        if !writeOut(io, m.getWord(io + R_WBUF), m.getWord(io + R_WLEN), R_WRITTEN, blocking, cancellable, err, metrics.REQUEST_HEADER_BYTES_SENT) { return false }
+        m.release(m.getWord(io + R_WBUF))
+        m.putWord(io + R_WBUF, 0)
+        const hdrs = message.requestHeaders(msg)
+        if m.getI32(io + R_WENC) == ENCODING_CONTENT_LENGTH { m.putI64(io + R_WLENGTH, soup_message_headers_get_content_length(hdrs)) }
+        // SOUP_EXPECTATION_CONTINUE: wait for "100 Continue".
+        if (soup_message_headers_get_expectations(hdrs) & 2) != 0 {
+            m.putI32(io + R_WRITE, BLOCKING)
+            m.putI32(io + R_READ, HEADERS)
+        } else {
+            m.putI32(io + R_WRITE, BODY_START)
+        }
+        message.wroteHeaders(msg)
+        return true
+    }
+    if state == BODY_START {
+        m.putI32(io + R_WRITE, BODY)
+        // The request body is logged as it is written, when the session
+        // has a logger for the message.
+        m.putWord(io + R_LOGGER, soup_session_get_feature_for_message(item.session(itemOf(io)), soup_logger_get_type(), msg))
+        return true
+    }
+    if state == BODY {
+        const body = message.requestBodyStream(msg)
+        const encoding = m.getI32(io + R_WENC)
+        if body == 0 || (m.getI64(io + R_WLENGTH) == 0 && encoding != ENCODING_EOF && encoding != ENCODING_CHUNKED) {
+            if body == 0 && encoding == ENCODING_CHUNKED && m.getI32(io + R_REQ_EOF) == 0 {
+                // A chunked body without a stream: only its last chunk.
+                m.putI32(io + R_REQ_EOF, 1)
+                frameLast(io)
+            }
+            if m.getWord(io + R_CHUNK_LEN) > m.getWord(io + R_CHUNK_SENT) {
+                if !writeOut(io, m.getWord(io + R_CHUNK), m.getWord(io + R_CHUNK_LEN), R_CHUNK_SENT, blocking, cancellable, err, metrics.REQUEST_BODY_BYTES_SENT) { return false }
+            }
+            m.putI32(io + R_WRITE, BODY_FLUSH)
+            return true
+        }
+        // A block being written goes out first.
+        if m.getWord(io + R_CHUNK_LEN) > m.getWord(io + R_CHUNK_SENT) {
+            if !writeOut(io, m.getWord(io + R_CHUNK), m.getWord(io + R_CHUNK_LEN), R_CHUNK_SENT, blocking, cancellable, err, metrics.REQUEST_BODY_BYTES_SENT) { return false }
+            const payload = m.getWord(io + R_CHUNK_DATA)
+            const blockLength = m.getWord(io + R_CHUNK_LEN)
+            m.putWord(io + R_CHUNK_LEN, 0)
+            m.putWord(io + R_CHUNK_SENT, 0)
+            m.putWord(io + R_CHUNK_DATA, 0)
+            if payload > 0 {
+                metrics.add(message.metricsOf(msg), metrics.REQUEST_BODY_SIZE, @intCast(u64, payload))
+                if m.getWord(io + R_LOGGER) != 0 {
+                    // The payload ends the block, before a chunk's CRLF.
+                    const framing: usize = if encoding == ENCODING_CHUNKED { 2 } else { 0 }
+                    const end = blockLength - framing
+                    __mlx_soup_logger_log_request_data(m.getWord(io + R_LOGGER), msg, m.getWord(io + R_CHUNK) + end - payload, payload)
+                }
+                message.wroteBodyData(msg, payload)
+            }
+            return true
+        }
+        if m.getI32(io + R_REQ_EOF) != 0 {
+            if encoding == ENCODING_CHUNKED && m.getI32(io + R_REQ_EOF) == 1 {
+                m.putI32(io + R_REQ_EOF, 2)
+                frameLast(io)
+                return true
+            }
+            _ = g.g_input_stream_close(body, 0, 0)
+            m.putI32(io + R_WRITE, BODY_FLUSH)
+            return true
+        }
+        if m.getWord(io + R_CHUNK) == 0 { m.putWord(io + R_CHUNK, m.raw(BLOCK + 32)) }
+        if blocking {
+            const scratch = m.raw(BLOCK)
+            const n = g.g_input_stream_read(body, scratch, BLOCK, cancellable, err)
+            if n < 0 {
+                m.release(scratch)
+                return false
+            }
+            if n == 0 {
+                m.putI32(io + R_REQ_EOF, 1)
+            } else {
+                frameBlock(io, scratch, @intCast(usize, n))
+            }
+            m.release(scratch)
+            return true
+        }
+        // Read into the block past the room a size line takes.
+        m.putI32(io + R_ASYNC_WAIT, 1)
+        _ = ref(io)
+        g.g_input_stream_read_async(body, m.getWord(io + R_CHUNK) + 16, BLOCK, m.getI32(itemOf(io) + item.R_PRIORITY), cancellable, @intFromPtr(__mlx_soup_io_body_read), io)
+        return ioError(err, conn.WOULD_BLOCK, "Operation would block")
+    }
+    if state == BODY_FLUSH {
+        m.putI32(io + R_WRITE, BODY_DONE)
+        return true
+    }
+    if state == BODY_DONE {
+        m.putI32(io + R_WRITE, FINISHING)
+        message.wroteBody(msg)
+        return true
+    }
+    if state == FINISHING {
+        m.putI32(io + R_WRITE, DONE)
+        if m.getI32(io + R_READ) == NOT_STARTED { m.putI32(io + R_READ, HEADERS) }
+        return true
+    }
+    return true
+}
+
+fn frameLast(io: usize) -> void {
+    if m.getWord(io + R_CHUNK) == 0 { m.putWord(io + R_CHUNK, m.raw(BLOCK + 32)) }
+    const block = m.getWord(io + R_CHUNK)
+    m.copy(block, m.literal("0\r\n\r\n"), 5)
+    m.putWord(io + R_CHUNK_LEN, 5)
+    m.putWord(io + R_CHUNK_SENT, 0)
+    m.putWord(io + R_CHUNK_DATA, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+// The response's headers off the connection: their text (C heap, up to
+// and with the last header line's end), false when they cannot be had
+// now or at all.
+fn readHeaders(io: usize, blocking: bool, cancellable: usize, err: usize, text: *usize, length: *usize) -> bool {
+    const cn = connOf(io)
+    while true {
+        const have = m.bytes(conn.bufferStart(cn), conn.buffered(cn))
+        if have.length > 0 && m.getI32(io + R_GOT_BYTES) == 0 {
+            m.putI32(io + R_GOT_BYTES, 1)
+            message.stamp(msgOf(io), metrics.RESPONSE_START)
+        }
+        var at: usize = 0
+        while at < have.length {
+            if have[at] == 10 {
+                var end: usize = 0
+                if at + 1 < have.length && have[at + 1] == 10 { end = at + 2 }
+                if at + 2 < have.length && have[at + 1] == 13 && have[at + 2] == 10 { end = at + 3 }
+                if end > 0 {
+                    text.* = m.dupBytes(conn.bufferStart(cn), at + 1)
+                    length.* = at + 1
+                    metrics.add(message.metricsOf(msgOf(io)), metrics.RESPONSE_HEADER_BYTES_RECEIVED, @intCast(u64, end))
+                    conn.consume(cn, end)
+                    return true
+                }
+            }
+            at += 1
+        }
+        if have.length > HEADER_SIZE_LIMIT { return ioError(err, conn.PARTIAL_INPUT, "Header too big") }
+        const n = conn.fill(cn, blocking, cancellable, err)
+        if n < 0 { return false }
+        if n == 0 {
+            const left = conn.buffered(cn)
+            if left > 0 {
+                text.* = m.dupBytes(conn.bufferStart(cn), left)
+                length.* = left
+                metrics.add(message.metricsOf(msgOf(io)), metrics.RESPONSE_HEADER_BYTES_RECEIVED, @intCast(u64, left))
+                conn.consume(cn, left)
+                return true
+            }
+            return ioError(err, conn.PARTIAL_INPUT, "Connection terminated unexpectedly")
+        }
+    }
+    return false
+}
+
+// libsoup's parse_headers: the status line and headers into the message,
+// and how the body is framed.
+fn parseHeaders(io: usize, text: usize, length: usize, err: usize) -> bool {
+    const msg = msgOf(io)
+    message.setReasonPhrase(msg, 0)
+    const cells = m.alloc(24)
+    const ok = headers.parseResponse(text, length, message.responseHeaders(msg), cells, cells + 8, cells + 16)
+    if !ok {
+        m.release(cells)
+        return setError(err, soup_session_error_quark(), 0, "Could not parse HTTP response")
+    }
+    const version = m.getI32(cells)
+    const code = m.get32(cells + 8)
+    message.setStatus(msg, code, m.getWord(cells + 16))
+    g.g_free(m.getWord(cells + 16))
+    m.release(cells)
+    if version < message.httpVersion(msg) { message.setHttpVersion(msg, version) }
+    var encoding = ENCODING_NONE
+    const informational = code >= 100 && code < 200
+    if message.methodIs(msg, "HEAD") || code == 204 || code == 304 || informational || (message.methodIs(msg, "CONNECT") && code >= 200 && code < 300) {
+        encoding = ENCODING_NONE
+    } else {
+        encoding = soup_message_headers_get_encoding(message.responseHeaders(msg))
+    }
+    m.putI32(io + R_RENC, encoding)
+    if encoding == ENCODING_UNRECOGNIZED { return setError(err, soup_session_error_quark(), 1, "Unrecognized HTTP response encoding") }
+    return true
+}
+
+fn ioRead(io: usize, blocking: bool, cancellable: usize, err: usize) -> bool {
+    const msg = msgOf(io)
+    const state = m.getI32(io + R_READ)
+    if state == HEADERS {
+        var text: usize = 0
+        var length: usize = 0
+        if !readHeaders(io, blocking, cancellable, err, &text, &length) { return false }
+        const parsed = parseHeaders(io, text, length, err)
+        m.release(text)
+        if !parsed {
+            // The rest is not read and the connection not reused.
+            soup_message_headers_append(message.requestHeaders(msg), m.literal("Connection"), m.literal("close"))
+            message.stamp(msg, metrics.RESPONSE_END)
+            m.putI32(io + R_READ, FINISHING)
+            return false
+        }
+        const code = message.statusOf(msg)
+        if code >= 100 && code < 200 {
+            if code == 100 && m.getI32(io + R_WRITE) == BLOCKING {
+                m.putI32(io + R_READ, BLOCKING)
+                m.putI32(io + R_WRITE, BODY_START)
+            } else {
+                m.putI32(io + R_READ, HEADERS)
+            }
+            message.gotInformational(msg)
+            // A "101 Switching Protocols" may have taken the connection.
+            if !current(io) { return ioError(err, conn.CANCELLED, "Operation was cancelled") }
+            message.cleanupResponse(msg)
+            return true
+        }
+        m.putI32(io + R_READ, BODY_START)
+        if m.getI32(io + R_WRITE) == BLOCKING { m.putI32(io + R_WRITE, FINISHING) }
+        if m.getI32(io + R_RENC) == ENCODING_CONTENT_LENGTH {
+            m.putI64(io + R_RLENGTH, soup_message_headers_get_content_length(message.responseHeaders(msg)))
+            // A server may send too short a body and close: allowed
+            // when the connection is not kept.
+            if !message.isKeepalive(msg) { m.putI32(io + R_RENC, ENCODING_EOF) }
+        } else {
+            m.putI64(io + R_RLENGTH, -1)
+        }
+        message.gotHeaders(msg)
+        return true
+    }
+    if state == BODY_START {
+        if m.getWord(io + R_BODY) == 0 {
+            var body = bodystream.newBody(connOf(io), msg, m.getI32(io + R_RENC), m.getI64(io + R_RLENGTH))
+            if setupBody != 0 {
+                const call: SetupFn = unsafe { @ptrFromInt(SetupFn, setupBody) }
+                const wrapped = call(msg, body)
+                g.g_object_unref(body)
+                body = wrapped
+            }
+            m.putWord(io + R_BODY, body)
+        }
+        const body = m.getWord(io + R_BODY)
+        if message.sniffer(msg) != 0 && bodystream.isSniffer(body) {
+            if !bodystream.snifferReady(body, blocking, cancellable, err) { return false }
+            if sniffContent != 0 {
+                const call: SniffFn = unsafe { @ptrFromInt(SniffFn, sniffContent) }
+                call(msg, body)
+            }
+        }
+        m.putI32(io + R_READ, BODY)
+        return true
+    }
+    if state == BODY {
+        const scratch = m.raw(BLOCK)
+        const n = bodystream.readDirect(m.getWord(io + R_BODY), scratch, BLOCK, blocking, cancellable, err)
+        m.release(scratch)
+        if n < 0 { return false }
+        if n == 0 { m.putI32(io + R_READ, BODY_DONE) }
+        return true
+    }
+    if state == BODY_DONE {
+        m.putI32(io + R_READ, FINISHING)
+        message.stamp(msg, metrics.RESPONSE_END)
+        conn.setReusable(connOf(io), message.isKeepalive(msg))
+        conn.setEverUsed(connOf(io))
+        message.gotBody(msg)
+        return true
+    }
+    if state == FINISHING {
+        m.putI32(io + R_READ, DONE)
+        return true
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Running
+
+fn runUntil(io: usize, blocking: bool, readState: i32, writeState: i32, cancellable: usize, err: usize) -> bool {
+    if g.g_cancellable_set_error_if_cancelled(cancellable, err) != 0 { return false }
+    const msg = msgOf(io)
+    _ = ref(io)
+    _ = g.g_object_ref(msg)
+    const cell = m.alloc(8)
+    var progress = true
+    while progress && current(io) && m.getI32(io + R_PAUSED) == 0 && m.getI32(io + R_ASYNC_WAIT) == 0 && (m.getI32(io + R_READ) < readState || m.getI32(io + R_WRITE) < writeState) {
+        if active(m.getI32(io + R_READ)) {
+            progress = ioRead(io, blocking, cancellable, cell)
+        } else if active(m.getI32(io + R_WRITE)) {
+            progress = ioWrite(io, blocking, cancellable, cell)
+        } else {
+            progress = false
+        }
+    }
+    var result = false
+    if m.getWord(cell) != 0 {
+        g.g_propagate_error(err, m.getWord(cell))
+    } else if !current(io) {
+        _ = ioError(err, conn.CANCELLED, "Operation was cancelled")
+    } else if m.getI32(io + R_ASYNC_WAIT) == 0 && g.g_cancellable_set_error_if_cancelled(cancellable, err) != 0 {
+        result = false
+    } else {
+        const done = m.getI32(io + R_READ) >= readState && m.getI32(io + R_WRITE) >= writeState
+        if !blocking && !done {
+            _ = ioError(err, conn.WOULD_BLOCK, "Operation would block")
+        } else {
+            result = done
+        }
+    }
+    m.release(cell)
+    g.g_object_unref(msg)
+    unref(io)
+    return result
+}
+
+// libsoup's request_is_restartable: a reused connection the server closed
+// before answering, for a method that may be sent again.
+fn restartable(io: usize, e: usize) -> bool {
+    if e == 0 { return false }
+    if m.getI32(io + R_READ) > HEADERS || m.getI32(io + R_GOT_BYTES) != 0 { return false }
+    if !conn.everUsed(connOf(io)) { return false }
+    if errorIs(e, conn.TIMED_OUT) || errorIs(e, conn.WOULD_BLOCK) || errorIs(e, conn.CANCELLED) { return false }
+    if m.get32(e) == g.g_tls_error_quark() { return false }
+    const method = m.cSlice(message.method(msgOf(io)))
+    return m.same(method, "GET") || m.same(method, "HEAD") || m.same(method, "OPTIONS") || m.same(method, "TRACE") || m.same(method, "PUT") || m.same(method, "DELETE")
+}
+
+fn finish(io: usize, e: usize) -> void {
+    if restartable(io, e) {
+        item.setState(itemOf(io), item.RESTARTING)
+    } else if e != 0 {
+        message.stamp(msgOf(io), metrics.RESPONSE_END)
+    }
+    finished(io)
+}
+
+// The message's I/O is over (completely, or interrupted): the completion
+// callback is told.
+pub fn finished(io: usize) -> void {
+    if !current(io) { return }
+    const completion = if m.getI32(io + R_READ) >= FINISHING && m.getI32(io + R_WRITE) >= FINISHING { COMPLETE } else { INTERRUPTED }
+    complete(io, completion)
+}
+
+fn complete(io: usize, completion: i32) -> void {
+    _ = ref(io)
+    destroySource(io)
+    if m.getWord(io + R_CLIENT) != 0 {
+        bodystream.detachClient(m.getWord(io + R_CLIENT))
+        m.putWord(io + R_CLIENT, 0)
+    }
+    item.setIo(itemOf(io), 0)
+    if completion != COMPLETE { conn.setReusable(connOf(io), false) }
+    const msg = g.g_object_ref(msgOf(io))
+    const callback = m.getWord(io + R_COMPLETION)
+    if callback != 0 {
+        const call: CompletionFn = unsafe { @ptrFromInt(CompletionFn, callback) }
+        call(msg, completion, m.getWord(io + R_COMPLETION_DATA))
+    }
+    g.g_object_unref(msg)
+    // The reference new() gave.
+    unref(io)
+    unref(io)
+}
+
+// The connection taken away (a WebSocket's): the I/O ends as stolen.
+pub fn stolen(io: usize) -> void { complete(io, STOLEN) }
+
+export fn __mlx_soup_io_ready(object: usize, io: usize) -> i32 {
+    m.putWord(io + R_SOURCE, 0)
+    resume(io)
+    return 0
+}
+
+// A source that runs the I/O again when it can go on.
+fn attachSource(io: usize, cancellable: usize, priority: i32) -> void {
+    destroySource(io)
+    var child: usize = 0
+    if m.getI32(io + R_PAUSED) != 0 {
+        if cancellable == 0 { return }
+        child = g_cancellable_source_new(cancellable)
+    } else if m.getI32(io + R_ASYNC_WAIT) != 0 {
+        return
+    } else if pollable(m.getI32(io + R_READ)) {
+        if m.getWord(io + R_BODY) != 0 && m.getI32(io + R_READ) >= BODY_START {
+            child = bodystream.source(m.getWord(io + R_BODY), cancellable)
+        } else {
+            // The headers wait for the stream itself (what is buffered
+            // was not enough).
+            const s = conn.istream(connOf(io))
+            child = if s != 0 && g.g_pollable_input_stream_can_poll(s) != 0 { g.g_pollable_input_stream_create_source(s, cancellable) } else { g.g_timeout_source_new(0) }
+        }
+    } else if pollable(m.getI32(io + R_WRITE)) {
+        child = conn.outputSource(connOf(io), cancellable)
+    } else {
+        child = g.g_timeout_source_new(0)
+    }
+    const source = g_pollable_source_new_full(msgOf(io), child, cancellable)
+    g.g_source_unref(child)
+    g.g_source_set_priority(source, priority)
+    g.g_source_set_callback(source, @intFromPtr(__mlx_soup_io_ready), io, 0)
+    _ = g.g_source_attach(source, g.g_main_context_get_thread_default())
+    m.putWord(io + R_SOURCE, source)
+}
+
+fn resume(io: usize) -> void {
+    if !current(io) { return }
+    const mode = m.getI32(io + R_MODE)
+    if mode == RUN_ALL { run(io, false) }
+    if mode == RUN_UNTIL_READ { untilReadStep(io) }
+}
+
+// Runs the whole exchange (libsoup's io_run): finishing it when done.
+pub fn run(io: usize, blocking: bool) -> void {
+    m.putI32(io + R_MODE, RUN_ALL)
+    destroySource(io)
+    _ = ref(io)
+    const it = itemOf(io)
+    const cell = m.alloc(8)
+    if runUntil(io, blocking, DONE, DONE, item.cancellable(it), cell) {
+        finished(io)
+    } else if errorIs(m.getWord(cell), conn.WOULD_BLOCK) {
+        g.g_error_free(m.getWord(cell))
+        attachSource(io, item.cancellable(it), item.priority(it))
+    } else {
+        const e = m.getWord(cell)
+        if current(io) {
+            item.setError(it, e)
+            finish(io, item.errorOf(it))
+        } else if e != 0 {
+            g.g_error_free(e)
+        }
+    }
+    m.release(cell)
+    unref(io)
+}
+
+// Sends the request and reads the response's headers (blocking): false
+// with `err` set when it fails.
+pub fn runUntilRead(io: usize, cancellable: usize, err: usize) -> bool {
+    if runUntil(io, true, BODY, ANY, cancellable, err) { return true }
+    if current(io) { finish(io, m.getWord(err)) }
+    return false
+}
+
+fn untilReadStep(io: usize) -> void {
+    destroySource(io)
+    const task = m.getWord(io + R_TASK)
+    if task == 0 { return }
+    _ = ref(io)
+    const cell = m.alloc(8)
+    if runUntil(io, false, BODY, ANY, g.g_task_get_cancellable(task), cell) {
+        m.putWord(io + R_TASK, 0)
+        m.putI32(io + R_MODE, RUN_NONE)
+        g.g_task_return_boolean(task, 1)
+        g.g_object_unref(task)
+    } else if errorIs(m.getWord(cell), conn.WOULD_BLOCK) {
+        g.g_error_free(m.getWord(cell))
+        attachSource(io, g.g_task_get_cancellable(task), g.g_task_get_priority(task))
+    } else {
+        const e = m.getWord(cell)
+        m.putWord(io + R_TASK, 0)
+        m.putI32(io + R_MODE, RUN_NONE)
+        if current(io) { finish(io, e) }
+        g.g_task_return_error(task, e)
+        g.g_object_unref(task)
+    }
+    m.release(cell)
+    unref(io)
+}
+
+// Sends the request and reads the response's headers without blocking:
+// `callback(msg, result, data)` is told (runUntilReadFinish).
+pub fn runUntilReadAsync(io: usize, priority: i32, cancellable: usize, callback: usize, data: usize) -> void {
+    const task = g.g_task_new(msgOf(io), cancellable, callback, data)
+    g.g_task_set_priority(task, priority)
+    m.putWord(io + R_TASK, task)
+    m.putI32(io + R_MODE, RUN_UNTIL_READ)
+    untilReadStep(io)
+}
+
+pub fn runUntilReadFinish(result: usize, err: usize) -> bool { return g.g_task_propagate_boolean(result, err) != 0 }
+
+// Reads (or drops) the rest of the response so the exchange can finish:
+// a body not read to its end is not read further (the connection is
+// then not kept).
+pub fn skip(io: usize, blocking: bool, cancellable: usize, err: usize) -> bool {
+    if m.getI32(io + R_READ) < BODY_DONE { m.putI32(io + R_READ, FINISHING) }
+    return runUntil(io, blocking, DONE, DONE, cancellable, err)
+}
+
+// The stream handed to the caller.
+pub fn responseStream(io: usize) -> usize {
+    const client = bodystream.newClient(m.getWord(io + R_BODY), msgOf(io), io, @intFromPtr(__mlx_soup_io_client_eof), @intFromPtr(__mlx_soup_io_client_close))
+    m.putWord(io + R_CLIENT, client)
+    return client
+}
+
+// The body read to its end: the exchange finishes when the stream is
+// closed (or let go of), as in libsoup.
+export fn __mlx_soup_io_client_eof(io: usize) -> void {
+    if !current(io) { return }
+    if m.getI32(io + R_READ) == BODY { m.putI32(io + R_READ, BODY_DONE) }
+}
+
+export fn __mlx_soup_io_client_close(io: usize, blocking: i32, cancellable: usize, err: usize) -> i32 {
+    if !current(io) { return 1 }
+    _ = ref(io)
+    const ok = skip(io, true, cancellable, err)
+    finished(io)
+    unref(io)
+    return if ok { 1 } else { 0 }
+}
+
+pub fn pause(io: usize) -> void {
+    destroySource(io)
+    m.putI32(io + R_PAUSED, 1)
+}
+
+pub fn unpause(io: usize) -> void { m.putI32(io + R_PAUSED, 0) }
+
+pub fn isPaused(io: usize) -> bool { return m.getI32(io + R_PAUSED) != 0 }
+
+// Runs it again soon (an unpaused message), from an idle source.
+export fn __mlx_soup_io_kick(io: usize) -> i32 {
+    resume(io)
+    unref(io)
+    return 0
+}
+
+pub fn kick(io: usize) -> void {
+    _ = ref(io)
+    const source = g.g_idle_source_new()
+    g.g_source_set_callback(source, @intFromPtr(__mlx_soup_io_kick), io, 0)
+    _ = g.g_source_attach(source, g.g_main_context_get_thread_default())
+    g.g_source_unref(source)
+}
+
+pub fn readState(io: usize) -> i32 { return m.getI32(io + R_READ) }
+pub fn connection(io: usize) -> usize { return connOf(io) }

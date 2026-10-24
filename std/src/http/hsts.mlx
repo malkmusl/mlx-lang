@@ -1,0 +1,488 @@
+// std.http.hsts: HTTP Strict Transport Security (RFC 6797) as libsoup's
+// SoupHSTSEnforcer keeps it. A Policy is a domain, its max-age, its
+// expiry (none for a session policy, which lasts while the enforcer
+// does) and whether it covers subdomains; an Enforcer learns policies
+// from https responses' Strict-Transport-Security headers (read
+// strictly: max-age in digits, includeSubDomains without a value, no
+// parameter twice) and says which hosts must be reached over https
+// (a host with a valid policy, or under a domain whose policy covers
+// subdomains). The policies are kept in a text file, a line each.
+//
+//     var enforcer: hsts.Enforcer = undefined
+//     hsts.init(&enforcer, allocator)
+//     var policy: hsts.Policy = undefined
+//     if hsts.parseHeader("max-age=31536000; includeSubDomains", "www.example.com", now, &policy) { hsts.setPolicy(&enforcer, &policy, now) }
+//     if hsts.mustEnforce(&enforcer, "a.www.example.com", now) { ... https:// ... }
+const headers = @import("./headers.mlx")
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Policy = struct {
+    domain: []const u8
+    maxAge: u64
+    // None for a session policy.
+    hasExpires: bool
+    expires: i64
+    includeSubdomains: bool
+    // The domain's block when the policy owns it (capacity 0: a view).
+    storage: [*]u8
+    capacity: usize
+}
+
+// Told of each change: the policy as it was (null for one added) and as
+// it is (null for one removed); both live through the call only.
+pub const ChangedFn = fn(context: usize, old: ?*const Policy, new: ?*const Policy) -> void
+
+pub const Enforcer = struct {
+    allocator: Allocator
+    // Host policies (with an expiry) and session policies, each a list of
+    // policies owning their domains.
+    host: [*]Policy
+    hostCount: usize
+    hostCapacity: usize
+    session: [*]Policy
+    sessionCount: usize
+    sessionCapacity: usize
+    onChanged: ChangedFn
+    context: usize
+    hasChanged: bool
+}
+
+fn noChange(context: usize, old: ?*const Policy, new: ?*const Policy) -> void {}
+
+// ---------------------------------------------------------------------------
+// Policies
+
+// A policy borrowing its domain: `maxAge` seconds from `now` (0: a date
+// long past, as libsoup's SOUP_HSTS_POLICY_MAX_AGE_PAST).
+pub fn policy(domain: []const u8, maxAge: u64, includeSubdomains: bool, now: i64) -> Policy {
+    var p = sessionPolicy(domain, includeSubdomains)
+    p.maxAge = maxAge
+    p.hasExpires = true
+    p.expires = if maxAge == 0 { 0 } else { now + @intCast(i64, maxAge) }
+    return p
+}
+
+// A policy with an expiry given.
+pub fn policyWithExpiry(domain: []const u8, maxAge: u64, expires: i64, includeSubdomains: bool) -> Policy {
+    var p = sessionPolicy(domain, includeSubdomains)
+    p.maxAge = maxAge
+    p.hasExpires = true
+    p.expires = expires
+    return p
+}
+
+// A session policy: no expiry.
+pub fn sessionPolicy(domain: []const u8, includeSubdomains: bool) -> Policy {
+    var p: Policy = undefined
+    p.domain = domain
+    p.maxAge = 0
+    p.hasExpires = false
+    p.expires = 0
+    p.includeSubdomains = includeSubdomains
+    p.capacity = 0
+    return p
+}
+
+pub fn isSession(p: *const Policy) -> bool { return !p.*.hasExpires }
+
+pub fn isExpired(p: *const Policy, now: i64) -> bool { return p.*.hasExpires && p.*.expires < now }
+
+pub fn equal(a: *const Policy, b: *const Policy) -> bool {
+    if !sameText(a.*.domain, b.*.domain) { return false }
+    if a.*.includeSubdomains != b.*.includeSubdomains || a.*.maxAge != b.*.maxAge { return false }
+    if a.*.hasExpires != b.*.hasExpires { return false }
+    return !a.*.hasExpires || a.*.expires == b.*.expires
+}
+
+fn sameText(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var index: usize = 0
+    while index < a.length {
+        if a[index] != b[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Gives a policy a domain of its own.
+pub fn own(allocator: Allocator, p: *Policy) -> bool {
+    const length = if p.*.domain.length == 0 { 1 } else { p.*.domain.length }
+    const memory = allocator.alloc(length, 1)
+    if memory == null { return false }
+    var i: usize = 0
+    while i < p.*.domain.length {
+        memory.?[i] = p.*.domain[i]
+        i += 1
+    }
+    if p.*.capacity != 0 { allocator.free(p.*.storage, p.*.capacity, 1) }
+    p.*.domain = memory.?[0..p.*.domain.length]
+    p.*.storage = memory.?
+    p.*.capacity = length
+    return true
+}
+
+pub fn policyFree(allocator: Allocator, p: *Policy) -> void {
+    if p.*.capacity != 0 { allocator.free(p.*.storage, p.*.capacity, 1) }
+    p.*.capacity = 0
+}
+
+// The policy of a Strict-Transport-Security value for `domain` (the
+// response's host) at `now`, read strictly as libsoup reads it: the
+// parameters separated by `;`, none twice, max-age in digits (quoted or
+// not), includeSubDomains without a value; false when there is no policy
+// in it.
+pub fn parseHeader(header: []const u8, domain: []const u8, now: i64, out: *Policy) -> bool {
+    var items = headers.list(header, 59)
+    var item: []const u8 = ""
+    var p: headers.Param = undefined
+    var seen: [64][]const u8 = undefined
+    var seenCount: usize = 0
+    var maxAge: u64 = 0
+    var hasMaxAge = false
+    var subdomains = false
+    var subdomainsWithValue = false
+    while headers.next(&items, &item) {
+        if !headers.param(item, &p) { continue }
+        var i: usize = 0
+        while i < seenCount {
+            if headers.equalsIgnoringCase(seen[i], p.name) { return false }
+            i += 1
+        }
+        if seenCount < 64 {
+            seen[seenCount] = p.name
+            seenCount += 1
+        }
+        if headers.equalsIgnoringCase(p.name, "max-age") {
+            if p.kind == headers.ParamKind.bare { continue }
+            var text: [64]u8 = undefined
+            var value = p.value
+            if p.kind == headers.ParamKind.quoted {
+                const n = headers.decodeQuoted(p.value, text[0..64])
+                value = text[0..n]
+            } else if p.kind == headers.ParamKind.extended {
+                continue
+            }
+            var good = true
+            var age: u64 = 0
+            for ch in value {
+                if ch < 48 || ch > 57 { good = false }
+                if good { age = age *% 10 +% @intCast(u64, ch - 48) }
+            }
+            if !good { return false }
+            maxAge = age
+            hasMaxAge = true
+        } else if headers.equalsIgnoringCase(p.name, "includeSubDomains") {
+            subdomains = true
+            if p.kind != headers.ParamKind.bare { subdomainsWithValue = true }
+        }
+    }
+    if !hasMaxAge || subdomainsWithValue { return false }
+    out.* = policy(domain, maxAge, subdomains, now)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The enforcer
+
+pub fn init(enforcer: *Enforcer, allocator: Allocator) -> void {
+    enforcer.*.allocator = allocator
+    enforcer.*.hostCount = 0
+    enforcer.*.hostCapacity = 0
+    enforcer.*.sessionCount = 0
+    enforcer.*.sessionCapacity = 0
+    enforcer.*.onChanged = noChange
+    enforcer.*.context = 0
+    enforcer.*.hasChanged = false
+}
+
+pub fn onChanged(enforcer: *Enforcer, callback: ChangedFn, context: usize) -> void {
+    enforcer.*.onChanged = callback
+    enforcer.*.context = context
+    enforcer.*.hasChanged = true
+}
+
+fn freeList(enforcer: *Enforcer, list: [*]Policy, count: usize, capacity: usize) -> void {
+    var i: usize = 0
+    while i < count {
+        policyFree(enforcer.*.allocator, &list[i])
+        i += 1
+    }
+    if capacity != 0 { enforcer.*.allocator.free(unsafe { @ptrCast([*]u8, list) }, capacity * @sizeOf(Policy), 8) }
+}
+
+pub fn deinit(enforcer: *Enforcer) -> void {
+    freeList(enforcer, enforcer.*.host, enforcer.*.hostCount, enforcer.*.hostCapacity)
+    freeList(enforcer, enforcer.*.session, enforcer.*.sessionCount, enforcer.*.sessionCapacity)
+    enforcer.*.hostCount = 0
+    enforcer.*.hostCapacity = 0
+    enforcer.*.sessionCount = 0
+    enforcer.*.sessionCapacity = 0
+}
+
+fn changed(enforcer: *Enforcer, old: ?*const Policy, new: ?*const Policy) -> void {
+    if enforcer.*.hasChanged { enforcer.*.onChanged(enforcer.*.context, old, new) }
+}
+
+fn find(list: [*]Policy, count: usize, domain: []const u8) -> usize {
+    var i: usize = 0
+    while i < count {
+        if headers.equalsIgnoringCase(list[i].domain, domain) { return i }
+        i += 1
+    }
+    return count
+}
+
+// Appends a copy of `p` to a list (grown as needed); false when memory
+// failed.
+fn append(enforcer: *Enforcer, list: *[*]Policy, count: *usize, capacity: *usize, p: *const Policy) -> bool {
+    if count.* == capacity.* {
+        const grown = if capacity.* == 0 { 8 } else { capacity.* * 2 }
+        const memory = enforcer.*.allocator.alloc(grown * @sizeOf(Policy), 8)
+        if memory == null { return false }
+        const items: [*]Policy = unsafe { @ptrCast([*]Policy, memory.?) }
+        var i: usize = 0
+        while i < count.* {
+            items[i] = list.*[i]
+            i += 1
+        }
+        if capacity.* != 0 { enforcer.*.allocator.free(unsafe { @ptrCast([*]u8, list.*) }, capacity.* * @sizeOf(Policy), 8) }
+        list.* = items
+        capacity.* = grown
+    }
+    var made = p.*
+    made.capacity = 0
+    if !own(enforcer.*.allocator, &made) { return false }
+    list.*[count.*] = made
+    count.* += 1
+    return true
+}
+
+fn removeAt(enforcer: *Enforcer, list: [*]Policy, count: *usize, index: usize) -> void {
+    policyFree(enforcer.*.allocator, &list[index])
+    var i = index
+    while i + 1 < count.* {
+        list[i] = list[i + 1]
+        i += 1
+    }
+    count.* -= 1
+}
+
+// Takes the expired host policies out (each told as removed).
+fn removeExpired(enforcer: *Enforcer, now: i64) -> void {
+    var i: usize = 0
+    while i < enforcer.*.hostCount {
+        if isExpired(&enforcer.*.host[i], now) {
+            var gone = enforcer.*.host[i]
+            gone.capacity = 0
+            const kept = own(enforcer.*.allocator, &gone)
+            removeAt(enforcer, enforcer.*.host, &enforcer.*.hostCount, i)
+            if kept {
+                changed(enforcer, &gone, null)
+                policyFree(enforcer.*.allocator, &gone)
+            }
+            continue
+        }
+        i += 1
+    }
+}
+
+fn removeHostPolicy(enforcer: *Enforcer, domain: []const u8, now: i64) -> void {
+    const index = find(enforcer.*.host, enforcer.*.hostCount, domain)
+    if index == enforcer.*.hostCount { return }
+    var gone = enforcer.*.host[index]
+    gone.capacity = 0
+    const kept = own(enforcer.*.allocator, &gone)
+    removeAt(enforcer, enforcer.*.host, &enforcer.*.hostCount, index)
+    if kept {
+        changed(enforcer, &gone, null)
+        policyFree(enforcer.*.allocator, &gone)
+    }
+    removeExpired(enforcer, now)
+}
+
+// libsoup's soup_hsts_enforcer_set_policy: an expired policy removes the
+// domain's; a session policy goes with the session policies, any other
+// with the host policies, replacing the domain's (a change told when it
+// differs) or added.
+pub fn setPolicy(enforcer: *Enforcer, p: *const Policy, now: i64) -> void {
+    if !isSession(p) && isExpired(p, now) {
+        removeHostPolicy(enforcer, p.*.domain, now)
+        return
+    }
+    const session = isSession(p)
+    const list: [*]Policy = if session { enforcer.*.session } else { enforcer.*.host }
+    const count = if session { enforcer.*.sessionCount } else { enforcer.*.hostCount }
+    const index = find(list, count, p.*.domain)
+    if index < count {
+        var old = list[index]
+        old.capacity = 0
+        if !own(enforcer.*.allocator, &old) { return }
+        var made = p.*
+        made.capacity = 0
+        if !own(enforcer.*.allocator, &made) {
+            policyFree(enforcer.*.allocator, &old)
+            return
+        }
+        policyFree(enforcer.*.allocator, &list[index])
+        list[index] = made
+        if !equal(&old, p) { changed(enforcer, &old, &list[index]) }
+        policyFree(enforcer.*.allocator, &old)
+        removeExpired(enforcer, now)
+        return
+    }
+    var appended = false
+    if session {
+        appended = append(enforcer, &enforcer.*.session, &enforcer.*.sessionCount, &enforcer.*.sessionCapacity, p)
+        if appended { changed(enforcer, null, &enforcer.*.session[enforcer.*.sessionCount - 1]) }
+    } else {
+        appended = append(enforcer, &enforcer.*.host, &enforcer.*.hostCount, &enforcer.*.hostCapacity, p)
+        if appended { changed(enforcer, null, &enforcer.*.host[enforcer.*.hostCount - 1]) }
+    }
+}
+
+pub fn setSessionPolicy(enforcer: *Enforcer, domain: []const u8, includeSubdomains: bool, now: i64) -> void {
+    const p = sessionPolicy(domain, includeSubdomains)
+    setPolicy(enforcer, &p, now)
+}
+
+// Whether the domain itself has a policy that is valid at `now`.
+pub fn hasValidPolicy(enforcer: *Enforcer, domain: []const u8, now: i64) -> bool {
+    if find(enforcer.*.session, enforcer.*.sessionCount, domain) < enforcer.*.sessionCount { return true }
+    const index = find(enforcer.*.host, enforcer.*.hostCount, domain)
+    if index < enforcer.*.hostCount { return !isExpired(&enforcer.*.host[index], now) }
+    return false
+}
+
+// Whether a policy of the domain (session or host) covers its subdomains.
+pub fn includesSubdomains(enforcer: *Enforcer, domain: []const u8) -> bool {
+    var index = find(enforcer.*.session, enforcer.*.sessionCount, domain)
+    if index < enforcer.*.sessionCount && enforcer.*.session[index].includeSubdomains { return true }
+    index = find(enforcer.*.host, enforcer.*.hostCount, domain)
+    return index < enforcer.*.hostCount && enforcer.*.host[index].includeSubdomains
+}
+
+// The domain after the first label and its dots (empty when there is
+// none): "example.com" of "www.example.com".
+pub fn superDomain(domain: []const u8) -> []const u8 {
+    var at: usize = 0
+    while at < domain.length && domain[at] != 46 { at += 1 }
+    while at < domain.length && domain[at] == 46 { at += 1 }
+    return domain[at..domain.length]
+}
+
+// Whether `domain` must be reached over https: it has a valid policy, or
+// a domain above it has one that covers subdomains.
+pub fn mustEnforce(enforcer: *Enforcer, domain: []const u8, now: i64) -> bool {
+    if hasValidPolicy(enforcer, domain, now) { return true }
+    var parent = superDomain(domain)
+    while parent.length > 0 {
+        if includesSubdomains(enforcer, parent) && hasValidPolicy(enforcer, parent, now) { return true }
+        parent = superDomain(parent)
+    }
+    return false
+}
+
+// The policies, host ones first then (when `sessionPolicies`) the
+// session ones: `index` from 0 up; false past the end.
+pub fn policyAt(enforcer: *Enforcer, sessionPolicies: bool, index: usize, out: **Policy) -> bool {
+    if index < enforcer.*.hostCount {
+        out.* = &enforcer.*.host[index]
+        return true
+    }
+    if !sessionPolicies { return false }
+    const rest = index - enforcer.*.hostCount
+    if rest < enforcer.*.sessionCount {
+        out.* = &enforcer.*.session[rest]
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// The file: a line per host policy, the domain, max-age, expiry and
+// whether it covers subdomains, tab-separated (what SoupHSTSEnforcerDB
+// keeps here instead of libsoup's SQLite file).
+
+fn putNumber(sink: headers.Sink, value: i64) -> void {
+    var digits: [24]u8 = undefined
+    var n: usize = 0
+    var rest: u64 = if value < 0 { @bitCast(u64, 0 -% value) } else { @bitCast(u64, value) }
+    while true {
+        digits[23 - n] = @intCast(u8, 48 + rest % 10)
+        n += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    if value < 0 { headers.putByte(sink, 45) }
+    headers.put(sink, digits[24 - n..24])
+}
+
+pub fn writeText(sink: headers.Sink, enforcer: *Enforcer) -> void {
+    var i: usize = 0
+    while i < enforcer.*.hostCount {
+        const p = &enforcer.*.host[i]
+        headers.put(sink, p.*.domain)
+        headers.putByte(sink, 9)
+        putNumber(sink, @bitCast(i64, p.*.maxAge))
+        headers.putByte(sink, 9)
+        putNumber(sink, p.*.expires)
+        headers.putByte(sink, 9)
+        headers.putByte(sink, if p.*.includeSubdomains { 49 } else { 48 })
+        headers.putByte(sink, 10)
+        i += 1
+    }
+}
+
+fn number(text: []const u8) -> i64 {
+    var value: i64 = 0
+    var negative = false
+    for ch in text {
+        if ch == 45 { negative = true }
+        if ch >= 48 && ch <= 57 { value = value *% 10 +% @intCast(i64, ch - 48) }
+    }
+    return if negative { 0 - value } else { value }
+}
+
+// The policy of a line of the file (a view; false for a line that is not
+// one).
+pub fn parseTextLine(line: []const u8, out: *Policy) -> bool {
+    var fields: [4]usize = [4]usize{ 0, 0, 0, 0 }
+    var count: usize = 1
+    var i: usize = 0
+    while i < line.length {
+        if line[i] == 9 && count < 4 {
+            fields[count] = i + 1
+            count += 1
+        }
+        i += 1
+    }
+    if count != 4 { return false }
+    out.* = policyWithExpiry(line[0..fields[1] - 1], @bitCast(u64, number(line[fields[1]..fields[2] - 1])), number(line[fields[2]..fields[3] - 1]), line[fields[3]] == 49)
+    return true
+}
+
+// Takes the file's policies that are not expired at `now` into the
+// enforcer (set directly, with no change told).
+pub fn loadText(enforcer: *Enforcer, contents: []const u8, now: i64) -> void {
+    var at: usize = 0
+    while at < contents.length {
+        var end = at
+        while end < contents.length && contents[end] != 10 { end += 1 }
+        var p: Policy = undefined
+        if parseTextLine(contents[at..end], &p) && !isExpired(&p, now) {
+            const index = find(enforcer.*.host, enforcer.*.hostCount, p.domain)
+            if index < enforcer.*.hostCount {
+                var made = p
+                if own(enforcer.*.allocator, &made) {
+                    policyFree(enforcer.*.allocator, &enforcer.*.host[index])
+                    enforcer.*.host[index] = made
+                }
+            } else {
+                _ = append(enforcer, &enforcer.*.host, &enforcer.*.hostCount, &enforcer.*.hostCapacity, &p)
+            }
+        }
+        at = end + 1
+    }
+}

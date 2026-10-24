@@ -1,0 +1,704 @@
+// std.unicode.search: string search by collation (usearch.h): where a
+// pattern occurs in text as a collator compares them (at its strength:
+// "a" finds "A" and "á" at the primary level), as ICU's StringSearch
+// finds it.
+//
+// A match begins and ends on boundaries of grapheme clusters (or of the
+// break iterator given), so that it takes whole characters with their
+// marks; it begins at a character that has collation elements; and its
+// elements, at the collator's strength, are the pattern's. The element
+// comparison is ICU's: exact (USEARCH_STANDARD_ELEMENT_COMPARISON), or
+// with a base letter of the pattern (its secondary and tertiary weights
+// the common ones) matching the letter with any accent or case in the
+// text (USEARCH_PATTERN_BASE_WEIGHT_IS_WILDCARD, what WebKit's
+// case-insensitive find uses), or either way round
+// (USEARCH_ANY_BASE_WEIGHT_IS_WILDCARD). At the identical strength the
+// match's code points (in NFD) must be the pattern's too. Canonical
+// matching (USEARCH_CANONICAL_MATCH) is kept but takes no part, as in ICU
+// since 4.something.
+//
+// The native API, for Mlx: `find` and `findLast` over UTF-8 text with a
+// collation.Collator.
+const m = @import("std.unicode.memory")
+const collation = @import("std.unicode.collation")
+const e = @import("std.unicode.collation.elements")
+const breaks = @import("std.unicode.breaks")
+const normalize = @import("std.unicode.normalize")
+const unicode = @import("std.unicode")
+const utf = @import("std.unicode.utf")
+
+pub const DONE: i32 = -1
+
+// USearchAttribute and USearchAttributeValue.
+pub const OVERLAP: i32 = 0
+pub const CANONICAL_MATCH: i32 = 1
+pub const ELEMENT_COMPARISON: i32 = 2
+pub const DEFAULT: i32 = -1
+pub const OFF: i32 = 0
+pub const ON: i32 = 1
+pub const STANDARD_ELEMENT_COMPARISON: i32 = 2
+pub const PATTERN_BASE_WEIGHT_IS_WILDCARD: i32 = 3
+pub const ANY_BASE_WEIGHT_IS_WILDCARD: i32 = 4
+
+// The searcher (C memory).
+const S_PATTERN: usize = 0
+const S_PATTERN_LENGTH: usize = 8
+const S_TEXT: usize = 16
+const S_TEXT_LENGTH: usize = 24
+const S_COLLATOR: usize = 32
+const S_OWNS_COLLATOR: usize = 40
+const S_BREAK_ITERATOR: usize = 48
+// Whether each index of the text (0 to its length) is a boundary (a byte
+// each; 0 until first needed).
+const S_BOUNDARIES: usize = 56
+const S_MATCHED_INDEX: usize = 64
+const S_MATCHED_LENGTH: usize = 68
+const S_OFFSET: usize = 72
+const S_OVERLAP: usize = 76
+const S_CANONICAL: usize = 77
+const S_RESET: usize = 78
+const S_FORWARD: usize = 79
+const S_COMPARISON: usize = 80
+const S_SIZE: usize = 96
+
+fn textLength(s: usize) -> i32 { return @intCast(i32, m.getWord(s + S_TEXT_LENGTH)) }
+
+// ---------------------------------------------------------------------------
+// Making and setting
+
+fn newSearch(pattern: usize, patternLength: i32, text: usize, textLength_: i32, coll: usize, owns: bool, breakIterator: usize, status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    if pattern == 0 || text == 0 || coll == 0 || patternLength < -1 || textLength_ < -1 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return 0
+    }
+    const pLength = m.units(pattern, patternLength)
+    const tLength = m.units(text, textLength_)
+    if pLength == 0 || tLength == 0 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return 0
+    }
+    const s = m.alloc(S_SIZE)
+    if s == 0 {
+        m.setError(status, m.MEMORY_ALLOCATION_ERROR)
+        return 0
+    }
+    m.putWord(s + S_PATTERN, pattern)
+    m.putWord(s + S_PATTERN_LENGTH, pLength)
+    m.putWord(s + S_TEXT, text)
+    m.putWord(s + S_TEXT_LENGTH, tLength)
+    m.putWord(s + S_COLLATOR, coll)
+    m.put8(s + S_OWNS_COLLATOR, if owns { 1 } else { 0 })
+    m.putWord(s + S_BREAK_ITERATOR, breakIterator)
+    resetState(s)
+    m.putI32(s + S_COMPARISON, STANDARD_ELEMENT_COMPARISON)
+    return s
+}
+
+fn resetState(s: usize) -> void {
+    m.putI32(s + S_MATCHED_INDEX, DONE)
+    m.putI32(s + S_MATCHED_LENGTH, 0)
+    m.putI32(s + S_OFFSET, 0)
+    m.put8(s + S_RESET, 1)
+    m.put8(s + S_FORWARD, 1)
+}
+
+pub fn usearch_open(pattern: usize, patternLength: i32, text: usize, textLength_: i32, locale: usize, breakIterator: usize, status: usize) -> usize {
+    if m.failed(status) { return 0 }
+    const coll = collation.ucol_open(locale, status)
+    if m.failed(status) { return 0 }
+    const s = newSearch(pattern, patternLength, text, textLength_, coll, true, breakIterator, status)
+    if s == 0 { collation.ucol_close(coll) }
+    return s
+}
+
+pub fn usearch_openFromCollator(pattern: usize, patternLength: i32, text: usize, textLength_: i32, coll: usize, breakIterator: usize, status: usize) -> usize {
+    return newSearch(pattern, patternLength, text, textLength_, coll, false, breakIterator, status)
+}
+
+pub fn usearch_close(s: usize) -> void {
+    if s == 0 { return }
+    if m.get8(s + S_OWNS_COLLATOR) != 0 { collation.ucol_close(m.getWord(s + S_COLLATOR)) }
+    m.release(m.getWord(s + S_BOUNDARIES))
+    m.release(s)
+}
+
+pub fn usearch_setOffset(s: usize, position: i32, status: usize) -> void {
+    if m.failed(status) || s == 0 { return }
+    if position < 0 || position > textLength(s) {
+        m.setError(status, m.INDEX_OUTOFBOUNDS_ERROR)
+    } else {
+        m.putI32(s + S_OFFSET, position)
+    }
+    m.putI32(s + S_MATCHED_INDEX, DONE)
+    m.putI32(s + S_MATCHED_LENGTH, 0)
+    m.put8(s + S_RESET, 0)
+}
+
+pub fn usearch_getOffset(s: usize) -> i32 {
+    if s == 0 { return DONE }
+    const offset = m.getI32(s + S_OFFSET)
+    if offset < 0 || offset > textLength(s) { return DONE }
+    return offset
+}
+
+pub fn usearch_setAttribute(s: usize, attribute: i32, value: i32, status: usize) -> void {
+    if m.failed(status) || s == 0 { return }
+    if attribute == OVERLAP {
+        m.put8(s + S_OVERLAP, if value == ON { 1 } else { 0 })
+    } else if attribute == CANONICAL_MATCH {
+        m.put8(s + S_CANONICAL, if value == ON { 1 } else { 0 })
+    } else if attribute == ELEMENT_COMPARISON {
+        m.putI32(s + S_COMPARISON, if value == PATTERN_BASE_WEIGHT_IS_WILDCARD || value == ANY_BASE_WEIGHT_IS_WILDCARD { value } else { STANDARD_ELEMENT_COMPARISON })
+    } else {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+    }
+}
+
+pub fn usearch_getAttribute(s: usize, attribute: i32) -> i32 {
+    if s == 0 { return DEFAULT }
+    if attribute == OVERLAP { return if m.get8(s + S_OVERLAP) != 0 { ON } else { OFF } }
+    if attribute == CANONICAL_MATCH { return if m.get8(s + S_CANONICAL) != 0 { ON } else { OFF } }
+    if attribute == ELEMENT_COMPARISON { return m.getI32(s + S_COMPARISON) }
+    return DEFAULT
+}
+
+pub fn usearch_getMatchedStart(s: usize) -> i32 { return if s != 0 { m.getI32(s + S_MATCHED_INDEX) } else { DONE } }
+
+pub fn usearch_getMatchedLength(s: usize) -> i32 {
+    if s == 0 || m.getI32(s + S_MATCHED_INDEX) == DONE { return 0 }
+    return m.getI32(s + S_MATCHED_LENGTH)
+}
+
+pub fn usearch_getMatchedText(s: usize, result: usize, resultCapacity: i32, status: usize) -> i32 {
+    if m.failed(status) { return DONE }
+    if s == 0 || resultCapacity < 0 || (resultCapacity > 0 && result == 0) {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return DONE
+    }
+    const index = m.getI32(s + S_MATCHED_INDEX)
+    if index == DONE {
+        _ = m.terminate(result, 0, resultCapacity, status)
+        return DONE
+    }
+    const n = @intCast(usize, m.getI32(s + S_MATCHED_LENGTH))
+    const copied = if n < @intCast(usize, resultCapacity) { n } else { @intCast(usize, resultCapacity) }
+    m.copy(result, m.getWord(s + S_TEXT) + @intCast(usize, index) * 2, copied * 2)
+    return m.terminate(result, n, resultCapacity, status)
+}
+
+pub fn usearch_setBreakIterator(s: usize, breakIterator: usize, status: usize) -> void {
+    if m.failed(status) || s == 0 { return }
+    m.putWord(s + S_BREAK_ITERATOR, breakIterator)
+    if breakIterator != 0 { breaks.ubrk_setText(breakIterator, m.getWord(s + S_TEXT), textLength(s), status) }
+    m.release(m.getWord(s + S_BOUNDARIES))
+    m.putWord(s + S_BOUNDARIES, 0)
+}
+
+pub fn usearch_getBreakIterator(s: usize) -> usize { return if s != 0 { m.getWord(s + S_BREAK_ITERATOR) } else { 0 } }
+
+pub fn usearch_setText(s: usize, text: usize, length: i32, status: usize) -> void {
+    if m.failed(status) { return }
+    if s == 0 || text == 0 || length < -1 || length == 0 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return
+    }
+    m.putWord(s + S_TEXT, text)
+    m.putWord(s + S_TEXT_LENGTH, m.units(text, length))
+    m.release(m.getWord(s + S_BOUNDARIES))
+    m.putWord(s + S_BOUNDARIES, 0)
+    if m.getWord(s + S_BREAK_ITERATOR) != 0 { breaks.ubrk_setText(m.getWord(s + S_BREAK_ITERATOR), text, length, status) }
+    m.putI32(s + S_MATCHED_INDEX, DONE)
+    m.putI32(s + S_MATCHED_LENGTH, 0)
+    m.putI32(s + S_OFFSET, 0)
+    m.put8(s + S_RESET, 1)
+}
+
+pub fn usearch_getText(s: usize, length: usize) -> usize {
+    if s == 0 { return 0 }
+    if length != 0 { m.putI32(length, textLength(s)) }
+    return m.getWord(s + S_TEXT)
+}
+
+pub fn usearch_getCollator(s: usize) -> usize { return if s != 0 { m.getWord(s + S_COLLATOR) } else { 0 } }
+
+pub fn usearch_setCollator(s: usize, coll: usize, status: usize) -> void {
+    if m.failed(status) { return }
+    if s == 0 || coll == 0 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return
+    }
+    if m.get8(s + S_OWNS_COLLATOR) != 0 && m.getWord(s + S_COLLATOR) != coll { collation.ucol_close(m.getWord(s + S_COLLATOR)) }
+    m.putWord(s + S_COLLATOR, coll)
+    m.put8(s + S_OWNS_COLLATOR, 0)
+}
+
+pub fn usearch_setPattern(s: usize, pattern: usize, length: i32, status: usize) -> void {
+    if m.failed(status) { return }
+    if s == 0 || pattern == 0 || length < -1 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return
+    }
+    const n = m.units(pattern, length)
+    if n == 0 {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return
+    }
+    m.putWord(s + S_PATTERN, pattern)
+    m.putWord(s + S_PATTERN_LENGTH, n)
+}
+
+pub fn usearch_getPattern(s: usize, length: usize) -> usize {
+    if s == 0 { return 0 }
+    if length != 0 { m.putI32(length, @intCast(i32, m.getWord(s + S_PATTERN_LENGTH))) }
+    return m.getWord(s + S_PATTERN)
+}
+
+// The settings back to their defaults and the search to its start.
+pub fn usearch_reset(s: usize) -> void {
+    if s == 0 { return }
+    m.put8(s + S_OVERLAP, 0)
+    m.put8(s + S_CANONICAL, 0)
+    m.putI32(s + S_COMPARISON, STANDARD_ELEMENT_COMPARISON)
+    resetState(s)
+}
+
+// ---------------------------------------------------------------------------
+// Matching
+
+// The boundaries of the text (a byte an index, its length included).
+fn boundaries(s: usize) -> usize {
+    const known = m.getWord(s + S_BOUNDARIES)
+    if known != 0 { return known }
+    const n = m.getWord(s + S_TEXT_LENGTH)
+    const flags = m.alloc(n + 1)
+    var status: i32 = 0
+    var iterator = m.getWord(s + S_BREAK_ITERATOR)
+    const own = iterator == 0
+    // UBRK_CHARACTER: grapheme clusters.
+    if own { iterator = breaks.ubrk_open(0, m.literal(""), m.getWord(s + S_TEXT), @intCast(i32, n), @intFromPtr(&status)) }
+    if iterator == 0 || status > 0 {
+        // (Without an iterator, every code point boundary.)
+        var i: usize = 0
+        while i <= n {
+            const unit = if i < n { m.get16(m.getWord(s + S_TEXT) + i * 2) } else { 0 }
+            m.put8(flags + i, if unit >= 56320 && unit <= 57343 && i > 0 { 0 } else { 1 })
+            i += 1
+        }
+    } else {
+        var at = breaks.ubrk_first(iterator)
+        while at >= 0 && @intCast(usize, at) <= n {
+            m.put8(flags + @intCast(usize, at), 1)
+            at = breaks.ubrk_next(iterator)
+        }
+        if own { breaks.ubrk_close(iterator) }
+    }
+    m.putWord(s + S_BOUNDARIES, flags)
+    return flags
+}
+
+fn isBoundary(s: usize, index: usize) -> bool { return m.get8(boundaries(s) + index) != 0 }
+
+fn nextBoundary(s: usize, index: usize) -> usize {
+    const n = m.getWord(s + S_TEXT_LENGTH)
+    var at = index + 1
+    while at < n && !isBoundary(s, at) { at += 1 }
+    return if at > n { n } else { at }
+}
+
+// The search weights of units [from, to) of `units` into `out`.
+fn weightsOf(coll: usize, units: usize, from: usize, to: usize, out: *m.Buffer) -> void {
+    var codes = m.buffer()
+    m.decode16(&codes, units + from * 2, to - from)
+    collation.searchWeights(coll, &codes, out)
+    m.dispose(&codes)
+}
+
+const MATCH: i32 = 0
+const NO_MATCH: i32 = 1
+const SKIP_TARGET: i32 = 2
+const SKIP_PATTERN: i32 = 3
+const NEED_MORE: i32 = 4
+
+// ICU's compareCE64s: an element of the text against one of the
+// pattern, by the comparison kind.
+fn compareElements(t: *m.Buffer, i: usize, pattern: *m.Buffer, j: usize, kind: i32) -> i32 {
+    const tp = m.at(t, i * 3)
+    const ts = m.at(t, i * 3 + 1)
+    const tt = m.at(t, i * 3 + 2)
+    const pp = m.at(pattern, j * 3)
+    const ps = m.at(pattern, j * 3 + 1)
+    const pt = m.at(pattern, j * 3 + 2)
+    if tp == pp && ts == ps && tt == pt { return MATCH }
+    if kind == STANDARD_ELEMENT_COMPARISON { return NO_MATCH }
+    const any = kind == ANY_BASE_WEIGHT_IS_WILDCARD
+    if tp != pp {
+        if tp == 0 { return SKIP_TARGET }
+        if pp == 0 && any { return SKIP_PATTERN }
+        return NO_MATCH
+    }
+    if ts != ps {
+        if ts == 0 { return SKIP_TARGET }
+        if ps == 0 && any { return SKIP_PATTERN }
+        return if ps == e.COMMON_SECONDARY || (any && ts == e.COMMON_SECONDARY) { MATCH } else { NO_MATCH }
+    }
+    if tt != pt { return if pt == e.COMMON_TERTIARY || (any && tt == e.COMMON_TERTIARY) { MATCH } else { NO_MATCH } }
+    return MATCH
+}
+
+// Whether the text's elements `t` are the pattern's: MATCH, NO_MATCH, or
+// NEED_MORE when they are a beginning of them. Elements of the text with
+// no primary weight after the pattern's last are taken with it (an
+// accent after a base letter) when the comparison lets them.
+fn compareSequences(t: *m.Buffer, pattern: *m.Buffer, kind: i32) -> i32 {
+    const tn = t.*.length / 3
+    const pn = pattern.*.length / 3
+    var i: usize = 0
+    var j: usize = 0
+    while j < pn {
+        if i >= tn {
+            // (Elements of the pattern with no primary weight left at the
+            // end of the text's are skipped when either side's base
+            // letters are wildcards, as ICU skips them against what comes
+            // next.)
+            if kind == ANY_BASE_WEIGHT_IS_WILDCARD {
+                var k = j
+                while k < pn && m.at(pattern, k * 3) == 0 { k += 1 }
+                if k == pn { return MATCH }
+            }
+            return NEED_MORE
+        }
+        const result = compareElements(t, i, pattern, j, kind)
+        if result == NO_MATCH { return NO_MATCH }
+        if result == MATCH {
+            i += 1
+            j += 1
+        } else if result == SKIP_TARGET {
+            i += 1
+        } else {
+            j += 1
+        }
+    }
+    while i < tn {
+        if m.at(t, i * 3) != 0 || kind == STANDARD_ELEMENT_COMPARISON { return NO_MATCH }
+        const result = compareElements(t, i, pattern, pn - 1, kind)
+        if result == NO_MATCH || result == SKIP_PATTERN { return NO_MATCH }
+        i += 1
+    }
+    return MATCH
+}
+
+// Whether units [from, to) are the pattern's in NFD (the identical
+// level).
+fn identical(s: usize, from: usize, to: usize) -> bool {
+    var a = m.buffer()
+    var b = m.buffer()
+    var na = m.buffer()
+    var nb = m.buffer()
+    m.decode16(&a, m.getWord(s + S_TEXT) + from * 2, to - from)
+    m.decode16(&b, m.getWord(s + S_PATTERN), m.getWord(s + S_PATTERN_LENGTH))
+    normalize.normalizeCodes(&na, &a, normalize.NFD)
+    normalize.normalizeCodes(&nb, &b, normalize.NFD)
+    var same = na.length == nb.length
+    var i: usize = 0
+    while same && i < na.length {
+        if m.at(&na, i) != m.at(&nb, i) { same = false }
+        i += 1
+    }
+    m.dispose(&a)
+    m.dispose(&b)
+    m.dispose(&na)
+    m.dispose(&nb)
+    return same
+}
+
+// How many more clusters a match is tried with after its elements stop
+// being the pattern's: a contraction (Danish "aa", Slovak "ch") changes
+// the elements of what it joins, so a mismatch may be undone by the
+// cluster after it.
+const RETRIES: usize = 2
+
+// The end of a match beginning at `start` (a boundary), or 0 for none:
+// the shortest whose elements are the pattern's.
+fn matchFrom(s: usize, start: usize, pattern: *m.Buffer) -> usize {
+    const coll = m.getWord(s + S_COLLATOR)
+    const text = m.getWord(s + S_TEXT)
+    const n = m.getWord(s + S_TEXT_LENGTH)
+    const kind = m.getI32(s + S_COMPARISON)
+    var end = nextBoundary(s, start)
+    var t = m.buffer()
+    // (A match begins at a character with elements.)
+    weightsOf(coll, text, start, end, &t)
+    if t.length == 0 {
+        m.dispose(&t)
+        return 0
+    }
+    var misses: usize = 0
+    while true {
+        const result = compareSequences(&t, pattern, kind)
+        if result == MATCH && (!collation.isIdentical(coll) || identical(s, start, end)) { break }
+        if result == NO_MATCH { misses += 1 }
+        if misses > RETRIES || end >= n {
+            m.dispose(&t)
+            return 0
+        }
+        end = nextBoundary(s, end)
+        t.length = 0
+        weightsOf(coll, text, start, end, &t)
+    }
+    m.dispose(&t)
+    return end
+}
+
+// The first match beginning at `from` or after: its start (or DONE) and
+// its end into `end`.
+fn searchForward(s: usize, from: usize, end: *usize) -> i32 {
+    var pattern = m.buffer()
+    weightsOf(m.getWord(s + S_COLLATOR), m.getWord(s + S_PATTERN), 0, m.getWord(s + S_PATTERN_LENGTH), &pattern)
+    const n = m.getWord(s + S_TEXT_LENGTH)
+    var start = from
+    var result: i32 = DONE
+    while start < n {
+        if isBoundary(s, start) {
+            const found = matchFrom(s, start, &pattern)
+            if found != 0 {
+                end.* = found
+                result = @intCast(i32, start)
+                break
+            }
+        }
+        start += 1
+    }
+    m.dispose(&pattern)
+    return result
+}
+
+// The last match ending at `before` or before it.
+fn searchBackward(s: usize, before: usize, end: *usize) -> i32 {
+    var pattern = m.buffer()
+    weightsOf(m.getWord(s + S_COLLATOR), m.getWord(s + S_PATTERN), 0, m.getWord(s + S_PATTERN_LENGTH), &pattern)
+    var start = before
+    var result: i32 = DONE
+    while start > 0 {
+        start -= 1
+        if isBoundary(s, start) {
+            const found = matchFrom(s, start, &pattern)
+            if found != 0 && found <= before {
+                end.* = found
+                result = @intCast(i32, start)
+                break
+            }
+        }
+    }
+    m.dispose(&pattern)
+    return result
+}
+
+// Whether the pattern has elements at the collator's strength.
+fn patternHasElements(s: usize) -> bool {
+    var pattern = m.buffer()
+    weightsOf(m.getWord(s + S_COLLATOR), m.getWord(s + S_PATTERN), 0, m.getWord(s + S_PATTERN_LENGTH), &pattern)
+    const has = pattern.length > 0
+    m.dispose(&pattern)
+    return has
+}
+
+fn found(s: usize, start: i32, end: usize) -> i32 {
+    m.putI32(s + S_MATCHED_INDEX, start)
+    m.putI32(s + S_MATCHED_LENGTH, @intCast(i32, end) - start)
+    m.putI32(s + S_OFFSET, start)
+    return start
+}
+
+fn notFound(s: usize, forward: bool) -> i32 {
+    m.putI32(s + S_MATCHED_INDEX, DONE)
+    m.putI32(s + S_MATCHED_LENGTH, 0)
+    m.putI32(s + S_OFFSET, if forward { textLength(s) } else { 0 })
+    return DONE
+}
+
+pub fn usearch_next(s: usize, status: usize) -> i32 {
+    if m.failed(status) || s == 0 { return DONE }
+    const offset = usearch_getOffset(s)
+    const n = textLength(s)
+    m.put8(s + S_RESET, 0)
+    const matched = m.getI32(s + S_MATCHED_INDEX)
+    const matchedLength = m.getI32(s + S_MATCHED_LENGTH)
+    if m.get8(s + S_FORWARD) != 0 {
+        if offset == n || (m.get8(s + S_OVERLAP) == 0 && matched != DONE && offset + matchedLength > n) { return notFound(s, true) }
+    } else {
+        // (Turning round: the match found going back is the first.)
+        m.put8(s + S_FORWARD, 1)
+        if matched != DONE { return matched }
+    }
+    if !patternHasElements(s) {
+        // A pattern of no elements matches at every code point.
+        var at = if matched == DONE { offset } else { matched + 1 }
+        if matched != DONE && at < n && isTrailSurrogateAt(s, at) { at += 1 }
+        if at >= n { return notFound(s, true) }
+        m.putI32(s + S_MATCHED_INDEX, at)
+        m.putI32(s + S_MATCHED_LENGTH, 0)
+        m.putI32(s + S_OFFSET, at)
+        return at
+    }
+    var from = offset
+    if matched != DONE && matchedLength > 0 { from = if m.get8(s + S_OVERLAP) != 0 { offset + 1 } else { offset + matchedLength } }
+    var end: usize = 0
+    const start = searchForward(s, @intCast(usize, from), &end)
+    if start == DONE { return notFound(s, true) }
+    return found(s, start, end)
+}
+
+fn isTrailSurrogateAt(s: usize, at: i32) -> bool {
+    const unit = m.get16(m.getWord(s + S_TEXT) + @intCast(usize, at) * 2)
+    return unit >= 56320 && unit <= 57343
+}
+
+pub fn usearch_previous(s: usize, status: usize) -> i32 {
+    if m.failed(status) || s == 0 { return DONE }
+    var offset = usearch_getOffset(s)
+    if m.get8(s + S_RESET) != 0 {
+        offset = textLength(s)
+        m.put8(s + S_FORWARD, 0)
+        m.put8(s + S_RESET, 0)
+        m.putI32(s + S_OFFSET, offset)
+    }
+    const matched = m.getI32(s + S_MATCHED_INDEX)
+    if m.get8(s + S_FORWARD) != 0 {
+        m.put8(s + S_FORWARD, 0)
+        if matched != DONE { return matched }
+    } else if offset == 0 || matched == 0 {
+        return notFound(s, false)
+    }
+    if !patternHasElements(s) {
+        var at = if matched == DONE { offset } else { matched }
+        if at <= 0 { return notFound(s, false) }
+        at -= 1
+        if at > 0 && isTrailSurrogateAt(s, at) { at -= 1 }
+        m.putI32(s + S_MATCHED_INDEX, at)
+        m.putI32(s + S_MATCHED_LENGTH, 0)
+        m.putI32(s + S_OFFSET, at)
+        return at
+    }
+    var before = offset
+    if m.get8(s + S_OVERLAP) != 0 && matched != DONE { before = matched + m.getI32(s + S_MATCHED_LENGTH) - 1 }
+    var end: usize = 0
+    const start = searchBackward(s, @intCast(usize, before), &end)
+    if start == DONE { return notFound(s, false) }
+    return found(s, start, end)
+}
+
+pub fn usearch_first(s: usize, status: usize) -> i32 {
+    if m.failed(status) || s == 0 { return DONE }
+    m.put8(s + S_FORWARD, 1)
+    usearch_setOffset(s, 0, status)
+    return usearch_next(s, status)
+}
+
+pub fn usearch_following(s: usize, position: i32, status: usize) -> i32 {
+    if m.failed(status) || s == 0 { return DONE }
+    m.put8(s + S_FORWARD, 1)
+    usearch_setOffset(s, position, status)
+    return usearch_next(s, status)
+}
+
+pub fn usearch_last(s: usize, status: usize) -> i32 {
+    if m.failed(status) || s == 0 { return DONE }
+    m.put8(s + S_FORWARD, 0)
+    usearch_setOffset(s, textLength(s), status)
+    return usearch_previous(s, status)
+}
+
+pub fn usearch_preceding(s: usize, position: i32, status: usize) -> i32 {
+    if m.failed(status) || s == 0 { return DONE }
+    m.put8(s + S_FORWARD, 0)
+    usearch_setOffset(s, position, status)
+    return usearch_previous(s, status)
+}
+
+// The match beginning at `startIdx` or after (ICU's internal
+// usearch_search): whether there is one, and its bounds.
+pub fn usearch_search(s: usize, startIdx: i32, matchStart: usize, matchLimit: usize, status: usize) -> u8 {
+    if m.failed(status) { return 0 }
+    if s == 0 || startIdx < 0 || startIdx > textLength(s) || !patternHasElements(s) {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return 0
+    }
+    var end: usize = 0
+    const start = searchForward(s, @intCast(usize, startIdx), &end)
+    if matchStart != 0 { m.putI32(matchStart, start) }
+    if matchLimit != 0 { m.putI32(matchLimit, if start == DONE { DONE } else { @intCast(i32, end) }) }
+    return if start == DONE { 0 } else { 1 }
+}
+
+// The last match ending at `startIdx` or before it (ICU's internal
+// usearch_searchBackwards).
+pub fn usearch_searchBackwards(s: usize, startIdx: i32, matchStart: usize, matchLimit: usize, status: usize) -> u8 {
+    if m.failed(status) { return 0 }
+    if s == 0 || startIdx < 0 || startIdx > textLength(s) || !patternHasElements(s) {
+        m.setError(status, m.ILLEGAL_ARGUMENT_ERROR)
+        return 0
+    }
+    var end: usize = 0
+    const start = searchBackward(s, @intCast(usize, startIdx), &end)
+    if matchStart != 0 { m.putI32(matchStart, start) }
+    if matchLimit != 0 { m.putI32(matchLimit, if start == DONE { DONE } else { @intCast(i32, end) }) }
+    return if start == DONE { 0 } else { 1 }
+}
+
+// ---------------------------------------------------------------------------
+// The native API
+
+// A match: where it begins and ends in the text (byte offsets).
+pub const Match = struct {
+    start: usize
+    end: usize
+}
+
+// The first match of `pattern` in `text` (UTF-8) beginning at byte `from`
+// or after, as `collator` compares them; false when there is none.
+// `wildcard` lets a base letter of the pattern match any accent and case
+// of it in the text (USEARCH_PATTERN_BASE_WEIGHT_IS_WILDCARD).
+pub fn find(allocator: utf.Allocator, collator: *const collation.Collator, pattern: []const u8, text: []const u8, from: usize, wildcard: bool, result: *Match) -> unicode.Error!bool {
+    return findIn(allocator, collator, pattern, text, from, wildcard, false, result)
+}
+
+// The last match ending at byte `before` or before it.
+pub fn findLast(allocator: utf.Allocator, collator: *const collation.Collator, pattern: []const u8, text: []const u8, before: usize, wildcard: bool, result: *Match) -> unicode.Error!bool {
+    return findIn(allocator, collator, pattern, text, before, wildcard, true, result)
+}
+
+// The UTF-16 offset of byte offset `at` of `text`, or the byte offset of
+// UTF-16 offset `at` (`toBytes`).
+fn convertOffset(text: []const u8, at: usize, toBytes: bool) -> usize {
+    var bytes: usize = 0
+    var units: usize = 0
+    while bytes < text.length {
+        if (if toBytes { units >= at } else { bytes >= at }) { break }
+        const next = utf.decode8(text, bytes)
+        bytes += next.length
+        units += utf.length16(next.codepoint)
+    }
+    return if toBytes { bytes } else { units }
+}
+
+fn findIn(allocator: utf.Allocator, collator: *const collation.Collator, pattern: []const u8, text: []const u8, position: usize, wildcard: bool, backward: bool, result: *Match) -> unicode.Error!bool {
+    if pattern.length == 0 || text.length == 0 { return false }
+    const p16 = try utf.toUtf16(allocator, pattern)
+    defer utf.free16(allocator, p16)
+    const t16 = try utf.toUtf16(allocator, text)
+    defer utf.free16(allocator, t16)
+    var status: i32 = 0
+    const s = usearch_openFromCollator(@intFromPtr(p16.pointer), @intCast(i32, p16.length), @intFromPtr(t16.pointer), @intCast(i32, t16.length), collator.*.handle, 0, @intFromPtr(&status))
+    try unicode.check(status)
+    if s == 0 { return unicode.Error.OutOfMemory }
+    defer usearch_close(s)
+    if wildcard { usearch_setAttribute(s, ELEMENT_COMPARISON, PATTERN_BASE_WEIGHT_IS_WILDCARD, @intFromPtr(&status)) }
+    var end: usize = 0
+    const at = convertOffset(text, position, false)
+    const start = if backward { searchBackward(s, at, &end) } else { searchForward(s, at, &end) }
+    if start == DONE { return false }
+    result.*.start = convertOffset(text, @intCast(usize, start), true)
+    result.*.end = convertOffset(text, end, true)
+    return true
+}

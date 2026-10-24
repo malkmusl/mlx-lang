@@ -1,0 +1,620 @@
+// D-Bus (gdbusproxy.h and its neighbours) as far as WebKit's base
+// library asks for it. This library does not speak D-Bus: a bus's
+// address is found as GIO finds it (DBUS_SYSTEM_BUS_ADDRESS or the
+// system's socket, DBUS_SESSION_BUS_ADDRESS or $XDG_RUNTIME_DIR/bus),
+// and connecting fails as GIO's does when nothing answers ("Could not
+// connect: ..." for a socket that is not there, "Cannot autolaunch D-Bus
+// without X11 $DISPLAY" for a session bus without an address); when a
+// bus does answer, connecting fails with G_IO_ERROR_NOT_SUPPORTED. The
+// asynchronous forms report the same error to their callback from the
+// main context. Introspection XML is parsed into GDBusNodeInfo (with
+// GMarkup), and D-Bus's remote error names are read from messages.
+const m = @import("./memory.mlx")
+const sys = @import("./sys.mlx")
+const threads = @import("./threads.mlx")
+const errors = @import("./errors.mlx")
+const messages = @import("./messages.mlx")
+const types = @import("./types.mlx")
+const ioerrors = @import("./ioerrors.mlx")
+const cancellable = @import("./cancellable.mlx")
+const task = @import("./task.mlx")
+
+extern("c") fn socket(domain: i32, kind: i32, protocol: i32) -> i32
+extern("c") fn connect(fd: i32, address: usize, length: u32) -> i32
+extern("c") fn stat(path: usize, buffer: usize) -> i32
+extern("c") fn g_object_unref(object: usize) -> void
+extern("c") fn g_task_propagate_pointer(t: usize, err: usize) -> usize
+extern("c") fn g_task_set_source_tag(t: usize, tag: usize) -> void
+extern("c") fn g_markup_parse_context_new(parser: usize, flags: i32, data: usize, notify: usize) -> usize
+extern("c") fn g_markup_parse_context_parse(k: usize, text: usize, length: i64, err: usize) -> i32
+extern("c") fn g_markup_parse_context_end_parse(k: usize, err: usize) -> i32
+extern("c") fn g_markup_parse_context_free(k: usize) -> void
+
+const BUS_STARTER: i32 = -1
+const BUS_SYSTEM: i32 = 1
+const BUS_SESSION: i32 = 2
+
+var proxyType: usize = 0
+var proxyOnce: u64 = 0
+var parserFuncs: [5]usize = undefined
+var parserOnce: u64 = 0
+
+// ---------------------------------------------------------------------------
+// Remote errors ("GDBus.Error:name: message")
+
+fn remoteName(message: usize, start: *usize, end: *usize) -> bool {
+    const prefix = "GDBus.Error:"
+    var i: usize = 0
+    while i < prefix.length {
+        if m.get8(message + i) != prefix[i] { return false }
+        i += 1
+    }
+    const begin = message + prefix.length
+    var p = begin
+    while m.get8(p) != 0 && m.get8(p) != ':' { p += 1 }
+    if m.get8(p) != ':' || m.get8(p + 1) != ' ' { return false }
+    start.* = begin
+    end.* = p
+    return true
+}
+
+export fn g_dbus_error_is_remote_error(e: usize) -> i32 {
+    const message = errors.message(e)
+    var i: usize = 0
+    const prefix = "GDBus.Error:"
+    while i < prefix.length {
+        if m.get8(message + i) != prefix[i] { return 0 }
+        i += 1
+    }
+    return 1
+}
+
+export fn g_dbus_error_get_remote_error(e: usize) -> usize {
+    var start: usize = 0
+    var end: usize = 0
+    if !remoteName(errors.message(e), &start, &end) { return 0 }
+    return m.dupBytes(start, end - start)
+}
+
+export fn g_dbus_error_strip_remote_error(e: usize) -> i32 {
+    var start: usize = 0
+    var end: usize = 0
+    const message = errors.message(e)
+    if !remoteName(message, &start, &end) { return 0 }
+    m.putWord(e + 8, m.dup(end + 2))
+    m.release(message)
+    return 1
+}
+
+// ---------------------------------------------------------------------------
+// Addresses and connecting
+
+fn isSocket(path: usize) -> bool {
+    const buffer = m.alloc(144)
+    const good = stat(path, buffer) == 0 && (m.get32(buffer + 24) & 0o170000) == 0o140000
+    m.release(buffer)
+    return good
+}
+
+pub fn addressFor(busType: i32, err: usize) -> usize {
+    var kind = busType
+    if kind == BUS_STARTER {
+        const starter = sys.getenv(m.literal("DBUS_STARTER_BUS_TYPE"))
+        kind = if starter != 0 && m.cIs(starter, "system") { BUS_SYSTEM } else { BUS_SESSION }
+        const address = sys.getenv(m.literal("DBUS_STARTER_ADDRESS"))
+        if address != 0 { return m.dup(address) }
+    }
+    if kind == BUS_SYSTEM {
+        const address = sys.getenv(m.literal("DBUS_SYSTEM_BUS_ADDRESS"))
+        return if address != 0 { m.dup(address) } else { m.dupSlice("unix:path=/run/dbus/system_bus_socket") }
+    }
+    if kind == BUS_SESSION {
+        const address = sys.getenv(m.literal("DBUS_SESSION_BUS_ADDRESS"))
+        if address != 0 { return m.dup(address) }
+        const runtime = sys.getenv(m.literal("XDG_RUNTIME_DIR"))
+        if runtime != 0 {
+            var path = m.text()
+            m.pushC(&path, runtime)
+            m.pushText(&path, "/bus")
+            if isSocket(path.address) {
+                var t = m.text()
+                m.pushText(&t, "unix:path=")
+                m.pushBytes(&t, path.address, path.length)
+                m.dispose(&path)
+                return m.finish(&t)
+            }
+            m.dispose(&path)
+        }
+        if sys.getenv(m.literal("DISPLAY")) == 0 {
+            ioerrors.set(err, ioerrors.FAILED, "Cannot autolaunch D-Bus without X11 $DISPLAY")
+        } else {
+            ioerrors.set(err, ioerrors.NOT_SUPPORTED, "Autolaunching D-Bus (dbus-launch) is not available")
+        }
+        return 0
+    }
+    ioerrors.set(err, ioerrors.INVALID_ARGUMENT, "Unknown bus type")
+    return 0
+}
+
+export fn g_dbus_address_get_for_bus_sync(bus_type: i32, c: usize, err: usize) -> usize {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    return addressFor(bus_type, err)
+}
+
+// Tries each element of the address ("unix:path=..." or
+// "unix:abstract=...", separated by ';'); always fails (see above).
+fn connectTo(address: usize, err: usize) -> void {
+    var p = address
+    var lastErrno: i32 = 2
+    var tried = false
+    while m.get8(p) != 0 {
+        var end = p
+        while m.get8(end) != 0 && m.get8(end) != ';' { end += 1 }
+        var colon = p
+        while colon < end && m.get8(colon) != ':' { colon += 1 }
+        if colon == end {
+            var t = m.text()
+            m.pushText(&t, "Address element “")
+            m.pushBytes(&t, p, end - p)
+            m.pushText(&t, "” does not contain a colon (:)")
+            ioerrors.setText(err, ioerrors.INVALID_ARGUMENT, &t)
+            return
+        }
+        const method = m.dupBytes(p, colon - p)
+        if m.cIs(method, "unix") {
+            // The path or abstract name.
+            var key = colon + 1
+            while key < end {
+                var keyEnd = key
+                while keyEnd < end && m.get8(keyEnd) != ',' { keyEnd += 1 }
+                var eq = key
+                while eq < keyEnd && m.get8(eq) != '=' { eq += 1 }
+                const isPath = eq - key == 4 && m.same(m.bytes(key, 4), "path")
+                const isAbstract = eq - key == 8 && m.same(m.bytes(key, 8), "abstract")
+                if (isPath || isAbstract) && eq < keyEnd {
+                    tried = true
+                    const name = eq + 1
+                    const length = keyEnd - name
+                    const fd = socket(1, 1 | 524288, 0)
+                    const addr = m.alloc(112)
+                    m.put16(addr, 1)
+                    const offset: usize = if isAbstract { 3 } else { 2 }
+                    if length + offset < 110 { m.copy(addr + offset, name, length) }
+                    const ok = fd >= 0 && connect(fd, addr, @intCast(u32, offset + length)) == 0
+                    if !ok { lastErrno = sys.errno() }
+                    if fd >= 0 { _ = sys.close(fd) }
+                    m.release(addr)
+                    if ok {
+                        m.release(method)
+                        ioerrors.set(err, ioerrors.NOT_SUPPORTED, "D-Bus connections are not available in this library")
+                        return
+                    }
+                }
+                key = keyEnd + 1
+            }
+        }
+        m.release(method)
+        p = if m.get8(end) == ';' { end + 1 } else { end }
+    }
+    if !tried {
+        ioerrors.set(err, ioerrors.INVALID_ARGUMENT, "Unknown or unsupported transport for address")
+        return
+    }
+    var t = m.text()
+    m.pushText(&t, "Could not connect: ")
+    m.pushC(&t, errors.errnoText(lastErrno))
+    ioerrors.setText(err, ioerrors.fromErrno(lastErrno), &t)
+}
+
+// The connection to a bus: never made here; the error is GIO's.
+fn busFailure(busType: i32, err: usize) -> void {
+    const cell = m.alloc(8)
+    const address = addressFor(busType, cell)
+    if address == 0 {
+        errors.report(err, m.getWord(cell))
+    } else {
+        connectTo(address, err)
+        m.release(address)
+    }
+    m.release(cell)
+}
+
+export fn g_bus_get_sync(bus_type: i32, c: usize, err: usize) -> usize {
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    busFailure(bus_type, err)
+    return 0
+}
+
+fn reportFailure(busType: i32, c: usize, callback: usize, user_data: usize, tag: usize) -> void {
+    const t = task.newTask(0, c, callback, user_data)
+    g_task_set_source_tag(t, tag)
+    const cell = m.alloc(8)
+    busFailure(busType, cell)
+    task.returnError(t, m.getWord(cell))
+    m.release(cell)
+    g_object_unref(t)
+}
+
+export fn g_bus_get(bus_type: i32, c: usize, callback: usize, user_data: usize) -> void { reportFailure(bus_type, c, callback, user_data, @intFromPtr(g_bus_get)) }
+export fn g_bus_get_finish(res: usize, err: usize) -> usize { return g_task_propagate_pointer(res, err) }
+
+// ---------------------------------------------------------------------------
+// GDBusProxy: the type exists; no proxy is ever made.
+
+export fn g_dbus_proxy_get_type() -> usize {
+    if threads.onceEnter(@intFromPtr(&proxyOnce)) {
+        types.ensureInit()
+        proxyType = ioerrors.defineType(types.T_OBJECT, "GDBusProxy", 408, 0, 32, 0, 0)
+        threads.onceLeave(@intFromPtr(&proxyOnce), 1)
+    }
+    return proxyType
+}
+
+fn noConnection(function: []const u8) -> void {
+    var t = m.text()
+    m.pushText(&t, function)
+    m.pushText(&t, ": assertion 'G_IS_DBUS_CONNECTION (connection)' failed")
+    messages.log(m.literal("GLib-GIO"), messages.LEVEL_CRITICAL, t.address)
+    m.dispose(&t)
+}
+
+fn noProxy(function: []const u8) -> void {
+    var t = m.text()
+    m.pushText(&t, function)
+    m.pushText(&t, ": assertion 'G_IS_DBUS_PROXY (proxy)' failed")
+    messages.log(m.literal("GLib-GIO"), messages.LEVEL_CRITICAL, t.address)
+    m.dispose(&t)
+}
+
+export fn g_dbus_proxy_new(connection: usize, flags: i32, info: usize, name: usize, object_path: usize, interface_name: usize, c: usize, callback: usize, user_data: usize) -> void { noConnection("g_dbus_proxy_new") }
+export fn g_dbus_proxy_new_finish(res: usize, err: usize) -> usize { return g_task_propagate_pointer(res, err) }
+
+export fn g_dbus_proxy_new_sync(connection: usize, flags: i32, info: usize, name: usize, object_path: usize, interface_name: usize, c: usize, err: usize) -> usize {
+    noConnection("g_dbus_proxy_new_sync")
+    return 0
+}
+
+export fn g_dbus_proxy_new_for_bus(bus_type: i32, flags: i32, info: usize, name: usize, object_path: usize, interface_name: usize, c: usize, callback: usize, user_data: usize) -> void {
+    _ = g_dbus_proxy_get_type()
+    reportFailure(bus_type, c, callback, user_data, @intFromPtr(g_dbus_proxy_new_for_bus))
+}
+
+export fn g_dbus_proxy_new_for_bus_finish(res: usize, err: usize) -> usize { return g_task_propagate_pointer(res, err) }
+
+export fn g_dbus_proxy_new_for_bus_sync(bus_type: i32, flags: i32, info: usize, name: usize, object_path: usize, interface_name: usize, c: usize, err: usize) -> usize {
+    _ = g_dbus_proxy_get_type()
+    if cancellable.setErrorIfCancelled(c, err) { return 0 }
+    busFailure(bus_type, err)
+    return 0
+}
+
+export fn g_dbus_proxy_get_connection(proxy: usize) -> usize {
+    noProxy("g_dbus_proxy_get_connection")
+    return 0
+}
+
+export fn g_dbus_proxy_get_flags(proxy: usize) -> i32 {
+    noProxy("g_dbus_proxy_get_flags")
+    return 0
+}
+
+export fn g_dbus_proxy_get_name(proxy: usize) -> usize {
+    noProxy("g_dbus_proxy_get_name")
+    return 0
+}
+
+export fn g_dbus_proxy_get_name_owner(proxy: usize) -> usize {
+    noProxy("g_dbus_proxy_get_name_owner")
+    return 0
+}
+
+export fn g_dbus_proxy_get_object_path(proxy: usize) -> usize {
+    noProxy("g_dbus_proxy_get_object_path")
+    return 0
+}
+
+export fn g_dbus_proxy_get_interface_name(proxy: usize) -> usize {
+    noProxy("g_dbus_proxy_get_interface_name")
+    return 0
+}
+
+export fn g_dbus_proxy_get_default_timeout(proxy: usize) -> i32 {
+    noProxy("g_dbus_proxy_get_default_timeout")
+    return -1
+}
+
+export fn g_dbus_proxy_set_default_timeout(proxy: usize, timeout_msec: i32) -> void { noProxy("g_dbus_proxy_set_default_timeout") }
+
+export fn g_dbus_proxy_get_cached_property(proxy: usize, property_name: usize) -> usize {
+    noProxy("g_dbus_proxy_get_cached_property")
+    return 0
+}
+
+export fn g_dbus_proxy_set_cached_property(proxy: usize, property_name: usize, value: usize) -> void { noProxy("g_dbus_proxy_set_cached_property") }
+
+export fn g_dbus_proxy_get_cached_property_names(proxy: usize) -> usize {
+    noProxy("g_dbus_proxy_get_cached_property_names")
+    return 0
+}
+
+export fn g_dbus_proxy_call(proxy: usize, method_name: usize, parameters: usize, flags: i32, timeout_msec: i32, c: usize, callback: usize, user_data: usize) -> void { noProxy("g_dbus_proxy_call") }
+
+export fn g_dbus_proxy_call_finish(proxy: usize, res: usize, err: usize) -> usize {
+    noProxy("g_dbus_proxy_call_finish")
+    return 0
+}
+
+export fn g_dbus_proxy_call_sync(proxy: usize, method_name: usize, parameters: usize, flags: i32, timeout_msec: i32, c: usize, err: usize) -> usize {
+    noProxy("g_dbus_proxy_call_sync")
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Introspection data. The structures are GIO's: every one starts with
+// its reference count and name; their lists are NULL-ended arrays.
+//
+// node: path 8, interfaces 16, nodes 24, annotations 32
+// interface: name 8, methods 16, signals 24, properties 32, annotations 40
+// method: name 8, in_args 16, out_args 24, annotations 32
+// signal: name 8, args 16, annotations 24
+// property: name 8, signature 16, flags 24, annotations 32
+// arg: name 8, signature 16, annotations 24
+// annotation: key 8, value 16, annotations 24
+
+const K_NODE: usize = 0
+const K_INTERFACE: usize = 1
+const K_METHOD: usize = 2
+const K_SIGNAL: usize = 3
+const K_PROPERTY: usize = 4
+const K_ARG: usize = 5
+const K_ANNOTATION: usize = 6
+const K_OTHER: usize = 7
+
+// A frame of the parse: the kind (0), the structure (8), three lists
+// (16, 40, 64) and the annotations (88).
+const F_KIND: usize = 0
+const F_OBJECT: usize = 8
+const F_LIST1: usize = 16
+const F_LIST2: usize = 40
+const F_LIST3: usize = 64
+const F_ANNOTATIONS: usize = 88
+const F_SIZE: usize = 112
+
+fn wordsAt(address: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, address) } }
+
+fn attribute(names: usize, valuesArray: usize, wanted: []const u8) -> usize {
+    var i: usize = 0
+    while m.getWord(names + i * 8) != 0 {
+        if m.cIs(m.getWord(names + i * 8), wanted) { return m.getWord(valuesArray + i * 8) }
+        i += 1
+    }
+    return 0
+}
+
+fn dupOrNull(text: usize) -> usize { return if text == 0 { 0 } else { m.dup(text) } }
+
+fn arrayOf(list: *m.Words) -> usize {
+    m.pushWord(list, 0)
+    return m.finishWords(list)
+}
+
+// The parse's state: the frames (words) and the root node (24).
+export fn __mlx_glib_dbus_start(k: usize, name: usize, names: usize, valuesArray: usize, state: usize, err: usize) -> void {
+    const frames = wordsAt(state)
+    const frame = m.alloc(F_SIZE)
+    var kind = K_OTHER
+    var size: usize = 0
+    if m.cIs(name, "node") {
+        kind = K_NODE
+        size = 40
+    } else if m.cIs(name, "interface") {
+        kind = K_INTERFACE
+        size = 48
+    } else if m.cIs(name, "method") {
+        kind = K_METHOD
+        size = 40
+    } else if m.cIs(name, "signal") {
+        kind = K_SIGNAL
+        size = 32
+    } else if m.cIs(name, "property") {
+        kind = K_PROPERTY
+        size = 40
+    } else if m.cIs(name, "arg") {
+        kind = K_ARG
+        size = 32
+    } else if m.cIs(name, "annotation") {
+        kind = K_ANNOTATION
+        size = 32
+    }
+    m.putWord(frame + F_KIND, kind)
+    if size != 0 {
+        const object = m.alloc(size)
+        m.putI32(object, 1)
+        if kind == K_ANNOTATION {
+            m.putWord(object + 8, dupOrNull(attribute(names, valuesArray, "name")))
+            m.putWord(object + 16, dupOrNull(attribute(names, valuesArray, "value")))
+        } else {
+            m.putWord(object + 8, dupOrNull(attribute(names, valuesArray, "name")))
+        }
+        if kind == K_ARG {
+            m.putWord(object + 16, dupOrNull(attribute(names, valuesArray, "type")))
+            // (The direction decides the method's list it goes to.)
+            const direction = attribute(names, valuesArray, "direction")
+            m.putWord(frame + F_LIST3, if direction != 0 && m.cIs(direction, "out") { 1 } else { 0 })
+        }
+        if kind == K_PROPERTY {
+            m.putWord(object + 16, dupOrNull(attribute(names, valuesArray, "type")))
+            const access = attribute(names, valuesArray, "access")
+            var flags: i32 = 0
+            if access != 0 && (m.cIs(access, "read") || m.cIs(access, "readwrite")) { flags = flags | 1 }
+            if access != 0 && (m.cIs(access, "write") || m.cIs(access, "readwrite")) { flags = flags | 2 }
+            m.putI32(object + 24, flags)
+        }
+        m.putWord(frame + F_OBJECT, object)
+    }
+    m.pushWord(frames, frame)
+}
+
+export fn __mlx_glib_dbus_end(k: usize, name: usize, state: usize, err: usize) -> void {
+    const frames = wordsAt(state)
+    const frame = m.wordAt(frames, frames.*.length - 1)
+    frames.*.length -= 1
+    const kind = m.getWord(frame + F_KIND)
+    const object = m.getWord(frame + F_OBJECT)
+    const annotations = arrayOf(wordsAt(frame + F_ANNOTATIONS))
+    if kind == K_NODE {
+        m.putWord(object + 16, arrayOf(wordsAt(frame + F_LIST1)))
+        m.putWord(object + 24, arrayOf(wordsAt(frame + F_LIST2)))
+        m.putWord(object + 32, annotations)
+    } else if kind == K_INTERFACE {
+        m.putWord(object + 16, arrayOf(wordsAt(frame + F_LIST1)))
+        m.putWord(object + 24, arrayOf(wordsAt(frame + F_LIST2)))
+        m.putWord(object + 32, arrayOf(wordsAt(frame + F_LIST3)))
+        m.putWord(object + 40, annotations)
+    } else if kind == K_METHOD {
+        m.putWord(object + 16, arrayOf(wordsAt(frame + F_LIST1)))
+        m.putWord(object + 24, arrayOf(wordsAt(frame + F_LIST2)))
+        m.putWord(object + 32, annotations)
+    } else if kind == K_SIGNAL {
+        m.putWord(object + 16, arrayOf(wordsAt(frame + F_LIST1)))
+        m.putWord(object + 24, annotations)
+    } else if kind == K_PROPERTY {
+        m.putWord(object + 32, annotations)
+    } else if kind == K_ARG || kind == K_ANNOTATION {
+        m.putWord(object + 24, annotations)
+    } else {
+        m.release(annotations)
+    }
+    const isOut = m.getWord(frame + F_LIST3) == 1 && kind == K_ARG
+    m.release(frame)
+    if kind == K_OTHER { return }
+    if frames.*.length == 0 {
+        if kind == K_NODE && m.getWord(state + 24) == 0 { m.putWord(state + 24, object) }
+        return
+    }
+    const parent = m.wordAt(frames, frames.*.length - 1)
+    const parentKind = m.getWord(parent + F_KIND)
+    if kind == K_ANNOTATION {
+        m.pushWord(wordsAt(parent + F_ANNOTATIONS), object)
+    } else if kind == K_INTERFACE && parentKind == K_NODE {
+        m.pushWord(wordsAt(parent + F_LIST1), object)
+    } else if kind == K_NODE && parentKind == K_NODE {
+        m.pushWord(wordsAt(parent + F_LIST2), object)
+    } else if kind == K_METHOD && parentKind == K_INTERFACE {
+        m.pushWord(wordsAt(parent + F_LIST1), object)
+    } else if kind == K_SIGNAL && parentKind == K_INTERFACE {
+        m.pushWord(wordsAt(parent + F_LIST2), object)
+    } else if kind == K_PROPERTY && parentKind == K_INTERFACE {
+        m.pushWord(wordsAt(parent + F_LIST3), object)
+    } else if kind == K_ARG && parentKind == K_METHOD {
+        m.pushWord(wordsAt(parent + (if isOut { F_LIST2 } else { F_LIST1 })), object)
+    } else if kind == K_ARG && parentKind == K_SIGNAL {
+        m.pushWord(wordsAt(parent + F_LIST1), object)
+    }
+}
+
+export fn g_dbus_node_info_new_for_xml(xml_data: usize, err: usize) -> usize {
+    if threads.onceEnter(@intFromPtr(&parserOnce)) {
+        parserFuncs[0] = @intFromPtr(__mlx_glib_dbus_start)
+        parserFuncs[1] = @intFromPtr(__mlx_glib_dbus_end)
+        parserFuncs[2] = 0
+        parserFuncs[3] = 0
+        parserFuncs[4] = 0
+        threads.onceLeave(@intFromPtr(&parserOnce), 1)
+    }
+    const state = m.alloc(32)
+    const k = g_markup_parse_context_new(@intFromPtr(&parserFuncs), 0, state, 0)
+    const ok = g_markup_parse_context_parse(k, xml_data, -1, err) != 0 && g_markup_parse_context_end_parse(k, err) != 0
+    g_markup_parse_context_free(k)
+    const root = m.getWord(state + 24)
+    m.disposeWords(wordsAt(state))
+    m.release(state)
+    if !ok {
+        if root != 0 { freeNode(root) }
+        return 0
+    }
+    if root == 0 {
+        errors.set(err, errors.quarkLiteral("g-markup-error-quark"), 5, "Expected a <node> element")
+        return 0
+    }
+    return root
+}
+
+fn freeList(list: usize, kind: usize) -> void {
+    if list == 0 { return }
+    var p = list
+    while m.getWord(p) != 0 {
+        freeOf(m.getWord(p), kind)
+        p += 8
+    }
+    m.release(list)
+}
+
+fn freeOf(object: usize, kind: usize) -> void {
+    if kind == K_NODE {
+        freeNode(object)
+        return
+    }
+    m.release(m.getWord(object + 8))
+    if kind == K_INTERFACE {
+        freeList(m.getWord(object + 16), K_METHOD)
+        freeList(m.getWord(object + 24), K_SIGNAL)
+        freeList(m.getWord(object + 32), K_PROPERTY)
+        freeList(m.getWord(object + 40), K_ANNOTATION)
+    } else if kind == K_METHOD {
+        freeList(m.getWord(object + 16), K_ARG)
+        freeList(m.getWord(object + 24), K_ARG)
+        freeList(m.getWord(object + 32), K_ANNOTATION)
+    } else if kind == K_SIGNAL {
+        freeList(m.getWord(object + 16), K_ARG)
+        freeList(m.getWord(object + 24), K_ANNOTATION)
+    } else if kind == K_PROPERTY {
+        m.release(m.getWord(object + 16))
+        freeList(m.getWord(object + 32), K_ANNOTATION)
+    } else {
+        m.release(m.getWord(object + 16))
+        freeList(m.getWord(object + 24), K_ANNOTATION)
+    }
+    m.release(object)
+}
+
+fn freeNode(node: usize) -> void {
+    m.release(m.getWord(node + 8))
+    freeList(m.getWord(node + 16), K_INTERFACE)
+    freeList(m.getWord(node + 24), K_NODE)
+    freeList(m.getWord(node + 32), K_ANNOTATION)
+    m.release(node)
+}
+
+export fn g_dbus_node_info_ref(info: usize) -> usize {
+    _ = @atomicRmw(u32, m.word32(info), add, 1, acq_rel)
+    return info
+}
+
+export fn g_dbus_node_info_unref(info: usize) -> void {
+    if @atomicRmw(u32, m.word32(info), sub, 1, acq_rel) == 1 { freeNode(info) }
+}
+
+export fn g_dbus_interface_info_ref(info: usize) -> usize {
+    _ = @atomicRmw(u32, m.word32(info), add, 1, acq_rel)
+    return info
+}
+
+export fn g_dbus_interface_info_unref(info: usize) -> void {
+    if @atomicRmw(u32, m.word32(info), sub, 1, acq_rel) == 1 { freeOf(info, K_INTERFACE) }
+}
+
+fn findIn(list: usize, name: usize) -> usize {
+    if list == 0 { return 0 }
+    var p = list
+    while m.getWord(p) != 0 {
+        if m.cEqual(m.getWord(m.getWord(p) + 8), name) { return m.getWord(p) }
+        p += 8
+    }
+    return 0
+}
+
+export fn g_dbus_node_info_lookup_interface(info: usize, name: usize) -> usize { return findIn(m.getWord(info + 16), name) }
+export fn g_dbus_interface_info_lookup_method(info: usize, name: usize) -> usize { return findIn(m.getWord(info + 16), name) }
+export fn g_dbus_interface_info_lookup_signal(info: usize, name: usize) -> usize { return findIn(m.getWord(info + 24), name) }
+export fn g_dbus_interface_info_lookup_property(info: usize, name: usize) -> usize { return findIn(m.getWord(info + 32), name) }

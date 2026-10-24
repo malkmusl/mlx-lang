@@ -21,33 +21,39 @@ trap 'rm -rf -- "$work"' EXIT
 compiler_args=()
 [[ $# -gt 0 ]] && compiler_args=(--compiler "$1")
 tools/install_compositor_session.sh --destdir "$work/root" --replace-sound-servers "${compiler_args[@]}" > "$work/install.log"
-bindir="$work/root/usr/local/bin"
+bindir="$work/root/usr/bin/mlx"
 entry="$work/root/usr/share/wayland-sessions/mlx-compositor.desktop"
 for program in mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions mlx-notifyd mlx-notify; do
     [[ -x "$bindir/$program" ]] || { echo "not installed: $program" >&2; cat "$work/install.log" >&2; exit 1; }
 done
-grep -qx "Exec=/usr/local/bin/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
-grep -qx "Exec=/usr/local/bin/mlx-audiod" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.Audio.service" || { echo "MLX Audio's service file is missing" >&2; exit 1; }
-grep -qx "Exec=/usr/local/bin/mlx-permissions" "$work/root/usr/local/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service" || { echo "the permission agent's service file is missing" >&2; exit 1; }
-grep -qx "Exec=/usr/local/bin/mlx-capture --portal" "$work/root/usr/local/share/mlx/dbus-1/services/org.freedesktop.portal.Desktop.service" || { echo "the screen-sharing portal's service file is missing" >&2; exit 1; }
-grep -qx "Exec=/usr/local/bin/mlx-notifyd" "$work/root/usr/local/share/mlx/dbus-1/services/org.freedesktop.Notifications.service" || { echo "the notifications' service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/mlx-audiod" "$work/root/usr/share/mlx/dbus-1/services/org.mlx.Audio.service" || { echo "MLX Audio's service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/mlx-permissions" "$work/root/usr/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service" || { echo "the permission agent's service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/mlx-capture --portal" "$work/root/usr/share/mlx/dbus-1/services/org.freedesktop.portal.Desktop.service" || { echo "the screen-sharing portal's service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/mlx-notifyd" "$work/root/usr/share/mlx/dbus-1/services/org.freedesktop.Notifications.service" || { echo "the notifications' service file is missing" >&2; exit 1; }
 for library in libpulse.so.0 libpulse-simple.so.0 libpulse-mainloop-glib.so.0 libasound_module_pcm_pulse.so libasound_module_ctl_pulse.so; do
-    [[ -f "$work/root/usr/local/lib/mlx-audio/$library" ]] || { echo "MLX Audio's $library is not installed" >&2; cat "$work/install.log" >&2; exit 1; }
+    [[ -f "$work/root/usr/lib/mlx-audio/$library" ]] || { echo "MLX Audio's $library is not installed" >&2; cat "$work/install.log" >&2; exit 1; }
 done
-grep -q "type pulse" "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && grep -qF 'lib "/usr/local/lib/mlx-audio/libasound_module_pcm_pulse.so"' "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && grep -qx "autospawn = no" "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" || { echo "--replace-sound-servers did not stage the ALSA and libpulse settings" >&2; cat "$work/install.log" >&2; exit 1; }
+grep -q "type pulse" "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && grep -qF 'lib "/usr/lib/mlx-audio/libasound_module_pcm_pulse.so"' "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && grep -qx "autospawn = no" "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" || { echo "--replace-sound-servers did not stage the ALSA and libpulse settings" >&2; cat "$work/install.log" >&2; exit 1; }
 if command -v systemctl > /dev/null; then
     [[ "$(readlink "$work/root/etc/systemd/user/pipewire.socket")" == /dev/null && "$(readlink "$work/root/etc/systemd/user/pulseaudio.service")" == /dev/null ]] || { echo "--replace-sound-servers did not mask PipeWire and PulseAudio" >&2; cat "$work/install.log" >&2; exit 1; }
 fi
 tools/install_compositor_session.sh --destdir "$work/root" --restore-sound-servers > "$work/restore.log"
 [[ ! -e "$work/root/etc/systemd/user/pipewire.socket" ]] || { echo "--restore-sound-servers left PipeWire masked" >&2; cat "$work/restore.log" >&2; exit 1; }
 [[ ! -e "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && ! -e "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" ]] || { echo "--restore-sound-servers left the settings" >&2; cat "$work/restore.log" >&2; exit 1; }
-files_entry="$work/root/usr/local/share/applications/org.mlx.files.desktop"
-grep -qx "Exec=/usr/local/bin/mlx-files %U" "$files_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.files.png" ]] || { echo "the file manager's entry or icon is missing" >&2; exit 1; }
-settings_entry="$work/root/usr/local/share/applications/mlx-settings.desktop"
-grep -qx "Icon=org.mlx.settings" "$settings_entry" && grep -qx "StartupWMClass=org.mlx.settings" "$settings_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.settings.png" ]] || { echo "the settings' entry or icon is missing" >&2; exit 1; }
-observatory_entry="$work/root/usr/local/share/applications/org.mlx.observatory.desktop"
-grep -qx "Exec=/usr/local/bin/mlx-observatory $repo_root" "$observatory_entry" && [[ -f "$work/root/usr/local/share/icons/hicolor/128x128/apps/org.mlx.observatory.png" ]] || { echo "MLX Observatory's entry or icon is missing" >&2; exit 1; }
-echo "ok   staged install: programs in PREFIX/bin, MLX Audio's libraries in PREFIX/lib/mlx-audio, session entry in wayland-sessions; the sound servers replaced and restored"
+grep -qx 'PATH=${PATH}:/usr/bin/mlx' "$work/root/etc/environment.d/50-mlx.conf" && [[ -f "$work/root/etc/profile.d/mlx.sh" ]] || { echo "/usr/bin/mlx was not put on PATH" >&2; cat "$work/install.log" >&2; exit 1; }
+files_entry="$work/root/usr/share/applications/org.mlx.files.desktop"
+grep -qx "Exec=/usr/bin/mlx/mlx-files %U" "$files_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.files.png" ]] || { echo "the file manager's entry or icon is missing" >&2; exit 1; }
+settings_entry="$work/root/usr/share/applications/mlx-settings.desktop"
+grep -qx "Icon=org.mlx.settings" "$settings_entry" && grep -qx "StartupWMClass=org.mlx.settings" "$settings_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.settings.png" ]] || { echo "the settings' entry or icon is missing" >&2; exit 1; }
+observatory_entry="$work/root/usr/share/applications/org.mlx.observatory.desktop"
+grep -qx "Exec=/usr/bin/mlx/mlx-observatory $repo_root" "$observatory_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.observatory.png" ]] || { echo "MLX Observatory's entry or icon is missing" >&2; exit 1; }
+# Voyager, when its WebKit build is there.
+if [[ -x mlx-out/webkit/mlx/bin/voyager ]]; then
+    voyager_entry="$work/root/usr/share/applications/org.mlx.voyager.desktop"
+    grep -qx "Exec=/usr/bin/mlx/voyager %U" "$voyager_entry" && grep -qx "StartupWMClass=org.mlx.voyager" "$voyager_entry" && [[ -x "$work/root/usr/bin/mlx/voyager" && -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.voyager.png" ]] || { echo "Voyager's entry, icon or program is missing" >&2; exit 1; }
+fi
+echo "ok   staged install: programs in PREFIX/bin/mlx, MLX Audio's libraries in PREFIX/lib/mlx-audio, session entry in wayland-sessions; the sound servers replaced and restored"
 
 # A systemctl that has PipeWire's user units and logs what it is told:
 # the session must stop and mask them for itself and start them again.
@@ -103,5 +109,5 @@ else
 fi
 [[ $checked -gt 0 ]] || { echo "neither cage nor weston is installed" >&2; exit 2; }
 tools/install_compositor_session.sh --destdir "$work/root" --uninstall > "$work/uninstall.log"
-[[ ! -e "$bindir/mlx-audiod" && ! -e "$work/root/usr/local/lib/mlx-audio" && ! -e "$entry" ]] || { echo "--uninstall left files behind" >&2; cat "$work/uninstall.log" >&2; exit 1; }
-echo "ok   staged uninstall: the programs, MLX Audio's libraries and the session entry removed"
+[[ ! -e "$bindir" && ! -e "$work/root/usr/lib/mlx-audio" && ! -e "$entry" && ! -e "$work/root/etc/profile.d/mlx.sh" ]] || { echo "--uninstall left files behind" >&2; cat "$work/uninstall.log" >&2; exit 1; }
+echo "ok   staged uninstall: the programs, MLX Audio's libraries, the session entry and the PATH additions removed"

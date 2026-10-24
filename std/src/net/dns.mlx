@@ -1,0 +1,426 @@
+// std.net.dns: names to addresses without a C library: an address
+// literal or "localhost" answered at once, then /etc/hosts, then the name
+// servers of /etc/resolv.conf asked over UDP (RFC 1035: a query for A and
+// one for AAAA records, the answers' names read with their compression
+// pointers, CNAMEs followed within the answer). Each server is tried in
+// turn, each query waiting at most the timeout; the addresses found go
+// IPv4 first.
+//
+//     var found: [8]dns.Address = undefined
+//     const count = dns.resolve("example.com", 443, &found, 8, 5000)
+const std = @import("std")
+const socket = std.linux.socket
+const event = std.linux.event
+const net = @import("../net.mlx")
+const random = @import("../random.mlx")
+
+pub const Address = net.Address
+
+const MAX_SERVERS: usize = 4
+const QUERY_ROOM: usize = 512
+const ANSWER_ROOM: usize = 4096
+
+fn isSpace(c: u8) -> bool { return c == 32 || c == 9 || c == 13 }
+
+fn equalsIgnoringCase(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var i: usize = 0
+    while i < a.length {
+        var x = a[i]
+        var y = b[i]
+        if x >= 65 && x <= 90 { x += 32 }
+        if y >= 65 && y <= 90 { y += 32 }
+        if x != y { return false }
+        i += 1
+    }
+    return true
+}
+
+fn add(found: [*]Address, count: *usize, max: usize, address: *const Address) -> void {
+    if count.* >= max { return }
+    // (The same address twice is kept once.)
+    var i: usize = 0
+    while i < count.* {
+        if found[i].family == address.*.family {
+            var same = true
+            var b: usize = 0
+            while b < 16 {
+                if found[i].bytes[b] != address.*.bytes[b] { same = false }
+                b += 1
+            }
+            if same { return }
+        }
+        i += 1
+    }
+    found[count.*] = address.*
+    count.* += 1
+}
+
+// Puts the IPv4 addresses before the IPv6 ones (each kind in its order).
+fn ipv4First(found: [*]Address, count: usize) -> void {
+    var sorted: usize = 0
+    var i: usize = 0
+    while i < count {
+        if found[i].family == net.Family.ipv4 {
+            if i != sorted {
+                const moved = found[i]
+                var j = i
+                while j > sorted {
+                    found[j] = found[j - 1]
+                    j -= 1
+                }
+                found[sorted] = moved
+            }
+            sorted += 1
+        }
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /etc/hosts
+
+fn hostsLookup(name: []const u8, port: u16, found: [*]Address, count: *usize, max: usize) -> void {
+    var contents: [65536]u8 = undefined
+    const bytes: [*]u8 = &contents
+    const length = std.fs.readFile("/etc/hosts".pointer, bytes, 65536)
+    var at: usize = 0
+    while at < length {
+        var end = at
+        while end < length && contents[end] != 10 { end += 1 }
+        var line = contents[at..end]
+        at = end + 1
+        var hash: usize = 0
+        while hash < line.length && line[hash] != 35 { hash += 1 }
+        line = line[0..hash]
+        // The address, then the names.
+        var p: usize = 0
+        while p < line.length && isSpace(line[p]) { p += 1 }
+        var addressEnd = p
+        while addressEnd < line.length && !isSpace(line[addressEnd]) { addressEnd += 1 }
+        if addressEnd == p { continue }
+        const addressText = line[p..addressEnd]
+        p = addressEnd
+        var matched = false
+        while p < line.length {
+            while p < line.length && isSpace(line[p]) { p += 1 }
+            var nameEnd = p
+            while nameEnd < line.length && !isSpace(line[nameEnd]) { nameEnd += 1 }
+            if nameEnd > p && equalsIgnoringCase(line[p..nameEnd], name) { matched = true }
+            p = nameEnd
+        }
+        if matched {
+            var address: Address = undefined
+            if net.parseAddress(addressText, port, &address) { add(found, count, max, &address) }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /etc/resolv.conf
+
+fn nameServers(servers: [*]Address, max: usize) -> usize {
+    var contents: [16384]u8 = undefined
+    const bytes: [*]u8 = &contents
+    const length = std.fs.readFile("/etc/resolv.conf".pointer, bytes, 16384)
+    var count: usize = 0
+    var at: usize = 0
+    while at < length && count < max {
+        var end = at
+        while end < length && contents[end] != 10 { end += 1 }
+        const line = contents[at..end]
+        at = end + 1
+        if line.length < 11 || !std.text.same(line[0..10], "nameserver") || !isSpace(line[10]) { continue }
+        var p: usize = 11
+        while p < line.length && isSpace(line[p]) { p += 1 }
+        var e = p
+        while e < line.length && !isSpace(line[e]) { e += 1 }
+        if net.parseAddress(line[p..e], 53, &servers[count]) { count += 1 }
+    }
+    return count
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+
+const TYPE_A: u16 = 1
+const TYPE_CNAME: u16 = 5
+const TYPE_AAAA: u16 = 28
+
+// A query for `name`'s records of `kind` into `out`; its length (0 when
+// the name does not fit a message).
+pub fn writeQuery(name: []const u8, kind: u16, id: u16, out: *[QUERY_ROOM]u8) -> usize {
+    if name.length == 0 || name.length > 253 { return 0 }
+    out.*[0] = @intCast(u8, id >> 8)
+    out.*[1] = @intCast(u8, id & 255)
+    // Recursion desired.
+    out.*[2] = 1
+    out.*[3] = 0
+    out.*[4] = 0
+    out.*[5] = 1
+    var i: usize = 6
+    while i < 12 {
+        out.*[i] = 0
+        i += 1
+    }
+    var n: usize = 12
+    var start: usize = 0
+    var at: usize = 0
+    while at <= name.length {
+        if at == name.length || name[at] == 46 {
+            const label = at - start
+            if label == 0 || label > 63 {
+                if at == name.length && label == 0 && at > 0 { break }
+                return 0
+            }
+            out.*[n] = @intCast(u8, label)
+            n += 1
+            var k = start
+            while k < at {
+                out.*[n] = name[k]
+                n += 1
+                k += 1
+            }
+            start = at + 1
+        }
+        at += 1
+    }
+    out.*[n] = 0
+    n += 1
+    out.*[n] = @intCast(u8, kind >> 8)
+    out.*[n + 1] = @intCast(u8, kind & 255)
+    out.*[n + 2] = 0
+    out.*[n + 3] = 1
+    return n + 4
+}
+
+// Skips a name at `at` (labels, or a compression pointer); the offset
+// after it, or 0 when it runs past the message.
+fn skipName(message: []const u8, at: usize) -> usize {
+    var p = at
+    while p < message.length {
+        const length = @intCast(usize, message[p])
+        if length == 0 { return p + 1 }
+        if (length & 0xc0) == 0xc0 { return if p + 2 <= message.length { p + 2 } else { 0 } }
+        p += 1 + length
+    }
+    return 0
+}
+
+// Whether the name at `at` (pointers followed) is `name`.
+fn nameAt(message: []const u8, at: usize, name: []const u8) -> bool {
+    var p = at
+    var n: usize = 0
+    var hops: usize = 0
+    while p < message.length && hops < 64 {
+        const length = @intCast(usize, message[p])
+        if length == 0 { return n == name.length }
+        if (length & 0xc0) == 0xc0 {
+            if p + 1 >= message.length { return false }
+            p = ((length & 0x3f) << 8) | @intCast(usize, message[p + 1])
+            hops += 1
+            continue
+        }
+        if n > 0 {
+            if n >= name.length || name[n] != 46 { return false }
+            n += 1
+        }
+        if p + 1 + length > message.length || n + length > name.length { return false }
+        if !equalsIgnoringCase(message[p + 1..p + 1 + length], name[n..n + length]) { return false }
+        n += length
+        p += 1 + length
+    }
+    return false
+}
+
+// Copies the name at `at` (pointers followed) into `out` as text; its
+// length (0: malformed).
+fn nameText(message: []const u8, at: usize, out: []u8) -> usize {
+    var p = at
+    var n: usize = 0
+    var hops: usize = 0
+    while p < message.length && hops < 64 {
+        const length = @intCast(usize, message[p])
+        if length == 0 { return n }
+        if (length & 0xc0) == 0xc0 {
+            if p + 1 >= message.length { return 0 }
+            p = ((length & 0x3f) << 8) | @intCast(usize, message[p + 1])
+            hops += 1
+            continue
+        }
+        if p + 1 + length > message.length || n + length + 1 > out.length { return 0 }
+        if n > 0 {
+            out[n] = 46
+            n += 1
+        }
+        var k: usize = 0
+        while k < length {
+            out[n + k] = message[p + 1 + k]
+            k += 1
+        }
+        n += length
+        p += 1 + length
+    }
+    return 0
+}
+
+// The addresses in an answer to a query for `name` (CNAMEs in the answer
+// followed, at most eight deep): how many were added. `rcode` is the
+// response's code (0: no error, 3: no such name).
+pub fn readAnswer(message: []const u8, name: []const u8, port: u16, found: [*]Address, count: *usize, max: usize, rcode: *u32) -> usize {
+    rcode.* = 0
+    if message.length < 12 { return 0 }
+    rcode.* = @intCast(u32, message[3] & 15)
+    const questions = (@intCast(usize, message[4]) << 8) | @intCast(usize, message[5])
+    const answers = (@intCast(usize, message[6]) << 8) | @intCast(usize, message[7])
+    var at: usize = 12
+    var q: usize = 0
+    while q < questions {
+        at = skipName(message, at)
+        if at == 0 || at + 4 > message.length { return 0 }
+        at += 4
+        q += 1
+    }
+    var current: [256]u8 = undefined
+    var currentLength = name.length
+    if name.length > 255 { return 0 }
+    var i: usize = 0
+    while i < name.length {
+        current[i] = name[i]
+        i += 1
+    }
+    const before = count.*
+    var aliases: usize = 0
+    var pass: usize = 0
+    while pass <= aliases && pass < 8 {
+        var p = at
+        var a: usize = 0
+        var alias: [256]u8 = undefined
+        var aliasLength: usize = 0
+        while a < answers {
+            const matches = nameAt(message, p, current[0..currentLength])
+            p = skipName(message, p)
+            if p == 0 || p + 10 > message.length { return count.* - before }
+            const kind = (@intCast(u16, message[p]) << 8) | @intCast(u16, message[p + 1])
+            const length = (@intCast(usize, message[p + 8]) << 8) | @intCast(usize, message[p + 9])
+            const data = p + 10
+            if data + length > message.length { return count.* - before }
+            if matches {
+                if kind == TYPE_A && length == 4 {
+                    var address = net.ipv4(message[data], message[data + 1], message[data + 2], message[data + 3], port)
+                    add(found, count, max, &address)
+                } else if kind == TYPE_AAAA && length == 16 {
+                    var address: Address = undefined
+                    address.family = net.Family.ipv6
+                    address.port = port
+                    address.scope = 0
+                    var b: usize = 0
+                    while b < 16 {
+                        address.bytes[b] = message[data + b]
+                        b += 1
+                    }
+                    add(found, count, max, &address)
+                } else if kind == TYPE_CNAME && aliasLength == 0 {
+                    aliasLength = nameText(message, data, alias[0..256])
+                }
+            }
+            p = data + length
+            a += 1
+        }
+        if aliasLength == 0 { break }
+        currentLength = aliasLength
+        i = 0
+        while i < aliasLength {
+            current[i] = alias[i]
+            i += 1
+        }
+        aliases += 1
+        pass += 1
+    }
+    return count.* - before
+}
+
+// Asks `server` for `name`'s records of `kind`: true when an answer came
+// (whatever it said); the addresses added to `found`.
+fn ask(server: *const Address, name: []const u8, kind: u16, port: u16, found: [*]Address, count: *usize, max: usize, timeoutMs: isize, rcode: *u32) -> bool {
+    var query: [QUERY_ROOM]u8 = undefined
+    var idBytes: [2]u8 = undefined
+    const idPointer: [*]u8 = &idBytes
+    _ = random.fill(idPointer, 2)
+    const id = (@intCast(u16, idBytes[0]) << 8) | @intCast(u16, idBytes[1])
+    const length = writeQuery(name, kind, id, &query)
+    if length == 0 { return false }
+    const family = if server.*.family == net.Family.ipv4 { socket.AF_INET } else { socket.AF_INET6 }
+    const fd = socket.open(family, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC, 0)
+    if fd < 0 { return false }
+    var raw: [28]u8 = undefined
+    const rawBytes: [*]u8 = &raw
+    const rawLength = net.sockaddr(server, rawBytes)
+    const queryBytes: [*]const u8 = &query
+    var answered = false
+    if socket.sendTo(fd, queryBytes, length, 0, @intFromPtr(rawBytes), rawLength) == @intCast(isize, length) {
+        var answer: [ANSWER_ROOM]u8 = undefined
+        const answerBytes: [*]u8 = &answer
+        // Answers to other queries (another id) are passed over until the
+        // time runs out.
+        var tries: usize = 0
+        while tries < 4 {
+            if event.waitReady(fd, false, timeoutMs) <= 0 { break }
+            const got = socket.receiveFrom(fd, answerBytes, ANSWER_ROOM, 0, 0, 0)
+            if got < 12 { break }
+            if answer[0] == idBytes[0] && answer[1] == idBytes[1] && (answer[2] & 0x80) != 0 {
+                _ = readAnswer(answer[0..@intCast(usize, got)], name, port, found, count, max, rcode)
+                answered = true
+                break
+            }
+            tries += 1
+        }
+    }
+    _ = socket.close(fd)
+    return answered
+}
+
+// std.net.resolve.
+pub fn resolve(name: []const u8, port: u16, found: [*]Address, max: usize, timeoutMs: isize) -> usize {
+    var count: usize = 0
+    if max == 0 { return 0 }
+    var literal: Address = undefined
+    if net.parseAddress(name, port, &literal) {
+        found[0] = literal
+        return 1
+    }
+    if equalsIgnoringCase(name, "localhost") {
+        var loop = net.ipv4(127, 0, 0, 1, port)
+        add(found, &count, max, &loop)
+        var six: Address = undefined
+        six.family = net.Family.ipv6
+        six.port = port
+        six.scope = 0
+        var b: usize = 0
+        while b < 16 {
+            six.bytes[b] = if b == 15 { 1 } else { 0 }
+            b += 1
+        }
+        add(found, &count, max, &six)
+        return count
+    }
+    hostsLookup(name, port, found, &count, max)
+    if count > 0 {
+        ipv4First(found, count)
+        return count
+    }
+    var servers: [MAX_SERVERS]Address = undefined
+    const serverPointer: [*]Address = &servers
+    const serverCount = nameServers(serverPointer, MAX_SERVERS)
+    var s: usize = 0
+    while s < serverCount {
+        var rcode: u32 = 0
+        const gotA = ask(&servers[s], name, TYPE_A, port, found, &count, max, timeoutMs, &rcode)
+        var gotAAAA = false
+        if gotA && rcode != 3 { gotAAAA = ask(&servers[s], name, TYPE_AAAA, port, found, &count, max, timeoutMs, &rcode) }
+        if gotA || gotAAAA { break }
+        s += 1
+    }
+    ipv4First(found, count)
+    return count
+}

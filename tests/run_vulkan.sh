@@ -20,7 +20,7 @@ if [[ -z "$compiler" ]]; then
     done
 fi
 if [[ -z "$compiler" || ! -x "$compiler" ]]; then
-    echo "run_vulkan.sh: no Mlx compiler found (build mlx1 with 'zig build mlx1')" >&2
+    echo "run_vulkan.sh: no Mlx compiler found (./mlx makes one)" >&2
     exit 1
 fi
 
@@ -75,7 +75,11 @@ run tests/255_spirv_module_runtime.mlx -- "$work/doubler.spv"
 run tests/262_truetype_runtime.mlx
 run tests/272_png_runtime.mlx
 run tests/292_png_encode_runtime.mlx
+run tests/343_flate_runtime.mlx
 run tests/264_ui_layout_runtime.mlx
+run tests/284_ui_widgets_runtime.mlx
+run tests/409_ui_field_long_runtime.mlx
+run tests/412_ui_chooser_runtime.mlx
 
 # The builder's module passes the Khronos validator, and modules from
 # glslang pass std.spirv.module.
@@ -136,8 +140,8 @@ else
     failures=$((failures + 1))
 fi
 
-# std.truetype's rasterizer against FreeType and a supersampled ground
-# truth (skipped without freetype-py and fontTools).
+# std.truetype's glyphs against the system's FreeType, pixel for pixel
+# (skipped without gcc and FreeType's development files).
 if python3 tools/check_truetype.py "$compiler" > "$work/output" 2>&1; then
     sed 's/^/     /' "$work/output"
     echo "ok   tools/check_truetype.py"

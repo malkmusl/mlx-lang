@@ -11,8 +11,8 @@ OUT_PATH="$TMP_DIR/out"
 LOG_PATH="$TMP_DIR/compiler.log"
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 
-echo "Building compiler..."
-zig build
+echo "Building the stage-0 compiler (zig-out/bin/mlx0, with zig; only when its sources changed)..."
+./mlx build mlx0
 
 echo "Checking that $MLX_FILE is rejected with $EXPECTED_CODE..."
 set +e

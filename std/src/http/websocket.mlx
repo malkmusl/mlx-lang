@@ -1,0 +1,337 @@
+// std.http.websocket: the WebSocket protocol's pieces (RFC 6455) that do
+// not depend on how bytes are moved: the handshake's keys, frame headers
+// written and read, masking, and the UTF-8 check text messages and close
+// reasons must pass.
+const sha1 = @import("../sha1.mlx")
+
+// What the server's Sec-WebSocket-Accept hashes the client's key with.
+pub const GUID: []const u8 = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+const ALPHABET: []const u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// Opcodes.
+pub const CONTINUATION: u8 = 0
+pub const TEXT: u8 = 1
+pub const BINARY: u8 = 2
+pub const CLOSE: u8 = 8
+pub const PING: u8 = 9
+pub const PONG: u8 = 10
+
+// The base64 of `length` bytes at `data` into `out` (room for
+// 4 * ceil(length / 3) bytes); the length written.
+pub fn base64Encode(data: [*]const u8, length: usize, out: [*]u8) -> usize {
+    var at: usize = 0
+    var written: usize = 0
+    while at < length {
+        const b0 = @intCast(u32, data[at])
+        const b1 = if at + 1 < length { @intCast(u32, data[at + 1]) } else { 0 }
+        const b2 = if at + 2 < length { @intCast(u32, data[at + 2]) } else { 0 }
+        const group = (b0 << 16) | (b1 << 8) | b2
+        out[written] = ALPHABET[@intCast(usize, (group >> 18) & 63)]
+        out[written + 1] = ALPHABET[@intCast(usize, (group >> 12) & 63)]
+        out[written + 2] = if at + 1 < length { ALPHABET[@intCast(usize, (group >> 6) & 63)] } else { 61 }
+        out[written + 3] = if at + 2 < length { ALPHABET[@intCast(usize, group & 63)] } else { 61 }
+        written += 4
+        at += 3
+    }
+    return written
+}
+
+fn rank(c: u8) -> i32 {
+    if c >= 65 && c <= 90 { return @intCast(i32, c - 65) }
+    if c >= 97 && c <= 122 { return @intCast(i32, c - 71) }
+    if c >= 48 && c <= 57 { return @intCast(i32, c + 4) }
+    if c == 43 { return 62 }
+    if c == 47 { return 63 }
+    // "=" counts as a symbol (of value 0); its bytes are taken off after.
+    if c == 61 { return 0 }
+    return -1
+}
+
+// How many bytes GLib's base64 decoder makes of `text`: what is not of
+// the alphabet is skipped, and each "=" among the last two symbols takes
+// a byte off.
+pub fn decodedLength(text: []const u8) -> usize {
+    var symbols: usize = 0
+    for c in text {
+        if rank(c) >= 0 { symbols += 1 }
+    }
+    var length = symbols / 4 * 3
+    var seen: usize = 0
+    var at = text.length
+    while at > 0 && seen < 2 {
+        at -= 1
+        if rank(text[at]) >= 0 {
+            if text[at] == 61 && length > 0 { length -= 1 }
+            seen += 1
+        }
+    }
+    return length
+}
+
+// Whether `key` is a Sec-WebSocket-Key: 24 characters, the base64 of 16
+// bytes.
+pub fn validKey(key: []const u8) -> bool { return key.length == 24 && decodedLength(key) == 16 }
+
+// Sec-WebSocket-Accept for `key`: the base64 of SHA-1(key + GUID), 28
+// bytes.
+pub fn acceptKey(key: []const u8, out: *[28]u8) -> void {
+    var hashing: sha1.Sha1 = undefined
+    sha1.sha1Init(&hashing)
+    sha1.sha1Update(&hashing, key)
+    sha1.sha1Update(&hashing, GUID)
+    var digest: [20]u8 = undefined
+    sha1.sha1Final(&hashing, &digest)
+    _ = base64Encode(&digest, 20, out)
+}
+
+// A frame's header as read.
+pub const Header = struct {
+    fin: bool
+    // The reserved bits (0x70 of the first byte).
+    reserved: u8
+    opcode: u8
+    masked: bool
+    mask: [4]u8
+    payloadLength: u64
+    // The bytes of the header, the mask among them.
+    length: usize
+}
+
+pub const Parse = enum(u8) {
+    ok,
+    // Not all of the header is there yet.
+    needMore,
+    // A length not written in the fewest bytes.
+    notMinimal
+}
+
+// Reads the frame header at the start of `data`.
+pub fn parseHeader(data: []const u8, header: *Header) -> Parse {
+    if data.length < 2 { return Parse.needMore }
+    header.*.fin = (data[0] & 0x80) != 0
+    header.*.reserved = data[0] & 0x70
+    header.*.opcode = data[0] & 0x0f
+    header.*.masked = (data[1] & 0x80) != 0
+    const short = data[1] & 0x7f
+    var at: usize = 2
+    if short == 126 {
+        if data.length < 4 { return Parse.needMore }
+        header.*.payloadLength = (@intCast(u64, data[2]) << 8) | @intCast(u64, data[3])
+        if header.*.payloadLength <= 125 { return Parse.notMinimal }
+        at = 4
+    } else if short == 127 {
+        if data.length < 10 { return Parse.needMore }
+        var value: u64 = 0
+        var index: usize = 2
+        while index < 10 {
+            value = (value << 8) | @intCast(u64, data[index])
+            index += 1
+        }
+        header.*.payloadLength = value
+        if value <= 65535 { return Parse.notMinimal }
+        at = 10
+    } else {
+        header.*.payloadLength = @intCast(u64, short)
+    }
+    if header.*.masked {
+        if data.length < at + 4 {
+            header.*.length = at + 4
+            return Parse.needMore
+        }
+        header.*.mask[0] = data[at]
+        header.*.mask[1] = data[at + 1]
+        header.*.mask[2] = data[at + 2]
+        header.*.mask[3] = data[at + 3]
+        at += 4
+    }
+    header.*.length = at
+    return Parse.ok
+}
+
+// Writes a header for a final frame of `first` (0x80, the reserved bits
+// and the opcode) and `length` payload bytes, masked with `mask` when
+// `masked`, into `out`; its length (2 to 14).
+pub fn writeHeader(out: *[14]u8, first: u8, length: u64, masked: bool, mask: [4]u8) -> usize {
+    out.*[0] = first
+    var at: usize = 2
+    if length < 126 {
+        out.*[1] = @intCast(u8, length & 0x7f)
+    } else if length < 65536 {
+        out.*[1] = 126
+        out.*[2] = @intCast(u8, (length >> 8) & 0xff)
+        out.*[3] = @intCast(u8, length & 0xff)
+        at = 4
+    } else {
+        out.*[1] = 127
+        var index: usize = 0
+        while index < 8 {
+            out.*[2 + index] = @intCast(u8, (length >> @intCast(u64, 56 - index * 8)) & 0xff)
+            index += 1
+        }
+        at = 10
+    }
+    if masked {
+        out.*[1] = out.*[1] | 0x80
+        out.*[at] = mask[0]
+        out.*[at + 1] = mask[1]
+        out.*[at + 2] = mask[2]
+        out.*[at + 3] = mask[3]
+        at += 4
+    }
+    return at
+}
+
+// XORs `length` bytes at `data` with the mask (masking and unmasking are
+// the same).
+pub fn applyMask(mask: [4]u8, data: [*]u8, length: usize) -> void {
+    var index: usize = 0
+    while index < length {
+        data[index] = data[index] ^ mask[index & 3]
+        index += 1
+    }
+}
+
+fn continuation(c: u8, maskBits: u8, expect: u8) -> bool { return (c & maskBits) == expect }
+
+// Whether `text` is UTF-8 by RFC 3629 (no surrogates, nothing past
+// U+10FFFF, no overlong forms), as libsoup checks WebSocket text.
+pub fn validUtf8(text: []const u8) -> bool {
+    var at: usize = 0
+    const n = text.length
+    while at < n {
+        const c = text[at]
+        if c < 128 {
+            at += 1
+            continue
+        }
+        if c < 0xe0 {
+            if n - at < 2 { return false }
+            if c < 0xc2 { return false }
+        } else if c < 0xf0 {
+            if n - at < 3 { return false }
+            const low = c & 0x0f
+            at += 1
+            if low == 0 {
+                if !continuation(text[at], 0xe0, 0xa0) { return false }
+            } else if low == 0x0d {
+                if !continuation(text[at], 0xe0, 0x80) { return false }
+            } else {
+                if !continuation(text[at], 0xc0, 0x80) { return false }
+            }
+        } else if c < 0xf5 {
+            if n - at < 4 { return false }
+            const low = c & 0x07
+            at += 1
+            if low == 0 {
+                if !continuation(text[at], 0xc0, 0x80) { return false }
+                if (text[at] & 0x30) == 0 { return false }
+            } else if low == 4 {
+                if !continuation(text[at], 0xf0, 0x80) { return false }
+            } else {
+                if !continuation(text[at], 0xc0, 0x80) { return false }
+            }
+            at += 1
+            if !continuation(text[at], 0xc0, 0x80) { return false }
+        } else {
+            return false
+        }
+        at += 1
+        if !continuation(text[at], 0xc0, 0x80) { return false }
+        at += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The opening handshake's pieces
+
+// A Sec-WebSocket-Key of 16 random bytes: their base64, 24 characters.
+pub fn makeKey(random: *const [16]u8, out: *[24]u8) -> void {
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, out) }
+    _ = base64Encode(random, 16, bytes)
+}
+
+// Whether a server's Sec-WebSocket-Accept answers `key` (case aside, as
+// libsoup compares them).
+pub fn acceptMatches(key: []const u8, accept: []const u8) -> bool {
+    var expected: [28]u8 = undefined
+    acceptKey(key, &expected)
+    if accept.length != 28 { return false }
+    var i: usize = 0
+    while i < 28 {
+        if lowerCase(accept[i]) != lowerCase(expected[i]) { return false }
+        i += 1
+    }
+    return true
+}
+
+fn lowerCase(c: u8) -> u8 { return if c >= 65 && c <= 90 { c + 32 } else { c } }
+
+fn isWhite(c: u8) -> bool { return c == 32 || c == 9 || c == 13 || c == 10 }
+
+// Whether a Sec-WebSocket-Protocol value a client asked for (its
+// protocols separated by commas or spaces, as libsoup splits it) names
+// `protocol`.
+pub fn protocolAsked(asked: []const u8, protocol: []const u8) -> bool {
+    var at: usize = 0
+    while at < asked.length {
+        while at < asked.length && (asked[at] == 44 || asked[at] == 32) { at += 1 }
+        var end = at
+        while end < asked.length && asked[end] != 44 && asked[end] != 32 { end += 1 }
+        if end > at && end - at == protocol.length {
+            var i: usize = 0
+            var same = true
+            while i < protocol.length {
+                if asked[at + i] != protocol[i] { same = false }
+                i += 1
+            }
+            if same { return true }
+        }
+        at = end
+    }
+    return false
+}
+
+// Whether a Sec-WebSocket-Protocol value names anything at all.
+pub fn anyProtocolAsked(asked: []const u8) -> bool {
+    for c in asked {
+        if c != 44 && c != 32 { return true }
+    }
+    return false
+}
+
+// The next extension of a Sec-WebSocket-Extensions value: its name (the
+// element up to `;`, spaces off; empty for an empty element, which
+// libsoup refuses) and its parameters (after the `;`, `hasParams`);
+// `at` moves on, false at the end. Elements are separated by commas
+// outside quoted strings.
+pub fn nextExtension(list: []const u8, at: *usize, name: *[]const u8, params: *[]const u8, hasParams: *bool) -> bool {
+    var start = at.*
+    // (A list's delimiters, as std.http.headers skips them.)
+    while start < list.length && (list[start] == 44 || isWhite(list[start])) { start += 1 }
+    if start >= list.length { return false }
+    var end = start
+    var quoted = false
+    while end < list.length {
+        const c = list[end]
+        if quoted {
+            if c == 92 && end + 1 < list.length { end += 1 } else if c == 34 { quoted = false }
+        } else if c == 34 {
+            quoted = true
+        } else if c == 44 {
+            break
+        }
+        end += 1
+    }
+    at.* = end
+    const element = list[start..end]
+    var nameEnd: usize = 0
+    while nameEnd < element.length && element[nameEnd] != 59 { nameEnd += 1 }
+    hasParams.* = nameEnd < element.length
+    params.* = if hasParams.* { element[nameEnd + 1..element.length] } else { element[element.length..element.length] }
+    var trimmed = nameEnd
+    while trimmed > 0 && isWhite(element[trimmed - 1]) { trimmed -= 1 }
+    name.* = element[0..trimmed]
+    return true
+}

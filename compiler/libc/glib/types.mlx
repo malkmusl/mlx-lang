@@ -1,0 +1,1204 @@
+// GObject's type system (gtype.h), as GLib's gtype.c builds it.
+//
+// A type is a node: a fundamental type's GType is its number shifted by
+// two (G_TYPE_MAKE_FUNDAMENTAL), the node in a table; a derived type's
+// GType is the address of its node, as in GLib. A node holds its name,
+// parent, depth, the chain of its ancestors, its flags (the fundamental
+// ones: classed, instantiatable, derivable, deep derivable; and its own:
+// abstract, value abstract, final, deprecated), what its GTypeInfo gave
+// (sizes and functions), its class once made, the interfaces added to it,
+// the size of its instances' private data, data by quark and, for a
+// boxed type, its copy and free functions.
+//
+// A class is made the first time it is asked for: the parent's class is
+// made first and copied, then every base_init from the root down runs on
+// it, the interfaces get their vtables (the parent's when inherited, a
+// copy of the interface's default vtable through its base_init when the
+// type adds the interface itself), class_init runs, then each interface
+// added here gets its interface_init. An instance is allocated with its
+// private data before it (GLib's negative offsets) and every
+// instance_init from the root down runs with the class pointer of the
+// type it belongs to.
+//
+// Everything that changes the registry or makes a class holds one
+// recursive lock (class_init and the other initializers run under it);
+// reading nodes does not need it.
+const m = @import("./memory.mlx")
+const sys = @import("./sys.mlx")
+const threads = @import("./threads.mlx")
+const messages = @import("./messages.mlx")
+const errors = @import("./errors.mlx")
+const hash = @import("./hash.mlx")
+
+// The initialization of the fundamental types the other modules register
+// (values.mlx, params.mlx, objects.mlx).
+extern("c") fn __mlx_glib_values_init() -> void
+extern("c") fn __mlx_glib_params_init() -> void
+extern("c") fn __mlx_glib_objects_init() -> void
+
+pub const FUNDAMENTAL_MAX: usize = 255 << 2
+
+pub const T_INVALID: usize = 0
+pub const T_NONE: usize = 1 << 2
+pub const T_INTERFACE: usize = 2 << 2
+pub const T_CHAR: usize = 3 << 2
+pub const T_UCHAR: usize = 4 << 2
+pub const T_BOOLEAN: usize = 5 << 2
+pub const T_INT: usize = 6 << 2
+pub const T_UINT: usize = 7 << 2
+pub const T_LONG: usize = 8 << 2
+pub const T_ULONG: usize = 9 << 2
+pub const T_INT64: usize = 10 << 2
+pub const T_UINT64: usize = 11 << 2
+pub const T_ENUM: usize = 12 << 2
+pub const T_FLAGS: usize = 13 << 2
+pub const T_FLOAT: usize = 14 << 2
+pub const T_DOUBLE: usize = 15 << 2
+pub const T_STRING: usize = 16 << 2
+pub const T_POINTER: usize = 17 << 2
+pub const T_BOXED: usize = 18 << 2
+pub const T_PARAM: usize = 19 << 2
+pub const T_OBJECT: usize = 20 << 2
+pub const T_VARIANT: usize = 21 << 2
+
+pub const CLASSED: u32 = 1
+pub const INSTANTIATABLE: u32 = 2
+pub const DERIVABLE: u32 = 4
+pub const DEEP_DERIVABLE: u32 = 8
+pub const ABSTRACT: u32 = 16
+pub const VALUE_ABSTRACT: u32 = 32
+pub const FINAL: u32 = 64
+pub const DEPRECATED: u32 = 128
+
+// The node.
+const N_PARENT: usize = 0
+const N_NAME: usize = 8
+const N_QNAME: usize = 16
+const N_DEPTH: usize = 20
+const N_FUNDAMENTAL: usize = 24
+const N_FLAGS: usize = 32
+const N_STATE: usize = 36
+const N_CLASS: usize = 40
+const N_CLASS_SIZE: usize = 48
+const N_INSTANCE_SIZE: usize = 52
+const N_BASE_INIT: usize = 56
+const N_BASE_FINALIZE: usize = 64
+const N_CLASS_INIT: usize = 72
+const N_CLASS_FINALIZE: usize = 80
+const N_CLASS_DATA: usize = 88
+const N_INSTANCE_INIT: usize = 96
+const N_VALUE_TABLE: usize = 104
+const N_SUPERS: usize = 112
+const N_CHILDREN: usize = 120
+const N_HOLDERS: usize = 144
+const N_PRIVATE: usize = 168
+const N_INSTANCES: usize = 172
+const N_QDATA: usize = 176
+const N_PREREQUISITES: usize = 200
+const N_DEFAULT_VTABLE: usize = 224
+const N_CLASS_REFS: usize = 232
+const N_ENTRIES: usize = 240
+const N_BOXED_COPY: usize = 264
+const N_BOXED_FREE: usize = 272
+const N_SIZE: usize = 280
+
+// An interface holder (added to a type) or entry (of a made class): the
+// interface, its vtable, interface_init, interface_finalize, the data,
+// whether the type added it itself.
+const E_IFACE: usize = 0
+const E_VTABLE: usize = 8
+const E_INIT: usize = 16
+const E_FINALIZE: usize = 24
+const E_DATA: usize = 32
+const E_OWN: usize = 40
+const E_SIZE: usize = 48
+
+const STATE_NONE: u32 = 0
+const STATE_MAKING: u32 = 1
+const STATE_READY: u32 = 2
+
+pub const ClassInit = fn(usize, usize) -> void
+pub const BaseInit = fn(usize) -> void
+pub const InstanceInit = fn(usize, usize) -> void
+
+var fundamentals: [256]usize = undefined
+var initDone: u64 = 0
+var initThread: u32 = 0
+var registryLock: usize = 0
+var names: usize = 0
+var serial: u32 = 0
+var nextFundamental: usize = 32
+var debugFlags: i32 = 0
+var cacheFuncs: usize = 0
+
+fn wordsAt(address: usize) -> *m.Words { unsafe { return @ptrFromInt(*m.Words, address) } }
+
+pub fn lockRegistry() -> void { threads.recursiveLock(registryLock) }
+pub fn unlockRegistry() -> void { threads.recursiveUnlock(registryLock) }
+
+// The registry, made once (the thread making it may use it meanwhile).
+pub fn ensureInit() -> void {
+    if @atomicLoad(u64, m.word64(@intFromPtr(&initDone)), acquire) == 1 { return }
+    if initThread != 0 && initThread == sys.tid() { return }
+    if threads.onceEnter(@intFromPtr(&initDone)) {
+        initThread = sys.tid()
+        var i: usize = 0
+        while i < 256 {
+            fundamentals[i] = 0
+            i += 1
+        }
+        registryLock = m.alloc(16)
+        names = hash.newTable(hash.strHashFunction(), hash.strEqualFunction(), 0, 0)
+        cacheFuncs = m.alloc(24)
+        _ = registerFundamentalNode(T_NONE, m.literal("void"), 0, 0)
+        _ = registerFundamentalNode(T_INTERFACE, m.literal("GInterface"), DERIVABLE, 0)
+        __mlx_glib_values_init()
+        __mlx_glib_params_init()
+        __mlx_glib_objects_init()
+        initThread = 0
+        threads.onceLeave(@intFromPtr(&initDone), 1)
+    }
+}
+
+export fn g_type_init() -> void { ensureInit() }
+
+export fn g_type_init_with_debug_flags(flags: i32) -> void {
+    debugFlags = flags
+    ensureInit()
+}
+
+// ---------------------------------------------------------------------------
+// Nodes
+
+pub fn nodeOf(t: usize) -> usize {
+    if t <= FUNDAMENTAL_MAX {
+        if (t & 3) != 0 { return 0 }
+        ensureInit()
+        return fundamentals[t >> 2]
+    }
+    return t
+}
+
+fn flagsOf(node: usize) -> u32 { return m.get32(node + N_FLAGS) }
+pub fn depthOf(node: usize) -> u32 { return m.get32(node + N_DEPTH) }
+fn supersOf(node: usize) -> usize { return m.getWord(node + N_SUPERS) }
+
+pub fn parentOf(t: usize) -> usize {
+    const node = nodeOf(t)
+    return if node == 0 { 0 } else { m.getWord(node + N_PARENT) }
+}
+
+pub fn fundamentalOf(t: usize) -> usize {
+    const node = nodeOf(t)
+    return if node == 0 { 0 } else { m.getWord(node + N_FUNDAMENTAL) }
+}
+
+pub fn nameOf(t: usize) -> usize {
+    const node = nodeOf(t)
+    return if node == 0 { 0 } else { m.getWord(node + N_NAME) }
+}
+
+// GLib's type_descriptive_name_I.
+pub fn describe(t: usize) -> usize {
+    if t == 0 { return m.literal("<invalid>") }
+    const name = nameOf(t)
+    return if name == 0 { m.literal("<unknown>") } else { name }
+}
+
+pub fn testFlags(t: usize, flags: u32) -> bool {
+    const node = nodeOf(t)
+    if node == 0 { return false }
+    return (flagsOf(node) & flags) == flags
+}
+
+fn newNode(t: usize, parent: usize, name: usize, flags: u32) -> usize {
+    const node = m.alloc(N_SIZE)
+    const id = if t != 0 { t } else { node }
+    const interned = errors.intern(name)
+    m.putWord(node + N_PARENT, parent)
+    m.putWord(node + N_NAME, interned)
+    m.put32(node + N_QNAME, errors.quarkOf(interned, false, true))
+    var depth: u32 = 1
+    var fundamental = id
+    if parent != 0 {
+        const pnode = nodeOf(parent)
+        depth = depthOf(pnode) + 1
+        fundamental = m.getWord(pnode + N_FUNDAMENTAL)
+        m.put32(node + N_PRIVATE, m.get32(pnode + N_PRIVATE))
+        m.pushWord(wordsAt(pnode + N_CHILDREN), id)
+    }
+    m.put32(node + N_DEPTH, depth)
+    m.putWord(node + N_FUNDAMENTAL, fundamental)
+    m.put32(node + N_FLAGS, flags)
+    const supers = m.alloc((@intCast(usize, depth) + 1) * 8)
+    m.putWord(supers, id)
+    if parent != 0 { m.copy(supers + 8, supersOf(nodeOf(parent)), @intCast(usize, depth - 1) * 8) }
+    m.putWord(node + N_SUPERS, supers)
+    _ = hash.insert(names, interned, id, true)
+    serial += 1
+    return node
+}
+
+fn registerFundamentalNode(t: usize, name: usize, fundamentalFlags: u32, typeFlags: u32) -> usize {
+    const node = newNode(t, 0, name, fundamentalFlags | typeFlags)
+    fundamentals[t >> 2] = node
+    return node
+}
+
+// A GTypeInfo (C layout: class_size u16 0, base_init 8, base_finalize 16,
+// class_init 24, class_finalize 32, class_data 40, instance_size u16 48,
+// n_preallocs 50, instance_init 56, value_table 64) taken into the node.
+fn takeInfo(node: usize, info: usize) -> void {
+    if info == 0 { return }
+    m.put32(node + N_CLASS_SIZE, @intCast(u32, m.get16(info)))
+    m.putWord(node + N_BASE_INIT, m.getWord(info + 8))
+    m.putWord(node + N_BASE_FINALIZE, m.getWord(info + 16))
+    m.putWord(node + N_CLASS_INIT, m.getWord(info + 24))
+    m.putWord(node + N_CLASS_FINALIZE, m.getWord(info + 32))
+    m.putWord(node + N_CLASS_DATA, m.getWord(info + 40))
+    m.put32(node + N_INSTANCE_SIZE, @intCast(u32, m.get16(info + 48)))
+    m.putWord(node + N_INSTANCE_INIT, m.getWord(info + 56))
+    if m.getWord(info + 64) != 0 { m.putWord(node + N_VALUE_TABLE, m.getWord(info + 64)) }
+}
+
+fn isValidName(name: usize) -> bool {
+    if name == 0 { return false }
+    const first = m.get8(name)
+    if !(m.isAlpha(first) || first == '_') { return false }
+    var p = name + 1
+    var n: usize = 1
+    while m.get8(p) != 0 {
+        const c = m.get8(p)
+        if !(m.isAlnum(c) || c == '-' || c == '_' || c == '+') { return false }
+        p += 1
+        n += 1
+    }
+    return n >= 3
+}
+
+fn warnText(prefix: []const u8, name: usize, suffix: []const u8) -> void {
+    var t = m.text()
+    m.pushText(&t, prefix)
+    m.pushC(&t, name)
+    m.pushText(&t, suffix)
+    messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, t.address)
+    m.dispose(&t)
+}
+
+fn criticalText(prefix: []const u8, name: usize, suffix: []const u8) -> void {
+    var t = m.text()
+    m.pushText(&t, prefix)
+    m.pushC(&t, name)
+    m.pushText(&t, suffix)
+    messages.log(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, t.address)
+    m.dispose(&t)
+}
+
+fn checkName(name: usize) -> bool {
+    if !isValidName(name) {
+        warnText("type name '", name, "' is too short or contains invalid characters")
+        return false
+    }
+    if hash.find(names, name) >= 0 {
+        warnText("cannot register existing type '", name, "'")
+        return false
+    }
+    return true
+}
+
+pub fn registerStatic(parent: usize, name: usize, info: usize, flags: u32) -> usize {
+    ensureInit()
+    lockRegistry()
+    if !checkName(name) {
+        unlockRegistry()
+        return 0
+    }
+    const pnode = nodeOf(parent)
+    if pnode == 0 {
+        warnText("cannot derive type '", name, "' from invalid parent type")
+        unlockRegistry()
+        return 0
+    }
+    const pflags = flagsOf(pnode)
+    if (pflags & FINAL) != 0 {
+        var t = m.text()
+        m.pushText(&t, "cannot derive '")
+        m.pushC(&t, name)
+        m.pushText(&t, "' from final parent type '")
+        m.pushC(&t, m.getWord(pnode + N_NAME))
+        m.pushText(&t, "'")
+        messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, t.address)
+        m.dispose(&t)
+        unlockRegistry()
+        return 0
+    }
+    const fnode = nodeOf(m.getWord(pnode + N_FUNDAMENTAL))
+    const fflags = flagsOf(fnode) & (CLASSED | INSTANTIATABLE | DERIVABLE | DEEP_DERIVABLE)
+    if (fflags & DERIVABLE) == 0 || (parent > FUNDAMENTAL_MAX && (fflags & DEEP_DERIVABLE) == 0) {
+        var t = m.text()
+        m.pushText(&t, "cannot derive '")
+        m.pushC(&t, name)
+        m.pushText(&t, "' from non-derivable parent type '")
+        m.pushC(&t, m.getWord(pnode + N_NAME))
+        m.pushText(&t, "'")
+        messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, t.address)
+        m.dispose(&t)
+        unlockRegistry()
+        return 0
+    }
+    if info != 0 && (fflags & CLASSED) != 0 && @intCast(u32, m.get16(info)) < m.get32(pnode + N_CLASS_SIZE) {
+        var t = m.text()
+        m.pushText(&t, "specified class size for type '")
+        m.pushC(&t, name)
+        m.pushText(&t, "' is smaller than the parent type's '")
+        m.pushC(&t, m.getWord(pnode + N_NAME))
+        m.pushText(&t, "' class size")
+        messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, t.address)
+        m.dispose(&t)
+        unlockRegistry()
+        return 0
+    }
+    if info != 0 && (fflags & INSTANTIATABLE) != 0 && @intCast(u32, m.get16(info + 48)) < m.get32(pnode + N_INSTANCE_SIZE) {
+        var t = m.text()
+        m.pushText(&t, "specified instance size for type '")
+        m.pushC(&t, name)
+        m.pushText(&t, "' is smaller than the parent type's '")
+        m.pushC(&t, m.getWord(pnode + N_NAME))
+        m.pushText(&t, "' instance size")
+        messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, t.address)
+        m.dispose(&t)
+        unlockRegistry()
+        return 0
+    }
+    const node = newNode(0, parent, name, fflags | flags)
+    m.put32(node + N_CLASS_SIZE, m.get32(pnode + N_CLASS_SIZE))
+    m.put32(node + N_INSTANCE_SIZE, m.get32(pnode + N_INSTANCE_SIZE))
+    takeInfo(node, info)
+    unlockRegistry()
+    return node
+}
+
+export fn g_type_register_static(parent_type: usize, type_name: usize, info: usize, flags: i32) -> usize {
+    return registerStatic(parent_type, type_name, info, @bitCast(u32, flags))
+}
+
+export fn g_type_register_static_simple(parent_type: usize, type_name: usize, class_size: u32, class_init: usize, instance_size: u32, instance_init: usize, flags: i32) -> usize {
+    if class_size > 0xffff || instance_size > 0xffff {
+        messages.logText(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, "g_type_register_static_simple: assertion 'class_size <= G_MAXUINT16' failed")
+        return 0
+    }
+    const info = m.alloc(72)
+    m.put16(info, @intCast(u16, class_size))
+    m.putWord(info + 24, class_init)
+    m.put16(info + 48, @intCast(u16, instance_size))
+    m.putWord(info + 56, instance_init)
+    const t = registerStatic(parent_type, type_name, info, @bitCast(u32, flags))
+    m.release(info)
+    return t
+}
+
+export fn g_type_register_dynamic(parent_type: usize, type_name: usize, plugin: usize, flags: i32) -> usize {
+    messages.logText(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, "g_type_register_dynamic: type plugins are not supported by this library")
+    return 0
+}
+
+pub fn registerFundamental(t: usize, name: usize, info: usize, finfo: usize, flags: u32) -> usize {
+    ensureInit()
+    lockRegistry()
+    if (t & 3) != 0 || t == 0 || t > FUNDAMENTAL_MAX || fundamentals[t >> 2] != 0 {
+        criticalText("g_type_register_fundamental: cannot register '", name, "' with this fundamental id")
+        unlockRegistry()
+        return 0
+    }
+    if hash.find(names, name) >= 0 {
+        warnText("cannot register existing type '", name, "'")
+        unlockRegistry()
+        return 0
+    }
+    const fflags = if finfo != 0 { m.get32(finfo) & 15 } else { 0 }
+    const node = registerFundamentalNode(t, name, fflags, flags)
+    takeInfo(node, info)
+    if (t >> 2) >= nextFundamental { nextFundamental = (t >> 2) + 1 }
+    unlockRegistry()
+    return t
+}
+
+export fn g_type_register_fundamental(type_id: usize, type_name: usize, info: usize, finfo: usize, flags: i32) -> usize {
+    return registerFundamental(type_id, type_name, info, finfo, @bitCast(u32, flags))
+}
+
+export fn g_type_fundamental_next() -> usize {
+    ensureInit()
+    if nextFundamental > 255 { return 0 }
+    return nextFundamental << 2
+}
+
+export fn g_type_get_type_registration_serial() -> u32 { return serial }
+
+// ---------------------------------------------------------------------------
+// Questions about types
+
+export fn g_type_name(t: usize) -> usize { return nameOf(t) }
+
+export fn g_type_qname(t: usize) -> u32 {
+    const node = nodeOf(t)
+    return if node == 0 { 0 } else { m.get32(node + N_QNAME) }
+}
+
+export fn g_type_from_name(name: usize) -> usize {
+    if name == 0 { return 0 }
+    ensureInit()
+    lockRegistry()
+    const t = hash.lookup(names, name)
+    unlockRegistry()
+    return t
+}
+
+export fn g_type_parent(t: usize) -> usize { return parentOf(t) }
+
+export fn g_type_depth(t: usize) -> u32 {
+    const node = nodeOf(t)
+    return if node == 0 { 0 } else { depthOf(node) }
+}
+
+export fn g_type_next_base(leaf: usize, root: usize) -> usize {
+    const node = nodeOf(leaf)
+    const rnode = nodeOf(root)
+    if node == 0 || rnode == 0 { return 0 }
+    const d = depthOf(node)
+    const rd = depthOf(rnode)
+    if d <= rd { return 0 }
+    const supers = supersOf(node)
+    if m.getWord(supers + @intCast(usize, d - rd) * 8) != root { return 0 }
+    return m.getWord(supers + @intCast(usize, d - rd - 1) * 8)
+}
+
+export fn g_type_fundamental(t: usize) -> usize { return fundamentalOf(t) }
+
+fn isAncestor(node: usize, ancestor: usize) -> bool {
+    const anode = nodeOf(ancestor)
+    if anode == 0 { return false }
+    const d = depthOf(node)
+    const ad = depthOf(anode)
+    if ad > d { return false }
+    return m.getWord(supersOf(node) + @intCast(usize, d - ad) * 8) == ancestor
+}
+
+// Whether the type of `node` or an ancestor added `iface` (or an
+// interface requiring it).
+fn implements(node: usize, iface: usize) -> bool {
+    const d = depthOf(node)
+    var i: usize = 0
+    while i < @intCast(usize, d) {
+        const t = m.getWord(supersOf(node) + i * 8)
+        const holders = wordsAt(nodeOf(t) + N_HOLDERS)
+        var k: usize = 0
+        while k < holders.*.length {
+            const added = m.getWord(m.wordAt(holders, k) + E_IFACE)
+            if added == iface || isA(added, iface) { return true }
+            k += 1
+        }
+        i += 1
+    }
+    return false
+}
+
+pub fn isA(t: usize, a: usize) -> bool {
+    if t == a { return true }
+    const node = nodeOf(t)
+    if node == 0 || nodeOf(a) == 0 { return false }
+    if isAncestor(node, a) { return true }
+    // An interface is what its prerequisites are, classes too (as
+    // GTlsClientConnection is a GTlsConnection).
+    if fundamentalOf(t) == T_INTERFACE {
+        const prereqs = wordsAt(node + N_PREREQUISITES)
+        var k: usize = 0
+        while k < prereqs.*.length {
+            if isA(m.wordAt(prereqs, k), a) { return true }
+            k += 1
+        }
+        return false
+    }
+    if fundamentalOf(a) == T_INTERFACE { return implements(node, a) }
+    return false
+}
+
+export fn g_type_is_a(t: usize, a: usize) -> i32 { return if isA(t, a) { 1 } else { 0 } }
+
+export fn g_type_test_flags(t: usize, flags: u32) -> i32 { return if testFlags(t, flags) { 1 } else { 0 } }
+
+fn arrayOf(list: *m.Words, count: usize) -> usize {
+    const result = m.alloc((list.*.length + 1) * 8)
+    m.copy(result, list.*.address, list.*.length * 8)
+    if count != 0 { m.put32(count, @intCast(u32, list.*.length)) }
+    return result
+}
+
+export fn g_type_children(t: usize, n_children: usize) -> usize {
+    const node = nodeOf(t)
+    if node == 0 {
+        if n_children != 0 { m.put32(n_children, 0) }
+        return m.alloc(8)
+    }
+    lockRegistry()
+    const result = arrayOf(wordsAt(node + N_CHILDREN), n_children)
+    unlockRegistry()
+    return result
+}
+
+export fn g_type_interfaces(t: usize, n_interfaces: usize) -> usize {
+    const node = nodeOf(t)
+    var list = m.words()
+    if node != 0 {
+        lockRegistry()
+        const d = depthOf(node)
+        var i = @intCast(usize, d)
+        while i > 0 {
+            i -= 1
+            const holders = wordsAt(nodeOf(m.getWord(supersOf(node) + i * 8)) + N_HOLDERS)
+            var k: usize = 0
+            while k < holders.*.length {
+                const iface = m.getWord(m.wordAt(holders, k) + E_IFACE)
+                var seen = false
+                var j: usize = 0
+                while j < list.length {
+                    if m.wordAt(&list, j) == iface { seen = true }
+                    j += 1
+                }
+                if !seen { m.pushWord(&list, iface) }
+                k += 1
+            }
+        }
+        unlockRegistry()
+    }
+    const result = arrayOf(&list, n_interfaces)
+    m.disposeWords(&list)
+    return result
+}
+
+export fn g_type_interface_prerequisites(t: usize, n_prerequisites: usize) -> usize {
+    const node = nodeOf(t)
+    if node == 0 {
+        if n_prerequisites != 0 { m.put32(n_prerequisites, 0) }
+        return m.alloc(8)
+    }
+    return arrayOf(wordsAt(node + N_PREREQUISITES), n_prerequisites)
+}
+
+export fn g_type_interface_add_prerequisite(interface_type: usize, prerequisite_type: usize) -> void {
+    const node = nodeOf(interface_type)
+    if node == 0 || fundamentalOf(interface_type) != T_INTERFACE { return }
+    lockRegistry()
+    m.pushWord(wordsAt(node + N_PREREQUISITES), prerequisite_type)
+    unlockRegistry()
+}
+
+export fn g_type_set_qdata(t: usize, quark: u32, data: usize) -> void {
+    const node = nodeOf(t)
+    if node == 0 { return }
+    lockRegistry()
+    const list = wordsAt(node + N_QDATA)
+    var k: usize = 0
+    while k < list.*.length {
+        if m.wordAt(list, k) == @intCast(usize, quark) {
+            m.putWord(list.*.address + (k + 1) * 8, data)
+            unlockRegistry()
+            return
+        }
+        k += 2
+    }
+    m.pushWord(list, @intCast(usize, quark))
+    m.pushWord(list, data)
+    unlockRegistry()
+}
+
+export fn g_type_get_qdata(t: usize, quark: u32) -> usize {
+    const node = nodeOf(t)
+    if node == 0 { return 0 }
+    lockRegistry()
+    const list = wordsAt(node + N_QDATA)
+    var k: usize = 0
+    var data: usize = 0
+    while k < list.*.length {
+        if m.wordAt(list, k) == @intCast(usize, quark) { data = m.wordAt(list, k + 1) }
+        k += 2
+    }
+    unlockRegistry()
+    return data
+}
+
+export fn g_type_query(t: usize, query: usize) -> void {
+    m.zero(query, 24)
+    const node = nodeOf(t)
+    if node == 0 || (flagsOf(node) & CLASSED) == 0 { return }
+    m.putWord(query, t)
+    m.putWord(query + 8, m.getWord(node + N_NAME))
+    m.put32(query + 16, m.get32(node + N_CLASS_SIZE))
+    m.put32(query + 20, m.get32(node + N_INSTANCE_SIZE))
+}
+
+export fn g_type_get_instance_count(t: usize) -> i32 {
+    const node = nodeOf(t)
+    if node == 0 || (debugFlags & 4) == 0 { return 0 }
+    return m.getI32(node + N_INSTANCES)
+}
+
+export fn g_type_get_plugin(t: usize) -> usize { return 0 }
+export fn g_type_interface_get_plugin(instance_type: usize, interface_type: usize) -> usize { return 0 }
+export fn g_type_ensure(t: usize) -> void { _ = nodeOf(t) }
+
+// The value table of a type (its own or its nearest ancestor's).
+pub fn valueTableOf(t: usize) -> usize {
+    // An interface's values are those of a prerequisite that has some.
+    if fundamentalOf(t) == T_INTERFACE {
+        const prereqs = wordsAt(nodeOf(t) + N_PREREQUISITES)
+        var k: usize = 0
+        while k < prereqs.*.length {
+            const table = valueTableOf(m.wordAt(prereqs, k))
+            if table != 0 { return table }
+            k += 1
+        }
+        return 0
+    }
+    var node = nodeOf(t)
+    while node != 0 {
+        const table = m.getWord(node + N_VALUE_TABLE)
+        if table != 0 { return table }
+        const parent = m.getWord(node + N_PARENT)
+        node = if parent == 0 { 0 } else { nodeOf(parent) }
+    }
+    return 0
+}
+
+export fn g_type_value_table_peek(t: usize) -> usize {
+    if testFlags(t, VALUE_ABSTRACT) { return 0 }
+    return valueTableOf(t)
+}
+
+pub fn setValueTable(t: usize, table: usize) -> void { m.putWord(nodeOf(t) + N_VALUE_TABLE, table) }
+
+export fn g_type_check_is_value_type(t: usize) -> i32 { return if t != 0 && g_type_value_table_peek(t) != 0 { 1 } else { 0 } }
+
+// ---------------------------------------------------------------------------
+// Boxed types' functions
+
+pub fn setBoxedFunctions(t: usize, copy: usize, free: usize) -> void {
+    const node = nodeOf(t)
+    m.putWord(node + N_BOXED_COPY, copy)
+    m.putWord(node + N_BOXED_FREE, free)
+}
+
+pub fn boxedCopyOf(t: usize) -> usize {
+    var node = nodeOf(t)
+    while node != 0 && m.getWord(node + N_BOXED_COPY) == 0 {
+        const parent = m.getWord(node + N_PARENT)
+        node = if parent == 0 { 0 } else { nodeOf(parent) }
+    }
+    return if node == 0 { 0 } else { m.getWord(node + N_BOXED_COPY) }
+}
+
+pub fn boxedFreeOf(t: usize) -> usize {
+    var node = nodeOf(t)
+    while node != 0 && m.getWord(node + N_BOXED_FREE) == 0 {
+        const parent = m.getWord(node + N_PARENT)
+        node = if parent == 0 { 0 } else { nodeOf(parent) }
+    }
+    return if node == 0 { 0 } else { m.getWord(node + N_BOXED_FREE) }
+}
+
+// ---------------------------------------------------------------------------
+// Interfaces
+
+fn findHolder(node: usize, iface: usize) -> usize {
+    const holders = wordsAt(node + N_HOLDERS)
+    var k: usize = 0
+    while k < holders.*.length {
+        if m.getWord(m.wordAt(holders, k) + E_IFACE) == iface { return m.wordAt(holders, k) }
+        k += 1
+    }
+    return 0
+}
+
+fn findEntry(node: usize, iface: usize) -> usize {
+    const entries = wordsAt(node + N_ENTRIES)
+    var k: usize = 0
+    while k < entries.*.length {
+        if m.getWord(m.wordAt(entries, k) + E_IFACE) == iface { return m.wordAt(entries, k) }
+        k += 1
+    }
+    return 0
+}
+
+// The default vtable of an interface type (made once: its base_init and
+// its default init, GTypeInfo's class_init, run on it).
+pub fn defaultVtable(iface: usize) -> usize {
+    const node = nodeOf(iface)
+    if node == 0 { return 0 }
+    var vtable = m.getWord(node + N_DEFAULT_VTABLE)
+    if vtable != 0 { return vtable }
+    lockRegistry()
+    vtable = m.getWord(node + N_DEFAULT_VTABLE)
+    if vtable == 0 {
+        const size = m.get32(node + N_CLASS_SIZE)
+        vtable = m.alloc(@intCast(usize, if size < 16 { 16 } else { size }))
+        m.putWord(vtable, iface)
+        m.putWord(node + N_DEFAULT_VTABLE, vtable)
+        const prereqs = wordsAt(node + N_PREREQUISITES)
+        var k: usize = 0
+        while k < prereqs.*.length {
+            const p = m.wordAt(prereqs, k)
+            if fundamentalOf(p) == T_INTERFACE { _ = defaultVtable(p) }
+            k += 1
+        }
+        const baseInit = m.getWord(node + N_BASE_INIT)
+        if baseInit != 0 {
+            const call: BaseInit = unsafe { @ptrFromInt(BaseInit, baseInit) }
+            call(vtable)
+        }
+        const init = m.getWord(node + N_CLASS_INIT)
+        if init != 0 {
+            const call: ClassInit = unsafe { @ptrFromInt(ClassInit, init) }
+            call(vtable, m.getWord(node + N_CLASS_DATA))
+        }
+    }
+    unlockRegistry()
+    return vtable
+}
+
+// A vtable of `iface` for the class of `node` (a copy of `from`).
+fn makeVtable(node: usize, iface: usize, from: usize) -> usize {
+    const inode = nodeOf(iface)
+    const size = @intCast(usize, m.get32(inode + N_CLASS_SIZE))
+    const vtable = m.alloc(if size < 16 { 16 } else { size })
+    m.copy(vtable, from, size)
+    m.putWord(vtable, iface)
+    m.putWord(vtable + 8, if node > FUNDAMENTAL_MAX { node } else { supersFirst(node) })
+    const baseInit = m.getWord(inode + N_BASE_INIT)
+    if baseInit != 0 {
+        const call: BaseInit = unsafe { @ptrFromInt(BaseInit, baseInit) }
+        call(vtable)
+    }
+    return vtable
+}
+
+fn supersFirst(node: usize) -> usize { return m.getWord(supersOf(node)) }
+
+fn initVtable(entry: usize) -> void {
+    const init = m.getWord(entry + E_INIT)
+    if init != 0 {
+        const call: ClassInit = unsafe { @ptrFromInt(ClassInit, init) }
+        call(m.getWord(entry + E_VTABLE), m.getWord(entry + E_DATA))
+    }
+}
+
+// GInterfaceInfo: interface_init 0, interface_finalize 8, data 16.
+export fn g_type_add_interface_static(instance_type: usize, interface_type: usize, info: usize) -> void {
+    const node = nodeOf(instance_type)
+    if node == 0 || fundamentalOf(interface_type) != T_INTERFACE || (flagsOf(node) & INSTANTIATABLE) == 0 {
+        messages.logText(m.literal("GLib-GObject"), messages.LEVEL_WARNING, "cannot add interface to a type that is not instantiatable")
+        return
+    }
+    lockRegistry()
+    if findHolder(node, interface_type) != 0 {
+        unlockRegistry()
+        return
+    }
+    const holder = m.alloc(E_SIZE)
+    m.putWord(holder + E_IFACE, interface_type)
+    if info != 0 {
+        m.putWord(holder + E_INIT, m.getWord(info))
+        m.putWord(holder + E_FINALIZE, m.getWord(info + 8))
+        m.putWord(holder + E_DATA, m.getWord(info + 16))
+    }
+    m.putWord(holder + E_OWN, 1)
+    m.pushWord(wordsAt(node + N_HOLDERS), holder)
+    // A class made already gets the interface now.
+    if m.get32(node + N_STATE) == STATE_READY {
+        const parentEntry = if m.getWord(node + N_PARENT) != 0 { findEntry(nodeOf(m.getWord(node + N_PARENT)), interface_type) } else { 0 }
+        const from = if parentEntry != 0 { m.getWord(parentEntry + E_VTABLE) } else { defaultVtable(interface_type) }
+        const entry = m.alloc(E_SIZE)
+        m.copy(entry, holder, E_SIZE)
+        m.putWord(entry + E_VTABLE, makeVtable(node, interface_type, from))
+        m.pushWord(wordsAt(node + N_ENTRIES), entry)
+        initVtable(entry)
+    }
+    unlockRegistry()
+}
+
+export fn g_type_interface_peek(instance_class: usize, iface_type: usize) -> usize {
+    if instance_class == 0 { return 0 }
+    const node = nodeOf(m.getWord(instance_class))
+    if node == 0 { return 0 }
+    const entry = findEntry(node, iface_type)
+    return if entry == 0 { 0 } else { m.getWord(entry + E_VTABLE) }
+}
+
+export fn g_type_interface_peek_parent(g_iface: usize) -> usize {
+    if g_iface == 0 { return 0 }
+    const instanceType = m.getWord(g_iface + 8)
+    const parent = parentOf(instanceType)
+    if parent == 0 { return 0 }
+    const pnode = nodeOf(parent)
+    const entry = findEntry(pnode, m.getWord(g_iface))
+    return if entry == 0 { 0 } else { m.getWord(entry + E_VTABLE) }
+}
+
+export fn g_type_default_interface_ref(t: usize) -> usize {
+    if fundamentalOf(t) != T_INTERFACE { return 0 }
+    return defaultVtable(t)
+}
+
+export fn g_type_default_interface_peek(t: usize) -> usize {
+    const node = nodeOf(t)
+    return if node == 0 { 0 } else { m.getWord(node + N_DEFAULT_VTABLE) }
+}
+
+export fn g_type_default_interface_unref(g_iface: usize) -> void {}
+
+// ---------------------------------------------------------------------------
+// Classes
+
+pub fn classOf(t: usize) -> usize {
+    const node = nodeOf(t)
+    if node == 0 || (flagsOf(node) & CLASSED) == 0 { return 0 }
+    if @atomicLoad(u32, m.word32(node + N_STATE), acquire) == STATE_READY { return m.getWord(node + N_CLASS) }
+    return makeClass(node)
+}
+
+fn makeClass(node: usize) -> usize {
+    lockRegistry()
+    if m.get32(node + N_STATE) != STATE_NONE {
+        // Made meanwhile, or being made by this thread (a class_init asking
+        // for its own class).
+        const made = m.getWord(node + N_CLASS)
+        unlockRegistry()
+        return made
+    }
+    const parent = m.getWord(node + N_PARENT)
+    var pclass: usize = 0
+    var pnode: usize = 0
+    if parent != 0 {
+        pnode = nodeOf(parent)
+        pclass = classOf(parent)
+    }
+    const size = @intCast(usize, m.get32(node + N_CLASS_SIZE))
+    const class = m.alloc(if size < 8 { 8 } else { size })
+    if pclass != 0 {
+        m.copy(class, pclass, @intCast(usize, m.get32(pnode + N_CLASS_SIZE)))
+        if (flagsOf(node) & INSTANTIATABLE) != 0 { m.put32(node + N_PRIVATE, m.get32(pnode + N_PRIVATE)) }
+    }
+    const t = supersFirst(node)
+    m.putWord(class, t)
+    m.putWord(node + N_CLASS, class)
+    m.put32(node + N_STATE, STATE_MAKING)
+    // Every base_init, from the root down.
+    var i = @intCast(usize, depthOf(node))
+    while i > 0 {
+        i -= 1
+        const bnode = nodeOf(m.getWord(supersOf(node) + i * 8))
+        const baseInit = m.getWord(bnode + N_BASE_INIT)
+        if baseInit != 0 {
+            const call: BaseInit = unsafe { @ptrFromInt(BaseInit, baseInit) }
+            call(class)
+        }
+    }
+    // The interfaces: the parent's vtables, and new ones for those added
+    // here (through their base_init).
+    const entries = wordsAt(node + N_ENTRIES)
+    if pnode != 0 {
+        const pentries = wordsAt(pnode + N_ENTRIES)
+        var k: usize = 0
+        while k < pentries.*.length {
+            const entry = m.alloc(E_SIZE)
+            m.copy(entry, m.wordAt(pentries, k), E_SIZE)
+            m.putWord(entry + E_OWN, 0)
+            m.pushWord(entries, entry)
+            k += 1
+        }
+    }
+    const holders = wordsAt(node + N_HOLDERS)
+    var k: usize = 0
+    while k < holders.*.length {
+        const holder = m.wordAt(holders, k)
+        const iface = m.getWord(holder + E_IFACE)
+        var entry = findEntry(node, iface)
+        const from = if entry != 0 { m.getWord(entry + E_VTABLE) } else { defaultVtable(iface) }
+        if entry == 0 {
+            entry = m.alloc(E_SIZE)
+            m.pushWord(entries, entry)
+        }
+        m.copy(entry, holder, E_SIZE)
+        m.putWord(entry + E_VTABLE, makeVtable(node, iface, from))
+        k += 1
+    }
+    const classInit = m.getWord(node + N_CLASS_INIT)
+    if classInit != 0 {
+        const call: ClassInit = unsafe { @ptrFromInt(ClassInit, classInit) }
+        call(class, m.getWord(node + N_CLASS_DATA))
+    }
+    k = 0
+    while k < entries.*.length {
+        const entry = m.wordAt(entries, k)
+        if m.getWord(entry + E_OWN) != 0 { initVtable(entry) }
+        k += 1
+    }
+    @atomicStore(u32, m.word32(node + N_STATE), STATE_READY, release)
+    unlockRegistry()
+    return class
+}
+
+export fn g_type_class_ref(t: usize) -> usize {
+    const class = classOf(t)
+    if class == 0 {
+        var text = m.text()
+        m.pushText(&text, "cannot retrieve class for invalid (unclassed) type '")
+        m.pushC(&text, describe(t))
+        m.pushText(&text, "'")
+        messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, text.address)
+        m.dispose(&text)
+        return 0
+    }
+    _ = @atomicRmw(u32, m.word32(nodeOf(t) + N_CLASS_REFS), add, 1, acq_rel)
+    return class
+}
+
+export fn g_type_class_peek(t: usize) -> usize {
+    const node = nodeOf(t)
+    if node == 0 || m.get32(node + N_STATE) == STATE_NONE { return 0 }
+    return m.getWord(node + N_CLASS)
+}
+
+export fn g_type_class_peek_static(t: usize) -> usize { return g_type_class_peek(t) }
+
+export fn g_type_class_unref(g_class: usize) -> void {
+    if g_class == 0 { return }
+    const node = nodeOf(m.getWord(g_class))
+    if node != 0 && m.get32(node + N_CLASS_REFS) > 0 { _ = @atomicRmw(u32, m.word32(node + N_CLASS_REFS), sub, 1, acq_rel) }
+}
+
+export fn g_type_class_unref_uncached(g_class: usize) -> void { g_type_class_unref(g_class) }
+
+export fn g_type_class_peek_parent(g_class: usize) -> usize {
+    if g_class == 0 { return 0 }
+    const parent = parentOf(m.getWord(g_class))
+    if parent == 0 { return 0 }
+    return classOf(parent)
+}
+
+// Classes are never freed (static types), so the cache functions are
+// kept but never called.
+export fn g_type_add_class_cache_func(cache_data: usize, cache_func: usize) -> void {
+    lockRegistry()
+    m.pushWord(wordsAt(cacheFuncs), cache_func)
+    m.pushWord(wordsAt(cacheFuncs), cache_data)
+    unlockRegistry()
+}
+
+export fn g_type_remove_class_cache_func(cache_data: usize, cache_func: usize) -> void {
+    lockRegistry()
+    const list = wordsAt(cacheFuncs)
+    var k: usize = 0
+    while k < list.*.length {
+        if m.wordAt(list, k) == cache_func && m.wordAt(list, k + 1) == cache_data {
+            m.putWord(list.*.address + k * 8, 0)
+            m.putWord(list.*.address + (k + 1) * 8, 0)
+        }
+        k += 2
+    }
+    unlockRegistry()
+}
+
+// ---------------------------------------------------------------------------
+// Private data and instances
+
+fn alignStruct(n: u32) -> u32 { return (n + 15) - ((n + 15) & 15) }
+
+export fn g_type_class_add_private(g_class: usize, private_size: usize) -> void {
+    const node = nodeOf(m.getWord(g_class))
+    if node == 0 || (flagsOf(node) & INSTANTIATABLE) == 0 { return }
+    const parent = m.getWord(node + N_PARENT)
+    if parent != 0 && m.get32(node + N_PRIVATE) != m.get32(nodeOf(parent) + N_PRIVATE) {
+        messages.logText(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, "g_type_class_add_private() called multiple times for the same type")
+        return
+    }
+    m.put32(node + N_PRIVATE, alignStruct(m.get32(node + N_PRIVATE) + @intCast(u32, private_size)))
+}
+
+export fn g_type_add_instance_private(class_type: usize, private_size: usize) -> i32 {
+    const node = nodeOf(class_type)
+    if node == 0 || (flagsOf(node) & INSTANTIATABLE) == 0 {
+        criticalText("cannot add private field to invalid (non-instantiatable) type '", describe(class_type), "'")
+        return 0
+    }
+    return @intCast(i32, private_size)
+}
+
+export fn g_type_class_adjust_private_offset(g_class: usize, private_size_or_offset: usize) -> void {
+    const value = m.getI32(private_size_or_offset)
+    if value <= 0 { return }
+    const node = nodeOf(m.getWord(g_class))
+    if node == 0 || (flagsOf(node) & INSTANTIATABLE) == 0 {
+        m.putI32(private_size_or_offset, 0)
+        return
+    }
+    const parent = m.getWord(node + N_PARENT)
+    if parent != 0 && m.get32(node + N_PRIVATE) != m.get32(nodeOf(parent) + N_PRIVATE) {
+        messages.logText(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, "g_type_class_add_private() called multiple times for the same type")
+        m.putI32(private_size_or_offset, 0)
+        return
+    }
+    const size = alignStruct(m.get32(node + N_PRIVATE) + @bitCast(u32, value))
+    m.put32(node + N_PRIVATE, size)
+    m.putI32(private_size_or_offset, 0 - @bitCast(i32, size))
+}
+
+export fn g_type_class_get_instance_private_offset(g_class: usize) -> i32 {
+    const node = nodeOf(m.getWord(g_class))
+    return 0 - @bitCast(i32, m.get32(node + N_PRIVATE))
+}
+
+export fn g_type_instance_get_private(instance: usize, private_type: usize) -> usize {
+    const node = nodeOf(private_type)
+    if instance == 0 || node == 0 { return 0 }
+    return instance - @intCast(usize, m.get32(node + N_PRIVATE))
+}
+
+// Class private data is not kept by this library.
+export fn g_type_class_get_private(klass: usize, private_type: usize) -> usize {
+    messages.logText(m.literal("GLib-GObject"), messages.LEVEL_CRITICAL, "g_type_class_get_private: class private data is not supported by this library")
+    return 0
+}
+
+pub fn createInstance(t: usize) -> usize {
+    const node = nodeOf(t)
+    if node == 0 || (flagsOf(node) & INSTANTIATABLE) == 0 {
+        criticalText("cannot create new instance of invalid (non-instantiatable) type '", describe(t), "'")
+        return 0
+    }
+    if (flagsOf(node) & ABSTRACT) != 0 {
+        criticalText("cannot create instance of abstract (non-instantiatable) type '", describe(t), "'")
+        return 0
+    }
+    const class = classOf(t)
+    const privateSize = @intCast(usize, m.get32(node + N_PRIVATE))
+    const instanceSize = @intCast(usize, m.get32(node + N_INSTANCE_SIZE))
+    const allocated = m.alloc(privateSize + instanceSize)
+    const instance = allocated + privateSize
+    var i = @intCast(usize, depthOf(node))
+    while i > 1 {
+        i -= 1
+        const pnode = nodeOf(m.getWord(supersOf(node) + i * 8))
+        const init = m.getWord(pnode + N_INSTANCE_INIT)
+        if init != 0 {
+            m.putWord(instance, m.getWord(pnode + N_CLASS))
+            const call: InstanceInit = unsafe { @ptrFromInt(InstanceInit, init) }
+            call(instance, class)
+        }
+    }
+    m.putWord(instance, class)
+    const init = m.getWord(node + N_INSTANCE_INIT)
+    if init != 0 {
+        const call: InstanceInit = unsafe { @ptrFromInt(InstanceInit, init) }
+        call(instance, class)
+    }
+    _ = @atomicRmw(u32, m.word32(node + N_INSTANCES), add, 1, acq_rel)
+    return instance
+}
+
+pub fn freeInstance(instance: usize) -> void {
+    const class = m.getWord(instance)
+    const node = nodeOf(m.getWord(class))
+    if node == 0 { return }
+    _ = @atomicRmw(u32, m.word32(node + N_INSTANCES), sub, 1, acq_rel)
+    m.putWord(instance, 0)
+    m.release(instance - @intCast(usize, m.get32(node + N_PRIVATE)))
+}
+
+export fn g_type_create_instance(t: usize) -> usize { return createInstance(t) }
+export fn g_type_free_instance(instance: usize) -> void { freeInstance(instance) }
+
+// ---------------------------------------------------------------------------
+// Checks (what the G_TYPE_CHECK_* macros call)
+
+pub fn instanceType(instance: usize) -> usize { return m.getWord(m.getWord(instance)) }
+
+export fn g_type_check_instance(instance: usize) -> i32 {
+    if instance == 0 { return 0 }
+    const class = m.getWord(instance)
+    if class == 0 {
+        messages.logText(m.literal("GLib-GObject"), messages.LEVEL_WARNING, "instance with invalid (NULL) class pointer")
+        return 0
+    }
+    const node = nodeOf(m.getWord(class))
+    if node == 0 || (flagsOf(node) & INSTANTIATABLE) == 0 {
+        messages.logText(m.literal("GLib-GObject"), messages.LEVEL_WARNING, "instance of invalid non-instantiatable type")
+        return 0
+    }
+    return 1
+}
+
+export fn g_type_check_instance_cast(instance: usize, iface_type: usize) -> usize {
+    if instance == 0 { return 0 }
+    const class = m.getWord(instance)
+    if class == 0 {
+        messages.logText(m.literal("GLib-GObject"), messages.LEVEL_WARNING, "invalid unclassed pointer in cast")
+        return instance
+    }
+    const t = m.getWord(class)
+    if isA(t, iface_type) { return instance }
+    var text = m.text()
+    m.pushText(&text, "invalid cast from '")
+    m.pushC(&text, describe(t))
+    m.pushText(&text, "' to '")
+    m.pushC(&text, describe(iface_type))
+    m.pushText(&text, "'")
+    messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, text.address)
+    m.dispose(&text)
+    return instance
+}
+
+export fn g_type_check_instance_is_a(instance: usize, iface_type: usize) -> i32 {
+    if instance == 0 || m.getWord(instance) == 0 { return 0 }
+    return if isA(instanceType(instance), iface_type) { 1 } else { 0 }
+}
+
+export fn g_type_check_instance_is_fundamentally_a(instance: usize, fundamental_type: usize) -> i32 {
+    if instance == 0 || m.getWord(instance) == 0 { return 0 }
+    return if fundamentalOf(instanceType(instance)) == fundamental_type { 1 } else { 0 }
+}
+
+export fn g_type_check_class_cast(g_class: usize, is_a_type: usize) -> usize {
+    if g_class == 0 { return 0 }
+    const t = m.getWord(g_class)
+    if isA(t, is_a_type) { return g_class }
+    var text = m.text()
+    m.pushText(&text, "invalid class cast from '")
+    m.pushC(&text, describe(t))
+    m.pushText(&text, "' to '")
+    m.pushC(&text, describe(is_a_type))
+    m.pushText(&text, "'")
+    messages.log(m.literal("GLib-GObject"), messages.LEVEL_WARNING, text.address)
+    m.dispose(&text)
+    return g_class
+}
+
+export fn g_type_check_class_is_a(g_class: usize, is_a_type: usize) -> i32 {
+    if g_class == 0 { return 0 }
+    return if isA(m.getWord(g_class), is_a_type) { 1 } else { 0 }
+}
+
+export fn g_type_check_value(value: usize) -> i32 { return if value != 0 && g_type_check_is_value_type(m.getWord(value)) != 0 { 1 } else { 0 } }
+
+export fn g_type_check_value_holds(value: usize, t: usize) -> i32 {
+    return if value != 0 && g_type_check_is_value_type(m.getWord(value)) != 0 && isA(m.getWord(value), t) { 1 } else { 0 }
+}
+
+export fn g_type_name_from_instance(instance: usize) -> usize {
+    if instance == 0 { return m.literal("<NULL-instance>") }
+    return g_type_name_from_class(m.getWord(instance))
+}
+
+export fn g_type_name_from_class(g_class: usize) -> usize {
+    if g_class == 0 { return m.literal("<NULL-class>") }
+    return nameOf(m.getWord(g_class))
+}

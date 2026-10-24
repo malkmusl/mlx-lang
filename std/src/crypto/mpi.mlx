@@ -1,0 +1,1026 @@
+// std.crypto.mpi: signed integers of any size, 64-bit limbs from the
+// least significant one in memory of an Allocator, for the numbers of
+// public-key cryptography that are not secret or not of a fixed size: a
+// key's parameters read and checked, RSA keys made (primes found, d and
+// the CRT's values worked out), a modulus of any form. The arithmetic is
+// schoolbook and Knuth's division, its time depending on the values; a
+// secret exponent goes through std.crypto.bignum's Montgomery ladder
+// (`powm` does so for an odd modulus of up to 16384 bits), constant time.
+//
+//     var a: mpi.Mpi = undefined
+//     mpi.init(&a, allocator)
+//     _ = mpi.fromHex(&a, "1234ABCD")
+//     _ = mpi.mul(&a, &a, &b)          // an operand may be the result
+//     mpi.deinit(&a)
+//
+// A result is made in fresh limbs and installed, so an operand may be the
+// result. Every operation that may need memory answers false when it got
+// none, its result then unchanged. The limb routines are public for code
+// that keeps limbs its own way (compiler/libc/gcrypt's MPIs do).
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const bignum = @import("./bignum.mlx")
+const random = @import("../random.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Mpi = struct {
+    allocator: Allocator
+    limbs: [*]u64
+    // The significant limbs (none for 0) and the room.
+    used: usize
+    capacity: usize
+    negative: bool
+}
+
+// (No u128 constant above 2^64 - 1: mlx4 keeps only a constant's low 64
+// bits, so 2^64 would be 0. Borrows are worked out on u64s.)
+const MASK: u128 = 18446744073709551615
+
+inline fn wide(value: u64) -> u128 { return @intCast(u128, value) }
+
+inline fn lowOf(value: u128) -> u64 { return @intCast(u64, value & MASK) }
+
+inline fn highOf(value: u128) -> u64 { return @intCast(u64, value >> 64) }
+
+// ---------------------------------------------------------------------------
+// Unsigned limb arithmetic
+
+// The significant limbs of a[0..n].
+pub fn significant(a: [*]const u64, n: usize) -> usize {
+    var count = n
+    while count > 0 && a[count - 1] == 0 { count -= 1 }
+    return count
+}
+
+// The order of two magnitudes given by their significant limbs.
+pub fn compareLimbs(a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> i32 {
+    if an != bn { return if an > bn { 1 } else { -1 } }
+    var index = an
+    while index > 0 {
+        index -= 1
+        if a[index] != b[index] { return if a[index] > b[index] { 1 } else { -1 } }
+    }
+    return 0
+}
+
+// out = a + b (an >= bn; out has an + 1 limbs): the limbs written.
+pub fn addLimbs(out: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> usize {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < an {
+        var sum = wide(a[index]) + wide(carry)
+        if index < bn { sum += wide(b[index]) }
+        out[index] = lowOf(sum)
+        carry = highOf(sum)
+        index += 1
+    }
+    out[an] = carry
+    return an + 1
+}
+
+// out = a - b (a >= b, an >= bn): the limbs written (an).
+pub fn subLimbs(out: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> usize {
+    var borrow: u64 = 0
+    var index: usize = 0
+    while index < an {
+        const x = a[index]
+        const y: u64 = if index < bn { b[index] } else { 0 }
+        const first = x -% y
+        const second = first -% borrow
+        borrow = if x < y || first < borrow { 1 } else { 0 }
+        out[index] = second
+        index += 1
+    }
+    return an
+}
+
+// out (an + bn limbs, zeroed) = a * b.
+pub fn mulLimbs(out: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize) -> void {
+    var i: usize = 0
+    while i < an {
+        var carry: u64 = 0
+        const x = wide(a[i])
+        var j: usize = 0
+        while j < bn {
+            const product = x * wide(b[j]) + wide(out[i + j]) + wide(carry)
+            out[i + j] = lowOf(product)
+            carry = highOf(product)
+            j += 1
+        }
+        out[i + bn] = carry
+        i += 1
+    }
+}
+
+// out = a << bits (out has an + bits / 64 + 1 limbs, zeroed).
+pub fn shiftLeftLimbs(out: [*]u64, a: [*]const u64, an: usize, bits: usize) -> void {
+    const whole = bits / 64
+    const part = @intCast(u64, bits % 64)
+    var index: usize = 0
+    while index < an {
+        if part == 0 {
+            out[index + whole] = a[index]
+        } else {
+            out[index + whole] = out[index + whole] | (a[index] << part)
+            out[index + whole + 1] = a[index] >> (64 - part)
+        }
+        index += 1
+    }
+}
+
+// out = a >> bits, its first `count` limbs.
+pub fn shiftRightLimbs(out: [*]u64, count: usize, a: [*]const u64, an: usize, bits: usize) -> void {
+    const whole = bits / 64
+    const part = @intCast(u64, bits % 64)
+    var index: usize = 0
+    while index < count {
+        var value: u64 = 0
+        if index + whole < an {
+            value = a[index + whole] >> part
+            if part != 0 && index + whole + 1 < an { value = value | (a[index + whole + 1] << (64 - part)) }
+        }
+        out[index] = value
+        index += 1
+    }
+}
+
+// The scratch limbs `divLimbs` needs for an an-limb dividend and a
+// bn-limb divisor.
+pub fn divScratch(an: usize, bn: usize) -> usize { return an + bn + 3 }
+
+// Knuth's algorithm D: q = a / b (when `wantQuotient`) and r = a mod b
+// for an >= bn > 0, b's top limb not 0. q has an - bn + 1 limbs; r has
+// bn; `scratch` has divScratch(an, bn) limbs and is wiped after.
+pub fn divLimbs(q: [*]u64, wantQuotient: bool, r: [*]u64, a: [*]const u64, an: usize, b: [*]const u64, bn: usize, scratch: [*]u64) -> void {
+    if bn == 1 {
+        var rest: u64 = 0
+        const d = wide(b[0])
+        var index = an
+        while index > 0 {
+            index -= 1
+            const value = (wide(rest) << 64) | wide(a[index])
+            if wantQuotient { q[index] = lowOf(value / d) }
+            rest = lowOf(value % d)
+        }
+        r[0] = rest
+        return
+    }
+    // Normalized: b's top bit set, a shifted alike (one limb more).
+    var shift: usize = 0
+    var top = b[bn - 1]
+    while top & 9223372036854775808 == 0 {
+        top = top << 1
+        shift += 1
+    }
+    const total = an + bn + 3
+    var index: usize = 0
+    while index < total {
+        scratch[index] = 0
+        index += 1
+    }
+    const v: [*]u64 = scratch
+    const u: [*]u64 = scratch + bn + 1
+    shiftLeftLimbs(v, b, bn, shift)
+    shiftLeftLimbs(u, a, an, shift)
+    const vTop = wide(v[bn - 1])
+    const vNext = wide(v[bn - 2])
+    var j = an - bn + 1
+    while j > 0 {
+        j -= 1
+        const numerator = (wide(u[j + bn]) << 64) | wide(u[j + bn - 1])
+        var qhat = numerator / vTop
+        var rhat = numerator % vTop
+        while highOf(qhat) != 0 || qhat * vNext > ((rhat << 64) | wide(u[j + bn - 2])) {
+            qhat -= 1
+            rhat += vTop
+            if highOf(rhat) != 0 { break }
+        }
+        // The digit is below 2^64 now.
+        var digit = lowOf(qhat)
+        // u[j..j+bn] -= digit * v
+        var borrow: u64 = 0
+        var carry: u64 = 0
+        var i: usize = 0
+        while i < bn {
+            const product = wide(digit) * wide(v[i]) + wide(carry)
+            carry = highOf(product)
+            const minuend = u[i + j]
+            const part = lowOf(product)
+            const first = minuend -% part
+            u[i + j] = first -% borrow
+            borrow = if minuend < part || first < borrow { 1 } else { 0 }
+            i += 1
+        }
+        const head = u[j + bn]
+        u[j + bn] = head -% carry -% borrow
+        if wide(head) < wide(carry) + wide(borrow) {
+            // The digit was one too large: add v back.
+            digit -= 1
+            var back: u64 = 0
+            i = 0
+            while i < bn {
+                const sum = wide(u[i + j]) + wide(v[i]) + wide(back)
+                u[i + j] = lowOf(sum)
+                back = highOf(sum)
+                i += 1
+            }
+            u[j + bn] = lowOf(wide(u[j + bn]) + wide(back))
+        }
+        if wantQuotient { q[j] = digit }
+    }
+    shiftRightLimbs(r, bn, u, bn + 1, shift)
+    index = 0
+    while index < total {
+        scratch[index] = 0
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Numbers and their limbs
+
+const NONE: usize = 8
+
+pub fn init(m: *Mpi, allocator: Allocator) -> void {
+    m.*.allocator = allocator
+    m.*.limbs = unsafe { @ptrFromInt([*]u64, NONE) }
+    m.*.used = 0
+    m.*.capacity = 0
+    m.*.negative = false
+}
+
+// Fresh zeroed limbs, at least one.
+fn fresh(allocator: Allocator, count: usize) -> ?[*]u64 {
+    const room = if count == 0 { 1 } else { count }
+    const memory = allocator.alloc(room * 8, 8)
+    if memory == null { return null }
+    const limbs = unsafe { @ptrCast([*]u64, memory.?) }
+    var index: usize = 0
+    while index < room {
+        limbs[index] = 0
+        index += 1
+    }
+    return limbs
+}
+
+fn wipeFree(allocator: Allocator, limbs: [*]u64, capacity: usize) -> void {
+    if capacity == 0 { return }
+    var index: usize = 0
+    while index < capacity {
+        limbs[index] = 0
+        index += 1
+    }
+    allocator.free(unsafe { @ptrCast([*]u8, limbs) }, capacity * 8, 8)
+}
+
+pub fn deinit(m: *Mpi) -> void {
+    wipeFree(m.*.allocator, m.*.limbs, m.*.capacity)
+    m.*.limbs = unsafe { @ptrFromInt([*]u64, NONE) }
+    m.*.used = 0
+    m.*.capacity = 0
+    m.*.negative = false
+}
+
+// `count` limbs at `limbs` (an allocation of `capacity` limbs) become w's
+// value, its sign `negative` (none for 0); w's old limbs are freed.
+fn install(w: *Mpi, limbs: [*]u64, count: usize, capacity: usize, negative: bool) -> void {
+    wipeFree(w.*.allocator, w.*.limbs, w.*.capacity)
+    w.*.limbs = limbs
+    w.*.capacity = capacity
+    w.*.used = significant(limbs, count)
+    w.*.negative = negative && w.*.used > 0
+}
+
+// w = the `count` limbs at `a` with the sign `negative` (a copy).
+fn assignLimbs(w: *Mpi, a: [*]const u64, count: usize, negative: bool) -> bool {
+    const capacity = if count == 0 { 1 } else { count }
+    const limbs = fresh(w.*.allocator, capacity)
+    if limbs == null { return false }
+    const out = limbs.?
+    var index: usize = 0
+    while index < count {
+        out[index] = a[index]
+        index += 1
+    }
+    install(w, out, count, capacity, negative)
+    return true
+}
+
+pub fn set(w: *Mpi, u: *const Mpi) -> bool {
+    if w == u { return true }
+    return assignLimbs(w, u.*.limbs, u.*.used, u.*.negative)
+}
+
+pub fn setU64(w: *Mpi, value: u64) -> bool {
+    var limb: [1]u64 = [1]u64{ value }
+    return assignLimbs(w, &limb, 1, false)
+}
+
+pub fn setI64(w: *Mpi, value: i64) -> bool {
+    const magnitude: u64 = if value < 0 { @bitCast(u64, 0 -% value) } else { @bitCast(u64, value) }
+    var limb: [1]u64 = [1]u64{ magnitude }
+    return assignLimbs(w, &limb, 1, value < 0)
+}
+
+pub fn isZero(m: *const Mpi) -> bool { return m.*.used == 0 }
+
+pub fn isNegative(m: *const Mpi) -> bool { return m.*.negative }
+
+pub fn isOdd(m: *const Mpi) -> bool { return m.*.used > 0 && (m.*.limbs[0] & 1) == 1 }
+
+// The magnitude's bits.
+pub fn bitLength(m: *const Mpi) -> usize {
+    if m.*.used == 0 { return 0 }
+    var top = m.*.limbs[m.*.used - 1]
+    var bits: usize = 0
+    while top != 0 {
+        bits += 1
+        top = top >> 1
+    }
+    return (m.*.used - 1) * 64 + bits
+}
+
+pub fn byteLength(m: *const Mpi) -> usize { return (bitLength(m) + 7) / 8 }
+
+// The magnitude as `out.length` big-endian bytes, zeroes before it (the
+// high bytes cut off when it is longer).
+pub fn toBytes(m: *const Mpi, out: []u8) -> void {
+    const length = out.length
+    var index: usize = 0
+    while index < length {
+        const position = length - 1 - index
+        const limb = index / 8
+        var byte: u64 = 0
+        if limb < m.*.used { byte = (m.*.limbs[limb] >> @intCast(u64, (index % 8) * 8)) & 255 }
+        out[position] = @intCast(u8, byte)
+        index += 1
+    }
+}
+
+// w = the unsigned big-endian number in `bytes`.
+pub fn fromBytes(w: *Mpi, bytes: []const u8) -> bool {
+    const length = bytes.length
+    const count = (length + 7) / 8
+    const capacity = if count == 0 { 1 } else { count }
+    const limbs = fresh(w.*.allocator, capacity)
+    if limbs == null { return false }
+    const out = limbs.?
+    var index: usize = 0
+    while index < length {
+        const value = @intCast(u64, bytes[length - 1 - index])
+        out[index / 8] = out[index / 8] | (value << @intCast(u64, (index % 8) * 8))
+        index += 1
+    }
+    install(w, out, count, capacity, false)
+    return true
+}
+
+// The lowest 64 bits of the magnitude.
+pub fn lowU64(m: *const Mpi) -> u64 { return if m.*.used == 0 { 0 } else { m.*.limbs[0] } }
+
+// ---------------------------------------------------------------------------
+// Signed arithmetic
+
+// w = (-1)^aNegative * a + (-1)^bNegative * b.
+fn addSigned(w: *Mpi, a: [*]const u64, an: usize, aNegative: bool, b: [*]const u64, bn: usize, bNegative: bool) -> bool {
+    const count = (if an > bn { an } else { bn }) + 1
+    const limbs = fresh(w.*.allocator, count)
+    if limbs == null { return false }
+    const out = limbs.?
+    if aNegative == bNegative {
+        if an >= bn {
+            _ = addLimbs(out, a, an, b, bn)
+        } else {
+            _ = addLimbs(out, b, bn, a, an)
+        }
+        install(w, out, count, count, aNegative)
+        return true
+    }
+    if compareLimbs(a, significant(a, an), b, significant(b, bn)) >= 0 {
+        _ = subLimbs(out, a, an, b, bn)
+        install(w, out, count, count, aNegative)
+    } else {
+        _ = subLimbs(out, b, bn, a, an)
+        install(w, out, count, count, bNegative)
+    }
+    return true
+}
+
+pub fn add(w: *Mpi, u: *const Mpi, v: *const Mpi) -> bool {
+    return addSigned(w, u.*.limbs, u.*.used, u.*.negative, v.*.limbs, v.*.used, v.*.negative)
+}
+
+pub fn sub(w: *Mpi, u: *const Mpi, v: *const Mpi) -> bool {
+    return addSigned(w, u.*.limbs, u.*.used, u.*.negative, v.*.limbs, v.*.used, !v.*.negative)
+}
+
+pub fn addU64(w: *Mpi, u: *const Mpi, value: u64) -> bool {
+    var limb: [1]u64 = [1]u64{ value }
+    return addSigned(w, u.*.limbs, u.*.used, u.*.negative, &limb, 1, false)
+}
+
+pub fn subU64(w: *Mpi, u: *const Mpi, value: u64) -> bool {
+    var limb: [1]u64 = [1]u64{ value }
+    return addSigned(w, u.*.limbs, u.*.used, u.*.negative, &limb, 1, true)
+}
+
+pub fn mul(w: *Mpi, u: *const Mpi, v: *const Mpi) -> bool {
+    const count = u.*.used + v.*.used
+    const capacity = if count == 0 { 1 } else { count }
+    const limbs = fresh(w.*.allocator, capacity)
+    if limbs == null { return false }
+    mulLimbs(limbs.?, u.*.limbs, u.*.used, v.*.limbs, v.*.used)
+    install(w, limbs.?, count, capacity, u.*.negative != v.*.negative)
+    return true
+}
+
+pub fn mulU64(w: *Mpi, u: *const Mpi, value: u64) -> bool {
+    var limb: [1]u64 = [1]u64{ value }
+    const count = u.*.used + 1
+    const limbs = fresh(w.*.allocator, count)
+    if limbs == null { return false }
+    mulLimbs(limbs.?, u.*.limbs, u.*.used, &limb, 1)
+    install(w, limbs.?, count, count, u.*.negative)
+    return true
+}
+
+// Truncating division: the quotient toward zero, the remainder with the
+// dividend's sign; either may be null for not wanted. False for a zero
+// divisor or no memory, nothing changed then.
+pub fn divRem(q: ?*Mpi, r: ?*Mpi, u: *const Mpi, v: *const Mpi) -> bool {
+    const an = u.*.used
+    const bn = v.*.used
+    if bn == 0 { return false }
+    const allocator = u.*.allocator
+    const uNegative = u.*.negative
+    const qNegative = u.*.negative != v.*.negative
+    if compareLimbs(u.*.limbs, an, v.*.limbs, bn) < 0 {
+        // The quotient is 0 and the remainder is u.
+        if r != null {
+            const remainder = r.?
+            if !assignLimbs(remainder, u.*.limbs, an, uNegative) { return false }
+        }
+        if q != null {
+            const quotient = q.?
+            if !assignLimbs(quotient, u.*.limbs, 0, false) { return false }
+        }
+        return true
+    }
+    const qCount = an - bn + 1
+    const scratchCount = divScratch(an, bn)
+    const quotientLimbs = fresh(allocator, qCount)
+    if quotientLimbs == null { return false }
+    const remainderLimbs = fresh(allocator, bn)
+    if remainderLimbs == null {
+        wipeFree(allocator, quotientLimbs.?, qCount)
+        return false
+    }
+    const scratch = fresh(allocator, scratchCount)
+    if scratch == null {
+        wipeFree(allocator, quotientLimbs.?, qCount)
+        wipeFree(allocator, remainderLimbs.?, bn)
+        return false
+    }
+    divLimbs(quotientLimbs.?, q != null, remainderLimbs.?, u.*.limbs, an, v.*.limbs, bn, scratch.?)
+    wipeFree(allocator, scratch.?, scratchCount)
+    if q != null {
+        const quotient = q.?
+        install(quotient, quotientLimbs.?, qCount, qCount, qNegative)
+    } else {
+        wipeFree(allocator, quotientLimbs.?, qCount)
+    }
+    if r != null {
+        const remainder = r.?
+        install(remainder, remainderLimbs.?, bn, bn, uNegative)
+    } else {
+        wipeFree(allocator, remainderLimbs.?, bn)
+    }
+    return true
+}
+
+// Floor division: the quotient toward minus infinity, the remainder with
+// the divisor's sign.
+pub fn floorDivRem(q: ?*Mpi, r: ?*Mpi, u: *const Mpi, v: *const Mpi) -> bool {
+    var divisor: Mpi = undefined
+    init(&divisor, u.*.allocator)
+    if !set(&divisor, v) { return false }
+    var remainder: Mpi = undefined
+    init(&remainder, u.*.allocator)
+    const dividendNegative = u.*.negative
+    var ok = divRem(q, &remainder, u, &divisor)
+    if ok && (divisor.negative != dividendNegative) && remainder.used != 0 {
+        if q != null {
+            const quotient = q.?
+            ok = subU64(quotient, quotient, 1)
+        }
+        if ok { ok = add(&remainder, &remainder, &divisor) }
+    }
+    if ok && r != null {
+        const target = r.?
+        ok = set(target, &remainder)
+    }
+    deinit(&remainder)
+    deinit(&divisor)
+    return ok
+}
+
+// r = u mod m with the sign of m (in [0, m) for a positive m).
+pub fn mod(r: *Mpi, u: *const Mpi, m: *const Mpi) -> bool {
+    return floorDivRem(null, r, u, m)
+}
+
+// The remainder of the magnitude by a small number.
+pub fn remainderU64(m: *const Mpi, divisor: u64) -> u64 {
+    if divisor == 0 { return 0 }
+    var rest: u64 = 0
+    const d = wide(divisor)
+    var index = m.*.used
+    while index > 0 {
+        index -= 1
+        rest = lowOf(((wide(rest) << 64) | wide(m.*.limbs[index])) % d)
+    }
+    return rest
+}
+
+// The order of two numbers: -1, 0 or 1.
+pub fn compare(u: *const Mpi, v: *const Mpi) -> i32 {
+    if u.*.used == 0 && v.*.used == 0 { return 0 }
+    if !u.*.negative && v.*.negative { return 1 }
+    if u.*.negative && !v.*.negative { return -1 }
+    const order = compareLimbs(u.*.limbs, u.*.used, v.*.limbs, v.*.used)
+    if order == 0 { return 0 }
+    if (order < 0) == u.*.negative { return 1 }
+    return -1
+}
+
+// The order of the magnitudes.
+pub fn compareMagnitude(u: *const Mpi, v: *const Mpi) -> i32 {
+    return compareLimbs(u.*.limbs, u.*.used, v.*.limbs, v.*.used)
+}
+
+pub fn compareU64(u: *const Mpi, value: u64) -> i32 {
+    if u.*.used == 0 { return if value != 0 { -1 } else { 0 } }
+    if u.*.negative { return -1 }
+    if u.*.used > 1 { return 1 }
+    const limb = u.*.limbs[0]
+    if limb > value { return 1 }
+    if limb < value { return -1 }
+    return 0
+}
+
+pub fn testBit(m: *const Mpi, n: usize) -> bool {
+    const limb = n / 64
+    if limb >= m.*.used { return false }
+    return (m.*.limbs[limb] >> @intCast(u64, n % 64)) & 1 == 1
+}
+
+// w's limbs with room for `count`, the value kept.
+fn reserve(w: *Mpi, count: usize) -> bool {
+    if count <= w.*.capacity { return true }
+    const limbs = fresh(w.*.allocator, count)
+    if limbs == null { return false }
+    const out = limbs.?
+    var index: usize = 0
+    while index < w.*.used {
+        out[index] = w.*.limbs[index]
+        index += 1
+    }
+    const used = w.*.used
+    const negative = w.*.negative
+    wipeFree(w.*.allocator, w.*.limbs, w.*.capacity)
+    w.*.limbs = out
+    w.*.capacity = count
+    w.*.used = used
+    w.*.negative = negative
+    return true
+}
+
+pub fn setBit(m: *Mpi, n: usize) -> bool {
+    const limb = n / 64
+    if !reserve(m, limb + 1) { return false }
+    var index = m.*.used
+    while index <= limb {
+        m.*.limbs[index] = 0
+        index += 1
+    }
+    m.*.limbs[limb] = m.*.limbs[limb] | (@intCast(u64, 1) << @intCast(u64, n % 64))
+    if limb + 1 > m.*.used { m.*.used = limb + 1 }
+    return true
+}
+
+pub fn clearBit(m: *Mpi, n: usize) -> void {
+    const limb = n / 64
+    if limb >= m.*.used { return }
+    m.*.limbs[limb] = m.*.limbs[limb] & ((@intCast(u64, 1) << @intCast(u64, n % 64)) ^ 18446744073709551615)
+    m.*.used = significant(m.*.limbs, m.*.used)
+    if m.*.used == 0 { m.*.negative = false }
+}
+
+// Bit n and every bit above it cleared.
+pub fn clearHigh(m: *Mpi, n: usize) -> void {
+    const limb = n / 64
+    if limb >= m.*.used { return }
+    m.*.limbs[limb] = m.*.limbs[limb] & ((@intCast(u64, 1) << @intCast(u64, n % 64)) -% 1)
+    m.*.used = significant(m.*.limbs, limb + 1)
+    if m.*.used == 0 { m.*.negative = false }
+}
+
+pub fn shiftLeft(w: *Mpi, u: *const Mpi, bits: usize) -> bool {
+    const an = u.*.used
+    const count = an + bits / 64 + 1
+    const limbs = fresh(w.*.allocator, count)
+    if limbs == null { return false }
+    shiftLeftLimbs(limbs.?, u.*.limbs, an, bits)
+    install(w, limbs.?, count, count, u.*.negative)
+    return true
+}
+
+// The magnitude shifted right (toward zero).
+pub fn shiftRight(w: *Mpi, u: *const Mpi, bits: usize) -> bool {
+    const an = u.*.used
+    const capacity = if an == 0 { 1 } else { an }
+    const limbs = fresh(w.*.allocator, capacity)
+    if limbs == null { return false }
+    shiftRightLimbs(limbs.?, an, u.*.limbs, an, bits)
+    install(w, limbs.?, an, capacity, u.*.negative)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Modular arithmetic
+
+// w = b^e mod m (e's sign ignored, m's too). An odd m of up to 4096 bits
+// goes by Montgomery's ladder in constant time (a secret exponent is safe
+// there); any other by squaring and multiplying with divisions.
+pub fn powm(w: *Mpi, b: *const Mpi, e: *const Mpi, m: *const Mpi) -> bool {
+    return power(w, b, e, m, false)
+}
+
+// The same where the exponent's timing may show (a public exponent, a
+// prime candidate's test): four bits at a time, a quarter of the work.
+pub fn powmPublic(w: *Mpi, b: *const Mpi, e: *const Mpi, m: *const Mpi) -> bool {
+    return power(w, b, e, m, true)
+}
+
+fn power(w: *Mpi, b: *const Mpi, e: *const Mpi, m: *const Mpi, public: bool) -> bool {
+    const n = m.*.used
+    if n == 0 { return false }
+    const allocator = w.*.allocator
+    if n == 1 && m.*.limbs[0] == 1 { return assignLimbs(w, m.*.limbs, 0, false) }
+    var modulusValue: Mpi = undefined
+    init(&modulusValue, allocator)
+    if !set(&modulusValue, m) { return false }
+    modulusValue.negative = false
+    // The base in [0, |m|).
+    var base: Mpi = undefined
+    init(&base, allocator)
+    var ok = mod(&base, b, &modulusValue)
+    const ebits = bitLength(e)
+    if ok && (m.*.limbs[0] & 1) == 1 && n <= bignum.MAX_LIMBS {
+        const storage = fresh(allocator, 3 * n)
+        const scratch = fresh(allocator, 3 * n)
+        const table = if public { fresh(allocator, 16 * n) } else { fresh(allocator, 1) }
+        // (A modulus of more than 4096 bits works in scratch of its own.)
+        const workLimbs = if n > bignum.STACK_LIMBS { bignum.scratchLimbs(n) } else { 1 }
+        const work = fresh(allocator, workLimbs)
+        if storage == null || scratch == null || table == null || work == null {
+            ok = false
+        } else {
+            var modulus: bignum.Modulus = undefined
+            bignum.modulusStorage(&modulus, storage.?, n)
+            if n > bignum.STACK_LIMBS { bignum.modulusScratch(&modulus, work.?) }
+            bignum.copy(modulus.m, m.*.limbs, n)
+            if bignum.modulusSet(&modulus, n) {
+                const value: [*]u64 = scratch.?
+                const result: [*]u64 = scratch.? + n
+                bignum.zero(value, n)
+                bignum.copy(value, base.limbs, base.used)
+                bignum.toMontgomery(&modulus, value, value)
+                var exponentLimbs: [*]const u64 = e.*.limbs
+                var one: [1]u64 = [1]u64{ 0 }
+                if e.*.used == 0 { exponentLimbs = &one }
+                if public {
+                    bignum.montExpWindow(&modulus, result, value, exponentLimbs, ebits, table.?)
+                } else {
+                    bignum.montExp(&modulus, result, value, exponentLimbs, ebits)
+                }
+                bignum.fromMontgomery(&modulus, result, result)
+                ok = assignLimbs(w, result, n, false)
+            } else {
+                ok = false
+            }
+        }
+        if storage != null { wipeFree(allocator, storage.?, 3 * n) }
+        if scratch != null { wipeFree(allocator, scratch.?, 3 * n) }
+        if table != null { wipeFree(allocator, table.?, if public { 16 * n } else { 1 }) }
+        if work != null { wipeFree(allocator, work.?, workLimbs) }
+    } else if ok {
+        var result: Mpi = undefined
+        init(&result, allocator)
+        ok = setU64(&result, 1)
+        var position = ebits
+        while ok && position > 0 {
+            position -= 1
+            ok = mul(&result, &result, &result) && mod(&result, &result, &modulusValue)
+            if ok && testBit(e, position) {
+                ok = mul(&result, &result, &base) && mod(&result, &result, &modulusValue)
+            }
+        }
+        if ok { ok = set(w, &result) }
+        deinit(&result)
+    }
+    deinit(&base)
+    deinit(&modulusValue)
+    return ok
+}
+
+// g = gcd(|a|, |b|).
+pub fn gcd(g: *Mpi, a: *const Mpi, b: *const Mpi) -> bool {
+    const allocator = g.*.allocator
+    var x: Mpi = undefined
+    var y: Mpi = undefined
+    var t: Mpi = undefined
+    init(&x, allocator)
+    init(&y, allocator)
+    init(&t, allocator)
+    var ok = set(&x, a) && set(&y, b)
+    x.negative = false
+    y.negative = false
+    while ok && y.used != 0 {
+        ok = mod(&t, &x, &y) && set(&x, &y) && set(&y, &t)
+    }
+    if ok { ok = set(g, &x) }
+    deinit(&x)
+    deinit(&y)
+    deinit(&t)
+    return ok
+}
+
+// x = |a|^-1 mod |n|; false when there is none (or no memory).
+pub fn invm(x: *Mpi, a: *const Mpi, n: *const Mpi) -> bool {
+    if a.*.used == 0 || n.*.used == 0 || compareU64(n, 1) == 0 { return false }
+    const allocator = x.*.allocator
+    var modulus: Mpi = undefined
+    var r0: Mpi = undefined
+    var r1: Mpi = undefined
+    var s0: Mpi = undefined
+    var s1: Mpi = undefined
+    var quotient: Mpi = undefined
+    var product: Mpi = undefined
+    var remainder: Mpi = undefined
+    var value: Mpi = undefined
+    init(&modulus, allocator)
+    init(&r0, allocator)
+    init(&r1, allocator)
+    init(&s0, allocator)
+    init(&s1, allocator)
+    init(&quotient, allocator)
+    init(&product, allocator)
+    init(&remainder, allocator)
+    init(&value, allocator)
+    var ok = set(&modulus, n) && set(&value, a)
+    modulus.negative = false
+    value.negative = false
+    if ok { ok = set(&r1, &modulus) && mod(&r0, &value, &modulus) && setU64(&s0, 1) }
+    // r0 = s0 * a (mod n) and r1 = s1 * a (mod n) throughout.
+    while ok && r1.used != 0 {
+        ok = divRem(&quotient, &remainder, &r0, &r1) && set(&r0, &r1) && set(&r1, &remainder) && mul(&product, &quotient, &s1) && sub(&product, &s0, &product) && set(&s0, &s1) && set(&s1, &product)
+    }
+    var found = ok && compareU64(&r0, 1) == 0
+    if found { found = mod(x, &s0, &modulus) }
+    deinit(&modulus)
+    deinit(&r0)
+    deinit(&r1)
+    deinit(&s0)
+    deinit(&s1)
+    deinit(&quotient)
+    deinit(&product)
+    deinit(&remainder)
+    deinit(&value)
+    return found
+}
+
+// ---------------------------------------------------------------------------
+// Text
+
+fn hexValue(byte: u8) -> u64 {
+    if byte >= '0' && byte <= '9' { return @intCast(u64, byte - '0') }
+    if byte >= 'a' && byte <= 'f' { return @intCast(u64, byte - 'a' + 10) }
+    if byte >= 'A' && byte <= 'F' { return @intCast(u64, byte - 'A' + 10) }
+    return 16
+}
+
+// w = the hexadecimal `text` ("-" before it for a negative number, "0x"
+// allowed, any number of digits); false for no digits or another
+// character.
+pub fn fromHex(w: *Mpi, text: []const u8) -> bool {
+    var at: usize = 0
+    var negative = false
+    if at < text.length && text[at] == '-' {
+        negative = true
+        at += 1
+    }
+    if at + 1 < text.length && text[at] == '0' && (text[at + 1] == 'x' || text[at + 1] == 'X') { at += 2 }
+    const digits = text.length - at
+    if digits == 0 { return false }
+    var index = at
+    while index < text.length {
+        if hexValue(text[index]) == 16 { return false }
+        index += 1
+    }
+    const count = (digits + 15) / 16
+    const limbs = fresh(w.*.allocator, count)
+    if limbs == null { return false }
+    const out = limbs.?
+    index = 0
+    while index < digits {
+        const digit = hexValue(text[text.length - 1 - index])
+        out[index / 16] = out[index / 16] | (digit << @intCast(u64, (index % 16) * 4))
+        index += 1
+    }
+    install(w, out, count, count, negative)
+    return true
+}
+
+// The number in upper-case hexadecimal, "-" before a negative one, "0"
+// for zero: the bytes written, 0 when `out` is too small.
+pub fn writeHex(m: *const Mpi, out: []u8) -> usize {
+    const bits = bitLength(m)
+    const digits = if bits == 0 { 1 } else { (bits + 3) / 4 }
+    const length = digits + (if m.*.negative { 1 } else { 0 })
+    if out.length < length { return 0 }
+    var at: usize = 0
+    if m.*.negative {
+        out[0] = '-'
+        at = 1
+    }
+    var index: usize = 0
+    while index < digits {
+        const position = digits - 1 - index
+        const limb = index / 16
+        var value: u64 = 0
+        if limb < m.*.used { value = (m.*.limbs[limb] >> @intCast(u64, (index % 16) * 4)) & 15 }
+        out[at + position] = if value < 10 { @intCast(u8, 48 + value) } else { @intCast(u8, 55 + value) }
+        index += 1
+    }
+    return length
+}
+
+// ---------------------------------------------------------------------------
+// Primes
+
+var smallPrimes: [564]u32 = undefined
+var smallPrimeCount: usize = 0
+
+// The odd primes below 4096 (564 of them), sieved once.
+fn primes() -> [*]const u32 {
+    if smallPrimeCount == 0 {
+        var sieve: [4096]u8 = undefined
+        var index: usize = 0
+        while index < 4096 {
+            sieve[index] = 0
+            index += 1
+        }
+        var count: usize = 0
+        var candidate: usize = 3
+        while candidate < 4096 {
+            if sieve[candidate] == 0 {
+                smallPrimes[count] = @intCast(u32, candidate)
+                count += 1
+                var multiple = candidate * candidate
+                while multiple < 4096 {
+                    sieve[multiple] = 1
+                    multiple += candidate
+                }
+            }
+            candidate += 2
+        }
+        smallPrimeCount = count
+    }
+    return &smallPrimes
+}
+
+// Whether |n| is prime as far as trial division by the primes below 4096
+// and Miller-Rabin with `rounds` random bases can tell (an error below
+// 4^-rounds); false too when memory ran out.
+pub fn isProbablePrime(n: *const Mpi, rounds: usize) -> bool {
+    if compareU64(n, 2) < 0 { return false }
+    if compareU64(n, 2) == 0 { return true }
+    if (n.*.limbs[0] & 1) == 0 { return false }
+    const table = primes()
+    var index: usize = 0
+    while index < smallPrimeCount {
+        const p = @intCast(u64, table[index])
+        if remainderU64(n, p) == 0 { return compareU64(n, p) == 0 }
+        index += 1
+    }
+    const allocator = n.*.allocator
+    var minusOne: Mpi = undefined
+    var r: Mpi = undefined
+    var base: Mpi = undefined
+    var x: Mpi = undefined
+    init(&minusOne, allocator)
+    init(&r, allocator)
+    init(&base, allocator)
+    init(&x, allocator)
+    var ok = subU64(&minusOne, n, 1)
+    // n - 1 = 2^s r, r odd.
+    var s: usize = 0
+    if ok { while !testBit(&minusOne, s) { s += 1 } }
+    if ok { ok = shiftRight(&r, &minusOne, s) }
+    const bytes = byteLength(n)
+    var scratch: [512]u8 = undefined
+    const room: usize = if bytes > 512 { 512 } else { bytes }
+    var prime = ok
+    var round: usize = 0
+    while ok && round < rounds && prime {
+        // A base in [2, n - 2].
+        if !random.fill(&scratch, room) { ok = false }
+        if ok { ok = fromBytes(&base, scratch[0..room]) && mod(&base, &base, &minusOne) }
+        if ok && compareU64(&base, 2) < 0 { ok = setU64(&base, 2) }
+        if ok { ok = powmPublic(&x, &base, &r, n) }
+        if ok && compareU64(&x, 1) != 0 && compare(&x, &minusOne) != 0 {
+            var witness = true
+            var step: usize = 1
+            while ok && step < s {
+                ok = mul(&x, &x, &x) && mod(&x, &x, n)
+                if ok && compare(&x, &minusOne) == 0 {
+                    witness = false
+                    break
+                }
+                step += 1
+            }
+            if witness { prime = false }
+        }
+        round += 1
+    }
+    deinit(&minusOne)
+    deinit(&r)
+    deinit(&base)
+    deinit(&x)
+    return ok && prime
+}
+
+// p = a random prime of exactly `bits` bits (its top two set, so that
+// two of them make a modulus of twice the bits) with gcd(p - 1, e) = 1:
+// from a random odd start, the next number no small prime divides (the
+// remainders of the start worked out once, then stepped by two), then
+// Miller-Rabin with five rounds. `bits` is at least 16 and at most 4096;
+// false for other sizes or no memory.
+pub fn generatePrime(p: *Mpi, bits: usize, e: *const Mpi) -> bool {
+    if bits < 16 || bits > 4096 { return false }
+    const table = primes()
+    const allocator = p.*.allocator
+    const bytes = (bits + 7) / 8
+    var scratch: [512]u8 = undefined
+    var remainders: [564]u64 = undefined
+    var start: Mpi = undefined
+    var candidate: Mpi = undefined
+    var minusOne: Mpi = undefined
+    var g: Mpi = undefined
+    init(&start, allocator)
+    init(&candidate, allocator)
+    init(&minusOne, allocator)
+    init(&g, allocator)
+    var ok = true
+    var found = false
+    while ok && !found {
+        if !random.fill(&scratch, bytes) { ok = false }
+        if ok { ok = fromBytes(&start, scratch[0..bytes]) }
+        if ok {
+            clearHigh(&start, bits)
+            ok = setBit(&start, bits - 1) && setBit(&start, bits - 2) && setBit(&start, 0)
+        }
+        var index: usize = 0
+        while ok && index < smallPrimeCount {
+            remainders[index] = remainderU64(&start, @intCast(u64, table[index]))
+            index += 1
+        }
+        var delta: u64 = 0
+        while ok && delta < 1048576 && !found {
+            var divisible = false
+            index = 0
+            while index < smallPrimeCount {
+                if (remainders[index] + delta) % @intCast(u64, table[index]) == 0 {
+                    divisible = true
+                    break
+                }
+                index += 1
+            }
+            if !divisible {
+                ok = addU64(&candidate, &start, delta) && subU64(&minusOne, &candidate, 1)
+                if ok && bitLength(&candidate) == bits {
+                    ok = gcd(&g, &minusOne, e)
+                    if ok && compareU64(&g, 1) == 0 && isProbablePrime(&candidate, 5) { found = true }
+                }
+            }
+            delta += 2
+        }
+    }
+    if found { found = set(p, &candidate) }
+    deinit(&start)
+    deinit(&candidate)
+    deinit(&minusOne)
+    deinit(&g)
+    return found
+}

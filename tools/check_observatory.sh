@@ -10,7 +10,9 @@
 #     connects to (the function is called from the other file); Escape
 #     clears; a click on a group in the sidebar selects the group, one on
 #     its check box leaves it out and the camera flies to what is shown;
-#   - drawn alike on the GPU (lavapipe) and on the CPU (MLX_CANVAS=cpu).
+#   - drawn alike on the GPU (lavapipe) and on the CPU (MLX_CANVAS=cpu);
+#   - Memory under Findings reads a program's memory as std.leaks writes
+#     it: its places on the tree's functions, its blocks and the holes.
 # The app runs under tools/wayland-test-host; MLX_CODEMAP_TRACE makes it
 # say what it read and selected.
 #
@@ -140,8 +142,8 @@ if command -v git > /dev/null; then
     # The workarounds at both commits (each counted from git archive and
     # kept in the cache, where the app finds them).
     HOME="$work" XDG_CACHE_HOME= "$work/mlx-observatory" -C "$tree" history > "$work/history.txt" 2> /dev/null
-    [[ $(grep -c "^20[0-9-]* [0-9a-f]\{7\}  2 0 1 1 0 0 0 0 0 0$" "$work/history.txt") -eq 2 ]] \
-        && grep -q "^▄▄ 1 Array casts$" "$work/history.txt" && [[ $(wc -l < "$work/.cache/mlx/codemap/workarounds-v1") -eq 2 ]] \
+    [[ $(grep -c "^20[0-9-]* [0-9a-f]\{7\}  2 0 1 1 0 0 0 0 0 0 0 0 0$" "$work/history.txt") -eq 2 ]] \
+        && grep -q "^▄▄ 1 Array casts$" "$work/history.txt" && [[ $(wc -l < "$work/.cache/mlx/codemap/workarounds-v2") -eq 2 ]] \
         || fail "history should count the two workarounds at both commits and keep them" "$work/history.txt"
     echo "ok   the command line: history (workarounds per commit)"
     "$work/mlx-observatory" -C "$tree" diff HEAD~1 > "$work/diff.txt"
@@ -203,8 +205,12 @@ status=0
 [[ ! -s "$work/rewrite.txt" ]] || fail "no workaround should be left after the rewrites" "$work/rewrite.txt"
 echo "ok   the command line: rewrite dropped and counted (preview, --apply)"
 
-# The app: at 1180x760 the sidebar's group rows are 26 apart from y 106
-# (Alles, app, lib), under the view switch.
+# The app at 1180x760, its sidebar from the top: Programs (the row at y
+# 55, opened its choices 20 apart from y 78; under it the explorer's rows
+# 20 apart from y 78: app, lib), View, then the group rows 26 apart from
+# y 219 (Alles, app, lib) and Color by with Machine code at y 717.
+# Selecting greet opens lib in the explorer; a click on lib closes it
+# again, so the rows below are where they were.
 cat > "$work/app.script" <<SCRIPT
 wait 4000
 shot SHOTS/start.ppm
@@ -220,26 +226,30 @@ wait 300
 down 1
 up 1
 wait 1500
-pointer 60 145
+pointer 100 99
+press 272
+release 272
+wait 300
+pointer 60 245
 wait 200
 press 272
 release 272
 wait 4000
 shot SHOTS/group.ppm
-pointer 20 171
+pointer 20 271
 wait 200
 press 272
 release 272
 wait 1000
-pointer 100 648
+pointer 100 717
 press 272
 release 272
 wait 500
-pointer 100 229
+pointer 100 55
 press 272
 release 272
 wait 500
-pointer 100 272
+pointer 100 98
 press 272
 release 272
 wait 2000
@@ -258,13 +268,18 @@ pointer 700 67
 press 272
 release 272
 wait 800
-pointer 100 90
+pointer 100 211
 press 272
 release 272
 wait 300
 press 272
 release 272
 wait 300
+pointer 100 98
+press 272
+release 272
+wait 1000
+shot SHOTS/explorer.ppm
 close
 SCRIPT
 
@@ -301,13 +316,13 @@ run() {
     grep -A1 "^codemap: selected tree/app/$" "$log" | grep -q "^codemap: related out 1 in 1$" || fail "codemap ($name): the app group should depend on the lib group (and lib/bad.mlx on app)" "$log"
     # Its check box leaves lib out: its declarations, and the workarounds
     # in it; the crash (through main in app) stays.
-    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0 [0-9]*$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
-    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1 [0-9]* [0-9]* [0-9]* 0 [0-9]* 0 [0-9]*$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0 [0-9]* [0-9]*$" "$log" || fail "codemap ($name): at first everything is shown" "$log"
+    grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 0 1 [0-9]* [0-9]* [0-9]* 0 [0-9]* 0 [0-9]* [0-9]*$" "$log" || fail "codemap ($name): the lib group's check box did not leave it out" "$log"
     grep -q "^codemap: flying to tree/app/$" "$log" || fail "codemap ($name): the camera did not fly to the group still shown" "$log"
     if [[ -n "${have_git:-}" ]]; then
         grep -q "^codemap: trend 2 commits, counted 2$" "$log" || fail "codemap ($name): the workarounds of both commits (history) are not read" "$log"
         grep -q "^codemap: diff since HEAD~1: 0 added, 1 changed, 0 removed$" "$log" || fail "codemap ($name): greet should be changed since HEAD~1" "$log"
-        grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0 1$" "$log" || fail "codemap ($name): the finding Changed should hold greet" "$log"
+        grep -q "^codemap: shown [0-9]* nodes, findings 0 0 [0-9]* 2 1 [0-9]* [0-9]* [0-9]* 2 [0-9]* 0 1 [0-9]*$" "$log" || fail "codemap ($name): the finding Changed should hold greet" "$log"
     fi
     # A query in the search: of the functions calling greet only main is
     # left (lib is left out, and the program app is shown).
@@ -317,6 +332,12 @@ run() {
     grep -q "^codemap: view saved Ansicht [0-9]*$" "$log" || fail "codemap ($name): the bookmark did not keep the query as a view" "$log"
     grep -q "^codemap: filter word " "$log" || fail "codemap ($name): the filter's first word was not added" "$log"
     grep -q "^codemap: section 0 folded$" "$log" && grep -q "^codemap: section 0 opened$" "$log" || fail "codemap ($name): the heading Groups did not fold up and open" "$log"
+    # The explorer: selecting greet opened lib, a click closes it; with
+    # the program app chosen the way to its main file is open, and a click
+    # on main.mlx selects the file.
+    grep -q "^codemap: explorer closed lib$" "$log" || fail "codemap ($name): the explorer's lib did not close with a click" "$log"
+    grep -q "^codemap: explorer file main.mlx$" "$log" && grep -q "^codemap: selected tree/app/main.mlx/$" "$log" \
+        || fail "codemap ($name): a click on main.mlx in the explorer did not select it" "$log"
     python3 - "$shots/start.ppm" "$shots/selected.ppm" <<'PY' || fail "codemap ($name): the view or the detail panel is not drawn" "$log"
 import sys
 def load(path):
@@ -368,6 +389,13 @@ search kind:fn calls:greet
 settle
 shot query
 escape
+finding memory
+settle
+shot memory
+finding hot
+settle
+shot hot
+finding none
 select lib/helper.mlx/greet
 record flight 3 100
 open app/main.mlx 5
@@ -506,6 +534,14 @@ pub fn drop() -> void {
 MLX
 printf 'wait 120000\nclose\n' > "$work/hold.script"
 runtime=$(mktemp -d)
+# A program's memory as std.leaks writes it: two places on the tree's
+# functions, three blocks with two holes between their mappings.
+mkdir -p "$runtime/mlx/memory"
+printf 'memory\tprogram\t4242\t1791800000\t12\t4\t3\t9000\t12288\t16384\t65536\t2048\nplace\t0\t2\t8000\t8192\t2\t0\tlib/helper.mlx:4:greet\t_start\nplace\t1\t1\t1000\t4096\t0\t0\tlib/extra.mlx:3:twice\t_start\nblock\t7f0000000000\t4000\t0\t1\nblock\t7f0000003000\t4000\t0\t1\nblock\t7f0000010000\t1000\t1\t0\nmap\t7f0000000000\t7f0000001000\trw-p\t\nmap\t7f0000003000\t7f0000004000\trw-p\t\nmap\t7f0000010000\t7f0000011000\trw-p\t\ngpu\tTest GPU\t4096\t2\t3\t1\ngpu-heap\t0\t268435456\t1\ngpu-heap\t1\t1073741824\t0\ngpu-type\t0\t0\t1\ngpu-type\t1\t1\t6\ngpu-place\t0\t2\t5000\t8192\tlib/helper.mlx:4:greet\t_start\ngpu-block\tabc0\t1000\t4096\t0\t0\t0\ngpu-block\tdef0\t4000\t4096\t1\t0\t0\n' > "$runtime/mlx/memory/program-4242.memory"
+# Its frames as std.diagnostics writes them: ten, the fifth a spike, two
+# over a 60 Hz frame.
+mkdir -p "$runtime/mlx/frames"
+printf 'frames\tprogram\t4242\t1791800000\t10\t250000\nframe\t1\t0\t2000\t1000\nframe\t2\t16000\t2100\t900\nframe\t3\t32000\t1900\t1100\nframe\t4\t48000\t2000\t1000\nframe\t5\t64000\t30000\t1000\nframe\t6\t96000\t2000\t20000\nframe\t7\t112000\t2200\t1000\nframe\t8\t128000\t1800\t1000\nframe\t9\t144000\t2000\t1200\nframe\t10\t160000\t2000\t1000\n' > "$runtime/mlx/frames/program-4242.frames"
 XDG_RUNTIME_DIR=$runtime "$work/test-host" host-demo "$work/us.xkb" "$work/hold.script" > "$work/demo-host.log" 2>&1 &
 host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$runtime/host-demo" ]] && break; sleep 0.1; done
@@ -517,9 +553,11 @@ kill "$host_pid" 2> /dev/null || true
 wait "$host_pid" 2> /dev/null || true
 rm -rf -- "$runtime"
 [[ $status -eq 0 ]] || fail "codemap (demo): the app exited with status $status" "$work/demo.log"
-for picture in start query flight-000 flight-001 flight-002; do
+for picture in start query memory hot flight-000 flight-001 flight-002; do
     head -c 15 "$work/demo/$picture.ppm" 2> /dev/null | grep -q "^P6$" || fail "codemap (demo): $picture.ppm is missing" "$work/demo.log"
 done
+grep -q "^codemap: memory program pid 4242: 2 places, 2 on declarations, 3 blocks, 2 holes, 2 GPU blocks in 1 places$" "$work/demo.log" || fail "codemap (demo): Memory did not read the program's memory (with its GPU's)" "$work/demo.log"
+grep -q "^codemap: frames program pid 4242: 10 frames, 2 spikes, 2 over budget$" "$work/demo.log" || fail "codemap (demo): Hot did not read the program's frames" "$work/demo.log"
 grep -q "^codemap: query kind:fn calls:greet: 2 declarations$" "$work/demo.log" || fail "codemap (demo): the query step did not run" "$work/demo.log"
 cmp -s "$work/demo/flight-000.ppm" "$work/demo/flight-002.ppm" && fail "codemap (demo): the recorded flight does not move" "$work/demo.log"
 echo "ok   codemap (demo): a script played, its frames written"

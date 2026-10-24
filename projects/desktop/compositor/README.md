@@ -11,7 +11,9 @@ A Wayland compositor written in Mlx with `std.wayland`. It runs either
 Either way it is a compositor in its own right: programs started with its
 `WAYLAND_DISPLAY` appear as windows inside it. It picks nested when it is
 started inside a Wayland session, freestanding otherwise (`--backend
-nested|drm` decides).
+nested|drm` decides). Freestanding, it first tells the boot splash
+(mlx-splash or plymouthd) to quit leaving its last frame, so the monitor
+goes from the splash to the desktop with no text console in between.
 
 - Keyboard and pointer go to the clients: the pointer to the window under
   it, a click focuses and raises a window, and keys go to the focused
@@ -101,7 +103,8 @@ WAYLAND_DISPLAY=wayland-mlx dbus-run-session nautilus
 Options: `--socket NAME`, `--size WxH`, `--fullscreen` (a fullscreen
 window at the monitor's resolution), `--renderer auto|vulkan|cpu` (default
 `auto`: Vulkan when a driver works, else the CPU), `--font PATH|none`,
-`--terminal PROGRAM`, `--launcher PROGRAM|none` (what Super starts),
+`--terminal PROGRAM`, `--greeter PROGRAM` (the restricted login-screen
+mode described below), `--launcher PROGRAM|none` (what Super starts),
 `--dock PROGRAM|none` (the dock, kept running), `--topbar PROGRAM|none`
 (the top bar, kept running), `--xwayland PROGRAM|none` (X programs, see
 X programs), `--run PROGRAM`
@@ -113,6 +116,24 @@ frame takes to compose and present).
 Each title bar shows the window's frames per second (the buffers it
 committed) and the desktop's (frames shown). Shown frames follow the
 monitor: at 60 Hz the desktop shows at most 60.
+
+## Greeter mode
+
+`--greeter PROGRAM` makes one compositor instance a login screen instead
+of a desktop session. It starts `PROGRAM` over a private `WAYLAND_SOCKET`
+connection adopted directly by the server. That connection, rather than a
+forgeable title or app id, identifies the trusted greeter client. Other
+clients may connect to the public display socket, but none of their
+surfaces are drawn, focused or hit-tested; keyboard and pointer input stay
+with the greeter and its popups.
+
+Greeter mode ignores `--run` programs and disables the terminal shortcut,
+launcher, dock, top bar, Xwayland, workspace hotkeys and touchpad
+workspace gestures. The only compositor shortcut left is
+Ctrl+Alt+F1..F12 on the freestanding backend, so recovery through another
+VT remains possible. When the greeter process exits, the compositor exits
+too and relinquishes DRM; the login service owns the larger lifecycle and
+starts a new greeter after a user session ends.
 
 ## Dock and launcher
 
@@ -186,6 +207,20 @@ click on one brings its window forward (a minimized one comes back), a
 click anywhere else, Escape or a second click on the icon closes them.
 The thumbnails follow their windows as they draw.
 
+Resting the pointer on the icon of an app that runs (600 ms) brings the
+same panel up over that icon, one window or several (the dock's
+`hover.mlx`; message `h`: the handles' object ids and the icon's middle
+on the dock). The panel sits 20 pixels higher than the clicked one so the
+grown icon stays clear. While it shows, the pointer on another icon swaps
+in that app's windows at once and an icon without windows takes it away.
+It stays while the pointer is on it, on the dock's bar or in between, and
+closes when the pointer leaves all three; then the compositor tells the
+dock (message `v`), which waits on another icon before asking again. A
+click on the icon brings the app's next window forward and closes the
+panel (the compositor leaves that click to the dock), a right click opens
+the menu in its place. `dock_hover` in `tools/check_desktop_clients.sh`
+plays this through.
+
 A right click on a dock icon opens its menu (an xdg_popup on the dock's
 layer surface): the app's own actions from its desktop entry (Firefox's
 "New Window" and "New Private Window"; an app without any gets "New
@@ -228,11 +263,31 @@ crash, it says where first (`mlx-dock: crashed: ...` and the functions,
 in the compositor's log), as the compositor does, and keeps the crash
 for MLX Observatory.
 
-With `dock-autohide = on` (mlx-settings: "Auto-hide dock") the dock
+With `dock-autohide = on` (mlx-settings: "Always hide") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
-back up when the pointer touches the output's bottom edge; it stays while
-its previews show or a button is held.
+back up when the pointer touches the output's bottom edge (a drag too,
+so files can be dropped on it); it stays while its previews show, its
+menu or a folder's stack is open, or a button is held. With
+`dock-autohide = smart`
+("Hide when a window is in the way") it does the same, but only goes
+while a window of the workspace shown (its frame and title bar) overlaps
+the dock's bar, and comes back by itself once no window does (`dock:
+nothing in its way` in the log).
+
+With `dock-workspaces = on` (mlx-settings: General, Dock, "Group by
+workspace"; off by default) the dock groups the apps that run by the
+workspace their windows are on: after the pinned apps, which stay as
+they are, comes a group per workspace with windows, the first workspace
+first, each behind a separator that carries the workspace's number like
+the top bar's buttons (the one shown lit). An app with windows on two
+workspaces is in both groups; a click on it brings its window on that
+workspace (and so that workspace), its previews and "Close" take only
+those windows. The foreign-toplevel protocol says nothing of
+workspaces, so the compositor tells the dock on its socket pair: `w`,
+whether to group, the workspace shown, a count and per window the
+dock's handle object id (u32) and its workspace (u8), sent whenever any
+of it changed.
 
 The top bar (`mlx-topbar`, `--topbar PROGRAM|none`, started and kept
 running like the dock over `MLX_TOPBAR_FD`) sits in the top layer along
@@ -379,13 +434,17 @@ people count ("Project 2" before "Project 10"). A click selects (Ctrl
 adds, Shift a range, a rectangle dragged over empty space selects what it
 touches), a double click or Enter opens (a file with `xdg-open`). F2
 renames (the name before its extension selected), Ctrl+Shift+N makes a
-folder, Delete moves to the trash (`gio trash`), Ctrl+C, Ctrl+X and
+folder, Delete moves to the trash (its own, in the freedesktop layout), Ctrl+C, Ctrl+X and
 Ctrl+V copy, cut and paste within it, Ctrl+F searches, Ctrl+H shows hidden
 files, Backspace or Alt+Left goes back, Alt+Up to the parent; typing jumps
 to a name. The right-click menu offers these, "Add to Dock" for a folder,
 "Open in Terminal", and in the trash "Put Back" and "Delete Immediately".
 Files dragged out go as `text/uri-list` (onto the dock's trash, into
-another folder); files dropped in are copied, its own moved. It reads a
+another folder); files dropped in are copied, its own moved: onto a
+folder, a place in the sidebar or a part of the path in the status bar
+they go into it (outlined while the drag is over it), onto the sidebar's
+Trash into the trash. A folder is never copied into itself or a folder
+inside it (that copy would never end; the status bar says so). It reads a
 folder again within a second when it changes, and its labels and dates
 follow the locale. `mlx-files PATH`, `file://` URIs and `trash:///` open
 it where asked; the dock opens its folders and the trash in it when it is
@@ -521,6 +580,14 @@ memfd), once more copying each frame in, as on drivers that cannot import
 them, and once more with the first frame made to look missing from the
 buffer, after which the renderer must copy.
 
+Every device descriptor is made nonblocking when the compositor takes it
+([`device.mlx`](device.mlx)), whoever opened it: the event loop reads the
+card and the input devices until EAGAIN, systemd-logind hands them over
+nonblocking, and a session manager that does not would leave the
+compositor waiting in read(2) for a page flip after its first frame,
+deaf to clients and keys. `tools/check_compositor_device.sh` checks it
+with a blocking pipe in place of the card.
+
 ## Desktop session (GDM, SDDM)
 
 `install_compositor.sh` at the repository root builds the compositor and
@@ -541,19 +608,31 @@ connected connectors, the `video` and `input` groups (needed only without
 logind), the Vulkan drivers, the XKB data, and the last session log,
 whose `modeset failed`, `crashed:` or `killed by signal` lines it points
 out. It wraps `tools/install_compositor_session.sh`, which does the
-building and copying (`--prefix`, default `/usr/local` there; `--destdir`
+building and copying (`--prefix`, default `/usr` there too; `--destdir`
 stages for packaging; `--build-only` builds into `mlx-out/session`). The
-build uses the canonical compiler, `mlx-out/bin/compiler/mlx4`, and makes
-it first from the bootstrap-built `zig-out/bin/mlx1` when it is missing
-(`mlx1 -> mlx2 -> mlx3`, the self-hosted compiler's fixed point): that
-compiler builds the same binary from the same sources on every machine,
-so the checksum `--check` prints matches a build elsewhere, and a crash
-address from one machine finds its place in another's disassembly.
+programs come from `./mlx build desktop client-libraries`
+([`build.mlx`](../../../build.mlx)), which builds a program only when a
+module it reads changed, the jobs side by side: a reinstall with nothing
+changed builds nothing. It uses the canonical compiler,
+`mlx-out/bin/compiler/mlx4`, made first from the bootstrap-built
+`zig-out/bin/mlx1` when it is missing (`mlx1 -> mlx2 -> mlx3`, the
+self-hosted compiler's fixed point): that compiler builds the same binary
+from the same sources on every machine, so the checksum `--check` prints
+matches a build elsewhere, and a crash address from one machine finds its
+place in another's disassembly. `--compiler PATH` compiles everything with
+another compiler instead.
 
-It puts `mlx-compositor`, `mlx-terminal` and `mlx-session` into
-`/usr/local/bin` (`--prefix`) and `mlx-compositor.desktop` into
-`/usr/share/wayland-sessions` (`--sessions`), where both display managers
-look; `--destdir` stages everything for packaging, `--build-only` only
+It puts `mlx-compositor`, `mlx-terminal`, `mlx-session` and the other
+programs into `/usr/bin/mlx` (`PREFIX/bin/mlx`, `--prefix`, default
+`/usr`), a directory of their own that the installation puts on PATH
+after the system's directories wherever a PATH comes from: login shells,
+the user session, the system services, sudo, su and the console login,
+PAM sessions and fish (the files are listed in
+[`tools/lib/mlx_layout.sh`](../../../tools/lib/mlx_layout.sh)), and
+`mlx-compositor.desktop` into `/usr/share/wayland-sessions`
+(`--sessions`), where both display managers look; programs from installs
+before that layout (in `/usr/local/bin` or `/usr/bin`) are listed by
+`tools/remove_old_mlx_layout.sh` and removed with `--remove`; `--destdir` stages everything for packaging, `--build-only` only
 builds (into `mlx-out/session`). Then log out and pick "Mlx Compositor":
 in GDM with the gear button once your user is chosen, in SDDM in the
 session menu.
@@ -657,7 +736,7 @@ display-mode = auto
 night-light = off
 night-light-temperature = 4000
 # The screen locker the lock hotkey and the top bar's session menu run.
-lock-command = swaylock
+lock-command = mlx-lock
 ```
 
 [`projects/desktop/settings`](../settings/main.mlx) changes them, in a
@@ -998,7 +1077,73 @@ version 1 (see Pointer lock), `ext_foreign_toplevel_list_v1`,
 `ext_foreign_toplevel_image_capture_source_manager_v1` and
 `ext_image_copy_capture_manager_v1` version 1 (see Screen capture),
 `xwayland_shell_v1` version 1 (to Xwayland alone; see X programs),
-`ext_session_lock_manager_v1` version 1 (see Locking and logging out).
+`ext_session_lock_manager_v1` version 1 (see Locking and logging out),
+`zwp_primary_selection_device_manager_v1` version 1 (see Copy and paste),
+`zxdg_output_manager_v1` version 3 (the output's logical position, size
+and name), `zwp_idle_inhibit_manager_v1` version 1 (a surface keeps the
+screen on while it is mapped: `idle inhibit: on` and `off` in the log)
+and `xdg_activation_v1` version 1 ([`extras.mlx`](extras.mlx)). An
+activation token is good only when the program asking for it had the
+keyboard (or is a part of the desktop in a layer: the dock, the
+launcher), for ten seconds and once, so a program cannot take the focus
+by itself; a window it names comes forward (to its workspace,
+`activation: TITLE`), any other use is `activation: refused`.
+`wp_viewporter`, `wp_fractional_scale_manager_v1` and
+`wp_single_pixel_buffer_manager_v1` version 1
+([`viewport.mlx`](viewport.mlx)) size surfaces apart from their buffers:
+a viewport crops a surface's buffer (`viewport: crop WxH at X,Y`) and
+scales it to a size (`viewport: size WxH`), applied with the next commit
+([`buffers.mlx`](buffers.mlx)), also without a new buffer; the preferred
+scale is always 120 (the output's scale is 1), so GTK 4, Qt and Firefox
+draw at 1 and size their surfaces through a viewport; a one-pixel buffer
+is an shm buffer in the compositor's own memory, for a viewport to
+stretch. Both renderers scale alike, each pixel the mean of 4x4 samples
+over the part of the crop it covers (on the CPU into the surface's
+pixels when it commits, on the GPU by the shrink shader into a copy of
+the surface's), so a scaled video or a game drawn at a lower resolution
+looks the same on either. A crop reaching outside the buffer, one of a
+fraction of a pixel without a size and a second viewport for a surface
+end the client, as the protocol says. `wp_cursor_shape_manager_v1`
+version 2 ([`pointer.mlx`](pointer.mlx)) lets a client name its cursor
+instead of drawing one: while it has the pointer the compositor draws the
+closest of its own ([`cursors.mlx`](cursors.mlx): the arrow, an I-beam,
+a pointing hand, the resize and move arrows, a crosshair, a no-entry sign
+and an hourglass, the same pixels on either renderer), for the latest
+enter as with `wl_pointer.set_cursor` (`cursor shape: N`); a shape there
+is not ends the client. `wp_presentation` version 1
+([`presentation.mlx`](presentation.mlx)) tells a client when a commit's
+content reached the screen: presented with the time on the monotonic
+clock, the output's refresh period and the frame's number (vsync when
+the frame came from a DRM page flip), or discarded when another commit
+replaced it before a frame showed it or the surface showed nothing.
+
+A window may belong to another (`xdg_toplevel.set_parent`,
+[`dialogs.mlx`](dialogs.mlx)): such a dialog opens centred over its
+parent, on the parent's workspace and outside the tiling, and comes up
+with it whenever the parent is focused. `xdg_wm_dialog_v1` version 1
+(xdg-dialog) makes one modal (`dialog: modal TITLE`): focusing the parent,
+by a click, the dock or a hotkey, gives the keyboard to the dialog, as
+GNOME does. A window cannot be its own parent or its dialog's
+(`invalid_parent`); when a parent goes, its dialogs belong to its own
+parent. `zxdg_exporter_v2` and `zxdg_importer_v2` version 1
+([`foreign.mlx`](foreign.mlx), xdg-foreign) do the same across programs:
+one exports its window and gets a handle (32 random hex digits), another
+given it (a portal's file chooser, a sandboxed program's dialog) imports
+it and makes a window of its own that window's dialog (`foreign: TITLE
+over TITLE`); a handle there is not is destroyed at once, and when the
+exported window goes, so do its imports.
+`wp_tearing_control_manager_v1` and `wp_content_type_manager_v1`
+version 1 ([`hints.mlx`](hints.mlx)) take what a client says of its
+surface: that a game's frames may tear (`tearing: async TITLE`; frames
+are still shown at the vertical blank, which the protocol allows) and
+whether it shows a photo, a video or a game (`content: video TITLE`).
+`ext_idle_notifier_v1` version 2 ([`idle.mlx`](idle.mlx), ext-idle-notify)
+tells swayidle and screen lockers when the seat has had no input for the
+time they asked (`idle: idled`) and when input comes again (`idle:
+resumed`); a notification made with `get_idle_notification` waits while
+a mapped surface inhibits idling, one made with
+`get_input_idle_notification` looks at input alone. A greeter compositor
+offers none of these.
 Composition is done in software, or with Vulkan (`--renderer vulkan`).
 
 ### Locking and logging out
@@ -1016,7 +1161,7 @@ locker locks and unlocks it; a second locker while one lives is refused
 (`finished`).
 
 The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
-the program `lock-command` names in the settings file (`swaylock` by
+the program `lock-command` names in the settings file (`mlx-lock` by
 default; a name on `PATH` or a path). The session menu's Log Out asks the
 compositor (on the bar's channel) to close every window; it ends once
 they have, or after four seconds, and the session with it.
@@ -1354,9 +1499,9 @@ both, without xdg-desktop-portal and without a PipeWire daemon:
   no after two minutes). The app is named from its process (`std.appid`).
 - `OpenPipeWireRemote` hands the app one end of a socket pair; the other
   end speaks PipeWire's native protocol, version 3
-  ([`pipewire.mlx`](../capture/pipewire.mlx), on SPA pods from
-  [`pod.mlx`](../capture/pod.mlx)): the core, the client, a registry
-  with the session's nodes, and the client nodes apps create for their
+  ([`pipewire.mlx`](../capture/pipewire.mlx), on the numbers and SPA pods
+  of [`std.pipewire`](../../../std/src/pipewire.mlx)): the core, the
+  client, a registry with the session's nodes, and the client nodes apps create for their
   streams. A connection sees its session's screens and windows only.
 - Each stream ([`stream.mlx`](../capture/stream.mlx)) is linked as
   PipeWire's session manager would: the format (BGRx, or BGRA when the
@@ -1388,7 +1533,7 @@ have its size, a no shares nothing, Share in the picker shares, and with
 Firefox (`FIREFOX=PATH`) a page's `getDisplayMedia` shows the screen.
 
 The library the apps take the frames with has an Mlx stand-in too:
-[`projects/desktop/libpipewire`](../libpipewire/README.md) builds
+[`compiler/libc/pipewire`](../../../compiler/libc/pipewire/README.md) builds
 `libpipewire-0.3.so.0` (every function of libpipewire 1.0.5, PipeWire's
 protocol on the portal's socket), so PipeWire's `libpipewire-0.3-0` is not
 needed for sharing either; `tools/install_compositor_session.sh
@@ -1432,6 +1577,52 @@ wire protocol without libc or libxcb):
   windows.
 - Override-redirect windows (menus, drop-downs, tooltips) show where X puts
   them, above the windows, without a frame or the keyboard.
+- The clipboard is one for both ([`xwm_selection.mlx`](xwm_selection.mlx)).
+  When a Wayland client sets the selection, a window of the window
+  manager's owns `CLIPBOARD` and answers X programs: `TARGETS` from the
+  selection's types (interned as atoms; `UTF8_STRING`, `TEXT` and `STRING`
+  stand for `text/plain`), any other target read from the Wayland source
+  through a pipe the event loop watches and put on the requestor's
+  property (appended in parts past a request's size). When an X program
+  takes `CLIPBOARD` (XFixes tells), its `TARGETS` and their names are
+  read and an X source with the types Wayland clients know (text as
+  `text/plain;charset=utf-8` and `text/plain`, and the MIME types)
+  becomes the selection; a Wayland client reading it gets the conversion
+  written into its pipe, the property read in parts, or `INCR` part by
+  part. Copied files cross as `text/uri-list` and
+  `x-special/gnome-copied-files` like any type. The primary selection and
+  X's `PRIMARY` are kept one the same way (a middle click pastes what was
+  last selected in either), apart from the clipboard.
+- Drag and drop from Wayland to X goes by XDND version 5
+  ([`xwm_dnd.mlx`](xwm_dnd.mlx)): a Wayland drag over an X window is not
+  offered as data, the compositor is its XDND source instead. The
+  clipboard's window owns `XdndSelection` with the drag's types (served
+  like `CLIPBOARD`), the window under the pointer is asked for
+  `XdndAware` and, from version 3, gets `XdndEnter` (the types, more than
+  three in `XdndTypeList`), `XdndPosition` for each motion (the next once
+  its `XdndStatus` came), `XdndLeave` when the pointer goes and
+  `XdndDrop` on release when its last status took a type. Its status is
+  the Wayland source's (a type taken, copy or move), and its
+  `XdndFinished` ends the Wayland drag. A window without `XdndAware`
+  takes no drops; released there, the drag is cancelled.
+  `tools/x11-dnd-test target` is such an X window for the checks (`xdnd`
+  in `tools/check_desktop_clients.sh`).
+- From X to Wayland: an X program taking `XdndSelection` (XFixes tells)
+  begins a drag; its types are read (`XdndTypeList`, else those its
+  `XdndEnter` names). While its button is held the X window keeps the
+  pointer, as an X server's implicit grab would: motion goes on to
+  Xwayland outside the window, so the program keeps dragging. Off X
+  windows the window manager maps a proxy over the whole screen (input
+  only, `XdndAware`, on top), the program sends it XDND, and the
+  compositor drags an X source over the Wayland surfaces (`drag: started
+  from an X program`). Each `XdndPosition` is answered with the Wayland
+  target's acceptance; `XdndDrop` drops there, the target reads
+  `XdndSelection` like an X `CLIPBOARD` (in parts, or `INCR`), and its
+  finish is the program's `XdndFinished`. Over X windows again the proxy
+  is unmapped and X windows take the drag among themselves; let go there,
+  or where nothing takes it, the Wayland drag ends (`drag: ended by the X
+  program`). `tools/x11-dnd-test source URI` drags like this
+  (`xdnd_from_x` in the checks).
 
 `--xwayland PROGRAM` names another X server, `--xwayland none` runs none.
 The log (`--verbose`) says what happens:
@@ -1455,6 +1646,20 @@ refuses a display without it): the selection is the data source a client
 set last, the focused client receives it as a data offer (when it gains
 focus and when the selection changes), and reading an offer passes the
 reader's pipe to the source's client, which writes the data into it.
+The primary selection (`zwp_primary_selection_device_manager_v1`,
+[`primary.mlx`](primary.mlx)), the text last selected that a middle click
+pastes, goes the same way beside it; only the client with the keyboard
+can set it (`--verbose`: `primary selection: set`). A greeter compositor
+does not offer it.
+
+Clipboard tools without a window (wl-copy and wl-paste, clipboard
+managers) read and set both through `ext_data_control_manager_v1`
+version 1 and its forerunner `zwlr_data_control_manager_v1` version 2
+([`data_control.mlx`](data_control.mlx); wl-clipboard 2.2 speaks the
+latter): a tool's device hears every change of either selection, with an
+offer it reads like a client's, and its source set as a selection is read
+by windows and X programs alike (`data control: selection set`). A
+source is set once. A greeter compositor does not offer it.
 
 Drag and drop goes the same way. A client starts a drag while a button is
 held; until the buttons are up the pointer is the drag's (clients get no
@@ -1490,8 +1695,15 @@ finished`.
 - `shell.mlx`: the server side, with globals, surfaces, shared memory and
   xdg-shell. Its parts: `protocols.mlx` (layer shell, the window list for
   docks, decorations, blur regions), `windows.mlx` (focus, window states,
-  resizing, input delivery, mapping), `launching.mlx` (launching
-  programs) and `lock.mlx` (the session lock, logging out).
+  resizing, input delivery, mapping), `buffers.mlx` (what a commit does
+  with the buffer: copied or held, cropped and scaled by a viewport),
+  `viewport.mlx` (viewporter, fractional-scale, single-pixel-buffer),
+  `presentation.mlx` (presentation feedback), `data_control.mlx`
+  (clipboard tools), `dialogs.mlx` (windows of windows, modal dialogs),
+  `hints.mlx` (tearing and content-type hints), `idle.mlx` (idle
+  notifications), `foreign.mlx` (windows parented across programs),
+  `launching.mlx` (launching programs) and `lock.mlx` (the session lock,
+  logging out).
 - `dmabuf.mlx`: linux-dmabuf; each dma-buf becomes a one-buffer pool.
 - `data.mlx`: `wl_data_device_manager`, copy and paste and drag and drop
   between clients.
@@ -1500,13 +1712,22 @@ finished`.
 - `vulkan.mlx`: the Vulkan renderer.
 - `scene.mlx`: stacking (layers and windows), hit-testing, title bars,
   damage tracking, blur and software composition.
+- `cursors.mlx`: the cursors the compositor draws itself.
 - `state.mlx`: shared records and list helpers.
 - `settings.mlx`: the settings file; `display.mlx`: the output told for
   mlx-settings, and night light.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all
 of this with scripted input (`tools/wayland-test-host`) on either renderer,
+including an untrusted second client beside the private greeter. Set
+`MLX_WAYLAND_GREETER_ONLY=1` for just that focused scenario. The full check
+continues
 with copy and paste between two clients (`wl-copy`, `wl-paste`) and a GTK 4
 window (`gtk4-widget-factory`) when those are installed;
 `tools/check_vulkan_wayland.sh` checks the Vulkan client in both renderers
 over `wl_shm` and linux-dmabuf, pixel by pixel.
+`tools/check_wayland_protocols.sh [compiler]` runs one client each against
+the smaller protocols (viewports, cursor shapes, presentation feedback,
+dialogs and xdg-foreign, the tearing and content-type hints, idle
+notifications, data-control), on both renderers where pixels are
+compared.

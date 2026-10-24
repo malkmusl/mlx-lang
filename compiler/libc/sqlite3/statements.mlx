@@ -1,0 +1,521 @@
+// Statements: sqlite3_prepare and its variants (UTF-8 and UTF-16, with
+// the tail of the text), sqlite3_step, _reset and _finalize, the
+// sqlite3_bind_* family and the parameters' names, the sqlite3_column_*
+// family, and what can be asked about a statement (its text, expanded
+// text, whether it reads only, its counters).
+const c = @import("./common.mlx")
+const sql = @import("std.sql")
+
+const mem = c.mem
+const value = c.value
+const core = c.core
+const engine = c.engine
+const ast = @import("std.sql.ast")
+const values = @import("./values.mlx")
+
+const Value = value.Value
+
+const TRANSIENT: usize = 18446744073709551615
+
+fn databaseOf(st: *core.Statement) -> *core.Database { return core.database(st.*.db) }
+
+// ---------------------------------------------------------------------------
+// Preparing.
+
+fn prepareWith(db: usize, text: usize, length: usize, out: usize, tail: usize, legacy: bool) -> i32 {
+    c.ready()
+    if out != 0 { mem.put64(out, 0) }
+    if db == 0 || out == 0 || text == 0 { return core.MISUSE }
+    const d = core.database(db)
+    var statement: usize = 0
+    var consumed: usize = 0
+    const rc = engine.prepare(d, text, length, &statement, &consumed)
+    mem.put64(out, @intCast(u64, statement))
+    if tail != 0 { mem.put64(tail, @intCast(u64, text + consumed)) }
+    if statement != 0 { core.statementOf(statement).*.legacy = legacy }
+    return c.reported(d, rc)
+}
+
+// The text's length as prepare takes it: up to its 0, and no further than
+// `bytes` when that is not negative.
+fn preparedLength(text: usize, bytes: i32) -> usize {
+    if text == 0 { return 0 }
+    return c.textLength(text, @intCast(i64, bytes))
+}
+
+export fn sqlite3_prepare(db: usize, text: usize, bytes: i32, out: usize, tail: usize) -> i32 {
+    return prepareWith(db, text, preparedLength(text, bytes), out, tail, true)
+}
+
+export fn sqlite3_prepare_v2(db: usize, text: usize, bytes: i32, out: usize, tail: usize) -> i32 {
+    return prepareWith(db, text, preparedLength(text, bytes), out, tail, false)
+}
+
+// The flags (persistent, no virtual tables) change nothing here.
+export fn sqlite3_prepare_v3(db: usize, text: usize, bytes: i32, flags: u32, out: usize, tail: usize) -> i32 {
+    return prepareWith(db, text, preparedLength(text, bytes), out, tail, false)
+}
+
+// UTF-16 texts are prepared as UTF-8; the tail is mapped back to where the
+// UTF-8 statement ended in the UTF-16 text.
+fn prepare16With(db: usize, text: usize, bytes: i32, out: usize, tail: usize, legacy: bool) -> i32 {
+    c.ready()
+    if out != 0 { mem.put64(out, 0) }
+    if db == 0 || out == 0 || text == 0 { return core.MISUSE }
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    c.utf16ToUtf8(text, c.utf16Units(text, @intCast(i64, bytes)), &b)
+    var utf8Tail: usize = 0
+    const rc = prepareWith(db, b.data, b.length, out, @intFromPtr(&utf8Tail), legacy)
+    if tail != 0 {
+        const consumed = if utf8Tail >= b.data { utf8Tail - b.data } else { 0 }
+        mem.put64(tail, @intCast(u64, text + c.utf16UnitsOf(b.data, consumed) * 2))
+    }
+    mem.freeBuffer(&b)
+    return rc
+}
+
+export fn sqlite3_prepare16(db: usize, text: usize, bytes: i32, out: usize, tail: usize) -> i32 {
+    return prepare16With(db, text, bytes, out, tail, true)
+}
+
+export fn sqlite3_prepare16_v2(db: usize, text: usize, bytes: i32, out: usize, tail: usize) -> i32 {
+    return prepare16With(db, text, bytes, out, tail, false)
+}
+
+export fn sqlite3_prepare16_v3(db: usize, text: usize, bytes: i32, flags: u32, out: usize, tail: usize) -> i32 {
+    return prepare16With(db, text, bytes, out, tail, false)
+}
+
+// ---------------------------------------------------------------------------
+// Running.
+
+export fn sqlite3_step(statement: usize) -> i32 {
+    if statement == 0 { return core.MISUSE }
+    const st = core.statementOf(statement)
+    const d = databaseOf(st)
+    const rc = engine.step(statement)
+    if rc == core.ROW || rc == core.DONE { return rc }
+    // The legacy interface says only that the step failed (sqlite3_reset
+    // says how).
+    if st.*.legacy && (rc & 255) != core.BUSY && (rc & 255) != core.MISUSE { return core.ERROR }
+    return c.reported(d, rc)
+}
+
+export fn sqlite3_reset(statement: usize) -> i32 {
+    if statement == 0 { return core.OK }
+    const st = core.statementOf(statement)
+    const d = databaseOf(st)
+    const rc = engine.reset(statement)
+    // The connection's error is the statement's (or none).
+    if rc == core.OK { core.clearError(d) }
+    return c.reported(d, rc)
+}
+
+export fn sqlite3_finalize(statement: usize) -> i32 {
+    if statement == 0 { return core.OK }
+    const d = databaseOf(core.statementOf(statement))
+    const rc = engine.finalize(statement)
+    return c.reported(d, rc)
+}
+
+export fn sqlite3_clear_bindings(statement: usize) -> i32 {
+    if statement == 0 { return core.MISUSE }
+    engine.clearBindings(statement)
+    return core.OK
+}
+
+// ---------------------------------------------------------------------------
+// Binding.
+
+// Calls the destructor an application gave with its data (SQLITE_STATIC
+// and SQLITE_TRANSIENT are not ones): the data was copied, or not taken.
+fn release(address: usize, destructor: usize) -> void {
+    if destructor == 0 || destructor == TRANSIENT || address == 0 { return }
+    const call: values.Destructor = unsafe { @ptrFromInt(values.Destructor, destructor) }
+    call(address)
+}
+
+// The parameter to bind, or 0 with the error returned in `rc`: MISUSE
+// when the statement is not at its start, RANGE when there is no such
+// parameter.
+fn slot(statement: usize, i: i32, rc: *i32) -> *Value {
+    rc.* = core.OK
+    var none: *Value = unsafe { @ptrFromInt(*Value, 8) }
+    if statement == 0 {
+        rc.* = core.MISUSE
+        return none
+    }
+    const st = core.statementOf(statement)
+    const d = databaseOf(st)
+    if !engine.canBind(statement) {
+        rc.* = core.MISUSE
+        _ = core.setError(d, core.MISUSE, "")
+        return none
+    }
+    const address = engine.parameterValue(statement, @intCast(i64, i))
+    if address == 0 {
+        rc.* = core.RANGE
+        _ = core.setError(d, core.RANGE, "")
+        return none
+    }
+    core.clearError(d)
+    return unsafe { @ptrFromInt(*Value, address) }
+}
+
+fn noMemory(statement: usize) -> i32 {
+    _ = core.setError(databaseOf(core.statementOf(statement)), core.NOMEM, "")
+    return core.NOMEM
+}
+
+fn bindBytes(statement: usize, i: i32, data: usize, length: usize, blob: bool, destructor: usize) -> i32 {
+    var rc: i32 = 0
+    const v = slot(statement, i, &rc)
+    if rc != core.OK {
+        release(data, destructor)
+        return rc
+    }
+    var ok = true
+    if data == 0 {
+        value.setNull(v)
+    } else if blob {
+        ok = value.setBlob(v, data, length)
+    } else {
+        ok = value.setText(v, data, length)
+    }
+    release(data, destructor)
+    if !ok { return noMemory(statement) }
+    return core.OK
+}
+
+export fn sqlite3_bind_blob(statement: usize, i: i32, data: usize, bytes: i32, destructor: usize) -> i32 {
+    const n: usize = if bytes < 0 { 0 } else { @intCast(usize, bytes) }
+    return bindBytes(statement, i, data, n, true, destructor)
+}
+
+export fn sqlite3_bind_blob64(statement: usize, i: i32, data: usize, bytes: u64, destructor: usize) -> i32 {
+    if bytes > 0x7fffffff {
+        release(data, destructor)
+        return core.TOOBIG
+    }
+    return bindBytes(statement, i, data, @intCast(usize, bytes), true, destructor)
+}
+
+export fn sqlite3_bind_double(statement: usize, i: i32, r: f64) -> i32 {
+    var rc: i32 = 0
+    const v = slot(statement, i, &rc)
+    if rc != core.OK { return rc }
+    // NaN binds NULL, as SQLite has it.
+    if r != r {
+        value.setNull(v)
+    } else {
+        value.setReal(v, r)
+    }
+    return core.OK
+}
+
+export fn sqlite3_bind_int(statement: usize, i: i32, n: i32) -> i32 {
+    var rc: i32 = 0
+    const v = slot(statement, i, &rc)
+    if rc != core.OK { return rc }
+    value.setInt(v, @intCast(i64, n))
+    return core.OK
+}
+
+export fn sqlite3_bind_int64(statement: usize, i: i32, n: i64) -> i32 {
+    var rc: i32 = 0
+    const v = slot(statement, i, &rc)
+    if rc != core.OK { return rc }
+    value.setInt(v, n)
+    return core.OK
+}
+
+export fn sqlite3_bind_null(statement: usize, i: i32) -> i32 {
+    var rc: i32 = 0
+    const v = slot(statement, i, &rc)
+    if rc != core.OK { return rc }
+    value.setNull(v)
+    return core.OK
+}
+
+// A text's bytes: up to its 0 when `bytes` is negative, else exactly
+// `bytes` of them.
+export fn sqlite3_bind_text(statement: usize, i: i32, text: usize, bytes: i32, destructor: usize) -> i32 {
+    const n: usize = if text == 0 { 0 } else if bytes < 0 { c.cLength(text) } else { @intCast(usize, bytes) }
+    return bindBytes(statement, i, text, n, false, destructor)
+}
+
+fn bindUtf16(statement: usize, i: i32, text: usize, units: usize, destructor: usize) -> i32 {
+    if text == 0 { return bindBytes(statement, i, 0, 0, false, destructor) }
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    c.utf16ToUtf8(text, units, &b)
+    const rc = bindBytes(statement, i, b.data, b.length, false, 0)
+    mem.freeBuffer(&b)
+    release(text, destructor)
+    return rc
+}
+
+export fn sqlite3_bind_text16(statement: usize, i: i32, text: usize, bytes: i32, destructor: usize) -> i32 {
+    if text == 0 { return bindBytes(statement, i, 0, 0, false, destructor) }
+    const units = if bytes < 0 { c.utf16Units(text, -1) } else { @intCast(usize, bytes) / 2 }
+    return bindUtf16(statement, i, text, units, destructor)
+}
+
+// SQLITE_UTF8 is 1; the UTF-16 encodings (2, 3, 4) are taken in the
+// machine's byte order.
+export fn sqlite3_bind_text64(statement: usize, i: i32, text: usize, bytes: u64, destructor: usize, encoding: u8) -> i32 {
+    if bytes > 0x7fffffff {
+        release(text, destructor)
+        return core.TOOBIG
+    }
+    if encoding == 2 || encoding == 3 || encoding == 4 {
+        if text == 0 { return bindBytes(statement, i, 0, 0, false, destructor) }
+        return bindUtf16(statement, i, text, @intCast(usize, bytes) / 2, destructor)
+    }
+    return bindBytes(statement, i, text, @intCast(usize, bytes), false, destructor)
+}
+
+export fn sqlite3_bind_value(statement: usize, i: i32, from: usize) -> i32 {
+    var rc: i32 = 0
+    const v = slot(statement, i, &rc)
+    if rc != core.OK { return rc }
+    if from == 0 {
+        value.setNull(v)
+        return core.OK
+    }
+    if !value.copy(v, unsafe { @ptrFromInt(*Value, from) }) { return noMemory(statement) }
+    return core.OK
+}
+
+export fn sqlite3_bind_zeroblob(statement: usize, i: i32, bytes: i32) -> i32 {
+    var rc: i32 = 0
+    const v = slot(statement, i, &rc)
+    if rc != core.OK { return rc }
+    if !value.setZeroBlob(v, if bytes < 0 { 0 } else { @intCast(usize, bytes) }) { return noMemory(statement) }
+    return core.OK
+}
+
+export fn sqlite3_bind_zeroblob64(statement: usize, i: i32, bytes: u64) -> i32 {
+    if bytes > 0x7fffffff {
+        if statement != 0 { _ = core.setError(databaseOf(core.statementOf(statement)), core.TOOBIG, "") }
+        return core.TOOBIG
+    }
+    return sqlite3_bind_zeroblob(statement, i, @intCast(i32, bytes))
+}
+
+export fn sqlite3_bind_parameter_count(statement: usize) -> i32 {
+    if statement == 0 { return 0 }
+    return @intCast(i32, engine.parameterCount(statement))
+}
+
+// A parameter's name with its prefix (":a", "@a", "$a", "?7"), or NULL for
+// a nameless one.
+export fn sqlite3_bind_parameter_name(statement: usize, i: i32) -> usize {
+    if statement == 0 { return 0 }
+    var length: usize = 0
+    return engine.parameterName(statement, @intCast(i64, i), &length)
+}
+
+export fn sqlite3_bind_parameter_index(statement: usize, name: usize) -> i32 {
+    if statement == 0 || name == 0 { return 0 }
+    return @intCast(i32, engine.parameterIndex(statement, mem.view(name, c.cLength(name))))
+}
+
+// ---------------------------------------------------------------------------
+// Results.
+
+// Result column `i` of the current row: a NULL value, and RANGE for the
+// connection, when there is no such column.
+fn columnOf(statement: usize, i: i32) -> *Value {
+    const st = core.statementOf(statement)
+    if i < 0 || @intCast(usize, i) >= engine.columnCount(statement) || engine.dataCount(statement) == 0 {
+        _ = core.setError(databaseOf(st), core.RANGE, "")
+        return engine.column(statement, 1 << 40)
+    }
+    return engine.column(statement, @intCast(usize, i))
+}
+
+export fn sqlite3_column_blob(statement: usize, i: i32) -> usize {
+    if statement == 0 { return 0 }
+    return values.blobOf(columnOf(statement, i))
+}
+
+export fn sqlite3_column_bytes(statement: usize, i: i32) -> i32 {
+    if statement == 0 { return 0 }
+    return values.bytesOf(columnOf(statement, i))
+}
+
+export fn sqlite3_column_bytes16(statement: usize, i: i32) -> i32 {
+    if statement == 0 { return 0 }
+    var units: usize = 0
+    _ = values.text16Of(columnOf(statement, i), &units)
+    return @intCast(i32, units * 2)
+}
+
+export fn sqlite3_column_double(statement: usize, i: i32) -> f64 {
+    if statement == 0 { return 0.0 }
+    return value.toReal(columnOf(statement, i))
+}
+
+export fn sqlite3_column_int(statement: usize, i: i32) -> i32 {
+    if statement == 0 { return 0 }
+    return @bitCast(i32, @intCast(u32, @bitCast(u64, value.toInt(columnOf(statement, i))) & 0xffffffff))
+}
+
+export fn sqlite3_column_int64(statement: usize, i: i32) -> i64 {
+    if statement == 0 { return 0 }
+    return value.toInt(columnOf(statement, i))
+}
+
+export fn sqlite3_column_text(statement: usize, i: i32) -> usize {
+    if statement == 0 { return 0 }
+    return values.textOf(columnOf(statement, i))
+}
+
+export fn sqlite3_column_text16(statement: usize, i: i32) -> usize {
+    if statement == 0 { return 0 }
+    var units: usize = 0
+    return values.text16Of(columnOf(statement, i), &units)
+}
+
+export fn sqlite3_column_type(statement: usize, i: i32) -> i32 {
+    if statement == 0 { return 5 }
+    return @intCast(i32, columnOf(statement, i).*.kind)
+}
+
+export fn sqlite3_column_value(statement: usize, i: i32) -> usize {
+    if statement == 0 { return 0 }
+    return @intFromPtr(columnOf(statement, i))
+}
+
+export fn sqlite3_column_count(statement: usize) -> i32 {
+    if statement == 0 { return 0 }
+    return @intCast(i32, engine.columnCount(statement))
+}
+
+export fn sqlite3_data_count(statement: usize) -> i32 {
+    if statement == 0 { return 0 }
+    return @intCast(i32, engine.dataCount(statement))
+}
+
+fn inRange(statement: usize, i: i32) -> bool {
+    return statement != 0 && i >= 0 && @intCast(usize, i) < engine.columnCount(statement)
+}
+
+export fn sqlite3_column_name(statement: usize, i: i32) -> usize {
+    if !inRange(statement, i) { return 0 }
+    return @intFromPtr(engine.columnName(statement, @intCast(usize, i)).pointer)
+}
+
+export fn sqlite3_column_decltype(statement: usize, i: i32) -> usize {
+    if !inRange(statement, i) { return 0 }
+    var length: usize = 0
+    return engine.columnType(statement, @intCast(usize, i), &length)
+}
+
+export fn sqlite3_column_table_name(statement: usize, i: i32) -> usize {
+    if !inRange(statement, i) { return 0 }
+    var table: usize = 0
+    var column: usize = 0
+    engine.columnOrigin(statement, @intCast(usize, i), &table, &column)
+    return table
+}
+
+export fn sqlite3_column_origin_name(statement: usize, i: i32) -> usize {
+    if !inRange(statement, i) { return 0 }
+    var table: usize = 0
+    var column: usize = 0
+    engine.columnOrigin(statement, @intCast(usize, i), &table, &column)
+    return column
+}
+
+export fn sqlite3_column_database_name(statement: usize, i: i32) -> usize {
+    if sqlite3_column_table_name(statement, i) == 0 { return 0 }
+    return @intFromPtr("main".pointer)
+}
+
+// A UTF-16 copy of a UTF-8 name, kept with the statement until it is
+// finalized.
+fn keep16(statement: usize, text: usize) -> usize {
+    if text == 0 { return 0 }
+    const st = core.statementOf(statement)
+    var b: mem.Buffer = undefined
+    mem.initBuffer(&b)
+    _ = mem.appendText(&b, "01234567")
+    _ = c.utf8ToUtf16(text, c.cLength(text), &b)
+    const block = mem.takeBuffer(&b)
+    if block == 0 { return 0 }
+    mem.put64(block, @intCast(u64, st.*.scratch))
+    st.*.scratch = block
+    return block + 8
+}
+
+export fn sqlite3_column_name16(statement: usize, i: i32) -> usize {
+    return keep16(statement, sqlite3_column_name(statement, i))
+}
+
+export fn sqlite3_column_decltype16(statement: usize, i: i32) -> usize {
+    return keep16(statement, sqlite3_column_decltype(statement, i))
+}
+
+// ---------------------------------------------------------------------------
+// About statements.
+
+export fn sqlite3_sql(statement: usize) -> usize {
+    if statement == 0 { return 0 }
+    return @intFromPtr(engine.sqlText(statement).pointer)
+}
+
+// The text with the parameters' values in it, from sqlite3_malloc (the
+// caller frees it).
+export fn sqlite3_expanded_sql(statement: usize) -> usize {
+    if statement == 0 { return 0 }
+    const st = core.statementOf(statement)
+    const d = databaseOf(st)
+    sql.os.enter(&d.*.mutex)
+    const text = engine.expandedText(statement)
+    const copy = c.cCopy(text, c.cLength(text))
+    sql.os.leave(&d.*.mutex)
+    return copy
+}
+
+export fn sqlite3_normalized_sql(statement: usize) -> usize { return 0 }
+
+export fn sqlite3_stmt_readonly(statement: usize) -> i32 {
+    if statement == 0 { return 1 }
+    return if engine.isReadOnly(statement) { 1 } else { 0 }
+}
+
+export fn sqlite3_stmt_isexplain(statement: usize) -> i32 {
+    if statement == 0 { return 0 }
+    const st = core.statementOf(statement)
+    if st.*.node == 0 { return 0 }
+    return @intCast(i32, ast.statement(st.*.node).*.explain)
+}
+
+export fn sqlite3_stmt_busy(statement: usize) -> i32 {
+    if statement == 0 { return 0 }
+    return if engine.isBusy(statement) { 1 } else { 0 }
+}
+
+// SQLITE_STMTSTATUS_FULLSCAN_STEP (1) and _SORT (2) are counted; the
+// others are 0.
+export fn sqlite3_stmt_status(statement: usize, op: i32, resetFlag: i32) -> i32 {
+    if statement == 0 { return 0 }
+    const st = core.statementOf(statement)
+    var n: i64 = 0
+    if op == 1 {
+        n = st.*.fullScans
+        if resetFlag != 0 { st.*.fullScans = 0 }
+    } else if op == 2 {
+        n = st.*.sorts
+        if resetFlag != 0 { st.*.sorts = 0 }
+    }
+    return @intCast(i32, n & 0x7fffffff)
+}
+
+export fn sqlite3_db_handle(statement: usize) -> usize {
+    if statement == 0 { return 0 }
+    return core.statementOf(statement).*.db
+}

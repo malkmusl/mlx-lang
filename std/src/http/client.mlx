@@ -1,0 +1,1306 @@
+// std.http.client: an HTTP/1.1 client for Mlx programs (the browser
+// Voyager's), on std.net, std.tls and the pieces of std.http: a Session
+// keeps connections per host and reuses them while they stay open,
+// follows redirects as libsoup follows them (std.http.message), answers
+// Basic and Digest challenges with the credentials a callback gives
+// (std.http.auth, kept per host for the requests after), sends and takes
+// cookies through a jar (std.http.cookiejar) and honours HSTS (std.http.hsts)
+// when given them, asks for gzip and deflate and undoes them (std.flate),
+// and reads bodies framed by Content-Length, chunks or the connection's
+// end. https:// runs on std.tls with the server's chain verified against
+// the system's CA bundle (or a trust store given), the name checked.
+//
+//     var session: client.Session = undefined
+//     client.init(&session, allocator)
+//     var response: client.Response = undefined
+//     if client.get(&session, "https://example.com/", &response) == client.Error.none {
+//         ... response.status, response.body.bytes[0..response.body.length] ...
+//         client.freeResponse(&session, &response)
+//     }
+//     client.deinit(&session)
+//
+// Everything is synchronous: a request blocks until its response is in
+// (each wait on the network at most `timeoutMs`). A body may also be
+// read as it comes, on another thread: requestHead stops after the head
+// of the response and hands its connection over (a Body, out of the
+// session's), which readBody then reads into a sink, piece by piece:
+//
+//     var body: client.Body = undefined
+//     if client.requestHead(&session, &req, &response, &body) == client.Error.none {
+//         ... response.status, the head ...
+//         client.readBody(&body, client.BodySink.{ .context = c, .write = piece })
+//         client.freeBody(&body)
+//     }
+const std = @import("std")
+const net = @import("../net.mlx")
+const tls = @import("../tls.mlx")
+const x509 = @import("../x509.mlx")
+const flate = @import("../flate.mlx")
+const uri = @import("../uri.mlx")
+const headers = @import("./headers.mlx")
+const message = @import("./message.mlx")
+const chunked = @import("./chunked.mlx")
+const auth = @import("./auth.mlx")
+const cookiejar = @import("./cookiejar.mlx")
+const hsts = @import("./hsts.mlx")
+const date = @import("./date.mlx")
+const random = @import("../random.mlx")
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Error = enum(u8) {
+    none,
+    // Not an http:// or https:// URL, or one that could not be read.
+    badUrl,
+    // The host has no address.
+    resolve,
+    // No address could be connected to.
+    connect,
+    // The TLS handshake failed, or the server's chain did not verify.
+    tls,
+    // The request could not be sent.
+    send,
+    // The connection ended, or timed out, before the response was whole.
+    receive,
+    // The response's head is not HTTP, or too long.
+    malformed,
+    // The body is longer than the session allows.
+    tooLarge,
+    tooManyRedirects,
+    noMemory,
+    // The sink of readBody asked to stop.
+    stopped
+}
+
+// Where readBody puts a body's pieces as they come (WRITE false: stop,
+// the connection closed).
+pub const BodySink = struct {
+    context: usize
+    write: fn(context: usize, data: []const u8) -> bool
+}
+
+// Asked for a user and password for a realm of a host (the callback
+// points `user` and `password` at texts that stay valid until the next
+// call); false when it has none.
+pub const CredentialsFn = fn(context: usize, host: []const u8, realm: []const u8, user: *[]const u8, password: *[]const u8) -> bool
+
+pub const Request = struct {
+    method: []const u8
+    url: []const u8
+    // Header lines of the caller's, each "Name: value\r\n".
+    headers: []const u8
+    body: []const u8
+    hasBody: bool
+}
+
+// Bytes of the session's allocator (freeResponse gives them back).
+pub const Bytes = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+}
+
+pub const Response = struct {
+    status: u32
+    version: message.Version
+    // The head as it came (the status line and the header lines), and
+    // the reason phrase in it.
+    head: Bytes
+    phrase: []const u8
+    // The body, with its content coding undone.
+    body: Bytes
+    // The URL the response came from (after redirects).
+    url: Bytes
+    // How many redirects were followed.
+    redirects: u32
+}
+
+const MAX_CONNECTIONS: usize = 8
+const MAX_AUTHS: usize = 8
+const READ_ROOM: usize = 16384
+const MAX_HEAD: usize = 65536
+const MAX_URL: usize = 4096
+
+const Connection = struct {
+    open: bool
+    https: bool
+    host: [256]u8
+    hostLength: usize
+    port: u16
+    fd: isize
+    tlsClient: *tls.Client
+    hasTls: bool
+    // Bytes received and not yet taken.
+    buffer: [READ_ROOM]u8
+    start: usize
+    end: usize
+    // Whether the server closed, or asked to.
+    closing: bool
+}
+
+const Scheme = enum(u8) {
+    basic,
+    digest
+}
+
+const AuthEntry = struct {
+    inUse: bool
+    https: bool
+    host: [256]u8
+    hostLength: usize
+    port: u16
+    scheme: Scheme
+    user: [256]u8
+    userLength: usize
+    password: [256]u8
+    passwordLength: usize
+    // Basic: the token; Digest: the challenge and the client's state.
+    token: [512]u8
+    tokenLength: usize
+    challenge: auth.DigestChallenge
+    hexUrp: [32]u8
+    hexA1: [32]u8
+    cnonce: [64]u8
+    cnonceLength: usize
+    nc: u32
+}
+
+pub const Session = struct {
+    allocator: Allocator
+    connections: [MAX_CONNECTIONS]Connection
+    auths: [MAX_AUTHS]AuthEntry
+    // The anchors https:// chains are verified against: the system's CA
+    // bundle unless one is given (setTrustStore), loaded when first needed.
+    store: x509.TrustStore
+    storeLoaded: bool
+    ownStore: bool
+    givenStore: *x509.TrustStore
+    // Whether a chain that does not verify is taken anyway.
+    insecure: bool
+    jar: *cookiejar.Jar
+    hasJar: bool
+    enforcer: *hsts.Enforcer
+    hasEnforcer: bool
+    credentials: CredentialsFn
+    credentialsContext: usize
+    hasCredentials: bool
+    userAgent: []const u8
+    timeoutMs: isize
+    maxRedirects: u32
+    // Whether redirects are followed (else a 3xx response comes back as
+    // it is: a browser's loader decides on each).
+    followRedirects: bool
+    maxBody: usize
+    // The time used for cookies and HSTS (0: the clock).
+    time: i64
+}
+
+fn noCredentials(context: usize, host: []const u8, realm: []const u8, user: *[]const u8, password: *[]const u8) -> bool { return false }
+
+pub fn init(session: *Session, allocator: Allocator) -> void {
+    session.*.allocator = allocator
+    var i: usize = 0
+    while i < MAX_CONNECTIONS {
+        session.*.connections[i].open = false
+        session.*.connections[i].hasTls = false
+        i += 1
+    }
+    i = 0
+    while i < MAX_AUTHS {
+        session.*.auths[i].inUse = false
+        i += 1
+    }
+    session.*.storeLoaded = false
+    session.*.ownStore = false
+    session.*.insecure = false
+    session.*.hasJar = false
+    session.*.hasEnforcer = false
+    session.*.credentials = noCredentials
+    session.*.credentialsContext = 0
+    session.*.hasCredentials = false
+    session.*.userAgent = "Mlx/0.1"
+    session.*.timeoutMs = 30000
+    session.*.maxRedirects = message.MAX_REDIRECTS
+    session.*.followRedirects = true
+    session.*.maxBody = 64 * 1024 * 1024
+    session.*.time = 0
+}
+
+pub fn deinit(session: *Session) -> void {
+    var i: usize = 0
+    while i < MAX_CONNECTIONS {
+        closeConnection(session, &session.*.connections[i])
+        i += 1
+    }
+    if session.*.storeLoaded && session.*.ownStore { x509.storeFree(&session.*.store) }
+    session.*.storeLoaded = false
+}
+
+pub fn setCookieJar(session: *Session, jar: *cookiejar.Jar) -> void {
+    session.*.jar = jar
+    session.*.hasJar = true
+}
+
+pub fn setHsts(session: *Session, enforcer: *hsts.Enforcer) -> void {
+    session.*.enforcer = enforcer
+    session.*.hasEnforcer = true
+}
+
+pub fn setCredentials(session: *Session, callback: CredentialsFn, context: usize) -> void {
+    session.*.credentials = callback
+    session.*.credentialsContext = context
+    session.*.hasCredentials = true
+}
+
+// Anchors of the caller's instead of the system's CA bundle.
+pub fn setTrustStore(session: *Session, store: *x509.TrustStore) -> void {
+    session.*.givenStore = store
+    session.*.storeLoaded = true
+    session.*.ownStore = false
+}
+
+fn now(session: *Session) -> i64 {
+    if session.*.time != 0 { return session.*.time }
+    return x509.now()
+}
+
+// ---------------------------------------------------------------------------
+// Growing bytes
+
+fn growBytes(session: *Session, bytes: *Bytes, needed: usize) -> bool { return growBytesWith(session.*.allocator, bytes, needed) }
+
+fn growBytesWith(allocator: Allocator, bytes: *Bytes, needed: usize) -> bool {
+    if needed <= bytes.*.capacity { return true }
+    var capacity = if bytes.*.capacity == 0 { 4096 } else { bytes.*.capacity * 2 }
+    while capacity < needed { capacity *= 2 }
+    const memory = allocator.alloc(capacity, 16)
+    if memory == null { return false }
+    var i: usize = 0
+    while i < bytes.*.length {
+        memory.?[i] = bytes.*.bytes[i]
+        i += 1
+    }
+    if bytes.*.capacity != 0 { allocator.free(bytes.*.bytes, bytes.*.capacity, 16) }
+    bytes.*.bytes = memory.?
+    bytes.*.capacity = capacity
+    return true
+}
+
+fn appendBytes(session: *Session, bytes: *Bytes, data: []const u8) -> bool { return appendBytesWith(session.*.allocator, bytes, data) }
+
+fn appendBytesWith(allocator: Allocator, bytes: *Bytes, data: []const u8) -> bool {
+    if !growBytesWith(allocator, bytes, bytes.*.length + data.length) { return false }
+    var i: usize = 0
+    while i < data.length {
+        bytes.*.bytes[bytes.*.length + i] = data[i]
+        i += 1
+    }
+    bytes.*.length += data.length
+    return true
+}
+
+fn freeBytes(session: *Session, bytes: *Bytes) -> void { freeBytesWith(session.*.allocator, bytes) }
+
+fn freeBytesWith(allocator: Allocator, bytes: *Bytes) -> void {
+    if bytes.*.capacity != 0 { allocator.free(bytes.*.bytes, bytes.*.capacity, 16) }
+    bytes.*.capacity = 0
+    bytes.*.length = 0
+}
+
+fn emptyBytes() -> Bytes {
+    var b: Bytes = undefined
+    b.length = 0
+    b.capacity = 0
+    return b
+}
+
+pub fn freeResponse(session: *Session, response: *Response) -> void {
+    freeBytes(session, &response.*.head)
+    freeBytes(session, &response.*.body)
+    freeBytes(session, &response.*.url)
+}
+
+fn sinkWrite(context: usize, data: []const u8) -> void {
+    const target: *SinkTarget = unsafe { @ptrFromInt(*SinkTarget, context) }
+    if !appendBytes(target.*.session, target.*.bytes, data) { target.*.failed = true }
+}
+
+const SinkTarget = struct {
+    session: *Session
+    bytes: *Bytes
+    failed: bool
+}
+
+fn sinkOf(target: *SinkTarget) -> headers.Sink { return headers.Sink.{ .context = @intFromPtr(target), .write = sinkWrite } }
+
+fn uriSinkOf(target: *SinkTarget) -> uri.Sink { return uri.Sink.{ .context = @intFromPtr(target), .write = sinkWrite } }
+
+// ---------------------------------------------------------------------------
+// Connections
+
+fn closeConnection(session: *Session, connection: *Connection) -> void { closeConnectionWith(session.*.allocator, connection) }
+
+fn closeConnectionWith(allocator: Allocator, connection: *Connection) -> void {
+    if !connection.*.open { return }
+    if connection.*.hasTls {
+        tls.close(connection.*.tlsClient)
+        const pending = tls.pendingOutput(connection.*.tlsClient)
+        _ = net.send(connection.*.fd, pending)
+        tls.clientFree(connection.*.tlsClient)
+        allocator.free(unsafe { @ptrCast([*]u8, connection.*.tlsClient) }, @sizeOf(tls.Client), 16)
+        connection.*.hasTls = false
+    }
+    net.close(connection.*.fd)
+    connection.*.open = false
+}
+
+fn sameHost(connection: *Connection, host: []const u8) -> bool {
+    return uri.equalsIgnoringCase(connection.*.host[0..connection.*.hostLength], host)
+}
+
+fn loadStore(session: *Session) -> bool {
+    if session.*.storeLoaded { return true }
+    x509.storeInit(&session.*.store, session.*.allocator)
+    _ = x509.storeLoadFile(&session.*.store, "/etc/ssl/certs/ca-certificates.crt".pointer)
+    session.*.storeLoaded = true
+    session.*.ownStore = true
+    return true
+}
+
+fn storeOf(session: *Session) -> *x509.TrustStore {
+    if session.*.ownStore { return &session.*.store }
+    return session.*.givenStore
+}
+
+// Runs the handshake on a connected socket.
+fn handshake(session: *Session, connection: *Connection, host: []const u8) -> Error {
+    const memory = session.*.allocator.alloc(@sizeOf(tls.Client), 16)
+    if memory == null { return Error.noMemory }
+    const client: *tls.Client = unsafe { @ptrCast(*tls.Client, memory.?) }
+    if !tls.clientInit(client, session.*.allocator) {
+        session.*.allocator.free(memory.?, @sizeOf(tls.Client), 16)
+        return Error.noMemory
+    }
+    connection.*.tlsClient = client
+    connection.*.hasTls = true
+    tls.setServerName(client, host)
+    tls.setAlpn(client, "\x08http/1.1")
+    if loadStore(session) { tls.setTrustStore(client, storeOf(session)) }
+    _ = tls.start(client)
+    while true {
+        if !flushTls(connection) { return Error.tls }
+        const state = tls.process(client)
+        if state == tls.State.connected { return Error.none }
+        if state == tls.State.checkCertificate {
+            _ = tls.acceptCertificate(client, session.*.insecure)
+            if !session.*.insecure {
+                _ = flushTls(connection)
+                return Error.tls
+            }
+            continue
+        }
+        if state != tls.State.handshaking { return Error.tls }
+        if !fillTls(session.*.timeoutMs, connection) { return Error.tls }
+    }
+    return Error.tls
+}
+
+fn flushTls(connection: *Connection) -> bool {
+    const pending = tls.pendingOutput(connection.*.tlsClient)
+    if pending.length == 0 { return true }
+    if !net.send(connection.*.fd, pending) { return false }
+    tls.outputSent(connection.*.tlsClient, pending.length)
+    return true
+}
+
+fn fillTls(timeoutMs: isize, connection: *Connection) -> bool {
+    const client = connection.*.tlsClient
+    const room = tls.inputRoom(client)
+    if room == 0 { return false }
+    if !net.readable(connection.*.fd, timeoutMs) { return false }
+    const got = net.receive(connection.*.fd, tls.inputSpace(client), room)
+    if got <= 0 {
+        _ = tls.endOfInput(client)
+        return false
+    }
+    tls.inputAdded(client, @intCast(usize, got))
+    return true
+}
+
+// A connection to `host`:`port`, one kept from before when there is one.
+fn connectTo(session: *Session, https: bool, host: []const u8, port: u16, out: **Connection) -> Error {
+    var i: usize = 0
+    while i < MAX_CONNECTIONS {
+        const c = &session.*.connections[i]
+        if c.*.open && c.*.https == https && c.*.port == port && sameHost(c, host) && !c.*.closing {
+            out.* = c
+            return Error.none
+        }
+        i += 1
+    }
+    // A free slot, or the first open one closed.
+    var slot: usize = MAX_CONNECTIONS
+    i = 0
+    while i < MAX_CONNECTIONS {
+        if !session.*.connections[i].open {
+            slot = i
+            break
+        }
+        i += 1
+    }
+    if slot == MAX_CONNECTIONS {
+        slot = 0
+        closeConnection(session, &session.*.connections[0])
+    }
+    const c = &session.*.connections[slot]
+    if host.length > 255 { return Error.badUrl }
+    var found: [8]net.Address = undefined
+    const foundPointer: [*]net.Address = &found
+    const count = net.resolve(host, port, foundPointer, 8, session.*.timeoutMs)
+    if count == 0 { return Error.resolve }
+    var fd: isize = -1
+    i = 0
+    while i < count {
+        fd = net.connect(&found[i], session.*.timeoutMs)
+        if fd >= 0 { break }
+        i += 1
+    }
+    if fd < 0 { return Error.connect }
+    c.*.open = true
+    c.*.https = https
+    c.*.port = port
+    c.*.fd = fd
+    c.*.hasTls = false
+    c.*.start = 0
+    c.*.end = 0
+    c.*.closing = false
+    var k: usize = 0
+    while k < host.length {
+        c.*.host[k] = host[k]
+        k += 1
+    }
+    c.*.hostLength = host.length
+    if https {
+        const result = handshake(session, c, host)
+        if result != Error.none {
+            closeConnection(session, c)
+            return result
+        }
+    }
+    out.* = c
+    return Error.none
+}
+
+// Sends all of `data` on the connection.
+fn sendAll(session: *Session, connection: *Connection, data: []const u8) -> bool {
+    if !connection.*.hasTls { return net.send(connection.*.fd, data) }
+    var taken: usize = 0
+    while taken < data.length {
+        const from: [*]const u8 = unsafe { data.pointer + taken }
+        const nowTaken = tls.write(connection.*.tlsClient, from, data.length - taken)
+        if nowTaken == 0 && !tls.hasPendingOutput(connection.*.tlsClient) { return false }
+        taken += nowTaken
+        if !flushTls(connection) { return false }
+    }
+    return true
+}
+
+// Receives into the connection's buffer (compacted first): false at the
+// end of the connection, a timeout or a failure.
+fn fillBuffer(timeoutMs: isize, connection: *Connection) -> bool {
+    if connection.*.start > 0 {
+        var i: usize = 0
+        while connection.*.start + i < connection.*.end {
+            connection.*.buffer[i] = connection.*.buffer[connection.*.start + i]
+            i += 1
+        }
+        connection.*.end -= connection.*.start
+        connection.*.start = 0
+    }
+    if connection.*.end == READ_ROOM { return false }
+    const into: [*]u8 = unsafe { @ptrCast([*]u8, &connection.*.buffer) + connection.*.end }
+    const room = READ_ROOM - connection.*.end
+    if !connection.*.hasTls {
+        if !net.readable(connection.*.fd, timeoutMs) { return false }
+        const got = net.receive(connection.*.fd, into, room)
+        if got <= 0 { return false }
+        connection.*.end += @intCast(usize, got)
+        return true
+    }
+    const client = connection.*.tlsClient
+    while true {
+        const state = tls.process(client)
+        if !flushTls(connection) { return false }
+        if tls.readable(client) > 0 {
+            connection.*.end += tls.read(client, into, room)
+            return true
+        }
+        if state != tls.State.connected { return false }
+        if !fillTls(timeoutMs, connection) { return false }
+    }
+    return false
+}
+
+fn buffered(connection: *Connection) -> []const u8 { return connection.*.buffer[connection.*.start..connection.*.end] }
+
+// ---------------------------------------------------------------------------
+// Authentication
+
+fn findAuth(session: *Session, https: bool, host: []const u8, port: u16) -> usize {
+    var i: usize = 0
+    while i < MAX_AUTHS {
+        const a = &session.*.auths[i]
+        if a.*.inUse && a.*.https == https && a.*.port == port && uri.equalsIgnoringCase(a.*.host[0..a.*.hostLength], host) { return i }
+        i += 1
+    }
+    return MAX_AUTHS
+}
+
+fn copyInto(out: [*]u8, room: usize, text: []const u8) -> usize {
+    var n = text.length
+    if n > room { n = room }
+    var i: usize = 0
+    while i < n {
+        out[i] = text[i]
+        i += 1
+    }
+    return n
+}
+
+// Keeps credentials for a host, from a challenge: false when there are
+// none or the challenge cannot be answered.
+fn takeChallenge(session: *Session, https: bool, host: []const u8, port: u16, challengeHeader: []const u8) -> bool {
+    if !session.*.hasCredentials { return false }
+    var slot = findAuth(session, https, host, port)
+    if slot == MAX_AUTHS {
+        slot = 0
+        var i: usize = 0
+        while i < MAX_AUTHS {
+            if !session.*.auths[i].inUse {
+                slot = i
+                break
+            }
+            i += 1
+        }
+    }
+    const a = &session.*.auths[slot]
+    // Digest over Basic, as libsoup prefers the stronger.
+    var it = auth.challenges(challengeHeader)
+    var challenge: []const u8 = ""
+    var best: []const u8 = ""
+    var bestDigest = false
+    var any = false
+    while auth.nextChallenge(&it, &challenge) {
+        if auth.schemeIs(challenge, "Digest") {
+            var d: auth.DigestChallenge = undefined
+            if auth.digestChallenge(auth.paramsOf(challenge, "Digest"), &d) {
+                if !bestDigest {
+                    best = challenge
+                    bestDigest = true
+                    any = true
+                }
+            }
+        } else if auth.schemeIs(challenge, "Basic") && !bestDigest {
+            best = challenge
+            any = true
+        }
+    }
+    if !any { return false }
+    var realm: []const u8 = ""
+    var realmText: [256]u8 = undefined
+    var realmLength: usize = 0
+    if bestDigest {
+        if !auth.digestChallenge(auth.paramsOf(best, "Digest"), &a.*.challenge) { return false }
+        realm = a.*.challenge.realm
+    } else {
+        if auth.findParam(auth.paramsOf(best, "Basic"), "realm", realmText[0..256], &realmLength) == auth.Found.value { realm = realmText[0..realmLength] }
+    }
+    var user: []const u8 = ""
+    var password: []const u8 = ""
+    if !session.*.credentials(session.*.credentialsContext, host, realm, &user, &password) { return false }
+    a.*.inUse = true
+    a.*.https = https
+    a.*.port = port
+    a.*.hostLength = copyInto(&a.*.host, 256, host)
+    a.*.userLength = copyInto(&a.*.user, 256, user)
+    a.*.passwordLength = copyInto(&a.*.password, 256, password)
+    if bestDigest {
+        a.*.scheme = Scheme.digest
+        var seed: [8]u8 = undefined
+        const seedPointer: [*]u8 = &seed
+        _ = random.fill(seedPointer, 8)
+        var seedValue: u64 = 0
+        var i: usize = 0
+        while i < 8 {
+            seedValue = (seedValue << 8) | @intCast(u64, seed[i])
+            i += 1
+        }
+        a.*.cnonceLength = auth.clientNonce(seedValue, @intCast(u64, std.linux.getpid()), now(session), &a.*.cnonce)
+        a.*.nc = 1
+        auth.hexUrp(user, a.*.challenge.realm, password, &a.*.hexUrp)
+        auth.hexA1(a.*.challenge.algorithm, &a.*.hexUrp, a.*.challenge.nonce, a.*.cnonce[0..a.*.cnonceLength], &a.*.hexA1)
+    } else {
+        a.*.scheme = Scheme.basic
+        a.*.tokenLength = auth.basicToken(user, password, a.*.token[0..512])
+    }
+    return true
+}
+
+// The Authorization value for a request to a host with credentials kept.
+fn writeAuthorization(session: *Session, slot: usize, method: []const u8, target: []const u8, sink: headers.Sink) -> void {
+    const a = &session.*.auths[slot]
+    if a.*.scheme == Scheme.basic {
+        auth.writeBasic(sink, a.*.token[0..a.*.tokenLength])
+        return
+    }
+    var response: [32]u8 = undefined
+    const qopAuth = (a.*.challenge.qopOptions & auth.QOP_AUTH) != 0
+    auth.digestResponse(method, target, &a.*.hexA1, qopAuth, a.*.challenge.nonce, a.*.cnonce[0..a.*.cnonceLength], a.*.nc, &response)
+    const credentials = auth.DigestCredentials.{ .user = a.*.user[0..a.*.userLength], .realm = a.*.challenge.realm, .nonce = a.*.challenge.nonce, .uri = target, .algorithm = a.*.challenge.algorithm, .response = response[0..32], .opaque = a.*.challenge.opaque, .hasOpaque = a.*.challenge.hasOpaque, .qopAuth = qopAuth, .cnonce = a.*.cnonce[0..a.*.cnonceLength], .nc = a.*.nc }
+    auth.writeDigest(sink, &credentials)
+    a.*.nc += 1
+}
+
+// ---------------------------------------------------------------------------
+// One exchange
+
+const Exchange = struct {
+    status: u32
+    version: message.Version
+    head: Bytes
+    body: Bytes
+    // What the head said.
+    keepAlive: bool
+    location: [MAX_URL]u8
+    locationLength: usize
+    hasLocation: bool
+    challenge: [4096]u8
+    challengeLength: usize
+    hasChallenge: bool
+    encoding: [64]u8
+    encodingLength: usize
+    // How the body is framed (exchangeBody reads it): whether it has
+    // one, and its length when framing says so.
+    hasBody: bool
+    framing: message.Framing
+    length: u64
+}
+
+fn lookupHeader(head: []const u8, name: []const u8, folded: []u8, value: *[]const u8) -> bool {
+    var it = message.headerLines(head)
+    var n: []const u8 = ""
+    var v: []const u8 = ""
+    var found = false
+    while message.nextHeader(&it, &n, &v, folded) {
+        if headers.equalsIgnoringCase(n, name) {
+            value.* = v
+            found = true
+            break
+        }
+    }
+    return found
+}
+
+// Reads a head from the connection into `exchange.head`; the bytes after
+// it stay in the connection's buffer.
+fn readHead(session: *Session, connection: *Connection, exchange: *Exchange) -> Error {
+    while true {
+        const data = buffered(connection)
+        const end = message.headEnd(data)
+        if end < data.length || (end == data.length && end > 0 && endsWithBlank(data)) {
+            if !appendBytes(session, &exchange.*.head, data[0..end]) { return Error.noMemory }
+            connection.*.start += end
+            return Error.none
+        }
+        if data.length >= MAX_HEAD { return Error.malformed }
+        if connection.*.end == READ_ROOM && connection.*.start == 0 {
+            // The head is longer than the buffer: kept so far, read on.
+            if !appendBytes(session, &exchange.*.head, data) { return Error.noMemory }
+            connection.*.start = connection.*.end
+            if exchange.*.head.length >= MAX_HEAD { return Error.malformed }
+        }
+        if !fillBuffer(session.*.timeoutMs, connection) { return Error.receive }
+        if exchange.*.head.length > 0 {
+            // A head read in pieces: the blank line may straddle them.
+            const more = buffered(connection)
+            if !appendBytes(session, &exchange.*.head, more) { return Error.noMemory }
+            connection.*.start = connection.*.end
+            const whole = exchange.*.head.bytes[0..exchange.*.head.length]
+            const headLength = message.headEnd(whole)
+            if headLength < whole.length || endsWithBlank(whole) {
+                // What follows the head goes back to the buffer.
+                const extra = whole[headLength..whole.length]
+                var i: usize = 0
+                while i < extra.length {
+                    connection.*.buffer[i] = extra[i]
+                    i += 1
+                }
+                connection.*.start = 0
+                connection.*.end = extra.length
+                exchange.*.head.length = headLength
+                return Error.none
+            }
+        }
+    }
+    return Error.receive
+}
+
+fn endsWithBlank(data: []const u8) -> bool {
+    if data.length >= 4 && data[data.length - 4] == 13 && data[data.length - 3] == 10 && data[data.length - 2] == 13 && data[data.length - 1] == 10 { return true }
+    return data.length >= 2 && data[data.length - 2] == 10 && data[data.length - 1] == 10
+}
+
+// What a body is read into: its bytes (the allocator's, up to maxBody),
+// or a sink given each piece as it comes (a coded body, gzip or deflate,
+// is kept whole and given decoded at the end).
+const Reading = struct {
+    allocator: Allocator
+    timeoutMs: isize
+    maxBody: usize
+    into: *Bytes
+    hasSink: bool
+    sink: BodySink
+    // Whether the body is coded (kept, then decoded).
+    coded: bool
+}
+
+fn readingOf(session: *Session, into: *Bytes) -> Reading {
+    return Reading.{ .allocator = session.*.allocator, .timeoutMs = session.*.timeoutMs, .maxBody = session.*.maxBody, .into = into, .hasSink = false, .sink = BodySink.{ .context = 0, .write = noSink }, .coded = false }
+}
+
+fn noSink(context: usize, data: []const u8) -> bool { return false }
+
+// A piece of the body: to the sink, or kept.
+fn keep(reading: *Reading, data: []const u8) -> Error {
+    if reading.*.hasSink && !reading.*.coded {
+        if data.length > 0 && !reading.*.sink.write(reading.*.sink.context, data) { return Error.stopped }
+        return Error.none
+    }
+    if reading.*.into.*.length + data.length > reading.*.maxBody { return Error.tooLarge }
+    if !appendBytesWith(reading.*.allocator, reading.*.into, data) { return Error.noMemory }
+    return Error.none
+}
+
+// Takes `count` bytes of the body off the connection.
+fn readExactly(reading: *Reading, connection: *Connection, count: u64) -> Error {
+    var left = count
+    while left > 0 {
+        var data = buffered(connection)
+        if data.length == 0 {
+            if !fillBuffer(reading.*.timeoutMs, connection) { return Error.receive }
+            data = buffered(connection)
+        }
+        var take = data.length
+        if @intCast(u64, take) > left { take = @intCast(usize, left) }
+        const result = keep(reading, data[0..take])
+        if result != Error.none { return result }
+        connection.*.start += take
+        left -= @intCast(u64, take)
+    }
+    return Error.none
+}
+
+// A line of the chunked coding (a size line, or the CRLF after a chunk).
+fn readLine(timeoutMs: isize, connection: *Connection, line: *[]const u8) -> Error {
+    while true {
+        const data = buffered(connection)
+        const lf = chunked.lineEnd(data)
+        if lf < data.length {
+            line.* = chunked.lineText(data, lf)
+            connection.*.start += lf + 1
+            return Error.none
+        }
+        if data.length >= 8192 { return Error.malformed }
+        if !fillBuffer(timeoutMs, connection) { return Error.receive }
+    }
+    return Error.receive
+}
+
+fn readChunked(reading: *Reading, connection: *Connection) -> Error {
+    const timeoutMs = reading.*.timeoutMs
+    while true {
+        var line: []const u8 = ""
+        var result = readLine(timeoutMs, connection, &line)
+        if result != Error.none { return result }
+        const chunkLength = chunked.chunkSize(line)
+        if chunkLength < 0 { return Error.malformed }
+        const size = @intCast(u64, chunkLength)
+        if size == 0 {
+            // The trailers, up to a blank line.
+            while true {
+                result = readLine(timeoutMs, connection, &line)
+                if result != Error.none { return result }
+                if line.length == 0 { return Error.none }
+            }
+        }
+        result = readExactly(reading, connection, size)
+        if result != Error.none { return result }
+        result = readLine(timeoutMs, connection, &line)
+        if result != Error.none { return result }
+    }
+    return Error.none
+}
+
+fn readToEnd(reading: *Reading, connection: *Connection) -> Error {
+    while true {
+        const data = buffered(connection)
+        if data.length > 0 {
+            const result = keep(reading, data)
+            if result != Error.none { return result }
+            connection.*.start = connection.*.end
+        }
+        if !fillBuffer(reading.*.timeoutMs, connection) { return Error.none }
+    }
+    return Error.none
+}
+
+// Undoes gzip or deflate on the body.
+fn decodeBody(session: *Session, exchange: *Exchange) -> void { decodeBytes(session.*.allocator, exchange.*.encoding[0..exchange.*.encodingLength], &exchange.*.body) }
+
+// Undoes gzip or deflate (the coding named `encoding`) on `body`.
+fn decodeBytes(allocator: Allocator, encoding: []const u8, body: *Bytes) -> void {
+    var format = flate.Format.detect
+    if headers.equalsIgnoringCase(encoding, "gzip") || headers.equalsIgnoringCase(encoding, "x-gzip") {
+        format = flate.Format.gzip
+    } else if headers.equalsIgnoringCase(encoding, "deflate") {
+        // (A "deflate" body is a zlib stream, or raw deflate from some
+        // servers: detected by its header.)
+        format = flate.Format.detect
+    } else {
+        return
+    }
+    if body.*.length == 0 { return }
+    var out: flate.Buffer = undefined
+    var status = flate.decompressAlloc(allocator, body.*.bytes, body.*.length, format, &out)
+    if status != flate.Status.done && format == flate.Format.detect {
+        status = flate.decompressAlloc(allocator, body.*.bytes, body.*.length, flate.Format.raw, &out)
+    }
+    if status != flate.Status.done { return }
+    freeBytesWith(allocator, body)
+    body.*.bytes = out.bytes
+    body.*.length = out.length
+    body.*.capacity = out.capacity
+}
+
+// Whether `encoding` is a coding decodeBytes undoes.
+fn isCoded(encoding: []const u8) -> bool {
+    return headers.equalsIgnoringCase(encoding, "gzip") || headers.equalsIgnoringCase(encoding, "x-gzip") || headers.equalsIgnoringCase(encoding, "deflate")
+}
+
+// Whether the header lines `extra` ("Name: value\r\n"...) have one
+// starting with `prefix` (lower case, with its colon), whatever its case.
+fn extraHasHeader(extra: []const u8, prefix: []const u8) -> bool {
+    var start: usize = 0
+    while start < extra.length {
+        if headers.startsWithIgnoringCase(extra[start..extra.length], prefix) { return true }
+        while start < extra.length && extra[start] != 10 { start += 1 }
+        start += 1
+    }
+    return false
+}
+
+// Sends `method` for `target` to the connection and reads the response.
+fn exchange(session: *Session, connection: *Connection, u: *const uri.Uri, method: []const u8, target: []const u8, extra: []const u8, body: []const u8, hasBody: bool, out: *Exchange) -> Error {
+    out.*.head = emptyBytes()
+    out.*.body = emptyBytes()
+    out.*.hasLocation = false
+    out.*.hasChallenge = false
+    out.*.encodingLength = 0
+    out.*.keepAlive = true
+    // The request.
+    var request = emptyBytes()
+    var target_ = SinkTarget.{ .session = session, .bytes = &request, .failed = false }
+    const sink = sinkOf(&target_)
+    message.writeRequestLine(sink, method, target, message.Version.http11)
+    headers.put(sink, "Host: ")
+    uri.writeHostHeader(uriSinkOf(&target_), u)
+    headers.put(sink, "\r\n")
+    // (The caller's own User-Agent among `extra`, a browser's: that one.)
+    if !extraHasHeader(extra, "user-agent:") { message.writeHeader(sink, "User-Agent", session.*.userAgent) }
+    message.writeHeader(sink, "Accept-Encoding", "gzip, deflate")
+    message.writeHeader(sink, "Connection", "keep-alive")
+    if hasBody {
+        headers.put(sink, "Content-Length: ")
+        putDecimal(sink, @intCast(u64, body.length))
+        headers.put(sink, "\r\n")
+    }
+    if session.*.hasJar {
+        var found: cookiejar.Found = undefined
+        const path = if u.*.path.length == 0 { "/" } else { u.*.path }
+        const cookieRequest = cookiejar.Request.{ .host = uri.hostName(u), .path = path, .https = uri.isHttps(u), .forHttp = true, .safeMethod = message.isSafeMethod(method), .topLevelNavigation = false, .hasTopLevel = false, .topLevelHost = "", .hasSiteForCookies = false, .siteForCookiesHost = "" }
+        cookiejar.cookiesFor(session.*.jar, &cookieRequest, now(session), &found)
+        if found.count > 0 {
+            headers.put(sink, "Cookie: ")
+            cookiejar.writeCookieHeader(sink, &found)
+            headers.put(sink, "\r\n")
+        }
+        cookiejar.freeFound(session.*.jar, &found)
+    }
+    const authSlot = findAuth(session, connection.*.https, uri.hostName(u), connection.*.port)
+    if authSlot < MAX_AUTHS {
+        headers.put(sink, "Authorization: ")
+        writeAuthorization(session, authSlot, method, target, sink)
+        headers.put(sink, "\r\n")
+    }
+    headers.put(sink, extra)
+    message.writeHeadEnd(sink)
+    if hasBody { headers.put(sink, body) }
+    if target_.failed {
+        freeBytes(session, &request)
+        return Error.noMemory
+    }
+    const sent = sendAll(session, connection, request.bytes[0..request.length])
+    freeBytes(session, &request)
+    if !sent { return Error.send }
+    // The response's head, past any informational ones.
+    var status: message.StatusLine = undefined
+    while true {
+        out.*.head.length = 0
+        const result = readHead(session, connection, out)
+        if result != Error.none { return result }
+        const head = out.*.head.bytes[0..out.*.head.length]
+        if !message.parseStatusLine(head[0..message.firstLineEnd(head)], &status) { return Error.malformed }
+        if status.code >= 200 || status.code == 101 { break }
+    }
+    out.*.status = status.code
+    out.*.version = status.version
+    // What the head says.
+    const head = out.*.head.bytes[0..out.*.head.length]
+    var folded: [MAX_HEAD]u8 = undefined
+    var it = message.headerLines(head)
+    var name: []const u8 = ""
+    var value: []const u8 = ""
+    var transferEncoding: [256]u8 = undefined
+    var transferLength: usize = 0
+    var hasTransfer = false
+    var contentLength: [64]u8 = undefined
+    var contentLengthLength: usize = 0
+    var hasContentLength = false
+    out.*.keepAlive = status.version == message.Version.http11
+    while message.nextHeader(&it, &name, &value, folded[0..MAX_HEAD]) {
+        if headers.equalsIgnoringCase(name, "Transfer-Encoding") {
+            transferLength = copyInto(&transferEncoding, 256, value)
+            hasTransfer = true
+        } else if headers.equalsIgnoringCase(name, "Content-Length") {
+            contentLengthLength = copyInto(&contentLength, 64, value)
+            hasContentLength = true
+        } else if headers.equalsIgnoringCase(name, "Content-Encoding") {
+            out.*.encodingLength = copyInto(&out.*.encoding, 64, value)
+        } else if headers.equalsIgnoringCase(name, "Connection") {
+            if headers.contains(value, "close") { out.*.keepAlive = false }
+            if headers.contains(value, "keep-alive") { out.*.keepAlive = true }
+        } else if headers.equalsIgnoringCase(name, "Location") {
+            out.*.locationLength = copyInto(&out.*.location, MAX_URL, value)
+            out.*.hasLocation = true
+        } else if headers.equalsIgnoringCase(name, "WWW-Authenticate") {
+            if out.*.hasChallenge && out.*.challengeLength + 2 + value.length <= 4096 {
+                out.*.challengeLength += copyInto(unsafe { @ptrCast([*]u8, &out.*.challenge) + out.*.challengeLength }, 4096 - out.*.challengeLength, ", ")
+            } else if !out.*.hasChallenge {
+                out.*.challengeLength = 0
+            }
+            out.*.challengeLength += copyInto(unsafe { @ptrCast([*]u8, &out.*.challenge) + out.*.challengeLength }, 4096 - out.*.challengeLength, value)
+            out.*.hasChallenge = true
+        } else if headers.equalsIgnoringCase(name, "Set-Cookie") {
+            if session.*.hasJar {
+                const path = if u.*.path.length == 0 { "/" } else { u.*.path }
+                const origin = cookiejar.Origin.{ .host = uri.hostName(u), .path = path, .https = uri.isHttps(u) }
+                cookiejar.setCookie(session.*.jar, value, &origin, false, "", now(session))
+            }
+        } else if headers.equalsIgnoringCase(name, "Strict-Transport-Security") {
+            if session.*.hasEnforcer && uri.isHttps(u) {
+                var policy: hsts.Policy = undefined
+                if hsts.parseHeader(value, uri.hostName(u), now(session), &policy) { hsts.setPolicy(session.*.enforcer, &policy, now(session)) }
+            }
+        }
+    }
+    // The body's framing.
+    out.*.hasBody = !message.responseHasNoBody(status.code, method)
+    out.*.length = 0
+    out.*.framing = message.Framing.length
+    if out.*.hasBody {
+        var badLength = false
+        out.*.framing = message.framingOf(transferEncoding[0..transferLength], hasTransfer, contentLength[0..contentLengthLength], hasContentLength, true, &out.*.length, &badLength)
+        if out.*.framing == message.Framing.none { out.*.hasBody = false }
+        if out.*.framing == message.Framing.eof { out.*.keepAlive = false }
+    }
+    return Error.none
+}
+
+// Reads the body exchange() left on the connection (its framing in
+// `ex`), then closes the connection unless it is kept.
+fn exchangeBody(session: *Session, connection: *Connection, ex: *Exchange) -> Error {
+    if ex.*.hasBody {
+        var reading = readingOf(session, &ex.*.body)
+        const result = readFramed(&reading, connection, ex.*.framing, ex.*.length)
+        if result != Error.none { return result }
+        decodeBody(session, ex)
+    }
+    if !ex.*.keepAlive { closeConnection(session, connection) }
+    return Error.none
+}
+
+fn readFramed(reading: *Reading, connection: *Connection, framing: message.Framing, length: u64) -> Error {
+    if framing == message.Framing.chunked { return readChunked(reading, connection) }
+    if framing == message.Framing.length { return readExactly(reading, connection, length) }
+    if framing == message.Framing.none { return Error.none }
+    return readToEnd(reading, connection)
+}
+
+fn putDecimal(sink: headers.Sink, value: u64) -> void {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var v = value
+    while true {
+        digits[19 - count] = @intCast(u8, 48 + v % 10)
+        count += 1
+        v = v / 10
+        if v == 0 { break }
+    }
+    headers.put(sink, digits[20 - count..20])
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+
+// Sends `request` and reads its response, following redirects and
+// answering challenges on the way.
+pub fn request(session: *Session, req: *const Request, response: *Response) -> Error {
+    return requestWith(session, req, response, null)
+}
+
+// A body left on its connection by requestHead, read by readBody (on
+// any one thread: it is no longer the session's) and freed by freeBody.
+pub const Body = struct {
+    allocator: Allocator
+    timeoutMs: isize
+    maxBody: usize
+    // The connection, taken out of the session (none: the response has
+    // no body, or it was read already).
+    connection: ?*Connection
+    framing: message.Framing
+    length: u64
+    encoding: [64]u8
+    encodingLength: usize
+}
+
+// As request, but the final response's body is not read: `body` holds
+// it, on the connection, for readBody. The head is in `response` (its
+// body empty).
+pub fn requestHead(session: *Session, req: *const Request, response: *Response, body: *Body) -> Error {
+    body.*.connection = null
+    return requestWith(session, req, response, body)
+}
+
+// The length the head gave the body (Content-Length), or -1 when it
+// gave none (chunks, or up to the connection's end) or the body is
+// coded.
+pub fn bodyLength(body: *const Body) -> i64 {
+    if body.*.connection == null { return 0 }
+    if body.*.framing != message.Framing.length || body.*.encodingLength > 0 { return -1 }
+    return @intCast(i64, body.*.length)
+}
+
+// Reads the body into SINK as it comes (a coded body whole, decoded,
+// at the end), then closes its connection. Error.stopped when the sink
+// asked to stop.
+pub fn readBody(body: *Body, sink: BodySink) -> Error {
+    if body.*.connection == null { return Error.none }
+    const connection = body.*.connection.?
+    var kept = emptyBytes()
+    const coded = isCoded(body.*.encoding[0..body.*.encodingLength])
+    var reading = Reading.{ .allocator = body.*.allocator, .timeoutMs = body.*.timeoutMs, .maxBody = body.*.maxBody, .into = &kept, .hasSink = true, .sink = sink, .coded = coded }
+    var result = readFramed(&reading, connection, body.*.framing, body.*.length)
+    if result == Error.none && coded {
+        decodeBytes(body.*.allocator, body.*.encoding[0..body.*.encodingLength], &kept)
+        if kept.length > 0 && !sink.write(sink.context, kept.bytes[0..kept.length]) { result = Error.stopped }
+    }
+    freeBytesWith(body.*.allocator, &kept)
+    freeBody(body)
+    return result
+}
+
+// The body's connection closed and given back (a body not read is
+// dropped).
+pub fn freeBody(body: *Body) -> void {
+    if body.*.connection == null { return }
+    const connection = body.*.connection.?
+    closeConnectionWith(body.*.allocator, connection)
+    body.*.allocator.free(unsafe { @ptrCast([*]u8, connection) }, @sizeOf(Connection), 16)
+    body.*.connection = null
+}
+
+fn requestWith(session: *Session, req: *const Request, response: *Response, handOver: ?*Body) -> Error {
+    response.*.head = emptyBytes()
+    response.*.body = emptyBytes()
+    response.*.url = emptyBytes()
+    response.*.redirects = 0
+    var current: [MAX_URL]u8 = undefined
+    var currentLength = copyInto(&current, MAX_URL, req.*.url)
+    if currentLength != req.*.url.length { return Error.badUrl }
+    var method: [32]u8 = undefined
+    var methodLength = copyInto(&method, 32, req.*.method)
+    var body = req.*.body
+    var hasBody = req.*.hasBody
+    var authTried = false
+    var redirects: u32 = 0
+    while true {
+        var u: uri.Uri = undefined
+        if !uri.parse(current[0..currentLength], &u) || !u.hasScheme || !u.hasAuthority || u.host.length == 0 { return Error.badUrl }
+        if !uri.isHttp(&u) && !uri.isHttps(&u) { return Error.badUrl }
+        // HSTS: a known host is reached over https.
+        if session.*.hasEnforcer && uri.isHttp(&u) && hsts.mustEnforce(session.*.enforcer, uri.hostName(&u), now(session)) {
+            var secure: [MAX_URL]u8 = undefined
+            var n: usize = copyInto(&secure, MAX_URL, "https://")
+            if u.hasUserinfo {
+                n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, u.userinfo)
+                n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, "@")
+            }
+            n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, u.host)
+            if u.hasPort && uri.portOf(&u) != 80 {
+                n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, ":")
+                n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, u.port)
+            }
+            n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, u.path)
+            if u.hasQuery {
+                n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, "?")
+                n += copyInto(unsafe { @ptrCast([*]u8, &secure) + n }, MAX_URL - n, u.query)
+            }
+            currentLength = copyInto(&current, MAX_URL, secure[0..n])
+            if !uri.parse(current[0..currentLength], &u) { return Error.badUrl }
+        }
+        const https = uri.isHttps(&u)
+        const host = uri.hostName(&u)
+        const port = uri.portOf(&u)
+        var targetText: Bytes = emptyBytes()
+        var targetSink = SinkTarget.{ .session = session, .bytes = &targetText, .failed = false }
+        uri.writeTarget(uriSinkOf(&targetSink), &u)
+        var connection: *Connection = undefined
+        var result = connectTo(session, https, host, port, &connection)
+        if result != Error.none {
+            freeBytes(session, &targetText)
+            return result
+        }
+        var ex: Exchange = undefined
+        result = exchange(session, connection, &u, method[0..methodLength], targetText.bytes[0..targetText.length], req.*.headers, body, hasBody, &ex)
+        freeBytes(session, &targetText)
+        // The body: read here, unless it is the final response's and the
+        // caller takes it (requestHead).
+        const challenged = ex.status == 401 && ex.hasChallenge && !authTried && session.*.hasCredentials
+        const redirected = message.redirectOf(ex.status, method[0..methodLength]) != message.Redirect.none && ex.hasLocation && ex.locationLength > 0 && session.*.followRedirects
+        if result == Error.none && (handOver == null || challenged || redirected) { result = exchangeBody(session, connection, &ex) }
+        if result != Error.none {
+            // (A connection that failed halfway is not reused.)
+            closeConnection(session, connection)
+            freeBytes(session, &ex.head)
+            freeBytes(session, &ex.body)
+            return result
+        }
+        // A challenge answered once.
+        if ex.status == 401 && ex.hasChallenge && !authTried && session.*.hasCredentials {
+            if takeChallenge(session, https, host, port, ex.challenge[0..ex.challengeLength]) {
+                authTried = true
+                freeBytes(session, &ex.head)
+                freeBytes(session, &ex.body)
+                continue
+            }
+        }
+        // A redirect followed.
+        const redirect = message.redirectOf(ex.status, method[0..methodLength])
+        if redirect != message.Redirect.none && ex.hasLocation && ex.locationLength > 0 && session.*.followRedirects {
+            if redirects >= session.*.maxRedirects {
+                freeBytes(session, &ex.head)
+                freeBytes(session, &ex.body)
+                return Error.tooManyRedirects
+            }
+            var next: [MAX_URL]u8 = undefined
+            const n = uri.resolve(&u, ex.location[0..ex.locationLength], next[0..MAX_URL])
+            if n == 0 {
+                freeBytes(session, &ex.head)
+                freeBytes(session, &ex.body)
+                return Error.badUrl
+            }
+            var target: uri.Uri = undefined
+            if !uri.parse(next[0..n], &target) || (!uri.isHttp(&target) && !uri.isHttps(&target)) || target.host.length == 0 {
+                freeBytes(session, &ex.head)
+                freeBytes(session, &ex.body)
+                return Error.badUrl
+            }
+            if redirect == message.Redirect.asGet {
+                if !message.sameBytes(method[0..methodLength], "HEAD") { methodLength = copyInto(&method, 32, "GET") }
+                hasBody = false
+                body = body[0..0]
+            }
+            currentLength = copyInto(&current, MAX_URL, next[0..n])
+            redirects += 1
+            authTried = false
+            freeBytes(session, &ex.head)
+            freeBytes(session, &ex.body)
+            continue
+        }
+        if handOver != null {
+            // The connection leaves the session with the body on it.
+            const taken = handOver.?
+            taken.*.allocator = session.*.allocator
+            taken.*.timeoutMs = session.*.timeoutMs
+            taken.*.maxBody = session.*.maxBody
+            taken.*.framing = ex.framing
+            taken.*.length = ex.length
+            taken.*.encodingLength = copyInto(&taken.*.encoding, 64, ex.encoding[0..ex.encodingLength])
+            taken.*.connection = null
+            if ex.hasBody {
+                const memory = session.*.allocator.alloc(@sizeOf(Connection), 16)
+                if memory == null {
+                    closeConnection(session, connection)
+                    freeBytes(session, &ex.head)
+                    return Error.noMemory
+                }
+                const moved: *Connection = unsafe { @ptrCast(*Connection, memory.?) }
+                moved.* = connection.*
+                taken.*.connection = moved
+                // (The slot is free; its descriptor and TLS state are the
+                // body's now.)
+                connection.*.open = false
+                connection.*.hasTls = false
+            } else if !ex.keepAlive {
+                closeConnection(session, connection)
+            }
+        }
+        response.*.status = ex.status
+        response.*.version = ex.version
+        response.*.head = ex.head
+        response.*.body = ex.body
+        response.*.redirects = redirects
+        if !appendBytes(session, &response.*.url, current[0..currentLength]) { return Error.noMemory }
+        const head = response.*.head.bytes[0..response.*.head.length]
+        var status: message.StatusLine = undefined
+        _ = message.parseStatusLine(head[0..message.firstLineEnd(head)], &status)
+        response.*.phrase = status.phrase
+        return Error.none
+    }
+    return Error.none
+}
+
+// A GET of `url`.
+pub fn get(session: *Session, url: []const u8, response: *Response) -> Error {
+    const req = Request.{ .method = "GET", .url = url, .headers = "", .body = "", .hasBody = false }
+    return request(session, &req, response)
+}
+
+// A POST of `body` to `url` with `contentType`.
+pub fn post(session: *Session, url: []const u8, contentType: []const u8, body: []const u8, response: *Response) -> Error {
+    var extra: [320]u8 = undefined
+    var n = copyInto(&extra, 320, "Content-Type: ")
+    n += copyInto(unsafe { @ptrCast([*]u8, &extra) + n }, 320 - n, contentType)
+    n += copyInto(unsafe { @ptrCast([*]u8, &extra) + n }, 320 - n, "\r\n")
+    const req = Request.{ .method = "POST", .url = url, .headers = extra[0..n], .body = body, .hasBody = true }
+    return request(session, &req, response)
+}
+
+// The first header `name` of a response: its value (folded into
+// `folded`), false when there is none.
+pub fn header(response: *const Response, name: []const u8, folded: []u8, value: *[]const u8) -> bool {
+    return lookupHeader(response.*.head.bytes[0..response.*.head.length], name, folded, value)
+}
+
+pub fn body(response: *const Response) -> []const u8 { return response.*.body.bytes[0..response.*.body.length] }

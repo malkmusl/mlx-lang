@@ -5,22 +5,7 @@
 // starts it under mlx-profile (tools/profile), which writes the profile
 // the Observatory then reads for Run time.
 const std = @import("std")
-
-const SYS_read: usize = 0
-const SYS_close: usize = 3
-const SYS_dup2: usize = 33
-// vfork: the child only runs execve (the Observatory's memory is big).
-const SYS_vfork: usize = 58
-const SYS_execve: usize = 59
-const SYS_exit: usize = 60
-const SYS_wait4: usize = 61
-const SYS_kill: usize = 62
-const SYS_chdir: usize = 80
-const SYS_pipe2: usize = 293
-const O_CLOEXEC: usize = 524288
-const O_NONBLOCK: usize = 2048
-const WNOHANG: usize = 1
-const SIGTERM: usize = 15
+const spawn_module = @import("std.spawn")
 
 pub const OUTPUT: usize = 16384
 
@@ -36,6 +21,8 @@ pub const Run = struct {
     // (-1: it has not ended yet).
     status: i32
     profiled: bool
+    // Run with MLX_LEAK_CHECK: its memory shows under Memory.
+    watched: bool
     stopped: bool
     output: [16384]u8
     outputLength: usize
@@ -50,12 +37,13 @@ pub fn init(run: *Run) -> void {
     run.*.ended = 0
     run.*.status = -1
     run.*.profiled = false
+    run.*.watched = false
     run.*.stopped = false
     run.*.outputLength = 0
 }
 
 fn outputBytes(run: *Run) -> [*]u8 {
-    unsafe { return @ptrFromInt([*]u8, @intFromPtr(run) + @offsetOf(Run, "output")) }
+    return &run.*.output
 }
 
 pub fn output(run: *Run) -> []const u8 { return outputBytes(run)[0..run.*.outputLength] }
@@ -65,38 +53,31 @@ pub fn output(run: *Run) -> []const u8 { return outputBytes(run)[0..run.*.output
 // did not start (or one still runs).
 pub fn start(run: *Run, root: [*]const u8, program: [*]const u8, profiler: [*]const u8, environment: [*][*]const u8, now: usize) -> bool {
     if run.*.running { return false }
-    var pipes: [2]i32 = [2]i32{ -1, -1 }
-    var made: isize = 0
-    unsafe { made = std.linux.syscall2(SYS_pipe2, @intFromPtr(&pipes), O_CLOEXEC | O_NONBLOCK) }
-    if made != 0 { return false }
     const profiled = profiler[0] != 0
-    const child = std.linux.syscall0(SYS_vfork)
-    if child == 0 {
-        const out = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 1)
-        const err = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 2)
-        const moved = std.linux.syscall1(SYS_chdir, @intFromPtr(root))
-        var arguments: [3][*]const u8 = undefined
-        arguments[0] = if profiled { profiler } else { program }
-        unsafe {
-            arguments[1] = if profiled { program } else { @ptrFromInt([*]const u8, 0) }
-            arguments[2] = @ptrFromInt([*]const u8, 0)
-        }
-        const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(&arguments), @intFromPtr(environment))
-        const exited = std.linux.syscall1(SYS_exit, 127)
+    var arguments: [3][*]const u8 = undefined
+    arguments[0] = if profiled { profiler } else { program }
+    var options: spawn_module.Options = undefined
+    unsafe {
+        arguments[1] = if profiled { program } else { @ptrFromInt([*]const u8, 0) }
+        arguments[2] = @ptrFromInt([*]const u8, 0)
+        options = spawn_module.options(arguments[0], @ptrCast([*][*]const u8, &arguments), environment)
     }
-    const writing = std.linux.syscall1(SYS_close, @intCast(usize, pipes[1]))
-    if child < 0 {
-        const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
-        return false
-    }
+    // In the workspace; vforked: the child only runs execve (the
+    // Observatory's memory is big).
+    options.directory = root
+    options.shareMemory = true
+    var reading: isize = -1
+    const child = spawn_module.startReading(&options, true, true, &reading)
+    if child < 0 { return false }
     run.*.pid = child
-    run.*.pipe = @intCast(isize, pipes[0])
+    run.*.pipe = reading
     run.*.drained = false
     run.*.running = true
     run.*.started = now
     run.*.ended = 0
     run.*.status = -1
     run.*.profiled = profiled
+    run.*.watched = false
     run.*.stopped = false
     run.*.outputLength = 0
     return true
@@ -130,10 +111,9 @@ pub fn pump(run: *Run, now: usize) -> bool {
     if !run.*.running { return false }
     var buffer: [4096]u8 = undefined
     while !run.*.drained {
-        var count: isize = 0
-        unsafe { count = std.linux.syscall3(SYS_read, @bitCast(usize, run.*.pipe), @intFromPtr(&buffer), 4096) }
+        const count = std.linux.read(run.*.pipe, &buffer, 4096)
         if count > 0 {
-            unsafe { keep(run, @ptrCast([*]const u8, &buffer), @bitCast(usize, count)) }
+            unsafe { keep(run, &buffer, @bitCast(usize, count)) }
         } else if count == 0 {
             run.*.drained = true
         } else {
@@ -141,25 +121,22 @@ pub fn pump(run: *Run, now: usize) -> bool {
             break
         }
     }
-    var status: i32 = 0
-    var waited: isize = 0
-    unsafe { waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, run.*.pid), @intFromPtr(&status), WNOHANG, 0) }
-    if waited == 0 { return false }
+    var status: usize = 0
+    if !spawn_module.ended(run.*.pid, &status) { return false }
     // Ended: what is left in the pipe, then it is closed.
     if !run.*.drained {
         while true {
-            var count: isize = 0
-            unsafe { count = std.linux.syscall3(SYS_read, @bitCast(usize, run.*.pipe), @intFromPtr(&buffer), 4096) }
+            const count = std.linux.read(run.*.pipe, &buffer, 4096)
             if count <= 0 { break }
-            unsafe { keep(run, @ptrCast([*]const u8, &buffer), @bitCast(usize, count)) }
+            unsafe { keep(run, &buffer, @bitCast(usize, count)) }
         }
     }
-    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, run.*.pipe))
+    std.linux.close(run.*.pipe)
     run.*.pipe = -1
     run.*.drained = true
     run.*.running = false
     run.*.ended = now
-    run.*.status = if waited < 0 { 255 } else if status & 127 == 0 { (status >> 8) & 255 } else { 128 + (status & 127) }
+    run.*.status = @intCast(i32, status)
     return true
 }
 
@@ -168,7 +145,7 @@ pub fn pump(run: *Run, now: usize) -> bool {
 pub fn stop(run: *Run) -> void {
     if !run.*.running { return }
     run.*.stopped = true
-    const asked = std.linux.syscall2(SYS_kill, @bitCast(usize, run.*.pid), SIGTERM)
+    _ = std.linux.process.kill(run.*.pid, std.linux.SIGTERM)
 }
 
 // The last `wanted` lines of the output (at most 16): where each starts

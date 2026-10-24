@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Writes projects/cc/names.mlx: the names mlx-cc interns first, in a fixed
+"""Writes compiler/cc/names.mlx: the names mlx-cc interns first, in a fixed
 order, so each has a constant id (punctuators P_*, keywords K_*, the
 preprocessor's words D_*).
 
-    python3 tools/cc/gen_names.py > projects/cc/names.mlx
+    python3 tools/cc/gen_names.py > compiler/cc/names.mlx
 """
 puncts = [
     ("ELLIPSIS", "..."), ("SHL_ASSIGN", "<<="), ("SHR_ASSIGN", ">>="),
@@ -17,6 +17,8 @@ puncts = [
     ("MINUS", "-"), ("STAR", "*"), ("SLASH", "/"), ("PERCENT", "%"), ("AMP", "&"),
     ("PIPE", "|"), ("CARET", "^"), ("TILDE", "~"), ("BANG", "!"), ("QUESTION", "?"),
     ("COLON", ":"), ("ASSIGN", "="), ("LT", "<"), ("GT", ">"), ("HASH", "#"),
+    # C++'s own.
+    ("SCOPE", "::"), ("ARROW_STAR", "->*"), ("DOT_STAR", ".*"),
 ]
 keywords = [
     "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
@@ -29,12 +31,26 @@ keywords = [
     "asm", "__typeof__", "typeof", "__signed__", "__builtin_va_list",
     "__builtin_va_start", "__builtin_va_end", "__builtin_va_arg", "__builtin_va_copy",
     "__builtin_offsetof", "__alignof__", "__thread",
+    # C23's spellings (keywords from -std=c23 on; literal.mlx maps the
+    # alternate ones to the C11 keywords above).
+    "bool", "true", "false", "nullptr", "static_assert", "alignas", "alignof",
+    "thread_local", "typeof_unqual", "constexpr", "_BitInt",
+    # C++'s keywords (from K_CLASS to K_TYPEID; keywords in C++ only).
+    "class", "namespace", "using", "new", "delete", "this", "operator",
+    "template", "typename", "public", "private", "protected", "virtual",
+    "explicit", "friend", "mutable", "throw", "try", "catch", "const_cast",
+    "static_cast", "reinterpret_cast", "dynamic_cast", "wchar_t", "char16_t",
+    "char32_t", "decltype", "noexcept", "export", "typeid",
 ]
+FIRST_CPP = "class"
+LAST_CPP = "typeid"
 directives = [
     "include", "include_next", "define", "undef", "if", "ifdef", "ifndef", "elif",
-    "else", "endif", "error", "warning", "pragma", "line", "defined", "__VA_ARGS__",
+    "elifdef", "elifndef", "else", "endif", "error", "warning", "pragma", "line",
+    "defined", "__VA_ARGS__",
     "once", "__FILE__", "__LINE__", "__COUNTER__", "__DATE__", "__TIME__",
-    "__has_include", "__has_include_next", "__BASE_FILE__", "__VA_OPT__", "main",
+    "__has_include", "__has_include_next", "__BASE_FILE__", "__VA_OPT__", "embed",
+    "__has_embed", "main",
     "_start", "exit", "__mlxcc_init",
 ]
 
@@ -44,8 +60,10 @@ OVERRIDES = {
     "__VA_ARGS__": "VA_ARGS", "__FILE__": "FILE_MACRO", "__LINE__": "LINE_MACRO",
     "__COUNTER__": "COUNTER", "__DATE__": "DATE", "__TIME__": "TIME",
     "__has_include": "HAS_INCLUDE", "__has_include_next": "HAS_INCLUDE_NEXT",
-    "__BASE_FILE__": "BASE_FILE", "__VA_OPT__": "VA_OPT",
+    "__BASE_FILE__": "BASE_FILE", "__VA_OPT__": "VA_OPT", "__has_embed": "HAS_EMBED",
     "__mlxcc_init": "MLXCC_INIT", "_start": "START",
+    "bool": "C23_BOOL", "static_assert": "C23_STATIC_ASSERT", "alignas": "C23_ALIGNAS",
+    "alignof": "C23_ALIGNOF", "thread_local": "C23_THREAD_LOCAL",
 }
 
 def const_name(word):
@@ -88,6 +106,8 @@ out.append(f"pub const FIRST_PUNCT: u32 = 1")
 out.append(f"pub const LAST_PUNCT: u32 = {len(puncts)}")
 out.append(f"pub const FIRST_KEYWORD: u32 = {len(puncts) + 1}")
 out.append(f"pub const LAST_KEYWORD: u32 = {len(puncts) + len(keywords)}")
+out.append(f"pub const FIRST_CPP: u32 = {len(puncts) + 1 + keywords.index(FIRST_CPP)}")
+out.append(f"pub const LAST_CPP: u32 = {len(puncts) + 1 + keywords.index(LAST_CPP)}")
 out.append("")
 out.append("fn fixed(text: []const u8, id: u32) -> void {")
 out.append("    if base.intern(text) != id { base.fatal(\"the fixed names are out of order\") }")

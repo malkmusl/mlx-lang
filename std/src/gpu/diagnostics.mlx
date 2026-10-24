@@ -1,0 +1,546 @@
+// std.gpu.diagnostics: the GPU's side of std.diagnostics, for every
+// context std.gpu opens. Each pass of a frame (a dispatch, a copy, a fill)
+// is noted with the functions that recorded it, read along the frame
+// pointers as std.crash reads a crash's:
+//
+// - Crashes: after each pass the GPU writes how many of the frame's passes
+//   it finished into a word the program can read (a breadcrumb). When the
+//   device is lost, or a frame does not finish in five seconds (a hang),
+//   the first pass not finished is the one that failed: the program says
+//   so on stderr with the functions that recorded it, and keeps it as a
+//   gpu-crash line in crashes.log. Once per context; the calls go on
+//   failing as before.
+//
+// - Profile: with MLX_GPU_PROFILE in the environment (1 for the profiles
+//   directory, else a directory; mlx-profile sets it for the programs it
+//   runs) each pass is timed with timestamps, and the time is put on the
+//   functions that recorded it: on the first as its own, on all of them as
+//   theirs with what they called, as a processor profile puts samples. The
+//   profile is written every two seconds while the program runs and when
+//   the context closes, as PROGRAM-gpu-SECONDS.profile in microseconds.
+//
+// - Frames: with MLX_FRAMES (std.diagnostics' frames) each frame's work
+//   gets a timestamp at its start and its end, and the GPU's time goes on
+//   the frame the program was drawing when it began.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const crash = @import("std.crash")
+const diagnostics = @import("std.diagnostics")
+const gpu = @import("std.gpu")
+
+const Context = gpu.Context
+
+// The passes of one frame, and the functions kept of each.
+pub const PASSES: usize = 512
+pub const DEPTH: usize = 8
+// The recording stacks a profile keeps (more are put on the last).
+const PLACES: usize = 1024
+// Names of functions, and their text.
+const NAMES: usize = 4096
+const NAME_SLOTS: usize = 8192
+const NAME_TEXT: usize = 524288
+const MESSAGE_SIZE: usize = 65536
+const WRITE_EVERY: usize = 2
+// The longest a frame may take before it counts as a hang (std.gpu waits
+// five seconds).
+pub const HANG_SECONDS: usize = 5
+
+pub const DISPATCH: u8 = 0
+pub const COPY: u8 = 1
+pub const FILL: u8 = 2
+pub const IMAGE: u8 = 3
+
+pub const State = struct {
+    // The breadcrumb: (frame serial & 0xFFFF) << 16 | passes finished.
+    marker: gpu.Buffer
+    hasMarker: bool
+    serial: u32
+    passes: usize
+    kinds: [*]u8
+    stacks: [*]usize
+    // Timestamps (profiling): two a pass.
+    profiling: bool
+    queryPool: vk.QueryPool
+    // Nanoseconds a tick, times 1024; the bits a timestamp has.
+    period: u64
+    validMask: u64
+    results: [*]u64
+    // The profile: each recording stack with its time.
+    placeStacks: [*]usize
+    placeNanoseconds: [*]u64
+    placeCount: usize
+    started: usize
+    written: usize
+    changed: bool
+    directory: [1024]u8
+    directoryLength: usize
+    program: [256]u8
+    programLength: usize
+    // Names of the functions met (cached: naming one reads the symbol table).
+    nameKeys: [*]usize
+    nameValues: [*]u32
+    nameStart: [*]u32
+    nameLength: [*]u32
+    nameSelf: [*]u64
+    nameTotal: [*]u64
+    nameMark: [*]u32
+    nameCount: usize
+    nameText: [*]u8
+    nameUsed: usize
+    message: [*]u8
+    reported: bool
+    // Frames: two timestamps a frame, and the frame (std.diagnostics') the
+    // work belongs to.
+    frameTiming: bool
+    frameQueries: vk.QueryPool
+    frameSerial: usize
+}
+
+fn stateOf(context: *const Context) -> *State {
+    unsafe { return @ptrFromInt(*State, context.*.diagnostics) }
+}
+
+fn allocate(context: *Context, size: usize) -> usize {
+    const memory = context.*.allocator.alloc(size, 16)
+    if memory == null { return 0 }
+    return @intFromPtr(memory.?)
+}
+
+fn bytes(address: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, address) }
+}
+
+// Sets up the breadcrumb and, when asked for, the timestamps; called by
+// gpu.open once the device is there. Nothing is noted when it cannot.
+pub fn open(context: *Context) -> void {
+    context.*.diagnostics = 0
+    const memory = allocate(context, @sizeOf(State))
+    const kinds = allocate(context, PASSES)
+    const stacks = allocate(context, PASSES * DEPTH * 8)
+    const message = allocate(context, MESSAGE_SIZE)
+    if memory == 0 || kinds == 0 || stacks == 0 || message == 0 { return }
+    var state: *State = undefined
+    unsafe {
+        state = @ptrFromInt(*State, memory)
+        state.*.kinds = @ptrFromInt([*]u8, kinds)
+        state.*.stacks = @ptrFromInt([*]usize, stacks)
+        state.*.message = @ptrFromInt([*]u8, message)
+    }
+    state.*.serial = 0
+    state.*.passes = 0
+    state.*.reported = false
+    state.*.profiling = false
+    state.*.placeCount = 0
+    state.*.nameCount = 0
+    state.*.nameUsed = 0
+    state.*.changed = false
+    state.*.frameTiming = false
+    state.*.frameSerial = 0
+    state.*.hasMarker = gpu.createBuffer(context, &state.*.marker, 16, false)
+    if state.*.hasMarker {
+        const word: [*]u32 = unsafe { @ptrFromInt([*]u32, state.*.marker.address) }
+        word[0] = 0
+    }
+    context.*.diagnostics = memory
+    if diagnostics.framesOn() && timestamps(context, state) {
+        var frame_info = vk.QueryPoolCreateInfo.init()
+        frame_info.queryType = vk.QueryType.timestamp
+        frame_info.queryCount = 2
+        var frame_pool: vk.QueryPool = 0
+        if vk.createQueryPool(context.*.commands, context.*.device, &frame_info, null, &frame_pool) == vk.Result.success {
+            state.*.frameQueries = frame_pool
+            state.*.frameTiming = true
+        }
+    }
+    const directory: [*]u8 = &state.*.directory
+    const asked = diagnostics.environmentValue("MLX_GPU_PROFILE", directory, 1000)
+    if asked == 0 || (asked == 1 && directory[0] == 48) { return }
+    state.*.directoryLength = if asked == 1 && directory[0] == 49 { 0 } else { asked }
+    startProfile(context, state)
+}
+
+// Whether the queue has timestamps; the bits they have and how long a
+// tick is.
+fn timestamps(context: *Context, state: *State) -> bool {
+    var count: u32 = 0
+    vk.getPhysicalDeviceQueueFamilyProperties(context.*.instanceCommands, context.*.physical, &count, null)
+    if count == 0 || count > 64 { return false }
+    const families_memory = allocate(context, @intCast(usize, count) * @sizeOf(vk.QueueFamilyProperties))
+    if families_memory == 0 { return false }
+    const families: [*]vk.QueueFamilyProperties = unsafe { @ptrFromInt([*]vk.QueueFamilyProperties, families_memory) }
+    vk.getPhysicalDeviceQueueFamilyProperties(context.*.instanceCommands, context.*.physical, &count, families)
+    const bits = families[context.*.family].timestampValidBits
+    if bits == 0 { return false }
+    var mask: u64 = 0
+    var bit: u32 = 0
+    while bit < bits && bit < 64 {
+        mask = (mask << 1) | 1
+        bit += 1
+    }
+    state.*.validMask = mask
+    var properties: vk.PhysicalDeviceProperties = undefined
+    vk.getPhysicalDeviceProperties(context.*.instanceCommands, context.*.physical, &properties)
+    const scaled: i64 = @intFromFloat(i64, properties.limits.timestampPeriod * 1024.0)
+    state.*.period = if scaled > 0 { @bitCast(u64, scaled) } else { 1024 }
+    return true
+}
+
+fn startProfile(context: *Context, state: *State) -> void {
+    // Timestamps on the queue, and how long a tick is.
+    if !timestamps(context, state) { return }
+    var info = vk.QueryPoolCreateInfo.init()
+    info.queryType = vk.QueryType.timestamp
+    info.queryCount = @intCast(u32, PASSES * 2)
+    var pool: vk.QueryPool = 0
+    if vk.createQueryPool(context.*.commands, context.*.device, &info, null, &pool) != vk.Result.success { return }
+    state.*.queryPool = pool
+    const results = allocate(context, PASSES * 2 * 8)
+    const place_stacks = allocate(context, PLACES * DEPTH * 8)
+    const place_time = allocate(context, PLACES * 8)
+    const keys = allocate(context, NAME_SLOTS * 8)
+    const values = allocate(context, NAME_SLOTS * 4)
+    const starts = allocate(context, NAMES * 4)
+    const lengths = allocate(context, NAMES * 4)
+    const selfs = allocate(context, NAMES * 8)
+    const totals = allocate(context, NAMES * 8)
+    const marks = allocate(context, NAMES * 4)
+    const text = allocate(context, NAME_TEXT)
+    if results == 0 || place_stacks == 0 || place_time == 0 || keys == 0 || values == 0 || starts == 0 || lengths == 0 || selfs == 0 || totals == 0 || marks == 0 || text == 0 { return }
+    unsafe {
+        state.*.results = @ptrFromInt([*]u64, results)
+        state.*.placeStacks = @ptrFromInt([*]usize, place_stacks)
+        state.*.placeNanoseconds = @ptrFromInt([*]u64, place_time)
+        state.*.nameKeys = @ptrFromInt([*]usize, keys)
+        state.*.nameValues = @ptrFromInt([*]u32, values)
+        state.*.nameStart = @ptrFromInt([*]u32, starts)
+        state.*.nameLength = @ptrFromInt([*]u32, lengths)
+        state.*.nameSelf = @ptrFromInt([*]u64, selfs)
+        state.*.nameTotal = @ptrFromInt([*]u64, totals)
+        state.*.nameMark = @ptrFromInt([*]u32, marks)
+        state.*.nameText = @ptrFromInt([*]u8, text)
+    }
+    var slot: usize = 0
+    while slot < NAME_SLOTS {
+        state.*.nameKeys[slot] = 0
+        slot += 1
+    }
+    const program: [*]u8 = &state.*.program
+    state.*.programLength = diagnostics.programName(program, 255)
+    state.*.started = diagnostics.now()
+    state.*.written = state.*.started
+    state.*.profiling = true
+}
+
+// A frame's recording began (gpu.begin): its passes are counted anew.
+pub fn beginFrame(context: *Context) -> void {
+    if context.*.diagnostics == 0 { return }
+    const state = stateOf(context)
+    state.*.serial = (state.*.serial + 1) & 65535
+    state.*.passes = 0
+    if state.*.profiling { vk.cmdResetQueryPool(context.*.commands, context.*.commandBuffer, state.*.queryPool, 0, @intCast(u32, PASSES * 2)) }
+    if state.*.frameTiming {
+        state.*.frameSerial = diagnostics.frameCurrent()
+        vk.cmdResetQueryPool(context.*.commands, context.*.commandBuffer, state.*.frameQueries, 0, 2)
+        vk.cmdWriteTimestamp(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, state.*.frameQueries, 0)
+    }
+}
+
+// The frame's work is all recorded (gpu.submitFrame, before the command
+// buffer ends): its end time.
+pub fn endFrame(context: *Context) -> void {
+    if context.*.diagnostics == 0 { return }
+    const state = stateOf(context)
+    if state.*.frameTiming { vk.cmdWriteTimestamp(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state.*.frameQueries, 1) }
+}
+
+// A pass begins: who recorded it, and its start time. Called straight from
+// the std.gpu function that records it, so the functions kept are from
+// that function's caller on.
+pub fn passStart(context: *Context, kind: u8) -> void {
+    if context.*.diagnostics == 0 { return }
+    const state = stateOf(context)
+    if state.*.passes >= PASSES { return }
+    const pass = state.*.passes
+    state.*.kinds[pass] = kind
+    var frame = @frameAddress()
+    var count: usize = 0
+    var skipped = false
+    while count < DEPTH && frame != 0 && frame & 7 == 0 {
+        const words: [*]const usize = unsafe { @ptrFromInt([*]const usize, frame) }
+        const back = words[1]
+        if back < 4096 { break }
+        // This function's return into std.gpu is no news.
+        if skipped {
+            state.*.stacks[pass * DEPTH + count] = back
+            count += 1
+        }
+        skipped = true
+        const next = words[0]
+        if next <= frame || next - frame > 1048576 { break }
+        frame = next
+    }
+    while count < DEPTH {
+        state.*.stacks[pass * DEPTH + count] = 0
+        count += 1
+    }
+    if state.*.profiling { vk.cmdWriteTimestamp(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT, state.*.queryPool, @intCast(u32, pass * 2)) }
+}
+
+// The pass was recorded: its end time, and the breadcrumb once all before
+// it finished.
+pub fn passEnd(context: *Context) -> void {
+    if context.*.diagnostics == 0 { return }
+    const state = stateOf(context)
+    if state.*.passes >= PASSES { return }
+    const pass = state.*.passes
+    state.*.passes += 1
+    if state.*.profiling { vk.cmdWriteTimestamp(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state.*.queryPool, @intCast(u32, pass * 2 + 1)) }
+    if !state.*.hasMarker { return }
+    vk.cmdPipelineBarrier(context.*.commands, context.*.commandBuffer, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 0, null)
+    vk.cmdFillBuffer(context.*.commands, context.*.commandBuffer, state.*.marker.buffer, 0, 4, (state.*.serial << 16) | @intCast(u32, pass + 1))
+}
+
+// The frame finished (its fence signalled): its passes' times go on the
+// functions that recorded them; the profile is written every few seconds.
+pub fn frameDone(context: *Context) -> void {
+    if context.*.diagnostics == 0 { return }
+    const state = stateOf(context)
+    if state.*.frameTiming {
+        var stamps: [2]u64 = [2]u64{ 0, 0 }
+        const read = vk.getQueryPoolResults(context.*.commands, context.*.device, state.*.frameQueries, 0, 2, 16, &stamps, 8, vk.QUERY_RESULT_64_BIT)
+        if read == vk.Result.success {
+            const ticks = ((stamps[1] & state.*.validMask) - (stamps[0] & state.*.validMask)) & state.*.validMask
+            diagnostics.frameGpu(state.*.frameSerial, ticks * state.*.period / 1024)
+        }
+    }
+    if !state.*.profiling || state.*.passes == 0 { return }
+    const count = state.*.passes
+    const got = vk.getQueryPoolResults(context.*.commands, context.*.device, state.*.queryPool, 0, @intCast(u32, count * 2), count * 16, unsafe { @ptrCast(*anyopaque, state.*.results) }, 8, vk.QUERY_RESULT_64_BIT)
+    if got != vk.Result.success { return }
+    var pass: usize = 0
+    while pass < count {
+        const begin = state.*.results[pass * 2] & state.*.validMask
+        const end = state.*.results[pass * 2 + 1] & state.*.validMask
+        const ticks = (end - begin) & state.*.validMask
+        addTime(state, pass, ticks * state.*.period / 1024)
+        pass += 1
+    }
+    state.*.changed = true
+    const time = diagnostics.now()
+    if time >= state.*.written + WRITE_EVERY { writeProfile(state) }
+}
+
+fn sameStack(state: *State, place: usize, pass: usize) -> bool {
+    var at: usize = 0
+    while at < DEPTH {
+        if state.*.placeStacks[place * DEPTH + at] != state.*.stacks[pass * DEPTH + at] { return false }
+        at += 1
+    }
+    return true
+}
+
+fn addTime(state: *State, pass: usize, nanoseconds: u64) -> void {
+    var place: usize = 0
+    while place < state.*.placeCount {
+        if sameStack(state, place, pass) {
+            state.*.placeNanoseconds[place] += nanoseconds
+            return
+        }
+        place += 1
+    }
+    if state.*.placeCount >= PLACES {
+        state.*.placeNanoseconds[PLACES - 1] += nanoseconds
+        return
+    }
+    place = state.*.placeCount
+    var at: usize = 0
+    while at < DEPTH {
+        state.*.placeStacks[place * DEPTH + at] = state.*.stacks[pass * DEPTH + at]
+        at += 1
+    }
+    state.*.placeNanoseconds[place] = nanoseconds
+    state.*.placeCount += 1
+}
+
+// The name (index) of the function a return address is in, cached; NAMES
+// when it has none.
+fn nameOf(state: *State, address: usize) -> usize {
+    const mask = NAME_SLOTS - 1
+    var slot = (address >> 4) & mask
+    while state.*.nameKeys[slot] != 0 {
+        if state.*.nameKeys[slot] == address { return @intCast(usize, state.*.nameValues[slot]) }
+        slot = (slot + 1) & mask
+    }
+    var named = NAMES
+    if state.*.nameCount < NAMES && state.*.nameUsed + 4096 < NAME_TEXT {
+        // path:line:function+0xOFFSET ...: the function is up to the "+".
+        const start = state.*.nameUsed
+        var length: usize = 0
+        crash.describeReturn(address, bytes(@intFromPtr(state.*.nameText) + start), &length)
+        var end: usize = 0
+        while end < length && state.*.nameText[start + end] != 43 && state.*.nameText[start + end] != 32 { end += 1 }
+        // The same function at another address: one name.
+        var other: usize = 0
+        while other < state.*.nameCount && named == NAMES {
+            if @intCast(usize, state.*.nameLength[other]) == end && std.text.same(state.*.nameText[@intCast(usize, state.*.nameStart[other])..@intCast(usize, state.*.nameStart[other]) + end], state.*.nameText[start..start + end]) { named = other }
+            other += 1
+        }
+        if named == NAMES && end > 0 {
+            named = state.*.nameCount
+            state.*.nameStart[named] = @intCast(u32, start)
+            state.*.nameLength[named] = @intCast(u32, end)
+            state.*.nameUsed += end
+            state.*.nameCount += 1
+        }
+    }
+    if state.*.nameCount < NAMES || named != NAMES {
+        state.*.nameKeys[slot] = address
+        state.*.nameValues[slot] = @intCast(u32, named)
+    }
+    return named
+}
+
+// Writes the profile: each place's time on the functions of its stack, in
+// microseconds.
+fn writeProfile(state: *State) -> void {
+    state.*.written = diagnostics.now()
+    state.*.changed = false
+    var name: usize = 0
+    while name < state.*.nameCount {
+        state.*.nameSelf[name] = 0
+        state.*.nameTotal[name] = 0
+        state.*.nameMark[name] = 0
+        name += 1
+    }
+    var all: u64 = 0
+    var place: usize = 0
+    while place < state.*.placeCount {
+        const time = state.*.placeNanoseconds[place] / 1000
+        all += time
+        var at: usize = 0
+        while at < DEPTH && state.*.placeStacks[place * DEPTH + at] != 0 {
+            const named = nameOf(state, state.*.placeStacks[place * DEPTH + at])
+            if named < NAMES {
+                if at == 0 { state.*.nameSelf[named] += time }
+                // A function in the stack twice counts once.
+                if state.*.nameMark[named] != @intCast(u32, place + 1) {
+                    state.*.nameMark[named] = @intCast(u32, place + 1)
+                    state.*.nameTotal[named] += time
+                }
+            }
+            at += 1
+        }
+        place += 1
+    }
+    var file: diagnostics.ProfileFile = undefined
+    const program: [*]const u8 = &state.*.program
+    const directory: [*]const u8 = &state.*.directory
+    if !diagnostics.openProfile(&file, diagnostics.Source.gpu, directory[0..state.*.directoryLength], program[0..state.*.programLength], state.*.started, all, 1) { return }
+    name = 0
+    while name < state.*.nameCount {
+        if state.*.nameTotal[name] > 0 {
+            const start = @intCast(usize, state.*.nameStart[name])
+            diagnostics.profileLine(&file, state.*.nameSelf[name], state.*.nameTotal[name], state.*.nameText[start..start + @intCast(usize, state.*.nameLength[name])])
+        }
+        name += 1
+    }
+    diagnostics.closeProfile(&file)
+}
+
+// A call on the device failed with `result`: a lost device, or a frame
+// that did not finish in time, is a GPU crash, said and kept once.
+pub fn failed(context: *Context, result: vk.Result) -> void {
+    if context.*.diagnostics == 0 { return }
+    if result != vk.Result.errorDeviceLost && result != vk.Result.timeout { return }
+    const state = stateOf(context)
+    if state.*.reported { return }
+    state.*.reported = true
+    var finished: usize = 0
+    if state.*.hasMarker {
+        const word: [*]const u32 = unsafe { @ptrFromInt([*]const u32, state.*.marker.address) }
+        const value = word[0]
+        if value >> 16 == state.*.serial { finished = @intCast(usize, value & 65535) }
+    }
+    const message = state.*.message
+    var length: usize = 0
+    var name: [256]u8 = undefined
+    const name_bytes: [*]u8 = &name
+    const name_length = diagnostics.processName(name_bytes, 256)
+    diagnostics.putBytes(message, &length, name_bytes, name_length)
+    diagnostics.put(message, &length, ": crashed: ")
+    const reason_start = length
+    if result == vk.Result.errorDeviceLost {
+        diagnostics.put(message, &length, "GPU device lost (the driver reset it after a hang or a fault)")
+    } else {
+        diagnostics.put(message, &length, "GPU hang (a frame did not finish in ")
+        diagnostics.putNumber(message, &length, HANG_SECONDS)
+        diagnostics.put(message, &length, " s)")
+    }
+    const failing = finished
+    if failing < state.*.passes {
+        diagnostics.put(message, &length, ", in pass ")
+        diagnostics.putNumber(message, &length, failing + 1)
+        diagnostics.put(message, &length, " of ")
+        diagnostics.putNumber(message, &length, state.*.passes)
+        diagnostics.put(message, &length, kindName(state.*.kinds[failing]))
+    } else if state.*.passes > 0 {
+        diagnostics.put(message, &length, ", after all ")
+        diagnostics.putNumber(message, &length, state.*.passes)
+        diagnostics.put(message, &length, " passes of the frame")
+    }
+    const reason_end = length
+    diagnostics.put(message, &length, "\n")
+    // The record (program, reason, frames) after the message.
+    const record_start = length
+    var record_length: usize = 0
+    const record = bytes(@intFromPtr(message) + record_start)
+    diagnostics.putBytes(record, &record_length, name_bytes, name_length)
+    diagnostics.put(record, &record_length, "\t")
+    diagnostics.putBytes(record, &record_length, bytes(@intFromPtr(message) + reason_start), reason_end - reason_start)
+    if failing < state.*.passes {
+        var at: usize = 0
+        while at < DEPTH && state.*.stacks[failing * DEPTH + at] != 0 && record_start + record_length + 2048 < MESSAGE_SIZE / 2 {
+            diagnostics.put(record, &record_length, "\t")
+            crash.describeReturn(state.*.stacks[failing * DEPTH + at], record, &record_length)
+            at += 1
+        }
+    }
+    // The message: each frame on a line of its own.
+    const shown = bytes(@intFromPtr(message) + record_start + record_length + 1)
+    var shown_length: usize = 0
+    diagnostics.putBytes(shown, &shown_length, message, record_start - 1)
+    var field: usize = 0
+    var at: usize = 0
+    while at < record_length {
+        if record[at] == 9 {
+            field += 1
+            if field >= 2 { diagnostics.put(shown, &shown_length, if field == 2 { "\n  recorded at " } else { "\n  from " }) }
+        } else if field >= 2 {
+            shown[shown_length] = record[at]
+            shown_length += 1
+        }
+        at += 1
+    }
+    diagnostics.put(shown, &shown_length, "\n")
+    _ = std.io.writeAllBytes(std.io.stderr(), shown, shown_length)
+    diagnostics.keepCrash(diagnostics.Source.gpu, record, record_length)
+}
+
+fn kindName(kind: u8) -> []const u8 {
+    if kind == DISPATCH { return " (a dispatch)" }
+    if kind == COPY { return " (a copy)" }
+    if kind == FILL { return " (a fill)" }
+    return " (an image copy)"
+}
+
+// The context closes: the profile a last time.
+pub fn close(context: *Context) -> void {
+    if context.*.diagnostics == 0 { return }
+    const state = stateOf(context)
+    if state.*.profiling {
+        if state.*.changed { writeProfile(state) }
+        vk.destroyQueryPool(context.*.commands, context.*.device, state.*.queryPool, null)
+    }
+    if state.*.hasMarker { gpu.destroyBuffer(context, &state.*.marker) }
+    context.*.diagnostics = 0
+}

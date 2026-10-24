@@ -11,6 +11,7 @@
 `117_multi_return_memory_runtime.mlx`, `46_error_union_abi_runtime.mlx`,
 `58_error_union_slice_abi_runtime.mlx`, `59_error_union_float_abi_runtime.mlx`,
 `61_error_union_memory_abi_runtime.mlx`, `62_error_union_multi_register_abi_runtime.mlx`,
+`323_error_union_payload_words_runtime.mlx`,
 `177_float_sse_runtime.mlx`, `178_float_cast_abi_runtime.mlx`,
 `186_threadlocal_abi_gap.mlx`, `198_direct_and_indirect_call_runtime.mlx`,
 `130_function_pointer_runtime.mlx`, `229_aggregate_field_assignment_runtime.mlx`
@@ -131,6 +132,10 @@ fn overflowBanks(i0: u8, i1: u8, i2: u8, i3: u8, i4: u8, i5: u8, i6: u8, f0: f64
 
 (`tests/178_float_cast_abi_runtime.mlx`)
 
+`tests/312_float_arguments_runtime.mlx` mixes integer and float parameters
+past the sixth integer register, and takes `@intFromFloat(T, value)`
+without a declared result type.
+
 Normal-return floating values use `xmm0` (and `xmm1` for a second
 eightbyte), per `<NormalReturn><Floating first="xmm0" second="xmm1"/>`.
 
@@ -188,6 +193,18 @@ none) and an optional slice was one word, so its length was lost on the way
 generated Wayland requests (`wl_data_offer.accept`) are such optional
 slices.
 
+An optional of anything but a pointer, a function, a slice or a float is
+tagged: the payload and then a tag, 1 when a value is present. In
+registers the tag is the word after the payload's (`?u32` and `?usize`
+are two words, returned in `rax` and `rdx`); in memory it is the byte
+after the payload's bytes (`@sizeOf(?u32)` is 5, `@sizeOf(?u8)` 2, at the
+payload's alignment), so a `?usize` holding 0 is not null and zeroed
+memory is null. An optional struct, union or array is a memory value like
+its payload: its address, the payload at offset 0 and the tag byte after
+it. `null` becomes the absent value wherever one is wanted, `== null`
+reads the tag, `.?` the payload (`tests/404_optional_zero_runtime.mlx`).
+An optional pointer stays the pointer, null being 0.
+
 A local of several words (a slice, an optional slice, an error union)
 normally lives in one frame slot per word, which the optimizer forwards
 and promotes to registers. When the module takes the local's address
@@ -208,11 +225,14 @@ classified INTEGER/SSE/MEMORY recursively; anything larger than 16 bytes (or
 whose eightbytes can't be satisfied by available registers) is passed/returned
 via memory instead.
 
-A 16-byte struct of two `u64` fields fits the register path and returns in
-`rax`/`rdx`:
+A struct, union or array result does not take that register path yet:
+every one, the 16-byte struct of two `u64` fields below included, comes
+back through storage its caller provides (see the hidden return storage
+further down; `NormalReturn`'s registers for aggregates of at most 16
+bytes are an open deviation, SPEC_CONFLICTS.md):
 
 ```mlx
-// A 16-byte struct crosses the call boundary in rax/rdx.
+// Even a 16-byte struct comes back through caller-provided storage.
 const Pair = struct {
     first: u64
     second: u64
@@ -261,18 +281,30 @@ that are not a multiple of 8 copy exactly
 
 Where a copy lives depends on who owns it. Aggregate literals, `var` copies
 and assignment copies come from the aggregate arena (an `alloca` with a
-byte count), which is never freed, so a function can return such storage
-by address. A `const` local's copy is a region of the function's frame
+byte count), which is never freed. Those whose address cannot outlive the
+function move into its
+frame instead (`ir/escape.mlx`, after the other LIR passes): one whose
+address is never returned, never stored outside the function's own
+memory, and only handed to callees whose parameter lets nothing out (the
+callee may read through it). A frame region is zeroed where the
+allocation runs, as the arena's memory is, unless a copy of the whole
+value fills it at once; one inside a loop moves only when its address is
+kept nowhere but its own binding, so no older pass's value is still
+reachable when the next pass reuses the bytes. The limits are 1 KiB an
+allocation and 8 KiB a frame (a thread may run on a small stack). A
+struct literal handed to a reading callee, or a `var` made in every pass
+of a loop, then no longer grows the arena
+(`tests/328_aggregates_in_frame_runtime.mlx`). A `const` local's copy is a region of the function's frame
 instead (the same `alloca` with `arg1 == 1`): the frame-size estimate adds
-its bytes, and nothing of it may be handed back by address. `return`
-therefore copies a value that may be, or lie inside, a `const` local's
-frame storage into the arena first, including what a call given such a
-local returns (a callee may return its parameter's storage), and rebases a
-slice of an array held in one (`copy.bytes[0..2]`) onto an arena copy of
-the whole local (`tests/265_aggregate_value_copy_runtime.mlx`). It does so
-only in a function that has such a local, with the function's return type;
-a slice the local merely holds (a field of slice type) points elsewhere and
-comes back as it is (`tests/273_const_return_paths_runtime.mlx`).
+its bytes, and nothing of it may be handed back by address. A struct,
+union or array result is copied into its caller's storage anyway (below),
+but a returned slice of an array held in such a local
+(`copy.bytes[0..2]`) would point into the frame: `return` rebases it onto
+an arena copy of the whole local
+(`tests/265_aggregate_value_copy_runtime.mlx`). It does so only in a
+function that has such a local; a slice the local merely holds (a field of
+slice type) points elsewhere and comes back as it is
+(`tests/273_const_return_paths_runtime.mlx`).
 
 A 20-byte array exceeds the 16-byte register-return threshold, so it returns
 through caller-owned hidden memory instead:
@@ -290,7 +322,23 @@ Per `NormalReturn`'s rule for larger/MEMORY returns, this hidden-storage
 pointer is passed as the *first* integer argument (ahead of the callee's own
 declared parameters, per `ArgumentAssignment`'s "a hidden large-return
 pointer, when present, consumes rdi before user integer arguments"), and
-is returned unchanged in `rax`.
+is returned unchanged in `rax`. On aarch64 it is the first integer argument
+too (`x0`, not AAPCS64's `x8`), and comes back in `x0`.
+
+In LIR the storage is a `param` before the declared ones, marked
+`FLAG_RETURN_SLOT` like the function's label. Every `return` copies its
+value there, before the function's defers run (so a defer changing a local
+afterwards does not change what the caller gets), and hands back the
+storage's address. A `return` whose value is itself such a call passes
+the same storage on instead of copying. The caller makes the storage
+where the call is, an `alloca` of the result's size passed as the call's
+first argument, and the call's value is that storage's address: escape
+analysis keeps it in the caller's frame unless the result's address
+outlives the caller, so a struct returned and used by value costs no arena
+memory. Whether a function takes the storage follows its declared result,
+for direct, method, generic and indirect calls alike, and the optimizer
+checks that each direct call agrees with its callee
+(`tests/329_return_storage_runtime.mlx`).
 
 ## Multiple returns
 
@@ -322,6 +370,12 @@ fn triple() -> (u64, u64, u64) {
 ```
 
 (`tests/117_multi_return_memory_runtime.mlx`)
+
+The self-hosted compiler returns a tuple between Mlx functions in
+registers instead, a word per register (`rax`, `rdx`, `rcx`, `r8`, `r9`,
+`r10`, `r11`, `rsi`, `rdi`; `x0` to `x7` on aarch64), so a tuple holding a
+slice and two integers comes back whole
+(`tests/311_wide_tuple_runtime.mlx`). Exported functions keep the C ABI.
 
 ## Error unions (`!T`) across the call boundary
 
@@ -363,6 +417,11 @@ fn source() ![]const u8 {
 ```
 
 (`tests/58_error_union_slice_abi_runtime.mlx`)
+
+An optional slice and a tuple holding a slice take as many payload
+registers as they have words (`rdx` and on), and an `!f32` returns its
+payload as an f32 in `xmm0` even when the function returns a float
+literal (`tests/323_error_union_payload_words_runtime.mlx`).
 
 ...and for a float payload, which uses the float payload bank (`xmm0`) while
 `rax` still carries the error tag:

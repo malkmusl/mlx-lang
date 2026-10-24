@@ -1,0 +1,351 @@
+// std.crypto.gcm: AES-GCM (NIST SP 800-38D) with 12-byte nonces and
+// 16-byte tags, the AEAD of TLS's AES suites, on std.aes's constant-time
+// cipher. GHASH multiplies in GF(2^128) with integer multiplications
+// whose carries are kept apart by holes in the operands (BearSSL's
+// ghash_ctmul64): no table, no branch on the data.
+//
+//     var aead: gcm.Gcm = undefined
+//     gcm.init(&aead, key, 16)                       // 16, 24 or 32 bytes
+//     gcm.seal(&aead, nonce, aad, plain, length, out, tag)
+//     if !gcm.open(&aead, nonce, aad, sealed, length, tag, out) { ... }
+//     gcm.finish(&aead)
+//
+// `out` may be the input itself. open checks the tag before it decrypts:
+// a forged record leaves `out` untouched.
+//
+// WebCrypto's AES-GCM takes an IV of any length and tags of 4 to 16
+// bytes: sealIv and openIv (the IV of another length than 12 hashed into
+// the first counter block, as SP 800-38D's 7.1 says; the tag cut to
+// `tagLength`).
+//
+//     gcm.sealIv(&aead, iv, aad, plain, length, out, tag, 12)
+//     if !gcm.openIv(&aead, iv, aad, sealed, length, tag, 12, out) { ... }
+
+const std = @import("std")
+const aes = @import("../aes.mlx")
+
+pub const Gcm = struct {
+    cipher: aes.Aes
+    // H = E(K, 0^128), as GHASH reads it (two big-endian words).
+    high: u64
+    low: u64
+}
+
+fn readBig(bytes: [*]const u8, at: usize) -> u64 {
+    var value: u64 = 0
+    var index: usize = 0
+    while index < 8 {
+        value = (value << 8) | @intCast(u64, bytes[at + index])
+        index += 1
+    }
+    return value
+}
+
+fn writeBig(bytes: [*]u8, at: usize, value: u64) -> void {
+    var index: usize = 0
+    while index < 8 {
+        bytes[at + index] = @intCast(u8, (value >> (56 - 8 * index)) & 255)
+        index += 1
+    }
+}
+
+// The carry-less product of x and y, its low 64 bits, from four integer
+// products of operands with three holes in every four bits: the carries
+// fall into the holes and are masked away.
+fn bmul64(x: u64, y: u64) -> u64 {
+    const m0: u64 = 1229782938247303441
+    const m1: u64 = 2459565876494606882
+    const m2: u64 = 4919131752989213764
+    const m3: u64 = 9838263505978427528
+    const x0 = x & m0
+    const x1 = x & m1
+    const x2 = x & m2
+    const x3 = x & m3
+    const y0 = y & m0
+    const y1 = y & m1
+    const y2 = y & m2
+    const y3 = y & m3
+    const z0 = (x0 *% y0) ^ (x1 *% y3) ^ (x2 *% y2) ^ (x3 *% y1)
+    const z1 = (x0 *% y1) ^ (x1 *% y0) ^ (x2 *% y3) ^ (x3 *% y2)
+    const z2 = (x0 *% y2) ^ (x1 *% y1) ^ (x2 *% y0) ^ (x3 *% y3)
+    const z3 = (x0 *% y3) ^ (x1 *% y2) ^ (x2 *% y1) ^ (x3 *% y0)
+    return (z0 & m0) | (z1 & m1) | (z2 & m2) | (z3 & m3)
+}
+
+// The bits of a word in the other order.
+fn reverse64(value: u64) -> u64 {
+    var x = value
+    x = ((x & 6148914691236517205) << 1) | ((x >> 1) & 6148914691236517205)
+    x = ((x & 3689348814741910323) << 2) | ((x >> 2) & 3689348814741910323)
+    x = ((x & 1085102592571150095) << 4) | ((x >> 4) & 1085102592571150095)
+    x = ((x & 71777214294589695) << 8) | ((x >> 8) & 71777214294589695)
+    x = ((x & 281470681808895) << 16) | ((x >> 16) & 281470681808895)
+    return (x << 32) | (x >> 32)
+}
+
+// The GHASH state: Y as two big-endian words.
+pub const Ghash = struct {
+    y1: u64
+    y0: u64
+}
+
+// Y = (Y ^ block) * H for each 16 bytes of `data`, the last block padded
+// with zeroes.
+pub fn ghash(aead: *Gcm, state: *Ghash, data: [*]const u8, length: usize) -> void {
+    const h1 = aead.*.high
+    const h0 = aead.*.low
+    const h0r = reverse64(h0)
+    const h1r = reverse64(h1)
+    const h2 = h0 ^ h1
+    const h2r = h0r ^ h1r
+    var y1 = state.*.y1
+    var y0 = state.*.y0
+    var block: [16]u8 = undefined
+    const tail: [*]u8 = &block
+    var at: usize = 0
+    while at < length {
+        if length - at >= 16 {
+            y1 = y1 ^ readBig(data, at)
+            y0 = y0 ^ readBig(data, at + 8)
+        } else {
+            var index: usize = 0
+            while index < 16 {
+                block[index] = if at + index < length { data[at + index] } else { 0 }
+                index += 1
+            }
+            y1 = y1 ^ readBig(tail, 0)
+            y0 = y0 ^ readBig(tail, 8)
+        }
+        at += 16
+        const y0r = reverse64(y0)
+        const y1r = reverse64(y1)
+        const y2 = y0 ^ y1
+        const y2r = y0r ^ y1r
+        const z0 = bmul64(y0, h0)
+        const z1 = bmul64(y1, h1)
+        var z2 = bmul64(y2, h2)
+        var z0h = bmul64(y0r, h0r)
+        var z1h = bmul64(y1r, h1r)
+        var z2h = bmul64(y2r, h2r)
+        z2 = z2 ^ z0 ^ z1
+        z2h = z2h ^ z0h ^ z1h
+        z0h = reverse64(z0h) >> 1
+        z1h = reverse64(z1h) >> 1
+        z2h = reverse64(z2h) >> 1
+        var v0 = z0
+        var v1 = z0h ^ z2
+        var v2 = z1 ^ z2h
+        var v3 = z1h
+        // GCM's bits are reflected: the product moves up a bit, then the
+        // reduction by x^128 + x^7 + x^2 + x + 1.
+        v3 = (v3 << 1) | (v2 >> 63)
+        v2 = (v2 << 1) | (v1 >> 63)
+        v1 = (v1 << 1) | (v0 >> 63)
+        v0 = v0 << 1
+        v2 = v2 ^ v0 ^ (v0 >> 1) ^ (v0 >> 2) ^ (v0 >> 7)
+        v1 = v1 ^ (v0 << 63) ^ (v0 << 62) ^ (v0 << 57)
+        v3 = v3 ^ v1 ^ (v1 >> 1) ^ (v1 >> 2) ^ (v1 >> 7)
+        v2 = v2 ^ (v1 << 63) ^ (v1 << 62) ^ (v1 << 57)
+        y0 = v2
+        y1 = v3
+    }
+    state.*.y1 = y1
+    state.*.y0 = y0
+}
+
+// The key schedule and H; false for a key that is not 16, 24 or 32
+// bytes.
+pub fn init(aead: *Gcm, key: [*]const u8, length: usize) -> bool {
+    if !aes.aesInit(&aead.*.cipher, key, length) { return false }
+    var zero: [16]u8 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    const block: [*]u8 = &zero
+    aes.aesEncrypt(&aead.*.cipher, block)
+    aead.*.high = readBig(block, 0)
+    aead.*.low = readBig(block, 8)
+    return true
+}
+
+pub fn finish(aead: *Gcm) -> void {
+    aes.aesFinish(&aead.*.cipher)
+    aead.*.high = 0
+    aead.*.low = 0
+}
+
+// The counter mode from counter block `first` on: `length` bytes of
+// `input` XORed with E(K, nonce | counter) into `out`.
+fn counterMode(aead: *Gcm, nonce: [*]const u8, first: u64, input: [*]const u8, length: usize, out: [*]u8) -> void {
+    var stream: [64]u8 = undefined
+    const keystream: [*]u8 = &stream
+    var counter = first
+    var at: usize = 0
+    while at < length {
+        var blocks = (length - at + 15) / 16
+        if blocks > 4 { blocks = 4 }
+        var block: usize = 0
+        while block < blocks {
+            var index: usize = 0
+            while index < 12 {
+                stream[block * 16 + index] = nonce[index]
+                index += 1
+            }
+            stream[block * 16 + 12] = @intCast(u8, (counter >> 24) & 255)
+            stream[block * 16 + 13] = @intCast(u8, (counter >> 16) & 255)
+            stream[block * 16 + 14] = @intCast(u8, (counter >> 8) & 255)
+            stream[block * 16 + 15] = @intCast(u8, counter & 255)
+            counter = (counter + 1) & 4294967295
+            block += 1
+        }
+        aes.aesEncryptBlocks(&aead.*.cipher, keystream, blocks)
+        var index: usize = 0
+        while index < blocks * 16 && at < length {
+            out[at] = input[at] ^ stream[index]
+            at += 1
+            index += 1
+        }
+    }
+    var index: usize = 0
+    while index < 64 {
+        stream[index] = 0
+        index += 1
+    }
+}
+
+// The tag of `aad` and the ciphertext: GHASH of both and their lengths in
+// bits, XORed with E(K, nonce | 1).
+fn tagOf(aead: *Gcm, nonce: [*]const u8, aad: []const u8, sealed: [*]const u8, length: usize, tag: [*]u8) -> void {
+    var first: [16]u8 = undefined
+    const j0: [*]u8 = &first
+    var index: usize = 0
+    while index < 12 {
+        first[index] = nonce[index]
+        index += 1
+    }
+    first[12] = 0
+    first[13] = 0
+    first[14] = 0
+    first[15] = 1
+    tagFrom(aead, j0, aad, sealed, length, tag)
+}
+
+// The same with the pre-counter block J0 as it is (16 bytes).
+fn tagFrom(aead: *Gcm, j0: [*]const u8, aad: []const u8, sealed: [*]const u8, length: usize, tag: [*]u8) -> void {
+    var state = Ghash.{ .y1 = 0, .y0 = 0 }
+    ghash(aead, &state, aad.pointer, aad.length)
+    ghash(aead, &state, sealed, length)
+    var lengths: [16]u8 = undefined
+    const bits: [*]u8 = &lengths
+    writeBig(bits, 0, @intCast(u64, aad.length) * 8)
+    writeBig(bits, 8, @intCast(u64, length) * 8)
+    ghash(aead, &state, bits, 16)
+    var mask: [16]u8 = undefined
+    const block: [*]u8 = &mask
+    var index: usize = 0
+    while index < 16 {
+        mask[index] = j0[index]
+        index += 1
+    }
+    aes.aesEncrypt(&aead.*.cipher, block)
+    writeBig(bits, 0, state.y1)
+    writeBig(bits, 8, state.y0)
+    index = 0
+    while index < 16 {
+        tag[index] = lengths[index] ^ mask[index]
+        index += 1
+    }
+}
+
+// Encrypts `length` bytes of `plain` into `out` and writes the 16-byte
+// tag of them and `aad`.
+pub fn seal(aead: *Gcm, nonce: [*]const u8, aad: []const u8, plain: [*]const u8, length: usize, out: [*]u8, tag: [*]u8) -> void {
+    counterMode(aead, nonce, 2, plain, length, out)
+    tagOf(aead, nonce, aad, out, length, tag)
+}
+
+// Decrypts `length` bytes of `sealed` into `out` when `tag` is theirs
+// and `aad`'s; false (and `out` untouched) when it is not.
+pub fn open(aead: *Gcm, nonce: [*]const u8, aad: []const u8, sealed: [*]const u8, length: usize, tag: [*]const u8, out: [*]u8) -> bool {
+    var computed: [16]u8 = undefined
+    const mine: [*]u8 = &computed
+    tagOf(aead, nonce, aad, sealed, length, mine)
+    var difference: u64 = 0
+    var index: usize = 0
+    while index < 16 {
+        difference = difference | @intCast(u64, computed[index] ^ tag[index])
+        index += 1
+    }
+    if difference != 0 { return false }
+    counterMode(aead, nonce, 2, sealed, length, out)
+    return true
+}
+
+// J0 for an IV of `iv.length` bytes (at least 1): IV | 0^31 | 1 for 12
+// bytes, else GHASH(IV, padded | 0^64 | the IV's length in bits).
+fn preCounter(aead: *Gcm, iv: []const u8, j0: [*]u8) -> void {
+    if iv.length == 12 {
+        var index: usize = 0
+        while index < 12 {
+            j0[index] = iv.pointer[index]
+            index += 1
+        }
+        j0[12] = 0
+        j0[13] = 0
+        j0[14] = 0
+        j0[15] = 1
+        return
+    }
+    var state = Ghash.{ .y1 = 0, .y0 = 0 }
+    ghash(aead, &state, iv.pointer, iv.length)
+    var lengths: [16]u8 = undefined
+    const bits: [*]u8 = &lengths
+    writeBig(bits, 0, 0)
+    writeBig(bits, 8, @intCast(u64, iv.length) * 8)
+    ghash(aead, &state, bits, 16)
+    writeBig(j0, 0, state.y1)
+    writeBig(j0, 8, state.y0)
+}
+
+fn counterAfter(j0: [*]const u8) -> u64 {
+    const low = (@intCast(u64, j0[12]) << 24) | (@intCast(u64, j0[13]) << 16) | (@intCast(u64, j0[14]) << 8) | @intCast(u64, j0[15])
+    return (low + 1) & 4294967295
+}
+
+// seal with an IV of any length (at least 1 byte) and a tag of
+// `tagLength` bytes (4 to 16); false for lengths out of those ranges.
+pub fn sealIv(aead: *Gcm, iv: []const u8, aad: []const u8, plain: [*]const u8, length: usize, out: [*]u8, tag: [*]u8, tagLength: usize) -> bool {
+    if iv.length == 0 || tagLength < 4 || tagLength > 16 { return false }
+    var first: [16]u8 = undefined
+    const j0: [*]u8 = &first
+    preCounter(aead, iv, j0)
+    counterMode(aead, j0, counterAfter(j0), plain, length, out)
+    var full: [16]u8 = undefined
+    const computed: [*]u8 = &full
+    tagFrom(aead, j0, aad, out, length, computed)
+    var index: usize = 0
+    while index < tagLength {
+        tag[index] = full[index]
+        index += 1
+    }
+    return true
+}
+
+// open with an IV of any length and a `tagLength`-byte tag: false (and
+// `out` untouched) when the tag is not theirs or a length is out of
+// range.
+pub fn openIv(aead: *Gcm, iv: []const u8, aad: []const u8, sealed: [*]const u8, length: usize, tag: [*]const u8, tagLength: usize, out: [*]u8) -> bool {
+    if iv.length == 0 || tagLength < 4 || tagLength > 16 { return false }
+    var first: [16]u8 = undefined
+    const j0: [*]u8 = &first
+    preCounter(aead, iv, j0)
+    var full: [16]u8 = undefined
+    const computed: [*]u8 = &full
+    tagFrom(aead, j0, aad, sealed, length, computed)
+    var difference: u64 = 0
+    var index: usize = 0
+    while index < tagLength {
+        difference = difference | @intCast(u64, full[index] ^ tag[index])
+        index += 1
+    }
+    if difference != 0 { return false }
+    counterMode(aead, j0, counterAfter(j0), sealed, length, out)
+    return true
+}

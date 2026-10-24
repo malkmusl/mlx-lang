@@ -20,7 +20,7 @@ Every chapter names the tests it draws on under a **Source tests** line so
 you can jump straight to the fixture and, if you want, run it yourself:
 
 ```sh
-zig build
+./mlx build mlx0          # the stage-0 compiler, with zig
 ./zig-out/bin/mlx0 tests/06_control_flow.mlx -o /tmp/out && /tmp/out; echo $?
 ```
 
@@ -43,6 +43,7 @@ For a compile-error fixture, use `tests/run_error.sh`:
 9. [Unsafe and safety](09-unsafe-and-safety.md) — the `unsafe` boundary, pointers, runtime safety checks
 10. [Modules](10-modules.md) — `@import`, visibility
 11. [Diagnostics](11-diagnostics.md) — selected `MLX-E`/`MLX-W` codes with fixtures
+12. [Containers and allocators](12-containers-and-allocators.md) — one heap per program, `std.HashMap` and `std.ArrayList` that free themselves
 
 ## Scope
 

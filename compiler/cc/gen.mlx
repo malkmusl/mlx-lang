@@ -1,0 +1,1718 @@
+// Code generation for expressions: a stack machine on rax (xmm0 for
+// floating values, the x87 top st0 for long doubles) with operands
+// pushed on the hardware stack. Every integer in rax is kept canonical
+// for its type (sign- or zero-extended to 64 bits), so comparisons and
+// divisions work on whole registers. A long double value is on the x87
+// stack exactly as long as an expression holds it: whatever drops one
+// pops it. Calls follow the System V AMD64 ABI, structs by value and
+// long doubles (in memory, 16-byte aligned, returned in st0) included.
+const base = @import("./base.mlx")
+const names = @import("./names.mlx")
+const types = @import("./types.mlx")
+const ast = @import("./ast.mlx")
+const tokens = @import("./tokens.mlx")
+const interp = @import("./interp.mlx")
+const x86 = @import("./x86.mlx")
+const genstmt = @import("./genstmt.mlx")
+const program = @import("./program.mlx")
+const extended = @import("./extended.mlx")
+const wide = @import("./wide.mlx")
+const atomics = @import("./atomics.mlx")
+const builtins = @import("./builtins.mlx")
+
+// Words pushed on the stack by the expression being generated (a call
+// needs rsp 16-byte aligned).
+var depth: i64 = 0
+var labelCounter: u32 = 0
+
+pub fn resetDepth() -> void { depth = 0 }
+pub fn currentDepth() -> i64 { return depth }
+
+// A label for the code generator's own jumps (above the parser's).
+pub fn newLabel() -> u32 {
+    labelCounter += 1
+    return 1000000000 + labelCounter
+}
+
+fn pushRax() -> void {
+    x86.push(x86.RAX)
+    depth += 1
+}
+
+fn popTo(r: u8) -> void {
+    x86.pop(r)
+    depth -= 1
+}
+
+fn pushFloat() -> void {
+    x86.subtractStack(8)
+    x86.storeFloat(x86.RSP, 0, 0, true)
+    depth += 1
+}
+
+fn popFloat(x: u8) -> void {
+    x86.loadFloat(x, x86.RSP, 0, true)
+    x86.addStack(8)
+    depth -= 1
+}
+
+// st0 to the stack (16 bytes) and back.
+fn pushExtended() -> void {
+    x86.subtractStack(16)
+    x86.fstpExtended(x86.RSP, 0)
+    depth += 2
+}
+
+fn popExtended() -> void {
+    x86.fldExtended(x86.RSP, 0)
+    x86.addStack(16)
+    depth -= 2
+}
+
+pub fn isLongDouble(ty: usize) -> bool { return types.kind(ty) == types.LDOUBLE }
+
+// Drops the value of an expression of type `ty` (a long double is on the
+// x87 stack and must come off).
+pub fn discard(ty: usize) -> void {
+    if isLongDouble(ty) { x86.fstpTop() }
+}
+
+pub fn argumentRegister(index: i64) -> u8 {
+    if index == 0 { return x86.RDI }
+    if index == 1 { return x86.RSI }
+    if index == 2 { return x86.RDX }
+    if index == 3 { return x86.RCX }
+    if index == 4 { return x86.R8 }
+    return x86.R9
+}
+
+pub fn isFloat(ty: usize) -> bool {
+    const k = types.kind(ty)
+    return k == types.FLOAT || k == types.DOUBLE || k == types.LDOUBLE
+}
+
+pub fn isDouble(ty: usize) -> bool {
+    return types.kind(ty) == types.DOUBLE
+}
+
+// A value kept in memory, whose address the expression's code leaves in
+// rax: a struct, a union, a wide integer (_BitInt over 64 bits).
+fn isStructLike(ty: usize) -> bool {
+    const k = types.kind(ty)
+    return k == types.STRUCT || k == types.UNION || k == types.WIDE
+}
+
+pub fn isWide(ty: usize) -> bool { return types.kind(ty) == types.WIDE }
+
+// ---------------------------------------------------------------------------
+// Wide integers: limbs in memory (wide.mlx), every operation a call of
+// the C runtime in include/__mlxcc_wide.c with the operands' addresses,
+// the width and the signedness, the result in a temporary of the
+// function's (typing.mlx gives the node one).
+
+// Calls the runtime function `name`, the stack 16-byte aligned.
+fn callWide(name: []const u8) -> void {
+    const odd = depth % 2 == 1
+    if odd { x86.subtractStack(8) }
+    x86.moveImmediate(x86.RAX, 0)
+    const id = base.intern(name)
+    x86.callSymbol(base.nameAddress(id), base.nameOf(id).length)
+    if odd { x86.addStack(8) }
+}
+
+fn wideBits(ty: usize) -> i64 { return types.at(ty).*.bits }
+
+fn wideUnsigned(ty: usize) -> i64 { return if types.isUnsigned(ty) { 1 } else { 0 } }
+
+// rax = the address of the temporary that holds node `n`'s wide result.
+fn wideResult(n: usize) -> void {
+    const o = ast.node(n).*.returnBuffer
+    if o == 0 { ast.errorAt(n, "internal error: a wide integer result without a place") }
+    x86.leaFrame(x86.RAX, ast.obj(o).*.offset)
+}
+
+// rdi = node `n`'s result place, rcx = the width, r8 = the signedness
+// of the wide type `ty`.
+fn wideCallFrame(n: usize, ty: usize) -> void {
+    wideResult(n)
+    x86.move(x86.RDI, x86.RAX)
+    x86.moveImmediate(x86.RCX, wideBits(ty))
+    x86.moveImmediate(x86.R8, wideUnsigned(ty))
+}
+
+// A unary operation (d, a, bits, u) on the wide value whose address is
+// in rax.
+fn genWideUnary(n: usize, name: []const u8) -> void {
+    const ty = ast.node(n).*.ty
+    genExpression(ast.node(n).*.lhs)
+    x86.move(x86.RSI, x86.RAX)
+    wideResult(n)
+    x86.move(x86.RDI, x86.RAX)
+    x86.moveImmediate(x86.RDX, wideBits(ty))
+    x86.moveImmediate(x86.RCX, wideUnsigned(ty))
+    callWide(name)
+    wideResult(n)
+}
+
+// A conversion to or from a wide integer (node `n`, a CAST).
+fn genWideCast(n: usize) -> void {
+    const node = ast.node(n)
+    const from = ast.typeOf(node.*.lhs)
+    const to = node.*.ty
+    genExpression(node.*.lhs)
+    const tk = types.kind(to)
+    if tk == types.VOID { return }
+    if tk == types.BOOL {
+        compareZero(from)
+        x86.setIf(x86.CC_NE, x86.RAX)
+        return
+    }
+    if isWide(from) && isWide(to) {
+        // The same type: the value's address is the result's.
+        if types.compatible(from, to) { return }
+        x86.move(x86.RSI, x86.RAX)
+        wideResult(n)
+        x86.move(x86.RDI, x86.RAX)
+        x86.moveImmediate(x86.RDX, wideBits(from))
+        x86.moveImmediate(x86.RCX, wideUnsigned(from))
+        x86.moveImmediate(x86.R8, wideBits(to))
+        x86.moveImmediate(x86.R9, wideUnsigned(to))
+        callWide("__mlxcc_wide_convert")
+        wideResult(n)
+        return
+    }
+    if isWide(to) {
+        if isFloat(from) {
+            // Through a double.
+            if isLongDouble(from) {
+                castLongDouble(from, types.doubleOf())
+            } else if !isDouble(from) {
+                x86.convertFloat(0, 0, false)
+            }
+            wideResult(n)
+            x86.move(x86.RDI, x86.RAX)
+            x86.moveImmediate(x86.RSI, wideBits(to))
+            x86.moveImmediate(x86.RDX, wideUnsigned(to))
+            callWide("__mlxcc_wide_from_double")
+            wideResult(n)
+            return
+        }
+        // A 64-bit value, sign-extended when its type is signed.
+        const signed = types.isInteger(from) && !types.isUnsigned(from) && types.kind(from) != types.BOOL
+        x86.move(x86.RSI, x86.RAX)
+        wideCallFrame(n, to)
+        x86.moveImmediate(x86.RDX, if signed { 1 } else { 0 })
+        callWide("__mlxcc_wide_from64")
+        wideResult(n)
+        return
+    }
+    // From a wide value (its address in rax).
+    if isFloat(to) {
+        x86.move(x86.RDI, x86.RAX)
+        x86.moveImmediate(x86.RSI, wideBits(from))
+        x86.moveImmediate(x86.RDX, wideUnsigned(from))
+        callWide("__mlxcc_wide_to_double")
+        if isLongDouble(to) {
+            castLongDouble(types.doubleOf(), to)
+        } else if !isDouble(to) {
+            x86.convertFloat(0, 0, true)
+        }
+        return
+    }
+    if isStructLike(to) { return }
+    // An integer or pointer: the low 64 bits, made canonical.
+    x86.load(x86.RAX, x86.RAX, 0, 8, false)
+    canonical(to)
+}
+
+// A binary operation whose left operand is wide (the right one is a
+// wide value of the same type, or a 64-bit shift count).
+fn genWideBinary(n: usize) -> void {
+    const node = ast.node(n)
+    const k = node.*.kind
+    const ty = ast.typeOf(node.*.lhs)
+    genExpression(node.*.rhs)
+    pushRax()
+    genExpression(node.*.lhs)
+    popTo(x86.RDX)
+    if k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        x86.move(x86.RDI, x86.RAX)
+        x86.move(x86.RSI, x86.RDX)
+        x86.moveImmediate(x86.RDX, wideBits(ty))
+        x86.moveImmediate(x86.RCX, wideUnsigned(ty))
+        callWide("__mlxcc_wide_cmp")
+        // -1, 0 or 1 against 0.
+        x86.extend(x86.RAX, 32, true)
+        x86.immediate(7, x86.RAX, 0)
+        var condition: u8 = x86.CC_E
+        if k == ast.NE { condition = x86.CC_NE }
+        if k == ast.LT { condition = x86.CC_L }
+        if k == ast.LE { condition = x86.CC_LE }
+        x86.setIf(condition, x86.RAX)
+        return
+    }
+    x86.move(x86.RSI, x86.RAX)
+    wideCallFrame(n, ty)
+    if k == ast.ADD {
+        callWide("__mlxcc_wide_add")
+    } else if k == ast.SUB {
+        callWide("__mlxcc_wide_sub")
+    } else if k == ast.MUL {
+        callWide("__mlxcc_wide_mul")
+    } else if k == ast.DIV {
+        callWide("__mlxcc_wide_div")
+    } else if k == ast.MOD {
+        callWide("__mlxcc_wide_rem")
+    } else if k == ast.BITAND {
+        callWide("__mlxcc_wide_and")
+    } else if k == ast.BITOR {
+        callWide("__mlxcc_wide_or")
+    } else if k == ast.BITXOR {
+        callWide("__mlxcc_wide_xor")
+    } else if k == ast.SHL {
+        callWide("__mlxcc_wide_shl")
+    } else if k == ast.SHR {
+        callWide("__mlxcc_wide_shr")
+    } else {
+        ast.errorAt(n, "invalid operands to a wide integer operation")
+    }
+    wideResult(n)
+}
+
+// Whether every part of `ty` between `low` and `high` (bytes, `ty` at
+// `offset`) is floating: the eightbyte goes in an SSE register.
+pub fn hasFloat(ty: usize, low: i64, high: i64, offset: i64) -> bool {
+    const k = types.kind(ty)
+    if k == types.STRUCT || k == types.UNION {
+        // An empty class (C++: one byte of padding) goes in an integer
+        // register.
+        if types.at(ty).*.members == 0 { return false }
+        var m = types.at(ty).*.members
+        while m != 0 {
+            if !hasFloat(types.member(m).*.ty, low, high, offset + types.member(m).*.offset) { return false }
+            m = types.member(m).*.next
+        }
+        return true
+    }
+    if k == types.ARRAY {
+        var index: i64 = 0
+        while index < types.at(ty).*.arrayLength {
+            if !hasFloat(types.baseOf(ty), low, high, offset + types.size(types.baseOf(ty)) * index) { return false }
+            index += 1
+        }
+        return true
+    }
+    return offset < low || high <= offset || k == types.FLOAT || k == types.DOUBLE
+}
+
+// Makes the integer in rax canonical for `ty` (its width's bits
+// sign- or zero-extended; a _BitInt's width need not be a size's).
+fn canonical(ty: usize) -> void {
+    if !types.isInteger(ty) { return }
+    const w = types.width(ty)
+    if w < 64 { x86.extendBits(x86.RAX, @intCast(usize, w), !types.isUnsigned(ty)) }
+}
+
+// The function an alias stands for (a template's `auto` parameter given
+// a function: a copy declaring it); `o` itself otherwise. (A static
+// function's alias, named by itself, was another object's name to the
+// linker: an undefined reference.)
+fn functionTarget(o: usize) -> usize {
+    if ast.obj(o).*.isFunction && ast.obj(o).*.usingOf != 0 { return ast.obj(o).*.usingOf }
+    return o
+}
+
+// A function the code being made calls or takes the address of: its
+// definition reached, made by genFunctions when it was not yet (the
+// static and inline functions are made only so; a static inline function
+// reached only through a template's argument, `SkFunctionObject<
+// WebPDataClear>` of Skia's, had not been referenced while parsing).
+pub var lateFunctions = false
+pub fn noteFunctionUsed(o: usize) -> void {
+    const d = ast.obj(o).*.definition
+    const f = if d != 0 { d } else { o }
+    if ast.obj(f).*.isStatic && !ast.obj(f).*.isReferenced {
+        ast.obj(f).*.isReferenced = true
+        ast.obj(o).*.isReferenced = true
+    }
+    if !ast.obj(f).*.reached {
+        if base.stats && ast.obj(f).*.pendingBody != 0 {
+            base.say("reached, its body never read: ")
+            base.say(base.nameOf(if ast.obj(f).*.linkName != 0 { ast.obj(f).*.linkName } else { ast.obj(f).*.name }))
+            base.say("\n")
+        }
+        ast.obj(f).*.reached = true
+        ast.obj(o).*.reached = true
+        if ast.obj(f).*.isDefinition && !ast.obj(f).*.generated { lateFunctions = true }
+    }
+}
+
+// A vtable or VTT the code being made or a table placed refers to: placed
+// by genFunctions (with what it refers to).
+pub fn noteTableUsed(o: usize) -> void {
+    const d = ast.obj(o).*.definition
+    const t = if d != 0 { d } else { o }
+    if !ast.obj(t).*.reached {
+        ast.obj(t).*.reached = true
+        ast.obj(o).*.reached = true
+        if ast.obj(t).*.isDefinition && !ast.obj(t).*.placed { lateFunctions = true }
+    }
+}
+
+// rax = the address of the global object `o`: its definition in the
+// program, else its name's (another object's, or a library's, bound by
+// the linker).
+pub fn globalAddress(r: u8, given: usize) -> void {
+    const o = functionTarget(given)
+    const d = ast.obj(o).*.definition
+    if ast.obj(o).*.isThreadLocal || (d != 0 && ast.obj(d).*.isThreadLocal) {
+        x86.threadLocalAddress(r, o)
+        return
+    }
+    if ast.obj(o).*.isFunction {
+        noteFunctionUsed(o)
+        if d != 0 && ast.obj(d).*.isDefinition {
+            const symbol = ast.obj(d).*.symbol
+            x86.symbolAddress(r, base.nameAddress(symbol), base.nameOf(symbol).length)
+        } else {
+            const name = linkNameOf(o)
+            x86.symbolAddress(r, base.nameAddress(name), base.nameOf(name).length)
+        }
+        return
+    }
+    if ast.obj(o).*.isTable || (d != 0 && ast.obj(d).*.isTable) { noteTableUsed(o) }
+    // (A weak one, an inline variable or a static of an inline function,
+    // by its name: the linker keeps one copy for every file.)
+    if d != 0 && ast.obj(d).*.placed && !ast.obj(d).*.isWeak {
+        x86.dataAddress(r, ast.obj(d).*.dataOffset)
+        return
+    }
+    const name = linkNameOf(o)
+    x86.symbolAddress(r, base.nameAddress(name), base.nameOf(name).length)
+}
+
+// The name the linker knows an object by (C++: its mangled one).
+pub fn linkNameOf(o: usize) -> u32 {
+    if ast.obj(o).*.linkName != 0 { return ast.obj(o).*.linkName }
+    return ast.obj(o).*.name
+}
+
+// reg = the address of the local `o` (in the frame, or where the local
+// it is stored at points).
+fn localAddress(reg: u8, o: usize) -> void {
+    const at = ast.obj(o).*.storedAt
+    if at != 0 {
+        x86.load(reg, x86.RBP, ast.obj(at).*.offset, 8, false)
+        return
+    }
+    x86.leaFrame(reg, ast.obj(o).*.offset)
+}
+
+pub fn genAddress(n: usize) -> void {
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.VAR {
+        const o = node.*.variable
+        if ast.obj(o).*.isLocal {
+            localAddress(x86.RAX, o)
+        } else {
+            globalAddress(x86.RAX, o)
+        }
+        return
+    }
+    if k == ast.DEREF {
+        genExpression(node.*.lhs)
+        return
+    }
+    if k == ast.COMMA {
+        genExpression(node.*.lhs)
+        if ast.kindOf(node.*.lhs) != ast.NULL_EXPR { discard(ast.typeOf(node.*.lhs)) }
+        genAddress(node.*.rhs)
+        return
+    }
+    if k == ast.MEMBER {
+        genAddress(node.*.lhs)
+        const m = types.member(node.*.member)
+        if m.*.isVirtual {
+            // A virtual base (C++): its offset is the one the object's
+            // vtable holds at the base's place before the address point.
+            x86.load(x86.R11, x86.RAX, 0, 8, false)
+            x86.load(x86.R11, x86.R11, m.*.vbaseSlot, 8, false)
+            x86.add(x86.RAX, x86.R11)
+            return
+        }
+        const offset = m.*.offset
+        if offset != 0 { x86.immediate(0, x86.RAX, offset) }
+        return
+    }
+    if k == ast.FUNCALL && node.*.returnBuffer != 0 {
+        genExpression(n)
+        return
+    }
+    if (k == ast.ASSIGN || k == ast.COND || k == ast.STMT_EXPR) && isStructLike(node.*.ty) {
+        genExpression(n)
+        return
+    }
+    if k == ast.CAST && isStructLike(node.*.ty) {
+        if isWide(node.*.ty) { genExpression(n) } else { genAddress(node.*.lhs) }
+        return
+    }
+    ast.errorAt(n, base.join("not an lvalue: node kind ", base.decimal(@intCast(u64, k))))
+}
+
+// Loads the value of type `ty` at the address in rax (an aggregate or a
+// function stays its address).
+fn load(ty: usize) -> void {
+    const k = types.kind(ty)
+    if k == types.ARRAY || k == types.STRUCT || k == types.UNION || k == types.WIDE || k == types.FUNC || k == types.VOID { return }
+    if k == types.FLOAT {
+        x86.loadFloat(0, x86.RAX, 0, false)
+        return
+    }
+    if k == types.DOUBLE {
+        x86.loadFloat(0, x86.RAX, 0, true)
+        return
+    }
+    if k == types.LDOUBLE {
+        x86.fldExtended(x86.RAX, 0)
+        return
+    }
+    x86.load(x86.RAX, x86.RAX, 0, types.size(ty), !types.isUnsigned(ty) && k != types.BOOL)
+    // A _BitInt's padding bits in memory are unspecified.
+    if types.isBitPrecise(ty) { canonical(ty) }
+}
+
+// Copies `size` bytes from [rax] to [rdi].
+pub fn copyBytes(size: i64) -> void {
+    var at: i64 = 0
+    while at + 8 <= size {
+        x86.load(x86.R8, x86.RAX, at, 8, false)
+        x86.store(x86.RDI, at, x86.R8, 8)
+        at += 8
+    }
+    while at < size {
+        x86.load(x86.R8, x86.RAX, at, 1, false)
+        x86.store(x86.RDI, at, x86.R8, 1)
+        at += 1
+    }
+}
+
+// Stores rax (xmm0) at the address on the stack.
+fn store(ty: usize) -> void {
+    popTo(x86.RDI)
+    const k = types.kind(ty)
+    if k == types.STRUCT || k == types.UNION || k == types.WIDE {
+        // (An empty class's byte is no data: it may share its address
+        // with a member of the object it is a base of.)
+        if !types.emptyClass(ty) { copyBytes(types.size(ty)) }
+        return
+    }
+    if k == types.FLOAT {
+        x86.storeFloat(x86.RDI, 0, 0, false)
+        return
+    }
+    if k == types.DOUBLE {
+        x86.storeFloat(x86.RDI, 0, 0, true)
+        return
+    }
+    if k == types.LDOUBLE {
+        // The value stays on the x87 stack as the assignment's.
+        x86.fldTop()
+        x86.fstpExtended(x86.RDI, 0)
+        return
+    }
+    x86.store(x86.RDI, 0, x86.RAX, types.size(ty))
+}
+
+// Sets the flags for "the value is zero" (equal).
+pub fn compareZero(ty: usize) -> void {
+    if isWide(ty) {
+        x86.move(x86.RDI, x86.RAX)
+        x86.moveImmediate(x86.RSI, wideBits(ty))
+        callWide("__mlxcc_wide_nonzero")
+        x86.testRegisters(x86.RAX, x86.RAX)
+        return
+    }
+    if isLongDouble(ty) {
+        // 0 compared with the value, both popped.
+        x86.fldz()
+        x86.fucomip()
+        x86.fstpTop()
+        return
+    }
+    if isFloat(ty) {
+        x86.floatXor(1, 1)
+        x86.floatCompare(0, 1, isDouble(ty))
+        return
+    }
+    x86.testRegisters(x86.RAX, x86.RAX)
+}
+
+fn castFloatToBool(ty: usize) -> void {
+    compareZero(ty)
+    x86.setIf(x86.CC_NE, x86.RAX)
+    x86.setIf(x86.CC_P, x86.RCX)
+    x86.orRegisters(x86.RAX, x86.RCX)
+}
+
+// An unsigned 64-bit integer in rax to floating xmm0.
+fn unsignedToFloat(toDouble: bool) -> void {
+    const negative = newLabel()
+    const done = newLabel()
+    x86.testRegisters(x86.RAX, x86.RAX)
+    x86.jumpIf(x86.CC_S, negative)
+    x86.floatFromInteger(0, x86.RAX, toDouble)
+    x86.jump(done)
+    x86.defineLabel(negative)
+    // Halve (keeping the low bit for rounding), convert, double.
+    x86.move(x86.RDI, x86.RAX)
+    x86.moveImmediate(x86.RDX, 1)
+    x86.andRegisters(x86.RAX, x86.RDX)
+    x86.shiftImmediate(x86.RDI, 1, false, false)
+    x86.orRegisters(x86.RDI, x86.RAX)
+    x86.floatFromInteger(0, x86.RDI, toDouble)
+    x86.floatArithmetic(88, 0, 0, toDouble)
+    x86.defineLabel(done)
+}
+
+// Floating xmm0 to an unsigned 64-bit integer in rax.
+fn floatToUnsigned(fromDouble: bool) -> void {
+    x86.integerFromFloat(x86.RCX, 0, fromDouble)
+    x86.moveFloat(1, 0)
+    // 2^63 in the source's format.
+    x86.moveImmediate(x86.RAX, if fromDouble { 4890909195324358656 } else { 1593835520 })
+    x86.floatFromBits(0, x86.RAX)
+    x86.floatArithmetic(92, 1, 0, fromDouble)
+    x86.integerFromFloat(x86.RAX, 1, fromDouble)
+    x86.move(x86.RDX, x86.RCX)
+    x86.shiftImmediate(x86.RDX, 63, false, true)
+    x86.andRegisters(x86.RAX, x86.RDX)
+    x86.orRegisters(x86.RAX, x86.RCX)
+}
+
+// Conversions to and from long double, through the stack (8 bytes).
+fn castLongDouble(from: usize, to: usize) -> void {
+    const fromLong = isLongDouble(from)
+    const toLong = isLongDouble(to)
+    if fromLong && toLong { return }
+    if toLong {
+        x86.subtractStack(8)
+        if isFloat(from) {
+            x86.storeFloat(x86.RSP, 0, 0, isDouble(from))
+            if isDouble(from) { x86.fldDouble(x86.RSP, 0) } else { x86.fldSingle(x86.RSP, 0) }
+        } else {
+            x86.store(x86.RSP, 0, x86.RAX, 8)
+            x86.fildQuad(x86.RSP, 0)
+            if types.size(from) == 8 && types.isUnsigned(from) {
+                // Above 2^63 the integer read as signed is 2^64 short.
+                const done = newLabel()
+                x86.testRegisters(x86.RAX, x86.RAX)
+                x86.jumpIf(x86.CC_NS, done)
+                x86.moveImmediate(x86.RAX, 4895412794951729152)
+                x86.store(x86.RSP, 0, x86.RAX, 8)
+                x86.faddDouble(x86.RSP, 0)
+                x86.defineLabel(done)
+            }
+        }
+        x86.addStack(8)
+        return
+    }
+    if isFloat(to) {
+        x86.subtractStack(8)
+        if isDouble(to) { x86.fstpDouble(x86.RSP, 0) } else { x86.fstpSingle(x86.RSP, 0) }
+        x86.loadFloat(0, x86.RSP, 0, isDouble(to))
+        x86.addStack(8)
+        return
+    }
+    if isStructLike(to) {
+        x86.fstpTop()
+        return
+    }
+    x86.subtractStack(8)
+    if types.size(to) == 8 && types.isUnsigned(to) {
+        // From 2^63 on: convert the value less 2^63, then set the bit.
+        const plain = newLabel()
+        const done = newLabel()
+        x86.moveImmediate(x86.RAX, 4890909195324358656)
+        x86.store(x86.RSP, 0, x86.RAX, 8)
+        x86.fldDouble(x86.RSP, 0)
+        x86.fucomip()
+        x86.jumpIf(x86.CC_A, plain)
+        x86.fsubDouble(x86.RSP, 0)
+        x86.fisttpQuad(x86.RSP, 0)
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+        x86.moveImmediate(x86.RDX, -9223372036854775807 - 1)
+        x86.orRegisters(x86.RAX, x86.RDX)
+        x86.jump(done)
+        x86.defineLabel(plain)
+        x86.fisttpQuad(x86.RSP, 0)
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+        x86.defineLabel(done)
+    } else {
+        x86.fisttpQuad(x86.RSP, 0)
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+    }
+    x86.addStack(8)
+    canonical(to)
+}
+
+pub fn cast(from: usize, to: usize) -> void {
+    const tk = types.kind(to)
+    if tk == types.VOID {
+        discard(from)
+        return
+    }
+    if tk == types.BOOL {
+        if isFloat(from) {
+            castFloatToBool(from)
+        } else {
+            compareZero(from)
+            x86.setIf(x86.CC_NE, x86.RAX)
+        }
+        return
+    }
+    if isLongDouble(from) || isLongDouble(to) {
+        castLongDouble(from, to)
+        return
+    }
+    const fromFloat = isFloat(from)
+    const toFloat = isFloat(to)
+    if !fromFloat && !toFloat {
+        canonical(to)
+        return
+    }
+    if !fromFloat && toFloat {
+        if types.size(from) == 8 && types.isUnsigned(from) {
+            unsignedToFloat(isDouble(to))
+        } else {
+            x86.floatFromInteger(0, x86.RAX, isDouble(to))
+        }
+        return
+    }
+    if fromFloat && toFloat {
+        if isDouble(from) != isDouble(to) { x86.convertFloat(0, 0, isDouble(from)) }
+        return
+    }
+    if isStructLike(to) { return }
+    if types.size(to) == 8 && types.isUnsigned(to) {
+        floatToUnsigned(isDouble(from))
+        return
+    }
+    x86.integerFromFloat(x86.RAX, 0, isDouble(from))
+    canonical(to)
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+
+fn pushStruct(ty: usize) -> void {
+    const size = types.alignTo(types.size(ty), 8)
+    x86.subtractStack(size)
+    depth += size / 8
+    x86.move(x86.RDI, x86.RSP)
+    copyBytes(types.size(ty))
+}
+
+// Where the next argument passed in memory ends (its offset from the
+// stack pointer at the call plus its size): the gap before it is left
+// for alignment.
+var stackCursor: i64 = 0
+
+fn pushArgumentsFrom(argument: usize, stackPass: bool) -> void {
+    if argument == 0 { return }
+    pushArgumentsFrom(ast.node(argument).*.next, stackPass)
+    if ast.node(argument).*.passByStack != stackPass { return }
+    const ty = ast.typeOf(argument)
+    if stackPass {
+        const end = ast.node(argument).*.stackOffset + types.alignTo(types.size(ty), 8)
+        const gap = stackCursor - end
+        if gap > 0 {
+            x86.subtractStack(gap)
+            depth += gap / 8
+        }
+        stackCursor = ast.node(argument).*.stackOffset
+    }
+    // (A call in the argument has arguments of its own.)
+    const cursorKept = stackCursor
+    genExpression(argument)
+    stackCursor = cursorKept
+    if isStructLike(ty) {
+        pushStruct(ty)
+    } else if isLongDouble(ty) {
+        pushExtended()
+    } else if isFloat(ty) {
+        pushFloat()
+    } else {
+        pushRax()
+    }
+}
+
+// Evaluates the arguments onto the stack: those passed in memory first
+// (they stay), then those passed in registers (popped into them); the
+// number of words left on the stack.
+fn pushArguments(n: usize) -> i64 {
+    var memory: i64 = 0
+    var gp: i64 = 0
+    var fp: i64 = 0
+    const node = ast.node(n)
+    if node.*.returnBuffer != 0 && types.inMemory(node.*.ty) { gp += 1 }
+    var argument = node.*.args
+    while argument != 0 {
+        const ty = ast.typeOf(argument)
+        var byStack = false
+        if isStructLike(ty) {
+            const size = types.size(ty)
+            byStack = types.inMemory(ty)
+            if !byStack {
+                const fp1: i64 = if hasFloat(ty, 0, 8, 0) { 1 } else { 0 }
+                const fp2: i64 = if size > 8 && hasFloat(ty, 8, 16, 0) { 1 } else { 0 }
+                const gp1: i64 = 1 - fp1
+                const gp2: i64 = if size > 8 { 1 - fp2 } else { 0 }
+                if fp + fp1 + fp2 <= 8 && gp + gp1 + gp2 <= 6 {
+                    fp += fp1 + fp2
+                    gp += gp1 + gp2
+                } else {
+                    byStack = true
+                }
+            }
+        } else if isLongDouble(ty) {
+            byStack = true
+        } else if isFloat(ty) {
+            if fp >= 8 { byStack = true }
+            fp += 1
+        } else {
+            if gp >= 6 { byStack = true }
+            gp += 1
+        }
+        // (Set either way: a node generated twice, a call's argument
+        // shared, may be classed otherwise the second time.)
+        ast.node(argument).*.passByStack = byStack
+        if byStack {
+            // In memory, in order, each at its alignment (a long double
+            // and a 16-byte aligned struct at 16).
+            var alignment = types.alignOf(ty)
+            if alignment < 8 { alignment = 8 }
+            memory = types.alignTo(memory, alignment)
+            ast.node(argument).*.stackOffset = memory
+            memory += types.alignTo(types.size(ty), 8)
+        }
+        argument = ast.node(argument).*.next
+    }
+    var stack = memory / 8
+    if (depth + stack) % 2 == 1 {
+        x86.subtractStack(8)
+        depth += 1
+        stack += 1
+    }
+    stackCursor = memory
+    pushArgumentsFrom(node.*.args, true)
+    pushArgumentsFrom(node.*.args, false)
+    if node.*.returnBuffer != 0 && types.inMemory(node.*.ty) {
+        // (Or the object the result is made at, cpp.construct's `m(f())`.)
+        if node.*.rhs != 0 { genExpression(node.*.rhs) } else { localAddress(x86.RAX, node.*.returnBuffer) }
+        pushRax()
+    }
+    return stack
+}
+
+// Stores a struct returned in rax/rdx and xmm0/xmm1 into its buffer.
+fn copyReturnBuffer(variable: usize) -> void {
+    const ty = ast.obj(variable).*.ty
+    const offset = ast.obj(variable).*.offset
+    const size = types.size(ty)
+    var gp: i64 = 0
+    var fp: u8 = 0
+    if hasFloat(ty, 0, 8, 0) {
+        x86.storeFloat(x86.RBP, offset, 0, size != 4)
+        fp += 1
+    } else {
+        var index: i64 = 0
+        while index < size && index < 8 {
+            x86.store(x86.RBP, offset + index, x86.RAX, 1)
+            x86.shiftImmediate(x86.RAX, 8, false, false)
+            index += 1
+        }
+        gp += 1
+    }
+    if size > 8 {
+        if hasFloat(ty, 8, 16, 0) {
+            x86.storeFloat(x86.RBP, offset + 8, fp, size != 12)
+        } else {
+            const r = if gp == 0 { x86.RAX } else { x86.RDX }
+            var index: i64 = 8
+            while index < size && index < 16 {
+                x86.store(x86.RBP, offset + index, r, 1)
+                x86.shiftImmediate(r, 8, false, false)
+                index += 1
+            }
+        }
+    }
+}
+
+fn genCall(n: usize) -> void {
+    const node = ast.node(n)
+    const callee = node.*.lhs
+    const direct = ast.kindOf(callee) == ast.VAR && types.kind(ast.typeOf(callee)) == types.FUNC
+    const stack = pushArguments(n)
+    if !direct {
+        genExpression(callee)
+        x86.move(x86.R10, x86.RAX)
+    }
+    var gp: i64 = 0
+    var fp: u8 = 0
+    if node.*.returnBuffer != 0 && types.inMemory(node.*.ty) {
+        popTo(argumentRegister(gp))
+        gp += 1
+    }
+    var argument = node.*.args
+    while argument != 0 {
+        if !ast.node(argument).*.passByStack {
+            const ty = ast.typeOf(argument)
+            if isStructLike(ty) {
+                if hasFloat(ty, 0, 8, 0) {
+                    popFloat(fp)
+                    fp += 1
+                } else {
+                    popTo(argumentRegister(gp))
+                    gp += 1
+                }
+                if types.size(ty) > 8 {
+                    if hasFloat(ty, 8, 16, 0) {
+                        popFloat(fp)
+                        fp += 1
+                    } else {
+                        popTo(argumentRegister(gp))
+                        gp += 1
+                    }
+                }
+            } else if isFloat(ty) {
+                popFloat(fp)
+                fp += 1
+            } else {
+                popTo(argumentRegister(gp))
+                gp += 1
+            }
+        }
+        argument = ast.node(argument).*.next
+    }
+    if direct {
+        // By its symbol: the definition's, else the name's (bound by the
+        // linker to another object's or a library's).
+        const o = functionTarget(ast.node(callee).*.variable)
+        const d = ast.obj(o).*.definition
+        noteFunctionUsed(o)
+        const symbol = if d != 0 && ast.obj(d).*.isDefinition { ast.obj(d).*.symbol } else { linkNameOf(o) }
+        x86.moveImmediate(x86.RAX, @intCast(i64, fp))
+        x86.callSymbol(base.nameAddress(symbol), base.nameOf(symbol).length)
+    } else {
+        x86.moveImmediate(x86.RAX, @intCast(i64, fp))
+        x86.callRegister(x86.R10)
+    }
+    if stack > 0 { x86.addStack(stack * 8) }
+    depth -= stack
+    // Narrow results come back with their upper bits unspecified.
+    const rt = node.*.ty
+    if types.kind(rt) == types.BOOL {
+        x86.extend(x86.RAX, 8, false)
+    } else if types.isInteger(rt) {
+        canonical(rt)
+    }
+    if node.*.returnBuffer != 0 && !types.inMemory(rt) {
+        copyReturnBuffer(node.*.returnBuffer)
+        x86.leaFrame(x86.RAX, ast.obj(node.*.returnBuffer).*.offset)
+    }
+}
+
+// va_arg: rax = the address of the next variadic argument of the type
+// `n` points to, taken from the register save area or the stack.
+fn genVaArg(n: usize) -> void {
+    genExpression(ast.node(n).*.lhs)
+    x86.move(x86.RCX, x86.RAX)
+    const ty = types.baseOf(ast.typeOf(n))
+    const overflow = newLabel()
+    const done = newLabel()
+    if isLongDouble(ty) {
+        // Always on the stack, 16-byte aligned.
+        x86.load(x86.RAX, x86.RCX, 8, 8, false)
+        x86.immediate(0, x86.RAX, 15)
+        x86.immediate(4, x86.RAX, -16)
+        x86.leaOffset(x86.RDX, x86.RAX, 16)
+        x86.store(x86.RCX, 8, x86.RDX, 8)
+        return
+    }
+    if isFloat(ty) {
+        x86.load(x86.RAX, x86.RCX, 4, 4, false)
+        x86.immediate(7, x86.RAX, 160)
+        x86.jumpIf(x86.CC_A, overflow)
+        x86.load(x86.RDX, x86.RCX, 16, 8, false)
+        x86.add(x86.RDX, x86.RAX)
+        x86.immediate(0, x86.RAX, 16)
+        x86.store(x86.RCX, 4, x86.RAX, 4)
+        x86.move(x86.RAX, x86.RDX)
+        x86.jump(done)
+    } else if !isStructLike(ty) {
+        x86.load(x86.RAX, x86.RCX, 0, 4, false)
+        x86.immediate(7, x86.RAX, 40)
+        x86.jumpIf(x86.CC_A, overflow)
+        x86.load(x86.RDX, x86.RCX, 16, 8, false)
+        x86.add(x86.RDX, x86.RAX)
+        x86.immediate(0, x86.RAX, 8)
+        x86.store(x86.RCX, 0, x86.RAX, 4)
+        x86.move(x86.RAX, x86.RDX)
+        x86.jump(done)
+    }
+    x86.defineLabel(overflow)
+    x86.load(x86.RAX, x86.RCX, 8, 8, false)
+    x86.leaOffset(x86.RDX, x86.RAX, types.alignTo(types.size(ty), 8))
+    x86.store(x86.RCX, 8, x86.RDX, 8)
+    x86.defineLabel(done)
+}
+
+// An asm statement (builtins.mlx): its one instruction.
+// Instructions assembled (builtins.withOperands, asm.mlx): rax, rcx,
+// rdx, rbx, rsi, rdi, r8, r9 and r10 loaded from the slots at
+// `node.lhs`, the bytes, the registers stored back; rbx and the
+// callee-saved registers the text clobbers kept for the caller.
+fn genAsmCode(n: usize) -> void {
+    const node = ast.node(n)
+    const address = @intCast(usize, node.*.high)
+    const length = @intCast(usize, node.*.label)
+    const symbols = node.*.extra
+    if node.*.lhs == 0 {
+        // (A call in the text finds the stack as a C call would.)
+        const odd = symbols != 0 && depth % 2 == 1
+        if odd { x86.subtractStack(8) }
+        asmBytes(address, length, symbols)
+        if odd { x86.addStack(8) }
+        return
+    }
+    const saved = @intCast(u64, node.*.breakLabel)
+    genExpression(node.*.lhs)
+    x86.push(x86.RBX)
+    var r: u8 = 5
+    while r < 16 {
+        if (saved >> @intCast(u6, r)) & 1 != 0 { x86.push(r) }
+        r += 1
+    }
+    x86.move(x86.R11, x86.RAX)
+    x86.push(x86.R11)
+    var slotRegisters: [9]u8 = [9]u8{ 0, 1, 2, 3, 6, 7, 8, 9, 10 }
+    var i: usize = 9
+    while i > 0 {
+        i -= 1
+        x86.load(slotRegisters[i], x86.R11, @intCast(i64, i * 8), 8, false)
+    }
+    // rbx, the callee-saved registers kept and r11 pushed: a call in the
+    // text finds the stack 16-byte aligned, as a C call would.
+    var pushed: i64 = depth + 2
+    r = 5
+    while r < 16 {
+        if (saved >> @intCast(u6, r)) & 1 != 0 { pushed += 1 }
+        r += 1
+    }
+    const odd = symbols != 0 && pushed % 2 == 1
+    if odd { x86.subtractStack(8) }
+    asmBytes(address, length, symbols)
+    if odd { x86.addStack(8) }
+    x86.pop(x86.R11)
+    i = 0
+    while i < 9 {
+        x86.store(x86.R11, @intCast(i64, i * 8), slotRegisters[i], 8)
+        i += 1
+    }
+    r = 16
+    while r > 5 {
+        r -= 1
+        if (saved >> @intCast(u6, r)) & 1 != 0 { x86.pop(r) }
+    }
+    x86.pop(x86.RBX)
+}
+
+// Inline assembly's bytes; the rel32 of each call or jump of a symbol
+// (asm.symbols' cells: name, length, offset, call, next) a relocation.
+fn asmBytes(address: usize, length: usize, symbols: usize) -> void {
+    var b: usize = 0
+    while b < length {
+        var s = symbols
+        while s != 0 && base.getWord(s + 16) != b { s = base.getWord(s + 32) }
+        if s != 0 {
+            x86.symbolRel32(base.getWord(s), base.getWord(s + 8), base.getWord(s + 24) != 0)
+            b += 4
+            continue
+        }
+        x86.byte(base.get8(address + b))
+        b += 1
+    }
+}
+
+fn genAsm(instruction: i64) -> void {
+    if instruction == builtins.ASM_PAUSE { x86.pause() }
+    if instruction == builtins.ASM_INT3 { x86.int3() }
+    if instruction == builtins.ASM_NOP { x86.nop() }
+    if instruction == builtins.ASM_MFENCE { x86.mfence() }
+    if instruction == builtins.ASM_LFENCE { x86.lfence() }
+    if instruction == builtins.ASM_SFENCE { x86.sfence() }
+    if instruction == builtins.ASM_UD2 { x86.ud2() }
+}
+
+// A bit builtin (builtins.mlx) on the unsigned operand (zero-extended
+// to 64 bits, so the 64-bit instructions serve every width): the
+// result in rax.
+fn genBitop(n: usize) -> void {
+    const node = ast.node(n)
+    const op = node.*.value
+    const width = node.*.high
+    genExpression(node.*.lhs)
+    if op == builtins.ALLOCA {
+        genAlloca()
+        return
+    }
+    if op == builtins.POPCOUNT {
+        x86.popcount(x86.RAX, x86.RAX)
+        return
+    }
+    if op == builtins.BSWAP {
+        if width == 64 {
+            x86.bswap(x86.RAX, true)
+        } else if width == 32 {
+            x86.bswap(x86.RAX, false)
+        } else {
+            x86.move(x86.RCX, x86.RAX)
+            x86.shiftImmediate(x86.RAX, 8, true, false)
+            x86.shiftImmediate(x86.RCX, 8, false, false)
+            x86.orRegisters(x86.RAX, x86.RCX)
+            x86.extend(x86.RAX, 16, false)
+        }
+        return
+    }
+    // clz, ctz, ffs: a zero operand has no set bit (clz and ctz give
+    // the width, ffs 0).
+    const zero = newLabel()
+    const done = newLabel()
+    x86.testRegisters(x86.RAX, x86.RAX)
+    x86.jumpIf(x86.CC_E, zero)
+    x86.bitScan(x86.RCX, x86.RAX, op == builtins.CLZ)
+    if op == builtins.CLZ {
+        x86.moveImmediate(x86.RAX, width - 1)
+        x86.sub(x86.RAX, x86.RCX)
+    } else {
+        x86.move(x86.RAX, x86.RCX)
+        if op == builtins.FFS { x86.immediate(0, x86.RAX, 1) }
+    }
+    x86.jump(done)
+    x86.defineLabel(zero)
+    x86.moveImmediate(x86.RAX, if op == builtins.FFS { 0 } else { width })
+    x86.defineLabel(done)
+}
+
+// `__builtin_alloca` of rax bytes: the stack pointer moved down by them
+// (rounded up to 16, as a call needs it aligned), the words the
+// expression has pushed so far moved down with it, the room between them
+// and the frame the result. The function's `leave` gives it back.
+fn genAlloca() -> void {
+    x86.immediate(0, x86.RAX, 15)
+    x86.immediate(4, x86.RAX, -16)
+    x86.move(x86.RDX, x86.RSP)
+    x86.sub(x86.RSP, x86.RAX)
+    var word: i64 = 0
+    while word < depth {
+        x86.load(x86.RCX, x86.RDX, word * 8, 8, false)
+        x86.store(x86.RSP, word * 8, x86.RCX, 8)
+        word += 1
+    }
+    x86.move(x86.RAX, x86.RSP)
+    if depth > 0 { x86.immediate(0, x86.RAX, depth * 8) }
+}
+
+// An atomic builtin (atomics.mlx): the operands evaluated onto the
+// stack first, then one locked instruction (a loop of cmpxchg for the
+// bit operations); the result in rax.
+fn genAtomic(n: usize) -> void {
+    const node = ast.node(n)
+    const op = node.*.value
+    if op == atomics.FENCE {
+        x86.mfence()
+        return
+    }
+    const ty = types.unqualified(types.baseOf(ast.typeOf(node.*.lhs)))
+    const size = types.size(ty)
+    const signed = types.isInteger(ty) && !types.isUnsigned(ty)
+    if op == atomics.LOAD {
+        genExpression(node.*.lhs)
+        x86.load(x86.RAX, x86.RAX, 0, size, signed)
+        return
+    }
+    if op == atomics.STORE && size == 16 {
+        // rsi the address, rcx the value's; rdx:rax what is there until
+        // cmpxchg16b swaps rcx:rbx in.
+        genExpression(node.*.rhs)
+        pushRax()
+        genExpression(node.*.lhs)
+        x86.move(x86.RSI, x86.RAX)
+        popTo(x86.RCX)
+        x86.push(x86.RBX)
+        x86.load(x86.RBX, x86.RCX, 0, 8, false)
+        x86.load(x86.RCX, x86.RCX, 8, 8, false)
+        x86.load(x86.RAX, x86.RSI, 0, 8, false)
+        x86.load(x86.RDX, x86.RSI, 8, 8, false)
+        const again = newLabel()
+        x86.defineLabel(again)
+        x86.lockCmpxchg16b(x86.RSI)
+        x86.jumpIf(x86.CC_NE, again)
+        x86.pop(x86.RBX)
+        return
+    }
+    if op == atomics.CMPXCHG && size == 16 {
+        // rsi the address, rdi the expected value's address, rcx the
+        // value's (rbx, saved, and rcx take it; rdx:rax the expected).
+        genExpression(node.*.rhs)
+        pushRax()
+        genExpression(node.*.cond)
+        pushRax()
+        genExpression(node.*.lhs)
+        x86.move(x86.RSI, x86.RAX)
+        popTo(x86.RDI)
+        popTo(x86.RCX)
+        x86.push(x86.RBX)
+        x86.load(x86.RBX, x86.RCX, 0, 8, false)
+        x86.load(x86.RCX, x86.RCX, 8, 8, false)
+        x86.load(x86.RAX, x86.RDI, 0, 8, false)
+        x86.load(x86.RDX, x86.RDI, 8, 8, false)
+        x86.lockCmpxchg16b(x86.RSI)
+        x86.setIf(x86.CC_E, x86.RCX)
+        x86.store(x86.RDI, 0, x86.RAX, 8)
+        x86.store(x86.RDI, 8, x86.RDX, 8)
+        x86.pop(x86.RBX)
+        x86.move(x86.RAX, x86.RCX)
+        x86.extend(x86.RAX, 8, false)
+        return
+    }
+    if op == atomics.CMPXCHG {
+        // rsi the address, rdx the expected value's address, rcx the
+        // value to store.
+        genExpression(node.*.rhs)
+        pushRax()
+        genExpression(node.*.cond)
+        pushRax()
+        genExpression(node.*.lhs)
+        x86.move(x86.RSI, x86.RAX)
+        popTo(x86.RDX)
+        popTo(x86.RCX)
+        x86.load(x86.RAX, x86.RDX, 0, size, signed)
+        x86.lockCmpxchg(x86.RSI, x86.RCX, size)
+        x86.setIf(x86.CC_E, x86.RDI)
+        // The value seen, to the expected one's place (the same value
+        // when it swapped).
+        x86.store(x86.RDX, 0, x86.RAX, size)
+        x86.move(x86.RAX, x86.RDI)
+        x86.extend(x86.RAX, 8, false)
+        return
+    }
+    // The operand in rdi, the address in rax (then rsi).
+    genExpression(node.*.rhs)
+    pushRax()
+    genExpression(node.*.lhs)
+    popTo(x86.RDI)
+    if op == atomics.STORE || op == atomics.EXCHANGE {
+        x86.xchg(x86.RAX, x86.RDI, size)
+        if op == atomics.STORE { return }
+        x86.move(x86.RAX, x86.RDI)
+        if size < 8 { x86.extend(x86.RAX, @intCast(usize, size * 8), signed) }
+        return
+    }
+    if op == atomics.ADD || op == atomics.SUB {
+        if op == atomics.SUB { x86.negate(x86.RDI) }
+        x86.move(x86.RCX, x86.RDI)
+        x86.lockXadd(x86.RAX, x86.RDI, size)
+        x86.move(x86.RAX, x86.RDI)
+        if node.*.high != 0 { x86.add(x86.RAX, x86.RCX) }
+        if size < 8 { x86.extend(x86.RAX, @intCast(usize, size * 8), signed) }
+        return
+    }
+    // and, or, xor, nand: rax = [rsi]; loop: rcx = rax op rdi; lock
+    // cmpxchg [rsi], rcx; until it swapped. rax the old value, rcx the
+    // new one.
+    x86.move(x86.RSI, x86.RAX)
+    x86.load(x86.RAX, x86.RSI, 0, size, signed)
+    const again = newLabel()
+    x86.defineLabel(again)
+    x86.move(x86.RCX, x86.RAX)
+    if op == atomics.AND || op == atomics.NAND { x86.andRegisters(x86.RCX, x86.RDI) }
+    if op == atomics.OR { x86.orRegisters(x86.RCX, x86.RDI) }
+    if op == atomics.XOR { x86.xorRegisters(x86.RCX, x86.RDI) }
+    if op == atomics.NAND { x86.complement(x86.RCX) }
+    x86.lockCmpxchg(x86.RSI, x86.RCX, size)
+    x86.jumpIf(x86.CC_NE, again)
+    if node.*.high != 0 { x86.move(x86.RAX, x86.RCX) }
+    if size < 8 { x86.extend(x86.RAX, @intCast(usize, size * 8), signed) }
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+
+// A binary operation on long doubles: st0 the right operand, st1 the
+// left, and the result (or the flags) from them.
+fn genLongDoubleBinary(n: usize) -> void {
+    const node = ast.node(n)
+    genExpression(node.*.rhs)
+    pushExtended()
+    genExpression(node.*.lhs)
+    popExtended()
+    const k = node.*.kind
+    if k == ast.ADD {
+        x86.faddp()
+    } else if k == ast.SUB {
+        x86.fsubp()
+    } else if k == ast.MUL {
+        x86.fmulp()
+    } else if k == ast.DIV {
+        x86.fdivp()
+    } else if k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        // The right operand compared with the left: as the SSE path's
+        // ucomisd xmm1 (right), xmm0 (left).
+        x86.fucomip()
+        x86.fstpTop()
+        if k == ast.EQ {
+            x86.setIf(x86.CC_E, x86.RAX)
+            x86.setIf(x86.CC_NP, x86.RDX)
+            x86.andRegisters(x86.RAX, x86.RDX)
+        } else if k == ast.NE {
+            x86.setIf(x86.CC_NE, x86.RAX)
+            x86.setIf(x86.CC_P, x86.RDX)
+            x86.orRegisters(x86.RAX, x86.RDX)
+        } else if k == ast.LT {
+            x86.setIf(x86.CC_A, x86.RAX)
+        } else {
+            x86.setIf(x86.CC_AE, x86.RAX)
+        }
+    } else {
+        ast.errorAt(n, "invalid operands to a floating operation")
+    }
+}
+
+fn genFloatBinary(n: usize) -> void {
+    const node = ast.node(n)
+    genExpression(node.*.rhs)
+    pushFloat()
+    genExpression(node.*.lhs)
+    popFloat(1)
+    const d = isDouble(ast.typeOf(node.*.lhs))
+    const k = node.*.kind
+    if k == ast.ADD {
+        x86.floatArithmetic(88, 0, 1, d)
+    } else if k == ast.SUB {
+        x86.floatArithmetic(92, 0, 1, d)
+    } else if k == ast.MUL {
+        x86.floatArithmetic(89, 0, 1, d)
+    } else if k == ast.DIV {
+        x86.floatArithmetic(94, 0, 1, d)
+    } else if k == ast.EQ {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_E, x86.RAX)
+        x86.setIf(x86.CC_NP, x86.RDX)
+        x86.andRegisters(x86.RAX, x86.RDX)
+    } else if k == ast.NE {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_NE, x86.RAX)
+        x86.setIf(x86.CC_P, x86.RDX)
+        x86.orRegisters(x86.RAX, x86.RDX)
+    } else if k == ast.LT {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_A, x86.RAX)
+    } else if k == ast.LE {
+        x86.floatCompare(1, 0, d)
+        x86.setIf(x86.CC_AE, x86.RAX)
+    } else {
+        ast.errorAt(n, "invalid operands to a floating operation")
+    }
+}
+
+fn bitMask(width: i64) -> i64 {
+    if width >= 64 { return -1 }
+    return @bitCast(i64, (@bitCast(u64, one()) << @intCast(u6, width)) -% 1)
+}
+
+fn one() -> i64 { return 1 }
+
+// Whether `n` calls a function that returns twice (`setjmp`): what the
+// expression pushed before the call is gone when it returns again, after
+// the calls between have used that stack.
+fn returnsTwice(n: usize) -> bool {
+    var x = n
+    while ast.kindOf(x) == ast.CAST { x = ast.node(x).*.lhs }
+    if ast.kindOf(x) != ast.FUNCALL || ast.kindOf(ast.node(x).*.lhs) != ast.VAR { return false }
+    const name = base.nameOf(ast.obj(ast.node(ast.node(x).*.lhs).*.variable).*.name)
+    return base.same(name, "setjmp") || base.same(name, "_setjmp") || base.same(name, "sigsetjmp") || base.same(name, "__sigsetjmp") || base.same(name, "vfork") || base.same(name, "getcontext") || base.same(name, "savectx")
+}
+
+fn genAssign(n: usize) -> void {
+    const node = ast.node(n)
+    const lhs = node.*.lhs
+    if returnsTwice(node.*.rhs) && types.isScalar(node.*.ty) && !(ast.kindOf(lhs) == ast.MEMBER && types.member(ast.node(lhs).*.member).*.bitWidth > 0) {
+        // `r = setjmp(buf)`: the call first, nothing pushed around it.
+        genExpression(node.*.rhs)
+        pushRax()
+        genAddress(lhs)
+        popTo(x86.RDI)
+        pushRax()
+        x86.move(x86.RAX, x86.RDI)
+        store(node.*.ty)
+        return
+    }
+    genAddress(lhs)
+    pushRax()
+    genExpression(node.*.rhs)
+    if ast.kindOf(lhs) == ast.MEMBER && types.member(ast.node(lhs).*.member).*.bitWidth > 0 {
+        // A bit-field: merge the value into its unit.
+        const m = ast.node(lhs).*.member
+        const width = types.member(m).*.bitWidth
+        const offset = types.member(m).*.bitOffset
+        const unit = types.member(m).*.ty
+        x86.move(x86.R8, x86.RAX)
+        x86.move(x86.RDI, x86.RAX)
+        x86.moveImmediate(x86.RDX, bitMask(width))
+        x86.andRegisters(x86.RDI, x86.RDX)
+        if offset > 0 { x86.shiftImmediate(x86.RDI, offset, true, false) }
+        x86.load(x86.RAX, x86.RSP, 0, 8, false)
+        x86.load(x86.RAX, x86.RAX, 0, types.size(unit), false)
+        const kept = ~(@bitCast(u64, bitMask(width)) << @intCast(u6, offset))
+        x86.moveImmediate(x86.R9, @bitCast(i64, kept))
+        x86.andRegisters(x86.RAX, x86.R9)
+        x86.orRegisters(x86.RAX, x86.RDI)
+        store(unit)
+        x86.move(x86.RAX, x86.R8)
+        return
+    }
+    store(node.*.ty)
+}
+
+fn genMemberValue(n: usize) -> void {
+    genAddress(n)
+    const m = ast.node(n).*.member
+    const width = types.member(m).*.bitWidth
+    if width <= 0 {
+        load(ast.typeOf(n))
+        return
+    }
+    const unit = types.member(m).*.ty
+    x86.load(x86.RAX, x86.RAX, 0, types.size(unit), false)
+    x86.shiftImmediate(x86.RAX, 64 - width - types.member(m).*.bitOffset, true, false)
+    // (A bool bit-field is 0 or 1, never sign-extended to -1.)
+    x86.shiftImmediate(x86.RAX, 64 - width, false, !types.bitFieldUnsigned(unit))
+}
+
+pub fn genExpression(n: usize) -> void {
+    if !interp.trace {
+        genExpressionAt(n)
+        return
+    }
+    // (Traced: the expression that leaves the stack otherwise.)
+    const before = depth
+    genExpressionAt(n)
+    if depth != before {
+        var line = base.join("stack moved by expression kind ", base.decimal(@intCast(u64, ast.node(n).*.kind)))
+        line = base.join(line, base.join(" by ", base.decimal(@intCast(u64, if depth > before { depth - before } else { before - depth }))))
+        const callee = ast.node(n).*.lhs
+        if ast.node(n).*.kind == ast.FUNCALL && ast.kindOf(callee) == ast.VAR { line = base.join(line, base.join(" calling ", base.nameOf(ast.obj(ast.node(callee).*.variable).*.name))) }
+        if ast.node(n).*.kind == ast.FUNCALL && ast.node(n).*.returnBuffer != 0 { line = base.join(line, " (buffer)") }
+        tokens.warnAt(ast.node(n).*.token, line)
+    }
+}
+
+fn genExpressionAt(n: usize) -> void {
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.NULL_EXPR { return }
+    if k == ast.BITCAST {
+        genExpression(node.*.lhs)
+        const fromFloat = isFloat(ast.typeOf(node.*.lhs))
+        const toFloat = isFloat(node.*.ty)
+        if fromFloat && !toFloat {
+            x86.bitsFromFloat(x86.RAX, 0)
+            canonical(node.*.ty)
+        } else if !fromFloat && toFloat {
+            x86.floatFromBits(0, x86.RAX)
+        } else if !fromFloat {
+            canonical(node.*.ty)
+        }
+        return
+    }
+    if k == ast.LABEL_ADDR {
+        const name = x86.label(node.*.label)
+        x86.symbolAddress(x86.RAX, name.0, name.1)
+        return
+    }
+    if k == ast.NUM {
+        const ty = node.*.ty
+        if isWide(ty) {
+            // The limbs (the constant's own, or a 64-bit value's) in the
+            // data area: their address.
+            var payload = node.*.extra
+            if payload == 0 { payload = wide.payloadFrom64(@bitCast(u64, node.*.value), ty, ty) }
+            const size = @intCast(usize, types.size(ty))
+            const offset = x86.reserve(size, 8, payload, size)
+            x86.dataAddress(x86.RAX, offset)
+            return
+        }
+        if isLongDouble(ty) {
+            // The 80 bits (the constant's own, or the double's widened)
+            // in the data area, pushed from there.
+            var payload = node.*.extra
+            if payload == 0 {
+                payload = base.alloc(extended.SIZE)
+                const widened = extended.fromDouble(@bitCast(u64, node.*.value))
+                extended.store(payload, widened.0, widened.1)
+            }
+            const offset = x86.reserve(extended.SIZE, 16, payload, extended.SIZE)
+            x86.dataAddress(x86.RAX, offset)
+            x86.fldExtended(x86.RAX, 0)
+            return
+        }
+        if types.kind(ty) == types.FLOAT {
+            const single = @floatCast(f32, @bitCast(f64, @bitCast(u64, node.*.value)))
+            x86.moveImmediate(x86.RAX, @intCast(i64, @bitCast(u32, single)) & 4294967295)
+            x86.floatFromBits(0, x86.RAX)
+        } else if isDouble(ty) {
+            x86.moveImmediate(x86.RAX, node.*.value)
+            x86.floatFromBits(0, x86.RAX)
+        } else {
+            x86.moveImmediate(x86.RAX, node.*.value)
+        }
+        return
+    }
+    if k == ast.NEG {
+        if isWide(node.*.ty) {
+            genWideUnary(n, "__mlxcc_wide_neg")
+            return
+        }
+        genExpression(node.*.lhs)
+        if isLongDouble(node.*.ty) {
+            x86.fchs()
+            return
+        }
+        if isFloat(node.*.ty) {
+            if isDouble(node.*.ty) {
+                x86.moveImmediate(x86.RAX, -9223372036854775807 - 1)
+            } else {
+                x86.moveImmediate(x86.RAX, 2147483648)
+            }
+            x86.floatFromBits(1, x86.RAX)
+            x86.floatXor(0, 1)
+            return
+        }
+        x86.negate(x86.RAX)
+        canonical(node.*.ty)
+        return
+    }
+    if k == ast.VAR {
+        genAddress(n)
+        load(node.*.ty)
+        return
+    }
+    if k == ast.MEMBER {
+        genMemberValue(n)
+        return
+    }
+    if k == ast.DEREF {
+        genExpression(node.*.lhs)
+        load(node.*.ty)
+        return
+    }
+    if k == ast.ADDR {
+        genAddress(node.*.lhs)
+        return
+    }
+    if k == ast.ASSIGN {
+        genAssign(n)
+        return
+    }
+    if k == ast.STMT_EXPR {
+        // The last statement's expression is the value: not dropped.
+        var s = node.*.body
+        while s != 0 {
+            if ast.node(s).*.next == 0 && ast.node(s).*.kind == ast.EXPR_STMT {
+                genExpression(ast.node(s).*.lhs)
+            } else {
+                genstmt.genStatement(s)
+            }
+            s = ast.node(s).*.next
+        }
+        return
+    }
+    if k == ast.COMMA {
+        genExpression(node.*.lhs)
+        // (Nothing to drop after a NULL_EXPR, which has no type.)
+        if ast.kindOf(node.*.lhs) != ast.NULL_EXPR { discard(ast.typeOf(node.*.lhs)) }
+        genExpression(node.*.rhs)
+        return
+    }
+    if k == ast.CAST {
+        if isWide(ast.typeOf(node.*.lhs)) || isWide(node.*.ty) {
+            genWideCast(n)
+            return
+        }
+        genExpression(node.*.lhs)
+        cast(ast.typeOf(node.*.lhs), node.*.ty)
+        return
+    }
+    if k == ast.MEMZERO && node.*.variable == 0 {
+        // `value` bytes zeroed at the address `lhs`.
+        genExpression(node.*.lhs)
+        x86.move(x86.RDI, x86.RAX)
+        x86.moveImmediate(x86.RCX, node.*.value)
+        x86.moveImmediate(x86.RAX, 0)
+        x86.repStoreBytes()
+        return
+    }
+    if k == ast.MEMZERO {
+        const o = node.*.variable
+        localAddress(x86.RDI, o)
+        x86.moveImmediate(x86.RCX, types.size(ast.obj(o).*.ty))
+        x86.moveImmediate(x86.RAX, 0)
+        x86.repStoreBytes()
+        return
+    }
+    if k == ast.COND {
+        const otherwise = newLabel()
+        const done = newLabel()
+        genExpression(node.*.cond)
+        compareZero(ast.typeOf(node.*.cond))
+        x86.jumpIf(x86.CC_E, otherwise)
+        genExpression(node.*.then)
+        x86.jump(done)
+        x86.defineLabel(otherwise)
+        genExpression(node.*.els)
+        x86.defineLabel(done)
+        return
+    }
+    if k == ast.NOT {
+        genExpression(node.*.lhs)
+        compareZero(ast.typeOf(node.*.lhs))
+        x86.setIf(x86.CC_E, x86.RAX)
+        return
+    }
+    if k == ast.BITNOT {
+        if isWide(node.*.ty) {
+            genWideUnary(n, "__mlxcc_wide_not")
+            return
+        }
+        genExpression(node.*.lhs)
+        x86.complement(x86.RAX)
+        canonical(node.*.ty)
+        return
+    }
+    if k == ast.LOGAND || k == ast.LOGOR {
+        const decided = newLabel()
+        const done = newLabel()
+        const stop: u8 = if k == ast.LOGAND { x86.CC_E } else { x86.CC_NE }
+        genExpression(node.*.lhs)
+        compareZero(ast.typeOf(node.*.lhs))
+        x86.jumpIf(stop, decided)
+        genExpression(node.*.rhs)
+        compareZero(ast.typeOf(node.*.rhs))
+        x86.jumpIf(stop, decided)
+        x86.moveImmediate(x86.RAX, if k == ast.LOGAND { 1 } else { 0 })
+        x86.jump(done)
+        x86.defineLabel(decided)
+        x86.moveImmediate(x86.RAX, if k == ast.LOGAND { 0 } else { 1 })
+        x86.defineLabel(done)
+        return
+    }
+    if k == ast.FUNCALL {
+        genCall(n)
+        return
+    }
+    if k == ast.VA_START {
+        const fn_obj = genstmt.currentFunction()
+        const area = ast.obj(fn_obj).*.vaArea
+        if area == 0 { ast.errorAt(n, "va_start used in a function with fixed arguments") }
+        genExpression(node.*.lhs)
+        x86.move(x86.RDI, x86.RAX)
+        x86.leaFrame(x86.RAX, ast.obj(area).*.offset)
+        copyBytes(24)
+        return
+    }
+    if k == ast.VA_ARG {
+        genVaArg(n)
+        return
+    }
+    if k == ast.ATOMIC {
+        genAtomic(n)
+        return
+    }
+    if k == ast.ASM {
+        if node.*.value == builtins.ASM_CODE {
+            genAsmCode(n)
+            return
+        }
+        genAsm(node.*.value)
+        return
+    }
+    if k == ast.BITOP {
+        genBitop(n)
+        return
+    }
+    // Binary operators.
+    if isWide(ast.typeOf(node.*.lhs)) {
+        genWideBinary(n)
+        return
+    }
+    if isLongDouble(ast.typeOf(node.*.lhs)) {
+        genLongDoubleBinary(n)
+        return
+    }
+    if isFloat(ast.typeOf(node.*.lhs)) {
+        genFloatBinary(n)
+        return
+    }
+    genExpression(node.*.rhs)
+    pushRax()
+    genExpression(node.*.lhs)
+    popTo(x86.RDI)
+    const signed = !types.isUnsigned(ast.typeOf(node.*.lhs))
+    if k == ast.ADD {
+        x86.add(x86.RAX, x86.RDI)
+        canonical(node.*.ty)
+    } else if k == ast.SUB {
+        x86.sub(x86.RAX, x86.RDI)
+        canonical(node.*.ty)
+    } else if k == ast.MUL {
+        x86.multiply(x86.RAX, x86.RDI)
+        canonical(node.*.ty)
+    } else if k == ast.DIV || k == ast.MOD {
+        x86.divide(x86.RDI, signed)
+        if k == ast.MOD { x86.move(x86.RAX, x86.RDX) }
+        canonical(node.*.ty)
+    } else if k == ast.BITAND {
+        x86.andRegisters(x86.RAX, x86.RDI)
+    } else if k == ast.BITOR {
+        x86.orRegisters(x86.RAX, x86.RDI)
+    } else if k == ast.BITXOR {
+        x86.xorRegisters(x86.RAX, x86.RDI)
+    } else if k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        x86.compare(x86.RAX, x86.RDI)
+        var condition: u8 = x86.CC_E
+        if k == ast.NE { condition = x86.CC_NE }
+        if k == ast.LT { condition = if signed { x86.CC_L } else { x86.CC_B } }
+        if k == ast.LE { condition = if signed { x86.CC_LE } else { x86.CC_BE } }
+        x86.setIf(condition, x86.RAX)
+    } else if k == ast.SHL {
+        x86.move(x86.RCX, x86.RDI)
+        x86.shiftByCl(x86.RAX, true, false)
+        canonical(node.*.ty)
+    } else if k == ast.SHR {
+        x86.move(x86.RCX, x86.RDI)
+        x86.shiftByCl(x86.RAX, false, signed)
+    } else {
+        ast.errorAt(n, "invalid expression")
+    }
+}
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepState() -> void {
+    base.keepState(@intFromPtr(&depth), @sizeOf(@typeOf(depth)))
+    base.keepState(@intFromPtr(&labelCounter), @sizeOf(@typeOf(labelCounter)))
+    base.keepState(@intFromPtr(&lateFunctions), @sizeOf(@typeOf(lateFunctions)))
+    base.keepState(@intFromPtr(&stackCursor), @sizeOf(@typeOf(stackCursor)))
+}
+// --- end of prefix snapshot state ---

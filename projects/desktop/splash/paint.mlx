@@ -1,0 +1,804 @@
+// Drawing for the boot splash: a surface of XRGB8888 pixels (the layout of
+// the kernel's dumb buffers and of /dev/fb0), light added to it (glows,
+// rings, sparks: their colours add up and saturate, as light does),
+// colours laid over it, anti-aliased lines, and the numbers the scene needs
+// fast: a sine table, a square root from a guess of its exponent, a
+// pseudo-random sequence that is the same on every boot.
+const std = @import("std")
+const math = @import("std.math")
+const vector = @import("std.ui.vector")
+
+pub const Allocator = std.allocator.Allocator
+
+pub const Surface = struct {
+    pixels: [*]u32
+    width: usize
+    height: usize
+    // Pixels from the start of one row to the next.
+    stride: usize
+    // Where drawing reaches (left and top in, right and bottom out): the
+    // animated part of a frame, so nothing lands where no frame clears.
+    clipLeft: i64
+    clipTop: i64
+    clipRight: i64
+    clipBottom: i64
+    // The tiles drawn on (TILE x TILE pixels, `tileColumns` to a row) are
+    // marked in `marks` while `marking`: the next frame restores only
+    // those, and the output copies only those.
+    marks: [*]u8
+    tileColumns: usize
+    marking: bool
+    // While a frame is recorded (0: drawn): the list its sparks, glows and
+    // lines go to instead of the pixels (a Recording's address).
+    recording: usize
+}
+
+// A tile's side in pixels, as a shift.
+pub const TILE_SHIFT: i64 = 5
+pub const TILE: i64 = 32
+
+pub fn clipAll(surface: *Surface) -> void {
+    surface.*.clipLeft = 0
+    surface.*.clipTop = 0
+    surface.*.clipRight = @intCast(i64, surface.*.width)
+    surface.*.clipBottom = @intCast(i64, surface.*.height)
+}
+
+// Drawing straight to the pixels, nothing marked.
+pub fn plain(surface: *Surface) -> void {
+    surface.*.marking = false
+    surface.*.recording = 0
+}
+
+// Marks the tiles under the pixels from (left, top) to (right, bottom),
+// all four in, already within the clip.
+pub fn mark(surface: *Surface, left: i64, top: i64, right: i64, bottom: i64) -> void {
+    if !surface.*.marking || right < left || bottom < top { return }
+    const first = @intCast(usize, left >> TILE_SHIFT)
+    const last = @intCast(usize, right >> TILE_SHIFT)
+    var row = @intCast(usize, top >> TILE_SHIFT)
+    const end = @intCast(usize, bottom >> TILE_SHIFT)
+    while row <= end {
+        var at = row * surface.*.tileColumns + first
+        const stop = row * surface.*.tileColumns + last
+        while at <= stop {
+            surface.*.marks[at] = 1
+            at += 1
+        }
+        row += 1
+    }
+}
+
+// The rectangle clipped, then marked.
+pub fn markClipped(surface: *Surface, left: i64, top: i64, right: i64, bottom: i64) -> void {
+    if !surface.*.marking { return }
+    const l = if left < surface.*.clipLeft { surface.*.clipLeft } else { left }
+    const t = if top < surface.*.clipTop { surface.*.clipTop } else { top }
+    const r = if right >= surface.*.clipRight { surface.*.clipRight - 1 } else { right }
+    const b = if bottom >= surface.*.clipBottom { surface.*.clipBottom - 1 } else { bottom }
+    mark(surface, l, t, r, b)
+}
+
+// ---------------------------------------------------------------------------
+// Recording
+
+// What a frame draws, in order, to be drawn later in bands by several
+// threads at once: each band draws what reaches into its rows, clipped to
+// them. Sparks, glows and lines record themselves while the surface
+// records; the scene adds its own kinds (the letters, the bar, text).
+pub const SPARK: u32 = 0
+pub const GLOW: u32 = 1
+pub const LINE: u32 = 2
+
+pub const Command = struct {
+    kind: u32
+    colour: u32
+    x: f64
+    y: f64
+    x1: f64
+    y1: f64
+    strength: f64
+    // A glow's sprite (its address), or what a scene's kind needs; the
+    // glow made in its light already (its first word's address; 0: none).
+    item: usize
+    tint: usize
+    // The rows it reaches, top and bottom in.
+    top: i64
+    bottom: i64
+}
+
+pub const Recording = struct {
+    commands: [*]Command
+    count: usize
+    capacity: usize
+    allocator: Allocator
+}
+
+pub fn initRecording(recording: *Recording, allocator: Allocator) -> bool {
+    recording.*.allocator = allocator
+    recording.*.count = 0
+    recording.*.capacity = 0
+    return grow(recording, 16384)
+}
+
+fn grow(recording: *Recording, capacity: usize) -> bool {
+    const memory = recording.*.allocator.alloc(capacity * @sizeOf(Command), 16)
+    if memory == null { return false }
+    const commands: [*]Command = unsafe { @ptrCast([*]Command, memory.?) }
+    if recording.*.capacity > 0 {
+        copyBytes(@intFromPtr(commands), @intFromPtr(recording.*.commands), recording.*.count * @sizeOf(Command))
+        const old: [*]u8 = unsafe { @ptrCast([*]u8, recording.*.commands) }
+        recording.*.allocator.free(old, recording.*.capacity * @sizeOf(Command), 16)
+    }
+    recording.*.commands = commands
+    recording.*.capacity = capacity
+    return true
+}
+
+// A command at the end of the list (null when there is no memory for it:
+// the frame goes without).
+pub fn record(surface: *Surface, kind: u32, top: i64, bottom: i64) -> ?*Command {
+    var recording: *Recording = unsafe { @ptrFromInt(*Recording, surface.*.recording) }
+    if bottom < surface.*.clipTop || top >= surface.*.clipBottom { return null }
+    if recording.*.count == recording.*.capacity && !grow(recording, recording.*.capacity * 2) { return null }
+    const command = &recording.*.commands[recording.*.count]
+    recording.*.count += 1
+    command.*.kind = kind
+    command.*.top = top
+    command.*.bottom = bottom
+    return command
+}
+
+// A round glow `size` x `size` (size = 2 * radius + 1): how much light each
+// pixel gets, 0 to 255, falling off as (1 - d²/r²)³ (close to a gaussian,
+// without exp).
+pub const Sprite = struct {
+    radius: i32
+    size: i32
+    values: [*]u8
+    // Per row, the first column with light (the rest of the row up to its
+    // mirror image has light too): the corners are skipped.
+    firsts: [*]u8
+    // Its glows made once per light (a Tints' address; 0: none).
+    tints: usize
+}
+
+// A sprite's glows in each light met so far, made once: the light times
+// each of the sprite's values, which a glow then adds as they are (the
+// light is a colour scaled by a weight in 256ths, so few lights recur
+// over and over: a ring's halos are its colour at a weight). Made while a
+// frame is recorded, read while its bands are drawn.
+pub const Tints = struct {
+    // Open addressing: each slot's light (with TINT_USED; 0: free) and its
+    // image's index; `images` holds `limit` images of size x size words.
+    keys: [*]u32
+    indices: [*]u32
+    slots: u32
+    count: u32
+    limit: u32
+    images: [*]u32
+}
+
+const TINT_USED: u32 = 2147483648
+
+// ---------------------------------------------------------------------------
+// Numbers
+
+const SINE_STEPS: usize = 4096
+
+pub const Tables = struct {
+    sines: [4097]f64
+}
+
+pub fn initTables(tables: *Tables) -> void {
+    var index: usize = 0
+    while index <= SINE_STEPS {
+        tables.*.sines[index] = math.sin(toFloat(index) * math.tau / toFloat(SINE_STEPS))
+        index += 1
+    }
+}
+
+// The sine of `radians` from the table, between its two nearest steps.
+pub fn sine(tables: *const Tables, radians: f64) -> f64 {
+    const steps = radians * toFloat(SINE_STEPS) / math.tau
+    var whole = @floor(steps)
+    const fraction = steps - whole
+    var turn = whole - @floor(whole / toFloat(SINE_STEPS)) * toFloat(SINE_STEPS)
+    const index = @intCast(usize, toInt(turn))
+    const low = tables.*.sines[index]
+    const high = tables.*.sines[index + 1]
+    return low + (high - low) * fraction
+}
+
+pub fn cosine(tables: *const Tables, radians: f64) -> f64 { return sine(tables, radians + math.pi / 2.0) }
+
+pub inline fn toFloat(value: usize) -> f64 { return @floatFromInt(f64, @intCast(i64, value)) }
+
+pub inline fn signedFloat(value: i64) -> f64 { return @floatFromInt(f64, value) }
+
+pub inline fn toInt(value: f64) -> i64 { return @intFromFloat(i64, value) }
+
+// The nearest whole number.
+pub inline fn round(value: f64) -> i64 { return toInt(@floor(value + 0.5)) }
+
+// Eases out: fast at first, slowing to a stop at 1.
+pub fn easeOut(t: f64) -> f64 {
+    const u = 1.0 - math.clamp(t, 0.0, 1.0)
+    return 1.0 - u * u * u
+}
+
+// ---------------------------------------------------------------------------
+// Colours (0x00RRGGBB, each channel 0-255)
+
+pub fn rgb(red: u32, green: u32, blue: u32) -> u32 { return 4278190080 | (red << 16) | (green << 8) | blue }
+
+// The colour words are worked on whole: red and blue in one multiply,
+// green in another, the channels' sums side by side (a frame mixes a few
+// million of them).
+pub const RED_BLUE: u32 = 16711935
+pub const GREEN: u32 = 65280
+pub const LOW_SEVEN: u32 = 8355711
+pub const HIGH_BITS: u32 = 8421504
+pub const OPAQUE: u32 = 4278190080
+// The same for two pixels in one 64-bit word.
+const PAIR_RGB: u64 = 0x00FFFFFF00FFFFFF
+const PAIR_LOW_SEVEN: u64 = 0x007F7F7F007F7F7F
+const PAIR_HIGH_BITS: u64 = 0x0080808000808080
+const PAIR_OPAQUE: u64 = 0xFF000000FF000000
+
+// The red, green and blue of `color` times `k` / 256 (k up to 256).
+pub inline fn scale(color: u32, k: u32) -> u32 {
+    return ((((color & RED_BLUE) * k) >> 8) & RED_BLUE) | ((((color & GREEN) * k) >> 8) & GREEN)
+}
+
+// 0-1 as 0-256.
+pub inline fn weight(t: f64) -> u32 { return @intCast(u32, toInt(math.clamp(t, 0.0, 1.0) * 256.0)) }
+
+// `a` toward `b` by `t` (0: a, 1: b).
+pub fn mix(a: u32, b: u32, t: f64) -> u32 {
+    const k = weight(t)
+    return OPAQUE | (scale(a, 256 - k) + scale(b, k))
+}
+
+// `color` at `scale` (0-1) of its brightness.
+pub fn dim(color: u32, brightness: f64) -> u32 { return OPAQUE | scale(color, weight(brightness)) }
+
+// Light `color` added to `pixel`, each channel stopping at 255: added in
+// their low seven bits, then the top bits; a channel that carries out of
+// its byte becomes 255.
+pub inline fn addPixel(pixel: u32, color: u32) -> u32 {
+    const a = pixel & 16777215
+    const b = color & 16777215
+    const sum = ((a & LOW_SEVEN) + (b & LOW_SEVEN)) ^ ((a ^ b) & HIGH_BITS)
+    const carry = ((a & b) | ((a | b) & ~sum)) & HIGH_BITS
+    return OPAQUE | sum | ((carry << 1) - (carry >> 7))
+}
+
+// `color` laid over `pixel` at `alpha` (0-255).
+pub fn overPixel(pixel: u32, color: u32, alpha: u32) -> u32 {
+    if alpha >= 255 { return color | OPAQUE }
+    const k = alpha + (alpha >> 7)
+    return OPAQUE | (scale(pixel, 256 - k) + scale(color, k))
+}
+
+// A premultiplied ARGB colour (as std.png keeps them) over `pixel`.
+pub fn overPremultiplied(pixel: u32, color: u32) -> u32 {
+    const alpha = color >> 24
+    if alpha == 0 { return pixel }
+    const k = alpha + (alpha >> 7)
+    return addPixel(scale(pixel, 256 - k), color)
+}
+
+// `color` with coverage `alpha` (0-255) as premultiplied ARGB.
+pub fn premultiplied(color: u32, alpha: u32) -> u32 {
+    return (alpha << 24) | scale(color, alpha + (alpha >> 7))
+}
+
+// Premultiplied ARGB `over` laid on `under` (alpha too).
+pub fn layer(under: u32, over: u32) -> u32 {
+    const alpha = over >> 24
+    const keep = 256 - (alpha + (alpha >> 7))
+    const red_blue = (over & RED_BLUE) + ((((under & RED_BLUE) * keep) >> 8) & RED_BLUE)
+    const alpha_green = ((over >> 8) & RED_BLUE) + (((((under >> 8) & RED_BLUE) * keep) >> 8) & RED_BLUE)
+    return red_blue | (alpha_green << 8)
+}
+
+// A premultiplied ARGB colour at `k` / 256 of its strength, alpha too.
+pub fn fadePremultiplied(color: u32, k: u32) -> u32 {
+    return ((((color >> 24) * k) >> 8) << 24) | scale(color, k)
+}
+
+// ---------------------------------------------------------------------------
+// Pixels
+
+pub inline fn inside(surface: *const Surface, x: i64, y: i64) -> bool {
+    return x >= surface.*.clipLeft && y >= surface.*.clipTop && x < surface.*.clipRight && y < surface.*.clipBottom
+}
+
+pub fn add(surface: *Surface, x: i64, y: i64, color: u32) -> void {
+    if !inside(surface, x, y) { return }
+    const at = @intCast(usize, y) * surface.*.stride + @intCast(usize, x)
+    surface.*.pixels[at] = addPixel(surface.*.pixels[at], color)
+    if surface.*.marking { surface.*.marks[@intCast(usize, y >> TILE_SHIFT) * surface.*.tileColumns + @intCast(usize, x >> TILE_SHIFT)] = 1 }
+}
+
+pub fn over(surface: *Surface, x: i64, y: i64, color: u32, alpha: u32) -> void {
+    if !inside(surface, x, y) || alpha == 0 { return }
+    const at = @intCast(usize, y) * surface.*.stride + @intCast(usize, x)
+    surface.*.pixels[at] = overPixel(surface.*.pixels[at], color, alpha)
+    if surface.*.marking { surface.*.marks[@intCast(usize, y >> TILE_SHIFT) * surface.*.tileColumns + @intCast(usize, x >> TILE_SHIFT)] = 1 }
+}
+
+// A spark at a point between pixels: `color` shared out over the four
+// pixels around it by how near each is.
+pub fn spark(surface: *Surface, x: f64, y: f64, color: u32, intensity: f64) -> void {
+    if intensity <= 0.0 { return }
+    const top = @floor(y - 0.5)
+    if surface.*.recording != 0 {
+        const row = toInt(top)
+        const command = record(surface, SPARK, row, row + 1)
+        if command == null { return }
+        command.?.*.x = x
+        command.?.*.y = y
+        command.?.*.colour = color
+        command.?.*.strength = intensity
+        return
+    }
+    const left = @floor(x - 0.5)
+    const ix = toInt(left)
+    const iy = toInt(top)
+    // The weights in 256ths, the light in each of the four pixels.
+    const k = toInt(math.clamp(intensity, 0.0, 1.0) * 256.0)
+    const wx = toInt((x - 0.5 - left) * 256.0)
+    const wy = toInt((y - 0.5 - top) * 256.0)
+    const right_share = (k * wx) >> 8
+    const left_share = k - right_share
+    const top_left = @intCast(u32, (left_share * (256 - wy)) >> 8)
+    const top_right = @intCast(u32, (right_share * (256 - wy)) >> 8)
+    const bottom_left = @intCast(u32, (left_share * wy) >> 8)
+    const bottom_right = @intCast(u32, (right_share * wy) >> 8)
+    if ix < surface.*.clipLeft || iy < surface.*.clipTop || ix + 1 >= surface.*.clipRight || iy + 1 >= surface.*.clipBottom {
+        // At the edge (of the region or a band): pixel by pixel, each
+        // checked, the same light as below.
+        add(surface, ix, iy, scale(color, top_left))
+        add(surface, ix + 1, iy, scale(color, top_right))
+        add(surface, ix, iy + 1, scale(color, bottom_left))
+        add(surface, ix + 1, iy + 1, scale(color, bottom_right))
+        return
+    }
+    const at = @intCast(usize, iy) * surface.*.stride + @intCast(usize, ix)
+    const below = at + surface.*.stride
+    surface.*.pixels[at] = addPixel(surface.*.pixels[at], scale(color, top_left))
+    surface.*.pixels[at + 1] = addPixel(surface.*.pixels[at + 1], scale(color, top_right))
+    surface.*.pixels[below] = addPixel(surface.*.pixels[below], scale(color, bottom_left))
+    surface.*.pixels[below + 1] = addPixel(surface.*.pixels[below + 1], scale(color, bottom_right))
+    mark(surface, ix, iy, ix + 1, iy + 1)
+}
+
+pub fn fillRect(surface: *Surface, x: i64, y: i64, width: i64, height: i64, color: u32, alpha: u32) -> void {
+    var row = y
+    while row < y + height {
+        var column = x
+        while column < x + width {
+            over(surface, column, row, color, alpha)
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Glows
+
+pub fn makeSprite(sprite: *Sprite, radius: i32, allocator: Allocator) -> bool {
+    const size = radius * 2 + 1
+    const memory = allocator.alloc(@intCast(usize, size * size), 1)
+    const firsts = allocator.alloc(@intCast(usize, size), 1)
+    if memory == null || firsts == null { return false }
+    sprite.*.radius = radius
+    sprite.*.size = size
+    sprite.*.values = memory.?
+    sprite.*.firsts = firsts.?
+    sprite.*.tints = 0
+    const r = signedFloat(@intCast(i64, radius)) + 0.5
+    var row: i32 = 0
+    while row < size {
+        var column: i32 = 0
+        while column < size {
+            const dx = signedFloat(@intCast(i64, column - radius))
+            const dy = signedFloat(@intCast(i64, row - radius))
+            const d = (dx * dx + dy * dy) / (r * r)
+            var value: f64 = 0.0
+            if d < 1.0 {
+                const falloff = 1.0 - d
+                value = falloff * falloff * falloff
+            }
+            sprite.*.values[@intCast(usize, row * size + column)] = @intCast(u8, toInt(value * 255.0 + 0.5))
+            column += 1
+        }
+        var first: i32 = 0
+        while first < radius && sprite.*.values[@intCast(usize, row * size + first)] == 0 { first += 1 }
+        sprite.*.firsts[@intCast(usize, row)] = @intCast(u8, first)
+        row += 1
+    }
+    return true
+}
+
+pub fn freeSprite(sprite: *Sprite, allocator: Allocator) -> void {
+    allocator.free(sprite.*.values, @intCast(usize, sprite.*.size * sprite.*.size), 1)
+    allocator.free(sprite.*.firsts, @intCast(usize, sprite.*.size), 1)
+}
+
+// Glows of `sprite` made once for up to `limit` lights (false without
+// memory: they are worked out each time instead).
+pub fn makeTints(sprite: *Sprite, tints: *Tints, limit: u32, allocator: Allocator) -> bool {
+    const slots = limit * 2
+    const keys = allocator.alloc(@intCast(usize, slots) * 4, 4)
+    const indices = allocator.alloc(@intCast(usize, slots) * 4, 4)
+    const area = @intCast(usize, sprite.*.size * sprite.*.size)
+    const images = allocator.alloc(@intCast(usize, limit) * area * 4, 4096)
+    if keys == null || indices == null || images == null { return false }
+    unsafe {
+        tints.*.keys = @ptrCast([*]u32, keys.?)
+        tints.*.indices = @ptrCast([*]u32, indices.?)
+        tints.*.images = @ptrCast([*]u32, images.?)
+    }
+    var slot: u32 = 0
+    while slot < slots {
+        tints.*.keys[slot] = 0
+        slot += 1
+    }
+    tints.*.slots = slots
+    tints.*.count = 0
+    tints.*.limit = limit
+    sprite.*.tints = @intFromPtr(tints)
+    return true
+}
+
+// The sprite's glow in `light` (its first word's address), made now if it
+// was not; 0 when the sprite has no tints or they are full.
+fn tintOf(sprite: *const Sprite, light: u32) -> usize {
+    if sprite.*.tints == 0 { return 0 }
+    const tints: *Tints = unsafe { @ptrFromInt(*Tints, sprite.*.tints) }
+    const key = light | TINT_USED
+    const area = @intCast(usize, sprite.*.size * sprite.*.size)
+    var slot = ((light *% 2654435761) >> 7) & (tints.*.slots - 1)
+    while tints.*.keys[slot] != 0 {
+        if tints.*.keys[slot] == key { return @intFromPtr(tints.*.images) + @intCast(usize, tints.*.indices[slot]) * area * 4 }
+        slot = (slot + 1) & (tints.*.slots - 1)
+    }
+    if tints.*.count >= tints.*.limit { return 0 }
+    const index = tints.*.count
+    tints.*.count += 1
+    tints.*.keys[slot] = key
+    tints.*.indices[slot] = index
+    const start = @intCast(usize, index) * area
+    var at: usize = 0
+    while at < area {
+        tints.*.images[start + at] = scale(light, @intCast(u32, sprite.*.values[at]))
+        at += 1
+    }
+    return @intFromPtr(tints.*.images) + start * 4
+}
+
+// `color` as light at `intensity`: dimmer below 1, turning toward white
+// above it (white at 4).
+pub fn lightOf(color: u32, intensity: f64) -> u32 {
+    if intensity < 1.0 { return scale(color, weight(intensity)) }
+    if intensity > 1.0 { return mix(color, 16777215, (intensity - 1.0) / 3.0) & 16777215 }
+    return color & 16777215
+}
+
+// The glow's light, `color` at `intensity` (0-1; more turns it toward
+// white, up to 4), added around (x, y).
+pub fn glow(surface: *Surface, sprite: *const Sprite, x: f64, y: f64, color: u32, intensity: f64) -> void {
+    if intensity <= 0.0 { return }
+    const cx = round(x - 0.5)
+    const cy = round(y - 0.5)
+    const radius = @intCast(i64, sprite.*.radius)
+    if surface.*.recording != 0 {
+        const command = record(surface, GLOW, cy - radius, cy + radius)
+        if command == null { return }
+        command.?.*.x = x
+        command.?.*.y = y
+        command.?.*.colour = color
+        command.?.*.strength = intensity
+        command.?.*.item = @intFromPtr(sprite)
+        command.?.*.tint = tintOf(sprite, lightOf(color, intensity))
+        return
+    }
+    const light = lightOf(color, intensity)
+    var top = cy - radius
+    var bottom = cy + radius + 1
+    if top < surface.*.clipTop { top = surface.*.clipTop }
+    if bottom > surface.*.clipBottom { bottom = surface.*.clipBottom }
+    markClipped(surface, cx - radius, top, cx + radius, bottom - 1)
+    const size = @intCast(i64, sprite.*.size)
+    // The pointers and counters in locals: this is the inner loop of most of
+    // a frame.
+    const pixels = surface.*.pixels
+    const sprite_values = sprite.*.values
+    const base = @intFromPtr(pixels)
+    var row = top
+    while row < bottom {
+        const sprite_row = row - cy + radius
+        const first = @intCast(i64, sprite.*.firsts[@intCast(usize, sprite_row)])
+        var left = cx - radius + first
+        var right = cx + radius - first + 1
+        if left < surface.*.clipLeft { left = surface.*.clipLeft }
+        if right > surface.*.clipRight { right = surface.*.clipRight }
+        if left < right {
+            const line = @intCast(usize, row) * surface.*.stride
+            var at = line + @intCast(usize, left)
+            const stop = line + @intCast(usize, right)
+            var from = @intCast(usize, sprite_row * size - cx + radius + left)
+            // Two pixels at a time, as one 64-bit word: half the loads,
+            // stores and turns of the loop.
+            while at + 1 < stop {
+                const v0 = @intCast(u32, sprite_values[from])
+                const v1 = @intCast(u32, sprite_values[from + 1])
+                if (v0 | v1) != 0 {
+                    const pair: *u64 = unsafe { @ptrFromInt(*u64, base + at * 4) }
+                    const a = pair.* & PAIR_RGB
+                    const b0 = ((((light & RED_BLUE) * v0) >> 8) & RED_BLUE) | ((((light & GREEN) * v0) >> 8) & GREEN)
+                    const b1 = ((((light & RED_BLUE) * v1) >> 8) & RED_BLUE) | ((((light & GREEN) * v1) >> 8) & GREEN)
+                    const b = @intCast(u64, b0) | (@intCast(u64, b1) << 32)
+                    const sum = ((a & PAIR_LOW_SEVEN) + (b & PAIR_LOW_SEVEN)) ^ ((a ^ b) & PAIR_HIGH_BITS)
+                    const carry = ((a & b) | ((a | b) & ~sum)) & PAIR_HIGH_BITS
+                    pair.* = PAIR_OPAQUE | sum | ((carry << 1) - (carry >> 7))
+                }
+                at += 2
+                from += 2
+            }
+            while at < stop {
+                const value = @intCast(u32, sprite_values[from])
+                if value != 0 {
+                    // addPixel(pixel, scale(light, value)), written out.
+                    const a = pixels[at] & 16777215
+                    const b = ((((light & RED_BLUE) * value) >> 8) & RED_BLUE) | ((((light & GREEN) * value) >> 8) & GREEN)
+                    const sum = ((a & LOW_SEVEN) + (b & LOW_SEVEN)) ^ ((a ^ b) & HIGH_BITS)
+                    const carry = ((a & b) | ((a | b) & ~sum)) & HIGH_BITS
+                    pixels[at] = OPAQUE | sum | ((carry << 1) - (carry >> 7))
+                }
+                at += 1
+                from += 1
+            }
+        }
+        row += 1
+    }
+}
+
+// A glow made already in its light (`tint`, from tintOf) added around
+// (x, y): the same as glow in that light, the light's words added as
+// they are.
+pub fn glowTinted(surface: *Surface, sprite: *const Sprite, tint: usize, x: f64, y: f64) -> void {
+    const cx = round(x - 0.5)
+    const cy = round(y - 0.5)
+    const radius = @intCast(i64, sprite.*.radius)
+    var top = cy - radius
+    var bottom = cy + radius + 1
+    if top < surface.*.clipTop { top = surface.*.clipTop }
+    if bottom > surface.*.clipBottom { bottom = surface.*.clipBottom }
+    markClipped(surface, cx - radius, top, cx + radius, bottom - 1)
+    const size = @intCast(i64, sprite.*.size)
+    const pixels = surface.*.pixels
+    const base = @intFromPtr(pixels)
+    const colours: [*]const u32 = unsafe { @ptrFromInt([*]const u32, tint) }
+    var row = top
+    while row < bottom {
+        const sprite_row = row - cy + radius
+        const first = @intCast(i64, sprite.*.firsts[@intCast(usize, sprite_row)])
+        var left = cx - radius + first
+        var right = cx + radius - first + 1
+        if left < surface.*.clipLeft { left = surface.*.clipLeft }
+        if right > surface.*.clipRight { right = surface.*.clipRight }
+        if left < right {
+            const line = @intCast(usize, row) * surface.*.stride
+            var at = line + @intCast(usize, left)
+            const stop = line + @intCast(usize, right)
+            var from = @intCast(usize, sprite_row * size - cx + radius + left)
+            while at + 1 < stop {
+                var pair: *u64 = undefined
+                var light: *const u64 = undefined
+                unsafe {
+                    pair = @ptrFromInt(*u64, base + at * 4)
+                    light = @ptrFromInt(*const u64, tint + from * 4)
+                }
+                const a = pair.* & PAIR_RGB
+                const b = light.*
+                const sum = ((a & PAIR_LOW_SEVEN) + (b & PAIR_LOW_SEVEN)) ^ ((a ^ b) & PAIR_HIGH_BITS)
+                const carry = ((a & b) | ((a | b) & ~sum)) & PAIR_HIGH_BITS
+                pair.* = PAIR_OPAQUE | sum | ((carry << 1) - (carry >> 7))
+                at += 2
+                from += 2
+            }
+            if at < stop { pixels[at] = addPixel(pixels[at], colours[from]) }
+        }
+        row += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lines
+
+// A line of light from (x0, y0) to (x1, y1), one pixel wide and smooth
+// (Xiaolin Wu's: each step lights the two pixels the line runs between).
+pub fn line(surface: *Surface, x0: f64, y0: f64, x1: f64, y1: f64, color: u32, intensity: f64) -> void {
+    if surface.*.recording != 0 {
+        const high = if y0 < y1 { y0 } else { y1 }
+        const low = if y0 < y1 { y1 } else { y0 }
+        const command = record(surface, LINE, toInt(@floor(high)) - 1, toInt(@floor(low)) + 2)
+        if command == null { return }
+        command.?.*.x = x0
+        command.?.*.y = y0
+        command.?.*.x1 = x1
+        command.?.*.y1 = y1
+        command.?.*.colour = color
+        command.?.*.strength = intensity
+        return
+    }
+    var ax = x0
+    var ay = y0
+    var bx = x1
+    var by = y1
+    const steep = math.absolute(by - ay) > math.absolute(bx - ax)
+    if steep {
+        var swap = ax
+        ax = ay
+        ay = swap
+        swap = bx
+        bx = by
+        by = swap
+    }
+    if ax > bx {
+        var swap = ax
+        ax = bx
+        bx = swap
+        swap = ay
+        ay = by
+        by = swap
+    }
+    const dx = bx - ax
+    if dx < 0.0001 { return }
+    const gradient = (by - ay) / dx
+    var x = @floor(ax + 0.5)
+    var end = @floor(bx + 0.5)
+    // Only the steps that can light a pixel within the clip: along the
+    // line (x) and across it (y, one pixel more for the pair it lights).
+    const low_along = signedFloat(if steep { surface.*.clipTop } else { surface.*.clipLeft })
+    const high_along = signedFloat(if steep { surface.*.clipBottom } else { surface.*.clipRight }) - 1.0
+    const low_across = signedFloat(if steep { surface.*.clipLeft } else { surface.*.clipTop }) - 1.0
+    const high_across = signedFloat(if steep { surface.*.clipRight } else { surface.*.clipBottom })
+    if x < low_along { x = low_along }
+    if end > high_along { end = high_along }
+    if gradient > 0.000001 {
+        const from = @floor(ax + (low_across - ay) / gradient)
+        const to = @floor(ax + (high_across - ay) / gradient) + 1.0
+        if x < from { x = from }
+        if end > to { end = to }
+    } else if gradient < -0.000001 {
+        const from = @floor(ax + (high_across - ay) / gradient)
+        const to = @floor(ax + (low_across - ay) / gradient) + 1.0
+        if x < from { x = from }
+        if end > to { end = to }
+    } else if ay < low_across || ay > high_across + 1.0 {
+        return
+    }
+    var y = ay + gradient * (x - ax)
+    while x <= end {
+        const base = @floor(y)
+        const fraction = y - base
+        if steep {
+            add(surface, toInt(base), toInt(x), dim(color, intensity * (1.0 - fraction)))
+            add(surface, toInt(base) + 1, toInt(x), dim(color, intensity * fraction))
+        } else {
+            add(surface, toInt(x), toInt(base), dim(color, intensity * (1.0 - fraction)))
+            add(surface, toInt(x), toInt(base) + 1, dim(color, intensity * fraction))
+        }
+        y += gradient
+        x += 1.0
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Copying
+
+const Block4096 = struct { words: [512]u64 }
+const Block512 = struct { words: [64]u64 }
+const Block64 = struct { words: [8]u64 }
+
+// `bytes` from `source` to `destination` (not overlapping): whole blocks are
+// one copy each (the backend's string move), the rest by bytes.
+pub fn copyBytes(destination: usize, source: usize, bytes: usize) -> void {
+    var to = destination
+    var from = source
+    var left = bytes
+    while left >= 4096 {
+        var target: *Block4096 = undefined
+        var origin: *const Block4096 = undefined
+        unsafe {
+            target = @ptrFromInt(*Block4096, to)
+            origin = @ptrFromInt(*const Block4096, from)
+        }
+        target.* = origin.*
+        to += 4096
+        from += 4096
+        left -= 4096
+    }
+    while left >= 512 {
+        var target: *Block512 = undefined
+        var origin: *const Block512 = undefined
+        unsafe {
+            target = @ptrFromInt(*Block512, to)
+            origin = @ptrFromInt(*const Block512, from)
+        }
+        target.* = origin.*
+        to += 512
+        from += 512
+        left -= 512
+    }
+    while left >= 64 {
+        var target: *Block64 = undefined
+        var origin: *const Block64 = undefined
+        unsafe {
+            target = @ptrFromInt(*Block64, to)
+            origin = @ptrFromInt(*const Block64, from)
+        }
+        target.* = origin.*
+        to += 64
+        from += 64
+        left -= 64
+    }
+    var bytes_to: [*]u8 = undefined
+    var bytes_from: [*]const u8 = undefined
+    unsafe {
+        bytes_to = @ptrFromInt([*]u8, to)
+        bytes_from = @ptrFromInt([*]const u8, from)
+    }
+    var index: usize = 0
+    while index < left {
+        bytes_to[index] = bytes_from[index]
+        index += 1
+    }
+}
+
+// The rectangle (x, y, width, height) of `source` into `target` (the same
+// size), row by row.
+pub fn copyRect(target: *Surface, source: *const Surface, x: usize, y: usize, width: usize, height: usize) -> void {
+    var row = y
+    while row < y + height && row < target.*.height {
+        const to = @intFromPtr(target.*.pixels) + (row * target.*.stride + x) * 4
+        const from = @intFromPtr(source.*.pixels) + (row * source.*.stride + x) * 4
+        copyBytes(to, from, width * 4)
+        row += 1
+    }
+}
+
+// The rectangle (left, top, width, height) of `source` into the buffer at
+// `address` (rows `pitch` bytes apart): a card's buffer or the framebuffer,
+// red and blue swapped for a framebuffer that wants them so.
+pub fn copyOut(source: *const Surface, address: usize, pitch: usize, left: usize, top: usize, width: usize, height: usize, swap: bool) -> void {
+    var row = top
+    while row < top + height {
+        const from = @intFromPtr(source.*.pixels) + (row * source.*.stride + left) * 4
+        const to = address + row * pitch + left * 4
+        if swap {
+            var origin: [*]const u32 = undefined
+            var target: [*]u32 = undefined
+            unsafe {
+                origin = @ptrFromInt([*]const u32, from)
+                target = @ptrFromInt([*]u32, to)
+            }
+            var column: usize = 0
+            while column < width {
+                const pixel = origin[column]
+                target[column] = (pixel & 4278255360) | ((pixel & 255) << 16) | ((pixel >> 16) & 255)
+                column += 1
+            }
+        } else {
+            copyBytes(to, from, width * 4)
+        }
+        row += 1
+    }
+}

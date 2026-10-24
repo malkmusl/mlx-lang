@@ -1,0 +1,255 @@
+// The Public Suffix List of std.http.psl, made from the list
+// (std/registry/publicsuffix/public_suffix_list.dat, publicsuffix.org's
+// file as of 2025-12-28, its ICANN and private sections both):
+//
+//     psl-generate LIST-FILE OUTPUT-FILE
+//
+// writes OUTPUT-FILE (std/src/http/psldata.mlx): every rule ("a.b", the
+// wildcards "*.b", the exceptions "!a.b"), lower case, sorted by their
+// bytes, each ended by a newline, for std.http.psl to search.
+// `./mlx build http-psl` runs it on this checkout.
+const std = @import("std")
+const crash = @import("std.crash")
+
+const SYS_mmap: usize = 9
+const SYS_exit_group: usize = 231
+
+// ---------------------------------------------------------------------------
+// Memory: an arena, reserved and never freed (the run is short).
+
+var arenaNext: usize = 0
+var arenaEnd: usize = 0
+
+fn alloc(size: usize) -> usize {
+    if arenaNext == 0 {
+        const reserved = std.linux.syscall6(SYS_mmap, 0, 1073741824, 3, 16418, @bitCast(usize, @intCast(isize, -1)), 0)
+        if reserved < 0 { fail("no memory") }
+        arenaNext = @bitCast(usize, reserved)
+        arenaEnd = arenaNext + 1073741824
+    }
+    const at = (arenaNext + 15) / 16 * 16
+    if at + size > arenaEnd { fail("out of memory") }
+    arenaNext = at + size
+    return at
+}
+
+fn put8(address: usize, value: u8) -> void { unsafe { @ptrFromInt(*u8, address).* = value } }
+fn get8(address: usize) -> u8 { unsafe { return @ptrFromInt(*u8, address).* } }
+fn putWord(address: usize, value: usize) -> void { unsafe { @ptrFromInt(*usize, address).* = value } }
+fn getWord(address: usize) -> usize { unsafe { return @ptrFromInt(*usize, address).* } }
+
+fn bytes(address: usize, length: usize) -> []const u8 {
+    var view: [*]const u8 = undefined
+    unsafe { view = @ptrFromInt([*]const u8, address) }
+    return view[0..length]
+}
+
+fn say(text: []const u8) -> void {
+    const ignored = std.io.writeAll(std.io.stderr(), text)
+}
+
+fn fail(message: []const u8) -> void {
+    say("psl-generate: ")
+    say(message)
+    say("\n")
+    const ignored = std.linux.syscall1(SYS_exit_group, 1)
+}
+
+fn join(first: []const u8, second: []const u8) -> []const u8 {
+    const at = alloc(first.length + second.length + 1)
+    var index: usize = 0
+    while index < first.length {
+        put8(at + index, first[index])
+        index += 1
+    }
+    index = 0
+    while index < second.length {
+        put8(at + first.length + index, second[index])
+        index += 1
+    }
+    return bytes(at, first.length + second.length)
+}
+
+fn readWhole(path: []const u8) -> []const u8 {
+    const capacity: usize = 16777216
+    const data = alloc(capacity)
+    const length = std.fs.readFileResult(join(path, "").pointer, unsafe { @ptrFromInt([*]u8, data) }, capacity)
+    if length < 0 { fail(join("cannot read ", path)) }
+    return bytes(data, @bitCast(usize, length))
+}
+
+fn writeWhole(path: []const u8, text: []const u8) -> void {
+    if !std.fs.writeFile(join(path, "").pointer, text.pointer, text.length, 420) { fail(join("cannot write ", path)) }
+}
+
+// ---------------------------------------------------------------------------
+// Output: text built up in one buffer.
+
+const OUT_SIZE: usize = 16777216
+var outBase: usize = 0
+var outTop: usize = 0
+
+fn out(text: []const u8) -> void {
+    if outBase == 0 { outBase = alloc(OUT_SIZE) }
+    if outTop + text.length > OUT_SIZE { fail("the output is too large") }
+    var index: usize = 0
+    while index < text.length {
+        put8(outBase + outTop + index, text[index])
+        index += 1
+    }
+    outTop += text.length
+}
+
+fn outNumber(value: usize) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    while count > 0 {
+        count -= 1
+        out(digits[count..count + 1])
+    }
+}
+
+// A byte of a rule inside the string literal: printable ASCII as it is
+// ('"' and '\\' escaped), the rest (UTF-8's bytes) in hex.
+fn outByte(byte: u8) -> void {
+    if byte == 34 || byte == 92 {
+        out("\\")
+        var one: [1]u8 = [1]u8{ byte }
+        out(one[0..1])
+    } else if byte >= 32 && byte < 127 {
+        var one: [1]u8 = [1]u8{ byte }
+        out(one[0..1])
+    } else {
+        const hex = "0123456789abcdef"
+        out("\\x")
+        out(hex[@intCast(usize, byte >> 4)..@intCast(usize, byte >> 4) + 1])
+        out(hex[@intCast(usize, byte & 15)..@intCast(usize, byte & 15) + 1])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rules: each a slice (address, length) in a table of two words.
+
+fn before(first: []const u8, second: []const u8) -> bool {
+    var index: usize = 0
+    while index < first.length && index < second.length {
+        if first[index] != second[index] { return first[index] < second[index] }
+        index += 1
+    }
+    return first.length < second.length
+}
+
+fn ruleAt(table: usize, index: usize) -> []const u8 { return bytes(getWord(table + index * 16), getWord(table + index * 16 + 8)) }
+
+// Merge sort of `count` rules at `table`, with room for as many at
+// `scratch`.
+fn sortRules(table: usize, scratch: usize, count: usize) -> void {
+    var width: usize = 1
+    var from = table
+    var to = scratch
+    while width < count {
+        var start: usize = 0
+        while start < count {
+            const middle = if start + width < count { start + width } else { count }
+            const end = if start + 2 * width < count { start + 2 * width } else { count }
+            var left = start
+            var right = middle
+            var at = start
+            while at < end {
+                var takeLeft = false
+                if left < middle && right < end {
+                    takeLeft = !before(ruleAt(from, right), ruleAt(from, left))
+                } else {
+                    takeLeft = left < middle
+                }
+                const pick = if takeLeft { left } else { right }
+                putWord(to + at * 16, getWord(from + pick * 16))
+                putWord(to + at * 16 + 8, getWord(from + pick * 16 + 8))
+                if takeLeft { left += 1 } else { right += 1 }
+                at += 1
+            }
+            start = end
+        }
+        const swap = from
+        from = to
+        to = swap
+        width = width * 2
+    }
+    if from != table {
+        var index: usize = 0
+        while index < count * 2 {
+            putWord(table + index * 8, getWord(from + index * 8))
+            index += 1
+        }
+    }
+}
+
+fn generate(listPath: []const u8, outputPath: []const u8) -> void {
+    const list = readWhole(listPath)
+    const table = alloc(list.length * 2 + 16)
+    var count: usize = 0
+    var at: usize = 0
+    while at < list.length {
+        var end = at
+        while end < list.length && list[end] != 10 { end += 1 }
+        // A rule is the line up to its first white space; comments and
+        // blank lines are not rules.
+        var stop = at
+        while stop < end && list[stop] != 32 && list[stop] != 9 && list[stop] != 13 { stop += 1 }
+        if stop > at && !(stop - at >= 2 && list[at] == 47 && list[at + 1] == 47) {
+            const rule = alloc(stop - at)
+            var index: usize = 0
+            while index < stop - at {
+                const byte = list[at + index]
+                put8(rule + index, if byte >= 65 && byte <= 90 { byte + 32 } else { byte })
+                index += 1
+            }
+            putWord(table + count * 16, rule)
+            putWord(table + count * 16 + 8, stop - at)
+            count += 1
+        }
+        at = end + 1
+    }
+    sortRules(table, alloc(count * 16 + 16), count)
+    out("// The Public Suffix List of std.http.psl: made by psl-generate\n")
+    out("// (std/registry/publicsuffix/generate.mlx) from publicsuffix.org's list\n")
+    out("// (std/registry/publicsuffix/public_suffix_list.dat); do not edit.\n\n")
+    out("pub const RULE_COUNT: usize = ")
+    outNumber(count)
+    out("\n\n// The rules (\"a.b\", wildcards \"*.b\", exceptions \"!a.b\"), lower\n")
+    out("// case, sorted by their bytes, each ended by a newline.\n")
+    out("pub const RULES: []const u8 = \"")
+    var index: usize = 0
+    while index < count {
+        for byte in ruleAt(table, index) { outByte(byte) }
+        out("\\n")
+        index += 1
+    }
+    out("\"\n")
+    writeWhole(outputPath, bytes(outBase, outTop))
+}
+
+fn cString(pointer: [*]const u8) -> []const u8 {
+    var length: usize = 0
+    while pointer[length] != 0 { length += 1 }
+    return pointer[0..length]
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    // The crash report before anything else: a crash names the function it
+    // was in and its callers, and is kept for MLX Observatory (std.crash).
+    _ = crash.install()
+    if arguments.length != 3 {
+        say("usage: psl-generate LIST-FILE OUTPUT-FILE\n")
+        return 2
+    }
+    generate(cString(arguments[1]), cString(arguments[2]))
+    return 0
+}

@@ -48,10 +48,15 @@ exercise it:
 - [`reference/vulkan.md`](reference/vulkan.md) — `std.vulkan` materialized
   from `vk.xml`, the driver loader and driver interface, SPIR-V and
   `std.json` (expands [`VULKAN.md`](VULKAN.md))
-- [`reference/truetype.md`](reference/truetype.md) — `std.truetype`: TrueType
-  parsing, anti-aliased rasterization, atlas, layout, and text on Vulkan
+- [`reference/truetype.md`](reference/truetype.md) — `std.truetype`: the font
+  engine (TrueType, OpenType, variable and color fonts, FreeType's
+  rasterizers), atlas, layout, and text on Vulkan
 - [`reference/ui.md`](reference/ui.md) — `std.ui`: layout building blocks
   (rectangles, insets, alignment, containers, stacks, reserved bars)
+- [`reference/unicode.md`](reference/unicode.md) — `std.unicode`: Unicode
+  and CLDR in Mlx (properties, casing, normalization, breaks, collation,
+  IDNA, locales, calendars, formatting), `std.timezone.database`, and the
+  ICU C API over them (`compiler/libc/icu`)
 - [`reference/memory-and-concurrency.md`](reference/memory-and-concurrency.md)
   — the memory model (lifetime, UB, overflow) and the atomics/TLS Stage-0 gap
 - [`reference/diagnostics-selfhost.md`](reference/diagnostics-selfhost.md) —
@@ -71,6 +76,11 @@ How the compiler itself works, normatively and concretely:
   written entirely in Mlx (lexer → parser → sema → comptime → LIR →
   x86_64 backend → ELF64), including where its current implementation is
   narrower than the normative spec
+- [`internals/allocators-and-containers.md`](internals/allocators-and-containers.md)
+  — the hand-written tables, arrays and arenas of the tree and the
+  `std.page_allocator` sites, what replaces each (`std.heap`, the generic
+  containers), the Observatory baseline before the conversion, and the
+  idiom
 
 ## Architecture notes
 

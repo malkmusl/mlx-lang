@@ -1,26 +1,14 @@
 // Asking Git (for the history of the code): runs `git -C ROOT ...` through
 // /bin/sh and reads what it writes, or runs a command in the background
-// (spawn, exited). No libc: vfork, a pipe, execve.
+// (spawn, exited). No libc: std.spawn (vfork, a pipe, execve).
 //
 //     var git: git_module.Git = undefined
 //     git_module.init(&git, allocator, root, environment)
 //     const text = git_module.run(&git, "log --format=%ct --name-only")
 const std = @import("std")
+const spawn_module = @import("std.spawn")
 
 pub const Allocator = std.allocator.Allocator
-
-const SYS_read: usize = 0
-const SYS_close: usize = 3
-const SYS_dup2: usize = 33
-// vfork: the child only runs execve, and the parent's memory is big (copying
-// its page tables for each git command would cost more than git).
-const SYS_vfork: usize = 58
-const SYS_execve: usize = 59
-const SYS_exit: usize = 60
-const SYS_wait4: usize = 61
-const SYS_open: usize = 2
-const SYS_pipe2: usize = 293
-const O_CLOEXEC: usize = 524288
 
 // The most a command may write (what is more is cut).
 pub const MOST_OUTPUT: usize = 268435456
@@ -118,33 +106,31 @@ pub fn run(git: *Git, arguments: []const u8) -> []const u8 {
     return finish(git)
 }
 
+// `sh -c` with the command made (NUL-terminated), vforked: the child only
+// runs execve, and the parent's memory is big (copying its page tables
+// for each git command would cost more than git).
+fn shell(git: *Git, arguments: *[4][*]const u8) -> spawn_module.Options {
+    unsafe {
+        arguments.*[0] = @ptrCast([*]const u8, "/bin/sh")
+        arguments.*[1] = @ptrCast([*]const u8, "-c")
+        arguments.*[2] = @ptrCast([*]const u8, git.*.command)
+        arguments.*[3] = @ptrFromInt([*]const u8, 0)
+        var options = spawn_module.options(arguments.*[0], @ptrCast([*][*]const u8, arguments), git.*.environment)
+        options.shareMemory = true
+        return options
+    }
+}
+
 // Runs the command made with begin, more and addQuoted.
 pub fn finish(git: *Git) -> []const u8 {
     add(git, " 2>/dev/null")
     git.*.command[git.*.commandLength] = 0
     git.*.outputLength = 0
-    var pipes: [2]i32 = [2]i32{ -1, -1 }
-    var made: isize = 0
-    unsafe { made = std.linux.syscall2(SYS_pipe2, @intFromPtr(&pipes), O_CLOEXEC) }
-    if made != 0 { return git.*.output[0..0] }
-    const child = std.linux.syscall0(SYS_vfork)
-    if child == 0 {
-        const out = std.linux.syscall2(SYS_dup2, @intCast(usize, pipes[1]), 1)
-        var arguments: [4][*]const u8 = undefined
-        unsafe {
-            arguments[0] = @ptrCast([*]const u8, "/bin/sh")
-            arguments[1] = @ptrCast([*]const u8, "-c")
-            arguments[2] = @ptrCast([*]const u8, git.*.command)
-            arguments[3] = @ptrFromInt([*]const u8, 0)
-            const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(&arguments), @intFromPtr(git.*.environment))
-        }
-        const exited = std.linux.syscall1(SYS_exit, 127)
-    }
-    const writing = std.linux.syscall1(SYS_close, @intCast(usize, pipes[1]))
-    if child < 0 {
-        const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
-        return git.*.output[0..0]
-    }
+    var arguments: [4][*]const u8 = undefined
+    var options = shell(git, &arguments)
+    var reading: isize = -1
+    const child = spawn_module.startReading(&options, false, false, &reading)
+    if child < 0 { return git.*.output[0..0] }
     while true {
         if git.*.outputLength + 65536 > git.*.capacity && git.*.capacity < MOST_OUTPUT {
             const bigger = git.*.capacity * 2
@@ -160,17 +146,15 @@ pub fn finish(git: *Git) -> []const u8 {
             git.*.capacity = bigger
         }
         if git.*.outputLength + 65536 > git.*.capacity { break }
-        var chunk: [*]u8 = undefined
-        unsafe { chunk = @ptrFromInt([*]u8, @intFromPtr(git.*.output) + git.*.outputLength) }
-        const got = std.linux.syscall3(SYS_read, @intCast(usize, pipes[0]), @intFromPtr(chunk), 65536)
+        const got = std.linux.read(reading, git.*.output + git.*.outputLength, 65536)
         if got <= 0 { break }
         git.*.outputLength += @bitCast(usize, got)
     }
-    const reading = std.linux.syscall1(SYS_close, @intCast(usize, pipes[0]))
-    var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
-    const waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, child), @intFromPtr(&status), 0, 0)
-    // Exited: the status is in the second byte.
-    git.*.status = if status[0] & 127 == 0 { status[1] } else { 255 }
+    std.linux.close(reading)
+    var status: usize = 0
+    _ = std.linux.process.waitProcess(child, &status, 0)
+    // Exited: its code; anything else is 255.
+    git.*.status = if status & 127 == 0 { @intCast(u8, (status >> 8) & 255) } else { 255 }
     return git.*.output[0..git.*.outputLength]
 }
 
@@ -180,27 +164,15 @@ pub fn finish(git: *Git) -> []const u8 {
 pub fn spawn(git: *Git) -> isize {
     add(git, " > /dev/null 2>&1 < /dev/null")
     git.*.command[git.*.commandLength] = 0
-    const child = std.linux.syscall0(SYS_vfork)
-    if child == 0 {
-        var arguments: [4][*]const u8 = undefined
-        unsafe {
-            arguments[0] = @ptrCast([*]const u8, "/bin/sh")
-            arguments[1] = @ptrCast([*]const u8, "-c")
-            arguments[2] = @ptrCast([*]const u8, git.*.command)
-            arguments[3] = @ptrFromInt([*]const u8, 0)
-            const ran = std.linux.syscall3(SYS_execve, @intFromPtr(arguments[0]), @intFromPtr(&arguments), @intFromPtr(git.*.environment))
-        }
-        const exited = std.linux.syscall1(SYS_exit, 127)
-    }
+    var arguments: [4][*]const u8 = undefined
+    var options = shell(git, &arguments)
+    const child = spawn_module.start(&options)
     return if child > 0 { child } else { 0 }
 }
 
 // Whether a process spawn started has ended (it is reaped then).
 pub fn exited(process: isize) -> bool {
     if process <= 0 { return true }
-    var status: [4]u8 = [4]u8{ 0, 0, 0, 0 }
-    // WNOHANG
-    const waited = std.linux.syscall4(SYS_wait4, @bitCast(usize, process), @intFromPtr(&status), 1, 0)
-    return waited != 0
+    var status: usize = 0
+    return std.linux.process.waitProcess(process, &status, std.linux.WNOHANG) != 0
 }
-

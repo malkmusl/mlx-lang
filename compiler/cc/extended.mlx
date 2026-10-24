@@ -1,0 +1,346 @@
+// The x87 extended format (C's long double on x86_64, 80 bits in 16): a
+// 64-bit mantissa with its integer bit written out, a 15-bit exponent
+// biased by 16383 and the sign in one 16-bit word. The compiler has no
+// such type itself, so a constant is made here from its decimal or
+// hexadecimal digits in 256-bit integer arithmetic (the digits times a
+// power of ten, kept to about 200 bits, then rounded to 64), or from a
+// double, and read back as a double for constant folding.
+const base = @import("./base.mlx")
+
+pub const SIZE: usize = 16
+
+const BIAS: i64 = 16383
+const TOP: u64 = 9223372036854775808
+
+// --- 256-bit unsigned integers as four limbs, the lowest first ----------------
+
+const Wide = struct {
+    limb: [4]u64
+}
+
+fn wideAt(address: usize) -> *Wide {
+    unsafe { return @ptrFromInt(*Wide, address) }
+}
+
+fn newWide(low: u64) -> usize {
+    const w = base.alloc(@sizeOf(Wide))
+    wideAt(w).*.limb[0] = low
+    wideAt(w).*.limb[1] = 0
+    wideAt(w).*.limb[2] = 0
+    wideAt(w).*.limb[3] = 0
+    return w
+}
+
+// a b in 128 bits (high, low), from 32-bit halves.
+fn mulWide(a: u64, b: u64) -> (u64, u64) {
+    const al = a & 4294967295
+    const ah = a >> 32
+    const bl = b & 4294967295
+    const bh = b >> 32
+    const ll = al * bl
+    const lh = al * bh
+    const hl = ah * bl
+    const hh = ah * bh
+    const mid = (ll >> 32) + (lh & 4294967295) + (hl & 4294967295)
+    const low = (mid << 32) | (ll & 4294967295)
+    const high = hh + (lh >> 32) + (hl >> 32) + (mid >> 32)
+    return -> (high, low)
+}
+
+// w = w times `factor` (below 2^32); the top limb must have room.
+fn multiply(w: usize, factor: u64) -> void {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < 4 {
+        const product = mulWide(wideAt(w).*.limb[index], factor)
+        const low = product.1 +% carry
+        carry = product.0 + (if low < product.1 { 1 } else { 0 })
+        wideAt(w).*.limb[index] = low
+        index += 1
+    }
+}
+
+// w = w / `divisor` (below 2^32), the remainder dropped.
+fn divide(w: usize, divisor: u64) -> void {
+    var remainder: u64 = 0
+    var index: usize = 4
+    while index > 0 {
+        index -= 1
+        const limb = wideAt(w).*.limb[index]
+        const highCurrent = (remainder << 32) | (limb >> 32)
+        const highQuotient = highCurrent / divisor
+        remainder = highCurrent % divisor
+        const lowCurrent = (remainder << 32) | (limb & 4294967295)
+        const lowQuotient = lowCurrent / divisor
+        remainder = lowCurrent % divisor
+        wideAt(w).*.limb[index] = (highQuotient << 32) | lowQuotient
+    }
+}
+
+// The position of the highest set bit (0 for the lowest), -1 for 0.
+fn topBit(w: usize) -> i64 {
+    var index: usize = 4
+    while index > 0 {
+        index -= 1
+        var limb = wideAt(w).*.limb[index]
+        if limb != 0 {
+            var bit: i64 = 0
+            while limb > 1 {
+                limb = limb >> 1
+                bit += 1
+            }
+            return @intCast(i64, index) * 64 + bit
+        }
+    }
+    return -1
+}
+
+fn shiftLeftOne(w: usize) -> void {
+    var index: usize = 4
+    while index > 0 {
+        index -= 1
+        var limb = wideAt(w).*.limb[index] << 1
+        if index > 0 && wideAt(w).*.limb[index - 1] & TOP != 0 { limb = limb | 1 }
+        wideAt(w).*.limb[index] = limb
+    }
+}
+
+fn shiftRightOne(w: usize) -> void {
+    var index: usize = 0
+    while index < 4 {
+        var limb = wideAt(w).*.limb[index] >> 1
+        if index < 3 && wideAt(w).*.limb[index + 1] & 1 != 0 { limb = limb | TOP }
+        wideAt(w).*.limb[index] = limb
+        index += 1
+    }
+}
+
+fn shiftLeft(w: usize, count: i64) -> void {
+    var left = count
+    while left > 0 {
+        shiftLeftOne(w)
+        left -= 1
+    }
+}
+
+fn shiftRight(w: usize, count: i64) -> void {
+    var left = count
+    while left > 0 {
+        shiftRightOne(w)
+        left -= 1
+    }
+}
+
+fn bitAt(w: usize, position: i64) -> bool {
+    if position < 0 { return false }
+    const index = @intCast(usize, position / 64)
+    const shift = @intCast(u6, position % 64)
+    return (wideAt(w).*.limb[index] >> shift) & 1 != 0
+}
+
+// Whether any bit below `position` is set.
+fn anyBelow(w: usize, position: i64) -> bool {
+    var bit: i64 = 0
+    while bit < position {
+        if bitAt(w, bit) { return true }
+        bit += 1
+    }
+    return false
+}
+
+// --- the format -------------------------------------------------------------------
+
+// The value `mantissa` 2^`exponent` (the mantissa with its top bit set),
+// rounded into the format: (mantissa, sign and exponent word).
+fn fromNormalized(mantissa: u64, exponent: i64, negative: bool) -> (u64, u16) {
+    const sign: u16 = if negative { 32768 } else { 0 }
+    var biased = exponent + 63 + BIAS
+    if biased >= 32767 { return -> (TOP, sign | 32767) }
+    if biased >= 1 { return -> (mantissa, sign | @intCast(u16, biased)) }
+    // Below the normal range: a denormal, the mantissa shifted right.
+    const shift = 1 - biased
+    if shift > 64 { return -> (0, sign) }
+    var m = mantissa
+    var roundUp = false
+    if shift == 64 {
+        roundUp = m & TOP != 0 && (m & (TOP - 1) != 0)
+        m = 0
+    } else {
+        const half = @intCast(u64, 1) << @intCast(u6, shift - 1)
+        const rest = m & (half + half - 1)
+        m = m >> @intCast(u6, shift)
+        roundUp = rest > half || (rest == half && m & 1 != 0)
+    }
+    if roundUp { m += 1 }
+    if m & TOP != 0 { return -> (m, sign | 1) }
+    return -> (m, sign)
+}
+
+// The value `mantissa` 2^`exponent` for any mantissa.
+pub fn fromBinary(mantissa: u64, exponent: i64, negative: bool) -> (u64, u16) {
+    if mantissa == 0 { return -> (0, if negative { 32768 } else { 0 }) }
+    var m = mantissa
+    var e = exponent
+    while m & TOP == 0 {
+        m = m << 1
+        e -= 1
+    }
+    return fromNormalized(m, e, negative)
+}
+
+pub fn newDigits() -> usize { return newWide(0) }
+
+// Whether another decimal digit fits in `w` (below 200 bits).
+pub fn hasRoom(w: usize) -> bool { return topBit(w) < 200 }
+
+pub fn pushDigit(w: usize, digit: u64) -> void { pushScaled(w, 10, digit) }
+pub fn pushHex(w: usize, digit: u64) -> void { pushScaled(w, 16, digit) }
+
+fn pushScaled(w: usize, scale: u64, digit: u64) -> void {
+    multiply(w, scale)
+    var carry = digit
+    var index: usize = 0
+    while index < 4 && carry != 0 {
+        const sum = wideAt(w).*.limb[index] +% carry
+        carry = if sum < carry { 1 } else { 0 }
+        wideAt(w).*.limb[index] = sum
+        index += 1
+    }
+}
+
+// The value `digits` 10^`exponent` (the digits as an integer).
+pub fn fromDecimal(digits: u64, exponent: i64, negative: bool) -> (u64, u16) {
+    return fromDigits(newWide(digits), exponent, negative)
+}
+
+// The digits in `w` (below 200 bits, pushDigit's) times 10^`exponent`:
+// multiplied or divided by ten as often as the exponent says, in 256
+// bits that keep at least 200 significant, then rounded to 64.
+pub fn fromDigits(w: usize, exponent: i64, negative: bool) -> (u64, u16) {
+    if topBit(w) < 0 { return -> (0, if negative { 32768 } else { 0 }) }
+    if exponent > 5000 { return -> (TOP, (if negative { 32768 } else { 0 }) | 32767) }
+    if exponent < -5100 { return -> (0, if negative { 32768 } else { 0 }) }
+    var e2: i64 = 0
+    var steps = exponent
+    while steps > 0 {
+        const top = topBit(w)
+        if top >= 250 {
+            shiftRight(w, top - 200)
+            e2 += top - 200
+        }
+        multiply(w, 10)
+        steps -= 1
+    }
+    while steps < 0 {
+        var top = topBit(w)
+        while top < 200 {
+            shiftLeftOne(w)
+            e2 -= 1
+            top += 1
+        }
+        divide(w, 10)
+        steps += 1
+    }
+    return roundWide(w, e2, negative)
+}
+
+// The digits in `w` times 2^`exponent` (hexadecimal constants).
+pub fn fromWideBinary(w: usize, exponent: i64, negative: bool) -> (u64, u16) {
+    if topBit(w) < 0 { return -> (0, if negative { 32768 } else { 0 }) }
+    return roundWide(w, exponent, negative)
+}
+
+// `w` 2^`exponent` rounded to 64 bits, half to even.
+fn roundWide(w: usize, exponent: i64, negative: bool) -> (u64, u16) {
+    var e2 = exponent
+    const top = topBit(w)
+    if top <= 63 {
+        const m = wideAt(w).*.limb[0]
+        return fromBinary(m, e2, negative)
+    }
+    const shift = top - 63
+    const roundBit = bitAt(w, shift - 1)
+    const sticky = anyBelow(w, shift - 1)
+    shiftRight(w, shift)
+    var m = wideAt(w).*.limb[0]
+    e2 += shift
+    if roundBit && (sticky || m & 1 != 0) {
+        m +%= 1
+        if m == 0 {
+            m = TOP
+            e2 += 1
+        }
+    }
+    return fromNormalized(m, e2, negative)
+}
+
+// A double's value in the format (exact).
+pub fn fromDouble(bits: u64) -> (u64, u16) {
+    const negative = bits & TOP != 0
+    const e = @intCast(i64, (bits >> 52) & 2047)
+    const fraction = bits & 4503599627370495
+    const sign: u16 = if negative { 32768 } else { 0 }
+    if e == 2047 { return -> (TOP | (fraction << 11), sign | 32767) }
+    if e == 0 { return fromBinary(fraction, -1074, negative) }
+    return -> ((fraction | 4503599627370496) << 11, sign | @intCast(u16, e - 1023 + BIAS))
+}
+
+// The value as a double, rounded to its 53 bits.
+pub fn toDouble(mantissa: u64, word: u16) -> f64 {
+    const negative = word & 32768 != 0
+    const e = @intCast(i64, word & 32767)
+    const signBit: u64 = if negative { TOP } else { 0 }
+    if e == 32767 {
+        if mantissa & (TOP - 1) == 0 { return @bitCast(f64, signBit | 9218868437227405312) }
+        return @bitCast(f64, signBit | 9221120237041090560)
+    }
+    if mantissa == 0 { return @bitCast(f64, signBit) }
+    var m = mantissa
+    var exponent = if e == 0 { 1 - BIAS - 63 } else { e - BIAS - 63 }
+    while m & TOP == 0 {
+        m = m << 1
+        exponent -= 1
+    }
+    // m 2^exponent = 1.f 2^(exponent + 63).
+    const unbiased = exponent + 63
+    if unbiased > 1023 { return @bitCast(f64, signBit | 9218868437227405312) }
+    var shift: i64 = 11
+    if unbiased < -1022 { shift += (-1022) - unbiased }
+    if shift >= 64 { return @bitCast(f64, signBit) }
+    const half = @intCast(u64, 1) << @intCast(u6, shift - 1)
+    const rest = m & (half + half - 1)
+    var kept = m >> @intCast(u6, shift)
+    if rest > half || (rest == half && kept & 1 != 0) { kept += 1 }
+    if unbiased < -1022 {
+        // A denormal double; a carry into the leading bit makes it normal.
+        return @bitCast(f64, signBit | kept)
+    }
+    var doubleExponent = unbiased + 1023
+    if kept & 9007199254740992 != 0 {
+        kept = kept >> 1
+        doubleExponent += 1
+        if doubleExponent > 2046 { return @bitCast(f64, signBit | 9218868437227405312) }
+    }
+    return @bitCast(f64, signBit | (@intCast(u64, doubleExponent) << 52) | (kept & 4503599627370495))
+}
+
+// Writes the 16 bytes of a value at `address` (10 of them count).
+pub fn store(address: usize, mantissa: u64, word: u16) -> void {
+    base.put64(address, mantissa)
+    base.put8(address + 8, @intCast(u8, word & 255))
+    base.put8(address + 9, @intCast(u8, word >> 8))
+    var index: usize = 10
+    while index < 16 {
+        base.put8(address + index, 0)
+        index += 1
+    }
+}
+
+pub fn load(address: usize) -> (u64, u16) {
+    return -> (base.get64(address), @intCast(u16, base.get8(address + 8)) | (@intCast(u16, base.get8(address + 9)) << 8))
+}
+
+// The value negated.
+pub fn negated(mantissa: u64, word: u16) -> (u64, u16) {
+    return -> (mantissa, word ^ 32768)
+}

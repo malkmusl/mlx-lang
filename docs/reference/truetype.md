@@ -1,9 +1,16 @@
-# TrueType fonts: `std.truetype`
+# Fonts: `std.truetype`
 
-`std.truetype` reads TrueType fonts, rasterizes glyphs with anti-aliasing,
-packs them into an atlas and lays out text. It needs no C library (no
-FreeType): it is plain Mlx, and it runs unchanged on x86_64 and on
-aarch64 (Android). It began as a port of a Zig TrueType renderer.
+`std.truetype` is the font engine of the standard library: it reads
+TrueType and OpenType fonts (glyf and CFF/CFF2 outlines) and their
+collections, variable fonts and color fonts, and renders their glyphs,
+as FreeType 2.13 reads and renders them, to the bit (outlines, metrics,
+advances, every rendered pixel). It needs no C library: it is plain Mlx,
+and it runs unchanged on x86_64 and on aarch64 (Android). FreeType's C
+API for C and C++ programs (WebKit's Skia and WebCore) is a layer over
+it, `compiler/libc/freetype` (`libmlxfreetype.so`, see its README).
+
+It has two levels: a `Font` with its `Atlas` and `Run`s, for drawing
+lines of text, and the engine under it, for everything else.
 
 ```mlx
 const tt = @import("std.truetype")
@@ -21,45 +28,28 @@ tt.drawRun(&atlas, &run, pixels, width, height, stride, x, baseline, 0xFFFFFFFF,
 ## Fonts
 
 `init(font, data, size)` reads a font held in memory and `loadFile(font,
-path, allocator)` reads one from disk. Every table read is bounds-checked,
-so a truncated or hostile file yields `Status.truncated`,
-`Status.missingTable` or missing glyphs, never an out-of-range read.
-
-| Table | Use |
-| --- | --- |
-| offset table | TrueType (`0x00010000`, `true`); for a `.ttc` collection, its first font; CFF (`OTTO`) is `Status.notTrueType` |
-| `head`, `maxp` | units per em, glyph count, short or long `loca` |
-| `hhea`, `hmtx` | ascender, descender, line gap, advance widths |
-| `cmap` | formats 0, 4, 6 and 12; the full-Unicode subtable (format 12) is preferred, then the BMP one (format 4) |
-| `loca`, `glyf` | simple glyphs, and compound glyphs (offsets, uniform and x/y scales, 2x2 transforms, nested up to 8 levels) |
-| `kern` | the legacy table, format 0 (horizontal pair kerning) |
+path, allocator)` reads one from disk (`initWith` takes the allocator of
+the engine's records; `init` uses the page allocator). The font is a face
+of the engine with its Unicode charmap selected: TrueType, OpenType with
+CFF or CFF2 outlines, the first font of a collection. Every read is
+bounds-checked, so a truncated or hostile file yields `Status.truncated`,
+`Status.missingTable` or missing glyphs, never an out-of-range read; a
+font without outlines (only embedded bitmaps) is `Status.notTrueType`,
+one without a Unicode charmap `Status.noUnicodeMap`.
 
 `glyphIndex(font, codepoint)`, `advanceWidth(font, glyph)` and
-`kerning(font, left, right)` answer in font units.
+`kerning(font, left, right)` answer in font units (advances from `hmtx`,
+kerning from the `kern` table). The font keeps its units per em, glyph
+count, `hhea` metrics, charmap format and kerning pairs.
 
-## Rasterizing
-
-`rasterize(font, glyph, scale, allocator, bitmap)` produces an 8-bit
-coverage bitmap; `scaleForPixelHeight(font, pixels)` gives the scale for a
-line of that height (ascender to descender). Outlines are decoded from
-TrueType's on- and off-curve points (two off-curve points in a row imply
-the on-curve point between them), quadratic curves are flattened
-adaptively, and each line segment adds its exact signed area and cover to
-an accumulation buffer whose running sum is the coverage of each pixel
-(after font-rs). The absolute sum, clamped to 1, gives TrueType's non-zero
-winding rule. Hinting instructions are not run.
-
-`tools/check_truetype.py` compares the result with FreeType (unhinted)
-and with a 16x16-supersampled rendering of the exact outline:
-
-| Font, size | Mean error, std.truetype | Mean error, FreeType |
-| --- | --- | --- |
-| DejaVu Sans subset, 24 px | 1.08 | 3.01 |
-| DejaVu Sans, 13 px | 1.41 | 4.83 |
-| DejaVu Sans Mono, 40 px | 0.68 | 2.06 |
-
-(errors in coverage levels out of 255; bitmap sizes and placement are
-identical to FreeType's for every glyph checked).
+`rasterize(font, glyph, scale, allocator, bitmap)` renders a glyph at
+`scale` pixels per font unit into an 8-bit coverage bitmap, unhinted,
+with FreeType's anti-aliasing rasterizer (the engine's `render` module):
+its size, placement and pixels are FreeType's.
+`scaleForPixelHeight(font, pixels)` gives the scale for a line of that
+height (ascender to descender). `tools/check_truetype.py` renders glyphs
+of TrueType and CFF fonts at several sizes with std.truetype and with the
+system's FreeType and requires them to be the same, pixel for pixel.
 
 ## Atlas, layout and drawing
 
@@ -80,22 +70,54 @@ Wayland client's label, the compositor's window titles (both renderers,
 compared by `tools/check_vulkan_wayland.sh`) and the Android app's label
 (from the system font).
 
+## The engine
+
+The modules of `std/src/truetype/`, each re-exported by `std.truetype`
+(`tt.faces`, `tt.load`...), are FreeType's parts in Mlx, computing what
+FreeType computes:
+
+| Module | What |
+| --- | --- |
+| `memory` | Memory by address, big-endian reads; a library's `Memory` record (three functions; `useAllocator` makes one of an `Allocator`) |
+| `records`, `objects` | The values (vectors, matrices, boxes, glyph metrics, bitmaps, outlines, size requests: FreeType's layouts) and constants (flags, modes, encodings, FreeType's error numbers); the records of a face, a size, a glyph slot, a charmap |
+| `library` | A library: its memory, the LCD filter, the CFF driver's properties (stem darkening, its parameters, the random seed) |
+| `face` (`tt.faces`) | Opening a face of memory or a file (`newFace`, `openFace`: the collection's font, a named instance, the TrueType or the CFF driver), its sizes (`setPixelSizes`, `setCharSize`, `requestSize`, `selectSize`: strikes of embedded bitmaps), slots, transform and properties |
+| `sfnt`, `cmap`, `psnames`, `info` | The SFNT container and its tables (`head`, `hhea`, `OS/2`, `post`, `name`, `gasp`, `kern`...), charmaps (every `cmap` format, a CFF font's encoding, Unicode charmaps of glyph names by the Adobe Glyph List), what a face tells (characters, variation selectors, SFNT tables and names, glyph and PostScript names, CID) |
+| `glyf`, `cffload`, `cf2`, `cff` | TrueType outlines (composites, phantom points); CFF and CFF2 (DICTs, charsets, encodings, subroutines, CID fonts, CFF2's blend) with the CFF driver's hinter (the Adobe engine) |
+| `variations` | `fvar`, `avar` (1 and 2), `gvar`, `HVAR`, `VVAR`, `MVAR`: named instances, design and normalized coordinates |
+| `sbit`, `color` | Embedded bitmaps (`EBLC`/`EBDT`, `CBLC`/`CBDT` and `sbix`, their PNGs decoded by `std.png`); `CPAL` palettes, `COLR` layers and version 1 paints |
+| `load`, `render`, `raster` | Loading a glyph into a slot (`loadGlyph`, `loadChar`, `getAdvances`, `kerning`); the anti-aliasing rasterizer (gray, LCD with the filters) and the monochrome one, `renderGlyph`, `outlineRender` with spans |
+| `outlines`, `bitmap` (`tt.bitmaps`), `calc` | Outline functions (decomposing, boxes, transforms, emboldening, orientation), bitmap functions (copies, emboldening, conversion, blending), synthetic styles; FreeType's fixed-point arithmetic and trigonometry |
+
+The engine's records are reached by their addresses (`tt.face(address)`
+gives a `*Face`); a face's slot, sizes and charmaps are its own, and its
+`user` word is its callers' (the C API keeps its records there). An
+`Engine` (`initEngine(engine, allocator)`) holds a library whose memory is
+an allocator's.
+
 ## Tests
 
 `tests/262_truetype_runtime.mlx` checks, on
 `tests/support/fonts/DejaVuSans-subset.ttf` (a DejaVu Sans subset with short
 `loca`, cmap formats 4 and 12, compound glyphs and kerning): the tables and
-metrics against fontTools, bitmaps whose placement matches FreeType and
-whose coverage is fixed, the atlas, layout with kerning and UTF-8,
-`drawRun`'s blending, and rejected input. It runs in `tests/run_vulkan.sh`,
-and `tools/diff_aarch64_backend.py` runs it on aarch64 too.
+metrics against fontTools, bitmaps against FreeType's (sizes, placement and
+coverage), the atlas, layout with kerning and UTF-8, `drawRun`'s blending,
+and rejected input. It runs in `tests/run_vulkan.sh`, and
+`tools/diff_aarch64_backend.py` runs it on aarch64 too. The engine itself
+is checked through FreeType's C API by `tools/check_freetype.sh`: test
+programs whose every printed outline point, metric and pixel must be
+FreeType 2.13's, a sweep of every glyph of every font of the system at
+several sizes and load flags against the system's FreeType, and damaged
+fonts.
 
 ## Limits
 
 - One line of text, left to right: no shaping, bidirectional text,
-  ligatures or line breaking.
-- Kerning comes from the legacy `kern` table only (OpenType `GPOS` is not
-  read); fonts without one are laid out with advances alone.
-- No hinting, no CFF outlines, no vertical metrics, no variable-font
-  instances (the default instance is drawn); compound glyphs positioned by
-  point matching are skipped.
+  ligatures or line breaking (kerning comes from the `kern` table only;
+  OpenType `GPOS` is not read).
+- No TrueType bytecode interpreter and no auto-hinter: TrueType glyphs
+  load unhinted (a hinted load has the unhinted outline with metrics on
+  the pixel grid); CFF glyphs are hinted by the CFF driver's hinter.
+- Not read: Type 1 and CID-keyed Type 1 fonts, PCF, BDF, PFR, Windows FNT,
+  WOFF and WOFF2, OpenType SVG, bare CFF files, the Macintosh's resource
+  forks.

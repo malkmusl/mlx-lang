@@ -158,7 +158,7 @@ the next frame.
 | Module | Widgets |
 | --- | --- |
 | `std.ui.controls` | `button` (plain, normal, primary; disabled), `smallButton`, `toggleButton`, `iconButton`, `miniButton` (a small button in a row), `menuButton` (opens a list), `splitButton` (an action and an arrow for its list), `closeButton` (round, a cross), `chevronButton` (back, forward), `link` (underlined under the pointer), `chip` (a small button in a line of text), `crumb` (a step of a path), `swatch` (a colour to choose), `valueRow` (a row with a value box at its right, such as a key binding being recorded), `checkBox`/`checkRow`/`checkRowIn` (on, off, mixed; a colour of its own), `radioRow`, `switchToggle`/`switchRow` (a settings row), `slider` (a value dragged or clicked along, or turned with the wheel; the Sound and Display pages of [`projects/desktop/settings`](../../projects/desktop/settings/page.mlx)), `heading` (a section that folds), `segment` (a choice), `pill`, `progress`, `sparkline`, labels |
-| `std.ui.field` | a one-line text field: `Field` (text, caret, selection), `fieldKey` (typing, Backspace/Delete by character or word, arrows, Home/End, Shift selecting, Ctrl+A, Enter, Escape), `textField` (drawn, a click places the caret; without the focus it shows the text's start), `notedField` (a note at its right, such as a count, and a text colour of its own) |
+| `std.ui.field` | a one-line text field: `Field` (text of any length in a block of `std.heap` that grows with it, wiped when given up; `init`, `clear`, `wipe`, `deinit`; caret, selection), `fieldKey` (typing, Backspace/Delete by character or word, arrows, Home/End, Shift selecting, Ctrl+A, Enter, Escape), `textField` (drawn, a click places the caret; without the focus it shows the text's start), `notedField` (a note at its right, such as a count, and a text colour of its own) |
 | `std.ui.scroll` | `Scroll` (offset, content, view), the wheel over an area, `bar` (drag the thumb, page by a click), `indicator` (the same as a thin bar over the content, without a track), `mark`s on the bar, the rows in view |
 | `std.ui.lists` | list and side bar rows (lit, chosen, indent, note, room for an icon), `rowBackground` and `part` (a row the app fills, whose parts have ids of their own), `columnHeader` (a sortable column's title), a fold arrow, a divider |
 | `std.ui.tabs` | a tab bar: tabs with a cross that closes them, a dot for unsaved changes |
@@ -201,7 +201,27 @@ The app asks the platform through the host: `redraw`, `setTick`,
 logical pixel), `typed` and `modifiers` (the current key), `wheelPixels`,
 `showKeyboard`/`hideKeyboard`, `home` (where its files are),
 `environmentValue`, `log`; what only a desktop has (`setTitle`,
-`setBlur`, `acceptDrops`, `startDrag`) does nothing on a phone.
+`setBlur`, `setFullscreen` after `open`, `acceptDrops`, `startDrag`)
+does nothing on a phone.
+
+The system clipboard goes through the host too. An app sets it with
+`beginClipboard`, one `addClipboard(mime, data)` for each type other apps
+may ask for, then `publishClipboard`; the host keeps the bytes and serves
+them whenever another app reads. `clipboardHas(mime)` and
+`readClipboard(mime)` see whichever app set it last (on Linux another
+client's bytes come through a pipe, a second at most per part),
+`clipboardIsOurs` says whether that was this app, and `clearClipboard`
+empties it. On Linux this is `wl_data_device`'s selection
+(`std.ui.wayland.panel_clipboard`); a phone has no system clipboard yet,
+so there an app's own copy is all there is. mlx-files puts copied files
+up as `x-special/gnome-copied-files`, `text/uri-list` (with
+`application/x-kde-cutselection` for a cut) and the paths as text, and
+pastes any of these from other apps. The primary selection, the text last
+selected that a middle click pastes, is `setPrimary(text)` and
+`readPrimary()` (`std.ui.wayland.panel_primary` on
+`zwp_primary_selection_device_v1`, offered as UTF-8 text; nothing on a
+phone): mlx-terminal sets it to what is selected and pastes it on a
+middle click.
 
 | Platform | Drawn by | Input |
 | --- | --- | --- |
@@ -237,10 +257,22 @@ clicks, a split button, a disabled back button, a crumb, a link, a
 swatch, a value row, a column header, a thin indicator, events through
 `std.ui.app.feed`, a text field edited by keys, a list scrolled by the
 wheel and by its bar, a tab closed, clipping, wrapping).
+`tests/409_ui_field_long_runtime.mlx` edits a text field of 4 KB and more
+(set, typed into the middle, grown past 8 KB, selected, deleted), draws it
+scrolled so the caret at its end is in view, places the caret by a click
+and a drag in the scrolled text, and wipes and frees its block.
 `tools/emulate_android_app.py` runs `examples/android/widgets.mlx` against
 a model of Android (Unicorn), drawn by a mock Vulkan driver and again on
 the CPU, and taps a switch row and a segment and drags over a row.
 `tests/264_ui_layout_runtime.mlx` covers the geometry, every alignment
 (including children that do not fit), bands, containers, stacks, a screen
 with safe insets and reserved top and bottom bars, and `fillRect`'s
-blending and clipping.
+blending and clipping. The Files app's parts have their own:
+`tests/288_filemanager_responsive_ui_runtime.mlx` holds its one layout
+for Wayland and Android to its breakpoints (a sidebar or rail on wide
+screens, a drawer on compact ones, Search and the sidebar toggle always
+reachable, density scaling sizes but not the breakpoint);
+`tests/289_canvas_mobile_buffer_runtime.mlx` draws into a padded
+RGBA_8888 buffer at its row stride, swapping red and blue only there and
+never writing the padding; `tests/285_filemanager_trash_runtime.mlx`
+makes the trash's folders under `XDG_DATA_HOME`.

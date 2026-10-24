@@ -375,8 +375,11 @@ modules are current.
 
 ### Bootstrap compiler constraints
 
-The runtime is written in the subset of Mlx that the self-hosted compiler
-lowers correctly today, and each workaround is commented at its use site:
+The runtime was written in the subset of Mlx that the self-hosted compiler
+lowered correctly at the time, and each workaround is commented at its use
+site. The compiler has since lifted the field-address, declaration-order,
+`@bitCast` and bare-`return` limits (tests 305 to 308) and the one on
+error union payloads (test 323), so new code need not follow those five:
 
 - field addresses (`&value.field`) are avoided, so the code uses pointers
   to separately allocated state and copy-modify-write on tables;

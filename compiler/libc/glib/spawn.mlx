@@ -1,0 +1,600 @@
+// Running programs (gspawn.h) and what GLib has for Unix alone
+// (glib-unix.h): pipes, non-blocking descriptors and signal sources.
+//
+// A program is started as GLib starts it: fork, then in the child the
+// working directory, the standard descriptors (pipes to the parent,
+// /dev/null, or the parent's own), the other descriptors closed on exec,
+// the child setup function and exec (searching PATH when asked); an exec
+// that fails writes its errno to a pipe the parent reads (the pipe
+// closes on a successful exec). A child the caller does not reap is
+// started from an intermediate child that exits at once, so that nothing
+// is left to wait for. g_spawn_sync reads the child's output and error
+// until both end, then waits for it.
+//
+// A signal source (SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH)
+// is dispatched in the main loop: the signal's handler marks it pending
+// and writes a byte to a pipe every signal source watches.
+const m = @import("./memory.mlx")
+const sys = @import("./sys.mlx")
+const threads = @import("./threads.mlx")
+const errors = @import("./errors.mlx")
+const messages = @import("./messages.mlx")
+const strings = @import("./strings.mlx")
+
+extern("c") fn fork() -> i32
+extern("c") fn execv(path: usize, argv: usize) -> i32
+extern("c") fn execve(path: usize, argv: usize, envp: usize) -> i32
+extern("c") fn execvp(file: usize, argv: usize) -> i32
+extern("c") fn execvpe(file: usize, argv: usize, envp: usize) -> i32
+extern("c") fn dup2(a: i32, b: i32) -> i32
+extern("c") fn _exit(code: i32) -> void
+extern("c") fn chdir(path: usize) -> i32
+extern("c") fn waitpid(pid: i32, status: usize, options: i32) -> i32
+extern("c") fn sigaction(signum: i32, act: usize, oldact: usize) -> i32
+extern("c") fn g_shell_parse_argv(command_line: usize, argcp: usize, argvp: usize, err: usize) -> i32
+extern("c") fn g_spawn_error_quark() -> u32
+extern("c") fn g_spawn_exit_error_quark() -> u32
+extern("c") fn g_unix_error_quark() -> u32
+extern("c") fn g_source_new(funcs: usize, size: u32) -> usize
+extern("c") fn g_source_add_unix_fd(source: usize, fd: i32, events: i32) -> usize
+extern("c") fn g_source_set_callback(source: usize, func: usize, data: usize, notify: usize) -> void
+extern("c") fn g_source_set_priority(source: usize, priority: i32) -> void
+extern("c") fn g_source_set_static_name(source: usize, name: usize) -> void
+extern("c") fn g_source_attach(source: usize, context: usize) -> u32
+extern("c") fn g_source_unref(source: usize) -> void
+
+const LEAVE_DESCRIPTORS_OPEN: i32 = 1
+const DO_NOT_REAP_CHILD: i32 = 2
+const SEARCH_PATH: i32 = 4
+const STDOUT_TO_DEV_NULL: i32 = 8
+const STDERR_TO_DEV_NULL: i32 = 16
+const CHILD_INHERITS_STDIN: i32 = 32
+const FILE_AND_ARGV_ZERO: i32 = 64
+const SEARCH_PATH_FROM_ENVP: i32 = 128
+const CLOEXEC_PIPES: i32 = 256
+const CHILD_INHERITS_STDOUT: i32 = 512
+const CHILD_INHERITS_STDERR: i32 = 1024
+const STDIN_FROM_DEV_NULL: i32 = 2048
+
+const O_RDONLY: i32 = 0
+const O_RDWR: i32 = 2
+const O_NONBLOCK: i32 = 2048
+const O_CLOEXEC: i32 = 524288
+const SYS_close_range: usize = 436
+
+// What a child reports through its error pipe.
+const CHILD_CHDIR_FAILED: i32 = 0
+const CHILD_EXEC_FAILED: i32 = 1
+const CHILD_DUP2_FAILED: i32 = 2
+const CHILD_FORK_FAILED: i32 = 3
+
+pub const ChildSetup = fn(usize) -> void
+pub const SourceFunc = fn(usize) -> i32
+
+fn spawnError(err: usize, code: i32, prefix: []const u8, quoted: usize, errnum: i32) -> void {
+    if err == 0 { return }
+    var t = m.text()
+    m.pushText(&t, prefix)
+    if quoted != 0 {
+        m.pushText(&t, " “")
+        m.pushC(&t, quoted)
+        m.pushText(&t, "”")
+    }
+    m.pushText(&t, " (")
+    m.pushC(&t, sys.strerror(errnum))
+    m.pushText(&t, ")")
+    errors.report(err, errors.newError(g_spawn_error_quark(), code, m.finish(&t)))
+}
+
+// GLib's exec_err_to_g_error.
+fn execErrorCode(errnum: i32) -> i32 {
+    if errnum == 13 { return 3 }
+    if errnum == 1 { return 4 }
+    if errnum == 7 { return 5 }
+    if errnum == 8 { return 6 }
+    if errnum == 36 { return 7 }
+    if errnum == 2 { return 8 }
+    if errnum == 12 { return 9 }
+    if errnum == 20 { return 10 }
+    if errnum == 40 { return 11 }
+    if errnum == 26 { return 12 }
+    if errnum == 5 { return 13 }
+    if errnum == 23 { return 14 }
+    if errnum == 24 { return 15 }
+    if errnum == 22 { return 16 }
+    if errnum == 21 { return 17 }
+    if errnum == 80 { return 18 }
+    return 19
+}
+
+fn writeAll(fd: i32, buffer: usize, count: usize) -> void {
+    var done: usize = 0
+    while done < count {
+        const n = sys.write(fd, buffer + done, count - done)
+        if n < 0 {
+            if sys.errno() == sys.EINTR { continue }
+            return
+        }
+        done += @intCast(usize, n)
+    }
+}
+
+// In the child: reports what failed and leaves.
+fn childFail(report: i32, what: i32, scratch: usize) -> void {
+    m.putI32(scratch, what)
+    m.putI32(scratch + 4, sys.errno())
+    writeAll(report, scratch, 8)
+    _exit(127)
+}
+
+fn moveTo(fd: i32, target: i32, report: i32, scratch: usize) -> void {
+    if fd == target {
+        // Clear close-on-exec: the descriptor is the child's own already.
+        _ = sys.fcntl(fd, 2, 0)
+        return
+    }
+    while dup2(fd, target) < 0 {
+        if sys.errno() != sys.EINTR { childFail(report, CHILD_DUP2_FAILED, scratch) }
+    }
+}
+
+// The child's part (no allocation: everything was made before the fork).
+fn execChild(workingDirectory: usize, file: usize, argv: usize, envp: usize, flags: i32, setup: usize, setupData: usize, stdinFd: i32, stdoutFd: i32, stderrFd: i32, report: i32, scratch: usize, devNull: usize) -> void {
+    if workingDirectory != 0 && chdir(workingDirectory) < 0 { childFail(report, CHILD_CHDIR_FAILED, scratch) }
+    if stdinFd >= 0 {
+        moveTo(stdinFd, 0, report, scratch)
+    } else if (flags & CHILD_INHERITS_STDIN) == 0 {
+        const nullFd = sys.open(devNull, O_RDONLY, 0)
+        if nullFd >= 0 { moveTo(nullFd, 0, report, scratch) }
+    }
+    if stdoutFd >= 0 {
+        moveTo(stdoutFd, 1, report, scratch)
+    } else if (flags & STDOUT_TO_DEV_NULL) != 0 {
+        const nullFd = sys.open(devNull, O_RDWR, 0)
+        if nullFd >= 0 { moveTo(nullFd, 1, report, scratch) }
+    }
+    if stderrFd >= 0 {
+        moveTo(stderrFd, 2, report, scratch)
+    } else if (flags & STDERR_TO_DEV_NULL) != 0 {
+        const nullFd = sys.open(devNull, O_RDWR, 0)
+        if nullFd >= 0 { moveTo(nullFd, 2, report, scratch) }
+    }
+    if (flags & LEAVE_DESCRIPTORS_OPEN) == 0 {
+        // Every other descriptor closes on exec (CLOSE_RANGE_CLOEXEC).
+        _ = sys.syscall3(SYS_close_range, 3, 0xffffffff, 4)
+    }
+    if setup != 0 {
+        const call: ChildSetup = unsafe { @ptrFromInt(ChildSetup, setup) }
+        call(setupData)
+    }
+    const search = (flags & (SEARCH_PATH | SEARCH_PATH_FROM_ENVP)) != 0
+    if search {
+        if envp != 0 { _ = execvpe(file, argv, envp) } else { _ = execvp(file, argv) }
+    } else {
+        if envp != 0 { _ = execve(file, argv, envp) } else { _ = execv(file, argv) }
+    }
+    childFail(report, CHILD_EXEC_FAILED, scratch)
+}
+
+// Reads the child's report: true when exec succeeded.
+fn readReport(report: i32, file: usize, workingDirectory: usize, err: usize) -> bool {
+    const buffer = m.alloc(16)
+    var got: usize = 0
+    while got < 8 {
+        const n = sys.read(report, buffer + got, 8 - got)
+        if n < 0 {
+            if sys.errno() == sys.EINTR { continue }
+            break
+        }
+        if n == 0 { break }
+        got += @intCast(usize, n)
+    }
+    var ok = true
+    if got == 8 {
+        ok = false
+        const what = m.getI32(buffer)
+        const errnum = m.getI32(buffer + 4)
+        if what == CHILD_CHDIR_FAILED {
+            spawnError(err, 2, "Failed to change to directory", workingDirectory, errnum)
+        } else if what == CHILD_EXEC_FAILED {
+            spawnError(err, execErrorCode(errnum), "Failed to execute child process", file, errnum)
+        } else if what == CHILD_DUP2_FAILED {
+            spawnError(err, 19, "Failed to redirect output or input of child process", 0, errnum)
+        } else {
+            spawnError(err, 0, "Failed to fork child process", 0, errnum)
+        }
+    }
+    m.release(buffer)
+    return ok
+}
+
+fn makePipe(fds: usize, err: usize) -> bool {
+    if sys.pipe2(fds, O_CLOEXEC) < 0 {
+        spawnError(err, 15, "Failed to create pipe for communicating with child process", 0, sys.errno())
+        return false
+    }
+    return true
+}
+
+fn closeFd(fd: i32) -> void { if fd >= 0 { _ = sys.close(fd) } }
+
+fn waitFor(pid: i32, status: usize) -> i32 {
+    while true {
+        const r = waitpid(pid, status, 0)
+        if r >= 0 || sys.errno() != sys.EINTR { return r }
+    }
+    return -1
+}
+
+// Starts the program; the pipes the caller asked for in `pipes` (the
+// parent's ends: input 0, output 4, error 8), the pid in `pidOut`.
+fn start(workingDirectory: usize, argv: usize, envp: usize, flags: i32, setup: usize, setupData: usize, pidOut: usize, wantIn: bool, wantOut: bool, wantErr: bool, pipes: usize, err: usize) -> bool {
+    if argv == 0 || m.getWord(argv) == 0 {
+        messages.critical("g_spawn_async_with_pipes: assertion 'argv != NULL && argv[0] != NULL' failed")
+        return false
+    }
+    var file = m.getWord(argv)
+    var args = argv
+    if (flags & FILE_AND_ARGV_ZERO) != 0 { args = argv + 8 }
+    const fds = m.alloc(64)
+    var i: usize = 0
+    while i < 16 {
+        m.putI32(fds + i * 4, -1)
+        i += 1
+    }
+    // fds: report 0/1, input 2/3, output 4/5, error 6/7.
+    var good = makePipe(fds, err)
+    if good && wantIn { good = makePipe(fds + 8, err) }
+    if good && wantOut { good = makePipe(fds + 16, err) }
+    if good && wantErr { good = makePipe(fds + 24, err) }
+    if !good {
+        i = 0
+        while i < 8 {
+            closeFd(m.getI32(fds + i * 4))
+            i += 1
+        }
+        m.release(fds)
+        return false
+    }
+    const scratch = m.alloc(16)
+    const devNull = m.dupSlice("/dev/null")
+    const intermediate = (flags & DO_NOT_REAP_CHILD) == 0
+    const pid = fork()
+    if pid < 0 {
+        spawnError(err, 0, "Failed to fork", 0, sys.errno())
+        i = 0
+        while i < 8 {
+            closeFd(m.getI32(fds + i * 4))
+            i += 1
+        }
+        m.release(fds)
+        m.release(scratch)
+        m.release(devNull)
+        return false
+    }
+    if pid == 0 {
+        // The child (or the intermediate one).
+        closeFd(m.getI32(fds))
+        closeFd(m.getI32(fds + 12))
+        closeFd(m.getI32(fds + 16))
+        closeFd(m.getI32(fds + 24))
+        if intermediate {
+            const grandchild = fork()
+            if grandchild < 0 { childFail(m.getI32(fds + 4), CHILD_FORK_FAILED, scratch) }
+            if grandchild != 0 { _exit(0) }
+        }
+        execChild(workingDirectory, file, args, envp, flags, setup, setupData, m.getI32(fds + 8), m.getI32(fds + 20), m.getI32(fds + 28), m.getI32(fds + 4), scratch, devNull)
+        _exit(127)
+    }
+    // The parent: its ends of the pipes.
+    closeFd(m.getI32(fds + 4))
+    closeFd(m.getI32(fds + 8))
+    closeFd(m.getI32(fds + 20))
+    closeFd(m.getI32(fds + 28))
+    if intermediate {
+        const status = m.alloc(8)
+        _ = waitFor(pid, status)
+        m.release(status)
+    }
+    const ok = readReport(m.getI32(fds), file, workingDirectory, err)
+    closeFd(m.getI32(fds))
+    if !ok {
+        if !intermediate {
+            const status = m.alloc(8)
+            _ = waitFor(pid, status)
+            m.release(status)
+        }
+        closeFd(m.getI32(fds + 12))
+        closeFd(m.getI32(fds + 16))
+        closeFd(m.getI32(fds + 24))
+    } else {
+        if pidOut != 0 { m.putI32(pidOut, if intermediate { 0 } else { pid }) }
+        if (flags & CLOEXEC_PIPES) == 0 {
+            if wantIn { _ = sys.fcntl(m.getI32(fds + 12), 2, 0) }
+            if wantOut { _ = sys.fcntl(m.getI32(fds + 16), 2, 0) }
+            if wantErr { _ = sys.fcntl(m.getI32(fds + 24), 2, 0) }
+        }
+        m.putI32(pipes, m.getI32(fds + 12))
+        m.putI32(pipes + 4, m.getI32(fds + 16))
+        m.putI32(pipes + 8, m.getI32(fds + 24))
+    }
+    m.release(fds)
+    m.release(scratch)
+    m.release(devNull)
+    return ok
+}
+
+export fn g_spawn_async_with_pipes(working_directory: usize, argv: usize, envp: usize, flags: i32, child_setup: usize, user_data: usize, child_pid: usize, standard_input: usize, standard_output: usize, standard_error: usize, err: usize) -> i32 {
+    const pipes = m.alloc(16)
+    const ok = start(working_directory, argv, envp, flags, child_setup, user_data, child_pid, standard_input != 0, standard_output != 0, standard_error != 0, pipes, err)
+    if ok {
+        if standard_input != 0 { m.putI32(standard_input, m.getI32(pipes)) }
+        if standard_output != 0 { m.putI32(standard_output, m.getI32(pipes + 4)) }
+        if standard_error != 0 { m.putI32(standard_error, m.getI32(pipes + 8)) }
+    }
+    m.release(pipes)
+    return if ok { 1 } else { 0 }
+}
+
+export fn g_spawn_async(working_directory: usize, argv: usize, envp: usize, flags: i32, child_setup: usize, user_data: usize, child_pid: usize, err: usize) -> i32 {
+    return g_spawn_async_with_pipes(working_directory, argv, envp, flags, child_setup, user_data, child_pid, 0, 0, 0, err)
+}
+
+// Reads both descriptors to their ends.
+fn readOutputs(outFd: i32, errFd: i32, outText: *m.Text, errText: *m.Text, err: usize) -> bool {
+    const pfds = m.alloc(16)
+    const buffer = m.alloc(4096)
+    var outOpen = outFd >= 0
+    var errOpen = errFd >= 0
+    var good = true
+    while outOpen || errOpen {
+        var n: u64 = 0
+        if outOpen {
+            m.putI32(pfds, outFd)
+            m.put16(pfds + 4, 1)
+            m.put16(pfds + 6, 0)
+            n = 1
+        }
+        if errOpen {
+            m.putI32(pfds + @intCast(usize, n) * 8, errFd)
+            m.put16(pfds + @intCast(usize, n) * 8 + 4, 1)
+            m.put16(pfds + @intCast(usize, n) * 8 + 6, 0)
+            n += 1
+        }
+        if sys.poll(pfds, n, -1) < 0 {
+            if sys.errno() == sys.EINTR { continue }
+            spawnError(err, 1, "Unexpected error in select() reading data from a child process", 0, sys.errno())
+            good = false
+            break
+        }
+        var k: usize = 0
+        while k < @intCast(usize, n) {
+            const fd = m.getI32(pfds + k * 8)
+            if m.get16(pfds + k * 8 + 6) != 0 {
+                const got = sys.read(fd, buffer, 4096)
+                if got > 0 {
+                    if fd == outFd { m.pushBytes(outText, buffer, @intCast(usize, got)) } else { m.pushBytes(errText, buffer, @intCast(usize, got)) }
+                } else if got == 0 || sys.errno() != sys.EINTR {
+                    if got < 0 {
+                        spawnError(err, 1, "Failed to read data from child process", 0, sys.errno())
+                        good = false
+                    }
+                    if fd == outFd { outOpen = false } else { errOpen = false }
+                }
+            }
+            k += 1
+        }
+        if !good { break }
+    }
+    m.release(pfds)
+    m.release(buffer)
+    return good
+}
+
+export fn g_spawn_sync(working_directory: usize, argv: usize, envp: usize, flags: i32, child_setup: usize, user_data: usize, standard_output: usize, standard_error: usize, wait_status: usize, err: usize) -> i32 {
+    if standard_output != 0 { m.putWord(standard_output, 0) }
+    if standard_error != 0 { m.putWord(standard_error, 0) }
+    const pipes = m.alloc(16)
+    const pid = m.alloc(8)
+    const syncFlags = (flags | DO_NOT_REAP_CHILD) & (0 - 1 - CLOEXEC_PIPES)
+    if !start(working_directory, argv, envp, syncFlags | CLOEXEC_PIPES, child_setup, user_data, pid, false, standard_output != 0, standard_error != 0, pipes, err) {
+        m.release(pipes)
+        m.release(pid)
+        return 0
+    }
+    var outText = m.text()
+    var errText = m.text()
+    const good = readOutputs(if standard_output != 0 { m.getI32(pipes + 4) } else { -1 }, if standard_error != 0 { m.getI32(pipes + 8) } else { -1 }, &outText, &errText, err)
+    closeFd(if standard_output != 0 { m.getI32(pipes + 4) } else { -1 })
+    closeFd(if standard_error != 0 { m.getI32(pipes + 8) } else { -1 })
+    const status = m.alloc(8)
+    _ = waitFor(m.getI32(pid), status)
+    if wait_status != 0 { m.putI32(wait_status, m.getI32(status)) }
+    m.release(status)
+    m.release(pipes)
+    m.release(pid)
+    if !good {
+        m.dispose(&outText)
+        m.dispose(&errText)
+        return 0
+    }
+    if standard_output != 0 { m.putWord(standard_output, m.finish(&outText)) } else { m.dispose(&outText) }
+    if standard_error != 0 { m.putWord(standard_error, m.finish(&errText)) } else { m.dispose(&errText) }
+    return 1
+}
+
+fn parseCommand(command_line: usize, err: usize) -> usize {
+    const cell = m.alloc(8)
+    var argv: usize = 0
+    if g_shell_parse_argv(command_line, 0, cell, err) != 0 { argv = m.getWord(cell) }
+    m.release(cell)
+    return argv
+}
+
+export fn g_spawn_command_line_sync(command_line: usize, standard_output: usize, standard_error: usize, wait_status: usize, err: usize) -> i32 {
+    const argv = parseCommand(command_line, err)
+    if argv == 0 { return 0 }
+    const ok = g_spawn_sync(0, argv, 0, SEARCH_PATH, 0, 0, standard_output, standard_error, wait_status, err)
+    strings.freeStrv(argv)
+    return ok
+}
+
+export fn g_spawn_command_line_async(command_line: usize, err: usize) -> i32 {
+    const argv = parseCommand(command_line, err)
+    if argv == 0 { return 0 }
+    const ok = g_spawn_async(0, argv, 0, SEARCH_PATH, 0, 0, 0, err)
+    strings.freeStrv(argv)
+    return ok
+}
+
+fn statusError(err: usize, domain: u32, code: i32, prefix: []const u8, number: i64) -> void {
+    if err == 0 { return }
+    var t = m.text()
+    m.pushText(&t, prefix)
+    m.pushSigned(&t, number)
+    errors.report(err, errors.newError(domain, code, m.finish(&t)))
+}
+
+export fn g_spawn_check_wait_status(wait_status: i32, err: usize) -> i32 {
+    const termsig = wait_status & 0x7f
+    if termsig == 0 {
+        const code = (wait_status >> 8) & 0xff
+        if code == 0 { return 1 }
+        statusError(err, g_spawn_exit_error_quark(), code, "Child process exited with code ", @intCast(i64, code))
+    } else if (wait_status & 0xff) == 0x7f {
+        statusError(err, g_spawn_error_quark(), 19, "Child process stopped by signal ", @intCast(i64, (wait_status >> 8) & 0xff))
+    } else if termsig != 0x7f {
+        statusError(err, g_spawn_error_quark(), 19, "Child process killed by signal ", @intCast(i64, termsig))
+    } else {
+        errors.set(err, g_spawn_error_quark(), 19, "Child process exited abnormally")
+    }
+    return 0
+}
+
+export fn g_spawn_check_exit_status(wait_status: i32, err: usize) -> i32 { return g_spawn_check_wait_status(wait_status, err) }
+export fn g_spawn_close_pid(pid: i32) -> void {}
+
+// ---------------------------------------------------------------------------
+// glib-unix.h
+
+fn unixError(err: usize) -> void {
+    const errnum = sys.errno()
+    errors.set(err, g_unix_error_quark(), 0, m.cSlice(sys.strerror(errnum)))
+}
+
+export fn g_unix_open_pipe(fds: usize, flags: i32, err: usize) -> i32 {
+    // FD_CLOEXEC (1) asks for O_CLOEXEC; O_ flags are taken as they are.
+    var pipeFlags = flags & (O_CLOEXEC | O_NONBLOCK)
+    if (flags & 1) != 0 { pipeFlags = pipeFlags | O_CLOEXEC }
+    if sys.pipe2(fds, pipeFlags) < 0 {
+        unixError(err)
+        return 0
+    }
+    return 1
+}
+
+export fn g_unix_set_fd_nonblocking(fd: i32, nonblock: i32, err: usize) -> i32 {
+    const current = sys.fcntl(fd, 3, 0)
+    if current < 0 {
+        unixError(err)
+        return 0
+    }
+    const wanted = if nonblock != 0 { current | O_NONBLOCK } else { current & (0 - 1 - O_NONBLOCK) }
+    if sys.fcntl(fd, 4, @intCast(usize, wanted)) < 0 {
+        unixError(err)
+        return 0
+    }
+    return 1
+}
+
+var pending: [65]u32 = undefined
+var installed: [65]u32 = undefined
+var wakePipe: [2]i32 = undefined
+var signalOnce: u64 = 0
+var signalLock: u32 = 0
+var signalFuncs: [6]usize = undefined
+
+export fn __mlx_glib_unix_signal_handler(signum: i32) -> void {
+    @atomicStore(u32, m.word32(@intFromPtr(&pending) + @intCast(usize, signum) * 4), 1, release)
+    const saved = sys.errno()
+    var byte: u8 = 1
+    _ = sys.write(wakePipe[1], @intFromPtr(&byte), 1)
+    sys.setErrno(saved)
+}
+
+export fn __mlx_glib_unix_signal_prepare(source: usize, timeout: usize) -> i32 {
+    m.putI32(timeout, -1)
+    return if @atomicLoad(u32, m.word32(@intFromPtr(&pending) + @intCast(usize, m.getI32(source + 96)) * 4), acquire) != 0 { 1 } else { 0 }
+}
+
+export fn __mlx_glib_unix_signal_check(source: usize) -> i32 {
+    const drain = m.alloc(64)
+    while sys.read(wakePipe[0], drain, 64) > 0 {}
+    m.release(drain)
+    return if @atomicLoad(u32, m.word32(@intFromPtr(&pending) + @intCast(usize, m.getI32(source + 96)) * 4), acquire) != 0 { 1 } else { 0 }
+}
+
+export fn __mlx_glib_unix_signal_dispatch(source: usize, callback: usize, user_data: usize) -> i32 {
+    @atomicStore(u32, m.word32(@intFromPtr(&pending) + @intCast(usize, m.getI32(source + 96)) * 4), 0, release)
+    if callback == 0 {
+        messages.warning("GUnixSignalSource dispatched without callback. You must call g_source_set_callback().")
+        return 0
+    }
+    const call: SourceFunc = unsafe { @ptrFromInt(SourceFunc, callback) }
+    return call(user_data)
+}
+
+fn ensureSignals() -> void {
+    if threads.onceEnter(@intFromPtr(&signalOnce)) {
+        m.zero(@intFromPtr(&pending), 65 * 4)
+        m.zero(@intFromPtr(&installed), 65 * 4)
+        _ = sys.pipe2(@intFromPtr(&wakePipe), O_CLOEXEC | O_NONBLOCK)
+        signalFuncs[0] = @intFromPtr(__mlx_glib_unix_signal_prepare)
+        signalFuncs[1] = @intFromPtr(__mlx_glib_unix_signal_check)
+        signalFuncs[2] = @intFromPtr(__mlx_glib_unix_signal_dispatch)
+        signalFuncs[3] = 0
+        signalFuncs[4] = 0
+        signalFuncs[5] = 0
+        threads.onceLeave(@intFromPtr(&signalOnce), 1)
+    }
+}
+
+fn install(signum: i32) -> void {
+    threads.lock(@intFromPtr(&signalLock))
+    if installed[@intCast(usize, signum)] == 0 {
+        installed[@intCast(usize, signum)] = 1
+        const action = m.alloc(152)
+        m.putWord(action, @intFromPtr(__mlx_glib_unix_signal_handler))
+        // SA_RESTART | SA_NOCLDSTOP.
+        m.putI32(action + 136, 0x10000000 | 1)
+        _ = sigaction(signum, action, 0)
+        m.release(action)
+    }
+    threads.unlock(@intFromPtr(&signalLock))
+}
+
+export fn g_unix_signal_source_new(signum: i32) -> usize {
+    if !(signum == 1 || signum == 2 || signum == 15 || signum == 10 || signum == 12 || signum == 28) {
+        messages.critical("g_unix_signal_source_new: assertion 'signum == SIGHUP || signum == SIGINT || signum == SIGTERM || signum == SIGUSR1 || signum == SIGUSR2 || signum == SIGWINCH' failed")
+        return 0
+    }
+    ensureSignals()
+    install(signum)
+    const source = g_source_new(@intFromPtr(&signalFuncs), 104)
+    m.putI32(source + 96, signum)
+    _ = g_source_add_unix_fd(source, wakePipe[0], 1)
+    g_source_set_static_name(source, m.literal("GUnixSignalSource"))
+    return source
+}
+
+export fn g_unix_signal_add_full(priority_: i32, signum: i32, handler: usize, user_data: usize, notify: usize) -> u32 {
+    const source = g_unix_signal_source_new(signum)
+    if source == 0 { return 0 }
+    if priority_ != 0 { g_source_set_priority(source, priority_) }
+    g_source_set_callback(source, handler, user_data, notify)
+    const id = g_source_attach(source, 0)
+    g_source_unref(source)
+    return id
+}
+
+export fn g_unix_signal_add(signum: i32, handler: usize, user_data: usize) -> u32 { return g_unix_signal_add_full(0, signum, handler, user_data, 0) }

@@ -1,0 +1,866 @@
+// The translation units compiled together as one relocatable object:
+// their definitions linked by name (a name with external linkage stands
+// for one definition), the globals placed in the data area, the code of
+// every function, and what the object says of itself: its symbols (the
+// functions and variables it defines, the names it needs), the
+// relocations of the references to those names and of the addresses its
+// data holds, and its own initialization (long double and wide integer
+// initializers computed at start, a function listed in .init_array).
+//
+// With -c the object is written as it is (compiler/cc/ar.mlx archives
+// such objects). Otherwise mlx-ld (compiler/ld/main.mlx, the Mlx
+// compiler's linker compiler/selfhost/object/link.mlx as a program of
+// its own) joins it with the objects and archives of the command line,
+// makes _start and __mlxcc_init, and writes the dynamically linked
+// program; the names no object defines come from the C library and the
+// other libraries (-l). There is no assembler in between; the linker is
+// a separate program so that a change to it relinks and compiles
+// nothing, and a change to the compiler leaves the linker's steps be.
+const base = @import("./base.mlx")
+const tokens = @import("./tokens.mlx")
+const names = @import("./names.mlx")
+const types = @import("./types.mlx")
+const ast = @import("./ast.mlx")
+const x86 = @import("./x86.mlx")
+const gen = @import("./gen.mlx")
+const genstmt = @import("./genstmt.mlx")
+const state = @import("./state.mlx")
+const encoder = @import("../../compiler/selfhost/backend/x86_64/encoder.mlx")
+const heap = @import("std.heap")
+const source = @import("../../compiler/selfhost/source.mlx")
+const relocatable = @import("../../compiler/selfhost/object/relocatable.mlx")
+const unit = @import("../../compiler/selfhost/object/unit.mlx")
+const std = @import("std")
+const vector_module = @import("../../std/bootstrap/vector.mlx")
+const table = @import("./table.mlx")
+
+const MAX_UNITS: usize = 4096
+
+var units: usize = 0
+var unitCount: usize = 0
+// Long double globals whose initializers are computed at start: cells
+// of (variable, offset, expression, next).
+var lateInitializers: usize = 0
+// By name id: the object a name with external linkage stands for.
+var definitions: usize = 0
+var initName: u32 = 0
+// The libraries the program needs (DT_NEEDED): NUL-ended names' addresses.
+var libraries: usize = 0 // (per run)
+var libraryCount: usize = 0 // (per run)
+// The objects and archives of the command line (NUL-ended paths).
+var inputs: usize = 0 // (per run)
+var inputCount: usize = 0 // (per run)
+// The program interpreter the executable names (NUL-ended), 0 for the
+// system's.
+var interpreter: usize = 0 // (per run)
+// The unit's thread-local variables laid out (.tdata): its size and
+// alignment so far.
+var tlsSize: usize = 0
+var tlsAlignment: usize = 1
+
+pub fn init() -> void {
+    units = base.alloc(MAX_UNITS * 8)
+    definitions = base.alloc(base.MAX_NAMES * 8)
+    initName = base.intern("__mlxcc_init_unit")
+}
+
+// The link's inputs, which the command line gives: the run's own (in the
+// side memory, base.beginSide).
+pub fn initInputs() -> void {
+    libraries = base.alloc(64 * 8)
+    libraryCount = 0
+    inputs = base.alloc(MAX_UNITS * 8)
+    inputCount = 0
+    addNeeded("libc.so.6")
+}
+
+// Forgets the units compiled so far (the next object of a -c run).
+pub fn resetUnits() -> void {
+    unitCount = 0
+    lateInitializers = 0
+    globalInits = 0
+    globalInitsTail = 0
+    tlsSize = 0
+    tlsAlignment = 1
+    x86.tlsReferences = 0
+    var index: usize = 0
+    while index < base.MAX_NAMES {
+        base.putWord(definitions + index * 8, 0)
+        index += 1
+    }
+}
+
+fn addNeeded(soname: []const u8) -> void {
+    var index: usize = 0
+    while index < libraryCount {
+        const known = base.getWord(libraries + index * 8)
+        if base.same(base.bytes(known, base.cLength(known)), soname) { return }
+        index += 1
+    }
+    if libraryCount >= 64 { base.fatal("too many libraries") }
+    base.putWord(libraries + libraryCount * 8, base.keep(soname))
+    libraryCount += 1
+}
+
+// --dynamic-linker PATH: the program starts on that loader (mlxlibc's
+// libmlxc.so.1 on MLX/Linux) rather than the system's.
+pub fn setInterpreter(path: []const u8) -> void {
+    interpreter = base.keep(path)
+}
+
+// -lNAME. libpthread, libdl and librt are part of libc; libm is
+// libm.so.6; others are libNAME.so.
+pub fn addLibrary(name: []const u8) -> void {
+    // -l:NAME: the library of that file name (`-l:libicuuc.so.74`).
+    if name.length > 1 && name[0] == 58 {
+        addNeeded(name[1..name.length])
+        return
+    }
+    // (libatomic's few functions are inline here.)
+    if base.same(name, "atomic") { return }
+    if base.same(name, "c") || base.same(name, "pthread") || base.same(name, "dl") || base.same(name, "rt") { return }
+    if base.same(name, "m") {
+        addNeeded("libm.so.6")
+        return
+    }
+    addNeeded(base.join(base.join("lib", name), ".so"))
+}
+
+pub fn hasInputs() -> bool { return inputCount > 0 }
+
+// A shared library named by its path (`/usr/lib/libicuuc.so.74`): the
+// program needs it by its file name.
+pub fn addSharedInput(path: []const u8) -> void {
+    var start: usize = 0
+    var index: usize = 0
+    while index < path.length {
+        if path[index] == 47 { start = index + 1 }
+        index += 1
+    }
+    addNeeded(path[start..path.length])
+}
+
+// An object or archive to link with the program.
+pub fn addInput(path: []const u8) -> void {
+    if inputCount >= MAX_UNITS { base.fatal("too many files") }
+    base.putWord(inputs + inputCount * 8, base.keep(path))
+    inputCount += 1
+}
+
+pub fn addLateInitializer(variable: usize, offset: i64, expression: usize) -> void {
+    const cell = base.alloc(32)
+    base.putWord(cell, variable)
+    base.putWord(cell + 8, @bitCast(u64, offset))
+    base.putWord(cell + 16, expression)
+    base.putWord(cell + 24, lateInitializers)
+    lateInitializers = cell
+}
+
+// Whether part of the global `variable` is computed when the program
+// starts (its initial bytes are not all its value).
+pub fn hasLateInitializer(variable: usize) -> bool {
+    var cell = lateInitializers
+    while cell != 0 {
+        if base.getWord(cell) == variable { return true }
+        cell = base.getWord(cell + 24)
+    }
+    return false
+}
+
+// C++: the constructions of global objects, run when the program
+// starts (cells of expression and next, in order).
+var globalInits: usize = 0
+var globalInitsTail: usize = 0
+
+pub fn addGlobalInit(expression: usize) -> void {
+    const cell = base.alloc(16)
+    base.putWord(cell, expression)
+    if globalInits == 0 { globalInits = cell } else { base.putWord(globalInitsTail + 8, cell) }
+    globalInitsTail = cell
+}
+
+pub fn addUnit(globals: usize) -> void {
+    if unitCount >= MAX_UNITS { base.fatal("too many files") }
+    base.putWord(units + unitCount * 8, globals)
+    unitCount += 1
+}
+
+fn definitionOf(name: u32) -> usize { return base.getWord(definitions + @intCast(usize, name) * 8) }
+
+fn setDefinition(name: u32, o: usize) -> void { base.putWord(definitions + @intCast(usize, name) * 8, o) }
+
+fn isInitialized(o: usize) -> bool {
+    return ast.obj(o).*.initData != 0 && !ast.obj(o).*.isTentative
+}
+
+// Chooses the definition of every name with external linkage.
+fn linkNames() -> void {
+    var unit: usize = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            const obj = ast.obj(o)
+            if !obj.*.isStatic && obj.*.name != 0 && obj.*.isDefinition {
+                // By the name the linker knows: a C++ overload is its own.
+                const key = gen.linkNameOf(o)
+                const known = definitionOf(key)
+                if known == 0 {
+                    setDefinition(key, o)
+                } else if known != o && (obj.*.isWeak || ast.obj(known).*.isWeak) {
+                    // A weak definition (an inline function, a vtable) in
+                    // several files: one of them, a strong one first.
+                    if ast.obj(known).*.isWeak && !obj.*.isWeak { setDefinition(key, o) }
+                } else if known != o {
+                    if obj.*.isFunction != ast.obj(known).*.isFunction {
+                        base.fatal(base.join("a function and a variable share the name ", base.nameOf(obj.*.name)))
+                    }
+                    if obj.*.isFunction || (isInitialized(o) && isInitialized(known)) {
+                        base.fatal(base.join("multiple definitions of ", base.nameOf(obj.*.name)))
+                    }
+                    // An initialized definition wins over tentative ones; of
+                    // tentative ones the larger.
+                    if isInitialized(o) || (!isInitialized(known) && types.size(obj.*.ty) > types.size(ast.obj(known).*.ty)) {
+                        setDefinition(key, o)
+                    }
+                }
+            }
+            o = obj.*.next
+        }
+        unit += 1
+    }
+    unit = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            const obj = ast.obj(o)
+            if obj.*.isStatic || obj.*.name == 0 {
+                obj.*.definition = if obj.*.isDefinition { o } else { 0 }
+                if obj.*.isFunction && obj.*.isDefinition && obj.*.name != 0 {
+                    // A static function's symbol, unique among the files.
+                    const unique = base.join(base.join(base.nameOf(obj.*.symbol), "."), base.decimal(@intCast(u64, unit)))
+                    obj.*.symbol = base.intern(unique)
+                }
+            } else {
+                obj.*.definition = definitionOf(gen.linkNameOf(o))
+            }
+            o = obj.*.next
+        }
+        unit += 1
+    }
+}
+
+// Places every defined variable in the data area (the vtables and VTTs
+// later, those the object refers to: genFunctions).
+fn placeData() -> void {
+    var unit: usize = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            const obj = ast.obj(o)
+            if !obj.*.isFunction && obj.*.isDefinition && obj.*.definition == o && !obj.*.placed && !obj.*.isTable {
+                placeVariable(o)
+            }
+            o = obj.*.next
+        }
+        unit += 1
+    }
+}
+
+// Places the defined variable O in the data area (or the TLS image).
+fn placeVariable(o: usize) -> void {
+    const obj = ast.obj(o)
+    var size = types.size(obj.*.ty)
+    if types.at(obj.*.ty).*.incomplete {
+        // `int a[];` never completed: one element (C11 6.9.2).
+        if types.kind(obj.*.ty) != types.ARRAY { base.errorAt(if obj.*.file != 0 { obj.*.file } else { state.file() }, 0, base.join("a variable has an incomplete type: ", base.nameOf(if obj.*.linkName != 0 { obj.*.linkName } else { obj.*.name }))) }
+        size = types.size(types.baseOf(obj.*.ty))
+    }
+    if size == 0 { size = 1 }
+    var alignment = obj.*.alignment
+    if alignment < 1 { alignment = types.alignOf(obj.*.ty) }
+    if alignment < 1 { alignment = 1 }
+    const count: usize = if obj.*.initData != 0 { @intCast(usize, size) } else { 0 }
+    if obj.*.isThreadLocal {
+        // In the TLS image, not the data area.
+        const a = @intCast(usize, alignment)
+        obj.*.dataOffset = (tlsSize + a - 1) / a * a
+        tlsSize = obj.*.dataOffset + @intCast(usize, size)
+        if a > tlsAlignment { tlsAlignment = a }
+        obj.*.placed = true
+        return
+    }
+    if @intCast(usize, alignment) > sectionAlignment { sectionAlignment = @intCast(usize, alignment) }
+    obj.*.dataOffset = x86.reserveInSection(@intCast(usize, size), @intCast(usize, alignment), obj.*.initData, count, DATA_START)
+    obj.*.placed = true
+}
+
+// What the placed variable O's initial bytes hold the addresses of:
+// the functions reached, the vtables and VTTs used.
+fn reachFromData(o: usize) -> void {
+    var r = ast.obj(o).*.relocations
+    while r != 0 {
+        const t = ast.relocation(r).*.target
+        if ast.obj(t).*.isFunction {
+            gen.noteFunctionUsed(t)
+        } else if ast.obj(t).*.isTable {
+            gen.noteTableUsed(t)
+        }
+        r = ast.relocation(r).*.next
+    }
+}
+
+// __mlxcc_init_unit: the long double and wide integer initializers
+// that are not constants alone, computed when the program starts (the
+// linker calls it from __mlxcc_init). False when there are none.
+fn genUnitInit() -> bool {
+    if lateInitializers == 0 && globalInits == 0 { return false }
+    x86.defineSymbol(base.nameAddress(initName), base.nameOf(initName).length)
+    // A frame for the temporaries of the initializers computed here.
+    var bottom: i64 = 0
+    var local = state.initLocals()
+    while local != 0 {
+        bottom += types.size(ast.obj(local).*.ty)
+        bottom = types.alignTo(bottom, 8)
+        ast.obj(local).*.offset = 0 - bottom
+        local = ast.obj(local).*.next
+    }
+    x86.prologue()
+    if bottom > 0 { x86.subtractStack(types.alignTo(bottom, 16)) }
+    var cell = lateInitializers
+    gen.resetDepth()
+    while cell != 0 {
+        const variable = base.getWord(cell)
+        const offset = @bitCast(i64, base.getWord(cell + 8))
+        const expression = base.getWord(cell + 16)
+        gen.genExpression(expression)
+        x86.dataAddress(x86.RDI, ast.obj(variable).*.dataOffset + @intCast(usize, offset))
+        const ty = ast.typeOf(expression)
+        if types.isWide(ty) {
+            gen.copyBytes(types.size(ty))
+        } else {
+            x86.fstpExtended(x86.RDI, 0)
+        }
+        cell = base.getWord(cell + 24)
+    }
+    cell = globalInits
+    while cell != 0 {
+        const expression = base.getWord(cell)
+        gen.genExpression(expression)
+        gen.discard(ast.typeOf(expression))
+        cell = base.getWord(cell + 8)
+    }
+    x86.epilogue()
+    return true
+}
+
+fn genFunctions() -> void {
+    // A reference to a declaration is one to its definition.
+    var unit: usize = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            const obj = ast.obj(o)
+            if obj.*.isFunction && obj.*.isReferenced && obj.*.definition != 0 && obj.*.definition != o { ast.obj(obj.*.definition).*.isReferenced = true }
+            // (An explicit instantiation's function, cpp.instantiateExplicitly.)
+            if obj.*.isFunction && obj.*.reached && obj.*.definition != 0 && obj.*.definition != o { ast.obj(obj.*.definition).*.reached = true }
+            o = obj.*.next
+        }
+        unit += 1
+    }
+    // What the variables placed hold the addresses of is reached.
+    unit = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            if ast.obj(o).*.placed && ast.obj(o).*.definition == o { reachFromData(o) }
+            o = ast.obj(o).*.next
+        }
+        unit += 1
+    }
+    // The functions with external linkage are made, and what the code made
+    // refers to (gen.noteFunctionUsed, noteTableUsed), again while it
+    // refers to functions not made or tables not placed yet: static and
+    // inline (weak) functions only when reached so, as C++ has the inline
+    // functions of headers made only where they are used (an inline
+    // function only named by another one never made is left out).
+    gen.lateFunctions = true
+    while gen.lateFunctions {
+        gen.lateFunctions = false
+        unit = 0
+        while unit < unitCount {
+            var o = base.getWord(units + unit * 8)
+            while o != 0 {
+                const obj = ast.obj(o)
+                if obj.*.isFunction && obj.*.isDefinition && obj.*.definition == o && !obj.*.generated {
+                    if (!obj.*.isStatic && !obj.*.isWeak) || obj.*.reached {
+                        obj.*.generated = true
+                        if obj.*.entryOf != 0 { genstmt.genEntry(o) } else { genstmt.genFunction(o) }
+                    }
+                } else if obj.*.isTable && obj.*.isDefinition && obj.*.definition == o && !obj.*.placed && obj.*.reached {
+                    placeVariable(o)
+                    reachFromData(o)
+                }
+                o = obj.*.next
+            }
+            unit += 1
+        }
+    }
+    if base.stats { showOwners() }
+}
+
+// (MLX_CC_STATS: the node bytes of function bodies by what became of
+// the function.)
+fn showOwners() -> void {
+    var bytes: [8]u64 = undefined
+    var counts: [8]u64 = undefined
+    var lateBytes: [4]u64 = undefined
+    var lateCounts: [4]u64 = undefined
+    var k: usize = 0
+    while k < 8 {
+        bytes[k] = 0
+        counts[k] = 0
+        if k < 4 {
+            lateBytes[k] = 0
+            lateCounts[k] = 0
+        }
+        k += 1
+    }
+    var unit: usize = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            const obj = ast.obj(o)
+            const b = table.get(&ast.ownerBytes, o)
+            if obj.*.isFunction && b != 0 {
+                var c: usize = 0
+                if obj.*.generated {
+                    c = if !obj.*.isStatic && !obj.*.isWeak { 0 } else { 1 }
+                } else {
+                    c = if obj.*.isStatic || obj.*.isWeak { 2 } else { 3 }
+                }
+                bytes[c] += @intCast(u64, b)
+                counts[c] += 1
+                if obj.*.isConstexpr {
+                    bytes[4] += @intCast(u64, b)
+                    counts[4] += 1
+                }
+                if obj.*.isInline {
+                    bytes[5 + (if obj.*.generated { 0 } else { 1 })] += @intCast(u64, b)
+                    counts[5 + (if obj.*.generated { 0 } else { 1 })] += 1
+                }
+                if !obj.*.generated {
+                    // Not made: read in place (member or not), a function
+                    // template's instance, a pended member.
+                    const late = table.get(&ast.lateKind, o)
+                    const lk = if late == 0 { (if obj.*.classType != 0 { 0 } else { 1 }) } else { late + 1 }
+                    lateBytes[lk] += @intCast(u64, b)
+                    lateCounts[lk] += 1
+                }
+                bytes[7] += @intCast(u64, b)
+                counts[7] += 1
+            }
+            o = obj.*.next
+        }
+        unit += 1
+    }
+    var total: u64 = 0
+    var slot: usize = 0
+    while slot < ast.ownerBytes.capacity {
+        if base.getWord(ast.ownerBytes.slots + slot * 16) != 0 { total += @intCast(u64, base.getWord(ast.ownerBytes.slots + slot * 16 + 8)) }
+        slot += 1
+    }
+    base.say("function body nodes, all owners: ")
+    base.sayNumber(@intCast(u64, ast.ownerBytes.count))
+    base.say(" ")
+    base.sayNumber(total)
+    base.say("\n")
+    k = 0
+    while k < 8 {
+        base.say(if k == 0 { "  external, made " } else if k == 1 { "  static/weak, made " } else if k == 2 { "  static/weak, not made " } else if k == 3 { "  other, not made " } else if k == 4 { "  (constexpr) " } else if k == 5 { "  (inline, made) " } else if k == 6 { "  (inline, not made) " } else { "  on the lists " })
+        base.sayNumber(counts[k])
+        base.say(" ")
+        base.sayNumber(bytes[k])
+        base.say("\n")
+        k += 1
+    }
+    k = 0
+    while k < 4 {
+        base.say(if k == 0 { "  not made: member read in place " } else if k == 1 { "  not made: other read in place " } else if k == 2 { "  not made: function template instance " } else { "  not made: pended member " })
+        base.sayNumber(lateCounts[k])
+        base.say(" ")
+        base.sayNumber(lateBytes[k])
+        base.say("\n")
+        k += 1
+    }
+    // The largest bodies.
+    var shown: usize = 0
+    var limit: usize = 18446744073709551615
+    while shown < 25 {
+        var best: usize = 0
+        var bestBytes: usize = 0
+        var slot: usize = 0
+        while slot < ast.ownerBytes.capacity {
+            const key = base.getWord(ast.ownerBytes.slots + slot * 16)
+            const value = base.getWord(ast.ownerBytes.slots + slot * 16 + 8)
+            if key != 0 && value > bestBytes && value < limit {
+                best = key - 1
+                bestBytes = value
+            }
+            slot += 1
+        }
+        if best == 0 { break }
+        const bo = ast.obj(best)
+        base.say("    ")
+        base.sayNumber(@intCast(u64, bestBytes))
+        base.say(if bo.*.generated { " made " } else { " not made " })
+        base.say(if bo.*.isConstexpr { "constexpr " } else { "" })
+        base.say(base.nameOf(if bo.*.linkName != 0 { bo.*.linkName } else { bo.*.name }))
+        base.say("\n")
+        limit = bestBytes
+        shown += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The object
+
+// The largest alignment of the data (`alignas(16384)`): the data
+// section's own.
+var sectionAlignment: usize = 16
+
+// The data area's first DATA_SIZE bytes are the Mlx runtime's words,
+// unused by C: the object's .data starts after them.
+const DATA_START: usize = encoder.DATA_SIZE
+
+fn bindingOf(obj: *ast.Obj) -> u8 {
+    if obj.*.isStatic { return relocatable.LOCAL }
+    if obj.*.isWeak { return relocatable.WEAK }
+    return relocatable.GLOBAL
+}
+
+// The index of the undefined symbol `name` in the object, added on
+// first use.
+fn undefinedSymbol(object: *relocatable.Object, name: u32) -> usize {
+    const text = base.nameOf(name)
+    const found = relocatable.findSymbol(object, base.pointer(base.nameAddress(name)), text.length)
+    // (Or defined here with a name the linker sees: a weak variable.)
+    if found != relocatable.NONE && (relocatable.symbolAt(object, found).*.section == relocatable.NONE || relocatable.symbolAt(object, found).*.binding != relocatable.LOCAL) { return found }
+    return relocatable.addSymbol(object, base.pointer(base.nameAddress(name)), text.length, relocatable.GLOBAL, relocatable.NOTYPE, relocatable.NONE, 0, 0)
+}
+
+fn newObject() -> *relocatable.Object {
+    const allocator = heap.allocator()
+    var object: *relocatable.Object = undefined
+    unsafe { object = @ptrFromInt(*relocatable.Object, base.alloc(@sizeOf(relocatable.Object))) }
+    relocatable.initAt(object, allocator, base.pointer(base.keep("unit")), 4)
+    return object
+}
+
+// Generates the units' code and data and describes them as a
+// relocatable object: the symbols of the functions and variables
+// defined (static ones local), of the names needed (undefined), the
+// references of the code to those names and to the data, the addresses
+// the data holds, and the unit's init function.
+pub fn buildObject() -> *relocatable.Object {
+    linkNames()
+    placeData()
+    const has_init = genUnitInit()
+    genFunctions()
+    const enc = x86.enc()
+    // (Every function's symbol is looked up below: by hash.)
+    const indexed = encoder.indexSymbols(enc)
+    const object = newObject()
+    const text = relocatable.addSection(object, relocatable.TEXT, base.pointer(@intFromPtr(enc.*.buf.*.items)), encoder.pos(enc), 16)
+    // The data area's image, less the runtime's words.
+    const area = encoder.dataSize(enc)
+    const image = base.alloc(area + 8)
+    var image_bytes: [*]u8 = undefined
+    unsafe { image_bytes = @ptrFromInt([*]u8, image) }
+    encoder.fillData(enc, image_bytes)
+    const data = relocatable.addSection(object, relocatable.DATA, base.pointer(image + DATA_START), area - DATA_START, if sectionAlignment > 16 { sectionAlignment } else { 16 })
+    const data_symbol = relocatable.addSymbol(object, base.pointer(base.keep("")), 0, relocatable.LOCAL, relocatable.SECTION, data, 0, 0)
+    const text_symbol = relocatable.addSymbol(object, base.pointer(base.keep("")), 0, relocatable.LOCAL, relocatable.SECTION, text, 0, 0)
+    // The thread-local variables' initial bytes.
+    var tdata: usize = relocatable.NONE
+    var tdata_symbol: usize = relocatable.NONE
+    if tlsSize > 0 {
+        const tls_image = base.alloc(tlsSize)
+        var unit_index: usize = 0
+        while unit_index < unitCount {
+            var v = base.getWord(units + unit_index * 8)
+            while v != 0 {
+                const obj = ast.obj(v)
+                if obj.*.isThreadLocal && obj.*.placed && obj.*.definition == v && obj.*.initData != 0 {
+                    if obj.*.relocations != 0 { base.errorAt(if obj.*.file != 0 { obj.*.file } else { state.file() }, 0, "a thread-local variable initialized with an address") }
+                    base.copy(tls_image + obj.*.dataOffset, obj.*.initData, @intCast(usize, types.size(obj.*.ty)))
+                }
+                v = obj.*.next
+            }
+            unit_index += 1
+        }
+        tdata = relocatable.addSection(object, relocatable.TDATA, base.pointer(tls_image), tlsSize, tlsAlignment)
+        tdata_symbol = relocatable.addSymbol(object, base.pointer(base.keep("")), 0, relocatable.LOCAL, relocatable.SECTION, tdata, 0, 0)
+    }
+    // The functions and variables defined.
+    var unit: usize = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            const obj = ast.obj(o)
+            obj.*.objectSymbol = 0
+            if obj.*.isDefinition && obj.*.definition == o && obj.*.name != 0 {
+                // By the name the linker knows (C++: the mangled one).
+                const link_name = gen.linkNameOf(o)
+                const name = base.nameOf(link_name)
+                if obj.*.isFunction {
+                    const found = encoder.findSymbol(enc, base.pointer(base.nameAddress(obj.*.symbol)), base.nameOf(obj.*.symbol).length)
+                    if found.0 {
+                        obj.*.objectSymbol = 1 + relocatable.addSymbol(object, base.pointer(base.nameAddress(link_name)), name.length, bindingOf(obj), relocatable.FUNC, text, found.1, 0)
+                        addLocation(object, text, found.1, obj.*.token)
+                    }
+                } else if obj.*.placed && obj.*.isThreadLocal {
+                    obj.*.objectSymbol = 1 + relocatable.addSymbol(object, base.pointer(base.nameAddress(link_name)), name.length, bindingOf(obj), relocatable.TLS, tdata, obj.*.dataOffset, @intCast(usize, types.size(obj.*.ty)))
+                } else if obj.*.placed {
+                    obj.*.objectSymbol = 1 + relocatable.addSymbol(object, base.pointer(base.nameAddress(link_name)), name.length, bindingOf(obj), relocatable.OBJECT, data, obj.*.dataOffset - DATA_START, @intCast(usize, types.size(obj.*.ty)))
+                }
+            }
+            o = obj.*.next
+        }
+        unit += 1
+    }
+    // The code's references: to a function of the object resolved, to a
+    // name of another object a relocation, to the data a relocation
+    // against the section.
+    var index: usize = 0
+    while index < encoder.fixupCount(enc) {
+        var fixup: *encoder.Fixup = undefined
+        unsafe { fixup = @ptrCast(*encoder.Fixup, vector_at(enc.*.fixups, index)) }
+        const kind = fixup.*.kind
+        if kind == encoder.FixupKind.call_rel32 || kind == encoder.FixupKind.jmp_rel32 || kind == encoder.FixupKind.lea_rip_rel32 {
+            const found = encoder.findSymbol(enc, fixup.*.targetPointer, fixup.*.targetLength)
+            if found.0 {
+                encoder.patch32(enc, fixup.*.patchOffset, @intCast(i32, @intCast(i64, found.1) - @intCast(i64, fixup.*.patchOffset + 4)))
+            } else {
+                const symbol = undefinedSymbol(object, base.intern(fixup.*.targetPointer[0..fixup.*.targetLength]))
+                relocatable.addRelocation(object, text, fixup.*.patchOffset, if kind == encoder.FixupKind.lea_rip_rel32 { relocatable.R_PC32 } else { relocatable.R_PLT32 }, symbol, -4)
+            }
+        } else if kind == encoder.FixupKind.data_rel32 {
+            relocatable.addRelocation(object, text, fixup.*.patchOffset, relocatable.R_PC32, data_symbol, @intCast(i64, fixup.*.targetHash - DATA_START) - 4)
+        } else {
+            base.fatal("internal error: a GOT reference in the object")
+        }
+        index += 1
+    }
+    // The thread-local references: offsets from the thread pointer.
+    var reference = x86.tlsReferences
+    while reference != 0 {
+        const place = base.getWord(reference)
+        const variable = base.getWord(reference + 8)
+        const d = ast.obj(variable).*.definition
+        if d != 0 && ast.obj(d).*.objectSymbol != 0 {
+            relocatable.addRelocation(object, text, place, relocatable.R_TPOFF32, ast.obj(d).*.objectSymbol - 1, 0)
+        } else if d != 0 && ast.obj(d).*.placed && ast.obj(d).*.isThreadLocal {
+            relocatable.addRelocation(object, text, place, relocatable.R_TPOFF32, tdata_symbol, @intCast(i64, ast.obj(d).*.dataOffset))
+        } else {
+            const symbol = undefinedSymbol(object, gen.linkNameOf(variable))
+            relocatable.symbolAt(object, symbol).*.kind = relocatable.TLS
+            relocatable.addRelocation(object, text, place, relocatable.R_TPOFF32, symbol, 0)
+        }
+        reference = base.getWord(reference + 16)
+    }
+    // The addresses the globals hold.
+    unit = 0
+    while unit < unitCount {
+        var o = base.getWord(units + unit * 8)
+        while o != 0 {
+            const obj = ast.obj(o)
+            if obj.*.placed && obj.*.definition == o && !obj.*.isThreadLocal {
+                var r = obj.*.relocations
+                while r != 0 {
+                    const rel = ast.relocation(r)
+                    const t = ast.obj(rel.*.target)
+                    const d = t.*.definition
+                    var symbol: usize = relocatable.NONE
+                    var addend = rel.*.addend
+                    if t.*.labelAddress != 0 {
+                        // `&&label`: the place in the code.
+                        const name = x86.label(ast.node(t.*.labelAddress).*.label)
+                        const found = encoder.findSymbol(enc, base.pointer(name.0), name.1)
+                        if !found.0 { base.fatal("internal error: a label's address outside the code") }
+                        symbol = text_symbol
+                        addend += @intCast(i64, found.1)
+                    } else if d != 0 && ast.obj(d).*.objectSymbol != 0 {
+                        symbol = ast.obj(d).*.objectSymbol - 1
+                    } else if d != 0 && !t.*.isFunction && ast.obj(d).*.placed {
+                        // A static or literal without a symbol: the data.
+                        symbol = data_symbol
+                        addend += @intCast(i64, ast.obj(d).*.dataOffset - DATA_START)
+                    } else {
+                        symbol = undefinedSymbol(object, gen.linkNameOf(rel.*.target))
+                    }
+                    relocatable.addRelocation(object, data, obj.*.dataOffset - DATA_START + @intCast(usize, rel.*.offset), relocatable.R_64, symbol, addend)
+                    r = rel.*.next
+                }
+            }
+            o = obj.*.next
+        }
+        unit += 1
+    }
+    // The unit's init function, listed in .init_array.
+    if has_init {
+        const found = encoder.findSymbol(enc, base.pointer(base.nameAddress(initName)), base.nameOf(initName).length)
+        const init_symbol = relocatable.addSymbol(object, base.pointer(base.nameAddress(initName)), base.nameOf(initName).length, relocatable.LOCAL, relocatable.FUNC, text, found.1, 0)
+        const entry = base.alloc(8)
+        const init = relocatable.addSection(object, relocatable.INIT, base.pointer(entry), 8, 8)
+        relocatable.addRelocation(object, init, 0, relocatable.R_64, init_symbol, 0)
+    }
+    return object
+}
+
+fn vector_at(v: *vector_module.Vector, index: usize) -> [*]u8 {
+    return vector_module.Vector.at(v.*, index)
+}
+
+
+// -c: writes the object to `output`.
+pub fn writeObject(output: []const u8) -> void {
+    const object = buildObject()
+    if !relocatable.write(object, base.pointer(base.keep(output))) {
+        base.say("mlx-cc: cannot write ")
+        base.say(output)
+        base.say("\n")
+        base.exit(1)
+    }
+}
+
+// Links the object with the inputs into the program `output`: runs
+// mlx-ld (compiler/ld/main.mlx) in this process's place, as cc runs ld,
+// on the object handed over as it is in memory (unit.mlx, in a memfd:
+// no file to clean up) followed by the objects and archives of the
+// command line in order, every library the program needs as -l:SONAME,
+// --dynamic-linker, -s and -Map. mlx-ld is $MLX_LD, else the one beside
+// this program. Does not return.
+pub fn write(output: []const u8, environment: [*][*]const u8) -> void {
+    const object = buildObject()
+    const linker = linkerPath(environment)
+    const made = unit.bytes(object, heap.allocator())
+    if made.0 == null { base.fatal("out of memory handing the unit to mlx-ld") }
+    const descriptor = std.linux.syscall2(SYS_memfd_create, base.keep("mlx-cc-unit"), 0)
+    if descriptor < 0 { base.fatal("cannot make the unit's memory file for mlx-ld") }
+    const file = std.fs.File.{ .descriptor = descriptor }
+    // (The bytes taken apart first: `made.0.?[...]` is read only by a
+    // newer compiler than the one these sources build.)
+    const madeBytes = made.0
+    if !std.fs.writeAll(file, madeBytes.?[0..made.1]) { base.fatal("cannot write the unit for mlx-ld") }
+    const unitPath = base.join("/proc/self/fd/", base.decimal(@intCast(u64, descriptor)))
+    const words = base.alloc((inputCount + libraryCount + 16) * 8)
+    var count: usize = 0
+    base.putWord(words + count * 8, base.keep(linker))
+    count += 1
+    base.putWord(words + count * 8, base.keep("-o"))
+    base.putWord(words + count * 8 + 8, base.keep(output))
+    count += 2
+    if interpreter != 0 {
+        base.putWord(words + count * 8, base.keep("--dynamic-linker"))
+        base.putWord(words + count * 8 + 8, interpreter)
+        count += 2
+    }
+    if stripped {
+        base.putWord(words + count * 8, base.keep("-s"))
+        count += 1
+    }
+    if mapPath != 0 {
+        base.putWord(words + count * 8, base.keep("-Map"))
+        base.putWord(words + count * 8 + 8, mapPath)
+        count += 2
+    }
+    base.putWord(words + count * 8, base.keep(unitPath))
+    count += 1
+    var index: usize = 0
+    while index < inputCount {
+        base.putWord(words + count * 8, base.getWord(inputs + index * 8))
+        count += 1
+        index += 1
+    }
+    // (libc.so.6, the first, mlx-ld needs by itself.)
+    index = 1
+    while index < libraryCount {
+        const soname = base.getWord(libraries + index * 8)
+        base.putWord(words + count * 8, base.keep(base.join("-l:", base.bytes(soname, base.cLength(soname)))))
+        count += 1
+        index += 1
+    }
+    base.putWord(words + count * 8, 0)
+    _ = std.linux.syscall3(std.linux.SYS_execve, base.getWord(words), words, @intFromPtr(environment))
+    base.say("mlx-cc: cannot run the linker ")
+    base.say(linker)
+    base.say(" (MLX_LD, or mlx-ld beside mlx-cc)\n")
+    base.exit(1)
+}
+
+const SYS_memfd_create: usize = 319
+const SYS_readlink: usize = 89
+
+// The linker: $MLX_LD, else mlx-ld beside this program, else mlx-ld
+// along PATH (execve then fails with the message above).
+fn linkerPath(environment: [*][*]const u8) -> []const u8 {
+    const variable = std.process.environmentFrom(environment, "MLX_LD")
+    if variable != null { return std.string.asSlice(variable.?) }
+    var buffer: [4096]u8 = undefined
+    const length = std.linux.syscall3(SYS_readlink, @intFromPtr("/proc/self/exe"), @intFromPtr(&buffer), 4095)
+    if length > 0 {
+        var view: [*]const u8 = undefined
+        unsafe { view = @ptrCast([*]const u8, &buffer) }
+        const exe = base.bytes(base.keep(view[0..@intCast(usize, length)]), @intCast(usize, length))
+        var end = exe.length
+        while end > 0 && exe[end - 1] != 47 { end -= 1 }
+        return base.join(exe[0..end], "mlx-ld")
+    }
+    return "mlx-ld"
+}
+
+// Where a function was defined: a local symbol at the function's start
+// named `@at PATH:LINE` (no C or C++ name has a space), which the linker
+// makes the program's line table of (link.mlx, .mlx_lines: the crash
+// report says the function's file and line) and leaves out of
+// everything else.
+const LOCATION_PREFIX: []const u8 = "@at "
+
+fn addLocation(object: *relocatable.Object, text: usize, offset: usize, token: usize) -> void {
+    if token == 0 { return }
+    const t = tokens.at(token)
+    if t.*.file == 0 { return }
+    const path = base.nameOf(base.fileName(@intCast(u32, t.*.file)))
+    const located = base.join(base.join(LOCATION_PREFIX, path), base.join(":", base.decimal(@intCast(u64, t.*.line))))
+    const ignored = relocatable.addSymbol(object, located.pointer, located.length, relocatable.LOCAL, relocatable.NOTYPE, text, offset, 0)
+}
+
+// -Wl,-Map=FILE: the program's functions by where they are, a line
+// each (the offset in the code in hex, which _start, the entry point,
+// begins; the name).
+var mapPath: usize = 0 // (per run)
+pub fn setMapPath(path: []const u8) -> void { mapPath = base.keep(path) }
+
+// -s, --strip-all: the program without its symbol table and line table.
+var stripped = false // (per run)
+pub fn setStripped() -> void { stripped = true }
+
+// Writes `length` bytes at `address` to the file `path`.
+pub fn writeBytes(path: []const u8, address: usize, length: usize) -> bool {
+    return relocatable.writeFile(base.pointer(base.keep(path)), base.pointer(address), length)
+}
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepState() -> void {
+    base.keepState(@intFromPtr(&units), @sizeOf(@typeOf(units)))
+    base.keepState(@intFromPtr(&unitCount), @sizeOf(@typeOf(unitCount)))
+    base.keepState(@intFromPtr(&lateInitializers), @sizeOf(@typeOf(lateInitializers)))
+    base.keepState(@intFromPtr(&definitions), @sizeOf(@typeOf(definitions)))
+    base.keepState(@intFromPtr(&initName), @sizeOf(@typeOf(initName)))
+    base.keepState(@intFromPtr(&tlsSize), @sizeOf(@typeOf(tlsSize)))
+    base.keepState(@intFromPtr(&tlsAlignment), @sizeOf(@typeOf(tlsAlignment)))
+    base.keepState(@intFromPtr(&globalInits), @sizeOf(@typeOf(globalInits)))
+    base.keepState(@intFromPtr(&globalInitsTail), @sizeOf(@typeOf(globalInitsTail)))
+    base.keepState(@intFromPtr(&sectionAlignment), @sizeOf(@typeOf(sectionAlignment)))
+}
+// --- end of prefix snapshot state ---

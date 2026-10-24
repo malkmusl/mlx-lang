@@ -1,0 +1,611 @@
+// std.webp.encode: a lossless (VP8L) WebP encoder. Pictures are coded with
+// the subtract-green transform, backward references to the pixel on the
+// left and the one above (runs and repeated rows), and five Huffman codes
+// built from the picture's own statistics (lengths limited to 15 bits,
+// coded with the code-length code and runs of zeros). It is not libwebp's
+// encoder: its files are larger than libwebp's best, but every decoder
+// reads them as the exact pixels given.
+//
+//     var out: encode.Bytes = undefined
+//     encode.initBytes(&out, allocator)
+//     if encode.encodeFile(&out, argb, width, height, stride) { ... out.data, out.size ... }
+//     encode.freeBytes(&out)
+//
+// The pixels are 32-bit ARGB words (alpha in the top byte), STRIDE words
+// a row, as WebPPicture's argb plane holds them.
+const io = @import("./io.mlx")
+
+pub const Allocator = io.Allocator
+
+inline fn get8(address: usize) -> u64 { return io.get8(address) }
+inline fn put8(address: usize, value: u64) -> void { io.put8(address, value) }
+
+inline fn get32(address: usize) -> u64 { return io.get32(address) }
+inline fn put32(address: usize, value: u64) -> void { io.put32(address, value) }
+
+const NUM_LITERAL_CODES: usize = 256
+const NUM_LENGTH_CODES: usize = 24
+const NUM_DISTANCE_CODES: usize = 40
+const MAX_LENGTH: usize = 4096
+const MIN_MATCH: usize = 3
+
+// A growing block of bytes.
+pub const Bytes = struct {
+    allocator: Allocator
+    data: usize
+    size: usize
+    capacity: usize
+    failed: bool
+}
+
+pub fn initBytes(b: *Bytes, allocator: Allocator) -> void {
+    io.zero(@intFromPtr(b), @sizeOf(Bytes))
+    b.*.allocator = allocator
+}
+
+pub fn freeBytes(b: *Bytes) -> void {
+    io.release(b.*.allocator, b.*.data, b.*.capacity)
+    b.*.data = 0
+    b.*.size = 0
+    b.*.capacity = 0
+}
+
+// Room for COUNT more bytes; false (and `failed`) when there is no memory.
+pub fn reserve(b: *Bytes, count: usize) -> bool {
+    if b.*.failed { return false }
+    if b.*.size + count <= b.*.capacity { return true }
+    var capacity = b.*.capacity * 2
+    if capacity < 256 { capacity = 256 }
+    while capacity < b.*.size + count { capacity = capacity * 2 }
+    const memory = io.allocate(b.*.allocator, capacity)
+    if memory == 0 {
+        b.*.failed = true
+        return false
+    }
+    io.copy(memory, b.*.data, b.*.size)
+    io.release(b.*.allocator, b.*.data, b.*.capacity)
+    b.*.data = memory
+    b.*.capacity = capacity
+    return true
+}
+
+pub fn appendBytes(b: *Bytes, source: usize, count: usize) -> void {
+    if !reserve(b, count) { return }
+    io.copy(b.*.data + b.*.size, source, count)
+    b.*.size += count
+}
+
+pub fn appendByte(b: *Bytes, value: u64) -> void {
+    if !reserve(b, 1) { return }
+    put8(b.*.data + b.*.size, value)
+    b.*.size += 1
+}
+
+pub fn appendLE32(b: *Bytes, value: u64) -> void {
+    appendByte(b, value)
+    appendByte(b, value >> 8)
+    appendByte(b, value >> 16)
+    appendByte(b, value >> 24)
+}
+
+pub fn appendTag(b: *Bytes, tag: []const u8) -> void {
+    appendByte(b, @intCast(u64, tag[0]))
+    appendByte(b, @intCast(u64, tag[1]))
+    appendByte(b, @intCast(u64, tag[2]))
+    appendByte(b, @intCast(u64, tag[3]))
+}
+
+// ---------------------------------------------------------------------------
+// Bits, least significant first
+
+const BitWriter = struct {
+    out: *Bytes
+    bits: u64
+    used: u64
+}
+
+fn putBits(w: *BitWriter, value: u64, count: u64) -> void {
+    var v = value
+    var n = count
+    while n > 0 {
+        var take = n
+        if take > 32 { take = 32 }
+        w.*.bits = w.*.bits | ((v & ((@intCast(u64, 1) << take) - 1)) << w.*.used)
+        w.*.used += take
+        v = v >> take
+        n -= take
+        while w.*.used >= 8 {
+            appendByte(w.*.out, w.*.bits & 0xff)
+            w.*.bits = w.*.bits >> 8
+            w.*.used -= 8
+        }
+    }
+}
+
+fn flushBits(w: *BitWriter) -> void {
+    if w.*.used > 0 { appendByte(w.*.out, w.*.bits & 0xff) }
+    w.*.bits = 0
+    w.*.used = 0
+}
+
+// ---------------------------------------------------------------------------
+// Huffman codes
+
+// A code of up to 280 symbols: each symbol's count, then its length and
+// (bit-reversed, to go out least significant first) code; `single` when
+// one symbol at most is used (it then takes no bits).
+const Code = struct {
+    size: usize
+    counts: [280]u64
+    lengths: [280]u8
+    codes: [280]u16
+    used: usize
+    single: bool
+}
+
+// What the encoder works in, allocated (large for a stack): the five
+// codes, the code-length code, the tree's arrays, the length tokens.
+const Work = struct {
+    green: Code
+    red: Code
+    blue: Code
+    alpha: Code
+    distance: Code
+    lengthCode: Code
+    symbols: [280]u16
+    weights: [560]u64
+    parents: [560]u16
+    tokens: [280]u16
+    extras: [280]u16
+}
+
+fn clearCode(code: *Code, size: usize) -> void {
+    io.zero(@intFromPtr(code), @sizeOf(Code))
+    code.*.size = size
+}
+
+// Huffman lengths of the counts, limited to MAX_LENGTH bits: the tree of
+// the counts, the small counts raised until it is shallow enough.
+fn buildLengths(work: *Work, code: *Code, maxLength: u64) -> void {
+    const symbols = unsafe { @ptrCast([*]u16, &work.*.symbols) }
+    const weights = unsafe { @ptrCast([*]u64, &work.*.weights) }
+    const parents = unsafe { @ptrCast([*]u16, &work.*.parents) }
+    var n: usize = 0
+    var s: usize = 0
+    while s < code.*.size {
+        code.*.lengths[s] = 0
+        if code.*.counts[s] > 0 {
+            symbols[n] = @intCast(u16, s)
+            n += 1
+        }
+        s += 1
+    }
+    code.*.used = n
+    code.*.single = n <= 1
+    if n == 0 { return }
+    if n == 1 {
+        code.*.lengths[@intCast(usize, symbols[0])] = 1
+        return
+    }
+    var floor: u64 = 1
+    while true {
+        // Leaves sorted by weight (then symbol), nodes made from the two
+        // lightest of the leaves and the nodes made so far.
+        var i: usize = 0
+        while i < n {
+            var w = code.*.counts[@intCast(usize, symbols[i])]
+            if w < floor { w = floor }
+            weights[i] = w
+            i += 1
+        }
+        i = 1
+        while i < n {
+            const w = weights[i]
+            const sym = symbols[i]
+            var j = i
+            while j > 0 && weights[j - 1] > w {
+                weights[j] = weights[j - 1]
+                symbols[j] = symbols[j - 1]
+                j -= 1
+            }
+            weights[j] = w
+            symbols[j] = sym
+            i += 1
+        }
+        var leaf: usize = 0
+        var node: usize = n
+        var next: usize = n
+        while next < 2 * n - 1 {
+            var first: usize = 0
+            if leaf < n && (node >= next || weights[leaf] <= weights[node]) {
+                first = leaf
+                leaf += 1
+            } else {
+                first = node
+                node += 1
+            }
+            var second: usize = 0
+            if leaf < n && (node >= next || weights[leaf] <= weights[node]) {
+                second = leaf
+                leaf += 1
+            } else {
+                second = node
+                node += 1
+            }
+            weights[next] = weights[first] + weights[second]
+            parents[first] = @intCast(u16, next)
+            parents[second] = @intCast(u16, next)
+            next += 1
+        }
+        var deepest: u64 = 0
+        i = 0
+        while i < n {
+            var depth: u64 = 0
+            var at = i
+            while at != 2 * n - 2 {
+                at = @intCast(usize, parents[at])
+                depth += 1
+            }
+            code.*.lengths[@intCast(usize, symbols[i])] = @intCast(u8, depth)
+            if depth > deepest { deepest = depth }
+            i += 1
+        }
+        if deepest <= maxLength { return }
+        floor = floor * 2
+    }
+}
+
+// Canonical codes of the lengths (shorter first, then by symbol), reversed.
+fn assignCodes(code: *Code) -> void {
+    var counts: [17]u64 = undefined
+    var nextCode: [17]u64 = undefined
+    var l: usize = 0
+    while l < 17 {
+        counts[l] = 0
+        l += 1
+    }
+    var s: usize = 0
+    while s < code.*.size {
+        counts[@intCast(usize, code.*.lengths[s])] += 1
+        s += 1
+    }
+    counts[0] = 0
+    var value: u64 = 0
+    l = 1
+    while l < 17 {
+        value = (value + counts[l - 1]) << 1
+        nextCode[l] = value
+        l += 1
+    }
+    s = 0
+    while s < code.*.size {
+        const length = @intCast(u64, code.*.lengths[s])
+        if length > 0 {
+            const c = nextCode[@intCast(usize, length)]
+            nextCode[@intCast(usize, length)] = c + 1
+            var reversed: u64 = 0
+            var k: u64 = 0
+            while k < length {
+                reversed = reversed | (((c >> k) & 1) << (length - 1 - k))
+                k += 1
+            }
+            code.*.codes[s] = @intCast(u16, reversed)
+        }
+        s += 1
+    }
+}
+
+fn putSymbol(w: *BitWriter, code: *Code, symbol: usize) -> void {
+    if code.*.single { return }
+    putBits(w, @intCast(u64, code.*.codes[symbol]), @intCast(u64, code.*.lengths[symbol]))
+}
+
+fn codeLengthOrder(i: usize) -> usize {
+    var order: [19]u8 = [19]u8{ 17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }
+    return @intCast(usize, order[i])
+}
+
+// The code-length tokens of CODE's lengths: literal lengths, and runs of
+// zeros (17: 3 to 10, 18: 11 to 138), into TOKENS (token, extra bits).
+fn tokenize(code: *Code, tokens: [*]u16, extras: [*]u16) -> usize {
+    var count: usize = 0
+    var s: usize = 0
+    while s < code.*.size {
+        const length = code.*.lengths[s]
+        if length == 0 {
+            var run: usize = 1
+            while s + run < code.*.size && code.*.lengths[s + run] == 0 && run < 138 { run += 1 }
+            if run >= 11 {
+                tokens[count] = 18
+                extras[count] = @intCast(u16, run - 11)
+                count += 1
+                s += run
+                continue
+            }
+            if run >= 3 {
+                tokens[count] = 17
+                extras[count] = @intCast(u16, run - 3)
+                count += 1
+                s += run
+                continue
+            }
+        }
+        tokens[count] = @intCast(u16, length)
+        extras[count] = 0
+        count += 1
+        s += 1
+    }
+    return count
+}
+
+// A Huffman code into the stream: a simple code for one or two symbols
+// under 256, else the lengths through the code-length code.
+fn putCode(w: *BitWriter, work: *Work, code: *Code) -> void {
+    var first: usize = 0
+    var second: usize = 0
+    var n: usize = 0
+    var s: usize = 0
+    while s < code.*.size {
+        if code.*.counts[s] > 0 {
+            if n == 0 { first = s } else { second = s }
+            n += 1
+        }
+        s += 1
+    }
+    if n <= 2 && first < 256 && (n < 2 || second < 256) {
+        // A simple code: its one or two symbols, 1 or 8 bits each.
+        putBits(w, 1, 1)
+        if n == 2 {
+            putBits(w, 1, 1)
+            putBits(w, 1, 1)
+            putBits(w, @intCast(u64, first), 8)
+            putBits(w, @intCast(u64, second), 8)
+            code.*.lengths[first] = 1
+            code.*.lengths[second] = 1
+            code.*.codes[first] = 0
+            code.*.codes[second] = 1
+            code.*.single = false
+        } else {
+            putBits(w, 0, 1)
+            if first < 2 {
+                putBits(w, 0, 1)
+                putBits(w, @intCast(u64, first), 1)
+            } else {
+                putBits(w, 1, 1)
+                putBits(w, @intCast(u64, first), 8)
+            }
+            code.*.single = true
+        }
+        return
+    }
+    putBits(w, 0, 1)
+    const tokens = unsafe { @ptrCast([*]u16, &work.*.tokens) }
+    const extras = unsafe { @ptrCast([*]u16, &work.*.extras) }
+    const count = tokenize(code, tokens, extras)
+    const lengthCode = &work.*.lengthCode
+    clearCode(lengthCode, 19)
+    var k: usize = 0
+    while k < count {
+        lengthCode.*.counts[@intCast(usize, tokens[k])] += 1
+        k += 1
+    }
+    buildLengths(work, lengthCode, 7)
+    assignCodes(lengthCode)
+    var numCodes: usize = 19
+    while numCodes > 4 && lengthCode.*.lengths[codeLengthOrder(numCodes - 1)] == 0 { numCodes -= 1 }
+    putBits(w, @intCast(u64, numCodes - 4), 4)
+    k = 0
+    while k < numCodes {
+        putBits(w, @intCast(u64, lengthCode.*.lengths[codeLengthOrder(k)]), 3)
+        k += 1
+    }
+    // (All the symbols: no max_symbol.)
+    putBits(w, 0, 1)
+    k = 0
+    while k < count {
+        const token = @intCast(usize, tokens[k])
+        putSymbol(w, lengthCode, token)
+        if token == 17 { putBits(w, @intCast(u64, extras[k]), 3) }
+        if token == 18 { putBits(w, @intCast(u64, extras[k]), 7) }
+        k += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The picture
+
+// A length or distance (1 and up) as its prefix symbol and extra bits.
+fn prefix(value: usize, symbol: *usize, extraBits: *u64, extraValue: *u64) -> void {
+    const d = value - 1
+    if d < 4 {
+        symbol.* = d
+        extraBits.* = 0
+        extraValue.* = 0
+        return
+    }
+    var highest: u64 = 0
+    var x = d
+    while x > 1 {
+        x = x >> 1
+        highest += 1
+    }
+    const second = (@intCast(u64, d) >> (highest - 1)) & 1
+    extraBits.* = highest - 1
+    extraValue.* = @intCast(u64, d) & ((@intCast(u64, 1) << (highest - 1)) - 1)
+    symbol.* = @intCast(usize, 2 * highest + second)
+}
+
+// The picture's pixels as the stream carries them: green subtracted
+// from red and blue.
+fn subtractGreen(argb: usize, width: usize, height: usize, stride: usize, pixels: usize) -> bool {
+    var hasAlpha = false
+    var y: usize = 0
+    while y < height {
+        var x: usize = 0
+        while x < width {
+            const p = get32(argb + 4 * (y * stride + x))
+            const green = (p >> 8) & 0xff
+            const red = (((p >> 16) & 0xff) + 256 - green) & 0xff
+            const blue = ((p & 0xff) + 256 - green) & 0xff
+            if (p >> 24) != 0xff { hasAlpha = true }
+            put32(pixels + 4 * (y * width + x), (p & 0xff00ff00) | (red << 16) | blue)
+            x += 1
+        }
+        y += 1
+    }
+    return hasAlpha
+}
+
+// The length of the run of pixels from I equal to those DISTANCE before.
+fn matchLength(pixels: usize, i: usize, total: usize, distance: usize) -> usize {
+    if distance == 0 || i < distance { return 0 }
+    var n: usize = 0
+    while i + n < total && n < MAX_LENGTH && get32(pixels + 4 * (i + n)) == get32(pixels + 4 * (i + n - distance)) { n += 1 }
+    return n
+}
+
+// A VP8L bitstream of the picture (the 5-byte header on) onto OUT.
+pub fn encodeBitstream(out: *Bytes, argb: usize, width: usize, height: usize, stride: usize) -> bool {
+    if width < 1 || height < 1 || width > 16384 || height > 16384 { return false }
+    const total = width * height
+    const pixels = io.allocate(out.*.allocator, 4 * total)
+    if pixels == 0 { return false }
+    const hasAlpha = subtractGreen(argb, width, height, stride, pixels)
+    // The references: for each position, a run length (0: a literal)
+    // and its plane code (1: the pixel above, 2: the one on the left).
+    const runs = io.allocate(out.*.allocator, 4 * total)
+    if runs == 0 {
+        io.release(out.*.allocator, pixels, 4 * total)
+        return false
+    }
+    const workAddress = io.allocate(out.*.allocator, @sizeOf(Work))
+    if workAddress == 0 {
+        io.release(out.*.allocator, runs, 4 * total)
+        io.release(out.*.allocator, pixels, 4 * total)
+        return false
+    }
+    const work = unsafe { @ptrFromInt(*Work, workAddress) }
+    const green = &work.*.green
+    const red = &work.*.red
+    const blue = &work.*.blue
+    const alpha = &work.*.alpha
+    const distance = &work.*.distance
+    clearCode(green, NUM_LITERAL_CODES + NUM_LENGTH_CODES)
+    clearCode(red, NUM_LITERAL_CODES)
+    clearCode(blue, NUM_LITERAL_CODES)
+    clearCode(alpha, NUM_LITERAL_CODES)
+    clearCode(distance, NUM_DISTANCE_CODES)
+    var symbol: usize = 0
+    var extraBits: u64 = 0
+    var extraValue: u64 = 0
+    var i: usize = 0
+    while i < total {
+        const left = matchLength(pixels, i, total, 1)
+        const up = matchLength(pixels, i, total, width)
+        var length = left
+        var plane: usize = 2
+        if up > left {
+            length = up
+            plane = 1
+        }
+        if length >= MIN_MATCH {
+            put32(runs + 4 * i, @intCast(u64, length | (plane << 16)))
+            prefix(length, &symbol, &extraBits, &extraValue)
+            green.*.counts[NUM_LITERAL_CODES + symbol] += 1
+            prefix(plane, &symbol, &extraBits, &extraValue)
+            distance.*.counts[symbol] += 1
+            i += length
+        } else {
+            put32(runs + 4 * i, 0)
+            const p = get32(pixels + 4 * i)
+            green.*.counts[@intCast(usize, (p >> 8) & 0xff)] += 1
+            red.*.counts[@intCast(usize, (p >> 16) & 0xff)] += 1
+            blue.*.counts[@intCast(usize, p & 0xff)] += 1
+            alpha.*.counts[@intCast(usize, p >> 24)] += 1
+            i += 1
+        }
+    }
+    buildLengths(work, green, 15)
+    buildLengths(work, red, 15)
+    buildLengths(work, blue, 15)
+    buildLengths(work, alpha, 15)
+    buildLengths(work, distance, 15)
+    assignCodes(green)
+    assignCodes(red)
+    assignCodes(blue)
+    assignCodes(alpha)
+    assignCodes(distance)
+
+    var w: BitWriter = undefined
+    w.out = out
+    w.bits = 0
+    w.used = 0
+    putBits(&w, 0x2f, 8)
+    putBits(&w, @intCast(u64, width - 1), 14)
+    putBits(&w, @intCast(u64, height - 1), 14)
+    if hasAlpha { putBits(&w, 1, 1) } else { putBits(&w, 0, 1) }
+    putBits(&w, 0, 3)
+    // One transform, subtract green; no colour cache; no meta codes.
+    putBits(&w, 1, 1)
+    putBits(&w, 2, 2)
+    putBits(&w, 0, 1)
+    putBits(&w, 0, 1)
+    putBits(&w, 0, 1)
+    putCode(&w, work, green)
+    putCode(&w, work, red)
+    putCode(&w, work, blue)
+    putCode(&w, work, alpha)
+    putCode(&w, work, distance)
+    i = 0
+    while i < total {
+        const run = get32(runs + 4 * i)
+        if run != 0 {
+            const length = @intCast(usize, run & 0xffff)
+            const plane = @intCast(usize, run >> 16)
+            prefix(length, &symbol, &extraBits, &extraValue)
+            putSymbol(&w, green, NUM_LITERAL_CODES + symbol)
+            putBits(&w, extraValue, extraBits)
+            prefix(plane, &symbol, &extraBits, &extraValue)
+            putSymbol(&w, distance, symbol)
+            putBits(&w, extraValue, extraBits)
+            i += length
+        } else {
+            const p = get32(pixels + 4 * i)
+            putSymbol(&w, green, @intCast(usize, (p >> 8) & 0xff))
+            putSymbol(&w, red, @intCast(usize, (p >> 16) & 0xff))
+            putSymbol(&w, blue, @intCast(usize, p & 0xff))
+            putSymbol(&w, alpha, @intCast(usize, p >> 24))
+            i += 1
+        }
+    }
+    flushBits(&w)
+    io.release(out.*.allocator, workAddress, @sizeOf(Work))
+    io.release(out.*.allocator, runs, 4 * total)
+    io.release(out.*.allocator, pixels, 4 * total)
+    return !out.*.failed
+}
+
+// A chunk: its tag, its size and BODY (SIZE bytes), padded to even.
+pub fn appendChunk(out: *Bytes, tag: []const u8, body: usize, size: usize) -> void {
+    appendTag(out, tag)
+    appendLE32(out, @intCast(u64, size))
+    appendBytes(out, body, size)
+    if (size & 1) != 0 { appendByte(out, 0) }
+}
+
+// A WebP file of the picture: RIFF, WEBP and its VP8L chunk.
+pub fn encodeFile(out: *Bytes, argb: usize, width: usize, height: usize, stride: usize) -> bool {
+    var bitstream: Bytes = undefined
+    initBytes(&bitstream, out.*.allocator)
+    if !encodeBitstream(&bitstream, argb, width, height, stride) {
+        freeBytes(&bitstream)
+        return false
+    }
+    const padded = bitstream.size + (bitstream.size & 1)
+    appendTag(out, "RIFF")
+    appendLE32(out, @intCast(u64, 4 + 8 + padded))
+    appendTag(out, "WEBP")
+    appendChunk(out, "VP8L", bitstream.data, bitstream.size)
+    freeBytes(&bitstream)
+    return !out.*.failed
+}

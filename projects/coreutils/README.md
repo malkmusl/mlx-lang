@@ -2,12 +2,17 @@
 
 Dependency-free Linux userland programs written in MLX. Each utility lives in
 its own directory and imports only the MLX standard library plus the shared
-modules next to it: the CLI diagnostic helpers in `common.mlx`, the digests in
-`checksum.mlx`, and the base encodings in `codec.mlx`. Path manipulation and
-canonicalization, chmod-style mode parsing, sized-number/duration parsing,
-POSIX-ish word splitting, and calendar/timestamp parsing were generalized out
-of these examples into `std.path`, `std.mode`, `std.parse`, `std.shell`, and
-`std.calendar` respectively, so other MLX programs can reuse them too.
+modules next to it: the CLI diagnostic helpers in `common.mlx`, the digest
+tools' shared program in `digest_cli.mlx` (md5sum, sha1sum, sha224sum,
+sha256sum, sha384sum, sha512sum and b2sum are each a call to it, and cksum
+takes its digests from it), and base2 and line wrapping for the base
+encodings in `codec.mlx`. Path manipulation and canonicalization,
+chmod-style mode parsing, sized-number/duration parsing, POSIX-ish word
+splitting, calendar/timestamp parsing, the digests (MD5, SHA-1, SHA-2,
+BLAKE2b) and RFC 4648's encodings were generalized out of these examples
+into `std.path`, `std.mode`, `std.parse`, `std.shell`, `std.calendar`,
+`std.md5`, `std.sha1`, `std.sha2`, `std.blake2` and `std.base64`
+respectively, so other MLX programs can reuse them too.
 
 Every utility calls `std.crash.install()` first thing in `main`, as the
 desktop programs do: a crash (a failed runtime check, a bad pointer, a stack
@@ -82,9 +87,12 @@ Build all utilities with the self-hosted compiler:
 ./projects/coreutils/benchmark.sh
 ```
 
-The build script defaults to the converged self-hosted compiler at
-`mlx-out/bin/compiler/mlx4` and writes the utilities to
-`mlx-out/bin/coreutils`. It never invokes the bootstrap compiler.
+The build script runs `./mlx build coreutils` (build.mlx's coreutils
+group), which builds a utility only when a module it reads changed, with
+the converged self-hosted compiler `mlx-out/bin/compiler/mlx4`, into
+`mlx-out/bin/coreutils`. Given a compiler (an argument or `MLX_COMPILER`)
+or another directory (`MLX_COREUTILS_BIN_DIR`) it compiles every utility
+with that compiler instead. It never invokes the bootstrap compiler.
 The benchmark creates a 128 MiB text workload when no fixture is supplied and
 compares every hot path directly with the installed GNU utility.
 

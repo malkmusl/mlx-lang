@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds MLX Audio's client libraries (projects/desktop/libpulse): Mlx
+# Builds MLX Audio's client libraries (compiler/libc/pulse): Mlx
 # stand-ins for PulseAudio's libpulse0 and libpulse-mainloop-glib0 and for
 # alsa-plugins' pulse plugin (libasound2-plugins), so that neither package
 # is needed for programs to reach MLX Audio.
@@ -9,7 +9,8 @@
 #     --deb            also build a Debian package (DIR/mlx-audio-libs_*.deb)
 #                      that installs them where the packages had theirs and
 #                      replaces those packages (apt install ./FILE.deb)
-#     --compiler PATH  the Mlx compiler (default: tools/ensure_compiler.sh)
+#     --compiler PATH  compile with this Mlx compiler (default: take them
+#                      from ./mlx build, only what is not current)
 #
 # Builds, into DIR:
 #   libpulse.so.0                 PulseAudio's client library (soname and
@@ -21,6 +22,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
+source tools/lib/mlx_build.sh
 
 out=mlx-out/libpulse
 deb=0
@@ -35,15 +37,21 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
-[[ -n "$compiler" ]] || compiler=$(tools/ensure_compiler.sh)
 mkdir -p "$out"
 
-source=projects/desktop/libpulse
-"$compiler" --quiet --plugin --soname=libpulse.so.0 --symbol-version=PULSE_0 "$source/libpulse.mlx" -o "$out/libpulse.so.0"
-"$compiler" --quiet --plugin --library libpulse.so.0 --soname=libpulse-simple.so.0 --symbol-version=PULSE_0 "$source/simple.mlx" -o "$out/libpulse-simple.so.0"
-"$compiler" --quiet --plugin --library libglib-2.0.so.0 --soname=libpulse-mainloop-glib.so.0 --symbol-version=PULSE_0 "$source/glib.mlx" -o "$out/libpulse-mainloop-glib.so.0"
-"$compiler" --quiet --plugin --library libasound.so.2 "$source/alsa.mlx" -o "$out/libasound_module_pcm_pulse.so"
-cp "$out/libasound_module_pcm_pulse.so" "$out/libasound_module_ctl_pulse.so"
+libraries=(libpulse.so.0 libpulse-simple.so.0 libpulse-mainloop-glib.so.0 libasound_module_pcm_pulse.so libasound_module_ctl_pulse.so)
+if [[ -n "$compiler" ]]; then
+    source=compiler/libc/pulse
+    "$compiler" --quiet --plugin --soname=libpulse.so.0 --symbol-version=PULSE_0 "$source/libpulse.mlx" -o "$out/libpulse.so.0"
+    "$compiler" --quiet --plugin --library libpulse.so.0 --soname=libpulse-simple.so.0 --symbol-version=PULSE_0 "$source/simple.mlx" -o "$out/libpulse-simple.so.0"
+    "$compiler" --quiet --plugin --library libglib-2.0.so.0 --soname=libpulse-mainloop-glib.so.0 --symbol-version=PULSE_0 "$source/glib.mlx" -o "$out/libpulse-mainloop-glib.so.0"
+    "$compiler" --quiet --plugin --library libasound.so.2 "$source/alsa.mlx" -o "$out/libasound_module_pcm_pulse.so"
+    cp "$out/libasound_module_pcm_pulse.so" "$out/libasound_module_ctl_pulse.so"
+else
+    # build.mlx's steps of the same names (client-libraries).
+    mlx_build "${libraries[@]}"
+    [[ "$out" -ef mlx-out/lib ]] || cp "${libraries[@]/#/mlx-out/lib/}" "$out/"
+fi
 echo "built $out: libpulse.so.0, libpulse-simple.so.0, libpulse-mainloop-glib.so.0, libasound_module_pcm_pulse.so, libasound_module_ctl_pulse.so"
 [[ $deb -eq 1 ]] || exit 0
 
@@ -75,7 +83,7 @@ ctl.pulse {
 }
 CONF
 cat > "$staged/usr/share/doc/mlx-audio-libs/copyright" <<'TEXT'
-MLX Audio's client libraries, written in Mlx (projects/desktop/libpulse in
+MLX Audio's client libraries, written in Mlx (compiler/libc/pulse in
 the mlx-lang repository). They implement the interfaces of PulseAudio's
 libpulse and of alsa-plugins' pulse plugin, whose behavior they follow.
 TEXT

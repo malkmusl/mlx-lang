@@ -1,0 +1,737 @@
+// GCC's builtins that are instructions: the bit builtins
+// (`__builtin_clz`, `__builtin_ctzl`, `__builtin_popcountll`,
+// `__builtin_bswap32`, `__builtin_ffs`, ...) and `__builtin_alloca` as
+// nodes of kind ast.BITOP (gen.genBitop: bsr, bsf, popcnt, bswap; the
+// stack pointer moved down), and `asm` statements of one
+// operand-less instruction (`asm volatile("pause")`, `asm("" ::: "memory")`,
+// `int3`, `ud2`, the fences) as nodes of kind ast.ASM (gen.genAsm). The
+// builtins that are plain C (`__builtin_memcpy`, `__builtin_expect`,
+// `__builtin_isnan`, ...) are macros (main.mlx PREDEFINED).
+const base = @import("./base.mlx")
+const names = @import("./names.mlx")
+const tokens = @import("./tokens.mlx")
+const cursor = @import("./cursor.mlx")
+const ast = @import("./ast.mlx")
+const types = @import("./types.mlx")
+const typing = @import("./typing.mlx")
+const expr = @import("./expr.mlx")
+const state = @import("./state.mlx")
+const eval = @import("./eval.mlx")
+const assembler = @import("./asm.mlx")
+
+// Node.value of a BITOP.
+pub const CLZ: i64 = 1
+pub const CTZ: i64 = 2
+pub const POPCOUNT: i64 = 3
+pub const BSWAP: i64 = 4
+pub const FFS: i64 = 5
+// `__builtin_alloca(size)`: room on the stack until the function returns
+// (gen.genAlloca).
+pub const ALLOCA: i64 = 6
+
+// Node.value of an ASM: the instruction.
+pub const ASM_NOTHING: i64 = 0
+pub const ASM_PAUSE: i64 = 1
+pub const ASM_INT3: i64 = 2
+pub const ASM_NOP: i64 = 3
+pub const ASM_MFENCE: i64 = 4
+pub const ASM_LFENCE: i64 = 5
+pub const ASM_SFENCE: i64 = 6
+pub const ASM_UD2: i64 = 7
+// With operands (their registers' values in the node's slots, see
+// asmExpression): `cpuid`, `rdtsc`, `movq %%rsp, %0`.
+pub const ASM_CPUID: i64 = 8
+pub const ASM_RDTSC: i64 = 9
+pub const ASM_READ_SP: i64 = 10
+pub const ASM_XGETBV: i64 = 11
+// Valgrind's client request (valgrind.h): `rolq` %rdi by 3, 13, 61 and
+// 51 (no change; the marker Valgrind looks for), then `xchgq %rbx,
+// %rbx`: rdx = the request at rax's answer (rdx unchanged when not run
+// under Valgrind); `xchgq %rcx,%rcx` reads the original function's
+// address into rax.
+pub const ASM_VALGRIND_REQUEST: i64 = 12
+pub const ASM_VALGRIND_NRADDR: i64 = 13
+// Instructions assembled (asm.mlx): their bytes, after the operands are
+// loaded into registers from the slots (builtins.withOperands).
+pub const ASM_CODE: i64 = 14
+
+// The bit builtin `name` stands for (0 for none) and its width in bits.
+fn bitOperation(name: u32) -> (i64, i64) {
+    const text = base.nameOf(name)
+    if text.length < 12 || !base.same(text[0..10], "__builtin_") { return -> (0, 0) }
+    var rest = text[10..text.length]
+    var width: i64 = 32
+    if base.same(rest, "alloca") { return -> (ALLOCA, 64) }
+    if base.same(rest, "bswap16") { return -> (BSWAP, 16) }
+    if base.same(rest, "bswap32") { return -> (BSWAP, 32) }
+    if base.same(rest, "bswap64") { return -> (BSWAP, 64) }
+    if rest.length > 2 && base.same(rest[rest.length - 2..rest.length], "ll") {
+        width = 64
+        rest = rest[0..rest.length - 2]
+    } else if rest.length > 1 && rest[rest.length - 1] == 'l' {
+        width = 64
+        rest = rest[0..rest.length - 1]
+    }
+    if base.same(rest, "clz") { return -> (CLZ, width) }
+    if base.same(rest, "ctz") { return -> (CTZ, width) }
+    if base.same(rest, "popcount") { return -> (POPCOUNT, width) }
+    if base.same(rest, "ffs") { return -> (FFS, width) }
+    return -> (0, 0)
+}
+
+pub fn isBitBuiltin(name: u32) -> bool {
+    return bitOperation(name).0 != 0
+}
+
+// `__builtin_clz(x)` at the name: the node.
+pub fn bitBuiltin(token: usize) -> usize {
+    const op = bitOperation(tokens.name(token))
+    cursor.advance()
+    cursor.expect(names.P_LPAREN)
+    const operand = expr.assign()
+    cursor.expect(names.P_RPAREN)
+    typing.addType(operand)
+    const unsignedType = if op.1 == 64 { types.ulongOf() } else if op.1 == 32 { types.uintOf() } else { types.ushortOf() }
+    const n = ast.make(ast.BITOP, token)
+    ast.node(n).*.value = op.0
+    ast.node(n).*.high = op.1
+    ast.node(n).*.lhs = typing.cast(operand, unsignedType)
+    ast.node(n).*.ty = if op.0 == BSWAP { unsignedType } else if op.0 == ALLOCA { types.pointerTo(types.voidOf()) } else { types.intOf() }
+    return n
+}
+
+// `asm [volatile] ("text" [: outputs [: inputs [: clobbers]]])` at
+// `asm`: the node. Only an instruction without operands is taken (the
+// clobbers may say "memory").
+pub fn asmExpression(token: usize) -> usize {
+    cursor.advance()
+    while cursor.consume(names.K_VOLATILE) || cursor.consume(names.K_GNU2_VOLATILE) || cursor.consume(names.K_INLINE) || cursor.consume(names.K_GNU2_INLINE) {}
+    cursor.expect(names.P_LPAREN)
+    var text: []const u8 = ""
+    while tokens.kind(cursor.peek()) == tokens.STRING {
+        text = base.join(text, literalText(cursor.peek()))
+        cursor.advance()
+    }
+    // The operands: outputs and inputs, each with its constraint
+    // (`"=a"(x)`, `"+r"(y)`, `[name] "m"(z)`, `"0"(w)`), and the
+    // clobbers.
+    var colons: u32 = 0
+    const constraintOf = base.alloc(MAX_ASM_OPERANDS * 16)
+    const nameOf = base.alloc(MAX_ASM_OPERANDS * 8)
+    const valueOf = base.alloc(MAX_ASM_OPERANDS * 8)
+    const isOutput = base.alloc(MAX_ASM_OPERANDS * 8)
+    var clobbers: []const u8 = " "
+    var operands: usize = 0
+    while !cursor.is(names.P_RPAREN) {
+        if cursor.isEof() { cursor.fail("unterminated asm") }
+        if cursor.consume(names.P_COLON) {
+            colons += 1
+            continue
+        }
+        if cursor.consume(names.P_SCOPE) {
+            // `::: "memory"`: the `::` of C++ is two colons here.
+            colons += 2
+            continue
+        }
+        if colons >= 3 {
+            if tokens.kind(cursor.peek()) == tokens.STRING { clobbers = base.join(clobbers, base.join(literalText(cursor.peek()), " ")) }
+            cursor.advance()
+            continue
+        }
+        if cursor.consume(names.P_COMMA) { continue }
+        var operandName: u32 = 0
+        if cursor.consume(names.P_LBRACKET) {
+            operandName = tokens.name(cursor.expectIdent())
+            cursor.expect(names.P_RBRACKET)
+        }
+        if tokens.kind(cursor.peek()) != tokens.STRING || operands == MAX_ASM_OPERANDS { tokens.errorAt(token, "inline assembly with these operands is not supported") }
+        const constraint = literalText(cursor.peek())
+        cursor.advance()
+        cursor.expect(names.P_LPAREN)
+        const e = expr.assign()
+        cursor.expect(names.P_RPAREN)
+        typing.addType(e)
+        base.putWord(constraintOf + operands * 16, base.keep(constraint))
+        base.putWord(constraintOf + operands * 16 + 8, constraint.length)
+        base.putWord(nameOf + operands * 8, @intCast(usize, operandName))
+        base.putWord(valueOf + operands * 8, e)
+        base.putWord(isOutput + operands * 8, if colons == 1 { 1 } else { 0 })
+        operands += 1
+    }
+    cursor.expect(names.P_RPAREN)
+    const n = ast.make(ast.ASM, token)
+    ast.node(n).*.ty = types.voidOf()
+    ast.node(n).*.value = instruction(trimmed(text), token)
+    if ast.node(n).*.value < 0 {
+        // Any other instruction: assembled (asm.mlx), the operands put
+        // into the template. (Basic asm, without colons, is taken as
+        // it is: `%` there is a register's.)
+        if operands == 0 {
+            const template = if colons == 0 { text } else { substituted(text, 0, 0, token) }
+            if assembler.assemble(unescaped(template)) { return assembledNode(n, 0) }
+            // Another architecture's instruction (`dmb ishst` behind `if
+            // (PAS_ARM)`): a trap, should it be reached.
+            ast.node(n).*.value = ASM_UD2
+            return n
+        }
+        return withOperands(n, text, operands, constraintOf, nameOf, valueOf, isOutput, clobbers, token)
+    }
+    if operands == 0 {
+        if ast.node(n).*.value >= ASM_CPUID { tokens.errorAt(token, "this instruction needs operands") }
+        return n
+    }
+    // `__asm__ volatile("" : "+r"(value))`: a barrier to an optimizer's
+    // reasoning; the operands keep their values.
+    if ast.node(n).*.value == ASM_NOTHING { return n }
+    if ast.node(n).*.value < ASM_CPUID && !namesOperand(text) {
+        // An instruction of no operands given inputs it does not name
+        // (libpas's `int3` with the crash reason in a register for a
+        // debugger): the instruction.
+        var outputs = false
+        var o: usize = 0
+        while o < operands {
+            if base.getWord(isOutput + o * 8) != 0 { outputs = true }
+            o += 1
+        }
+        if !outputs { return n }
+    }
+    return withOperands(n, text, operands, constraintOf, nameOf, valueOf, isOutput, clobbers, token)
+}
+
+const MAX_ASM_OPERANDS: usize = 30
+
+// The registers the operands are given, by slot: rax, rcx, rdx, rbx,
+// rsi, rdi, r8, r9, r10 (r11 holds the slots' address).
+const ASM_SLOTS: usize = 9
+const SLOT_REGISTERS = "0 1 2 3 6 7 8 9 10"
+const REGISTERS64 = "rax rcx rdx rbx rsp rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15"
+const REGISTERS32 = "eax ecx edx ebx esp ebp esi edi r8d r9d r10d r11d r12d r13d r14d r15d"
+const REGISTERS16 = "ax cx dx bx sp bp si di r8w r9w r10w r11w r12w r13w r14w r15w"
+const REGISTERS8 = "al cl dl bl spl bpl sil dil r8b r9b r10b r11b r12b r13b r14b r15b"
+
+// The `which`th blank-separated word of `list`.
+fn word(list: []const u8, which: usize) -> []const u8 {
+    var index: usize = 0
+    var s: usize = 0
+    var i: usize = 0
+    while i <= list.length {
+        if i == list.length || list[i] == ' ' {
+            if index == which { return list[s..i] }
+            index += 1
+            s = i + 1
+        }
+        i += 1
+    }
+    return ""
+}
+
+// The position of `name` among the blank-separated `list`, -1 for none.
+fn wordIndex(name: []const u8, list: []const u8) -> i64 {
+    var index: i64 = 0
+    var s: usize = 0
+    var i: usize = 0
+    while i <= list.length {
+        if i == list.length || list[i] == ' ' {
+            if base.same(list[s..i], name) { return index }
+            index += 1
+            s = i + 1
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn slotRegister(slot: usize) -> usize {
+    var r: usize = 0
+    const text = word(SLOT_REGISTERS, slot)
+    var i: usize = 0
+    while i < text.length {
+        r = r * 10 + @intCast(usize, text[i] - '0')
+        i += 1
+    }
+    return r
+}
+
+// A clobber's register number (any width's name), -1 for none.
+fn clobberedRegister(name: []const u8) -> i64 {
+    var plain = name
+    if plain.length > 0 && plain[0] == '%' { plain = plain[1..plain.length] }
+    var r = wordIndex(plain, REGISTERS64)
+    if r < 0 { r = wordIndex(plain, REGISTERS32) }
+    if r < 0 { r = wordIndex(plain, REGISTERS16) }
+    if r < 0 { r = wordIndex(plain, REGISTERS8) }
+    return r
+}
+
+// The operands' places: per operand its kind (1 a register, 2 memory
+// at the address in a register, 3 a constant), slot and constant.
+const PLACE_REGISTER: usize = 1
+const PLACE_MEMORY: usize = 2
+const PLACE_CONSTANT: usize = 3
+var placeKind: usize = 0
+var placeSlot: usize = 0
+var placeValue: usize = 0
+var placeType: usize = 0
+var uniqueAsm: u64 = 0
+
+fn has(text: []const u8, c: u8) -> bool {
+    var i: usize = 0
+    while i < text.length {
+        if text[i] == c { return true }
+        i += 1
+    }
+    return false
+}
+
+// An asm statement with operands for the assembler: the operands' slots
+// chosen by their constraints, the template's `%0`, `%q[name]`, `%%`
+// and `%=` put in, the text assembled; the inputs stored into the
+// slots before and the outputs read from them after (gen.genAsmCode).
+fn withOperands(n: usize, text: []const u8, count: usize, constraintOf: usize, nameOf: usize, valueOf: usize, isOutput: usize, clobbers: []const u8, token: usize) -> usize {
+    placeKind = base.alloc(count * 8 + 8)
+    placeSlot = base.alloc(count * 8 + 8)
+    placeValue = base.alloc(count * 8 + 8)
+    placeType = base.alloc(count * 8 + 8)
+    // The slots taken: by a constraint naming the register, a clobber,
+    // or an operand given it.
+    var taken: u64 = 0
+    var saved: u64 = 0
+    var c: usize = 0
+    while c < 64 {
+        const clobber = word(clobbers, c)
+        c += 1
+        if clobber.length == 0 { continue }
+        const r = clobberedRegister(clobber)
+        if r >= 0 {
+            var slot: usize = 0
+            while slot < ASM_SLOTS {
+                if @intCast(i64, slotRegister(slot)) == r { taken = taken | (@intCast(u64, 1) << @intCast(u6, slot)) }
+                slot += 1
+            }
+            // (A callee-saved register is kept around the text.)
+            if r == 5 || r >= 12 { saved = saved | (@intCast(u64, 1) << @intCast(u6, r)) }
+        }
+    }
+    // First the constraints naming a register, then the ties, then the
+    // rest.
+    var pass: usize = 0
+    while pass < 3 {
+        var k: usize = 0
+        while k < count {
+            const constraint = base.bytes(base.getWord(constraintOf + k * 16), base.getWord(constraintOf + k * 16 + 8))
+            const e = base.getWord(valueOf + k * 8)
+            base.putWord(placeType + k * 8, ast.typeOf(e))
+            var fixedSlot: i64 = -1
+            var tie: i64 = -1
+            var i: usize = 0
+            while i < constraint.length {
+                const ch = constraint[i]
+                if ch == 'a' { fixedSlot = 0 }
+                if ch == 'c' { fixedSlot = 1 }
+                if ch == 'd' { fixedSlot = 2 }
+                if ch == 'b' { fixedSlot = 3 }
+                if ch == 'S' { fixedSlot = 4 }
+                if ch == 'D' { fixedSlot = 5 }
+                if ch >= '0' && ch <= '9' { tie = @intCast(i64, ch - '0') }
+                i += 1
+            }
+            const generic = has(constraint, 'r') || has(constraint, 'q') || has(constraint, 'g') || has(constraint, 'R') || has(constraint, 'Q')
+            const memory = !generic && (has(constraint, 'm') || has(constraint, 'o') || has(constraint, 'V'))
+            const constant = !generic && !memory && fixedSlot < 0 && tie < 0 && (has(constraint, 'i') || has(constraint, 'n') || has(constraint, 'e') || has(constraint, 'Z') || has(constraint, 'I') || has(constraint, 'J') || has(constraint, 'K') || has(constraint, 'M') || has(constraint, 'N'))
+            if pass == 0 && fixedSlot >= 0 {
+                base.putWord(placeKind + k * 8, PLACE_REGISTER)
+                base.putWord(placeSlot + k * 8, @intCast(usize, fixedSlot))
+                taken = taken | (@intCast(u64, 1) << @intCast(u6, fixedSlot))
+            }
+            if pass == 0 && constant {
+                if !eval.isConstant(e) { tokens.errorAt(token, base.join("an asm operand is not a constant: ", constraint)) }
+                base.putWord(placeKind + k * 8, PLACE_CONSTANT)
+                base.putWord(placeValue + k * 8, @bitCast(u64, eval.evaluate(e)))
+            }
+            if pass == 1 && tie >= 0 && fixedSlot < 0 {
+                if @intCast(usize, tie) >= count || base.getWord(placeKind + @intCast(usize, tie) * 8) != PLACE_REGISTER { tokens.errorAt(token, "an asm operand tied to an operand not in a register") }
+                base.putWord(placeKind + k * 8, PLACE_REGISTER)
+                base.putWord(placeSlot + k * 8, base.getWord(placeSlot + @intCast(usize, tie) * 8))
+            }
+            if pass == 2 && base.getWord(placeKind + k * 8) == 0 {
+                if !generic && !memory {
+                    if has(constraint, 'x') || has(constraint, 'v') || has(constraint, 'w') || has(constraint, 't') || has(constraint, 'f') || has(constraint, 'Y') { tokens.errorAt(token, base.join("inline assembly with a floating-point register operand is not supported: ", constraint)) }
+                    tokens.errorAt(token, base.join("inline assembly with this constraint is not supported: ", constraint))
+                }
+                var slot: usize = 0
+                while slot < ASM_SLOTS && (taken & (@intCast(u64, 1) << @intCast(u6, slot))) != 0 { slot += 1 }
+                if slot == ASM_SLOTS { tokens.errorAt(token, "inline assembly with too many register operands") }
+                taken = taken | (@intCast(u64, 1) << @intCast(u6, slot))
+                base.putWord(placeKind + k * 8, if memory { PLACE_MEMORY } else { PLACE_REGISTER })
+                base.putWord(placeSlot + k * 8, slot)
+            }
+            k += 1
+        }
+        pass += 1
+    }
+    const template = substituted(text, count, nameOf, token)
+    if !assembler.assemble(unescaped(template)) { tokens.errorAt(token, base.join("inline assembly: ", base.join(assembler.problem(), base.join(" in: ", template)))) }
+    // The slots: the inputs stored before, the outputs read after.
+    const ulong = types.ulongOf()
+    const slots = typing.temporaryOf(types.arrayOf(ulong, @intCast(i64, ASM_SLOTS)), token)
+    var result: usize = 0
+    var k: usize = 0
+    while k < count {
+        const kind = base.getWord(placeKind + k * 8)
+        const e = base.getWord(valueOf + k * 8)
+        const constraint = base.bytes(base.getWord(constraintOf + k * 16), base.getWord(constraintOf + k * 16 + 8))
+        const output = base.getWord(isOutput + k * 8) != 0
+        const input = !output || has(constraint, '+')
+        if kind == PLACE_MEMORY {
+            const address = ast.unary(ast.ADDR, e, token)
+            typing.addType(address)
+            const store = ast.binary(ast.ASSIGN, slotValue(slots, base.getWord(placeSlot + k * 8), token), typing.cast(address, ulong), token)
+            typing.addType(store)
+            result = joined(result, store, token)
+        } else if kind == PLACE_REGISTER && input {
+            if !types.isInteger(ast.typeOf(e)) && types.kind(ast.typeOf(e)) != types.PTR && types.kind(ast.typeOf(e)) != types.BOOL { tokens.errorAt(token, "inline assembly with a register operand of this type is not supported") }
+            const store = ast.binary(ast.ASSIGN, slotValue(slots, base.getWord(placeSlot + k * 8), token), typing.cast(e, ulong), token)
+            typing.addType(store)
+            result = joined(result, store, token)
+        }
+        k += 1
+    }
+    ast.node(n).*.lhs = slotAddress(slots, 0, token)
+    result = joined(result, assembledNode(n, saved), token)
+    k = 0
+    while k < count {
+        if base.getWord(isOutput + k * 8) != 0 && base.getWord(placeKind + k * 8) == PLACE_REGISTER {
+            const target = base.getWord(valueOf + k * 8)
+            const load = ast.binary(ast.ASSIGN, target, typing.cast(slotValue(slots, base.getWord(placeSlot + k * 8), token), ast.typeOf(target)), token)
+            typing.addType(load)
+            result = joined(result, load, token)
+        }
+        k += 1
+    }
+    return result
+}
+
+// The ASM node `n` made to emit the bytes just assembled (assembler.code):
+// value ASM_CODE, its bytes' address in `high` and their number in
+// `label`, the callee-saved registers to keep in `breakLabel`.
+fn assembledNode(n: usize, saved: u64) -> usize {
+    ast.node(n).*.value = ASM_CODE
+    ast.node(n).*.high = @intCast(i64, assembler.code)
+    ast.node(n).*.label = @intCast(u32, assembler.codeLength)
+    ast.node(n).*.breakLabel = @intCast(u32, saved)
+    // The calls and jumps of symbols in it (asm.symbols).
+    ast.node(n).*.extra = assembler.symbols
+    return n
+}
+
+// The `\n` and `\t` a template spells out (the string's own escapes
+// are the bytes already) as newlines and blanks.
+fn unescaped(text: []const u8) -> []const u8 {
+    const out = base.alloc(text.length + 1)
+    var n: usize = 0
+    var i: usize = 0
+    while i < text.length {
+        var ch = text[i]
+        if ch == '\\' && i + 1 < text.length && (text[i + 1] == 'n' || text[i + 1] == 't') {
+            ch = if text[i + 1] == 'n' { '\n' } else { ' ' }
+            i += 1
+        }
+        base.put8(out + n, ch)
+        n += 1
+        i += 1
+    }
+    return base.bytes(out, n)
+}
+
+// The register of slot `slot` named for `size` bytes (`h`: the high
+// byte of rax..rbx).
+fn slotName(slot: usize, size: i64, high: bool) -> []const u8 {
+    const r = slotRegister(slot)
+    if high {
+        if r == 0 { return "%ah" }
+        if r == 1 { return "%ch" }
+        if r == 2 { return "%dh" }
+        if r == 3 { return "%bh" }
+    }
+    if size == 1 { return base.join("%", word(REGISTERS8, r)) }
+    if size == 2 { return base.join("%", word(REGISTERS16, r)) }
+    if size == 4 { return base.join("%", word(REGISTERS32, r)) }
+    return base.join("%", word(REGISTERS64, r))
+}
+
+// The template with its operands put in (`count` 0: only `%%` and
+// `%=`).
+fn substituted(text: []const u8, count: usize, nameOf: usize, token: usize) -> []const u8 {
+    var out: []const u8 = ""
+    var s: usize = 0
+    var i: usize = 0
+    uniqueAsm += 1
+    while i < text.length {
+        if text[i] != '%' || i + 1 >= text.length {
+            i += 1
+            continue
+        }
+        out = base.join(out, text[s..i])
+        var j = i + 1
+        if text[j] == '%' {
+            out = base.join(out, "%")
+            i = j + 1
+            s = i
+            continue
+        }
+        if text[j] == '=' {
+            out = base.join(out, base.decimal(uniqueAsm))
+            i = j + 1
+            s = i
+            continue
+        }
+        var modifier: u8 = 0
+        if ((text[j] >= 'a' && text[j] <= 'z') || (text[j] >= 'A' && text[j] <= 'Z')) && j + 1 < text.length && (text[j + 1] == '[' || (text[j + 1] >= '0' && text[j + 1] <= '9')) {
+            modifier = text[j]
+            j += 1
+        }
+        var which: i64 = -1
+        if text[j] == '[' {
+            var close = j + 1
+            while close < text.length && text[close] != ']' { close += 1 }
+            const wanted = base.intern(text[j + 1..close])
+            var k: usize = 0
+            while k < count {
+                if @intCast(u32, base.getWord(nameOf + k * 8)) == wanted { which = @intCast(i64, k) }
+                k += 1
+            }
+            j = close + 1
+        } else if text[j] >= '0' && text[j] <= '9' {
+            which = 0
+            while j < text.length && text[j] >= '0' && text[j] <= '9' {
+                which = which * 10 + @intCast(i64, text[j] - '0')
+                j += 1
+            }
+        } else {
+            // `%rax` in basic asm's style: as it is.
+            out = base.join(out, "%")
+            i = i + 1
+            s = i
+            continue
+        }
+        if which < 0 || @intCast(usize, which) >= count { tokens.errorAt(token, base.join("an asm operand not given: ", text[i..j])) }
+        out = base.join(out, operandText(@intCast(usize, which), modifier))
+        i = j
+        s = i
+    }
+    return base.join(out, text[s..text.length])
+}
+
+fn operandText(k: usize, modifier: u8) -> []const u8 {
+    const kind = base.getWord(placeKind + k * 8)
+    if kind == PLACE_CONSTANT {
+        const v = @bitCast(i64, base.getWord(placeValue + k * 8))
+        const shown = if v < 0 { base.join("-", base.decimal(@bitCast(u64, 0 - v))) } else { base.decimal(@bitCast(u64, v)) }
+        if modifier == 'c' || modifier == 'P' { return shown }
+        if modifier == 'n' { return if v > 0 { base.join("-", base.decimal(@bitCast(u64, v))) } else { base.decimal(@bitCast(u64, 0 - v)) } }
+        return base.join("$", shown)
+    }
+    const slot = base.getWord(placeSlot + k * 8)
+    if kind == PLACE_MEMORY { return base.join("(", base.join(slotName(slot, 8, false), ")")) }
+    var size = types.size(base.getWord(placeType + k * 8))
+    if size != 1 && size != 2 && size != 4 { size = 8 }
+    if modifier == 'q' { size = 8 }
+    if modifier == 'k' { size = 4 }
+    if modifier == 'w' { size = 2 }
+    if modifier == 'b' { size = 1 }
+    // (`%a0`, `%P0` of a register: the register.)
+    return slotName(slot, size, modifier == 'h')
+}
+
+// `&slots[index]` and `slots[index]` of the asm's register slots.
+fn slotAddress(slots: usize, index: usize, token: usize) -> usize {
+    const variable = ast.variableNode(slots, token)
+    typing.addType(variable)
+    const first = typing.cast(ast.unary(ast.ADDR, variable, token), types.pointerTo(types.ulongOf()))
+    const offset = ast.number(@intCast(i64, index), token)
+    ast.node(offset).*.ty = types.longOf()
+    const sum = expr.newAdd(first, offset, token)
+    typing.addType(sum)
+    return sum
+}
+
+fn slotValue(slots: usize, index: usize, token: usize) -> usize {
+    const n = ast.unary(ast.DEREF, slotAddress(slots, index, token), token)
+    typing.addType(n)
+    return n
+}
+
+fn joined(first: usize, second: usize, token: usize) -> usize {
+    if first == 0 { return second }
+    const n = ast.binary(ast.COMMA, first, second, token)
+    ast.node(n).*.ty = types.voidOf()
+    return n
+}
+
+// The text between the quotes of a string literal token.
+fn literalText(token: usize) -> []const u8 {
+    // (Adjacent literals are one token: its bytes, less the NUL.)
+    const ty = tokens.at(token).*.ty
+    if ty != 0 && tokens.at(token).*.data != 0 && types.kind(ty) == types.ARRAY && types.size(types.baseOf(ty)) == 1 && types.at(ty).*.arrayLength > 0 {
+        return base.bytes(tokens.at(token).*.data, @intCast(usize, types.at(ty).*.arrayLength - 1))
+    }
+    const raw = tokens.text(token)
+    var first: usize = 0
+    while first < raw.length && raw[first] != '"' { first += 1 }
+    var last = raw.length
+    while last > first + 1 && raw[last - 1] != '"' { last -= 1 }
+    if last <= first + 1 { return "" }
+    return raw[first + 1..last - 1]
+}
+
+// The text without the blanks, newlines and semicolons around it.
+// Whether an asm template names an operand (`%0`, `%[name]`; `%%` is
+// a `%`).
+fn namesOperand(text: []const u8) -> bool {
+    var i: usize = 0
+    while i < text.length {
+        if text[i] == '%' {
+            if i + 1 < text.length && text[i + 1] == '%' {
+                i += 2
+                continue
+            }
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// The template without blanks, `;` and the `\n`, `\t` escapes.
+fn squeezed(text: []const u8) -> []const u8 {
+    const out = base.alloc(text.length + 1)
+    var n: usize = 0
+    var i: usize = 0
+    while i < text.length {
+        const c = text[i]
+        if c == '\\' && i + 1 < text.length && (text[i + 1] == 'n' || text[i + 1] == 't') {
+            i += 2
+            continue
+        }
+        if c != ' ' && c != '\t' && c != '\n' && c != ';' {
+            base.put8(out + n, c)
+            n += 1
+        }
+        i += 1
+    }
+    return base.bytes(out, n)
+}
+
+fn trimmed(text: []const u8) -> []const u8 {
+    var start: usize = 0
+    var end = text.length
+    // (And the escapes `\n\t` written in the literal: `"cpuid\n\t"`.)
+    var changed = true
+    while changed {
+        changed = false
+        while start < end && isBlank(text[start]) { start += 1 }
+        while end > start && isBlank(text[end - 1]) { end -= 1 }
+        if end >= start + 2 && text[end - 2] == '\\' && (text[end - 1] == 'n' || text[end - 1] == 't') {
+            end -= 2
+            changed = true
+        }
+    }
+    return text[start..end]
+}
+
+fn isBlank(c: u8) -> bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '\\'
+}
+
+fn instruction(text: []const u8, token: usize) -> i64 {
+    if text.length == 0 { return ASM_NOTHING }
+    if base.same(text, "pause") || base.same(text, "rep; nop") || base.same(text, "rep nop") { return ASM_PAUSE }
+    if base.same(text, "int3") || base.same(text, "int $3") || base.same(text, "int $03") || base.same(text, "int $0x03") || base.same(text, "int $0x3") { return ASM_INT3 }
+    if base.same(text, "nop") { return ASM_NOP }
+    // `lock; orl $0, (%rsp)`: a full fence (as mfence is).
+    if base.same(text, "mfence") || base.same(text, "lock; orl $0, (%%rsp)") || base.same(text, "lock; orl $0, (%rsp)") || base.same(text, "lock; orl $0,(%%rsp)") || base.same(text, "lock; orl $0, (%%esp)") { return ASM_MFENCE }
+    if base.same(text, "lfence") { return ASM_LFENCE }
+    if base.same(text, "sfence") { return ASM_SFENCE }
+    if base.same(text, "ud2") { return ASM_UD2 }
+    if base.same(text, "cpuid") { return ASM_CPUID }
+    if base.same(text, "rdtsc") { return ASM_RDTSC }
+    if base.same(text, "xgetbv") { return ASM_XGETBV }
+    if base.same(text, "movq %%rsp, %0") || base.same(text, "mov %%rsp, %0") { return ASM_READ_SP }
+    const plain = squeezed(text)
+    const preamble = "rolq$3,%%rdirolq$13,%%rdirolq$61,%%rdirolq$51,%%rdi"
+    if base.startsWith(plain, preamble) {
+        const rest = plain[preamble.length..plain.length]
+        if base.same(rest, "xchgq%%rbx,%%rbx") { return ASM_VALGRIND_REQUEST }
+        if base.same(rest, "xchgq%%rcx,%%rcx") { return ASM_VALGRIND_NRADDR }
+    }
+    return -1
+}
+
+// `__builtin_sqrt(x)`, `__builtin_roundevenf(x)` and the other math
+// builtins of one or two floating arguments: libm's function of the
+// name (roundeven is rint: halves to even in the default rounding
+// mode), declared on first use; 0 for no such builtin.
+var mathDeclared: usize = 0
+
+pub fn mathBuiltin(name: u32, token: usize) -> usize {
+    const text = base.nameOf(name)
+    if text.length <= 10 || !base.same(text[0..10], "__builtin_") { return 0 }
+    const full = text[10..text.length]
+    var stem = full
+    var suffix: []const u8 = ""
+    var ty = types.doubleOf()
+    if !isMathName(stem) && stem.length > 1 && (stem[stem.length - 1] == 'f' || stem[stem.length - 1] == 'l') {
+        suffix = stem[stem.length - 1..stem.length]
+        ty = if suffix[0] == 'f' { types.floatOf() } else { types.ldoubleOf() }
+        stem = stem[0..stem.length - 1]
+    }
+    if !isMathName(stem) { return 0 }
+    const linkName = base.intern(base.join(if base.same(stem, "roundeven") { "rint" } else { stem }, suffix))
+    // Declared before (by a header or an earlier builtin): that one.
+    var c = mathDeclared
+    while c != 0 {
+        if @intCast(u32, base.getWord(c)) == linkName { return ast.variableNode(base.getWord(c + 8), token) }
+        c = base.getWord(c + 16)
+    }
+    const fnType = types.functionReturning(ty)
+    const first = types.newParam(ty, 0, 0)
+    types.at(fnType).*.params = first
+    if isBinaryMath(stem) { types.param(first).*.next = types.newParam(ty, 0, 0) }
+    const o = ast.newObj(linkName, fnType, token)
+    ast.obj(o).*.isFunction = true
+    ast.obj(o).*.isReferenced = true
+    ast.obj(o).*.externC = true
+    state.addGlobal(o)
+    const cell = base.alloc(24)
+    base.putWord(cell, @intCast(usize, linkName))
+    base.putWord(cell + 8, o)
+    base.putWord(cell + 16, mathDeclared)
+    mathDeclared = cell
+    return ast.variableNode(o, token)
+}
+
+fn isMathName(stem: []const u8) -> bool {
+    if isBinaryMath(stem) { return true }
+    if base.same(stem, "sqrt") || base.same(stem, "cbrt") || base.same(stem, "floor") || base.same(stem, "ceil") || base.same(stem, "round") { return true }
+    if base.same(stem, "roundeven") || base.same(stem, "trunc") || base.same(stem, "rint") || base.same(stem, "nearbyint") || base.same(stem, "sin") { return true }
+    if base.same(stem, "cos") || base.same(stem, "tan") || base.same(stem, "asin") || base.same(stem, "acos") || base.same(stem, "atan") { return true }
+    if base.same(stem, "sinh") || base.same(stem, "cosh") || base.same(stem, "tanh") || base.same(stem, "exp") || base.same(stem, "exp2") { return true }
+    if base.same(stem, "expm1") || base.same(stem, "log") || base.same(stem, "log2") || base.same(stem, "log10") || base.same(stem, "log1p") { return true }
+    if base.same(stem, "erf") || base.same(stem, "erfc") || base.same(stem, "lgamma") || base.same(stem, "tgamma") || base.same(stem, "logb") { return true }
+    return false
+}
+
+fn isBinaryMath(stem: []const u8) -> bool {
+    return base.same(stem, "pow") || base.same(stem, "atan2") || base.same(stem, "fmod") || base.same(stem, "copysign") || base.same(stem, "fmin") || base.same(stem, "fmax") || base.same(stem, "hypot") || base.same(stem, "remainder") || base.same(stem, "nextafter") || base.same(stem, "fdim")
+}
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepState() -> void {
+    base.keepState(@intFromPtr(&placeKind), @sizeOf(@typeOf(placeKind)))
+    base.keepState(@intFromPtr(&placeSlot), @sizeOf(@typeOf(placeSlot)))
+    base.keepState(@intFromPtr(&placeValue), @sizeOf(@typeOf(placeValue)))
+    base.keepState(@intFromPtr(&placeType), @sizeOf(@typeOf(placeType)))
+    base.keepState(@intFromPtr(&uniqueAsm), @sizeOf(@typeOf(uniqueAsm)))
+    base.keepState(@intFromPtr(&mathDeclared), @sizeOf(@typeOf(mathDeclared)))
+}
+// --- end of prefix snapshot state ---

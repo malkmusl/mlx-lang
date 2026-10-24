@@ -1,0 +1,573 @@
+// std.http.cookie: cookies (RFC 6265) as libsoup reads, writes and matches
+// them. A Set-Cookie value is NAME=VALUE (a NAME may be missing: the whole
+// is the value then) and attributes after `;`, each `name` or
+// `name=value`; they are read in order, as later ones override earlier
+// ones (an Expires after a Max-Age wins, and the other way round). A
+// cookie's domain matches a host that is it, or ends with it when it
+// starts with a dot; its path matches a request's path that starts with
+// it at a `/`.
+//
+// A Cookie owns its texts (one block of an allocator, freed with
+// cookieFree) or borrows them (a view, which frees nothing). Its expiry
+// is seconds since the Unix epoch; a session cookie has none.
+//
+//     var cookie: cookie.Cookie = undefined
+//     if cookie.parseSetCookie(allocator, "id=7; Path=/; Max-Age=60", true, "www.example.com", "/a/b", now, &cookie) {
+//         cookie.writeSetCookie(sink, &cookie)   // id=7; expires=...; path=/; domain=www.example.com; SameSite=Lax
+//         cookie.cookieFree(allocator, &cookie)
+//     }
+const headers = @import("./headers.mlx")
+const date = @import("./date.mlx")
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const SameSite = enum(u8) {
+    none,
+    lax,
+    strict
+}
+
+pub const Cookie = struct {
+    name: []const u8
+    value: []const u8
+    domain: []const u8
+    path: []const u8
+    hasDomain: bool
+    hasPath: bool
+    // Seconds since the Unix epoch; none for a session cookie.
+    hasExpires: bool
+    expires: i64
+    secure: bool
+    httpOnly: bool
+    sameSite: SameSite
+    // The block the texts live in when the cookie owns them (capacity 0:
+    // a view).
+    storage: [*]u8
+    capacity: usize
+}
+
+fn isWhite(c: u8) -> bool { return c == 32 || c == 9 }
+
+fn skipWhite(text: []const u8, at: usize) -> usize {
+    var i = at
+    while i < text.length && isWhite(text[i]) { i += 1 }
+    return i
+}
+
+fn unskipWhite(text: []const u8, at: usize, start: usize) -> usize {
+    var i = at
+    while i > start && isWhite(text[i - 1]) { i -= 1 }
+    return i
+}
+
+fn endsAttribute(c: u8) -> bool { return c == 59 || c == 44 || c == 61 }
+
+// A value from `at` (past its `=`, if there is one) to the next `;`, its
+// spaces around taken off; `at` is left at the `;` (or the end).
+pub fn value(text: []const u8, at: *usize) -> []const u8 {
+    var p = at.*
+    if p < text.length && text[p] == 61 { p += 1 }
+    const start = skipWhite(text, p)
+    p = start
+    while p < text.length && text[p] != 59 { p += 1 }
+    const end = unskipWhite(text, p, start)
+    at.* = p
+    return text[start..end]
+}
+
+// The NAME and VALUE that start a Set-Cookie value; `at` is left where the
+// attributes start. A value with no `=` before its first `;` or `,` has no
+// name: the NAME is empty and all of it is the VALUE.
+pub fn nameAndValue(text: []const u8, name: *[]const u8, cookieValue: *[]const u8) -> usize {
+    const start = skipWhite(text, 0)
+    var p = start
+    while p < text.length && !endsAttribute(text[p]) { p += 1 }
+    if p < text.length && text[p] == 61 {
+        name.* = text[start..unskipWhite(text, p, start)]
+    } else {
+        name.* = text[0..0]
+        p = start
+    }
+    cookieValue.* = value(text, &p)
+    return p
+}
+
+pub const Attribute = struct {
+    name: []const u8
+    value: []const u8
+    hasValue: bool
+}
+
+// The attribute after `at` (at a `;`), false when there is none; `at` is
+// left at the `;` after it.
+pub fn nextAttribute(text: []const u8, at: *usize, attribute: *Attribute) -> bool {
+    if at.* >= text.length || text[at.*] != 59 { return false }
+    const start = skipWhite(text, at.* + 1)
+    var p = start
+    while p < text.length && !endsAttribute(text[p]) { p += 1 }
+    const end = unskipWhite(text, p, start)
+    const hasValue = p < text.length && text[p] == 61
+    attribute.*.name = text[start..end]
+    attribute.*.hasValue = hasValue
+    // (An attribute without a value ends where its name does: at a `;`,
+    // or at a `,`, which ends the attributes, as in libsoup.)
+    attribute.*.value = text[0..0]
+    if hasValue { attribute.*.value = value(text, &p) }
+    at.* = p
+    return true
+}
+
+// libsoup's soup_host_matches_host: the same host (case aside), or a
+// domain starting with a dot that the host is (without the dot) or ends
+// with (case kept).
+pub fn hostMatches(domain: []const u8, host: []const u8) -> bool {
+    if headers.equalsIgnoringCase(domain, host) { return true }
+    if domain.length == 0 || domain[0] != 46 { return false }
+    if headers.equalsIgnoringCase(domain[1..domain.length], host) { return true }
+    if host.length < domain.length { return false }
+    const tail = host[host.length - domain.length..host.length]
+    var index: usize = 0
+    while index < domain.length {
+        if tail[index] != domain[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Whether a cookie of `path` goes with a request for `requestPath`: an
+// empty path goes with all; else the request's path starts with it, and
+// either the cookie's path ends with `/` or the request's continues with
+// one (or ends there).
+pub fn pathMatches(path: []const u8, requestPath: []const u8) -> bool {
+    if path.length == 0 { return true }
+    if requestPath.length < path.length {
+        // (libsoup's strncmp stops at the shorter one's end: a request path
+        // shorter than the cookie's never matches.)
+        return false
+    }
+    var index: usize = 0
+    while index < path.length {
+        if path[index] != requestPath[index] { return false }
+        index += 1
+    }
+    if path[path.length - 1] != 47 && requestPath.length > path.length && requestPath[path.length] != 47 { return false }
+    return true
+}
+
+// The default path of a cookie from a request's path: up to its last `/`
+// (not counting a first one), else "/".
+pub fn defaultPath(requestPath: []const u8) -> []const u8 {
+    var slash = requestPath.length
+    var i = requestPath.length
+    while i > 0 {
+        i -= 1
+        if requestPath[i] == 47 {
+            slash = i
+            break
+        }
+    }
+    if slash == requestPath.length || slash == 0 { return "/" }
+    return requestPath[0..slash]
+}
+
+// ---------------------------------------------------------------------------
+// Host names
+
+fn isDigit(c: u8) -> bool { return c >= 48 && c <= 57 }
+
+fn isIpv4(host: []const u8) -> bool {
+    var at: usize = 0
+    var octets: usize = 0
+    while octets < 4 {
+        var digits: usize = 0
+        var number: u64 = 0
+        while at < host.length && isDigit(host[at]) {
+            number = number * 10 + @intCast(u64, host[at] - 48)
+            if number > 255 { return false }
+            digits += 1
+            at += 1
+        }
+        if digits == 0 { return false }
+        octets += 1
+        if octets < 4 {
+            if at >= host.length || host[at] != 46 { return false }
+            at += 1
+        }
+    }
+    return at == host.length
+}
+
+fn isHexDigit(c: u8) -> bool { return isDigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70) }
+
+fn isIpv6(host: []const u8) -> bool {
+    if headers.indexOf(host, 58, 0) == host.length { return false }
+    var groups: usize = 0
+    var doubleColon = false
+    var at: usize = 0
+    // An embedded IPv4 address at the end counts as two groups.
+    var tail = host.length
+    var lastColon: usize = 0
+    var i: usize = 0
+    while i < host.length {
+        if host[i] == 58 { lastColon = i }
+        i += 1
+    }
+    if headers.indexOf(host, 46, lastColon) < host.length {
+        if !isIpv4(host[lastColon + 1..host.length]) { return false }
+        tail = lastColon + 1
+        groups = 2
+    }
+    if tail >= 2 && host[0] == 58 && host[1] == 58 {
+        doubleColon = true
+        at = 2
+    } else if host[0] == 58 {
+        return false
+    }
+    while at < tail {
+        var digits: usize = 0
+        while at < tail && isHexDigit(host[at]) {
+            digits += 1
+            at += 1
+        }
+        if digits == 0 || digits > 4 { return false }
+        groups += 1
+        if at == tail { break }
+        if host[at] != 58 { return false }
+        at += 1
+        if at < tail && host[at] == 58 {
+            if doubleColon { return false }
+            doubleColon = true
+            at += 1
+        } else if at == tail {
+            return false
+        }
+    }
+    if doubleColon { return groups < 8 }
+    return groups == 8
+}
+
+// GLib's g_hostname_is_ip_address: an IPv4 or IPv6 address literal.
+pub fn isIpAddress(host: []const u8) -> bool { return isIpv4(host) || isIpv6(host) }
+
+// ---------------------------------------------------------------------------
+// Cookies made and freed
+
+// A cookie that borrows its texts.
+pub fn view(name: []const u8, cookieValue: []const u8, domain: []const u8, hasDomain: bool, path: []const u8, hasPath: bool) -> Cookie {
+    var cookie: Cookie = undefined
+    cookie.name = name
+    cookie.value = cookieValue
+    cookie.domain = domain
+    cookie.hasDomain = hasDomain
+    cookie.path = path
+    cookie.hasPath = hasPath
+    cookie.hasExpires = false
+    cookie.expires = 0
+    cookie.secure = false
+    cookie.httpOnly = false
+    cookie.sameSite = SameSite.lax
+    cookie.capacity = 0
+    return cookie
+}
+
+fn place(storage: [*]u8, at: *usize, text: []const u8) -> []const u8 {
+    const start = at.*
+    var i: usize = 0
+    while i < text.length {
+        storage[start + i] = text[i]
+        i += 1
+    }
+    at.* = start + text.length
+    return storage[start..start + text.length]
+}
+
+// A cookie of its own with these texts (its other fields as a view's:
+// no expiry, SameSite Lax); false when memory failed.
+pub fn make(allocator: Allocator, name: []const u8, cookieValue: []const u8, domain: []const u8, hasDomain: bool, path: []const u8, hasPath: bool, out: *Cookie) -> bool {
+    var cookie = view(name, cookieValue, domain, hasDomain, path, hasPath)
+    if !own(allocator, &cookie) { return false }
+    out.* = cookie
+    return true
+}
+
+// Gives a view texts of its own (a block of the allocator); a cookie that
+// owns its texts already is copied into a new block.
+pub fn own(allocator: Allocator, cookie: *Cookie) -> bool {
+    var total = cookie.*.name.length + cookie.*.value.length + cookie.*.domain.length + cookie.*.path.length
+    if total == 0 { total = 1 }
+    const memory = allocator.alloc(total, 1)
+    if memory == null { return false }
+    const storage = memory.?
+    var at: usize = 0
+    const name = place(storage, &at, cookie.*.name)
+    const cookieValue = place(storage, &at, cookie.*.value)
+    const domain = place(storage, &at, cookie.*.domain)
+    const path = place(storage, &at, cookie.*.path)
+    if cookie.*.capacity != 0 { allocator.free(cookie.*.storage, cookie.*.capacity, 1) }
+    cookie.*.name = name
+    cookie.*.value = cookieValue
+    cookie.*.domain = domain
+    cookie.*.path = path
+    cookie.*.storage = storage
+    cookie.*.capacity = total
+    return true
+}
+
+// A copy of `cookie` that owns its texts.
+pub fn copy(allocator: Allocator, cookie: *const Cookie, out: *Cookie) -> bool {
+    var made = cookie.*
+    made.capacity = 0
+    if !own(allocator, &made) { return false }
+    out.* = made
+    return true
+}
+
+pub fn cookieFree(allocator: Allocator, cookie: *Cookie) -> void {
+    if cookie.*.capacity != 0 { allocator.free(cookie.*.storage, cookie.*.capacity, 1) }
+    cookie.*.capacity = 0
+}
+
+// Sets one of the texts (the cookie's block is made again).
+pub const Field = enum(u8) {
+    name,
+    value,
+    domain,
+    path
+}
+
+pub fn setText(allocator: Allocator, cookie: *Cookie, field: Field, text: []const u8, present: bool) -> bool {
+    var changed = cookie.*
+    changed.capacity = 0
+    if field == Field.name { changed.name = text }
+    if field == Field.value { changed.value = text }
+    if field == Field.domain {
+        changed.domain = text
+        changed.hasDomain = present
+    }
+    if field == Field.path {
+        changed.path = text
+        changed.hasPath = present
+    }
+    if !own(allocator, &changed) { return false }
+    cookieFree(allocator, cookie)
+    cookie.* = changed
+    return true
+}
+
+// libsoup's soup_cookie_set_max_age at `now`: -1 for no expiry, 0 for a
+// date long past (the cookie is gone at once), else `maxAge` seconds from
+// now.
+pub fn setMaxAge(cookie: *Cookie, maxAge: i32, now: i64) -> void {
+    if maxAge == -1 {
+        cookie.*.hasExpires = false
+        cookie.*.expires = 0
+    } else if maxAge == 0 {
+        cookie.*.hasExpires = true
+        cookie.*.expires = 0
+    } else {
+        cookie.*.hasExpires = true
+        cookie.*.expires = now + @intCast(i64, maxAge)
+    }
+}
+
+// Whether the cookie's expiry (if it has one) is before `now`.
+pub fn isExpired(cookie: *const Cookie, now: i64) -> bool { return cookie.*.hasExpires && cookie.*.expires < now }
+
+// Whether the cookie goes with a request: not secure over plain HTTP, not
+// expired, and its path matching the request's (`requestPath`
+// normalized).
+pub fn appliesTo(cookie: *const Cookie, https: bool, requestPath: []const u8, now: i64) -> bool {
+    if cookie.*.secure && !https { return false }
+    if isExpired(cookie, now) { return false }
+    if cookie.*.path.length == 0 { return true }
+    return pathMatches(cookie.*.path, requestPath)
+}
+
+// libsoup's soup_cookie_equal: the same name, value and path.
+pub fn equal(a: *const Cookie, b: *const Cookie) -> bool {
+    if !sameText(a.*.name, b.*.name) || !sameText(a.*.value, b.*.value) { return false }
+    if a.*.hasPath != b.*.hasPath { return false }
+    return sameText(a.*.path, b.*.path)
+}
+
+pub fn sameText(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var index: usize = 0
+    while index < a.length {
+        if a[index] != b[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Reading Set-Cookie
+
+// C's strtol of all of `text` (spaces and a sign allowed first; nothing
+// after the digits).
+fn parseLong(text: []const u8, result: *i64) -> bool {
+    var i: usize = 0
+    while i < text.length && headers.isSpace(text[i]) { i += 1 }
+    var negative = false
+    if i < text.length && (text[i] == 43 || text[i] == 45) {
+        negative = text[i] == 45
+        i += 1
+    }
+    const start = i
+    var v: i64 = 0
+    while i < text.length && isDigit(text[i]) {
+        if v < 922337203685477580 { v = v * 10 + @intCast(i64, text[i] - 48) } else { v = 9223372036854775807 }
+        i += 1
+    }
+    // (No digits: strtol leaves nothing read, and the whole text is left.)
+    if i == start { return text.length == 0 }
+    if i != text.length { return false }
+    result.* = if negative { 0 - v } else { v }
+    return true
+}
+
+// libsoup's parse_one_cookie: the cookie of a Set-Cookie value, against
+// the request it came from (`hasOrigin`: its host and normalized path),
+// at `now` (for Max-Age); false when it is refused (a domain without a
+// dot, or one the origin's host is not in) or memory failed. The cookie
+// owns its texts.
+pub fn parseSetCookie(allocator: Allocator, text: []const u8, hasOrigin: bool, originHost: []const u8, originPath: []const u8, now: i64, out: *Cookie) -> bool {
+    var cookie = view(text[0..0], text[0..0], text[0..0], false, text[0..0], false)
+    var at = nameAndValue(text, &cookie.name, &cookie.value)
+    var attribute: Attribute = undefined
+    while nextAttribute(text, &at, &attribute) {
+        const n = attribute.name
+        if headers.equalsIgnoringCase(n, "domain") && attribute.hasValue {
+            cookie.domain = attribute.value
+            cookie.hasDomain = attribute.value.length > 0
+        } else if headers.equalsIgnoringCase(n, "expires") && attribute.hasValue {
+            // (Each Expires replaces the expiry, even one that cannot be
+            // read: the cookie has none then.)
+            var d: date.Date = undefined
+            cookie.hasExpires = date.parse(attribute.value, &d)
+            cookie.expires = if cookie.hasExpires { date.toUnix(&d) } else { 0 }
+        } else if headers.equalsIgnoringCase(n, "httponly") {
+            cookie.httpOnly = true
+        } else if headers.equalsIgnoringCase(n, "max-age") && attribute.hasValue {
+            var maxAge: i64 = 0
+            if parseLong(attribute.value, &maxAge) {
+                if maxAge < 0 { maxAge = 0 }
+                // (An int, as libsoup's soup_cookie_set_max_age takes.)
+                setMaxAge(&cookie, @bitCast(i32, @intCast(u32, @bitCast(u64, maxAge) & 0xffffffff)), now)
+            }
+        } else if headers.equalsIgnoringCase(n, "path") && attribute.hasValue {
+            cookie.hasPath = attribute.value.length > 0 && attribute.value[0] == 47
+            cookie.path = if cookie.hasPath { attribute.value } else { text[0..0] }
+        } else if headers.equalsIgnoringCase(n, "secure") {
+            cookie.secure = true
+        } else if headers.equalsIgnoringCase(n, "samesite") {
+            if attribute.hasValue {
+                if headers.equalsIgnoringCase(attribute.value, "None") {
+                    cookie.sameSite = SameSite.none
+                } else if headers.equalsIgnoringCase(attribute.value, "Strict") {
+                    cookie.sameSite = SameSite.strict
+                }
+            }
+        }
+    }
+    var dotted: [256]u8 = undefined
+    if cookie.hasDomain {
+        // A domain needs a dot past its first character; one that is not an
+        // address gets a dot first.
+        const d = cookie.domain
+        if d.length < 2 || headers.indexOf(d, 46, 1) >= d.length { return false }
+        if !isIpAddress(d) && d[0] != 46 {
+            if d.length + 1 > 256 { return false }
+            dotted[0] = 46
+            var i: usize = 0
+            while i < d.length {
+                dotted[1 + i] = d[i]
+                i += 1
+            }
+            cookie.domain = dotted[0..d.length + 1]
+        }
+    }
+    if hasOrigin {
+        if cookie.hasDomain {
+            if !hostMatches(cookie.domain, originHost) { return false }
+        } else {
+            cookie.domain = originHost
+            cookie.hasDomain = true
+        }
+        if !cookie.hasPath {
+            cookie.path = defaultPath(originPath)
+            cookie.hasPath = true
+        }
+    } else if !cookie.hasPath {
+        cookie.path = "/"
+        cookie.hasPath = true
+    }
+    // The texts into a block of their own.
+    if !own(allocator, &cookie) { return false }
+    out.* = cookie
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// libsoup's serialize_cookie: as a Set-Cookie value (`setCookie`) or as a
+// Cookie header's `name=value`; a cookie with neither name nor value
+// writes nothing. `first` is false when another cookie was written before
+// into the same header (", " or "; " goes between).
+pub fn write(sink: headers.Sink, cookie: *const Cookie, setCookie: bool, first: bool) -> void {
+    if cookie.*.name.length == 0 && cookie.*.value.length == 0 { return }
+    if !first { headers.put(sink, if setCookie { ", " } else { "; " }) }
+    if setCookie || cookie.*.name.length > 0 {
+        headers.put(sink, cookie.*.name)
+        headers.putByte(sink, 61)
+    }
+    headers.put(sink, cookie.*.value)
+    if !setCookie { return }
+    if cookie.*.hasExpires {
+        headers.put(sink, "; expires=")
+        date.writeUnix(sink, cookie.*.expires, true)
+    }
+    if cookie.*.hasPath {
+        headers.put(sink, "; path=")
+        headers.put(sink, cookie.*.path)
+    }
+    if cookie.*.hasDomain {
+        headers.put(sink, "; domain=")
+        headers.put(sink, cookie.*.domain)
+    }
+    if cookie.*.sameSite != SameSite.none {
+        headers.put(sink, "; SameSite=")
+        headers.put(sink, if cookie.*.sameSite == SameSite.lax { "Lax" } else { "Strict" })
+    }
+    if cookie.*.secure { headers.put(sink, "; secure") }
+    if cookie.*.httpOnly { headers.put(sink, "; HttpOnly") }
+}
+
+pub fn writeSetCookie(sink: headers.Sink, cookie: *const Cookie) -> void { write(sink, cookie, true, true) }
+
+pub fn writeCookieHeader(sink: headers.Sink, cookie: *const Cookie) -> void { write(sink, cookie, false, true) }
+
+// The cookies of a request's Cookie header (`name=value; name2=value2`),
+// one at a time as views (`at` moves on; false at the end): a pair
+// without a name or a value is passed over, as libsoup passes it over.
+pub fn nextInHeader(header: []const u8, at: *usize, out: *Cookie) -> bool {
+    var items = headers.List.{ .text = header, .at = at.*, .delim = 59 }
+    var item: []const u8 = ""
+    while headers.next(&items, &item) {
+        var p: headers.Param = undefined
+        at.* = items.at
+        if !headers.param(item, &p) || p.kind == headers.ParamKind.bare || p.kind == headers.ParamKind.extended { continue }
+        var pairValue = p.value
+        if p.kind == headers.ParamKind.quoted {
+            // (libsoup unquotes a quoted value; the quotes are left here,
+            // a cookie value being opaque: the caller may decodeQuoted.)
+            pairValue = p.value
+        }
+        out.* = view(p.name, pairValue, header[0..0], false, header[0..0], false)
+        return true
+    }
+    at.* = items.at
+    return false
+}

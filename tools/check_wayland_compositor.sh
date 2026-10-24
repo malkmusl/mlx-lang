@@ -135,6 +135,51 @@ run_scenario() {
     wait "$host_pid" || { echo "test host failed ($name):" >&2; cat "$work/$name-host.log" >&2; exit 1; }
 }
 
+# Greeter mode has one trusted client connection of its own.  A second
+# client can still connect to the public socket (the socket must remain a
+# normal Wayland display), but it must neither become visible nor take the
+# keyboard.  The wrapper gives the terminal shells different directories so
+# the typed `pwd` says which one received the command.
+mkdir -p "$work/greeter-dir" "$work/attacker-dir"
+cat > "$work/greeter-wrapper" <<SCRIPT
+#!/bin/sh
+(
+    sleep 1
+    unset WAYLAND_SOCKET
+    cd "$work/attacker-dir" || exit 1
+    exec "$work/mlx-terminal"
+) &
+cd "$work/greeter-dir" || exit 1
+exec "$work/mlx-terminal"
+SCRIPT
+chmod +x "$work/greeter-wrapper"
+cat > "$work/blocked-helper" <<SCRIPT
+#!/bin/sh
+echo started >> "$work/greeter-blocked.marker"
+SCRIPT
+chmod +x "$work/blocked-helper"
+cat > "$work/greeter.script" <<SCRIPT
+wait 2500
+pointer 200 200
+press 272
+release 272
+wait 300
+type pwd > $work/greeter-input.marker
+enter
+wait 500
+down 56
+down 28
+up 28
+up 56
+wait 500
+close
+SCRIPT
+run_scenario greeter "$work/greeter.script" --greeter "$work/greeter-wrapper" --run "$work/blocked-helper" --terminal "$work/blocked-helper" --launcher "$work/blocked-helper" --dock "$work/blocked-helper" --topbar "$work/blocked-helper" --xwayland "$work/blocked-helper"
+[[ "$(cat "$work/greeter-input.marker" 2> /dev/null)" == "$work/greeter-dir" ]] || { echo "a non-greeter surface received input in greeter mode" >&2; cat "$work/greeter-compositor.log" >&2; exit 1; }
+[[ ! -e "$work/greeter-blocked.marker" ]] || { echo "an ordinary program or desktop helper started in greeter mode" >&2; cat "$work/greeter-compositor.log" >&2; exit 1; }
+echo "ok   greeter mode starts only its trusted client and gives only it input"
+if [[ ${MLX_WAYLAND_GREETER_ONLY:-0} == 1 ]]; then exit 0; fi
+
 # Scenario 1: Mlx terminals (the terminal's title follows its shell once
 # bash names it, so the log lines are matched by their kind alone).
 cat > "$work/terminal.script" <<SCRIPT
@@ -835,7 +880,8 @@ echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up 
 # its sidebar 28 pixels apart from y 44: General, Network, Display, Sound,
 # Apps, Window management, Top bar, Appearance, Language; on the Window management page the
 # hotkey rows 34 pixels apart from y 436, on the General page the
-# terminal's at y 186). Maximize gets Super+Shift+M; minimize gets
+# terminal's at y 375, under the dock's three choices and its workspace
+# switch). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
 "$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/mlx-settings"
@@ -870,7 +916,7 @@ pointer 124 82
 press 272
 release 272
 wait 300
-pointer 524 225
+pointer 524 375
 press 272
 release 272
 wait 300
@@ -1401,9 +1447,12 @@ else
     echo "skip GTK 3 is not installed"
 fi
 
-# Scenario 6: copy and paste between two clients through the compositor's
-# wl_data_device_manager, with wl-clipboard (if available): wl-copy sets
-# the selection, wl-paste (another client) reads it through a pipe.
+# Scenario 6: copy and paste between two clients through the compositor,
+# with wl-clipboard (if available): wl-copy sets the selection, wl-paste
+# (another client) reads it through a pipe. wl-clipboard takes the
+# data-control protocol where it is offered (data_control.mlx); the data
+# device between windows is check_desktop_clients.sh's (mlx-terminal,
+# mlx-files).
 if command -v wl-copy > /dev/null && command -v wl-paste > /dev/null; then
     cat > "$work/clipboard.sh" <<SCRIPT
 #!/bin/sh

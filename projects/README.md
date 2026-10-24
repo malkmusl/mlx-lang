@@ -8,7 +8,8 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   - [`compositor/`](desktop/compositor/README.md): the Wayland compositor
     (nested or on DRM/KMS, CPU or Vulkan composition, hot-reloadable
     shell and renderer); `tools/check_wayland_compositor.sh`,
-    `tools/check_compositor_drm.sh`, `tools/check_compositor_modules.sh`.
+    `tools/check_compositor_drm.sh`, `tools/check_compositor_device.sh`,
+    `tools/check_compositor_modules.sh`, `tools/check_wayland_protocols.sh`.
   - `dock/`, `launcher/`, `topbar/`, `settings/`, `files/`: the desktop's
     clients (the dock, the application launcher, the top bar, the
     settings and the file manager); `tools/check_desktop_clients.sh`.
@@ -16,6 +17,11 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   - [`terminal/`](desktop/terminal/README.md): the terminal emulator, a
     window around `std.terminal` and `std.ui.terminal`;
     `tools/check_terminal.sh`.
+  - [`splash/`](desktop/splash/README.md): mlx-splash, the boot splash
+    in place of Plymouth (the MLX letters with orbiting rings and the
+    Observatory's code graph, on KMS or the framebuffer, Plymouth's
+    protocol for systemd) and mlx-splashctl; `tools/install_splash.sh`;
+    `tools/check_splash.sh`.
   - `shared/`: what the desktop's clients share: the drawing canvas (CPU
     and GPU), the layer-shell and window surface (`panel.mlx`), keyboard
     text, desktop entries and icons, places and the trash, thumbnails,
@@ -30,11 +36,15 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   `tools/mlx-lsp`); `tools/check_observatory.sh`.
 - [`coreutils/`](coreutils/README.md): Linux userland programs;
   `projects/coreutils/build.sh` and `test.sh`.
-- [`libc/`](libc/README.md): mlxlibc, the C library and dynamic loader in
-  Mlx for legacy programs; `tools/check_mlxlibc.sh`.
-- [`cc/`](cc/README.md): mlx-cc, the C compiler in Mlx (preprocessor,
-  parser, x86_64 code and ELF written itself, its own headers);
-  `tools/check_cc.sh`.
+- [`libc/`](libc/README.md): mlxlibc, the C library, libm and dynamic
+  loader in Mlx for legacy programs; `tools/check_mlxlibc.sh`.
+- [`libcpp/`](libcpp/README.md): mlxlibcpp, the C++ standard library for
+  mlx-cc (`std::string`, `<iostream>`, `<vector>`, `<algorithm>`, new and
+  delete, the `c*` headers); `tools/check_cpp.sh`.
+- [`cc/`](cc/README.md): mlx-cc, the C compiler in Mlx (C89 to C23 and
+  the GNU variants, preprocessor, parser, x86_64 code and ELF written
+  itself, its own headers); `tools/check_cc.sh`, and
+  `tools/check_cc_projects.sh` for zlib, Lua and SQLite.
 - [`init/`](init/README.md): mlx-init, PID 1 of MLX/Linux (mounts,
   services, supervision, the control socket, shutdown) and mlx-initctl;
   `tools/check_init.sh`.

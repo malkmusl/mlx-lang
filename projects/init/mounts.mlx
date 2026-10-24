@@ -1,12 +1,14 @@
 // The file systems: the virtual ones every system needs (mounted as PID 1
-// when they are not there yet), then the mounts file, whose lines are
-// fstab's first four fields:
+// when they are not there yet), then /etc/fstab. All six fields are read:
 //
-//     /dev/sda2  /home  ext4   defaults,noatime
-//     tmpfs      /tmp   tmpfs  mode=1777
+//     /dev/sda2  /home  ext4   defaults,noatime  0  2
+//     tmpfs      /tmp   tmpfs  mode=1777         0  0
 //
-// (`noauto` skips a line, swap and `none` are left alone). A mount that
-// fails is said and does not stop the boot.
+// The fifth (dump) field is accepted for compatibility. The sixth orders
+// checks: pass 1 first (normally root), then each larger pass. `noauto`
+// skips both checking and mounting; swap and `none` are left alone. Fstab
+// octal escapes such as \040 are decoded before a path reaches the kernel.
+// A mount or check that fails is said and does not silently count as success.
 const std = @import("std")
 const linux = @import("./linux.mlx")
 const config = @import("./config.mlx")
@@ -17,11 +19,11 @@ const PROC_MAGIC: isize = 40864
 const SYSFS_MAGIC: isize = 1650812274
 const TMPFS_MAGIC: isize = 16914836
 const DEVPTS_MAGIC: isize = 7377
-const EBUSY: isize = -16
+const FIELD_CAPACITY: usize = 512
 
 // Mounts `kind` at `target` unless a file system of that type is there.
 fn ensure(target: []const u8, source: []const u8, kind: []const u8, magic: isize, flags: usize, data: []const u8) -> void {
-    const made = linux.makeDirectory(target, 493)
+    _ = linux.makeDirectory(target, 493)
     if linux.fileSystemType(target) == magic { return }
     const mounted = linux.mount(source, target, kind, flags, data)
     if mounted != 0 { config.sayFailed("could not mount ", target, mounted) }
@@ -37,14 +39,220 @@ pub fn early() -> void {
     ensure("/run", "tmpfs", "tmpfs", TMPFS_MAGIC, linux.MS_NOSUID | linux.MS_NODEV, "mode=0755")
 }
 
-fn blank(byte: u8) -> bool { return byte == 32 || byte == 9 }
-
 // The next blank-separated field of `line` from `at`; empty at the end.
 fn nextField(line: []const u8, at: *usize) -> []const u8 {
-    while at.* < line.length && blank(line[at.*]) { at.* += 1 }
+    while at.* < line.length && std.ascii.isBlank(line[at.*]) { at.* += 1 }
     const start = at.*
-    while at.* < line.length && !blank(line[at.*]) { at.* += 1 }
+    while at.* < line.length && !std.ascii.isBlank(line[at.*]) { at.* += 1 }
     return line[start..at.*]
+}
+
+fn octal(byte: u8) -> bool { return byte >= 48 && byte <= 55 }
+
+// fstab uses octal escapes because its fields remain whitespace separated.
+// Decode every three-digit escape, not just \040 and \011: \134 (a literal
+// backslash) and escaped comment characters are common too.
+fn decode(field: []const u8, into: [*]u8, capacity: usize) -> []const u8 {
+    var at: usize = 0
+    var length: usize = 0
+    while at < field.length && length < capacity {
+        if field[at] == 92 && at + 3 < field.length && octal(field[at + 1]) && octal(field[at + 2]) && octal(field[at + 3]) {
+            into[length] = (field[at + 1] - 48) * 64 + (field[at + 2] - 48) * 8 + field[at + 3] - 48
+            at += 4
+        } else {
+            into[length] = field[at]
+            at += 1
+        }
+        length += 1
+    }
+    return into[0..length]
+}
+
+fn starts(text: []const u8, prefix: []const u8) -> bool {
+    return text.length >= prefix.length && std.text.same(text[0..prefix.length], prefix)
+}
+
+// mount(2) accepts a path, not fstab's UUID=/LABEL= notation. The stable
+// symlinks created below /dev/disk retain that notation without needing a
+// libc or libblkid resolver. A value too long for the bounded path buffer is
+// left unchanged so the kernel reports the same failure as for any bad
+// source rather than mounting some truncated device name.
+fn resolvedSource(source: []const u8, into: [*]u8, capacity: usize) -> []const u8 {
+    var marker: []const u8 = ""
+    var directory: []const u8 = ""
+    if starts(source, "UUID=") {
+        marker = "UUID="
+        directory = "/dev/disk/by-uuid/"
+    } else if starts(source, "LABEL=") {
+        marker = "LABEL="
+        directory = "/dev/disk/by-label/"
+    } else if starts(source, "PARTUUID=") {
+        marker = "PARTUUID="
+        directory = "/dev/disk/by-partuuid/"
+    } else if starts(source, "PARTLABEL=") {
+        marker = "PARTLABEL="
+        directory = "/dev/disk/by-partlabel/"
+    } else {
+        return source
+    }
+    const value = source[marker.length..source.length]
+    if value.length == 0 || directory.length + value.length > capacity { return source }
+    var length = std.text.append(into, 0, capacity, directory)
+    length = std.text.append(into, length, capacity, value)
+    return into[0..length]
+}
+
+fn number(field: []const u8, valid: *bool) -> usize {
+    if field.length == 0 { return 0 }
+    var result: usize = 0
+    var index: usize = 0
+    while index < field.length {
+        if field[index] < 48 || field[index] > 57 || result > 1000000 {
+            valid.* = false
+            return 0
+        }
+        result = result * 10 + @intCast(usize, field[index] - 48)
+        index += 1
+    }
+    return result
+}
+
+fn skipped(kind: []const u8, target: []const u8, options: []const u8) -> bool {
+    if target.length == 0 || kind.length == 0 || std.text.same(target, "none") || std.text.same(kind, "swap") { return true }
+    var start: usize = 0
+    while start < options.length {
+        var end = start
+        while end < options.length && options[end] != 44 { end += 1 }
+        if std.text.same(options[start..end], "noauto") { return true }
+        start = end + 1
+    }
+    return false
+}
+
+// One synchronous fsck invocation. The front-end chooses the checker for
+// `kind`; Mlx only supplies automatic repair, the type, and the source.
+fn executeCheck(program: []const u8, source: []const u8, kind: []const u8) -> usize {
+    var programBuffer: [FIELD_CAPACITY]u8 = undefined
+    var sourceBuffer: [FIELD_CAPACITY]u8 = undefined
+    var kindBuffer: [FIELD_CAPACITY]u8 = undefined
+    var programBytes: [*]u8 = undefined
+    var sourceBytes: [*]u8 = undefined
+    var kindBytes: [*]u8 = undefined
+    unsafe {
+        programBytes = @ptrCast([*]u8, &programBuffer)
+        sourceBytes = @ptrCast([*]u8, &sourceBuffer)
+        kindBytes = @ptrCast([*]u8, &kindBuffer)
+    }
+    const programPointer = std.text.zeroTerminated(programBytes, FIELD_CAPACITY, program)
+    const sourcePointer = std.text.zeroTerminated(sourceBytes, FIELD_CAPACITY, source)
+    const kindPointer = std.text.zeroTerminated(kindBytes, FIELD_CAPACITY, kind)
+    var arguments: [6][*]const u8 = undefined
+    var environment: [2][*]const u8 = undefined
+    unsafe {
+        arguments[0] = programPointer
+        arguments[1] = @ptrCast([*]const u8, "-a")
+        arguments[2] = @ptrCast([*]const u8, "-t")
+        arguments[3] = kindPointer
+        arguments[4] = sourcePointer
+        arguments[5] = @ptrFromInt([*]const u8, 0)
+        environment[0] = @ptrCast([*]const u8, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        environment[1] = @ptrFromInt([*]const u8, 0)
+    }
+    const pid = std.linux.process.fork()
+    if pid < 0 { return 127 }
+    if pid == 0 {
+        std.linux.process.unblockAllSignals()
+        const ignored = std.linux.process.execute(programPointer, unsafe { @ptrCast([*][*]const u8, &arguments) }, unsafe { @ptrCast([*][*]const u8, &environment) })
+        std.linux.exitGroup(127)
+    }
+    var raw: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    var waited = std.linux.syscall4(std.linux.SYS_wait4, @bitCast(usize, pid), @intFromPtr(&raw), 0, 0)
+    while waited == std.linux.EINTR { waited = std.linux.syscall4(std.linux.SYS_wait4, @bitCast(usize, pid), @intFromPtr(&raw), 0, 0) }
+    if waited != pid { return 127 }
+    const status = @intCast(usize, raw[0]) | (@intCast(usize, raw[1]) << 8)
+    return std.linux.process.exitStatus(status)
+}
+
+// Runs the configured fsck front-end in fstab pass order. Exit 0 means a
+// clean file system and 1 means corrected errors. Every other result stops
+// the checks and returns false: mounting after an uncorrected or operational
+// fsck failure risks turning recoverable damage into lost data. No later pass
+// starts while an earlier one is still working.
+pub fn checkFileSystems(state: *State, checker: []const u8) -> bool {
+    if checker.length == 0 || std.text.same(checker, "none") { return true }
+    const path = config.mountsFile(state)
+    if !linux.exists(path) { return true }
+    const size = config.readFile(state, path)
+    const text = config.scratch(state)
+    var highest: usize = 0
+    var start: usize = 0
+    while start < size {
+        var end = start
+        while end < size && text[end] != 10 { end += 1 }
+        const line = std.text.trimmed(text[start..end])
+        start = end + 1
+        if line.length == 0 || line[0] == 35 { continue }
+        var at: usize = 0
+        const sourceField = nextField(line, &at)
+        const targetField = nextField(line, &at)
+        const kindField = nextField(line, &at)
+        const optionsField = nextField(line, &at)
+        const dumpField = nextField(line, &at)
+        const passField = nextField(line, &at)
+        var valid = true
+        const wantedPass = number(passField, &valid)
+        if valid && wantedPass > highest { highest = wantedPass }
+    }
+    var pass: usize = 1
+    while pass <= highest {
+        start = 0
+        while start < size {
+            var end = start
+            while end < size && text[end] != 10 { end += 1 }
+            const line = std.text.trimmed(text[start..end])
+            start = end + 1
+            if line.length == 0 || line[0] == 35 { continue }
+            var at: usize = 0
+            const rawSource = nextField(line, &at)
+            const rawTarget = nextField(line, &at)
+            const rawKind = nextField(line, &at)
+            const rawOptions = nextField(line, &at)
+            const dumpField = nextField(line, &at)
+            const passField = nextField(line, &at)
+            var valid = true
+            const dump = number(dumpField, &valid)
+            const wantedPass = number(passField, &valid)
+            if !valid || wantedPass != pass { continue }
+            var sourceStorage: [FIELD_CAPACITY]u8 = undefined
+            var resolvedStorage: [FIELD_CAPACITY]u8 = undefined
+            var targetStorage: [FIELD_CAPACITY]u8 = undefined
+            var kindStorage: [FIELD_CAPACITY]u8 = undefined
+            var sourceBytes: [*]u8 = undefined
+            var resolvedBytes: [*]u8 = undefined
+            var targetBytes: [*]u8 = undefined
+            var kindBytes: [*]u8 = undefined
+            unsafe {
+                sourceBytes = @ptrCast([*]u8, &sourceStorage)
+                resolvedBytes = @ptrCast([*]u8, &resolvedStorage)
+                targetBytes = @ptrCast([*]u8, &targetStorage)
+                kindBytes = @ptrCast([*]u8, &kindStorage)
+            }
+            const decodedSource = decode(rawSource, sourceBytes, FIELD_CAPACITY)
+            const source = resolvedSource(decodedSource, resolvedBytes, FIELD_CAPACITY)
+            const target = decode(rawTarget, targetBytes, FIELD_CAPACITY)
+            const kind = decode(rawKind, kindBytes, FIELD_CAPACITY)
+            if skipped(kind, target, rawOptions) { continue }
+            const status = executeCheck(checker, source, kind)
+            if status == 0 || status == 1 {
+                if state.*.verbose { config.sayWith("checked file system: ", target, false, 0) }
+            } else {
+                config.sayWith("file-system check failed for ", target, true, status)
+                return false
+            }
+        }
+        pass += 1
+    }
+    return true
 }
 
 // The mount flags from fstab options; the rest of the options (the file
@@ -91,7 +299,7 @@ fn parseOptions(options: []const u8, data: [*]u8, data_capacity: usize, data_len
     return flags
 }
 
-// Mounts what the mounts file lists.
+// Mounts what the fstab file lists. The check pass has already run.
 pub fn fromFile(state: *State) -> void {
     const path = config.mountsFile(state)
     if !linux.exists(path) { return }
@@ -105,24 +313,50 @@ pub fn fromFile(state: *State) -> void {
         start = end + 1
         if line.length == 0 || line[0] == 35 { continue }
         var at: usize = 0
-        const source = nextField(line, &at)
-        const target = nextField(line, &at)
-        const kind = nextField(line, &at)
+        const rawSource = nextField(line, &at)
+        const rawTarget = nextField(line, &at)
+        const rawKind = nextField(line, &at)
         var options = nextField(line, &at)
+        const dumpField = nextField(line, &at)
+        const passField = nextField(line, &at)
         if options.length == 0 { options = "defaults" }
-        if target.length == 0 || kind.length == 0 || std.text.same(target, "none") || std.text.same(kind, "swap") { continue }
+        var validNumbers = true
+        const dump = number(dumpField, &validNumbers)
+        const pass = number(passField, &validNumbers)
+        if !validNumbers {
+            config.sayWith("invalid dump/pass fields in fstab for ", rawTarget, false, 0)
+            continue
+        }
+        var sourceStorage: [FIELD_CAPACITY]u8 = undefined
+        var resolvedStorage: [FIELD_CAPACITY]u8 = undefined
+        var targetStorage: [FIELD_CAPACITY]u8 = undefined
+        var kindStorage: [FIELD_CAPACITY]u8 = undefined
+        var sourceBytes: [*]u8 = undefined
+        var resolvedBytes: [*]u8 = undefined
+        var targetBytes: [*]u8 = undefined
+        var kindBytes: [*]u8 = undefined
+        unsafe {
+            sourceBytes = @ptrCast([*]u8, &sourceStorage)
+            resolvedBytes = @ptrCast([*]u8, &resolvedStorage)
+            targetBytes = @ptrCast([*]u8, &targetStorage)
+            kindBytes = @ptrCast([*]u8, &kindStorage)
+        }
+        const decodedSource = decode(rawSource, sourceBytes, FIELD_CAPACITY)
+        const source = resolvedSource(decodedSource, resolvedBytes, FIELD_CAPACITY)
+        const target = decode(rawTarget, targetBytes, FIELD_CAPACITY)
+        const kind = decode(rawKind, kindBytes, FIELD_CAPACITY)
+        if skipped(kind, target, options) { continue }
         var data: [256]u8 = undefined
-        var data_bytes: [*]u8 = undefined
-        unsafe { data_bytes = @ptrCast([*]u8, &data) }
+        const data_bytes: [*]u8 = &data
         var data_length: usize = 0
         var skip = false
         const flags = parseOptions(options, data_bytes, 256, &data_length, &skip)
         if skip { continue }
-        const made = linux.makeDirectory(target, 493)
+        _ = linux.makeDirectory(target, 493)
         const mounted = linux.mount(source, target, kind, flags, data_bytes[0..data_length])
         if mounted == 0 {
             if state.*.verbose { config.sayWith("mounted ", target, false, 0) }
-        } else if mounted == EBUSY {
+        } else if mounted == std.linux.EBUSY {
             if state.*.verbose { config.sayWith("already mounted: ", target, false, 0) }
         } else {
             config.sayFailed("could not mount ", target, mounted)
@@ -146,8 +380,8 @@ pub fn unmountAll(state: *State) -> void {
         while end < size && text[end] != 10 { end += 1 }
         const line = text[start..end]
         var at: usize = 0
-        const source = nextField(line, &at)
-        while at < line.length && blank(line[at]) { at += 1 }
+        _ = nextField(line, &at)
+        while at < line.length && std.ascii.isBlank(line[at]) { at += 1 }
         const target_start = at
         const target = nextField(line, &at)
         if target.length > 0 {

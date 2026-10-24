@@ -7,7 +7,15 @@
 // (std.terminal.keys). TERM is xterm-256color. The window follows the size
 // its compositor configures, in whole cells, and the shell learns each new
 // size (TIOCSWINSZ). The wheel and Shift+Page Up/Down scroll through the
-// history; the title follows the program's (OSC 0 and 2).
+// history; the title follows the program's (OSC 0 and 2). The pointer
+// selects (std.ui.terminal_input: drag, double and triple click, Shift
+// and a click) unless the program asked for the mouse; Ctrl+Shift+C or
+// Ctrl+Insert copies the selection to the clipboard, Ctrl+Shift+V or
+// Shift+Insert pastes it (filtered, bracketed when the program asked), a
+// selection is also the primary selection a middle click pastes, and
+// files dropped on the window are typed as their quoted paths. What goes
+// to the program waits in a queue while its side of the pty is full, so a
+// big paste never stops the window.
 //
 //     mlx4 projects/desktop/terminal/main.mlx -o mlx-terminal
 //     ./mlx-terminal                       # $SHELL, else mlx-sh beside it or installed, else /bin/sh
@@ -24,6 +32,8 @@ const app = @import("std.ui.app")
 const host = @import("std.ui.host")
 const text = @import("std.ui.text")
 const ui_terminal = @import("std.ui.terminal")
+const terminal_input = @import("std.ui.terminal_input")
+const ui_keys = @import("std.ui.keys")
 const terminal = @import("std.terminal")
 const pty = @import("std.terminal.pty")
 const crash = @import("std.crash")
@@ -34,6 +44,14 @@ const DEFAULT_FONT_HEIGHT: i32 = 15
 const HISTORY_LINES: usize = 5000
 const PADDING: i32 = 6
 const READ_CAPACITY: usize = 65536
+// Output is taken in parts no bigger than this, so the history drops
+// fewer lines between two looks at the selection than it holds.
+const FEED_PART: usize = 4096
+// The most that waits for the program (a bigger paste is cut short).
+const PENDING_LIMIT: usize = 16777216
+const SYS_WRITE: usize = 1
+const EAGAIN: isize = -11
+const KEY_INSERT: u32 = 110
 
 const Terminal = struct {
     host: *host.Host
@@ -49,6 +67,16 @@ const Terminal = struct {
     height: i32
     status: u8
     input: [READ_CAPACITY]u8
+    allocator: std.allocator.Allocator
+    // Where the pointer is.
+    pointerX: i32
+    pointerY: i32
+    // What waits to go to the program: bytes from pendingFrom to
+    // pendingLength of a buffer of pendingCapacity.
+    pending: [*]u8
+    pendingFrom: usize
+    pendingLength: usize
+    pendingCapacity: usize
 }
 
 fn terminalOf(context: *anyopaque) -> *Terminal {
@@ -72,10 +100,96 @@ fn childOf(terminal_state: *Terminal) -> *pty.Child {
 }
 
 fn inputOf(terminal_state: *Terminal) -> [*]u8 {
-    unsafe { return @ptrCast([*]u8, &terminal_state.*.input) }
+    return &terminal_state.*.input
 }
 
 fn named(value: std.string.String, name: []const u8) -> bool { return std.string.eql(value, std.string.fromSlice(name)) }
+
+// Sends `bytes` to the program: written now as far as its side of the
+// pty takes them, the rest queued (flushPending writes it on the next
+// ticks).
+fn send(terminal_state: *Terminal, bytes: [*]const u8, length: usize) -> void {
+    if !terminal_state.*.hasChild || length == 0 { return }
+    var sent: usize = 0
+    if terminal_state.*.pendingFrom == terminal_state.*.pendingLength { sent = writeSome(terminal_state, bytes, length) }
+    if sent == length { return }
+    const waiting = terminal_state.*.pendingLength - terminal_state.*.pendingFrom
+    if waiting + length - sent > PENDING_LIMIT {
+        say("mlx-terminal: the program is not reading; a paste was cut short\n")
+        return
+    }
+    if !reservePending(terminal_state, length - sent) { return }
+    var index = sent
+    while index < length {
+        terminal_state.*.pending[terminal_state.*.pendingLength] = bytes[index]
+        terminal_state.*.pendingLength += 1
+        index += 1
+    }
+    host.setTick(terminal_state.*.host, 20)
+}
+
+// Writes what the pty takes without waiting; how much that was.
+fn writeSome(terminal_state: *Terminal, bytes: [*]const u8, length: usize) -> usize {
+    const master = childOf(terminal_state).*.master
+    var sent: usize = 0
+    while sent < length {
+        const result = std.linux.syscall3(SYS_WRITE, @bitCast(usize, master), @intFromPtr(bytes) + sent, length - sent)
+        if result <= 0 { return sent }
+        sent += @bitCast(usize, result)
+    }
+    return sent
+}
+
+// Room for `more` bytes at the queue's end (what was written moves to the
+// front first).
+fn reservePending(terminal_state: *Terminal, more: usize) -> bool {
+    const from = terminal_state.*.pendingFrom
+    const waiting = terminal_state.*.pendingLength - from
+    if from > 0 {
+        var index: usize = 0
+        while index < waiting {
+            terminal_state.*.pending[index] = terminal_state.*.pending[from + index]
+            index += 1
+        }
+        terminal_state.*.pendingFrom = 0
+        terminal_state.*.pendingLength = waiting
+    }
+    if waiting + more <= terminal_state.*.pendingCapacity { return true }
+    var capacity = if terminal_state.*.pendingCapacity == 0 { 65536 } else { terminal_state.*.pendingCapacity }
+    while capacity < waiting + more { capacity *= 2 }
+    const memory = terminal_state.*.allocator.alloc(capacity, 16)
+    if memory == null { return false }
+    const grown: [*]u8 = unsafe { @ptrCast([*]u8, memory.?) }
+    var index: usize = 0
+    while index < waiting {
+        grown[index] = terminal_state.*.pending[index]
+        index += 1
+    }
+    if terminal_state.*.pendingCapacity > 0 { terminal_state.*.allocator.free(terminal_state.*.pending, terminal_state.*.pendingCapacity, 16) }
+    terminal_state.*.pending = grown
+    terminal_state.*.pendingCapacity = capacity
+    return true
+}
+
+// Writes what waits as far as the pty takes it; the ticks stop once all
+// of it went.
+fn flushPending(terminal_state: *Terminal) -> void {
+    const from = terminal_state.*.pendingFrom
+    const waiting = terminal_state.*.pendingLength - from
+    if waiting > 0 && terminal_state.*.hasChild {
+        const pending: [*]const u8 = terminal_state.*.pending
+        terminal_state.*.pendingFrom += writeSome(terminal_state, pending + from, waiting)
+    }
+    if terminal_state.*.pendingFrom == terminal_state.*.pendingLength {
+        terminal_state.*.pendingFrom = 0
+        terminal_state.*.pendingLength = 0
+        host.setTick(terminal_state.*.host, 0)
+    }
+}
+
+fn say(text_bytes: []const u8) -> void {
+    _ = std.io.writeAll(std.io.stderr(), text_bytes)
+}
 
 fn number(value: std.string.String, fallback: usize) -> usize {
     const parsed = std.parse.unsigned(value)
@@ -86,15 +200,14 @@ fn number(value: std.string.String, fallback: usize) -> usize {
 fn afterOutput(terminal_state: *Terminal) -> void {
     const screen = screenOf(terminal_state)
     var reply: [terminal.RESPONSE_CAPACITY]u8 = undefined
-    var reply_bytes: [*]u8 = undefined
-    unsafe { reply_bytes = @ptrCast([*]u8, &reply) }
+    const reply_bytes: [*]u8 = &reply
     const owed = terminal.takeResponses(screen, reply_bytes, terminal.RESPONSE_CAPACITY)
-    if owed > 0 && terminal_state.*.hasChild { pty.write(childOf(terminal_state), reply_bytes, owed) }
+    if owed > 0 { send(terminal_state, reply_bytes, owed) }
     if terminal.takeTitleChange(screen) {
         const title = terminal.titleText(screen)
         host.setTitle(terminal_state.*.host, if title.length > 0 { title } else { "Mlx Terminal" })
     }
-    const rang = terminal.takeBell(screen)
+    _ = terminal.takeBell(screen)
     if terminal.takeDirty(screen) { host.redraw(terminal_state.*.host) }
 }
 
@@ -108,8 +221,16 @@ fn readOutput(terminal_state: *Terminal) -> void {
     while more {
         const got = pty.read(child, buffer, READ_CAPACITY)
         if got > 0 {
-            terminal.feed(screenOf(terminal_state), buffer[0..@bitCast(usize, got)])
-        } else if got == pty.EAGAIN {
+            // In parts, the selection following the history after each.
+            const total = @bitCast(usize, got)
+            var at: usize = 0
+            while at < total {
+                const end = if total - at > FEED_PART { at + FEED_PART } else { total }
+                terminal.feed(screenOf(terminal_state), buffer[at..end])
+                terminal_input.follow(viewOf(terminal_state))
+                at = end
+            }
+        } else if got == std.linux.EAGAIN {
             more = false
         } else {
             // 0 or EIO: the program closed its side.
@@ -140,7 +261,9 @@ fn configured(terminal_state: *Terminal, width: i32, height: i32) -> void {
     if columns != terminal_state.*.columns || rows != terminal_state.*.rows {
         terminal_state.*.columns = columns
         terminal_state.*.rows = rows
-        const resized = terminal.resize(screenOf(terminal_state), columns, rows)
+        // The lines are laid out anew: the selection is not where it was.
+        terminal_input.clear(view)
+        _ = terminal.resize(screenOf(terminal_state), columns, rows)
         if terminal_state.*.hasChild { pty.resize(childOf(terminal_state), @intCast(u16, columns), @intCast(u16, rows)) }
     }
     host.redraw(terminal_state.*.host)
@@ -154,6 +277,159 @@ fn sizeRule(context: *anyopaque, width: *u32, height: *u32) -> void {
     if height.* > 0 { height.* = @intCast(u32, ui_terminal.pixelHeight(view, ui_terminal.rowsFor(view, @intCast(i32, height.*)))) }
 }
 
+// Copies the selection to the clipboard as text.
+fn copy(terminal_state: *Terminal) -> void {
+    const view = viewOf(terminal_state)
+    const capacity = terminal_input.selectedCapacity(view)
+    if capacity == 0 { return }
+    const memory = terminal_state.*.allocator.alloc(capacity, 16)
+    if memory == null { return }
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, memory.?) }
+    const length = terminal_input.selectedText(view, bytes, capacity)
+    const own_host = terminal_state.*.host
+    host.beginClipboard(own_host)
+    const selected = bytes[0..length]
+    _ = host.addClipboard(own_host, "text/plain;charset=utf-8", selected)
+    _ = host.addClipboard(own_host, "text/plain", selected)
+    _ = host.addClipboard(own_host, "UTF8_STRING", selected)
+    _ = host.addClipboard(own_host, "TEXT", selected)
+    if host.publishClipboard(own_host) {
+        say("mlx-terminal: copied ")
+        sayNumber(length)
+        say(" bytes\n")
+    }
+    terminal_state.*.allocator.free(bytes, capacity, 16)
+}
+
+// The selection becomes the primary selection (a middle click in any
+// program pastes it).
+fn selectToPrimary(terminal_state: *Terminal) -> void {
+    const view = viewOf(terminal_state)
+    const capacity = terminal_input.selectedCapacity(view)
+    if capacity == 0 { return }
+    const memory = terminal_state.*.allocator.alloc(capacity, 16)
+    if memory == null { return }
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, memory.?) }
+    const length = terminal_input.selectedText(view, bytes, capacity)
+    if length > 0 { _ = host.setPrimary(terminal_state.*.host, bytes[0..length]) }
+    terminal_state.*.allocator.free(bytes, capacity, 16)
+}
+
+fn sayNumber(value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    var out: [20]u8 = undefined
+    var index: usize = 0
+    while index < count {
+        out[index] = digits[count - 1 - index]
+        index += 1
+    }
+    const bytes: [*]const u8 = &out
+    say(bytes[0..count])
+}
+
+// Pastes the clipboard's text.
+fn paste(terminal_state: *Terminal) -> void {
+    const own_host = terminal_state.*.host
+    var pasted = host.readClipboard(own_host, "text/plain;charset=utf-8")
+    if pasted.length == 0 { pasted = host.readClipboard(own_host, "UTF8_STRING") }
+    if pasted.length == 0 { pasted = host.readClipboard(own_host, "text/plain") }
+    typeText(terminal_state, pasted)
+}
+
+// Sends `text` as a paste: filtered, inside the brackets when the program
+// asked for them; the live screen comes back.
+fn typeText(terminal_state: *Terminal, text_bytes: []const u8) -> void {
+    if text_bytes.length == 0 { return }
+    const view = viewOf(terminal_state)
+    var part: [4096]u8 = undefined
+    const part_bytes: [*]u8 = &part
+    send(terminal_state, part_bytes, terminal_input.pasteBegin(view, part_bytes))
+    var at: usize = 0
+    while at < text_bytes.length {
+        var written: usize = 0
+        at = terminal_input.filterPaste(text_bytes, at, part_bytes, 4096, &written)
+        send(terminal_state, part_bytes, written)
+    }
+    send(terminal_state, part_bytes, terminal_input.pasteEnd(view, part_bytes))
+    terminal.resetView(screenOf(terminal_state))
+    say("mlx-terminal: pasted ")
+    sayNumber(text_bytes.length)
+    say(" bytes\n")
+}
+
+// Files dropped on the window: their paths, quoted.
+fn dropped(terminal_state: *Terminal) -> void {
+    const list = host.dropData(terminal_state.*.host)
+    if list.length == 0 { return }
+    // Quoting at most quadruples a quote; with the quotes and the space.
+    const capacity = list.length * 4 + 16
+    const memory = terminal_state.*.allocator.alloc(capacity, 16)
+    if memory == null { return }
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, memory.?) }
+    const length = terminal_input.quotedPaths(list, bytes, capacity)
+    typeText(terminal_state, bytes[0..length])
+    terminal_state.*.allocator.free(bytes, capacity, 16)
+}
+
+// The window's whole area (the view draws into all of it).
+fn wholeArea(terminal_state: *Terminal) -> ui.Rect {
+    return ui.rect(0, 0, terminal_state.*.width, terminal_state.*.height)
+}
+
+// What the pointer did, for the selection or the program.
+fn pointerEvent(terminal_state: *Terminal, kind: u32, a: u32, b: i32) -> void {
+    const own_host = terminal_state.*.host
+    const view = viewOf(terminal_state)
+    const modifiers = host.modifiers(own_host)
+    var out: [terminal_input.REPORT_CAPACITY]u8 = undefined
+    const out_bytes: [*]u8 = &out
+    var length: usize = 0
+    if kind == app.EVENT_MOTION {
+        terminal_state.*.pointerX = @bitCast(i32, a)
+        terminal_state.*.pointerY = b
+        length = terminal_input.motion(view, wholeArea(terminal_state), terminal_state.*.pointerX, terminal_state.*.pointerY, modifiers, out_bytes)
+    } else if kind == app.EVENT_BUTTON {
+        if b != 0 && a == terminal_input.BUTTON_MIDDLE && !terminal_input.reportsMouse(view, modifiers) {
+            // The middle button pastes the primary selection.
+            typeText(terminal_state, host.readPrimary(own_host))
+        } else if b != 0 {
+            length = terminal_input.press(view, wholeArea(terminal_state), terminal_state.*.pointerX, terminal_state.*.pointerY, a, modifiers, std.time.milliseconds(), out_bytes)
+        } else {
+            const was_selecting = view.*.selecting
+            length = terminal_input.release(view, wholeArea(terminal_state), terminal_state.*.pointerX, terminal_state.*.pointerY, a, modifiers, out_bytes)
+            // What was just selected is the primary selection.
+            if was_selecting && !view.*.selecting && view.*.hasSelection { selectToPrimary(terminal_state) }
+        }
+    } else if kind == app.EVENT_WHEEL && a == 0 {
+        length = terminal_input.wheel(view, wholeArea(terminal_state), terminal_state.*.pointerX, terminal_state.*.pointerY, b, modifiers, out_bytes)
+    }
+    send(terminal_state, out_bytes, length)
+    if terminal.takeDirty(screenOf(terminal_state)) { host.redraw(own_host) }
+}
+
+// The clipboard's keys: true when `key` was one of them.
+fn clipboardKey(terminal_state: *Terminal, key: u32, modifiers: u32) -> bool {
+    const control = modifiers & ui_keys.CONTROL != 0
+    const shift = modifiers & ui_keys.SHIFT != 0
+    if (control && shift && key == ui_keys.C) || (control && !shift && key == KEY_INSERT) {
+        copy(terminal_state)
+        return true
+    }
+    if (control && shift && key == ui_keys.V) || (shift && !control && key == KEY_INSERT) {
+        paste(terminal_state)
+        return true
+    }
+    return false
+}
+
 fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
     const terminal_state = terminalOf(context)
     const own_host = terminal_state.*.host
@@ -161,21 +437,28 @@ fn onEvent(context: *anyopaque, kind: u32, a: u32, b: i32) -> void {
         configured(terminal_state, @intCast(i32, a), b)
     } else if kind == app.EVENT_WATCH {
         readOutput(terminal_state)
+        flushPending(terminal_state)
+    } else if kind == app.EVENT_TICK {
+        flushPending(terminal_state)
     } else if kind == app.EVENT_KEY {
         viewOf(terminal_state).*.focused = true
         if b != 0 {
+            const modifiers = host.modifiers(own_host)
+            if b == 1 && clipboardKey(terminal_state, a, modifiers) {
+                if terminal.takeDirty(screenOf(terminal_state)) { host.redraw(own_host) }
+                return
+            }
             var bytes: [16]u8 = undefined
-            var bytes_pointer: [*]u8 = undefined
-            unsafe { bytes_pointer = @ptrCast([*]u8, &bytes) }
-            const length = ui_terminal.key(viewOf(terminal_state), a, host.modifiers(own_host), host.typed(own_host), host.plainTyped(own_host), bytes_pointer)
-            if length > 0 && terminal_state.*.hasChild { pty.write(childOf(terminal_state), bytes_pointer, length) }
+            const bytes_pointer: [*]u8 = &bytes
+            const length = ui_terminal.key(viewOf(terminal_state), a, modifiers, host.typed(own_host), host.plainTyped(own_host), bytes_pointer)
+            send(terminal_state, bytes_pointer, length)
             if terminal.takeDirty(screenOf(terminal_state)) { host.redraw(own_host) }
         }
-    } else if kind == app.EVENT_WHEEL {
-        if a == 0 {
-            ui_terminal.wheel(viewOf(terminal_state), b)
-            if terminal.takeDirty(screenOf(terminal_state)) { host.redraw(own_host) }
-        }
+    } else if kind == app.EVENT_MOTION || kind == app.EVENT_BUTTON || kind == app.EVENT_WHEEL {
+        pointerEvent(terminal_state, kind, a, b)
+    } else if kind == app.EVENT_DROP {
+        dropped(terminal_state)
+        if terminal.takeDirty(screenOf(terminal_state)) { host.redraw(own_host) }
     } else if kind == app.EVENT_KEYBOARD_LEAVE {
         viewOf(terminal_state).*.focused = false
         host.redraw(own_host)
@@ -191,8 +474,7 @@ fn programEnvironment(entries: [*][*]const u8, allocator: std.allocator.Allocato
     while @intFromPtr(entries[count]) != 0 { count += 1 }
     const memory = allocator.alloc((count + 3) * @sizeOf([*]const u8), 8)
     if memory == null { return null }
-    var result: [*][*]const u8 = undefined
-    unsafe { result = @ptrCast([*][*]const u8, memory.?) }
+    const result: [*][*]const u8 = unsafe { @ptrCast([*][*]const u8, memory.?) }
     var used: usize = 0
     var index: usize = 0
     while index < count {
@@ -220,18 +502,17 @@ fn defaultShell(entries: [*][*]const u8) -> [*]const u8 {
     if shell != null && shell.?.length > 0 { return shell.?.pointer }
     var candidate: [*]const u8 = undefined
     var own: [*]u8 = undefined
-    unsafe {
-        own = @ptrCast([*]u8, &shell_path)
-        candidate = @ptrCast([*]const u8, "/proc/self/exe")
-    }
-    const got = std.fs.readLink(candidate, own, 4000)
+    unsafe { own = &shell_path }
+    const got = std.fs.executablePath(own, 4001)
     if got > 0 {
-        var length = @bitCast(usize, got)
+        var length = got
         while length > 0 && own[length - 1] != 47 { length -= 1 }
         length = std.text.append(own, length, 4000, "mlx-sh")
         own[length] = 0
         if std.fs.exists(own) { return own }
     }
+    unsafe { candidate = @ptrCast([*]const u8, "/usr/bin/mlx/mlx-sh") }
+    if std.fs.exists(candidate) { return candidate }
     unsafe { candidate = @ptrCast([*]const u8, "/usr/local/bin/mlx-sh") }
     if std.fs.exists(candidate) { return candidate }
     unsafe { candidate = @ptrCast([*]const u8, "/usr/bin/mlx-sh") }
@@ -243,17 +524,16 @@ fn defaultShell(entries: [*][*]const u8) -> [*]const u8 {
 const Failure = error { Usage, NoMemory, NoFont, NoProgram }
 
 fn fail(message: []const u8, failure: Failure) -> Failure!void {
-    const said = std.io.eprintln(message)
+    _ = std.io.eprintln(message)
     return failure
 }
 
 pub fn main(arguments: [][*]const u8) -> !void {
-    const reporting = crash.install()
-    const allocator = std.page_allocator.init()
+    _ = crash.install()
+    const allocator = std.heap.allocator()
     const memory = allocator.alloc(@sizeOf(Terminal), 16)
     if memory == null { try fail("mlx-terminal: out of memory", Failure.NoMemory) }
-    var terminal_state: *Terminal = undefined
-    unsafe { terminal_state = @ptrCast(*Terminal, memory.?) }
+    const terminal_state: *Terminal = unsafe { @ptrCast(*Terminal, memory.?) }
     const entries = std.process.environmentEntries(arguments)
     var font_height: usize = @intCast(usize, DEFAULT_FONT_HEIGHT)
     const from_environment = std.process.environmentFrom(entries, "MLX_TERMINAL_FONT_SIZE")
@@ -293,11 +573,17 @@ pub fn main(arguments: [][*]const u8) -> !void {
     terminal_state.*.rows = rows
     terminal_state.*.hasChild = false
     terminal_state.*.status = 0
+    terminal_state.*.allocator = allocator
+    terminal_state.*.pointerX = 0
+    terminal_state.*.pointerY = 0
+    terminal_state.*.pendingFrom = 0
+    terminal_state.*.pendingLength = 0
+    terminal_state.*.pendingCapacity = 0
     const view = viewOf(terminal_state)
     terminal_state.*.width = ui_terminal.pixelWidth(view, columns)
     terminal_state.*.height = ui_terminal.pixelHeight(view, rows)
     const options = host.Options.{ .title = "Mlx Terminal", .appId = "org.mlx.terminal", .width = @intCast(u32, terminal_state.*.width), .height = @intCast(u32, terminal_state.*.height), .minWidth = ui_terminal.pixelWidth(view, 10), .minHeight = ui_terminal.pixelHeight(view, 2) }
-    const created = host.create(options, @ptrCast(*anyopaque, terminal_state), draw, onEvent)
+    const created = host.create(options, terminal_state, draw, onEvent)
     if created == null { try fail("mlx-terminal: out of memory for the window", Failure.NoMemory) }
     terminal_state.*.host = created.?
     host.setSizeRule(terminal_state.*.host, sizeRule)
@@ -306,8 +592,7 @@ pub fn main(arguments: [][*]const u8) -> !void {
     const environment = programEnvironment(entries, allocator)
     if environment == null { try fail("mlx-terminal: out of memory", Failure.NoMemory) }
     var argv: [64][*]const u8 = undefined
-    var argv_pointer: [*][*]const u8 = undefined
-    unsafe { argv_pointer = @ptrCast([*][*]const u8, &argv) }
+    const argv_pointer: [*][*]const u8 = unsafe { @ptrCast([*][*]const u8, &argv) }
     var argc: usize = 0
     if program_at != 0 {
         while program_at + argc < count && argc < 63 {
@@ -322,6 +607,8 @@ pub fn main(arguments: [][*]const u8) -> !void {
     if !pty.spawn(childOf(terminal_state), argv[0], argv_pointer, environment.?, @intCast(u16, columns), @intCast(u16, rows)) { try fail("mlx-terminal: the program could not be started", Failure.NoProgram) }
     terminal_state.*.hasChild = true
     host.watchDescriptor(terminal_state.*.host, childOf(terminal_state).*.master)
+    // Files dropped on the window come as text/uri-list.
+    host.acceptDrops(terminal_state.*.host, "text/uri-list")
     try host.run(terminal_state.*.host)
     pty.hangUp(childOf(terminal_state))
 }

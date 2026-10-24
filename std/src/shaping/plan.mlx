@@ -1,0 +1,663 @@
+// Shaping plans (HarfBuzz's hb-ot-map.cc and the plan half of
+// hb-ot-shape.cc): the map builder that collects the features a shaper
+// and the user ask for, gives each its mask bits and lists the lookups of
+// GSUB and GPOS in stages (with the shaper's pauses between stages); the
+// map it compiles; and the plan's decisions (who classifies glyphs, who
+// positions: GPOS, the kern table or the fallback).
+const m = @import("./memory.mlx")
+const common = @import("./common.mlx")
+const face = @import("./face.mlx")
+const set = @import("./set.mlx")
+const layout = @import("./layout.mlx")
+const tags = @import("./tags.mlx")
+const kern = @import("./kern.mlx")
+
+pub const F_NONE: u32 = 0x0000
+pub const F_GLOBAL: u32 = 0x0001
+pub const F_HAS_FALLBACK: u32 = 0x0002
+pub const F_MANUAL_ZWNJ: u32 = 0x0004
+pub const F_MANUAL_ZWJ: u32 = 0x0008
+pub const F_MANUAL_JOINERS: u32 = 0x000C
+pub const F_GLOBAL_MANUAL_JOINERS: u32 = 0x000D
+pub const F_GLOBAL_HAS_FALLBACK: u32 = 0x0003
+pub const F_GLOBAL_SEARCH: u32 = 0x0010
+pub const F_RANDOM: u32 = 0x0020
+pub const F_PER_SYLLABLE: u32 = 0x0040
+
+pub const MAX_BITS: u32 = 8
+pub const MAX_VALUE: u32 = 255
+
+// The normalization modes and mark zeroing of shapers.
+pub const NORMALIZATION_NONE: u32 = 0
+pub const NORMALIZATION_DECOMPOSED: u32 = 1
+pub const NORMALIZATION_COMPOSED_DIACRITICS: u32 = 2
+pub const NORMALIZATION_COMPOSED_DIACRITICS_NO_SHORT_CIRCUIT: u32 = 3
+pub const NORMALIZATION_AUTO: u32 = 4
+
+pub const ZERO_WIDTH_MARKS_NONE: u32 = 0
+pub const ZERO_WIDTH_MARKS_BY_GDEF_EARLY: u32 = 1
+pub const ZERO_WIDTH_MARKS_BY_GDEF_LATE: u32 = 2
+
+// ---------------------------------------------------------------------------
+// Growing arrays of fixed-size records
+
+pub const Vec = struct {
+    data: usize
+    count: u32
+    capacity: u32
+    size: u32
+}
+
+pub fn vecInit(v: *Vec, size: u32) -> void {
+    v.*.data = 0
+    v.*.count = 0
+    v.*.capacity = 0
+    v.*.size = size
+}
+
+pub fn vecFree(v: *Vec) -> void {
+    m.release(v.*.data)
+    v.*.data = 0
+    v.*.count = 0
+    v.*.capacity = 0
+}
+
+// A new zeroed record at the end; its address (0 when out of memory).
+pub fn vecPush(v: *Vec) -> usize {
+    if v.*.count == v.*.capacity {
+        const capacity = if v.*.capacity < 8 { 8 } else { v.*.capacity * 2 }
+        const grown = m.grow(v.*.data, @intCast(usize, capacity) * @intCast(usize, v.*.size))
+        if grown == 0 { return 0 }
+        v.*.data = grown
+        v.*.capacity = capacity
+    }
+    const at = v.*.data + @intCast(usize, v.*.count) * @intCast(usize, v.*.size)
+    m.zero(at, @intCast(usize, v.*.size))
+    v.*.count += 1
+    return at
+}
+
+pub fn vecAt(v: *Vec, i: u32) -> usize { return v.*.data + @intCast(usize, i) * @intCast(usize, v.*.size) }
+
+// ---------------------------------------------------------------------------
+// The map
+
+// A feature of the map (36 bytes): tag, index in GSUB and GPOS, stage in
+// GSUB and GPOS, shift, mask, the mask of value 1, flags.
+pub const FM_TAG: usize = 0
+pub const FM_INDEX0: usize = 4
+pub const FM_INDEX1: usize = 8
+pub const FM_STAGE0: usize = 12
+pub const FM_STAGE1: usize = 16
+pub const FM_SHIFT: usize = 20
+pub const FM_MASK: usize = 24
+pub const FM_MASK1: usize = 28
+pub const FM_FLAGS: usize = 32
+pub const FM_SIZE: u32 = 36
+
+pub const MF_NEEDS_FALLBACK: u32 = 1
+pub const MF_AUTO_ZWNJ: u32 = 2
+pub const MF_AUTO_ZWJ: u32 = 4
+pub const MF_RANDOM: u32 = 8
+pub const MF_PER_SYLLABLE: u32 = 16
+
+// A lookup of the map (16 bytes): its index, flags (MF_*), mask, the tag of
+// its feature.
+pub const LM_INDEX: usize = 0
+pub const LM_FLAGS: usize = 4
+pub const LM_MASK: usize = 8
+pub const LM_TAG: usize = 12
+pub const LM_SIZE: u32 = 16
+
+// A stage of the map (8 bytes): the end of its lookups, its pause (a
+// shaper's pause number, 0: none).
+pub const ST_LAST: usize = 0
+pub const ST_PAUSE: usize = 4
+pub const ST_SIZE: u32 = 8
+
+pub const Map = struct {
+    globalMask: u32
+    chosenScript0: u32
+    chosenScript1: u32
+    foundScript0: bool
+    foundScript1: bool
+    features: Vec
+    lookups0: Vec
+    lookups1: Vec
+    stages0: Vec
+    stages1: Vec
+}
+
+pub fn mapInit(map: *Map) -> void {
+    map.*.globalMask = 0
+    map.*.chosenScript0 = 0
+    map.*.chosenScript1 = 0
+    map.*.foundScript0 = false
+    map.*.foundScript1 = false
+    vecInit(&map.*.features, FM_SIZE)
+    vecInit(&map.*.lookups0, LM_SIZE)
+    vecInit(&map.*.lookups1, LM_SIZE)
+    vecInit(&map.*.stages0, ST_SIZE)
+    vecInit(&map.*.stages1, ST_SIZE)
+}
+
+pub fn mapFini(map: *Map) -> void {
+    vecFree(&map.*.features)
+    vecFree(&map.*.lookups0)
+    vecFree(&map.*.lookups1)
+    vecFree(&map.*.stages0)
+    vecFree(&map.*.stages1)
+}
+
+pub fn lookups(map: *Map, tableIndex: u32) -> *Vec { return if tableIndex == 0 { &map.*.lookups0 } else { &map.*.lookups1 } }
+pub fn stages(map: *Map, tableIndex: u32) -> *Vec { return if tableIndex == 0 { &map.*.stages0 } else { &map.*.stages1 } }
+
+// The feature record of `tag` (0: none), by binary search.
+pub fn findFeature(map: *Map, tag: u32) -> usize {
+    const v = &map.*.features
+    var lo: i64 = 0
+    var hi: i64 = @intCast(i64, v.*.count) - 1
+    while lo <= hi {
+        const mid = (lo + hi) / 2
+        const at = vecAt(v, @intCast(u32, mid))
+        const t = m.get32(at + FM_TAG)
+        if tag < t {
+            hi = mid - 1
+        } else if tag > t {
+            lo = mid + 1
+        } else {
+            return at
+        }
+    }
+    return 0
+}
+
+pub fn getMask(map: *Map, tag: u32, shift: *u32) -> u32 {
+    const f = findFeature(map, tag)
+    shift.* = if f != 0 { m.get32(f + FM_SHIFT) } else { 0 }
+    return if f != 0 { m.get32(f + FM_MASK) } else { 0 }
+}
+
+pub fn getMaskOnly(map: *Map, tag: u32) -> u32 {
+    const f = findFeature(map, tag)
+    return if f != 0 { m.get32(f + FM_MASK) } else { 0 }
+}
+
+pub fn get1Mask(map: *Map, tag: u32) -> u32 {
+    const f = findFeature(map, tag)
+    return if f != 0 { m.get32(f + FM_MASK1) } else { 0 }
+}
+
+pub fn needsFallback(map: *Map, tag: u32) -> bool {
+    const f = findFeature(map, tag)
+    return f != 0 && (m.get32(f + FM_FLAGS) & MF_NEEDS_FALLBACK) != 0
+}
+
+pub fn getFeatureIndex(map: *Map, tableIndex: u32, tag: u32) -> u32 {
+    const f = findFeature(map, tag)
+    if f == 0 { return layout.NOT_FOUND }
+    return m.get32(f + (if tableIndex == 0 { FM_INDEX0 } else { FM_INDEX1 }))
+}
+
+pub fn getFeatureStage(map: *Map, tableIndex: u32, tag: u32) -> u32 {
+    const f = findFeature(map, tag)
+    if f == 0 { return 0xFFFFFFFF }
+    return m.get32(f + (if tableIndex == 0 { FM_STAGE0 } else { FM_STAGE1 }))
+}
+
+// The lookups of stage `stage` of a table: the records from `start` to
+// `end` of its lookups (none past the last stage).
+pub fn stageLookups(map: *Map, tableIndex: u32, stage: u32, start: *u32, end: *u32) -> void {
+    const ss = stages(map, tableIndex)
+    start.* = 0
+    end.* = 0
+    if stage > ss.*.count { return }
+    start.* = if stage != 0 { m.get32(vecAt(ss, stage - 1) + ST_LAST) } else { 0 }
+    end.* = if stage < ss.*.count { m.get32(vecAt(ss, stage) + ST_LAST) } else { lookups(map, tableIndex).*.count }
+}
+
+// ---------------------------------------------------------------------------
+// The map builder
+
+// A feature asked for (28 bytes): tag, sequence number, max value, flags,
+// default value, stage in GSUB and GPOS.
+const FI_TAG: usize = 0
+const FI_SEQ: usize = 4
+const FI_MAX: usize = 8
+const FI_FLAGS: usize = 12
+const FI_DEFAULT: usize = 16
+const FI_STAGE0: usize = 20
+const FI_STAGE1: usize = 24
+const FI_SIZE: u32 = 28
+
+// A pause asked for (8 bytes): its stage, its pause number.
+const SI_INDEX: usize = 0
+const SI_PAUSE: usize = 4
+const SI_SIZE: u32 = 8
+
+pub const Builder = struct {
+    face: usize
+    direction: u32
+    script: u32
+    language: usize
+    isSimple: bool
+    chosenScript0: u32
+    chosenScript1: u32
+    foundScript0: bool
+    foundScript1: bool
+    scriptIndex0: u32
+    scriptIndex1: u32
+    languageIndex0: u32
+    languageIndex1: u32
+    currentStage0: u32
+    currentStage1: u32
+    featureInfos: Vec
+    stages0: Vec
+    stages1: Vec
+}
+
+const TAG_GSUB: u32 = 0x47535542
+const TAG_GPOS: u32 = 0x47504F53
+
+fn tableTag(tableIndex: u32) -> u32 { return if tableIndex == 0 { TAG_GSUB } else { TAG_GPOS } }
+
+pub fn builderInit(b: *Builder, fc: usize, direction: u32, script: u32, language: usize) -> void {
+    b.*.face = fc
+    b.*.direction = direction
+    b.*.script = script
+    b.*.language = language
+    b.*.isSimple = false
+    b.*.currentStage0 = 0
+    b.*.currentStage1 = 0
+    vecInit(&b.*.featureInfos, FI_SIZE)
+    vecInit(&b.*.stages0, SI_SIZE)
+    vecInit(&b.*.stages1, SI_SIZE)
+    var scriptTags: [3]u32 = [_]u32{ 0, 0, 0 }
+    var languageTags: [3]u32 = [_]u32{ 0, 0, 0 }
+    var scriptCount: u32 = 3
+    var languageCount: u32 = 3
+    tags.tagsFromScriptAndLanguage(script, language, @intFromPtr(&scriptCount), @intFromPtr(&scriptTags), @intFromPtr(&languageCount), @intFromPtr(&languageTags))
+    var ti: u32 = 0
+    while ti < 2 {
+        var scriptIndex: u32 = 0
+        var chosen: u32 = 0
+        var languageIndex: u32 = 0
+        const found = layout.selectScript(fc, tableTag(ti), scriptCount, @intFromPtr(&scriptTags), @intFromPtr(&scriptIndex), @intFromPtr(&chosen))
+        _ = layout.selectLanguage(fc, tableTag(ti), scriptIndex, languageCount, @intFromPtr(&languageTags), @intFromPtr(&languageIndex), 0)
+        if ti == 0 {
+            b.*.foundScript0 = found
+            b.*.chosenScript0 = chosen
+            b.*.scriptIndex0 = scriptIndex
+            b.*.languageIndex0 = languageIndex
+        } else {
+            b.*.foundScript1 = found
+            b.*.chosenScript1 = chosen
+            b.*.scriptIndex1 = scriptIndex
+            b.*.languageIndex1 = languageIndex
+        }
+        ti += 1
+    }
+}
+
+pub fn builderFini(b: *Builder) -> void {
+    vecFree(&b.*.featureInfos)
+    vecFree(&b.*.stages0)
+    vecFree(&b.*.stages1)
+}
+
+pub fn addFeature(b: *Builder, tag: u32, flags: u32, value: u32) -> void {
+    if tag == 0 { return }
+    const info = vecPush(&b.*.featureInfos)
+    if info == 0 { return }
+    m.put32(info + FI_TAG, tag)
+    m.put32(info + FI_SEQ, b.*.featureInfos.count)
+    m.put32(info + FI_MAX, value)
+    m.put32(info + FI_FLAGS, flags)
+    m.put32(info + FI_DEFAULT, if (flags & F_GLOBAL) != 0 { value } else { 0 })
+    m.put32(info + FI_STAGE0, b.*.currentStage0)
+    m.put32(info + FI_STAGE1, b.*.currentStage1)
+}
+
+pub fn enableFeature(b: *Builder, tag: u32, flags: u32, value: u32) -> void { addFeature(b, tag, F_GLOBAL | flags, value) }
+pub fn disableFeature(b: *Builder, tag: u32) -> void { addFeature(b, tag, F_GLOBAL, 0) }
+
+pub fn hasFeature(b: *Builder, tag: u32) -> bool {
+    if layout.languageFindFeature(b.*.face, TAG_GSUB, b.*.scriptIndex0, b.*.languageIndex0, tag, 0) { return true }
+    return layout.languageFindFeature(b.*.face, TAG_GPOS, b.*.scriptIndex1, b.*.languageIndex1, tag, 0)
+}
+
+pub fn addPause(b: *Builder, tableIndex: u32, pause: u32) -> void {
+    const s = vecPush(if tableIndex == 0 { &b.*.stages0 } else { &b.*.stages1 })
+    if s == 0 { return }
+    if tableIndex == 0 {
+        m.put32(s + SI_INDEX, b.*.currentStage0)
+        b.*.currentStage0 += 1
+    } else {
+        m.put32(s + SI_INDEX, b.*.currentStage1)
+        b.*.currentStage1 += 1
+    }
+    m.put32(s + SI_PAUSE, pause)
+}
+
+pub fn addGsubPause(b: *Builder, pause: u32) -> void { addPause(b, 0, pause) }
+pub fn addGposPause(b: *Builder, pause: u32) -> void { addPause(b, 1, pause) }
+
+fn bitStorage(v_: u32) -> u32 {
+    var v = v_
+    var n: u32 = 0
+    while v != 0 {
+        n += 1
+        v >>= 1
+    }
+    return n
+}
+
+fn addLookups(b: *Builder, map: *Map, tableIndex: u32, featureIndex: u32, variationsIndex: u32, mask: u32, flags: u32, featureTag: u32) -> void {
+    const tableLookupCount = layout.otLayoutTableGetLookupCount(b.*.face, tableTag(tableIndex))
+    var indices: [32]u32 = undefined
+    var offset: u32 = 0
+    while true {
+        var len: u32 = 32
+        _ = layout.featureLookups(b.*.face, tableTag(tableIndex), featureIndex, variationsIndex, offset, @intFromPtr(&len), @intFromPtr(&indices))
+        var i: u32 = 0
+        while i < len {
+            if indices[@intCast(usize, i)] < tableLookupCount {
+                const l = vecPush(lookups(map, tableIndex))
+                if l != 0 {
+                    m.put32(l + LM_INDEX, indices[@intCast(usize, i)])
+                    m.put32(l + LM_FLAGS, flags)
+                    m.put32(l + LM_MASK, mask)
+                    m.put32(l + LM_TAG, featureTag)
+                }
+            }
+            i += 1
+        }
+        offset += len
+        if len != 32 { break }
+    }
+}
+
+// Sorts records of `size` bytes in [start, end) of `v` by the u32 at
+// `key` (then the one at `key2`), stable (an insertion sort: lists are
+// short).
+fn sortRecords(v: *Vec, start: u32, end: u32, key: usize, key2: usize, useKey2: bool) -> void {
+    const size = @intCast(usize, v.*.size)
+    const tmp = m.alloc(size)
+    var i = start + 1
+    while i < end {
+        m.copy(tmp, vecAt(v, i), size)
+        const k = m.get32(tmp + key)
+        const k2 = if useKey2 { m.get32(tmp + key2) } else { 0 }
+        var j = i
+        while j > start {
+            const prevAt = vecAt(v, j - 1)
+            const pk = m.get32(prevAt + key)
+            const pk2 = if useKey2 { m.get32(prevAt + key2) } else { 0 }
+            if pk < k || (pk == k && pk2 <= k2) { break }
+            m.copy(vecAt(v, j), prevAt, size)
+            j -= 1
+        }
+        m.copy(vecAt(v, j), tmp, size)
+        i += 1
+    }
+    m.release(tmp)
+}
+
+// The feature variations index (of GSUB or GPOS) of the coordinates.
+pub fn variationsIndex(fc: usize, tableIndex: u32, coords: usize, count: u32) -> u32 {
+    var t: m.Table = undefined
+    layout.gsubgpos(fc, tableIndex, &t)
+    var index: u32 = 0
+    _ = layout.findVariationsIndex(&t, coords, count, &index)
+    return index
+}
+
+pub fn compile(b: *Builder, map: *Map, variations0: u32, variations1: u32) -> void {
+    const globalBitShift: u32 = 31
+    const globalBitMask: u32 = 0x80000000
+    map.*.globalMask = globalBitMask
+    var requiredIndex0: u32 = 0
+    var requiredIndex1: u32 = 0
+    var requiredTag0: u32 = 0
+    var requiredTag1: u32 = 0
+    var requiredStage0: u32 = 0
+    var requiredStage1: u32 = 0
+    map.*.chosenScript0 = b.*.chosenScript0
+    map.*.chosenScript1 = b.*.chosenScript1
+    map.*.foundScript0 = b.*.foundScript0
+    map.*.foundScript1 = b.*.foundScript1
+    _ = layout.requiredFeature(b.*.face, TAG_GSUB, b.*.scriptIndex0, b.*.languageIndex0, @intFromPtr(&requiredIndex0), @intFromPtr(&requiredTag0))
+    _ = layout.requiredFeature(b.*.face, TAG_GPOS, b.*.scriptIndex1, b.*.languageIndex1, @intFromPtr(&requiredIndex1), @intFromPtr(&requiredTag1))
+
+    // Sort the features and merge duplicates.
+    const infos = &b.*.featureInfos
+    if infos.*.count != 0 {
+        if !b.*.isSimple { sortRecords(infos, 0, infos.*.count, FI_TAG, FI_SEQ, true) }
+        var j: u32 = 0
+        var i: u32 = 1
+        while i < infos.*.count {
+            const fi = vecAt(infos, i)
+            var fj = vecAt(infos, j)
+            if m.get32(fi + FI_TAG) != m.get32(fj + FI_TAG) {
+                j += 1
+                fj = vecAt(infos, j)
+                m.copy(fj, fi, @intCast(usize, FI_SIZE))
+            } else {
+                if (m.get32(fi + FI_FLAGS) & F_GLOBAL) != 0 {
+                    m.put32(fj + FI_FLAGS, m.get32(fj + FI_FLAGS) | F_GLOBAL)
+                    m.put32(fj + FI_MAX, m.get32(fi + FI_MAX))
+                    m.put32(fj + FI_DEFAULT, m.get32(fi + FI_DEFAULT))
+                } else {
+                    if (m.get32(fj + FI_FLAGS) & F_GLOBAL) != 0 { m.put32(fj + FI_FLAGS, m.get32(fj + FI_FLAGS) ^ F_GLOBAL) }
+                    if m.get32(fi + FI_MAX) > m.get32(fj + FI_MAX) { m.put32(fj + FI_MAX, m.get32(fi + FI_MAX)) }
+                }
+                m.put32(fj + FI_FLAGS, m.get32(fj + FI_FLAGS) | (m.get32(fi + FI_FLAGS) & F_HAS_FALLBACK))
+                if m.get32(fi + FI_STAGE0) < m.get32(fj + FI_STAGE0) { m.put32(fj + FI_STAGE0, m.get32(fi + FI_STAGE0)) }
+                if m.get32(fi + FI_STAGE1) < m.get32(fj + FI_STAGE1) { m.put32(fj + FI_STAGE1, m.get32(fi + FI_STAGE1)) }
+            }
+            i += 1
+        }
+        infos.*.count = j + 1
+    }
+
+    const featureIndices0 = set.mapCreate()
+    const featureIndices1 = set.mapCreate()
+    layout.collectFeaturesMap(b.*.face, TAG_GSUB, b.*.scriptIndex0, b.*.languageIndex0, featureIndices0)
+    layout.collectFeaturesMap(b.*.face, TAG_GPOS, b.*.scriptIndex1, b.*.languageIndex1, featureIndices1)
+
+    // Allocate bits.
+    var nextBit: u32 = 4
+    var i: u32 = 0
+    while i < infos.*.count {
+        const info = vecAt(infos, i)
+        i += 1
+        const tag = m.get32(info + FI_TAG)
+        const flags = m.get32(info + FI_FLAGS)
+        const maxValue = m.get32(info + FI_MAX)
+        var bitsNeeded: u32 = 0
+        if (flags & F_GLOBAL) != 0 && maxValue == 1 {
+            bitsNeeded = 0
+        } else {
+            bitsNeeded = bitStorage(maxValue)
+            if bitsNeeded > MAX_BITS { bitsNeeded = MAX_BITS }
+        }
+        if maxValue == 0 || nextBit + bitsNeeded >= globalBitShift { continue }
+        var found = false
+        var index0: u32 = layout.NOT_FOUND
+        var index1: u32 = layout.NOT_FOUND
+        if requiredTag0 == tag { requiredStage0 = m.get32(info + FI_STAGE0) }
+        if requiredTag1 == tag { requiredStage1 = m.get32(info + FI_STAGE1) }
+        var v: u32 = 0
+        if set.mapHas(featureIndices0, tag, &v) {
+            index0 = v
+            found = true
+        }
+        if set.mapHas(featureIndices1, tag, &v) {
+            index1 = v
+            found = true
+        }
+        if !found && (flags & F_GLOBAL_SEARCH) != 0 {
+            if layout.tableFindFeature(b.*.face, TAG_GSUB, tag, @intFromPtr(&index0)) { found = true }
+            if layout.tableFindFeature(b.*.face, TAG_GPOS, tag, @intFromPtr(&index1)) { found = true }
+        }
+        if !found && (flags & F_HAS_FALLBACK) == 0 { continue }
+        const fm = vecPush(&map.*.features)
+        if fm == 0 { continue }
+        m.put32(fm + FM_TAG, tag)
+        m.put32(fm + FM_INDEX0, index0)
+        m.put32(fm + FM_INDEX1, index1)
+        m.put32(fm + FM_STAGE0, m.get32(info + FI_STAGE0))
+        m.put32(fm + FM_STAGE1, m.get32(info + FI_STAGE1))
+        var mflags: u32 = 0
+        if (flags & F_MANUAL_ZWNJ) == 0 { mflags |= MF_AUTO_ZWNJ }
+        if (flags & F_MANUAL_ZWJ) == 0 { mflags |= MF_AUTO_ZWJ }
+        if (flags & F_RANDOM) != 0 { mflags |= MF_RANDOM }
+        if (flags & F_PER_SYLLABLE) != 0 { mflags |= MF_PER_SYLLABLE }
+        if !found { mflags |= MF_NEEDS_FALLBACK }
+        var shift: u32 = 0
+        var mask: u32 = 0
+        if (flags & F_GLOBAL) != 0 && maxValue == 1 {
+            shift = globalBitShift
+            mask = globalBitMask
+        } else {
+            shift = nextBit
+            mask = (@intCast(u32, 1) << @intCast(u5, nextBit + bitsNeeded)) - (@intCast(u32, 1) << @intCast(u5, nextBit))
+            nextBit += bitsNeeded
+            map.*.globalMask |= (m.get32(info + FI_DEFAULT) << @intCast(u5, shift)) & mask
+        }
+        m.put32(fm + FM_SHIFT, shift)
+        m.put32(fm + FM_MASK, mask)
+        m.put32(fm + FM_MASK1, (@intCast(u32, 1) << @intCast(u5, shift)) & mask)
+        m.put32(fm + FM_FLAGS, mflags)
+    }
+    set.mapDestroy(featureIndices0)
+    set.mapDestroy(featureIndices1)
+    if b.*.isSimple { sortRecords(&map.*.features, 0, map.*.features.count, FM_TAG, 0, false) }
+
+    addGsubPause(b, 0)
+    addGposPause(b, 0)
+
+    var ti: u32 = 0
+    while ti < 2 {
+        const ls = lookups(map, ti)
+        const builderStages = if ti == 0 { &b.*.stages0 } else { &b.*.stages1 }
+        const currentStage = if ti == 0 { b.*.currentStage0 } else { b.*.currentStage1 }
+        const requiredIndex = if ti == 0 { requiredIndex0 } else { requiredIndex1 }
+        const requiredStage = if ti == 0 { requiredStage0 } else { requiredStage1 }
+        const variations = if ti == 0 { variations0 } else { variations1 }
+        var stageIndex: u32 = 0
+        var lastNumLookups: u32 = 0
+        var stage: u32 = 0
+        while stage < currentStage {
+            if requiredIndex != layout.NOT_FOUND && requiredStage == stage {
+                addLookups(b, map, ti, requiredIndex, variations, globalBitMask, MF_AUTO_ZWNJ | MF_AUTO_ZWJ, 0x20202020)
+            }
+            var k: u32 = 0
+            while k < map.*.features.count {
+                const fm = vecAt(&map.*.features, k)
+                if m.get32(fm + (if ti == 0 { FM_STAGE0 } else { FM_STAGE1 })) == stage {
+                    addLookups(b, map, ti, m.get32(fm + (if ti == 0 { FM_INDEX0 } else { FM_INDEX1 })), variations, m.get32(fm + FM_MASK), m.get32(fm + FM_FLAGS) & ~MF_NEEDS_FALLBACK, m.get32(fm + FM_TAG))
+                }
+                k += 1
+            }
+            // Sort the stage's lookups and merge duplicates.
+            if lastNumLookups + 1 < ls.*.count {
+                sortRecords(ls, lastNumLookups, ls.*.count, LM_INDEX, 0, false)
+                var j = lastNumLookups
+                var n = j + 1
+                while n < ls.*.count {
+                    const li = vecAt(ls, n)
+                    var lj = vecAt(ls, j)
+                    if m.get32(li + LM_INDEX) != m.get32(lj + LM_INDEX) {
+                        j += 1
+                        lj = vecAt(ls, j)
+                        m.copy(lj, li, @intCast(usize, LM_SIZE))
+                    } else {
+                        m.put32(lj + LM_MASK, m.get32(lj + LM_MASK) | m.get32(li + LM_MASK))
+                        const keep = m.get32(li + LM_FLAGS) | ~(MF_AUTO_ZWNJ | MF_AUTO_ZWJ)
+                        m.put32(lj + LM_FLAGS, m.get32(lj + LM_FLAGS) & keep)
+                    }
+                    n += 1
+                }
+                ls.*.count = j + 1
+            }
+            lastNumLookups = ls.*.count
+            if stageIndex < builderStages.*.count && m.get32(vecAt(builderStages, stageIndex) + SI_INDEX) == stage {
+                const sm = vecPush(stages(map, ti))
+                if sm != 0 {
+                    m.put32(sm + ST_LAST, lastNumLookups)
+                    m.put32(sm + ST_PAUSE, m.get32(vecAt(builderStages, stageIndex) + SI_PAUSE))
+                }
+                stageIndex += 1
+            }
+            stage += 1
+        }
+        ti += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The plan
+
+pub const Plan = struct {
+    direction: u32
+    script: u32
+    language: usize
+    shaper: u32
+    map: Map
+    data: usize
+    fracMask: u32
+    numrMask: u32
+    dnomMask: u32
+    rtlmMask: u32
+    kernMask: u32
+    trakMask: u32
+    requestedKerning: bool
+    requestedTracking: bool
+    hasFrac: bool
+    hasVert: bool
+    hasGposMark: bool
+    zeroMarks: bool
+    fallbackGlyphClasses: bool
+    fallbackMarkPositioning: bool
+    adjustMarkPositioningWhenZeroing: bool
+    applyGpos: bool
+    applyKern: bool
+    applyFallbackKern: bool
+}
+
+fn tag4(a: u8, b: u8, c: u8, d: u8) -> u32 { return common.tag(a, b, c, d) }
+
+// The plan's decisions once its map is compiled (hb_ot_shape_planner_t::
+// compile): `gposTag` is the shaper's (0: any), `scriptZeroMarks` and
+// `scriptFallbackPosition` its mark handling.
+pub fn decide(plan: *Plan, fc: usize, gposTag: u32, scriptZeroMarks: bool, scriptFallbackPosition: bool) -> void {
+    const map = &plan.*.map
+    plan.*.fracMask = get1Mask(map, tag4(102, 114, 97, 99))
+    plan.*.numrMask = get1Mask(map, tag4(110, 117, 109, 114))
+    plan.*.dnomMask = get1Mask(map, tag4(100, 110, 111, 109))
+    plan.*.hasFrac = plan.*.fracMask != 0 || (plan.*.numrMask != 0 && plan.*.dnomMask != 0)
+    plan.*.rtlmMask = get1Mask(map, tag4(114, 116, 108, 109))
+    plan.*.hasVert = get1Mask(map, tag4(118, 101, 114, 116)) != 0
+    const kernTag = if common.isHorizontal(plan.*.direction) { tag4(107, 101, 114, 110) } else { tag4(118, 107, 114, 110) }
+    plan.*.kernMask = getMaskOnly(map, kernTag)
+    plan.*.requestedKerning = plan.*.kernMask != 0
+    plan.*.trakMask = getMaskOnly(map, tag4(116, 114, 97, 107))
+    plan.*.requestedTracking = plan.*.trakMask != 0
+    const hasGposKern = getFeatureIndex(map, 1, kernTag) != layout.NOT_FOUND
+    const disableGpos = gposTag != 0 && gposTag != map.*.chosenScript1
+    var gdef: m.Table = undefined
+    layout.gdefView(fc, &gdef)
+    plan.*.fallbackGlyphClasses = !layout.gdefHasGlyphClasses(&gdef)
+    const hasGpos = !disableGpos && layout.hasData(fc, 1)
+    plan.*.applyGpos = hasGpos
+    plan.*.applyKern = false
+    if !hasGposKern || !plan.*.applyGpos {
+        if kern.hasData(fc) { plan.*.applyKern = true }
+    }
+    plan.*.applyFallbackKern = !(plan.*.applyGpos || plan.*.applyKern)
+    plan.*.zeroMarks = scriptZeroMarks && (!plan.*.applyKern || !kern.hasStateMachine(fc))
+    plan.*.hasGposMark = get1Mask(map, tag4(109, 97, 114, 107)) != 0
+    plan.*.adjustMarkPositioningWhenZeroing = !plan.*.applyGpos && (!plan.*.applyKern || !kern.hasCrossStream(fc))
+    plan.*.fallbackMarkPositioning = plan.*.adjustMarkPositioningWhenZeroing && scriptFallbackPosition
+}

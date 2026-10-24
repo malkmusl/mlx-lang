@@ -1,0 +1,504 @@
+// offlineasm's passes over the tree (its transform.rb): settings
+// resolved (each "if" made its branch), macros expanded (with fresh
+// variables, arguments and constants substituted, the local labels of
+// each expansion renamed), structure offsets, sizes and constant
+// expressions made the numbers the offsets extractor found, and
+// arithmetic on numbers folded.
+//
+// Every pass rebuilds the nodes as Ruby's mapChildren does, a child at a
+// time and in Ruby's order (the order counts: fresh variable numbers and
+// unique label names are handed out as the passes go).
+const s = @import("../support.mlx")
+const u = @import("./util.mlx")
+const ast = @import("./ast.mlx")
+
+const Node = ast.Node
+
+const RESOLVE_SETTINGS: u8 = 1
+const DEMACROIFY: u8 = 2
+const FRESH_VARIABLES: u8 = 3
+const SUBSTITUTE: u8 = 4
+const SUBSTITUTE_LABELS: u8 = 5
+const RESOLVE_OFFSETS: u8 = 6
+const FOLD: u8 = 7
+
+// $uniqueMacroVarID.
+var uniqueMacroVarId: u64 = 0
+
+// What a pass works with: the settings (a map of names, 1 for true and 2
+// for false), the macros or the variables' values in scope (a scope), or
+// the new names of local labels (a map).
+const Context = struct {
+    map: ?*u.Map
+    scope: ?*u.Scope
+}
+
+fn apply(pass: u8, node: *Node, context: Context) -> *Node {
+    if pass == RESOLVE_SETTINGS { return resolveSettingsOf(node, context) }
+    if pass == DEMACROIFY { return demacroifyOf(node, context.scope) }
+    if pass == FRESH_VARIABLES { return freshVariablesOf(node, context.scope) }
+    if pass == SUBSTITUTE { return substituteOf(node, context.scope) }
+    if pass == SUBSTITUTE_LABELS { return substituteLabelsOf(node, context.map.?) }
+    if pass == RESOLVE_OFFSETS { return resolveOffsetsOf(node) }
+    return foldOf(node)
+}
+
+fn mapList(pass: u8, items: [*]*Node, count: usize, context: Context) -> [*]*Node {
+    const mapped = ast.nodeArray(count)
+    var index: usize = 0
+    while index < count {
+        mapped[index] = apply(pass, items[index], context)
+        index += 1
+    }
+    return mapped
+}
+
+// Node#mapChildren, the block being the pass.
+fn mapChildren(pass: u8, node: *Node, context: Context) -> *Node {
+    const kind = node.*.kind
+    if kind == ast.ADD || kind == ast.SUB || kind == ast.MUL || kind == ast.OR || kind == ast.AND || kind == ast.XOR || kind == ast.ADDRESS || kind == ast.CONST_DECL || kind == ast.PRED_AND || kind == ast.PRED_OR {
+        const left = apply(pass, node.*.a.?, context)
+        const right = apply(pass, node.*.b.?, context)
+        return ast.binary(kind, node.*.origin, left, right)
+    }
+    if kind == ast.NEG || kind == ast.BITNOT || kind == ast.PRED_NOT {
+        return ast.unary(kind, node.*.origin, apply(pass, node.*.a.?, context))
+    }
+    if kind == ast.BASE_INDEX {
+        const result = ast.newNode(kind, node.*.origin)
+        result.*.a = apply(pass, node.*.a.?, context)
+        result.*.b = apply(pass, node.*.b.?, context)
+        result.*.c = apply(pass, node.*.c.?, context)
+        result.*.d = apply(pass, node.*.d.?, context)
+        return result
+    }
+    if kind == ast.INSTRUCTION || kind == ast.SEQUENCE || kind == ast.MACRO_CALL {
+        const result = ast.copyNode(node)
+        result.*.items = mapList(pass, node.*.items, node.*.count, context)
+        return result
+    }
+    if kind == ast.LABEL {
+        // Labels are unique: changed in place.
+        if node.*.isAligned && node.*.a != null { node.*.a = apply(pass, node.*.a.?, context) }
+        return node
+    }
+    if kind == ast.LABEL_REFERENCE {
+        const result = ast.labelReference(node.*.origin, apply(pass, node.*.a.?, context))
+        result.*.value = node.*.value
+        return result
+    }
+    if kind == ast.LOCAL_LABEL_REFERENCE {
+        return ast.localLabelReference(node.*.origin, apply(pass, node.*.a.?, context))
+    }
+    if kind == ast.IF_THEN_ELSE {
+        const predicate = apply(pass, node.*.a.?, context)
+        const result = ast.ifThenElse(node.*.origin, predicate, apply(pass, node.*.b.?, context))
+        result.*.c = apply(pass, node.*.c.?, context)
+        return result
+    }
+    if kind == ast.MACRO {
+        const result = ast.copyNode(node)
+        result.*.items = mapList(pass, node.*.items, node.*.count, context)
+        result.*.a = apply(pass, node.*.a.?, context)
+        return result
+    }
+    return node
+}
+
+// ---------------------------------------------------------------------------
+// Settings.
+
+fn settingValue(node: *Node, settings: *u.Map) -> bool {
+    const kind = node.*.kind
+    if kind == ast.TRUE { return true }
+    if kind == ast.FALSE { return false }
+    if kind == ast.SETTING {
+        const value = u.mapGet(settings, node.*.name)
+        if value == 0 { s.fail(u.cat("offlineasm: no value for the setting ", node.*.name)) }
+        return value == 1
+    }
+    if kind == ast.PRED_AND { return settingValue(node.*.a.?, settings) && settingValue(node.*.b.?, settings) }
+    if kind == ast.PRED_OR { return settingValue(node.*.a.?, settings) || settingValue(node.*.b.?, settings) }
+    if kind == ast.PRED_NOT { return !settingValue(node.*.a.?, settings) }
+    s.fail("offlineasm: not a predicate")
+    return false
+}
+
+fn resolveSettingsOf(node: *Node, context: Context) -> *Node {
+    const kind = node.*.kind
+    if kind == ast.TRUE || kind == ast.FALSE || kind == ast.SETTING || kind == ast.PRED_AND || kind == ast.PRED_OR || kind == ast.PRED_NOT {
+        return ast.boolNode(settingValue(node, context.map.?))
+    }
+    if kind == ast.IF_THEN_ELSE {
+        if settingValue(node.*.a.?, context.map.?) { return resolveSettingsOf(node.*.b.?, context) }
+        return resolveSettingsOf(node.*.c.?, context)
+    }
+    if kind == ast.SEQUENCE {
+        var list = ast.listNew(node.*.count + 4)
+        var index: usize = 0
+        while index < node.*.count {
+            const item = resolveSettingsOf(node.*.items[index], context)
+            if item.*.kind == ast.SEQUENCE {
+                var inner: usize = 0
+                while inner < item.*.count {
+                    ast.listAdd(&list, item.*.items[inner])
+                    inner += 1
+                }
+            } else {
+                ast.listAdd(&list, item)
+            }
+            index += 1
+        }
+        return ast.withItems(ast.SEQUENCE, node.*.origin, list.items, list.count)
+    }
+    return mapChildren(RESOLVE_SETTINGS, node, context)
+}
+
+// node.resolveSettings(settings): SETTINGS maps each setting's name to 1
+// (true) or 2 (false).
+pub fn resolveSettings(node: *Node, settings: *u.Map) -> *Node {
+    return resolveSettingsOf(node, Context.{ .map = settings, .scope = null })
+}
+
+// ---------------------------------------------------------------------------
+// "%NAME%" in names: the concatenations of $concatenation.
+
+// Whether TEXT has a "%NAME%" (NAME of [a-zA-Z0-9_]).
+fn hasConcatenation(text: []const u8) -> bool {
+    var at: usize = 0
+    while at < text.length {
+        if text[at] == 37 {
+            var end = at + 1
+            while end < text.length && (u.isAlnum(text[end]) || text[end] == 95) { end += 1 }
+            if end > at + 1 && end < text.length && text[end] == 37 { return true }
+        }
+        at += 1
+    }
+    return false
+}
+
+// TEXT with each "%NAME%" whose variable has a value in MAPPING made the
+// value's name ("%NAME%" around it with WRAP), as Ruby's gsub makes it.
+fn concatenate(text: []const u8, origin: u64, mapping: ?*u.Scope, wrap: bool) -> []const u8 {
+    var result = u.bufNew(text.length + 16)
+    var at: usize = 0
+    while at < text.length {
+        if text[at] == 37 {
+            var end = at + 1
+            while end < text.length && (u.isAlnum(text[end]) || text[end] == 95) { end += 1 }
+            if end > at + 1 && end < text.length && text[end] == 37 {
+                const name = text[at + 1..end]
+                const variable = ast.variableFor(origin, name, "")
+                const value = ast.nodeAt(u.scopeGet(mapping, variable.*.name))
+                if value != null {
+                    if wrap { u.bufAdd(&result, "%") }
+                    u.bufAdd(&result, ast.nameOf(value.?))
+                    if wrap { u.bufAdd(&result, "%") }
+                } else {
+                    u.bufAdd(&result, text[at..end + 1])
+                }
+                at = end + 1
+                continue
+            }
+        }
+        u.bufByte(&result, text[at])
+        at += 1
+    }
+    return u.bufText(&result)
+}
+
+// The renaming shared by freshVariables (WRAP) and substitute for the
+// kinds that have a name made of concatenations; null for another kind.
+fn renamed(node: *Node, mapping: ?*u.Scope, wrap: bool) -> ?*Node {
+    const kind = node.*.kind
+    if kind == ast.VARIABLE {
+        if hasConcatenation(node.*.name) { return ast.variableFor(node.*.origin, concatenate(node.*.name, node.*.origin, mapping, wrap), "") }
+        const value = ast.nodeAt(u.scopeGet(mapping, node.*.name))
+        if value != null { return value.? }
+        return node
+    }
+    if kind == ast.STRUCT_OFFSET {
+        const dump = ast.structOffsetDump(node)
+        if hasConcatenation(dump) { return ast.structOffsetOfDump(node.*.origin, concatenate(dump, node.*.origin, mapping, wrap)) }
+        return node
+    }
+    if kind == ast.CONST_EXPR {
+        if hasConcatenation(node.*.name) { return ast.constExprFor(node.*.origin, concatenate(node.*.name, node.*.origin, mapping, wrap)) }
+        return node
+    }
+    if kind == ast.SIZEOF {
+        if hasConcatenation(node.*.name) { return ast.sizeofFor(node.*.origin, concatenate(node.*.name, node.*.origin, mapping, wrap)) }
+        return node
+    }
+    if kind == ast.LABEL {
+        const alignedToVariable = node.*.a != null && node.*.a.?.*.kind == ast.VARIABLE
+        if hasConcatenation(node.*.name) || alignedToVariable {
+            const name = concatenate(node.*.name, node.*.origin, mapping, wrap)
+            const result = ast.labelFor(node.*.origin, name, node.*.definedInFile)
+            if node.*.isGlobal { result.*.isGlobal = true }
+            if !node.*.isAligned {
+                result.*.isGlobal = true
+                result.*.isAligned = false
+            }
+            if node.*.isAligned && node.*.a != null {
+                const alignTo = if wrap { freshVariablesOf(node.*.a.?, mapping) } else { substituteOf(node.*.a.?, mapping) }
+                ast.setAligned(result, alignTo)
+            }
+            if !node.*.isExtern { result.*.isExtern = false }
+            return result
+        }
+        return node
+    }
+    return null
+}
+
+// ---------------------------------------------------------------------------
+// freshVariables and substitute.
+
+fn freshVariablesOf(node: *Node, mapping: ?*u.Scope) -> *Node {
+    const kind = node.*.kind
+    if kind == ast.MACRO { return freshMacro(node, mapping) }
+    if kind == ast.MACRO_CALL {
+        var newName = ast.variableFor(node.*.origin, node.*.name, node.*.original)
+        const value = ast.nodeAt(u.scopeGet(mapping, newName.*.name))
+        if value != null { newName = value.? }
+        const result = ast.copyNode(node)
+        result.*.items = mapList(FRESH_VARIABLES, node.*.items, node.*.count, Context.{ .map = null, .scope = mapping })
+        result.*.name = newName.*.name
+        return result
+    }
+    const result = renamed(node, mapping, true)
+    if result != null { return result.? }
+    return mapChildren(FRESH_VARIABLES, node, Context.{ .map = null, .scope = mapping })
+}
+
+// Macro#freshVariables: its variables made new ones ("_varN"), in its
+// body too.
+fn freshMacro(macro: *Node, mapping: ?*u.Scope) -> *Node {
+    const myMapping = u.scopeNew(mapping)
+    const variables = ast.nodeArray(macro.*.count)
+    var index: usize = 0
+    while index < macro.*.count {
+        const variable = macro.*.items[index]
+        uniqueMacroVarId += 1
+        const fresh = ast.variableFor(variable.*.origin, u.cat("_var", s.decimal(uniqueMacroVarId)), variable.*.text)
+        variables[index] = fresh
+        u.scopeSet(myMapping, variable.*.name, ast.wordOf(fresh))
+        index += 1
+    }
+    const result = ast.copyNode(macro)
+    result.*.items = variables
+    result.*.a = freshVariablesOf(macro.*.a.?, myMapping)
+    return result
+}
+
+fn substituteOf(node: *Node, mapping: ?*u.Scope) -> *Node {
+    const kind = node.*.kind
+    if kind == ast.SEQUENCE { return substituteSequence(node, mapping) }
+    if kind == ast.MACRO {
+        // The mapping without the macro's own variables.
+        const myMapping = u.scopeNew(mapping)
+        myMapping.*.hidden = unsafe { @ptrFromInt([*][]const u8, s.alloc((node.*.count + 1) * @sizeOf([]const u8))) }
+        var index: usize = 0
+        while index < node.*.count {
+            myMapping.*.hidden[index] = node.*.items[index].*.name
+            index += 1
+        }
+        myMapping.*.hiddenCount = node.*.count
+        return mapChildren(SUBSTITUTE, node, Context.{ .map = null, .scope = myMapping })
+    }
+    const result = renamed(node, mapping, false)
+    if result != null { return result.? }
+    return mapChildren(SUBSTITUTE, node, Context.{ .map = null, .scope = mapping })
+}
+
+// Sequence#substitute: the constants declared in the sequence are values
+// for what follows them, and go.
+fn substituteSequence(sequence: *Node, constants: ?*u.Scope) -> *Node {
+    var list = ast.listNew(sequence.*.count + 1)
+    var myConstants = constants
+    var own: ?*u.Scope = null
+    var index: usize = 0
+    while index < sequence.*.count {
+        const item = sequence.*.items[index]
+        if item.*.kind == ast.CONST_DECL {
+            const variable = item.*.a.?
+            if variable.*.kind != ast.VARIABLE { s.fail("offlineasm: a constant that is not a variable") }
+            const value = substituteOf(item.*.b.?, myConstants)
+            if own == null {
+                own = u.scopeNew(constants)
+                myConstants = own
+            }
+            u.scopeSet(own.?, variable.*.name, ast.wordOf(value))
+        } else {
+            ast.listAdd(&list, substituteOf(item, myConstants))
+        }
+        index += 1
+    }
+    return ast.withItems(ast.SEQUENCE, sequence.*.origin, list.items, list.count)
+}
+
+pub fn substitute(node: *Node) -> *Node { return substituteOf(node, null) }
+
+fn substituteLabelsOf(node: *Node, mapping: *u.Map) -> *Node {
+    if node.*.kind == ast.LOCAL_LABEL {
+        const value = ast.nodeAt(u.mapGet(mapping, node.*.name))
+        if value != null { return value.? }
+        return node
+    }
+    return mapChildren(SUBSTITUTE_LABELS, node, Context.{ .map = mapping, .scope = null })
+}
+
+// Sequence#renameLabels: the local labels defined in the sequence made
+// unique names ("_COMMENT_NAME"), where they are referred to too.
+fn renameLabels(sequence: *Node, comment: []const u8) -> *Node {
+    const mapping = u.mapNew(16)
+    var index: usize = 0
+    while index < sequence.*.count {
+        const item = sequence.*.items[index]
+        if item.*.kind == ast.LOCAL_LABEL {
+            const name = item.*.name
+            const cleanName = if name.length > 0 && name[0] == 46 { u.cat("_", name[1..name.length]) } else { name }
+            u.mapPut(mapping, name, ast.wordOf(ast.uniqueLocalLabel(sequence.*.origin, u.cat3(comment, "_", cleanName))))
+        }
+        index += 1
+    }
+    return substituteLabelsOf(sequence, mapping)
+}
+
+// ---------------------------------------------------------------------------
+// demacroify.
+
+fn demacroifyOf(node: *Node, macros: ?*u.Scope) -> *Node {
+    if node.*.kind == ast.SEQUENCE { return demacroifySequence(node, macros) }
+    return mapChildren(DEMACROIFY, node, Context.{ .map = null, .scope = macros })
+}
+
+fn demacroifySequence(sequence: *Node, macros: ?*u.Scope) -> *Node {
+    var myMacros = macros
+    var index: usize = 0
+    // The macros of the sequence first, so that they may be used before
+    // they are defined.
+    while index < sequence.*.count {
+        const item = sequence.*.items[index]
+        if item.*.kind == ast.MACRO {
+            if myMacros == macros { myMacros = u.scopeNew(macros) }
+            u.scopeSet(myMacros.?, item.*.name, ast.wordOf(freshMacro(item, null)))
+        }
+        index += 1
+    }
+    var list = ast.listNew(sequence.*.count + 4)
+    index = 0
+    while index < sequence.*.count {
+        const item = sequence.*.items[index]
+        if item.*.kind == ast.MACRO {
+            // Already taken.
+        } else if item.*.kind == ast.MACRO_CALL {
+            const found = ast.nodeAt(u.scopeGet(myMacros, item.*.name))
+            if found == null { s.fail(u.cat3("offlineasm: Could not find macro ", item.*.original, u.cat(" at ", ast.originString(item.*.origin)))) }
+            const macro = found.?
+            if macro.*.count != item.*.count {
+                s.fail(u.cat3("offlineasm: Argument count mismatch for call to ", item.*.original, u.cat(" at ", ast.originString(item.*.origin))))
+            }
+            const mapping = u.scopeNew(null)
+            const myMyMacros = u.scopeNew(myMacros)
+            var argument: usize = 0
+            while argument < item.*.count {
+                const operand = item.*.items[argument]
+                const variable = macro.*.items[argument]
+                const named = if operand.*.kind == ast.VARIABLE { u.scopeGet(myMacros, operand.*.name) } else { 0 }
+                if named != 0 {
+                    u.scopeSet(myMyMacros, variable.*.name, named)
+                    u.scopeSet(mapping, variable.*.name, 0)
+                } else if operand.*.kind == ast.MACRO {
+                    u.scopeSet(myMyMacros, variable.*.name, ast.wordOf(freshMacro(operand, null)))
+                    u.scopeSet(mapping, variable.*.name, 0)
+                } else {
+                    u.scopeSet(mapping, variable.*.name, ast.wordOf(operand))
+                }
+                argument += 1
+            }
+            if item.*.hasText {
+                ast.listAdd(&list, ast.instruction(item.*.origin, "localAnnotation", ast.nodeArray(0), 0, item.*.text, true))
+            }
+            const body = renameLabels(demacroifySequence(substituteSequence(macro.*.a.?, mapping), myMyMacros), item.*.original)
+            var inner: usize = 0
+            while inner < body.*.count {
+                ast.listAdd(&list, body.*.items[inner])
+                inner += 1
+            }
+        } else {
+            ast.listAdd(&list, demacroifyOf(item, myMacros))
+        }
+        index += 1
+    }
+    return substituteSequence(ast.withItems(ast.SEQUENCE, sequence.*.origin, list.items, list.count), null)
+}
+
+pub fn demacroify(node: *Node) -> *Node { return demacroifyOf(node, null) }
+
+// ---------------------------------------------------------------------------
+// resolveOffsets and fold.
+
+fn resolveOffsetsOf(node: *Node) -> *Node {
+    const kind = node.*.kind
+    if kind == ast.STRUCT_OFFSET || kind == ast.SIZEOF || kind == ast.CONST_EXPR {
+        if !node.*.resolved { s.fail(u.cat("offlineasm: Could not find a value for ", node.*.name)) }
+        return ast.immediate(node.*.origin, node.*.value)
+    }
+    return mapChildren(RESOLVE_OFFSETS, node, Context.{ .map = null, .scope = null })
+}
+
+fn plusOffset(reference: *Node, offset: i128) -> *Node {
+    const result = ast.labelReference(reference.*.origin, reference.*.a.?)
+    result.*.value = reference.*.value + offset
+    return result
+}
+
+fn foldOf(node: *Node) -> *Node {
+    const kind = node.*.kind
+    if kind == ast.ADD || kind == ast.SUB || kind == ast.MUL || kind == ast.OR || kind == ast.AND || kind == ast.XOR {
+        const left = foldOf(node.*.a.?)
+        const right = foldOf(node.*.b.?)
+        const leftNumber = left.*.kind == ast.IMMEDIATE
+        const rightNumber = right.*.kind == ast.IMMEDIATE
+        if kind == ast.ADD {
+            if leftNumber && right.*.kind == ast.LABEL_REFERENCE { return plusOffset(right, left.*.value) }
+            if left.*.kind == ast.LABEL_REFERENCE && rightNumber { return plusOffset(left, right.*.value) }
+        }
+        if kind == ast.SUB && left.*.kind == ast.LABEL_REFERENCE && rightNumber { return plusOffset(left, 0 - right.*.value) }
+        if !leftNumber || !rightNumber { return ast.binary(kind, node.*.origin, left, right) }
+        const a = left.*.value
+        const b = right.*.value
+        var value: i128 = 0
+        if kind == ast.ADD {
+            value = a + b
+        } else if kind == ast.SUB {
+            value = a - b
+        } else if kind == ast.MUL {
+            value = a * b
+        } else if kind == ast.OR {
+            value = a | b
+        } else if kind == ast.AND {
+            value = a & b
+        } else {
+            value = a ^ b
+        }
+        return ast.immediate(node.*.origin, value)
+    }
+    if kind == ast.NEG || kind == ast.BITNOT {
+        const child = foldOf(node.*.a.?)
+        if child.*.kind != ast.IMMEDIATE { return ast.unary(kind, node.*.origin, child) }
+        // (An if-expression of 128 bits loses its upper half: statements.)
+        var value = ~child.*.value
+        if kind == ast.NEG { value = 0 - child.*.value }
+        return ast.immediate(node.*.origin, value)
+    }
+    return mapChildren(FOLD, node, Context.{ .map = null, .scope = null })
+}
+
+// node.resolve(constantsMap): the values are in the structure offset,
+// size and constant expression nodes already.
+pub fn resolve(node: *Node) -> *Node {
+    return foldOf(resolveOffsetsOf(demacroify(node)))
+}

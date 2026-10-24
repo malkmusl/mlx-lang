@@ -3,11 +3,18 @@
 #
 #   - zlib 1.3.1: the library and its test program (test/example.c), run
 #     on the system's C library and on mlxlibc alone;
-#   - Lua 5.4.7: the interpreter, then the official Lua 5.4.7 test suite
-#     (user mode, `_U=true`) file by file.
+#   - Lua 5.4.7: the interpreter as POSIX systems build it (LUA_USE_POSIX:
+#     sigaction, popen, mkstemp; not dlopen, whose tests need shared
+#     objects), then the official Lua 5.4.7 test suite (user mode,
+#     `_U=true`) file by file;
+#   - SQLite 3.46.1: the library (the amalgamation) and its shell, in the
+#     single-threaded and in the default thread-safe configuration
+#     (pthread.h, dlfcn.h); the shell runs compiler/cc/tests/sqlite.sql
+#     and prints what gcc's build of it printed (sqlite.expected), on the
+#     system's C library and on mlxlibc alone.
 #
 # The sources are downloaded from their projects (or taken from
-# --sources DIR, which holds the three tarballs) and must match the
+# --sources DIR, which holds the four tarballs) and must match the
 # SHA-256 sums below. Each is unpacked in a directory of its own and only
 # compiled and run, never sourced.
 #
@@ -45,9 +52,11 @@ fetch() {
 fetch zlib.tar.gz https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
 fetch lua.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz 9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
 fetch luatests.tar.gz https://www.lua.org/tests/lua-5.4.7-tests.tar.gz 8a4898ffe4c7613c8009327a0722db7a41ef861d526c77c5b46114e59ebf811e
+fetch sqlite.tar.gz https://www.sqlite.org/2024/sqlite-autoconf-3460100.tar.gz 67d3fe6d268e6eaddcae3727fce58fcc8e9c53869bdd07a0c61e38ddf2965071
 
-"$compiler" --quiet projects/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
-cp -r projects/cc/include "$work/include"
+"$compiler" --quiet compiler/cc/main.mlx -o "$work/mlx-cc" || fail "mlx-cc does not build"
+"$compiler" --quiet compiler/ld/main.mlx -o "$work/mlx-ld" || fail "mlx-ld does not build"
+cp -r compiler/cc/include "$work/include"
 cc="$work/mlx-cc"
 tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/lib" > /dev/null
 lib="$work/lib/libmlxc.so.1"
@@ -72,7 +81,7 @@ lfiles=()
 for source in "$lua"/*.c; do
     [[ $(basename "$source") == luac.c ]] || lfiles+=("$source")
 done
-"$cc" -o "$work/lua" "${lfiles[@]}" -lm 2> "$work/lua.cc" || fail "Lua does not compile: $(head -5 "$work/lua.cc")"
+"$cc" -o "$work/lua" -DLUA_USE_POSIX "${lfiles[@]}" -lm 2> "$work/lua.cc" || fail "Lua does not compile: $(head -5 "$work/lua.cc")"
 [[ ! -s "$work/lua.cc" ]] || fail "Lua: the compiler said: $(head -5 "$work/lua.cc")"
 answer=$("$work/lua" -e 'print(("%d %.3f %s"):format(6 * 7, math.pi, ("ok"):upper()))')
 [[ "$answer" == "42 3.142 OK" ]] || fail "Lua answered: $answer"
@@ -84,4 +93,45 @@ for name in strings math sort nextvar pm utf8 tpack vararg closure calls constru
     passed+=("$name")
 done
 echo "ok   Lua 5.4.7: the interpreter, and ${#passed[@]} files of the official test suite pass"
+
+# Lua again from objects: each file with -c, the library an archive of
+# mlx-ar's, the interpreter linked against it with -L and -l.
+"$compiler" --quiet compiler/cc/ar.mlx -o "$work/mlx-ar" || fail "mlx-ar does not build"
+mkdir -p "$work/lua-objects"
+lobjects=()
+for source in "${lfiles[@]}"; do
+    name=$(basename "$source" .c)
+    (cd "$work/lua-objects" && "$cc" -c -DLUA_USE_POSIX "$source") 2>> "$work/lua-objects.cc" || fail "Lua -c $name: $(head -5 "$work/lua-objects.cc")"
+    [[ $name == lua ]] || lobjects+=("$work/lua-objects/$name.o")
+done
+"$work/mlx-ar" rcs "$work/lua-objects/liblua.a" "${lobjects[@]}" || fail "mlx-ar: liblua.a"
+"$cc" -o "$work/lua-linked" "$work/lua-objects/lua.o" -L"$work/lua-objects" -llua -lm 2>> "$work/lua-objects.cc" || fail "Lua does not link from objects: $(head -5 "$work/lua-objects.cc")"
+answer=$("$work/lua-linked" -e 'print(("%d %.3f %s"):format(6 * 7, math.pi, ("ok"):upper()))')
+[[ "$answer" == "42 3.142 OK" ]] || fail "Lua from objects answered: $answer"
+for name in strings math closure; do
+    (cd "$suite" && timeout 300 "$work/lua-linked" -e "_U=true" "$name.lua" > "$work/lua-linked-$name.log" 2>&1) || fail "Lua from objects, test $name.lua: $(tail -5 "$work/lua-linked-$name.log")"
+done
+echo "ok   Lua from ${#lobjects[@]} objects and an archive of mlx-ar's (-c, -L, -l): the interpreter and 3 test files pass"
+
+# SQLite: the amalgamation and the shell, single-threaded and thread-safe.
+sqlite=$(ls -d "$work"/src-sqlite/*/)
+script=$repo_root/compiler/cc/tests/sqlite.sql
+expected=$repo_root/compiler/cc/tests/sqlite.expected
+"$cc" -o "$work/sqlite3" -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DQS=0 "$sqlite/sqlite3.c" "$sqlite/shell.c" -lm 2> "$work/sqlite.cc" || fail "SQLite does not compile: $(head -5 "$work/sqlite.cc")"
+[[ ! -s "$work/sqlite.cc" ]] || fail "SQLite: the compiler said: $(head -5 "$work/sqlite.cc")"
+"$cc" -o "$work/sqlite3-threads" -DSQLITE_DQS=0 -DSQLITE_ENABLE_MATH_FUNCTIONS "$sqlite/sqlite3.c" "$sqlite/shell.c" -lm -lpthread -ldl 2> "$work/sqlite-threads.cc" || fail "SQLite (thread-safe) does not compile: $(head -5 "$work/sqlite-threads.cc")"
+for build in sqlite3 sqlite3-threads; do
+    status=0
+    (cd "$work/zrun" && timeout 120 "$work/$build" -batch :memory: < "$script" > "$work/$build.out" 2>&1) || status=$?
+    echo "exit $status" >> "$work/$build.out"
+    cmp -s "$expected" "$work/$build.out" || fail "$build prints otherwise than gcc's build (expected < > got): $(diff "$expected" "$work/$build.out" | head -12)"
+done
+answer=$(echo 'select round(sqrt(2), 6), round(pow(2, 10)), ceil(2.1), floor(-2.1);' | "$work/sqlite3-threads" -batch :memory:)
+[[ "$answer" == "1.414214|1024.0|3.0|-3.0" ]] || fail "SQLite's math functions answered: $answer"
+status=0
+# On mlxlibc, -lm is the libm.so.6 built next to libmlxc.so.1.
+(cd "$work/zrun" && env -i LD_LIBRARY_PATH="$work/lib" timeout 120 "$lib" "$work/sqlite3" -batch :memory: < "$script" > "$work/sqlite3.mlxlibc" 2>&1) || status=$?
+echo "exit $status" >> "$work/sqlite3.mlxlibc"
+cmp -s "$expected" "$work/sqlite3.mlxlibc" || fail "SQLite on mlxlibc prints otherwise (expected < > got): $(diff "$expected" "$work/sqlite3.mlxlibc" | head -12)"
+echo "ok   SQLite 3.46.1: the library and its shell, single-threaded and thread-safe, run $(grep -c ';' "$script") statements as gcc's build does, on glibc and on mlxlibc"
 echo "check_cc_projects.sh: all checks passed"

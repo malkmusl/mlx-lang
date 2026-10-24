@@ -1,0 +1,302 @@
+// The Mlx port's platform strategies (MlxPlatformStrategies.h).
+#include "config.h"
+#include "MlxPlatformStrategies.h"
+
+#include "BlobRegistry.h"
+#include "BlobRegistryImpl.h"
+#include "BlobResourceHandle.h"
+#include "CachedResource.h"
+#include "FrameLoader.h"
+#include "LoaderStrategy.h"
+#include "LocalFrame.h"
+#include "MIMETypeRegistry.h"
+#include "MediaStrategy.h"
+#include "NetworkLoadMetrics.h"
+#include "ResourceError.h"
+#include "ResourceHandle.h"
+#include "ResourceLoader.h"
+#include "ResourceResponse.h"
+#include "SharedBuffer.h"
+#include "SubresourceLoader.h"
+#include "port/embed/MlxNetwork.h"
+#include "port/embed/MlxSchemeHandler.h"
+#include "Document.h"
+#include "OriginAccessPatterns.h"
+#include "ProcessCapabilities.h"
+#include "SecurityOrigin.h"
+#include "port/MlxWebPort.h"
+#include "port/platform/graphics/mlx/MlxSkiaRoutines.h"
+#include <wtf/RunLoop.h>
+#include <wtf/text/CString.h>
+
+namespace WebCore {
+
+// The errors WebCore asks the strategy to make, in WebKit's internal domain
+// with NSURLError's codes, which WebCore's own checks compare with.
+static constexpr int cancelledCode = -999;
+static constexpr int blockedCode = 103;
+static constexpr int cannotShowURLCode = 101;
+static constexpr int interruptedCode = 102;
+static constexpr int cannotShowMIMETypeCode = 100;
+static constexpr int fileDoesNotExistCode = -1100;
+static constexpr int pluginWillHandleCode = 204;
+static constexpr int httpsOnlyCode = 106;
+
+static ResourceError errorFor(const URL& url, int code, ASCIILiteral description, ResourceError::Type type = ResourceError::Type::General)
+{
+    return ResourceError(errorDomainWebKitInternal, code, url, description, type);
+}
+
+// A file: URL's file, read whole by the Mlx side (std.fs) and given to the
+// loader as WebKit2's WebResourceLoader gives the network process's: the
+// response (typed by the file's extension, MIMETypeRegistryMlx.cpp), once
+// WebCore has decided on it the data, then the end.
+static void loadFile(ResourceLoader& loader)
+{
+    if (loader.reachedTerminalState())
+        return;
+    URL url = loader.request().url();
+    String path = url.fileSystemPath();
+    uint32_t reason = 0;
+    size_t contents = mlxweb_file_read(path.utf8().data(), &reason);
+    if (!contents) {
+        loader.didFail(reason == MLXWEB_FILE_NOT_FOUND
+            ? errorFor(url, fileDoesNotExistCode, "The file does not exist"_s)
+            : errorFor(url, cannotShowURLCode, "The file cannot be read"_s));
+        return;
+    }
+    size_t length = mlxweb_file_length(contents);
+    Ref data = SharedBuffer::create(std::span<const uint8_t>(mlxweb_file_bytes(contents), length));
+    mlxweb_file_release(contents);
+
+    String mimeType = MIMETypeRegistry::mimeTypeForPath(path);
+    if (mimeType.isEmpty())
+        mimeType = "application/octet-stream"_s;
+    ResourceResponse response(WTF::move(url), WTF::move(mimeType), static_cast<long long>(length), String());
+    loader.didReceiveResponse(WTF::move(response), [loader = Ref { loader }, data = WTF::move(data)] {
+        if (!loader->reachedTerminalState() && data->size() && loader->request().httpMethod() != "HEAD"_s)
+            loader->didReceiveBuffer(data, data->size(), DataPayloadWholeResource);
+        if (!loader->reachedTerminalState())
+            loader->didFinishLoading(NetworkLoadMetrics { });
+    });
+}
+
+// A blob: URL's bytes (a File's, a Blob's: the process's blob registry),
+// read whole by WebCore's BlobResourceHandle and given to the loader as a
+// file's are (FileReader, fetch() of a blob URL, a blob URL's page).
+static void loadBlob(ResourceLoader& loader)
+{
+    if (loader.reachedTerminalState())
+        return;
+    const auto& request = loader.request();
+    auto* blobData = MlxPlatformStrategies::blobData(request.url());
+    ResourceError error;
+    ResourceResponse response;
+    Vector<uint8_t> bytes;
+    BlobResourceHandle::loadResourceSynchronously(blobData, request, error, response, bytes);
+    if (!error.isNull()) {
+        loader.didFail(error);
+        return;
+    }
+    Ref data = SharedBuffer::create(WTF::move(bytes));
+    loader.didReceiveResponse(WTF::move(response), [loader = Ref { loader }, data = WTF::move(data)] {
+        if (!loader->reachedTerminalState() && data->size() && loader->request().httpMethod() != "HEAD"_s)
+            loader->didReceiveBuffer(data, data->size(), DataPayloadWholeResource);
+        if (!loader->reachedTerminalState())
+            loader->didFinishLoading(NetworkLoadMetrics { });
+    });
+}
+
+// Each load a SubresourceLoader (the main resource's too), run as WebKit2's
+// WebLoaderStrategy runs them, from the main loop: data: URLs by WebCore
+// itself (ResourceLoader::start, DataURLDecoder), file: URLs by the port
+// (loadFile, std.fs), blob: URLs from the process's blob registry
+// (loadBlob), http: and https: by the port's network (MlxNetwork:
+// std.http and std.tls on a thread of their own), the embedder's schemes
+// by its callbacks (MlxSchemeHandler: Voyager's voyager:); other schemes
+// fail as URLs that cannot be shown. No scheduling by priority yet.
+class MlxLoaderStrategy final : public LoaderStrategy {
+public:
+    void loadResource(LocalFrame& frame, CachedResource& resource, ResourceRequest&& request, const ResourceLoaderOptions& options, CompletionHandler<void(RefPtr<SubresourceLoader>&&)>&& completionHandler) override
+    {
+        SubresourceLoader::create(frame, resource, WTF::move(request), options, [completionHandler = WTF::move(completionHandler)](RefPtr<SubresourceLoader>&& loader) mutable {
+            if (loader)
+                schedule(*loader);
+            completionHandler(WTF::move(loader));
+        });
+    }
+
+    static void schedule(ResourceLoader& loader)
+    {
+        const URL& url = loader.request().url();
+        if (url.protocolIsData()) {
+            loader.start();
+            return;
+        }
+        if (url.protocolIsFile()) {
+            RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
+                loadFile(loader);
+            });
+            return;
+        }
+        if (url.protocolIsBlob()) {
+            RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
+                loadBlob(loader);
+            });
+            return;
+        }
+        if (MlxNetwork::handles(url)) {
+            MlxNetwork::load(loader);
+            return;
+        }
+        if (MlxSchemeHandler::handles(url)) {
+            MlxSchemeHandler::load(loader);
+            return;
+        }
+        RunLoop::mainSingleton().dispatch([loader = Ref { loader }] {
+            if (!loader->reachedTerminalState())
+                loader->didFail(errorFor(loader->request().url(), cannotShowURLCode, "The port does not load this URL yet"_s));
+        });
+    }
+
+    void loadResourceSynchronously(FrameLoader& frameLoader, ResourceLoaderIdentifier, const ResourceRequest& request, ClientCredentialPolicy, const FetchOptions&, const HTTPHeaderMap&, ResourceError& error, ResourceResponse& response, Vector<uint8_t>& data) override
+    {
+        if (MlxNetwork::handles(request.url())) {
+            MlxNetwork::loadSynchronously(request, error, response, data);
+            return;
+        }
+        if (request.url().protocolIsBlob()) {
+            BlobResourceHandle::loadResourceSynchronously(MlxPlatformStrategies::blobData(request.url()), request, error, response, data);
+            return;
+        }
+        if (MlxSchemeHandler::handles(request.url())) {
+            // (WebCore's asynchronous loads check this in ResourceLoader::init;
+            // a synchronous one is checked here: only the scheme's own pages.)
+            RefPtr document = frameLoader.frame().document();
+            if (!document || !document->securityOrigin().canDisplay(request.url(), OriginAccessPatternsForWebProcess::singleton())) {
+                error = cannotShowURLError(request);
+                return;
+            }
+            MlxSchemeHandler::loadSynchronously(request, error, response, data);
+            return;
+        }
+        ResourceHandle::loadResourceSynchronously(frameLoader.networkingContext(), request, StoredCredentialsPolicy::Use, nullptr, error, response, data);
+    }
+
+    void pageLoadCompleted(Page&) override { }
+    void browsingContextRemoved(LocalFrame&) override { }
+    // (A load gone: a body still coming is read no further.)
+    void remove(ResourceLoader* loader) override
+    {
+        if (loader)
+            MlxNetwork::loaderGone(*loader);
+    }
+    void setDefersLoading(ResourceLoader&, bool) override { }
+    void crossOriginRedirectReceived(ResourceLoader*, const URL&) override { }
+    void servePendingRequests(ResourceLoadPriority) override { }
+    void suspendPendingRequests() override { }
+    void resumePendingRequests() override { }
+
+    // STUB (later: pings, beacons and hyperlink auditing, sent through
+    // MlxNetwork without waiting for the answer): a ping is refused.
+    void startPingLoad(LocalFrame&, ResourceRequest& request, const HTTPHeaderMap&, const FetchOptions&, ContentSecurityPolicyImposition, PingLoadCompletionHandler&& completionHandler) override
+    {
+        if (completionHandler)
+            completionHandler(errorFor(request.url(), cannotShowURLCode, "Ping loads are not supported yet"_s), { });
+    }
+
+    void preconnectTo(FrameLoader&, ResourceRequest&& request, StoredCredentialsPolicy, ShouldPreconnectAsFirstParty, PreconnectCompletionHandler&& completionHandler) override
+    {
+        if (completionHandler)
+            completionHandler(errorFor(request.url(), cannotShowURLCode, "Preconnecting is not supported"_s));
+    }
+
+    void setCaptureExtraNetworkLoadMetricsEnabled(bool) override { }
+
+    bool isOnLine() const override { return true; }
+    void addOnlineStateChangeListener(Function<void(bool)>&&) override { }
+
+    void isResourceLoadFinished(CachedResource& resource, CompletionHandler<void(bool)>&& callback) override
+    {
+        callback(resource.isLoaded());
+    }
+
+    ResourceError cancelledError(const ResourceRequest& request) const override { return errorFor(request.url(), cancelledCode, "Load cancelled"_s, ResourceError::Type::Cancellation); }
+    ResourceError blockedError(const ResourceRequest& request) const override { return errorFor(request.url(), blockedCode, "Not allowed to use restricted network port"_s); }
+    bool isBlockedError(const ResourceError& error) const override { return error.errorCode() == blockedCode && error.domain() == errorDomainWebKitInternal; }
+    ResourceError blockedByContentBlockerError(const ResourceRequest& request) const override { return errorFor(request.url(), blockedCode, "The URL was blocked by a content blocker"_s); }
+    ResourceError cannotShowURLError(const ResourceRequest& request) const override { return errorFor(request.url(), cannotShowURLCode, "The URL can't be shown"_s); }
+    ResourceError interruptedForPolicyChangeError(const ResourceRequest& request) const override { return errorFor(request.url(), interruptedCode, "Frame load was interrupted"_s); }
+    ResourceError blockedByContentFilterError(const ResourceRequest& request) const override { return errorFor(request.url(), blockedCode, "The URL was blocked by a content filter"_s); }
+    ResourceError cannotShowMIMETypeError(const ResourceResponse& response) const override { return errorFor(response.url(), cannotShowMIMETypeCode, "The content of the URL can't be shown"_s); }
+    ResourceError fileDoesNotExistError(const ResourceResponse& response) const override { return errorFor(response.url(), fileDoesNotExistCode, "The file does not exist"_s); }
+    ResourceError httpsUpgradeRedirectLoopError(const ResourceRequest& request) const override { return errorFor(request.url(), httpsOnlyCode, "HTTPS upgrade redirect loop detected"_s); }
+    ResourceError httpNavigationWithHTTPSOnlyError(const ResourceRequest& request) const override { return errorFor(request.url(), httpsOnlyCode, "Navigation failed because the request was for an HTTP URL with HTTPS-Only enabled"_s); }
+    bool isHttpNavigationWithHTTPSOnlyError(const ResourceError& error) const override { return error.errorCode() == httpsOnlyCode && error.domain() == errorDomainWebKitInternal; }
+    ResourceError pluginWillHandleLoadError(const ResourceResponse& response) const override { return errorFor(response.url(), pluginWillHandleCode, "Plug-in handled load"_s); }
+};
+
+// Media: nothing to make (video and web audio are off in the port).
+class MlxMediaStrategy final : public MediaStrategy {
+};
+
+// Blobs in the process, as WebKitLegacy's WebBlobRegistry kept them.
+class MlxBlobRegistry final : public BlobRegistry {
+private:
+    void registerInternalFileBlobURL(const URL& url, Ref<BlobDataFileReference>&& reference, const String&, const String& contentType) override { m_registry.registerInternalFileBlobURL(url, WTF::move(reference), contentType); }
+    void registerInternalBlobURL(const URL& url, Vector<BlobPart>&& parts, const String& contentType) override { m_registry.registerInternalBlobURL(url, WTF::move(parts), contentType); }
+    void registerBlobURL(const URL& url, const URL& sourceURL, const PolicyContainer& policyContainer, const std::optional<SecurityOriginData>& topOrigin) override { m_registry.registerBlobURL(url, sourceURL, policyContainer, topOrigin); }
+    void registerInternalBlobURLOptionallyFileBacked(const URL& url, const URL& sourceURL, RefPtr<BlobDataFileReference>&& reference, const String& contentType) override { m_registry.registerInternalBlobURLOptionallyFileBacked(url, sourceURL, WTF::move(reference), contentType, { }); }
+    void registerInternalBlobURLForSlice(const URL& url, const URL& sourceURL, long long start, long long end, const String& contentType) override { m_registry.registerInternalBlobURLForSlice(url, sourceURL, start, end, contentType); }
+    void unregisterBlobURL(const URL& url, const std::optional<SecurityOriginData>& topOrigin) override { m_registry.unregisterBlobURL(url, topOrigin); }
+    void registerBlobURLHandle(const URL& url, const std::optional<SecurityOriginData>& topOrigin) override { m_registry.registerBlobURLHandle(url, topOrigin); }
+    void unregisterBlobURLHandle(const URL& url, const std::optional<SecurityOriginData>& topOrigin) override { m_registry.unregisterBlobURLHandle(url, topOrigin); }
+    String blobType(const URL& url) override { return m_registry.blobType(url); }
+    unsigned long long blobSize(const URL& url) override { return m_registry.blobSize(url); }
+    void writeBlobsToTemporaryFilesForIndexedDB(const Vector<String>& blobURLs, CompletionHandler<void(Vector<String>&& filePaths)>&& completionHandler) override { m_registry.writeBlobsToTemporaryFilesForIndexedDB(blobURLs, WTF::move(completionHandler)); }
+    BlobRegistryImpl* blobRegistryImpl() override { return &m_registry; }
+
+public:
+    BlobRegistryImpl m_registry;
+};
+
+static MlxBlobRegistry* processBlobRegistry;
+
+BlobData* MlxPlatformStrategies::blobData(const URL& url)
+{
+    return processBlobRegistry ? processBlobRegistry->m_registry.blobDataFromURL(url) : nullptr;
+}
+
+void MlxPlatformStrategies::initialize()
+{
+    static MlxPlatformStrategies* strategies = new MlxPlatformStrategies;
+    setPlatformStrategies(strategies);
+    // (Every buffer of the process on the CPU: no GPU is used, so the
+    // layers' tiles and images are raster ones, PORT.md "Compositing".)
+    ProcessCapabilities::setCanUseAcceleratedBuffers(false);
+    // (Skia's row blends and fills, the port's: SkiaRoutinesMlx.cpp.)
+    installMlxSkiaRoutines();
+}
+
+LoaderStrategy* MlxPlatformStrategies::createLoaderStrategy()
+{
+    return new MlxLoaderStrategy;
+}
+
+PasteboardStrategy* MlxPlatformStrategies::createPasteboardStrategy()
+{
+    return nullptr;
+}
+
+MediaStrategy* MlxPlatformStrategies::createMediaStrategy()
+{
+    return new MlxMediaStrategy;
+}
+
+BlobRegistry* MlxPlatformStrategies::createBlobRegistry()
+{
+    processBlobRegistry = new MlxBlobRegistry;
+    return processBlobRegistry;
+}
+
+} // namespace WebCore

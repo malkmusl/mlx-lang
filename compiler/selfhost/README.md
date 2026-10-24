@@ -54,9 +54,10 @@ runtime foundation remain independent of libc and Zig dependencies:
   is declared, `path:line:name` (for example
   `projects/desktop/files/main.mlx:1234:drawRow`), and the runtime's routines
   keep theirs (`_start`, `__mlx_*`). `nm`, `gdb` and `perf` show them, and the
-  crash handler of the desktop programs
-  (`std/src/crash.mlx`) names the functions a crash went
-  through with them. The lowering keeps each function's module and name
+  crash handler of every program, the compiler itself among them
+  (`std/src/crash.mlx`, installed first thing in `main.mlx`; the driver
+  says the phase and the module it is at with `crash.contextAt`) names
+  the functions a crash went through with them. The lowering keeps each function's module and name
   offset on its LIR symbol for this. It also adds a line table
   (`.mlx_lines`): the lowering notes on every LIR instruction where in the
   source it comes from (`lir.setSource`), the backend notes where its
@@ -82,7 +83,7 @@ dependencies of the compiler or self-hosting path.
 Build the self-hosted compiler with:
 
 ```sh
-zig build mlx1
+./mlx build mlx1                      # zig builds mlx0, mlx0 builds mlx1
 zig-out/bin/mlx1 tests/01_basic.mlx
 ```
 
@@ -94,6 +95,14 @@ functions can expand at every level, O2 automatically expands only very small
 eligible functions, and O3 uses a larger cost budget. The remaining global
 optimization and register-allocation work is tracked separately.
 
+`--depfile=PATH` writes every module the compiler loaded, one path per line
+(as the loader named them, relative to the working directory), once the
+module graph is loaded: `mlx build` decides by these files whether an
+output is current. `mlx build [ARGS...]` (the first argument `build`) runs
+the `build.mlx` of the working directory
+([`driver/build_command.mlx`](driver/build_command.mlx),
+[`docs/reference/build-system.md`](../../docs/reference/build-system.md)).
+
 Progress reporting is enabled by default and records the duration of every
 pipeline step. A rejected compilation marks the active step as `failed`, reports
 its duration and semantic error count, and prints stable `MLX-E...` diagnostics
@@ -101,6 +110,47 @@ on stderr. `--quiet` disables progress output; `--trace` additionally prints
 input paths, module graph details, LIR counts, and unresolved backend symbols.
 Lexer/parser failures additionally identify the failing module and first bad
 byte instead of collapsing to a generic module-graph error.
+
+## Bootstrapping: what the compiler's sources may use
+
+The compiler is built by an older compiler: `tools/ensure_compiler.sh`
+builds the current sources with the previous canonical `mlx4` (kept as
+`mlx-out/bin/compiler/mlx4.previous` when a new one is installed), and
+falls back to `zig-out/bin/mlx0` (from `compiler/bootstrap`, Zig) when
+there is none. So everything `main.mlx` imports, transitively (the
+compiler, `std/bootstrap`, and the few `std/src` modules of the crash
+report: `crash`, `leaks`, `diagnostics`, `turns`, `heap`, `io`), is
+written in the language those compilers already know:
+
+- No new language feature until the previous canonical compiler has it:
+  a feature is used in the compiler only after a canonical `mlx4` that
+  supports it was installed. The generic aggregate types
+  (`fn List(comptime T: type) -> type { return struct { ... } }`) and the
+  standard containers built on them (`std.HashMap`, `std.ArrayList`) are
+  for programs, not for the compiler or `std/bootstrap`.
+- Never the std root. `@import("std")` (`std/src/std.mlx`) brings in every
+  std module, the containers among them; the closure imports the modules
+  it needs by path instead (`@import("../bootstrap/text.mlx")`,
+  `@import("./diagnostics.mlx")`). `codemap.layers` states this for each
+  module of the closure, and `mlx-codemap layers` checks it.
+- What mlx0 parses: declarations, `if`/`while`/`for`/`match`/`defer`
+  statements, and `unsafe { ... }` only as a *statement* (a block), never
+  as an expression: write `var p: [*]u8 = undefined` and then
+  `unsafe { p = @ptrFromInt([*]u8, address) }`, not `const p: [*]u8 =
+  unsafe { @ptrFromInt([*]u8, address) }`. No import cycles: mlx0 does not
+  analyze a module graph with a cycle (`std.crash` gives `std.leaks` its
+  `describeReturn` with `leaks.describeWith` instead of being imported
+  back).
+
+`tools/check_bootstrap.sh` is the check: the previous canonical compiler
+builds `main.mlx` and the compiler it builds compiles and runs a test, the
+closure (the build's `--depfile`) does not reach `std/src/std.mlx`, mlx0
+parses the closure and analyzes its module graph, and `mlx-codemap layers`
+finds nothing against `codemap.layers`. mlx0 itself no longer builds the
+compiler to the end: it predates language changes the compiler uses (a
+slice's length is `.length`, mlx0 knows `.len`), so it stops in its third
+step, analyzing the root module; the check reports that, and requires the
+whole build with `MLX0_STRICT=1`.
 
 Verify deterministic self-hosting with:
 

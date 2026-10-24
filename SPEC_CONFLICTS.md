@@ -136,3 +136,13 @@ naming (enum members in camelCase without their prefix, `VK_`-less constants,
 wrappers taking their dispatch table first), the selected extensions and the
 loader's behavior (one driver per `Driver`, no device merging or layers)
 are provisional std conventions, not normative mappings.
+
+### Aggregate returns of at most 16 bytes
+
+`spec/01-abi/mlxcc-x86_64.xml` `<NormalReturn>` returns register-compatible
+values of at most 16 bytes in `rax`/`rdx` (or `xmm0`/`xmm1`) and only larger
+or MEMORY-class ones through caller-provided storage. The canonical compiler
+returns every struct, union and array through caller-provided storage (the
+hidden pointer first, as the spec's rule for larger returns has it), small
+ones included; scalars, slices, tuples and error unions use the registers
+(`docs/reference/abi.md`, `tests/329_return_storage_runtime.mlx`).
