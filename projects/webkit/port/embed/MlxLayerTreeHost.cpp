@@ -1,4 +1,4 @@
-// A page's composited layers on the CPU: MlxLayerTreeHost.h says what.
+// A page's composited layers, on the GPU or the CPU: MlxLayerTreeHost.h says what.
 // Beside the host: MlxDisplayLink, the process's frame clock (a thread
 // ticking at the display's rate while anything wants frames: the hosts'
 // compositors, the scrolling trees' animated scrolls, the pages' rendering
@@ -16,11 +16,13 @@
 #include "Damage.h"
 #include "DisplayRefreshMonitor.h"
 #include "EventHandler.h"
+#include "GLContext.h"
 #include "GraphicsLayerCoordinated.h"
 #include "LocalFrame.h"
 #include "LocalFrameView.h"
 #include "NativeImage.h"
 #include "Page.h"
+#include "PlatformDisplay.h"
 #include "ScrollableArea.h"
 #include "Scrollbar.h"
 #include "ScrollbarTheme.h"
@@ -30,9 +32,13 @@
 #include "Settings.h"
 #include "SkiaCompositingLayer.h"
 #include "SkiaPaintingEngine.h"
+#include "TextureMapper.h"
+#include "TextureMapperGLHeaders.h"
+#include "TextureMapperLayer.h"
 #include "ThreadedScrollingCoordinator.h"
 #include "ThreadedScrollingTree.h"
 #include "port/platform/graphics/mlx/MlxDarkMode.h"
+#include "port/platform/graphics/mlx/PlatformDisplayMlx.h"
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
 #include <skia/core/SkCanvas.h>
 #include <skia/core/SkImage.h>
@@ -340,6 +346,132 @@ void MlxLayerTreeHost::ensureScrollbarsController(Page& page, ScrollableArea& ar
 }
 
 // ---------------------------------------------------------------------------
+// The GPU's compositor (ThreadedCompositor's TextureMapper path, WPE's)
+
+static std::atomic<bool> s_gpuCompositingAllowed { true };
+
+void MlxLayerTreeHost::setGPUCompositingAllowed(bool allowed)
+{
+    s_gpuCompositingAllowed = allowed;
+}
+
+static bool gpuCompositingWanted()
+{
+    if (!s_gpuCompositingAllowed.load())
+        return false;
+    const char* mode = getenv("MLX_COMPOSITING");
+    return !mode || strcmp(mode, "cpu");
+}
+
+// The compositor thread's GL context (ANGLE's, surfaceless, sharing its
+// textures with the display's sharing context as every compositor's
+// does: BitmapTexturePool's are the process's), WebKit's TextureMapper on
+// it, and the framebuffer the frames are composed in: a colour texture of
+// the view's size, with depth and stencil (TextureMapper's clips and 3D).
+// Frames are composed with their Y axis flipped, so the framebuffer's rows
+// read back top down, as the raster frame's.
+struct MlxLayerTreeHost::GPUCompositor {
+    WTF_MAKE_TZONE_ALLOCATED_INLINE(GPUCompositor);
+public:
+    std::unique_ptr<GLContext> context;
+    std::unique_ptr<TextureMapper> textureMapper;
+    GLuint framebuffer { 0 };
+    GLuint color { 0 };
+    GLuint depthStencil { 0 };
+    IntSize size;
+    Vector<uint32_t> rows;
+
+    static std::unique_ptr<GPUCompositor> create()
+    {
+        auto& display = PlatformDisplay::sharedDisplay();
+        auto context = GLContext::create(display.glDisplay(), GLContext::Target::Surfaceless, display.sharingGLContext());
+        if (!context || !context->makeContextCurrent())
+            return nullptr;
+        auto compositor = makeUnique<GPUCompositor>();
+        compositor->context = WTF::move(context);
+        compositor->textureMapper = TextureMapper::create();
+        if (getenv("MLX_TRACE_COMPOSITOR"))
+            fprintf(stderr, "compositor on the GPU: %s\n", reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+        return compositor;
+    }
+
+    ~GPUCompositor()
+    {
+        if (!context->makeContextCurrent())
+            return;
+        textureMapper = nullptr;
+        deleteTarget();
+    }
+
+    void deleteTarget()
+    {
+        if (framebuffer)
+            glDeleteFramebuffers(1, &framebuffer);
+        if (color)
+            glDeleteTextures(1, &color);
+        if (depthStencil)
+            glDeleteRenderbuffers(1, &depthStencil);
+        framebuffer = color = depthStencil = 0;
+        size = { };
+    }
+
+    // The framebuffer of WANTED's size, bound; true when made anew (what
+    // it holds is not the last frame).
+    bool ensureTarget(const IntSize& wanted)
+    {
+        if (framebuffer && wanted == size) {
+            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            return false;
+        }
+        deleteTarget();
+        size = wanted;
+        glGenTextures(1, &color);
+        glBindTexture(GL_TEXTURE_2D, color);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size.width(), size.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glGenRenderbuffers(1, &depthStencil);
+        glBindRenderbuffer(GL_RENDERBUFFER, depthStencil);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8_OES, size.width(), size.height());
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        glGenFramebuffers(1, &framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthStencil);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthStencil);
+        return true;
+    }
+
+    // RECT of the framebuffer into PIXELS (STRIDE words a row, BGRA as
+    // Skia's N32), one read for the rectangle. (Read as RGBA, the
+    // framebuffer's own order, and swapped here: ANGLE's Vulkan backend
+    // converts a BGRA read on the GPU, which on lavapipe took 10 ms of a
+    // 300x300 read, the swap a fraction of one.)
+    void read(const IntRect& wanted, uint32_t* pixels, int stride)
+    {
+        IntRect rect = intersection(wanted, IntRect({ }, size));
+        if (rect.isEmpty() || !framebuffer)
+            return;
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        size_t width = rect.width();
+        rows.resize(width * rect.height());
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(rect.x(), rect.y(), rect.width(), rect.height(), GL_RGBA, GL_UNSIGNED_BYTE, rows.mutableSpan().data());
+        for (int y = 0; y < rect.height(); ++y) {
+            uint32_t* row = pixels + static_cast<size_t>(rect.y() + y) * stride + rect.x();
+            const uint32_t* source = rows.span().data() + y * width;
+            for (size_t x = 0; x < width; ++x) {
+                uint32_t pixel = source[x];
+                row[x] = (pixel & 0xFF00FF00) | ((pixel & 0xFF) << 16) | ((pixel >> 16) & 0xFF);
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // The host
 
 MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
@@ -355,8 +487,24 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
         Locker locker { m_rootLayer->lock() };
         m_rootLayer->setAnchorPoint(FloatPoint3D(0, 0, 0));
     }
-    if (m_mode == Mode::Threaded) {
+    // On the GPU: the compositor's thread (in both modes) owns its GL
+    // context; without one, the CPU's compositor.
+    bool gpu = gpuCompositingWanted() && mlxEnsureSharedDisplay();
+    if (m_mode == Mode::Threaded || gpu)
         m_compositorQueue = WorkQueue::create("MlxCompositor"_s);
+    if (gpu) {
+        m_compositorQueue->dispatchSync([this] {
+            m_gpu = GPUCompositor::create();
+        });
+        m_onGPU = !!m_gpu;
+        if (!m_onGPU && m_mode == Mode::Synchronous)
+            m_compositorQueue = nullptr;
+    }
+    if (m_onGPU) {
+        m_globalDamage = std::make_shared<Damage>(IntSize(1, 1));
+        m_rootLayer->setDamageInGlobalCoordinateSpace(m_globalDamage);
+    }
+    if (m_mode == Mode::Threaded) {
         m_displayLinkObserver = makeUnique<MlxDisplayLinkObserver>([this](MonotonicTime now) { return displayLinkFired(now); });
         MlxDisplayLink::singleton().add(*m_displayLinkObserver);
     }
@@ -397,10 +545,14 @@ void MlxLayerTreeHost::invalidate()
         m_scrollingTree = nullptr;
     }
     auto letGo = [this] {
+        // (A target's textures go with its GL context current.)
+        if (m_gpu)
+            m_gpu->context->makeContextCurrent();
         commitScene();
         m_rootLayer->invalidateTarget();
         for (auto& layer : std::exchange(m_committedLayers, { }))
             layer->invalidateTarget();
+        m_gpu = nullptr;
     };
     if (m_compositorQueue)
         m_compositorQueue->dispatchSync(WTF::move(letGo));
@@ -429,6 +581,8 @@ Ref<GraphicsLayer> MlxLayerTreeHost::createGraphicsLayer(GraphicsLayer::Type typ
 void MlxLayerTreeHost::attachLayer(CoordinatedPlatformLayer& layer)
 {
     layer.setDamagePropagationEnabled(true);
+    if (m_globalDamage)
+        layer.setDamageInGlobalCoordinateSpace(m_globalDamage);
     {
         Locker locker { m_layersLock };
         m_layers.add(layer);
@@ -744,23 +898,124 @@ void MlxLayerTreeHost::flushCompositingState(const OptionSet<CompositionReason>&
 {
     if (reasons.hasExactlyOneBitSet() && reasons.contains(CompositionReason::Animation))
         return;
+    // (The layers' targets: SkiaCompositingLayers on the CPU,
+    // TextureMapperLayers on the GPU, whose tiles' updates are uploads
+    // into textures: the context current.)
+    bool skia = !m_onGPU;
+    if (m_gpu)
+        m_gpu->context->makeContextCurrent();
     commitScene();
     {
         Locker scene { m_sceneStateLock };
-        m_rootLayer->flushPositionChanges(reasons, true);
+        m_rootLayer->flushPositionChanges(reasons, skia);
         for (auto& layer : m_committedLayers)
-            Ref { layer }->flushPositionChanges(reasons, true);
+            Ref { layer }->flushPositionChanges(reasons, skia);
     }
     Vector<Ref<CoordinatedPlatformLayer>, 16> withTiles;
-    m_rootLayer->flushCompositingState(reasons, true);
+    m_rootLayer->flushCompositingState(reasons, skia);
     for (auto& layer : m_committedLayers) {
         Ref platformLayer = layer;
-        platformLayer->flushCompositingState(reasons, true);
+        platformLayer->flushCompositingState(reasons, skia);
         if (platformLayer->hasPendingBackingStoreTileUpdates())
             withTiles.append(WTF::move(platformLayer));
     }
     for (auto& layer : withTiles)
         layer->processPendingBackingStoreTileUpdates();
+    if (m_onGPU)
+        darkenSolidColors();
+}
+
+// CoordinatedPlatformLayer's contents colour (m_contentsColor, which WebKit
+// keeps to itself and hands only to the layer's targets), read through a
+// pointer to the member taken where C++ lets a private member be named:
+// an explicit instantiation's arguments.
+template<typename Tag, typename Tag::Type member>
+struct MlxPrivateMember {
+    friend typename Tag::Type mlxPrivateMember(Tag) { return member; }
+};
+struct MlxContentsColor {
+    using Type = Color CoordinatedPlatformLayer::*;
+    friend Type mlxPrivateMember(MlxContentsColor);
+};
+template struct MlxPrivateMember<MlxContentsColor, &CoordinatedPlatformLayer::m_contentsColor>;
+
+// Forced dark on the GPU: a layer's solid colour (RenderLayerBacking's
+// directly composited background), which the CPU's compositor draws through
+// MlxDarkModeCanvas, is given to its TextureMapperLayer darkened (after
+// each flush, which gives it the page's colour when that changes). Its
+// tiles and images were darkened when they were recorded.
+void MlxLayerTreeHost::darkenSolidColors()
+{
+    bool dark = m_forcedDark.load();
+    auto darken = [dark](CoordinatedPlatformLayer& layer) {
+        Color color;
+        {
+            Locker locker { layer.lock() };
+            color = layer.*mlxPrivateMember(MlxContentsColor { });
+        }
+        if (!color.isValid())
+            return;
+        if (dark) {
+            auto [r, g, b, a] = color.toColorTypeLossy<SRGBA<float>>().resolved();
+            auto darkened = mlxForcedDarkColor(SkColor4f { r, g, b, a });
+            color = Color(SRGBA<float> { darkened.fR, darkened.fG, darkened.fB, darkened.fA });
+        }
+        layer.ensureTarget().setSolidColor(color);
+    };
+    darken(m_rootLayer);
+    for (auto& layer : m_committedLayers)
+        darken(layer);
+}
+
+// A frame on the GPU (ThreadedCompositor::paintToTextureMapper): the
+// animations applied, the damage collected, and only what it covers
+// cleared (the page's white) and composed when the framebuffer holds the
+// last frame.
+bool MlxLayerTreeHost::paintFrameOnGPU(const IntSize& size, std::optional<Damage>& frameDamage, bool targetValid, bool& running)
+{
+    auto& gpu = *m_gpu;
+    if (!gpu.context->makeContextCurrent())
+        return false;
+    if (gpu.ensureTarget(size))
+        targetValid = false;
+    glViewport(0, 0, size.width(), size.height());
+    auto& root = m_rootLayer->ensureTarget();
+    if (!root.transform().isIdentity())
+        root.setTransform({ });
+    running = root.applyAnimationsRecursively(MonotonicTime::now());
+
+    auto& textureMapper = *gpu.textureMapper;
+    FloatRect whole({ }, size);
+    textureMapper.beginPainting(TextureMapper::FlipY::Yes);
+    textureMapper.beginClip(TransformationMatrix(), FloatRoundedRect(whole));
+    root.prepareForPainting(textureMapper);
+    Damage damage(size);
+    root.collectDamage(textureMapper, damage);
+    std::optional<FloatRoundedRect> changed;
+    IntRect cleared({ }, size);
+    if (targetValid) {
+        textureMapper.setDamage(damage);
+        cleared = damage.bounds();
+        if (!FloatRect(cleared).contains(whole))
+            changed = FloatRoundedRect(FloatRect(cleared));
+    } else
+        textureMapper.setDamage(std::nullopt);
+    if (changed)
+        textureMapper.beginClip(TransformationMatrix(), *changed);
+    if (!cleared.isEmpty()) {
+        auto background = m_forcedDark.load() ? mlxForcedDarkColor(SkColors::kWhite) : SkColors::kWhite;
+        glScissor(cleared.x(), cleared.y(), cleared.width(), cleared.height());
+        glClearColor(background.fR, background.fG, background.fB, 1);
+        glClearStencil(0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        root.paint(textureMapper);
+    }
+    if (changed)
+        textureMapper.endClip();
+    textureMapper.endClip();
+    textureMapper.endPainting();
+    frameDamage = WTF::move(damage);
+    return true;
 }
 
 // The compositor's canvas in front of the frame's: a tile or an image
@@ -905,6 +1160,7 @@ void MlxLayerTreeHost::renderFrame()
 
     bool running = false;
     MonotonicTime locked;
+    MonotonicTime composed;
     {
         Locker locker { m_frameLock };
         locked = MonotonicTime::now();
@@ -919,11 +1175,22 @@ void MlxLayerTreeHost::renderFrame()
             m_frameValid = false;
         }
         if (!size.isEmpty()) {
-            auto info = SkImageInfo::MakeN32Premul(size.width(), size.height());
-            auto surface = SkSurfaces::WrapPixels(info, m_framePixels.mutableSpan().data(), static_cast<size_t>(size.width()) * 4);
             std::optional<Damage> damage = Damage(size);
             bool valid = m_frameValid;
-            running = paintFrame(*surface->getCanvas(), damage, valid);
+            if (m_onGPU) {
+                // (What changed read back into the frame, all of it when it
+                // was not valid: in one read, the damage's bounds, since
+                // each read waits for the GPU.)
+                if (!paintFrameOnGPU(size, damage, valid, running))
+                    valid = false;
+                IntRect changed = valid && damage ? damage->bounds() : IntRect({ }, size);
+                composed = MonotonicTime::now();
+                m_gpu->read(changed, m_framePixels.mutableSpan().data(), size.width());
+            } else {
+                auto info = SkImageInfo::MakeN32Premul(size.width(), size.height());
+                auto surface = SkSurfaces::WrapPixels(info, m_framePixels.mutableSpan().data(), static_cast<size_t>(size.width()) * 4);
+                running = paintFrame(*surface->getCanvas(), damage, valid);
+            }
             m_frameValid = true;
             if (!valid)
                 m_frameDamageFull = true;
@@ -944,7 +1211,10 @@ void MlxLayerTreeHost::renderFrame()
     static bool traceFrames = getenv("MLX_TRACE_COMPOSITOR");
     if (traceFrames) {
         auto painted = MonotonicTime::now();
-        fprintf(stderr, "compositor frame flush %.1f wait %.1f paint %.1f ms\n", (flushed - started).milliseconds(), (locked - flushed).milliseconds(), (painted - locked).milliseconds());
+        if (m_onGPU)
+            fprintf(stderr, "compositor frame (gpu) flush %.1f wait %.1f paint %.1f ms (read back %.1f)\n", (flushed - started).milliseconds(), (locked - flushed).milliseconds(), (painted - locked).milliseconds(), (painted - composed).milliseconds());
+        else
+            fprintf(stderr, "compositor frame (cpu) flush %.1f wait %.1f paint %.1f ms\n", (flushed - started).milliseconds(), (locked - flushed).milliseconds(), (painted - locked).milliseconds());
     }
     countFrame();
     m_newFrame = true;
@@ -1005,9 +1275,27 @@ void MlxLayerTreeHost::composite(SkCanvas& canvas, Vector<IntRect>* damage)
         Locker locker { m_stateLock };
         m_reasons = { };
     }
-    flushCompositingState({ CompositionReason::RenderingUpdate, CompositionReason::AsyncScrolling });
-    std::optional<Damage> frameDamage = Damage(IntSize(canvas.getBaseLayerSize().width(), canvas.getBaseLayerSize().height()));
-    m_animationsRunning = paintFrame(canvas, frameDamage, false);
+    IntSize size(canvas.getBaseLayerSize().width(), canvas.getBaseLayerSize().height());
+    std::optional<Damage> frameDamage = Damage(size);
+    if (m_onGPU) {
+        // (On the compositor's thread, where its context is: the whole
+        // frame composed and read back into the canvas.)
+        m_compositorQueue->dispatchSync([&] {
+            flushCompositingState({ CompositionReason::RenderingUpdate, CompositionReason::AsyncScrolling });
+            if (size.isEmpty() || !m_gpu)
+                return;
+            bool running = false;
+            paintFrameOnGPU(size, frameDamage, false, running);
+            m_animationsRunning = running;
+            Vector<uint32_t> pixels(static_cast<size_t>(size.width()) * size.height());
+            m_gpu->read(IntRect({ }, size), pixels.mutableSpan().data(), size.width());
+            auto info = SkImageInfo::MakeN32Premul(size.width(), size.height());
+            canvas.writePixels(info, pixels.span().data(), static_cast<size_t>(size.width()) * 4, 0, 0);
+        });
+    } else {
+        flushCompositingState({ CompositionReason::RenderingUpdate, CompositionReason::AsyncScrolling });
+        m_animationsRunning = paintFrame(canvas, frameDamage, false);
+    }
     countFrame();
     if (damage && frameDamage) {
         damage->clear();
