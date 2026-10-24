@@ -43,7 +43,7 @@ if [ -n "${JSC_REFERENCE:-}" ]; then
             # [[no_unique_address]]). Then the reference is what WebKit's
             # offlineasm (Ruby) makes of mlx-cc's extractor.
             [ "$name" = LLIntAssembly.h ] && command -v ruby >/dev/null || fail "$name differs from $JSC_REFERENCE/$name"
-            source=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}/Source/JavaScriptCore
+            source=${WEBKIT_SOURCE:-projects/webkit/upstream}/Source/JavaScriptCore
             work=$(mktemp -d)
             env CMAKE_CXX_COMPILER_ID=GNU GCC_OFFLINEASM_SOURCE_MAP=OFF ruby "$source/offlineasm/asm.rb" -I"$JSC_REFERENCE/" "$source/llint/LowLevelInterpreter.asm" \
                 "$objects/LLIntOffsetsExtractor.cpp.o" "$work/LLIntAssembly.h" normal --binary-format=ELF >/dev/null
@@ -67,7 +67,7 @@ if [ -n "${JSC_REFERENCE:-}" ]; then
             cmp -s "$glib_made/$file" "$glib_reference/$file" || fail "JavaScriptCoreGLib: $file differs from $glib_reference/$file"
             compared=$((compared + 1))
         done
-        [ "$(readlink mlx-out/webkit/wpe/generated/JavaScriptCoreGLib/Headers/jsc)" = "${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}/Source/JavaScriptCore/API/glib" ] || fail "JavaScriptCoreGLib/Headers/jsc is not a link to API/glib"
+        [ "$(readlink -f mlx-out/webkit/wpe/generated/JavaScriptCoreGLib/Headers/jsc)" = "$(readlink -f "${WEBKIT_SOURCE:-projects/webkit/upstream}/Source/JavaScriptCore/API/glib")" ] || fail "JavaScriptCoreGLib/Headers/jsc is not a link to API/glib"
     fi
     echo "check_webkit_generators: $port: $compared files the same as WebKit's generators make them"
 else

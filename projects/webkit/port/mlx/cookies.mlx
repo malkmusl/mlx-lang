@@ -1,0 +1,155 @@
+// The cookie jar kept in the profile (PORT.md, M7): http.mlx's jar
+// (std.http.cookiejar) read from an SQLite database at start and written
+// back cookie by cookie as it changes, as libsoup's SoupCookieJarDB keeps
+// one: its `moz_cookies` table (Firefox's, which libsoup took), through
+// std.sql's engine. Only cookies with an expiry are kept (a session
+// cookie dies with the process); the expired ones are not read. Used on
+// the network thread only, as the jar is.
+const std = @import("std")
+const sql = @import("std.sql")
+const cookie = @import("std.http.cookie")
+const cookiejar = @import("std.http.cookiejar")
+
+const engine = sql.engine
+const core = sql.core
+const value = sql.value
+
+var db: usize = 0
+var opened = false
+var sqlReady = false
+
+// The table, as SoupCookieJarDB makes it.
+const CREATE: []const u8 = "CREATE TABLE IF NOT EXISTS moz_cookies (id INTEGER PRIMARY KEY, name TEXT, value TEXT, host TEXT, path TEXT, expiry INTEGER, lastAccessed INTEGER, isSecure INTEGER, isHttpOnly INTEGER, sameSite INTEGER)"
+const SELECT: []const u8 = "SELECT name, value, host, path, expiry, isSecure, isHttpOnly, sameSite FROM moz_cookies"
+const INSERT: []const u8 = "INSERT INTO moz_cookies VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+const DELETE: []const u8 = "DELETE FROM moz_cookies WHERE name=? AND host=? AND path=?"
+const PURGE: []const u8 = "DELETE FROM moz_cookies WHERE expiry <= ?"
+
+fn prepare(text: []const u8) -> usize {
+    var statement: usize = 0
+    var tail: usize = 0
+    if engine.prepare(core.database(db), @intFromPtr(text.pointer), text.length, &statement, &tail) != core.OK { return 0 }
+    return statement
+}
+
+fn bindText(statement: usize, i: i64, text: []const u8) -> void {
+    const slot = engine.parameterValue(statement, i)
+    if slot != 0 { _ = value.setString(unsafe { @ptrFromInt(*value.Value, slot) }, text) }
+}
+
+fn bindInt(statement: usize, i: i64, n: i64) -> void {
+    const slot = engine.parameterValue(statement, i)
+    if slot != 0 { value.setInt(unsafe { @ptrFromInt(*value.Value, slot) }, n) }
+}
+
+fn columnText(statement: usize, i: usize) -> []const u8 {
+    const v = engine.column(statement, i)
+    if v.*.kind != value.TEXT && v.*.kind != value.BLOB { return "" }
+    if v.*.data == 0 || v.*.length == 0 { return "" }
+    const view: [*]const u8 = unsafe { @ptrFromInt([*]const u8, v.*.data) }
+    return view[0..v.*.length]
+}
+
+fn columnInt(statement: usize, i: usize) -> i64 {
+    const v = engine.column(statement, i)
+    return if v.*.kind == value.INTEGER { v.*.i } else { 0 }
+}
+
+// Runs a statement of no rows (its parameters bound by BIND).
+fn run(statement: usize) -> void {
+    if statement == 0 { return }
+    _ = engine.step(statement)
+    _ = engine.finalize(statement)
+}
+
+fn sameSiteNumber(policy: cookie.SameSite) -> i64 {
+    if policy == cookie.SameSite.lax { return 1 }
+    if policy == cookie.SameSite.strict { return 2 }
+    return 0
+}
+
+fn sameSiteOf(number: i64) -> cookie.SameSite {
+    if number == 1 { return cookie.SameSite.lax }
+    if number == 2 { return cookie.SameSite.strict }
+    return cookie.SameSite.none
+}
+
+fn forget(ck: *const cookie.Cookie) -> void {
+    const statement = prepare(DELETE)
+    bindText(statement, 1, ck.*.name)
+    bindText(statement, 2, ck.*.domain)
+    bindText(statement, 3, ck.*.path)
+    run(statement)
+}
+
+fn keep(ck: *const cookie.Cookie, now: i64) -> void {
+    const statement = prepare(INSERT)
+    bindText(statement, 1, ck.*.name)
+    bindText(statement, 2, ck.*.value)
+    bindText(statement, 3, ck.*.domain)
+    bindText(statement, 4, ck.*.path)
+    bindInt(statement, 5, ck.*.expires)
+    bindInt(statement, 6, now)
+    bindInt(statement, 7, if ck.*.secure { 1 } else { 0 })
+    bindInt(statement, 8, if ck.*.httpOnly { 1 } else { 0 })
+    bindInt(statement, 9, sameSiteNumber(ck.*.sameSite))
+    run(statement)
+}
+
+// The jar's change told (SoupCookieJarDB's `changed`): the cookie that
+// was taken out of the table, the new one put in when it has an expiry.
+fn changed(context: usize, old: ?*const cookie.Cookie, new: ?*const cookie.Cookie) -> void {
+    if !opened { return }
+    if old != null { forget(old.?) }
+    if new != null && new.?.*.hasExpires { keep(new.?, context_now()) }
+}
+
+fn context_now() -> i64 {
+    const moment = std.time.realtime()
+    return @intCast(i64, moment.seconds)
+}
+
+// Opens the database at PATH (made when missing) and takes its cookies
+// that have not expired at NOW into JAR, which tells each change after.
+pub fn open(path: []const u8, jar: *cookiejar.Jar, now: i64) -> void {
+    close()
+    if path.length == 0 { return }
+    if !sqlReady {
+        sql.use(std.heap.allocator())
+        sqlReady = true
+    }
+    if !std.fs.makeParents(path, 448) { return }
+    if engine.open(path, engine.OPEN_READWRITE | engine.OPEN_CREATE, &db) != core.OK {
+        _ = engine.close(db, true)
+        db = 0
+        return
+    }
+    opened = true
+    run(prepare(CREATE))
+    const purge = prepare(PURGE)
+    bindInt(purge, 1, now)
+    run(purge)
+    const statement = prepare(SELECT)
+    if statement != 0 {
+        while engine.step(statement) == core.ROW {
+            const expiry = columnInt(statement, 4)
+            if expiry <= now { continue }
+            const maxAge: i32 = if expiry - now <= 2147483647 { @intCast(i32, expiry - now) } else { 2147483647 }
+            var ck = cookie.view(columnText(statement, 0), columnText(statement, 1), columnText(statement, 2), true, columnText(statement, 3), true)
+            cookie.setMaxAge(&ck, maxAge, now)
+            ck.secure = columnInt(statement, 5) != 0
+            ck.httpOnly = columnInt(statement, 6) != 0
+            ck.sameSite = sameSiteOf(columnInt(statement, 7))
+            cookiejar.addCookie(jar, &ck, false, false, false, "", now)
+        }
+        _ = engine.finalize(statement)
+    }
+    cookiejar.onChanged(jar, changed, 0)
+}
+
+pub fn close() -> void {
+    if !opened { return }
+    _ = engine.close(db, true)
+    db = 0
+    opened = false
+}

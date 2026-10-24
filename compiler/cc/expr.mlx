@@ -23,6 +23,7 @@ const atomics = @import("./atomics.mlx")
 const builtins = @import("./builtins.mlx")
 const interp = @import("./interp.mlx")
 const mangle = @import("./mangle.mlx")
+const codeIndex = @import("./index.mlx")
 
 // C++: in a template argument list a `>` (and `>>`) ends the argument
 // rather than comparing (template.mlx sets it; parentheses lift it).
@@ -145,6 +146,10 @@ pub fn conversionRank(from: usize, to: usize) -> i64 {
         if !cpp.userConversion && cpp.implicitConversionTo(from, target) != 0 { return 1 }
         return 0
     }
+    // A scoped enum converts implicitly to no other type ([conv.prom]
+    // promotes unscoped ones only): `Encoder << Type::String` takes the
+    // constrained template for enums, not operator<<(uint8_t).
+    if standard.cpp && types.kind(from) == types.ENUM && types.at(from).*.scopedEnum { return 0 }
     const fk = types.kind(from)
     const tk = types.kind(target)
     // An array (or a pointer converted: a derived class's to its
@@ -160,6 +165,18 @@ pub fn conversionRank(from: usize, to: usize) -> i64 {
     // C++: nothing converts to an enum by itself.
     if standard.cpp && tk == types.ENUM { return 0 }
     if types.isInteger(from) && types.isInteger(target) {
+        // An unscoped enum promotes ([conv.prom]) to the first of int,
+        // unsigned int, long... that holds its values; one with a fixed
+        // underlying type to that type (and to its own promotion).
+        // (FontSelectionValue(SkFontStyle::kExtraBlack_Weight) takes
+        // FontSelectionValue(int), not the (int16_t) one.)
+        if standard.cpp && fk == types.ENUM && types.at(target).*.charKind == 0 {
+            const underlying = types.underlyingOf(from)
+            const plain = types.unqualified(target)
+            if types.at(from).*.fixedEnum && types.compatible(underlying, plain) && sameIntegerType(underlying, plain) { return 3 }
+            const promoted = if types.size(underlying) < 4 { types.intOf() } else { underlying }
+            if types.compatible(promoted, plain) && sameIntegerType(promoted, plain) { return 3 }
+        }
         // Integral promotions ([conv.prom]): a type narrower than int to
         // int; char32_t to unsigned int, wchar_t to int (the first of
         // int, unsigned int that holds all its values).
@@ -561,7 +578,17 @@ pub fn templateForPointer(n: usize, pt: usize) -> usize {
         index += 1
         p = types.param(p).*.next
     }
-    const instance = template.candidateInstance(ast.obj(o).*.template, given, count, ast.obj(o).*.templateArgs)
+    var instance = template.candidateInstance(ast.obj(o).*.template, given, count, ast.obj(o).*.templateArgs)
+    // (Deduced from the pointer's parameter types as they are when a call
+    // with them deduces another signature: by-value `auto` parameters for
+    // reference ones.)
+    if instance == 0 || !decl.sameSignature(ast.obj(instance).*.ty, fnType) {
+        const outer = template.addressParams
+        template.addressParams = types.at(fnType).*.params
+        const exact = template.candidateInstance(ast.obj(o).*.template, given, count, ast.obj(o).*.templateArgs)
+        template.addressParams = outer
+        if exact != 0 { instance = exact }
+    }
     if instance == 0 { return 0 }
     var ity = ast.obj(instance).*.ty
     if !decl.sameSignature(ity, fnType) { return 0 }
@@ -1001,6 +1028,7 @@ pub fn conditional() -> usize {
         thenHeld = moved.1
     } else {
         ast.node(n).*.then = branch(thenValue, outer)
+        ast.node(n).*.cond = resetBefore(ast.node(n).*.cond)
     }
     cursor.expect(names.P_COLON)
     outer = state.takeTemporaries()
@@ -1063,6 +1091,7 @@ pub fn conditional() -> usize {
         return cpp.movedConditional(n, types.unqualified(ast.typeOf(thenValue)), token)
     }
     ast.node(n).*.els = branch(elsValue, outer)
+    ast.node(n).*.cond = resetBefore(ast.node(n).*.cond)
     if thenMoves { cpp.undoMovedBranch(thenHeld) }
     if convertThen {
         typing.addType(ast.node(n).*.els)
@@ -1138,14 +1167,81 @@ pub fn conditional() -> usize {
 // An operand that may not be evaluated (the right one of && and ||, a
 // branch of ?:): in C++ the temporaries it makes are destroyed within
 // it, since the end of the expression may never see them made.
+// The flags of the last branch whose temporaries were deferred (cells;
+// 0: none): its own and those of the branches within it, whose
+// temporaries it took over (a branch skipped leaves them unset too). The
+// caller resets them before the branch may run (resetBefore).
+var lastBranchFlags: usize = 0
+
+// A branch (`c ? a : b`'s, `a && b`'s right side): its temporaries live
+// to the end of the full expression ([class.temporary]: `c ?
+// SecurityOrigin::create(url)->data() : topOrigin().data()` of WebCore's
+// Document::setURL copies the data before the origin goes), each
+// destroyed only when the branch ran: a flag the branch sets
+// (destroyGuard), reset before it by the caller.
 fn branch(n: usize, outer: usize) -> usize {
+    lastBranchFlags = 0
     if !standard.cpp { return n }
-    const kept = cpp.flushTemporaries(n, true, ast.tokenOf(n))
-    state.setTemporaries(outer)
-    // A class value the branch yields is destroyed by the expression.
-    const held = cpp.takeKeptTemporary()
-    if held != 0 { state.addTemporary(held) }
-    return kept
+    const mine = state.takeTemporaries()
+    if mine == 0 {
+        state.setTemporaries(outer)
+        return n
+    }
+    const token = ast.tokenOf(n)
+    const flag = cpp.branchFlag(token)
+    var flags = flagCell(flag, 0)
+    var c = mine
+    var last: usize = 0
+    while c != 0 {
+        const o = state.cellNode(c)
+        const guard = ast.obj(o).*.destroyGuard
+        if guard == 0 {
+            ast.obj(o).*.destroyGuard = flag
+        } else if !hasFlag(flags, guard) {
+            flags = flagCell(guard, flags)
+        }
+        last = c
+        c = state.cellNext(c)
+    }
+    base.putWord(last + 8, outer)
+    state.setTemporaries(mine)
+    lastBranchFlags = flags
+    typing.addType(n)
+    const set = ast.binary(ast.COMMA, cpp.setFlag(flag, 1, token), n, token)
+    ast.node(set).*.ty = ast.typeOf(n)
+    ast.node(set).*.xvalue = ast.node(n).*.xvalue
+    return set
+}
+
+fn flagCell(flag: usize, next: usize) -> usize {
+    const c = base.alloc(16)
+    base.putWord(c, flag)
+    base.putWord(c + 8, next)
+    return c
+}
+
+fn hasFlag(flags: usize, flag: usize) -> bool {
+    var c = flags
+    while c != 0 {
+        if base.getWord(c) == flag { return true }
+        c = base.getWord(c + 8)
+    }
+    return false
+}
+
+// `e` preceded by the resets of the last branch's flags, when it has any.
+fn resetBefore(e: usize) -> usize {
+    var c = lastBranchFlags
+    lastBranchFlags = 0
+    var n = e
+    while c != 0 {
+        typing.addType(n)
+        const reset = ast.binary(ast.COMMA, cpp.setFlag(base.getWord(c), 0, ast.tokenOf(e)), n, ast.tokenOf(e))
+        ast.node(reset).*.ty = ast.typeOf(n)
+        n = reset
+        c = base.getWord(c + 8)
+    }
+    return n
 }
 
 fn logicalOr() -> usize {
@@ -1155,7 +1251,7 @@ fn logicalOr() -> usize {
         cursor.advance()
         const outer = state.takeTemporaries()
         const rhs = branch(logicalAnd(), outer)
-        n = binaryNode(ast.LOGOR, "||", n, rhs, token)
+        n = binaryNode(ast.LOGOR, "||", resetBefore(n), rhs, token)
     }
     return n
 }
@@ -1167,7 +1263,7 @@ fn logicalAnd() -> usize {
         cursor.advance()
         const outer = state.takeTemporaries()
         const rhs = branch(bitOr(), outer)
-        n = binaryNode(ast.LOGAND, "&&", n, rhs, token)
+        n = binaryNode(ast.LOGAND, "&&", resetBefore(n), rhs, token)
     }
     return n
 }
@@ -1341,6 +1437,19 @@ fn additive() -> usize {
     return n
 }
 
+// The operand of a built-in ++ or -- (no operator++ of its own): a class
+// object by the lvalue its conversion to a reference gives (`operator
+// unsigned &()`: WebCore's GridSpanIterator, a range-for's `++it`
+// incrementing the span's line); another the operand itself.
+pub fn incrementedObject(operand: usize) -> usize {
+    typing.addType(operand)
+    if !cpp.isClassType(types.unqualified(types.referenced(ast.typeOf(operand)))) { return operand }
+    const converted = classOperand(operand)
+    if converted == 0 { return operand }
+    typing.addType(converted)
+    return converted
+}
+
 // A class operand of + or - by its conversion to a scalar or a
 // pointer; 0 for none.
 fn classOperand(value: usize) -> usize {
@@ -1447,6 +1556,26 @@ pub fn castExpression() -> usize {
 // A cast to `ty`; to a reference type (`(T &)x`, `const_cast<T &>(x)`)
 // the object it then refers to.
 fn castTo(operand: usize, ty: usize) -> usize {
+    if standard.cpp && !types.isReference(ty) && cpp.isClassType(ty) {
+        // `static_cast<T>(e)`, `(T)e` of an object of the class T (or of
+        // a class derived from it): a temporary T made as `T t(e);` makes
+        // it ([expr.static.cast]), the object copied, an xvalue moved
+        // (`static_cast<T>(std::forward<U>(x))` of Markable::value_or), not
+        // the object's bytes taken while it still owns what they point to.
+        // (A prvalue of the class is that temporary already.)
+        // So of any other operand too: `static_cast<LayoutUnit>(double)`
+        // (WTF's clampTo) is the class's constructor from a double, an
+        // explicit one included, not the double's bits.
+        typing.addType(operand)
+        const from = types.unqualified(ast.typeOf(operand))
+        const prvalue = !ast.node(operand).*.xvalue && isRvalueArgument(operand)
+        const sameTemporary = prvalue && cpp.isClassType(from) && cpp.sameClassPublic(from, ty)
+        if !sameTemporary && types.kind(from) != types.VOID {
+            const args = base.alloc(16)
+            base.putWord(args, operand)
+            return cpp.functionalCast(ty, args, 1, ast.tokenOf(operand))
+        }
+    }
     const n = typing.cast(operand, ty)
     if types.isReference(ty) {
         const object = typing.dereferenced(n)
@@ -1566,18 +1695,20 @@ fn unary() -> usize {
     if cursor.consume(names.P_BANG) { return unaryNode(ast.NOT, "!", castExpression(), token) }
     if cursor.consume(names.P_TILDE) { return unaryNode(ast.BITNOT, "~", castExpression(), token) }
     if cursor.consume(names.P_INC) {
-        const operand = unary()
+        var operand = unary()
         if standard.cpp {
             const call = cpp.unaryOperator("++", operand, false, token)
             if call != 0 { return call }
+            operand = incrementedObject(operand)
         }
         return toAssign(newAdd(operand, ast.number(1, token), token))
     }
     if cursor.consume(names.P_DEC) {
-        const operand = unary()
+        var operand = unary()
         if standard.cpp {
             const call = cpp.unaryOperator("--", operand, false, token)
             if call != 0 { return call }
+            operand = incrementedObject(operand)
         }
         return toAssign(newSub(operand, ast.number(1, token), token))
     }
@@ -1684,6 +1815,22 @@ fn constObject(object: usize) -> bool {
     return f != 0 && types.at(ast.obj(f).*.ty).*.constMethod
 }
 
+// The error of a member the class does not have, naming the member and
+// the class as C++ writes it, and `->` when the class has an operator->
+// (a smart pointer reached with `.`: `blobRegistry().blobRegistryImpl()`
+// of a CheckedRef).
+fn noSuchMember(operand: usize, ty: usize, nameToken: usize) -> void {
+    var name = mangle.spelling(ty)
+    if name.length == 0 { name = base.nameOf(types.at(ty).*.name) }
+    const mark = base.buildMark()
+    base.append("no such member '")
+    base.append(base.nameOf(tokens.name(nameToken)))
+    base.append("' in ")
+    base.append(name)
+    if standard.cpp && cpp.hasArrowOperator(operand, nameToken) { base.append(" (it has an operator->: did you mean '->'?)") }
+    tokens.errorAt(nameToken, base.keepBuilt(mark))
+}
+
 pub fn structReference(operand: usize, nameToken: usize) -> usize {
     typing.addType(operand)
     var ty = ast.typeOf(operand)
@@ -1709,7 +1856,7 @@ pub fn structReference(operand: usize, nameToken: usize) -> usize {
             if member != 0 { return member }
         }
         if m == 0 && decl.sfinae { return softFailure(nameToken) }
-        if m == 0 { tokens.errorAt(nameToken, "no such member") }
+        if m == 0 { noSuchMember(operand, ty, nameToken) }
         n = ast.unary(ast.MEMBER, n, nameToken)
         ast.node(n).*.member = m
         if types.member(m).*.name != 0 { break }
@@ -1853,11 +2000,11 @@ fn postfix() -> usize {
         } else if cursor.consume(names.P_INC) {
             var call: usize = 0
             if standard.cpp { call = cpp.unaryOperator("++", n, true, token) }
-            n = if call != 0 { call } else { incrementAfter(n, 1, token) }
+            n = if call != 0 { call } else { incrementAfter(if standard.cpp { incrementedObject(n) } else { n }, 1, token) }
         } else if cursor.consume(names.P_DEC) {
             var call: usize = 0
             if standard.cpp { call = cpp.unaryOperator("--", n, true, token) }
-            n = if call != 0 { call } else { incrementAfter(n, -1, token) }
+            n = if call != 0 { call } else { incrementAfter(if standard.cpp { incrementedObject(n) } else { n }, -1, token) }
         } else {
             return n
         }
@@ -2722,6 +2869,7 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
         // those directly, and WebKit's checked-pointer delete calls one
         // after the object's destructor, when its vtable is the base's.)
         if ast.obj(chosen).*.isVirtual && ast.node(callee).*.value == 0 && !cpp.cannotOverride(chosen, base.getWord(given)) {
+            if codeIndex.enabled { codeIndex.noteCall(ast.node(callee).*.token, chosen) }
             call = cpp.virtualCallee(chosen, given, token)
         }
     }
@@ -2813,6 +2961,15 @@ pub fn buildCall(callee: usize, givenArgs: usize, givenCount: usize, token: usiz
     // A struct, union or wide integer result comes back through a
     // buffer of the caller's.
     const rt = types.baseOf(fnType)
+    // (A class only declared has no size: the call would take its result
+    // in registers where the function, compiled where the class is whole,
+    // writes it to a buffer. C++ makes it an error outside decltype and
+    // sizeof: Voyager's call of EventHandler::handleMouseMoveEvent, its
+    // HandleUserInputEventResult only declared, passed `this` as the
+    // buffer.)
+    if (types.kind(rt) == types.STRUCT || types.kind(rt) == types.UNION) && types.at(types.unqualified(rt)).*.incomplete && unevaluated == 0 {
+        tokens.errorAt(token, "calling a function whose result type is incomplete (a class declared only here: include its definition)")
+    }
     if types.kind(rt) == types.STRUCT || types.kind(rt) == types.UNION || types.isWide(rt) {
         ast.node(n).*.returnBuffer = temporary(rt, token)
         if standard.cpp { cpp.noteCall(n) }
@@ -3500,3 +3657,17 @@ fn primary() -> usize {
     tokens.errorAt(token, "expected an expression")
     return 0
 }
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepState() -> void {
+    base.keepState(@intFromPtr(&inTemplateArguments), @sizeOf(@typeOf(inTemplateArguments)))
+    base.keepState(@intFromPtr(&betweenTemplates), @sizeOf(@typeOf(betweenTemplates)))
+    base.keepState(@intFromPtr(&keptStart), @sizeOf(@typeOf(keptStart)))
+    base.keepState(@intFromPtr(&keptExpression), @sizeOf(@typeOf(keptExpression)))
+    base.keepState(@intFromPtr(&keptEnd), @sizeOf(@typeOf(keptEnd)))
+    base.keepState(@intFromPtr(&lastBranchFlags), @sizeOf(@typeOf(lastBranchFlags)))
+    base.keepState(@intFromPtr(&constantObjects), @sizeOf(@typeOf(constantObjects)))
+    base.keepState(@intFromPtr(&unevaluated), @sizeOf(@typeOf(unevaluated)))
+    base.keepState(@intFromPtr(&unqualifiedCallee), @sizeOf(@typeOf(unqualifiedCallee)))
+}
+// --- end of prefix snapshot state ---

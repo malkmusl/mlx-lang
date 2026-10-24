@@ -12,7 +12,10 @@
 // anything is built.
 const std = @import("std")
 
-pub const MAX_NODES: usize = 8192
+pub const MAX_NODES: usize = 32768
+// The steps by name (find): open addressing, each slot the step's index
+// plus one (0: empty); twice MAX_NODES.
+const NAME_SLOTS: usize = 65536
 pub const MAX_OPTIONS: usize = 16
 pub const MAX_INPUTS: usize = 16
 pub const MAX_TREES: usize = 4
@@ -75,8 +78,13 @@ pub const Node = struct {
     dependencies: [128]usize
     dependencyCount: usize
     // A command whose output may come from the result cache although it
-    // names no depfile (cacheable).
+    // names no depfile (cacheable), or never does although it names one
+    // (uncached).
     cacheable: bool
+    uncached: bool
+    // The stamp the command's program is known by in the result cache
+    // instead of its bytes (programEpoch); "" for its bytes.
+    epoch: []const u8
     // The run: wanted by the steps asked for, its state, whether it was
     // made now (not current), its job, and how long the last build took.
     wanted: bool
@@ -87,6 +95,15 @@ pub const Node = struct {
     stale: bool
     looked: bool
     rebuilt: bool
+    // Made by a job of this run (not taken from the cache).
+    made: bool
+    // The memory it is expected to take (KiB): declared (Build.memory),
+    // and its peak resident memory the last time it ran (0: not known).
+    memory: usize
+    peak: usize
+    // The depfile's modification time when the job started (0: none).
+    depfileSeconds: usize
+    depfileNanoseconds: usize
     pid: isize
     started: usize
     took: usize
@@ -94,7 +111,8 @@ pub const Node = struct {
 
 pub const Builder = struct {
     package: Package
-    nodes: [8192]Node
+    nodes: [32768]Node
+    names: [65536]u32
     nodeCount: usize
     defaultNode: usize
     // The first declaration the graph could not take.
@@ -112,6 +130,18 @@ pub const Builder = struct {
     dryRun: bool
     verbose: bool
     keepGoing: bool
+    // --verify-epoch N: after the build, N of the steps keyed by an epoch
+    // (programEpoch) made again and compared with what they were.
+    verifyCount: usize
+    // --retry-failed: a step whose failure the result cache remembers for
+    // the files as they are runs again instead of failing at once.
+    retryFailed: bool
+    // Jobs start only when their memory fits (memory.mlx); off with
+    // --no-memory-limit. How often a ready step waited for memory.
+    memoryAware: bool
+    heldForMemory: usize
+    // The largest peak resident memory of a job this run (KiB).
+    peakSeen: usize
     requested: [64][]const u8
     requestedCount: usize
     // The runner itself (mlx-out/build/runner), kept current like a step.
@@ -153,6 +183,11 @@ pub fn create() -> ?*Builder {
     b.*.dryRun = false
     b.*.verbose = false
     b.*.keepGoing = false
+    b.*.verifyCount = 0
+    b.*.retryFailed = false
+    b.*.memoryAware = true
+    b.*.heldForMemory = 0
+    b.*.peakSeen = 0
     b.*.requestedCount = 0
     b.*.pathTurn = 0
     b.*.argumentUsed = 0
@@ -201,14 +236,34 @@ pub fn node(b: *Builder, index: usize) -> *Node {
     unsafe { return @ptrFromInt(*Node, @intFromPtr(b) + @offsetOf(Builder, "nodes") + index * @sizeOf(Node)) }
 }
 
-// The step called `name`, or NONE.
+fn nameHash(name: []const u8) -> usize {
+    var hash: u64 = 14695981039346656037
+    for byte in name { hash = (hash ^ @intCast(u64, byte)) *% 1099511628211 }
+    return @intCast(usize, hash & @intCast(u64, NAME_SLOTS - 1))
+}
+
+fn nameSlots(b: *Builder) -> [*]u32 {
+    unsafe { return @ptrFromInt([*]u32, @intFromPtr(b) + @offsetOf(Builder, "names")) }
+}
+
+// The step called `name`, or NONE (by the name table: a build of tens of
+// thousands of steps declares each with a look for its name).
 pub fn find(b: *Builder, name: []const u8) -> usize {
-    var index: usize = 0
-    while index < b.*.nodeCount {
+    const slots = nameSlots(b)
+    var slot = nameHash(name)
+    while slots[slot] != 0 {
+        const index = @intCast(usize, slots[slot]) - 1
         if std.text.same(node(b, index).*.name, name) { return index }
-        index += 1
+        slot = (slot + 1) & (NAME_SLOTS - 1)
     }
     return NONE
+}
+
+fn remember(b: *Builder, index: usize) -> void {
+    const slots = nameSlots(b)
+    var slot = nameHash(node(b, index).*.name)
+    while slots[slot] != 0 { slot = (slot + 1) & (NAME_SLOTS - 1) }
+    slots[slot] = @intCast(u32, index + 1)
 }
 
 // A file name for a step's own files (logs, manifests): its name with
@@ -238,12 +293,19 @@ pub fn initNode(item: *Node, kind: u8, name: []const u8, source: []const u8, out
     item.*.treeCount = 0
     item.*.dependencyCount = 0
     item.*.cacheable = false
+    item.*.uncached = false
+    item.*.epoch = ""
     item.*.wanted = false
     item.*.state = STATE_WAITING
     item.*.checked = false
     item.*.stale = false
     item.*.looked = false
     item.*.rebuilt = false
+    item.*.made = false
+    item.*.memory = 0
+    item.*.peak = 0
+    item.*.depfileSeconds = 0
+    item.*.depfileNanoseconds = 0
     item.*.pid = 0
     item.*.started = 0
     item.*.took = 0
@@ -266,6 +328,7 @@ fn add(b: *Builder, kind: u8, name: []const u8, source: []const u8, output: []co
     b.*.nodeCount += 1
     const item = node(b, index)
     initNode(item, kind, name, source, output)
+    remember(b, index)
     if kind == KIND_PROGRAM || kind == KIND_SHARED || kind == KIND_PLUGIN {
         item.*.depfile = joined(b, joined(b, "mlx-out/build/cache/", fileName(b, name)), ".d")
     }
@@ -386,6 +449,14 @@ pub fn cacheable(b: *Builder, step: Step) -> void {
     if valid(b, step) { node(b, step.index).*.cacheable = true }
 }
 
+// The command's output never goes to the result cache, though it has a
+// depfile: a large file that is quick to make again and that nothing's
+// key holds (mlx-cc's prefix snapshots: the objects made with one are
+// the objects made without it).
+pub fn uncached(b: *Builder, step: Step) -> void {
+    if valid(b, step) { node(b, step.index).*.uncached = true }
+}
+
 // Whether ITEM's output is kept in the result cache, and may be taken from
 // it: an Mlx step's (the compiler makes the one file from the modules it
 // lists), a command's that makes one file and says what it read. A command
@@ -399,7 +470,30 @@ pub fn resultCached(item: *Node) -> bool {
         const output = item.*.output
         return output.length < 4 || !std.text.same(output[output.length - 4..output.length], ".apk")
     }
-    return item.*.kind == KIND_COMMAND && (item.*.depfile.length != 0 || item.*.cacheable)
+    return item.*.kind == KIND_COMMAND && !item.*.uncached && (item.*.depfile.length != 0 || item.*.cacheable)
+}
+
+// The program STEP's command runs (its line's first word) is known to
+// the result cache by the contents of STAMP, a file the program's build
+// writes saying its code generation epoch (`mlx-cc --codegen-epoch=FILE`),
+// instead of by the program's own bytes; STAMP is an input of the step
+// (the program itself should not be). A new build of the program that
+// writes the same stamp leaves the step current and its cached files
+// valid: the program promises that the same epoch makes the same file
+// from the same inputs (compiler/cc/epoch.mlx; `mlx build --verify-epoch`
+// checks it). A failure is still remembered by the program's bytes
+// (store.mlx): a new build of the program runs the steps that failed.
+pub fn programEpoch(b: *Builder, step: Step, stamp: []const u8) -> void {
+    if !valid(b, step) { return }
+    node(b, step.index).*.epoch = stamp
+    input(b, step, stamp)
+}
+
+// STEP is expected to take MEGABYTES of memory at its peak, until a run
+// of it says how much it took (memory.mlx): a job starts only when that
+// fits beside the running ones.
+pub fn memory(b: *Builder, step: Step, megabytes: usize) -> void {
+    if valid(b, step) { node(b, step.index).*.memory = megabytes * 1024 }
 }
 
 // STEP runs after OTHER, and only when OTHER was built.

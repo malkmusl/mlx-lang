@@ -76,7 +76,7 @@ else
     echo "ok   transform.c on $(ls "$work"/corpus/*.icc | wc -l) profiles made again: the same as the system's Little CMS ($(grep -c ': [0-9a-f]\{8\}$' "$work/ours") transforms)"
 fi
 
-webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+webkit=${WEBKIT_SOURCE:-projects/webkit/upstream}
 if [ ! -d "$webkit/Source/WebCore" ]; then
     echo "skip WebCore's sources that use Little CMS: no WebKit source at $webkit (WEBKIT_SOURCE)"
 elif [ ! -d mlx-out/webkit/wpe/generated/WebCore ]; then

@@ -119,7 +119,7 @@ else
     echo "ok   tests/tls_handshake.c"
 fi
 
-webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+webkit=${WEBKIT_SOURCE:-projects/webkit/upstream}
 generated=mlx-out/webkit/generated
 if [ ! -d "$webkit/Source/WTF/wtf" ]; then
     echo "skip WTF's GLib sources: no WebKit source at $webkit (WEBKIT_SOURCE)"

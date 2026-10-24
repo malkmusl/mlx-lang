@@ -5,7 +5,9 @@
 # again (and not for a file saved unchanged), commands with input trees and
 # with another step's output, a changed build.mlx and a changed compiler,
 # a failing step, --keep-going, --dry-run, --force, --clean, --list, and the
-# compiler's --depfile (without the result cache: check_build_cache.sh).
+# compiler's --depfile (without the result cache: check_build_cache.sh),
+# and that the runner's memory stays flat over 20,000 steps
+# (check_build_runner.sh).
 #
 #   tools/check_build.sh [compiler]
 set -euo pipefail
@@ -195,4 +197,6 @@ echo three > "$deps_project/in/b c.h"
 (cd "$deps_project" && "$compiler" build) > "$work/deps3.log" 2>&1 || fail "the third depfile build failed" "$work/deps3.log"
 [[ "$(started "$work/deps3.log")" == "joined" && "$(cat "$deps_project/mlx-out/joined.txt")" == $'one\nthree' ]] || fail "a file of the depfile changed and the command did not run again" "$work/deps3.log"
 echo "ok   a command's make-style depfile lists its inputs"
+# The runner's memory over tens of thousands of steps (std.turns).
+tools/check_build_runner.sh "$compiler" | grep -v '^check_build_runner.sh:' || fail "the runner's memory check failed"
 echo "all mlx build checks passed"

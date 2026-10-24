@@ -96,7 +96,7 @@ else
     echo "ok   $same of $total streams are byte for byte the system zlib's"
 fi
 
-webkit=${WEBKIT_SOURCE:-/home/user/csrc/wpe/wpewebkit-2.54.1}
+webkit=${WEBKIT_SOURCE:-projects/webkit/upstream}
 if [ ! -d "$webkit/Source/ThirdParty/ANGLE" ]; then
     echo "skip ANGLE's sources that use zlib: no WebKit source at $webkit (WEBKIT_SOURCE)"
 else

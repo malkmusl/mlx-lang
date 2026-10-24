@@ -1,2 +1,2 @@
-/* <smmintrin.h>, <immintrin.h>, <x86intrin.h>: the same few intrinsics as <emmintrin.h>. */
-#include <emmintrin.h>
+/* <x86intrin.h>: the intrinsics of x86-64's baseline (<emmintrin.h>) and <smmintrin.h>. */
+#include <smmintrin.h>

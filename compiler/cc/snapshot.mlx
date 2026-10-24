@@ -1,0 +1,665 @@
+// The prefix snapshot: the compiler's whole state after the -include
+// files of a command line were read (preprocessed and parsed), written by
+// one run and taken up by others with the same command line, which then
+// read only their own file. A WebKit unit spends most of its time in its
+// prefix (WebCorePrefix.h and what it includes), the same in every unit
+// of a target.
+//
+//     mlx-cc --write-prefix-snapshot SNAP FLAGS -include P.h [-MD -MF SNAP.d]
+//     mlx-cc --prefix-snapshot SNAP FLAGS -include P.h -c unit.cpp -o unit.o
+//
+// The state is the arena's used part, which lies at a fixed address
+// (base.init), and the modules' variables (each module's keepState(),
+// written by tools/cc_snapshot_state.py): every address in the one points
+// into the other or into the program itself, which is the same binary.
+// The file is the header and the record (below), then the arena's pages
+// (the zero ones left as holes), which a reader maps where they were
+// (MAP_PRIVATE: the page cache's copy, shared by the units built at once
+// and copied only where a unit writes) instead of reading the prefix.
+//
+// A reader takes the snapshot only when it is the state its own run would
+// have reached, else it reads the prefix itself and says why:
+//   - the key: the compiler (a hash of its binary, and its path, which
+//     finds the system headers), the working directory, the language, the
+//     environment that changes what is read (MLX_CC_INCLUDE,
+//     MLX_CC_READ_ALL_BODIES), and the options of the command line that
+//     change the compilation, in their order (-I, -isystem, -D, -U,
+//     -include, -std= and every option it does not know); not those of
+//     the run alone (-o, -c, -MD and its kind, -L, -l, the link's, the
+//     files);
+//   - the variables: the same list of addresses and sizes;
+//   - every file the prefix read: its size and a hash of its contents
+//     (a file of the same contents written again since, with another
+//     inode, takes its #pragma once mark along);
+//   - the include search's answers that hold: for each directory searched
+//     (and each one a quoted #include looked next to its file in) whose
+//     modification time changed since, that none of the names the
+//     search did not find in it, or found after it, is there now.
+// What a snapshot holds does not depend on the file that reads it: the
+// unit's own path is given to the compiler after the prefix (its
+// lambdas' and unnamed namespace's names in the prefix take the prefix's
+// identity instead, in every run, with a snapshot or without), and the
+// run's own memory (the command line's texts, the link's inputs, the
+// object writer's buffers) lies outside the arena (base.beginSide).
+const std = @import("std")
+const base = @import("./base.mlx")
+const paths = @import("./paths.mlx")
+const preprocess = @import("./preprocess.mlx")
+const x86 = @import("./x86.mlx")
+
+const SYS_read: usize = 0
+const SYS_open: usize = 2
+const SYS_close: usize = 3
+const SYS_stat: usize = 4
+const SYS_fstat: usize = 5
+const SYS_mmap: usize = 9
+const SYS_pread64: usize = 17
+const SYS_pwrite64: usize = 18
+const SYS_ftruncate: usize = 77
+const SYS_rename: usize = 82
+const SYS_unlink: usize = 87
+
+// "MLXCCSNP", and the format's version.
+const MAGIC: usize = 5787227053165202509
+const VERSION: usize = 1
+const PAGE: usize = 4096
+const HEADER: usize = 4096
+
+// ---------------------------------------------------------------------------
+// The record, built in the side memory
+
+var out: usize = 0 // (per run)
+var outLength: usize = 0 // (per run)
+var outCapacity: usize = 0 // (per run)
+
+fn ensure(more: usize) -> void {
+    if outLength + more <= outCapacity { return }
+    var capacity = if outCapacity == 0 { 1048576 } else { outCapacity * 2 }
+    while capacity < outLength + more { capacity *= 2 }
+    const larger = base.sideAlloc(capacity)
+    if outLength > 0 { base.copy(larger, out, outLength) }
+    out = larger
+    outCapacity = capacity
+}
+
+fn putWord(value: usize) -> void {
+    ensure(8)
+    base.putWord(out + outLength, value)
+    outLength += 8
+}
+
+// A text: its length, its bytes, zeros to the next word.
+fn putText(text: []const u8) -> void {
+    putWord(text.length)
+    ensure(text.length + 8)
+    base.putText(out + outLength, text)
+    outLength += (text.length + 7) / 8 * 8
+}
+
+fn putBytes(address: usize, length: usize) -> void {
+    ensure(length + 8)
+    base.copy(out + outLength, address, length)
+    outLength += (length + 7) / 8 * 8
+}
+
+// Reading it back: a cursor over the record.
+var record: usize = 0 // (per run)
+var recordEnd: usize = 0 // (per run)
+var at: usize = 0 // (per run)
+
+fn takeWord() -> usize {
+    if at + 8 > recordEnd { return 0 }
+    const value = base.getWord(record + at)
+    at += 8
+    return value
+}
+
+fn takeText() -> []const u8 {
+    const length = takeWord()
+    if at + length > recordEnd { return "" }
+    const text = base.bytes(record + at, length)
+    at += (length + 7) / 8 * 8
+    return text
+}
+
+// ---------------------------------------------------------------------------
+// What is checked
+
+// The hash of the compiler's own binary (the key's first line).
+pub fn compilerHash() -> u64 {
+    const file = readWhole("/proc/self/exe")
+    if file.0 == 0 { return 0 }
+    return base.contentHash(file.0, file.1)
+}
+
+// The file at `path` read into the side memory: (address, length), (0, 0)
+// when it cannot be read; its identity (device and inode) and size.
+var readBuffer: usize = 0 // (per run)
+var readCapacity: usize = 0 // (per run)
+var lastIdentity: u64 = 0 // (per run)
+
+fn readWhole(path: []const u8) -> (usize, usize) {
+    const descriptor = std.linux.syscall3(SYS_open, base.cPath(path), 524288, 0)
+    if descriptor < 0 { return -> (0, 0) }
+    const status = base.sideAlloc(144)
+    var size: usize = 0
+    lastIdentity = 0
+    if std.linux.syscall2(SYS_fstat, @bitCast(usize, descriptor), status) >= 0 {
+        size = base.getWord(status + 48)
+        lastIdentity = (@intCast(u64, base.getWord(status)) << 32) ^ @intCast(u64, base.getWord(status + 8))
+    }
+    if size + 1 > readCapacity {
+        readCapacity = (size + 1) * 2
+        if readCapacity < 1048576 { readCapacity = 1048576 }
+        readBuffer = base.sideAlloc(readCapacity)
+    }
+    var length: usize = 0
+    while length < size {
+        const count = std.linux.syscall3(SYS_read, @bitCast(usize, descriptor), readBuffer + length, size - length)
+        if count <= 0 { break }
+        length += @intCast(usize, count)
+    }
+    const closed = std.linux.syscall1(SYS_close, @bitCast(usize, descriptor))
+    if length != size { return -> (0, 0) }
+    return -> (readBuffer, length)
+}
+
+// A directory's state: (modification time in seconds and nanoseconds,
+// identity), zeros when there is none.
+fn directoryState(path: []const u8) -> (usize, usize, u64) {
+    const status = base.sideAlloc(144)
+    if std.linux.syscall2(SYS_stat, base.cPath(path), status) < 0 { return -> (0, 0, 0) }
+    const identity = (@intCast(u64, base.getWord(status)) << 32) ^ @intCast(u64, base.getWord(status + 8))
+    return -> (base.getWord(status + 88), base.getWord(status + 96), identity)
+}
+
+// Whether `directory` + "/" + `name` is a header now (as paths.find
+// asks).
+fn isHeaderIn(directory: []const u8, name: []const u8) -> bool {
+    const path = base.join(base.join(directory, "/"), name)
+    return paths.exists(path) && !base.isDirectory(path)
+}
+
+fn note(path: []const u8, why: []const u8) -> void {
+    base.say("mlx-cc: prefix snapshot ")
+    base.say(path)
+    base.say(" not used (")
+    base.say(why)
+    base.say("): reading the prefix\n")
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// The snapshot of the state now (the -include files read, at file scope)
+// written to `path`, under `key`; false (said) when it cannot be.
+pub fn write(path: []const u8, key: []const u8) -> bool {
+    // (What is made here is the run's own: the arena stays as the state
+    // is.)
+    base.beginSide()
+    const ok = writeFile(path, key)
+    base.endSide()
+    return ok
+}
+
+fn writeFile(path: []const u8, key: []const u8) -> bool {
+    if !base.fixedArena {
+        base.say("mlx-cc: no prefix snapshot: the arena is not at its fixed address\n")
+        return false
+    }
+    if x86.position() != 0 {
+        base.say("mlx-cc: no prefix snapshot: code was made while the prefix was read\n")
+        return false
+    }
+    if base.stateCellCount() == 0 { keepAllState() }
+    outLength = 0
+    putText(key)
+    // The variables: their addresses and sizes, then their bytes.
+    const cells = base.stateCellCount()
+    putWord(cells)
+    var index: usize = 0
+    while index < cells {
+        putWord(base.getWord(base.stateCell(index)))
+        putWord(base.getWord(base.stateCell(index) + 8))
+        index += 1
+    }
+    index = 0
+    while index < cells {
+        const address = base.getWord(base.stateCell(index))
+        const size = base.getWord(base.stateCell(index) + 8)
+        // (A word that points into the run's own memory would point into
+        // the reader's.)
+        if size == 8 && base.isSide(base.getWord(address)) {
+            base.say("mlx-cc: no prefix snapshot: a variable points into the command line's memory\n")
+            return false
+        }
+        putBytes(address, size)
+        index += 1
+    }
+    // The files read: path, size, identity, hash.
+    const fileTotal = @intCast(usize, base.files())
+    var fileRecords: usize = 0
+    var id: usize = 1
+    while id < fileTotal {
+        const name = base.nameOf(base.fileName(@intCast(u32, id)))
+        if name.length > 0 && name[0] != 60 { fileRecords += 1 }
+        id += 1
+    }
+    putWord(fileRecords)
+    id = 1
+    while id < fileTotal {
+        const name = base.nameOf(base.fileName(@intCast(u32, id)))
+        if name.length > 0 && name[0] != 60 {
+            putText(name)
+            const length = base.fileLength(@intCast(u32, id))
+            putWord(length)
+            putWord(@intCast(usize, base.fileIdentity(name)))
+            putWord(@intCast(usize, base.contentHash(base.fileData(@intCast(u32, id)), length)))
+        }
+        id += 1
+    }
+    // The include directories, in their order, with their state.
+    const directoryTotal = paths.directoryCount()
+    putWord(directoryTotal)
+    index = 0
+    while index < directoryTotal {
+        const name = base.nameOf(paths.directoryName(index))
+        putText(name)
+        const state = directoryState(name)
+        putWord(state.0)
+        putWord(state.1)
+        putWord(@intCast(usize, state.2))
+        index += 1
+    }
+    // The search's answers: the name, the first directory tried, the one
+    // it was found in (or the count: none).
+    var answers: usize = 0
+    var slot: usize = 0
+    while slot < paths.answerSlots() {
+        if paths.answerKey(slot) != 0 { answers += 1 }
+        slot += 1
+    }
+    putWord(answers)
+    slot = 0
+    while slot < paths.answerSlots() {
+        const key_ = paths.answerKey(slot)
+        if key_ != 0 {
+            putText(base.nameOf(@intCast(u32, key_ >> 32)))
+            putWord(key_ & 4294967295)
+            putWord(paths.answerIndex(slot))
+        }
+        slot += 1
+    }
+    // The local misses: the directory (with its state) and the name.
+    var misses: usize = 0
+    slot = 0
+    while slot < paths.missSlots() {
+        if paths.missKey(slot) != 0 { misses += 1 }
+        slot += 1
+    }
+    putWord(misses)
+    slot = 0
+    while slot < paths.missSlots() {
+        const key_ = paths.missKey(slot)
+        if key_ != 0 {
+            const directory = base.nameOf(@intCast(u32, key_ >> 32))
+            putText(directory)
+            const state = directoryState(directory)
+            putWord(state.0)
+            putWord(state.1)
+            putWord(@intCast(usize, state.2))
+            putText(base.nameOf(@intCast(u32, key_ & 4294967295)))
+        }
+        slot += 1
+    }
+    // The file: header, record, then the arena's pages from the next page.
+    const used = base.arenaUsed()
+    const pages = (used + PAGE - 1) / PAGE
+    const imageOffset = (HEADER + outLength + PAGE - 1) / PAGE * PAGE
+    const header = base.sideAlloc(HEADER)
+    base.putWord(header, MAGIC)
+    base.putWord(header + 8, VERSION)
+    base.putWord(header + 16, base.arenaStart())
+    base.putWord(header + 24, used)
+    base.putWord(header + 32, outLength)
+    base.putWord(header + 40, imageOffset)
+    base.putWord(header + 48, pages)
+    const temporary = base.join(path, ".tmp")
+    // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+    const descriptor = std.linux.syscall3(SYS_open, base.keep(temporary), 524865, 420)
+    if descriptor < 0 {
+        base.say("mlx-cc: cannot write ")
+        base.say(temporary)
+        base.say("\n")
+        return false
+    }
+    const fd = @bitCast(usize, descriptor)
+    var ok = writeAt(fd, header, HEADER, 0) && writeAt(fd, out, outLength, HEADER)
+    // The pages, a run of nonzero ones at a time.
+    const start = base.arenaStart()
+    var page: usize = 0
+    while ok && page < pages {
+        if isZeroPage(start + page * PAGE) {
+            page += 1
+        } else {
+            var end = page + 1
+            while end < pages && end - page < 4096 && !isZeroPage(start + end * PAGE) { end += 1 }
+            ok = writeAt(fd, start + page * PAGE, (end - page) * PAGE, imageOffset + page * PAGE)
+            page = end
+        }
+    }
+    if ok { ok = std.linux.syscall2(SYS_ftruncate, fd, imageOffset + pages * PAGE) >= 0 }
+    const closed = std.linux.syscall1(SYS_close, fd)
+    if ok { ok = std.linux.syscall2(SYS_rename, base.keep(temporary), base.keep(path)) >= 0 }
+    if !ok {
+        const removed = std.linux.syscall1(SYS_unlink, base.keep(temporary))
+        base.say("mlx-cc: cannot write ")
+        base.say(path)
+        base.say("\n")
+        return false
+    }
+    return true
+}
+
+fn writeAt(fd: usize, address: usize, length: usize, offset: usize) -> bool {
+    var done: usize = 0
+    while done < length {
+        const count = std.linux.syscall4(SYS_pwrite64, fd, address + done, length - done, offset + done)
+        if count <= 0 { return false }
+        done += @intCast(usize, count)
+    }
+    return true
+}
+
+fn isZeroPage(address: usize) -> bool {
+    var index: usize = 0
+    while index < PAGE {
+        if base.getWord(address + index) != 0 { return false }
+        index += 8
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+// The state of the snapshot at `path` taken up, when its key is `key` and
+// what it read is as it was: true; else false (said), nothing changed.
+pub fn load(path: []const u8, key: []const u8) -> bool {
+    // (What is made here is the run's own: when the snapshot is not taken
+    // the run goes on as one without it, its arena untouched.)
+    base.beginSide()
+    const ok = loadFile(path, key)
+    base.endSide()
+    return ok
+}
+
+fn loadFile(path: []const u8, key: []const u8) -> bool {
+    if !base.fixedArena {
+        note(path, "the arena is not at its fixed address")
+        return false
+    }
+    const descriptor = std.linux.syscall3(SYS_open, base.cPath(path), 524288, 0)
+    if descriptor < 0 {
+        note(path, "it cannot be opened")
+        return false
+    }
+    const fd = @bitCast(usize, descriptor)
+    const ok = check(fd, path, key)
+    if !ok {
+        const closed = std.linux.syscall1(SYS_close, fd)
+        return false
+    }
+    // Taken up: the arena's pages mapped where they were (over this run's
+    // own arena, which holds nothing yet but what every run makes before
+    // its command line is read), the variables set.
+    const header = record - HEADER
+    const pages = base.getWord(header + 48)
+    if pages > 0 {
+        // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED
+        const mapped = std.linux.syscall6(SYS_mmap, base.arenaStart(), pages * PAGE, 3, 18, fd, base.getWord(header + 40))
+        if mapped != @bitCast(isize, base.arenaStart()) { base.fatal("cannot map the prefix snapshot") }
+    }
+    const closed = std.linux.syscall1(SYS_close, fd)
+    var index: usize = 0
+    while index < takenCells {
+        const address = base.getWord(base.stateCell(index))
+        const size = base.getWord(base.stateCell(index) + 8)
+        base.copy(address, record + takenBytes, size)
+        takenBytes += (size + 7) / 8 * 8
+        index += 1
+    }
+    base.continueArena(base.getWord(header + 24))
+    // Files written again with the same contents.
+    index = 0
+    while index < renameCount {
+        preprocess.renameIdentity(@intCast(u64, base.getWord(renames + index * 16)), @intCast(u64, base.getWord(renames + index * 16 + 8)))
+        index += 1
+    }
+    // What the prefix warned about, said again.
+    base.sayWarnings()
+    return true
+}
+
+var takenCells: usize = 0 // (per run)
+var takenBytes: usize = 0 // (per run)
+var renames: usize = 0 // (per run)
+var renameCount: usize = 0 // (per run)
+
+// The header, the record and what it says checked; `record` and the
+// variables' offset in it set.
+fn check(fd: usize, path: []const u8, key: []const u8) -> bool {
+    const header = base.sideAlloc(HEADER)
+    if std.linux.syscall4(SYS_pread64, fd, header, HEADER, 0) != @bitCast(isize, HEADER) {
+        note(path, "it is too short")
+        return false
+    }
+    if base.getWord(header) != MAGIC || base.getWord(header + 8) != VERSION {
+        note(path, "not a snapshot of this format")
+        return false
+    }
+    if base.getWord(header + 16) != base.arenaStart() {
+        note(path, "another arena address")
+        return false
+    }
+    const length = base.getWord(header + 32)
+    // (The record right after the header in the side memory.)
+    const buffer = base.sideAlloc(HEADER + length + 16)
+    base.copy(buffer, header, HEADER)
+    record = buffer + HEADER
+    recordEnd = length
+    at = 0
+    var done: usize = 0
+    while done < length {
+        const count = std.linux.syscall4(SYS_pread64, fd, record + done, length - done, HEADER + done)
+        if count <= 0 {
+            note(path, "it is too short")
+            return false
+        }
+        done += @intCast(usize, count)
+    }
+    // The key.
+    const written = takeText()
+    if !base.same(written, key) {
+        note(path, base.join("another command line or compiler: ", firstDifference(written, key)))
+        return false
+    }
+    // The variables.
+    if base.stateCellCount() == 0 { keepAllState() }
+    takenCells = takeWord()
+    if takenCells != base.stateCellCount() {
+        note(path, "another compiler's variables")
+        return false
+    }
+    var index: usize = 0
+    while index < takenCells {
+        const address = takeWord()
+        const size = takeWord()
+        if address != base.getWord(base.stateCell(index)) || size != base.getWord(base.stateCell(index) + 8) {
+            note(path, "another compiler's variables")
+            return false
+        }
+        index += 1
+    }
+    takenBytes = at
+    index = 0
+    while index < takenCells {
+        at += (base.getWord(base.stateCell(index) + 8) + 7) / 8 * 8
+        index += 1
+    }
+    // The files.
+    const fileRecords = takeWord()
+    renames = base.sideAlloc(fileRecords * 16 + 16)
+    renameCount = 0
+    index = 0
+    while index < fileRecords {
+        const name = takeText()
+        const size = takeWord()
+        const identity = takeWord()
+        const hash = takeWord()
+        const file = readWhole(name)
+        if file.0 == 0 && size != 0 {
+            note(path, base.join(name, " is gone"))
+            return false
+        }
+        if file.1 != size || @intCast(usize, base.contentHash(file.0, file.1)) != hash {
+            note(path, base.join(name, " changed"))
+            return false
+        }
+        if @intCast(usize, lastIdentity) != identity {
+            base.putWord(renames + renameCount * 16, identity)
+            base.putWord(renames + renameCount * 16 + 8, @intCast(usize, lastIdentity))
+            renameCount += 1
+        }
+        index += 1
+    }
+    // The include directories: those changed since.
+    const directoryTotal = takeWord()
+    const dirNames = base.sideAlloc(directoryTotal * 16 + 16)
+    const changed = base.sideAlloc(directoryTotal + 16)
+    index = 0
+    while index < directoryTotal {
+        const name = takeText()
+        const seconds = takeWord()
+        const nanoseconds = takeWord()
+        const identity = takeWord()
+        base.putWord(dirNames + index * 16, @intFromPtr(name.pointer))
+        base.putWord(dirNames + index * 16 + 8, name.length)
+        const now = directoryState(name)
+        if now.0 != seconds || now.1 != nanoseconds || @intCast(usize, now.2) != identity { base.put8(changed + index, 1) }
+        index += 1
+    }
+    // The answers through a changed directory: none found there now
+    // before where it was found, and the one found still there.
+    const answers = takeWord()
+    index = 0
+    while index < answers {
+        const name = takeText()
+        const first = takeWord()
+        const foundIn = takeWord()
+        var d = first
+        while d < directoryTotal && d <= foundIn {
+            if base.get8(changed + d) != 0 {
+                const directory = base.bytes(base.getWord(dirNames + d * 16), base.getWord(dirNames + d * 16 + 8))
+                const there = isHeaderIn(directory, name)
+                if there != (d == foundIn) {
+                    note(path, base.join(base.join(directory, "/"), base.join(name, if there { " is new" } else { " is gone" })))
+                    return false
+                }
+            }
+            d += 1
+        }
+        index += 1
+    }
+    // The local misses in a changed directory: still missing.
+    const misses = takeWord()
+    index = 0
+    while index < misses {
+        const directory = takeText()
+        const seconds = takeWord()
+        const nanoseconds = takeWord()
+        const identity = takeWord()
+        const name = takeText()
+        const now = directoryState(directory)
+        if (now.0 != seconds || now.1 != nanoseconds || @intCast(usize, now.2) != identity) && isHeaderIn(directory, name) {
+            note(path, base.join(base.join(directory, "/"), base.join(name, " is new")))
+            return false
+        }
+        index += 1
+    }
+    return true
+}
+
+// The first line of `written` that `wanted` does not have (for the note).
+fn firstDifference(written: []const u8, wanted: []const u8) -> []const u8 {
+    var start: usize = 0
+    var index: usize = 0
+    while index < written.length && index < wanted.length && written[index] == wanted[index] {
+        if written[index] == 10 { start = index + 1 }
+        index += 1
+    }
+    var end = index
+    while end < wanted.length && wanted[end] != 10 { end += 1 }
+    if start >= wanted.length { return "the snapshot's has more" }
+    return wanted[start..end]
+}
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+const state_asm = @import("./asm.mlx")
+const state_ast = @import("./ast.mlx")
+const state_atomics = @import("./atomics.mlx")
+const state_builtins = @import("./builtins.mlx")
+const state_cpp = @import("./cpp.mlx")
+const state_cursor = @import("./cursor.mlx")
+const state_decl = @import("./decl.mlx")
+const state_eval = @import("./eval.mlx")
+const state_expr = @import("./expr.mlx")
+const state_gen = @import("./gen.mlx")
+const state_genstmt = @import("./genstmt.mlx")
+const state_initializer = @import("./initializer.mlx")
+const state_interp = @import("./interp.mlx")
+const state_lambda = @import("./lambda.mlx")
+const state_literal = @import("./literal.mlx")
+const state_macros = @import("./macros.mlx")
+const state_mangle = @import("./mangle.mlx")
+const state_names = @import("./names.mlx")
+const state_paths = @import("./paths.mlx")
+const state_preprocess = @import("./preprocess.mlx")
+const state_program = @import("./program.mlx")
+const state_scope = @import("./scope.mlx")
+const state_standard = @import("./standard.mlx")
+const state_state = @import("./state.mlx")
+const state_template = @import("./template.mlx")
+const state_types = @import("./types.mlx")
+const state_x86 = @import("./x86.mlx")
+fn keepAllState() -> void {
+    state_asm.keepState()
+    state_ast.keepState()
+    state_atomics.keepState()
+    base.keepBaseState()
+    state_builtins.keepState()
+    state_cpp.keepState()
+    state_cursor.keepState()
+    state_decl.keepState()
+    state_eval.keepState()
+    state_expr.keepState()
+    state_gen.keepState()
+    state_genstmt.keepState()
+    state_initializer.keepState()
+    state_interp.keepState()
+    state_lambda.keepState()
+    state_literal.keepState()
+    state_macros.keepState()
+    state_mangle.keepState()
+    state_names.keepState()
+    state_paths.keepState()
+    state_preprocess.keepState()
+    state_program.keepState()
+    state_scope.keepState()
+    state_standard.keepState()
+    state_state.keepState()
+    state_template.keepState()
+    state_types.keepState()
+    state_x86.keepState()
+}
+// --- end of prefix snapshot state ---

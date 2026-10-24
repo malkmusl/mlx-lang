@@ -324,7 +324,9 @@ sk_sp<SkTypeface> SkiaSystemFallbackFontCache::fontForCharacterCluster(const Str
         return nullptr;
     char32_t character = *iterator;
 
-    auto& cache = m_cache.ensure(locale, [] {
+    // (A null locale, no lang given, is the empty string's: a String key
+    // of a HashMap is never null.)
+    auto& cache = m_cache.ensure(locale.isNull() ? emptyString() : locale, [] {
         return makeUnique<FontSetCache>();
     }).iterator->value;
     if (auto found = cache->typefaces.find(character); found != cache->typefaces.end())

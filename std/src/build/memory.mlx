@@ -1,0 +1,152 @@
+// Memory-aware parallelism: a job starts only when the memory it is
+// expected to take fits beside what the running jobs are still expected
+// to take, in what the machine (or the container's cgroup) has available,
+// so that `-j 4` (or the processors, the default) is safe for a build
+// whose steps take gigabytes each (WebKit's units: 1-4 GB) and the
+// memory killer (exit 137) does not stop a step half-way.
+//
+// What a step is expected to take: its peak resident memory the last
+// time it ran (the child's ru_maxrss from wait4, kept in its manifest and
+// in the result cache's entry beside the time it took: `took MS PEAK_KB`),
+// with an eighth more; before it ever ran, what build.mlx declared
+// (Build.memory); nothing known: no limit (as plain -j).
+//
+// What is available, looked at whenever a job could start: MemAvailable
+// (/proc/meminfo; what other processes take, another build beside this
+// one included, is already out of it), lower when the cgroup's limit
+// (v2 memory.max less memory.current, v1 memory.limit_in_bytes less
+// memory.usage_in_bytes) says less, less a margin (an eighth of the
+// memory, at least 1 GiB), less what the running jobs are still expected
+// to grow by (each one's expectation less its resident memory now, from
+// /proc/PID/statm). A step that does not fit waits for a running job to
+// end; when none runs, it starts anyway (it might fit, and the build
+// must go on).
+const std = @import("std")
+const graph = @import("./graph.mlx")
+
+const KIB: usize = 1024
+
+// A number in a small file (or after NAME in /proc/meminfo); 0 when none.
+fn readNumber(b: *graph.Builder, path: []const u8, name: []const u8) -> usize {
+    const file = std.fs.open(graph.cPath(b, path), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return 0 }
+    var buffer: [4096]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    const got = std.fs.read(file, bytes, 4095)
+    _ = std.fs.close(file)
+    if got <= 0 { return 0 }
+    const length = @bitCast(usize, got)
+    var at: usize = 0
+    if name.length > 0 {
+        // NAME: VALUE kB, a line of /proc/meminfo.
+        var found = false
+        while at + name.length <= length && !found {
+            if (at == 0 || bytes[at - 1] == 10) && std.text.same(bytes[at..at + name.length], name) {
+                found = true
+                at += name.length
+            } else {
+                at += 1
+            }
+        }
+        if !found { return 0 }
+        while at < length && (bytes[at] == 32 || bytes[at] == 58) { at += 1 }
+    }
+    var value: usize = 0
+    var digits: usize = 0
+    while at < length && bytes[at] >= 48 && bytes[at] <= 57 && digits < 19 {
+        value = value * 10 + @intCast(usize, bytes[at] - 48)
+        at += 1
+        digits += 1
+    }
+    return value
+}
+
+// What a cgroup limit leaves (KiB); NONE without a limit.
+fn cgroupRoom(b: *graph.Builder) -> usize {
+    const limit2 = readNumber(b, "/sys/fs/cgroup/memory.max", "")
+    if limit2 > 0 {
+        const used = readNumber(b, "/sys/fs/cgroup/memory.current", "")
+        return if limit2 > used { (limit2 - used) / KIB } else { 0 }
+    }
+    const limit1 = readNumber(b, "/sys/fs/cgroup/memory/memory.limit_in_bytes", "")
+    // (v1 says "no limit" with a number near 2^63.)
+    if limit1 > 0 && limit1 < 1152921504606846976 {
+        const used = readNumber(b, "/sys/fs/cgroup/memory/memory.usage_in_bytes", "")
+        return if limit1 > used { (limit1 - used) / KIB } else { 0 }
+    }
+    return graph.NONE
+}
+
+// The machine's memory (KiB).
+pub fn total(b: *graph.Builder) -> usize {
+    return readNumber(b, "/proc/meminfo", "MemTotal")
+}
+
+// Available now for new jobs and the growth of the running ones (KiB).
+pub fn available(b: *graph.Builder) -> usize {
+    var room = readNumber(b, "/proc/meminfo", "MemAvailable")
+    const limited = cgroupRoom(b)
+    if limited < room { room = limited }
+    var margin = total(b) / 8
+    if margin < 1048576 { margin = 1048576 }
+    return if room > margin { room - margin } else { 0 }
+}
+
+// What ITEM is expected to take at its peak (KiB); 0 when nothing is known.
+pub fn expected(item: *graph.Node) -> usize {
+    if item.*.peak > 0 { return item.*.peak + item.*.peak / 8 }
+    return item.*.memory
+}
+
+// A running job's resident memory now (KiB), from /proc/PID/statm.
+fn resident(b: *graph.Builder, pid: isize) -> usize {
+    var buffer: [64]u8 = undefined
+    const bytes: [*]u8 = unsafe { @ptrCast([*]u8, &buffer) }
+    var length = std.text.append(bytes, 0, 64, "/proc/")
+    length = std.text.appendUnsigned(bytes, length, 64, @bitCast(usize, pid))
+    length = std.text.append(bytes, length, 64, "/statm")
+    const path = bytes[0..length]
+    const file = std.fs.open(graph.cPath(b, path), std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) { return 0 }
+    var text: [128]u8 = undefined
+    const textBytes: [*]u8 = unsafe { @ptrCast([*]u8, &text) }
+    const got = std.fs.read(file, textBytes, 127)
+    _ = std.fs.close(file)
+    if got <= 0 { return 0 }
+    // size resident shared ...: the second, in pages.
+    var at: usize = 0
+    const end = @bitCast(usize, got)
+    while at < end && textBytes[at] != 32 { at += 1 }
+    at += 1
+    var pages: usize = 0
+    while at < end && textBytes[at] >= 48 && textBytes[at] <= 57 {
+        pages = pages * 10 + @intCast(usize, textBytes[at] - 48)
+        at += 1
+    }
+    return pages * 4
+}
+
+// What the running jobs are still expected to grow by (KiB).
+pub fn growth(b: *graph.Builder) -> usize {
+    var sum: usize = 0
+    var index: usize = 0
+    while index < b.*.nodeCount {
+        const item = graph.node(b, index)
+        if item.*.state == graph.STATE_RUNNING && item.*.pid > 0 {
+            const wanted = expected(item)
+            const now = resident(b, item.*.pid)
+            if wanted > now { sum += wanted - now }
+        }
+        index += 1
+    }
+    return sum
+}
+
+// What a job starting now may take (KiB) beside the RUNNING jobs: NONE
+// with none running, or without the memory limit (--no-memory-limit).
+pub fn budget(b: *graph.Builder, running: usize) -> usize {
+    if running == 0 || !b.*.memoryAware { return graph.NONE }
+    const room = available(b)
+    const grow = growth(b)
+    return if room > grow { room - grow } else { 0 }
+}

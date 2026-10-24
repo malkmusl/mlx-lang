@@ -5,7 +5,7 @@
 // are in, as the compiler writes them (path:line:function), and C
 // libraries by their own symbols.
 //
-//   mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]
+//   mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] [--thread NAME] PROGRAM [ARGUMENT...]
 //
 // Only samples where the program runs count (not where it waits in the
 // kernel); --wall counts all. At the end it prints the functions the most
@@ -22,7 +22,9 @@
 // MLX_FRAMES has its frames written as a timeline (std.diagnostics), the
 // processor's and the GPU's time on each.
 //
-// The main thread is sampled; the program's other threads run on.
+// The main thread is sampled, or with --thread the thread of that name
+// (its /proc comm, as pthread_setname_np gave it: a compositor's, a
+// worker's); the program's other threads run on.
 const std = @import("std")
 const crash = @import("std.crash")
 const diagnostics = @import("std.diagnostics")
@@ -55,6 +57,9 @@ const MAPS_SIZE: usize = 1048576
 // Everything the profiler keeps (big tables, allocated once).
 const Profiler = struct {
     child: usize
+    // --thread: the thread sampled (its id once found, else 0) and its name.
+    thread: usize
+    threadName: []const u8
     // The functions: their names (in names), samples in them and with what
     // they called; a hash of names to them.
     names: [*]u8
@@ -77,6 +82,13 @@ const Profiler = struct {
     fileImages: [64]usize
     fileSizes: [64]usize
     fileCount: usize
+    // Each file's functions in address order (indexSymbols), made the first
+    // time an address is named in it: where, how many, its names' strings.
+    fileFunctions: [64]usize
+    fileFunctionCounts: [64]usize
+    fileStrings: [64]usize
+    fileStringsSizes: [64]usize
+    fileIndexed: [64]bool
     // The sample being taken.
     frames: [64]u64
     frameCount: usize
@@ -381,51 +393,142 @@ fn nameInFile(profiler: *Profiler, from: usize, to: usize, in_file: usize) -> us
         index += 1
     }
     if !placed { return 0 }
+    var file: usize = 0
+    while file < profiler.*.fileCount && profiler.*.fileImages[file] != image { file += 1 }
+    if file == profiler.*.fileCount { return 0 }
+    if !profiler.*.fileIndexed[file] { indexFile(profiler, file, image, size) }
+    return nameInIndex(profiler, file, image, address)
+}
+
+// The functions of the file (its symbol table's, else its dynamic one's),
+// indexed once.
+fn indexFile(profiler: *Profiler, file: usize, image: usize, size: usize) -> void {
+    profiler.*.fileIndexed[file] = true
+    profiler.*.fileFunctionCounts[file] = 0
     const section_offset = read64(image, 40)
     const section_count = read16(image, 60)
-    if section_offset + section_count * 64 > size { return 0 }
+    if section_offset + section_count * 64 > size { return }
     var kind: usize = 2
     while kind != 0 {
-        index = 0
+        var index: usize = 0
         while index < section_count {
             const header = section_offset + index * 64
             if read32(image, header + 4) == kind {
                 const strings_header = section_offset + read32(image, header + 40) * 64
-                const named = nameInSymbols(profiler, image, size, read64(image, header + 24), read64(image, header + 32), read64(image, strings_header + 24), read64(image, strings_header + 32), address)
-                if named > 0 { return named }
+                const symbols = read64(image, header + 24)
+                const symbols_size = read64(image, header + 32)
+                const strings = read64(image, strings_header + 24)
+                const strings_size = read64(image, strings_header + 32)
+                if symbols + symbols_size <= size && strings + strings_size <= size {
+                    var count: usize = 0
+                    const functions = indexSymbols(image, symbols, symbols_size, &count)
+                    if count > 0 {
+                        profiler.*.fileFunctions[file] = @intFromPtr(functions)
+                        profiler.*.fileFunctionCounts[file] = count
+                        profiler.*.fileStrings[file] = strings
+                        profiler.*.fileStringsSizes[file] = strings_size
+                        return
+                    }
+                }
             }
             index += 1
         }
         kind = if kind == 2 { 11 } else { 0 }
     }
-    return 0
 }
 
-fn nameInSymbols(profiler: *Profiler, image: usize, size: usize, symbols: usize, symbols_size: usize, strings: usize, strings_size: usize, address: usize) -> usize {
-    if symbols + symbols_size > size || strings + strings_size > size { return 0 }
-    var best_value: usize = 0
-    var best_name: usize = 0
-    var found = false
+// A symbol table's functions in address order, three words each (address,
+// size, name), and how many: an address is then named by a binary search,
+// not a walk through every symbol (a program of a few hundred thousand
+// functions, as a WebKit one, takes seconds an address that way).
+fn indexSymbols(image: usize, symbols: usize, symbols_size: usize, count: *usize) -> [*]usize {
+    var functions: usize = 0
     var at = symbols
     while at + 24 <= symbols + symbols_size {
-        const kind = bytesAt(image + at + 4)[0] & 15
-        const value = read64(image, at + 8)
-        const extent = read64(image, at + 16)
-        if kind == 2 && value <= address && (address < value + extent || extent == 0) && (!found || value > best_value) {
-            best_value = value
-            best_name = read32(image, at)
-            found = true
+        if bytesAt(image + at + 4)[0] & 15 == 2 && read64(image, at + 8) != 0 { functions += 1 }
+        at += 24
+    }
+    const entries: [*]usize = unsafe { @ptrFromInt([*]usize, allocate(functions * 24 + 24)) }
+    var n: usize = 0
+    at = symbols
+    while at + 24 <= symbols + symbols_size {
+        if bytesAt(image + at + 4)[0] & 15 == 2 && read64(image, at + 8) != 0 {
+            entries[n * 3] = read64(image, at + 8)
+            entries[n * 3 + 1] = read64(image, at + 16)
+            entries[n * 3 + 2] = read32(image, at)
+            n += 1
         }
         at += 24
     }
-    if !found || best_name >= strings_size { return 0 }
-    const name = bytesAt(image + strings + best_name)
-    var length: usize = 0
-    while best_name + length < strings_size && name[length] != 0 && length < 4000 {
-        profiler.*.text[length] = name[length]
-        length += 1
+    // Heap sort by address.
+    var start = n / 2
+    while start > 0 {
+        start -= 1
+        siftDown(entries, start, n)
     }
-    return length
+    var end = n
+    while end > 1 {
+        end -= 1
+        swapEntries(entries, 0, end)
+        siftDown(entries, 0, end)
+    }
+    count.* = n
+    return entries
+}
+
+fn swapEntries(entries: [*]usize, first: usize, second: usize) -> void {
+    var word: usize = 0
+    while word < 3 {
+        const kept = entries[first * 3 + word]
+        entries[first * 3 + word] = entries[second * 3 + word]
+        entries[second * 3 + word] = kept
+        word += 1
+    }
+}
+
+fn siftDown(entries: [*]usize, start: usize, end: usize) -> void {
+    var root = start
+    while root * 2 + 1 < end {
+        var child = root * 2 + 1
+        if child + 1 < end && entries[(child + 1) * 3] > entries[child * 3] { child += 1 }
+        if entries[root * 3] >= entries[child * 3] { return }
+        swapEntries(entries, root, child)
+        root = child
+    }
+}
+
+// The function of the file's index that holds `address` (the nearest at or
+// below it whose extent holds it, or of no extent), into the profiler's
+// text; its name's length (0: none).
+fn nameInIndex(profiler: *Profiler, file: usize, image: usize, address: usize) -> usize {
+    const entries: [*]usize = unsafe { @ptrFromInt([*]usize, profiler.*.fileFunctions[file]) }
+    const strings = profiler.*.fileStrings[file]
+    const strings_size = profiler.*.fileStringsSizes[file]
+    var low: usize = 0
+    var high = profiler.*.fileFunctionCounts[file]
+    while low < high {
+        const middle = (low + high) / 2
+        if entries[middle * 3] <= address { low = middle + 1 } else { high = middle }
+    }
+    var tries: usize = 0
+    while low > 0 && tries < 64 {
+        low -= 1
+        tries += 1
+        const value = entries[low * 3]
+        const extent = entries[low * 3 + 1]
+        if address < value + extent || extent == 0 {
+            const name_at = entries[low * 3 + 2]
+            if name_at >= strings_size { return 0 }
+            const name = bytesAt(image + strings + name_at)
+            var length: usize = 0
+            while name_at + length < strings_size && name[length] != 0 && length < 4000 {
+                profiler.*.text[length] = name[length]
+                length += 1
+            }
+            return length
+        }
+    }
+    return 0
 }
 
 // The function `address` is in (NONE-like 4294967295: unknown), named
@@ -463,11 +566,13 @@ fn readWords(profiler: *Profiler, address: usize, into: [*]u64, count: usize) ->
 }
 
 // Where the stopped program is: rip, then the return addresses along
-// rbp (one byte back, into the call).
-fn sample(profiler: *Profiler) -> void {
+// rbp (one byte back, into the call), of the main thread or --thread's;
+// false when its registers cannot be read.
+fn capture(profiler: *Profiler) -> bool {
     var registers: [27]u64 = undefined
-    const got = std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_GETREGS, profiler.*.child, 0, @intFromPtr(&registers))
-    if got != 0 { return }
+    const target = if profiler.*.thread != 0 { profiler.*.thread } else { profiler.*.child }
+    const got = std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_GETREGS, target, 0, @intFromPtr(&registers))
+    if got != 0 { return false }
     profiler.*.frameCount = 0
     profiler.*.frames[0] = registers[16]
     profiler.*.frameCount = 1
@@ -483,6 +588,13 @@ fn sample(profiler: *Profiler) -> void {
         if pair[0] <= frame { break }
         frame = pair[0]
     }
+    return true
+}
+
+// The frames captured, counted for their functions (named from the
+// symbol tables the first time an address is seen, which can take long:
+// the program runs on meanwhile).
+fn countFrames(profiler: *Profiler) -> void {
     // Self: the first; total: every function once.
     profiler.*.round += 1
     var at: usize = 0
@@ -594,31 +706,13 @@ fn noteEnd(profiler: *Profiler) -> void {
 }
 
 fn running(profiler: *Profiler) -> bool {
-    var path: [64]u8 = undefined
+    var path: [96]u8 = undefined
     const bytes: [*]u8 = &path
-    var length: usize = 0
-    for byte in "/proc/" {
-        bytes[length] = byte
-        length += 1
+    if profiler.*.thread != 0 {
+        _ = threadPath(profiler, profiler.*.thread, "/stat", bytes)
+    } else {
+        _ = procPath(profiler, "/stat", bytes)
     }
-    var digits: [24]u8 = undefined
-    var count: usize = 0
-    var rest = profiler.*.child
-    while rest > 0 || count == 0 {
-        digits[count] = @intCast(u8, 48 + rest % 10)
-        rest /= 10
-        count += 1
-    }
-    while count > 0 {
-        count -= 1
-        bytes[length] = digits[count]
-        length += 1
-    }
-    for byte in "/stat" {
-        bytes[length] = byte
-        length += 1
-    }
-    bytes[length] = 0
     const file = std.linux.syscall3(std.linux.SYS_open, @intFromPtr(bytes), 0, 0)
     if file < 0 { return false }
     var stat: [512]u8 = undefined
@@ -629,6 +723,114 @@ fn running(profiler: *Profiler) -> bool {
     var at = @bitCast(usize, got)
     while at > 0 && stat[at - 1] != 41 { at -= 1 }
     return at + 1 < @bitCast(usize, got) && stat[at + 1] == 82
+}
+
+// --thread: /proc/PID/task/TID`file` into `into` (NUL-ended); its length.
+fn threadPath(profiler: *Profiler, thread: usize, file: []const u8, into: [*]u8) -> usize {
+    var length = procPath(profiler, "/task/", into)
+    length = appendNumber(into, length, thread)
+    for byte in file {
+        into[length] = byte
+        length += 1
+    }
+    into[length] = 0
+    return length
+}
+
+// --thread: the id of the program's thread named `threadName` (its comm),
+// else 0.
+fn findThread(profiler: *Profiler) -> usize {
+    var path: [96]u8 = undefined
+    const bytes: [*]u8 = &path
+    _ = procPath(profiler, "/task", bytes)
+    const directory = std.linux.syscall3(std.linux.SYS_open, @intFromPtr(bytes), 65536, 0)
+    if directory < 0 { return 0 }
+    var entries: [4096]u8 = undefined
+    var found: usize = 0
+    while found == 0 {
+        const got = std.linux.syscall3(std.linux.SYS_getdents64, @bitCast(usize, directory), @intFromPtr(&entries), 4096)
+        if got <= 0 { break }
+        var at: usize = 0
+        while at < @bitCast(usize, got) && found == 0 {
+            // linux_dirent64: inode, offset, record length (u16), type, name.
+            const record = @intCast(usize, entries[at + 16]) | (@intCast(usize, entries[at + 17]) << 8)
+            var thread: usize = 0
+            var digit = at + 19
+            while entries[digit] >= 48 && entries[digit] <= 57 {
+                thread = thread * 10 + @intCast(usize, entries[digit] - 48)
+                digit += 1
+            }
+            if thread != 0 && entries[digit] == 0 {
+                _ = threadPath(profiler, thread, "/comm", bytes)
+                const file = std.linux.syscall3(std.linux.SYS_open, @intFromPtr(bytes), 0, 0)
+                if file >= 0 {
+                    var comm: [32]u8 = undefined
+                    const read = std.linux.read(file, &comm, 32)
+                    std.linux.close(file)
+                    var length: usize = if read > 0 { @bitCast(usize, read) } else { 0 }
+                    while length > 0 && comm[length - 1] == 10 { length -= 1 }
+                    if same(comm[0..length], profiler.*.threadName) { found = thread }
+                }
+            }
+            at += record
+        }
+    }
+    std.linux.close(directory)
+    return found
+}
+
+// --thread: one stop of the thread, sampled when it was running. The
+// thread is interrupted, and its stop waited for while the main thread's
+// stops are let go on (a thread may wait on the main one: a signal stop of
+// the main thread left waiting would hold it). False when the thread is
+// gone (it is looked for again).
+fn sampleThread(profiler: *Profiler, counted: bool, wall: bool, skipped: *usize) -> bool {
+    const thread = profiler.*.thread
+    const was_running = wall || running(profiler)
+    if std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_INTERRUPT, thread, 0, 0) != 0 { return false }
+    var pause: [2]usize = [2]usize{ 0, 100000 }
+    while true {
+        var status: [1]u32 = [1]u32{ 0 }
+        const waited = std.linux.syscall4(std.linux.SYS_wait4, thread, @intFromPtr(&status), WALL | std.linux.WNOHANG, 0)
+        if waited < 0 { return false }
+        if waited == 0 {
+            if !mainGoesOn(profiler) { return false }
+            _ = std.linux.syscall2(std.linux.SYS_nanosleep, @intFromPtr(&pause), 0)
+            continue
+        }
+        const value = @intCast(usize, status[0])
+        if value & 127 != 127 { return false }
+        const signal = (value >> 8) & 255
+        const stop_event = (value >> 16) & 255
+        if stop_event == PTRACE_EVENT_STOP && signal == std.linux.SIGTRAP { break }
+        // A signal for the thread: on to it; a stop of the whole program: on.
+        const passed_signal = if stop_event != 0 { 0 } else { signal }
+        if std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_CONT, thread, 0, passed_signal) != 0 { return false }
+    }
+    const captured = counted && was_running && capture(profiler)
+    if counted && !was_running { skipped.* += 1 }
+    if std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_CONT, thread, 0, 0) != 0 { return false }
+    if captured { countFrames(profiler) }
+    return true
+}
+
+// --thread: the main thread's stops (signals, its exit) let go on without
+// waiting; false once the program has ended.
+fn mainGoesOn(profiler: *Profiler) -> bool {
+    while true {
+        var status: [1]u32 = [1]u32{ 0 }
+        const waited = std.linux.syscall4(std.linux.SYS_wait4, profiler.*.child, @intFromPtr(&status), WALL | std.linux.WNOHANG, 0)
+        if waited == 0 { return true }
+        if waited < 0 { return false }
+        const value = @intCast(usize, status[0])
+        if value & 127 != 127 { return false }
+        const signal = (value >> 8) & 255
+        const stop_event = (value >> 16) & 255
+        if stop_event == PTRACE_EVENT_EXIT && !profiler.*.endNoted { noteEnd(profiler) }
+        const passed_signal = if stop_event != 0 { 0 } else { signal }
+        _ = std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, passed_signal)
+    }
+    return true
 }
 
 // Waits for the program's main thread to stop with `event` (a ptrace event:
@@ -781,7 +983,7 @@ fn writeProfile(profiler: *Profiler, directory: []const u8, program: []const u8,
 }
 
 fn usage() -> void {
-    sayError("usage: mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] PROGRAM [ARGUMENT...]\n")
+    sayError("usage: mlx-profile [-o DIRECTORY] [--every MILLISECONDS] [--after MILLISECONDS] [--wall] [--thread NAME] PROGRAM [ARGUMENT...]\n")
 }
 
 pub fn main(arguments: [][*]const u8) -> u8 {
@@ -793,6 +995,7 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     var interval: usize = 5
     var after: usize = 0
     var wall = false
+    var thread_name: []const u8 = ""
     var directory: [*]const u8 = undefined
     var has_directory = false
     while first < arguments.length {
@@ -816,6 +1019,9 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         } else if same(argument, "--wall") {
             wall = true
             first += 1
+        } else if same(argument, "--thread") && first + 1 < arguments.length {
+            thread_name = std.text.cString(arguments[first + 1])
+            first += 2
         } else {
             break
         }
@@ -853,6 +1059,8 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     }
     if child < 0 { return 1 }
     profiler.*.child = @bitCast(usize, child)
+    profiler.*.thread = 0
+    profiler.*.threadName = thread_name
     var first_status: [1]u32 = [1]u32{ 0 }
     const first_wait = std.linux.syscall4(std.linux.SYS_wait4, profiler.*.child, @intFromPtr(&first_status), std.linux.WUNTRACED, 0)
     profiler.*.endNoted = false
@@ -873,16 +1081,37 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     // With --after, the stops before then are not counted (to see a
     // program's frames rather than its start).
     const counted_from = std.time.milliseconds() + after
-    while true {
+    if thread_name.length > 0 {
+        // --thread: the main thread runs on; the thread named is seized
+        // once it is there and stopped each time instead.
+        if std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, 0) != 0 { return 1 }
+        while mainGoesOn(profiler) {
+            _ = std.linux.syscall2(std.linux.SYS_nanosleep, @intFromPtr(&sleep), 0)
+            if profiler.*.thread == 0 {
+                const found = findThread(profiler)
+                if found != 0 && std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_SEIZE, found, 0, 0) == 0 { profiler.*.thread = found }
+                continue
+            }
+            if !sampleThread(profiler, std.time.milliseconds() >= counted_from, wall, &skipped) { profiler.*.thread = 0 }
+        }
+    }
+    // (A stop's frames are captured while the program is stopped and
+    // counted once it runs again: naming a new address can take long.)
+    var captured = false
+    while thread_name.length == 0 {
         const resumed = std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_CONT, profiler.*.child, 0, 0)
         if resumed != 0 { break }
+        if captured {
+            countFrames(profiler)
+            captured = false
+        }
         _ = std.linux.syscall2(std.linux.SYS_nanosleep, @intFromPtr(&sleep), 0)
         const was_running = wall || running(profiler)
         const stopped = std.linux.syscall4(std.linux.SYS_ptrace, PTRACE_INTERRUPT, profiler.*.child, 0, 0)
         if stopped != 0 { break }
         if waitFor(profiler, PTRACE_EVENT_STOP) != 1 { break }
         if std.time.milliseconds() < counted_from { continue }
-        if was_running { sample(profiler) } else { skipped += 1 }
+        if was_running { captured = capture(profiler) } else { skipped += 1 }
     }
     // The program's name: its file's.
     const program_path = std.text.cString(arguments[first])

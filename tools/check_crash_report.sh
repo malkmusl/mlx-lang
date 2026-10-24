@@ -74,6 +74,16 @@ echo "ok   a failure the program cannot go on after (crash.fail) is reported wit
 
 # The handler's own values come from the value arena too: when the program
 # filled it, the handler takes room of its own and says so.
+# The handler itself faulting while it names the frames (made to): it
+# runs again, says the original crash, the frames as files and offsets,
+# and what failed, and ends as the original crash would have.
+run broken 132
+grep -q '^crashy: crashed: illegal instruction (a failed runtime check' "$work/broken.out" || fail "a fault in the handler loses the original crash" "$work/broken.out"
+grep -q '^  at crashy+0x[0-9a-f]*$' "$work/broken.out" || fail "a fault in the handler does not give the frames as file and offset" "$work/broken.out"
+grep -q '^  from crashy+0x[0-9a-f]*$' "$work/broken.out" || fail "a fault in the handler drops the callers" "$work/broken.out"
+grep -q '^  (the report failed naming the frames: signal 11 at [^ ]* in the crash handler; the frames from there are unnamed)$' "$work/broken.out" || fail "a fault in the handler is not said" "$work/broken.out"
+echo "ok   a fault in the crash handler itself still reports the original crash, its frames unnamed"
+
 run values 132
 grep -q "^crashy: crashed: illegal instruction (the values' arena is full" "$work/values.out" || fail "a full value arena is not said" "$work/values.out"
 grep -q '^  at tests/support/crash_report.mlx:[0-9]*:hoard+0x' "$work/values.out" || fail "the full arena does not name hoard" "$work/values.out"
@@ -98,7 +108,7 @@ echo "ok   a context whose memory is gone is left out of the report"
 
 log="$work/state/mlx/crashes.log"
 [[ -f "$log" ]] || fail "no crashes.log"
-[[ $(wc -l < "$log") -eq 8 ]] || fail "crashes.log does not hold eight crashes" "$log"
+[[ $(wc -l < "$log") -eq 9 ]] || fail "crashes.log does not hold nine crashes" "$log"
 awk -F'\t' '$1 != "crash" || $2 !~ /^[0-9]+$/ || $3 != "crashy" || NF < 5 { bad = 1 } END { exit bad }' "$log" || fail "crashes.log lines are not crash/time/program/reason/frames" "$log"
 grep -q "	tests/support/crash_report.mlx:16:middle+0x[0-9a-f]* at tests/support/crash_report.mlx:13	" "$log" || fail "the kept crash has no frames" "$log"
 grep -q "	illegal instruction ([^	]*), while compiling src/widget.c:12	tests/support/crash_report.mlx:16:middle" "$log" || fail "the kept crash does not have the context with its reason" "$log"
@@ -127,6 +137,7 @@ echo "ok   every program build.mlx declares installs the crash report"
 # report of a compiler crash is what the probe above checked.
 mkdir -p "$work/cc"
 "$compiler" --quiet compiler/cc/main.mlx -o "$work/cc/mlx-cc" || fail "mlx-cc does not build"
+"$compiler" --quiet compiler/ld/main.mlx -o "$work/cc/mlx-ld" || fail "mlx-ld does not build"
 ln -s "$repo_root/compiler/cc/include" "$work/cc/include"
 printf 'typedef struct { char buffer[65536]; int n; } Async;\nint main(void) { Async a = { 0 }; return a.n; }\n' > "$work/async.c"
 set +e
@@ -146,6 +157,90 @@ else
     cc_crashed=1
 fi
 
+# mlx-cc's programs: the linker writes their symbol table (link.mlx), the
+# locals first, every function and variable with its type, binding and
+# size, and the line table of where each function was defined; on
+# mlxlibc a crash names each frame's function, a C++ one mangled and as
+# it is written (std.demangle), and where it was defined. -s leaves the
+# tables out.
+tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/libc" > "$work/libc.log" 2>&1 || fail "mlxlibc does not build" "$work/libc.log"
+loader="$work/libc/libmlxc.so.1"
+"$work/cc/mlx-cc" tests/support/crash_report_cc.c -o "$work/cc/crash_c" --dynamic-linker="$loader" 2> "$work/cc_c.err" || fail "the C probe does not build" "$work/cc_c.err"
+"$work/cc/mlx-cc" -c tests/support/crash_report_cc.cpp -o "$work/cc/crash_cpp.o" 2> "$work/cc_cpp.err" || fail "the C++ probe does not compile" "$work/cc_cpp.err"
+"$work/cc/mlx-cc" "$work/cc/crash_cpp.o" -o "$work/cc/crash_cpp" --dynamic-linker="$loader" 2>> "$work/cc_cpp.err" || fail "the C++ probe does not link" "$work/cc_cpp.err"
+"$work/cc/mlx-cc" "$work/cc/crash_cpp.o" -o "$work/cc/crash_cpp_stripped" -s --dynamic-linker="$loader" 2>> "$work/cc_cpp.err" || fail "the C++ probe does not link with -s" "$work/cc_cpp.err"
+if command -v readelf > /dev/null; then
+    readelf -SW "$work/cc/crash_cpp" > "$work/sections"
+    readelf -sW "$work/cc/crash_cpp" > "$work/symtab"
+    grep -q ' \.symtab ' "$work/sections" && grep -q ' \.strtab ' "$work/sections" && grep -q ' \.mlx_lines ' "$work/sections" || fail "mlx-cc's program has no .symtab, .strtab and .mlx_lines" "$work/sections"
+    # sh_info: the first global, after every local.
+    first_global=$(awk '$2 == ".symtab" { print $(NF - 1) }' "$work/sections")
+    awk -v first="$first_global" '/^Symbol table .\.symtab/ { on = 1; next } on && $1 ~ /^[0-9]+:$/ { n = $1 + 0; if (($5 == "LOCAL") != (n < first)) bad = 1 } END { exit bad }' "$work/symtab" || fail "the symbol table's locals do not all come before its globals (sh_info $first_global)" "$work/symtab"
+    for symbol in 'FUNC +WEAK .* _ZN8geometry9Holder<i>4pokeEPN8geometry5ShapeEi$' 'FUNC +GLOBAL .* _ZN8geometry7measureEPN8geometry5ShapeE$' 'FUNC +GLOBAL .* _start$' 'FUNC +LOCAL .* __mlxcc_init$' 'FUNC +LOCAL .* printf@plt$' 'OBJECT +LOCAL .* _ZN8geometry5depthE$' 'SECTION +LOCAL +DEFAULT +6 '; do
+        grep -qE "$symbol" "$work/symtab" || fail "no symbol like '$symbol' in mlx-cc's program" "$work/symtab"
+    done
+    awk '/^Symbol table .\.symtab/ { on = 1; next } on && $4 == "FUNC" && $3 == 0 { bad = 1 } END { exit bad }' "$work/symtab" || fail "a function of mlx-cc's program has no size" "$work/symtab"
+    readelf -SW "$work/cc/crash_cpp_stripped" | grep -q ' \.symtab ' && fail "-s left the symbol table in"
+    echo "ok   mlx-cc's linker writes the symbol table (locals first, types, bindings, sizes) and the line table; -s leaves them out"
+fi
+run_cc() { # PROGRAM OUTPUT
+    set +e
+    XDG_STATE_HOME="$work/state" "$work/cc/$1" > "$work/$1.out" 2>&1
+    status=$?
+    set -e
+    [[ $status -eq 139 ]] || fail "$1 exited $status, not 139" "$work/$1.out"
+}
+run_cc crash_c
+grep -q '^crash_c: crashed: segmentation fault touching 0x0$' "$work/crash_c.out" || fail "no crash line for the C probe" "$work/crash_c.out"
+grep -q '^  at inner+0x[0-9a-f]* defined at tests/support/crash_report_cc.c:8$' "$work/crash_c.out" || fail "the C crash is not placed in inner (line 8)" "$work/crash_c.out"
+grep -q '^  from middle+0x[0-9a-f]* defined at tests/support/crash_report_cc.c:10$' "$work/crash_c.out" || fail "middle (line 10) is not among the C probe's callers" "$work/crash_c.out"
+grep -q '^  from main+0x[0-9a-f]* defined at tests/support/crash_report_cc.c:12$' "$work/crash_c.out" || fail "main (line 12) is not among the C probe's callers" "$work/crash_c.out"
+grep -q '^  from _start+0x' "$work/crash_c.out" || fail "_start is not named" "$work/crash_c.out"
+echo "ok   a crash of mlx-cc's C program names its functions and where they were defined"
+run_cc crash_cpp
+grep -q '^  at _ZN8geometry9Holder<i>4pokeEPN8geometry5ShapeEi+0x[0-9a-f]* (geometry::Holder<int>::poke(geometry::Shape\*, int)) defined at tests/support/crash_report_cc.cpp:12$' "$work/crash_cpp.out" || fail "the C++ crash is not placed in Holder<int>::poke (line 12), mangled and demangled" "$work/crash_cpp.out"
+grep -q '^  from _ZN8geometry7measureEPN8geometry5ShapeE+0x[0-9a-f]* (geometry::measure(geometry::Shape\*)) defined at tests/support/crash_report_cc.cpp:14$' "$work/crash_cpp.out" || fail "geometry::measure (line 14) is not among the callers" "$work/crash_cpp.out"
+grep -q '^  from _Z5outeri+0x[0-9a-f]* (outer(int)) defined at tests/support/crash_report_cc.cpp:21$' "$work/crash_cpp.out" || fail "outer(int) (line 21) is not among the callers" "$work/crash_cpp.out"
+grep -q "	_ZN8geometry7measureEPN8geometry5ShapeE+0x[0-9a-f]* (geometry::measure(geometry::Shape\*)) defined at tests/support/crash_report_cc.cpp:14	" "$log" || fail "crashes.log does not keep the C++ frames with their names" "$log"
+echo "ok   a crash of mlx-cc's C++ program names its functions mangled and as written, and where they were defined"
+run_cc crash_cpp_stripped
+grep -q '^  at crash_cpp_stripped+0x[0-9a-f]*$' "$work/crash_cpp_stripped.out" || fail "the stripped program's frames are not named by the file and offset" "$work/crash_cpp_stripped.out"
+echo "ok   a stripped program's frames are the file and the offset"
+
+# An inline function's copy in an object whose definition another
+# object's replaced is still called by its own object, and still named
+# (a local of the same name).
+"$work/cc/mlx-cc" -c tests/support/crash_report_inline_a.cpp -o "$work/cc/inline_a.o" 2> "$work/inline.err" || fail "the inline probe does not compile" "$work/inline.err"
+"$work/cc/mlx-cc" -c tests/support/crash_report_inline_b.cpp -o "$work/cc/inline_b.o" 2>> "$work/inline.err" || fail "the inline probe does not compile" "$work/inline.err"
+"$work/cc/mlx-cc" "$work/cc/inline_a.o" "$work/cc/inline_b.o" -o "$work/cc/crash_inline" --dynamic-linker="$loader" 2>> "$work/inline.err" || fail "the inline probe does not link" "$work/inline.err"
+run_cc crash_inline
+grep -q '^  at _Z5twicePi+0x[0-9a-f]* (twice(int\*)) defined at tests/support/crash_report_inline_b.cpp:5$' "$work/crash_inline.out" || fail "the crash in an object's own copy of an inline function is not named" "$work/crash_inline.out"
+echo "ok   an object's own copy of an inline function, replaced as the program's, is named"
+
+# At scale: a C++ program of a million and more functions (a generated
+# object of 1,000,000 beside tests/support/crash_report_scale.cpp) that
+# crashes 21 calls deep in functions with long template names, as
+# webcore-dump did. mlxlibc's handler has the 64 KiB value arena of a
+# --stack-arena export for its whole run: naming every frame (C++ names
+# demangled) must not run it out, and the handler died of exactly that
+# before (a failed check in nameInImage).
+awk -v n=1000000 'BEGIN { for (i = 0; i < n; i++) printf "int many_%d(int x) { return x + %d; }\n", i, i; printf "int many_functions(int x) { return many_%d(x) - %d; }\n", n - 1, n - 1 }' > "$work/many.c"
+"$work/cc/mlx-cc" -c "$work/many.c" -o "$work/many.o" 2> "$work/many.err" || fail "the million functions do not compile" "$work/many.err"
+rm -f "$work/many.c"
+"$work/cc/mlx-cc" -c tests/support/crash_report_scale.cpp -o "$work/cc/scale.o" 2> "$work/scale.err" || fail "the scale probe does not compile" "$work/scale.err"
+"$work/cc/mlx-cc" "$work/cc/scale.o" "$work/many.o" -o "$work/cc/crash_scale" --dynamic-linker="$loader" 2>> "$work/scale.err" || fail "the scale probe does not link" "$work/scale.err"
+rm -f "$work/many.o"
+if command -v readelf > /dev/null; then
+    symbols=$(readelf -SW "$work/cc/crash_scale" | awk '$2 == ".symtab" { print $6 }')
+    (( 16#$symbols / 24 > 1000000 )) || fail "the scale probe's symbol table has fewer than a million symbols"
+fi
+run_cc crash_scale
+[[ $(grep -c '^  from _ZN5scale[0-9]*Level<[0-9]*>4downE.*+0x[0-9a-f]* (scale::Level<[0-9]*>::down(_IO_FILE\*, scale::Nest<scale::Box<scale::Nest<scale::Box<scale::Nest<scale::Box<int>, 1> >, 2> >, [0-9]*>\*, long))' "$work/crash_scale.out") -eq 20 ]] || fail "the deep C++ frames of the scale probe are not all named and demangled" "$work/crash_scale.out"
+grep -q '^  at _ZN5scale8Level<0>4downE.*(scale::Level<0>::down(' "$work/crash_scale.out" || fail "the scale probe's crash is not placed in Level<0>::down" "$work/crash_scale.out"
+grep -q '^  from main+0x[0-9a-f]* defined at tests/support/crash_report_scale.cpp:[0-9]*$' "$work/crash_scale.out" || fail "main is not among the scale probe's callers" "$work/crash_scale.out"
+grep -q 'the report failed' "$work/crash_scale.out" && fail "the handler failed naming the scale probe's frames" "$work/crash_scale.out"
+echo "ok   a crash among a million functions, 21 frames of long C++ names deep, is named in full"
+
 # mlx-codemap crashes (tools/codemap, installed also as mlx-codemap) lists
 # the kept crashes on the functions of this tree.
 "$compiler" --quiet tools/codemap/main.mlx -o "$work/codemap" || fail "codemap does not build"
@@ -156,6 +251,11 @@ if [[ $cc_crashed -eq 1 ]]; then
     grep -q '^compiler/cc/[a-z0-9_]*\.mlx:[0-9]*:[0-9]*: function [A-Za-z0-9_]* (crashed here 1x)$' "$work/crashes.txt" || fail "codemap crashes does not list the function mlx-cc crashed in" "$work/crashes.txt"
     grep -q '^== mlx-cc: .*, while compiling async.c:2$' "$work/crashes.txt" || fail "codemap crashes does not show the crash of mlx-cc with its context" "$work/crashes.txt"
 fi
+grep -q '^   from _ZN8geometry7measureEPN8geometry5ShapeE+0x[0-9a-f]* (geometry::measure(geometry::Shape\*)) defined at tests/support/crash_report_cc.cpp:14$' "$work/crashes.txt" || fail "codemap crashes does not show the C++ frames with their names" "$work/crashes.txt"
+# A frame an older handler kept mangled is shown with its C++ name too.
+printf 'crash\t1\told\tsegmentation fault touching 0x0\tsrc/old.cpp:3:_Z5outeri+0x1f\n' >> "$log"
+XDG_STATE_HOME="$work/state" "$work/codemap" -C "$repo_root" crashes > "$work/crashes.txt" 2>&1 || fail "codemap crashes failed" "$work/crashes.txt"
+grep -q '^   at src/old.cpp:3:_Z5outeri+0x1f (outer(int))$' "$work/crashes.txt" || fail "codemap crashes does not demangle a mangled frame kept without its name" "$work/crashes.txt"
 echo "ok   mlx-codemap crashes lists the kept crashes on their functions"
 
 # The rule: every Wayland client in projects/, examples/ and tools/ watches

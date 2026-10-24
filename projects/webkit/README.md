@@ -10,7 +10,11 @@ programs written in Mlx (generators/), and their output is that of
 WebKit's own generators to the byte.
 
 The sources are WPE WebKit 2.54.1's tree: `WEBKIT_SOURCE` (the directory
-with `Source/`), by default /home/user/csrc/wpe/wpewebkit-2.54.1.
+with `Source/`), by default projects/webkit/upstream, the release tarball
+as it is and never modified (UPSTREAM.md: what was imported, how to
+upgrade; tools/check_webkit_upstream.sh holds the tree to it). The
+default is the path in the checkout, so the compiles' command lines, and
+the result cache's entries, are the same in every checkout and worktree.
 
 Two of WebKit's ports are built, by the same steps from a description
 of each (`Port` in build.mlx): JSCOnly (JavaScriptCore alone, the

@@ -1,0 +1,442 @@
+// http: and https: for the port's loader (MlxNetwork.cpp): requests run by
+// std.http's client (HTTP/1.1, connections kept per host, chunked bodies,
+// gzip and deflate undone, std.tls with the server's chain checked by
+// std.x509 against the system's CA bundle), with the cookie jar of
+// std.http.cookiejar, which the client sends from and takes Set-Cookie
+// into, and which document.cookie reads and writes (cookiesFor,
+// setCookie). The C++ side calls all of these from one thread of its own
+// (the network queue), so the session and the jar need no lock.
+//
+// Redirects are not followed here: a 3xx response comes back as it is,
+// for WebCore to decide on (ResourceLoader::willSendRequest).
+//
+// A streamed request (STREAMED: the loads of pages, downloads) comes back
+// after the head when its body is long or of a length not known: the body
+// stays on its connection, out of the session (std.http.client's
+// requestHead), and the C++ side reads it on a thread of its own with
+// streamRead, piece by piece, while the network queue goes on with other
+// requests. Such a body is not stored in the HTTP cache.
+//
+// The profile (MlxProfile.cpp, openProfile): the jar is kept in an SQLite
+// database (cookies.mlx) and GET responses in the HTTP cache on disk
+// (httpcache.mlx), which a request consults by its cache mode before it
+// goes to the server.
+//
+// MLXWEB_CA_FILE=PATH in the environment adds the certificates of a PEM
+// file to the anchors (a test CA).
+const std = @import("std")
+const client = @import("std.http.client")
+const cookiejar = @import("std.http.cookiejar")
+const headers = @import("std.http.headers")
+const uri = @import("std.uri")
+const x509 = @import("std.x509")
+const httpcache = @import("./httpcache.mlx")
+const cookies = @import("./cookies.mlx")
+
+extern("c") fn malloc(size: usize) -> usize
+extern("c") fn free(address: usize) -> void
+extern("c") fn getenv(name: [*]const u8) -> usize
+
+// Why a request has no response (the client's errors, as MlxWebPort.h
+// numbers them; 0 for a response).
+pub const ERROR_BAD_URL: u32 = 1
+pub const ERROR_CONNECT: u32 = 2
+pub const ERROR_TLS: u32 = 3
+pub const ERROR_RECEIVE: u32 = 4
+pub const ERROR_OTHER: u32 = 5
+
+
+var session: client.Session = undefined
+var jar: cookiejar.Jar = undefined
+var store: x509.TrustStore = undefined
+var ready = false
+
+fn bytesAt(address: usize, length: usize) -> []const u8 {
+    if address == 0 || length == 0 { return "" }
+    const view: [*]const u8 = unsafe { @ptrFromInt([*]const u8, address) }
+    return view[0..length]
+}
+
+fn cLength(address: usize) -> usize {
+    if address == 0 { return 0 }
+    const view: [*]const u8 = unsafe { @ptrFromInt([*]const u8, address) }
+    var n: usize = 0
+    while view[n] != 0 { n += 1 }
+    return n
+}
+
+fn cText(address: usize) -> []const u8 { return bytesAt(address, cLength(address)) }
+
+// A copy of BYTES on the C heap (one byte more, a zero after them).
+fn copied(bytes: []const u8) -> usize {
+    const address = malloc(bytes.length + 1)
+    if address == 0 { return 0 }
+    const to: [*]u8 = unsafe { @ptrFromInt([*]u8, address) }
+    var i: usize = 0
+    while i < bytes.length {
+        to[i] = bytes[i]
+        i += 1
+    }
+    to[bytes.length] = 0
+    return address
+}
+
+fn prepare() -> void {
+    if ready { return }
+    const allocator = std.heap.allocator()
+    client.init(&session, allocator)
+    cookiejar.init(&jar, allocator)
+    client.setCookieJar(&session, &jar)
+    session.followRedirects = false
+    x509.storeInit(&store, allocator)
+    _ = x509.storeLoadFile(&store, "/etc/ssl/certs/ca-certificates.crt".pointer)
+    const extra = getenv("MLXWEB_CA_FILE".pointer)
+    if extra != 0 { _ = x509.storeLoadFile(&store, unsafe { @ptrFromInt([*]const u8, extra) }) }
+    client.setTrustStore(&session, &store)
+    ready = true
+}
+
+fn failureOf(result: client.Error) -> u32 {
+    if result == client.Error.badUrl { return ERROR_BAD_URL }
+    if result == client.Error.resolve || result == client.Error.connect { return ERROR_CONNECT }
+    if result == client.Error.tls { return ERROR_TLS }
+    if result == client.Error.receive || result == client.Error.malformed { return ERROR_RECEIVE }
+    return ERROR_OTHER
+}
+
+// The cache modes of a request (MlxWebPort.h's MLXWEB_CACHE_*, from
+// WebCore's ResourceRequestCachePolicy).
+pub const CACHE_DEFAULT: u32 = 0
+pub const CACHE_RELOAD: u32 = 1
+pub const CACHE_PREFER: u32 = 2
+pub const CACHE_ONLY: u32 = 3
+pub const CACHE_BYPASS: u32 = 4
+pub const CACHE_REVALIDATE: u32 = 5
+pub const ERROR_NOT_CACHED: u32 = 6
+
+// Where an answer came from: the network, the cache with no request sent,
+// the cache after the server's 304.
+pub const SOURCE_NETWORK: u32 = 0
+pub const SOURCE_CACHE: u32 = 1
+pub const SOURCE_REVALIDATED: u32 = 2
+
+// A response on the C heap: the status, the head as it came (status line
+// and header lines), the body with its content coding undone.
+const Answer = struct {
+    failure: u32
+    status: u32
+    head: usize
+    headLength: usize
+    body: usize
+    bodyLength: usize
+    source: u32
+    // The body still on its connection (a client.Body on the heap; 0:
+    // none, the body is whole above) and the length its head gave (-1:
+    // none).
+    stream: usize
+    streamLength: i64
+}
+
+// A body this long or shorter is read whole even when streamed (and may
+// be cached).
+const WHOLE_BODY: i64 = 65536
+
+fn answerAt(address: usize) -> *Answer { return unsafe { @ptrFromInt(*Answer, address) } }
+
+fn newAnswer() -> usize {
+    const address = malloc(@sizeOf(Answer))
+    if address == 0 { return 0 }
+    const answer = answerAt(address)
+    answer.*.failure = 0
+    answer.*.status = 0
+    answer.*.head = 0
+    answer.*.headLength = 0
+    answer.*.body = 0
+    answer.*.bodyLength = 0
+    answer.*.source = SOURCE_NETWORK
+    answer.*.stream = 0
+    answer.*.streamLength = -1
+    return address
+}
+
+fn fill(address: usize, status: u32, head: []const u8, body: []const u8, source: u32) -> void {
+    const answer = answerAt(address)
+    answer.*.status = status
+    answer.*.head = copied(head)
+    answer.*.headLength = head.length
+    answer.*.body = copied(body)
+    answer.*.bodyLength = body.length
+    answer.*.source = source
+}
+
+fn isSafe(method: []const u8) -> bool {
+    return std.text.same(method, "GET") || std.text.same(method, "HEAD") || std.text.same(method, "OPTIONS") || std.text.same(method, "TRACE")
+}
+
+// The status of a stored head's status line ("HTTP/1.1 200 OK").
+fn statusOf(head: []const u8) -> u32 {
+    var at: usize = 0
+    while at < head.length && head[at] != 32 { at += 1 }
+    var status: u32 = 0
+    at += 1
+    while at < head.length && head[at] >= 48 && head[at] <= 57 {
+        status = status * 10 + @intCast(u32, head[at] - 48)
+        at += 1
+    }
+    return status
+}
+
+// Runs a request: METHOD, URL and HEADERS ("Name: value\r\n" lines) are C
+// strings, BODY has BODY_LENGTH bytes (HAS_BODY 0: none), MODE the cache's
+// (CACHE_*: the profile's HTTP cache, httpcache.mlx, answers a GET from
+// disk when it may, revalidates, stores). The answer, or 0 without memory.
+pub fn request(method: usize, url: usize, headerLines: usize, body: usize, bodyLength: usize, hasBody: bool, mode: u32, streamed: bool) -> usize {
+    prepare()
+    const address = newAnswer()
+    if address == 0 { return 0 }
+    const methodText = cText(method)
+    const urlText = cText(url)
+    const lines = cText(headerLines)
+    const cached = httpcache.enabled() && mode != CACHE_BYPASS && std.text.same(methodText, "GET") && !httpcache.forbidsStoring(lines)
+    if !cached || httpcache.isConditional(lines) {
+        const requestTime = httpcache.now()
+        var response: client.Response = undefined
+        const result = send(methodText, urlText, lines, bytesAt(body, bodyLength), hasBody, &response, if streamed { address } else { 0 })
+        if result != client.Error.none {
+            answerAt(address).*.failure = failureOf(result)
+            return address
+        }
+        const head = response.head.bytes[0..response.head.length]
+        const got = response.body.bytes[0..response.body.length]
+        if cached && response.status != 304 && answerAt(address).*.stream == 0 { httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now()) }
+        if !isSafe(methodText) && response.status < 400 { httpcache.invalidate(urlText, lines) }
+        fill(address, response.status, head, got, SOURCE_NETWORK)
+        client.freeResponse(&session, &response)
+        return address
+    }
+    var stored = httpcache.Stored.init()
+    const found = mode != CACHE_RELOAD && httpcache.find(methodText, urlText, lines, &stored)
+    if found {
+        const now = httpcache.now()
+        if mode == CACHE_PREFER || mode == CACHE_ONLY || (mode != CACHE_REVALIDATE && httpcache.isFresh(&stored, lines, now)) {
+            httpcache.touch(&stored)
+            fill(address, statusOf(stored.head()), stored.head(), stored.body(), SOURCE_CACHE)
+            return address
+        }
+    } else if mode == CACHE_ONLY {
+        answerAt(address).*.failure = ERROR_NOT_CACHED
+        return address
+    }
+    // To the server, with the stored response's validators.
+    var conditional = std.ArrayList(u8).init(std.heap.allocator())
+    _ = conditional.appendSlice(lines)
+    const validating = found && httpcache.validators(&stored, &conditional)
+    const requestTime = httpcache.now()
+    var response: client.Response = undefined
+    var sent: []const u8 = lines
+    if validating { sent = conditional.items() }
+    const result = send(methodText, urlText, sent, bytesAt(body, bodyLength), hasBody, &response, if streamed { address } else { 0 })
+    if result != client.Error.none {
+        answerAt(address).*.failure = failureOf(result)
+        return address
+    }
+    const head = response.head.bytes[0..response.head.length]
+    const got = response.body.bytes[0..response.body.length]
+    if validating && response.status == 304 {
+        var merged = std.ArrayList(u8).init(std.heap.allocator())
+        httpcache.merge(&stored, head, &merged)
+        httpcache.refresh(&stored, merged.items(), requestTime, httpcache.now())
+        fill(address, statusOf(stored.head()), merged.items(), stored.body(), SOURCE_REVALIDATED)
+        client.freeResponse(&session, &response)
+        return address
+    }
+    if answerAt(address).*.stream == 0 { httpcache.store(methodText, urlText, lines, response.status, head, got, requestTime, httpcache.now()) }
+    fill(address, response.status, head, got, SOURCE_NETWORK)
+    client.freeResponse(&session, &response)
+    return address
+}
+
+// Sends a request; for a streamed one (ANSWER not 0) a body that is long
+// or of no known length stays on its connection, in the answer's stream,
+// and one that is short is read now into the response.
+fn send(method: []const u8, url: []const u8, lines: []const u8, body: []const u8, hasBody: bool, response: *client.Response, answer: usize) -> client.Error {
+    const req = client.Request.{ .method = method, .url = url, .headers = lines, .body = body, .hasBody = hasBody }
+    if answer == 0 { return client.request(&session, &req, response) }
+    const memory = std.heap.allocator().alloc(@sizeOf(client.Body), 16)
+    if memory == null { return client.Error.noMemory }
+    const left: *client.Body = unsafe { @ptrCast(*client.Body, memory.?) }
+    const result = client.requestHead(&session, &req, response, left)
+    if result != client.Error.none {
+        std.heap.allocator().free(memory.?, @sizeOf(client.Body), 16)
+        return result
+    }
+    const length = client.bodyLength(left)
+    if length >= 0 && length <= WHOLE_BODY {
+        // (Short: read now, as request reads it.)
+        var whole = Whole.{ .response = response, .failed = false }
+        const read = client.readBody(left, client.BodySink.{ .context = @intFromPtr(&whole), .write = wholeWrite })
+        std.heap.allocator().free(memory.?, @sizeOf(client.Body), 16)
+        if read != client.Error.none || whole.failed {
+            client.freeResponse(&session, response)
+            return if read != client.Error.none { read } else { client.Error.noMemory }
+        }
+        return client.Error.none
+    }
+    answerAt(answer).*.stream = @intFromPtr(left)
+    answerAt(answer).*.streamLength = length
+    return client.Error.none
+}
+
+const Whole = struct {
+    response: *client.Response
+    failed: bool
+}
+
+fn wholeWrite(context: usize, data: []const u8) -> bool {
+    const whole: *Whole = unsafe { @ptrFromInt(*Whole, context) }
+    const into = &whole.*.response.*.body
+    const needed = into.*.length + data.length
+    if needed > into.*.capacity {
+        var capacity = if into.*.capacity == 0 { 4096 } else { into.*.capacity * 2 }
+        while capacity < needed { capacity *= 2 }
+        const memory = session.allocator.alloc(capacity, 16)
+        if memory == null {
+            whole.*.failed = true
+            return false
+        }
+        var i: usize = 0
+        while i < into.*.length {
+            memory.?[i] = into.*.bytes[i]
+            i += 1
+        }
+        if into.*.capacity != 0 { session.allocator.free(into.*.bytes, into.*.capacity, 16) }
+        into.*.bytes = memory.?
+        into.*.capacity = capacity
+    }
+    var i: usize = 0
+    while i < data.length {
+        into.*.bytes[into.*.length + i] = data[i]
+        i += 1
+    }
+    into.*.length = needed
+    return true
+}
+
+// The length the head gave a streamed body (-1: none; 0 when there is
+// no stream).
+pub fn streamLength(answer: usize) -> i64 { return if answer == 0 || answerAt(answer).*.stream == 0 { 0 } else { answerAt(answer).*.streamLength } }
+pub fn hasStream(answer: usize) -> bool { return answer != 0 && answerAt(answer).*.stream != 0 }
+
+// The C++ side's sink of a streamed body: called with each piece, 0 to
+// stop.
+const PieceFn = fn(usize, usize, usize) -> u32
+
+const Piece = struct {
+    callback: usize
+    context: usize
+}
+
+fn pieceWrite(context: usize, data: []const u8) -> bool {
+    const piece: *Piece = unsafe { @ptrFromInt(*Piece, context) }
+    const target: PieceFn = unsafe { @ptrFromInt(PieceFn, piece.*.callback) }
+    return target(piece.*.context, @intFromPtr(data.pointer), data.length) != 0
+}
+
+// Reads the answer's streamed body to its end into CALLBACK(CONTEXT,
+// bytes, length) on the calling thread (any one: the body is no longer
+// the session's); 0 when it was all read, 1 when the callback stopped
+// it, 2 when the connection failed. The stream is gone after.
+pub fn streamRead(answer: usize, callback: usize, context: usize) -> u32 {
+    if answer == 0 || answerAt(answer).*.stream == 0 { return 0 }
+    const left: *client.Body = unsafe { @ptrFromInt(*client.Body, answerAt(answer).*.stream) }
+    var piece = Piece.{ .callback = callback, .context = context }
+    const result = client.readBody(left, client.BodySink.{ .context = @intFromPtr(&piece), .write = pieceWrite })
+    std.heap.allocator().free(unsafe { @ptrFromInt([*]u8, answerAt(answer).*.stream) }, @sizeOf(client.Body), 16)
+    answerAt(answer).*.stream = 0
+    if result == client.Error.none { return 0 }
+    if result == client.Error.stopped { return 1 }
+    return 2
+}
+
+pub fn source(answer: usize) -> u32 { return if answer == 0 { SOURCE_NETWORK } else { answerAt(answer).*.source } }
+
+// The profile's files (MlxProfile.cpp): the cookie database and the HTTP
+// cache's directory, C strings (empty: none).
+pub fn openProfile(cookiePath: usize, cacheDirectory: usize) -> void {
+    prepare()
+    cookies.open(cText(cookiePath), &jar, x509.now())
+    httpcache.open(cText(cacheDirectory))
+}
+
+pub fn closeProfile() -> void {
+    cookies.close()
+    httpcache.close()
+}
+
+pub fn failure(answer: usize) -> u32 { return if answer == 0 { ERROR_OTHER } else { answerAt(answer).*.failure } }
+pub fn status(answer: usize) -> u32 { return if answer == 0 { 0 } else { answerAt(answer).*.status } }
+pub fn head(answer: usize) -> usize { return if answer == 0 { 0 } else { answerAt(answer).*.head } }
+pub fn headLength(answer: usize) -> usize { return if answer == 0 { 0 } else { answerAt(answer).*.headLength } }
+pub fn body(answer: usize) -> usize { return if answer == 0 { 0 } else { answerAt(answer).*.body } }
+pub fn bodyLength(answer: usize) -> usize { return if answer == 0 { 0 } else { answerAt(answer).*.bodyLength } }
+
+pub fn release(answer: usize) -> void {
+    if answer == 0 { return }
+    if answerAt(answer).*.stream != 0 {
+        // (A body never read: its connection closed.)
+        const left: *client.Body = unsafe { @ptrFromInt(*client.Body, answerAt(answer).*.stream) }
+        client.freeBody(left)
+        std.heap.allocator().free(unsafe { @ptrFromInt([*]u8, answerAt(answer).*.stream) }, @sizeOf(client.Body), 16)
+    }
+    if answerAt(answer).*.head != 0 { free(answerAt(answer).*.head) }
+    if answerAt(answer).*.body != 0 { free(answerAt(answer).*.body) }
+    free(answer)
+}
+
+// ---------------------------------------------------------------------------
+// Cookies for scripts
+
+const Text = struct {
+    bytes: [4096]u8
+    length: usize
+}
+
+fn textWrite(context: usize, data: []const u8) -> void {
+    const text: *Text = unsafe { @ptrFromInt(*Text, context) }
+    for byte in data {
+        if text.*.length < 4096 {
+            text.*.bytes[text.*.length] = byte
+            text.*.length += 1
+        }
+    }
+}
+
+// The cookies of the jar that go with URL (a C string), as a Cookie header
+// lists them (FOR_HTTP false: those a script may see, no HttpOnly ones);
+// a C string on the C heap, or 0.
+pub fn cookiesFor(url: usize, forHttp: bool) -> usize {
+    prepare()
+    var u: uri.Uri = undefined
+    if !uri.parse(cText(url), &u) || !u.hasAuthority { return 0 }
+    const path = if u.path.length == 0 { "/" } else { u.path }
+    const req = cookiejar.Request.{ .host = uri.hostName(&u), .path = path, .https = uri.isHttps(&u), .forHttp = forHttp, .safeMethod = true, .topLevelNavigation = false, .hasTopLevel = false, .topLevelHost = "", .hasSiteForCookies = false, .siteForCookiesHost = "" }
+    var found: cookiejar.Found = undefined
+    cookiejar.cookiesFor(&jar, &req, x509.now(), &found)
+    var text: Text = undefined
+    text.length = 0
+    cookiejar.writeCookieHeader(headers.Sink.{ .context = @intFromPtr(&text), .write = textWrite }, &found)
+    cookiejar.freeFound(&jar, &found)
+    return copied(text.bytes[0..text.length])
+}
+
+// A cookie set by a script of URL: LINE as a Set-Cookie header's value.
+pub fn setCookie(url: usize, line: usize) -> void {
+    prepare()
+    var u: uri.Uri = undefined
+    if !uri.parse(cText(url), &u) || !u.hasAuthority { return }
+    const path = if u.path.length == 0 { "/" } else { u.path }
+    const origin = cookiejar.Origin.{ .host = uri.hostName(&u), .path = path, .https = uri.isHttps(&u) }
+    cookiejar.setCookie(&jar, cText(line), &origin, false, "", x509.now())
+}
+
+pub fn releaseText(text: usize) -> void { if text != 0 { free(text) } }

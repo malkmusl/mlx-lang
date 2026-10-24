@@ -8,13 +8,16 @@
 // initializers computed at start, a function listed in .init_array).
 //
 // With -c the object is written as it is (compiler/cc/ar.mlx archives
-// such objects). Otherwise the Mlx compiler's linker
-// (compiler/selfhost/object/link.mlx) joins it with the objects and
-// archives of the command line, makes _start and __mlxcc_init, and
-// writes the dynamically linked program; the names no object defines
-// come from the C library and the other libraries (-l). There is no
-// assembler in between, and the linker is the compiler's own.
+// such objects). Otherwise mlx-ld (compiler/ld/main.mlx, the Mlx
+// compiler's linker compiler/selfhost/object/link.mlx as a program of
+// its own) joins it with the objects and archives of the command line,
+// makes _start and __mlxcc_init, and writes the dynamically linked
+// program; the names no object defines come from the C library and the
+// other libraries (-l). There is no assembler in between; the linker is
+// a separate program so that a change to it relinks and compiles
+// nothing, and a change to the compiler leaves the linker's steps be.
 const base = @import("./base.mlx")
+const tokens = @import("./tokens.mlx")
 const names = @import("./names.mlx")
 const types = @import("./types.mlx")
 const ast = @import("./ast.mlx")
@@ -26,8 +29,8 @@ const encoder = @import("../../compiler/selfhost/backend/x86_64/encoder.mlx")
 const heap = @import("std.heap")
 const source = @import("../../compiler/selfhost/source.mlx")
 const relocatable = @import("../../compiler/selfhost/object/relocatable.mlx")
-const archive = @import("../../compiler/selfhost/object/archive.mlx")
-const link = @import("../../compiler/selfhost/object/link.mlx")
+const unit = @import("../../compiler/selfhost/object/unit.mlx")
+const std = @import("std")
 const vector_module = @import("../../std/bootstrap/vector.mlx")
 const table = @import("./table.mlx")
 
@@ -42,14 +45,14 @@ var lateInitializers: usize = 0
 var definitions: usize = 0
 var initName: u32 = 0
 // The libraries the program needs (DT_NEEDED): NUL-ended names' addresses.
-var libraries: usize = 0
-var libraryCount: usize = 0
+var libraries: usize = 0 // (per run)
+var libraryCount: usize = 0 // (per run)
 // The objects and archives of the command line (NUL-ended paths).
-var inputs: usize = 0
-var inputCount: usize = 0
+var inputs: usize = 0 // (per run)
+var inputCount: usize = 0 // (per run)
 // The program interpreter the executable names (NUL-ended), 0 for the
 // system's.
-var interpreter: usize = 0
+var interpreter: usize = 0 // (per run)
 // The unit's thread-local variables laid out (.tdata): its size and
 // alignment so far.
 var tlsSize: usize = 0
@@ -59,6 +62,11 @@ pub fn init() -> void {
     units = base.alloc(MAX_UNITS * 8)
     definitions = base.alloc(base.MAX_NAMES * 8)
     initName = base.intern("__mlxcc_init_unit")
+}
+
+// The link's inputs, which the command line gives: the run's own (in the
+// side memory, base.beginSide).
+pub fn initInputs() -> void {
     libraries = base.alloc(64 * 8)
     libraryCount = 0
     inputs = base.alloc(MAX_UNITS * 8)
@@ -264,7 +272,7 @@ fn placeVariable(o: usize) -> void {
     var size = types.size(obj.*.ty)
     if types.at(obj.*.ty).*.incomplete {
         // `int a[];` never completed: one element (C11 6.9.2).
-        if types.kind(obj.*.ty) != types.ARRAY { base.errorAt(obj.*.file, 0, base.join("a variable has an incomplete type: ", base.nameOf(if obj.*.linkName != 0 { obj.*.linkName } else { obj.*.name }))) }
+        if types.kind(obj.*.ty) != types.ARRAY { base.errorAt(if obj.*.file != 0 { obj.*.file } else { state.file() }, 0, base.join("a variable has an incomplete type: ", base.nameOf(if obj.*.linkName != 0 { obj.*.linkName } else { obj.*.name }))) }
         size = types.size(types.baseOf(obj.*.ty))
     }
     if size == 0 { size = 1 }
@@ -583,7 +591,7 @@ pub fn buildObject() -> *relocatable.Object {
             while v != 0 {
                 const obj = ast.obj(v)
                 if obj.*.isThreadLocal && obj.*.placed && obj.*.definition == v && obj.*.initData != 0 {
-                    if obj.*.relocations != 0 { base.errorAt(obj.*.file, 0, "a thread-local variable initialized with an address") }
+                    if obj.*.relocations != 0 { base.errorAt(if obj.*.file != 0 { obj.*.file } else { state.file() }, 0, "a thread-local variable initialized with an address") }
                     base.copy(tls_image + obj.*.dataOffset, obj.*.initData, @intCast(usize, types.size(obj.*.ty)))
                 }
                 v = obj.*.next
@@ -608,6 +616,7 @@ pub fn buildObject() -> *relocatable.Object {
                     const found = encoder.findSymbol(enc, base.pointer(base.nameAddress(obj.*.symbol)), base.nameOf(obj.*.symbol).length)
                     if found.0 {
                         obj.*.objectSymbol = 1 + relocatable.addSymbol(object, base.pointer(base.nameAddress(link_name)), name.length, bindingOf(obj), relocatable.FUNC, text, found.1, 0)
+                        addLocation(object, text, found.1, obj.*.token)
                     }
                 } else if obj.*.placed && obj.*.isThreadLocal {
                     obj.*.objectSymbol = 1 + relocatable.addSymbol(object, base.pointer(base.nameAddress(link_name)), name.length, bindingOf(obj), relocatable.TLS, tdata, obj.*.dataOffset, @intCast(usize, types.size(obj.*.ty)))
@@ -724,160 +733,134 @@ pub fn writeObject(output: []const u8) -> void {
     }
 }
 
-// Links the object with the inputs and writes the program to `output`.
-pub fn write(output: []const u8) -> void {
+// Links the object with the inputs into the program `output`: runs
+// mlx-ld (compiler/ld/main.mlx) in this process's place, as cc runs ld,
+// on the object handed over as it is in memory (unit.mlx, in a memfd:
+// no file to clean up) followed by the objects and archives of the
+// command line in order, every library the program needs as -l:SONAME,
+// --dynamic-linker, -s and -Map. mlx-ld is $MLX_LD, else the one beside
+// this program. Does not return.
+pub fn write(output: []const u8, environment: [*][*]const u8) -> void {
     const object = buildObject()
-    const allocator = heap.allocator()
-    var program_encoder: *encoder.Encoder = undefined
-    var linker: *link.Linker = undefined
-    unsafe {
-        program_encoder = @ptrFromInt(*encoder.Encoder, base.alloc(@sizeOf(encoder.Encoder)))
-        linker = @ptrFromInt(*link.Linker, base.alloc(@sizeOf(link.Linker)))
+    const linker = linkerPath(environment)
+    const made = unit.bytes(object, heap.allocator())
+    if made.0 == null { base.fatal("out of memory handing the unit to mlx-ld") }
+    const descriptor = std.linux.syscall2(SYS_memfd_create, base.keep("mlx-cc-unit"), 0)
+    if descriptor < 0 { base.fatal("cannot make the unit's memory file for mlx-ld") }
+    const file = std.fs.File.{ .descriptor = descriptor }
+    // (The bytes taken apart first: `made.0.?[...]` is read only by a
+    // newer compiler than the one these sources build.)
+    const madeBytes = made.0
+    if !std.fs.writeAll(file, madeBytes.?[0..made.1]) { base.fatal("cannot write the unit for mlx-ld") }
+    const unitPath = base.join("/proc/self/fd/", base.decimal(@intCast(u64, descriptor)))
+    const words = base.alloc((inputCount + libraryCount + 16) * 8)
+    var count: usize = 0
+    base.putWord(words + count * 8, base.keep(linker))
+    count += 1
+    base.putWord(words + count * 8, base.keep("-o"))
+    base.putWord(words + count * 8 + 8, base.keep(output))
+    count += 2
+    if interpreter != 0 {
+        base.putWord(words + count * 8, base.keep("--dynamic-linker"))
+        base.putWord(words + count * 8 + 8, interpreter)
+        count += 2
     }
-    program_encoder.* = encoder.init(allocator)
-    link.initAt(linker, allocator, program_encoder)
-    link.addObject(linker, object)
+    if stripped {
+        base.putWord(words + count * 8, base.keep("-s"))
+        count += 1
+    }
+    if mapPath != 0 {
+        base.putWord(words + count * 8, base.keep("-Map"))
+        base.putWord(words + count * 8 + 8, mapPath)
+        count += 2
+    }
+    base.putWord(words + count * 8, base.keep(unitPath))
+    count += 1
     var index: usize = 0
     while index < inputCount {
-        const path = base.getWord(inputs + index * 8)
-        const length = base.cLength(path)
-        const file = source.load(allocator, base.pointer(path), length)
-        if !file.valid {
-            base.say("mlx-cc: cannot read ")
-            base.say(base.bytes(path, length))
-            base.say("\n")
-            base.exit(1)
-        }
-        if archive.isArchive(file.bytes, file.length) {
-            if !link.addArchive(linker, file.bytes, file.length, base.pointer(path), length) { linkFailed(linker) }
-        } else {
-            const input = newObject()
-            input.*.pathPointer = base.pointer(path)
-            input.*.pathLength = length
-            if !relocatable.read(input, file.bytes, file.length) {
-                base.say("mlx-cc: not a relocatable object or an archive: ")
-                base.say(base.bytes(path, length))
-                base.say("\n")
-                base.exit(1)
-            }
-            link.addObject(linker, input)
-        }
+        base.putWord(words + count * 8, base.getWord(inputs + index * 8))
+        count += 1
         index += 1
     }
-    var needed: [*]const [*]const u8 = undefined
-    unsafe { needed = @ptrFromInt([*]const [*]const u8, libraries) }
-    const interpreter_length = if interpreter == 0 { 0 } else { base.cLength(interpreter) }
-    const interpreter_text = if interpreter == 0 { base.pointer(base.keep("")) } else { base.pointer(interpreter) }
-    if !link.writeProgram(linker, needed, libraryCount, interpreter_text, interpreter_length, base.pointer(base.keep(output))) { linkFailed(linker) }
-    if mapPath != 0 { writeLinkMap(linker, base.bytes(mapPath, base.cLength(mapPath))) }
+    // (libc.so.6, the first, mlx-ld needs by itself.)
+    index = 1
+    while index < libraryCount {
+        const soname = base.getWord(libraries + index * 8)
+        base.putWord(words + count * 8, base.keep(base.join("-l:", base.bytes(soname, base.cLength(soname)))))
+        count += 1
+        index += 1
+    }
+    base.putWord(words + count * 8, 0)
+    _ = std.linux.syscall3(std.linux.SYS_execve, base.getWord(words), words, @intFromPtr(environment))
+    base.say("mlx-cc: cannot run the linker ")
+    base.say(linker)
+    base.say(" (MLX_LD, or mlx-ld beside mlx-cc)\n")
+    base.exit(1)
+}
+
+const SYS_memfd_create: usize = 319
+const SYS_readlink: usize = 89
+
+// The linker: $MLX_LD, else mlx-ld beside this program, else mlx-ld
+// along PATH (execve then fails with the message above).
+fn linkerPath(environment: [*][*]const u8) -> []const u8 {
+    const variable = std.process.environmentFrom(environment, "MLX_LD")
+    if variable != null { return std.string.asSlice(variable.?) }
+    var buffer: [4096]u8 = undefined
+    const length = std.linux.syscall3(SYS_readlink, @intFromPtr("/proc/self/exe"), @intFromPtr(&buffer), 4095)
+    if length > 0 {
+        var view: [*]const u8 = undefined
+        unsafe { view = @ptrCast([*]const u8, &buffer) }
+        const exe = base.bytes(base.keep(view[0..@intCast(usize, length)]), @intCast(usize, length))
+        var end = exe.length
+        while end > 0 && exe[end - 1] != 47 { end -= 1 }
+        return base.join(exe[0..end], "mlx-ld")
+    }
+    return "mlx-ld"
+}
+
+// Where a function was defined: a local symbol at the function's start
+// named `@at PATH:LINE` (no C or C++ name has a space), which the linker
+// makes the program's line table of (link.mlx, .mlx_lines: the crash
+// report says the function's file and line) and leaves out of
+// everything else.
+const LOCATION_PREFIX: []const u8 = "@at "
+
+fn addLocation(object: *relocatable.Object, text: usize, offset: usize, token: usize) -> void {
+    if token == 0 { return }
+    const t = tokens.at(token)
+    if t.*.file == 0 { return }
+    const path = base.nameOf(base.fileName(@intCast(u32, t.*.file)))
+    const located = base.join(base.join(LOCATION_PREFIX, path), base.join(":", base.decimal(@intCast(u64, t.*.line))))
+    const ignored = relocatable.addSymbol(object, located.pointer, located.length, relocatable.LOCAL, relocatable.NOTYPE, text, offset, 0)
 }
 
 // -Wl,-Map=FILE: the program's functions by where they are, a line
 // each (the offset in the code in hex, which _start, the entry point,
 // begins; the name).
-var mapPath: usize = 0
+var mapPath: usize = 0 // (per run)
 pub fn setMapPath(path: []const u8) -> void { mapPath = base.keep(path) }
 
-// `OFFSET TEXT\n` at `at` (the offset in 16 hex digits); where the
-// next line begins.
-fn mapLine(buffer: usize, start: usize, value: usize, text: [*]const u8, length: usize) -> usize {
-    var at = start
-    var shift: i64 = 60
-    while shift >= 0 {
-        const digit = @intCast(u8, (value >> @intCast(u6, shift)) & 15)
-        base.put8(buffer + at, if digit < 10 { 48 + digit } else { 87 + digit })
-        at += 1
-        shift -= 4
-    }
-    base.put8(buffer + at, 32)
-    at += 1
-    var c: usize = 0
-    while c < length {
-        base.put8(buffer + at, text[c])
-        at += 1
-        c += 1
-    }
-    base.put8(buffer + at, 10)
-    return at + 1
-}
-
-fn writeLinkMap(linker: *link.Linker, path: []const u8) -> void {
-    var size: usize = 0
-    var index: usize = 0
-    while index < link.objectCount(linker) {
-        const object = link.objectAt(linker, index)
-        if object.*.included {
-            size += object.*.pathLength + 26
-            var s: usize = 0
-            while s < relocatable.symbolCount(object) {
-                size += relocatable.symbolAt(object, s).*.nameLength + 18
-                s += 1
-            }
-        }
-        index += 1
-    }
-    const buffer = base.alloc(size + 16)
-    var at: usize = 0
-    index = 0
-    while index < link.objectCount(linker) {
-        const object = link.objectAt(linker, index)
-        if object.*.included {
-            // Where the object's code begins: `OFFSET @object PATH`.
-            const text = relocatable.sectionOfKind(object, relocatable.TEXT)
-            if text != relocatable.NONE {
-                at = mapLine(buffer, at, relocatable.sectionAt(object, text).*.placed, base.pointer(base.keep("@object ")), 8)
-                var c: usize = 0
-                while c < object.*.pathLength {
-                    base.put8(buffer + at - 1 + c, object.*.pathPointer[c])
-                    c += 1
-                }
-                base.put8(buffer + at - 1 + c, 10)
-                at += c
-            }
-            var s: usize = 0
-            while s < relocatable.symbolCount(object) {
-                const symbol = relocatable.symbolAt(object, s)
-                s += 1
-                if symbol.*.section == relocatable.NONE || symbol.*.section == relocatable.ABSOLUTE || symbol.*.nameLength == 0 { continue }
-                const section = relocatable.sectionAt(object, symbol.*.section)
-                if section.*.kind != relocatable.TEXT { continue }
-                const value = section.*.placed + symbol.*.value
-                var shift: i64 = 60
-                while shift >= 0 {
-                    const digit = @intCast(u8, (value >> @intCast(u6, shift)) & 15)
-                    base.put8(buffer + at, if digit < 10 { 48 + digit } else { 87 + digit })
-                    at += 1
-                    shift -= 4
-                }
-                base.put8(buffer + at, 32)
-                at += 1
-                var c: usize = 0
-                while c < symbol.*.nameLength {
-                    base.put8(buffer + at, symbol.*.namePointer[c])
-                    at += 1
-                    c += 1
-                }
-                base.put8(buffer + at, 10)
-                at += 1
-            }
-        }
-        index += 1
-    }
-    if !relocatable.writeFile(base.pointer(base.keep(path)), base.pointer(buffer), at) {
-        base.say("mlx-cc: cannot write the link map\n")
-    }
-}
+// -s, --strip-all: the program without its symbol table and line table.
+var stripped = false // (per run)
+pub fn setStripped() -> void { stripped = true }
 
 // Writes `length` bytes at `address` to the file `path`.
 pub fn writeBytes(path: []const u8, address: usize, length: usize) -> bool {
     return relocatable.writeFile(base.pointer(base.keep(path)), base.pointer(address), length)
 }
 
-fn linkFailed(linker: *link.Linker) -> void {
-    base.say("mlx-cc: ")
-    base.say(link.errorMessage(linker))
-    base.say(" ")
-    base.say(link.errorName(linker))
-    base.say("\n")
-    base.exit(1)
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepState() -> void {
+    base.keepState(@intFromPtr(&units), @sizeOf(@typeOf(units)))
+    base.keepState(@intFromPtr(&unitCount), @sizeOf(@typeOf(unitCount)))
+    base.keepState(@intFromPtr(&lateInitializers), @sizeOf(@typeOf(lateInitializers)))
+    base.keepState(@intFromPtr(&definitions), @sizeOf(@typeOf(definitions)))
+    base.keepState(@intFromPtr(&initName), @sizeOf(@typeOf(initName)))
+    base.keepState(@intFromPtr(&tlsSize), @sizeOf(@typeOf(tlsSize)))
+    base.keepState(@intFromPtr(&tlsAlignment), @sizeOf(@typeOf(tlsAlignment)))
+    base.keepState(@intFromPtr(&globalInits), @sizeOf(@typeOf(globalInits)))
+    base.keepState(@intFromPtr(&globalInitsTail), @sizeOf(@typeOf(globalInitsTail)))
+    base.keepState(@intFromPtr(&sectionAlignment), @sizeOf(@typeOf(sectionAlignment)))
 }
+// --- end of prefix snapshot state ---
