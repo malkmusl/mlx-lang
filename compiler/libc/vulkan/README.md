@@ -40,3 +40,9 @@ tools/check_mlx_vulkan.sh                # the headers in C and C++, a buffer fi
   command buffers) and those only a loader answers (versions, layers,
   instance extensions). `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`
   give the driver's own functions but for those.
+- **Tracing**: with `MLX_VULKAN_TRACE` set, each command called through
+  the tables is written on the standard error with its first argument
+  (`vulkan: vkCmdDraw 0x...`): what a crash in the driver came after.
+  Then `vkGetDeviceProcAddr` gives this library's functions too, so that
+  the commands a program calls through pointers it asked for are said
+  as well.
