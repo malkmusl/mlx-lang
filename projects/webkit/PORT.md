@@ -577,8 +577,8 @@ then damages and commits it.
 Since M8 accelerated compositing is on (`MlxLayerTreeHost::configure`:
 accelerated compositing, forced compositing mode, fixed position layers,
 asynchronous frame and overflow scrolling, damage propagation), on the
-GPU since its third part ("On the GPU" below), on the CPU where there is
-no Vulkan device, where the device is a CPU's, or when asked. What WebKit has for it, and what the
+GPU since its third part ("On the GPU" below), on any Vulkan device
+(software ones too), on the CPU where there is none or when asked. What WebKit has for it, and what the
 port takes:
 
 - **The layers: WebKit's coordinated graphics, as they are.**
@@ -608,7 +608,10 @@ port takes:
   composes on the GPU. `ProcessCapabilities::setCanUseAcceleratedBuffers(false)`:
   no canvas or image buffer is painted on the GPU; layers' tiles only
   with `MLX_PAINTING=gpu` (Ganesh over ANGLE, a GL context per painting
-  thread: "What M8's third part leaves").
+  thread: "What M8's third part leaves"), and only then has the display a
+  Skia context (`PlatformDisplay::skiaGLContext`, the port's): WebKit
+  accelerates a canvas' buffers (`RenderingPurpose::Canvas`, a WebGL
+  canvas drawn into a 2D one) whenever there is one.
 - **The tiles' painting, the port's** (WebKit's files take GL for
   granted): `SkiaPaintingEngineMlx.cpp` records a layer's dirty region on
   the main thread (`GraphicsContextSkia` over an `SkPictureRecorder`) and
@@ -672,22 +675,25 @@ port takes:
   pointer to the member taken in an explicit instantiation), the
   background cleared darkened. WebGL canvases are textures in the same
   share group ("WebGL"). The CPU's compositor stays: no Vulkan device
-  (no display or no context), a software one (ANGLE's EGL device's
-  `VkPhysicalDevice`, EGL_ANGLE_device_vulkan, whose
+  (no display or no context), `MLX_COMPOSITING=cpu`, or an embedder's
+  `MlxLayerTreeHost::setGPUCompositingAllowed(false)` (Voyager's
+  `--no-gpu-compositing`). A software device (lavapipe, llvmpipe,
+  SwiftShader) composes on the GPU too; the trace says it is one (ANGLE's
+  EGL device's `VkPhysicalDevice`, EGL_ANGLE_device_vulkan, whose
   `VkPhysicalDeviceProperties::deviceType` is
-  `VK_PHYSICAL_DEVICE_TYPE_CPU`: lavapipe, llvmpipe, SwiftShader;
-  port/angle/vulkan_device_type.cpp), `MLX_COMPOSITING=cpu`, or an
-  embedder's `MlxLayerTreeHost::setGPUCompositingAllowed(false)`
-  (Voyager's `--no-gpu-compositing`). `MLX_COMPOSITING=gpu` composes on
-  the GPU on any device: the checks (tools/check_webkit_mlx_*.sh,
-  check_voyager.sh) set it unless told otherwise, so the GPU's path stays
-  tested on lavapipe. On lavapipe the CPU's compositor is the faster
-  (a frame of the animation page 4.5 against 5.4 ms, of a page scrolled
-  by whole views 4.8 against 12.1 ms, half the memory), WebGL's pages
-  aside (the drawing buffer read back each frame on the main thread:
-  about 35 frames a second against 55). WebGL uses ANGLE on whatever
-  device there is either way. `MLX_TRACE_COMPOSITOR` names the renderer
-  (or why the CPU's) and each frame's path; Voyager's `VOYAGER_TRACE`
+  `VK_PHYSICAL_DEVICE_TYPE_CPU`; port/angle/vulkan_device_type.cpp). The
+  checks (tools/check_webkit_mlx_*.sh, check_voyager.sh) run the default,
+  and with `MLX_COMPOSITING=cpu` the CPU's compositor. On lavapipe, the
+  GPU's compositor with its asynchronous reads: a frame of the animation
+  page 1.7 ms (0.45 of it the read), of a page scrolled by whole views
+  3.9 ms (0.8), of the WebGL page 1.5 ms (0.4), at the display's 60
+  frames a second. WebGL uses ANGLE on whatever
+  device there is either way. A WebGL context made current tells WebKit's
+  GLContexts so (GLContextWrapper's current context dropped, as
+  upstream's GraphicsContextGLTextureMapperANGLE is one): else Skia's or
+  the compositor's context, current before, was taken for current still
+  and their calls went to WebGL's. `MLX_TRACE_COMPOSITOR` names the renderer
+  and the Vulkan device (or why the CPU's) and each frame's path; Voyager's `VOYAGER_TRACE`
   says where its tabs compose and why.
 - **The frame clock: `MlxDisplayLink`**, a thread ticking at the
   display's rate (60 Hz; `MLX_REFRESH_RATE` 1 to 240), started only while

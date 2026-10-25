@@ -20,6 +20,8 @@
 #include "GLDisplay.h"
 #include "PlatformDisplay.h"
 #include <EGL/egl.h>
+#include <stdlib.h>
+#include <string.h>
 #include <wtf/MainThread.h>
 #include <wtf/NeverDestroyed.h>
 #include <wtf/TZoneMallocInlines.h>
@@ -85,8 +87,16 @@ public:
 };
 static thread_local std::unique_ptr<MlxSkiaGLContext> s_skiaGLContext;
 
+bool mlxGPUPaintingWanted()
+{
+    const char* painting = getenv("MLX_PAINTING");
+    return painting && !strcmp(painting, "gpu");
+}
+
 GLContext* PlatformDisplay::skiaGLContext()
 {
+    if (!mlxGPUPaintingWanted())
+        return nullptr;
     if (!s_skiaGLContext) {
         s_skiaGLContext = makeUnique<MlxSkiaGLContext>();
         auto glContext = GLContext::createOffscreen(*this);

@@ -167,6 +167,15 @@ GraphicsContextGLANGLE::~GraphicsContextGLANGLE()
 
 bool GraphicsContextGLANGLE::makeContextCurrent()
 {
+    // WebKit's GLContexts (Skia's, the compositor's, the painting
+    // threads') keep which of them is current on the thread
+    // (GLContextWrapper) and skip eglMakeCurrent when it is theirs: one
+    // made current before WebGL's would be taken for current still, and
+    // Skia's calls (a WebGL canvas drawn into a 2D one with the GPU's
+    // compositor on) would go to WebGL's context. (Upstream's
+    // GraphicsContextGLTextureMapperANGLE is a GLContextWrapper itself.)
+    if (auto* current = GLContextWrapper::currentContext())
+        current->didUnmakeContextCurrent();
     if (EGL_GetCurrentContext() == m_contextObj)
         return true;
     return EGL_MakeCurrent(m_displayObj, EGL_NO_SURFACE, EGL_NO_SURFACE, m_contextObj);

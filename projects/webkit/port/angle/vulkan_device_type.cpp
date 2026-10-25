@@ -1,8 +1,7 @@
 // The kind of ANGLE's Vulkan device, for the port (PORT.md, "Compositing"):
-// the compositor composes on the GPU by default unless the device is a
-// CPU's (VK_PHYSICAL_DEVICE_TYPE_CPU: lavapipe, llvmpipe, SwiftShader),
-// where TextureMapper's frames and their read back cost more than the
-// CPU's compositor. GraphicsContextGLMlx.cpp asks ANGLE's EGL device for
+// the compositor composes on the GPU on any device and names it, and
+// whether it is a CPU's (VK_PHYSICAL_DEVICE_TYPE_CPU: lavapipe, llvmpipe,
+// SwiftShader), in its trace. GraphicsContextGLMlx.cpp asks ANGLE's EGL device for
 // its VkPhysicalDevice (EGL_ANGLE_device_vulkan) and asks here, where
 // vulkan/vulkan.h is (mlx-vulkan's: libANGLE.a's sources have it).
 #include <string.h>

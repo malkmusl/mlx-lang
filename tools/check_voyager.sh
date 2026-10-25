@@ -112,7 +112,7 @@
 #      the canvas (its green, 300x300 where the page puts it) and the
 #      triangle's red in it. Skipped, said, on a machine without a Vulkan
 #      driver.
-#  25. on the GPU's compositor (MLX_COMPOSITING=gpu, the check's default),
+#  25. on the GPU's compositor (the default; skipped with MLX_COMPOSITING=cpu),
 #      tabs of the animation page opened, then closed (the first of them
 #      too): the textures of the compositors' share group (the engine's
 #      "textures T") come back to one tab's (BitmapTexturePool's unused
@@ -125,10 +125,6 @@ set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
-# The GPU's compositor, also on a software Vulkan device (lavapipe), where
-# the port composes on the CPU by default; MLX_COMPOSITING=cpu checks the
-# CPU's.
-export MLX_COMPOSITING=${MLX_COMPOSITING:-gpu}
 fail() { echo "FAIL $1" >&2; exit 1; }
 build=1
 keep=""
@@ -806,7 +802,7 @@ else
     # (whose compositor asked for textures first) and two others closed;
     # the textures in the share group ("textures T" in the engine's
     # counts) come back to the one tab's.
-    if [[ $MLX_COMPOSITING == gpu ]]; then
+    if [[ ${MLX_COMPOSITING:-} != cpu ]]; then
         write_runner "$work/voyager-pool" animation.html
         {
             echo "wait 8000"

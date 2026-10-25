@@ -358,13 +358,11 @@ void MlxLayerTreeHost::setGPUCompositingAllowed(bool allowed)
     s_gpuCompositingAllowed = allowed;
 }
 
-// Whether a host is to compose on the GPU, and why (compositingChoice):
+// Whether a host is to compose on the GPU, and why (compositingReason):
 // MLX_COMPOSITING=cpu, or the embedder's setGPUCompositingAllowed(false),
-// the CPU; MLX_COMPOSITING=gpu, the GPU whatever the device; otherwise
-// the GPU unless ANGLE's Vulkan device is a CPU's (lavapipe, llvmpipe,
-// SwiftShader: TextureMapper's frames and their read back cost more there
-// than the CPU's compositor). WebGL uses ANGLE on whatever device there
-// is either way.
+// the CPU; without a Vulkan device (no ANGLE display), the CPU; otherwise
+// the GPU, on any Vulkan device, software ones (lavapipe, llvmpipe,
+// SwiftShader) included: the reason names the device and its type.
 static bool gpuCompositingWanted(String& reason)
 {
     const char* mode = getenv("MLX_COMPOSITING");
@@ -376,20 +374,13 @@ static bool gpuCompositingWanted(String& reason)
         reason = "the embedder's choice"_s;
         return false;
     }
-    if (mode && !strcmp(mode, "gpu")) {
-        reason = "MLX_COMPOSITING=gpu"_s;
-        return true;
-    }
     if (!mlxANGLEDisplay()) {
         reason = "no Vulkan device"_s;
         return false;
     }
     const char* device = "";
-    if (mlxANGLEDeviceIsCPU(&device)) {
-        reason = makeString("a software Vulkan device, "_s, String::fromLatin1(device), "; MLX_COMPOSITING=gpu composes there"_s);
-        return false;
-    }
-    reason = makeString("Vulkan device "_s, String::fromLatin1(device));
+    bool software = mlxANGLEDeviceIsCPU(&device);
+    reason = makeString("Vulkan device "_s, String::fromLatin1(device), software ? " (a CPU's)"_s : ""_s);
     return true;
 }
 
@@ -646,16 +637,15 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
     // Skia context's proxy. Not by default: Ganesh's SkSL compiler, as
     // mlx-cc compiles it, fails on its GPU module; PORT.md.)
     if (m_onGPU) {
-        const char* painting = getenv("MLX_PAINTING");
         auto& display = PlatformDisplay::sharedDisplay();
-        bool onGPU = painting && !strcmp(painting, "gpu") && display.skiaGLContext() && display.skiaGrContext();
+        bool onGPU = mlxGPUPaintingWanted() && display.skiaGLContext() && display.skiaGrContext();
         if (onGPU)
             m_paintingEngine = SkiaPaintingEngine::create(display.skiaGrContext()->threadSafeProxy());
         if (getenv("MLX_TRACE_COMPOSITOR"))
             fprintf(stderr, "compositor's tiles painted on the %s\n", onGPU ? "GPU" : "CPU");
     }
-    if (!m_onGPU && getenv("MLX_TRACE_COMPOSITOR"))
-        fprintf(stderr, "compositor on the CPU: %s\n", m_compositingReason.utf8().data());
+    if (getenv("MLX_TRACE_COMPOSITOR"))
+        fprintf(stderr, "compositor on the %s: %s\n", m_onGPU ? "GPU" : "CPU", m_compositingReason.utf8().data());
     if (m_onGPU) {
         m_globalDamage = std::make_shared<Damage>(IntSize(1, 1));
         m_rootLayer->setDamageInGlobalCoordinateSpace(m_globalDamage);

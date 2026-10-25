@@ -20,7 +20,7 @@
 // WebKit's TextureMapper composes them into a framebuffer of the view's
 // size, of which each frame's damage is read back into the raster frame
 // (Threaded: asynchronously, the frame ready when its read is done).
-// On the CPU (no Vulkan device or a CPU's, setGPUCompositingAllowed(false),
+// On the CPU (no Vulkan device, setGPUCompositingAllowed(false),
 // MLX_COMPOSITING=cpu): SkiaCompositingLayer composes the layers straight
 // into the raster frame.
 //
@@ -92,8 +92,8 @@ public:
     static void configure(Settings&);
 
     // Whether hosts made from now on may compose on the GPU (true by
-    // default: on the GPU when a display exists and its Vulkan device is
-    // not a CPU's, or MLX_COMPOSITING=gpu; MLX_COMPOSITING=cpu never);
+    // default: on the GPU when a display exists, on any Vulkan device,
+    // software ones included; MLX_COMPOSITING=cpu never);
     // false is the CPU's compositor (an embedder's --no-gpu-compositing).
     static void setGPUCompositingAllowed(bool);
     // Whether this host composes on the GPU.

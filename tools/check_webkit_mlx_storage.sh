@@ -32,10 +32,6 @@ set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
-# The GPU's compositor, also on a software Vulkan device (lavapipe), where
-# the port composes on the CPU by default; MLX_COMPOSITING=cpu checks the
-# CPU's.
-export MLX_COMPOSITING=${MLX_COMPOSITING:-gpu}
 layout=projects/webkit/tests/layout
 work=$(mktemp -d /tmp/mlx-webkit-storage.XXXXXX)
 trap 'rm -rf -- "$work"' EXIT
