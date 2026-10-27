@@ -138,6 +138,9 @@ public:
     // rectangles that changed since the last take (all of it after a
     // resize or a first take); false when no frame is composed yet.
     bool takeFrame(uint32_t* pixels, int width, int height, int stride, Vector<IntRect>& damage);
+    // Whether takeFrame's frame is copied into the pixels by the GPU (the
+    // pixels then memory the GPU can import: a wl_shm pool's).
+    bool presentsDirectly() const { return m_presentsDirectly; }
     // Whether a frame was composed since the last take.
     bool hasNewFrame() const { return m_newFrame.load(); }
 
@@ -173,6 +176,8 @@ public:
     bool displayLinkFired(MonotonicTime);
 
 private:
+    bool presentFrame(uint32_t* pixels, int width, int height, int stride, Vector<IntRect>& damage);
+
     // GraphicsLayerFactory
     Ref<GraphicsLayer> createGraphicsLayer(GraphicsLayer::Type, GraphicsLayerClient&) final;
 
@@ -270,6 +275,9 @@ private:
     bool m_onGPU { false };
     // (On the GPU, Threaded: frames read back asynchronously.)
     bool m_asynchronousReads { false };
+    // (On the GPU in the Threaded mode, the frame copied by the GPU into
+    // the embedder's buffer when it is taken: presentFrame.)
+    bool m_presentsDirectly { false };
     bool m_readPollScheduled { false };
     String m_compositingReason;
     // (On the GPU: the damage the layers' TextureMapperLayers infer in the

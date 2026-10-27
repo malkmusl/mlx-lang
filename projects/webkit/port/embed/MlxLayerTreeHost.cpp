@@ -41,6 +41,8 @@
 #include "port/platform/graphics/mlx/MlxDarkMode.h"
 #include "port/platform/graphics/mlx/PlatformDisplayMlx.h"
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <skia/core/SkCanvas.h>
 #include <skia/core/SkImage.h>
 #include <skia/core/SkSurface.h>
@@ -54,6 +56,25 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
 #include <wtf/SetForScope.h>
 #include <wtf/text/MakeString.h>
 #include <wtf/Threading.h>
+
+// ANGLE's EGL and GL entry points for the direct presentation
+// (EGL_ANGLE_device_vulkan, EGL_ANGLE_vulkan_image, GL_ANGLE_vulkan_image)
+// and its Vulkan side (port/angle/vulkan_present.cpp).
+extern "C" {
+EGLBoolean EGLAPIENTRY eglQueryDisplayAttribEXT(EGLDisplay, EGLint, EGLAttrib*);
+EGLBoolean EGLAPIENTRY eglQueryDeviceAttribEXT(EGLDeviceEXT, EGLint, EGLAttrib*);
+EGLImageKHR EGLAPIENTRY eglCreateImageKHR(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer, const EGLint*);
+EGLBoolean EGLAPIENTRY eglDestroyImageKHR(EGLDisplay, EGLImageKHR);
+void EGLAPIENTRY eglLockVulkanQueueANGLE(EGLDisplay);
+void EGLAPIENTRY eglUnlockVulkanQueueANGLE(EGLDisplay);
+void GL_APIENTRY glEGLImageTargetTexture2DOES(GLenum, GLeglImageOES);
+void GL_APIENTRY glAcquireTexturesANGLE(GLuint, const GLuint*, const GLenum*);
+void GL_APIENTRY glReleaseTexturesANGLE(GLuint, const GLuint*, GLenum*);
+void* mlxVulkanPresenterCreate(void* physicalDevice, void* device, void* queue, uint32_t family);
+void mlxVulkanPresenterDestroy(void*);
+bool mlxVulkanPresenterMakeImage(void*, int width, int height, void** image, const void** info);
+bool mlxVulkanPresenterCopy(void*, uint32_t glLayout, uint32_t* layoutAfter, uint32_t* pixels, int width, int height, int stride, void (*lock)(void*), void (*unlock)(void*), void*);
+}
 
 namespace WebCore {
 
@@ -401,8 +422,15 @@ public:
     GLuint depthStencil { 0 };
     IntSize size;
     Vector<uint32_t> rows;
+    // The direct presentation (port/angle/vulkan_present.cpp): the frame a
+    // VkImage of the port's on ANGLE's device, copied on ANGLE's queue into
+    // the window's buffer imported as host memory. Null when the device
+    // cannot (or MLX_COMPOSITOR_PRESENT=read).
+    void* presenter { nullptr };
+    EGLDisplay eglDisplay { EGL_NO_DISPLAY };
+    EGLImageKHR presentImage { EGL_NO_IMAGE_KHR };
 
-    static std::unique_ptr<GPUCompositor> create()
+    static std::unique_ptr<GPUCompositor> create(bool present)
     {
         auto& display = PlatformDisplay::sharedDisplay();
         auto context = GLContext::create(display.glDisplay(), GLContext::Target::Surfaceless, display.sharingGLContext());
@@ -416,9 +444,65 @@ public:
         auto* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
         const char* readMode = getenv("MLX_COMPOSITOR_READ");
         compositor->asynchronous = version && strstr(version, "OpenGL ES 3") && !(readMode && !strcmp(readMode, "sync"));
+        const char* presentMode = getenv("MLX_COMPOSITOR_PRESENT");
+        if (present && !(presentMode && !strcmp(presentMode, "read")))
+            compositor->startPresenter(display.eglDisplay());
         if (getenv("MLX_TRACE_COMPOSITOR"))
-            fprintf(stderr, "compositor on the GPU: %s (%s, %s reads)\n", reinterpret_cast<const char*>(glGetString(GL_RENDERER)), version ? version : "", compositor->asynchronous ? "asynchronous" : "synchronous");
+            fprintf(stderr, "compositor on the GPU: %s (%s, %s)\n", reinterpret_cast<const char*>(glGetString(GL_RENDERER)), version ? version : "", compositor->presenter ? "frames copied into the window's buffer on the GPU" : compositor->asynchronous ? "asynchronous reads" : "synchronous reads");
         return compositor;
+    }
+
+    // The presenter on ANGLE's VkDevice (its handles from EGL's device),
+    // when ANGLE has EGL_ANGLE_vulkan_image and GL_ANGLE_vulkan_image and
+    // the device imports host memory.
+    void startPresenter(EGLDisplay display)
+    {
+        const char* eglExtensions = eglQueryString(display, EGL_EXTENSIONS);
+        const char* glExtensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+        if (!eglExtensions || !strstr(eglExtensions, "EGL_ANGLE_vulkan_image") || !glExtensions || !strstr(glExtensions, "GL_ANGLE_vulkan_image"))
+            return;
+        EGLAttrib device = 0;
+        EGLAttrib physicalDevice = 0;
+        EGLAttrib vulkanDevice = 0;
+        EGLAttrib queue = 0;
+        EGLAttrib family = 0;
+        if (!eglQueryDisplayAttribEXT(display, EGL_DEVICE_EXT, &device) || !device)
+            return;
+        auto eglDevice = reinterpret_cast<EGLDeviceEXT>(device);
+        if (!eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_PHYSICAL_DEVICE_ANGLE, &physicalDevice) || !eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_DEVICE_ANGLE, &vulkanDevice)
+            || !eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_QUEUE_ANGLE, &queue) || !eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_QUEUE_FAMILIY_INDEX_ANGLE, &family))
+            return;
+        presenter = mlxVulkanPresenterCreate(reinterpret_cast<void*>(physicalDevice), reinterpret_cast<void*>(vulkanDevice), reinterpret_cast<void*>(queue), static_cast<uint32_t>(family));
+        if (presenter)
+            eglDisplay = display;
+    }
+
+    void stopPresenter()
+    {
+        if (presentImage != EGL_NO_IMAGE_KHR)
+            eglDestroyImageKHR(eglDisplay, presentImage);
+        presentImage = EGL_NO_IMAGE_KHR;
+        mlxVulkanPresenterDestroy(presenter);
+        presenter = nullptr;
+    }
+
+    // The frame's WIDTH x HEIGHT top left into PIXELS (STRIDE words a row:
+    // the window's buffer) by the GPU; false when it cannot (the caller
+    // reads it instead).
+    bool present(uint32_t* pixels, int width, int height, int stride)
+    {
+        if (!presenter || presentImage == EGL_NO_IMAGE_KHR || !color)
+            return false;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        GLenum layout = GL_NONE;
+        glReleaseTexturesANGLE(1, &color, &layout);
+        uint32_t after = layout;
+        auto lock = [](void* display) { eglLockVulkanQueueANGLE(static_cast<EGLDisplay>(display)); };
+        auto unlock = [](void* display) { eglUnlockVulkanQueueANGLE(static_cast<EGLDisplay>(display)); };
+        bool copied = mlxVulkanPresenterCopy(presenter, layout, &after, pixels, std::min(width, size.width()), std::min(height, size.height()), stride, lock, unlock, eglDisplay);
+        GLenum acquired = after;
+        glAcquireTexturesANGLE(1, &color, &acquired);
+        return copied;
     }
 
     ~GPUCompositor()
@@ -427,6 +511,8 @@ public:
             return;
         textureMapper = nullptr;
         deleteTarget();
+        if (presenter)
+            stopPresenter();
         for (auto& read : reads) {
             if (read.fence)
                 glDeleteSync(read.fence);
@@ -443,6 +529,9 @@ public:
             glDeleteTextures(1, &color);
         if (depthStencil)
             glDeleteRenderbuffers(1, &depthStencil);
+        if (presentImage != EGL_NO_IMAGE_KHR)
+            eglDestroyImageKHR(eglDisplay, presentImage);
+        presentImage = EGL_NO_IMAGE_KHR;
         framebuffer = color = depthStencil = 0;
         size = { };
     }
@@ -463,7 +552,8 @@ public:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size.width(), size.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        if (!makePresentImage())
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size.width(), size.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glBindTexture(GL_TEXTURE_2D, 0);
         glGenRenderbuffers(1, &depthStencil);
         glBindRenderbuffer(GL_RENDERBUFFER, depthStencil);
@@ -475,6 +565,37 @@ public:
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthStencil);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthStencil);
         return true;
+    }
+
+    // The bound texture's storage the presenter's image (BGRA, the window's
+    // words), when there is a presenter; without one, or when ANGLE does
+    // not take the image, false (and no presenter from then on).
+    bool makePresentImage()
+    {
+        if (!presenter)
+            return false;
+        void* image = nullptr;
+        const void* info = nullptr;
+        if (mlxVulkanPresenterMakeImage(presenter, size.width(), size.height(), &image, &info)) {
+            auto address = reinterpret_cast<uint64_t>(info);
+            const EGLint attributes[] = {
+                EGL_VULKAN_IMAGE_CREATE_INFO_HI_ANGLE, static_cast<EGLint>(address >> 32),
+                EGL_VULKAN_IMAGE_CREATE_INFO_LO_ANGLE, static_cast<EGLint>(address & 0xFFFFFFFF),
+                EGL_NONE
+            };
+            presentImage = eglCreateImageKHR(eglDisplay, EGL_NO_CONTEXT, EGL_VULKAN_IMAGE_ANGLE, reinterpret_cast<EGLClientBuffer>(&image), attributes);
+            if (presentImage != EGL_NO_IMAGE_KHR) {
+                glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, presentImage);
+                if (glGetError() == GL_NO_ERROR)
+                    return true;
+                eglDestroyImageKHR(eglDisplay, presentImage);
+                presentImage = EGL_NO_IMAGE_KHR;
+            }
+        }
+        if (getenv("MLX_TRACE_COMPOSITOR"))
+            fprintf(stderr, "compositor: ANGLE takes no image of the presenter's: frames read back\n");
+        stopPresenter();
+        return false;
     }
 
     // Asynchronous reads (GLES 3's pixel pack buffers and fences: ANGLE's
@@ -623,10 +744,11 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
         m_compositorQueue = WorkQueue::create("MlxCompositor"_s);
     if (gpu) {
         m_compositorQueue->dispatchSync([this] {
-            m_gpu = GPUCompositor::create();
+            m_gpu = GPUCompositor::create(m_mode == Mode::Threaded);
         });
         m_onGPU = !!m_gpu;
-        m_asynchronousReads = m_onGPU && m_mode == Mode::Threaded && m_gpu->asynchronous;
+        m_presentsDirectly = m_onGPU && m_mode == Mode::Threaded && m_gpu->presenter;
+        m_asynchronousReads = m_onGPU && m_mode == Mode::Threaded && m_gpu->asynchronous && !m_presentsDirectly;
         if (!m_onGPU)
             m_compositingReason = "no GL context on ANGLE's display"_s;
         if (!m_onGPU && m_mode == Mode::Synchronous)
@@ -1333,7 +1455,10 @@ void MlxLayerTreeHost::renderFrame()
                     valid = false;
                 IntRect changed = valid && damage ? damage->bounds() : IntRect({ }, size);
                 composed = MonotonicTime::now();
-                m_gpu->read(changed, m_framePixels.mutableSpan().data(), size.width());
+                // (Presented directly: the embedder's take of the frame
+                // copies it on the GPU into the window's buffer.)
+                if (!m_presentsDirectly)
+                    m_gpu->read(changed, m_framePixels.mutableSpan().data(), size.width());
             } else {
                 auto info = SkImageInfo::MakeN32Premul(size.width(), size.height());
                 auto surface = SkSurfaces::WrapPixels(info, m_framePixels.mutableSpan().data(), static_cast<size_t>(size.width()) * 4);
@@ -1514,6 +1639,8 @@ void MlxLayerTreeHost::setFrameReadyCallback(Function<void()>&& callback)
 
 bool MlxLayerTreeHost::takeFrame(uint32_t* pixels, int width, int height, int stride, Vector<IntRect>& damage)
 {
+    if (m_presentsDirectly)
+        return presentFrame(pixels, width, height, stride, damage);
     Locker locker { m_frameLock };
     m_newFrame = false;
     if (!(m_asynchronousReads ? m_frameReadable : m_frameValid) || m_frameSize.isEmpty())
@@ -1538,6 +1665,42 @@ bool MlxLayerTreeHost::takeFrame(uint32_t* pixels, int width, int height, int st
     m_frameDamage = { };
     m_frameDamageFull = false;
     return true;
+}
+
+// The frame taken directly (m_presentsDirectly): on the compositor's
+// thread, between its frames, the last frame copied by the GPU into PIXELS
+// (the window's buffer, imported into ANGLE's device), what is past the
+// frame white; read back there if the copy fails.
+bool MlxLayerTreeHost::presentFrame(uint32_t* pixels, int width, int height, int stride, Vector<IntRect>& damage)
+{
+    bool taken = false;
+    m_compositorQueue->dispatchSync([&] {
+        Locker locker { m_frameLock };
+        m_newFrame = false;
+        if (!m_frameValid || m_frameSize.isEmpty() || !m_gpu || !m_gpu->context->makeContextCurrent())
+            return;
+        int copyWidth = std::min(width, m_frameSize.width());
+        int copyHeight = std::min(height, m_frameSize.height());
+        static bool trace = getenv("MLX_TRACE_COMPOSITOR");
+        auto started = MonotonicTime::now();
+        if (!m_gpu->present(pixels, copyWidth, copyHeight, stride))
+            m_gpu->read(IntRect(0, 0, copyWidth, copyHeight), pixels, stride);
+        if (trace)
+            fprintf(stderr, "compositor present %.1f ms\n", (MonotonicTime::now() - started).milliseconds());
+        for (int y = 0; y < height; ++y) {
+            uint32_t* row = pixels + static_cast<size_t>(y) * stride;
+            for (int x = y < copyHeight ? copyWidth : 0; x < width; ++x)
+                row[x] = 0xFFFFFFFF;
+        }
+        if (m_frameDamageFull || m_frameSize != IntSize(width, height))
+            damage = { IntRect(0, 0, width, height) };
+        else
+            damage = WTF::move(m_frameDamage);
+        m_frameDamage = { };
+        m_frameDamageFull = false;
+        taken = true;
+    });
+    return taken;
 }
 
 void MlxLayerTreeHost::composite(SkCanvas& canvas, Vector<IntRect>* damage)
