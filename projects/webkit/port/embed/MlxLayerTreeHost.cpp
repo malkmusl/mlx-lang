@@ -444,9 +444,18 @@ public:
         auto* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
         const char* readMode = getenv("MLX_COMPOSITOR_READ");
         compositor->asynchronous = version && strstr(version, "OpenGL ES 3") && !(readMode && !strcmp(readMode, "sync"));
+        // (Presented directly on a GPU, unless MLX_COMPOSITOR_PRESENT=read;
+        // on a CPU's device only with MLX_COMPOSITOR_PRESENT=gpu: there
+        // the copy is the processor's too, and the take waits for the
+        // frame's drawing, which the asynchronous read leaves to the
+        // device's threads: on lavapipe a frame of the animation page took
+        // 5.6 ms of the main thread presented, 2.4 ms read back.)
         const char* presentMode = getenv("MLX_COMPOSITOR_PRESENT");
-        if (present && !(presentMode && !strcmp(presentMode, "read")))
+        bool presentWanted = presentMode ? !strcmp(presentMode, "gpu") : !mlxANGLEDeviceIsCPU();
+        if (present && presentWanted)
             compositor->startPresenter(display.eglDisplay());
+        else if (present && getenv("MLX_TRACE_COMPOSITOR"))
+            fprintf(stderr, "compositor: frames read back (%s)\n", presentMode ? "MLX_COMPOSITOR_PRESENT" : "a CPU's Vulkan device: MLX_COMPOSITOR_PRESENT=gpu presents directly");
         if (getenv("MLX_TRACE_COMPOSITOR"))
             fprintf(stderr, "compositor on the GPU: %s (%s, %s)\n", reinterpret_cast<const char*>(glGetString(GL_RENDERER)), version ? version : "", compositor->presenter ? "frames copied into the window's buffer on the GPU" : compositor->asynchronous ? "asynchronous reads" : "synchronous reads");
         return compositor;
@@ -457,24 +466,36 @@ public:
     // the device imports host memory.
     void startPresenter(EGLDisplay display)
     {
+        const char* reason = startPresenterOn(display);
+        if (getenv("MLX_TRACE_COMPOSITOR") && reason)
+            fprintf(stderr, "compositor: frames read back (%s)\n", reason);
+    }
+
+    // Why there is no presenter, or null.
+    const char* startPresenterOn(EGLDisplay display)
+    {
         const char* eglExtensions = eglQueryString(display, EGL_EXTENSIONS);
         const char* glExtensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
-        if (!eglExtensions || !strstr(eglExtensions, "EGL_ANGLE_vulkan_image") || !glExtensions || !strstr(glExtensions, "GL_ANGLE_vulkan_image"))
-            return;
+        if (!eglExtensions || !strstr(eglExtensions, "EGL_ANGLE_vulkan_image"))
+            return "no EGL_ANGLE_vulkan_image";
+        if (!glExtensions || !strstr(glExtensions, "GL_ANGLE_vulkan_image"))
+            return "no GL_ANGLE_vulkan_image";
         EGLAttrib device = 0;
         EGLAttrib physicalDevice = 0;
         EGLAttrib vulkanDevice = 0;
         EGLAttrib queue = 0;
         EGLAttrib family = 0;
         if (!eglQueryDisplayAttribEXT(display, EGL_DEVICE_EXT, &device) || !device)
-            return;
+            return "no EGL device";
         auto eglDevice = reinterpret_cast<EGLDeviceEXT>(device);
         if (!eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_PHYSICAL_DEVICE_ANGLE, &physicalDevice) || !eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_DEVICE_ANGLE, &vulkanDevice)
             || !eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_QUEUE_ANGLE, &queue) || !eglQueryDeviceAttribEXT(eglDevice, EGL_VULKAN_QUEUE_FAMILIY_INDEX_ANGLE, &family))
-            return;
+            return "no Vulkan handles of ANGLE's EGL device";
         presenter = mlxVulkanPresenterCreate(reinterpret_cast<void*>(physicalDevice), reinterpret_cast<void*>(vulkanDevice), reinterpret_cast<void*>(queue), static_cast<uint32_t>(family));
-        if (presenter)
-            eglDisplay = display;
+        if (!presenter)
+            return "the Vulkan device imports no host memory";
+        eglDisplay = display;
+        return nullptr;
     }
 
     void stopPresenter()
@@ -1641,6 +1662,8 @@ bool MlxLayerTreeHost::takeFrame(uint32_t* pixels, int width, int height, int st
 {
     if (m_presentsDirectly)
         return presentFrame(pixels, width, height, stride, damage);
+    static bool trace = getenv("MLX_TRACE_COMPOSITOR");
+    auto started = MonotonicTime::now();
     Locker locker { m_frameLock };
     m_newFrame = false;
     if (!(m_asynchronousReads ? m_frameReadable : m_frameValid) || m_frameSize.isEmpty())
@@ -1664,6 +1687,8 @@ bool MlxLayerTreeHost::takeFrame(uint32_t* pixels, int width, int height, int st
         damage = WTF::move(m_frameDamage);
     m_frameDamage = { };
     m_frameDamageFull = false;
+    if (trace)
+        fprintf(stderr, "compositor take %.1f ms (copied)\n", (MonotonicTime::now() - started).milliseconds());
     return true;
 }
 
@@ -1674,6 +1699,8 @@ bool MlxLayerTreeHost::takeFrame(uint32_t* pixels, int width, int height, int st
 bool MlxLayerTreeHost::presentFrame(uint32_t* pixels, int width, int height, int stride, Vector<IntRect>& damage)
 {
     bool taken = false;
+    auto asked = MonotonicTime::now();
+    double presentTime = 0;
     m_compositorQueue->dispatchSync([&] {
         Locker locker { m_frameLock };
         m_newFrame = false;
@@ -1681,12 +1708,10 @@ bool MlxLayerTreeHost::presentFrame(uint32_t* pixels, int width, int height, int
             return;
         int copyWidth = std::min(width, m_frameSize.width());
         int copyHeight = std::min(height, m_frameSize.height());
-        static bool trace = getenv("MLX_TRACE_COMPOSITOR");
         auto started = MonotonicTime::now();
         if (!m_gpu->present(pixels, copyWidth, copyHeight, stride))
             m_gpu->read(IntRect(0, 0, copyWidth, copyHeight), pixels, stride);
-        if (trace)
-            fprintf(stderr, "compositor present %.1f ms\n", (MonotonicTime::now() - started).milliseconds());
+        presentTime = (MonotonicTime::now() - started).milliseconds();
         for (int y = 0; y < height; ++y) {
             uint32_t* row = pixels + static_cast<size_t>(y) * stride;
             for (int x = y < copyHeight ? copyWidth : 0; x < width; ++x)
@@ -1700,6 +1725,9 @@ bool MlxLayerTreeHost::presentFrame(uint32_t* pixels, int width, int height, int
         m_frameDamageFull = false;
         taken = true;
     });
+    static bool trace = getenv("MLX_TRACE_COMPOSITOR");
+    if (trace && taken)
+        fprintf(stderr, "compositor take %.1f ms (presented %.1f)\n", (MonotonicTime::now() - asked).milliseconds(), presentTime);
     return taken;
 }
 

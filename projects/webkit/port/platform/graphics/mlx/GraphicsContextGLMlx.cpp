@@ -95,25 +95,35 @@ private:
 
 // ANGLE's display on Vulkan, initialized once for the process (each
 // context its own of it; the GPU compositor's contexts too:
-// PlatformDisplayMlx.h).
+// PlatformDisplayMlx.h). ANGLE's device asked for
+// VK_EXT_external_memory_host (its feature supportsExternalMemoryHost,
+// which ANGLE turns on by itself for OpenCL only), so the GPU compositor
+// can copy its frames into the window's buffer on the device
+// (port/angle/vulkan_present.cpp); where the driver has no such
+// extension, ANGLE's device cannot be made with it, and the display is
+// made without.
 void* mlxANGLEDisplay()
 {
     static EGLDisplay display = [] {
-        const EGLAttrib attributes[] = {
-            EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
-            EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE, EGL_PLATFORM_SURFACELESS_MESA,
-            EGL_NONE
-        };
-        EGLDisplay made = EGL_GetPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE, nullptr, attributes);
-        if (made == EGL_NO_DISPLAY)
-            return EGL_NO_DISPLAY;
-        EGLint major = 0;
-        EGLint minor = 0;
-        if (!EGL_Initialize(made, &major, &minor)) {
-            WTFLogAlways("ANGLE: no Vulkan device (EGL error 0x%x)", EGL_GetError());
-            return EGL_NO_DISPLAY;
+        const char* hostMemory[] = { "supportsExternalMemoryHost", nullptr };
+        for (bool withHostMemory : { true, false }) {
+            const EGLAttrib attributes[] = {
+                EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
+                EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE, EGL_PLATFORM_SURFACELESS_MESA,
+                withHostMemory ? EGL_FEATURE_OVERRIDES_ENABLED_ANGLE : EGL_NONE, reinterpret_cast<EGLAttrib>(hostMemory),
+                EGL_NONE
+            };
+            EGLDisplay made = EGL_GetPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE, nullptr, attributes);
+            if (made == EGL_NO_DISPLAY)
+                continue;
+            EGLint major = 0;
+            EGLint minor = 0;
+            if (EGL_Initialize(made, &major, &minor))
+                return made;
+            if (!withHostMemory)
+                WTFLogAlways("ANGLE: no Vulkan device (EGL error 0x%x)", EGL_GetError());
         }
-        return made;
+        return EGL_NO_DISPLAY;
     }();
     return display;
 }

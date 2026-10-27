@@ -11,6 +11,7 @@
 // glAcquireTexturesANGLE after, the queue's lock); this file, compiled
 // with vulkan/vulkan.h (mlx-vulkan's) in libANGLE.a, the Vulkan side.
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
@@ -99,7 +100,16 @@ extern "C" void* mlxVulkanPresenterCreate(void* physicalDevice, void* device, vo
     poolInfo.queueFamilyIndex = family;
     VkFenceCreateInfo fenceInfo { };
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (!p->hostPointerProperties || vkCreateCommandPool(p->device, &poolInfo, nullptr, &p->pool) != VK_SUCCESS || vkCreateFence(p->device, &fenceInfo, nullptr, &p->fence) != VK_SUCCESS) {
+    const char* failed = nullptr;
+    if (!p->hostPointerProperties)
+        failed = "no vkGetMemoryHostPointerPropertiesEXT";
+    else if (vkCreateCommandPool(p->device, &poolInfo, nullptr, &p->pool) != VK_SUCCESS)
+        failed = "no command pool";
+    else if (vkCreateFence(p->device, &fenceInfo, nullptr, &p->fence) != VK_SUCCESS)
+        failed = "no fence";
+    if (failed) {
+        if (getenv("MLX_TRACE_COMPOSITOR"))
+            fprintf(stderr, "compositor: no presenter: %s\n", failed);
         if (p->pool)
             vkDestroyCommandPool(p->device, p->pool, nullptr);
         delete p;
