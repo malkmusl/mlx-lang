@@ -33,6 +33,7 @@ const unit = @import("../../compiler/selfhost/object/unit.mlx")
 const std = @import("std")
 const vector_module = @import("../../std/bootstrap/vector.mlx")
 const table = @import("./table.mlx")
+const assembler = @import("./asm.mlx")
 
 const MAX_UNITS: usize = 4096
 
@@ -57,6 +58,13 @@ var interpreter: usize = 0 // (per run)
 // alignment so far.
 var tlsSize: usize = 0
 var tlsAlignment: usize = 1
+// The units' top-level asm statements (`asm("...");` outside functions):
+// cells of the text's address and length, the unit's number, the next,
+// in order; and the text each unit's assembled to (cells of its offset
+// in the code, its relocations, its symbols, the next).
+var topLevelAsm: usize = 0
+var topLevelAsmTail: usize = 0
+var assembledAsm: usize = 0
 
 pub fn init() -> void {
     units = base.alloc(MAX_UNITS * 8)
@@ -82,6 +90,9 @@ pub fn resetUnits() -> void {
     globalInitsTail = 0
     tlsSize = 0
     tlsAlignment = 1
+    topLevelAsm = 0
+    topLevelAsmTail = 0
+    assembledAsm = 0
     x86.tlsReferences = 0
     var index: usize = 0
     while index < base.MAX_NAMES {
@@ -177,6 +188,97 @@ pub fn addGlobalInit(expression: usize) -> void {
     base.putWord(cell, expression)
     if globalInits == 0 { globalInits = cell } else { base.putWord(globalInitsTail + 8, cell) }
     globalInitsTail = cell
+}
+
+// A top-level asm statement of the unit being read (the next one added).
+pub fn addTopLevelAsm(text: []const u8) -> void {
+    const cell = base.alloc(32)
+    base.putWord(cell, base.keep(text))
+    base.putWord(cell + 8, text.length)
+    base.putWord(cell + 16, unitCount)
+    base.putWord(cell + 24, 0)
+    if topLevelAsm == 0 { topLevelAsm = cell } else { base.putWord(topLevelAsmTail + 24, cell) }
+    topLevelAsmTail = cell
+}
+
+// Each unit's top-level asm statements, one text, assembled (asm.mlx's
+// assembleFile) after the functions' code, at its alignment (padded with
+// int3): the largest alignment asked.
+fn assembleTopLevel() -> usize {
+    var largest: usize = 16
+    var unit: usize = 0
+    var last: usize = 0
+    while unit < unitCount {
+        var text: []const u8 = ""
+        var c = topLevelAsm
+        while c != 0 {
+            if base.getWord(c + 16) == unit { text = base.join(base.join(text, base.bytes(base.getWord(c), base.getWord(c + 8))), "\n") }
+            c = base.getWord(c + 24)
+        }
+        if text.length > 0 {
+            if !assembler.assembleFile(text) { base.fatal(base.join("top-level assembly: ", assembler.problem())) }
+            const boundary = if assembler.alignment > 16 { assembler.alignment } else { 16 }
+            if boundary > largest { largest = boundary }
+            while x86.position() % boundary != 0 { x86.byte(204) }
+            const cell = base.alloc(32)
+            base.putWord(cell, x86.position())
+            base.putWord(cell + 8, assembler.relocations)
+            base.putWord(cell + 16, assembler.fileSymbols)
+            base.putWord(cell + 24, 0)
+            if last == 0 { assembledAsm = cell } else { base.putWord(last + 24, cell) }
+            last = cell
+            var b: usize = 0
+            while b < assembler.codeLength {
+                x86.byte(base.get8(assembler.code + b))
+                b += 1
+            }
+        }
+        unit += 1
+    }
+    return largest
+}
+
+// The symbols top-level assembly defines (before the code's references
+// to them are resolved).
+fn addAsmSymbols(object: *relocatable.Object, text: usize) -> void {
+    var cell = assembledAsm
+    while cell != 0 {
+        const at = base.getWord(cell)
+        var s = base.getWord(cell + 16)
+        while s != 0 {
+            const binding = base.getWord(s + 24)
+            const kind = base.getWord(s + 32)
+            const objectBinding = if binding == 2 { relocatable.WEAK } else if binding == 1 { relocatable.GLOBAL } else { relocatable.LOCAL }
+            const objectKind = if kind == assembler.TYPE_FUNC { relocatable.FUNC } else if kind == assembler.TYPE_OBJECT { relocatable.OBJECT } else { relocatable.NOTYPE }
+            const ignored = relocatable.addSymbol(object, base.pointer(base.getWord(s)), base.getWord(s + 8), objectBinding, objectKind, text, at + base.getWord(s + 16), base.getWord(s + 40))
+            s = base.getWord(s + 48)
+        }
+        cell = base.getWord(cell + 24)
+    }
+}
+
+// The relocations of top-level assembly: to its own text, to its
+// symbols, to the names it needs.
+fn addAsmRelocations(object: *relocatable.Object, text: usize, textSymbol: usize) -> void {
+    var cell = assembledAsm
+    while cell != 0 {
+        const at = base.getWord(cell)
+        var r = base.getWord(cell + 8)
+        while r != 0 {
+            const nameLength = base.getWord(r + 24)
+            var addend = @bitCast(i64, base.getWord(r + 32))
+            var symbol: usize = textSymbol
+            if nameLength == 0 {
+                addend += @intCast(i64, at)
+            } else {
+                const found = relocatable.findSymbol(object, base.pointer(base.getWord(r + 16)), nameLength)
+                symbol = if found != relocatable.NONE { found } else { undefinedSymbol(object, base.intern(base.bytes(base.getWord(r + 16), nameLength))) }
+            }
+            relocatable.addRelocation(object, text, at + base.getWord(r), @intCast(u8, base.getWord(r + 8)), symbol, addend)
+            r = base.getWord(r + 40)
+        }
+        cell = base.getWord(cell + 24)
+    }
 }
 
 pub fn addUnit(globals: usize) -> void {
@@ -566,11 +668,12 @@ pub fn buildObject() -> *relocatable.Object {
     placeData()
     const has_init = genUnitInit()
     genFunctions()
+    const textAlignment = assembleTopLevel()
     const enc = x86.enc()
     // (Every function's symbol is looked up below: by hash.)
     const indexed = encoder.indexSymbols(enc)
     const object = newObject()
-    const text = relocatable.addSection(object, relocatable.TEXT, base.pointer(@intFromPtr(enc.*.buf.*.items)), encoder.pos(enc), 16)
+    const text = relocatable.addSection(object, relocatable.TEXT, base.pointer(@intFromPtr(enc.*.buf.*.items)), encoder.pos(enc), textAlignment)
     // The data area's image, less the runtime's words.
     const area = encoder.dataSize(enc)
     const image = base.alloc(area + 8)
@@ -628,6 +731,7 @@ pub fn buildObject() -> *relocatable.Object {
         }
         unit += 1
     }
+    addAsmSymbols(object, text)
     // The code's references: to a function of the object resolved, to a
     // name of another object a relocation, to the data a relocation
     // against the section.
@@ -651,6 +755,7 @@ pub fn buildObject() -> *relocatable.Object {
         }
         index += 1
     }
+    addAsmRelocations(object, text, text_symbol)
     // The thread-local references: offsets from the thread pointer.
     var reference = x86.tlsReferences
     while reference != 0 {
@@ -859,6 +964,9 @@ pub fn keepState() -> void {
     base.keepState(@intFromPtr(&initName), @sizeOf(@typeOf(initName)))
     base.keepState(@intFromPtr(&tlsSize), @sizeOf(@typeOf(tlsSize)))
     base.keepState(@intFromPtr(&tlsAlignment), @sizeOf(@typeOf(tlsAlignment)))
+    base.keepState(@intFromPtr(&topLevelAsm), @sizeOf(@typeOf(topLevelAsm)))
+    base.keepState(@intFromPtr(&topLevelAsmTail), @sizeOf(@typeOf(topLevelAsmTail)))
+    base.keepState(@intFromPtr(&assembledAsm), @sizeOf(@typeOf(assembledAsm)))
     base.keepState(@intFromPtr(&globalInits), @sizeOf(@typeOf(globalInits)))
     base.keepState(@intFromPtr(&globalInitsTail), @sizeOf(@typeOf(globalInitsTail)))
     base.keepState(@intFromPtr(&sectionAlignment), @sizeOf(@typeOf(sectionAlignment)))

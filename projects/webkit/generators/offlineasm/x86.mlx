@@ -1,0 +1,1387 @@
+// The X86_64 backend of offlineasm (its x86.rb, with the Assembler of
+// asm.rb for code that is not the C loop and the label lowering of
+// backends.rb): each instruction of the resolved tree made the lines of
+// AT&T assembly LLIntAssembly.h has for it, as C strings inside the
+// OFFLINE_ASM_BEGIN ... OFFLINE_ASM_END of LowLevelInterpreter.cpp's
+// top-level asm statement, the place in the .asm sources it came from in
+// a comment at column 40 (when it is another place than the last one
+// written), and with --binary-format=ELF the .size and .type of each
+// label before the next one. Linux's spelling: no Windows forms.
+const std = @import("std")
+const s = @import("../support.mlx")
+const u = @import("./util.mlx")
+const ast = @import("./ast.mlx")
+const cloop = @import("./cloop.mlx")
+
+const Node = ast.Node
+
+// Whether each label's .size and .type are written ($emitELFDebugDirectives).
+pub var elfDirectives = false
+
+// ---------------------------------------------------------------------------
+// The assembler: the comments waiting for a line, as cloop.mlx has them
+// (its lines go to the same output).
+
+var codeOriginPointer: [*]const u8 = undefined
+var codeOriginLength: usize = 0
+var hasCodeOrigin = false
+var lastCodeOriginPointer: [*]const u8 = undefined
+var lastCodeOriginLength: usize = 0
+var hasLastCodeOrigin = false
+const SPACER_NONE: u8 = 0
+const SPACER_GLOBAL: u8 = 1
+const SPACER_ANNOTATION: u8 = 2
+var newlineSpacerState: u8 = 0
+const COMMENT_COLUMN: usize = 40
+// The label whose .size and .type wait for the next label ("" for none).
+var deferredPointer: [*]const u8 = undefined
+var deferredLength: usize = 0
+
+fn line(text: []const u8) -> void { cloop.line(text) }
+
+fn lastComment() -> []const u8 {
+    var result: []const u8 = ""
+    const codeOrigin = codeOriginPointer[0..codeOriginLength]
+    if hasCodeOrigin && (!hasLastCodeOrigin || !std.text.same(codeOrigin, lastCodeOriginPointer[0..lastCodeOriginLength])) {
+        lastCodeOriginPointer = codeOriginPointer
+        lastCodeOriginLength = codeOriginLength
+        hasLastCodeOrigin = true
+        result = codeOrigin
+    }
+    hasCodeOrigin = false
+    if result.length > 0 { return u.cat("// ", result) }
+    return result
+}
+
+fn formatDump(text: []const u8, comment: []const u8) -> []const u8 {
+    if comment.length > 0 { return u.cat3(u.padRight(text, COMMENT_COLUMN), " ", comment) }
+    return text
+}
+
+// Assembler#puts: one line of assembly.
+fn puts(text: []const u8) -> void { line(formatDump(u.cat3("    \"", text, " \\n\""), lastComment())) }
+
+fn putsNewlineSpacerIfAppropriate(state: u8) -> void {
+    if newlineSpacerState != state {
+        line("")
+        newlineSpacerState = state
+    }
+}
+
+fn putsLabel(name: []const u8, isGlobal: bool, isExport: bool, isAligned: bool, alignTo: []const u8) -> void {
+    if deferredLength > 0 {
+        const deferred = deferredPointer[0..deferredLength]
+        line(u.cat5("    \".size ", deferred, " , . - ", deferred, " \\n\""))
+        line(u.cat3("    \".type ", deferred, " , function \\n\""))
+        deferredLength = 0
+    }
+    putsNewlineSpacerIfAppropriate(SPACER_GLOBAL)
+    if isGlobal {
+        if isAligned {
+            if isExport {
+                line(formatDump(u.cat3("OFFLINE_ASM_GLOBAL_EXPORT_LABEL(", name, ")"), lastComment()))
+            } else if alignTo.length > 0 {
+                line(formatDump(u.cat5("OFFLINE_ASM_ALIGNED_GLOBAL_LABEL(", name, ", ", alignTo, ")"), lastComment()))
+            } else {
+                line(formatDump(u.cat3("OFFLINE_ASM_GLOBAL_LABEL(", name, ")"), lastComment()))
+            }
+        } else if isExport {
+            line(formatDump(u.cat3("OFFLINE_ASM_UNALIGNED_GLOBAL_EXPORT_LABEL(", name, ")"), lastComment()))
+        } else {
+            line(formatDump(u.cat3("OFFLINE_ASM_UNALIGNED_GLOBAL_LABEL(", name, ")"), lastComment()))
+        }
+    } else if std.text.startsWith(name, "llint_op_") {
+        line(formatDump(u.cat3("OFFLINE_ASM_OPCODE_LABEL(op_", name[9..name.length], ")"), lastComment()))
+    } else {
+        if alignTo.length > 0 { line(formatDump(u.cat3("OFFLINE_ASM_ALIGN_TRAP(", alignTo, ")"), lastComment())) }
+        line(formatDump(u.cat3("OFFLINE_ASM_GLUE_LABEL(", name, ")"), lastComment()))
+    }
+    if elfDirectives {
+        deferredPointer = name.pointer
+        deferredLength = name.length
+    }
+    newlineSpacerState = SPACER_NONE
+}
+
+fn putsLocalLabel(name: []const u8) -> void {
+    line("")
+    line(formatDump(u.cat3("  OFFLINE_ASM_LOCAL_LABEL(", name, ")"), lastComment()))
+}
+
+// Assembler#inAsm, around lowering the tree.
+pub fn lowerProgram(program: *Node) -> void {
+    hasCodeOrigin = false
+    newlineSpacerState = SPACER_NONE
+    deferredLength = 0
+    line("")
+    line("OFFLINE_ASM_BEGIN")
+    lowerList(program.*.items, program.*.count)
+    const comment = lastComment()
+    if comment.length > 0 { line(comment) }
+    line("OFFLINE_ASM_END")
+}
+
+// ---------------------------------------------------------------------------
+// Sequences: Sequence#getModifiedListX86_64 (an immediate that is no
+// 32-bit one moved into the scratch register first, but by `move`), then
+// each node lowered.
+
+fn scratch() -> *Node {
+    const node = ast.newNode(SPECIAL_REGISTER, 0)
+    node.*.name = "r11"
+    return node
+}
+
+fn scratchFPR() -> *Node {
+    const node = ast.newNode(SPECIAL_REGISTER, 0)
+    node.*.name = "xmm7"
+    return node
+}
+
+const SPECIAL_REGISTER: u8 = 200
+
+fn validImmediate(node: *Node) -> bool { return node.*.value >= -2147483648 && node.*.value <= 2147483647 }
+
+fn lowerList(items: [*]*Node, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        const node = items[index]
+        const kind = node.*.kind
+        if kind == ast.INSTRUCTION {
+            if std.text.same(node.*.name, "move") {
+                lowerNode(node)
+            } else {
+                var usedScratch = false
+                const operands = ast.nodeArray(node.*.count)
+                var changed = false
+                var at: usize = 0
+                while at < node.*.count {
+                    const operand = node.*.items[at]
+                    if operand.*.kind == ast.IMMEDIATE && !validImmediate(operand) {
+                        if usedScratch { s.fail(u.cat("offlineasm: Attempt to use scratch register twice at ", ast.originString(operand.*.origin))) }
+                        const moved = ast.nodeArray(2)
+                        moved[0] = operand
+                        moved[1] = scratch()
+                        lowerNode(ast.instruction(operand.*.origin, "move", moved, 2, "", false))
+                        usedScratch = true
+                        operands[at] = moved[1]
+                        changed = true
+                    } else {
+                        operands[at] = operand
+                    }
+                    at += 1
+                }
+                if changed {
+                    lowerNode(ast.instruction(node.*.origin, node.*.name, operands, node.*.count, node.*.text, node.*.hasText))
+                } else {
+                    lowerNode(node)
+                }
+            }
+        } else if kind == ast.LABEL || kind == ast.LOCAL_LABEL || kind == ast.SKIP {
+            lowerNode(node)
+        } else {
+            s.fail(u.cat("offlineasm: Unexpected node at ", ast.originString(node.*.origin)))
+        }
+        index += 1
+    }
+}
+
+fn lowerNode(node: *Node) -> void {
+    const kind = node.*.kind
+    if kind == ast.INSTRUCTION {
+        const origin = ast.originString(node.*.origin)
+        codeOriginPointer = origin.pointer
+        codeOriginLength = origin.length
+        hasCodeOrigin = true
+        lowerInstruction(node)
+    } else if kind == ast.LABEL {
+        const alignTo = if node.*.a != null { ast.dump(node.*.a.?) } else { "" }
+        putsLabel(node.*.name[1..node.*.name.length], node.*.isGlobal, node.*.isExport, node.*.isAligned, alignTo)
+    } else if kind == ast.LOCAL_LABEL {
+        putsLocalLabel(ast.localLabelString(node))
+    } else if kind != ast.SKIP {
+        s.fail(u.cat("offlineasm: Unexpected node at ", ast.originString(node.*.origin)))
+    }
+}
+
+// A sequence of instructions made here (Sequence.new(...).lower).
+var pending: ast.List = undefined
+
+fn begin() -> void { pending = ast.listNew(16) }
+
+fn add(node: *Node) -> void { ast.listAdd(&pending, node) }
+
+fn op(origin: u64, opcode: []const u8, a: *Node, b: ?*Node, c: ?*Node) -> *Node {
+    var count: usize = 1
+    if b != null { count = 2 }
+    if c != null { count = 3 }
+    const operands = ast.nodeArray(count)
+    operands[0] = a
+    if b != null { operands[1] = b.? }
+    if c != null { operands[2] = c.? }
+    return ast.instruction(origin, opcode, operands, count, "", false)
+}
+
+fn lowerPending() -> void {
+    const list = pending
+    lowerList(list.items, list.count)
+}
+
+fn localRef(origin: u64, label: *Node) -> *Node { return ast.localLabelReference(origin, label) }
+
+// ---------------------------------------------------------------------------
+// Operands.
+
+const BYTE: u8 = 1
+const HALF: u8 = 2
+const INT: u8 = 3
+const PTR: u8 = 4
+const QUAD: u8 = 5
+const FLOAT: u8 = 6
+const DOUBLE: u8 = 7
+const VECTOR: u8 = 8
+
+fn bad(node: *Node, what: []const u8) -> void {
+    s.fail(u.cat5("offlineasm: ", what, " of an operand of kind ", s.decimal(@intCast(u64, node.*.kind)), u.cat(" at ", ast.originString(node.*.origin))))
+}
+
+fn register(name: []const u8) -> []const u8 { return u.cat("%", name) }
+
+fn x86GPR(node: *Node) -> []const u8 {
+    if node.*.kind != ast.REGISTER { bad(node, "x86GPR") }
+    const name = node.*.name
+    if std.text.same(name, "t0") { return "eax" }
+    if std.text.same(name, "t6") { return "edi" }
+    if std.text.same(name, "t1") { return "esi" }
+    if std.text.same(name, "t2") { return "edx" }
+    if std.text.same(name, "t3") { return "ecx" }
+    if std.text.same(name, "t4") { return "r8" }
+    if std.text.same(name, "t5") { return "r10" }
+    if std.text.same(name, "t7") { return "r9" }
+    if std.text.same(name, "csr0") { return "ebx" }
+    if std.text.same(name, "csr1") { return "r12" }
+    if std.text.same(name, "csr2") { return "r13" }
+    if std.text.same(name, "csr3") { return "r14" }
+    if std.text.same(name, "csr4") { return "r15" }
+    if std.text.same(name, "cfr") { return "ebp" }
+    if std.text.same(name, "sp") { return "esp" }
+    s.fail(u.cat3("offlineasm: cannot use register ", name, " on X86"))
+    return ""
+}
+
+fn gprName(name: []const u8, kind: u8) -> []const u8 {
+    if name.length >= 2 && name[0] == 114 && name[1] >= 48 && name[1] <= 57 {
+        // r8 .. r15
+        if kind == BYTE { return register(u.cat(name, "b")) }
+        if kind == HALF { return register(u.cat(name, "w")) }
+        if kind == INT { return register(u.cat(name, "d")) }
+        if kind == PTR || kind == QUAD { return register(name) }
+        s.fail(u.cat("offlineasm: bad kind when converting GPR name ", name))
+    }
+    var name8: []const u8 = ""
+    var name16: []const u8 = ""
+    if std.text.same(name, "eax") || std.text.same(name, "ebx") || std.text.same(name, "ecx") || std.text.same(name, "edx") {
+        name8 = u.cat(name[1..2], "l")
+        name16 = name[1..3]
+    } else if std.text.same(name, "esi") || std.text.same(name, "edi") || std.text.same(name, "ebp") || std.text.same(name, "esp") {
+        name16 = name[1..3]
+        name8 = u.cat(name16, "l")
+    } else {
+        s.fail(u.cat("offlineasm: bad GPR name ", name))
+    }
+    if kind == BYTE { return register(name8) }
+    if kind == HALF { return register(name16) }
+    if kind == INT { return register(u.cat("e", name16)) }
+    if kind == PTR || kind == QUAD { return register(u.cat("r", name16)) }
+    s.fail(u.cat("offlineasm: invalid kind for GPR ", name))
+    return ""
+}
+
+fn supports8Bit(node: *Node) -> bool {
+    if node.*.kind == ast.ADDRESS || node.*.kind == ast.BASE_INDEX || node.*.kind == ast.ABSOLUTE_ADDRESS { return true }
+    const name = x86GPR(node)
+    return !(name[0] == 114)
+}
+
+fn fprName(node: *Node) -> []const u8 {
+    const name = node.*.name
+    if name.length == 3 && name[0] == 102 && name[1] == 116 && name[2] >= 48 && name[2] <= 55 { return register(u.cat("xmm", name[2..3])) }
+    s.fail(u.cat3("offlineasm: Bad register ", name, u.cat(" for X86 at ", ast.originString(node.*.origin))))
+    return ""
+}
+
+fn vecName(node: *Node) -> []const u8 {
+    const name = node.*.name
+    // (x86.rb names v5 where v4 belongs: v4 alone is "bad".)
+    if name.length >= 2 && name[0] == 118 && name[1] >= 48 && name[1] <= 55 && (name.length == 2 || name[2] == 95) {
+        if std.text.same(name, "v4") { return u.cat3("Bad register name ", name, u.cat(" at ", ast.originString(node.*.origin))) }
+        if std.text.same(name, "v5") { return register("xmm4") }
+        return register(u.cat("xmm", name[1..2]))
+    }
+    return u.cat3("Bad register name ", name, u.cat(" at ", ast.originString(node.*.origin)))
+}
+
+fn x86Operand(node: *Node, kind: u8) -> []const u8 {
+    const nodeKind = node.*.kind
+    if nodeKind == ast.REGISTER { return gprName(x86GPR(node), kind) }
+    if nodeKind == SPECIAL_REGISTER {
+        if kind == HALF { return register(u.cat(node.*.name, "w")) }
+        if kind == INT { return register(u.cat(node.*.name, "d")) }
+        return register(node.*.name)
+    }
+    if nodeKind == ast.FP_REGISTER {
+        if kind != FLOAT && kind != DOUBLE && kind != VECTOR { bad(node, "an FPR as an integer") }
+        return fprName(node)
+    }
+    if nodeKind == ast.VEC_REGISTER { return vecName(node) }
+    if nodeKind == ast.IMMEDIATE { return u.cat("$", u.decimal128(node.*.value)) }
+    if nodeKind == ast.ADDRESS || nodeKind == ast.BASE_INDEX || nodeKind == ast.ABSOLUTE_ADDRESS { return x86AddressOperand(node, PTR) }
+    if nodeKind == ast.LOCAL_LABEL_REFERENCE { return asmLabel(node) }
+    bad(node, "x86Operand")
+    return ""
+}
+
+fn scaleValue(node: *Node) -> i128 {
+    const scale = node.*.c.?
+    if scale.*.kind == ast.IMMEDIATE && (scale.*.value == 1 || scale.*.value == 2 || scale.*.value == 4 || scale.*.value == 8) { return scale.*.value }
+    s.fail(u.cat("offlineasm: Bad scale at ", ast.originString(node.*.origin)))
+    return 0
+}
+
+fn x86AddressOperand(node: *Node, addressKind: u8) -> []const u8 {
+    const kind = node.*.kind
+    if kind == ast.ADDRESS { return u.cat4(u.decimal128(node.*.b.?.*.value), "(", x86Operand(node.*.a.?, addressKind), ")") }
+    if kind == ast.BASE_INDEX {
+        return u.cat5(u.decimal128(node.*.d.?.*.value), "(", x86Operand(node.*.a.?, addressKind), ", ", u.cat4(x86Operand(node.*.b.?, addressKind), ", ", u.decimal128(scaleValue(node)), ")"))
+    }
+    if kind == ast.ABSOLUTE_ADDRESS { return u.decimal128(node.*.a.?.*.value) }
+    bad(node, "x86AddressOperand")
+    return ""
+}
+
+fn x86CallOperand(node: *Node, kind: u8) -> []const u8 {
+    const nodeKind = node.*.kind
+    if nodeKind == ast.REGISTER { return u.cat("*", x86Operand(node, PTR)) }
+    if nodeKind == SPECIAL_REGISTER { return u.cat("*", x86Operand(node, QUAD)) }
+    if nodeKind == ast.FP_REGISTER { return u.cat("*", x86Operand(node, kind)) }
+    if nodeKind == ast.IMMEDIATE { return u.decimal128(node.*.value) }
+    if nodeKind == ast.ADDRESS || nodeKind == ast.BASE_INDEX { return u.cat("*", x86Operand(node, kind)) }
+    if nodeKind == ast.ABSOLUTE_ADDRESS { return u.cat("*", u.decimal128(node.*.a.?.*.value)) }
+    if nodeKind == ast.LABEL_REFERENCE || nodeKind == ast.LOCAL_LABEL_REFERENCE { return asmLabel(node) }
+    bad(node, "x86CallOperand")
+    return ""
+}
+
+fn isExternLabel(label: *Node) -> bool { return label.*.kind == ast.LABEL && label.*.isExtern }
+
+// LabelReference#asmLabel and LocalLabelReference#asmLabel.
+fn asmLabel(node: *Node) -> []const u8 {
+    if node.*.kind == ast.LABEL_REFERENCE {
+        const label = node.*.a.?
+        const name = label.*.name[1..label.*.name.length]
+        if isExternLabel(label) || label.*.isGlobal { return u.cat3("\" LABEL_REFERENCE(", name, ") \"") }
+        return u.cat3("\" LOCAL_LABEL_STRING(", name, ") \"")
+    }
+    if node.*.kind == ast.LOCAL_LABEL_REFERENCE { return u.cat3("\" LOCAL_LABEL_STRING(", ast.localLabelString(node.*.a.?), ") \"") }
+    bad(node, "asmLabel")
+    return ""
+}
+
+// x86LoadOperand: a label's value through the GOT, else the operand.
+fn x86LoadOperand(node: *Node, kind: u8, destination: *Node) -> []const u8 {
+    if node.*.kind == ast.LABEL_REFERENCE {
+        puts(u.cat4("movq ", asmLabel(node), "@GOTPCREL(%rip), ", x86Operand(destination, PTR)))
+        return u.cat4(u.decimal128(node.*.value), "(", x86Operand(destination, PTR), ")")
+    }
+    return x86Operand(node, kind)
+}
+
+fn operands2(node: *Node, first: u8, second: u8) -> []const u8 {
+    if node.*.count != 2 { s.fail(u.cat("offlineasm: Expected 2 operands at ", ast.originString(node.*.origin))) }
+    return u.cat3(x86Operand(node.*.items[0], first), ", ", x86Operand(node.*.items[1], second))
+}
+
+fn operands1(node: *Node, first: u8) -> []const u8 {
+    if node.*.count != 1 { s.fail(u.cat("offlineasm: Expected 1 operand at ", ast.originString(node.*.origin))) }
+    return x86Operand(node.*.items[0], first)
+}
+
+fn loadOperands(node: *Node, sourceKind: u8, destinationKind: u8) -> []const u8 {
+    const source = x86LoadOperand(node.*.items[0], sourceKind, node.*.items[1])
+    return u.cat3(source, ", ", x86Operand(node.*.items[1], destinationKind))
+}
+
+fn suffix(kind: u8) -> []const u8 {
+    if kind == BYTE { return "b" }
+    if kind == HALF { return "w" }
+    if kind == INT { return "l" }
+    if kind == PTR || kind == QUAD { return "q" }
+    if kind == FLOAT { return "ss" }
+    if kind == DOUBLE { return "sd" }
+    s.fail("offlineasm: no suffix")
+    return ""
+}
+
+fn bytesOf(kind: u8) -> i128 {
+    if kind == BYTE { return 1 }
+    if kind == HALF { return 2 }
+    if kind == INT || kind == FLOAT { return 4 }
+    return 8
+}
+
+// Node equality as Ruby has it: immediates by value, registers by name,
+// the rest by identity.
+fn same(first: *Node, second: *Node) -> bool {
+    if first == second { return true }
+    if first.*.kind != second.*.kind { return false }
+    if first.*.kind == ast.IMMEDIATE { return first.*.value == second.*.value }
+    if ast.isRegisterKind(first.*.kind) || first.*.kind == SPECIAL_REGISTER { return std.text.same(first.*.name, second.*.name) }
+    return false
+}
+
+fn isImmediateValue(node: *Node, value: i128) -> bool { return node.*.kind == ast.IMMEDIATE && node.*.value == value }
+
+fn isRegister(node: *Node) -> bool { return node.*.kind == ast.REGISTER }
+
+fn imm(value: i128) -> []const u8 { return u.cat("$", u.decimal128(value)) }
+
+fn order(a: []const u8, b: []const u8) -> []const u8 { return u.cat3(a, ", ", b) }
+
+// ---------------------------------------------------------------------------
+// The instructions' helpers (x86.rb's handleX86*).
+
+fn emitLea(source: *Node, destination: *Node, kind: u8) -> void {
+    if source.*.kind == ast.LABEL_REFERENCE {
+        puts(u.cat4("movq ", asmLabel(source), "@GOTPCREL(%rip), ", x86Operand(destination, PTR)))
+        if source.*.value != 0 { puts(u.cat4("add", suffix(kind), " ", order(imm(source.*.value), x86Operand(destination, kind)))) }
+    } else {
+        puts(u.cat4("lea", suffix(kind), " ", order(x86AddressOperand(source, kind), x86Operand(destination, kind))))
+    }
+}
+
+fn opWithCount(node: *Node, opcode: []const u8, kind: u8, count: usize) -> void {
+    const o = node.*.items
+    if count == 3 {
+        if same(o[0], o[2]) {
+            puts(u.cat3(opcode, " ", order(x86Operand(o[1], kind), x86Operand(o[2], kind))))
+        } else if same(o[1], o[2]) {
+            puts(u.cat3(opcode, " ", order(x86Operand(o[0], kind), x86Operand(o[2], kind))))
+        } else {
+            puts(u.cat4("mov", suffix(kind), " ", order(x86Operand(o[0], kind), x86Operand(o[2], kind))))
+            puts(u.cat3(opcode, " ", order(x86Operand(o[1], kind), x86Operand(o[2], kind))))
+        }
+    } else {
+        puts(u.cat3(opcode, " ", order(x86Operand(o[0], kind), x86Operand(o[1], kind))))
+    }
+}
+
+fn handleOp(node: *Node, opcode: []const u8, kind: u8) -> void { opWithCount(node, opcode, kind, node.*.count) }
+
+fn handleShift(node: *Node, opcode: []const u8, kind: u8) -> void {
+    const o = node.*.items
+    if o[0].*.kind == ast.IMMEDIATE || std.text.same(x86GPR(o[0]), "ecx") {
+        puts(u.cat3(opcode, " ", order(x86Operand(o[0], BYTE), x86Operand(o[1], kind))))
+    } else {
+        const ecx = gprName("ecx", PTR)
+        puts(u.cat5("xchgq ", x86Operand(o[0], PTR), ", ", ecx, ""))
+        const destination = if std.text.same(x86GPR(o[1]), "ecx") { o[0] } else { o[1] }
+        puts(u.cat3(opcode, " ", order(register("cl"), x86Operand(destination, kind))))
+        puts(u.cat5("xchgq ", x86Operand(o[0], PTR), ", ", ecx, ""))
+    }
+}
+
+fn fpBranch(node: *Node, kind: u8, branch: []const u8, reverse: bool) -> void {
+    const o = node.*.items
+    if reverse {
+        puts(u.cat4("ucomi", suffix(kind), " ", order(x86Operand(o[0], DOUBLE), x86Operand(o[1], DOUBLE))))
+    } else {
+        puts(u.cat4("ucomi", suffix(kind), " ", order(x86Operand(o[1], DOUBLE), x86Operand(o[0], DOUBLE))))
+    }
+    puts(u.cat3(branch, " ", asmLabel(o[2])))
+}
+
+fn intCompare(node: *Node, conditionSuffix: []const u8, kind: u8) -> void {
+    const o = node.*.items
+    const equality = std.text.same(conditionSuffix, "e") || std.text.same(conditionSuffix, "ne")
+    if isImmediateValue(o[0], 0) && isRegister(o[1]) && equality {
+        puts(u.cat4("test", suffix(kind), " ", order(x86Operand(o[1], kind), x86Operand(o[1], kind))))
+    } else if isImmediateValue(o[1], 0) && isRegister(o[0]) && equality {
+        puts(u.cat4("test", suffix(kind), "  ", order(x86Operand(o[0], kind), x86Operand(o[0], kind))))
+    } else {
+        puts(u.cat4("cmp", suffix(kind), " ", order(x86Operand(o[1], kind), x86Operand(o[0], kind))))
+    }
+}
+
+fn intBranch(node: *Node, branch: []const u8, kind: u8) -> void {
+    intCompare(node, branch[1..branch.length], kind)
+    puts(u.cat3(branch, " ", asmLabel(node.*.items[2])))
+}
+
+fn setOn(setOpcode: []const u8, operand: *Node) -> void {
+    if supports8Bit(operand) {
+        puts(u.cat3(setOpcode, " ", x86Operand(operand, BYTE)))
+        puts(u.cat("movzbl ", order(x86Operand(operand, BYTE), x86Operand(operand, INT))))
+    } else {
+        const ax = ast.registerFor(ast.REGISTER, 0, "t0")
+        puts(u.cat4("xchgq ", x86Operand(operand, PTR), ", ", x86Operand(ax, PTR)))
+        puts(u.cat3(setOpcode, " ", x86Operand(ax, BYTE)))
+        puts(u.cat4("movzbl ", x86Operand(ax, BYTE), ", ", x86Operand(ax, INT)))
+        puts(u.cat4("xchgq ", x86Operand(operand, PTR), ", ", x86Operand(ax, PTR)))
+    }
+}
+
+fn intCompareSet(node: *Node, setOpcode: []const u8, kind: u8) -> void {
+    intCompare(node, setOpcode[3..setOpcode.length], kind)
+    setOn(setOpcode, node.*.items[2])
+}
+
+fn fpCompare(kind: u8, left: *Node, right: *Node) -> void {
+    puts(u.cat4("ucomi", suffix(kind), " ", order(x86Operand(left, DOUBLE), x86Operand(right, DOUBLE))))
+}
+
+// handleX86FPCompareSet: SPECIAL 1 for :eq, 2 for :nequn, 0 for SET.
+fn fpCompareSet(node: *Node, kind: u8, setOpcode: []const u8, special: u8, reverse: bool) -> void {
+    const left = node.*.items[0]
+    const right = node.*.items[1]
+    const target = node.*.items[2]
+    if special != 0 {
+        if same(left, right) {
+            fpCompare(kind, right, left)
+            setOn(if special == 1 { "setnp" } else { "setp" }, target)
+            return
+        }
+        const isUnordered = ast.uniqueLocalLabel(node.*.origin, "isUnordered")
+        puts(u.cat("movq ", order(imm(if special == 1 { 0 } else { 1 }), x86Operand(target, QUAD))))
+        fpCompare(kind, right, left)
+        puts(u.cat("jp ", asmLabel(localRef(node.*.origin, isUnordered))))
+        setOn(if special == 1 { "sete" } else { "setne" }, target)
+        lowerNode(isUnordered)
+        return
+    }
+    if reverse {
+        fpCompare(kind, left, right)
+    } else {
+        fpCompare(kind, right, left)
+    }
+    setOn(setOpcode, target)
+}
+
+fn handleTest(node: *Node, kind: u8) -> void {
+    const value = node.*.items[0]
+    var mask: *Node = undefined
+    if node.*.count == 2 {
+        mask = ast.immediate(node.*.origin, -1)
+    } else if node.*.count == 3 {
+        mask = node.*.items[1]
+    } else {
+        s.fail(u.cat("offlineasm: Expected 2 or 3 operands at ", ast.originString(node.*.origin)))
+    }
+    if isImmediateValue(mask, -1) {
+        if isRegister(value) {
+            puts(u.cat5("test", suffix(kind), " ", x86Operand(value, kind), u.cat(", ", x86Operand(value, kind))))
+        } else {
+            puts(u.cat4("cmp", suffix(kind), " ", order(imm(0), x86Operand(value, kind))))
+        }
+    } else {
+        puts(u.cat4("test", suffix(kind), " ", order(x86Operand(mask, kind), x86Operand(value, kind))))
+    }
+}
+
+fn branchTest(node: *Node, branch: []const u8, kind: u8) -> void {
+    handleTest(node, kind)
+    puts(u.cat3(branch, " ", asmLabel(node.*.items[node.*.count - 1])))
+}
+
+fn setTest(node: *Node, setOpcode: []const u8, kind: u8) -> void {
+    handleTest(node, kind)
+    setOn(setOpcode, node.*.items[node.*.count - 1])
+}
+
+fn jumpTarget(node: *Node) -> *Node {
+    if node.*.count == 4 { return node.*.items[3] }
+    if node.*.count == 3 { return node.*.items[2] }
+    s.fail(u.cat("offlineasm: bad operand count at ", ast.originString(node.*.origin)))
+    return node
+}
+
+fn opBranch(node: *Node, opcode: []const u8, branch: []const u8, kind: u8) -> void {
+    opWithCount(node, opcode, kind, node.*.count - 1)
+    puts(u.cat3(branch, " ", asmLabel(jumpTarget(node))))
+}
+
+fn subBranch(node: *Node, branch: []const u8, kind: u8) -> void {
+    const o = node.*.items
+    if node.*.count == 4 && same(o[1], o[2]) {
+        puts(u.cat4("neg", suffix(kind), " ", x86Operand(o[2], kind)))
+        puts(u.cat4("add", suffix(kind), " ", order(x86Operand(o[0], kind), x86Operand(o[2], kind))))
+    } else {
+        opWithCount(node, u.cat("sub", suffix(kind)), kind, node.*.count - 1)
+    }
+    puts(u.cat3(branch, " ", asmLabel(jumpTarget(node))))
+}
+
+fn handleAdd(node: *Node, kind: u8) -> void {
+    const o = node.*.items
+    if node.*.count == 3 && same(o[1], o[2]) {
+        if !isImmediateValue(o[0], 0) { puts(u.cat4("add", suffix(kind), " ", order(x86Operand(o[0], kind), x86Operand(o[2], kind)))) }
+    } else if node.*.count == 3 && o[0].*.kind == ast.IMMEDIATE {
+        if !isRegister(o[1]) || !isRegister(o[2]) { s.fail(u.cat("offlineasm: add's operands at ", ast.originString(node.*.origin))) }
+        if o[0].*.value == 0 {
+            if !same(o[1], o[2]) { puts(u.cat4("mov", suffix(kind), " ", order(x86Operand(o[1], kind), x86Operand(o[2], kind)))) }
+        } else {
+            puts(u.cat4("lea", suffix(kind), " ", order(u.cat4(u.decimal128(o[0].*.value), "(", x86Operand(o[1], kind), ")"), x86Operand(o[2], kind))))
+        }
+    } else if node.*.count == 3 && isRegister(o[0]) {
+        if !isRegister(o[1]) || !isRegister(o[2]) { s.fail(u.cat("offlineasm: add's operands at ", ast.originString(node.*.origin))) }
+        if same(o[0], o[2]) {
+            puts(u.cat4("add", suffix(kind), " ", order(x86Operand(o[1], kind), x86Operand(o[2], kind))))
+        } else {
+            puts(u.cat5("lea", suffix(kind), " (", x86Operand(o[0], kind), u.cat5(", ", x86Operand(o[1], kind), "), ", x86Operand(o[2], kind), "")))
+        }
+    } else {
+        if !isImmediateValue(o[0], 0) { puts(u.cat4("add", suffix(kind), " ", operands2(node, kind, kind))) }
+    }
+}
+
+fn handleSub(node: *Node, kind: u8) -> void {
+    const o = node.*.items
+    if node.*.count == 3 {
+        if isImmediateValue(o[1], 0) {
+            if !isRegister(o[0]) || !isRegister(o[2]) { s.fail(u.cat("offlineasm: sub's operands at ", ast.originString(node.*.origin))) }
+            if !same(o[0], o[2]) { puts(u.cat4("mov", suffix(kind), " ", order(x86Operand(o[0], kind), x86Operand(o[2], kind)))) }
+            return
+        }
+        if same(o[1], o[2]) {
+            puts(u.cat4("neg", suffix(kind), " ", x86Operand(o[2], kind)))
+            if !isImmediateValue(o[0], 0) { puts(u.cat4("add", suffix(kind), " ", order(x86Operand(o[0], kind), x86Operand(o[2], kind)))) }
+            return
+        }
+    }
+    if node.*.count == 2 && isImmediateValue(o[0], 0) { return }
+    handleOp(node, u.cat("sub", suffix(kind)), kind)
+}
+
+fn handleMul(node: *Node, kind: u8) -> void {
+    const o = node.*.items
+    if node.*.count == 3 && o[0].*.kind == ast.IMMEDIATE {
+        puts(u.cat4("imul", suffix(kind), " ", u.cat5(x86Operand(o[0], kind), ", ", x86Operand(o[1], kind), ", ", x86Operand(o[2], kind))))
+        return
+    }
+    if node.*.count == 2 && o[0].*.kind == ast.IMMEDIATE {
+        const value = o[0].*.value
+        if value > 0 && (value & (value - 1)) == 0 {
+            var log: i128 = 0
+            while (@intCast(i128, 1) << @intCast(u7, log)) < value { log += 1 }
+            puts(u.cat4("sal", suffix(kind), " ", order(imm(log), x86Operand(o[1], kind))))
+            return
+        }
+    }
+    handleOp(node, u.cat("imul", suffix(kind)), kind)
+}
+
+fn handleFP(node: *Node, stem: []const u8, kind: u8) -> void {
+    const o = node.*.items
+    if node.*.count == 2 {
+        puts(u.cat4(stem, suffix(kind), " ", order(x86Operand(o[0], kind), x86Operand(o[1], kind))))
+    } else if node.*.count == 3 {
+        puts(u.cat5("v", stem, suffix(kind), " ", u.cat5(x86Operand(o[1], kind), ", ", x86Operand(o[0], kind), ", ", x86Operand(o[2], kind))))
+    } else {
+        s.fail("offlineasm: Unexpected number of operands for floating point addition")
+    }
+}
+
+fn handleMove(node: *Node) -> void {
+    const o = node.*.items
+    if isImmediateValue(o[0], 0) && isRegister(o[1]) {
+        puts(u.cat4("xorq ", x86Operand(o[1], QUAD), ", ", x86Operand(o[1], QUAD)))
+    } else if !std.text.same(x86Operand(o[0], QUAD), x86Operand(o[1], QUAD)) {
+        puts(u.cat("movq ", operands2(node, QUAD, QUAD)))
+    }
+}
+
+fn countLeadingZeros(node: *Node, kind: u8) -> void {
+    const origin = node.*.origin
+    const target = node.*.items[1]
+    const srcIsNonZero = ast.uniqueLocalLabel(origin, "srcIsNonZero")
+    const skipNonZeroCase = ast.uniqueLocalLabel(origin, "skipNonZeroCase")
+    const zeroValue = ast.immediate(origin, bytesOf(kind) * 8)
+    const xorValue = ast.immediate(origin, if kind == QUAD { 63 } else { 31 })
+    puts(u.cat4("bsr", suffix(kind), " ", operands2(node, kind, kind)))
+    begin()
+    add(op(origin, "bnz", localRef(origin, srcIsNonZero), null, null))
+    add(op(origin, "move", zeroValue, target, null))
+    add(op(origin, "jmp", localRef(origin, skipNonZeroCase), null, null))
+    add(srcIsNonZero)
+    add(op(origin, if kind == QUAD { "xorq" } else { "xori" }, xorValue, target, null))
+    add(skipNonZeroCase)
+    lowerPending()
+}
+
+fn countTrailingZeros(node: *Node, kind: u8) -> void {
+    const origin = node.*.origin
+    const target = node.*.items[1]
+    const srcIsNonZero = ast.uniqueLocalLabel(origin, "srcIsNonZero")
+    const zeroValue = ast.immediate(origin, bytesOf(kind) * 8)
+    puts(u.cat4("bsf", suffix(kind), " ", operands2(node, kind, kind)))
+    begin()
+    add(op(origin, "bnz", localRef(origin, srcIsNonZero), null, null))
+    add(op(origin, "move", zeroValue, target, null))
+    add(srcIsNonZero)
+    lowerPending()
+}
+
+fn truncateToQuad(node: *Node, kind: u8) -> void {
+    const origin = node.*.origin
+    const source = node.*.items[0]
+    const destination = node.*.items[1]
+    const slow = ast.uniqueLocalLabel(origin, "slow")
+    const done = ast.uniqueLocalLabel(origin, "done")
+    const gpr = scratch()
+    const fpr = scratchFPR()
+    const signBit = ast.immediate(origin, 9223372036854775807 + 1)
+    var int64Min: *Node = undefined
+    var negInt64Min: *Node = undefined
+    var integer: []const u8 = ""
+    var floating: []const u8 = ""
+    if kind == FLOAT {
+        int64Min = ast.immediate(origin, 3741319168)
+        negInt64Min = ast.immediate(origin, 1593835520)
+        integer = "i"
+        floating = "f"
+    } else {
+        int64Min = ast.immediate(origin, 14114281232179134464)
+        negInt64Min = ast.immediate(origin, 4890909195324358656)
+        integer = "q"
+        floating = "d"
+    }
+    begin()
+    add(op(origin, "move", negInt64Min, gpr, null))
+    add(op(origin, u.cat4("f", integer, "2", floating), gpr, fpr, null))
+    add(op(origin, u.cat3("b", floating, "gteq"), source, fpr, localRef(origin, slow)))
+    add(op(origin, u.cat3("truncate", floating, "2qs"), source, destination, null))
+    add(op(origin, "jmp", localRef(origin, done), null, null))
+    add(slow)
+    add(op(origin, "move", int64Min, gpr, null))
+    add(op(origin, u.cat4("f", integer, "2", floating), gpr, fpr, null))
+    add(op(origin, u.cat("add", floating), source, fpr, null))
+    add(op(origin, u.cat3("truncate", floating, "2qs"), fpr, destination, null))
+    add(op(origin, "move", signBit, gpr, null))
+    add(op(origin, "orq", gpr, destination, null))
+    add(done)
+    lowerPending()
+}
+
+fn convertQuad(node: *Node, kind: u8) -> void {
+    const origin = node.*.origin
+    const source = node.*.items[0]
+    const scratch1 = node.*.items[1]
+    const destination = node.*.items[2]
+    const slow = ast.uniqueLocalLabel(origin, "slow")
+    const done = ast.uniqueLocalLabel(origin, "done")
+    const scratch2 = scratch()
+    const one = ast.immediate(origin, 1)
+    const floating: []const u8 = if kind == FLOAT { "f" } else { "d" }
+    begin()
+    add(op(origin, "btqs", source, localRef(origin, slow), null))
+    add(op(origin, u.cat3("cq2", floating, "s"), source, destination, null))
+    add(op(origin, "jmp", localRef(origin, done), null, null))
+    add(slow)
+    add(op(origin, "move", source, scratch1, null))
+    add(op(origin, "move", source, scratch2, null))
+    add(op(origin, "urshiftq", one, scratch1, null))
+    add(op(origin, "andq", one, scratch2, null))
+    add(op(origin, "orq", scratch1, scratch2, null))
+    add(op(origin, u.cat3("cq2", floating, "s"), scratch2, destination, null))
+    add(op(origin, u.cat("add", floating), destination, destination, null))
+    add(done)
+    lowerPending()
+}
+
+// ---------------------------------------------------------------------------
+// The instructions (lowerX86Common), looked up by their opcode.
+
+const Form = struct {
+    group: u8
+    kind: u8
+    text: []const u8
+}
+
+// Groups.
+const G_OP: u8 = 1           // handleX86Op(text, kind)
+const G_SHIFT: u8 = 2        // handleX86Shift(text + suffix, kind)
+const G_ADD: u8 = 3
+const G_SUB: u8 = 4
+const G_MUL: u8 = 5
+const G_INT_BRANCH: u8 = 6   // handleX86IntBranch(text, kind)
+const G_BRANCH_TEST: u8 = 7  // handleX86BranchTest(text, kind)
+const G_OP_BRANCH: u8 = 8    // handleX86OpBranch(op + suffix, text, kind)
+const G_SUB_BRANCH: u8 = 9
+const G_COMPARE_SET: u8 = 10 // handleX86IntCompareSet(text, kind)
+const G_SET_TEST: u8 = 11    // handleX86SetTest(text, kind)
+const G_FP: u8 = 12          // add/sub/mul/div of floats (text: the stem)
+const G_FP_BRANCH: u8 = 13   // handleX86FPBranch(kind, text, normal)
+const G_FP_BRANCH_R: u8 = 14 // ... reverse
+const G_FP_SET: u8 = 15      // handleX86FPCompareSet(kind, text)
+const G_FP_SET_R: u8 = 16
+const G_ROUND: u8 = 17       // roundss/roundsd $N
+const G_MULBRANCH: u8 = 18   // imul then a branch
+const G_ORBRANCH: u8 = 19    // orl then a branch
+const G_OTHER: u8 = 20
+
+var forms: *u.Map = undefined
+var formList: [*]Form = undefined
+var formCount: usize = 0
+var formsReady = false
+
+fn form(name: []const u8, group: u8, kind: u8, text: []const u8) -> void {
+    formList[formCount] = Form.{ .group = group, .kind = kind, .text = text }
+    formCount += 1
+    u.mapPut(forms, name, formCount)
+}
+
+fn kindSuffix(kind: u8) -> []const u8 {
+    if kind == INT { return "i" }
+    if kind == PTR { return "p" }
+    if kind == QUAD { return "q" }
+    if kind == BYTE { return "b" }
+    return ""
+}
+
+fn initializeForms() -> void {
+    forms = u.mapNew(2048)
+    unsafe { formList = @ptrFromInt([*]Form, s.alloc(1024 * @sizeOf(Form))) }
+    const ipq = [3]u8{ INT, PTR, QUAD }
+    for kind in ipq {
+        const k = kindSuffix(kind)
+        form(u.cat("add", k), G_ADD, kind, "")
+        form(u.cat("and", k), G_OP, kind, u.cat("and", suffix(kind)))
+        form(u.cat("lshift", k), G_SHIFT, kind, u.cat("sal", suffix(kind)))
+        form(u.cat("mul", k), G_MUL, kind, "")
+        form(u.cat("or", k), G_OP, kind, u.cat("or", suffix(kind)))
+        form(u.cat("rshift", k), G_SHIFT, kind, u.cat("sar", suffix(kind)))
+        form(u.cat("urshift", k), G_SHIFT, kind, u.cat("shr", suffix(kind)))
+        form(u.cat("sub", k), G_SUB, kind, "")
+        form(u.cat("xor", k), G_OP, kind, u.cat("xor", suffix(kind)))
+        form(u.cat3("b", k, "eq"), G_INT_BRANCH, kind, "je")
+        form(u.cat3("b", k, "neq"), G_INT_BRANCH, kind, "jne")
+        form(u.cat3("b", k, "a"), G_INT_BRANCH, kind, "ja")
+        form(u.cat3("b", k, "aeq"), G_INT_BRANCH, kind, "jae")
+        form(u.cat3("b", k, "b"), G_INT_BRANCH, kind, "jb")
+        form(u.cat3("b", k, "beq"), G_INT_BRANCH, kind, "jbe")
+        form(u.cat3("b", k, "gt"), G_INT_BRANCH, kind, "jg")
+        form(u.cat3("b", k, "gteq"), G_INT_BRANCH, kind, "jge")
+        form(u.cat3("b", k, "lt"), G_INT_BRANCH, kind, "jl")
+        form(u.cat3("b", k, "lteq"), G_INT_BRANCH, kind, "jle")
+        form(u.cat3("bt", k, "s"), G_BRANCH_TEST, kind, "js")
+        form(u.cat3("bt", k, "z"), G_BRANCH_TEST, kind, "jz")
+        form(u.cat3("bt", k, "nz"), G_BRANCH_TEST, kind, "jnz")
+        form(u.cat3("badd", k, "o"), G_OP_BRANCH, kind, "jo")
+        form(u.cat3("badd", k, "s"), G_OP_BRANCH, kind, "js")
+        form(u.cat3("badd", k, "z"), G_OP_BRANCH, kind, "jz")
+        form(u.cat3("badd", k, "nz"), G_OP_BRANCH, kind, "jnz")
+        form(u.cat3("c", k, "eq"), G_COMPARE_SET, kind, "sete")
+        form(u.cat3("c", k, "neq"), G_COMPARE_SET, kind, "setne")
+        form(u.cat3("c", k, "a"), G_COMPARE_SET, kind, "seta")
+        form(u.cat3("c", k, "aeq"), G_COMPARE_SET, kind, "setae")
+        form(u.cat3("c", k, "b"), G_COMPARE_SET, kind, "setb")
+        form(u.cat3("c", k, "beq"), G_COMPARE_SET, kind, "setbe")
+        form(u.cat3("c", k, "gt"), G_COMPARE_SET, kind, "setg")
+        form(u.cat3("c", k, "gteq"), G_COMPARE_SET, kind, "setge")
+        form(u.cat3("c", k, "lt"), G_COMPARE_SET, kind, "setl")
+        form(u.cat3("c", k, "lteq"), G_COMPARE_SET, kind, "setle")
+        form(u.cat3("t", k, "s"), G_SET_TEST, kind, "sets")
+        form(u.cat3("t", k, "z"), G_SET_TEST, kind, "setz")
+        form(u.cat3("t", k, "nz"), G_SET_TEST, kind, "setnz")
+    }
+    form("andf", G_OP, FLOAT, "andps")
+    form("andd", G_OP, DOUBLE, "andpd")
+    form("orf", G_OP, FLOAT, "orps")
+    form("ord", G_OP, DOUBLE, "orpd")
+    form("orh", G_OP, HALF, "orw")
+    form("rrotatei", G_SHIFT, INT, "rorl")
+    form("rrotateq", G_SHIFT, QUAD, "rorq")
+    form("lrotatei", G_SHIFT, INT, "roll")
+    form("lrotateq", G_SHIFT, QUAD, "rolq")
+    form("bbeq", G_INT_BRANCH, BYTE, "je")
+    form("bbneq", G_INT_BRANCH, BYTE, "jne")
+    form("bba", G_INT_BRANCH, BYTE, "ja")
+    form("bbaeq", G_INT_BRANCH, BYTE, "jae")
+    form("bbb", G_INT_BRANCH, BYTE, "jb")
+    form("bbbeq", G_INT_BRANCH, BYTE, "jbe")
+    form("bbgt", G_INT_BRANCH, BYTE, "jg")
+    form("bbgteq", G_INT_BRANCH, BYTE, "jge")
+    form("bblt", G_INT_BRANCH, BYTE, "jl")
+    form("bblteq", G_INT_BRANCH, BYTE, "jlteq")
+    form("btbs", G_BRANCH_TEST, BYTE, "js")
+    form("btbz", G_BRANCH_TEST, BYTE, "jz")
+    form("btbnz", G_BRANCH_TEST, BYTE, "jnz")
+    form("cbeq", G_COMPARE_SET, BYTE, "sete")
+    form("cbneq", G_COMPARE_SET, BYTE, "setne")
+    form("cba", G_COMPARE_SET, BYTE, "seta")
+    form("cbaeq", G_COMPARE_SET, BYTE, "setae")
+    form("cbb", G_COMPARE_SET, BYTE, "setb")
+    form("cbbeq", G_COMPARE_SET, BYTE, "setbe")
+    form("cbgt", G_COMPARE_SET, BYTE, "setg")
+    form("cbgteq", G_COMPARE_SET, BYTE, "setge")
+    form("cblt", G_COMPARE_SET, BYTE, "setl")
+    form("cblteq", G_COMPARE_SET, BYTE, "setle")
+    form("tbs", G_SET_TEST, BYTE, "sets")
+    form("tbz", G_SET_TEST, BYTE, "setz")
+    form("tbnz", G_SET_TEST, BYTE, "setnz")
+    form("bsubio", G_SUB_BRANCH, INT, "jo")
+    form("bsubis", G_SUB_BRANCH, INT, "js")
+    form("bsubiz", G_SUB_BRANCH, INT, "jz")
+    form("bsubinz", G_SUB_BRANCH, INT, "jnz")
+    form("bmulio", G_MULBRANCH, INT, "jo")
+    form("bmulis", G_MULBRANCH, INT, "js")
+    form("bmuliz", G_MULBRANCH, INT, "jz")
+    form("bmulinz", G_MULBRANCH, INT, "jnz")
+    form("borio", G_ORBRANCH, INT, "jo")
+    form("boris", G_ORBRANCH, INT, "js")
+    form("boriz", G_ORBRANCH, INT, "jz")
+    form("borinz", G_ORBRANCH, INT, "jnz")
+    form("addf", G_FP, FLOAT, "add")
+    form("addd", G_FP, DOUBLE, "add")
+    form("mulf", G_FP, FLOAT, "mul")
+    form("muld", G_FP, DOUBLE, "mul")
+    form("subf", G_FP, FLOAT, "sub")
+    form("subd", G_FP, DOUBLE, "sub")
+    form("divf", G_FP, FLOAT, "div")
+    form("divd", G_FP, DOUBLE, "div")
+    form("bdneq", G_FP_BRANCH, DOUBLE, "jne")
+    form("bdgt", G_FP_BRANCH, DOUBLE, "ja")
+    form("bdgteq", G_FP_BRANCH, DOUBLE, "jae")
+    form("bdlt", G_FP_BRANCH_R, DOUBLE, "ja")
+    form("bdlteq", G_FP_BRANCH_R, DOUBLE, "jae")
+    form("bdequn", G_FP_BRANCH, DOUBLE, "je")
+    form("bdgtun", G_FP_BRANCH_R, DOUBLE, "jb")
+    form("bdgtequn", G_FP_BRANCH_R, DOUBLE, "jbe")
+    form("bdltun", G_FP_BRANCH, DOUBLE, "jb")
+    form("bdltequn", G_FP_BRANCH, DOUBLE, "jbe")
+    form("bfgt", G_FP_BRANCH, FLOAT, "ja")
+    form("bfgteq", G_FP_BRANCH, FLOAT, "jae")
+    form("bflt", G_FP_BRANCH_R, FLOAT, "ja")
+    form("bfgtun", G_FP_BRANCH_R, FLOAT, "jb")
+    form("bfgtequn", G_FP_BRANCH_R, FLOAT, "jbe")
+    form("bfltun", G_FP_BRANCH, FLOAT, "jb")
+    form("bfltequn", G_FP_BRANCH, FLOAT, "jbe")
+    form("cfneq", G_FP_SET, FLOAT, "setne")
+    form("cdneq", G_FP_SET, DOUBLE, "setne")
+    form("cfgt", G_FP_SET, FLOAT, "seta")
+    form("cdgt", G_FP_SET, DOUBLE, "seta")
+    form("cfgteq", G_FP_SET, FLOAT, "setae")
+    form("cdgteq", G_FP_SET, DOUBLE, "setae")
+    form("cflt", G_FP_SET_R, FLOAT, "seta")
+    form("cdlt", G_FP_SET_R, DOUBLE, "seta")
+    form("cflteq", G_FP_SET_R, FLOAT, "setae")
+    form("cdlteq", G_FP_SET_R, DOUBLE, "setae")
+    form("roundf", G_ROUND, FLOAT, "0")
+    form("roundd", G_ROUND, DOUBLE, "0")
+    form("floorf", G_ROUND, FLOAT, "1")
+    form("floord", G_ROUND, DOUBLE, "1")
+    form("ceilf", G_ROUND, FLOAT, "2")
+    form("ceild", G_ROUND, DOUBLE, "2")
+    form("truncatef", G_ROUND, FLOAT, "3")
+    form("truncated", G_ROUND, DOUBLE, "3")
+    formsReady = true
+}
+
+fn lowerInstruction(node: *Node) -> void {
+    if !formsReady { initializeForms() }
+    const opcode = node.*.name
+    const found = u.mapGet(forms, opcode)
+    if found != 0 {
+        const f = formList[found - 1]
+        const kind = f.kind
+        const g = f.group
+        if g == G_OP {
+            handleOp(node, f.text, kind)
+        } else if g == G_SHIFT {
+            handleShift(node, f.text, kind)
+        } else if g == G_ADD {
+            handleAdd(node, kind)
+        } else if g == G_SUB {
+            handleSub(node, kind)
+        } else if g == G_MUL {
+            handleMul(node, kind)
+        } else if g == G_INT_BRANCH {
+            intBranch(node, f.text, kind)
+        } else if g == G_BRANCH_TEST {
+            branchTest(node, f.text, kind)
+        } else if g == G_OP_BRANCH {
+            opBranch(node, u.cat("add", suffix(kind)), f.text, kind)
+        } else if g == G_SUB_BRANCH {
+            subBranch(node, f.text, kind)
+        } else if g == G_MULBRANCH {
+            opBranch(node, "imull", f.text, kind)
+        } else if g == G_ORBRANCH {
+            opBranch(node, "orl", f.text, kind)
+        } else if g == G_COMPARE_SET {
+            intCompareSet(node, f.text, kind)
+        } else if g == G_SET_TEST {
+            setTest(node, f.text, kind)
+        } else if g == G_FP {
+            handleFP(node, f.text, kind)
+        } else if g == G_FP_BRANCH {
+            fpBranch(node, kind, f.text, false)
+        } else if g == G_FP_BRANCH_R {
+            fpBranch(node, kind, f.text, true)
+        } else if g == G_FP_SET {
+            fpCompareSet(node, kind, f.text, 0, false)
+        } else if g == G_FP_SET_R {
+            fpCompareSet(node, kind, f.text, 0, true)
+        } else if g == G_ROUND {
+            puts(u.cat5(if kind == FLOAT { "roundss $" } else { "roundsd $" }, f.text, ", ", x86Operand(node.*.items[0], DOUBLE), u.cat(", ", x86Operand(node.*.items[1], DOUBLE))))
+        }
+        return
+    }
+    lowerOther(node, opcode)
+}
+
+fn is(opcode: []const u8, name: []const u8) -> bool { return std.text.same(opcode, name) }
+
+fn lowerOther(node: *Node, opcode: []const u8) -> void {
+    const o = node.*.items
+    if is(opcode, "negi") {
+        puts(u.cat("negl ", operands1(node, INT)))
+    } else if is(opcode, "negp") || is(opcode, "negq") {
+        puts(u.cat("negq ", operands1(node, if is(opcode, "negp") { PTR } else { QUAD })))
+    } else if is(opcode, "noti") {
+        puts(u.cat("notl ", operands1(node, INT)))
+    } else if is(opcode, "notq") {
+        puts(u.cat("notq ", operands1(node, QUAD)))
+    } else if is(opcode, "leap") {
+        emitLea(o[0], o[1], PTR)
+    } else if is(opcode, "pcrtoaddr") {
+        puts(u.cat4("leaq ", asmLabel(o[0]), "(%rip), ", x86Operand(o[1], QUAD)))
+    } else if is(opcode, "loadi") || is(opcode, "atomicloadi") {
+        puts(u.cat("movl ", loadOperands(node, INT, INT)))
+    } else if is(opcode, "storei") {
+        puts(u.cat("movl ", operands2(node, INT, INT)))
+    } else if is(opcode, "loadis") {
+        puts(u.cat("movslq ", loadOperands(node, INT, QUAD)))
+    } else if is(opcode, "transferi") {
+        puts(u.cat("movl ", order(x86LoadOperand(o[0], INT, ast.immediate(0, 0)), x86Operand(scratch(), INT))))
+        puts(u.cat("movl ", order(x86Operand(scratch(), INT), x86Operand(o[1], INT))))
+    } else if is(opcode, "loadp") {
+        puts(u.cat("movq ", loadOperands(node, PTR, PTR)))
+    } else if is(opcode, "storep") {
+        puts(u.cat("movq ", operands2(node, PTR, PTR)))
+    } else if is(opcode, "transferp") || is(opcode, "transferq") {
+        const kind: u8 = if is(opcode, "transferp") { PTR } else { QUAD }
+        puts(u.cat("movq ", order(x86LoadOperand(o[0], kind, ast.immediate(0, 0)), x86Operand(scratch(), kind))))
+        puts(u.cat("movq ", order(x86Operand(scratch(), kind), x86Operand(o[1], kind))))
+    } else if is(opcode, "loadq") || is(opcode, "atomicloadq") {
+        puts(u.cat("movq ", loadOperands(node, QUAD, QUAD)))
+    } else if is(opcode, "storeq") {
+        puts(u.cat("movq ", operands2(node, QUAD, QUAD)))
+    } else if is(opcode, "loadb") || is(opcode, "atomicloadb") {
+        puts(u.cat("movzbl ", loadOperands(node, BYTE, INT)))
+    } else if is(opcode, "loadbsi") {
+        puts(u.cat("movsbl ", loadOperands(node, BYTE, INT)))
+    } else if is(opcode, "loadbsq") {
+        puts(u.cat("movsbq ", loadOperands(node, BYTE, QUAD)))
+    } else if is(opcode, "loadh") || is(opcode, "atomicloadh") {
+        puts(u.cat("movzwl ", loadOperands(node, HALF, INT)))
+    } else if is(opcode, "loadhsi") {
+        puts(u.cat("movswl ", loadOperands(node, HALF, INT)))
+    } else if is(opcode, "loadhsq") {
+        puts(u.cat("movswq ", loadOperands(node, HALF, QUAD)))
+    } else if is(opcode, "storeb") {
+        puts(u.cat("movb ", operands2(node, BYTE, BYTE)))
+    } else if is(opcode, "storeh") {
+        puts(u.cat("movw ", operands2(node, HALF, HALF)))
+    } else if is(opcode, "loadf") || is(opcode, "storef") {
+        puts(u.cat("movss ", operands2(node, FLOAT, FLOAT)))
+    } else if is(opcode, "loadd") || is(opcode, "moved") || is(opcode, "stored") {
+        puts(u.cat("movsd ", operands2(node, DOUBLE, DOUBLE)))
+    } else if is(opcode, "loadv") {
+        puts(u.cat("movdqu ", operands2(node, INT, DOUBLE)))
+    } else if is(opcode, "storev") {
+        puts(u.cat("movups ", operands2(node, VECTOR, VECTOR)))
+    } else if is(opcode, "sqrtf") {
+        puts(u.cat("sqrtss ", order(x86Operand(o[0], FLOAT), x86Operand(o[1], FLOAT))))
+    } else if is(opcode, "sqrtd") {
+        puts(u.cat("sqrtsd ", order(x86Operand(o[0], DOUBLE), x86Operand(o[1], DOUBLE))))
+    } else if is(opcode, "truncatef2i") {
+        puts(u.cat("cvttss2si ", order(x86Operand(o[0], FLOAT), x86Operand(o[1], QUAD))))
+    } else if is(opcode, "truncated2i") {
+        puts(u.cat("cvttsd2si ", order(x86Operand(o[0], DOUBLE), x86Operand(o[1], QUAD))))
+    } else if is(opcode, "truncatef2q") {
+        truncateToQuad(node, FLOAT)
+    } else if is(opcode, "truncated2q") {
+        truncateToQuad(node, DOUBLE)
+    } else if is(opcode, "truncatef2is") {
+        puts(u.cat("cvttss2si ", order(x86Operand(o[0], FLOAT), x86Operand(o[1], INT))))
+    } else if is(opcode, "truncatef2qs") {
+        puts(u.cat("cvttss2si ", order(x86Operand(o[0], FLOAT), x86Operand(o[1], QUAD))))
+    } else if is(opcode, "truncated2is") {
+        puts(u.cat("cvttsd2si ", order(x86Operand(o[0], DOUBLE), x86Operand(o[1], INT))))
+    } else if is(opcode, "truncated2qs") {
+        puts(u.cat("cvttsd2si ", order(x86Operand(o[0], DOUBLE), x86Operand(o[1], QUAD))))
+    } else if is(opcode, "ci2d") {
+        puts(u.cat("cvtsi2sd ", order(x86Operand(o[0], QUAD), x86Operand(o[1], DOUBLE))))
+    } else if is(opcode, "ci2ds") {
+        puts(u.cat("cvtsi2sd ", order(x86Operand(o[0], INT), x86Operand(o[1], DOUBLE))))
+    } else if is(opcode, "ci2fs") {
+        puts(u.cat("cvtsi2ss ", order(x86Operand(o[0], INT), x86Operand(o[1], FLOAT))))
+    } else if is(opcode, "ci2f") {
+        puts(u.cat("cvtsi2ss ", order(x86Operand(o[0], QUAD), x86Operand(o[1], FLOAT))))
+    } else if is(opcode, "cq2f") {
+        convertQuad(node, FLOAT)
+    } else if is(opcode, "cq2d") {
+        convertQuad(node, DOUBLE)
+    } else if is(opcode, "cq2fs") {
+        puts(u.cat("cvtsi2ssq ", order(x86Operand(o[0], QUAD), x86Operand(o[1], FLOAT))))
+    } else if is(opcode, "cq2ds") {
+        puts(u.cat("cvtsi2sdq ", order(x86Operand(o[0], QUAD), x86Operand(o[1], DOUBLE))))
+    } else if is(opcode, "cd2f") {
+        puts(u.cat("cvtsd2ss ", operands2(node, DOUBLE, FLOAT)))
+    } else if is(opcode, "cf2d") {
+        puts(u.cat("cvtss2sd ", operands2(node, FLOAT, DOUBLE)))
+    } else if is(opcode, "bdeq") || is(opcode, "bfeq") {
+        const kind: u8 = if is(opcode, "bdeq") { DOUBLE } else { FLOAT }
+        puts(u.cat4("ucomi", suffix(kind), " ", order(x86Operand(o[0], kind), x86Operand(o[1], kind))))
+        if same(o[0], o[1]) {
+            puts(u.cat("jnp ", asmLabel(o[2])))
+        } else {
+            const isUnordered = ast.uniqueLocalLabel(node.*.origin, if kind == DOUBLE { "bdeq" } else { "bfeq" })
+            puts(u.cat("jp ", asmLabel(localRef(node.*.origin, isUnordered))))
+            puts(u.cat("je ", asmLabel(localRef(node.*.origin, o[2]))))
+            lowerNode(isUnordered)
+        }
+    } else if is(opcode, "bdnequn") {
+        puts(u.cat("ucomisd ", order(x86Operand(o[0], DOUBLE), x86Operand(o[1], DOUBLE))))
+        if same(o[0], o[1]) {
+            puts(u.cat("jp ", asmLabel(o[2])))
+        } else {
+            const isUnordered = ast.uniqueLocalLabel(node.*.origin, "bdnequn")
+            const isEqual = ast.uniqueLocalLabel(node.*.origin, "bdnequn")
+            puts(u.cat("jp ", asmLabel(localRef(node.*.origin, isUnordered))))
+            puts(u.cat("je ", asmLabel(localRef(node.*.origin, isEqual))))
+            lowerNode(isUnordered)
+            puts(u.cat("jmp ", asmLabel(o[2])))
+            lowerNode(isEqual)
+        }
+    } else if is(opcode, "btd2i") {
+        puts(u.cat4("cvttsd2si ", x86Operand(o[0], DOUBLE), ", ", x86Operand(o[1], INT)))
+        puts(u.cat("cmpl $0x80000000 ", x86Operand(o[1], INT)))
+        puts(u.cat("je ", asmLabel(o[2])))
+    } else if is(opcode, "td2i") {
+        puts(u.cat4("cvttsd2si ", x86Operand(o[0], DOUBLE), ", ", x86Operand(o[1], INT)))
+    } else if is(opcode, "bcd2i") {
+        puts(u.cat4("cvttsd2si ", x86Operand(o[0], DOUBLE), ", ", x86Operand(o[1], INT)))
+        puts(u.cat4("testl ", x86Operand(o[1], INT), ", ", x86Operand(o[1], INT)))
+        puts(u.cat("je ", asmLabel(o[2])))
+        puts(u.cat3("cvtsi2sd ", x86Operand(o[1], INT), ", %xmm7"))
+        puts(u.cat3("ucomisd ", x86Operand(o[0], DOUBLE), ", %xmm7"))
+        puts(u.cat("jp ", asmLabel(o[2])))
+        puts(u.cat("jne ", asmLabel(o[2])))
+    } else if is(opcode, "movdz") {
+        puts(u.cat4("xorpd ", x86Operand(o[0], DOUBLE), ", ", x86Operand(o[0], DOUBLE)))
+    } else if is(opcode, "pop") {
+        var index: usize = 0
+        while index < node.*.count {
+            puts(u.cat("pop ", x86Operand(o[index], PTR)))
+            index += 1
+        }
+    } else if is(opcode, "popv") {
+        var index: usize = 0
+        while index < node.*.count {
+            puts(u.cat("movdqu (%rsp), ", x86Operand(o[index], VECTOR)))
+            puts("add $16, %rsp")
+            index += 1
+        }
+    } else if is(opcode, "push") {
+        var index: usize = 0
+        while index < node.*.count {
+            puts(u.cat("push ", x86Operand(o[index], PTR)))
+            index += 1
+        }
+    } else if is(opcode, "pushv") {
+        var index: usize = 0
+        while index < node.*.count {
+            puts("sub $16, %rsp")
+            puts(u.cat3("movdqu ", x86Operand(o[index], VECTOR), ", (%rsp)"))
+            index += 1
+        }
+    } else if is(opcode, "move") {
+        handleMove(node)
+    } else if is(opcode, "sxi2q") {
+        puts(u.cat4("movslq ", x86Operand(o[0], INT), ", ", x86Operand(o[1], QUAD)))
+    } else if is(opcode, "zxi2q") {
+        puts(u.cat("movl ", order(x86Operand(o[0], INT), x86Operand(o[1], INT))))
+    } else if is(opcode, "sxb2i") {
+        puts(u.cat4("movsbl ", x86Operand(o[0], BYTE), ", ", x86Operand(o[1], INT)))
+    } else if is(opcode, "sxh2i") {
+        puts(u.cat4("movswl ", x86Operand(o[0], HALF), ", ", x86Operand(o[1], INT)))
+    } else if is(opcode, "sxb2q") || is(opcode, "sxb2p") {
+        puts(u.cat4("movsbq ", x86Operand(o[0], BYTE), ", ", x86Operand(o[1], QUAD)))
+    } else if is(opcode, "sxh2q") {
+        puts(u.cat4("movswq ", x86Operand(o[0], HALF), ", ", x86Operand(o[1], QUAD)))
+    } else if is(opcode, "nop") {
+        puts("nop")
+    } else if is(opcode, "jmp") {
+        puts(u.cat("jmp ", x86CallOperand(o[0], PTR)))
+    } else if is(opcode, "break") {
+        puts(u.cat("int ", imm(3)))
+    } else if is(opcode, "call") {
+        puts(u.cat("call ", x86CallOperand(o[0], PTR)))
+    } else if is(opcode, "ret") {
+        puts("ret")
+    } else if is(opcode, "cfeq") || is(opcode, "cdeq") {
+        fpCompareSet(node, if is(opcode, "cfeq") { FLOAT } else { DOUBLE }, "", 1, false)
+    } else if is(opcode, "cfnequn") || is(opcode, "cdnequn") {
+        fpCompareSet(node, if is(opcode, "cfnequn") { FLOAT } else { DOUBLE }, "", 2, false)
+    } else if is(opcode, "peek") {
+        const sp = ast.registerFor(ast.REGISTER, 0, "sp")
+        puts(u.cat("movq ", order(u.cat4(u.decimal128(o[0].*.value * 8), "(", x86Operand(sp, PTR), ")"), x86Operand(o[1], PTR))))
+    } else if is(opcode, "poke") {
+        const sp = ast.registerFor(ast.REGISTER, 0, "sp")
+        puts(u.cat("movq ", order(x86Operand(o[0], PTR), u.cat4(u.decimal128(o[1].*.value * 8), "(", x86Operand(sp, PTR), ")"))))
+    } else if is(opcode, "cdqi") {
+        puts("cdq")
+    } else if is(opcode, "cqoq") {
+        puts("cqo")
+    } else if is(opcode, "idivi") {
+        puts(u.cat("idivl ", x86Operand(o[0], INT)))
+    } else if is(opcode, "udivi") {
+        puts(u.cat("divl ", x86Operand(o[0], INT)))
+    } else if is(opcode, "idivq") {
+        puts(u.cat("idivq ", x86Operand(o[0], QUAD)))
+    } else if is(opcode, "udivq") {
+        puts(u.cat("divq ", x86Operand(o[0], QUAD)))
+    } else if is(opcode, "adcq") {
+        puts(u.cat("adcq ", operands2(node, QUAD, QUAD)))
+    } else if is(opcode, "sbcq") {
+        puts(u.cat("sbbq ", operands2(node, QUAD, QUAD)))
+    } else if is(opcode, "umulhq") {
+        puts(u.cat("mulq ", x86Operand(o[0], QUAD)))
+    } else if is(opcode, "smulhq") {
+        puts(u.cat("imulq ", x86Operand(o[0], QUAD)))
+    } else if is(opcode, "popcnti") {
+        puts(u.cat("popcntl ", operands2(node, INT, INT)))
+    } else if is(opcode, "popcntq") {
+        puts(u.cat("popcntq ", operands2(node, QUAD, QUAD)))
+    } else if is(opcode, "tzcnti") {
+        countTrailingZeros(node, INT)
+    } else if is(opcode, "tzcntq") {
+        countTrailingZeros(node, QUAD)
+    } else if is(opcode, "lzcnti") {
+        countLeadingZeros(node, INT)
+    } else if is(opcode, "lzcntq") {
+        countLeadingZeros(node, QUAD)
+    } else if is(opcode, "fii2d") {
+        puts(u.cat4("movd ", x86Operand(o[0], INT), ", ", x86Operand(o[2], DOUBLE)))
+        puts(u.cat3("movd ", x86Operand(o[1], INT), ", %xmm7"))
+        puts("psllq $32, %xmm7")
+        puts(u.cat("por %xmm7, ", x86Operand(o[2], DOUBLE)))
+    } else if is(opcode, "fd2ii") {
+        puts(u.cat4("movd ", x86Operand(o[0], DOUBLE), ", ", x86Operand(o[1], INT)))
+        puts(u.cat3("movsd ", x86Operand(o[0], DOUBLE), ", %xmm7"))
+        puts("psrlq $32, %xmm7")
+        puts(u.cat("movd %xmm7, ", x86Operand(o[2], INT)))
+    } else if is(opcode, "fq2d") {
+        puts(u.cat4("movq ", x86Operand(o[0], QUAD), ", ", x86Operand(o[1], DOUBLE)))
+    } else if is(opcode, "fd2q") {
+        puts(u.cat4("movq ", x86Operand(o[0], DOUBLE), ", ", x86Operand(o[1], QUAD)))
+    } else if is(opcode, "fi2f") {
+        puts(u.cat("movd ", operands2(node, INT, FLOAT)))
+    } else if is(opcode, "ff2i") {
+        puts(u.cat("movd ", operands2(node, FLOAT, INT)))
+    } else if is(opcode, "bo") || is(opcode, "bs") || is(opcode, "bz") || is(opcode, "bnz") {
+        puts(u.cat4("j", opcode[1..opcode.length], " ", asmLabel(o[0])))
+    } else if is(opcode, "leai") {
+        puts(u.cat("leal ", order(x86AddressOperand(o[0], INT), x86Operand(o[1], INT))))
+    } else if is(opcode, "memfence") || is(opcode, "fence") {
+        puts("lock; orl $0, (%rsp)")
+    } else if is(opcode, "absf") || is(opcode, "negf") {
+        puts(u.cat("movl ", order("$0x80000000", x86Operand(scratch(), INT))))
+        puts(u.cat("movd ", order(x86Operand(scratch(), INT), x86Operand(o[1], FLOAT))))
+        puts(u.cat3(if is(opcode, "absf") { "andnps" } else { "xorps" }, " ", order(x86Operand(o[0], FLOAT), x86Operand(o[1], FLOAT))))
+    } else if is(opcode, "absd") || is(opcode, "negd") {
+        puts(u.cat("movq ", order("$0x8000000000000000", x86Operand(scratch(), QUAD))))
+        puts(u.cat("movd ", order(x86Operand(scratch(), QUAD), x86Operand(o[1], DOUBLE))))
+        puts(u.cat3(if is(opcode, "absd") { "andnps" } else { "xorpd" }, " ", order(x86Operand(o[0], DOUBLE), x86Operand(o[1], DOUBLE))))
+    } else if is(opcode, "tls_loadp") {
+        if o[0].*.kind == ast.IMMEDIATE {
+            puts(u.cat("movq ", order(u.cat("%gs:", u.decimal128(o[0].*.value * 8)), x86Operand(o[1], QUAD))))
+        } else {
+            puts(u.cat("movq ", order(u.cat3("%gs:(, ", x86Operand(o[0], QUAD), ", 8)"), x86Operand(o[1], QUAD))))
+        }
+    } else if is(opcode, "tls_storep") {
+        if o[1].*.kind == ast.IMMEDIATE {
+            puts(u.cat("movq ", order(x86Operand(o[0], PTR), u.cat("%gs:", u.decimal128(o[1].*.value * 8)))))
+        } else {
+            puts(u.cat("movq ", order(x86Operand(o[0], PTR), u.cat3("%gs:(, ", x86Operand(o[1], PTR), ", 8)"))))
+        }
+    } else if atomics(node, opcode) {
+        // (Done.)
+    } else {
+        lowerDefault(node)
+    }
+}
+
+fn atomicKind(letter: u8) -> u8 {
+    if letter == 98 { return BYTE }
+    if letter == 104 { return HALF }
+    if letter == 105 { return INT }
+    return QUAD
+}
+
+fn atomics(node: *Node, opcode: []const u8) -> bool {
+    const o = node.*.items
+    const last = opcode[opcode.length - 1]
+    if std.text.startsWith(opcode, "atomicxchgadd") && opcode.length == 14 {
+        const kind = atomicKind(last)
+        puts(u.cat4("lock xadd", suffix(kind), " ", operands2(node, kind, kind)))
+        return true
+    }
+    if std.text.startsWith(opcode, "atomicxchgsub") && opcode.length == 14 {
+        const kind = atomicKind(last)
+        puts(u.cat4("neg", suffix(kind), " ", x86Operand(o[0], kind)))
+        puts(u.cat4("lock xadd", suffix(kind), " ", operands2(node, kind, kind)))
+        return true
+    }
+    if std.text.startsWith(opcode, "atomicxchg") && opcode.length == 11 {
+        const kind = atomicKind(last)
+        puts(u.cat4("xchg", suffix(kind), " ", operands2(node, kind, kind)))
+        return true
+    }
+    const branching = std.text.startsWith(opcode, "batomicweakcas") && opcode.length == 15
+    if branching || (std.text.startsWith(opcode, "atomicweakcas") && opcode.length == 14) {
+        if !(o[0].*.kind == ast.REGISTER && std.text.same(o[0].*.name, "t0")) { s.fail("offlineasm: first operand must be t0") }
+        const kind = atomicKind(last)
+        puts(u.cat4("lock cmpxchg", suffix(kind), " ", order(x86Operand(o[1], kind), x86Operand(o[2], kind))))
+        if branching { puts(u.cat("jne ", asmLabel(o[node.*.count - 1]))) }
+        return true
+    }
+    return false
+}
+
+// Instruction#lowerDefault.
+fn lowerDefault(node: *Node) -> void {
+    const opcode = node.*.name
+    if is(opcode, "localAnnotation") {
+        // Instruction annotations are off: nothing.
+    } else if is(opcode, "globalAnnotation") {
+        putsNewlineSpacerIfAppropriate(SPACER_ANNOTATION)
+    } else if is(opcode, "emit") {
+        var text = u.bufNew(64)
+        var index: usize = 0
+        while index < node.*.count {
+            const operand = node.*.items[index]
+            if operand.*.kind == ast.LOCAL_LABEL_REFERENCE {
+                u.bufAdd(&text, asmLabel(operand))
+            } else {
+                u.bufAdd(&text, ast.dump(operand))
+            }
+            index += 1
+        }
+        puts(u.bufText(&text))
+    } else if is(opcode, "tagCodePtr") || is(opcode, "tagReturnAddress") || is(opcode, "untagReturnAddress") || is(opcode, "removeCodePtrTag") || is(opcode, "untagArrayPtr") || is(opcode, "removeArrayPtrTag") {
+        // Nothing.
+    } else {
+        s.fail(u.cat3("offlineasm: Unhandled opcode ", opcode, u.cat(" at ", ast.originString(node.*.origin))))
+    }
+}
