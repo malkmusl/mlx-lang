@@ -632,10 +632,9 @@ MlxLayerTreeHost::MlxLayerTreeHost(Page& page, Mode mode)
         if (!m_onGPU && m_mode == Mode::Synchronous)
             m_compositorQueue = nullptr;
     }
-    // (On the GPU with MLX_PAINTING=gpu, the tiles painted there too, by
-    // Ganesh over ANGLE's GLES: the painting engine has the main thread's
-    // Skia context's proxy. Not by default: Ganesh's SkSL compiler, as
-    // mlx-cc compiles it, fails on its GPU module; PORT.md.)
+    // (On the GPU the tiles are painted there too, by Ganesh over ANGLE's
+    // GLES, unless MLX_PAINTING=cpu: the painting engine has the main
+    // thread's Skia context's proxy.)
     if (m_onGPU) {
         auto& display = PlatformDisplay::sharedDisplay();
         bool onGPU = mlxGPUPaintingWanted() && display.skiaGLContext() && display.skiaGrContext();

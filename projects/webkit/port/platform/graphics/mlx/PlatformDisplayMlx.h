@@ -23,10 +23,10 @@ bool mlxANGLEDeviceIsCPU(const char** name = nullptr);
 // is no display or no GL context can be made on it.
 bool mlxEnsureSharedDisplay();
 
-// Whether Ganesh paints on the display (MLX_PAINTING=gpu): a layer's tiles
-// with the GPU's compositor, and the canvases WebKit asks to accelerate
-// (RenderingPurpose::Canvas: a WebGL canvas drawn into a 2D one).
-// Otherwise PlatformDisplay::skiaGLContext() is null and they are
+// Whether Ganesh paints on the display (unless MLX_PAINTING=cpu): a
+// layer's tiles with the GPU's compositor, and the canvases WebKit asks
+// to accelerate (RenderingPurpose::Canvas: a WebGL canvas drawn into a 2D
+// one). Otherwise PlatformDisplay::skiaGLContext() is null and they are
 // painted on the CPU.
 bool mlxGPUPaintingWanted();
 

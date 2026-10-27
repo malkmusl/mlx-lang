@@ -10,9 +10,9 @@
 // What PlatformDisplaySkia.cpp gives (Ganesh on the display: a GL
 // context and a GrDirectContext for each thread that paints) is the
 // port's here, since WebKit's makes it only for GTK and WPE: with the GPU
-// compositor and MLX_PAINTING=gpu, a layer's tiles are painted by Ganesh
-// over ANGLE's GLES into textures (SkiaPaintingEngineMlx.cpp); otherwise
-// on the CPU and uploaded.
+// compositor, a layer's tiles are painted by Ganesh over ANGLE's GLES into
+// textures (SkiaPaintingEngineMlx.cpp); with MLX_PAINTING=cpu on the CPU
+// and uploaded.
 #include "config.h"
 #include "PlatformDisplayMlx.h"
 
@@ -90,7 +90,7 @@ static thread_local std::unique_ptr<MlxSkiaGLContext> s_skiaGLContext;
 bool mlxGPUPaintingWanted()
 {
     const char* painting = getenv("MLX_PAINTING");
-    return painting && !strcmp(painting, "gpu");
+    return !painting || strcmp(painting, "cpu");
 }
 
 GLContext* PlatformDisplay::skiaGLContext()

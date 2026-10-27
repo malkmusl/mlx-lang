@@ -6,7 +6,7 @@
 // back into each dirty tile's buffer (CoordinatedUnacceleratedTileBuffer)
 // on worker threads, which the compositor copies into its tiles
 // (SkiaBackingStoreMlx.cpp). With a GrContextThreadSafeProxy (the GPU
-// compositor's host gives one with MLX_PAINTING=gpu: MlxLayerTreeHost),
+// compositor's host gives one unless MLX_PAINTING=cpu: MlxLayerTreeHost),
 // the recording is played
 // back by Ganesh over ANGLE's GLES instead, as WebKit's engine does without
 // deferred display lists: into a texture of BitmapTexturePool's
