@@ -550,8 +550,12 @@ public:
             glDeleteTextures(1, &color);
         if (depthStencil)
             glDeleteRenderbuffers(1, &depthStencil);
-        if (presentImage != EGL_NO_IMAGE_KHR)
+        if (presentImage != EGL_NO_IMAGE_KHR) {
             eglDestroyImageKHR(eglDisplay, presentImage);
+            // (ANGLE's work on the image done before the presenter frees
+            // it: a tab closed freed it under lavapipe's draws of it.)
+            glFinish();
+        }
         presentImage = EGL_NO_IMAGE_KHR;
         framebuffer = color = depthStencil = 0;
         size = { };

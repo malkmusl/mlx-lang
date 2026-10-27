@@ -129,7 +129,9 @@ extern "C" void mlxVulkanPresenterDestroy(void* presenter)
     auto* p = static_cast<Presenter*>(presenter);
     if (!p)
         return;
-    vkDeviceWaitIdle(p->device);
+    // (Its copies were waited for; ANGLE's work on the image is finished
+    // by the caller, glFinish: the queue is ANGLE's, not to be waited on
+    // here unlocked.)
     destroyImage(*p);
     vkDestroyFence(p->device, p->fence, nullptr);
     vkDestroyCommandPool(p->device, p->pool, nullptr);
