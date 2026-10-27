@@ -387,6 +387,30 @@ mlx-cc compiles both as released now:
   62 of 62, check_webkit_mlx_layout.sh 44 of 44, check_voyager.sh all,
   on the GPU path; the CPU's path (`MLX_COMPOSITING=cpu`) paints the
   same pixels as the GPU's for composited, forced dark and WebGL pages.
+- **M8, part 4, done** (tiles painted on the GPU, frames presented
+  directly; "Compositing" below): with the GPU's compositor, Ganesh over
+  ANGLE paints the layers' tiles into textures by default
+  (`MLX_PAINTING=cpu` for the CPU's painting and uploads), after mlx-cc's
+  epochs 27 to 31 fixed what Skia's GPU code met (remove_if copying
+  unique_ptrs, deleted assignments taken as bytes, `new (n) T` with a
+  size, a `T &` bound to a temporary of another type, a member function's
+  result instantiated while its class was laid out, a member template's
+  definition applied twice, an overloaded name for a function reference);
+  ANGLE has its share context lock. On a GPU the frame is copied by the
+  device into the window's wl_shm buffer; on a CPU's device it is read
+  back (`MLX_COMPOSITOR_PRESENT=gpu|read`). On lavapipe (ms a frame of
+  the compositor thread, then of the embedder's take, from
+  `MLX_TRACE_COMPOSITOR`, medians past the load), CPU painting with read
+  back, GPU painting with read back, GPU painting presented directly:
+  check_voyager.sh's animation 1.4 + 1.7, 1.4 + 1.7, 1.2 + 3.9; a long
+  page scrolled by whole views (wheel and Page Down) 4.0 + 1.9,
+  3.3 + 1.9, 3.0 + 3.7; the WebGL page 1.3 + 1.7, 1.3 + 1.7,
+  1.0 + 4.8 (60, 60 and 56 frames a second). Checks, on the GPU path and
+  with `MLX_COMPOSITING=cpu`: check_webkit_mlx_compositing.sh 103 of
+  103, check_webkit_mlx_paint.sh 19 of 19, check_webkit_mlx_webgl.sh 62
+  of 62, check_webkit_mlx_layout.sh 44 of 44, storage 63 of 63, network
+  37 of 37, crypto 231 of 231, check_voyager.sh (also with
+  `MLX_COMPOSITOR_PRESENT=gpu`), tools/check_cpp.sh.
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -606,12 +630,12 @@ port takes:
   is ANGLE's surfaceless display on Vulkan, the one WebGL's contexts are
   made on (`mlxANGLEDisplay`), made the shared display only when a host
   composes on the GPU. `ProcessCapabilities::setCanUseAcceleratedBuffers(false)`:
-  no canvas or image buffer is painted on the GPU; layers' tiles only
-  with `MLX_PAINTING=gpu` (Ganesh over ANGLE, a GL context per painting
-  thread: "What M8's third part leaves"), and only then has the display a
-  Skia context (`PlatformDisplay::skiaGLContext`, the port's): WebKit
-  accelerates a canvas' buffers (`RenderingPurpose::Canvas`, a WebGL
-  canvas drawn into a 2D one) whenever there is one.
+  no canvas or image buffer is painted on the GPU; layers' tiles are
+  (Ganesh over ANGLE, a GL context per painting thread: "The tiles'
+  painting" below) unless `MLX_PAINTING=cpu`, and only then has the
+  display a Skia context (`PlatformDisplay::skiaGLContext`, the port's):
+  WebKit accelerates a canvas' buffers (`RenderingPurpose::Canvas`, a
+  WebGL canvas drawn into a 2D one) whenever there is one.
 - **The tiles' painting, the port's** (WebKit's files take GL for
   granted): `SkiaPaintingEngineMlx.cpp` records a layer's dirty region on
   the main thread (`GraphicsContextSkia` over an `SkPictureRecorder`) and
@@ -620,10 +644,25 @@ port takes:
   as WebKit reads it); `SkiaBackingStoreMlx.cpp` keeps the tiles as raster
   `SkSurface`s on the compositor's side, copying in a buffer's dirty
   rectangle when its painting is complete, and draws them (with the
-  damage's culling) for `SkiaCompositingLayer`. On the GPU the same
-  tiles go to texmap's backing store, which uploads each into a texture
+  damage's culling) for `SkiaCompositingLayer`. On the GPU's compositor
+  the recordings are played back by Ganesh over ANGLE's GLES instead:
+  the host gives its painting engine the proxy of the main thread's Skia
+  context, and each recording (forced dark applied when it was recorded,
+  images as they are) is played on a GPU painting thread
+  (`WEBKIT_SKIA_GPU_PAINTING_THREADS`, 2 by default), each with its own
+  GL context and GrDirectContext (PlatformDisplayMlx.cpp), into a
+  texture of BitmapTexturePool's (CoordinatedAcceleratedTileBuffer),
+  which the tile takes: no upload. ANGLE is built with its share context
+  lock and context mutexes (angle.mlx: those contexts, the compositor's
+  and WebGL's are current on several threads at once). With
+  `MLX_PAINTING=cpu` the tiles are painted on the CPU as above and go to
+  texmap's backing store, which uploads each into a texture
   (`BitmapTexture::updateContents`); an image a layer shows directly is
-  uploaded once (CoordinatedPlatformLayerBufferNativeImageMlx.cpp).
+  uploaded once (CoordinatedPlatformLayerBufferNativeImageMlx.cpp). What
+  kept Ganesh off was mlx-cc's (epochs 27 to 31: SkSL's module loader
+  reading freed elements, GrSkSLFP built at address 0, a processor's
+  flags never cleared, skvx::Vec<4,float>'s halves at one offset, which
+  drew no anti-aliased path).
 - **The host: `port/embed/MlxLayerTreeHost`**, what WebKit2's
   `LayerTreeHost`, `ThreadedCompositor` and `DrawingArea` are to WPE, in
   one process: the chrome client's `GraphicsLayerFactory`,
@@ -668,7 +707,27 @@ port takes:
   compositor thread's frame went from 5.4 to 2.5 ms (the animation page),
   12.1 to 4.7 ms (a page scrolled by whole views) and 6.0 to 2.2 ms
   (WebGL's), the read's part from 3.9, 8.4 and 4.6 ms to 0.8, 1.2 and
-  0.6. Forced dark: tiles and
+  0.6. On a GPU the frame is presented directly instead
+  (port/angle/vulkan_present.cpp, `MlxLayerTreeHost::presentFrame`): the
+  framebuffer's colour is a B8G8R8A8 VkImage of the port's on ANGLE's
+  VkDevice (EGL_ANGLE_device_vulkan's handles), which ANGLE draws into as
+  an EGLImage (EGL_ANGLE_vulkan_image); when the embedder takes the
+  frame, the window's wl_shm buffer is imported into that device as host
+  memory (VK_EXT_external_memory_host, which ANGLE enables for OpenCL
+  only: the port's display asks for its feature `supportsExternalMemoryHost`
+  through EGL_FEATURE_OVERRIDES_ENABLED_ANGLE, and is made without it
+  where the driver has no such extension), and a copy on ANGLE's queue
+  (under eglLockVulkanQueueANGLE, between glReleaseTexturesANGLE and
+  glAcquireTexturesANGLE) writes the frame into it: no read back, no swap
+  and no copy on the processor. On a CPU's device (lavapipe, llvmpipe,
+  SwiftShader) frames are read back by default, since there the copy is
+  the processor's too and the take waits for the frame's drawing, which
+  the asynchronous read leaves to the device's threads (on lavapipe the
+  take of an animation frame 3.9 ms presented against 1.7 ms read back and
+  copied, a whole view scrolled 3.7 against 1.9, WebGL's 4.8 against
+  1.7). `MLX_COMPOSITOR_PRESENT=gpu` presents directly on any device
+  (check_voyager.sh passes so on lavapipe), `=read` reads back on any;
+  `MLX_TRACE_COMPOSITOR` says which, why, and each take's time. Forced dark: tiles and
   images were darkened when recorded; a layer's solid colour is given to
   its TextureMapperLayer darkened after each flush (`darkenSolidColors`:
   CoordinatedPlatformLayer keeps the colour private, read through a
@@ -1610,42 +1669,25 @@ What M2 found, and how the port meets it without a patch:
     visible rects (`LAYER_TREE_INCLUDES_*` WebKit2 fills), iframes'
     text in dumpAsText, and layers WebKit2's drawing area adds.
 - **What M8's third part leaves** (compositing on the GPU):
-  - Presenting copies: the frame's damage is read back from the GPU
-    (asynchronously, the compositor thread not waiting) into the host's
-    raster frame, which the embedder copies into its wl_shm buffer. Zero
-    copy is open. A dmabuf the Wayland compositor takes (linux-dmabuf:
-    projects/desktop/compositor accepts one linear ARGB8888 plane) needs
-    ANGLE's framebuffer in exportable memory of a DRM device
-    (VK_EXT_external_memory_dma_buf with DRM format modifiers; the port
-    has no GBM, `USE_GBM` off), which lavapipe without a render node
-    cannot give, so nothing here could test it. A Vulkan swapchain of
-    std.ui.gpu_canvas's (VK_KHR_wayland_surface) needs ANGLE's image and
-    std.ui's device to meet (std.vulkan's instance is not ANGLE's: an
-    image exported as an opaque fd, VK_KHR_external_memory_fd, imported by
-    ANGLE through GL_EXT_memory_object_fd, a semaphore the same way), and
-    the page its own surface: Voyager's window is one wl_shm surface std.ui
-    draws, chrome and page, so the page would be a wl_subsurface std.ui's
-    panel does not make yet. On lavapipe a swapchain's present is itself a
-    copy into wl_shm.
-  - Tiles, images and 2D canvases are painted on the CPU and uploaded.
-    Painting tiles with Ganesh over ANGLE's GLES is in place but off:
-    `MLX_PAINTING=gpu` (with the GPU compositor) has the host give its
-    painting engine the proxy of the main thread's Skia context, and
-    SkiaPaintingEngineMlx.cpp plays each recording (forced dark applied
-    when it was recorded, images as they are) back on a GPU painting
-    thread (`WEBKIT_SKIA_GPU_PAINTING_THREADS`, 2 by default) into a
-    texture of BitmapTexturePool's (CoordinatedAcceleratedTileBuffer),
-    each thread with its own GL context and GrDirectContext
-    (PlatformDisplayMlx.cpp); the tile takes the texture, no upload. What
-    blocks it is Skia's SkSL compiler as mlx-cc compiles it: loading the
-    `sksl_gpu` module (the first text drawn: the long page) reaches
-    `SkUNREACHABLE` in `TProgramVisitor::visitProgramElement`, a module
-    element of no kind it knows, on one painting thread as on two (the
-    animation and WebGL pages, whose tiles have no text, ran without it). An earlier failure there, the module's numbers read as
-    garbage, was mlxlibcpp's: `std::stringstream` was an `ostringstream`
-    and Skia's `SkSL::stod` read nothing (fixed: it reads now). No GPU
-    atlases of images, no deferred display lists, and 2D canvases stay on
-    the CPU (ProcessCapabilities says no accelerated buffers).
+  - Presenting without a copy at all: on a GPU the frame is copied by
+    the device into the window's wl_shm buffer (imported as host memory),
+    on a CPU's device read back. Handing the Wayland compositor the frame
+    itself needs a dmabuf (linux-dmabuf: projects/desktop/compositor
+    accepts one linear ARGB8888 plane) of ANGLE's framebuffer in
+    exportable memory of a DRM device (VK_EXT_external_memory_dma_buf with
+    DRM format modifiers; the port has no GBM, `USE_GBM` off), which
+    lavapipe without a render node cannot give, so nothing here could test
+    it; or a Vulkan swapchain of std.ui.gpu_canvas's
+    (VK_KHR_wayland_surface), which needs ANGLE's image and std.ui's
+    device to meet (std.vulkan's instance is not ANGLE's) and the page its
+    own wl_subsurface, which std.ui's panel does not make yet. The direct
+    copy is waited for on the main thread (the take, through the
+    compositor's thread for its context); a copy into a buffer the window
+    commits later would not be.
+  - Images and 2D canvases are painted on the CPU and uploaded (tiles are
+    Ganesh's): no GPU atlases of images, no deferred display lists, and
+    2D canvases stay on the CPU (ProcessCapabilities says no accelerated
+    buffers).
   - Forced dark's solid colour layers are darkened through a pointer to
     CoordinatedPlatformLayer's private `m_contentsColor` (taken in an
     explicit instantiation). A hook the port owns needs one upstream
