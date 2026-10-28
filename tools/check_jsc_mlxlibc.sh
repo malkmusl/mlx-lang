@@ -11,10 +11,15 @@
 #   - the scripts of projects/webkit/tests/jsc print what they print on
 #     the glibc-linked jsc (their .expected files; Intl and the core
 #     language as node prints them, a stress of the runtime, sorting,
-#     typed arrays), run with an empty environment; the benchmark
+#     typed arrays, exceptions caught in hot functions), run with an
+#     empty environment; the benchmark
 #     tests/bench/bench.js runs, its results right;
 #   - a running jsc has mlxlibc's loader mapped and neither glibc's C
-#     library nor its loader.
+#     library nor its loader;
+#   - WTF's generic run loop (tests/wtf-runloop.cpp, built as
+#     webkit-wtf-runloop) starts, stops, destroys and fires timers in
+#     its tree without a dangling CheckedPtr, and prints what
+#     tests/wtf-runloop.expected says.
 #
 #   tools/check_jsc_mlxlibc.sh [--no-build]   (--no-build: jsc as it is)
 set -euo pipefail
@@ -26,8 +31,8 @@ trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 
 if [[ "${1:-}" != --no-build ]]; then
-    ./mlx build libc webkit-jsc-shell -j 2 > "$work/build.log" 2>&1 || { tail -20 "$work/build.log"; fail "./mlx build libc webkit-jsc-shell"; }
-    echo "ok   ./mlx build libc webkit-jsc-shell"
+    ./mlx build libc webkit-jsc-shell webkit-wtf-runloop -j 2 > "$work/build.log" 2>&1 || { tail -20 "$work/build.log"; fail "./mlx build libc webkit-jsc-shell webkit-wtf-runloop"; }
+    echo "ok   ./mlx build libc webkit-jsc-shell webkit-wtf-runloop"
 fi
 jsc=$repo_root/mlx-out/webkit/bin/jsc
 [[ -x "$jsc" ]] || fail "$jsc is missing"
@@ -55,6 +60,7 @@ run numbers-percent numbers.js -- percent
 run stress stress.js
 run sort sort.js
 run f64 f64.js
+run exceptions exceptions.js
 echo "ok   ${#ran[@]} scripts print what the glibc-linked jsc prints: ${ran[*]}"
 
 # The benchmark (projects/webkit/tests/bench/bench.js): each section
@@ -78,5 +84,12 @@ grep -q "$repo_root/mlx-out/libc/libmlxc.so.1" <<< "$maps" || fail "jsc does not
 grep -q "$repo_root/mlx-out/libc/libm.so.6" <<< "$maps" || fail "jsc does not have mlxlibc's libm.so.6"
 ! grep -E -q "/libc\.so\.6|/ld-linux|/libm\.so\.6" <<< "$(grep -v "$repo_root/mlx-out/libc/" <<< "$maps")" || fail "glibc is in jsc's process"
 echo "ok   a running jsc has mlxlibc's loader and libm mapped, and nothing of glibc"
+
+# WTF's generic run loop: its timer tree (port/wtf/RunLoopGenericMlx.cpp).
+runloop=$repo_root/mlx-out/webkit/bin/wtf-runloop
+[[ -x "$runloop" ]] || fail "$runloop is missing"
+env -i timeout 120 "$runloop" > "$work/runloop.out" 2>&1 || fail "wtf-runloop exits with $?: $(tail -3 "$work/runloop.out")"
+diff -u projects/webkit/tests/wtf-runloop.expected "$work/runloop.out" > "$work/runloop.diff" || { head -20 "$work/runloop.diff"; fail "wtf-runloop prints otherwise than tests/wtf-runloop.expected"; }
+echo "ok   wtf-runloop: the generic run loop's timers started, stopped, destroyed and fired"
 
 echo "check_jsc_mlxlibc.sh: all checks passed"

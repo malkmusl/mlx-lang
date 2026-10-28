@@ -480,6 +480,36 @@ mlx-cc compiles both as released now:
   of 37, crypto 231 of 231, compositing 103 of 103, webgl 62 of 62,
   check_voyager.sh, check_cpp.sh (585 programs), check_jsc_mlxlibc.sh,
   check_webkit_upstream.sh.
+
+  An exception thrown in JIT code escaped its `try` (a direct eval's, a
+  `replace` callback's, a JSON reviver's, a sort comparator's once the
+  caller was compiled): mlx-cc made every JIT operation's
+  `ExceptionOperationResult` through ExceptionOperationImplicitResult's
+  conversion to a bare `T` (the value alone, the exception flag lost)
+  instead of its conversion to `ExceptionOperationResult<T>`; and
+  `c ? T(a) : T(b)` moved the branch's temporary into the result by its
+  bytes, so the DFG's `Vector<CallVariant, 1>` of a call's status
+  pointed into a dead temporary's inline buffer and libpas freed it
+  (handleArraySort). Epoch 41 (conversiontemplateordering,
+  conditionalinlinebuffer); tests/jsc/exceptions.js
+  (check_jsc_mlxlibc.sh) throws each 3000 times.
+
+  The rare stop of webcore-dump on a CheckedPtr to a dead ScheduledTask
+  of the generic RunLoop's timer tree (about one run in 30 of crypto's
+  RSA key generation, with or without the JIT) is WebKit's, not a
+  miscompilation: RedBlackTree::remove takes a node out but leaves its
+  m_left and m_right, CheckedPtrs, at the children it had; when one of
+  those children's timer is destroyed, WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR
+  finds it still counted (scribbles and leaks it), and the removed task's
+  next insert releases the dead child. Three timers do it every time
+  (tests/wtf-runloop.cpp, built as `webkit-wtf-runloop`; WebKit's main
+  branch has the same `remove`). port/wtf/RunLoopGenericMlx.cpp compiles
+  RunLoopGeneric.cpp with an explicit specialization of the tree's
+  `remove` for the run loop's tasks (WebKit's body, then the node's
+  reset), declared before its first use; wtf-runloop's 20000 random
+  timer steps pass (check_jsc_mlxlibc.sh), and crypto's five RSA
+  key-generation tests passed 150 runs of 150.
+
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -605,7 +635,7 @@ port in the tarball that builds WebCore without GLib).
 
 | | Choice | Why |
 |---|---|---|
-| Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
+| Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, through port/wtf/RunLoopGenericMlx.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
 | Graphics | `USE_SKIA`, CPU raster; no `USE_CAIRO` | Skia compiles here already (`webkit-skia`); WebCore's only living 2D back end besides Cairo (GTK/WPE moved to Skia); CPU first, no EGL |
 | Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the GPU by TextureMapper over ANGLE's GLES (since M8's third part), on the CPU by `SkiaCompositingLayer` without a Vulkan device or on a CPU's (lavapipe), unless `MLX_COMPOSITING=gpu`; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles, TextureMapper and scrolling tree as they are ("Compositing") |
 | WebGL | `ENABLE_WEBGL` and `USE_ANGLE` (since M8): `GraphicsContextGLANGLE` with the port's GraphicsContextGLMlx, ANGLE on Vulkan (libmlxvulkan.so) | ANGLE is WebKit's WebGL everywhere; Vulkan is what std.gpu speaks, and lavapipe runs it without a GPU ("WebGL") |
@@ -629,7 +659,9 @@ As M1 has them: JSCOnly's sources (lists/wtf.txt: `generic/`,
 and std.timezone, `TextBreakIteratorInternalICUUnix`.
 
 **The main loop.** WebCore and the embedder run on the main thread's
-`RunLoop` (RunLoopGeneric: a condition variable, a tree of timers). The
+`RunLoop` (RunLoopGeneric: a condition variable, a tree of timers;
+port/wtf/RunLoopGenericMlx.cpp compiles WebKit's file with its tree's
+`remove` leaving the removed task unlinked, M8's sixth part). The
 port's I/O (the Wayland socket, network sockets, file watchers) is waited
 for by one thread of the port's Mlx side on std.linux's epoll, timerfd
 and eventfd, which hands each ready source to the main thread with
@@ -1709,11 +1741,6 @@ What M2 found, and how the port meets it without a patch:
   - Half of the Wikipedia page's time is bmalloc's (libpas') allocation,
     which mlx-cc compiles without inlining (about 41% of a profile with
     the LLInt).
-  - Rarely (about one run in 30 of crypto's RSA key generation, with or
-    without the JIT), webcore-dump stops on a CheckedPtr to a dead
-    ScheduledTask in the generic RunLoop's timer tree:
-    RedBlackTree::remove leaves a removed node's children in it, and a
-    node inserted again releases them after they died.
 - **What M8's first part leaves** (composited layers on the CPU):
   - Voyager presents a frame on its window's thread, which is WebCore's
     main thread: the compositor composites, scrolls and animates on its
