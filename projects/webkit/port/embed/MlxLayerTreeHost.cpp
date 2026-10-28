@@ -514,15 +514,21 @@ public:
     {
         if (!presenter || presentImage == EGL_NO_IMAGE_KHR || !color)
             return false;
+        static bool trace = getenv("MLX_TRACE_COMPOSITOR");
+        auto t0 = MonotonicTime::now();
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         GLenum layout = GL_NONE;
         glReleaseTexturesANGLE(1, &color, &layout);
+        auto t1 = MonotonicTime::now();
         uint32_t after = layout;
         auto lock = [](void* display) { eglLockVulkanQueueANGLE(static_cast<EGLDisplay>(display)); };
         auto unlock = [](void* display) { eglUnlockVulkanQueueANGLE(static_cast<EGLDisplay>(display)); };
         bool copied = mlxVulkanPresenterCopy(presenter, layout, &after, pixels, std::min(width, size.width()), std::min(height, size.height()), stride, lock, unlock, eglDisplay);
+        auto t2 = MonotonicTime::now();
         GLenum acquired = after;
         glAcquireTexturesANGLE(1, &color, &acquired);
+        if (trace)
+            fprintf(stderr, "compositor present: release %.1f copy %.1f acquire %.1f ms\n", (t1 - t0).milliseconds(), (t2 - t1).milliseconds(), (MonotonicTime::now() - t2).milliseconds());
         return copied;
     }
 

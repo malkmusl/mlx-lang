@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
 
 namespace {
@@ -226,6 +227,7 @@ extern "C" bool mlxVulkanPresenterCopy(void* presenter, uint32_t glLayout, uint3
     void* hostPointer = reinterpret_cast<void*>(base);
     ++p.copies;
     Presenter::Import* found = nullptr;
+    bool fresh = false;
     Presenter::Import* oldest = &p.imports[0];
     for (auto& import : p.imports) {
         if (import.buffer && import.base == base && import.size == size)
@@ -272,6 +274,7 @@ extern "C" bool mlxVulkanPresenterCopy(void* presenter, uint32_t glLayout, uint3
         }
         freeImport(p, *oldest);
         found = oldest;
+        fresh = true;
         found->base = base;
         found->size = size;
         found->buffer = buffer;
@@ -329,12 +332,21 @@ extern "C" bool mlxVulkanPresenterCopy(void* presenter, uint32_t glLayout, uint3
             submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &p.commands;
+            static bool trace = getenv("MLX_TRACE_COMPOSITOR");
+            struct timespec t0, t1, t2;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
             lock(lockContext);
             VkResult result = vkQueueSubmit(p.queue, 1, &submit, p.fence);
             unlock(lockContext);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
             if (result == VK_SUCCESS) {
                 copied = vkWaitForFences(p.device, 1, &p.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
                 vkResetFences(p.device, 1, &p.fence);
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t2);
+            if (trace) {
+                auto ms = [](const timespec& a, const timespec& b) { return (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_nsec - a.tv_nsec) / 1e6; };
+                fprintf(stderr, "presenter: import %s, submit %.1f wait %.1f ms\n", fresh ? "new" : "kept", ms(t0, t1), ms(t1, t2));
             }
         }
     }
