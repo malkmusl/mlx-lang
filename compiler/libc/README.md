@@ -73,8 +73,11 @@ and where it goes.
 - **`heap.mlx`**: `malloc`, `free`, `calloc`, `realloc`, `posix_memalign`,
   `aligned_alloc`, `malloc_usable_size` on `std.general_purpose_allocator`
   with a 16-byte header per block.
-- **`string.mlx`**, **`ctype.mlx`**: the `mem*`/`str*` set, `strerror`
-  (glibc's texts), `strsignal`, the `__ctype_*_loc` tables.
+- **`string.mlx`**, **`ctype.mlx`**: the `mem*`/`str*` set (`memcpy`,
+  `memmove` and `memset` of 64 bytes or more as `rep movsb`/`rep stosb`,
+  machine code `sys.installFastMemory` puts on a page at the start:
+  glibc's speed), `strerror` (glibc's texts), `strsignal`, the
+  `__ctype_*_loc` tables.
 - **`stdlib.mlx`**, **`bignum.mlx`**: `strtol`/`strtod` (exact, through
   1536-bit integers), `qsort`, `bsearch`, `rand` (glibc's TYPE_3
   sequence), `getenv`/`setenv`, `exit` and `atexit`, `system`.
