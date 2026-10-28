@@ -460,6 +460,26 @@ mlx-cc compiles both as released now:
   layout 44 of 44, paint 19 of 19, storage 63 of 63, network 37 of 37,
   crypto 231 of 231, compositing 103 of 103, webgl 62 of 62,
   check_voyager.sh, check_webkit_upstream.sh.
+- **M8, part 6** (JavaScriptCore's JIT finished): WebCore's CSS selector
+  JIT is on (`ENABLE_CSS_SELECTOR_JIT`, as WebKit has it with the JIT on
+  x86-64). The selector it compiled for `:root::view-transition` crashed
+  on the saved en.wikipedia.org/wiki/WebKit page, a pointer read a byte
+  off: the compiler's StackAllocator (cssjit/StackAllocator.h) computes
+  `stackReference - stackUnitInBytes()`, a StackReference converting to
+  unsigned, and mlx-cc took LayoutUnit's `operator-(int, const
+  LayoutUnit &)` for it (the class through its conversion, the unsigned
+  through LayoutUnit's converting constructor) instead of the built-in
+  subtraction: popAndDiscardUpTo's offsets came out in LayoutUnit's
+  sixty-fourths, the generated code addressed its stack slots wrongly.
+  mlx-cc weighs the built-in operator as a candidate now
+  ([over.match.oper]; epoch 40, test builtinoperatorcandidate), with the
+  fixes B3, Air, the FTL and WebAssembly's sources needed (the epoch's
+  list in compiler/cc/epoch.mlx). The Wikipedia page lays out with the
+  selector JIT as without the JIT (its render tree the same), in 40 s.
+  Checks: layout 44 of 44, paint 19 of 19, storage 63 of 63, network 37
+  of 37, crypto 231 of 231, compositing 103 of 103, webgl 62 of 62,
+  check_voyager.sh, check_cpp.sh (585 programs), check_jsc_mlxlibc.sh,
+  check_webkit_upstream.sh.
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -598,7 +618,7 @@ port in the tarball that builds WebCore without GLib).
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
-| JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; no FTL (B3/Air), no WebAssembly; `ENABLE_CSS_SELECTOR_JIT` off ("What M8's fifth part leaves") | JavaScriptCore's own tiers on x86-64, made by the port's own toolchain: bench.js runs in 1.05 s, 8.4 s with the C loop (below) |
+| JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; no FTL (B3/Air), no WebAssembly; WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, since M8's sixth part) | JavaScriptCore's own tiers on x86-64, made by the port's own toolchain: bench.js runs in 1.05 s, 8.4 s with the C loop (below) |
 
 ### WTF, bmalloc, JavaScriptCore
 
@@ -1686,10 +1706,6 @@ What M2 found, and how the port meets it without a patch:
   has none either). The file chooser has no previews.
 - **What M8's fifth part leaves** (JavaScriptCore's JIT):
   - The FTL (B3 and Air) and WebAssembly are off: the next tiers.
-  - WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, which WebKit
-    turns on with the JIT) is off: a selector it compiled crashed
-    (a pointer read shifted by a byte) styling the saved Wikipedia page,
-    though the layout, paint and compositing checks passed with it.
   - Half of the Wikipedia page's time is bmalloc's (libpas') allocation,
     which mlx-cc compiles without inlining (about 41% of a profile with
     the LLInt).
