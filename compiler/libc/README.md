@@ -150,7 +150,8 @@ and where it goes.
   (where its `libm.so.6` is), the system directories, `/lib/mlx` first), symbol lookup through `DT_GNU_HASH` or `DT_HASH` in
   load order (symbol versions are not compared), relocations (`RELATIVE`,
   `RELR`, `64`, `GLOB_DAT`, `JUMP_SLOT`, `COPY`, `IRELATIVE`, `DTPMOD64`,
-  `DTPOFF64`, `TPOFF64`), static TLS laid out below each thread's control
+  `DTPOFF64`, `TPOFF64`, `TLSDESC` with a static resolver, as Mesa's
+  drivers use), static TLS laid out below each thread's control
   block (the executable's block right under the thread pointer, as its
   code assumes; `__tls_get_addr`; a thread that started before a dlopen
   gets the new module's image on first use), RELRO, constructors and
