@@ -31,7 +31,32 @@ struct Presenter {
     VkImage image { VK_NULL_HANDLE };
     VkDeviceMemory imageMemory { VK_NULL_HANDLE };
     VkImageCreateInfo imageInfo { };
+    // The window's buffers imported (their pages pinned by the driver:
+    // on amdgpu tens of milliseconds for a frame's worth), kept across
+    // frames: a window has a few buffers, reused frame after frame. An
+    // import unused for a while goes, as the window's buffers do on a
+    // resize.
+    struct Import {
+        uintptr_t base { 0 };
+        VkDeviceSize size { 0 };
+        VkBuffer buffer { VK_NULL_HANDLE };
+        VkDeviceMemory memory { VK_NULL_HANDLE };
+        uint64_t lastUsed { 0 };
+    };
+    static constexpr int importCount = 4;
+    static constexpr uint64_t importKept = 60;
+    Import imports[importCount];
+    uint64_t copies { 0 };
 };
+
+void freeImport(Presenter& p, Presenter::Import& import)
+{
+    if (import.buffer)
+        vkDestroyBuffer(p.device, import.buffer, nullptr);
+    if (import.memory)
+        vkFreeMemory(p.device, import.memory, nullptr);
+    import = { };
+}
 
 uint32_t memoryType(Presenter& p, uint32_t bits, VkMemoryPropertyFlags wanted)
 {
@@ -133,6 +158,8 @@ extern "C" void mlxVulkanPresenterDestroy(void* presenter)
     // by the caller, glFinish: the queue is ANGLE's, not to be waited on
     // here unlocked.)
     destroyImage(*p);
+    for (auto& import : p->imports)
+        freeImport(*p, import);
     vkDestroyFence(p->device, p->fence, nullptr);
     vkDestroyCommandPool(p->device, p->pool, nullptr);
     delete p;
@@ -197,36 +224,63 @@ extern "C" bool mlxVulkanPresenterCopy(void* presenter, uint32_t glLayout, uint3
     uintptr_t base = first / p.hostAlignment * p.hostAlignment;
     VkDeviceSize size = (end - base + p.hostAlignment - 1) / p.hostAlignment * p.hostAlignment;
     void* hostPointer = reinterpret_cast<void*>(base);
-    VkMemoryHostPointerPropertiesEXT hostProperties { };
-    hostProperties.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
-    if (p.hostPointerProperties(p.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostPointer, &hostProperties) != VK_SUCCESS || !hostProperties.memoryTypeBits)
-        return false;
-    VkExternalMemoryBufferCreateInfo external { };
-    external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
-    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-    VkBufferCreateInfo bufferInfo { };
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.pNext = &external;
-    bufferInfo.size = size;
-    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkBuffer buffer = VK_NULL_HANDLE;
-    if (vkCreateBuffer(p.device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
-        return false;
-    VkMemoryRequirements requirements;
-    vkGetBufferMemoryRequirements(p.device, buffer, &requirements);
-    VkImportMemoryHostPointerInfoEXT import { };
-    import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
-    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-    import.pHostPointer = hostPointer;
-    VkMemoryAllocateInfo allocateInfo { };
-    allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocateInfo.pNext = &import;
-    allocateInfo.allocationSize = size;
-    allocateInfo.memoryTypeIndex = memoryType(p, hostProperties.memoryTypeBits & requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    ++p.copies;
+    Presenter::Import* found = nullptr;
+    Presenter::Import* oldest = &p.imports[0];
+    for (auto& import : p.imports) {
+        if (import.buffer && import.base == base && import.size == size)
+            found = &import;
+        else if (import.buffer && p.copies - import.lastUsed > Presenter::importKept)
+            freeImport(p, import);
+        if (import.lastUsed < oldest->lastUsed)
+            oldest = &import;
+    }
+    if (!found) {
+        VkMemoryHostPointerPropertiesEXT hostProperties { };
+        hostProperties.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+        if (p.hostPointerProperties(p.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostPointer, &hostProperties) != VK_SUCCESS || !hostProperties.memoryTypeBits)
+            return false;
+        VkExternalMemoryBufferCreateInfo external { };
+        external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo bufferInfo { };
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.pNext = &external;
+        bufferInfo.size = size;
+        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        if (vkCreateBuffer(p.device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+            return false;
+        VkMemoryRequirements requirements;
+        vkGetBufferMemoryRequirements(p.device, buffer, &requirements);
+        VkImportMemoryHostPointerInfoEXT import { };
+        import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = hostPointer;
+        VkMemoryAllocateInfo allocateInfo { };
+        allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocateInfo.pNext = &import;
+        allocateInfo.allocationSize = size;
+        allocateInfo.memoryTypeIndex = memoryType(p, hostProperties.memoryTypeBits & requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (allocateInfo.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(p.device, &allocateInfo, nullptr, &memory) != VK_SUCCESS || vkBindBufferMemory(p.device, buffer, memory, 0) != VK_SUCCESS) {
+            vkDestroyBuffer(p.device, buffer, nullptr);
+            if (memory)
+                vkFreeMemory(p.device, memory, nullptr);
+            return false;
+        }
+        freeImport(p, *oldest);
+        found = oldest;
+        found->base = base;
+        found->size = size;
+        found->buffer = buffer;
+        found->memory = memory;
+    }
+    found->lastUsed = p.copies;
+    VkBuffer buffer = found->buffer;
     bool copied = false;
-    if (allocateInfo.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(p.device, &allocateInfo, nullptr, &memory) == VK_SUCCESS && vkBindBufferMemory(p.device, buffer, memory, 0) == VK_SUCCESS) {
+    {
         VkImageLayout layout = vulkanLayout(glLayout);
         VkCommandBufferBeginInfo begin { };
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -284,8 +338,5 @@ extern "C" bool mlxVulkanPresenterCopy(void* presenter, uint32_t glLayout, uint3
             }
         }
     }
-    vkDestroyBuffer(p.device, buffer, nullptr);
-    if (memory)
-        vkFreeMemory(p.device, memory, nullptr);
     return copied;
 }
