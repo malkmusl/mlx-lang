@@ -510,6 +510,11 @@ mlx-cc compiles both as released now:
   timer steps pass (check_jsc_mlxlibc.sh), and crypto's five RSA
   key-generation tests passed 150 runs of 150.
 
+  fast/selectors: tools/check_webkit_mlx_selectors.sh runs the
+  dumpAsText tests of WebKit's fast/selectors that pass
+  (tests/layout/selectors.txt: 218 of the 251 that dump text) with the
+  selector JIT.
+
   mlx-codemap knew little of JavaScriptCore's JIT: a header's shard of
   the index is written by the first unit that reads it, and the first
   to read LinkBuffer.h had the assembler off (one `#if
