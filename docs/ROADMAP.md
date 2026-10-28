@@ -202,6 +202,38 @@ builtins, and `importC` in Mlx (C and C++ code as Mlx code) follows. The other w
 driver for one GPU family in Mlx (`docs/VULKAN.md` has the first steps)
 takes Mesa out of the picture for that hardware.
 
+## Phase 6b: mlx-cc's code to gcc -O2's speed
+
+Voyager runs, and runs slowly: a profile of its main thread on Google
+and YouTube (`mlx-profile`, 2026-10-28) is flat, the top of it bmalloc's
+`ALWAYS_INLINE` allocation path, `LayoutUnit`'s accessors,
+`OptionSet::containsAny` and `_mm_cmpeq_epi8` as real calls, and 128-bit
+arithmetic through `__mlxcc_wide_*`: the compiler, not one hot spot.
+JavaScriptCore's JIT tiers (LLInt as assembly, Baseline, DFG, FTL,
+WebAssembly) are in, so the C++ is what is left to speed up. The LIR back
+end (mlx4's own LIR, optimizer and register allocation, the default
+since epoch 44) is the first step: SQLite's workload 2.8 s -> 1.43 s,
+bench.js 1.05 s -> 0.75 s. The measure for the rest is a workload's time
+against gcc -O2's, not an estimate: the goal is under 2x on native
+WebKit work (webcore-dump laying out and painting tests/bench's pages,
+jsc on bench.js, SQLite) before anything is called fast.
+
+- [ ] Inlining in the LIR lowering: `always_inline` and small functions
+  (accessors, operators, intrinsics) of the unit at their call sites;
+  the machine code checked by eye on the profile's top functions.
+- [ ] SIMD intrinsics as their instructions (`_mm_cmpeq_epi8`, the SSE2
+  set WebKit's string code uses), not functions.
+- [ ] 128-bit arithmetic as instructions where x86-64 has them (`mul`,
+  add with carry, shifts), the helpers for the rest.
+- [ ] The benchmark: tools/check_cc_projects.sh's SQLite, jsc's bench.js
+  and a webcore-dump workload, each timed against gcc -O2's build of
+  the same, in one script, run before and after each change here.
+- [ ] Voyager profiled again under the same conditions (the same URLs
+  and machine): the main thread, `MlxCompositor`, `MlxGPUPainting`,
+  and JavaScript, layout, painting and compositing told apart.
+- [ ] Zero-copy presentation on a real GPU: the window's buffer a dma-buf
+  the compositor imports (it can), instead of wl_shm read back.
+
 ## Phase 7: boot and bootstrap
 
 1. Boot without GRUB: the kernel's EFI stub started directly, or an EFI
