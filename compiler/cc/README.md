@@ -188,6 +188,107 @@ interpreter; `--dynamic-linker PATH` (also `-Wl,--dynamic-linker=PATH`)
 names another, such as mlxlibc's `libmlxc.so.1`, so it starts on that
 alone.
 
+## The LIR back end
+
+By default (`-fbackend=lir`, or `MLX_CC_BACKEND=lir` in the
+environment; `-fbackend=stack` or `MLX_CC_BACKEND=stack` is the stack
+machine alone, and the environment leaves the command line, and so `mlx
+build`'s cache keys, as they are) each function body is made not as the
+stack machine of gen.mlx but as the Mlx compiler's own intermediate
+representation, LIR (`compiler/selfhost/ir`),
+which mlx4's optimizer (constants folded, loads of locals forwarded and
+locals held as values, copies propagated, stores and dead values dropped,
+the most used locals of a function in rbx, r12 and r13) and its x86-64
+back end then turn into code, through the one encoder both share. The
+lowering is `ir.mlx` (the syntax tree to LIR: the C semantics, the
+System V classification of calls and parameters) and `irgen.mlx` (the
+LIR through mlx4's passes and back end into the object, and the few
+instructions the back end leaves to its client). A function the lowering
+does not cover yet (`ir.unsupported` says which) is made by the stack
+machine as before, in the same object: the two agree on the ABI, the
+frame pointer, the data area, the symbols and the labels, so a program
+may mix them freely. `MLX_CC_STATS` counts the functions each way and the
+reasons; `MLX_CC_LIR_TRACE` prints every function's LIR as lowered and as
+optimized, with its locals and its frame; `MLX_CC_LIR_LIMIT=N` lowers
+only the first N functions of the run, the rest by the stack machine, to
+find by bisection the function a lowering gets wrong.
+
+What C needs that mlx4's LIR did not have, added to it with mlx4's own
+output byte for byte as before (its lowering makes none of them):
+
+- `extend` (arg0 made canonical for an integer of arg1 bits, sign- or
+  zero-extended): C's narrow arithmetic. Every integer is 64 bits wide in
+  the LIR and kept canonical for its C type, as the stack machine keeps
+  rax; an `int` sum is a 64-bit `add` and an `extend 32`. The lowering
+  remembers what each value is canonical for already (a narrow load, an
+  extend, a comparison's 0 or 1, a local's value, a call's narrow result
+  the back end extends) and extends no such value again; the optimizer
+  folds an extend of a constant, and one of a load or an extend of the
+  same width and sign.
+- `frame_local` (arg0 the offset of a place of the frame, below rbp or,
+  negative, the caller's arguments above it): a local whose address is
+  taken, an aggregate, a parameter passed in memory, each where
+  genstmt.assignOffsets put it; the back end reads and writes the place
+  directly (`mov rax, [rbp - 24]`), and fuses a constant member offset
+  into the access. A scalar local whose address is never taken (`p += 1`
+  takes it as `tmp = &p; *tmp = *tmp + 1`; the lowering reads through
+  such a temporary) is an 8-byte `alloca` holding its canonical value,
+  what the optimizer promotes and the register pass may hold in a
+  register. The back end's `State` in its client mode (`preciseSlots`)
+  gives the slot of a value read for the last time to the next value
+  (`releaseDead` after each instruction; a value made before a loop and
+  read in it lives to the loop's back edge; a gep fused into the access
+  after it keeps its operands until then), and sizes the frame by the
+  most values live at once, not by the function's instructions: a
+  thousand-case switch no longer takes eight bytes a case, and
+  JavaScriptCore's DFG fits its 1 MB compiler threads.
+- `external` and `external_value` (arg0 the client's word, arg1 and arg2
+  its operands in extraData): an instruction the back end leaves to the
+  client, which runs the emission loop itself and emits these with the
+  x86.mlx and gen.mlx it has: the address of a global (its definition in
+  the data area, a name of another object, a thread-local variable's, an
+  import's), a memzero, the bit builtins, `pause` and the fences, and an
+  asm statement with operands (its assembled bytes between the loads of
+  its register operands from their slots and the stores back, as
+  gen.genAsmCode emits them). An
+  `external` may read and write memory and is a barrier to the passes
+  that keep values in or out of it; an `external_value` is an address
+  computed, dropped when nothing reads it.
+- `FLAG_C_CALL` on a call or a return: the C ABI's conventions. A call
+  sets al to the number of vector registers its arguments take (a
+  variadic callee reads it), so a call through a pointer goes through
+  r11; a narrow result has its upper bits made canonical. A struct
+  returned in registers is a tuple of its eightbytes (an integer one in
+  rax then rdx, a floating one in xmm0 then xmm1, by class), returned as
+  a `tuple_literal` and read from a call as `tuple_element`s; one over 16
+  bytes goes through the hidden first parameter, as the stack machine
+  passes it. A struct argument passed in registers is its eightbytes as
+  separate arguments; one passed in memory is its words, after every
+  argument passed in a register, the integer registers padded to six
+  with zeros when any argument goes to the stack so that the back end's
+  own counting puts no word of them in a register.
+- `optimize.runLocal`: the passes within one function (no dead function
+  removal, no escape analysis of the arena, which the C code never
+  allocates from), for an LIR holding one function at a time; the back
+  end's `State` takes the function's block labels from a base
+  (`.block_N`, unique in the object), the C frame's size (the LIR's
+  value slots lie below genstmt's locals) and a slot budget of 8 bytes
+  per instruction (C values are one word).
+
+What stays the stack machine's, function by function: `long double`
+(the x87 stack is not in the LIR), wide integers, variadic function
+definitions and `va_arg`, `cpuid`, `rdtsc` and the other asm forms the
+compiler knows by name, computed `goto`, `__builtin_alloca`, 16-byte
+atomics, `setjmp`'s returns, and arguments passed in memory at an
+alignment of 16. File-scope `asm` is the object's as before.
+
+Measured (tools/check_cc_projects.sh's SQLite 3.46.1 amalgamation, this
+machine): the shell compiles in 1.8 s against 1.3 s (2468 of its 2495
+functions lowered), its program is 3.3 MB against 4.2 MB, and a workload
+of 300,000 rows inserted, indexed, grouped, joined and updated runs in
+1.4 to 1.8 s against 2.8 to 3.4 s. JavaScriptCore built so passes
+check_jsc_mlxlibc.sh, bench.js in 0.75 s against 1.05 to 1.3 s.
+
 ## Headers
 
 `include/` holds mlx-cc's own C headers (`stdio.h`, `stdlib.h`,
@@ -209,13 +310,15 @@ in `/usr/local/lib/mlx-cc/include`.
 | Constants and strings | `literal.mlx`, `extended.mlx` (long double constants) |
 | Types and syntax tree | `types.mlx`, `ast.mlx` |
 | Parser | `cursor.mlx`, `state.mlx`, `scope.mlx`, `decl.mlx`, `initializer.mlx`, `expr.mlx`, `stmt.mlx`, `typing.mlx`, `eval.mlx` |
-| Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
+| Code | `ir.mlx`, `irgen.mlx` (function bodies through mlx4's LIR and back end, below), `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions: the stack machine) |
 | Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through mlx-ld), `compiler/ld/main.mlx` (mlx-ld: `compiler/selfhost/object/link.mlx` as a program, the link map), `ar.mlx` (mlx-ar) |
 | The C variant | `standard.mlx` (`-std=`: the macros, the keywords) |
 | Prefix snapshots | `snapshot.mlx` (below) |
 | Driver | `main.mlx` |
 
-The code generator is a stack machine on rax (xmm0 for floating values),
+Function bodies go through mlx4's LIR ("The LIR back end", below); what
+its lowering does not cover, and everything around the bodies, is the
+stack machine's: a stack machine on rax (xmm0 for floating values),
 with every integer kept canonical for its type in the whole register.
 Calls follow the System V AMD64 ABI, structs passed and returned by value
 included, and variadic functions set up the ABI's register save area so a
