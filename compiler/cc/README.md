@@ -207,7 +207,10 @@ does not cover yet (`ir.unsupported` says which) is made by the stack
 machine as before, in the same object: the two agree on the ABI, the
 frame pointer, the data area, the symbols and the labels, so a program
 may mix them freely. `MLX_CC_STATS` counts the functions each way and the
-reasons.
+reasons; `MLX_CC_LIR_TRACE` prints every function's LIR as lowered and as
+optimized, with its locals and its frame; `MLX_CC_LIR_LIMIT=N` lowers
+only the first N functions of the run, the rest by the stack machine, to
+find by bisection the function a lowering gets wrong.
 
 What C needs that mlx4's LIR did not have, added to it with mlx4's own
 output byte for byte as before (its lowering makes none of them):
@@ -215,7 +218,12 @@ output byte for byte as before (its lowering makes none of them):
 - `extend` (arg0 made canonical for an integer of arg1 bits, sign- or
   zero-extended): C's narrow arithmetic. Every integer is 64 bits wide in
   the LIR and kept canonical for its C type, as the stack machine keeps
-  rax; an `int` sum is a 64-bit `add` and an `extend 32`.
+  rax; an `int` sum is a 64-bit `add` and an `extend 32`. The lowering
+  remembers what each value is canonical for already (a narrow load, an
+  extend, a comparison's 0 or 1, a local's value, a call's narrow result
+  the back end extends) and extends no such value again; the optimizer
+  folds an extend of a constant, and one of a load or an extend of the
+  same width and sign.
 - `frame_local` (arg0 the offset of a place of the frame, below rbp or,
   negative, the caller's arguments above it): a local whose address is
   taken, an aggregate, a parameter passed in memory, each where
@@ -225,13 +233,23 @@ output byte for byte as before (its lowering makes none of them):
   takes it as `tmp = &p; *tmp = *tmp + 1`; the lowering reads through
   such a temporary) is an 8-byte `alloca` holding its canonical value,
   what the optimizer promotes and the register pass may hold in a
-  register.
+  register. The back end's `State` in its client mode (`preciseSlots`)
+  gives the slot of a value read for the last time to the next value
+  (`releaseDead` after each instruction; a value made before a loop and
+  read in it lives to the loop's back edge; a gep fused into the access
+  after it keeps its operands until then), and sizes the frame by the
+  most values live at once, not by the function's instructions: a
+  thousand-case switch no longer takes eight bytes a case, and
+  JavaScriptCore's DFG fits its 1 MB compiler threads.
 - `external` and `external_value` (arg0 the client's word, arg1 and arg2
   its operands in extraData): an instruction the back end leaves to the
   client, which runs the emission loop itself and emits these with the
   x86.mlx and gen.mlx it has: the address of a global (its definition in
   the data area, a name of another object, a thread-local variable's, an
-  import's), a memzero, the bit builtins, `pause` and the fences. An
+  import's), a memzero, the bit builtins, `pause` and the fences, and an
+  asm statement with operands (its assembled bytes between the loads of
+  its register operands from their slots and the stores back, as
+  gen.genAsmCode emits them). An
   `external` may read and write memory and is a barrier to the passes
   that keep values in or out of it; an `external_value` is an address
   computed, dropped when nothing reads it.
@@ -258,10 +276,17 @@ output byte for byte as before (its lowering makes none of them):
 
 What stays the stack machine's, function by function: `long double`
 (the x87 stack is not in the LIR), wide integers, variadic function
-definitions and `va_arg`, inline assembly with operands, computed
-`goto`, `__builtin_alloca`, 16-byte atomics, `setjmp`'s returns, and
-arguments passed in memory at an alignment of 16. File-scope `asm`
-is the object's as before.
+definitions and `va_arg`, `cpuid`, `rdtsc` and the other asm forms the
+compiler knows by name, computed `goto`, `__builtin_alloca`, 16-byte
+atomics, `setjmp`'s returns, and arguments passed in memory at an
+alignment of 16. File-scope `asm` is the object's as before.
+
+Measured (tools/check_cc_projects.sh's SQLite 3.46.1 amalgamation, this
+machine): the shell compiles in 1.8 s against 1.3 s (2468 of its 2495
+functions lowered), its program is 3.3 MB against 4.2 MB, and a workload
+of 300,000 rows inserted, indexed, grouped, joined and updated runs in
+1.4 to 1.8 s against 2.8 to 3.4 s. JavaScriptCore built so passes
+check_jsc_mlxlibc.sh, bench.js in 0.75 s against 1.05 to 1.3 s.
 
 ## Headers
 
