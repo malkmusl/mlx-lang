@@ -411,6 +411,55 @@ mlx-cc compiles both as released now:
   of 62, check_webkit_mlx_layout.sh 44 of 44, storage 63 of 63, network
   37 of 37, crypto 231 of 231, check_voyager.sh (also with
   `MLX_COMPOSITOR_PRESENT=gpu`), tools/check_cpp.sh.
+- **M8, part 5, done** (JavaScriptCore's LLInt in assembly, the Baseline
+  JIT and the DFG): JSCOnly and Mlx build JavaScriptCore with
+  `ENABLE_C_LOOP` off and `ENABLE_JIT` and `ENABLE_DFG_JIT` on (FTL and
+  WebAssembly off; WPE keeps the C loop). offlineasm's X86_64 back end
+  is the port's (generators/offlineasm/x86.mlx, a port of x86.rb and of
+  asm.rb's assembler, LLIntAssembly.h byte for byte as the Ruby one
+  writes it), and mlx-cc assembles LowLevelInterpreter.cpp's top-level
+  asm statement (and MacroAssemblerX86_64.cpp's probe trampolines) as
+  GNU as does: relaxed jumps, sections, `.globl`/`.type`/`.size`/
+  `.p2align`, data directives, symbolic displacements, RIP-relative,
+  GOTPCREL and PLT relocations, VEX moves (epoch 32, tests fileasm and
+  typedefenumalias). The JIT's code is mlx-cc's to compile: epochs 33
+  to 39 fixed what JavaScriptCore's JIT, DFG and YARR met, each with a
+  test in compiler/cc/tests/cpp (using-declarations of using-declared
+  functions, a static member hiding a using-declared overload, a class's
+  own overloads before its using-declaration's, a base instance's
+  template parameter taken as a member, default arguments looked up where
+  they were used, a generic lambda in a lambda without `this`, template
+  moves of noncopyable classes, `= default` moves beside declared copies
+  (the DFG's switch tables were copies its code did not point into),
+  a derived object copied through a deleted conversion template,
+  std::array<T, 0> returned in xmm0 over the caller's saved rbp,
+  log-deep make_index_sequence and calls of 4096 arguments for WTF's
+  enumNames, partial ordering, CTAD of the template's own class, empty
+  folds, unary operators of classes, and more: compiler/cc/epoch.mlx).
+  The extractors and the jsc shell take JavaScriptCorePrefix.h as the
+  library does (InlineCacheCompiler.h names `CCallHelpers::Jump` of a
+  class it only declares), and port/JavaScriptCoreMlxPrefix.h gives the
+  JIT without WebAssembly its CompilationResult.h. mlxlibc needed
+  nothing new: the executable allocator's RWX `mmap`, the VM traps'
+  signals and `ucontext_t` (a watchdog stops a JIT-compiled loop) were
+  there. std.sql freed an INSERT's values as wide as its table was at
+  finalization, past them when IndexedDB's store finalized its statements
+  after its tables changed (storage/indexeddb/key-generator.html crashed
+  one run in five with the JIT's timing; compiler/libc/sqlite3/tests/
+  writes.c). Numbers (C loop, LLInt in assembly, Baseline and DFG):
+  projects/webkit/tests/bench/bench.js in jsc 8.4 s, 2.35 s, 1.05 s
+  (loops 2.6 s, 20 ms, 20 ms; objects 1.7 s, 0.8 s, 0.15 s; arrays 2.8 s,
+  0.6 s, 0.23 s; strings 0.4 s, 0.15 s, 0.08 s; regexp 0.19 s, 0.17 s,
+  0.11 s; JSON 0.6 s, 0.5 s, 0.45 s); bench.html in webcore-dump 10.0 s,
+  3.6 s, 1.05 s; the saved en.wikipedia.org/wiki/WebKit page loads in
+  56 s, 56 s, 32 s (without scripts 25 s before, 12.5 s now). jsc's scripts
+  print what they did with `--forceEagerCompilation=true`,
+  `--useConcurrentJIT=false` and low tier-up thresholds too. Checks:
+  check_jsc_mlxlibc.sh (it runs bench.js), check_cpp.sh, check_cc.sh,
+  check_sqlite.sh,
+  layout 44 of 44, paint 19 of 19, storage 63 of 63, network 37 of 37,
+  crypto 231 of 231, compositing 103 of 103, webgl 62 of 62,
+  check_voyager.sh, check_webkit_upstream.sh.
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -549,7 +598,7 @@ port in the tarball that builds WebCore without GLib).
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
-| JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
+| JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; no FTL (B3/Air), no WebAssembly; `ENABLE_CSS_SELECTOR_JIT` off ("What M8's fifth part leaves") | JavaScriptCore's own tiers on x86-64, made by the port's own toolchain: bench.js runs in 1.05 s, 8.4 s with the C loop (below) |
 
 ### WTF, bmalloc, JavaScriptCore
 
@@ -1454,7 +1503,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
 | M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh and check_webkit_mlx_crypto.sh, the network check's downloads and uploads, check_voyager.sh's (done, both parts) |
-| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done) |
+| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done); the JIT: tools/check_jsc_mlxlibc.sh's scripts and bench.js (part 5 done: the LLInt in assembly, Baseline and DFG) |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
 compile); the port's sources for M2 can be written beside it, since each
@@ -1635,6 +1684,20 @@ What M2 found, and how the port meets it without a patch:
   read. A download that is no GET cannot be resumed (pausing it cancels
   it); there is no dialog to choose a name or a folder (Safari's default
   has none either). The file chooser has no previews.
+- **What M8's fifth part leaves** (JavaScriptCore's JIT):
+  - The FTL (B3 and Air) and WebAssembly are off: the next tiers.
+  - WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, which WebKit
+    turns on with the JIT) is off: a selector it compiled crashed
+    (a pointer read shifted by a byte) styling the saved Wikipedia page,
+    though the layout, paint and compositing checks passed with it.
+  - Half of the Wikipedia page's time is bmalloc's (libpas') allocation,
+    which mlx-cc compiles without inlining (about 41% of a profile with
+    the LLInt).
+  - Rarely (about one run in 30 of crypto's RSA key generation, with or
+    without the JIT), webcore-dump stops on a CheckedPtr to a dead
+    ScheduledTask in the generic RunLoop's timer tree:
+    RedBlackTree::remove leaves a removed node's children in it, and a
+    node inserted again releases them after they died.
 - **What M8's first part leaves** (composited layers on the CPU):
   - Voyager presents a frame on its window's thread, which is WebCore's
     main thread: the compositor composites, scrolls and animates on its
