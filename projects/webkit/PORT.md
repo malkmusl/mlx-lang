@@ -358,6 +358,108 @@ mlx-cc compiles both as released now:
   WebGL pages (a triangle, a texture from an image, uniforms, WebGL 2's
   instancing), check_voyager.sh's scenario 24 (a WebGL canvas animated
   on the frame clock: about 38 frames a second on lavapipe in Voyager).
+- **M8, part 3, done** (compositing on the GPU; "Compositing" below):
+  the layers are composed by WebKit's TextureMapper (its GL painter,
+  BitmapTexture, texmap's backing stores, as WPE composes them) over
+  ANGLE's GLES on the same surfaceless Vulkan display as WebGL, on the
+  compositor thread's own GL context, into a framebuffer whose damaged
+  bounds are read back into the wl_shm frame; tiles are still painted on
+  the CPU (Skia raster, worker threads) and uploaded into textures
+  (Ganesh over ANGLE is not trivial here: WebKit's GPU painting engine is
+  SkiaPaintingEngine.cpp's atlases and per-thread GL contexts); WebGL
+  canvases are textures shared with the compositor (no read back). The
+  CPU's compositor stays for no Vulkan device, `MLX_COMPOSITING=cpu` and
+  Voyager's `--no-gpu-compositing`. On lavapipe (no GPU in the machine
+  measured; ms of the compositor's frame from `MLX_TRACE_COMPOSITOR`,
+  busy samples of mlx-profile from 8 s on, CPU's then GPU's): the
+  animation of check_voyager.sh's scenario 23 at 60 frames a second both
+  ways, 3.9 then 5.2 ms a frame, the compositor thread 271 then 216
+  samples, the main thread 727 then 702, the process 14.2 then 16.0 s
+  of processor time (lavapipe's threads); a long page scrolled by 24
+  wheel events (the whole view damaged each frame) 6.6 then 15 ms a frame,
+  11 ms of it the read back of the whole frame waiting for lavapipe's
+  rendering, compositor 36 then 48 samples, main thread 158 then 169;
+  scenario 24's WebGL canvas 38 then 50 frames a second. Reading BGRA
+  had ANGLE convert on the GPU: 15.5 ms an animation frame, 41 frames a
+  second, before reads were RGBA swapped on the CPU. Checks:
+  check_webkit_mlx_compositing.sh 103 of 103, check_webkit_mlx_paint.sh
+  19 of 19 (composited.html@forcedark among them), check_webkit_mlx_webgl.sh
+  62 of 62, check_webkit_mlx_layout.sh 44 of 44, check_voyager.sh all,
+  on the GPU path; the CPU's path (`MLX_COMPOSITING=cpu`) paints the
+  same pixels as the GPU's for composited, forced dark and WebGL pages.
+- **M8, part 4, done** (tiles painted on the GPU, frames presented
+  directly; "Compositing" below): with the GPU's compositor, Ganesh over
+  ANGLE paints the layers' tiles into textures by default
+  (`MLX_PAINTING=cpu` for the CPU's painting and uploads), after mlx-cc's
+  epochs 27 to 31 fixed what Skia's GPU code met (remove_if copying
+  unique_ptrs, deleted assignments taken as bytes, `new (n) T` with a
+  size, a `T &` bound to a temporary of another type, a member function's
+  result instantiated while its class was laid out, a member template's
+  definition applied twice, an overloaded name for a function reference);
+  ANGLE has its share context lock. On a GPU the frame is copied by the
+  device into the window's wl_shm buffer; on a CPU's device it is read
+  back (`MLX_COMPOSITOR_PRESENT=gpu|read`). On lavapipe (ms a frame of
+  the compositor thread, then of the embedder's take, from
+  `MLX_TRACE_COMPOSITOR`, medians past the load), CPU painting with read
+  back, GPU painting with read back, GPU painting presented directly:
+  check_voyager.sh's animation 1.4 + 1.7, 1.4 + 1.7, 1.2 + 3.9; a long
+  page scrolled by whole views (wheel and Page Down) 4.0 + 1.9,
+  3.3 + 1.9, 3.0 + 3.7; the WebGL page 1.3 + 1.7, 1.3 + 1.7,
+  1.0 + 4.8 (60, 60 and 56 frames a second). Checks, on the GPU path and
+  with `MLX_COMPOSITING=cpu`: check_webkit_mlx_compositing.sh 103 of
+  103, check_webkit_mlx_paint.sh 19 of 19, check_webkit_mlx_webgl.sh 62
+  of 62, check_webkit_mlx_layout.sh 44 of 44, storage 63 of 63, network
+  37 of 37, crypto 231 of 231, check_voyager.sh (also with
+  `MLX_COMPOSITOR_PRESENT=gpu`), tools/check_cpp.sh.
+- **M8, part 5, done** (JavaScriptCore's LLInt in assembly, the Baseline
+  JIT and the DFG): JSCOnly and Mlx build JavaScriptCore with
+  `ENABLE_C_LOOP` off and `ENABLE_JIT` and `ENABLE_DFG_JIT` on (FTL and
+  WebAssembly off; WPE keeps the C loop). offlineasm's X86_64 back end
+  is the port's (generators/offlineasm/x86.mlx, a port of x86.rb and of
+  asm.rb's assembler, LLIntAssembly.h byte for byte as the Ruby one
+  writes it), and mlx-cc assembles LowLevelInterpreter.cpp's top-level
+  asm statement (and MacroAssemblerX86_64.cpp's probe trampolines) as
+  GNU as does: relaxed jumps, sections, `.globl`/`.type`/`.size`/
+  `.p2align`, data directives, symbolic displacements, RIP-relative,
+  GOTPCREL and PLT relocations, VEX moves (epoch 32, tests fileasm and
+  typedefenumalias). The JIT's code is mlx-cc's to compile: epochs 33
+  to 39 fixed what JavaScriptCore's JIT, DFG and YARR met, each with a
+  test in compiler/cc/tests/cpp (using-declarations of using-declared
+  functions, a static member hiding a using-declared overload, a class's
+  own overloads before its using-declaration's, a base instance's
+  template parameter taken as a member, default arguments looked up where
+  they were used, a generic lambda in a lambda without `this`, template
+  moves of noncopyable classes, `= default` moves beside declared copies
+  (the DFG's switch tables were copies its code did not point into),
+  a derived object copied through a deleted conversion template,
+  std::array<T, 0> returned in xmm0 over the caller's saved rbp,
+  log-deep make_index_sequence and calls of 4096 arguments for WTF's
+  enumNames, partial ordering, CTAD of the template's own class, empty
+  folds, unary operators of classes, and more: compiler/cc/epoch.mlx).
+  The extractors and the jsc shell take JavaScriptCorePrefix.h as the
+  library does (InlineCacheCompiler.h names `CCallHelpers::Jump` of a
+  class it only declares), and port/JavaScriptCoreMlxPrefix.h gives the
+  JIT without WebAssembly its CompilationResult.h. mlxlibc needed
+  nothing new: the executable allocator's RWX `mmap`, the VM traps'
+  signals and `ucontext_t` (a watchdog stops a JIT-compiled loop) were
+  there. std.sql freed an INSERT's values as wide as its table was at
+  finalization, past them when IndexedDB's store finalized its statements
+  after its tables changed (storage/indexeddb/key-generator.html crashed
+  one run in five with the JIT's timing; compiler/libc/sqlite3/tests/
+  writes.c). Numbers (C loop, LLInt in assembly, Baseline and DFG):
+  projects/webkit/tests/bench/bench.js in jsc 8.4 s, 2.35 s, 1.05 s
+  (loops 2.6 s, 20 ms, 20 ms; objects 1.7 s, 0.8 s, 0.15 s; arrays 2.8 s,
+  0.6 s, 0.23 s; strings 0.4 s, 0.15 s, 0.08 s; regexp 0.19 s, 0.17 s,
+  0.11 s; JSON 0.6 s, 0.5 s, 0.45 s); bench.html in webcore-dump 10.0 s,
+  3.6 s, 1.05 s; the saved en.wikipedia.org/wiki/WebKit page loads in
+  56 s, 56 s, 32 s (without scripts 25 s before, 12.5 s now). jsc's scripts
+  print what they did with `--forceEagerCompilation=true`,
+  `--useConcurrentJIT=false` and low tier-up thresholds too. Checks:
+  check_jsc_mlxlibc.sh (it runs bench.js), check_cpp.sh, check_cc.sh,
+  check_sqlite.sh,
+  layout 44 of 44, paint 19 of 19, storage 63 of 63, network 37 of 37,
+  crypto 231 of 231, compositing 103 of 103, webgl 62 of 62,
+  check_voyager.sh, check_webkit_upstream.sh.
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -485,7 +587,7 @@ port in the tarball that builds WebCore without GLib).
 |---|---|---|
 | Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
 | Graphics | `USE_SKIA`, CPU raster; no `USE_CAIRO` | Skia compiles here already (`webkit-skia`); WebCore's only living 2D back end besides Cairo (GTK/WPE moved to Skia); CPU first, no EGL |
-| Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the CPU by `SkiaCompositingLayer`; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles and scrolling tree as they are; only TextureMapper's GL painter is left out ("Compositing") |
+| Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the GPU by TextureMapper over ANGLE's GLES (since M8's third part), on the CPU by `SkiaCompositingLayer` without a Vulkan device or on a CPU's (lavapipe), unless `MLX_COMPOSITING=gpu`; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles, TextureMapper and scrolling tree as they are ("Compositing") |
 | WebGL | `ENABLE_WEBGL` and `USE_ANGLE` (since M8): `GraphicsContextGLANGLE` with the port's GraphicsContextGLMlx, ANGLE on Vulkan (libmlxvulkan.so) | ANGLE is WebKit's WebGL everywhere; Vulkan is what std.gpu speaks, and lavapipe runs it without a GPU ("WebGL") |
 | Network | neither `USE_SOUP` nor `USE_CURL` | A load is the embedder's (`LoaderStrategy`), over std.http and std.tls |
 | Images | WebCore's `ScalableImageDecoder`, with our PNG, JPEG and WebP decoders; WebKit's BMP, GIF, ICO as they are | WebCore's decoders call libpng, libjpeg, libwebp; ours call std.png, std.jpeg, std.webp |
@@ -496,7 +598,7 @@ port in the tarball that builds WebCore without GLib).
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
 | Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
-| JavaScript | `ENABLE_C_LOOP` (no JIT), as now | the JIT's code needs offlineasm's x86 back end and mlx-cc's inline assembly; later |
+| JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; no FTL (B3/Air), no WebAssembly; `ENABLE_CSS_SELECTOR_JIT` off ("What M8's fifth part leaves") | JavaScriptCore's own tiers on x86-64, made by the port's own toolchain: bench.js runs in 1.05 s, 8.4 s with the C loop (below) |
 
 ### WTF, bmalloc, JavaScriptCore
 
@@ -548,7 +650,9 @@ then damages and commits it.
 Since M8 accelerated compositing is on (`MlxLayerTreeHost::configure`:
 accelerated compositing, forced compositing mode, fixed position layers,
 asynchronous frame and overflow scrolling, damage propagation), on the
-CPU. What WebKit has for it, and what the port takes:
+GPU since its third part ("On the GPU" below), on any Vulkan device
+(software ones too), on the CPU where there is none or when asked. What WebKit has for it, and what the
+port takes:
 
 - **The layers: WebKit's coordinated graphics, as they are.**
   `GraphicsLayerCoordinated`, `CoordinatedPlatformLayer` (a layer's state
@@ -565,11 +669,22 @@ CPU. What WebKit has for it, and what the port takes:
   use them in WebKit2's web process; a `GraphicsLayer` of the port's own
   would have repeated their tiling, their animations and their
   scrolling tree glue, and only coordinated graphics have
-  `SkiaCompositingLayer`. TextureMapper itself (its GL painter) is not
-  used: TextureMapperMlx.cpp, BitmapTextureMlx.cpp and
-  CoordinatedPlatformLayerBufferNativeImageMlx.cpp define what is named
-  of it, STUBs (`RELEASE_ASSERT_NOT_REACHED`) where only GL calls them.
-  `ProcessCapabilities::setCanUseAcceleratedBuffers(false)`: no display.
+  `SkiaCompositingLayer`. On the GPU, TextureMapper (its GL painter,
+  `BitmapTexture` and its pool, its shaders), `TextureMapperLayer`,
+  texmap's `CoordinatedBackingStore` and `CoordinatedPlatformLayerBufferRGB`
+  (CoordinatedPlatformLayerBufferRGBMlx.cpp: GLES 2's headers lack
+  `GL_RGBA8`), PlatformDisplay and platform/graphics/egl's `GLContext`,
+  `GLDisplay` and `GLFence` are compiled as they are, over ANGLE's GLES and
+  EGL (libGLESv2.a carries ANGLE's libEGL entry points). PlatformDisplayMlx
+  is ANGLE's surfaceless display on Vulkan, the one WebGL's contexts are
+  made on (`mlxANGLEDisplay`), made the shared display only when a host
+  composes on the GPU. `ProcessCapabilities::setCanUseAcceleratedBuffers(false)`:
+  no canvas or image buffer is painted on the GPU; layers' tiles are
+  (Ganesh over ANGLE, a GL context per painting thread: "The tiles'
+  painting" below) unless `MLX_PAINTING=cpu`, and only then has the
+  display a Skia context (`PlatformDisplay::skiaGLContext`, the port's):
+  WebKit accelerates a canvas' buffers (`RenderingPurpose::Canvas`, a
+  WebGL canvas drawn into a 2D one) whenever there is one.
 - **The tiles' painting, the port's** (WebKit's files take GL for
   granted): `SkiaPaintingEngineMlx.cpp` records a layer's dirty region on
   the main thread (`GraphicsContextSkia` over an `SkPictureRecorder`) and
@@ -578,7 +693,25 @@ CPU. What WebKit has for it, and what the port takes:
   as WebKit reads it); `SkiaBackingStoreMlx.cpp` keeps the tiles as raster
   `SkSurface`s on the compositor's side, copying in a buffer's dirty
   rectangle when its painting is complete, and draws them (with the
-  damage's culling) for `SkiaCompositingLayer`.
+  damage's culling) for `SkiaCompositingLayer`. On the GPU's compositor
+  the recordings are played back by Ganesh over ANGLE's GLES instead:
+  the host gives its painting engine the proxy of the main thread's Skia
+  context, and each recording (forced dark applied when it was recorded,
+  images as they are) is played on a GPU painting thread
+  (`WEBKIT_SKIA_GPU_PAINTING_THREADS`, 2 by default), each with its own
+  GL context and GrDirectContext (PlatformDisplayMlx.cpp), into a
+  texture of BitmapTexturePool's (CoordinatedAcceleratedTileBuffer),
+  which the tile takes: no upload. ANGLE is built with its share context
+  lock and context mutexes (angle.mlx: those contexts, the compositor's
+  and WebGL's are current on several threads at once). With
+  `MLX_PAINTING=cpu` the tiles are painted on the CPU as above and go to
+  texmap's backing store, which uploads each into a texture
+  (`BitmapTexture::updateContents`); an image a layer shows directly is
+  uploaded once (CoordinatedPlatformLayerBufferNativeImageMlx.cpp). What
+  kept Ganesh off was mlx-cc's (epochs 27 to 31: SkSL's module loader
+  reading freed elements, GrSkSLFP built at address 0, a processor's
+  flags never cleared, skvx::Vec<4,float>'s halves at one offset, which
+  drew no anti-aliased path).
 - **The host: `port/embed/MlxLayerTreeHost`**, what WebKit2's
   `LayerTreeHost`, `ThreadedCompositor` and `DrawingArea` are to WPE, in
   one process: the chrome client's `GraphicsLayerFactory`,
@@ -593,7 +726,83 @@ CPU. What WebKit has for it, and what the port takes:
   with `SkiaCompositingLayer::paint` and the frame's damage, and tells
   the embedder a frame is ready. Two modes: **Threaded** (Voyager) and
   **Synchronous** (webcore-dump: `composite()` flushes and paints on the
-  calling thread, for tests).
+  calling thread, for tests; on the GPU on the compositor's thread,
+  waited for, since the GL context is that thread's).
+- **On the GPU** (ThreadedCompositor's TextureMapper path, WPE's): the
+  compositor thread owns a GL context of ANGLE's display (surfaceless,
+  sharing textures with the display's sharing context as every
+  compositor's does: BitmapTexturePool's are the process's, outliving
+  any page: WebKit's pool releases the textures unused for 3 seconds on
+  the main thread's run loop, with the sharing context current, whichever
+  host asked for them; Voyager's `VOYAGER_TRACE` counts the share group's
+  textures, check_voyager.sh's 25 sees them come back after tabs close), the layers'
+  targets are `TextureMapperLayer`s, and a frame (`paintFrameOnGPU`)
+  applies the animations, collects the damage (the layers' damage in the
+  view's coordinates, one `Damage` shared by all, as LayerTreeHost's),
+  clears only what it covers to the page's white and has TextureMapper
+  compose there, Y flipped, into a framebuffer of the view's size (a
+  colour texture, depth and stencil for TextureMapper's clips and 3D).
+  The damage's bounds are then read back into the raster frame, which
+  goes to the wl_shm buffer as before: in the Threaded mode without
+  waiting (GLES 3's pixel pack buffers, ANGLE's contexts being 3.1: the
+  rectangle read into a buffer on the GPU's queue, a fence after it, at
+  most three reads going), the frame composed without the frame's lock,
+  and each read taken into the raster frame with its damage once its
+  fence has signalled (at the next frame, or by a poll of the compositor
+  thread every millisecond), a frame ready then; `MLX_COMPOSITOR_READ=sync`
+  reads as webcore-dump's Synchronous mode does, `glReadPixels` waiting
+  for the GPU. RGBA is swapped on the CPU, since ANGLE converts a BGRA
+  read on the GPU (10 ms of a frame on lavapipe). On lavapipe the
+  compositor thread's frame went from 5.4 to 2.5 ms (the animation page),
+  12.1 to 4.7 ms (a page scrolled by whole views) and 6.0 to 2.2 ms
+  (WebGL's), the read's part from 3.9, 8.4 and 4.6 ms to 0.8, 1.2 and
+  0.6. On a GPU the frame is presented directly instead
+  (port/angle/vulkan_present.cpp, `MlxLayerTreeHost::presentFrame`): the
+  framebuffer's colour is a B8G8R8A8 VkImage of the port's on ANGLE's
+  VkDevice (EGL_ANGLE_device_vulkan's handles), which ANGLE draws into as
+  an EGLImage (EGL_ANGLE_vulkan_image); when the embedder takes the
+  frame, the window's wl_shm buffer is imported into that device as host
+  memory (VK_EXT_external_memory_host, which ANGLE enables for OpenCL
+  only: the port's display asks for its feature `supportsExternalMemoryHost`
+  through EGL_FEATURE_OVERRIDES_ENABLED_ANGLE, and is made without it
+  where the driver has no such extension), and a copy on ANGLE's queue
+  (under eglLockVulkanQueueANGLE, between glReleaseTexturesANGLE and
+  glAcquireTexturesANGLE) writes the frame into it: no read back, no swap
+  and no copy on the processor. On a CPU's device (lavapipe, llvmpipe,
+  SwiftShader) frames are read back by default, since there the copy is
+  the processor's too and the take waits for the frame's drawing, which
+  the asynchronous read leaves to the device's threads (on lavapipe the
+  take of an animation frame 3.9 ms presented against 1.7 ms read back and
+  copied, a whole view scrolled 3.7 against 1.9, WebGL's 4.8 against
+  1.7). `MLX_COMPOSITOR_PRESENT=gpu` presents directly on any device
+  (check_voyager.sh passes so on lavapipe), `=read` reads back on any;
+  `MLX_TRACE_COMPOSITOR` says which, why, and each take's time. Forced dark: tiles and
+  images were darkened when recorded; a layer's solid colour is given to
+  its TextureMapperLayer darkened after each flush (`darkenSolidColors`:
+  CoordinatedPlatformLayer keeps the colour private, read through a
+  pointer to the member taken in an explicit instantiation), the
+  background cleared darkened. WebGL canvases are textures in the same
+  share group ("WebGL"). The CPU's compositor stays: no Vulkan device
+  (no display or no context), `MLX_COMPOSITING=cpu`, or an embedder's
+  `MlxLayerTreeHost::setGPUCompositingAllowed(false)` (Voyager's
+  `--no-gpu-compositing`). A software device (lavapipe, llvmpipe,
+  SwiftShader) composes on the GPU too; the trace says it is one (ANGLE's
+  EGL device's `VkPhysicalDevice`, EGL_ANGLE_device_vulkan, whose
+  `VkPhysicalDeviceProperties::deviceType` is
+  `VK_PHYSICAL_DEVICE_TYPE_CPU`; port/angle/vulkan_device_type.cpp). The
+  checks (tools/check_webkit_mlx_*.sh, check_voyager.sh) run the default,
+  and with `MLX_COMPOSITING=cpu` the CPU's compositor. On lavapipe, the
+  GPU's compositor with its asynchronous reads: a frame of the animation
+  page 1.7 ms (0.45 of it the read), of a page scrolled by whole views
+  3.9 ms (0.8), of the WebGL page 1.5 ms (0.4), at the display's 60
+  frames a second. WebGL uses ANGLE on whatever
+  device there is either way. A WebGL context made current tells WebKit's
+  GLContexts so (GLContextWrapper's current context dropped, as
+  upstream's GraphicsContextGLTextureMapperANGLE is one): else Skia's or
+  the compositor's context, current before, was taken for current still
+  and their calls went to WebGL's. `MLX_TRACE_COMPOSITOR` names the renderer
+  and the Vulkan device (or why the CPU's) and each frame's path; Voyager's `VOYAGER_TRACE`
+  says where its tabs compose and why.
 - **The frame clock: `MlxDisplayLink`**, a thread ticking at the
   display's rate (60 Hz; `MLX_REFRESH_RATE` 1 to 240), started only while
   someone wants frames: the compositor while animations run or a
@@ -713,8 +922,18 @@ system's EGL:
   ANGLE's Vulkan backend says what costs it time as debug messages
   ("GPU stall due to ReadPixels"), which WebGL writes on the console;
   other ports' GL backend says none, so they are turned off (errors stay).
-- **Presenting: read back into the canvas' layer.** The compositor is on
-  the CPU, so at each frame WebGL presents (`prepareForDisplay`) the
+- **Presenting on the GPU compositor: a shared texture.** When the
+  compositor composes on the GPU (the shared display exists), a context
+  is made sharing the display's sharing context, and each frame WebGL
+  presents swaps the drawing buffer's texture with the compositor's
+  (WPE's `swapCompositorTexture`), handed to the canvas' layer as
+  `CoordinatedPlatformLayerBufferRGB` with an EGL fence sync of ANGLE's,
+  which the compositor waits for on the GPU (made, it submits the
+  context's open render pass, which `glFlush` leaves open; WebKit's
+  `GLFence` is `HAVE(GL_FENCE)`'s, off here, and WebGL 1 has no GL sync
+  objects). Nothing is read back.
+- **Presenting on the CPU compositor: read back into the canvas' layer.**
+  At each frame WebGL presents (`prepareForDisplay`) the
   drawing buffer, resolved from its samples, is read back (`ReadPixels`),
   flipped to the page's way up and made a raster image in the
   compositor's format (BGRA, premultiplied: drawn by the port's row
@@ -1284,7 +1503,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
 | M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh and check_webkit_mlx_crypto.sh, the network check's downloads and uploads, check_voyager.sh's (done, both parts) |
-| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done) |
+| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done); the JIT: tools/check_jsc_mlxlibc.sh's scripts and bench.js (part 5 done: the LLInt in assembly, Baseline and DFG) |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
 compile); the port's sources for M2 can be written beside it, since each
@@ -1465,6 +1684,20 @@ What M2 found, and how the port meets it without a patch:
   read. A download that is no GET cannot be resumed (pausing it cancels
   it); there is no dialog to choose a name or a folder (Safari's default
   has none either). The file chooser has no previews.
+- **What M8's fifth part leaves** (JavaScriptCore's JIT):
+  - The FTL (B3 and Air) and WebAssembly are off: the next tiers.
+  - WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, which WebKit
+    turns on with the JIT) is off: a selector it compiled crashed
+    (a pointer read shifted by a byte) styling the saved Wikipedia page,
+    though the layout, paint and compositing checks passed with it.
+  - Half of the Wikipedia page's time is bmalloc's (libpas') allocation,
+    which mlx-cc compiles without inlining (about 41% of a profile with
+    the LLInt).
+  - Rarely (about one run in 30 of crypto's RSA key generation, with or
+    without the JIT), webcore-dump stops on a CheckedPtr to a dead
+    ScheduledTask in the generic RunLoop's timer tree:
+    RedBlackTree::remove leaves a removed node's children in it, and a
+    node inserted again releases them after they died.
 - **What M8's first part leaves** (composited layers on the CPU):
   - Voyager presents a frame on its window's thread, which is WebCore's
     main thread: the compositor composites, scrolls and animates on its
@@ -1485,9 +1718,6 @@ What M2 found, and how the port meets it without a patch:
     second definition of ScrollbarsController's), though a drag of one
     scrolls; their layers' contents are drawn on the CPU
     (ScrollerCoordinatedMlx.cpp) once they show.
-  - TextureMapper's GL painter, BitmapTexture and the GPU's tile and
-    image buffers are STUBs: compositing on the GPU (Ganesh over
-    std.gpu's Vulkan) is later.
   - Skia under mlx-cc takes its portable paths (no vector registers):
     the port's row blends and fills (SkiaRoutinesMlx.cpp) and the
     compositor's sprites (MlxCompositingCanvas) make translated layers
@@ -1501,6 +1731,44 @@ What M2 found, and how the port meets it without a patch:
     expectations' layer sizes from macOS's fonts, tile coverage and
     visible rects (`LAYER_TREE_INCLUDES_*` WebKit2 fills), iframes'
     text in dumpAsText, and layers WebKit2's drawing area adds.
+- **What M8's third part leaves** (compositing on the GPU):
+  - Presenting without a copy at all: on a GPU the frame is copied by
+    the device into the window's wl_shm buffer (imported as host memory),
+    on a CPU's device read back. Handing the Wayland compositor the frame
+    itself needs a dmabuf (linux-dmabuf: projects/desktop/compositor
+    accepts one linear ARGB8888 plane) of ANGLE's framebuffer in
+    exportable memory of a DRM device (VK_EXT_external_memory_dma_buf with
+    DRM format modifiers; the port has no GBM, `USE_GBM` off), which
+    lavapipe without a render node cannot give, so nothing here could test
+    it; or a Vulkan swapchain of std.ui.gpu_canvas's
+    (VK_KHR_wayland_surface), which needs ANGLE's image and std.ui's
+    device to meet (std.vulkan's instance is not ANGLE's) and the page its
+    own wl_subsurface, which std.ui's panel does not make yet. The direct
+    copy is waited for on the main thread (the take, through the
+    compositor's thread for its context); a copy into a buffer the window
+    commits later would not be.
+  - Images and 2D canvases are painted on the CPU and uploaded (tiles are
+    Ganesh's): no GPU atlases of images, no deferred display lists, and
+    2D canvases stay on the CPU (ProcessCapabilities says no accelerated
+    buffers).
+  - Forced dark's solid colour layers are darkened through a pointer to
+    CoordinatedPlatformLayer's private `m_contentsColor` (taken in an
+    explicit instantiation). A hook the port owns needs one upstream
+    does not offer: the colour RenderLayerBacking gives
+    `GraphicsLayer::setContentsToSolidColor` is kept privately by
+    `GraphicsLayerCoordinated` (a `final` class, so no port subclass from
+    the layer factory), by `CoordinatedPlatformLayer` (whose setter is
+    public, no getter; its client is told only that something changed)
+    and by `TextureMapperLayer` (setter only); the colour is drawn by
+    `TextureMapperSolidColorLayer`, inline in TextureMapperLayer.cpp, through
+    `TextureMapper::drawSolidColor`, neither virtual nor the port's. A
+    `contentsColor()` getter on CoordinatedPlatformLayer upstream (or a
+    colour filter of the TextureMapper's, as MlxDarkModeCanvas is the
+    CPU compositor's) would let the trick go.
+  - `HAVE(GL_FENCE)` is off in the port's configuration (turning it on
+    rebuilds WebCore whole): WebKit's `GLFence::create` gives no fence,
+    so the WebGL frame's fence is the port's (an EGL fence sync); tile
+    uploads need none (the compositor's own context).
 - **What M8's second part leaves** (WebGL):
   - Voyager's WebGL page runs at about 38 of the display's 60 frames a
     second on lavapipe: a frame's main thread is the script and ANGLE's
@@ -1513,10 +1781,9 @@ What M2 found, and how the port meets it without a patch:
     System V bucket (compiler/selfhost/object/elf64_dynamic.mlx); the
     loader indexes them itself. Real buckets (or a GNU hash) belong in
     the compiler, with its next canonical build.
-  - The drawing buffer is read back each frame and copied into a raster
-    image (a 300x300 canvas: about 0.4 MB a frame); a texture shared
-    with the compositor waits for compositing on the GPU (Ganesh over
-    std.gpu's Vulkan, the same device ANGLE's).
+  - On the CPU compositor the drawing buffer is still read back each
+    frame and copied into a raster image (a 300x300 canvas: about 0.4 MB
+    a frame); on the GPU compositor it is a shared texture.
   - WebGL runs in the web process's main thread, as WebKitLegacy had it
     (no GPU process); a context's ANGLE work, lavapipe's draws included,
     is the main thread's time.

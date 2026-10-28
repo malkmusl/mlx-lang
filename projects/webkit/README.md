@@ -29,7 +29,7 @@ pictures.
     ./mlx build webkit-wtf            WTF, the JSCOnly port, on mlx-unicode (libWTF.a)
     ./mlx build webkit-jsc-derived    what JavaScriptCore's build generates
     ./mlx build webkit-webcore-derived  what WebCore's build generates (the WPE port)
-    ./mlx build webkit-jsc            JavaScriptCore, C_LOOP (libJavaScriptCore.a)
+    ./mlx build webkit-jsc            JavaScriptCore: the LLInt in x86-64 assembly, Baseline JIT and DFG (libJavaScriptCore.a)
     ./mlx build webkit-jsc-shell      mlx-out/webkit/bin/jsc, on mlxlibc alone (below)
     ./mlx build webkit-angle          ANGLE, WebGL's OpenGL ES (libANGLE.a, libGLESv2.a)
 

@@ -11,7 +11,8 @@
 #   - the scripts of projects/webkit/tests/jsc print what they print on
 #     the glibc-linked jsc (their .expected files; Intl and the core
 #     language as node prints them, a stress of the runtime, sorting,
-#     typed arrays), run with an empty environment;
+#     typed arrays), run with an empty environment; the benchmark
+#     tests/bench/bench.js runs, its results right;
 #   - a running jsc has mlxlibc's loader mapped and neither glibc's C
 #     library nor its loader.
 #
@@ -55,6 +56,11 @@ run stress stress.js
 run sort sort.js
 run f64 f64.js
 echo "ok   ${#ran[@]} scripts print what the glibc-linked jsc prints: ${ran[*]}"
+
+# The benchmark (projects/webkit/tests/bench/bench.js): each section
+# checks its result, the times are printed.
+(cd projects/webkit/tests/bench && env -i timeout 600 "$jsc" bench.js > "$work/bench.out" 2>&1) || fail "bench.js: $(tail -3 "$work/bench.out")"
+echo "ok   bench.js: $(tr '\n' ' ' < "$work/bench.out")"
 
 # What the process maps while a script runs.
 echo 'for (;;) {}' > "$work/spin.js"

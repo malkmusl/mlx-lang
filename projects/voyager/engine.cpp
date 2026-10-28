@@ -11,8 +11,10 @@
 // one cycle, every tab's: background tabs keep running); hand the shown
 // tab's latest frame to the window's pixels with its damage (each tab's
 // MlxLayerTreeHost composites its layers on a compositor thread at the
-// display's rate and scrolls on the scrolling thread, PORT.md
-// "Compositing"; with --no-compositing the view is painted whole through
+// display's rate, on the GPU when there is a Vulkan device, a software one
+// included (else, or with --no-gpu-compositing or MLX_COMPOSITING=cpu, on
+// the CPU), and scrolls on the scrolling thread,
+// PORT.md "Compositing"; with --no-compositing the view is painted whole through
 // GraphicsContextSkia, as before M8), and the pointer's, the wheel's and the keyboard's
 // events to it (WebCore's EventHandler; text typed into an editable
 // element through the Editor, editing keys as its commands; a link
@@ -29,7 +31,7 @@
 // (VoyagerBuild.h). about:about and about:version (any about: but blank
 // and srcdoc) are voyager://about and voyager://version.
 //
-//     voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] FILE|URL
+//     voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] [--no-gpu-compositing] FILE|URL
 //
 // Built by ./mlx build webkit-mlx-voyager (mlx-out/webkit/mlx/bin/voyager);
 // tools/check_voyager.sh runs it on the compositor.
@@ -485,6 +487,7 @@ struct Engine {
     // VOYAGER_TRACE: the shown tab's compositor's counts last written.
     unsigned tracedPaints { 0 };
     unsigned tracedFrames { 0 };
+    bool tracedCompositing { false };
     MonotonicTime lastTrace;
 };
 
@@ -583,6 +586,13 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     settings.setScriptEnabled(true);
     if (engine.compositing) {
         tab->host = makeUnique<MlxLayerTreeHost>(*tab->page, MlxLayerTreeHost::Mode::Threaded);
+        tab->host->setCountsTextures(engine.trace);
+        // (With VOYAGER_TRACE, where the first tab composes and why: the
+        // Vulkan device and whether it is a CPU's.)
+        if (engine.trace && !engine.tracedCompositing) {
+            engine.tracedCompositing = true;
+            fprintf(stderr, "voyager: compositing on the %s (%s)\n", tab->host->composesOnGPU() ? "GPU" : "CPU", tab->host->compositingReason().utf8().data());
+        }
         tab->host->setSize(size);
         tab->host->setFrameReadyCallback([&engine] {
             signalWindow(engine);
@@ -750,8 +760,9 @@ bool isForcedDark(Engine*, Tab*);
 // rendering update runs on the frame clock: its compositor's
 // MlxLayerTreeHost.) With VOYAGER_TRACE, the shown tab's compositor's
 // counts when they change, twice a second at most ("voyager: compositor
-// paints P frames F fps R": the layers painted on the main thread, the
-// frames composed, the frames a second on the compositor thread).
+// paints P frames F [textures T] fps R": the layers painted on the main
+// thread, the frames composed, on the GPU the textures of the compositors'
+// share group, the frames a second on the compositor thread).
 int engineCycle(Engine* engine)
 {
     RunLoop::cycle();
@@ -788,7 +799,10 @@ int engineCycle(Engine* engine)
             engine->lastTrace = now;
             engine->tracedPaints = paints;
             engine->tracedFrames = frames;
-            fprintf(stderr, "voyager: compositor paints %u frames %u fps %.1f\n", paints, frames, shown->host->framesPerSecond());
+            if (shown->host->composesOnGPU())
+                fprintf(stderr, "voyager: compositor paints %u frames %u textures %u fps %.1f\n", paints, frames, shown->host->textures(), shown->host->framesPerSecond());
+            else
+                fprintf(stderr, "voyager: compositor paints %u frames %u fps %.1f\n", paints, frames, shown->host->framesPerSecond());
         }
     }
     return shown->host->hasNewFrame() ? 1 : 0;
@@ -1354,7 +1368,7 @@ extern char** environ;
 
 static int usage()
 {
-    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] FILE|URL\n");
+    fprintf(stderr, "usage: voyager [--font FILE]... [--size WIDTHxHEIGHT] [--profile DIR] [--no-compositing] [--no-gpu-compositing] FILE|URL\n");
     return 2;
 }
 
@@ -1372,6 +1386,8 @@ int main(int argc, char** argv)
             profile = argv[++i];
         else if (!strcmp(argv[i], "--no-compositing"))
             compositing = false;
+        else if (!strcmp(argv[i], "--no-gpu-compositing"))
+            MlxLayerTreeHost::setGPUCompositingAllowed(false);
         else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             int width = 0;
             int height = 0;

@@ -1,4 +1,4 @@
-// A page's composited layers on the CPU (PORT.md, "Compositing"): what
+// A page's composited layers (PORT.md, "Compositing"): what
 // WebKit2's LayerTreeHost, CoordinatedSceneState and ThreadedCompositor
 // (Source/WebKit, which the port does not build) are to WPE, for the
 // port's single process. WebCore's coordinated graphics make the layers
@@ -14,6 +14,16 @@
 // display's rate) and composes frames into a raster frame of the view's
 // size, with the damage of each.
 //
+// On the GPU when it can (WPE's way): the compositor thread owns a GL
+// context of ANGLE's surfaceless EGL display (PlatformDisplayMlx.h), the
+// layers' targets are TextureMapperLayers, their tiles textures, and
+// WebKit's TextureMapper composes them into a framebuffer of the view's
+// size, of which each frame's damage is read back into the raster frame
+// (Threaded: asynchronously, the frame ready when its read is done).
+// On the CPU (no Vulkan device, setGPUCompositingAllowed(false),
+// MLX_COMPOSITING=cpu): SkiaCompositingLayer composes the layers straight
+// into the raster frame.
+//
 // Threaded (Voyager): a compositor thread composes when something asks for
 // a frame (a rendering update, a scroll of the scrolling thread, a running
 // animation), on the ticks of MlxDisplayLink, the process's frame clock;
@@ -23,8 +33,9 @@
 // as WebKit2's EventDispatcher sends them), which scrolls the layers
 // without the main thread; what it cannot handle goes to the main thread.
 //
-// Synchronous (webcore-dump): composite() composes on the calling thread,
-// after the painting of the tiles is done.
+// Synchronous (webcore-dump): composite() composes on the calling thread
+// (on the GPU: on the compositor's thread, waited for), after the painting
+// of the tiles is done.
 #pragma once
 
 #include "CoordinatedPlatformLayer.h"
@@ -46,6 +57,7 @@
 #include <wtf/Vector.h>
 #include <wtf/WeakPtr.h>
 #include <wtf/WorkQueue.h>
+#include <wtf/text/WTFString.h>
 
 class SkCanvas;
 
@@ -78,6 +90,16 @@ public:
     // fixed elements composited, frames and overflow scrolled
     // asynchronously, damage propagated for compositing from it.
     static void configure(Settings&);
+
+    // Whether hosts made from now on may compose on the GPU (true by
+    // default: on the GPU when a display exists, on any Vulkan device,
+    // software ones included; MLX_COMPOSITING=cpu never);
+    // false is the CPU's compositor (an embedder's --no-gpu-compositing).
+    static void setGPUCompositingAllowed(bool);
+    // Whether this host composes on the GPU.
+    bool composesOnGPU() const { return m_onGPU; }
+    // Why the host composes where it does (the device, or what chose).
+    const String& compositingReason() const { return m_compositingReason; }
 
     // The host of LAYER's page (the client of its platform layer).
     static MlxLayerTreeHost& of(const GraphicsLayerCoordinated&);
@@ -116,6 +138,9 @@ public:
     // rectangles that changed since the last take (all of it after a
     // resize or a first take); false when no frame is composed yet.
     bool takeFrame(uint32_t* pixels, int width, int height, int stride, Vector<IntRect>& damage);
+    // Whether takeFrame's frame is copied into the pixels by the GPU (the
+    // pixels then memory the GPU can import: a wl_shm pool's).
+    bool presentsDirectly() const { return m_presentsDirectly; }
     // Whether a frame was composed since the last take.
     bool hasNewFrame() const { return m_newFrame.load(); }
 
@@ -136,6 +161,12 @@ public:
     unsigned frames() const { return m_frames.load(); }
     double framesPerSecond() const;
     void didPaintLayer() { ++m_paints; }
+    // On the GPU, with counting asked for (setCountsTextures): the GL
+    // textures in the compositors' share group (BitmapTexturePool's,
+    // WebGL's, the frames' targets), counted by the compositor thread
+    // twice a second at most while it composes.
+    void setCountsTextures(bool counts) { m_countsTextures = counts; }
+    unsigned textures() const { return m_textures.load(); }
 
     // The page goes away: the layers let go, the compositor stopped.
     void invalidate();
@@ -145,6 +176,8 @@ public:
     bool displayLinkFired(MonotonicTime);
 
 private:
+    bool presentFrame(uint32_t* pixels, int width, int height, int stride, Vector<IntRect>& damage);
+
     // GraphicsLayerFactory
     Ref<GraphicsLayer> createGraphicsLayer(GraphicsLayer::Type, GraphicsLayerClient&) final;
 
@@ -172,7 +205,17 @@ private:
     void requestCompositionForRenderingUpdate();
     void scheduleFrameLocked() WTF_REQUIRES_LOCK(m_stateLock);
     void renderFrame();
+    void renderFrameOnGPU(bool& running, MonotonicTime& locked, MonotonicTime& composed);
+    void takeReads(bool wait);
+    void scheduleReadPoll();
     bool paintFrame(SkCanvas&, std::optional<Damage>& frameDamage, bool targetValid);
+    // The GPU's compositor (its GL context, TextureMapper and framebuffer,
+    // on the compositor thread): the frame of SIZE composed (only its
+    // damage when TARGETVALID), the damage in FRAMEDAMAGE; false when its
+    // context is lost.
+    struct GPUCompositor;
+    bool paintFrameOnGPU(const IntSize&, std::optional<Damage>& frameDamage, bool targetValid, bool& running);
+    void darkenSolidColors();
     void didCompositeRenderingUpdate();
     void countFrame();
     RefPtr<ScrollingTree> mainThreadScrollingTree();
@@ -228,6 +271,18 @@ private:
     RefPtr<ScrollingTree> m_scrollingTree WTF_GUARDED_BY_LOCK(m_stateLock);
     Function<void()> m_frameReady;
     std::atomic<bool> m_animationsRunning { false };
+    std::unique_ptr<GPUCompositor> m_gpu;
+    bool m_onGPU { false };
+    // (On the GPU, Threaded: frames read back asynchronously.)
+    bool m_asynchronousReads { false };
+    // (On the GPU in the Threaded mode, the frame copied by the GPU into
+    // the embedder's buffer when it is taken: presentFrame.)
+    bool m_presentsDirectly { false };
+    bool m_readPollScheduled { false };
+    String m_compositingReason;
+    // (On the GPU: the damage the layers' TextureMapperLayers infer in the
+    // view's coordinates, shared by all, as LayerTreeHost's.)
+    std::shared_ptr<Damage> m_globalDamage;
 
     // The frame (the compositor's target): its pixels, whether they hold
     // the last frame, the damage not yet taken.
@@ -235,6 +290,8 @@ private:
     Vector<uint32_t> m_framePixels WTF_GUARDED_BY_LOCK(m_frameLock);
     IntSize m_frameSize WTF_GUARDED_BY_LOCK(m_frameLock);
     bool m_frameValid WTF_GUARDED_BY_LOCK(m_frameLock) { false };
+    // (Asynchronous reads: whether a frame of its size has been read.)
+    bool m_frameReadable WTF_GUARDED_BY_LOCK(m_frameLock) { false };
     Vector<IntRect> m_frameDamage WTF_GUARDED_BY_LOCK(m_frameLock);
     bool m_frameDamageFull WTF_GUARDED_BY_LOCK(m_frameLock) { true };
     std::atomic<bool> m_newFrame { false };
@@ -242,6 +299,9 @@ private:
 
     std::atomic<unsigned> m_paints { 0 };
     std::atomic<unsigned> m_frames { 0 };
+    std::atomic<bool> m_countsTextures { false };
+    std::atomic<unsigned> m_textures { 0 };
+    MonotonicTime m_texturesCounted;
     Lock m_fpsLock;
     Vector<MonotonicTime> m_frameTimes WTF_GUARDED_BY_LOCK(m_fpsLock);
 };

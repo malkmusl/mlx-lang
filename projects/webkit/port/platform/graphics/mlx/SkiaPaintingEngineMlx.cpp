@@ -5,24 +5,37 @@
 // SkPictureRecorder: the main thread's paint) and the recording is played
 // back into each dirty tile's buffer (CoordinatedUnacceleratedTileBuffer)
 // on worker threads, which the compositor copies into its tiles
-// (SkiaBackingStoreMlx.cpp). WebKit's SkiaPaintingEngine.cpp (not compiled:
-// lists/webcore-mlx-skipped.txt) also has the GPU's paths (atlases of
-// images in GL textures, deferred display lists); the port has no GPU.
+// (SkiaBackingStoreMlx.cpp). With a GrContextThreadSafeProxy (the GPU
+// compositor's host gives one unless MLX_PAINTING=cpu: MlxLayerTreeHost),
+// the recording is played
+// back by Ganesh over ANGLE's GLES instead, as WebKit's engine does without
+// deferred display lists: into a texture of BitmapTexturePool's
+// (CoordinatedAcceleratedTileBuffer, taken on the main thread with its
+// Skia GL context current) on a GPU painting thread with its own
+// (PlatformDisplayMlx.cpp), which the compositor's tile then shows or
+// copies from on the GPU: no upload. WebKit's SkiaPaintingEngine.cpp (not
+// compiled: lists/webcore-mlx-skipped.txt) also has atlases of images in
+// GL textures and deferred display lists; the port's recordings keep
+// their images as they are (raster images Ganesh uploads as it draws).
 //
 // Forced dark mode (PORT.md, "Forced dark mode") is applied here, to the
 // layers' contents as they are recorded (MlxDarkModeCanvas in front of the
 // recorder), not when the layers are composited: images stay as they are,
 // and a layer's colours are darkened once, not each frame. Each recording
 // is counted for the page's host (MlxLayerTreeHost::didPaintLayer): the
-// paints Voyager traces.
+// paints Voyager traces. Played back on the CPU or on the GPU, the
+// recording is the same, darkened or not.
 #include "config.h"
 #include "SkiaPaintingEngine.h"
 
 #if USE(COORDINATED_GRAPHICS) && USE(SKIA)
+#include "BitmapTexturePool.h"
 #include "CoordinatedPlatformLayer.h"
 #include "CoordinatedTileBuffer.h"
 #include "GraphicsContextSkia.h"
+#include "GLContext.h"
 #include "GraphicsLayerCoordinated.h"
+#include "PlatformDisplay.h"
 #include "SkiaRecordingResult.h"
 #include "port/embed/MlxLayerTreeHost.h"
 #include "port/platform/graphics/mlx/MlxDarkMode.h"
@@ -41,7 +54,10 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(SkiaPaintingEngine);
 SkiaPaintingEngine::SkiaPaintingEngine(sk_sp<GrContextThreadSafeProxy>&& threadSafeGrContext)
     : m_threadSafeGrContext(WTF::move(threadSafeGrContext))
 {
-    m_paintingWorkerPool = WorkerPool::create("MlxPaintingWorker"_s, numberOfCPUPaintingThreads());
+    if (m_threadSafeGrContext)
+        m_paintingWorkerPool = WorkerPool::create("MlxGPUPainting"_s, numberOfGPUPaintingThreads());
+    else
+        m_paintingWorkerPool = WorkerPool::create("MlxPaintingWorker"_s, numberOfCPUPaintingThreads());
 }
 
 SkiaPaintingEngine::~SkiaPaintingEngine() = default;
@@ -67,7 +83,21 @@ unsigned SkiaPaintingEngine::numberOfCPUPaintingThreads()
     return count;
 }
 
-unsigned SkiaPaintingEngine::numberOfGPUPaintingThreads() { return 0; }
+// Painting on the GPU: 2 threads with four cores or more, else 1, as
+// WebKit's engine has it (WEBKIT_SKIA_GPU_PAINTING_THREADS, 1 to 4).
+unsigned SkiaPaintingEngine::numberOfGPUPaintingThreads()
+{
+    static unsigned count = [] {
+        unsigned threads = WTF::numberOfProcessorCores() >= 4 ? 2 : 1;
+        if (const char* variable = getenv("WEBKIT_SKIA_GPU_PAINTING_THREADS")) {
+            auto value = parseInteger<unsigned>(StringView::fromLatin1(variable));
+            if (value && *value >= 1 && *value <= 4)
+                threads = *value;
+        }
+        return threads;
+    }();
+    return count;
+}
 bool SkiaPaintingEngine::shouldUseDMABufAtlasTextures() { return false; }
 bool SkiaPaintingEngine::shouldUseLinearTileTextures() { return false; }
 bool SkiaPaintingEngine::shouldUseVivanteSuperTiledTileTextures() { return false; }
@@ -89,8 +119,17 @@ void SkiaPaintingEngine::paintIntoGraphicsContext(const GraphicsLayer& layer, Gr
     layer.paintGraphicsLayerContents(context, contents);
 }
 
-Ref<CoordinatedTileBuffer> SkiaPaintingEngine::createBuffer(RenderingMode, const IntSize& size, bool contentsOpaque) const
+Ref<CoordinatedTileBuffer> SkiaPaintingEngine::createBuffer(RenderingMode renderingMode, const IntSize& size, bool contentsOpaque) const
 {
+    if (renderingMode == RenderingMode::Accelerated) {
+        // (A texture of the pool, taken with a context of the share group
+        // current: the main thread's Skia one.)
+        OptionSet<BitmapTexture::Flags> flags;
+        if (!contentsOpaque)
+            flags.add(BitmapTexture::Flags::SupportsAlpha);
+        if (auto* context = PlatformDisplay::sharedDisplay().skiaGLContext(); context && context->makeContextCurrent())
+            return CoordinatedAcceleratedTileBuffer::create(BitmapTexturePool::singleton().acquireTexture(size, flags));
+    }
     return CoordinatedUnacceleratedTileBuffer::create(size, contentsOpaque ? CoordinatedTileBuffer::NoFlags : CoordinatedTileBuffer::SupportsAlpha);
 }
 
@@ -130,9 +169,15 @@ Ref<CoordinatedTileBuffer> SkiaPaintingEngine::replay(const GraphicsLayerCoordin
     platformLayer->willPaintTile();
     // (The buffer is the dirty rectangle's: the compositor copies it into
     // the tile at its place.)
-    auto buffer = createBuffer(RenderingMode::Unaccelerated, dirtyRect.size(), recording->contentsOpaque());
+    auto buffer = createBuffer(m_threadSafeGrContext ? RenderingMode::Accelerated : RenderingMode::Unaccelerated, dirtyRect.size(), recording->contentsOpaque());
     buffer->beginPainting();
     m_paintingWorkerPool->postTask([platformLayer = WTF::move(platformLayer), buffer = Ref { buffer }, dirtyRect, recording = WTF::move(recording)]() mutable {
+        // (On the GPU: this thread's Skia GL context, made the first time.)
+        if (buffer->isBackedByOpenGL() && !PlatformDisplay::sharedDisplay().skiaGLContext()) {
+            buffer->completePainting();
+            platformLayer->didPaintTile();
+            return;
+        }
         if (auto* canvas = buffer->canvas()) {
             canvas->save();
             canvas->clear(SkColors::kTransparent);

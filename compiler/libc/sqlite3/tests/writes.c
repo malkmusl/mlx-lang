@@ -266,6 +266,24 @@ static const char *drops =
     "SELECT type, name FROM sqlite_master ORDER BY name;"
     "PRAGMA integrity_check;";
 
+/* An INSERT finalized after its table was dropped and a wider one made
+   in its place (WebKit's IndexedDB store finalizes its cached
+   statements late): the statement's values are freed as they were
+   made, not as many as the new table has. */
+static void finalize_after_schema_change(sqlite3 *db)
+{
+    sqlite3_exec(db, "CREATE TABLE narrow (a);", 0, 0, 0);
+    sqlite3_stmt *insert = 0;
+    sqlite3_prepare_v2(db, "INSERT INTO narrow VALUES (?);", -1, &insert, 0);
+    sqlite3_bind_text(insert, 1, "kept", -1, SQLITE_TRANSIENT);
+    int stepped = sqlite3_step(insert);
+    sqlite3_reset(insert);
+    sqlite3_exec(db, "DROP TABLE narrow; CREATE TABLE wide (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p);", 0, 0, 0);
+    int finalized = sqlite3_finalize(insert);
+    printf("finalized after the schema changed: step %d, finalize %d\n", stepped, finalized);
+    sqlite3_exec(db, "DROP TABLE wide;", 0, 0, 0);
+}
+
 int main(void)
 {
     sqlite3 *db = open_memory();
@@ -296,6 +314,7 @@ int main(void)
     for (int i = 0; check_errors[i]; i++)
         run(db, check_errors[i]);
     run(db, drops);
+    finalize_after_schema_change(db);
     sqlite3_close(db);
     return 0;
 }

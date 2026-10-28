@@ -90,7 +90,17 @@ pub const Class = struct {
     // the implicit copy constructor and assignment are deleted.
     declaredCopy: bool
     declaredCopyAssign: bool
+    declaredMoveAssign: bool
+    // `C &operator=(const C &) = delete;`, `C &operator=(C &&) = delete;`.
+    deletedCopyAssign: bool
+    deletedMoveAssign: bool
     declaredMove: bool
+    // `C(C &&) = default;`, `C &operator=(C &&) = default;`: an rvalue of
+    // the class is moved member by member, not copied by a copy
+    // constructor or assignment declared beside (WTF's FixedVector, whose
+    // moved storage JIT code points into).
+    defaultedMove: bool
+    defaultedMoveAssign: bool
     // The member functions in order (cells of object and next).
     methods: usize
     methodsTail: usize
@@ -732,17 +742,26 @@ pub fn findInherited(prefix: u32, name: u32, isTag: bool) -> usize {
         // (A using-declaration naming it in a base, before the other
         // bases: `using EventTarget::WeakPtrImplType;` in WebCore's
         // Performance, whose first base has one too.)
-        if !isTag {
+        // (Not past the class's own declarations of the name, which its
+        // using-declaration's functions joined: MacroAssembler's
+        // branchPtr(cond, RegisterID, TrustedImmPtr) beside `using
+        // MacroAssemblerBase::branchPtr;` named as `CCallHelpers::branchPtr`
+        // in the DFG's JITCompiler.)
+        if !isTag && (first || scope.findQualified(at(c).*.prefix, name, false) == 0) {
             const used = usedFrom(c, name)
             if used != 0 {
                 var found = scope.findQualified(at(used).*.prefix, name, false)
+                if found != 0 && scope.at(found).*.parameter { found = 0 }
                 if found == 0 && at(used).*.prefix != prefix { found = findInherited(at(used).*.prefix, name, false) }
                 if found != 0 { return found }
             }
         }
+        // (Not a base instance's template parameter: `Graph` of WTF's
+        // Dominators<Graph> in the DFG's BackwardsDominators is the DFG's
+        // Graph.)
         if !first {
             const found = scope.findQualified(at(c).*.prefix, name, isTag)
-            if found != 0 { return found }
+            if found != 0 && !scope.at(found).*.parameter { return found }
         }
         first = false
         cell = base.getWord(cell + 8)
@@ -884,6 +903,21 @@ pub fn inheritedBinding(name: u32) -> usize {
             if index + 1 != scope.prefixCount() { break }
             prefix = scope.parentOf(prefix)
         }
+    }
+    return 0
+}
+
+// A name of a base of the classes the code being read is in, those of
+// the innermost prefix and around it only (not those of the places an
+// instance or a default argument is read for): its binding, 0 for none.
+pub fn lexicalInheritedBinding(name: u32) -> usize {
+    var prefix = scope.currentNamespace()
+    while prefix != 0 {
+        if classWithPrefix(prefix) != 0 {
+            const found = findInherited(prefix, name, false)
+            if found != 0 { return found }
+        }
+        prefix = scope.parentOf(prefix)
     }
     return 0
 }
@@ -1536,6 +1570,22 @@ fn joinedMemberCallee(name: u32, record: usize, others: usize, o: usize, address
     return n
 }
 
+// The explicit placeholder (template.explicitPlaceholder) of the member
+// template `binding`, with the templates of the name the class's
+// using-declarations bring in from its bases (`using Base::alloc;`
+// beside the class's own `template <...> alloc(...)`, the DFG's
+// SpeculativeJIT calling the base's `emitAllocateJSObjectWithKnownSize<
+// ClassType>(vm(), ...)`).
+pub fn explicitMemberPlaceholder(binding: usize) -> usize {
+    const holder = template.explicitPlaceholder(binding)
+    const classTy = classWithPrefix(scope.parentOf(scope.at(binding).*.name))
+    if classTy != 0 {
+        const others = usedBaseTemplates(classTy, ast.obj(holder).*.name, scope.at(binding).*.obj, 0)
+        if others != 0 { ast.obj(holder).*.baseTemplates = others }
+    }
+    return holder
+}
+
 // The member function templates `name` of the bases the class's
 // using-declarations of the name bring in (and of theirs, nested) that
 // are not the chain `first`'s nor among `found` already: cells of their
@@ -1893,18 +1943,42 @@ pub fn construct(address: usize, ty: usize, args: usize, count: usize, token: us
             // An object of the class is copied by a copy (or move)
             // constructor, else member by member: not through a
             // converting constructor taking what its conversion operator
-            // makes of it (`C(E)` and `explicit operator bool`).
-            if count == 1 && plainScore < 4 && sameClass(ast.typeOf(base.getWord(args)), ty) {
+            // makes of it (`C(E)` and `explicit operator bool`), nor one
+            // taking another type at all (`CodeLocationLabel(void *)`
+            // through CodePtr's deleted `template <class T> operator T()`,
+            // a HandlerInfo of JSC moved member by member).
+            if count == 1 && plain != 0 && (plainScore < 4 || !takesOwnClass(plain, ty)) && sameClass(ast.typeOf(base.getWord(args)), ty) {
                 plain = 0
                 plainScore = -1
+            }
+            // (An rvalue of the class with `C(C &&) = default` beside a
+            // declared copy constructor: moved member by member.)
+            if count == 1 && plain != 0 && at(c).*.defaultedMove && expr.isRvalueArgument(base.getWord(args)) && sameClass(ast.typeOf(base.getWord(args)), ty) && !types.isRvalueReference(firstParameterType(plain)) {
+                plain = 0
+                plainScore = -1
+            }
+            // (Nor an object of a class derived from it, copied as its
+            // base part, by one taking a scalar it converts to:
+            // `CodePtr<tag>(label)` of LinkBuffer::link, a CodeLocationLabel,
+            // not CodePtr(void *) through the deleted conversion template.)
+            if count == 1 && plain != 0 && firstParameterType(plain) != 0 && !takesOwnClass(plain, ty) && !isClassType(types.unqualified(types.referenced(firstParameterType(plain)))) {
+                const vt = types.unqualified(types.referenced(ast.typeOf(base.getWord(args))))
+                if isClassType(vt) && info(vt) != info(ty) && baseOffset(vt, ty) >= 0 {
+                    plain = 0
+                    plainScore = -1
+                }
             }
         }
         // A constructor template's instance, when it fits better.
         var instance: usize = 0
         var instanceScore: i64 = -1
         // (Never for an object of the class: a template is no copy
-        // constructor.)
-        if at(c).*.ctorTemplates != 0 && !(count == 1 && sameClass(ast.typeOf(base.getWord(args)), ty)) {
+        // constructor. But for an rvalue of a class deleting its copy
+        // constructor and declaring no move constructor, the template's:
+        // `template<typename U> Bag(Bag<T, U>&&)` of WTF's noncopyable
+        // Bag.)
+        const deletedCopyOnly = count == 1 && at(c).*.deletedCopy && !at(c).*.declaredMove && expr.isRvalueArgument(base.getWord(args))
+        if at(c).*.ctorTemplates != 0 && (deletedCopyOnly || !(count == 1 && sameClass(ast.typeOf(base.getWord(args)), ty))) {
             instance = template.candidateInstance(at(c).*.ctorTemplates, args, count, 0)
             if instance != 0 { instanceScore = expr.argumentScore(instance, args, count) }
         }
@@ -2370,7 +2444,11 @@ fn classNewAhead(args: usize) -> bool {
     const a = base.getWord(args)
     typing.addType(a)
     const at_ = types.referenced(ast.typeOf(a))
-    return types.kind(at_) != types.PTR && types.kind(at_) != types.ARRAY && isClassType(at_)
+    // (Only an address is the place itself: any other argument goes to an
+    // operator new taking it, `new (footerSize) GrSkSLFP(...)` Skia's
+    // GrProcessor::operator new(size_t, size_t), not the size taken for an
+    // address.)
+    return types.kind(at_) != types.PTR && types.kind(at_) != types.ARRAY && !types.isNullptr(at_)
 }
 
 pub fn temporaryObject(ty: usize, args: usize, count: usize, token: usize) -> usize {
@@ -4370,6 +4448,7 @@ fn noteSpecialMember(classTy: usize, fnType: usize, isCtor: bool, name: u32) -> 
     const c = info(classTy)
     if types.isRvalueReference(pt) {
         at(c).*.declaredMove = true
+        if !isCtor { at(c).*.declaredMoveAssign = true }
     } else if isCtor {
         at(c).*.declaredCopy = true
     } else {
@@ -4473,11 +4552,20 @@ pub fn memberFunction(classTy: usize, fnType: usize, nameToken: usize, name: u32
         if isCtor && defaulted {
             if types.at(fnType).*.params == 0 { at(c).*.defaultedDefault = true } else { at(c).*.defaultedCopy = true }
         }
+        const dp = types.at(fnType).*.params
+        if defaulted && !isDtor && dp != 0 && types.param(dp).*.next == 0 && types.isRvalueReference(types.param(dp).*.ty) && sameClass(types.unqualified(types.referenced(types.param(dp).*.ty)), classTy) {
+            if isCtor { at(c).*.defaultedMove = true } else if name == assignName { at(c).*.defaultedMoveAssign = true }
+        }
         // (A deleted copy or move constructor: no object of the class is
         // made so, __is_constructible says.)
         const p = types.at(fnType).*.params
         if isCtor && deleted && p != 0 && types.param(p).*.next == 0 && types.kind(types.param(p).*.ty) == types.REF && sameClass(types.referenced(types.param(p).*.ty), classTy) {
             if types.isRvalueReference(types.param(p).*.ty) { at(c).*.deletedMove = true } else { at(c).*.deletedCopy = true }
+        }
+        // (A deleted copy or move assignment: an assignment that would
+        // take it is an error, not the implicit one's bytes.)
+        if !isCtor && !isDtor && deleted && name == assignName && p != 0 && types.param(p).*.next == 0 && types.kind(types.param(p).*.ty) == types.REF && sameClass(types.unqualified(types.referenced(types.param(p).*.ty)), classTy) {
+            if types.isRvalueReference(types.param(p).*.ty) { at(c).*.deletedMoveAssign = true } else { at(c).*.deletedCopyAssign = true }
         }
         return false
     }
@@ -4806,7 +4894,7 @@ pub fn staticMember(classTy: usize, declared: usize, nameToken: usize, attr: usi
     obj.*.alignment = types.alignOf(ty)
     state.addGlobal(o)
     const bound = scope.bindVariable(name, o)
-    if (cursor.is(names.P_ASSIGN) || cursor.is(names.P_LBRACE)) && (isObjectType(ty) || (isClassType(ty) && cursor.is(names.P_ASSIGN) && !cursor.isToken(cursor.peekNext(), names.P_LBRACE))) {
+    if (cursor.is(names.P_ASSIGN) || cursor.is(names.P_LBRACE)) && (isObjectType(ty) || (isClassType(ty) && cursor.is(names.P_ASSIGN) && !cursor.isToken(cursor.peekNext(), names.P_LBRACE)) || bracedCopyAhead(ty)) {
         // (`static constexpr std::optional<R> range { std::nullopt };`:
         // constructed when the program starts, as a global object is.)
         globalObject(o, nameToken)
@@ -4983,8 +5071,11 @@ fn sameParameters(first: usize, second: usize) -> bool {
     if types.at(first).*.constMethod != types.at(second).*.constMethod || types.at(first).*.refQualifier != types.at(second).*.refQualifier { return false }
     var p = types.at(first).*.params
     var q = types.at(second).*.params
-    if p != 0 { p = types.param(p).*.next }
-    if q != 0 { q = types.param(q).*.next }
+    // (The object's `this` passed over: a static member function has
+    // none, `static invert(DoubleCondition)` beside the base's
+    // `invert(RelationalCondition)`, which compared as alike hid it.)
+    if p != 0 && types.param(p).*.name == names.K_THIS { p = types.param(p).*.next }
+    if q != 0 && types.param(q).*.name == names.K_THIS { q = types.param(q).*.next }
     while p != 0 && q != 0 {
         if !types.compatible(types.param(p).*.ty, types.param(q).*.ty) { return false }
         if !types.sameType(types.unqualified(types.param(p).*.ty), types.unqualified(types.param(q).*.ty)) { return false }
@@ -5105,7 +5196,12 @@ fn joinUsings(c: usize) -> void {
         while ast.obj(last).*.nextOverload != 0 { last = ast.obj(last).*.nextOverload }
         var f = memberOf(bt, name)
         while f != 0 {
-            if ast.obj(f).*.isFunction && ast.obj(f).*.usingOf == 0 {
+            // (The base's own aliases too, of its using-declarations:
+            // MacroAssembler's `using MacroAssemblerBase::jump;` beside
+            // its jump(Label), named by `using Base::jump;` in the DFG's
+            // SpeculativeJIT two classes down.)
+            const target = if ast.obj(f).*.usingOf != 0 { ast.obj(f).*.usingOf } else { f }
+            if ast.obj(f).*.isFunction {
                 var hidden = false
                 var o = first
                 while o != 0 {
@@ -5114,10 +5210,10 @@ fn joinUsings(c: usize) -> void {
                 }
                 if !hidden {
                     const alias = base.alloc(@sizeOf(ast.Obj))
-                    base.copy(alias, f, @sizeOf(ast.Obj))
+                    base.copy(alias, target, @sizeOf(ast.Obj))
                     ast.obj(alias).*.nextOverload = 0
                     ast.obj(alias).*.isDefinition = false
-                    ast.obj(alias).*.usingOf = f
+                    ast.obj(alias).*.usingOf = target
                     ast.obj(last).*.nextOverload = alias
                     last = alias
                 }
@@ -5419,9 +5515,9 @@ fn readDeferred() -> void {
 // The arguments `(a, b)` or `{a, b}` after their opener: the array and
 // the count.
 pub fn readArguments(closer: u32) -> (usize, usize) {
-    const MAX_ARGS: usize = 256
+    const MAX_ARGS: usize = 4096
     const mark = base.scratchMark()
-    const given = base.scratch(MAX_ARGS * 8)
+    const given = base.scratchWords(MAX_ARGS)
     const count = expr.argumentList(closer, given, MAX_ARGS)
     const kept = base.keptWords(given, count)
     base.releaseScratch(mark)
@@ -6808,6 +6904,29 @@ pub fn constantArgument(value: usize, ty: usize, token: usize) -> usize {
 
 // A global of a class type, after its declarator: made when the program
 // starts.
+// Whether braces here hold one expression of the class `ty` itself (`T
+// x { f() }`, f giving a T: a copy of it, [dcl.init.list] 3.2; JSC's
+// `static constexpr ArrayType values { constructScratchRegisters() };`).
+pub fn bracedCopyAhead(ty: usize) -> bool {
+    if !cursor.is(names.P_LBRACE) || !isClassType(types.unqualified(ty)) { return false }
+    const after = cursor.peekNext()
+    if tokens.is(after, names.P_LBRACE) || tokens.is(after, names.P_RBRACE) || tokens.is(after, names.P_DOT) || tokens.is(after, names.P_LBRACKET) { return false }
+    const saved = cursor.save()
+    const outer = state.takeTemporaries()
+    cursor.advance()
+    const e = expr.assign()
+    typing.addType(e)
+    const given = types.unqualified(types.referenced(ast.typeOf(e)))
+    var copies = isClassType(given) && sameClass(given, types.unqualified(ty))
+    if copies {
+        const ignored = cursor.consume(names.P_COMMA)
+        copies = cursor.is(names.P_RBRACE)
+    }
+    state.setTemporaries(outer)
+    cursor.restore(saved)
+    return copies
+}
+
 pub fn globalObject(o: usize, token: usize) -> void {
     const ty = ast.obj(o).*.ty
     ast.obj(o).*.isDefinition = true
@@ -6822,6 +6941,13 @@ pub fn globalObject(o: usize, token: usize) -> void {
     if cursor.consume(names.P_LPAREN) {
         const args = readArguments(names.P_RPAREN)
         init = construct(address, ty, args.0, args.1, token)
+    } else if bracedCopyAhead(ty) {
+        // `T x { f() }`, f giving a T: as `T x = f()`.
+        cursor.advance()
+        const value = expr.assign()
+        const ignoredComma = cursor.consume(names.P_COMMA)
+        cursor.expect(names.P_RBRACE)
+        init = construct(address, ty, argumentList(value, 0), 1, token)
     } else if cursor.is(names.P_LBRACE) || (cursor.is(names.P_ASSIGN) && cursor.isToken(cursor.peekNext(), names.P_LBRACE)) {
         const ignored = cursor.consume(names.P_ASSIGN)
         // (A global initializer_list's array is the program's, as a
@@ -7434,6 +7560,22 @@ pub fn deducedClass(token: usize) -> usize {
     } else {
         tokens.errorAt(token, "the class template's arguments cannot be deduced without an initializer")
     }
+    // (One object of the template's own: the copy deduction candidate, more
+    // specialized than any guide taking it as a parameter alone, which
+    // is not weighed (`OptionSet seen = node->enumeratorMetadata();` of
+    // JSC's DFG: OptionSet(E) for E an OptionSet would make an
+    // OptionSet<OptionSet<...>>, whose static_assert fails).)
+    if count == 1 {
+        typing.addType(base.getWord(args))
+        const own = types.unqualified(types.referenced(ast.typeOf(base.getWord(args))))
+        if isClassType(own) && templateRecordOf(own) == scope.at(named).*.obj {
+            expr.unevaluated -= 1
+            const droppedOwn = state.takeTemporaries()
+            state.setTemporaries(pending)
+            cursor.restore(saved)
+            return own
+        }
+    }
     const nameToken = tokens.copy(token)
     tokens.at(nameToken).*.kind = tokens.IDENT
     tokens.at(nameToken).*.name = scope.at(guides).*.name
@@ -7750,7 +7892,7 @@ pub fn explicitMemberTemplate(classTy: usize, name: u32, object: usize, nameToke
         var b = t
         while b != 0 && !template.isFunctionTemplate(b) && scope.at(b).*.name == scope.at(t).*.name && scope.at(b).*.depth == scope.at(t).*.depth { b = scope.at(b).*.hidden }
         if b != 0 && template.isFunctionTemplate(b) {
-            const holder = template.explicitPlaceholder(b)
+            const holder = explicitMemberPlaceholder(b)
             const n = ast.variableNode(holder, nameToken)
             ast.node(n).*.lhs = object
             return n
@@ -7782,7 +7924,7 @@ pub fn memberAccess(nameToken: usize) -> usize {
                     while b != 0 && !template.isFunctionTemplate(b) && scope.at(b).*.name == scope.at(t).*.name && scope.at(b).*.depth == scope.at(t).*.depth { b = scope.at(b).*.hidden }
                     if b != 0 && template.isFunctionTemplate(b) {
                         cursor.restore(nameToken)
-                        const holder = template.explicitPlaceholder(b)
+                        const holder = explicitMemberPlaceholder(b)
                         const n = ast.variableNode(holder, nameToken)
                         if binding != 0 && !ast.obj(o).*.isStaticMember { ast.node(n).*.lhs = thisPointer(nameToken) }
                         return n
@@ -7928,7 +8070,7 @@ pub fn memberReference(object: usize, nameToken: usize) -> usize {
                 var holder: usize = 0
                 if cursor.is(names.P_LT) {
                     // (Read from its `<`: the name's token may be a copy.)
-                    holder = template.explicitPlaceholder(binding)
+                    holder = explicitMemberPlaceholder(binding)
                 } else {
                     holder = template.placeholder(binding)
                     ast.obj(holder).*.nextOverload = 0
@@ -7960,7 +8102,7 @@ pub fn memberReference(object: usize, nameToken: usize) -> usize {
                 while b != 0 && !template.isFunctionTemplate(b) && scope.at(b).*.name == scope.at(t).*.name && scope.at(b).*.depth == scope.at(t).*.depth { b = scope.at(b).*.hidden }
                 if b != 0 && template.isFunctionTemplate(b) {
                     cursor.restore(nameToken)
-                    const holder = template.explicitPlaceholder(b)
+                    const holder = explicitMemberPlaceholder(b)
                     const n = ast.variableNode(holder, nameToken)
                     ast.node(n).*.lhs = addressOf(object, nameToken)
                     return n
@@ -8295,13 +8437,32 @@ fn conversionOf(classTy: usize, target: usize, explicitToo: bool) -> usize {
     const ignored = completeIfNeeded(classTy)
     var c = info(classTy)
     var fallback: usize = 0
+    // (A conversion function to the very target first: as good as a
+    // template's instance, and not a template: WTF's CodePtr's `explicit
+    // operator bool() const` over its deleted `template <class T>
+    // operator T()`.)
+    var exact = c
+    while exact != 0 {
+        var cell = at(exact).*.conversions
+        while cell != 0 {
+            const o = base.getWord(cell)
+            if (explicitToo || !ast.obj(o).*.isExplicit) && types.compatible(types.referenced(base.getWord(cell + 8)), types.referenced(target)) && types.kind(types.referenced(target)) == types.BOOL { return o }
+            cell = base.getWord(cell + 16)
+        }
+        exact = nextInLine(exact, info(classTy))
+    }
     // (A conversion function template's instance to the very target
-    // before another conversion's.)
+    // before another conversion's; on a const object a const one only.)
+    const constObject = types.isConst(types.referenced(classTy))
     var t = c
     while t != 0 {
         var cell = at(t).*.conversionTemplates
         while cell != 0 {
             const instance = template.conversionInstance(base.getWord(cell), target)
+            if instance != 0 && constObject && !types.at(ast.obj(instance).*.ty).*.constMethod {
+                cell = base.getWord(cell + 8)
+                continue
+            }
             if instance != 0 && (explicitToo || !ast.obj(instance).*.isExplicit) {
                 ast.obj(instance).*.isReferenced = true
                 template.ensureDefined(instance)
@@ -8784,6 +8945,15 @@ fn assignsOwnClass(classTy: usize, rhs: usize) -> bool {
 
 // Whether the member operator `f` takes an object of its class `classTy`
 // (by value or reference) after `this`.
+// The type of the function `f`'s first parameter after `this` (0 for
+// none).
+fn firstParameterType(f: usize) -> usize {
+    var p = types.at(ast.obj(f).*.ty).*.params
+    if p != 0 && types.param(p).*.name == names.K_THIS { p = types.param(p).*.next }
+    if p == 0 { return 0 }
+    return types.param(p).*.ty
+}
+
 fn takesOwnClass(f: usize, classTy: usize) -> bool {
     var p = types.at(ast.obj(f).*.ty).*.params
     if p != 0 && types.param(p).*.name == names.K_THIS { p = types.param(p).*.next }
@@ -8977,12 +9147,21 @@ pub fn assignOperator(lhs: usize, rhs: usize, token: usize) -> usize {
     // (Of the class itself, its own copy or move assignment, declared or
     // defaulted, before a template's: `WeakPtr<T>::operator=(WeakPtr &&)`
     // over `template <class U> operator=(WeakPtr<U> &&)`.)
-    if record != 0 && !sameClass(types.unqualified(types.referenced(ast.typeOf(rhs))), types.unqualified(ty)) {
+    // (But an rvalue of a class deleting its copy assignment and
+    // declaring no move assignment: the template's, `template<typename
+    // U> Bag& operator=(Bag<T, U>&&)` of WTF's noncopyable Bag.)
+    const deletedCopyOnly = expr.isRvalueArgument(rhs) && info(types.unqualified(ty)) != 0 && at(info(types.unqualified(ty))).*.deletedCopyAssign && !at(info(types.unqualified(ty))).*.declaredMoveAssign
+    if record != 0 && (deletedCopyOnly || !sameClass(types.unqualified(types.referenced(ast.typeOf(rhs))), types.unqualified(ty))) {
         const instance = template.candidateInstance(record, argumentList(rhs, 0), 1, 0)
         if instance != 0 && expr.argumentScore(instance, argumentList(rhs, 0), 1) > chosenScore {
             template.useInstance(instance)
             return expr.buildCall(methodNode(instance, addressOf(lhs, token), token), argumentList(rhs, 0), 1, token)
         }
+    }
+    // (`operator=(C &&) = default` beside a declared copy assignment:
+    // an rvalue of the class moved member by member.)
+    if chosen != 0 && info(types.unqualified(ty)) != 0 && at(info(types.unqualified(ty))).*.defaultedMoveAssign && expr.isRvalueArgument(rhs) && sameClass(ast.typeOf(rhs), ty) && !types.isRvalueReference(firstParameterType(chosen)) {
+        return memberwiseAssign(lhs, rhs, ty, token)
     }
     if chosen != 0 {
         const address = addressOf(lhs, token)
@@ -9001,6 +9180,16 @@ pub fn assignOperator(lhs: usize, rhs: usize, token: usize) -> usize {
         const converted = convertedObject(rhs, types.unqualified(ty), token)
         if converted != 0 { return assignOperator(lhs, converted, token) }
     }
+    if sameClass(ast.typeOf(rhs), ty) && assignmentDeleted(ty, expr.isRvalueArgument(rhs)) {
+        // (The copy or move assignment the class deletes: `*out = *first`
+        // of unique_ptrs is no copy of their pointers.)
+        if decl.sfinae {
+            decl.sfinaeFailed = true
+            return number(0, types.intOf(), token)
+        }
+        tokens.errorAt(token, deletedAssignment(ty, expr.isRvalueArgument(rhs)))
+        return 0
+    }
     if !needsSpecialCopy(ty) && record == 0 { return 0 }
     // (In SFINAE, a requirement `{ expected = std::move(f) }` of WTF's
     // Invocable: not met.)
@@ -9015,6 +9204,29 @@ pub fn assignOperator(lhs: usize, rhs: usize, token: usize) -> usize {
         return assignOperator(lhs, convertValue(rhs, ty), token)
     }
     return memberwiseAssign(lhs, rhs, ty, token)
+}
+
+// Whether assigning an object of the class `ty` (an rvalue with
+// `moving`) takes an assignment it deletes: the copy assignment for an
+// lvalue; for an rvalue the move assignment, or the copy one when no move
+// assignment is declared.
+fn assignmentDeleted(ty: usize, moving: bool) -> bool {
+    const c = info(types.unqualified(types.referenced(ty)))
+    if c == 0 { return false }
+    if !moving { return at(c).*.deletedCopyAssign }
+    return at(c).*.deletedMoveAssign || (at(c).*.deletedCopyAssign && !at(c).*.declaredMoveAssign)
+}
+
+// "use of the deleted copy assignment of 'T'" (or move).
+fn deletedAssignment(ty: usize, moving: bool) -> []const u8 {
+    const t = types.unqualified(types.referenced(ty))
+    var name = mangle.spelling(t)
+    if name.length == 0 { name = base.nameOf(types.at(t).*.name) }
+    const mark = base.buildMark()
+    base.append(if moving && at(info(t)).*.deletedMoveAssign { "use of the deleted move assignment of '" } else { "use of the deleted copy assignment of '" })
+    base.append(name)
+    base.append("'")
+    return base.keepBuilt(mark)
 }
 
 // `lhs = rhs` of one class, member by member, the source by its address
