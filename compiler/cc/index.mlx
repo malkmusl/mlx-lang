@@ -9,9 +9,10 @@
 //
 //     DIR/<hash of the absolute path>-<hash of the contents>.cxi
 //
-// A shard that is there already is not written again: a header indexed
-// by one unit is not indexed by the next (nor by the next build, as long
-// as it is unchanged), which keeps the cost of indexing a WebCore unit to
+// A shard that is there already is not written again unless this unit
+// left out less of the file (S below): a header indexed by one unit is
+// not indexed by the next (nor by the next build, as long as it is
+// unchanged), which keeps the cost of indexing a WebCore unit to
 // its own file and the headers no unit read before. A shard is written
 // whole to a temporary name and renamed, so units side by side never see
 // half of one. The text (one record a line; a PLACE is LINE:COLUMN, both
@@ -20,6 +21,8 @@
 //
 //     mlx-cc index 1
 //     file HASH PATH                      the shard's file
+//     S COUNT                             the tokens of the file's false
+//         groups in the unit that wrote it (noteSkippedGroup)
 //     D PLACE LENGTH KIND PARENT LINK BODY DEF QNAME NAME
 //         a declaration whose name is at PLACE: KIND f function,
 //         v variable, c class (C++), s struct (C), u union, d data
@@ -186,13 +189,85 @@ pub fn noteMacro(token: usize) -> void {
     base.putWord(push(&macroDefinitions), token)
 }
 
+// What of a file the preprocessor left out: the tokens of its false
+// groups (`#if 0` ... `#endif`), each group counted once a unit and not
+// when the same text was a true group before (a header's include guard
+// on its next #include). A header's shard says it (an S record): one
+// unit's macros may leave out what another's keep (JavaScriptCore's
+// LinkBuffer.h is a line of `#if ENABLE(ASSEMBLER)` where the assembler
+// is off), and a shard that is there is written again by a unit that left
+// out less of its file.
+var skippedAt: usize = 0
+var groups: table.Table = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
+
+// While the preprocessor runs, a file's tokens left out are not all
+// counted yet: whether its shard is written again is not decided then.
+pub var holding = false
+
+fn groupKey(token: usize) -> usize {
+    if token == 0 || tokens.isEof(token) { return 0 }
+    return tokens.at(token).*.start
+}
+
+// A true group starts at `token`.
+pub fn noteLiveGroup(token: usize) -> void {
+    const key = groupKey(token)
+    if key != 0 && table.get(&groups, key) == 0 { table.set(&groups, key, 1) }
+}
+
+// A false group of `count` tokens starts at `token`.
+pub fn noteSkippedGroup(token: usize, count: usize) -> void {
+    const key = groupKey(token)
+    if key == 0 || table.get(&groups, key) != 0 { return }
+    table.set(&groups, key, 2)
+    const file = tokens.at(token).*.file
+    if file == 0 || @intCast(usize, file) >= base.MAX_FILES { return }
+    if skippedAt == 0 { skippedAt = base.alloc(base.MAX_FILES * 8) }
+    const at = skippedAt + @intCast(usize, file) * 8
+    base.putWord(at, base.getWord(at) + count)
+}
+
+fn skippedOf(file: u32) -> usize {
+    if skippedAt == 0 || file == 0 || @intCast(usize, file) >= base.MAX_FILES { return 0 }
+    return base.getWord(skippedAt + @intCast(usize, file) * 8)
+}
+
+// The S record of the shard at `path` (none: as if it left out all).
+fn skippedIn(path: []const u8) -> usize {
+    var buffer: [2048]u8 = undefined
+    const bytes: [*]u8 = &buffer
+    const descriptor = std.linux.syscall3(2, base.cPath(path), 524288, 0)
+    if descriptor < 0 { return 18446744073709551615 }
+    const count = std.linux.syscall3(0, @bitCast(usize, descriptor), @intFromPtr(bytes), 2048)
+    const closed = std.linux.syscall1(3, @bitCast(usize, descriptor))
+    if count <= 0 { return 18446744073709551615 }
+    const length = @intCast(usize, count)
+    // The third line.
+    var at: usize = 0
+    var lines: usize = 0
+    while at < length && lines < 2 {
+        if bytes[at] == 10 { lines += 1 }
+        at += 1
+    }
+    if at + 2 >= length || bytes[at] != 83 || bytes[at + 1] != 32 { return 18446744073709551615 }
+    at += 2
+    var value: usize = 0
+    while at < length && bytes[at] >= 48 && bytes[at] <= 57 {
+        value = value * 10 + @intCast(usize, bytes[at] - 48)
+        at += 1
+    }
+    return value
+}
+
 // Whether what is in file `file` (an id of base's) is left out: its
-// shard is there already (or it is no file). Asked once a file: a header
-// another unit indexed costs nothing more (its uses are not kept).
+// shard is there already, made by a unit that left out no more of it
+// (or it is no file). Asked once a file: a header another unit indexed
+// costs nothing more (its uses are not kept).
 var fileStates: usize = 0
 
 fn skipsFile(file: u32) -> bool {
     if file == 0 { return true }
+    if holding { return false }
     if fileStates == 0 { fileStates = base.alloc(base.MAX_FILES) }
     var state = base.get8(fileStates + @intCast(usize, file))
     if state == 0 {
@@ -519,6 +594,7 @@ const Shard = struct {
     path: u32
     absolute: []const u8
     hash: u64
+    file: u32
     skip: bool
     records: Buffer
     files: table.Table
@@ -586,11 +662,13 @@ fn shardOf(path: u32, file: u32) -> usize {
     shard.*.path = path
     shard.*.order = List.{ .items = 0, .length = 0, .capacity = 0, .size = 4 }
     const name = base.nameOf(path)
+    shard.*.file = file
     shard.*.skip = name.length == 0 || name[0] == 60
     if !shard.*.skip {
         shard.*.absolute = absolutePath(name)
         shard.*.hash = fnv(14695981039346656037, base.bytes(base.fileData(file), base.fileLength(file)))
-        shard.*.skip = exists(shardPath(shard, false))
+        const final = shardPath(shard, false)
+        shard.*.skip = exists(final) && skippedIn(final) <= skippedOf(file)
     }
     table.set(&shards, @intCast(usize, path), address)
     base.putWord(push(&shardList), address)
@@ -887,12 +965,16 @@ fn writeShards() -> void {
     var at: usize = 0
     while at < shardList.length {
         const shard = shardAt(base.getWord(shardList.items + at * 8))
+        // (A unit beside this one may have written it meanwhile.)
+        if !shard.*.skip && exists(shardPath(shard, false)) && skippedIn(shardPath(shard, false)) <= skippedOf(shard.*.file) { shard.*.skip = true }
         if !shard.*.skip {
             var text = Buffer.{ .data = 0, .length = 0, .capacity = 0 }
             put(&text, "mlx-cc index 1\nfile ")
             putHex(&text, shard.*.hash)
             putByte(&text, 32)
             put(&text, shard.*.absolute)
+            put(&text, "\nS ")
+            putNumber(&text, @intCast(u64, skippedOf(shard.*.file)))
             putByte(&text, 10)
             if shard.*.records.length > 0 { put(&text, base.bytes(shard.*.records.data, shard.*.records.length)) }
             var number: usize = 0
@@ -925,6 +1007,8 @@ fn writeShards() -> void {
 
 fn forget() -> void {
     fileStates = 0
+    skippedAt = 0
+    groups = table.Table.{ .slots = 0, .capacity = 0, .count = 0 }
     uses.length = 0
     classes.length = 0
     macroDefinitions.length = 0

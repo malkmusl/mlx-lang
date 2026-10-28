@@ -510,6 +510,12 @@ mlx-cc compiles both as released now:
   timer steps pass (check_jsc_mlxlibc.sh), and crypto's five RSA
   key-generation tests passed 150 runs of 150.
 
+  mlx-codemap knew little of JavaScriptCore's JIT: a header's shard of
+  the index is written by the first unit that reads it, and the first
+  to read LinkBuffer.h had the assembler off (one `#if
+  ENABLE(ASSEMBLER)` line of it). mlx-cc counts what each file's false
+  groups leave out (an `S` record) and writes a shard again when a unit
+  leaves out less (tools/check_codemap_cpp.sh, arcs.h).
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
