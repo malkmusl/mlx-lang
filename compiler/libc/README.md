@@ -17,7 +17,7 @@ gcc program.c -L mlx-out/libc -lmlxc -Wl,-rpath,$PWD/mlx-out/libc  # next to gli
 
 | Library | What it is | Built from |
 | --- | --- | --- |
-| `libmlxc.so.1` (`libmlxc.so`) | 848 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, gettext, iconv, POSIX regular expressions, dlfcn, `inet_pton`; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
+| `libmlxc.so.1` (`libmlxc.so`) | 848 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families (`open_memstream`), pthread with thread-local storage and C11's `threads.h` on it, `tsearch`, getopt, dirent, err/warn/error, syslog, locale stubs, gettext, iconv, POSIX regular expressions, dlfcn, `inet_pton`; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
 | `libm.so.6` (`libm.so`) | the math functions of `<math.h>`: `std.math`'s sine, cosine (huge arguments reduced with the bits of 2/pi), e^x, logarithms and cube root, with the arc tangent, the inverse and hyperbolic functions, powers (whole exponents to an ulp in double-double arithmetic), `fmod` and `remainder` exact, the rounding functions, `frexp`/`ldexp`, `hypot`, `nextafter`, `erf`/`erfc` (a series in double-double, a continued fraction), `tgamma`/`lgamma` (Lanczos and a rising product), the classification, and the `f` variants; `tools/libm_check.py` compares it with glibc's libm call by call; the 41 `l` (long double) variants (`sinl` to `lgammal`) are x87 code of their own, `tools/libc/x87_long.s`, generated into `x87_long.mlx` by `tools/libc/gen_x87.py` and bound by the loader from a page of its own. Not yet: the Bessel functions, errno | `libm.mlx`, `x87_long.mlx` |
 
 It is a `--plugin` shared object on a stack arena with no C library under
@@ -137,7 +137,8 @@ and where it goes.
   `pthread_join`/`detach` (a registry of the live threads: a handle
   already joined answers ESRCH), mutexes (normal, recursive,
   error-checking), condition variables, rwlocks, spin locks, barriers,
-  semaphores, keys with destructors, `pthread_once`, names;
+  semaphores, keys with destructors, `pthread_once`, names, and C11's
+  `threads.h` (`call_once`, `mtx_*`, `cnd_*`, `thrd_*`, `tss_*`) on them;
   `pthread_getattr_np` of the main thread describes the kernel's stack
   as glibc does (the mapping holding the first stack pointer in
   `/proc/self/maps`, as deep as `RLIMIT_STACK` allows), since
