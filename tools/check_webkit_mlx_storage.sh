@@ -21,13 +21,14 @@
 # layer trees, internals.layerTreeAsText) with --list compositing.txt
 # --fonts, as tools/check_webkit_mlx_compositing.sh does.
 #
-#   tools/check_webkit_mlx_storage.sh [--no-build] [-j N] [--keep DIR] [--list NAME] [--fonts] [TEST...]
+#   tools/check_webkit_mlx_storage.sh [--no-build] [-j N] [--keep DIR] [--list NAME] [--fonts] [--timeout S] [TEST...]
 #     (--no-build: the program as it is; -j: the build's jobs, 2 by
 #     default; --keep: what each test printed, kept in DIR; --list: the
 #     list of tests/layout, storage.txt by default; --fonts:
 #     WebKitTestRunner's fonts, as tools/check_webkit_mlx_layout.sh gives
-#     them, for tests whose text's sizes show; TEST: paths of the list,
-#     all by default)
+#     them, for tests whose text's sizes show; --timeout: the seconds a
+#     test has to finish, 60 by default; TEST: paths of the list, all by
+#     default)
 set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,6 +43,7 @@ jobs=2
 keep=""
 list=storage.txt
 fonts=0
+seconds=60
 chosen=()
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --keep) keep=$2; shift ;;
         --list) list=$2; shift ;;
         --fonts) fonts=1 ;;
+        --timeout) seconds=$2; shift ;;
         -*) fail "unknown argument $1" ;;
         *) chosen+=("$1") ;;
     esac
@@ -108,7 +111,7 @@ for test in "${tests[@]}"; do
     [[ -n "$expected" ]] || fail "$test has no -expected.txt"
     out=$work/out.txt
     status=0
-    env -i HOME="$work/home" TMPDIR="$work/tmp" TZ=US/Pacific "${fontEnvironment[@]}" timeout 120 "$program" --test --size 800x600 --timeout 60 "${fontOptions[@]}" "$repo_root/$layout/LayoutTests/$test" > "$out" 2> "$work/err.txt" || status=$?
+    env -i HOME="$work/home" TMPDIR="$work/tmp" TZ=US/Pacific "${fontEnvironment[@]}" timeout $(( seconds + 60 )) "$program" --test --size 800x600 --timeout "$seconds" "${fontOptions[@]}" "$repo_root/$layout/LayoutTests/$test" > "$out" 2> "$work/err.txt" || status=$?
     if [[ -n "$keep" ]]; then
         mkdir -p "$keep/$(dirname "$test")"
         cp "$out" "$keep/${test%.*}-actual.txt"

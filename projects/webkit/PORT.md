@@ -512,8 +512,21 @@ mlx-cc compiles both as released now:
 
   fast/selectors: tools/check_webkit_mlx_selectors.sh runs the
   dumpAsText tests of WebKit's fast/selectors that pass
-  (tests/layout/selectors.txt: 218 of the 251 that dump text) with the
-  selector JIT.
+  (tests/layout/selectors.txt: 219 of the 251 that dump text) with the
+  selector JIT. The other 32 fail with or without the JIT, for what
+  webcore-dump's test runner lacks: eventSender (:hover, :active, access
+  keys), UIHelper, internals' style invalidation counters and selector
+  filter hashes, an active and focused window (:focus-within,
+  :focus-visible, setWindowIsKey, read-only inputs), a harness file of
+  imported/w3c (selector-aliases.html); three print a blank line or a
+  word apart from the expected text. A test has 180 s there:
+  case-insensitive-attribute-register-requirement-1.html, right but
+  slow, takes about 56 s (the runner's default is 60) because each of
+  its 973 checks adds a line to the document and its next
+  getComputedStyle resolves the style of the whole, longer document:
+  seven tenths of a profile in Style::TreeResolver, three tenths of
+  all the samples libpas' allocation (below, "What M8's fifth part
+  leaves").
 
   mlx-codemap knew little of JavaScriptCore's JIT: a header's shard of
   the index is written by the first unit that reads it, and the first
