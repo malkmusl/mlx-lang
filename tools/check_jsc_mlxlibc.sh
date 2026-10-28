@@ -11,8 +11,10 @@
 #   - the scripts of projects/webkit/tests/jsc print what they print on
 #     the glibc-linked jsc (their .expected files; Intl and the core
 #     language as node prints them, a stress of the runtime, sorting,
-#     typed arrays, exceptions caught in hot functions), run with an
-#     empty environment; the benchmark
+#     typed arrays, exceptions caught in hot functions, WebAssembly:
+#     its tiers, traps, the fault handler's bounds checks, SIMD), run
+#     with an empty environment, then again with the JIT's tiers (the
+#     FTL, BBQ, OMG) made early and with eager compilation; the benchmark
 #     tests/bench/bench.js runs, its results right;
 #   - a running jsc has mlxlibc's loader mapped and neither glibc's C
 #     library nor its loader;
@@ -44,24 +46,39 @@ needed=$(readelf -d "$jsc" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' 
 echo "ok   jsc starts on mlxlibc's loader and needs libc.so.6, mlx-unicode, libm.so.6"
 
 tests=projects/webkit/tests/jsc
-run() { # NAME SCRIPT [ARGUMENTS]
+flags=()
+run() { # NAME SCRIPT [ARGUMENTS], with jsc's options in flags
     local name=$1 status=0
     shift
-    (cd "$tests" && env -i timeout 600 "$jsc" "$@" > "$work/$name.out" 2>&1) || status=$?
-    [[ $status -eq 0 ]] || fail "$name: jsc exits with $status: $(tail -3 "$work/$name.out")"
-    diff -u "$tests/$name.expected" "$work/$name.out" > "$work/$name.diff" || { head -20 "$work/$name.diff"; fail "$name prints otherwise than the glibc-linked jsc"; }
+    (cd "$tests" && env -i timeout 600 "$jsc" "${flags[@]}" "$@" > "$work/$name.out" 2>&1) || status=$?
+    [[ $status -eq 0 ]] || fail "$name ${flags[*]}: jsc exits with $status: $(tail -3 "$work/$name.out")"
+    diff -u "$tests/$name.expected" "$work/$name.out" > "$work/$name.diff" || { head -20 "$work/$name.diff"; fail "$name ${flags[*]} prints otherwise than the glibc-linked jsc"; }
     ran+=("$name")
 }
-ran=()
-run intl intl.js
-run core core.js
-run numbers-currency numbers.js -- currency
-run numbers-percent numbers.js -- percent
-run stress stress.js
-run sort sort.js
-run f64 f64.js
-run exceptions exceptions.js
+scripts() {
+    ran=()
+    run intl intl.js
+    run core core.js
+    run numbers-currency numbers.js -- currency
+    run numbers-percent numbers.js -- percent
+    run stress stress.js
+    run sort sort.js
+    run f64 f64.js
+    run exceptions exceptions.js
+    run wasm wasm.js
+}
+scripts
 echo "ok   ${#ran[@]} scripts print what the glibc-linked jsc prints: ${ran[*]}"
+# Again with each tier made early (the FTL after 40 runs of a function,
+# WebAssembly's BBQ and OMG after few calls), the compilers on the
+# script's thread, and with every function compiled before it runs.
+flags=(--useConcurrentJIT=false --thresholdForJITAfterWarmUp=10 --thresholdForOptimizeAfterWarmUp=20 --thresholdForFTLOptimizeAfterWarmUp=40 --thresholdForFTLOptimizeSoon=40 --thresholdForBBQOptimizeAfterWarmUp=10 --thresholdForOMGOptimizeAfterWarmUp=20)
+scripts
+echo "ok   the same with the tiers early: ${flags[*]}"
+flags=(--useConcurrentJIT=false --forceEagerCompilation=true)
+scripts
+echo "ok   the same with ${flags[*]}"
+flags=()
 
 # The benchmark (projects/webkit/tests/bench/bench.js): each section
 # checks its result, the times are printed.
