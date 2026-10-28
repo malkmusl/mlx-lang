@@ -1,0 +1,148 @@
+// A function's LIR (ir.mlx) made into code: mlx4's optimizer over it,
+// then its x86-64 back end instruction by instruction into the encoder
+// x86.mlx writes to, with the instructions the back end leaves to its
+// client (lir.Opcode.external, external_value) emitted here with x86.mlx
+// and gen.mlx: the addresses of globals, a memzero, the bit builtins,
+// the plain asm instructions.
+const base = @import("./base.mlx")
+const ast = @import("./ast.mlx")
+const x86 = @import("./x86.mlx")
+const gen = @import("./gen.mlx")
+const builtins = @import("./builtins.mlx")
+const ir = @import("./ir.mlx")
+const lir = @import("../../compiler/selfhost/ir/lir.mlx")
+const optimize = @import("../../compiler/selfhost/ir/optimize.mlx")
+const encoder = @import("../../compiler/selfhost/backend/x86_64/encoder.mlx")
+const target = @import("../../compiler/selfhost/backend/x86_64/target.mlx")
+const state_module = @import("../../compiler/selfhost/backend/x86_64/codegen/state.mlx")
+const emitter = @import("../../compiler/selfhost/backend/x86_64/codegen/emitter.mlx")
+const heap = @import("std.heap")
+
+// The client's words of an external instruction (its low byte; the rest
+// its payload).
+pub const EXT_GLOBAL: usize = 1
+pub const EXT_MEMZERO: usize = 2
+pub const EXT_BITOP: usize = 3
+pub const EXT_ASM: usize = 4
+
+// Every function's blocks are named after the ones before (.block_N).
+var blockLabelBase: usize = 0 // (per run)
+
+// The slot budget per instruction: a C value is one word.
+const SLOT_BUDGET: usize = 8
+
+pub fn emitFunction(fn_obj: usize, program: *lir.Lir, block_count: usize, frame_bytes: usize) -> void {
+    const allocator = heap.allocator()
+    const result = optimize.runLocal(program, allocator)
+    if ir.trace { ir.dump(fn_obj, program, "optimized") }
+    const enc = x86.enc()
+    const count = lir.instCount(program)
+    const reserved = encoder.reserve(enc, count * 20 + 4096)
+    const state = state_module.State.create(allocator, enc, program, ir.store())
+    state.*.blockLabelBase = blockLabelBase
+    state.*.slotBudget = SLOT_BUDGET
+    state.*.slotBase = frame_bytes
+    state.*.keepBlockLabels = true
+    blockLabelBase += block_count
+    // (At 16: a function's address is even, which a pointer to a virtual
+    // member function, odd, is told apart from.)
+    while x86.position() % 16 != 0 { x86.int3() }
+    var index: usize = 0
+    while index < count {
+        const instruction = lir.getInst(program, index)
+        state_module.State.settleLazy(state, index, instruction)
+        if instruction.opcode == lir.Opcode.external || instruction.opcode == lir.Opcode.external_value {
+            emitExternal(state, index, instruction)
+        } else {
+            emitter.Emitter.emitInstruction(state, index, instruction)
+        }
+        index += 1
+    }
+    state_module.State.destroy(state)
+}
+
+fn operand(state: *state_module.State, instruction: lir.Inst, at: usize) -> usize {
+    return lir.getExtra(state.*.lir, instruction.arg1 + at)
+}
+
+fn emitExternal(state: *state_module.State, index: usize, instruction: lir.Inst) -> void {
+    const kind = instruction.arg0 & 255
+    const payload = instruction.arg0 >> 8
+    const enc = x86.enc()
+    if kind == EXT_GLOBAL {
+        gen.globalAddress(x86.RAX, payload)
+        enc.*.raxStackSlot = 0
+        state_module.State.storeRaxResult(state, index)
+        return
+    }
+    if kind == EXT_MEMZERO {
+        // rep stosb: rcx bytes of al at rdi.
+        state_module.State.loadOp(state, target.Register.rdi, operand(state, instruction, 0))
+        x86.moveImmediate(x86.RCX, @intCast(i64, payload))
+        x86.moveImmediate(x86.RAX, 0)
+        x86.repStoreBytes()
+        enc.*.raxStackSlot = 0
+        encoder.forgetXmm(enc)
+        state_module.State.storeRaxResult(state, index)
+        return
+    }
+    if kind == EXT_BITOP {
+        state_module.State.loadOp(state, target.Register.rax, operand(state, instruction, 0))
+        emitBitop(@intCast(i64, payload & 255), @intCast(i64, payload >> 8))
+        enc.*.raxStackSlot = 0
+        state_module.State.storeRaxResult(state, index)
+        return
+    }
+    if kind == EXT_ASM {
+        const instruction_kind = @intCast(i64, payload)
+        if instruction_kind == builtins.ASM_PAUSE { x86.pause() }
+        if instruction_kind == builtins.ASM_INT3 { x86.int3() }
+        if instruction_kind == builtins.ASM_NOP { x86.nop() }
+        if instruction_kind == builtins.ASM_MFENCE { x86.mfence() }
+        if instruction_kind == builtins.ASM_LFENCE { x86.lfence() }
+        if instruction_kind == builtins.ASM_SFENCE { x86.sfence() }
+        if instruction_kind == builtins.ASM_UD2 { x86.ud2() }
+        enc.*.raxStackSlot = 0
+        encoder.forgetXmm(enc)
+        state_module.State.storeRaxResult(state, index)
+        return
+    }
+    base.fatal("internal error: an external LIR instruction of an unknown kind")
+}
+
+// A bit builtin on the unsigned operand in rax (gen.genBitop's code):
+// the result in rax.
+fn emitBitop(op: i64, width: i64) -> void {
+    if op == builtins.BSWAP {
+        if width == 64 {
+            x86.bswap(x86.RAX, true)
+        } else if width == 32 {
+            x86.bswap(x86.RAX, false)
+        } else {
+            x86.move(x86.RCX, x86.RAX)
+            x86.shiftImmediate(x86.RAX, 8, true, false)
+            x86.shiftImmediate(x86.RCX, 8, false, false)
+            x86.orRegisters(x86.RAX, x86.RCX)
+            x86.extend(x86.RAX, 16, false)
+        }
+        return
+    }
+    // clz, ctz, ffs: a zero operand has no set bit (clz and ctz give
+    // the width, ffs 0).
+    const zero = gen.newLabel()
+    const done = gen.newLabel()
+    x86.testRegisters(x86.RAX, x86.RAX)
+    x86.jumpIf(x86.CC_E, zero)
+    x86.bitScan(x86.RCX, x86.RAX, op == builtins.CLZ)
+    if op == builtins.CLZ {
+        x86.moveImmediate(x86.RAX, width - 1)
+        x86.sub(x86.RAX, x86.RCX)
+    } else {
+        x86.move(x86.RAX, x86.RCX)
+        if op == builtins.FFS { x86.immediate(0, x86.RAX, 1) }
+    }
+    x86.jump(done)
+    x86.defineLabel(zero)
+    x86.moveImmediate(x86.RAX, if op == builtins.FFS { 0 } else { width })
+    x86.defineLabel(done)
+}

@@ -1,0 +1,1996 @@
+// A function lowered to the Mlx compiler's LIR (compiler/selfhost/ir)
+// instead of the stack machine of gen.mlx: `-fbackend=lir`. mlx4's
+// optimizer and x86-64 back end then make the code (irgen.mlx), through
+// the encoder both share with x86.mlx. The two agree on everything the
+// rest of the object sees (the ABI, rbp, the data area, the symbols), so
+// a function the lowering does not cover (`unsupported` says which: long
+// double, wide integers, variadic definitions, inline assembly with
+// operands, ...) is made by the stack machine as before.
+//
+// Every integer is a 64-bit LIR value kept canonical for its C type (as
+// the stack machine keeps rax): a narrow operation is the 64-bit one
+// followed by `extend`. A struct's value is its address. A scalar local
+// whose address is never taken is an 8-byte `alloca` that the optimizer
+// promotes and the register pass may keep in rbx, r12 or r13; every other
+// local is at the place genstmt.assignOffsets gave it, reached by
+// `frame_local`. Calls follow the System V classification of gen.mlx.
+const base = @import("./base.mlx")
+const names = @import("./names.mlx")
+const types = @import("./types.mlx")
+const ast = @import("./ast.mlx")
+const tokens = @import("./tokens.mlx")
+const interp = @import("./interp.mlx")
+const x86 = @import("./x86.mlx")
+const gen = @import("./gen.mlx")
+const genstmt = @import("./genstmt.mlx")
+const builtins = @import("./builtins.mlx")
+const atomics = @import("./atomics.mlx")
+const irgen = @import("./irgen.mlx")
+const lir = @import("../../compiler/selfhost/ir/lir.mlx")
+const type_store = @import("../../compiler/selfhost/sema/types/store.mlx")
+const heap = @import("std.heap")
+
+pub const BACKEND_STACK: u8 = 0
+pub const BACKEND_LIR: u8 = 1
+pub var backend: u8 = 0 // (per run)
+
+// The mlx4 types the LIR's values carry (the back end asks them whether
+// a value is floating, how wide and whether signed).
+var storeAddress: usize = 0 // (per run)
+pub var tI8: usize = 0 // (per run)
+pub var tI16: usize = 0 // (per run)
+pub var tI32: usize = 0 // (per run)
+pub var tI64: usize = 0 // (per run)
+pub var tU8: usize = 0 // (per run)
+pub var tU16: usize = 0 // (per run)
+pub var tU32: usize = 0 // (per run)
+pub var tU64: usize = 0 // (per run)
+pub var tF32: usize = 0 // (per run)
+pub var tF64: usize = 0 // (per run)
+pub var tBool: usize = 0 // (per run)
+// The tuples of two eightbytes a struct comes back in: integer/integer,
+// integer/float, float/integer, float/float.
+var tupleII: usize = 0 // (per run)
+var tupleIF: usize = 0 // (per run)
+var tupleFI: usize = 0 // (per run)
+var tupleFF: usize = 0 // (per run)
+
+pub fn store() -> *type_store.Store {
+    unsafe { return @ptrFromInt(*type_store.Store, storeAddress) }
+}
+
+fn tupleOf(first: usize, second: usize) -> usize {
+    const start = type_store.Store.appendExtra(store(), first)
+    const added = type_store.Store.appendExtra(store(), second)
+    return type_store.Store.tuple(store(), start, 2)
+}
+
+pub fn init() -> void {
+    if storeAddress != 0 { return }
+    storeAddress = base.sideAlloc(@sizeOf(type_store.Store))
+    store().* = type_store.Store.init(heap.allocator())
+    tI8 = type_store.Store.integer(store(), true, 8)
+    tI16 = type_store.Store.integer(store(), true, 16)
+    tI32 = type_store.Store.integer(store(), true, 32)
+    tI64 = type_store.Store.integer(store(), true, 64)
+    tU8 = type_store.Store.integer(store(), false, 8)
+    tU16 = type_store.Store.integer(store(), false, 16)
+    tU32 = type_store.Store.integer(store(), false, 32)
+    tU64 = type_store.Store.integer(store(), false, 64)
+    tF32 = type_store.Store.float(store(), 32)
+    tF64 = type_store.Store.float(store(), 64)
+    tBool = type_store.Store.primitive(store(), type_store.Kind.bool_type)
+    tupleII = tupleOf(tI64, tI64)
+    tupleIF = tupleOf(tI64, tF64)
+    tupleFI = tupleOf(tF64, tI64)
+    tupleFF = tupleOf(tF64, tF64)
+}
+
+// ---------------------------------------------------------------------------
+// Statistics (MLX_CC_STATS): the functions each way, and why not.
+
+const REASON_COUNT: usize = 16
+pub const R_LONG_DOUBLE: usize = 0
+pub const R_WIDE: usize = 1
+pub const R_VARIADIC: usize = 2
+pub const R_ASM: usize = 3
+pub const R_VA_ARG: usize = 4
+pub const R_LABEL_ADDRESS: usize = 5
+pub const R_ALLOCA: usize = 6
+pub const R_ATOMIC16: usize = 7
+pub const R_SETJMP: usize = 8
+pub const R_STACK_ALIGNMENT: usize = 9
+pub const R_BIT_PRECISE: usize = 10
+pub const R_NODE_KIND: usize = 11
+pub const R_ENTRY: usize = 12
+pub const R_SPECIAL_ASM: usize = 13
+
+var loweredCount: u64 = 0 // (per run)
+var loweredInstructions: u64 = 0 // (per run)
+var fallbackCount: u64 = 0 // (per run)
+var reasonCounts: [16]u64 = undefined // (per run)
+var reasonsReady = false // (per run)
+var unsupportedReason: usize = 0 // (per run)
+
+fn reasonName(reason: usize) -> []const u8 {
+    if reason == R_LONG_DOUBLE { return "long double" }
+    if reason == R_WIDE { return "wide integers" }
+    if reason == R_VARIADIC { return "variadic definitions" }
+    if reason == R_ASM { return "inline assembly with operands" }
+    if reason == R_VA_ARG { return "va_arg, va_start, va_copy" }
+    if reason == R_LABEL_ADDRESS { return "label addresses and computed goto" }
+    if reason == R_ALLOCA { return "__builtin_alloca" }
+    if reason == R_ATOMIC16 { return "16-byte atomics" }
+    if reason == R_SETJMP { return "setjmp and the like" }
+    if reason == R_STACK_ALIGNMENT { return "arguments in memory at an alignment of 16" }
+    if reason == R_BIT_PRECISE { return "_BitInt of an odd width" }
+    if reason == R_NODE_KIND { return "a node kind not lowered" }
+    if reason == R_ENTRY { return "entry thunks" }
+    if reason == R_SPECIAL_ASM { return "cpuid, rdtsc, xgetbv, the stack pointer, valgrind" }
+    return "other"
+}
+
+fn countFallback(reason: usize) -> void {
+    if !reasonsReady {
+        var i: usize = 0
+        while i < REASON_COUNT {
+            reasonCounts[i] = 0
+            i += 1
+        }
+        reasonsReady = true
+    }
+    fallbackCount += 1
+    if reason < REASON_COUNT { reasonCounts[reason] += 1 }
+}
+
+pub fn showStats() -> void {
+    if backend != BACKEND_LIR { return }
+    base.say("lir: ")
+    base.sayNumber(loweredCount)
+    base.say(" functions lowered (")
+    base.sayNumber(loweredInstructions)
+    base.say(" instructions), ")
+    base.sayNumber(fallbackCount)
+    base.say(" by the stack machine\n")
+    var i: usize = 0
+    while i < REASON_COUNT {
+        if reasonsReady && reasonCounts[i] != 0 {
+            base.say("lir:   ")
+            base.sayNumber(reasonCounts[i])
+            base.say(" for ")
+            base.say(reasonName(i))
+            base.say("\n")
+        }
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MLX_CC_LIR_TRACE: the LIR of every function as lowered, on stderr.
+
+pub var trace = false // (per run)
+
+fn opcodeName(opcode: lir.Opcode) -> []const u8 {
+    const code = @intFromEnum(opcode)
+    if opcode == lir.Opcode.const_i { return "const_i" }
+    if opcode == lir.Opcode.copy { return "copy" }
+    if opcode == lir.Opcode.cast { return "cast" }
+    if opcode == lir.Opcode.bitcast { return "bitcast" }
+    if opcode == lir.Opcode.add { return "add" }
+    if opcode == lir.Opcode.sub { return "sub" }
+    if opcode == lir.Opcode.mul { return "mul" }
+    if opcode == lir.Opcode.div { return "div" }
+    if opcode == lir.Opcode.rem { return "rem" }
+    if opcode == lir.Opcode.udiv { return "udiv" }
+    if opcode == lir.Opcode.urem { return "urem" }
+    if opcode == lir.Opcode.bit_and { return "and" }
+    if opcode == lir.Opcode.bit_or { return "or" }
+    if opcode == lir.Opcode.bit_xor { return "xor" }
+    if opcode == lir.Opcode.shl { return "shl" }
+    if opcode == lir.Opcode.shr { return "shr" }
+    if opcode == lir.Opcode.popcount { return "popcount" }
+    if opcode == lir.Opcode.icmp { return "icmp" }
+    if opcode == lir.Opcode.fcmp { return "fcmp" }
+    if opcode == lir.Opcode.load { return "load" }
+    if opcode == lir.Opcode.store { return "store" }
+    if opcode == lir.Opcode.alloca { return "alloca" }
+    if opcode == lir.Opcode.gep { return "gep" }
+    if opcode == lir.Opcode.label { return "label" }
+    if opcode == lir.Opcode.br { return "br" }
+    if opcode == lir.Opcode.condbr { return "condbr" }
+    if opcode == lir.Opcode.icmp_br { return "icmp_br" }
+    if opcode == lir.Opcode.call { return "call" }
+    if opcode == lir.Opcode.direct_call { return "direct_call" }
+    if opcode == lir.Opcode.ret { return "ret" }
+    if opcode == lir.Opcode.param { return "param" }
+    if opcode == lir.Opcode.tuple_literal { return "tuple_literal" }
+    if opcode == lir.Opcode.tuple_element { return "tuple_element" }
+    if opcode == lir.Opcode.mem_copy { return "mem_copy" }
+    if opcode == lir.Opcode.atomic_load { return "atomic_load" }
+    if opcode == lir.Opcode.atomic_store { return "atomic_store" }
+    if opcode == lir.Opcode.atomic_rmw { return "atomic_rmw" }
+    if opcode == lir.Opcode.cmpxchg { return "cmpxchg" }
+    if opcode == lir.Opcode.fence { return "fence" }
+    if opcode == lir.Opcode.dead { return "dead" }
+    if opcode == lir.Opcode.extend { return "extend" }
+    if opcode == lir.Opcode.frame_local { return "frame_local" }
+    if opcode == lir.Opcode.external { return "external" }
+    if opcode == lir.Opcode.external_value { return "external_value" }
+    if opcode == lir.Opcode.unreachable_inst { return "unreachable" }
+    return base.join("op", base.decimal(@intCast(u64, code)))
+}
+
+fn sayArg(value: usize) -> void {
+    if value == lir.NONE {
+        base.say(" -")
+        return
+    }
+    base.say(" ")
+    if value > 4294967295 {
+        base.say("-")
+        base.sayNumber(@intCast(u64, 0 -% value))
+        return
+    }
+    base.sayNumber(@intCast(u64, value))
+}
+
+pub fn dump(fn_obj: usize, program: *lir.Lir, title: []const u8) -> void {
+    base.say("lir ")
+    base.say(title)
+    base.say(" ")
+    base.say(base.nameOf(ast.obj(fn_obj).*.symbol))
+    base.say(":\n")
+    var index: usize = 0
+    while index < lir.instCount(program) {
+        const inst = lir.getInst(program, index)
+        if inst.opcode != lir.Opcode.dead {
+            base.say("  ")
+            base.sayNumber(@intCast(u64, index))
+            base.say(": ")
+            base.say(opcodeName(inst.opcode))
+            sayArg(inst.arg0)
+            sayArg(inst.arg1)
+            sayArg(inst.arg2)
+            if inst.opcode == lir.Opcode.direct_call || inst.opcode == lir.Opcode.call || inst.opcode == lir.Opcode.external || inst.opcode == lir.Opcode.external_value {
+                base.say(" [")
+                var at: usize = 0
+                while at < inst.arg2 {
+                    sayArg(lir.getExtra(program, inst.arg1 + at))
+                    at += 1
+                }
+                base.say(" ]")
+            }
+            if inst.flags != 0 {
+                base.say(" flags ")
+                base.sayNumber(@intCast(u64, inst.flags))
+            }
+            base.say("\n")
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The function being lowered
+
+var current: lir.Lir = undefined // (per run)
+var fnObj: usize = 0 // (per run)
+var blockCount: usize = 0 // (per run)
+var blockOpen = false // (per run)
+// The C labels (the parser's and gen.newLabel's numbers) by block: an
+// open-addressing table of (label + 1, block) pairs.
+var labelTable: usize = 0 // (per run)
+var labelCapacity: usize = 0 // (per run)
+var labelCount: usize = 0 // (per run)
+// The locals: per local (ast.obj(o).dataOffset holds its index plus one
+// while the function is lowered) its kind and value.
+const LOCAL_MEMORY: u8 = 0
+const LOCAL_SLOT: u8 = 1
+const LOCAL_ALIAS: u8 = 2
+var localKinds: usize = 0 // (per run)
+var localValues: usize = 0 // (per run)
+var localFlags: usize = 0 // (per run)
+var localCount: usize = 0 // (per run)
+// localFlags bits.
+const ADDRESSED: usize = 1
+const ALIAS_BROKEN: usize = 2
+const ALIAS_STORE: usize = 4
+// A parameter: its value comes from the caller, so no store of it is
+// its only one.
+const PARAMETER: usize = 8
+var scratchMark: usize = 0 // (per run)
+// The constant 0 and the 8-byte slots made in the current block (the
+// optimizer folds duplicates anyway).
+var mainFunction = false // (per run)
+
+fn ir() -> *lir.Lir { return &current }
+
+fn emit(opcode: lir.Opcode, typeId: usize, a0: usize, a1: usize, a2: usize) -> usize {
+    if !blockOpen { openBlock(newBlock()) }
+    var inst = lir.initInst(opcode, typeId)
+    inst.arg0 = a0
+    inst.arg1 = a1
+    inst.arg2 = a2
+    return lir.addInst(ir(), inst)
+}
+
+fn emitFlagged(opcode: lir.Opcode, typeId: usize, flags: u8, a0: usize, a1: usize, a2: usize) -> usize {
+    if !blockOpen { openBlock(newBlock()) }
+    var inst = lir.initInst(opcode, typeId)
+    inst.flags = flags
+    inst.arg0 = a0
+    inst.arg1 = a1
+    inst.arg2 = a2
+    return lir.addInst(ir(), inst)
+}
+
+fn newBlock() -> usize {
+    const block = blockCount
+    blockCount += 1
+    return block
+}
+
+// Starts block `block`: the open block, if any, falls into it.
+fn openBlock(block: usize) -> void {
+    if blockOpen { terminate(lir.branch(block)) }
+    const added = lir.addInst(ir(), lir.blockLabelInst(block))
+    blockOpen = true
+}
+
+fn terminate(inst: lir.Inst) -> void {
+    if !blockOpen { openBlock(newBlock()) }
+    const added = lir.addInst(ir(), inst)
+    blockOpen = false
+}
+
+fn branchTo(block: usize) -> void { terminate(lir.branch(block)) }
+
+fn condBranch(cond: usize, yes: usize, no: usize) -> void { terminate(lir.condBranch(cond, yes, no)) }
+
+// The block of C label `label`, made when first asked for.
+fn blockOf(label: u32) -> usize {
+    const key = @intCast(usize, label) + 1
+    if labelCount * 2 >= labelCapacity { growLabels() }
+    var slot = (key *% 2654435761) & (labelCapacity - 1)
+    while true {
+        const entry = labelTable + slot * 16
+        const found = base.getWord(entry)
+        if found == 0 {
+            base.putWord(entry, key)
+            const block = newBlock()
+            base.putWord(entry + 8, block)
+            labelCount += 1
+            return block
+        }
+        if found == key { return base.getWord(entry + 8) }
+        slot = (slot + 1) & (labelCapacity - 1)
+    }
+    return 0
+}
+
+fn growLabels() -> void {
+    const oldTable = labelTable
+    const oldCapacity = labelCapacity
+    labelCapacity = if oldCapacity == 0 { 64 } else { oldCapacity * 2 }
+    labelTable = base.scratch(labelCapacity * 16)
+    var i: usize = 0
+    while i < oldCapacity {
+        const key = base.getWord(oldTable + i * 16)
+        if key != 0 {
+            var slot = (key *% 2654435761) & (labelCapacity - 1)
+            while base.getWord(labelTable + slot * 16) != 0 { slot = (slot + 1) & (labelCapacity - 1) }
+            base.putWord(labelTable + slot * 16, key)
+            base.putWord(labelTable + slot * 16 + 8, base.getWord(oldTable + i * 16 + 8))
+        }
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Types
+
+pub fn isFloat(ty: usize) -> bool {
+    const k = types.kind(ty)
+    return k == types.FLOAT || k == types.DOUBLE
+}
+
+fn isStructLike(ty: usize) -> bool {
+    const k = types.kind(ty)
+    return k == types.STRUCT || k == types.UNION || k == types.WIDE
+}
+
+// The mlx4 type of a C type's values.
+fn tyOf(ty: usize) -> usize {
+    const k = types.kind(ty)
+    if k == types.BOOL { return tBool }
+    if k == types.FLOAT { return tF32 }
+    if k == types.DOUBLE { return tF64 }
+    if k == types.CHAR || k == types.SHORT || k == types.INT || k == types.LONG || k == types.ENUM {
+        const size = types.size(ty)
+        const unsigned = types.isUnsigned(ty)
+        if size == 1 { return if unsigned { tU8 } else { tI8 } }
+        if size == 2 { return if unsigned { tU16 } else { tI16 } }
+        if size == 4 { return if unsigned { tU32 } else { tI32 } }
+        return if unsigned { tU64 } else { tI64 }
+    }
+    return tU64
+}
+
+// Whether a value of `ty` is an integer narrower than 64 bits, and
+// whether signed.
+fn narrow(ty: usize) -> (bool, bool) {
+    if !types.isInteger(ty) || types.size(ty) >= 8 { return -> (false, false) }
+    return -> (true, !types.isUnsigned(ty) && types.kind(ty) != types.BOOL)
+}
+
+fn constant(typeId: usize, value: i64) -> usize {
+    return emit(lir.Opcode.const_i, typeId, @intCast(usize, @bitCast(u64, value)), lir.NONE, lir.NONE)
+}
+
+fn zero() -> usize { return constant(tI64, 0) }
+
+// `value` made canonical for `ty` (an integer narrower than 64 bits).
+fn canonical(value: usize, ty: usize) -> usize {
+    const n = narrow(ty)
+    if !n.0 { return value }
+    const width = @intCast(usize, types.size(ty) * 8)
+    return emit(lir.Opcode.extend, tyOf(ty), value, width, if n.1 { 1 } else { 0 })
+}
+
+// The value of `ty` at `address` (an aggregate or a function stays its
+// address).
+fn load(address: usize, ty: usize) -> usize {
+    const k = types.kind(ty)
+    if k == types.ARRAY || k == types.STRUCT || k == types.UNION || k == types.WIDE || k == types.FUNC || k == types.VOID { return address }
+    const size = @intCast(usize, types.size(ty))
+    const signed = !types.isUnsigned(ty) && k != types.BOOL && !isFloat(ty)
+    return emit(lir.Opcode.load, tyOf(ty), address, size, if signed { 1 } else { 0 })
+}
+
+fn loadWidth(address: usize, typeId: usize, width: usize, signed: bool) -> usize {
+    return emit(lir.Opcode.load, typeId, address, width, if signed { 1 } else { 0 })
+}
+
+fn storeWidth(address: usize, value: usize, width: usize) -> void {
+    const stored = emit(lir.Opcode.store, lir.NONE, address, value, width)
+}
+
+// `value` of `ty` stored at `address` (a struct copied from the address
+// `value` holds).
+fn storeValue(address: usize, value: usize, ty: usize) -> void {
+    const k = types.kind(ty)
+    if k == types.STRUCT || k == types.UNION {
+        if !types.emptyClass(ty) { copyBytes(address, value, @intCast(usize, types.size(ty))) }
+        return
+    }
+    storeWidth(address, value, @intCast(usize, types.size(ty)))
+}
+
+// The address `base` + `offset` bytes.
+fn offsetBy(address: usize, offset: i64) -> usize {
+    if offset == 0 { return address }
+    return emit(lir.Opcode.gep, tU64, address, constant(tI64, offset), 1)
+}
+
+// `size` bytes copied from `source` to `destination`: word by word for a
+// few, else the back end's rep movsb.
+fn copyBytes(destination: usize, source: usize, size: usize) -> void {
+    if size > 64 {
+        const copied = emit(lir.Opcode.mem_copy, lir.NONE, destination, source, size)
+        return
+    }
+    var at: usize = 0
+    while at < size {
+        var width: usize = 8
+        while width > size - at { width /= 2 }
+        const word = loadWidth(offsetBy(source, @intCast(i64, at)), tU64, width, false)
+        storeWidth(offsetBy(destination, @intCast(i64, at)), word, width)
+        at += width
+    }
+}
+
+// The `bytes` (1 to 8) at `address` + `offset` as one integer value,
+// the low byte first.
+fn loadWord(address: usize, offset: i64, bytes: usize) -> usize {
+    if bytes == 8 || bytes == 4 || bytes == 2 || bytes == 1 {
+        return loadWidth(offsetBy(address, offset), tU64, bytes, false)
+    }
+    var result: usize = lir.NONE
+    var at: usize = 0
+    while at < bytes {
+        var width: usize = 4
+        while width > bytes - at { width /= 2 }
+        var part = loadWidth(offsetBy(address, offset + @intCast(i64, at)), tU64, width, false)
+        if at > 0 { part = emit(lir.Opcode.shl, tU64, part, constant(tI64, @intCast(i64, at * 8)), lir.NONE) }
+        result = if result == lir.NONE { part } else { emit(lir.Opcode.bit_or, tU64, result, part, lir.NONE) }
+        at += width
+    }
+    return result
+}
+
+// The integer `word` stored as `bytes` (1 to 8) at `address` + `offset`.
+fn storeWord(address: usize, offset: i64, word: usize, bytes: usize) -> void {
+    if bytes == 8 || bytes == 4 || bytes == 2 || bytes == 1 {
+        storeWidth(offsetBy(address, offset), word, bytes)
+        return
+    }
+    var at: usize = 0
+    while at < bytes {
+        var width: usize = 4
+        while width > bytes - at { width /= 2 }
+        var part = word
+        if at > 0 { part = emit(lir.Opcode.shr, tU64, word, constant(tI64, @intCast(i64, at * 8)), lir.NONE) }
+        storeWidth(offsetBy(address, offset + @intCast(i64, at)), part, width)
+        at += width
+    }
+}
+
+// A float eightbyte of a struct (`bytes` 4 or 8 at `offset`) as an f64
+// value: the bits in xmm's low half.
+fn loadFloatWord(address: usize, offset: i64, bytes: usize) -> usize {
+    if bytes >= 8 { return loadWidth(offsetBy(address, offset), tF64, 8, false) }
+    const bits = loadWord(address, offset, bytes)
+    return emit(lir.Opcode.bitcast, tF64, bits, lir.NONE, lir.NONE)
+}
+
+// ---------------------------------------------------------------------------
+// Locals
+
+fn localIndex(o: usize) -> usize { return ast.obj(o).*.dataOffset - 1 }
+
+fn hasLocalInfo(o: usize) -> bool { return ast.obj(o).*.isLocal && ast.obj(o).*.dataOffset != 0 }
+
+fn localKind(o: usize) -> u8 { return base.get8(localKinds + localIndex(o)) }
+
+fn localValue(o: usize) -> usize { return base.getWord(localValues + localIndex(o) * 8) }
+
+fn localFlag(o: usize) -> usize { return base.getWord(localFlags + localIndex(o) * 8) }
+
+fn setLocalFlag(o: usize, flag: usize) -> void {
+    const at = localFlags + localIndex(o) * 8
+    base.putWord(at, base.getWord(at) | flag)
+}
+
+// The place of the frame (the back end's rbp offset) at the frame
+// offset `offset` (genstmt.assignOffsets: negative below rbp).
+fn frameLocal(offset: i64) -> usize {
+    return emit(lir.Opcode.frame_local, tU64, @intCast(usize, @bitCast(u64, 0 - offset)), lir.NONE, lir.NONE)
+}
+
+// The address of the local `o` in memory (in the frame, or where the
+// local it is stored at points).
+fn localAddress(o: usize) -> usize {
+    const at = ast.obj(o).*.storedAt
+    if at != 0 { return loadWidth(frameLocal(ast.obj(at).*.offset), tU64, 8, false) }
+    return frameLocal(ast.obj(o).*.offset)
+}
+
+// The local a VAR or a DEREF of an alias names, and whether it is a slot.
+fn slotOf(o: usize) -> (bool, usize) {
+    var target = o
+    if hasLocalInfo(target) && localKind(target) == LOCAL_ALIAS { target = localValue(target) }
+    if hasLocalInfo(target) && localKind(target) == LOCAL_SLOT { return -> (true, localValue(target)) }
+    return -> (false, target)
+}
+
+// ---------------------------------------------------------------------------
+// Can the function be lowered? And which of its locals are slots.
+
+fn refuse(reason: usize) -> bool {
+    unsupportedReason = reason
+    return false
+}
+
+fn checkType(ty: usize) -> bool {
+    if ty == 0 { return true }
+    const k = types.kind(ty)
+    if k == types.LDOUBLE { return refuse(R_LONG_DOUBLE) }
+    if k == types.WIDE { return refuse(R_WIDE) }
+    if types.isBitPrecise(ty) && types.isInteger(ty) { return refuse(R_BIT_PRECISE) }
+    return true
+}
+
+fn checkList(first: usize) -> bool {
+    var n = first
+    while n != 0 {
+        if !check(n) { return false }
+        n = ast.node(n).*.next
+    }
+    return true
+}
+
+fn checkArguments(n: usize) -> bool {
+    var memory: i64 = 0
+    var gp: i64 = 0
+    var fp: i64 = 0
+    const node = ast.node(n)
+    if node.*.returnBuffer != 0 && types.inMemory(node.*.ty) { gp += 1 }
+    var argument = node.*.args
+    while argument != 0 {
+        if !check(argument) { return false }
+        const ty = ast.typeOf(argument)
+        var byStack = false
+        if isStructLike(ty) {
+            const size = types.size(ty)
+            byStack = types.inMemory(ty)
+            if !byStack {
+                const fp1: i64 = if gen.hasFloat(ty, 0, 8, 0) { 1 } else { 0 }
+                const fp2: i64 = if size > 8 && gen.hasFloat(ty, 8, 16, 0) { 1 } else { 0 }
+                const gp1: i64 = 1 - fp1
+                const gp2: i64 = if size > 8 { 1 - fp2 } else { 0 }
+                if fp + fp1 + fp2 <= 8 && gp + gp1 + gp2 <= 6 {
+                    fp += fp1 + fp2
+                    gp += gp1 + gp2
+                } else {
+                    byStack = true
+                }
+            }
+        } else if isFloat(ty) {
+            if fp >= 8 { byStack = true }
+            fp += 1
+        } else {
+            if gp >= 6 { byStack = true }
+            gp += 1
+        }
+        if byStack && types.alignOf(ty) > 8 { return refuse(R_STACK_ALIGNMENT) }
+        argument = ast.node(argument).*.next
+    }
+    return true
+}
+
+fn isSetjmpCall(n: usize) -> bool {
+    var x = n
+    while ast.kindOf(x) == ast.CAST { x = ast.node(x).*.lhs }
+    if ast.kindOf(x) != ast.FUNCALL || ast.kindOf(ast.node(x).*.lhs) != ast.VAR { return false }
+    const name = base.nameOf(ast.obj(ast.node(ast.node(x).*.lhs).*.variable).*.name)
+    return base.same(name, "setjmp") || base.same(name, "_setjmp") || base.same(name, "sigsetjmp") || base.same(name, "__sigsetjmp") || base.same(name, "vfork") || base.same(name, "getcontext") || base.same(name, "savectx")
+}
+
+// The local `x` of `&x` (under casts between pointer types), else 0.
+fn addressedLocal(n: usize) -> usize {
+    var e = n
+    while ast.kindOf(e) == ast.CAST && types.kind(ast.typeOf(e)) == types.PTR { e = ast.node(e).*.lhs }
+    if ast.kindOf(e) != ast.ADDR || ast.kindOf(ast.node(e).*.lhs) != ast.VAR { return 0 }
+    const x = ast.node(ast.node(e).*.lhs).*.variable
+    if !hasLocalInfo(x) { return 0 }
+    return x
+}
+
+// An lvalue used by its address (`&(a, *tmp)`, `(T)*tmp` of a struct):
+// a temporary's alias through it does not hold.
+fn breakAliasIn(n: usize) -> void {
+    if n == 0 { return }
+    const node = ast.node(n)
+    if node.*.kind == ast.DEREF && ast.kindOf(node.*.lhs) == ast.VAR {
+        if hasLocalInfo(ast.node(node.*.lhs).*.variable) { setLocalFlag(ast.node(node.*.lhs).*.variable, ALIAS_BROKEN) }
+        return
+    }
+    if node.*.kind == ast.COMMA { breakAliasIn(node.*.rhs) }
+    if node.*.kind == ast.CAST { breakAliasIn(node.*.lhs) }
+}
+
+// Whether `n` (an expression or a statement) can be lowered; the walk
+// also notes which locals have their address taken and which temporaries
+// only hold a local's address (`tmp = &x; *tmp = *tmp + 1`).
+var checkParent: u8 = 0 // (per run)
+
+fn check(n: usize) -> bool {
+    if n == 0 { return true }
+    const node = ast.node(n)
+    const k = node.*.kind
+    const parentKept = checkParent
+    const result = checkNode(n)
+    checkParent = parentKept
+    return result
+}
+
+fn checkNode(n: usize) -> bool {
+    const node = ast.node(n)
+    const k = node.*.kind
+    checkParent = k
+    if !checkType(node.*.ty) { return false }
+    if k == ast.NULL_EXPR || k == ast.NUM || k == ast.JUMP { return true }
+    if k == ast.VAR {
+        if !checkType(ast.obj(node.*.variable).*.ty) { return false }
+        // A temporary read other than through `*tmp` keeps no alias.
+        if hasLocalInfo(node.*.variable) {
+            setLocalFlag(node.*.variable, ALIAS_BROKEN)
+        }
+        return true
+    }
+    if k == ast.ADDR {
+        const inner = node.*.lhs
+        if ast.kindOf(inner) == ast.VAR {
+            if !checkType(ast.obj(ast.node(inner).*.variable).*.ty) { return false }
+            if hasLocalInfo(ast.node(inner).*.variable) {
+                if trace { base.say(base.join("lir: & of ", base.join(base.nameOf(ast.obj(ast.node(inner).*.variable).*.name), base.join(" under node kind ", base.join(base.decimal(@intCast(u64, checkParent)), "\n"))))) }
+                setLocalFlag(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN)
+            }
+            return true
+        }
+        breakAliasIn(inner)
+        return check(inner)
+    }
+    if k == ast.DEREF {
+        const inner = node.*.lhs
+        if ast.kindOf(inner) == ast.VAR {
+            // `*tmp`: the alias's use.
+            return checkType(ast.obj(ast.node(inner).*.variable).*.ty)
+        }
+        return check(inner)
+    }
+    if k == ast.ASSIGN {
+        const lhs = node.*.lhs
+        const rhs = node.*.rhs
+        if isSetjmpCall(rhs) { return refuse(R_SETJMP) }
+        if ast.kindOf(lhs) == ast.VAR && hasLocalInfo(ast.node(lhs).*.variable) {
+            const t = ast.node(lhs).*.variable
+            if !checkType(ast.obj(t).*.ty) { return false }
+            // `tmp = &x`: tmp an alias of x while this is its only store
+            // and every other use of it is `*tmp`.
+            const x = if types.kind(ast.obj(t).*.ty) == types.PTR && localFlag(t) & PARAMETER == 0 { addressedLocal(rhs) } else { 0 }
+            if x != 0 {
+                if !checkType(ast.obj(x).*.ty) { return false }
+                if ast.obj(x).*.storedAt == 0 && localFlag(t) & ALIAS_STORE == 0 {
+                    setLocalFlag(t, ALIAS_STORE)
+                    base.put8(localKinds + localIndex(t), LOCAL_ALIAS)
+                    base.putWord(localValues + localIndex(t) * 8, x)
+                    return true
+                }
+                setLocalFlag(t, ALIAS_BROKEN)
+                setLocalFlag(x, ADDRESSED | ALIAS_BROKEN)
+                return true
+            }
+            setLocalFlag(t, ALIAS_BROKEN)
+            return check(rhs)
+        }
+        if ast.kindOf(lhs) == ast.DEREF && ast.kindOf(ast.node(lhs).*.lhs) == ast.VAR {
+            if !checkType(ast.obj(ast.node(ast.node(lhs).*.lhs).*.variable).*.ty) { return false }
+            return check(rhs)
+        }
+        breakAliasIn(lhs)
+        return check(lhs) && check(rhs)
+    }
+    if k == ast.BITCAST || k == ast.NEG || k == ast.CAST || k == ast.NOT || k == ast.BITNOT || k == ast.EXPR_STMT || k == ast.RETURN || k == ast.CASE || k == ast.LABEL {
+        return check(node.*.lhs)
+    }
+    if k == ast.MEMBER {
+        if !checkType(types.member(node.*.member).*.ty) { return false }
+        const inner = node.*.lhs
+        if ast.kindOf(inner) == ast.VAR {
+            if hasLocalInfo(ast.node(inner).*.variable) { setLocalFlag(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN) }
+            return checkType(ast.obj(ast.node(inner).*.variable).*.ty)
+        }
+        return check(inner)
+    }
+    if k == ast.COMMA || k == ast.LOGAND || k == ast.LOGOR || k == ast.ADD || k == ast.SUB || k == ast.MUL || k == ast.DIV || k == ast.MOD ||
+        k == ast.BITAND || k == ast.BITOR || k == ast.BITXOR || k == ast.SHL || k == ast.SHR || k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        return check(node.*.lhs) && check(node.*.rhs)
+    }
+    if k == ast.COND { return check(node.*.cond) && check(node.*.then) && check(node.*.els) }
+    if k == ast.STMT_EXPR || k == ast.BLOCK { return checkList(node.*.body) }
+    if k == ast.MEMZERO {
+        // (Of a local: a store of zero, not a use of its address.)
+        if node.*.variable != 0 { return true }
+        return check(node.*.lhs)
+    }
+    if k == ast.FUNCALL {
+        if node.*.returnBuffer != 0 && hasLocalInfo(node.*.returnBuffer) { setLocalFlag(node.*.returnBuffer, ADDRESSED | ALIAS_BROKEN) }
+        if !checkType(node.*.ty) { return false }
+        if !check(node.*.lhs) { return false }
+        if node.*.rhs != 0 && !check(node.*.rhs) { return false }
+        return checkArguments(n)
+    }
+    if k == ast.VA_START || k == ast.VA_ARG || k == ast.VA_COPY { return refuse(R_VA_ARG) }
+    if k == ast.LABEL_ADDR { return refuse(R_LABEL_ADDRESS) }
+    if k == ast.ATOMIC {
+        if node.*.value != atomics.FENCE {
+            const ty = types.unqualified(types.baseOf(ast.typeOf(node.*.lhs)))
+            if types.size(ty) == 16 { return refuse(R_ATOMIC16) }
+        }
+        return check(node.*.lhs) && check(node.*.rhs) && check(node.*.cond)
+    }
+    if k == ast.ASM {
+        if node.*.value == builtins.ASM_CODE { return refuse(R_ASM) }
+        if node.*.value >= builtins.ASM_CPUID { return refuse(R_SPECIAL_ASM) }
+        return true
+    }
+    if k == ast.BITOP {
+        if node.*.value == builtins.ALLOCA { return refuse(R_ALLOCA) }
+        return check(node.*.lhs)
+    }
+    if k == ast.IF { return check(node.*.cond) && check(node.*.then) && check(node.*.els) }
+    if k == ast.FOR { return check(node.*.init) && check(node.*.cond) && check(node.*.then) && check(node.*.inc) }
+    if k == ast.DO { return check(node.*.then) && check(node.*.cond) }
+    if k == ast.SWITCH { return check(node.*.cond) && check(node.*.then) }
+    if k == ast.GOTO {
+        if node.*.lhs != 0 { return refuse(R_LABEL_ADDRESS) }
+        return true
+    }
+    return refuse(R_NODE_KIND)
+}
+
+// Numbers the function's locals and parameters (dataOffset) and sets up
+// their tables.
+fn indexLocals(fn_obj: usize) -> void {
+    localCount = 0
+    var local = ast.obj(fn_obj).*.locals
+    while local != 0 {
+        if ast.obj(local).*.isLocal { localCount += 1 }
+        local = ast.obj(local).*.next
+    }
+    var cell = ast.obj(fn_obj).*.params
+    while cell != 0 {
+        localCount += 1
+        cell = base.getWord(cell + 8)
+    }
+    localKinds = base.scratch(localCount + 8)
+    localValues = base.scratch(localCount * 8 + 8)
+    localFlags = base.scratch(localCount * 8 + 8)
+    var index: usize = 0
+    local = ast.obj(fn_obj).*.locals
+    while local != 0 {
+        if ast.obj(local).*.isLocal && ast.obj(local).*.dataOffset == 0 {
+            ast.obj(local).*.dataOffset = index + 1
+            index += 1
+        }
+        local = ast.obj(local).*.next
+    }
+    cell = ast.obj(fn_obj).*.params
+    while cell != 0 {
+        const p = base.getWord(cell)
+        if ast.obj(p).*.dataOffset == 0 {
+            ast.obj(p).*.dataOffset = index + 1
+            index += 1
+        }
+        setLocalFlag(p, PARAMETER)
+        cell = base.getWord(cell + 8)
+    }
+    localCount = index
+}
+
+fn forgetLocals(fn_obj: usize) -> void {
+    var local = ast.obj(fn_obj).*.locals
+    while local != 0 {
+        if ast.obj(local).*.isLocal { ast.obj(local).*.dataOffset = 0 }
+        local = ast.obj(local).*.next
+    }
+    var cell = ast.obj(fn_obj).*.params
+    while cell != 0 {
+        ast.obj(base.getWord(cell)).*.dataOffset = 0
+        cell = base.getWord(cell + 8)
+    }
+}
+
+// Whether the local `o` is a value held in an 8-byte slot of the LIR's
+// (the optimizer's and the register pass's to keep where it likes).
+fn isSlotLocal(o: usize) -> bool {
+    const obj = ast.obj(o)
+    if !obj.*.isLocal || obj.*.storedAt != 0 || obj.*.offset > 0 { return false }
+    const ty = obj.*.ty
+    if !types.isScalar(ty) && types.kind(ty) != types.REF { return false }
+    if types.size(ty) > 8 || types.isBitPrecise(ty) || types.kind(ty) == types.LDOUBLE { return false }
+    return localFlag(o) & ADDRESSED == 0
+}
+
+// After the walk: the aliases that held, the slots, the rest in memory.
+fn classifyLocals(fn_obj: usize) -> void {
+    var index: usize = 0
+    while index < localCount {
+        const kind = base.get8(localKinds + index)
+        const flags = base.getWord(localFlags + index * 8)
+        if kind == LOCAL_ALIAS && flags & ALIAS_BROKEN != 0 {
+            // The alias did not hold: its target's address is taken.
+            const x = base.getWord(localValues + index * 8)
+            setLocalFlag(x, ADDRESSED)
+            base.put8(localKinds + index, LOCAL_MEMORY)
+        }
+        index += 1
+    }
+    var local = ast.obj(fn_obj).*.locals
+    while local != 0 {
+        if hasLocalInfo(local) && localKind(local) == LOCAL_MEMORY && isSlotLocal(local) {
+            base.put8(localKinds + localIndex(local), LOCAL_SLOT)
+            base.putWord(localValues + localIndex(local) * 8, lir.NONE)
+        }
+        local = ast.obj(local).*.next
+    }
+    var cell = ast.obj(fn_obj).*.params
+    while cell != 0 {
+        const p = base.getWord(cell)
+        if hasLocalInfo(p) && localKind(p) == LOCAL_MEMORY && isSlotLocal(p) {
+            base.put8(localKinds + localIndex(p), LOCAL_SLOT)
+            base.putWord(localValues + localIndex(p) * 8, lir.NONE)
+        }
+        cell = base.getWord(cell + 8)
+    }
+}
+
+// The slots of the slot locals, made at the function's entry.
+fn makeSlots(fn_obj: usize) -> void {
+    var local = ast.obj(fn_obj).*.locals
+    while local != 0 {
+        if hasLocalInfo(local) && localKind(local) == LOCAL_SLOT && localValue(local) == lir.NONE {
+            base.putWord(localValues + localIndex(local) * 8, emit(lir.Opcode.alloca, tyOf(ast.obj(local).*.ty), lir.NONE, lir.NONE, lir.NONE))
+        }
+        local = ast.obj(local).*.next
+    }
+    var cell = ast.obj(fn_obj).*.params
+    while cell != 0 {
+        const p = base.getWord(cell)
+        if hasLocalInfo(p) && localKind(p) == LOCAL_SLOT && localValue(p) == lir.NONE {
+            base.putWord(localValues + localIndex(p) * 8, emit(lir.Opcode.alloca, tyOf(ast.obj(p).*.ty), lir.NONE, lir.NONE, lir.NONE))
+        }
+        cell = base.getWord(cell + 8)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+
+// The address of the global object `o` (irgen emits it as gen.globalAddress
+// does: its definition in the data area, a name of another object, a
+// thread-local one, an import).
+fn globalAddress(o: usize) -> usize {
+    if ast.obj(o).*.isFunction { gen.noteFunctionUsed(o) }
+    const start = lir.extraDataCount(ir())
+    return emit(lir.Opcode.external_value, tU64, irgen.EXT_GLOBAL | (o << 8), start, 0)
+}
+
+fn address(n: usize) -> usize {
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.VAR {
+        const o = node.*.variable
+        if ast.obj(o).*.isLocal { return localAddress(o) }
+        return globalAddress(o)
+    }
+    if k == ast.DEREF {
+        const inner = node.*.lhs
+        if ast.kindOf(inner) == ast.VAR && hasLocalInfo(ast.node(inner).*.variable) && localKind(ast.node(inner).*.variable) == LOCAL_ALIAS {
+            const x = localValue(ast.node(inner).*.variable)
+            if slotOf(x).0 { ast.errorAt(n, "internal error: the address of a local held as a value") }
+            return localAddress(x)
+        }
+        return expression(inner)
+    }
+    if k == ast.COMMA {
+        const dropped = expression(node.*.lhs)
+        return address(node.*.rhs)
+    }
+    if k == ast.MEMBER {
+        const holder = address(node.*.lhs)
+        const m = types.member(node.*.member)
+        if m.*.isVirtual {
+            // A virtual base (C++): its offset is the one the object's
+            // vtable holds at the base's place before the address point.
+            const vtable = loadWidth(holder, tU64, 8, false)
+            const offset = loadWidth(offsetBy(vtable, m.*.vbaseSlot), tU64, 8, false)
+            return emit(lir.Opcode.add, tU64, holder, offset, lir.NONE)
+        }
+        return offsetBy(holder, m.*.offset)
+    }
+    if k == ast.FUNCALL && node.*.returnBuffer != 0 { return expression(n) }
+    if (k == ast.ASSIGN || k == ast.COND || k == ast.STMT_EXPR) && isStructLike(node.*.ty) { return expression(n) }
+    if k == ast.CAST && isStructLike(node.*.ty) { return address(node.*.lhs) }
+    ast.errorAt(n, base.join("not an lvalue: node kind ", base.decimal(@intCast(u64, k))))
+    return lir.NONE
+}
+
+// Sets the flags of "the value of `ty` is zero": a bool value.
+fn isZero(value: usize, ty: usize) -> usize {
+    if isFloat(ty) {
+        const fzero = emit(lir.Opcode.bitcast, tyOf(ty), zero(), lir.NONE, lir.NONE)
+        return emit(lir.Opcode.fcmp, tI32, @intCast(usize, @intFromEnum(lir.CmpPredicate.eq)), value, fzero)
+    }
+    return emit(lir.Opcode.icmp, tI32, @intCast(usize, @intFromEnum(lir.CmpPredicate.eq)), value, zero())
+}
+
+fn isNonZero(value: usize, ty: usize) -> usize {
+    if isFloat(ty) {
+        const fzero = emit(lir.Opcode.bitcast, tyOf(ty), zero(), lir.NONE, lir.NONE)
+        return emit(lir.Opcode.fcmp, tI32, @intCast(usize, @intFromEnum(lir.CmpPredicate.ne)), value, fzero)
+    }
+    return emit(lir.Opcode.icmp, tI32, @intCast(usize, @intFromEnum(lir.CmpPredicate.ne)), value, zero())
+}
+
+// A condition's value as the back end's condbr tests it (any nonzero
+// integer): a float compared with zero first.
+fn truth(n: usize) -> usize {
+    const value = expression(n)
+    const ty = ast.typeOf(n)
+    if isFloat(ty) { return isNonZero(value, ty) }
+    return value
+}
+
+fn cast(value: usize, from: usize, to: usize) -> usize {
+    const tk = types.kind(to)
+    if tk == types.VOID { return lir.NONE }
+    if tk == types.BOOL { return isNonZero(value, from) }
+    const fromFloat = isFloat(from)
+    const toFloat = isFloat(to)
+    if !fromFloat && !toFloat { return canonical(value, to) }
+    if !fromFloat && toFloat {
+        return emit(lir.Opcode.cast, tyOf(to), value, tyOf(from), lir.NONE)
+    }
+    if fromFloat && toFloat {
+        if types.kind(from) == types.kind(to) { return value }
+        return emit(lir.Opcode.cast, tyOf(to), value, tyOf(from), lir.NONE)
+    }
+    if isStructLike(to) { return value }
+    // A float to an integer: through a 64-bit one (unsigned for u64).
+    const wide = if types.size(to) == 8 && types.isUnsigned(to) { tU64 } else { tI64 }
+    const whole = emit(lir.Opcode.cast, wide, value, tyOf(from), lir.NONE)
+    return canonical(whole, to)
+}
+
+fn predicateOf(k: u8, signed: bool) -> lir.CmpPredicate {
+    if k == ast.EQ { return lir.CmpPredicate.eq }
+    if k == ast.NE { return lir.CmpPredicate.ne }
+    if k == ast.LT { return if signed { lir.CmpPredicate.lt } else { lir.CmpPredicate.ult } }
+    return if signed { lir.CmpPredicate.le } else { lir.CmpPredicate.ule }
+}
+
+fn floatBinary(n: usize) -> usize {
+    const node = ast.node(n)
+    const k = node.*.kind
+    const ty = ast.typeOf(node.*.lhs)
+    // (The right operand first, as the stack machine evaluates them.)
+    const rhs = expression(node.*.rhs)
+    const lhs = expression(node.*.lhs)
+    if k == ast.ADD { return emit(lir.Opcode.add, tyOf(ty), lhs, rhs, lir.NONE) }
+    if k == ast.SUB { return emit(lir.Opcode.sub, tyOf(ty), lhs, rhs, lir.NONE) }
+    if k == ast.MUL { return emit(lir.Opcode.mul, tyOf(ty), lhs, rhs, lir.NONE) }
+    if k == ast.DIV { return emit(lir.Opcode.div, tyOf(ty), lhs, rhs, lir.NONE) }
+    if k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        // (Typed by its integer result; the back end takes the width from
+        // the operands.)
+        return emit(lir.Opcode.fcmp, tI32, @intCast(usize, @intFromEnum(predicateOf(k, true))), lhs, rhs)
+    }
+    ast.errorAt(n, "invalid operands to a floating operation")
+    return lir.NONE
+}
+
+// `p + i * size` (expr.mlx scales pointer arithmetic so): a gep, which
+// the back end folds into the access.
+fn pointerAdd(n: usize) -> (bool, usize) {
+    const node = ast.node(n)
+    if types.kind(node.*.ty) != types.PTR || node.*.kind != ast.ADD { return -> (false, 0) }
+    const scaled = node.*.rhs
+    if ast.kindOf(scaled) != ast.MUL || ast.kindOf(ast.node(scaled).*.rhs) != ast.NUM { return -> (false, 0) }
+    const scale = ast.node(ast.node(scaled).*.rhs).*.value
+    if scale <= 0 || scale > 2147483647 { return -> (false, 0) }
+    const index = expression(ast.node(scaled).*.lhs)
+    const pointer = expression(node.*.lhs)
+    return -> (true, emit(lir.Opcode.gep, tU64, pointer, index, @intCast(usize, scale)))
+}
+
+fn binary(n: usize) -> usize {
+    const node = ast.node(n)
+    const k = node.*.kind
+    const lty = ast.typeOf(node.*.lhs)
+    if isFloat(lty) { return floatBinary(n) }
+    const scaled = pointerAdd(n)
+    if scaled.0 { return scaled.1 }
+    const rhs = expression(node.*.rhs)
+    const lhs = expression(node.*.lhs)
+    const signed = !types.isUnsigned(lty)
+    const ty = node.*.ty
+    if k == ast.ADD { return canonical(emit(lir.Opcode.add, tyOf(ty), lhs, rhs, lir.NONE), ty) }
+    if k == ast.SUB { return canonical(emit(lir.Opcode.sub, tyOf(ty), lhs, rhs, lir.NONE), ty) }
+    if k == ast.MUL { return canonical(emit(lir.Opcode.mul, tyOf(ty), lhs, rhs, lir.NONE), ty) }
+    if k == ast.DIV { return canonical(emit(if signed { lir.Opcode.div } else { lir.Opcode.udiv }, tyOf(ty), lhs, rhs, lir.NONE), ty) }
+    if k == ast.MOD { return canonical(emit(if signed { lir.Opcode.rem } else { lir.Opcode.urem }, tyOf(ty), lhs, rhs, lir.NONE), ty) }
+    if k == ast.BITAND { return emit(lir.Opcode.bit_and, tyOf(ty), lhs, rhs, lir.NONE) }
+    if k == ast.BITOR { return emit(lir.Opcode.bit_or, tyOf(ty), lhs, rhs, lir.NONE) }
+    if k == ast.BITXOR { return emit(lir.Opcode.bit_xor, tyOf(ty), lhs, rhs, lir.NONE) }
+    if k == ast.EQ || k == ast.NE || k == ast.LT || k == ast.LE {
+        return emit(lir.Opcode.icmp, tI32, @intCast(usize, @intFromEnum(predicateOf(k, signed))), lhs, rhs)
+    }
+    if k == ast.SHL { return canonical(emit(lir.Opcode.shl, tyOf(ty), lhs, rhs, lir.NONE), ty) }
+    if k == ast.SHR { return emit(lir.Opcode.shr, if signed { tI64 } else { tU64 }, lhs, rhs, lir.NONE) }
+    ast.errorAt(n, "invalid expression")
+    return lir.NONE
+}
+
+fn bitMask(width: i64) -> i64 {
+    if width >= 64 { return -1 }
+    return @bitCast(i64, (@intCast(u64, 1) << @intCast(u6, width)) -% 1)
+}
+
+fn assign(n: usize) -> usize {
+    const node = ast.node(n)
+    const lhs = node.*.lhs
+    const ty = node.*.ty
+    // A slot local, or `*tmp` with tmp an alias of one: the value stored
+    // into its slot. The alias's own store (`tmp = &x`) is nothing: the
+    // lowering reads x through it.
+    var target: usize = 0
+    if ast.kindOf(lhs) == ast.VAR && hasLocalInfo(ast.node(lhs).*.variable) {
+        target = ast.node(lhs).*.variable
+        if localKind(target) == LOCAL_ALIAS { return lir.NONE }
+    }
+    if ast.kindOf(lhs) == ast.DEREF && ast.kindOf(ast.node(lhs).*.lhs) == ast.VAR {
+        const t = ast.node(ast.node(lhs).*.lhs).*.variable
+        if hasLocalInfo(t) && localKind(t) == LOCAL_ALIAS { target = localValue(t) }
+    }
+    if target != 0 {
+        const slot = slotOf(target)
+        if slot.0 {
+            const value = expression(node.*.rhs)
+            storeWidth(slot.1, value, lir.NONE)
+            return value
+        }
+    }
+    const place = address(lhs)
+    const value = expression(node.*.rhs)
+    if ast.kindOf(lhs) == ast.MEMBER && types.member(ast.node(lhs).*.member).*.bitWidth > 0 {
+        // A bit-field: merge the value into its unit.
+        const m = ast.node(lhs).*.member
+        const width = types.member(m).*.bitWidth
+        const offset = types.member(m).*.bitOffset
+        const unit = types.member(m).*.ty
+        const size = @intCast(usize, types.size(unit))
+        var bits = emit(lir.Opcode.bit_and, tU64, value, constant(tI64, bitMask(width)), lir.NONE)
+        if offset > 0 { bits = emit(lir.Opcode.shl, tU64, bits, constant(tI64, offset), lir.NONE) }
+        const old = loadWidth(place, tU64, size, false)
+        const kept = ~(@bitCast(u64, bitMask(width)) << @intCast(u6, offset))
+        const cleared = emit(lir.Opcode.bit_and, tU64, old, constant(tI64, @bitCast(i64, kept)), lir.NONE)
+        const merged = emit(lir.Opcode.bit_or, tU64, cleared, bits, lir.NONE)
+        storeWidth(place, merged, size)
+        return value
+    }
+    storeValue(place, value, ty)
+    if isStructLike(ty) { return place }
+    return value
+}
+
+fn memberValue(n: usize) -> usize {
+    const place = address(n)
+    const m = ast.node(n).*.member
+    const width = types.member(m).*.bitWidth
+    if width <= 0 { return load(place, ast.typeOf(n)) }
+    const unit = types.member(m).*.ty
+    const bits = loadWidth(place, tU64, @intCast(usize, types.size(unit)), false)
+    const up = emit(lir.Opcode.shl, tU64, bits, constant(tI64, 64 - width - types.member(m).*.bitOffset), lir.NONE)
+    // (A bool bit-field is 0 or 1, never sign-extended to -1.)
+    const signed = !types.bitFieldUnsigned(unit)
+    return emit(lir.Opcode.shr, if signed { tI64 } else { tU64 }, up, constant(tI64, 64 - width), lir.NONE)
+}
+
+// A value made in branches: an 8-byte slot both store, loaded after.
+fn joinSlot() -> usize { return emit(lir.Opcode.alloca, tU64, lir.NONE, lir.NONE, lir.NONE) }
+
+fn conditional(n: usize) -> usize {
+    const node = ast.node(n)
+    const ty = node.*.ty
+    const isVoid = types.kind(ty) == types.VOID
+    const slot = if isVoid { lir.NONE } else { joinSlot() }
+    const yes = newBlock()
+    const no = newBlock()
+    const done = newBlock()
+    condBranch(truth(node.*.cond), yes, no)
+    openBlock(yes)
+    const first = expression(node.*.then)
+    if !isVoid && first != lir.NONE { storeWidth(slot, first, lir.NONE) }
+    branchTo(done)
+    openBlock(no)
+    const second = expression(node.*.els)
+    if !isVoid && second != lir.NONE { storeWidth(slot, second, lir.NONE) }
+    branchTo(done)
+    openBlock(done)
+    if isVoid { return lir.NONE }
+    return loadWidth(slot, tyOf(ty), lir.NONE, false)
+}
+
+fn logical(n: usize) -> usize {
+    const node = ast.node(n)
+    const isAnd = node.*.kind == ast.LOGAND
+    const slot = joinSlot()
+    const second = newBlock()
+    const decided = newBlock()
+    const done = newBlock()
+    const first = truth(node.*.lhs)
+    if isAnd { condBranch(first, second, decided) } else { condBranch(first, decided, second) }
+    openBlock(second)
+    const rest = isNonZero(expression(node.*.rhs), ast.typeOf(node.*.rhs))
+    storeWidth(slot, rest, lir.NONE)
+    branchTo(done)
+    openBlock(decided)
+    storeWidth(slot, constant(tI32, if isAnd { 0 } else { 1 }), lir.NONE)
+    branchTo(done)
+    openBlock(done)
+    return loadWidth(slot, tI32, lir.NONE, false)
+}
+
+fn statementExpression(n: usize) -> usize {
+    var result: usize = lir.NONE
+    var s = ast.node(n).*.body
+    while s != 0 {
+        if ast.node(s).*.next == 0 && ast.node(s).*.kind == ast.EXPR_STMT {
+            result = expression(ast.node(s).*.lhs)
+        } else {
+            statement(s)
+        }
+        s = ast.node(s).*.next
+    }
+    return result
+}
+
+fn negate(n: usize) -> usize {
+    const node = ast.node(n)
+    const ty = node.*.ty
+    const value = expression(node.*.lhs)
+    if isFloat(ty) {
+        const sign: i64 = if types.kind(ty) == types.DOUBLE { -9223372036854775807 - 1 } else { 2147483648 }
+        const bits = emit(lir.Opcode.bitcast, tU64, value, lir.NONE, lir.NONE)
+        const flipped = emit(lir.Opcode.bit_xor, tU64, bits, constant(tI64, sign), lir.NONE)
+        return emit(lir.Opcode.bitcast, tyOf(ty), flipped, lir.NONE, lir.NONE)
+    }
+    return canonical(emit(lir.Opcode.sub, tyOf(ty), zero(), value, lir.NONE), ty)
+}
+
+fn memzero(place: usize, size: i64) -> void {
+    if size <= 64 {
+        var at: i64 = 0
+        while at < size {
+            var width: i64 = 8
+            while width > size - at { width /= 2 }
+            storeWidth(offsetBy(place, at), zero(), @intCast(usize, width))
+            at += width
+        }
+        return
+    }
+    const start = lir.addExtra(ir(), place)
+    const cleared = emit(lir.Opcode.external, tU64, irgen.EXT_MEMZERO | (@intCast(usize, size) << 8), start, 1)
+}
+
+fn bitop(n: usize) -> usize {
+    const node = ast.node(n)
+    const op = node.*.value
+    const value = expression(node.*.lhs)
+    if op == builtins.POPCOUNT { return emit(lir.Opcode.popcount, tU64, value, 64, lir.NONE) }
+    const start = lir.addExtra(ir(), value)
+    const word = irgen.EXT_BITOP | (@intCast(usize, op) << 8) | (@intCast(usize, node.*.high) << 16)
+    return emit(lir.Opcode.external, tU64, word, start, 1)
+}
+
+fn asmInstruction(instruction: i64) -> void {
+    if instruction == builtins.ASM_NOTHING { return }
+    const start = lir.extraDataCount(ir())
+    const done = emit(lir.Opcode.external, tU64, irgen.EXT_ASM | (@intCast(usize, instruction) << 8), start, 0)
+}
+
+// The atomics (atomics.mlx's nodes) as the LIR's: the codes are
+// sema/builtins/atomics.mlx's, read by the back end (seq_cst always, as
+// the stack machine does).
+const ORDER_SEQ_CST: usize = 5
+const OP_XCHG: usize = 0
+const OP_ADD: usize = 1
+const OP_SUB: usize = 2
+const OP_AND: usize = 3
+const OP_NAND: usize = 4
+const OP_OR: usize = 5
+const OP_XOR: usize = 6
+
+fn atomic(n: usize) -> usize {
+    const node = ast.node(n)
+    const op = node.*.value
+    if op == atomics.FENCE { return emit(lir.Opcode.fence, lir.NONE, ORDER_SEQ_CST, lir.NONE, lir.NONE) }
+    const ty = types.unqualified(types.baseOf(ast.typeOf(node.*.lhs)))
+    const size = @intCast(usize, types.size(ty))
+    const signed = types.isInteger(ty) && !types.isUnsigned(ty)
+    const typeId = tyOf(ty)
+    if op == atomics.LOAD {
+        const place = expression(node.*.lhs)
+        return emit(lir.Opcode.atomic_load, typeId, place, size, (if signed { 1 } else { 0 }) | (ORDER_SEQ_CST << 4))
+    }
+    if op == atomics.CMPXCHG {
+        // rhs the value to store, cond the expected value's address, lhs
+        // the address.
+        const value = expression(node.*.rhs)
+        const expectedAt = expression(node.*.cond)
+        const place = expression(node.*.lhs)
+        const expected = loadWidth(expectedAt, typeId, size, signed)
+        var width: u8 = 0
+        if size == 2 { width = 1 }
+        if size == 4 { width = 2 }
+        if size == 8 { width = 3 }
+        const flags: u8 = (width << 1) | (if signed { 8 } else { 0 }) | @intCast(u8, ORDER_SEQ_CST << 5)
+        const result = emitFlagged(lir.Opcode.cmpxchg, typeId, flags, place, expected, value)
+        const seen = emit(lir.Opcode.tuple_element, typeId, result, 1, lir.NONE)
+        storeWidth(expectedAt, seen, size)
+        return emit(lir.Opcode.tuple_element, tBool, result, 0, lir.NONE)
+    }
+    const operand = expression(node.*.rhs)
+    const place = expression(node.*.lhs)
+    if op == atomics.STORE {
+        const stored = emit(lir.Opcode.atomic_store, lir.NONE, place, operand, size | (ORDER_SEQ_CST << 8))
+        return lir.NONE
+    }
+    var code: usize = OP_XCHG
+    if op == atomics.ADD { code = OP_ADD }
+    if op == atomics.SUB { code = OP_SUB }
+    if op == atomics.AND { code = OP_AND }
+    if op == atomics.OR { code = OP_OR }
+    if op == atomics.XOR { code = OP_XOR }
+    if op == atomics.NAND { code = OP_NAND }
+    const old = emit(lir.Opcode.atomic_rmw, typeId, place, operand, size | (code << 8) | (ORDER_SEQ_CST << 16) | ((if signed { 1 } else { 0 }) << 24))
+    if node.*.high == 0 || op == atomics.EXCHANGE { return old }
+    // The value after the operation.
+    var fresh: usize = old
+    if op == atomics.ADD { fresh = emit(lir.Opcode.add, tU64, old, operand, lir.NONE) }
+    if op == atomics.SUB { fresh = emit(lir.Opcode.sub, tU64, old, operand, lir.NONE) }
+    if op == atomics.AND || op == atomics.NAND { fresh = emit(lir.Opcode.bit_and, tU64, old, operand, lir.NONE) }
+    if op == atomics.OR { fresh = emit(lir.Opcode.bit_or, tU64, old, operand, lir.NONE) }
+    if op == atomics.XOR { fresh = emit(lir.Opcode.bit_xor, tU64, old, operand, lir.NONE) }
+    if op == atomics.NAND { fresh = emit(lir.Opcode.bit_xor, tU64, fresh, constant(tI64, -1), lir.NONE) }
+    return canonical(fresh, ty)
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+
+// An argument list as the back end's call takes it: the values passed in
+// registers in order (a struct's eightbytes as values of their class),
+// then the words of what goes to the stack, in order, after the integer
+// registers are padded to six so that the back end's own counting puts
+// none of those words in a register.
+var registerArgs: usize = 0 // (per run)
+var registerCount: usize = 0 // (per run)
+var stackArgs: usize = 0 // (per run)
+var stackCount: usize = 0 // (per run)
+var integerArgs: usize = 0 // (per run)
+
+fn addStackArg(value: usize) -> void {
+    base.putWord(stackArgs + stackCount * 8, value)
+    stackCount += 1
+}
+
+// The words of a struct of `size` bytes at `place` to the stack list.
+fn pushStructWords(place: usize, size: i64) -> void {
+    var at: i64 = 0
+    while at < size {
+        const bytes = if size - at >= 8 { 8 } else { size - at }
+        addStackArg(loadWord(place, at, @intCast(usize, bytes)))
+        at += 8
+    }
+}
+
+fn call(n: usize) -> usize {
+    const node = ast.node(n)
+    const callee = node.*.lhs
+    const direct = ast.kindOf(callee) == ast.VAR && types.kind(ast.typeOf(callee)) == types.FUNC
+    const rt = node.*.ty
+    const bufferInMemory = node.*.returnBuffer != 0 && types.inMemory(rt)
+    // Count the arguments first for the lists' room.
+    var count: usize = 2
+    var argument = node.*.args
+    while argument != 0 {
+        count += 1 + @intCast(usize, (types.size(ast.typeOf(argument)) + 7) / 8)
+        argument = ast.node(argument).*.next
+    }
+    const savedRegisterArgs = registerArgs
+    const savedRegisterCount = registerCount
+    const savedStackArgs = stackArgs
+    const savedStackCount = stackCount
+    const savedIntegerArgs = integerArgs
+    registerArgs = base.scratchWords(count + 8)
+    stackArgs = base.scratchWords(count + 8)
+    registerCount = 0
+    stackCount = 0
+    integerArgs = 0
+    var gp: i64 = 0
+    var fp: i64 = 0
+    if bufferInMemory { gp += 1 }
+    // The arguments classified first: per argument its class (0 in
+    // registers, 1 in memory) and, in registers, its float eightbytes
+    // (bits 1 and 2), its place among the register values, and the node.
+    const argumentCount = count
+    const classes = base.scratchWords(argumentCount + 1)
+    const places = base.scratchWords(argumentCount + 1)
+    const nodes = base.scratchWords(argumentCount + 1)
+    var arguments: usize = 0
+    var registerValues: usize = 0
+    argument = node.*.args
+    while argument != 0 {
+        const ty = ast.typeOf(argument)
+        var class: usize = 0
+        if isStructLike(ty) {
+            const size = types.size(ty)
+            var byStack = types.inMemory(ty)
+            if !byStack {
+                const fp1: i64 = if gen.hasFloat(ty, 0, 8, 0) { 1 } else { 0 }
+                const fp2: i64 = if size > 8 && gen.hasFloat(ty, 8, 16, 0) { 1 } else { 0 }
+                const gp1: i64 = 1 - fp1
+                const gp2: i64 = if size > 8 { 1 - fp2 } else { 0 }
+                if fp + fp1 + fp2 <= 8 && gp + gp1 + gp2 <= 6 {
+                    fp += fp1 + fp2
+                    gp += gp1 + gp2
+                    if fp1 != 0 { class |= 2 }
+                    if fp2 != 0 { class |= 4 }
+                } else {
+                    byStack = true
+                }
+            }
+            if byStack { class = 1 }
+            if !byStack {
+                base.putWord(places + arguments * 8, registerValues)
+                registerValues += if size > 8 { 2 } else { 1 }
+            }
+        } else if isFloat(ty) {
+            if fp >= 8 { class = 1 } else {
+                base.putWord(places + arguments * 8, registerValues)
+                registerValues += 1
+            }
+            fp += 1
+        } else {
+            if gp >= 6 { class = 1 } else {
+                base.putWord(places + arguments * 8, registerValues)
+                registerValues += 1
+            }
+            gp += 1
+        }
+        base.putWord(classes + arguments * 8, class)
+        base.putWord(nodes + arguments * 8, argument)
+        arguments += 1
+        argument = ast.node(argument).*.next
+    }
+    // Evaluated as the stack machine evaluates them (C leaves the order
+    // unspecified; the tests expect gcc's, which it shares): those passed
+    // in memory first, then those in registers, each list from the last.
+    // The stack words are pushed from the last argument's, so the list
+    // holds them from the first.
+    var at = arguments
+    while at > 0 {
+        at -= 1
+        if base.getWord(classes + at * 8) != 1 { continue }
+        const argumentNode = base.getWord(nodes + at * 8)
+        const ty = ast.typeOf(argumentNode)
+        const value = expression(argumentNode)
+        if isStructLike(ty) {
+            base.putWord(places + at * 8, value)
+        } else if isFloat(ty) {
+            base.putWord(places + at * 8, emit(lir.Opcode.bitcast, tU64, value, lir.NONE, lir.NONE))
+        } else {
+            base.putWord(places + at * 8, value)
+        }
+    }
+    at = 0
+    while at < arguments {
+        if base.getWord(classes + at * 8) == 1 {
+            const argumentNode = base.getWord(nodes + at * 8)
+            const ty = ast.typeOf(argumentNode)
+            if isStructLike(ty) { pushStructWords(base.getWord(places + at * 8), types.size(ty)) } else { addStackArg(base.getWord(places + at * 8)) }
+        }
+        at += 1
+    }
+    registerCount = registerValues
+    at = arguments
+    while at > 0 {
+        at -= 1
+        const class = base.getWord(classes + at * 8)
+        if class == 1 { continue }
+        const argumentNode = base.getWord(nodes + at * 8)
+        const ty = ast.typeOf(argumentNode)
+        const place = base.getWord(places + at * 8)
+        const value = expression(argumentNode)
+        if isStructLike(ty) {
+            const size = types.size(ty)
+            const first = if size < 8 { size } else { 8 }
+            if class & 2 != 0 { base.putWord(registerArgs + place * 8, loadFloatWord(value, 0, @intCast(usize, first))) } else { base.putWord(registerArgs + place * 8, loadWord(value, 0, @intCast(usize, first))) }
+            if size > 8 {
+                if class & 4 != 0 { base.putWord(registerArgs + (place + 1) * 8, loadFloatWord(value, 8, @intCast(usize, size - 8))) } else { base.putWord(registerArgs + (place + 1) * 8, loadWord(value, 8, @intCast(usize, size - 8))) }
+            }
+        } else {
+            base.putWord(registerArgs + place * 8, value)
+        }
+    }
+    integerArgs = @intCast(usize, if gp > 6 { 6 } else { gp })
+    if bufferInMemory && integerArgs > 0 { integerArgs -= 1 }
+    var buffer: usize = lir.NONE
+    if node.*.returnBuffer != 0 {
+        // (Or the object the result is made at, cpp.construct's `m(f())`.)
+        buffer = if node.*.rhs != 0 { expression(node.*.rhs) } else { localAddress(node.*.returnBuffer) }
+    }
+    var function: usize = lir.NONE
+    var symbol: usize = lir.NONE
+    if direct {
+        // By its symbol: the definition's, else the name's (bound by the
+        // linker to another object's or a library's).
+        const o = functionTarget(ast.node(callee).*.variable)
+        const d = ast.obj(o).*.definition
+        gen.noteFunctionUsed(o)
+        const name = if d != 0 && ast.obj(d).*.isDefinition { ast.obj(d).*.symbol } else { gen.linkNameOf(o) }
+        symbol = symbolOf(name)
+    } else {
+        function = expression(callee)
+    }
+    // The list: the hidden buffer first, the register values, the
+    // padding, the stack words.
+    const start = lir.extraDataCount(ir())
+    var total: usize = 0
+    if bufferInMemory {
+        const added = lir.addExtra(ir(), buffer)
+        total += 1
+        integerArgs += 1
+    }
+    var i: usize = 0
+    while i < registerCount {
+        const added = lir.addExtra(ir(), base.getWord(registerArgs + i * 8))
+        total += 1
+        i += 1
+    }
+    if stackCount > 0 {
+        while integerArgs < 6 {
+            const added = lir.addExtra(ir(), zero())
+            total += 1
+            integerArgs += 1
+        }
+        i = 0
+        while i < stackCount {
+            const added = lir.addExtra(ir(), base.getWord(stackArgs + i * 8))
+            total += 1
+            i += 1
+        }
+    }
+    // (zero() may have added instructions: the extras are values, their
+    // order in extraData is what matters.)
+    registerArgs = savedRegisterArgs
+    registerCount = savedRegisterCount
+    stackArgs = savedStackArgs
+    stackCount = savedStackCount
+    integerArgs = savedIntegerArgs
+    // The result's type: a struct in registers is its eightbytes.
+    var resultType: usize = lir.NONE
+    var eightbytes: usize = 0
+    var firstFloat = false
+    var secondFloat = false
+    if isStructLike(rt) && !bufferInMemory && !types.inMemory(rt) {
+        const size = types.size(rt)
+        firstFloat = gen.hasFloat(rt, 0, 8, 0)
+        eightbytes = 1
+        if size > 8 {
+            eightbytes = 2
+            secondFloat = gen.hasFloat(rt, 8, 16, 0)
+        }
+        if eightbytes == 1 {
+            resultType = if firstFloat { tF64 } else { tI64 }
+        } else if firstFloat && secondFloat {
+            resultType = tupleFF
+        } else if firstFloat {
+            resultType = tupleFI
+        } else if secondFloat {
+            resultType = tupleIF
+        } else {
+            resultType = tupleII
+        }
+    } else if types.kind(rt) != types.VOID && !isStructLike(rt) {
+        resultType = tyOf(rt)
+    }
+    var result: usize = lir.NONE
+    if direct {
+        result = emitFlagged(lir.Opcode.direct_call, resultType, lir.FLAG_C_CALL, symbol, start, total)
+    } else {
+        result = emitFlagged(lir.Opcode.call, resultType, lir.FLAG_C_CALL, function, start, total)
+    }
+    if bufferInMemory { return buffer }
+    if eightbytes != 0 {
+        if node.*.returnBuffer == 0 { return lir.NONE }
+        // The struct from its registers into its buffer.
+        const size = types.size(rt)
+        const first = if size < 8 { size } else { 8 }
+        if eightbytes == 1 {
+            if firstFloat { storeWidth(buffer, result, @intCast(usize, first)) } else { storeWord(buffer, 0, result, @intCast(usize, first)) }
+        } else {
+            const a = emit(lir.Opcode.tuple_element, if firstFloat { tF64 } else { tI64 }, result, 0, lir.NONE)
+            const b = emit(lir.Opcode.tuple_element, if secondFloat { tF64 } else { tI64 }, result, 1, lir.NONE)
+            if firstFloat { storeWidth(buffer, a, 8) } else { storeWord(buffer, 0, a, 8) }
+            if secondFloat { storeWidth(offsetBy(buffer, 8), b, @intCast(usize, size - 8)) } else { storeWord(buffer, 8, b, @intCast(usize, size - 8)) }
+        }
+        return buffer
+    }
+    if types.kind(rt) == types.VOID { return lir.NONE }
+    return result
+}
+
+// The function an alias stands for (gen.functionTarget).
+fn functionTarget(o: usize) -> usize {
+    if ast.obj(o).*.isFunction && ast.obj(o).*.usingOf != 0 { return ast.obj(o).*.usingOf }
+    return o
+}
+
+// The LIR symbol of the name `id`.
+fn symbolOf(id: u32) -> usize {
+    const pointer = base.pointer(base.nameAddress(id))
+    const length = base.nameOf(id).length
+    const found = lir.findSymbol(ir(), pointer, length)
+    if found.0 { return found.1 }
+    return lir.addSymbol(ir(), pointer, length)
+}
+
+pub fn expression(n: usize) -> usize {
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.NULL_EXPR { return lir.NONE }
+    if k == ast.NUM {
+        const ty = node.*.ty
+        if types.kind(ty) == types.FLOAT {
+            const single = @floatCast(f32, @bitCast(f64, @bitCast(u64, node.*.value)))
+            const bits = constant(tU64, @intCast(i64, @bitCast(u32, single)) & 4294967295)
+            return emit(lir.Opcode.bitcast, tF32, bits, lir.NONE, lir.NONE)
+        }
+        if types.kind(ty) == types.DOUBLE {
+            const bits = constant(tU64, node.*.value)
+            return emit(lir.Opcode.bitcast, tF64, bits, lir.NONE, lir.NONE)
+        }
+        return constant(tyOf(ty), node.*.value)
+    }
+    if k == ast.BITCAST {
+        const value = expression(node.*.lhs)
+        const to = node.*.ty
+        const fromFloat = isFloat(ast.typeOf(node.*.lhs))
+        if isFloat(to) { return emit(lir.Opcode.bitcast, tyOf(to), value, lir.NONE, lir.NONE) }
+        const bits = if fromFloat { emit(lir.Opcode.bitcast, tU64, value, lir.NONE, lir.NONE) } else { value }
+        return canonical(bits, to)
+    }
+    if k == ast.NEG { return negate(n) }
+    if k == ast.VAR {
+        const o = node.*.variable
+        if ast.obj(o).*.isLocal && hasLocalInfo(o) {
+            const slot = slotOf(o)
+            if slot.0 { return loadWidth(slot.1, tyOf(node.*.ty), lir.NONE, false) }
+        }
+        return load(address(n), node.*.ty)
+    }
+    if k == ast.MEMBER { return memberValue(n) }
+    if k == ast.DEREF {
+        const inner = node.*.lhs
+        if ast.kindOf(inner) == ast.VAR && hasLocalInfo(ast.node(inner).*.variable) && localKind(ast.node(inner).*.variable) == LOCAL_ALIAS {
+            const x = localValue(ast.node(inner).*.variable)
+            const slot = slotOf(x)
+            if slot.0 { return loadWidth(slot.1, tyOf(node.*.ty), lir.NONE, false) }
+            return load(localAddress(x), node.*.ty)
+        }
+        return load(expression(inner), node.*.ty)
+    }
+    if k == ast.ADDR { return address(node.*.lhs) }
+    if k == ast.ASSIGN { return assign(n) }
+    if k == ast.STMT_EXPR { return statementExpression(n) }
+    if k == ast.COMMA {
+        const dropped = expression(node.*.lhs)
+        return expression(node.*.rhs)
+    }
+    if k == ast.CAST {
+        const value = expression(node.*.lhs)
+        return cast(value, ast.typeOf(node.*.lhs), node.*.ty)
+    }
+    if k == ast.MEMZERO && node.*.variable == 0 {
+        // `value` bytes zeroed at the address `lhs`.
+        memzero(expression(node.*.lhs), node.*.value)
+        return lir.NONE
+    }
+    if k == ast.MEMZERO {
+        const o = node.*.variable
+        if hasLocalInfo(o) {
+            // (An alias has no storage of its own.)
+            if localKind(o) == LOCAL_ALIAS { return lir.NONE }
+            const slot = slotOf(o)
+            if slot.0 {
+                storeWidth(slot.1, zero(), lir.NONE)
+                return lir.NONE
+            }
+        }
+        memzero(localAddress(o), types.size(ast.obj(o).*.ty))
+        return lir.NONE
+    }
+    if k == ast.COND { return conditional(n) }
+    if k == ast.NOT { return isZero(expression(node.*.lhs), ast.typeOf(node.*.lhs)) }
+    if k == ast.BITNOT {
+        const value = expression(node.*.lhs)
+        return canonical(emit(lir.Opcode.bit_xor, tyOf(node.*.ty), value, constant(tI64, -1), lir.NONE), node.*.ty)
+    }
+    if k == ast.LOGAND || k == ast.LOGOR { return logical(n) }
+    if k == ast.FUNCALL { return call(n) }
+    if k == ast.ATOMIC { return atomic(n) }
+    if k == ast.ASM {
+        asmInstruction(node.*.value)
+        return lir.NONE
+    }
+    if k == ast.BITOP { return bitop(n) }
+    return binary(n)
+}
+
+// ---------------------------------------------------------------------------
+// Statements
+
+fn switchStatement(n: usize) -> void {
+    const node = ast.node(n)
+    const value = expression(node.*.cond)
+    var c = node.*.cases
+    while c != 0 {
+        const low = ast.node(c).*.value
+        const high = ast.node(c).*.high
+        const target = blockOf(ast.node(c).*.label)
+        const next = newBlock()
+        if low == high {
+            const hit = emit(lir.Opcode.icmp, tI32, @intCast(usize, @intFromEnum(lir.CmpPredicate.eq)), value, constant(tI64, low))
+            condBranch(hit, target, next)
+        } else {
+            // low <= value <= high as one unsigned comparison.
+            const shifted = emit(lir.Opcode.sub, tU64, value, constant(tI64, low), lir.NONE)
+            const hit = emit(lir.Opcode.icmp, tI32, @intCast(usize, @intFromEnum(lir.CmpPredicate.ule)), shifted, constant(tI64, high -% low))
+            condBranch(hit, target, next)
+        }
+        openBlock(next)
+        c = ast.node(c).*.caseNext
+    }
+    if node.*.defaultCase != 0 { branchTo(blockOf(ast.node(node.*.defaultCase).*.label)) } else { branchTo(blockOf(node.*.breakLabel)) }
+    statement(node.*.then)
+    openBlock(blockOf(node.*.breakLabel))
+}
+
+fn returnStatement(n: usize) -> void {
+    const node = ast.node(n)
+    if node.*.lhs == 0 {
+        terminate(flaggedRet(lir.NONE, lir.NONE))
+        return
+    }
+    const ty = ast.typeOf(node.*.lhs)
+    const value = expression(node.*.lhs)
+    if !isStructLike(ty) {
+        if types.kind(ty) == types.VOID { terminate(flaggedRet(lir.NONE, lir.NONE)) } else { terminate(flaggedRet(tyOf(ty), value)) }
+        return
+    }
+    const size = types.size(ty)
+    if types.inMemory(ty) {
+        // Into the caller's buffer, whose address came as the hidden first
+        // parameter (and goes back in rax).
+        const hidden = base.getWord(ast.obj(fnObj).*.params)
+        const slot = slotOf(hidden)
+        const destination = if slot.0 { loadWidth(slot.1, tU64, lir.NONE, false) } else { loadWidth(localAddress(hidden), tU64, 8, false) }
+        copyBytes(destination, value, @intCast(usize, size))
+        terminate(flaggedRet(tU64, destination))
+        return
+    }
+    // In registers: the eightbytes.
+    const firstFloat = gen.hasFloat(ty, 0, 8, 0)
+    const first = if size < 8 { size } else { 8 }
+    const a = if firstFloat { loadFloatWord(value, 0, @intCast(usize, first)) } else { loadWord(value, 0, @intCast(usize, first)) }
+    if size <= 8 {
+        terminate(flaggedRet(if firstFloat { tF64 } else { tI64 }, a))
+        return
+    }
+    const secondFloat = gen.hasFloat(ty, 8, 16, 0)
+    const b = if secondFloat { loadFloatWord(value, 8, @intCast(usize, size - 8)) } else { loadWord(value, 8, @intCast(usize, size - 8)) }
+    var tupleType = tupleII
+    if firstFloat && secondFloat { tupleType = tupleFF } else if firstFloat { tupleType = tupleFI } else if secondFloat { tupleType = tupleIF }
+    const start = lir.addExtra(ir(), a)
+    const added = lir.addExtra(ir(), b)
+    const literal = emit(lir.Opcode.tuple_literal, tupleType, start, 2, lir.NONE)
+    terminate(flaggedRet(tupleType, literal))
+}
+
+fn flaggedRet(typeId: usize, value: usize) -> lir.Inst {
+    var inst = lir.retInst(typeId, value)
+    inst.flags = lir.FLAG_C_CALL
+    return inst
+}
+
+pub fn statement(n: usize) -> void {
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.IF {
+        const otherwise = newBlock()
+        const done = newBlock()
+        const then = newBlock()
+        condBranch(truth(node.*.cond), then, otherwise)
+        openBlock(then)
+        statement(node.*.then)
+        branchTo(done)
+        openBlock(otherwise)
+        if node.*.els != 0 { statement(node.*.els) }
+        openBlock(done)
+        return
+    }
+    if k == ast.FOR {
+        const begin = newBlock()
+        const body = newBlock()
+        if node.*.init != 0 { statement(node.*.init) }
+        openBlock(begin)
+        if node.*.cond != 0 {
+            condBranch(truth(node.*.cond), body, blockOf(node.*.breakLabel))
+        }
+        openBlock(body)
+        statement(node.*.then)
+        openBlock(blockOf(node.*.continueLabel))
+        if node.*.inc != 0 { const dropped = expression(node.*.inc) }
+        branchTo(begin)
+        openBlock(blockOf(node.*.breakLabel))
+        return
+    }
+    if k == ast.DO {
+        const begin = newBlock()
+        openBlock(begin)
+        statement(node.*.then)
+        openBlock(blockOf(node.*.continueLabel))
+        condBranch(truth(node.*.cond), begin, blockOf(node.*.breakLabel))
+        openBlock(blockOf(node.*.breakLabel))
+        return
+    }
+    if k == ast.SWITCH {
+        switchStatement(n)
+        return
+    }
+    if k == ast.CASE || k == ast.LABEL {
+        openBlock(blockOf(node.*.label))
+        statement(node.*.lhs)
+        return
+    }
+    if k == ast.BLOCK {
+        // What follows a return, a break, a continue or a goto, up to a
+        // statement with a label, is not generated (genstmt.genStatement
+        // says why).
+        var s = node.*.body
+        var ended = false
+        while s != 0 {
+            if !ended || genstmt.hasLabel(s) {
+                statement(s)
+                ended = genstmt.endsControl(s)
+            }
+            s = ast.node(s).*.next
+        }
+        return
+    }
+    if k == ast.GOTO || k == ast.JUMP {
+        branchTo(blockOf(node.*.label))
+        return
+    }
+    if k == ast.RETURN {
+        returnStatement(n)
+        return
+    }
+    if k == ast.EXPR_STMT {
+        const dropped = expression(node.*.lhs)
+        return
+    }
+    ast.errorAt(n, "invalid statement")
+}
+
+// ---------------------------------------------------------------------------
+// Functions
+
+// The parameters passed in registers, in order (`param` instructions
+// the back end stores from rdi, rsi, ... and xmm0, ...), into their
+// locals; those in memory are read where they lie.
+fn parameters(fn_obj: usize) -> void {
+    var cell = ast.obj(fn_obj).*.params
+    while cell != 0 {
+        const p = base.getWord(cell)
+        const ty = ast.obj(p).*.ty
+        const offset = ast.obj(p).*.offset
+        if offset < 0 {
+            if isStructLike(ty) {
+                const size = types.size(ty)
+                const place = localAddress(p)
+                const first = if size < 8 { size } else { 8 }
+                if gen.hasFloat(ty, 0, 8, 0) {
+                    const value = emit(lir.Opcode.param, tF64, lir.NONE, lir.NONE, lir.NONE)
+                    storeWidth(place, value, @intCast(usize, first))
+                } else {
+                    const value = emit(lir.Opcode.param, tI64, lir.NONE, lir.NONE, lir.NONE)
+                    storeWord(place, 0, value, @intCast(usize, first))
+                }
+                if size > 8 {
+                    if gen.hasFloat(ty, 8, 16, 0) {
+                        const value = emit(lir.Opcode.param, tF64, lir.NONE, lir.NONE, lir.NONE)
+                        storeWidth(offsetBy(place, 8), value, @intCast(usize, size - 8))
+                    } else {
+                        const value = emit(lir.Opcode.param, tI64, lir.NONE, lir.NONE, lir.NONE)
+                        storeWord(place, 8, value, @intCast(usize, size - 8))
+                    }
+                }
+            } else {
+                const value = emit(lir.Opcode.param, tyOf(ty), lir.NONE, lir.NONE, lir.NONE)
+                const slot = slotOf(p)
+                if slot.0 {
+                    storeWidth(slot.1, value, lir.NONE)
+                } else {
+                    storeWidth(localAddress(p), value, @intCast(usize, types.size(ty)))
+                }
+            }
+        }
+        cell = base.getWord(cell + 8)
+    }
+}
+
+// The locals aligned beyond 16: their addresses computed into the words
+// they are reached by (genstmt.genFunction does the same).
+fn alignLocals() -> void {
+    var cell = genstmt.overAligned
+    while cell != 0 {
+        const local = base.getWord(cell)
+        const alignment = ast.obj(local).*.alignment
+        const room = frameLocal(ast.obj(local).*.offset)
+        const up = emit(lir.Opcode.add, tU64, room, constant(tI64, alignment - 1), lir.NONE)
+        const aligned = emit(lir.Opcode.bit_and, tU64, up, constant(tI64, 0 - alignment), lir.NONE)
+        storeWidth(frameLocal(ast.obj(base.getWord(cell + 8)).*.offset), aligned, lir.NONE)
+        cell = base.getWord(cell + 16)
+    }
+}
+
+// Whether the function `fn_obj` can be lowered (its locals classified
+// on the way).
+fn prepare(fn_obj: usize) -> bool {
+    const obj = ast.obj(fn_obj)
+    if obj.*.entryOf != 0 { return refuse(R_ENTRY) }
+    if obj.*.vaArea != 0 { return refuse(R_VARIADIC) }
+    if !checkType(obj.*.ty) || !checkType(types.baseOf(obj.*.ty)) { return false }
+    indexLocals(fn_obj)
+    var cell = obj.*.params
+    while cell != 0 {
+        if !checkType(ast.obj(base.getWord(cell)).*.ty) { return false }
+        cell = base.getWord(cell + 8)
+    }
+    var local = obj.*.locals
+    while local != 0 {
+        if !checkType(ast.obj(local).*.ty) { return false }
+        local = ast.obj(local).*.next
+    }
+    if !check(obj.*.body) { return false }
+    classifyLocals(fn_obj)
+    return true
+}
+
+// Makes the function's code through the LIR, its locals placed by
+// genstmt.assignOffsets already; false when the stack machine has to
+// (nothing was emitted then).
+pub fn genFunction(fn_obj: usize) -> bool {
+    if backend != BACKEND_LIR { return false }
+    init()
+    scratchMark = base.scratchMark()
+    labelTable = 0
+    labelCapacity = 0
+    labelCount = 0
+    unsupportedReason = REASON_COUNT
+    if !prepare(fn_obj) {
+        forgetLocals(fn_obj)
+        base.releaseScratch(scratchMark)
+        countFallback(unsupportedReason)
+        if interp.trace { tokens.warnAt(ast.obj(fn_obj).*.token, base.join(base.join("lir: ", base.nameOf(if ast.obj(fn_obj).*.linkName != 0 { ast.obj(fn_obj).*.linkName } else { ast.obj(fn_obj).*.name })), base.join(" by the stack machine: ", reasonName(unsupportedReason)))) }
+        return false
+    }
+    fnObj = fn_obj
+    mainFunction = ast.obj(fn_obj).*.name == names.D_MAIN
+    current = lir.init(heap.allocator())
+    blockCount = 0
+    blockOpen = false
+    const symbol = ast.obj(fn_obj).*.symbol
+    const label = lir.addInst(ir(), lir.labelInst(tyOf(types.baseOf(ast.obj(fn_obj).*.ty)), symbolOf(symbol)))
+    openBlock(newBlock())
+    makeSlots(fn_obj)
+    parameters(fn_obj)
+    alignLocals()
+    statement(ast.obj(fn_obj).*.body)
+    if blockOpen {
+        // main returns 0 when it ends without a return (C11 5.1.2.2.3).
+        if mainFunction { terminate(flaggedRet(tI32, constant(tI32, 0))) } else { terminate(flaggedRet(lir.NONE, lir.NONE)) }
+    }
+    loweredCount += 1
+    loweredInstructions += @intCast(u64, lir.instCount(ir()))
+    if trace {
+        dump(fn_obj, ir(), "lowered")
+        var local = ast.obj(fn_obj).*.locals
+        while local != 0 {
+            if hasLocalInfo(local) {
+                base.say(base.join("  local ", base.join(base.nameOf(ast.obj(local).*.name), base.join(" kind ", base.join(base.decimal(@intCast(u64, localKind(local))), base.join(" flags ", base.join(base.decimal(@intCast(u64, localFlag(local))), base.join(" offset ", base.join(base.decimal(@intCast(u64, @bitCast(u64, ast.obj(local).*.offset))), "\n")))))))))
+            }
+            local = ast.obj(local).*.next
+        }
+    }
+    irgen.emitFunction(fn_obj, ir(), blockCount, @intCast(usize, ast.obj(fn_obj).*.stackSize))
+    lir.deinit(ir())
+    forgetLocals(fn_obj)
+    base.releaseScratch(scratchMark)
+    return true
+}
