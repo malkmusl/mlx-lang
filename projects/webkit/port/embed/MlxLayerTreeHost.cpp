@@ -1719,8 +1719,17 @@ bool MlxLayerTreeHost::presentFrame(uint32_t* pixels, int width, int height, int
         int copyWidth = std::min(width, m_frameSize.width());
         int copyHeight = std::min(height, m_frameSize.height());
         auto started = MonotonicTime::now();
-        if (!m_gpu->present(pixels, copyWidth, copyHeight, stride))
+        if (!m_gpu->present(pixels, copyWidth, copyHeight, stride)) {
             m_gpu->read(IntRect(0, 0, copyWidth, copyHeight), pixels, stride);
+            // (A window buffer the device cannot import, wl_shm's memfd
+            // pages on amdgpu: this frame read synchronously, the next
+            // ones read asynchronously as without a presenter, instead of
+            // a synchronous read of every frame, 60 ms each on an RX 580.)
+            m_presentsDirectly = false;
+            m_asynchronousReads = m_gpu->asynchronous;
+            if (getenv("MLX_TRACE_COMPOSITOR"))
+                fprintf(stderr, "compositor: the window's buffer could not be presented on the GPU: frames %s\n", m_asynchronousReads ? "read back asynchronously" : "read back");
+        }
         presentTime = (MonotonicTime::now() - started).milliseconds();
         for (int y = 0; y < height; ++y) {
             uint32_t* row = pixels + static_cast<size_t>(y) * stride;

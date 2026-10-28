@@ -240,8 +240,12 @@ extern "C" bool mlxVulkanPresenterCopy(void* presenter, uint32_t glLayout, uint3
     if (!found) {
         VkMemoryHostPointerPropertiesEXT hostProperties { };
         hostProperties.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
-        if (p.hostPointerProperties(p.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostPointer, &hostProperties) != VK_SUCCESS || !hostProperties.memoryTypeBits)
+        static bool trace = getenv("MLX_TRACE_COMPOSITOR");
+        if (p.hostPointerProperties(p.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostPointer, &hostProperties) != VK_SUCCESS || !hostProperties.memoryTypeBits) {
+            if (trace)
+                fprintf(stderr, "presenter: the device takes no host pointer for the window's buffer\n");
             return false;
+        }
         VkExternalMemoryBufferCreateInfo external { };
         external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -266,7 +270,10 @@ extern "C" bool mlxVulkanPresenterCopy(void* presenter, uint32_t glLayout, uint3
         allocateInfo.allocationSize = size;
         allocateInfo.memoryTypeIndex = memoryType(p, hostProperties.memoryTypeBits & requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        if (allocateInfo.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(p.device, &allocateInfo, nullptr, &memory) != VK_SUCCESS || vkBindBufferMemory(p.device, buffer, memory, 0) != VK_SUCCESS) {
+        VkResult allocated = allocateInfo.memoryTypeIndex == UINT32_MAX ? VK_ERROR_FEATURE_NOT_PRESENT : vkAllocateMemory(p.device, &allocateInfo, nullptr, &memory);
+        if (allocated != VK_SUCCESS || vkBindBufferMemory(p.device, buffer, memory, 0) != VK_SUCCESS) {
+            if (trace)
+                fprintf(stderr, "presenter: the window's buffer could not be imported (VkResult %d, memory type %u, %llu bytes)\n", static_cast<int>(allocated), allocateInfo.memoryTypeIndex, static_cast<unsigned long long>(size));
             vkDestroyBuffer(p.device, buffer, nullptr);
             if (memory)
                 vkFreeMemory(p.device, memory, nullptr);
