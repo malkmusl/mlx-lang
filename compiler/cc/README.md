@@ -190,11 +190,12 @@ alone.
 
 ## The LIR back end
 
-`-fbackend=lir` (or `MLX_CC_BACKEND=lir` in the environment, which
-leaves the command line, and so `mlx build`'s cache keys, as they are;
-`-fbackend=stack` and no setting are the stack machine) makes each
-function body not as the stack machine of gen.mlx but as the Mlx
-compiler's own intermediate representation, LIR (`compiler/selfhost/ir`),
+By default (`-fbackend=lir`, or `MLX_CC_BACKEND=lir` in the
+environment; `-fbackend=stack` or `MLX_CC_BACKEND=stack` is the stack
+machine alone, and the environment leaves the command line, and so `mlx
+build`'s cache keys, as they are) each function body is made not as the
+stack machine of gen.mlx but as the Mlx compiler's own intermediate
+representation, LIR (`compiler/selfhost/ir`),
 which mlx4's optimizer (constants folded, loads of locals forwarded and
 locals held as values, copies propagated, stores and dead values dropped,
 the most used locals of a function in rbx, r12 and r13) and its x86-64
@@ -309,13 +310,15 @@ in `/usr/local/lib/mlx-cc/include`.
 | Constants and strings | `literal.mlx`, `extended.mlx` (long double constants) |
 | Types and syntax tree | `types.mlx`, `ast.mlx` |
 | Parser | `cursor.mlx`, `state.mlx`, `scope.mlx`, `decl.mlx`, `initializer.mlx`, `expr.mlx`, `stmt.mlx`, `typing.mlx`, `eval.mlx` |
-| Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
+| Code | `ir.mlx`, `irgen.mlx` (function bodies through mlx4's LIR and back end, below), `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions: the stack machine) |
 | Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through mlx-ld), `compiler/ld/main.mlx` (mlx-ld: `compiler/selfhost/object/link.mlx` as a program, the link map), `ar.mlx` (mlx-ar) |
 | The C variant | `standard.mlx` (`-std=`: the macros, the keywords) |
 | Prefix snapshots | `snapshot.mlx` (below) |
 | Driver | `main.mlx` |
 
-The code generator is a stack machine on rax (xmm0 for floating values),
+Function bodies go through mlx4's LIR ("The LIR back end", below); what
+its lowering does not cover, and everything around the bodies, is the
+stack machine's: a stack machine on rax (xmm0 for floating values),
 with every integer kept canonical for its type in the whole register.
 Calls follow the System V AMD64 ABI, structs passed and returned by value
 included, and variadic functions set up the ABI's register save area so a
