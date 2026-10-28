@@ -169,6 +169,10 @@ pub fn showStats() -> void {
 // MLX_CC_LIR_TRACE: the LIR of every function as lowered, on stderr.
 
 pub var trace = false // (per run)
+// MLX_CC_LIR_LIMIT=N: only the first N functions go through the LIR, the
+// rest through the stack machine (to find the function a lowering gets
+// wrong by bisection).
+pub var limit: usize = 18446744073709551615 // (per run)
 
 fn opcodeName(opcode: lir.Opcode) -> []const u8 {
     const code = @intFromEnum(opcode)
@@ -560,8 +564,17 @@ fn frameLocal(offset: i64) -> usize {
 // The address of the local `o` in memory (in the frame, or where the
 // local it is stored at points).
 fn localAddress(o: usize) -> usize {
+    if hasLocalInfo(o) && localKind(o) != LOCAL_MEMORY { tokens.errorAt(ast.obj(o).*.token, "internal error: the address of a local held as a value") }
     const at = ast.obj(o).*.storedAt
-    if at != 0 { return loadWidth(frameLocal(ast.obj(at).*.offset), tU64, 8, false) }
+    if at != 0 {
+        // (The local holding the address may itself be a slot: a
+        // parameter passed by invisible reference.)
+        if hasLocalInfo(at) {
+            const slot = slotOf(at)
+            if slot.0 { return loadWidth(slot.1, tU64, lir.NONE, false) }
+        }
+        return loadWidth(frameLocal(ast.obj(at).*.offset), tU64, 8, false)
+    }
     return frameLocal(ast.obj(o).*.offset)
 }
 
@@ -656,38 +669,32 @@ fn addressedLocal(n: usize) -> usize {
     return x
 }
 
-// An lvalue used by its address (`&(a, *tmp)`, `(T)*tmp` of a struct):
-// a temporary's alias through it does not hold.
-fn breakAliasIn(n: usize) -> void {
+// An lvalue used by its address (`&(a, x)`, `(T)x` of a struct, `&*tmp`):
+// the local named at its end has its address taken (as `address` finds
+// it), and a temporary's alias through it does not hold.
+fn markAddressed(n: usize) -> void {
     if n == 0 { return }
     const node = ast.node(n)
+    if node.*.kind == ast.VAR {
+        if hasLocalInfo(node.*.variable) { setLocalFlag(node.*.variable, ADDRESSED | ALIAS_BROKEN) }
+        return
+    }
     if node.*.kind == ast.DEREF && ast.kindOf(node.*.lhs) == ast.VAR {
         if hasLocalInfo(ast.node(node.*.lhs).*.variable) { setLocalFlag(ast.node(node.*.lhs).*.variable, ALIAS_BROKEN) }
         return
     }
-    if node.*.kind == ast.COMMA { breakAliasIn(node.*.rhs) }
-    if node.*.kind == ast.CAST { breakAliasIn(node.*.lhs) }
+    if node.*.kind == ast.COMMA { markAddressed(node.*.rhs) }
+    if node.*.kind == ast.CAST { markAddressed(node.*.lhs) }
+    if node.*.kind == ast.MEMBER { markAddressed(node.*.lhs) }
 }
 
 // Whether `n` (an expression or a statement) can be lowered; the walk
 // also notes which locals have their address taken and which temporaries
 // only hold a local's address (`tmp = &x; *tmp = *tmp + 1`).
-var checkParent: u8 = 0 // (per run)
-
 fn check(n: usize) -> bool {
     if n == 0 { return true }
     const node = ast.node(n)
     const k = node.*.kind
-    const parentKept = checkParent
-    const result = checkNode(n)
-    checkParent = parentKept
-    return result
-}
-
-fn checkNode(n: usize) -> bool {
-    const node = ast.node(n)
-    const k = node.*.kind
-    checkParent = k
     if !checkType(node.*.ty) { return false }
     if k == ast.NULL_EXPR || k == ast.NUM || k == ast.JUMP { return true }
     if k == ast.VAR {
@@ -702,13 +709,10 @@ fn checkNode(n: usize) -> bool {
         const inner = node.*.lhs
         if ast.kindOf(inner) == ast.VAR {
             if !checkType(ast.obj(ast.node(inner).*.variable).*.ty) { return false }
-            if hasLocalInfo(ast.node(inner).*.variable) {
-                if trace { base.say(base.join("lir: & of ", base.join(base.nameOf(ast.obj(ast.node(inner).*.variable).*.name), base.join(" under node kind ", base.join(base.decimal(@intCast(u64, checkParent)), "\n"))))) }
-                setLocalFlag(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN)
-            }
+            if hasLocalInfo(ast.node(inner).*.variable) { setLocalFlag(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN) }
             return true
         }
-        breakAliasIn(inner)
+        markAddressed(inner)
         return check(inner)
     }
     if k == ast.DEREF {
@@ -748,7 +752,7 @@ fn checkNode(n: usize) -> bool {
             if !checkType(ast.obj(ast.node(ast.node(lhs).*.lhs).*.variable).*.ty) { return false }
             return check(rhs)
         }
-        breakAliasIn(lhs)
+        markAddressed(lhs)
         return check(lhs) && check(rhs)
     }
     if k == ast.BITCAST || k == ast.NEG || k == ast.CAST || k == ast.NOT || k == ast.BITNOT || k == ast.EXPR_STMT || k == ast.RETURN || k == ast.CASE || k == ast.LABEL {
@@ -1056,8 +1060,9 @@ fn floatBinary(n: usize) -> usize {
 fn pointerAdd(n: usize) -> (bool, usize) {
     const node = ast.node(n)
     if types.kind(node.*.ty) != types.PTR || node.*.kind != ast.ADD { return -> (false, 0) }
-    const scaled = node.*.rhs
-    if ast.kindOf(scaled) != ast.MUL || ast.kindOf(ast.node(scaled).*.rhs) != ast.NUM { return -> (false, 0) }
+    var scaled = node.*.rhs
+    while ast.kindOf(scaled) == ast.CAST && types.size(ast.typeOf(scaled)) == 8 && types.isInteger(ast.typeOf(scaled)) { scaled = ast.node(scaled).*.lhs }
+    if ast.kindOf(scaled) != ast.MUL || ast.kindOf(ast.node(scaled).*.rhs) != ast.NUM || types.size(ast.typeOf(scaled)) != 8 { return -> (false, 0) }
     const scale = ast.node(ast.node(scaled).*.rhs).*.value
     if scale <= 0 || scale > 2147483647 { return -> (false, 0) }
     const index = expression(ast.node(scaled).*.lhs)
@@ -1947,6 +1952,7 @@ fn prepare(fn_obj: usize) -> bool {
 // (nothing was emitted then).
 pub fn genFunction(fn_obj: usize) -> bool {
     if backend != BACKEND_LIR { return false }
+    if loweredCount >= @intCast(u64, limit) { return false }
     init()
     scratchMark = base.scratchMark()
     labelTable = 0
