@@ -1,0 +1,1371 @@
+// std.h264: reads H.264 (ITU-T H.264 / ISO/IEC 14496-10) streams as far
+// as a decoder that is given whole pictures needs: NAL units (Annex B
+// start codes or length prefixes), sequence and picture parameter sets
+// into the Vulkan video registry's structures (std.vulkan.video), slice
+// headers, and the decoding process around the pictures: picture order
+// counts (8.2.1), reference marking (8.2.5: sliding window and memory
+// management control operations), the decoded picture buffer with its
+// slots, and the output order (C.4.5.3's bumping). What comes out per
+// access unit is what VkVideoDecodeInfoKHR needs: the picture's slot and
+// StdVideoDecodeH264PictureInfo, the reference slots with their
+// StdVideoDecodeH264ReferenceInfo, and the slice offsets.
+//
+//     const h = h264.create(allocator)
+//     h264.parameterSet(h, sps, length)      (each avcC parameter set, or inline)
+//     h264.accessUnit(h, sample, length, 4)  (an MP4 sample: length-prefixed NALs)
+//     ... h.*.picture (decode it), then h264.finishPicture(h)
+//     while h264.nextOutput(h, &slot, &poc) { ... present the slot }
+//     h264.flush(h)                           (at the end of the stream)
+//
+// Frames only (frame_mbs_only_flag or no field pictures: what video on
+// the web is); field pictures answer unsupported.
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const video = @import("./vulkan/video.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Status = enum(u8) {
+    ok,
+    // Nothing decodable (no slice) in the access unit.
+    empty,
+    corrupt,
+    unsupported,
+    noMemory
+}
+
+pub const MAX_SPS: usize = 32
+pub const MAX_PPS: usize = 256
+pub const DPB_SIZE: usize = 16
+// Slots: the DPB's pictures plus the one being decoded.
+pub const SLOTS: usize = DPB_SIZE + 1
+pub const MAX_SLICES: usize = 256
+pub const MAX_MMCO: usize = 32
+const RBSP_CAPACITY: usize = 4096
+
+pub const NAL_SLICE: u8 = 1
+pub const NAL_SLICE_IDR: u8 = 5
+pub const NAL_SEI: u8 = 6
+pub const NAL_SPS: u8 = 7
+pub const NAL_PPS: u8 = 8
+pub const NAL_AUD: u8 = 9
+pub const NAL_END_SEQUENCE: u8 = 10
+
+pub const Nal = struct {
+    kind: u8
+    refIdc: u8
+    // The NAL unit's bytes (its header byte first).
+    offset: usize
+    length: usize
+}
+
+// The next NAL unit of an Annex B stream from `at` (moved past it).
+pub fn nextAnnexB(bytes: [*]const u8, length: usize, at: *usize, nal: *Nal) -> bool {
+    var start = at.*
+    // The start code.
+    while start + 3 <= length {
+        if bytes[start] == 0 && bytes[start + 1] == 0 && bytes[start + 2] == 1 { break }
+        start += 1
+    }
+    if start + 3 > length { return false }
+    start += 3
+    var end = start
+    while end + 3 <= length {
+        if bytes[end] == 0 && bytes[end + 1] == 0 && (bytes[end + 2] == 1 || bytes[end + 2] == 0) { break }
+        end += 1
+    }
+    if end + 3 > length { end = length }
+    // Trailing zero bytes belong to the next start code.
+    while end > start && bytes[end - 1] == 0 { end -= 1 }
+    if end == start { return false }
+    nal.*.offset = start
+    nal.*.length = end - start
+    nal.*.kind = bytes[start] & 31
+    nal.*.refIdc = (bytes[start] >> 5) & 3
+    at.* = end
+    return true
+}
+
+// The next NAL unit of a length-prefixed stream (an MP4 sample).
+pub fn nextPrefixed(bytes: [*]const u8, length: usize, prefix: usize, at: *usize, nal: *Nal) -> bool {
+    if at.* + prefix > length { return false }
+    var size: usize = 0
+    var index: usize = 0
+    while index < prefix {
+        size = (size << 8) | @intCast(usize, bytes[at.* + index])
+        index += 1
+    }
+    const start = at.* + prefix
+    if size == 0 || size > length - start { return false }
+    nal.*.offset = start
+    nal.*.length = size
+    nal.*.kind = bytes[start] & 31
+    nal.*.refIdc = (bytes[start] >> 5) & 3
+    at.* = start + size
+    return true
+}
+
+// ---- RBSP bits ----
+
+const Reader = struct {
+    bytes: [RBSP_CAPACITY]u8
+    length: usize
+    at: usize
+    failed: bool
+}
+
+// Copies a NAL unit's payload (after its header byte) with emulation
+// prevention bytes removed, up to RBSP_CAPACITY bytes (slice data past
+// the header is not needed here).
+fn load(reader: *Reader, bytes: [*]const u8, length: usize) -> void {
+    var zeros: usize = 0
+    var index: usize = 1
+    reader.*.length = 0
+    reader.*.at = 0
+    reader.*.failed = false
+    while index < length && reader.*.length < RBSP_CAPACITY {
+        const byte = bytes[index]
+        index += 1
+        if zeros >= 2 && byte == 3 {
+            zeros = 0
+            continue
+        }
+        reader.*.bytes[reader.*.length] = byte
+        reader.*.length += 1
+        if byte == 0 { zeros += 1 } else { zeros = 0 }
+    }
+}
+
+fn bits(reader: *Reader, count: u32) -> u32 {
+    var value: u32 = 0
+    var left = count
+    while left > 0 {
+        const byteIndex = reader.*.at >> 3
+        if byteIndex >= reader.*.length {
+            reader.*.failed = true
+            return 0
+        }
+        const bit = @intCast(u32, reader.*.at & 7)
+        const available = 8 - bit
+        var take = left
+        if take > available { take = available }
+        const byte = @intCast(u32, reader.*.bytes[byteIndex])
+        const piece = (byte >> (available - take)) & ((@intCast(u32, 1) << take) - 1)
+        value = (value << take) | piece
+        reader.*.at += @intCast(usize, take)
+        left -= take
+    }
+    return value
+}
+
+fn flag(reader: *Reader) -> bool { return bits(reader, 1) == 1 }
+
+// ue(v): an unsigned Exp-Golomb code.
+fn ue(reader: *Reader) -> u32 {
+    var zeros: u32 = 0
+    while bits(reader, 1) == 0 {
+        zeros += 1
+        if zeros > 31 || reader.*.failed {
+            reader.*.failed = true
+            return 0
+        }
+    }
+    if zeros == 0 { return 0 }
+    return ((@intCast(u32, 1) << zeros) - 1) + bits(reader, zeros)
+}
+
+// se(v): a signed Exp-Golomb code.
+fn se(reader: *Reader) -> i32 {
+    const code = ue(reader)
+    const magnitude = @intCast(i32, (code + 1) / 2)
+    if code & 1 == 1 { return magnitude }
+    return -magnitude
+}
+
+// more_rbsp_data(): bits before the trailing one and its zeros.
+fn moreData(reader: *Reader) -> bool {
+    if reader.*.failed { return false }
+    const byteIndex = reader.*.at >> 3
+    if byteIndex >= reader.*.length { return false }
+    // The last one bit of the RBSP.
+    var last = reader.*.length
+    while last > 0 && reader.*.bytes[last - 1] == 0 { last -= 1 }
+    if last == 0 { return false }
+    const byte = reader.*.bytes[last - 1]
+    var trailing: usize = 0
+    while (byte >> @intCast(u8, trailing)) & 1 == 0 { trailing += 1 }
+    const stopBit = (last - 1) * 8 + (7 - trailing)
+    return reader.*.at < stopBit
+}
+
+// ---- Parameter sets ----
+
+pub const Sps = struct {
+    present: bool
+    std: video.StdVideoH264SequenceParameterSet
+    scaling: video.StdVideoH264ScalingLists
+    vui: video.StdVideoH264SequenceParameterSetVui
+    hrd: video.StdVideoH264HrdParameters
+    offsetForRefFrame: [256]i32
+    // Derived.
+    width: u32
+    height: u32
+    widthInMbs: u32
+    heightInMbs: u32
+    maxFrameNum: u32
+    maxPocLsb: u32
+    frameMbsOnly: bool
+    // The DPB's size in frames and how many frames may wait for output
+    // (VUI's max_dec_frame_buffering and num_reorder_frames, else the
+    // level's).
+    dpbFrames: u32
+    reorderFrames: u32
+}
+
+pub const Pps = struct {
+    present: bool
+    std: video.StdVideoH264PictureParameterSet
+    scaling: video.StdVideoH264ScalingLists
+    spsId: u32
+    sliceGroups: u32
+    weightedBipredIdc: u32
+    numRefIdxActive0: u32
+    numRefIdxActive1: u32
+}
+
+fn scalingList(reader: *Reader, list: [*]u8, size: usize, useDefault: *bool) -> void {
+    var last: i32 = 8
+    var next: i32 = 8
+    var index: usize = 0
+    useDefault.* = false
+    while index < size {
+        if next != 0 {
+            const delta = se(reader)
+            next = @intCast(i32, @intCast(u32, @intCast(i64, last) + @intCast(i64, delta) + 256) & 255)
+            if index == 0 && next == 0 {
+                useDefault.* = true
+                return
+            }
+        }
+        if next != 0 { last = next }
+        list[index] = @intCast(u8, last)
+        index += 1
+    }
+}
+
+// Reads the scaling lists (SPS: 8 or 12 of them, PPS: 6 + 2 or 6 of
+// transform_8x8) into `scaling`'s masks and lists.
+fn scalingLists(reader: *Reader, scaling: *video.StdVideoH264ScalingLists, count: usize) -> void {
+    scaling.*.scaling_list_present_mask = 0
+    scaling.*.use_default_scaling_matrix_mask = 0
+    var index: usize = 0
+    while index < count {
+        if flag(reader) {
+            scaling.*.scaling_list_present_mask |= @intCast(u16, @intCast(u32, 1) << @intCast(u32, index))
+            var useDefault = false
+            if index < 6 {
+                scalingList(reader, &scaling.*.ScalingList4x4[index], 16, &useDefault)
+            } else {
+                scalingList(reader, &scaling.*.ScalingList8x8[index - 6], 64, &useDefault)
+            }
+            if useDefault { scaling.*.use_default_scaling_matrix_mask |= @intCast(u16, @intCast(u32, 1) << @intCast(u32, index)) }
+        }
+        index += 1
+    }
+}
+
+fn hrdParameters(reader: *Reader, hrd: *video.StdVideoH264HrdParameters) -> void {
+    const count = ue(reader) + 1
+    hrd.*.cpb_cnt_minus1 = @intCast(u8, (count - 1) & 255)
+    hrd.*.bit_rate_scale = @intCast(u8, bits(reader, 4))
+    hrd.*.cpb_size_scale = @intCast(u8, bits(reader, 4))
+    var index: usize = 0
+    while index < @intCast(usize, count) && index < 32 {
+        hrd.*.bit_rate_value_minus1[index] = ue(reader)
+        hrd.*.cpb_size_value_minus1[index] = ue(reader)
+        hrd.*.cbr_flag[index] = @intCast(u8, bits(reader, 1))
+        index += 1
+    }
+    hrd.*.initial_cpb_removal_delay_length_minus1 = bits(reader, 5)
+    hrd.*.cpb_removal_delay_length_minus1 = bits(reader, 5)
+    hrd.*.dpb_output_delay_length_minus1 = bits(reader, 5)
+    hrd.*.time_offset_length = bits(reader, 5)
+}
+
+// Levels' MaxDpbMbs (Table A-1), by level_idc.
+fn maxDpbMbs(level: u32, constraintSet3: bool) -> u32 {
+    if level == 9 || (level == 11 && constraintSet3) { return 396 }
+    if level == 10 { return 396 }
+    if level == 11 { return 900 }
+    if level == 12 || level == 13 || level == 20 { return 2376 }
+    if level == 21 { return 4752 }
+    if level == 22 || level == 30 { return 8100 }
+    if level == 31 { return 18000 }
+    if level == 32 { return 20480 }
+    if level == 40 || level == 41 { return 32768 }
+    if level == 42 { return 34816 }
+    if level == 50 { return 110400 }
+    if level == 51 || level == 52 { return 184320 }
+    return 696320
+}
+
+// The registry's level_idc enumeration (StdVideoH264LevelIdc: 1.0 is 0,
+// 1.1 1, ... 6.2 19) from the stream's level_idc.
+fn levelCode(level: u32, constraintSet3: bool) -> u32 {
+    if level == 9 || (level == 11 && constraintSet3) { return video.STD_VIDEO_H264_LEVEL_IDC_1_1 }
+    const majors = level / 10
+    const minors = level % 10
+    if majors == 1 { return minors }
+    if majors == 2 { return 4 + minors }
+    if majors == 3 { return 7 + minors }
+    if majors == 4 { return 10 + minors }
+    if majors == 5 { return 13 + minors }
+    return 16 + minors
+}
+
+fn zeroBytes(target: [*]u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        target[index] = 0
+        index += 1
+    }
+}
+
+fn parseSps(h: *Decoder, reader: *Reader) -> Status {
+    const profile = bits(reader, 8)
+    const constraints = bits(reader, 8)
+    const level = bits(reader, 8)
+    const id = ue(reader)
+    if reader.*.failed || id >= @intCast(u32, MAX_SPS) { return Status.corrupt }
+    const sps = spsAt(h, @intCast(usize, id))
+    unsafe { zeroBytes(@ptrCast([*]u8, sps), @sizeOf(Sps)) }
+    const s = &sps.*.std
+    s.*.profile_idc = profile
+    s.*.level_idc = levelCode(level, constraints & 0x10 != 0)
+    s.*.seq_parameter_set_id = @intCast(u8, id)
+    var flags: u32 = 0
+    if constraints & 0x80 != 0 { flags |= video.StdVideoH264SpsFlags_constraint_set0_flag }
+    if constraints & 0x40 != 0 { flags |= video.StdVideoH264SpsFlags_constraint_set1_flag }
+    if constraints & 0x20 != 0 { flags |= video.StdVideoH264SpsFlags_constraint_set2_flag }
+    if constraints & 0x10 != 0 { flags |= video.StdVideoH264SpsFlags_constraint_set3_flag }
+    if constraints & 0x08 != 0 { flags |= video.StdVideoH264SpsFlags_constraint_set4_flag }
+    if constraints & 0x04 != 0 { flags |= video.StdVideoH264SpsFlags_constraint_set5_flag }
+    s.*.chroma_format_idc = 1
+    if profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 || profile == 139 || profile == 134 || profile == 135 {
+        s.*.chroma_format_idc = ue(reader)
+        if s.*.chroma_format_idc == 3 {
+            if flag(reader) { flags |= video.StdVideoH264SpsFlags_separate_colour_plane_flag }
+        }
+        s.*.bit_depth_luma_minus8 = @intCast(u8, ue(reader) & 255)
+        s.*.bit_depth_chroma_minus8 = @intCast(u8, ue(reader) & 255)
+        if flag(reader) { flags |= video.StdVideoH264SpsFlags_qpprime_y_zero_transform_bypass_flag }
+        if flag(reader) {
+            flags |= video.StdVideoH264SpsFlags_seq_scaling_matrix_present_flag
+            scalingLists(reader, &sps.*.scaling, if s.*.chroma_format_idc != 3 { 8 } else { 12 })
+            s.*.pScalingLists = &sps.*.scaling
+        }
+    }
+    s.*.log2_max_frame_num_minus4 = @intCast(u8, ue(reader) & 255)
+    s.*.pic_order_cnt_type = ue(reader)
+    if s.*.pic_order_cnt_type == 0 {
+        s.*.log2_max_pic_order_cnt_lsb_minus4 = @intCast(u8, ue(reader) & 255)
+    } else if s.*.pic_order_cnt_type == 1 {
+        if flag(reader) { flags |= video.StdVideoH264SpsFlags_delta_pic_order_always_zero_flag }
+        s.*.offset_for_non_ref_pic = se(reader)
+        s.*.offset_for_top_to_bottom_field = se(reader)
+        const count = ue(reader)
+        if count > 255 { return Status.corrupt }
+        s.*.num_ref_frames_in_pic_order_cnt_cycle = @intCast(u8, count)
+        var index: usize = 0
+        while index < @intCast(usize, count) {
+            sps.*.offsetForRefFrame[index] = se(reader)
+            index += 1
+        }
+        s.*.pOffsetForRefFrame = &sps.*.offsetForRefFrame[0]
+    }
+    s.*.max_num_ref_frames = @intCast(u8, ue(reader) & 255)
+    if flag(reader) { flags |= video.StdVideoH264SpsFlags_gaps_in_frame_num_value_allowed_flag }
+    s.*.pic_width_in_mbs_minus1 = ue(reader)
+    s.*.pic_height_in_map_units_minus1 = ue(reader)
+    const frameMbsOnly = flag(reader)
+    if frameMbsOnly {
+        flags |= video.StdVideoH264SpsFlags_frame_mbs_only_flag
+    } else {
+        if flag(reader) { flags |= video.StdVideoH264SpsFlags_mb_adaptive_frame_field_flag }
+    }
+    if flag(reader) { flags |= video.StdVideoH264SpsFlags_direct_8x8_inference_flag }
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsFlags_frame_cropping_flag
+        s.*.frame_crop_left_offset = ue(reader)
+        s.*.frame_crop_right_offset = ue(reader)
+        s.*.frame_crop_top_offset = ue(reader)
+        s.*.frame_crop_bottom_offset = ue(reader)
+    }
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsFlags_vui_parameters_present_flag
+        const status = parseVui(reader, sps)
+        if status != Status.ok { return status }
+        s.*.pSequenceParameterSetVui = &sps.*.vui
+    }
+    if reader.*.failed { return Status.corrupt }
+    s.*.flags.bits0 = flags
+    // Derived values.
+    sps.*.frameMbsOnly = frameMbsOnly
+    sps.*.widthInMbs = s.*.pic_width_in_mbs_minus1 + 1
+    sps.*.heightInMbs = (s.*.pic_height_in_map_units_minus1 + 1) * (if frameMbsOnly { 1 } else { 2 })
+    if sps.*.widthInMbs == 0 || sps.*.heightInMbs == 0 || sps.*.widthInMbs > 1024 || sps.*.heightInMbs > 1024 { return Status.corrupt }
+    // Cropping in samples (4:2:0: 2 per unit, times 2 vertically for
+    // frame_mbs_only 0).
+    var cropX: u32 = 2
+    var cropY: u32 = 2
+    if s.*.chroma_format_idc == 0 || s.*.chroma_format_idc == 3 {
+        cropX = 1
+        cropY = 1
+    } else if s.*.chroma_format_idc == 2 {
+        cropY = 1
+    }
+    if !frameMbsOnly { cropY *= 2 }
+    const fullWidth = sps.*.widthInMbs * 16
+    const fullHeight = sps.*.heightInMbs * 16
+    const cropped = (s.*.frame_crop_left_offset + s.*.frame_crop_right_offset) * cropX
+    const croppedY = (s.*.frame_crop_top_offset + s.*.frame_crop_bottom_offset) * cropY
+    if cropped >= fullWidth || croppedY >= fullHeight { return Status.corrupt }
+    sps.*.width = fullWidth - cropped
+    sps.*.height = fullHeight - croppedY
+    if s.*.log2_max_frame_num_minus4 > 12 || s.*.log2_max_pic_order_cnt_lsb_minus4 > 12 { return Status.corrupt }
+    sps.*.maxFrameNum = @intCast(u32, 1) << (@intCast(u32, s.*.log2_max_frame_num_minus4) + 4)
+    sps.*.maxPocLsb = @intCast(u32, 1) << (@intCast(u32, s.*.log2_max_pic_order_cnt_lsb_minus4) + 4)
+    var dpb = maxDpbMbs(level, constraints & 0x10 != 0) / (sps.*.widthInMbs * sps.*.heightInMbs)
+    if dpb > 16 { dpb = 16 }
+    if dpb < @intCast(u32, s.*.max_num_ref_frames) { dpb = @intCast(u32, s.*.max_num_ref_frames) }
+    if dpb == 0 { dpb = 1 }
+    sps.*.dpbFrames = dpb
+    sps.*.reorderFrames = dpb
+    if sps.*.vui.flags.bits0 & video.StdVideoH264SpsVuiFlags_bitstream_restriction_flag != 0 {
+        if sps.*.vui.max_dec_frame_buffering != 0 && @intCast(u32, sps.*.vui.max_dec_frame_buffering) <= 16 {
+            sps.*.dpbFrames = @intCast(u32, sps.*.vui.max_dec_frame_buffering)
+            if sps.*.dpbFrames < @intCast(u32, s.*.max_num_ref_frames) { sps.*.dpbFrames = @intCast(u32, s.*.max_num_ref_frames) }
+        }
+        sps.*.reorderFrames = @intCast(u32, sps.*.vui.max_num_reorder_frames)
+        if sps.*.reorderFrames > sps.*.dpbFrames { sps.*.reorderFrames = sps.*.dpbFrames }
+    } else if constraints & 0x80 != 0 || (profile == 66) {
+        // Baseline streams have no B frames: output at once.
+        sps.*.reorderFrames = 0
+    }
+    sps.*.present = true
+    return Status.ok
+}
+
+fn parseVui(reader: *Reader, sps: *Sps) -> Status {
+    const vui = &sps.*.vui
+    var flags: u32 = 0
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_aspect_ratio_info_present_flag
+        vui.*.aspect_ratio_idc = bits(reader, 8)
+        if vui.*.aspect_ratio_idc == 255 {
+            vui.*.sar_width = @intCast(u16, bits(reader, 16))
+            vui.*.sar_height = @intCast(u16, bits(reader, 16))
+        }
+    }
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_overscan_info_present_flag
+        if flag(reader) { flags |= video.StdVideoH264SpsVuiFlags_overscan_appropriate_flag }
+    }
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_video_signal_type_present_flag
+        vui.*.video_format = @intCast(u8, bits(reader, 3))
+        if flag(reader) { flags |= video.StdVideoH264SpsVuiFlags_video_full_range_flag }
+        if flag(reader) {
+            flags |= video.StdVideoH264SpsVuiFlags_color_description_present_flag
+            vui.*.colour_primaries = @intCast(u8, bits(reader, 8))
+            vui.*.transfer_characteristics = @intCast(u8, bits(reader, 8))
+            vui.*.matrix_coefficients = @intCast(u8, bits(reader, 8))
+        }
+    }
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_chroma_loc_info_present_flag
+        vui.*.chroma_sample_loc_type_top_field = @intCast(u8, ue(reader) & 255)
+        vui.*.chroma_sample_loc_type_bottom_field = @intCast(u8, ue(reader) & 255)
+    }
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_timing_info_present_flag
+        vui.*.num_units_in_tick = bits(reader, 32)
+        vui.*.time_scale = bits(reader, 32)
+        if flag(reader) { flags |= video.StdVideoH264SpsVuiFlags_fixed_frame_rate_flag }
+    }
+    var hrdPresent = false
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_nal_hrd_parameters_present_flag
+        hrdParameters(reader, &sps.*.hrd)
+        hrdPresent = true
+    }
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_vcl_hrd_parameters_present_flag
+        hrdParameters(reader, &sps.*.hrd)
+        hrdPresent = true
+    }
+    if hrdPresent {
+        _ = bits(reader, 1)
+        vui.*.pHrdParameters = &sps.*.hrd
+    }
+    _ = bits(reader, 1)
+    if flag(reader) {
+        flags |= video.StdVideoH264SpsVuiFlags_bitstream_restriction_flag
+        _ = bits(reader, 1)
+        _ = ue(reader)
+        _ = ue(reader)
+        _ = ue(reader)
+        _ = ue(reader)
+        vui.*.max_num_reorder_frames = @intCast(u8, ue(reader) & 255)
+        vui.*.max_dec_frame_buffering = @intCast(u8, ue(reader) & 255)
+    }
+    vui.*.flags.bits0 = flags
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn parsePps(h: *Decoder, reader: *Reader) -> Status {
+    const id = ue(reader)
+    const spsId = ue(reader)
+    if reader.*.failed || id >= @intCast(u32, MAX_PPS) || spsId >= @intCast(u32, MAX_SPS) { return Status.corrupt }
+    const pps = ppsAt(h, @intCast(usize, id))
+    unsafe { zeroBytes(@ptrCast([*]u8, pps), @sizeOf(Pps)) }
+    const p = &pps.*.std
+    p.*.pic_parameter_set_id = @intCast(u8, id)
+    p.*.seq_parameter_set_id = @intCast(u8, spsId)
+    pps.*.spsId = spsId
+    var flags: u32 = 0
+    if flag(reader) { flags |= video.StdVideoH264PpsFlags_entropy_coding_mode_flag }
+    if flag(reader) { flags |= video.StdVideoH264PpsFlags_bottom_field_pic_order_in_frame_present_flag }
+    pps.*.sliceGroups = ue(reader) + 1
+    if pps.*.sliceGroups > 1 {
+        // FMO/ASO: not in any profile the web uses.
+        return Status.unsupported
+    }
+    pps.*.numRefIdxActive0 = ue(reader) + 1
+    pps.*.numRefIdxActive1 = ue(reader) + 1
+    if pps.*.numRefIdxActive0 > 32 || pps.*.numRefIdxActive1 > 32 { return Status.corrupt }
+    p.*.num_ref_idx_l0_default_active_minus1 = @intCast(u8, pps.*.numRefIdxActive0 - 1)
+    p.*.num_ref_idx_l1_default_active_minus1 = @intCast(u8, pps.*.numRefIdxActive1 - 1)
+    if flag(reader) { flags |= video.StdVideoH264PpsFlags_weighted_pred_flag }
+    pps.*.weightedBipredIdc = bits(reader, 2)
+    p.*.weighted_bipred_idc = pps.*.weightedBipredIdc
+    p.*.pic_init_qp_minus26 = @intCast(i8, se(reader))
+    p.*.pic_init_qs_minus26 = @intCast(i8, se(reader))
+    p.*.chroma_qp_index_offset = @intCast(i8, se(reader))
+    if flag(reader) { flags |= video.StdVideoH264PpsFlags_deblocking_filter_control_present_flag }
+    if flag(reader) { flags |= video.StdVideoH264PpsFlags_constrained_intra_pred_flag }
+    if flag(reader) { flags |= video.StdVideoH264PpsFlags_redundant_pic_cnt_present_flag }
+    p.*.second_chroma_qp_index_offset = p.*.chroma_qp_index_offset
+    if moreData(reader) {
+        const transform8x8 = flag(reader)
+        if transform8x8 { flags |= video.StdVideoH264PpsFlags_transform_8x8_mode_flag }
+        if flag(reader) {
+            flags |= video.StdVideoH264PpsFlags_pic_scaling_matrix_present_flag
+            const sps = spsAt(h, @intCast(usize, spsId))
+            const chroma444 = sps.*.present && sps.*.std.chroma_format_idc == 3
+            var count: usize = 6
+            if transform8x8 { count += if chroma444 { 6 } else { 2 } }
+            scalingLists(reader, &pps.*.scaling, count)
+            p.*.pScalingLists = &pps.*.scaling
+        }
+        p.*.second_chroma_qp_index_offset = @intCast(i8, se(reader))
+    }
+    if reader.*.failed { return Status.corrupt }
+    p.*.flags.bits0 = flags
+    pps.*.present = true
+    return Status.ok
+}
+
+// ---- Slices ----
+
+pub const SLICE_P: u32 = 0
+pub const SLICE_B: u32 = 1
+pub const SLICE_I: u32 = 2
+
+const Mmco = struct {
+    op: u32
+    differenceOfPicNums: u32
+    longTermPicNum: u32
+    longTermFrameIdx: u32
+    maxLongTermFrameIdx: u32
+}
+
+pub const Slice = struct {
+    nalType: u8
+    refIdc: u8
+    firstMb: u32
+    sliceType: u32
+    ppsId: u32
+    frameNum: u32
+    fieldPic: bool
+    bottomField: bool
+    idrPicId: u32
+    pocLsb: u32
+    deltaPocBottom: i32
+    deltaPoc0: i32
+    deltaPoc1: i32
+    redundantPicCnt: u32
+    // dec_ref_pic_marking.
+    noOutputOfPriorPics: bool
+    longTermReference: bool
+    adaptiveMarking: bool
+    mmcoCount: usize
+    mmco: [MAX_MMCO]Mmco
+}
+
+fn parseSliceHeader(h: *Decoder, reader: *Reader, nal: *Nal, slice: *Slice) -> Status {
+    slice.*.nalType = nal.*.kind
+    slice.*.refIdc = nal.*.refIdc
+    slice.*.firstMb = ue(reader)
+    slice.*.sliceType = ue(reader) % 5
+    slice.*.ppsId = ue(reader)
+    if reader.*.failed || slice.*.ppsId >= @intCast(u32, MAX_PPS) { return Status.corrupt }
+    const pps = ppsAt(h, @intCast(usize, slice.*.ppsId))
+    if !pps.*.present { return Status.corrupt }
+    const sps = spsAt(h, @intCast(usize, pps.*.spsId))
+    if !sps.*.present { return Status.corrupt }
+    if sps.*.std.flags.bits0 & video.StdVideoH264SpsFlags_separate_colour_plane_flag != 0 { _ = bits(reader, 2) }
+    slice.*.frameNum = bits(reader, @intCast(u32, sps.*.std.log2_max_frame_num_minus4) + 4)
+    slice.*.fieldPic = false
+    slice.*.bottomField = false
+    if !sps.*.frameMbsOnly {
+        slice.*.fieldPic = flag(reader)
+        if slice.*.fieldPic {
+            slice.*.bottomField = flag(reader)
+            return Status.unsupported
+        }
+    }
+    slice.*.idrPicId = 0
+    if nal.*.kind == NAL_SLICE_IDR { slice.*.idrPicId = ue(reader) }
+    slice.*.pocLsb = 0
+    slice.*.deltaPocBottom = 0
+    slice.*.deltaPoc0 = 0
+    slice.*.deltaPoc1 = 0
+    const bottomInFrame = pps.*.std.flags.bits0 & video.StdVideoH264PpsFlags_bottom_field_pic_order_in_frame_present_flag != 0
+    if sps.*.std.pic_order_cnt_type == 0 {
+        slice.*.pocLsb = bits(reader, @intCast(u32, sps.*.std.log2_max_pic_order_cnt_lsb_minus4) + 4)
+        if bottomInFrame { slice.*.deltaPocBottom = se(reader) }
+    } else if sps.*.std.pic_order_cnt_type == 1 && sps.*.std.flags.bits0 & video.StdVideoH264SpsFlags_delta_pic_order_always_zero_flag == 0 {
+        slice.*.deltaPoc0 = se(reader)
+        if bottomInFrame { slice.*.deltaPoc1 = se(reader) }
+    }
+    slice.*.redundantPicCnt = 0
+    if pps.*.std.flags.bits0 & video.StdVideoH264PpsFlags_redundant_pic_cnt_present_flag != 0 { slice.*.redundantPicCnt = ue(reader) }
+    var active0 = pps.*.numRefIdxActive0
+    var active1 = pps.*.numRefIdxActive1
+    if slice.*.sliceType == SLICE_B { _ = bits(reader, 1) }
+    if slice.*.sliceType == SLICE_P || slice.*.sliceType == 3 || slice.*.sliceType == SLICE_B {
+        if flag(reader) {
+            active0 = ue(reader) + 1
+            if slice.*.sliceType == SLICE_B { active1 = ue(reader) + 1 }
+        }
+    }
+    if active0 > 32 || active1 > 32 { return Status.corrupt }
+    // ref_pic_list_modification.
+    if slice.*.sliceType != SLICE_I && slice.*.sliceType != 4 {
+        var list: usize = 0
+        const lists: usize = if slice.*.sliceType == SLICE_B { 2 } else { 1 }
+        while list < lists {
+            if flag(reader) {
+                var guard: usize = 0
+                while guard < 66 {
+                    const idc = ue(reader)
+                    if idc == 3 || reader.*.failed { break }
+                    _ = ue(reader)
+                    guard += 1
+                }
+            }
+            list += 1
+        }
+    }
+    // pred_weight_table.
+    const weightedPred = pps.*.std.flags.bits0 & video.StdVideoH264PpsFlags_weighted_pred_flag != 0
+    if (weightedPred && (slice.*.sliceType == SLICE_P || slice.*.sliceType == 3)) || (pps.*.weightedBipredIdc == 1 && slice.*.sliceType == SLICE_B) {
+        _ = ue(reader)
+        if sps.*.std.chroma_format_idc != 0 { _ = ue(reader) }
+        var list: usize = 0
+        const lists: usize = if slice.*.sliceType == SLICE_B { 2 } else { 1 }
+        while list < lists {
+            const count = if list == 0 { active0 } else { active1 }
+            var index: u32 = 0
+            while index < count {
+                if flag(reader) {
+                    _ = se(reader)
+                    _ = se(reader)
+                }
+                if sps.*.std.chroma_format_idc != 0 {
+                    if flag(reader) {
+                        _ = se(reader)
+                        _ = se(reader)
+                        _ = se(reader)
+                        _ = se(reader)
+                    }
+                }
+                index += 1
+            }
+            list += 1
+        }
+    }
+    // dec_ref_pic_marking.
+    slice.*.noOutputOfPriorPics = false
+    slice.*.longTermReference = false
+    slice.*.adaptiveMarking = false
+    slice.*.mmcoCount = 0
+    if nal.*.refIdc != 0 {
+        if nal.*.kind == NAL_SLICE_IDR {
+            slice.*.noOutputOfPriorPics = flag(reader)
+            slice.*.longTermReference = flag(reader)
+        } else {
+            slice.*.adaptiveMarking = flag(reader)
+            if slice.*.adaptiveMarking {
+                while slice.*.mmcoCount < MAX_MMCO {
+                    const op = ue(reader)
+                    if op == 0 || reader.*.failed { break }
+                    const entry = &slice.*.mmco[slice.*.mmcoCount]
+                    entry.*.op = op
+                    entry.*.differenceOfPicNums = 0
+                    entry.*.longTermPicNum = 0
+                    entry.*.longTermFrameIdx = 0
+                    entry.*.maxLongTermFrameIdx = 0
+                    if op == 1 || op == 3 { entry.*.differenceOfPicNums = ue(reader) + 1 }
+                    if op == 2 { entry.*.longTermPicNum = ue(reader) }
+                    if op == 3 || op == 6 { entry.*.longTermFrameIdx = ue(reader) }
+                    if op == 4 { entry.*.maxLongTermFrameIdx = ue(reader) }
+                    slice.*.mmcoCount += 1
+                }
+            }
+        }
+    }
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+// ---- The decoded picture buffer ----
+
+const Frame = struct {
+    used: bool
+    frameNum: u32
+    frameNumWrap: i32
+    poc: i32
+    topPoc: i32
+    bottomPoc: i32
+    isReference: bool
+    isLongTerm: bool
+    longTermFrameIdx: u32
+    neededForOutput: bool
+    // A frame made for a gap in frame_num: never output.
+    nonExisting: bool
+}
+
+// What a decoder needs for the current picture.
+pub const Picture = struct {
+    slot: usize
+    spsId: u32
+    ppsId: u32
+    width: u32
+    height: u32
+    isIdr: bool
+    isReference: bool
+    poc: i32
+    info: video.StdVideoDecodeH264PictureInfo
+    referenceCount: usize
+    referenceSlots: [DPB_SIZE]usize
+    references: [DPB_SIZE]video.StdVideoDecodeH264ReferenceInfo
+    sliceCount: usize
+    // Each slice NAL's offset within the access unit's bytes, and its
+    // length (the NAL unit with its header byte).
+    sliceOffsets: [MAX_SLICES]u32
+    sliceLengths: [MAX_SLICES]u32
+}
+
+pub const Decoder = struct {
+    allocator: Allocator
+    sps: [MAX_SPS]Sps
+    pps: [MAX_PPS]Pps
+    reader: Reader
+    slice: Slice
+    frames: [SLOTS]Frame
+    picture: Picture
+    inPicture: bool
+    flushing: bool
+    // POC state (8.2.1).
+    prevPocMsb: i32
+    prevPocLsb: u32
+    prevFrameNumOffset: u32
+    prevFrameNum: u32
+    prevRefFrameNum: u32
+    prevHadMmco5: bool
+    // The SPS in force.
+    activeSps: usize
+    dpbFrames: u32
+    reorderFrames: u32
+    // Pictures decoded (statistics).
+    decoded: u64
+}
+
+pub fn create(allocator: Allocator) -> ?*Decoder {
+    const memory = allocator.alloc(@sizeOf(Decoder), 16)
+    if memory == null { return null }
+    var h: *Decoder = undefined
+    unsafe { h = @ptrCast(*Decoder, memory.?) }
+    unsafe { zeroBytes(@ptrCast([*]u8, h), @sizeOf(Decoder)) }
+    h.*.allocator = allocator
+    h.*.activeSps = MAX_SPS
+    h.*.dpbFrames = 1
+    return h
+}
+
+pub fn destroy(h: *Decoder) -> void {
+    unsafe { h.*.allocator.free(@ptrCast([*]u8, h), @sizeOf(Decoder), 16) }
+}
+
+pub fn spsAt(h: *Decoder, id: usize) -> *Sps {
+    unsafe { return @ptrCast(*Sps, &h.*.sps[id]) }
+}
+
+pub fn ppsAt(h: *Decoder, id: usize) -> *Pps {
+    unsafe { return @ptrCast(*Pps, &h.*.pps[id]) }
+}
+
+// Reads one NAL unit of parameter sets (an avcC entry, without a start
+// code or length) or any NAL unit: SPS and PPS are kept, others ignored.
+pub fn parameterSet(h: *Decoder, bytes: [*]const u8, length: usize) -> Status {
+    if length < 2 { return Status.corrupt }
+    var nal: Nal = undefined
+    nal.offset = 0
+    nal.length = length
+    nal.kind = bytes[0] & 31
+    nal.refIdc = (bytes[0] >> 5) & 3
+    return readNal(h, bytes, &nal)
+}
+
+fn readNal(h: *Decoder, bytes: [*]const u8, nal: *Nal) -> Status {
+    if nal.*.kind == NAL_SPS {
+        load(&h.*.reader, &bytes[nal.*.offset], nal.*.length)
+        return parseSps(h, &h.*.reader)
+    }
+    if nal.*.kind == NAL_PPS {
+        load(&h.*.reader, &bytes[nal.*.offset], nal.*.length)
+        return parsePps(h, &h.*.reader)
+    }
+    return Status.ok
+}
+
+// Reads an access unit (one picture's NAL units: an MP4 sample with
+// `prefix`-byte lengths, or an Annex B piece with prefix 0): parameter
+// sets are kept, the slices make h.picture. finishPicture() follows
+// once the picture is decoded.
+pub fn accessUnit(h: *Decoder, bytes: [*]const u8, length: usize, prefix: usize) -> Status {
+    var at: usize = 0
+    var nal: Nal = undefined
+    var sawSlice = false
+    h.*.picture.sliceCount = 0
+    while true {
+        var more = false
+        if prefix == 0 {
+            more = nextAnnexB(bytes, length, &at, &nal)
+        } else {
+            more = nextPrefixed(bytes, length, prefix, &at, &nal)
+        }
+        if !more { break }
+        if nal.kind == NAL_SLICE || nal.kind == NAL_SLICE_IDR {
+            if !sawSlice {
+                load(&h.*.reader, &bytes[nal.offset], nal.length)
+                const status = parseSliceHeader(h, &h.*.reader, &nal, &h.*.slice)
+                if status != Status.ok { return status }
+                if h.*.slice.redundantPicCnt != 0 { continue }
+                const started = beginPicture(h)
+                if started != Status.ok { return started }
+                sawSlice = true
+            }
+            if h.*.picture.sliceCount < MAX_SLICES {
+                h.*.picture.sliceOffsets[h.*.picture.sliceCount] = @intCast(u32, nal.offset)
+                h.*.picture.sliceLengths[h.*.picture.sliceCount] = @intCast(u32, nal.length)
+                h.*.picture.sliceCount += 1
+            }
+        } else {
+            const status = readNal(h, bytes, &nal)
+            if status != Status.ok && status != Status.unsupported { return status }
+        }
+    }
+    if !sawSlice { return Status.empty }
+    return Status.ok
+}
+
+fn freeSlot(h: *Decoder) -> usize {
+    var slot: usize = 0
+    while slot < SLOTS {
+        if !h.*.frames[slot].used { return slot }
+        slot += 1
+    }
+    return SLOTS
+}
+
+// Outputs (marks as output) the waiting frame with the smallest POC;
+// false when none waits. The slot is freed when the frame is no
+// reference any more.
+fn bump(h: *Decoder, slot: *usize, poc: *i32) -> bool {
+    var best: usize = SLOTS
+    var index: usize = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.neededForOutput && (best == SLOTS || frame.*.poc < h.*.frames[best].poc) { best = index }
+        index += 1
+    }
+    if best == SLOTS { return false }
+    h.*.frames[best].neededForOutput = false
+    slot.* = best
+    poc.* = h.*.frames[best].poc
+    if !h.*.frames[best].isReference { h.*.frames[best].used = false }
+    return true
+}
+
+fn waitingForOutput(h: *Decoder) -> u32 {
+    var count: u32 = 0
+    var index: usize = 0
+    while index < SLOTS {
+        if h.*.frames[index].used && h.*.frames[index].neededForOutput { count += 1 }
+        index += 1
+    }
+    return count
+}
+
+fn fullness(h: *Decoder) -> u32 {
+    var count: u32 = 0
+    var index: usize = 0
+    while index < SLOTS {
+        if h.*.frames[index].used { count += 1 }
+        index += 1
+    }
+    return count
+}
+
+// The next frame to present, in output order: its slot and POC. False
+// when none is due yet (the decoder holds frames back for reordering);
+// after flush() every frame comes out. A slot given out that is no
+// reference any more is reused by the next accessUnit(): present (copy)
+// it first.
+pub fn nextOutput(h: *Decoder, slot: *usize, poc: *i32) -> bool {
+    if h.*.flushing || waitingForOutput(h) > h.*.reorderFrames || fullness(h) > h.*.dpbFrames {
+        if bump(h, slot, poc) { return true }
+    }
+    return false
+}
+
+// At the end of the stream: every frame is output (nextOutput), and the
+// references are dropped.
+pub fn flush(h: *Decoder) -> void {
+    h.*.flushing = true
+}
+
+fn removeAll(h: *Decoder) -> void {
+    var index: usize = 0
+    while index < SLOTS {
+        h.*.frames[index].isReference = false
+        h.*.frames[index].isLongTerm = false
+        if !h.*.frames[index].neededForOutput { h.*.frames[index].used = false }
+        index += 1
+    }
+}
+
+// Starts the picture described by h.slice: POC, a slot, the reference
+// list for the decoder, frame_num gaps filled.
+fn beginPicture(h: *Decoder) -> Status {
+    const slice = &h.*.slice
+    const pps = ppsAt(h, @intCast(usize, slice.*.ppsId))
+    const spsId = @intCast(usize, pps.*.spsId)
+    const sps = spsAt(h, spsId)
+    const isIdr = slice.*.nalType == NAL_SLICE_IDR
+    if h.*.flushing {
+        h.*.flushing = false
+    }
+    if h.*.activeSps != spsId || isIdr {
+        if h.*.activeSps != spsId {
+            // A new sequence: everything out, then empty.
+            var index: usize = 0
+            while index < SLOTS {
+                if h.*.frames[index].used {
+                    h.*.frames[index].isReference = false
+                    h.*.frames[index].isLongTerm = false
+                }
+                index += 1
+            }
+            h.*.activeSps = spsId
+            h.*.dpbFrames = sps.*.dpbFrames
+            h.*.reorderFrames = sps.*.reorderFrames
+        }
+    }
+    if isIdr {
+        // All references gone; prior pictures output unless told not to.
+        var index: usize = 0
+        while index < SLOTS {
+            const frame = &h.*.frames[index]
+            if frame.*.used {
+                frame.*.isReference = false
+                frame.*.isLongTerm = false
+                if slice.*.noOutputOfPriorPics || frame.*.nonExisting {
+                    frame.*.used = false
+                } else if !frame.*.neededForOutput {
+                    frame.*.used = false
+                }
+            }
+            index += 1
+        }
+        // Those still waiting are output before the IDR (reorderFrames
+        // of 0 for the moment: nextOutput gives them first since their
+        // POC is remade below... they keep their old POC; IDR's is 0).
+        // To keep order, offset them: every waiting frame's POC is made
+        // far below 0.
+        index = 0
+        while index < SLOTS {
+            if h.*.frames[index].used && h.*.frames[index].neededForOutput { h.*.frames[index].poc -= 1073741824 }
+            index += 1
+        }
+        h.*.prevRefFrameNum = 0
+    } else if sps.*.std.flags.bits0 & video.StdVideoH264SpsFlags_gaps_in_frame_num_value_allowed_flag != 0 {
+        // Frames missing between the previous reference frame and this
+        // one are made as non-existing short-term references (8.2.5.2).
+        var expected = (h.*.prevRefFrameNum + 1) % sps.*.maxFrameNum
+        var guard: u32 = 0
+        while slice.*.frameNum != h.*.prevRefFrameNum && expected != slice.*.frameNum && guard < 64 {
+            // Sliding window, then a frame with frame_num `expected`.
+            slidingWindow(h, sps)
+            const slot = freeSlot(h)
+            if slot < SLOTS {
+                const frame = &h.*.frames[slot]
+                frame.*.used = true
+                frame.*.frameNum = expected
+                frame.*.poc = 0
+                frame.*.topPoc = 0
+                frame.*.bottomPoc = 0
+                frame.*.isReference = true
+                frame.*.isLongTerm = false
+                frame.*.neededForOutput = false
+                frame.*.nonExisting = true
+            }
+            h.*.prevRefFrameNum = expected
+            h.*.prevFrameNum = expected
+            // POC type 1 and 2 state follows frame_num.
+            expected = (expected + 1) % sps.*.maxFrameNum
+            guard += 1
+        }
+    }
+    // Picture order count (8.2.1), frames only.
+    var topPoc: i32 = 0
+    var bottomPoc: i32 = 0
+    const pocType = sps.*.std.pic_order_cnt_type
+    if pocType == 0 {
+        if isIdr {
+            h.*.prevPocMsb = 0
+            h.*.prevPocLsb = 0
+        }
+        const maxLsb = @intCast(i32, sps.*.maxPocLsb)
+        const lsb = @intCast(i32, slice.*.pocLsb)
+        const prevLsb = @intCast(i32, h.*.prevPocLsb)
+        var msb: i32 = h.*.prevPocMsb
+        if lsb < prevLsb && prevLsb - lsb >= maxLsb / 2 {
+            msb = h.*.prevPocMsb + maxLsb
+        } else if lsb > prevLsb && lsb - prevLsb > maxLsb / 2 {
+            msb = h.*.prevPocMsb - maxLsb
+        }
+        topPoc = msb + lsb
+        bottomPoc = topPoc + slice.*.deltaPocBottom
+        if slice.*.refIdc != 0 {
+            h.*.prevPocMsb = msb
+            h.*.prevPocLsb = slice.*.pocLsb
+        }
+    } else {
+        var frameNumOffset: u32 = 0
+        if isIdr {
+            frameNumOffset = 0
+        } else if h.*.prevFrameNum > slice.*.frameNum {
+            frameNumOffset = h.*.prevFrameNumOffset + sps.*.maxFrameNum
+        } else {
+            frameNumOffset = h.*.prevFrameNumOffset
+        }
+        if pocType == 1 {
+            const cycle = @intCast(u32, sps.*.std.num_ref_frames_in_pic_order_cnt_cycle)
+            var absFrameNum: u32 = 0
+            if cycle != 0 { absFrameNum = frameNumOffset + slice.*.frameNum }
+            if slice.*.refIdc == 0 && absFrameNum > 0 { absFrameNum -= 1 }
+            var expectedPoc: i32 = 0
+            if absFrameNum > 0 {
+                const cycleCount = (absFrameNum - 1) / cycle
+                const inCycle = (absFrameNum - 1) % cycle
+                var expectedDelta: i32 = 0
+                var index: usize = 0
+                while index < @intCast(usize, cycle) {
+                    expectedDelta += sps.*.offsetForRefFrame[index]
+                    index += 1
+                }
+                expectedPoc = @intCast(i32, cycleCount) * expectedDelta
+                index = 0
+                while index <= @intCast(usize, inCycle) {
+                    expectedPoc += sps.*.offsetForRefFrame[index]
+                    index += 1
+                }
+            }
+            if slice.*.refIdc == 0 { expectedPoc += sps.*.std.offset_for_non_ref_pic }
+            topPoc = expectedPoc + slice.*.deltaPoc0
+            bottomPoc = topPoc + sps.*.std.offset_for_top_to_bottom_field + slice.*.deltaPoc1
+        } else {
+            var temp: i32 = 0
+            if !isIdr {
+                temp = 2 * @intCast(i32, frameNumOffset + slice.*.frameNum)
+                if slice.*.refIdc == 0 { temp -= 1 }
+            }
+            topPoc = temp
+            bottomPoc = temp
+        }
+        h.*.prevFrameNumOffset = frameNumOffset
+    }
+    h.*.prevFrameNum = slice.*.frameNum
+    const poc = if topPoc < bottomPoc { topPoc } else { bottomPoc }
+    // A slot for the picture.
+    const slot = freeSlot(h)
+    if slot >= SLOTS { return Status.corrupt }
+    const picture = &h.*.picture
+    picture.*.slot = slot
+    picture.*.spsId = @intCast(u32, spsId)
+    picture.*.ppsId = slice.*.ppsId
+    picture.*.width = sps.*.width
+    picture.*.height = sps.*.height
+    picture.*.isIdr = isIdr
+    picture.*.isReference = slice.*.refIdc != 0
+    picture.*.poc = poc
+    var flags: u32 = 0
+    if slice.*.sliceType == SLICE_I || slice.*.sliceType == 4 { flags |= video.StdVideoDecodeH264PictureInfoFlags_is_intra }
+    if isIdr { flags |= video.StdVideoDecodeH264PictureInfoFlags_IdrPicFlag }
+    if slice.*.refIdc != 0 { flags |= video.StdVideoDecodeH264PictureInfoFlags_is_reference }
+    picture.*.info.flags.bits0 = flags
+    picture.*.info.seq_parameter_set_id = @intCast(u8, spsId)
+    picture.*.info.pic_parameter_set_id = @intCast(u8, slice.*.ppsId)
+    picture.*.info.reserved1 = 0
+    picture.*.info.reserved2 = 0
+    picture.*.info.frame_num = @intCast(u16, slice.*.frameNum)
+    picture.*.info.idr_pic_id = @intCast(u16, slice.*.idrPicId)
+    picture.*.info.PicOrderCnt[0] = topPoc
+    picture.*.info.PicOrderCnt[1] = bottomPoc
+    // The references: every reference frame in the DPB.
+    picture.*.referenceCount = 0
+    var index: usize = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.isReference && index != slot && picture.*.referenceCount < DPB_SIZE {
+            const at = picture.*.referenceCount
+            picture.*.referenceSlots[at] = index
+            var referenceFlags: u32 = video.StdVideoDecodeH264ReferenceInfoFlags_used_for_long_term_reference
+            if !frame.*.isLongTerm { referenceFlags = 0 }
+            if frame.*.nonExisting { referenceFlags |= video.StdVideoDecodeH264ReferenceInfoFlags_is_non_existing }
+            picture.*.references[at].flags.bits0 = referenceFlags
+            picture.*.references[at].FrameNum = @intCast(u16, if frame.*.isLongTerm { frame.*.longTermFrameIdx } else { frame.*.frameNum })
+            picture.*.references[at].reserved = 0
+            picture.*.references[at].PicOrderCnt[0] = frame.*.topPoc
+            picture.*.references[at].PicOrderCnt[1] = frame.*.bottomPoc
+            picture.*.referenceCount += 1
+        }
+        index += 1
+    }
+    const frame = &h.*.frames[slot]
+    frame.*.used = true
+    frame.*.frameNum = slice.*.frameNum
+    frame.*.poc = poc
+    frame.*.topPoc = topPoc
+    frame.*.bottomPoc = bottomPoc
+    frame.*.isReference = false
+    frame.*.isLongTerm = false
+    frame.*.longTermFrameIdx = 0
+    frame.*.neededForOutput = false
+    frame.*.nonExisting = false
+    h.*.inPicture = true
+    return Status.ok
+}
+
+fn slidingWindow(h: *Decoder, sps: *Sps) -> void {
+    var shortTerm: u32 = 0
+    var longTerm: u32 = 0
+    var index: usize = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.isReference && index != h.*.picture.slot {
+            if frame.*.isLongTerm { longTerm += 1 } else { shortTerm += 1 }
+        }
+        index += 1
+    }
+    var maxRefs = @intCast(u32, sps.*.std.max_num_ref_frames)
+    if maxRefs == 0 { maxRefs = 1 }
+    while shortTerm > 0 && shortTerm + longTerm >= maxRefs {
+        // The short-term reference with the smallest FrameNumWrap.
+        var oldest: usize = SLOTS
+        index = 0
+        while index < SLOTS {
+            const frame = &h.*.frames[index]
+            if frame.*.used && frame.*.isReference && !frame.*.isLongTerm && index != h.*.picture.slot {
+                if oldest == SLOTS || frame.*.frameNumWrap < h.*.frames[oldest].frameNumWrap { oldest = index }
+            }
+            index += 1
+        }
+        if oldest == SLOTS { break }
+        h.*.frames[oldest].isReference = false
+        if !h.*.frames[oldest].neededForOutput { h.*.frames[oldest].used = false }
+        shortTerm -= 1
+    }
+}
+
+// FrameNumWrap and PicNum of every short-term reference, for the
+// current frame_num (8.2.4.1).
+fn computeWraps(h: *Decoder, sps: *Sps, frameNum: u32) -> void {
+    var index: usize = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.isReference && !frame.*.isLongTerm {
+            if frame.*.frameNum > frameNum {
+                frame.*.frameNumWrap = @intCast(i32, frame.*.frameNum) - @intCast(i32, sps.*.maxFrameNum)
+            } else {
+                frame.*.frameNumWrap = @intCast(i32, frame.*.frameNum)
+            }
+        }
+        index += 1
+    }
+}
+
+// After the picture is decoded: reference marking (8.2.5) and the frame
+// made available for output.
+pub fn finishPicture(h: *Decoder) -> void {
+    if !h.*.inPicture { return }
+    h.*.inPicture = false
+    const slice = &h.*.slice
+    const pps = ppsAt(h, @intCast(usize, slice.*.ppsId))
+    const sps = spsAt(h, @intCast(usize, pps.*.spsId))
+    const slot = h.*.picture.slot
+    const frame = &h.*.frames[slot]
+    h.*.decoded += 1
+    computeWraps(h, sps, slice.*.frameNum)
+    var hadMmco5 = false
+    if slice.*.refIdc != 0 {
+        if slice.*.nalType == NAL_SLICE_IDR {
+            frame.*.isReference = true
+            frame.*.isLongTerm = slice.*.longTermReference
+            frame.*.longTermFrameIdx = 0
+        } else if slice.*.adaptiveMarking {
+            var index: usize = 0
+            while index < slice.*.mmcoCount {
+                const op = slice.*.mmco[index]
+                if op.op == 1 {
+                    const picNum = @intCast(i32, slice.*.frameNum) - @intCast(i32, op.differenceOfPicNums)
+                    unmarkShortTerm(h, picNum)
+                } else if op.op == 2 {
+                    unmarkLongTerm(h, op.longTermPicNum)
+                } else if op.op == 3 {
+                    const picNum = @intCast(i32, slice.*.frameNum) - @intCast(i32, op.differenceOfPicNums)
+                    unmarkLongTermIdx(h, op.longTermFrameIdx, slot)
+                    var j: usize = 0
+                    while j < SLOTS {
+                        const candidate = &h.*.frames[j]
+                        if candidate.*.used && candidate.*.isReference && !candidate.*.isLongTerm && candidate.*.frameNumWrap == picNum && j != slot {
+                            candidate.*.isLongTerm = true
+                            candidate.*.longTermFrameIdx = op.longTermFrameIdx
+                        }
+                        j += 1
+                    }
+                } else if op.op == 4 {
+                    var j: usize = 0
+                    while j < SLOTS {
+                        const candidate = &h.*.frames[j]
+                        if candidate.*.used && candidate.*.isReference && candidate.*.isLongTerm && (op.maxLongTermFrameIdx == 0 || candidate.*.longTermFrameIdx >= op.maxLongTermFrameIdx - 1) {
+                            candidate.*.isReference = false
+                            if !candidate.*.neededForOutput { candidate.*.used = false }
+                        }
+                        j += 1
+                    }
+                } else if op.op == 5 {
+                    var j: usize = 0
+                    while j < SLOTS {
+                        if j != slot {
+                            const candidate = &h.*.frames[j]
+                            candidate.*.isReference = false
+                            candidate.*.isLongTerm = false
+                            if candidate.*.used && !candidate.*.neededForOutput { candidate.*.used = false }
+                        }
+                        j += 1
+                    }
+                    hadMmco5 = true
+                } else if op.op == 6 {
+                    unmarkLongTermIdx(h, op.longTermFrameIdx, slot)
+                    frame.*.isLongTerm = true
+                    frame.*.longTermFrameIdx = op.longTermFrameIdx
+                }
+                index += 1
+            }
+            frame.*.isReference = true
+        } else {
+            slidingWindow(h, sps)
+            frame.*.isReference = true
+        }
+        h.*.prevRefFrameNum = slice.*.frameNum
+    }
+    if hadMmco5 {
+        // The picture counts as frame_num 0 and POC relative to itself.
+        const top = frame.*.topPoc
+        frame.*.topPoc = 0
+        frame.*.bottomPoc = frame.*.bottomPoc - top
+        frame.*.poc = if frame.*.topPoc < frame.*.bottomPoc { frame.*.topPoc } else { frame.*.bottomPoc }
+        frame.*.frameNum = 0
+        h.*.prevRefFrameNum = 0
+        h.*.prevFrameNum = 0
+        h.*.prevFrameNumOffset = 0
+        h.*.prevPocMsb = 0
+        h.*.prevPocLsb = 0
+        // Everything else is output first.
+        var j: usize = 0
+        while j < SLOTS {
+            if j != slot && h.*.frames[j].used && h.*.frames[j].neededForOutput { h.*.frames[j].poc -= 1073741824 }
+            j += 1
+        }
+    }
+    frame.*.neededForOutput = true
+}
+
+fn unmarkShortTerm(h: *Decoder, picNum: i32) -> void {
+    var j: usize = 0
+    while j < SLOTS {
+        const candidate = &h.*.frames[j]
+        if candidate.*.used && candidate.*.isReference && !candidate.*.isLongTerm && candidate.*.frameNumWrap == picNum && j != h.*.picture.slot {
+            candidate.*.isReference = false
+            if !candidate.*.neededForOutput { candidate.*.used = false }
+        }
+        j += 1
+    }
+}
+
+fn unmarkLongTerm(h: *Decoder, longTermPicNum: u32) -> void {
+    var j: usize = 0
+    while j < SLOTS {
+        const candidate = &h.*.frames[j]
+        if candidate.*.used && candidate.*.isReference && candidate.*.isLongTerm && candidate.*.longTermFrameIdx == longTermPicNum && j != h.*.picture.slot {
+            candidate.*.isReference = false
+            if !candidate.*.neededForOutput { candidate.*.used = false }
+        }
+        j += 1
+    }
+}
+
+fn unmarkLongTermIdx(h: *Decoder, idx: u32, except: usize) -> void {
+    var j: usize = 0
+    while j < SLOTS {
+        const candidate = &h.*.frames[j]
+        if j != except && candidate.*.used && candidate.*.isReference && candidate.*.isLongTerm && candidate.*.longTermFrameIdx == idx {
+            candidate.*.isReference = false
+            if !candidate.*.neededForOutput { candidate.*.used = false }
+        }
+        j += 1
+    }
+}
+
+// Frees the slot of a frame that was output and is no reference (the
+// caller presented it); frames still referenced stay.
+pub fn releaseSlot(h: *Decoder, slot: usize) -> void {
+    if slot >= SLOTS { return }
+    const frame = &h.*.frames[slot]
+    if frame.*.used && !frame.*.isReference && !frame.*.neededForOutput { frame.*.used = false }
+}

@@ -83,6 +83,14 @@ quarter-size FFT) from an AudioSpecificConfig or ADTS; HE-AAC's SBR is
 read past (test 417, against the WAV a Chromium test sound was encoded
 from). `aac/tables.mlx` holds the standard's codebooks and band tables.
 
+`h264.mlx` (`std.h264`) reads H.264 streams for a decoder that is given
+whole pictures (the GPU's through Vulkan video, or a software one):
+NAL units in Annex B or length-prefixed framing, SPS and PPS into the
+Vulkan video registry's structures (`std.vulkan.video`), slice headers,
+and the process around pictures: picture order counts, reference
+marking (sliding window and MMCO), the decoded picture buffer's slots
+and the output order (test 418 on WebKit's test.mp4). Frames only.
+
 `flate/gzip.mlx` (`std.flate.gzip`) reads and writes gzip files in
 pieces for Mlx programs, what zlib's gz* functions do (test 385).
 

@@ -58,6 +58,8 @@
 #                                       their tracks, samples and codec data
 #   tests/417_aac_decode_runtime.mlx    std.aac: AAC-LC from MP4 and ADTS against
 #                                       the WAV it was encoded from
+#   tests/418_h264_stream_runtime.mlx   std.h264: parameter sets, pictures, the
+#                                       DPB's output order (WebKit's test.mp4)
 #   tests/367_webp_decode_runtime.mlx   std.webp's decoders: lossy, lossless,
 #                                       alpha, animation (demuxer), rows
 #                                       done incrementally, damage; the
@@ -161,6 +163,7 @@ run 390_heap_runtime "the program's heap: one wherever it is asked for, in the s
 run 392_demangle_runtime "C++ names as c++filt writes them (g++'s and clang++'s manglings) and mlx-cc's own spellings; names it cannot read; a cut text"
 run 410_crypto_rsa_sizes_runtime "RSA keys of any size: a 64-bit modulus, 512 bits made and verified in its frame, 4160 bits (numbers and work on the heap) signed, verified and OAEP both ways, d alone, three primes; out of range refused"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
+run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
 run 417_aac_decode_runtime "AAC-LC decoded from an MP4 and an ADTS stream, each within 15 dB of the WAV it was encoded from; damaged blocks refused; reset"
 run 416_mp4_demux_runtime "MP4 files read: a plain file's sample tables (chunks, composition offsets, sync samples, an edit list, seeking), fragments (trex defaults, tfdt, trun flags, one without tfdt), avcC parameter sets and Annex B, AudioSpecificConfig, a fragment cut short, damage"
 
