@@ -67,7 +67,7 @@ public:
     // A track of a source buffer's initialization segment: the player
     // plays the first video and the first audio track it is given.
     TrackID allocateTrackID() { return ++m_lastTrackID; }
-    void addSourceTrack(TrackID, bool isVideo, uint32_t timescale, uint64_t editMediaTime, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize&);
+    void addSourceTrack(TrackID, bool isVideo, uint32_t timescale, uint64_t editMediaTime, uint32_t nalLengthSize, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize&);
     const Logger& logger() const;
     uint64_t nextLogIdentifier() { return ++m_lastLogIdentifier; }
 #endif
@@ -127,6 +127,8 @@ private:
         uint32_t timescale { 1 };
         uint32_t codec { 0 };
         uint64_t editMediaTime { 0 };
+        // The bytes of length before each NAL unit of a video sample.
+        uint32_t nalLengthSize { 4 };
     };
 
     void fileLoaded();

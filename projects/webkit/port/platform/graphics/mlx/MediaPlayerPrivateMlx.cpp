@@ -280,7 +280,7 @@ const Logger& MediaPlayerPrivateMlx::logger() const
     return m_logger;
 }
 
-void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t timescale, uint64_t editMediaTime, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize& size)
+void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t timescale, uint64_t editMediaTime, uint32_t nalLengthSize, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize& size)
 {
     Track track;
     track.index = 0;
@@ -291,6 +291,7 @@ void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t ti
         if (m_videoTrack)
             return;
         track.codec = MLXWEB_MEDIA_H264;
+        track.nalLengthSize = nalLengthSize ? nalLengthSize : 4;
         m_videoTrack = track;
         m_naturalSize = size;
         Locker locker { m_decoderLock };
@@ -460,6 +461,8 @@ void MediaPlayerPrivateMlx::configureFromDemuxer()
         if (trackDuration > duration)
             duration = trackDuration;
         if (kind == MLXWEB_MEDIA_VIDEO && track.codec == MLXWEB_MEDIA_H264 && !m_videoTrack) {
+            auto nalLengthSize = mlxweb_media_track_nal_length_size(m_demuxer, index);
+            track.nalLengthSize = nalLengthSize ? nalLengthSize : 4;
             m_videoTrack = track;
             m_naturalSize = FloatSize(mlxweb_media_track_width(m_demuxer, index), mlxweb_media_track_height(m_demuxer, index));
         } else if (kind == MLXWEB_MEDIA_AUDIO && track.codec == MLXWEB_MEDIA_AAC && !m_audioTrack) {
@@ -1020,7 +1023,7 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
             }
         }
     }
-    auto status = mlxweb_media_h264_access_unit(m_h264, bytes.span().data(), bytes.size(), 4);
+    auto status = mlxweb_media_h264_access_unit(m_h264, bytes.span().data(), bytes.size(), m_videoTrack->nalLengthSize);
     if (status != MLXWEB_MEDIA_OK)
         return;
     uint32_t pictureSlot = mlxweb_media_h264_picture_slot(m_h264);

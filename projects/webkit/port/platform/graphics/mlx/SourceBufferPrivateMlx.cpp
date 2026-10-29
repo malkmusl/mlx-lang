@@ -111,7 +111,7 @@ bool SourceBufferPrivateMlx::processInitialization()
                     break;
                 parameterSets.append(Vector<uint8_t>(std::span<const uint8_t> { bytes, length }));
             }
-            player->addSourceTrack(track.id, true, track.timescale, track.editMediaTime, configSpan, parameterSets, track.size);
+            player->addSourceTrack(track.id, true, track.timescale, track.editMediaTime, mlxweb_media_track_nal_length_size(m_demuxer, index), configSpan, parameterSets, track.size);
             InitializationSegment::VideoTrackInformation information;
             information.description = MediaDescriptionMlx::create("avc1"_s, true);
             information.track = VideoTrackPrivateMlx::create(track.id, static_cast<int>(m_tracks.size()));
@@ -119,7 +119,7 @@ bool SourceBufferPrivateMlx::processInitialization()
             m_tracks.append(track);
         } else if (kind == MLXWEB_MEDIA_AUDIO && codec == MLXWEB_MEDIA_AAC) {
             track.id = player->allocateTrackID();
-            player->addSourceTrack(track.id, false, track.timescale, track.editMediaTime, configSpan, { }, { });
+            player->addSourceTrack(track.id, false, track.timescale, track.editMediaTime, 0, configSpan, { }, { });
             InitializationSegment::AudioTrackInformation information;
             information.description = MediaDescriptionMlx::create("mp4a.40.2"_s, false);
             information.track = AudioTrackPrivateMlx::create(track.id, static_cast<int>(m_tracks.size()));
