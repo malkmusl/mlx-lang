@@ -782,8 +782,10 @@ body is not made for a call in an unevaluated operand
 An error inside a template instance names the instances being read and
 where each was needed. WTF's `Assertions.cpp` compiles with what came
 next (`tests/cpp/wtfforms2.cpp`, `wtfforms3.cpp`): GCC's
-`__builtin_add_overflow`, `sub` and `mul` (computed exactly in a
-130-bit integer); a member's default argument read when a call needs
+`__builtin_add_overflow`, `sub` and `mul` (the instruction and its
+overflow flag when the operands and the result are one 4- or 8-byte
+integer type, WTF's `Checked<T>`; computed exactly in a 130-bit
+integer otherwise, `tests/overflowfast.c`); a member's default argument read when a call needs
 it (it may name members declared later); a class nested in a class or
 a class template defined outside it (`template <..> class Outer::Inner
 {...}`); a constexpr function reading a string literal, taking a
