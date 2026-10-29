@@ -222,17 +222,34 @@ jsc on bench.js, SQLite) before anything is called fast.
   (accessors, operators, intrinsics) of the unit at their call sites
   (epoch 45; `__OPTIMIZE__` defined for libpas's `PAS_ALWAYS_INLINE`,
   epoch 46). jsc's bench.js 0.74 s, webcore-dump bench.html 1.73 s (the
-  LIR build before it was not timed on the same page; the machine code
-  of the profile's top functions still to be checked by eye).
+  LIR build before it was not timed on the same page). Checked by eye on
+  a LayoutUnit loop (epoch 49): functions returning a reference
+  (`operator+=`) are inlined too, `this` and reference parameters are
+  aliases of the locals they name, a call that is a statement delivers
+  no result, and a local of one scalar member becomes a slot the
+  register pass may keep in a register: the loop's body went from 50
+  instructions to 22 (gcc -O2: 7). What is left in it is the back
+  end's: every intermediate value stored to its frame slot and read
+  back, one working register (rax) and three callee-saved ones for
+  locals.
+- [ ] The back end's register allocation: intermediate values of a
+  block in the caller-saved registers, not frame slots; locals in more
+  than rbx, r12 and r13.
 - [x] SIMD intrinsics as their instructions (epoch 47): the SSE, SSE2,
   SSE3, SSSE3, SSE4.1 and SSE4.2 headers over `__builtin_mlxcc_asm`,
   the assembler knowing the packed-integer instructions
   (compiler/cc/README.md, "Inline assembly").
+- [x] `__builtin_add_overflow`, `sub` and `mul` of one 4- or 8-byte
+  type as the instruction and its flag (epoch 48): a function holding
+  one no longer falls back to the stack machine with the wide runtime.
 - [ ] 128-bit arithmetic as instructions where x86-64 has them (`mul`,
-  add with carry, shifts), the helpers for the rest.
-- [ ] The benchmark: tools/check_cc_projects.sh's SQLite, jsc's bench.js
-  and a webcore-dump workload, each timed against gcc -O2's build of
-  the same, in one script, run before and after each change here.
+  add with carry, shifts), the helpers for the rest; `__int128` values
+  in the LIR instead of the stack machine.
+- [x] The benchmark: tools/bench_native.sh times jsc on bench.js and
+  webcore-dump on bench.html (medians; gcc -O2's build of WebKit is not
+  in the repository, so its numbers come from outside). Epoch 46: 0.74 s
+  / 1.73 s / 0.89 s (without scripts); epoch 48 (SSE instructions, the
+  overflow builtins): 0.77 s / 1.67 s / 0.92 s.
 - [ ] Voyager profiled again under the same conditions (the same URLs
   and machine): the main thread, `MlxCompositor`, `MlxGPUPainting`,
   and JavaScript, layout, painting and compositing told apart.

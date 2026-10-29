@@ -28,6 +28,7 @@ const builtins = @import("./builtins.mlx")
 const atomics = @import("./atomics.mlx")
 const irgen = @import("./irgen.mlx")
 const lir = @import("../../compiler/selfhost/ir/lir.mlx")
+const operands = @import("../../compiler/selfhost/ir/operands.mlx")
 const type_store = @import("../../compiler/selfhost/sema/types/store.mlx")
 const heap = @import("std.heap")
 
@@ -156,7 +157,9 @@ pub fn showStats() -> void {
     base.sayNumber(inlinedCount)
     base.say(" calls inlined (")
     base.sayNumber(inlinedNodes)
-    base.say(" nodes)\n")
+    base.say(" nodes); ")
+    base.sayNumber(promotedPlaces)
+    base.say(" places promoted to slots\n")
     var i: usize = 0
     while i < REASON_COUNT {
         if reasonsReady && reasonCounts[i] != 0 {
@@ -312,6 +315,9 @@ const PARAMETER: usize = 8
 // the offset in localValues, when it lives in memory).
 const INLINED: usize = 16
 const INLINED_PLACE: usize = 32
+// An alias of a pointer parameter's value (`tmp = this`), not of a
+// local's storage: settled when the parameter is bound (inlineCall).
+const ALIAS_OF_POINTER: usize = 64
 var localCapacity: usize = 0 // (per run)
 var scratchMark: usize = 0 // (per run)
 // Inlining (MLX_CC_INLINE=0, -fno-inline: off): a call of a small function
@@ -328,6 +334,11 @@ var labelSalt: usize = 0 // (per run) the salt of the labels being lowered (0: t
 var inInline = false // (per run)
 var inlineJoin: usize = 0 // (per run) the block an inlined body's returns go to
 var inlineResultSlot: usize = 0 // (per run) the slot its scalar result is stored in
+// A call that is a statement (`a += b;` through operator+=): the body
+// inlined need not deliver its result, so a `return *this` keeps `this`
+// an alias of the object.
+var discardedCall: usize = 0 // (per run)
+var inlineResultUnused = false // (per run)
 var inlineResultType: usize = 0 // (per run) the callee's return type
 var inlineReturnBuffer: usize = 0 // (per run) the buffer its struct result is copied to
 var inlinedLocals: usize = 0 // (per run) cells (obj, next) of the inlined functions' locals indexed here
@@ -637,7 +648,7 @@ fn frameLocal(offset: i64) -> usize {
 // The address of the local `o` in memory (in the frame, or where the
 // local it is stored at points).
 fn localAddress(o: usize) -> usize {
-    if hasLocalInfo(o) && localKind(o) != LOCAL_MEMORY { tokens.errorAt(ast.obj(o).*.token, "internal error: the address of a local held as a value") }
+    if hasLocalInfo(o) && localKind(o) != LOCAL_MEMORY { tokens.errorAt(ast.obj(o).*.token, base.join("internal error: the address of a local held as a value: ", base.join(base.nameOf(ast.obj(o).*.name), base.join(" kind ", base.join(base.decimal(@intCast(u64, localKind(o))), base.join(" flags ", base.join(base.decimal(@intCast(u64, localFlag(o))), base.join(" in ", base.nameOf(ast.obj(fnObj).*.name))))))))) }
     if hasLocalInfo(o) && localFlag(o) & INLINED_PLACE != 0 { return frameLocal(@bitCast(i64, @intCast(u64, localValue(o)))) }
     const at = ast.obj(o).*.storedAt
     if at != 0 {
@@ -745,7 +756,18 @@ fn isSetjmpCall(n: usize) -> bool {
 // The local `x` of `&x` (under casts between pointer types), else 0.
 fn addressedLocal(n: usize) -> usize {
     var e = n
-    while ast.kindOf(e) == ast.CAST && types.kind(ast.typeOf(e)) == types.PTR { e = ast.node(e).*.lhs }
+    while true {
+        if ast.kindOf(e) == ast.CAST && (types.kind(ast.typeOf(e)) == types.PTR || types.kind(ast.typeOf(e)) == types.REF) {
+            e = ast.node(e).*.lhs
+        } else if ast.kindOf(e) == ast.ADDR && ast.kindOf(ast.node(e).*.lhs) == ast.DEREF {
+            // (`&*p`: p.)
+            e = ast.node(ast.node(e).*.lhs).*.lhs
+        } else {
+            break
+        }
+    }
+    // (A pointer that is an alias of a local: that local.)
+    if ast.kindOf(e) == ast.VAR && hasLocalInfo(ast.node(e).*.variable) && localKind(ast.node(e).*.variable) == LOCAL_ALIAS && localFlag(localValue(ast.node(e).*.variable)) & PARAMETER == 0 { return localValue(ast.node(e).*.variable) }
     if ast.kindOf(e) != ast.ADDR || ast.kindOf(ast.node(e).*.lhs) != ast.VAR { return 0 }
     const x = ast.node(ast.node(e).*.lhs).*.variable
     if !hasLocalInfo(x) { return 0 }
@@ -759,11 +781,15 @@ fn markAddressed(n: usize) -> void {
     if n == 0 { return }
     const node = ast.node(n)
     if node.*.kind == ast.VAR {
-        if hasLocalInfo(node.*.variable) { setLocalFlag(node.*.variable, ADDRESSED | ALIAS_BROKEN) }
+        if hasLocalInfo(node.*.variable) { breakAlias(node.*.variable, ADDRESSED | ALIAS_BROKEN, "its address, through a cast or a member") }
         return
     }
     if node.*.kind == ast.DEREF && ast.kindOf(node.*.lhs) == ast.VAR {
-        if hasLocalInfo(ast.node(node.*.lhs).*.variable) { setLocalFlag(ast.node(node.*.lhs).*.variable, ALIAS_BROKEN) }
+        // `(*tmp).m`, `tmp->m`: the memory is the local tmp stands for
+        // when it is an alias (that local stays in memory); through any
+        // other pointer, nothing of this frame.
+        const t = ast.node(node.*.lhs).*.variable
+        if hasLocalInfo(t) && localKind(t) == LOCAL_ALIAS && localFlag(t) & ALIAS_OF_POINTER == 0 { setLocalFlag(localValue(t), ADDRESSED) }
         return
     }
     if node.*.kind == ast.COMMA { markAddressed(node.*.rhs) }
@@ -782,9 +808,14 @@ fn check(n: usize) -> bool {
     if k == ast.NULL_EXPR || k == ast.NUM || k == ast.JUMP { return true }
     if k == ast.VAR {
         if !checkType(ast.obj(node.*.variable).*.ty) { return false }
-        // A temporary read other than through `*tmp` keeps no alias.
-        if hasLocalInfo(node.*.variable) {
-            setLocalFlag(node.*.variable, ALIAS_BROKEN)
+        // A temporary read other than through `*tmp` keeps no alias (its
+        // store may come after the read); an inlined body's pointer
+        // parameter, bound before the body and never stored to while an
+        // alias, is read as the address of the local it stands for.
+        const v = node.*.variable
+        if hasLocalInfo(v) {
+            const parameterAlias = localFlag(v) & PARAMETER != 0 && localFlag(v) & INLINED != 0 && (types.kind(ast.obj(v).*.ty) == types.PTR || types.kind(ast.obj(v).*.ty) == types.REF)
+            if !parameterAlias { breakAlias(v, ALIAS_BROKEN, "read as a value") }
         }
         return true
     }
@@ -792,7 +823,7 @@ fn check(n: usize) -> bool {
         const inner = node.*.lhs
         if ast.kindOf(inner) == ast.VAR {
             if !checkType(ast.obj(ast.node(inner).*.variable).*.ty) { return false }
-            if hasLocalInfo(ast.node(inner).*.variable) { setLocalFlag(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN) }
+            if hasLocalInfo(ast.node(inner).*.variable) { breakAlias(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN, "its address taken") }
             return true
         }
         markAddressed(inner)
@@ -824,11 +855,24 @@ fn check(n: usize) -> bool {
                     base.putWord(localValues + localIndex(t) * 8, x)
                     return true
                 }
-                setLocalFlag(t, ALIAS_BROKEN)
-                setLocalFlag(x, ADDRESSED | ALIAS_BROKEN)
+                breakAlias(t, ALIAS_BROKEN, "a second alias")
+                breakAlias(x, ADDRESSED | ALIAS_BROKEN, "a second alias of it")
                 return true
             }
-            setLocalFlag(t, ALIAS_BROKEN)
+            // `tmp = this` in an inlined body (a compound assignment's
+            // temporary): tmp an alias of what `this` is bound to, settled
+            // when the body's parameters are bound (inlineCall).
+            const copied = pointerCopied(rhs)
+            if types.kind(ast.obj(t).*.ty) == types.PTR && localFlag(t) & PARAMETER == 0 && localFlag(t) & ALIAS_STORE == 0 && copied != 0 {
+                const p = copied
+                if localFlag(p) & PARAMETER != 0 && localFlag(p) & INLINED != 0 && types.kind(ast.obj(p).*.ty) == types.PTR && ast.obj(t).*.storedAt == 0 {
+                    setLocalFlag(t, ALIAS_STORE | ALIAS_OF_POINTER)
+                    base.put8(localKinds + localIndex(t), LOCAL_ALIAS)
+                    base.putWord(localValues + localIndex(t) * 8, p)
+                    return true
+                }
+            }
+            breakAlias(t, ALIAS_BROKEN, "stored to")
             return check(rhs)
         }
         if ast.kindOf(lhs) == ast.DEREF && ast.kindOf(ast.node(lhs).*.lhs) == ast.VAR {
@@ -838,6 +882,7 @@ fn check(n: usize) -> bool {
         markAddressed(lhs)
         return check(lhs) && check(rhs)
     }
+    if k == ast.RETURN && inlineResultUnused && trivialResult(node.*.lhs) { return true }
     if k == ast.BITCAST || k == ast.NEG || k == ast.CAST || k == ast.NOT || k == ast.BITNOT || k == ast.EXPR_STMT || k == ast.RETURN || k == ast.CASE || k == ast.LABEL {
         return check(node.*.lhs)
     }
@@ -845,7 +890,7 @@ fn check(n: usize) -> bool {
         if !checkType(types.member(node.*.member).*.ty) { return false }
         const inner = node.*.lhs
         if ast.kindOf(inner) == ast.VAR {
-            if hasLocalInfo(ast.node(inner).*.variable) { setLocalFlag(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN) }
+            if hasLocalInfo(ast.node(inner).*.variable) { breakAlias(ast.node(inner).*.variable, ADDRESSED | ALIAS_BROKEN, "a member of it") }
             return checkType(ast.obj(ast.node(inner).*.variable).*.ty)
         }
         // (`((T *)&x)->m`: the member is in x's memory.)
@@ -864,7 +909,7 @@ fn check(n: usize) -> bool {
         return check(node.*.lhs)
     }
     if k == ast.FUNCALL {
-        if node.*.returnBuffer != 0 && hasLocalInfo(node.*.returnBuffer) { setLocalFlag(node.*.returnBuffer, ADDRESSED | ALIAS_BROKEN) }
+        if node.*.returnBuffer != 0 && hasLocalInfo(node.*.returnBuffer) { breakAlias(node.*.returnBuffer, ADDRESSED | ALIAS_BROKEN, "a call's result buffer") }
         if !checkType(node.*.ty) { return false }
         if !check(node.*.lhs) { return false }
         if node.*.rhs != 0 && !check(node.*.rhs) { return false }
@@ -1063,7 +1108,7 @@ fn address(n: usize) -> usize {
         const inner = node.*.lhs
         if ast.kindOf(inner) == ast.VAR && hasLocalInfo(ast.node(inner).*.variable) && localKind(ast.node(inner).*.variable) == LOCAL_ALIAS {
             const x = localValue(ast.node(inner).*.variable)
-            if slotOf(x).0 { ast.errorAt(n, "internal error: the address of a local held as a value") }
+            if slotOf(x).0 { ast.errorAt(n, base.join("internal error: the address of a local held as a value (through an alias): ", base.join(base.nameOf(ast.obj(x).*.name), base.join(" in ", base.nameOf(ast.obj(fnObj).*.name))))) }
             return localAddress(x)
         }
         return expression(inner)
@@ -1801,6 +1846,7 @@ fn inlineCandidate(n: usize) -> usize {
     const f = ast.obj(d)
     if !f.*.isDefinition || f.*.body == 0 || !f.*.isFunction || f.*.beingInlined || f.*.isNoinline { return 0 }
     if f.*.vaArea != 0 || f.*.entryOf != 0 || f.*.name == names.D_MAIN { return 0 }
+    const saying = trace && f.*.isAlwaysInline
     const limit = if f.*.isAlwaysInline { INLINE_ALWAYS_COST } else { INLINE_COST }
     var cost: usize = 0
     if f.*.inlineCost != 0 {
@@ -1819,40 +1865,375 @@ fn inlineCandidate(n: usize) -> usize {
     const rt = types.baseOf(f.*.ty)
     const callType = node.*.ty
     if isStructLike(rt) {
-        if types.inMemory(rt) || node.*.returnBuffer == 0 || !isStructLike(callType) || types.size(callType) != types.size(rt) { return 0 }
+        if types.inMemory(rt) || node.*.returnBuffer == 0 || !isStructLike(callType) || types.size(callType) != types.size(rt) {
+            if saying { traceRefusal(f, "its result, a struct") }
+            return 0
+        }
     } else if types.kind(rt) != types.VOID {
-        if types.kind(rt) == types.LDOUBLE || types.isBitPrecise(rt) || types.size(rt) > 8 { return 0 }
-        if types.kind(callType) == types.VOID || !sameValueType(rt, callType) { return 0 }
+        if types.kind(rt) == types.LDOUBLE || types.isBitPrecise(rt) || types.size(rt) > 8 {
+            if saying { traceRefusal(f, "its result's type") }
+            return 0
+        }
+        // (A reference result is the object's address, the call a pointer
+        // the parser dereferences.)
+        const referenceResult = types.kind(rt) == types.REF && types.kind(callType) == types.PTR
+        if types.kind(callType) == types.VOID || (!referenceResult && !sameValueType(rt, callType)) {
+            if saying { traceRefusal(f, base.join("its result against the call's type: kinds ", base.join(base.decimal(@intCast(u64, types.kind(rt))), base.join(" and ", base.decimal(@intCast(u64, types.kind(callType))))))) }
+            return 0
+        }
     } else if types.kind(callType) != types.VOID {
+        if saying { traceRefusal(f, "void, the call not") }
         return 0
     }
     // The parameters against the arguments.
     var cell = f.*.params
     var argument = node.*.args
     while cell != 0 {
-        if argument == 0 { return 0 }
+        if argument == 0 {
+            if saying { traceRefusal(f, "fewer arguments than parameters") }
+            return 0
+        }
         const p = base.getWord(cell)
         const ty = ast.obj(p).*.ty
-        if ast.obj(p).*.storedAt != 0 || ast.obj(p).*.alignment > 16 || ast.obj(p).*.isResultBuffer { return 0 }
+        if ast.obj(p).*.storedAt != 0 || ast.obj(p).*.alignment > 16 || ast.obj(p).*.isResultBuffer {
+            if saying { traceRefusal(f, "a parameter's place") }
+            return 0
+        }
         if isStructLike(ty) {
             const at = ast.typeOf(argument)
-            if types.inMemory(ty) || !isStructLike(at) || types.size(at) != types.size(ty) { return 0 }
+            if types.inMemory(ty) || !isStructLike(at) || types.size(at) != types.size(ty) {
+                if saying { traceRefusal(f, "a struct parameter against its argument") }
+                return 0
+            }
         } else {
-            if types.kind(ty) == types.LDOUBLE || types.isBitPrecise(ty) || types.size(ty) > 8 { return 0 }
+            if types.kind(ty) == types.LDOUBLE || types.isBitPrecise(ty) || types.size(ty) > 8 {
+                if saying { traceRefusal(f, "a parameter's type") }
+                return 0
+            }
             const at = ast.typeOf(argument)
-            if isStructLike(at) || types.kind(at) == types.LDOUBLE || types.kind(at) == types.VOID { return 0 }
+            if isStructLike(at) || types.kind(at) == types.LDOUBLE || types.kind(at) == types.VOID {
+                if saying { traceRefusal(f, base.join("a parameter against its argument: kinds ", base.join(base.decimal(@intCast(u64, types.kind(ty))), base.join(" and ", base.decimal(@intCast(u64, types.kind(at))))))) }
+                return 0
+            }
         }
         cell = base.getWord(cell + 8)
         argument = ast.node(argument).*.next
     }
-    if argument != 0 { return 0 }
+    if argument != 0 {
+        if saying { traceRefusal(f, "more arguments than parameters") }
+        return 0
+    }
     var local = f.*.locals
     while local != 0 {
-        if ast.obj(local).*.isLocal && (ast.obj(local).*.storedAt != 0 || ast.obj(local).*.alignment > 16) { return 0 }
+        if ast.obj(local).*.isLocal && (ast.obj(local).*.storedAt != 0 || ast.obj(local).*.alignment > 16) {
+            if saying { traceRefusal(f, "a local's place or alignment") }
+            return 0
+        }
         local = ast.obj(local).*.next
     }
     inlineCostFound = cost
     return d
+}
+
+// ---------------------------------------------------------------------------
+// Places promoted to slots. A place of the frame that is only loaded and
+// stored whole, every access of one width (a struct local of one scalar
+// member, LayoutUnit or RefPtr; an inlined body's parameter or temporary
+// of such a type; a struct copied through) becomes an 8-byte alloca as a
+// scalar local is: the optimizer forwards its loads and the register
+// pass may keep it in a register. The allocas take the PLACEHOLDERS
+// dead instructions after the function's label (an alloca comes before
+// every use). A narrow slot keeps its value canonical for the type its
+// loads read it as: a store into it must hold that form, so a value is
+// taken from another promoted place of the same type, from a constant
+// (made canonical when it has no other use), from an instruction typed
+// so, or from a copy's load (one that only stores feed on, which is
+// given the slot's type and sign to extend by).
+const PLACEHOLDERS: usize = 16
+var placeholderStart: usize = 0 // (per run)
+pub var promotedPlaces: u64 = 0 // (per run)
+// MLX_CC_PROMOTE=0: no promotion of places.
+pub var promoting = true // (per run)
+
+// A group's words: the offset, the lowest frame_local, the width, the
+// type its loads read, how many loads feed something other than a
+// store, how many stores, whether it can be promoted, its placeholder,
+// how many loads feed stores only (a copy's).
+const G_OFFSET: usize = 0
+const G_FIRST: usize = 1
+const G_WIDTH: usize = 2
+const G_TYPE: usize = 3
+const G_LOADS: usize = 4
+const G_STORES: usize = 5
+const G_OK: usize = 6
+const G_SLOT: usize = 7
+const G_RAW: usize = 8
+const G_WORDS: usize = 9
+
+fn groupWord(groups: usize, g: usize, field: usize) -> usize { return base.getWord(groups + (g * G_WORDS + field) * 8) }
+fn setGroupWord(groups: usize, g: usize, field: usize, value: usize) -> void { base.putWord(groups + (g * G_WORDS + field) * 8, value) }
+
+fn isFloatTypeId(t: usize) -> bool { return t == tF32 || t == tF64 }
+fn isSignedTypeId(t: usize) -> bool { return t == tI8 || t == tI16 || t == tI32 || t == tI64 }
+
+// Whether the bits of a const_i are canonical for a narrow type.
+fn constantFits(bits: usize, width: usize, typeId: usize) -> bool {
+    const shift = @intCast(u6, 64 - width * 8)
+    if isSignedTypeId(typeId) { return @bitCast(u64, @bitCast(i64, bits << shift) >> shift) == @bitCast(u64, bits) }
+    return (bits >> @intCast(u6, width * 8)) == 0
+}
+
+fn canonicalConstant(bits: usize, width: usize, typeId: usize) -> usize {
+    const shift = @intCast(u6, 64 - width * 8)
+    if isSignedTypeId(typeId) { return @bitCast(u64, @bitCast(i64, bits << shift) >> shift) }
+    return (bits << shift) >> shift
+}
+
+fn promotePlaces() -> void {
+    if !promoting { return }
+    const program = ir()
+    const count = lir.instCount(program)
+    if count == 0 { return }
+    // The uses of every value; per frame_local, its loads and stores; per
+    // load, the stores it feeds.
+    const uses = base.scratch(count * 8)
+    const accesses = base.scratch(count * 8)
+    const fed = base.scratch(count * 8)
+    const groupOf = base.scratch(count * 8)
+    unsafe {
+        const table = @ptrFromInt([*]usize, uses)
+        var i: usize = 0
+        while i < count {
+            operands.visit(program, i, lir.getInst(program, i), table, count, operands.COUNT)
+            i += 1
+        }
+    }
+    // The groups, one per offset (a hash of the offsets).
+    var places: usize = 0
+    var i: usize = 0
+    while i < count {
+        if lir.getInst(program, i).opcode == lir.Opcode.frame_local { places += 1 }
+        i += 1
+    }
+    if places == 0 { return }
+    var capacity: usize = 16
+    while capacity < places * 2 { capacity *= 2 }
+    const keys = base.scratch(capacity * 8)
+    const slots = base.scratch(capacity * 8)
+    const groups = base.scratch(places * G_WORDS * 8)
+    var groupCount: usize = 0
+    i = 0
+    while i < count {
+        const inst = lir.getInst(program, i)
+        if inst.opcode != lir.Opcode.frame_local {
+            i += 1
+            continue
+        }
+        const key = inst.arg0 + 1
+        var at = (inst.arg0 * 2654435761) & (capacity - 1)
+        var g: usize = 0
+        while true {
+            const k = base.getWord(keys + at * 8)
+            if k == key {
+                g = base.getWord(slots + at * 8)
+                break
+            }
+            if k == 0 {
+                base.putWord(keys + at * 8, key)
+                g = groupCount + 1
+                base.putWord(slots + at * 8, g)
+                groupCount += 1
+                setGroupWord(groups, g - 1, G_OFFSET, inst.arg0)
+                setGroupWord(groups, g - 1, G_FIRST, i)
+                setGroupWord(groups, g - 1, G_OK, 1)
+                break
+            }
+            at = (at + 1) & (capacity - 1)
+        }
+        base.putWord(groupOf + i * 8, g)
+        i += 1
+    }
+    // The loads and stores: their width and type, per group.
+    i = 0
+    while i < count {
+        const inst = lir.getInst(program, i)
+        if inst.opcode == lir.Opcode.store && inst.arg1 < count && lir.getInst(program, inst.arg1).opcode == lir.Opcode.load && inst.arg2 == lir.getInst(program, inst.arg1).arg1 {
+            base.putWord(fed + inst.arg1 * 8, base.getWord(fed + inst.arg1 * 8) + 1)
+        }
+        if (inst.opcode == lir.Opcode.load || inst.opcode == lir.Opcode.store) && inst.arg0 < count && base.getWord(groupOf + inst.arg0 * 8) != 0 {
+            const g = base.getWord(groupOf + inst.arg0 * 8) - 1
+            base.putWord(accesses + inst.arg0 * 8, base.getWord(accesses + inst.arg0 * 8) + 1)
+            const width = if inst.opcode == lir.Opcode.load { inst.arg1 } else { inst.arg2 }
+            if width == lir.NONE || width == 0 || width > 8 || (width != 1 && width != 2 && width != 4 && width != 8) {
+                setGroupWord(groups, g, G_OK, 0)
+            } else if groupWord(groups, g, G_WIDTH) == 0 {
+                setGroupWord(groups, g, G_WIDTH, width)
+            } else if groupWord(groups, g, G_WIDTH) != width {
+                setGroupWord(groups, g, G_OK, 0)
+            }
+            if inst.opcode == lir.Opcode.store { setGroupWord(groups, g, G_STORES, groupWord(groups, g, G_STORES) + 1) }
+        }
+        i += 1
+    }
+    // The loads that feed more than stores decide the slot's type.
+    i = 0
+    while i < count {
+        const inst = lir.getInst(program, i)
+        if inst.opcode == lir.Opcode.load && inst.arg0 < count && base.getWord(groupOf + inst.arg0 * 8) != 0 {
+            const g = base.getWord(groupOf + inst.arg0 * 8) - 1
+            const raw = inst.arg1 != 8 && base.getWord(fed + i * 8) == base.getWord(uses + i * 8) && base.getWord(uses + i * 8) != 0
+            if raw {
+                setGroupWord(groups, g, G_RAW, groupWord(groups, g, G_RAW) + 1)
+            } else {
+                setGroupWord(groups, g, G_LOADS, groupWord(groups, g, G_LOADS) + 1)
+                const t = groupWord(groups, g, G_TYPE)
+                if t == 0 {
+                    setGroupWord(groups, g, G_TYPE, inst.typeId)
+                } else if t != inst.typeId && (inst.arg1 != 8 || isFloatTypeId(t) != isFloatTypeId(inst.typeId)) {
+                    setGroupWord(groups, g, G_OK, 0)
+                }
+            }
+        }
+        i += 1
+    }
+    // A frame_local read by anything but its loads and stores keeps its
+    // group in memory; a group loaded only by copies has no type to hold.
+    i = 0
+    while i < count {
+        const g = base.getWord(groupOf + i * 8)
+        if g != 0 && base.getWord(uses + i * 8) != base.getWord(accesses + i * 8) { setGroupWord(groups, g - 1, G_OK, 0) }
+        i += 1
+    }
+    // (A place nothing here stores is written by the caller or the
+    // prologue: the arguments above rbp, a register save area.)
+    var g: usize = 0
+    while g < groupCount {
+        if groupWord(groups, g, G_WIDTH) == 0 || groupWord(groups, g, G_STORES) == 0 || @bitCast(i64, groupWord(groups, g, G_OFFSET)) <= 0 { setGroupWord(groups, g, G_OK, 0) }
+        if groupWord(groups, g, G_LOADS) == 0 && groupWord(groups, g, G_RAW) == 0 && groupWord(groups, g, G_TYPE) == 0 { setGroupWord(groups, g, G_TYPE, tU64) }
+        g += 1
+    }
+    // A place only copies read takes the type of the slot its copies
+    // feed (a struct passed along to where a member is read): what its
+    // own stores hold is then checked against that form below. One that
+    // feeds no typed slot has no form to keep and stays in memory.
+    var rounds: usize = 0
+    var changed = true
+    while changed && rounds < 4 {
+        changed = false
+        rounds += 1
+        i = 0
+        while i < count {
+            const inst = lir.getInst(program, i)
+            if inst.opcode == lir.Opcode.store && inst.arg0 < count && inst.arg1 < count && base.getWord(groupOf + inst.arg0 * 8) != 0 {
+                const to = base.getWord(groupOf + inst.arg0 * 8) - 1
+                const value = lir.getInst(program, inst.arg1)
+                if groupWord(groups, to, G_OK) != 0 && groupWord(groups, to, G_TYPE) != 0 && value.opcode == lir.Opcode.load && value.arg0 < count && base.getWord(groupOf + value.arg0 * 8) != 0 {
+                    const from = base.getWord(groupOf + value.arg0 * 8) - 1
+                    if groupWord(groups, from, G_OK) != 0 && groupWord(groups, from, G_TYPE) == 0 && groupWord(groups, from, G_WIDTH) == groupWord(groups, to, G_WIDTH) {
+                        setGroupWord(groups, from, G_TYPE, groupWord(groups, to, G_TYPE))
+                        changed = true
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+    g = 0
+    while g < groupCount {
+        if groupWord(groups, g, G_TYPE) == 0 { setGroupWord(groups, g, G_OK, 0) }
+        g += 1
+    }
+    // The stores' values against the slots' types.
+    i = 0
+    while i < count {
+        const inst = lir.getInst(program, i)
+        if inst.opcode == lir.Opcode.store && inst.arg0 < count && base.getWord(groupOf + inst.arg0 * 8) != 0 && inst.arg1 < count {
+            const g = base.getWord(groupOf + inst.arg0 * 8) - 1
+            if groupWord(groups, g, G_OK) != 0 && (groupWord(groups, g, G_LOADS) != 0 || groupWord(groups, g, G_RAW) != 0) {
+                const width = groupWord(groups, g, G_WIDTH)
+                const t = groupWord(groups, g, G_TYPE)
+                const value = lir.getInst(program, inst.arg1)
+                var ok = false
+                if width == 8 {
+                    ok = isFloatTypeId(value.typeId) == isFloatTypeId(t)
+                } else if value.typeId == t {
+                    ok = true
+                } else if value.opcode == lir.Opcode.const_i {
+                    ok = constantFits(value.arg0, width, t) || base.getWord(uses + inst.arg1 * 8) == 1
+                } else if value.opcode == lir.Opcode.load && value.arg1 == width && base.getWord(fed + inst.arg1 * 8) == base.getWord(uses + inst.arg1 * 8) {
+                    // A copy's load: from a promoted place, that place's
+                    // form; from memory, given this slot's type below.
+                    const source = if value.arg0 < count { base.getWord(groupOf + value.arg0 * 8) } else { 0 }
+                    const single = base.getWord(uses + inst.arg1 * 8) == 1
+                    ok = single && (source == 0 || groupWord(groups, source - 1, G_OK) == 0 || groupWord(groups, source - 1, G_TYPE) == t)
+                }
+                if !ok { setGroupWord(groups, g, G_OK, 0) }
+            }
+        }
+        i += 1
+    }
+    // The promoted groups, in the order of their first use, up to the
+    // placeholders; the frame_locals dead, the loads and stores to the
+    // slots, the copies' loads and the constants given the slots' form.
+    var taken: usize = 0
+    g = 0
+    while g < groupCount && taken < PLACEHOLDERS {
+        if groupWord(groups, g, G_OK) != 0 {
+            const slot = placeholderStart + taken
+            var alloca = lir.initInst(lir.Opcode.alloca, groupWord(groups, g, G_TYPE))
+            alloca.arg0 = lir.NONE
+            alloca.arg1 = lir.NONE
+            alloca.arg2 = lir.NONE
+            lir.setInst(program, slot, alloca)
+            setGroupWord(groups, g, G_SLOT, slot + 1)
+            taken += 1
+            promotedPlaces += 1
+        }
+        g += 1
+    }
+    if taken == 0 { return }
+    i = 0
+    while i < count {
+        var inst = lir.getInst(program, i)
+        if (inst.opcode == lir.Opcode.load || inst.opcode == lir.Opcode.store) && inst.arg0 < count && base.getWord(groupOf + inst.arg0 * 8) != 0 {
+            const g2 = base.getWord(groupOf + inst.arg0 * 8) - 1
+            const slot = groupWord(groups, g2, G_SLOT)
+            if slot != 0 {
+                inst.arg0 = slot - 1
+                if inst.opcode == lir.Opcode.load {
+                    inst.arg1 = lir.NONE
+                    inst.arg2 = 0
+                } else {
+                    inst.arg2 = lir.NONE
+                    if inst.arg1 < count && (groupWord(groups, g2, G_LOADS) != 0 || groupWord(groups, g2, G_RAW) != 0) {
+                        var value = lir.getInst(program, inst.arg1)
+                        const width = groupWord(groups, g2, G_WIDTH)
+                        const t = groupWord(groups, g2, G_TYPE)
+                        if width != 8 && value.typeId != t {
+                            if value.opcode == lir.Opcode.const_i && !constantFits(value.arg0, width, t) {
+                                value.arg0 = canonicalConstant(value.arg0, width, t)
+                                lir.setInst(program, inst.arg1, value)
+                            } else if value.opcode == lir.Opcode.load && value.arg1 == width {
+                                // (A copy's load from memory: this type's extension. One
+                                // from a promoted place is already of this form.)
+                                value.typeId = t
+                                value.arg2 = if isSignedTypeId(t) { 1 } else { 0 }
+                                lir.setInst(program, inst.arg1, value)
+                            }
+                        }
+                    }
+                }
+                lir.setInst(program, i, inst)
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < count {
+        const g3 = base.getWord(groupOf + i * 8)
+        if g3 != 0 && groupWord(groups, g3 - 1, G_SLOT) != 0 { lir.setInst(program, i, lir.initInst(lir.Opcode.dead, lir.NONE)) }
+        i += 1
+    }
 }
 
 fn traceRefusal(f: *ast.Obj, why: []const u8) -> void {
@@ -1971,10 +2352,19 @@ fn inlineCall(n: usize) -> (bool, usize) {
     // The body checked as a function's is (its locals numbered first); a
     // body the lowering does not cover is called.
     const savedReason = unsupportedReason
+    // (A struct result is written into the call's buffer, whether or
+    // not the value is read: `T x = f();`.)
+    const savedUnused = inlineResultUnused
+    inlineResultUnused = n == discardedCall && !isStructLike(types.baseOf(f.*.ty))
+    // (From here the function is not inlined into its own arguments: a
+    // site of it there would number its locals again under this one.)
+    f.*.beingInlined = true
     indexInlined(d)
     if !check(f.*.body) {
         if trace && f.*.isAlwaysInline { traceRefusal(f, reasonName(unsupportedReason)) }
         unsupportedReason = savedReason
+        inlineResultUnused = savedUnused
+        f.*.beingInlined = false
         return -> (false, 0)
     }
     classifyInlined(d)
@@ -2006,7 +2396,39 @@ fn inlineCall(n: usize) -> (bool, usize) {
         const ty = ast.obj(p).*.ty
         const argumentNode = base.getWord(argumentNodes + at * 8)
         var value = base.getWord(values + at * 8)
-        if isStructLike(ty) {
+        // A pointer parameter given a local's address (`this`, a reference
+        // to a local) that the body only reads through: an alias of the
+        // local, which stays in memory, instead of a slot holding its
+        // address (the promotion of places then sees loads and stores
+        // alone).
+        var aliased: usize = 0
+        if (types.kind(ty) == types.PTR || types.kind(ty) == types.REF) && localFlag(p) & ALIAS_BROKEN == 0 && localKind(p) == LOCAL_SLOT {
+            aliased = addressedLocal(argumentNode)
+            if aliased == 0 && types.kind(ty) == types.REF && ast.kindOf(argumentNode) == ast.VAR && hasLocalInfo(ast.node(argumentNode).*.variable) { aliased = ast.node(argumentNode).*.variable }
+            if aliased != 0 && (ast.obj(aliased).*.storedAt != 0 || localKind(aliased) != LOCAL_MEMORY || localFlag(aliased) & INLINED_PLACE != 0 && localFlag(aliased) & INLINED == 0) { aliased = 0 }
+        }
+        if trace && (types.kind(ty) == types.PTR || types.kind(ty) == types.REF) {
+            if aliased != 0 {
+                base.say(base.join("lir:   parameter ", base.join(base.nameOf(ast.obj(p).*.name), base.join(" an alias of ", base.join(base.nameOf(ast.obj(aliased).*.name), "\n")))))
+            } else {
+                const flagsText = base.decimal(@intCast(u64, localFlag(p)))
+                const kindText = base.decimal(@intCast(u64, localKind(p)))
+                const indexText = base.join(base.decimal(@intCast(u64, ast.obj(p).*.dataOffset)), if hasLocalInfo(p) { " known" } else { " UNKNOWN" })
+                base.say(base.join("lir:   parameter ", base.join(base.nameOf(ast.obj(p).*.name), base.join(" of ", base.join(base.nameOf(if f.*.linkName != 0 { f.*.linkName } else { f.*.name }), base.join(" offset ", base.join(indexText, base.join(" a slot (flags ", base.join(flagsText, base.join(", kind ", base.join(kindText, ", argument")))))))))))
+                var chain = argumentNode
+                while chain != 0 {
+                    base.say(base.join(" ", base.join(base.decimal(@intCast(u64, ast.kindOf(chain))), base.join("/t", base.decimal(@intCast(u64, types.kind(ast.typeOf(chain))))))))
+                    if ast.kindOf(chain) == ast.VAR { break }
+                    chain = ast.node(chain).*.lhs
+                }
+                base.say(")\n")
+            }
+        }
+        if aliased != 0 {
+            base.put8(localKinds + localIndex(p), LOCAL_ALIAS)
+            base.putWord(localValues + localIndex(p) * 8, aliased)
+            setLocalFlag(aliased, ADDRESSED)
+        } else if isStructLike(ty) {
             copyBytes(localAddress(p), value, @intCast(usize, types.size(ty)))
         } else {
             const from = ast.typeOf(argumentNode)
@@ -2021,6 +2443,23 @@ fn inlineCall(n: usize) -> (bool, usize) {
         at += 1
         cell = base.getWord(cell + 8)
     }
+    // The aliases of a parameter (`tmp = this`): of the local the
+    // parameter was bound to, else slots as the parameter is.
+    var local = f.*.locals
+    while local != 0 {
+        if hasLocalInfo(local) && localKind(local) == LOCAL_ALIAS && localFlag(local) & ALIAS_OF_POINTER != 0 {
+            const target = localValue(local)
+            if hasLocalInfo(target) {
+                if localKind(target) == LOCAL_ALIAS {
+                    base.putWord(localValues + localIndex(local) * 8, localValue(target))
+                } else {
+                    base.put8(localKinds + localIndex(local), LOCAL_SLOT)
+                    base.putWord(localValues + localIndex(local) * 8, emit(lir.Opcode.alloca, tyOf(ast.obj(local).*.ty), lir.NONE, lir.NONE, lir.NONE))
+                }
+            }
+        }
+        local = ast.obj(local).*.next
+    }
     // The result's place, the join, the body.
     const rt = types.baseOf(f.*.ty)
     const savedJoin = inlineJoin
@@ -2034,7 +2473,7 @@ fn inlineCall(n: usize) -> (bool, usize) {
     inlineResultType = rt
     if isStructLike(rt) {
         inlineReturnBuffer = if node.*.rhs != 0 { expression(node.*.rhs) } else { localAddress(node.*.returnBuffer) }
-    } else if types.kind(rt) != types.VOID {
+    } else if types.kind(rt) != types.VOID && !inlineResultUnused {
         inlineResultSlot = emit(lir.Opcode.alloca, tyOf(rt), lir.NONE, lir.NONE, lir.NONE)
     }
     inlineJoin = newBlock()
@@ -2055,10 +2494,11 @@ fn inlineCall(n: usize) -> (bool, usize) {
     var result: usize = lir.NONE
     if isStructLike(rt) {
         result = inlineReturnBuffer
-    } else if types.kind(rt) != types.VOID {
+    } else if types.kind(rt) != types.VOID && !inlineResultUnused {
         result = loadWidth(inlineResultSlot, tyOf(rt), lir.NONE, false)
         if types.isInteger(rt) { noteCanonicalFor(result, rt) }
     }
+    inlineResultUnused = savedUnused
     inlineJoin = savedJoin
     inlineResultSlot = savedSlot
     inlineResultType = savedType
@@ -2072,6 +2512,10 @@ fn inlineCall(n: usize) -> (bool, usize) {
 // the join.
 fn inlineReturn(n: usize) -> void {
     const node = ast.node(n)
+    if inlineResultUnused && trivialResult(node.*.lhs) {
+        branchTo(inlineJoin)
+        return
+    }
     if node.*.lhs != 0 {
         const ty = ast.typeOf(node.*.lhs)
         const value = expression(node.*.lhs)
@@ -2084,6 +2528,31 @@ fn inlineReturn(n: usize) -> void {
         }
     }
     branchTo(inlineJoin)
+}
+
+// A returned `*this` or variable: nothing happens in it, so a body
+// inlined for its effect alone leaves it out.
+fn trivialResult(n: usize) -> bool {
+    if n == 0 { return false }
+    const k = ast.kindOf(n)
+    if k == ast.VAR { return true }
+    return k == ast.DEREF && ast.kindOf(ast.node(n).*.lhs) == ast.VAR
+}
+
+// The pointer local `n` copies (`p`, `&*p`, `(T *)p`), 0 for none.
+fn pointerCopied(n: usize) -> usize {
+    var e = n
+    while ast.kindOf(e) == ast.CAST && types.kind(ast.typeOf(e)) == types.PTR { e = ast.node(e).*.lhs }
+    if ast.kindOf(e) == ast.ADDR && ast.kindOf(ast.node(e).*.lhs) == ast.DEREF { e = ast.node(ast.node(e).*.lhs).*.lhs }
+    if ast.kindOf(e) != ast.VAR || !hasLocalInfo(ast.node(e).*.variable) { return 0 }
+    return ast.node(e).*.variable
+}
+
+// The local `o` keeps no alias, and holds none (MLX_CC_LIR_TRACE says
+// why).
+fn breakAlias(o: usize, flags: usize, why: []const u8) -> void {
+    if trace && hasLocalInfo(o) { base.say(base.join("lir:   no alias for ", base.join(base.nameOf(ast.obj(o).*.name), base.join(": ", base.join(why, "\n"))))) }
+    setLocalFlag(o, flags)
 }
 
 // The function an alias stands for (gen.functionTarget).
@@ -2130,6 +2599,9 @@ pub fn expression(n: usize) -> usize {
     if k == ast.VAR {
         const o = node.*.variable
         if ast.obj(o).*.isLocal && hasLocalInfo(o) {
+            // (An alias read as a value: the address of the local it
+            // stands for.)
+            if localKind(o) == LOCAL_ALIAS { return localAddress(localValue(o)) }
             const slot = slotOf(o)
             if slot.0 { return slotLoad(slot.1, slot.2, node.*.ty) }
         }
@@ -2371,7 +2843,18 @@ pub fn statement(n: usize) -> void {
         return
     }
     if k == ast.EXPR_STMT {
-        const dropped = expression(node.*.lhs)
+        var dropped_expression = node.*.lhs
+        var inner = dropped_expression
+        while ast.kindOf(inner) == ast.CAST && types.kind(ast.typeOf(inner)) == types.VOID { inner = ast.node(inner).*.lhs }
+        if ast.kindOf(inner) == ast.DEREF { inner = ast.node(inner).*.lhs }
+        if ast.kindOf(inner) == ast.FUNCALL {
+            discardedCall = inner
+            // (The parser's dereference of a reference result: its load
+            // would be dead.)
+            if inner != dropped_expression && types.kind(ast.typeOf(ast.node(inner).*.lhs)) == types.FUNC && types.isReference(types.baseOf(ast.typeOf(ast.node(inner).*.lhs))) { dropped_expression = inner }
+        }
+        const dropped = expression(dropped_expression)
+        discardedCall = 0
         return
     }
     ast.errorAt(n, "invalid statement")
@@ -2488,6 +2971,8 @@ pub fn genFunction(fn_obj: usize) -> bool {
     inlineSites = 0
     labelSalt = 0
     inInline = false
+    inlineResultUnused = false
+    discardedCall = 0
     inlinedLocals = 0
     canonTable = 0
     canonCapacity = 0
@@ -2497,6 +2982,12 @@ pub fn genFunction(fn_obj: usize) -> bool {
     const symbol = ast.obj(fn_obj).*.symbol
     const label = lir.addInst(ir(), lir.labelInst(tyOf(types.baseOf(ast.obj(fn_obj).*.ty)), symbolOf(symbol)))
     openBlock(newBlock())
+    placeholderStart = lir.instCount(ir())
+    var placeholder: usize = 0
+    while placeholder < PLACEHOLDERS {
+        const dead = emit(lir.Opcode.dead, lir.NONE, lir.NONE, lir.NONE, lir.NONE)
+        placeholder += 1
+    }
     makeSlots(fn_obj)
     parameters(fn_obj)
     alignLocals()
@@ -2517,6 +3008,8 @@ pub fn genFunction(fn_obj: usize) -> bool {
             local = ast.obj(local).*.next
         }
     }
+    promotePlaces()
+    if trace { dump(fn_obj, ir(), "places promoted") }
     // (The inlined bodies' places below the function's own locals.)
     ast.obj(fn_obj).*.stackSize = types.alignTo(ast.obj(fn_obj).*.stackSize, 16)
     irgen.emitFunction(fn_obj, ir(), blockCount, @intCast(usize, ast.obj(fn_obj).*.stackSize))

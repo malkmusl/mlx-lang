@@ -283,10 +283,24 @@ parameter in memory) is lowered as the body in place of the call, to a
 depth of 4 and 6000 nodes a caller. The arguments are stored into the
 parameters, which are locals of the caller from then on (slots, or
 places of its frame below its own locals), a `return` stores the result
-into a slot (a struct in registers is made into the call's buffer) and
-branches to the block after the body, and the body's labels are salted
-per site. `MLX_CC_STATS` counts the calls inlined, `MLX_CC_LIR_TRACE`
-names them.
+into a slot (a struct in registers is made into the call's buffer; a
+reference is the object's address, which the call's dereference reads
+through) and branches to the block after the body, and the body's
+labels are salted per site. A pointer or reference parameter given a
+local's address (`this`, `const T &`, through `&*p` or a cast) that the
+body only reads through, or copies (`tmp = this`, a compound
+assignment's temporary) or passes on to another body inlined, is an
+alias of that local: no address is stored, `p->m` is the local's
+member. A call that is a statement (`a += b;`) does not deliver its
+result, so a `return *this` leaves `this` an alias. After the body, a
+place of the frame that is only loaded and stored whole, one width
+(such a local of one scalar member, LayoutUnit or RefPtr, a parameter
+or temporary of such a type, a struct copied through) becomes an 8-byte
+slot like a scalar local's, which the optimizer forwards loads of and
+the register pass may keep in a register (`MLX_CC_PROMOTE=0`: not;
+ir.promotePlaces). `MLX_CC_STATS` counts the calls inlined and the
+places promoted, `MLX_CC_LIR_TRACE` names them, the parameters bound as
+aliases and why a local keeps none.
 
 What stays the stack machine's, function by function: `long double`
 (the x87 stack is not in the LIR), wide integers, variadic function
