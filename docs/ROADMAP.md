@@ -252,7 +252,14 @@ jsc on bench.js, SQLite) before anything is called fast.
   overflow builtins): 0.77 s / 1.67 s / 0.92 s.
 - [ ] Voyager profiled again under the same conditions (the same URLs
   and machine): the main thread, `MlxCompositor`, `MlxGPUPainting`,
-  and JavaScript, layout, painting and compositing told apart.
+  and JavaScript, layout, painting and compositing told apart. Seen on
+  bench.js with `JSC_reportCompileTimes=true` (epoch 48): the tiers all
+  run (34 compiles, FTL among them), but compiling is where the time
+  goes: 958 ms of compile time in an 814 ms run (on its threads), one
+  FTL compile of a 416-byte function 142 ms (DFG 56, B3 86), which a
+  gcc-built JavaScriptCore does in a few milliseconds. The JIT's own
+  C++ (DFG, B3, Air) is the code to make fast, not the JavaScript it
+  emits.
 - [ ] Zero-copy presentation on a real GPU: the window's buffer a dma-buf
   the compositor imports (it can), instead of wl_shm read back.
 

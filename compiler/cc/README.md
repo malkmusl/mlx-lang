@@ -299,9 +299,12 @@ place of the frame that is only loaded and stored whole, one width
 or temporary of such a type, a struct copied through) becomes an 8-byte
 slot like a scalar local's, which the optimizer forwards loads of and
 the register pass may keep in a register (`MLX_CC_PROMOTE=0`: not;
-ir.promotePlaces). `MLX_CC_STATS` counts the calls inlined and the
-places promoted, `MLX_CC_LIR_TRACE` names them, the parameters bound as
-aliases and why a local keeps none.
+ir.promotePlaces). An inline function of a header (a weak
+symbol) is still made in a unit that inlines every call of it, as a
+call would have it: another unit may call it with only its declaration
+in sight (WebCore's `*Inlines.h`). `MLX_CC_STATS` counts the calls
+inlined and the places promoted, `MLX_CC_LIR_TRACE` names them, the
+parameters bound as aliases and why a local keeps none.
 
 What stays the stack machine's, function by function: `long double`
 (the x87 stack is not in the LIR), wide integers, variadic function
