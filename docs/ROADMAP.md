@@ -267,9 +267,10 @@ jsc on bench.js, SQLite) before anything is called fast.
   nothing), so the back end uses separate variables.
 - [x] The `extend` after an `int` operation (epoch 53): dropped when
   every reader takes the low 32 bits alone (an operator producing low
-  bits from low bits, a store of 4 bytes or fewer, a call's argument,
-  which the callee extends on entry); kept before a compare, a shift
-  right, a division, an address, a whole-word store or a return.
+  bits from low bits, a store of 4 bytes or fewer); kept before a
+  compare, a shift right, a division, an address, a whole-word store, a
+  return or a call's argument (epoch 54: the parameter may be 64 bits
+  wide, the extend being that conversion).
 - [ ] The vtable's adjustment entry read only for a class with more
   than one base; values live across blocks in registers; a function's
   prologue saving only the registers it uses (it does) and no frame

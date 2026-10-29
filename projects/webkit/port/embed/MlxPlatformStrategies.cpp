@@ -11,6 +11,10 @@
 #include "LocalFrame.h"
 #include "MIMETypeRegistry.h"
 #include "MediaStrategy.h"
+#if ENABLE(VIDEO)
+#include "MediaPlayer.h"
+#include "MediaPlayerPrivateMlx.h"
+#endif
 #include "NetworkLoadMetrics.h"
 #include "ResourceError.h"
 #include "ResourceHandle.h"
@@ -303,6 +307,11 @@ void MlxPlatformStrategies::initialize()
     ProcessCapabilities::setCanUseAcceleratedBuffers(false);
     // (Skia's row blends and fills, the port's: SkiaRoutinesMlx.cpp.)
     installMlxSkiaRoutines();
+#if ENABLE(VIDEO)
+    // The media engine (MP4, AAC, H.264 over the Mlx side; PORT.md,
+    // "Media"), registered before any player asks for one.
+    MediaPlayerFactorySupport::callRegisterMediaEngine(MediaPlayerPrivateMlx::registerMediaEngine);
+#endif
 }
 
 LoaderStrategy* MlxPlatformStrategies::createLoaderStrategy()

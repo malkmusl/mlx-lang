@@ -713,7 +713,8 @@ port in the tarball that builds WebCore without GLib).
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
-| Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
+| Media | `ENABLE_VIDEO` and `ENABLE_MEDIA_SOURCE` (since M8's media part): the port's own engine, MediaPlayerPrivateMlx (below, "Media"), over std.mp4, std.aac, std.h264 and std.audio through the Mlx side | the audio and video elements, Media Source Extensions (YouTube's player), no GStreamer |
+| Off | `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; `ENABLE_FTL_JIT` and `ENABLE_WEBASSEMBLY` with BBQ and OMG (since M8's sixth part): the FTL (B3 and Air), WebAssembly's in-place interpreter and tiers, bounds checks by the fault handler; WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, since M8's sixth part) | JavaScriptCore's own tiers on x86-64, as WPE has them, made by the port's own toolchain: bench.js runs in 1.2 s, 8.4 s with the C loop (below) |
 
 ### WTF, bmalloc, JavaScriptCore
@@ -1561,6 +1562,49 @@ the Mlx side's port/mlx/crypto.mlx (MlxWebPort.h's `mlxweb_crypto_*`):
 | Localized strings | `LocalizedStringsMlx.cpp` (English first) |
 | Memory pressure | WTF's Unix handler; the compositor's memory notices later |
 
+### Media
+
+`ENABLE_VIDEO` and `ENABLE_MEDIA_SOURCE` are on; the engine is the
+port's own, registered by `MlxPlatformStrategies::initialize` through
+`MediaPlayerFactorySupport::callRegisterMediaEngine` (WebKit's own hook
+for an engine of the embedder's): `port/platform/graphics/mlx/MediaPlayerPrivateMlx`
+(the MediaPlayerPrivateInterface), `MediaSourcePrivateMlx` and
+`SourceBufferPrivateMlx` (WebCore's generic SourceBufferPrivate does the
+track buffers, the coded frame processing and eviction; the port's
+subclass parses what a page appends and hands the samples back to the
+player), `MediaSampleMlx.h` (a sample's bytes and times, the tracks and
+descriptions of an initialization segment). It plays MP4: H.264
+(`avc1`, `avc3`) and AAC-LC (`mp4a.40.2`; HE-AAC as its core) in
+`video/mp4`, `audio/mp4` and `audio/aac`, which is what YouTube serves
+through MSE besides VP9/AV1 in WebM, and what a GPU of the RX 580's
+generation decodes.
+
+The Mlx side (port/mlx/media.mlx, `mlxweb_media_*` and `mlxweb_audio_*`)
+is std.mp4 (the demuxer: a whole file's sample tables with seeking, or
+an initialization segment and media segments with the samples of each
+`moof`), std.aac (the decoder, 1024 float samples per channel and block),
+std.h264 (parameter sets, slice headers, picture order counts, the
+reference marking and the decoded picture buffer: what a decoder that
+takes whole pictures, the GPU's through std.vulkan's video extensions,
+needs per access unit) and std.audio (a playback stream on MLX Audio:
+`write` blocks as the server takes the frames).
+
+A plain file is loaded whole through the player's resource loader
+(WebCore's MediaResourceLoader over the port's loader strategy) and
+demuxed; a media source's samples come from its source buffers. Sound
+runs on a thread of the player's: it decodes the next audio sample and
+hands it to MLX Audio, which paces it; the frames handed over, less the
+stream's latency, are the clock the video follows and `currentTime()`
+reports (without an audio track, the monotonic time since play). Video
+samples due by the clock go through std.h264's picture order; their
+decoding into pixels is the next part (Vulkan video, VK_KHR_video_decode_h264,
+on RADV: std.vulkan has the extensions and std.vulkan.video the
+registry's H.264 structures; until then the video is black and the frames
+are counted as decoded or dropped). Seeking resets the decoders, the
+demuxer's cursors (to the sync sample before the time) and the clock;
+a media source's seek waits for its buffers (`waitForTarget`) and
+re-enqueues from the time.
+
 ### One process first
 
 **Recommendation: the first runnable milestones embed WebCore in
@@ -1594,7 +1638,8 @@ processes come later, if at all before Lattice.**
 
 The port's C++ reaches std through `export` functions with the C ABI.
 Most belong in the port's Mlx plugin (projects/webkit/port/mlx,
-`libmlxwebport.so`), which imports std.http, std.png and the others and
+`libmlxwebport.so`), which imports std.http, std.png, std.mp4, std.aac,
+std.h264, std.audio and the others and
 exports what the port's C++ needs in its shapes (a decoder object with
 `append`/`frame` functions, an HTTP request with callbacks): std's own
 APIs are Mlx slices and structs, not C. Rules of exports apply: an
@@ -1621,7 +1666,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
 | M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh and check_webkit_mlx_crypto.sh, the network check's downloads and uploads, check_voyager.sh's (done, both parts) |
-| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done); the JIT: tools/check_jsc_mlxlibc.sh's scripts and bench.js (part 5 done: the LLInt in assembly, Baseline and DFG; part 6 done: the CSS selector JIT, the FTL, WebAssembly) |
+| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (MP4, AAC, H.264 and MSE over std.mp4, std.aac, std.h264, std.audio: the media part; the pictures' decoding on the GPU next), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done); the JIT: tools/check_jsc_mlxlibc.sh's scripts and bench.js (part 5 done: the LLInt in assembly, Baseline and DFG; part 6 done: the CSS selector JIT, the FTL, WebAssembly) |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
 compile); the port's sources for M2 can be written beside it, since each
