@@ -1636,6 +1636,10 @@ the layer as a NativeImage (`CoordinatedPlatformLayerBufferNativeImage`),
 also kept for `paint`.
 Without a decoding device the video stays black and the frames are
 counted; `examples/vulkan-decode` decodes a file on the device alone.
+tools/check_voyager.sh's scenario 26 plays WebKit's test.mp4 (6 s of
+H.264 with a silent AAC track) by itself in Voyager
+(projects/voyager/tests/media.html: the page turns green on `playing`,
+blue on `ended`, and tells the end's time in its title).
 Seeking resets the decoders, the demuxer's cursors (to the sync sample
 before the time) and the clock; a media source's seek waits for its
 buffers (`waitForTarget`) and re-enqueues from the time.

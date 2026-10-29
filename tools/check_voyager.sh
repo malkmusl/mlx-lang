@@ -820,4 +820,24 @@ else
         echo "ok   tabs of layers opened and closed (the first among them): the share group's textures $idle, $most, then $last again"
     fi
 fi
+# 26: a video playing by itself (media.html: WebKit's test.mp4 of 6 s,
+# H.264 with a silent AAC track, through the port's media engine; no
+# sound server here, so the clock runs by the wall, and no GPU decoder
+# on lavapipe, so the frames stay black): the page reports playing and
+# the end through its title and its background.
+write_runner "$work/voyager-media" media.html
+printf 'wait 5000\nshot %s\nwait 9000\nshot %s\nclose\n' "$work/media-playing.ppm" "$work/media-ended.ppm" > "$work/media.script"
+run_scenario media "$work/media.script" "$work/voyager-media"
+log=$work/voyager.log
+grep -q "^voyager: title media:playing" "$log" || { cat "$log" >&2; fail "the video did not start playing (no media:playing title)"; }
+ended=$(grep -o "^voyager: title media:ended:[0-9]*" "$log" | tail -1 | cut -d: -f4)
+[[ -n "$ended" ]] && (( ended >= 5 && ended <= 7 )) || { cat "$log" >&2; fail "the video did not end at its 6 s (${ended:-no end})"; }
+playing=$(box_of "$work/media-playing.ppm" 00c000)
+[[ -n "$playing" ]] || fail "the page was not green while the video played"
+ended_box=$(box_of "$work/media-ended.ppm" 0000c0)
+[[ -n "$ended_box" ]] || fail "the page was not blue after the video ended"
+frame=$(box_of "$work/media-playing.ppm" 000000)
+read -r fx fy fw fh <<< "$frame"
+[[ -n "$frame" ]] && (( fw >= 300 && fh >= 220 )) || fail "no video box of 320x240 in the screenshot (its black: ${frame:-none})"
+echo "ok   a video plays by itself and ends at $ended s: the page green then blue, the video's box ${fw}x${fh}"
 echo "check_voyager.sh: all checks passed"

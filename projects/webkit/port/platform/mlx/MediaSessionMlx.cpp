@@ -8,6 +8,14 @@
 #include "NowPlayingInfo.h"
 #include "Page.h"
 #include "PlatformMediaSessionInterface.h"
+#if ENABLE(MEDIA_SESSION)
+#include "Document.h"
+#include "LocalDOMWindow.h"
+#include "LocalFrame.h"
+#include "MediaSession.h"
+#include "Navigator.h"
+#include "NavigatorMediaSession.h"
+#endif
 #include "port/MlxWebPort.h"
 #include <wtf/NeverDestroyed.h>
 #include <wtf/text/CString.h>
@@ -107,6 +115,31 @@ static inline std::span<const char> text(const CString& string)
     return string.span();
 }
 
+// Whether the page's MediaSession (navigator.mediaSession) handles
+// `action`: the controls' next and previous buttons.
+static bool pageHandlesAction(Page* page, int action)
+{
+#if ENABLE(MEDIA_SESSION)
+    if (!page)
+        return false;
+    RefPtr frame = dynamicDowncast<LocalFrame>(page->mainFrame());
+    if (!frame)
+        return false;
+    RefPtr document = frame->document();
+    if (!document)
+        return false;
+    RefPtr window = document->window();
+    if (!window)
+        return false;
+    RefPtr session = NavigatorMediaSession::mediaSessionIfExists(window->navigator());
+    return session && session->hasActionHandler(static_cast<MediaSessionAction>(action));
+#else
+    UNUSED_PARAM(page);
+    UNUSED_PARAM(action);
+    return false;
+#endif
+}
+
 void MediaSessionMlx::refresh(bool seeked)
 {
     Page* page = nullptr;
@@ -144,7 +177,14 @@ void MediaSessionMlx::refresh(bool seeked)
     int64_t length = std::isfinite(info->duration) && info->duration > 0 ? static_cast<int64_t>(info->duration * 1000000) : 0;
     int64_t position = std::isfinite(info->currentTime) ? static_cast<int64_t>(info->currentTime * 1000000) : 0;
     uint32_t status = info->isPlaying ? MLXWEB_MEDIA_PLAYING : MLXWEB_MEDIA_PAUSED;
-    mlxweb_media_session_update(m_session, status, text(title).data(), title.length(), text(artist).data(), artist.length(), text(album).data(), album.length(), text(artwork).data(), artwork.length(), nullptr, 0, length, position, info->supportsSeeking, 0, 0, seeked);
+#if ENABLE(MEDIA_SESSION)
+    bool canNext = pageHandlesAction(page, static_cast<int>(MediaSessionAction::Nexttrack));
+    bool canPrevious = pageHandlesAction(page, static_cast<int>(MediaSessionAction::Previoustrack));
+#else
+    bool canNext = pageHandlesAction(page, 0);
+    bool canPrevious = canNext;
+#endif
+    mlxweb_media_session_update(m_session, status, text(title).data(), title.length(), text(artist).data(), artist.length(), text(album).data(), album.length(), text(artwork).data(), artwork.length(), nullptr, 0, length, position, info->supportsSeeking, canNext, canPrevious, seeked);
 }
 
 void MediaSessionMlx::command(uint32_t kind, int64_t time)
