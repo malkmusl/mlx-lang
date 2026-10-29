@@ -480,7 +480,10 @@ ran for both.
 A server disconnects a client for a protocol error (one the runtime posts
 for a request it cannot dispatch, or one a handler posts with
 `postError`), a malformed message, events it stopped reading (its output
-buffer is full), a file descriptor that could not be duplicated for it,
+buffer, 64 KiB at first, grows by doubling to 16 MiB while the client
+does not read, enough for a client whose main thread is busy for a
+while as the pointer moves; past that the client is taken as gone), a
+file descriptor that could not be duplicated for it,
 memory that ran out, or because the server asked (`Client.disconnect`);
 a client that leaves on its own is the plain case. The client-destroyed
 handler can tell them apart with `Client.failure()` (`server.FAIL_*`) and,
