@@ -198,8 +198,13 @@ stack machine of gen.mlx but as the Mlx compiler's own intermediate
 representation, LIR (`compiler/selfhost/ir`),
 which mlx4's optimizer (constants folded, loads of locals forwarded and
 locals held as values, copies propagated, stores and dead values dropped,
-the most used locals of a function in rbx, r12 and r13) and its x86-64
-back end then turn into code, through the one encoder both share. The
+blocks only fallen into joined to the block before them, the most used
+locals of a function in rbx, r12, r13, r14 and r15, `int`, `unsigned`
+and byte locals among them, each register kept extended to the word)
+and its x86-64 back end (a block's intermediate values in rsi, rdi, r8,
+r9 and r10 until a call or the block's end, an operand read last
+operated on in its own register, loads and leas straight into theirs)
+then turn into code, through the one encoder both share. The
 lowering is `ir.mlx` (the syntax tree to LIR: the C semantics, the
 System V classification of calls and parameters) and `irgen.mlx` (the
 LIR through mlx4's passes and back end into the object, and the few

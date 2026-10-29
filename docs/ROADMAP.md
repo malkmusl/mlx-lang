@@ -232,9 +232,30 @@ jsc on bench.js, SQLite) before anything is called fast.
   end's: every intermediate value stored to its frame slot and read
   back, one working register (rax) and three callee-saved ones for
   locals.
-- [ ] The back end's register allocation: intermediate values of a
-  block in the caller-saved registers, not frame slots; locals in more
-  than rbx, r12 and r13.
+- [x] The back end's register allocation (epoch 52): a block's
+  intermediate values live in rsi, rdi, r8, r9 and r10 (State.cacheResult
+  in `backend/x86_64/codegen/state.mlx`), spilled to their slots only
+  before a call or the block's end when read after it; an operand read
+  last is operated on in its own register and the result takes it
+  over (`x * x`, `extend`, `copy` without code); loads and leas go
+  straight into the result's register; the optimizer joins a block
+  only fallen into to the block before it (the inliner left one per
+  call), so the cache lives across what were block boundaries; mlx-cc's
+  functions keep locals in five callee-saved registers (r14 and r15
+  too: C code keeps no arena in them), `int`, `unsigned` and byte
+  locals among them (the register holds the value extended; a store
+  re-extends it, `x = x + 1` with its `extend` done in place); a
+  discarded call at the end of a comma (an operator's, its argument
+  evaluated before) delivers no result. The LayoutUnit loop's body: 11
+  instructions (was 22; gcc -O2: 7), no frame access but the two
+  parameters' slots. Found on the way: the encoder's rax slot cache
+  was not reset by `setcc` and the memory-operand ALU forms, and mlx4
+  miscompiles an assignment to a tuple's field (`held.0 = true` does
+  nothing), so the back end uses separate variables.
+- [ ] 32-bit arithmetic as such (the `extend` after every `int`
+  operation costs an instruction); parameters in registers; the cache
+  kept across a call's arguments (loaded from the registers in order,
+  a parallel move); values live across blocks in registers.
 - [x] SIMD intrinsics as their instructions (epoch 47): the SSE, SSE2,
   SSE3, SSSE3, SSE4.1 and SSE4.2 headers over `__builtin_mlxcc_asm`,
   the assembler knowing the packed-integer instructions

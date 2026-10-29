@@ -18,6 +18,12 @@ const lir = @import("./lir.mlx")
 const escape = @import("./escape.mlx")
 
 pub const REGISTERS: usize = 3
+// How many a client's functions may use (mlx-cc's C and C++ code, with
+// no arena in r14 and r15, takes five), and whether a local loaded and
+// stored as 4 bytes or as a byte, all its uses agreeing, may have one
+// (lir.registerWidth; the backend keeps the register extended that way).
+pub var registerCount: usize = REGISTERS
+pub var narrowLocals: bool = false
 const LOOP_WEIGHT: usize = 8
 const WEIGHT_LIMIT: usize = 1073741824
 
@@ -27,24 +33,29 @@ pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> usize {
     if count == 0 { return 0 }
     const weight_memory = allocator.alloc(count * 8, 8)
     const score_memory = allocator.alloc(count * 8, 8)
-    if weight_memory == null || score_memory == null { return 0 }
+    const width_memory = allocator.alloc(count * 8, 8)
+    if weight_memory == null || score_memory == null || width_memory == null { return 0 }
     var weights: [*]usize = undefined
     var scores: [*]usize = undefined
+    var widths: [*]usize = undefined
     unsafe {
         weights = @ptrCast([*]usize, weight_memory.?)
         scores = @ptrCast([*]usize, score_memory.?)
+        widths = @ptrCast([*]usize, width_memory.?)
     }
     var index: usize = 0
     while index < count {
         weights[index] = 1
         scores[index] = 0
+        widths[index] = lir.NONE
         index += 1
     }
     weighLoops(ir, allocator, weights, count)
-    scoreSlots(ir, weights, scores, count)
-    const given = assign(ir, scores, count)
+    scoreSlots(ir, weights, scores, widths, count)
+    const given = assign(ir, scores, widths, count)
     allocator.free(weight_memory.?, count * 8, 8)
     allocator.free(score_memory.?, count * 8, 8)
+    allocator.free(width_memory.?, count * 8, 8)
     return given
 }
 
@@ -77,15 +88,48 @@ fn score(scores: [*]usize, slot: usize, weight: usize) -> void {
     scores[slot] = scores[slot] + weight
 }
 
-fn scoreSlots(ir: *lir.Lir, weights: [*]usize, scores: [*]usize, count: usize) -> void {
+// The code (lir.registerWidth) of a load or store of `width` bytes, a
+// load's `signed`: NONE for a width no register local may have.
+fn widthCode(width: usize, signed: bool) -> usize {
+    if width == lir.NONE || width == 8 { return lir.WIDTH_WORD }
+    if !narrowLocals { return lir.NONE }
+    if width == 4 { return if signed { lir.WIDTH_INT } else { lir.WIDTH_UINT } }
+    if width == 1 && !signed { return lir.WIDTH_BYTE }
+    return lir.NONE
+}
+
+// A load or store of `slot` with `code`: scored when it agrees with the
+// slot's earlier ones (a store, with no signedness, with their width).
+fn scoreAccess(scores: [*]usize, widths: [*]usize, slot: usize, code: usize, is_store: bool, weight: usize) -> void {
+    if code == lir.NONE || scores[slot] == lir.NONE {
+        scores[slot] = lir.NONE
+        return
+    }
+    const known = widths[slot]
+    if known == lir.NONE {
+        widths[slot] = code
+    } else if known != code {
+        // (A store of 4 bytes agrees with loads of either signedness; a
+        // load after stores alone decides the signedness.)
+        const same_width = lir.widthBits(known) == lir.widthBits(code)
+        if !same_width || lir.widthBits(code) != 32 {
+            scores[slot] = lir.NONE
+            return
+        }
+        if !is_store { widths[slot] = code }
+    }
+    scores[slot] = scores[slot] + weight
+}
+
+fn scoreSlots(ir: *lir.Lir, weights: [*]usize, scores: [*]usize, widths: [*]usize, count: usize) -> void {
     var index: usize = 0
     while index < count {
         const inst = lir.instAt(ir, index)
         const op = inst.*.opcode
         if op == lir.Opcode.load && isSlot(ir, inst.*.arg0, count) {
-            if inst.*.arg1 != lir.NONE && inst.*.arg1 != 8 { block(ir, scores, inst.*.arg0, count) } else { score(scores, inst.*.arg0, weights[index]) }
+            scoreAccess(scores, widths, inst.*.arg0, widthCode(inst.*.arg1, inst.*.arg2 == 1), false, weights[index])
         } else if op == lir.Opcode.store && isSlot(ir, inst.*.arg0, count) {
-            if inst.*.arg2 != lir.NONE && inst.*.arg2 != 8 { block(ir, scores, inst.*.arg0, count) } else { score(scores, inst.*.arg0, weights[index]) }
+            scoreAccess(scores, widths, inst.*.arg0, widthCode(inst.*.arg2, false), true, weights[index])
         }
         // A fused comparison's operands sit on the comparison it replaced.
         if op == lir.Opcode.icmp_br && inst.*.arg0 != lir.NONE && inst.*.arg0 < count {
@@ -156,7 +200,7 @@ fn weighLoop(labels: [*]usize, blocks: usize, weights: [*]usize, target_block: u
 
 // In each function, the REGISTERS best scored slots (used at least twice)
 // get a register each.
-fn assign(ir: *lir.Lir, scores: [*]usize, count: usize) -> usize {
+fn assign(ir: *lir.Lir, scores: [*]usize, widths: [*]usize, count: usize) -> usize {
     var given: usize = 0
     var start: usize = 0
     while start < count {
@@ -167,7 +211,7 @@ fn assign(ir: *lir.Lir, scores: [*]usize, count: usize) -> usize {
         var end = start + 1
         while end < count && !isFunctionLabel(lir.instAt(ir, end)) { end += 1 }
         var register: usize = 1
-        while register <= REGISTERS {
+        while register <= registerCount {
             var best: usize = lir.NONE
             var best_score: usize = 1
             var index = start + 1
@@ -180,7 +224,8 @@ fn assign(ir: *lir.Lir, scores: [*]usize, count: usize) -> usize {
             }
             if best == lir.NONE { break }
             const slot = lir.instAt(ir, best)
-            slot.*.flags = slot.*.flags | @intCast(u8, register * 16)
+            const code = if widths[best] == lir.NONE { lir.WIDTH_WORD } else { widths[best] }
+            slot.*.flags = slot.*.flags | @intCast(u8, register * 16 + code * 2)
             given += 1
             register += 1
         }
