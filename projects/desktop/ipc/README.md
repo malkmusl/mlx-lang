@@ -13,6 +13,7 @@ mlx4 projects/desktop/ipc/main.mlx -o mlx-ipcd
 mlx4 projects/desktop/ipc/tool.mlx -o mlx-ipc
 ./mlx-ipcd --run mlx-compositor          # a session on this bus
 tools/check_ipc.sh                       # the end-to-end check
+tools/check_mpris.sh                     # Voyager's MPRIS player on the bus
 ```
 
 The desktop session (`mlx-session`, installed by

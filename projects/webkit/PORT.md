@@ -1586,8 +1586,24 @@ an initialization segment and media segments with the samples of each
 std.h264 (parameter sets, slice headers, picture order counts, the
 reference marking and the decoded picture buffer: what a decoder that
 takes whole pictures, the GPU's through std.vulkan's video extensions,
-needs per access unit) and std.audio (a playback stream on MLX Audio:
-`write` blocks as the server takes the frames).
+needs per access unit) and std.audio (a playback stream on MLX Audio
+over its MLXIPC channel: `write` blocks as the server takes the frames).
+
+The desktop's media controls see Voyager as an MPRIS player on MLXIPC:
+port/mlx/mediasession.mlx owns `org.mpris.MediaPlayer2.voyager` and
+answers the Properties, Player and root interfaces in MLXIPC's own
+format (std.ipc; the bus carries them to the top bar, a D-Bus client),
+and `MediaSessionMlx` (port/platform/mlx) tells it what plays from
+WebCore's media sessions (the pages' managers' current session and its
+NowPlayingInfo: the title, duration, position, whether it seeks; the
+embedder registers its pages) and polls it from the main thread for the
+controls' commands, which go to the session as remote control commands
+(play, pause, toggle, stop, next, previous, seek) that the media
+element carries out. A player that stopped leaves the bus after half a
+minute. ENABLE_MEDIA_SESSION stays off: a page's MediaSession metadata
+(artist, artwork) is not seen yet, the title is the document's.
+`tools/check_mpris.sh` runs the player on mlx-ipcd against dbus-send,
+gdbus and dbus-monitor (the properties, the commands, the signals).
 
 A plain file is loaded whole through the player's resource loader
 (WebCore's MediaResourceLoader over the port's loader strategy) and

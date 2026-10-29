@@ -79,6 +79,7 @@
 #include "port/MlxWebPort.h"
 #include "port/embed/MlxFrameLoaderClient.h"
 #include "UserAgent.h"
+#include "port/platform/mlx/MediaSessionMlx.h"
 #include "port/platform/mlx/UserAgentMlx.h"
 #include "CookieJar.h"
 #include "port/embed/MlxNetwork.h"
@@ -582,6 +583,7 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
         ReferrerPolicy::EmptyString
     };
     tab->page = Page::create(WTF::move(configuration));
+    MediaSessionMlx::singleton().addPage(*tab->page);
     auto& settings = tab->page->settings();
     settings.setScriptEnabled(true);
     if (engine.compositing) {
@@ -696,6 +698,7 @@ void engineClose(Engine* engine, int id)
     tab->frame->loader().stopAllLoaders();
     tab->frame->loader().detachFromParent();
     MlxProfile::pageClosed(*tab->page);
+    MediaSessionMlx::singleton().removePage(*tab->page);
     tab->frame = nullptr;
     tab->page = nullptr;
     tab->host = nullptr;

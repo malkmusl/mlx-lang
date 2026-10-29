@@ -9,6 +9,7 @@
 #include "GraphicsContext.h"
 #include "MediaPlayer.h"
 #include "MediaSampleMlx.h"
+#include "MediaSessionMlx.h"
 #include "NativeImage.h"
 #include "NetworkLoadMetrics.h"
 #include "PlatformMediaResourceLoader.h"
@@ -617,6 +618,7 @@ void MediaPlayerPrivateMlx::play()
     if (m_videoTrack)
         startVideoThread();
     m_player->playbackStateChanged();
+    MediaSessionMlx::singleton().playbackChanged();
 }
 
 void MediaPlayerPrivateMlx::pause()
@@ -628,6 +630,7 @@ void MediaPlayerPrivateMlx::pause()
     wakeAudio();
     wakeVideo();
     m_player->playbackStateChanged();
+    MediaSessionMlx::singleton().playbackChanged();
 }
 
 void MediaPlayerPrivateMlx::setRate(float rate)
@@ -676,6 +679,7 @@ Ref<MediaTimePromise> MediaPlayerPrivateMlx::seekToTarget(const SeekTarget& targ
     resetDecoders();
     seekClockTo(time);
     wakeAudio();
+    MediaSessionMlx::singleton().playbackChanged(true);
 #if ENABLE(MEDIA_SOURCE)
     if (m_mediaSource) {
         return m_mediaSource->waitForTarget(target)->whenSettled(RunLoop::mainSingleton(), [weakThis = WeakPtr { *this }](auto&& result) -> Ref<MediaTimePromise> {
@@ -740,6 +744,7 @@ void MediaPlayerPrivateMlx::didReachEnd()
         m_clockBase = total;
     m_player->timeChanged();
     m_player->playbackStateChanged();
+    MediaSessionMlx::singleton().playbackChanged();
 }
 
 // ---- Sound ----

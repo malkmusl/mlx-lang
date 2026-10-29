@@ -353,7 +353,9 @@ small message in either format, about 40 µs over a direct channel;
 
 `std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
 `connect` finds the sound server on the session bus and gets a direct
-MLXIPC channel to it (starting it when needed), `openStream` opens a
+MLXIPC channel to it (starting it when needed; the bus is asked in
+MLXIPC's own format, `std.ipc`, and in D-Bus's when it does not speak
+that), `openStream` opens a
 playing or recording stream (any rate, 1 to 8 channels, S16, S32 or
 F32; `refusal` says when the app's MLXIPC permissions refused it),
 `write` plays as fast as the server asks, `read` returns what was
