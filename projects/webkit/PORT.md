@@ -1632,8 +1632,11 @@ runs on a thread of its own too: the samples go through std.h264's
 picture order as they come (one picture ahead) and are decoded by the
 GPU's video decoder (`mlxweb_video_*`: std.gpu.video over
 std.vulkan's VK_KHR_video_decode_h264, on the first driver whose device
-has a video decode queue; RADV's UVD on the RX 580, Mesa 24.2 or
-`RADV_PERFTEST=video_decode` before): each picture's slices go to a
+has a video decode queue; RADV's UVD on the RX 580, which RADV
+offers only with `RADV_EXPERIMENTAL=video_decode` in the environment,
+`RADV_PERFTEST=video_decode` in Mesa before 26, as UVD's decoding stays
+experimental there; VCN's is on by itself since Mesa 24.2): each
+picture's slices go to a
 Vulkan video session, the decoded picture buffer is one layered image,
 every picture is read back after its decode (NV12 into a buffer of the
 device's) and every frame due is converted to BGRA by std.gpu's nv12
@@ -1648,14 +1651,18 @@ H.264 with a silent AAC track) by itself in Voyager
 (projects/voyager/tests/media.html: the page turns green on `playing`,
 blue on `ended`, and tells the end's time in its title).
 
-On a machine with a video decoder (RADV's RX 580: Mesa 24.2 or later,
-`RADV_PERFTEST=video_decode` before), the stack is tried bottom up:
+On a machine with a video decoder (RADV's RX 580 with
+`RADV_EXPERIMENTAL=video_decode` exported, see above), the stack is
+tried bottom up:
 
     vulkaninfo | grep VK_KHR_video_decode_h264      # the extension is there
     ./mlx build examples
     mlx-out/bin/vulkan-decode --trace projects/webkit/upstream/Tools/TestWebKitAPI/Resources/test.mp4 out.png 50
     ./mlx build webkit-mlx-voyager
     tools/check_voyager.sh                          # scenario 26 among them
+
+(The RX 580 decodes test.mp4's 182 pictures without a failure at 236
+frames a second, 9 DPB slots of 17, the colour conversion on the GPU.)
 
 then a page with a video (a file: URL of test.mp4, then YouTube): the
 top bar shows the player (title, artist and cover from YouTube's
