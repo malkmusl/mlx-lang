@@ -75,6 +75,14 @@ file's samples from its sample tables with seeking to sync samples, a
 fragmented file's samples from each `moof`+`mdat` (test 416;
 tests/support/mp4_corpus.py makes the files).
 
+`aac.mlx` (`std.aac`) decodes AAC-LC (MPEG-4 audio object type 2, the
+`mp4a.40.2` of YouTube and MP4 files): every tool of the LC profile
+(channel pairs, M/S and intensity stereo, PNS, TNS, pulses, the four
+window sequences with sine and KBD windows, the IMDCT through a
+quarter-size FFT) from an AudioSpecificConfig or ADTS; HE-AAC's SBR is
+read past (test 417, against the WAV a Chromium test sound was encoded
+from). `aac/tables.mlx` holds the standard's codebooks and band tables.
+
 `flate/gzip.mlx` (`std.flate.gzip`) reads and writes gzip files in
 pieces for Mlx programs, what zlib's gz* functions do (test 385).
 
