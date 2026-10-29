@@ -109,8 +109,9 @@ echo "ok   ${#diagnosed[@]} programs refused with their messages: ${diagnosed[*]
 
 # What an object holds: the inline, static and template functions and the
 # vtables its code or data refers to, not those only named by functions
-# never made (inlinereach.cpp).
-"$cc" -c -o "$work/inlinereach.o" "$tests/inlinereach.cpp" 2> "$work/reach.err" || fail "-c of inlinereach.cpp: $(head -3 "$work/reach.err")"
+# never made (inlinereach.cpp). (Without inlining: with it, doubled is
+# lowered into helper and rightly left out, as gcc -O2 leaves it out.)
+"$cc" -fno-inline -c -o "$work/inlinereach.o" "$tests/inlinereach.cpp" 2> "$work/reach.err" || fail "-c of inlinereach.cpp: $(head -3 "$work/reach.err")"
 symbols=$(nm "$work/inlinereach.o" | awk '{ print $NF }' | sort | tr '\n' ' ')
 for name in _Z7tripledi _Z12unusedInlinei _ZTV6Unused _ZN6Unused5valueEv; do
     [[ " $symbols" != *" $name "* ]] || fail "inlinereach.o has $name, which nothing made refers to"
@@ -142,8 +143,10 @@ echo "ok   the lambdas of two files are classes of their own"
 # inline variables, which two files read in different orders: one class
 # each for the program (a static local of its call operator one object,
 # a template's instance for it one instance), named as g++ names it.
-"$cc" -c -o "$work/lambdaodr_a.o" "$tests/lambdaodr/a.cpp" 2> "$work/lambdaodr.err" || fail "-c of lambdaodr/a.cpp: $(head -3 "$work/lambdaodr.err")"
-"$cc" -c -o "$work/lambdaodr_b.o" "$tests/lambdaodr/b.cpp" 2>> "$work/lambdaodr.err" || fail "-c of lambdaodr/b.cpp: $(head -3 "$work/lambdaodr.err")"
+# (Without inlining, so that the objects hold the lambdas' call operators
+# the symbols are read for below.)
+"$cc" -fno-inline -c -o "$work/lambdaodr_a.o" "$tests/lambdaodr/a.cpp" 2> "$work/lambdaodr.err" || fail "-c of lambdaodr/a.cpp: $(head -3 "$work/lambdaodr.err")"
+"$cc" -fno-inline -c -o "$work/lambdaodr_b.o" "$tests/lambdaodr/b.cpp" 2>> "$work/lambdaodr.err" || fail "-c of lambdaodr/b.cpp: $(head -3 "$work/lambdaodr.err")"
 "$cc" -x c++ -o "$work/lambdaodr" "$work/lambdaodr_a.o" "$work/lambdaodr_b.o" 2>> "$work/lambdaodr.err" || fail "linking lambdaodr: $(head -3 "$work/lambdaodr.err")"
 "$work/lambdaodr" > "$work/lambdaodr.out" || fail "lambdaodr exits with $?"
 cmp -s "$tests/lambdaodr/expected" "$work/lambdaodr.out" || fail "lambdaodr prints otherwise (expected < > got): $(diff "$tests/lambdaodr/expected" "$work/lambdaodr.out" | head -6)"

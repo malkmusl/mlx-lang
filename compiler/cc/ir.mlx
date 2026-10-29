@@ -152,7 +152,11 @@ pub fn showStats() -> void {
     base.sayNumber(loweredInstructions)
     base.say(" instructions), ")
     base.sayNumber(fallbackCount)
-    base.say(" by the stack machine\n")
+    base.say(" by the stack machine; ")
+    base.sayNumber(inlinedCount)
+    base.say(" calls inlined (")
+    base.sayNumber(inlinedNodes)
+    base.say(" nodes)\n")
     var i: usize = 0
     while i < REASON_COUNT {
         if reasonsReady && reasonCounts[i] != 0 {
@@ -303,7 +307,32 @@ const ALIAS_STORE: usize = 4
 // A parameter: its value comes from the caller, so no store of it is
 // its only one.
 const PARAMETER: usize = 8
+// A local of a function inlined into this one (its offset is the other
+// function's: a place of this frame is given to it, INLINED_PLACE with
+// the offset in localValues, when it lives in memory).
+const INLINED: usize = 16
+const INLINED_PLACE: usize = 32
+var localCapacity: usize = 0 // (per run)
 var scratchMark: usize = 0 // (per run)
+// Inlining (MLX_CC_INLINE=0, -fno-inline: off): a call of a small function
+// of the unit lowered as its body in place, see inlineCall.
+pub var inlining = true // (per run)
+const INLINE_COST: usize = 48
+const INLINE_ALWAYS_COST: usize = 600
+const INLINE_DEPTH: usize = 4
+const INLINE_BUDGET: usize = 6000
+var inlineDepth: usize = 0 // (per run)
+var inlineBudget: usize = 0 // (per run) nodes inlined into the function being lowered
+var inlineSites: usize = 0 // (per run) sites in it: each salts the body's labels
+var labelSalt: usize = 0 // (per run) the salt of the labels being lowered (0: the function's own)
+var inInline = false // (per run)
+var inlineJoin: usize = 0 // (per run) the block an inlined body's returns go to
+var inlineResultSlot: usize = 0 // (per run) the slot its scalar result is stored in
+var inlineResultType: usize = 0 // (per run) the callee's return type
+var inlineReturnBuffer: usize = 0 // (per run) the buffer its struct result is copied to
+var inlinedLocals: usize = 0 // (per run) cells (obj, next) of the inlined functions' locals indexed here
+var inlinedCount: u64 = 0 // (per run)
+var inlinedNodes: u64 = 0 // (per run)
 // The constant 0 and the 8-byte slots made in the current block (the
 // optimizer folds duplicates anyway).
 var mainFunction = false // (per run)
@@ -354,7 +383,9 @@ fn condBranch(cond: usize, yes: usize, no: usize) -> void { terminate(lir.condBr
 
 // The block of C label `label`, made when first asked for.
 fn blockOf(label: u32) -> usize {
-    const key = @intCast(usize, label) + 1
+    // (An inlined body's labels are its function's, the same at every
+    // site: each site's salt tells them apart.)
+    const key = (labelSalt << 32) | (@intCast(usize, label) + 1)
     if labelCount * 2 >= labelCapacity { growLabels() }
     var slot = (key *% 2654435761) & (labelCapacity - 1)
     while true {
@@ -607,6 +638,7 @@ fn frameLocal(offset: i64) -> usize {
 // local it is stored at points).
 fn localAddress(o: usize) -> usize {
     if hasLocalInfo(o) && localKind(o) != LOCAL_MEMORY { tokens.errorAt(ast.obj(o).*.token, "internal error: the address of a local held as a value") }
+    if hasLocalInfo(o) && localFlag(o) & INLINED_PLACE != 0 { return frameLocal(@bitCast(i64, @intCast(u64, localValue(o)))) }
     const at = ast.obj(o).*.storedAt
     if at != 0 {
         // (The local holding the address may itself be a slot: a
@@ -881,9 +913,10 @@ fn indexLocals(fn_obj: usize) -> void {
         localCount += 1
         cell = base.getWord(cell + 8)
     }
-    localKinds = base.scratch(localCount + 8)
-    localValues = base.scratch(localCount * 8 + 8)
-    localFlags = base.scratch(localCount * 8 + 8)
+    localCapacity = localCount + 64
+    localKinds = base.scratch(localCapacity + 8)
+    localValues = base.scratch(localCapacity * 8 + 8)
+    localFlags = base.scratch(localCapacity * 8 + 8)
     var index: usize = 0
     local = ast.obj(fn_obj).*.locals
     while local != 0 {
@@ -906,6 +939,28 @@ fn indexLocals(fn_obj: usize) -> void {
     localCount = index
 }
 
+// Room in the tables for `wanted` locals (the inlined functions' come
+// after the function's own).
+fn ensureLocalRoom(wanted: usize) -> void {
+    if wanted <= localCapacity { return }
+    var capacity = localCapacity * 2
+    if capacity < wanted + 64 { capacity = wanted + 64 }
+    const kinds = base.scratch(capacity + 8)
+    const values = base.scratch(capacity * 8 + 8)
+    const flags = base.scratch(capacity * 8 + 8)
+    var i: usize = 0
+    while i < localCount {
+        base.put8(kinds + i, base.get8(localKinds + i))
+        base.putWord(values + i * 8, base.getWord(localValues + i * 8))
+        base.putWord(flags + i * 8, base.getWord(localFlags + i * 8))
+        i += 1
+    }
+    localKinds = kinds
+    localValues = values
+    localFlags = flags
+    localCapacity = capacity
+}
+
 fn forgetLocals(fn_obj: usize) -> void {
     var local = ast.obj(fn_obj).*.locals
     while local != 0 {
@@ -923,7 +978,8 @@ fn forgetLocals(fn_obj: usize) -> void {
 // (the optimizer's and the register pass's to keep where it likes).
 fn isSlotLocal(o: usize) -> bool {
     const obj = ast.obj(o)
-    if !obj.*.isLocal || obj.*.storedAt != 0 || obj.*.offset > 0 { return false }
+    if !obj.*.isLocal || obj.*.storedAt != 0 { return false }
+    if obj.*.offset > 0 && localFlag(o) & INLINED == 0 { return false }
     const ty = obj.*.ty
     if !types.isScalar(ty) && types.kind(ty) != types.REF { return false }
     if types.size(ty) > 8 || types.isBitPrecise(ty) || types.kind(ty) == types.LDOUBLE { return false }
@@ -1425,6 +1481,10 @@ fn call(n: usize) -> usize {
     const node = ast.node(n)
     const callee = node.*.lhs
     const direct = ast.kindOf(callee) == ast.VAR && types.kind(ast.typeOf(callee)) == types.FUNC
+    if direct {
+        const inlined = inlineCall(n)
+        if inlined.0 { return inlined.1 }
+    }
     const rt = node.*.ty
     const bufferInMemory = node.*.returnBuffer != 0 && types.inMemory(rt)
     // Count the arguments first for the lists' room.
@@ -1659,6 +1719,360 @@ fn call(n: usize) -> usize {
     return result
 }
 
+// ---------------------------------------------------------------------------
+// Inlining: a call of a function of the unit whose body is small (INLINE_COST
+// nodes, INLINE_ALWAYS_COST for one marked always_inline) is lowered as the
+// body in place of the call: the arguments stored into the parameters (slots
+// or places of this frame, as the function's own locals are), the body's
+// returns stores of the result into a slot and branches to a block after
+// it, the body's labels salted per site. A function lowered this way keeps
+// its locals' numbering while the caller is lowered (inlinedLocals, forgotten
+// at its end); a second site of the same function gets fresh slots and
+// reuses the frame places of the first.
+
+// The size of the body `n`, counted up to `limit` (more than it: too big,
+// or something an inlined body must not hold: a setjmp, an asm statement,
+// the frame's or the return address, alloca, va_arg).
+fn inlineCost(n: usize, limit: usize) -> usize {
+    if n == 0 { return 0 }
+    const node = ast.node(n)
+    const k = node.*.kind
+    if k == ast.ASM || k == ast.VA_START || k == ast.VA_ARG || k == ast.VA_COPY || k == ast.LABEL_ADDR { return limit + 1 }
+    if k == ast.BITOP && node.*.value == builtins.ALLOCA { return limit + 1 }
+    if k == ast.FUNCALL && isSetjmpCall(n) { return limit + 1 }
+    if k == ast.GOTO && node.*.lhs != 0 { return limit + 1 }
+    var total: usize = 1
+    if k == ast.BLOCK || k == ast.STMT_EXPR {
+        var item = node.*.body
+        while item != 0 && total <= limit {
+            total += inlineCost(item, limit)
+            item = ast.node(item).*.next
+        }
+        return total
+    }
+    if k == ast.FUNCALL {
+        var argument = node.*.args
+        while argument != 0 && total <= limit {
+            total += inlineCost(argument, limit)
+            argument = ast.node(argument).*.next
+        }
+    }
+    total += inlineCost(node.*.lhs, limit)
+    if total > limit { return total }
+    total += inlineCost(node.*.rhs, limit)
+    if total > limit { return total }
+    total += inlineCost(node.*.cond, limit)
+    if total > limit { return total }
+    total += inlineCost(node.*.then, limit)
+    if total > limit { return total }
+    total += inlineCost(node.*.els, limit)
+    if total > limit { return total }
+    total += inlineCost(node.*.init, limit)
+    if total > limit { return total }
+    total += inlineCost(node.*.inc, limit)
+    return total
+}
+
+// Whether `ty` and `other` are the same for the purposes of a value
+// passed between an inlined body and its caller.
+fn sameValueType(ty: usize, other: usize) -> bool {
+    if types.kind(ty) != types.kind(other) { return false }
+    if types.size(ty) != types.size(other) { return false }
+    return types.isUnsigned(ty) == types.isUnsigned(other)
+}
+
+// The definition the call `n` may be lowered in place of (0: none): a
+// direct call of a function of the unit, small enough, not recursive,
+// with no parameter or local the lowering could not give a place of this
+// frame, no result in memory; the cost of its body in `inlineCostFound`.
+var inlineCostFound: usize = 0 // (per run)
+
+fn inlineCandidate(n: usize) -> usize {
+    if !inlining || backend != BACKEND_LIR || inlineDepth >= INLINE_DEPTH { return 0 }
+    const node = ast.node(n)
+    const o = functionTarget(ast.node(node.*.lhs).*.variable)
+    const d = ast.obj(o).*.definition
+    if d == 0 || d == fnObj { return 0 }
+    const f = ast.obj(d)
+    if !f.*.isDefinition || f.*.body == 0 || !f.*.isFunction || f.*.beingInlined || f.*.isNoinline { return 0 }
+    if f.*.vaArea != 0 || f.*.entryOf != 0 || f.*.name == names.D_MAIN { return 0 }
+    const limit = if f.*.isAlwaysInline { INLINE_ALWAYS_COST } else { INLINE_COST }
+    var cost: usize = 0
+    if f.*.inlineCost != 0 {
+        cost = @intCast(usize, f.*.inlineCost) - 1
+    } else {
+        cost = inlineCost(f.*.body, INLINE_ALWAYS_COST)
+        if cost > INLINE_ALWAYS_COST { cost = INLINE_ALWAYS_COST + 1 }
+        f.*.inlineCost = @intCast(u32, cost + 1)
+    }
+    if cost > limit || inlineBudget + cost > INLINE_BUDGET { return 0 }
+    // The result: a scalar of the call's type, or a struct in registers
+    // made into the call's buffer.
+    const rt = types.baseOf(f.*.ty)
+    const callType = node.*.ty
+    if isStructLike(rt) {
+        if types.inMemory(rt) || node.*.returnBuffer == 0 || !isStructLike(callType) || types.size(callType) != types.size(rt) { return 0 }
+    } else if types.kind(rt) != types.VOID {
+        if types.kind(rt) == types.LDOUBLE || types.isBitPrecise(rt) || types.size(rt) > 8 { return 0 }
+        if types.kind(callType) == types.VOID || !sameValueType(rt, callType) { return 0 }
+    } else if types.kind(callType) != types.VOID {
+        return 0
+    }
+    // The parameters against the arguments.
+    var cell = f.*.params
+    var argument = node.*.args
+    while cell != 0 {
+        if argument == 0 { return 0 }
+        const p = base.getWord(cell)
+        const ty = ast.obj(p).*.ty
+        if ast.obj(p).*.storedAt != 0 || ast.obj(p).*.alignment > 16 || ast.obj(p).*.isResultBuffer { return 0 }
+        if isStructLike(ty) {
+            const at = ast.typeOf(argument)
+            if types.inMemory(ty) || !isStructLike(at) || types.size(at) != types.size(ty) { return 0 }
+        } else {
+            if types.kind(ty) == types.LDOUBLE || types.isBitPrecise(ty) || types.size(ty) > 8 { return 0 }
+            const at = ast.typeOf(argument)
+            if isStructLike(at) || types.kind(at) == types.LDOUBLE || types.kind(at) == types.VOID { return 0 }
+        }
+        cell = base.getWord(cell + 8)
+        argument = ast.node(argument).*.next
+    }
+    if argument != 0 { return 0 }
+    var local = f.*.locals
+    while local != 0 {
+        if ast.obj(local).*.isLocal && (ast.obj(local).*.storedAt != 0 || ast.obj(local).*.alignment > 16) { return 0 }
+        local = ast.obj(local).*.next
+    }
+    inlineCostFound = cost
+    return d
+}
+
+// Numbers the locals and parameters of `d` after the ones numbered so far
+// (those numbered at an earlier site keep their numbers), noting them for
+// the end of the function.
+fn indexInlined(d: usize) -> void {
+    var added: usize = 0
+    var local = ast.obj(d).*.locals
+    while local != 0 {
+        if ast.obj(local).*.isLocal && ast.obj(local).*.dataOffset == 0 { added += 1 }
+        local = ast.obj(local).*.next
+    }
+    var cell = ast.obj(d).*.params
+    while cell != 0 {
+        if ast.obj(base.getWord(cell)).*.dataOffset == 0 { added += 1 }
+        cell = base.getWord(cell + 8)
+    }
+    ensureLocalRoom(localCount + added)
+    local = ast.obj(d).*.locals
+    while local != 0 {
+        if ast.obj(local).*.isLocal {
+            if ast.obj(local).*.dataOffset == 0 { numberInlined(local, INLINED) } else { freshInlined(local, INLINED) }
+        }
+        local = ast.obj(local).*.next
+    }
+    cell = ast.obj(d).*.params
+    while cell != 0 {
+        const p = base.getWord(cell)
+        if ast.obj(p).*.dataOffset == 0 { numberInlined(p, INLINED | PARAMETER) } else { freshInlined(p, INLINED | PARAMETER) }
+        cell = base.getWord(cell + 8)
+    }
+}
+
+// A local numbered at an earlier site, classified again for this one
+// (the body's check runs again): in memory until the check says, its
+// place of the frame kept.
+fn freshInlined(o: usize, flags: usize) -> void {
+    const index = localIndex(o)
+    base.put8(localKinds + index, LOCAL_MEMORY)
+    if base.getWord(localFlags + index * 8) & INLINED_PLACE != 0 {
+        base.putWord(localFlags + index * 8, flags | INLINED_PLACE)
+    } else {
+        base.putWord(localFlags + index * 8, flags)
+        base.putWord(localValues + index * 8, 0)
+    }
+}
+
+fn numberInlined(o: usize, flags: usize) -> void {
+    ast.obj(o).*.dataOffset = localCount + 1
+    base.put8(localKinds + localCount, LOCAL_MEMORY)
+    base.putWord(localValues + localCount * 8, 0)
+    base.putWord(localFlags + localCount * 8, flags)
+    localCount += 1
+    const cell = base.scratch(16)
+    base.putWord(cell, o)
+    base.putWord(cell + 8, inlinedLocals)
+    inlinedLocals = cell
+}
+
+// After the body's check: the aliases that did not hold, the slots (fresh
+// at every site) and the places of this frame for the rest.
+fn classifyInlined(d: usize) -> void {
+    var index: usize = 0
+    while index < localCount {
+        if base.get8(localKinds + index) == LOCAL_ALIAS && base.getWord(localFlags + index * 8) & ALIAS_BROKEN != 0 {
+            const x = base.getWord(localValues + index * 8)
+            setLocalFlag(x, ADDRESSED)
+            base.put8(localKinds + index, LOCAL_MEMORY)
+        }
+        index += 1
+    }
+    var local = ast.obj(d).*.locals
+    while local != 0 {
+        if hasLocalInfo(local) { settleInlined(local) }
+        local = ast.obj(local).*.next
+    }
+    var cell = ast.obj(d).*.params
+    while cell != 0 {
+        if hasLocalInfo(base.getWord(cell)) { settleInlined(base.getWord(cell)) }
+        cell = base.getWord(cell + 8)
+    }
+}
+
+fn settleInlined(o: usize) -> void {
+    if localKind(o) == LOCAL_ALIAS { return }
+    if localFlag(o) & INLINED_PLACE != 0 { return }
+    if isSlotLocal(o) {
+        base.put8(localKinds + localIndex(o), LOCAL_SLOT)
+        base.putWord(localValues + localIndex(o) * 8, emit(lir.Opcode.alloca, tyOf(ast.obj(o).*.ty), lir.NONE, lir.NONE, lir.NONE))
+        return
+    }
+    // A place of this frame below everything placed so far.
+    const ty = ast.obj(o).*.ty
+    var alignment = ast.obj(o).*.alignment
+    if alignment < 8 { alignment = 8 }
+    if types.kind(ty) == types.ARRAY && types.size(ty) >= 16 && alignment < 16 { alignment = 16 }
+    var size = types.size(ty)
+    if size < 8 { size = 8 }
+    const bottom = types.alignTo(ast.obj(fnObj).*.stackSize + size, alignment)
+    ast.obj(fnObj).*.stackSize = bottom
+    base.putWord(localValues + localIndex(o) * 8, @intCast(usize, @bitCast(u64, 0 - bottom)))
+    setLocalFlag(o, INLINED_PLACE)
+}
+
+// The call `n` lowered as the body of its function in place: (true, the
+// result) when it was, (false, 0) when the call is to be made.
+fn inlineCall(n: usize) -> (bool, usize) {
+    const d = inlineCandidate(n)
+    if d == 0 { return -> (false, 0) }
+    const node = ast.node(n)
+    const f = ast.obj(d)
+    // The body checked as a function's is (its locals numbered first); a
+    // body the lowering does not cover is called.
+    const savedReason = unsupportedReason
+    indexInlined(d)
+    if !check(f.*.body) {
+        unsupportedReason = savedReason
+        return -> (false, 0)
+    }
+    classifyInlined(d)
+    // The arguments, from the last as a call's are, then into the parameters.
+    var count: usize = 0
+    var argument = node.*.args
+    while argument != 0 {
+        count += 1
+        argument = ast.node(argument).*.next
+    }
+    const argumentNodes = base.scratchWords(count + 1)
+    const values = base.scratchWords(count + 1)
+    var at: usize = 0
+    argument = node.*.args
+    while argument != 0 {
+        base.putWord(argumentNodes + at * 8, argument)
+        at += 1
+        argument = ast.node(argument).*.next
+    }
+    at = count
+    while at > 0 {
+        at -= 1
+        base.putWord(values + at * 8, expression(base.getWord(argumentNodes + at * 8)))
+    }
+    var cell = f.*.params
+    at = 0
+    while cell != 0 {
+        const p = base.getWord(cell)
+        const ty = ast.obj(p).*.ty
+        const argumentNode = base.getWord(argumentNodes + at * 8)
+        var value = base.getWord(values + at * 8)
+        if isStructLike(ty) {
+            copyBytes(localAddress(p), value, @intCast(usize, types.size(ty)))
+        } else {
+            const from = ast.typeOf(argumentNode)
+            if types.kind(ty) != types.PTR && types.kind(ty) != types.REF && types.kind(ty) != types.FUNC && !sameValueType(from, ty) { value = cast(value, from, ty) }
+            const slot = slotOf(p)
+            if slot.0 {
+                storeWidth(slot.1, value, lir.NONE)
+            } else {
+                storeWidth(localAddress(p), value, @intCast(usize, types.size(ty)))
+            }
+        }
+        at += 1
+        cell = base.getWord(cell + 8)
+    }
+    // The result's place, the join, the body.
+    const rt = types.baseOf(f.*.ty)
+    const savedJoin = inlineJoin
+    const savedSlot = inlineResultSlot
+    const savedType = inlineResultType
+    const savedBuffer = inlineReturnBuffer
+    const savedSalt = labelSalt
+    const savedIn = inInline
+    inlineResultSlot = lir.NONE
+    inlineReturnBuffer = lir.NONE
+    inlineResultType = rt
+    if isStructLike(rt) {
+        inlineReturnBuffer = if node.*.rhs != 0 { expression(node.*.rhs) } else { localAddress(node.*.returnBuffer) }
+    } else if types.kind(rt) != types.VOID {
+        inlineResultSlot = emit(lir.Opcode.alloca, tyOf(rt), lir.NONE, lir.NONE, lir.NONE)
+    }
+    inlineJoin = newBlock()
+    inlineSites += 1
+    labelSalt = inlineSites
+    inInline = true
+    inlineDepth += 1
+    inlineBudget += inlineCostFound
+    inlinedCount += 1
+    inlinedNodes += @intCast(u64, inlineCostFound)
+    f.*.beingInlined = true
+    if trace { base.say(base.join("lir: inlined ", base.join(base.nameOf(if f.*.linkName != 0 { f.*.linkName } else { f.*.name }), base.join(" into ", base.join(base.nameOf(if ast.obj(fnObj).*.linkName != 0 { ast.obj(fnObj).*.linkName } else { ast.obj(fnObj).*.name }), "\n"))))) }
+    statement(f.*.body)
+    if blockOpen { branchTo(inlineJoin) }
+    openBlock(inlineJoin)
+    f.*.beingInlined = false
+    inlineDepth -= 1
+    var result: usize = lir.NONE
+    if isStructLike(rt) {
+        result = inlineReturnBuffer
+    } else if types.kind(rt) != types.VOID {
+        result = loadWidth(inlineResultSlot, tyOf(rt), lir.NONE, false)
+        if types.isInteger(rt) { noteCanonicalFor(result, rt) }
+    }
+    inlineJoin = savedJoin
+    inlineResultSlot = savedSlot
+    inlineResultType = savedType
+    inlineReturnBuffer = savedBuffer
+    labelSalt = savedSalt
+    inInline = savedIn
+    return -> (true, result)
+}
+
+// A return in an inlined body: the value into the result's place, then
+// the join.
+fn inlineReturn(n: usize) -> void {
+    const node = ast.node(n)
+    if node.*.lhs != 0 {
+        const ty = ast.typeOf(node.*.lhs)
+        const value = expression(node.*.lhs)
+        if isStructLike(inlineResultType) {
+            if inlineReturnBuffer != lir.NONE && isStructLike(ty) { copyBytes(inlineReturnBuffer, value, @intCast(usize, types.size(inlineResultType))) }
+        } else if types.kind(inlineResultType) != types.VOID && inlineResultSlot != lir.NONE && types.kind(ty) != types.VOID {
+            var stored = value
+            if types.kind(inlineResultType) != types.PTR && types.kind(inlineResultType) != types.REF && types.kind(inlineResultType) != types.FUNC && !sameValueType(ty, inlineResultType) { stored = cast(value, ty, inlineResultType) }
+            storeWidth(inlineResultSlot, stored, lir.NONE)
+        }
+    }
+    branchTo(inlineJoin)
+}
+
 // The function an alias stands for (gen.functionTarget).
 fn functionTarget(o: usize) -> usize {
     if ast.obj(o).*.isFunction && ast.obj(o).*.usingOf != 0 { return ast.obj(o).*.usingOf }
@@ -1810,6 +2224,10 @@ fn switchStatement(n: usize) -> void {
 
 fn returnStatement(n: usize) -> void {
     const node = ast.node(n)
+    if inInline {
+        inlineReturn(n)
+        return
+    }
     if node.*.lhs == 0 {
         terminate(flaggedRet(lir.NONE, lir.NONE))
         return
@@ -2041,6 +2459,12 @@ pub fn genFunction(fn_obj: usize) -> bool {
     }
     fnObj = fn_obj
     mainFunction = ast.obj(fn_obj).*.name == names.D_MAIN
+    inlineDepth = 0
+    inlineBudget = 0
+    inlineSites = 0
+    labelSalt = 0
+    inInline = false
+    inlinedLocals = 0
     canonTable = 0
     canonCapacity = 0
     current = lir.init(heap.allocator())
@@ -2069,9 +2493,30 @@ pub fn genFunction(fn_obj: usize) -> bool {
             local = ast.obj(local).*.next
         }
     }
+    // (The inlined bodies' places below the function's own locals.)
+    ast.obj(fn_obj).*.stackSize = types.alignTo(ast.obj(fn_obj).*.stackSize, 16)
     irgen.emitFunction(fn_obj, ir(), blockCount, @intCast(usize, ast.obj(fn_obj).*.stackSize))
     lir.deinit(ir())
     forgetLocals(fn_obj)
+    var cell = inlinedLocals
+    while cell != 0 {
+        ast.obj(base.getWord(cell)).*.dataOffset = 0
+        cell = base.getWord(cell + 8)
+    }
+    inlinedLocals = 0
     base.releaseScratch(scratchMark)
     return true
 }
+
+// --- prefix snapshot state (tools/cc_snapshot_state.py writes this) ---
+pub fn keepState() -> void {
+    base.keepState(@intFromPtr(&inlineBudget), @sizeOf(@typeOf(inlineBudget)))
+    base.keepState(@intFromPtr(&inlineSites), @sizeOf(@typeOf(inlineSites)))
+    base.keepState(@intFromPtr(&labelSalt), @sizeOf(@typeOf(labelSalt)))
+    base.keepState(@intFromPtr(&inlineJoin), @sizeOf(@typeOf(inlineJoin)))
+    base.keepState(@intFromPtr(&inlineResultSlot), @sizeOf(@typeOf(inlineResultSlot)))
+    base.keepState(@intFromPtr(&inlineResultType), @sizeOf(@typeOf(inlineResultType)))
+    base.keepState(@intFromPtr(&inlineReturnBuffer), @sizeOf(@typeOf(inlineReturnBuffer)))
+    base.keepState(@intFromPtr(&inlinedLocals), @sizeOf(@typeOf(inlinedLocals)))
+}
+// --- end of prefix snapshot state ---

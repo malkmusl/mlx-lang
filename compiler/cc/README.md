@@ -275,6 +275,19 @@ output byte for byte as before (its lowering makes none of them):
   value slots lie below genstmt's locals) and a slot budget of 8 bytes
   per instruction (C values are one word).
 
+Calls are inlined (`-fno-inline`, `MLX_CC_INLINE=0`: not): a direct
+call of a function of the unit whose body is small (48 nodes of the
+syntax tree; 600 for one declared `always_inline`; never one declared
+`noinline`, variadic, recursive into itself, or with a result or
+parameter in memory) is lowered as the body in place of the call, to a
+depth of 4 and 6000 nodes a caller. The arguments are stored into the
+parameters, which are locals of the caller from then on (slots, or
+places of its frame below its own locals), a `return` stores the result
+into a slot (a struct in registers is made into the call's buffer) and
+branches to the block after the body, and the body's labels are salted
+per site. `MLX_CC_STATS` counts the calls inlined, `MLX_CC_LIR_TRACE`
+names them.
+
 What stays the stack machine's, function by function: `long double`
 (the x87 stack is not in the LIR), wide integers, variadic function
 definitions and `va_arg`, `cpuid`, `rdtsc` and the other asm forms the
