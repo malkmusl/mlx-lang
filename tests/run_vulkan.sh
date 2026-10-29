@@ -173,6 +173,13 @@ else
     cat "$work/check"
     failures=$((failures + 1))
 fi
+if python3 -I std/registry/vulkan/video_materialize.py --check > "$work/check" 2>&1; then
+    echo "ok   std/src/vulkan/video.mlx is current"
+else
+    echo "FAIL std/src/vulkan/video.mlx is stale"
+    cat "$work/check"
+    failures=$((failures + 1))
+fi
 if std/registry/spirv/materialize.sh --check "$compiler" > "$work/check" 2>&1; then
     echo "ok   std/src/spirv/core.mlx is current"
 else

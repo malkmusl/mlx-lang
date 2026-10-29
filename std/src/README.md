@@ -156,7 +156,12 @@ yescrypt ($y$, Ubuntu's default) and scrypt ($7$) ones,
 `tools/check_crypt.sh` compares it with the system's crypt(3).
 `vulkan.mlx` (`std.vulkan`) is the Vulkan API, materialized from
 `std/registry/vulkan/vk.xml` by `vulkan/registry.mlx` and
-`vulkan/materialize.mlx` — do not edit it by hand. `vulkan/loader.mlx`
+`vulkan/materialize.mlx` — do not edit it by hand; it includes the video
+decoding extensions (VK_KHR_video_queue, video_decode_queue,
+video_decode_h264, video_decode_h265), whose StdVideo* parameter
+structures are `vulkan/video.mlx` (`std.vulkan.video`, materialized from
+`std/registry/vulkan/video.xml` by `video_materialize.py`, the layouts
+checked against the C headers). `vulkan/loader.mlx`
 (`std.vulkan.loader`) finds and opens drivers without a C loader, and
 `vulkan/icd.mlx` (`std.vulkan.icd`) is the driver side of that interface.
 `spirv/core.mlx` (`std.spirv.core`, generated from
