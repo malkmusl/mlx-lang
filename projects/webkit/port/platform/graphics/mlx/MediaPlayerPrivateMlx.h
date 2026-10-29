@@ -26,6 +26,7 @@
 #include <wtf/HashMap.h>
 #include <wtf/Logger.h>
 #include <wtf/Lock.h>
+#include <wtf/ThreadSafeRefCounted.h>
 #include <wtf/Threading.h>
 #include <wtf/WeakPtr.h>
 
@@ -40,9 +41,15 @@ class PlatformMediaResource;
 class PlatformMediaResourceLoader;
 class SourceBufferPrivateMlx;
 
-class MediaPlayerPrivateMlx final : public MediaPlayerPrivateInterface, public CanMakeWeakPtr<MediaPlayerPrivateMlx> {
+// (MediaPlayerPrivateInterface is an AbstractRefCounted: the player
+// counts its references itself, destroyed on the main thread, as the
+// GStreamer player does.)
+class MediaPlayerPrivateMlx final : public MediaPlayerPrivateInterface, public CanMakeWeakPtr<MediaPlayerPrivateMlx>, public ThreadSafeRefCounted<MediaPlayerPrivateMlx, WTF::DestructionThread::Main> {
     WTF_MAKE_TZONE_ALLOCATED(MediaPlayerPrivateMlx);
 public:
+    void ref() const final { ThreadSafeRefCounted::ref(); }
+    void deref() const final { ThreadSafeRefCounted::deref(); }
+
     static void registerMediaEngine(MediaEngineRegistrar);
     static bool supportsContainer(const String& containerType);
     static bool supportsCodec(const String& codec);
