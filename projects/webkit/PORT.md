@@ -713,7 +713,7 @@ port in the tarball that builds WebCore without GLib).
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
-| Media | `ENABLE_VIDEO` and `ENABLE_MEDIA_SOURCE` (since M8's media part): the port's own engine, MediaPlayerPrivateMlx (below, "Media"), over std.mp4, std.aac, std.h264, std.gpu.video (Vulkan video) and std.audio through the Mlx side | the audio and video elements, Media Source Extensions (YouTube's player), no GStreamer |
+| Media | `ENABLE_VIDEO`, `ENABLE_MEDIA_SOURCE` and `ENABLE_MEDIA_SESSION` (since M8's media part): the port's own engine, MediaPlayerPrivateMlx (below, "Media"), over std.mp4, std.aac, std.h264, std.gpu.video (Vulkan video) and std.audio through the Mlx side | the audio and video elements, Media Source Extensions (YouTube's player), no GStreamer |
 | Off | `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
 | JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; `ENABLE_FTL_JIT` and `ENABLE_WEBASSEMBLY` with BBQ and OMG (since M8's sixth part): the FTL (B3 and Air), WebAssembly's in-place interpreter and tiers, bounds checks by the fault handler; WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, since M8's sixth part) | JavaScriptCore's own tiers on x86-64, as WPE has them, made by the port's own toolchain: bench.js runs in 1.2 s, 8.4 s with the C loop (below) |
 
@@ -1601,8 +1601,11 @@ controls' commands, which go to the session as remote control commands
 (play, pause, toggle, stop, next, previous, seek) that the media
 element carries out; Raise shows the tab that plays (the engine's
 `raised` poll, as `opened`). A player that stopped leaves the bus after
-half a minute. ENABLE_MEDIA_SESSION stays off: a page's MediaSession
-metadata (artist, artwork) is not seen yet, the title is the document's.
+half a minute. With ENABLE_MEDIA_SESSION on, a page's MediaSession
+(navigator.mediaSession: YouTube's title, artist and artwork, its
+nexttrack and previoustrack handlers, which CanGoNext and
+CanGoPrevious tell) is what the controls show and command; without
+one, the title is the document's.
 
 A video or audio element's `controls` are WebKit's modern media
 controls: RenderThemeMlx gives WebCore their script and style sheet
