@@ -1605,7 +1605,11 @@ half a minute. With ENABLE_MEDIA_SESSION on, a page's MediaSession
 (navigator.mediaSession: YouTube's title, artist and artwork, its
 nexttrack and previoustrack handlers, which CanGoNext and
 CanGoPrevious tell) is what the controls show and command; without
-one, the title is the document's.
+one, the title is the document's. The artwork WebCore loaded (or the
+page's icon) is written once per track as a PNG under
+`$XDG_RUNTIME_DIR` (`mlxweb_media_session_cover`: voyager-cover-PID-N.png,
+the one before deleted, the last on close) and told as a file://
+mpris:artUrl, the form the top bar's popup shows.
 
 A video or audio element's `controls` are WebKit's modern media
 controls: RenderThemeMlx gives WebCore their script and style sheet

@@ -16,11 +16,14 @@
 #include <wtf/RunLoop.h>
 #include <wtf/Vector.h>
 #include <wtf/WeakPtr.h>
+#include <wtf/text/CString.h>
+#include <wtf/text/WTFString.h>
 
 namespace WebCore {
 
 class Page;
 class PlatformMediaSessionInterface;
+struct NowPlayingInfo;
 
 class MediaSessionMlx {
 public:
@@ -42,6 +45,7 @@ private:
     void command(uint32_t kind, int64_t time);
     RefPtr<PlatformMediaSessionInterface> bestSession(Page*& page);
     void closeSession();
+    CString coverFor(const NowPlayingInfo&);
 
     Vector<WeakPtr<Page>> m_pages;
     size_t m_session { 0 };
@@ -51,6 +55,8 @@ private:
     bool m_refreshPending { false };
     bool m_seekPending { false };
     unsigned m_ticks { 0 };
+    String m_coverSource;
+    CString m_coverUrl;
     RunLoop::Timer m_timer;
     Function<void(Page&)> m_raise;
 };

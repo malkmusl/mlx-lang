@@ -4,7 +4,9 @@
 
 #if ENABLE(VIDEO)
 
+#include "Image.h"
 #include "MediaSessionManagerInterface.h"
+#include "NativeImage.h"
 #include "NowPlayingInfo.h"
 #include "Page.h"
 #include "PlatformMediaSessionInterface.h"
@@ -17,6 +19,8 @@
 #include "NavigatorMediaSession.h"
 #endif
 #include "port/MlxWebPort.h"
+#include <skia/core/SkColorSpace.h>
+#include <skia/core/SkImage.h>
 #include <wtf/NeverDestroyed.h>
 #include <wtf/text/CString.h>
 
@@ -82,6 +86,8 @@ void MediaSessionMlx::closeSession()
         return;
     mlxweb_media_session_close(m_session);
     m_session = 0;
+    m_coverSource = { };
+    m_coverUrl = { };
 }
 
 // The session shown: one that plays, else the last that has something
@@ -140,6 +146,45 @@ static bool pageHandlesAction(Page* page, int action)
 #endif
 }
 
+// The track's cover for the controls: the artwork WebCore loaded for
+// the page's MediaSession (or the page's icon), its pixels written as a
+// PNG file by the Mlx side once per artwork; the file:// URL is what the
+// top bar shows. Empty without one.
+CString MediaSessionMlx::coverFor(const NowPlayingInfo& info)
+{
+    if (!info.metadata.artwork || !info.metadata.artwork->image) {
+        m_coverSource = { };
+        m_coverUrl = { };
+        return m_coverUrl;
+    }
+    if (info.metadata.artwork->src == m_coverSource)
+        return m_coverUrl;
+    m_coverSource = info.metadata.artwork->src;
+    m_coverUrl = { };
+    if (!m_session)
+        return m_coverUrl;
+    RefPtr nativeImage = info.metadata.artwork->image->nativeImage();
+    if (!nativeImage)
+        return m_coverUrl;
+    auto& image = nativeImage->platformImage();
+    if (!image)
+        return m_coverUrl;
+    int width = image->width();
+    int height = image->height();
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096)
+        return m_coverUrl;
+    size_t rowBytes = static_cast<size_t>(width) * 4;
+    Vector<uint32_t> pixels(static_cast<size_t>(width) * height);
+    auto pixelInfo = SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
+    if (!image->readPixels(pixelInfo, pixels.mutableSpan().data(), rowBytes, 0, 0))
+        return m_coverUrl;
+    char url[1024];
+    size_t length = mlxweb_media_session_cover(m_session, pixels.span().data(), width, height, width, url, sizeof(url));
+    if (length)
+        m_coverUrl = CString(unsafeMakeSpan(url, length));
+    return m_coverUrl;
+}
+
 void MediaSessionMlx::refresh(bool seeked)
 {
     Page* page = nullptr;
@@ -171,8 +216,8 @@ void MediaSessionMlx::refresh(bool seeked)
     auto title = info->metadata.title.utf8();
     auto artist = info->metadata.artist.utf8();
     auto album = info->metadata.album.utf8();
-    CString artwork;
-    if (info->metadata.artwork)
+    CString artwork = coverFor(*info);
+    if (artwork.isNull() && info->metadata.artwork)
         artwork = info->metadata.artwork->src.utf8();
     int64_t length = std::isfinite(info->duration) && info->duration > 0 ? static_cast<int64_t>(info->duration * 1000000) : 0;
     int64_t position = std::isfinite(info->currentTime) ? static_cast<int64_t>(info->currentTime * 1000000) : 0;

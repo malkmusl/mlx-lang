@@ -70,6 +70,11 @@ all=$(dbus-send --session --print-reply --dest=$name $path org.freedesktop.DBus.
 [[ "$all" == *'int64 180000000'* && "$all" == *'int64 12000000'* ]] || fail "the length or position is off: $all"
 [[ "$all" == *'object path "/org/mlx/voyager/track/2"'* ]] || fail "no track id: $all"
 echo "ok   GetAll: the track, its length and position, Playing"
+art=$(printf '%s' "$all" | grep -A1 '"mpris:artUrl"' | grep -o 'string "file://[^"]*"' | sed 's/^string "file:\/\///; s/"$//')
+[[ -n "$art" ]] || fail "no file:// mpris:artUrl in the metadata: $all"
+[[ "$art" == */voyager-cover-$player_pid-1.png ]] || fail "the cover is not named for the player: $art"
+[[ -f "$art" && "$(head -c 4 "$art")" == $'\x89PNG' ]] || fail "the cover $art is no PNG file"
+echo "ok   the metadata's cover is a PNG file of the player's: $art"
 identity=$(dbus-send --session --print-reply --dest=$name $path org.freedesktop.DBus.Properties.Get string:org.mpris.MediaPlayer2 string:Identity)
 [[ "$identity" == *'string "Voyager"'* ]] || fail "Identity: $identity"
 root=$(dbus-send --session --print-reply --dest=$name $path org.freedesktop.DBus.Properties.GetAll string:org.mpris.MediaPlayer2)
@@ -102,6 +107,8 @@ player_pid=
 grep -q "^command 5 0" "$work/player.log" || fail "Next did not reach the player"
 grep -q "^command 7 65000000" "$work/player.log" || fail "SetPosition did not reach the player with its time"
 echo "ok   Next and SetPosition reach the player with the position"
+[[ ! -e "$art" ]] || fail "the cover $art outlived the player"
+echo "ok   the cover went with the player"
 sleep 0.3
 grep -q "PropertiesChanged" "$work/monitor.log" || fail "no PropertiesChanged signal was seen"
 grep -q "Seeked" "$work/monitor.log" || fail "no Seeked signal was seen"
