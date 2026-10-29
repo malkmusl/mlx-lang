@@ -1647,6 +1647,21 @@ tools/check_voyager.sh's scenario 26 plays WebKit's test.mp4 (6 s of
 H.264 with a silent AAC track) by itself in Voyager
 (projects/voyager/tests/media.html: the page turns green on `playing`,
 blue on `ended`, and tells the end's time in its title).
+
+On a machine with a video decoder (RADV's RX 580: Mesa 24.2 or later,
+`RADV_PERFTEST=video_decode` before), the stack is tried bottom up:
+
+    vulkaninfo | grep VK_KHR_video_decode_h264      # the extension is there
+    ./mlx build examples
+    mlx-out/bin/vulkan-decode --trace projects/webkit/upstream/Tools/TestWebKitAPI/Resources/test.mp4 out.png 50
+    ./mlx build webkit-mlx-webcore voyager
+    tools/check_voyager.sh                          # scenario 26 among them
+
+then a page with a video (a file: URL of test.mp4, then YouTube): the
+top bar shows the player (title, artist and cover from YouTube's
+MediaSession), its buttons play, pause, skip and seek, Raise shows the
+tab. Without the extension the sound plays and the picture stays
+black (the software decoder is still to come).
 Seeking resets the decoders, the demuxer's cursors (to the sync sample
 before the time) and the clock; a media source's seek waits for its
 buffers (`waitForTarget`) and re-enqueues from the time.
