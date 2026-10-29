@@ -278,15 +278,16 @@ output byte for byte as before (its lowering makes none of them):
 Calls are inlined (`-fno-inline`, `MLX_CC_INLINE=0`: not): a direct
 call of a function of the unit whose body is small (48 nodes of the
 syntax tree; 600 for one declared `always_inline`; never one declared
-`noinline`, variadic, recursive into itself, or with a result or
-parameter in memory) is lowered as the body in place of the call, to a
-depth of 4 and 6000 nodes a caller. The arguments are stored into the
-parameters, which are locals of the caller from then on (slots, or
-places of its frame below its own locals), a `return` stores the result
-into a slot (a struct in registers is made into the call's buffer; a
-reference is the object's address, which the call's dereference reads
-through) and branches to the block after the body, and the body's
-labels are salted per site. A pointer or reference parameter given a
+`noinline`, variadic, or recursive into itself) is lowered as the body
+in place of the call, to a depth of 4 and 20000 nodes a caller
+(libpas's always_inline chains, which pass their configurations as
+structs by value, fit). The arguments are stored into the parameters,
+which are locals of the caller from then on (slots, or places of its
+frame below its own locals; a struct's bytes copied into its place), a
+`return` stores the result into a slot (a struct is made into the
+call's buffer; a reference is the object's address, which the call's
+dereference reads through) and branches to the block after the body,
+and the body's labels are salted per site. A pointer or reference parameter given a
 local's address (`this`, `const T &`, through `&*p` or a cast) that the
 body only reads through, or copies (`tmp = this`, a compound
 assignment's temporary) or passes on to another body inlined, is an
