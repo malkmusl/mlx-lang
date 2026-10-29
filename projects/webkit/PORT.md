@@ -1596,16 +1596,19 @@ runs on a thread of the player's: it decodes the next audio sample and
 hands it to MLX Audio, which paces it; the frames handed over, less the
 stream's latency, are the clock the video follows and `currentTime()`
 reports (without an audio track, the monotonic time since play). Video
-samples due by the clock go through std.h264's picture order and are
-decoded by the GPU's video decoder (`mlxweb_video_*`: std.gpu.video over
+runs on a thread of its own too: the samples go through std.h264's
+picture order as they come (one picture ahead) and are decoded by the
+GPU's video decoder (`mlxweb_video_*`: std.gpu.video over
 std.vulkan's VK_KHR_video_decode_h264, on the first driver whose device
 has a video decode queue; RADV's UVD on the RX 580, Mesa 24.2 or
 `RADV_PERFTEST=video_decode` before): each picture's slices go to a
 Vulkan video session, the decoded picture buffer is one layered image,
 every picture is read back after its decode (NV12 into a buffer of the
 device's) and every frame due is converted to BGRA by std.gpu's nv12
-kernel, read back and handed to the layer as a NativeImage
-(`CoordinatedPlatformLayerBufferNativeImage`), also kept for `paint`.
+kernel, read back and, at its presentation time (the sample's, by the
+slot it was decoded into; a seek drops the frame waiting), handed to
+the layer as a NativeImage (`CoordinatedPlatformLayerBufferNativeImage`),
+also kept for `paint`.
 Without a decoding device the video stays black and the frames are
 counted; `examples/vulkan-decode` decodes a file on the device alone.
 Seeking resets the decoders, the demuxer's cursors (to the sync sample

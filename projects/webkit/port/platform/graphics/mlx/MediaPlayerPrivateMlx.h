@@ -11,7 +11,10 @@
 // Sound runs on a thread of its own that decodes the next audio sample
 // and hands it to MLX Audio, which paces it; the frames handed over are
 // the clock the video follows and currentTime() reports. Without an
-// audio track the clock is the monotonic time since play().
+// audio track the clock is the monotonic time since play(). Video runs
+// on a thread of its own too: it decodes the samples as they come (one
+// picture ahead of the frames due), reads each frame back when the
+// picture order gives it and hands it to the layer at its time.
 #pragma once
 
 #if ENABLE(VIDEO)
@@ -23,7 +26,6 @@
 #include <wtf/HashMap.h>
 #include <wtf/Logger.h>
 #include <wtf/Lock.h>
-#include <wtf/RunLoop.h>
 #include <wtf/Threading.h>
 #include <wtf/WeakPtr.h>
 
@@ -114,8 +116,8 @@ private:
     MediaPlayer::MovieLoadType movieLoadType() const final { return m_mediaSource ? MediaPlayer::MovieLoadType::StoredStream : MediaPlayer::MovieLoadType::Download; }
     String engineDescription() const final { return "Mlx"_s; }
     bool ended() const final { return m_ended; }
-    unsigned decodedFrameCount() const final { return m_decodedFrames; }
-    unsigned droppedFrameCount() const final { return m_droppedFrames; }
+    unsigned decodedFrameCount() const final { return m_decodedFrames.load(); }
+    unsigned droppedFrameCount() const final { return m_droppedFrames.load(); }
     bool supportsProgressMonitoring() const final { return !m_mediaSource; }
 
     // A track of the movie: the demuxer's index and what decodes it.
@@ -139,10 +141,13 @@ private:
     void stopAudioThread();
     void audioLoop();
     bool nextAudioSample(Vector<uint8_t>& bytes, MediaTime& presentationTime);
-    bool nextVideoSample(Vector<uint8_t>& bytes, MediaTime& presentationTime, bool& sync);
-    void videoTick();
-    void decodeVideoSample(const Vector<uint8_t>&, const MediaTime&, bool sync);
-    void presentFrame(uint32_t slot);
+    bool nextVideoSample(Vector<uint8_t>& bytes, MediaTime& presentationTime);
+    void startVideoThread();
+    void stopVideoThread();
+    void wakeVideo();
+    void videoLoop();
+    void decodeVideoSample(const Vector<uint8_t>&, const MediaTime&);
+    bool presentFrame(uint32_t slot, const MediaTime& due);
     void checkEnded();
     void didReachEnd();
     void resetDecoders();
@@ -211,21 +216,30 @@ private:
     MonotonicTime m_clockStarted;
     bool m_clockRunning { false };
 
-    // Video: the H.264 picture order (port/mlx/media.mlx's) and the layer
-    // the frames go to; the timer that takes the samples due.
+    // Video: the H.264 picture order (port/mlx/media.mlx's), the GPU's
+    // decoder (opened at the first picture; 0 when no device decodes)
+    // and the layer the frames go to. The decoders are the video
+    // thread's; the main thread touches them (parameter sets, a reset)
+    // under m_decoderLock.
     size_t m_h264 { 0 };
     bool m_h264Configured { false };
-    // The GPU's decoder (port/mlx/media.mlx's), opened at the first
-    // picture; 0 when no device decodes.
     size_t m_videoDecoder { 0 };
     bool m_videoDecoderTried { false };
-    RefPtr<NativeImage> m_lastFrame;
+    Lock m_decoderLock;
+    // The presentation time of the picture in each DPB slot.
+    MediaTime m_slotTimes[17];
+    RefPtr<Thread> m_videoThread;
+    Lock m_videoLock;
+    Condition m_videoCondition;
+    bool m_videoThreadShouldExit { false };
+    // Bumped by a seek: a frame waiting for its time is dropped.
+    std::atomic<unsigned> m_videoGeneration { 0 };
+    Lock m_frameLock;
+    RefPtr<NativeImage> m_lastFrame WTF_GUARDED_BY_LOCK(m_frameLock);
     RefPtr<CoordinatedPlatformLayerBufferProxy> m_layerProxy;
-    RunLoop::Timer m_videoTimer;
-    MediaTime m_lastVideoTime { MediaTime::invalidTime() };
-    unsigned m_decodedFrames { 0 };
-    unsigned m_droppedFrames { 0 };
-    bool m_videoEnded { false };
+    std::atomic<unsigned> m_decodedFrames { 0 };
+    std::atomic<unsigned> m_droppedFrames { 0 };
+    std::atomic<bool> m_videoEnded { false };
     bool m_audioEnded { false };
     TrackID m_lastTrackID { 0 };
     uint64_t m_lastLogIdentifier { 0 };

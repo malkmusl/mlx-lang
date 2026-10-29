@@ -147,7 +147,6 @@ private:
 MediaPlayerPrivateMlx::MediaPlayerPrivateMlx(MediaPlayer* player)
     : m_player(player)
     , m_logger(Logger::create(this))
-    , m_videoTimer(RunLoop::mainSingleton(), "MediaPlayerPrivateMlx::VideoTimer"_s, this, &MediaPlayerPrivateMlx::videoTick)
 {
 #if USE(COORDINATED_GRAPHICS)
     m_layerProxy = CoordinatedPlatformLayerBufferProxy::create();
@@ -215,6 +214,7 @@ void MediaPlayerPrivateMlx::mediaSourceHasRetrievedAllData()
     for (auto& queue : m_queues.values())
         queue.ended = true;
     wakeAudio();
+    wakeVideo();
 }
 
 void MediaPlayerPrivateMlx::notifyActiveSourceBuffersChanged()
@@ -231,6 +231,7 @@ void MediaPlayerPrivateMlx::enqueueSample(Ref<MediaSampleMlx>&& sample, TrackID 
         queue.ended = false;
     }
     wakeAudio();
+    wakeVideo();
 }
 
 void MediaPlayerPrivateMlx::flushTrack(TrackID trackID)
@@ -259,6 +260,7 @@ void MediaPlayerPrivateMlx::setTrackEnded(TrackID trackID)
     auto& queue = m_queues.ensure(trackID, [] { return Queue { }; }).iterator->value;
     queue.ended = true;
     wakeAudio();
+    wakeVideo();
 }
 
 void MediaPlayerPrivateMlx::notifyWhenReadyForMoreSamples(TrackID trackID, SourceBufferPrivateMlx& buffer)
@@ -291,6 +293,7 @@ void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t ti
         track.codec = MLXWEB_MEDIA_H264;
         m_videoTrack = track;
         m_naturalSize = size;
+        Locker locker { m_decoderLock };
         if (!m_h264)
             m_h264 = mlxweb_media_h264_create();
         if (m_h264) {
@@ -314,8 +317,8 @@ void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t ti
     if (m_playing) {
         if (m_audioTrack)
             startAudioThread();
-        if (m_videoTrack && !m_videoTimer.isActive())
-            m_videoTimer.startRepeating(16_ms);
+        if (m_videoTrack)
+            startVideoThread();
     }
 }
 
@@ -331,7 +334,7 @@ void MediaPlayerPrivateMlx::mediaSourceBufferedChanged()
 void MediaPlayerPrivateMlx::cancelLoad()
 {
     stopAudioThread();
-    m_videoTimer.stop();
+    stopVideoThread();
     m_playing = false;
     m_clockRunning = false;
     if (m_resource) {
@@ -374,7 +377,10 @@ void MediaPlayerPrivateMlx::cancelLoad()
         m_videoDecoder = 0;
     }
     m_videoDecoderTried = false;
-    m_lastFrame = nullptr;
+    {
+        Locker locker { m_frameLock };
+        m_lastFrame = nullptr;
+    }
     if (m_audioOutput) {
         mlxweb_audio_close(m_audioOutput);
         m_audioOutput = 0;
@@ -606,7 +612,7 @@ void MediaPlayerPrivateMlx::play()
     if (m_audioTrack)
         startAudioThread();
     if (m_videoTrack)
-        m_videoTimer.startRepeating(16_ms);
+        startVideoThread();
     m_player->playbackStateChanged();
 }
 
@@ -616,8 +622,8 @@ void MediaPlayerPrivateMlx::pause()
         return;
     m_playing = false;
     stopClock();
-    m_videoTimer.stop();
     wakeAudio();
+    wakeVideo();
     m_player->playbackStateChanged();
 }
 
@@ -659,10 +665,13 @@ Ref<MediaTimePromise> MediaPlayerPrivateMlx::seekToTarget(const SeekTarget& targ
                 mlxweb_media_seek(m_demuxer, m_videoTrack->index, static_cast<uint64_t>(std::max<int64_t>(0, time.toTimeScale(m_videoTrack->timescale).timeValue())) + m_videoTrack->editMediaTime);
         }
     }
+    // A frame waiting for its time is dropped first: the video thread
+    // holds the decoders while it waits.
+    ++m_videoGeneration;
+    wakeVideo();
     flushQueues();
     resetDecoders();
     seekClockTo(time);
-    m_lastVideoTime = MediaTime::invalidTime();
     wakeAudio();
 #if ENABLE(MEDIA_SOURCE)
     if (m_mediaSource) {
@@ -699,6 +708,7 @@ void MediaPlayerPrivateMlx::resetDecoders()
 {
     if (m_aacDecoder)
         mlxweb_media_aac_reset(m_aacDecoder);
+    Locker locker { m_decoderLock };
     if (m_h264) {
         mlxweb_media_h264_flush(m_h264);
         uint32_t slot = 0;
@@ -722,7 +732,6 @@ void MediaPlayerPrivateMlx::didReachEnd()
     m_playing = false;
     m_ended = true;
     stopClock();
-    m_videoTimer.stop();
     auto total = duration();
     if (total.isValid() && !total.isPositiveInfinite())
         m_clockBase = total;
@@ -876,7 +885,40 @@ void MediaPlayerPrivateMlx::audioLoop()
 
 // ---- Video ----
 
-bool MediaPlayerPrivateMlx::nextVideoSample(Vector<uint8_t>& bytes, MediaTime& presentationTime, bool& sync)
+void MediaPlayerPrivateMlx::wakeVideo()
+{
+    Locker locker { m_videoLock };
+    m_videoCondition.notifyAll();
+}
+
+void MediaPlayerPrivateMlx::startVideoThread()
+{
+    if (m_videoThread) {
+        wakeVideo();
+        return;
+    }
+    m_videoThreadShouldExit = false;
+    m_videoThread = Thread::create("MediaPlayerPrivateMlx video"_s, [this] {
+        videoLoop();
+    });
+}
+
+void MediaPlayerPrivateMlx::stopVideoThread()
+{
+    if (!m_videoThread)
+        return;
+    {
+        Locker locker { m_videoLock };
+        m_videoThreadShouldExit = true;
+        m_videoCondition.notifyAll();
+    }
+    m_videoThread->waitForCompletion();
+    m_videoThread = nullptr;
+}
+
+// The next video sample in decoding order: a media source's queue, or
+// the file's next sample.
+bool MediaPlayerPrivateMlx::nextVideoSample(Vector<uint8_t>& bytes, MediaTime& presentationTime)
 {
 #if ENABLE(MEDIA_SOURCE)
     if (m_mediaSource) {
@@ -887,13 +929,8 @@ bool MediaPlayerPrivateMlx::nextVideoSample(Vector<uint8_t>& bytes, MediaTime& p
             Locker locker { m_queueLock };
             auto it = m_queues.find(m_videoTrack->id);
             if (it != m_queues.end()) {
-                if (!it->value.samples.isEmpty()) {
-                    auto& first = it->value.samples.first();
-                    // Only what is due by the clock.
-                    if (first->presentationTime() > clockTime() + MediaTime(1, 30))
-                        return false;
+                if (!it->value.samples.isEmpty())
                     sample = it->value.samples.takeFirst();
-                }
                 ended = it->value.ended && it->value.samples.isEmpty();
                 if (it->value.samples.size() < videoQueueLimit / 2 && it->value.waiting) {
                     waiting = WTF::move(it->value.waiting);
@@ -902,8 +939,10 @@ bool MediaPlayerPrivateMlx::nextVideoSample(Vector<uint8_t>& bytes, MediaTime& p
             }
         }
         if (waiting) {
-            if (RefPtr buffer = waiting.get())
-                buffer->readyForMoreSamples(m_videoTrack->id);
+            callOnMainThread([waiting, trackID = m_videoTrack->id] {
+                if (RefPtr buffer = waiting.get())
+                    buffer->readyForMoreSamples(trackID);
+            });
         }
         if (!sample) {
             if (ended)
@@ -912,7 +951,6 @@ bool MediaPlayerPrivateMlx::nextVideoSample(Vector<uint8_t>& bytes, MediaTime& p
         }
         bytes = sample->bytes();
         presentationTime = sample->presentationTime();
-        sync = sample->flags() & MediaSample::IsSync;
         return true;
     }
 #endif
@@ -928,47 +966,49 @@ bool MediaPlayerPrivateMlx::nextVideoSample(Vector<uint8_t>& bytes, MediaTime& p
         return false;
     bytes = Vector<uint8_t>(m_fileBytes.subspan(sample.offset, sample.size));
     presentationTime = MediaTime(sample.pts - static_cast<int64_t>(m_videoTrack->editMediaTime), m_videoTrack->timescale);
-    sync = sample.sync;
     return true;
 }
 
-void MediaPlayerPrivateMlx::videoTick()
+// The video thread: while playing, the samples as they come, each
+// decoded and the frames due shown at their time.
+void MediaPlayerPrivateMlx::videoLoop()
 {
-    if (!m_playing || !m_videoTrack)
-        return;
-    // A file's samples are taken as they come due; a media source's are
-    // checked against the clock before they are taken.
-    for (unsigned taken = 0; taken < 4; ++taken) {
-        Vector<uint8_t> bytes;
-        MediaTime presentationTime;
-        bool sync = false;
-#if ENABLE(MEDIA_SOURCE)
-        if (!m_mediaSource) {
-#endif
-            if (m_lastVideoTime.isValid() && m_lastVideoTime > clockTime() + MediaTime(1, 30))
+    Vector<uint8_t> bytes;
+    MediaTime presentationTime;
+    while (true) {
+        {
+            Locker locker { m_videoLock };
+            while (!m_videoThreadShouldExit && !m_playing)
+                m_videoCondition.wait(m_videoLock);
+            if (m_videoThreadShouldExit)
                 break;
-#if ENABLE(MEDIA_SOURCE)
         }
-#endif
-        if (!nextVideoSample(bytes, presentationTime, sync))
-            break;
-        m_lastVideoTime = presentationTime;
-        decodeVideoSample(bytes, presentationTime, sync);
+        if (!nextVideoSample(bytes, presentationTime)) {
+            if (m_videoEnded) {
+                callOnMainThread([weakThis = WeakPtr { *this }] {
+                    if (RefPtr protectedThis = weakThis.get())
+                        protectedThis->checkEnded();
+                });
+            }
+            Locker locker { m_videoLock };
+            m_videoCondition.waitFor(m_videoLock, 20_ms);
+            continue;
+        }
+        decodeVideoSample(bytes, presentationTime);
     }
-    if (m_videoEnded)
-        checkEnded();
 }
 
 // The access unit through the H.264 picture order: its picture in the
 // decoded picture buffer, decoded by the GPU (std.gpu.video), then the
-// pictures due for output read back and shown. Without a decoding
-// device the frames are counted and the layer stays as it is.
-void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, const MediaTime& presentationTime, bool)
+// pictures due for output read back and shown at their time. Without a
+// decoding device the frames are counted and the layer stays as it is.
+void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, const MediaTime& presentationTime)
 {
+    Locker locker { m_decoderLock };
     if (!m_h264)
         return;
     if (!m_h264Configured) {
-        Locker locker { m_demuxerLock };
+        Locker demuxerLocker { m_demuxerLock };
         if (m_demuxer) {
             for (size_t set = 0;; ++set) {
                 size_t length = 0;
@@ -983,6 +1023,9 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
     auto status = mlxweb_media_h264_access_unit(m_h264, bytes.span().data(), bytes.size(), 4);
     if (status != MLXWEB_MEDIA_OK)
         return;
+    uint32_t pictureSlot = mlxweb_media_h264_picture_slot(m_h264);
+    if (pictureSlot < std::size(m_slotTimes))
+        m_slotTimes[pictureSlot] = presentationTime;
     if (!m_videoDecoderTried) {
         m_videoDecoderTried = true;
         m_videoDecoder = mlxweb_video_open();
@@ -992,44 +1035,74 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
     uint32_t slot = 0;
     int32_t poc = 0;
     while (mlxweb_media_h264_next_output(m_h264, &slot, &poc)) {
-        if (presentationTime + MediaTime(1, 2) < clockTime()) {
+        MediaTime due = slot < std::size(m_slotTimes) ? m_slotTimes[slot] : presentationTime;
+        if (due + MediaTime(1, 2) < clockTime()) {
             ++m_droppedFrames;
             continue;
         }
-        ++m_decodedFrames;
-        if (decoded)
-            presentFrame(slot);
+        if (decoded && presentFrame(slot, due))
+            ++m_decodedFrames;
+        else
+            ++m_droppedFrames;
     }
 }
 
 // The frame in the decoder's slot: read back as BGRA into a Skia raster
-// image, to the layer (and kept for paint).
-void MediaPlayerPrivateMlx::presentFrame(uint32_t slot)
+// image now (the slot may be reused by the next picture), shown when
+// its time comes (kept for paint), unless a seek came first. False
+// when it could not be read.
+bool MediaPlayerPrivateMlx::presentFrame(uint32_t slot, const MediaTime& due)
 {
     int width = mlxweb_video_width(m_videoDecoder);
     int height = mlxweb_video_height(m_videoDecoder);
     if (width <= 0 || height <= 0)
-        return;
+        return false;
     size_t rowBytes = static_cast<size_t>(width) * 4;
     auto data = SkData::MakeUninitialized(rowBytes * height);
     if (!data || !mlxweb_video_read_frame(m_videoDecoder, slot, data->writable_data(), rowBytes))
-        return;
+        return false;
     auto info = SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
     auto image = SkImages::RasterFromData(info, WTF::move(data), rowBytes);
     if (!image)
-        return;
+        return false;
     RefPtr nativeImage = NativeImage::create(WTF::move(image));
     if (!nativeImage)
-        return;
-    m_lastFrame = nativeImage;
+        return false;
+    // Its time: wait for it (a pause shows it where it stopped; a seek
+    // drops it).
+    unsigned generation = m_videoGeneration.load();
+    while (m_playing && !m_videoThreadShouldExit) {
+        auto now = clockTime();
+        if (due <= now + MediaTime(1, 120))
+            break;
+        double seconds = (due - now).toDouble();
+        if (seconds > 0.25)
+            seconds = 0.25;
+        Locker locker { m_videoLock };
+        m_videoCondition.waitFor(m_videoLock, Seconds(seconds));
+        if (m_videoGeneration.load() != generation)
+            return false;
+    }
+    if (m_videoGeneration.load() != generation)
+        return false;
+    {
+        Locker locker { m_frameLock };
+        m_lastFrame = nativeImage;
+    }
     if (m_naturalSize != FloatSize(width, height)) {
-        m_naturalSize = FloatSize(width, height);
-        m_player->sizeChanged();
+        callOnMainThread([weakThis = WeakPtr { *this }, size = FloatSize(width, height)] {
+            RefPtr protectedThis = weakThis.get();
+            if (!protectedThis || protectedThis->m_naturalSize == size)
+                return;
+            protectedThis->m_naturalSize = size;
+            protectedThis->m_player->sizeChanged();
+        });
     }
 #if USE(COORDINATED_GRAPHICS)
     if (m_layerProxy)
         m_layerProxy->setDisplayBuffer(CoordinatedPlatformLayerBufferNativeImage::create(nativeImage.releaseNonNull(), nullptr));
 #endif
+    return true;
 }
 
 PlatformLayer* MediaPlayerPrivateMlx::platformLayer() const
@@ -1045,8 +1118,13 @@ void MediaPlayerPrivateMlx::paint(GraphicsContext& context, const FloatRect& rec
 {
     if (!m_videoTrack)
         return;
-    if (m_lastFrame) {
-        context.drawNativeImage(*m_lastFrame, rect, FloatRect { { }, m_lastFrame->size() });
+    RefPtr<NativeImage> frame;
+    {
+        Locker locker { m_frameLock };
+        frame = m_lastFrame;
+    }
+    if (frame) {
+        context.drawNativeImage(*frame, rect, FloatRect { { }, frame->size() });
         return;
     }
     context.fillRect(rect, Color::black);
