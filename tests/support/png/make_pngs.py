@@ -5,8 +5,9 @@ Each NAME.png comes with NAME.argb: the pixels std.png must decode it to,
 premultiplied 0xAARRGGBB as little-endian words (alpha rounded like std.png:
 (channel * alpha + 127) // 255). The images cover every colour type and bit
 depth, all five row filters (row r uses filter r % 5), and zlib streams with
-stored (level 0), fixed and dynamic Huffman blocks. interlaced.png must be
-refused. scaled.argb is rgba8.png shrunk to 5x3 by area averaging.
+stored (level 0), fixed and dynamic Huffman blocks. interlaced.png is
+rgba8's pixels interlaced (Adam7, each pass filtered on its own).
+scaled.argb is rgba8.png shrunk to 5x3 by area averaging.
 
 Run from the repository root:  python3 tests/support/png/make_pngs.py
 """
@@ -47,9 +48,26 @@ def filtered(rows, bpp):
     return out
 
 
+# Adam7: each pass's rows (the pixels at its start and step), filtered as
+# an image of its own; passes without pixels are left out.
+ADAM7 = [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)]
+
+
+def interlaced(rows, bpp):
+    out = b""
+    for x0, y0, dx, dy in ADAM7:
+        pass_rows = [bytes(row[(x * bpp):(x * bpp + bpp)]) for row in rows[y0::dy] for x in range(x0, W, dx)]
+        columns = len(range(x0, W, dx))
+        if not pass_rows or columns == 0:
+            continue
+        pass_rows = [b"".join(pass_rows[i:i + columns]) for i in range(0, len(pass_rows), columns)]
+        out += filtered(pass_rows, bpp)
+    return out
+
+
 def png(color_type, depth, rows, bpp, level=9, palette=None, trns=None, interlace=0, strategy=None):
     header = struct.pack(">IIBBBBB", W, H, depth, color_type, 0, 0, interlace)
-    data = filtered(rows, bpp)
+    data = interlaced(rows, bpp) if interlace else filtered(rows, bpp)
     if strategy is None:
         compressed = zlib.compress(data, level)
     else:
@@ -124,9 +142,9 @@ def main():
     alpha = lambda i: trns[i] if i < len(trns) else 255
     save("palette4", png(3, 4, rows, 1, palette=palette, trns=trns),
          [premultiply(alpha(i), palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]) for row in values for i in row])
-    # Interlaced: refused.
+    # Interlaced (Adam7): rgba8's pixels again.
     rows = [bytes(v for x in range(W) for v in rgba(x, y)) for y in range(H)]
-    save("interlaced", png(6, 8, rows, 4, interlace=1), None)
+    save("interlaced", png(6, 8, rows, 4, interlace=1), rgba8)
     # rgba8 shrunk to 5x3 by area averaging.
     scaled = []
     for y in range(3):
