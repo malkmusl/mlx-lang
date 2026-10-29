@@ -246,16 +246,34 @@ jsc on bench.js, SQLite) before anything is called fast.
   locals among them (the register holds the value extended; a store
   re-extends it, `x = x + 1` with its `extend` done in place); a
   discarded call at the end of a comma (an operator's, its argument
-  evaluated before) delivers no result. The LayoutUnit loop's body: 11
-  instructions (was 22; gcc -O2: 7), no frame access but the two
-  parameters' slots. Found on the way: the encoder's rax slot cache
+  evaluated before) delivers no result; a function's parameters compete
+  with its locals for the registers (registers.parameterHomes, the
+  value moved into one on entry), so `this` lives in a register; a
+  call's arguments and its address (r11) are loaded as a parallel
+  move from wherever they are, the cache's registers included (the
+  call reads them before it writes them), and a shift by a constant
+  is a shift by an immediate; `p[i]` is a gep the back end makes one
+  indexed load, store or lea of ([base + index * 4], an index read
+  last scaled in its own register otherwise), a pointer plus a
+  constant (a vtable entry's) a gep folded into the access, and a
+  load of what the block already loaded (the vtable pointer for two
+  virtual calls, a member read twice) a copy of it. The LayoutUnit
+  loop's body: 11 instructions (was 22; gcc -O2: 7), with no frame
+  access at all; a virtual call: the vtable pointer and two entries
+  loaded, two moves and the call. Found on the way: the encoder's rax
+  slot cache
   was not reset by `setcc` and the memory-operand ALU forms, and mlx4
   miscompiles an assignment to a tuple's field (`held.0 = true` does
   nothing), so the back end uses separate variables.
-- [ ] 32-bit arithmetic as such (the `extend` after every `int`
-  operation costs an instruction); parameters in registers; the cache
-  kept across a call's arguments (loaded from the registers in order,
-  a parallel move); values live across blocks in registers.
+- [x] The `extend` after an `int` operation (epoch 53): dropped when
+  every reader takes the low 32 bits alone (an operator producing low
+  bits from low bits, a store of 4 bytes or fewer, a call's argument,
+  which the callee extends on entry); kept before a compare, a shift
+  right, a division, an address, a whole-word store or a return.
+- [ ] The vtable's adjustment entry read only for a class with more
+  than one base; values live across blocks in registers; a function's
+  prologue saving only the registers it uses (it does) and no frame
+  for a function needing none.
 - [x] SIMD intrinsics as their instructions (epoch 47): the SSE, SSE2,
   SSE3, SSSE3, SSE4.1 and SSE4.2 headers over `__builtin_mlxcc_asm`,
   the assembler knowing the packed-integer instructions

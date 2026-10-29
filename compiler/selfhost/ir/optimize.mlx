@@ -1,5 +1,6 @@
 const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
 const control_flow_dce = @import("./control_flow_dce.mlx")
+const OPERAND_CAPACITY: usize = 64
 const escape = @import("./escape.mlx")
 const registers = @import("./registers.mlx")
 const function_dce = @import("./function_dce.mlx")
@@ -34,6 +35,11 @@ pub const Result = struct {
     returnSlotMismatches: usize
 }
 
+// Whether an `extend` to 32 bits or fewer whose every reader takes the
+// low bits alone is dropped (dropExtends): a client's (mlx-cc's) choice,
+// whose int arithmetic extends after every operation.
+pub var narrowArithmetic: bool = false
+
 pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result { return runPasses(ir, allocator, true) }
 
 // The passes within each function alone, for an LIR that holds one
@@ -59,9 +65,12 @@ fn runPasses(ir: *lir.Lir, allocator: allocator_module.Allocator, whole: bool) -
         var post_terminator = control_flow_dce.eliminatePostTerminator(ir)
         var merged = control_flow_dce.mergeFallthroughBlocks(ir, allocator)
         var folded = foldConstants(ir, count, &simplified)
-        const forwarded = forwardLocalLoads(ir, first, second, count)
+        var forwarded = forwardLocalLoads(ir, first, second, count)
         const single = single_store.run(ir, allocator)
-        const propagated = propagateCopies(ir, first, count)
+        var propagated = propagateCopies(ir, first, count)
+        // (After the copies: two loads through one address name it alike.)
+        forwarded += forwardLoads(ir, first, second, count)
+        propagated += propagateCopies(ir, first, count)
         folded += foldConstants(ir, count, &simplified)
         post_terminator += control_flow_dce.eliminatePostTerminator(ir)
         merged += control_flow_dce.mergeFallthroughBlocks(ir, allocator)
@@ -69,7 +78,19 @@ fn runPasses(ir: *lir.Lir, allocator: allocator_module.Allocator, whole: bool) -
         recordUses(ir, uses, count)
         const fused = fuseComparisonBranches(ir, uses, count)
         const promoted = promoteLocals(ir, uses, first, second, count)
-        const eliminated = eliminateUnused(ir, uses, count)
+        var eliminated = eliminateUnused(ir, uses, count)
+        // (After the locals' dead stores are gone: a whole-word store
+        // reads every bit.)
+        var dropped: usize = 0
+        if narrowArithmetic {
+            dropped = dropExtends(ir, first, count)
+            if dropped > 0 {
+                propagated += propagateCopies(ir, first, count)
+                zero(uses, count)
+                recordUses(ir, uses, count)
+                eliminated += eliminateUnused(ir, uses, count)
+            }
+        }
         markRetentionHints(ir, uses, count)
         var moved = escape.Result.{ .regions = 0, .bytes = 0, .slotMismatches = 0 }
         if whole { moved = escape.run(ir, allocator) }
@@ -217,6 +238,93 @@ fn forwardLocalLoads(ir: *lir.Lir, values: [*]usize, epochs: [*]usize, count: us
         index += 1
     }
     return forwarded
+}
+
+// A load of what a load before it in the block read, with no store, call
+// or other barrier between them (the same address value, width and
+// signedness): a copy of the first (an object's vtable pointer read for
+// two virtual calls, a member read twice).
+fn forwardLoads(ir: *lir.Lir, values: [*]usize, epochs: [*]usize, count: usize) -> usize {
+    zeroPair(values, epochs, count)
+    var current_epoch: usize = 1
+    var forwarded: usize = 0
+    var index: usize = 0
+    while index < count {
+        const inst = lir.getInst(ir, index)
+        if (isBarrier(inst.opcode) && !copiesIntoFreshStorage(ir, inst, count)) || inst.opcode == lir.Opcode.store { current_epoch += 1 }
+        if inst.opcode == lir.Opcode.load && inst.arg0 != lir.NONE && inst.arg0 < count {
+            const address = inst.arg0
+            if epochs[address] == current_epoch {
+                const earlier = lir.getInst(ir, values[address])
+                if earlier.arg1 == inst.arg1 && earlier.arg2 == inst.arg2 {
+                    var replacement = lir.initInst(lir.Opcode.copy, inst.typeId)
+                    replacement.arg0 = values[address]
+                    lir.setInst(ir, index, replacement)
+                    forwarded += 1
+                    index += 1
+                    continue
+                }
+            }
+            values[address] = index
+            epochs[address] = current_epoch
+        }
+        index += 1
+    }
+    return forwarded
+}
+
+// The upper bits of a value matter to few of its readers: the operators
+// whose low bits come from their operands' low bits (add, sub, mul, the
+// bitwise ones, shl, a shift's count), a store of 4 bytes or fewer, a
+// call's argument (the callee extends it on entry) and another extend
+// to 32 bits or fewer take the low bits alone. An extend from 32 bits
+// read nowhere else is a copy of its operand (mlx-cc's int arithmetic:
+// `movslq` after every operation otherwise).
+fn dropExtends(ir: *lir.Lir, sensitive: [*]usize, count: usize) -> usize {
+    zero(sensitive, count)
+    var buffer: [OPERAND_CAPACITY]usize = undefined
+    var index: usize = 0
+    while index < count {
+        const inst = lir.getInst(ir, index)
+        const op = inst.opcode
+        if op == lir.Opcode.add || op == lir.Opcode.sub || op == lir.Opcode.mul || op == lir.Opcode.bit_and || op == lir.Opcode.bit_or || op == lir.Opcode.bit_xor || op == lir.Opcode.shl {
+        } else if op == lir.Opcode.shr {
+            markSensitive(sensitive, count, inst.arg0)
+        } else if op == lir.Opcode.extend && inst.arg1 <= 32 {
+        } else if op == lir.Opcode.store && inst.arg2 != lir.NONE && inst.arg2 <= 4 {
+            markSensitive(sensitive, count, inst.arg0)
+        } else if op == lir.Opcode.call {
+            markSensitive(sensitive, count, inst.arg0)
+        } else if op == lir.Opcode.direct_call {
+        } else {
+            const read = operands.collect(ir, inst, &buffer, OPERAND_CAPACITY)
+            var at: usize = 0
+            while at < read && at < OPERAND_CAPACITY {
+                markSensitive(sensitive, count, buffer[at])
+                at += 1
+            }
+        }
+        index += 1
+    }
+    var dropped: usize = 0
+    index = 0
+    while index < count {
+        const inst = lir.getInst(ir, index)
+        // (From 32 bits only: an extend from 8 or 16 changes the low 32
+        // bits too, which a 4-byte reader sees.)
+        if inst.opcode == lir.Opcode.extend && inst.arg1 == 32 && sensitive[index] == 0 {
+            var replacement = lir.initInst(lir.Opcode.copy, inst.typeId)
+            replacement.arg0 = inst.arg0
+            lir.setInst(ir, index, replacement)
+            dropped += 1
+        }
+        index += 1
+    }
+    return dropped
+}
+
+fn markSensitive(sensitive: [*]usize, count: usize, value: usize) -> void {
+    if value != lir.NONE && value < count { sensitive[value] = 1 }
 }
 
 // A mem_copy into storage an alloca with a byte count just made (a local's

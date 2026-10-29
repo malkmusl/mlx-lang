@@ -197,13 +197,17 @@ build`'s cache keys, as they are) each function body is made not as the
 stack machine of gen.mlx but as the Mlx compiler's own intermediate
 representation, LIR (`compiler/selfhost/ir`),
 which mlx4's optimizer (constants folded, loads of locals forwarded and
-locals held as values, copies propagated, stores and dead values dropped,
+locals held as values, copies propagated, a load of what the block
+loaded already a copy of it, stores and dead values dropped,
 blocks only fallen into joined to the block before them, the most used
-locals of a function in rbx, r12, r13, r14 and r15, `int`, `unsigned`
-and byte locals among them, each register kept extended to the word)
+locals and parameters of a function in rbx, r12, r13, r14 and r15,
+`int`, `unsigned` and byte locals among them, each register kept
+extended to the word)
 and its x86-64 back end (a block's intermediate values in rsi, rdi, r8,
 r9 and r10 until a call or the block's end, an operand read last
-operated on in its own register, loads and leas straight into theirs)
+operated on in its own register, loads and leas straight into theirs,
+a call's arguments moved from wherever they are at once, `p[i]` one
+indexed load, store or lea)
 then turn into code, through the one encoder both share. The
 lowering is `ir.mlx` (the syntax tree to LIR: the C semantics, the
 System V classification of calls and parameters) and `irgen.mlx` (the

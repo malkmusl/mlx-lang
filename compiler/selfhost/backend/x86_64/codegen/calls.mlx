@@ -3,6 +3,9 @@ const target = @import("../target.mlx")
 const lir_module = @import("../../../ir/lir.mlx")
 const state_module = @import("./state.mlx")
 
+// The most integer argument registers a call loads (target.ARG_REGS_COUNT).
+const MOVE_CAPACITY: usize = 8
+
 const AbiLocation = struct {
     isFloat: bool
     inRegister: bool
@@ -27,19 +30,14 @@ pub const Calls = struct {
         return false
     }
 
+    // The function's address goes to r11 with the arguments (one of the
+    // moves: it may be in a register an argument goes to).
     fn emitCall(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
-        const function = state_module.State.allocateOp(state, instruction.arg0)
-        const cleanup = Self.prepareCall(state, instruction.arg1, instruction.arg2)
+        const cleanup = Self.prepareCall(state, instruction.arg1, instruction.arg2, instruction.arg0)
         const c_call = instruction.flags & lir_module.FLAG_C_CALL != 0
-        if c_call {
-            // (al takes the count of vector registers.)
-            encoder.emitMovRegMem(state.*.enc, target.Register.r11, function)
-            Self.setVectorCount(state, instruction)
-            encoder.emitCallReg(state.*.enc, target.Register.r11)
-        } else {
-            encoder.emitMovRegMem(state.*.enc, target.Register.rax, function)
-            encoder.emitCallReg(state.*.enc, target.Register.rax)
-        }
+        // (al takes the count of vector registers.)
+        if c_call { Self.setVectorCount(state, instruction) }
+        encoder.emitCallReg(state.*.enc, target.Register.r11)
         Self.finishCall(state, index, instruction, cleanup, true)
     }
 
@@ -49,7 +47,7 @@ pub const Calls = struct {
     }
 
     fn emitDirectCall(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
-        const cleanup = Self.prepareCall(state, instruction.arg1, instruction.arg2)
+        const cleanup = Self.prepareCall(state, instruction.arg1, instruction.arg2, lir_module.NONE)
         const symbol = lir_module.getSymbol(state.*.lir, instruction.arg0)
         const foreign = symbol.flags & lir_module.SYMBOL_IMPORT != 0
         const c_call = instruction.flags & lir_module.FLAG_C_CALL != 0
@@ -75,12 +73,12 @@ pub const Calls = struct {
         return result
     }
 
-    fn prepareCall(state: *state_module.State, start: usize, count: usize) -> usize {
+    fn prepareCall(state: *state_module.State, start: usize, count: usize, function: usize) -> usize {
         const stack_count = Self.stackArgumentCount(state, start, count)
         const padding: usize = if stack_count & 1 != 0 { 1 } else { 0 }
         if padding != 0 { encoder.emitSubRspImm32(state.*.enc, 8) }
         Self.pushStackArguments(state, start, count)
-        Self.loadRegisterArguments(state, start, count)
+        Self.loadRegisterArguments(state, start, count, function)
         return stack_count + padding
     }
 
@@ -88,6 +86,7 @@ pub const Calls = struct {
     // pointer), whose narrow integer results have unspecified upper bits.
     fn finishCall(state: *state_module.State, index: usize, instruction: lir_module.Inst, cleanup: usize, may_be_foreign: bool) -> void {
         const type_id = instruction.typeId
+        state_module.State.dropCache(state)
         if cleanup > 0 { encoder.emitAddRspImm32(state.*.enc, @intCast(u32, cleanup * 8)) }
         if instruction.flags & lir_module.FLAG_C_CALL != 0 && state_module.State.isTuple(state, type_id) {
             Self.storeCReturnValue(state, index, type_id)
@@ -204,7 +203,19 @@ pub const Calls = struct {
         encoder.emitPushReg(state.*.enc, target.Register.rax)
     }
 
-    fn loadRegisterArguments(state: *state_module.State, start: usize, count: usize) -> void {
+    // The floating arguments from their slots; the integer ones, and the
+    // address of `function` (NONE for a direct call) into r11, as a
+    // parallel move: an argument still in a register (the cache's, a
+    // local's or a parameter's) goes from there, so a move is made only
+    // once no other still reads its destination, and a cycle among them
+    // is broken through rax (free here: nothing is kept in it for a call).
+    fn loadRegisterArguments(state: *state_module.State, start: usize, count: usize, function: usize) -> void {
+        var destinations: [MOVE_CAPACITY]target.Register = undefined
+        var values: [MOVE_CAPACITY]usize = undefined
+        var slots: [MOVE_CAPACITY]i32 = undefined
+        var sources: [MOVE_CAPACITY]usize = undefined
+        var pending: [MOVE_CAPACITY]bool = undefined
+        var moves: usize = 0
         var argument_index: usize = 0
         while argument_index < count {
             const argument = lir_module.getExtra(state.*.lir, start + argument_index)
@@ -212,20 +223,85 @@ pub const Calls = struct {
             const component_count = state_module.State.componentCount(state, argument)
             while component < component_count {
                 const location = Self.argumentLocation(state, start, argument_index, component)
-                if component == 0 && location.inRegister && !location.isFloat {
-                    state_module.State.loadOp(state, target.argReg(location.registerIndex), argument)
-                    component += 1
-                    continue
+                if location.inRegister && location.isFloat {
+                    const slot = state_module.State.getComponent(state, argument, component)
+                    if slot.0 {
+                        const value = lir_module.getInst(state.*.lir, argument)
+                        encoder.emitMovXmmMem(state.*.enc, location.registerIndex, slot.1, state_module.State.floatBits(state, value.typeId))
+                    }
+                } else if location.inRegister && moves < MOVE_CAPACITY {
+                    destinations[moves] = target.argReg(location.registerIndex)
+                    values[moves] = lir_module.NONE
+                    slots[moves] = 0
+                    sources[moves] = 16
+                    pending[moves] = true
+                    if component == 0 {
+                        values[moves] = argument
+                        const held = state_module.State.lazyRegister(state, argument)
+                        if held.0 { sources[moves] = @intCast(usize, target.regIndex(held.1)) }
+                        moves += 1
+                    } else {
+                        const slot = state_module.State.getComponent(state, argument, component)
+                        if slot.0 {
+                            slots[moves] = slot.1
+                            moves += 1
+                        }
+                    }
                 }
-                const slot = state_module.State.getComponent(state, argument, component)
-                if slot.0 && location.inRegister && location.isFloat {
-                    const value = lir_module.getInst(state.*.lir, argument)
-                    encoder.emitMovXmmMem(state.*.enc, location.registerIndex, slot.1, state_module.State.floatBits(state, value.typeId))
-                }
-                if slot.0 && location.inRegister && !location.isFloat { encoder.emitMovRegMem(state.*.enc, target.argReg(location.registerIndex), slot.1) }
                 component += 1
             }
             argument_index += 1
+        }
+        if function != lir_module.NONE {
+            destinations[moves] = target.Register.r11
+            values[moves] = function
+            slots[moves] = 0
+            sources[moves] = 16
+            pending[moves] = true
+            const held = state_module.State.lazyRegister(state, function)
+            if held.0 { sources[moves] = @intCast(usize, target.regIndex(held.1)) }
+            moves += 1
+        }
+        var done: usize = 0
+        while done < moves {
+            var chosen = lir_module.NONE
+            var at: usize = 0
+            while at < moves && chosen == lir_module.NONE {
+                if pending[at] {
+                    var blocked = false
+                    var other: usize = 0
+                    while other < moves {
+                        if other != at && pending[other] && sources[other] == @intCast(usize, target.regIndex(destinations[at])) { blocked = true }
+                        other += 1
+                    }
+                    if !blocked { chosen = at }
+                }
+                at += 1
+            }
+            if chosen == lir_module.NONE {
+                // A cycle: the first pending register source goes to rax.
+                at = 0
+                while at < moves {
+                    if pending[at] && sources[at] < 16 {
+                        encoder.emitMovRegReg(state.*.enc, target.Register.rax, @enumFromInt(target.Register, @intCast(u8, sources[at])))
+                        sources[at] = @intCast(usize, target.regIndex(target.Register.rax))
+                        values[at] = lir_module.NONE
+                        slots[at] = 0 - 1
+                        at = moves
+                    }
+                    at += 1
+                }
+                continue
+            }
+            if slots[chosen] == 0 - 1 {
+                encoder.emitMovRegReg(state.*.enc, destinations[chosen], target.Register.rax)
+            } else if values[chosen] != lir_module.NONE {
+                state_module.State.loadOp(state, destinations[chosen], values[chosen])
+            } else {
+                encoder.emitMovRegMem(state.*.enc, destinations[chosen], slots[chosen])
+            }
+            pending[chosen] = false
+            done += 1
         }
     }
 
