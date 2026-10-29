@@ -1599,9 +1599,18 @@ NowPlayingInfo: the title, duration, position, whether it seeks; the
 embedder registers its pages) and polls it from the main thread for the
 controls' commands, which go to the session as remote control commands
 (play, pause, toggle, stop, next, previous, seek) that the media
-element carries out. A player that stopped leaves the bus after half a
-minute. ENABLE_MEDIA_SESSION stays off: a page's MediaSession metadata
-(artist, artwork) is not seen yet, the title is the document's.
+element carries out; Raise shows the tab that plays (the engine's
+`raised` poll, as `opened`). A player that stopped leaves the bus after
+half a minute. ENABLE_MEDIA_SESSION stays off: a page's MediaSession
+metadata (artist, artwork) is not seen yet, the title is the document's.
+
+A video or audio element's `controls` are WebKit's modern media
+controls: RenderThemeMlx gives WebCore their script and style sheet
+from the user agent bundles the build makes of
+Modules/modern-media-controls, and their icons from files (the
+directory `MLX_WEBKIT_MEDIA_ICONS` names, else the source tree's
+`images/adwaita` under the working directory, else
+`/usr/share/mlx/voyager/media-controls`).
 `tools/check_mpris.sh` runs the player on mlx-ipcd against dbus-send,
 gdbus and dbus-monitor (the properties, the commands, the signals).
 

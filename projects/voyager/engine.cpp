@@ -205,6 +205,9 @@ struct VoyagerEngine {
     // (x, y, width, height each, from the page's origin), at most
     // CAPACITY: how many.
     int (*damage)(Engine*, int* rects, int capacity);
+    // The tab the desktop's media controls asked to show (MPRIS Raise:
+    // the one whose page plays), 0 for none.
+    int (*raised)(Engine*);
 };
 
 // The modifiers as voyager.mlx gives them.
@@ -468,6 +471,8 @@ struct Engine {
     // The tabs the engine opened itself, for the window: id, and whether
     // shown at once.
     Vector<std::pair<int, bool>> opened;
+    // The tabs the media controls asked to show, for the window.
+    Vector<int> raised;
     IntSize size;
     bool dark { false };
     // VOYAGER_TRACE in the environment: each event on standard error.
@@ -739,6 +744,15 @@ int engineOpened(Engine* engine, int* foreground)
 int engineLoad(Engine* engine, int id, const char* target)
 {
     return loadInto(tabOf(engine, id), target);
+}
+
+int engineRaised(Engine* engine)
+{
+    if (engine->raised.isEmpty())
+        return 0;
+    int id = engine->raised.first();
+    engine->raised.removeAt(0);
+    return id;
 }
 
 void engineResize(Engine* engine, int width, int height)
@@ -1420,6 +1434,16 @@ int main(int argc, char** argv)
     engine.size = size;
     engine.trace = getenv("VOYAGER_TRACE");
     engine.compositing = compositing;
+    // The media controls' Raise: the window shows the tab that plays.
+    MediaSessionMlx::singleton().setRaiseHandler([](Page& page) {
+        for (auto& tab : engine.tabs.values()) {
+            if (tab->page.get() == &page) {
+                engine.raised.append(tab->id);
+                signalWindow(engine);
+                return;
+            }
+        }
+    });
     // The window wakes for the main thread's work and for each frame: the
     // run loop's wake-up (a task dispatched to it from another thread: the
     // frame clock's rendering update, the network's data) and the
@@ -1486,7 +1510,7 @@ int main(int argc, char** argv)
         engineReload, engineStop, engineLoading, engineSetDark, engineForcedDark,
         engineChooser, engineChoose, engineSetDownloads, engineDownloadCount, engineDownload,
         engineDownloadPath, engineDownloadType, engineDownloadAction,
-        engineDescriptor, engineWake, engineDamage
+        engineDescriptor, engineWake, engineDamage, engineRaised
     };
     // main's arguments, then the environment with MLX_CANVAS=cpu (the
     // window drawn into wl_shm buffers on the CPU, which the engine
