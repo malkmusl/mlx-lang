@@ -1654,7 +1654,7 @@ On a machine with a video decoder (RADV's RX 580: Mesa 24.2 or later,
     vulkaninfo | grep VK_KHR_video_decode_h264      # the extension is there
     ./mlx build examples
     mlx-out/bin/vulkan-decode --trace projects/webkit/upstream/Tools/TestWebKitAPI/Resources/test.mp4 out.png 50
-    ./mlx build webkit-mlx-webcore voyager
+    ./mlx build webkit-mlx-voyager
     tools/check_voyager.sh                          # scenario 26 among them
 
 then a page with a video (a file: URL of test.mp4, then YouTube): the
