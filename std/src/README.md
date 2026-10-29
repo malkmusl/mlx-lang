@@ -68,6 +68,13 @@ process group.
 WPA2 needs (`tools/check_wifi.sh`); and AES-128/192/256 bitsliced in
 constant time, four blocks at once, for TLS.
 
+`mp4.mlx` (`std.mp4`) reads MP4 (ISO base media) files and MSE segments:
+the tracks (H.264, H.265, VP9, AV1, AAC, Opus) with their codec
+configuration (avcC/hvcC parameter sets, AudioSpecificConfig), a plain
+file's samples from its sample tables with seeking to sync samples, a
+fragmented file's samples from each `moof`+`mdat` (test 416;
+tests/support/mp4_corpus.py makes the files).
+
 `flate/gzip.mlx` (`std.flate.gzip`) reads and writes gzip files in
 pieces for Mlx programs, what zlib's gz* functions do (test 385).
 
