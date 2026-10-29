@@ -1649,7 +1649,13 @@ counted; `examples/vulkan-decode` decodes a file on the device alone.
 tools/check_voyager.sh's scenario 26 plays WebKit's test.mp4 (6 s of
 H.264 with a silent AAC track) by itself in Voyager
 (projects/voyager/tests/media.html: the page turns green on `playing`,
-blue on `ended`, and tells the end's time in its title).
+blue on `ended`, and tells the end's time in its title). Scenario 27
+types into a text area of a generic font family and presses Backspace
+(edit.html): the typing style copies the computed font-family, whose
+generic families are WebCore's name tables, which
+`MlxPlatformStrategies::initialize` sets up as WebKit's process warming
+does (`ProcessWarming::initializeNames`; without them `sans-serif`
+was a null string, the CSS value pool's key).
 
 On a machine with a video decoder (RADV's RX 580 with
 `RADV_EXPERIMENTAL=video_decode` exported, see above), the stack is

@@ -27,6 +27,7 @@
 #include "Document.h"
 #include "OriginAccessPatterns.h"
 #include "ProcessCapabilities.h"
+#include "ProcessWarming.h"
 #include "SecurityOrigin.h"
 #include "port/MlxWebPort.h"
 #include "port/platform/graphics/mlx/MlxSkiaRoutines.h"
@@ -302,6 +303,13 @@ void MlxPlatformStrategies::initialize()
 {
     static MlxPlatformStrategies* strategies = new MlxPlatformStrategies;
     setPlatformStrategies(strategies);
+    // WebCore's name tables, the generic font families among them
+    // (WebKitFontFamilyNames: without init() `sans-serif` is a null
+    // family, which the typing style's copy of the computed
+    // font-family handed the CSS value pool as a key, Voyager dying on
+    // a Backspace in Google's search box), as WebKit's process warming
+    // does before any page.
+    ProcessWarming::initializeNames();
     // (Every buffer of the process on the CPU: no GPU is used, so the
     // layers' tiles and images are raster ones, PORT.md "Compositing".)
     ProcessCapabilities::setCanUseAcceleratedBuffers(false);

@@ -840,4 +840,18 @@ frame=$(box_of "$work/media-playing.ppm" 000000)
 read -r fx fy fw fh <<< "$frame"
 [[ -n "$frame" ]] && (( fw >= 300 && fh >= 220 )) || fail "no video box of 320x240 in the screenshot (its black: ${frame:-none})"
 echo "ok   a video plays by itself and ends at $ended s: the page green then blue, the video's box ${fw}x${fh}"
+# 27: typing into a text area of a generic font family (edit.html,
+# sans-serif as Google's search box) and a Backspace: the delete
+# command copies the computed font-family into the typing style, which
+# asks the CSS value pool for each family (WebCore's name tables must
+# be initialized: a generic family that was a null string was the
+# pool's key, Voyager dying on the first Backspace in Google's search
+# box). The page's title tells the text after each change.
+write_runner "$work/voyager-edit" edit.html
+printf 'wait 5000\npointer %d %d\npress 272\nrelease 272\nwait 800\ntype ab\nwait 800\ndown 14\nup 14\nwait 1500\nclose\n' $(( page_x0 + 300 )) $(( page_y0 + 300 )) > "$work/edit.script"
+run_scenario edit "$work/edit.script" "$work/voyager-edit"
+log=$work/voyager.log
+grep -q "^voyager: title edit:ab$" "$log" || { cat "$log" >&2; fail "typing into the text area did not reach it (no edit:ab title)"; }
+grep -q "^voyager: title edit:a$" "$log" || { cat "$log" >&2; fail "Backspace did not delete the last character (no edit:a title)"; }
+echo "ok   typing into a text area of a generic family and a Backspace (the typing style's font-family)"
 echo "check_voyager.sh: all checks passed"
