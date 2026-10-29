@@ -249,7 +249,11 @@ jsc on bench.js, SQLite) before anything is called fast.
   webcore-dump on bench.html (medians; gcc -O2's build of WebKit is not
   in the repository, so its numbers come from outside). Epoch 46: 0.74 s
   / 1.73 s / 0.89 s (without scripts); epoch 48 (SSE instructions, the
-  overflow builtins): 0.77 s / 1.67 s / 0.92 s.
+  overflow builtins): 0.77 s / 1.67 s / 0.92 s; epoch 51 (reference
+  results inlined, parameter aliases, places promoted, struct
+  parameters of any size): 0.65 s / 1.73 s / 0.97 s, the layout and
+  paint checks green. JavaScriptCore gains, WebCore's layout does not:
+  its time is the back end's frame traffic, not calls.
 - [ ] Voyager profiled again under the same conditions (the same URLs
   and machine): the main thread, `MlxCompositor`, `MlxGPUPainting`,
   and JavaScript, layout, painting and compositing told apart. Seen on
