@@ -277,7 +277,8 @@ Observatory share:
   the run's glyphs per pixel; every pixel starts at a base coverage, 0 for
   text and 255 with no glyphs for a solid fill), `blurPass` and `blurMask`
   (the compositor's blur), `paint` (the desktop apps' canvas), `warp`
-  (wobbly windows) and `shrink` (window previews).
+  (wobbly windows), `shrink` (window previews) and `nv12` (std.gpu.video's
+  NV12 to BGRA).
   `tools/check-shaders` validates them and writes them out for `spirv-val`.
 - `std.gpu.text` keeps a `std.truetype` atlas and the frame's glyph runs in
   GPU memory and records `text` dispatches; GPU text equals
@@ -304,10 +305,13 @@ Observatory share:
   decode is submitted and waited for, then the picture (the DPB layer,
   or the output image where the decoder keeps them apart) is copied on
   the compute queue (the images shared between the two families) into
-  the layer's part of a host buffer; `readFrame` converts a slot's NV12
-  there to BGRA (BT.601 or BT.709 from the VUI, limited or full range).
-  `tests/419_gpu_video_runtime.mlx` checks the bitstream, the colour
-  conversion and that lavapipe (no decoder) is refused;
+  the layer's part of an NV12 buffer; `readFrame` converts a slot's NV12
+  to BGRA with the `nv12` kernel (`std.gpu.shaders`, built by
+  `video_shader.mlx`: BT.601 or BT.709 from the VUI, limited or full
+  range, 16.16 fixed point) into a readback buffer, or on the host when
+  the kernel cannot be made. `tests/419_gpu_video_runtime.mlx` checks
+  the bitstream, the host's conversion, the kernel against it on
+  lavapipe and that lavapipe (no decoder) is refused;
   `examples/vulkan-decode` decodes a file's H.264 track on a device that
   has one and saves a frame.
 - `std.gpu.swapchain` presents to a window surface: each frame the pattern is

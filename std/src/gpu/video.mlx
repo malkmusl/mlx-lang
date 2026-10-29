@@ -21,13 +21,16 @@
 // are used. The decode runs on the video queue and is waited for, then
 // the picture (the DPB layer, or the output image where the decoder
 // keeps them apart) is copied on the compute queue into the layer's
-// part of a host buffer, from which readFrame converts NV12 to BGRA.
-// Frames only (no field pictures), 4:2:0 8 bit.
+// part of an NV12 buffer; readFrame converts a slot's NV12 to BGRA with
+// the nv12 kernel (std.gpu.shaders) into a readback buffer, or on the
+// host when the kernel cannot be made. Frames only (no field pictures),
+// 4:2:0 8 bit.
 
 const std = @import("std")
 const vk = @import("std.vulkan")
 const video = @import("std.vulkan.video")
 const gpu = @import("std.gpu")
+const shaders = @import("std.gpu.shaders")
 const h264 = @import("std.h264")
 
 pub const Allocator = std.allocator.Allocator
@@ -49,9 +52,16 @@ pub const MAX_LAYERS: usize = h264.SLOTS
 const NONE: u32 = 4294967295
 const MAX_BINDS: usize = 8
 
-// The colour conversion (NV12 to BGRA): fixed-point tables (16 bits of
-// fraction) for the stream's matrix and range.
+// The colour conversion (NV12 to BGRA): the coefficients (16 bits of
+// fraction, as the nv12 kernel takes them) and the host's tables of
+// them, for the stream's matrix and range.
 pub const Conversion = struct {
+    yBias: i32
+    yScale: i32
+    rCrCoefficient: i32
+    gCbCoefficient: i32
+    gCrCoefficient: i32
+    bCbCoefficient: i32
     y: [256]i32
     rCr: [256]i32
     gCb: [256]i32
@@ -100,7 +110,13 @@ pub const Decoder = struct {
     outputMemory: vk.DeviceMemory
     outputView: vk.ImageView
     bitstream: gpu.Buffer
-    readback: gpu.Buffer
+    // The pictures read back as NV12, a layer's frameBytes each: device
+    // memory the nv12 kernel converts into `bgra` (host visible), or
+    // host visible memory the host converts from.
+    nv12: gpu.Buffer
+    bgra: gpu.Buffer
+    kernel: gpu.Kernel
+    kernelReady: bool
     commandPool: vk.CommandPool
     commandBuffer: vk.CommandBuffer
     fence: vk.Fence
@@ -161,7 +177,9 @@ pub fn create(context: *gpu.Context, allocator: Allocator) -> ?*Decoder {
     d.*.allocator = allocator
     d.*.profileIdc = NONE
     d.*.bitstream.fd = -1
-    d.*.readback.fd = -1
+    d.*.nv12.fd = -1
+    d.*.bgra.fd = -1
+    d.*.kernelReady = createConverter(context, allocator, &d.*.kernel)
     var slot: usize = 0
     while slot < h264.SLOTS {
         d.*.layerOfSlot[slot] = NONE
@@ -247,7 +265,8 @@ fn destroySession(d: *Decoder) -> void {
     }
     d.*.sessionMemoryCount = 0
     gpu.destroyBuffer(context, &d.*.bitstream)
-    gpu.destroyBuffer(context, &d.*.readback)
+    gpu.destroyBuffer(context, &d.*.nv12)
+    gpu.destroyBuffer(context, &d.*.bgra)
     var slot: usize = 0
     while slot < h264.SLOTS {
         d.*.layerOfSlot[slot] = NONE
@@ -530,7 +549,12 @@ fn ensureSession(d: *Decoder, sps: *const h264.Sps) -> Status {
         if !createView(d, d.*.outputImage, 0, &d.*.outputView) { return Status.failed }
     }
     d.*.frameBytes = @intCast(u64, codedWidth) * @intCast(u64, codedHeight) * 3 / 2
-    if !gpu.createReadbackBuffer(context, &d.*.readback, d.*.frameBytes * @intCast(u64, neededLayers)) { return Status.outOfMemory }
+    if d.*.kernelReady {
+        if !gpu.createDeviceBuffer(context, &d.*.nv12, d.*.frameBytes * @intCast(u64, neededLayers)) { return Status.outOfMemory }
+        if !gpu.createReadbackBuffer(context, &d.*.bgra, @intCast(u64, codedWidth) * @intCast(u64, codedHeight) * 4) { return Status.outOfMemory }
+    } else {
+        if !gpu.createReadbackBuffer(context, &d.*.nv12, d.*.frameBytes * @intCast(u64, neededLayers)) { return Status.outOfMemory }
+    }
     return Status.ok
 }
 
@@ -853,9 +877,9 @@ pub fn decode(d: *Decoder, h: *h264.Decoder, bytes: [*]const u8) -> Status {
 // ---- Reading back ----
 
 // Copies the picture just decoded into `layer` (the DPB layer, or the
-// output image) to the layer's part of the readback buffer, on the
-// compute queue (the images are shared between the two families; the
-// decode was waited for).
+// output image) to the layer's part of the NV12 buffer, on the compute
+// queue (the images are shared between the two families; the decode
+// was waited for).
 fn readBack(d: *Decoder, layer: u32) -> bool {
     const context = d.*.context
     const commands = context.*.commands
@@ -904,7 +928,7 @@ fn readBack(d: *Decoder, layer: u32) -> bool {
     regions[1].imageExtent.width = d.*.pictureWidth / 2
     regions[1].imageExtent.height = d.*.pictureHeight / 2
     regions[1].imageExtent.depth = 1
-    vk.cmdCopyImageToBuffer(commands, command_buffer, image, vk.ImageLayout.transferSrcOptimal, d.*.readback.buffer, 2, &regions)
+    vk.cmdCopyImageToBuffer(commands, command_buffer, image, vk.ImageLayout.transferSrcOptimal, d.*.nv12.buffer, 2, &regions)
     if d.*.coincide {
         // Back to the DPB layout: the layer stays a reference.
         var back = toTransfer
@@ -916,8 +940,8 @@ fn readBack(d: *Decoder, layer: u32) -> bool {
     }
     var visible = vk.MemoryBarrier.init()
     visible.srcAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
-    visible.dstAccessMask = vk.ACCESS_HOST_READ_BIT
-    vk.cmdPipelineBarrier(commands, command_buffer, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_HOST_BIT, 0, 1, &visible, 0, null, 0, null)
+    visible.dstAccessMask = vk.ACCESS_HOST_READ_BIT | vk.ACCESS_SHADER_READ_BIT
+    vk.cmdPipelineBarrier(commands, command_buffer, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_HOST_BIT | vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &visible, 0, null, 0, null)
     if !gpu.submit(context) { return false }
     d.*.layerRead[layer] = true
     return true
@@ -927,16 +951,77 @@ fn readBack(d: *Decoder, layer: u32) -> bool {
 // overwritten) as BGRA pixels into `out`, rows `stride` bytes apart,
 // width(d) x height(d) of them. False when the slot holds no frame.
 pub fn readFrame(d: *Decoder, slot: usize, out: [*]u8, stride: usize) -> bool {
-    if slot >= h264.SLOTS || d.*.layerOfSlot[slot] == NONE || d.*.readback.address == 0 { return false }
+    if slot >= h264.SLOTS || d.*.layerOfSlot[slot] == NONE || d.*.nv12.buffer == 0 { return false }
     const layer = d.*.layerOfSlot[slot]
     if !d.*.layerRead[layer] { return false }
     const lumaBytes = @intCast(usize, d.*.pictureWidth) * @intCast(usize, d.*.pictureHeight)
-    const pixels: [*]const u8 = unsafe { @ptrFromInt([*]const u8, d.*.readback.address + @intCast(usize, d.*.frameBytes) * @intCast(usize, layer)) }
+    const base = @intCast(usize, d.*.frameBytes) * @intCast(usize, layer)
     const lumaStride = @intCast(usize, d.*.pictureWidth)
-    const luma: [*]const u8 = &pixels[@intCast(usize, d.*.cropY) * lumaStride + @intCast(usize, d.*.cropX)]
-    const chroma: [*]const u8 = &pixels[lumaBytes + @intCast(usize, d.*.cropY) / 2 * lumaStride + @intCast(usize, d.*.cropX) / 2 * 2]
-    convertNv12(&d.*.conversion, luma, lumaStride, chroma, lumaStride, @intCast(usize, d.*.width), @intCast(usize, d.*.height), out, stride)
+    const lumaOffset = base + @intCast(usize, d.*.cropY) * lumaStride + @intCast(usize, d.*.cropX)
+    const chromaOffset = base + lumaBytes + @intCast(usize, d.*.cropY) / 2 * lumaStride + @intCast(usize, d.*.cropX) / 2 * 2
+    const width_ = @intCast(usize, d.*.width)
+    const height_ = @intCast(usize, d.*.height)
+    if d.*.kernelReady {
+        if !convertOnGpu(d.*.context, &d.*.kernel, &d.*.conversion, d.*.nv12.buffer, lumaOffset, lumaStride, chromaOffset, lumaStride, width_, height_, d.*.bgra.buffer, 0, width_) { return false }
+        const pixels: [*]const u8 = unsafe { @ptrFromInt([*]const u8, d.*.bgra.address) }
+        var row: usize = 0
+        while row < height_ {
+            var column: usize = 0
+            while column < width_ * 4 {
+                out[row * stride + column] = pixels[row * width_ * 4 + column]
+                column += 1
+            }
+            row += 1
+        }
+        return true
+    }
+    const pixels: [*]const u8 = unsafe { @ptrFromInt([*]const u8, d.*.nv12.address) }
+    convertNv12(&d.*.conversion, &pixels[lumaOffset], lumaStride, &pixels[chromaOffset], lumaStride, width_, height_, out, stride)
     return true
+}
+
+// ---- The nv12 kernel ----
+
+// Makes the nv12 kernel (std.gpu.shaders) on `context`: false when it
+// cannot be (the host converts then).
+pub fn createConverter(context: *gpu.Context, allocator: Allocator, kernel: *gpu.Kernel) -> bool {
+    var code: [*]u32 = undefined
+    const words = shaders.buildNv12Words(allocator, &code)
+    if words == 0 { return false }
+    const made = gpu.createKernel(context, kernel, code, words, 2, shaders.NV12_WORDS)
+    unsafe { allocator.free(@ptrCast([*]u8, code), words * 4, 4) }
+    return made
+}
+
+// Converts a `width` x `height` NV12 picture in `source` (luma bytes at
+// `lumaOffset`, rows `lumaStride` bytes apart; Cb/Cr pairs at
+// `chromaOffset`, rows `chromaStride` apart) with `conversion`'s
+// coefficients into `target` (0xFFRRGGBB words at `targetOffset`, rows
+// `targetStride` words apart) on the GPU, and waits for it. The kernel
+// reads `source` by whole words: its size covers the last byte's word.
+pub fn convertOnGpu(context: *gpu.Context, kernel: *const gpu.Kernel, conversion: *const Conversion, source: vk.Buffer, lumaOffset: usize, lumaStride: usize, chromaOffset: usize, chromaStride: usize, width_: usize, height_: usize, target: vk.Buffer, targetOffset: usize, targetStride: usize) -> bool {
+    var push = shaders.Nv12.{
+        .width = @intCast(u32, width_),
+        .height = @intCast(u32, height_),
+        .lumaOffset = @intCast(u32, lumaOffset),
+        .lumaStride = @intCast(u32, lumaStride),
+        .chromaOffset = @intCast(u32, chromaOffset),
+        .chromaStride = @intCast(u32, chromaStride),
+        .targetOffset = @intCast(u32, targetOffset),
+        .targetStride = @intCast(u32, targetStride),
+        .yBias = conversion.*.yBias,
+        .yScale = conversion.*.yScale,
+        .rCr = conversion.*.rCrCoefficient,
+        .gCb = conversion.*.gCbCoefficient,
+        .gCr = conversion.*.gCrCoefficient,
+        .bCb = conversion.*.bCbCoefficient,
+    }
+    var buffers: [2]vk.Buffer = [2]vk.Buffer{ source, target }
+    if !gpu.begin(context) { return false }
+    var dispatched = false
+    unsafe { dispatched = gpu.dispatch(context, kernel, @ptrCast([*]const vk.Buffer, &buffers), &push, gpu.groups(@intCast(u32, width_), shaders.GROUP_SIZE), gpu.groups(@intCast(u32, height_), shaders.GROUP_SIZE)) }
+    if !dispatched { return false }
+    return gpu.submit(context)
 }
 
 // ---- Colour ----
@@ -992,6 +1077,12 @@ pub fn conversionFor(conversion: *Conversion, matrix: u32, fullRange: bool) -> v
             bCb = 116130
         }
     }
+    conversion.*.yBias = if fullRange { 0 } else { 16 }
+    conversion.*.yScale = yScale
+    conversion.*.rCrCoefficient = rCr
+    conversion.*.gCbCoefficient = gCb
+    conversion.*.gCrCoefficient = gCr
+    conversion.*.bCbCoefficient = bCb
     var index: i32 = 0
     while index < 256 {
         var y = index

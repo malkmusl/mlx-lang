@@ -1602,9 +1602,9 @@ std.vulkan's VK_KHR_video_decode_h264, on the first driver whose device
 has a video decode queue; RADV's UVD on the RX 580, Mesa 24.2 or
 `RADV_PERFTEST=video_decode` before): each picture's slices go to a
 Vulkan video session, the decoded picture buffer is one layered image,
-every picture is read back after its decode (NV12 into a host buffer)
-and every frame due is converted to BGRA on the CPU and handed to the
-layer as a NativeImage
+every picture is read back after its decode (NV12 into a buffer of the
+device's) and every frame due is converted to BGRA by std.gpu's nv12
+kernel, read back and handed to the layer as a NativeImage
 (`CoordinatedPlatformLayerBufferNativeImage`), also kept for `paint`.
 Without a decoding device the video stays black and the frames are
 counted; `examples/vulkan-decode` decodes a file on the device alone.

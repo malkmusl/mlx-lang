@@ -184,8 +184,9 @@ when asked for), with `gpu/shaders.mlx`
 (`std.gpu.video`) decodes the H.264 pictures `std.h264` reads on the
 GPU's video decoder (VK_KHR_video_decode_h264: a session per stream, the
 DPB as one layered image, the slices in a bitstream buffer) and reads
-the frames back as BGRA (NV12 converted on the host; test 419 on
-lavapipe, `examples/vulkan-decode` on a decoding device). See
+the frames back as BGRA (NV12 converted by the `nv12` kernel of
+`gpu/video_shader.mlx`, or on the host; test 419 on lavapipe,
+`examples/vulkan-decode` on a decoding device). See
 `docs/reference/vulkan.md`.
 
 `truetype.mlx` (`std.truetype`) and `truetype/` are the font engine:
