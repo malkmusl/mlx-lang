@@ -218,11 +218,16 @@ against gcc -O2's, not an estimate: the goal is under 2x on native
 WebKit work (webcore-dump laying out and painting tests/bench's pages,
 jsc on bench.js, SQLite) before anything is called fast.
 
-- [ ] Inlining in the LIR lowering: `always_inline` and small functions
-  (accessors, operators, intrinsics) of the unit at their call sites;
-  the machine code checked by eye on the profile's top functions.
-- [ ] SIMD intrinsics as their instructions (`_mm_cmpeq_epi8`, the SSE2
-  set WebKit's string code uses), not functions.
+- [x] Inlining in the LIR lowering: `always_inline` and small functions
+  (accessors, operators, intrinsics) of the unit at their call sites
+  (epoch 45; `__OPTIMIZE__` defined for libpas's `PAS_ALWAYS_INLINE`,
+  epoch 46). jsc's bench.js 0.74 s, webcore-dump bench.html 1.73 s (the
+  LIR build before it was not timed on the same page; the machine code
+  of the profile's top functions still to be checked by eye).
+- [x] SIMD intrinsics as their instructions (epoch 47): the SSE, SSE2,
+  SSE3, SSSE3, SSE4.1 and SSE4.2 headers over `__builtin_mlxcc_asm`,
+  the assembler knowing the packed-integer instructions
+  (compiler/cc/README.md, "Inline assembly").
 - [ ] 128-bit arithmetic as instructions where x86-64 has them (`mul`,
   add with carry, shifts), the helpers for the rest.
 - [ ] The benchmark: tools/check_cc_projects.sh's SQLite, jsc's bench.js

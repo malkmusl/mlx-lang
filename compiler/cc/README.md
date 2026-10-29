@@ -584,14 +584,24 @@ plain C as predefined macros (`__builtin_memcpy`, `__builtin_expect`,
 `__builtin_isnan`, `__builtin_inf`, `__builtin_constant_p` as 0, ...;
 `tests/builtins.c` against gcc; `__builtin_frame_address(n)` and
 `__builtin_return_address(n)` walk the rbp chain every function keeps).
-`<mmintrin.h>`, `<xmmintrin.h>` and `<emmintrin.h>` (and
-`smmintrin.h`, `immintrin.h`, `x86intrin.h` over them) give all of
-x86-64's baseline intrinsics, MMX's, SSE's and SSE2's, as plain
-functions over unions of lanes (`__m64`, `__m128`, `__m128d`,
-`__m128i`, 16-byte aligned), with the instructions' results
-(`tests/ssebaseline.c` against gcc's build, `tests/cpp/ssebaseline.cpp`):
-SIMDe's native x86 path compiles on them (`SIMDE_X86_SSE2_NATIVE`,
-which WebKit's port defines). `__SSE__` and `__SSE2__` are not
+`<mmintrin.h>`, `<xmmintrin.h>` and `<emmintrin.h>` give all of
+x86-64's baseline intrinsics, MMX's, SSE's and SSE2's, over unions of
+lanes (`__m64`, `__m128`, `__m128d`, `__m128i`, 16-byte aligned); each
+SSE one is its instruction: `__builtin_mlxcc_asm(text, a, b, c)` runs
+the assembled text with a, b and c in rdi, rsi and rdx and rax its
+result, so `_mm_add_epi8` is two `movdqu`, a `paddb` and a `movdqu`
+back, and nothing else once inlined (the ones with an immediate are
+macros of a statement expression over `__builtin_mlxcc_asmi(text, i,
+...)`, which puts the constant in for `%i`; the lane sets and
+extractions are plain stores and loads). `<pmmintrin.h>`,
+`<tmmintrin.h>`, `<smmintrin.h>` and `<nmmintrin.h>` (`immintrin.h`
+and `x86intrin.h` over them) add SSE3, SSSE3, SSE4.1 and SSE4.2 the
+same way (x86-64-v2: `pshufb`, the blends, `ptest`, the widening
+conversions, the roundings, `pcmpgtq`; the horizontal sums and dot
+products lane by lane). `tests/ssebaseline.c` and `tests/sse4.c` print
+what gcc's build does, `tests/fixedasm.c` the builtin alone,
+`tests/cpp/ssebaseline.cpp` in C++. SIMDe's native x86 path compiles
+on them (`SIMDE_X86_SSE2_NATIVE`, which WebKit's port defines). `__SSE__` and `__SSE2__` are not
 predefined, there being no GCC vector types, which code testing them
 takes to come with the intrinsics. C++20's three-way comparison `<=>`
 (`tests/cpp/compare.cpp`) gives a class's operator function or, between
@@ -930,7 +940,10 @@ GNU as makes it, the stack 16-byte aligned at a call (libpas's
 double-free check), and the data directives (`tests/inlineasm.c`
 against gcc's build;
 `tests/asmencoding.c` prints each instruction's bytes, which are GNU
-as's). JavaScriptCore's copy loops for the garbage collector
+as's). The SSE instructions are SSE2's, SSSE3's and SSE4's over packed
+values too (`paddb` to `pcmpgtq`, the shuffles, blends and roundings
+with their immediates, `pmovmskb`, `ptest`): the legacy encodings of
+the VEX.128 ones WebAssembly's interpreter uses, from the same table. JavaScriptCore's copy loops for the garbage collector
 (`movups` through `xmm0`-`xmm3` with local labels), `rep stosq`, `divq`
 and the register saves of its stack scan are written so.
 JavaScriptCore came next (its build without JIT): its first unified
@@ -1029,9 +1042,11 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   thread-local variable is the program's own (local exec): one in a
   shared library, or a C++ `thread_local` object constructed per
   thread, is not supported (the main thread's is constructed at start). Inline
-  `asm` has no floating-point register operands (`x`, `t`), no `asm
-  goto`, no data naming a symbol and no other sections; the x87 and AVX
-  instructions are not assembled. No `_Float16`; and with no GCC vector
+  `asm` has no floating-point register operands (`x`, `t`; the
+  intrinsics headers get by with `__builtin_mlxcc_asm`), no `asm goto`,
+  no data naming a symbol and no other sections; the x87 instructions,
+  and of AVX only the VEX.128 ones the WebAssembly interpreter uses,
+  are assembled. No `_Float16`; and with no GCC vector
   types `__SSE__` and `__SSE2__` are not predefined, though the
   intrinsics are there.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where
