@@ -116,8 +116,9 @@ checked as Name, NCName, QName or Nmtoken (`validName`, `isName`,
 materialized from the Vulkan registry, with `std.vulkan.loader` and
 `std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
 `std.spirv.builder`, `std.spirv.module` and `std.spirv.compute`
-(`std/src/spirv/`) and `std.gpu` with `std.gpu.shaders`, `std.gpu.text`
-and `std.gpu.swapchain` (`std/src/gpu.mlx`, `std/src/gpu/`) are Stage-1
+(`std/src/spirv/`) and `std.gpu` with `std.gpu.shaders`, `std.gpu.text`,
+`std.gpu.swapchain` and `std.gpu.video` (H.264 on the GPU's video
+decoder) (`std/src/gpu.mlx`, `std/src/gpu/`) are Stage-1
 extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 

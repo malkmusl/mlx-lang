@@ -1,0 +1,1036 @@
+// std.gpu.video: H.264 pictures decoded by the GPU's video decoder
+// (VK_KHR_video_decode_h264: RADV's UVD/VCN, ANV, NVIDIA) on a std.gpu
+// context opened with `wantVideo`. std.h264 reads the stream (parameter
+// sets, slice headers, the picture order and the decoded picture
+// buffer); this module gives each of its pictures to the decoder and
+// reads the frames back as BGRA pixels.
+//
+//     var context: gpu.Context = undefined        // options.wantVideo = true
+//     const d = video.create(&context, allocator).?
+//     h264.accessUnit(h, bytes, length, prefix)
+//     video.decode(d, h, bytes, length)            // the picture's slices
+//     h264.finishPicture(h)
+//     while h264.nextOutput(h, &slot, &poc) {
+//         video.readFrame(d, slot, pixels, stride)  // BGRA, video.width(d) x height(d)
+//     }
+//
+// The session is made for the stream's SPS (its size and DPB) and
+// remade when a later SPS needs more; the session parameters are remade
+// when a parameter set the picture uses changed. The DPB is one image
+// with a layer per slot; std.h264's slots are mapped to layers as they
+// are used. The decode runs on the video queue and is waited for, then
+// the picture (the DPB layer, or the output image where the decoder
+// keeps them apart) is copied on the compute queue into the layer's
+// part of a host buffer, from which readFrame converts NV12 to BGRA.
+// Frames only (no field pictures), 4:2:0 8 bit.
+
+const std = @import("std")
+const vk = @import("std.vulkan")
+const video = @import("std.vulkan.video")
+const gpu = @import("std.gpu")
+const h264 = @import("std.h264")
+
+pub const Allocator = std.allocator.Allocator
+
+pub const Status = enum(u8) {
+    ok,
+    // The device has no H.264 decoder, or not for this stream's profile
+    // or size.
+    unsupported,
+    // A Vulkan call failed.
+    failed,
+    outOfMemory,
+    // The picture's slot or a reference has no DPB layer, or the picture
+    // has no slices.
+    corrupt,
+}
+
+pub const MAX_LAYERS: usize = h264.SLOTS
+const NONE: u32 = 4294967295
+const MAX_BINDS: usize = 8
+
+// The colour conversion (NV12 to BGRA): fixed-point tables (16 bits of
+// fraction) for the stream's matrix and range.
+pub const Conversion = struct {
+    y: [256]i32
+    rCr: [256]i32
+    gCb: [256]i32
+    gCr: [256]i32
+    bCb: [256]i32
+}
+
+pub const Decoder = struct {
+    context: *gpu.Context
+    allocator: Allocator
+    // The profile (the SPS's profile_idc, 4:2:0 8 bit, frames) and what
+    // the device does for it. The chain is set once: profile.pNext is
+    // h264Profile, profileList lists profile.
+    profileIdc: u32
+    profile: vk.VideoProfileInfoKHR
+    h264Profile: vk.VideoDecodeH264ProfileInfoKHR
+    profileList: vk.VideoProfileListInfoKHR
+    capabilities: vk.VideoCapabilitiesKHR
+    decodeCapabilities: vk.VideoDecodeCapabilitiesKHR
+    h264Capabilities: vk.VideoDecodeH264CapabilitiesKHR
+    format: vk.Format
+    // The decoded picture is the DPB picture (else a separate output
+    // image is decoded into and the DPB slot reconstructed by the
+    // driver).
+    coincide: bool
+    // The session: pictures up to codedWidth x codedHeight, `layers` DPB
+    // pictures.
+    session: vk.VideoSessionKHR
+    sessionMemory: [MAX_BINDS]vk.DeviceMemory
+    sessionMemoryCount: u32
+    parameters: vk.VideoSessionParametersKHR
+    spsSeen: [h264.MAX_SPS]h264.Sps
+    ppsSeen: [h264.MAX_PPS]h264.Pps
+    codedWidth: u32
+    codedHeight: u32
+    layers: u32
+    dpbImage: vk.Image
+    dpbMemory: vk.DeviceMemory
+    views: [MAX_LAYERS]vk.ImageView
+    layerLayout: [MAX_LAYERS]vk.ImageLayout
+    layerOfSlot: [h264.SLOTS]u32
+    // The layer's picture is in its part of the readback buffer.
+    layerRead: [MAX_LAYERS]bool
+    frameBytes: u64
+    outputImage: vk.Image
+    outputMemory: vk.DeviceMemory
+    outputView: vk.ImageView
+    bitstream: gpu.Buffer
+    readback: gpu.Buffer
+    commandPool: vk.CommandPool
+    commandBuffer: vk.CommandBuffer
+    fence: vk.Fence
+    needsReset: bool
+    // The last picture decoded: its coded size, and the frame within it.
+    pictureWidth: u32
+    pictureHeight: u32
+    cropX: u32
+    cropY: u32
+    width: u32
+    height: u32
+    matrix: u32
+    fullRange: bool
+    conversion: Conversion
+    // Pictures decoded (statistics).
+    decoded: u64
+}
+
+fn zeroBytes(target: [*]u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        target[index] = 0
+        index += 1
+    }
+}
+
+fn sameBytes(a: [*]const u8, b: [*]const u8, count: usize) -> bool {
+    var index: usize = 0
+    while index < count {
+        if a[index] != b[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn memoryType(context: *const gpu.Context, bits: u32, wanted: vk.MemoryPropertyFlags) -> u32 {
+    var index: u32 = 0
+    while index < context.*.memory.*.memoryTypeCount {
+        if bits & (@intCast(u32, 1) << @intCast(u5, index)) != 0 && context.*.memory.*.memoryTypes[index].propertyFlags & wanted == wanted { return index }
+        index += 1
+    }
+    return NONE
+}
+
+// Whether the context's device decodes H.264.
+pub fn supported(context: *const gpu.Context) -> bool {
+    return context.*.videoFamily != gpu.NONE_FAMILY && context.*.videoH264
+}
+
+pub fn create(context: *gpu.Context, allocator: Allocator) -> ?*Decoder {
+    if !supported(context) { return null }
+    const memory = allocator.alloc(@sizeOf(Decoder), 16)
+    if memory == null { return null }
+    var d: *Decoder = undefined
+    unsafe { d = @ptrCast(*Decoder, memory.?) }
+    unsafe { zeroBytes(@ptrCast([*]u8, d), @sizeOf(Decoder)) }
+    d.*.context = context
+    d.*.allocator = allocator
+    d.*.profileIdc = NONE
+    d.*.bitstream.fd = -1
+    d.*.readback.fd = -1
+    var slot: usize = 0
+    while slot < h264.SLOTS {
+        d.*.layerOfSlot[slot] = NONE
+        slot += 1
+    }
+    var pool_info = vk.CommandPoolCreateInfo.init()
+    pool_info.flags = vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    pool_info.queueFamilyIndex = context.*.videoFamily
+    var pool: vk.CommandPool = 0
+    gpu.step(context, "vkCreateCommandPool (video)")
+    if vk.createCommandPool(context.*.commands, context.*.device, &pool_info, null, &pool) != vk.Result.success {
+        destroy(d)
+        return null
+    }
+    d.*.commandPool = pool
+    var allocation = vk.CommandBufferAllocateInfo.init()
+    allocation.commandPool = pool
+    allocation.level = vk.CommandBufferLevel.primary
+    allocation.commandBufferCount = 1
+    var command_buffer: vk.CommandBuffer = 0
+    if vk.allocateCommandBuffers(context.*.commands, context.*.device, &allocation, &command_buffer) != vk.Result.success {
+        destroy(d)
+        return null
+    }
+    d.*.commandBuffer = command_buffer
+    var fence_info = vk.FenceCreateInfo.init()
+    var fence: vk.Fence = 0
+    if vk.createFence(context.*.commands, context.*.device, &fence_info, null, &fence) != vk.Result.success {
+        destroy(d)
+        return null
+    }
+    d.*.fence = fence
+    return d
+}
+
+pub fn destroy(d: *Decoder) -> void {
+    const context = d.*.context
+    _ = vk.deviceWaitIdle(context.*.commands, context.*.device)
+    destroySession(d)
+    if d.*.fence != 0 { vk.destroyFence(context.*.commands, context.*.device, d.*.fence, null) }
+    if d.*.commandPool != 0 { vk.destroyCommandPool(context.*.commands, context.*.device, d.*.commandPool, null) }
+    unsafe { d.*.allocator.free(@ptrCast([*]u8, d), @sizeOf(Decoder), 16) }
+}
+
+// The frame last decoded: its size and where it is in the coded
+// picture.
+pub fn width(d: *const Decoder) -> u32 { return d.*.width }
+pub fn height(d: *const Decoder) -> u32 { return d.*.height }
+
+// ---- The session ----
+
+fn destroySession(d: *Decoder) -> void {
+    const context = d.*.context
+    const commands = context.*.commands
+    const device = context.*.device
+    if d.*.parameters != 0 { vk.destroyVideoSessionParametersKHR(commands, device, d.*.parameters, null) }
+    d.*.parameters = 0
+    var layer: usize = 0
+    while layer < MAX_LAYERS {
+        if d.*.views[layer] != 0 { vk.destroyImageView(commands, device, d.*.views[layer], null) }
+        d.*.views[layer] = 0
+        d.*.layerLayout[layer] = vk.ImageLayout.undefined_
+        d.*.layerRead[layer] = false
+        layer += 1
+    }
+    if d.*.outputView != 0 { vk.destroyImageView(commands, device, d.*.outputView, null) }
+    d.*.outputView = 0
+    if d.*.outputImage != 0 { vk.destroyImage(commands, device, d.*.outputImage, null) }
+    d.*.outputImage = 0
+    if d.*.outputMemory != 0 { vk.freeMemory(commands, device, d.*.outputMemory, null) }
+    d.*.outputMemory = 0
+    if d.*.dpbImage != 0 { vk.destroyImage(commands, device, d.*.dpbImage, null) }
+    d.*.dpbImage = 0
+    if d.*.dpbMemory != 0 { vk.freeMemory(commands, device, d.*.dpbMemory, null) }
+    d.*.dpbMemory = 0
+    if d.*.session != 0 { vk.destroyVideoSessionKHR(commands, device, d.*.session, null) }
+    d.*.session = 0
+    var bind: usize = 0
+    while bind < @intCast(usize, d.*.sessionMemoryCount) {
+        if d.*.sessionMemory[bind] != 0 { vk.freeMemory(commands, device, d.*.sessionMemory[bind], null) }
+        d.*.sessionMemory[bind] = 0
+        bind += 1
+    }
+    d.*.sessionMemoryCount = 0
+    gpu.destroyBuffer(context, &d.*.bitstream)
+    gpu.destroyBuffer(context, &d.*.readback)
+    var slot: usize = 0
+    while slot < h264.SLOTS {
+        d.*.layerOfSlot[slot] = NONE
+        slot += 1
+    }
+    d.*.codedWidth = 0
+    d.*.codedHeight = 0
+    d.*.layers = 0
+    d.*.profileIdc = NONE
+}
+
+// The device's capabilities for the profile: false when it does not
+// decode it.
+fn queryProfile(d: *Decoder, profileIdc: u32) -> bool {
+    const context = d.*.context
+    d.*.h264Profile = vk.VideoDecodeH264ProfileInfoKHR.init()
+    d.*.h264Profile.stdProfileIdc = profileIdc
+    d.*.h264Profile.pictureLayout = vk.VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR
+    d.*.profile = vk.VideoProfileInfoKHR.init()
+    d.*.profile.pNext = &d.*.h264Profile
+    d.*.profile.videoCodecOperation = vk.VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR
+    d.*.profile.chromaSubsampling = vk.VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR
+    d.*.profile.lumaBitDepth = vk.VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR
+    d.*.profile.chromaBitDepth = vk.VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR
+    d.*.profileList = vk.VideoProfileListInfoKHR.init()
+    d.*.profileList.profileCount = 1
+    d.*.profileList.pProfiles = &d.*.profile
+    d.*.h264Capabilities = vk.VideoDecodeH264CapabilitiesKHR.init()
+    d.*.decodeCapabilities = vk.VideoDecodeCapabilitiesKHR.init()
+    d.*.decodeCapabilities.pNext = &d.*.h264Capabilities
+    d.*.capabilities = vk.VideoCapabilitiesKHR.init()
+    d.*.capabilities.pNext = &d.*.decodeCapabilities
+    gpu.step(context, "vkGetPhysicalDeviceVideoCapabilitiesKHR")
+    if vk.getPhysicalDeviceVideoCapabilitiesKHR(context.*.instanceCommands, context.*.physical, &d.*.profile, &d.*.capabilities) != vk.Result.success { return false }
+    d.*.coincide = d.*.decodeCapabilities.flags & vk.VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR != 0
+    d.*.profileIdc = profileIdc
+    return true
+}
+
+// The picture format the device offers for `usage` with the profile:
+// NV12 (G8_B8R8_2PLANE_420) wanted.
+fn pictureFormat(d: *Decoder, usage: vk.ImageUsageFlags, format: *vk.Format) -> bool {
+    const context = d.*.context
+    var info = vk.PhysicalDeviceVideoFormatInfoKHR.init()
+    info.pNext = &d.*.profileList
+    info.imageUsage = usage
+    var count: u32 = 0
+    if vk.getPhysicalDeviceVideoFormatPropertiesKHR(context.*.instanceCommands, context.*.physical, &info, &count, null) != vk.Result.success { return false }
+    if count == 0 { return false }
+    if count > 16 { count = 16 }
+    var properties: [16]vk.VideoFormatPropertiesKHR = undefined
+    var index: u32 = 0
+    while index < count {
+        properties[index] = vk.VideoFormatPropertiesKHR.init()
+        index += 1
+    }
+    if vk.getPhysicalDeviceVideoFormatPropertiesKHR(context.*.instanceCommands, context.*.physical, &info, &count, &properties) != vk.Result.success { return false }
+    index = 0
+    while index < count {
+        if properties[index].format == vk.Format.g8B8r82plane420Unorm {
+            format.* = properties[index].format
+            return true
+        }
+        index += 1
+    }
+    return false
+}
+
+fn createImage(d: *Decoder, width_: u32, height_: u32, layers: u32, usage: vk.ImageUsageFlags, image: *vk.Image, memory: *vk.DeviceMemory) -> bool {
+    const context = d.*.context
+    var families: [2]u32 = undefined
+    families[0] = context.*.family
+    families[1] = context.*.videoFamily
+    var info = vk.ImageCreateInfo.init()
+    info.pNext = &d.*.profileList
+    info.imageType = vk.ImageType.type2d
+    info.format = d.*.format
+    info.extent.width = width_
+    info.extent.height = height_
+    info.extent.depth = 1
+    info.mipLevels = 1
+    info.arrayLayers = layers
+    info.samples = vk.SAMPLE_COUNT_1_BIT
+    info.tiling = vk.ImageTiling.optimal
+    info.usage = usage
+    info.initialLayout = vk.ImageLayout.undefined_
+    if context.*.family != context.*.videoFamily {
+        // Decoded on the video queue, read back on the compute queue.
+        info.sharingMode = vk.SharingMode.concurrent
+        info.queueFamilyIndexCount = 2
+        info.pQueueFamilyIndices = &families
+    } else {
+        info.sharingMode = vk.SharingMode.exclusive
+    }
+    var created: vk.Image = 0
+    gpu.step(context, "vkCreateImage (video)")
+    if vk.createImage(context.*.commands, context.*.device, &info, null, &created) != vk.Result.success { return false }
+    image.* = created
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getImageMemoryRequirements(context.*.commands, context.*.device, created, &requirements)
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.allocationSize = requirements.size
+    allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    if allocation.memoryTypeIndex == NONE { allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits, 0) }
+    if allocation.memoryTypeIndex == NONE { return false }
+    var allocated: vk.DeviceMemory = 0
+    gpu.step(context, "vkAllocateMemory (video image)")
+    if vk.allocateMemory(context.*.commands, context.*.device, &allocation, null, &allocated) != vk.Result.success { return false }
+    memory.* = allocated
+    if vk.bindImageMemory(context.*.commands, context.*.device, created, allocated, 0) != vk.Result.success { return false }
+    return true
+}
+
+fn createView(d: *Decoder, image: vk.Image, layer: u32, view: *vk.ImageView) -> bool {
+    const context = d.*.context
+    var info = vk.ImageViewCreateInfo.init()
+    info.image = image
+    info.viewType = vk.ImageViewType.type2d
+    info.format = d.*.format
+    info.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    info.subresourceRange.baseMipLevel = 0
+    info.subresourceRange.levelCount = 1
+    info.subresourceRange.baseArrayLayer = layer
+    info.subresourceRange.layerCount = 1
+    var created: vk.ImageView = 0
+    if vk.createImageView(context.*.commands, context.*.device, &info, null, &created) != vk.Result.success { return false }
+    view.* = created
+    return true
+}
+
+// A buffer the decoder reads the slices from: host visible, of at least
+// `size` bytes.
+fn ensureBitstream(d: *Decoder, size: u64) -> bool {
+    if d.*.bitstream.buffer != 0 && d.*.bitstream.size >= size { return true }
+    const context = d.*.context
+    gpu.destroyBuffer(context, &d.*.bitstream)
+    var wanted = size
+    if wanted < 1048576 { wanted = 1048576 }
+    d.*.bitstream.size = wanted
+    var info = vk.BufferCreateInfo.init()
+    info.pNext = &d.*.profileList
+    info.size = wanted
+    info.usage = vk.BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR
+    info.sharingMode = vk.SharingMode.exclusive
+    var buffer: vk.Buffer = 0
+    gpu.step(context, "vkCreateBuffer (bitstream)")
+    if vk.createBuffer(context.*.commands, context.*.device, &info, null, &buffer) != vk.Result.success { return false }
+    d.*.bitstream.buffer = buffer
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getBufferMemoryRequirements(context.*.commands, context.*.device, buffer, &requirements)
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.allocationSize = requirements.size
+    allocation.memoryTypeIndex = memoryType(context, requirements.memoryTypeBits, vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    if allocation.memoryTypeIndex == NONE { return false }
+    var memory: vk.DeviceMemory = 0
+    if vk.allocateMemory(context.*.commands, context.*.device, &allocation, null, &memory) != vk.Result.success { return false }
+    d.*.bitstream.memory = memory
+    if vk.bindBufferMemory(context.*.commands, context.*.device, buffer, memory, 0) != vk.Result.success { return false }
+    var mapped: ?*anyopaque = null
+    if vk.mapMemory(context.*.commands, context.*.device, memory, 0, vk.WHOLE_SIZE, 0, &mapped) != vk.Result.success { return false }
+    d.*.bitstream.address = @intFromPtr(mapped.?)
+    return true
+}
+
+fn alignUp(value: u32, granularity: u32) -> u32 {
+    if granularity <= 1 { return value }
+    return (value + granularity - 1) / granularity * granularity
+}
+
+// The session for `sps`: kept when the one there fits (same profile,
+// size and DPB not larger), else made anew.
+fn ensureSession(d: *Decoder, sps: *const h264.Sps) -> Status {
+    const context = d.*.context
+    const profileIdc = sps.*.std.profile_idc
+    if sps.*.std.chroma_format_idc != 1 || sps.*.std.bit_depth_luma_minus8 != 0 || sps.*.std.bit_depth_chroma_minus8 != 0 { return Status.unsupported }
+    if !sps.*.frameMbsOnly { return Status.unsupported }
+    const neededWidth = sps.*.widthInMbs * 16
+    const neededHeight = sps.*.heightInMbs * 16
+    var neededLayers = sps.*.dpbFrames + 2
+    if neededLayers > @intCast(u32, MAX_LAYERS) { neededLayers = @intCast(u32, MAX_LAYERS) }
+    if d.*.session != 0 && d.*.profileIdc == profileIdc && d.*.codedWidth >= neededWidth && d.*.codedHeight >= neededHeight && d.*.layers >= neededLayers { return Status.ok }
+    _ = vk.deviceWaitIdle(context.*.commands, context.*.device)
+    destroySession(d)
+    // The profile: the SPS's, else Main or High (a Constrained Baseline
+    // stream decodes as Main on devices without Baseline).
+    if !queryProfile(d, profileIdc) {
+        if profileIdc == video.STD_VIDEO_H264_PROFILE_IDC_BASELINE || profileIdc == 88 {
+            if !queryProfile(d, video.STD_VIDEO_H264_PROFILE_IDC_MAIN) && !queryProfile(d, video.STD_VIDEO_H264_PROFILE_IDC_HIGH) { return Status.unsupported }
+        } else {
+            return Status.unsupported
+        }
+    }
+    const capabilities = &d.*.capabilities
+    const codedWidth = alignUp(neededWidth, capabilities.*.pictureAccessGranularity.width)
+    const codedHeight = alignUp(neededHeight, capabilities.*.pictureAccessGranularity.height)
+    if codedWidth > capabilities.*.maxCodedExtent.width || codedHeight > capabilities.*.maxCodedExtent.height { return Status.unsupported }
+    if codedWidth < capabilities.*.minCodedExtent.width || codedHeight < capabilities.*.minCodedExtent.height { return Status.unsupported }
+    if capabilities.*.maxDpbSlots < 2 { return Status.unsupported }
+    if neededLayers > capabilities.*.maxDpbSlots { neededLayers = capabilities.*.maxDpbSlots }
+    // The DPB's usage: the decoded picture too, read back, where the
+    // two coincide; else the output image is read back.
+    var usage: vk.ImageUsageFlags = vk.IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR
+    if d.*.coincide { usage |= vk.IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | vk.IMAGE_USAGE_TRANSFER_SRC_BIT }
+    const outputUsage = vk.IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | vk.IMAGE_USAGE_TRANSFER_SRC_BIT
+    var format: vk.Format = vk.Format.undefined_
+    if !pictureFormat(d, usage, &format) { return Status.unsupported }
+    d.*.format = format
+    if !d.*.coincide {
+        var outputFormat: vk.Format = vk.Format.undefined_
+        if !pictureFormat(d, outputUsage, &outputFormat) || outputFormat != format { return Status.unsupported }
+    }
+
+    var info = vk.VideoSessionCreateInfoKHR.init()
+    info.queueFamilyIndex = context.*.videoFamily
+    info.pVideoProfile = &d.*.profile
+    info.pictureFormat = format
+    info.maxCodedExtent.width = codedWidth
+    info.maxCodedExtent.height = codedHeight
+    info.referencePictureFormat = format
+    info.maxDpbSlots = neededLayers
+    info.maxActiveReferencePictures = neededLayers - 1
+    if info.maxActiveReferencePictures > capabilities.*.maxActiveReferencePictures { info.maxActiveReferencePictures = capabilities.*.maxActiveReferencePictures }
+    info.pStdHeaderVersion = &capabilities.*.stdHeaderVersion
+    var session: vk.VideoSessionKHR = 0
+    gpu.step(context, "vkCreateVideoSessionKHR")
+    if vk.createVideoSessionKHR(context.*.commands, context.*.device, &info, null, &session) != vk.Result.success { return Status.failed }
+    d.*.session = session
+    d.*.needsReset = true
+    d.*.codedWidth = codedWidth
+    d.*.codedHeight = codedHeight
+    d.*.layers = neededLayers
+
+    // The session's memory: every bind it asks for.
+    var bindCount: u32 = 0
+    if vk.getVideoSessionMemoryRequirementsKHR(context.*.commands, context.*.device, session, &bindCount, null) != vk.Result.success { return Status.failed }
+    if bindCount > @intCast(u32, MAX_BINDS) { return Status.failed }
+    var requirements: [MAX_BINDS]vk.VideoSessionMemoryRequirementsKHR = undefined
+    var binds: [MAX_BINDS]vk.BindVideoSessionMemoryInfoKHR = undefined
+    var bind: u32 = 0
+    while bind < bindCount {
+        requirements[bind] = vk.VideoSessionMemoryRequirementsKHR.init()
+        bind += 1
+    }
+    if vk.getVideoSessionMemoryRequirementsKHR(context.*.commands, context.*.device, session, &bindCount, &requirements) != vk.Result.success { return Status.failed }
+    bind = 0
+    while bind < bindCount {
+        var allocation = vk.MemoryAllocateInfo.init()
+        allocation.allocationSize = requirements[bind].memoryRequirements.size
+        allocation.memoryTypeIndex = memoryType(context, requirements[bind].memoryRequirements.memoryTypeBits, vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        if allocation.memoryTypeIndex == NONE { allocation.memoryTypeIndex = memoryType(context, requirements[bind].memoryRequirements.memoryTypeBits, 0) }
+        if allocation.memoryTypeIndex == NONE { return Status.failed }
+        var memory: vk.DeviceMemory = 0
+        gpu.step(context, "vkAllocateMemory (video session)")
+        if vk.allocateMemory(context.*.commands, context.*.device, &allocation, null, &memory) != vk.Result.success { return Status.outOfMemory }
+        d.*.sessionMemory[bind] = memory
+        d.*.sessionMemoryCount = bind + 1
+        binds[bind] = vk.BindVideoSessionMemoryInfoKHR.init()
+        binds[bind].memoryBindIndex = requirements[bind].memoryBindIndex
+        binds[bind].memory = memory
+        binds[bind].memoryOffset = 0
+        binds[bind].memorySize = requirements[bind].memoryRequirements.size
+        bind += 1
+    }
+    if bindCount > 0 {
+        gpu.step(context, "vkBindVideoSessionMemoryKHR")
+        if vk.bindVideoSessionMemoryKHR(context.*.commands, context.*.device, session, bindCount, &binds) != vk.Result.success { return Status.failed }
+    }
+
+    // The DPB: one image, a layer per slot, and a view per layer; the
+    // output image when the decoder keeps them apart.
+    if !createImage(d, codedWidth, codedHeight, neededLayers, usage, &d.*.dpbImage, &d.*.dpbMemory) { return Status.outOfMemory }
+    var layer: u32 = 0
+    while layer < neededLayers {
+        if !createView(d, d.*.dpbImage, layer, &d.*.views[layer]) { return Status.failed }
+        d.*.layerLayout[layer] = vk.ImageLayout.undefined_
+        layer += 1
+    }
+    if !d.*.coincide {
+        if !createImage(d, codedWidth, codedHeight, 1, outputUsage, &d.*.outputImage, &d.*.outputMemory) { return Status.outOfMemory }
+        if !createView(d, d.*.outputImage, 0, &d.*.outputView) { return Status.failed }
+    }
+    d.*.frameBytes = @intCast(u64, codedWidth) * @intCast(u64, codedHeight) * 3 / 2
+    if !gpu.createReadbackBuffer(context, &d.*.readback, d.*.frameBytes * @intCast(u64, neededLayers)) { return Status.outOfMemory }
+    return Status.ok
+}
+
+// The session parameters: every SPS and PPS std.h264 holds, made anew
+// when one the picture uses changed since.
+fn ensureParameters(d: *Decoder, h: *h264.Decoder, spsId: usize, ppsId: usize) -> Status {
+    const context = d.*.context
+    const sps = h264.spsAt(h, spsId)
+    const pps = h264.ppsAt(h, ppsId)
+    var same = d.*.parameters != 0
+    unsafe {
+        if same && !sameBytes(@ptrCast([*]const u8, sps), @ptrCast([*]const u8, &d.*.spsSeen[spsId]), @sizeOf(h264.Sps)) { same = false }
+        if same && !sameBytes(@ptrCast([*]const u8, pps), @ptrCast([*]const u8, &d.*.ppsSeen[ppsId]), @sizeOf(h264.Pps)) { same = false }
+    }
+    if same { return Status.ok }
+    var spss: [h264.MAX_SPS]video.StdVideoH264SequenceParameterSet = undefined
+    var ppss: [h264.MAX_PPS]video.StdVideoH264PictureParameterSet = undefined
+    var spsCount: u32 = 0
+    var ppsCount: u32 = 0
+    var id: usize = 0
+    while id < h264.MAX_SPS {
+        const set = h264.spsAt(h, id)
+        if set.*.present {
+            spss[spsCount] = set.*.std
+            spsCount += 1
+        }
+        d.*.spsSeen[id] = set.*
+        id += 1
+    }
+    id = 0
+    while id < h264.MAX_PPS {
+        const set = h264.ppsAt(h, id)
+        if set.*.present && h264.spsAt(h, @intCast(usize, set.*.spsId)).*.present {
+            ppss[ppsCount] = set.*.std
+            ppsCount += 1
+        }
+        d.*.ppsSeen[id] = set.*
+        id += 1
+    }
+    var add = vk.VideoDecodeH264SessionParametersAddInfoKHR.init()
+    add.stdSPSCount = spsCount
+    add.pStdSPSs = &spss
+    add.stdPPSCount = ppsCount
+    add.pStdPPSs = &ppss
+    var h264Info = vk.VideoDecodeH264SessionParametersCreateInfoKHR.init()
+    h264Info.maxStdSPSCount = @intCast(u32, h264.MAX_SPS)
+    h264Info.maxStdPPSCount = @intCast(u32, h264.MAX_PPS)
+    h264Info.pParametersAddInfo = &add
+    var info = vk.VideoSessionParametersCreateInfoKHR.init()
+    info.pNext = &h264Info
+    info.videoSession = d.*.session
+    var parameters: vk.VideoSessionParametersKHR = 0
+    gpu.step(context, "vkCreateVideoSessionParametersKHR")
+    if vk.createVideoSessionParametersKHR(context.*.commands, context.*.device, &info, null, &parameters) != vk.Result.success { return Status.failed }
+    if d.*.parameters != 0 {
+        // The last decode was waited for: the old object is idle.
+        vk.destroyVideoSessionParametersKHR(context.*.commands, context.*.device, d.*.parameters, null)
+    }
+    d.*.parameters = parameters
+    return Status.ok
+}
+
+// ---- The bitstream ----
+
+// The bytes the decoder reads for `picture`'s slices: each with a
+// three-byte start code.
+pub fn bitstreamSize(picture: *const h264.Picture) -> usize {
+    var size: usize = 0
+    var slice: usize = 0
+    while slice < picture.*.sliceCount {
+        size += 3 + @intCast(usize, picture.*.sliceLengths[slice])
+        slice += 1
+    }
+    return size
+}
+
+// Writes the slices of `picture` (within the access unit's `bytes`) to
+// `out` with start codes; `offsets` gets each slice's offset in it.
+// Returns the bytes written.
+pub fn writeBitstream(picture: *const h264.Picture, bytes: [*]const u8, out: [*]u8, offsets: [*]u32) -> usize {
+    var at: usize = 0
+    var slice: usize = 0
+    while slice < picture.*.sliceCount {
+        offsets[slice] = @intCast(u32, at)
+        out[at] = 0
+        out[at + 1] = 0
+        out[at + 2] = 1
+        at += 3
+        const offset = @intCast(usize, picture.*.sliceOffsets[slice])
+        const length = @intCast(usize, picture.*.sliceLengths[slice])
+        var index: usize = 0
+        while index < length {
+            out[at + index] = bytes[offset + index]
+            index += 1
+        }
+        at += length
+        slice += 1
+    }
+    return at
+}
+
+// ---- Decoding ----
+
+// Maps std.h264's slots to DPB layers: slots no longer used free their
+// layers; the picture's slot and its references get one.
+fn mapLayers(d: *Decoder, h: *h264.Decoder, picture: *const h264.Picture) -> bool {
+    var slot: usize = 0
+    while slot < h264.SLOTS {
+        if !h.*.frames[slot].used { d.*.layerOfSlot[slot] = NONE }
+        slot += 1
+    }
+    var needed: usize = 0
+    while needed <= picture.*.referenceCount {
+        const wanted = if needed < picture.*.referenceCount { picture.*.referenceSlots[needed] } else { picture.*.slot }
+        if d.*.layerOfSlot[wanted] == NONE {
+            var taken: [MAX_LAYERS]bool = undefined
+            var layer: usize = 0
+            while layer < MAX_LAYERS {
+                taken[layer] = false
+                layer += 1
+            }
+            slot = 0
+            while slot < h264.SLOTS {
+                if d.*.layerOfSlot[slot] != NONE { taken[d.*.layerOfSlot[slot]] = true }
+                slot += 1
+            }
+            layer = 0
+            while layer < @intCast(usize, d.*.layers) && taken[layer] { layer += 1 }
+            if layer >= @intCast(usize, d.*.layers) { return false }
+            d.*.layerOfSlot[wanted] = @intCast(u32, layer)
+            d.*.layerRead[layer] = false
+        }
+        needed += 1
+    }
+    return true
+}
+
+fn pictureResource(d: *Decoder, view: vk.ImageView) -> vk.VideoPictureResourceInfoKHR {
+    var resource = vk.VideoPictureResourceInfoKHR.init()
+    resource.codedOffset.x = 0
+    resource.codedOffset.y = 0
+    resource.codedExtent.width = d.*.pictureWidth
+    resource.codedExtent.height = d.*.pictureHeight
+    resource.baseArrayLayer = 0
+    resource.imageViewBinding = view
+    return resource
+}
+
+// Decodes the picture std.h264 read from the access unit `bytes` (the
+// one h264.accessUnit was given, before finishPicture): its slices to
+// the decoder, the result in the DPB layer of the picture's slot.
+pub fn decode(d: *Decoder, h: *h264.Decoder, bytes: [*]const u8) -> Status {
+    const context = d.*.context
+    const picture = &h.*.picture
+    if picture.*.sliceCount == 0 { return Status.corrupt }
+    const sps = h264.spsAt(h, @intCast(usize, picture.*.spsId))
+    const sessionStatus = ensureSession(d, sps)
+    if sessionStatus != Status.ok { return sessionStatus }
+    const parametersStatus = ensureParameters(d, h, @intCast(usize, picture.*.spsId), @intCast(usize, picture.*.ppsId))
+    if parametersStatus != Status.ok { return parametersStatus }
+    d.*.pictureWidth = sps.*.widthInMbs * 16
+    d.*.pictureHeight = sps.*.heightInMbs * 16
+    d.*.cropX = sps.*.std.frame_crop_left_offset * 2
+    d.*.cropY = sps.*.std.frame_crop_top_offset * 2
+    d.*.width = sps.*.width
+    d.*.height = sps.*.height
+    setConversion(d, sps)
+    if !mapLayers(d, h, picture) { return Status.corrupt }
+    const dstLayer = d.*.layerOfSlot[picture.*.slot]
+
+    // The slices.
+    const size = bitstreamSize(picture)
+    const alignment = d.*.capabilities.minBitstreamBufferSizeAlignment
+    var range = @intCast(u64, size)
+    if alignment > 1 { range = (range + alignment - 1) / alignment * alignment }
+    if !ensureBitstream(d, range) { return Status.outOfMemory }
+    var sliceOffsets: [h264.MAX_SLICES]u32 = undefined
+    unsafe { _ = writeBitstream(picture, bytes, @ptrFromInt([*]u8, d.*.bitstream.address), &sliceOffsets) }
+
+    // The command buffer: the layers not yet in the DPB layout (fresh,
+    // or references never decoded) into it, then the decode.
+    const commands = context.*.commands
+    if vk.resetCommandBuffer(commands, d.*.commandBuffer, 0) != vk.Result.success { return Status.failed }
+    var begin = vk.CommandBufferBeginInfo.init()
+    begin.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    if vk.beginCommandBuffer(commands, d.*.commandBuffer, &begin) != vk.Result.success { return Status.failed }
+    var barriers: [MAX_LAYERS + 1]vk.ImageMemoryBarrier2 = undefined
+    var barrierCount: u32 = 0
+    var layer: u32 = 0
+    while layer < d.*.layers {
+        if d.*.layerLayout[layer] == vk.ImageLayout.undefined_ || layer == dstLayer {
+            var barrier = vk.ImageMemoryBarrier2.init()
+            barrier.srcStageMask = vk.PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+            barrier.srcAccessMask = 0
+            barrier.dstStageMask = vk.PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR
+            barrier.dstAccessMask = vk.ACCESS_2_VIDEO_DECODE_READ_BIT_KHR | vk.ACCESS_2_VIDEO_DECODE_WRITE_BIT_KHR
+            barrier.oldLayout = d.*.layerLayout[layer]
+            barrier.newLayout = vk.ImageLayout.videoDecodeDpbKhr
+            barrier.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+            barrier.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+            barrier.image = d.*.dpbImage
+            barrier.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+            barrier.subresourceRange.baseMipLevel = 0
+            barrier.subresourceRange.levelCount = 1
+            barrier.subresourceRange.baseArrayLayer = layer
+            barrier.subresourceRange.layerCount = 1
+            barriers[barrierCount] = barrier
+            barrierCount += 1
+            d.*.layerLayout[layer] = vk.ImageLayout.videoDecodeDpbKhr
+        }
+        layer += 1
+    }
+    if !d.*.coincide {
+        var barrier = vk.ImageMemoryBarrier2.init()
+        barrier.srcStageMask = vk.PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+        barrier.srcAccessMask = 0
+        barrier.dstStageMask = vk.PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR
+        barrier.dstAccessMask = vk.ACCESS_2_VIDEO_DECODE_WRITE_BIT_KHR
+        barrier.oldLayout = vk.ImageLayout.undefined_
+        barrier.newLayout = vk.ImageLayout.videoDecodeDstKhr
+        barrier.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        barrier.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+        barrier.image = d.*.outputImage
+        barrier.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+        barrier.subresourceRange.levelCount = 1
+        barrier.subresourceRange.layerCount = 1
+        barriers[barrierCount] = barrier
+        barrierCount += 1
+    }
+    var dependency = vk.DependencyInfo.init()
+    dependency.imageMemoryBarrierCount = barrierCount
+    dependency.pImageMemoryBarriers = &barriers
+    vk.cmdPipelineBarrier2(commands, d.*.commandBuffer, &dependency)
+
+    // The references, and the slot the picture is set up in (bound as
+    // inactive for the begin, activated by the decode).
+    var resources: [MAX_LAYERS + 1]vk.VideoPictureResourceInfoKHR = undefined
+    var dpbInfos: [MAX_LAYERS + 1]vk.VideoDecodeH264DpbSlotInfoKHR = undefined
+    var slots: [MAX_LAYERS + 1]vk.VideoReferenceSlotInfoKHR = undefined
+    var boundSlots: [MAX_LAYERS + 1]vk.VideoReferenceSlotInfoKHR = undefined
+    var reference: usize = 0
+    while reference < picture.*.referenceCount {
+        const referenceLayer = d.*.layerOfSlot[picture.*.referenceSlots[reference]]
+        resources[reference] = pictureResource(d, d.*.views[referenceLayer])
+        dpbInfos[reference] = vk.VideoDecodeH264DpbSlotInfoKHR.init()
+        dpbInfos[reference].pStdReferenceInfo = &picture.*.references[reference]
+        slots[reference] = vk.VideoReferenceSlotInfoKHR.init()
+        slots[reference].pNext = &dpbInfos[reference]
+        slots[reference].slotIndex = @intCast(i32, referenceLayer)
+        slots[reference].pPictureResource = &resources[reference]
+        boundSlots[reference] = slots[reference]
+        reference += 1
+    }
+    const setup = picture.*.referenceCount
+    var setupInfo: video.StdVideoDecodeH264ReferenceInfo = undefined
+    setupInfo.flags.bits0 = video.StdVideoDecodeH264ReferenceInfoFlags_top_field_flag | video.StdVideoDecodeH264ReferenceInfoFlags_bottom_field_flag
+    setupInfo.FrameNum = picture.*.info.frame_num
+    setupInfo.reserved = 0
+    setupInfo.PicOrderCnt[0] = picture.*.info.PicOrderCnt[0]
+    setupInfo.PicOrderCnt[1] = picture.*.info.PicOrderCnt[1]
+    resources[setup] = pictureResource(d, d.*.views[dstLayer])
+    dpbInfos[setup] = vk.VideoDecodeH264DpbSlotInfoKHR.init()
+    dpbInfos[setup].pStdReferenceInfo = &setupInfo
+    slots[setup] = vk.VideoReferenceSlotInfoKHR.init()
+    slots[setup].pNext = &dpbInfos[setup]
+    slots[setup].slotIndex = @intCast(i32, dstLayer)
+    slots[setup].pPictureResource = &resources[setup]
+    boundSlots[setup] = slots[setup]
+    boundSlots[setup].slotIndex = -1
+
+    var beginCoding = vk.VideoBeginCodingInfoKHR.init()
+    beginCoding.videoSession = d.*.session
+    beginCoding.videoSessionParameters = d.*.parameters
+    beginCoding.referenceSlotCount = @intCast(u32, setup + 1)
+    beginCoding.pReferenceSlots = &boundSlots
+    vk.cmdBeginVideoCodingKHR(commands, d.*.commandBuffer, &beginCoding)
+    if d.*.needsReset {
+        var control = vk.VideoCodingControlInfoKHR.init()
+        control.flags = vk.VIDEO_CODING_CONTROL_RESET_BIT_KHR
+        vk.cmdControlVideoCodingKHR(commands, d.*.commandBuffer, &control)
+        d.*.needsReset = false
+    }
+    var h264Picture = vk.VideoDecodeH264PictureInfoKHR.init()
+    h264Picture.pStdPictureInfo = &picture.*.info
+    h264Picture.sliceCount = @intCast(u32, picture.*.sliceCount)
+    h264Picture.pSliceOffsets = &sliceOffsets
+    var decodeInfo = vk.VideoDecodeInfoKHR.init()
+    decodeInfo.pNext = &h264Picture
+    decodeInfo.srcBuffer = d.*.bitstream.buffer
+    decodeInfo.srcBufferOffset = 0
+    decodeInfo.srcBufferRange = range
+    if d.*.coincide {
+        decodeInfo.dstPictureResource = resources[setup]
+    } else {
+        decodeInfo.dstPictureResource = pictureResource(d, d.*.outputView)
+    }
+    decodeInfo.pSetupReferenceSlot = &slots[setup]
+    decodeInfo.referenceSlotCount = @intCast(u32, picture.*.referenceCount)
+    decodeInfo.pReferenceSlots = &slots
+    vk.cmdDecodeVideoKHR(commands, d.*.commandBuffer, &decodeInfo)
+    var endCoding = vk.VideoEndCodingInfoKHR.init()
+    vk.cmdEndVideoCodingKHR(commands, d.*.commandBuffer, &endCoding)
+    if vk.endCommandBuffer(commands, d.*.commandBuffer) != vk.Result.success { return Status.failed }
+
+    var command_buffer = d.*.commandBuffer
+    var submit = vk.SubmitInfo.init()
+    submit.commandBufferCount = 1
+    submit.pCommandBuffers = &command_buffer
+    gpu.step(context, "vkQueueSubmit (video decode)")
+    if vk.queueSubmit(commands, context.*.videoQueue, 1, &submit, d.*.fence) != vk.Result.success { return Status.failed }
+    var fence = d.*.fence
+    const waited = vk.waitForFences(commands, context.*.device, 1, &fence, vk.TRUE, 5000000000)
+    _ = vk.resetFences(commands, context.*.device, 1, &fence)
+    if waited != vk.Result.success { return Status.failed }
+    d.*.decoded += 1
+    if !readBack(d, dstLayer) { return Status.failed }
+    return Status.ok
+}
+
+// ---- Reading back ----
+
+// Copies the picture just decoded into `layer` (the DPB layer, or the
+// output image) to the layer's part of the readback buffer, on the
+// compute queue (the images are shared between the two families; the
+// decode was waited for).
+fn readBack(d: *Decoder, layer: u32) -> bool {
+    const context = d.*.context
+    const commands = context.*.commands
+    if !gpu.begin(context) { return false }
+    const command_buffer = context.*.commandBuffer
+    var image = d.*.dpbImage
+    var imageLayer = layer
+    var decodedLayout = vk.ImageLayout.videoDecodeDpbKhr
+    if !d.*.coincide {
+        image = d.*.outputImage
+        imageLayer = 0
+        decodedLayout = vk.ImageLayout.videoDecodeDstKhr
+    }
+    var toTransfer = vk.ImageMemoryBarrier.init()
+    toTransfer.srcAccessMask = 0
+    toTransfer.dstAccessMask = vk.ACCESS_TRANSFER_READ_BIT
+    toTransfer.oldLayout = decodedLayout
+    toTransfer.newLayout = vk.ImageLayout.transferSrcOptimal
+    toTransfer.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    toTransfer.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    toTransfer.image = image
+    toTransfer.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    toTransfer.subresourceRange.baseMipLevel = 0
+    toTransfer.subresourceRange.levelCount = 1
+    toTransfer.subresourceRange.baseArrayLayer = imageLayer
+    toTransfer.subresourceRange.layerCount = 1
+    vk.cmdPipelineBarrier(commands, command_buffer, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &toTransfer)
+    const base = d.*.frameBytes * @intCast(u64, layer)
+    const lumaBytes = @intCast(u64, d.*.pictureWidth) * @intCast(u64, d.*.pictureHeight)
+    var regions: [2]vk.BufferImageCopy = undefined
+    regions[0] = vk.BufferImageCopy.init()
+    regions[0].bufferOffset = base
+    regions[0].imageSubresource.aspectMask = vk.IMAGE_ASPECT_PLANE_0_BIT
+    regions[0].imageSubresource.mipLevel = 0
+    regions[0].imageSubresource.baseArrayLayer = imageLayer
+    regions[0].imageSubresource.layerCount = 1
+    regions[0].imageExtent.width = d.*.pictureWidth
+    regions[0].imageExtent.height = d.*.pictureHeight
+    regions[0].imageExtent.depth = 1
+    regions[1] = vk.BufferImageCopy.init()
+    regions[1].bufferOffset = base + lumaBytes
+    regions[1].imageSubresource.aspectMask = vk.IMAGE_ASPECT_PLANE_1_BIT
+    regions[1].imageSubresource.mipLevel = 0
+    regions[1].imageSubresource.baseArrayLayer = imageLayer
+    regions[1].imageSubresource.layerCount = 1
+    regions[1].imageExtent.width = d.*.pictureWidth / 2
+    regions[1].imageExtent.height = d.*.pictureHeight / 2
+    regions[1].imageExtent.depth = 1
+    vk.cmdCopyImageToBuffer(commands, command_buffer, image, vk.ImageLayout.transferSrcOptimal, d.*.readback.buffer, 2, &regions)
+    if d.*.coincide {
+        // Back to the DPB layout: the layer stays a reference.
+        var back = toTransfer
+        back.srcAccessMask = vk.ACCESS_TRANSFER_READ_BIT
+        back.dstAccessMask = 0
+        back.oldLayout = vk.ImageLayout.transferSrcOptimal
+        back.newLayout = vk.ImageLayout.videoDecodeDpbKhr
+        vk.cmdPipelineBarrier(commands, command_buffer, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, null, 0, null, 1, &back)
+    }
+    var visible = vk.MemoryBarrier.init()
+    visible.srcAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    visible.dstAccessMask = vk.ACCESS_HOST_READ_BIT
+    vk.cmdPipelineBarrier(commands, command_buffer, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_HOST_BIT, 0, 1, &visible, 0, null, 0, null)
+    if !gpu.submit(context) { return false }
+    d.*.layerRead[layer] = true
+    return true
+}
+
+// The frame decoded into std.h264's `slot` (by decode(), not yet
+// overwritten) as BGRA pixels into `out`, rows `stride` bytes apart,
+// width(d) x height(d) of them. False when the slot holds no frame.
+pub fn readFrame(d: *Decoder, slot: usize, out: [*]u8, stride: usize) -> bool {
+    if slot >= h264.SLOTS || d.*.layerOfSlot[slot] == NONE || d.*.readback.address == 0 { return false }
+    const layer = d.*.layerOfSlot[slot]
+    if !d.*.layerRead[layer] { return false }
+    const lumaBytes = @intCast(usize, d.*.pictureWidth) * @intCast(usize, d.*.pictureHeight)
+    const pixels: [*]const u8 = unsafe { @ptrFromInt([*]const u8, d.*.readback.address + @intCast(usize, d.*.frameBytes) * @intCast(usize, layer)) }
+    const lumaStride = @intCast(usize, d.*.pictureWidth)
+    const luma: [*]const u8 = &pixels[@intCast(usize, d.*.cropY) * lumaStride + @intCast(usize, d.*.cropX)]
+    const chroma: [*]const u8 = &pixels[lumaBytes + @intCast(usize, d.*.cropY) / 2 * lumaStride + @intCast(usize, d.*.cropX) / 2 * 2]
+    convertNv12(&d.*.conversion, luma, lumaStride, chroma, lumaStride, @intCast(usize, d.*.width), @intCast(usize, d.*.height), out, stride)
+    return true
+}
+
+// ---- Colour ----
+
+pub const MATRIX_BT601: u32 = 5
+pub const MATRIX_BT709: u32 = 1
+
+// The stream's matrix: the VUI's when it says, else BT.709 for HD
+// pictures and BT.601 below.
+fn setConversion(d: *Decoder, sps: *const h264.Sps) -> void {
+    var matrix = MATRIX_BT601
+    var fullRange = false
+    if sps.*.height > 576 { matrix = MATRIX_BT709 }
+    if sps.*.std.flags.bits0 & video.StdVideoH264SpsFlags_vui_parameters_present_flag != 0 {
+        if sps.*.vui.flags.bits0 & video.StdVideoH264SpsVuiFlags_video_full_range_flag != 0 { fullRange = true }
+        if sps.*.vui.flags.bits0 & video.StdVideoH264SpsVuiFlags_color_description_present_flag != 0 {
+            const coefficients = @intCast(u32, sps.*.vui.matrix_coefficients)
+            if coefficients == 1 { matrix = MATRIX_BT709 }
+            if coefficients == 5 || coefficients == 6 { matrix = MATRIX_BT601 }
+        }
+    }
+    if d.*.matrix == matrix && d.*.fullRange == fullRange && d.*.conversion.rCr[255] != 0 { return }
+    d.*.matrix = matrix
+    d.*.fullRange = fullRange
+    conversionFor(&d.*.conversion, matrix, fullRange)
+}
+
+// The tables for `matrix` (MATRIX_BT601 or MATRIX_BT709) and the range.
+pub fn conversionFor(conversion: *Conversion, matrix: u32, fullRange: bool) -> void {
+    // The coefficients, in 1/65536.
+    var yScale: i32 = 76309
+    var rCr: i32 = 104597
+    var gCb: i32 = -25624
+    var gCr: i32 = -53281
+    var bCb: i32 = 132251
+    if matrix == MATRIX_BT709 {
+        rCr = 117504
+        gCb = -13954
+        gCr = -34903
+        bCb = 138412
+    }
+    if fullRange {
+        yScale = 65536
+        if matrix == MATRIX_BT709 {
+            rCr = 103206
+            gCb = -12276
+            gCr = -30679
+            bCb = 121609
+        } else {
+            rCr = 91881
+            gCb = -22554
+            gCr = -46802
+            bCb = 116130
+        }
+    }
+    var index: i32 = 0
+    while index < 256 {
+        var y = index
+        if !fullRange { y = index - 16 }
+        conversion.*.y[@intCast(usize, index)] = y * yScale + 32768
+        const c = index - 128
+        conversion.*.rCr[@intCast(usize, index)] = c * rCr
+        conversion.*.gCb[@intCast(usize, index)] = c * gCb
+        conversion.*.gCr[@intCast(usize, index)] = c * gCr
+        conversion.*.bCb[@intCast(usize, index)] = c * bCb
+        index += 1
+    }
+}
+
+fn clampByte(value: i32) -> u8 {
+    if value < 0 { return 0 }
+    if value > 16711680 { return 255 }
+    return @intCast(u8, value >> 16)
+}
+
+// NV12 (luma rows, then interleaved Cb/Cr rows of half the height) to
+// BGRA.
+pub fn convertNv12(conversion: *const Conversion, luma: [*]const u8, lumaStride: usize, chroma: [*]const u8, chromaStride: usize, width_: usize, height_: usize, out: [*]u8, stride: usize) -> void {
+    var row: usize = 0
+    while row < height_ {
+        const lumaRow: [*]const u8 = &luma[row * lumaStride]
+        const chromaRow: [*]const u8 = &chroma[row / 2 * chromaStride]
+        const outRow: [*]u8 = &out[row * stride]
+        var column: usize = 0
+        while column < width_ {
+            const cb = @intCast(usize, chromaRow[column / 2 * 2])
+            const cr = @intCast(usize, chromaRow[column / 2 * 2 + 1])
+            const y = conversion.*.y[@intCast(usize, lumaRow[column])]
+            outRow[column * 4] = clampByte(y + conversion.*.bCb[cb])
+            outRow[column * 4 + 1] = clampByte(y + conversion.*.gCb[cb] + conversion.*.gCr[cr])
+            outRow[column * 4 + 2] = clampByte(y + conversion.*.rCr[cr])
+            outRow[column * 4 + 3] = 255
+            column += 1
+        }
+        row += 1
+    }
+}

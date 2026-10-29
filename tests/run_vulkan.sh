@@ -68,8 +68,9 @@ if [[ -n "$lavapipe" ]]; then
     run tests/257_vulkan_sharing_runtime.mlx VK_DRIVER_FILES="$lavapipe"
     run tests/258_vulkan_swapchain_runtime.mlx VK_DRIVER_FILES="$lavapipe"
     run tests/263_vulkan_text_runtime.mlx VK_DRIVER_FILES="$lavapipe"
+    run tests/419_gpu_video_runtime.mlx VK_DRIVER_FILES="$lavapipe"
 else
-    echo "skip tests/253, 254, 256, 257, 258 and 263 (no lavapipe manifest)"
+    echo "skip tests/253, 254, 256, 257, 258, 263 and 419 (no lavapipe manifest)"
 fi
 run tests/255_spirv_module_runtime.mlx -- "$work/doubler.spv"
 run tests/262_truetype_runtime.mlx
@@ -111,7 +112,7 @@ if command -v glslangValidator > /dev/null; then
     done
 fi
 
-for example in examples/vulkan-info/main.mlx examples/vulkan-wayland-client/main.mlx projects/desktop/compositor/main.mlx; do
+for example in examples/vulkan-info/main.mlx examples/vulkan-decode/main.mlx examples/vulkan-wayland-client/main.mlx projects/desktop/compositor/main.mlx; do
     if "$compiler" --quiet "$example" -o "$work/example" 2> "$work/errors"; then
         echo "ok   $example (builds)"
     else

@@ -287,9 +287,29 @@ Observatory share:
 - `std.gpu` opens a device with one compute queue and, on request, the
   sharing extensions the driver supports: dma-buf import and export
   (`VK_EXT_external_memory_dma_buf`) and imported host memory
-  (`VK_EXT_external_memory_host`). It creates, imports and destroys storage
+  (`VK_EXT_external_memory_host`), and the device's video decode queue
+  (`wantVideo`: `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`,
+  `VK_KHR_video_decode_h264`/`h265` and synchronization2, a device with
+  one chosen over one without). It creates, imports and destroys storage
   buffers (`createReadbackBuffer`: host-cached memory for results the CPU
   reads back), compiles kernels and records dispatches.
+- `std.gpu.video` (`gpu/video.mlx`) decodes H.264 on that queue: a
+  video session for the stream's SPS (profile, coded size, DPB slots;
+  remade when a later SPS needs more), session parameters from every SPS
+  and PPS `std.h264` holds (remade when one the picture uses changed),
+  the DPB as one NV12 image with a layer per slot (`std.h264`'s slots
+  mapped to layers as they are used; the reference and setup slots of
+  each `vkCmdDecodeVideoKHR` from the picture's `StdVideoDecodeH264*`
+  structures), the slices in a bitstream buffer with start codes. The
+  decode is submitted and waited for, then the picture (the DPB layer,
+  or the output image where the decoder keeps them apart) is copied on
+  the compute queue (the images shared between the two families) into
+  the layer's part of a host buffer; `readFrame` converts a slot's NV12
+  there to BGRA (BT.601 or BT.709 from the VUI, limited or full range).
+  `tests/419_gpu_video_runtime.mlx` checks the bitstream, the colour
+  conversion and that lavapipe (no decoder) is refused;
+  `examples/vulkan-decode` decodes a file's H.264 track on a device that
+  has one and saves a frame.
 - `std.gpu.swapchain` presents to a window surface: each frame the pattern is
   rendered into a buffer, a callback may draw over it (the Android app's
   label), and the buffer is copied into the acquired image
@@ -327,14 +347,15 @@ receives pixel by pixel.
 and `tests/262_truetype_runtime.mlx` everywhere; `tests/253_vulkan_loader_runtime.mlx`,
 `tests/254_spirv_compute_runtime.mlx` and
 `tests/256_vulkan_icd_runtime.mlx`, `tests/257_vulkan_sharing_runtime.mlx`,
-`tests/258_vulkan_swapchain_runtime.mlx` and
-`tests/263_vulkan_text_runtime.mlx` when lavapipe (package
+`tests/258_vulkan_swapchain_runtime.mlx`,
+`tests/263_vulkan_text_runtime.mlx` and `tests/419_gpu_video_runtime.mlx`
+when lavapipe (package
 `mesa-vulkan-drivers`) is installed; `tools/check_vulkan_wayland.sh` when
 lavapipe and `xkbcli` are; the `spirv-val` and glslang cross-checks
 (including the examples' shaders) when those tools are present; the layout
 check when gcc and `vulkan/vulkan.h` are; and verifies that
-`examples/vulkan-info`, `examples/vulkan-wayland-client` and
-`projects/desktop/compositor` build and that both generated modules are
+`examples/vulkan-info`, `examples/vulkan-decode`,
+`examples/vulkan-wayland-client` and `projects/desktop/compositor` build and that both generated modules are
 current.
 
 ## Limits

@@ -1,0 +1,205 @@
+// Decodes the H.264 track of an MP4 file on the GPU's video decoder
+// (std.gpu.video over std.vulkan's VK_KHR_video_decode_h264, the stream
+// read by std.mp4 and std.h264) and reports what the device did; one
+// frame can be saved as a PNG.
+//
+//     mlx4 examples/vulkan-decode/main.mlx -o vulkan-decode
+//     ./vulkan-decode FILE.mp4                 decode every frame, print the rate
+//     ./vulkan-decode FILE.mp4 OUT.png [N]     also save output frame N (0) as a PNG
+//
+// VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json limits
+// the search to one driver, as with the Khronos loader. Without a video
+// decode queue (lavapipe, say) the program says so and exits 2.
+
+const std = @import("std")
+const crash = @import("std.crash")
+const gpu = @import("std.gpu")
+const gvideo = @import("std.gpu.video")
+const h264 = @import("std.h264")
+const mp4 = @import("std.mp4")
+const png = @import("std.png")
+const loader = @import("std.vulkan.loader")
+const fs = @import("../../std/bootstrap/fs.mlx")
+const time = @import("../../std/bootstrap/time.mlx")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+fn sayNumber(value: usize) -> void { _ = std.io.writeUnsigned(std.io.stdout(), value) }
+fn sayC(text: [*]const u8) -> void { _ = std.io.writeString(std.io.stdout(), std.process.fromCString(text)) }
+
+fn statusName(status: gvideo.Status) -> []const u8 {
+    return match status {
+        .ok => "ok",
+        .unsupported => "unsupported",
+        .failed => "a Vulkan call failed",
+        .outOfMemory => "out of memory",
+        .corrupt => "corrupt",
+    }
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    _ = crash.install()
+    const allocator = std.heap.allocator()
+    if std.process.count(arguments) < 2 {
+        say("usage: vulkan-decode FILE.mp4 [OUT.png [N]]\n")
+        return 1
+    }
+    const path = std.process.argument(arguments, 1)
+    var savePath: ?[*]const u8 = null
+    var saveFrame: usize = 0
+    if std.process.count(arguments) > 2 { savePath = std.process.argument(arguments, 2).pointer }
+    if std.process.count(arguments) > 3 { saveFrame = std.parse.unsigned(std.process.argument(arguments, 3)).value }
+
+    var driver: loader.Driver = undefined
+    const opened = loader.openFirstDriver(&driver, arguments, allocator)
+    if opened != loader.Status.ok {
+        say("no Vulkan driver: ")
+        say(loader.statusMessage(opened))
+        say("\n")
+        return 2
+    }
+    var context: gpu.Context = undefined
+    var options = gpu.defaultOptions("vulkan-decode\x00".pointer)
+    options.wantVideo = true
+    const status = gpu.open(&context, driver, &options, allocator)
+    if status != gpu.Status.ok {
+        say(gpu.statusMessage(status))
+        say("\n")
+        return 2
+    }
+    say("device: ")
+    sayC(gpu.deviceName(&context))
+    if !gvideo.supported(&context) {
+        say(": no H.264 video decode queue (VK_KHR_video_decode_h264)\n")
+        gpu.close(&context)
+        return 2
+    }
+    say(": video decode queue family ")
+    sayNumber(@intCast(usize, context.videoFamily))
+    say("\n")
+
+    const loaded = fs.readFileAlloc(path.pointer, allocator)
+    if loaded == null {
+        say("cannot read the file\n")
+        return 1
+    }
+    const contents = loaded.?
+    const data: [*]const u8 = unsafe { @ptrCast([*]const u8, contents.items) }
+    var movie: mp4.Movie = undefined
+    mp4.init(&movie, allocator)
+    var samples: mp4.Samples = undefined
+    mp4.initSamples(&samples, allocator)
+    var used: usize = 0
+    if mp4.parse(&movie, data, contents.length, &samples, &used) != mp4.Status.ok {
+        say("not an MP4 file this reads\n")
+        return 1
+    }
+    const index = mp4.trackOfKind(&movie, mp4.KIND_VIDEO)
+    if index >= mp4.MAX_TRACKS || mp4.track(&movie, index).*.codec != mp4.CODEC_H264 {
+        say("no H.264 video track\n")
+        return 1
+    }
+    const track = mp4.track(&movie, index)
+    const h = h264.create(allocator).?
+    var set: []const u8 = undefined
+    var sets: usize = 0
+    while mp4.parameterSet(track, sets, &set) {
+        if h264.parameterSet(h, &set[0], set.length) != h264.Status.ok {
+            say("bad parameter set\n")
+            return 1
+        }
+        sets += 1
+    }
+    const d = gvideo.create(&context, allocator)
+    if d == null {
+        say("cannot create the decoder\n")
+        return 2
+    }
+    const decoder = d.?
+
+    var pixels: usize = 0
+    var pixelBytes: usize = 0
+    var pictures: usize = 0
+    var outputs: usize = 0
+    var failures: usize = 0
+    var slot: usize = 0
+    var poc: i32 = 0
+    var sample: mp4.Sample = undefined
+    const started = time.monotonicNanoseconds()
+    var decodeNanoseconds: usize = 0
+    var readNanoseconds: usize = 0
+    while mp4.nextSample(&movie, index, &sample) {
+        const prefix = @intCast(usize, track.*.nalLengthSize)
+        const parsed = h264.accessUnit(h, &data[sample.offset], sample.size, prefix)
+        if parsed != h264.Status.ok {
+            if parsed != h264.Status.empty { failures += 1 }
+            continue
+        }
+        const before = time.monotonicNanoseconds()
+        const decoded = gvideo.decode(decoder, h, &data[sample.offset])
+        decodeNanoseconds += time.monotonicNanoseconds() - before
+        if decoded != gvideo.Status.ok {
+            if failures == 0 {
+                say("decode: ")
+                say(statusName(decoded))
+                say("\n")
+            }
+            failures += 1
+        }
+        pictures += 1
+        h264.finishPicture(h)
+        while h264.nextOutput(h, &slot, &poc) {
+            const width = @intCast(usize, gvideo.width(decoder))
+            const height = @intCast(usize, gvideo.height(decoder))
+            if pixels == 0 || pixelBytes < width * height * 4 {
+                if pixels != 0 { unsafe { allocator.free(@ptrFromInt([*]u8, pixels), pixelBytes, 16) } }
+                pixelBytes = width * height * 4
+                const memory = allocator.alloc(pixelBytes, 16)
+                if memory == null { return 1 }
+                pixels = @intFromPtr(memory.?)
+            }
+            const readStart = time.monotonicNanoseconds()
+            var read = false
+            unsafe { read = gvideo.readFrame(decoder, slot, @ptrFromInt([*]u8, pixels), width * 4) }
+            readNanoseconds += time.monotonicNanoseconds() - readStart
+            if read && savePath != null && outputs == saveFrame {
+                var saved = false
+                unsafe { saved = png.saveFile(savePath.?, @ptrFromInt([*]const u32, pixels), width, height, width, false, allocator) }
+                say(if saved { "saved frame " } else { "could not save frame " })
+                sayNumber(outputs)
+                say(" (")
+                sayNumber(width)
+                say("x")
+                sayNumber(height)
+                say(")\n")
+            }
+            if !read { failures += 1 }
+            outputs += 1
+        }
+    }
+    h264.flush(h)
+    while h264.nextOutput(h, &slot, &poc) { outputs += 1 }
+    const elapsed = time.monotonicNanoseconds() - started
+    say("pictures ")
+    sayNumber(pictures)
+    say(", frames ")
+    sayNumber(outputs)
+    say(", failures ")
+    sayNumber(failures)
+    say("; ")
+    sayNumber(elapsed / 1000000)
+    say(" ms in all, ")
+    sayNumber(decodeNanoseconds / 1000000)
+    say(" ms decoding, ")
+    sayNumber(readNanoseconds / 1000000)
+    say(" ms reading back")
+    if elapsed > 0 {
+        say(" (")
+        sayNumber(outputs * 1000000000 / elapsed)
+        say(" frames/s)")
+    }
+    say("\n")
+    gvideo.destroy(decoder)
+    h264.destroy(h)
+    gpu.close(&context)
+    return if failures == 0 { 0 } else { 3 }
+}

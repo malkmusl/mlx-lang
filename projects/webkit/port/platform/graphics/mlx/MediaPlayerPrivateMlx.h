@@ -1,8 +1,9 @@
 // The Mlx port's media engine (PORT.md, "Media"): MP4 files and Media
 // Source Extensions segments read by std.mp4, AAC-LC decoded by std.aac
 // and played on MLX Audio through std.audio, H.264 pictures ordered by
-// std.h264 (their decoding is the GPU's through Vulkan video, when the
-// port has it), all through libmlxwebport.so (port/mlx/media.mlx).
+// std.h264 and decoded by the GPU's video decoder through std.gpu.video
+// (Vulkan video; without one the video stays black), all through
+// libmlxwebport.so (port/mlx/media.mlx).
 //
 // A file is loaded whole through the player's resource loader, then its
 // tracks' samples come from the demuxer in order; a media source's
@@ -30,6 +31,7 @@ namespace WebCore {
 
 class CoordinatedPlatformLayerBufferProxy;
 class MediaSampleMlx;
+class NativeImage;
 class MediaSourcePrivateMlx;
 class MlxMediaResourceClient;
 class PlatformMediaResource;
@@ -140,6 +142,7 @@ private:
     bool nextVideoSample(Vector<uint8_t>& bytes, MediaTime& presentationTime, bool& sync);
     void videoTick();
     void decodeVideoSample(const Vector<uint8_t>&, const MediaTime&, bool sync);
+    void presentFrame(uint32_t slot);
     void checkEnded();
     void didReachEnd();
     void resetDecoders();
@@ -212,6 +215,11 @@ private:
     // the frames go to; the timer that takes the samples due.
     size_t m_h264 { 0 };
     bool m_h264Configured { false };
+    // The GPU's decoder (port/mlx/media.mlx's), opened at the first
+    // picture; 0 when no device decodes.
+    size_t m_videoDecoder { 0 };
+    bool m_videoDecoderTried { false };
+    RefPtr<NativeImage> m_lastFrame;
     RefPtr<CoordinatedPlatformLayerBufferProxy> m_layerProxy;
     RunLoop::Timer m_videoTimer;
     MediaTime m_lastVideoTime { MediaTime::invalidTime() };

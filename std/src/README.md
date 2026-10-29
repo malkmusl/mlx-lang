@@ -177,9 +177,16 @@ checked against the C headers). `vulkan/loader.mlx`
 `spirv/module.mlx` write, read and validate SPIR-V, and
 `spirv/compute.mlx` (`std.spirv.compute`) declares compute kernels.
 `gpu.mlx` (`std.gpu`) runs compute kernels on pixel buffers (one device and
-queue, dma-buf and host-memory sharing), with `gpu/shaders.mlx`
+queue, dma-buf and host-memory sharing, the device's video decode queue
+when asked for), with `gpu/shaders.mlx`
 (`std.gpu.shaders`), `gpu/text.mlx` (`std.gpu.text`) and
-`gpu/swapchain.mlx` (`std.gpu.swapchain`). See `docs/reference/vulkan.md`.
+`gpu/swapchain.mlx` (`std.gpu.swapchain`). `gpu/video.mlx`
+(`std.gpu.video`) decodes the H.264 pictures `std.h264` reads on the
+GPU's video decoder (VK_KHR_video_decode_h264: a session per stream, the
+DPB as one layered image, the slices in a bitstream buffer) and reads
+the frames back as BGRA (NV12 converted on the host; test 419 on
+lavapipe, `examples/vulkan-decode` on a decoding device). See
+`docs/reference/vulkan.md`.
 
 `truetype.mlx` (`std.truetype`) and `truetype/` are the font engine:
 TrueType and OpenType (CFF, CFF2) fonts, variable and color fonts, read

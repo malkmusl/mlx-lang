@@ -9,6 +9,7 @@
 #include "GraphicsContext.h"
 #include "MediaPlayer.h"
 #include "MediaSampleMlx.h"
+#include "NativeImage.h"
 #include "NetworkLoadMetrics.h"
 #include "PlatformMediaResourceLoader.h"
 #include "ResourceError.h"
@@ -19,6 +20,9 @@
 #include <wtf/MainThread.h>
 #include <wtf/TZoneMallocInlines.h>
 #include <wtf/text/StringToIntegerConversion.h>
+#include <skia/core/SkColorSpace.h>
+#include <skia/core/SkData.h>
+#include <skia/core/SkImage.h>
 
 #if ENABLE(MEDIA_SOURCE)
 #include "MediaSourcePrivateClient.h"
@@ -27,6 +31,7 @@
 #endif
 
 #if USE(COORDINATED_GRAPHICS)
+#include "CoordinatedPlatformLayerBufferNativeImage.h"
 #include "CoordinatedPlatformLayerBufferProxy.h"
 #endif
 
@@ -364,6 +369,12 @@ void MediaPlayerPrivateMlx::cancelLoad()
         mlxweb_media_h264_destroy(m_h264);
         m_h264 = 0;
     }
+    if (m_videoDecoder) {
+        mlxweb_video_close(m_videoDecoder);
+        m_videoDecoder = 0;
+    }
+    m_videoDecoderTried = false;
+    m_lastFrame = nullptr;
     if (m_audioOutput) {
         mlxweb_audio_close(m_audioOutput);
         m_audioOutput = 0;
@@ -949,9 +960,9 @@ void MediaPlayerPrivateMlx::videoTick()
 }
 
 // The access unit through the H.264 picture order: its picture in the
-// decoded picture buffer, the pictures due for output. Their pixels
-// come once the port decodes on the GPU (Vulkan video); until then the
-// frames are counted and the layer stays as it is.
+// decoded picture buffer, decoded by the GPU (std.gpu.video), then the
+// pictures due for output read back and shown. Without a decoding
+// device the frames are counted and the layer stays as it is.
 void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, const MediaTime& presentationTime, bool)
 {
     if (!m_h264)
@@ -972,15 +983,53 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
     auto status = mlxweb_media_h264_access_unit(m_h264, bytes.span().data(), bytes.size(), 4);
     if (status != MLXWEB_MEDIA_OK)
         return;
+    if (!m_videoDecoderTried) {
+        m_videoDecoderTried = true;
+        m_videoDecoder = mlxweb_video_open();
+    }
+    bool decoded = m_videoDecoder && mlxweb_video_decode(m_videoDecoder, m_h264, bytes.span().data()) == MLXWEB_MEDIA_OK;
     mlxweb_media_h264_finish_picture(m_h264);
     uint32_t slot = 0;
     int32_t poc = 0;
     while (mlxweb_media_h264_next_output(m_h264, &slot, &poc)) {
-        if (presentationTime + MediaTime(1, 2) < clockTime())
+        if (presentationTime + MediaTime(1, 2) < clockTime()) {
             ++m_droppedFrames;
-        else
-            ++m_decodedFrames;
+            continue;
+        }
+        ++m_decodedFrames;
+        if (decoded)
+            presentFrame(slot);
     }
+}
+
+// The frame in the decoder's slot: read back as BGRA into a Skia raster
+// image, to the layer (and kept for paint).
+void MediaPlayerPrivateMlx::presentFrame(uint32_t slot)
+{
+    int width = mlxweb_video_width(m_videoDecoder);
+    int height = mlxweb_video_height(m_videoDecoder);
+    if (width <= 0 || height <= 0)
+        return;
+    size_t rowBytes = static_cast<size_t>(width) * 4;
+    auto data = SkData::MakeUninitialized(rowBytes * height);
+    if (!data || !mlxweb_video_read_frame(m_videoDecoder, slot, data->writable_data(), rowBytes))
+        return;
+    auto info = SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
+    auto image = SkImages::RasterFromData(info, WTF::move(data), rowBytes);
+    if (!image)
+        return;
+    RefPtr nativeImage = NativeImage::create(WTF::move(image));
+    if (!nativeImage)
+        return;
+    m_lastFrame = nativeImage;
+    if (m_naturalSize != FloatSize(width, height)) {
+        m_naturalSize = FloatSize(width, height);
+        m_player->sizeChanged();
+    }
+#if USE(COORDINATED_GRAPHICS)
+    if (m_layerProxy)
+        m_layerProxy->setDisplayBuffer(CoordinatedPlatformLayerBufferNativeImage::create(nativeImage.releaseNonNull(), nullptr));
+#endif
 }
 
 PlatformLayer* MediaPlayerPrivateMlx::platformLayer() const
@@ -996,6 +1045,10 @@ void MediaPlayerPrivateMlx::paint(GraphicsContext& context, const FloatRect& rec
 {
     if (!m_videoTrack)
         return;
+    if (m_lastFrame) {
+        context.drawNativeImage(*m_lastFrame, rect, FloatRect { { }, m_lastFrame->size() });
+        return;
+    }
     context.fillRect(rect, Color::black);
 }
 

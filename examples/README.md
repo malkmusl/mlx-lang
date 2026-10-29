@@ -11,6 +11,8 @@ larger programs (the desktop, MLX Observatory, coreutils) are under
   (`std.vulkan.loader`).
 - [`vulkan-wayland-client/`](vulkan-wayland-client/README.md): a Wayland
   window rendered by a compute shader (`std.gpu`).
+- `vulkan-decode/`: an MP4 file's H.264 track decoded on the GPU's video
+  decoder (`std.gpu.video`), a frame saved as a PNG.
 - `android/gestures.mlx`: touch gestures on Android (`std.android`).
 - [`vulkan-android/`](vulkan-android/README.md): Vulkan on Android through a
   swapchain (`std.gpu.swapchain`).
