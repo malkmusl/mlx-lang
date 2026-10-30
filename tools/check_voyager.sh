@@ -119,8 +119,9 @@
 #      textures released on the main thread's run loop, whichever page
 #      asked for them first).
 #
-#   tools/check_voyager.sh [--no-build] [--keep DIR]
+#   tools/check_voyager.sh [--no-build] [--voyager PROGRAM] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
+#     (--voyager: that program checked instead, not built)
 set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -128,9 +129,12 @@ cd "$repo_root"
 fail() { echo "FAIL $1" >&2; exit 1; }
 build=1
 keep=""
+voyager=$repo_root/mlx-out/webkit/mlx/bin/voyager
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-build) build=0 ;;
+        # (Another program checked, linked by hand: implies --no-build.)
+        --voyager) voyager=$(realpath "$2"); build=0; shift ;;
         --keep) keep=$2; shift ;;
         *) echo "FAIL unknown argument $1" >&2; exit 1 ;;
     esac
@@ -142,7 +146,6 @@ if [[ $build -eq 1 ]]; then
     ./mlx build libc webkit-mlx-voyager > /dev/null 2>&1 || fail "./mlx build webkit-mlx-voyager"
     echo "ok   ./mlx build webkit-mlx-voyager"
 fi
-voyager=$repo_root/mlx-out/webkit/mlx/bin/voyager
 [[ -x "$voyager" ]] || fail "$voyager is missing"
 compiler=${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}
 

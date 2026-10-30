@@ -725,25 +725,23 @@ As M1 has them: JSCOnly's sources (lists/wtf.txt: `generic/`,
 `MemoryPressureHandlerUnix`, `LanguageUnix`, `TimeZone.cpp` with mlx-unicode
 and std.timezone, `TextBreakIteratorInternalICUUnix`.
 
-**Memory.** `USE_SYSTEM_MALLOC` is on for the JSCOnly and Mlx
-configurations: WTF's fastMalloc, IsoHeaps and TZone heaps are
-mlxlibc's malloc (std's general-purpose allocator: size classes behind
-one lock), not bmalloc's libpas. libpas is written for a compiler that
-inlines its `PAS_ALWAYS_INLINE` chains and folds its heap configuration
-(a 1 KiB struct built as a compound literal at every use, passed by
-value down ten levels) to constants; mlx-cc builds that configuration
-on the stack at every call, so one allocation with its free cost 12 µs
-against 217 ns on mlxlibc's malloc (projects/webkit/tests has no
-benchmark of it yet; the numbers are from a loop of 4 million
-allocations of 16 to 240 bytes), and a Google page spent 60% of its
-time in fastMalloc and fastFree. libpas is still compiled and linked
-(bmalloc's sources are one list), and nothing calls it. The way back
-is mlx-cc's: constant compound literals as static data copied from,
-`always_inline` honoured, and the configuration's fields folded through
-the inlined chain; then libpas is the allocator again (it is 5 to 10
-times faster than a general-purpose malloc under gcc). JavaScriptCore's
-executable memory uses its own allocator in this configuration, not
-libpas's JIT heap.
+**Memory.** bmalloc's libpas is WebKit's allocator, as upstream has it
+(`USE_SYSTEM_MALLOC` off). libpas is written for a compiler that inlines
+its `PAS_ALWAYS_INLINE` chains and folds its heap configuration (a 1 KiB
+struct built as a compound literal at every use, passed by value down
+ten levels) to constants. mlx-cc built that configuration on the stack
+at every call: one allocation with its free cost 12 µs, and a Google
+page spent 60% of its time in fastMalloc and fastFree. mlx-cc now folds
+the configuration's loads in the shared LIR (region loads,
+compiler/cc/README.md) and packs the frame's places that are left: the
+allocation and free fast paths keep no copy and no zeroing of it, their
+frames go from 20 to 25 KiB to 0.5 to 1.2 KiB, and an allocation with its
+free costs 290 ns (a loop of 4 million allocations of 16 to 240 bytes;
+mlxlibc's malloc 217 ns). With WebCore and JavaScriptCore as they were,
+libpas and WTF compiled again: the saved Wikipedia page in webcore-dump
+in 6 s instead of 21 s, its render tree the same; bench.html in 1.2 s
+instead of 30 s. (`USE_SYSTEM_MALLOC` was on for a day as the way
+around it.)
 
 **The main loop.** WebCore and the embedder run on the main thread's
 `RunLoop` (RunLoopGeneric: a condition variable, a tree of timers;
@@ -1943,10 +1941,9 @@ What M2 found, and how the port meets it without a patch:
   has none either). The file chooser has no previews.
 - **What M8's fifth part leaves** (JavaScriptCore's JIT):
   - Half of the Wikipedia page's time was bmalloc's (libpas') allocation,
-    which mlx-cc compiles without inlining (about 41% of a profile with
-    the LLInt; 60% of Google's): the port runs on mlxlibc's malloc for
-    now ("Memory" above), 50 times cheaper an allocation; libpas comes
-    back when mlx-cc folds its configuration.
+    which mlx-cc compiled without folding its configuration (about 41% of
+    a profile with the LLInt; 60% of Google's): mlx-cc folds it now
+    ("Memory" above), 40 times cheaper an allocation.
 - **What M8's first part leaves** (composited layers on the CPU):
   - Voyager presents a frame on its window's thread, which is WebCore's
     main thread: the compositor composites, scrolls and animates on its

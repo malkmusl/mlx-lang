@@ -55,6 +55,10 @@ tree="$work/tree"
 mkdir -p "$tree/src"
 ln -s "$repo_root/std" "$tree/std"
 ln -s "$repo_root/compiler" "$tree/compiler"
+# (The compilers' --version module, which the repository's build.mlx
+# writes: mlx-cc imports it.)
+mkdir -p "$tree/mlx-out"
+cp "$repo_root/mlx-out/version.mlx" "$tree/mlx-out/version.mlx" || fail "mlx-out/version.mlx is missing (./mlx build writes it)"
 cat > "$tree/src/main.c" <<'EOF_C'
 #include <stdio.h>
 int twice(int);

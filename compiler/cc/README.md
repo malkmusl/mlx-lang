@@ -308,7 +308,30 @@ place of the frame that is only loaded and stored whole, one width
 or temporary of such a type, a struct copied through) becomes an 8-byte
 slot like a scalar local's, which the optimizer forwards loads of and
 the register pass may keep in a register (`MLX_CC_PROMOTE=0`: not;
-ir.promotePlaces). An inline function of a header (a weak
+ir.promotePlaces). A place that is copied, passed on by value and read
+in parts, but whose address nothing else takes (a struct passed by
+value through inlined calls: libpas's heap configuration, a 1 KiB
+compound literal handed down ten `always_inline` levels), has its
+loads folded in the shared LIR (`compiler/selfhost/ir/region_loads.mlx`,
+after single-store promotion and copy propagation): a load is the value
+the last write of its bytes left there, followed through each copy back
+to the store, the zeroing or the constant bytes it came from, and with
+the load's register class (a double's bits read as a word are bitcast);
+a place then read by nothing loses its writes, the copies into it with
+them. What is left of the frame's places is packed after the optimizer
+(`compiler/selfhost/ir/frame.mlx`, a `frame_local` carrying its place's
+size), so the frame is as big as what is still reached. To narrow a
+miscompilation: `MLX_CC_NO_REGION_FOLD` and `MLX_CC_NO_REGION_DROP` turn
+the folding or the dropping off, `MLX_CC_REGION_ONLY=TEXT` keeps both
+to the units whose path holds TEXT, `MLX_CC_REGION_FUNCTION=TEXT` to the
+functions whose symbol holds it, and `MLX_CC_REGION_LIMIT=N` folds at
+most N loads of a function, to find the wrong one by bisection;
+`MLX_CC_LIR_TRACE` prints each function's regions (loads folded, writes
+and places dropped, why the others were not folded), each fold (the
+load, the write followed, the value) and the frame before and after
+packing. `tests/pasconfig.c` is libpas's shape; tools/check_cc.sh checks
+that its `allocate` keeps no copy, no zeroing and no place of the
+configuration. An inline function of a header (a weak
 symbol) is still made in a unit that inlines every call of it, as a
 call would have it: another unit may call it with only its declaration
 in sight (WebCore's `*Inlines.h`). `MLX_CC_STATS` counts the calls

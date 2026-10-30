@@ -1,0 +1,846 @@
+// Loads from a region of the frame that the function itself wrote,
+// folded to what was written; regions nothing reads any more, dropped.
+//
+// A struct made in place (a compound literal, an aggregate initializer,
+// a by-value parameter of an inlined call, the copy a by-value argument
+// is loaded from) is a region of the frame (frame_local) written by
+// stores, by a zeroing external and by mem_copy, then read by loads and
+// by mem_copy. When the region's address goes nowhere else (no call,
+// no store of it, no arithmetic but gep by a constant), every byte of
+// it comes from a write this function made. A load reads what the last
+// write to its bytes wrote, known when every write overlapping those
+// bytes is on every path to the load (in the load's block before it,
+// or in a block dominating the load's): those writes are ordered, one
+// dominating the next, and the last of them is the one. A load reading
+// exactly what one store wrote becomes that value (narrowed as the load
+// would widen it); zeroed bytes become 0; bytes a mem_copy brought are
+// followed to the source region at the copy's place. A region left
+// with no load, no copy out of it and no other use is dead: its
+// stores, zeroing and copies into it go (eliminateUnused drops its
+// addresses after).
+//
+// libpas's heap configuration is such a region: a 1 KiB compound
+// literal of constants and function addresses, passed by value down a
+// chain of always_inline functions that read a few fields of it; with
+// this pass the fields are the constants, and neither the literal nor
+// the parameters' copies of it are made.
+const allocator_module = @import("../../../std/bootstrap/allocator.mlx")
+const lir = @import("./lir.mlx")
+const operands = @import("./operands.mlx")
+const dominance = @import("./dominance.mlx")
+const type_store = @import("../sema/types/store.mlx")
+
+// An external that zeroes memory: the one whose client word's low byte
+// is `zeroingKind`, zeroing the count of bytes the word holds above
+// `zeroingShift` bits, its one operand the address (mlx-cc's memzero).
+// NONE: no external zeroes.
+pub var zeroingKind: usize = lir.NONE // (per run)
+pub var zeroingShift: usize = 8 // (per run)
+// Switches for narrowing a miscompilation down: no loads folded, no
+// dead regions' writes dropped.
+// The client's type store (the address of a type_store.Store): a load
+// folded keeps its register class, so a value of the other class (a
+// double stored, the word loaded for a struct passed by value) is
+// bitcast rather than copied, and a narrow load of it is left alone.
+// Without a store, only loads typed like the value are folded.
+pub var typeStoreAddress: usize = 0 // (per run)
+pub var foldLoads: bool = true // (per run)
+pub var dropWrites: bool = true // (per run)
+// The client's switches (a miscompilation narrowed: folding or
+// dropping off everywhere); foldLoads and dropWrites are what the
+// current function gets.
+pub var foldAllowed: bool = true // (per run)
+// At most this many loads folded per function (narrowing further):
+// the client sets foldBudget to its limit before a function's runs.
+pub var foldLimit: usize = 0xffffffffffffffff // (per run)
+pub var foldBudget: usize = 0xffffffffffffffff // (per run)
+pub var dropAllowed: bool = true // (per run)
+// A text (its address and length) a function's name must hold for its
+// loads to be folded, when the length is not 0 (the client's switch).
+pub var onlyFunctionPointer: usize = 0 // (per run)
+pub var onlyFunctionLength: usize = 0 // (per run)
+// A log of the folds for a trace: per fold the load, the write it
+// followed first, the kind (FROM_*) and the value; FOLD_LOG entries at
+// most, foldLogged of them.
+pub const FOLD_LOG: usize = 256
+pub var foldLog: [FOLD_LOG * 4]usize = undefined // (per run)
+pub var foldLogged: usize = 0 // (per run)
+var topWrite: usize = 0 // (per run)
+
+pub const Result = struct {
+    // The first instruction that let a region escape, and its opcode.
+    firstEscapeAt: usize
+    firstEscapeOpcode: usize
+    loadsFolded: usize
+    writesDropped: usize
+    regionsDropped: usize
+    // For a trace: the loads of regions seen, those in blocks whose
+    // dominators are known, those at a known offset of an unescaped
+    // region, and the regions that escaped.
+    loadsSeen: usize
+    loadsTrusted: usize
+    loadsTried: usize
+    regionsEscaped: usize
+}
+
+// Why a load was not folded, counted for a trace: no write to its bytes
+// before it and the region's writes not in one dominating block;
+// written in several blocks; the one writer block not dominating; a
+// write overlapping its bytes partly; a copy whose source is unknown.
+pub var failNoWrite: usize = 0 // (per run)
+pub var failManyWriters: usize = 0 // (per run)
+pub var failNotDominating: usize = 0 // (per run)
+pub var failPartial: usize = 0 // (per run)
+pub var failCopySource: usize = 0 // (per run)
+pub var failValueAfter: usize = 0 // (per run)
+pub var failClass: usize = 0 // (per run)
+const OPERAND_CAPACITY: usize = 64
+const MAX_DEPTH: usize = 16
+const UNKNOWN: usize = lir.NONE
+
+// Per instruction: the region its address value names (an index into
+// the regions, or NONE) and the byte offset into it (UNKNOWN for one
+// moved by a value not known: a load through it is not folded, a
+// write through it unsettles every byte of the region).
+const Addresses = struct {
+    region: [*]usize
+    offset: [*]usize
+}
+
+const Regions = struct {
+    // The frame offset (frame_local's arg0) naming each region.
+    key: [*]usize
+    escaped: [*]usize
+    // The region's writes (stores, copies into it, zeroings): their
+    // instruction indexes, writeStart[region] .. + writers[region] of
+    // `writes`.
+    writeStart: [*]usize
+    writers: [*]usize
+    writes: [*]usize
+    reads: [*]usize
+    count: usize
+}
+
+fn words(allocator: allocator_module.Allocator, count: usize) -> ?[*]usize {
+    const size = if count == 0 { 8 } else { count * 8 }
+    const memory = allocator.alloc(size, 8)
+    if memory == null { return null }
+    unsafe { return @ptrCast([*]usize, memory.?) }
+}
+
+fn free(allocator: allocator_module.Allocator, memory: [*]usize, count: usize) -> void {
+    const size = if count == 0 { 8 } else { count * 8 }
+    unsafe { allocator.free(@ptrCast([*]u8, memory), size, 8) }
+}
+
+fn fill(memory: [*]usize, count: usize, value: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        memory[index] = value
+        index += 1
+    }
+}
+
+fn regionOf(regions: *Regions, key: usize) -> usize {
+    var index: usize = 0
+    while index < regions.*.count {
+        if regions.*.key[index] == key { return index }
+        index += 1
+    }
+    return lir.NONE
+}
+
+// The value of a constant index: a const_i, or an extend of one (an int
+// index widened). (false, 0) for anything else.
+fn constantIndex(ir: *lir.Lir, index: usize, count: usize) -> (bool, usize) {
+    if index == lir.NONE || index >= count { return -> (false, 0) }
+    const inst = lir.getInst(ir, index)
+    if inst.opcode == lir.Opcode.const_i { return -> (true, inst.arg0) }
+    if inst.opcode == lir.Opcode.extend && inst.arg0 < count && lir.getInst(ir, inst.arg0).opcode == lir.Opcode.const_i {
+        const bits = inst.arg1
+        if bits == 0 || bits >= 64 { return -> (true, lir.getInst(ir, inst.arg0).arg0) }
+        const mask = (@intCast(usize, 1) << @intCast(u6, bits)) - 1
+        var value = lir.getInst(ir, inst.arg0).arg0 & mask
+        if inst.arg2 != 0 && value & (@intCast(usize, 1) << @intCast(u6, bits - 1)) != 0 { value |= ~mask }
+        return -> (true, value)
+    }
+    return -> (false, 0)
+}
+
+fn zeroedBytes(inst: lir.Inst) -> usize {
+    if inst.opcode != lir.Opcode.external || zeroingKind == lir.NONE || inst.arg2 != 1 { return 0 }
+    if inst.arg0 & 255 != zeroingKind { return 0 }
+    return inst.arg0 >> zeroingShift
+}
+
+fn storeWidth(inst: lir.Inst) -> usize { return if inst.arg2 == lir.NONE { 8 } else { inst.arg2 } }
+fn loadWidth(inst: lir.Inst) -> usize { return if inst.arg1 == lir.NONE { 8 } else { inst.arg1 } }
+
+// The address an instruction writes, with how many bytes: a store
+// (arg0, its width), a mem_copy (arg0, arg2), a zeroing external (its
+// operand, the count). (NONE, 0) for anything else.
+fn written(ir: *lir.Lir, inst: lir.Inst) -> (usize, usize) {
+    if inst.opcode == lir.Opcode.store { return -> (inst.arg0, storeWidth(inst)) }
+    if inst.opcode == lir.Opcode.mem_copy { return -> (inst.arg0, inst.arg2) }
+    const zeroed = zeroedBytes(inst)
+    if zeroed > 0 { return -> (lir.getExtra(ir, inst.arg1), zeroed) }
+    return -> (lir.NONE, 0)
+}
+
+// The kinds of what a load's bytes come from.
+const FROM_NONE: usize = 0
+const FROM_VALUE: usize = 1
+const FROM_ZERO: usize = 2
+// A constant composed of several writes' bytes (two int fields read as
+// the word a call passes by value, a byte of a wider constant).
+const FROM_CONST: usize = 3
+// (writeTo only: the write does not settle every byte asked for.)
+const FROM_PARTIAL: usize = 4
+
+// Why the last load was not folded (the fold log's failure kinds are
+// FAIL_LOGGED + this).
+pub const FAIL_NO_WRITE: usize = 1
+pub const FAIL_NOT_DOMINATING: usize = 3
+pub const FAIL_PARTIAL: usize = 4
+pub const FAIL_COPY_SOURCE: usize = 5
+pub const FAIL_VALUE_AFTER: usize = 6
+pub const FAIL_CLASS: usize = 7
+pub const FAIL_LOGGED: usize = 10
+pub var lastFail: usize = 0 // (per run)
+
+// Which blocks each block can reach by one step or more (a bit per
+// pair), made when a load first meets a write that does not dominate
+// it: a write in a block that cannot reach the load's is no write of
+// what the load reads. Past REACH_LIMIT blocks every block is taken to
+// reach every other.
+const REACH_LIMIT: usize = 8192
+const Reach = struct {
+    bits: [*]usize
+    words: usize
+    blocks: usize
+    // A walk's scratch: the blocks visited (a bit each) and its stack.
+    visited: [*]usize
+    visitedWords: usize
+    stack: [*]usize
+    ready: bool
+    failed: bool
+    allocator: allocator_module.Allocator
+}
+
+fn reachBit(reach: *Reach, from: usize, to: usize) -> bool {
+    const index = from * reach.*.blocks + to
+    return reach.*.bits[index >> 6] & (@intCast(usize, 1) << @intCast(u6, index & 63)) != 0
+}
+
+fn setReachBit(reach: *Reach, from: usize, to: usize) -> void {
+    const index = from * reach.*.blocks + to
+    reach.*.bits[index >> 6] |= @intCast(usize, 1) << @intCast(u6, index & 63)
+}
+
+fn buildReach(d: *dominance.Dominance, reach: *Reach) -> void {
+    reach.*.ready = true
+    const blocks = d.*.blockCount
+    if blocks == 0 || blocks > REACH_LIMIT {
+        reach.*.failed = true
+        return
+    }
+    reach.*.blocks = blocks
+    reach.*.words = (blocks * blocks + 63) / 64
+    reach.*.visitedWords = (blocks + 63) / 64
+    const bits = words(reach.*.allocator, reach.*.words)
+    const stack = words(reach.*.allocator, blocks)
+    const visited = words(reach.*.allocator, reach.*.visitedWords)
+    if bits == null || stack == null || visited == null {
+        if bits != null { free(reach.*.allocator, bits.?, reach.*.words) }
+        if stack != null { free(reach.*.allocator, stack.?, blocks) }
+        if visited != null { free(reach.*.allocator, visited.?, reach.*.visitedWords) }
+        reach.*.failed = true
+        return
+    }
+    reach.*.bits = bits.?
+    reach.*.stack = stack.?
+    reach.*.visited = visited.?
+    fill(reach.*.bits, reach.*.words, 0)
+    var from: usize = 0
+    while from < blocks {
+        var top: usize = 0
+        stack.?[top] = from
+        top += 1
+        while top > 0 {
+            top -= 1
+            const at = stack.?[top]
+            var which: usize = 0
+            while which < 2 {
+                const next = d.*.successors[at * 2 + which]
+                which += 1
+                if next == lir.NONE || next >= blocks || reachBit(reach, from, next) { continue }
+                setReachBit(reach, from, next)
+                stack.?[top] = next
+                top += 1
+            }
+        }
+        from += 1
+    }
+}
+
+// Whether some path leads from block `from` to block `to` without
+// passing through block `avoid` (one step or more; `from` may be `to`:
+// a way round to it). True when not known.
+fn reachesAvoiding(d: *dominance.Dominance, reach: *Reach, from: usize, to: usize, avoid: usize) -> bool {
+    if !reach.*.ready { buildReach(d, reach) }
+    if reach.*.failed { return true }
+    fill(reach.*.visited, reach.*.visitedWords, 0)
+    var top: usize = 0
+    reach.*.stack[top] = from
+    top += 1
+    while top > 0 {
+        top -= 1
+        const at = reach.*.stack[top]
+        var which: usize = 0
+        while which < 2 {
+            const next = d.*.successors[at * 2 + which]
+            which += 1
+            if next == lir.NONE || next >= reach.*.blocks || next == avoid { continue }
+            if next == to { return true }
+            const word = next >> 6
+            const bit = @intCast(usize, 1) << @intCast(u6, next & 63)
+            if reach.*.visited[word] & bit != 0 { continue }
+            reach.*.visited[word] |= bit
+            reach.*.stack[top] = next
+            top += 1
+        }
+    }
+    return false
+}
+
+// Whether a write in block `from` may run before the load in block
+// `to` on some path (true when not known).
+fn mayReach(d: *dominance.Dominance, reach: *Reach, from: usize, to: usize) -> bool {
+    if !reach.*.ready { buildReach(d, reach) }
+    if reach.*.failed { return true }
+    return reachBit(reach, from, to)
+}
+
+// Whether the write at `write` (in block `wb`) is on every path to the
+// instruction `at` in `block`, before it: in the same block before it,
+// or in a block dominating it.
+fn reaches(d: *dominance.Dominance, write: usize, wb: usize, at: usize, block: usize) -> bool {
+    if wb == block { return write < at }
+    return dominance.dominates(d, wb, block)
+}
+
+// Of two writes both reaching `at` in `block`, whether `second` runs
+// after `first`.
+fn later(d: *dominance.Dominance, first: usize, second: usize, block: usize) -> bool {
+    const fb = d.*.blockOf[first]
+    const sb = d.*.blockOf[second]
+    if fb == sb { return second > first }
+    if sb == block { return true }
+    if fb == block { return false }
+    return dominance.dominates(d, fb, sb)
+}
+
+// What the `width` bytes at `offset` of region `region` hold at the
+// instruction `at` (in block `block`): (FROM_VALUE, the stored value's
+// instruction), (FROM_CONST, the bytes as a constant), (FROM_ZERO, 0),
+// or (FROM_NONE, 0) when not known.
+fn contentsAt(ir: *lir.Lir, d: *dominance.Dominance, reach: *Reach, addresses: *Addresses, regions: *Regions, region: usize, offset: usize, width: usize, at: usize, block: usize, depth: usize) -> (usize, usize) {
+    if depth >= MAX_DEPTH || regions.*.escaped[region] != 0 { return -> (FROM_NONE, 0) }
+    const latest = latestWrite(ir, d, reach, addresses, regions, region, offset, width, at, block)
+    if latest == lir.NONE { return -> (FROM_NONE, 0) }
+    if depth == 0 { topWrite = latest }
+    const direct = writeTo(ir, d, reach, addresses, regions, latest, region, offset, width, depth)
+    if direct.0 != FROM_PARTIAL { return direct }
+    // Several writes settle the bytes between them: a constant when
+    // each one's part is.
+    const composed = composeAt(ir, d, reach, addresses, regions, region, offset, width, at, block, depth)
+    if composed.0 == FROM_NONE && lastFail == 0 {
+        failPartial += 1
+        lastFail = FAIL_PARTIAL
+    }
+    return composed
+}
+
+// The last write overlapping the `width` bytes at `offset` of `region`
+// that reaches `at` (in block `block`) with no other write possibly
+// between: NONE (a failure counted) when there is none or another
+// write may come between.
+fn latestWrite(ir: *lir.Lir, d: *dominance.Dominance, reach: *Reach, addresses: *Addresses, regions: *Regions, region: usize, offset: usize, width: usize, at: usize, block: usize) -> usize {
+    const count = lir.instCount(ir)
+    // The last write overlapping the bytes, every overlapping write
+    // reaching `at`.
+    var latest = lir.NONE
+    var others = false
+    var index = regions.*.writeStart[region]
+    const end = index + regions.*.writers[region]
+    while index < end {
+        const write = regions.*.writes[index]
+        index += 1
+        const inst = lir.getInst(ir, write)
+        const target = written(ir, inst)
+        if target.1 == 0 || target.0 >= count || addresses.*.region[target.0] != region { continue }
+        const start = addresses.*.offset[target.0]
+        if start == UNKNOWN {
+            failPartial += 1
+            lastFail = FAIL_PARTIAL
+            return lir.NONE
+        }
+        if start + target.1 <= offset || start >= offset + width { continue }
+        const wb = d.*.blockOf[write]
+        if !reaches(d, write, wb, at, block) {
+            others = true
+            continue
+        }
+        if latest == lir.NONE || later(d, latest, write, block) { latest = write }
+    }
+    if latest == lir.NONE {
+        failNoWrite += 1
+        lastFail = FAIL_NO_WRITE
+        return lir.NONE
+    }
+    // A write not on every path may still run between the last one on
+    // every path and the load: not when that one is in the load's own
+    // block (nothing comes between), nor when every way from the
+    // write's block to the load's passes the last write's block again
+    // (another site's copy into the same place, in a loop).
+    const lb = d.*.blockOf[latest]
+    if others && lb != block {
+        index = regions.*.writeStart[region]
+        while index < end {
+            const write = regions.*.writes[index]
+            index += 1
+            const inst = lir.getInst(ir, write)
+            const target = written(ir, inst)
+            if target.1 == 0 || target.0 >= count || addresses.*.region[target.0] != region { continue }
+            const start = addresses.*.offset[target.0]
+            if start + target.1 <= offset || start >= offset + width { continue }
+            const wb = d.*.blockOf[write]
+            if reaches(d, write, wb, at, block) { continue }
+            var harmful = false
+            if wb == lb {
+                harmful = write > latest
+            } else if mayReach(d, reach, wb, block) {
+                harmful = reachesAvoiding(d, reach, wb, block, lb)
+            }
+            if harmful {
+                failNotDominating += 1
+                lastFail = FAIL_NOT_DOMINATING
+                return lir.NONE
+            }
+        }
+    }
+    return latest
+}
+
+// The `width` bytes at `offset` of `region` at `at` as a constant made
+// of the writes settling each byte (a store of a constant, a copy of
+// constant bytes, zeroing): (FROM_CONST, the constant), else (FROM_NONE,
+// 0) with the failure counted.
+fn composeAt(ir: *lir.Lir, d: *dominance.Dominance, reach: *Reach, addresses: *Addresses, regions: *Regions, region: usize, offset: usize, width: usize, at: usize, block: usize, depth: usize) -> (usize, usize) {
+    const count = lir.instCount(ir)
+    var value: usize = 0
+    var b = offset
+    while b < offset + width {
+        const write = latestWrite(ir, d, reach, addresses, regions, region, b, 1, at, block)
+        if write == lir.NONE { return -> (FROM_NONE, 0) }
+        const inst = lir.getInst(ir, write)
+        const target = written(ir, inst)
+        const start = addresses.*.offset[target.0]
+        // (One byte at a time: the next one's last write may be another,
+        // later one, as a field stored after the whole was zeroed.)
+        const piece: usize = 1
+        const piece_end = b + 1
+        var bytes: usize = 0
+        if inst.opcode == lir.Opcode.store {
+            const constant = constantBits(ir, inst.arg1, count)
+            if !constant.0 {
+                failPartial += 1
+                lastFail = FAIL_PARTIAL
+                return -> (FROM_NONE, 0)
+            }
+            bytes = constant.1 >> @intCast(u6, (b - start) * 8)
+        } else if inst.opcode == lir.Opcode.mem_copy {
+            const source = inst.arg1
+            if source >= count || addresses.*.region[source] == lir.NONE || addresses.*.offset[source] == UNKNOWN {
+                failCopySource += 1
+                lastFail = FAIL_COPY_SOURCE
+                return -> (FROM_NONE, 0)
+            }
+            const found = contentsAt(ir, d, reach, addresses, regions, addresses.*.region[source], addresses.*.offset[source] + (b - start), piece, write, d.*.blockOf[write], depth + 1)
+            if found.0 == FROM_CONST {
+                bytes = found.1
+            } else if found.0 == FROM_VALUE {
+                const constant = constantBits(ir, found.1, count)
+                if !constant.0 {
+                    failPartial += 1
+                    lastFail = FAIL_PARTIAL
+                    return -> (FROM_NONE, 0)
+                }
+                bytes = constant.1
+            } else if found.0 != FROM_ZERO {
+                return -> (FROM_NONE, 0)
+            }
+        }
+        bytes &= 255
+        value |= bytes << @intCast(u6, (b - offset) * 8)
+        b = piece_end
+    }
+    return -> (FROM_CONST, value)
+}
+
+// The bits of the constant the instruction is (a const_i, an extend or
+// a bitcast of one).
+fn constantBits(ir: *lir.Lir, index: usize, count: usize) -> (bool, usize) {
+    const direct = constantIndex(ir, index, count)
+    if direct.0 { return direct }
+    if index == lir.NONE || index >= count { return -> (false, 0) }
+    const inst = lir.getInst(ir, index)
+    if inst.opcode == lir.Opcode.bitcast || inst.opcode == lir.Opcode.copy { return constantIndex(ir, inst.arg0, count) }
+    return -> (false, 0)
+}
+
+// What the write at `index`, covering the bytes [offset, offset +
+// width) of `region`, leaves there: as contentsAt gives it, (FROM_NONE,
+// 0) for a copy not followed, (FROM_PARTIAL, 0) for a write that does
+// not settle them all (a partial one, a store of another width).
+fn writeTo(ir: *lir.Lir, d: *dominance.Dominance, reach: *Reach, addresses: *Addresses, regions: *Regions, index: usize, region: usize, offset: usize, width: usize, depth: usize) -> (usize, usize) {
+    const inst = lir.getInst(ir, index)
+    const target = written(ir, inst)
+    const start = addresses.*.offset[target.0]
+    const end = start + target.1
+    if start > offset || end < offset + width { return -> (FROM_PARTIAL, 0) }
+    if inst.opcode == lir.Opcode.store {
+        if start != offset || target.1 != width { return -> (FROM_PARTIAL, 0) }
+        // (The value stored is no address of a region: it would be
+        // dropped with the region, and read as a value is read whole.)
+        return -> (FROM_VALUE, inst.arg1)
+    }
+    if inst.opcode == lir.Opcode.mem_copy {
+        const source = inst.arg1
+        if source >= lir.instCount(ir) || addresses.*.region[source] == lir.NONE || addresses.*.offset[source] == UNKNOWN {
+            failCopySource += 1
+            lastFail = FAIL_COPY_SOURCE
+            return -> (FROM_NONE, 0)
+        }
+        const source_region = addresses.*.region[source]
+        const source_offset = addresses.*.offset[source] + (offset - start)
+        return contentsAt(ir, d, reach, addresses, regions, source_region, source_offset, width, index, d.*.blockOf[index], depth + 1)
+    }
+    return -> (FROM_ZERO, 0)
+}
+
+// An operand `value` of the instruction `index`: an address into a
+// region that is not the instruction's own target lets the region
+// escape.
+fn noteOperand(addresses: *Addresses, regions: *Regions, result: *Result, inst: lir.Inst, op: lir.Opcode, index: usize, value: usize, target: usize, count: usize) -> void {
+    if value == lir.NONE || value >= count || addresses.*.region[value] == lir.NONE { return }
+    const is_target = op == lir.Opcode.store && value == inst.arg0 || op == lir.Opcode.mem_copy && (value == inst.arg0 || value == inst.arg1) || zeroedBytes(inst) > 0 && value == target
+    if is_target { return }
+    regions.*.escaped[addresses.*.region[value]] = 1
+    if result.*.firstEscapeAt == lir.NONE {
+        result.*.firstEscapeAt = index
+        result.*.firstEscapeOpcode = @intCast(usize, @intFromEnum(op))
+    }
+}
+
+pub fn run(ir: *lir.Lir, allocator: allocator_module.Allocator) -> Result {
+    var result = Result.{ .firstEscapeAt = lir.NONE, .firstEscapeOpcode = 0, .loadsFolded = 0, .writesDropped = 0, .regionsDropped = 0, .loadsSeen = 0, .loadsTrusted = 0, .loadsTried = 0, .regionsEscaped = 0 }
+    const count = lir.instCount(ir)
+    if count == 0 { return result }
+    failNoWrite = 0
+    failManyWriters = 0
+    failNotDominating = 0
+    failPartial = 0
+    failCopySource = 0
+    failValueAfter = 0
+    failClass = 0
+    const region_memory = words(allocator, count)
+    const offset_memory = words(allocator, count)
+    if region_memory == null || offset_memory == null {
+        if region_memory != null { free(allocator, region_memory.?, count) }
+        if offset_memory != null { free(allocator, offset_memory.?, count) }
+        return result
+    }
+    var addresses = Addresses.{ .region = region_memory.?, .offset = offset_memory.? }
+    fill(addresses.region, count, lir.NONE)
+    fill(addresses.offset, count, 0)
+    // The regions: one per distinct frame offset.
+    var region_count: usize = 0
+    var index: usize = 0
+    while index < count {
+        if lir.getInst(ir, index).opcode == lir.Opcode.frame_local { region_count += 1 }
+        index += 1
+    }
+    if region_count == 0 {
+        free(allocator, addresses.region, count)
+        free(allocator, addresses.offset, count)
+        return result
+    }
+    const key_memory = words(allocator, region_count)
+    const escaped_memory = words(allocator, region_count)
+    const start_memory = words(allocator, region_count)
+    const writers_memory = words(allocator, region_count)
+    const writes_memory = words(allocator, count)
+    const reads_memory = words(allocator, region_count)
+    const write_region_memory = words(allocator, count)
+    if key_memory == null || escaped_memory == null || start_memory == null || writers_memory == null || writes_memory == null || reads_memory == null || write_region_memory == null {
+        if key_memory != null { free(allocator, key_memory.?, region_count) }
+        if escaped_memory != null { free(allocator, escaped_memory.?, region_count) }
+        if start_memory != null { free(allocator, start_memory.?, region_count) }
+        if writers_memory != null { free(allocator, writers_memory.?, region_count) }
+        if writes_memory != null { free(allocator, writes_memory.?, count) }
+        if reads_memory != null { free(allocator, reads_memory.?, region_count) }
+        if write_region_memory != null { free(allocator, write_region_memory.?, count) }
+        free(allocator, addresses.region, count)
+        free(allocator, addresses.offset, count)
+        return result
+    }
+    var regions = Regions.{ .key = key_memory.?, .escaped = escaped_memory.?, .writeStart = start_memory.?, .writers = writers_memory.?, .writes = writes_memory.?, .reads = reads_memory.?, .count = 0 }
+    // Per instruction: the region it writes, for the lists below.
+    const write_region = write_region_memory.?
+    fill(write_region, count, lir.NONE)
+    fill(regions.escaped, region_count, 0)
+    fill(regions.writeStart, region_count, 0)
+    fill(regions.writers, region_count, 0)
+    fill(regions.reads, region_count, 0)
+    // Addresses: frame_local names a region; gep by a constant moves
+    // within it; a copy keeps it; anything else made from one lets the
+    // region escape.
+    index = 0
+    while index < count {
+        const inst = lir.getInst(ir, index)
+        if inst.opcode == lir.Opcode.frame_local {
+            var region = regionOf(&regions, inst.arg0)
+            if region == lir.NONE {
+                region = regions.count
+                regions.key[region] = inst.arg0
+                regions.count += 1
+            }
+            addresses.region[index] = region
+            addresses.offset[index] = 0
+        } else if inst.opcode == lir.Opcode.gep && inst.arg0 < count && addresses.region[inst.arg0] != lir.NONE {
+            const region = addresses.region[inst.arg0]
+            const known = constantIndex(ir, inst.arg1, count)
+            addresses.region[index] = region
+            addresses.offset[index] = UNKNOWN
+            if known.0 && addresses.offset[inst.arg0] != UNKNOWN {
+                const scale = if inst.arg2 == lir.NONE || inst.arg2 == 0 { 1 } else { inst.arg2 }
+                const moved = known.1 *% scale
+                // (A negative or huge offset: not one this pass follows.)
+                if moved < 1073741824 && addresses.offset[inst.arg0] + moved < 1073741824 { addresses.offset[index] = addresses.offset[inst.arg0] + moved }
+            }
+        } else if inst.opcode == lir.Opcode.copy && inst.arg0 < count && addresses.region[inst.arg0] != lir.NONE {
+            addresses.region[index] = addresses.region[inst.arg0]
+            addresses.offset[index] = addresses.offset[inst.arg0]
+        }
+        index += 1
+    }
+    // Uses: a load or a copy out of a region reads it; a store into it, a
+    // copy into it or a zeroing of it writes it; any other use of an
+    // address into it (a call's argument, a value stored, arithmetic,
+    // a comparison) lets it escape.
+    var d = dominance.compute(ir, allocator)
+    var buffer: [OPERAND_CAPACITY]usize = undefined
+    const buffer_words: [*]usize = &buffer
+    index = 0
+    while index < count {
+        const inst = lir.getInst(ir, index)
+        const op = inst.opcode
+        if op == lir.Opcode.gep || op == lir.Opcode.copy || op == lir.Opcode.frame_local {
+            // (Address arithmetic handled above; a copy of a non-address
+            // is no use of a region.)
+        } else if op == lir.Opcode.load {
+            if inst.arg0 < count && addresses.region[inst.arg0] != lir.NONE { regions.reads[addresses.region[inst.arg0]] += 1 }
+        } else {
+            const target = written(ir, inst)
+            var reads_from = lir.NONE
+            if op == lir.Opcode.mem_copy { reads_from = inst.arg1 }
+            if target.0 != lir.NONE && target.0 < count && addresses.region[target.0] != lir.NONE {
+                const region = addresses.region[target.0]
+                write_region[index] = region
+                regions.writers[region] += 1
+            }
+            if reads_from != lir.NONE && reads_from < count && addresses.region[reads_from] != lir.NONE { regions.reads[addresses.region[reads_from]] += 1 }
+            // Every other operand that is an address into a region: an
+            // escape (a store's value among them, a mem_copy's neither
+            // address, a zeroing's operand neither). A call's operands
+            // (a struct by value is its words) are read from the extra
+            // data, as many as there are.
+            var extra_start = lir.NONE
+            var extra_count: usize = 0
+            if op == lir.Opcode.call || op == lir.Opcode.syscall || op == lir.Opcode.direct_call || op == lir.Opcode.external || op == lir.Opcode.external_value {
+                extra_start = inst.arg1
+                extra_count = inst.arg2
+            } else if op == lir.Opcode.tuple_literal || op == lir.Opcode.clone_thread {
+                extra_start = inst.arg0
+                extra_count = inst.arg1
+            }
+            var read: usize = 0
+            if extra_start != lir.NONE {
+                // (The callee, for a call through a value.)
+                if op == lir.Opcode.call || op == lir.Opcode.syscall { noteOperand(&addresses, &regions, &result, inst, op, index, inst.arg0, target.0, count) }
+            } else {
+                read = operands.collect(ir, inst, buffer_words, OPERAND_CAPACITY)
+            }
+            var at: usize = 0
+            while at < read && at < OPERAND_CAPACITY {
+                noteOperand(&addresses, &regions, &result, inst, op, index, buffer[at], target.0, count)
+                at += 1
+            }
+            at = 0
+            while at < extra_count {
+                noteOperand(&addresses, &regions, &result, inst, op, index, lir.getExtra(ir, extra_start + at), target.0, count)
+                at += 1
+            }
+        }
+        index += 1
+    }
+    // The writes listed per region.
+    var next: usize = 0
+    var region: usize = 0
+    while region < regions.count {
+        regions.writeStart[region] = next
+        next += regions.writers[region]
+        regions.writers[region] = 0
+        region += 1
+    }
+    index = 0
+    while index < count {
+        if write_region[index] != lir.NONE {
+            const r = write_region[index]
+            regions.writes[regions.writeStart[r] + regions.writers[r]] = index
+            regions.writers[r] += 1
+        }
+        index += 1
+    }
+    // The loads, folded.
+    var reach = Reach.{ .bits = regions.writes, .words = 0, .blocks = 0, .visited = regions.writes, .visitedWords = 0, .stack = regions.writes, .ready = false, .failed = false, .allocator = allocator }
+    index = 0
+    while index < count {
+        const inst = lir.getInst(ir, index)
+        if inst.opcode == lir.Opcode.load && inst.arg0 < count && addresses.region[inst.arg0] != lir.NONE {
+            const region = addresses.region[inst.arg0]
+            const block = d.blockOf[index]
+            result.loadsSeen += 1
+            if d.trusted[block] != 0 { result.loadsTrusted += 1 }
+            if foldLoads && foldBudget > 0 && regions.escaped[region] == 0 && d.trusted[block] != 0 && addresses.offset[inst.arg0] != UNKNOWN {
+                result.loadsTried += 1
+                const width = loadWidth(inst)
+                lastFail = 0
+                topWrite = lir.NONE
+                const found = contentsAt(ir, &d, &reach, &addresses, &regions, region, addresses.offset[inst.arg0], width, index, block, 0)
+                var replaced = false
+                var skipped = false
+                if found.0 == FROM_ZERO {
+                    lir.setInst(ir, index, lir.constI(inst.typeId, 0))
+                    replaced = true
+                } else if found.0 == FROM_CONST {
+                    var bits = found.1
+                    if width < 8 {
+                        const mask = (@intCast(usize, 1) << @intCast(u6, width * 8)) - 1
+                        bits &= mask
+                        if inst.arg2 != lir.NONE && inst.arg2 != 0 && bits & (@intCast(usize, 1) << @intCast(u6, width * 8 - 1)) != 0 { bits |= ~mask }
+                    }
+                    lir.setInst(ir, index, lir.constI(inst.typeId, bits))
+                    replaced = true
+                } else if found.0 == FROM_VALUE && found.1 >= index {
+                    failValueAfter += 1
+                    lastFail = FAIL_VALUE_AFTER
+                } else if found.0 == FROM_VALUE {
+                    const value: usize = found.1
+                    const value_type = lir.getInst(ir, value).typeId
+                    const same_type = value_type == inst.typeId
+                    if width >= 8 {
+                        // (A bitcast between two types of one class is a move.)
+                        var replacement = lir.initInst(if same_type { lir.Opcode.copy } else { lir.Opcode.bitcast }, inst.typeId)
+                        replacement.arg0 = value
+                        lir.setInst(ir, index, replacement)
+                    } else if same_type || (typeStoreAddress != 0 && floatClass(value_type) == floatClass(inst.typeId)) {
+                        var replacement = lir.initInst(lir.Opcode.extend, inst.typeId)
+                        replacement.arg0 = value
+                        replacement.arg1 = width * 8
+                        replacement.arg2 = if inst.arg2 == lir.NONE { 0 } else { inst.arg2 }
+                        lir.setInst(ir, index, replacement)
+                    } else {
+                        failClass += 1
+                        lastFail = FAIL_CLASS
+                        skipped = true
+                    }
+                    replaced = !skipped
+                }
+                if replaced {
+                    result.loadsFolded += 1
+                    foldBudget -= 1
+                    regions.reads[region] -= 1
+                    if foldLogged < FOLD_LOG {
+                        foldLog[foldLogged * 4] = index
+                        foldLog[foldLogged * 4 + 1] = topWrite
+                        foldLog[foldLogged * 4 + 2] = found.0
+                        foldLog[foldLogged * 4 + 3] = found.1
+                        foldLogged += 1
+                    }
+                } else if foldLogged < FOLD_LOG {
+                    foldLog[foldLogged * 4] = index
+                    foldLog[foldLogged * 4 + 1] = topWrite
+                    foldLog[foldLogged * 4 + 2] = FAIL_LOGGED + lastFail
+                    foldLog[foldLogged * 4 + 3] = 0
+                    foldLogged += 1
+                }
+            }
+        }
+        index += 1
+    }
+    // Regions read by nothing: their writes dropped, which may leave
+    // another region unread (a copy into a dead one read it).
+    var changed = dropWrites
+    while changed {
+        changed = false
+        index = 0
+        while index < count {
+            const inst = lir.getInst(ir, index)
+            const target = written(ir, inst)
+            if target.0 != lir.NONE && target.0 < count && addresses.region[target.0] != lir.NONE {
+                const region = addresses.region[target.0]
+                if regions.escaped[region] == 0 && regions.reads[region] == 0 {
+                    if inst.opcode == lir.Opcode.mem_copy && inst.arg1 < count && addresses.region[inst.arg1] != lir.NONE { regions.reads[addresses.region[inst.arg1]] -= 1 }
+                    lir.setInst(ir, index, lir.initInst(lir.Opcode.dead, lir.NONE))
+                    result.writesDropped += 1
+                    changed = true
+                }
+            }
+            index += 1
+        }
+    }
+    region = 0
+    while region < regions.count {
+        if regions.escaped[region] == 0 && regions.reads[region] == 0 && regions.writers[region] > 0 { result.regionsDropped += 1 }
+        if regions.escaped[region] != 0 { result.regionsEscaped += 1 }
+        region += 1
+    }
+    if reach.ready && !reach.failed {
+        free(allocator, reach.bits, reach.words)
+        free(allocator, reach.stack, reach.blocks)
+        free(allocator, reach.visited, reach.visitedWords)
+    }
+    dominance.deinit(&d)
+    free(allocator, regions.key, region_count)
+    free(allocator, regions.escaped, region_count)
+    free(allocator, regions.writeStart, region_count)
+    free(allocator, regions.writers, region_count)
+    free(allocator, regions.writes, count)
+    free(allocator, regions.reads, region_count)
+    free(allocator, write_region, count)
+    free(allocator, addresses.region, count)
+    free(allocator, addresses.offset, count)
+    return result
+}
+
+// Whether the type is of the float register class (false without a store).
+fn floatClass(type_id: usize) -> bool {
+    if typeStoreAddress == 0 || type_id == 0 { return false }
+    unsafe {
+        const store = @ptrFromInt(*type_store.Store, typeStoreAddress)
+        if type_id >= store.*.types.*.length { return false }
+        return type_store.Store.get(store, type_id).*.kind == type_store.Kind.float
+    }
+}

@@ -481,7 +481,16 @@ single-store promotion (`single_store.mlx`: a local one store writes and
 nothing else touches is read as the stored value wherever that store
 dominates the load, after `dominance.mlx` builds the blocks and their
 dominator tree, so a `const` binding in a loop body read in later blocks
-of the pass needs no frame slot), copy propagation, a second
+of the pass needs no frame slot), copy propagation, region loads
+(`region_loads.mlx`: a client's places of the frame, `frame_local`, whose
+address nothing but loads, stores, copies and calls' by-value arguments
+reaches, have each load replaced by what the last write of its bytes
+left there: the stored value, bitcast when its type is not the load's,
+a constant composed byte by byte, zero, followed through `mem_copy`
+from place to place; a write counts when it reaches the load on every
+path and no other write can come between, `dominance.mlx` and the
+blocks' reachability decide; places then read by nothing lose their
+writes; copy propagation and constant folding run again after it), a second
 constant-folding pass (to catch constants
 exposed by the first), post-terminator dead-code elimination
 (`control_flow_dce.mlx`), comparison-branch fusion, stack-slot promotion,
@@ -775,7 +784,7 @@ and updates 643 locals in place (`backend values kept out of the frame`,
 instructions (4.73 to 3.97 billion) into a binary 15% smaller, and the
 nested loop of 300 million passes runs in 0.10 s instead of 0.75 s
 (`tests/341_values_out_of_frame_runtime.mlx` covers a local read after it
-changed, across blocks and through calls). `tests/342_single_store_runtime.mlx` covers locals stored once (`ir/single_store.mlx`): a load the store dominates reads the stored value directly, a load it does not dominate still reads the local.
+changed, across blocks and through calls). `tests/342_single_store_runtime.mlx` covers locals stored once (`ir/single_store.mlx`): a load the store dominates reads the stored value directly, a load it does not dominate still reads the local. `tests/420_selfhost_region_loads_runtime.mlx` covers region loads (`ir/region_loads.mlx`): a load through a copy of a place is the stored value, a double's bits read as a word are bitcast, two narrow constant stores read as one word are one constant, a struct zeroed whole and then given its fields is each byte's last write, and the places then read by nothing lose every store and copy. mlx-cc packs the places left after the optimizer (`ir/frame.mlx`, `frame.compact`): the frame of libpas's allocation fast path goes from 25 KiB to 1.2 KiB.
 
 **Field accesses with a displacement** (x86_64, `Memory.emitGep`). A
 `gep` whose index is a constant and whose only reader is the load or
