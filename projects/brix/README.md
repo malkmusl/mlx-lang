@@ -15,8 +15,8 @@ requirements are spec/04-stdlib/os/brix.xml:
 
 brixOS boots in QEMU (`-kernel`, Multiboot), says itself on the serial
 line and runs mlx-sh in user mode on it, and the programs of its boot
-archive (the coreutils, in /bin) as processes of their own, on a file
-system in memory (/tmp, /root):
+archive (the coreutils) as processes of their own, on a file system in
+memory with brixOS's own layout and copy on write:
 
     ./mlx build brix
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
@@ -27,9 +27,46 @@ system in memory (/tmp, /root):
     brixOS: 511 MiB (415 free), 2076 MHz
     root@brix:~# seq 3 | sort -r | tr "\n" " "; echo
     3 2 1
-    root@brix:~# cd /tmp; echo hello > a; mkdir d; mv a d; ls -l d
-    total 1
-    -rw-r--r-- 1 0 0 6 Nov  2 20:15 a
+    root@brix:~# ls /
+    devices  system  temporary  users
+    root@brix:~# cd /temporary; cat /system/programs/mlx-sh > a
+    root@brix:/temporary# stat -f -c "%f free" .; cp a b; stat -f -c "%f free" .
+    37627 free
+    37617 free
+
+## The layout
+
+brixOS does not use Unix's directory layout (the FHS); its directories
+are named for what they hold:
+
+    /system/programs   the programs (the boot archive; read-only bytes,
+                       copied into pages of their own when written)
+    /system/settings   the system's settings: users, groups
+    /devices           console, tty, null, zero
+    /users/root        the user's home (the shell starts there)
+    /temporary         scratch space
+
+Linux programs (all the repository's programs are, for now) expect some
+of Unix's paths. The system call layer, not the tree, maps them:
+`/tmp` → /temporary, `/dev` → /devices, `/etc/passwd` and `/etc/group`
+→ /system/settings/users and groups, `/proc/self/exe` → the program the
+process runs. `ls /` shows only brixOS's own directories.
+
+## Copy on write
+
+A physical page counts who holds it (`Frames.share`, `Frames.free`):
+
+- fork shares every page of the parent with the child, read-only and
+  marked copy-on-write in both; the first write (by the program, or by
+  the kernel for a system call: CR0.WP is on) copies the page, or takes
+  it back writable when it is the last holder (`Space.copyOnWrite`).
+- Files share pages: copy_file_range and the FICLONE ioctl share whole
+  pages between files (`Vfs.copyRange`), and a write to a shared page
+  copies it first (`writableBlock`). std.fs.copy (cp, and every copy of
+  std) tries copy_file_range first, which on Linux gives reflinks on
+  btrfs and XFS. A copy of a 570 KB file costs a few pages instead of
+  139.
+- The archive's programs are pages of the boot image until written.
 
 The pieces:
 
@@ -61,20 +98,20 @@ The pieces:
   - serial.mlx, console.mlx: `Uart` (COM1, polled) and `Console`
     (`console.out`).
   - memory.mlx: `Page`, `Frames` (physical frames from the Multiboot
-    memory size), `Space` (an address space sharing the kernel's half:
-    map, translate, back, release, write, destroy).
+    memory size, with the count of their holders), `Space` (an address
+    space sharing the kernel's half: map, translate, back, release,
+    write, clone sharing its pages, copyOnWrite, destroy).
   - vfs.mlx: `Vfs`, the file system: a tree of `Node`s in memory (a
     tmpfs). A file's data is in pages (12 direct, an indirect page, a
-    double indirect one), a directory's in 64-byte entries; a node lives
-    while a directory names it or a descriptor holds it. At boot: /bin
-    (the archive's programs, nodes over its bytes, copied into pages of
-    their own when first written), /dev (console, tty, null, zero), /tmp,
-    /root.
+    double indirect one; shared between files, copied on write), a
+    directory's in 64-byte entries; a node lives while a directory names
+    it or a descriptor holds it. The tree at boot is the layout above.
   - filecalls.mlx: `FileCalls`, the calls on paths (relative to the
     working directory or a directory's descriptor): open/creat with
     O_CREAT, O_EXCL, O_TRUNC, O_APPEND, stat/statx, access, getcwd,
     chdir, mkdir, rmdir, unlink, rename, link, truncate, chmod, utimensat,
-    statfs, getdents64; /proc/self/exe (a shell runs scripts by it).
+    statfs, getdents64, copy_file_range; `Compat`, Linux's paths onto
+    brixOS's; /proc/self/exe (a shell runs scripts by it).
   - archive.mlx, elf.mlx: the boot archive's files; a static ELF
     program in any file of the file system, its segments copied into an
     address space.
@@ -85,7 +122,7 @@ The pieces:
     range it is handed), its `Descriptors`, its pid, parent and group,
     what it waits for, and its registers while it does not run.
   - scheduler.mlx: `Scheduler`, the table of processes: fork (the
-    touched pages copied, `Space.clone`), the end of a process (a zombie
+    pages shared copy-on-write, `Space.clone`), the end of a process (a zombie
     until its parent's wait4; SIGCHLD for sigtimedwait), signals that end
     processes (kill, Ctrl-C to the terminal's foreground group), and the
     switch to the next process. There is no timer yet: a process runs
@@ -128,11 +165,9 @@ kernel runs), more than one CPU, an EFI loader.
 1. The timer (the APIC's) and preemption; the serial line's interrupt;
    signal handlers (rt_sigaction, delivery, sigreturn) and job control
    (SIGTSTP, SIGCONT).
-2. Copy on write: pages shared with a count of who holds them, for fork
-   (it copies every touched page now) and for files (cp and snapshots
-   share pages until one side writes; the archive's programs already
-   are copied up only when written). Then a disk: virtio-blk, ext2 as
-   the first format on it.
+2. Snapshots of directories (a tree of nodes whose files share every
+   page), then a disk: virtio-blk, and a copy-on-write format of
+   brixOS's own on it (ext2 as the format to exchange with Linux).
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
 5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.

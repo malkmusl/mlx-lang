@@ -1,7 +1,16 @@
-// The file system: one tree of nodes in memory (a tmpfs) with the boot
-// archive's programs in /bin (read-only nodes over the archive's bytes,
-// copied into pages of their own when written: a first copy on write),
-// the devices in /dev, and /tmp and /root to write in.
+// The file system: one tree of nodes in memory (a tmpfs). brixOS's own
+// layout, by what things are rather than by Unix's history:
+//
+//   /system/programs   the boot archive's programs (nodes over its bytes,
+//                      copied into pages of their own when written)
+//   /system/settings   the system's settings (users, groups)
+//   /devices           console, tty, null, zero
+//   /users/root        the user's home
+//   /temporary         scratch space
+//
+// (Linux programs' /dev, /tmp, /etc/passwd and /proc/self/exe are mapped
+// onto these by the system call layer, filecalls.mlx; they are not in the
+// tree.)
 //
 // A node's data is in pages (4 KiB frames): DIRECT of them by the node,
 // then a page of 512 page addresses (indirect), then a page of 512 such
@@ -122,40 +131,72 @@ pub const Vfs = struct {
 
     fn slots(page: usize) -> [*]usize { return unsafe { @ptrFromInt([*]usize, layout.Memory.virtual(page)) } }
 
-    // The page of `slot` in the address page `table` (made when `create`).
-    fn slotPage(table: usize, slot: usize, create: bool) -> usize {
-        const entries = slots(table)
-        if entries[slot] == 0 && create { entries[slot] = memory.allFrames().allocate() }
-        return entries[slot]
-    }
-
-    // The page holding block `index` of the node's data; 0 when there is
-    // none (a hole, or memory is out when `create`).
-    fn block(self: *Self, index: usize, which: usize, create: bool) -> usize {
+    // Where the page address of block `which` of the node is (in the
+    // node, or in an address page, made when `create`); null when there
+    // is no such place (or memory is out).
+    fn blockSlot(self: *Self, index: usize, which: usize, create: bool) -> ?*usize {
         const n = &self.*.nodes[index]
-        if which < Node.DIRECT {
-            if n.*.blocks[which] == 0 && create { n.*.blocks[which] = memory.allFrames().allocate() }
-            return n.*.blocks[which]
-        }
+        if which < Node.DIRECT { return &n.*.blocks[which] }
         var rest = which - Node.DIRECT
         if rest < ADDRESSES_PER_PAGE {
-            if n.*.indirect == 0 {
-                if !create { return 0 }
-                n.*.indirect = memory.allFrames().allocate()
-                if n.*.indirect == 0 { return 0 }
-            }
-            return slotPage(n.*.indirect, rest, create)
+            if !addressPage(&n.*.indirect, create) { return null }
+            return &slots(n.*.indirect)[rest]
         }
         rest -= ADDRESSES_PER_PAGE
-        if rest >= ADDRESSES_PER_PAGE * ADDRESSES_PER_PAGE { return 0 }
-        if n.*.doubleIndirect == 0 {
-            if !create { return 0 }
-            n.*.doubleIndirect = memory.allFrames().allocate()
-            if n.*.doubleIndirect == 0 { return 0 }
+        if rest >= ADDRESSES_PER_PAGE * ADDRESSES_PER_PAGE { return null }
+        if !addressPage(&n.*.doubleIndirect, create) { return null }
+        const middle = &slots(n.*.doubleIndirect)[rest / ADDRESSES_PER_PAGE]
+        if !addressPage(middle, create) { return null }
+        return &slots(middle.*)[rest % ADDRESSES_PER_PAGE]
+    }
+
+    // An address page at `place`, made when there is none and `create`.
+    fn addressPage(place: *usize, create: bool) -> bool {
+        if place.* == 0 {
+            if !create { return false }
+            place.* = memory.allFrames().allocate()
         }
-        const middle = slotPage(n.*.doubleIndirect, rest / ADDRESSES_PER_PAGE, create)
-        if middle == 0 { return 0 }
-        return slotPage(middle, rest % ADDRESSES_PER_PAGE, create)
+        return place.* != 0
+    }
+
+    // The page holding block `which` of the node's data; 0 when there is
+    // none (a hole, or memory is out when `create`). It may be shared
+    // with other files: only for reading.
+    fn block(self: *Self, index: usize, which: usize, create: bool) -> usize {
+        const slot = self.blockSlot(index, which, create)
+        if slot == null { return 0 }
+        if slot.?.* == 0 && create { slot.?.* = memory.allFrames().allocate() }
+        return slot.?.*
+    }
+
+    // The page of block `which` to write to: the node's own (a page it
+    // shares is copied first: copy on write); 0 when memory is out.
+    fn writableBlock(self: *Self, index: usize, which: usize) -> usize {
+        const slot = self.blockSlot(index, which, true)
+        if slot == null { return 0 }
+        const frames = memory.allFrames()
+        if slot.?.* == 0 {
+            slot.?.* = frames.allocate()
+        } else if frames.holderCount(slot.?.*) > 1 {
+            const copy = frames.allocate()
+            if copy == 0 { return 0 }
+            Bytes.copyWords(layout.Memory.virtual(copy), layout.Memory.virtual(slot.?.*), Page.SIZE)
+            frames.free(slot.?.*)
+            slot.?.* = copy
+        }
+        return slot.?.*
+    }
+
+    // Block `which` of the node becomes `page` (shared: one more holds
+    // it; 0 for a hole), what it was let go; false when it cannot.
+    fn shareBlock(self: *Self, index: usize, which: usize, page: usize) -> bool {
+        const frames = memory.allFrames()
+        const slot = self.blockSlot(index, which, page != 0)
+        if slot == null { return page == 0 }
+        if page != 0 && !frames.share(page) { return false }
+        if slot.?.* != 0 { frames.free(slot.?.*) }
+        slot.?.* = page
+        return true
     }
 
     // The pages of blocks `from` on freed (a truncation, or the node's
@@ -277,7 +318,7 @@ pub const Vfs = struct {
             const within = at % Page.SIZE
             var chunk = Page.SIZE - within
             if chunk > length - done { chunk = length - done }
-            const page = self.block(index, at / Page.SIZE, true)
+            const page = self.writableBlock(index, at / Page.SIZE)
             if page == 0 { break }
             Bytes.copy(Bytes.pointer(layout.Memory.virtual(page) + within), unsafe { @ptrFromInt([*]const u8, @intFromPtr(from) + done) }, chunk)
             done += chunk
@@ -299,7 +340,7 @@ pub const Vfs = struct {
             self.freeBlocks(index, Page.up(size) / Page.SIZE)
             // The rest of the last page reads zeros.
             if size % Page.SIZE != 0 {
-                const page = self.block(index, size / Page.SIZE, false)
+                const page = if self.block(index, size / Page.SIZE, false) == 0 { 0 } else { self.writableBlock(index, size / Page.SIZE) }
                 if page != 0 { Bytes.fill(Bytes.pointer(layout.Memory.virtual(page) + size % Page.SIZE), Page.SIZE - size % Page.SIZE, 0) }
             }
         }
@@ -308,6 +349,44 @@ pub const Vfs = struct {
         n.*.modified = time
         n.*.changed = time
         return 0
+    }
+
+    // `length` bytes of `from`'s data from `fromOffset` into `to`'s at
+    // `toOffset` (copy_file_range, a clone): whole pages are shared (copy
+    // on write: the first write to either copies the page), the rest is
+    // copied. How many, or -errno.
+    pub fn copyRange(self: *Self, from: usize, fromOffset: usize, to: usize, toOffset: usize, length: usize) -> isize {
+        const source = &self.*.nodes[from]
+        const target = &self.*.nodes[to]
+        if target.*.kind == NodeKind.archive && !self.copyUp(to) { return ENOSPC }
+        var done: usize = 0
+        var buffer: [512]u8 = undefined
+        while done < length {
+            const at = fromOffset + done
+            const into = toOffset + done
+            if at >= source.*.size { break }
+            const left = if length - done < source.*.size - at { length - done } else { source.*.size - at }
+            // A whole page (or the source's last, at or past the target's
+            // end): shared.
+            if source.*.kind == NodeKind.file && at % Page.SIZE == 0 && into % Page.SIZE == 0 && (left >= Page.SIZE || into + left >= target.*.size) {
+                const chunk = if left > Page.SIZE { Page.SIZE } else { left }
+                if self.shareBlock(to, into / Page.SIZE, self.block(from, at / Page.SIZE, false)) {
+                    done += chunk
+                    if into + chunk > target.*.size { target.*.size = into + chunk }
+                    continue
+                }
+            }
+            const chunk = if left > 512 { 512 } else { left }
+            const read = self.read(from, at, &buffer, chunk)
+            const written = self.write(to, into, &buffer, read)
+            if written < 0 { return if done > 0 { @intCast(isize, done) } else { written } }
+            done += @bitCast(usize, written)
+            if @bitCast(usize, written) < chunk { break }
+        }
+        const time = now()
+        target.*.modified = time
+        target.*.changed = time
+        return @intCast(isize, done)
     }
 
     // ---- directories ----
@@ -542,8 +621,15 @@ pub const Vfs = struct {
         return made
     }
 
-    // /, /bin (the archive), /dev (console, tty, null, zero), /tmp,
-    // /root.
+    // A file `name` in `parent` holding `text`.
+    fn addFile(self: *Self, parent: usize, name: []const u8, mode: usize, text: []const u8) -> void {
+        const made = self.create(NodeKind.file, mode)
+        if made == NONE { return }
+        _ = self.write(made, 0, text.pointer, text.length)
+        _ = self.link(parent, name.pointer, name.length, made)
+    }
+
+    // The tree at boot (the layout above).
     pub fn init(self: *Self) -> void {
         var k: usize = 0
         while k < MAX_NODES {
@@ -555,7 +641,8 @@ pub const Vfs = struct {
         const root = self.create(NodeKind.directory, 0x1ED)
         self.*.nodes[root].links = 1
         self.*.nodes[root].parent = ROOT
-        const bin = self.addDirectory(ROOT, "bin", 0x1ED)
+        const system = self.addDirectory(ROOT, "system", 0x1ED)
+        const bin = self.addDirectory(system, "programs", 0x1ED)
         const files = archive.Archive.boot()
         var f: usize = 0
         while f < files.count() {
@@ -567,13 +654,17 @@ pub const Vfs = struct {
             }
             f += 1
         }
-        const dev = self.addDirectory(ROOT, "dev", 0x1ED)
+        const settings = self.addDirectory(system, "settings", 0x1ED)
+        self.addFile(settings, "users", 0x1A4, "root:x:0:0:root:/users/root:/system/programs/mlx-sh\n")
+        self.addFile(settings, "groups", 0x1A4, "root:x:0:\n")
+        const dev = self.addDirectory(ROOT, "devices", 0x1ED)
         self.*.console = self.device(dev, "console", NodeKind.terminal)
         _ = self.device(dev, "tty", NodeKind.terminal)
         _ = self.device(dev, "null", NodeKind.null_device)
         _ = self.device(dev, "zero", NodeKind.zero_device)
-        _ = self.addDirectory(ROOT, "tmp", 0x3FF)
-        _ = self.addDirectory(ROOT, "root", 0x1C0)
+        _ = self.addDirectory(ROOT, "temporary", 0x3FF)
+        const users = self.addDirectory(ROOT, "users", 0x1ED)
+        _ = self.addDirectory(users, "root", 0x1C0)
     }
 }
 

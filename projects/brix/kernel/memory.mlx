@@ -1,7 +1,10 @@
 // Physical frames (4 KiB) and address spaces. Frames come from
 // Memory.FREE to the end of memory (the Multiboot information's, within
-// the mapped GiB); freed ones are kept on a list. Page tables are reached
-// through the kernel's view of physical memory.
+// the mapped GiB); freed ones are kept on a list. A frame can be shared
+// (by address spaces after a fork, by files): it counts who holds it and
+// is free when the last one lets it go; a shared page is copied when one
+// of them writes to it (copy on write). Page tables are reached through
+// the kernel's view of physical memory.
 const layout = @import("../layout.mlx")
 const cpu = @import("./cpu.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
@@ -11,6 +14,9 @@ pub const Page = struct {
     pub const PRESENT: usize = 1
     pub const WRITABLE: usize = 2
     pub const USER: usize = 4
+    // An available bit of an entry: the page is shared, written only
+    // after a copy (it is mapped read-only).
+    pub const COPY_ON_WRITE: usize = 0x200
     // The frame's address in an entry.
     pub const ADDRESS: usize = 0x000FFFFFFFFFF000
 
@@ -19,10 +25,15 @@ pub const Page = struct {
 }
 
 pub const Frames = struct {
+    // A frame is held by at most this many (sharing more copies it).
+    pub const MAX_HOLDERS: usize = 0xFFFF
+
     next: usize
     end: usize
     freeList: usize
     freeCount: usize
+    // How many hold each frame (a u16 per frame, in frames of their own).
+    holders: [*]u16
 
     // Memory from the Multiboot information (mem_upper: KiB above 1 MiB).
     pub fn init(self: *Self) -> void {
@@ -37,6 +48,23 @@ pub const Frames = struct {
         }
         if end > layout.Memory.MAPPED_LIMIT { end = layout.Memory.MAPPED_LIMIT }
         self.*.end = Page.down(end)
+        // The counts first, taken from the start of the free frames.
+        const countBytes = Page.up(self.*.end / Page.SIZE * 2)
+        self.*.holders = unsafe { @ptrFromInt([*]u16, layout.Memory.virtual(self.*.next)) }
+        Bytes.zeroWords(layout.Memory.virtual(self.*.next), countBytes)
+        self.*.next += countBytes
+    }
+
+    // How many hold the frame.
+    pub fn holderCount(self: *const Self, frame: usize) -> usize { return @intCast(usize, self.*.holders[frame / Page.SIZE]) }
+
+    // One more holds the frame; false when it is held by too many (the
+    // caller copies it instead).
+    pub fn share(self: *Self, frame: usize) -> bool {
+        const at = frame / Page.SIZE
+        if @intCast(usize, self.*.holders[at]) >= MAX_HOLDERS { return false }
+        self.*.holders[at] += 1
+        return true
     }
 
     pub fn totalBytes(self: *const Self) -> usize { return self.*.end }
@@ -56,10 +84,18 @@ pub const Frames = struct {
             return 0
         }
         Bytes.zeroWords(layout.Memory.virtual(frame), Page.SIZE)
+        self.*.holders[frame / Page.SIZE] = 1
         return frame
     }
 
+    // A holder lets the frame go; it is free when it was the last.
     pub fn free(self: *Self, frame: usize) -> void {
+        const at = frame / Page.SIZE
+        if self.*.holders[at] > 1 {
+            self.*.holders[at] -= 1
+            return
+        }
+        self.*.holders[at] = 0
         Bytes.write64(Bytes.pointer(layout.Memory.virtual(frame)), 0, self.*.freeList)
         self.*.freeList = frame
         self.*.freeCount += 1
@@ -183,9 +219,10 @@ pub const Space = struct {
         return self.write(address, &bytes, 8)
     }
 
-    // A copy of the lower half: every page that is mapped copied into a
-    // frame of its own (a fork's child); the root is 0 when memory is out
-    // (what was copied is freed again).
+    // A copy of the lower half that shares its pages (a fork's child):
+    // every writable page becomes read-only and copy-on-write in both
+    // spaces (the caller makes the processor forget the old mappings);
+    // the root is 0 when memory is out (what was made is freed again).
     pub fn clone(self: Self) -> Space {
         const copy = Space.create()
         if !copy.isValid() { return copy }
@@ -200,7 +237,7 @@ pub const Space = struct {
                         var k: usize = 0
                         while k < 512 {
                             const pt = next(pd, k, false)
-                            if pt != 0 && !copyTable(copy, pt, (i << 39) | (j << 30) | (k << 21)) {
+                            if pt != 0 && !shareTable(copy, pt, (i << 39) | (j << 30) | (k << 21)) {
                                 copy.destroy()
                                 return Space.{ .root = 0 }
                             }
@@ -215,23 +252,60 @@ pub const Space = struct {
         return copy
     }
 
-    // The pages of the page table `pt` (mapping from `base` on) copied
-    // into `into`.
-    fn copyTable(into: Space, pt: usize, base: usize) -> bool {
+    // The pages of the page table `pt` (mapping from `base` on) shared
+    // with `into`, copy-on-write (copied when too many share one).
+    fn shareTable(into: Space, pt: usize, base: usize) -> bool {
         var l: usize = 0
         while l < 512 {
-            const value = entries(pt)[l]
+            const slot = &entries(pt)[l]
+            const value = slot.*
             if value & Page.PRESENT != 0 {
-                const frame = frames.allocate()
-                if frame == 0 { return false }
-                Bytes.copyWords(layout.Memory.virtual(frame), layout.Memory.virtual(value & Page.ADDRESS), Page.SIZE)
-                if !into.map(base | (l << 12), frame, value & (Page.SIZE - 1)) {
-                    frames.free(frame)
-                    return false
+                const frame = value & Page.ADDRESS
+                var flags = value & (Page.SIZE - 1)
+                if frames.share(frame) {
+                    if flags & Page.WRITABLE != 0 {
+                        flags = (flags & ~Page.WRITABLE) | Page.COPY_ON_WRITE
+                        slot.* = frame | flags
+                    }
+                    if !into.map(base | (l << 12), frame, flags) {
+                        frames.free(frame)
+                        return false
+                    }
+                } else {
+                    const copy = frames.allocate()
+                    if copy == 0 { return false }
+                    Bytes.copyWords(layout.Memory.virtual(copy), layout.Memory.virtual(frame), Page.SIZE)
+                    if !into.map(base | (l << 12), copy, flags) {
+                        frames.free(copy)
+                        return false
+                    }
                 }
             }
             l += 1
         }
+        return true
+    }
+
+    // A write to the copy-on-write page at `address`: the page becomes
+    // the space's own (copied when others still hold it) and writable.
+    // False when the page is not copy-on-write (or memory is out).
+    pub fn copyOnWrite(self: Self, address: usize) -> bool {
+        const slot = self.entry(address, false)
+        if slot == null { return false }
+        const value = slot.?.*
+        if value & Page.PRESENT == 0 || value & Page.COPY_ON_WRITE == 0 { return false }
+        const frame = value & Page.ADDRESS
+        const flags = (value & (Page.SIZE - 1) & ~Page.COPY_ON_WRITE) | Page.WRITABLE
+        if frames.holderCount(frame) == 1 {
+            slot.?.* = frame | flags
+        } else {
+            const copy = frames.allocate()
+            if copy == 0 { return false }
+            Bytes.copyWords(layout.Memory.virtual(copy), layout.Memory.virtual(frame), Page.SIZE)
+            slot.?.* = copy | flags
+            frames.free(frame)
+        }
+        cpu.Cpu.invalidatePage(address)
         return true
     }
 

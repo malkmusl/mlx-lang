@@ -4,13 +4,19 @@
 # of it is in what is built), the kernel says itself on the serial line and
 # starts mlx-sh from the boot archive in user mode; commands typed at its
 # prompt run (builtins, arithmetic, the working directory, a glob over the
-# archive's files in /bin); programs of the archive run (fork, execve, wait4),
+# archive's programs in /system/programs: brixOS's own layout); programs of
+# the archive run (fork, execve, wait4, the child's pages shared copy on
+# write),
 # also in pipelines, command substitutions, subshells and in the
-# background; files are made, written, appended to, moved, copied, linked
-# and removed in the tmpfs, with directories, the working directory, the
-# umask, /dev/null and /dev/zero; a script runs (by /proc/self/exe), a
-# program copied into /tmp runs, and a program of /bin written to is
-# copied up; Ctrl-C ends the foreground program, Ctrl-D ends its input;
+# background, with what the child changes staying its own; files are made,
+# written, appended to, moved, copied, linked and removed in the tmpfs, with
+# directories, the working directory, the umask, the devices; Linux
+# programs' /tmp, /dev and /etc/passwd lead to /temporary, /devices and
+# /system/settings; a copy shares the pages of its file until it is
+# written to (copy on write); a script runs (by /proc/self/exe), a program
+# copied into /temporary runs, and a program of /system/programs written
+# to is copied up; Ctrl-C ends the foreground program, Ctrl-D ends its
+# input;
 # `exit 3` ends the shell and the kernel starts it again; and no system
 # call the programs made was missing.
 #
@@ -94,10 +100,10 @@ type_line 'echo $((6 * 7)) $(( 1 << 10 ))'
 wait_for '^42 1024$'
 echo "ok   arithmetic expansion"
 
-type_line 'pwd; cd /; echo * /bin/*'
-wait_for '^/root$'
-wait_for '^bin dev root tmp /bin/cat /bin/chmod /bin/cp /bin/head /bin/ln /bin/ls /bin/mkdir /bin/mlx-sh /bin/mv /bin/rm /bin/seq /bin/sleep /bin/stat /bin/uname /bin/wc$'
-echo "ok   the working directory and a glob over the tree (the archive in /bin)"
+type_line 'pwd; cd /; echo * /system/* /system/programs/m*'
+wait_for '^/users/root$'
+wait_for '^devices system temporary users /system/programs /system/settings /system/programs/mkdir /system/programs/mlx-sh /system/programs/mv$'
+echo "ok   the working directory and a glob over the tree (brixOS's layout)"
 
 type_line 'x=brix; echo ${x}OS ${#x}'
 wait_for '^brixOS 4$'
@@ -109,7 +115,7 @@ wait_for '^hello$'
 wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines"
 
-type_line 'ls /bin; cat /bin/mlx-sh | wc -c'
+type_line 'ls /system/programs; cat /system/programs/mlx-sh | wc -c'
 wait_for 'ls  *mkdir  *mlx-sh'
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
@@ -122,28 +128,42 @@ wait_for '^inner$'
 wait_for '^sub 4$'
 echo "ok   exit statuses, a missing program, command substitutions, subshells"
 
-type_line 'cd /tmp && echo hello > a && echo more >> a && cat a | wc -l && mkdir -p d/e && mv a d/e/b && cp d/e/b c && ln c l && ls d/e && stat -c "%s %h" l'
+type_line 'cd /temporary && echo hello > a && echo more >> a && cat a | wc -l && mkdir -p d/e && mv a d/e/b && cp d/e/b c && ln c l && ls d/e && stat -c "%s %h" l'
 wait_for '^2$'
 wait_for '^b$'
 wait_for '^11 2$'
 type_line 'rm -r d c l && ls -A; pwd; echo gone'
-wait_for '^/tmp$'
+wait_for '^/temporary$'
 wait_for '^gone$'
 echo "ok   files and directories in the tmpfs: write, append, move, copy, link, remove"
 
-type_line 'umask 077; echo z > f; stat -c %a f; mkdir g; stat -c %a g; echo x > /dev/null; head -c 5 /dev/zero | wc -c'
+type_line 'umask 077; echo z > f; stat -c %a f; mkdir g; stat -c %a g; echo x > /devices/null; head -c 5 /devices/zero | wc -c'
 wait_for '^600$'
 wait_for '^700$'
 wait_for '^5$'
-echo "ok   the umask, /dev/null, /dev/zero"
+echo "ok   the umask, /devices/null, /devices/zero"
+
+type_line 'echo linux > /tmp/l; cat /temporary/l; echo y > /dev/null; cat /etc/passwd; ls /dev'
+wait_for '^linux$'
+wait_for '^root:x:0:0:root:/users/root:/system/programs/mlx-sh$'
+wait_for '^console  null  tty  zero$'
+echo "ok   Linux programs' /tmp, /dev and /etc/passwd"
+
+type_line 'cat /system/programs/mlx-sh > big; before=$(stat -f -c %f .); cp big copy; after=$(stat -f -c %f .); echo shared $(( before - after < 64 )) $(wc -c < copy)'
+wait_for "^shared 1 $(stat -c %s "$shell")\$"
+type_line 'echo more >> copy; wc -c < big; rm big copy; x=1; (x=2; echo child $x); echo parent $x'
+wait_for "^$(stat -c %s "$shell")\$" 2
+wait_for '^child 2$'
+wait_for '^parent 1$'
+echo "ok   copy on write: a copy shares its file's pages, a fork's child its parent's"
 
 type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
 wait_for '^script one$'
 wait_for '^script two$'
-type_line 'cp /bin/uname /tmp/u; /tmp/u -s; echo copied > /bin/seq; cat /bin/seq'
+type_line 'cp /system/programs/uname /temporary/u; /temporary/u -s; echo copied > /system/programs/seq; cat /system/programs/seq'
 wait_for '^brixOS$' 2
 wait_for '^copied$'
-echo "ok   scripts, a program copied into /tmp, a file of /bin copied up when written"
+echo "ok   scripts, a program copied into /temporary, a program written to copied up"
 
 type_line 'sleep 1 & wait; echo waited'
 wait_for '^waited$'
