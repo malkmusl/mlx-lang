@@ -1598,7 +1598,10 @@ descriptions of an initialization segment). It plays MP4: H.264
 (`avc1`, `avc3`) and AAC-LC (`mp4a.40.2`; HE-AAC as its core) in
 `video/mp4`, `audio/mp4` and `audio/aac`, which is what YouTube serves
 through MSE besides VP9/AV1 in WebM, and what a GPU of the RX 580's
-generation decodes.
+generation decodes; H.265 (`hvc1`, `hev1`, Main) when a device's video
+decoder takes it (`mlxweb_video_supports_h265` asks the driver once;
+the CPU decodes H.264 only, an H.265 video without such a device is
+black).
 
 The Mlx side (port/mlx/media.mlx, `mlxweb_media_*` and `mlxweb_audio_*`)
 is std.mp4 (the demuxer: a whole file's sample tables with seeking, or
@@ -1724,6 +1727,8 @@ it, see above; vulkaninfo and vulkan-decode need
     vulkaninfo | grep VK_KHR_video_decode_h264      # the extension is there
     ./mlx build examples
     mlx-out/bin/vulkan-decode --trace projects/webkit/upstream/Tools/TestWebKitAPI/Resources/test.mp4 out.png 50
+    ffmpeg -i some.mp4 -c:v libx265 -tag:v hvc1 hevc.mp4  # an H.265 file (any)
+    mlx-out/bin/vulkan-decode --trace hevc.mp4 hevc.png 50 # VK_KHR_video_decode_h265
     ./mlx build webkit-mlx-voyager
     tools/check_voyager.sh                          # scenario 26 among them
 

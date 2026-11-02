@@ -74,7 +74,7 @@ public:
     // A track of a source buffer's initialization segment: the player
     // plays the first video and the first audio track it is given.
     TrackID allocateTrackID() { return ++m_lastTrackID; }
-    void addSourceTrack(TrackID, bool isVideo, uint32_t timescale, uint64_t editMediaTime, uint32_t nalLengthSize, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize&);
+    void addSourceTrack(TrackID, bool isVideo, uint32_t codec, uint32_t timescale, uint64_t editMediaTime, uint32_t nalLengthSize, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize&);
     const Logger& logger() const;
     uint64_t nextLogIdentifier() { return ++m_lastLogIdentifier; }
 #endif
@@ -252,6 +252,7 @@ private:
     std::atomic<unsigned> m_decodedFrames { 0 };
     std::atomic<unsigned> m_droppedFrames { 0 };
     std::atomic<bool> m_videoEnded { false };
+    bool m_videoUnsupported { false };
     bool m_audioEnded { false };
     TrackID m_lastTrackID { 0 };
     uint64_t m_lastLogIdentifier { 0 };

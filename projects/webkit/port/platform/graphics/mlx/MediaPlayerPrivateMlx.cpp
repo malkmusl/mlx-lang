@@ -111,6 +111,10 @@ static bool supportsCodecLowercase(const String& lower)
     // AVC in any profile, as the decoder reads every frame-coded stream.
     if (lower.startsWith("avc1"_s) || lower.startsWith("avc3"_s))
         return true;
+    // HEVC when a device's video decoder takes it (the CPU decodes AVC
+    // only).
+    if (lower.startsWith("hvc1"_s) || lower.startsWith("hev1"_s))
+        return mlxweb_video_supports_h265();
     // AAC-LC, and HE-AAC played as its LC core.
     if (lower == "mp4a.40.2"_s || lower == "mp4a.40.02"_s || lower == "mp4a.40.5"_s || lower == "mp4a.40.05"_s || lower == "mp4a.40.29"_s || lower == "mp4a.40"_s || lower == "mp4a"_s)
         return true;
@@ -306,9 +310,9 @@ const Logger& MediaPlayerPrivateMlx::logger() const
     return m_logger;
 }
 
-void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t timescale, uint64_t editMediaTime, uint32_t nalLengthSize, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize& size)
+void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t codec, uint32_t timescale, uint64_t editMediaTime, uint32_t nalLengthSize, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize& size)
 {
-    MEDIA_TRACE("source track %llu: %s, timescale %u, %dx%d, %zu parameter sets", static_cast<unsigned long long>(id), isVideo ? "H.264 video" : "AAC audio", timescale, static_cast<int>(size.width()), static_cast<int>(size.height()), parameterSets.size());
+    MEDIA_TRACE("source track %llu: %s, timescale %u, %dx%d, %zu parameter sets", static_cast<unsigned long long>(id), isVideo ? (codec == MLXWEB_MEDIA_H265 ? "H.265 video" : "H.264 video") : "AAC audio", timescale, static_cast<int>(size.width()), static_cast<int>(size.height()), parameterSets.size());
     Track track;
     track.index = 0;
     track.id = id;
@@ -317,7 +321,7 @@ void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t ti
     if (isVideo) {
         if (m_videoTrack)
             return;
-        track.codec = MLXWEB_MEDIA_H264;
+        track.codec = codec == MLXWEB_MEDIA_H265 ? MLXWEB_MEDIA_H265 : MLXWEB_MEDIA_H264;
         track.nalLengthSize = nalLengthSize ? nalLengthSize : 4;
         m_videoTrack = track;
         m_naturalSize = size;
@@ -325,6 +329,7 @@ void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t ti
         if (!m_h264)
             m_h264 = mlxweb_media_h264_create();
         if (m_h264) {
+            mlxweb_media_h264_set_codec(m_h264, track.codec);
             for (auto& set : parameterSets)
                 mlxweb_media_h264_parameter_set(m_h264, set.span().data(), set.size());
             m_h264Configured = !parameterSets.isEmpty();
@@ -456,7 +461,7 @@ void MediaPlayerPrivateMlx::fileLoaded()
     }
     locker.unlockEarly();
     configureFromDemuxer();
-    MEDIA_TRACE("file of %zu bytes: %s%s, %dx%d, %.3f s", m_fileBytes.size(), m_videoTrack ? "H.264 video " : "", m_audioTrack ? "AAC audio" : "", static_cast<int>(m_naturalSize.width()), static_cast<int>(m_naturalSize.height()), m_duration.isValid() ? m_duration.toDouble() : 0.0);
+    MEDIA_TRACE("file of %zu bytes: %s%s, %dx%d, %.3f s", m_fileBytes.size(), m_videoTrack ? (m_videoTrack->codec == MLXWEB_MEDIA_H265 ? "H.265 video " : "H.264 video ") : "", m_audioTrack ? "AAC audio" : "", static_cast<int>(m_naturalSize.width()), static_cast<int>(m_naturalSize.height()), m_duration.isValid() ? m_duration.toDouble() : 0.0);
     if (!m_audioTrack && !m_videoTrack) {
         setNetworkState(MediaPlayer::NetworkState::FormatError);
         return;
@@ -490,7 +495,7 @@ void MediaPlayerPrivateMlx::configureFromDemuxer()
         MediaTime trackDuration(static_cast<int64_t>(mlxweb_media_track_duration(m_demuxer, index)), track.timescale);
         if (trackDuration > duration)
             duration = trackDuration;
-        if (kind == MLXWEB_MEDIA_VIDEO && track.codec == MLXWEB_MEDIA_H264 && !m_videoTrack) {
+        if (kind == MLXWEB_MEDIA_VIDEO && (track.codec == MLXWEB_MEDIA_H264 || track.codec == MLXWEB_MEDIA_H265) && !m_videoTrack) {
             auto nalLengthSize = mlxweb_media_track_nal_length_size(m_demuxer, index);
             track.nalLengthSize = nalLengthSize ? nalLengthSize : 4;
             m_videoTrack = track;
@@ -511,6 +516,8 @@ void MediaPlayerPrivateMlx::configureFromDemuxer()
     if (m_videoTrack) {
         if (!m_h264)
             m_h264 = mlxweb_media_h264_create();
+        if (m_h264)
+            mlxweb_media_h264_set_codec(m_h264, m_videoTrack->codec);
         m_h264Configured = false;
         if (m_h264) {
             for (size_t set = 0;; ++set) {
@@ -1082,7 +1089,15 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
         if (!m_videoDecoder)
             presentBlack();
     }
-    bool decoded = m_videoDecoder && mlxweb_video_decode(m_videoDecoder, m_h264, bytes.span().data()) == MLXWEB_MEDIA_OK;
+    auto status = m_videoDecoder ? mlxweb_video_decode(m_videoDecoder, m_h264, bytes.span().data()) : MLXWEB_MEDIA_UNSUPPORTED;
+    bool decoded = status == MLXWEB_MEDIA_OK;
+    // A stream the decoder does not take (H.265 without a device that
+    // decodes it): the video's box black, once.
+    if (m_videoDecoder && status == MLXWEB_MEDIA_UNSUPPORTED && !m_videoUnsupported) {
+        m_videoUnsupported = true;
+        MEDIA_TRACE("the video decoder does not decode this stream, the video is black");
+        presentBlack();
+    }
     mlxweb_media_h264_finish_picture(m_h264);
     presentDueFrames(decoded, presentationTime);
 }
