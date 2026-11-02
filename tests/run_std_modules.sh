@@ -69,6 +69,8 @@
 #                                       std.h265.decode: a Main 10 stream
 #                                       decoded on the CPU, bit-exact, and
 #                                       on a pool of threads
+#   tests/425_vp9_header_runtime.mlx    std.vp9: uncompressed headers, the
+#                                       reference slots, superframes
 #   tests/367_webp_decode_runtime.mlx   std.webp's decoders: lossy, lossless,
 #                                       alpha, animation (demuxer), rows
 #                                       done incrementally, damage; the
@@ -176,6 +178,7 @@ run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structur
 run 422_h264_cpu_decode_runtime "WebKit's test.mp4 (Main profile, B frames) decoded on the CPU through std.mp4 and std.h264: every picture, in presentation order, the planes' CRC-32 the reference decoding's"
 run 423_h265_stream_runtime "H.265 parameter sets into the Vulkan video structures, every picture of a 64x64 stream with B frames and a CRA picture, the reference picture sets' current lists as slots, the output order, a random access from the CRA picture, a cut SPS refused"
 run 424_h265_cpu_decode_runtime "a 64x64 H.265 Main 10 stream (weighted B frames, AMP, transform skip, SAO, wavefronts) decoded on the CPU by std.h265.decode: every picture in output order with the planes' CRC-32 the reference decoding's, 8-bit planes rounded; the same on a pool of three threads"
+run 425_vp9_header_runtime "a 48x32 VP9 stream's uncompressed headers (profile, depth, subsampling, size, frame types, references and their slots, refresh flags, the compressed header's place), a superframe's index split, a broken frame marker refused"
 run 417_aac_decode_runtime "AAC-LC decoded from an MP4 and an ADTS stream, each within 15 dB of the WAV it was encoded from; damaged blocks refused; reset"
 run 416_mp4_demux_runtime "MP4 files read: a plain file's sample tables (chunks, composition offsets, sync samples, an edit list, seeking), fragments (trex defaults, tfdt, trun flags, one without tfdt), avcC parameter sets and Annex B, AudioSpecificConfig, a fragment cut short, damage"
 
