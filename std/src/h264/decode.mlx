@@ -167,10 +167,13 @@ pub const Cpu = struct {
     scale8: [2][6][64]i32
     // Implicit bi-prediction's weights per (ref0, ref1).
     implicitWeights: [MAX_REFS][MAX_REFS]i32
-    // The entropy decoder's state (cabac.mlx).
+    // The entropy decoder's state (CABAC): codIRange, codIOffset and per
+    // context (pStateIdx << 1) | valMPS; the previous macroblock's
+    // mb_qp_delta (for its context).
     cabacRange: u32
     cabacOffset: u32
     contexts: [1024]u8
+    lastQpDelta: i32
     // The macroblock being decoded.
     mbAddr: u32
     mbX: u32
@@ -2977,7 +2980,6 @@ fn decodeSlice(cpu: *Cpu, h: *h264.Decoder, nal: [*]const u8, length: usize) -> 
     return decodeSliceCavlc(cpu, cpu.*.header.qp)
 }
 
-fn decodeSliceCabac(cpu: *Cpu, qp: i32) -> Status { return Status.unsupported }
 
 fn prepareImplicit(cpu: *Cpu, h: *h264.Decoder) -> void {}
 
@@ -3253,4 +3255,865 @@ fn deblockPicture(cpu: *Cpu) -> void {
         }
         addr += 1
     }
+}
+
+// ---- CABAC (9.3) ----
+
+fn cabacStart(cpu: *Cpu) -> void {
+    const b = &cpu.*.bits
+    bits_module.alignToByte(b)
+    cpu.*.cabacRange = 510
+    cpu.*.cabacOffset = bits_module.read(b, 9)
+}
+
+// The contexts' initial states for the slice (9.3.1.1).
+fn cabacInitContexts(cpu: *Cpu) -> void {
+    const slice = cpu.*.header.sliceType
+    const idc = @intCast(usize, cpu.*.header.cabacInitIdc)
+    const qp = clip3(0, 51, cpu.*.header.qp)
+    var ctx: usize = 0
+    while ctx < 460 {
+        var m: i32 = 0
+        var n: i32 = 0
+        if slice == h264.SLICE_I {
+            m = @intCast(i32, tables.CABAC_INIT_I[ctx * 2])
+            n = @intCast(i32, tables.CABAC_INIT_I[ctx * 2 + 1])
+        } else {
+            m = @intCast(i32, tables.CABAC_INIT_PB[idc * 920 + ctx * 2])
+            n = @intCast(i32, tables.CABAC_INIT_PB[idc * 920 + ctx * 2 + 1])
+        }
+        const pre = clip3(1, 126, ((m * qp) >> 4) + n)
+        if pre <= 63 {
+            cpu.*.contexts[ctx] = @intCast(u8, (63 - pre) << 1)
+        } else {
+            cpu.*.contexts[ctx] = @intCast(u8, ((pre - 64) << 1) | 1)
+        }
+        ctx += 1
+    }
+}
+
+fn decision(cpu: *Cpu, ctx: usize) -> u32 {
+    const state = @intCast(u32, cpu.*.contexts[ctx])
+    const p = state >> 1
+    var mps = state & 1
+    const q = (cpu.*.cabacRange >> 6) & 3
+    const lps = @intCast(u32, tables.RANGE_LPS[@intCast(usize, p * 4 + q)])
+    cpu.*.cabacRange -= lps
+    var bin: u32 = 0
+    if cpu.*.cabacOffset >= cpu.*.cabacRange {
+        bin = 1 - mps
+        cpu.*.cabacOffset -= cpu.*.cabacRange
+        cpu.*.cabacRange = lps
+        if p == 0 { mps = 1 - mps }
+        cpu.*.contexts[ctx] = @intCast(u8, (@intCast(u32, tables.NEXT_LPS[@intCast(usize, p)]) << 1) | mps)
+    } else {
+        bin = mps
+        cpu.*.contexts[ctx] = @intCast(u8, (@intCast(u32, tables.NEXT_MPS[@intCast(usize, p)]) << 1) | mps)
+    }
+    const b = &cpu.*.bits
+    while cpu.*.cabacRange < 256 {
+        cpu.*.cabacRange <<= 1
+        cpu.*.cabacOffset = (cpu.*.cabacOffset << 1) | bits_module.read(b, 1)
+    }
+    return bin
+}
+
+fn bypass(cpu: *Cpu) -> u32 {
+    cpu.*.cabacOffset = (cpu.*.cabacOffset << 1) | bits_module.read(&cpu.*.bits, 1)
+    if cpu.*.cabacOffset >= cpu.*.cabacRange {
+        cpu.*.cabacOffset -= cpu.*.cabacRange
+        return 1
+    }
+    return 0
+}
+
+fn terminate(cpu: *Cpu) -> u32 {
+    cpu.*.cabacRange -= 2
+    if cpu.*.cabacOffset >= cpu.*.cabacRange { return 1 }
+    const b = &cpu.*.bits
+    while cpu.*.cabacRange < 256 {
+        cpu.*.cabacRange <<= 1
+        cpu.*.cabacOffset = (cpu.*.cabacOffset << 1) | bits_module.read(b, 1)
+    }
+    return 0
+}
+
+fn flagOf(value: bool) -> usize { return if value { 1 } else { 0 } }
+
+// mb_skip_flag (ctxIdxOffset 11 for P, 24 for B).
+fn cabacSkip(cpu: *Cpu) -> bool {
+    const a = mbA(cpu)
+    const b = mbB(cpu)
+    const inc = flagOf(a != null && !a.?.*.skip) + flagOf(b != null && !b.?.*.skip)
+    const base: usize = if cpu.*.header.sliceType == h264.SLICE_B { 24 } else { 11 }
+    return decision(cpu, base + inc) == 1
+}
+
+// An I macroblock type's bins after the first (I_PCM or I_16x16's): 25
+// for I_PCM, else 1..24; `base` 3 (I slices) or 17 (the suffix in P and
+// B slices), whose context increments differ.
+fn cabacIntraRest(cpu: *Cpu, base: usize, prefixInP: bool) -> u32 {
+    if terminate(cpu) == 1 { return 25 }
+    const c1: usize = if prefixInP { 1 } else { 3 }
+    const c2: usize = if prefixInP { 2 } else { 4 }
+    const luma = decision(cpu, base + c1)
+    var chroma: u32 = 0
+    if decision(cpu, base + c2) == 1 {
+        chroma = 1 + decision(cpu, base + c2 + (if prefixInP { @intCast(usize, 0) } else { @intCast(usize, 1) }))
+    }
+    var predHi: u32 = 0
+    var predLo: u32 = 0
+    if prefixInP {
+        predHi = decision(cpu, base + 3)
+        predLo = decision(cpu, base + 3)
+    } else {
+        predHi = decision(cpu, base + 6)
+        predLo = decision(cpu, base + 7)
+    }
+    return 1 + predHi * 2 + predLo + chroma * 4 + luma * 12
+}
+
+// mb_type of an I slice (9.3.2.5, ctxIdxOffset 3).
+fn cabacMbTypeI(cpu: *Cpu) -> u32 {
+    const a = mbA(cpu)
+    const b = mbB(cpu)
+    const inc = flagOf(a != null && a.?.*.kind != MB_I_NXN) + flagOf(b != null && b.?.*.kind != MB_I_NXN)
+    if decision(cpu, 3 + inc) == 0 { return 0 }
+    return cabacIntraRest(cpu, 3, false)
+}
+
+// mb_type of a P slice: 0..4 (P types) or 5 + an I type.
+fn cabacMbTypeP(cpu: *Cpu) -> u32 {
+    if decision(cpu, 14) == 0 {
+        if decision(cpu, 15) == 0 {
+            return if decision(cpu, 16) == 0 { 0 } else { 3 }
+        }
+        return if decision(cpu, 17) == 0 { 2 } else { 1 }
+    }
+    // The I suffix (ctxIdxOffset 17).
+    if decision(cpu, 17) == 0 { return 5 }
+    return 5 + cabacIntraRest(cpu, 17, true)
+}
+
+fn cabacSubTypeP(cpu: *Cpu) -> u32 {
+    if decision(cpu, 21) == 1 { return 0 }
+    if decision(cpu, 22) == 0 { return 1 }
+    return if decision(cpu, 23) == 1 { 2 } else { 3 }
+}
+
+// ref_idx_lX for the partition at raster block (x, y) (ctxIdxOffset 54).
+fn cabacRefIdx(cpu: *Cpu, list: usize, x: i32, y: i32, done: u32) -> i32 {
+    var inc: usize = 0
+    var index: usize = 0
+    const a = lumaBlock(cpu, x - 1, y, done, &index)
+    if a != null && refPositive(a.?, list, index) { inc += 1 }
+    const b = lumaBlock(cpu, x, y - 1, done, &index)
+    if b != null && refPositive(b.?, list, index) { inc += 2 }
+    var value: i32 = 0
+    var ctx: usize = 54 + inc
+    while decision(cpu, ctx) == 1 {
+        value += 1
+        ctx = if value == 1 { 58 } else { 59 }
+        if value > 32 {
+            cpu.*.bits.failed = true
+            return 0
+        }
+    }
+    return value
+}
+
+// A neighbour's reference index of list `list` at raster block `index`
+// greater than 0 (B direct and skipped ones counted as 0).
+fn refPositive(mb: *Mb, list: usize, index: usize) -> bool {
+    if mb.*.intra || mb.*.skip { return false }
+    const blk8 = blk8Of(index)
+    if mb.*.direct[blk8] { return false }
+    return mb.*.ref[list][blk8] > 0
+}
+
+// mvd_lX[comp] of the partition at raster block (x, y) (ctxIdxOffset 40
+// for x, 47 for y; UEG3 with uCoff 9).
+fn cabacMvd(cpu: *Cpu, list: usize, comp: usize, x: i32, y: i32, done: u32) -> i32 {
+    var sum: i32 = 0
+    var index: usize = 0
+    const a = lumaBlock(cpu, x - 1, y, done, &index)
+    if a != null { sum += absolute(@intCast(i32, a.?.*.mvd[list][index][comp])) }
+    const b = lumaBlock(cpu, x, y - 1, done, &index)
+    if b != null { sum += absolute(@intCast(i32, b.?.*.mvd[list][index][comp])) }
+    const base: usize = if comp == 0 { 40 } else { 47 }
+    const inc: usize = if sum < 3 { 0 } else if sum > 32 { 2 } else { 1 }
+    if decision(cpu, base + inc) == 0 { return 0 }
+    var prefix: i32 = 1
+    while prefix < 9 {
+        const ctxInc: usize = if prefix == 1 { 3 } else if prefix == 2 { 4 } else if prefix == 3 { 5 } else { 6 }
+        if decision(cpu, base + ctxInc) == 0 { break }
+        prefix += 1
+    }
+    var value = prefix
+    if prefix >= 9 {
+        var k: u32 = 3
+        var suffix: i32 = 0
+        while bypass(cpu) == 1 {
+            suffix += @intCast(i32, 1) << @intCast(u5, k)
+            k += 1
+            if k > 24 {
+                cpu.*.bits.failed = true
+                return 0
+            }
+        }
+        while k > 0 {
+            k -= 1
+            suffix += @intCast(i32, bypass(cpu)) << @intCast(u5, k)
+        }
+        value += suffix
+    }
+    return if bypass(cpu) == 1 { -value } else { value }
+}
+
+// coded_block_pattern (ctxIdxOffset 73 luma, 77 chroma).
+fn cabacCbp(cpu: *Cpu, mb: *Mb) -> u32 {
+    var cbp: u32 = 0
+    var b8: u32 = 0
+    while b8 < 4 {
+        const x = b8 & 1
+        const y = b8 >> 1
+        var condA: usize = 0
+        var condB: usize = 0
+        // Left 8x8 block.
+        if x == 1 {
+            condA = flagOf(cbp & (@intCast(u32, 1) << @intCast(u5, b8 - 1)) == 0)
+        } else {
+            condA = cbpCondLuma(mbA(cpu), b8 + 1)
+        }
+        if y == 1 {
+            condB = flagOf(cbp & (@intCast(u32, 1) << @intCast(u5, b8 - 2)) == 0)
+        } else {
+            condB = cbpCondLuma(mbB(cpu), b8 + 2)
+        }
+        if decision(cpu, 73 + condA + 2 * condB) == 1 { cbp |= @intCast(u32, 1) << @intCast(u5, b8) }
+        b8 += 1
+    }
+    const a = mbA(cpu)
+    const b = mbB(cpu)
+    const inc0 = cbpCondChroma(a, 0) + 2 * cbpCondChroma(b, 0)
+    if decision(cpu, 77 + inc0) == 1 {
+        const inc1 = cbpCondChroma(a, 1) + 2 * cbpCondChroma(b, 1)
+        if decision(cpu, 77 + 4 + inc1) == 1 {
+            cbp |= 0x20
+        } else {
+            cbp |= 0x10
+        }
+    }
+    return cbp
+}
+
+fn cbpCondLuma(n: ?*Mb, b8: u32) -> usize {
+    if n == null { return 0 }
+    const mb = n.?
+    if mb.*.kind == MB_I_PCM { return 0 }
+    if !mb.*.skip && mb.*.cbp & (@intCast(u32, 1) << @intCast(u5, b8)) != 0 { return 0 }
+    return 1
+}
+
+fn cbpCondChroma(n: ?*Mb, bin: u32) -> usize {
+    if n == null { return 0 }
+    const mb = n.?
+    if mb.*.kind == MB_I_PCM { return 1 }
+    if mb.*.skip { return 0 }
+    const chroma = mb.*.cbp >> 4
+    if bin == 0 { return flagOf(chroma != 0) }
+    return flagOf(chroma == 2)
+}
+
+// mb_qp_delta (ctxIdxOffset 60).
+fn cabacQpDelta(cpu: *Cpu) -> i32 {
+    var ctx: usize = 60 + (if cpu.*.lastQpDelta != 0 { @intCast(usize, 1) } else { @intCast(usize, 0) })
+    var count: i32 = 0
+    while decision(cpu, ctx) == 1 {
+        count += 1
+        ctx = if count == 1 { 62 } else { 63 }
+        if count > 104 {
+            cpu.*.bits.failed = true
+            return 0
+        }
+    }
+    if count == 0 { return 0 }
+    const magnitude = (count + 1) >> 1
+    return if count & 1 == 1 { magnitude } else { -magnitude }
+}
+
+fn cabacChromaMode(cpu: *Cpu) -> u8 {
+    const a = mbA(cpu)
+    const b = mbB(cpu)
+    const condA = flagOf(a != null && a.?.*.intra && a.?.*.kind != MB_I_PCM && a.?.*.chromaMode != 0)
+    const condB = flagOf(b != null && b.?.*.intra && b.?.*.kind != MB_I_PCM && b.?.*.chromaMode != 0)
+    if decision(cpu, 64 + condA + condB) == 0 { return 0 }
+    if decision(cpu, 67) == 0 { return 1 }
+    return if decision(cpu, 67) == 0 { 2 } else { 3 }
+}
+
+fn cabacTransform8x8(cpu: *Cpu) -> bool {
+    const a = mbA(cpu)
+    const b = mbB(cpu)
+    const inc = flagOf(a != null && a.?.*.transform8x8) + flagOf(b != null && b.?.*.transform8x8)
+    return decision(cpu, 399 + inc) == 1
+}
+
+// coded_block_flag's ctxIdxInc for a neighbour (9.3.3.1.1.9): `kind` 0
+// luma DC, 1 a luma 4x4 block (raster index), 2 chroma DC (plane), 3 a
+// chroma AC block (plane * 4 + raster).
+fn cbfCond(cpu: *Cpu, n: ?*Mb, kind: u32, index: usize) -> usize {
+    const mb = current(cpu)
+    if n == null { return flagOf(mb.*.intra) }
+    const m = n.?
+    if m.*.kind == MB_I_PCM { return 1 }
+    if kind == 0 {
+        if m.*.kind != MB_I_16X16 { return 0 }
+        return flagOf(m.*.cbfDc & 1 != 0)
+    }
+    if kind == 1 {
+        if m.*.skip { return 0 }
+        if m.*.cbp & (@intCast(u32, 1) << @intCast(u5, blk8Of(index))) == 0 { return 0 }
+        if m.*.transform8x8 { return 1 }
+        return flagOf(m.*.nz[index] != 0)
+    }
+    if kind == 2 {
+        if m.*.skip || m.*.cbp >> 4 == 0 { return 0 }
+        return flagOf(m.*.cbfDc & (@intCast(u8, 2) << @intCast(u3, index)) != 0)
+    }
+    if m.*.skip || m.*.cbp >> 4 != 2 { return 0 }
+    return flagOf(m.*.nzc[index] != 0)
+}
+
+// residual_block_cabac (7.3.5.3.3): the coefficient list (levelListIdx
+// order, `count` of them) of category `cat` (0 Intra16x16DC, 1
+// Intra16x16AC, 2 luma 4x4, 3 chroma DC, 4 chroma AC, 5 luma 8x8), after
+// coded_block_flag; the number of non-zero coefficients.
+fn cabacResidual(cpu: *Cpu, list: [*]i32, count: usize, cat: u32) -> u8 {
+    var k: usize = 0
+    while k < count {
+        list[k] = 0
+        k += 1
+    }
+    var sigBase: usize = 105
+    var lastBase: usize = 166
+    var absBase: usize = 227
+    if cat == 1 {
+        sigBase += 15
+        lastBase += 15
+        absBase += 10
+    } else if cat == 2 {
+        sigBase += 29
+        lastBase += 29
+        absBase += 20
+    } else if cat == 3 {
+        sigBase += 44
+        lastBase += 44
+        absBase += 30
+    } else if cat == 4 {
+        sigBase += 47
+        lastBase += 47
+        absBase += 39
+    } else if cat == 5 {
+        sigBase = 402
+        lastBase = 417
+        absBase = 426
+    }
+    var significant: [64]bool = undefined
+    var numCoeff = count
+    var i: usize = 0
+    while i + 1 < numCoeff {
+        var sigInc = i
+        var lastInc = i
+        if cat == 3 {
+            sigInc = if i < 2 { i } else { 2 }
+            lastInc = sigInc
+        } else if cat == 5 {
+            sigInc = @intCast(usize, tables.SIG8X8[i])
+            lastInc = @intCast(usize, tables.LAST8X8[i])
+        }
+        significant[i] = decision(cpu, sigBase + sigInc) == 1
+        if significant[i] {
+            if decision(cpu, lastBase + lastInc) == 1 { numCoeff = i + 1 }
+        }
+        i += 1
+    }
+    significant[numCoeff - 1] = true
+    var numEq1: usize = 0
+    var numGt1: usize = 0
+    var total: u8 = 0
+    i = numCoeff
+    while i > 0 {
+        i -= 1
+        if !significant[i] { continue }
+        const inc0: usize = if numGt1 != 0 { 0 } else if numEq1 + 1 < 4 { numEq1 + 1 } else { 4 }
+        var level: i32 = 1
+        if decision(cpu, absBase + inc0) == 1 {
+            const limit: usize = if cat == 3 { 3 } else { 4 }
+            const incN = 5 + (if numGt1 < limit { numGt1 } else { limit })
+            var prefix: i32 = 1
+            while prefix < 14 && decision(cpu, absBase + incN) == 1 { prefix += 1 }
+            var value = prefix
+            if prefix >= 14 {
+                var kk: u32 = 0
+                var suffix: i32 = 0
+                while bypass(cpu) == 1 {
+                    suffix += @intCast(i32, 1) << @intCast(u5, kk)
+                    kk += 1
+                    if kk > 24 {
+                        cpu.*.bits.failed = true
+                        return 0
+                    }
+                }
+                while kk > 0 {
+                    kk -= 1
+                    suffix += @intCast(i32, bypass(cpu)) << @intCast(u5, kk)
+                }
+                value += suffix
+            }
+            level = value + 1
+        }
+        if level == 1 { numEq1 += 1 } else { numGt1 += 1 }
+        list[i] = if bypass(cpu) == 1 { -level } else { level }
+        total += 1
+    }
+    return total
+}
+
+// coded_block_flag of a block (ctxIdxOffset 85; `cat` its ctxBlockCat,
+// `kind`/`index` as in cbfCond for the neighbours A and B).
+fn cabacCbf(cpu: *Cpu, cat: u32, condA: usize, condB: usize) -> bool {
+    const catOffset: usize = @intCast(usize, cat) * 4
+    return decision(cpu, 85 + catOffset + condA + 2 * condB) == 1
+}
+
+// The luma 4x4 block neighbours' coded_block_flag conditions for raster
+// block (x, y) of the current macroblock.
+fn cbfLuma(cpu: *Cpu, x: i32, y: i32, done: u32, condA: *usize, condB: *usize) -> void {
+    var index: usize = 0
+    const mb = current(cpu)
+    const a = lumaBlock(cpu, x - 1, y, done, &index)
+    if a == null && x - 1 >= 0 {
+        // Within the macroblock: decoded before (always, in blkIdx order).
+        condA.* = cbfCond(cpu, mb, 1, @intCast(usize, y * 4 + x - 1))
+    } else if a == null && x == 0 {
+        condA.* = cbfCond(cpu, null, 1, 0)
+    } else {
+        condA.* = cbfCond(cpu, a, 1, index)
+    }
+    const b = lumaBlock(cpu, x, y - 1, done, &index)
+    if b == null && y - 1 >= 0 {
+        condB.* = cbfCond(cpu, mb, 1, @intCast(usize, (y - 1) * 4 + x))
+    } else if b == null && y == 0 {
+        condB.* = cbfCond(cpu, null, 1, 0)
+    } else {
+        condB.* = cbfCond(cpu, b, 1, index)
+    }
+}
+
+fn residualLumaCabac(cpu: *Cpu, mb: *Mb, i16: bool) -> Status {
+    if i16 {
+        const condA = cbfCond(cpu, mbA(cpu), 0, 0)
+        const condB = cbfCond(cpu, mbB(cpu), 0, 0)
+        if cabacCbf(cpu, 0, condA, condB) {
+            _ = cabacResidual(cpu, &cpu.*.lumaDc, 16, 0)
+            mb.*.cbfDc |= 1
+        } else {
+            var k: usize = 0
+            while k < 16 {
+                cpu.*.lumaDc[k] = 0
+                k += 1
+            }
+        }
+    }
+    var b8: usize = 0
+    while b8 < 4 {
+        const coded = mb.*.cbp & (@intCast(u32, 1) << @intCast(u5, b8)) != 0
+        if mb.*.transform8x8 {
+            var total: u8 = 0
+            if coded {
+                total = cabacResidual(cpu, &cpu.*.coefficients8[b8], 64, 5)
+            } else {
+                var j: usize = 0
+                while j < 64 {
+                    cpu.*.coefficients8[b8][j] = 0
+                    j += 1
+                }
+            }
+            const first = (b8 >> 1) * 8 + (b8 & 1) * 2
+            mb.*.nz[first] = total
+            mb.*.nz[first + 1] = total
+            mb.*.nz[first + 4] = total
+            mb.*.nz[first + 5] = total
+            b8 += 1
+            continue
+        }
+        var sub: usize = 0
+        while sub < 4 {
+            const blk = b8 * 4 + sub
+            const raster = @intCast(usize, BLK_RASTER[blk])
+            const coefficients: [*]i32 = &cpu.*.coefficients[raster]
+            var k: usize = 0
+            while k < 16 {
+                coefficients[k] = 0
+                k += 1
+            }
+            mb.*.nz[raster] = 0
+            if coded {
+                var condA: usize = 0
+                var condB: usize = 0
+                cbfLuma(cpu, blockX(blk), blockY(blk), doneBefore(blk), &condA, &condB)
+                if i16 {
+                    if cabacCbf(cpu, 1, condA, condB) { mb.*.nz[raster] = cabacResidual(cpu, &coefficients[1], 15, 1) }
+                } else {
+                    if cabacCbf(cpu, 2, condA, condB) { mb.*.nz[raster] = cabacResidual(cpu, coefficients, 16, 2) }
+                }
+            }
+            sub += 1
+        }
+        b8 += 1
+    }
+    if cpu.*.bits.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn residualChromaCabac(cpu: *Cpu, mb: *Mb) -> Status {
+    const a = mbA(cpu)
+    const b = mbB(cpu)
+    var c: usize = 0
+    while c < 2 {
+        var k: usize = 0
+        while k < 4 {
+            cpu.*.chromaDc[c][k] = 0
+            k += 1
+        }
+        if cabacCbf(cpu, 3, cbfCond(cpu, a, 2, c), cbfCond(cpu, b, 2, c)) {
+            _ = cabacResidual(cpu, &cpu.*.chromaDc[c], 4, 3)
+            mb.*.cbfDc |= @intCast(u8, 2) << @intCast(u3, c)
+        }
+        c += 1
+    }
+    c = 0
+    while c < 2 {
+        var blk: usize = 0
+        while blk < 4 {
+            const ac: [*]i32 = &cpu.*.chromaAc[c][blk]
+            var k: usize = 0
+            while k < 16 {
+                ac[k] = 0
+                k += 1
+            }
+            mb.*.nzc[c * 4 + blk] = 0
+            if mb.*.cbp & 0x20 != 0 {
+                const x = blk & 1
+                const y = blk >> 1
+                var condA: usize = 0
+                var condB: usize = 0
+                if x == 1 {
+                    condA = cbfCond(cpu, mb, 3, c * 4 + blk - 1)
+                } else {
+                    condA = cbfCond(cpu, a, 3, c * 4 + blk + 1)
+                }
+                if y == 1 {
+                    condB = cbfCond(cpu, mb, 3, c * 4 + blk - 2)
+                } else {
+                    condB = cbfCond(cpu, b, 3, c * 4 + blk + 2)
+                }
+                if cabacCbf(cpu, 4, condA, condB) { mb.*.nzc[c * 4 + blk] = cabacResidual(cpu, &ac[1], 15, 4) }
+            }
+            blk += 1
+        }
+        c += 1
+    }
+    if cpu.*.bits.failed { return Status.corrupt }
+    return Status.ok
+}
+
+// The reference indices and vector differences of a P macroblock by
+// CABAC, then its motion.
+fn parseInterPCabac(cpu: *Cpu, mb: *Mb, p: *Parsed, mbType: u32) -> Status {
+    const active = cpu.*.header.active[0]
+    const partCount: usize = if mbType == 0 { 1 } else if mbType < 3 { 2 } else { 4 }
+    if mbType >= 3 {
+        var k: usize = 0
+        while k < 4 {
+            p.*.subTypes[k] = cabacSubTypeP(cpu)
+            k += 1
+        }
+    }
+    // ref_idx: each partition's, its 8x8 blocks taking it at once (the
+    // next partitions' contexts look at them).
+    var k: usize = 0
+    while k < partCount {
+        var x: i32 = 0
+        var y: i32 = 0
+        partOrigin(mbType, k, &x, &y)
+        var ref: i32 = 0
+        if active > 1 {
+            ref = cabacRefIdx(cpu, 0, x, y, partDone(mbType, k))
+            if ref >= @intCast(i32, active) { return Status.corrupt }
+        }
+        p.*.refs[0][k] = ref
+        setPartRef(mb, 0, mbType, k, ref)
+        k += 1
+    }
+    // mvd: stored in mb's blocks as read.
+    k = 0
+    var mvdCount: usize = 0
+    while k < partCount {
+        var x: i32 = 0
+        var y: i32 = 0
+        partOrigin(mbType, k, &x, &y)
+        var w: i32 = 4
+        var h: i32 = 4
+        if mbType == 1 { h = 2 }
+        if mbType == 2 { w = 2 }
+        if mbType >= 3 {
+            w = 2
+            h = 2
+        }
+        if mbType >= 3 {
+            const subType = p.*.subTypes[k]
+            const parts = subParts(subType)
+            const sw = subWidth(subType)
+            const sh = subHeight(subType)
+            var j: u32 = 0
+            while j < parts {
+                var sx = x
+                var sy = y
+                if subType == 1 { sy += @intCast(i32, j) }
+                if subType == 2 { sx += @intCast(i32, j) }
+                if subType == 3 {
+                    sx += @intCast(i32, j & 1)
+                    sy += @intCast(i32, j >> 1)
+                }
+                readMvd(cpu, mb, p, 0, mvdCount, sx, sy, sw, sh)
+                mvdCount += 1
+                j += 1
+            }
+        } else {
+            readMvd(cpu, mb, p, 0, mvdCount, x, y, w, h)
+            mvdCount += 1
+        }
+        k += 1
+    }
+    if cpu.*.bits.failed { return Status.corrupt }
+    return applyInter(cpu, mb, p, 0, mbType, partCount)
+}
+
+// The partition k's top-left raster block of a P/B macroblock type
+// (0 16x16, 1 16x8, 2 8x16, 3+ 8x8).
+fn partOrigin(mbType: u32, k: usize, x: *i32, y: *i32) -> void {
+    x.* = 0
+    y.* = 0
+    if mbType == 1 { y.* = @intCast(i32, k) * 2 }
+    if mbType == 2 { x.* = @intCast(i32, k) * 2 }
+    if mbType >= 3 {
+        x.* = @intCast(i32, k & 1) * 2
+        y.* = @intCast(i32, k >> 1) * 2
+    }
+}
+
+// The raster blocks of the partitions before k (all their blocks: the
+// whole macroblock's state is written per partition as read).
+fn partDone(mbType: u32, k: usize) -> u32 {
+    var mask: u32 = 0
+    var j: usize = 0
+    while j < k {
+        var x: i32 = 0
+        var y: i32 = 0
+        partOrigin(mbType, j, &x, &y)
+        var w: i32 = 4
+        var h: i32 = 4
+        if mbType == 1 { h = 2 }
+        if mbType == 2 { w = 2 }
+        if mbType >= 3 {
+            w = 2
+            h = 2
+        }
+        var by = y
+        while by < y + h {
+            var bx = x
+            while bx < x + w {
+                mask |= @intCast(u32, 1) << @intCast(u5, by * 4 + bx)
+                bx += 1
+            }
+            by += 1
+        }
+        j += 1
+    }
+    return mask
+}
+
+fn setPartRef(mb: *Mb, list: usize, mbType: u32, k: usize, ref: i32) -> void {
+    if mbType == 0 {
+        var j: usize = 0
+        while j < 4 {
+            mb.*.ref[list][j] = @intCast(i8, ref)
+            j += 1
+        }
+    } else if mbType == 1 {
+        mb.*.ref[list][k * 2] = @intCast(i8, ref)
+        mb.*.ref[list][k * 2 + 1] = @intCast(i8, ref)
+    } else if mbType == 2 {
+        mb.*.ref[list][k] = @intCast(i8, ref)
+        mb.*.ref[list][k + 2] = @intCast(i8, ref)
+    } else {
+        mb.*.ref[list][k] = @intCast(i8, ref)
+    }
+}
+
+// One partition's mvd_lX (both components) into p and mb's blocks
+// (raster (x, y), w x h blocks).
+fn readMvd(cpu: *Cpu, mb: *Mb, p: *Parsed, list: usize, index: usize, x: i32, y: i32, w: i32, h: i32) -> void {
+    // The blocks written so far: everything but this partition's own.
+    var mask: u32 = 0xffff
+    var by = y
+    while by < y + h {
+        var bx = x
+        while bx < x + w {
+            mask &= ~(@intCast(u32, 1) << @intCast(u5, by * 4 + bx))
+            bx += 1
+        }
+        by += 1
+    }
+    const dx = cabacMvd(cpu, list, 0, x, y, mask)
+    const dy = cabacMvd(cpu, list, 1, x, y, mask)
+    p.*.mvd[list][index][0] = dx
+    p.*.mvd[list][index][1] = dy
+    by = y
+    while by < y + h {
+        var bx = x
+        while bx < x + w {
+            const raster = @intCast(usize, by * 4 + bx)
+            mb.*.mvd[list][raster][0] = @intCast(i16, dx)
+            mb.*.mvd[list][raster][1] = @intCast(i16, dy)
+            bx += 1
+        }
+        by += 1
+    }
+}
+
+// macroblock_layer() of an I or P slice read by CABAC.
+fn parseMbCabac(cpu: *Cpu, mb: *Mb, p: *Parsed, qp: *i32) -> Status {
+    const slice = cpu.*.header.sliceType
+    var mbType: u32 = 0
+    var intraType: u32 = 0
+    var intra = true
+    if slice == h264.SLICE_P {
+        mbType = cabacMbTypeP(cpu)
+        if mbType < 5 {
+            intra = false
+        } else {
+            intraType = mbType - 5
+        }
+    } else if slice == h264.SLICE_I {
+        mbType = cabacMbTypeI(cpu)
+        intraType = mbType
+    } else {
+        return Status.unsupported
+    }
+    p.*.mbType = mbType
+    mb.*.intra = intra
+    if intra {
+        if intraType == 25 {
+            const status = readPcm(cpu, mb, qp)
+            cpu.*.lastQpDelta = 0
+            if status != Status.ok { return status }
+            cabacStart(cpu)
+            return Status.ok
+        }
+        if intraType == 0 {
+            mb.*.kind = MB_I_NXN
+            if transform8x8Allowed(cpu) { mb.*.transform8x8 = cabacTransform8x8(cpu) }
+            const count: usize = if mb.*.transform8x8 { 4 } else { 16 }
+            var k: usize = 0
+            while k < count {
+                p.*.prevFlag[k] = decision(cpu, 68) == 1
+                p.*.remMode[k] = 0
+                if !p.*.prevFlag[k] {
+                    const b0 = decision(cpu, 69)
+                    const b1 = decision(cpu, 69)
+                    const b2 = decision(cpu, 69)
+                    p.*.remMode[k] = b0 | (b1 << 1) | (b2 << 2)
+                }
+                k += 1
+            }
+        } else {
+            mb.*.kind = MB_I_16X16
+            p.*.i16Mode = (intraType - 1) % 4
+            const chroma = ((intraType - 1) / 4) % 3
+            mb.*.cbp = (chroma << 4) | (if intraType >= 13 { @intCast(u32, 15) } else { @intCast(u32, 0) })
+        }
+        mb.*.chromaMode = cabacChromaMode(cpu)
+    } else {
+        mb.*.kind = MB_P_16X16 + @intCast(u8, mbType)
+        const status = parseInterPCabac(cpu, mb, p, mbType)
+        if status != Status.ok { return status }
+    }
+    if mb.*.kind != MB_I_16X16 {
+        mb.*.cbp = cabacCbp(cpu, mb)
+        if !intra && mb.*.cbp & 15 != 0 && transform8x8Allowed(cpu) && interAllows8x8(mb, p) {
+            mb.*.transform8x8 = cabacTransform8x8(cpu)
+        }
+    }
+    var delta: i32 = 0
+    if mb.*.cbp != 0 || mb.*.kind == MB_I_16X16 {
+        delta = cabacQpDelta(cpu)
+        if delta < -26 || delta > 25 { return Status.corrupt }
+        qp.* = (qp.* + delta + 52) % 52
+    }
+    cpu.*.lastQpDelta = delta
+    mb.*.qp = qp.*
+    if mb.*.cbp & 15 != 0 || mb.*.kind == MB_I_16X16 {
+        const status = residualLumaCabac(cpu, mb, mb.*.kind == MB_I_16X16)
+        if status != Status.ok { return status }
+    } else {
+        clearLuma(cpu, mb)
+    }
+    if mb.*.cbp & 0x30 != 0 {
+        const status = residualChromaCabac(cpu, mb)
+        if status != Status.ok { return status }
+    } else {
+        clearChroma(cpu, mb)
+    }
+    if cpu.*.bits.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn decodeSliceCabac(cpu: *Cpu, qpIn: i32) -> Status {
+    cabacStart(cpu)
+    cabacInitContexts(cpu)
+    cpu.*.lastQpDelta = 0
+    var qp = qpIn
+    var addr = cpu.*.header.firstMb
+    const total = cpu.*.widthMbs * cpu.*.heightMbs
+    var p: Parsed = undefined
+    while addr < total {
+        startMb(cpu, addr)
+        const mb = current(cpu)
+        resetMb(cpu, mb)
+        var skipped = false
+        if cpu.*.header.sliceType != h264.SLICE_I {
+            skipped = cabacSkip(cpu)
+        }
+        if skipped {
+            mb.*.qp = qp
+            cpu.*.lastQpDelta = 0
+            if cpu.*.header.sliceType == h264.SLICE_P {
+                skipP(cpu, mb)
+            } else {
+                const status = skipB(cpu, mb)
+                if status != Status.ok { return status }
+            }
+        } else {
+            const status = parseMbCabac(cpu, mb, &p, &qp)
+            if status != Status.ok { return status }
+        }
+        finishMb(cpu, mb, &p)
+        addr += 1
+        if terminate(cpu) == 1 { break }
+        if cpu.*.bits.failed { return Status.corrupt }
+    }
+    return Status.ok
 }
