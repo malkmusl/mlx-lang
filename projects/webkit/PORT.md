@@ -1689,8 +1689,19 @@ profile streams (8x8 transform, pyramid B, temporal direct, weighted
 P/B, slices) as ffmpeg does; tests/422_h264_cpu_decode_runtime.mlx
 checks test.mp4's output. A slice that cannot be decoded leaves its
 macroblocks concealed (the first reference's samples, or grey) and the
-picture's other slices decoded. It runs on one thread: 320x240 at about
-180 pictures a second, 1080p at about 7 (multithreading is next).
+picture's other slices decoded. The player decodes on a pool of threads
+(std.h264.decode's `Pool`, frame threading: one per processor but the
+caller's, at most 16, or `MLX_VIDEO_THREADS`): the caller's thread reads
+each picture's slice headers and builds its reference lists, a worker
+decodes it, its motion compensation waiting for the rows of a reference
+still being decoded (each picture's rows are filtered and published as
+they are done) and its direct prediction for the colocated motion; a slot
+is written again only when the pictures reading it are done, and
+pictures given out wait in the pool, their slots held by std.h264
+(`holdOutputs`), until decoded (`mlxweb_video_next_output`). On one
+thread 320x240 decodes at about 180 pictures a second and 1080p High at
+about 7; four processors decode 1080p about three times as fast, and the
+pool grows with the processors.
 `MLX_TRACE_MEDIA=1` traces the players on standard error ("media: ..."):
 the codecs a page asks about, loads, tracks, ready and network states,
 play, pause, seeks, the decoder opened (the GPU's or the CPU's) or not, every 120th frame's

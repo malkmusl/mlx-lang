@@ -156,6 +156,8 @@ private:
     void wakeVideo();
     void videoLoop();
     void decodeVideoSample(const Vector<uint8_t>&, const MediaTime&);
+    void presentVideoTail();
+    void presentDueFrames(bool decoded, const MediaTime& presentationTime);
     bool presentFrame(uint32_t slot, const MediaTime& due);
     void presentBlack();
     void checkEnded();

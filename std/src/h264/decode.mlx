@@ -21,6 +21,8 @@ const video = @import("../vulkan/video.mlx")
 const tables = @import("./tables.mlx")
 const bits_module = @import("./bits.mlx")
 const allocator_module = @import("../../bootstrap/allocator.mlx")
+const linux = @import("../../bootstrap/os/linux.mlx")
+const thread = @import("../../bootstrap/os/linux/thread.mlx")
 
 pub const Allocator = allocator_module.Allocator
 pub const Bits = bits_module.Bits
@@ -105,6 +107,14 @@ pub const Frame = struct {
     id: u32
     poc: i32
     longTerm: bool
+    // Decoding on a Pool's threads: luma rows of samples final (after
+    // the deblocking filter) and macroblock rows of motion stored, so far,
+    // while `writing` is 1 (a picture being decoded into the frame); the
+    // pictures in flight that read the frame as a reference.
+    progress: u32
+    motionRows: u32
+    writing: u32
+    readers: u32
 }
 
 pub const MAX_REFS: usize = 32
@@ -141,7 +151,15 @@ pub const Header = struct {
 
 pub const Cpu = struct {
     allocator: Allocator
-    frames: [h264.SLOTS]Frame
+    // The slots' frames: the Cpu's own, or (a Pool's workers) another's.
+    frames: [*]Frame
+    ownsFrames: bool
+    // A Pool's worker: progress is told to the threads waiting for it.
+    threaded: bool
+    // The current picture's macroblock rows whose motion is stored and
+    // which went through the deblocking filter.
+    rowsStored: u32
+    rowsDeblocked: u32
     width: u32
     height: u32
     widthMbs: u32
@@ -208,13 +226,38 @@ fn zero(target: [*]u8, count: usize) -> void {
     }
 }
 
+fn copyBytes(target: [*]u8, source: [*]const u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        target[index] = source[index]
+        index += 1
+    }
+}
+
 pub fn create(allocator: Allocator) -> ?*Cpu {
+    const frames = allocator.alloc(h264.SLOTS * @sizeOf(Frame), 16)
+    if frames == null { return null }
+    zero(frames.?, h264.SLOTS * @sizeOf(Frame))
+    var shared: [*]Frame = undefined
+    unsafe { shared = @ptrCast([*]Frame, frames.?) }
+    const cpu = createSharing(allocator, shared)
+    if cpu == null {
+        allocator.free(frames.?, h264.SLOTS * @sizeOf(Frame), 16)
+        return null
+    }
+    cpu.?.*.ownsFrames = true
+    return cpu
+}
+
+// A Cpu decoding into another's frames.
+fn createSharing(allocator: Allocator, frames: [*]Frame) -> ?*Cpu {
     const memory = allocator.alloc(@sizeOf(Cpu), 16)
     if memory == null { return null }
     var cpu: *Cpu = undefined
     unsafe { cpu = @ptrCast(*Cpu, memory.?) }
     unsafe { zero(@ptrCast([*]u8, cpu), @sizeOf(Cpu)) }
     cpu.*.allocator = allocator
+    cpu.*.frames = frames
     bits_module.init(&cpu.*.bits, allocator)
     cpu.*.nextId = 1
     return cpu
@@ -244,10 +287,13 @@ fn freeMbs(cpu: *Cpu) -> void {
 }
 
 pub fn destroy(cpu: *Cpu) -> void {
-    var slot: usize = 0
-    while slot < h264.SLOTS {
-        freeFrame(cpu, &cpu.*.frames[slot])
-        slot += 1
+    if cpu.*.ownsFrames {
+        var slot: usize = 0
+        while slot < h264.SLOTS {
+            freeFrame(cpu, &cpu.*.frames[slot])
+            slot += 1
+        }
+        unsafe { cpu.*.allocator.free(@ptrCast([*]u8, cpu.*.frames), h264.SLOTS * @sizeOf(Frame), 16) }
     }
     freeMbs(cpu)
     bits_module.deinit(&cpu.*.bits)
@@ -276,7 +322,7 @@ fn prepare(cpu: *Cpu, sps: *h264.Sps) -> bool {
     const heightMbs = sps.*.heightInMbs
     if widthMbs == cpu.*.widthMbs && heightMbs == cpu.*.heightMbs && cpu.*.mbCount != 0 { return true }
     var slot: usize = 0
-    while slot < h264.SLOTS {
+    while cpu.*.ownsFrames && slot < h264.SLOTS {
         freeFrame(cpu, &cpu.*.frames[slot])
         slot += 1
     }
@@ -2615,6 +2661,7 @@ fn predictRegion(cpu: *Cpu, mb: *Mb, first: usize, size: usize) -> void {
         const frame = &cpu.*.frames[cpu.*.refs[0][@intCast(usize, ref0)]]
         const mvx = @intCast(i32, mb.*.mv[0][first][0])
         const mvy = @intCast(i32, mb.*.mv[0][first][1])
+        awaitReference(cpu, frame, py, n, mvy)
         predictLuma(cpu, frame, px, py, n, n, mvx, mvy, &cpu.*.predL0)
         predictChromaBlock(cpu, frame, 0, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC0[0])
         predictChromaBlock(cpu, frame, 1, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC0[1])
@@ -2624,6 +2671,7 @@ fn predictRegion(cpu: *Cpu, mb: *Mb, first: usize, size: usize) -> void {
         const frame = &cpu.*.frames[cpu.*.refs[1][@intCast(usize, ref1)]]
         const mvx = @intCast(i32, mb.*.mv[1][first][0])
         const mvy = @intCast(i32, mb.*.mv[1][first][1])
+        awaitReference(cpu, frame, py, n, mvy)
         predictLuma(cpu, frame, px, py, n, n, mvx, mvy, &cpu.*.predL1)
         predictChromaBlock(cpu, frame, 0, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC1[0])
         predictChromaBlock(cpu, frame, 1, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC1[1])
@@ -3052,6 +3100,7 @@ fn decodeSliceCavlc(cpu: *Cpu, qpIn: i32) -> Status {
                     if status != Status.ok { return status }
                 }
                 finishMb(cpu, mb, &p)
+                if cpu.*.mbX + 1 == cpu.*.widthMbs { rowDone(cpu, cpu.*.mbY) }
                 addr += 1
                 if skipRun == 0 && !bits_module.moreData(b) { break }
                 continue
@@ -3061,6 +3110,7 @@ fn decodeSliceCavlc(cpu: *Cpu, qpIn: i32) -> Status {
         const status = parseMbCavlc(cpu, mb, &p, &qp)
         if status != Status.ok { return status }
         finishMb(cpu, mb, &p)
+        if cpu.*.mbX + 1 == cpu.*.widthMbs { rowDone(cpu, cpu.*.mbY) }
         addr += 1
         if !bits_module.moreData(b) { break }
     }
@@ -3077,18 +3127,10 @@ pub fn decodePicture(cpu: *Cpu, h: *h264.Decoder, bytes: [*]const u8) -> Status 
     const sps = h264.spsAt(h, @intCast(usize, picture.*.spsId))
     if !prepare(cpu, sps) { return Status.noMemory }
     if !ensureFrame(cpu, slot) { return Status.noMemory }
-    cpu.*.slot = slot
-    cpu.*.frame = &cpu.*.frames[slot]
-    cpu.*.poc = picture.*.poc
-    cpu.*.frame.*.id = cpu.*.nextId
-    cpu.*.frame.*.poc = picture.*.poc
+    cpu.*.frames[slot].id = cpu.*.nextId
+    cpu.*.frames[slot].poc = picture.*.poc
     cpu.*.nextId += 1
-    var k: usize = 0
-    while k < cpu.*.mbCount {
-        mbAt(cpu, k).*.slice = 0
-        k += 1
-    }
-    cpu.*.sliceNum = 0
+    startPicture(cpu, slot, picture.*.poc)
     var index: usize = 0
     var result = Status.ok
     while index < picture.*.sliceCount {
@@ -3102,11 +3144,83 @@ pub fn decodePicture(cpu: *Cpu, h: *h264.Decoder, bytes: [*]const u8) -> Status 
         // macroblocks not reached concealed.
         if status != Status.ok { result = status }
     }
-    concealMissing(cpu)
-    if !skipDeblocking { deblockPicture(cpu) }
-    storeMotion(cpu)
-    cpu.*.decoded += 1
+    endPicture(cpu)
     return result
+}
+
+// The picture of `slot` begins: no macroblock decoded, no row done.
+fn startPicture(cpu: *Cpu, slot: usize, poc: i32) -> void {
+    cpu.*.slot = slot
+    cpu.*.frame = &cpu.*.frames[slot]
+    cpu.*.poc = poc
+    var k: usize = 0
+    while k < cpu.*.mbCount {
+        mbAt(cpu, k).*.slice = 0
+        k += 1
+    }
+    cpu.*.sliceNum = 0
+    cpu.*.rowsStored = 0
+    cpu.*.rowsDeblocked = 0
+}
+
+// Macroblock row `row` is reconstructed: its motion stored, and the row
+// above it (whose samples the rows below no longer predict from)
+// filtered; its rows of samples final but the last three, which the next
+// row's filtering changes.
+fn rowDone(cpu: *Cpu, row: u32) -> void {
+    if row < cpu.*.rowsStored { return }
+    storeMotionRows(cpu, cpu.*.rowsStored, row + 1)
+    cpu.*.rowsStored = row + 1
+    publish(cpu, &cpu.*.frame.*.motionRows, row + 1)
+    if row >= 1 && row > cpu.*.rowsDeblocked {
+        if !skipDeblocking { deblockRows(cpu, cpu.*.rowsDeblocked, row) }
+        cpu.*.rowsDeblocked = row
+        publish(cpu, &cpu.*.frame.*.progress, (row - 1) * 16 + 13)
+    }
+}
+
+// The picture's slices are all decoded: what no slice covered
+// concealed, the rows left stored and filtered, the frame final.
+fn endPicture(cpu: *Cpu) -> void {
+    if concealMissing(cpu) {
+        storeMotionRows(cpu, 0, cpu.*.heightMbs)
+    } else {
+        storeMotionRows(cpu, cpu.*.rowsStored, cpu.*.heightMbs)
+    }
+    if !skipDeblocking { deblockRows(cpu, cpu.*.rowsDeblocked, cpu.*.heightMbs) }
+    cpu.*.rowsStored = cpu.*.heightMbs
+    cpu.*.rowsDeblocked = cpu.*.heightMbs
+    publish(cpu, &cpu.*.frame.*.motionRows, cpu.*.heightMbs)
+    publish(cpu, &cpu.*.frame.*.progress, cpu.*.height)
+    cpu.*.decoded += 1
+}
+
+fn publish(cpu: *Cpu, counter: *u32, value: u32) -> void {
+    @atomicStore(u32, counter, value, release)
+    if cpu.*.threaded { _ = thread.futexWake(counter, 2147483647, true) }
+}
+
+// Waits until `counter` reaches `needed` while the frame is being
+// written (a frame no picture writes is final).
+fn awaitCounter(counter: *u32, writing: *u32, needed: u32) -> void {
+    while true {
+        const have = @atomicLoad(u32, counter, acquire)
+        if have >= needed { return }
+        if @atomicLoad(u32, writing, acquire) == 0 { return }
+        _ = thread.futexWait(counter, have, 0, true)
+    }
+}
+
+// Waits until the reference `frame` has the rows a block at luma row py,
+// n rows high, with vertical vector mvy, reads (its window and chroma's).
+fn awaitReference(cpu: *Cpu, frame: *Frame, py: i32, n: i32, mvy: i32) -> void {
+    if @atomicLoad(u32, &frame.*.writing, acquire) == 0 { return }
+    var bottom = py + (mvy >> 2) + n + 3
+    const chroma = 2 * (py / 2 + (mvy >> 3) + n / 2 + 2)
+    if chroma > bottom { bottom = chroma }
+    if bottom > @intCast(i32, cpu.*.height) { bottom = @intCast(i32, cpu.*.height) }
+    if bottom < 1 { bottom = 1 }
+    awaitCounter(&frame.*.progress, &frame.*.writing, @intCast(u32, bottom))
 }
 
 fn decodeSlice(cpu: *Cpu, h: *h264.Decoder, nal: [*]const u8, length: usize) -> Status {
@@ -3122,6 +3236,10 @@ fn decodeSlice(cpu: *Cpu, h: *h264.Decoder, nal: [*]const u8, length: usize) -> 
     const lists = buildLists(cpu, h)
     if lists != Status.ok { return lists }
     prepareRefs(cpu, h)
+    return decodeSliceData(cpu)
+}
+
+fn decodeSliceData(cpu: *Cpu) -> Status {
     if cpu.*.pps.*.std.flags.bits0 & video.StdVideoH264PpsFlags_entropy_coding_mode_flag != 0 {
         return decodeSliceCabac(cpu, cpu.*.header.qp)
     }
@@ -3133,7 +3251,8 @@ fn decodeSlice(cpu: *Cpu, h: *h264.Decoder, nal: [*]const u8, length: usize) -> 
 // of the first reference picture where there is one, else grey; intra
 // for later pictures' direct prediction, left out by the deblocking
 // filter.
-fn concealMissing(cpu: *Cpu) -> void {
+fn concealMissing(cpu: *Cpu) -> bool {
+    var any = false
     var source: ?*Frame = null
     if cpu.*.refCount[0] > 0 && cpu.*.refs[0][0] < h264.SLOTS && cpu.*.refs[0][0] != cpu.*.slot {
         const frame = &cpu.*.frames[cpu.*.refs[0][0]]
@@ -3149,6 +3268,7 @@ fn concealMissing(cpu: *Cpu) -> void {
             addr += 1
             continue
         }
+        any = true
         unsafe { zero(@ptrCast([*]u8, mb), @sizeOf(Mb)) }
         mb.*.intra = true
         mb.*.kind = MB_I_16X16
@@ -3183,16 +3303,18 @@ fn concealMissing(cpu: *Cpu) -> void {
         }
         addr += 1
     }
+    return any
 }
 
 
 // The picture's motion per 4x4 block, kept with its frame for later B
 // pictures' direct prediction.
-fn storeMotion(cpu: *Cpu) -> void {
+fn storeMotionRows(cpu: *Cpu, firstRow: u32, endRow: u32) -> void {
     const frame = cpu.*.frame
     const widthBlocks = @intCast(usize, cpu.*.widthMbs) * 4
-    var addr: usize = 0
-    while addr < cpu.*.mbCount {
+    var addr = @intCast(usize, firstRow * cpu.*.widthMbs)
+    const end = @intCast(usize, endRow * cpu.*.widthMbs)
+    while addr < end {
         const mb = mbAt(cpu, addr)
         const mbx = addr % @intCast(usize, cpu.*.widthMbs)
         const mby = addr / @intCast(usize, cpu.*.widthMbs)
@@ -3348,15 +3470,16 @@ fn filterSamples(plane: [*]u8, base: usize, step: usize, bS: i32, alpha: i32, be
     }
 }
 
-fn deblockPicture(cpu: *Cpu) -> void {
+fn deblockRows(cpu: *Cpu, firstRow: u32, endRow: u32) -> void {
     const widthMbs = @intCast(usize, cpu.*.widthMbs)
     const width = @intCast(usize, cpu.*.width)
     const cw = width / 2
     const frame = cpu.*.frame
     const cbOffset = @intCast(i32, cpu.*.pps.*.std.chroma_qp_index_offset)
     const crOffset = @intCast(i32, cpu.*.pps.*.std.second_chroma_qp_index_offset)
-    var addr: usize = 0
-    while addr < cpu.*.mbCount {
+    var addr = @intCast(usize, firstRow * cpu.*.widthMbs)
+    const end = @intCast(usize, endRow * cpu.*.widthMbs)
+    while addr < end {
         const q = mbAt(cpu, addr)
         if q.*.slice == 0 || q.*.dbIdc == 1 {
             addr += 1
@@ -4320,6 +4443,7 @@ fn decodeSliceCabac(cpu: *Cpu, qpIn: i32) -> Status {
             if status != Status.ok { return status }
         }
         finishMb(cpu, mb, &p)
+        if cpu.*.mbX + 1 == cpu.*.widthMbs { rowDone(cpu, cpu.*.mbY) }
         addr += 1
         if terminate(cpu) == 1 { break }
         if cpu.*.bits.failed { return Status.corrupt }
@@ -4416,6 +4540,7 @@ fn colocated(cpu: *Cpu, raster: usize) -> Colocated {
     if cpu.*.refCount[1] == 0 || slot >= h264.SLOTS { return col }
     const frame = &cpu.*.frames[slot]
     if !frame.*.allocated { return col }
+    awaitCounter(&frame.*.motionRows, &frame.*.writing, cpu.*.mbY + 1)
     var x = raster & 3
     var y = raster >> 2
     if direct8x8(cpu) {
@@ -4811,4 +4936,478 @@ fn parseInterB(cpu: *Cpu, mb: *Mb, p: *Parsed, mbType: u32, cabac: bool) -> Stat
         k += 1
     }
     return Status.ok
+}
+
+// ---- Decoding on threads (a Pool) ----
+//
+// A Pool decodes several pictures at once, each on a worker thread of its
+// own (frame threading): submit() takes the picture std.h264 started, as
+// decodePicture does, but reads its slice headers and builds its
+// reference lists on the caller's thread (std.h264's state is the
+// caller's) and hands the slice data to a worker; a worker's motion
+// compensation waits for the rows of a reference picture still being
+// decoded that it reads, and direct prediction for the colocated rows'
+// motion. A slot's frame is written again only when the pictures reading
+// it and its last decode are done; awaitSlot() waits for a slot's
+// picture before it is read. Workers allocate nothing (the caller's
+// thread sizes everything), and they block every signal.
+
+pub const MAX_THREADS: usize = 16
+// Pictures in flight at most.
+const JOBS: usize = 18
+const STACK_SIZE: usize = 1048576
+
+// What a worker needs of a slice: its header, the reference lists and
+// what derives from them, its PPS, and its RBSP (after the header).
+const SliceJob = struct {
+    header: Header
+    refs: [2][MAX_REFS]usize
+    refCount: [2]u32
+    refIsLong: [2][MAX_REFS]bool
+    implicitWeights: [MAX_REFS][MAX_REFS]i32
+    pps: h264.Pps
+    offset: usize
+    length: usize
+    at: usize
+    stop: usize
+}
+
+const Job = struct {
+    // 1 when no worker has it (finished or never given).
+    done: u32
+    slot: usize
+    poc: i32
+    sps: h264.Sps
+    slices: [*]SliceJob
+    sliceCount: usize
+    sliceCapacity: usize
+    // The slices' RBSPs, each with 16 zero bytes after it.
+    bytes: [*]u8
+    used: usize
+    byteCapacity: usize
+    // The slots the picture reads (a bit each).
+    readers: u32
+    status: Status
+}
+
+const Seat = struct {
+    // The Pool's address (a *Pool field here gave mlx4 a layout of Pool
+    // without its seats where Seat's was resolved first).
+    pool: usize
+    cpu: *Cpu
+    stack: usize
+    // The thread's id, zeroed by the kernel when it ends.
+    tid: u32
+}
+
+pub const Pool = struct {
+    allocator: Allocator
+    // Reads the slice headers on the caller's thread; owns the frames.
+    root: *Cpu
+    threads: usize
+    seats: [MAX_THREADS]Seat
+    // Decodes on the caller's thread when there are no threads.
+    inline_: *Cpu
+    jobs: [*]Job
+    // Pictures submitted and taken by workers; `signal` counts changes
+    // the workers wait on, `quit` ends them.
+    submitted: u32
+    taken: u32
+    signal: u32
+    quit: u32
+    // Pictures std.h264 gave out, held (h.holdOutputs) until decoded:
+    // slots and POCs, oldest first; the slot nextReady() gave last,
+    // released at the next call (h264.SLOTS: none).
+    outputSlots: [h264.SLOTS]usize
+    outputPocs: [h264.SLOTS]i32
+    outputCount: usize
+    given: usize
+}
+
+// A pool of `threads` workers (0: every picture decoded in submit(), on
+// the caller's thread); null without memory.
+pub fn createPool(allocator: Allocator, threads: usize) -> ?*Pool {
+    const memory = allocator.alloc(@sizeOf(Pool), 16)
+    if memory == null { return null }
+    var pool: *Pool = undefined
+    unsafe { pool = @ptrCast(*Pool, memory.?) }
+    unsafe { zero(@ptrCast([*]u8, pool), @sizeOf(Pool)) }
+    pool.*.allocator = allocator
+    const root = create(allocator)
+    if root == null {
+        allocator.free(memory.?, @sizeOf(Pool), 16)
+        return null
+    }
+    pool.*.root = root.?
+    const jobs = allocator.alloc(JOBS * @sizeOf(Job), 16)
+    const helper = createSharing(allocator, root.?.*.frames)
+    if jobs == null || helper == null {
+        destroy(root.?)
+        allocator.free(memory.?, @sizeOf(Pool), 16)
+        return null
+    }
+    zero(jobs.?, JOBS * @sizeOf(Job))
+    unsafe { pool.*.jobs = @ptrCast([*]Job, jobs.?) }
+    var k: usize = 0
+    while k < JOBS {
+        pool.*.jobs[k].done = 1
+        k += 1
+    }
+    pool.*.inline_ = helper.?
+    pool.*.given = h264.SLOTS
+    const wanted = if threads > MAX_THREADS { MAX_THREADS } else { threads }
+    while pool.*.threads < wanted {
+        if !startWorker(pool, pool.*.threads) { break }
+        pool.*.threads += 1
+    }
+    return pool
+}
+
+fn startWorker(pool: *Pool, index: usize) -> bool {
+    const seat = &pool.*.seats[index]
+    const cpu = createSharing(pool.*.allocator, pool.*.root.*.frames)
+    if cpu == null { return false }
+    const stack = pool.*.allocator.alloc(STACK_SIZE, 4096)
+    if stack == null {
+        destroy(cpu.?)
+        return false
+    }
+    cpu.?.*.threaded = true
+    seat.*.pool = @intFromPtr(pool)
+    seat.*.cpu = cpu.?
+    seat.*.stack = @intFromPtr(stack.?)
+    seat.*.tid = 0
+    const flags = thread.THREAD_CLONE_FLAGS | thread.CLONE_CHILD_SETTID | thread.CLONE_CHILD_CLEARTID
+    const started = @spawnThread(flags, seat.*.stack + STACK_SIZE, 0, @intFromPtr(&seat.*.tid), 0, mlx_h264_decode_worker, @intFromPtr(seat))
+    if started <= 0 {
+        pool.*.allocator.free(stack.?, STACK_SIZE, 4096)
+        destroy(cpu.?)
+        return false
+    }
+    return true
+}
+
+// A worker thread. An export, so that in a plugin (the port's
+// libmlxwebport.so) the thread gets an aggregate arena of its own for its
+// life: a plugin's export maps one per call, and the caller's, which the
+// thread inherits in r14/r15, is unmapped when the export that started it
+// returns.
+export fn mlx_h264_decode_worker(argument: usize) -> usize {
+    var seat: *Seat = unsafe { @ptrFromInt(*Seat, argument) }
+    // Signals are the process's other threads' to take, but a fault's
+    // own (SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV), which the
+    // crash report takes here (blocked, the kernel would end the process
+    // without one).
+    var others: u64 = 18446744073709551615 & ~@intCast(u64, 0x4f8)
+    _ = thread.syscall4(linux.SYS_rt_sigprocmask, 0, @intFromPtr(&others), 0, 8)
+    var pool: *Pool = unsafe { @ptrFromInt(*Pool, seat.*.pool) }
+    while true {
+        const signal = @atomicLoad(u32, &pool.*.signal, acquire)
+        if @atomicLoad(u32, &pool.*.quit, acquire) != 0 { return 0 }
+        const taken = @atomicLoad(u32, &pool.*.taken, acquire)
+        if taken != @atomicLoad(u32, &pool.*.submitted, acquire) {
+            const swapped = @cmpxchgWeak(u32, &pool.*.taken, taken, taken +% 1, acq_rel, acquire)
+            if swapped.0 { runJob(seat.*.cpu, &pool.*.jobs[@intCast(usize, taken) % JOBS]) }
+            continue
+        }
+        _ = thread.futexWait(&pool.*.signal, signal, 0, true)
+    }
+    return 0
+}
+
+fn awaitZero(word: *u32) -> void {
+    while true {
+        const value = @atomicLoad(u32, word, acquire)
+        if value == 0 { return }
+        _ = thread.futexWait(word, value, 0, true)
+    }
+}
+
+fn awaitJob(job: *Job) -> void {
+    while @atomicLoad(u32, &job.*.done, acquire) == 0 { _ = thread.futexWait(&job.*.done, 0, 0, true) }
+}
+
+// Waits until every picture submitted is decoded.
+pub fn drain(pool: *Pool) -> void {
+    var k: usize = 0
+    while k < JOBS {
+        awaitJob(&pool.*.jobs[k])
+        k += 1
+    }
+}
+
+// Waits until the picture in `slot` is decoded (before reading it).
+pub fn awaitSlot(pool: *Pool, slot: usize) -> void {
+    if slot >= h264.SLOTS { return }
+    awaitZero(&pool.*.root.*.frames[slot].writing)
+}
+
+pub fn poolPlanes(pool: *Pool, slot: usize) -> Planes { return planes(pool.*.root, slot) }
+
+pub fn destroyPool(pool: *Pool) -> void {
+    drain(pool)
+    @atomicStore(u32, &pool.*.quit, 1, release)
+    _ = @atomicRmw(u32, &pool.*.signal, add, 1, acq_rel)
+    _ = thread.futexWake(&pool.*.signal, 2147483647, true)
+    const a = pool.*.allocator
+    var k: usize = 0
+    while k < pool.*.threads {
+        const seat = &pool.*.seats[k]
+        // The kernel zeroes the id and wakes it (a shared futex) when the
+        // thread has ended; its stack is free then.
+        while true {
+            const tid = @atomicLoad(u32, &seat.*.tid, acquire)
+            if tid == 0 { break }
+            _ = thread.futexWait(&seat.*.tid, tid, 0, false)
+        }
+        var stack: [*]u8 = undefined
+        unsafe { stack = @ptrFromInt([*]u8, seat.*.stack) }
+        a.free(stack, STACK_SIZE, 4096)
+        destroy(seat.*.cpu)
+        k += 1
+    }
+    k = 0
+    while k < JOBS {
+        const job = &pool.*.jobs[k]
+        if job.*.sliceCapacity != 0 {
+            unsafe { a.free(@ptrCast([*]u8, job.*.slices), job.*.sliceCapacity * @sizeOf(SliceJob), 16) }
+        }
+        if job.*.byteCapacity != 0 { a.free(job.*.bytes, job.*.byteCapacity, 16) }
+        k += 1
+    }
+    unsafe { a.free(@ptrCast([*]u8, pool.*.jobs), JOBS * @sizeOf(Job), 16) }
+    destroy(pool.*.inline_)
+    destroy(pool.*.root)
+    unsafe { a.free(@ptrCast([*]u8, pool), @sizeOf(Pool), 16) }
+}
+
+// Room in a job for `slices` slices and `bytes` bytes: false without
+// memory.
+fn reserveJob(pool: *Pool, job: *Job, slices: usize, bytes: usize) -> bool {
+    const a = pool.*.allocator
+    if slices > job.*.sliceCapacity {
+        var capacity: usize = 4
+        while capacity < slices { capacity *= 2 }
+        const memory = a.alloc(capacity * @sizeOf(SliceJob), 16)
+        if memory == null { return false }
+        if job.*.sliceCapacity != 0 {
+            unsafe {
+                copyBytes(memory.?, @ptrCast([*]const u8, job.*.slices), job.*.sliceCount * @sizeOf(SliceJob))
+                a.free(@ptrCast([*]u8, job.*.slices), job.*.sliceCapacity * @sizeOf(SliceJob), 16)
+            }
+        }
+        unsafe { job.*.slices = @ptrCast([*]SliceJob, memory.?) }
+        job.*.sliceCapacity = capacity
+    }
+    if bytes > job.*.byteCapacity {
+        var capacity: usize = 65536
+        while capacity < bytes { capacity *= 2 }
+        const memory = a.alloc(capacity, 16)
+        if memory == null { return false }
+        if job.*.byteCapacity != 0 {
+            copyBytes(memory.?, job.*.bytes, job.*.used)
+            a.free(job.*.bytes, job.*.byteCapacity, 16)
+        }
+        job.*.bytes = memory.?
+        job.*.byteCapacity = capacity
+    }
+    return true
+}
+
+// Starts decoding the picture std.h264 started (h.picture) from the
+// access unit's bytes (decodePicture's arguments): its slices' headers
+// read and reference lists built now, the rest on a worker (or now,
+// without threads). The bytes may be reused when it returns.
+pub fn submit(pool: *Pool, h: *h264.Decoder, bytes: [*]const u8) -> Status {
+    const root = pool.*.root
+    const picture = &h.*.picture
+    const slot = picture.*.slot
+    if slot >= h264.SLOTS { return Status.corrupt }
+    const sps = h264.spsAt(h, @intCast(usize, picture.*.spsId))
+    // A new size: what is in flight first (the frames are made again).
+    if sps.*.widthInMbs != root.*.widthMbs || sps.*.heightInMbs != root.*.heightMbs { drain(pool) }
+    if !prepare(root, sps) || !prepare(pool.*.inline_, sps) { return Status.noMemory }
+    var k: usize = 0
+    while k < pool.*.threads {
+        if !prepare(pool.*.seats[k].cpu, sps) { return Status.noMemory }
+        k += 1
+    }
+    if !ensureFrame(root, slot) { return Status.noMemory }
+    const sequence = pool.*.submitted
+    const job = &pool.*.jobs[@intCast(usize, sequence) % JOBS]
+    awaitJob(job)
+    // The slot's last decode and the pictures reading it as a reference.
+    const frame = &root.*.frames[slot]
+    awaitZero(&frame.*.writing)
+    awaitZero(&frame.*.readers)
+    frame.*.id = root.*.nextId
+    frame.*.poc = picture.*.poc
+    root.*.nextId += 1
+    root.*.slot = slot
+    root.*.frame = frame
+    root.*.poc = picture.*.poc
+    unsafe { copyBytes(@ptrCast([*]u8, &job.*.sps), @ptrCast([*]const u8, sps), @sizeOf(h264.Sps)) }
+    job.*.slot = slot
+    job.*.poc = picture.*.poc
+    job.*.sliceCount = 0
+    job.*.used = 0
+    job.*.readers = 0
+    job.*.status = Status.ok
+    var index: usize = 0
+    while index < picture.*.sliceCount {
+        const offset = @intCast(usize, picture.*.sliceOffsets[index])
+        const length = @intCast(usize, picture.*.sliceLengths[index])
+        index += 1
+        if length < 2 { continue }
+        const nal: [*]const u8 = &bytes[offset]
+        if !bits_module.load(&root.*.bits, nal, length) { return Status.noMemory }
+        const status = parseHeader(root, h, nal[0] & 31, (nal[0] >> 5) & 3)
+        if status != Status.ok || root.*.header.firstMb >= root.*.widthMbs * root.*.heightMbs {
+            job.*.status = Status.corrupt
+            continue
+        }
+        if buildLists(root, h) != Status.ok {
+            job.*.status = Status.corrupt
+            continue
+        }
+        prepareRefs(root, h)
+        const rbsp = root.*.bits.length + 16
+        if !reserveJob(pool, job, job.*.sliceCount + 1, job.*.used + rbsp) { return Status.noMemory }
+        const slice = &job.*.slices[job.*.sliceCount]
+        unsafe {
+            copyBytes(@ptrCast([*]u8, &slice.*.header), @ptrCast([*]const u8, &root.*.header), @sizeOf(Header))
+            copyBytes(@ptrCast([*]u8, &slice.*.refs), @ptrCast([*]const u8, &root.*.refs), @sizeOf([2][MAX_REFS]usize))
+            copyBytes(@ptrCast([*]u8, &slice.*.refIsLong), @ptrCast([*]const u8, &root.*.refIsLong), @sizeOf([2][MAX_REFS]bool))
+            copyBytes(@ptrCast([*]u8, &slice.*.implicitWeights), @ptrCast([*]const u8, &root.*.implicitWeights), @sizeOf([MAX_REFS][MAX_REFS]i32))
+            copyBytes(@ptrCast([*]u8, &slice.*.pps), @ptrCast([*]const u8, root.*.pps), @sizeOf(h264.Pps))
+        }
+        slice.*.refCount[0] = root.*.refCount[0]
+        slice.*.refCount[1] = root.*.refCount[1]
+        slice.*.offset = job.*.used
+        slice.*.length = root.*.bits.length
+        slice.*.at = root.*.bits.at
+        slice.*.stop = root.*.bits.stop
+        copyBytes(&job.*.bytes[job.*.used], root.*.bits.bytes, rbsp)
+        job.*.used += (rbsp + 15) & ~@intCast(usize, 15)
+        var list: usize = 0
+        while list < 2 {
+            var i: usize = 0
+            while i < @intCast(usize, root.*.refCount[list]) && i < MAX_REFS {
+                const reference = root.*.refs[list][i]
+                if reference < h264.SLOTS && reference != slot { job.*.readers |= @intCast(u32, 1) << @intCast(u5, reference) }
+                i += 1
+            }
+            list += 1
+        }
+        job.*.sliceCount += 1
+    }
+    var reference: usize = 0
+    while reference < h264.SLOTS {
+        if job.*.readers & (@intCast(u32, 1) << @intCast(u5, reference)) != 0 { _ = @atomicRmw(u32, &root.*.frames[reference].readers, add, 1, acq_rel) }
+        reference += 1
+    }
+    frame.*.progress = 0
+    frame.*.motionRows = 0
+    @atomicStore(u32, &frame.*.writing, 1, release)
+    @atomicStore(u32, &job.*.done, 0, release)
+    if pool.*.threads == 0 {
+        runJob(pool.*.inline_, job)
+        return job.*.status
+    }
+    @atomicStore(u32, &pool.*.submitted, sequence +% 1, release)
+    _ = @atomicRmw(u32, &pool.*.signal, add, 1, acq_rel)
+    _ = thread.futexWake(&pool.*.signal, 1, true)
+    return Status.ok
+}
+
+// Decodes a job's picture on `cpu`, then lets go of the slots it read
+// and of its own.
+fn runJob(cpu: *Cpu, job: *Job) -> void {
+    startPicture(cpu, job.*.slot, job.*.poc)
+    cpu.*.sps = &job.*.sps
+    var index: usize = 0
+    while index < job.*.sliceCount {
+        const slice = &job.*.slices[index]
+        index += 1
+        unsafe {
+            copyBytes(@ptrCast([*]u8, &cpu.*.header), @ptrCast([*]const u8, &slice.*.header), @sizeOf(Header))
+            copyBytes(@ptrCast([*]u8, &cpu.*.refs), @ptrCast([*]const u8, &slice.*.refs), @sizeOf([2][MAX_REFS]usize))
+            copyBytes(@ptrCast([*]u8, &cpu.*.refIsLong), @ptrCast([*]const u8, &slice.*.refIsLong), @sizeOf([2][MAX_REFS]bool))
+            copyBytes(@ptrCast([*]u8, &cpu.*.implicitWeights), @ptrCast([*]const u8, &slice.*.implicitWeights), @sizeOf([MAX_REFS][MAX_REFS]i32))
+        }
+        cpu.*.refCount[0] = slice.*.refCount[0]
+        cpu.*.refCount[1] = slice.*.refCount[1]
+        cpu.*.pps = &slice.*.pps
+        // The RBSP is the job's (the worker's reader owns no bytes).
+        cpu.*.bits.bytes = &job.*.bytes[slice.*.offset]
+        cpu.*.bits.capacity = 0
+        cpu.*.bits.length = slice.*.length
+        cpu.*.bits.at = slice.*.at
+        cpu.*.bits.stop = slice.*.stop
+        cpu.*.bits.failed = false
+        cpu.*.sliceNum += 1
+        prepareScaling(cpu)
+        const status = decodeSliceData(cpu)
+        if status != Status.ok { job.*.status = status }
+    }
+    endPicture(cpu)
+    const frames = cpu.*.frames
+    var reference: usize = 0
+    while reference < h264.SLOTS {
+        if job.*.readers & (@intCast(u32, 1) << @intCast(u5, reference)) != 0 {
+            _ = @atomicRmw(u32, &frames[reference].readers, sub, 1, acq_rel)
+            _ = thread.futexWake(&frames[reference].readers, 2147483647, true)
+        }
+        reference += 1
+    }
+    const frame = &frames[job.*.slot]
+    @atomicStore(u32, &frame.*.writing, 0, release)
+    _ = thread.futexWake(&frame.*.writing, 2147483647, true)
+    _ = thread.futexWake(&frame.*.progress, 2147483647, true)
+    _ = thread.futexWake(&frame.*.motionRows, 2147483647, true)
+    @atomicStore(u32, &job.*.done, 1, release)
+    _ = thread.futexWake(&job.*.done, 2147483647, true)
+}
+
+// The next picture to present (std.h264.nextOutput's, with the
+// pool's decoding behind it): pictures given out by std.h264 wait in the
+// pool, their slots held, until decoded, so that the caller goes on
+// submitting meanwhile; true with its slot and POC once the oldest is
+// decoded, or (waiting for it) when as many wait as the slots allow or
+// the stream is being flushed. The slot is the caller's until the next
+// call.
+pub fn nextReady(pool: *Pool, h: *h264.Decoder, slot: *usize, poc: *i32) -> bool {
+    if pool.*.given < h264.SLOTS {
+        h264.releaseSlot(h, pool.*.given)
+        pool.*.given = h264.SLOTS
+    }
+    h.*.holdOutputs = true
+    var outSlot: usize = 0
+    var outPoc: i32 = 0
+    while pool.*.outputCount < h264.SLOTS && h264.nextOutput(h, &outSlot, &outPoc) {
+        pool.*.outputSlots[pool.*.outputCount] = outSlot
+        pool.*.outputPocs[pool.*.outputCount] = outPoc
+        pool.*.outputCount += 1
+    }
+    if pool.*.outputCount == 0 { return false }
+    // Slots std.h264 leaves for held pictures: SLOTS less its DPB and the
+    // picture being started.
+    var room: usize = 0
+    if h264.SLOTS > @intCast(usize, h.*.dpbFrames) + 2 { room = h264.SLOTS - @intCast(usize, h.*.dpbFrames) - 2 }
+    if room > pool.*.threads + 1 { room = pool.*.threads + 1 }
+    const first = pool.*.outputSlots[0]
+    const decoded = @atomicLoad(u32, &pool.*.root.*.frames[first].writing, acquire) == 0
+    if !decoded && pool.*.outputCount <= room && !h.*.flushing { return false }
+    awaitSlot(pool, first)
+    slot.* = first
+    poc.* = pool.*.outputPocs[0]
+    var k: usize = 1
+    while k < pool.*.outputCount {
+        pool.*.outputSlots[k - 1] = pool.*.outputSlots[k]
+        pool.*.outputPocs[k - 1] = pool.*.outputPocs[k]
+        k += 1
+    }
+    pool.*.outputCount -= 1
+    pool.*.given = first
+    return true
 }

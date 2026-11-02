@@ -754,7 +754,7 @@ void MediaPlayerPrivateMlx::resetDecoders()
         mlxweb_media_h264_flush(m_h264);
         uint32_t slot = 0;
         int32_t poc = 0;
-        while (mlxweb_media_h264_next_output(m_h264, &slot, &poc)) { }
+        while (mlxweb_video_next_output(m_videoDecoder, m_h264, &slot, &poc)) { }
     }
 }
 
@@ -1028,6 +1028,9 @@ void MediaPlayerPrivateMlx::videoLoop()
         }
         if (!nextVideoSample(bytes, presentationTime)) {
             if (m_videoEnded) {
+                // The pictures still held for reordering (and, on the CPU's
+                // decoder, being decoded) come out at the end.
+                presentVideoTail();
                 callOnMainThread([weakThis = WeakPtr { *this }] {
                     if (RefPtr protectedThis = weakThis.get())
                         protectedThis->checkEnded();
@@ -1081,9 +1084,27 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
     }
     bool decoded = m_videoDecoder && mlxweb_video_decode(m_videoDecoder, m_h264, bytes.span().data()) == MLXWEB_MEDIA_OK;
     mlxweb_media_h264_finish_picture(m_h264);
+    presentDueFrames(decoded, presentationTime);
+}
+
+// At the end of the samples: every picture left in the decoded picture
+// buffer flushed out and shown at its time.
+void MediaPlayerPrivateMlx::presentVideoTail()
+{
+    Locker locker { m_decoderLock };
+    if (!m_h264)
+        return;
+    mlxweb_media_h264_flush(m_h264);
+    presentDueFrames(!!m_videoDecoder, MediaTime::zeroTime());
+}
+
+// The pictures next_output gives: each shown at its time (the sample's,
+// by its slot), or dropped when late.
+void MediaPlayerPrivateMlx::presentDueFrames(bool decoded, const MediaTime& presentationTime)
+{
     uint32_t slot = 0;
     int32_t poc = 0;
-    while (mlxweb_media_h264_next_output(m_h264, &slot, &poc)) {
+    while (mlxweb_video_next_output(m_videoDecoder, m_h264, &slot, &poc)) {
         MediaTime due = slot < std::size(m_slotTimes) ? m_slotTimes[slot] : presentationTime;
         if (due + MediaTime(1, 2) < clockTime()) {
             ++m_droppedFrames;
