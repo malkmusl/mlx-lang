@@ -1042,9 +1042,10 @@ void MediaPlayerPrivateMlx::videoLoop()
 }
 
 // The access unit through the H.264 picture order: its picture in the
-// decoded picture buffer, decoded by the GPU (std.gpu.video), then the
-// pictures due for output read back and shown at their time. Without a
-// decoding device the frames are counted and the layer stays as it is.
+// decoded picture buffer, decoded by the GPU (std.gpu.video) or the CPU
+// (std.h264.decode), then the pictures due for output read back and
+// shown at their time. Without a decoder the frames are counted and the
+// layer stays black.
 void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, const MediaTime& presentationTime)
 {
     Locker locker { m_decoderLock };
@@ -1072,7 +1073,7 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
     if (!m_videoDecoderTried) {
         m_videoDecoderTried = true;
         m_videoDecoder = mlxweb_video_open();
-        MEDIA_TRACE("video decoder %s", m_videoDecoder ? "opened (the GPU's)" : "none: no device decodes H.264, the video is black");
+        MEDIA_TRACE("video decoder %s", !m_videoDecoder ? "none (MLX_VIDEO_DECODER rules every one out), the video is black" : mlxweb_video_kind(m_videoDecoder) == 1 ? "opened (the GPU's)" : "opened (the CPU's: no device decodes H.264, or MLX_VIDEO_DECODER=cpu)");
         // No decoding device: the video's box black (as a player shows a
         // video it cannot decode), not left empty.
         if (!m_videoDecoder)

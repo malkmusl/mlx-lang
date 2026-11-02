@@ -2,7 +2,8 @@
 // MP4 files and MSE segments read by std.mp4, AAC decoded by std.aac,
 // H.264 access units kept in order by std.h264 (parameter sets, picture
 // order, the decoded picture buffer), the pictures decoded by the GPU's
-// video decoder through std.gpu.video (Vulkan video), and sound played
+// video decoder through std.gpu.video (Vulkan video) or, without one, on
+// the CPU by std.h264.decode, and sound played
 // through std.audio (MLX Audio). Every object lives on the C library's
 // heap; a handle is its address.
 const std = @import("std")
@@ -12,6 +13,8 @@ const h264 = @import("std.h264")
 const audio = @import("std.audio")
 const gpu = @import("std.gpu")
 const gvideo = @import("std.gpu.video")
+const hdecode = @import("std.h264.decode")
+const vkvideo = @import("std.vulkan.video")
 const loader = @import("std.vulkan.loader")
 const environment_module = @import("./environment.mlx")
 extern("c") fn malloc(size: usize) -> usize
@@ -362,69 +365,119 @@ pub fn h264Flush(address: usize) -> void {
     h264.flush(h264At(address))
 }
 
-// ---- The GPU's video decoder ----
+// ---- The video decoder: the GPU's, or the CPU's ----
+
+const KIND_GPU: u32 = 1
+const KIND_CPU: u32 = 2
 
 const VideoDecoder = struct {
+    kind: u32
     driver: loader.Driver
     context: gpu.Context
     decoder: *gvideo.Decoder
     // The process's environment, for the loader (VK_DRIVER_FILES, the
     // XDG directories).
     environment: environment_module.Vector
+    // The CPU's decoder (std.h264.decode) and what its frames are read
+    // with: the visible part of the picture and the colour conversion.
+    cpu: *hdecode.Cpu
+    width: u32
+    height: u32
+    cropX: u32
+    cropY: u32
+    matrix: u32
+    fullRange: bool
+    conversion: gvideo.Conversion
 }
 
 fn videoAt(address: usize) -> *VideoDecoder { return unsafe { @ptrFromInt(*VideoDecoder, address) } }
 
-// Opens the GPU's H.264 decoder (the first Vulkan driver whose device
-// has one): a handle, 0 without such a device. RADV offers UVD's decoder
-// (the RX 580's generation) only when asked, as experimental: it is
-// asked here (RADV_EXPERIMENTAL=video_decode, RADV_PERFTEST=video_decode
-// before Mesa 26) unless the environment sets those variables itself;
-// VCN's decoder and other drivers' ignore them.
+// Opens a video decoder: a handle, 0 without one. MLX_VIDEO_DECODER
+// chooses: "gpu" the GPU's only, "cpu" the CPU's only; otherwise the
+// GPU's when a device decodes H.264, else the CPU's.
 pub fn videoOpen() -> usize {
-    _ = setenv("RADV_EXPERIMENTAL\x00".pointer, "video_decode\x00".pointer, 0)
-    _ = setenv("RADV_PERFTEST\x00".pointer, "video_decode\x00".pointer, 0)
     const address = malloc(@sizeOf(VideoDecoder))
     if address == 0 { return 0 }
     const v = videoAt(address)
-    if !environment_module.read(&v.*.environment) {
-        free(address)
-        return 0
+    v.*.kind = 0
+    v.*.width = 0
+    v.*.height = 0
+    v.*.matrix = 0
+    v.*.fullRange = false
+    const choice = getenv("MLX_VIDEO_DECODER\x00".pointer)
+    var wantGpu = true
+    var wantCpu = true
+    if choice != 0 {
+        const text: [*]const u8 = unsafe { @ptrFromInt([*]const u8, choice) }
+        if text[0] == 99 && text[1] == 112 && text[2] == 117 && text[3] == 0 { wantGpu = false }
+        if text[0] == 103 && text[1] == 112 && text[2] == 117 && text[3] == 0 { wantCpu = false }
     }
+    if wantGpu && openGpu(v) {
+        v.*.kind = KIND_GPU
+        return address
+    }
+    if wantCpu {
+        const cpu = hdecode.create(allocator())
+        if cpu != null {
+            v.*.cpu = cpu.?
+            v.*.kind = KIND_CPU
+            return address
+        }
+    }
+    free(address)
+    return 0
+}
+
+// The GPU's H.264 decoder (the first Vulkan driver whose device has
+// one). RADV offers UVD's decoder (the RX 580's generation) only when
+// asked, as experimental: it is asked here (RADV_EXPERIMENTAL=
+// video_decode, RADV_PERFTEST=video_decode before Mesa 26) unless the
+// environment sets those variables itself; VCN's decoder and other
+// drivers' ignore them.
+fn openGpu(v: *VideoDecoder) -> bool {
+    _ = setenv("RADV_EXPERIMENTAL\x00".pointer, "video_decode\x00".pointer, 0)
+    _ = setenv("RADV_PERFTEST\x00".pointer, "video_decode\x00".pointer, 0)
+    if !environment_module.read(&v.*.environment) { return false }
     if loader.openFirstDriver(&v.*.driver, environment_module.arguments(&v.*.environment), allocator()) != loader.Status.ok {
-        videoFree(v, address)
-        return 0
+        environment_module.release(&v.*.environment)
+        return false
     }
     var options = gpu.defaultOptions("Voyager\x00".pointer)
     options.wantVideo = true
     if gpu.open(&v.*.context, v.*.driver, &options, allocator()) != gpu.Status.ok {
         loader.closeDriver(&v.*.driver)
-        videoFree(v, address)
-        return 0
+        environment_module.release(&v.*.environment)
+        return false
     }
     const decoder = gvideo.create(&v.*.context, allocator())
     if decoder == null {
         gpu.close(&v.*.context)
         loader.closeDriver(&v.*.driver)
-        videoFree(v, address)
-        return 0
+        environment_module.release(&v.*.environment)
+        return false
     }
     v.*.decoder = decoder.?
-    return address
-}
-
-fn videoFree(v: *VideoDecoder, address: usize) -> void {
-    environment_module.release(&v.*.environment)
-    free(address)
+    return true
 }
 
 pub fn videoClose(address: usize) -> void {
     if address == 0 { return }
     const v = videoAt(address)
-    gvideo.destroy(v.*.decoder)
-    gpu.close(&v.*.context)
-    loader.closeDriver(&v.*.driver)
-    videoFree(v, address)
+    if v.*.kind == KIND_GPU {
+        gvideo.destroy(v.*.decoder)
+        gpu.close(&v.*.context)
+        loader.closeDriver(&v.*.driver)
+        environment_module.release(&v.*.environment)
+    } else if v.*.kind == KIND_CPU {
+        hdecode.destroy(v.*.cpu)
+    }
+    free(address)
+}
+
+// Which decoder a handle is: 1 the GPU's, 2 the CPU's (0 none).
+pub fn videoKind(address: usize) -> u32 {
+    if address == 0 { return 0 }
+    return videoAt(address).*.kind
 }
 
 fn videoStatus(status: gvideo.Status) -> u32 {
@@ -440,17 +493,64 @@ fn videoStatus(status: gvideo.Status) -> u32 {
 pub fn videoDecode(address: usize, h264Address: usize, bytes: usize) -> u32 {
     if address == 0 || h264Address == 0 || bytes == 0 { return CORRUPT }
     const data: [*]const u8 = unsafe { @ptrFromInt([*]const u8, bytes) }
-    return videoStatus(gvideo.decode(videoAt(address).*.decoder, h264At(h264Address), data))
+    const v = videoAt(address)
+    if v.*.kind == KIND_GPU { return videoStatus(gvideo.decode(v.*.decoder, h264At(h264Address), data)) }
+    const h = h264At(h264Address)
+    const status = hdecode.decodePicture(v.*.cpu, h, data)
+    cpuPictureFormat(v, h)
+    // A broken slice still leaves a picture (its macroblocks concealed).
+    if status == h264.Status.corrupt { return OK }
+    return h264Status(status)
+}
+
+// The visible size, crop and colour of the CPU's pictures from the SPS
+// of the picture just decoded.
+fn cpuPictureFormat(v: *VideoDecoder, h: *h264.Decoder) -> void {
+    const sps = h264.spsAt(h, @intCast(usize, h.*.picture.spsId))
+    var left: u32 = 0
+    var right: u32 = 0
+    var top: u32 = 0
+    var bottom: u32 = 0
+    if sps.*.std.flags.bits0 & vkvideo.StdVideoH264SpsFlags_frame_cropping_flag != 0 {
+        left = sps.*.std.frame_crop_left_offset * 2
+        right = sps.*.std.frame_crop_right_offset * 2
+        top = sps.*.std.frame_crop_top_offset * 2
+        bottom = sps.*.std.frame_crop_bottom_offset * 2
+    }
+    const codedWidth = sps.*.widthInMbs * 16
+    const codedHeight = sps.*.heightInMbs * 16
+    if left + right >= codedWidth || top + bottom >= codedHeight {
+        left = 0
+        right = 0
+        top = 0
+        bottom = 0
+    }
+    v.*.cropX = left
+    v.*.cropY = top
+    v.*.width = codedWidth - left - right
+    v.*.height = codedHeight - top - bottom
+    var matrix: u32 = 0
+    var fullRange = false
+    gvideo.streamColour(sps, &matrix, &fullRange)
+    if matrix != v.*.matrix || fullRange != v.*.fullRange {
+        v.*.matrix = matrix
+        v.*.fullRange = fullRange
+        gvideo.conversionFor(&v.*.conversion, matrix, fullRange)
+    }
 }
 
 pub fn videoWidth(address: usize) -> u32 {
     if address == 0 { return 0 }
-    return gvideo.width(videoAt(address).*.decoder)
+    const v = videoAt(address)
+    if v.*.kind == KIND_CPU { return v.*.width }
+    return gvideo.width(v.*.decoder)
 }
 
 pub fn videoHeight(address: usize) -> u32 {
     if address == 0 { return 0 }
-    return gvideo.height(videoAt(address).*.decoder)
+    const v = videoAt(address)
+    if v.*.kind == KIND_CPU { return v.*.height }
+    return gvideo.height(v.*.decoder)
 }
 
 // The frame in `slot` (one next_output gave) as BGRA rows `stride`
@@ -458,7 +558,19 @@ pub fn videoHeight(address: usize) -> u32 {
 pub fn videoReadFrame(address: usize, slot: u32, out: usize, stride: usize) -> u32 {
     if address == 0 || out == 0 { return 0 }
     const pixels: [*]u8 = unsafe { @ptrFromInt([*]u8, out) }
-    if !gvideo.readFrame(videoAt(address).*.decoder, @intCast(usize, slot), pixels, stride) { return 0 }
+    const v = videoAt(address)
+    if v.*.kind == KIND_CPU {
+        if @intCast(usize, slot) >= h264.SLOTS || v.*.width == 0 { return 0 }
+        const planes = hdecode.planes(v.*.cpu, @intCast(usize, slot))
+        if planes.width < v.*.cropX + v.*.width || planes.height < v.*.cropY + v.*.height { return 0 }
+        const lumaStride = @intCast(usize, planes.width)
+        const chromaStride = lumaStride / 2
+        const luma: [*]const u8 = &planes.y[@intCast(usize, v.*.cropY) * lumaStride + @intCast(usize, v.*.cropX)]
+        const chromaAt = @intCast(usize, v.*.cropY / 2) * chromaStride + @intCast(usize, v.*.cropX / 2)
+        gvideo.convertI420(&v.*.conversion, luma, lumaStride, &planes.cb[chromaAt], &planes.cr[chromaAt], chromaStride, @intCast(usize, v.*.width), @intCast(usize, v.*.height), pixels, stride)
+        return 1
+    }
+    if !gvideo.readFrame(v.*.decoder, @intCast(usize, slot), pixels, stride) { return 0 }
     return 1
 }
 

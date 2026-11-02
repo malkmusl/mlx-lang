@@ -1666,12 +1666,34 @@ kernel, read back and, at its presentation time (the sample's, by the
 slot it was decoded into; a seek drops the frame waiting), handed to
 the layer as a NativeImage (`CoordinatedPlatformLayerBufferNativeImage`),
 also kept for `paint`.
-Without a decoding device the video's box is black (a black frame of
-its size handed to the layer) and the frames are counted;
-`examples/vulkan-decode` decodes a file on the device alone.
+Without a decoding device the pictures are decoded on the CPU by
+std.h264.decode (below), into the same slots, converted to BGRA with the
+same matrix (std.gpu.video's `streamColour` and `convertI420`) and shown
+the same way; `MLX_VIDEO_DECODER=cpu` takes the CPU's even with a
+device, `MLX_VIDEO_DECODER=gpu` the GPU's only (without a device the
+video's box is then black: a black frame of its size handed to the
+layer, and the frames are counted). `examples/vulkan-decode` decodes a
+file on the device alone.
+
+std.h264.decode (std/src/h264/decode.mlx, with std/src/h264/bits.mlx and
+the tables of std/src/h264/tables.mlx) decodes the pictures std.h264
+starts, slice by slice: CAVLC and CABAC, I, P and B slices (every
+macroblock and sub-macroblock type, direct prediction spatial and
+temporal, B_Skip), intra 4x4, 8x8 and 16x16 prediction, the 4x4 and 8x8
+transforms with scaling matrices, weighted prediction explicit and
+implicit, the deblocking filter; Baseline, Main and High profile 4:2:0
+8-bit frames (field pictures and MBAFF are refused). It decodes the ITU's
+conformance streams of those profiles bit-exact (BA*, CABA*, CANL, CAPCM,
+CAQP, CAWP, CVWP, CVBS, CVSE, MIDR, MPS, MR1, NRF, SVA), and x264's High
+profile streams (8x8 transform, pyramid B, temporal direct, weighted
+P/B, slices) as ffmpeg does; tests/422_h264_cpu_decode_runtime.mlx
+checks test.mp4's output. A slice that cannot be decoded leaves its
+macroblocks concealed (the first reference's samples, or grey) and the
+picture's other slices decoded. It runs on one thread: 320x240 at about
+180 pictures a second, 1080p at about 7 (multithreading is next).
 `MLX_TRACE_MEDIA=1` traces the players on standard error ("media: ..."):
 the codecs a page asks about, loads, tracks, ready and network states,
-play, pause, seeks, the decoder opened or not, every 120th frame's
+play, pause, seeks, the decoder opened (the GPU's or the CPU's) or not, every 120th frame's
 counts and the end.
 tools/check_voyager.sh's scenario 26 plays WebKit's test.mp4 (6 s of
 H.264 with a silent AAC track) by itself in Voyager
@@ -1700,8 +1722,8 @@ frames a second, 9 DPB slots of 17, the colour conversion on the GPU.)
 then a page with a video (a file: URL of test.mp4, then YouTube): the
 top bar shows the player (title, artist and cover from YouTube's
 MediaSession), its buttons play, pause, skip and seek, Raise shows the
-tab. Without the extension the sound plays and the picture stays
-black (the software decoder is still to come).
+tab. Without the extension the CPU decodes the pictures
+(std.h264.decode, above).
 Seeking resets the decoders, the demuxer's cursors (to the sync sample
 before the time) and the clock; a media source's seek waits for its
 buffers (`waitForTarget`) and re-enqueues from the time.

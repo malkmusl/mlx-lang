@@ -844,8 +844,10 @@ fi
 # 26: a video playing by itself (media.html: WebKit's test.mp4 of 6 s,
 # H.264 with a silent AAC track, through the port's media engine; no
 # sound server here, so the clock runs by the wall, and no GPU decoder
-# on lavapipe, so the frames stay black): the page reports playing and
-# the end through its title and its background.
+# on lavapipe, so std.h264.decode decodes the pictures on the CPU): the
+# page reports playing and the end through its title and its
+# background, and the video's box shows its pictures (test.mp4 is
+# black with white text, a white disc and colour bars).
 write_runner "$work/voyager-media" media.html
 printf 'wait 5000\nshot %s\nwait 9000\nshot %s\nclose\n' "$work/media-playing.ppm" "$work/media-ended.ppm" > "$work/media.script"
 run_scenario media "$work/media.script" "$work/voyager-media"
@@ -860,7 +862,39 @@ ended_box=$(box_of "$work/media-ended.ppm" 0000c0)
 frame=$(box_of "$work/media-playing.ppm" 000000)
 read -r fx fy fw fh <<< "$frame"
 [[ -n "$frame" ]] && (( fw >= 300 && fh >= 220 )) || fail "no video box of 320x240 in the screenshot (its black: ${frame:-none})"
-echo "ok   a video plays by itself and ends at $ended s: the page green then blue, the video's box ${fw}x${fh}"
+decoded=$(python3 -I - "$work/media-playing.ppm" "$fx" "$fy" "$fw" "$fh" << 'EOF'
+import sys
+path = sys.argv[1]
+x0, y0, w, h = (int(v) for v in sys.argv[2:6])
+data = open(path, "rb").read()
+fields, at = [], 0
+while len(fields) < 4:
+    while data[at:at + 1].isspace():
+        at += 1
+    if data[at:at + 1] == b"#":
+        at = data.index(b"\n", at)
+        continue
+    end = at
+    while not data[end:end + 1].isspace():
+        end += 1
+    fields.append(data[at:end])
+    at = end
+width = int(fields[1])
+pixels = data[at + 1:]
+white = yellow = 0
+for y in range(y0, y0 + h):
+    for x in range(x0, x0 + w):
+        r, g, b = pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+        if r > 200 and g > 200 and b > 200:
+            white += 1
+        elif r > 150 and g > 150 and b < 90:
+            yellow += 1
+print(white, yellow)
+EOF
+)
+read -r white yellow <<< "$decoded"
+(( white >= 1000 && yellow >= 100 )) || fail "the video's box does not show its pictures (${white:-?} white and ${yellow:-?} yellow pixels; the CPU's decoder did not run?)"
+echo "ok   a video plays by itself and ends at $ended s: the page green then blue, the video's box ${fw}x${fh} showing its pictures (decoded on the CPU)"
 # 27: typing into a text area of a generic font family (edit.html,
 # sans-serif as Google's search box) and a Backspace: the delete
 # command copies the computed font-family into the typing style, which
