@@ -1,0 +1,280 @@
+// brixfs: brixOS's disk format (projects/brix/brixfs.mlx) from outside the
+// kernel: on a disk image on Linux, or on /devices/disk0 in brixOS.
+//
+//   brixfs format DEVICE          an empty volume (its root directory)
+//   brixfs list DEVICE            every path with its size, the snapshots
+//   brixfs cat DEVICE PATH        a file's bytes
+//
+// It reads the newer valid superblock, as the kernel does.
+const std = @import("std")
+const format = @import("../../brixfs.mlx")
+const Brixfs = format.Brixfs
+const Superblock = format.Superblock
+const Inode = format.Inode
+const Entry = format.Entry
+const SnapshotEntry = format.SnapshotEntry
+
+const SYS_pread64: usize = 17
+const SYS_pwrite64: usize = 18
+// brixOS's own: the disk's volume mounted (ENOSYS on Linux).
+const SYS_mount_disk: usize = 1002
+const BLOCK = Brixfs.BLOCK
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stderr(), text) }
+fn print(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+fn printNumber(value: usize) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[23 - count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest /= 10
+        if rest == 0 { break }
+    }
+    print(digits[24 - count..24])
+}
+
+fn fail(text: []const u8) -> u8 {
+    say("brixfs: ")
+    say(text)
+    say("\n")
+    return 1
+}
+
+const Device = struct {
+    descriptor: isize
+
+    fn readBlock(self: Self, number: usize, into: [*]u8) -> bool {
+        return std.linux.syscall4(SYS_pread64, @bitCast(usize, self.descriptor), @intFromPtr(into), BLOCK, number * BLOCK) == @intCast(isize, BLOCK)
+    }
+
+    fn writeBlock(self: Self, number: usize, from: [*]const u8) -> bool {
+        return std.linux.syscall4(SYS_pwrite64, @bitCast(usize, self.descriptor), @intFromPtr(from), BLOCK, number * BLOCK) == @intCast(isize, BLOCK)
+    }
+
+    // The newer valid superblock into `into`; false when there is none.
+    fn superblock(self: Self, into: *Superblock) -> bool {
+        var block: [BLOCK]u8 = undefined
+        var other: Superblock = undefined
+        var found = false
+        var k: usize = 0
+        while k < Brixfs.SUPERBLOCKS {
+            if self.readBlock(k, &block) && other.decode(&block) && (!found || other.generation > into.*.generation) {
+                into.* = other
+                found = true
+            }
+            k += 1
+        }
+        return found
+    }
+
+    // Inode `number` of the table at `root`.
+    fn inode(self: Self, root: usize, number: usize, into: *Inode) -> bool {
+        var block: [BLOCK]u8 = undefined
+        if !self.readBlock(root, &block) { return false }
+        const table = Brixfs.get(&block, (number / Brixfs.INODES_PER_BLOCK) * 8, 8)
+        if table == 0 || !self.readBlock(table, &block) { return false }
+        into.*.decode(&block, Inode.offsetIn(number))
+        return true
+    }
+
+    // The block number of a file's block `index` (0: a hole).
+    fn dataBlock(self: Self, node: *const Inode, index: usize) -> usize {
+        if index < Brixfs.DIRECT { return node.*.direct[index] }
+        var block: [BLOCK]u8 = undefined
+        var rest = index - Brixfs.DIRECT
+        if rest < Brixfs.POINTERS_PER_BLOCK {
+            if node.*.indirect == 0 || !self.readBlock(node.*.indirect, &block) { return 0 }
+            return Brixfs.get(&block, rest * 8, 8)
+        }
+        rest -= Brixfs.POINTERS_PER_BLOCK
+        if node.*.doubleIndirect == 0 || !self.readBlock(node.*.doubleIndirect, &block) { return 0 }
+        const middle = Brixfs.get(&block, (rest / Brixfs.POINTERS_PER_BLOCK) * 8, 8)
+        if middle == 0 || !self.readBlock(middle, &block) { return 0 }
+        return Brixfs.get(&block, (rest % Brixfs.POINTERS_PER_BLOCK) * 8, 8)
+    }
+}
+
+fn openDevice(path: [*]const u8, writing: bool) -> ?Device {
+    const file = std.fs.open(path, if writing { std.fs.READ_WRITE } else { std.fs.READ_ONLY }, 0)
+    if !std.fs.isValid(file) { return null }
+    return Device.{ .descriptor = file.descriptor }
+}
+
+// An empty volume: superblock A (generation 1), the table root (block 2),
+// the first inode block (block 3) with the root directory.
+fn formatDevice(path: [*]const u8) -> u8 {
+    var status: std.fs.Stat = undefined
+    if std.fs.status(path, &status) != 0 { return fail("cannot see the device") }
+    const blocks = @bitCast(usize, status.size) / BLOCK
+    if blocks < 8 { return fail("the device is too small (32 KiB at least)") }
+    const opened = openDevice(path, true)
+    if opened == null { return fail("cannot open the device to write") }
+    const device = opened.?
+    var block: [BLOCK]u8 = undefined
+    var k: usize = 0
+    while k < BLOCK {
+        block[k] = 0
+        k += 1
+    }
+    // Superblock B: nothing (no valid superblock).
+    if !device.writeBlock(1, &block) { return fail("cannot write") }
+    Brixfs.put(&block, 0, 8, 3)
+    if !device.writeBlock(2, &block) { return fail("cannot write") }
+    Brixfs.put(&block, 0, 8, 0)
+    var root: Inode = undefined
+    root.clear()
+    root.kind = Brixfs.DIRECTORY
+    root.mode = 0x1ED
+    root.links = 1
+    root.encode(&block, Inode.offsetIn(Brixfs.ROOT_INODE))
+    if !device.writeBlock(3, &block) { return fail("cannot write") }
+    const superblock = Superblock.{ .blocks = blocks, .generation = 1, .root = 2, .nextInode = 2, .snapshots = 0 }
+    superblock.encode(&block)
+    if !device.writeBlock(0, &block) { return fail("cannot write") }
+    print("brixfs: ")
+    printNumber(blocks)
+    print(" blocks of 4 KiB\n")
+    // On brixOS: the kernel mounts it (at /volumes/disk0).
+    if std.linux.syscall0(SYS_mount_disk) == 0 { print("brixfs: mounted at /volumes/disk0\n") }
+    return 0
+}
+
+// The tree under directory inode `number` at `prefix`, one line a path.
+fn listDirectory(device: Device, root: usize, number: usize, prefix: []u8, length: usize) -> bool {
+    var directory: Inode = undefined
+    if !device.inode(root, number, &directory) { return false }
+    var block: [BLOCK]u8 = undefined
+    var index: usize = 0
+    while index * BLOCK < directory.size {
+        const at = device.dataBlock(&directory, index)
+        if at != 0 && device.readBlock(at, &block) {
+            var slot: usize = 0
+            while slot < BLOCK / Brixfs.ENTRY_SIZE && index * BLOCK + slot * Brixfs.ENTRY_SIZE < directory.size {
+                const child = Entry.inode(&block, slot)
+                if child != 0 {
+                    const nameLength = Entry.nameLength(&block, slot)
+                    var path_length = length
+                    prefix[path_length] = 47
+                    path_length += 1
+                    var k: usize = 0
+                    while k < nameLength && path_length < prefix.length {
+                        prefix[path_length] = block[Entry.nameAt(slot) + k]
+                        path_length += 1
+                        k += 1
+                    }
+                    var node: Inode = undefined
+                    if device.inode(root, child, &node) {
+                        print(prefix[0..path_length])
+                        if node.kind == Brixfs.DIRECTORY {
+                            print("/\n")
+                            if !listDirectory(device, root, child, prefix, path_length) { return false }
+                        } else {
+                            print(" ")
+                            printNumber(node.size)
+                            print("\n")
+                        }
+                    }
+                }
+                slot += 1
+            }
+        }
+        index += 1
+    }
+    return true
+}
+
+fn list(path: [*]const u8) -> u8 {
+    const opened = openDevice(path, false)
+    if opened == null { return fail("cannot open the device") }
+    const device = opened.?
+    var superblock: Superblock = undefined
+    if !device.superblock(&superblock) { return fail("no brixfs volume on the device") }
+    var prefix: [4096]u8 = undefined
+    if !listDirectory(device, superblock.root, Brixfs.ROOT_INODE, prefix[0..4096], 0) { return fail("the volume cannot be read") }
+    if superblock.snapshots != 0 {
+        var block: [BLOCK]u8 = undefined
+        if device.readBlock(superblock.snapshots, &block) {
+            var slot: usize = 0
+            while slot < Brixfs.MAX_SNAPSHOTS {
+                if SnapshotEntry.root(&block, slot) != 0 {
+                    print("snapshot ")
+                    print(block[SnapshotEntry.nameAt(slot)..SnapshotEntry.nameAt(slot) + SnapshotEntry.nameLength(&block, slot)])
+                    print("\n")
+                }
+                slot += 1
+            }
+        }
+    }
+    return 0
+}
+
+// The inode `path` names under the root; 0 when none.
+fn find(device: Device, root: usize, path: []const u8) -> usize {
+    var number = Brixfs.ROOT_INODE
+    var k: usize = 0
+    var block: [BLOCK]u8 = undefined
+    while k < path.length {
+        while k < path.length && path[k] == 47 { k += 1 }
+        if k >= path.length { break }
+        const start = k
+        while k < path.length && path[k] != 47 { k += 1 }
+        var directory: Inode = undefined
+        if !device.inode(root, number, &directory) || directory.kind != Brixfs.DIRECTORY { return 0 }
+        var found: usize = 0
+        var index: usize = 0
+        while index * BLOCK < directory.size && found == 0 {
+            const at = device.dataBlock(&directory, index)
+            if at != 0 && device.readBlock(at, &block) {
+                var slot: usize = 0
+                while slot < BLOCK / Brixfs.ENTRY_SIZE && found == 0 {
+                    if Entry.inode(&block, slot) != 0 && Entry.nameLength(&block, slot) == k - start && std.text.same(block[Entry.nameAt(slot)..Entry.nameAt(slot) + k - start], path[start..k]) { found = Entry.inode(&block, slot) }
+                    slot += 1
+                }
+            }
+            index += 1
+        }
+        if found == 0 { return 0 }
+        number = found
+    }
+    return number
+}
+
+fn cat(path: [*]const u8, file: []const u8) -> u8 {
+    const opened = openDevice(path, false)
+    if opened == null { return fail("cannot open the device") }
+    const device = opened.?
+    var superblock: Superblock = undefined
+    if !device.superblock(&superblock) { return fail("no brixfs volume on the device") }
+    const number = find(device, superblock.root, file)
+    var node: Inode = undefined
+    if number == 0 || !device.inode(superblock.root, number, &node) || node.kind != Brixfs.FILE { return fail("no such file on the volume") }
+    var block: [BLOCK]u8 = undefined
+    var done: usize = 0
+    while done < node.size {
+        const at = device.dataBlock(&node, done / BLOCK)
+        var k: usize = 0
+        while k < BLOCK {
+            block[k] = 0
+            k += 1
+        }
+        if at != 0 { _ = device.readBlock(at, &block) }
+        const chunk = if node.size - done > BLOCK { BLOCK } else { node.size - done }
+        _ = std.io.writeAll(std.io.stdout(), block[0..chunk])
+        done += chunk
+    }
+    return 0
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    const count = std.process.count(arguments)
+    if count < 3 { return fail("usage: brixfs format|list DEVICE | brixfs cat DEVICE PATH") }
+    const command = std.string.asSlice(std.process.argument(arguments, 1))
+    const device = std.process.argument(arguments, 2).pointer
+    if std.text.same(command, "format") && count == 3 { return formatDevice(device) }
+    if std.text.same(command, "list") && count == 3 { return list(device) }
+    if std.text.same(command, "cat") && count == 4 { return cat(device, std.string.asSlice(std.process.argument(arguments, 3))) }
+    return fail("usage: brixfs format|list DEVICE | brixfs cat DEVICE PATH")
+}

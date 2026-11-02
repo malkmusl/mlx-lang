@@ -17,7 +17,12 @@
 # of / into itself) share the files' pages, stay apart from the tree when
 # either changes, refuse changes when read-only, and are taken out; a
 # virtio disk is found and read and written as /devices/disk0 (what is
-# written reaches the image); a script runs (by /proc/self/exe), a program
+# written reaches the image); brixfs formats it in brixOS and the kernel
+# mounts it at /volumes/disk0: files and directories written there reach
+# the disk (the host's brixfs lists and reads them), a snapshot on the disk
+# keeps the old state; after a second boot both are there, the snapshot
+# is taken out and its blocks are free again; a script runs (by
+# /proc/self/exe), a program
 # copied into /temporary runs, and a program of /system/programs written
 # to is copied up; Ctrl-C ends the foreground program, Ctrl-D ends its
 # input;
@@ -51,7 +56,7 @@ shell=mlx-out/bin/mlx-sh
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 mkdir -p "$work/bin"
-for program in cat chmod cp head ln ls mkdir mv rm seq sleep stat uname wc; do
+for program in cat chmod cp head ln ls mkdir mv rm seq sleep stat sync tail uname wc; do
     if [[ -x mlx-out/bin/coreutils/$program ]]; then
         cp mlx-out/bin/coreutils/$program "$work/bin/"
     else
@@ -59,18 +64,33 @@ for program in cat chmod cp head ln ls mkdir mv rm seq sleep stat uname wc; do
     fi
 done
 "$compiler" --quiet projects/brix/tools/snapshot/main.mlx -o "$work/snapshot"
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "$work/bin/"
+"$compiler" --quiet projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and coreutils) build"
 
-# A disk of 1 MiB that starts with a text of the host's.
-head -c 1048576 /dev/zero > "$work/disk.img"
+# A disk of 4 MiB that starts with a text of the host's.
+head -c 4194304 /dev/zero > "$work/disk.img"
 printf 'brix disk' | dd of="$work/disk.img" conv=notrunc status=none
 
-mkfifo "$work/input"
-qemu-system-x86_64 -m 256M -display none -monitor none -no-reboot -cpu max \
-    -serial stdio -kernel "$work/brix.img" -drive "file=$work/disk.img,format=raw,if=virtio" < "$work/input" > "$work/serial.txt" 2>&1 &
-qemu_pid=$!
-exec 3> "$work/input"
+# brixOS in QEMU with the disk, typed at through a FIFO; the serial line
+# into serial.txt. Booted again by boot, after stop.
+boot() {
+    rm -f "$work/input"
+    mkfifo "$work/input"
+    : > "$work/serial.txt"
+    qemu-system-x86_64 -m 256M -display none -monitor none -no-reboot -cpu max \
+        -serial stdio -kernel "$work/brix.img" -drive "file=$work/disk.img,format=raw,if=virtio" < "$work/input" > "$work/serial.txt" 2>&1 &
+    qemu_pid=$!
+    exec 3> "$work/input"
+    prompts=0
+}
+stop() {
+    exec 3>&-
+    kill "$qemu_pid" 2> /dev/null || true
+    wait "$qemu_pid" 2> /dev/null || true
+    qemu_pid=
+}
+boot
 
 # The serial output with the line editor's redraws taken out: carriage
 # returns as line ends, erase-to-end-of-line sequences dropped.
@@ -99,7 +119,7 @@ type_to_program() {
 
 wait_for '^brixOS: kernel at 0x200000'
 wait_for '^brixOS: [0-9]* MiB ([0-9]* free), [0-9]* MHz$'
-wait_for '^brixOS: /devices/disk0, 1024 KiB (virtio)$'
+wait_for '^brixOS: /devices/disk0, 4096 KiB (virtio)$'
 echo "ok   the kernel boots and says itself on the serial line"
 
 type_line 'echo hello brix'
@@ -112,7 +132,7 @@ echo "ok   arithmetic expansion"
 
 type_line 'pwd; cd /; echo * /system/* /system/programs/m*'
 wait_for '^/users/root$'
-wait_for '^devices system temporary users /system/programs /system/settings /system/programs/mkdir /system/programs/mlx-sh /system/programs/mv$'
+wait_for '^devices system temporary users volumes /system/programs /system/settings /system/programs/mkdir /system/programs/mlx-sh /system/programs/mv$'
 echo "ok   the working directory and a glob over the tree (brixOS's layout)"
 
 type_line 'x=brix; echo ${x}OS ${#x}'
@@ -126,7 +146,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for '^16$'
+wait_for '^19$'
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -184,10 +204,25 @@ echo "ok   snapshots: shared pages, apart when changed, read-only, of / into its
 
 type_line 'head -c 9 /devices/disk0; echo; stat -c "%F %s" /devices/disk0; echo written by brixOS > /devices/disk0; head -c 17 /devices/disk0; echo'
 wait_for '^brix disk$'
-wait_for '^block special file 1048576$'
+wait_for '^block special file 4194304$'
 wait_for '^written by brixOS$'
 [[ "$(head -c 17 "$work/disk.img")" == "written by brixOS" ]] || fail "what brixOS wrote is not in the disk image"
 echo "ok   the virtio disk: /devices/disk0 read and written, the image has it"
+
+type_line 'brixfs format /devices/disk0 && cd /volumes/disk0 && mkdir docs && echo hello volume > docs/a && seq 2000 > numbers && cp /system/programs/mlx-sh big && sync && ls; cd /temporary'
+wait_for '^brixfs: mounted at /volumes/disk0$'
+wait_for '^big  docs  numbers$'
+"$work/brixfs" list "$work/disk.img" > "$work/list" 2>&1 || fail "the host's brixfs cannot read the volume: $(cat "$work/list")"
+grep -q '^/docs/a 13$' "$work/list" && grep -q '^/numbers 8893$' "$work/list" && grep -q "^/big $(stat -c %s "$shell")\$" "$work/list" || fail "the volume lacks what was written: $(cat "$work/list")"
+[[ "$("$work/brixfs" cat "$work/disk.img" docs/a)" == "hello volume" ]] || fail "the host reads another docs/a"
+type_line 'snapshot -r /volumes/disk0 /volumes/before && rm /volumes/disk0/big && echo changed > /volumes/disk0/docs/a && sync && ls /volumes && cat /volumes/before/docs/a /volumes/disk0/docs/a; echo x > /volumes/before/x'
+wait_for '^before[[:space:]]*disk0$'
+wait_for '^hello volume$'
+wait_for '^changed$'
+wait_for 'before/x'
+"$work/brixfs" list "$work/disk.img" > "$work/list" 2>&1
+grep -q '^snapshot before$' "$work/list" && ! grep -q '^/big ' "$work/list" || fail "the snapshot or the removal is not on the disk: $(cat "$work/list")"
+echo "ok   brixfs: formatted and mounted, files on the disk (the host reads them), a read-only snapshot on it"
 
 type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
 wait_for '^script one$'
@@ -225,3 +260,24 @@ if output | grep -q '^\[brixOS: system call'; then
     fail "system calls the programs made are missing: $(output | grep '^\[brixOS: system call' | tr '\n' ' ')"
 fi
 echo "ok   no system call the programs made was missing"
+
+# The second boot: the volume and its snapshot as they were committed.
+stop
+boot
+wait_for '^brixOS: /volumes/disk0 (brixfs, generation [0-9]*)$'
+type_line 'ls /volumes; cat /volumes/disk0/docs/a /volumes/before/docs/a; tail -n 1 /volumes/disk0/numbers; ls /volumes/before; echo free $(stat -f -c %f /volumes/disk0)'
+wait_for '^before[[:space:]]*disk0$'
+wait_for '^changed$'
+wait_for '^hello volume$'
+wait_for '^2000$'
+wait_for '^big  docs  numbers$'
+wait_for '^free [0-9]*$'
+free_before=$(output | grep '^free [0-9]*$' | tail -n 1 | cut -d' ' -f2)
+type_line 'snapshot -d /volumes/before && ls /volumes && echo free $(stat -f -c %f /volumes/disk0)'
+wait_for '^disk0$'
+wait_for '^free [0-9]*$' 2
+free_after=$(output | grep '^free [0-9]*$' | tail -n 1 | cut -d' ' -f2)
+(( free_after > free_before + 100 )) || fail "the snapshot's blocks are not free again ($free_before, then $free_after)"
+"$work/brixfs" list "$work/disk.img" > "$work/list" 2>&1
+! grep -q '^snapshot ' "$work/list" || fail "the snapshot is still on the disk"
+echo "ok   brixfs after a reboot: the files and the snapshot there, the snapshot taken out, its blocks free"

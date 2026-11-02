@@ -7,6 +7,8 @@
 //   /devices           console, tty, null, zero, disk0 (a virtio disk)
 //   /users/root        the user's home
 //   /temporary         scratch space
+//   /volumes           the disks' volumes (brixfs, volume.mlx): disk0,
+//                      and its snapshots by their names
 //
 // (Linux programs' /dev, /tmp, /etc/passwd and /proc/self/exe are mapped
 // onto these by the system call layer, filecalls.mlx; they are not in the
@@ -24,6 +26,7 @@ const archive = @import("./archive.mlx")
 const clock = @import("./clock.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
 const Errno = @import("./errno.mlx").Errno
+const volume = @import("./volume.mlx")
 const Page = memory.Page
 
 pub const NodeKind = enum(u8) { free, directory, file, archive, terminal, null_device, zero_device, disk }
@@ -51,6 +54,14 @@ pub const Node = struct {
     // Part of a read-only snapshot: neither it nor (a directory) what it
     // names changes.
     readOnly: bool
+    // On a disk: its view of a volume (1 on; 0: memory only), its inode
+    // there, whether its data was read from the disk yet, and what changed
+    // since the last commit (its inode, its data).
+    volume: usize
+    diskInode: usize
+    loaded: bool
+    dirty: bool
+    dataDirty: bool
 
     pub fn isDirectory(self: *const Self) -> bool { return self.*.kind == NodeKind.directory }
 
@@ -72,6 +83,7 @@ pub const Vfs = struct {
     pub const ENOTEMPTY: isize = -39
     pub const EBUSY: isize = -16
     pub const EFBIG: isize = -27
+    pub const EXDEV: isize = -18
 
     nodes: [MAX_NODES]Node
     console: usize
@@ -103,6 +115,11 @@ pub const Vfs = struct {
                 n.*.doubleIndirect = 0
                 n.*.archiveIndex = 0
                 n.*.readOnly = false
+                n.*.volume = 0
+                n.*.diskInode = 0
+                n.*.loaded = true
+                n.*.dirty = false
+                n.*.dataDirty = false
                 const time = now()
                 n.*.accessed = time
                 n.*.modified = time
@@ -127,8 +144,113 @@ pub const Vfs = struct {
     fn collect(self: *Self, index: usize) -> void {
         const n = &self.*.nodes[index]
         if n.*.links != 0 || n.*.opens != 0 || n.*.kind == NodeKind.free { return }
+        // A disk's node is gone from the disk at the next commit.
+        if n.*.volume != 0 { volume.store().forget(index) }
         self.freeData(index)
         n.*.kind = NodeKind.free
+    }
+
+    // ---- a disk's nodes ----
+
+    // A node of a disk whose data was not read yet is read now.
+    pub fn ready(self: *Self, index: usize) -> void {
+        const n = &self.*.nodes[index]
+        if n.*.volume != 0 && !n.*.loaded {
+            n.*.loaded = true
+            volume.store().load(index)
+        }
+    }
+
+    // A node of a disk changed (its data too when `data`): it goes to
+    // the disk at the next commit.
+    pub fn touch(self: *Self, index: usize, data: bool) -> void {
+        const n = &self.*.nodes[index]
+        if n.*.volume == 0 { return }
+        n.*.dirty = true
+        if data { n.*.dataDirty = true }
+        volume.store().changed()
+    }
+
+    // The page of block `which` for data read from a disk (made).
+    pub fn pageForLoad(self: *Self, index: usize, which: usize) -> usize { return self.block(index, which, true) }
+
+    // The page of block `which` (0: a hole), for writing it to a disk.
+    pub fn pageOf(self: *Self, index: usize, which: usize) -> usize { return self.block(index, which, false) }
+
+    // `name` in a directory for `target` as it was read from a disk: no
+    // link counted, nothing changed.
+    pub fn attach(self: *Self, directory: usize, name: [*]const u8, length: usize, target: usize) -> bool {
+        var record: [ENTRY_SIZE]u8 = undefined
+        Bytes.fill(&record, ENTRY_SIZE, 0)
+        Bytes.write32(&record, 0, target)
+        record[4] = @intCast(u8, length)
+        Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(&record) + 5) }, name, length)
+        const d = &self.*.nodes[directory]
+        const at = d.*.size
+        const page = self.block(directory, at / Page.SIZE, true)
+        if page == 0 { return false }
+        Bytes.copy(Bytes.pointer(layout.Memory.virtual(page) + at % Page.SIZE), &record, ENTRY_SIZE)
+        d.*.size = at + ENTRY_SIZE
+        if self.*.nodes[target].isDirectory() { self.*.nodes[target].parent = directory }
+        return true
+    }
+
+    // The entry of `directory` naming `target` cleared, nothing else
+    // (a view of a disk taken out of /volumes).
+    pub fn detach(self: *Self, directory: usize, target: usize) -> void {
+        var slot: usize = 0
+        while slot < self.slotCount(directory) {
+            var name: [*]const u8 = undefined
+            var length: usize = 0
+            if self.entry(directory, slot, &name, &length) == target {
+                const page = self.block(directory, slot / ENTRIES_PER_PAGE, false)
+                Bytes.write32(Bytes.pointer(layout.Memory.virtual(page) + (slot % ENTRIES_PER_PAGE) * ENTRY_SIZE), 0, 0)
+                return
+            }
+            slot += 1
+        }
+    }
+
+    // A node of a view of a disk dropped from the tree as it is (the
+    // view is taken out; nothing of the disk changes).
+    pub fn drop(self: *Self, index: usize) -> void {
+        const n = &self.*.nodes[index]
+        n.*.volume = 0
+        n.*.links = 0
+        n.*.opens = 0
+        self.freeData(index)
+        n.*.kind = NodeKind.free
+    }
+
+    // A node of the memory-only tree (and what a directory of it names)
+    // becomes a node of view `view` of a disk: archive programs become
+    // files, devices cannot; 0 or -errno.
+    fn adopt(self: *Self, index: usize, view: usize) -> isize {
+        const n = &self.*.nodes[index]
+        if n.*.volume == view { return 0 }
+        if n.*.volume != 0 { return EXDEV }
+        if n.*.kind == NodeKind.archive && !self.copyUp(index) { return ENOSPC }
+        if n.*.kind != NodeKind.file && n.*.kind != NodeKind.directory { return EXDEV }
+        const number = volume.store().newInode()
+        if number == 0 { return ENOSPC }
+        n.*.volume = view
+        n.*.diskInode = number
+        n.*.loaded = true
+        self.touch(index, true)
+        if n.*.isDirectory() {
+            var slot: usize = 0
+            while slot < self.slotCount(index) {
+                var name: [*]const u8 = undefined
+                var length: usize = 0
+                const child = self.entry(index, slot, &name, &length)
+                if child != NONE {
+                    const adopted = self.adopt(child, view)
+                    if adopted < 0 { return adopted }
+                }
+                slot += 1
+            }
+        }
+        return 0
     }
 
     // ---- data ----
@@ -267,6 +389,7 @@ pub const Vfs = struct {
     // Up to `length` bytes of the node's data from `offset` into `into`:
     // how many there were.
     pub fn read(self: *Self, index: usize, offset: usize, into: [*]u8, length: usize) -> usize {
+        self.ready(index)
         const n = &self.*.nodes[index]
         if offset >= n.*.size { return 0 }
         const count = if length > n.*.size - offset { n.*.size - offset } else { length }
@@ -313,6 +436,8 @@ pub const Vfs = struct {
     // `length` bytes from `from` into the node's data at `offset`: how
     // many went in, or -errno.
     pub fn write(self: *Self, index: usize, offset: usize, from: [*]const u8, length: usize) -> isize {
+        self.ready(index)
+        self.touch(index, true)
         const n = &self.*.nodes[index]
         if n.*.kind == NodeKind.archive && !self.copyUp(index) { return ENOSPC }
         if offset + length > (Node.DIRECT + ADDRESSES_PER_PAGE + ADDRESSES_PER_PAGE * ADDRESSES_PER_PAGE) * Page.SIZE { return EFBIG }
@@ -338,6 +463,8 @@ pub const Vfs = struct {
     // The node's size set to `size` (pages past it freed, a longer one
     // reads zeros); 0 or -errno.
     pub fn truncate(self: *Self, index: usize, size: usize) -> isize {
+        self.ready(index)
+        self.touch(index, true)
         const n = &self.*.nodes[index]
         if n.*.kind == NodeKind.archive && !self.copyUp(index) { return ENOSPC }
         if size < n.*.size {
@@ -360,6 +487,9 @@ pub const Vfs = struct {
     // on write: the first write to either copies the page), the rest is
     // copied. How many, or -errno.
     pub fn copyRange(self: *Self, from: usize, fromOffset: usize, to: usize, toOffset: usize, length: usize) -> isize {
+        self.ready(from)
+        self.ready(to)
+        self.touch(to, true)
         const source = &self.*.nodes[from]
         const target = &self.*.nodes[to]
         if target.*.kind == NodeKind.archive && !self.copyUp(to) { return ENOSPC }
@@ -398,6 +528,7 @@ pub const Vfs = struct {
     // The entry `slot` of a directory: its node (NONE when free), and its
     // name into `name` (the length into `length`).
     pub fn entry(self: *Self, directory: usize, slot: usize, name: *[*]const u8, length: *usize) -> usize {
+        self.ready(directory)
         const page = self.block(directory, slot / ENTRIES_PER_PAGE, false)
         if page == 0 { return NONE }
         const at = Bytes.pointer(layout.Memory.virtual(page) + (slot % ENTRIES_PER_PAGE) * ENTRY_SIZE)
@@ -408,7 +539,10 @@ pub const Vfs = struct {
     }
 
     // How many entry slots the directory has (used or not).
-    pub fn slotCount(self: *Self, directory: usize) -> usize { return self.*.nodes[directory].size / ENTRY_SIZE }
+    pub fn slotCount(self: *Self, directory: usize) -> usize {
+        self.ready(directory)
+        return self.*.nodes[directory].size / ENTRY_SIZE
+    }
 
     fn sameName(a: [*]const u8, aLength: usize, b: [*]const u8, bLength: usize) -> bool {
         if aLength != bLength { return false }
@@ -442,6 +576,13 @@ pub const Vfs = struct {
         if length > NAME_MAX { return ENAMETOOLONG }
         if length == 0 { return Errno.ENOENT }
         if self.lookup(directory, name, length) != NONE { return EEXIST }
+        // Onto a disk: a new node (and its tree) becomes the disk's.
+        const view = self.*.nodes[directory].volume
+        if self.*.nodes[target].volume != view {
+            if self.*.nodes[target].links != 0 { return EXDEV }
+            const adopted = self.adopt(target, view)
+            if adopted < 0 { return adopted }
+        }
         // A free slot, or one more at the end.
         var slot: usize = 0
         while slot < self.slotCount(directory) {
@@ -461,6 +602,7 @@ pub const Vfs = struct {
         t.*.links += 1
         t.*.changed = now()
         if t.*.isDirectory() { t.*.parent = directory }
+        self.touch(target, false)
         return 0
     }
 
@@ -479,6 +621,8 @@ pub const Vfs = struct {
                 t.*.links -= 1
                 t.*.changed = now()
                 self.*.nodes[directory].modified = now()
+                self.touch(directory, true)
+                if t.*.links > 0 { self.touch(found, false) }
                 self.collect(found)
                 return 0
             }
@@ -748,6 +892,8 @@ pub const Vfs = struct {
         _ = self.device(dev, "null", NodeKind.null_device)
         _ = self.device(dev, "zero", NodeKind.zero_device)
         _ = self.addDirectory(ROOT, "temporary", 0x3FF)
+        const volumes = self.addDirectory(ROOT, "volumes", 0x1ED)
+        if volumes != NONE { self.*.nodes[volumes].readOnly = true }
         const users = self.addDirectory(ROOT, "users", 0x1ED)
         _ = self.addDirectory(users, "root", 0x1C0)
     }

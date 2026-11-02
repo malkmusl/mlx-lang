@@ -1,0 +1,736 @@
+// The disk's brixfs volume (projects/brix/brixfs.mlx) in the tree: the
+// current state at /volumes/disk0, each snapshot read-only at
+// /volumes/NAME. Nodes are read from the disk when first used (vfs.mlx's
+// `ready`); what changes is written back by a commit, when the system is
+// idle (every process waits) or a program asks (sync, fsync):
+//
+//   1. each changed node: its data (when it changed) into new blocks, its
+//      inode into the table block that holds it, staged;
+//   2. the staged table blocks into new blocks, the table root into a new
+//      block;
+//   3. the superblock the current one is not, with the next generation.
+//
+// Nothing in use is written over, so the volume on the disk is always the
+// last commit, whole. Free blocks are those no root reaches (the current
+// one, the snapshots'), found again after each commit (and at mount).
+const layout = @import("../layout.mlx")
+const memory = @import("./memory.mlx")
+const vfs = @import("./vfs.mlx")
+const virtio = @import("./virtio.mlx")
+const console = @import("./console.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const Errno = @import("./errno.mlx").Errno
+const format = @import("../brixfs.mlx")
+const Brixfs = format.Brixfs
+const Superblock = format.Superblock
+const Inode = format.Inode
+const SnapshotEntry = format.SnapshotEntry
+const Page = memory.Page
+const Vfs = vfs.Vfs
+const NodeKind = vfs.NodeKind
+
+// A view of the volume: its current state (view 0, writable) or a
+// snapshot (read-only).
+pub const View = struct {
+    pub const MAX_FREED: usize = 256
+
+    used: bool
+    // The inode table's root block.
+    root: usize
+    readOnly: bool
+    // Its root directory in the tree.
+    node: usize
+    // Inodes gone since the last commit (view 0).
+    freed: [MAX_FREED]usize
+    freedCount: usize
+}
+
+pub const Store = struct {
+    pub const MAX_VIEWS: usize = 8
+    const SCRATCH: usize = 4
+
+    mounted: bool
+    readOnly: bool
+    superblock: Superblock
+    // Which superblock (0 or 1) is the current one.
+    slot: usize
+    // A bit a block: in use.
+    bitmap: [*]u8
+    cursor: usize
+    // The current table root's pointers, and pages to read blocks into.
+    rootPage: usize
+    scratch: [SCRATCH]usize
+    // The snapshot table (0: none).
+    snapshots: usize
+    views: [MAX_VIEWS]View
+    // Table blocks being made in a commit (a page each, by their index).
+    staged: [Brixfs.POINTERS_PER_BLOCK]usize
+    dirty: bool
+
+    // ---- blocks ----
+
+    fn page(frame: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(frame)) }
+
+    fn readBlock(number: usize, frame: usize) -> bool { return virtio.disk().read(number * Brixfs.BLOCK, page(frame), Brixfs.BLOCK) == @intCast(isize, Brixfs.BLOCK) }
+
+    fn writeBlock(number: usize, frame: usize) -> bool { return virtio.disk().write(number * Brixfs.BLOCK, page(frame), Brixfs.BLOCK) == @intCast(isize, Brixfs.BLOCK) }
+
+    fn used(self: *const Self, number: usize) -> bool { return self.*.bitmap[number / 8] & (@intCast(u8, 1) << @intCast(u3, number % 8)) != 0 }
+
+    fn mark(self: *Self, number: usize) -> void {
+        if number < self.*.superblock.blocks { self.*.bitmap[number / 8] |= @intCast(u8, 1) << @intCast(u3, number % 8) }
+    }
+
+    // A free block (marked in use); 0 when the disk is full.
+    fn allocate(self: *Self) -> usize {
+        var tries: usize = 0
+        while tries < self.*.superblock.blocks {
+            const number = self.*.cursor
+            self.*.cursor += 1
+            if self.*.cursor >= self.*.superblock.blocks { self.*.cursor = Brixfs.SUPERBLOCKS }
+            if !self.used(number) {
+                self.mark(number)
+                return number
+            }
+            tries += 1
+        }
+        return 0
+    }
+
+    // ---- mounting ----
+
+    // The disk's volume, if it has one, at /volumes/disk0 (and its
+    // snapshots); whether it has one.
+    pub fn mount(self: *Self) -> bool {
+        self.*.mounted = false
+        self.*.dirty = false
+        const disk = virtio.disk()
+        if !disk.*.present { return false }
+        const frames = memory.allFrames()
+        var k: usize = 0
+        while k < SCRATCH {
+            self.*.scratch[k] = frames.allocate()
+            if self.*.scratch[k] == 0 { return false }
+            k += 1
+        }
+        self.*.rootPage = frames.allocate()
+        if self.*.rootPage == 0 { return false }
+        // The newer valid superblock.
+        var found = false
+        var other: Superblock = undefined
+        var s: usize = 0
+        while s < Brixfs.SUPERBLOCKS {
+            if readBlock(s, self.*.scratch[0]) && other.decode(page(self.*.scratch[0])) && (!found || other.generation > self.*.superblock.generation) {
+                self.*.superblock = other
+                self.*.slot = s
+                found = true
+            }
+            s += 1
+        }
+        if !found || self.*.superblock.blocks > disk.*.capacity * virtio.VirtioBlock.SECTOR / Brixfs.BLOCK { return false }
+        const bitmapPages = Page.up((self.*.superblock.blocks + 7) / 8) / Page.SIZE
+        const bitmap = frames.allocateContiguous(bitmapPages)
+        if bitmap == 0 || !readBlock(self.*.superblock.root, self.*.rootPage) { return false }
+        self.*.bitmap = page(bitmap)
+        self.*.cursor = Brixfs.SUPERBLOCKS
+        self.*.snapshots = self.*.superblock.snapshots
+        self.*.readOnly = disk.*.readOnly
+        self.*.mounted = true
+        k = 0
+        while k < MAX_VIEWS {
+            self.*.views[k].used = false
+            k += 1
+        }
+        if !self.mountView(0, self.*.superblock.root, self.*.readOnly, "disk0".pointer, 5) {
+            self.*.mounted = false
+            return false
+        }
+        self.mountSnapshots()
+        self.sweep()
+        return true
+    }
+
+    // View `view` (its table at `root`) at /volumes/NAME.
+    fn mountView(self: *Self, view: usize, root: usize, readOnly: bool, name: [*]const u8, length: usize) -> bool {
+        const tree = vfs.fileSystem()
+        const volumes = tree.lookup(Vfs.ROOT, "volumes".pointer, 7)
+        if volumes == Vfs.NONE { return false }
+        const v = &self.*.views[view]
+        v.*.used = true
+        v.*.root = root
+        v.*.readOnly = readOnly
+        v.*.freedCount = 0
+        v.*.node = self.stub(view, Brixfs.ROOT_INODE)
+        if v.*.node == Vfs.NONE || !tree.attach(volumes, name, length, v.*.node) {
+            v.*.used = false
+            return false
+        }
+        return true
+    }
+
+    fn mountSnapshots(self: *Self) -> void {
+        if self.*.snapshots == 0 || !readBlock(self.*.snapshots, self.*.scratch[3]) { return }
+        const table = page(self.*.scratch[3])
+        var slot: usize = 0
+        while slot < Brixfs.MAX_SNAPSHOTS {
+            const root = SnapshotEntry.root(table, slot)
+            if root != 0 {
+                const view = self.freeView()
+                if view == 0 { return }
+                var name: [Brixfs.SNAPSHOT_NAME_MAX]u8 = undefined
+                const length = SnapshotEntry.nameLength(table, slot)
+                Bytes.copy(&name, unsafe { @ptrFromInt([*]const u8, @intFromPtr(table) + SnapshotEntry.nameAt(slot)) }, length)
+                _ = self.mountView(view, root, true, &name, length)
+                // (mountView read into the scratch pages: the table again.)
+                if !readBlock(self.*.snapshots, self.*.scratch[3]) { return }
+            }
+            slot += 1
+        }
+    }
+
+    fn freeView(self: *Self) -> usize {
+        var k: usize = 1
+        while k < MAX_VIEWS {
+            if !self.*.views[k].used { return k }
+            k += 1
+        }
+        return 0
+    }
+
+    // ---- inodes ----
+
+    // A new inode number of the current view; 0 when there is none left.
+    pub fn newInode(self: *Self) -> usize {
+        if !self.*.mounted || self.*.superblock.nextInode >= Brixfs.MAX_INODES { return 0 }
+        const number = self.*.superblock.nextInode
+        self.*.superblock.nextInode += 1
+        return number
+    }
+
+    // Inode `number` of view `view` into `into`.
+    fn readInode(self: *Self, view: usize, number: usize, into: *Inode) -> bool {
+        var root = self.*.rootPage
+        if view != 0 {
+            if !readBlock(self.*.views[view].root, self.*.scratch[0]) { return false }
+            root = self.*.scratch[0]
+        }
+        const table = Brixfs.get(page(root), (number / Brixfs.INODES_PER_BLOCK) * 8, 8)
+        if table == 0 {
+            into.*.clear()
+            return true
+        }
+        if !readBlock(table, self.*.scratch[1]) { return false }
+        into.*.decode(page(self.*.scratch[1]), Inode.offsetIn(number))
+        return true
+    }
+
+    // The block number of a file's block `index` (0: a hole).
+    fn dataBlock(self: *Self, node: *const Inode, index: usize) -> usize {
+        if index < Brixfs.DIRECT { return node.*.direct[index] }
+        var rest = index - Brixfs.DIRECT
+        if rest < Brixfs.POINTERS_PER_BLOCK {
+            if node.*.indirect == 0 || !readBlock(node.*.indirect, self.*.scratch[2]) { return 0 }
+            return Brixfs.get(page(self.*.scratch[2]), rest * 8, 8)
+        }
+        rest -= Brixfs.POINTERS_PER_BLOCK
+        if node.*.doubleIndirect == 0 || !readBlock(node.*.doubleIndirect, self.*.scratch[2]) { return 0 }
+        const middle = Brixfs.get(page(self.*.scratch[2]), (rest / Brixfs.POINTERS_PER_BLOCK) * 8, 8)
+        if middle == 0 || !readBlock(middle, self.*.scratch[2]) { return 0 }
+        return Brixfs.get(page(self.*.scratch[2]), (rest % Brixfs.POINTERS_PER_BLOCK) * 8, 8)
+    }
+
+    // The tree's node of inode `number` of view `view`: the one there is,
+    // or a new one with the inode's kind, mode, size and times whose data
+    // is read when first used; NONE when it cannot be.
+    pub fn stub(self: *Self, view: usize, number: usize) -> usize {
+        const tree = vfs.fileSystem()
+        var k: usize = Vfs.ROOT
+        while k < Vfs.MAX_NODES {
+            const n = tree.node(k)
+            if n.*.kind != NodeKind.free && n.*.volume == view + 1 && n.*.diskInode == number { return k }
+            k += 1
+        }
+        var record: Inode = undefined
+        if !self.readInode(view, number, &record) || record.kind == Brixfs.FREE { return Vfs.NONE }
+        const made = tree.create(if record.kind == Brixfs.DIRECTORY { NodeKind.directory } else { NodeKind.file }, record.mode)
+        if made == Vfs.NONE { return Vfs.NONE }
+        const n = tree.node(made)
+        n.*.volume = view + 1
+        n.*.diskInode = number
+        n.*.loaded = false
+        n.*.links = record.links
+        n.*.size = record.size
+        n.*.accessed = record.accessed
+        n.*.modified = record.modified
+        n.*.changed = record.changed
+        n.*.readOnly = self.*.views[view].readOnly
+        return made
+    }
+
+    // ---- loading ----
+
+    // A node's data from the disk: a file's blocks into its pages, a
+    // directory's entries into its own (the nodes they name as stubs).
+    pub fn load(self: *Self, index: usize) -> void {
+        const tree = vfs.fileSystem()
+        const n = tree.node(index)
+        const view = n.*.volume - 1
+        var record: Inode = undefined
+        if !self.readInode(view, n.*.diskInode, &record) { return }
+        const blocks = Page.up(record.size) / Page.SIZE
+        if n.*.kind == NodeKind.file {
+            var b: usize = 0
+            while b < blocks {
+                const number = self.dataBlock(&record, b)
+                if number != 0 {
+                    const frame = tree.pageForLoad(index, b)
+                    if frame == 0 || !readBlock(number, frame) { return }
+                }
+                b += 1
+            }
+            n.*.size = record.size
+            return
+        }
+        // A directory: its entries, the nodes they name.
+        n.*.size = 0
+        var b: usize = 0
+        while b < blocks {
+            const number = self.dataBlock(&record, b)
+            if number != 0 && readBlock(number, self.*.scratch[3]) {
+                var slot: usize = 0
+                while slot < Brixfs.BLOCK / Brixfs.ENTRY_SIZE && b * Brixfs.BLOCK + slot * Brixfs.ENTRY_SIZE < record.size {
+                    const entries = page(self.*.scratch[3])
+                    const child = format.Entry.inode(entries, slot)
+                    if child != 0 {
+                        var name: [Brixfs.NAME_MAX]u8 = undefined
+                        const length = format.Entry.nameLength(entries, slot)
+                        Bytes.copy(&name, unsafe { @ptrFromInt([*]const u8, @intFromPtr(entries) + format.Entry.nameAt(slot)) }, length)
+                        const node = self.stub(view, child)
+                        if node != Vfs.NONE { _ = tree.attach(index, &name, length, node) }
+                        // (stub may have read into the scratch pages.)
+                        _ = readBlock(number, self.*.scratch[3])
+                    }
+                    slot += 1
+                }
+            }
+            b += 1
+        }
+    }
+
+    // ---- changes ----
+
+    pub fn changed(self: *Self) -> void { self.*.dirty = true }
+
+    // A node of a disk is gone from the tree: its inode is freed at the
+    // next commit (the current view's only).
+    pub fn forget(self: *Self, index: usize) -> void {
+        const n = vfs.fileSystem().node(index)
+        if n.*.volume != 1 || n.*.diskInode == 0 { return }
+        const v = &self.*.views[0]
+        if v.*.freedCount == View.MAX_FREED { _ = self.commit() }
+        if v.*.freedCount < View.MAX_FREED {
+            v.*.freed[v.*.freedCount] = n.*.diskInode
+            v.*.freedCount += 1
+        }
+        self.*.dirty = true
+    }
+
+    // ---- committing ----
+
+    // The block number of data block `index` set in an inode being made;
+    // the pointer pages in `indirect` (a page), `double` (a page) and
+    // `middle` (the current one of the double indirect block's).
+    fn setPointer(record: *Inode, index: usize, number: usize, pointers: *[3]usize) -> void {
+        if index < Brixfs.DIRECT {
+            record.*.direct[index] = number
+            return
+        }
+        var rest = index - Brixfs.DIRECT
+        if rest < Brixfs.POINTERS_PER_BLOCK {
+            Brixfs.put(page(pointers.*[0]), rest * 8, 8, number)
+            return
+        }
+        rest -= Brixfs.POINTERS_PER_BLOCK
+        Brixfs.put(page(pointers.*[2]), (rest % Brixfs.POINTERS_PER_BLOCK) * 8, 8, number)
+    }
+
+    // A full middle page of the double indirect block written (when it
+    // names any block); false when the disk is full.
+    fn flushMiddle(self: *Self, which: usize, pointers: *[3]usize, any: bool) -> bool {
+        if !any { return true }
+        const number = self.allocate()
+        if number == 0 || !writeBlock(number, pointers.*[2]) { return false }
+        Brixfs.put(page(pointers.*[1]), which * 8, 8, number)
+        Bytes.zeroWords(layout.Memory.virtual(pointers.*[2]), Page.SIZE)
+        return true
+    }
+
+    // A node's data into new blocks (a directory's entries naming inodes,
+    // not the tree's nodes), its pointers into `record`; false when the
+    // disk is full.
+    fn writeData(self: *Self, index: usize, record: *Inode) -> bool {
+        const tree = vfs.fileSystem()
+        const n = tree.node(index)
+        const frames = memory.allFrames()
+        var pointers = [3]usize{ frames.allocate(), frames.allocate(), frames.allocate() }
+        if pointers[0] == 0 || pointers[1] == 0 || pointers[2] == 0 { return false }
+        const blocks = Page.up(n.*.size) / Page.SIZE
+        var anyIndirect = false
+        var anyDouble = false
+        var anyMiddle = false
+        var currentMiddle: usize = 0
+        var ok = true
+        var b: usize = 0
+        while b < blocks && ok {
+            const frame = tree.pageOf(index, b)
+            if b >= Brixfs.DIRECT + Brixfs.POINTERS_PER_BLOCK {
+                const which = (b - Brixfs.DIRECT - Brixfs.POINTERS_PER_BLOCK) / Brixfs.POINTERS_PER_BLOCK
+                if which != currentMiddle {
+                    ok = self.flushMiddle(currentMiddle, &pointers, anyMiddle)
+                    anyMiddle = false
+                    currentMiddle = which
+                }
+            }
+            if frame != 0 && ok {
+                var source = frame
+                if n.*.kind == NodeKind.directory {
+                    // Entries name inodes on the disk.
+                    source = self.*.scratch[3]
+                    Bytes.copyWords(layout.Memory.virtual(source), layout.Memory.virtual(frame), Page.SIZE)
+                    const entries = page(source)
+                    var slot: usize = 0
+                    while slot < Brixfs.BLOCK / Brixfs.ENTRY_SIZE {
+                        const child = format.Entry.inode(entries, slot)
+                        if child != 0 { Brixfs.put(entries, slot * Brixfs.ENTRY_SIZE, 4, tree.node(child).*.diskInode) }
+                        slot += 1
+                    }
+                }
+                const number = self.allocate()
+                if number == 0 || !writeBlock(number, source) {
+                    ok = false
+                } else {
+                    setPointer(record, b, number, &pointers)
+                    if b >= Brixfs.DIRECT { anyIndirect = true }
+                    if b >= Brixfs.DIRECT + Brixfs.POINTERS_PER_BLOCK {
+                        anyDouble = true
+                        anyMiddle = true
+                    }
+                }
+            }
+            b += 1
+        }
+        if ok && anyDouble { ok = self.flushMiddle(currentMiddle, &pointers, anyMiddle) }
+        if ok && anyIndirect {
+            const number = self.allocate()
+            if number == 0 || !writeBlock(number, pointers[0]) { ok = false } else { record.*.indirect = number }
+        }
+        if ok && anyDouble {
+            const number = self.allocate()
+            if number == 0 || !writeBlock(number, pointers[1]) { ok = false } else { record.*.doubleIndirect = number }
+        }
+        frames.free(pointers[0])
+        frames.free(pointers[1])
+        frames.free(pointers[2])
+        return ok
+    }
+
+    // Inode `number` as `record`, in its table block being made.
+    fn stage(self: *Self, number: usize, record: *const Inode) -> bool {
+        const which = number / Brixfs.INODES_PER_BLOCK
+        if self.*.staged[which] == 0 {
+            const frame = memory.allFrames().allocate()
+            if frame == 0 { return false }
+            const old = Brixfs.get(page(self.*.rootPage), which * 8, 8)
+            if old != 0 && !readBlock(old, frame) { return false }
+            self.*.staged[which] = frame
+        }
+        record.encode(page(self.*.staged[which]), Inode.offsetIn(number))
+        return true
+    }
+
+    fn unstage(self: *Self) -> void {
+        var k: usize = 0
+        while k < Brixfs.POINTERS_PER_BLOCK {
+            if self.*.staged[k] != 0 { memory.allFrames().free(self.*.staged[k]) }
+            self.*.staged[k] = 0
+            k += 1
+        }
+    }
+
+    // What changed since the last commit onto the disk, as described
+    // above; whether it is there (when not, the disk has the last commit
+    // still, and the changes stay to be committed).
+    pub fn commit(self: *Self) -> bool {
+        if !self.*.mounted || !self.*.dirty || self.*.readOnly { return true }
+        const tree = vfs.fileSystem()
+        self.unstage()
+        var ok = true
+        // 1. Changed nodes: their data, their inodes.
+        var k: usize = Vfs.ROOT
+        while k < Vfs.MAX_NODES && ok {
+            const n = tree.node(k)
+            if n.*.kind != NodeKind.free && n.*.volume == 1 && n.*.dirty {
+                var record: Inode = undefined
+                if n.*.dataDirty || !self.readInode(0, n.*.diskInode, &record) || record.kind == Brixfs.FREE {
+                    record.clear()
+                    ok = self.writeData(k, &record)
+                }
+                record.kind = if n.*.kind == NodeKind.directory { Brixfs.DIRECTORY } else { Brixfs.FILE }
+                record.mode = n.*.mode
+                record.links = n.*.links
+                record.size = n.*.size
+                record.accessed = n.*.accessed
+                record.modified = n.*.modified
+                record.changed = n.*.changed
+                ok = ok && self.stage(n.*.diskInode, &record)
+            }
+            k += 1
+        }
+        // Inodes gone.
+        const current = &self.*.views[0]
+        var f: usize = 0
+        while f < current.*.freedCount && ok {
+            var free: Inode = undefined
+            free.clear()
+            ok = self.stage(current.*.freed[f], &free)
+            f += 1
+        }
+        // 2. The table blocks, then the root.
+        var newRoot: usize = 0
+        if ok {
+            const rootCopy = memory.allFrames().allocate()
+            ok = rootCopy != 0
+            if ok {
+                Bytes.copyWords(layout.Memory.virtual(rootCopy), layout.Memory.virtual(self.*.rootPage), Page.SIZE)
+                var t: usize = 0
+                while t < Brixfs.POINTERS_PER_BLOCK && ok {
+                    if self.*.staged[t] != 0 {
+                        const number = self.allocate()
+                        ok = number != 0 && writeBlock(number, self.*.staged[t])
+                        if ok { Brixfs.put(page(rootCopy), t * 8, 8, number) }
+                    }
+                    t += 1
+                }
+                newRoot = if ok { self.allocate() } else { 0 }
+                ok = ok && newRoot != 0 && writeBlock(newRoot, rootCopy)
+                if ok { Bytes.copyWords(layout.Memory.virtual(self.*.rootPage), layout.Memory.virtual(rootCopy), Page.SIZE) }
+                memory.allFrames().free(rootCopy)
+            }
+        }
+        self.unstage()
+        // 3. The other superblock, with the next generation.
+        if ok { ok = self.writeSuperblock(newRoot, self.*.snapshots) }
+        if !ok {
+            console.out.write("brixOS: the commit to disk0 failed (the disk is full?); the disk has the last one\n")
+            self.sweep()
+            return false
+        }
+        // Committed: nothing is changed any more.
+        k = Vfs.ROOT
+        while k < Vfs.MAX_NODES {
+            const n = tree.node(k)
+            if n.*.volume == 1 {
+                n.*.dirty = false
+                n.*.dataDirty = false
+            }
+            k += 1
+        }
+        current.*.freedCount = 0
+        current.*.root = newRoot
+        self.*.dirty = false
+        self.sweep()
+        return true
+    }
+
+    // The superblock the current one is not: `root`, `snapshots`, the
+    // next generation; it becomes the current one.
+    fn writeSuperblock(self: *Self, root: usize, snapshots: usize) -> bool {
+        var next = self.*.superblock
+        next.generation += 1
+        next.root = root
+        next.snapshots = snapshots
+        const other = 1 - self.*.slot
+        next.encode(page(self.*.scratch[0]))
+        if !writeBlock(other, self.*.scratch[0]) { return false }
+        self.*.superblock = next
+        self.*.slot = other
+        self.*.snapshots = snapshots
+        return true
+    }
+
+    // ---- free blocks ----
+
+    // Every block a root reaches marked in use; the rest free.
+    fn sweep(self: *Self) -> void {
+        Bytes.fill(self.*.bitmap, (self.*.superblock.blocks + 7) / 8, 0)
+        self.mark(0)
+        self.mark(1)
+        self.markTable(self.*.superblock.root)
+        if self.*.snapshots != 0 {
+            self.mark(self.*.snapshots)
+            var slot: usize = 0
+            while slot < Brixfs.MAX_SNAPSHOTS {
+                // (markTable reads into the scratch pages: the table again.)
+                if !readBlock(self.*.snapshots, self.*.scratch[3]) { return }
+                const root = SnapshotEntry.root(page(self.*.scratch[3]), slot)
+                if root != 0 { self.markTable(root) }
+                slot += 1
+            }
+        }
+        self.*.cursor = Brixfs.SUPERBLOCKS
+    }
+
+    // A table root, its inode blocks and every block their inodes reach.
+    fn markTable(self: *Self, root: usize) -> void {
+        self.mark(root)
+        var t: usize = 0
+        while t < Brixfs.POINTERS_PER_BLOCK {
+            if !readBlock(root, self.*.scratch[0]) { return }
+            const table = Brixfs.get(page(self.*.scratch[0]), t * 8, 8)
+            if table != 0 {
+                self.mark(table)
+                var i: usize = 0
+                while i < Brixfs.INODES_PER_BLOCK {
+                    if !readBlock(table, self.*.scratch[1]) { return }
+                    var record: Inode = undefined
+                    record.decode(page(self.*.scratch[1]), i * Brixfs.INODE_SIZE)
+                    if record.kind != Brixfs.FREE { self.markInode(&record) }
+                    i += 1
+                }
+            }
+            t += 1
+        }
+    }
+
+    fn markInode(self: *Self, record: *const Inode) -> void {
+        var d: usize = 0
+        while d < Brixfs.DIRECT {
+            if record.*.direct[d] != 0 { self.mark(record.*.direct[d]) }
+            d += 1
+        }
+        if record.*.indirect != 0 { self.markPointers(record.*.indirect, false) }
+        if record.*.doubleIndirect != 0 { self.markPointers(record.*.doubleIndirect, true) }
+    }
+
+    // A pointer block and what it names (pointer blocks again when
+    // `double`).
+    fn markPointers(self: *Self, number: usize, double: bool) -> void {
+        self.mark(number)
+        const frame = if double { self.*.scratch[3] } else { self.*.scratch[2] }
+        var k: usize = 0
+        while k < Brixfs.POINTERS_PER_BLOCK {
+            if !readBlock(number, frame) { return }
+            const target = Brixfs.get(page(frame), k * 8, 8)
+            if target != 0 {
+                if double { self.markPointers(target, false) } else { self.mark(target) }
+            }
+            k += 1
+        }
+    }
+
+    // ---- snapshots ----
+
+    // The volume's current state kept as snapshot `name` (committed
+    // first), at /volumes/NAME read-only; 0 or -errno.
+    pub fn snapshot(self: *Self, name: [*]const u8, length: usize) -> isize {
+        if !self.*.mounted { return Errno.ENOENT }
+        if self.*.readOnly { return Errno.EROFS }
+        if length == 0 || length > Brixfs.SNAPSHOT_NAME_MAX { return -36 }
+        const view = self.freeView()
+        if view == 0 { return -28 }
+        self.*.dirty = true
+        if !self.commit() { return -28 }
+        // The table with the new entry, in a new block.
+        const table = self.*.scratch[3]
+        if self.*.snapshots == 0 {
+            Bytes.zeroWords(layout.Memory.virtual(table), Page.SIZE)
+        } else if !readBlock(self.*.snapshots, table) {
+            return -5
+        }
+        var slot: usize = 0
+        while slot < Brixfs.MAX_SNAPSHOTS && SnapshotEntry.root(page(table), slot) != 0 { slot += 1 }
+        if slot == Brixfs.MAX_SNAPSHOTS { return -28 }
+        SnapshotEntry.write(page(table), slot, name, length, self.*.superblock.root)
+        const block = self.allocate()
+        if block == 0 || !writeBlock(block, table) || !self.writeSuperblock(self.*.superblock.root, block) { return -28 }
+        self.sweep()
+        if !self.mountView(view, self.*.superblock.root, true, name, length) { return -28 }
+        return 0
+    }
+
+    // The view whose root directory is `node`; 0 when none (or the
+    // current one).
+    pub fn snapshotView(self: *Self, node: usize) -> usize {
+        var k: usize = 1
+        while k < MAX_VIEWS {
+            if self.*.views[k].used && self.*.views[k].node == node { return k }
+            k += 1
+        }
+        return 0
+    }
+
+    // Whether `node` is the current volume's root (/volumes/disk0).
+    pub fn isCurrentRoot(self: *Self, node: usize) -> bool { return self.*.mounted && self.*.views[0].used && self.*.views[0].node == node }
+
+    // Snapshot view `view` taken out: from /volumes, from the tree, from
+    // the snapshot table; its blocks free unless others use them; 0 or
+    // -errno.
+    pub fn removeSnapshot(self: *Self, view: usize) -> isize {
+        const tree = vfs.fileSystem()
+        const v = &self.*.views[view]
+        // Not while something holds one of its nodes (but /volumes).
+        var k: usize = Vfs.ROOT
+        while k < Vfs.MAX_NODES {
+            const n = tree.node(k)
+            if n.*.kind != NodeKind.free && n.*.volume == view + 1 && n.*.opens > 0 { return -16 }
+            k += 1
+        }
+        if !readBlock(self.*.snapshots, self.*.scratch[3]) { return -5 }
+        const table = page(self.*.scratch[3])
+        var slot: usize = 0
+        while slot < Brixfs.MAX_SNAPSHOTS && SnapshotEntry.root(table, slot) != v.*.root { slot += 1 }
+        if slot < Brixfs.MAX_SNAPSHOTS { SnapshotEntry.write(table, slot, "".pointer, 0, 0) }
+        var empty = true
+        var e: usize = 0
+        while e < Brixfs.MAX_SNAPSHOTS {
+            if SnapshotEntry.root(table, e) != 0 { empty = false }
+            e += 1
+        }
+        var block: usize = 0
+        if !empty {
+            block = self.allocate()
+            if block == 0 || !writeBlock(block, self.*.scratch[3]) { return -28 }
+        }
+        if !self.writeSuperblock(self.*.superblock.root, block) { return -5 }
+        // Its nodes out of the tree.
+        const volumes = tree.lookup(Vfs.ROOT, "volumes".pointer, 7)
+        if volumes != Vfs.NONE { tree.detach(volumes, v.*.node) }
+        k = Vfs.ROOT
+        while k < Vfs.MAX_NODES {
+            const n = tree.node(k)
+            if n.*.kind != NodeKind.free && n.*.volume == view + 1 { tree.drop(k) }
+            k += 1
+        }
+        v.*.used = false
+        self.sweep()
+        return 0
+    }
+
+    // Blocks no root reaches.
+    pub fn freeBlocks(self: *const Self) -> usize {
+        var count: usize = 0
+        var k: usize = 0
+        while k < self.*.superblock.blocks {
+            if !self.used(k) { count += 1 }
+            k += 1
+        }
+        return count
+    }
+
+    // Every change committed (sync, the system idle).
+    pub fn commitAll(self: *Self) -> void { _ = self.commit() }
+}
+
+var disk0: Store = undefined // (per run)
+
+pub fn store() -> *Store { return &disk0 }

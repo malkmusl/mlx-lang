@@ -46,6 +46,7 @@ are named for what they hold:
     /devices           console, tty, null, zero, disk0 (a virtio disk)
     /users/root        the user's home (the shell starts there)
     /temporary         scratch space
+    /volumes           the disk's brixfs volume (disk0) and its snapshots
 
 Linux programs (all the repository's programs are, for now) expect some
 of Unix's paths. The system call layer, not the tree, maps them:
@@ -91,7 +92,50 @@ its size: programs read and write it at any byte offset
 written is on the disk image. The driver (`VirtioBlock`, virtio.mlx)
 uses the legacy PCI transport (registers in an I/O BAR), one virtqueue in
 pages of its own, one request at a time through a bounce page, polled.
-There is no file system on it yet.
+While a volume is mounted from it, /devices/disk0 is not writable.
+
+## brixfs: the disk's format
+
+brixfs (projects/brix/brixfs.mlx, the format; kernel/volume.mlx, the
+kernel's side; tools/brixfs, the tool) is copy on write: nothing in use
+is written over.
+
+- Blocks of 4 KiB. Blocks 0 and 1 are superblocks taking turns; the
+  valid one (its checksum right) with the higher generation is the
+  volume. It names the inode table's root block, the next inode number
+  and the snapshot table.
+- The inode table: a root block of 512 inode block numbers, 16 inodes of
+  256 bytes each. A file's data: 12 direct blocks, an indirect block, a
+  double indirect one; a directory's: 64-byte entries (inode, name).
+- A commit writes what changed into free blocks: a changed file's data
+  and pointer blocks (unchanged files keep theirs), the inode blocks with
+  changed inodes, a new table root; then the other superblock with the
+  next generation. Until that one block is written the disk is the last
+  commit, whole; after it, the new one.
+- Free blocks are those no root reaches (the current one, the
+  snapshots'): marked again at mount and after each commit.
+- A snapshot is the current root kept in the snapshot table:
+  `snapshot -r /volumes/disk0 /volumes/NAME` commits, keeps the root and
+  mounts it read-only at /volumes/NAME; `snapshot -d /volumes/NAME`
+  takes it out (its blocks are free unless the volume still uses them).
+
+In the tree, /volumes/disk0 is the current state. Nodes are read from
+the disk when first used (`Vfs.ready`: a file's data at once, a
+directory's entries as nodes not read yet); a change marks a node
+(`Vfs.touch`); a node made in the tmpfs and linked into the volume
+becomes the volume's (`Vfs.adopt`); moves between the volume and the
+rest of the tree are EXDEV. Commits happen when the system is idle (every
+process waits, e.g. at the shell's prompt) and at sync, fsync, syncfs.
+
+    brixfs format /devices/disk0     on brixOS (it is mounted at once), or
+    brixfs format disk.img           on the host
+    brixfs list disk.img             every path and size, the snapshots
+    brixfs cat disk.img docs/a       a file
+
+Not there yet: a file is written again whole when it changed (not only
+its changed blocks), inode numbers are not reused, every node read from
+the disk stays in memory (1024 nodes at most), no flush command to the
+device (the host's writes are in its order).
 
 The pieces:
 
@@ -170,7 +214,9 @@ The pieces:
     clock), uname, getrandom; signals are accepted and never come. A
     call it lacks is said once on the console (`[brixOS: system call N
     not there]`) and gets ENOSYS.
-  - pci.mlx, virtio.mlx: PCI's configuration space, the virtio disk.
+  - pci.mlx, virtio.mlx: PCI's configuration space, the virtio disk;
+    volume.mlx: `Store`, the brixfs volume (mount, read, commit, sweep,
+    snapshots).
   - frame.mlx, trap.mlx, shell.mlx: the trap `Frame` (registers saved,
     SSE state kept by FXSAVE in the blob), `brix_trap` (system calls and
     the switches they bring, page faults of a process's regions, a crash
@@ -183,19 +229,16 @@ keeps the processor; Ctrl-C reaches only what reads the terminal or
 waits), signal handlers (signals end a process or are dropped; job
 control's stops do not stop), interrupts at all (the PICs are masked;
 the serial line and the clocks are polled), symbolic links, users and
-permissions that are checked, a file system on the disk (the tree's
-files live as long as the kernel runs), more than one CPU, an EFI
-loader.
+permissions that are checked, more than one CPU, an EFI loader.
 
 ## Next
 
 1. The timer (the APIC's) and preemption; the serial line's interrupt;
    signal handlers (rt_sigaction, delivery, sigreturn) and job control
    (SIGTSTP, SIGCONT).
-2. A copy-on-write format of brixOS's own on the disk (a tree of pages
-   that are never written in place, a new root per change, snapshots as
-   old roots kept), mounted into the tree; interrupts for the disk; ext2
-   as the format to exchange with Linux.
+2. brixfs: only a file's changed blocks written, inode reuse, nodes
+   evicted from memory, the device's flush; interrupts for the disk;
+   ext2 as the format to exchange with Linux.
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
 5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.

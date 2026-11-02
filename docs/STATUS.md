@@ -82,8 +82,10 @@ wait (no timer yet), on a VFS with a tmpfs in brixOS's own layout
 (/system/programs, /devices, /users, /temporary; Linux's paths mapped by
 the system call layer), with copy on write for fork and for files
 (copy_file_range, FICLONE; std.fs.copy uses copy_file_range), snapshots
-of trees (the snapshot tool), and a virtio disk as /devices/disk0 (no
-file system on it yet) (`./mlx build brix`, `tools/check_brix.sh`). Note:
+of trees (the snapshot tool), a virtio disk as /devices/disk0, and
+brixfs on it, a copy-on-write format of brixOS's own (A/B superblocks,
+commits when idle or at sync, snapshots as kept roots) mounted at
+/volumes/disk0 (`./mlx build brix`, `tools/check_brix.sh`). Note:
 ROADMAP.md is written for a Linux kernel ("replacing it is not the
 goal"); brixOS is the Stage 4 target of AGENT_IMPLEMENTATION.md and
 spec/04-stdlib/os/brix.xml.
