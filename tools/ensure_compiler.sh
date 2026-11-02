@@ -677,6 +677,21 @@ inlines_with_own_names() {
     [[ $status -eq 13 ]]
 }
 
+# Whether $1 builds kernels (--target=x86_64-freestanding: a _start that
+# takes its arena in rdi and rsi and never makes a system call; brixOS's,
+# projects/brix).
+builds_freestanding_kernels() {
+    local probe ok=1
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    printf 'pub fn main() -> u8 { return 0 }\n' > "$probe/kernel.mlx"
+    if "$1" --quiet --target=x86_64-freestanding "$probe/kernel.mlx" -o "$probe/kernel" > /dev/null 2>&1 \
+        && [[ "$(od -An -tx1 -j "$(( 0x1000 ))" -N3 "$probe/kernel" | tr -d ' ')" == "4989fe" ]]; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -725,6 +740,7 @@ probes=(
     "runs_build|the build command (mlx build)"
     "inlines_with_own_names|inlined functions reading their own module's variables, not the caller's locals"
     "says_its_version|its version (mlx4 --version)"
+    "builds_freestanding_kernels|kernels (--target=x86_64-freestanding)"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

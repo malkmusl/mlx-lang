@@ -1,0 +1,417 @@
+// System calls: Linux's numbers and conventions (rax the number, rdi, rsi,
+// rdx, r10, r8, r9 the arguments, rax the result or -errno), the part a
+// shell on a serial terminal needs. A process of its own is not there yet
+// (fork, execve: ENOSYS); signals are taken and never come.
+const layout = @import("../layout.mlx")
+const cpu = @import("./cpu.mlx")
+const console = @import("./console.mlx")
+const process = @import("./process.mlx")
+const files = @import("./files.mlx")
+const tty = @import("./tty.mlx")
+const clock = @import("./clock.mlx")
+
+const EPERM: isize = -1
+const EINTR: isize = -4
+const EAGAIN: isize = -11
+const ECHILD: isize = -10
+const EFAULT: isize = -14
+const ENOSYS: isize = -38
+const ENOENT: isize = -2
+
+pub const Result = struct {
+    value: isize
+    exit: bool
+    status: usize
+}
+
+var unknownSeen: [512]bool = undefined // (per run)
+var randomState: usize = 0 // (per run)
+
+pub fn init() -> void {
+    var k: usize = 0
+    while k < 512 {
+        unknownSeen[k] = false
+        k += 1
+    }
+    randomState = cpu.rdtsc() | 1
+}
+
+fn bytes(address: usize) -> [*]u8 { return unsafe { @ptrFromInt([*]u8, address) } }
+
+fn put64(address: usize, value: usize) -> void {
+    const into = bytes(address)
+    var k: usize = 0
+    while k < 8 {
+        into[k] = @intCast(u8, (value >> @intCast(u6, k * 8)) & 255)
+        k += 1
+    }
+}
+
+fn put32(address: usize, value: usize) -> void {
+    const into = bytes(address)
+    var k: usize = 0
+    while k < 4 {
+        into[k] = @intCast(u8, (value >> @intCast(u6, k * 8)) & 255)
+        k += 1
+    }
+}
+
+fn get64(address: usize) -> usize {
+    const from = bytes(address)
+    var value: usize = 0
+    var k: usize = 0
+    while k < 8 {
+        value |= @intCast(usize, from[k]) << @intCast(u6, k * 8)
+        k += 1
+    }
+    return value
+}
+
+// A NUL-terminated string of the program's, its pages made; false when
+// it is not the program's (or longer than 4 KiB).
+fn userString(address: usize) -> bool {
+    var at = address
+    while at < address + 4096 {
+        if !process.prepare(at, 1) { return false }
+        if bytes(at)[0] == 0 { return true }
+        at += 1
+    }
+    return false
+}
+
+fn copyText(address: usize, capacity: usize, text: []const u8) -> void {
+    const into = bytes(address)
+    var k: usize = 0
+    while k < capacity {
+        into[k] = if k < text.length { text.pointer[k] } else { 0 }
+        k += 1
+    }
+}
+
+fn ok(value: isize) -> Result { return Result.{ .value = value, .exit = false, .status = 0 } }
+
+fn unsigned(value: isize) -> usize { return @bitCast(usize, value) }
+
+fn signed(value: usize) -> isize { return @bitCast(isize, value) }
+
+// Waits until the terminal has input or `nanoseconds` passed (negative:
+// however long it takes); whether it has.
+fn waitInput(nanoseconds: isize) -> bool {
+    const start = clock.monotonic()
+    while !tty.pending() {
+        if nanoseconds >= 0 && clock.monotonic() - start >= unsigned(nanoseconds) { return false }
+    }
+    return true
+}
+
+fn sleep(nanoseconds: usize) -> void {
+    const start = clock.monotonic()
+    while clock.monotonic() - start < nanoseconds {}
+}
+
+// poll's struct pollfd array: readiness now, else after waiting.
+fn poll(address: usize, count: usize, nanoseconds: isize) -> isize {
+    if !process.prepare(address, count * 8) { return EFAULT }
+    var round: usize = 0
+    while true {
+        var ready: isize = 0
+        var k: usize = 0
+        while k < count {
+            const entry = bytes(address + k * 8)
+            const fd = signed(get64(address + k * 8) & 0xFFFFFFFF)
+            const fd32 = if fd >= 0x80000000 { -1 } else { fd }
+            const events = @intCast(usize, entry[4]) | (@intCast(usize, entry[5]) << 8)
+            var revents: usize = 0
+            const what = files.kindOf(fd32)
+            if fd32 >= 0 {
+                if what == files.NONE {
+                    revents = 0x20
+                } else if what == files.TERMINAL {
+                    if events & 1 != 0 && tty.pending() { revents |= 1 }
+                    if events & 4 != 0 { revents |= 4 }
+                } else {
+                    revents = events & 5
+                }
+            }
+            entry[6] = @intCast(u8, revents & 255)
+            entry[7] = @intCast(u8, revents >> 8)
+            if revents != 0 { ready += 1 }
+            k += 1
+        }
+        if ready > 0 || nanoseconds == 0 || round > 0 { return ready }
+        _ = waitInput(nanoseconds)
+        round += 1
+    }
+    return 0
+}
+
+fn timespec(address: usize) -> isize {
+    if address == 0 { return -1 }
+    if !process.prepare(address, 16) { return 0 }
+    return signed(get64(address) * 1000000000 + get64(address + 8))
+}
+
+fn uname(address: usize) -> isize {
+    if !process.prepare(address, 390) { return EFAULT }
+    copyText(address, 65, "brixOS")
+    copyText(address + 65, 65, "brix")
+    copyText(address + 130, 65, "0.1")
+    copyText(address + 195, 65, "#1")
+    copyText(address + 260, 65, "x86_64")
+    copyText(address + 325, 65, "")
+    return 0
+}
+
+fn ioctl(fd: isize, request: usize, argument: usize) -> isize {
+    if files.kindOf(fd) == files.NONE { return files.EBADF }
+    if files.kindOf(fd) != files.TERMINAL { return files.ENOTTY }
+    if request == 0x5401 {
+        if !process.prepare(argument, tty.TERMIOS_SIZE) { return EFAULT }
+        tty.getAttributes(bytes(argument))
+        return 0
+    }
+    if request == 0x5402 || request == 0x5403 || request == 0x5404 {
+        if !process.prepare(argument, tty.TERMIOS_SIZE) { return EFAULT }
+        tty.setAttributes(bytes(argument))
+        return 0
+    }
+    if request == 0x5413 {
+        if !process.prepare(argument, 8) { return EFAULT }
+        put64(argument, 24 | (80 << 16))
+        return 0
+    }
+    if request == 0x540F || request == 0x5429 {
+        if !process.prepare(argument, 4) { return EFAULT }
+        put32(argument, 1)
+        return 0
+    }
+    if request == 0x5410 || request == 0x540E || request == 0x5414 || request == 0x5421 { return 0 }
+    return files.EINVAL
+}
+
+fn writeVector(fd: isize, address: usize, count: usize, reading: bool) -> isize {
+    if !process.prepare(address, count * 16) { return EFAULT }
+    var total: isize = 0
+    var k: usize = 0
+    while k < count {
+        const base = get64(address + k * 16)
+        const length = get64(address + k * 16 + 8)
+        if length > 0 {
+            if !process.prepare(base, length) { return EFAULT }
+            const done = if reading { files.read(fd, bytes(base), length) } else { files.write(fd, bytes(base), length) }
+            if done < 0 { return if total > 0 { total } else { done } }
+            total += done
+            if reading && unsigned(done) < length { return total }
+        }
+        k += 1
+    }
+    return total
+}
+
+fn random(address: usize, length: usize) -> isize {
+    if !process.prepare(address, length) { return EFAULT }
+    const into = bytes(address)
+    var k: usize = 0
+    while k < length {
+        randomState ^= randomState << 13
+        randomState ^= randomState >> 7
+        randomState ^= randomState << 17
+        into[k] = @intCast(u8, (randomState >> 24) & 255)
+        k += 1
+    }
+    return signed(length)
+}
+
+fn fcntl(fd: isize, command: usize, argument: usize) -> isize {
+    if files.kindOf(fd) == files.NONE { return files.EBADF }
+    if command == 0 { return files.duplicate(fd, argument, false) }
+    if command == 1030 { return files.duplicate(fd, argument, true) }
+    if command == 1 { return if files.getCloseOnExec(fd) { 1 } else { 0 } }
+    if command == 2 {
+        files.setCloseOnExec(fd, argument & 1 != 0)
+        return 0
+    }
+    if command == 3 { return if files.kindOf(fd) == files.TERMINAL { 2 } else { 0 } }
+    if command == 4 { return 0 }
+    return files.EINVAL
+}
+
+fn limits(old: usize) -> isize {
+    if old != 0 {
+        if !process.prepare(old, 16) { return EFAULT }
+        put64(old, 0xFFFFFFFFFFFFFFFF)
+        put64(old + 8, 0xFFFFFFFFFFFFFFFF)
+    }
+    return 0
+}
+
+fn clockTime(which: usize, address: usize) -> isize {
+    if !process.prepare(address, 16) { return EFAULT }
+    const now = if which == 0 || which == 5 || which == 8 { clock.realtime() } else { clock.monotonic() }
+    put64(address, now / 1000000000)
+    put64(address + 8, now % 1000000000)
+    return 0
+}
+
+fn pathCall(number: usize, path: usize, argument: usize, flags: usize) -> isize {
+    if !userString(path) { return EFAULT }
+    const text: [*]const u8 = bytes(path)
+    if number == 2 || number == 257 { return files.open(text, argument) }
+    if number == 4 || number == 6 || number == 262 {
+        if !process.prepare(argument, 144) { return EFAULT }
+        if flags & 0x1000 != 0 && text[0] == 0 { return EFAULT }
+        return files.statusOf(text, bytes(argument))
+    }
+    if number == 21 || number == 269 || number == 439 {
+        const found = files.lookup(text)
+        return if found < 0 { found } else { 0 }
+    }
+    if number == 80 {
+        const found = files.lookup(text)
+        if found < 0 { return found }
+        return if found == @intCast(isize, files.MAX) { 0 } else { files.ENOTDIR }
+    }
+    if number == 89 || number == 267 { return files.EINVAL }
+    return ENOSYS
+}
+
+pub fn call(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> Result {
+    _ = a5
+    _ = a6
+    const fd = signed(a1)
+    if number == 0 {
+        if !process.prepare(a2, a3) { return ok(EFAULT) }
+        return ok(files.read(fd, bytes(a2), a3))
+    }
+    if number == 1 {
+        if !process.prepare(a2, a3) { return ok(EFAULT) }
+        return ok(files.write(fd, bytes(a2), a3))
+    }
+    if number == 2 { return ok(pathCall(number, a1, a2, 0)) }
+    if number == 257 { return ok(pathCall(number, a2, a3, 0)) }
+    if number == 3 { return ok(files.close(fd)) }
+    if number == 4 || number == 6 { return ok(pathCall(number, a1, a2, 0)) }
+    if number == 262 {
+        if a2 != 0 && userString(a2) && bytes(a2)[0] == 0 && a4 & 0x1000 != 0 {
+            if !process.prepare(a3, 144) { return ok(EFAULT) }
+            return ok(files.status(fd, bytes(a3)))
+        }
+        return ok(pathCall(number, a2, a3, a4))
+    }
+    if number == 5 {
+        if !process.prepare(a2, 144) { return ok(EFAULT) }
+        return ok(files.status(fd, bytes(a2)))
+    }
+    if number == 7 { return ok(poll(a1, a2, if signed(a3) < 0 { -1 } else { signed(a3) * 1000000 })) }
+    if number == 271 { return ok(poll(a1, a2, timespec(a3))) }
+    if number == 8 { return ok(files.seek(fd, signed(a2), a3)) }
+    if number == 9 {
+        if a4 & 0x20 == 0 { return ok(-19) }
+        return ok(process.mmap(a1, a2, a4 & 0x10 != 0 || a4 & 0x100000 != 0))
+    }
+    if number == 10 || number == 28 { return ok(0) }
+    if number == 11 { return ok(process.munmap(a1, a2)) }
+    if number == 12 { return ok(signed(process.brk(a1))) }
+    if number == 13 {
+        if a3 != 0 {
+            if !process.prepare(a3, 32) { return ok(EFAULT) }
+            var k: usize = 0
+            while k < 32 {
+                bytes(a3)[k] = 0
+                k += 1
+            }
+        }
+        return ok(0)
+    }
+    if number == 14 {
+        if a3 != 0 {
+            if !process.prepare(a3, 8) { return ok(EFAULT) }
+            put64(a3, 0)
+        }
+        return ok(0)
+    }
+    if number == 16 { return ok(ioctl(fd, a2, a3)) }
+    if number == 19 { return ok(writeVector(fd, a2, a3, true)) }
+    if number == 20 { return ok(writeVector(fd, a2, a3, false)) }
+    if number == 21 || number == 80 || number == 89 { return ok(pathCall(number, a1, a2, 0)) }
+    if number == 269 || number == 439 || number == 267 { return ok(pathCall(number, a2, a3, 0)) }
+    if number == 24 { return ok(0) }
+    if number == 32 { return ok(files.duplicate(fd, 0, false)) }
+    if number == 33 { return ok(files.duplicateTo(fd, signed(a2))) }
+    if number == 292 {
+        if fd == signed(a2) { return ok(files.EINVAL) }
+        return ok(files.duplicateTo(fd, signed(a2)))
+    }
+    if number == 35 || number == 230 {
+        const at = if number == 35 { a1 } else { a3 }
+        const nanoseconds = timespec(at)
+        if nanoseconds > 0 { sleep(unsigned(nanoseconds)) }
+        return ok(0)
+    }
+    if number == 39 || number == 186 || number == 110 || number == 111 || number == 121 || number == 124 { return ok(1) }
+    if number == 102 || number == 104 || number == 107 || number == 108 { return ok(0) }
+    if number == 105 || number == 106 || number == 109 || number == 112 || number == 95 { return ok(0) }
+    if number == 57 || number == 58 || number == 56 || number == 59 || number == 22 || number == 293 || number == 435 { return ok(ENOSYS) }
+    if number == 60 || number == 231 { return Result.{ .value = 0, .exit = true, .status = a1 & 255 } }
+    if number == 61 || number == 247 { return ok(ECHILD) }
+    if number == 62 || number == 200 || number == 234 { return ok(0) }
+    if number == 63 { return ok(uname(a1)) }
+    if number == 72 { return ok(fcntl(fd, a2, a3)) }
+    if number == 79 {
+        if a2 < 2 { return ok(-34) }
+        if !process.prepare(a1, 2) { return ok(EFAULT) }
+        bytes(a1)[0] = 47
+        bytes(a1)[1] = 0
+        return ok(2)
+    }
+    if number == 81 { return ok(if files.kindOf(fd) == files.DIRECTORY { 0 } else { files.ENOTDIR }) }
+    if number == 96 {
+        if a1 != 0 {
+            if !process.prepare(a1, 16) { return ok(EFAULT) }
+            const now = clock.realtime()
+            put64(a1, now / 1000000000)
+            put64(a1 + 8, (now % 1000000000) / 1000)
+        }
+        return ok(0)
+    }
+    if number == 97 || number == 302 { return ok(limits(if number == 97 { a2 } else { a4 })) }
+    if number == 128 {
+        const nanoseconds = timespec(a3)
+        if nanoseconds > 0 { sleep(unsigned(nanoseconds)) }
+        return ok(EAGAIN)
+    }
+    if number == 130 { return ok(EINTR) }
+    if number == 131 || number == 218 || number == 273 || number == 334 { return ok(if number == 218 { 1 } else { 0 }) }
+    if number == 158 {
+        if a1 == 0x1002 {
+            cpu.wrmsr(0xC0000100, a2)
+            return ok(0)
+        }
+        return ok(files.EINVAL)
+    }
+    if number == 201 {
+        const seconds = clock.realtime() / 1000000000
+        if a1 != 0 && process.prepare(a1, 8) { put64(a1, seconds) }
+        return ok(signed(seconds))
+    }
+    if number == 217 {
+        if !process.prepare(a2, a3) { return ok(EFAULT) }
+        return ok(files.entries(fd, bytes(a2), a3))
+    }
+    if number == 228 { return ok(clockTime(a1, a2)) }
+    if number == 229 {
+        if a2 != 0 && process.prepare(a2, 16) {
+            put64(a2, 0)
+            put64(a2 + 8, 1)
+        }
+        return ok(0)
+    }
+    if number == 318 { return ok(random(a1, a2)) }
+    if number < 512 && !unknownSeen[number] {
+        unknownSeen[number] = true
+        console.write("[brixOS: system call ")
+        console.decimal(number)
+        console.write(" not there]\n")
+    }
+    return ok(ENOSYS)
+}
