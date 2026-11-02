@@ -99,6 +99,7 @@ pub const Frame = struct {
     refIds: [*]u32
     refPocs: [*]i32
     refLong: [*]u8
+    refIndex: [*]i8
     intraMb: [*]u8
     blocks: usize
     id: u32
@@ -167,6 +168,8 @@ pub const Cpu = struct {
     scale8: [2][6][64]i32
     // Implicit bi-prediction's weights per (ref0, ref1).
     implicitWeights: [MAX_REFS][MAX_REFS]i32
+    // The slice's reference pictures that are long-term, per list.
+    refIsLong: [2][MAX_REFS]bool
     // The entropy decoder's state (CABAC): codIRange, codIOffset and per
     // context (pStateIdx << 1) | valMPS; the previous macroblock's
     // mb_qp_delta (for its context).
@@ -225,6 +228,7 @@ fn freeFrame(cpu: *Cpu, frame: *Frame) -> void {
         a.free(@ptrCast([*]u8, frame.*.refPocs), frame.*.blocks * 8, 16)
     }
     a.free(frame.*.refLong, frame.*.blocks * 2, 16)
+    unsafe { a.free(@ptrCast([*]u8, frame.*.refIndex), frame.*.blocks * 2, 16) }
     a.free(frame.*.intraMb, frame.*.blocks / 16, 16)
     frame.*.allocated = false
 }
@@ -299,8 +303,9 @@ fn ensureFrame(cpu: *Cpu, slot: usize) -> bool {
     const ids = a.alloc(blocks * 8, 16)
     const pocs = a.alloc(blocks * 8, 16)
     const longs = a.alloc(blocks * 2, 16)
+    const indices = a.alloc(blocks * 2, 16)
     const intra = a.alloc(blocks / 16, 16)
-    if y == null || cb == null || cr == null || mvs == null || ids == null || pocs == null || longs == null || intra == null { return false }
+    if y == null || cb == null || cr == null || mvs == null || ids == null || pocs == null || longs == null || indices == null || intra == null { return false }
     frame.*.y = y.?
     frame.*.cb = cb.?
     frame.*.cr = cr.?
@@ -308,6 +313,7 @@ fn ensureFrame(cpu: *Cpu, slot: usize) -> bool {
         frame.*.mvs = @ptrCast([*]i16, mvs.?)
         frame.*.refIds = @ptrCast([*]u32, ids.?)
         frame.*.refPocs = @ptrCast([*]i32, pocs.?)
+        frame.*.refIndex = @ptrCast([*]i8, indices.?)
     }
     frame.*.refLong = longs.?
     frame.*.intraMb = intra.?
@@ -1741,10 +1747,14 @@ fn parseMbCavlc(cpu: *Cpu, mb: *Mb, p: *Parsed, qp: *i32) -> Status {
     } else if slice == h264.SLICE_I {
         intraType = mbType
     } else {
-        return parseMbBCavlc(cpu, mb, p, qp, mbType)
+        if mbType < 23 {
+            intra = false
+        } else {
+            intraType = mbType - 23
+        }
     }
     if intra && intraType > 25 { return Status.corrupt }
-    if !intra && mbType > 4 { return Status.corrupt }
+    if !intra && slice == h264.SLICE_P && mbType > 4 { return Status.corrupt }
     p.*.mbType = mbType
     mb.*.intra = intra
     if intra {
@@ -1768,9 +1778,12 @@ fn parseMbCavlc(cpu: *Cpu, mb: *Mb, p: *Parsed, qp: *i32) -> Status {
         }
         mb.*.chromaMode = @intCast(u8, bits_module.ue(b))
         if mb.*.chromaMode > 3 { return Status.corrupt }
-    } else {
+    } else if slice == h264.SLICE_P {
         mb.*.kind = MB_P_16X16 + @intCast(u8, if mbType > 3 { 3 } else { mbType })
         const status = parseInterP(cpu, mb, p, mbType)
+        if status != Status.ok { return status }
+    } else {
+        const status = parseInterB(cpu, mb, p, mbType, false)
         if status != Status.ok { return status }
     }
     if mb.*.kind != MB_I_16X16 {
@@ -1778,7 +1791,7 @@ fn parseMbCavlc(cpu: *Cpu, mb: *Mb, p: *Parsed, qp: *i32) -> Status {
         if code > 47 { return Status.corrupt }
         const value = if intra { tables.CBP_INTRA[code] } else { tables.CBP_INTER[code] }
         mb.*.cbp = ((@intCast(u32, value) >> 4) << 4) | (@intCast(u32, value) & 15)
-        if !intra && mb.*.cbp & 15 != 0 && transform8x8Allowed(cpu) && interAllows8x8(mb, p) {
+        if !intra && mb.*.cbp & 15 != 0 && transform8x8Allowed(cpu) && interAllows8x8(cpu, mb, p) {
             mb.*.transform8x8 = bits_module.flag(b)
         }
     }
@@ -1843,7 +1856,8 @@ fn clearChroma(cpu: *Cpu, mb: *Mb) -> void {
 
 // transform_size_8x8_flag of an inter macroblock: no sub-partition below
 // 8x8 (and, for B_8x8's direct sub-macroblocks, direct_8x8_inference).
-fn interAllows8x8(mb: *Mb, p: *Parsed) -> bool {
+fn interAllows8x8(cpu: *Cpu, mb: *Mb, p: *Parsed) -> bool {
+    if mb.*.kind == MB_B_DIRECT { return direct8x8(cpu) }
     if mb.*.kind == MB_P_8X8 {
         var k: usize = 0
         while k < 4 {
@@ -1855,8 +1869,8 @@ fn interAllows8x8(mb: *Mb, p: *Parsed) -> bool {
         var k: usize = 0
         while k < 4 {
             if mb.*.direct[k] {
-                if !direct8x8(mb) { return false }
-            } else if p.*.subTypes[k] != 0 {
+                if !direct8x8(cpu) { return false }
+            } else if p.*.subTypes[k] > 3 {
                 return false
             }
             k += 1
@@ -2108,11 +2122,9 @@ fn intraModes(cpu: *Cpu, mb: *Mb, p: *Parsed) -> void {
 
 // ---- B macroblocks (filled in with B slices) ----
 
-fn parseMbBCavlc(cpu: *Cpu, mb: *Mb, p: *Parsed, qp: *i32, mbType: u32) -> Status {
-    return Status.unsupported
+fn direct8x8(cpu: *Cpu) -> bool {
+    return cpu.*.sps.*.std.flags.bits0 & video.StdVideoH264SpsFlags_direct_8x8_inference_flag != 0
 }
-
-fn direct8x8(mb: *Mb) -> bool { return true }
 
 // ---- Reconstruction (8.3, 8.4, 8.5) ----
 
@@ -2918,7 +2930,6 @@ fn decodeSliceCavlc(cpu: *Cpu, qpIn: i32) -> Status {
     return Status.ok
 }
 
-fn skipB(cpu: *Cpu, mb: *Mb) -> Status { return Status.unsupported }
 
 // Decodes the slices of the picture std.h264 started (h.picture) from the
 // access unit's bytes into its slot.
@@ -2949,10 +2960,10 @@ pub fn decodePicture(cpu: *Cpu, h: *h264.Decoder, bytes: [*]const u8) -> Status 
         index += 1
         const status = decodeSlice(cpu, h, &bytes[offset], length)
         if status == Status.empty { continue }
-        if status != Status.ok {
-            result = status
-            break
-        }
+        if status == Status.noMemory { return status }
+        // A broken or unsupported slice: the others still decoded, its
+        // macroblocks not reached concealed.
+        if status != Status.ok { result = status }
     }
     concealMissing(cpu)
     if !skipDeblocking { deblockPicture(cpu) }
@@ -2973,7 +2984,7 @@ fn decodeSlice(cpu: *Cpu, h: *h264.Decoder, nal: [*]const u8, length: usize) -> 
     prepareScaling(cpu)
     const lists = buildLists(cpu, h)
     if lists != Status.ok { return lists }
-    if cpu.*.header.sliceType == h264.SLICE_B { prepareImplicit(cpu, h) }
+    prepareRefs(cpu, h)
     if cpu.*.pps.*.std.flags.bits0 & video.StdVideoH264PpsFlags_entropy_coding_mode_flag != 0 {
         return decodeSliceCabac(cpu, cpu.*.header.qp)
     }
@@ -2981,10 +2992,61 @@ fn decodeSlice(cpu: *Cpu, h: *h264.Decoder, nal: [*]const u8, length: usize) -> 
 }
 
 
-fn prepareImplicit(cpu: *Cpu, h: *h264.Decoder) -> void {}
-
-// Macroblocks no slice covered (a lost slice): grey.
-fn concealMissing(cpu: *Cpu) -> void {}
+// Macroblocks no slice covered (a lost or broken slice): the samples
+// of the first reference picture where there is one, else grey; intra
+// for later pictures' direct prediction, left out by the deblocking
+// filter.
+fn concealMissing(cpu: *Cpu) -> void {
+    var source: ?*Frame = null
+    if cpu.*.refCount[0] > 0 && cpu.*.refs[0][0] < h264.SLOTS && cpu.*.refs[0][0] != cpu.*.slot {
+        const frame = &cpu.*.frames[cpu.*.refs[0][0]]
+        if frame.*.allocated { source = frame }
+    }
+    const width = @intCast(usize, cpu.*.width)
+    const cw = width / 2
+    const frame = cpu.*.frame
+    var addr: usize = 0
+    while addr < cpu.*.mbCount {
+        const mb = mbAt(cpu, addr)
+        if mb.*.slice != 0 {
+            addr += 1
+            continue
+        }
+        unsafe { zero(@ptrCast([*]u8, mb), @sizeOf(Mb)) }
+        mb.*.intra = true
+        mb.*.kind = MB_I_16X16
+        var k: usize = 0
+        while k < 4 {
+            mb.*.ref[0][k] = -1
+            mb.*.ref[1][k] = -1
+            k += 1
+        }
+        const px = (addr % @intCast(usize, cpu.*.widthMbs)) * 16
+        const py = (addr / @intCast(usize, cpu.*.widthMbs)) * 16
+        var y: usize = 0
+        while y < 16 {
+            var x: usize = 0
+            while x < 16 {
+                const at = (py + y) * width + px + x
+                frame.*.y[at] = if source != null { source.?.*.y[at] } else { 128 }
+                x += 1
+            }
+            y += 1
+        }
+        y = 0
+        while y < 8 {
+            var x: usize = 0
+            while x < 8 {
+                const at = (py / 2 + y) * cw + px / 2 + x
+                frame.*.cb[at] = if source != null { source.?.*.cb[at] } else { 128 }
+                frame.*.cr[at] = if source != null { source.?.*.cr[at] } else { 128 }
+                x += 1
+            }
+            y += 1
+        }
+        addr += 1
+    }
+}
 
 
 // The picture's motion per 4x4 block, kept with its frame for later B
@@ -3012,13 +3074,15 @@ fn storeMotion(cpu: *Cpu) -> void {
                     frame.*.refIds[at] = 0
                     frame.*.refPocs[at] = 0
                     frame.*.refLong[at] = 0
+                    frame.*.refIndex[at] = -1
                 } else {
                     frame.*.mvs[at * 2] = mb.*.mv[list][raster][0]
                     frame.*.mvs[at * 2 + 1] = mb.*.mv[list][raster][1]
                     frame.*.refIds[at] = mb.*.refId[list][blk8]
                     const refSlot = cpu.*.refs[list][@intCast(usize, ref)]
                     frame.*.refPocs[at] = if refSlot < h264.SLOTS { cpu.*.frames[refSlot].poc } else { 0 }
-                    frame.*.refLong[at] = 0
+                    frame.*.refLong[at] = if cpu.*.refIsLong[list][@intCast(usize, ref)] { 1 } else { 0 }
+                    frame.*.refIndex[at] = ref
                 }
                 list += 1
             }
@@ -4011,7 +4075,12 @@ fn parseMbCabac(cpu: *Cpu, mb: *Mb, p: *Parsed, qp: *i32) -> Status {
         mbType = cabacMbTypeI(cpu)
         intraType = mbType
     } else {
-        return Status.unsupported
+        mbType = cabacMbTypeB(cpu)
+        if mbType < 23 {
+            intra = false
+        } else {
+            intraType = mbType - 23
+        }
     }
     p.*.mbType = mbType
     mb.*.intra = intra
@@ -4046,14 +4115,17 @@ fn parseMbCabac(cpu: *Cpu, mb: *Mb, p: *Parsed, qp: *i32) -> Status {
             mb.*.cbp = (chroma << 4) | (if intraType >= 13 { @intCast(u32, 15) } else { @intCast(u32, 0) })
         }
         mb.*.chromaMode = cabacChromaMode(cpu)
-    } else {
+    } else if slice == h264.SLICE_P {
         mb.*.kind = MB_P_16X16 + @intCast(u8, mbType)
         const status = parseInterPCabac(cpu, mb, p, mbType)
+        if status != Status.ok { return status }
+    } else {
+        const status = parseInterB(cpu, mb, p, mbType, true)
         if status != Status.ok { return status }
     }
     if mb.*.kind != MB_I_16X16 {
         mb.*.cbp = cabacCbp(cpu, mb)
-        if !intra && mb.*.cbp & 15 != 0 && transform8x8Allowed(cpu) && interAllows8x8(mb, p) {
+        if !intra && mb.*.cbp & 15 != 0 && transform8x8Allowed(cpu) && interAllows8x8(cpu, mb, p) {
             mb.*.transform8x8 = cabacTransform8x8(cpu)
         }
     }
@@ -4114,6 +4186,492 @@ fn decodeSliceCabac(cpu: *Cpu, qpIn: i32) -> Status {
         addr += 1
         if terminate(cpu) == 1 { break }
         if cpu.*.bits.failed { return Status.corrupt }
+    }
+    return Status.ok
+}
+
+// ---- B macroblocks (7.3.5.1, 7.3.5.2, 8.4.1.2) ----
+
+// The prediction lists (1 L0, 2 L1, 3 both) of the partitions of B
+// mb_type 1..21 (Table 7-14).
+var B_PRED0 = [22]u8{0, 1, 2, 3, 1, 1, 2, 2, 1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3}
+var B_PRED1 = [22]u8{0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 1, 1, 3, 3, 3, 3, 1, 1, 2, 2, 3, 3}
+
+// sub_mb_type of B (Table 7-18): its lists (0: direct) and its shape as
+// a P sub_mb_type (8x8, 8x4, 4x8, 4x4).
+fn subPredB(t: u32) -> u32 {
+    if t == 0 { return 0 }
+    if t <= 3 { return t }
+    if t <= 5 { return 1 }
+    if t <= 7 { return 2 }
+    if t <= 9 { return 3 }
+    return t - 9
+}
+
+fn subShapeB(t: u32) -> u32 {
+    if t <= 3 { return 0 }
+    if t >= 10 { return 3 }
+    return if t & 1 == 0 { 1 } else { 2 }
+}
+
+// The slice's reference pictures: long-term or not, and implicit
+// bi-prediction's weights (8.4.2.3.1).
+fn prepareRefs(cpu: *Cpu, h: *h264.Decoder) -> void {
+    var list: usize = 0
+    while list < 2 {
+        var i: usize = 0
+        while i < @intCast(usize, cpu.*.refCount[list]) && i < MAX_REFS {
+            const slot = cpu.*.refs[list][i]
+            cpu.*.refIsLong[list][i] = slot < h264.SLOTS && isLongRef(h, cpu, slot)
+            i += 1
+        }
+        list += 1
+    }
+    if cpu.*.header.sliceType != h264.SLICE_B { return }
+    var i: usize = 0
+    while i < @intCast(usize, cpu.*.refCount[0]) && i < MAX_REFS {
+        var j: usize = 0
+        while j < @intCast(usize, cpu.*.refCount[1]) && j < MAX_REFS {
+            cpu.*.implicitWeights[i][j] = 32
+            const s0 = cpu.*.refs[0][i]
+            const s1 = cpu.*.refs[1][j]
+            if s0 < h264.SLOTS && s1 < h264.SLOTS && !cpu.*.refIsLong[0][i] && !cpu.*.refIsLong[1][j] {
+                const poc0 = cpu.*.frames[s0].poc
+                const poc1 = cpu.*.frames[s1].poc
+                if poc1 != poc0 {
+                    const dsf = distScale(cpu.*.poc, poc0, poc1)
+                    if (dsf >> 2) >= -64 && (dsf >> 2) <= 128 { cpu.*.implicitWeights[i][j] = dsf >> 2 }
+                }
+            }
+            j += 1
+        }
+        i += 1
+    }
+}
+
+// DistScaleFactor (8.4.1.2.3) of the current picture between pictures
+// of POC poc0 and poc1 (different).
+fn distScale(poc: i32, poc0: i32, poc1: i32) -> i32 {
+    const tb = clip3(-128, 127, poc - poc0)
+    const td = clip3(-128, 127, poc1 - poc0)
+    const tx = (16384 + absolute(td / 2)) / td
+    return clip3(-1024, 1023, (tb * tx + 32) >> 6)
+}
+
+fn minPositive(a: i32, b: i32) -> i32 {
+    if a >= 0 && b >= 0 { return if a < b { a } else { b } }
+    return if a > b { a } else { b }
+}
+
+// The colocated 4x4 block (8.4.1.2.1) of raster block `raster` of the
+// current macroblock in RefPicList1[0]: its vector and reference index
+// (-1: intra or none), and the referenced picture's id.
+const Colocated = struct {
+    ref: i32
+    mvx: i32
+    mvy: i32
+    id: u32
+}
+
+fn colocated(cpu: *Cpu, raster: usize) -> Colocated {
+    var col = Colocated.{ .ref = -1, .mvx = 0, .mvy = 0, .id = 0 }
+    const slot = cpu.*.refs[1][0]
+    if cpu.*.refCount[1] == 0 || slot >= h264.SLOTS { return col }
+    const frame = &cpu.*.frames[slot]
+    if !frame.*.allocated { return col }
+    var x = raster & 3
+    var y = raster >> 2
+    if direct8x8(cpu) {
+        // The macroblock's corner blocks.
+        x = if x >= 2 { 3 } else { 0 }
+        y = if y >= 2 { 3 } else { 0 }
+    }
+    const widthBlocks = @intCast(usize, cpu.*.widthMbs) * 4
+    if frame.*.intraMb[@intCast(usize, cpu.*.mbAddr)] != 0 { return col }
+    const block = (@intCast(usize, cpu.*.mbY) * 4 + y) * widthBlocks + @intCast(usize, cpu.*.mbX) * 4 + x
+    var at = block * 2
+    if frame.*.refIndex[at] < 0 { at += 1 }
+    if frame.*.refIndex[at] < 0 { return col }
+    col.ref = @intCast(i32, frame.*.refIndex[at])
+    col.mvx = @intCast(i32, frame.*.mvs[at * 2])
+    col.mvy = @intCast(i32, frame.*.mvs[at * 2 + 1])
+    col.id = frame.*.refIds[at]
+    return col
+}
+
+// The direct prediction (8.4.1.2) of the current macroblock's 8x8 blocks
+// in `mask` (bit per 8x8 block).
+fn predictDirect(cpu: *Cpu, mb: *Mb, mask: u32) -> void {
+    if cpu.*.header.directSpatial {
+        directSpatial(cpu, mb, mask)
+    } else {
+        directTemporal(cpu, mb, mask)
+    }
+}
+
+fn directSpatial(cpu: *Cpu, mb: *Mb, mask: u32) -> void {
+    var refs: [2]i32 = undefined
+    var list: usize = 0
+    while list < 2 {
+        const a = motionAt(cpu, list, -1, 0, 0)
+        const b = motionAt(cpu, list, 0, -1, 0)
+        var c = motionAt(cpu, list, 4, -1, 0)
+        if !c.available { c = motionAt(cpu, list, -1, -1, 0) }
+        refs[list] = minPositive(a.ref, minPositive(b.ref, c.ref))
+        list += 1
+    }
+    var zero = false
+    if refs[0] < 0 && refs[1] < 0 {
+        refs[0] = 0
+        refs[1] = 0
+        zero = true
+    }
+    var mvp: [2][2]i32 = undefined
+    list = 0
+    while list < 2 {
+        mvp[list][0] = 0
+        mvp[list][1] = 0
+        if !zero && refs[list] >= 0 { predictMv(cpu, list, 0, 0, 4, 4, refs[list], 0, 0, &mvp[list][0], &mvp[list][1]) }
+        list += 1
+    }
+    const colShort = !cpu.*.refIsLong[1][0]
+    var b8: usize = 0
+    while b8 < 4 {
+        if mask & (@intCast(u32, 1) << @intCast(u5, b8)) == 0 {
+            b8 += 1
+            continue
+        }
+        mb.*.direct[b8] = true
+        list = 0
+        while list < 2 {
+            mb.*.ref[list][b8] = @intCast(i8, refs[list])
+            mb.*.refId[list][b8] = if refs[list] >= 0 { refIdOf(cpu, list, refs[list]) } else { 0 }
+            list += 1
+        }
+        var sub: usize = 0
+        while sub < 4 {
+            const raster = (b8 >> 1) * 8 + (b8 & 1) * 2 + (sub >> 1) * 4 + (sub & 1)
+            var colZero = false
+            if !zero && colShort && (refs[0] == 0 || refs[1] == 0) {
+                const col = colocated(cpu, raster)
+                colZero = col.ref == 0 && col.mvx >= -1 && col.mvx <= 1 && col.mvy >= -1 && col.mvy <= 1
+            }
+            list = 0
+            while list < 2 {
+                var mvx: i32 = 0
+                var mvy: i32 = 0
+                if !zero && refs[list] >= 0 && !(refs[list] == 0 && colZero) {
+                    mvx = mvp[list][0]
+                    mvy = mvp[list][1]
+                }
+                _ = setMotion(mb, list, @intCast(i32, raster & 3), @intCast(i32, raster >> 2), 1, 1, mvx, mvy, 0, 0)
+                list += 1
+            }
+            sub += 1
+        }
+        b8 += 1
+    }
+}
+
+fn directTemporal(cpu: *Cpu, mb: *Mb, mask: u32) -> void {
+    var b8: usize = 0
+    while b8 < 4 {
+        if mask & (@intCast(u32, 1) << @intCast(u5, b8)) == 0 {
+            b8 += 1
+            continue
+        }
+        mb.*.direct[b8] = true
+        var sub: usize = 0
+        while sub < 4 {
+            const raster = (b8 >> 1) * 8 + (b8 & 1) * 2 + (sub >> 1) * 4 + (sub & 1)
+            const col = colocated(cpu, raster)
+            var ref0: i32 = 0
+            if col.ref >= 0 {
+                // The lowest index of list 0 referencing the colocated
+                // block's reference picture.
+                var i: u32 = 0
+                while i < cpu.*.refCount[0] {
+                    const slot = cpu.*.refs[0][i]
+                    if slot < h264.SLOTS && cpu.*.frames[slot].id == col.id {
+                        ref0 = @intCast(i32, i)
+                        break
+                    }
+                    i += 1
+                }
+            }
+            var mv0x = col.mvx
+            var mv0y = col.mvy
+            var mv1x: i32 = 0
+            var mv1y: i32 = 0
+            const s0 = cpu.*.refs[0][@intCast(usize, ref0)]
+            const s1 = cpu.*.refs[1][0]
+            if s0 < h264.SLOTS && s1 < h264.SLOTS && !cpu.*.refIsLong[0][@intCast(usize, ref0)] {
+                const poc0 = cpu.*.frames[s0].poc
+                const poc1 = cpu.*.frames[s1].poc
+                if poc1 != poc0 {
+                    const dsf = distScale(cpu.*.poc, poc0, poc1)
+                    mv0x = (dsf * col.mvx + 128) >> 8
+                    mv0y = (dsf * col.mvy + 128) >> 8
+                    mv1x = mv0x - col.mvx
+                    mv1y = mv0y - col.mvy
+                }
+            }
+            if sub == 0 {
+                mb.*.ref[0][b8] = @intCast(i8, ref0)
+                mb.*.ref[1][b8] = 0
+                mb.*.refId[0][b8] = refIdOf(cpu, 0, ref0)
+                mb.*.refId[1][b8] = refIdOf(cpu, 1, 0)
+            }
+            const x = @intCast(i32, raster & 3)
+            const y = @intCast(i32, raster >> 2)
+            _ = setMotion(mb, 0, x, y, 1, 1, mv0x, mv0y, 0, 0)
+            _ = setMotion(mb, 1, x, y, 1, 1, mv1x, mv1y, 0, 0)
+            sub += 1
+        }
+        b8 += 1
+    }
+}
+
+// B_Skip (and B_Direct_16x16's prediction).
+fn skipB(cpu: *Cpu, mb: *Mb) -> Status {
+    mb.*.kind = MB_B_SKIP
+    mb.*.skip = true
+    mb.*.intra = false
+    predictDirect(cpu, mb, 15)
+    return Status.ok
+}
+
+// The geometry of a partition: P mb_type semantics (0 16x16, 1 16x8,
+// 2 8x16, 3 8x8) as partOrigin's.
+fn partSize(shape: u32, w: *i32, h: *i32) -> void {
+    w.* = 4
+    h.* = 4
+    if shape == 1 { h.* = 2 }
+    if shape == 2 { w.* = 2 }
+    if shape >= 3 {
+        w.* = 2
+        h.* = 2
+    }
+}
+
+fn readRef(cpu: *Cpu, cabac: bool, list: usize, x: i32, y: i32, done: u32) -> i32 {
+    const active = cpu.*.header.active[list]
+    if active <= 1 { return 0 }
+    if cabac { return cabacRefIdx(cpu, list, x, y, done) }
+    return @intCast(i32, bits_module.te(&cpu.*.bits, active - 1))
+}
+
+fn cabacSubTypeB(cpu: *Cpu) -> u32 {
+    if decision(cpu, 36) == 0 { return 0 }
+    if decision(cpu, 37) == 0 { return 1 + decision(cpu, 39) }
+    var t: u32 = 3
+    if decision(cpu, 38) == 1 {
+        if decision(cpu, 39) == 1 { return 11 + decision(cpu, 39) }
+        t += 4
+    }
+    t += 2 * decision(cpu, 39)
+    t += decision(cpu, 39)
+    return t
+}
+
+// mb_type of a B slice: 0..22, or 23 + an I type.
+fn cabacMbTypeB(cpu: *Cpu) -> u32 {
+    const a = mbA(cpu)
+    const b = mbB(cpu)
+    const inc = flagOf(a != null && a.?.*.kind != MB_B_SKIP && a.?.*.kind != MB_B_DIRECT) + flagOf(b != null && b.?.*.kind != MB_B_SKIP && b.?.*.kind != MB_B_DIRECT)
+    if decision(cpu, 27 + inc) == 0 { return 0 }
+    if decision(cpu, 30) == 0 { return 1 + decision(cpu, 32) }
+    var bits = decision(cpu, 31) << 3
+    bits |= decision(cpu, 32) << 2
+    bits |= decision(cpu, 32) << 1
+    bits |= decision(cpu, 32)
+    if bits < 8 { return bits + 3 }
+    if bits == 13 {
+        // The I suffix (ctxIdxOffset 32).
+        if decision(cpu, 32) == 0 { return 23 }
+        return 23 + cabacIntraRest(cpu, 32, true)
+    }
+    if bits == 14 { return 11 }
+    if bits == 15 { return 22 }
+    bits = (bits << 1) | decision(cpu, 32)
+    return bits - 4
+}
+
+// The prediction of a B macroblock of mb_type 0..22: its references and
+// vectors (read by CAVLC or CABAC), the direct ones derived.
+fn parseInterB(cpu: *Cpu, mb: *Mb, p: *Parsed, mbType: u32, cabac: bool) -> Status {
+    const b = &cpu.*.bits
+    if mbType == 0 {
+        mb.*.kind = MB_B_DIRECT
+        predictDirect(cpu, mb, 15)
+        return Status.ok
+    }
+    var shape: u32 = 0
+    var partCount: usize = 1
+    var preds: [4]u32 = undefined
+    if mbType == 22 {
+        mb.*.kind = MB_B_8X8
+        shape = 3
+        partCount = 4
+        var k: usize = 0
+        while k < 4 {
+            p.*.subTypes[k] = if cabac { cabacSubTypeB(cpu) } else { bits_module.ue(b) }
+            if p.*.subTypes[k] > 12 { return Status.corrupt }
+            preds[k] = subPredB(p.*.subTypes[k])
+            if preds[k] == 0 { mb.*.direct[k] = true }
+            k += 1
+        }
+    } else if mbType <= 3 {
+        mb.*.kind = MB_B_16X16
+        preds[0] = @intCast(u32, B_PRED0[mbType])
+    } else {
+        mb.*.kind = if mbType & 1 == 0 { MB_B_16X8 } else { MB_B_8X16 }
+        shape = if mbType & 1 == 0 { 1 } else { 2 }
+        partCount = 2
+        preds[0] = @intCast(u32, B_PRED0[mbType])
+        preds[1] = @intCast(u32, B_PRED1[mbType])
+    }
+    // ref_idx_l0 then ref_idx_l1, each partition's at once into mb.
+    var list: usize = 0
+    while list < 2 {
+        var k: usize = 0
+        while k < partCount {
+            if preds[k] & (@intCast(u32, 1) << @intCast(u5, list)) != 0 {
+                var x: i32 = 0
+                var y: i32 = 0
+                partOrigin(shape, k, &x, &y)
+                const ref = readRef(cpu, cabac, list, x, y, partDone(shape, k))
+                if ref < 0 || ref >= @intCast(i32, cpu.*.header.active[list]) { return Status.corrupt }
+                p.*.refs[list][k] = ref
+                setPartRef(mb, list, shape, k, ref)
+            }
+            k += 1
+        }
+        list += 1
+    }
+    // mvd_l0 then mvd_l1, at k * 4 + sub-partition.
+    list = 0
+    while list < 2 {
+        var k: usize = 0
+        while k < partCount {
+            if preds[k] & (@intCast(u32, 1) << @intCast(u5, list)) != 0 {
+                var x: i32 = 0
+                var y: i32 = 0
+                partOrigin(shape, k, &x, &y)
+                var w: i32 = 0
+                var h: i32 = 0
+                partSize(shape, &w, &h)
+                var subType: u32 = 0
+                if shape == 3 { subType = subShapeB(p.*.subTypes[k]) }
+                const parts = subParts(subType)
+                var j: u32 = 0
+                while j < parts {
+                    var sx = x
+                    var sy = y
+                    var sw = w
+                    var sh = h
+                    if shape == 3 {
+                        sw = subWidth(subType)
+                        sh = subHeight(subType)
+                        if subType == 1 { sy += @intCast(i32, j) }
+                        if subType == 2 { sx += @intCast(i32, j) }
+                        if subType == 3 {
+                            sx += @intCast(i32, j & 1)
+                            sy += @intCast(i32, j >> 1)
+                        }
+                    }
+                    const index = k * 4 + @intCast(usize, j)
+                    if cabac {
+                        readMvd(cpu, mb, p, list, index, sx, sy, sw, sh)
+                    } else {
+                        p.*.mvd[list][index][0] = bits_module.se(b)
+                        p.*.mvd[list][index][1] = bits_module.se(b)
+                    }
+                    j += 1
+                }
+            }
+            k += 1
+        }
+        list += 1
+    }
+    if b.*.failed { return Status.corrupt }
+    // The direct sub-macroblocks, then the others' vectors in order.
+    var directMask: u32 = 0
+    var k: usize = 0
+    while k < partCount {
+        if shape == 3 && preds[k] == 0 { directMask |= @intCast(u32, 1) << @intCast(u5, k) }
+        k += 1
+    }
+    if directMask != 0 { predictDirect(cpu, mb, directMask) }
+    k = 0
+    while k < partCount {
+        if preds[k] == 0 {
+            k += 1
+            continue
+        }
+        var x: i32 = 0
+        var y: i32 = 0
+        partOrigin(shape, k, &x, &y)
+        var w: i32 = 0
+        var h: i32 = 0
+        partSize(shape, &w, &h)
+        const before = partDone(shape, k)
+        list = 0
+        while list < 2 {
+            if preds[k] & (@intCast(u32, 1) << @intCast(u5, list)) == 0 {
+                list += 1
+                continue
+            }
+            const ref = p.*.refs[list][k]
+            var by = y
+            while by < y + h {
+                var bx = x
+                while bx < x + w {
+                    const blk8 = @intCast(usize, (by >> 1) * 2 + (bx >> 1))
+                    mb.*.refId[list][blk8] = refIdOf(cpu, list, ref)
+                    bx += 2
+                }
+                by += 2
+            }
+            var done = before
+            if shape == 3 {
+                const subType = subShapeB(p.*.subTypes[k])
+                const parts = subParts(subType)
+                const sw = subWidth(subType)
+                const sh = subHeight(subType)
+                var j: u32 = 0
+                while j < parts {
+                    var sx = x
+                    var sy = y
+                    if subType == 1 { sy += @intCast(i32, j) }
+                    if subType == 2 { sx += @intCast(i32, j) }
+                    if subType == 3 {
+                        sx += @intCast(i32, j & 1)
+                        sy += @intCast(i32, j >> 1)
+                    }
+                    var mvx: i32 = 0
+                    var mvy: i32 = 0
+                    predictMv(cpu, list, sx, sy, sw, sh, ref, 0, done, &mvx, &mvy)
+                    const index = k * 4 + @intCast(usize, j)
+                    const dx = p.*.mvd[list][index][0]
+                    const dy = p.*.mvd[list][index][1]
+                    done |= setMotion(mb, list, sx, sy, sw, sh, mvx + dx, mvy + dy, dx, dy)
+                    j += 1
+                }
+            } else {
+                var form: u32 = 0
+                if shape == 1 { form = @intCast(u32, k) + 1 }
+                if shape == 2 { form = @intCast(u32, k) + 3 }
+                var mvx: i32 = 0
+                var mvy: i32 = 0
+                predictMv(cpu, list, x, y, w, h, ref, form, done, &mvx, &mvy)
+                const dx = p.*.mvd[list][k * 4][0]
+                const dy = p.*.mvd[list][k * 4][1]
+                _ = setMotion(mb, list, x, y, w, h, mvx + dx, mvy + dy, dx, dy)
+            }
+            list += 1
+        }
+        k += 1
     }
     return Status.ok
 }
