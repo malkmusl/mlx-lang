@@ -1,0 +1,1424 @@
+// std.h265: reads H.265 / HEVC (ITU-T H.265 / ISO/IEC 23008-2) streams as
+// far as a decoder that is given whole pictures needs, as std.h264 does
+// for H.264: NAL units (two-byte headers; Annex B start codes or length
+// prefixes), video, sequence and picture parameter sets into the Vulkan
+// video registry's structures (std.vulkan.video), the first slice
+// segment header of each picture, and the decoding process around the
+// pictures: picture order counts (8.3.1), the reference picture set and
+// the marking it makes (8.3.2), RASL pictures after a random access
+// point skipped, the decoded picture buffer with its slots and the
+// output order (C.5.2's bumping, latency included). What comes out per
+// access unit is what VkVideoDecodeInfoKHR needs: the picture's slot and
+// StdVideoDecodeH265PictureInfo (the reference picture set's current
+// lists as slots), the reference slots with their
+// StdVideoDecodeH265ReferenceInfo, and the slice segments' offsets.
+//
+//     const h = h265.create(allocator)
+//     h265.parameterSet(h, nal, length)      (each hvcC NAL unit, or inline)
+//     h265.accessUnit(h, sample, length, 4)  (an MP4 sample: length-prefixed NALs)
+//     ... h.*.picture (decode it), then h265.finishPicture(h)
+//     while h265.nextOutput(h, &slot, &poc) { ... present the slot }
+//     h265.flush(h)                           (at the end of the stream)
+//
+// One layer (nuh_layer_id 0; others are ignored), 4:2:0 or 4:0:0.
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const video = @import("./vulkan/video.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const Status = enum(u8) {
+    ok,
+    // Nothing to decode in the access unit (no slice, or a RASL picture
+    // whose references are not there).
+    empty,
+    corrupt,
+    unsupported,
+    noMemory
+}
+
+pub const MAX_VPS: usize = 16
+pub const MAX_SPS: usize = 16
+pub const MAX_PPS: usize = 64
+pub const DPB_SIZE: usize = 16
+pub const SLOTS: usize = DPB_SIZE + 1
+pub const MAX_SLICES: usize = 256
+pub const MAX_ST_RPS: usize = 65
+pub const MAX_LT: usize = 32
+const RBSP_CAPACITY: usize = 4096
+// A slot index that names no picture (RefPicSet lists).
+pub const NO_SLOT: u8 = 255
+
+pub const NAL_TRAIL_N: u8 = 0
+pub const NAL_RADL_N: u8 = 6
+pub const NAL_RADL_R: u8 = 7
+pub const NAL_RASL_N: u8 = 8
+pub const NAL_RASL_R: u8 = 9
+pub const NAL_BLA_W_LP: u8 = 16
+pub const NAL_BLA_N_LP: u8 = 18
+pub const NAL_IDR_W_RADL: u8 = 19
+pub const NAL_IDR_N_LP: u8 = 20
+pub const NAL_CRA: u8 = 21
+pub const NAL_VPS: u8 = 32
+pub const NAL_SPS: u8 = 33
+pub const NAL_PPS: u8 = 34
+pub const NAL_AUD: u8 = 35
+pub const NAL_EOS: u8 = 36
+pub const NAL_EOB: u8 = 37
+
+pub const SLICE_B: u32 = 0
+pub const SLICE_P: u32 = 1
+pub const SLICE_I: u32 = 2
+
+pub const Nal = struct {
+    kind: u8
+    layer: u8
+    temporalId: u8
+    // The NAL unit's bytes (its two header bytes first).
+    offset: usize
+    length: usize
+}
+
+fn header(bytes: [*]const u8, start: usize, nal: *Nal) -> void {
+    nal.*.kind = (bytes[start] >> 1) & 63
+    nal.*.layer = ((bytes[start] & 1) << 5) | (bytes[start + 1] >> 3)
+    const tid = bytes[start + 1] & 7
+    nal.*.temporalId = if tid > 0 { tid - 1 } else { 0 }
+}
+
+// The next NAL unit of an Annex B stream from `at` (moved past it).
+pub fn nextAnnexB(bytes: [*]const u8, length: usize, at: *usize, nal: *Nal) -> bool {
+    var start = at.*
+    while start + 3 <= length {
+        if bytes[start] == 0 && bytes[start + 1] == 0 && bytes[start + 2] == 1 { break }
+        start += 1
+    }
+    if start + 3 > length { return false }
+    start += 3
+    var end = start
+    while end + 3 <= length {
+        if bytes[end] == 0 && bytes[end + 1] == 0 && (bytes[end + 2] == 1 || bytes[end + 2] == 0) { break }
+        end += 1
+    }
+    if end + 3 > length { end = length }
+    while end > start && bytes[end - 1] == 0 { end -= 1 }
+    if end < start + 2 {
+        at.* = end
+        return nextAnnexB(bytes, length, at, nal)
+    }
+    nal.*.offset = start
+    nal.*.length = end - start
+    header(bytes, start, nal)
+    at.* = end
+    return true
+}
+
+// The next NAL unit of a length-prefixed stream (an MP4 sample).
+pub fn nextPrefixed(bytes: [*]const u8, length: usize, prefix: usize, at: *usize, nal: *Nal) -> bool {
+    if at.* + prefix > length { return false }
+    var size: usize = 0
+    var index: usize = 0
+    while index < prefix {
+        size = (size << 8) | @intCast(usize, bytes[at.* + index])
+        index += 1
+    }
+    const start = at.* + prefix
+    if size < 2 || size > length - start { return false }
+    nal.*.offset = start
+    nal.*.length = size
+    header(bytes, start, nal)
+    at.* = start + size
+    return true
+}
+
+// ---- RBSP bits ----
+
+const Reader = struct {
+    bytes: [RBSP_CAPACITY]u8
+    length: usize
+    at: usize
+    failed: bool
+}
+
+// Copies a NAL unit's payload (after its two header bytes) with
+// emulation prevention bytes removed, up to RBSP_CAPACITY bytes.
+fn load(reader: *Reader, bytes: [*]const u8, length: usize) -> void {
+    var zeros: usize = 0
+    var index: usize = 2
+    reader.*.length = 0
+    reader.*.at = 0
+    reader.*.failed = false
+    while index < length && reader.*.length < RBSP_CAPACITY {
+        const byte = bytes[index]
+        index += 1
+        if zeros >= 2 && byte == 3 {
+            zeros = 0
+            continue
+        }
+        reader.*.bytes[reader.*.length] = byte
+        reader.*.length += 1
+        if byte == 0 { zeros += 1 } else { zeros = 0 }
+    }
+}
+
+fn bits(reader: *Reader, count: u32) -> u32 {
+    var value: u32 = 0
+    var left = count
+    while left > 0 {
+        const byteIndex = reader.*.at >> 3
+        if byteIndex >= reader.*.length {
+            reader.*.failed = true
+            return 0
+        }
+        const bit = @intCast(u32, reader.*.at & 7)
+        const available = 8 - bit
+        var take = left
+        if take > available { take = available }
+        const byte = @intCast(u32, reader.*.bytes[byteIndex])
+        const piece = (byte >> (available - take)) & ((@intCast(u32, 1) << take) - 1)
+        value = (value << take) | piece
+        reader.*.at += @intCast(usize, take)
+        left -= take
+    }
+    return value
+}
+
+fn skipBits(reader: *Reader, count: u32) -> void {
+    var left = count
+    while left > 0 {
+        const take: u32 = if left > 16 { 16 } else { left }
+        _ = bits(reader, take)
+        left -= take
+    }
+}
+
+fn flag(reader: *Reader) -> bool { return bits(reader, 1) == 1 }
+
+fn ue(reader: *Reader) -> u32 {
+    var zeros: u32 = 0
+    while bits(reader, 1) == 0 {
+        zeros += 1
+        if zeros > 31 || reader.*.failed {
+            reader.*.failed = true
+            return 0
+        }
+    }
+    if zeros == 0 { return 0 }
+    return ((@intCast(u32, 1) << zeros) - 1) + bits(reader, zeros)
+}
+
+fn se(reader: *Reader) -> i32 {
+    const code = ue(reader)
+    const magnitude = @intCast(i32, (code + 1) / 2)
+    if code & 1 == 1 { return magnitude }
+    return -magnitude
+}
+
+// Ceil(Log2(value)).
+fn ceilLog2(value: u32) -> u32 {
+    var count: u32 = 0
+    while (@intCast(u32, 1) << count) < value { count += 1 }
+    return count
+}
+
+fn zeroBytes(target: [*]u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        target[index] = 0
+        index += 1
+    }
+}
+
+// ---- Parameter sets ----
+
+// A short-term reference picture set as derived (7.4.8): the negative
+// and positive POC deltas and whether the current picture uses each.
+pub const Rps = struct {
+    negative: u32
+    positive: u32
+    deltaS0: [16]i32
+    usedS0: [16]bool
+    deltaS1: [16]i32
+    usedS1: [16]bool
+}
+
+pub const Vps = struct {
+    present: bool
+    std: video.StdVideoH265VideoParameterSet
+    tierLevel: video.StdVideoH265ProfileTierLevel
+    bufferManagement: video.StdVideoH265DecPicBufMgr
+}
+
+pub const Sps = struct {
+    present: bool
+    std: video.StdVideoH265SequenceParameterSet
+    tierLevel: video.StdVideoH265ProfileTierLevel
+    bufferManagement: video.StdVideoH265DecPicBufMgr
+    scaling: video.StdVideoH265ScalingLists
+    stRpsSyntax: [MAX_ST_RPS]video.StdVideoH265ShortTermRefPicSet
+    longTerm: video.StdVideoH265LongTermRefPicsSps
+    rps: [MAX_ST_RPS]Rps
+    // Derived.
+    width: u32
+    height: u32
+    // The conformance window in luma samples.
+    cropLeft: u32
+    cropRight: u32
+    cropTop: u32
+    cropBottom: u32
+    log2CtbSize: u32
+    picSizeInCtbs: u32
+    maxPocLsb: u32
+    // The DPB's size in pictures, the reordering and the latency (the
+    // highest sub-layer's); SpsMaxLatencyPictures, 0 when none.
+    dpbPictures: u32
+    reorderPictures: u32
+    latencyPictures: u32
+    // The VUI's colour: matrix_coefficients (2 when not said) and range.
+    matrix: u32
+    fullRange: bool
+}
+
+pub const Pps = struct {
+    present: bool
+    std: video.StdVideoH265PictureParameterSet
+    scaling: video.StdVideoH265ScalingLists
+    spsId: u32
+}
+
+// Table 7-6: the default 8x8 (and larger) lists, in scan order.
+var DEFAULT_INTRA = [64]u8{ 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18, 17, 18, 18, 17, 18, 21, 19, 20, 21, 20, 19, 21, 24, 22, 22, 24, 24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31, 29, 36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115 }
+var DEFAULT_INTER = [64]u8{ 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 20, 20, 20, 20, 20, 20, 20, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28, 28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91 }
+
+// The list of size `sizeId` (0 4x4 .. 3 32x32) and matrix (32x32: 0 or
+// 1 for matrices 0 and 3) in the Vulkan structure, and its DC.
+fn listAt(lists: *video.StdVideoH265ScalingLists, sizeId: u32, matrix: usize) -> [*]u8 {
+    if sizeId == 0 { return &lists.*.ScalingList4x4[matrix] }
+    if sizeId == 1 { return &lists.*.ScalingList8x8[matrix] }
+    if sizeId == 2 { return &lists.*.ScalingList16x16[matrix] }
+    return &lists.*.ScalingList32x32[matrix]
+}
+
+fn setDefault(lists: *video.StdVideoH265ScalingLists, sizeId: u32, matrixId: u32) -> void {
+    const slot = if sizeId == 3 { @intCast(usize, matrixId / 3) } else { @intCast(usize, matrixId) }
+    const list = listAt(lists, sizeId, slot)
+    if sizeId == 0 {
+        var k: usize = 0
+        while k < 16 {
+            list[k] = 16
+            k += 1
+        }
+        return
+    }
+    var k: usize = 0
+    while k < 64 {
+        list[k] = if matrixId < 3 { DEFAULT_INTRA[k] } else { DEFAULT_INTER[k] }
+        k += 1
+    }
+    if sizeId == 2 { lists.*.ScalingListDCCoef16x16[slot] = 16 }
+    if sizeId == 3 { lists.*.ScalingListDCCoef32x32[slot] = 16 }
+}
+
+pub fn defaultScaling(lists: *video.StdVideoH265ScalingLists) -> void {
+    var sizeId: u32 = 0
+    while sizeId < 4 {
+        var matrixId: u32 = 0
+        while matrixId < 6 {
+            setDefault(lists, sizeId, matrixId)
+            matrixId += if sizeId == 3 { @intCast(u32, 3) } else { @intCast(u32, 1) }
+        }
+        sizeId += 1
+    }
+}
+
+// scaling_list_data() (7.3.4).
+fn scalingListData(reader: *Reader, lists: *video.StdVideoH265ScalingLists) -> void {
+    var sizeId: u32 = 0
+    while sizeId < 4 {
+        const step: u32 = if sizeId == 3 { 3 } else { 1 }
+        var matrixId: u32 = 0
+        while matrixId < 6 {
+            const slot = if sizeId == 3 { @intCast(usize, matrixId / 3) } else { @intCast(usize, matrixId) }
+            const list = listAt(lists, sizeId, slot)
+            const count: usize = if sizeId == 0 { 16 } else { 64 }
+            if !flag(reader) {
+                const delta = ue(reader) * step
+                if delta == 0 || delta > matrixId {
+                    setDefault(lists, sizeId, matrixId)
+                } else {
+                    const refId = matrixId - delta
+                    const refSlot = if sizeId == 3 { @intCast(usize, refId / 3) } else { @intCast(usize, refId) }
+                    const source = listAt(lists, sizeId, refSlot)
+                    var k: usize = 0
+                    while k < count {
+                        list[k] = source[k]
+                        k += 1
+                    }
+                    if sizeId == 2 { lists.*.ScalingListDCCoef16x16[slot] = lists.*.ScalingListDCCoef16x16[refSlot] }
+                    if sizeId == 3 { lists.*.ScalingListDCCoef32x32[slot] = lists.*.ScalingListDCCoef32x32[refSlot] }
+                }
+            } else {
+                var next: i32 = 8
+                if sizeId > 1 {
+                    next = se(reader) + 8
+                    if sizeId == 2 { lists.*.ScalingListDCCoef16x16[slot] = @intCast(u8, next & 255) }
+                    if sizeId == 3 { lists.*.ScalingListDCCoef32x32[slot] = @intCast(u8, next & 255) }
+                }
+                var k: usize = 0
+                while k < count {
+                    next = (next + se(reader) + 256) & 255
+                    list[k] = @intCast(u8, next)
+                    k += 1
+                }
+            }
+            matrixId += step
+        }
+        sizeId += 1
+    }
+}
+
+// profile_tier_level(1, maxSubLayersMinus1) (7.3.3).
+fn profileTierLevel(reader: *Reader, maxSubLayersMinus1: u32, out: *video.StdVideoH265ProfileTierLevel) -> void {
+    _ = bits(reader, 2)
+    var flags: u32 = 0
+    if flag(reader) { flags |= video.StdVideoH265ProfileTierLevelFlags_general_tier_flag }
+    out.*.general_profile_idc = bits(reader, 5)
+    const compatibility = bits(reader, 32)
+    // A profile told by its compatibility flags alone.
+    if out.*.general_profile_idc == 0 {
+        var j: u32 = 1
+        while j < 32 {
+            if compatibility & (@intCast(u32, 0x80000000) >> j) != 0 {
+                out.*.general_profile_idc = j
+                break
+            }
+            j += 1
+        }
+    }
+    if flag(reader) { flags |= video.StdVideoH265ProfileTierLevelFlags_general_progressive_source_flag }
+    if flag(reader) { flags |= video.StdVideoH265ProfileTierLevelFlags_general_interlaced_source_flag }
+    if flag(reader) { flags |= video.StdVideoH265ProfileTierLevelFlags_general_non_packed_constraint_flag }
+    if flag(reader) { flags |= video.StdVideoH265ProfileTierLevelFlags_general_frame_only_constraint_flag }
+    skipBits(reader, 44)
+    out.*.flags.bits0 = flags
+    out.*.general_level_idc = levelOf(bits(reader, 8))
+    var profilePresent: [8]bool = undefined
+    var levelPresent: [8]bool = undefined
+    var i: u32 = 0
+    while i < maxSubLayersMinus1 {
+        profilePresent[i] = flag(reader)
+        levelPresent[i] = flag(reader)
+        i += 1
+    }
+    if maxSubLayersMinus1 > 0 {
+        i = maxSubLayersMinus1
+        while i < 8 {
+            _ = bits(reader, 2)
+            i += 1
+        }
+    }
+    i = 0
+    while i < maxSubLayersMinus1 {
+        if profilePresent[i] { skipBits(reader, 88) }
+        if levelPresent[i] { _ = bits(reader, 8) }
+        i += 1
+    }
+}
+
+// general_level_idc (30 x the level) as StdVideoH265LevelIdc.
+fn levelOf(value: u32) -> u32 {
+    if value <= 30 { return video.STD_VIDEO_H265_LEVEL_IDC_1_0 }
+    if value <= 60 { return video.STD_VIDEO_H265_LEVEL_IDC_2_0 }
+    if value <= 63 { return video.STD_VIDEO_H265_LEVEL_IDC_2_1 }
+    if value <= 90 { return video.STD_VIDEO_H265_LEVEL_IDC_3_0 }
+    if value <= 93 { return video.STD_VIDEO_H265_LEVEL_IDC_3_1 }
+    if value <= 120 { return video.STD_VIDEO_H265_LEVEL_IDC_4_0 }
+    if value <= 123 { return video.STD_VIDEO_H265_LEVEL_IDC_4_1 }
+    if value <= 150 { return video.STD_VIDEO_H265_LEVEL_IDC_5_0 }
+    if value <= 153 { return video.STD_VIDEO_H265_LEVEL_IDC_5_1 }
+    if value <= 156 { return video.STD_VIDEO_H265_LEVEL_IDC_5_2 }
+    if value <= 180 { return video.STD_VIDEO_H265_LEVEL_IDC_6_0 }
+    if value <= 183 { return video.STD_VIDEO_H265_LEVEL_IDC_6_1 }
+    return video.STD_VIDEO_H265_LEVEL_IDC_6_2
+}
+
+// The sub-layer ordering info (VPS and SPS): every sub-layer's, the
+// ones not sent copied from the highest.
+fn orderingInfo(reader: *Reader, maxSubLayersMinus1: u32, present: bool, out: *video.StdVideoH265DecPicBufMgr) -> void {
+    var i: u32 = if present { 0 } else { maxSubLayersMinus1 }
+    while i <= maxSubLayersMinus1 {
+        out.*.max_dec_pic_buffering_minus1[i] = @intCast(u8, ue(reader) & 255)
+        out.*.max_num_reorder_pics[i] = @intCast(u8, ue(reader) & 255)
+        out.*.max_latency_increase_plus1[i] = ue(reader)
+        i += 1
+    }
+    if !present {
+        i = 0
+        while i < maxSubLayersMinus1 {
+            out.*.max_dec_pic_buffering_minus1[i] = out.*.max_dec_pic_buffering_minus1[maxSubLayersMinus1]
+            out.*.max_num_reorder_pics[i] = out.*.max_num_reorder_pics[maxSubLayersMinus1]
+            out.*.max_latency_increase_plus1[i] = out.*.max_latency_increase_plus1[maxSubLayersMinus1]
+            i += 1
+        }
+    }
+}
+
+fn parseVps(h: *Decoder, reader: *Reader) -> Status {
+    const id = @intCast(usize, bits(reader, 4))
+    const vps = &h.*.vps[id]
+    unsafe { zeroBytes(@ptrCast([*]u8, vps), @sizeOf(Vps)) }
+    _ = bits(reader, 2)
+    _ = bits(reader, 6)
+    const maxSubLayersMinus1 = bits(reader, 3)
+    var flags: u32 = 0
+    if flag(reader) { flags |= video.StdVideoH265VpsFlags_vps_temporal_id_nesting_flag }
+    _ = bits(reader, 16)
+    if maxSubLayersMinus1 > 6 { return Status.corrupt }
+    profileTierLevel(reader, maxSubLayersMinus1, &vps.*.tierLevel)
+    const orderingPresent = flag(reader)
+    if orderingPresent { flags |= video.StdVideoH265VpsFlags_vps_sub_layer_ordering_info_present_flag }
+    orderingInfo(reader, maxSubLayersMinus1, orderingPresent, &vps.*.bufferManagement)
+    if reader.*.failed { return Status.corrupt }
+    vps.*.std.flags.bits0 = flags
+    vps.*.std.vps_video_parameter_set_id = @intCast(u8, id)
+    vps.*.std.vps_max_sub_layers_minus1 = @intCast(u8, maxSubLayersMinus1)
+    vps.*.std.pDecPicBufMgr = &vps.*.bufferManagement
+    vps.*.std.pHrdParameters = null
+    vps.*.std.pProfileTierLevel = &vps.*.tierLevel
+    vps.*.present = true
+    return Status.ok
+}
+
+// st_ref_pic_set(index) (7.3.7) of the SPS's sets 0..count-1 (or the
+// slice header's, index == count), its syntax into `syntax` and the set
+// derived (7.4.8) into `out`.
+fn stRefPicSet(reader: *Reader, sps: *Sps, index: u32, count: u32, syntax: *video.StdVideoH265ShortTermRefPicSet, out: *Rps) -> Status {
+    unsafe { zeroBytes(@ptrCast([*]u8, syntax), @sizeOf(video.StdVideoH265ShortTermRefPicSet)) }
+    var predicted = false
+    if index != 0 { predicted = flag(reader) }
+    if predicted {
+        var deltaIdx: u32 = 1
+        if index == count { deltaIdx = ue(reader) + 1 }
+        if deltaIdx > index { return Status.corrupt }
+        const sign = flag(reader)
+        const absDelta = ue(reader) + 1
+        if absDelta > 32768 { return Status.corrupt }
+        syntax.*.flags.bits0 = video.StdVideoH265ShortTermRefPicSetFlags_inter_ref_pic_set_prediction_flag
+        if sign { syntax.*.flags.bits0 |= video.StdVideoH265ShortTermRefPicSetFlags_delta_rps_sign }
+        syntax.*.delta_idx_minus1 = deltaIdx - 1
+        syntax.*.abs_delta_rps_minus1 = @intCast(u16, absDelta - 1)
+        const deltaRps = if sign { -@intCast(i32, absDelta) } else { @intCast(i32, absDelta) }
+        const reference = &sps.*.rps[index - deltaIdx]
+        const numDelta = reference.*.negative + reference.*.positive
+        var used: [33]bool = undefined
+        var useDelta: [33]bool = undefined
+        var j: u32 = 0
+        while j <= numDelta {
+            used[j] = flag(reader)
+            useDelta[j] = true
+            if !used[j] { useDelta[j] = flag(reader) }
+            if used[j] { syntax.*.used_by_curr_pic_flag |= @intCast(u16, 1) << @intCast(u4, j & 15) }
+            if useDelta[j] { syntax.*.use_delta_flag |= @intCast(u16, 1) << @intCast(u4, j & 15) }
+            j += 1
+        }
+        // (7-61), (7-62).
+        var i: u32 = 0
+        var k: i32 = @intCast(i32, reference.*.positive) - 1
+        while k >= 0 {
+            const d = reference.*.deltaS1[@intCast(usize, k)] + deltaRps
+            const at = @intCast(usize, reference.*.negative) + @intCast(usize, k)
+            if d < 0 && useDelta[at] && i < 16 {
+                out.*.deltaS0[i] = d
+                out.*.usedS0[i] = used[at]
+                i += 1
+            }
+            k -= 1
+        }
+        if deltaRps < 0 && useDelta[numDelta] && i < 16 {
+            out.*.deltaS0[i] = deltaRps
+            out.*.usedS0[i] = used[numDelta]
+            i += 1
+        }
+        var n: u32 = 0
+        while n < reference.*.negative {
+            const d = reference.*.deltaS0[n] + deltaRps
+            if d < 0 && useDelta[n] && i < 16 {
+                out.*.deltaS0[i] = d
+                out.*.usedS0[i] = used[n]
+                i += 1
+            }
+            n += 1
+        }
+        out.*.negative = i
+        i = 0
+        k = @intCast(i32, reference.*.negative) - 1
+        while k >= 0 {
+            const d = reference.*.deltaS0[@intCast(usize, k)] + deltaRps
+            if d > 0 && useDelta[@intCast(usize, k)] && i < 16 {
+                out.*.deltaS1[i] = d
+                out.*.usedS1[i] = used[@intCast(usize, k)]
+                i += 1
+            }
+            k -= 1
+        }
+        if deltaRps > 0 && useDelta[numDelta] && i < 16 {
+            out.*.deltaS1[i] = deltaRps
+            out.*.usedS1[i] = used[numDelta]
+            i += 1
+        }
+        n = 0
+        while n < reference.*.positive {
+            const d = reference.*.deltaS1[n] + deltaRps
+            const at = @intCast(usize, reference.*.negative + n)
+            if d > 0 && useDelta[at] && i < 16 {
+                out.*.deltaS1[i] = d
+                out.*.usedS1[i] = used[at]
+                i += 1
+            }
+            n += 1
+        }
+        out.*.positive = i
+    } else {
+        out.*.negative = ue(reader)
+        out.*.positive = ue(reader)
+        if out.*.negative > 16 || out.*.positive > 16 || out.*.negative + out.*.positive > 16 { return Status.corrupt }
+        var previous: i32 = 0
+        var i: u32 = 0
+        while i < out.*.negative {
+            const delta = ue(reader) + 1
+            syntax.*.delta_poc_s0_minus1[i] = @intCast(u16, (delta - 1) & 65535)
+            previous -= @intCast(i32, delta)
+            out.*.deltaS0[i] = previous
+            out.*.usedS0[i] = flag(reader)
+            if out.*.usedS0[i] { syntax.*.used_by_curr_pic_s0_flag |= @intCast(u16, 1) << @intCast(u4, i) }
+            i += 1
+        }
+        previous = 0
+        i = 0
+        while i < out.*.positive {
+            const delta = ue(reader) + 1
+            syntax.*.delta_poc_s1_minus1[i] = @intCast(u16, (delta - 1) & 65535)
+            previous += @intCast(i32, delta)
+            out.*.deltaS1[i] = previous
+            out.*.usedS1[i] = flag(reader)
+            if out.*.usedS1[i] { syntax.*.used_by_curr_pic_s1_flag |= @intCast(u16, 1) << @intCast(u4, i) }
+            i += 1
+        }
+    }
+    syntax.*.num_negative_pics = @intCast(u8, out.*.negative)
+    syntax.*.num_positive_pics = @intCast(u8, out.*.positive)
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn parseSps(h: *Decoder, reader: *Reader) -> Status {
+    const vpsId = bits(reader, 4)
+    const maxSubLayersMinus1 = bits(reader, 3)
+    const nesting = flag(reader)
+    if maxSubLayersMinus1 > 6 { return Status.corrupt }
+    var tierLevel: video.StdVideoH265ProfileTierLevel = undefined
+    profileTierLevel(reader, maxSubLayersMinus1, &tierLevel)
+    const id = ue(reader)
+    if reader.*.failed || id >= @intCast(u32, MAX_SPS) { return Status.corrupt }
+    const sps = &h.*.sps[@intCast(usize, id)]
+    unsafe { zeroBytes(@ptrCast([*]u8, sps), @sizeOf(Sps)) }
+    sps.*.tierLevel = tierLevel
+    const s = &sps.*.std
+    var flags: u32 = 0
+    if nesting { flags |= video.StdVideoH265SpsFlags_sps_temporal_id_nesting_flag }
+    s.*.sps_video_parameter_set_id = @intCast(u8, vpsId)
+    s.*.sps_max_sub_layers_minus1 = @intCast(u8, maxSubLayersMinus1)
+    s.*.sps_seq_parameter_set_id = @intCast(u8, id)
+    s.*.chroma_format_idc = ue(reader)
+    if s.*.chroma_format_idc == 3 {
+        if flag(reader) { flags |= video.StdVideoH265SpsFlags_separate_colour_plane_flag }
+    }
+    s.*.pic_width_in_luma_samples = ue(reader)
+    s.*.pic_height_in_luma_samples = ue(reader)
+    if flag(reader) {
+        flags |= video.StdVideoH265SpsFlags_conformance_window_flag
+        s.*.conf_win_left_offset = ue(reader)
+        s.*.conf_win_right_offset = ue(reader)
+        s.*.conf_win_top_offset = ue(reader)
+        s.*.conf_win_bottom_offset = ue(reader)
+    }
+    s.*.bit_depth_luma_minus8 = @intCast(u8, ue(reader) & 255)
+    s.*.bit_depth_chroma_minus8 = @intCast(u8, ue(reader) & 255)
+    const log2MaxPocLsbMinus4 = ue(reader)
+    if log2MaxPocLsbMinus4 > 12 { return Status.corrupt }
+    s.*.log2_max_pic_order_cnt_lsb_minus4 = @intCast(u8, log2MaxPocLsbMinus4)
+    const orderingPresent = flag(reader)
+    if orderingPresent { flags |= video.StdVideoH265SpsFlags_sps_sub_layer_ordering_info_present_flag }
+    orderingInfo(reader, maxSubLayersMinus1, orderingPresent, &sps.*.bufferManagement)
+    s.*.log2_min_luma_coding_block_size_minus3 = @intCast(u8, ue(reader) & 255)
+    s.*.log2_diff_max_min_luma_coding_block_size = @intCast(u8, ue(reader) & 255)
+    s.*.log2_min_luma_transform_block_size_minus2 = @intCast(u8, ue(reader) & 255)
+    s.*.log2_diff_max_min_luma_transform_block_size = @intCast(u8, ue(reader) & 255)
+    s.*.max_transform_hierarchy_depth_inter = @intCast(u8, ue(reader) & 255)
+    s.*.max_transform_hierarchy_depth_intra = @intCast(u8, ue(reader) & 255)
+    defaultScaling(&sps.*.scaling)
+    if flag(reader) {
+        flags |= video.StdVideoH265SpsFlags_scaling_list_enabled_flag
+        if flag(reader) {
+            flags |= video.StdVideoH265SpsFlags_sps_scaling_list_data_present_flag
+            scalingListData(reader, &sps.*.scaling)
+        }
+    }
+    if flag(reader) { flags |= video.StdVideoH265SpsFlags_amp_enabled_flag }
+    if flag(reader) { flags |= video.StdVideoH265SpsFlags_sample_adaptive_offset_enabled_flag }
+    if flag(reader) {
+        flags |= video.StdVideoH265SpsFlags_pcm_enabled_flag
+        s.*.pcm_sample_bit_depth_luma_minus1 = @intCast(u8, bits(reader, 4))
+        s.*.pcm_sample_bit_depth_chroma_minus1 = @intCast(u8, bits(reader, 4))
+        s.*.log2_min_pcm_luma_coding_block_size_minus3 = @intCast(u8, ue(reader) & 255)
+        s.*.log2_diff_max_min_pcm_luma_coding_block_size = @intCast(u8, ue(reader) & 255)
+        if flag(reader) { flags |= video.StdVideoH265SpsFlags_pcm_loop_filter_disabled_flag }
+    }
+    const sets = ue(reader)
+    if sets > 64 { return Status.corrupt }
+    s.*.num_short_term_ref_pic_sets = @intCast(u8, sets)
+    var index: u32 = 0
+    while index < sets {
+        const status = stRefPicSet(reader, sps, index, sets, &sps.*.stRpsSyntax[index], &sps.*.rps[index])
+        if status != Status.ok { return status }
+        index += 1
+    }
+    if flag(reader) {
+        flags |= video.StdVideoH265SpsFlags_long_term_ref_pics_present_flag
+        const count = ue(reader)
+        if count > 32 { return Status.corrupt }
+        s.*.num_long_term_ref_pics_sps = @intCast(u8, count)
+        var i: u32 = 0
+        while i < count {
+            sps.*.longTerm.lt_ref_pic_poc_lsb_sps[i] = bits(reader, log2MaxPocLsbMinus4 + 4)
+            if flag(reader) { sps.*.longTerm.used_by_curr_pic_lt_sps_flag |= @intCast(u32, 1) << @intCast(u5, i) }
+            i += 1
+        }
+    }
+    if flag(reader) { flags |= video.StdVideoH265SpsFlags_sps_temporal_mvp_enabled_flag }
+    if flag(reader) { flags |= video.StdVideoH265SpsFlags_strong_intra_smoothing_enabled_flag }
+    sps.*.matrix = 2
+    // The VUI as far as the colour (what follows is not needed: the VUI is
+    // not handed to Vulkan, nor the extensions of profiles beyond Main 10).
+    if flag(reader) {
+        if flag(reader) {
+            if bits(reader, 8) == 255 { skipBits(reader, 32) }
+        }
+        if flag(reader) { _ = flag(reader) }
+        if flag(reader) {
+            _ = bits(reader, 3)
+            sps.*.fullRange = flag(reader)
+            if flag(reader) {
+                _ = bits(reader, 8)
+                _ = bits(reader, 8)
+                sps.*.matrix = bits(reader, 8)
+            }
+        }
+    }
+    if reader.*.failed { return Status.corrupt }
+    s.*.flags.bits0 = flags
+    s.*.pProfileTierLevel = &sps.*.tierLevel
+    s.*.pDecPicBufMgr = &sps.*.bufferManagement
+    s.*.pScalingLists = &sps.*.scaling
+    s.*.pShortTermRefPicSet = &sps.*.stRpsSyntax[0]
+    s.*.pLongTermRefPicsSps = &sps.*.longTerm
+    s.*.pSequenceParameterSetVui = null
+    s.*.pPredictorPaletteEntries = null
+    // Derived.
+    const minCb = @intCast(u32, s.*.log2_min_luma_coding_block_size_minus3) + 3
+    sps.*.log2CtbSize = minCb + @intCast(u32, s.*.log2_diff_max_min_luma_coding_block_size)
+    if sps.*.log2CtbSize > 6 || sps.*.log2CtbSize < 4 { return Status.corrupt }
+    sps.*.width = s.*.pic_width_in_luma_samples
+    sps.*.height = s.*.pic_height_in_luma_samples
+    if sps.*.width == 0 || sps.*.height == 0 || sps.*.width > 8192 || sps.*.height > 8192 { return Status.corrupt }
+    const ctb = @intCast(u32, 1) << @intCast(u5, sps.*.log2CtbSize)
+    sps.*.picSizeInCtbs = ((sps.*.width + ctb - 1) / ctb) * ((sps.*.height + ctb - 1) / ctb)
+    sps.*.maxPocLsb = @intCast(u32, 1) << @intCast(u5, log2MaxPocLsbMinus4 + 4)
+    const subWidth: u32 = if s.*.chroma_format_idc == 1 || s.*.chroma_format_idc == 2 { 2 } else { 1 }
+    const subHeight: u32 = if s.*.chroma_format_idc == 1 { 2 } else { 1 }
+    sps.*.cropLeft = s.*.conf_win_left_offset * subWidth
+    sps.*.cropRight = s.*.conf_win_right_offset * subWidth
+    sps.*.cropTop = s.*.conf_win_top_offset * subHeight
+    sps.*.cropBottom = s.*.conf_win_bottom_offset * subHeight
+    if sps.*.cropLeft + sps.*.cropRight >= sps.*.width || sps.*.cropTop + sps.*.cropBottom >= sps.*.height {
+        sps.*.cropLeft = 0
+        sps.*.cropRight = 0
+        sps.*.cropTop = 0
+        sps.*.cropBottom = 0
+    }
+    const highest = @intCast(usize, maxSubLayersMinus1)
+    sps.*.dpbPictures = @intCast(u32, sps.*.bufferManagement.max_dec_pic_buffering_minus1[highest]) + 1
+    if sps.*.dpbPictures > @intCast(u32, DPB_SIZE) { sps.*.dpbPictures = @intCast(u32, DPB_SIZE) }
+    sps.*.reorderPictures = @intCast(u32, sps.*.bufferManagement.max_num_reorder_pics[highest])
+    sps.*.latencyPictures = 0
+    const latency = sps.*.bufferManagement.max_latency_increase_plus1[highest]
+    if latency != 0 { sps.*.latencyPictures = sps.*.reorderPictures + latency - 1 }
+    sps.*.present = true
+    return Status.ok
+}
+
+fn parsePps(h: *Decoder, reader: *Reader) -> Status {
+    const id = ue(reader)
+    const spsId = ue(reader)
+    if reader.*.failed || id >= @intCast(u32, MAX_PPS) || spsId >= @intCast(u32, MAX_SPS) { return Status.corrupt }
+    const pps = &h.*.pps[@intCast(usize, id)]
+    unsafe { zeroBytes(@ptrCast([*]u8, pps), @sizeOf(Pps)) }
+    const p = &pps.*.std
+    var flags: u32 = 0
+    p.*.pps_pic_parameter_set_id = @intCast(u8, id)
+    p.*.pps_seq_parameter_set_id = @intCast(u8, spsId)
+    pps.*.spsId = spsId
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_dependent_slice_segments_enabled_flag }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_output_flag_present_flag }
+    p.*.num_extra_slice_header_bits = @intCast(u8, bits(reader, 3))
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_sign_data_hiding_enabled_flag }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_cabac_init_present_flag }
+    p.*.num_ref_idx_l0_default_active_minus1 = @intCast(u8, ue(reader) & 15)
+    p.*.num_ref_idx_l1_default_active_minus1 = @intCast(u8, ue(reader) & 15)
+    p.*.init_qp_minus26 = @intCast(i8, se(reader))
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_constrained_intra_pred_flag }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_transform_skip_enabled_flag }
+    if flag(reader) {
+        flags |= video.StdVideoH265PpsFlags_cu_qp_delta_enabled_flag
+        p.*.diff_cu_qp_delta_depth = @intCast(u8, ue(reader) & 255)
+    }
+    p.*.pps_cb_qp_offset = @intCast(i8, se(reader))
+    p.*.pps_cr_qp_offset = @intCast(i8, se(reader))
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_pps_slice_chroma_qp_offsets_present_flag }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_weighted_pred_flag }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_weighted_bipred_flag }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_transquant_bypass_enabled_flag }
+    const tiles = flag(reader)
+    if tiles { flags |= video.StdVideoH265PpsFlags_tiles_enabled_flag }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_entropy_coding_sync_enabled_flag }
+    if tiles {
+        const columns = ue(reader)
+        const rows = ue(reader)
+        if columns > 18 || rows > 20 { return Status.corrupt }
+        p.*.num_tile_columns_minus1 = @intCast(u8, columns)
+        p.*.num_tile_rows_minus1 = @intCast(u8, rows)
+        if flag(reader) {
+            flags |= video.StdVideoH265PpsFlags_uniform_spacing_flag
+        } else {
+            var i: u32 = 0
+            while i < columns {
+                p.*.column_width_minus1[i] = @intCast(u16, ue(reader) & 65535)
+                i += 1
+            }
+            i = 0
+            while i < rows {
+                p.*.row_height_minus1[i] = @intCast(u16, ue(reader) & 65535)
+                i += 1
+            }
+        }
+        if flag(reader) { flags |= video.StdVideoH265PpsFlags_loop_filter_across_tiles_enabled_flag }
+    }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_pps_loop_filter_across_slices_enabled_flag }
+    if flag(reader) {
+        flags |= video.StdVideoH265PpsFlags_deblocking_filter_control_present_flag
+        if flag(reader) { flags |= video.StdVideoH265PpsFlags_deblocking_filter_override_enabled_flag }
+        if flag(reader) {
+            flags |= video.StdVideoH265PpsFlags_pps_deblocking_filter_disabled_flag
+        } else {
+            p.*.pps_beta_offset_div2 = @intCast(i8, se(reader))
+            p.*.pps_tc_offset_div2 = @intCast(i8, se(reader))
+        }
+    }
+    // The SPS's lists unless the PPS has its own (Vulkan takes the PPS's
+    // when pps_scaling_list_data_present_flag is set).
+    defaultScaling(&pps.*.scaling)
+    if flag(reader) {
+        flags |= video.StdVideoH265PpsFlags_pps_scaling_list_data_present_flag
+        scalingListData(reader, &pps.*.scaling)
+    }
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_lists_modification_present_flag }
+    p.*.log2_parallel_merge_level_minus2 = @intCast(u8, ue(reader) & 255)
+    if flag(reader) { flags |= video.StdVideoH265PpsFlags_slice_segment_header_extension_present_flag }
+    if reader.*.failed { return Status.corrupt }
+    p.*.flags.bits0 = flags
+    p.*.pScalingLists = &pps.*.scaling
+    p.*.pPredictorPaletteEntries = null
+    pps.*.present = true
+    return Status.ok
+}
+
+// ---- Slice segment headers ----
+
+pub const Slice = struct {
+    nalType: u8
+    temporalId: u8
+    first: bool
+    noOutputOfPriorPics: bool
+    ppsId: u32
+    sliceType: u32
+    picOutputFlag: bool
+    pocLsb: u32
+    // The short-term set: the SPS's (index) or the slice's own.
+    stRpsFromSps: bool
+    stRpsIndex: u32
+    ownRps: Rps
+    ownRpsSyntax: video.StdVideoH265ShortTermRefPicSet
+    stRpsBits: u32
+    // NumDeltaPocs[RefRpsIdx] of the slice's own set when predicted.
+    refRpsDeltas: u32
+    // The long-term entries: PocLsbLt, UsedByCurrPicLt and the MSB.
+    ltCount: u32
+    ltPocLsb: [MAX_LT]u32
+    ltUsed: [MAX_LT]bool
+    ltMsbPresent: [MAX_LT]bool
+    ltMsbCycle: [MAX_LT]u32
+}
+
+fn isIrap(kind: u8) -> bool { return kind >= 16 && kind <= 23 }
+fn isIdr(kind: u8) -> bool { return kind == NAL_IDR_W_RADL || kind == NAL_IDR_N_LP }
+fn isRasl(kind: u8) -> bool { return kind == NAL_RASL_N || kind == NAL_RASL_R }
+// Sub-layer non-reference pictures (TRAIL_N, TSA_N, ... RSV_VCL_N14).
+fn isSubLayerNonReference(kind: u8) -> bool { return kind <= 14 && kind % 2 == 0 }
+
+// The first slice segment header of a picture (7.3.6.1) as far as the
+// decoding process here needs.
+fn parseSliceHeader(h: *Decoder, reader: *Reader, nal: *const Nal, slice: *Slice) -> Status {
+    slice.*.nalType = nal.*.kind
+    slice.*.temporalId = nal.*.temporalId
+    slice.*.first = flag(reader)
+    slice.*.noOutputOfPriorPics = false
+    if isIrap(nal.*.kind) { slice.*.noOutputOfPriorPics = flag(reader) }
+    slice.*.ppsId = ue(reader)
+    if reader.*.failed || slice.*.ppsId >= @intCast(u32, MAX_PPS) { return Status.corrupt }
+    const pps = &h.*.pps[@intCast(usize, slice.*.ppsId)]
+    if !pps.*.present { return Status.corrupt }
+    const sps = &h.*.sps[@intCast(usize, pps.*.spsId)]
+    if !sps.*.present { return Status.corrupt }
+    if !slice.*.first {
+        // Not a picture's first segment: nothing more is needed of it.
+        return Status.ok
+    }
+    skipBits(reader, @intCast(u32, pps.*.std.num_extra_slice_header_bits))
+    slice.*.sliceType = ue(reader)
+    slice.*.picOutputFlag = true
+    if pps.*.std.flags.bits0 & video.StdVideoH265PpsFlags_output_flag_present_flag != 0 { slice.*.picOutputFlag = flag(reader) }
+    if sps.*.std.flags.bits0 & video.StdVideoH265SpsFlags_separate_colour_plane_flag != 0 { _ = bits(reader, 2) }
+    slice.*.pocLsb = 0
+    slice.*.stRpsFromSps = false
+    slice.*.stRpsIndex = 0
+    slice.*.stRpsBits = 0
+    slice.*.refRpsDeltas = 0
+    slice.*.ltCount = 0
+    slice.*.ownRps.negative = 0
+    slice.*.ownRps.positive = 0
+    if !isIdr(nal.*.kind) {
+        slice.*.pocLsb = bits(reader, @intCast(u32, sps.*.std.log2_max_pic_order_cnt_lsb_minus4) + 4)
+        const sets = @intCast(u32, sps.*.std.num_short_term_ref_pic_sets)
+        slice.*.stRpsFromSps = flag(reader)
+        if !slice.*.stRpsFromSps {
+            const before = reader.*.at
+            const status = stRefPicSet(reader, sps, sets, sets, &slice.*.ownRpsSyntax, &slice.*.ownRps)
+            if status != Status.ok { return status }
+            slice.*.stRpsBits = @intCast(u32, reader.*.at - before)
+            if slice.*.ownRpsSyntax.flags.bits0 & video.StdVideoH265ShortTermRefPicSetFlags_inter_ref_pic_set_prediction_flag != 0 {
+                const reference = &sps.*.rps[sets - (slice.*.ownRpsSyntax.delta_idx_minus1 + 1)]
+                slice.*.refRpsDeltas = reference.*.negative + reference.*.positive
+            }
+        } else {
+            if sets == 0 { return Status.corrupt }
+            if sets > 1 { slice.*.stRpsIndex = bits(reader, ceilLog2(sets)) }
+            if slice.*.stRpsIndex >= sets { return Status.corrupt }
+        }
+        if sps.*.std.flags.bits0 & video.StdVideoH265SpsFlags_long_term_ref_pics_present_flag != 0 {
+            var fromSps: u32 = 0
+            const spsCount = @intCast(u32, sps.*.std.num_long_term_ref_pics_sps)
+            if spsCount > 0 { fromSps = ue(reader) }
+            const own = ue(reader)
+            if fromSps > spsCount || fromSps + own > @intCast(u32, MAX_LT) { return Status.corrupt }
+            slice.*.ltCount = fromSps + own
+            var i: u32 = 0
+            var cycle: u32 = 0
+            while i < slice.*.ltCount {
+                if i < fromSps {
+                    var index: u32 = 0
+                    if spsCount > 1 { index = bits(reader, ceilLog2(spsCount)) }
+                    slice.*.ltPocLsb[i] = sps.*.longTerm.lt_ref_pic_poc_lsb_sps[index & 31]
+                    slice.*.ltUsed[i] = sps.*.longTerm.used_by_curr_pic_lt_sps_flag & (@intCast(u32, 1) << @intCast(u5, index & 31)) != 0
+                } else {
+                    slice.*.ltPocLsb[i] = bits(reader, @intCast(u32, sps.*.std.log2_max_pic_order_cnt_lsb_minus4) + 4)
+                    slice.*.ltUsed[i] = flag(reader)
+                }
+                slice.*.ltMsbPresent[i] = flag(reader)
+                // DeltaPocMsbCycleLt (7-52): accumulated within each group.
+                var delta: u32 = 0
+                if slice.*.ltMsbPresent[i] { delta = ue(reader) }
+                if i == 0 || i == fromSps { cycle = delta } else { cycle += delta }
+                slice.*.ltMsbCycle[i] = cycle
+                i += 1
+            }
+        }
+    }
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+// ---- The decoded picture buffer ----
+
+pub const Frame = struct {
+    used: bool
+    held: bool
+    poc: i32
+    isReference: bool
+    isLongTerm: bool
+    neededForOutput: bool
+    // Pictures output after this one went into the DPB (C.5.2.3).
+    latency: u32
+    epoch: u32
+}
+
+// What a decoder needs for the current picture.
+pub const Picture = struct {
+    slot: usize
+    vpsId: u32
+    spsId: u32
+    ppsId: u32
+    width: u32
+    height: u32
+    isIrap: bool
+    isIdr: bool
+    poc: i32
+    info: video.StdVideoDecodeH265PictureInfo
+    referenceCount: usize
+    referenceSlots: [DPB_SIZE]usize
+    references: [DPB_SIZE]video.StdVideoDecodeH265ReferenceInfo
+    sliceCount: usize
+    // Each slice segment NAL's offset within the access unit's bytes and
+    // its length (the NAL unit with its header).
+    sliceOffsets: [MAX_SLICES]u32
+    sliceLengths: [MAX_SLICES]u32
+}
+
+pub const Decoder = struct {
+    allocator: Allocator
+    vps: [MAX_VPS]Vps
+    sps: [MAX_SPS]Sps
+    pps: [MAX_PPS]Pps
+    reader: Reader
+    slice: Slice
+    frames: [SLOTS]Frame
+    picture: Picture
+    inPicture: bool
+    flushing: bool
+    // The next picture starts a coded video sequence (the first, or after
+    // an end of sequence): its NoRaslOutputFlag is 1.
+    sequenceStart: bool
+    // NoRaslOutputFlag of the last IRAP picture (its RASL pictures are
+    // skipped when 1).
+    noRaslOutput: bool
+    // The previous TemporalId 0 picture's POC (8.3.1).
+    prevTid0Poc: i32
+    epoch: u32
+    holdOutputs: bool
+    activeSps: usize
+    dpbPictures: u32
+    reorderPictures: u32
+    latencyPictures: u32
+    decoded: u64
+}
+
+pub fn create(allocator: Allocator) -> ?*Decoder {
+    const memory = allocator.alloc(@sizeOf(Decoder), 16)
+    if memory == null { return null }
+    var h: *Decoder = undefined
+    unsafe { h = @ptrCast(*Decoder, memory.?) }
+    unsafe { zeroBytes(@ptrCast([*]u8, h), @sizeOf(Decoder)) }
+    h.*.allocator = allocator
+    h.*.activeSps = MAX_SPS
+    h.*.dpbPictures = 1
+    h.*.sequenceStart = true
+    return h
+}
+
+pub fn destroy(h: *Decoder) -> void {
+    unsafe { h.*.allocator.free(@ptrCast([*]u8, h), @sizeOf(Decoder), 16) }
+}
+
+pub fn vpsAt(h: *Decoder, id: usize) -> *Vps { return &h.*.vps[id] }
+pub fn spsAt(h: *Decoder, id: usize) -> *Sps { return &h.*.sps[id] }
+pub fn ppsAt(h: *Decoder, id: usize) -> *Pps { return &h.*.pps[id] }
+
+// Reads one NAL unit of parameter sets (an hvcC entry, without a start
+// code or length) or any NAL unit: VPS, SPS and PPS are kept.
+pub fn parameterSet(h: *Decoder, bytes: [*]const u8, length: usize) -> Status {
+    if length < 3 { return Status.corrupt }
+    var nal: Nal = undefined
+    nal.offset = 0
+    nal.length = length
+    header(bytes, 0, &nal)
+    return readNal(h, bytes, &nal)
+}
+
+fn readNal(h: *Decoder, bytes: [*]const u8, nal: *Nal) -> Status {
+    if nal.*.layer != 0 { return Status.ok }
+    if nal.*.kind == NAL_VPS {
+        load(&h.*.reader, &bytes[nal.*.offset], nal.*.length)
+        return parseVps(h, &h.*.reader)
+    }
+    if nal.*.kind == NAL_SPS {
+        load(&h.*.reader, &bytes[nal.*.offset], nal.*.length)
+        return parseSps(h, &h.*.reader)
+    }
+    if nal.*.kind == NAL_PPS {
+        load(&h.*.reader, &bytes[nal.*.offset], nal.*.length)
+        return parsePps(h, &h.*.reader)
+    }
+    if nal.*.kind == NAL_EOS || nal.*.kind == NAL_EOB { h.*.sequenceStart = true }
+    return Status.ok
+}
+
+// Reads an access unit (one picture's NAL units: an MP4 sample with
+// `prefix`-byte lengths, or an Annex B piece with prefix 0): parameter
+// sets are kept, the slice segments make h.picture. finishPicture()
+// follows once the picture is decoded. Empty for a RASL picture whose
+// random access point started the sequence (it is not decoded).
+pub fn accessUnit(h: *Decoder, bytes: [*]const u8, length: usize, prefix: usize) -> Status {
+    var at: usize = 0
+    var nal: Nal = undefined
+    var started = false
+    h.*.picture.sliceCount = 0
+    while true {
+        var more = false
+        if prefix == 0 {
+            more = nextAnnexB(bytes, length, &at, &nal)
+        } else {
+            more = nextPrefixed(bytes, length, prefix, &at, &nal)
+        }
+        if !more { break }
+        if nal.kind < 32 {
+            if nal.layer != 0 || (nal.kind > 9 && nal.kind < 16) || nal.kind > 21 { continue }
+            if !started {
+                load(&h.*.reader, &bytes[nal.offset], nal.length)
+                const status = parseSliceHeader(h, &h.*.reader, &nal, &h.*.slice)
+                if status != Status.ok { return status }
+                if !h.*.slice.first { continue }
+                if isRasl(nal.kind) && h.*.noRaslOutput { return Status.empty }
+                const begun = beginPicture(h)
+                if begun != Status.ok { return begun }
+                started = true
+            }
+            if h.*.picture.sliceCount < MAX_SLICES {
+                h.*.picture.sliceOffsets[h.*.picture.sliceCount] = @intCast(u32, nal.offset)
+                h.*.picture.sliceLengths[h.*.picture.sliceCount] = @intCast(u32, nal.length)
+                h.*.picture.sliceCount += 1
+            }
+        } else {
+            const status = readNal(h, bytes, &nal)
+            if status != Status.ok && status != Status.unsupported { return status }
+        }
+    }
+    if !started { return Status.empty }
+    return Status.ok
+}
+
+fn freeSlot(h: *Decoder) -> usize {
+    var slot: usize = 0
+    while slot < SLOTS {
+        if !h.*.frames[slot].used { return slot }
+        slot += 1
+    }
+    return SLOTS
+}
+
+// A frame no longer a reference: gone unless output waits for it or the
+// caller holds it.
+fn unmark(frame: *Frame) -> void {
+    frame.*.isReference = false
+    frame.*.isLongTerm = false
+    if !frame.*.neededForOutput { frame.*.used = frame.*.held }
+}
+
+// The reference picture with POC `poc` (all its bits, or the LSB of
+// `mask` when not 0); SLOTS when none.
+fn findReference(h: *Decoder, poc: i32, mask: i32, exclude: usize) -> usize {
+    var slot: usize = 0
+    while slot < SLOTS {
+        const frame = &h.*.frames[slot]
+        if slot != exclude && frame.*.used && frame.*.isReference {
+            const value = if mask != 0 { frame.*.poc & mask } else { frame.*.poc }
+            if value == poc { return slot }
+        }
+        slot += 1
+    }
+    return SLOTS
+}
+
+// Starts the picture described by h.slice: POC, the reference picture
+// set and its marking, the DPB's output before the picture, a slot.
+fn beginPicture(h: *Decoder) -> Status {
+    const slice = &h.*.slice
+    const pps = &h.*.pps[@intCast(usize, slice.*.ppsId)]
+    const spsId = @intCast(usize, pps.*.spsId)
+    const sps = &h.*.sps[spsId]
+    const kind = slice.*.nalType
+    const irap = isIrap(kind)
+    if h.*.flushing { h.*.flushing = false }
+    var noRasl = false
+    if irap {
+        noRasl = isIdr(kind) || (kind >= 16 && kind <= 18) || h.*.sequenceStart
+        h.*.noRaslOutput = noRasl
+    }
+    if h.*.activeSps != spsId {
+        h.*.activeSps = spsId
+        h.*.dpbPictures = sps.*.dpbPictures
+        h.*.reorderPictures = sps.*.reorderPictures
+        h.*.latencyPictures = sps.*.latencyPictures
+    }
+    // POC (8.3.1).
+    const maxLsb = @intCast(i32, sps.*.maxPocLsb)
+    const lsb = @intCast(i32, slice.*.pocLsb)
+    var msb: i32 = 0
+    if !(irap && noRasl) {
+        const prevLsb = h.*.prevTid0Poc & (maxLsb - 1)
+        const prevMsb = h.*.prevTid0Poc - prevLsb
+        msb = prevMsb
+        if lsb < prevLsb && prevLsb - lsb >= maxLsb / 2 {
+            msb = prevMsb + maxLsb
+        } else if lsb > prevLsb && lsb - prevLsb > maxLsb / 2 {
+            msb = prevMsb - maxLsb
+        }
+    }
+    const poc = msb + lsb
+    if slice.*.temporalId == 0 && !isRasl(kind) && kind != NAL_RADL_N && kind != NAL_RADL_R && !isSubLayerNonReference(kind) { h.*.prevTid0Poc = poc }
+    // A random access point that starts a sequence: every reference goes,
+    // what waits for output comes out first (or is dropped).
+    if irap && noRasl {
+        const first = h.*.sequenceStart && h.*.decoded == 0
+        var dropOutput = slice.*.noOutputOfPriorPics
+        if kind == NAL_CRA { dropOutput = !first && h.*.sequenceStart }
+        var index: usize = 0
+        while index < SLOTS {
+            const frame = &h.*.frames[index]
+            if frame.*.used {
+                if dropOutput { frame.*.neededForOutput = false }
+                unmark(frame)
+            }
+            index += 1
+        }
+        h.*.epoch += 1
+    }
+    h.*.sequenceStart = false
+    // The reference picture set (8.3.2).
+    const picture = &h.*.picture
+    var index: usize = 0
+    while index < 8 {
+        picture.*.info.RefPicSetStCurrBefore[index] = NO_SLOT
+        picture.*.info.RefPicSetStCurrAfter[index] = NO_SLOT
+        picture.*.info.RefPicSetLtCurr[index] = NO_SLOT
+        index += 1
+    }
+    var keep: [SLOTS]bool = undefined
+    index = 0
+    while index < SLOTS {
+        keep[index] = false
+        index += 1
+    }
+    if !isIdr(kind) {
+        var rps: *Rps = &slice.*.ownRps
+        if slice.*.stRpsFromSps { rps = &sps.*.rps[@intCast(usize, slice.*.stRpsIndex)] }
+        // Long-term first (they are not short-term candidates after).
+        var ltCurr: usize = 0
+        var i: u32 = 0
+        while i < slice.*.ltCount {
+            var target = @intCast(i32, slice.*.ltPocLsb[i])
+            var mask: i32 = maxLsb - 1
+            if slice.*.ltMsbPresent[i] {
+                target += poc - @intCast(i32, slice.*.ltMsbCycle[i]) * maxLsb - (poc & (maxLsb - 1))
+                mask = 0
+            }
+            const found = findReference(h, target, mask, SLOTS)
+            if found < SLOTS {
+                keep[found] = true
+                h.*.frames[found].isLongTerm = true
+            }
+            if slice.*.ltUsed[i] && ltCurr < 8 {
+                picture.*.info.RefPicSetLtCurr[ltCurr] = if found < SLOTS { @intCast(u8, found) } else { NO_SLOT }
+                ltCurr += 1
+            }
+            i += 1
+        }
+        var before: usize = 0
+        var after: usize = 0
+        var n: u32 = 0
+        while n < rps.*.negative {
+            const found = findShortTerm(h, poc + rps.*.deltaS0[n])
+            if found < SLOTS { keep[found] = true }
+            if rps.*.usedS0[n] && before < 8 {
+                picture.*.info.RefPicSetStCurrBefore[before] = if found < SLOTS { @intCast(u8, found) } else { NO_SLOT }
+                before += 1
+            }
+            n += 1
+        }
+        n = 0
+        while n < rps.*.positive {
+            const found = findShortTerm(h, poc + rps.*.deltaS1[n])
+            if found < SLOTS { keep[found] = true }
+            if rps.*.usedS1[n] && after < 8 {
+                picture.*.info.RefPicSetStCurrAfter[after] = if found < SLOTS { @intCast(u8, found) } else { NO_SLOT }
+                after += 1
+            }
+            n += 1
+        }
+    }
+    // Every reference not in the set is no reference any more.
+    index = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.isReference && !keep[index] { unmark(frame) }
+        index += 1
+    }
+    const slot = freeSlot(h)
+    if slot >= SLOTS { return Status.corrupt }
+    picture.*.slot = slot
+    picture.*.vpsId = @intCast(u32, sps.*.std.sps_video_parameter_set_id)
+    picture.*.spsId = @intCast(u32, spsId)
+    picture.*.ppsId = slice.*.ppsId
+    picture.*.width = sps.*.width
+    picture.*.height = sps.*.height
+    picture.*.isIrap = irap
+    picture.*.isIdr = isIdr(kind)
+    picture.*.poc = poc
+    var flags: u32 = video.StdVideoDecodeH265PictureInfoFlags_IsReference
+    if irap { flags |= video.StdVideoDecodeH265PictureInfoFlags_IrapPicFlag }
+    if isIdr(kind) { flags |= video.StdVideoDecodeH265PictureInfoFlags_IdrPicFlag }
+    if slice.*.stRpsFromSps { flags |= video.StdVideoDecodeH265PictureInfoFlags_short_term_ref_pic_set_sps_flag }
+    picture.*.info.flags.bits0 = flags
+    picture.*.info.sps_video_parameter_set_id = sps.*.std.sps_video_parameter_set_id
+    picture.*.info.pps_seq_parameter_set_id = @intCast(u8, spsId)
+    picture.*.info.pps_pic_parameter_set_id = @intCast(u8, slice.*.ppsId)
+    picture.*.info.NumDeltaPocsOfRefRpsIdx = @intCast(u8, slice.*.refRpsDeltas)
+    picture.*.info.PicOrderCntVal = poc
+    picture.*.info.NumBitsForSTRefPicSetInSlice = @intCast(u16, slice.*.stRpsBits)
+    picture.*.info.reserved = 0
+    // The references: every reference picture left in the DPB.
+    picture.*.referenceCount = 0
+    index = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.isReference && index != slot && picture.*.referenceCount < DPB_SIZE {
+            const at = picture.*.referenceCount
+            picture.*.referenceSlots[at] = index
+            picture.*.references[at].flags.bits0 = if frame.*.isLongTerm { video.StdVideoDecodeH265ReferenceInfoFlags_used_for_long_term_reference } else { 0 }
+            picture.*.references[at].PicOrderCntVal = frame.*.poc
+            picture.*.referenceCount += 1
+        }
+        index += 1
+    }
+    const frame = &h.*.frames[slot]
+    frame.*.used = true
+    frame.*.held = false
+    frame.*.poc = poc
+    frame.*.isReference = false
+    frame.*.isLongTerm = false
+    frame.*.neededForOutput = false
+    frame.*.latency = 0
+    frame.*.epoch = h.*.epoch
+    h.*.inPicture = true
+    return Status.ok
+}
+
+fn findShortTerm(h: *Decoder, poc: i32) -> usize {
+    var slot: usize = 0
+    while slot < SLOTS {
+        const frame = &h.*.frames[slot]
+        if frame.*.used && frame.*.isReference && !frame.*.isLongTerm && frame.*.poc == poc { return slot }
+        slot += 1
+    }
+    return SLOTS
+}
+
+// The picture is decoded: a short-term reference now, output when its
+// PicOutputFlag says (C.5.2.3).
+pub fn finishPicture(h: *Decoder) -> void {
+    if !h.*.inPicture { return }
+    h.*.inPicture = false
+    h.*.decoded += 1
+    const slot = h.*.picture.slot
+    var index: usize = 0
+    while index < SLOTS {
+        const other = &h.*.frames[index]
+        if index != slot && other.*.used && other.*.neededForOutput { other.*.latency += 1 }
+        index += 1
+    }
+    const frame = &h.*.frames[slot]
+    frame.*.isReference = true
+    frame.*.neededForOutput = h.*.slice.picOutputFlag
+    frame.*.latency = 0
+}
+
+// Outputs the waiting frame first in order (epoch, then POC).
+fn bump(h: *Decoder, slot: *usize, poc: *i32) -> bool {
+    var best: usize = SLOTS
+    var index: usize = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.neededForOutput {
+            if best == SLOTS || frame.*.epoch < h.*.frames[best].epoch || (frame.*.epoch == h.*.frames[best].epoch && frame.*.poc < h.*.frames[best].poc) { best = index }
+        }
+        index += 1
+    }
+    if best == SLOTS { return false }
+    h.*.frames[best].neededForOutput = false
+    if h.*.holdOutputs { h.*.frames[best].held = true }
+    slot.* = best
+    poc.* = h.*.frames[best].poc
+    if !h.*.frames[best].isReference { h.*.frames[best].used = h.*.frames[best].held }
+    return true
+}
+
+fn waiting(h: *Decoder) -> u32 {
+    var count: u32 = 0
+    var index: usize = 0
+    while index < SLOTS {
+        if h.*.frames[index].used && h.*.frames[index].neededForOutput { count += 1 }
+        index += 1
+    }
+    return count
+}
+
+fn fullness(h: *Decoder) -> u32 {
+    var count: u32 = 0
+    var index: usize = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && (frame.*.isReference || frame.*.neededForOutput) { count += 1 }
+        index += 1
+    }
+    return count
+}
+
+fn latencyDue(h: *Decoder) -> bool {
+    if h.*.latencyPictures == 0 { return false }
+    var index: usize = 0
+    while index < SLOTS {
+        const frame = &h.*.frames[index]
+        if frame.*.used && frame.*.neededForOutput && frame.*.latency >= h.*.latencyPictures { return true }
+        index += 1
+    }
+    return false
+}
+
+// The next frame to present, in output order: its slot and POC. False
+// when none is due yet; after flush() every frame comes out.
+pub fn nextOutput(h: *Decoder, slot: *usize, poc: *i32) -> bool {
+    if h.*.flushing || waiting(h) > h.*.reorderPictures || latencyDue(h) || fullness(h) >= h.*.dpbPictures + 1 {
+        if bump(h, slot, poc) { return true }
+    }
+    return false
+}
+
+pub fn flush(h: *Decoder) -> void {
+    h.*.flushing = true
+    h.*.sequenceStart = true
+}
+
+// A slot given out by nextOutput() under holdOutputs is free again.
+pub fn releaseSlot(h: *Decoder, slot: usize) -> void {
+    if slot >= SLOTS { return }
+    const frame = &h.*.frames[slot]
+    frame.*.held = false
+    if frame.*.used && !frame.*.isReference && !frame.*.neededForOutput { frame.*.used = false }
+}

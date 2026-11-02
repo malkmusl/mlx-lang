@@ -63,6 +63,8 @@
 #   tests/422_h264_cpu_decode_runtime.mlx
 #                                       std.h264.decode: WebKit's test.mp4
 #                                       decoded on the CPU, bit-exact
+#   tests/423_h265_stream_runtime.mlx   std.h265: parameter sets, pictures, the
+#                                       reference picture sets, output order
 #   tests/367_webp_decode_runtime.mlx   std.webp's decoders: lossy, lossless,
 #                                       alpha, animation (demuxer), rows
 #                                       done incrementally, damage; the
@@ -168,6 +170,7 @@ run 410_crypto_rsa_sizes_runtime "RSA keys of any size: a 64-bit modulus, 512 bi
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
 run 422_h264_cpu_decode_runtime "WebKit's test.mp4 (Main profile, B frames) decoded on the CPU through std.mp4 and std.h264: every picture, in presentation order, the planes' CRC-32 the reference decoding's"
+run 423_h265_stream_runtime "H.265 parameter sets into the Vulkan video structures, every picture of a 64x64 stream with B frames and a CRA picture, the reference picture sets' current lists as slots, the output order, a random access from the CRA picture, a cut SPS refused"
 run 417_aac_decode_runtime "AAC-LC decoded from an MP4 and an ADTS stream, each within 15 dB of the WAV it was encoded from; damaged blocks refused; reset"
 run 416_mp4_demux_runtime "MP4 files read: a plain file's sample tables (chunks, composition offsets, sync samples, an edit list, seeking), fragments (trex defaults, tfdt, trun flags, one without tfdt), avcC parameter sets and Annex B, AudioSpecificConfig, a fragment cut short, damage"
 
