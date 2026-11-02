@@ -192,6 +192,10 @@ pub const Cpu = struct {
     predL1: [256]u8
     predC0: [2][64]u8
     predC1: [2][64]u8
+    // Motion compensation's reference window (24 x 21) and horizontal
+    // half samples (16 x 21).
+    mcWindow: [576]i32
+    mcHalves: [336]i32
     // Decoded pictures (statistics).
     decoded: u64
 }
@@ -1464,83 +1468,150 @@ fn setMotion(mb: *Mb, list: usize, x: i32, y: i32, w: i32, h: i32, mvx: i32, mvy
 
 // ---- Inter prediction samples (8.4.2.2) ----
 
-fn lumaPixel(frame: *Frame, width: i32, height: i32, x: i32, y: i32) -> i32 {
-    var cx = x
-    var cy = y
-    if cx < 0 { cx = 0 }
-    if cx >= width { cx = width - 1 }
-    if cy < 0 { cy = 0 }
-    if cy >= height { cy = height - 1 }
-    return @intCast(i32, frame.*.y[@intCast(usize, cy * width + cx)])
-}
-
-fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
-    return a - 5 * b + 20 * c + 20 * d - 5 * e + f
-}
-
-// The horizontal half sample b1 (before rounding) at (x + 1/2, y).
-fn halfH(frame: *Frame, w: i32, h: i32, x: i32, y: i32) -> i32 {
-    return tap6(lumaPixel(frame, w, h, x - 2, y), lumaPixel(frame, w, h, x - 1, y), lumaPixel(frame, w, h, x, y), lumaPixel(frame, w, h, x + 1, y), lumaPixel(frame, w, h, x + 2, y), lumaPixel(frame, w, h, x + 3, y))
-}
-
-fn halfV(frame: *Frame, w: i32, h: i32, x: i32, y: i32) -> i32 {
-    return tap6(lumaPixel(frame, w, h, x, y - 2), lumaPixel(frame, w, h, x, y - 1), lumaPixel(frame, w, h, x, y), lumaPixel(frame, w, h, x, y + 1), lumaPixel(frame, w, h, x, y + 2), lumaPixel(frame, w, h, x, y + 3))
-}
-
 fn clip1(value: i32) -> i32 {
     if value < 0 { return 0 }
     if value > 255 { return 255 }
     return value
 }
 
-// A luma prediction sample (Table 8-12) at integer (x, y) with the
-// quarter-sample fraction (fx, fy).
-fn lumaSample(frame: *Frame, w: i32, h: i32, x: i32, y: i32, fx: i32, fy: i32) -> i32 {
-    const g = lumaPixel(frame, w, h, x, y)
-    if fx == 0 && fy == 0 { return g }
-    if fy == 0 {
-        const b = clip1((halfH(frame, w, h, x, y) + 16) >> 5)
-        if fx == 2 { return b }
-        if fx == 1 { return (g + b + 1) >> 1 }
-        return (lumaPixel(frame, w, h, x + 1, y) + b + 1) >> 1
-    }
-    if fx == 0 {
-        const hv = clip1((halfV(frame, w, h, x, y) + 16) >> 5)
-        if fy == 2 { return hv }
-        if fy == 1 { return (g + hv + 1) >> 1 }
-        return (lumaPixel(frame, w, h, x, y + 1) + hv + 1) >> 1
-    }
-    // The centre j from the horizontal half samples of six rows.
-    const j1 = tap6(halfH(frame, w, h, x, y - 2), halfH(frame, w, h, x, y - 1), halfH(frame, w, h, x, y), halfH(frame, w, h, x, y + 1), halfH(frame, w, h, x, y + 2), halfH(frame, w, h, x, y + 3))
-    const j = clip1((j1 + 512) >> 10)
-    const b = clip1((halfH(frame, w, h, x, y) + 16) >> 5)
-    const hv = clip1((halfV(frame, w, h, x, y) + 16) >> 5)
-    const s = clip1((halfH(frame, w, h, x, y + 1) + 16) >> 5)
-    const m = clip1((halfV(frame, w, h, x + 1, y) + 16) >> 5)
-    if fx == 2 && fy == 2 { return j }
-    if fx == 2 && fy == 1 { return (b + j + 1) >> 1 }
-    if fx == 2 && fy == 3 { return (j + s + 1) >> 1 }
-    if fx == 1 && fy == 2 { return (hv + j + 1) >> 1 }
-    if fx == 3 && fy == 2 { return (j + m + 1) >> 1 }
-    if fx == 1 && fy == 1 { return (b + hv + 1) >> 1 }
-    if fx == 3 && fy == 1 { return (b + m + 1) >> 1 }
-    if fx == 1 && fy == 3 { return (hv + s + 1) >> 1 }
-    return (m + s + 1) >> 1
-}
-
 // The luma prediction of a w x h block at (px, py) of the picture with
-// the vector (mvx, mvy) into out (rows of 16).
+// the vector (mvx, mvy) into out (rows of 16): the reference samples it
+// needs copied into a window first (24 wide, two samples before, three
+// after; edges repeated outside the picture), then Table 8-12 on it.
 fn predictLuma(cpu: *Cpu, frame: *Frame, px: i32, py: i32, w: i32, h: i32, mvx: i32, mvy: i32, out: [*]u8) -> void {
     const width = @intCast(i32, cpu.*.width)
     const height = @intCast(i32, cpu.*.height)
+    const ix = px + (mvx >> 2) - 2
+    const iy = py + (mvy >> 2) - 2
+    const ww = w + 5
+    const wh = h + 5
+    // The windows are the Cpu's (values over 1 KiB in a function would
+    // be kept in the compiler's value arena for good); unchecked access,
+    // indices bounded by w, h <= 16.
+    const win: [*]i32 = &cpu.*.mcWindow
+    const plane = frame.*.y
+    if ix >= 0 && iy >= 0 && ix + ww <= width && iy + wh <= height {
+        var r: i32 = 0
+        while r < wh {
+            const src: [*]u8 = &plane[@intCast(usize, (iy + r) * width + ix)]
+            const row = @intCast(usize, r * 24)
+            var c: usize = 0
+            while c < @intCast(usize, ww) {
+                win[row + c] = @intCast(i32, src[c])
+                c += 1
+            }
+            r += 1
+        }
+    } else {
+        var r: i32 = 0
+        while r < wh {
+            const sy = clampTo(iy + r, height)
+            const row = @intCast(usize, r * 24)
+            var c: i32 = 0
+            while c < ww {
+                win[row + @intCast(usize, c)] = @intCast(i32, plane[@intCast(usize, sy * width + clampTo(ix + c, width))])
+                c += 1
+            }
+            r += 1
+        }
+    }
     const fx = mvx & 3
     const fy = mvy & 3
-    var y: i32 = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            const value = lumaSample(frame, width, height, px + x + (mvx >> 2), py + y + (mvy >> 2), fx, fy)
-            out[@intCast(usize, (py & 15) + y) * 16 + @intCast(usize, (px & 15) + x)] = @intCast(u8, value)
+    const ow = @intCast(usize, w)
+    const oh = @intCast(usize, h)
+    const o0 = @intCast(usize, (py & 15) * 16 + (px & 15))
+    if fx == 0 && fy == 0 {
+        var y: usize = 0
+        while y < oh {
+            var x: usize = 0
+            while x < ow {
+                out[o0 + y * 16 + x] = @intCast(u8, win[(y + 2) * 24 + x + 2])
+                x += 1
+            }
+            y += 1
+        }
+        return
+    }
+    if fy == 0 {
+        var y: usize = 0
+        while y < oh {
+            var x: usize = 0
+            while x < ow {
+                const at = (y + 2) * 24 + x
+                const raw = win[at] - 5 * win[at + 1] + 20 * win[at + 2] + 20 * win[at + 3] - 5 * win[at + 4] + win[at + 5]
+                var v = clip1((raw + 16) >> 5)
+                if fx == 1 { v = (v + win[at + 2] + 1) >> 1 }
+                if fx == 3 { v = (v + win[at + 3] + 1) >> 1 }
+                out[o0 + y * 16 + x] = @intCast(u8, v)
+                x += 1
+            }
+            y += 1
+        }
+        return
+    }
+    if fx == 0 {
+        var y: usize = 0
+        while y < oh {
+            var x: usize = 0
+            while x < ow {
+                const at = y * 24 + x + 2
+                const raw = win[at] - 5 * win[at + 24] + 20 * win[at + 48] + 20 * win[at + 72] - 5 * win[at + 96] + win[at + 120]
+                var v = clip1((raw + 16) >> 5)
+                if fy == 1 { v = (v + win[at + 48] + 1) >> 1 }
+                if fy == 3 { v = (v + win[at + 72] + 1) >> 1 }
+                out[o0 + y * 16 + x] = @intCast(u8, v)
+                x += 1
+            }
+            y += 1
+        }
+        return
+    }
+    // The horizontal half samples before rounding, every window row.
+    const rawH: [*]i32 = &cpu.*.mcHalves
+    var r: usize = 0
+    while r < @intCast(usize, wh) {
+        var x: usize = 0
+        while x < ow {
+            const at = r * 24 + x
+            rawH[r * 16 + x] = win[at] - 5 * win[at + 1] + 20 * win[at + 2] + 20 * win[at + 3] - 5 * win[at + 4] + win[at + 5]
+            x += 1
+        }
+        r += 1
+    }
+    const needJ = fx == 2 || fy == 2
+    var y: usize = 0
+    while y < oh {
+        var x: usize = 0
+        while x < ow {
+            var j: i32 = 0
+            if needJ {
+                const at = y * 16 + x
+                j = clip1((rawH[at] - 5 * rawH[at + 16] + 20 * rawH[at + 32] + 20 * rawH[at + 48] - 5 * rawH[at + 64] + rawH[at + 80] + 512) >> 10)
+            }
+            // b (this row) or s (the next) from the horizontal halves, h
+            // (this column) or m (the next) vertically.
+            var horizontal: i32 = 0
+            if fy != 2 {
+                const row: usize = if fy == 3 { y + 3 } else { y + 2 }
+                horizontal = clip1((rawH[row * 16 + x] + 16) >> 5)
+            }
+            var vertical: i32 = 0
+            if fx != 2 {
+                const col: usize = if fx == 3 { x + 3 } else { x + 2 }
+                const at = y * 24 + col
+                vertical = clip1((win[at] - 5 * win[at + 24] + 20 * win[at + 48] + 20 * win[at + 72] - 5 * win[at + 96] + win[at + 120] + 16) >> 5)
+            }
+            var v: i32 = 0
+            if fx == 2 && fy == 2 {
+                v = j
+            } else if fx == 2 {
+                v = (horizontal + j + 1) >> 1
+            } else if fy == 2 {
+                v = (vertical + j + 1) >> 1
+            } else {
+                v = (horizontal + vertical + 1) >> 1
+            }
+            out[o0 + y * 16 + x] = @intCast(u8, v)
             x += 1
         }
         y += 1
@@ -1555,22 +1626,44 @@ fn predictChromaBlock(cpu: *Cpu, frame: *Frame, c: usize, px: i32, py: i32, w: i
     const plane = if c == 0 { frame.*.cb } else { frame.*.cr }
     const fx = mvx & 7
     const fy = mvy & 7
-    var y: i32 = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            const x0 = px + x + (mvx >> 3)
-            const y0 = py + y + (mvy >> 3)
-            const ax = clampTo(x0, width)
-            const bx = clampTo(x0 + 1, width)
-            const ay = clampTo(y0, height)
-            const by = clampTo(y0 + 1, height)
-            const a = @intCast(i32, plane[@intCast(usize, ay * width + ax)])
-            const b = @intCast(i32, plane[@intCast(usize, ay * width + bx)])
-            const cc = @intCast(i32, plane[@intCast(usize, by * width + ax)])
-            const d = @intCast(i32, plane[@intCast(usize, by * width + bx)])
-            const value = ((8 - fx) * (8 - fy) * a + fx * (8 - fy) * b + (8 - fx) * fy * cc + fx * fy * d + 32) >> 6
-            out[@intCast(usize, (py & 7) + y) * 8 + @intCast(usize, (px & 7) + x)] = @intCast(u8, value)
+    const ix = px + (mvx >> 3)
+    const iy = py + (mvy >> 3)
+    var win: [81]i32 = undefined
+    const ww = w + 1
+    const wh = h + 1
+    var r: i32 = 0
+    if ix >= 0 && iy >= 0 && ix + ww <= width && iy + wh <= height {
+        while r < wh {
+            const src: [*]u8 = &plane[@intCast(usize, (iy + r) * width + ix)]
+            var k: usize = 0
+            while k < @intCast(usize, ww) {
+                win[@intCast(usize, r * 9) + k] = @intCast(i32, src[k])
+                k += 1
+            }
+            r += 1
+        }
+    } else {
+        while r < wh {
+            const sy = clampTo(iy + r, height)
+            var k: i32 = 0
+            while k < ww {
+                win[@intCast(usize, r * 9 + k)] = @intCast(i32, plane[@intCast(usize, sy * width + clampTo(ix + k, width))])
+                k += 1
+            }
+            r += 1
+        }
+    }
+    const wa = (8 - fx) * (8 - fy)
+    const wb = fx * (8 - fy)
+    const wc = (8 - fx) * fy
+    const wd = fx * fy
+    const o0 = @intCast(usize, (py & 7) * 8 + (px & 7))
+    var y: usize = 0
+    while y < @intCast(usize, h) {
+        var x: usize = 0
+        while x < @intCast(usize, w) {
+            const at = y * 9 + x
+            out[o0 + y * 8 + x] = @intCast(u8, (wa * win[at] + wb * win[at + 1] + wc * win[at + 9] + wd * win[at + 10] + 32) >> 6)
             x += 1
         }
         y += 1
@@ -2462,47 +2555,98 @@ fn reconstructChroma(cpu: *Cpu, mb: *Mb) -> void {
 // The inter prediction of the current macroblock (each 4x4 block with its
 // vector) into predL0 / predC0, weighted.
 fn predictInter(cpu: *Cpu, mb: *Mb) -> void {
-    const px = @intCast(i32, cpu.*.mbX) * 16
-    const py = @intCast(i32, cpu.*.mbY) * 16
-    var raster: usize = 0
-    while raster < 16 {
-        const bx = @intCast(i32, raster & 3) * 4
-        const by = @intCast(i32, raster >> 2) * 4
-        const blk8 = ((raster >> 3) << 1) | ((raster & 3) >> 1)
-        const ref0 = @intCast(i32, mb.*.ref[0][blk8])
-        const ref1 = @intCast(i32, mb.*.ref[1][blk8])
-        var lists: u32 = 0
-        if ref0 >= 0 {
-            const frame = &cpu.*.frames[cpu.*.refs[0][@intCast(usize, ref0)]]
-            const mvx = @intCast(i32, mb.*.mv[0][raster][0])
-            const mvy = @intCast(i32, mb.*.mv[0][raster][1])
-            predictLuma(cpu, frame, px + bx, py + by, 4, 4, mvx, mvy, &cpu.*.predL0)
-            predictChromaBlock(cpu, frame, 0, (px + bx) / 2, (py + by) / 2, 2, 2, mvx, mvy, &cpu.*.predC0[0])
-            predictChromaBlock(cpu, frame, 1, (px + bx) / 2, (py + by) / 2, 2, 2, mvx, mvy, &cpu.*.predC0[1])
-            lists |= 1
+    // The largest regions of one motion: the macroblock, else each 8x8
+    // block, else each 4x4 block.
+    if sameMotion(mb, 0, 4) {
+        predictRegion(cpu, mb, 0, 4)
+        return
+    }
+    var b8: usize = 0
+    while b8 < 4 {
+        const first = (b8 >> 1) * 8 + (b8 & 1) * 2
+        if sameMotion(mb, first, 2) {
+            predictRegion(cpu, mb, first, 2)
+        } else {
+            predictRegion(cpu, mb, first, 1)
+            predictRegion(cpu, mb, first + 1, 1)
+            predictRegion(cpu, mb, first + 4, 1)
+            predictRegion(cpu, mb, first + 5, 1)
         }
-        if ref1 >= 0 {
-            const frame = &cpu.*.frames[cpu.*.refs[1][@intCast(usize, ref1)]]
-            const mvx = @intCast(i32, mb.*.mv[1][raster][0])
-            const mvy = @intCast(i32, mb.*.mv[1][raster][1])
-            predictLuma(cpu, frame, px + bx, py + by, 4, 4, mvx, mvy, &cpu.*.predL1)
-            predictChromaBlock(cpu, frame, 0, (px + bx) / 2, (py + by) / 2, 2, 2, mvx, mvy, &cpu.*.predC1[0])
-            predictChromaBlock(cpu, frame, 1, (px + bx) / 2, (py + by) / 2, 2, 2, mvx, mvy, &cpu.*.predC1[1])
-            lists |= 2
-        }
-        weightBlock(cpu, raster, lists, ref0, ref1)
-        raster += 1
+        b8 += 1
     }
 }
 
-// Weighted sample prediction (8.4.2.3) of 4x4 block `raster`: the result
-// in predL0 / predC0.
-fn weightBlock(cpu: *Cpu, raster: usize, lists: u32, ref0: i32, ref1: i32) -> void {
+// Whether the `size` x `size` 4x4 blocks from raster block `first` share
+// their references and vectors.
+fn sameMotion(mb: *Mb, first: usize, size: usize) -> bool {
+    const b0 = blk8Of(first)
+    var list: usize = 0
+    while list < 2 {
+        const ref = mb.*.ref[list][b0]
+        var y: usize = 0
+        while y < size {
+            var x: usize = 0
+            while x < size {
+                const raster = first + y * 4 + x
+                if mb.*.ref[list][blk8Of(raster)] != ref { return false }
+                if ref >= 0 {
+                    if mb.*.mv[list][raster][0] != mb.*.mv[list][first][0] || mb.*.mv[list][raster][1] != mb.*.mv[list][first][1] { return false }
+                }
+                x += 1
+            }
+            y += 1
+        }
+        list += 1
+    }
+    return true
+}
+
+// The prediction of a region of `size` x `size` 4x4 blocks from raster
+// block `first`, of one motion, into predL0 / predC0.
+fn predictRegion(cpu: *Cpu, mb: *Mb, first: usize, size: usize) -> void {
+    const px = @intCast(i32, cpu.*.mbX) * 16 + @intCast(i32, first & 3) * 4
+    const py = @intCast(i32, cpu.*.mbY) * 16 + @intCast(i32, first >> 2) * 4
+    const n = @intCast(i32, size) * 4
+    const blk8 = blk8Of(first)
+    const ref0 = @intCast(i32, mb.*.ref[0][blk8])
+    const ref1 = @intCast(i32, mb.*.ref[1][blk8])
+    var lists: u32 = 0
+    if ref0 >= 0 {
+        const frame = &cpu.*.frames[cpu.*.refs[0][@intCast(usize, ref0)]]
+        const mvx = @intCast(i32, mb.*.mv[0][first][0])
+        const mvy = @intCast(i32, mb.*.mv[0][first][1])
+        predictLuma(cpu, frame, px, py, n, n, mvx, mvy, &cpu.*.predL0)
+        predictChromaBlock(cpu, frame, 0, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC0[0])
+        predictChromaBlock(cpu, frame, 1, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC0[1])
+        lists |= 1
+    }
+    if ref1 >= 0 {
+        const frame = &cpu.*.frames[cpu.*.refs[1][@intCast(usize, ref1)]]
+        const mvx = @intCast(i32, mb.*.mv[1][first][0])
+        const mvy = @intCast(i32, mb.*.mv[1][first][1])
+        predictLuma(cpu, frame, px, py, n, n, mvx, mvy, &cpu.*.predL1)
+        predictChromaBlock(cpu, frame, 0, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC1[0])
+        predictChromaBlock(cpu, frame, 1, px / 2, py / 2, n / 2, n / 2, mvx, mvy, &cpu.*.predC1[1])
+        lists |= 2
+    }
+    weightRegion(cpu, first, size, lists, ref0, ref1)
+}
+
+// Weighted sample prediction (8.4.2.3) of a region of `size` x `size`
+// 4x4 blocks from raster block `first`: the result in predL0 / predC0.
+fn weightRegion(cpu: *Cpu, first: usize, size: usize, lists: u32, ref0: i32, ref1: i32) -> void {
     const s = &cpu.*.header
-    const implicit = cpu.*.pps.*.weightedBipredIdc == 2 && s.*.sliceType == h264.SLICE_B
+    const implicit = cpu.*.pps.*.weightedBipredIdc == 2 && s.*.sliceType == h264.SLICE_B && lists == 3
     const explicit = s.*.weighted
-    if !explicit && !implicit && lists != 3 { 
-        if lists == 2 { copyL1(cpu, raster) }
+    const x0 = (first & 3) * 4
+    const y0 = (first >> 2) * 4
+    const n = size * 4
+    if !explicit && !implicit {
+        // Default: list 0 as it is, list 1 copied, both averaged.
+        if lists == 1 { return }
+        averagePlane(&cpu.*.predL0, &cpu.*.predL1, 16, x0, y0, n, lists)
+        averagePlane(&cpu.*.predC0[0], &cpu.*.predC1[0], 8, x0 / 2, y0 / 2, n / 2, lists)
+        averagePlane(&cpu.*.predC0[1], &cpu.*.predC1[1], 8, x0 / 2, y0 / 2, n / 2, lists)
         return
     }
     var plane: usize = 0
@@ -2512,9 +2656,7 @@ fn weightBlock(cpu: *Cpu, raster: usize, lists: u32, ref0: i32, ref1: i32) -> vo
         var w1: i32 = 1
         var o0: i32 = 0
         var o1: i32 = 0
-        var mode: u32 = 0
         if explicit {
-            mode = 1
             if plane == 0 {
                 logWD = @intCast(i32, s.*.lumaLog2)
                 if ref0 >= 0 {
@@ -2536,80 +2678,75 @@ fn weightBlock(cpu: *Cpu, raster: usize, lists: u32, ref0: i32, ref1: i32) -> vo
                     o1 = s.*.chromaOffset[1][@intCast(usize, ref1)][plane - 1]
                 }
             }
-        } else if implicit && lists == 3 {
-            mode = 1
-            logWD = 5
-            w0 = 64 - cpu.*.implicitWeights[@intCast(usize, ref0)][@intCast(usize, ref1)]
-            w1 = cpu.*.implicitWeights[@intCast(usize, ref0)][@intCast(usize, ref1)]
         } else {
-            mode = 0
+            logWD = 5
+            w1 = cpu.*.implicitWeights[@intCast(usize, ref0)][@intCast(usize, ref1)]
+            w0 = 64 - w1
         }
-        const size: usize = if plane == 0 { 4 } else { 2 }
-        const stride: usize = if plane == 0 { 16 } else { 8 }
-        const x0 = (raster & 3) * size
-        const y0 = (raster >> 2) * size
-        var p0: [*]u8 = &cpu.*.predL0
-        var p1: [*]u8 = &cpu.*.predL1
-        if plane > 0 {
-            p0 = &cpu.*.predC0[plane - 1]
-            p1 = &cpu.*.predC1[plane - 1]
-        }
-        var y: usize = 0
-        while y < size {
-            var x: usize = 0
-            while x < size {
-                const at = (y0 + y) * stride + x0 + x
-                const a = @intCast(i32, p0[at])
-                const b = @intCast(i32, p1[at])
-                var value: i32 = 0
-                if mode == 0 {
-                    value = if lists == 3 { (a + b + 1) >> 1 } else if lists == 1 { a } else { b }
-                } else if lists == 3 {
-                    value = ((a * w0 + b * w1 + (@intCast(i32, 1) << @intCast(u5, logWD))) >> @intCast(u5, logWD + 1)) + ((o0 + o1 + 1) >> 1)
-                } else {
-                    const sample = if lists == 1 { a } else { b }
-                    const w = if lists == 1 { w0 } else { w1 }
-                    const o = if lists == 1 { o0 } else { o1 }
-                    if logWD >= 1 {
-                        value = ((sample * w + (@intCast(i32, 1) << @intCast(u5, logWD - 1))) >> @intCast(u5, logWD)) + o
-                    } else {
-                        value = sample * w + o
-                    }
-                }
-                p0[at] = clip255(value)
-                x += 1
-            }
-            y += 1
+        if plane == 0 {
+            weightPlane(&cpu.*.predL0, &cpu.*.predL1, 16, x0, y0, n, lists, logWD, w0, w1, o0, o1)
+        } else {
+            weightPlane(&cpu.*.predC0[plane - 1], &cpu.*.predC1[plane - 1], 8, x0 / 2, y0 / 2, n / 2, lists, logWD, w0, w1, o0, o1)
         }
         plane += 1
     }
 }
 
-fn copyL1(cpu: *Cpu, raster: usize) -> void {
-    const x0 = (raster & 3) * 4
-    const y0 = (raster >> 2) * 4
+// Default weighted prediction of an n x n block at (x0, y0) of p0 / p1
+// (rows `stride` apart) into p0: list 1's samples (lists 2) or the
+// rounded average (lists 3).
+fn averagePlane(p0: [*]u8, p1: [*]u8, stride: usize, x0: usize, y0: usize, n: usize, lists: u32) -> void {
     var y: usize = 0
-    while y < 4 {
+    while y < n {
+        const row = (y0 + y) * stride + x0
         var x: usize = 0
-        while x < 4 {
-            cpu.*.predL0[(y0 + y) * 16 + x0 + x] = cpu.*.predL1[(y0 + y) * 16 + x0 + x]
-            x += 1
+        if lists == 2 {
+            while x < n {
+                p0[row + x] = p1[row + x]
+                x += 1
+            }
+        } else {
+            while x < n {
+                p0[row + x] = @intCast(u8, (@intCast(u32, p0[row + x]) + @intCast(u32, p1[row + x]) + 1) >> 1)
+                x += 1
+            }
         }
         y += 1
     }
-    var c: usize = 0
-    while c < 2 {
-        y = 0
-        while y < 2 {
-            var x: usize = 0
-            while x < 2 {
-                const at = ((raster >> 2) * 2 + y) * 8 + (raster & 3) * 2 + x
-                cpu.*.predC0[c][at] = cpu.*.predC1[c][at]
-                x += 1
+}
+
+// Explicit or implicit weighted prediction (8.4.2.3.2) of an n x n block
+// at (x0, y0) of p0 / p1 into p0.
+fn weightPlane(p0: [*]u8, p1: [*]u8, stride: usize, x0: usize, y0: usize, n: usize, lists: u32, logWD: i32, w0: i32, w1: i32, o0: i32, o1: i32) -> void {
+    const shift = @intCast(u5, logWD)
+    const round: i32 = if logWD >= 1 { @intCast(i32, 1) << @intCast(u5, logWD - 1) } else { 0 }
+    var w = w0
+    var o = o0
+    var source = p0
+    if lists == 2 {
+        w = w1
+        o = o1
+        source = p1
+    }
+    var y: usize = 0
+    while y < n {
+        const row = (y0 + y) * stride + x0
+        var x: usize = 0
+        while x < n {
+            var value: i32 = 0
+            if lists == 3 {
+                value = ((@intCast(i32, p0[row + x]) * w0 + @intCast(i32, p1[row + x]) * w1 + (@intCast(i32, 1) << shift)) >> (shift + 1)) + ((o0 + o1 + 1) >> 1)
+            } else if logWD >= 1 {
+                value = ((@intCast(i32, source[row + x]) * w + round) >> shift) + o
+            } else {
+                value = @intCast(i32, source[row + x]) * w + o
             }
-            y += 1
+            if value < 0 { value = 0 }
+            if value > 255 { value = 255 }
+            p0[row + x] = @intCast(u8, value)
+            x += 1
         }
-        c += 1
+        y += 1
     }
 }
 
