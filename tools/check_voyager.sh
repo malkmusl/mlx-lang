@@ -514,8 +514,8 @@ for shot in light dark; do
     [[ $scheme == "$expected" ]] || fail "the prefers-color-scheme box is #$scheme, not #$expected, when $shot"
 done
 echo "ok   a switch of the desktop's scheme: the toolbar and the page follow it, without a reload"
-# 13: forced dark mode, following the desktop.
-write_runner "$work/voyager-forced" second.html
+# 13: forced dark mode (on: VOYAGER_FORCE_DARK=1), following the desktop.
+write_runner "$work/voyager-forced" second.html VOYAGER_FORCE_DARK=1
 echo "color-scheme = dark" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
 x0=$page_x0
 y0=$page_y0
@@ -544,6 +544,24 @@ grep -q "^voyager: tab 1 forced dark no$" "$log" || { cat "$log" >&2; fail "the 
 square=$(pixel_of "$work/unforced.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
 [[ $square == ffffff ]] || fail "the square is not white again on a light desktop (#$square)"
 echo "ok   the desktop switched to light: the page is painted as it is again"
+# 13b: forced dark off by default: on a dark desktop a page without a dark
+# design is as it is; Ctrl+Shift+D turns forced dark on (and writes
+# voyager.conf's force-dark).
+write_runner "$work/voyager-unforced" second.html
+echo "color-scheme = dark" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
+rm -f "$XDG_CONFIG_HOME/mlx/voyager.conf"
+printf 'wait 12000\nshot %s\ndown 29\ndown 42\ndown 32\nup 32\nup 42\nup 29\nwait 4000\nshot %s\nclose\n' "$work/plain.ppm" "$work/toggled.ppm" > "$work/toggle.script"
+run_scenario toggle "$work/toggle.script" "$work/voyager-unforced"
+log=$work/voyager.log
+square=$(pixel_of "$work/plain.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
+[[ $square == ffffff ]] || { cat "$log" >&2; fail "second.html was painted dark on a dark desktop with forced dark off (#$square)"; }
+grep -q "^voyager: tab 1 forced dark yes$" "$log" || { cat "$log" >&2; fail "Ctrl+Shift+D did not turn forced dark on"; }
+square=$(pixel_of "$work/toggled.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
+[[ $(lightness_of "$square") == dark ]] || fail "the square is not dark after Ctrl+Shift+D (#$square)"
+grep -q "^force-dark = on$" "$XDG_CONFIG_HOME/mlx/voyager.conf" 2> /dev/null || fail "Ctrl+Shift+D did not write force-dark = on to voyager.conf"
+rm -f "$XDG_CONFIG_HOME/mlx/voyager.conf"
+echo "color-scheme = light" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
+echo "ok   forced dark is off by default (a page without a dark design stays white on a dark desktop); Ctrl+Shift+D turns it on and keeps it in voyager.conf"
 # 14: the internal pages.
 write_runner "$work/voyager-internal" voyager://about
 address_script() {

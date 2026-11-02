@@ -14,6 +14,14 @@
 
 namespace WebCore {
 
+// MLX_TRACE_MEDIA (MediaPlayerPrivateMlx.cpp): appends refused, on
+// standard error.
+static bool mediaTrace()
+{
+    static const bool on = getenv("MLX_TRACE_MEDIA");
+    return on;
+}
+
 Ref<SourceBufferPrivateMlx> SourceBufferPrivateMlx::create(MediaSourcePrivateMlx& mediaSource, const ContentType& contentType)
 {
     return adoptRef(*new SourceBufferPrivateMlx(mediaSource, contentType));
@@ -51,12 +59,16 @@ Ref<MediaPromise> SourceBufferPrivateMlx::appendInternal(Ref<SharedBuffer>&& buf
     size_t used = 0;
     auto status = mlxweb_media_demuxer_parse(m_demuxer, m_pending.span().data(), m_pending.size(), &used);
     if (status == MLXWEB_MEDIA_CORRUPT || status == MLXWEB_MEDIA_UNSUPPORTED || status == MLXWEB_MEDIA_NO_MEMORY) {
+        if (mediaTrace())
+            fprintf(stderr, "media: append of %zu bytes refused (%s, %s)\n", buffer->size(), status == MLXWEB_MEDIA_CORRUPT ? "corrupt" : status == MLXWEB_MEDIA_UNSUPPORTED ? "unsupported" : "no memory", m_contentType.raw().utf8().data());
         m_pending.clear();
         mlxweb_media_clear_samples(m_demuxer);
         return MediaPromise::createAndReject(status == MLXWEB_MEDIA_NO_MEMORY ? PlatformMediaError::MemoryError : PlatformMediaError::ParsingError);
     }
     if (!m_haveTracks && mlxweb_media_track_count(m_demuxer)) {
         if (!processInitialization()) {
+            if (mediaTrace())
+                fprintf(stderr, "media: initialization segment without an H.264 or AAC track (%s)\n", m_contentType.raw().utf8().data());
             m_pending.clear();
             mlxweb_media_clear_samples(m_demuxer);
             return MediaPromise::createAndReject(PlatformMediaError::ParsingError);
@@ -68,8 +80,11 @@ Ref<MediaPromise> SourceBufferPrivateMlx::appendInternal(Ref<SharedBuffer>&& buf
     mlxweb_media_clear_samples(m_demuxer);
     if (used)
         m_pending.removeAt(0, used);
-    if (!samplesOk)
+    if (!samplesOk) {
+        if (mediaTrace())
+            fprintf(stderr, "media: samples of an append refused (%s)\n", m_contentType.raw().utf8().data());
         return MediaPromise::createAndReject(PlatformMediaError::ParsingError);
+    }
     return MediaPromise::createAndResolve();
 }
 

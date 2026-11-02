@@ -457,6 +457,11 @@ struct Tab {
     IntPoint lastPressPosition;
     MouseButton pressedButton { MouseButton::None };
     MonotonicTime lastUpdate;
+    // isForcedDark's last answer, for which document and when (the page's
+    // style sheets are walked again at most every 250 ms).
+    const void* darkDesignDocument { nullptr };
+    MonotonicTime darkDesignCheckedAt;
+    bool darkDesign { false };
     // A link pressed with the middle button or Ctrl: opened in a tab
     // behind on the release (the page sees neither).
     URL heldLink;
@@ -475,6 +480,9 @@ struct Engine {
     Vector<int> raised;
     IntSize size;
     bool dark { false };
+    // Forced dark allowed (voyager.conf's force-dark): a page without a
+    // dark design of its own painted dark on a dark desktop.
+    bool forceDark { false };
     // VOYAGER_TRACE in the environment: each event on standard error.
     bool trace { false };
     // Composited (each tab's MlxLayerTreeHost); --no-compositing: each
@@ -854,15 +862,23 @@ int engineDamage(Engine* engine, int* rects, int capacity)
     return count;
 }
 
-// Whether the tab is painted in forced dark: the desktop dark, its page
-// without a dark design of its own (always: Voyager has no setting for
-// it, it follows the desktop).
+// Whether the tab is painted in forced dark: forced dark allowed
+// (voyager.conf's force-dark), the desktop dark, its page without a dark
+// design of its own.
 bool isForcedDark(Engine* engine, Tab* tab)
 {
-    if (!engine->dark || !tab)
+    if (!engine->dark || !engine->forceDark || !tab)
         return false;
     RefPtr document = tab->frame->document();
-    return document && !mlxPageHasDarkDesign(*document);
+    if (!document)
+        return false;
+    auto now = MonotonicTime::now();
+    if (tab->darkDesignDocument != document.get() || now - tab->darkDesignCheckedAt >= 250_ms) {
+        tab->darkDesignDocument = document.get();
+        tab->darkDesignCheckedAt = now;
+        tab->darkDesign = mlxPageHasDarkDesign(*document);
+    }
+    return !tab->darkDesign;
 }
 
 // --no-compositing: the view painted whole into the window's pixels on
@@ -1110,16 +1126,26 @@ int engineLoading(Engine* engine, int id)
     return tab && tab->frame->loader().isLoading() ? 1 : 0;
 }
 
-// The desktop's scheme: every page's appearance follows it at once (its
-// media queries evaluated again, its styles and the view's background
-// resolved again), no reload.
-void engineSetDark(Engine* engine, int dark)
+// The desktop's scheme (bit 0: dark) and whether forced dark is allowed
+// (bit 1): every page's appearance follows the scheme at once (its media
+// queries evaluated again, its styles and the view's background resolved
+// again), no reload.
+void engineSetDark(Engine* engine, int scheme)
 {
-    if (engine->trace)
-        fprintf(stderr, "voyager: appearance %s\n", dark ? "dark" : "light");
+    bool dark = scheme & 1;
+    bool forceDark = scheme & 2;
+    if (engine->trace) {
+        if (dark != engine->dark)
+            fprintf(stderr, "voyager: appearance %s\n", dark ? "dark" : "light");
+        if (forceDark != engine->forceDark)
+            fprintf(stderr, "voyager: forced dark %s\n", forceDark ? "allowed" : "off");
+    }
+    bool schemeChanged = dark != engine->dark;
     engine->dark = dark;
+    engine->forceDark = forceDark;
     for (auto& tab : engine->tabs.values()) {
-        tab->page->setUseColorAppearance(dark, false);
+        if (schemeChanged)
+            tab->page->setUseColorAppearance(dark, false);
         tab->dirty = true;
     }
 }

@@ -157,6 +157,7 @@ private:
     void videoLoop();
     void decodeVideoSample(const Vector<uint8_t>&, const MediaTime&);
     bool presentFrame(uint32_t slot, const MediaTime& due);
+    void presentBlack();
     void checkEnded();
     void didReachEnd();
     void resetDecoders();

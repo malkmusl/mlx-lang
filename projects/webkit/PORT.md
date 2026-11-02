@@ -1127,11 +1127,14 @@ ScrollbarThemeAdwaita's (overlay scrollbars in the scheme's grey).
 
 ### Forced dark mode
 
-A page with no dark design of its own is painted dark on a dark desktop,
-always (Voyager has no button, key or setting for it: it follows the
-desktop's scheme, as it does for its toolbar and for the pages'
-`prefers-color-scheme`; on a light desktop pages are painted as they
-are), as Chrome's "Auto Dark Mode for Web Contents" does, by the port's
+With forced dark on, a page with no dark design of its own is painted
+dark on a dark desktop (on a light desktop pages are painted as they
+are; with it off, the default, a page keeps its own look and only gets
+`prefers-color-scheme: dark`). Voyager's setting is `force-dark = on` in
+`$XDG_CONFIG_HOME/mlx/voyager.conf`, switched (and written) by
+Ctrl+Shift+D, `VOYAGER_FORCE_DARK=1` or `0` overriding it; the engine
+gets it with the desktop's scheme (`setDark`'s bit 1). It works as
+Chrome's "Auto Dark Mode for Web Contents" does, by the port's
 painting layer (`MlxDarkMode.h`), not by WebKit: the embedder paints the
 view through `MlxDarkModeCanvas`, a Skia canvas (an `SkNWayCanvas` in
 front of the target) whose draws change their paint: a solid colour
@@ -1653,7 +1656,8 @@ std.vulkan's VK_KHR_video_decode_h264, on the first driver whose device
 has a video decode queue; RADV's UVD on the RX 580, which RADV
 offers only with `RADV_EXPERIMENTAL=video_decode` in the environment,
 `RADV_PERFTEST=video_decode` in Mesa before 26, as UVD's decoding stays
-experimental there; VCN's is on by itself since Mesa 24.2): each
+experimental there: the player sets both before it opens the driver,
+unless the environment has them; VCN's is on by itself since Mesa 24.2): each
 picture's slices go to a
 Vulkan video session, the decoded picture buffer is one layered image,
 every picture is read back after its decode (NV12 into a buffer of the
@@ -1662,8 +1666,13 @@ kernel, read back and, at its presentation time (the sample's, by the
 slot it was decoded into; a seek drops the frame waiting), handed to
 the layer as a NativeImage (`CoordinatedPlatformLayerBufferNativeImage`),
 also kept for `paint`.
-Without a decoding device the video stays black and the frames are
-counted; `examples/vulkan-decode` decodes a file on the device alone.
+Without a decoding device the video's box is black (a black frame of
+its size handed to the layer) and the frames are counted;
+`examples/vulkan-decode` decodes a file on the device alone.
+`MLX_TRACE_MEDIA=1` traces the players on standard error ("media: ..."):
+the codecs a page asks about, loads, tracks, ready and network states,
+play, pause, seeks, the decoder opened or not, every 120th frame's
+counts and the end.
 tools/check_voyager.sh's scenario 26 plays WebKit's test.mp4 (6 s of
 H.264 with a silent AAC track) by itself in Voyager
 (projects/voyager/tests/media.html: the page turns green on `playing`,
@@ -1675,9 +1684,9 @@ generic families are WebCore's name tables, which
 does (`ProcessWarming::initializeNames`; without them `sans-serif`
 was a null string, the CSS value pool's key).
 
-On a machine with a video decoder (RADV's RX 580 with
-`RADV_EXPERIMENTAL=video_decode` exported, see above), the stack is
-tried bottom up:
+On a machine with a video decoder (RADV's RX 580: Voyager asks RADV for
+it, see above; vulkaninfo and vulkan-decode need
+`RADV_EXPERIMENTAL=video_decode` exported), the stack is tried bottom up:
 
     vulkaninfo | grep VK_KHR_video_decode_h264      # the extension is there
     ./mlx build examples

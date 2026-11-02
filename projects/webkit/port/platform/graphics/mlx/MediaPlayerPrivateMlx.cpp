@@ -46,6 +46,17 @@ static constexpr uint32_t audioLatencyMilliseconds = 100;
 static constexpr size_t audioQueueLimit = 64;
 static constexpr size_t videoQueueLimit = 32;
 
+// MLX_TRACE_MEDIA in the environment: what the players do, on standard
+// error ("media: ..."): loads, tracks, states, play and pause, seeks,
+// the decoder, the frames decoded and dropped, the end.
+static bool mediaTrace()
+{
+    static const bool on = getenv("MLX_TRACE_MEDIA");
+    return on;
+}
+
+#define MEDIA_TRACE(...) do { if (mediaTrace()) { fprintf(stderr, "media: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
 // ---- The factory ----
 
 class MediaPlayerFactoryMlx final : public MediaPlayerFactory {
@@ -95,9 +106,8 @@ bool MediaPlayerPrivateMlx::supportsContainer(const String& containerType)
     return type == "video/mp4"_s || type == "audio/mp4"_s || type == "audio/aac"_s || type == "audio/x-m4a"_s || type == "video/x-m4v"_s;
 }
 
-bool MediaPlayerPrivateMlx::supportsCodec(const String& codec)
+static bool supportsCodecLowercase(const String& lower)
 {
-    auto lower = codec.convertToASCIILowercase().trim(isASCIIWhitespace<char16_t>);
     // AVC in any profile, as the decoder reads every frame-coded stream.
     if (lower.startsWith("avc1"_s) || lower.startsWith("avc3"_s))
         return true;
@@ -105,6 +115,14 @@ bool MediaPlayerPrivateMlx::supportsCodec(const String& codec)
     if (lower == "mp4a.40.2"_s || lower == "mp4a.40.02"_s || lower == "mp4a.40.5"_s || lower == "mp4a.40.05"_s || lower == "mp4a.40.29"_s || lower == "mp4a.40"_s || lower == "mp4a"_s)
         return true;
     return false;
+}
+
+bool MediaPlayerPrivateMlx::supportsCodec(const String& codec)
+{
+    auto lower = codec.convertToASCIILowercase().trim(isASCIIWhitespace<char16_t>);
+    bool supported = supportsCodecLowercase(lower);
+    MEDIA_TRACE("codec %s: %s", lower.utf8().data(), supported ? "supported" : "not supported");
+    return supported;
 }
 
 // ---- The loader's client ----
@@ -166,6 +184,7 @@ void MediaPlayerPrivateMlx::load(const String& urlString)
 
 void MediaPlayerPrivateMlx::load(const URL& url, const LoadOptions&)
 {
+    MEDIA_TRACE("load %s", url.string().utf8().data());
     cancelLoad();
     m_networkState = MediaPlayer::NetworkState::Loading;
     m_readyState = MediaPlayer::ReadyState::HaveNothing;
@@ -185,6 +204,7 @@ void MediaPlayerPrivateMlx::load(const URL& url, const LoadOptions&)
 #if ENABLE(MEDIA_SOURCE)
 void MediaPlayerPrivateMlx::load(const URL&, const LoadOptions&, MediaSourcePrivateClient& client)
 {
+    MEDIA_TRACE("load a media source");
     cancelLoad();
     m_networkState = MediaPlayer::NetworkState::Loading;
     m_readyState = MediaPlayer::ReadyState::HaveNothing;
@@ -228,6 +248,11 @@ void MediaPlayerPrivateMlx::enqueueSample(Ref<MediaSampleMlx>&& sample, TrackID 
     {
         Locker locker { m_queueLock };
         auto& queue = m_queues.ensure(trackID, [] { return Queue { }; }).iterator->value;
+        if (mediaTrace()) {
+            static unsigned enqueued;
+            if (!(++enqueued % 100))
+                MEDIA_TRACE("%u samples enqueued (track %llu at %.3f s, %zu waiting)", enqueued, static_cast<unsigned long long>(trackID), sample->presentationTime().toDouble(), queue.samples.size() + 1);
+        }
         queue.samples.append(WTF::move(sample));
         queue.ended = false;
     }
@@ -283,6 +308,7 @@ const Logger& MediaPlayerPrivateMlx::logger() const
 
 void MediaPlayerPrivateMlx::addSourceTrack(TrackID id, bool isVideo, uint32_t timescale, uint64_t editMediaTime, uint32_t nalLengthSize, std::span<const uint8_t> config, const Vector<Vector<uint8_t>>& parameterSets, const FloatSize& size)
 {
+    MEDIA_TRACE("source track %llu: %s, timescale %u, %dx%d, %zu parameter sets", static_cast<unsigned long long>(id), isVideo ? "H.264 video" : "AAC audio", timescale, static_cast<int>(size.width()), static_cast<int>(size.height()), parameterSets.size());
     Track track;
     track.index = 0;
     track.id = id;
@@ -403,6 +429,7 @@ void MediaPlayerPrivateMlx::didReceiveData(std::span<const uint8_t> bytes)
 
 void MediaPlayerPrivateMlx::didFailLoading()
 {
+    MEDIA_TRACE("loading failed");
     setNetworkState(MediaPlayer::NetworkState::NetworkError);
 }
 
@@ -423,11 +450,13 @@ void MediaPlayerPrivateMlx::fileLoaded()
     auto status = mlxweb_media_demuxer_parse(m_demuxer, m_fileBytes.span().data(), m_fileBytes.size(), &used);
     if (status != MLXWEB_MEDIA_OK || !mlxweb_media_track_count(m_demuxer)) {
         locker.unlockEarly();
+        MEDIA_TRACE("file of %zu bytes not demuxed (status %d)", m_fileBytes.size(), static_cast<int>(status));
         setNetworkState(MediaPlayer::NetworkState::FormatError);
         return;
     }
     locker.unlockEarly();
     configureFromDemuxer();
+    MEDIA_TRACE("file of %zu bytes: %s%s, %dx%d, %.3f s", m_fileBytes.size(), m_videoTrack ? "H.264 video " : "", m_audioTrack ? "AAC audio" : "", static_cast<int>(m_naturalSize.width()), static_cast<int>(m_naturalSize.height()), m_duration.isValid() ? m_duration.toDouble() : 0.0);
     if (!m_audioTrack && !m_videoTrack) {
         setNetworkState(MediaPlayer::NetworkState::FormatError);
         return;
@@ -500,6 +529,7 @@ void MediaPlayerPrivateMlx::setNetworkState(MediaPlayer::NetworkState state)
 {
     if (m_networkState == state)
         return;
+    MEDIA_TRACE("network state %d", static_cast<int>(state));
     m_networkState = state;
     m_player->networkStateChanged();
 }
@@ -508,6 +538,7 @@ void MediaPlayerPrivateMlx::setReadyState(MediaPlayer::ReadyState state)
 {
     if (m_readyState == state)
         return;
+    MEDIA_TRACE("ready state %d", static_cast<int>(state));
     m_readyState = state;
     m_player->readyStateChanged();
 }
@@ -612,6 +643,7 @@ void MediaPlayerPrivateMlx::play()
     m_playing = true;
     m_audioEnded = false;
     m_videoEnded = false;
+    MEDIA_TRACE("play at %.3f s (%s%s)", m_clockBase.toDouble(), m_audioTrack ? "audio" : "", m_videoTrack ? (m_audioTrack ? ", video" : "video") : "");
     startClock(m_clockBase);
     if (m_audioTrack)
         startAudioThread();
@@ -627,6 +659,7 @@ void MediaPlayerPrivateMlx::pause()
         return;
     m_playing = false;
     stopClock();
+    MEDIA_TRACE("pause at %.3f s, %u frames decoded, %u dropped", m_clockBase.toDouble(), m_decodedFrames.load(), m_droppedFrames.load());
     wakeAudio();
     wakeVideo();
     m_player->playbackStateChanged();
@@ -659,6 +692,7 @@ void MediaPlayerPrivateMlx::setMuted(bool muted)
 Ref<MediaTimePromise> MediaPlayerPrivateMlx::seekToTarget(const SeekTarget& target)
 {
     auto time = target.time;
+    MEDIA_TRACE("seek to %.3f s", time.toDouble());
     m_ended = false;
     m_audioEnded = false;
     m_videoEnded = false;
@@ -736,6 +770,7 @@ void MediaPlayerPrivateMlx::checkEnded()
 
 void MediaPlayerPrivateMlx::didReachEnd()
 {
+    MEDIA_TRACE("ended, %u frames decoded, %u dropped", m_decodedFrames.load(), m_droppedFrames.load());
     m_playing = false;
     m_ended = true;
     stopClock();
@@ -1037,6 +1072,11 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
     if (!m_videoDecoderTried) {
         m_videoDecoderTried = true;
         m_videoDecoder = mlxweb_video_open();
+        MEDIA_TRACE("video decoder %s", m_videoDecoder ? "opened (the GPU's)" : "none: no device decodes H.264, the video is black");
+        // No decoding device: the video's box black (as a player shows a
+        // video it cannot decode), not left empty.
+        if (!m_videoDecoder)
+            presentBlack();
     }
     bool decoded = m_videoDecoder && mlxweb_video_decode(m_videoDecoder, m_h264, bytes.span().data()) == MLXWEB_MEDIA_OK;
     mlxweb_media_h264_finish_picture(m_h264);
@@ -1052,7 +1092,40 @@ void MediaPlayerPrivateMlx::decodeVideoSample(const Vector<uint8_t>& bytes, cons
             ++m_decodedFrames;
         else
             ++m_droppedFrames;
+        unsigned frames = m_decodedFrames.load() + m_droppedFrames.load();
+        if (frames && !(frames % 120))
+            MEDIA_TRACE("frames: %u decoded, %u dropped, at %.3f s", m_decodedFrames.load(), m_droppedFrames.load(), clockTime().toDouble());
     }
+}
+
+// A black frame of the video's size handed to the layer and kept for
+// paint: what shows when no device decodes the video.
+void MediaPlayerPrivateMlx::presentBlack()
+{
+    int width = std::max(2, static_cast<int>(m_naturalSize.width()));
+    int height = std::max(2, static_cast<int>(m_naturalSize.height()));
+    auto info = SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kOpaque_SkAlphaType, SkColorSpace::MakeSRGB());
+    size_t rowBytes = static_cast<size_t>(width) * 4;
+    auto data = SkData::MakeUninitialized(rowBytes * height);
+    if (!data)
+        return;
+    auto* pixels = static_cast<uint32_t*>(data->writable_data());
+    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i)
+        pixels[i] = 0xff000000;
+    auto image = SkImages::RasterFromData(info, WTF::move(data), rowBytes);
+    if (!image)
+        return;
+    RefPtr nativeImage = NativeImage::create(WTF::move(image));
+    if (!nativeImage)
+        return;
+    {
+        Locker locker { m_frameLock };
+        m_lastFrame = nativeImage;
+    }
+#if USE(COORDINATED_GRAPHICS)
+    if (m_layerProxy)
+        m_layerProxy->setDisplayBuffer(CoordinatedPlatformLayerBufferNativeImage::create(nativeImage.releaseNonNull(), nullptr));
+#endif
 }
 
 // The frame in the decoder's slot: read back as BGRA into a Skia raster
