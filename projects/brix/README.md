@@ -107,13 +107,18 @@ is written over.
 - The inode table: a root block of 512 inode block numbers, 16 inodes of
   256 bytes each. A file's data: 12 direct blocks, an indirect block, a
   double indirect one; a directory's: 64-byte entries (inode, name).
-- A commit writes what changed into free blocks: a changed file's data
-  and pointer blocks (unchanged files keep theirs), the inode blocks with
-  changed inodes, a new table root; then the other superblock with the
-  next generation. Until that one block is written the disk is the last
+- A commit writes what changed into free blocks: of a changed file the
+  pages written since the last commit (each page of the tree carries a
+  changed mark) and the pointer blocks naming them, the rest keeps its
+  blocks; a changed directory whole; the inode blocks with changed
+  inodes, a new table root; then, between two flushes of the device
+  (virtio's FLUSH when it offers it), the other superblock with the next
+  generation. Until that one block is written the disk is the last
   commit, whole; after it, the new one.
 - Free blocks are those no root reaches (the current one, the
-  snapshots'): marked again at mount and after each commit.
+  snapshots'): marked again at mount and after each commit. The same
+  sweep notes the current table's free inode numbers; new files take the
+  lowest of them before a number never used.
 - A snapshot is the current root kept in the snapshot table:
   `snapshot -r /volumes/disk0 /volumes/NAME` commits, keeps the root and
   mounts it read-only at /volumes/NAME; `snapshot -d /volumes/NAME`
@@ -126,16 +131,23 @@ directory's entries as nodes not read yet); a change marks a node
 becomes the volume's (`Vfs.adopt`); moves between the volume and the
 rest of the tree are EXDEV. Commits happen when the system is idle (every
 process waits, e.g. at the shell's prompt) and at sync, fsync, syncfs.
+After an idle commit (`Store.trim`), while fewer than half of the tree's
+1024 nodes are free, clean directories read from the disk are unloaded
+(the nodes they name freed, subdirectories first; nothing open, changed
+or linked twice goes), and while less than a quarter of memory is free,
+clean files' pages are dropped; both are read again when used. stat
+gives a volume node's inode number and the volume as its device.
 
     brixfs format /devices/disk0     on brixOS (it is mounted at once), or
     brixfs format disk.img           on the host
     brixfs list disk.img             every path and size, the snapshots
     brixfs cat disk.img docs/a       a file
+    brixfs blocks disk.img docs/a    a file's block numbers (0: a hole)
 
-Not there yet: a file is written again whole when it changed (not only
-its changed blocks), inode numbers are not reused, every node read from
-the disk stays in memory (1024 nodes at most), no flush command to the
-device (the host's writes are in its order).
+Not there yet: a directory is still written whole when an entry changed;
+nodes held open or with more than one link stay in memory; no journal of
+small writes between commits (a crash loses what came after the last
+one, never more).
 
 The pieces:
 
@@ -236,9 +248,8 @@ permissions that are checked, more than one CPU, an EFI loader.
 1. The timer (the APIC's) and preemption; the serial line's interrupt;
    signal handlers (rt_sigaction, delivery, sigreturn) and job control
    (SIGTSTP, SIGCONT).
-2. brixfs: only a file's changed blocks written, inode reuse, nodes
-   evicted from memory, the device's flush; interrupts for the disk;
-   ext2 as the format to exchange with Linux.
+2. Interrupts for the disk; ext2 as the format to exchange with Linux;
+   brixfs directories written by changed page.
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
 5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.

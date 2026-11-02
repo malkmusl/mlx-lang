@@ -84,7 +84,9 @@ the system call layer), with copy on write for fork and for files
 (copy_file_range, FICLONE; std.fs.copy uses copy_file_range), snapshots
 of trees (the snapshot tool), a virtio disk as /devices/disk0, and
 brixfs on it, a copy-on-write format of brixOS's own (A/B superblocks,
-commits when idle or at sync, snapshots as kept roots) mounted at
+commits of the changed blocks when idle or at sync with the device
+flushed, inode numbers reused, snapshots as kept roots, directories
+leaving memory when nodes run short) mounted at
 /volumes/disk0 (`./mlx build brix`, `tools/check_brix.sh`). Note:
 ROADMAP.md is written for a Linux kernel ("replacing it is not the
 goal"); brixOS is the Stage 4 target of AGENT_IMPLEMENTATION.md and

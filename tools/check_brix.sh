@@ -21,7 +21,9 @@
 # mounts it at /volumes/disk0: files and directories written there reach
 # the disk (the host's brixfs lists and reads them), a snapshot on the disk
 # keeps the old state; after a second boot both are there, the snapshot
-# is taken out and its blocks are free again; a script runs (by
+# is taken out and its blocks are free again, an appended file keeps its
+# unchanged blocks, inode numbers are used again, and more files than
+# the tree has nodes for are there (unloaded, read again); a script runs (by
 # /proc/self/exe), a program
 # copied into /temporary runs, and a program of /system/programs written
 # to is copied up; Ctrl-C ends the foreground program, Ctrl-D ends its
@@ -281,3 +283,37 @@ free_after=$(output | grep '^free [0-9]*$' | tail -n 1 | cut -d' ' -f2)
 "$work/brixfs" list "$work/disk.img" > "$work/list" 2>&1
 ! grep -q '^snapshot ' "$work/list" || fail "the snapshot is still on the disk"
 echo "ok   brixfs after a reboot: the files and the snapshot there, the snapshot taken out, its blocks free"
+
+# Only what changed is written: a file of 144 blocks appended to keeps
+# every block but its last on the disk.
+type_line 'cd /volumes/disk0 && seq 100000 > large && sync && echo written'
+wait_for '^written$'
+"$work/brixfs" blocks "$work/disk.img" large > "$work/blocks.before" 2>&1 || fail "the host cannot list large's blocks: $(cat "$work/blocks.before")"
+[[ $(wc -l < "$work/blocks.before") == 144 ]] || fail "large has $(wc -l < "$work/blocks.before") blocks, not 144"
+type_line 'echo 100001 >> large && sync && tail -n 1 large'
+wait_for '^100001$'
+"$work/brixfs" blocks "$work/disk.img" large > "$work/blocks.after" 2>&1
+cmp -s <(head -n 143 "$work/blocks.before") <(head -n 143 "$work/blocks.after") || fail "blocks of large that did not change were written again"
+[[ "$(tail -n 1 "$work/blocks.before")" != "$(tail -n 1 "$work/blocks.after")" ]] || fail "the changed block of large was written in place"
+# A removed file's inode number is used again.
+type_line 'echo a > r1 && sync && i=$(stat -c %i r1) && rm r1 && sync && echo b > r2 && echo reused $(( $(stat -c %i r2) == i ))'
+wait_for '^reused 1$'
+echo "ok   brixfs: an appended file's unchanged blocks stay, a removed file's inode number is used again"
+
+# More files than the tree has nodes for: directories read from the disk
+# leave memory when the system is idle and are read again when used.
+type_line 'mkdir m1 m2 m3 && for i in $(seq 400); do : > m1/f$i; done; echo seven > m1/f7; echo made m1'
+wait_for '^made m1$'
+type_line 'for i in $(seq 400); do : > m2/f$i; done; echo made m2'
+wait_for '^made m2$'
+type_line 'for i in $(seq 400); do : > m3/f$i; done; echo made m3'
+wait_for '^made m3$'
+type_line 'cat m1/f7; ls m1 | wc -l'
+wait_for '^seven$'
+wait_for '^400$'
+type_line 'ls m2 | wc -l'
+wait_for '^400$' 2
+type_line 'ls m3 | wc -l; rm -r m1 m2 m3 && echo removed'
+wait_for '^400$' 3
+wait_for '^removed$'
+echo "ok   brixfs: more files than nodes in memory (directories unloaded when idle, read again)"
