@@ -5,6 +5,7 @@
 // turns the carriage return a terminal sends for Enter into "\n".
 const serial = @import("./serial.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
+const wait = @import("./wait.mlx")
 
 pub const Terminal = struct {
     // struct termios (Linux's kernel layout): four flag words, the line
@@ -21,6 +22,7 @@ pub const Terminal = struct {
     const ONLCR: usize = 0x4
     const ICANON: usize = 0x2
     const ECHO: usize = 0x8
+    const ISIG: usize = 0x1
     const VINTR: usize = 0
     const VQUIT: usize = 1
     const VERASE: usize = 2
@@ -31,10 +33,16 @@ pub const Terminal = struct {
 
     uart: serial.Uart
     termios: [TERMIOS_SIZE]u8
+    // Canonical mode: the line being edited, then (once it ends) given
+    // out from lineGiven to lineReady before the next is edited.
     line: [LINE_CAPACITY]u8
     lineLength: usize
     lineReady: usize
     lineGiven: usize
+    // EOF typed on an empty line (the next read gives 0).
+    endOfFile: bool
+    // Ctrl-C typed (ISIG): the foreground group is to be interrupted.
+    interrupted: bool
 
     // A cooked terminal on `uart`: ICRNL IXON, OPOST ONLCR, B38400 CS8
     // CREAD, ISIG ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN, the
@@ -55,11 +63,15 @@ pub const Terminal = struct {
         self.*.lineLength = 0
         self.*.lineReady = 0
         self.*.lineGiven = 0
+        self.*.endOfFile = false
+        self.*.interrupted = false
     }
 
     fn flags(self: *const Self, which: usize) -> usize { return Bytes.read32(&self.*.termios, which) }
 
     fn character(self: *const Self, which: usize) -> u8 { return self.*.termios[CHARACTERS + which] }
+
+    fn canonical(self: *const Self) -> bool { return self.flags(LOCAL_FLAGS) & ICANON != 0 }
 
     pub fn getAttributes(self: *const Self, into: [*]u8) -> void { Bytes.copy(into, &self.*.termios, TERMIOS_SIZE) }
 
@@ -81,21 +93,33 @@ pub const Terminal = struct {
         return byte
     }
 
-    fn rubOut(self: *const Self, echo: bool) -> void {
-        if !echo { return }
-        self.*.uart.put(BACKSPACE)
-        self.*.uart.put(32)
-        self.*.uart.put(BACKSPACE)
+    fn echoText(self: *const Self, text: []const u8) -> void {
+        var k: usize = 0
+        while k < text.length {
+            self.*.uart.put(text[k])
+            k += 1
+        }
     }
 
-    // A line edited in canonical mode; false at EOF on an empty line.
-    fn editLine(self: *Self) -> bool {
-        self.*.lineLength = 0
-        self.*.lineReady = 0
-        self.*.lineGiven = 0
+    fn rubOut(self: *const Self, echo: bool) -> void {
+        if echo { self.echoText("\x08 \x08") }
+    }
+
+    fn hasLine(self: *const Self) -> bool { return self.*.lineGiven < self.*.lineReady }
+
+    // Canonical mode: the bytes that came, edited into the line (erase,
+    // kill, EOF, Ctrl-C), until a line is complete.
+    fn feed(self: *Self) -> void {
         const echo = self.flags(LOCAL_FLAGS) & ECHO != 0
-        while true {
+        const signals = self.flags(LOCAL_FLAGS) & ISIG != 0
+        while !self.hasLine() && !self.*.endOfFile && self.*.uart.ready() {
             const byte = self.input()
+            if signals && byte == self.character(VINTR) {
+                if echo { self.echoText("^C\r\n") }
+                self.*.lineLength = 0
+                self.*.interrupted = true
+                continue
+            }
             if byte == self.character(VERASE) || byte == BACKSPACE {
                 if self.*.lineLength > 0 {
                     self.*.lineLength -= 1
@@ -111,8 +135,13 @@ pub const Terminal = struct {
                 continue
             }
             if byte == self.character(VEOF) {
-                if self.*.lineLength == 0 { return false }
-                break
+                if self.*.lineLength == 0 {
+                    self.*.endOfFile = true
+                } else {
+                    self.*.lineReady = self.*.lineLength
+                    self.*.lineGiven = 0
+                }
+                continue
             }
             if self.*.lineLength < LINE_CAPACITY - 1 {
                 self.*.line[self.*.lineLength] = byte
@@ -122,37 +151,62 @@ pub const Terminal = struct {
                     self.*.uart.put(byte)
                 }
             }
-            if byte == 10 { break }
+            if byte == 10 {
+                self.*.lineReady = self.*.lineLength
+                self.*.lineGiven = 0
+            }
         }
-        self.*.lineReady = self.*.lineLength
-        return true
     }
 
-    // Bytes for a read of at most `capacity` (at least one: it waits; 0
-    // at EOF).
-    pub fn read(self: *Self, into: [*]u8, capacity: usize) -> usize {
+    // Bytes for a read of at most `capacity`: those there are (a line in
+    // canonical mode), 0 at EOF, or wait.BLOCKED when there are none yet.
+    pub fn read(self: *Self, into: [*]u8, capacity: usize) -> isize {
         if capacity == 0 { return 0 }
-        if self.flags(LOCAL_FLAGS) & ICANON == 0 {
-            into[0] = self.input()
-            var count: usize = 1
+        if !self.canonical() {
+            if !self.*.uart.ready() { return wait.BLOCKED }
+            var count: usize = 0
             while count < capacity && self.*.uart.ready() {
                 into[count] = self.input()
                 count += 1
             }
-            return count
+            return @intCast(isize, count)
         }
-        if self.*.lineGiven >= self.*.lineReady && !self.editLine() { return 0 }
-        var count: usize = 0
-        while count < capacity && self.*.lineGiven < self.*.lineReady {
-            into[count] = self.*.line[self.*.lineGiven]
-            self.*.lineGiven += 1
-            count += 1
+        self.feed()
+        if self.hasLine() {
+            var count: usize = 0
+            while count < capacity && self.hasLine() {
+                into[count] = self.*.line[self.*.lineGiven]
+                self.*.lineGiven += 1
+                count += 1
+            }
+            if !self.hasLine() {
+                self.*.lineReady = 0
+                self.*.lineGiven = 0
+                self.*.lineLength = 0
+            }
+            return @intCast(isize, count)
         }
-        return count
+        if self.*.endOfFile {
+            self.*.endOfFile = false
+            return 0
+        }
+        return wait.BLOCKED
     }
 
-    // Whether a read would give bytes now.
-    pub fn pending(self: *const Self) -> bool { return self.*.lineGiven < self.*.lineReady || self.*.uart.ready() }
+    // Whether a read would give something now (in canonical mode, the
+    // input that came is edited first).
+    pub fn pending(self: *Self) -> bool {
+        if !self.canonical() { return self.*.uart.ready() }
+        self.feed()
+        return self.hasLine() || self.*.endOfFile
+    }
+
+    // Whether Ctrl-C was typed since the last time this was asked.
+    pub fn takeInterrupt(self: *Self) -> bool {
+        const was = self.*.interrupted
+        self.*.interrupted = false
+        return was
+    }
 }
 
 var console: Terminal = undefined // (per run)

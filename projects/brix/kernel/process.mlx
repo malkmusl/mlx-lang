@@ -1,5 +1,7 @@
 // A process: a static ELF program from the boot archive in its own
-// address space, with its descriptors. Its memory: the program's
+// address space, with its descriptors, its place among the others (pid,
+// parent, group), what it waits for and, while it does not run, its
+// registers. Its memory: the program's
 // segments, the break after them, anonymous mappings from MMAP_BASE up,
 // the stack under STACK_TOP; all but the segments are pages made on first
 // touch (a page fault in one of the regions, or the kernel preparing a
@@ -9,6 +11,8 @@ const memory = @import("./memory.mlx")
 const archive = @import("./archive.mlx")
 const files = @import("./files.mlx")
 const Elf = @import("./elf.mlx").Elf
+const Frame = @import("./frame.mlx").Frame
+const wait = @import("./wait.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
 const Errno = @import("./errno.mlx").Errno
 const Page = memory.Page
@@ -22,11 +26,17 @@ pub const Region = struct {
     pub fn contains(self: Self, address: usize) -> bool { return address >= self.start && address < self.end }
 }
 
-// NUL-terminated strings for a program's argv or envp.
+// NUL-terminated strings for a program's argv or envp (in the kernel, or
+// in the memory of the process that is in use: execve's).
 pub const Strings = struct {
     items: [*]const [*]const u8
     count: usize
 }
+
+pub const State = enum(u8) { free, ready, blocked, zombie }
+
+// What load says.
+pub const Loaded = enum(u8) { done, missing, not_a_program, no_memory }
 
 pub const Process = struct {
     pub const STACK_TOP: usize = 0x7FFFFFFFF000
@@ -34,7 +44,8 @@ pub const Process = struct {
     pub const MMAP_BASE: usize = 0x100000000000
     pub const USER_LIMIT: usize = 0x800000000000
     pub const MAX_REGIONS: usize = 256
-    const MAX_STRINGS: usize = 32
+    // How many argv and envp strings a program gets at most.
+    pub const MAX_STRINGS: usize = 256
     // The auxiliary vector's keys.
     const AT_NULL: usize = 0
     const AT_PHDR: usize = 3
@@ -45,6 +56,20 @@ pub const Process = struct {
     const AT_UID: usize = 11
     const AT_RANDOM: usize = 25
 
+    state: State
+    pid: usize
+    parentPid: usize
+    group: usize
+    // The wait status for wait4, once a zombie.
+    status: usize
+    waitingFor: wait.Wait
+    // The deadline of the wait passed (the call it makes again ends).
+    timedOut: bool
+    // A child ended since the process last took SIGCHLD.
+    childSignal: bool
+    // The registers while it does not run, and its FS base.
+    context: Frame
+    fsBase: usize
     space: Space
     entry: usize
     stack: usize
@@ -57,10 +82,60 @@ pub const Process = struct {
     regionCount: usize
     files: files.Descriptors
 
-    pub fn init(self: *Self) -> void {
+    // A fresh process `pid` (child of `parentPid`): no memory, the
+    // terminal on 0, 1 and 2.
+    pub fn init(self: *Self, pid: usize, parentPid: usize) -> void {
+        self.*.state = State.ready
+        self.*.pid = pid
+        self.*.parentPid = parentPid
+        self.*.group = pid
+        self.*.status = 0
+        self.*.waitingFor = wait.Wait.none()
+        self.*.timedOut = false
+        self.*.childSignal = false
+        self.*.fsBase = 0
         self.*.space = Space.{ .root = 0 }
+        self.*.breakStart = 0
+        self.*.breakEnd = 0
+        self.*.mmapNext = MMAP_BASE
         self.*.regionCount = 0
         self.*.files.init()
+    }
+
+    // The memory, descriptors and registers of `parent` copied (a fork:
+    // the child's call returns 0); false when memory is out.
+    pub fn forkFrom(self: *Self, parent: *Self, frame: *const Frame) -> bool {
+        const space = parent.*.space.clone()
+        if !space.isValid() { return false }
+        self.*.space = space
+        self.*.group = parent.*.group
+        self.*.fsBase = parent.*.fsBase
+        self.*.entry = parent.*.entry
+        self.*.stack = parent.*.stack
+        self.*.breakStart = parent.*.breakStart
+        self.*.breakEnd = parent.*.breakEnd
+        self.*.mmapNext = parent.*.mmapNext
+        self.*.programHeaders = parent.*.programHeaders
+        self.*.programHeaderCount = parent.*.programHeaderCount
+        var k: usize = 0
+        while k < parent.*.regionCount {
+            self.*.regions[k].start = parent.*.regions[k].start
+            self.*.regions[k].end = parent.*.regions[k].end
+            k += 1
+        }
+        self.*.regionCount = parent.*.regionCount
+        self.*.files.copyFrom(&parent.*.files)
+        self.*.context = frame.*
+        self.*.context.rax = 0
+        return true
+    }
+
+    // Its memory freed (the boot tables in use when it was its own).
+    pub fn releaseMemory(self: *Self) -> void {
+        if !self.*.space.isValid() { return }
+        if cpu.Cpu.pageTables() == self.*.space.root { Space.boot().activate() }
+        self.*.space.destroy()
+        self.*.space = Space.{ .root = 0 }
     }
 
     // ---- regions ----
@@ -217,98 +292,97 @@ pub const Process = struct {
 
     // The stack the program starts with: argc, argv, envp, the auxiliary
     // vector, then the strings and 16 random bytes at the top. Its
-    // pointer.
+    // pointer; 0 when memory is out.
     fn buildStack(self: *Self, target: Space, arguments: Strings, environment: Strings) -> usize {
-        var top = STACK_TOP - 16
-        var pointers: [MAX_STRINGS]usize = undefined
-        var total: usize = 0
-        while total < arguments.count + environment.count && total < MAX_STRINGS {
-            const text = if total < arguments.count { arguments.items[total] } else { environment.items[total - arguments.count] }
-            const n = Bytes.length(text) + 1
-            top -= n
-            _ = target.write(top, text, n)
-            pointers[total] = top
-            total += 1
+        const total = arguments.count + environment.count
+        // The strings' room.
+        var bytes: usize = 0
+        var k: usize = 0
+        while k < total {
+            bytes += Bytes.length(string(arguments, environment, k)) + 1
+            k += 1
         }
-        top -= top % 16
-        top -= 16
-        const random = top
+        const strings = STACK_TOP - 16 - bytes
+        var random = strings - strings % 16 - 16
         var seed = cpu.Cpu.timestamp() | 1
         var r: usize = 0
         while r < 2 {
             seed ^= seed << 13
             seed ^= seed >> 7
             seed ^= seed << 17
-            _ = target.writeWord(random + r * 8, seed)
+            if !target.writeWord(random + r * 8, seed) { return 0 }
             r += 1
         }
-        const auxiliary = [16]usize{ AT_PHDR, self.*.programHeaders, AT_PHENT, Elf.HEADER_SIZE, AT_PHNUM, self.*.programHeaderCount, AT_PAGESZ, Page.SIZE, AT_ENTRY, self.*.entry, AT_UID, 0, AT_RANDOM, random, AT_NULL, 0 }
+        // argc, argv and its NULL, envp and its NULL, 8 auxiliary pairs.
         const words = 1 + arguments.count + 1 + environment.count + 1 + 16
-        top -= words * 8
+        var top = random - words * 8
         top -= top % 16
         var at = top
-        _ = target.writeWord(at, arguments.count)
+        if !target.writeWord(at, arguments.count) { return 0 }
         at += 8
-        // argv, its NULL, envp, its NULL.
-        if arguments.count == 0 {
-            _ = target.writeWord(at, 0)
-            at += 8
-        }
-        var k: usize = 0
+        var text = strings
+        k = 0
         while k < total {
-            _ = target.writeWord(at, pointers[k])
+            const item = string(arguments, environment, k)
+            const n = Bytes.length(item) + 1
+            if !target.write(text, item, n) || !target.writeWord(at, text) { return 0 }
+            text += n
             at += 8
             k += 1
             if k == arguments.count {
-                _ = target.writeWord(at, 0)
+                if !target.writeWord(at, 0) { return 0 }
                 at += 8
             }
         }
-        _ = target.writeWord(at, 0)
+        if !target.writeWord(at, 0) { return 0 }
         at += 8
+        const auxiliary = [16]usize{ AT_PHDR, self.*.programHeaders, AT_PHENT, Elf.HEADER_SIZE, AT_PHNUM, self.*.programHeaderCount, AT_PAGESZ, Page.SIZE, AT_ENTRY, self.*.entry, AT_UID, 0, AT_RANDOM, random, AT_NULL, 0 }
         var a: usize = 0
         while a < 16 {
-            _ = target.writeWord(at, auxiliary[a])
+            if !target.writeWord(at, auxiliary[a]) { return 0 }
             at += 8
             a += 1
         }
         return top
     }
 
-    // The program `name` of the boot archive loaded into a new address
-    // space, which becomes the process's and the one in use (the old one
-    // freed); false when it is not there, is no static x86-64 ELF program,
-    // or memory is out.
-    pub fn load(self: *Self, name: []const u8, arguments: Strings, environment: Strings) -> bool {
+    fn string(arguments: Strings, environment: Strings, k: usize) -> [*]const u8 {
+        return if k < arguments.count { arguments.items[k] } else { environment.items[k - arguments.count] }
+    }
+
+    // The program of the boot archive at `index` loaded into a new
+    // address space, which becomes the process's and the one in use (the
+    // old one freed). The strings may be in the old one (execve's).
+    pub fn load(self: *Self, index: usize, arguments: Strings, environment: Strings) -> Loaded {
         const boot = archive.Archive.boot()
-        const index = boot.find(name.pointer, name.length)
-        if index == boot.count() { return false }
+        if index >= boot.count() { return Loaded.missing }
+        // (A program gets its name as argv[0]; argv's NULL follows it.)
+        if arguments.count == 0 { return Loaded.not_a_program }
         const file = boot.file(index)
         const elf = Elf.{ .data = file.data, .size = file.size }
-        if !elf.isProgram() { return false }
+        if !elf.isProgram() { return Loaded.not_a_program }
         const target = Space.create()
-        if !target.isValid() { return false }
+        if !target.isValid() { return Loaded.no_memory }
         const highest = self.loadSegments(target, elf)
-        if highest == 0 {
-            target.destroy()
-            return false
-        }
-        self.*.entry = elf.entry()
+        const entry = elf.entry()
+        const savedEntry = self.*.entry
+        self.*.entry = entry
         self.*.programHeaderCount = elf.headerCount()
+        const stack = if highest == 0 { 0 } else { self.buildStack(target, arguments, environment) }
+        if stack == 0 {
+            self.*.entry = savedEntry
+            target.destroy()
+            return Loaded.no_memory
+        }
+        self.*.stack = stack
         self.*.breakStart = Page.up(highest)
         self.*.breakEnd = self.*.breakStart
         self.*.mmapNext = MMAP_BASE
         self.*.regionCount = 0
-        self.*.stack = self.buildStack(target, arguments, environment)
         const old = self.*.space
         self.*.space = target
         target.activate()
         if old.isValid() { old.destroy() }
-        return true
+        return Loaded.done
     }
 }
-
-var shell: Process = undefined // (per run)
-
-// The process running (there is one yet).
-pub fn current() -> *Process { return &shell }

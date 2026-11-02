@@ -74,13 +74,14 @@ Commands:
 
 On the branch `brix-kernel` (projects/brix/README.md there): mlx4 has an
 `x86_64-freestanding` target (`--target=x86_64-freestanding`), brix-image
-makes a Multiboot image (boot blob, kernel, file archive), and the kernel
-boots in QEMU to the serial console and runs mlx-sh in user mode with a
-subset of Linux's system calls (`./mlx build brix`,
-`tools/check_brix.sh`). Only builtins run: no fork/execve yet, no
-interrupts (polled serial line). Note: ROADMAP.md is written for a Linux
-kernel ("replacing it is not the goal"); brixOS is the Stage 4 target of
-AGENT_IMPLEMENTATION.md and spec/04-stdlib/os/brix.xml.
+makes a Multiboot image (boot blob, kernel, file archive with mlx-sh and
+the coreutils), and the kernel boots in QEMU to the serial console and
+runs mlx-sh in user mode with Linux's system call numbers; programs run
+as processes (fork, execve, wait4, pipes, Ctrl-C), scheduled when they
+wait (no timer yet) (`./mlx build brix`, `tools/check_brix.sh`). Note:
+ROADMAP.md is written for a Linux kernel ("replacing it is not the
+goal"); brixOS is the Stage 4 target of AGENT_IMPLEMENTATION.md and
+spec/04-stdlib/os/brix.xml.
 
 To try at home:
 

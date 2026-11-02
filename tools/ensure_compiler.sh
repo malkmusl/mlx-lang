@@ -706,6 +706,20 @@ resolves_aggregate_constant_lengths() {
     [[ $status -eq 13 ]]
 }
 
+# Whether $1 lets a method's locals shadow its struct's members and the
+# module's declarations (tests/427 exits 13).
+lets_locals_shadow_members() {
+    local probe status=0
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    if "$1" --quiet tests/427_local_shadows_member_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+    else
+        status=1
+    fi
+    rm -rf -- "$probe"
+    [[ $status -eq 13 ]]
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -756,6 +770,7 @@ probes=(
     "says_its_version|its version (mlx4 --version)"
     "builds_freestanding_kernels|kernels (--target=x86_64-freestanding)"
     "resolves_aggregate_constant_lengths|a struct's constants as its array fields' lengths"
+    "lets_locals_shadow_members|locals shadowing their struct's members and module declarations"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

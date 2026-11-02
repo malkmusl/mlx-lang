@@ -1,10 +1,15 @@
 // System calls: Linux's numbers and conventions (rax the number, rdi,
 // rsi, rdx, r10, r8, r9 the arguments, rax the result or -errno), the
-// part a shell on a serial terminal needs. Processes of their own are not
-// there yet (fork, execve: ENOSYS); signals are taken and never come.
+// part a shell and its programs on a serial terminal need: processes
+// (fork, execve, wait4, exit, kill), pipes, the terminal, the archive's
+// files, memory, time. Signals other than those that end a process, and
+// SIGCHLD for sigtimedwait, are taken and never come.
 const cpu = @import("./cpu.mlx")
 const console = @import("./console.mlx")
 const process = @import("./process.mlx")
+const scheduler = @import("./scheduler.mlx")
+const wait = @import("./wait.mlx")
+const pipe = @import("./pipe.mlx")
 const files = @import("./files.mlx")
 const terminal = @import("./terminal.mlx")
 const clock = @import("./clock.mlx")
@@ -85,7 +90,6 @@ pub const Number = struct {
     pub const CLOCK_NANOSLEEP: usize = 230
     pub const EXIT_GROUP: usize = 231
     pub const TGKILL: usize = 234
-    pub const WAITID: usize = 247
     pub const OPENAT: usize = 257
     pub const NEWFSTATAT: usize = 262
     pub const READLINKAT: usize = 267
@@ -95,7 +99,17 @@ pub const Number = struct {
     pub const DUP3: usize = 292
     pub const PIPE2: usize = 293
     pub const PRLIMIT64: usize = 302
+    pub const GETXATTR: usize = 191
+    pub const LGETXATTR: usize = 192
+    pub const FGETXATTR: usize = 193
+    pub const LISTXATTR: usize = 194
+    pub const LLISTXATTR: usize = 195
+    pub const FLISTXATTR: usize = 196
+    pub const SPLICE: usize = 275
+    pub const COPY_FILE_RANGE: usize = 326
+    pub const SENDFILE: usize = 40
     pub const GETRANDOM: usize = 318
+    pub const STATX: usize = 332
     pub const RSEQ: usize = 334
     pub const CLONE3: usize = 435
     pub const FACCESSAT2: usize = 439
@@ -103,11 +117,25 @@ pub const Number = struct {
 }
 
 // What became of a system call besides its result.
-pub const Outcome = struct {
-    exit: bool
-    status: usize
+pub const OutcomeKind = enum(u8) {
+    // The result is in rax; the process goes on.
+    done,
+    // The process waits (for `waiting`) and makes the call again.
+    blocked,
+    // The process lets another run first (sched_yield).
+    yielded,
+    // The process exited (`status`, a wait status).
+    exited,
+    // The process ended by a signal during the call (it is a zombie now).
+    ended,
+    // execve: the frame holds the new program's start.
+    replaced
+}
 
-    pub fn running() -> Outcome { return Outcome.{ .exit = false, .status = 0 } }
+pub const Outcome = struct {
+    kind: OutcomeKind
+    waiting: wait.Wait
+    status: usize
 }
 
 // The arguments of a call, in order.
@@ -165,8 +193,16 @@ pub const System = struct {
     const ROWS: usize = 24
     const COLUMNS: usize = 80
 
+    const WNOHANG: usize = 1
+    const CLONE_THREAD: usize = 0x10000
+    const SIGINFO_SIZE: usize = 128
+
     random: Random
     unknownSeen: [Number.LIMIT]bool
+    // The call in progress: what became of it, and whether the wait it
+    // made before ended by its deadline.
+    outcome: Outcome
+    timedOut: bool
 
     pub fn init(self: *Self) -> void {
         Bytes.fill(unsafe { @ptrCast([*]u8, &self.*.unknownSeen) }, Number.LIMIT, 0)
@@ -177,21 +213,48 @@ pub const System = struct {
     // ended (the outcome says).
     pub fn handle(self: *Self, frame: *Frame, p: *Process) -> Outcome {
         const number = frame.*.rax
-        if number == Number.EXIT || number == Number.EXIT_GROUP { return Outcome.{ .exit = true, .status = frame.*.rdi & 255 } }
-        const result = self.call(p, number, Arguments.of(frame))
-        frame.*.rax = @bitCast(usize, result)
-        return Outcome.running()
+        self.*.outcome = Outcome.{ .kind = OutcomeKind.done, .waiting = wait.Wait.none(), .status = 0 }
+        self.*.timedOut = p.*.timedOut
+        p.*.timedOut = false
+        if number == Number.EXIT || number == Number.EXIT_GROUP {
+            self.*.outcome.kind = OutcomeKind.exited
+            self.*.outcome.status = scheduler.Status.exited(frame.*.rdi)
+            return self.*.outcome
+        }
+        const result = self.call(p, frame, number, Arguments.of(frame))
+        // Ctrl-C typed while the terminal was read.
+        if terminal.serialConsole().takeInterrupt() { scheduler.processes().interruptForeground() }
+        if p.*.state == process.State.zombie || p.*.state == process.State.free {
+            self.*.outcome.kind = OutcomeKind.ended
+            return self.*.outcome
+        }
+        if result == wait.BLOCKED && self.*.outcome.kind == OutcomeKind.done { self.*.outcome.kind = OutcomeKind.blocked }
+        if self.*.outcome.kind == OutcomeKind.done { frame.*.rax = @bitCast(usize, result) }
+        if self.*.outcome.kind == OutcomeKind.yielded { frame.*.rax = 0 }
+        return self.*.outcome
     }
 
-    fn call(self: *Self, p: *Process, number: usize, a: Arguments) -> isize {
+    // The call waits for `w` (it is made again when that holds).
+    fn block(self: *Self, w: wait.Wait) -> isize {
+        self.*.outcome.kind = OutcomeKind.blocked
+        self.*.outcome.waiting = w
+        return wait.BLOCKED
+    }
+
+    fn deadlineAfter(nanoseconds: isize) -> usize {
+        if nanoseconds < 0 { return 0 }
+        return clock.system().monotonic() + @bitCast(usize, nanoseconds)
+    }
+
+    fn call(self: *Self, p: *Process, frame: *Frame, number: usize, a: Arguments) -> isize {
         const fd = a.fd()
         if number == Number.READ {
             if !p.prepare(a.a2, a.a3) { return Errno.EFAULT }
-            return p.*.files.read(fd, Bytes.pointer(a.a2), a.a3)
+            return p.*.files.read(fd, Bytes.pointer(a.a2), a.a3, &self.*.outcome.waiting)
         }
         if number == Number.WRITE {
             if !p.prepare(a.a2, a.a3) { return Errno.EFAULT }
-            return p.*.files.write(fd, Bytes.pointer(a.a2), a.a3)
+            return p.*.files.write(fd, Bytes.pointer(a.a2), a.a3, &self.*.outcome.waiting)
         }
         if number == Number.OPEN { return open(p, a.a1, a.a2) }
         if number == Number.OPENAT { return open(p, a.a2, a.a3) }
@@ -202,8 +265,8 @@ pub const System = struct {
             if a.a4 & AT_EMPTY_PATH != 0 && p.prepareString(a.a2) && Bytes.pointer(a.a2)[0] == 0 { return status(p, fd, a.a3) }
             return statusOf(p, a.a2, a.a3)
         }
-        if number == Number.POLL { return poll(p, a.a1, a.a2, if @bitCast(isize, a.a3) < 0 { -1 } else { @bitCast(isize, a.a3 * 1000000) }) }
-        if number == Number.PPOLL { return poll(p, a.a1, a.a2, timespec(p, a.a3)) }
+        if number == Number.POLL { return self.poll(p, a.a1, a.a2, if @bitCast(isize, a.a3) < 0 { -1 } else { @bitCast(isize, a.a3 * 1000000) }) }
+        if number == Number.PPOLL { return self.poll(p, a.a1, a.a2, timespec(p, a.a3)) }
         if number == Number.LSEEK { return p.*.files.seek(fd, @bitCast(isize, a.a2), a.a3) }
         if number == Number.MMAP {
             if a.a4 & MAP_ANONYMOUS == 0 { return Errno.ENODEV }
@@ -215,11 +278,14 @@ pub const System = struct {
         if number == Number.RT_SIGACTION { return zeroOut(p, a.a3, 32) }
         if number == Number.RT_SIGPROCMASK { return zeroOut(p, a.a3, 8) }
         if number == Number.IOCTL { return ioctl(p, fd, a.a2, a.a3) }
-        if number == Number.READV { return vector(p, fd, a.a2, a.a3, true) }
-        if number == Number.WRITEV { return vector(p, fd, a.a2, a.a3, false) }
+        if number == Number.READV { return self.vector(p, fd, a.a2, a.a3, true) }
+        if number == Number.WRITEV { return self.vector(p, fd, a.a2, a.a3, false) }
         if number == Number.ACCESS || number == Number.CHDIR || number == Number.READLINK { return pathCall(p, number, a.a1) }
         if number == Number.FACCESSAT || number == Number.FACCESSAT2 || number == Number.READLINKAT { return pathCall(p, number, a.a2) }
-        if number == Number.SCHED_YIELD { return 0 }
+        if number == Number.SCHED_YIELD {
+            self.*.outcome.kind = OutcomeKind.yielded
+            return 0
+        }
         if number == Number.DUP { return p.*.files.duplicate(fd, 0, false) }
         if number == Number.DUP2 { return p.*.files.duplicateTo(fd, @bitCast(isize, a.a2)) }
         if number == Number.DUP3 {
@@ -227,16 +293,38 @@ pub const System = struct {
             return p.*.files.duplicateTo(fd, @bitCast(isize, a.a2))
         }
         if number == Number.NANOSLEEP || number == Number.CLOCK_NANOSLEEP {
+            if self.*.timedOut { return 0 }
             const nanoseconds = timespec(p, if number == Number.NANOSLEEP { a.a1 } else { a.a3 })
-            if nanoseconds > 0 { clock.system().sleep(@bitCast(usize, nanoseconds)) }
-            return 0
+            if nanoseconds <= 0 { return 0 }
+            return self.block(wait.Wait.on(wait.WaitKind.sleep, 0, deadlineAfter(nanoseconds)))
         }
-        if number == Number.GETPID || number == Number.GETTID || number == Number.GETPPID || number == Number.GETPGRP || number == Number.GETPGID || number == Number.GETSID { return 1 }
+        if number == Number.GETPID || number == Number.GETTID { return @intCast(isize, p.*.pid) }
+        if number == Number.GETPPID { return @intCast(isize, p.*.parentPid) }
+        if number == Number.GETPGRP { return @intCast(isize, p.*.group) }
+        if number == Number.GETPGID { return groupOf(p, a.a1) }
+        if number == Number.SETPGID { return setGroup(p, a.a1, a.a2) }
+        if number == Number.SETSID {
+            p.*.group = p.*.pid
+            return @intCast(isize, p.*.pid)
+        }
+        if number == Number.GETSID { return @intCast(isize, scheduler.Scheduler.FIRST_PID) }
         if number == Number.GETUID || number == Number.GETGID || number == Number.GETEUID || number == Number.GETEGID { return 0 }
-        if number == Number.SETUID || number == Number.SETGID || number == Number.SETPGID || number == Number.SETSID || number == Number.UMASK { return 0 }
-        if number == Number.FORK || number == Number.VFORK || number == Number.CLONE || number == Number.CLONE3 || number == Number.EXECVE || number == Number.PIPE || number == Number.PIPE2 { return Errno.ENOSYS }
-        if number == Number.WAIT4 || number == Number.WAITID { return Errno.ECHILD }
-        if number == Number.KILL || number == Number.TKILL || number == Number.TGKILL { return 0 }
+        if number == Number.SETUID || number == Number.SETGID || number == Number.UMASK { return 0 }
+        if number == Number.FORK || number == Number.VFORK { return fork(frame) }
+        if number == Number.CLONE {
+            // A fork by clone (SIGCHLD, maybe CLONE_VM | CLONE_VFORK); no
+            // threads yet.
+            if a.a1 & CLONE_THREAD != 0 || a.a1 & 255 != scheduler.Signal.CHLD { return Errno.ENOSYS }
+            return fork(frame)
+        }
+        // (clone3 is tried first by some programs; they fall back to clone.)
+        if number == Number.CLONE3 { return Errno.ENOSYS }
+        if number == Number.EXECVE { return self.execute(p, frame, a.a1, a.a2, a.a3) }
+        if number == Number.PIPE || number == Number.PIPE2 { return makePipe(p, a.a1, if number == Number.PIPE2 { a.a2 } else { 0 }) }
+        if number == Number.WAIT4 { return self.waitChild(p, @bitCast(isize, a.a1), a.a2, a.a3) }
+        if number == Number.KILL { return scheduler.processes().signal(p, @bitCast(isize, a.a1), a.a2) }
+        if number == Number.TKILL { return scheduler.processes().signal(p, @bitCast(isize, a.a1), a.a2) }
+        if number == Number.TGKILL { return scheduler.processes().signal(p, @bitCast(isize, a.a2), a.a3) }
         if number == Number.UNAME { return uname(p, a.a1) }
         if number == Number.FCNTL { return fcntl(p, fd, a.a2, a.a3) }
         if number == Number.GETCWD {
@@ -256,16 +344,13 @@ pub const System = struct {
         }
         if number == Number.GETRLIMIT { return limits(p, a.a2) }
         if number == Number.PRLIMIT64 { return limits(p, a.a4) }
-        if number == Number.RT_SIGTIMEDWAIT {
-            const nanoseconds = timespec(p, a.a3)
-            if nanoseconds > 0 { clock.system().sleep(@bitCast(usize, nanoseconds)) }
-            return Errno.EAGAIN
-        }
+        if number == Number.RT_SIGTIMEDWAIT { return self.takeSignal(p, a.a1, a.a2, a.a3) }
         if number == Number.RT_SIGSUSPEND { return Errno.EINTR }
         if number == Number.SIGALTSTACK || number == Number.SET_ROBUST_LIST || number == Number.RSEQ { return 0 }
         if number == Number.SET_TID_ADDRESS { return 1 }
         if number == Number.ARCH_PRCTL {
             if a.a1 != ARCH_SET_FS { return Errno.EINVAL }
+            p.*.fsBase = a.a2
             cpu.Msr.write(cpu.Msr.FS_BASE, a.a2)
             return 0
         }
@@ -287,6 +372,11 @@ pub const System = struct {
             return 0
         }
         if number == Number.GETRANDOM { return self.randomBytes(p, a.a1, a.a2) }
+        if number == Number.STATX { return statx(p, fd, a.a2, a.a3, a.a5) }
+        // No extended attributes (EOPNOTSUPP).
+        if number >= Number.GETXATTR && number <= Number.FLISTXATTR { return -95 }
+        // Copies inside the kernel: the program copies by read and write.
+        if number == Number.SPLICE || number == Number.COPY_FILE_RANGE || number == Number.SENDFILE { return Errno.EINVAL }
         self.sayUnknown(number)
         return Errno.ENOSYS
     }
@@ -298,6 +388,124 @@ pub const System = struct {
         console.out.write("[brixOS: system call ")
         console.out.decimal(number)
         console.out.write(" not there]\n")
+    }
+
+    // ---- processes ----
+
+    fn fork(frame: *Frame) -> isize {
+        const pid = scheduler.processes().fork(frame)
+        if pid == 0 { return Errno.ENOMEM }
+        return @intCast(isize, pid)
+    }
+
+    // A NULL-terminated array of string pointers in the process's memory
+    // (argv, envp), checked; its count is MAX_STRINGS + 1 when it is not
+    // the process's or too long.
+    fn strings(p: *Process, address: usize) -> process.Strings {
+        const bad = process.Strings.{ .items = unsafe { @ptrFromInt([*]const [*]const u8, 8) }, .count = Process.MAX_STRINGS + 1 }
+        if address == 0 { return process.Strings.{ .items = unsafe { @ptrFromInt([*]const [*]const u8, 8) }, .count = 0 } }
+        var count: usize = 0
+        while true {
+            if count > Process.MAX_STRINGS || !p.prepare(address + count * 8, 8) { return bad }
+            const item = Bytes.read64(Bytes.pointer(address + count * 8), 0)
+            if item == 0 { break }
+            if !p.prepareString(item) { return bad }
+            count += 1
+        }
+        return process.Strings.{ .items = unsafe { @ptrFromInt([*]const [*]const u8, address) }, .count = count }
+    }
+
+    // execve: the archive's program `path` replaces the process's (its
+    // descriptors stay, but those marked close-on-exec).
+    fn execute(self: *Self, p: *Process, frame: *Frame, path: usize, argv: usize, envp: usize) -> isize {
+        const E2BIG: isize = -7
+        if !p.prepareString(path) { return Errno.EFAULT }
+        const found = files.Path.lookup(Bytes.pointer(path))
+        if found == files.Path.ROOT { return Errno.EACCES }
+        if found < 0 { return found }
+        const arguments = strings(p, argv)
+        const environment = strings(p, envp)
+        if arguments.count > Process.MAX_STRINGS || environment.count > Process.MAX_STRINGS { return E2BIG }
+        const loaded = p.load(@bitCast(usize, found), arguments, environment)
+        if loaded == process.Loaded.missing { return Errno.ENOENT }
+        if loaded == process.Loaded.not_a_program { return Errno.ENOEXEC }
+        if loaded == process.Loaded.no_memory { return Errno.ENOMEM }
+        p.*.files.closeOnExec()
+        p.*.fsBase = 0
+        cpu.Msr.write(cpu.Msr.FS_BASE, 0)
+        frame.startAt(p.*.entry, p.*.stack)
+        self.*.outcome.kind = OutcomeKind.replaced
+        return 0
+    }
+
+    // wait4: a child that ended (its pid, its status written), 0 with
+    // WNOHANG when none did yet, ECHILD when there is none to wait for;
+    // else it waits.
+    fn waitChild(self: *Self, p: *Process, pid: isize, statusAddress: usize, options: usize) -> isize {
+        const table = scheduler.processes()
+        const ended = table.child(p, pid)
+        if ended != null {
+            if statusAddress != 0 {
+                if !p.prepare(statusAddress, 4) { return Errno.EFAULT }
+                Bytes.write32(Bytes.pointer(statusAddress), 0, ended.?.*.status)
+            }
+            const found = ended.?.*.pid
+            ended.?.*.state = process.State.free
+            return @intCast(isize, found)
+        }
+        if !table.hasChild(p, pid) { return Errno.ECHILD }
+        if options & WNOHANG != 0 { return 0 }
+        return self.block(wait.Wait.on(wait.WaitKind.child, pid, 0))
+    }
+
+    // rt_sigtimedwait: SIGCHLD when a child ended since it was last taken
+    // (the only signal that comes); EAGAIN when the timeout passes.
+    fn takeSignal(self: *Self, p: *Process, setAddress: usize, infoAddress: usize, timeoutAddress: usize) -> isize {
+        if !p.prepare(setAddress, 8) { return Errno.EFAULT }
+        const set = Bytes.read64(Bytes.pointer(setAddress), 0)
+        const one: usize = 1
+        const chld = one << @intCast(u6, scheduler.Signal.CHLD - 1)
+        if set & chld != 0 && p.*.childSignal {
+            p.*.childSignal = false
+            if infoAddress != 0 {
+                if !p.prepare(infoAddress, SIGINFO_SIZE) { return Errno.EFAULT }
+                Bytes.fill(Bytes.pointer(infoAddress), SIGINFO_SIZE, 0)
+                Bytes.write32(Bytes.pointer(infoAddress), 0, scheduler.Signal.CHLD)
+            }
+            return @intCast(isize, scheduler.Signal.CHLD)
+        }
+        if self.*.timedOut { return Errno.EAGAIN }
+        const nanoseconds = timespec(p, timeoutAddress)
+        if nanoseconds == 0 { return Errno.EAGAIN }
+        return self.block(wait.Wait.on(wait.WaitKind.signal, 0, deadlineAfter(nanoseconds)))
+    }
+
+    fn groupOf(p: *Process, pid: usize) -> isize {
+        if pid == 0 || pid == p.*.pid { return @intCast(isize, p.*.group) }
+        const other = scheduler.processes().find(pid)
+        if other == null { return Errno.ESRCH }
+        return @intCast(isize, other.?.*.group)
+    }
+
+    fn setGroup(p: *Process, pid: usize, group: usize) -> isize {
+        var target = p
+        if pid != 0 && pid != p.*.pid {
+            const other = scheduler.processes().find(pid)
+            if other == null { return Errno.ESRCH }
+            target = other.?
+        }
+        target.*.group = if group == 0 { target.*.pid } else { group }
+        return 0
+    }
+
+    fn makePipe(p: *Process, address: usize, flags: usize) -> isize {
+        if !p.prepare(address, 8) { return Errno.EFAULT }
+        var ends = [2]isize{ 0, 0 }
+        const result = p.*.files.pipe(&ends, flags)
+        if result < 0 { return result }
+        Bytes.write32(Bytes.pointer(address), 0, @bitCast(usize, ends[0]))
+        Bytes.write32(Bytes.pointer(address), 4, @bitCast(usize, ends[1]))
+        return 0
     }
 
     fn randomBytes(self: *Self, p: *Process, address: usize, length: usize) -> isize {
@@ -328,6 +536,14 @@ pub const System = struct {
         return p.*.files.status(fd, Bytes.pointer(address))
     }
 
+    // statx(dirfd, path, flags, mask, buffer): the root's files by path,
+    // or the descriptor with AT_EMPTY_PATH and "".
+    fn statx(p: *Process, fd: isize, path: usize, flags: usize, address: usize) -> isize {
+        if !p.prepareString(path) || !p.prepare(address, files.Status.STATX_SIZE) { return Errno.EFAULT }
+        if flags & AT_EMPTY_PATH != 0 && Bytes.pointer(path)[0] == 0 { return p.*.files.statusAs(fd, Bytes.pointer(address), true) }
+        return files.Status.ofPathAs(Bytes.pointer(path), Bytes.pointer(address), true)
+    }
+
     fn statusOf(p: *Process, path: usize, address: usize) -> isize {
         if !p.prepareString(path) || !p.prepare(address, files.Status.SIZE) { return Errno.EFAULT }
         return files.Status.ofPath(Bytes.pointer(path), Bytes.pointer(address))
@@ -352,45 +568,31 @@ pub const System = struct {
         return @bitCast(isize, Bytes.read64(at, 0) * NANOSECONDS + Bytes.read64(at, 8))
     }
 
-    // Waits until the terminal has input or `nanoseconds` passed
-    // (negative: however long it takes).
-    fn waitInput(nanoseconds: isize) -> void {
-        const time = clock.system()
-        const start = time.monotonic()
-        while !terminal.serialConsole().pending() {
-            if nanoseconds >= 0 && time.monotonic() - start >= @bitCast(usize, nanoseconds) { return }
-        }
-    }
-
-    // poll's struct pollfd array: readiness now, else after waiting.
-    fn poll(p: *Process, address: usize, count: usize, nanoseconds: isize) -> isize {
+    // poll's struct pollfd array: readiness now, else it waits for the
+    // terminal, a pipe or the timeout.
+    fn poll(self: *Self, p: *Process, address: usize, count: usize, nanoseconds: isize) -> isize {
         if !p.prepare(address, count * 8) { return Errno.EFAULT }
-        var waited = false
-        while true {
-            var ready: isize = 0
-            var k: usize = 0
-            while k < count {
-                const entry = Bytes.pointer(address + k * 8)
-                const fd = @intCast(isize, @bitCast(i32, @intCast(u32, Bytes.read32(entry, 0))))
-                const events = Bytes.read16(entry, 4)
-                var revents: usize = 0
-                if fd >= 0 {
-                    revents = match p.*.files.kindOf(fd) {
-                        .none => POLLNVAL,
-                        .terminal => (if events & POLLIN != 0 && terminal.serialConsole().pending() { POLLIN } else { 0 }) | (events & POLLOUT),
-                        .file => events & (POLLIN | POLLOUT),
-                        .directory => events & (POLLIN | POLLOUT)
-                    }
+        var ready: isize = 0
+        var k: usize = 0
+        while k < count {
+            const entry = Bytes.pointer(address + k * 8)
+            const fd = @intCast(isize, @bitCast(i32, @intCast(u32, Bytes.read32(entry, 0))))
+            const events = Bytes.read16(entry, 4)
+            var revents: usize = 0
+            if fd >= 0 {
+                if p.*.files.kindOf(fd) == Kind.none {
+                    revents = POLLNVAL
+                } else {
+                    if events & POLLIN != 0 && p.*.files.readable(fd) { revents |= POLLIN }
+                    if events & POLLOUT != 0 && p.*.files.writable(fd) { revents |= POLLOUT }
                 }
-                Bytes.write16(entry, 6, revents)
-                if revents != 0 { ready += 1 }
-                k += 1
             }
-            if ready > 0 || nanoseconds == 0 || waited { return ready }
-            waitInput(nanoseconds)
-            waited = true
+            Bytes.write16(entry, 6, revents)
+            if revents != 0 { ready += 1 }
+            k += 1
         }
-        return 0
+        if ready > 0 || nanoseconds == 0 || self.*.timedOut { return ready }
+        return self.block(wait.Wait.on(wait.WaitKind.poll, @bitCast(isize, pipe.table().*.events), deadlineAfter(nanoseconds)))
     }
 
     fn uname(p: *Process, address: usize) -> isize {
@@ -429,15 +631,20 @@ pub const System = struct {
         }
         if request == TIOCGPGRP || request == TIOCGSID {
             if !p.prepare(argument, 4) { return Errno.EFAULT }
-            Bytes.write32(Bytes.pointer(argument), 0, 1)
+            Bytes.write32(Bytes.pointer(argument), 0, if request == TIOCGPGRP { scheduler.processes().*.foreground } else { scheduler.Scheduler.FIRST_PID })
             return 0
         }
-        if request == TIOCSPGRP || request == TIOCSCTTY || request == TIOCSWINSZ || request == FIONBIO { return 0 }
+        if request == TIOCSPGRP {
+            if !p.prepare(argument, 4) { return Errno.EFAULT }
+            scheduler.processes().*.foreground = Bytes.read32(Bytes.pointer(argument), 0)
+            return 0
+        }
+        if request == TIOCSCTTY || request == TIOCSWINSZ || request == FIONBIO { return 0 }
         return Errno.EINVAL
     }
 
     // readv and writev.
-    fn vector(p: *Process, fd: isize, address: usize, count: usize, reading: bool) -> isize {
+    fn vector(self: *Self, p: *Process, fd: isize, address: usize, count: usize, reading: bool) -> isize {
         if !p.prepare(address, count * 16) { return Errno.EFAULT }
         var total: isize = 0
         var k: usize = 0
@@ -446,7 +653,8 @@ pub const System = struct {
             const length = Bytes.read64(Bytes.pointer(address), k * 16 + 8)
             if length > 0 {
                 if !p.prepare(base, length) { return Errno.EFAULT }
-                const done = if reading { p.*.files.read(fd, Bytes.pointer(base), length) } else { p.*.files.write(fd, Bytes.pointer(base), length) }
+                const done = if reading { p.*.files.read(fd, Bytes.pointer(base), length, &self.*.outcome.waiting) } else { p.*.files.write(fd, Bytes.pointer(base), length, &self.*.outcome.waiting) }
+                if done == wait.BLOCKED && total > 0 { return total }
                 if done < 0 { return if total > 0 { total } else { done } }
                 total += done
                 if reading && @bitCast(usize, done) < length { return total }

@@ -14,17 +14,20 @@ requirements are spec/04-stdlib/os/brix.xml:
 ## What runs
 
 brixOS boots in QEMU (`-kernel`, Multiboot), says itself on the serial
-line and runs mlx-sh in user mode on it:
+line and runs mlx-sh in user mode on it, and the programs of its boot
+archive (the coreutils) as processes of their own:
 
     ./mlx build brix
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
         -kernel mlx-out/bin/brix/brix.img
     tools/check_brix.sh        # the same, typed at, checked
 
-    brixOS: kernel at 0x200000, 52 KiB
-    brixOS: 511 MiB (463 free), 2082 MHz
-    root@brix:~# echo $((6*7))
-    42
+    brixOS: kernel at 0x200000, 292 KiB
+    brixOS: 511 MiB (415 free), 2076 MHz
+    root@brix:~# seq 3 | sort -r | tr "\n" " "; echo
+    3 2 1
+    root@brix:~# ls -l /cat
+    -rwxr-xr-x 1 0 0 233464 Nov  2 20:02 /cat
 
 The pieces:
 
@@ -41,7 +44,8 @@ The pieces:
   0xFFFF800000000000, long mode), the 64-bit start (higher half, IDT,
   TSS, SYSCALL MSRs, SSE), the SYSCALL entry and a stub per vector. Then
   the kernel's segments (at 2 MiB) and the archive of files
-  (`BRIXFS01`: name, offset, size; `NAME=FILE` arguments).
+  (`BRIXFS01`: name, offset, size; `NAME=FILE` and `DIRECTORY/`
+  arguments, sorted by name), up to the kernel's arena at 64 MiB.
 - **The kernel** (projects/brix/kernel), Mlx without std, written as
   types that hold their functions and constants (`Space.map`,
   `Process.load`, `Terminal.read`, `layout.Op.OUTB`); the state is a few
@@ -59,40 +63,58 @@ The pieces:
     map, translate, back, release, write, destroy).
   - archive.mlx, elf.mlx: the boot archive's files; a static ELF
     program's segments.
-  - process.mlx: `Process`: the program from the archive (a static ELF, as
+  - process.mlx: `Process`: a program from the archive (a static ELF, as
     mlx4 and mlx-ld write them) in its own `Space`, its stack (argv,
     envp, auxv), break, anonymous mappings and stack as `Region`s of
     pages made on first touch (page faults, or the kernel preparing a
-    range it is handed), its `Descriptors`.
+    range it is handed), its `Descriptors`, its pid, parent and group,
+    what it waits for, and its registers while it does not run.
+  - scheduler.mlx: `Scheduler`, the table of processes: fork (the
+    touched pages copied, `Space.clone`), the end of a process (a zombie
+    until its parent's wait4; SIGCHLD for sigtimedwait), signals that end
+    processes (kill, Ctrl-C to the terminal's foreground group), and the
+    switch to the next process. There is no timer yet: a process runs
+    until it waits, ends or yields. A system call that has to wait
+    (wait4, a pipe, the terminal, poll, nanosleep, sigtimedwait) leaves
+    the process at its SYSCALL instruction to make the call again when
+    what it waits for (`Wait`) holds, so no process needs a kernel stack
+    of its own; while none can run, the serial line is polled.
+  - pipe.mlx: `Pipe`s (4 KiB ring buffers, their readers and writers
+    counted by the descriptors).
   - system.mlx, files.mlx, terminal.mlx, clock.mlx: `System` answers
     Linux's system call numbers (`Number`) and structures for what a
     shell on a terminal needs: read, write, the termios of the serial
-    line (`Terminal`: canonical mode with echo and erase, raw mode,
-    ONLCR, ICRNL), the window size, mmap/munmap/brk, the archive's files
-    read-only in `/` (open, stat, getdents64, lseek), poll, clocks
+    line (`Terminal`: canonical mode edited as input comes, with echo,
+    erase, EOF and Ctrl-C, raw mode, ONLCR, ICRNL; the foreground group),
+    the window size, fork, execve, wait4, exit, kill, pipe, setpgid,
+    mmap/munmap/brk, the archive's files read-only in `/` (open, stat,
+    statx, getdents64, lseek), poll, clocks
     (`Clock`: the TSC, its rate measured against the `Pit`, the `Cmos`
     clock), uname, getrandom; signals are accepted and never come. A
     call it lacks is said once on the console (`[brixOS: system call N
     not there]`) and gets ENOSYS.
   - frame.mlx, trap.mlx, shell.mlx: the trap `Frame` (registers saved,
-    SSE state kept by FXSAVE in the blob), `brix_trap` (system calls,
-    page faults of the program's regions, a crash report for the rest),
-    and mlx-sh started again when it exits or faults.
+    SSE state kept by FXSAVE in the blob), `brix_trap` (system calls and
+    the switches they bring, page faults of a process's regions, a crash
+    report for the rest: a faulting program ends with SIGSEGV), and
+    mlx-sh as the first process, started again (every other process
+    ending) when it exits or faults.
 
-Not there yet: processes of their own (fork, execve, wait: mlx-sh says
-"cannot fork" for anything but its builtins), interrupts (the PICs are
-masked; the serial line and the clocks are polled), a writable file
-system, more than one CPU, an EFI loader.
+Not there yet: a timer (a program that computes without a system call
+keeps the processor; Ctrl-C reaches only what reads the terminal or
+waits), signal handlers (signals end a process or are dropped; job
+control's stops do not stop), interrupts at all (the PICs are masked;
+the serial line and the clocks are polled), a writable file system,
+more than one CPU, an EFI loader.
 
 ## Next
 
-1. Processes: a process table, fork (copying the address space, later
-   copy on write), execve from the archive, wait4 and exit status,
-   pipes; then mlx-sh runs programs and pipelines.
-2. Interrupts: the APIC timer and the serial line's interrupt, a
-   scheduler, sleeping instead of polling.
-3. A file system (a RAM disk first, then a disk driver), the
-   coreutils (projects/coreutils) in the image.
+1. The timer (the APIC's) and preemption; the serial line's interrupt;
+   signal handlers (rt_sigaction, delivery, sigreturn) and job control
+   (SIGTSTP, SIGCONT).
+2. A file system (a RAM disk first, then a disk driver): directories,
+   writable files, /proc/self/exe for scripts.
+3. Copy-on-write fork (fork copies every touched page now).
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
 5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.

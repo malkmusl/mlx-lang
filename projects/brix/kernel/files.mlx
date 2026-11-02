@@ -1,23 +1,22 @@
-// A program's descriptors: the terminal (0, 1 and 2 at the start), the
-// boot archive's files (read only, all in the root directory) and the
-// root directory.
+// A process's descriptors: the terminal (0, 1 and 2 at the start), the
+// boot archive's files (read only, all in the root directory), the root
+// directory, and the ends of pipes.
 const archive = @import("./archive.mlx")
 const terminal = @import("./terminal.mlx")
+const pipes = @import("./pipe.mlx")
+const wait = @import("./wait.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
 const Errno = @import("./errno.mlx").Errno
+const clock = @import("./clock.mlx")
 
-pub const Kind = enum(u8) { none, terminal, file, directory }
+pub const Kind = enum(u8) { none, terminal, file, directory, pipe_read, pipe_write }
 
 pub const Descriptor = struct {
     kind: Kind
-    // The archive's file (kind file).
+    // The archive's file (kind file), the pipe (its ends).
     index: usize
     offset: usize
     closeOnExec: bool
-
-    pub fn closed() -> Descriptor { return Descriptor.{ .kind = Kind.none, .index = 0, .offset = 0, .closeOnExec = false } }
-
-    pub fn of(kind: Kind, index: usize) -> Descriptor { return Descriptor.{ .kind = kind, .index = index, .offset = 0, .closeOnExec = false } }
 }
 
 // What a path names: the root, a file of the archive, or nothing.
@@ -50,6 +49,7 @@ pub const Status = struct {
     const S_IFCHR_0620: usize = 0x2190
     const S_IFREG_0755: usize = 0x81ED
     const S_IFDIR_0755: usize = 0x41ED
+    const S_IFIFO_0600: usize = 0x1180
 
     pub fn fill(into: [*]u8, kind: Kind, item: usize, size: usize) -> void {
         Bytes.fill(into, SIZE, 0)
@@ -57,6 +57,8 @@ pub const Status = struct {
             .terminal => S_IFCHR_0620,
             .directory => S_IFDIR_0755,
             .file => S_IFREG_0755,
+            .pipe_read => S_IFIFO_0600,
+            .pipe_write => S_IFIFO_0600,
             .none => 0
         }
         Bytes.write64(into, 0, 1) // st_dev
@@ -67,6 +69,47 @@ pub const Status = struct {
         Bytes.write64(into, 48, size)
         Bytes.write64(into, 56, 4096) // st_blksize
         Bytes.write64(into, 64, (size + 511) / 512)
+        // Every time: when brixOS started.
+        const booted = clock.system().bootTime()
+        Bytes.write64(into, 72, booted) // st_atime
+        Bytes.write64(into, 88, booted) // st_mtime
+        Bytes.write64(into, 104, booted) // st_ctime
+    }
+
+    // A struct statx (256 bytes) for the same.
+    pub const STATX_SIZE: usize = 256
+    const STATX_BASIC_STATS: usize = 0x7FF
+
+    pub fn fillStatx(into: [*]u8, kind: Kind, item: usize, size: usize) -> void {
+        var plain: [SIZE]u8 = undefined
+        fill(&plain, kind, item, size)
+        Bytes.fill(into, STATX_SIZE, 0)
+        Bytes.write32(into, 0, STATX_BASIC_STATS) // stx_mask
+        Bytes.write32(into, 4, 4096) // stx_blksize
+        Bytes.write32(into, 16, 1) // stx_nlink
+        Bytes.write16(into, 28, Bytes.read32(&plain, 24)) // stx_mode
+        Bytes.write64(into, 32, Bytes.read64(&plain, 8)) // stx_ino
+        Bytes.write64(into, 40, size)
+        Bytes.write64(into, 48, (size + 511) / 512)
+        if kind == Kind.terminal { Bytes.write32(into, 128, 4) } // stx_rdev_major (tty)
+        const booted = clock.system().bootTime()
+        Bytes.write64(into, 64, booted) // stx_atime
+        Bytes.write64(into, 80, booted) // stx_btime
+        Bytes.write64(into, 96, booted) // stx_ctime
+        Bytes.write64(into, 112, booted) // stx_mtime
+    }
+
+    // The kind, item and size `path` names, into a struct stat or statx.
+    pub fn ofPathAs(path: [*]const u8, into: [*]u8, statx: bool) -> isize {
+        const found = Path.lookup(path)
+        if found < 0 && found != Path.ROOT { return found }
+        const isRoot = found == Path.ROOT
+        const index = if isRoot { 0 } else { @bitCast(usize, found) }
+        const kind = if isRoot { Kind.directory } else { Kind.file }
+        const item = if isRoot { 0 } else { index + 1 }
+        const size = if isRoot { 0 } else { archive.Archive.boot().file(index).size }
+        if statx { fillStatx(into, kind, item, size) } else { fill(into, kind, item, size) }
+        return 0
     }
 
     pub fn ofPath(path: [*]const u8, into: [*]u8) -> isize {
@@ -97,7 +140,61 @@ pub const Descriptors = struct {
     pub fn init(self: *Self) -> void {
         var k: usize = 0
         while k < MAX {
-            self.*.slots[k] = if k < 3 { Descriptor.of(Kind.terminal, 0) } else { Descriptor.closed() }
+            self.*.slots[k].kind = if k < 3 { Kind.terminal } else { Kind.none }
+            self.*.slots[k].index = 0
+            self.*.slots[k].offset = 0
+            self.*.slots[k].closeOnExec = false
+            k += 1
+        }
+    }
+
+    // One more descriptor of what `d` is (a pipe counts its ends).
+    fn retain(d: *const Descriptor) -> void {
+        if d.*.kind == Kind.pipe_read { pipes.table().at(d.*.index).*.readers += 1 }
+        if d.*.kind == Kind.pipe_write { pipes.table().at(d.*.index).*.writers += 1 }
+    }
+
+    fn release(d: *const Descriptor) -> void {
+        if d.*.kind == Kind.pipe_read { pipes.table().at(d.*.index).*.readers -= 1 }
+        if d.*.kind == Kind.pipe_write { pipes.table().at(d.*.index).*.writers -= 1 }
+        if d.*.kind == Kind.pipe_read || d.*.kind == Kind.pipe_write { pipes.table().changed() }
+    }
+
+    // `to` becomes a copy of `from` (what `to` was closed first).
+    fn place(self: *Self, to: usize, from: *const Descriptor, closeOnExec: bool) -> void {
+        retain(from)
+        const slot = &self.*.slots[to]
+        if slot.*.kind != Kind.none { release(slot) }
+        slot.*.kind = from.*.kind
+        slot.*.index = from.*.index
+        slot.*.offset = from.*.offset
+        slot.*.closeOnExec = closeOnExec
+    }
+
+    // The descriptors of `other` (a fork's child gets its parent's).
+    pub fn copyFrom(self: *Self, other: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            self.*.slots[k].kind = Kind.none
+            if other.*.slots[k].kind != Kind.none { self.place(k, &other.*.slots[k], other.*.slots[k].closeOnExec) }
+            k += 1
+        }
+    }
+
+    // Every descriptor closed (a process ends).
+    pub fn closeAll(self: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            _ = self.close(@intCast(isize, k))
+            k += 1
+        }
+    }
+
+    // Those marked close-on-exec closed (execve).
+    pub fn closeOnExec(self: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            if self.*.slots[k].closeOnExec { _ = self.close(@intCast(isize, k)) }
             k += 1
         }
     }
@@ -133,16 +230,43 @@ pub const Descriptors = struct {
         if flags & O_DIRECTORY != 0 && !isDirectory { return Errno.ENOTDIR }
         const fd = self.lowestFree(0)
         if fd < 0 { return fd }
-        var descriptor = if isDirectory { Descriptor.of(Kind.directory, 0) } else { Descriptor.of(Kind.file, @bitCast(usize, found)) }
-        descriptor.closeOnExec = flags & O_CLOEXEC != 0
-        self.*.slots[@bitCast(usize, fd)] = descriptor
+        const slot = &self.*.slots[@bitCast(usize, fd)]
+        slot.*.kind = if isDirectory { Kind.directory } else { Kind.file }
+        slot.*.index = if isDirectory { 0 } else { @bitCast(usize, found) }
+        slot.*.offset = 0
+        slot.*.closeOnExec = flags & O_CLOEXEC != 0
         return fd
+    }
+
+    // A new pipe: its read end at fds[0], its write end at fds[1].
+    pub fn pipe(self: *Self, fds: *[2]isize, flags: usize) -> isize {
+        const readEnd = self.lowestFree(0)
+        if readEnd < 0 { return readEnd }
+        self.*.slots[@bitCast(usize, readEnd)].kind = Kind.pipe_read
+        const writeEnd = self.lowestFree(0)
+        self.*.slots[@bitCast(usize, readEnd)].kind = Kind.none
+        if writeEnd < 0 { return writeEnd }
+        const index = pipes.table().create()
+        if index == pipes.Pipes.MAX { return Errno.ENFILE }
+        const ends = [2]isize{ readEnd, writeEnd }
+        var k: usize = 0
+        while k < 2 {
+            const slot = &self.*.slots[@bitCast(usize, ends[k])]
+            slot.*.kind = if k == 0 { Kind.pipe_read } else { Kind.pipe_write }
+            slot.*.index = index
+            slot.*.offset = 0
+            slot.*.closeOnExec = flags & O_CLOEXEC != 0
+            fds.*[k] = ends[k]
+            k += 1
+        }
+        return 0
     }
 
     pub fn close(self: *Self, fd: isize) -> isize {
         const slot = self.get(fd)
         if slot == null { return Errno.EBADF }
-        slot.?.* = Descriptor.closed()
+        release(slot.?)
+        slot.?.*.kind = Kind.none
         return 0
     }
 
@@ -152,8 +276,7 @@ pub const Descriptors = struct {
         if slot == null { return Errno.EBADF }
         const copy = self.lowestFree(from)
         if copy < 0 { return copy }
-        self.*.slots[@bitCast(usize, copy)] = slot.?.*
-        self.*.slots[@bitCast(usize, copy)].closeOnExec = closeOnExec
+        self.place(@bitCast(usize, copy), slot.?, closeOnExec)
         return copy
     }
 
@@ -161,23 +284,35 @@ pub const Descriptors = struct {
     pub fn duplicateTo(self: *Self, fd: isize, to: isize) -> isize {
         const slot = self.get(fd)
         if slot == null || to < 0 || to >= @intCast(isize, MAX) { return Errno.EBADF }
-        if fd != to {
-            self.*.slots[@bitCast(usize, to)] = slot.?.*
-            self.*.slots[@bitCast(usize, to)].closeOnExec = false
-        }
+        if fd != to { self.place(@bitCast(usize, to), slot.?, false) }
         return to
     }
 
-    pub fn read(self: *Self, fd: isize, into: [*]u8, capacity: usize) -> isize {
+    // A read: the bytes, 0 at the end, -errno, or wait.BLOCKED with what
+    // to wait for in `waiting`.
+    pub fn read(self: *Self, fd: isize, into: [*]u8, capacity: usize, waiting: *wait.Wait) -> isize {
         const slot = self.get(fd)
         if slot == null { return Errno.EBADF }
         const d = slot.?
-        return match d.*.kind {
-            .terminal => @intCast(isize, terminal.serialConsole().read(into, capacity)),
-            .directory => Errno.EISDIR,
-            .file => readFile(d, into, capacity),
-            .none => Errno.EBADF
+        if d.*.kind == Kind.terminal {
+            const result = terminal.serialConsole().read(into, capacity)
+            if result == wait.BLOCKED { waiting.* = wait.Wait.on(wait.WaitKind.terminal, 0, 0) }
+            return result
         }
+        if d.*.kind == Kind.pipe_read {
+            const end = pipes.table().at(d.*.index)
+            if capacity == 0 { return 0 }
+            if end.*.count == 0 {
+                if end.*.writers == 0 { return 0 }
+                waiting.* = wait.Wait.on(wait.WaitKind.pipe_read, @intCast(isize, d.*.index), 0)
+                return wait.BLOCKED
+            }
+            pipes.table().changed()
+            return @intCast(isize, end.read(into, capacity))
+        }
+        if d.*.kind == Kind.directory { return Errno.EISDIR }
+        if d.*.kind != Kind.file { return Errno.EBADF }
+        return readFile(d, into, capacity)
     }
 
     fn readFile(d: *Descriptor, into: [*]u8, capacity: usize) -> isize {
@@ -191,17 +326,34 @@ pub const Descriptors = struct {
         return @intCast(isize, count)
     }
 
-    pub fn write(self: *Self, fd: isize, from: [*]const u8, length: usize) -> isize {
-        if self.kindOf(fd) != Kind.terminal { return Errno.EBADF }
-        terminal.serialConsole().write(from, length)
-        return @intCast(isize, length)
+    // A write: the bytes taken, -errno, or wait.BLOCKED (a full pipe).
+    pub fn write(self: *Self, fd: isize, from: [*]const u8, length: usize, waiting: *wait.Wait) -> isize {
+        const slot = self.get(fd)
+        if slot == null { return Errno.EBADF }
+        const d = slot.?
+        if d.*.kind == Kind.terminal {
+            terminal.serialConsole().write(from, length)
+            return @intCast(isize, length)
+        }
+        if d.*.kind == Kind.pipe_write {
+            const end = pipes.table().at(d.*.index)
+            if end.*.readers == 0 { return Errno.EPIPE }
+            if length == 0 { return 0 }
+            if end.*.count == pipes.Pipe.CAPACITY {
+                waiting.* = wait.Wait.on(wait.WaitKind.pipe_write, @intCast(isize, d.*.index), 0)
+                return wait.BLOCKED
+            }
+            pipes.table().changed()
+            return @intCast(isize, end.write(from, length))
+        }
+        return Errno.EBADF
     }
 
     pub fn seek(self: *Self, fd: isize, to: isize, whence: usize) -> isize {
         const slot = self.get(fd)
         if slot == null { return Errno.EBADF }
         const d = slot.?
-        if d.*.kind == Kind.terminal { return Errno.ESPIPE }
+        if d.*.kind != Kind.file && d.*.kind != Kind.directory { return Errno.ESPIPE }
         if whence > 2 { return Errno.EINVAL }
         var base: isize = 0
         if whence == 1 { base = @intCast(isize, d.*.offset) }
@@ -212,13 +364,36 @@ pub const Descriptors = struct {
         return position
     }
 
-    pub fn status(self: *Self, fd: isize, into: [*]u8) -> isize {
+    pub fn status(self: *Self, fd: isize, into: [*]u8) -> isize { return self.statusAs(fd, into, false) }
+
+    // fstat's struct stat, or statx's.
+    pub fn statusAs(self: *Self, fd: isize, into: [*]u8, statx: bool) -> isize {
         const slot = self.get(fd)
         if slot == null { return Errno.EBADF }
         const d = slot.?
         const size = if d.*.kind == Kind.file { archive.Archive.boot().file(d.*.index).size } else { 0 }
-        Status.fill(into, d.*.kind, if d.*.kind == Kind.file { d.*.index + 1 } else { 0 }, size)
+        const item = if d.*.kind == Kind.file { d.*.index + 1 } else { 0 }
+        if statx { Status.fillStatx(into, d.*.kind, item, size) } else { Status.fill(into, d.*.kind, item, size) }
         return 0
+    }
+
+    // Whether `fd` could be read (POLLIN) or written (POLLOUT) without
+    // waiting.
+    pub fn readable(self: *Self, fd: isize) -> bool {
+        const slot = self.get(fd)
+        if slot == null { return false }
+        const d = slot.?
+        if d.*.kind == Kind.terminal { return terminal.serialConsole().pending() }
+        if d.*.kind == Kind.pipe_read { return pipes.table().at(d.*.index).readable() }
+        return d.*.kind == Kind.file || d.*.kind == Kind.directory
+    }
+
+    pub fn writable(self: *Self, fd: isize) -> bool {
+        const slot = self.get(fd)
+        if slot == null { return false }
+        const d = slot.?
+        if d.*.kind == Kind.pipe_write { return pipes.table().at(d.*.index).writable() }
+        return d.*.kind == Kind.terminal
     }
 
     // getdents64 on the root: ".", "..", then the archive's files.

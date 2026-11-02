@@ -1,4 +1,4 @@
-// brix-image KERNEL OUT [NAME=FILE...]: brixOS's boot image, for a
+// brix-image KERNEL OUT [NAME=FILE | DIRECTORY/ ...]: brixOS's boot image, for a
 // Multiboot loader (QEMU's -kernel, GRUB's multiboot): the boot blob (a
 // Multiboot header with load addresses, the 32-bit code that turns on
 // long mode, the GDT, TSS and IDT, the trap stubs and the SYSCALL entry),
@@ -13,7 +13,8 @@
 //   0x00120000  the boot stack (to 0x00140000), then the trap and
 //               system call stack (to 0x00180000)
 //   0x00200000  the kernel's segments, as linked (from 0x400000)
-//   after it    the archive (page aligned)
+//   after it    the archive (page aligned), up to the kernel's arena
+//   0x04000000  the kernel's arena (32 MiB), then the frames it hands out
 //
 // The kernel runs in the higher half: virtual 0xFFFF800000000000 + the
 // physical address (all of the first GiB), so that user programs keep the
@@ -76,10 +77,88 @@ fn symbol(elf: [*]const u8, length: usize, name: []const u8) -> usize {
     return 0
 }
 
+// The archive's layout: the magic and the count, then a record per file
+// (its name, NUL padded, then its offset and size).
+const Archive = struct {
+    pub const RECORDS: usize = 16
+    pub const RECORD: usize = 64
+    pub const NAME_CAPACITY: usize = 48
+    pub const MAX_FILES: usize = 256
+}
+
+// Whether `left` sorts after `right` (bytewise).
+fn after(left: []const u8, right: []const u8) -> bool {
+    var k: usize = 0
+    while k < left.length && k < right.length {
+        if left[k] != right[k] { return left[k] > right[k] }
+        k += 1
+    }
+    return left.length > right.length
+}
+
+// The files for the archive, sorted by name.
+const Files = struct {
+    names: [Archive.MAX_FILES][]const u8
+    contents: [Archive.MAX_FILES][*]const u8
+    lengths: [Archive.MAX_FILES]usize
+    count: usize
+
+    // The file at `path` (NUL-terminated) as `name`.
+    pub fn add(self: *Self, allocator: std.heap.Allocator, name: []const u8, path: [*]const u8) -> bool {
+        if self.*.count == Archive.MAX_FILES || name.length >= Archive.NAME_CAPACITY { return false }
+        const data = std.fs.readFileAlloc(path, allocator)
+        if data == null { return false }
+        // In order of name.
+        var at = self.*.count
+        while at > 0 && after(self.*.names[at - 1], name) {
+            self.*.names[at] = self.*.names[at - 1]
+            self.*.contents[at] = self.*.contents[at - 1]
+            self.*.lengths[at] = self.*.lengths[at - 1]
+            at -= 1
+        }
+        self.*.names[at] = name
+        self.*.contents[at] = unsafe { @ptrCast([*]const u8, data.?.items) }
+        self.*.lengths[at] = data.?.length
+        self.*.count += 1
+        return true
+    }
+
+    // Every regular file of the directory `path` (ending in "/") under
+    // its own name.
+    pub fn addDirectory(self: *Self, allocator: std.heap.Allocator, path: []const u8) -> bool {
+        const directory_path = std.text.zeroTerminated(allocator.alloc(path.length + 1, 1).?, path.length + 1, path)
+        const directory = std.fs.open(directory_path, 65536, 0)
+        if !std.fs.isValid(directory) { return false }
+        const buffer = allocator.alloc(65536, 8).?
+        var reader = std.fs.entries(directory, buffer, 65536)
+        var entry: std.fs.Entry = undefined
+        while std.fs.nextEntry(&reader, &entry) {
+            if entry.kind != std.fs.ENTRY_FILE { continue }
+            const name = std.string.asSlice(entry.name)
+            const copy = allocator.alloc(name.length + 1, 1).?
+            var k: usize = 0
+            while k < name.length {
+                copy[k] = name[k]
+                k += 1
+            }
+            const full = allocator.alloc(path.length + name.length + 1, 1).?
+            var length = std.text.append(full, 0, path.length + name.length + 1, path)
+            length = std.text.append(full, length, path.length + name.length + 1, name)
+            full[length] = 0
+            if !self.add(allocator, copy[0..name.length], full) {
+                _ = std.fs.close(directory)
+                return false
+            }
+        }
+        _ = std.fs.close(directory)
+        return !reader.failed
+    }
+}
+
 pub fn main(arguments: [][*]const u8) -> u8 {
     const allocator = std.heap.allocator()
     const count = std.process.count(arguments)
-    if count < 3 { return fail("usage: brix-image KERNEL OUT [NAME=FILE...]") }
+    if count < 3 { return fail("usage: brix-image KERNEL OUT [NAME=FILE | DIRECTORY/ ...]") }
     const loaded = std.fs.readFileAlloc(std.process.argument(arguments, 1).pointer, allocator)
     if loaded == null { return fail("cannot read the kernel") }
     const elf: [*]const u8 = unsafe { @ptrCast([*]const u8, loaded.?.items) }
@@ -107,24 +186,28 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     if trap == 0 { return fail("the kernel has no brix_trap") }
 
     // The archive's files.
-    const files = count - 3
-    var archiveSize: usize = 4096
+    var list: Files = undefined
+    list.count = 0
+    var a: usize = 3
+    while a < count {
+        const spec = std.process.argument(arguments, a)
+        const text = spec.pointer[0..spec.length]
+        if text.length > 1 && text[text.length - 1] == 47 {
+            if !list.addDirectory(allocator, text) { return fail("cannot read a directory for the archive (or a name is too long, or there are too many files)") }
+        } else {
+            var eq: usize = 0
+            while eq < text.length && text[eq] != 61 { eq += 1 }
+            if eq == 0 || eq >= text.length { return fail("a file is NAME=PATH or DIRECTORY/") }
+            if !list.add(allocator, text[0..eq], &spec.pointer[eq + 1]) { return fail("cannot read a file for the archive (or its name is too long, or there are too many)") }
+        }
+        a += 1
+    }
+    const files = list.count
+    const headerSize = (Archive.RECORDS + files * Archive.RECORD + 4095) & ~@intCast(usize, 4095)
+    var archiveSize = headerSize
     var f: usize = 0
-    var contents: [16][*]const u8 = undefined
-    var lengths: [16]usize = undefined
-    var names: [16][]const u8 = undefined
-    if files > 16 { return fail("at most 16 files") }
     while f < files {
-        const spec = std.process.argument(arguments, 3 + f)
-        var eq: usize = 0
-        while eq < spec.length && spec.pointer[eq] != 61 { eq += 1 }
-        if eq == 0 || eq >= spec.length || eq > 47 { return fail("a file is NAME=PATH") }
-        names[f] = spec.pointer[0..eq]
-        const data = std.fs.readFileAlloc(&spec.pointer[eq + 1], allocator)
-        if data == null { return fail("cannot read a file for the archive") }
-        contents[f] = unsafe { @ptrCast([*]const u8, data.?.items) }
-        lengths[f] = data.?.length
-        archiveSize += (data.?.length + 4095) & ~@intCast(usize, 4095)
+        archiveSize += (list.lengths[f] + 4095) & ~@intCast(usize, 4095)
         f += 1
     }
 
@@ -167,24 +250,25 @@ pub fn main(arguments: [][*]const u8) -> u8 {
         m += 1
     }
     Asm.put64(image, archive + 8, files)
-    var dataAt: usize = 4096
+    var dataAt = headerSize
     f = 0
     while f < files {
-        const record = archive + 16 + f * 64
+        const record = archive + Archive.RECORDS + f * Archive.RECORD
+        const name = list.names[f]
         var c: usize = 0
-        while c < names[f].length {
-            image[record + c] = names[f][c]
+        while c < name.length {
+            image[record + c] = name[c]
             c += 1
         }
-        Asm.put64(image, record + 48, dataAt)
-        Asm.put64(image, record + 56, lengths[f])
-        const source = contents[f]
+        Asm.put64(image, record + Archive.NAME_CAPACITY, dataAt)
+        Asm.put64(image, record + Archive.NAME_CAPACITY + 8, list.lengths[f])
+        const source = list.contents[f]
         c = 0
-        while c < lengths[f] {
+        while c < list.lengths[f] {
             image[archive + dataAt + c] = source[c]
             c += 1
         }
-        dataAt += (lengths[f] + 4095) & ~@intCast(usize, 4095)
+        dataAt += (list.lengths[f] + 4095) & ~@intCast(usize, 4095)
         f += 1
     }
 

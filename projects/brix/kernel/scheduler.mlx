@@ -1,0 +1,289 @@
+// The processes and which one runs. There is no timer yet: a process runs
+// until it waits (a system call that blocks), ends, or yields; then the
+// next one that can go on runs (round robin). Waiting for the terminal is
+// polling the serial line when nothing else can run.
+const console = @import("./console.mlx")
+const cpu = @import("./cpu.mlx")
+const clock = @import("./clock.mlx")
+const terminal = @import("./terminal.mlx")
+const pipe = @import("./pipe.mlx")
+const process = @import("./process.mlx")
+const wait = @import("./wait.mlx")
+const Frame = @import("./frame.mlx").Frame
+const Process = process.Process
+const State = process.State
+const WaitKind = wait.WaitKind
+
+// Signals as Linux numbers them (those brixOS acts on).
+pub const Signal = struct {
+    pub const HUP: usize = 1
+    pub const INT: usize = 2
+    pub const QUIT: usize = 3
+    pub const KILL: usize = 9
+    pub const SEGV: usize = 11
+    pub const PIPE: usize = 13
+    pub const TERM: usize = 15
+    pub const CHLD: usize = 17
+
+    // Whether the signal ends a process (the others are taken and
+    // dropped: there are no handlers yet).
+    pub fn ends(signal: usize) -> bool { return signal == HUP || signal == INT || signal == QUIT || signal == KILL || signal == PIPE || signal == TERM }
+}
+
+// The wait status of a process that exited with `code`, or was ended by
+// `signal`.
+pub const Status = struct {
+    pub fn exited(code: usize) -> usize { return (code & 255) << 8 }
+    pub fn killed(signal: usize) -> usize { return signal & 127 }
+}
+
+pub const Scheduler = struct {
+    pub const MAX: usize = 16
+    // The process brixOS starts (the shell); its end starts it again.
+    pub const FIRST_PID: usize = 1
+
+    processes: [MAX]Process
+    current: usize
+    nextPid: usize
+    // The terminal's foreground process group (tcsetpgrp).
+    foreground: usize
+
+    pub fn init(self: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            self.*.processes[k].state = State.free
+            self.*.processes[k].pid = 0
+            k += 1
+        }
+        self.*.current = 0
+        self.*.nextPid = FIRST_PID
+        self.*.foreground = FIRST_PID
+    }
+
+    pub fn running(self: *Self) -> *Process { return &self.*.processes[self.*.current] }
+
+    // The process `pid`; null when there is none.
+    pub fn find(self: *Self, pid: usize) -> ?*Process {
+        var k: usize = 0
+        while k < MAX {
+            const p = &self.*.processes[k]
+            if p.*.state != State.free && p.*.pid == pid { return p }
+            k += 1
+        }
+        return null
+    }
+
+    // A new process (a child of `parentPid`); null when the table is full.
+    pub fn create(self: *Self, parentPid: usize) -> ?*Process {
+        var k: usize = 0
+        while k < MAX {
+            const p = &self.*.processes[k]
+            if p.*.state == State.free {
+                p.init(self.*.nextPid, parentPid)
+                self.*.nextPid += 1
+                return p
+            }
+            k += 1
+        }
+        return null
+    }
+
+    // The first process: `p` runs from now on.
+    pub fn makeCurrent(self: *Self, p: *Process) -> void {
+        var k: usize = 0
+        while k < MAX {
+            if &self.*.processes[k] == p { self.*.current = k }
+            k += 1
+        }
+    }
+
+    // fork: a copy of the running process, ready to run; its pid, or 0
+    // when there is no room or memory.
+    pub fn fork(self: *Self, frame: *const Frame) -> usize {
+        const parent = self.running()
+        const created = self.create(parent.*.pid)
+        if created == null { return 0 }
+        const child = created.?
+        if !child.forkFrom(parent, frame) {
+            child.*.files.closeAll()
+            child.*.state = State.free
+            return 0
+        }
+        return child.*.pid
+    }
+
+    // `p` ends with the wait status `status`: its memory and descriptors
+    // go, its children are nobody's, its parent hears of it (and waits
+    // for it), or it is gone at once when it has none.
+    pub fn terminate(self: *Self, p: *Process, status: usize) -> void {
+        p.*.files.closeAll()
+        p.releaseMemory()
+        p.*.status = status
+        p.*.state = State.zombie
+        var k: usize = 0
+        while k < MAX {
+            const child = &self.*.processes[k]
+            if child.*.state != State.free && child.*.parentPid == p.*.pid {
+                child.*.parentPid = 0
+                if child.*.state == State.zombie { child.*.state = State.free }
+            }
+            k += 1
+        }
+        if p.*.parentPid != 0 {
+            const parent = self.find(p.*.parentPid)
+            if parent != null {
+                parent.?.*.childSignal = true
+                return
+            }
+        }
+        p.*.state = State.free
+    }
+
+    // A child of `p` that ended (a zombie) among those `pid` names (-1
+    // and 0: any, below -1: of that group, else that one); null when none
+    // did.
+    pub fn child(self: *Self, p: *Process, pid: isize) -> ?*Process {
+        var k: usize = 0
+        while k < MAX {
+            const q = &self.*.processes[k]
+            if q.*.state != State.free && q.*.parentPid == p.*.pid && matches(q, pid) && q.*.state == State.zombie { return q }
+            k += 1
+        }
+        return null
+    }
+
+    // Whether `p` has a child among those `pid` names.
+    pub fn hasChild(self: *Self, p: *Process, pid: isize) -> bool {
+        var k: usize = 0
+        while k < MAX {
+            const q = &self.*.processes[k]
+            if q.*.state != State.free && q.*.parentPid == p.*.pid && matches(q, pid) { return true }
+            k += 1
+        }
+        return false
+    }
+
+    fn matches(q: *const Process, pid: isize) -> bool {
+        if pid > 0 { return q.*.pid == @bitCast(usize, pid) }
+        if pid < -1 { return q.*.group == @bitCast(usize, -pid) }
+        return true
+    }
+
+    // `signal` to the processes `pid` names (kill's: one, -1 every one
+    // but the first, 0 the sender's group, below -1 a group); 0, or -3
+    // (ESRCH) when it names none. The first process (the shell) takes
+    // signals without ending.
+    pub fn signal(self: *Self, sender: *Process, pid: isize, number: usize) -> isize {
+        var found = false
+        var k: usize = 0
+        while k < MAX {
+            const q = &self.*.processes[k]
+            if q.*.state == State.ready || q.*.state == State.blocked {
+                var hit = false
+                if pid > 0 { hit = q.*.pid == @bitCast(usize, pid) }
+                if pid == 0 { hit = q.*.group == sender.*.group }
+                if pid == -1 { hit = q.*.pid != FIRST_PID }
+                if pid < -1 { hit = q.*.group == @bitCast(usize, -pid) }
+                if hit {
+                    found = true
+                    if number != 0 && Signal.ends(number) && q.*.pid != FIRST_PID { self.terminate(q, Status.killed(number)) }
+                }
+            }
+            k += 1
+        }
+        return if found { 0 } else { -3 }
+    }
+
+    // Ctrl-C on the terminal: SIGINT to its foreground group.
+    pub fn interruptForeground(self: *Self) -> void {
+        const sender = self.running()
+        _ = self.signal(sender, -@intCast(isize, self.*.foreground), Signal.INT)
+    }
+
+    // Whether what `p` waits for holds now (a deadline that passed is
+    // told by timedOut).
+    fn canGo(self: *Self, p: *Process) -> bool {
+        const w = p.*.waitingFor
+        if w.deadline != 0 && clock.system().monotonic() >= w.deadline {
+            p.*.timedOut = true
+            return true
+        }
+        if w.kind == WaitKind.none { return true }
+        if w.kind == WaitKind.child { return self.child(p, w.target) != null || !self.hasChild(p, w.target) }
+        if w.kind == WaitKind.signal { return p.*.childSignal }
+        if w.kind == WaitKind.terminal { return terminal.serialConsole().pending() }
+        if w.kind == WaitKind.pipe_read { return pipe.table().at(@bitCast(usize, w.target)).readable() }
+        if w.kind == WaitKind.pipe_write { return pipe.table().at(@bitCast(usize, w.target)).writable() }
+        if w.kind == WaitKind.poll { return terminal.serialConsole().pending() || pipe.table().*.events != @bitCast(usize, w.target) }
+        return false
+    }
+
+    // Whether `p`'s wait can end without another process (the terminal,
+    // the clock).
+    fn wakesAlone(p: *const Process) -> bool {
+        const kind = p.*.waitingFor.kind
+        return p.*.waitingFor.deadline != 0 || kind == WaitKind.terminal || kind == WaitKind.poll
+    }
+
+    // The running process stops here (its registers are in `frame`):
+    // blocked on `w` (at its SYSCALL, to make the call again), or ready
+    // (it yields). Then the next process runs.
+    pub fn suspend(self: *Self, frame: *Frame, w: wait.Wait, number: usize) -> bool {
+        const p = self.running()
+        p.*.context = frame.*
+        if w.kind == WaitKind.none {
+            p.*.state = State.ready
+        } else {
+            p.*.context.rip -= 2
+            p.*.context.rax = number
+            p.*.waitingFor = w
+            p.*.state = State.blocked
+        }
+        return self.switchTo(frame)
+    }
+
+    // The next process that can go on into `frame` (its memory and FS
+    // base in use): the one after the running one first. While none can,
+    // the terminal is polled (Ctrl-C ends the foreground group). False
+    // when none ever can (every one waits for another): the caller starts
+    // over.
+    pub fn switchTo(self: *Self, frame: *Frame) -> bool {
+        while true {
+            if terminal.serialConsole().takeInterrupt() { self.interruptForeground() }
+            var anyAlone = false
+            var step: usize = 1
+            while step <= MAX {
+                const k = (self.*.current + step) % MAX
+                const p = &self.*.processes[k]
+                if p.*.state == State.blocked {
+                    if self.canGo(p) {
+                        p.*.state = State.ready
+                        p.*.waitingFor = wait.Wait.none()
+                    } else if wakesAlone(p) {
+                        anyAlone = true
+                    }
+                }
+                if p.*.state == State.ready {
+                    self.*.current = k
+                    frame.* = p.*.context
+                    p.*.space.activate()
+                    cpu.Msr.write(cpu.Msr.FS_BASE, p.*.fsBase)
+                    return true
+                }
+                step += 1
+            }
+            if !anyAlone {
+                console.out.write("brixOS: every process waits for another\n")
+                return false
+            }
+        }
+        return false
+    }
+}
+
+var table: Scheduler = undefined // (per run)
+
+pub fn processes() -> *Scheduler { return &table }
+
+// The process running.
+pub fn current() -> *Process { return table.running() }
