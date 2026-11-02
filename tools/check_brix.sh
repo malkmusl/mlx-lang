@@ -4,9 +4,13 @@
 # of it is in what is built), the kernel says itself on the serial line and
 # starts mlx-sh from the boot archive in user mode; commands typed at its
 # prompt run (builtins, arithmetic, the working directory, a glob over the
-# archive's files); programs of the archive run (fork, execve, wait4),
+# archive's files in /bin); programs of the archive run (fork, execve, wait4),
 # also in pipelines, command substitutions, subshells and in the
-# background; Ctrl-C ends the foreground program, Ctrl-D ends its input;
+# background; files are made, written, appended to, moved, copied, linked
+# and removed in the tmpfs, with directories, the working directory, the
+# umask, /dev/null and /dev/zero; a script runs (by /proc/self/exe), a
+# program copied into /tmp runs, and a program of /bin written to is
+# copied up; Ctrl-C ends the foreground program, Ctrl-D ends its input;
 # `exit 3` ends the shell and the kernel starts it again; and no system
 # call the programs made was missing.
 #
@@ -37,7 +41,7 @@ shell=mlx-out/bin/mlx-sh
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 mkdir -p "$work/bin"
-for program in cat ls seq sleep uname wc; do
+for program in cat chmod cp head ln ls mkdir mv rm seq sleep stat uname wc; do
     if [[ -x mlx-out/bin/coreutils/$program ]]; then
         cp mlx-out/bin/coreutils/$program "$work/bin/"
     else
@@ -69,7 +73,7 @@ prompts=0
 # Types $1 and Enter at the next prompt.
 type_line() {
     prompts=$((prompts + 1))
-    wait_for '^root@brix:~# $' "$prompts"
+    wait_for '^root@brix:[^#]*# $' "$prompts"
     printf '%s\r' "$1" >&3
 }
 # Types $1 (printf's format) to the program that runs, after a moment.
@@ -90,10 +94,10 @@ type_line 'echo $((6 * 7)) $(( 1 << 10 ))'
 wait_for '^42 1024$'
 echo "ok   arithmetic expansion"
 
-type_line 'pwd; cd /; echo *'
-wait_for '^/$'
-wait_for '^cat ls mlx-sh seq sleep uname wc$'
-echo "ok   the working directory and a glob over the boot archive"
+type_line 'pwd; cd /; echo * /bin/*'
+wait_for '^/root$'
+wait_for '^bin dev root tmp /bin/cat /bin/chmod /bin/cp /bin/head /bin/ln /bin/ls /bin/mkdir /bin/mlx-sh /bin/mv /bin/rm /bin/seq /bin/sleep /bin/stat /bin/uname /bin/wc$'
+echo "ok   the working directory and a glob over the tree (the archive in /bin)"
 
 type_line 'x=brix; echo ${x}OS ${#x}'
 wait_for '^brixOS 4$'
@@ -105,8 +109,8 @@ wait_for '^hello$'
 wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines"
 
-type_line 'ls; cat /mlx-sh | wc -c'
-wait_for 'ls  *mlx-sh  *seq'
+type_line 'ls /bin; cat /bin/mlx-sh | wc -c'
+wait_for 'ls  *mkdir  *mlx-sh'
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -117,6 +121,29 @@ wait_for '^sub 8$'
 wait_for '^inner$'
 wait_for '^sub 4$'
 echo "ok   exit statuses, a missing program, command substitutions, subshells"
+
+type_line 'cd /tmp && echo hello > a && echo more >> a && cat a | wc -l && mkdir -p d/e && mv a d/e/b && cp d/e/b c && ln c l && ls d/e && stat -c "%s %h" l'
+wait_for '^2$'
+wait_for '^b$'
+wait_for '^11 2$'
+type_line 'rm -r d c l && ls -A; pwd; echo gone'
+wait_for '^/tmp$'
+wait_for '^gone$'
+echo "ok   files and directories in the tmpfs: write, append, move, copy, link, remove"
+
+type_line 'umask 077; echo z > f; stat -c %a f; mkdir g; stat -c %a g; echo x > /dev/null; head -c 5 /dev/zero | wc -c'
+wait_for '^600$'
+wait_for '^700$'
+wait_for '^5$'
+echo "ok   the umask, /dev/null, /dev/zero"
+
+type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
+wait_for '^script one$'
+wait_for '^script two$'
+type_line 'cp /bin/uname /tmp/u; /tmp/u -s; echo copied > /bin/seq; cat /bin/seq'
+wait_for '^brixOS$' 2
+wait_for '^copied$'
+echo "ok   scripts, a program copied into /tmp, a file of /bin copied up when written"
 
 type_line 'sleep 1 & wait; echo waited'
 wait_for '^waited$'

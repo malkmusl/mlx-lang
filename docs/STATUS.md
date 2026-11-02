@@ -78,7 +78,8 @@ makes a Multiboot image (boot blob, kernel, file archive with mlx-sh and
 the coreutils), and the kernel boots in QEMU to the serial console and
 runs mlx-sh in user mode with Linux's system call numbers; programs run
 as processes (fork, execve, wait4, pipes, Ctrl-C), scheduled when they
-wait (no timer yet) (`./mlx build brix`, `tools/check_brix.sh`). Note:
+wait (no timer yet), on a VFS with a tmpfs (/bin is the archive, /tmp,
+/root, /dev); copy on write is the next step (`./mlx build brix`, `tools/check_brix.sh`). Note:
 ROADMAP.md is written for a Linux kernel ("replacing it is not the
 goal"); brixOS is the Stage 4 target of AGENT_IMPLEMENTATION.md and
 spec/04-stdlib/os/brix.xml.

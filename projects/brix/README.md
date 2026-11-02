@@ -15,7 +15,8 @@ requirements are spec/04-stdlib/os/brix.xml:
 
 brixOS boots in QEMU (`-kernel`, Multiboot), says itself on the serial
 line and runs mlx-sh in user mode on it, and the programs of its boot
-archive (the coreutils) as processes of their own:
+archive (the coreutils, in /bin) as processes of their own, on a file
+system in memory (/tmp, /root):
 
     ./mlx build brix
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
@@ -26,8 +27,9 @@ archive (the coreutils) as processes of their own:
     brixOS: 511 MiB (415 free), 2076 MHz
     root@brix:~# seq 3 | sort -r | tr "\n" " "; echo
     3 2 1
-    root@brix:~# ls -l /cat
-    -rwxr-xr-x 1 0 0 233464 Nov  2 20:02 /cat
+    root@brix:~# cd /tmp; echo hello > a; mkdir d; mv a d; ls -l d
+    total 1
+    -rw-r--r-- 1 0 0 6 Nov  2 20:15 a
 
 The pieces:
 
@@ -61,8 +63,21 @@ The pieces:
   - memory.mlx: `Page`, `Frames` (physical frames from the Multiboot
     memory size), `Space` (an address space sharing the kernel's half:
     map, translate, back, release, write, destroy).
+  - vfs.mlx: `Vfs`, the file system: a tree of `Node`s in memory (a
+    tmpfs). A file's data is in pages (12 direct, an indirect page, a
+    double indirect one), a directory's in 64-byte entries; a node lives
+    while a directory names it or a descriptor holds it. At boot: /bin
+    (the archive's programs, nodes over its bytes, copied into pages of
+    their own when first written), /dev (console, tty, null, zero), /tmp,
+    /root.
+  - filecalls.mlx: `FileCalls`, the calls on paths (relative to the
+    working directory or a directory's descriptor): open/creat with
+    O_CREAT, O_EXCL, O_TRUNC, O_APPEND, stat/statx, access, getcwd,
+    chdir, mkdir, rmdir, unlink, rename, link, truncate, chmod, utimensat,
+    statfs, getdents64; /proc/self/exe (a shell runs scripts by it).
   - archive.mlx, elf.mlx: the boot archive's files; a static ELF
-    program's segments.
+    program in any file of the file system, its segments copied into an
+    address space.
   - process.mlx: `Process`: a program from the archive (a static ELF, as
     mlx4 and mlx-ld write them) in its own `Space`, its stack (argv,
     envp, auxv), break, anonymous mappings and stack as `Region`s of
@@ -80,15 +95,15 @@ The pieces:
     what it waits for (`Wait`) holds, so no process needs a kernel stack
     of its own; while none can run, the serial line is polled.
   - pipe.mlx: `Pipe`s (4 KiB ring buffers, their readers and writers
-    counted by the descriptors).
+    counted by the descriptors); files.mlx: `Descriptors` (of nodes or
+    pipe ends, with their access mode, O_APPEND, close-on-exec).
   - system.mlx, files.mlx, terminal.mlx, clock.mlx: `System` answers
     Linux's system call numbers (`Number`) and structures for what a
     shell on a terminal needs: read, write, the termios of the serial
     line (`Terminal`: canonical mode edited as input comes, with echo,
     erase, EOF and Ctrl-C, raw mode, ONLCR, ICRNL; the foreground group),
     the window size, fork, execve, wait4, exit, kill, pipe, setpgid,
-    mmap/munmap/brk, the archive's files read-only in `/` (open, stat,
-    statx, getdents64, lseek), poll, clocks
+    umask, mmap/munmap/brk, read/write/lseek on files, poll, clocks
     (`Clock`: the TSC, its rate measured against the `Pit`, the `Cmos`
     clock), uname, getrandom; signals are accepted and never come. A
     call it lacks is said once on the console (`[brixOS: system call N
@@ -104,17 +119,20 @@ Not there yet: a timer (a program that computes without a system call
 keeps the processor; Ctrl-C reaches only what reads the terminal or
 waits), signal handlers (signals end a process or are dropped; job
 control's stops do not stop), interrupts at all (the PICs are masked;
-the serial line and the clocks are polled), a writable file system,
-more than one CPU, an EFI loader.
+the serial line and the clocks are polled), symbolic links, users and
+permissions that are checked, a disk (the files live as long as the
+kernel runs), more than one CPU, an EFI loader.
 
 ## Next
 
 1. The timer (the APIC's) and preemption; the serial line's interrupt;
    signal handlers (rt_sigaction, delivery, sigreturn) and job control
    (SIGTSTP, SIGCONT).
-2. A file system (a RAM disk first, then a disk driver): directories,
-   writable files, /proc/self/exe for scripts.
-3. Copy-on-write fork (fork copies every touched page now).
+2. Copy on write: pages shared with a count of who holds them, for fork
+   (it copies every touched page now) and for files (cp and snapshots
+   share pages until one side writes; the archive's programs already
+   are copied up only when written). Then a disk: virtio-blk, ext2 as
+   the first format on it.
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
 5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.
