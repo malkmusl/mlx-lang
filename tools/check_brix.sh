@@ -16,7 +16,8 @@
 # written to (copy on write); snapshots of a tree (read-only or not, also
 # of / into itself) share the files' pages, stay apart from the tree when
 # either changes, refuse changes when read-only, and are taken out; a
-# script runs (by /proc/self/exe), a program
+# virtio disk is found and read and written as /devices/disk0 (what is
+# written reaches the image); a script runs (by /proc/self/exe), a program
 # copied into /temporary runs, and a program of /system/programs written
 # to is copied up; Ctrl-C ends the foreground program, Ctrl-D ends its
 # input;
@@ -61,9 +62,13 @@ done
 "$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and coreutils) build"
 
+# A disk of 1 MiB that starts with a text of the host's.
+head -c 1048576 /dev/zero > "$work/disk.img"
+printf 'brix disk' | dd of="$work/disk.img" conv=notrunc status=none
+
 mkfifo "$work/input"
 qemu-system-x86_64 -m 256M -display none -monitor none -no-reboot -cpu max \
-    -serial stdio -kernel "$work/brix.img" < "$work/input" > "$work/serial.txt" 2>&1 &
+    -serial stdio -kernel "$work/brix.img" -drive "file=$work/disk.img,format=raw,if=virtio" < "$work/input" > "$work/serial.txt" 2>&1 &
 qemu_pid=$!
 exec 3> "$work/input"
 
@@ -94,6 +99,7 @@ type_to_program() {
 
 wait_for '^brixOS: kernel at 0x200000'
 wait_for '^brixOS: [0-9]* MiB ([0-9]* free), [0-9]* MHz$'
+wait_for '^brixOS: /devices/disk0, 1024 KiB (virtio)$'
 echo "ok   the kernel boots and says itself on the serial line"
 
 type_line 'echo hello brix'
@@ -150,7 +156,7 @@ echo "ok   the umask, /devices/null, /devices/zero"
 type_line 'echo linux > /tmp/l; cat /temporary/l; echo y > /dev/null; cat /etc/passwd; ls /dev'
 wait_for '^linux$'
 wait_for '^root:x:0:0:root:/users/root:/system/programs/mlx-sh$'
-wait_for '^console  null  tty  zero$'
+wait_for '^console  disk0[[:space:]]*null  tty  zero$'
 echo "ok   Linux programs' /tmp, /dev and /etc/passwd"
 
 type_line 'cat /system/programs/mlx-sh > big; before=$(stat -f -c %f .); cp big copy; after=$(stat -f -c %f .); echo shared $(( before - after < 64 )) $(wc -c < copy)'
@@ -175,6 +181,13 @@ wait_for '^a  sub$'
 type_line 'snapshot -d snap && snapshot -d everything && snapshot -d copy && ls snap copy 2>&1 | wc -l'
 wait_for '^2$' 2
 echo "ok   snapshots: shared pages, apart when changed, read-only, of / into itself, taken out"
+
+type_line 'head -c 9 /devices/disk0; echo; stat -c "%F %s" /devices/disk0; echo written by brixOS > /devices/disk0; head -c 17 /devices/disk0; echo'
+wait_for '^brix disk$'
+wait_for '^block special file 1048576$'
+wait_for '^written by brixOS$'
+[[ "$(head -c 17 "$work/disk.img")" == "written by brixOS" ]] || fail "what brixOS wrote is not in the disk image"
+echo "ok   the virtio disk: /devices/disk0 read and written, the image has it"
 
 type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
 wait_for '^script one$'

@@ -20,7 +20,8 @@ memory with brixOS's own layout and copy on write:
 
     ./mlx build brix
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
-        -kernel mlx-out/bin/brix/brix.img
+        -kernel mlx-out/bin/brix/brix.img \
+        -drive file=disk.img,format=raw,if=virtio     # a disk, if wanted
     tools/check_brix.sh        # the same, typed at, checked
 
     brixOS: kernel at 0x200000, 292 KiB
@@ -42,7 +43,7 @@ are named for what they hold:
     /system/programs   the programs (the boot archive; read-only bytes,
                        copied into pages of their own when written)
     /system/settings   the system's settings: users, groups
-    /devices           console, tty, null, zero
+    /devices           console, tty, null, zero, disk0 (a virtio disk)
     /users/root        the user's home (the shell starts there)
     /temporary         scratch space
 
@@ -80,6 +81,17 @@ source: `snapshot -r / /users/root/before`. Restoring is a snapshot back.
 The tool calls brixOS's own system calls 1000 (SNAPSHOT) and 1001
 (REMOVE_SNAPSHOT), past Linux's numbers. (Hard links inside a tree become
 separate files in its snapshot.)
+
+## The disk
+
+A virtio block device (QEMU's `-drive ...,if=virtio`) is found on PCI
+bus 0 at boot (`Pci`, pci.mlx) and is /devices/disk0, a block device of
+its size: programs read and write it at any byte offset
+(`head -c 9 /devices/disk0`, `echo text > /devices/disk0`); what is
+written is on the disk image. The driver (`VirtioBlock`, virtio.mlx)
+uses the legacy PCI transport (registers in an I/O BAR), one virtqueue in
+pages of its own, one request at a time through a bounce page, polled.
+There is no file system on it yet.
 
 The pieces:
 
@@ -158,6 +170,7 @@ The pieces:
     clock), uname, getrandom; signals are accepted and never come. A
     call it lacks is said once on the console (`[brixOS: system call N
     not there]`) and gets ENOSYS.
+  - pci.mlx, virtio.mlx: PCI's configuration space, the virtio disk.
   - frame.mlx, trap.mlx, shell.mlx: the trap `Frame` (registers saved,
     SSE state kept by FXSAVE in the blob), `brix_trap` (system calls and
     the switches they bring, page faults of a process's regions, a crash
@@ -170,16 +183,19 @@ keeps the processor; Ctrl-C reaches only what reads the terminal or
 waits), signal handlers (signals end a process or are dropped; job
 control's stops do not stop), interrupts at all (the PICs are masked;
 the serial line and the clocks are polled), symbolic links, users and
-permissions that are checked, a disk (the files live as long as the
-kernel runs), more than one CPU, an EFI loader.
+permissions that are checked, a file system on the disk (the tree's
+files live as long as the kernel runs), more than one CPU, an EFI
+loader.
 
 ## Next
 
 1. The timer (the APIC's) and preemption; the serial line's interrupt;
    signal handlers (rt_sigaction, delivery, sigreturn) and job control
    (SIGTSTP, SIGCONT).
-2. A disk: virtio-blk, and a copy-on-write format of brixOS's own on it
-   (snapshots there too; ext2 as the format to exchange with Linux).
+2. A copy-on-write format of brixOS's own on the disk (a tree of pages
+   that are never written in place, a new root per change, snapshots as
+   old roots kept), mounted into the tree; interrupts for the disk; ext2
+   as the format to exchange with Linux.
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
 5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.

@@ -1,0 +1,194 @@
+// A virtio block device (QEMU's `-drive if=virtio`): the legacy PCI
+// transport (registers in an I/O BAR), one virtqueue in pages of its own,
+// one request at a time, polled (no interrupts yet). A request is three
+// descriptors: its header (type, sector), the data (in a bounce page of
+// the kernel's), the status byte the device writes.
+const layout = @import("../layout.mlx")
+const memory = @import("./memory.mlx")
+const Port = @import("./cpu.mlx").Port
+const Pci = @import("./pci.mlx").Pci
+const Bytes = @import("./bytes.mlx").Bytes
+const Errno = @import("./errno.mlx").Errno
+const Page = memory.Page
+
+pub const VirtioBlock = struct {
+    pub const VENDOR: usize = 0x1AF4
+    // The transitional block device (legacy registers).
+    pub const DEVICE: usize = 0x1001
+    pub const SECTOR: usize = 512
+    // Sectors in one request: the bounce page.
+    const SECTORS_PER_REQUEST: usize = Page.SIZE / SECTOR
+    const EIO: isize = -5
+    // Registers, from the I/O BAR.
+    const HOST_FEATURES: usize = 0x00
+    const GUEST_FEATURES: usize = 0x04
+    const QUEUE_PFN: usize = 0x08
+    const QUEUE_SIZE: usize = 0x0C
+    const QUEUE_SELECT: usize = 0x0E
+    const QUEUE_NOTIFY: usize = 0x10
+    const STATUS: usize = 0x12
+    const CAPACITY: usize = 0x14
+    // STATUS's bits.
+    const ACKNOWLEDGE: usize = 1
+    const DRIVER: usize = 2
+    const DRIVER_OK: usize = 4
+    // Features: the device is read-only.
+    const FEATURE_READ_ONLY: usize = 0x20
+    // Descriptor flags.
+    const NEXT: usize = 1
+    const DEVICE_WRITES: usize = 2
+    // Request types.
+    const READ: usize = 0
+    const WRITE: usize = 1
+    // How long a request is waited for (polls).
+    const PATIENCE: usize = 200000000
+
+    present: bool
+    port: usize
+    queueSize: usize
+    // The queue (physical), and where its used ring is in it.
+    queue: usize
+    usedOffset: usize
+    availableIndex: usize
+    lastUsed: usize
+    // Sectors of 512 bytes.
+    capacity: usize
+    readOnly: bool
+    // Bounce pages: the request's header and status byte; the data.
+    request: usize
+    buffer: usize
+
+    // The first virtio block device on bus 0, made ready; whether there
+    // is one.
+    pub fn probe(self: *Self) -> bool {
+        self.*.present = false
+        const address = Pci.find(VENDOR, DEVICE)
+        if address == Pci.NONE { return false }
+        const port = Pci.ioBase(address, 0)
+        if port == 0 { return false }
+        Pci.enable(address)
+        self.*.port = port
+        // Reset, then known and driven.
+        Port.out8(port + STATUS, 0)
+        Port.out8(port + STATUS, ACKNOWLEDGE)
+        Port.out8(port + STATUS, ACKNOWLEDGE | DRIVER)
+        const features = Port.in32(port + HOST_FEATURES)
+        self.*.readOnly = features & FEATURE_READ_ONLY != 0
+        // None of the optional features are used.
+        Port.out32(port + GUEST_FEATURES, 0)
+        Port.out16(port + QUEUE_SELECT, 0)
+        const size = Port.in16(port + QUEUE_SIZE)
+        if size == 0 { return false }
+        self.*.queueSize = size
+        // Descriptors and the available ring, then the used ring on a
+        // page boundary.
+        self.*.usedOffset = Page.up(16 * size + 6 + 2 * size)
+        const pages = (self.*.usedOffset + Page.up(6 + 8 * size)) / Page.SIZE
+        const frames = memory.allFrames()
+        self.*.queue = frames.allocateContiguous(pages)
+        self.*.request = frames.allocate()
+        self.*.buffer = frames.allocate()
+        if self.*.queue == 0 || self.*.request == 0 || self.*.buffer == 0 { return false }
+        Port.out32(port + QUEUE_PFN, self.*.queue / Page.SIZE)
+        self.*.availableIndex = 0
+        self.*.lastUsed = 0
+        self.*.capacity = Port.in32(port + CAPACITY) | (Port.in32(port + CAPACITY + 4) << 32)
+        Port.out8(port + STATUS, ACKNOWLEDGE | DRIVER | DRIVER_OK)
+        self.*.present = true
+        return true
+    }
+
+    pub fn sizeInBytes(self: *const Self) -> usize { return self.*.capacity * SECTOR }
+
+    fn queueBytes(self: *const Self) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.queue)) }
+
+    fn describe(self: *const Self, index: usize, address: usize, length: usize, flags: usize, next: usize) -> void {
+        const d = self.queueBytes()
+        Bytes.write64(d, index * 16, address)
+        Bytes.write32(d, index * 16 + 8, length)
+        Bytes.write16(d, index * 16 + 12, flags)
+        Bytes.write16(d, index * 16 + 14, next)
+    }
+
+    // `count` sectors from `sector` into the bounce page, or from it
+    // (`writing`); whether the device did it.
+    fn transfer(self: *Self, sector: usize, count: usize, writing: bool) -> bool {
+        const header = Bytes.pointer(layout.Memory.virtual(self.*.request))
+        Bytes.write32(header, 0, if writing { WRITE } else { READ })
+        Bytes.write32(header, 4, 0)
+        Bytes.write64(header, 8, sector)
+        header[16] = 0xFF
+        self.describe(0, self.*.request, 16, NEXT, 1)
+        self.describe(1, self.*.buffer, count * SECTOR, NEXT | (if writing { 0 } else { DEVICE_WRITES }), 2)
+        self.describe(2, self.*.request + 16, 1, DEVICE_WRITES, 0)
+        // The chain in the available ring, then its index, then the
+        // device told.
+        const q = self.queueBytes()
+        const available = 16 * self.*.queueSize
+        Bytes.write16(q, available + 4 + 2 * (self.*.availableIndex % self.*.queueSize), 0)
+        self.*.availableIndex = (self.*.availableIndex + 1) & 0xFFFF
+        Bytes.write16(q, available + 2, self.*.availableIndex)
+        Port.out16(self.*.port + QUEUE_NOTIFY, 0)
+        var polls: usize = 0
+        while Bytes.read16(q, self.*.usedOffset + 2) == self.*.lastUsed {
+            polls += 1
+            if polls > PATIENCE { return false }
+        }
+        self.*.lastUsed = (self.*.lastUsed + 1) & 0xFFFF
+        return header[16] == 0
+    }
+
+    // Up to `length` bytes from byte `offset` into `into`: how many (0 at
+    // the end), or -EIO.
+    pub fn read(self: *Self, offset: usize, into: [*]u8, length: usize) -> isize {
+        const size = self.sizeInBytes()
+        if offset >= size { return 0 }
+        const total = if length > size - offset { size - offset } else { length }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const sector = at / SECTOR
+            const within = at % SECTOR
+            var count = (within + total - done + SECTOR - 1) / SECTOR
+            if count > SECTORS_PER_REQUEST { count = SECTORS_PER_REQUEST }
+            if !self.transfer(sector, count, false) { return if done > 0 { @intCast(isize, done) } else { EIO } }
+            var chunk = count * SECTOR - within
+            if chunk > total - done { chunk = total - done }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(into) + done) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(data) + within) }, chunk)
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+
+    // `length` bytes from `from` at byte `offset` (sectors written in
+    // part are read first): how many, -ENOSPC past the end, -EROFS, -EIO.
+    pub fn write(self: *Self, offset: usize, from: [*]const u8, length: usize) -> isize {
+        if self.*.readOnly { return Errno.EROFS }
+        const size = self.sizeInBytes()
+        if offset >= size { return if length == 0 { 0 } else { -28 } }
+        const total = if length > size - offset { size - offset } else { length }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const sector = at / SECTOR
+            const within = at % SECTOR
+            var count = (within + total - done + SECTOR - 1) / SECTOR
+            if count > SECTORS_PER_REQUEST { count = SECTORS_PER_REQUEST }
+            var chunk = count * SECTOR - within
+            if chunk > total - done { chunk = total - done }
+            // A sector written in part keeps the rest of its bytes.
+            if (within != 0 || chunk % SECTOR != 0) && !self.transfer(sector, count, false) { return if done > 0 { @intCast(isize, done) } else { EIO } }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(data) + within) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(from) + done) }, chunk)
+            if !self.transfer(sector, count, true) { return if done > 0 { @intCast(isize, done) } else { EIO } }
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+}
+
+var first: VirtioBlock = undefined // (per run)
+
+// The disk (present or not).
+pub fn disk() -> *VirtioBlock { return &first }
