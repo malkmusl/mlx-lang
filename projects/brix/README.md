@@ -68,6 +68,19 @@ A physical page counts who holds it (`Frames.share`, `Frames.free`):
   139.
 - The archive's programs are pages of the boot image until written.
 
+## Snapshots
+
+`snapshot SOURCE DESTINATION` (projects/brix/tools/snapshot, in
+/system/programs) makes a copy of a tree at once, whatever its size: new
+directories, files that share every page with the originals
+(`Vfs.cloneTree`); a write to either side copies the page. `-r` makes it
+read-only (changes fail with EROFS), `-d SNAPSHOT` takes one out. The
+copy is built before anything names it, so a snapshot may go inside its
+source: `snapshot -r / /users/root/before`. Restoring is a snapshot back.
+The tool calls brixOS's own system calls 1000 (SNAPSHOT) and 1001
+(REMOVE_SNAPSHOT), past Linux's numbers. (Hard links inside a tree become
+separate files in its snapshot.)
+
 The pieces:
 
 - **mlx4 `--target=x86_64-freestanding`**: the program's `_start` takes
@@ -165,9 +178,8 @@ kernel runs), more than one CPU, an EFI loader.
 1. The timer (the APIC's) and preemption; the serial line's interrupt;
    signal handlers (rt_sigaction, delivery, sigreturn) and job control
    (SIGTSTP, SIGCONT).
-2. Snapshots of directories (a tree of nodes whose files share every
-   page), then a disk: virtio-blk, and a copy-on-write format of
-   brixOS's own on it (ext2 as the format to exchange with Linux).
+2. A disk: virtio-blk, and a copy-on-write format of brixOS's own on it
+   (snapshots there too; ext2 as the format to exchange with Linux).
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
 5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.

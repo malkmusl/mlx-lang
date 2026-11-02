@@ -13,7 +13,10 @@
 # directories, the working directory, the umask, the devices; Linux
 # programs' /tmp, /dev and /etc/passwd lead to /temporary, /devices and
 # /system/settings; a copy shares the pages of its file until it is
-# written to (copy on write); a script runs (by /proc/self/exe), a program
+# written to (copy on write); snapshots of a tree (read-only or not, also
+# of / into itself) share the files' pages, stay apart from the tree when
+# either changes, refuse changes when read-only, and are taken out; a
+# script runs (by /proc/self/exe), a program
 # copied into /temporary runs, and a program of /system/programs written
 # to is copied up; Ctrl-C ends the foreground program, Ctrl-D ends its
 # input;
@@ -54,7 +57,8 @@ for program in cat chmod cp head ln ls mkdir mv rm seq sleep stat uname wc; do
         "$compiler" --quiet "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
     fi
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "$work/bin/"
+"$compiler" --quiet projects/brix/tools/snapshot/main.mlx -o "$work/snapshot"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and coreutils) build"
 
 mkfifo "$work/input"
@@ -115,8 +119,8 @@ wait_for '^hello$'
 wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines"
 
-type_line 'ls /system/programs; cat /system/programs/mlx-sh | wc -c'
-wait_for 'ls  *mkdir  *mlx-sh'
+type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
+wait_for '^16$'
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -156,6 +160,21 @@ wait_for "^$(stat -c %s "$shell")\$" 2
 wait_for '^child 2$'
 wait_for '^parent 1$'
 echo "ok   copy on write: a copy shares its file's pages, a fork's child its parent's"
+
+type_line 'mkdir -p w/sub; echo one > w/a; echo two > w/sub/b; snapshot -r w snap && snapshot w copy && echo changed > w/a && echo edit >> copy/sub/b && cat snap/a copy/a w/a copy/sub/b w/sub/b'
+wait_for '^one$' 2
+wait_for '^changed$'
+wait_for '^edit$'
+wait_for '^two$' 2
+type_line 'echo x > snap/a; rm -f snap/sub/b; cat snap/sub/b snap/a; snapshot / /temporary/everything && ls /temporary/everything/temporary/snap'
+wait_for 'snap/a'
+wait_for "rm: cannot remove 'snap/sub/b'"
+wait_for '^two$' 3
+wait_for '^one$' 3
+wait_for '^a  sub$'
+type_line 'snapshot -d snap && snapshot -d everything && snapshot -d copy && ls snap copy 2>&1 | wc -l'
+wait_for '^2$' 2
+echo "ok   snapshots: shared pages, apart when changed, read-only, of / into itself, taken out"
 
 type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
 wait_for '^script one$'
