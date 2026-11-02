@@ -63,7 +63,7 @@ type_line() {
 }
 
 wait_for '^brixOS: kernel at 0x200000'
-wait_for '^brixOS: [0-9]* MiB, [0-9]* MHz$'
+wait_for '^brixOS: [0-9]* MiB ([0-9]* free), [0-9]* MHz$'
 echo "ok   the kernel boots and says itself on the serial line"
 
 type_line 'echo hello brix'

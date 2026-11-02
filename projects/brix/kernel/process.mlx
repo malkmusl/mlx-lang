@@ -1,320 +1,314 @@
-// The one process: a static ELF program from the boot archive (mlx-sh)
-// in its own address space. Its memory: the program's segments, the break
-// after them, anonymous mappings from MMAP_BASE up, the stack under
-// STACK_TOP; all but the segments are pages made on first touch (a page
-// fault in one of the regions, or the kernel preparing a range it is
-// given).
-const layout = @import("../layout.mlx")
+// A process: a static ELF program from the boot archive in its own
+// address space, with its descriptors. Its memory: the program's
+// segments, the break after them, anonymous mappings from MMAP_BASE up,
+// the stack under STACK_TOP; all but the segments are pages made on first
+// touch (a page fault in one of the regions, or the kernel preparing a
+// range it is handed).
 const cpu = @import("./cpu.mlx")
 const memory = @import("./memory.mlx")
 const archive = @import("./archive.mlx")
+const files = @import("./files.mlx")
+const Elf = @import("./elf.mlx").Elf
+const Bytes = @import("./bytes.mlx").Bytes
+const Errno = @import("./errno.mlx").Errno
+const Page = memory.Page
+const Space = memory.Space
 
-pub const PAGE: usize = 4096
-pub const STACK_TOP: usize = 0x7FFFFFFFF000
-pub const STACK_SIZE: usize = 8 * 1024 * 1024
-pub const MMAP_BASE: usize = 0x100000000000
-pub const USER_LIMIT: usize = 0x800000000000
-const MAX_REGIONS: usize = 256
+// [start, end) of the program's memory, made on first touch.
+pub const Region = struct {
+    start: usize
+    end: usize
 
-var space: usize = 0 // (per run)
-var entryPoint: usize = 0 // (per run)
-var stackPointer: usize = 0 // (per run)
-var breakStart: usize = 0 // (per run)
-var breakEnd: usize = 0 // (per run)
-var mmapNext: usize = 0 // (per run)
-var programHeaders: usize = 0 // (per run)
-var programHeaderCount: usize = 0 // (per run)
-var regionStart: [MAX_REGIONS]usize = undefined // (per run)
-var regionEnd: [MAX_REGIONS]usize = undefined // (per run)
-var regionCount: usize = 0 // (per run)
+    pub fn contains(self: Self, address: usize) -> bool { return address >= self.start && address < self.end }
+}
 
-pub fn entry() -> usize { return entryPoint }
-pub fn stack() -> usize { return stackPointer }
+// NUL-terminated strings for a program's argv or envp.
+pub const Strings = struct {
+    items: [*]const [*]const u8
+    count: usize
+}
 
-fn pageDown(value: usize) -> usize { return value & ~(PAGE - 1) }
-fn pageUp(value: usize) -> usize { return (value + PAGE - 1) & ~(PAGE - 1) }
+pub const Process = struct {
+    pub const STACK_TOP: usize = 0x7FFFFFFFF000
+    pub const STACK_SIZE: usize = 8 * 1024 * 1024
+    pub const MMAP_BASE: usize = 0x100000000000
+    pub const USER_LIMIT: usize = 0x800000000000
+    pub const MAX_REGIONS: usize = 256
+    const MAX_STRINGS: usize = 32
+    // The auxiliary vector's keys.
+    const AT_NULL: usize = 0
+    const AT_PHDR: usize = 3
+    const AT_PHENT: usize = 4
+    const AT_PHNUM: usize = 5
+    const AT_PAGESZ: usize = 6
+    const AT_ENTRY: usize = 9
+    const AT_UID: usize = 11
+    const AT_RANDOM: usize = 25
 
-fn read16(bytes: [*]const u8, at: usize) -> usize { return @intCast(usize, bytes[at]) | (@intCast(usize, bytes[at + 1]) << 8) }
-fn read32(bytes: [*]const u8, at: usize) -> usize { return read16(bytes, at) | (read16(bytes, at + 2) << 16) }
-fn read64(bytes: [*]const u8, at: usize) -> usize { return read32(bytes, at) | (read32(bytes, at + 4) << 32) }
+    space: Space
+    entry: usize
+    stack: usize
+    breakStart: usize
+    breakEnd: usize
+    mmapNext: usize
+    programHeaders: usize
+    programHeaderCount: usize
+    regions: [MAX_REGIONS]Region
+    regionCount: usize
+    files: files.Descriptors
 
-// ---- regions ----
-
-fn inRegion(address: usize) -> bool {
-    if address >= breakStart && address < breakEnd { return true }
-    if address >= STACK_TOP - STACK_SIZE && address < STACK_TOP { return true }
-    var k: usize = 0
-    while k < regionCount {
-        if address >= regionStart[k] && address < regionEnd[k] { return true }
-        k += 1
+    pub fn init(self: *Self) -> void {
+        self.*.space = Space.{ .root = 0 }
+        self.*.regionCount = 0
+        self.*.files.init()
     }
-    return false
-}
 
-fn addRegion(start: usize, end: usize) -> bool {
-    if regionCount == MAX_REGIONS { return false }
-    regionStart[regionCount] = start
-    regionEnd[regionCount] = end
-    regionCount += 1
-    return true
-}
+    // ---- regions ----
 
-// [start, end) out of the regions (cutting or splitting them) and its
-// pages freed.
-fn removeRange(start: usize, end: usize) -> void {
-    var k: usize = 0
-    while k < regionCount {
-        const a = regionStart[k]
-        const b = regionEnd[k]
-        if end <= a || start >= b {
-            k += 1
-            continue
-        }
-        // The pages of the overlap, those that were touched.
-        var page = if start > a { start } else { a }
-        const last = if end < b { end } else { b }
-        while page < last {
-            memory.release(space, page)
-            page += PAGE
-        }
-        if start <= a && end >= b {
-            regionCount -= 1
-            regionStart[k] = regionStart[regionCount]
-            regionEnd[k] = regionEnd[regionCount]
-            continue
-        }
-        if start <= a {
-            regionStart[k] = end
-        } else if end >= b {
-            regionEnd[k] = start
-        } else {
-            regionEnd[k] = start
-            _ = addRegion(end, b)
-        }
-        k += 1
-    }
-}
-
-// A page fault at `address`: true when it is in a region and has its
-// page now.
-pub fn fault(address: usize) -> bool {
-    if address >= USER_LIMIT || !inRegion(address) { return false }
-    if memory.translate(space, address) != 0 { return false }
-    return memory.back(space, address)
-}
-
-// [address, address + length) usable by the kernel for the program:
-// below the kernel's half, and every page mapped (made now when in a
-// region).
-pub fn prepare(address: usize, length: usize) -> bool {
-    if length == 0 { return true }
-    if address >= USER_LIMIT || length > USER_LIMIT - address { return false }
-    var page = pageDown(address)
-    while page < address + length {
-        if memory.translate(space, page) == 0 {
-            if !inRegion(page) || !memory.back(space, page) { return false }
-        }
-        page += PAGE
-    }
-    return true
-}
-
-// ---- system calls on memory ----
-
-pub fn mmap(address: usize, length: usize, fixed: bool) -> isize {
-    if length == 0 { return -22 }
-    const size = pageUp(length)
-    var start: usize = 0
-    if fixed {
-        if address & (PAGE - 1) != 0 || address >= USER_LIMIT || size > USER_LIMIT - address { return -22 }
-        start = address
-        removeRange(start, start + size)
-    } else {
-        start = mmapNext
-        mmapNext += size + PAGE
-    }
-    if !addRegion(start, start + size) { return -12 }
-    return @bitCast(isize, start)
-}
-
-pub fn munmap(address: usize, length: usize) -> isize {
-    if address & (PAGE - 1) != 0 || address >= USER_LIMIT { return -22 }
-    removeRange(address, address + pageUp(length))
-    return 0
-}
-
-pub fn brk(wanted: usize) -> usize {
-    if wanted < breakStart || wanted >= MMAP_BASE { return breakEnd }
-    const end = pageUp(wanted)
-    if end < breakEnd {
-        var page = end
-        while page < breakEnd {
-            memory.release(space, page)
-            page += PAGE
-        }
-    }
-    breakEnd = end
-    return wanted
-}
-
-// ---- loading ----
-
-// `length` bytes from `from` into the space at `address` (pages made as
-// needed, through the kernel's view of their frames).
-fn copyInto(target: usize, address: usize, from: [*]const u8, length: usize) -> bool {
-    var done: usize = 0
-    while done < length {
-        const at = address + done
-        var frame = memory.translate(target, at)
-        if frame == 0 {
-            if !memory.back(target, at) { return false }
-            frame = memory.translate(target, at)
-        }
-        const offset = at & (PAGE - 1)
-        var chunk = PAGE - offset
-        if chunk > length - done { chunk = length - done }
-        const into: [*]u8 = unsafe { @ptrFromInt([*]u8, cpu.physical(frame) + offset) }
+    fn inRegion(self: *const Self, address: usize) -> bool {
+        if address >= self.*.breakStart && address < self.*.breakEnd { return true }
+        if address >= STACK_TOP - STACK_SIZE && address < STACK_TOP { return true }
         var k: usize = 0
-        while k < chunk {
-            into[k] = from[done + k]
+        while k < self.*.regionCount {
+            if self.*.regions[k].contains(address) { return true }
             k += 1
         }
-        done += chunk
+        return false
     }
-    return true
-}
 
-fn putWord(target: usize, address: usize, value: usize) -> bool {
-    var bytes: [8]u8 = undefined
-    var k: usize = 0
-    while k < 8 {
-        bytes[k] = @intCast(u8, (value >> @intCast(u6, k * 8)) & 255)
-        k += 1
+    fn addRegion(self: *Self, start: usize, end: usize) -> bool {
+        if self.*.regionCount == MAX_REGIONS { return false }
+        self.*.regions[self.*.regionCount] = Region.{ .start = start, .end = end }
+        self.*.regionCount += 1
+        return true
     }
-    return copyInto(target, address, &bytes, 8)
-}
 
-fn length(text: [*]const u8) -> usize {
-    var n: usize = 0
-    while text[n] != 0 { n += 1 }
-    return n
-}
-
-// The stack the program starts with: argc, argv, envp, the auxiliary
-// vector, then the strings and 16 random bytes at the top.
-fn buildStack(target: usize, arguments: [*]const [*]const u8, argumentCount: usize, environment: [*]const [*]const u8, environmentCount: usize) -> usize {
-    var top = STACK_TOP - 16
-    var pointers: [32]usize = undefined
-    var k: usize = 0
-    while k < argumentCount + environmentCount && k < 32 {
-        const text = if k < argumentCount { arguments[k] } else { environment[k - argumentCount] }
-        const n = length(text) + 1
-        top -= n
-        _ = copyInto(target, top, text, n)
-        pointers[k] = top
-        k += 1
-    }
-    const total = k
-    top -= top % 16
-    top -= 16
-    const random = top
-    var seed = cpu.rdtsc() | 1
-    var r: usize = 0
-    while r < 2 {
-        seed ^= seed << 13
-        seed ^= seed >> 7
-        seed ^= seed << 17
-        _ = putWord(target, random + r * 8, seed)
-        r += 1
-    }
-    // argc, argv + NULL, envp + NULL, 8 auxiliary pairs (16 words).
-    const words = 1 + argumentCount + 1 + environmentCount + 1 + 16
-    top -= words * 8
-    top -= top % 16
-    var at = top
-    _ = putWord(target, at, argumentCount)
-    at += 8
-    k = 0
-    while k < argumentCount && k < total {
-        _ = putWord(target, at, pointers[k])
-        at += 8
-        k += 1
-    }
-    _ = putWord(target, at, 0)
-    at += 8
-    while k < total {
-        _ = putWord(target, at, pointers[k])
-        at += 8
-        k += 1
-    }
-    _ = putWord(target, at, 0)
-    at += 8
-    const aux = [16]usize{ 3, programHeaders, 4, 56, 5, programHeaderCount, 6, PAGE, 9, entryPoint, 11, 0, 25, random, 0, 0 }
-    var a: usize = 0
-    while a < 16 {
-        _ = putWord(target, at, aux[a])
-        at += 8
-        a += 1
-    }
-    return top
-}
-
-// The program `name` loaded into a new address space, which becomes the
-// current one (the old one freed); false when it is not in the archive,
-// is no static x86-64 ELF program, or memory is out.
-pub fn load(name: [*]const u8, nameLength: usize, arguments: [*]const [*]const u8, argumentCount: usize, environment: [*]const [*]const u8, environmentCount: usize) -> bool {
-    var file: archive.File = undefined
-    if !archive.find(name, nameLength, &file) { return false }
-    const elf = file.data
-    if file.size < 64 || elf[0] != 0x7F || elf[1] != 69 || elf[2] != 76 || elf[3] != 70 { return false }
-    if elf[4] != 2 || read16(elf, 18) != 62 || read16(elf, 16) != 2 { return false }
-    const target = memory.newSpace()
-    if target == 0 { return false }
-    const phoff = read64(elf, 32)
-    const phnum = read16(elf, 56)
-    var highest: usize = 0
-    var headers: usize = 0
-    var k: usize = 0
-    while k < phnum {
-        const ph = phoff + k * 56
-        if read32(elf, ph) == 1 {
-            const offset = read64(elf, ph + 8)
-            const address = read64(elf, ph + 16)
-            const fileSize = read64(elf, ph + 32)
-            const memorySize = read64(elf, ph + 40)
-            if offset + fileSize > file.size || address >= MMAP_BASE {
-                memory.freeSpace(target)
-                return false
+    // [start, end) out of the regions (cutting or splitting them), its
+    // touched pages freed.
+    fn removeRange(self: *Self, start: usize, end: usize) -> void {
+        var k: usize = 0
+        while k < self.*.regionCount {
+            const region = self.*.regions[k]
+            if end <= region.start || start >= region.end {
+                k += 1
+                continue
             }
-            if offset == 0 { headers = address + phoff }
-            if !copyInto(target, address, unsafe { @ptrFromInt([*]const u8, @intFromPtr(elf) + offset) }, fileSize) {
-                memory.freeSpace(target)
-                return false
+            var page = if start > region.start { start } else { region.start }
+            const last = if end < region.end { end } else { region.end }
+            while page < last {
+                self.*.space.release(page)
+                page += Page.SIZE
             }
-            // The rest of the segment: zero pages (copyInto makes them).
-            var page = pageUp(address + fileSize)
-            while page < address + memorySize {
-                if memory.translate(target, page) == 0 && !memory.back(target, page) {
-                    memory.freeSpace(target)
-                    return false
-                }
-                page += PAGE
+            if start <= region.start && end >= region.end {
+                self.*.regionCount -= 1
+                self.*.regions[k] = self.*.regions[self.*.regionCount]
+                continue
             }
-            if address + memorySize > highest { highest = address + memorySize }
+            if start <= region.start {
+                self.*.regions[k].start = end
+            } else if end >= region.end {
+                self.*.regions[k].end = start
+            } else {
+                self.*.regions[k].end = start
+                _ = self.addRegion(end, region.end)
+            }
+            k += 1
         }
-        k += 1
     }
-    entryPoint = read64(elf, 24)
-    programHeaders = headers
-    programHeaderCount = phnum
-    breakStart = pageUp(highest)
-    breakEnd = breakStart
-    mmapNext = MMAP_BASE
-    regionCount = 0
-    stackPointer = buildStack(target, arguments, argumentCount, environment, environmentCount)
-    const old = space
-    space = target
-    cpu.writeCr3(target)
-    if old != 0 { memory.freeSpace(old) }
-    return true
+
+    // A page fault at `address`: true when it is in a region and has its
+    // page now.
+    pub fn fault(self: *Self, address: usize) -> bool {
+        if address >= USER_LIMIT || !self.inRegion(address) { return false }
+        if self.*.space.translate(address) != 0 { return false }
+        return self.*.space.back(address)
+    }
+
+    // ---- the program's memory, for the kernel ----
+
+    // [address, address + length) usable by the kernel: below the
+    // kernel's half, and every page mapped (made now when in a region).
+    pub fn prepare(self: *Self, address: usize, length: usize) -> bool {
+        if length == 0 { return true }
+        if address >= USER_LIMIT || length > USER_LIMIT - address { return false }
+        var page = Page.down(address)
+        while page < address + length {
+            if self.*.space.translate(page) == 0 {
+                if !self.inRegion(page) || !self.*.space.back(page) { return false }
+            }
+            page += Page.SIZE
+        }
+        return true
+    }
+
+    // A NUL-terminated string at `address`, its pages made; false when
+    // it is not the program's (or longer than a page).
+    pub fn prepareString(self: *Self, address: usize) -> bool {
+        var at = address
+        while at < address + Page.SIZE {
+            if !self.prepare(at, 1) { return false }
+            if Bytes.pointer(at)[0] == 0 { return true }
+            at += 1
+        }
+        return false
+    }
+
+    // ---- system calls on memory ----
+
+    pub fn mmap(self: *Self, address: usize, length: usize, fixed: bool) -> isize {
+        if length == 0 { return Errno.EINVAL }
+        const size = Page.up(length)
+        var start: usize = 0
+        if fixed {
+            if address & (Page.SIZE - 1) != 0 || address >= USER_LIMIT || size > USER_LIMIT - address { return Errno.EINVAL }
+            start = address
+            self.removeRange(start, start + size)
+        } else {
+            start = self.*.mmapNext
+            self.*.mmapNext += size + Page.SIZE
+        }
+        if !self.addRegion(start, start + size) { return Errno.ENOMEM }
+        return @bitCast(isize, start)
+    }
+
+    pub fn munmap(self: *Self, address: usize, length: usize) -> isize {
+        if address & (Page.SIZE - 1) != 0 || address >= USER_LIMIT { return Errno.EINVAL }
+        self.removeRange(address, address + Page.up(length))
+        return 0
+    }
+
+    pub fn brk(self: *Self, wanted: usize) -> usize {
+        if wanted < self.*.breakStart || wanted >= MMAP_BASE { return self.*.breakEnd }
+        const end = Page.up(wanted)
+        var page = end
+        while page < self.*.breakEnd {
+            self.*.space.release(page)
+            page += Page.SIZE
+        }
+        self.*.breakEnd = end
+        return wanted
+    }
+
+    // ---- loading ----
+
+    // The segments of `elf` into `target`; the end of the highest, or 0
+    // when one does not fit or memory is out.
+    fn loadSegments(self: *Self, target: Space, elf: Elf) -> usize {
+        var highest: usize = 0
+        var k: usize = 0
+        while k < elf.headerCount() {
+            if elf.isLoadable(k) {
+                const segment = elf.segment(k)
+                if segment.offset + segment.fileSize > elf.size || segment.address >= MMAP_BASE { return 0 }
+                if segment.offset == 0 { self.*.programHeaders = segment.address + elf.headerOffset() }
+                if !target.write(segment.address, elf.bytesAt(segment.offset), segment.fileSize) { return 0 }
+                // The rest of the segment: zero pages.
+                var page = Page.up(segment.address + segment.fileSize)
+                while page < segment.address + segment.memorySize {
+                    if target.translate(page) == 0 && !target.back(page) { return 0 }
+                    page += Page.SIZE
+                }
+                if segment.address + segment.memorySize > highest { highest = segment.address + segment.memorySize }
+            }
+            k += 1
+        }
+        return highest
+    }
+
+    // The stack the program starts with: argc, argv, envp, the auxiliary
+    // vector, then the strings and 16 random bytes at the top. Its
+    // pointer.
+    fn buildStack(self: *Self, target: Space, arguments: Strings, environment: Strings) -> usize {
+        var top = STACK_TOP - 16
+        var pointers: [MAX_STRINGS]usize = undefined
+        var total: usize = 0
+        while total < arguments.count + environment.count && total < MAX_STRINGS {
+            const text = if total < arguments.count { arguments.items[total] } else { environment.items[total - arguments.count] }
+            const n = Bytes.length(text) + 1
+            top -= n
+            _ = target.write(top, text, n)
+            pointers[total] = top
+            total += 1
+        }
+        top -= top % 16
+        top -= 16
+        const random = top
+        var seed = cpu.Cpu.timestamp() | 1
+        var r: usize = 0
+        while r < 2 {
+            seed ^= seed << 13
+            seed ^= seed >> 7
+            seed ^= seed << 17
+            _ = target.writeWord(random + r * 8, seed)
+            r += 1
+        }
+        const auxiliary = [16]usize{ AT_PHDR, self.*.programHeaders, AT_PHENT, Elf.HEADER_SIZE, AT_PHNUM, self.*.programHeaderCount, AT_PAGESZ, Page.SIZE, AT_ENTRY, self.*.entry, AT_UID, 0, AT_RANDOM, random, AT_NULL, 0 }
+        const words = 1 + arguments.count + 1 + environment.count + 1 + 16
+        top -= words * 8
+        top -= top % 16
+        var at = top
+        _ = target.writeWord(at, arguments.count)
+        at += 8
+        // argv, its NULL, envp, its NULL.
+        if arguments.count == 0 {
+            _ = target.writeWord(at, 0)
+            at += 8
+        }
+        var k: usize = 0
+        while k < total {
+            _ = target.writeWord(at, pointers[k])
+            at += 8
+            k += 1
+            if k == arguments.count {
+                _ = target.writeWord(at, 0)
+                at += 8
+            }
+        }
+        _ = target.writeWord(at, 0)
+        at += 8
+        var a: usize = 0
+        while a < 16 {
+            _ = target.writeWord(at, auxiliary[a])
+            at += 8
+            a += 1
+        }
+        return top
+    }
+
+    // The program `name` of the boot archive loaded into a new address
+    // space, which becomes the process's and the one in use (the old one
+    // freed); false when it is not there, is no static x86-64 ELF program,
+    // or memory is out.
+    pub fn load(self: *Self, name: []const u8, arguments: Strings, environment: Strings) -> bool {
+        const boot = archive.Archive.boot()
+        const index = boot.find(name.pointer, name.length)
+        if index == boot.count() { return false }
+        const file = boot.file(index)
+        const elf = Elf.{ .data = file.data, .size = file.size }
+        if !elf.isProgram() { return false }
+        const target = Space.create()
+        if !target.isValid() { return false }
+        const highest = self.loadSegments(target, elf)
+        if highest == 0 {
+            target.destroy()
+            return false
+        }
+        self.*.entry = elf.entry()
+        self.*.programHeaderCount = elf.headerCount()
+        self.*.breakStart = Page.up(highest)
+        self.*.breakEnd = self.*.breakStart
+        self.*.mmapNext = MMAP_BASE
+        self.*.regionCount = 0
+        self.*.stack = self.buildStack(target, arguments, environment)
+        const old = self.*.space
+        self.*.space = target
+        target.activate()
+        if old.isValid() { old.destroy() }
+        return true
+    }
 }
+
+var shell: Process = undefined // (per run)
+
+// The process running (there is one yet).
+pub fn current() -> *Process { return &shell }

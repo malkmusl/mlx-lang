@@ -22,7 +22,7 @@ line and runs mlx-sh in user mode on it:
     tools/check_brix.sh        # the same, typed at, checked
 
     brixOS: kernel at 0x200000, 52 KiB
-    brixOS: 511 MiB, 2088 MHz
+    brixOS: 511 MiB (463 free), 2082 MHz
     root@brix:~# echo $((6*7))
     42
 
@@ -35,38 +35,49 @@ The pieces:
   maps it (the higher half).
 - **brix-image** (projects/brix/image): one file QEMU (or any Multiboot
   loader) boots. The first MiB is the boot blob, assembled by brix-image
-  itself (asm.mlx: bytes, labels, fixups): the Multiboot header, the
-  boot info the kernel reads (layout.mlx `INFO_*`), GDT, TSS, IDT, the
+  itself (asm.mlx's `Asm`: bytes, labels, fixups): the Multiboot header, the
+  boot info the kernel reads (layout.mlx `Info`), GDT, TSS, IDT, the
   32-bit entry (page tables for the first GiB at 0 and at
   0xFFFF800000000000, long mode), the 64-bit start (higher half, IDT,
   TSS, SYSCALL MSRs, SSE), the SYSCALL entry and a stub per vector. Then
   the kernel's segments (at 2 MiB) and the archive of files
   (`BRIXFS01`: name, offset, size; `NAME=FILE` arguments).
-- **The kernel** (projects/brix/kernel), Mlx without std:
+- **The kernel** (projects/brix/kernel), Mlx without std, written as
+  types that hold their functions and constants (`Space.map`,
+  `Process.load`, `Terminal.read`, `layout.Op.OUTB`); the state is a few
+  module variables of those types (the frames, the process, the
+  terminal, the clock), reached through functions (`process.current()`):
   - cpu.mlx: mlx4 has no privileged instructions, so the kernel asks the
-    blob for them by SYSCALL from ring 0 (port I/O, CR2/CR3, INVLPG,
-    WRMSR, RDTSC, entering user mode); the entry tells the kernel's calls
-    from the program's by the return address's half.
-  - serial.mlx, console.mlx: COM1, polled.
-  - memory.mlx: physical frames from the Multiboot memory size, page
-    tables, address spaces sharing the kernel's half.
-  - process.mlx: the program from the archive (a static ELF, as mlx4 and
-    mlx-ld write them) in its own address space, its stack (argv, envp,
-    auxv), break, anonymous mappings and stack as pages made on first
-    touch (page faults, or the kernel preparing a range it is handed).
-  - system.mlx, files.mlx, tty.mlx, clock.mlx: Linux's system call
-    numbers and structures for what a shell on a terminal needs: read,
-    write, the termios of the serial line (canonical mode with echo and
-    erase, raw mode, ONLCR, ICRNL), the window size, mmap/munmap/brk,
-    the archive's files read-only in `/` (open, stat, getdents64, lseek),
-    poll, clocks (TSC, its rate measured against the PIT, the CMOS
-    clock), uname, getrandom; signals are accepted and never come.
-    A call it lacks is said once on the console (`[brixOS: system call
-    N not there]`) and gets ENOSYS.
-  - trap.mlx: `brix_trap`, called by the blob's common trap path with
-    the frame (registers saved, SSE state kept by FXSAVE): system calls,
-    page faults of the program's regions, a crash report for the rest.
-    When the shell exits or faults, the kernel starts it again.
+    blob for them by SYSCALL from ring 0 (`Port`, `Cpu`, `Msr`,
+    `BootInfo`: port I/O, CR2/CR3, INVLPG, WRMSR, RDTSC, entering user
+    mode); the entry tells the kernel's calls from the program's by the
+    return address's half.
+  - serial.mlx, console.mlx: `Uart` (COM1, polled) and `Console`
+    (`console.out`).
+  - memory.mlx: `Page`, `Frames` (physical frames from the Multiboot
+    memory size), `Space` (an address space sharing the kernel's half:
+    map, translate, back, release, write, destroy).
+  - archive.mlx, elf.mlx: the boot archive's files; a static ELF
+    program's segments.
+  - process.mlx: `Process`: the program from the archive (a static ELF, as
+    mlx4 and mlx-ld write them) in its own `Space`, its stack (argv,
+    envp, auxv), break, anonymous mappings and stack as `Region`s of
+    pages made on first touch (page faults, or the kernel preparing a
+    range it is handed), its `Descriptors`.
+  - system.mlx, files.mlx, terminal.mlx, clock.mlx: `System` answers
+    Linux's system call numbers (`Number`) and structures for what a
+    shell on a terminal needs: read, write, the termios of the serial
+    line (`Terminal`: canonical mode with echo and erase, raw mode,
+    ONLCR, ICRNL), the window size, mmap/munmap/brk, the archive's files
+    read-only in `/` (open, stat, getdents64, lseek), poll, clocks
+    (`Clock`: the TSC, its rate measured against the `Pit`, the `Cmos`
+    clock), uname, getrandom; signals are accepted and never come. A
+    call it lacks is said once on the console (`[brixOS: system call N
+    not there]`) and gets ENOSYS.
+  - frame.mlx, trap.mlx, shell.mlx: the trap `Frame` (registers saved,
+    SSE state kept by FXSAVE in the blob), `brix_trap` (system calls,
+    page faults of the program's regions, a crash report for the rest),
+    and mlx-sh started again when it exits or faults.
 
 Not there yet: processes of their own (fork, execve, wait: mlx-sh says
 "cannot fork" for anything but its builtins), interrupts (the PICs are

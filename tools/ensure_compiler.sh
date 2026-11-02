@@ -692,6 +692,20 @@ builds_freestanding_kernels() {
     return $ok
 }
 
+# Whether $1 lets a struct's own constants name its array fields' lengths
+# (`entries: [MAX]Entry`, `[Self.MAX]`; tests/426 exits 13).
+resolves_aggregate_constant_lengths() {
+    local probe status=0
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    if "$1" --quiet tests/426_aggregate_constant_lengths_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+    else
+        status=1
+    fi
+    rm -rf -- "$probe"
+    [[ $status -eq 13 ]]
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -741,6 +755,7 @@ probes=(
     "inlines_with_own_names|inlined functions reading their own module's variables, not the caller's locals"
     "says_its_version|its version (mlx4 --version)"
     "builds_freestanding_kernels|kernels (--target=x86_64-freestanding)"
+    "resolves_aggregate_constant_lengths|a struct's constants as its array fields' lengths"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
