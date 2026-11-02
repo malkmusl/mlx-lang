@@ -468,6 +468,10 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'env direct execution differ
 printf '43\n' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'env PATH execution differs'
 
+# A command whose second letter is an option's (a, C, S) is a command.
+/usr/bin/env -i PATH=/usr/bin "$bin_dir/env" false > "$work_dir/actual" && fail 'env false succeeded'
+[[ ! -s "$work_dir/actual" ]] || fail 'env false printed the environment'
+
 set +e
 /usr/bin/env -i "$bin_dir/env" /bin/sh -c 'exit 7'
 env_command_status=$?

@@ -82,7 +82,9 @@ wait (no timer yet), on a VFS with a tmpfs in brixOS's own layout
 (/system/programs, /devices, /users, /temporary; Linux's paths mapped by
 the system call layer), with copy on write for fork and for files
 (copy_file_range, FICLONE; std.fs.copy uses copy_file_range), snapshots
-of trees (the snapshot tool), a virtio disk as /devices/disk0, and
+of trees (the snapshot tool), symbolic links and FIFOs, all 73
+coreutils (each checked against the host's run), a virtio disk as
+/devices/disk0, and
 brixfs on it, a copy-on-write format of brixOS's own (A/B superblocks,
 commits of the changed blocks when idle or at sync with the device
 flushed, inode numbers reused, snapshots as kept roots, directories

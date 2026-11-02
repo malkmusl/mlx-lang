@@ -21,7 +21,8 @@
 # mounts it at /volumes/disk0: files and directories written there reach
 # the disk (the host's brixfs lists and reads them), a snapshot on the disk
 # keeps the old state; after a second boot both are there, the snapshot
-# is taken out and its blocks are free again, an appended file keeps its
+# is taken out and its blocks are free again (links and FIFOs on the disk
+# too), every coreutils program runs as on the host, an appended file keeps its
 # unchanged blocks, inode numbers are used again, and more files than
 # the tree has nodes for are there (unloaded, read again); a script runs (by
 # /proc/self/exe), a program
@@ -57,18 +58,18 @@ shell=mlx-out/bin/mlx-sh
 [[ -x $shell ]] || { "$compiler" --quiet projects/shell/main.mlx -o "$work/mlx-sh"; shell=$work/mlx-sh; }
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
+# Every coreutils program (built here: what is in mlx-out may be older).
 mkdir -p "$work/bin"
-for program in cat chmod cp head ln ls mkdir mv rm seq sleep stat sync tail uname wc; do
-    if [[ -x mlx-out/bin/coreutils/$program ]]; then
-        cp mlx-out/bin/coreutils/$program "$work/bin/"
-    else
-        "$compiler" --quiet "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
-    fi
+programs=()
+for main in projects/coreutils/*/main.mlx; do
+    programs+=("$(basename "$(dirname "$main")")")
 done
+printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet "projects/coreutils/{}/main.mlx" -o "$work/bin/{}"
+(( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
 "$compiler" --quiet projects/brix/tools/snapshot/main.mlx -o "$work/snapshot"
 "$compiler" --quiet projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "$work/bin/"
-echo "ok   the kernel, brix-image and the boot image (mlx-sh and coreutils) build"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "every-program=tools/brix_programs.sh" "$work/bin/"
+echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
 head -c 4194304 /dev/zero > "$work/disk.img"
@@ -134,7 +135,7 @@ echo "ok   arithmetic expansion"
 
 type_line 'pwd; cd /; echo * /system/* /system/programs/m*'
 wait_for '^/users/root$'
-wait_for '^devices system temporary users volumes /system/programs /system/settings /system/programs/mkdir /system/programs/mlx-sh /system/programs/mv$'
+wait_for '^devices system temporary users volumes /system/programs /system/settings /system/programs/md5sum /system/programs/mkdir /system/programs/mkfifo /system/programs/mlx-sh /system/programs/mv$'
 echo "ok   the working directory and a glob over the tree (brixOS's layout)"
 
 type_line 'x=brix; echo ${x}OS ${#x}'
@@ -148,7 +149,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for '^19$'
+wait_for "^$(( ${#programs[@]} + 4 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -224,7 +225,26 @@ wait_for '^changed$'
 wait_for 'before/x'
 "$work/brixfs" list "$work/disk.img" > "$work/list" 2>&1
 grep -q '^snapshot before$' "$work/list" && ! grep -q '^/big ' "$work/list" || fail "the snapshot or the removal is not on the disk: $(cat "$work/list")"
+type_line 'ln -s docs/a /volumes/disk0/toa && mkfifo /volumes/disk0/pipe && sync && echo linked $(cat /volumes/disk0/toa)'
+wait_for '^linked changed$'
+"$work/brixfs" list "$work/disk.img" > "$work/list" 2>&1
+grep -q '^/toa -> docs/a$' "$work/list" && grep -q '^/pipe fifo$' "$work/list" || fail "the link or the FIFO is not on the disk: $(cat "$work/list")"
 echo "ok   brixfs: formatted and mounted, files on the disk (the host reads them), a read-only snapshot on it"
+
+# Every coreutils program as on the host: tools/brix_programs.sh's output
+# in brixOS and on the host (the same programs) the same.
+mkdir "$work/host"
+host_shell=$(realpath "$shell")
+(cd "$work/host" && env -i T="$work/host" PATH="$work/bin" "$host_shell" "$repo_root/tools/brix_programs.sh" > "$work/programs.host" 2>&1) || true
+type_line 'mlx-sh /system/programs/every-program'
+tries=0
+until output | grep -q '^@@ done$'; do
+    (( tries++ < 1200 )) || fail "tools/brix_programs.sh did not end in brixOS"
+    sleep 0.1
+done
+output | sed -n '/^@@ env \[/,/^@@ done$/p' | grep -v '^$' > "$work/programs.brix"
+grep -v '^$' "$work/programs.host" | diff - "$work/programs.brix" > "$work/programs.diff" || fail "programs differ from the host's run (< host, > brixOS): $(cat "$work/programs.diff")"
+echo "ok   all ${#programs[@]} coreutils programs run as on the host (links, FIFOs included)"
 
 type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
 wait_for '^script one$'
@@ -267,9 +287,11 @@ echo "ok   no system call the programs made was missing"
 stop
 boot
 wait_for '^brixOS: /volumes/disk0 (brixfs, generation [0-9]*)$'
-type_line 'ls /volumes; cat /volumes/disk0/docs/a /volumes/before/docs/a; tail -n 1 /volumes/disk0/numbers; ls /volumes/before; echo free $(stat -f -c %f /volumes/disk0)'
+type_line 'ls /volumes; cat /volumes/disk0/docs/a /volumes/before/docs/a; tail -n 1 /volumes/disk0/numbers; ls /volumes/before; echo free $(stat -f -c %f /volumes/disk0); readlink /volumes/disk0/toa; stat -c %F /volumes/disk0/pipe'
 wait_for '^before[[:space:]]*disk0$'
 wait_for '^changed$'
+wait_for '^docs/a$'
+wait_for '^fifo$'
 wait_for '^hello volume$'
 wait_for '^2000$'
 wait_for '^big  docs  numbers$'
@@ -282,7 +304,7 @@ free_after=$(output | grep '^free [0-9]*$' | tail -n 1 | cut -d' ' -f2)
 (( free_after > free_before + 100 )) || fail "the snapshot's blocks are not free again ($free_before, then $free_after)"
 "$work/brixfs" list "$work/disk.img" > "$work/list" 2>&1
 ! grep -q '^snapshot ' "$work/list" || fail "the snapshot is still on the disk"
-echo "ok   brixfs after a reboot: the files and the snapshot there, the snapshot taken out, its blocks free"
+echo "ok   brixfs after a reboot: the files, a link, a FIFO and the snapshot there, the snapshot taken out, its blocks free"
 
 # Only what changed is written: a file of 144 blocks appended to keeps
 # every block but its last on the disk.

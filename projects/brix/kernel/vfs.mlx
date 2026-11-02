@@ -29,7 +29,9 @@ const Errno = @import("./errno.mlx").Errno
 const volume = @import("./volume.mlx")
 const Page = memory.Page
 
-pub const NodeKind = enum(u8) { free, directory, file, archive, terminal, null_device, zero_device, disk }
+// A symbolic link holds its target as its data; a FIFO (named pipe) a
+// pipe while it is open.
+pub const NodeKind = enum(u8) { free, directory, file, archive, terminal, null_device, zero_device, disk, symlink, fifo }
 
 pub const Node = struct {
     pub const DIRECT: usize = 12
@@ -47,6 +49,8 @@ pub const Node = struct {
     doubleIndirect: usize
     // The archive's file (kind archive).
     archiveIndex: usize
+    // A FIFO's pipe while it is open (its index + 1; 0: none).
+    pipe: usize
     // Seconds since 1970.
     accessed: usize
     modified: usize
@@ -64,6 +68,11 @@ pub const Node = struct {
     dataDirty: bool
 
     pub fn isDirectory(self: *const Self) -> bool { return self.*.kind == NodeKind.directory }
+
+    pub fn isLink(self: *const Self) -> bool { return self.*.kind == NodeKind.symlink }
+
+    // Whether its data is pages of its own (a file, a directory, a link).
+    pub fn hasPages(self: *const Self) -> bool { return self.*.kind == NodeKind.file || self.*.kind == NodeKind.directory || self.*.kind == NodeKind.symlink }
 
     // Whether it holds bytes (a file, or an archive's file).
     pub fn isRegular(self: *const Self) -> bool { return self.*.kind == NodeKind.file || self.*.kind == NodeKind.archive }
@@ -119,6 +128,7 @@ pub const Vfs = struct {
                 n.*.indirect = 0
                 n.*.doubleIndirect = 0
                 n.*.archiveIndex = 0
+                n.*.pipe = 0
                 n.*.readOnly = false
                 n.*.volume = 0
                 n.*.diskInode = 0
@@ -264,7 +274,7 @@ pub const Vfs = struct {
         if n.*.volume == view { return 0 }
         if n.*.volume != 0 { return EXDEV }
         if n.*.kind == NodeKind.archive && !self.copyUp(index) { return ENOSPC }
-        if n.*.kind != NodeKind.file && n.*.kind != NodeKind.directory { return EXDEV }
+        if !n.hasPages() && n.*.kind != NodeKind.fifo { return EXDEV }
         const number = volume.store().newInode()
         if number == 0 { return ENOSPC }
         n.*.volume = view
@@ -422,7 +432,7 @@ pub const Vfs = struct {
 
     fn freeData(self: *Self, index: usize) -> void {
         const n = &self.*.nodes[index]
-        if n.*.kind == NodeKind.file || n.*.kind == NodeKind.directory { self.freeBlocks(index, 0) }
+        if n.hasPages() { self.freeBlocks(index, 0) }
         n.*.size = 0
     }
 
@@ -722,7 +732,7 @@ pub const Vfs = struct {
         const copy = &self.*.nodes[made]
         copy.*.archiveIndex = original.*.archiveIndex
         if original.*.kind == NodeKind.archive || original.*.kind == NodeKind.disk { copy.*.size = original.*.size }
-        if original.*.kind == NodeKind.file {
+        if original.*.kind == NodeKind.file || original.*.kind == NodeKind.symlink {
             const copied = self.copyRange(source, 0, made, 0, original.*.size)
             if copied < 0 || @bitCast(usize, copied) != original.*.size {
                 self.collect(made)
@@ -781,48 +791,77 @@ pub const Vfs = struct {
 
     // ---- paths ----
 
-    // The node `path` names, from `base` when it is relative; -errno.
-    pub fn resolve(self: *Self, base: usize, path: [*]const u8) -> isize {
-        var at: usize = if path[0] == 47 { ROOT } else { base }
+    // Links followed from one path at most (more: ELOOP).
+    const MAX_LINKS: usize = 40
+
+    // The node `path` names, from `base` when it is relative, symbolic
+    // links followed (the last component's too); -errno.
+    pub fn resolve(self: *Self, base: usize, path: [*]const u8) -> isize { return self.walk(base, path, textLength(path), true, 0) }
+
+    // The same, a link as the last component is that link (lstat,
+    // readlink).
+    pub fn resolveLink(self: *Self, base: usize, path: [*]const u8) -> isize { return self.walk(base, path, textLength(path), false, 0) }
+
+    fn textLength(text: [*]const u8) -> usize {
+        var k: usize = 0
+        while text[k] != 0 { k += 1 }
+        return k
+    }
+
+    // The node path[0..end] names from `base` (from the root when it
+    // starts with '/'): every component a directory's entry, links in the
+    // middle followed, the last one when `followLast` or a '/' follows
+    // it; -errno.
+    fn walk(self: *Self, base: usize, path: [*]const u8, end: usize, followLast: bool, depth: usize) -> isize {
+        var at: usize = if end > 0 && path[0] == 47 { ROOT } else { base }
         var k: usize = 0
         while true {
-            while path[k] == 47 { k += 1 }
-            if path[k] == 0 { break }
+            while k < end && path[k] == 47 { k += 1 }
+            if k >= end { break }
             const start = k
-            while path[k] != 0 && path[k] != 47 { k += 1 }
+            while k < end && path[k] != 47 { k += 1 }
             if !self.*.nodes[at].isDirectory() { return Errno.ENOTDIR }
             const next = self.lookup(at, unsafe { @ptrFromInt([*]const u8, @intFromPtr(path) + start) }, k - start)
             if next == NONE { return Errno.ENOENT }
+            if self.*.nodes[next].isLink() && (followLast || k < end) { return self.follow(at, next, path, k, end, followLast, depth) }
             at = next
         }
         return @intCast(isize, at)
     }
 
+    // The walk on through the link `link` of `directory`: its target, then
+    // what is left of the path (path[from..end]), as one path in a page
+    // of its own.
+    fn follow(self: *Self, directory: usize, link: usize, path: [*]const u8, from: usize, end: usize, followLast: bool, depth: usize) -> isize {
+        if depth >= MAX_LINKS { return Errno.ELOOP }
+        self.ready(link)
+        const size = self.*.nodes[link].size
+        if size == 0 { return Errno.ENOENT }
+        if size + end - from >= Page.SIZE { return Errno.ENAMETOOLONG }
+        const frame = memory.allFrames().allocate()
+        if frame == 0 { return Errno.ENOMEM }
+        const joined = Bytes.pointer(layout.Memory.virtual(frame))
+        _ = self.read(link, 0, joined, size)
+        Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(joined) + size) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(path) + from) }, end - from)
+        const found = self.walk(directory, joined, size + end - from, followLast, depth + 1)
+        memory.allFrames().free(frame)
+        return found
+    }
+
     // The directory that would hold the last component of `path` (its
     // node, or -errno), the component into `name` (empty for "/").
     pub fn resolveParent(self: *Self, base: usize, path: [*]const u8, name: *[]const u8) -> isize {
-        var end: usize = 0
-        while path[end] != 0 { end += 1 }
+        var end = textLength(path)
         while end > 1 && path[end - 1] == 47 { end -= 1 }
         var start = end
         while start > 0 && path[start - 1] != 47 { start -= 1 }
         name.* = path[start..end]
         if end - start > NAME_MAX { return ENAMETOOLONG }
         // The directory part, as a path of its own.
-        var at: usize = if path[0] == 47 { ROOT } else { base }
-        var k: usize = 0
-        while k < start {
-            while k < start && path[k] == 47 { k += 1 }
-            if k >= start { break }
-            const from = k
-            while k < start && path[k] != 47 { k += 1 }
-            if !self.*.nodes[at].isDirectory() { return Errno.ENOTDIR }
-            const next = self.lookup(at, unsafe { @ptrFromInt([*]const u8, @intFromPtr(path) + from) }, k - from)
-            if next == NONE { return Errno.ENOENT }
-            at = next
-        }
-        if !self.*.nodes[at].isDirectory() { return Errno.ENOTDIR }
-        return @intCast(isize, at)
+        const at = self.walk(base, path, start, true, 0)
+        if at < 0 { return at }
+        if !self.*.nodes[@bitCast(usize, at)].isDirectory() { return Errno.ENOTDIR }
+        return at
     }
 
     // The path of the directory `directory` into `into` (NUL-terminated):

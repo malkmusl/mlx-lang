@@ -128,6 +128,11 @@ pub const FileCalls = struct {
     const AT_FDCWD: isize = -100
     const AT_REMOVEDIR: usize = 0x200
     const AT_EMPTY_PATH: usize = 0x1000
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100
+    const AT_SYMLINK_FOLLOW: usize = 0x400
+    const S_IFMT: usize = 0xF000
+    const S_IFIFO: usize = 0x1000
+    const S_IFREG: usize = 0x8000
     const RENAME_NOREPLACE: usize = 1
     const X_OK: usize = 1
     const EXECUTE_BITS: usize = 0x49
@@ -151,7 +156,8 @@ pub const FileCalls = struct {
         if number == FileNumber.OPEN { return open(p, AT_FDCWD, a1, a2, a3) }
         if number == FileNumber.OPENAT { return open(p, fd, a2, a3, a4) }
         if number == FileNumber.CREAT { return open(p, AT_FDCWD, a1, Open.CREATE | Open.WRITE_ONLY | Open.TRUNCATE, a2) }
-        if number == FileNumber.STAT || number == FileNumber.LSTAT { return statusOf(p, AT_FDCWD, a1, 0, a2, false) }
+        if number == FileNumber.STAT { return statusOf(p, AT_FDCWD, a1, 0, a2, false) }
+        if number == FileNumber.LSTAT { return statusOf(p, AT_FDCWD, a1, AT_SYMLINK_NOFOLLOW, a2, false) }
         if number == FileNumber.FSTAT { return statusOfDescriptor(p, fd, a2, false) }
         if number == FileNumber.NEWFSTATAT { return statusOf(p, fd, a2, a4, a3, false) }
         if number == FileNumber.STATX { return statusOf(p, fd, a2, a3, a5, true) }
@@ -174,10 +180,13 @@ pub const FileCalls = struct {
         if number == FileNumber.RENAME { return rename(p, AT_FDCWD, a1, AT_FDCWD, a2, 0) }
         if number == FileNumber.RENAMEAT { return rename(p, fd, a2, descriptor(a3), a4, 0) }
         if number == FileNumber.RENAMEAT2 { return rename(p, fd, a2, descriptor(a3), a4, a5) }
-        if number == FileNumber.LINK { return link(p, AT_FDCWD, a1, AT_FDCWD, a2) }
-        if number == FileNumber.LINKAT { return link(p, fd, a2, descriptor(a3), a4) }
-        // No symbolic links, no device files made by programs.
-        if number == FileNumber.SYMLINK || number == FileNumber.SYMLINKAT || number == FileNumber.MKNOD || number == FileNumber.MKNODAT { return Errno.EPERM }
+        if number == FileNumber.LINK { return link(p, AT_FDCWD, a1, AT_FDCWD, a2, 0) }
+        if number == FileNumber.LINKAT { return link(p, fd, a2, descriptor(a3), a4, a5) }
+        if number == FileNumber.SYMLINK { return symbolicLink(p, a1, AT_FDCWD, a2) }
+        if number == FileNumber.SYMLINKAT { return symbolicLink(p, a1, descriptor(a2), a3) }
+        // FIFOs and files; no device files made by programs.
+        if number == FileNumber.MKNOD { return makeNode(p, AT_FDCWD, a1, a2) }
+        if number == FileNumber.MKNODAT { return makeNode(p, fd, a2, a3) }
         if number == FileNumber.READLINK { return readLink(p, AT_FDCWD, a1, a2, a3) }
         if number == FileNumber.READLINKAT { return readLink(p, fd, a2, a3, a4) }
         if number == FileNumber.TRUNCATE { return truncatePath(p, a1, a2) }
@@ -194,7 +203,11 @@ pub const FileCalls = struct {
             return setMode(node, a2)
         }
         // One user: owners stay.
-        if number == FileNumber.CHOWN || number == FileNumber.LCHOWN { return exists(p, AT_FDCWD, a1) }
+        if number == FileNumber.CHOWN { return exists(p, AT_FDCWD, a1) }
+        if number == FileNumber.LCHOWN {
+            const found = resolveLink(p, AT_FDCWD, a1)
+            return if found < 0 { found } else { 0 }
+        }
         if number == FileNumber.FCHOWNAT { return exists(p, fd, a2) }
         if number == FileNumber.FCHOWN { return if p.*.files.get(fd) == null { Errno.EBADF } else { 0 } }
         if number == FileNumber.UTIMENSAT { return setTimes(p, fd, a2, a3, a4) }
@@ -251,15 +264,21 @@ pub const FileCalls = struct {
         return @intCast(isize, node)
     }
 
-    // The node a path argument names; -errno (EFAULT when it is not the
-    // process's).
-    pub fn resolve(p: *Process, dirfd: isize, path: usize) -> isize {
+    // The node a path argument names, links followed; -errno (EFAULT when
+    // it is not the process's).
+    pub fn resolve(p: *Process, dirfd: isize, path: usize) -> isize { return resolveWith(p, dirfd, path, true) }
+
+    // The same, a link as the last component that link.
+    fn resolveLink(p: *Process, dirfd: isize, path: usize) -> isize { return resolveWith(p, dirfd, path, false) }
+
+    fn resolveWith(p: *Process, dirfd: isize, path: usize, follow: bool) -> isize {
         if !p.prepareString(path) { return Errno.EFAULT }
         if isSelfExe(Bytes.pointer(path)) { return if p.*.program == Vfs.NONE { Errno.ENOENT } else { @intCast(isize, p.*.program) } }
         const text = Compat.native(Bytes.pointer(path), translationBuffer(0))
         if text[0] == 0 { return Errno.ENOENT }
         const from = if text[0] == 47 { @intCast(isize, Vfs.ROOT) } else { base(p, dirfd) }
         if from < 0 { return from }
+        if !follow { return vfs.fileSystem().resolveLink(@bitCast(usize, from), text) }
         return vfs.fileSystem().resolve(@bitCast(usize, from), text)
     }
 
@@ -289,8 +308,12 @@ pub const FileCalls = struct {
 
     fn open(p: *Process, dirfd: isize, path: usize, flags: usize, mode: usize) -> isize {
         const tree = vfs.fileSystem()
-        var found = resolve(p, dirfd, path)
+        // O_CREAT|O_EXCL and O_NOFOLLOW: a link is not followed (it is
+        // there; it is not opened).
+        const follow = flags & Open.NO_FOLLOW == 0 && !(flags & Open.CREATE != 0 && flags & Open.EXCLUSIVE != 0)
+        var found = resolveWith(p, dirfd, path, follow)
         if found >= 0 && flags & Open.CREATE != 0 && flags & Open.EXCLUSIVE != 0 { return Vfs.EEXIST }
+        if found >= 0 && tree.node(@bitCast(usize, found)).isLink() { return Errno.ELOOP }
         if found == Errno.ENOENT && flags & Open.CREATE != 0 {
             var name: []const u8 = undefined
             const directory = resolveParent(p, dirfd, path, &name, 0)
@@ -315,6 +338,7 @@ pub const FileCalls = struct {
         if n.*.readOnly && (Open.writes(flags) || flags & Open.TRUNCATE != 0) { return Errno.EROFS }
         // The disk is the volume's while it is mounted.
         if n.*.kind == NodeKind.disk && volume.store().*.mounted && Open.writes(flags) { return Vfs.EBUSY }
+        if n.*.kind == NodeKind.fifo { return p.*.files.openFifo(node, flags) }
         if flags & Open.TRUNCATE != 0 && Open.writes(flags) && n.isRegular() {
             const truncated = tree.truncate(node, 0)
             if truncated < 0 { return truncated }
@@ -332,7 +356,7 @@ pub const FileCalls = struct {
             }
             return p.*.files.status(dirfd, Bytes.pointer(address), statx)
         }
-        const found = resolve(p, dirfd, path)
+        const found = resolveWith(p, dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)
         if found < 0 { return found }
         files.Status.ofNode(@bitCast(usize, found), Bytes.pointer(address), statx)
         return 0
@@ -437,8 +461,10 @@ pub const FileCalls = struct {
         return tree.unlink(@bitCast(usize, from), oldName.pointer, oldName.length)
     }
 
-    fn link(p: *Process, oldDirfd: isize, oldPath: usize, newDirfd: isize, newPath: usize) -> isize {
-        const found = resolve(p, oldDirfd, oldPath)
+    // link, linkat (a link as the source is linked itself unless
+    // AT_SYMLINK_FOLLOW).
+    fn link(p: *Process, oldDirfd: isize, oldPath: usize, newDirfd: isize, newPath: usize, flags: usize) -> isize {
+        const found = resolveWith(p, oldDirfd, oldPath, flags & AT_SYMLINK_FOLLOW != 0)
         if found < 0 { return found }
         const node = @bitCast(usize, found)
         if vfs.fileSystem().node(node).isDirectory() { return Errno.EPERM }
@@ -450,12 +476,70 @@ pub const FileCalls = struct {
         return vfs.fileSystem().link(@bitCast(usize, directory), name.pointer, name.length, node)
     }
 
-    // readlink: only /proc/self/exe is a link (to the program's path).
+    // A new node of `kind` named by a path: its index, or -errno.
+    fn makeNamed(p: *Process, dirfd: isize, path: usize, kind: NodeKind, mode: usize) -> isize {
+        const tree = vfs.fileSystem()
+        var name: []const u8 = undefined
+        const directory = resolveParent(p, dirfd, path, &name, 1)
+        if directory < 0 { return directory }
+        if name.length == 0 || isDot(name) { return Vfs.EEXIST }
+        if changeable(@bitCast(usize, directory)) < 0 { return Errno.EROFS }
+        if tree.lookup(@bitCast(usize, directory), name.pointer, name.length) != Vfs.NONE { return Vfs.EEXIST }
+        const made = tree.create(kind, mode)
+        if made == Vfs.NONE { return Vfs.ENOSPC }
+        // Held until it is linked (a failed link frees it).
+        tree.retain(made)
+        const linked = tree.link(@bitCast(usize, directory), name.pointer, name.length, made)
+        if linked < 0 {
+            tree.release(made)
+            return linked
+        }
+        tree.release(made)
+        return @intCast(isize, made)
+    }
+
+    // symlink, symlinkat: a link holding `target` as it is.
+    fn symbolicLink(p: *Process, target: usize, dirfd: isize, path: usize) -> isize {
+        if !p.prepareString(target) { return Errno.EFAULT }
+        const text = Bytes.pointer(target)
+        var length: usize = 0
+        while text[length] != 0 { length += 1 }
+        if length == 0 { return Errno.ENOENT }
+        if length >= memory.Page.SIZE { return Errno.ENAMETOOLONG }
+        const made = makeNamed(p, dirfd, path, NodeKind.symlink, 0x1FF)
+        if made < 0 { return made }
+        const node = @bitCast(usize, made)
+        const written = vfs.fileSystem().write(node, 0, text, length)
+        if written < 0 {
+            var name: []const u8 = undefined
+            const directory = resolveParent(p, dirfd, path, &name, 1)
+            if directory >= 0 { _ = vfs.fileSystem().unlink(@bitCast(usize, directory), name.pointer, name.length) }
+            return written
+        }
+        return 0
+    }
+
+    // mknod, mknodat: a FIFO, or an empty file.
+    fn makeNode(p: *Process, dirfd: isize, path: usize, mode: usize) -> isize {
+        const format = mode & S_IFMT
+        if format != S_IFIFO && format != S_IFREG && format != 0 { return Errno.EPERM }
+        const made = makeNamed(p, dirfd, path, if format == S_IFIFO { NodeKind.fifo } else { NodeKind.file }, mode & 0xFFF & ~p.*.umask)
+        return if made < 0 { made } else { 0 }
+    }
+
+    // readlink: a link's target; /proc/self/exe's is the program's path.
     fn readLink(p: *Process, dirfd: isize, path: usize, address: usize, capacity: usize) -> isize {
         if !p.prepareString(path) { return Errno.EFAULT }
         if !isSelfExe(Bytes.pointer(path)) {
-            const found = resolve(p, dirfd, path)
-            return if found < 0 { found } else { Errno.EINVAL }
+            const found = resolveLink(p, dirfd, path)
+            if found < 0 { return found }
+            const node = @bitCast(usize, found)
+            const tree = vfs.fileSystem()
+            if !tree.node(node).isLink() { return Errno.EINVAL }
+            const size = tree.node(node).*.size
+            const count = if size > capacity { capacity } else { size }
+            if !p.prepare(address, count) { return Errno.EFAULT }
+            return @intCast(isize, tree.read(node, 0, Bytes.pointer(address), count))
         }
         if p.*.program == Vfs.NONE { return Errno.ENOENT }
         var buffer: [512]u8 = undefined

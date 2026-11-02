@@ -54,6 +54,17 @@ of Unix's paths. The system call layer, not the tree, maps them:
 → /system/settings/users and groups, `/proc/self/exe` → the program the
 process runs. `ls /` shows only brixOS's own directories.
 
+Besides files and directories the tree holds symbolic links (a link's
+target is its data; `Vfs.walk` follows links in the middle of a path,
+and the last one unless lstat, readlink, O_NOFOLLOW or O_CREAT|O_EXCL
+ask for the link; 40 at most, then ELOOP) and FIFOs (mkfifo, mknod: a
+pipe while one is open; a read waits for the first writer, a write for
+the first reader). Both are stored on brixfs too.
+
+All 73 programs of projects/coreutils are in the boot archive;
+tools/check_brix.sh runs each (tools/brix_programs.sh) in brixOS and on
+the host and compares what they print.
+
 ## Copy on write
 
 A physical page counts who holds it (`Frames.share`, `Frames.free`):
@@ -106,7 +117,8 @@ is written over.
   and the snapshot table.
 - The inode table: a root block of 512 inode block numbers, 16 inodes of
   256 bytes each. A file's data: 12 direct blocks, an indirect block, a
-  double indirect one; a directory's: 64-byte entries (inode, name).
+  double indirect one; a directory's: 64-byte entries (inode, name); a
+  symbolic link's: its target; a FIFO has none.
 - A commit writes what changed into free blocks: of a changed file the
   pages written since the last commit (each page of the tree carries a
   changed mark) and the pointer blocks naming them, the rest keeps its
@@ -240,8 +252,9 @@ Not there yet: a timer (a program that computes without a system call
 keeps the processor; Ctrl-C reaches only what reads the terminal or
 waits), signal handlers (signals end a process or are dropped; job
 control's stops do not stop), interrupts at all (the PICs are masked;
-the serial line and the clocks are polled), symbolic links, users and
-permissions that are checked, more than one CPU, an EFI loader.
+the serial line and the clocks are polled), users and permissions that
+are checked, a FIFO opened to read and write at once, more than one CPU,
+an EFI loader.
 
 ## Next
 
