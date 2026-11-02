@@ -944,18 +944,23 @@ EOF
 read -r red blue <<< "$decoded"
 (( red >= 500 && blue >= 500 )) || fail "the H.265 video's box does not show its pictures (${red:-?} red and ${blue:-?} blue pixels; the CPU's H.265 decoder did not run?)"
 echo "ok   an H.265 video plays by itself and ends at $ended s: the page green then blue, the video showing its colour bars (decoded on the CPU by std.h265.decode)"
-# 27: typing into a text area of a generic font family (edit.html,
-# sans-serif as Google's search box) and a Backspace: the delete
-# command copies the computed font-family into the typing style, which
-# asks the CSS value pool for each family (WebCore's name tables must
-# be initialized: a generic family that was a null string was the
-# pool's key, Voyager dying on the first Backspace in Google's search
-# box). The page's title tells the text after each change.
+# 27: typing into text areas (edit.html) and a Backspace in each: the
+# delete command copies the computed font-family into the typing style,
+# which asks the CSS value pool for each family. The top area's font is
+# sans-serif, as Google's search box (WebCore's name tables must be
+# initialized: a generic family that was a null string was the pool's
+# key, Voyager dying on the first Backspace in Google's search box); the
+# bottom one's -webkit-body, as YouTube's (the page settings' standard
+# family: empty, it was a null family, Voyager dying on a Backspace in
+# YouTube's search box). The page's title tells the text after each
+# change.
 write_runner "$work/voyager-edit" edit.html
-printf 'wait 5000\npointer %d %d\npress 272\nrelease 272\nwait 800\ntype ab\nwait 800\ndown 14\nup 14\nwait 1500\nclose\n' $(( page_x0 + 300 )) $(( page_y0 + 300 )) > "$work/edit.script"
+printf 'wait 5000\npointer %d %d\npress 272\nrelease 272\nwait 800\ntype ab\nwait 800\ndown 14\nup 14\nwait 1500\npointer %d %d\npress 272\nrelease 272\nwait 800\ntype cd\nwait 800\ndown 14\nup 14\nwait 1500\nclose\n' $(( page_x0 + 300 )) $(( page_y0 + 100 )) $(( page_x0 + 300 )) $(( page_y0 + 500 )) > "$work/edit.script"
 run_scenario edit "$work/edit.script" "$work/voyager-edit"
 log=$work/voyager.log
-grep -q "^voyager: title edit:ab$" "$log" || { cat "$log" >&2; fail "typing into the text area did not reach it (no edit:ab title)"; }
-grep -q "^voyager: title edit:a$" "$log" || { cat "$log" >&2; fail "Backspace did not delete the last character (no edit:a title)"; }
-echo "ok   typing into a text area of a generic family and a Backspace (the typing style's font-family)"
+grep -q "^voyager: title edit:top:ab$" "$log" || { cat "$log" >&2; fail "typing into the top text area did not reach it (no edit:top:ab title)"; }
+grep -q "^voyager: title edit:top:a$" "$log" || { cat "$log" >&2; fail "Backspace did not delete the top area's last character (no edit:top:a title)"; }
+grep -q "^voyager: title edit:bottom:cd$" "$log" || { cat "$log" >&2; fail "typing into the bottom (-webkit-body) text area did not reach it (no edit:bottom:cd title)"; }
+grep -q "^voyager: title edit:bottom:c$" "$log" || { cat "$log" >&2; fail "Backspace did not delete the bottom (-webkit-body) area's last character (no edit:bottom:c title)"; }
+echo "ok   typing into text areas of a generic family and of -webkit-body and a Backspace in each (the typing style's font-family)"
 echo "check_voyager.sh: all checks passed"

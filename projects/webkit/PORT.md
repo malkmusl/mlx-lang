@@ -1744,13 +1744,20 @@ counts and the end.
 tools/check_voyager.sh's scenario 26 plays WebKit's test.mp4 (6 s of
 H.264 with a silent AAC track) by itself in Voyager
 (projects/voyager/tests/media.html: the page turns green on `playing`,
-blue on `ended`, and tells the end's time in its title). Scenario 27
-types into a text area of a generic font family and presses Backspace
-(edit.html): the typing style copies the computed font-family, whose
-generic families are WebCore's name tables, which
+blue on `ended`, and tells the end's time in its title; its H.265
+twin, hevc.html, plays a small hvc1 file decoded by std.h265.decode).
+Scenario 27 types into two text areas and presses Backspace in each
+(edit.html): the typing style copies the computed font-family, which
+must hold no null family (the CSS value pool's key). The top area's is a
+generic family, whose names are WebCore's name tables, which
 `MlxPlatformStrategies::initialize` sets up as WebKit's process warming
-does (`ProcessWarming::initializeNames`; without them `sans-serif`
-was a null string, the CSS value pool's key).
+does (`ProcessWarming::initializeNames`; without them `sans-serif` was
+a null string: Google's search box); the bottom one's is
+`-webkit-body`, the page settings' standard family, which Voyager's
+engine sets with the other generic families' to Fontconfig's aliases
+(`serif`, `sans-serif`, `monospace`, ...: what the port's FontCache gives
+them anyway; WebCore's defaults are empty, and an empty standard family
+was a null string: YouTube's search box).
 
 On a machine with a video decoder (RADV's RX 580: Voyager asks RADV for
 it, see above; vulkaninfo and vulkan-decode need

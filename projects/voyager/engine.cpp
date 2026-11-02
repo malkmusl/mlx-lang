@@ -621,6 +621,19 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     settings.setLocalStorageEnabled(true);
     settings.setSessionStorageEnabled(true);
     settings.setDownloadAttributeEnabled(true);
+    // The generic families' fonts, as Fontconfig's aliases (what the
+    // port's FontCache gives the generic families anyway, so pages look
+    // the same). WebCore's defaults are empty (WebKit's UI process sets
+    // them): `font-family: -webkit-body` (YouTube's search box) was then a
+    // null family, which a Backspace's typing style handed the CSS value
+    // pool as a key, Voyager dying.
+    settings.setStandardFontFamily("serif"_s);
+    settings.setSerifFontFamily("serif"_s);
+    settings.setSansSerifFontFamily("sans-serif"_s);
+    settings.setFixedFontFamily("monospace"_s);
+    settings.setCursiveFontFamily("cursive"_s);
+    settings.setFantasyFontFamily("fantasy"_s);
+    settings.setPictographFontFamily("serif"_s);
     tab->frame = tab->page->localMainFrame();
     if (!tab->frame || !tab->client)
         return nullptr;
