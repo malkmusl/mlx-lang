@@ -122,6 +122,12 @@ pub const Decoder = struct {
     // The layer's picture is in its part of the readback buffer.
     layerRead: [MAX_LAYERS]bool
     frameBytes: u64
+    // A 10-bit session (H.265 Main 10): the pictures P010-like, two bytes
+    // a sample (G10X6_B10X6R10X6_2PLANE_420), read back by the host and
+    // rounded to 8 bits in `narrow` before the conversion.
+    wide: bool
+    narrow: [*]u8
+    narrowBytes: usize
     outputImage: vk.Image
     outputMemory: vk.DeviceMemory
     outputView: vk.ImageView
@@ -242,6 +248,7 @@ pub fn destroy(d: *Decoder) -> void {
     destroySession(d)
     if d.*.fence != 0 { vk.destroyFence(context.*.commands, context.*.device, d.*.fence, null) }
     if d.*.commandPool != 0 { vk.destroyCommandPool(context.*.commands, context.*.device, d.*.commandPool, null) }
+    if d.*.narrowBytes != 0 { d.*.allocator.free(d.*.narrow, d.*.narrowBytes, 16) }
     unsafe { d.*.allocator.free(@ptrCast([*]u8, d), @sizeOf(Decoder), 16) }
 }
 
@@ -320,8 +327,9 @@ fn queryProfile(d: *Decoder, codec: u32, profileIdc: u32) -> bool {
         d.*.profile.videoCodecOperation = vk.VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR
     }
     d.*.profile.chromaSubsampling = vk.VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR
-    d.*.profile.lumaBitDepth = vk.VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR
-    d.*.profile.chromaBitDepth = vk.VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR
+    const depth = if d.*.wide { vk.VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR } else { vk.VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR }
+    d.*.profile.lumaBitDepth = depth
+    d.*.profile.chromaBitDepth = depth
     d.*.profileList = vk.VideoProfileListInfoKHR.init()
     d.*.profileList.profileCount = 1
     d.*.profileList.pProfiles = &d.*.profile
@@ -344,7 +352,7 @@ fn queryProfile(d: *Decoder, codec: u32, profileIdc: u32) -> bool {
 }
 
 // The picture format the device offers for `usage` with the profile:
-// NV12 (G8_B8R8_2PLANE_420) wanted.
+// NV12 (G8_B8R8_2PLANE_420) wanted, its 10-bit form for a wide session.
 fn pictureFormat(d: *Decoder, usage: vk.ImageUsageFlags, format: *vk.Format) -> bool {
     const context = d.*.context
     var info = vk.PhysicalDeviceVideoFormatInfoKHR.init()
@@ -363,7 +371,8 @@ fn pictureFormat(d: *Decoder, usage: vk.ImageUsageFlags, format: *vk.Format) -> 
     if vk.getPhysicalDeviceVideoFormatPropertiesKHR(context.*.instanceCommands, context.*.physical, &info, &count, &properties) != vk.Result.success { return false }
     index = 0
     while index < count {
-        if properties[index].format == vk.Format.g8B8r82plane420Unorm {
+        const wanted = if d.*.wide { vk.Format.g10x6B10x6r10x62plane420Unorm3pack16 } else { vk.Format.g8B8r82plane420Unorm }
+        if properties[index].format == wanted {
             format.* = properties[index].format
             return true
         }
@@ -478,23 +487,26 @@ fn alignUp(value: u32, granularity: u32) -> u32 {
 fn ensureSession(d: *Decoder, sps: *const h264.Sps) -> Status {
     if sps.*.std.chroma_format_idc != 1 || sps.*.std.bit_depth_luma_minus8 != 0 || sps.*.std.bit_depth_chroma_minus8 != 0 { return Status.unsupported }
     if !sps.*.frameMbsOnly { return Status.unsupported }
-    return openSession(d, CODEC_H264, sps.*.std.profile_idc, sps.*.widthInMbs * 16, sps.*.heightInMbs * 16, sps.*.dpbFrames + 2)
+    return openSession(d, CODEC_H264, sps.*.std.profile_idc, sps.*.widthInMbs * 16, sps.*.heightInMbs * 16, sps.*.dpbFrames + 2, false)
 }
 
 fn ensureSessionH265(d: *Decoder, sps: *const h265.Sps) -> Status {
-    if sps.*.std.chroma_format_idc != 1 || sps.*.std.bit_depth_luma_minus8 != 0 || sps.*.std.bit_depth_chroma_minus8 != 0 { return Status.unsupported }
-    return openSession(d, CODEC_H265, sps.*.tierLevel.general_profile_idc, sps.*.width, sps.*.height, sps.*.dpbPictures + 2)
+    // 4:2:0, 8 bits (Main) or 10 (Main 10).
+    if sps.*.std.chroma_format_idc != 1 || sps.*.std.bit_depth_luma_minus8 != sps.*.std.bit_depth_chroma_minus8 { return Status.unsupported }
+    if sps.*.std.bit_depth_luma_minus8 != 0 && sps.*.std.bit_depth_luma_minus8 != 2 { return Status.unsupported }
+    return openSession(d, CODEC_H265, sps.*.tierLevel.general_profile_idc, sps.*.width, sps.*.height, sps.*.dpbPictures + 2, sps.*.std.bit_depth_luma_minus8 == 2)
 }
 
 // A session for `codec`'s profile, pictures up to the size and `layers`
 // DPB pictures: the one there when it suffices, else made anew.
-fn openSession(d: *Decoder, codec: u32, profileIdc: u32, neededWidth: u32, neededHeight: u32, layers: u32) -> Status {
+fn openSession(d: *Decoder, codec: u32, profileIdc: u32, neededWidth: u32, neededHeight: u32, layers: u32, wide: bool) -> Status {
     const context = d.*.context
     var neededLayers = layers
     if neededLayers > @intCast(u32, MAX_LAYERS) { neededLayers = @intCast(u32, MAX_LAYERS) }
-    if d.*.session != 0 && d.*.codec == codec && d.*.streamProfile == profileIdc && d.*.codedWidth >= neededWidth && d.*.codedHeight >= neededHeight && d.*.layers >= neededLayers { return Status.ok }
+    if d.*.session != 0 && d.*.codec == codec && d.*.streamProfile == profileIdc && d.*.wide == wide && d.*.codedWidth >= neededWidth && d.*.codedHeight >= neededHeight && d.*.layers >= neededLayers { return Status.ok }
     _ = vk.deviceWaitIdle(context.*.commands, context.*.device)
     destroySession(d)
+    d.*.wide = wide
     // The profile: the SPS's, else (H.264) Main or High: a Constrained
     // Baseline stream decodes as Main on devices without Baseline; (H.265)
     // Main for Main Still Picture.
@@ -597,8 +609,8 @@ fn openSession(d: *Decoder, codec: u32, profileIdc: u32, neededWidth: u32, neede
         if !createImage(d, codedWidth, codedHeight, 1, outputUsage, &d.*.outputImage, &d.*.outputMemory) { return Status.outOfMemory }
         if !createView(d, d.*.outputImage, 0, &d.*.outputView) { return Status.failed }
     }
-    d.*.frameBytes = @intCast(u64, codedWidth) * @intCast(u64, codedHeight) * 3 / 2
-    if d.*.kernelReady {
+    d.*.frameBytes = @intCast(u64, codedWidth) * @intCast(u64, codedHeight) * 3 / 2 * (if wide { @intCast(u64, 2) } else { @intCast(u64, 1) })
+    if d.*.kernelReady && !wide {
         if !gpu.createDeviceBuffer(context, &d.*.nv12, d.*.frameBytes * @intCast(u64, neededLayers)) { return Status.outOfMemory }
         if !gpu.createReadbackBuffer(context, &d.*.bgra, @intCast(u64, codedWidth) * @intCast(u64, codedHeight) * 4) { return Status.outOfMemory }
     } else {
@@ -1169,7 +1181,7 @@ fn readBack(d: *Decoder, layer: u32) -> bool {
     toTransfer.subresourceRange.layerCount = 1
     vk.cmdPipelineBarrier(commands, command_buffer, vk.PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &toTransfer)
     const base = d.*.frameBytes * @intCast(u64, layer)
-    const lumaBytes = @intCast(u64, d.*.pictureWidth) * @intCast(u64, d.*.pictureHeight)
+    const lumaBytes = @intCast(u64, d.*.pictureWidth) * @intCast(u64, d.*.pictureHeight) * (if d.*.wide { @intCast(u64, 2) } else { @intCast(u64, 1) })
     var regions: [2]vk.BufferImageCopy = undefined
     regions[0] = vk.BufferImageCopy.init()
     regions[0].bufferOffset = base
@@ -1222,6 +1234,7 @@ pub fn readFrame(d: *Decoder, slot: usize, out: [*]u8, stride: usize) -> bool {
     const chromaOffset = base + lumaBytes + @intCast(usize, d.*.cropY) / 2 * lumaStride + @intCast(usize, d.*.cropX) / 2 * 2
     const width_ = @intCast(usize, d.*.width)
     const height_ = @intCast(usize, d.*.height)
+    if d.*.wide { return readWide(d, base, out, stride) }
     if d.*.kernelReady {
         if !convertOnGpu(d.*.context, &d.*.kernel, &d.*.conversion, d.*.nv12.buffer, lumaOffset, lumaStride, chromaOffset, lumaStride, width_, height_, d.*.bgra.buffer, 0, width_) { return false }
         const pixels: [*]const u8 = unsafe { @ptrFromInt([*]const u8, d.*.bgra.address) }
@@ -1238,6 +1251,58 @@ pub fn readFrame(d: *Decoder, slot: usize, out: [*]u8, stride: usize) -> bool {
     }
     const pixels: [*]const u8 = unsafe { @ptrFromInt([*]const u8, d.*.nv12.address) }
     convertNv12(&d.*.conversion, &pixels[lumaOffset], lumaStride, &pixels[chromaOffset], lumaStride, width_, height_, out, stride)
+    return true
+}
+
+// readFrame() of a 10-bit session: the visible part of the layer's
+// picture at `base` rounded to 8 bits (NV12 in `narrow`), then converted.
+fn readWide(d: *Decoder, base: usize, out: [*]u8, stride: usize) -> bool {
+    const width_ = @intCast(usize, d.*.width)
+    const height_ = @intCast(usize, d.*.height)
+    const wanted = width_ * height_ + (width_ + 1) / 2 * 2 * ((height_ + 1) / 2)
+    if wanted > d.*.narrowBytes {
+        if d.*.narrowBytes != 0 { d.*.allocator.free(d.*.narrow, d.*.narrowBytes, 16) }
+        d.*.narrowBytes = 0
+        const memory = d.*.allocator.alloc(wanted, 16)
+        if memory == null { return false }
+        d.*.narrow = memory.?
+        d.*.narrowBytes = wanted
+    }
+    const samples: [*]const u16 = unsafe { @ptrFromInt([*]const u16, d.*.nv12.address + base) }
+    const pictureWidth = @intCast(usize, d.*.pictureWidth)
+    const cropX = @intCast(usize, d.*.cropX)
+    const cropY = @intCast(usize, d.*.cropY)
+    const narrow = d.*.narrow
+    // Luma, then the interleaved chroma (16-bit samples, the value in the
+    // top 10 bits): (v + 128) >> 8 is the 10-bit value rounded to 8.
+    var row: usize = 0
+    while row < height_ {
+        const from = (cropY + row) * pictureWidth + cropX
+        var column: usize = 0
+        while column < width_ {
+            var value = (@intCast(u32, samples[from + column]) + 128) >> 8
+            if value > 255 { value = 255 }
+            narrow[row * width_ + column] = @intCast(u8, value)
+            column += 1
+        }
+        row += 1
+    }
+    const chromaBase = pictureWidth * @intCast(usize, d.*.pictureHeight)
+    const chromaWidth = (width_ + 1) / 2 * 2
+    const chromaAt = width_ * height_
+    row = 0
+    while row < (height_ + 1) / 2 {
+        const from = chromaBase + (cropY / 2 + row) * pictureWidth + cropX / 2 * 2
+        var column: usize = 0
+        while column < chromaWidth {
+            var value = (@intCast(u32, samples[from + column]) + 128) >> 8
+            if value > 255 { value = 255 }
+            narrow[chromaAt + row * chromaWidth + column] = @intCast(u8, value)
+            column += 1
+        }
+        row += 1
+    }
+    convertNv12(&d.*.conversion, narrow, width_, &narrow[chromaAt], chromaWidth, width_, height_, out, stride)
     return true
 }
 

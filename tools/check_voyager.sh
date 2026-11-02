@@ -895,6 +895,55 @@ EOF
 read -r white yellow <<< "$decoded"
 (( white >= 1000 && yellow >= 100 )) || fail "the video's box does not show its pictures (${white:-?} white and ${yellow:-?} yellow pixels; the CPU's decoder did not run?)"
 echo "ok   a video plays by itself and ends at $ended s: the page green then blue, the video's box ${fw}x${fh} showing its pictures (decoded on the CPU)"
+# 26b: an H.265 video playing by itself (hevc.html: 3 s of testsrc,
+# 320x240, hvc1; no GPU decoder on lavapipe, so std.h265.decode decodes
+# it on the CPU): the page reports playing and the end through its title
+# and its background, and the video's box shows its colour bars (red and
+# blue pixels in the page, which is green while it plays).
+write_runner "$work/voyager-hevc" hevc.html
+printf 'wait 3000\nshot %s\nwait 6000\nshot %s\nclose\n' "$work/hevc-playing.ppm" "$work/hevc-ended.ppm" > "$work/hevc.script"
+run_scenario hevc "$work/hevc.script" "$work/voyager-hevc"
+log=$work/voyager.log
+grep -q "^voyager: title hevc:playing" "$log" || { cat "$log" >&2; fail "the H.265 video did not start playing (no hevc:playing title)"; }
+ended=$(grep -o "^voyager: title hevc:ended:[0-9]*" "$log" | tail -1 | cut -d: -f4)
+[[ -n "$ended" ]] && (( ended >= 2 && ended <= 4 )) || { cat "$log" >&2; fail "the H.265 video did not end at its 3 s (${ended:-no end})"; }
+page=$(box_of "$work/hevc-playing.ppm" 00c000)
+read -r px py pw ph <<< "$page"
+[[ -n "$page" ]] || fail "the page was not green while the H.265 video played"
+[[ -n "$(box_of "$work/hevc-ended.ppm" 0000c0)" ]] || fail "the page was not blue after the H.265 video ended"
+decoded=$(python3 -I - "$work/hevc-playing.ppm" "$px" "$py" "$pw" "$ph" << 'EOF'
+import sys
+path = sys.argv[1]
+x0, y0, w, h = (int(v) for v in sys.argv[2:6])
+data = open(path, "rb").read()
+fields, at = [], 0
+while len(fields) < 4:
+    while data[at:at + 1].isspace():
+        at += 1
+    if data[at:at + 1] == b"#":
+        at = data.index(b"\n", at)
+        continue
+    end = at
+    while not data[end:end + 1].isspace():
+        end += 1
+    fields.append(data[at:end])
+    at = end
+width = int(fields[1])
+pixels = data[at + 1:]
+red = blue = 0
+for y in range(y0, y0 + h):
+    for x in range(x0, x0 + w):
+        r, g, b = pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+        if r > 180 and g < 80 and b < 80:
+            red += 1
+        elif b > 180 and r < 80 and g < 80:
+            blue += 1
+print(red, blue)
+EOF
+)
+read -r red blue <<< "$decoded"
+(( red >= 500 && blue >= 500 )) || fail "the H.265 video's box does not show its pictures (${red:-?} red and ${blue:-?} blue pixels; the CPU's H.265 decoder did not run?)"
+echo "ok   an H.265 video plays by itself and ends at $ended s: the page green then blue, the video showing its colour bars (decoded on the CPU by std.h265.decode)"
 # 27: typing into a text area of a generic font family (edit.html,
 # sans-serif as Google's search box) and a Backspace: the delete
 # command copies the computed font-family into the typing style, which

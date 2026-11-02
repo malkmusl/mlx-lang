@@ -3,7 +3,7 @@
 // H.264 access units kept in order by std.h264 (parameter sets, picture
 // order, the decoded picture buffer), the pictures decoded by the GPU's
 // video decoder through std.gpu.video (Vulkan video) or, without one, on
-// the CPU by std.h264.decode, and sound played
+// the CPU by std.h264.decode (H.265: std.h265.decode), and sound played
 // through std.audio (MLX Audio). Every object lives on the C library's
 // heap; a handle is its address.
 const std = @import("std")
@@ -15,6 +15,7 @@ const audio = @import("std.audio")
 const gpu = @import("std.gpu")
 const gvideo = @import("std.gpu.video")
 const hdecode = @import("std.h264.decode")
+const hevcdecode = @import("std.h265.decode")
 const vkvideo = @import("std.vulkan.video")
 const loader = @import("std.vulkan.loader")
 const environment_module = @import("./environment.mlx")
@@ -452,6 +453,14 @@ const VideoDecoder = struct {
     // frames are read with: the visible part of the picture and the
     // colour conversion.
     cpu: *hdecode.Pool
+    // H.265 on the CPU (std.h265.decode's pool, made at the first H.265
+    // picture the GPU's decoder cannot take); whether the last picture
+    // was decoded there.
+    hevc: *hevcdecode.Pool
+    hasHevc: bool
+    hevcOnCpu: bool
+    // Whether the GPU's decoder takes H.265: 0 not asked yet, 1 yes, 2 no.
+    gpuHevc: u32
     width: u32
     height: u32
     cropX: u32
@@ -471,6 +480,9 @@ pub fn videoOpen() -> usize {
     if address == 0 { return 0 }
     const v = videoAt(address)
     v.*.kind = 0
+    v.*.hasHevc = false
+    v.*.hevcOnCpu = false
+    v.*.gpuHevc = 0
     v.*.width = 0
     v.*.height = 0
     v.*.matrix = 0
@@ -542,6 +554,7 @@ pub fn videoClose(address: usize) -> void {
     } else if v.*.kind == KIND_CPU {
         hdecode.destroyPool(v.*.cpu)
     }
+    if v.*.hasHevc { hevcdecode.destroyPool(v.*.hevc) }
     free(address)
 }
 
@@ -570,39 +583,25 @@ fn cpuThreads() -> usize {
 // its slot and POC stored, 0 when none is due. Without a decoder,
 // std.h264's.
 pub fn videoNextOutput(address: usize, h264Address: usize, slot: usize, poc: usize) -> u32 {
-    if address == 0 || videoAt(address).*.kind != KIND_CPU || h264Address == 0 || isHevc(h264Address) { return h264NextOutput(h264Address, slot, poc) }
+    if address == 0 || h264Address == 0 { return h264NextOutput(h264Address, slot, poc) }
+    const v = videoAt(address)
     var outSlot: usize = 0
     var outPoc: i32 = 0
-    if !hdecode.nextReady(videoAt(address).*.cpu, h264At(h264Address), &outSlot, &outPoc) { return 0 }
+    if isHevc(h264Address) {
+        if !v.*.hasHevc || !v.*.hevcOnCpu { return h264NextOutput(h264Address, slot, poc) }
+        if !hevcdecode.nextReady(v.*.hevc, h265At(h264Address), &outSlot, &outPoc) { return 0 }
+    } else {
+        if v.*.kind != KIND_CPU { return h264NextOutput(h264Address, slot, poc) }
+        if !hdecode.nextReady(v.*.cpu, h264At(h264Address), &outSlot, &outPoc) { return 0 }
+    }
     if slot != 0 { unsafe { @ptrFromInt(*u32, slot).* = @intCast(u32, outSlot) } }
     if poc != 0 { unsafe { @ptrFromInt(*i32, poc).* = outPoc } }
     return 1
 }
 
-// Whether H.265 can be played: a device's video decoder takes it
-// (asked once: the driver is opened and closed again). The CPU decodes
-// H.264 only.
-var h265Known: bool = false
-var h265Decodes: bool = false
-
-pub fn videoSupportsH265() -> u32 {
-    if !h265Known {
-        h265Known = true
-        const address = malloc(@sizeOf(VideoDecoder))
-        if address != 0 {
-            const v = videoAt(address)
-            if openGpu(v) {
-                h265Decodes = gvideo.supportedH265(&v.*.context)
-                gvideo.destroy(v.*.decoder)
-                gpu.close(&v.*.context)
-                loader.closeDriver(&v.*.driver)
-                environment_module.release(&v.*.environment)
-            }
-            free(address)
-        }
-    }
-    return if h265Decodes { 1 } else { 0 }
-}
+// Whether H.265 can be played: always (the GPU's decoder when it takes
+// it, else the CPU's: std.h265.decode, Main and Main 10).
+pub fn videoSupportsH265() -> u32 { return 1 }
 
 // Which decoder a handle is: 1 the GPU's, 2 the CPU's (0 none).
 pub fn videoKind(address: usize) -> u32 {
@@ -625,9 +624,32 @@ pub fn videoDecode(address: usize, h264Address: usize, bytes: usize) -> u32 {
     const data: [*]const u8 = unsafe { @ptrFromInt([*]const u8, bytes) }
     const v = videoAt(address)
     if isHevc(h264Address) {
-        // H.265 on the GPU only.
-        if v.*.kind != KIND_GPU { return UNSUPPORTED }
-        return videoStatus(gvideo.decodeH265(v.*.decoder, h265At(h264Address), data))
+        // The GPU's decoder when it takes H.265, else the CPU's.
+        if v.*.kind == KIND_GPU && v.*.gpuHevc == 0 { v.*.gpuHevc = if gvideo.supportedH265(&v.*.context) { 1 } else { 2 } }
+        if v.*.kind == KIND_GPU && v.*.gpuHevc == 1 {
+            const status = gvideo.decodeH265(v.*.decoder, h265At(h264Address), data)
+            if status != gvideo.Status.unsupported {
+                v.*.hevcOnCpu = false
+                return videoStatus(status)
+            }
+            // A stream the device's decoder does not take (its profile, bit
+            // depth or size: refused at its first picture): the CPU's from
+            // here on.
+            v.*.gpuHevc = 2
+        }
+        if !v.*.hasHevc {
+            const pool = hevcdecode.createPool(allocator(), cpuThreads())
+            if pool == null { return NO_MEMORY }
+            v.*.hevc = pool.?
+            v.*.hasHevc = true
+        }
+        v.*.hevcOnCpu = true
+        const hevc = h265At(h264Address)
+        const status = hevcdecode.submit(v.*.hevc, hevc, data)
+        hevcPictureFormat(v, hevc)
+        // A broken slice still leaves a picture.
+        if status == h265.Status.corrupt { return OK }
+        return h265Status(status)
     }
     if v.*.kind == KIND_GPU { return videoStatus(gvideo.decode(v.*.decoder, h264At(h264Address), data)) }
     const h = h264At(h264Address)
@@ -674,17 +696,49 @@ fn cpuPictureFormat(v: *VideoDecoder, h: *h264.Decoder) -> void {
     }
 }
 
+// The visible size, crop and colour of the CPU's H.265 pictures from
+// the SPS of the picture just decoded.
+fn hevcPictureFormat(v: *VideoDecoder, h: *h265.Decoder) -> void {
+    const sps = h265.spsAt(h, @intCast(usize, h.*.picture.spsId))
+    var left = sps.*.cropLeft
+    var right = sps.*.cropRight
+    var top = sps.*.cropTop
+    var bottom = sps.*.cropBottom
+    if left + right >= sps.*.width || top + bottom >= sps.*.height {
+        left = 0
+        right = 0
+        top = 0
+        bottom = 0
+    }
+    v.*.cropX = left
+    v.*.cropY = top
+    v.*.width = sps.*.width - left - right
+    v.*.height = sps.*.height - top - bottom
+    var matrix: u32 = 0
+    var fullRange = false
+    gvideo.streamColourH265(sps, &matrix, &fullRange)
+    if matrix != v.*.matrix || fullRange != v.*.fullRange {
+        v.*.matrix = matrix
+        v.*.fullRange = fullRange
+        gvideo.conversionFor(&v.*.conversion, matrix, fullRange)
+    }
+}
+
+// Whether the frames are the CPU's (std.h264.decode's, or
+// std.h265.decode's for the last H.265 picture).
+fn framesOnCpu(v: *VideoDecoder) -> bool { return v.*.kind == KIND_CPU || (v.*.hasHevc && v.*.hevcOnCpu) }
+
 pub fn videoWidth(address: usize) -> u32 {
     if address == 0 { return 0 }
     const v = videoAt(address)
-    if v.*.kind == KIND_CPU { return v.*.width }
+    if framesOnCpu(v) { return v.*.width }
     return gvideo.width(v.*.decoder)
 }
 
 pub fn videoHeight(address: usize) -> u32 {
     if address == 0 { return 0 }
     const v = videoAt(address)
-    if v.*.kind == KIND_CPU { return v.*.height }
+    if framesOnCpu(v) { return v.*.height }
     return gvideo.height(v.*.decoder)
 }
 
@@ -694,6 +748,21 @@ pub fn videoReadFrame(address: usize, slot: u32, out: usize, stride: usize) -> u
     if address == 0 || out == 0 { return 0 }
     const pixels: [*]u8 = unsafe { @ptrFromInt([*]u8, out) }
     const v = videoAt(address)
+    if v.*.hasHevc && v.*.hevcOnCpu {
+        if @intCast(usize, slot) >= h265.SLOTS || v.*.width == 0 { return 0 }
+        hevcdecode.awaitSlot(v.*.hevc, @intCast(usize, slot))
+        const planes = hevcdecode.poolPlanes(v.*.hevc, @intCast(usize, slot))
+        if planes.width < v.*.cropX + v.*.width || planes.height < v.*.cropY + v.*.height { return 0 }
+        var y: [*]const u8 = undefined
+        var cb: [*]const u8 = undefined
+        var cr: [*]const u8 = undefined
+        if !hevcdecode.poolPlanes8(v.*.hevc, @intCast(usize, slot), &y, &cb, &cr) { return 0 }
+        const lumaStride = @intCast(usize, planes.width)
+        const chromaStride = lumaStride / 2
+        const chromaAt = @intCast(usize, v.*.cropY / 2) * chromaStride + @intCast(usize, v.*.cropX / 2)
+        gvideo.convertI420(&v.*.conversion, &y[@intCast(usize, v.*.cropY) * lumaStride + @intCast(usize, v.*.cropX)], lumaStride, &cb[chromaAt], &cr[chromaAt], chromaStride, @intCast(usize, v.*.width), @intCast(usize, v.*.height), pixels, stride)
+        return 1
+    }
     if v.*.kind == KIND_CPU {
         if @intCast(usize, slot) >= h264.SLOTS || v.*.width == 0 { return 0 }
         hdecode.awaitSlot(v.*.cpu, @intCast(usize, slot))

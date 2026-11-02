@@ -111,8 +111,8 @@ static bool supportsCodecLowercase(const String& lower)
     // AVC in any profile, as the decoder reads every frame-coded stream.
     if (lower.startsWith("avc1"_s) || lower.startsWith("avc3"_s))
         return true;
-    // HEVC when a device's video decoder takes it (the CPU decodes AVC
-    // only).
+    // HEVC: the device's video decoder when it takes it, else the CPU's
+    // (Main and Main 10).
     if (lower.startsWith("hvc1"_s) || lower.startsWith("hev1"_s))
         return mlxweb_video_supports_h265();
     // AAC-LC, and HE-AAC played as its LC core.

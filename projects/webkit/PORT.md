@@ -1598,10 +1598,9 @@ descriptions of an initialization segment). It plays MP4: H.264
 (`avc1`, `avc3`) and AAC-LC (`mp4a.40.2`; HE-AAC as its core) in
 `video/mp4`, `audio/mp4` and `audio/aac`, which is what YouTube serves
 through MSE besides VP9/AV1 in WebM, and what a GPU of the RX 580's
-generation decodes; H.265 (`hvc1`, `hev1`, Main) when a device's video
-decoder takes it (`mlxweb_video_supports_h265` asks the driver once;
-the CPU decodes H.264 only, an H.265 video without such a device is
-black).
+generation decodes; H.265 (`hvc1`, `hev1`, Main and Main 10) on a
+device's video decoder when it takes it, else on the CPU
+(std.h265.decode, below).
 
 The Mlx side (port/mlx/media.mlx, `mlxweb_media_*` and `mlxweb_audio_*`)
 is std.mp4 (the demuxer: a whole file's sample tables with seeking, or
@@ -1705,6 +1704,39 @@ pictures given out wait in the pool, their slots held by std.h264
 thread 320x240 decodes at about 180 pictures a second and 1080p High at
 about 7; four processors decode 1080p about three times as fast, and the
 pool grows with the processors.
+
+std.h265.decode (std/src/h265/decode.mlx, with the standard's tables in
+std/src/h265/tables.mlx) decodes the pictures std.h265 starts the same
+way: the Main and Main 10 profiles
+(4:2:0 and 4:0:0, 8 to 10 bits, every picture size the levels allow, to
+8192x4320), I, P and B slices, slice segments dependent and not, tiles
+and wavefront substreams, the coding quadtree with CABAC, intra
+prediction (planar, DC, the 33 angles, the reference substitution and
+smoothing, constrained intra), inter prediction (merge with spatial,
+temporal, combined and zero candidates, the parallel merge level, AMVP,
+temporal motion vectors from the collocated picture, the 8-tap and
+4-tap interpolation, weighted prediction default and explicit),
+asymmetric partitions, PCM, transform skip, lossless coding units,
+scaling lists, sign data hiding, the DST and the inverse transforms to
+32x32, the deblocking filter and SAO. It decodes the 143 streams of the
+ITU's HEVC_v1 conformance suite that are Main or Main 10 (AMP, AMVP,
+CAINIT, CIP, CONFWIN, DBLK, DELTAQP, DSLICE, ENTP, EXT, FILLER, HRD,
+INITQP, IPRED, ipcm, LS, LTRPSPS, MAXBINS, MERGE, MVCLIP, MVDL1ZERO,
+MVEDGE, NoOutPrior, NUT, OPFLAG, PMERGE, POC, PPS, PS, RAP, RPLM, RPS,
+RQT, SAO, SAODBLK, SDH, SLICES, SLIST, SLPPLP, STRUCT, TILES, TMVP,
+TSCL, TSKIP, TSUNEQBD, TUSIZE, VPSID, VPSSPSPPS, WP, WPP) bit-exact,
+the yuv MD5s they come with; tests/424_h265_cpu_decode_runtime.mlx
+checks a Main 10 stream's output. Samples are 16-bit whatever the
+depth; `planes8` rounds them to 8 bits for the player's conversion.
+The loop filters run a CTB row behind the decoding (the row below's
+intra prediction reads the unfiltered samples), SAO a row behind the
+deblocking, so that a picture's rows are final as it goes (with tiles,
+at its end). Its `Pool` is std.h264.decode's design: the caller's
+thread reads the slice segment headers and builds the reference lists,
+a worker decodes the picture, waiting for the reference rows its motion
+compensation reads and for the collocated picture's motion rows. One
+thread decodes x265's 1080p at about 7 pictures a second, three about
+12.
 `MLX_TRACE_MEDIA=1` traces the players on standard error ("media: ..."):
 the codecs a page asks about, loads, tracks, ready and network states,
 play, pause, seeks, the decoder opened (the GPU's or the CPU's) or not, every 120th frame's
