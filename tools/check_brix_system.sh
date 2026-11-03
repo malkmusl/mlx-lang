@@ -5,7 +5,9 @@
 # the system (/system, /users and /temporary are the disk's, the same
 # nodes as /volumes/disk0's; the boot archive's programs at /volumes/boot),
 # programs run from the disk, a file written in /users/root is there after
-# yet another boot.
+# yet another boot. Users and permissions: files keep their owner and
+# group on the disk, and the kernel checks modes against the user a
+# process runs as (`as USER PROGRAM` runs one as another user).
 #
 #   tools/check_brix_system.sh [compiler]
 set -euo pipefail
@@ -31,10 +33,11 @@ mkdir -p "$work/bin"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 "$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
 "$compiler" --quiet $brix projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
-for program in ls cat cp mkdir chmod sync stat uname echo seq wc rm; do
+"$compiler" --quiet $brix projects/brix/tools/as/main.mlx -o "$work/as"
+for program in ls cat cp mkdir chmod chown sync stat uname echo seq wc rm; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "brixfs=$work/brixfs" "install=projects/brix/tools/install.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "brixfs=$work/brixfs" "as=$work/as" "install=projects/brix/tools/install.sh" "$work/bin/"
 echo "ok   the kernel and a boot image with install build"
 
 head -c 8388608 /dev/zero > "$work/disk.img"
@@ -94,15 +97,33 @@ wait_for '^written$'
 output | grep -q '^programs  settings$' || fail "the boot archive is not at /volumes/boot"
 inodes=$(output | grep -E '^[0-9]+ [0-9]+$' | head -n 1)
 [[ -n "$inodes" && ${inodes% *} == "${inodes#* }" ]] || fail "/system and /volumes/disk0/system are not the same node ($inodes)"
+# Users: a file of user 7, mode 600; user 7 reads and writes it, user 8
+# may not; a directory of user 7, mode 700, user 8 cannot list; the
+# owner and group reach the disk.
+type_line 'echo secret > /temporary/s && chmod 600 /temporary/s && chown 7:3 /temporary/s && stat -c %u:%g /temporary/s && as 7 cat /temporary/s; as 8 cat /temporary/s; echo denied $(( $? != 0 ))'
+wait_for '^7:3$'
+wait_for '^secret$'
+wait_for '^denied 1$'
+type_line 'as 7 mlx-sh -c "echo changed > /temporary/s"; cat /temporary/s; as 8 mlx-sh -c "echo again > /temporary/s"; echo refused $(( $? != 0 )); cat /temporary/s'
+wait_for '^changed$' 2
+wait_for '^refused 1$'
+type_line 'mkdir /temporary/d && chmod 700 /temporary/d && chown 7 /temporary/d && as 7 mlx-sh -c "echo in > /temporary/d/f" && as 7 cat /temporary/d/f; as 8 ls /temporary/d; echo listed $(( $? != 0 )); as 8 chmod 777 /temporary/d; echo chmod $(( $? != 0 )); as 8 as 7 cat /temporary/d/f; echo became $(( $? != 0 )); sync; echo synced'
+wait_for '^in$'
+wait_for '^listed 1$'
+wait_for '^chmod 1$'
+wait_for '^became 1$'
+wait_for '^synced$'
 stop
-echo "ok   booted from the disk: /system is the volume's, programs run from it, the boot archive at /volumes/boot"
+echo "ok   booted from the disk: /system is the volume's, programs run from it, the boot archive at /volumes/boot; users and modes are checked"
 
 # The third: what was written is there.
 boot
 wait_for '^brixOS: / from /volumes/disk0'
-type_line 'cat /users/root/note; ls /temporary'
+type_line 'cat /users/root/note; ls /temporary; stat -c %u:%g /temporary/s /temporary/d'
 wait_for '^kept$'
-wait_for '^t$'
+wait_for '^d  s  t$'
+wait_for '^7:3$'
+wait_for '^7:0$'
 stop
-echo "ok   a file written in /users/root is there after another boot"
+echo "ok   a file written in /users/root is there after another boot, with its owner and group"
 echo PASS

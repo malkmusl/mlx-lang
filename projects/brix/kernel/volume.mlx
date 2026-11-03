@@ -24,6 +24,7 @@ const format = @import("../brixfs.mlx")
 const Brixfs = format.Brixfs
 const Superblock = format.Superblock
 const Inode = format.Inode
+const Extent = format.Extent
 const SnapshotEntry = format.SnapshotEntry
 const Page = memory.Page
 const Vfs = vfs.Vfs
@@ -47,7 +48,10 @@ pub const View = struct {
 
 pub const Store = struct {
     pub const MAX_VIEWS: usize = 8
-    const SCRATCH: usize = 4
+    // Pages to read blocks into: 0 a view's root, 1 an inode block, 2 and
+    // 3 the marking's and loading's, 4 and 5 the extent reader's, 6 and 7
+    // the commit's old map's.
+    const SCRATCH: usize = 8
     // Free inode numbers of the current root kept for reuse (the lowest).
     const MAX_FREE_INODES: usize = 1024
 
@@ -75,6 +79,8 @@ pub const Store = struct {
     freeInodeNext: usize
     // Something was read from the disk or changed since the last trim.
     needsTrim: bool
+    // Reads a file's extents (its buffers: scratch 4 and 5).
+    reader: format.ExtentReader
 
     // ---- blocks ----
 
@@ -83,6 +89,13 @@ pub const Store = struct {
     fn readBlock(number: usize, frame: usize) -> bool { return virtio.disk().read(number * Brixfs.BLOCK, page(frame), Brixfs.BLOCK) == @intCast(isize, Brixfs.BLOCK) }
 
     fn writeBlock(number: usize, frame: usize) -> bool { return virtio.disk().write(number * Brixfs.BLOCK, page(frame), Brixfs.BLOCK) == @intCast(isize, Brixfs.BLOCK) }
+
+    // A block into a buffer (the extent reader's read).
+    fn readInto(number: usize, into: [*]u8) -> bool { return virtio.disk().read(number * Brixfs.BLOCK, into, Brixfs.BLOCK) == @intCast(isize, Brixfs.BLOCK) }
+
+    // The extent reader's buffers hold nothing (blocks freed by a sweep
+    // may be written again).
+    fn forgetBlocks(self: *Self) -> void { self.*.reader.init() }
 
     fn used(self: *const Self, number: usize) -> bool { return self.*.bitmap[number / 8] & (@intCast(u8, 1) << @intCast(u3, number % 8)) != 0 }
 
@@ -141,6 +154,7 @@ pub const Store = struct {
         const bitmap = frames.allocateContiguous(bitmapPages)
         if bitmap == 0 || !readBlock(self.*.superblock.root, self.*.rootPage) { return false }
         self.*.bitmap = page(bitmap)
+        self.*.reader.init()
         self.*.cursor = Brixfs.SUPERBLOCKS
         self.*.snapshots = self.*.superblock.snapshots
         self.*.readOnly = disk.*.readOnly
@@ -271,17 +285,7 @@ pub const Store = struct {
 
     // The block number of a file's block `index` (0: a hole).
     fn dataBlock(self: *Self, node: *const Inode, index: usize) -> usize {
-        if index < Brixfs.DIRECT { return node.*.direct[index] }
-        var rest = index - Brixfs.DIRECT
-        if rest < Brixfs.POINTERS_PER_BLOCK {
-            if node.*.indirect == 0 || !readBlock(node.*.indirect, self.*.scratch[2]) { return 0 }
-            return Brixfs.get(page(self.*.scratch[2]), rest * 8, 8)
-        }
-        rest -= Brixfs.POINTERS_PER_BLOCK
-        if node.*.doubleIndirect == 0 || !readBlock(node.*.doubleIndirect, self.*.scratch[2]) { return 0 }
-        const middle = Brixfs.get(page(self.*.scratch[2]), (rest / Brixfs.POINTERS_PER_BLOCK) * 8, 8)
-        if middle == 0 || !readBlock(middle, self.*.scratch[2]) { return 0 }
-        return Brixfs.get(page(self.*.scratch[2]), (rest % Brixfs.POINTERS_PER_BLOCK) * 8, 8)
+        return self.*.reader.blockAt(node, index, page(self.*.scratch[4]), page(self.*.scratch[5]), readInto)
     }
 
     // The tree's node of inode `number` of view `view`: the one there is,
@@ -305,6 +309,8 @@ pub const Store = struct {
         n.*.loaded = false
         n.*.links = record.links
         n.*.size = record.size
+        n.*.user = record.user
+        n.*.group = record.group
         n.*.accessed = record.accessed
         n.*.modified = record.modified
         n.*.changed = record.changed
@@ -402,216 +408,151 @@ pub const Store = struct {
 
     // ---- committing ----
 
-    // The block number of data block `index` set in an inode being made;
-    // the pointer pages in `indirect` (a page), `double` (a page) and
-    // `middle` (the current one of the double indirect block's).
-    fn setPointer(record: *Inode, index: usize, number: usize, pointers: *[3]usize) -> void {
-        if index < Brixfs.DIRECT {
-            record.*.direct[index] = number
-            return
-        }
-        var rest = index - Brixfs.DIRECT
-        if rest < Brixfs.POINTERS_PER_BLOCK {
-            Brixfs.put(page(pointers.*[0]), rest * 8, 8, number)
-            return
-        }
-        rest -= Brixfs.POINTERS_PER_BLOCK
-        Brixfs.put(page(pointers.*[2]), (rest % Brixfs.POINTERS_PER_BLOCK) * 8, 8, number)
+    // A file's extents being made: the one being extended, the ones in a
+    // page not written yet, the pages written (named in another page).
+    const ExtentBuilder = struct {
+        current: Extent
+        inPage: usize
+        pages: usize
+        count: usize
     }
 
-    // A full middle page of the double indirect block written (when it
-    // names any block); false when the disk is full.
-    fn flushMiddle(self: *Self, which: usize, pointers: *[3]usize, any: bool) -> bool {
-        if !any { return true }
-        const number = self.allocate()
-        if number == 0 || !writeBlock(number, pointers.*[2]) { return false }
-        Brixfs.put(page(pointers.*[1]), which * 8, 8, number)
-        Bytes.zeroWords(layout.Memory.virtual(pointers.*[2]), Page.SIZE)
+    // The file's block `b` is on the disk at `disk`: the extent being made
+    // goes on, or a new one starts; false when the disk is full.
+    fn addBlock(self: *Self, builder: *ExtentBuilder, b: usize, disk: usize, extentsPage: usize, pointersPage: usize) -> bool {
+        const c = &builder.*.current
+        if c.*.length > 0 && b == c.*.start + c.*.length && disk == c.*.block + c.*.length {
+            c.*.length += 1
+            return true
+        }
+        if !self.flushExtent(builder, extentsPage, pointersPage) { return false }
+        c.* = Extent.{ .start = b, .length = 1, .block = disk }
         return true
     }
 
-    // A node's data into new blocks (a directory's entries naming inodes,
-    // not the tree's nodes), its pointers into `record`; false when the
-    // disk is full.
-    fn writeData(self: *Self, index: usize, record: *Inode) -> bool {
+    // The extent being made (when there is one) into the page, which
+    // goes to the disk when it is full; false when the disk is full (or
+    // the file has too many extents).
+    fn flushExtent(self: *Self, builder: *ExtentBuilder, extentsPage: usize, pointersPage: usize) -> bool {
+        if builder.*.current.length == 0 { return true }
+        if builder.*.inPage == Brixfs.EXTENTS_PER_BLOCK {
+            if builder.*.pages == Brixfs.POINTERS_PER_BLOCK { return false }
+            const number = self.allocate()
+            if number == 0 || !writeBlock(number, extentsPage) { return false }
+            Brixfs.put(page(pointersPage), builder.*.pages * 8, 8, number)
+            builder.*.pages += 1
+            builder.*.inPage = 0
+        }
+        builder.*.current.encode(page(extentsPage), builder.*.inPage * Brixfs.EXTENT_SIZE)
+        builder.*.inPage += 1
+        builder.*.count += 1
+        builder.*.current.length = 0
+        return true
+    }
+
+    // The extents made into `record`: in the inode, in one block, or in
+    // the blocks one block names; false when the disk is full.
+    fn storeExtents(self: *Self, record: *Inode, builder: *ExtentBuilder, extentsPage: usize, pointersPage: usize) -> bool {
+        record.*.extentCount = builder.*.count
+        record.*.tree = 0
+        record.*.depth = 0
+        var k: usize = 0
+        while k < Brixfs.INLINE_EXTENTS {
+            record.*.extents[k] = Extent.{ .start = 0, .length = 0, .block = 0 }
+            k += 1
+        }
+        if builder.*.pages == 0 && builder.*.count <= Brixfs.INLINE_EXTENTS {
+            k = 0
+            while k < builder.*.count {
+                record.*.extents[k] = Extent.decode(page(extentsPage), k * Brixfs.EXTENT_SIZE)
+                k += 1
+            }
+            return true
+        }
+        if builder.*.pages == 0 {
+            const number = self.allocate()
+            if number == 0 || !writeBlock(number, extentsPage) { return false }
+            record.*.tree = number
+            record.*.depth = 1
+            return true
+        }
+        if builder.*.inPage > 0 {
+            if builder.*.pages == Brixfs.POINTERS_PER_BLOCK { return false }
+            const number = self.allocate()
+            if number == 0 || !writeBlock(number, extentsPage) { return false }
+            Brixfs.put(page(pointersPage), builder.*.pages * 8, 8, number)
+            builder.*.pages += 1
+        }
+        const number = self.allocate()
+        if number == 0 || !writeBlock(number, pointersPage) { return false }
+        record.*.tree = number
+        record.*.depth = 2
+        return true
+    }
+
+    // A node's data onto the disk as it is now: blocks that changed
+    // (every block when `whole`: a directory, whose entries name inodes
+    // on the disk, or a file not on the disk yet) into new blocks, the
+    // rest where they are (`record`'s extents say where), the new extents
+    // into `record`; false when the disk is full.
+    fn writeFile(self: *Self, index: usize, record: *Inode, whole: bool) -> bool {
         const tree = vfs.fileSystem()
         const n = tree.node(index)
         const frames = memory.allFrames()
-        var pointers = [3]usize{ frames.allocate(), frames.allocate(), frames.allocate() }
-        if pointers[0] == 0 || pointers[1] == 0 || pointers[2] == 0 { return false }
+        const extentsPage = frames.allocate()
+        const pointersPage = frames.allocate()
+        if extentsPage == 0 || pointersPage == 0 {
+            if extentsPage != 0 { frames.free(extentsPage) }
+            if pointersPage != 0 { frames.free(pointersPage) }
+            return false
+        }
+        Bytes.zeroWords(layout.Memory.virtual(pointersPage), Page.SIZE)
+        const old = record.*
+        var oldReader: format.ExtentReader = undefined
+        oldReader.init()
+        var builder = ExtentBuilder.{ .current = Extent.{ .start = 0, .length = 0, .block = 0 }, .inPage = 0, .pages = 0, .count = 0 }
         const blocks = Page.up(n.*.size) / Page.SIZE
-        var anyIndirect = false
-        var anyDouble = false
-        var anyMiddle = false
-        var currentMiddle: usize = 0
         var ok = true
         var b: usize = 0
         while b < blocks && ok {
             const frame = tree.pageOf(index, b)
-            if b >= Brixfs.DIRECT + Brixfs.POINTERS_PER_BLOCK {
-                const which = (b - Brixfs.DIRECT - Brixfs.POINTERS_PER_BLOCK) / Brixfs.POINTERS_PER_BLOCK
-                if which != currentMiddle {
-                    ok = self.flushMiddle(currentMiddle, &pointers, anyMiddle)
-                    anyMiddle = false
-                    currentMiddle = which
-                }
-            }
-            if frame != 0 && ok {
-                var source = frame
-                if n.*.kind == NodeKind.directory {
-                    // Entries name inodes on the disk.
-                    source = self.*.scratch[3]
-                    Bytes.copyWords(layout.Memory.virtual(source), layout.Memory.virtual(frame), Page.SIZE)
-                    const entries = page(source)
-                    var slot: usize = 0
-                    while slot < Brixfs.BLOCK / Brixfs.ENTRY_SIZE {
-                        const child = format.Entry.inode(entries, slot)
-                        if child != 0 { Brixfs.put(entries, slot * Brixfs.ENTRY_SIZE, 4, tree.node(child).*.diskInode) }
-                        slot += 1
-                    }
-                }
-                const number = self.allocate()
-                if number == 0 || !writeBlock(number, source) {
-                    ok = false
-                } else {
-                    setPointer(record, b, number, &pointers)
-                    if b >= Brixfs.DIRECT { anyIndirect = true }
-                    if b >= Brixfs.DIRECT + Brixfs.POINTERS_PER_BLOCK {
-                        anyDouble = true
-                        anyMiddle = true
-                    }
-                }
-            }
-            b += 1
-        }
-        if ok && anyDouble { ok = self.flushMiddle(currentMiddle, &pointers, anyMiddle) }
-        if ok && anyIndirect {
-            const number = self.allocate()
-            if number == 0 || !writeBlock(number, pointers[0]) { ok = false } else { record.*.indirect = number }
-        }
-        if ok && anyDouble {
-            const number = self.allocate()
-            if number == 0 || !writeBlock(number, pointers[1]) { ok = false } else { record.*.doubleIndirect = number }
-        }
-        frames.free(pointers[0])
-        frames.free(pointers[1])
-        frames.free(pointers[2])
-        return ok
-    }
-
-    // ---- a file's changed blocks ----
-
-    const FAILED: usize = 0xFFFFFFFFFFFFFFFF
-
-    // The disk block for block `b` of a file whose old one is `old`: the
-    // old one when the page did not change, a new one with the page in
-    // it when it did (or was not on the disk), 0 for a hole; FAILED when
-    // the disk is full.
-    fn blockFor(self: *Self, index: usize, b: usize, old: usize) -> usize {
-        const tree = vfs.fileSystem()
-        const frame = tree.pageOf(index, b)
-        if frame == 0 { return 0 }
-        if old != 0 && !tree.pageChanged(index, b, false) { return old }
-        const number = self.allocate()
-        if number == 0 || !writeBlock(number, frame) { return FAILED }
-        _ = tree.pageChanged(index, b, true)
-        return number
-    }
-
-    // A pointer block (`old`, 0 for none) with the pointers of blocks
-    // `first` on (512 of them) as they are now: the old block when none
-    // changed, 0 when none is left, else a new block; FAILED when the
-    // disk is full. `frame` holds it.
-    fn pointerBlock(self: *Self, index: usize, old: usize, first: usize, blocks: usize, frame: usize) -> usize {
-        if old == 0 && first >= blocks { return 0 }
-        if old != 0 {
-            if !readBlock(old, frame) { return FAILED }
-        } else {
-            Bytes.zeroWords(layout.Memory.virtual(frame), Page.SIZE)
-        }
-        const pointers = page(frame)
-        var changed = false
-        var any = false
-        var k: usize = 0
-        while k < Brixfs.POINTERS_PER_BLOCK {
-            const b = first + k
-            const before = Brixfs.get(pointers, k * 8, 8)
-            const after = if b < blocks { self.blockFor(index, b, before) } else { 0 }
-            if after == FAILED { return FAILED }
-            if after != before {
-                Brixfs.put(pointers, k * 8, 8, after)
-                changed = true
-            }
-            if after != 0 { any = true }
-            k += 1
-        }
-        if !any { return 0 }
-        if !changed { return old }
-        const number = self.allocate()
-        if number == 0 || !writeBlock(number, frame) { return FAILED }
-        return number
-    }
-
-    // A file's data on the disk as it is now, into `record` (its old
-    // pointers in it, or none): only blocks that changed are written,
-    // with the pointer blocks that name them; false when the disk is
-    // full.
-    fn writeChanges(self: *Self, index: usize, record: *Inode) -> bool {
-        const tree = vfs.fileSystem()
-        const blocks = Page.up(tree.node(index).*.size) / Page.SIZE
-        var b: usize = 0
-        while b < Brixfs.DIRECT {
-            const number = if b < blocks { self.blockFor(index, b, record.*.direct[b]) } else { 0 }
-            if number == FAILED { return false }
-            record.*.direct[b] = number
-            b += 1
-        }
-        const frames = memory.allFrames()
-        const top = frames.allocate()
-        const middle = frames.allocate()
-        var ok = top != 0 && middle != 0
-        if ok {
-            const indirect = self.pointerBlock(index, record.*.indirect, Brixfs.DIRECT, blocks, middle)
-            ok = indirect != FAILED
-            if ok { record.*.indirect = indirect }
-        }
-        // The double indirect block: its middle blocks, then it.
-        const base = Brixfs.DIRECT + Brixfs.POINTERS_PER_BLOCK
-        if ok && (record.*.doubleIndirect != 0 || blocks > base) {
-            if record.*.doubleIndirect != 0 {
-                ok = readBlock(record.*.doubleIndirect, top)
+            if frame == 0 {
+                // A hole: no extent covers it.
+                ok = self.flushExtent(&builder, extentsPage, pointersPage)
             } else {
-                Bytes.zeroWords(layout.Memory.virtual(top), Page.SIZE)
-            }
-            var changed = false
-            var any = false
-            var m: usize = 0
-            while m < Brixfs.POINTERS_PER_BLOCK && ok {
-                const before = Brixfs.get(page(top), m * 8, 8)
-                const after = self.pointerBlock(index, before, base + m * Brixfs.POINTERS_PER_BLOCK, blocks, middle)
-                if after == FAILED {
-                    ok = false
+                var disk: usize = 0
+                const previous = if whole { 0 } else { oldReader.blockAt(&old, b, page(self.*.scratch[6]), page(self.*.scratch[7]), readInto) }
+                if previous != 0 && !tree.pageChanged(index, b, false) {
+                    disk = previous
                 } else {
-                    if after != before {
-                        Brixfs.put(page(top), m * 8, 8, after)
-                        changed = true
+                    var source = frame
+                    if n.*.kind == NodeKind.directory {
+                        // Entries name inodes on the disk.
+                        source = self.*.scratch[3]
+                        Bytes.copyWords(layout.Memory.virtual(source), layout.Memory.virtual(frame), Page.SIZE)
+                        const entries = page(source)
+                        var slot: usize = 0
+                        while slot < Brixfs.BLOCK / Brixfs.ENTRY_SIZE {
+                            const child = format.Entry.inode(entries, slot)
+                            if child != 0 { Brixfs.put(entries, slot * Brixfs.ENTRY_SIZE, 4, tree.node(child).*.diskInode) }
+                            slot += 1
+                        }
                     }
-                    if after != 0 { any = true }
+                    disk = self.allocate()
+                    if disk == 0 || !writeBlock(disk, source) {
+                        ok = false
+                    } else {
+                        _ = tree.pageChanged(index, b, true)
+                    }
                 }
-                m += 1
+                if ok { ok = self.addBlock(&builder, b, disk, extentsPage, pointersPage) }
             }
-            if ok {
-                if !any {
-                    record.*.doubleIndirect = 0
-                } else if changed {
-                    const number = self.allocate()
-                    ok = number != 0 && writeBlock(number, top)
-                    if ok { record.*.doubleIndirect = number }
-                }
-            }
+            b += 1
         }
-        if top != 0 { frames.free(top) }
-        if middle != 0 { frames.free(middle) }
+        if ok { ok = self.flushExtent(&builder, extentsPage, pointersPage) }
+        if ok { ok = self.storeExtents(record, &builder, extentsPage, pointersPage) }
+        frames.free(extentsPage)
+        frames.free(pointersPage)
         return ok
     }
 
@@ -644,6 +585,7 @@ pub const Store = struct {
     pub fn commit(self: *Self) -> bool {
         if !self.*.mounted || !self.*.dirty || self.*.readOnly { return true }
         const tree = vfs.fileSystem()
+        self.forgetBlocks()
         self.unstage()
         var ok = true
         // 1. Changed nodes: their data, their inodes.
@@ -654,21 +596,15 @@ pub const Store = struct {
                 var record: Inode = undefined
                 const known = self.readInode(0, n.*.diskInode, &record) && record.kind != Brixfs.FREE
                 if !known { record.clear() }
-                if n.*.dataDirty || !known {
-                    if n.*.kind == NodeKind.directory {
-                        // A directory is written whole (its entries name
-                        // the inodes).
-                        record.clear()
-                        ok = self.writeData(k, &record)
-                    } else {
-                        // A file: its changed blocks only.
-                        ok = self.writeChanges(k, &record)
-                    }
-                }
+                // A directory is written whole (its entries name the
+                // inodes); a file's changed blocks only.
+                if n.*.dataDirty || !known { ok = self.writeFile(k, &record, n.*.kind == NodeKind.directory || !known) }
                 record.kind = inodeKind(n.*.kind)
                 record.mode = n.*.mode
                 record.links = n.*.links
                 record.size = n.*.size
+                record.user = n.*.user
+                record.group = n.*.group
                 record.accessed = n.*.accessed
                 record.modified = n.*.modified
                 record.changed = n.*.changed
@@ -773,6 +709,7 @@ pub const Store = struct {
             }
         }
         self.*.cursor = Brixfs.SUPERBLOCKS
+        self.forgetBlocks()
     }
 
     // A table root, its inode blocks and every block their inodes reach;
@@ -816,31 +753,32 @@ pub const Store = struct {
         self.*.freeInodeCount += 1
     }
 
+    // An inode's blocks: its extents' (read through scratch 4 and 5),
+    // the extent blocks and the block naming them.
     fn markInode(self: *Self, record: *const Inode) -> void {
-        var d: usize = 0
-        while d < Brixfs.DIRECT {
-            if record.*.direct[d] != 0 { self.mark(record.*.direct[d]) }
-            d += 1
-        }
-        if record.*.indirect != 0 { self.markPointers(record.*.indirect, false) }
-        if record.*.doubleIndirect != 0 { self.markPointers(record.*.doubleIndirect, true) }
-    }
-
-    // A pointer block and what it names (pointer blocks again when
-    // `double`: the double indirect block in scratch 3, a middle one in
-    // scratch 2).
-    fn markPointers(self: *Self, number: usize, double: bool) -> void {
-        self.mark(number)
-        const frame = if double { self.*.scratch[3] } else { self.*.scratch[2] }
-        if !readBlock(number, frame) { return }
+        if record.*.depth >= 1 { self.mark(record.*.tree) }
+        var reader: format.ExtentReader = undefined
+        reader.init()
         var k: usize = 0
-        while k < Brixfs.POINTERS_PER_BLOCK {
-            const target = Brixfs.get(page(frame), k * 8, 8)
-            if target != 0 {
-                if double { self.markPointers(target, false) } else { self.mark(target) }
+        while k < record.*.extentCount {
+            const e = reader.extentAt(record, k, page(self.*.scratch[4]), page(self.*.scratch[5]), readInto)
+            if e.length == 0 { break }
+            var j: usize = 0
+            while j < e.length {
+                self.mark(e.block + j)
+                j += 1
             }
             k += 1
         }
+        if record.*.depth == 2 && reader.pointerBlock == record.*.tree {
+            var t: usize = 0
+            while t < Brixfs.POINTERS_PER_BLOCK {
+                const block = Brixfs.get(page(self.*.scratch[5]), t * 8, 8)
+                if block != 0 { self.mark(block) }
+                t += 1
+            }
+        }
+        self.forgetBlocks()
     }
 
     // ---- snapshots ----

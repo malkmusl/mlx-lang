@@ -173,13 +173,17 @@ is written over.
   volume. It names the inode table's root block, the next inode number
   and the snapshot table.
 - The inode table: a root block of 512 inode block numbers, 16 inodes of
-  256 bytes each. A file's data: 12 direct blocks, an indirect block, a
-  double indirect one; a directory's: 64-byte entries (inode, name); a
-  symbolic link's: its target; a FIFO has none.
+  256 bytes each (format version 2). An inode names its owner and group.
+  A file's data is named by extents (a run of blocks: where in the file,
+  how many, where on the disk): 12 in the inode, else in a block of 256
+  (depth 1) or in up to 512 such blocks one block names (depth 2), so a
+  file written in one go is one extent; a directory's data: 64-byte
+  entries (inode, name); a symbolic link's: its target; a FIFO has none.
 - A commit writes what changed into free blocks: of a changed file the
   pages written since the last commit (each page of the tree carries a
-  changed mark) and the pointer blocks naming them, the rest keeps its
-  blocks; a changed directory whole; the inode blocks with changed
+  changed mark), the rest keeps its blocks, and its extents are made
+  again (`Store.writeFile`: an extent goes on while the next block
+  follows the last on the disk); a changed directory whole; the inode blocks with changed
   inodes, a new table root; then, between two flushes of the device
   (virtio's FLUSH when it offers it), the other superblock with the next
   generation. Until that one block is written the disk is the last
@@ -223,6 +227,17 @@ gives a volume node's inode number and the volume as its device.
     brixfs list disk.img             every path and size, the snapshots
     brixfs cat disk.img docs/a       a file
     brixfs blocks disk.img docs/a    a file's block numbers (0: a hole)
+
+Users: a process runs as a user and a group (0, the system's, at boot;
+setuid and setgid, which only the system's user may use to become
+another: `as USER[:GROUP] PROGRAM` of the tools does), new nodes are
+theirs, chown changes that (an owner only the group), and the kernel
+checks modes (`Vfs.permits`: read, write, execute for the owner, the
+group, the rest; the system's user may everything but run what no bit
+lets anyone run) when a path is walked (execute on each directory), a
+node is opened, made, removed, renamed, run, or its mode and times are
+changed (the owner's); the Linux layer says EACCES or EPERM, brixOS's
+own calls denied. Owner and group are on the disk with the inode.
 
 Not there yet: a directory is still written whole when an entry changed;
 nodes held open or with more than one link stay in memory; no journal of
@@ -344,8 +359,8 @@ The pieces:
 
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
-the disk works for one, the APIC (the legacy PICs do), users and permissions that
-are checked, the kernel on more than one processor (the others start
+the disk works for one, the APIC (the legacy PICs do), groups a user is
+in beyond its own, the kernel on more than one processor (the others start
 and wait halted).
 
 ## brixOS's own interface
