@@ -28,6 +28,12 @@ memory with brixOS's own layout and copy on write:
     brixOS: 511 MiB (415 free), 2076 MHz
     root@brix:~# seq 3 | sort -r | tr "\n" " "; echo
     3 2 1
+
+The programs in the image are built for brixOS (`--target=x86_64-brixos`,
+into mlx-out/bin/brix): `@import("builtin").os` is `brixos` in them, so a
+program asks at compile time which system it is for (`uname -o` says
+brixOS), and std picks its `X.brixos.mlx` files (std.platform). They
+still call the kernel by Linux's system call numbers.
     root@brix:~# ls /
     devices  system  temporary  users
     root@brix:~# cd /temporary; cat /system/programs/mlx-sh > a

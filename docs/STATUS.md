@@ -73,7 +73,10 @@ Commands:
 ## brixOS kernel
 
 On the branch `brix-kernel` (projects/brix/README.md there): mlx4 has an
-`x86_64-freestanding` target (`--target=x86_64-freestanding`), brix-image
+`x86_64-freestanding` target (`--target=x86_64-freestanding`) for the
+kernel and an `x86_64-brixos` one for its programs (`@import("builtin")`
+tells a program its target at compile time, `if comptime builtin.os ==
+builtin.Os.brixos` prunes the other branch), brix-image
 makes a Multiboot image (boot blob, kernel, file archive with mlx-sh and
 the coreutils), and the kernel boots in QEMU to the serial console and
 runs mlx-sh in user mode with Linux's system call numbers; programs run

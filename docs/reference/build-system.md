@@ -64,7 +64,27 @@ Key normative points:
 <MlxTargets version="1.0" normative="true">
   <TargetFields>arch os abi endian pointer_bits cpu_features</TargetFields>
   <BuiltinModule name="builtin">target, cpu features, optimize mode, language version</BuiltinModule>
+  <BuiltinDeclarations><![CDATA[
+pub const Os = enum(u8) { linux, android, freebsd, windows, brixos, freestanding }
+pub const Arch = enum(u8) { x86_64, aarch64 }
+pub const Endian = enum(u8) { little, big }
+pub const endian: Endian
+pub const pointer_bits: usize
+pub const os: Os
+pub const arch: Arch
+pub const optimization_level: usize   // 0 to 3 (-O0 .. -O3)
+pub const runtime_safety: bool
+]]></BuiltinDeclarations>
+  <OsQuery><![CDATA[if comptime builtin.os == builtin.Os.brixos { ... } else { ... }]]></OsQuery>
   <Initial arch="x86_64" os="linux freebsd windows brixos freestanding"/>
+  <Initial arch="aarch64" os="linux android"/>
+  <CompilerTargets>
+    <Target flag="--target=x86_64-linux" output="static ELF executable" default="true"/>
+    <Target flag="--target=x86_64-brixos" output="static ELF executable for brixOS; std picks its X.brixos.mlx files"/>
+    <Target flag="--target=x86_64-freestanding" output="static ELF without an operating system (a kernel)"/>
+    <Target flag="--target=aarch64-linux" output="static ELF executable"/>
+    <Target flag="--target=aarch64-android" output="ELF shared object for the output path ending in .so, signed APK for .apk"/>
+  </CompilerTargets>
   <FeatureQuery><![CDATA[if comptime builtin.cpu.has(.avx2) { ... }]]></FeatureQuery>
   <FunctionFeatureRequirement><![CDATA[fn fast(...) void requires(.avx2) { ... }]]></FunctionFeatureRequirement>
   <Rule>A function requiring a CPU feature may only be called when the compilation target guarantees the feature or from code guarded by an explicit runtime dispatch mechanism that targets a feature-specialized function.</Rule>
@@ -74,8 +94,34 @@ Key normative points:
 A target is fully described by six fields: `arch`, `os`, `abi`, `endian`,
 `pointer_bits`, `cpu_features`. A built-in `builtin` module exposes the
 current target, CPU feature set, optimize mode, and language version to
-comptime code, and the spec gives two concrete syntax examples for feature
-gating:
+comptime code.
+
+What the compiler has of it: `@import("builtin")` is a module mlx4 writes
+from `--target` and the optimization options (`os`, `arch`, `endian`,
+`pointer_bits`, `optimization_level`, `runtime_safety`, and the `Os`,
+`Arch`, `Endian` enums, as `<BuiltinDeclarations>` lists them). A program
+asks it at compile time, and only the branch taken is analyzed, so the
+other may name what this target lacks:
+
+```mlx
+const builtin = @import("builtin")
+
+fn operatingSystem() -> []const u8 {
+    if comptime builtin.os == builtin.Os.brixos { return "brixOS" }
+    if comptime builtin.os == builtin.Os.windows { @compileError("no Windows yet") }
+    return "GNU/Linux"
+}
+```
+
+tests/428_builtin_target_runtime.mlx asks every field and prunes a branch
+that names what x86_64-linux lacks; tests/429_comptime_compile_error.mlx
+is a `@compileError` in the branch taken (MLX-E5003 with its text).
+
+`--target=x86_64-brixos` builds for brixOS (static executables that run
+by Linux's system call numbers for now; std picks `X.brixos.mlx` over
+`X.mlx`, as `X.android.mlx` for Android). The CPU feature set
+(`builtin.cpu`) is not there yet. The spec gives two concrete syntax
+examples for feature gating:
 
 - A comptime feature query: `if comptime builtin.cpu.has(.avx2) { ... }`
 - A per-function feature requirement:
