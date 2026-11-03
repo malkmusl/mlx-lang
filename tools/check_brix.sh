@@ -80,13 +80,13 @@ mkdir -p "$work/linux-tools/bin"
 printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet "projects/coreutils/{}/main.mlx" -o "$work/linux-tools/bin/{}"
 "$compiler" --quiet projects/shell/main.mlx -o "$work/linux-tools/mlx-sh"
 (( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
-for tool in snapshot brixfs floats signals native events objects; do
+for tool in snapshot brixfs floats signals native events objects kinds; do
     "$compiler" --quiet $brix "projects/brix/tools/$tool/main.mlx" -o "$work/$tool"
 done
 for tool in brixfs floats signals; do
     "$compiler" --quiet "projects/brix/tools/$tool/main.mlx" -o "$work/linux-tools/$tool"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "objects=$work/objects" "every-program=tools/brix_programs.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "objects=$work/objects" "kinds=$work/kinds" "every-program=tools/brix_programs.sh" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
@@ -167,7 +167,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines; built for brixOS, uname -o says so"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for "^$(( ${#programs[@]} + 9 ))\$"
+wait_for "^$(( ${#programs[@]} + 10 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -371,6 +371,57 @@ END
 output | sed -n '/^@@ objects$/,/^@@ objects end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/objects.brix"
 diff "$work/objects.expected" "$work/objects.brix" > "$work/objects.diff" || fail "the objects behave otherwise (< expected, > brixOS): $(cat "$work/objects.diff")"
 echo "ok   brixOS's own nodes, streams, channels (bytes and a handle), branch, spawn with the handles given, events sent, changes taken"
+
+# brixOS's other objects: a rename, a snapshot by handle, timers, a
+# memory object shared with a branch, groups and the session.
+type_line 'echo @@ kinds; kinds; echo @@ kinds end $?'
+wait_for '^@@ kinds end 0$'
+cat > "$work/kinds.expected" <<'END'
+kinds
+rename 0
+the old name (not found) 6
+renamed file
+a file onto a directory (is a directory) 14
+a directory under itself (invalid) 10
+snapshot 0
+renamed file (in the snapshot)
+written in the snapshot (read only) 16
+the same name again (exists) 7
+timer kind 8
+readable before its deadline 0
+read (bytes) 8
+waited for it 1
+expired at least once 1
+waited for again 1
+expired again 1
+once: read (bytes) 8
+once: again (no more) 0
+a write to a timer (no right) 3
+memory kind 7
+zeroed 0
+from the branch (the branch wrote it)
+from the branch (its second page, mapped again)
+past its end (invalid) 10
+from the branch (still mapped after its handle closed)
+session kind 6
+own group in front 0
+group kind 2
+in front 1
+the branch's own group in front 0
+put in front 0
+now in front 1
+ours still 0
+ours back 0
+an event to their group 0
+the branch ended by an event 2
+of kind (terminate) 5
+their group ended 1
+an event to it (not found) 6
+a group in front of a file (wrong kind) 2
+END
+output | sed -n '/^@@ kinds$/,/^@@ kinds end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/kinds.brix"
+diff "$work/kinds.expected" "$work/kinds.brix" > "$work/kinds.diff" || fail "the other objects behave otherwise (< expected, > brixOS): $(cat "$work/kinds.diff")"
+echo "ok   brixOS's other objects: rename, a snapshot by handle, timers, a memory object shared with a branch, groups in front of the session"
 
 type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
 wait_for '^trapped$'

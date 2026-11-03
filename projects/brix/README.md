@@ -317,11 +317,16 @@ and handles, which move from the sender's table to the receiver's;
 kernel/channel.mlx), memory (map, unmap), processes (spawn a program
 with exactly the handles given, branch, replace, exit, take a child's
 change, send an event; a process handle's state says when it ended or
-changed), events (claim, take, the upcall), the clocks. Native programs
-see brixOS's own layout (/temporary; /tmp is the Linux layer's). Not
-yet: groups and sessions as handles, timers, memory objects, rename,
-snapshots by handle. std.os.brix for programs; projects/brix/tools/native,
-events and objects show them (tools/check_brix.sh compares their lines). A handle names a slot of the process's table and
+changed), events (claim, take, the upcall), the clocks, rename and
+snapshots of a tree by its handle (kernel/names.mlx, the core's, which
+the Linux layer's rename and SNAPSHOT use too), timers (kernel/timer.mlx:
+readable when expired, a read takes the count; native/timers.mlx),
+memory objects (kernel/memoryobjects.mlx: pages mapped shared, an entry
+bit keeps them shared through a branch), groups (group_join; a group
+handle in front of the session, an event to all of it). Native programs
+see brixOS's own layout (/temporary; /tmp is the Linux layer's).
+std.os.brix for programs; projects/brix/tools/native, events, objects
+and kinds show them (tools/check_brix.sh compares their lines). A handle names a slot of the process's table and
 the generation the slot had ((generation << 8) | (slot + 1)): a handle
 kept past a close stays invalid when the slot is used again. The Linux
 layer's descriptors are the slots' numbers, its view of the same table
@@ -361,10 +366,9 @@ layer.
 
 ## Next
 
-1. The native interface on: groups and sessions as handles, timers,
-   memory objects, rename; std's opening, directories and processes
-   (fs.open, std.process spawn) on std.os.brix too, then std.posix as
-   the facade for the rest.
+1. std's opening, directories and processes (fs.open, std.process
+   spawn) on std.os.brix too, then std.posix as the facade for the
+   rest; mlx-sh's jobs as groups by handle.
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
 3. EFI boot (PE32+, GOP framebuffer) beside Multiboot.
