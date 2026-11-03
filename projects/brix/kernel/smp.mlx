@@ -1,0 +1,156 @@
+// The other processors: found in ACPI's MADT (the BIOS's RSDP, its RSDT,
+// the APIC table's local APICs), started through the local APIC (INIT,
+// then two startup IPIs naming the trampoline's page, layout.Ap) and
+// counted as they reach long mode. They wait there, halted: the kernel
+// runs on the first processor only (no per-processor state, no lock yet).
+const layout = @import("../layout.mlx")
+const memory = @import("./memory.mlx")
+const clock = @import("./clock.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+
+// The local APIC's registers (its page mapped uncached at its physical
+// address in the kernel's view).
+const LAPIC: usize = 0xFEE00000
+const ID: usize = 0x20
+const ICR_LOW: usize = 0x300
+const ICR_HIGH: usize = 0x310
+const DELIVERY_PENDING: u32 = 0x1000
+const MAX_CPUS: usize = 32
+
+pub const Processors = struct {
+    // Processors the MADT names (enabled), and how many more started.
+    count: usize
+    started: usize
+    apicIds: [MAX_CPUS]usize
+}
+
+var found: Processors = undefined // (per run)
+
+pub fn processors() -> *Processors { return &found }
+
+fn physical(address: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(address)) }
+
+fn same(bytes: [*]const u8, text: []const u8) -> bool {
+    var k: usize = 0
+    while k < text.length {
+        if bytes[k] != text[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// The RSDP: in the EBDA's first KiB or the BIOS area (0xE0000..0xFFFFF),
+// on a 16-byte boundary, its checksum right; 0 when there is none (an EFI
+// boot keeps it in the firmware's configuration table).
+fn rsdp() -> usize {
+    const ebda = Bytes.read16(physical(0x40E), 0) << 4
+    var at = ebda
+    while ebda != 0 && at < ebda + 1024 {
+        if same(physical(at), "RSD PTR ") && sum(at, 20) { return at }
+        at += 16
+    }
+    at = 0xE0000
+    while at < 0x100000 {
+        if same(physical(at), "RSD PTR ") && sum(at, 20) { return at }
+        at += 16
+    }
+    return 0
+}
+
+fn sum(at: usize, length: usize) -> bool {
+    var total: usize = 0
+    var k: usize = 0
+    while k < length {
+        total += @intCast(usize, physical(at)[k])
+        k += 1
+    }
+    return total & 0xFF == 0
+}
+
+fn reg(offset: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, layout.Memory.virtual(LAPIC) + offset) } }
+
+// The local APIC's page in the kernel's view: a page directory for the
+// fourth GiB under the boot PDPT (which every address space shares), its
+// 2 MiB page there uncached; false when memory is out.
+fn mapApic() -> bool {
+    const pdpt = physical(layout.Memory.BLOB + layout.Blob.PDPT)
+    if Bytes.read64(pdpt, 3 * 8) & 1 == 0 {
+        const directory = memory.allFrames().allocate()
+        if directory == 0 { return false }
+        Bytes.write64(pdpt, 3 * 8, directory | 0x3)
+    }
+    const directory = Bytes.read64(pdpt, 3 * 8) & memory.Page.ADDRESS
+    // Present, writable, a 2 MiB page, write-through, uncached.
+    Bytes.write64(physical(directory), ((LAPIC >> 21) & 511) * 8, LAPIC | 0x83 | 0x18)
+    return true
+}
+
+fn wait(nanoseconds: usize) -> void {
+    const until = clock.system().monotonic() + nanoseconds
+    while clock.system().monotonic() < until {}
+}
+
+fn send(apic: usize, command: u32) -> void {
+    reg(ICR_HIGH).* = @intCast(u32, apic << 24)
+    reg(ICR_LOW).* = command
+    var tries: usize = 0
+    while reg(ICR_LOW).* & DELIVERY_PENDING != 0 && tries < 1000000 { tries += 1 }
+}
+
+// The processors found, the others started (INIT, two startup IPIs),
+// waited for up to a second.
+pub fn start() -> void {
+    found.count = 1
+    found.started = 0
+    const pointer = rsdp()
+    if pointer == 0 { return }
+    const rsdt = Bytes.read32(physical(pointer), 16)
+    if rsdt == 0 || rsdt >= layout.Memory.MAPPED_LIMIT { return }
+    const length = Bytes.read32(physical(rsdt), 4)
+    var madt: usize = 0
+    var at: usize = 36
+    while at + 4 <= length {
+        const table = Bytes.read32(physical(rsdt), at)
+        if table != 0 && table < layout.Memory.MAPPED_LIMIT && same(physical(table), "APIC") { madt = table }
+        at += 4
+    }
+    if madt == 0 { return }
+    const madtLength = Bytes.read32(physical(madt), 4)
+    found.count = 0
+    at = 44
+    while at + 2 <= madtLength {
+        const kind = physical(madt)[at]
+        const size = @intCast(usize, physical(madt)[at + 1])
+        if size < 2 { break }
+        // A processor's local APIC, enabled.
+        if kind == 0 && Bytes.read32(physical(madt), at + 4) & 1 != 0 && found.count < MAX_CPUS {
+            found.apicIds[found.count] = @intCast(usize, physical(madt)[at + 3])
+            found.count += 1
+        }
+        at += size
+    }
+    if found.count < 2 || !mapApic() { return }
+    // The trampoline where the startup IPI's vector names it.
+    Bytes.copy(physical(layout.Ap.START), physical(layout.Memory.BLOB + layout.Blob.AP), layout.Ap.SIZE)
+    const counter = unsafe { @ptrFromInt(*u32, layout.Memory.virtual(layout.Ap.START + layout.Ap.STARTED)) }
+    counter.* = 0
+    const own = @intCast(usize, reg(ID).* >> 24)
+    var k: usize = 0
+    var others: usize = 0
+    while k < found.count {
+        const apic = found.apicIds[k]
+        if apic != own {
+            others += 1
+            // INIT, then the startup IPI twice (vector: the page).
+            send(apic, 0x4500)
+            wait(10000000)
+            send(apic, 0x4600 | @intCast(u32, layout.Ap.START >> 12))
+            wait(200000)
+            send(apic, 0x4600 | @intCast(u32, layout.Ap.START >> 12))
+        }
+        k += 1
+    }
+    const until = clock.system().monotonic() + 1000000000
+    while @intCast(usize, counter.*) < others && clock.system().monotonic() < until {}
+    found.started = @intCast(usize, counter.*)
+}

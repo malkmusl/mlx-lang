@@ -24,6 +24,13 @@ memory with brixOS's own layout and copy on write:
         -drive file=mlx-out/bin/brix/disk.img,format=raw,if=virtio
     tools/check_brix.sh        # the same, typed at, checked
 
+With `-smp N`, the kernel finds the processors in ACPI's MADT and starts
+the others through the local APIC (INIT and startup IPIs naming the
+trampoline's page, image/ap.mlx, kernel/smp.mlx): they reach long mode on
+the boot page tables and wait there, halted ("brixOS: 4 processors, 3
+more started (halted)"; tools/check_brix_smp.sh); the kernel runs on the
+first one only for now.
+
 or from UEFI (OVMF's firmware in QEMU; on a machine, the same file as
 EFI/BOOT/BOOTX64.EFI on a FAT partition):
 
@@ -319,7 +326,8 @@ The pieces:
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
 the disk works for one, the APIC (the legacy PICs do), users and permissions that
-are checked, more than one CPU.
+are checked, the kernel on more than one processor (the others start
+and wait halted).
 
 ## brixOS's own interface
 
@@ -403,7 +411,9 @@ layer.
    among them); programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
-   (GOP's) for EFI boots; more than one CPU; ext2 written too.
+   (GOP's) for EFI boots; the kernel on the
+   other processors (per-processor stacks, TSS and GDT, a lock, the local
+   APIC's timer, IPIs); ext2 written too.
 2. std.posix as the facade for what programs still ask the Linux layer
    (stat, fcntl, signals of their own), once the native ground holds.
 
