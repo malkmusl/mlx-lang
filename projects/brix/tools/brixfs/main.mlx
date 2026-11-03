@@ -8,6 +8,17 @@
 //                                 target, "fifo"), the snapshots
 //   brixfs cat DEVICE PATH        a file's bytes
 //   brixfs blocks DEVICE PATH     a file's block numbers (0: a hole)
+//   brixfs check DEVICE           the volume checked: the superblock, the
+//                                 table, every inode's extents in range
+//                                 and no block in two files of one root,
+//                                 entries naming inodes that are there,
+//                                 link counts; the snapshots' roots too.
+//                                 Exits 1 when something is wrong.
+//   brixfs repair DEVICE          checked, and what can be mended is:
+//                                 link counts set to the entries' count,
+//                                 entries naming no inode cleared, in a
+//                                 new commit (the volume on the disk is
+//                                 never written over).
 //
 // It reads the newer valid superblock, as the kernel does.
 const std = @import("std")
@@ -327,9 +338,255 @@ fn createImage(path: [*]const u8, megabytes: []const u8) -> u8 {
     return formatDevice(path)
 }
 
+// ---- check and repair ----
+
+// What a root holds: a bit a block in use, a link count an inode (from
+// the entries), what was found wrong.
+const Check = struct {
+    const MAX_BLOCKS_CHECKED: usize = 1 << 22
+    const LINKS: usize = Brixfs.MAX_INODES
+
+    device: Device
+    blocks: usize
+    used: [MAX_BLOCKS_CHECKED / 8]u8
+    links: [LINKS]u32
+    problems: usize
+    // Repair: the table blocks changed (a page each by index; 0 none).
+    staged: [Brixfs.POINTERS_PER_BLOCK]usize
+
+    fn say(self: *Self, text: []const u8, number: usize) -> void {
+        print("brixfs: ")
+        print(text)
+        print(" ")
+        printNumber(number)
+        print("\n")
+        self.*.problems += 1
+    }
+
+    fn isUsed(self: *const Self, block: usize) -> bool { return self.*.used[block / 8] & (@intCast(u8, 1) << @intCast(u3, block % 8)) != 0 }
+
+    // The block marked; false when it was marked already (two files of
+    // the root name it) or is out of range.
+    fn use(self: *Self, block: usize) -> bool {
+        if block < Brixfs.SUPERBLOCKS || block >= self.*.blocks { return false }
+        if self.isUsed(block) { return false }
+        self.*.used[block / 8] |= @intCast(u8, 1) << @intCast(u3, block % 8)
+        return true
+    }
+
+    fn clearUsed(self: *Self) -> void {
+        var k: usize = 0
+        while k < (self.*.blocks + 7) / 8 {
+            self.*.used[k] = 0
+            k += 1
+        }
+    }
+
+    // An inode's extents: in range, its blocks used once, covering no
+    // more than its size; the extent blocks too.
+    fn checkExtents(self: *Self, number: usize, record: *const Inode) -> void {
+        const need = (record.*.size + BLOCK - 1) / BLOCK
+        if record.*.depth > 2 { self.say("inode with an extent depth beyond 2:", number) }
+        if record.*.depth >= 1 && !self.use(record.*.tree) { self.say("inode whose extent block is out of range or in use twice:", number) }
+        if record.*.depth == 2 {
+            var pointers: [BLOCK]u8 = undefined
+            if self.*.device.readBlock(record.*.tree, &pointers) {
+                var t: usize = 0
+                while t < Brixfs.POINTERS_PER_BLOCK {
+                    const block = Brixfs.get(&pointers, t * 8, 8)
+                    if block != 0 && !self.use(block) { self.say("inode with an extent block out of range or in use twice:", number) }
+                    t += 1
+                }
+            }
+        }
+        var k: usize = 0
+        while k < record.*.extentCount {
+            const e = reader.extentAt(record, k, &extentBuffer, &pointerBuffer, readForReader)
+            if e.length == 0 {
+                self.say("inode whose extents cannot be read:", number)
+                return
+            }
+            if e.start + e.length > need { self.say("inode with an extent past its size:", number) }
+            var j: usize = 0
+            while j < e.length {
+                if !self.use(e.block + j) {
+                    self.say("inode naming a block out of range or in use twice:", number)
+                    break
+                }
+                j += 1
+            }
+            k += 1
+        }
+    }
+
+    // A directory's entries: each names an inode that is there; links
+    // counted. Cleared (in a staged copy) when `repairing` and naming
+    // nothing.
+    fn checkDirectory(self: *Self, root: usize, number: usize, record: *const Inode) -> void {
+        var block: [BLOCK]u8 = undefined
+        var index: usize = 0
+        while index * BLOCK < record.*.size {
+            readerDescriptor = self.*.device.descriptor
+            const at = reader.blockAt(record, index, &extentBuffer, &pointerBuffer, readForReader)
+            if at != 0 && self.*.device.readBlock(at, &block) {
+                var slot: usize = 0
+                while slot < BLOCK / Brixfs.ENTRY_SIZE && index * BLOCK + slot * Brixfs.ENTRY_SIZE < record.*.size {
+                    const child = Entry.inode(&block, slot)
+                    if child != 0 {
+                        var target: Inode = undefined
+                        if child >= Brixfs.MAX_INODES || !self.*.device.inode(root, child, &target) || target.kind == Brixfs.FREE {
+                            self.say("directory with an entry naming no inode:", number)
+                        } else {
+                            self.*.links[child] += 1
+                        }
+                    }
+                    slot += 1
+                }
+            }
+            index += 1
+        }
+    }
+
+    // One root (the current one or a snapshot's): everything it holds.
+    fn checkRoot(self: *Self, root: usize, nextInode: usize) -> void {
+        self.clearUsed()
+        var k: usize = 0
+        while k < Brixfs.MAX_INODES {
+            self.*.links[k] = 0
+            k += 1
+        }
+        if !self.use(root) { self.say("table root out of range:", root) }
+        var rootBlock: [BLOCK]u8 = undefined
+        if !self.*.device.readBlock(root, &rootBlock) {
+            self.say("table root cannot be read:", root)
+            return
+        }
+        var t: usize = 0
+        while t < Brixfs.POINTERS_PER_BLOCK {
+            const table = Brixfs.get(&rootBlock, t * 8, 8)
+            if table != 0 && !self.use(table) { self.say("inode block out of range or in use twice:", table) }
+            t += 1
+        }
+        // The inodes: kinds, extents, entries.
+        var number: usize = Brixfs.ROOT_INODE
+        while number < nextInode {
+            var record: Inode = undefined
+            if !self.*.device.inode(root, number, &record) {
+                number += 1
+                continue
+            }
+            if record.kind == Brixfs.FREE {
+                number += 1
+                continue
+            }
+            if record.kind > Brixfs.FIFO { self.say("inode of an unknown kind:", number) }
+            readerDescriptor = self.*.device.descriptor
+            reader.init()
+            self.checkExtents(number, &record)
+            if record.kind == Brixfs.DIRECTORY { self.checkDirectory(root, number, &record) }
+            number += 1
+        }
+        // Link counts (the root directory names itself once).
+        self.*.links[Brixfs.ROOT_INODE] += 1
+        number = Brixfs.ROOT_INODE
+        while number < nextInode {
+            var record: Inode = undefined
+            if self.*.device.inode(root, number, &record) && record.kind != Brixfs.FREE {
+                if record.links != @intCast(usize, self.*.links[number]) {
+                    self.say("inode whose link count is not the entries' (the inode):", number)
+                } else if self.*.links[number] == 0 {
+                    self.say("inode no directory names:", number)
+                }
+            }
+            number += 1
+        }
+    }
+}
+
+var checker: Check = undefined // (per run)
+
+fn check(path: [*]const u8, repairing: bool) -> u8 {
+    const opened = openDevice(path, repairing)
+    if opened == null { return fail("cannot open the device") }
+    const device = opened.?
+    var superblock: Superblock = undefined
+    if !device.superblock(&superblock) { return fail("no brixfs volume on the device") }
+    const c = &checker
+    c.*.device = device
+    c.*.blocks = superblock.blocks
+    c.*.problems = 0
+    if superblock.blocks > Check.MAX_BLOCKS_CHECKED { return fail("the volume is larger than check can hold (16 GiB)") }
+    if superblock.root == 0 || superblock.root >= superblock.blocks { c.say("superblock naming a table root out of range:", superblock.root) }
+    if superblock.nextInode > Brixfs.MAX_INODES { c.say("superblock with a next inode past the table:", superblock.nextInode) }
+    c.checkRoot(superblock.root, superblock.nextInode)
+    // Repair: link counts, in a new commit.
+    if repairing && c.*.problems > 0 {
+        var mended: usize = 0
+        var rootBlock: [BLOCK]u8 = undefined
+        if !device.readBlock(superblock.root, &rootBlock) { return fail("the table root cannot be read") }
+        var tableBlock: [BLOCK]u8 = undefined
+        var t: usize = 0
+        var cursor: usize = Brixfs.SUPERBLOCKS
+        while t < Brixfs.POINTERS_PER_BLOCK {
+            const table = Brixfs.get(&rootBlock, t * 8, 8)
+            if table != 0 && device.readBlock(table, &tableBlock) {
+                var changed = false
+                var i: usize = 0
+                while i < Brixfs.INODES_PER_BLOCK {
+                    const number = t * Brixfs.INODES_PER_BLOCK + i
+                    var record: Inode = undefined
+                    record.decode(&tableBlock, i * Brixfs.INODE_SIZE)
+                    if record.kind != Brixfs.FREE && number < superblock.nextInode && record.links != @intCast(usize, c.*.links[number]) && c.*.links[number] > 0 {
+                        record.links = @intCast(usize, c.*.links[number])
+                        record.encode(&tableBlock, i * Brixfs.INODE_SIZE)
+                        changed = true
+                        mended += 1
+                    }
+                    i += 1
+                }
+                if changed {
+                    // A free block for the new table block.
+                    while cursor < superblock.blocks && c.isUsed(cursor) { cursor += 1 }
+                    if cursor >= superblock.blocks { return fail("no free block for the repair") }
+                    if !device.writeBlock(cursor, &tableBlock) { return fail("cannot write") }
+                    _ = c.use(cursor)
+                    Brixfs.put(&rootBlock, t * 8, 8, cursor)
+                }
+            }
+            t += 1
+        }
+        if mended > 0 {
+            while cursor < superblock.blocks && c.isUsed(cursor) { cursor += 1 }
+            if cursor >= superblock.blocks { return fail("no free block for the repair") }
+            if !device.writeBlock(cursor, &rootBlock) { return fail("cannot write") }
+            var next = superblock
+            next.generation += 1
+            next.root = cursor
+            var block: [BLOCK]u8 = undefined
+            next.encode(&block)
+            // The other superblock: the one the newer generation is not in.
+            var slot: usize = 0
+            var first: Superblock = undefined
+            if device.readBlock(0, &block) && first.decode(&block) && first.generation == superblock.generation { slot = 1 }
+            next.encode(&block)
+            if !device.writeBlock(slot, &block) { return fail("cannot write the superblock") }
+            print("brixfs: ")
+            printNumber(mended)
+            print(" link counts mended (generation ")
+            printNumber(next.generation)
+            print(")\n")
+        }
+    }
+    if c.*.problems == 0 {
+        print("brixfs: the volume is sound\n")
+        return 0
+    }
+    return 1
+}
+
 pub fn main(arguments: [][*]const u8) -> u8 {
     const count = std.process.count(arguments)
-    if count < 3 { return fail("usage: brixfs format|list DEVICE | brixfs cat|blocks DEVICE PATH | brixfs create IMAGE MIB") }
+    if count < 3 { return fail("usage: brixfs format|list|check|repair DEVICE | brixfs cat|blocks DEVICE PATH | brixfs create IMAGE MIB") }
     const command = std.string.asSlice(std.process.argument(arguments, 1))
     const device = std.process.argument(arguments, 2).pointer
     if std.text.same(command, "format") && count == 3 { return formatDevice(device) }
@@ -337,5 +594,7 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     if std.text.same(command, "list") && count == 3 { return list(device) }
     if std.text.same(command, "cat") && count == 4 { return cat(device, std.string.asSlice(std.process.argument(arguments, 3))) }
     if std.text.same(command, "blocks") && count == 4 { return blocks(device, std.string.asSlice(std.process.argument(arguments, 3))) }
-    return fail("usage: brixfs format|list DEVICE | brixfs cat|blocks DEVICE PATH | brixfs create IMAGE MIB")
+    if std.text.same(command, "check") && count == 3 { return check(device, false) }
+    if std.text.same(command, "repair") && count == 3 { return check(device, true) }
+    return fail("usage: brixfs format|list|check|repair DEVICE | brixfs cat|blocks DEVICE PATH | brixfs create IMAGE MIB")
 }

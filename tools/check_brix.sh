@@ -586,3 +586,10 @@ type_line 'ls m3 | wc -l; rm -r m1 m2 m3 && echo removed'
 wait_for '^400$' 3
 wait_for '^removed$'
 echo "ok   brixfs: more files than nodes in memory (directories unloaded when idle, read again)"
+
+# The volume checked: in brixOS on the device, on the host on the image.
+type_line 'sync; brixfs check /devices/disk0'
+wait_for '^brixfs: the volume is sound$'
+"$work/linux-tools/brixfs" check "$work/disk.img" > "$work/check.txt" 2>&1 || fail "the host's brixfs check finds something: $(cat "$work/check.txt")"
+grep -q '^brixfs: the volume is sound$' "$work/check.txt" || fail "the host's brixfs check does not say the volume is sound"
+echo "ok   brixfs check: the volume is sound, in brixOS and on the host"

@@ -63,6 +63,10 @@ pub const Node = struct {
     // Its owner and group (users and groups by number, 0 the system's).
     user: usize
     group: usize
+    // A directory's index of its entries by name (a frame of hash slots
+    // naming entry slots; 0: none, made at the first lookup of a big
+    // directory, dropped with its entries).
+    index: usize
     // Part of a read-only snapshot: neither it nor (a directory) what it
     // names changes.
     readOnly: bool
@@ -184,6 +188,7 @@ pub const Vfs = struct {
                 n.*.archiveIndex = 0
                 n.*.user = 0
                 n.*.group = 0
+                n.*.index = 0
                 n.*.pipe = 0
                 n.*.readOnly = false
                 n.*.volume = 0
@@ -268,6 +273,7 @@ pub const Vfs = struct {
         self.freeBlocks(index, 0)
         n.*.size = size
         n.*.loaded = false
+        self.dropIndex(index)
     }
 
     // `name` in a directory for `target` as it was read from a disk: no
@@ -285,6 +291,7 @@ pub const Vfs = struct {
         Bytes.copy(Bytes.pointer(layout.Memory.virtual(page) + at % Page.SIZE), &record, ENTRY_SIZE)
         d.*.size = at + ENTRY_SIZE
         if self.node(target).*.isDirectory() { self.node(target).*.parent = directory }
+        self.indexEntry(directory, at / ENTRY_SIZE, name, length)
         return true
     }
 
@@ -512,6 +519,7 @@ pub const Vfs = struct {
         const n = self.node(index)
         if n.hasPages() { self.freeBlocks(index, 0) }
         n.*.size = 0
+        self.dropIndex(index)
     }
 
     // Up to `length` bytes of the node's data from `offset` into `into`:
@@ -688,9 +696,133 @@ pub const Vfs = struct {
 
     // The node a directory names `name`; NONE when none ("." and ".."
     // too).
+    // ---- a directory's index ----
+
+    // Directories with this many entry slots or more are looked up by an
+    // index: hash slots (u32, an entry slot + 1; 0 free) in frames, two
+    // for each entry slot rounded up to a power of two, probed in order;
+    // an entry that went leaves a slot naming an empty entry behind
+    // (the name does not match: the probing goes on), and an index that
+    // grew long chains is made again. Index slot 0 holds the entry
+    // count the index was made for (its capacity follows from it).
+    const INDEX_FROM: usize = 64
+    const INDEX_MAX_FRAMES: usize = 64
+
+    fn hashName(name: [*]const u8, length: usize) -> usize {
+        var hash: usize = 0xCBF29CE484222325
+        var k: usize = 0
+        while k < length {
+            hash = (hash ^ @intCast(usize, name[k])) *% 0x100000001B3
+            k += 1
+        }
+        return hash
+    }
+
+    // How many hash slots the index of a directory with `slots` entry
+    // slots has (0: too big).
+    fn indexCapacity(slots: usize) -> usize {
+        var capacity: usize = 1024
+        while capacity < slots * 2 && capacity < INDEX_MAX_FRAMES * 1024 { capacity *= 2 }
+        return if capacity < slots * 2 { 0 } else { capacity }
+    }
+
+    fn indexSlots(self: *Self, directory: usize) -> [*]u32 { return unsafe { @ptrFromInt([*]u32, layout.Memory.virtual(self.node(directory).*.index)) } }
+
+    // The entry slots the index was made for.
+    fn indexedSlots(self: *Self, directory: usize) -> usize { return @intCast(usize, self.indexSlots(directory)[0]) }
+
+    pub fn dropIndex(self: *Self, directory: usize) -> void {
+        const n = self.node(directory)
+        if n.*.index == 0 { return }
+        const frames = memory.allFrames()
+        const pages = indexCapacity(self.indexedSlots(directory)) / 1024
+        var k: usize = 0
+        while k < pages {
+            frames.free(n.*.index + k * Page.SIZE)
+            k += 1
+        }
+        n.*.index = 0
+    }
+
+    // The directory's index made from its entries (none when memory is
+    // out or it is too big).
+    fn buildIndex(self: *Self, directory: usize) -> void {
+        const slots = self.slotCount(directory)
+        const capacity = indexCapacity(slots)
+        if capacity == 0 { return }
+        const frame = memory.allFrames().allocateContiguous(capacity / 1024)
+        if frame == 0 { return }
+        self.node(directory).*.index = frame
+        const table = self.indexSlots(directory)
+        var k: usize = 0
+        while k < capacity {
+            table[k] = 0
+            k += 1
+        }
+        table[0] = @intCast(u32, slots)
+        var slot: usize = 0
+        while slot < slots {
+            var name: [*]const u8 = undefined
+            var length: usize = 0
+            if self.entry(directory, slot, &name, &length) != NONE { self.indexEntry(directory, slot, name, length) }
+            slot += 1
+        }
+    }
+
+    // Entry `slot` named `name` into the index (when there is one); a
+    // chain longer than 32, or a slot past what the index was made for,
+    // drops the index (made again at a lookup).
+    fn indexEntry(self: *Self, directory: usize, slot: usize, name: [*]const u8, length: usize) -> void {
+        const n = self.node(directory)
+        if n.*.index == 0 { return }
+        const capacity = indexCapacity(self.indexedSlots(directory))
+        if slot * 2 >= capacity {
+            self.dropIndex(directory)
+            return
+        }
+        const table = self.indexSlots(directory)
+        var at = hashName(name, length) & (capacity - 1)
+        if at == 0 { at = 1 }
+        var probes: usize = 0
+        while table[at] != 0 {
+            probes += 1
+            if probes > 32 {
+                self.dropIndex(directory)
+                return
+            }
+            at = (at + 1) & (capacity - 1)
+            if at == 0 { at = 1 }
+        }
+        table[at] = @intCast(u32, slot + 1)
+    }
+
+    // The entry named `name`, by the index (which is there).
+    fn lookupIndexed(self: *Self, directory: usize, name: [*]const u8, length: usize) -> usize {
+        const capacity = indexCapacity(self.indexedSlots(directory))
+        const table = self.indexSlots(directory)
+        var at = hashName(name, length) & (capacity - 1)
+        if at == 0 { at = 1 }
+        var probes: usize = 0
+        while table[at] != 0 && probes <= capacity {
+            const slot = @intCast(usize, table[at]) - 1
+            var entryName: [*]const u8 = undefined
+            var entryLength: usize = 0
+            const found = self.entry(directory, slot, &entryName, &entryLength)
+            if found != NONE && sameName(entryName, entryLength, name, length) { return found }
+            probes += 1
+            at = (at + 1) & (capacity - 1)
+            if at == 0 { at = 1 }
+        }
+        return NONE
+    }
+
     pub fn lookup(self: *Self, directory: usize, name: [*]const u8, length: usize) -> usize {
         if length == 1 && name[0] == 46 { return directory }
         if length == 2 && name[0] == 46 && name[1] == 46 { return self.node(directory).*.parent }
+        if self.slotCount(directory) >= INDEX_FROM {
+            if self.node(directory).*.index == 0 { self.buildIndex(directory) }
+            if self.node(directory).*.index != 0 { return self.lookupIndexed(directory, name, length) }
+        }
         var slot: usize = 0
         while slot < self.slotCount(directory) {
             var entryName: [*]const u8 = undefined
@@ -728,6 +860,7 @@ pub const Vfs = struct {
         Bytes.write32(&record, 0, target)
         record[4] = @intCast(u8, length)
         Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(&record) + 5) }, name, length)
+        self.indexEntry(directory, slot, name, length)
         const written = self.write(directory, slot * ENTRY_SIZE, &record, ENTRY_SIZE)
         if written < 0 { return written }
         const t = self.node(target)

@@ -227,6 +227,22 @@ gives a volume node's inode number and the volume as its device.
     brixfs list disk.img             every path and size, the snapshots
     brixfs cat disk.img docs/a       a file
     brixfs blocks disk.img docs/a    a file's block numbers (0: a hole)
+    brixfs check disk.img            the volume checked (the table, every
+                                     inode's extents in range and no
+                                     block in two files of one root,
+                                     entries naming inodes that are
+                                     there, link counts; the snapshots'
+                                     roots too); also on brixOS, on
+                                     /devices/disk0 while mounted
+    brixfs repair disk.img           checked, link counts mended in a
+                                     new commit
+
+A directory of 64 entry slots or more is looked up through an index
+made at its first lookup (`Vfs.buildIndex`: hash slots in frames, two
+for each entry slot, probed in order), kept up as entries are added,
+and dropped with the directory's entries (unloaded, or when a chain
+grows long: made again at the next lookup). The entries on the disk
+stay a list.
 
 Users: a process runs as a user and a group (0, the system's, at boot;
 setuid and setgid, which only the system's user may use to become
