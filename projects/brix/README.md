@@ -297,12 +297,16 @@ The pieces:
   The code is position independent, so the kernel runs where the boot
   maps it (the higher half).
 - **brix-image** (projects/brix/image): one file QEMU (or any Multiboot
-  loader) boots. The first MiB is the boot blob, assembled by brix-image
-  itself (asm.mlx's `Asm`: bytes, labels, fixups): the Multiboot header, the
-  boot info the kernel reads (layout.mlx `Info`), GDT, TSS, IDT, the
-  32-bit entry (page tables for the first GiB at 0 and at
-  0xFFFF800000000000, long mode), the 64-bit start (higher half, IDT,
-  TSS, SYSCALL MSRs, SSE), the SYSCALL entry and a stub per vector. Then
+  loader) boots. The first MiB is the boot blob: its code is AT&T
+  assembly (blob.mlx, ap.mlx, efi.mlx) assembled by mlx-cc's assembler
+  (compiler/cc/asm.mlx, through assemble.mlx: the layout's numbers as
+  `.set` constants, the parts at their offsets by `.org`, the kernel's
+  _start, brix_trap and brix_ap by relocation), its tables written by
+  brix-image: the Multiboot header, the boot info the kernel reads
+  (layout.mlx `Info`), GDT, TSSs, IDT, the 32-bit entry (page tables for
+  the first GiB at 0 and at 0xFFFF800000000000, long mode), the 64-bit
+  start (higher half, IDT, TSS, SYSCALL MSRs, SSE), the SYSCALL entry
+  and a stub per vector. Then
   the kernel's segments (at 2 MiB) and the archive of files
   (`BRIXFS01`: name, offset, size; `NAME=FILE` and `DIRECTORY/`
   arguments, sorted by name), up to the kernel's arena at 64 MiB.

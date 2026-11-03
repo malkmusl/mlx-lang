@@ -992,7 +992,13 @@ GNU as makes it, the stack 16-byte aligned at a call (libpas's
 double-free check), and the data directives (`tests/inlineasm.c`
 against gcc's build;
 `tests/asmencoding.c` prints each instruction's bytes, which are GNU
-as's). The SSE instructions are SSE2's, SSSE3's and SSE4's over packed
+as's). For boot code (brixOS's boot blob, projects/brix/image) top-level
+assembly also has `.code16`, `.code32` and `.code64`, `.org`, `.set`,
+the system instructions (cli, sti, hlt, lgdt, lidt, ltr, invlpg,
+swapgs, rdmsr, wrmsr, iretq, lretq, ljmp, in, out, fxsave, fxrstor,
+the control and segment registers), segment overrides (`%gs:8`) and
+relocations for `movabs $symbol, %reg` and `ljmp $sel, $symbol`
+(`tests/bootasm.c`). The SSE instructions are SSE2's, SSSE3's and SSE4's over packed
 values too (`paddb` to `pcmpgtq`, the shuffles, blends and roundings
 with their immediates, `pmovmskb`, `ptest`): the legacy encodings of
 the VEX.128 ones WebAssembly's interpreter uses, from the same table. JavaScriptCore's copy loops for the garbage collector
