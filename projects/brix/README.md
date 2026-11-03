@@ -18,10 +18,10 @@ line and runs mlx-sh in user mode on it, and the programs of its boot
 archive (the coreutils) as processes of their own, on a file system in
 memory with brixOS's own layout and copy on write:
 
-    ./mlx build brix
+    ./mlx build brix           # also mlx-out/bin/brix/disk.img (16 MiB)
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
         -kernel mlx-out/bin/brix/brix.img \
-        -drive file=disk.img,format=raw,if=virtio     # a disk, if wanted
+        -drive file=mlx-out/bin/brix/disk.img,format=raw,if=virtio
     tools/check_brix.sh        # the same, typed at, checked
 
     brixOS: kernel at 0x200000, 292 KiB
@@ -165,7 +165,10 @@ clean files' pages are dropped; both are read again when used. stat
 gives a volume node's inode number and the volume as its device.
 
     brixfs format /devices/disk0     on brixOS (it is mounted at once), or
-    brixfs format disk.img           on the host
+    brixfs format disk.img           on the host (mlx-out/bin/brixfs)
+    brixfs create disk.img 16        a formatted 16 MiB image (one that
+                                     is there is kept; ./mlx build brix
+                                     makes mlx-out/bin/brix/disk.img so)
     brixfs list disk.img             every path and size, the snapshots
     brixfs cat disk.img docs/a       a file
     brixfs blocks disk.img docs/a    a file's block numbers (0: a hole)

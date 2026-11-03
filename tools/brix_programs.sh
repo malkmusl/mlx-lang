@@ -2,7 +2,10 @@
 # (tools/check_brix.sh compares the two): what each prints between
 # "@@ command" and "@@ status N". Nothing here may depend on the machine:
 # not the directory (both work in one named work), the user, the CPUs.
-# Standard input is /dev/null (no program waits for a terminal).
+# Standard input is the null device (no program waits for a terminal):
+# $N, /dev/null on the host, /devices/null in brixOS (its programs see
+# brixOS's own paths).
+if [ -n "$T" ]; then N=/dev/null; else N=/devices/null; fi
 umask 022
 cd ${T:-/temporary} && mkdir work && cd work
 printf 'b\na\nc\na\n' > f; seq 10 > n; printf 'x 1\ny 2\n' > j1; printf 'x A\ny B\n' > j2
@@ -37,7 +40,7 @@ r head -n 2 n
 r join j1 j2
 r link f hard
 r ln -s f soft
-echo "@@ logname"; logname > /dev/null 2>&1; echo "@@ ran"
+echo "@@ logname"; logname > $N 2>&1; echo "@@ ran"
 r ls -1
 r md5sum f
 r mkdir dir
@@ -98,7 +101,7 @@ r unexpand -a spaces
 r uniq s1
 r unlink hard
 r wc n
-echo "@@ whoami"; whoami > /dev/null; echo "@@ status $?"
+echo "@@ whoami"; whoami > $N; echo "@@ status $?"
 echo "@@ yes | head -n 2"; yes | head -n 2; echo "@@ status $?"
 r ls -1
 

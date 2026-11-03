@@ -86,7 +86,7 @@ done
 for tool in brixfs floats signals; do
     "$compiler" --quiet "projects/brix/tools/$tool/main.mlx" -o "$work/linux-tools/$tool"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "objects=$work/objects" "kinds=$work/kinds" "every-program=tools/brix_programs.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "objects=$work/objects" "kinds=$work/kinds" "linux-cat=$work/linux-tools/bin/cat" "linux-ls=$work/linux-tools/bin/ls" "every-program=tools/brix_programs.sh" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
@@ -167,7 +167,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines; built for brixOS, uname -o says so"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for "^$(( ${#programs[@]} + 10 ))\$"
+wait_for "^$(( ${#programs[@]} + 12 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -194,7 +194,7 @@ wait_for '^700$'
 wait_for '^5$'
 echo "ok   the umask, /devices/null, /devices/zero"
 
-type_line 'echo linux > /tmp/l; cat /temporary/l; echo y > /dev/null; cat /etc/passwd; ls /dev'
+type_line 'echo linux > /temporary/l; linux-cat /tmp/l; linux-cat /dev/null; linux-cat /etc/passwd; linux-ls /dev'
 wait_for '^linux$'
 wait_for '^root:x:0:0:root:/users/root:/system/programs/mlx-sh$'
 wait_for '^console  disk0[[:space:]]*null  tty  zero$'
@@ -266,7 +266,7 @@ echo "ok   all ${#programs[@]} coreutils programs run as on the host (links, FIF
 
 # Two programs at once that compute in the SSE registers for many time
 # slices, each keeping its own.
-type_line 'floats > /tmp/f1 & floats > /tmp/f2; wait; cat /tmp/f1 /tmp/f2'
+type_line 'floats > /temporary/f1 & floats > /temporary/f2; wait; cat /temporary/f1 /temporary/f2'
 sum=$("$work/linux-tools/floats")
 wait_for "^$sum$" 2
 echo "ok   two programs at once keep their own SSE registers"
@@ -451,11 +451,11 @@ echo "ok   Ctrl-C ends the foreground program (SIGINT)"
 # The timer and the serial line's interrupts: a program that never waits
 # is ended by Ctrl-C; a busy one in the background leaves time to the
 # others.
-type_line 'yes > /dev/null'
+type_line 'yes > /devices/null'
 type_to_program '\003'
 type_line 'echo busy $?'
 wait_for '^busy 130$'
-type_line 'yes > /dev/null & sleep 1; echo the shell runs; kill $!; wait $!; echo ended $?'
+type_line 'yes > /devices/null & sleep 1; echo the shell runs; kill $!; wait $!; echo ended $?'
 wait_for '^the shell runs$'
 wait_for '^ended 143$'
 echo "ok   preemption: Ctrl-C ends a busy program, a busy one in the background leaves time to the shell"
@@ -474,11 +474,11 @@ wait_for '^two$' 2
 type_to_program '\004'
 type_line 'echo fg $?'
 wait_for '^fg 0$'
-type_line 'yes > /dev/null'
+type_line 'yes > /devices/null'
 type_to_program '\032'
-wait_for '^\[1\]+ Stopped  yes > /dev/null$'
+wait_for '^\[1\]+ Stopped  yes > /devices/null$'
 type_line 'bg; jobs; kill %1; wait; echo bg done'
-wait_for '^\[1\]+ Running  yes > /dev/null$'
+wait_for '^\[1\]+ Running  yes > /devices/null$'
 wait_for '^bg done$'
 type_line 'cat &'
 type_line 'sleep 1; jobs'
