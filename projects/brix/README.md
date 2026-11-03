@@ -372,9 +372,9 @@ layer.
 
 ## Next
 
-1. mlx-sh on brixOS's own calls: its jobs as groups by handle,
-   programs by process_spawn; then std.posix as the facade for the rest
-   (std's opening, directories and std.spawn are native already).
+1. std.posix as the facade for the rest: what programs still ask the
+   Linux layer (stat, chdir, pipes, fcntl, signals of their own); mlx-sh
+   already runs on brixOS's own calls (projects/shell/host.brixos.mlx).
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
 3. EFI boot (PE32+, GOP framebuffer) beside Multiboot.

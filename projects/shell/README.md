@@ -120,8 +120,16 @@ given back after it (`std.turns`), so a long loop does not grow the
 shell; with `MLX_TURNS_POISON` set what is given back is overwritten,
 which `tools/check_shell.sh` runs with.
 
-- `sys.mlx`: the syscalls and signals; the terminal (raw mode, its size,
-  job control's process groups) is `std.terminal.tty`'s.
+- `sys.mlx`: the syscalls and signals; the terminal (raw mode, its size)
+  is `std.terminal.tty`'s.
+- `host.mlx`: how the shell makes and looks after its processes: fork,
+  execve, wait4, process groups, the terminal's front, kill (Linux's).
+  `host.brixos.mlx` is the same on brixOS's own calls (built with
+  `--target=x86_64-brixos`): branch, replace, process_change, group_join,
+  session_front, event_send; a child is a process handle (`$!` and `jobs
+  -p` give it), a job's group a group handle, and the shell reads
+  process_change's records as wait4's words and its signal numbers as
+  brixOS's events.
 - `state.mlx`: the `Shell`, the arenas, variables, functions,
   positionals, messages.
 - `parser.mlx`: a tokenizer and recursive descent into nodes (words are
