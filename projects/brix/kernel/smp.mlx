@@ -1,32 +1,84 @@
 // The other processors: found in ACPI's MADT (the BIOS's RSDP, its RSDT,
-// the APIC table's local APICs), started through the local APIC (INIT,
-// then two startup IPIs naming the trampoline's page, layout.Ap) and
-// counted as they reach long mode. They wait there, halted: the kernel
-// runs on the first processor only (no per-processor state, no lock yet).
+// the APIC table's local APICs), given a trap stack, a TSS and a block
+// each (layout.PerCpu), started through the local APIC (INIT, then two
+// startup IPIs naming the trampoline's page, layout.Ap) and counted as
+// they reach long mode; they go on into the kernel (brix_ap, trap.mlx)
+// and run processes of their own, their time slices by their local
+// APIC's timer. The kernel runs on one processor at a time (`lock`, the
+// kernel lock: taken at every entry, let go while a processor idles);
+// the processes run beside each other. At most layout.Memory.MAX_CPUS
+// run it; the rest stay in the trampoline, halted.
 const layout = @import("../layout.mlx")
 const memory = @import("./memory.mlx")
 const clock = @import("./clock.mlx")
+const cpu = @import("./cpu.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
 
 // The local APIC's registers (its page mapped uncached at its physical
 // address in the kernel's view).
 const LAPIC: usize = 0xFEE00000
 const ID: usize = 0x20
+const EOI: usize = 0xB0
+const SPURIOUS: usize = 0xF0
 const ICR_LOW: usize = 0x300
 const ICR_HIGH: usize = 0x310
+const LVT_TIMER: usize = 0x320
+const TIMER_INITIAL: usize = 0x380
+const TIMER_CURRENT: usize = 0x390
+const TIMER_DIVIDE: usize = 0x3E0
 const DELIVERY_PENDING: u32 = 0x1000
-const MAX_CPUS: usize = 32
+const TIMER_PERIODIC: u32 = 0x20000
+const TIMER_MASKED: u32 = 0x10000
+const MAX_LISTED: usize = 32
+// A trap stack: 64 pages (as the first processor's).
+const STACK_PAGES: usize = 64
+
+pub const MAX_CPUS: usize = layout.Memory.MAX_CPUS
 
 pub const Processors = struct {
-    // Processors the MADT names (enabled), and how many more started.
+    // Processors the MADT names (enabled), how many more started (into
+    // the trampoline), and how many run the kernel.
     count: usize
     started: usize
-    apicIds: [MAX_CPUS]usize
+    running: usize
+    apicIds: [MAX_LISTED]usize
+    // The local APIC's timer ticks in 10 ms (a time slice).
+    timerTicks: usize
+    mapped: bool
 }
 
 var found: Processors = undefined // (per run)
 
 pub fn processors() -> *Processors { return &found }
+
+// The kernel lock: the processor holding it (+ 1; 0: none) and how
+// often it took it (an interrupt while it waits inside the kernel takes
+// it again).
+var lockOwner: usize = 0 // (per run)
+var lockDepth: usize = 0 // (per run)
+// The processor the kernel runs on (valid while it holds the lock).
+var current: usize = 0 // (per run)
+
+pub fn currentCpu() -> usize { return current }
+
+// The kernel taken by processor `id` (waited for when another has it).
+pub fn lock(id: usize) -> void {
+    if lockOwner == id + 1 {
+        lockDepth += 1
+        return
+    }
+    while true {
+        const taken = @cmpxchgWeak(usize, &lockOwner, 0, id + 1, acquire, monotonic)
+        if taken.0 { break }
+    }
+    lockDepth = 1
+    current = id
+}
+
+pub fn unlock() -> void {
+    lockDepth -= 1
+    if lockDepth == 0 { @atomicStore(usize, &lockOwner, 0, release) }
+}
 
 fn physical(address: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(address)) }
 
@@ -73,6 +125,7 @@ fn reg(offset: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, layout.Memory.
 // fourth GiB under the boot PDPT (which every address space shares), its
 // 2 MiB page there uncached; false when memory is out.
 fn mapApic() -> bool {
+    if found.mapped { return true }
     const pdpt = physical(layout.Memory.BLOB + layout.Blob.PDPT)
     if Bytes.read64(pdpt, 3 * 8) & 1 == 0 {
         const directory = memory.allFrames().allocate()
@@ -82,6 +135,7 @@ fn mapApic() -> bool {
     const directory = Bytes.read64(pdpt, 3 * 8) & memory.Page.ADDRESS
     // Present, writable, a 2 MiB page, write-through, uncached.
     Bytes.write64(physical(directory), ((LAPIC >> 21) & 511) * 8, LAPIC | 0x83 | 0x18)
+    found.mapped = true
     return true
 }
 
@@ -97,11 +151,61 @@ fn send(apic: usize, command: u32) -> void {
     while reg(ICR_LOW).* & DELIVERY_PENDING != 0 && tries < 1000000 { tries += 1 }
 }
 
+// The local APIC's timer ticks in 10 ms, measured on this processor
+// (the timer counts the bus clock, the same on every one).
+fn measureTimer() -> void {
+    reg(SPURIOUS).* = 0x100 | @intCast(u32, layout.Vector.SPURIOUS)
+    reg(TIMER_DIVIDE).* = 0xB
+    reg(LVT_TIMER).* = TIMER_MASKED | @intCast(u32, layout.Vector.LAPIC_TIMER)
+    reg(TIMER_INITIAL).* = 0xFFFFFFFF
+    wait(10000000)
+    const left = @intCast(usize, reg(TIMER_CURRENT).*)
+    reg(TIMER_INITIAL).* = 0
+    found.timerTicks = 0xFFFFFFFF - left
+}
+
+// This processor's local APIC timer: an interrupt (Vector.LAPIC_TIMER)
+// every 10 ms, its time slice.
+pub fn startTimer() -> void {
+    if found.timerTicks == 0 { return }
+    reg(SPURIOUS).* = 0x100 | @intCast(u32, layout.Vector.SPURIOUS)
+    reg(TIMER_DIVIDE).* = 0xB
+    reg(LVT_TIMER).* = TIMER_PERIODIC | @intCast(u32, layout.Vector.LAPIC_TIMER)
+    reg(TIMER_INITIAL).* = @intCast(u32, found.timerTicks)
+}
+
+// The end of a local APIC interrupt (its timer's).
+pub fn endOfInterrupt() -> void { reg(EOI).* = 0 }
+
+// Processor `k`'s block and TSS: a trap stack of its own, its share of
+// the arena, its number; false when memory is out.
+fn prepare(k: usize) -> bool {
+    const stack = memory.allFrames().allocateContiguous(STACK_PAGES)
+    if stack == 0 { return false }
+    const top = layout.Memory.virtual(stack + STACK_PAGES * memory.Page.SIZE)
+    const block = Bytes.pointer(layout.Blob.perCpuOf(k))
+    Bytes.write64(block, layout.PerCpu.TRAP_STACK, top)
+    Bytes.write64(block, layout.PerCpu.USER_RSP, 0)
+    Bytes.write64(block, layout.PerCpu.ARENA_BASE, layout.Memory.KERNEL_VIRTUAL + layout.Memory.arenaOf(k))
+    Bytes.write64(block, layout.PerCpu.ARENA_END, layout.Memory.KERNEL_VIRTUAL + layout.Memory.arenaOf(k + 1))
+    Bytes.write64(block, layout.PerCpu.INDEX, k)
+    // Its arena's bump-pointer word (the arena's first, as _start sets
+    // the first processor's).
+    resetArena(k)
+    // Its TSS: rsp0, the trap stack (interrupts from user mode).
+    Bytes.write64(Bytes.pointer(layout.Blob.tssOf(k)), 4, top)
+    return true
+}
+
 // The processors found, the others started (INIT, two startup IPIs),
-// waited for up to a second.
+// waited for up to a second; the first MAX_CPUS - 1 of them come into
+// the kernel (brix_ap) once the first processor lets go of it.
 pub fn start() -> void {
     found.count = 1
     found.started = 0
+    found.running = 1
+    found.timerTicks = 0
+    found.mapped = false
     const pointer = rsdp()
     if pointer == 0 { return }
     const rsdt = Bytes.read32(physical(pointer), 16)
@@ -123,21 +227,28 @@ pub fn start() -> void {
         const size = @intCast(usize, physical(madt)[at + 1])
         if size < 2 { break }
         // A processor's local APIC, enabled.
-        if kind == 0 && Bytes.read32(physical(madt), at + 4) & 1 != 0 && found.count < MAX_CPUS {
+        if kind == 0 && Bytes.read32(physical(madt), at + 4) & 1 != 0 && found.count < MAX_LISTED {
             found.apicIds[found.count] = @intCast(usize, physical(madt)[at + 3])
             found.count += 1
         }
         at += size
     }
     if found.count < 2 || !mapApic() { return }
+    measureTimer()
+    // The blocks of those that will run the kernel.
+    var k: usize = 1
+    while k < found.count && k < MAX_CPUS {
+        if !prepare(k) { return }
+        k += 1
+    }
     // The trampoline where the startup IPI's vector names it.
     Bytes.copy(physical(layout.Ap.START), physical(layout.Memory.BLOB + layout.Blob.AP), layout.Ap.SIZE)
     const counter = unsafe { @ptrFromInt(*u32, layout.Memory.virtual(layout.Ap.START + layout.Ap.STARTED)) }
     counter.* = 0
     const own = @intCast(usize, reg(ID).* >> 24)
-    var k: usize = 0
+    k = 0
     var others: usize = 0
-    while k < found.count {
+    while k < found.count && others < MAX_CPUS - 1 {
         const apic = found.apicIds[k]
         if apic != own {
             others += 1
@@ -153,4 +264,18 @@ pub fn start() -> void {
     const until = clock.system().monotonic() + 1000000000
     while @intCast(usize, counter.*) < others && clock.system().monotonic() < until {}
     found.started = @intCast(usize, counter.*)
+}
+
+// Processor `k`'s arena emptied: its bump-pointer word (the arena's
+// first) at the start again. For a kernel path that does not return to
+// its callers (brix_ap entering user mode), whose allocations would
+// stay.
+pub fn resetArena(k: usize) -> void {
+    const base = layout.Memory.KERNEL_VIRTUAL + layout.Memory.arenaOf(k)
+    Bytes.write64(Bytes.pointer(base), 0, base + 8)
+}
+
+// Processor `id` runs the kernel from now on (its first entry).
+pub fn joined(id: usize) -> void {
+    if id + 1 > found.running { found.running = id + 1 }
 }

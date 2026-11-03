@@ -27,9 +27,28 @@ memory with brixOS's own layout and copy on write:
 With `-smp N`, the kernel finds the processors in ACPI's MADT and starts
 the others through the local APIC (INIT and startup IPIs naming the
 trampoline's page, image/ap.mlx, kernel/smp.mlx): they reach long mode on
-the boot page tables and wait there, halted ("brixOS: 4 processors, 3
-more started (halted)"; tools/check_brix_smp.sh); the kernel runs on the
-first one only for now.
+the boot page tables, take a number each (the trampoline's counter), go
+on in the blob's code64 (the kernel's GDT and IDT, a TSS and a block of
+their own, layout.PerCpu, as the kernel's GS base: trap stack, arena,
+number) and come into the kernel at brix_ap ("brixOS: 4 processors, 3
+more started", "brixOS: processor 1 runs"; tools/check_brix_smp.sh). Up
+to Memory.MAX_CPUS (8) run the kernel; more stay halted.
+
+The kernel runs on one processor at a time: every entry (brix_trap,
+brix_ap) takes the kernel lock (smp.mlx; an interrupt while the kernel
+waits on the same processor takes it again) and lets it go on the way
+back to user mode or while the processor idles (on the boot page
+tables, halted until an interrupt). The processes run beside each
+other: a ready process is taken by whichever processor looks first (a
+running one by none other: State.running), with its registers, SSE
+state, page tables and FS base; a processor keeps its own current
+process. The first processor's time slices come from the PIT, the
+others' from their local APIC timers (vector 0xF0, calibrated against
+the clock at boot); the PIC's interrupts (the serial line, the disks)
+reach the first one only, so another processor polls a disk request.
+An idle processor notices new work at its next timer tick (no IPIs
+yet). A process ending or the shell restarting on one processor leaves
+the processes running on others alone (they end as usual).
 
 or from UEFI (OVMF's firmware in QEMU; on a machine, the same file as
 EFI/BOOT/BOOTX64.EFI on a FAT partition):

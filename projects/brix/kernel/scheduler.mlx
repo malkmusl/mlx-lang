@@ -14,6 +14,8 @@ const objects = @import("./native/objects.mlx")
 const events = @import("./events.mlx")
 const linux_signals = @import("./linux/signals.mlx")
 const volume = @import("./volume.mlx")
+const smp = @import("./smp.mlx")
+const memory = @import("./memory.mlx")
 const frame_module = @import("./frame.mlx")
 const Frame = frame_module.Frame
 const Sse = frame_module.Sse
@@ -30,7 +32,8 @@ pub const Scheduler = struct {
     pub const FIRST_PID: usize = 1
 
     processes: [MAX]Process
-    current: usize
+    // Each processor's current process (the one it runs, or ran last).
+    current: [smp.MAX_CPUS]usize
     nextPid: usize
     // The terminal's foreground process group (tcsetpgrp).
     foreground: usize
@@ -42,12 +45,53 @@ pub const Scheduler = struct {
             self.*.processes[k].pid = 0
             k += 1
         }
-        self.*.current = 0
+        k = 0
+        while k < smp.MAX_CPUS {
+            self.*.current[k] = 0
+            k += 1
+        }
         self.*.nextPid = FIRST_PID
         self.*.foreground = FIRST_PID
     }
 
-    pub fn running(self: *Self) -> *Process { return &self.*.processes[self.*.current] }
+    pub fn running(self: *Self) -> *Process { return &self.*.processes[self.*.current[smp.currentCpu()]] }
+
+    // Every process let go (its descriptors, memory, nodes) but those
+    // running on other processors, which go on (orphans; they end as
+    // usual): how many of those there are.
+    pub fn freeAllButRunning(self: *Self) -> usize {
+        var survivors: usize = 0
+        var k: usize = 0
+        while k < MAX {
+            const p = &self.*.processes[k]
+            if p.*.state == State.running && k != self.*.current[smp.currentCpu()] {
+                survivors += 1
+            } else if p.*.state != State.free {
+                p.*.files.closeAll()
+                p.releaseMemory()
+                p.releaseNodes()
+                p.*.state = State.free
+            }
+            k += 1
+        }
+        return survivors
+    }
+
+    // The shell (FIRST_PID) made again; null when the table is full.
+    pub fn createShell(self: *Self) -> ?*Process {
+        var k: usize = 0
+        while k < MAX {
+            const p = &self.*.processes[k]
+            if p.*.state == State.free {
+                p.init(FIRST_PID, 0)
+                if self.*.nextPid <= FIRST_PID { self.*.nextPid = FIRST_PID + 1 }
+                self.*.foreground = FIRST_PID
+                return p
+            }
+            k += 1
+        }
+        return null
+    }
 
     // The process `pid`; null when there is none.
     pub fn find(self: *Self, pid: usize) -> ?*Process {
@@ -75,13 +119,14 @@ pub const Scheduler = struct {
         return null
     }
 
-    // The first process: `p` runs from now on.
+    // The first process: `p` runs on this processor from now on.
     pub fn makeCurrent(self: *Self, p: *Process) -> void {
         var k: usize = 0
         while k < MAX {
-            if &self.*.processes[k] == p { self.*.current = k }
+            if &self.*.processes[k] == p { self.*.current[smp.currentCpu()] = k }
             k += 1
         }
+        p.*.state = State.running
     }
 
     // fork: a copy of the running process, ready to run; its pid, or 0
@@ -206,7 +251,7 @@ pub const Scheduler = struct {
         if kind == Event.KILL && q.*.state == State.stopped { q.*.state = State.ready }
     }
 
-    fn alive(q: *const Process) -> bool { return q.*.state == State.ready || q.*.state == State.blocked || q.*.state == State.stopped }
+    fn alive(q: *const Process) -> bool { return q.*.state == State.ready || q.*.state == State.running || q.*.state == State.blocked || q.*.state == State.stopped }
 
     // Whether `p` has a child among those `pid` names.
     pub fn hasChild(self: *Self, p: *Process, pid: isize) -> bool {
@@ -332,18 +377,21 @@ pub const Scheduler = struct {
     pub fn preempt(self: *Self, frame: *Frame) -> bool { return self.suspend(frame, wait.Wait.none(), 0) }
 
     // The next process that can go on into `frame` (its registers, memory
-    // and FS base in use): the one after the running one first. While none
-    // can, the processor waits for an interrupt (the terminal's signals go
-    // to the foreground group). False
-    // when none ever can (every one waits for another): the caller starts
-    // over.
+    // and FS base in use): the one after this processor's current one
+    // first (a process on another processor is not taken). While none
+    // can, the processor idles: it lets go of the kernel and waits for
+    // an interrupt (the terminal's signals go to the foreground group).
+    // False, on the first processor, when none ever can (every one waits
+    // for another, none runs elsewhere): the caller starts over.
     pub fn switchTo(self: *Self, frame: *Frame) -> bool {
         while true {
+            const id = smp.currentCpu()
             self.terminalSignals()
             var anyAlone = false
+            var elsewhere = false
             var step: usize = 1
             while step <= MAX {
-                const k = (self.*.current + step) % MAX
+                const k = (self.*.current[id] + step) % MAX
                 const p = &self.*.processes[k]
                 if p.*.state == State.blocked {
                     if self.canGo(p) {
@@ -353,8 +401,12 @@ pub const Scheduler = struct {
                         anyAlone = true
                     }
                 }
+                // (This processor's own is ready, blocked or gone by now:
+                // a running one is on another processor.)
+                if p.*.state == State.running { elsewhere = true }
                 if p.*.state == State.ready {
-                    self.*.current = k
+                    self.*.current[id] = k
+                    p.*.state = State.running
                     frame.* = p.*.context
                     Bytes.copy(frame.sse(), &p.*.sse, Sse.SIZE)
                     p.*.space.activate()
@@ -363,16 +415,22 @@ pub const Scheduler = struct {
                 }
                 step += 1
             }
-            if !anyAlone {
+            if !anyAlone && !elsewhere && id == 0 {
                 console.out.write("brixOS: every process waits for another\n")
                 return false
             }
             // Idle: what changed goes to the disk; what is not needed
             // leaves memory; then the processor halts until an interrupt
-            // (the timer's next tick at the latest).
+            // (the timer's next tick at the latest), the kernel let go
+            // of meanwhile (another processor may run it). On the boot
+            // page tables: the last process's may go while it waits
+            // (the process ends on another processor).
             _ = volume.commitAll()
             volume.trimAll()
+            memory.Space.boot().activate()
+            smp.unlock()
             cpu.Cpu.wait()
+            smp.lock(id)
         }
         return false
     }
