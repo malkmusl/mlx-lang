@@ -87,10 +87,12 @@ are named for what they hold:
     /system/programs   the programs (the boot archive; read-only bytes,
                        copied into pages of their own when written)
     /system/settings   the system's settings: users, groups
-    /devices           console, tty, null, zero, disk0 (a virtio disk)
+    /devices           console, tty, null, zero, disk0, disk1, ... (the
+                       virtio disks)
     /users/root        the user's home (the shell starts there)
     /temporary         scratch space
-    /volumes           the disk's brixfs volume (disk0) and its snapshots
+    /volumes           each disk's volume (diskN: brixfs, or ext2
+                       read-only) and the brixfs volumes' snapshots
 
 Linux programs (all the repository's programs are, for now) expect some
 of Unix's paths. The system call layer, not the tree, maps them:
@@ -146,13 +148,21 @@ The tool calls brixOS's own system calls 1000 (SNAPSHOT) and 1001
 (REMOVE_SNAPSHOT), past Linux's numbers. (Hard links inside a tree become
 separate files in its snapshot.)
 
-## The disk
+## The disks
 
-A virtio block device (QEMU's `-drive ...,if=virtio`) is found on PCI
-bus 0 at boot (`Pci`, pci.mlx) and is /devices/disk0, a block device of
-its size: programs read and write it at any byte offset
-(`head -c 9 /devices/disk0`, `echo text > /devices/disk0`); what is
-written is on the disk image. The driver (`VirtioBlock`, virtio.mlx)
+The virtio block devices (QEMU's `-drive ...,if=virtio`, up to four) are
+found on PCI bus 0 at boot (`Pci`, pci.mlx), in the bus's order, and are
+/devices/disk0, /devices/disk1, ..., block devices of their sizes:
+programs read and write them at any byte offset (`head -c 9
+/devices/disk0`, `echo text > /devices/disk1`); what is written is on the
+disk image. Each disk's volume is mounted at /volumes/diskN (a brixfs
+volume, read and written, or an ext2 one read-only); the first with a
+system on it becomes / (below). A volume on another disk is formatted
+and used alike (`brixfs format /devices/disk1`, then /volumes/disk1;
+`sync` commits every volume); disks may share an interrupt line.
+Partitions (a GPT) are not read yet: a disk is one volume.
+tools/check_brix_disks.sh boots with three disks (a brixfs system, an
+empty one formatted and written in brixOS, an ext2 image). The driver (`VirtioBlock`, virtio.mlx)
 uses the legacy PCI transport (registers in an I/O BAR), one virtqueue in
 pages of its own, one request at a time through a bounce page; the
 processor halts until the device's interrupt (its PCI interrupt line, the
@@ -160,7 +170,7 @@ PIC's IRQ 11 in QEMU, taken back through the ISR register) says it is
 done ("brixOS: disk0 answers by interrupt" at boot). The process that
 asked still waits inside the kernel meanwhile: no other one runs until
 the request is done.
-While a volume is mounted from it, /devices/disk0 is not writable.
+While a volume is mounted from it, a /devices/diskN is not writable.
 
 ## brixfs: the disk's format
 
@@ -221,8 +231,8 @@ gives a volume node's inode number and the volume as its device.
                                      makes mlx-out/bin/brix/disk.img so)
     ext2 make disk.img 8 DIRECTORY   an ext2 image of a host directory
                                      (mlx-out/bin/ext2): brixOS mounts
-                                     an ext2 disk0 read-only at
-                                     /volumes/disk0 (kernel/ext2.mlx;
+                                     an ext2 disk read-only at its
+                                     /volumes/diskN (kernel/ext2.mlx;
                                      Linux's images too, 1-4 KiB blocks)
     brixfs list disk.img             every path and size, the snapshots
     brixfs cat disk.img docs/a       a file
@@ -233,7 +243,7 @@ gives a volume node's inode number and the volume as its device.
                                      entries naming inodes that are
                                      there, link counts; the snapshots'
                                      roots too); also on brixOS, on
-                                     /devices/disk0 while mounted
+                                     /devices/diskN while mounted
     brixfs repair disk.img           checked, link counts mended in a
                                      new commit
 
