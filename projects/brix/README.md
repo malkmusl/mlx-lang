@@ -46,9 +46,12 @@ process. The first processor's time slices come from the PIT, the
 others' from their local APIC timers (vector 0xF0, calibrated against
 the clock at boot); the PIC's interrupts (the serial line, the disks)
 reach the first one only, so another processor polls a disk request.
-An idle processor notices new work at its next timer tick (no IPIs
-yet). A process ending or the shell restarting on one processor leaves
-the processes running on others alone (they end as usual).
+On the way out of the kernel a processor that leaves a process runnable
+(ready, or a blocked one whose wait is over) while another idles wakes
+that one with an IPI (Vector.WAKE); an idle processor also looks again
+at its timer's tick. A process ending or the shell restarting on one
+processor leaves the processes running on others alone (they end as
+usual).
 
 or from UEFI (OVMF's firmware in QEMU; on a machine, the same file as
 EFI/BOOT/BOOTX64.EFI on a FAT partition):
