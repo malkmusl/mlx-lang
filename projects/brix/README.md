@@ -330,7 +330,9 @@ snapshots of a tree by its handle (kernel/names.mlx, the core's, which
 the Linux layer's rename and SNAPSHOT use too), timers (kernel/timer.mlx:
 readable when expired, a read takes the count; native/timers.mlx),
 memory objects (kernel/memoryobjects.mlx: pages mapped shared, an entry
-bit keeps them shared through a branch), groups (group_join; a group
+bit keeps them shared through a branch), files mapped (node_map: the
+file's own pages, copy on write, so every view and the file share them
+until one writes), groups (group_join; a group
 handle in front of the session, an event to all of it). Native programs
 see brixOS's own layout (/temporary; /tmp is the Linux layer's).
 std.os.brix for programs; projects/brix/tools/native, events, objects
@@ -378,8 +380,9 @@ layer.
 ## Next
 
 1. A start block for programs (their handles by role, the session's
-   among them); files mapped as memory objects (one page cache);
-   ext2 as the format to exchange with Linux; EFI boot (PE32+, GOP
+   among them); programs loaded through node_map (their text shared);
+   files mapped shared and writable (the page cache telling a view's
+   holds from a snapshot's); ext2 as the format to exchange with Linux; EFI boot (PE32+, GOP
    framebuffer) beside Multiboot; more than one CPU.
 2. std.posix as the facade for what programs still ask the Linux layer
    (stat, fcntl, signals of their own), once the native ground holds.

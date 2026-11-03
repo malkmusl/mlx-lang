@@ -433,10 +433,15 @@ a handler 1
 handled 1
 of kind (user) 13
 a handler for kill (no) 0
+second page (mapped)
+first page (the file, after a write to the view)
+First page (the view)
+ELF (a program of the archive, mapped)
+a directory mapped (wrong kind) 2
 END
 output | sed -n '/^@@ kinds$/,/^@@ kinds end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/kinds.brix"
 diff "$work/kinds.expected" "$work/kinds.brix" > "$work/kinds.diff" || fail "the other objects behave otherwise (< expected, > brixOS): $(cat "$work/kinds.diff")"
-echo "ok   brixOS's other objects: rename, a snapshot by handle, timers, a memory object shared with a branch, groups in front of the session; std.spawn by handles; std's working directory, pipes and std.events"
+echo "ok   brixOS's other objects: rename, a snapshot by handle, timers, a memory object shared with a branch, groups in front of the session; std.spawn by handles; std's working directory, pipes and std.events; files mapped"
 
 type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
 wait_for '^trapped$'
