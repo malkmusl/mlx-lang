@@ -1439,12 +1439,20 @@ handed over at `extraAt`, `keep`/`keepAlso` stay open across execve and
 directory, `newSession` gives it a session of its own, `unblockSignals`
 clears the mask a parent with a signal descriptor left, `detach` starts
 the program from an intermediate child reaped at once, and `shareMemory`
-vforks (for large parents). `start` returns the pid (or -errno);
-`startReading` hands back the read end of a pipe the child writes to;
-`capture` runs it to its end with its output kept; `wait` and `ended`
-give the exit code or 128 plus the signal; `execute` and `executeIn` are
-the PATH lookup for children that fork themselves, and `find` is where a
-name would run from. A program that cannot run exits with 127.
+vforks (for large parents). `start` returns a `Child` (`started()`; its
+`id` is -errno when it did not start): on Linux a pid, on brixOS a
+process handle (process_spawn with exactly its input, output, errors and
+the descriptors placed at their numbers; with `directory`, `newSession`,
+`detach` or `unblockSignals` the Linux layer forks), and `child.pid()`
+for Linux's own calls. `startReading` hands back the read end of a pipe
+the child writes to; `capture` runs it to its end with its output kept;
+`wait` and `ended` give an `Ending` (`exited` and its `code`, or what
+ended it: the signal's number on Linux, the event's kind on brixOS;
+`status()` as a shell's $?); `terminate` and `kill` ask it to end and end
+it. `execute` and `executeIn` are the PATH lookup for children that fork
+themselves, and `find` is where a name would run from; without PATH,
+`std.platform.PROGRAMS` (brixOS: /system/programs). A program that cannot
+run exits with 127.
 
 ```mlx
 const spawn = @import("std.spawn")
@@ -1452,8 +1460,9 @@ const spawn = @import("std.spawn")
 var options = spawn.options(program, argv, envp)
 options.searchPath = true
 var output: [4096]u8 = undefined
-var status: usize = 0
-const length = spawn.capture(&options, true, &output, 4096, &status)
+var ending = spawn.Ending.lost()
+const length = spawn.capture(&options, true, &output, 4096, &ending)
+if ending.status() != 0 { ... }
 ```
 
 ## Git repositories (`std.git`)

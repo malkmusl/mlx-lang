@@ -418,10 +418,16 @@ of kind (terminate) 5
 their group ended 1
 an event to it (not found) 6
 a group in front of a file (wrong kind) 2
+by std.spawn
+its ending 0
+started by a handle 1
+asked to end 1
+ended by an event 1
+of kind (terminate) 5
 END
 output | sed -n '/^@@ kinds$/,/^@@ kinds end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/kinds.brix"
 diff "$work/kinds.expected" "$work/kinds.brix" > "$work/kinds.diff" || fail "the other objects behave otherwise (< expected, > brixOS): $(cat "$work/kinds.diff")"
-echo "ok   brixOS's other objects: rename, a snapshot by handle, timers, a memory object shared with a branch, groups in front of the session"
+echo "ok   brixOS's other objects: rename, a snapshot by handle, timers, a memory object shared with a branch, groups in front of the session; std.spawn by handles"
 
 type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
 wait_for '^trapped$'
