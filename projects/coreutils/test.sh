@@ -1612,6 +1612,20 @@ diff <("$bin_dir/pr" -l 20 -t -o 4 "$work_dir/prtest") <(/usr/bin/pr -l 20 -t -o
 diff <("$bin_dir/pr" -l 20 -F "$work_dir/prtest" | normalize_pr_date) <(/usr/bin/pr -l 20 -F "$work_dir/prtest" | normalize_pr_date) > /dev/null || fail 'pr -F output differs'
 printf '1\n2\n3\n' > "$work_dir/pr3"
 diff <("$bin_dir/pr" -l 15 "$work_dir/pr3" | normalize_pr_date) <(/usr/bin/pr -l 15 "$work_dir/pr3" | normalize_pr_date) > /dev/null || fail 'pr short-input padding output differs'
+# Columns down (balanced on the last page), across, files in parallel,
+# truncation and joined lines, separators, tabs both ways, control
+# characters, numbering, page ranges, form feeds held to the next page;
+# the header's date is the file's (fixed here), in TZ=UTC.
+seq 200 > "$work_dir/pr200"
+printf 'alpha\tbeta\nctl\001x\nback\bspace\na line too long for a narrow column of a page\n\fafter a form feed\n\tlast\n' > "$work_dir/prmixed"
+touch -d '2020-05-06 07:08:09' "$work_dir/pr200" "$work_dir/prmixed"
+for pr_flags in '-3' '-2 -a' '-4 -t -a' '-m' '-3 -l 20' '-J -2' '-W 20' '-w 40 -3' '-s: -3' '-S|| -2' '-e:4 -t' '-i.5 -t' '-c' '-v' '-n:3 -2' '-N 5 -n' '-d -2' '-o 3 -2' '+2:3 -3' '-D %d.%m.%Y -2' '-F -3' '-T -2' '-2 -h TITLE'; do
+    for pr_input in pr200 prmixed; do
+        pr_files="$work_dir/$pr_input"
+        [[ "$pr_flags" == -m ]] && pr_files="$work_dir/pr200 $work_dir/prmixed"
+        diff <(TZ=UTC LC_ALL=C "$bin_dir/pr" $pr_flags $pr_files) <(TZ=UTC LC_ALL=C /usr/bin/pr $pr_flags $pr_files) > /dev/null || fail "pr $pr_flags $pr_input output differs"
+    done
+done
 
 # Every utility installs std.crash first thing in main: a crash says the
 # function, the line and the callers on stderr and is kept in crashes.log.

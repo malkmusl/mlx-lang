@@ -186,6 +186,9 @@ r csplit -f part n '/5/'
 r cat part00
 r rm part00 part01
 r pr -T -o 2 n
+r pr -2 -T -w 20 n
+r pr -3 -a -t -s, n
+r pr -m -t n j1
 r tac -s , enc
 r tee -a t1 < f
 r cat t1

@@ -5,6 +5,10 @@ set -e
 
 MLX_FILE=$1
 EXPECTED_CODE=$2
+if [[ $# -lt 2 ]]; then
+    echo "usage: tests/run_error.sh FILE.mlx MLX-EXXXX" >&2
+    exit 2
+fi
 
 TMP_DIR=$(mktemp -d)
 OUT_PATH="$TMP_DIR/out"
@@ -12,7 +16,16 @@ LOG_PATH="$TMP_DIR/compiler.log"
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 
 echo "Building the stage-0 compiler (zig-out/bin/mlx0, with zig; only when its sources changed)..."
-./mlx build mlx0
+# Without zig an mlx0 built before serves as it is; without either there
+# is nothing to test with.
+if command -v zig > /dev/null; then
+    ./mlx build mlx0
+elif [[ -x zig-out/bin/mlx0 ]]; then
+    echo "(no zig: zig-out/bin/mlx0 as it was built)"
+else
+    echo "skip: no zig and no zig-out/bin/mlx0"
+    exit 0
+fi
 
 echo "Checking that $MLX_FILE is rejected with $EXPECTED_CODE..."
 set +e
