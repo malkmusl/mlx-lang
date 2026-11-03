@@ -312,15 +312,17 @@ What there is: kernel/native (calls.mlx, objects.mlx, status.mlx) with
 handle_close, handle_duplicate, handle_info, wait, read and write (at a
 position or streaming), clock_read and process_exit; std.os.brix for
 programs; projects/brix/tools/native shows them (tools/check_brix.sh
-compares its lines). A handle is still a descriptor slot plus one, so a
-closed handle's number comes back with the next open (the opaque handles
-the spec wants are next), and the core still answers with Linux's errno
-(native/status.mlx turns it into a Status) until it speaks Status itself.
+compares its lines). A handle names a slot of the process's table and
+the generation the slot had ((generation << 8) | (slot + 1)): a handle
+kept past a close stays invalid when the slot is used again. The Linux
+layer's descriptors are the slots' numbers, its view of the same table
+(handle_of_descriptor gives a descriptor's handle while std moves over).
+The core answers in its own Status (status.mlx); the Linux layer turns
+it into errno at its edge (linux/errno.mlx).
 
 ## Next
 
-1. The native interface on: the core answering in Status, opaque
-   handles, events and the upcall under the Linux layer's signals,
+1. The native interface on: events and the upcall under the Linux layer's signals,
    spawn and branch, nodes, streams, channels; std (io, fs, process) on
    std.os.brix for --target=x86_64-brixos.
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;

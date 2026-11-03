@@ -294,6 +294,9 @@ seen after the writer closed (readable, peer gone) 5
 brix!
 hello
 file kind (node) 3
+the closed writer's handle (invalid handle) 1
+the file is in the writer's slot
+under another handle
 close twice (invalid handle) 1
 read from a closed handle (invalid handle) 1
 real time after 2023
