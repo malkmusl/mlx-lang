@@ -131,6 +131,7 @@ pub const Scheduler = struct {
             const parent = self.find(p.*.parentPid)
             if parent != null {
                 parent.?.*.signals.post(Signal.CHLD, p.*.pid)
+                p.*.change = 0
                 return
             }
         }
@@ -149,6 +150,62 @@ pub const Scheduler = struct {
         }
         return null
     }
+
+    // wait4's options for stops and continuations.
+    pub const UNTRACED: usize = 2
+    pub const CONTINUED: usize = 8
+
+    // A child of `p` among those `pid` names that stopped (UNTRACED) or
+    // went on (CONTINUED) since its parent last asked; null when none did.
+    pub fn changed(self: *Self, p: *Process, pid: isize, options: usize) -> ?*Process {
+        var k: usize = 0
+        while k < MAX {
+            const q = &self.*.processes[k]
+            if q.*.state != State.free && q.*.state != State.zombie && q.*.parentPid == p.*.pid && matches(q, pid) && q.*.change != 0 {
+                const stop = q.*.change & 0xFF == 0x7F
+                if (stop && options & UNTRACED != 0) || (!stop && options & CONTINUED != 0) { return q }
+            }
+            k += 1
+        }
+        return null
+    }
+
+    // The running process stops by `number` (its registers in `frame`
+    // kept): its parent hears of it; the next process runs.
+    pub fn stop(self: *Self, frame: *Frame, number: usize) -> bool {
+        const p = self.running()
+        p.*.context = frame.*
+        Bytes.copy(&p.*.sse, frame.sse(), Sse.SIZE)
+        p.*.state = State.stopped
+        p.*.change = (number << 8) | 0x7F
+        self.tellParent(p)
+        return self.switchTo(frame)
+    }
+
+    // A stopped `q` goes on where it stopped (SIGCONT).
+    fn resume(self: *Self, q: *Process) -> void {
+        if q.*.state != State.stopped { return }
+        q.*.state = State.ready
+        q.*.change = 0xFFFF
+        self.tellParent(q)
+    }
+
+    // SIGCHLD to the parent of `p`, when it has one.
+    fn tellParent(self: *Self, p: *Process) -> void {
+        if p.*.parentPid == 0 { return }
+        const parent = self.find(p.*.parentPid)
+        if parent != null { parent.?.*.signals.post(Signal.CHLD, p.*.pid) }
+    }
+
+    // `number` (from `sender`, 0 the kernel) to `q`: pending; SIGCONT
+    // makes a stopped process go on, SIGKILL makes it run to end.
+    fn send(self: *Self, q: *Process, number: usize, sender: usize) -> void {
+        q.*.signals.post(number, sender)
+        if number == Signal.CONT { self.resume(q) }
+        if number == Signal.KILL && q.*.state == State.stopped { q.*.state = State.ready }
+    }
+
+    fn alive(q: *const Process) -> bool { return q.*.state == State.ready || q.*.state == State.blocked || q.*.state == State.stopped }
 
     // Whether `p` has a child among those `pid` names.
     pub fn hasChild(self: *Self, p: *Process, pid: isize) -> bool {
@@ -177,7 +234,7 @@ pub const Scheduler = struct {
         var k: usize = 0
         while k < MAX {
             const q = &self.*.processes[k]
-            if q.*.state == State.ready || q.*.state == State.blocked {
+            if alive(q) {
                 var hit = false
                 if pid > 0 { hit = q.*.pid == @bitCast(usize, pid) }
                 if pid == 0 { hit = q.*.group == sender.*.group }
@@ -185,7 +242,7 @@ pub const Scheduler = struct {
                 if pid < -1 { hit = q.*.group == @bitCast(usize, -pid) }
                 if hit {
                     found = true
-                    if number != 0 { q.*.signals.post(number, sender.*.pid) }
+                    if number != 0 { self.send(q, number, sender.*.pid) }
                 }
             }
             k += 1
@@ -193,18 +250,25 @@ pub const Scheduler = struct {
         return if found { 0 } else { -3 }
     }
 
-    // `number` from the terminal (the kernel) to its foreground group.
-    pub fn signalForeground(self: *Self, number: usize) -> void {
+    // `number` from the kernel to the process group `group`.
+    pub fn signalGroup(self: *Self, group: usize, number: usize) -> void {
         var k: usize = 0
         while k < MAX {
             const q = &self.*.processes[k]
-            if (q.*.state == State.ready || q.*.state == State.blocked) && q.*.group == self.*.foreground { q.*.signals.post(number, 0) }
+            if alive(q) && q.*.group == group { self.send(q, number, 0) }
             k += 1
         }
     }
 
-    // Ctrl-C on the terminal: SIGINT to its foreground group.
-    pub fn interruptForeground(self: *Self) -> void { self.signalForeground(Signal.INT) }
+    // The signals the terminal's characters asked for (Ctrl-C, Ctrl-\,
+    // Ctrl-Z) to its foreground group.
+    pub fn terminalSignals(self: *Self) -> void {
+        while true {
+            const number = terminal.serialConsole().takeSignal()
+            if number == 0 { return }
+            self.signalGroup(self.*.foreground, number)
+        }
+    }
 
     // Whether what `p` waits for holds now (a deadline that passed is
     // told by timedOut), or a signal can be delivered to it.
@@ -216,7 +280,7 @@ pub const Scheduler = struct {
             return true
         }
         if w.kind == WaitKind.none { return true }
-        if w.kind == WaitKind.child { return self.child(p, w.target) != null || !self.hasChild(p, w.target) }
+        if w.kind == WaitKind.child { return self.child(p, w.target) != null || self.changed(p, w.target, w.options) != null || !self.hasChild(p, w.target) }
         if w.kind == WaitKind.signal { return p.*.signals.pending & @bitCast(usize, w.target) != 0 }
         if w.kind == WaitKind.pause { return false }
         if w.kind == WaitKind.terminal { return terminal.serialConsole().pending() }
@@ -227,7 +291,7 @@ pub const Scheduler = struct {
     }
 
     // Whether `p`'s wait can end without another process (the terminal,
-    // the clock; a signal by Ctrl-C).
+    // the clock; a signal from the terminal).
     fn wakesAlone(p: *const Process) -> bool {
         const kind = p.*.waitingFor.kind
         return p.*.waitingFor.deadline != 0 || kind == WaitKind.terminal || kind == WaitKind.poll || kind == WaitKind.pause
@@ -258,13 +322,13 @@ pub const Scheduler = struct {
 
     // The next process that can go on into `frame` (its registers, memory
     // and FS base in use): the one after the running one first. While none
-    // can, the processor waits for an interrupt (Ctrl-C ends the
-    // foreground group). False
+    // can, the processor waits for an interrupt (the terminal's signals go
+    // to the foreground group). False
     // when none ever can (every one waits for another): the caller starts
     // over.
     pub fn switchTo(self: *Self, frame: *Frame) -> bool {
         while true {
-            if terminal.serialConsole().takeInterrupt() { self.interruptForeground() }
+            self.terminalSignals()
             var anyAlone = false
             var step: usize = 1
             while step <= MAX {

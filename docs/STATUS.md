@@ -82,7 +82,8 @@ wait and by the timer (the PIT's interrupt ends a time slice in user
 mode, the serial line's brings input and Ctrl-C, each process keeps its
 SSE registers), with signals as Linux's programs expect them (handlers
 on rt_sigframes, masks, sigsuspend, EINTR and SA_RESTART, the alternate
-stack), on a VFS with a tmpfs in brixOS's own layout
+stack) and job control (Ctrl-Z, fg, bg, SIGTTIN, wait4's WUNTRACED), on
+a VFS with a tmpfs in brixOS's own layout
 (/system/programs, /devices, /users, /temporary; Linux's paths mapped by
 the system call layer), with copy on write for fork and for files
 (copy_file_range, FICLONE; std.fs.copy uses copy_file_range), snapshots

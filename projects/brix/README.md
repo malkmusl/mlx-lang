@@ -229,9 +229,12 @@ The pieces:
     what it waits for, and its registers while it does not run.
   - scheduler.mlx: `Scheduler`, the table of processes: fork (the
     pages shared copy-on-write, `Space.clone`), the end of a process (a zombie
-    until its parent's wait4; SIGCHLD to it), signals sent (kill, Ctrl-C to
-    the terminal's foreground group: pending until the process runs), and
-    the switch to the next process: when it waits, ends or yields, or when
+    until its parent's wait4; SIGCHLD to it), signals sent (kill, Ctrl-C,
+    Ctrl-\\ and Ctrl-Z to the terminal's foreground group: pending until
+    the process runs), job control (a process stopped by SIGSTOP, SIGTSTP,
+    SIGTTIN or SIGTTOU waits until SIGCONT; its parent sees it with
+    wait4's WUNTRACED and WCONTINUED; a group behind that reads the
+    terminal gets SIGTTIN), and the switch to the next process: when it waits, ends or yields, or when
     the timer's interrupt comes in user mode (its time slice, 10 ms, is
     over). A system call that has to wait
     (wait4, a pipe, the terminal, poll, nanosleep, sigtimedwait) leaves
@@ -246,8 +249,9 @@ The pieces:
   - system.mlx, files.mlx, terminal.mlx, clock.mlx: `System` answers
     Linux's system call numbers (`Number`) and structures for what a
     shell on a terminal needs: read, write, the termios of the serial
-    line (`Terminal`: its input queued as the interrupt brings it, Ctrl-C
-    taken at once, so it ends a program that never reads; canonical
+    line (`Terminal`: its input queued as the interrupt brings it, Ctrl-C,
+    Ctrl-\\ and Ctrl-Z taken at once, so they reach a program that never
+    reads; canonical
     mode edited as input comes, with echo, erase and EOF, raw mode,
     ONLCR, ICRNL; the foreground group),
     the window size, fork, execve, wait4, exit, kill, pipe, setpgid,
@@ -258,8 +262,8 @@ The pieces:
   - signals.mlx: `Signals`, a process's actions (rt_sigaction), mask
     (rt_sigprocmask, rt_sigsuspend), pending signals with their senders,
     alternate stack (sigaltstack). Delivered on the way back to user
-    mode: the default action (ignore, or end the process; the shell is
-    ended only by its faults), or the handler on a frame as Linux builds
+    mode: the default action (ignore, stop, or end the process; the shell
+    is ended only by its faults and never stops), or the handler on a frame as Linux builds
     it (rt_sigframe: the return to the restorer, the ucontext with the
     registers and the mask, the siginfo, the SSE registers), which
     rt_sigreturn takes back. A system call the process waited in ends
@@ -278,20 +282,18 @@ The pieces:
     mlx-sh as the first process, started again (every other process
     ending) when it exits or faults.
 
-Not there yet: job control's stops (SIGTSTP, SIGSTOP and Ctrl-Z do
-nothing yet), the disk's interrupt (its requests
+Not there yet: orphaned process groups (a stopped one whose parent
+ended stays stopped), TOSTOP's SIGTTOU, the disk's interrupt (its requests
 are polled), the APIC (the legacy PICs do), users and permissions that
 are checked, more than one CPU, an EFI loader.
 
 ## Next
 
-1. Job control: stopped processes (SIGTSTP, SIGSTOP, SIGTTIN, SIGTTOU),
-   SIGCONT, Ctrl-Z, wait4's WUNTRACED and WCONTINUED.
-2. Interrupts for the disk; ext2 as the format to exchange with Linux;
+1. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
-4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
+2. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
    std.posix translating onto them, instead of Linux's numbers.
-5. EFI boot (PE32+, GOP framebuffer) beside Multiboot.
+3. EFI boot (PE32+, GOP framebuffer) beside Multiboot.
 
 ## The plan from the start
 

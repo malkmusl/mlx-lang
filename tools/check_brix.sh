@@ -31,6 +31,7 @@
 # serial line's interrupt), the timer shares the processor (each process
 # keeps its SSE registers); signals behave as on the host (handlers, masks,
 # EINTR, sigsuspend, a fault on the alternate stack; the shell's trap);
+# job control works (Ctrl-Z, fg, bg, SIGTTIN, kill -STOP and -CONT);
 # Ctrl-D ends its input;
 # `exit 3` ends the shell and the kernel starts it again; and no system
 # call the programs made was missing.
@@ -302,6 +303,39 @@ type_line 'yes > /dev/null & sleep 1; echo the shell runs; kill $!; wait $!; ech
 wait_for '^the shell runs$'
 wait_for '^ended 143$'
 echo "ok   preemption: Ctrl-C ends a busy program, a busy one in the background leaves time to the shell"
+
+# Job control: Ctrl-Z stops the program in front and fg brings it back;
+# bg lets a stopped one go on behind; one behind that reads the terminal
+# stops (SIGTTIN) until fg; kill -STOP and -CONT.
+type_line 'cat'
+type_to_program 'one\r'
+wait_for '^one$' 2
+type_to_program '\032'
+wait_for '^\[1\]+ Stopped  cat$'
+type_line 'fg'
+type_to_program 'two\r'
+wait_for '^two$' 2
+type_to_program '\004'
+type_line 'echo fg $?'
+wait_for '^fg 0$'
+type_line 'yes > /dev/null'
+type_to_program '\032'
+wait_for '^\[1\]+ Stopped  yes > /dev/null$'
+type_line 'bg; jobs; kill %1; wait; echo bg done'
+wait_for '^\[1\]+ Running  yes > /dev/null$'
+wait_for '^bg done$'
+type_line 'cat &'
+type_line 'sleep 1; jobs'
+wait_for '^\[1\]+ Stopped  cat$' 2
+type_line 'fg'
+type_to_program 'three\r'
+wait_for '^three$' 2
+type_to_program '\004'
+type_line 'sleep 30 & kill -STOP $!; sleep 1; jobs; kill -CONT $!; jobs; kill $!; wait; echo stop done'
+wait_for '^\[1\]+ Stopped  sleep 30$'
+wait_for '^\[1\]+ Running  sleep 30$'
+wait_for '^stop done$'
+echo "ok   job control: Ctrl-Z and fg, bg, a read behind stops (SIGTTIN), kill -STOP and -CONT"
 
 type_line 'wc -l'
 type_to_program 'a\rb\r'
