@@ -75,13 +75,13 @@ for main in projects/coreutils/*/main.mlx; do
 done
 printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet $brix "projects/coreutils/{}/main.mlx" -o "$work/bin/{}"
 (( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
-for tool in snapshot brixfs floats signals native; do
+for tool in snapshot brixfs floats signals native events; do
     "$compiler" --quiet $brix "projects/brix/tools/$tool/main.mlx" -o "$work/$tool"
 done
 for tool in brixfs floats signals; do
     "$compiler" --quiet "projects/brix/tools/$tool/main.mlx" -o "$work/linux-tools/$tool"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "every-program=tools/brix_programs.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "every-program=tools/brix_programs.sh" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
@@ -162,7 +162,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines; built for brixOS, uname -o says so"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for "^$(( ${#programs[@]} + 7 ))\$"
+wait_for "^$(( ${#programs[@]} + 8 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -304,6 +304,28 @@ END
 output | sed -n '/^@@ native$/,/^@@ end 7$/p' | sed '1d;$d' | grep -v '^$' > "$work/native.brix"
 diff "$work/native.expected" "$work/native.brix" > "$work/native.diff" || fail "the native calls answer otherwise (< expected, > brixOS): $(cat "$work/native.diff")"
 echo "ok   brixOS's own calls: handles, the one wait with deadlines, positioned and streaming reads and writes, the clock, process_exit"
+
+# brixOS's events: the queue, the upcall, a wait it interrupts, a default
+# action, a fault through the upcall.
+type_line 'echo @@ events; events; echo @@ end $?'
+wait_for '^@@ end 0$'
+cat > "$work/events.expected" <<'END'
+events
+queued 1
+its kind (user) 13
+its signal 10
+sent by itself
+upcalls 1
+the upcall's signal 12
+wait interrupted 12
+upcalls 2
+child ended by signal 15
+fault through the upcall, exception 14
+faulting child exited 9
+END
+output | sed -n '/^@@ events$/,/^@@ end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/events.brix"
+diff "$work/events.expected" "$work/events.brix" > "$work/events.diff" || fail "the events go otherwise (< expected, > brixOS): $(cat "$work/events.diff")"
+echo "ok   brixOS's events: the queue, the upcall and its return, an interrupted wait, a default action, a fault through the upcall"
 
 type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
 wait_for '^trapped$'

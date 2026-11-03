@@ -21,17 +21,19 @@ const frame_module = @import("./frame.mlx")
 const Frame = frame_module.Frame
 const Exception = frame_module.Exception
 const Process = @import("./process.mlx").Process
-const Status = scheduler.Status
+const events = @import("./events.mlx")
+const Event = events.Event
+const Ending = events.Ending
 const terminal = @import("./terminal.mlx")
 const Irq = @import("./interrupts.mlx").Irq
-const signals = @import("./signals.mlx")
+const signals = @import("./linux/signals.mlx")
 const Signal = signals.Signal
 const Signals = signals.Signals
 
 export fn brix_trap(address: usize) -> void {
     const frame = Frame.at(address)
     handle(frame)
-    // Back to user mode: the signals the process can take now.
+    // Back to user mode: the events the process can take now.
     deliver(frame)
 }
 
@@ -57,12 +59,22 @@ fn handle(frame: *Frame) -> void {
         return
     }
     if frame.*.vector >= Exception.COUNT { return }
-    // A fault of the program: its signal (SIGSEGV, SIGILL, SIGFPE, ...),
-    // which its handler may take; a report on the console when it ends
-    // the program.
+    // A fault of the program: the fault event (its detail the processor's
+    // exception), which its upcall may take, or, in the Linux layer's
+    // view, its signal (SIGSEGV, SIGILL, SIGFPE, ...) for a handler; a
+    // report on the console when it ends the program.
     if frame.fromUser() {
-        const number = signals.ofException(frame.*.vector)
         const address = if frame.*.vector == Exception.PAGE_FAULT { cpu.Cpu.faultAddress() } else { frame.*.rip }
+        if p.*.events.native {
+            if p.*.events.isClaimed(Event.FAULT) && p.*.events.upcallEntry != 0 && !p.*.events.inUpcall {
+                p.*.events.add(events.Record.{ .kind = Event.FAULT, .detail = @intCast(u32, frame.*.vector), .sender = 0, .reserved = @intCast(u32, address & 0xFFFFFFFF) })
+                return
+            }
+            frame.report()
+            end(frame, p, Ending.event(Event.FAULT, @intCast(u32, frame.*.vector)))
+            return
+        }
+        const number = signals.ofException(frame.*.vector)
         p.*.signals.force(number, address)
         if !p.*.signals.caught(number) { frame.report() }
         return
@@ -80,50 +92,98 @@ fn after(frame: *Frame, p: *Process, number: usize, outcome: call.Outcome) -> vo
         .replaced => {},
         .blocked => next(frame, table.suspend(frame, outcome.waiting, number)),
         .yielded => next(frame, table.suspend(frame, wait.Wait.none(), number)),
-        .exited => end(frame, p, outcome.status),
+        .exited => end(frame, p, Ending.exit(outcome.status)),
         .ended => next(frame, table.switchTo(frame))
     }
 }
 
-// The signals of the process returning to user mode in `frame`: its
-// handler runs (on a frame on its stack), or the default action: nothing,
-// the process stops (job control) or ends, and the next one runs, whose
-// signals come in turn. The first process, the shell, is ended only by
-// its faults (it starts again) and never stops.
+// The events of the process returning to user mode in `frame`, and of
+// the next ones when it stops or ends. The first process, the shell, is
+// ended only by its faults (it starts again) and never stops.
 fn deliver(frame: *Frame) -> void {
     const table = scheduler.processes()
     while frame.fromUser() {
         const p = table.running()
-        const fault = p.*.signals.faulted()
-        const number = p.*.signals.take()
-        if number == 0 {
-            p.*.signals.inCall = false
+        const goOn = if p.*.events.native { deliverNative(frame, p) } else { deliverLinux(frame, p) }
+        if !goOn {
+            p.*.inCall = false
             return
         }
-        if p.*.signals.caught(number) {
-            const call = frame.*.rax
-            p.*.signals.endCall(frame, number, call == system.Number.PAUSE || call == system.Number.RT_SIGSUSPEND)
-            // A native call says so in its own status.
-            if native.isNative(call) && frame.*.rax == @bitCast(usize, @intCast(isize, -4)) { frame.*.rax = @bitCast(usize, -status_module.Status.code(status_module.Status.interrupted)) }
-            const base = p.*.signals.place(frame, number)
-            if base != 0 && p.prepare(base, Signals.extent(base)) {
-                p.*.signals.enter(frame, number, base)
-                return
-            }
-            // No room for the frame (or no restorer): the program ends
-            // as by SIGSEGV.
-            end(frame, p, Status.killed(Signal.SEGV))
-        } else if fault == number {
-            end(frame, p, Status.killed(number))
-        } else if p.*.pid == scheduler.Scheduler.FIRST_PID || p.*.signals.ignoredNow(number) {
-            // Nothing (the shell neither ends nor stops by a signal).
-        } else if p.*.signals.stopsNow(number) {
-            p.*.signals.inCall = false
-            next(frame, table.stop(frame, number))
-        } else {
-            end(frame, p, Status.killed(number))
-        }
     }
+}
+
+// A native process's events: a claimed one runs the upcall (it stays
+// queued for events_take), the others their default action. Whether to
+// look again (at this process or the one that runs now).
+fn deliverNative(frame: *Frame, p: *Process) -> bool {
+    const table = scheduler.processes()
+    const index = p.*.events.next()
+    if index == p.*.events.count { return false }
+    const record = p.*.events.queue[index]
+    if p.*.events.isClaimed(record.kind) {
+        // A call the upcall interrupts ends: interrupted.
+        if p.*.inCall {
+            frame.*.rax = @bitCast(usize, -status_module.Status.code(status_module.Status.interrupted))
+            frame.*.rip += 2
+            p.*.inCall = false
+        }
+        const base = p.*.events.contextAt()
+        if base != 0 && p.prepare(base, events.Events.CONTEXT_SIZE) {
+            p.*.events.enter(frame, base)
+            return false
+        }
+        // No stack for the upcall: the program ends as by a fault.
+        end(frame, p, Ending.event(Event.FAULT, 0))
+        return true
+    }
+    _ = p.*.events.removeAt(index)
+    if record.kind == Event.FAULT {
+        end(frame, p, Ending.event(record.kind, record.detail))
+    } else if Event.ignoredByDefault(record.kind) || p.*.pid == scheduler.Scheduler.FIRST_PID {
+        // Nothing.
+    } else if Event.stops(record.kind) {
+        p.*.inCall = false
+        next(frame, table.stop(frame, record.kind, record.detail))
+    } else {
+        end(frame, p, Ending.event(record.kind, record.detail))
+    }
+    return true
+}
+
+// The Linux layer's view: the lowest signal the process can take now;
+// its handler runs (on an rt_sigframe), or its default action: nothing,
+// the process stops (job control) or ends.
+fn deliverLinux(frame: *Frame, p: *Process) -> bool {
+    const table = scheduler.processes()
+    const fault = p.*.signals.faulted()
+    const number = p.*.signals.take()
+    if number == 0 { return false }
+    const event = signals.eventOf(number)
+    if p.*.signals.caught(number) {
+        const call = frame.*.rax
+        p.*.signals.endCall(frame, number, call == system.Number.PAUSE || call == system.Number.RT_SIGSUSPEND, &p.*.inCall)
+        // A native call says so in its own status.
+        if native.isNative(call) && frame.*.rax == @bitCast(usize, @intCast(isize, -4)) { frame.*.rax = @bitCast(usize, -status_module.Status.code(status_module.Status.interrupted)) }
+        const base = p.*.signals.place(frame, number)
+        if base != 0 && p.prepare(base, Signals.extent(base)) {
+            p.*.signals.enter(frame, number, base)
+            return false
+        }
+        // No room for the frame (or no restorer): the program ends as by
+        // SIGSEGV.
+        const segv = signals.eventOf(Signal.SEGV)
+        end(frame, p, Ending.event(segv.kind, segv.detail))
+    } else if fault == number {
+        end(frame, p, Ending.event(event.kind, event.detail))
+    } else if p.*.pid == scheduler.Scheduler.FIRST_PID || p.*.signals.ignoredNow(number) {
+        // Nothing (the shell neither ends nor stops by a signal).
+    } else if p.*.signals.stopsNow(number) {
+        p.*.inCall = false
+        next(frame, table.stop(frame, event.kind, event.detail))
+    } else {
+        end(frame, p, Ending.event(event.kind, event.detail))
+    }
+    return true
 }
 
 // An interrupt: in the kernel (it waits in the idle loop) only taken
@@ -139,7 +199,7 @@ fn interrupt(frame: *Frame, irq: usize) -> void {
     if irq == Irq.SERIAL {
         terminal.serialConsole().receive()
         Irq.acknowledge(irq)
-        // Ctrl-C, Ctrl-\, Ctrl-Z: their signals to the foreground group
+        // Ctrl-C, Ctrl-\, Ctrl-Z: their events to the foreground group
         // (delivered on the way back to user mode; in the idle loop, the
         // scheduler sends them).
         if frame.fromUser() { table.terminalSignals() }
@@ -148,18 +208,18 @@ fn interrupt(frame: *Frame, irq: usize) -> void {
     Irq.acknowledge(irq)
 }
 
-// The process `p` ended with `status`: the next one runs, or the shell
+// The process `p` ended (`ending`): the next one runs, or the shell
 // starts again when it was the shell.
-fn end(frame: *Frame, p: *Process, status: usize) -> void {
+fn end(frame: *Frame, p: *Process, ending: Ending) -> void {
     if p.*.pid == scheduler.Scheduler.FIRST_PID {
         console.out.write("brixOS: the shell ended (")
-        console.out.decimal(if status & 127 == 0 { status >> 8 } else { 128 + (status & 127) })
+        console.out.decimal(if ending.exited { ending.code } else { 128 + signals.numberOf(ending.kind, ending.detail) })
         console.out.write(")\n")
         shell.restart(frame)
         return
     }
     const table = scheduler.processes()
-    table.terminate(p, status)
+    table.terminate(p, ending)
     next(frame, table.switchTo(frame))
 }
 

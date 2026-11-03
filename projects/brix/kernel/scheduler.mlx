@@ -11,7 +11,8 @@ const pipe = @import("./pipe.mlx")
 const process = @import("./process.mlx")
 const wait = @import("./wait.mlx")
 const objects = @import("./native/objects.mlx")
-const signals_module = @import("./signals.mlx")
+const events = @import("./events.mlx")
+const linux_signals = @import("./linux/signals.mlx")
 const volume = @import("./volume.mlx")
 const frame_module = @import("./frame.mlx")
 const Frame = frame_module.Frame
@@ -21,14 +22,7 @@ const Process = process.Process
 const State = process.State
 const WaitKind = wait.WaitKind
 
-pub const Signal = signals_module.Signal
-
-// The wait status of a process that exited with `code`, or was ended by
-// `signal`.
-pub const Status = struct {
-    pub fn exited(code: usize) -> usize { return (code & 255) << 8 }
-    pub fn killed(signal: usize) -> usize { return signal & 127 }
-}
+const Event = events.Event
 
 pub const Scheduler = struct {
     pub const MAX: usize = 16
@@ -110,14 +104,14 @@ pub const Scheduler = struct {
         return child.*.pid
     }
 
-    // `p` ends with the wait status `status`: its memory and descriptors
-    // go, its children are nobody's, its parent hears of it (and waits
-    // for it), or it is gone at once when it has none.
-    pub fn terminate(self: *Self, p: *Process, status: usize) -> void {
+    // `p` ends (`ending`): its memory and descriptors go, its children
+    // are nobody's, its parent hears of it (and takes its end), or it is
+    // gone at once when it has none.
+    pub fn terminate(self: *Self, p: *Process, ending: events.Ending) -> void {
         p.*.files.closeAll()
         p.releaseNodes()
         p.releaseMemory()
-        p.*.status = status
+        p.*.ending = ending
         p.*.state = State.zombie
         var k: usize = 0
         while k < MAX {
@@ -131,8 +125,8 @@ pub const Scheduler = struct {
         if p.*.parentPid != 0 {
             const parent = self.find(p.*.parentPid)
             if parent != null {
-                parent.?.*.signals.post(Signal.CHLD, p.*.pid)
-                p.*.change = 0
+                self.send(parent.?, Event.CHILD, 0, p.*.pid)
+                p.*.change = events.Change.none()
                 return
             }
         }
@@ -162,8 +156,8 @@ pub const Scheduler = struct {
         var k: usize = 0
         while k < MAX {
             const q = &self.*.processes[k]
-            if q.*.state != State.free && q.*.state != State.zombie && q.*.parentPid == p.*.pid && matches(q, pid) && q.*.change != 0 {
-                const stop = q.*.change & 0xFF == 0x7F
+            if q.*.state != State.free && q.*.state != State.zombie && q.*.parentPid == p.*.pid && matches(q, pid) && q.*.change.what != events.Change.NONE {
+                const stop = q.*.change.what == events.Change.STOPPED
                 if (stop && options & UNTRACED != 0) || (!stop && options & CONTINUED != 0) { return q }
             }
             k += 1
@@ -171,39 +165,45 @@ pub const Scheduler = struct {
         return null
     }
 
-    // The running process stops by `number` (its registers in `frame`
-    // kept): its parent hears of it; the next process runs.
-    pub fn stop(self: *Self, frame: *Frame, number: usize) -> bool {
+    // The running process stops by the event `kind` (its registers in
+    // `frame` kept): its parent hears of it; the next process runs.
+    pub fn stop(self: *Self, frame: *Frame, kind: u32, detail: u32) -> bool {
         const p = self.running()
         p.*.context = frame.*
         Bytes.copy(&p.*.sse, frame.sse(), Sse.SIZE)
         p.*.state = State.stopped
-        p.*.change = (number << 8) | 0x7F
+        p.*.change = events.Change.{ .what = events.Change.STOPPED, .kind = kind, .detail = detail }
         self.tellParent(p)
         return self.switchTo(frame)
     }
 
-    // A stopped `q` goes on where it stopped (SIGCONT).
+    // A stopped `q` goes on where it stopped (the resume event).
     fn resume(self: *Self, q: *Process) -> void {
         if q.*.state != State.stopped { return }
         q.*.state = State.ready
-        q.*.change = 0xFFFF
+        q.*.change = events.Change.{ .what = events.Change.WENT_ON, .kind = 0, .detail = 0 }
         self.tellParent(q)
     }
 
-    // SIGCHLD to the parent of `p`, when it has one.
+    // The child event to the parent of `p`, when it has one.
     fn tellParent(self: *Self, p: *Process) -> void {
         if p.*.parentPid == 0 { return }
         const parent = self.find(p.*.parentPid)
-        if parent != null { parent.?.*.signals.post(Signal.CHLD, p.*.pid) }
+        if parent != null { self.send(parent.?, Event.CHILD, 0, p.*.pid) }
     }
 
-    // `number` (from `sender`, 0 the kernel) to `q`: pending; SIGCONT
-    // makes a stopped process go on, SIGKILL makes it run to end.
-    fn send(self: *Self, q: *Process, number: usize, sender: usize) -> void {
-        q.*.signals.post(number, sender)
-        if number == Signal.CONT { self.resume(q) }
-        if number == Signal.KILL && q.*.state == State.stopped { q.*.state = State.ready }
+    // The event `kind` (`detail`, from `sender`: 0 the kernel) to `q`:
+    // resume makes a stopped process go on, kill makes it run to its
+    // end; then it waits for `q` in its queue, or in the Linux layer's
+    // view (as a signal) when `q` has not taken its events itself.
+    pub fn send(self: *Self, q: *Process, kind: u32, detail: u32, sender: usize) -> void {
+        if q.*.events.native {
+            q.*.events.add(events.Record.{ .kind = kind, .detail = detail, .sender = @intCast(u32, sender), .reserved = 0 })
+        } else {
+            q.*.signals.post(linux_signals.numberOf(kind, detail), sender)
+        }
+        if kind == Event.RESUME { self.resume(q) }
+        if kind == Event.KILL && q.*.state == State.stopped { q.*.state = State.ready }
     }
 
     fn alive(q: *const Process) -> bool { return q.*.state == State.ready || q.*.state == State.blocked || q.*.state == State.stopped }
@@ -225,12 +225,10 @@ pub const Scheduler = struct {
         return true
     }
 
-    // `signal` to the processes `pid` names (kill's: one, -1 every one
-    // but the first, 0 the sender's group, below -1 a group): pending for
-    // each, delivered when it runs next; 0, or -3 (ESRCH) when it names
-    // none, -22 (EINVAL) for a number that is no signal.
-    pub fn signal(self: *Self, sender: *Process, pid: isize, number: usize) -> isize {
-        if number != 0 && !Signal.valid(number) { return -22 }
+    // The event `kind` to the processes `pid` names (one, -1 every one
+    // but the first, 0 the sender's group, below -1 a group); whether it
+    // named any.
+    pub fn sendTo(self: *Self, sender: *Process, pid: isize, kind: u32, detail: u32) -> bool {
         var found = false
         var k: usize = 0
         while k < MAX {
@@ -243,38 +241,38 @@ pub const Scheduler = struct {
                 if pid < -1 { hit = q.*.group == @bitCast(usize, -pid) }
                 if hit {
                     found = true
-                    if number != 0 { self.send(q, number, sender.*.pid) }
+                    if kind != 0 { self.send(q, kind, detail, sender.*.pid) }
                 }
             }
             k += 1
         }
-        return if found { 0 } else { -3 }
+        return found
     }
 
-    // `number` from the kernel to the process group `group`.
-    pub fn signalGroup(self: *Self, group: usize, number: usize) -> void {
+    // The event `kind` from the kernel to the process group `group`.
+    pub fn sendGroup(self: *Self, group: usize, kind: u32, detail: u32) -> void {
         var k: usize = 0
         while k < MAX {
             const q = &self.*.processes[k]
-            if alive(q) && q.*.group == group { self.send(q, number, 0) }
+            if alive(q) && q.*.group == group { self.send(q, kind, detail, 0) }
             k += 1
         }
     }
 
-    // The signals the terminal's characters asked for (Ctrl-C, Ctrl-\,
-    // Ctrl-Z) to its foreground group.
+    // The events the terminal's characters asked for (Ctrl-C, Ctrl-\,
+    // Ctrl-Z: interrupt, quit, suspend) to its foreground group.
     pub fn terminalSignals(self: *Self) -> void {
         while true {
-            const number = terminal.serialConsole().takeSignal()
-            if number == 0 { return }
-            self.signalGroup(self.*.foreground, number)
+            const kind = terminal.serialConsole().takeEvent()
+            if kind == 0 { return }
+            self.sendGroup(self.*.foreground, kind, 0)
         }
     }
 
     // Whether what `p` waits for holds now (a deadline that passed is
     // told by timedOut), or a signal can be delivered to it.
     fn canGo(self: *Self, p: *Process) -> bool {
-        if p.*.signals.deliverable() != 0 { return true }
+        if (p.*.events.native && p.*.events.pending()) || (!p.*.events.native && p.*.signals.deliverable() != 0) { return true }
         const w = p.*.waitingFor
         if w.deadline != 0 && clock.system().monotonic() >= w.deadline {
             p.*.timedOut = true
@@ -313,7 +311,7 @@ pub const Scheduler = struct {
             p.*.context.rax = number
             p.*.waitingFor = w
             p.*.state = State.blocked
-            p.*.signals.inCall = true
+            p.*.inCall = true
         }
         return self.switchTo(frame)
     }

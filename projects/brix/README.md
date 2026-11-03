@@ -320,10 +320,24 @@ layer's descriptors are the slots' numbers, its view of the same table
 The core answers in its own Status (status.mlx); the Linux layer turns
 it into errno at its edge (linux/errno.mlx).
 
+Events are the core's (events.mlx): Ctrl-C at the session is an
+interrupt, a child that changed a child event, a fault a fault event,
+with a detail; a kind the program has not claimed takes its default
+(end, stop, go on, nothing), a claimed one waits in the process's queue
+(events_take) or runs the one upcall (upcall_set; the registers and SSE
+registers in a context record on its stack, upcall_return goes back; a
+wait it interrupts ends with interrupted). How a process ended or
+stopped is an exit code or an event. The Linux layer's signals are a
+view of these (linux/signals.mlx): a signal number is an event with the
+number as its detail, so it comes back as sent; handlers, masks and
+rt_sigframes are the Linux layer's, and wait4's status words its
+encoding. A process that has claimed nothing and set no upcall sees its
+events that way. projects/brix/tools/events shows the native side.
+
 ## Next
 
-1. The native interface on: events and the upcall under the Linux layer's signals,
-   spawn and branch, nodes, streams, channels; std (io, fs, process) on
+1. The native interface on: spawn and branch, nodes, streams,
+   channels; std (io, fs, process) on
    std.os.brix for --target=x86_64-brixos.
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
