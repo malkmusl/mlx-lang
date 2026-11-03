@@ -364,13 +364,16 @@ sets replace them. A streaming read of the session from a group behind
 gets READ_BEHIND, as the Linux layer's read gets SIGTTIN. Built for
 Linux, the same programs keep Linux's calls (the code is the same byte
 for byte; tools/check_brix.sh runs the host's side with those builds).
-Opening, the directory calls and fork/exec still go through the Linux
+Opening (node_open, its handle's slot the descriptor; flags it has no
+word for go to the Linux layer) and reading directories (node_list's
+entries as getdents64 records, "." and ".." first, a cookie per
+descriptor) are native too; fork/exec still go through the Linux
 layer.
 
 ## Next
 
-1. std's opening, directories and processes (fs.open, std.process
-   spawn) on std.os.brix too, then std.posix as the facade for the
+1. std's processes (std.process spawn and wait) on std.os.brix too
+   (opening and directories are), then std.posix as the facade for the
    rest; mlx-sh's jobs as groups by handle.
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
