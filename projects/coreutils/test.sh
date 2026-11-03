@@ -1523,6 +1523,19 @@ diff <("$bin_dir/date" -u '+%Y-%m-%d %H:%M') <(/usr/bin/date -u '+%Y-%m-%d %H:%M
 diff <("$bin_dir/date" -d @1700000000 -R) <(/usr/bin/date -d @1700000000 -R) > /dev/null || fail 'date -R output differs'
 diff <("$bin_dir/date" -d @1700000000 -Iseconds) <(/usr/bin/date -d @1700000000 -Iseconds) > /dev/null || fail 'date -Iseconds output differs'
 diff <("$bin_dir/date" -d @1700000000 --rfc-3339=seconds) <(/usr/bin/date -d @1700000000 --rfc-3339=seconds) > /dev/null || fail 'date --rfc-3339=seconds output differs'
+# The O modifier as coreutils 9.11 has it (older ones handed it to the C
+# library): flags and widths apply, %OY is a year, %Oc and %Ox are bad.
+[[ "$(LC_ALL=C "$bin_dir/date" -u -d @0 '+%OY|%+Oe|%-OW|%Oq|%O::z|%Ob|%#OB|%Oc|%Ox')" == '1970|01|0|1|+00:00:00|Jan|JANUARY|%Oc|%Ox' ]] || fail 'date O modifier output differs'
+# +FORMAT is strftime as coreutils has it: flags, widths, ISO weeks, %C,
+# %:z, glibc's %c; $TZ; @SECONDS with a fraction (negative: toward the
+# past). (No O modifier here: the host's GNU may be older than 9.11's.)
+for date_format in '+%G-W%V-%u %U %W %C %g' '+%_5d|%-m|%010Y|%^b|%#A|%#Z' '+%:z %::z %:::z %z' '+%c|%x|%X|%r|%^c|%_30c' '+%F %10F %-D %R %T %s %N %3N %q' '+%%|%Q|%5|%Ea|%-%'; do
+    for date_zone in UTC America/St_Johns Asia/Kolkata; do
+        for date_stamp in @0 @1609459199 @1609675200.25 @-1.5; do
+            diff <(TZ=$date_zone LC_ALL=C "$bin_dir/date" -d $date_stamp "$date_format") <(TZ=$date_zone LC_ALL=C /usr/bin/date -d $date_stamp "$date_format") > /dev/null || fail "date -d $date_stamp '$date_format' (TZ=$date_zone) output differs"
+        done
+    done
+done
 diff <("$bin_dir/date" -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') <(/usr/bin/date -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') > /dev/null || fail 'date custom format output differs'
 diff <("$bin_dir/date" -d @1700000000) <(/usr/bin/date -d @1700000000) > /dev/null || fail 'date -d @epoch output differs'
 diff <("$bin_dir/date" -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') <(/usr/bin/date -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') > /dev/null || fail 'date -d STRING output differs'
@@ -1619,6 +1632,10 @@ diff <("$bin_dir/pr" -l 15 "$work_dir/pr3" | normalize_pr_date) <(/usr/bin/pr -l
 seq 200 > "$work_dir/pr200"
 printf 'alpha\tbeta\nctl\001x\nback\bspace\na line too long for a narrow column of a page\n\fafter a form feed\n\tlast\n' > "$work_dir/prmixed"
 touch -d '2020-05-06 07:08:09' "$work_dir/pr200" "$work_dir/prmixed"
+# The header: -D as strftime has it, widths as mbswidth counts them.
+for pr_flags in '-D %_5d|%^b|%G-W%V|%:z|%-%' '-D %c' '-h 日本語-é- x' '-h abc\001\377'; do
+    diff <(TZ=Asia/Kolkata LC_ALL=C.UTF-8 "$bin_dir/pr" -l 11 "$pr_flags" "$work_dir/pr200" 2>&1 | head -n 4) <(TZ=Asia/Kolkata LC_ALL=C.UTF-8 /usr/bin/pr -l 11 "$pr_flags" "$work_dir/pr200" 2>&1 | head -n 4) > /dev/null || fail "pr $pr_flags header differs"
+done
 for pr_flags in '-3' '-2 -a' '-4 -t -a' '-m' '-3 -l 20' '-J -2' '-W 20' '-w 40 -3' '-s: -3' '-S|| -2' '-e:4 -t' '-i.5 -t' '-c' '-v' '-n:3 -2' '-N 5 -n' '-d -2' '-o 3 -2' '+2:3 -3' '-D %d.%m.%Y -2' '-F -3' '-T -2' '-2 -h TITLE'; do
     for pr_input in pr200 prmixed; do
         pr_files="$work_dir/$pr_input"
