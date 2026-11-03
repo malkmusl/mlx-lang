@@ -24,6 +24,21 @@ memory with brixOS's own layout and copy on write:
         -drive file=mlx-out/bin/brix/disk.img,format=raw,if=virtio
     tools/check_brix.sh        # the same, typed at, checked
 
+or from UEFI (OVMF's firmware in QEMU; on a machine, the same file as
+EFI/BOOT/BOOTX64.EFI on a FAT partition):
+
+    qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
+        -bios /usr/share/ovmf/OVMF.fd \
+        -drive format=raw,file=fat:rw:mlx-out/bin/brix/esp
+    tools/check_brix_efi.sh    # the same, checked
+
+brix-image writes an EFI application when its output ends in .efi
+(image/efi.mlx): a PE32+ file with the Multiboot image in it and a
+loader in front that does a Multiboot loader's part (the memory map's
+end below 4 GiB as mem_upper, ExitBootServices, out of long mode, the
+image to 1 MiB, the blob's entry). The console stays the serial line
+(no GOP framebuffer yet).
+
     brixOS: kernel at 0x200000, 292 KiB
     brixOS: 511 MiB (415 free), 2076 MHz
     root@brix:~# seq 3 | sort -r | tr "\n" " "; echo
@@ -304,7 +319,7 @@ The pieces:
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
 the disk works for one, the APIC (the legacy PICs do), users and permissions that
-are checked, more than one CPU, an EFI loader.
+are checked, more than one CPU.
 
 ## brixOS's own interface
 
@@ -387,8 +402,8 @@ layer.
 1. A start block for programs (their handles by role, the session's
    among them); programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
-   holds from a snapshot's); EFI boot (PE32+, GOP
-   framebuffer) beside Multiboot; more than one CPU; ext2 written too.
+   holds from a snapshot's); a framebuffer console
+   (GOP's) for EFI boots; more than one CPU; ext2 written too.
 2. std.posix as the facade for what programs still ask the Linux layer
    (stat, fcntl, signals of their own), once the native ground holds.
 
