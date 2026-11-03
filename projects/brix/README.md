@@ -116,7 +116,12 @@ its size: programs read and write it at any byte offset
 (`head -c 9 /devices/disk0`, `echo text > /devices/disk0`); what is
 written is on the disk image. The driver (`VirtioBlock`, virtio.mlx)
 uses the legacy PCI transport (registers in an I/O BAR), one virtqueue in
-pages of its own, one request at a time through a bounce page, polled.
+pages of its own, one request at a time through a bounce page; the
+processor halts until the device's interrupt (its PCI interrupt line, the
+PIC's IRQ 11 in QEMU, taken back through the ISR register) says it is
+done ("brixOS: disk0 answers by interrupt" at boot). The process that
+asked still waits inside the kernel meanwhile: no other one runs until
+the request is done.
 While a volume is mounted from it, /devices/disk0 is not writable.
 
 ## brixfs: the disk's format
@@ -292,8 +297,8 @@ The pieces:
     ending) when it exits or faults.
 
 Not there yet: orphaned process groups (a stopped one whose parent
-ended stays stopped), TOSTOP's SIGTTOU, the disk's interrupt (its requests
-are polled), the APIC (the legacy PICs do), users and permissions that
+ended stays stopped), TOSTOP's SIGTTOU, other processes running while
+the disk works for one, the APIC (the legacy PICs do), users and permissions that
 are checked, more than one CPU, an EFI loader.
 
 ## brixOS's own interface
@@ -372,12 +377,12 @@ layer.
 
 ## Next
 
-1. std.posix as the facade for the rest: what programs still ask the
-   Linux layer (stat, chdir, pipes, fcntl, signals of their own); mlx-sh
-   already runs on brixOS's own calls (projects/shell/host.brixos.mlx).
-2. Interrupts for the disk; ext2 as the format to exchange with Linux;
-   brixfs directories written by changed page.
-3. EFI boot (PE32+, GOP framebuffer) beside Multiboot.
+1. A start block for programs (their handles by role, the session's
+   among them); files mapped as memory objects (one page cache);
+   ext2 as the format to exchange with Linux; EFI boot (PE32+, GOP
+   framebuffer) beside Multiboot; more than one CPU.
+2. std.posix as the facade for what programs still ask the Linux layer
+   (stat, fcntl, signals of their own), once the native ground holds.
 
 ## The plan from the start
 
