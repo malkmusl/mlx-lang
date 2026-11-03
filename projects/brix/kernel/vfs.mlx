@@ -35,6 +35,9 @@ const Page = memory.Page
 // pipe while it is open.
 pub const NodeKind = enum(u8) { free, directory, file, archive, terminal, null_device, zero_device, disk, symlink, fifo }
 
+// A node's room in its chunk (@sizeOf(Node) fits it).
+pub const NODE_SIZE: usize = 256
+
 pub const Node = struct {
     pub const DIRECT: usize = 12
 
@@ -81,7 +84,11 @@ pub const Node = struct {
 }
 
 pub const Vfs = struct {
-    pub const MAX_NODES: usize = 1024
+    // Nodes come in chunks of a page (NODES_PER_CHUNK each), made as
+    // they are needed: the table has no fixed size (CHUNKS pages at the
+    // most, 65536 nodes; the budget, below, keeps it a cache).
+    pub const NODES_PER_CHUNK: usize = 16
+    pub const CHUNKS: usize = 4096
     pub const NAME_MAX: usize = 59
     pub const ENTRY_SIZE: usize = 64
     pub const ROOT: usize = 1
@@ -94,20 +101,65 @@ pub const Vfs = struct {
     const CHANGED: usize = 1
     const ADDRESS: usize = ~(Page.SIZE - 1)
 
-    nodes: [MAX_NODES]Node
+    chunks: [CHUNKS]usize
+    // How many nodes the chunks hold (node indices below it are valid).
+    count: usize
     console: usize
 
     // ---- nodes ----
 
-    pub fn node(self: *Self, index: usize) -> *Node { return &self.*.nodes[index] }
+    pub fn node(self: *Self, index: usize) -> *Node {
+        return unsafe { @ptrFromInt(*Node, layout.Memory.virtual(self.*.chunks[index / NODES_PER_CHUNK]) + (index % NODES_PER_CHUNK) * NODE_SIZE) }
+    }
+
+    // How many nodes there are (free ones among them); indices below it
+    // name nodes.
+    pub fn nodeCount(self: *const Self) -> usize { return self.*.count }
+
+    // One chunk of nodes more (free); false when memory is out or the
+    // table cannot grow further.
+    fn grow(self: *Self) -> bool {
+        const chunk = self.*.count / NODES_PER_CHUNK
+        if chunk >= CHUNKS { return false }
+        const frame = memory.allFrames().allocate()
+        if frame == 0 { return false }
+        self.*.chunks[chunk] = frame
+        self.*.count += NODES_PER_CHUNK
+        var k = self.*.count - NODES_PER_CHUNK
+        while k < self.*.count {
+            self.node(k).*.kind = NodeKind.free
+            k += 1
+        }
+        return true
+    }
+
+    // How many nodes the tree keeps loaded at the most before idle time
+    // lets clean ones read from a disk go (a cache: a node for every 256
+    // KiB of memory, 512 at least); more are made when programs hold them.
+    pub fn nodeBudget(self: *const Self) -> usize {
+        const scaled = memory.allFrames().totalBytes() / (256 * 1024)
+        return if scaled < 512 { 512 } else { scaled }
+    }
+
+    // How many nodes are in use.
+    pub fn usedNodes(self: *Self) -> usize {
+        var used: usize = 0
+        var k: usize = ROOT
+        while k < self.*.count {
+            if self.node(k).*.kind != NodeKind.free { used += 1 }
+            k += 1
+        }
+        return used
+    }
 
     fn now() -> usize { return clock.system().realtime() / clock.Clock.NANOSECONDS }
 
-    // A new node of `kind` (no links yet); NONE when the table is full.
+    // A new node of `kind` (no links yet); NONE when memory is out.
     pub fn create(self: *Self, kind: NodeKind, mode: usize) -> usize {
         var k: usize = ROOT
-        while k < MAX_NODES {
-            const n = &self.*.nodes[k]
+        while k <= self.*.count {
+            if k == self.*.count && !self.grow() { return NONE }
+            const n = self.node(k)
             if n.*.kind == NodeKind.free {
                 n.*.kind = kind
                 n.*.mode = mode & 0xFFF
@@ -143,16 +195,16 @@ pub const Vfs = struct {
 
     // A descriptor holds the node, or lets it go; a node no directory
     // names and no descriptor holds is freed.
-    pub fn retain(self: *Self, index: usize) -> void { self.*.nodes[index].opens += 1 }
+    pub fn retain(self: *Self, index: usize) -> void { self.node(index).*.opens += 1 }
 
     pub fn release(self: *Self, index: usize) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.*.opens > 0 { n.*.opens -= 1 }
         self.collect(index)
     }
 
     fn collect(self: *Self, index: usize) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.*.links != 0 || n.*.opens != 0 || n.*.kind == NodeKind.free { return }
         // A disk's node is gone from the disk at the next commit.
         if n.*.volume != 0 && n.*.volume != ext2.Ext2Volume.VOLUME { volume.store().forget(index) }
@@ -164,7 +216,7 @@ pub const Vfs = struct {
 
     // A node of a disk whose data was not read yet is read now.
     pub fn ready(self: *Self, index: usize) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.*.volume != 0 && !n.*.loaded {
             n.*.loaded = true
             if n.*.volume == ext2.Ext2Volume.VOLUME {
@@ -178,7 +230,7 @@ pub const Vfs = struct {
     // A node of a disk changed (its data too when `data`): it goes to
     // the disk at the next commit.
     pub fn touch(self: *Self, index: usize, data: bool) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.*.volume == 0 || n.*.volume == ext2.Ext2Volume.VOLUME { return }
         n.*.dirty = true
         if data { n.*.dataDirty = true }
@@ -200,20 +252,9 @@ pub const Vfs = struct {
         return true
     }
 
-    // How many nodes are free.
-    pub fn freeNodes(self: *Self) -> usize {
-        var count: usize = 0
-        var k: usize = ROOT
-        while k < MAX_NODES {
-            if self.*.nodes[k].kind == NodeKind.free { count += 1 }
-            k += 1
-        }
-        return count
-    }
-
     // A disk's node's data dropped from memory (read again when used).
     pub fn unloadData(self: *Self, index: usize) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         const size = n.*.size
         self.freeBlocks(index, 0)
         n.*.size = size
@@ -228,13 +269,13 @@ pub const Vfs = struct {
         Bytes.write32(&record, 0, target)
         record[4] = @intCast(u8, length)
         Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(&record) + 5) }, name, length)
-        const d = &self.*.nodes[directory]
+        const d = self.node(directory)
         const at = d.*.size
         const page = self.block(directory, at / Page.SIZE, true)
         if page == 0 { return false }
         Bytes.copy(Bytes.pointer(layout.Memory.virtual(page) + at % Page.SIZE), &record, ENTRY_SIZE)
         d.*.size = at + ENTRY_SIZE
-        if self.*.nodes[target].isDirectory() { self.*.nodes[target].parent = directory }
+        if self.node(target).*.isDirectory() { self.node(target).*.parent = directory }
         return true
     }
 
@@ -252,7 +293,7 @@ pub const Vfs = struct {
             if found != NONE && sameName(entryName, entryLength, name.pointer, name.length) {
                 const page = self.block(directory, slot / ENTRIES_PER_PAGE, false)
                 Bytes.write32(Bytes.pointer(layout.Memory.virtual(page) + (slot % ENTRIES_PER_PAGE) * ENTRY_SIZE), 0, target)
-                if self.*.nodes[target].isDirectory() { self.*.nodes[target].parent = directory }
+                if self.node(target).*.isDirectory() { self.node(target).*.parent = directory }
                 return found
             }
             slot += 1
@@ -263,7 +304,7 @@ pub const Vfs = struct {
     // A memory-only node nothing names any more goes, with its tree.
     pub fn retire(self: *Self, index: usize) -> void {
         self.removeTree(index)
-        self.*.nodes[index].links = 0
+        self.node(index).*.links = 0
         self.collect(index)
     }
 
@@ -286,7 +327,7 @@ pub const Vfs = struct {
     // A node of a view of a disk dropped from the tree as it is (the
     // view is taken out; nothing of the disk changes).
     pub fn drop(self: *Self, index: usize) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         n.*.volume = 0
         n.*.links = 0
         n.*.opens = 0
@@ -298,7 +339,7 @@ pub const Vfs = struct {
     // becomes a node of view `view` of a disk: archive programs become
     // files, devices cannot; 0 or -errno.
     fn adopt(self: *Self, index: usize, view: usize) -> isize {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.*.volume == view { return 0 }
         if n.*.volume != 0 { return Status.cross_volume }
         if n.*.kind == NodeKind.archive && !self.copyUp(index) { return Status.no_space }
@@ -333,7 +374,7 @@ pub const Vfs = struct {
     // node, or in an address page, made when `create`); null when there
     // is no such place (or memory is out).
     fn blockSlot(self: *Self, index: usize, which: usize, create: bool) -> ?*usize {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if which < Node.DIRECT { return &n.*.blocks[which] }
         var rest = which - Node.DIRECT
         if rest < ADDRESSES_PER_PAGE {
@@ -368,7 +409,7 @@ pub const Vfs = struct {
     }
 
     // The mark of a disk's node's changed pages.
-    fn changeMark(self: *Self, index: usize) -> usize { return if self.*.nodes[index].volume != 0 { CHANGED } else { 0 } }
+    fn changeMark(self: *Self, index: usize) -> usize { return if self.node(index).*.volume != 0 { CHANGED } else { 0 } }
 
     // The page of block `which` to write to: the node's own (a page it
     // shares is copied first: copy on write); 0 when memory is out.
@@ -406,7 +447,7 @@ pub const Vfs = struct {
     // The pages of blocks `from` on freed (a truncation, or the node's
     // end).
     fn freeBlocks(self: *Self, index: usize, from: usize) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         const frames = memory.allFrames()
         var which = from
         while which < Node.DIRECT {
@@ -459,7 +500,7 @@ pub const Vfs = struct {
     }
 
     fn freeData(self: *Self, index: usize) -> void {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.hasPages() { self.freeBlocks(index, 0) }
         n.*.size = 0
     }
@@ -468,7 +509,7 @@ pub const Vfs = struct {
     // how many there were.
     pub fn read(self: *Self, index: usize, offset: usize, into: [*]u8, length: usize) -> usize {
         self.ready(index)
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if offset >= n.*.size { return 0 }
         const count = if length > n.*.size - offset { n.*.size - offset } else { length }
         if n.*.kind == NodeKind.archive {
@@ -501,7 +542,7 @@ pub const Vfs = struct {
     // An archive's file becomes a file of pages of its own, with the same
     // bytes (before its first change); false when memory is out.
     fn copyUp(self: *Self, index: usize) -> bool {
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         const source = archive.Archive.boot().file(n.*.archiveIndex)
         n.*.kind = NodeKind.file
         var done: usize = 0
@@ -520,7 +561,7 @@ pub const Vfs = struct {
     pub fn write(self: *Self, index: usize, offset: usize, from: [*]const u8, length: usize) -> isize {
         self.ready(index)
         self.touch(index, true)
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.*.kind == NodeKind.archive && !self.copyUp(index) { return Status.no_space }
         if offset + length > (Node.DIRECT + ADDRESSES_PER_PAGE + ADDRESSES_PER_PAGE * ADDRESSES_PER_PAGE) * Page.SIZE { return Status.too_large }
         var done: usize = 0
@@ -547,7 +588,7 @@ pub const Vfs = struct {
     pub fn truncate(self: *Self, index: usize, size: usize) -> isize {
         self.ready(index)
         self.touch(index, true)
-        const n = &self.*.nodes[index]
+        const n = self.node(index)
         if n.*.kind == NodeKind.archive && !self.copyUp(index) { return Status.no_space }
         if size < n.*.size {
             self.freeBlocks(index, Page.up(size) / Page.SIZE)
@@ -572,8 +613,8 @@ pub const Vfs = struct {
         self.ready(from)
         self.ready(to)
         self.touch(to, true)
-        const source = &self.*.nodes[from]
-        const target = &self.*.nodes[to]
+        const source = self.node(from)
+        const target = self.node(to)
         if target.*.kind == NodeKind.archive && !self.copyUp(to) { return Status.no_space }
         var done: usize = 0
         var buffer: [512]u8 = undefined
@@ -623,7 +664,7 @@ pub const Vfs = struct {
     // How many entry slots the directory has (used or not).
     pub fn slotCount(self: *Self, directory: usize) -> usize {
         self.ready(directory)
-        return self.*.nodes[directory].size / ENTRY_SIZE
+        return self.node(directory).*.size / ENTRY_SIZE
     }
 
     fn sameName(a: [*]const u8, aLength: usize, b: [*]const u8, bLength: usize) -> bool {
@@ -640,7 +681,7 @@ pub const Vfs = struct {
     // too).
     pub fn lookup(self: *Self, directory: usize, name: [*]const u8, length: usize) -> usize {
         if length == 1 && name[0] == 46 { return directory }
-        if length == 2 && name[0] == 46 && name[1] == 46 { return self.*.nodes[directory].parent }
+        if length == 2 && name[0] == 46 && name[1] == 46 { return self.node(directory).*.parent }
         var slot: usize = 0
         while slot < self.slotCount(directory) {
             var entryName: [*]const u8 = undefined
@@ -659,9 +700,9 @@ pub const Vfs = struct {
         if length == 0 { return Status.not_found }
         if self.lookup(directory, name, length) != NONE { return Status.exists }
         // Onto a disk: a new node (and its tree) becomes the disk's.
-        const view = self.*.nodes[directory].volume
-        if self.*.nodes[target].volume != view {
-            if self.*.nodes[target].links != 0 { return Status.cross_volume }
+        const view = self.node(directory).*.volume
+        if self.node(target).*.volume != view {
+            if self.node(target).*.links != 0 { return Status.cross_volume }
             const adopted = self.adopt(target, view)
             if adopted < 0 { return adopted }
         }
@@ -680,7 +721,7 @@ pub const Vfs = struct {
         Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(&record) + 5) }, name, length)
         const written = self.write(directory, slot * ENTRY_SIZE, &record, ENTRY_SIZE)
         if written < 0 { return written }
-        const t = &self.*.nodes[target]
+        const t = self.node(target)
         t.*.links += 1
         t.*.changed = now()
         if t.*.isDirectory() { t.*.parent = directory }
@@ -699,10 +740,10 @@ pub const Vfs = struct {
             if found != NONE && sameName(entryName, entryLength, name, length) {
                 const page = self.block(directory, slot / ENTRIES_PER_PAGE, false)
                 Bytes.write32(Bytes.pointer(layout.Memory.virtual(page) + (slot % ENTRIES_PER_PAGE) * ENTRY_SIZE), 0, 0)
-                const t = &self.*.nodes[found]
+                const t = self.node(found)
                 t.*.links -= 1
                 t.*.changed = now()
-                self.*.nodes[directory].modified = now()
+                self.node(directory).*.modified = now()
                 self.touch(directory, true)
                 if t.*.links > 0 { self.touch(found, false) }
                 self.collect(found)
@@ -728,10 +769,10 @@ pub const Vfs = struct {
     pub fn isUnder(self: *Self, node_index: usize, ancestor: usize) -> bool {
         var at = node_index
         var steps: usize = 0
-        while steps < MAX_NODES {
+        while steps < self.*.count {
             if at == ancestor { return true }
             if at == ROOT { return false }
-            at = self.*.nodes[at].parent
+            at = self.node(at).*.parent
             steps += 1
         }
         return false
@@ -758,10 +799,10 @@ pub const Vfs = struct {
     // before anything names it (so a snapshot may go inside its source).
     // Its node; NONE when nodes or memory ran out (nothing is left over).
     pub fn cloneTree(self: *Self, source: usize, readOnly: bool) -> usize {
-        const original = &self.*.nodes[source]
+        const original = self.node(source)
         const made = self.create(original.*.kind, original.*.mode)
         if made == NONE { return NONE }
-        const copy = &self.*.nodes[made]
+        const copy = self.node(made)
         copy.*.archiveIndex = original.*.archiveIndex
         if original.*.kind == NodeKind.archive || original.*.kind == NodeKind.disk { copy.*.size = original.*.size }
         if original.*.kind == NodeKind.file || original.*.kind == NodeKind.symlink {
@@ -803,7 +844,7 @@ pub const Vfs = struct {
     // What a directory names, all of it, let go (each node freed when
     // nothing else holds it); the directory itself stays as it is held.
     pub fn removeTree(self: *Self, directory: usize) -> void {
-        if !self.*.nodes[directory].isDirectory() {
+        if !self.node(directory).*.isDirectory() {
             self.collect(directory)
             return
         }
@@ -813,7 +854,7 @@ pub const Vfs = struct {
             var length: usize = 0
             const child = self.entry(directory, slot, &name, &length)
             if child != NONE {
-                if self.*.nodes[child].isDirectory() { self.removeTree(child) }
+                if self.node(child).*.isDirectory() { self.removeTree(child) }
                 _ = self.unlink(directory, name, length)
             }
             slot += 1
@@ -852,10 +893,10 @@ pub const Vfs = struct {
             if k >= end { break }
             const start = k
             while k < end && path[k] != 47 { k += 1 }
-            if !self.*.nodes[at].isDirectory() { return Status.not_directory }
+            if !self.node(at).*.isDirectory() { return Status.not_directory }
             const next = self.lookup(at, unsafe { @ptrFromInt([*]const u8, @intFromPtr(path) + start) }, k - start)
             if next == NONE { return Status.not_found }
-            if self.*.nodes[next].isLink() && (followLast || k < end) { return self.follow(at, next, path, k, end, followLast, depth) }
+            if self.node(next).*.isLink() && (followLast || k < end) { return self.follow(at, next, path, k, end, followLast, depth) }
             at = next
         }
         return @intCast(isize, at)
@@ -867,7 +908,7 @@ pub const Vfs = struct {
     fn follow(self: *Self, directory: usize, link: usize, path: [*]const u8, from: usize, end: usize, followLast: bool, depth: usize) -> isize {
         if depth >= MAX_LINKS { return Status.link_loop }
         self.ready(link)
-        const size = self.*.nodes[link].size
+        const size = self.node(link).*.size
         if size == 0 { return Status.not_found }
         if size + end - from >= Page.SIZE { return Status.name_too_long }
         const frame = memory.allFrames().allocate()
@@ -892,7 +933,7 @@ pub const Vfs = struct {
         // The directory part, as a path of its own.
         const at = self.walk(base, path, start, true, 0)
         if at < 0 { return at }
-        if !self.*.nodes[@bitCast(usize, at)].isDirectory() { return Status.not_directory }
+        if !self.node(@bitCast(usize, at)).*.isDirectory() { return Status.not_directory }
         return at
     }
 
@@ -905,8 +946,8 @@ pub const Vfs = struct {
         into[at] = 0
         var current = directory
         var steps: usize = 0
-        while current != ROOT && steps < MAX_NODES {
-            const parent = self.*.nodes[current].parent
+        while current != ROOT && steps < self.*.count {
+            const parent = self.node(current).*.parent
             var slot: usize = 0
             var found = false
             while slot < self.slotCount(parent) && !found {
@@ -952,7 +993,7 @@ pub const Vfs = struct {
         const devices = self.lookup(ROOT, "devices".pointer, 7)
         if devices == NONE { return }
         const made = self.device(devices, name, kind)
-        if made != NONE { self.*.nodes[made].size = size }
+        if made != NONE { self.node(made).*.size = size }
     }
 
     fn device(self: *Self, parent: usize, name: []const u8, kind: NodeKind) -> usize {
@@ -971,16 +1012,13 @@ pub const Vfs = struct {
 
     // The tree at boot (the layout above).
     pub fn init(self: *Self) -> void {
-        var k: usize = 0
-        while k < MAX_NODES {
-            self.*.nodes[k].kind = NodeKind.free
-            k += 1
-        }
+        self.*.count = 0
+        _ = self.grow()
         // Node 0 is no node.
-        self.*.nodes[NONE].kind = NodeKind.directory
+        self.node(NONE).*.kind = NodeKind.directory
         const root = self.create(NodeKind.directory, 0x1ED)
-        self.*.nodes[root].links = 1
-        self.*.nodes[root].parent = ROOT
+        self.node(root).*.links = 1
+        self.node(root).*.parent = ROOT
         const system = self.addDirectory(ROOT, "system", 0x1ED)
         const bin = self.addDirectory(system, "programs", 0x1ED)
         const files = archive.Archive.boot()
@@ -988,8 +1026,8 @@ pub const Vfs = struct {
         while f < files.count() {
             const made = self.create(NodeKind.archive, 0x1ED)
             if made != NONE {
-                self.*.nodes[made].archiveIndex = f
-                self.*.nodes[made].size = files.file(f).size
+                self.node(made).*.archiveIndex = f
+                self.node(made).*.size = files.file(f).size
                 _ = self.link(bin, files.name(f), files.nameLength(f), made)
             }
             f += 1
@@ -1004,7 +1042,7 @@ pub const Vfs = struct {
         _ = self.device(dev, "zero", NodeKind.zero_device)
         _ = self.addDirectory(ROOT, "temporary", 0x3FF)
         const volumes = self.addDirectory(ROOT, "volumes", 0x1ED)
-        if volumes != NONE { self.*.nodes[volumes].readOnly = true }
+        if volumes != NONE { self.node(volumes).*.readOnly = true }
         const users = self.addDirectory(ROOT, "users", 0x1ED)
         _ = self.addDirectory(users, "root", 0x1C0)
     }

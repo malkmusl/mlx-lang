@@ -200,11 +200,14 @@ directory's entries as nodes not read yet); a change marks a node
 becomes the volume's (`Vfs.adopt`); moves between the volume and the
 rest of the tree are EXDEV. Commits happen when the system is idle (every
 process waits, e.g. at the shell's prompt) and at sync, fsync, syncfs.
-After an idle commit (`Store.trim`), while fewer than half of the tree's
-1024 nodes are free, clean directories read from the disk are unloaded
-(the nodes they name freed, subdirectories first; nothing open, changed
-or linked twice goes), and while less than a quarter of memory is free,
-clean files' pages are dropped; both are read again when used. stat
+The tree's nodes come in page-sized chunks made as they are needed (no
+fixed count; `Vfs.grow`), and the tree is a cache: after an idle commit
+(`Store.trim`), while more nodes are in use than its budget (one for
+every 256 KiB of memory, 512 at least), clean directories read from the
+disk are unloaded (the nodes they name freed, subdirectories first;
+nothing open, changed or linked twice goes), and while less than a
+quarter of memory is free, clean files' pages are dropped; both are read
+again when used. stat
 gives a volume node's inode number and the volume as its device.
 
     brixfs format /devices/disk0     on brixOS (it is mounted at once), or
