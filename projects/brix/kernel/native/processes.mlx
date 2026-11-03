@@ -1,0 +1,156 @@
+// The native calls on processes: spawn (a program in a new process with
+// exactly the handles given), branch (a copy-on-write copy of the
+// caller), a child's change taken, an event sent. A process handle names
+// the process by its pid.
+const scheduler = @import("../scheduler.mlx")
+const events = @import("../events.mlx")
+const files = @import("../files.mlx")
+const vfs = @import("../vfs.mlx")
+const process = @import("../process.mlx")
+const Frame = @import("../frame.mlx").Frame
+const Sse = @import("../frame.mlx").Sse
+const Bytes = @import("../bytes.mlx").Bytes
+const Status = @import("../status.mlx").Status
+const objects = @import("./objects.mlx")
+
+const Process = process.Process
+const State = process.State
+
+// A change record: what (EXITED, ENDED, STOPPED, WENT_ON), the exit
+// code or the event's kind, the event's detail, reserved (u32 each).
+pub const Changed = struct {
+    pub const EXITED: usize = 1
+    pub const ENDED: usize = 2
+    pub const STOPPED: usize = 3
+    pub const WENT_ON: usize = 4
+    pub const SIZE: usize = 16
+}
+
+// The handles a spawned process may get.
+const SPAWN_HANDLES: usize = 16
+
+// The process a handle names (null: none, or not a process handle).
+pub fn processOf(p: *Process, handle: usize) -> ?*Process {
+    const fd = objects.descriptorOf(p, handle)
+    if fd < 0 { return null }
+    const slot = p.*.files.get(fd).?
+    if slot.*.kind != files.Kind.process { return null }
+    return scheduler.processes().find(slot.*.index)
+}
+
+// The program node a handle names (a regular file), or a Status.
+pub fn programOf(p: *Process, handle: usize) -> isize {
+    const fd = objects.descriptorOf(p, handle)
+    if fd < 0 { return Status.invalid_handle }
+    const slot = p.*.files.get(fd).?
+    if slot.*.kind != files.Kind.node || !vfs.fileSystem().node(slot.*.index).isRegular() { return Status.wrong_kind }
+    return @intCast(isize, slot.*.index)
+}
+
+// A handle to the process `pid` in `p`'s table.
+fn handleTo(p: *Process, pid: usize) -> isize {
+    const fd = p.*.files.openObject(files.Kind.process, pid, files.Open.READ_WRITE)
+    if fd < 0 { return fd }
+    return @bitCast(isize, objects.handleOf(p, fd))
+}
+
+// The start block at `address`: its arguments and environment.
+pub fn startOf(p: *Process, address: usize, arguments: *process.Strings, environment: *process.Strings) -> bool {
+    if !p.prepare(address, 16) { return false }
+    arguments.* = p.strings(Bytes.read64(Bytes.pointer(address), 0))
+    environment.* = p.strings(Bytes.read64(Bytes.pointer(address), 8))
+    return arguments.*.count <= Process.MAX_STRINGS && environment.*.count <= Process.MAX_STRINGS
+}
+
+// process_spawn: the program `program` in a new process, a child of `p`,
+// in its group and working directory, with exactly `count` handles of
+// `p`'s (at `list`): the first is its input, then output, then errors,
+// and so on by place. A handle to it, or a Status.
+pub fn spawn(p: *Process, program: usize, start: usize, list: usize, count: usize) -> isize {
+    const node = programOf(p, program)
+    if node < 0 { return node }
+    if count > SPAWN_HANDLES { return Status.too_large }
+    var arguments: process.Strings = undefined
+    var environment: process.Strings = undefined
+    if !startOf(p, start, &arguments, &environment) { return Status.bad_address }
+    if !p.prepare(list, count * 4) { return Status.bad_address }
+    var k: usize = 0
+    while k < count {
+        if !objects.exists(p, Bytes.read32(Bytes.pointer(list), k * 4)) { return Status.invalid_handle }
+        k += 1
+    }
+    const table = scheduler.processes()
+    const created = table.create(p.*.pid)
+    if created == null { return Status.too_many }
+    const q = created.?
+    q.*.group = p.*.group
+    q.*.umask = p.*.umask
+    q.setDirectory(p.*.directory)
+    q.*.files.closeAll()
+    k = 0
+    while k < count {
+        const fd = objects.descriptorOf(p, Bytes.read32(Bytes.pointer(list), k * 4))
+        q.*.files.adoptAt(k, p.*.files.get(fd).?)
+        k += 1
+    }
+    // The strings are read from `p`'s memory while the new space is
+    // filled; then `p`'s is the one in use again.
+    const loaded = q.load(@bitCast(usize, node), arguments, environment)
+    p.*.space.activate()
+    if loaded != process.Loaded.done {
+        q.*.files.closeAll()
+        q.releaseNodes()
+        q.*.state = State.free
+        return if loaded == process.Loaded.no_memory { Status.no_memory } else { Status.wrong_kind }
+    }
+    q.setProgram(@bitCast(usize, node), vfs.Vfs.NONE)
+    q.*.fsBase = 0
+    q.*.context.setStart(q.*.entry, q.*.stack)
+    Sse.reset(&q.*.sse)
+    return handleTo(p, q.*.pid)
+}
+
+// process_branch: a copy-on-write copy of `p` (its registers in `frame`),
+// which gets 0 from the call; `p` gets a handle to it.
+pub fn branch(p: *Process, frame: *const Frame) -> isize {
+    const pid = scheduler.processes().fork(frame)
+    if pid == 0 { return Status.no_memory }
+    return handleTo(p, pid)
+}
+
+// process_change: what became of the child `handle` names, taken (an
+// ended one is gone then); would_block when nothing did.
+pub fn change(p: *Process, handle: usize, address: usize) -> isize {
+    const found = processOf(p, handle)
+    if found == null { return Status.invalid_handle }
+    const q = found.?
+    if q.*.parentPid != p.*.pid { return Status.denied }
+    if !p.prepare(address, Changed.SIZE) { return Status.bad_address }
+    const into = Bytes.pointer(address)
+    if q.*.state == State.zombie {
+        const ending = q.*.ending
+        Bytes.write32(into, 0, if ending.exited { Changed.EXITED } else { Changed.ENDED })
+        Bytes.write32(into, 4, if ending.exited { ending.code } else { @intCast(usize, ending.kind) })
+        Bytes.write32(into, 8, if ending.exited { 0 } else { @intCast(usize, ending.detail) })
+        Bytes.write32(into, 12, 0)
+        q.*.state = State.free
+        return 0
+    }
+    if q.*.change.what == events.Change.NONE { return Status.would_block }
+    const stopped = q.*.change.what == events.Change.STOPPED
+    Bytes.write32(into, 0, if stopped { Changed.STOPPED } else { Changed.WENT_ON })
+    Bytes.write32(into, 4, @intCast(usize, q.*.change.kind))
+    Bytes.write32(into, 8, @intCast(usize, q.*.change.detail))
+    Bytes.write32(into, 12, 0)
+    q.*.change = events.Change.none()
+    return 0
+}
+
+// event_send: the event `kind` to the process `handle` names.
+pub fn sendEvent(p: *Process, handle: usize, kind: usize) -> isize {
+    const found = processOf(p, handle)
+    if found == null { return Status.invalid_handle }
+    if kind == 0 || kind >= @intCast(usize, events.Event.COUNT) { return Status.invalid }
+    scheduler.processes().send(found.?, @intCast(u32, kind), 0, p.*.pid)
+    return 0
+}

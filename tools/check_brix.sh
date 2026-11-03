@@ -75,13 +75,13 @@ for main in projects/coreutils/*/main.mlx; do
 done
 printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet $brix "projects/coreutils/{}/main.mlx" -o "$work/bin/{}"
 (( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
-for tool in snapshot brixfs floats signals native events; do
+for tool in snapshot brixfs floats signals native events objects; do
     "$compiler" --quiet $brix "projects/brix/tools/$tool/main.mlx" -o "$work/$tool"
 done
 for tool in brixfs floats signals; do
     "$compiler" --quiet "projects/brix/tools/$tool/main.mlx" -o "$work/linux-tools/$tool"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "every-program=tools/brix_programs.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "objects=$work/objects" "every-program=tools/brix_programs.sh" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
@@ -162,7 +162,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines; built for brixOS, uname -o says so"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for "^$(( ${#programs[@]} + 8 ))\$"
+wait_for "^$(( ${#programs[@]} + 9 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -307,8 +307,8 @@ echo "ok   brixOS's own calls: handles, the one wait with deadlines, positioned 
 
 # brixOS's events: the queue, the upcall, a wait it interrupts, a default
 # action, a fault through the upcall.
-type_line 'echo @@ events; events; echo @@ end $?'
-wait_for '^@@ end 0$'
+type_line 'echo @@ events; events; echo @@ events end $?'
+wait_for '^@@ events end 0$'
 cat > "$work/events.expected" <<'END'
 events
 queued 1
@@ -323,9 +323,49 @@ child ended by signal 15
 fault through the upcall, exception 14
 faulting child exited 9
 END
-output | sed -n '/^@@ events$/,/^@@ end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/events.brix"
+output | sed -n '/^@@ events$/,/^@@ events end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/events.brix"
 diff "$work/events.expected" "$work/events.brix" > "$work/events.diff" || fail "the events go otherwise (< expected, > brixOS): $(cat "$work/events.diff")"
 echo "ok   brixOS's events: the queue, the upcall and its return, an interrupted wait, a default action, a fault through the upcall"
+
+# brixOS's own nodes, streams, channels and processes.
+type_line 'echo @@ objects; objects; echo @@ objects end $?'
+wait_for '^@@ objects end 0$'
+cat > "$work/objects.expected" <<'END'
+objects
+make a directory 0
+file kind 1
+file size 11
+open it again exclusively (exists) 7
+a link 0
+a fifo 0
+native (through the link)
+  entry a.txt kind 1
+  entry to-a kind 3
+  entry pipe kind 4
+entries 3
+remove a full directory (not empty) 15
+open a missing one (not found) 6
+streamed
+send 0
+the sent handle here (invalid handle) 1
+receive 0
+hello channel
+handles received 1
+native file (through the received handle)
+receive again (would block) 4
+receive after the peer closed (peer gone) 11
+the branch exited 1
+with 5
+nothing yet (would block) 4
+the other ended by an event 2
+of kind (terminate) 5
+the spawned echo exited 1
+with 0
+spawned
+END
+output | sed -n '/^@@ objects$/,/^@@ objects end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/objects.brix"
+diff "$work/objects.expected" "$work/objects.brix" > "$work/objects.diff" || fail "the objects behave otherwise (< expected, > brixOS): $(cat "$work/objects.diff")"
+echo "ok   brixOS's own nodes, streams, channels (bytes and a handle), branch, spawn with the handles given, events sent, changes taken"
 
 type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
 wait_for '^trapped$'

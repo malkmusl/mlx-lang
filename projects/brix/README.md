@@ -308,11 +308,20 @@ layer (kernel/linux: system.mlx, filecalls.mlx, errno.mlx) for the
 programs built for Linux, and std.posix will be a facade over the native
 calls.
 
-What there is: kernel/native (calls.mlx, objects.mlx, status.mlx) with
-handle_close, handle_duplicate, handle_info, wait, read and write (at a
-position or streaming), clock_read and process_exit; std.os.brix for
-programs; projects/brix/tools/native shows them (tools/check_brix.sh
-compares its lines). A handle names a slot of the process's table and
+What there is: kernel/native (calls.mlx, objects.mlx, processes.mlx,
+nodes.mlx, streams.mlx): handles (close, duplicate, info), wait, read and
+write (at a position or streaming), nodes (open with read, write,
+create, exclusive, truncate; info; make a directory, a FIFO or a link;
+remove; list), streams (a pipe's two ends), channels (messages of bytes
+and handles, which move from the sender's table to the receiver's;
+kernel/channel.mlx), memory (map, unmap), processes (spawn a program
+with exactly the handles given, branch, replace, exit, take a child's
+change, send an event; a process handle's state says when it ended or
+changed), events (claim, take, the upcall), the clocks. Native programs
+see brixOS's own layout (/temporary; /tmp is the Linux layer's). Not
+yet: groups and sessions as handles, timers, memory objects, rename,
+snapshots by handle. std.os.brix for programs; projects/brix/tools/native,
+events and objects show them (tools/check_brix.sh compares their lines). A handle names a slot of the process's table and
 the generation the slot had ((generation << 8) | (slot + 1)): a handle
 kept past a close stays invalid when the slot is used again. The Linux
 layer's descriptors are the slots' numbers, its view of the same table
@@ -336,8 +345,8 @@ events that way. projects/brix/tools/events shows the native side.
 
 ## Next
 
-1. The native interface on: spawn and branch, nodes, streams,
-   channels; std (io, fs, process) on
+1. The native interface on: groups and sessions as handles, timers,
+   memory objects, rename; std (io, fs, process) on
    std.os.brix for --target=x86_64-brixos.
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
