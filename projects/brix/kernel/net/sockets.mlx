@@ -1,0 +1,363 @@
+// Sockets: the table of UDP and TCP sockets a process's descriptor
+// (files.Kind.socket) names. Each has a receive ring in frames of its
+// own (RING bytes: a UDP socket's datagrams as records, a TCP socket's
+// bytes in order); a TCP socket's connection is tcp.mlx's at the same
+// index (api.mlx joins the two: what a call does to a socket). Every
+// change a waiting process may care about (bytes came, room was made,
+// the state moved) counts in the socket's generation and the table's
+// events (poll).
+const memory = @import("../memory.mlx")
+const layout = @import("../../layout.mlx")
+const Bytes = @import("../bytes.mlx").Bytes
+const stack = @import("./stack.mlx")
+const udp = @import("./udp.mlx")
+const Status = @import("../status.mlx").Status
+const Page = memory.Page
+const limits = @import("./limits.mlx")
+
+pub const Kind = enum(u8) { free, udp, tcp }
+
+pub const RING: usize = limits.RING
+const RING_PAGES: usize = RING / Page.SIZE
+// A UDP record: the length, the source address and port, then the bytes.
+pub const RECORD: usize = 8
+// Ports given to sockets that bind none.
+const FIRST_EPHEMERAL: usize = 49152
+
+pub const Socket = struct {
+    kind: Kind
+    // Descriptors naming it.
+    holders: usize
+    localPort: usize
+    remote: stack.Ip
+    remotePort: usize
+    connected: bool
+    // The receive ring (physical pages), and its bytes in use.
+    ring: usize
+    head: usize
+    count: usize
+    // The pending error (SO_ERROR; -errno), and whether the peer closed
+    // (reads give 0 after the bytes).
+    pendingError: isize
+    peerClosed: bool
+    listening: bool
+    generation: usize
+
+    fn bytes(self: *const Self) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.ring)) }
+
+    // `length` bytes from `data` into the ring (room checked by the caller).
+    fn put(self: *Self, data: [*]const u8, length: usize) -> void {
+        const b = self.bytes()
+        var k: usize = 0
+        while k < length {
+            b[(self.*.head + self.*.count + k) % RING] = data[k]
+            k += 1
+        }
+        self.*.count += length
+    }
+
+    // `length` bytes from the ring's start into `into`.
+    fn take(self: *Self, into: [*]u8, length: usize) -> void {
+        const b = self.bytes()
+        var k: usize = 0
+        while k < length {
+            into[k] = b[(self.*.head + k) % RING]
+            k += 1
+        }
+        self.*.head = (self.*.head + length) % RING
+        self.*.count -= length
+    }
+
+    fn peek(self: *const Self, at: usize) -> u8 { return self.bytes()[(self.*.head + at) % RING] }
+
+    pub fn room(self: *const Self) -> usize { return RING - self.*.count }
+
+    pub fn changed(self: *Self) -> void {
+        self.*.generation += 1
+        table.events += 1
+    }
+}
+
+pub const MAX: usize = limits.MAX_SOCKETS
+
+pub const Sockets = struct {
+    slots: [MAX]Socket
+    events: usize
+    nextEphemeral: usize
+
+    pub fn init(self: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            self.*.slots[k].kind = Kind.free
+            self.*.slots[k].holders = 0
+            k += 1
+        }
+        self.*.events = 0
+        self.*.nextEphemeral = FIRST_EPHEMERAL
+    }
+
+    pub fn at(self: *Self, index: usize) -> *Socket { return &self.*.slots[index] }
+
+    pub fn generationOf(self: *Self, index: usize) -> usize { return self.*.slots[index].generation }
+
+    // A socket of `kind`: its index, or Status.too_many / no_memory.
+    pub fn open(self: *Self, kind: Kind) -> isize {
+        var k: usize = 0
+        while k < MAX && self.*.slots[k].kind != Kind.free { k += 1 }
+        if k == MAX { return Status.too_many }
+        const s = &self.*.slots[k]
+        s.*.ring = memory.allFrames().allocateContiguous(RING_PAGES)
+        if s.*.ring == 0 { return Status.no_memory }
+        s.*.kind = kind
+        s.*.holders = 1
+        s.*.localPort = 0
+        s.*.remote = stack.ipOf(0, 0, 0, 0)
+        s.*.remotePort = 0
+        s.*.connected = false
+        s.*.head = 0
+        s.*.count = 0
+        s.*.pendingError = 0
+        s.*.peerClosed = false
+        s.*.listening = false
+        s.*.generation = 1
+        return @intCast(isize, k)
+    }
+
+    // The socket's memory given back when it could not be finished (its
+    // connection's part failed).
+    pub fn abandon(self: *Self, index: usize) -> void {
+        self.freeRing(&self.*.slots[index])
+        self.*.slots[index].kind = Kind.free
+    }
+
+    fn freeRing(self: *Self, s: *Socket) -> void {
+        var k: usize = 0
+        while k < RING_PAGES {
+            memory.allFrames().free(s.*.ring + k * Page.SIZE)
+            k += 1
+        }
+    }
+
+    pub fn retain(self: *Self, index: usize) -> void { self.*.slots[index].holders += 1 }
+
+    pub fn holdersOf(self: *Self, index: usize) -> usize { return self.*.slots[index].holders }
+
+    // A descriptor let go: whether it was the last (api.release then
+    // closes the socket).
+    pub fn release(self: *Self, index: usize) -> bool {
+        const s = &self.*.slots[index]
+        if s.*.holders == 0 { return false }
+        s.*.holders -= 1
+        return s.*.holders == 0
+    }
+
+    // The socket gone (its ring too; a connection's memory is tcp.mlx's).
+    pub fn drop(self: *Self, index: usize) -> void {
+        const s = &self.*.slots[index]
+        if s.*.kind == Kind.free { return }
+        self.freeRing(s)
+        s.*.kind = Kind.free
+        self.*.events += 1
+    }
+
+    // Something about the socket changed (a waiting process looks again).
+    pub fn changed(self: *Self, index: usize) -> void { self.*.slots[index].changed() }
+
+    // Room was made (bytes acknowledged, a connection accepted): a
+    // waiting writer looks again.
+    pub fn roomMade(self: *Self, index: usize) -> void { self.*.slots[index].changed() }
+
+    // Whether `port` is a socket's of `kind` (bound).
+    fn portTaken(self: *Self, kind: Kind, port: usize) -> bool {
+        var k: usize = 0
+        while k < MAX {
+            if self.*.slots[k].kind == kind && self.*.slots[k].localPort == port { return true }
+            k += 1
+        }
+        return false
+    }
+
+    // The socket bound to `port` (0: one the system picks); false when
+    // the port is taken.
+    pub fn bind(self: *Self, index: usize, port: usize) -> bool {
+        const s = &self.*.slots[index]
+        if port == 0 {
+            var tries: usize = 0
+            while tries < 1000 {
+                const candidate = self.*.nextEphemeral
+                self.*.nextEphemeral = if candidate + 1 > 65535 { FIRST_EPHEMERAL } else { candidate + 1 }
+                if !self.portTaken(s.*.kind, candidate) {
+                    s.*.localPort = candidate
+                    return true
+                }
+                tries += 1
+            }
+            return false
+        }
+        if self.portTaken(s.*.kind, port) { return false }
+        s.*.localPort = port
+        return true
+    }
+
+    // The socket's peer set (a UDP socket: its datagrams go there and
+    // come from there; a TCP socket: the connection api.connect opens);
+    // false when no port could be had.
+    pub fn setPeer(self: *Self, index: usize, remote: stack.Ip, port: usize) -> bool {
+        const s = &self.*.slots[index]
+        if s.*.localPort == 0 && !self.bind(index, 0) { return false }
+        s.*.remote = remote
+        s.*.remotePort = port
+        if s.*.kind == Kind.udp { s.*.connected = true }
+        return true
+    }
+
+    // ---- UDP ----
+
+    // A datagram for the socket bound to `port`: queued when it has room.
+    pub fn deliverDatagram(port: usize, source: stack.Ip, sourcePort: usize, data: [*]const u8, length: usize) -> void {
+        var k: usize = 0
+        while k < MAX {
+            const s = &table.slots[k]
+            if s.*.kind == Kind.udp && s.*.localPort == port && (!s.*.connected || (stack.same(s.*.remote, source) && s.*.remotePort == sourcePort)) {
+                if s.room() >= RECORD + length {
+                    var header: [RECORD]u8 = undefined
+                    stack.putBe16(&header, 0, length)
+                    stack.putIp(&header, 2, source)
+                    stack.putBe16(&header, 6, sourcePort)
+                    s.put(&header, RECORD)
+                    s.put(data, length)
+                    s.changed()
+                }
+                return
+            }
+            k += 1
+        }
+    }
+
+    // A datagram sent from the socket to `remote`:`port` (its connected
+    // peer when none is given: port 0).
+    pub fn sendDatagram(self: *Self, index: usize, remote: stack.Ip, port: usize, data: [*]const u8, length: usize) -> isize {
+        const s = &self.*.slots[index]
+        if s.*.localPort == 0 && !self.bind(index, 0) { return Status.too_many }
+        const to = if port == 0 { s.*.remote } else { remote }
+        const toPort = if port == 0 { s.*.remotePort } else { port }
+        if toPort == 0 { return Status.invalid }
+        if !udp.send(s.*.localPort, to, toPort, data, length) { return Status.would_block }
+        return @intCast(isize, length)
+    }
+
+    // The next datagram of the socket (its source into `from`,
+    // `fromPort`): its length (what fits in `capacity`, the rest dropped),
+    // or would_block.
+    pub fn receiveDatagram(self: *Self, index: usize, into: [*]u8, capacity: usize, from: *stack.Ip, fromPort: *usize) -> isize {
+        const s = &self.*.slots[index]
+        if s.*.count < RECORD { return Status.would_block }
+        var header: [RECORD]u8 = undefined
+        s.take(&header, RECORD)
+        const length = stack.be16(&header, 0)
+        from.* = stack.getIp(&header, 2)
+        fromPort.* = stack.be16(&header, 6)
+        const given = if length > capacity { capacity } else { length }
+        s.take(into, given)
+        if length > given {
+            var scratch: [64]u8 = undefined
+            var left = length - given
+            while left > 0 {
+                const chunk = if left > 64 { 64 } else { left }
+                s.take(&scratch, chunk)
+                left -= chunk
+            }
+        }
+        s.changed()
+        return @intCast(isize, given)
+    }
+
+    // ---- TCP ----
+
+    // Bytes of a connection, in order, into the socket's ring: how many
+    // were taken (the rest the peer sends again).
+    pub fn deliverBytes(index: usize, data: [*]const u8, length: usize) -> usize {
+        const s = &table.slots[index]
+        const taken = if length > s.room() { s.room() } else { length }
+        if taken > 0 {
+            s.put(data, taken)
+            s.changed()
+        }
+        return taken
+    }
+
+    // The peer closed its side: reads give what came, then 0.
+    pub fn peerClosed(index: usize) -> void {
+        table.slots[index].peerClosed = true
+        table.slots[index].changed()
+    }
+
+    // The connection failed (-errno kept for the next call and
+    // SO_ERROR).
+    pub fn failed(index: usize, code: isize) -> void {
+        table.slots[index].pendingError = code
+        table.slots[index].connected = false
+        table.slots[index].changed()
+    }
+
+    pub fn established(index: usize) -> void {
+        table.slots[index].connected = true
+        table.slots[index].changed()
+    }
+
+    // Bytes of the stream into `into`: how many, 0 when the peer closed
+    // and all came, would_block when none yet (api.receiveBytes tells
+    // the connection of the room made).
+    pub fn receiveBytes(self: *Self, index: usize, into: [*]u8, capacity: usize) -> isize {
+        const s = &self.*.slots[index]
+        if s.*.count == 0 {
+            if s.*.pendingError != 0 { return self.takeError(index) }
+            if s.*.peerClosed { return 0 }
+            return Status.would_block
+        }
+        const given = if s.*.count > capacity { capacity } else { s.*.count }
+        s.take(into, given)
+        s.changed()
+        return @intCast(isize, given)
+    }
+
+    // The pending error, taken (as a Status-like negative errno).
+    pub fn takeError(self: *Self, index: usize) -> isize {
+        const s = &self.*.slots[index]
+        const code = s.*.pendingError
+        s.*.pendingError = 0
+        return code
+    }
+
+    // The socket a connection to `port` from `remote`:`remotePort` is
+    // for: the listener's index, or MAX.
+    pub fn listenerFor(port: usize) -> usize {
+        var k: usize = 0
+        while k < MAX {
+            const s = &table.slots[k]
+            if s.*.kind == Kind.tcp && s.*.listening && s.*.localPort == port { return k }
+            k += 1
+        }
+        return MAX
+    }
+
+    // A listening socket (api.listen made its connection listen).
+    pub fn setListening(self: *Self, index: usize) -> void { self.*.slots[index].listening = true }
+
+    // A socket for a connection a listener took (SYN came): its index or
+    // too_many; it is the listener's pending one until accepted.
+    pub fn openAccepted(self: *Self, port: usize, remote: stack.Ip, remotePort: usize) -> isize {
+        const index = self.open(Kind.tcp)
+        if index < 0 { return index }
+        const s = &self.*.slots[@bitCast(usize, index)]
+        s.*.holders = 0
+        s.*.localPort = port
+        s.*.remote = remote
+        s.*.remotePort = remotePort
+        return index
+    }
+}
+
+var table: Sockets = undefined // (per run)
+
+pub fn sockets() -> *Sockets { return &table }

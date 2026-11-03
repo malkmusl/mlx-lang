@@ -194,6 +194,46 @@ asked still waits inside the kernel meanwhile: no other one runs until
 the request is done.
 While a volume is mounted from it, a /devices/diskN is not writable.
 
+## The network
+
+A virtio network device (QEMU's `-netdev user,id=n0 -device
+virtio-net-pci,netdev=n0`) is /devices/net0 (`VirtioNet`,
+virtionet.mlx: the legacy transport, a receive queue with buffers posted
+ahead and a transmit queue, on a virtqueue of their own, virtqueue.mlx);
+"brixOS: /devices/net0, 52:54:00:12:34:56 (virtio, IRQ 11)" at boot.
+The kernel's stack (kernel/net) runs on it:
+
+- stack.mlx: Ethernet, ARP (a table of the neighbours, a request when
+  one is missing: the packet is dropped and the sender tries again),
+  IPv4 (one address, netmask and gateway; no fragments) and ICMP (echo
+  answered). The addresses are QEMU's user network's (10.0.2.15/24,
+  the gateway 10.0.2.2, the name server 10.0.2.3) unless
+  /system/settings/network says otherwise (`address`, `netmask`,
+  `gateway`, `nameserver` lines); the kernel writes
+  /system/settings/resolv.conf for programs that look names up
+  ("brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server
+  10.0.2.3").
+- udp.mlx, tcp.mlx: datagrams; connections (active and passive open,
+  segments of MSS bytes within the peer's window from a send ring,
+  sent again after a timeout that doubles, data received in order into
+  the socket's ring and acknowledged at once, FIN both ways, RST; no
+  selective acknowledgement, no slow start).
+- sockets.mlx, api.mlx: the sockets a process's descriptors name
+  (files.Kind.socket; 32 at most, a 16 KiB ring each), and what a call
+  does to one. A call that has to wait leaves the process waiting for
+  the socket to change (WaitKind.socket), as reads of pipes do.
+- linux/socketcalls.mlx: Linux's socket calls (socket, connect
+  (EINPROGRESS and SO_ERROR for a non-blocking one, as std.net makes
+  them), bind, listen, accept, sendto, recvfrom, shutdown, the names and
+  options) on AF_INET: std.net, std.net.dns (resolv.conf and hosts at
+  std.platform's paths) and std.http.client run unchanged, so does
+  wget (projects/wget: `wget URL [-O FILE]`, http and https).
+
+tools/check_brix_net.sh boots with the user network and fetches files
+(a small one, a 400 KiB one, a missing one) from an HTTP server on the
+host with wget. Not yet: DHCP, IPv6, brixOS's own socket calls (the
+native interface), a ping tool.
+
 ## brixfs: the disk's format
 
 brixfs (projects/brix/brixfs.mlx, the format; kernel/volume.mlx, the

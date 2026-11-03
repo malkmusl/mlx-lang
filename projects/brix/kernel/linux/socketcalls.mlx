@@ -1,0 +1,239 @@
+// Linux's socket calls on the network's sockets (net/sockets.mlx): AF_INET
+// stream (TCP) and datagram (UDP) sockets as descriptors (files.Kind
+// .socket), connect (non-blocking: EINPROGRESS, then poll and SO_ERROR,
+// as std.net does), bind, listen, accept, sendto, recvfrom, shutdown,
+// the names, the options (taken, SO_ERROR answered). A call that has to
+// wait leaves the process waiting for the socket to change
+// (WaitKind.socket).
+const process = @import("../process.mlx")
+const files = @import("../files.mlx")
+const wait = @import("../wait.mlx")
+const Bytes = @import("../bytes.mlx").Bytes
+const Errno = @import("./errno.mlx").Errno
+const Status = @import("../status.mlx").Status
+const stack = @import("../net/stack.mlx")
+const sockets = @import("../net/sockets.mlx")
+const api = @import("../net/api.mlx")
+const tcp = @import("../net/tcp.mlx")
+const tcpState = tcp.State
+const Process = process.Process
+
+pub const Number = struct {
+    pub const SOCKET: usize = 41
+    pub const CONNECT: usize = 42
+    pub const ACCEPT: usize = 43
+    pub const SENDTO: usize = 44
+    pub const RECVFROM: usize = 45
+    pub const SENDMSG: usize = 46
+    pub const RECVMSG: usize = 47
+    pub const SHUTDOWN: usize = 48
+    pub const BIND: usize = 49
+    pub const LISTEN: usize = 50
+    pub const GETSOCKNAME: usize = 51
+    pub const GETPEERNAME: usize = 52
+    pub const SOCKETPAIR: usize = 53
+    pub const SETSOCKOPT: usize = 54
+    pub const GETSOCKOPT: usize = 55
+    pub const ACCEPT4: usize = 288
+}
+
+const AF_INET: usize = 2
+const SOCK_STREAM: usize = 1
+const SOCK_DGRAM: usize = 2
+const SOCK_NONBLOCK: usize = 2048
+const SOCK_CLOEXEC: usize = 524288
+const SOL_SOCKET: usize = 1
+const SO_ERROR: usize = 4
+const SOCKADDR_IN: usize = 16
+const EINPROGRESS: isize = -115
+const ENOTSOCK: isize = -88
+const EAFNOSUPPORT: isize = -97
+const EADDRINUSE: isize = -98
+const ENOTCONN: isize = -107
+const EISCONN: isize = -106
+const ECONNREFUSED: isize = -111
+
+pub const SocketCalls = struct {
+    pub fn handles(number: usize) -> bool {
+        return (number >= Number.SOCKET && number <= Number.GETSOCKOPT) || number == Number.ACCEPT4
+    }
+
+    // The socket a descriptor names: its index, or -1.
+    fn socketOf(p: *Process, fd: isize) -> isize {
+        const slot = p.*.files.get(fd)
+        if slot == null || slot.?.*.kind != files.Kind.socket { return -1 }
+        return @intCast(isize, slot.?.*.index)
+    }
+
+    fn nonBlocking(p: *Process, fd: isize) -> bool {
+        const slot = p.*.files.get(fd)
+        return slot != null && slot.?.*.flags & files.O_NONBLOCK != 0
+    }
+
+    // The call waits for socket `index` to change.
+    fn blockOn(index: usize, waiting: *wait.Wait) -> isize {
+        waiting.* = wait.Wait.on(wait.WaitKind.socket, @intCast(isize, index), 0)
+        waiting.*.options = sockets.sockets().generationOf(index)
+        return wait.BLOCKED
+    }
+
+    // A sockaddr_in at `address`: (valid, the IP, the port).
+    fn readAddress(p: *Process, address: usize, length: usize) -> (bool, stack.Ip, usize) {
+        if length < SOCKADDR_IN || !p.prepare(address, SOCKADDR_IN) { return -> (false, stack.ipOf(0, 0, 0, 0), 0) }
+        const a = Bytes.pointer(address)
+        if Bytes.read16(a, 0) != AF_INET { return -> (false, stack.ipOf(0, 0, 0, 0), 0) }
+        return -> (true, stack.getIp(a, 4), stack.be16(a, 2))
+    }
+
+    // A sockaddr_in written at `address` (its length word at `lengthAt`).
+    fn writeAddress(p: *Process, address: usize, lengthAt: usize, ip: stack.Ip, port: usize) -> isize {
+        if address == 0 || lengthAt == 0 { return 0 }
+        if !p.prepare(lengthAt, 4) { return Errno.EFAULT }
+        const room = Bytes.read32(Bytes.pointer(lengthAt), 0)
+        var record: [SOCKADDR_IN]u8 = undefined
+        Bytes.fill(&record, SOCKADDR_IN, 0)
+        Bytes.write16(&record, 0, AF_INET)
+        stack.putBe16(&record, 2, port)
+        stack.putIp(&record, 4, ip)
+        const given = if room > SOCKADDR_IN { SOCKADDR_IN } else { room }
+        if !p.prepare(address, given) { return Errno.EFAULT }
+        Bytes.copy(Bytes.pointer(address), &record, given)
+        Bytes.write32(Bytes.pointer(lengthAt), 0, SOCKADDR_IN)
+        return 0
+    }
+
+    pub fn call(p: *Process, number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, waiting: *wait.Wait) -> isize {
+        if number == Number.SOCKET {
+            if a1 != AF_INET { return EAFNOSUPPORT }
+            const kind = a2 & 0xFF
+            if kind != SOCK_STREAM && kind != SOCK_DGRAM { return Errno.EINVAL }
+            if !stack.configuration().*.up { return Errno.ENODEV }
+            const index = api.open(if kind == SOCK_STREAM { sockets.Kind.tcp } else { sockets.Kind.udp })
+            if index < 0 { return index }
+            var flags: usize = files.Open.READ_WRITE
+            if a2 & SOCK_NONBLOCK != 0 { flags |= files.O_NONBLOCK }
+            if a2 & SOCK_CLOEXEC != 0 { flags |= files.Open.CLOSE_ON_EXEC }
+            const fd = p.*.files.openSocket(@bitCast(usize, index), flags)
+            if fd < 0 { api.release(@bitCast(usize, index)) }
+            return fd
+        }
+        const fd = @intCast(isize, @bitCast(i32, @intCast(u32, a1 & 0xFFFFFFFF)))
+        if number == Number.SOCKETPAIR || number == Number.SENDMSG || number == Number.RECVMSG { return Errno.ENOSYS }
+        const found = socketOf(p, fd)
+        if found < 0 { return if p.*.files.get(fd) == null { Errno.EBADF } else { ENOTSOCK } }
+        const index = @bitCast(usize, found)
+        const table = sockets.sockets()
+        const s = table.at(index)
+        if number == Number.BIND {
+            const address = readAddress(p, a2, a3)
+            if !address.0 { return Errno.EINVAL }
+            return if table.bind(index, address.2) { 0 } else { EADDRINUSE }
+        }
+        if number == Number.CONNECT {
+            if s.*.kind == sockets.Kind.tcp && s.*.connected { return EISCONN }
+            if s.*.kind == sockets.Kind.tcp && s.*.pendingError != 0 { return table.takeError(index) }
+            if s.*.kind == sockets.Kind.tcp && tcp.connectionAt(index).*.state == tcpState.syn_sent {
+                // (Made again while the handshake runs: waits, or says so.)
+                if nonBlocking(p, fd) { return EINPROGRESS }
+                return blockOn(index, waiting)
+            }
+            const address = readAddress(p, a2, a3)
+            if !address.0 { return Errno.EINVAL }
+            const result = api.connect(index, address.1, address.2)
+            if result < 0 { return result }
+            if s.*.kind == sockets.Kind.udp { return 0 }
+            if nonBlocking(p, fd) { return EINPROGRESS }
+            return blockOn(index, waiting)
+        }
+        if number == Number.LISTEN { return api.listen(index) }
+        if number == Number.ACCEPT || number == Number.ACCEPT4 {
+            const accepted = api.accept(index)
+            if accepted == Status.would_block {
+                if nonBlocking(p, fd) { return Errno.EAGAIN }
+                return blockOn(index, waiting)
+            }
+            if accepted < 0 { return accepted }
+            const made = table.at(@bitCast(usize, accepted))
+            var flags: usize = files.Open.READ_WRITE
+            if number == Number.ACCEPT4 && a4 & SOCK_NONBLOCK != 0 { flags |= files.O_NONBLOCK }
+            if number == Number.ACCEPT4 && a4 & SOCK_CLOEXEC != 0 { flags |= files.Open.CLOSE_ON_EXEC }
+            const newFd = p.*.files.openSocket(@bitCast(usize, accepted), flags)
+            if newFd < 0 {
+                api.release(@bitCast(usize, accepted))
+                return newFd
+            }
+            return writeAddress(p, a2, a3, made.*.remote, made.*.remotePort) | newFd
+        }
+        if number == Number.SENDTO {
+            if !p.prepare(a2, a3) { return Errno.EFAULT }
+            if s.*.kind == sockets.Kind.udp {
+                var ip = stack.ipOf(0, 0, 0, 0)
+                var port: usize = 0
+                if a5 != 0 {
+                    const address = readAddress(p, a5, a6of(a4, a5))
+                    if !address.0 { return Errno.EINVAL }
+                    ip = address.1
+                    port = address.2
+                }
+                return table.sendDatagram(index, ip, port, Bytes.pointer(a2), a3)
+            }
+            if !s.*.connected { return if s.*.pendingError != 0 { table.takeError(index) } else { ENOTCONN } }
+            const sent = api.sendBytes(index, Bytes.pointer(a2), a3)
+            if sent == Status.would_block {
+                if nonBlocking(p, fd) { return Errno.EAGAIN }
+                return blockOn(index, waiting)
+            }
+            return sent
+        }
+        if number == Number.RECVFROM {
+            if !p.prepare(a2, a3) { return Errno.EFAULT }
+            if s.*.kind == sockets.Kind.udp {
+                var from: stack.Ip = undefined
+                var fromPort: usize = 0
+                const got = table.receiveDatagram(index, Bytes.pointer(a2), a3, &from, &fromPort)
+                if got == Status.would_block {
+                    if nonBlocking(p, fd) || a4 & 64 != 0 { return Errno.EAGAIN }
+                    return blockOn(index, waiting)
+                }
+                if got >= 0 && a5 != 0 {
+                    const written = writeAddress(p, a5, a6of(a4, a5), from, fromPort)
+                    if written < 0 { return written }
+                }
+                return got
+            }
+            const got = api.receiveBytes(index, Bytes.pointer(a2), a3)
+            if got == Status.would_block {
+                if nonBlocking(p, fd) || a4 & 64 != 0 { return Errno.EAGAIN }
+                return blockOn(index, waiting)
+            }
+            return got
+        }
+        if number == Number.SHUTDOWN {
+            if a2 == 1 || a2 == 2 { api.shutdown(index) }
+            return 0
+        }
+        if number == Number.GETSOCKNAME { return writeAddress(p, a2, a3, stack.configuration().*.address, s.*.localPort) }
+        if number == Number.GETPEERNAME {
+            if !s.*.connected { return ENOTCONN }
+            return writeAddress(p, a2, a3, s.*.remote, s.*.remotePort)
+        }
+        if number == Number.SETSOCKOPT { return 0 }
+        if number == Number.GETSOCKOPT {
+            if a2 == SOL_SOCKET && a3 == SO_ERROR {
+                if !p.prepare(a5, 4) || !p.prepare(a4, 4) { return Errno.EFAULT }
+                const code = table.takeError(index)
+                Bytes.write32(Bytes.pointer(a4), 0, @bitCast(usize, 0 - code) & 0xFFFFFFFF)
+                Bytes.write32(Bytes.pointer(a5), 0, 4)
+                return 0
+            }
+            return Errno.ENOSYS
+        }
+        return Errno.ENOSYS
+    }
+
+    // (sendto's and recvfrom's sixth argument, the address length: the
+    // frame's r9; given to call as a4's upper half is not: it is read
+    // from the frame by system.mlx and passed in a5's place when a5 is
+    // the address.)
+    fn a6of(a4: usize, a5: usize) -> usize { return SOCKADDR_IN }
+}

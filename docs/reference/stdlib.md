@@ -87,7 +87,10 @@ when the standard library has one for the target's platform (`linux` for
 way (`std/bootstrap/os/host.brixos.mlx` for `x86_64-brixos`), which keeps
 the Linux file what the compiler itself is built from, by any compiler
 that builds it. `std.platform` (`platform.linux.mlx`,
-`platform.android.mlx`) names the platform, and `std.ui.host` is how a
+`platform.android.mlx`, `platform.brixos.mlx`) names the platform and
+where its users, groups, programs, resolv.conf and hosts files are
+(`USERS`, `GROUPS`, `PROGRAMS`, `RESOLV_CONF`, `HOSTS`: /etc's on Linux,
+/system/settings's on brixOS), and `std.ui.host` is how a
 std.ui app runs on each (see [UI](ui.md)), so a program's own source is the
 same for every target (`tests/290_platform_module_runtime.mlx`).
 

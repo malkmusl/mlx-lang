@@ -1,0 +1,175 @@
+// A virtio network device (QEMU's `-device virtio-net-pci`): the legacy
+// PCI transport, its MAC from the configuration space, a receive queue
+// with buffers posted ahead (RX_COUNT of 2 KiB: the 10-byte header and a
+// frame) and a transmit queue of buffers the device takes one chain
+// each; frames received go to the stack (net/stack.mlx) from the
+// device's interrupt (or when the stack looks). /devices/net0.
+const layout = @import("../layout.mlx")
+const memory = @import("./memory.mlx")
+const console = @import("./console.mlx")
+const Port = @import("./cpu.mlx").Port
+const Irq = @import("./interrupts.mlx").Irq
+const Pci = @import("./pci.mlx").Pci
+const Bytes = @import("./bytes.mlx").Bytes
+const Virtqueue = @import("./virtqueue.mlx").Virtqueue
+const stack = @import("./net/stack.mlx")
+const Page = memory.Page
+
+pub const VirtioNet = struct {
+    pub const VENDOR: usize = 0x1AF4
+    // The transitional network device (legacy registers).
+    pub const DEVICE: usize = 0x1000
+    const HOST_FEATURES: usize = 0x00
+    const GUEST_FEATURES: usize = 0x04
+    const STATUS: usize = 0x12
+    const ISR: usize = 0x13
+    // The device's configuration (legacy, no MSI-X): the MAC.
+    const CONFIG_MAC: usize = 0x14
+    const ACKNOWLEDGE: usize = 1
+    const DRIVER: usize = 2
+    const DRIVER_OK: usize = 4
+    // Features: the device has a MAC address.
+    const FEATURE_MAC: usize = 0x20
+    // The legacy header before each frame.
+    pub const HEADER: usize = 10
+    // Buffers of 2 KiB (two to a page): a header and a full frame.
+    pub const BUFFER: usize = 2048
+    pub const RX_COUNT: usize = 16
+    pub const TX_COUNT: usize = 16
+    pub const NO_IRQ: usize = 0xFF
+    pub const MAX_FRAME: usize = 1514
+
+    present: bool
+    port: usize
+    irq: usize
+    interrupts: usize
+    mac: [6]u8
+    rx: Virtqueue
+    tx: Virtqueue
+    // The buffers (physical, RX_COUNT then TX_COUNT, BUFFER each), and
+    // which buffer each descriptor of the queues carries.
+    buffers: usize
+    rxBufferOf: [256]u8
+    txBufferOf: [256]u8
+    // The transmit buffers in flight (bits).
+    txBusy: usize
+    received: usize
+    sent: usize
+
+    fn buffer(self: *const Self, k: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.buffers + k * BUFFER)) }
+
+    // The first virtio network device on bus 0, made ready; whether there
+    // is one.
+    pub fn probe(self: *Self) -> bool {
+        self.*.present = false
+        const address = Pci.find(VENDOR, DEVICE)
+        if address == Pci.NONE { return false }
+        const port = Pci.ioBase(address, 0)
+        if port == 0 { return false }
+        Pci.enable(address)
+        self.*.port = port
+        Port.out8(port + STATUS, 0)
+        Port.out8(port + STATUS, ACKNOWLEDGE)
+        Port.out8(port + STATUS, ACKNOWLEDGE | DRIVER)
+        const features = Port.in32(port + HOST_FEATURES)
+        Port.out32(port + GUEST_FEATURES, features & FEATURE_MAC)
+        var k: usize = 0
+        while k < 6 {
+            self.*.mac[k] = if features & FEATURE_MAC != 0 { @intCast(u8, Port.in8(port + CONFIG_MAC + k)) } else { @intCast(u8, 0x52 + k) }
+            k += 1
+        }
+        if !self.*.rx.init(port, 0) || !self.*.tx.init(port, 1) { return false }
+        self.*.buffers = memory.allFrames().allocateContiguous((RX_COUNT + TX_COUNT) * BUFFER / Page.SIZE)
+        if self.*.buffers == 0 { return false }
+        self.*.txBusy = 0
+        self.*.received = 0
+        self.*.sent = 0
+        self.*.interrupts = 0
+        k = 0
+        while k < RX_COUNT {
+            if !self.postReceive(k) { return false }
+            k += 1
+        }
+        Port.out8(port + STATUS, ACKNOWLEDGE | DRIVER | DRIVER_OK)
+        self.*.irq = Pci.read(address, 0x3C) & 0xFF
+        if self.*.irq == 0 || self.*.irq >= 16 {
+            self.*.irq = NO_IRQ
+        } else {
+            Irq.unmask(self.*.irq)
+        }
+        self.*.present = true
+        return true
+    }
+
+    // Receive buffer `k` to the device (it writes a header and a frame).
+    fn postReceive(self: *Self, k: usize) -> bool {
+        const taken = self.*.rx.take()
+        if !taken.0 { return false }
+        self.*.rxBufferOf[taken.1] = @intCast(u8, k)
+        self.*.rx.set(taken.1, self.*.buffers + k * BUFFER, BUFFER, Virtqueue.DEVICE_WRITES, Virtqueue.NONE)
+        self.*.rx.submit(taken.1)
+        return true
+    }
+
+    // The transmit buffers the device is done with, free again.
+    fn reclaim(self: *Self) -> void {
+        while true {
+            const done = self.*.tx.used()
+            if !done.0 { return }
+            self.*.txBusy &= ~(@intCast(usize, 1) << @intCast(u6, self.*.txBufferOf[done.1]))
+            self.*.tx.give(done.1)
+        }
+    }
+
+    // `frame` (`length` bytes, an Ethernet frame) to the wire; false when
+    // every buffer is in flight.
+    pub fn transmit(self: *Self, frame: [*]const u8, length: usize) -> bool {
+        if !self.*.present || length > MAX_FRAME { return false }
+        self.reclaim()
+        var k: usize = 0
+        while k < TX_COUNT && self.*.txBusy & (@intCast(usize, 1) << @intCast(u6, k)) != 0 { k += 1 }
+        if k == TX_COUNT { return false }
+        const taken = self.*.tx.take()
+        if !taken.0 { return false }
+        const slot = RX_COUNT + k
+        const into = self.buffer(slot)
+        Bytes.fill(into, HEADER, 0)
+        Bytes.copy(Bytes.pointer(@intFromPtr(into) + HEADER), frame, length)
+        self.*.txBusy |= @intCast(usize, 1) << @intCast(u6, k)
+        self.*.txBufferOf[taken.1] = @intCast(u8, k)
+        self.*.tx.set(taken.1, self.*.buffers + slot * BUFFER, HEADER + length, 0, Virtqueue.NONE)
+        self.*.tx.submit(taken.1)
+        self.*.sent += 1
+        return true
+    }
+
+    // The frames the device received, to the stack; their buffers posted
+    // again.
+    pub fn receive(self: *Self) -> void {
+        if !self.*.present { return }
+        while true {
+            const done = self.*.rx.used()
+            if !done.0 { return }
+            const k = @intCast(usize, self.*.rxBufferOf[done.1])
+            self.*.rx.give(done.1)
+            if done.2 > HEADER {
+                self.*.received += 1
+                stack.receive(Bytes.pointer(@intFromPtr(self.buffer(k)) + HEADER), done.2 - HEADER)
+            }
+            _ = self.postReceive(k)
+        }
+    }
+
+    // Its interrupt: taken back (the ISR register), the frames received
+    // taken in; whether the device raised one.
+    pub fn interrupted(self: *Self) -> bool {
+        if Port.in8(self.*.port + ISR) & 1 == 0 { return false }
+        self.*.interrupts += 1
+        self.receive()
+        return true
+    }
+}
+
+var first: VirtioNet = undefined // (per run)
+
+pub fn device() -> *VirtioNet { return &first }
