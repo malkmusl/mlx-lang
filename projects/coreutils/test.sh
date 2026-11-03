@@ -1505,6 +1505,11 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -s output differs'
 "$bin_dir/paste" -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
 /usr/bin/paste -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -d, output differs'
+for options in -sd+ -zsd, "-sd :" -sz; do
+    "$bin_dir/paste" $options "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+    /usr/bin/paste $options "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "paste $options (grouped options) output differs"
+done
 
 printf 'a\nb\nc\nd\ne\n' > "$work_dir/shuf1"
 sort "$work_dir/shuf1" > "$work_dir/shuf1-sorted"
