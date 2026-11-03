@@ -27,7 +27,8 @@
 # the tree has nodes for are there (unloaded, read again); a script runs (by
 # /proc/self/exe), a program
 # copied into /temporary runs, and a program of /system/programs written
-# to is copied up; Ctrl-C ends the foreground program, Ctrl-D ends its
+# to is copied up; Ctrl-C ends the foreground program (a busy one too: the
+# serial line's interrupt), the timer shares the processor; Ctrl-D ends its
 # input;
 # `exit 3` ends the shell and the kernel starts it again; and no system
 # call the programs made was missing.
@@ -68,7 +69,8 @@ printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet "p
 (( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
 "$compiler" --quiet projects/brix/tools/snapshot/main.mlx -o "$work/snapshot"
 "$compiler" --quiet projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "every-program=tools/brix_programs.sh" "$work/bin/"
+"$compiler" --quiet projects/brix/tools/floats/main.mlx -o "$work/floats"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "every-program=tools/brix_programs.sh" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
@@ -149,7 +151,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for "^$(( ${#programs[@]} + 4 ))\$"
+wait_for "^$(( ${#programs[@]} + 5 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -246,6 +248,13 @@ output | sed -n '/^@@ env \[/,/^@@ done$/p' | grep -v '^$' > "$work/programs.bri
 grep -v '^$' "$work/programs.host" | diff - "$work/programs.brix" > "$work/programs.diff" || fail "programs differ from the host's run (< host, > brixOS): $(cat "$work/programs.diff")"
 echo "ok   all ${#programs[@]} coreutils programs run as on the host (links, FIFOs included)"
 
+# Two programs at once that compute in the SSE registers for many time
+# slices, each keeping its own.
+type_line 'floats > /tmp/f1 & floats > /tmp/f2; wait; cat /tmp/f1 /tmp/f2'
+sum=$("$work/floats")
+wait_for "^$sum$" 2
+echo "ok   two programs at once keep their own SSE registers"
+
 type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
 wait_for '^script one$'
 wait_for '^script two$'
@@ -265,6 +274,18 @@ type_to_program '\003'
 type_line 'echo after $?'
 wait_for '^after 130$'
 echo "ok   Ctrl-C ends the foreground program (SIGINT)"
+
+# The timer and the serial line's interrupts: a program that never waits
+# is ended by Ctrl-C; a busy one in the background leaves time to the
+# others.
+type_line 'yes > /dev/null'
+type_to_program '\003'
+type_line 'echo busy $?'
+wait_for '^busy 130$'
+type_line 'yes > /dev/null & sleep 1; echo the shell runs; kill $!; wait $!; echo ended $?'
+wait_for '^the shell runs$'
+wait_for '^ended 143$'
+echo "ok   preemption: Ctrl-C ends a busy program, a busy one in the background leaves time to the shell"
 
 type_line 'wc -l'
 type_to_program 'a\rb\r'

@@ -65,6 +65,9 @@ All 73 programs of projects/coreutils are in the boot archive;
 tools/check_brix.sh runs each, about 180 invocations with their options
 (tools/brix_programs.sh), in brixOS and on the host and compares what
 they print.
+It also runs projects/brix/tools/floats (a long computation in the SSE
+registers) twice at once: both must print the host's result, so each
+process keeps its registers across the timer's preemptions.
 
 ## Copy on write
 
@@ -189,8 +192,13 @@ The pieces:
     `BootInfo`: port I/O, CR2/CR3, INVLPG, WRMSR, RDTSC, entering user
     mode); the entry tells the kernel's calls from the program's by the
     return address's half.
-  - serial.mlx, console.mlx: `Uart` (COM1, polled) and `Console`
-    (`console.out`).
+  - serial.mlx, console.mlx: `Uart` (COM1: output polled, input by its
+    receive interrupt) and `Console` (`console.out`).
+  - interrupts.mlx: `Irq`, the two 8259 PICs moved to vectors 32 to 47
+    with only the timer (the PIT's channel 0, 100 Hz) and the serial
+    line unmasked; end of interrupt, spurious IRQ 7 and 15. The kernel
+    runs with interrupts off (trap gates and SYSCALL clear IF): they
+    come in user mode, or while the idle loop halts.
   - memory.mlx: `Page`, `Frames` (physical frames from the Multiboot
     memory size, with the count of their holders), `Space` (an address
     space sharing the kernel's half: map, translate, back, release,
@@ -219,20 +227,25 @@ The pieces:
     pages shared copy-on-write, `Space.clone`), the end of a process (a zombie
     until its parent's wait4; SIGCHLD for sigtimedwait), signals that end
     processes (kill, Ctrl-C to the terminal's foreground group), and the
-    switch to the next process. There is no timer yet: a process runs
-    until it waits, ends or yields. A system call that has to wait
+    switch to the next process: when it waits, ends or yields, or when
+    the timer's interrupt comes in user mode (its time slice, 10 ms, is
+    over). A system call that has to wait
     (wait4, a pipe, the terminal, poll, nanosleep, sigtimedwait) leaves
     the process at its SYSCALL instruction to make the call again when
     what it waits for (`Wait`) holds, so no process needs a kernel stack
-    of its own; while none can run, the serial line is polled.
+    of its own; while none can run, the processor halts until an
+    interrupt. Each process keeps its SSE registers (FXSAVE's image)
+    while it does not run; a new program starts with the default ones.
   - pipe.mlx: `Pipe`s (4 KiB ring buffers, their readers and writers
     counted by the descriptors); files.mlx: `Descriptors` (of nodes or
     pipe ends, with their access mode, O_APPEND, close-on-exec).
   - system.mlx, files.mlx, terminal.mlx, clock.mlx: `System` answers
     Linux's system call numbers (`Number`) and structures for what a
     shell on a terminal needs: read, write, the termios of the serial
-    line (`Terminal`: canonical mode edited as input comes, with echo,
-    erase, EOF and Ctrl-C, raw mode, ONLCR, ICRNL; the foreground group),
+    line (`Terminal`: its input queued as the interrupt brings it, Ctrl-C
+    taken at once, so it ends a program that never reads; canonical
+    mode edited as input comes, with echo, erase and EOF, raw mode,
+    ONLCR, ICRNL; the foreground group),
     the window size, fork, execve, wait4, exit, kill, pipe, setpgid,
     umask, mmap/munmap/brk, read/write/lseek on files, poll, clocks
     (`Clock`: the TSC, its rate measured against the `Pit`, the `Cmos`
@@ -243,25 +256,22 @@ The pieces:
     volume.mlx: `Store`, the brixfs volume (mount, read, commit, sweep,
     snapshots).
   - frame.mlx, trap.mlx, shell.mlx: the trap `Frame` (registers saved,
-    SSE state kept by FXSAVE in the blob), `brix_trap` (system calls and
-    the switches they bring, page faults of a process's regions, a crash
+    SSE state kept by FXSAVE in the blob below it: `Frame.sse`, `Sse`),
+    `brix_trap` (system calls and the switches they bring, the timer's
+    and the serial line's interrupts, page faults of a process's regions, a crash
     report for the rest: a faulting program ends with SIGSEGV), and
     mlx-sh as the first process, started again (every other process
     ending) when it exits or faults.
 
-Not there yet: a timer (a program that computes without a system call
-keeps the processor; Ctrl-C reaches only what reads the terminal or
-waits), signal handlers (signals end a process or are dropped; job
-control's stops do not stop), interrupts at all (the PICs are masked;
-the serial line and the clocks are polled), users and permissions that
-are checked, more than one CPU,
-an EFI loader.
+Not there yet: signal handlers (signals end a process or are dropped;
+job control's stops do not stop), the disk's interrupt (its requests
+are polled), the APIC (the legacy PICs do), users and permissions that
+are checked, more than one CPU, an EFI loader.
 
 ## Next
 
-1. The timer (the APIC's) and preemption; the serial line's interrupt;
-   signal handlers (rt_sigaction, delivery, sigreturn) and job control
-   (SIGTSTP, SIGCONT).
+1. Signal handlers (rt_sigaction, delivery, sigreturn) and job control
+   (SIGTSTP, SIGCONT, Ctrl-Z).
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
