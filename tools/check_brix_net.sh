@@ -4,7 +4,9 @@
 # network device; the kernel's stack (ARP, IPv4, ICMP, UDP, TCP), Linux's
 # socket calls for std.net, and wget (std.http.client) fetching files
 # from an HTTP server on the host: a small one, a large one (many
-# segments, the window, acknowledgements), a missing one (404).
+# segments, the window, acknowledgements), a missing one (404); ping to
+# the gateway; brixOS's own socket calls (netcalls: a stream connection
+# to ourselves through the stack, a datagram, an echo).
 #
 #   tools/check_brix_net.sh [compiler]
 set -euo pipefail
@@ -36,11 +38,13 @@ mkdir -p "$work/bin" "$work/www"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 "$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
 "$compiler" --quiet $brix projects/wget/main.mlx -o "$work/wget"
+"$compiler" --quiet $brix projects/ping/main.mlx -o "$work/ping"
+"$compiler" --quiet $brix projects/brix/tools/netcalls/main.mlx -o "$work/netcalls"
 for program in cat wc echo sha256sum; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "wget=$work/wget" "$work/bin/"
-echo "ok   the kernel, wget and a boot image build"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "$work/bin/"
+echo "ok   the kernel, wget, ping, netcalls and a boot image build"
 
 # The host's HTTP server on a port of its own.
 echo "hello from the host" > "$work/www/hello.txt"
@@ -77,10 +81,19 @@ type_line() {
     printf '%s\r' "$1" >&3
 }
 wait_for '^brixOS: /devices/net0, [0-9a-f:]* (virtio, IRQ [0-9]*)$'
-wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3$'
+wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
 type_line 'cat /system/settings/resolv.conf'
 wait_for '^nameserver 10.0.2.3$'
-echo "ok   the virtio network device is found, the stack configured for QEMU's user network, /etc/resolv.conf written"
+echo "ok   the virtio network device is found, the stack configured by DHCP from QEMU's user network, resolv.conf written"
+type_line 'ping 10.0.2.2 2; echo ping $?'
+wait_for '^[0-9]* bytes from 10.0.2.2: seq=1 time=[0-9.]* ms$'
+wait_for '^--- 2 sent, 2 received$'
+wait_for '^ping 0$'
+type_line 'netcalls; echo netcalls $?'
+for expected in '^socket kind 9$' '^connect 0$' '^client writable (connected) 2$' '^listener readable (a connection waits) 1$' '^the peer is ourselves$' '^received 5$' '^hello$' '^read 5$' '^client sees the end (peer gone) 4$' '^receive at the end 0$' '^datagram received 5$' '^from port 4712$' '^echo answered 1$' '^an echo reply$' '^netcalls 0$'; do
+    wait_for "$expected"
+done
+echo "ok   ping gets its echoes; the native socket calls: a stream to ourselves, a datagram, an echo"
 type_line "wget http://10.0.2.2:$port/hello.txt -O /temporary/hello.txt && cat /temporary/hello.txt"
 wait_for '^wget: /temporary/hello.txt: 20 bytes$'
 wait_for '^hello from the host$'

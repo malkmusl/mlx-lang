@@ -181,8 +181,13 @@ disk image. Each disk's volume is mounted at /volumes/diskN (a brixfs
 volume, read and written, or an ext2 one read-only); the first with a
 system on it becomes / (below). A volume on another disk is formatted
 and used alike (`brixfs format /devices/disk1`, then /volumes/disk1;
-`sync` commits every volume); disks may share an interrupt line.
-Partitions (a GPT) are not read yet: a disk is one volume.
+`sync` commits every volume); disks may share an interrupt line. A
+disk with a GPT (block.mlx reads it: the header's and the entries'
+CRC32s checked) is /devices/diskN with its partitions /devices/diskNpM
+(from 1), each a volume of its own at /volumes/diskNpM (the disk itself
+is then no volume); `brixfs partition /devices/disk3 2 1` writes a GPT
+with partitions of those sizes (MiB) on a device or an image (a boot
+later sees them).
 tools/check_brix_disks.sh boots with three disks (a brixfs system, an
 empty one formatted and written in brixOS, an ext2 image). The driver (`VirtioBlock`, virtio.mlx)
 uses the legacy PCI transport (registers in an I/O BAR), one virtqueue in
@@ -229,10 +234,25 @@ The kernel's stack (kernel/net) runs on it:
   std.platform's paths) and std.http.client run unchanged, so does
   wget (projects/wget: `wget URL [-O FILE]`, http and https).
 
-tools/check_brix_net.sh boots with the user network and fetches files
-(a small one, a 400 KiB one, a missing one) from an HTTP server on the
-host with wget. Not yet: DHCP, IPv6, brixOS's own socket calls (the
-native interface), a ping tool.
+- dhcp.mlx: at boot, unless the settings give an address, DHCP asks
+  QEMU's user network (DISCOVER, REQUEST; the ACK's address, netmask,
+  router and name server; "(DHCP)" on the boot line; the lease is not
+  renewed). settings.mlx reads the network file and writes resolv.conf.
+- native/sockets.mlx: brixOS's own socket calls (spec calls 39 to 46:
+  socket_open of a stream, datagram or ping socket, bind, connect,
+  listen, accept, send, receive, info; std.os.brix's socketOpen and
+  the rest). A call never waits: it says would_block and the program
+  waits on the handle (READABLE, WRITABLE, PEER_GONE, ENDED). A packet
+  to our own address goes through the stack at once (a loopback), so a
+  program may talk to itself.
+- ping (projects/ping): `ping HOST [COUNT]` on a datagram socket of
+  IPPROTO_ICMP (the kernel sets the identifier; Linux's ping sockets
+  work the same).
+
+tools/check_brix_net.sh boots with the user network: DHCP, ping to the
+gateway, wget fetching files (a small one, a 400 KiB one, a missing one)
+from an HTTP server on the host, and the native calls (a stream to
+ourselves, a datagram, an echo). Not yet: IPv6, a lease's renewal.
 
 ## brixfs: the disk's format
 

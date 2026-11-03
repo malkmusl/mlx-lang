@@ -23,6 +23,8 @@
 // It reads the newer valid superblock, as the kernel does.
 const std = @import("std")
 const format = @import("../../brixfs.mlx")
+const random = @import("std.random")
+const flate = @import("std.flate")
 const Brixfs = format.Brixfs
 const Superblock = format.Superblock
 const Inode = format.Inode
@@ -154,17 +156,180 @@ fn formatDevice(path: [*]const u8) -> u8 {
     print("brixfs: ")
     printNumber(blocks)
     print(" blocks of 4 KiB\n")
-    // On brixOS: the kernel mounts it (at /volumes/diskN: the device's
-    // number, /devices/diskN).
-    var which: usize = 0
-    var at: usize = 0
-    while path[at] != 0 { at += 1 }
-    if at > 0 && path[at - 1] >= 48 && path[at - 1] <= 57 { which = @intCast(usize, path[at - 1] - 48) }
-    if std.linux.syscall1(SYS_mount_disk, which) == 0 {
-        print("brixfs: mounted at /volumes/disk")
-        printNumber(which)
+    // On brixOS: the kernel mounts it (at /volumes/NAME: the device's
+    // name, /devices/NAME).
+    const name = deviceName(path)
+    if std.linux.syscall2(SYS_mount_disk, @intFromPtr(name.pointer), name.length) == 0 {
+        print("brixfs: mounted at /volumes/")
+        print(name)
         print("\n")
     }
+    return 0
+}
+
+// The last part of a path (a device's name).
+fn deviceName(path: [*]const u8) -> []const u8 {
+    var length: usize = 0
+    while path[length] != 0 { length += 1 }
+    var start = length
+    while start > 0 && path[start - 1] != 47 { start -= 1 }
+    return path[start..length]
+}
+
+// ---- partitions ----
+
+const SECTOR: usize = 512
+const GPT_ENTRIES: usize = 128
+const GPT_ENTRY: usize = 128
+// The partitions start at LBA 40 (4 KiB aligned, after the entries).
+const FIRST_USABLE: usize = 40
+
+fn writeSectors(device: Device, lba: usize, from: [*]const u8, length: usize) -> bool {
+    return std.linux.syscall4(SYS_pwrite64, @bitCast(usize, device.descriptor), @intFromPtr(from), length, lba * SECTOR) == @intCast(isize, length)
+}
+
+fn putGuid(into: [*]u8, at: usize) -> void {
+    var guid: [16]u8 = undefined
+    if !random.fill(&guid, 16) {
+        var k: usize = 0
+        while k < 16 {
+            guid[k] = @intCast(u8, (random.random32() >> @intCast(u5, (k % 4) * 8)) & 255)
+            k += 1
+        }
+    }
+    // (Version 4, variant 1.)
+    guid[7] = (guid[7] & 0x0F) | 0x40
+    guid[8] = (guid[8] & 0x3F) | 0x80
+    var k: usize = 0
+    while k < 16 {
+        into[at + k] = guid[k]
+        k += 1
+    }
+}
+
+// A GPT header (primary or backup) into `header` (a sector).
+fn gptHeader(header: [*]u8, mine: usize, other: usize, lastUsable: usize, entriesLba: usize, entriesCrc: usize, diskGuid: [*]const u8) -> void {
+    var k: usize = 0
+    while k < SECTOR {
+        header[k] = 0
+        k += 1
+    }
+    const signature = "EFI PART"
+    k = 0
+    while k < 8 {
+        header[k] = signature[k]
+        k += 1
+    }
+    Brixfs.put(header, 8, 4, 0x00010000)
+    Brixfs.put(header, 12, 4, 92)
+    Brixfs.put(header, 24, 8, mine)
+    Brixfs.put(header, 32, 8, other)
+    Brixfs.put(header, 40, 8, FIRST_USABLE)
+    Brixfs.put(header, 48, 8, lastUsable)
+    k = 0
+    while k < 16 {
+        header[56 + k] = diskGuid[k]
+        k += 1
+    }
+    Brixfs.put(header, 72, 8, entriesLba)
+    Brixfs.put(header, 80, 4, GPT_ENTRIES)
+    Brixfs.put(header, 84, 4, GPT_ENTRY)
+    Brixfs.put(header, 88, 4, entriesCrc)
+    Brixfs.put(header, 16, 4, @intCast(usize, flate.crc32(0, header, 92)))
+}
+
+// brixfs partition DEVICE MIB...: a GPT with one partition per size (MiB,
+// from LBA 40 on, 4 KiB aligned), the protective MBR, the backup at the
+// end; what was on the device is no volume any more.
+fn partitionDevice(path: [*]const u8, arguments: [][*]const u8, first: usize, count: usize) -> u8 {
+    var status: std.fs.Stat = undefined
+    if std.fs.status(path, &status) != 0 { return fail("cannot see the device") }
+    const sectors = @bitCast(usize, status.size) / SECTOR
+    if sectors < FIRST_USABLE + 34 + 8 { return fail("the device is too small to partition") }
+    const lastUsable = sectors - 34
+    const opened = openDevice(path, true)
+    if opened == null { return fail("cannot open the device to write") }
+    const device = opened.?
+    var entries: [GPT_ENTRIES * GPT_ENTRY]u8 = undefined
+    var k: usize = 0
+    while k < GPT_ENTRIES * GPT_ENTRY {
+        entries[k] = 0
+        k += 1
+    }
+    // Linux's filesystem data type (0FC63DAF-8483-4772-8E79-3D69D8477DE4).
+    const kind = [16]u8{ 0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4 }
+    var next = FIRST_USABLE
+    var n: usize = 0
+    while n < count {
+        const text = std.string.asSlice(std.process.argument(arguments, first + n))
+        var size: usize = 0
+        for digit in text {
+            if digit < 48 || digit > 57 { return fail("a partition's size is MiB as a number") }
+            size = size * 10 + @intCast(usize, digit - 48)
+        }
+        if size == 0 { return fail("a partition's size is MiB as a number") }
+        const length = size * 1048576 / SECTOR
+        if next + length - 1 > lastUsable { return fail("the partitions do not fit the device") }
+        const entry: [*]u8 = unsafe { @ptrFromInt([*]u8, @intFromPtr(&entries) + n * GPT_ENTRY) }
+        k = 0
+        while k < 16 {
+            entry[k] = kind[k]
+            k += 1
+        }
+        putGuid(entry, 16)
+        Brixfs.put(entry, 32, 8, next)
+        Brixfs.put(entry, 40, 8, next + length - 1)
+        // The name, UTF-16: "brix" and the number.
+        const name = "brix"
+        k = 0
+        while k < 4 {
+            entry[56 + 2 * k] = name[k]
+            k += 1
+        }
+        entry[64] = @intCast(u8, 49 + n)
+        next += length
+        n += 1
+    }
+    const entriesCrc = @intCast(usize, flate.crc32(0, &entries, GPT_ENTRIES * GPT_ENTRY))
+    var diskGuid: [16]u8 = undefined
+    putGuid(&diskGuid, 0)
+    var header: [SECTOR]u8 = undefined
+    // The protective MBR: one partition of type EE over the disk.
+    k = 0
+    while k < SECTOR {
+        header[k] = 0
+        k += 1
+    }
+    header[446 + 4] = 0xEE
+    header[446 + 1] = 0
+    header[446 + 2] = 2
+    header[446 + 3] = 0
+    header[446 + 5] = 0xFF
+    header[446 + 6] = 0xFF
+    header[446 + 7] = 0xFF
+    Brixfs.put(&header, 446 + 8, 4, 1)
+    Brixfs.put(&header, 446 + 12, 4, if sectors - 1 > 0xFFFFFFFF { 0xFFFFFFFF } else { sectors - 1 })
+    header[510] = 0x55
+    header[511] = 0xAA
+    if !writeSectors(device, 0, &header, SECTOR) { return fail("cannot write") }
+    gptHeader(&header, 1, sectors - 1, lastUsable, 2, entriesCrc, &diskGuid)
+    if !writeSectors(device, 1, &header, SECTOR) || !writeSectors(device, 2, &entries, GPT_ENTRIES * GPT_ENTRY) { return fail("cannot write") }
+    gptHeader(&header, sectors - 1, 1, lastUsable, sectors - 33, entriesCrc, &diskGuid)
+    if !writeSectors(device, sectors - 33, &entries, GPT_ENTRIES * GPT_ENTRY) || !writeSectors(device, sectors - 1, &header, SECTOR) { return fail("cannot write") }
+    // (The old volume's superblocks: no volume on the disk itself.)
+    k = 0
+    while k < SECTOR {
+        header[k] = 0
+        k += 1
+    }
+    var s: usize = 0
+    while s < Brixfs.SUPERBLOCKS {
+        _ = writeSectors(device, FIRST_USABLE - 8 + s * 8, &header, SECTOR)
+        s += 1
+    }
+    print("brixfs: ")
+    printNumber(count)
+    print(" partitions (a new table: the system sees them after a boot)\n")
     return 0
 }
 
@@ -595,10 +760,11 @@ fn check(path: [*]const u8, repairing: bool) -> u8 {
 
 pub fn main(arguments: [][*]const u8) -> u8 {
     const count = std.process.count(arguments)
-    if count < 3 { return fail("usage: brixfs format|list|check|repair DEVICE | brixfs cat|blocks DEVICE PATH | brixfs create IMAGE MIB") }
+    if count < 3 { return fail("usage: brixfs format|list|check|repair DEVICE | brixfs cat|blocks DEVICE PATH | brixfs create IMAGE MIB | brixfs partition DEVICE MIB...") }
     const command = std.string.asSlice(std.process.argument(arguments, 1))
     const device = std.process.argument(arguments, 2).pointer
     if std.text.same(command, "format") && count == 3 { return formatDevice(device) }
+    if std.text.same(command, "partition") && count >= 4 { return partitionDevice(device, arguments, 3, count - 3) }
     if std.text.same(command, "create") && count == 4 { return createImage(device, std.string.asSlice(std.process.argument(arguments, 3))) }
     if std.text.same(command, "list") && count == 3 { return list(device) }
     if std.text.same(command, "cat") && count == 4 { return cat(device, std.string.asSlice(std.process.argument(arguments, 3))) }
