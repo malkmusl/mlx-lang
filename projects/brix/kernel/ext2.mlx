@@ -1,0 +1,190 @@
+// ext2 on the disk (projects/brix/ext2.mlx's format), the format brixOS
+// exchanges disks with Linux in: mounted read-only at /volumes/disk0 when
+// the disk is no brixfs volume. Its nodes are stubs (kind, size, times)
+// until used; then a file's blocks are read into its pages and a
+// directory's entries into stubs of their own (vfs.ready), as brixfs's
+// are. Block sizes of 1, 2 and 4 KiB; direct, indirect, double and triple
+// block numbers; fast symbolic links; any number of block groups.
+const memory = @import("./memory.mlx")
+const virtio = @import("./virtio.mlx")
+const vfs = @import("./vfs.mlx")
+const layout = @import("../layout.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const format = @import("../ext2.mlx")
+
+const Ext2 = format.Ext2
+const Vfs = vfs.Vfs
+const NodeKind = vfs.NodeKind
+const Page = memory.Page
+
+pub const Ext2Volume = struct {
+    // The volume number its nodes have (apart from brixfs's views).
+    pub const VOLUME: usize = 0x7FFF
+
+    mounted: bool
+    blockSize: usize
+    inodesPerGroup: usize
+    inodeSize: usize
+    // The group descriptors' first block.
+    descriptors: usize
+    // Directory entries carry their file type (a one-byte name length).
+    fileTypes: bool
+    // A page to read blocks into.
+    scratch: usize
+
+    fn read(offset: usize, into: [*]u8, length: usize) -> bool { return virtio.disk().read(offset, into, length) == @intCast(isize, length) }
+
+    fn read32(offset: usize) -> usize {
+        var bytes: [4]u8 = undefined
+        if !read(offset, &bytes, 4) { return 0 }
+        return Ext2.get(&bytes, 0, 4)
+    }
+
+    // An ext2 volume on the disk, mounted at /volumes/disk0 (read-only);
+    // whether there was one.
+    pub fn mount(self: *Self) -> bool {
+        self.*.mounted = false
+        if !virtio.disk().*.present { return false }
+        var superblock: [1024]u8 = undefined
+        if !read(Ext2.SUPERBLOCK, &superblock, 1024) || Ext2.get(&superblock, Ext2.S_MAGIC, 2) != Ext2.MAGIC { return false }
+        const log = Ext2.get(&superblock, Ext2.S_LOG_BLOCK_SIZE, 4)
+        if log > 2 { return false }
+        self.*.blockSize = @intCast(usize, 1024) << @intCast(u6, log)
+        self.*.inodesPerGroup = Ext2.get(&superblock, Ext2.S_INODES_PER_GROUP, 4)
+        self.*.inodeSize = if Ext2.get(&superblock, Ext2.S_REV_LEVEL, 4) == 0 { Ext2.GOOD_OLD_INODE_SIZE } else { Ext2.get(&superblock, Ext2.S_INODE_SIZE, 2) }
+        self.*.descriptors = Ext2.get(&superblock, Ext2.S_FIRST_DATA_BLOCK, 4) + 1
+        self.*.fileTypes = Ext2.get(&superblock, Ext2.S_FEATURE_INCOMPAT, 4) & Ext2.INCOMPAT_FILETYPE != 0
+        if self.*.inodesPerGroup == 0 || self.*.inodeSize < 128 { return false }
+        self.*.scratch = memory.allFrames().allocate()
+        if self.*.scratch == 0 { return false }
+        const tree = vfs.fileSystem()
+        const volumes = tree.lookup(Vfs.ROOT, "volumes".pointer, 7)
+        if volumes == Vfs.NONE { return false }
+        const root = self.stub(Ext2.ROOT_INODE)
+        if root == Vfs.NONE || !tree.attach(volumes, "disk0".pointer, 5, root) { return false }
+        self.*.mounted = true
+        return true
+    }
+
+    // Inode `number`'s first 128 bytes into `into`.
+    fn inode(self: *Self, number: usize, into: *[128]u8) -> bool {
+        if number == 0 { return false }
+        const group = (number - 1) / self.*.inodesPerGroup
+        const within = (number - 1) % self.*.inodesPerGroup
+        const table = read32(self.*.descriptors * self.*.blockSize + group * Ext2.DESCRIPTOR_SIZE + Ext2.G_INODE_TABLE)
+        if table == 0 { return false }
+        return read(table * self.*.blockSize + within * self.*.inodeSize, into, 128)
+    }
+
+    // The disk block of the inode's block `which` (0: a hole).
+    fn dataBlock(self: *Self, record: *const [128]u8, which: usize) -> usize {
+        const per = self.*.blockSize / 4
+        if which < Ext2.DIRECT { return Ext2.get(record, Ext2.I_BLOCK + 4 * which, 4) }
+        var rest = which - Ext2.DIRECT
+        if rest < per { return self.pointer(Ext2.get(record, Ext2.I_BLOCK + 48, 4), rest) }
+        rest -= per
+        if rest < per * per { return self.pointer(self.pointer(Ext2.get(record, Ext2.I_BLOCK + 52, 4), rest / per), rest % per) }
+        rest -= per * per
+        const top = self.pointer(Ext2.get(record, Ext2.I_BLOCK + 56, 4), rest / (per * per))
+        return self.pointer(self.pointer(top, (rest / per) % per), rest % per)
+    }
+
+    // The block number at `index` of pointer block `block` (0: a hole).
+    fn pointer(self: *Self, block: usize, index: usize) -> usize {
+        if block == 0 { return 0 }
+        return read32(block * self.*.blockSize + index * 4)
+    }
+
+    // The tree's node for inode `number` (a stub, made once).
+    pub fn stub(self: *Self, number: usize) -> usize {
+        const tree = vfs.fileSystem()
+        var k: usize = Vfs.ROOT
+        while k < Vfs.MAX_NODES {
+            const n = tree.node(k)
+            if n.*.kind != NodeKind.free && n.*.volume == VOLUME && n.*.diskInode == number { return k }
+            k += 1
+        }
+        var record: [128]u8 = undefined
+        if !self.inode(number, &record) { return Vfs.NONE }
+        const mode = Ext2.get(&record, Ext2.I_MODE, 2)
+        const kind = mode & Ext2.S_IFMT
+        const nodeKind = if kind == Ext2.S_IFDIR { NodeKind.directory } else if kind == Ext2.S_IFLNK { NodeKind.symlink } else if kind == Ext2.S_IFIFO { NodeKind.fifo } else { NodeKind.file }
+        const made = tree.create(nodeKind, mode & 0xFFF)
+        if made == Vfs.NONE { return Vfs.NONE }
+        const n = tree.node(made)
+        n.*.volume = VOLUME
+        n.*.diskInode = number
+        n.*.loaded = false
+        n.*.readOnly = true
+        n.*.links = Ext2.get(&record, Ext2.I_LINKS, 2)
+        n.*.size = Ext2.get(&record, Ext2.I_SIZE, 4)
+        if kind == Ext2.S_IFREG { n.*.size |= Ext2.get(&record, Ext2.I_SIZE_HIGH, 4) << 32 }
+        n.*.accessed = Ext2.get(&record, Ext2.I_ATIME, 4)
+        n.*.modified = Ext2.get(&record, Ext2.I_MTIME, 4)
+        n.*.changed = Ext2.get(&record, Ext2.I_CTIME, 4)
+        return made
+    }
+
+    // A node's data from the disk: a file's (a link's) blocks into its
+    // pages, a directory's entries into stubs.
+    pub fn load(self: *Self, index: usize) -> void {
+        const tree = vfs.fileSystem()
+        const n = tree.node(index)
+        var record: [128]u8 = undefined
+        if !self.inode(n.*.diskInode, &record) { return }
+        const size = n.*.size
+        if n.*.kind == NodeKind.fifo { return }
+        if n.*.kind == NodeKind.symlink && size < Ext2.FAST_LINK && Ext2.get(&record, Ext2.I_BLOCKS, 4) == 0 {
+            // A fast link: its target in i_block.
+            const frame = tree.pageForLoad(index, 0)
+            if frame != 0 { Bytes.copy(Bytes.pointer(layout.Memory.virtual(frame)), unsafe { @ptrFromInt([*]const u8, @intFromPtr(&record) + Ext2.I_BLOCK) }, size) }
+            return
+        }
+        const perPage = Page.SIZE / self.*.blockSize
+        const blocks = (size + self.*.blockSize - 1) / self.*.blockSize
+        if n.*.kind == NodeKind.file || n.*.kind == NodeKind.symlink {
+            var b: usize = 0
+            while b < blocks {
+                const number = self.dataBlock(&record, b)
+                if number != 0 {
+                    const frame = tree.pageForLoad(index, b / perPage)
+                    if frame == 0 { return }
+                    const into = Bytes.pointer(layout.Memory.virtual(frame) + (b % perPage) * self.*.blockSize)
+                    if !read(number * self.*.blockSize, into, self.*.blockSize) { return }
+                }
+                b += 1
+            }
+            return
+        }
+        // A directory: its entries (".", ".." are the tree's own).
+        n.*.size = 0
+        const entries = Bytes.pointer(layout.Memory.virtual(self.*.scratch))
+        var b: usize = 0
+        while b < blocks {
+            const number = self.dataBlock(&record, b)
+            if number != 0 && read(number * self.*.blockSize, entries, self.*.blockSize) {
+                var at: usize = 0
+                while at + 8 <= self.*.blockSize {
+                    const child = Ext2.get(entries, at, 4)
+                    const length = Ext2.get(entries, at + 4, 2)
+                    const nameLength = if self.*.fileTypes { @intCast(usize, entries[at + 6]) } else { Ext2.get(entries, at + 6, 2) }
+                    if length < 8 { break }
+                    const isDot = (nameLength == 1 && entries[at + 8] == 46) || (nameLength == 2 && entries[at + 8] == 46 && entries[at + 9] == 46)
+                    if child != 0 && !isDot && nameLength > 0 && at + 8 + nameLength <= self.*.blockSize {
+                        var name: [256]u8 = undefined
+                        Bytes.copy(&name, Bytes.pointer(layout.Memory.virtual(self.*.scratch) + at + 8), nameLength)
+                        const node = self.stub(child)
+                        if node != Vfs.NONE { _ = tree.attach(index, &name, nameLength, node) }
+                        // (stub reads through the disk, not the scratch page.)
+                    }
+                    at += length
+                }
+            }
+            b += 1
+        }
+    }
+}
+
+var first: Ext2Volume = undefined // (per run)
+
+pub fn volume() -> *Ext2Volume { return &first }

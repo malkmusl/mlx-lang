@@ -174,6 +174,11 @@ gives a volume node's inode number and the volume as its device.
     brixfs create disk.img 16        a formatted 16 MiB image (one that
                                      is there is kept; ./mlx build brix
                                      makes mlx-out/bin/brix/disk.img so)
+    ext2 make disk.img 8 DIRECTORY   an ext2 image of a host directory
+                                     (mlx-out/bin/ext2): brixOS mounts
+                                     an ext2 disk0 read-only at
+                                     /volumes/disk0 (kernel/ext2.mlx;
+                                     Linux's images too, 1-4 KiB blocks)
     brixfs list disk.img             every path and size, the snapshots
     brixfs cat disk.img docs/a       a file
     brixfs blocks disk.img docs/a    a file's block numbers (0: a hole)
@@ -382,8 +387,8 @@ layer.
 1. A start block for programs (their handles by role, the session's
    among them); programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
-   holds from a snapshot's); ext2 as the format to exchange with Linux; EFI boot (PE32+, GOP
-   framebuffer) beside Multiboot; more than one CPU.
+   holds from a snapshot's); EFI boot (PE32+, GOP
+   framebuffer) beside Multiboot; more than one CPU; ext2 written too.
 2. std.posix as the facade for what programs still ask the Linux layer
    (stat, fcntl, signals of their own), once the native ground holds.
 
