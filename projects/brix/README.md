@@ -59,11 +59,12 @@ target is its data; `Vfs.walk` follows links in the middle of a path,
 and the last one unless lstat, readlink, O_NOFOLLOW or O_CREAT|O_EXCL
 ask for the link; 40 at most, then ELOOP) and FIFOs (mkfifo, mknod: a
 pipe while one is open; a read waits for the first writer, a write for
-the first reader). Both are stored on brixfs too.
+the first reader; O_RDWR waits for no one). Both are stored on brixfs too.
 
 All 73 programs of projects/coreutils are in the boot archive;
-tools/check_brix.sh runs each (tools/brix_programs.sh) in brixOS and on
-the host and compares what they print.
+tools/check_brix.sh runs each, about 180 invocations with their options
+(tools/brix_programs.sh), in brixOS and on the host and compares what
+they print.
 
 ## Copy on write
 
@@ -253,7 +254,7 @@ keeps the processor; Ctrl-C reaches only what reads the terminal or
 waits), signal handlers (signals end a process or are dropped; job
 control's stops do not stop), interrupts at all (the PICs are masked;
 the serial line and the clocks are polled), users and permissions that
-are checked, a FIFO opened to read and write at once, more than one CPU,
+are checked, more than one CPU,
 an EFI loader.
 
 ## Next

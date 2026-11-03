@@ -235,8 +235,8 @@ echo "ok   brixfs: formatted and mounted, files on the disk (the host reads them
 # in brixOS and on the host (the same programs) the same.
 mkdir "$work/host"
 host_shell=$(realpath "$shell")
-(cd "$work/host" && env -i T="$work/host" PATH="$work/bin" "$host_shell" "$repo_root/tools/brix_programs.sh" > "$work/programs.host" 2>&1) || true
-type_line 'mlx-sh /system/programs/every-program'
+(cd "$work/host" && env -i T="$work/host" PATH="$work/bin" HOME=/users/root "$host_shell" "$repo_root/tools/brix_programs.sh" < /dev/null > "$work/programs.host" 2>&1) || true
+type_line 'mlx-sh /system/programs/every-program < /devices/null'
 tries=0
 until output | grep -q '^@@ done$'; do
     (( tries++ < 1200 )) || fail "tools/brix_programs.sh did not end in brixOS"

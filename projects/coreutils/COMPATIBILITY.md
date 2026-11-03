@@ -12,7 +12,7 @@ their `/usr/bin` counterparts.
 | `true`, `false` | complete | none known |
 | `echo` | complete | locale-specific XSI behavior is not enabled |
 | `cat` | complete | validate multibyte display behavior outside `LC_ALL=C` |
-| `wc` | complete | full Unicode `wcwidth` and hardware-specific `--debug` wording |
+| `wc` | complete | hardware-specific `--debug` wording; widths and white space follow the Unicode data of std.unicode, which may be newer than the C library's |
 | `pwd` | complete | none known |
 | `mkdir` | complete | native context assignment still needs validation on an SELinux/SMACK host |
 | `rmdir` | complete | none known |
@@ -31,7 +31,7 @@ their `/usr/bin` counterparts.
 | `truncate` | complete | validate filesystem-specific IO-block behavior |
 | `mkfifo` | complete | native context assignment still needs validation on an SELinux/SMACK host |
 | `sync` | complete | none known |
-| `cp` | partial | recursive trees, symlink policies, backups, sparse/reflink copies, ownership, xattrs, ACLs, and interactive mode |
+| `cp` | partial | `-r`/`-R`/`-a` copy trees with links as links, but `-L`/`-H` (dereferencing), backups, sparse/reflink copies, ownership, xattrs, ACLs, and interactive mode are not implemented |
 | `mv` | partial | cross-filesystem copy fallback, backups, interactive mode, full update modes, and native context assignment |
 | `rm` | partial | unwritable-file terminal prompts, `--preserve-root=all` parent-device checks, and exact GNU interactive directory wording |
 | `ln` | partial | numbered/existing backup policies and atomic replacement without backups |
@@ -44,7 +44,7 @@ their `/usr/bin` counterparts.
 | `arch` | complete | none known |
 | `logname` | complete | reads `/proc/self/loginuid`; NSS sources beyond local passwd files |
 | `whoami` | complete | NSS sources beyond local passwd files |
-| `seq` | partial | integer arguments only; `-f/--format` floating-point printf formatting is not implemented |
+| `seq` | partial | integers and decimal fractions (computed exactly, printed with FIRST's and INCREMENT's decimals as GNU does), but no exponents or hexadecimal floats; `-f/--format` floating-point printf formatting is not implemented |
 | `tac` | partial | `-r/--regex` regular-expression separators are not implemented |
 | `nl` | partial | header/body/footer section delimiters (`\:\:\:`), `-p` no-reset, `-bpREGEX` numbering, and `-l` blank-line joining are not implemented; the whole input is treated as one body section |
 | `fold` | complete | none known |

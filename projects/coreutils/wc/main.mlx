@@ -1,6 +1,7 @@
 const std = @import("std")
 const common = @import("../common.mlx")
 const crash = @import("std.crash")
+const properties = @import("std.unicode.properties")
 
 const Counts = struct {
     lines: usize
@@ -10,6 +11,12 @@ const Counts = struct {
     maxLineLength: usize
     currentLineLength: usize
     inWord: bool
+    // A UTF-8 sequence being read: its continuation bytes still to come,
+    // the code point so far, the least one its length may encode (less is
+    // an overlong form, no character).
+    pending: usize
+    scalar: u32
+    least: u32
 }
 
 const Options = struct {
@@ -41,7 +48,7 @@ const Results = struct {
 }
 
 fn emptyCounts() -> Counts {
-    return Counts.{ .lines = 0, .words = 0, .chars = 0, .bytes = 0, .maxLineLength = 0, .currentLineLength = 0, .inWord = false }
+    return Counts.{ .lines = 0, .words = 0, .chars = 0, .bytes = 0, .maxLineLength = 0, .currentLineLength = 0, .inWord = false, .pending = 0, .scalar = 0, .least = 0 }
 }
 
 inline fn uncommonWhitespace(value: u64, newline: usize) -> bool {
@@ -54,10 +61,11 @@ inline fn matchingBytes(pointer: [*]const u8, needle: u8) -> usize {
     unsafe { return @byteMask64(pointer, needle) }
 }
 
-inline fn whitespaceMask64(pointer: [*]const u8, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, newline: usize) -> usize {
-    const has_high_byte = (a | b | c | d | e | f | g | h) & 9259542123273814144 != 0
+// The white space among 64 bytes: newlines (given), spaces, 9 to 13, and
+// in the C locale 0xA0 (no-break space as GNU's btoc32 reads the byte).
+inline fn whitespaceMask64(pointer: [*]const u8, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, newline: usize, nbsp: bool) -> usize {
     var whitespace = newline | matchingBytes(pointer, 32)
-    if has_high_byte { whitespace = whitespace | matchingBytes(pointer, 160) }
+    if nbsp { whitespace = whitespace | matchingBytes(pointer, 160) }
     const uncommon = uncommonWhitespace(a, newline & 255) || uncommonWhitespace(b, (newline >> 8) & 255) ||
         uncommonWhitespace(c, (newline >> 16) & 255) || uncommonWhitespace(d, (newline >> 24) & 255) ||
         uncommonWhitespace(e, (newline >> 32) & 255) || uncommonWhitespace(f, (newline >> 40) & 255) ||
@@ -86,29 +94,240 @@ inline fn possiblyContainsWhitespace(value: u64) -> bool {
     return low_byte != 0 || value & 9259542123273814144 != 0
 }
 
-fn updateWidth(counts: *Counts, byte: u8, options: Options) -> void {
-    if !options.maxLineLength { return }
-    if byte == 10 {
+// What GNU wc (coreutils 9.11, glibc) counts, character by character. In
+// the C locale a character is a byte; in a UTF-8 one a code point read as
+// glibc reads them (overlong forms and surrogates are none; the old five-
+// and six-byte forms are), and a byte that makes no character (an
+// encoding error) is neither a character nor columns but part of a word.
+
+// Whether a character is printable (iswprint): not a control, unassigned,
+// a surrogate or a line or paragraph separator.
+inline fn printable(c: u32, utf8: bool) -> bool {
+    if c < 127 { return c >= 32 }
+    if !utf8 || c < 160 { return false }
+    // Ranges with every code point assigned (Latin-1 and Latin Extended,
+    // Cyrillic, kana, CJK ideographs, Hangul syllables) without the tables.
+    if c < 592 || (c >= 1024 && c < 1328) || (c >= 12353 && c <= 12438) || (c >= 12441 && c <= 12543) || (c >= 19968 && c <= 40959) || (c >= 44032 && c <= 55203) { return true }
+    const category = properties.generalCategory(c)
+    return category != properties.GeneralCategory.unassigned && category != properties.GeneralCategory.control &&
+        category != properties.GeneralCategory.surrogate && category != properties.GeneralCategory.lineSeparator &&
+        category != properties.GeneralCategory.paragraphSeparator
+}
+
+// White space between words (isspace or c32isspace, and the no-break
+// spaces U+00A0, U+2007, U+202F, U+2060): ASCII's, 0xA0 in the C locale,
+// Unicode's in UTF-8.
+inline fn space(c: u32, utf8: bool) -> bool {
+    if c == 32 || (c >= 9 && c <= 13) { return true }
+    if !utf8 { return c == 160 }
+    return c == 160 || c == 5760 || (c >= 8192 && c <= 8202) || c == 8239 || c == 8287 || c == 8288 || c == 12288
+}
+
+// -L: a tab to the next multiple of 8; a newline, carriage return or
+// form feed ends the line; a printable character takes its columns.
+inline fn updateWidth(counts: *Counts, c: u32, utf8: bool) -> void {
+    if c == 10 || c == 13 || c == 12 {
         if counts.*.currentLineLength > counts.*.maxLineLength { counts.*.maxLineLength = counts.*.currentLineLength }
         counts.*.currentLineLength = 0
-    } else if byte == 9 { counts.*.currentLineLength = (counts.*.currentLineLength / 8 + 1) * 8 } else if byte == 8 {
-        if counts.*.currentLineLength > 0 { counts.*.currentLineLength -= 1 }
-    } else if byte == 13 { counts.*.currentLineLength = 0 } else if byte >= 32 && byte != 127 && (!options.utf8 || byte & 192 != 128) {
-        counts.*.currentLineLength += 1
+    } else if c == 9 {
+        counts.*.currentLineLength = (counts.*.currentLineLength / 8 + 1) * 8
+    } else if c < 127 {
+        if c >= 32 { counts.*.currentLineLength += 1 }
+    } else if printable(c, utf8) {
+        counts.*.currentLineLength += columns(c)
     }
 }
 
-fn consumeScalar(counts: *Counts, bytes: [*]const u8, start: usize, length: usize, options: Options) -> void {
+// A printable character's columns (wcwidth): the common ranges without
+// the tables.
+inline fn columns(c: u32) -> usize {
+    if c < 768 || (c >= 1024 && c < 1155) { return 1 }
+    if (c >= 12353 && c <= 12438) || (c >= 12443 && c <= 12543) || (c >= 19968 && c <= 40959) || (c >= 44032 && c <= 55203) { return 2 }
+    return @intCast(usize, properties.columnWidth(c))
+}
+
+// -w: a word is what lies between white space (any other character, a
+// control or an encoding error too, is part of one).
+inline fn wordCharacter(counts: *Counts, c: u32, utf8: bool) -> void {
+    if space(c, utf8) {
+        counts.*.inWord = false
+    } else {
+        inWord(counts)
+    }
+}
+
+inline fn inWord(counts: *Counts) -> void {
+    if !counts.*.inWord { counts.*.words += 1 }
+    counts.*.inWord = true
+}
+
+// A sequence that makes no character: part of a word (-w), nothing else.
+inline fn encodingError(counts: *Counts, wanted: Wanted) -> void {
+    counts.*.pending = 0
+    if wanted.words { inWord(counts) }
+}
+
+// What to count of each character (Options, as the byte loop needs it).
+const Wanted = struct {
+    chars: bool
+    width: bool
+    words: bool
+    utf8: bool
+}
+
+inline fn character(counts: *Counts, c: u32, wanted: Wanted) -> void {
+    if wanted.chars { counts.*.chars += 1 }
+    if wanted.width { updateWidth(counts, c, wanted.utf8) }
+    if wanted.words { wordCharacter(counts, c, wanted.utf8) }
+}
+
+// A byte past ASCII in UTF-8: a lead byte starts a sequence (C0, C1 and
+// FE, FF none), a continuation byte goes on with one (or is no character).
+fn sequenceByte(counts: *Counts, byte: u8, wanted: Wanted) -> void {
+    if byte & 192 == 128 {
+        if counts.*.pending == 0 {
+            encodingError(counts, wanted)
+            return
+        }
+        counts.*.scalar = (counts.*.scalar << 6) | @intCast(u32, byte & 63)
+        counts.*.pending -= 1
+        if counts.*.pending == 0 {
+            const c = counts.*.scalar
+            if c >= counts.*.least && (c < 55296 || c > 57343) { character(counts, c, wanted) } else { encodingError(counts, wanted) }
+        }
+        return
+    }
+    // A lead byte ends a sequence that was not finished.
+    if counts.*.pending != 0 { encodingError(counts, wanted) }
+    if byte < 194 || byte >= 254 {
+        encodingError(counts, wanted)
+    } else if byte >= 194 && byte < 224 {
+        counts.*.pending = 1
+        counts.*.scalar = @intCast(u32, byte & 31)
+        counts.*.least = 128
+    } else if byte >= 224 && byte < 240 {
+        counts.*.pending = 2
+        counts.*.scalar = @intCast(u32, byte & 15)
+        counts.*.least = 2048
+    } else if byte >= 240 && byte < 248 {
+        counts.*.pending = 3
+        counts.*.scalar = @intCast(u32, byte & 7)
+        counts.*.least = 65536
+    } else if byte >= 248 && byte < 252 {
+        counts.*.pending = 4
+        counts.*.scalar = @intCast(u32, byte & 3)
+        counts.*.least = 2097152
+    } else if byte >= 252 && byte < 254 {
+        counts.*.pending = 5
+        counts.*.scalar = @intCast(u32, byte & 1)
+        counts.*.least = 67108864
+    }
+}
+
+// UTF-8 for -l, -w and -m (no -L): consumeScalar's work with the state
+// in locals, written back once.
+fn consumeUtf8(counts: *Counts, bytes: [*]const u8, start: usize, length: usize, wantLines: bool, wantWords: bool, wantChars: bool) -> void {
+    var lines = counts.*.lines
+    var words = counts.*.words
+    var chars = counts.*.chars
+    var in_word = counts.*.inWord
+    var pending = counts.*.pending
+    var scalar = counts.*.scalar
+    var least = counts.*.least
     var index = start
     while index < length {
         const byte = bytes[index]
-        if options.lines && byte == 10 { counts.*.lines += 1 }
-        if options.chars && (!options.utf8 || byte & 192 != 128) { counts.*.chars += 1 }
-        updateWidth(counts, byte, options)
-        if options.words {
-            const whitespace = byte == 32 || byte == 160 || (byte >= 9 && byte <= 13)
-            if !whitespace && !counts.*.inWord { counts.*.words += 1 }
-            counts.*.inWord = !whitespace
+        index += 1
+        var c: u32 = 0
+        if byte < 128 {
+            if pending != 0 {
+                // The sequence before it was not finished: an encoding error.
+                pending = 0
+                if !in_word { words += 1 }
+                in_word = true
+            }
+            if byte == 10 && wantLines { lines += 1 }
+            c = @intCast(u32, byte)
+        } else if byte & 192 == 128 {
+            if pending == 0 {
+                if !in_word { words += 1 }
+                in_word = true
+                continue
+            }
+            scalar = (scalar << 6) | @intCast(u32, byte & 63)
+            pending -= 1
+            if pending != 0 { continue }
+            if scalar < least || (scalar >= 55296 && scalar <= 57343) {
+                if !in_word { words += 1 }
+                in_word = true
+                continue
+            }
+            c = scalar
+        } else {
+            if pending != 0 || byte < 194 || byte >= 254 {
+                if !in_word { words += 1 }
+                in_word = true
+            }
+            pending = 0
+            if byte >= 194 && byte < 224 {
+                pending = 1
+                scalar = @intCast(u32, byte & 31)
+                least = 128
+            } else if byte >= 224 && byte < 240 {
+                pending = 2
+                scalar = @intCast(u32, byte & 15)
+                least = 2048
+            } else if byte >= 240 && byte < 248 {
+                pending = 3
+                scalar = @intCast(u32, byte & 7)
+                least = 65536
+            } else if byte >= 248 && byte < 252 {
+                pending = 4
+                scalar = @intCast(u32, byte & 3)
+                least = 2097152
+            } else if byte >= 252 && byte < 254 {
+                pending = 5
+                scalar = @intCast(u32, byte & 1)
+                least = 67108864
+            }
+            continue
+        }
+        // A character.
+        chars += 1
+        if space(c, true) {
+            in_word = false
+        } else if !in_word {
+            words += 1
+            in_word = true
+        }
+    }
+    counts.*.lines = lines
+    if wantWords { counts.*.words = words }
+    if wantChars { counts.*.chars = chars }
+    counts.*.inWord = in_word
+    counts.*.pending = pending
+    counts.*.scalar = scalar
+    counts.*.least = least
+}
+
+fn consumeScalar(counts: *Counts, bytes: [*]const u8, start: usize, length: usize, options: Options) -> void {
+    if options.utf8 && !options.maxLineLength {
+        consumeUtf8(counts, bytes, start, length, options.lines, options.words, options.chars)
+        return
+    }
+    const wanted = Wanted.{ .chars = options.chars && options.utf8, .width = options.maxLineLength, .words = options.words, .utf8 = options.utf8 }
+    const lines = options.lines
+    const utf8 = options.utf8
+    var index = start
+    while index < length {
+        const byte = bytes[index]
+        if lines && byte == 10 { counts.*.lines += 1 }
+        if !utf8 || byte < 128 {
+            // (An ASCII byte ends a sequence that was not finished.)
+            if counts.*.pending != 0 { encodingError(counts, wanted) }
+            character(counts, @intCast(u32, byte), wanted)
+        } else {
+            sequenceByte(counts, byte, wanted)
         }
         index += 1
     }
@@ -119,7 +338,10 @@ fn consume(counts: *Counts, bytes: [*]const u8, length: usize, options: Options)
     var words = counts.*.words
     var in_word = counts.*.inWord
     var index: usize = 0
-    while !options.chars && !options.maxLineLength && index + 64 <= length {
+    // (Characters are bytes in the C locale: countFile counts them so.)
+    const utf8Chars = options.chars && options.utf8
+    const decode = options.utf8 && (options.words || options.chars)
+    while !options.maxLineLength && index + 64 <= length {
         const a = loadWord(bytes, index)
         const b = loadWord(bytes, index + 8)
         const c = loadWord(bytes, index + 16)
@@ -129,6 +351,20 @@ fn consume(counts: *Counts, bytes: [*]const u8, length: usize, options: Options)
         const g = loadWord(bytes, index + 48)
         const h = loadWord(bytes, index + 56)
         const pointer = pointerAt(bytes, index)
+        const high = (a | b | c | d | e | f | g | h) & 9259542123273814144 != 0
+        if decode && (high || counts.*.pending != 0) {
+            // UTF-8 past ASCII: byte by byte (lines, words, characters).
+            counts.*.lines = lines
+            counts.*.words = words
+            counts.*.inWord = in_word
+            consumeScalar(counts, bytes, index, index + 64, options)
+            lines = counts.*.lines
+            words = counts.*.words
+            in_word = counts.*.inWord
+            index += 64
+            continue
+        }
+        if utf8Chars { counts.*.chars += 64 }
         if options.words {
             if !possiblyContainsWhitespace(a) && !possiblyContainsWhitespace(b) &&
                 !possiblyContainsWhitespace(c) && !possiblyContainsWhitespace(d) &&
@@ -138,7 +374,7 @@ fn consume(counts: *Counts, bytes: [*]const u8, length: usize, options: Options)
                 in_word = true
             } else {
                 const newline = matchingBytes(pointer, 10)
-                const whitespace = whitespaceMask64(pointer, a, b, c, d, e, f, g, h, newline)
+                const whitespace = whitespaceMask64(pointer, a, b, c, d, e, f, g, h, newline, high && !options.utf8)
                 const previous = if in_word { 0 } else { 1 }
                 const starts = ~whitespace & ((whitespace << 1) | previous)
                 words += @popCount(starts)
@@ -158,7 +394,9 @@ fn consume(counts: *Counts, bytes: [*]const u8, length: usize, options: Options)
 }
 
 fn countFile(file: std.fs.File, counts: *Counts, options: Options) -> bool {
-    if !options.lines && !options.words && !options.chars && !options.maxLineLength {
+    // The C locale's characters are its bytes.
+    defer { if options.chars && !options.utf8 { counts.*.chars = counts.*.bytes } }
+    if !options.lines && !options.words && !(options.chars && options.utf8) && !options.maxLineLength {
         const start = std.fs.seek(file, 0, std.fs.SEEK_CURRENT)
         if start >= 0 {
             const end = std.fs.seek(file, 0, std.fs.SEEK_END)
@@ -185,13 +423,16 @@ fn countFile(file: std.fs.File, counts: *Counts, options: Options) -> bool {
             break
         }
         const length = @bitCast(usize, amount)
-        if options.lines || options.words || options.chars || options.maxLineLength {
+        if options.lines || options.words || (options.chars && options.utf8) || options.maxLineLength {
             unsafe { consume(counts, @ptrCast([*]const u8, buffer), length, options) }
         } else {
             counts.*.bytes += length
         }
     }
     allocator.free(buffer, common.BUFFER_SIZE, 8)
+    // A sequence the input ended in is an encoding error.
+    if counts.*.pending != 0 && options.words { inWord(counts) }
+    counts.*.pending = 0
     if counts.*.currentLineLength > counts.*.maxLineLength { counts.*.maxLineLength = counts.*.currentLineLength }
     return success
 }
