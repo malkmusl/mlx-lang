@@ -74,6 +74,11 @@ for main in projects/coreutils/*/main.mlx; do
     programs+=("$(basename "$(dirname "$main")")")
 done
 printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet $brix "projects/coreutils/{}/main.mlx" -o "$work/bin/{}"
+# The host's run of them (std on brixOS reads, writes and ends by brixOS's
+# own calls, which Linux does not have): the same sources built for Linux.
+mkdir -p "$work/linux-tools/bin"
+printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet "projects/coreutils/{}/main.mlx" -o "$work/linux-tools/bin/{}"
+"$compiler" --quiet projects/shell/main.mlx -o "$work/linux-tools/mlx-sh"
 (( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
 for tool in snapshot brixfs floats signals native events objects; do
     "$compiler" --quiet $brix "projects/brix/tools/$tool/main.mlx" -o "$work/$tool"
@@ -245,10 +250,10 @@ grep -q '^/toa -> docs/a$' "$work/list" && grep -q '^/pipe fifo$' "$work/list" |
 echo "ok   brixfs: formatted and mounted, files on the disk (the host reads them), a read-only snapshot on it"
 
 # Every coreutils program as on the host: tools/brix_programs.sh's output
-# in brixOS and on the host (the same programs) the same.
+# in brixOS and on the host (the same sources, built for each) the same.
 mkdir "$work/host"
-host_shell=$(realpath "$shell")
-(cd "$work/host" && env -i T="$work/host" PATH="$work/bin" HOME=/users/root "$host_shell" "$repo_root/tools/brix_programs.sh" < /dev/null > "$work/programs.host" 2>&1) || true
+host_shell=$(realpath "$work/linux-tools/mlx-sh")
+(cd "$work/host" && env -i T="$work/host" PATH="$work/linux-tools/bin" HOME=/users/root "$host_shell" "$repo_root/tools/brix_programs.sh" < /dev/null > "$work/programs.host" 2>&1) || true
 type_line 'mlx-sh /system/programs/every-program < /devices/null'
 tries=0
 until output | grep -q '^@@ done$'; do
