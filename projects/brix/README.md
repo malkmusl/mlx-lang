@@ -67,7 +67,11 @@ tools/check_brix.sh runs each, about 180 invocations with their options
 they print.
 It also runs projects/brix/tools/floats (a long computation in the SSE
 registers) twice at once: both must print the host's result, so each
-process keeps its registers across the timer's preemptions.
+process keeps its registers across the timer's preemptions; and
+projects/brix/tools/signals, a line for each step of what signals do
+(handlers, masks, sigtimedwait, EINTR and SA_RESTART, sigsuspend, a
+fault on the alternate stack), which must print what it prints on the
+host.
 
 ## Copy on write
 
@@ -225,9 +229,9 @@ The pieces:
     what it waits for, and its registers while it does not run.
   - scheduler.mlx: `Scheduler`, the table of processes: fork (the
     pages shared copy-on-write, `Space.clone`), the end of a process (a zombie
-    until its parent's wait4; SIGCHLD for sigtimedwait), signals that end
-    processes (kill, Ctrl-C to the terminal's foreground group), and the
-    switch to the next process: when it waits, ends or yields, or when
+    until its parent's wait4; SIGCHLD to it), signals sent (kill, Ctrl-C to
+    the terminal's foreground group: pending until the process runs), and
+    the switch to the next process: when it waits, ends or yields, or when
     the timer's interrupt comes in user mode (its time slice, 10 ms, is
     over). A system call that has to wait
     (wait4, a pipe, the terminal, poll, nanosleep, sigtimedwait) leaves
@@ -249,9 +253,20 @@ The pieces:
     the window size, fork, execve, wait4, exit, kill, pipe, setpgid,
     umask, mmap/munmap/brk, read/write/lseek on files, poll, clocks
     (`Clock`: the TSC, its rate measured against the `Pit`, the `Cmos`
-    clock), uname, getrandom; signals are accepted and never come. A
-    call it lacks is said once on the console (`[brixOS: system call N
+    clock), uname, getrandom, signals. A call it lacks is said once on the console (`[brixOS: system call N
     not there]`) and gets ENOSYS.
+  - signals.mlx: `Signals`, a process's actions (rt_sigaction), mask
+    (rt_sigprocmask, rt_sigsuspend), pending signals with their senders,
+    alternate stack (sigaltstack). Delivered on the way back to user
+    mode: the default action (ignore, or end the process; the shell is
+    ended only by its faults), or the handler on a frame as Linux builds
+    it (rt_sigframe: the return to the restorer, the ucontext with the
+    registers and the mask, the siginfo, the SSE registers), which
+    rt_sigreturn takes back. A system call the process waited in ends
+    with EINTR, or is made again with SA_RESTART; pause and sigsuspend
+    end with a handler. A fault raises its signal (SIGSEGV, SIGILL,
+    SIGFPE, ...), which a handler can take (std.crash's do), else the
+    program ends with a report.
   - pci.mlx, virtio.mlx: PCI's configuration space, the virtio disk;
     volume.mlx: `Store`, the brixfs volume (mount, read, commit, sweep,
     snapshots).
@@ -263,15 +278,15 @@ The pieces:
     mlx-sh as the first process, started again (every other process
     ending) when it exits or faults.
 
-Not there yet: signal handlers (signals end a process or are dropped;
-job control's stops do not stop), the disk's interrupt (its requests
+Not there yet: job control's stops (SIGTSTP, SIGSTOP and Ctrl-Z do
+nothing yet), the disk's interrupt (its requests
 are polled), the APIC (the legacy PICs do), users and permissions that
 are checked, more than one CPU, an EFI loader.
 
 ## Next
 
-1. Signal handlers (rt_sigaction, delivery, sigreturn) and job control
-   (SIGTSTP, SIGCONT, Ctrl-Z).
+1. Job control: stopped processes (SIGTSTP, SIGSTOP, SIGTTIN, SIGTTOU),
+   SIGCONT, Ctrl-Z, wait4's WUNTRACED and WCONTINUED.
 2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
 4. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with

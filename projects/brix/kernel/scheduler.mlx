@@ -10,6 +10,7 @@ const terminal = @import("./terminal.mlx")
 const pipe = @import("./pipe.mlx")
 const process = @import("./process.mlx")
 const wait = @import("./wait.mlx")
+const signals_module = @import("./signals.mlx")
 const volume = @import("./volume.mlx")
 const frame_module = @import("./frame.mlx")
 const Frame = frame_module.Frame
@@ -19,21 +20,7 @@ const Process = process.Process
 const State = process.State
 const WaitKind = wait.WaitKind
 
-// Signals as Linux numbers them (those brixOS acts on).
-pub const Signal = struct {
-    pub const HUP: usize = 1
-    pub const INT: usize = 2
-    pub const QUIT: usize = 3
-    pub const KILL: usize = 9
-    pub const SEGV: usize = 11
-    pub const PIPE: usize = 13
-    pub const TERM: usize = 15
-    pub const CHLD: usize = 17
-
-    // Whether the signal ends a process (the others are taken and
-    // dropped: there are no handlers yet).
-    pub fn ends(signal: usize) -> bool { return signal == HUP || signal == INT || signal == QUIT || signal == KILL || signal == PIPE || signal == TERM }
-}
+pub const Signal = signals_module.Signal
 
 // The wait status of a process that exited with `code`, or was ended by
 // `signal`.
@@ -143,7 +130,7 @@ pub const Scheduler = struct {
         if p.*.parentPid != 0 {
             const parent = self.find(p.*.parentPid)
             if parent != null {
-                parent.?.*.childSignal = true
+                parent.?.*.signals.post(Signal.CHLD, p.*.pid)
                 return
             }
         }
@@ -181,10 +168,11 @@ pub const Scheduler = struct {
     }
 
     // `signal` to the processes `pid` names (kill's: one, -1 every one
-    // but the first, 0 the sender's group, below -1 a group); 0, or -3
-    // (ESRCH) when it names none. The first process (the shell) takes
-    // signals without ending.
+    // but the first, 0 the sender's group, below -1 a group): pending for
+    // each, delivered when it runs next; 0, or -3 (ESRCH) when it names
+    // none, -22 (EINVAL) for a number that is no signal.
     pub fn signal(self: *Self, sender: *Process, pid: isize, number: usize) -> isize {
+        if number != 0 && !Signal.valid(number) { return -22 }
         var found = false
         var k: usize = 0
         while k < MAX {
@@ -197,7 +185,7 @@ pub const Scheduler = struct {
                 if pid < -1 { hit = q.*.group == @bitCast(usize, -pid) }
                 if hit {
                     found = true
-                    if number != 0 && Signal.ends(number) && q.*.pid != FIRST_PID { self.terminate(q, Status.killed(number)) }
+                    if number != 0 { q.*.signals.post(number, sender.*.pid) }
                 }
             }
             k += 1
@@ -205,15 +193,23 @@ pub const Scheduler = struct {
         return if found { 0 } else { -3 }
     }
 
-    // Ctrl-C on the terminal: SIGINT to its foreground group.
-    pub fn interruptForeground(self: *Self) -> void {
-        const sender = self.running()
-        _ = self.signal(sender, -@intCast(isize, self.*.foreground), Signal.INT)
+    // `number` from the terminal (the kernel) to its foreground group.
+    pub fn signalForeground(self: *Self, number: usize) -> void {
+        var k: usize = 0
+        while k < MAX {
+            const q = &self.*.processes[k]
+            if (q.*.state == State.ready || q.*.state == State.blocked) && q.*.group == self.*.foreground { q.*.signals.post(number, 0) }
+            k += 1
+        }
     }
 
+    // Ctrl-C on the terminal: SIGINT to its foreground group.
+    pub fn interruptForeground(self: *Self) -> void { self.signalForeground(Signal.INT) }
+
     // Whether what `p` waits for holds now (a deadline that passed is
-    // told by timedOut).
+    // told by timedOut), or a signal can be delivered to it.
     fn canGo(self: *Self, p: *Process) -> bool {
+        if p.*.signals.deliverable() != 0 { return true }
         const w = p.*.waitingFor
         if w.deadline != 0 && clock.system().monotonic() >= w.deadline {
             p.*.timedOut = true
@@ -221,7 +217,8 @@ pub const Scheduler = struct {
         }
         if w.kind == WaitKind.none { return true }
         if w.kind == WaitKind.child { return self.child(p, w.target) != null || !self.hasChild(p, w.target) }
-        if w.kind == WaitKind.signal { return p.*.childSignal }
+        if w.kind == WaitKind.signal { return p.*.signals.pending & @bitCast(usize, w.target) != 0 }
+        if w.kind == WaitKind.pause { return false }
         if w.kind == WaitKind.terminal { return terminal.serialConsole().pending() }
         if w.kind == WaitKind.pipe_read { return pipe.table().at(@bitCast(usize, w.target)).readable() }
         if w.kind == WaitKind.pipe_write { return pipe.table().at(@bitCast(usize, w.target)).writable() }
@@ -230,10 +227,10 @@ pub const Scheduler = struct {
     }
 
     // Whether `p`'s wait can end without another process (the terminal,
-    // the clock).
+    // the clock; a signal by Ctrl-C).
     fn wakesAlone(p: *const Process) -> bool {
         const kind = p.*.waitingFor.kind
-        return p.*.waitingFor.deadline != 0 || kind == WaitKind.terminal || kind == WaitKind.poll
+        return p.*.waitingFor.deadline != 0 || kind == WaitKind.terminal || kind == WaitKind.poll || kind == WaitKind.pause
     }
 
     // The running process stops here (its registers are in `frame`):
@@ -250,6 +247,7 @@ pub const Scheduler = struct {
             p.*.context.rax = number
             p.*.waitingFor = w
             p.*.state = State.blocked
+            p.*.signals.inCall = true
         }
         return self.switchTo(frame)
     }
@@ -257,10 +255,6 @@ pub const Scheduler = struct {
     // The time slice of the running process is over (the timer, in user
     // mode): it is ready, and the next one runs (itself when no other can).
     pub fn preempt(self: *Self, frame: *Frame) -> bool { return self.suspend(frame, wait.Wait.none(), 0) }
-
-    // Whether the running process can go on (an interrupt may have ended
-    // it: Ctrl-C).
-    pub fn runningCanGo(self: *Self) -> bool { return self.running().*.state == State.ready }
 
     // The next process that can go on into `frame` (its registers, memory
     // and FS base in use): the one after the running one first. While none

@@ -28,8 +28,10 @@
 # /proc/self/exe), a program
 # copied into /temporary runs, and a program of /system/programs written
 # to is copied up; Ctrl-C ends the foreground program (a busy one too: the
-# serial line's interrupt), the timer shares the processor; Ctrl-D ends its
-# input;
+# serial line's interrupt), the timer shares the processor (each process
+# keeps its SSE registers); signals behave as on the host (handlers, masks,
+# EINTR, sigsuspend, a fault on the alternate stack; the shell's trap);
+# Ctrl-D ends its input;
 # `exit 3` ends the shell and the kernel starts it again; and no system
 # call the programs made was missing.
 #
@@ -70,7 +72,8 @@ printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet "p
 "$compiler" --quiet projects/brix/tools/snapshot/main.mlx -o "$work/snapshot"
 "$compiler" --quiet projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
 "$compiler" --quiet projects/brix/tools/floats/main.mlx -o "$work/floats"
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "every-program=tools/brix_programs.sh" "$work/bin/"
+"$compiler" --quiet projects/brix/tools/signals/main.mlx -o "$work/signals"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "every-program=tools/brix_programs.sh" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
@@ -151,7 +154,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for "^$(( ${#programs[@]} + 5 ))\$"
+wait_for "^$(( ${#programs[@]} + 6 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -254,6 +257,19 @@ type_line 'floats > /tmp/f1 & floats > /tmp/f2; wait; cat /tmp/f1 /tmp/f2'
 sum=$("$work/floats")
 wait_for "^$sum$" 2
 echo "ok   two programs at once keep their own SSE registers"
+
+# Signals: handlers and their return, masks, sigtimedwait, default and
+# ignored actions, EINTR and SA_RESTART, sigsuspend, a fault on the
+# alternate stack; as on the host.
+type_line 'echo @@ signals; signals; echo @@ end'
+wait_for '^@@ end$'
+"$work/signals" > "$work/signals.host"
+output | sed -n '/^@@ signals$/,/^@@ end$/p' | sed '1d;$d' | grep -v '^$' > "$work/signals.brix"
+diff "$work/signals.host" "$work/signals.brix" > "$work/signals.diff" || fail "signals differ from the host's (< host, > brixOS): $(cat "$work/signals.diff")"
+type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
+wait_for '^trapped$'
+wait_for '^after trap$'
+echo "ok   signals: handlers, masks, sigtimedwait, EINTR and SA_RESTART, sigsuspend, a fault on the alternate stack, the shell's trap"
 
 type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
 wait_for '^script one$'
