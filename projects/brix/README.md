@@ -18,7 +18,7 @@ line and runs mlx-sh in user mode on it, and the programs of its boot
 archive (the coreutils) as processes of their own, on a file system in
 memory with brixOS's own layout and copy on write:
 
-    ./mlx build brix           # also mlx-out/bin/brix/disk.img (16 MiB)
+    ./mlx build brix           # also mlx-out/bin/brix/disk.img (64 MiB)
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
         -kernel mlx-out/bin/brix/brix.img \
         -drive file=mlx-out/bin/brix/disk.img,format=raw,if=virtio
@@ -62,6 +62,22 @@ still call the kernel by Linux's system call numbers.
     root@brix:/temporary# stat -f -c "%f free" .; cp a b; stat -f -c "%f free" .
     37627 free
     37617 free
+
+## The system on the disk
+
+The boot image holds the kernel and an archive (mlx-sh, the tools, the
+coreutils) that the first boot runs from. `install` in brixOS puts the
+system onto a brixfs volume (`brixfs format /devices/disk0; install`:
+/system, /users and /temporary copied to /volumes/disk0, committed), and
+from then on the kernel boots from the disk: a volume with
+system/programs/mlx-sh on it is the system, its /system, /users and
+/temporary are the tree's (vfs.graft: the same nodes as
+/volumes/disk0's; the memory-only ones go), programs run from the disk
+and what is written stays. The boot archive's /system is at
+/volumes/boot then (`install` installs from there again). "brixOS: /
+from /volumes/disk0 (the boot archive at /volumes/boot)" says so;
+tools/check_brix_system.sh does it, boots again twice and reads what it
+wrote. /devices and /volumes stay the memory-only tree's.
 
 ## The layout
 
@@ -193,7 +209,7 @@ gives a volume node's inode number and the volume as its device.
 
     brixfs format /devices/disk0     on brixOS (it is mounted at once), or
     brixfs format disk.img           on the host (mlx-out/bin/brixfs)
-    brixfs create disk.img 16        a formatted 16 MiB image (one that
+    brixfs create disk.img 64        a formatted 64 MiB image (one that
                                      is there is kept; ./mlx build brix
                                      makes mlx-out/bin/brix/disk.img so)
     ext2 make disk.img 8 DIRECTORY   an ext2 image of a host directory
