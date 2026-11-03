@@ -345,9 +345,10 @@ events that way. projects/brix/tools/events shows the native side.
 
 std on brixOS: a program built with --target=x86_64-brixos reads and
 writes its files by brixOS's own calls (std/bootstrap/fs.mlx and
-time.mlx choose by `if comptime builtin.os == builtin.Os.brixos`): std
-keeps descriptor numbers, remembers each one's handle
-(std.os.brix.transferDescriptor) and asks again when a close or dup2
+time.mlx go through ./os/host.mlx, which is host.brixos.mlx there: a
+platform's file, not `if comptime`, so the compiler's own sources stay
+buildable by older compilers and mlx1): std keeps descriptor numbers,
+remembers each one's handle and asks again when a close or dup2
 made it stale; the clocks are clock_read; _start ends the program by
 process_exit (the compiler's x86_64 backend). The native statuses reach
 std's callers as the errno values they check, until std's own error
