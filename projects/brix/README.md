@@ -218,7 +218,7 @@ The pieces:
     double indirect one; shared between files, copied on write), a
     directory's in 64-byte entries; a node lives while a directory names
     it or a descriptor holds it. The tree at boot is the layout above.
-  - filecalls.mlx: `FileCalls`, the calls on paths (relative to the
+  - linux/filecalls.mlx: `FileCalls`, the calls on paths (relative to the
     working directory or a directory's descriptor): open/creat with
     O_CREAT, O_EXCL, O_TRUNC, O_APPEND, stat/statx, access, getcwd,
     chdir, mkdir, rmdir, unlink, rename, link, truncate, chmod, utimensat,
@@ -252,7 +252,7 @@ The pieces:
   - pipe.mlx: `Pipe`s (4 KiB ring buffers, their readers and writers
     counted by the descriptors); files.mlx: `Descriptors` (of nodes or
     pipe ends, with their access mode, O_APPEND, close-on-exec).
-  - system.mlx, files.mlx, terminal.mlx, clock.mlx: `System` answers
+  - linux/system.mlx, files.mlx, terminal.mlx, clock.mlx: `System` answers
     Linux's system call numbers (`Number`) and structures for what a
     shell on a terminal needs: read, write, the termios of the serial
     line (`Terminal`: its input queued as the interrupt brings it, Ctrl-C,
@@ -293,12 +293,38 @@ ended stays stopped), TOSTOP's SIGTTOU, the disk's interrupt (its requests
 are polled), the APIC (the legacy PICs do), users and permissions that
 are checked, more than one CPU, an EFI loader.
 
+## brixOS's own interface
+
+brixOS is a Unix in what a person sees, but its kernel interface is its
+own (spec/04-stdlib/os/brix.xml): handles with rights instead of
+descriptor numbers, one wait over the states of handles with a deadline,
+reads and writes that name their position (no cursor in the kernel),
+spawn and branch (a copy-on-write copy of a process, as snapshots copy
+trees) instead of fork alone, a queue of events and one upcall per
+process instead of signal numbers, handlers and masks, groups and
+sessions as objects, its own status codes. Its calls are SYSCALL with
+NATIVE_BASE (0x4000) + n; Linux's numbers below that are a translation
+layer (kernel/linux: system.mlx, filecalls.mlx, errno.mlx) for the
+programs built for Linux, and std.posix will be a facade over the native
+calls.
+
+What there is: kernel/native (calls.mlx, objects.mlx, status.mlx) with
+handle_close, handle_duplicate, handle_info, wait, read and write (at a
+position or streaming), clock_read and process_exit; std.os.brix for
+programs; projects/brix/tools/native shows them (tools/check_brix.sh
+compares its lines). A handle is still a descriptor slot plus one, so a
+closed handle's number comes back with the next open (the opaque handles
+the spec wants are next), and the core still answers with Linux's errno
+(native/status.mlx turns it into a Status) until it speaks Status itself.
+
 ## Next
 
-1. Interrupts for the disk; ext2 as the format to exchange with Linux;
+1. The native interface on: the core answering in Status, opaque
+   handles, events and the upcall under the Linux layer's signals,
+   spawn and branch, nodes, streams, channels; std (io, fs, process) on
+   std.os.brix for --target=x86_64-brixos.
+2. Interrupts for the disk; ext2 as the format to exchange with Linux;
    brixfs directories written by changed page.
-2. The native handles, waits and IPC of spec/04-stdlib/os/brix.xml, with
-   std.posix translating onto them, instead of Linux's numbers.
 3. EFI boot (PE32+, GOP framebuffer) beside Multiboot.
 
 ## The plan from the start

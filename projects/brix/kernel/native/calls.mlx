@@ -1,0 +1,158 @@
+// brixOS's own calls (spec/04-stdlib/os/brix.xml, <Calls>): SYSCALL with
+// the number at or above NATIVE_BASE; below it, Linux's numbers go to
+// the translation layer (linux/system.mlx). The first ones: handles
+// (close, duplicate, info), the one wait over handles, reads and writes
+// at a position or streaming, the clocks, the end of the process.
+const call = @import("../call.mlx")
+const wait = @import("../wait.mlx")
+const clock = @import("../clock.mlx")
+const scheduler = @import("../scheduler.mlx")
+const Frame = @import("../frame.mlx").Frame
+const Process = @import("../process.mlx").Process
+const Bytes = @import("../bytes.mlx").Bytes
+const objects = @import("./objects.mlx")
+const Status = @import("./status.mlx").Status
+
+const Outcome = call.Outcome
+const OutcomeKind = call.OutcomeKind
+
+pub const NATIVE_BASE: usize = 0x4000
+
+// The calls (NATIVE_BASE + n).
+pub const Call = struct {
+    pub const HANDLE_CLOSE: usize = 0
+    pub const HANDLE_DUPLICATE: usize = 1
+    pub const HANDLE_INFO: usize = 2
+    pub const WAIT: usize = 3
+    pub const READ: usize = 4
+    pub const WRITE: usize = 5
+    pub const PROCESS_EXIT: usize = 23
+    pub const CLOCK_READ: usize = 32
+}
+
+// A read or write that streams (no position).
+const STREAM: usize = 0xFFFFFFFFFFFFFFFF
+// A wait without a deadline.
+const FOREVER: usize = 0xFFFFFFFFFFFFFFFF
+// A wait item: handle, want, seen, reserved (u32 each).
+const ITEM_SIZE: usize = 16
+const INFO_SIZE: usize = 16
+
+pub fn isNative(number: usize) -> bool { return number >= NATIVE_BASE }
+
+pub const Native = struct {
+    outcome: Outcome
+    // The wait this call made before ended by its deadline.
+    timedOut: bool
+
+    // The call in `frame` for `p`: its result in rax, unless the process
+    // waits or ended (the outcome says).
+    pub fn handle(self: *Self, frame: *Frame, p: *Process) -> Outcome {
+        self.*.outcome = Outcome.{ .kind = OutcomeKind.done, .waiting = wait.Wait.none(), .status = 0 }
+        self.*.timedOut = p.*.timedOut
+        p.*.timedOut = false
+        const result = self.dispatch(frame, p, frame.*.rax - NATIVE_BASE)
+        if self.*.outcome.kind == OutcomeKind.done { frame.*.rax = @bitCast(usize, result) }
+        return self.*.outcome
+    }
+
+    fn dispatch(self: *Self, frame: *Frame, p: *Process, number: usize) -> isize {
+        const a1 = frame.*.rdi
+        const a2 = frame.*.rsi
+        const a3 = frame.*.rdx
+        const a4 = frame.*.r10
+        if number == Call.HANDLE_CLOSE {
+            if !objects.exists(p, a1) { return Status.invalid_handle }
+            return Status.ofCore(p.*.files.close(objects.descriptorOf(a1)))
+        }
+        if number == Call.HANDLE_DUPLICATE {
+            if !objects.exists(p, a1) { return Status.invalid_handle }
+            if @intCast(u32, a2 & 0xFFFFFFFF) & ~objects.rightsOf(p, a1) != 0 { return Status.no_right }
+            const copy = p.*.files.duplicate(objects.descriptorOf(a1), 0, false)
+            if copy < 0 { return Status.ofCore(copy) }
+            return copy + 1
+        }
+        if number == Call.HANDLE_INFO { return info(p, a1, a2) }
+        if number == Call.WAIT { return self.waitFor(p, a1, a2, a3) }
+        if number == Call.READ || number == Call.WRITE { return self.transfer(p, a1, a2, a3, a4, number == Call.WRITE) }
+        if number == Call.PROCESS_EXIT {
+            self.*.outcome.kind = OutcomeKind.exited
+            self.*.outcome.status = scheduler.Status.exited(a1)
+            return 0
+        }
+        if number == Call.CLOCK_READ {
+            if a1 == 0 { return @bitCast(isize, clock.system().monotonic()) }
+            if a1 == 1 { return @bitCast(isize, clock.system().realtime()) }
+            return Status.invalid
+        }
+        return Status.unsupported
+    }
+
+    // handle_info: kind, rights and state of the handle's object.
+    fn info(p: *Process, handle: usize, address: usize) -> isize {
+        if !objects.exists(p, handle) { return Status.invalid_handle }
+        if !p.prepare(address, INFO_SIZE) { return Status.bad_address }
+        const into = Bytes.pointer(address)
+        const kind = objects.kindOf(p, handle)
+        Bytes.write32(into, 0, @intCast(usize, kind))
+        Bytes.write32(into, 4, @intCast(usize, objects.rightsOf(p, handle)))
+        Bytes.write32(into, 8, @intCast(usize, objects.stateOf(p, handle)))
+        Bytes.write32(into, 12, 0)
+        return @intCast(isize, kind)
+    }
+
+    // wait: the items' states written; the count of those ready, or
+    // timed_out; else the process waits (it makes the call again).
+    fn waitFor(self: *Self, p: *Process, address: usize, count: usize, deadline: usize) -> isize {
+        if count == 0 || count > wait.HandleWait.MAX { return Status.invalid }
+        if !p.prepare(address, count * ITEM_SIZE) { return Status.bad_address }
+        const items = Bytes.pointer(address)
+        var ready: usize = 0
+        var k: usize = 0
+        while k < count {
+            const handle = Bytes.read32(items, k * ITEM_SIZE)
+            if !objects.exists(p, handle) { return Status.invalid_handle }
+            const seen = objects.stateOf(p, handle)
+            Bytes.write32(items, k * ITEM_SIZE + 8, @intCast(usize, seen))
+            if @intCast(usize, seen) & Bytes.read32(items, k * ITEM_SIZE + 4) != 0 { ready += 1 }
+            k += 1
+        }
+        if ready > 0 { return @intCast(isize, ready) }
+        if deadline == 0 || self.*.timedOut { return Status.timed_out }
+        if deadline != FOREVER && clock.system().monotonic() >= deadline { return Status.timed_out }
+        k = 0
+        while k < count {
+            p.*.waitItems[k] = wait.HandleWait.{ .handle = @intCast(u32, Bytes.read32(items, k * ITEM_SIZE)), .want = @intCast(u32, Bytes.read32(items, k * ITEM_SIZE + 4)) }
+            k += 1
+        }
+        p.*.waitCount = count
+        self.*.outcome.kind = OutcomeKind.blocked
+        self.*.outcome.waiting = wait.Wait.on(wait.WaitKind.handles, 0, if deadline == FOREVER { 0 } else { deadline })
+        return wait.BLOCKED
+    }
+
+    // read and write: at a position of a node, or streaming (a stream,
+    // the session); a stream that has nothing yet makes the process wait.
+    fn transfer(self: *Self, p: *Process, handle: usize, address: usize, length: usize, at: usize, writing: bool) -> isize {
+        if !objects.exists(p, handle) { return Status.invalid_handle }
+        const rights = objects.rightsOf(p, handle)
+        if (writing && rights & objects.Rights.WRITE == 0) || (!writing && rights & objects.Rights.READ == 0) { return Status.no_right }
+        if !p.prepare(address, length) { return Status.bad_address }
+        const fd = objects.descriptorOf(handle)
+        var result: isize = 0
+        if at == STREAM {
+            result = if writing { p.*.files.write(fd, Bytes.pointer(address), length, &self.*.outcome.waiting) } else { p.*.files.read(fd, Bytes.pointer(address), length, &self.*.outcome.waiting) }
+        } else {
+            result = p.*.files.transferAt(fd, Bytes.pointer(address), length, at, writing, &self.*.outcome.waiting)
+        }
+        if result == wait.BLOCKED {
+            self.*.outcome.kind = OutcomeKind.blocked
+            return result
+        }
+        return Status.ofCore(result)
+    }
+}
+
+var native: Native = undefined // (per run)
+
+pub fn calls() -> *Native { return &native }

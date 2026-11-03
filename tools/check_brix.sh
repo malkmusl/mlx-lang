@@ -63,7 +63,7 @@ fail() { echo "FAIL $1" >&2; [[ -f "$work/serial.txt" ]] && cat -v "$work/serial
 # (brixfs, signals, floats: the host's runs are what brixOS's must match)
 # also for Linux.
 brix=--target=x86_64-brixos
-mkdir -p "$work/bin" "$work/native"
+mkdir -p "$work/bin" "$work/linux-tools"
 "$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
 shell=$work/mlx-sh
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
@@ -75,13 +75,13 @@ for main in projects/coreutils/*/main.mlx; do
 done
 printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet $brix "projects/coreutils/{}/main.mlx" -o "$work/bin/{}"
 (( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
-for tool in snapshot brixfs floats signals; do
+for tool in snapshot brixfs floats signals native; do
     "$compiler" --quiet $brix "projects/brix/tools/$tool/main.mlx" -o "$work/$tool"
 done
 for tool in brixfs floats signals; do
-    "$compiler" --quiet "projects/brix/tools/$tool/main.mlx" -o "$work/native/$tool"
+    "$compiler" --quiet "projects/brix/tools/$tool/main.mlx" -o "$work/linux-tools/$tool"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "every-program=tools/brix_programs.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "every-program=tools/brix_programs.sh" "$work/bin/"
 echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
@@ -162,7 +162,7 @@ wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines; built for brixOS, uname -o says so"
 
 type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
-wait_for "^$(( ${#programs[@]} + 6 ))\$"
+wait_for "^$(( ${#programs[@]} + 7 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
 
@@ -228,19 +228,19 @@ echo "ok   the virtio disk: /devices/disk0 read and written, the image has it"
 type_line 'brixfs format /devices/disk0 && cd /volumes/disk0 && mkdir docs && echo hello volume > docs/a && seq 2000 > numbers && cp /system/programs/mlx-sh big && sync && ls; cd /temporary'
 wait_for '^brixfs: mounted at /volumes/disk0$'
 wait_for '^big  docs  numbers$'
-"$work/native/brixfs" list "$work/disk.img" > "$work/list" 2>&1 || fail "the host's brixfs cannot read the volume: $(cat "$work/list")"
+"$work/linux-tools/brixfs" list "$work/disk.img" > "$work/list" 2>&1 || fail "the host's brixfs cannot read the volume: $(cat "$work/list")"
 grep -q '^/docs/a 13$' "$work/list" && grep -q '^/numbers 8893$' "$work/list" && grep -q "^/big $(stat -c %s "$shell")\$" "$work/list" || fail "the volume lacks what was written: $(cat "$work/list")"
-[[ "$("$work/native/brixfs" cat "$work/disk.img" docs/a)" == "hello volume" ]] || fail "the host reads another docs/a"
+[[ "$("$work/linux-tools/brixfs" cat "$work/disk.img" docs/a)" == "hello volume" ]] || fail "the host reads another docs/a"
 type_line 'snapshot -r /volumes/disk0 /volumes/before && rm /volumes/disk0/big && echo changed > /volumes/disk0/docs/a && sync && ls /volumes && cat /volumes/before/docs/a /volumes/disk0/docs/a; echo x > /volumes/before/x'
 wait_for '^before[[:space:]]*disk0$'
 wait_for '^hello volume$'
 wait_for '^changed$'
 wait_for 'before/x'
-"$work/native/brixfs" list "$work/disk.img" > "$work/list" 2>&1
+"$work/linux-tools/brixfs" list "$work/disk.img" > "$work/list" 2>&1
 grep -q '^snapshot before$' "$work/list" && ! grep -q '^/big ' "$work/list" || fail "the snapshot or the removal is not on the disk: $(cat "$work/list")"
 type_line 'ln -s docs/a /volumes/disk0/toa && mkfifo /volumes/disk0/pipe && sync && echo linked $(cat /volumes/disk0/toa)'
 wait_for '^linked changed$'
-"$work/native/brixfs" list "$work/disk.img" > "$work/list" 2>&1
+"$work/linux-tools/brixfs" list "$work/disk.img" > "$work/list" 2>&1
 grep -q '^/toa -> docs/a$' "$work/list" && grep -q '^/pipe fifo$' "$work/list" || fail "the link or the FIFO is not on the disk: $(cat "$work/list")"
 echo "ok   brixfs: formatted and mounted, files on the disk (the host reads them), a read-only snapshot on it"
 
@@ -262,7 +262,7 @@ echo "ok   all ${#programs[@]} coreutils programs run as on the host (links, FIF
 # Two programs at once that compute in the SSE registers for many time
 # slices, each keeping its own.
 type_line 'floats > /tmp/f1 & floats > /tmp/f2; wait; cat /tmp/f1 /tmp/f2'
-sum=$("$work/native/floats")
+sum=$("$work/linux-tools/floats")
 wait_for "^$sum$" 2
 echo "ok   two programs at once keep their own SSE registers"
 
@@ -271,9 +271,37 @@ echo "ok   two programs at once keep their own SSE registers"
 # alternate stack; as on the host.
 type_line 'echo @@ signals; signals; echo @@ end'
 wait_for '^@@ end$'
-"$work/native/signals" > "$work/signals.host"
+"$work/linux-tools/signals" > "$work/signals.host"
 output | sed -n '/^@@ signals$/,/^@@ end$/p' | sed '1d;$d' | grep -v '^$' > "$work/signals.brix"
 diff "$work/signals.host" "$work/signals.brix" > "$work/signals.diff" || fail "signals differ from the host's (< host, > brixOS): $(cat "$work/signals.diff")"
+# brixOS's own calls (std.os.brix): handles, the one wait, positioned
+# and streaming reads and writes, the clock, process_exit.
+type_line 'echo @@ native; native; echo @@ end $?'
+wait_for '^@@ end 7$'
+cat > "$work/native.expected" <<'END'
+native calls
+output kind (session) 6
+output writable
+pipe kind (stream) 4
+wait now (timed out) 5
+wait 50 ms (timed out) 5
+the deadline held
+ready after a write 1
+seen (readable) 1
+read 1
+it was x
+seen after the writer closed (readable, peer gone) 5
+brix!
+hello
+file kind (node) 3
+close twice (invalid handle) 1
+read from a closed handle (invalid handle) 1
+real time after 2023
+END
+output | sed -n '/^@@ native$/,/^@@ end 7$/p' | sed '1d;$d' | grep -v '^$' > "$work/native.brix"
+diff "$work/native.expected" "$work/native.brix" > "$work/native.diff" || fail "the native calls answer otherwise (< expected, > brixOS): $(cat "$work/native.diff")"
+echo "ok   brixOS's own calls: handles, the one wait with deadlines, positioned and streaming reads and writes, the clock, process_exit"
+
 type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
 wait_for '^trapped$'
 wait_for '^after trap$'
@@ -380,7 +408,7 @@ wait_for '^disk0$'
 wait_for '^free [0-9]*$' 2
 free_after=$(output | grep '^free [0-9]*$' | tail -n 1 | cut -d' ' -f2)
 (( free_after > free_before + 100 )) || fail "the snapshot's blocks are not free again ($free_before, then $free_after)"
-"$work/native/brixfs" list "$work/disk.img" > "$work/list" 2>&1
+"$work/linux-tools/brixfs" list "$work/disk.img" > "$work/list" 2>&1
 ! grep -q '^snapshot ' "$work/list" || fail "the snapshot is still on the disk"
 echo "ok   brixfs after a reboot: the files, a link, a FIFO and the snapshot there, the snapshot taken out, its blocks free"
 
@@ -388,11 +416,11 @@ echo "ok   brixfs after a reboot: the files, a link, a FIFO and the snapshot the
 # every block but its last on the disk.
 type_line 'cd /volumes/disk0 && seq 100000 > large && sync && echo written'
 wait_for '^written$'
-"$work/native/brixfs" blocks "$work/disk.img" large > "$work/blocks.before" 2>&1 || fail "the host cannot list large's blocks: $(cat "$work/blocks.before")"
+"$work/linux-tools/brixfs" blocks "$work/disk.img" large > "$work/blocks.before" 2>&1 || fail "the host cannot list large's blocks: $(cat "$work/blocks.before")"
 [[ $(wc -l < "$work/blocks.before") == 144 ]] || fail "large has $(wc -l < "$work/blocks.before") blocks, not 144"
 type_line 'echo 100001 >> large && sync && tail -n 1 large'
 wait_for '^100001$'
-"$work/native/brixfs" blocks "$work/disk.img" large > "$work/blocks.after" 2>&1
+"$work/linux-tools/brixfs" blocks "$work/disk.img" large > "$work/blocks.after" 2>&1
 cmp -s <(head -n 143 "$work/blocks.before") <(head -n 143 "$work/blocks.after") || fail "blocks of large that did not change were written again"
 [[ "$(tail -n 1 "$work/blocks.before")" != "$(tail -n 1 "$work/blocks.after")" ]] || fail "the changed block of large was written in place"
 # A removed file's inode number is used again.
