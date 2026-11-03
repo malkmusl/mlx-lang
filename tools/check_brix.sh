@@ -424,10 +424,18 @@ started by a handle 1
 asked to end 1
 ended by an event 1
 of kind (terminate) 5
+into a directory 1
+/temporary/kinds (the working directory)
+a file there by its name alone 1
+piped (through std's pipe)
+a handler 1
+handled 1
+of kind (user) 13
+a handler for kill (no) 0
 END
 output | sed -n '/^@@ kinds$/,/^@@ kinds end 0$/p' | sed '1d;$d' | grep -v '^$' > "$work/kinds.brix"
 diff "$work/kinds.expected" "$work/kinds.brix" > "$work/kinds.diff" || fail "the other objects behave otherwise (< expected, > brixOS): $(cat "$work/kinds.diff")"
-echo "ok   brixOS's other objects: rename, a snapshot by handle, timers, a memory object shared with a branch, groups in front of the session; std.spawn by handles"
+echo "ok   brixOS's other objects: rename, a snapshot by handle, timers, a memory object shared with a branch, groups in front of the session; std.spawn by handles; std's working directory, pipes and std.events"
 
 type_line "trap 'echo trapped' USR1; kill -USR1 \$\$; echo after trap; trap - USR1"
 wait_for '^trapped$'

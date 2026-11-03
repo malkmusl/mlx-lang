@@ -1465,6 +1465,26 @@ const length = spawn.capture(&options, true, &output, 4096, &ending)
 if ending.status() != 0 { ... }
 ```
 
+## Events on brixOS (`std.events`)
+
+**Implementation:** `std/src/events.mlx`
+**Source tests:** `projects/brix/tools/kinds` (compared by `tools/check_brix.sh`)
+
+brixOS's events (spec/04-stdlib/os/brix.xml, `<Events>`) for a program
+built with `--target=x86_64-brixos`: `handle(kind, handler)` runs
+`handler(record)` for each event of that kind, from the program's one
+upcall on a stack of its own; `release(kind)` gives the kind back its
+default. A read or write through std's files that the upcall came in is
+made again; a wait ends with `interrupted`. Halt and kill cannot be
+handled. Built for another system, `handle` says false.
+
+```mlx
+const events = @import("std.events")
+
+fn onUser(record: events.Record) -> void { ... }
+_ = events.handle(events.Event.USER, onUser)
+```
+
 ## Git repositories (`std.git`)
 
 **Implementation:** `std/src/git.mlx`, `std/src/git/pack.mlx`
