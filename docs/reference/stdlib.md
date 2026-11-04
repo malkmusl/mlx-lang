@@ -88,9 +88,10 @@ way (`std/bootstrap/os/host.brixos.mlx` for `x86_64-brixos`), which keeps
 the Linux file what the compiler itself is built from, by any compiler
 that builds it. `std.platform` (`platform.linux.mlx`,
 `platform.android.mlx`, `platform.brixos.mlx`) names the platform and
-where its users, groups, programs, resolv.conf and hosts files are
-(`USERS`, `GROUPS`, `PROGRAMS`, `RESOLV_CONF`, `HOSTS`: /etc's on Linux,
-/system/settings's on brixOS), and `std.ui.host` is how a
+where its users, groups, programs, resolv.conf, hosts and trusted
+certificates files are (`USERS`, `GROUPS`, `PROGRAMS`, `RESOLV_CONF`,
+`HOSTS`, `CA_CERTIFICATES`: /etc's on Linux, /system/settings's on
+brixOS), and `std.ui.host` is how a
 std.ui app runs on each (see [UI](ui.md)), so a program's own source is the
 same for every target (`tests/290_platform_module_runtime.mlx`).
 
@@ -510,6 +511,14 @@ the member) writes one member; `readFile` and `writeFile` do a whole
 file at once. Each buffers 8 KiB in memory of the allocator.
 `tests/385_flate_gzip_runtime.mlx` writes and reads files in odd pieces,
 two members, a plain file, trailing data, damaged and truncated members.
+
+`std.tar` (`std/src/tar.mlx`) is tar archives (POSIX ustar): `parseHeader`
+reads a 512-byte header block into a `Header` (kind, name with the prefix
+joined, size, mode, link target; GNU's long-name members are told by their
+kind), `writeHeader` makes one (the name split around a slash into prefix
+and name when longer than 100 bytes, the checksum), and `reader`/`next`
+give the regular files of an archive held in memory. projects/tar is the
+program over it (`tar -czf`, `-xzf`, `-tf`, on Linux and brixOS).
 
 `std.crc` (`std/src/crc.mlx`) has the check values: `crc32(crc, data,
 length)` (the CRC-32 of gzip, zlib, PNG and ZIP, 0 to start),

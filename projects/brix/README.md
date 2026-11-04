@@ -32,7 +32,11 @@ on in the blob's code64 (the kernel's GDT and IDT, a TSS and a block of
 their own, layout.PerCpu, as the kernel's GS base: trap stack, arena,
 number) and come into the kernel at brix_ap ("brixOS: 4 processors, 3
 more started", "brixOS: processor 1 runs"; tools/check_brix_smp.sh). Up
-to Memory.MAX_CPUS (8) run the kernel; more stay halted.
+to Memory.MAX_CPUS (8) run the kernel; more stay halted. Each
+processor's arena (mlx4's aggregate arena, 4 MiB of the kernel's 32) is
+loaded into r14 and r15 at each entry to the kernel; an idle processor,
+which stays in the kernel, releases each round of its loop's
+(Scheduler.switchTo: smp.arenaMark, arenaRelease).
 
 The kernel runs on one processor at a time: every entry (brix_trap,
 brix_ap) takes the kernel lock (smp.mlx; an interrupt while the kernel
@@ -550,6 +554,32 @@ word for go to the Linux layer) and reading directories (node_list's
 entries as getdents64 records, "." and ".." first, a cookie per
 descriptor) are native too; fork/exec still go through the Linux
 layer.
+
+## The compiler in brixOS
+
+brixOS builds its own compiler. mlx4 built for brixOS
+(`--target=x86_64-brixos`, mlx-out/bin/brix/mlx4) is in the boot
+archive, as is tar (projects/tar: tar archives made, listed and
+unpacked, plain or gzip, on std.tar and std.flate.gzip). The compiler's
+sources come in as an archive: on the host
+
+    mlx-out/bin/tar -czf mlx.tar.gz compiler/selfhost std/src std/bootstrap mlx-out/version.mlx
+
+(the compiler needs std/src beside its working directory and the version
+module), served by any HTTP server; in brixOS
+
+    cd /volumes/disk0
+    wget http://10.0.2.2:8000/mlx.tar.gz -O mlx.tar.gz
+    tar -xzf mlx.tar.gz
+    mlx4 -o hello hello.mlx && ./hello
+    mlx4 -o mlx4-2 compiler/selfhost/main.mlx && ./mlx4-2 --version
+
+mlx4's target without --target is the system it runs on (brixOS there),
+so what it builds runs in brixOS. The compiler it builds is byte for
+byte the one the host builds for brixOS. tools/check_brix_selfhost.sh
+does this with QEMU (1 GiB, two processors, a 256 MiB brixfs disk; the
+self-build takes a few minutes without KVM) and compares the archive's
+members, a file's bytes, the program's output and the compilers' bytes.
 
 ## Next
 

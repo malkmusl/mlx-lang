@@ -79,7 +79,7 @@ pub const runtime_safety: bool
   <Initial arch="x86_64" os="linux freebsd windows brixos freestanding"/>
   <Initial arch="aarch64" os="linux android"/>
   <CompilerTargets>
-    <Target flag="--target=x86_64-linux" output="static ELF executable" default="true"/>
+    <Target flag="--target=x86_64-linux" output="static ELF executable" default="true" note="the default is the system the compiler runs on: a compiler built for brixOS builds brixOS programs without --target"/>
     <Target flag="--target=x86_64-brixos" output="static ELF executable for brixOS; std picks its X.brixos.mlx files (for std.X and relative imports), reads and writes by brixOS's own calls, and _start ends by process_exit"/>
     <Target flag="--target=x86_64-freestanding" output="static ELF without an operating system (a kernel)"/>
     <Target flag="--target=aarch64-linux" output="static ELF executable"/>
@@ -119,7 +119,11 @@ is a `@compileError` in the branch taken (MLX-E5003 with its text).
 
 `--target=x86_64-brixos` builds for brixOS (static executables that run
 by Linux's system call numbers for now; std picks `X.brixos.mlx` over
-`X.mlx`, as `X.android.mlx` for Android). The CPU feature set
+`X.mlx`, as `X.android.mlx` for Android). Without `--target` the
+compiler builds for the system it runs on: x86_64 Linux, or brixOS for
+the mlx4 built for brixOS (`builtin.os` in the compiler's own code), so
+brixOS builds its programs and the compiler itself
+(tools/check_brix_selfhost.sh). The CPU feature set
 (`builtin.cpu`) is not there yet. The spec gives two concrete syntax
 examples for feature gating:
 
