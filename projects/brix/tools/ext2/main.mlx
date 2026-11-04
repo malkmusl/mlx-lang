@@ -1,0 +1,335 @@
+// ext2: an ext2 disk image made from a directory of the host's, for
+// brixOS to mount (and Linux too):
+//
+//   ext2 make IMAGE MIB DIRECTORY
+//
+// Revision 0, blocks of 1 KiB, one block group (8 MiB at most), 256
+// inodes; directories, files (up to 268 KiB: twelve direct blocks and one
+// indirect), symbolic links (in the inode when short), a lost+found.
+const std = @import("std")
+const format = @import("../../ext2.mlx")
+
+const Ext2 = format.Ext2
+const BLOCK: usize = 1024
+const INODES: usize = 256
+const INODE_TABLE: usize = 5
+const INODE_TABLE_BLOCKS: usize = INODES * Ext2.GOOD_OLD_INODE_SIZE / BLOCK
+const FIRST_FREE_BLOCK: usize = INODE_TABLE + INODE_TABLE_BLOCKS
+const LOST_FOUND: usize = 11
+const MOST_ENTRIES: usize = 128
+const SYS_readlink: usize = 89
+
+var image: [*]u8 = undefined // (per run)
+var blocks: usize = 0 // (per run)
+var nextBlock: usize = FIRST_FREE_BLOCK // (per run)
+var nextInode: usize = LOST_FOUND + 1 // (per run)
+var directories: usize = 0 // (per run)
+var now: usize = 0 // (per run)
+var failed: bool = false // (per run)
+
+fn copyBytes(into: [*]u8, from: [*]const u8, length: usize) -> void {
+    var k: usize = 0
+    while k < length {
+        into[k] = from[k]
+        k += 1
+    }
+}
+
+fn fillZero(into: [*]u8, length: usize) -> void {
+    var k: usize = 0
+    while k < length {
+        into[k] = 0
+        k += 1
+    }
+}
+
+fn say(text: []const u8) -> void { _ = std.linux.write(2, text.pointer, text.length) }
+
+fn fail(text: []const u8) -> u8 {
+    say("ext2: ")
+    say(text)
+    say("\n")
+    return 1
+}
+
+fn at(block: usize) -> [*]u8 { return unsafe { @ptrFromInt([*]u8, @intFromPtr(image) + block * BLOCK) } }
+
+// A zeroed block, marked used; 0 when the image is full.
+fn allocateBlock() -> usize {
+    if nextBlock >= blocks {
+        failed = true
+        return 0
+    }
+    const block = nextBlock
+    nextBlock += 1
+    return block
+}
+
+fn allocateInode() -> usize {
+    if nextInode > INODES {
+        failed = true
+        return 0
+    }
+    const inode = nextInode
+    nextInode += 1
+    return inode
+}
+
+fn inodeAt(number: usize) -> [*]u8 { return unsafe { @ptrFromInt([*]u8, @intFromPtr(at(INODE_TABLE)) + (number - 1) * Ext2.GOOD_OLD_INODE_SIZE) } }
+
+// An inode's fields; `data` its block numbers (direct, then one
+// indirect block made for the rest).
+fn writeInode(number: usize, mode: usize, size: usize, links: usize, data: []const usize) -> void {
+    const inode = inodeAt(number)
+    Ext2.put(inode, Ext2.I_MODE, 2, mode)
+    Ext2.put(inode, Ext2.I_SIZE, 4, size)
+    Ext2.put(inode, Ext2.I_ATIME, 4, now)
+    Ext2.put(inode, Ext2.I_CTIME, 4, now)
+    Ext2.put(inode, Ext2.I_MTIME, 4, now)
+    Ext2.put(inode, Ext2.I_LINKS, 2, links)
+    var used = data.length
+    var k: usize = 0
+    while k < data.length && k < Ext2.DIRECT {
+        Ext2.put(inode, Ext2.I_BLOCK + 4 * k, 4, data[k])
+        k += 1
+    }
+    if data.length > Ext2.DIRECT {
+        const indirect = allocateBlock()
+        if indirect == 0 { return }
+        used += 1
+        Ext2.put(inode, Ext2.I_BLOCK + 4 * Ext2.DIRECT, 4, indirect)
+        while k < data.length {
+            Ext2.put(at(indirect), 4 * (k - Ext2.DIRECT), 4, data[k])
+            k += 1
+        }
+    }
+    Ext2.put(inode, Ext2.I_BLOCKS, 4, used * (BLOCK / 512))
+}
+
+// `length` bytes from `from` into blocks of their own: their numbers into
+// `into`; how many.
+fn writeData(from: [*]const u8, length: usize, into: *[268]usize) -> usize {
+    var count: usize = 0
+    var done: usize = 0
+    while done < length {
+        if count == 268 {
+            failed = true
+            return count
+        }
+        const block = allocateBlock()
+        if block == 0 { return count }
+        const chunk = if length - done > BLOCK { BLOCK } else { length - done }
+        copyBytes(at(block), unsafe { @ptrFromInt([*]const u8, @intFromPtr(from) + done) }, chunk)
+        into.*[count] = block
+        count += 1
+        done += chunk
+    }
+    return count
+}
+
+const Entry = struct {
+    inode: usize
+    name: [256]u8
+    length: usize
+}
+
+// A directory's data: ".", "..", then `entries`, each record 4-aligned,
+// the last of a block to its end.
+fn writeDirectory(number: usize, parent: usize, entries: []const Entry, links: usize) -> void {
+    var data: [268]usize = undefined
+    var count: usize = 0
+    var block: usize = 0
+    var used: usize = BLOCK
+    var last: usize = 0
+    var k: usize = 0
+    while k < entries.length + 2 {
+        var name: []const u8 = "."
+        var inode = number
+        if k == 1 {
+            name = ".."
+            inode = parent
+        } else if k > 1 {
+            name = entries[k - 2].name[0..entries[k - 2].length]
+            inode = entries[k - 2].inode
+        }
+        const size = (8 + name.length + 3) & ~@intCast(usize, 3)
+        if used + size > BLOCK {
+            // The last record of the full block reaches its end.
+            if block != 0 { Ext2.put(at(block), last + 4, 2, BLOCK - last) }
+            block = allocateBlock()
+            if block == 0 || count == 268 { return }
+            data[count] = block
+            count += 1
+            used = 0
+        }
+        const record = at(block)
+        Ext2.put(record, used, 4, inode)
+        Ext2.put(record, used + 4, 2, size)
+        Ext2.put(record, used + 6, 2, name.length)
+        copyBytes(unsafe { @ptrFromInt([*]u8, @intFromPtr(record) + used + 8) }, name.pointer, name.length)
+        last = used
+        used += size
+        k += 1
+    }
+    Ext2.put(at(block), last + 4, 2, BLOCK - last)
+    writeInode(number, Ext2.S_IFDIR | 0x1ED, count * BLOCK, links, data[0..count])
+}
+
+// The host's directory `path` (NUL-terminated, `length` long) as inode
+// `number`, under `parent`.
+fn addDirectory(path: *[4096]u8, length: usize, number: usize, parent: usize) -> void {
+    var entries: [MOST_ENTRIES]Entry = undefined
+    var count: usize = 0
+    var subdirectories: usize = 0
+    // The root names lost+found first.
+    if number == Ext2.ROOT_INODE {
+        entries[0].inode = LOST_FOUND
+        copyBytes(&entries[0].name, "lost+found".pointer, 10)
+        entries[0].length = 10
+        count = 1
+    }
+    const directory = std.fs.open(path, std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(directory) {
+        failed = true
+        return
+    }
+    var buffer: [8192]u8 = undefined
+    var reader = std.fs.entries(directory, &buffer, 8192)
+    var found: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &found) {
+        if std.fs.isDotName(found.name) { continue }
+        const name = std.string.asSlice(found.name)
+        if count == MOST_ENTRIES || length + 1 + name.length >= 4096 || name.length > 255 {
+            failed = true
+            break
+        }
+        // The child's path after this one's.
+        path.*[length] = 47
+        copyBytes(unsafe { @ptrFromInt([*]u8, @intFromPtr(path) + length + 1) }, name.pointer, name.length)
+        const childLength = length + 1 + name.length
+        path.*[childLength] = 0
+        var status: std.fs.Stat = undefined
+        if std.fs.statusAt(path, &status, true) != 0 { continue }
+        const kind = @intCast(usize, status.mode) & Ext2.S_IFMT
+        const child = allocateInode()
+        if child == 0 { break }
+        const mode = @intCast(usize, status.mode) & 0xFFF
+        if kind == Ext2.S_IFDIR {
+            addDirectory(path, childLength, child, number)
+            subdirectories += 1
+        } else if kind == Ext2.S_IFLNK {
+            var target: [4096]u8 = undefined
+            const got = std.linux.syscall3(SYS_readlink, @intFromPtr(path), @intFromPtr(&target), 4096)
+            const size = if got > 0 { @bitCast(usize, got) } else { 0 }
+            if size < Ext2.FAST_LINK {
+                // In the inode itself.
+                writeInode(child, Ext2.S_IFLNK | 0x1FF, size, 1, empty())
+                copyBytes(unsafe { @ptrFromInt([*]u8, @intFromPtr(inodeAt(child)) + Ext2.I_BLOCK) }, &target, size)
+            } else {
+                var data: [268]usize = undefined
+                const used = writeData(&target, size, &data)
+                writeInode(child, Ext2.S_IFLNK | 0x1FF, size, 1, data[0..used])
+            }
+        } else if kind == Ext2.S_IFREG {
+            const size = @bitCast(usize, status.size)
+            if size > 268 * BLOCK {
+                failed = true
+                continue
+            }
+            var bytes: [268 * 1024]u8 = undefined
+            const read = std.fs.readFile(path, &bytes, 268 * BLOCK)
+            var data: [268]usize = undefined
+            const used = writeData(&bytes, read, &data)
+            writeInode(child, Ext2.S_IFREG | mode, read, 1, data[0..used])
+        } else {
+            nextInode -= 1
+            continue
+        }
+        const entry = &entries[count]
+        entry.*.inode = child
+        copyBytes(&entry.*.name, name.pointer, name.length)
+        entry.*.length = name.length
+        count += 1
+        path.*[length] = 0
+    }
+    path.*[length] = 0
+    _ = std.fs.close(directory)
+    directories += 1
+    writeDirectory(number, parent, entries[0..count], 2 + subdirectories + (if number == Ext2.ROOT_INODE { 1 } else { 0 }))
+}
+
+fn empty() -> []const usize {
+    const none: [*]const usize = unsafe { @ptrFromInt([*]const usize, 8) }
+    return none[0..0]
+}
+
+// A bitmap block: the first `used` bits set, and the ones from `count`
+// on (past the group's end).
+fn bitmap(block: usize, used: usize, count: usize) -> void {
+    var bit: usize = 0
+    while bit < BLOCK * 8 {
+        if bit < used || bit >= count { at(block)[bit / 8] |= @intCast(u8, 1) << @intCast(u3, bit % 8) }
+        bit += 1
+    }
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if std.process.count(arguments) != 5 || !std.text.same(std.string.asSlice(std.process.argument(arguments, 1)), "make") { return fail("usage: ext2 make IMAGE MIB DIRECTORY") }
+    const output = std.process.argument(arguments, 2).pointer
+    var megabytes: usize = 0
+    for digit in std.string.asSlice(std.process.argument(arguments, 3)) {
+        if digit < 48 || digit > 57 { return fail("the size is MiB as a number") }
+        megabytes = megabytes * 10 + @intCast(usize, digit - 48)
+    }
+    if megabytes == 0 || megabytes > 8 { return fail("1 to 8 MiB (one block group)") }
+    blocks = megabytes * 1024
+    const memory = std.heap.allocator().alloc(blocks * BLOCK, 4096)
+    if memory == null { return fail("no memory") }
+    image = memory.?
+    fillZero(image, blocks * BLOCK)
+    now = @bitCast(usize, std.time.realtime().seconds)
+    // lost+found, then the directory's tree as the root.
+    writeDirectory(LOST_FOUND, Ext2.ROOT_INODE, empty_entries(), 2)
+    var path: [4096]u8 = undefined
+    const source = std.string.asSlice(std.process.argument(arguments, 4))
+    if source.length >= 4000 { return fail("the directory's path is too long") }
+    copyBytes(&path, source.pointer, source.length)
+    path[source.length] = 0
+    addDirectory(&path, source.length, Ext2.ROOT_INODE, Ext2.ROOT_INODE)
+    if failed { return fail("the directory does not fit (or could not be read)") }
+    // The bitmaps, the group's descriptor, the superblock.
+    bitmap(3, nextBlock - 1, blocks - 1)
+    bitmap(4, nextInode - 1, INODES)
+    const descriptor = at(2)
+    Ext2.put(descriptor, Ext2.G_BLOCK_BITMAP, 4, 3)
+    Ext2.put(descriptor, Ext2.G_INODE_BITMAP, 4, 4)
+    Ext2.put(descriptor, Ext2.G_INODE_TABLE, 4, INODE_TABLE)
+    Ext2.put(descriptor, Ext2.G_FREE_BLOCKS, 2, blocks - nextBlock)
+    Ext2.put(descriptor, Ext2.G_FREE_INODES, 2, INODES + 1 - nextInode)
+    Ext2.put(descriptor, Ext2.G_USED_DIRS, 2, directories + 1)
+    const superblock = at(1)
+    Ext2.put(superblock, Ext2.S_INODES_COUNT, 4, INODES)
+    Ext2.put(superblock, Ext2.S_BLOCKS_COUNT, 4, blocks)
+    Ext2.put(superblock, Ext2.S_FREE_BLOCKS, 4, blocks - nextBlock)
+    Ext2.put(superblock, Ext2.S_FREE_INODES, 4, INODES + 1 - nextInode)
+    Ext2.put(superblock, Ext2.S_FIRST_DATA_BLOCK, 4, 1)
+    Ext2.put(superblock, Ext2.S_BLOCKS_PER_GROUP, 4, 8192)
+    Ext2.put(superblock, Ext2.S_FRAGS_PER_GROUP, 4, 8192)
+    Ext2.put(superblock, Ext2.S_INODES_PER_GROUP, 4, INODES)
+    Ext2.put(superblock, Ext2.S_WTIME, 4, now)
+    Ext2.put(superblock, Ext2.S_MAX_MOUNT_COUNT, 2, 0xFFFF)
+    Ext2.put(superblock, Ext2.S_MAGIC, 2, Ext2.MAGIC)
+    Ext2.put(superblock, Ext2.S_STATE, 2, 1)
+    Ext2.put(superblock, Ext2.S_ERRORS, 2, 1)
+    const file = std.fs.open(output, std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 0x1A4)
+    if !std.fs.isValid(file) { return fail("cannot write the image") }
+    const written = std.fs.writeAllBytes(file, image, blocks * BLOCK)
+    _ = std.fs.close(file)
+    if !written { return fail("cannot write the image") }
+    return 0
+}
+
+fn empty_entries() -> []const Entry {
+    const none: [*]const Entry = unsafe { @ptrFromInt([*]const Entry, 8) }
+    return none[0..0]
+}

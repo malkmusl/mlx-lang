@@ -24,6 +24,8 @@
 #include <limits.h>
 #include <malloc.h>
 #include <pthread.h>
+#include <search.h>
+#include <threads.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -524,6 +526,86 @@ static void check_dl(const char *plugin) {
 
 static void say_goodbye(void) { printf("atexit ran\n"); }
 
+
+// C11 threads, a memory stream and the tsearch family: what Mesa's
+// drivers, libdrm and libelf use of glibc beyond POSIX.
+static once_flag c11_once = ONCE_FLAG_INIT;
+static int c11_once_count;
+static mtx_t c11_mutex;
+static cnd_t c11_cond;
+static int c11_ready;
+static tss_t c11_key;
+static void c11_init(void) { c11_once_count++; }
+static int c11_worker(void *argument) {
+    call_once(&c11_once, c11_init);
+    tss_set(c11_key, argument);
+    mtx_lock(&c11_mutex);
+    while (!c11_ready) cnd_wait(&c11_cond, &c11_mutex);
+    mtx_unlock(&c11_mutex);
+    return (int)(long)tss_get(c11_key) * 3;
+}
+static int compare_longs(const void *a, const void *b) {
+    long x = *(const long *)a, y = *(const long *)b;
+    return (x > y) - (x < y);
+}
+static void print_node(const void *node, VISIT order, int level) {
+    if (order == postorder || order == leaf) printf(" %ld@%d", **(long *const *)node, level);
+}
+static void free_nothing(void *key) { (void)key; }
+static void check_c11_and_search(void) {
+    section("c11 threads, memory stream, tsearch");
+    mtx_init(&c11_mutex, mtx_plain | mtx_recursive);
+    cnd_init(&c11_cond);
+    tss_create(&c11_key, NULL);
+    thrd_t workers[3];
+    for (long i = 0; i < 3; i++) printf("%d", thrd_create(&workers[i], c11_worker, (void *)(10L + i)));
+    mtx_lock(&c11_mutex);
+    mtx_lock(&c11_mutex);
+    c11_ready = 1;
+    cnd_broadcast(&c11_cond);
+    mtx_unlock(&c11_mutex);
+    mtx_unlock(&c11_mutex);
+    int total = 0;
+    for (int i = 0; i < 3; i++) {
+        int result = 0;
+        thrd_join(workers[i], &result);
+        total += result;
+    }
+    printf(" once %d total %d trylock %d %d equal %d\n", c11_once_count, total, mtx_trylock(&c11_mutex), mtx_unlock(&c11_mutex), thrd_equal(thrd_current(), thrd_current()));
+    mtx_destroy(&c11_mutex);
+    cnd_destroy(&c11_cond);
+    tss_delete(c11_key);
+
+    char *text = NULL;
+    size_t size = 0;
+    FILE *memory = open_memstream(&text, &size);
+    fprintf(memory, "hello %d", 42);
+    fflush(memory);
+    printf("[%s] %zu tell %ld", text, size, ftell(memory));
+    fseek(memory, -2, SEEK_CUR);
+    fputs("7 world", memory);
+    for (int i = 0; i < 200; i++) fputc('.', memory);
+    fclose(memory);
+    printf(" [%.*s] %zu\n", 13, text, size);
+    free(text);
+
+    long keys[] = { 50, 30, 70, 20, 40, 60, 80, 30 };
+    void *root = NULL;
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        long **node = tsearch(&keys[i], &root, compare_longs);
+        printf("%s", *node == &keys[i] ? "+" : "=");
+    }
+    long probe = 60;
+    printf(" find %ld %p", **(long **)tfind(&probe, &root, compare_longs), tfind(&(long){ 65 }, &root, compare_longs));
+    probe = 30;
+    printf(" delete %d", tdelete(&probe, &root, compare_longs) != NULL);
+    probe = 50;
+    printf(" %d", tdelete(&probe, &root, compare_longs) != NULL);
+    twalk(root, print_node);
+    tdestroy(root, free_nothing);
+    printf("\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: mlxlibc_check WORKDIR mlx|glibc\n");
@@ -543,6 +625,7 @@ int main(int argc, char **argv) {
     check_stdio(argv[1]);
     check_time();
     check_pthread();
+    check_c11_and_search();
     check_unistd(argv[1]);
     check_inet();
     if (argc > 3) check_dl(argv[3]);

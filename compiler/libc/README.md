@@ -17,7 +17,7 @@ gcc program.c -L mlx-out/libc -lmlxc -Wl,-rpath,$PWD/mlx-out/libc  # next to gli
 
 | Library | What it is | Built from |
 | --- | --- | --- |
-| `libmlxc.so.1` (`libmlxc.so`) | 848 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families, pthread with thread-local storage, getopt, dirent, err/warn/error, syslog, locale stubs, gettext, iconv, POSIX regular expressions, dlfcn, `inet_pton`; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
+| `libmlxc.so.1` (`libmlxc.so`) | 848 exported C names: memory, strings, ctype, stdlib, errno, environment, process, time, the system call wrappers, signals, stdio (glibc's FILE layout, `popen`/`pclose`), the printf and scanf families (`open_memstream`), pthread with thread-local storage and C11's `threads.h` on it, `tsearch`, getopt, dirent, err/warn/error, syslog, locale stubs, gettext, iconv, POSIX regular expressions, dlfcn, `inet_pton`; and the dynamic loader behind `__mlx_start` | `libc.mlx` |
 | `libm.so.6` (`libm.so`) | the math functions of `<math.h>`: `std.math`'s sine, cosine (huge arguments reduced with the bits of 2/pi), e^x, logarithms and cube root, with the arc tangent, the inverse and hyperbolic functions, powers (whole exponents to an ulp in double-double arithmetic), `fmod` and `remainder` exact, the rounding functions, `frexp`/`ldexp`, `hypot`, `nextafter`, `erf`/`erfc` (a series in double-double, a continued fraction), `tgamma`/`lgamma` (Lanczos and a rising product), the classification, and the `f` variants; `tools/libm_check.py` compares it with glibc's libm call by call; the 41 `l` (long double) variants (`sinl` to `lgammal`) are x87 code of their own, `tools/libc/x87_long.s`, generated into `x87_long.mlx` by `tools/libc/gen_x87.py` and bound by the loader from a page of its own. Not yet: the Bessel functions, errno | `libm.mlx`, `x87_long.mlx` |
 
 It is a `--plugin` shared object on a stack arena with no C library under
@@ -73,8 +73,11 @@ and where it goes.
 - **`heap.mlx`**: `malloc`, `free`, `calloc`, `realloc`, `posix_memalign`,
   `aligned_alloc`, `malloc_usable_size` on `std.general_purpose_allocator`
   with a 16-byte header per block.
-- **`string.mlx`**, **`ctype.mlx`**: the `mem*`/`str*` set, `strerror`
-  (glibc's texts), `strsignal`, the `__ctype_*_loc` tables.
+- **`string.mlx`**, **`ctype.mlx`**: the `mem*`/`str*` set (`memcpy`,
+  `memmove` and `memset` of 64 bytes or more as `rep movsb`/`rep stosb`,
+  machine code `sys.installFastMemory` puts on a page at the start:
+  glibc's speed), `strerror` (glibc's texts), `strsignal`, the
+  `__ctype_*_loc` tables.
 - **`stdlib.mlx`**, **`bignum.mlx`**: `strtol`/`strtod` (exact, through
   1536-bit integers), `qsort`, `bsearch`, `rand` (glibc's TYPE_3
   sequence), `getenv`/`setenv`, `exit` and `atexit`, `system`.
@@ -137,7 +140,8 @@ and where it goes.
   `pthread_join`/`detach` (a registry of the live threads: a handle
   already joined answers ESRCH), mutexes (normal, recursive,
   error-checking), condition variables, rwlocks, spin locks, barriers,
-  semaphores, keys with destructors, `pthread_once`, names;
+  semaphores, keys with destructors, `pthread_once`, names, and C11's
+  `threads.h` (`call_once`, `mtx_*`, `cnd_*`, `thrd_*`, `tss_*`) on them;
   `pthread_getattr_np` of the main thread describes the kernel's stack
   as glibc does (the mapping holding the first stack pointer in
   `/proc/self/maps`, as deep as `RLIMIT_STACK` allows), since
@@ -150,7 +154,8 @@ and where it goes.
   (where its `libm.so.6` is), the system directories, `/lib/mlx` first), symbol lookup through `DT_GNU_HASH` or `DT_HASH` in
   load order (symbol versions are not compared), relocations (`RELATIVE`,
   `RELR`, `64`, `GLOB_DAT`, `JUMP_SLOT`, `COPY`, `IRELATIVE`, `DTPMOD64`,
-  `DTPOFF64`, `TPOFF64`), static TLS laid out below each thread's control
+  `DTPOFF64`, `TPOFF64`, `TLSDESC` with a static resolver, as Mesa's
+  drivers use), static TLS laid out below each thread's control
   block (the executable's block right under the thread pointer, as its
   code assumes; `__tls_get_addr`; a thread that started before a dlopen
   gets the new module's image on first use), RELRO, constructors and

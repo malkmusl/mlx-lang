@@ -1,0 +1,168 @@
+// Block devices: each virtio disk whole ("diskN"), and each partition of
+// a disk with a GPT ("diskNpM", from 1): a range of a disk's bytes, read
+// and written within it. Each is /devices/NAME, and each has a volume
+// store (volume.mlx, ext2.mlx) at the same index: a partitioned disk's
+// own volume is not looked for. The GPT (LBA 1: "EFI PART", the
+// header's and the entries' CRC32s checked) names the partitions by
+// their first and last LBA; the protective MBR is not read.
+const layout = @import("../layout.mlx")
+const memory = @import("./memory.mlx")
+const virtio = @import("./virtio.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const Page = memory.Page
+
+pub const MAX_BLOCKS: usize = 16
+const SECTOR: usize = 512
+pub const NAME_CAPACITY: usize = 12
+
+pub const Block = struct {
+    present: bool
+    // The disk it is on, and its bytes there.
+    disk: usize
+    start: usize
+    size: usize
+    // A whole disk (not a partition), and whether that disk has
+    // partitions (then its own volume is not looked for).
+    whole: bool
+    partitioned: bool
+    name: [NAME_CAPACITY]u8
+    nameLength: usize
+
+    pub fn readOnly(self: *const Self) -> bool { return virtio.diskAt(self.*.disk).*.readOnly }
+
+    // Up to `length` bytes from `offset` into `into`: how many (0 at the
+    // end), or -Status.io_error.
+    pub fn read(self: *const Self, offset: usize, into: [*]u8, length: usize) -> isize {
+        if offset >= self.*.size { return 0 }
+        const total = if length > self.*.size - offset { self.*.size - offset } else { length }
+        return virtio.diskAt(self.*.disk).read(self.*.start + offset, into, total)
+    }
+
+    pub fn write(self: *const Self, offset: usize, from: [*]const u8, length: usize) -> isize {
+        if offset >= self.*.size { return 0 }
+        const total = if length > self.*.size - offset { self.*.size - offset } else { length }
+        return virtio.diskAt(self.*.disk).write(self.*.start + offset, from, total)
+    }
+
+    pub fn flush(self: *const Self) -> bool { return virtio.diskAt(self.*.disk).flush() }
+
+    pub fn nameText(self: *const Self) -> []const u8 { return self.*.name[0..self.*.nameLength] }
+}
+
+var blocks: [MAX_BLOCKS]Block = undefined // (per run)
+var blockCount: usize = 0 // (per run)
+
+pub fn count() -> usize { return blockCount }
+
+pub fn at(index: usize) -> *Block { return &blocks[index] }
+
+// The block device named `name`; MAX_BLOCKS when there is none.
+pub fn named(name: []const u8) -> usize {
+    var k: usize = 0
+    while k < blockCount {
+        const b = &blocks[k]
+        if b.*.nameLength == name.length {
+            var same = true
+            var c: usize = 0
+            while c < name.length {
+                if b.*.name[c] != name[c] { same = false }
+                c += 1
+            }
+            if same { return k }
+        }
+        k += 1
+    }
+    return MAX_BLOCKS
+}
+
+fn add(disk: usize, start: usize, size: usize, whole: bool, partition: usize) -> bool {
+    if blockCount == MAX_BLOCKS { return false }
+    const b = &blocks[blockCount]
+    b.*.present = true
+    b.*.disk = disk
+    b.*.start = start
+    b.*.size = size
+    b.*.whole = whole
+    b.*.partitioned = false
+    b.*.name[0] = 100
+    b.*.name[1] = 105
+    b.*.name[2] = 115
+    b.*.name[3] = 107
+    b.*.name[4] = @intCast(u8, 48 + disk)
+    b.*.nameLength = 5
+    if !whole {
+        b.*.name[5] = 112
+        b.*.nameLength = 6
+        if partition >= 10 {
+            b.*.name[6] = @intCast(u8, 48 + partition / 10)
+            b.*.nameLength = 7
+        }
+        b.*.name[b.*.nameLength] = @intCast(u8, 48 + partition % 10)
+        b.*.nameLength += 1
+    }
+    blockCount += 1
+    return true
+}
+
+// Every disk's block devices: the disk, and its GPT's partitions.
+pub fn probe() -> void {
+    blockCount = 0
+    const scratch = memory.allFrames().allocateContiguous(5)
+    if scratch == 0 { return }
+    const header = Bytes.pointer(layout.Memory.virtual(scratch))
+    const entries = Bytes.pointer(layout.Memory.virtual(scratch + Page.SIZE))
+    var d: usize = 0
+    while d < virtio.count() {
+        const disk = virtio.diskAt(d)
+        const whole = blockCount
+        if !add(d, 0, disk.sizeInBytes(), true, 0) { break }
+        // The GPT header at LBA 1.
+        if disk.read(SECTOR, header, SECTOR) == @intCast(isize, SECTOR) && gptHeaderValid(header) {
+            const entriesAt = Bytes.read64(header, 72)
+            const entryCount = Bytes.read32(header, 80)
+            const entrySize = Bytes.read32(header, 84)
+            const total = entryCount * entrySize
+            if entrySize >= 128 && total <= 4 * Page.SIZE && disk.read(entriesAt * SECTOR, entries, total) == @intCast(isize, total) && Bytes.crc32(entries, total) == Bytes.read32(header, 88) {
+                var partition: usize = 0
+                var k: usize = 0
+                while k < entryCount {
+                    const entry = Bytes.pointer(@intFromPtr(entries) + k * entrySize)
+                    if Bytes.read64(entry, 0) != 0 || Bytes.read64(entry, 8) != 0 {
+                        const first = Bytes.read64(entry, 32)
+                        const last = Bytes.read64(entry, 40)
+                        partition += 1
+                        if last >= first && (last + 1) * SECTOR <= disk.sizeInBytes() {
+                            blocks[whole].partitioned = true
+                            if !add(d, first * SECTOR, (last - first + 1) * SECTOR, false, partition) { break }
+                        }
+                    }
+                    k += 1
+                }
+            }
+        }
+        d += 1
+    }
+    var k: usize = 0
+    while k < 5 {
+        memory.allFrames().free(scratch + k * Page.SIZE)
+        k += 1
+    }
+}
+
+// "EFI PART", a header of 92 bytes or more whose CRC32 (the field
+// itself zero) is right.
+fn gptHeaderValid(header: [*]u8) -> bool {
+    const signature = "EFI PART"
+    var k: usize = 0
+    while k < 8 {
+        if header[k] != signature[k] { return false }
+        k += 1
+    }
+    const size = Bytes.read32(header, 12)
+    if size < 92 || size > SECTOR { return false }
+    const crc = Bytes.read32(header, 16)
+    Bytes.write32(header, 16, 0)
+    const computed = Bytes.crc32(header, size)
+    Bytes.write32(header, 16, crc)
+    return computed == crc
+}

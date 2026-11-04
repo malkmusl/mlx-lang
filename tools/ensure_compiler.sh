@@ -677,6 +677,59 @@ inlines_with_own_names() {
     [[ $status -eq 13 ]]
 }
 
+# Whether $1 builds kernels (--target=x86_64-freestanding: a _start that
+# takes its arena in rdi and rsi and never makes a system call; brixOS's,
+# projects/brix).
+builds_freestanding_kernels() {
+    local probe ok=1
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    printf 'pub fn main() -> u8 { return 0 }\n' > "$probe/kernel.mlx"
+    if "$1" --quiet --target=x86_64-freestanding "$probe/kernel.mlx" -o "$probe/kernel" > /dev/null 2>&1 \
+        && [[ "$(od -An -tx1 -j "$(( 0x1000 ))" -N3 "$probe/kernel" | tr -d ' ')" == "4989fe" ]]; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 lets a struct's own constants name its array fields' lengths
+# (`entries: [MAX]Entry`, `[Self.MAX]`; tests/426 exits 13).
+resolves_aggregate_constant_lengths() {
+    local probe status=0
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    if "$1" --quiet tests/426_aggregate_constant_lengths_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+    else
+        status=1
+    fi
+    rm -rf -- "$probe"
+    [[ $status -eq 13 ]]
+}
+
+# Whether $1 lets a method's locals shadow its struct's members and the
+# module's declarations (tests/427 exits 13).
+lets_locals_shadow_members() {
+    local probe status=0
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    if "$1" --quiet tests/427_local_shadows_member_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+    else
+        status=1
+    fi
+    rm -rf -- "$probe"
+    [[ $status -eq 13 ]]
+}
+
+# Whether $1 names the symbol its backend cannot resolve (MLX-E3004 with
+# "unresolved backend symbol: main" for a module without main).
+names_unresolved_symbols() {
+    local probe status=0 output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" --quiet tests/support/no_main.mlx -o "$probe/probe" 2>&1) || status=$?
+    rm -rf -- "$probe"
+    [[ $status -ne 0 ]] && grep -q "unresolved backend symbol: main" <<< "$output"
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -725,6 +778,10 @@ probes=(
     "runs_build|the build command (mlx build)"
     "inlines_with_own_names|inlined functions reading their own module's variables, not the caller's locals"
     "says_its_version|its version (mlx4 --version)"
+    "builds_freestanding_kernels|kernels (--target=x86_64-freestanding)"
+    "resolves_aggregate_constant_lengths|a struct's constants as its array fields' lengths"
+    "lets_locals_shadow_members|locals shadowing their struct's members and module declarations"
+    "names_unresolved_symbols|the unresolved backend symbol named (MLX-E3004)"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

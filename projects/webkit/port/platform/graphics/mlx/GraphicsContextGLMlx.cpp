@@ -69,6 +69,12 @@ public:
     RefPtr<PixelBuffer> readCompositedResults() final { return readRenderingResultsForPainting(); }
     bool reshapeDrawingBuffer() final;
     void prepareForDisplay() final;
+#if ENABLE(VIDEO)
+    // (No copy of a video frame straight into a texture yet, as the
+    // TextureMapper ports: WebGL paints the frame into an image and
+    // uploads that.)
+    bool copyTextureFromVideoFrame(VideoFrame&, PlatformGLObject, GCGLenum, GCGLint, GCGLenum, GCGLenum, GCGLenum, bool, bool) final { return false; }
+#endif
 
 private:
     explicit GraphicsContextGLMlx(GraphicsContextGLAttributes&& attributes)

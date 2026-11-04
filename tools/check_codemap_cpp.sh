@@ -6,7 +6,9 @@
 #   - mlx-cc --index=DIR (and MLX_CC_INDEX=DIR) writes the index of what
 #     it compiles, and the objects are byte for byte the ones it writes
 #     without (no CODEGEN_EPOCH bump needed);
-#   - a shard is written once: compiling again writes none;
+#   - a shard is written once: compiling again writes none, unless the
+#     unit leaves out less of the file than the one that wrote it (a
+#     header's `#if` its macros make true);
 #   - find, refs, callers, callees, outline, def, show, members, imports
 #     and importers answer as tools/codemap/tests/cpp/expected/ says,
 #     across C, C++ and Mlx.
@@ -54,6 +56,20 @@ before=$(ls -l --time-style=+%s.%N "$index" | md5sum)
 after=$(ls -l --time-style=+%s.%N "$index" | md5sum)
 [[ "$before" == "$after" ]] || fail "compiling again wrote shards again"
 echo "ok   a shard per file read, written once ($(ls "$index" | wc -l) shards)"
+
+# A header one unit's macros leave a line of (arcs.h without SHAPES_ARCS):
+# a unit that keeps more of it writes its shard again, one that keeps
+# less does not.
+arcs() { grep -l "^file [0-9a-f]* $tree/arcs.h\$" "$index"/*.cxi; }
+"$cc" --index="$index" -c arcs.cpp -o "$work/arcs-off.o"
+grep -q '^D .* arcLength$' "$(arcs)" && fail "arcs.h's shard has arcLength without SHAPES_ARCS"
+"$cc" --index="$index" -DSHAPES_ARCS=1 -c arcs.cpp -o "$work/arcs-on.o"
+grep -q '^D .* arcLength$' "$(arcs)" || fail "arcs.h's shard was not written again with SHAPES_ARCS" "$(arcs)"
+before=$(ls -l --time-style=+%s.%N "$index" | md5sum)
+"$cc" --index="$index" -c arcs.cpp -o "$work/arcs-off.o"
+after=$(ls -l --time-style=+%s.%N "$index" | md5sum)
+[[ "$before" == "$after" ]] || fail "a unit that left out more of arcs.h wrote shards again"
+echo "ok   a header's shard is written again by a unit that leaves out less of it"
 cd "$repo_root"
 
 # The answers.
@@ -89,3 +105,4 @@ ask imports-cpp imports shapes.cpp
 ask callers-mlx callers scale.mlx:shapes_scale
 ask refs-c refs counted
 ask callers-c callers bump
+ask find-arc find arcLength

@@ -70,8 +70,11 @@
 
 #if PLATFORM(WIN)
 #include "WebCoreBundleWin.h"
-#include <wtf/FileSystem.h>
 #endif
+#include "SharedBuffer.h"
+#include <stdlib.h>
+#include <wtf/FileSystem.h>
+#include <wtf/text/MakeString.h>
 
 #if PLATFORM(GTK) || PLATFORM(WPE)
 #include "SystemSettings.h"
@@ -278,6 +281,79 @@ String RenderThemeAdwaita::extraDefaultStyleSheet()
     }();
     return sheet.get();
 }
+
+#if ENABLE(VIDEO)
+// The media controls (a video or audio element's `controls`): WebKit's
+// modern media controls, their script and style sheet from the user
+// agent bundles the build makes of Modules/modern-media-controls; their
+// icons from files: the directory MLX_WEBKIT_MEDIA_ICONS names, else
+// the source tree's images/adwaita under the working directory, else
+// /usr/share/mlx/voyager/media-controls.
+Vector<String, 2> RenderThemeAdwaita::mediaControlsScripts()
+{
+    return { StringImpl::createWithoutCopying(ModernMediaControlsJavaScript) };
+}
+
+Vector<String, 2> RenderThemeAdwaita::mediaControlsStyleSheets(const HTMLMediaElement&)
+{
+    if (m_mediaControlsStyleSheet.isEmpty())
+        m_mediaControlsStyleSheet = StringImpl::createWithoutCopying(ModernMediaControlsUserAgentStyleSheet);
+    return { m_mediaControlsStyleSheet };
+}
+
+static std::optional<Vector<uint8_t>> mediaControlsIconFile(const String& iconName, const String& iconType)
+{
+    auto fileName = makeString(iconName, '.', iconType);
+    Vector<String, 3> directories;
+    if (const char* given = getenv("MLX_WEBKIT_MEDIA_ICONS"))
+        directories.append(String::fromUTF8(given));
+    directories.append("projects/webkit/upstream/Source/WebCore/Modules/modern-media-controls/images/adwaita"_s);
+    directories.append("/usr/share/mlx/voyager/media-controls"_s);
+    for (auto& directory : directories) {
+        if (auto data = FileSystem::readEntireFile(FileSystem::pathByAppendingComponent(directory, fileName)))
+            return data;
+    }
+    return std::nullopt;
+}
+
+RefPtr<FragmentedSharedBuffer> RenderThemeAdwaita::mediaControlsImageDataForIconNameAndType(const String& iconName, const String& iconType)
+{
+    auto data = mediaControlsIconFile(iconName, iconType);
+    if (!data)
+        return nullptr;
+    return SharedBuffer::create(WTF::move(*data));
+}
+
+String RenderThemeAdwaita::mediaControlsBase64StringForIconNameAndType(const String& iconName, const String& iconType)
+{
+    auto data = mediaControlsIconFile(iconName, iconType);
+    if (!data)
+        return emptyString();
+    return base64EncodeToString(*data);
+}
+
+// m:ss, or h:mm:ss from an hour on.
+String RenderThemeAdwaita::mediaControlsFormattedStringForDuration(double durationInSeconds)
+{
+    if (!std::isfinite(durationInSeconds) || durationInSeconds < 0)
+        return "0:00"_s;
+    auto total = static_cast<uint64_t>(durationInSeconds);
+    auto seconds = total % 60;
+    auto minutes = (total / 60) % 60;
+    auto hours = total / 3600;
+    StringBuilder text;
+    if (hours) {
+        text.append(hours, ':');
+        if (minutes < 10)
+            text.append('0');
+    }
+    text.append(minutes, ':');
+    if (seconds < 10)
+        text.append('0');
+    text.append(seconds);
+    return text.toString();
+}
+#endif // ENABLE(VIDEO)
 
 
 // The system colours of std.ui.theme's palette for the scheme (light: the

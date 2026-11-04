@@ -53,3 +53,10 @@ they load (`fast/canvas/webgl/resources/`, `webgl/resources/` and its
 the GLib ports have their own), taken from the same revision;
 tools/check_webkit_mlx_webgl.sh runs them as the storage check runs its
 own, and skips them where there is no Vulkan driver.
+
+`selectors.txt` lists the dumpAsText tests of `fast/selectors` that pass
+(M8's CSS selector JIT; the list's header says why the others of the
+directory do not), with `fast/selectors/resources/html-link-type-tests.js`
+and their expected text, taken from the same revision;
+tools/check_webkit_mlx_selectors.sh runs them as the storage check runs
+its own.

@@ -1,0 +1,661 @@
+// tar: archives (POSIX ustar, on std.tar) made, listed and extracted,
+// plain or gzip (std.flate.gzip):
+//
+//   tar -cf ARCHIVE [-z] [-C DIR] PATH...   the files, directories and
+//                                           links at PATHs (directories
+//                                           with everything in them, in
+//                                           name order) into ARCHIVE
+//   tar -xf ARCHIVE [-z] [-C DIR]           ARCHIVE's members into the
+//                                           current (or DIR) directory
+//   tar -tf ARCHIVE [-z]                    ARCHIVE's member names
+//
+// The letters go together (`tar -czf out.tar.gz std`, `tar xzf
+// out.tar.gz`); -v names each member as it is handled; -z makes a gzip
+// archive (reading, a gzip one is told from a plain one by itself).
+// ARCHIVE "-" is standard output or input. Names are stored as given
+// without leading slashes (ustar's prefix when longer than 100 bytes;
+// GNU tar's long names are read); extracting, a name that leaves the
+// directory ("..") is passed over. Modes are kept (files, directories); owners
+// and times are not. 0, or 1 when something could not be done (said).
+const std = @import("std")
+const tar = @import("std.tar")
+const gzip = @import("std.flate.gzip")
+
+const CHUNK: usize = 65536
+const PATH_MAX: usize = 4096
+
+fn say(text: []const u8) -> void { _ = std.linux.write(2, text.pointer, text.length) }
+fn print(text: []const u8) -> void { _ = std.linux.write(1, text.pointer, text.length) }
+
+fn sayNumber(value: usize) -> void {
+    var buffer: [20]u8 = undefined
+    var n = value
+    var count: usize = 0
+    while true {
+        buffer[19 - count] = @intCast(u8, 48 + n % 10)
+        count += 1
+        n /= 10
+        if n == 0 { break }
+    }
+    say(buffer[20 - count..20])
+}
+
+fn complain(what: []const u8, path: []const u8) -> void {
+    say("tar: ")
+    say(path)
+    say(": ")
+    say(what)
+    say("\n")
+}
+
+// Where an archive is written: a file, or a gzip member in one.
+const Sink = struct {
+    file: std.fs.File
+    compressed: bool
+    writer: gzip.Writer
+    failed: bool
+
+    fn put(self: *Self, data: []const u8) -> bool {
+        if self.*.failed { return false }
+        var ok = false
+        if self.*.compressed { ok = gzip.write(&self.*.writer, data) } else { ok = std.fs.writeAllBytes(self.*.file, data.pointer, data.length) }
+        if !ok { self.*.failed = true }
+        return ok
+    }
+
+    fn zeros(self: *Self, count: usize) -> bool {
+        var block: [tar.BLOCK]u8 = undefined
+        var k: usize = 0
+        while k < tar.BLOCK {
+            block[k] = 0
+            k += 1
+        }
+        var left = count
+        while left > 0 {
+            const piece = if left < tar.BLOCK { left } else { tar.BLOCK }
+            if !self.put(block[0..piece]) { return false }
+            left -= piece
+        }
+        return true
+    }
+}
+
+// Where an archive is read from: a file, plain or gzip (the reader tells
+// them apart).
+const Source = struct {
+    reader: gzip.Reader
+    // Exactly `length` bytes into `into`; false at the end or on an error.
+    fn take(self: *Self, into: [*]u8, length: usize) -> bool {
+        var got: usize = 0
+        while got < length {
+            const amount = gzip.read(&self.*.reader, into + got, length - got)
+            if amount <= 0 { return false }
+            got += @intCast(usize, amount)
+        }
+        return true
+    }
+    // `length` bytes passed over.
+    fn skip(self: *Self, scratch: [*]u8, length: usize) -> bool {
+        var left = length
+        while left > 0 {
+            const piece = if left < CHUNK { left } else { CHUNK }
+            if !self.take(scratch, piece) { return false }
+            left -= piece
+        }
+        return true
+    }
+}
+
+const Options = struct {
+    action: u8
+    compress: bool
+    verbose: bool
+    archive: []const u8
+    directory: []const u8
+    firstPath: usize
+    pathCount: usize
+}
+
+var allocator: std.heap.Allocator = undefined // (per run)
+var options: Options = undefined // (per run)
+var chunk: [*]u8 = undefined // (per run)
+var sink: Sink = undefined // (per run)
+var source: Source = undefined // (per run)
+var leadingSlashSaid: bool = false // (per run)
+var longName: [PATH_MAX]u8 = undefined // (per run)
+var longNameLength: usize = 0 // (per run)
+var longLink: [PATH_MAX]u8 = undefined // (per run)
+var longLinkLength: usize = 0 // (per run)
+
+fn usage() -> u8 {
+    say("usage: tar -c|-x|-t [-z] [-v] -f ARCHIVE [-C DIR] [PATH...]\n")
+    return 1
+}
+
+// The options from the arguments: letters in a cluster (with or without
+// the dash), f and C taking the next argument; the rest are paths.
+fn parseOptions(arguments: [][*]const u8) -> bool {
+    const count = std.process.count(arguments)
+    options = Options.{ .action = 0, .compress = false, .verbose = false, .archive = "", .directory = "", .firstPath = 0, .pathCount = 0 }
+    var k: usize = 1
+    while k < count {
+        const argument = std.string.asSlice(std.process.argument(arguments, k))
+        const cluster = argument.length > 0 && (argument[0] == 45 || k == 1)
+        if !cluster || (argument.length == 1 && argument[0] == 45) {
+            if options.firstPath == 0 { options.firstPath = k }
+            options.pathCount += 1
+            k += 1
+            continue
+        }
+        var at: usize = if argument[0] == 45 { 1 } else { 0 }
+        while at < argument.length {
+            const letter = argument[at]
+            at += 1
+            if letter == 99 || letter == 120 || letter == 116 {
+                if options.action != 0 && options.action != letter {
+                    say("tar: one of -c, -x and -t\n")
+                    return false
+                }
+                options.action = letter
+            } else if letter == 122 { options.compress = true } else if letter == 118 { options.verbose = true } else if letter == 112 {
+                // -p: modes are kept always.
+            } else if letter == 102 || letter == 67 {
+                var value: []const u8 = argument[at..argument.length]
+                at = argument.length
+                if value.length == 0 {
+                    k += 1
+                    if k >= count {
+                        say("tar: -f and -C take an argument\n")
+                        return false
+                    }
+                    value = std.string.asSlice(std.process.argument(arguments, k))
+                }
+                if letter == 102 { options.archive = value } else { options.directory = value }
+            } else {
+                say("tar: unknown option -")
+                say(argument[at - 1..at])
+                say("\n")
+                return false
+            }
+        }
+        k += 1
+    }
+    return options.action != 0 && options.archive.length > 0
+}
+
+// `text` as a NUL-terminated path in `buffer`.
+fn terminate(buffer: *[PATH_MAX]u8, text: []const u8) -> bool {
+    if text.length >= PATH_MAX { return false }
+    var k: usize = 0
+    while k < text.length {
+        buffer.*[k] = text[k]
+        k += 1
+    }
+    buffer.*[text.length] = 0
+    return true
+}
+
+// ---- creating ----
+
+// `name` (the member's name) with a header of `kind`.
+fn header(name: []const u8, kind: u8, mode: usize, size: usize, modified: usize, link: []const u8) -> bool {
+    var block: [tar.BLOCK]u8 = undefined
+    const blockPointer: [*]u8 = &block
+    if !tar.writeHeader(blockPointer, name, kind, mode, size, modified, link) {
+        complain("the name is too long for the archive", name)
+        return false
+    }
+    if options.verbose {
+        say(name)
+        say("\n")
+    }
+    return sink.put(block[0..tar.BLOCK])
+}
+
+fn addFile(path: *[PATH_MAX]u8, name: []const u8, status: *const std.fs.Stat) -> bool {
+    const file = std.fs.open(path, std.fs.READ_ONLY, 0)
+    if !std.fs.isValid(file) {
+        complain("cannot be read", name)
+        return false
+    }
+    const size = @intCast(usize, status.*.size)
+    if !header(name, tar.FILE, @intCast(usize, status.*.mode) & 4095, size, @intCast(usize, status.*.modifiedSeconds), "") {
+        _ = std.fs.close(file)
+        return false
+    }
+    var left = size
+    while left > 0 {
+        const want = if left < CHUNK { left } else { CHUNK }
+        const got = std.fs.read(file, chunk, want)
+        if got <= 0 {
+            complain("ended before its size (changed while being read)", name)
+            _ = std.fs.close(file)
+            return false
+        }
+        if !sink.put(chunk[0..@intCast(usize, got)]) {
+            _ = std.fs.close(file)
+            return false
+        }
+        left -= @intCast(usize, got)
+    }
+    _ = std.fs.close(file)
+    return sink.zeros(tar.dataBlocks(size) - size)
+}
+
+fn addLink(path: *[PATH_MAX]u8, name: []const u8) -> bool {
+    var target: [PATH_MAX]u8 = undefined
+    const targetPointer: [*]u8 = &target
+    const length = std.fs.readLink(path, targetPointer, PATH_MAX)
+    if length <= 0 {
+        complain("the link cannot be read", name)
+        return false
+    }
+    return header(name, tar.SYMBOLIC_LINK, 511, 0, 0, target[0..@intCast(usize, length)])
+}
+
+fn before(names: [*]const u8, left: usize, right: usize) -> bool {
+    var k: usize = 0
+    while true {
+        const a = names[left + k]
+        const b = names[right + k]
+        if a != b { return a < b }
+        if a == 0 { return false }
+        k += 1
+    }
+    return false
+}
+
+// A directory's member, then its entries in name order.
+fn addDirectory(path: *[PATH_MAX]u8, length: usize, name: []const u8, status: *const std.fs.Stat) -> bool {
+    var slashed: [PATH_MAX + 1]u8 = undefined
+    var k: usize = 0
+    while k < name.length {
+        slashed[k] = name[k]
+        k += 1
+    }
+    slashed[name.length] = 47
+    if !header(slashed[0..name.length + 1], tar.DIRECTORY, @intCast(usize, status.*.mode) & 4095, 0, @intCast(usize, status.*.modifiedSeconds), "") { return false }
+    const directory = std.fs.open(path, std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(directory) {
+        complain("the directory cannot be read", name)
+        return false
+    }
+    // The names, NUL-terminated one after another, then sorted.
+    var names = std.fs.ArrayList.init(allocator, 4096)
+    const records = allocator.alloc(8192, 16)
+    if records == null { return false }
+    var entries = std.fs.entries(directory, records.?, 8192)
+    var entry: std.fs.Entry = undefined
+    var count: usize = 0
+    while std.fs.nextEntry(&entries, &entry) {
+        if std.fs.isDotName(entry.name) { continue }
+        names = names.appendSlice(std.string.asSlice(entry.name))
+        names = names.append(0)
+        count += 1
+    }
+    allocator.free(records.?, 8192, 16)
+    _ = std.fs.close(directory)
+    if entries.failed {
+        complain("the directory cannot be read", name)
+        names.deinit()
+        return false
+    }
+    var ok = true
+    if count > 0 {
+        const memory = allocator.alloc(count * 8, 8)
+        if memory == null { return false }
+        const offsets: [*]usize = unsafe { @ptrCast([*]usize, memory.?) }
+        var at: usize = 0
+        k = 0
+        while k < count {
+            offsets[k] = at
+            while names.items[at] != 0 { at += 1 }
+            at += 1
+            k += 1
+        }
+        // Insertion sort: directories are small.
+        k = 1
+        while k < count {
+            const moving = offsets[k]
+            var j = k
+            while j > 0 && before(names.items, moving, offsets[j - 1]) {
+                offsets[j] = offsets[j - 1]
+                j -= 1
+            }
+            offsets[j] = moving
+            k += 1
+        }
+        k = 0
+        while k < count && ok {
+            var end = offsets[k]
+            while names.items[end] != 0 { end += 1 }
+            const child = names.items[offsets[k]..end]
+            if length + 1 + child.length >= PATH_MAX {
+                complain("the path is too long", child)
+                ok = false
+                break
+            }
+            path.*[length] = 47
+            var c: usize = 0
+            while c < child.length {
+                path.*[length + 1 + c] = child[c]
+                c += 1
+            }
+            path.*[length + 1 + child.length] = 0
+            ok = addPath(path, length + 1 + child.length, name.length + 1 + child.length, ok)
+            k += 1
+        }
+        path.*[length] = 0
+        allocator.free(memory.?, count * 8, 8)
+    }
+    names.deinit()
+    return ok
+}
+
+// What is at `path` (`length` bytes, NUL-terminated; the member name is
+// its last `nameLength` bytes) into the archive.
+fn addPath(path: *[PATH_MAX]u8, length: usize, nameLength: usize, okSoFar: bool) -> bool {
+    if !okSoFar { return false }
+    const pathPointer: [*]const u8 = path
+    const name = pathPointer[length - nameLength..length]
+    var status: std.fs.Stat = undefined
+    if std.fs.statusAt(path, &status, true) != 0 {
+        complain("not found", name)
+        return false
+    }
+    const kind = status.mode & 61440
+    if kind == 16384 { return addDirectory(path, length, name, &status) }
+    if kind == 32768 { return addFile(path, name, &status) }
+    if kind == 40960 { return addLink(path, name) }
+    complain("neither a file, a directory nor a link: not archived", name)
+    return true
+}
+
+fn create(arguments: [][*]const u8) -> u8 {
+    sink.failed = false
+    sink.compressed = options.compress
+    if options.archive.length == 1 && options.archive[0] == 45 {
+        sink.file = std.fs.File.{ .descriptor = 1 }
+    } else {
+        var archivePath: [PATH_MAX]u8 = undefined
+        if !terminate(&archivePath, options.archive) { return usage() }
+        sink.file = std.fs.open(&archivePath, std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, 420)
+        if !std.fs.isValid(sink.file) {
+            complain("cannot be written", options.archive)
+            return 1
+        }
+    }
+    if options.compress && !gzip.writerInit(&sink.writer, allocator, sink.file, false, 6) {
+        say("tar: no memory for the compressor\n")
+        return 1
+    }
+    if options.directory.length > 0 {
+        var directory: [PATH_MAX]u8 = undefined
+        if !terminate(&directory, options.directory) || !std.fs.changeDirectory(&directory) {
+            complain("cannot change to the directory", options.directory)
+            return 1
+        }
+    }
+    var ok = options.pathCount > 0
+    if !ok { say("tar: nothing to archive\n") }
+    var k = options.firstPath
+    var seen: usize = 0
+    while seen < options.pathCount && ok {
+        const argument = std.string.asSlice(std.process.argument(arguments, k))
+        k += 1
+        if argument.length > 0 && argument[0] == 45 && argument.length > 1 { continue }
+        seen += 1
+        // Leading slashes go (the name is relative in the archive).
+        var start: usize = 0
+        while start < argument.length && argument[start] == 47 { start += 1 }
+        if start > 0 && !leadingSlashSaid {
+            say("tar: leading slashes left out of the names\n")
+            leadingSlashSaid = true
+        }
+        var end = argument.length
+        while end > start + 1 && argument[end - 1] == 47 { end -= 1 }
+        var path: [PATH_MAX]u8 = undefined
+        if !terminate(&path, argument) { return usage() }
+        const name = argument[start..end]
+        var c: usize = 0
+        while c < name.length {
+            path[c] = name[c]
+            c += 1
+        }
+        // (The path as given opens it: "/x" or "x".)
+        if start > 0 {
+            path[0] = 47
+            c = 0
+            while c < name.length {
+                path[1 + c] = name[c]
+                c += 1
+            }
+            path[1 + name.length] = 0
+            ok = addPath(&path, 1 + name.length, name.length, ok)
+        } else {
+            path[name.length] = 0
+            ok = addPath(&path, name.length, name.length, ok)
+        }
+    }
+    if ok { ok = sink.zeros(2 * tar.BLOCK) }
+    if options.compress { ok = gzip.writerClose(&sink.writer) && ok }
+    if sink.file.descriptor != 1 { _ = std.fs.close(sink.file) }
+    if sink.failed { say("tar: the archive could not be written\n") }
+    return if ok { 0 } else { 1 }
+}
+
+// ---- extracting and listing ----
+
+// The directories of `path` up to `end` made (each that is not there).
+fn makeParents(path: *[PATH_MAX]u8, end: usize) -> bool {
+    var k: usize = 1
+    while k < end {
+        if path.*[k] == 47 {
+            path.*[k] = 0
+            const made = std.fs.makeDirResult(path, 493)
+            path.*[k] = 47
+            if made != 0 && made != -17 { return false }
+        }
+        k += 1
+    }
+    return true
+}
+
+// Whether a member's name may be extracted: not empty, not leaving the
+// directory. Leading "./" and "/" are taken off (`start`).
+fn safeName(name: []const u8, start: *usize) -> bool {
+    var at: usize = 0
+    while at < name.length && (name[at] == 47 || (name[at] == 46 && at + 1 < name.length && name[at + 1] == 47)) {
+        at += if name[at] == 47 { 1 } else { 2 }
+    }
+    start.* = at
+    if at >= name.length { return false }
+    var k = at
+    while k < name.length {
+        if name[k] == 46 && k + 1 < name.length && name[k + 1] == 46 && (k == at || name[k - 1] == 47) && (k + 2 == name.length || name[k + 2] == 47) { return false }
+        k += 1
+    }
+    return true
+}
+
+fn extractFile(path: *[PATH_MAX]u8, name: []const u8, item: *const tar.Header) -> bool {
+    if !makeParents(path, name.length) {
+        complain("the directories cannot be made", name)
+        return false
+    }
+    const file = std.fs.open(path, std.fs.WRITE_ONLY | std.fs.CREATE | std.fs.TRUNCATE, item.*.mode)
+    if !std.fs.isValid(file) {
+        complain("cannot be written", name)
+        return false
+    }
+    var left = item.*.size
+    var ok = true
+    while left > 0 && ok {
+        const piece = if left < CHUNK { left } else { CHUNK }
+        if !source.take(chunk, piece) {
+            complain("the archive ends inside the file", name)
+            ok = false
+            break
+        }
+        if !std.fs.writeAllBytes(file, chunk, piece) {
+            complain("cannot be written", name)
+            ok = false
+            break
+        }
+        left -= piece
+    }
+    _ = std.fs.close(file)
+    if ok && !std.fs.chmod(path, item.*.mode) { ok = true }
+    return ok
+}
+
+fn extractDirectory(path: *[PATH_MAX]u8, name: []const u8, item: *const tar.Header) -> bool {
+    if !makeParents(path, name.length) {
+        complain("the directories cannot be made", name)
+        return false
+    }
+    const made = std.fs.makeDirResult(path, item.*.mode | 448)
+    if made != 0 && made != -17 {
+        complain("the directory cannot be made", name)
+        return false
+    }
+    return true
+}
+
+fn extractLink(path: *[PATH_MAX]u8, name: []const u8, item: *const tar.Header) -> bool {
+    if !makeParents(path, name.length) {
+        complain("the directories cannot be made", name)
+        return false
+    }
+    var target: [PATH_MAX]u8 = undefined
+    if !terminate(&target, tar.headerLink(item)) { return false }
+    _ = std.fs.delete(path)
+    if !std.fs.symbolicLink(&target, path) {
+        complain("the link cannot be made", name)
+        return false
+    }
+    return true
+}
+
+fn extract() -> u8 {
+    if options.archive.length == 1 && options.archive[0] == 45 {
+        if !gzip.readerInit(&source.reader, allocator, std.fs.File.{ .descriptor = 0 }, false) {
+            say("tar: no memory for the decompressor\n")
+            return 1
+        }
+    } else {
+        var archivePath: [PATH_MAX]u8 = undefined
+        if !terminate(&archivePath, options.archive) { return usage() }
+        if !gzip.openRead(&source.reader, allocator, &archivePath) {
+            complain("cannot be read", options.archive)
+            return 1
+        }
+    }
+    if options.action == 120 && options.directory.length > 0 {
+        var directory: [PATH_MAX]u8 = undefined
+        if !terminate(&directory, options.directory) || !std.fs.changeDirectory(&directory) {
+            complain("cannot change to the directory", options.directory)
+            return 1
+        }
+    }
+    var ok = true
+    var members: usize = 0
+    var block: [tar.BLOCK]u8 = undefined
+    const blockPointer: [*]u8 = &block
+    while ok {
+        if !source.take(blockPointer, tar.BLOCK) {
+            if gzip.readerError(&source.reader) != gzip.Error.none {
+                say("tar: the archive is damaged\n")
+                ok = false
+            } else if members == 0 {
+                say("tar: not a tar archive\n")
+                ok = false
+            }
+            break
+        }
+        var item: tar.Header = undefined
+        if !tar.parseHeader(blockPointer, &item) { break }
+        members += 1
+        if item.kind == tar.LONG_NAME || item.kind == tar.LONG_LINK {
+            // GNU: the next member's name (or link target) is this one's data.
+            const into: *[PATH_MAX]u8 = if item.kind == tar.LONG_NAME { &longName } else { &longLink }
+            const length: *usize = if item.kind == tar.LONG_NAME { &longNameLength } else { &longLinkLength }
+            if item.size >= PATH_MAX {
+                say("tar: a name is too long\n")
+                ok = false
+                break
+            }
+            ok = source.take(into, item.size) && source.skip(chunk, tar.dataBlocks(item.size) - item.size)
+            length.* = item.size
+            while length.* > 0 && into.*[length.* - 1] == 0 { length.* -= 1 }
+            continue
+        }
+        var given = tar.headerName(&item)
+        if longNameLength > 0 {
+            const bytes: [*]const u8 = &longName
+            given = bytes[0..longNameLength]
+            longNameLength = 0
+        }
+        if longLinkLength > 0 {
+            const bytes: [*]const u8 = &longLink
+            var k: usize = 0
+            while k < longLinkLength && k < 100 {
+                item.linkBytes[k] = bytes[k]
+                k += 1
+            }
+            item.linkLength = k
+            longLinkLength = 0
+        }
+        if options.action == 116 {
+            print(given)
+            print("\n")
+            ok = source.skip(chunk, tar.dataBlocks(item.size))
+            continue
+        }
+        var start: usize = 0
+        if !safeName(given, &start) {
+            complain("not extracted (the name leaves the directory)", given)
+            ok = source.skip(chunk, tar.dataBlocks(item.size))
+            continue
+        }
+        var end = given.length
+        if item.kind == tar.DIRECTORY && end > start && given[end - 1] == 47 { end -= 1 }
+        const name = given[start..end]
+        var path: [PATH_MAX]u8 = undefined
+        if !terminate(&path, name) {
+            complain("the name is too long", name)
+            ok = false
+            break
+        }
+        if options.verbose {
+            say(name)
+            say("\n")
+        }
+        if item.kind == tar.FILE {
+            ok = extractFile(&path, name, &item)
+            if ok { ok = source.skip(chunk, tar.dataBlocks(item.size) - item.size) }
+        } else if item.kind == tar.DIRECTORY {
+            ok = extractDirectory(&path, name, &item)
+        } else if item.kind == tar.SYMBOLIC_LINK {
+            ok = extractLink(&path, name, &item)
+        } else {
+            ok = source.skip(chunk, tar.dataBlocks(item.size))
+        }
+    }
+    gzip.readerClose(&source.reader)
+    return if ok { 0 } else { 1 }
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if !parseOptions(arguments) { return usage() }
+    allocator = std.heap.allocator()
+    const memory = allocator.alloc(CHUNK, 16)
+    if memory == null {
+        say("tar: no memory\n")
+        return 1
+    }
+    chunk = memory.?
+    const result = if options.action == 99 { create(arguments) } else { extract() }
+    allocator.free(chunk, CHUNK, 16)
+    return result
+}

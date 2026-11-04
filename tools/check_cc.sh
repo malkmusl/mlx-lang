@@ -20,6 +20,11 @@
 #     path to the libm built next to it): no GNU code
 #     between the C source and the running process; and one built with
 #     --dynamic-linker naming mlxlibc starts on it by itself;
+#   - tests/pasconfig.c, libpas's shape (a configuration built as a
+#     compound literal, passed by value down always_inline calls): in the
+#     LIR of `allocate` after optimization there is no copy of it and no
+#     zeroing left (region_loads.mlx), and its frame holds no place
+#     (frame.mlx);
 #   - separate compilation: every program again from objects (-c, one
 #     per .c file; the second file through an archive mlx-ar made, found
 #     by -L and -l) linked by mlx-cc, printing the same on glibc and on
@@ -71,6 +76,15 @@ for name in "${programs[@]}"; do
     cmp -s "$tests/$name.expected" "$work/$name.out" || fail "$name prints otherwise (expected < > got): $(diff "$tests/$name.expected" "$work/$name.out" | head -12)"
 done
 echo "ok   ${#programs[@]} programs compile and run as expected: ${programs[*]}"
+
+# libpas's configuration: built on the stack at every call before
+# (12 µs an allocation in bmalloc), now folded into its fields' values.
+MLX_CC_LIR_TRACE=1 "$cc" -c -o "$work/pasconfig.o" "$tests/pasconfig.c" 2> "$work/pasconfig.trace" || fail "pasconfig.c does not compile with the LIR trace"
+left=$(awk '/^lir optimized allocate:/ {on = 1; next} on && /^lir/ {exit} on && ($2 == "mem_copy" || $2 == "external") {n++} END {print n + 0}' "$work/pasconfig.trace")
+[[ $left == 0 ]] || fail "pasconfig: $left copies or zeroings of the configuration are left in allocate"
+frame=$(sed -n 's/^lir: frame of allocate: [0-9]* bytes compacted to \([0-9]*\),.*/\1/p' "$work/pasconfig.trace")
+[[ $frame == 0 ]] || fail "pasconfig: allocate's frame keeps ${frame:-all its} bytes of places"
+echo "ok   pasconfig: allocate copies and zeroes no configuration, and its frame holds no place"
 
 # The variants: what each predefines, as gcc does.
 variants=0

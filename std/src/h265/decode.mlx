@@ -1,0 +1,4572 @@
+// std.h265.decode: H.265 / HEVC decoded on the CPU (ITU-T H.265 clause 8):
+// the Main and Main 10 profiles, 4:2:0 (and 4:0:0), every picture size up
+// to 8192x4320, I, P and B slices, slice segments, tiles and wavefront
+// substreams, PCM, transform skip, lossless coding units. std.h265 reads
+// the parameter sets and keeps the decoded picture buffer (its slots, the
+// reference picture sets, the output order); this module decodes each
+// picture's slice segments into its slot's planes:
+//
+//     const d = decode.create(allocator)
+//     h265.accessUnit(h, sample, length, 4)   (h.picture: the slot)
+//     decode.decodePicture(d, h, sample)       (the slices into the slot)
+//     h265.finishPicture(h)
+//     while h265.nextOutput(h, &slot, &poc) { decode.planes(d, slot) ... }
+//
+// Samples are kept as 16-bit values whatever the bit depth; planes8()
+// gives a picture's 8-bit planes (10-bit ones rounded). A Pool decodes
+// several pictures at once on threads (submit(), nextReady(); see
+// "Decoding on threads" below).
+//
+// The parts: the slice segment header in full (7.3.6), the reference
+// picture lists (8.3.4), the coding tree read by CABAC (9.3; the contexts
+// in the order of tables.mlx), intra prediction (8.4.4.2), inter
+// prediction with merge, AMVP and temporal motion vectors (8.5.3) and
+// weighted samples, scaling and the inverse transforms (8.6), the
+// deblocking filter (8.7.2) and sample adaptive offset (8.7.3).
+const h265 = @import("../h265.mlx")
+const video = @import("../vulkan/video.mlx")
+const tables = @import("./tables.mlx")
+const cabacTables = @import("../h264/tables.mlx")
+const bits_module = @import("../h264/bits.mlx")
+const allocator_module = @import("../../bootstrap/allocator.mlx")
+const linux = @import("../../bootstrap/os/linux.mlx")
+const thread = @import("../../bootstrap/os/linux/thread.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const Bits = bits_module.Bits
+pub const Status = h265.Status
+
+pub const MAX_REFS: usize = 16
+
+// Prediction modes and partitions.
+const MODE_INTER: u8 = 0
+const MODE_INTRA: u8 = 1
+const MODE_SKIP: u8 = 2
+
+const PART_2Nx2N: u32 = 0
+const PART_2NxN: u32 = 1
+const PART_Nx2N: u32 = 2
+const PART_NxN: u32 = 3
+const PART_2NxnU: u32 = 4
+const PART_2NxnD: u32 = 5
+const PART_nLx2N: u32 = 6
+const PART_nRx2N: u32 = 7
+
+// A slot's picture: its planes and, for later pictures' temporal motion
+// vectors, its motion per 4x4 block.
+pub const Frame = struct {
+    allocated: bool
+    planes: [3][*]u16
+    sizes: [3]usize
+    width: u32
+    height: u32
+    // Per 4x4 block: the motion of list 0 and 1 (x, y), the reference
+    // index (-1: none), the referenced picture's POC and whether it was
+    // long-term; intra.
+    mv: [*]i16
+    refIdx: [*]i8
+    refPoc: [*]i32
+    refLong: [*]u8
+    intra: [*]u8
+    blocks: usize
+    bitDepth: u32
+    // The conformance window of its SPS: luma samples cropped left, top,
+    // right, bottom.
+    crop: [4]u32
+    poc: i32
+    id: u32
+    // Decoding on a Pool's threads: luma rows final (loop filtered) and
+    // rows whose motion is stored; 1 while a picture is written into the
+    // frame; the pictures in flight reading it as a reference.
+    progress: u32
+    motionRows: u32
+    writing: u32
+    readers: u32
+}
+
+// A slice segment header in full (7.3.6.1) and what it derives.
+pub const Header = struct {
+    first: bool
+    noOutputOfPriorPics: bool
+    ppsId: u32
+    dependent: bool
+    address: u32
+    sliceType: u32
+    picOutputFlag: bool
+    pocLsb: u32
+    saoLuma: bool
+    saoChroma: bool
+    temporalMvp: bool
+    active: [2]u32
+    // ref_pic_lists_modification: list_entry per index (or none).
+    modify: [2]bool
+    entries: [2][16]u32
+    mvdL1Zero: bool
+    cabacInit: bool
+    colFromL0: bool
+    colRefIdx: u32
+    // pred_weight_table.
+    lumaLog2: u32
+    chromaLog2: u32
+    lumaWeight: [2][16]i32
+    lumaOffset: [2][16]i32
+    chromaWeight: [2][16][2]i32
+    chromaOffset: [2][16][2]i32
+    maxMergeCand: u32
+    qpDelta: i32
+    cbQpOffset: i32
+    crQpOffset: i32
+    deblockingDisabled: bool
+    betaOffset: i32
+    tcOffset: i32
+    loopFilterAcross: bool
+    // NumPicTotalCurr and the reference picture set's current lists'
+    // lengths.
+    totalCurr: u32
+    stBefore: u32
+    stAfter: u32
+    ltCurr: u32
+}
+
+// The deblocking and SAO settings of a slice, kept per CTB.
+const CtbInfo = struct {
+    sliceAddr: i32
+    tile: u32
+    deblockingDisabled: bool
+    betaOffset: i32
+    tcOffset: i32
+    loopFilterAcross: bool
+    // SAO per component: type (0 none, 1 band, 2 edge), band position or
+    // edge class, four offsets.
+    saoType: [3]u8
+    saoClass: [3]u8
+    saoOffset: [3][4]i16
+}
+
+pub const Decoder = struct {
+    allocator: Allocator
+    // The slots' frames: the decoder's own, or (a Pool's workers) the
+    // pool's.
+    frames: [*]Frame
+    ownsFrames: bool
+    // A Pool's worker: waits for references' rows, tells its progress.
+    threaded: bool
+    // CTB rows loop filtered so far (in raster order without tiles, else
+    // at the picture's end); whether SAO may apply (rows are kept for
+    // it).
+    rowWise: bool
+    rowsDecoded: u32
+    rowsFiltered: u32
+    pictureSao: bool
+    sps: *h265.Sps
+    pps: *h265.Pps
+    // The sequence's geometry.
+    width: u32
+    height: u32
+    chromaFormat: u32
+    bitDepth: u32
+    bitDepthC: u32
+    log2Ctb: u32
+    ctbSize: u32
+    log2MinCb: u32
+    log2MinTb: u32
+    log2MaxTb: u32
+    ctbW: u32
+    ctbH: u32
+    ctbCount: u32
+    // Per 4x4 block of the picture.
+    blocksW: u32
+    blocksH: u32
+    // CTB addressing (6.5.1): raster to tile scan and back, tile ids,
+    // the tiles' column and row boundaries.
+    rsToTs: [*]u32
+    tsToRs: [*]u32
+    tileId: [*]u32
+    colBd: [21]u32
+    rowBd: [23]u32
+    // MinTbAddrZs per 4x4 block (6.5.2).
+    zscan: [*]u32
+    // Per CTB.
+    ctbs: [*]CtbInfo
+    // Per 4x4 block: coding tree depth, skip flag, prediction mode, luma
+    // intra mode, QpY, loop filter off (PCM or lossless), coded luma
+    // residual, edges (bit 0 vertical TU, 1 vertical PU, 2 horizontal TU,
+    // 3 horizontal PU), the deblocking bS of the left and top edges.
+    ctDepth: [*]u8
+    skip: [*]u8
+    predMode: [*]u8
+    intraMode: [*]u8
+    qp: [*]i8
+    noFilter: [*]u8
+    coded: [*]u8
+    edges: [*]u8
+    bsV: [*]u8
+    bsH: [*]u8
+    mapBytes: usize
+    // A copy of the deblocked picture for SAO.
+    saoCopy: [3][*]u16
+    saoBytes: usize
+    // The picture.
+    slot: usize
+    frame: *Frame
+    poc: i32
+    nextId: u32
+    header: Header
+    sliceAddr: i32
+    // The reference picture lists: slots, POCs, long-term, per list.
+    refs: [2][MAX_REFS]usize
+    refPocs: [2][MAX_REFS]i32
+    refLong: [2][MAX_REFS]bool
+    refCount: [2]u32
+    noBackwardPred: bool
+    // The entropy decoder: the RBSP, codIRange, codIOffset, the contexts
+    // ((pStateIdx << 1) | valMps) and those kept for the wavefront.
+    bits: Bits
+    range: u32
+    offset: u32
+    contexts: [tables.CONTEXTS]u8
+    wppContexts: [tables.CONTEXTS]u8
+    // The contexts at the last slice segment's end (a dependent segment
+    // goes on with them).
+    dsContexts: [tables.CONTEXTS]u8
+    ctbAddrRs: u32
+    // The next quantization group's qPY_PREV is the slice's QP (a slice,
+    // tile or wavefront row began).
+    qgReset: bool
+    maxTrafoDepth: u32
+    intraSplit: bool
+    // The coding unit being decoded.
+    qpY: i32
+    qpYPred: i32
+    // qPY_PREV: QpY of the last coding unit decoded.
+    qpPrev: i32
+    cuQpDeltaCoded: bool
+    cuQpDelta: i32
+    bypass: bool
+    cuPredMode: u8
+    partMode: u32
+    intraModes: [4]u32
+    intraChroma: u32
+    mergeFlag: bool
+    // Scratch: the coefficients and residual of a transform block, the
+    // transform's intermediate, a reference block for interpolation, the
+    // two lists' predictions, intra reference samples.
+    coefficients: [1024]i32
+    residual: [1024]i32
+    intermediate: [1024]i32
+    window: [5184]u16
+    filtered: [5184]i32
+    pred0: [4096]i32
+    pred1: [4096]i32
+    refTop: [129]i32
+    refLine: [257]i32
+    // The scaling factors in force, per size, matrix and position
+    // (raster): 4x4, 8x8, 16x16 and 32x32 (the 8x8 list and the DC).
+    scaling: [4][6][64]i32
+    scalingDc: [4][6]i32
+    // 8-bit planes for planes8().
+    out8: [3][*]u8
+    out8Bytes: [3]usize
+    decoded: u64
+    // What prepare() last sized for: the std.h265 decoder, its parameter
+    // sets' generation, the PPS.
+    preparedFor: usize
+    preparedGeneration: u32
+    preparedPps: usize
+}
+
+fn zero(target: [*]u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        target[index] = 0
+        index += 1
+    }
+}
+
+fn copyBytes(target: [*]u8, source: [*]const u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        target[index] = source[index]
+        index += 1
+    }
+}
+
+fn clip3(low: i32, high: i32, value: i32) -> i32 {
+    if value < low { return low }
+    if value > high { return high }
+    return value
+}
+
+fn absolute(value: i32) -> i32 { return if value < 0 { -value } else { value } }
+fn minimum(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+fn maximum(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+fn shl(value: i32, count: i32) -> i32 { return value << @intCast(u5, count) }
+fn shr(value: i32, count: i32) -> i32 { return value >> @intCast(u5, count) }
+fn sign(value: i32) -> i32 {
+    if value > 0 { return 1 }
+    if value < 0 { return -1 }
+    return 0
+}
+
+pub fn create(allocator: Allocator) -> ?*Decoder {
+    const frames = allocator.alloc(h265.SLOTS * @sizeOf(Frame), 16)
+    if frames == null { return null }
+    zero(frames.?, h265.SLOTS * @sizeOf(Frame))
+    var shared: [*]Frame = undefined
+    unsafe { shared = @ptrCast([*]Frame, frames.?) }
+    const d = createSharing(allocator, shared)
+    if d == null {
+        allocator.free(frames.?, h265.SLOTS * @sizeOf(Frame), 16)
+        return null
+    }
+    d.?.*.ownsFrames = true
+    return d
+}
+
+// A decoder whose frames are `frames` (another's).
+fn createSharing(allocator: Allocator, frames: [*]Frame) -> ?*Decoder {
+    const memory = allocator.alloc(@sizeOf(Decoder), 16)
+    if memory == null { return null }
+    var d: *Decoder = undefined
+    unsafe { d = @ptrCast(*Decoder, memory.?) }
+    unsafe { zero(@ptrCast([*]u8, d), @sizeOf(Decoder)) }
+    d.*.allocator = allocator
+    d.*.frames = frames
+    bits_module.init(&d.*.bits, allocator)
+    d.*.nextId = 1
+    return d
+}
+
+fn freeFrame(d: *Decoder, frame: *Frame) -> void {
+    if !frame.*.allocated { return }
+    const a = d.*.allocator
+    var c: usize = 0
+    while c < 3 {
+        if frame.*.sizes[c] != 0 { unsafe { a.free(@ptrCast([*]u8, frame.*.planes[c]), frame.*.sizes[c] * 2, 16) } }
+        c += 1
+    }
+    unsafe {
+        a.free(@ptrCast([*]u8, frame.*.mv), frame.*.blocks * 8, 16)
+        a.free(@ptrCast([*]u8, frame.*.refIdx), frame.*.blocks * 2, 16)
+        a.free(@ptrCast([*]u8, frame.*.refPoc), frame.*.blocks * 8, 16)
+    }
+    a.free(frame.*.refLong, frame.*.blocks * 2, 16)
+    a.free(frame.*.intra, frame.*.blocks, 16)
+    frame.*.allocated = false
+}
+
+fn freeMaps(d: *Decoder) -> void {
+    if d.*.mapBytes == 0 { return }
+    const a = d.*.allocator
+    const blocks = d.*.mapBytes
+    unsafe {
+        a.free(@ptrCast([*]u8, d.*.rsToTs), @intCast(usize, d.*.ctbCount) * 4, 16)
+        a.free(@ptrCast([*]u8, d.*.tsToRs), @intCast(usize, d.*.ctbCount) * 4, 16)
+        a.free(@ptrCast([*]u8, d.*.tileId), @intCast(usize, d.*.ctbCount) * 4, 16)
+        a.free(@ptrCast([*]u8, d.*.ctbs), @intCast(usize, d.*.ctbCount) * @sizeOf(CtbInfo), 16)
+        a.free(@ptrCast([*]u8, d.*.zscan), blocks * 4, 16)
+        a.free(@ptrCast([*]u8, d.*.qp), blocks, 16)
+    }
+    a.free(d.*.ctDepth, blocks, 16)
+    a.free(d.*.skip, blocks, 16)
+    a.free(d.*.predMode, blocks, 16)
+    a.free(d.*.intraMode, blocks, 16)
+    a.free(d.*.noFilter, blocks, 16)
+    a.free(d.*.coded, blocks, 16)
+    a.free(d.*.edges, blocks, 16)
+    a.free(d.*.bsV, blocks, 16)
+    a.free(d.*.bsH, blocks, 16)
+    var c: usize = 0
+    while c < 3 {
+        if d.*.saoBytes != 0 {
+            const size = if c == 0 { d.*.saoBytes } else { d.*.saoBytes / 4 }
+            unsafe { a.free(@ptrCast([*]u8, d.*.saoCopy[c]), size * 2, 16) }
+        }
+        if d.*.out8Bytes[c] != 0 { a.free(d.*.out8[c], d.*.out8Bytes[c], 16) }
+        d.*.out8Bytes[c] = 0
+        c += 1
+    }
+    d.*.saoBytes = 0
+    d.*.mapBytes = 0
+}
+
+pub fn destroy(d: *Decoder) -> void {
+    if d.*.ownsFrames {
+        var slot: usize = 0
+        while slot < h265.SLOTS {
+            freeFrame(d, &d.*.frames[slot])
+            slot += 1
+        }
+        unsafe { d.*.allocator.free(@ptrCast([*]u8, d.*.frames), h265.SLOTS * @sizeOf(Frame), 16) }
+    }
+    freeMaps(d)
+    bits_module.deinit(&d.*.bits)
+    unsafe { d.*.allocator.free(@ptrCast([*]u8, d), @sizeOf(Decoder), 16) }
+}
+
+// The planes of a slot's picture (16-bit samples, `bitDepth` of them
+// used): luma (width x height), then Cb and Cr (half each way).
+pub const Planes = struct {
+    y: [*]const u16
+    cb: [*]const u16
+    cr: [*]const u16
+    width: u32
+    height: u32
+    bitDepth: u32
+    // Luma samples outside the conformance window: left, top, right,
+    // bottom.
+    crop: [4]u32
+}
+
+pub fn planes(d: *Decoder, slot: usize) -> Planes {
+    const frame = &d.*.frames[slot]
+    return Planes.{ .y = frame.*.planes[0], .cb = frame.*.planes[1], .cr = frame.*.planes[2], .width = frame.*.width, .height = frame.*.height, .bitDepth = frame.*.bitDepth, .crop = frame.*.crop }
+}
+
+// The 8-bit planes of a slot's picture (rounded from 10 bits), in
+// buffers of the decoder's kept until the next call; false without
+// memory.
+pub fn planes8(d: *Decoder, slot: usize, y: *[*]const u8, cb: *[*]const u8, cr: *[*]const u8) -> bool {
+    const frame = &d.*.frames[slot]
+    if !frame.*.allocated { return false }
+    var c: usize = 0
+    while c < 3 {
+        const size = frame.*.sizes[c]
+        if size > d.*.out8Bytes[c] {
+            if d.*.out8Bytes[c] != 0 { d.*.allocator.free(d.*.out8[c], d.*.out8Bytes[c], 16) }
+            d.*.out8Bytes[c] = 0
+            const memory = d.*.allocator.alloc(size, 16)
+            if memory == null { return false }
+            d.*.out8[c] = memory.?
+            d.*.out8Bytes[c] = size
+        }
+        const source = frame.*.planes[c]
+        const target = d.*.out8[c]
+        const depth = frame.*.bitDepth
+        var k: usize = 0
+        if depth == 8 {
+            while k < size {
+                target[k] = @intCast(u8, source[k])
+                k += 1
+            }
+        } else {
+            const shift = @intCast(u4, depth - 8)
+            const round = @intCast(u32, 1) << @intCast(u5, depth - 9)
+            while k < size {
+                var value = (@intCast(u32, source[k]) + round) >> shift
+                if value > 255 { value = 255 }
+                target[k] = @intCast(u8, value)
+                k += 1
+            }
+        }
+        c += 1
+    }
+    y.* = d.*.out8[0]
+    cb.* = d.*.out8[1]
+    cr.* = d.*.out8[2]
+    return true
+}
+
+// ---- The entropy decoder (9.3.4.3) ----
+
+fn cabacStart(d: *Decoder) -> void {
+    bits_module.alignToByte(&d.*.bits)
+    d.*.range = 510
+    d.*.offset = bits_module.read(&d.*.bits, 9)
+}
+
+// The contexts' initial states for the slice (9.3.2.2).
+fn initContexts(d: *Decoder) -> void {
+    var initType: usize = 0
+    if d.*.header.sliceType == h265.SLICE_P { initType = if d.*.header.cabacInit { 2 } else { 1 } }
+    if d.*.header.sliceType == h265.SLICE_B { initType = if d.*.header.cabacInit { 1 } else { 2 } }
+    const qp = clip3(0, 51, sliceQp(d))
+    var ctx: usize = 0
+    while ctx < tables.CONTEXTS {
+        const value = @intCast(i32, tables.INIT_VALUES[initType * tables.CONTEXTS + ctx])
+        const m = (value >> 4) * 5 - 45
+        const n = ((value & 15) << 3) - 16
+        const pre = clip3(1, 126, ((m * qp) >> 4) + n)
+        if pre <= 63 {
+            d.*.contexts[ctx] = @intCast(u8, (63 - pre) << 1)
+        } else {
+            d.*.contexts[ctx] = @intCast(u8, ((pre - 64) << 1) | 1)
+        }
+        ctx += 1
+    }
+}
+
+fn sliceQp(d: *Decoder) -> i32 { return 26 + @intCast(i32, d.*.pps.*.std.init_qp_minus26) + d.*.header.qpDelta }
+
+fn decision(d: *Decoder, ctx: usize) -> u32 {
+    const state = @intCast(u32, d.*.contexts[ctx])
+    const p = state >> 1
+    var mps = state & 1
+    const q = (d.*.range >> 6) & 3
+    const lps = @intCast(u32, cabacTables.RANGE_LPS[@intCast(usize, p * 4 + q)])
+    d.*.range -= lps
+    var bin: u32 = 0
+    if d.*.offset >= d.*.range {
+        bin = 1 - mps
+        d.*.offset -= d.*.range
+        d.*.range = lps
+        if p == 0 { mps = 1 - mps }
+        d.*.contexts[ctx] = @intCast(u8, (@intCast(u32, cabacTables.NEXT_LPS[@intCast(usize, p)]) << 1) | mps)
+    } else {
+        bin = mps
+        d.*.contexts[ctx] = @intCast(u8, (@intCast(u32, cabacTables.NEXT_MPS[@intCast(usize, p)]) << 1) | mps)
+    }
+    while d.*.range < 256 {
+        d.*.range <<= 1
+        d.*.offset = (d.*.offset << 1) | bits_module.read(&d.*.bits, 1)
+    }
+    return bin
+}
+
+fn bypass(d: *Decoder) -> u32 {
+    d.*.offset = (d.*.offset << 1) | bits_module.read(&d.*.bits, 1)
+    if d.*.offset >= d.*.range {
+        d.*.offset -= d.*.range
+        return 1
+    }
+    return 0
+}
+
+// `count` bypass bins, the first the highest bit.
+fn bypassBits(d: *Decoder, count: u32) -> u32 {
+    var value: u32 = 0
+    var k: u32 = 0
+    while k < count {
+        value = (value << 1) | bypass(d)
+        k += 1
+    }
+    return value
+}
+
+fn terminate(d: *Decoder) -> u32 {
+    d.*.range -= 2
+    if d.*.offset >= d.*.range { return 1 }
+    while d.*.range < 256 {
+        d.*.range <<= 1
+        d.*.offset = (d.*.offset << 1) | bits_module.read(&d.*.bits, 1)
+    }
+    return 0
+}
+
+// ---- Scans (6.5.3 to 6.5.5) ----
+
+// Up-right diagonal scans of 2x2, 4x4 and 8x8 (x | y << 4 per position),
+// horizontal and vertical 4x4 and 2x2 ones; made once.
+var DIAG2 = [4]u8{ 0, 0, 0, 0 }
+var DIAG4 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+var DIAG8: [64]u8 = undefined
+var HORIZ4: [16]u8 = undefined
+var VERT4: [16]u8 = undefined
+var HORIZ2: [4]u8 = undefined
+var VERT2: [4]u8 = undefined
+var scansReady: bool = false
+
+fn diagonal(out: [*]u8, size: i32) -> void {
+    var i: i32 = 0
+    var x: i32 = 0
+    var y: i32 = 0
+    while i < size * size {
+        while y >= 0 {
+            if x < size && y < size {
+                out[@intCast(usize, i)] = @intCast(u8, x | (y << 4))
+                i += 1
+            }
+            y -= 1
+            x += 1
+        }
+        y = x
+        x = 0
+    }
+}
+
+fn prepareScans() -> void {
+    if scansReady { return }
+    diagonal(&DIAG2, 2)
+    diagonal(&DIAG4, 4)
+    diagonal(&DIAG8, 8)
+    var i: usize = 0
+    while i < 16 {
+        HORIZ4[i] = @intCast(u8, (i & 3) | ((i >> 2) << 4))
+        VERT4[i] = @intCast(u8, (i >> 2) | ((i & 3) << 4))
+        i += 1
+    }
+    i = 0
+    while i < 4 {
+        HORIZ2[i] = @intCast(u8, (i & 1) | ((i >> 1) << 4))
+        VERT2[i] = @intCast(u8, (i >> 1) | ((i & 1) << 4))
+        i += 1
+    }
+    scansReady = true
+}
+
+// ---- The sequence and the picture ----
+
+// Sizes everything for the SPS and PPS: false without memory.
+fn prepare(d: *Decoder, sps: *h265.Sps, pps: *h265.Pps) -> bool {
+    if !prepareSize(d, sps) { return false }
+    prepareStream(d, sps, pps)
+    return true
+}
+
+// The maps sized for the SPS's pictures (allocating): false without
+// memory.
+fn prepareSize(d: *Decoder, sps: *h265.Sps) -> bool {
+    prepareScans()
+    const s = &sps.*.std
+    const log2Ctb = sps.*.log2CtbSize
+    const width = sps.*.width
+    const height = sps.*.height
+    const ctbSize = @intCast(u32, 1) << @intCast(u5, log2Ctb)
+    const ctbW = (width + ctbSize - 1) / ctbSize
+    const ctbH = (height + ctbSize - 1) / ctbSize
+    const sameSize = d.*.mapBytes != 0 && d.*.width == width && d.*.height == height && d.*.log2Ctb == log2Ctb && d.*.chromaFormat == s.*.chroma_format_idc
+    if !sameSize {
+        // (Frames keep their size until reused: those still to be output
+        // are read after the new sequence began.)
+        freeMaps(d)
+        d.*.width = width
+        d.*.height = height
+        d.*.chromaFormat = s.*.chroma_format_idc
+        d.*.log2Ctb = log2Ctb
+        d.*.ctbSize = ctbSize
+        d.*.ctbW = ctbW
+        d.*.ctbH = ctbH
+        d.*.ctbCount = ctbW * ctbH
+        d.*.blocksW = (width + 3) / 4
+        d.*.blocksH = (height + 3) / 4
+        const blocks = @intCast(usize, d.*.blocksW * d.*.blocksH)
+        const a = d.*.allocator
+        const count = @intCast(usize, d.*.ctbCount)
+        const rsToTs = a.alloc(count * 4, 16)
+        const tsToRs = a.alloc(count * 4, 16)
+        const tileId = a.alloc(count * 4, 16)
+        const ctbs = a.alloc(count * @sizeOf(CtbInfo), 16)
+        const zscan = a.alloc(blocks * 4, 16)
+        const qp = a.alloc(blocks, 16)
+        const ctDepth = a.alloc(blocks, 16)
+        const skip = a.alloc(blocks, 16)
+        const predMode = a.alloc(blocks, 16)
+        const intraMode = a.alloc(blocks, 16)
+        const noFilter = a.alloc(blocks, 16)
+        const coded = a.alloc(blocks, 16)
+        const edges = a.alloc(blocks, 16)
+        const bsV = a.alloc(blocks, 16)
+        const bsH = a.alloc(blocks, 16)
+        if rsToTs == null || tsToRs == null || tileId == null || ctbs == null || zscan == null || qp == null || ctDepth == null || skip == null || predMode == null || intraMode == null || noFilter == null || coded == null || edges == null || bsV == null || bsH == null { return false }
+        unsafe {
+            d.*.rsToTs = @ptrCast([*]u32, rsToTs.?)
+            d.*.tsToRs = @ptrCast([*]u32, tsToRs.?)
+            d.*.tileId = @ptrCast([*]u32, tileId.?)
+            d.*.ctbs = @ptrCast([*]CtbInfo, ctbs.?)
+            d.*.zscan = @ptrCast([*]u32, zscan.?)
+            d.*.qp = @ptrCast([*]i8, qp.?)
+        }
+        d.*.ctDepth = ctDepth.?
+        d.*.skip = skip.?
+        d.*.predMode = predMode.?
+        d.*.intraMode = intraMode.?
+        d.*.noFilter = noFilter.?
+        d.*.coded = coded.?
+        d.*.edges = edges.?
+        d.*.bsV = bsV.?
+        d.*.bsH = bsH.?
+        d.*.mapBytes = blocks
+        const lumaSize = @intCast(usize, width * height)
+        var c: usize = 0
+        while c < 3 {
+            const size = if c == 0 { lumaSize } else { chromaSize(d) }
+            if size != 0 {
+                const memory = a.alloc(size * 2, 16)
+                if memory == null { return false }
+                unsafe { d.*.saoCopy[c] = @ptrCast([*]u16, memory.?) }
+            }
+            c += 1
+        }
+        d.*.saoBytes = lumaSize
+    }
+    return true
+}
+
+// What the SPS and PPS set (allocating nothing): bit depths, block
+// sizes, tiles, scaling factors.
+fn prepareStream(d: *Decoder, sps: *h265.Sps, pps: *h265.Pps) -> void {
+    const s = &sps.*.std
+    d.*.bitDepth = @intCast(u32, s.*.bit_depth_luma_minus8) + 8
+    d.*.bitDepthC = @intCast(u32, s.*.bit_depth_chroma_minus8) + 8
+    d.*.log2MinCb = @intCast(u32, s.*.log2_min_luma_coding_block_size_minus3) + 3
+    d.*.log2MinTb = @intCast(u32, s.*.log2_min_luma_transform_block_size_minus2) + 2
+    d.*.log2MaxTb = d.*.log2MinTb + @intCast(u32, s.*.log2_diff_max_min_luma_transform_block_size)
+    prepareTiles(d, pps)
+    prepareScaling(d, sps, pps)
+    d.*.rowWise = pps.*.std.flags.bits0 & video.StdVideoH265PpsFlags_tiles_enabled_flag == 0
+    d.*.pictureSao = s.*.flags.bits0 & video.StdVideoH265SpsFlags_sample_adaptive_offset_enabled_flag != 0
+}
+
+// Chroma samples per plane (0 for 4:0:0).
+fn chromaSize(d: *Decoder) -> usize {
+    if d.*.chromaFormat == 0 { return 0 }
+    return @intCast(usize, (d.*.width / 2) * (d.*.height / 2))
+}
+
+// The tiles' boundaries, CtbAddrRsToTs, CtbAddrTsToRs, TileId (6.5.1)
+// and MinTbAddrZs per 4x4 block (6.5.2).
+fn prepareTiles(d: *Decoder, pps: *h265.Pps) -> void {
+    const p = &pps.*.std
+    var columns: u32 = 1
+    var rows: u32 = 1
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_tiles_enabled_flag != 0 {
+        columns = @intCast(u32, p.*.num_tile_columns_minus1) + 1
+        rows = @intCast(u32, p.*.num_tile_rows_minus1) + 1
+    }
+    const uniform = p.*.flags.bits0 & video.StdVideoH265PpsFlags_uniform_spacing_flag != 0
+    var i: u32 = 0
+    d.*.colBd[0] = 0
+    while i < columns {
+        var widthOf: u32 = 0
+        if uniform || columns == 1 {
+            widthOf = ((i + 1) * d.*.ctbW) / columns - (i * d.*.ctbW) / columns
+        } else if i + 1 < columns {
+            widthOf = @intCast(u32, p.*.column_width_minus1[i]) + 1
+        } else {
+            widthOf = d.*.ctbW - d.*.colBd[i]
+        }
+        d.*.colBd[i + 1] = d.*.colBd[i] + widthOf
+        i += 1
+    }
+    d.*.rowBd[0] = 0
+    i = 0
+    while i < rows {
+        var heightOf: u32 = 0
+        if uniform || rows == 1 {
+            heightOf = ((i + 1) * d.*.ctbH) / rows - (i * d.*.ctbH) / rows
+        } else if i + 1 < rows {
+            heightOf = @intCast(u32, p.*.row_height_minus1[i]) + 1
+        } else {
+            heightOf = d.*.ctbH - d.*.rowBd[i]
+        }
+        d.*.rowBd[i + 1] = d.*.rowBd[i] + heightOf
+        i += 1
+    }
+    var rs: u32 = 0
+    while rs < d.*.ctbCount {
+        const tbX = rs % d.*.ctbW
+        const tbY = rs / d.*.ctbW
+        var tileX: u32 = 0
+        i = 0
+        while i < columns {
+            if tbX >= d.*.colBd[i] { tileX = i }
+            i += 1
+        }
+        var tileY: u32 = 0
+        i = 0
+        while i < rows {
+            if tbY >= d.*.rowBd[i] { tileY = i }
+            i += 1
+        }
+        var value: u32 = 0
+        i = 0
+        while i < tileX {
+            value += (d.*.rowBd[tileY + 1] - d.*.rowBd[tileY]) * (d.*.colBd[i + 1] - d.*.colBd[i])
+            i += 1
+        }
+        i = 0
+        while i < tileY {
+            value += d.*.ctbW * (d.*.rowBd[i + 1] - d.*.rowBd[i])
+            i += 1
+        }
+        value += (tbY - d.*.rowBd[tileY]) * (d.*.colBd[tileX + 1] - d.*.colBd[tileX]) + tbX - d.*.colBd[tileX]
+        d.*.rsToTs[rs] = value
+        d.*.tsToRs[value] = rs
+        d.*.tileId[rs] = tileY * columns + tileX
+        rs += 1
+    }
+    const shift = @intCast(i32, d.*.log2Ctb) - 2
+    var y: u32 = 0
+    while y < d.*.blocksH {
+        var x: u32 = 0
+        while x < d.*.blocksW {
+            const ctb = (y >> @intCast(u5, shift)) * d.*.ctbW + (x >> @intCast(u5, shift))
+            var value = d.*.rsToTs[ctb] << @intCast(u5, shift * 2)
+            var k: i32 = 0
+            while k < shift {
+                const m = @intCast(u32, 1) << @intCast(u5, k)
+                if m & x != 0 { value += m * m }
+                if m & y != 0 { value += 2 * m * m }
+                k += 1
+            }
+            d.*.zscan[y * d.*.blocksW + x] = value
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// ScalingFactor (7.4.5) of the lists in force: the 4x4 lists and the
+// 8x8 ones (each larger size upsampled from its 8x8 list at use) in
+// raster order, the DC of 16x16 and 32x32; 16 everywhere without
+// scaling lists.
+fn prepareScaling(d: *Decoder, sps: *h265.Sps, pps: *h265.Pps) -> void {
+    var lists: *video.StdVideoH265ScalingLists = &sps.*.scaling
+    if pps.*.std.flags.bits0 & video.StdVideoH265PpsFlags_pps_scaling_list_data_present_flag != 0 { lists = &pps.*.scaling }
+    const enabled = sps.*.std.flags.bits0 & video.StdVideoH265SpsFlags_scaling_list_enabled_flag != 0
+    var sizeId: usize = 0
+    while sizeId < 4 {
+        var matrix: usize = 0
+        while matrix < 6 {
+            var k: usize = 0
+            const count: usize = if sizeId == 0 { 16 } else { 64 }
+            while k < count {
+                var value: i32 = 16
+                if enabled {
+                    if sizeId == 0 {
+                        const position = @intCast(usize, DIAG4[k])
+                        d.*.scaling[0][matrix][(position >> 4) * 4 + (position & 15)] = @intCast(i32, lists.*.ScalingList4x4[matrix][k])
+                        k += 1
+                        continue
+                    }
+                    const position = @intCast(usize, DIAG8[k])
+                    if sizeId == 1 { value = @intCast(i32, lists.*.ScalingList8x8[matrix][k]) }
+                    if sizeId == 2 { value = @intCast(i32, lists.*.ScalingList16x16[matrix][k]) }
+                    if sizeId == 3 { value = @intCast(i32, lists.*.ScalingList32x32[if matrix < 3 { @intCast(usize, 0) } else { @intCast(usize, 1) }][k]) }
+                    d.*.scaling[sizeId][matrix][(position >> 4) * 8 + (position & 15)] = value
+                } else {
+                    d.*.scaling[sizeId][matrix][k] = 16
+                }
+                k += 1
+            }
+            var dc: i32 = 16
+            if enabled {
+                if sizeId == 2 { dc = @intCast(i32, lists.*.ScalingListDCCoef16x16[matrix]) }
+                if sizeId == 3 { dc = @intCast(i32, lists.*.ScalingListDCCoef32x32[if matrix < 3 { @intCast(usize, 0) } else { @intCast(usize, 1) }]) }
+            }
+            d.*.scalingDc[sizeId][matrix] = dc
+            matrix += 1
+        }
+        sizeId += 1
+    }
+}
+
+fn ensureFrame(d: *Decoder, slot: usize) -> bool {
+    const frame = &d.*.frames[slot]
+    frame.*.bitDepth = d.*.bitDepth
+    if frame.*.allocated && frame.*.width == d.*.width && frame.*.height == d.*.height && frame.*.sizes[1] == chromaSize(d) { return true }
+    freeFrame(d, frame)
+    const a = d.*.allocator
+    const blocks = @intCast(usize, d.*.blocksW * d.*.blocksH)
+    var c: usize = 0
+    while c < 3 {
+        const size = if c == 0 { @intCast(usize, d.*.width * d.*.height) } else { chromaSize(d) }
+        frame.*.sizes[c] = size
+        if size != 0 {
+            const memory = a.alloc(size * 2, 16)
+            if memory == null { return false }
+            unsafe { frame.*.planes[c] = @ptrCast([*]u16, memory.?) }
+        } else {
+            frame.*.planes[c] = frame.*.planes[0]
+        }
+        c += 1
+    }
+    const mv = a.alloc(blocks * 8, 16)
+    const refIdx = a.alloc(blocks * 2, 16)
+    const refPoc = a.alloc(blocks * 8, 16)
+    const refLong = a.alloc(blocks * 2, 16)
+    const intra = a.alloc(blocks, 16)
+    if mv == null || refIdx == null || refPoc == null || refLong == null || intra == null { return false }
+    unsafe {
+        frame.*.mv = @ptrCast([*]i16, mv.?)
+        frame.*.refIdx = @ptrCast([*]i8, refIdx.?)
+        frame.*.refPoc = @ptrCast([*]i32, refPoc.?)
+    }
+    frame.*.refLong = refLong.?
+    frame.*.intra = intra.?
+    frame.*.blocks = blocks
+    frame.*.width = d.*.width
+    frame.*.height = d.*.height
+    frame.*.allocated = true
+    // A picture never decoded (a missing reference) is mid grey.
+    c = 0
+    while c < 3 {
+        const middle = @intCast(u16, 1) << @intCast(u4, (if c == 0 { d.*.bitDepth } else { d.*.bitDepthC }) - 1)
+        var k: usize = 0
+        while k < frame.*.sizes[c] {
+            frame.*.planes[c][k] = middle
+            k += 1
+        }
+        c += 1
+    }
+    var k: usize = 0
+    while k < blocks {
+        frame.*.intra[k] = 1
+        k += 1
+    }
+    return true
+}
+
+// ---- The slice segment header (7.3.6) ----
+
+// st_ref_pic_set(num_short_term_ref_pic_sets) of a slice header, read
+// past; the set (its counts and use) derived into `out`.
+fn sliceRps(d: *Decoder, sps: *h265.Sps, out: *h265.Rps) -> bool {
+    const b = &d.*.bits
+    const index = @intCast(u32, sps.*.std.num_short_term_ref_pic_sets)
+    var predicted = false
+    if index != 0 { predicted = bits_module.flag(b) }
+    if predicted {
+        const deltaIdx = bits_module.ue(b) + 1
+        if deltaIdx > index { return false }
+        const signFlag = bits_module.flag(b)
+        const absDelta = bits_module.ue(b) + 1
+        const deltaRps = if signFlag { -@intCast(i32, absDelta) } else { @intCast(i32, absDelta) }
+        const reference = &sps.*.rps[index - deltaIdx]
+        const numDelta = reference.*.negative + reference.*.positive
+        var used: [33]bool = undefined
+        var useDelta: [33]bool = undefined
+        var j: u32 = 0
+        while j <= numDelta {
+            used[j] = bits_module.flag(b)
+            useDelta[j] = true
+            if !used[j] { useDelta[j] = bits_module.flag(b) }
+            j += 1
+        }
+        var i: u32 = 0
+        var k: i32 = @intCast(i32, reference.*.positive) - 1
+        while k >= 0 {
+            const dPoc = reference.*.deltaS1[@intCast(usize, k)] + deltaRps
+            const at = @intCast(usize, reference.*.negative) + @intCast(usize, k)
+            if dPoc < 0 && useDelta[at] && i < 16 {
+                out.*.deltaS0[i] = dPoc
+                out.*.usedS0[i] = used[at]
+                i += 1
+            }
+            k -= 1
+        }
+        if deltaRps < 0 && useDelta[numDelta] && i < 16 {
+            out.*.deltaS0[i] = deltaRps
+            out.*.usedS0[i] = used[numDelta]
+            i += 1
+        }
+        var n: u32 = 0
+        while n < reference.*.negative {
+            const dPoc = reference.*.deltaS0[n] + deltaRps
+            if dPoc < 0 && useDelta[n] && i < 16 {
+                out.*.deltaS0[i] = dPoc
+                out.*.usedS0[i] = used[n]
+                i += 1
+            }
+            n += 1
+        }
+        out.*.negative = i
+        i = 0
+        k = @intCast(i32, reference.*.negative) - 1
+        while k >= 0 {
+            const dPoc = reference.*.deltaS0[@intCast(usize, k)] + deltaRps
+            if dPoc > 0 && useDelta[@intCast(usize, k)] && i < 16 {
+                out.*.deltaS1[i] = dPoc
+                out.*.usedS1[i] = used[@intCast(usize, k)]
+                i += 1
+            }
+            k -= 1
+        }
+        if deltaRps > 0 && useDelta[numDelta] && i < 16 {
+            out.*.deltaS1[i] = deltaRps
+            out.*.usedS1[i] = used[numDelta]
+            i += 1
+        }
+        n = 0
+        while n < reference.*.positive {
+            const dPoc = reference.*.deltaS1[n] + deltaRps
+            const at = @intCast(usize, reference.*.negative + n)
+            if dPoc > 0 && useDelta[at] && i < 16 {
+                out.*.deltaS1[i] = dPoc
+                out.*.usedS1[i] = used[at]
+                i += 1
+            }
+            n += 1
+        }
+        out.*.positive = i
+        return !b.*.failed
+    }
+    out.*.negative = bits_module.ue(b)
+    out.*.positive = bits_module.ue(b)
+    if out.*.negative > 16 || out.*.positive > 16 || out.*.negative + out.*.positive > 16 { return false }
+    var i: u32 = 0
+    while i < out.*.negative {
+        _ = bits_module.ue(b)
+        out.*.usedS0[i] = bits_module.flag(b)
+        i += 1
+    }
+    i = 0
+    while i < out.*.positive {
+        _ = bits_module.ue(b)
+        out.*.usedS1[i] = bits_module.flag(b)
+        i += 1
+    }
+    return !b.*.failed
+}
+
+fn ceilLog2(value: u32) -> u32 {
+    var count: u32 = 0
+    while (@intCast(u32, 1) << @intCast(u5, count)) < value { count += 1 }
+    return count
+}
+
+// The slice segment header of the NAL unit loaded (`kind` its type);
+// a dependent segment keeps the header of its slice.
+fn parseHeader(d: *Decoder, h: *h265.Decoder, kind: u8) -> Status {
+    const b = &d.*.bits
+    const s = &d.*.header
+    const first = bits_module.flag(b)
+    var noOutput = false
+    if kind >= 16 && kind <= 23 { noOutput = bits_module.flag(b) }
+    const ppsId = bits_module.ue(b)
+    if b.*.failed || ppsId >= @intCast(u32, h265.MAX_PPS) { return Status.corrupt }
+    const pps = h265.ppsAt(h, @intCast(usize, ppsId))
+    if !pps.*.present { return Status.corrupt }
+    const sps = h265.spsAt(h, @intCast(usize, pps.*.spsId))
+    if !sps.*.present { return Status.corrupt }
+    d.*.pps = pps
+    d.*.sps = sps
+    const p = &pps.*.std
+    var dependent = false
+    var address: u32 = 0
+    if !first {
+        if p.*.flags.bits0 & video.StdVideoH265PpsFlags_dependent_slice_segments_enabled_flag != 0 { dependent = bits_module.flag(b) }
+        address = bits_module.read(b, ceilLog2(sps.*.picSizeInCtbs))
+        if address >= sps.*.picSizeInCtbs { return Status.corrupt }
+    }
+    s.*.dependent = dependent
+    s.*.address = address
+    s.*.first = first
+    if dependent { return Status.ok }
+    s.*.noOutputOfPriorPics = noOutput
+    s.*.ppsId = ppsId
+    var k: u32 = 0
+    while k < @intCast(u32, p.*.num_extra_slice_header_bits) {
+        _ = bits_module.flag(b)
+        k += 1
+    }
+    s.*.sliceType = bits_module.ue(b)
+    if s.*.sliceType > 2 { return Status.corrupt }
+    s.*.picOutputFlag = true
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_output_flag_present_flag != 0 { s.*.picOutputFlag = bits_module.flag(b) }
+    const sf = sps.*.std.flags.bits0
+    if sf & video.StdVideoH265SpsFlags_separate_colour_plane_flag != 0 { _ = bits_module.read(b, 2) }
+    s.*.temporalMvp = false
+    s.*.totalCurr = 0
+    s.*.stBefore = 0
+    s.*.stAfter = 0
+    s.*.ltCurr = 0
+    if kind != h265.NAL_IDR_W_RADL && kind != h265.NAL_IDR_N_LP {
+        s.*.pocLsb = bits_module.read(b, @intCast(u32, sps.*.std.log2_max_pic_order_cnt_lsb_minus4) + 4)
+        var rps: h265.Rps = undefined
+        const sets = @intCast(u32, sps.*.std.num_short_term_ref_pic_sets)
+        if !bits_module.flag(b) {
+            if !sliceRps(d, sps, &rps) { return Status.corrupt }
+        } else {
+            var index: u32 = 0
+            if sets > 1 { index = bits_module.read(b, ceilLog2(sets)) }
+            if index >= sets { return Status.corrupt }
+            rps = sps.*.rps[index]
+        }
+        var i: u32 = 0
+        while i < rps.negative {
+            if rps.usedS0[i] { s.*.stBefore += 1 }
+            i += 1
+        }
+        i = 0
+        while i < rps.positive {
+            if rps.usedS1[i] { s.*.stAfter += 1 }
+            i += 1
+        }
+        if sf & video.StdVideoH265SpsFlags_long_term_ref_pics_present_flag != 0 {
+            var fromSps: u32 = 0
+            const spsCount = @intCast(u32, sps.*.std.num_long_term_ref_pics_sps)
+            if spsCount > 0 { fromSps = bits_module.ue(b) }
+            const own = bits_module.ue(b)
+            if fromSps + own > 32 { return Status.corrupt }
+            i = 0
+            while i < fromSps + own {
+                var used = false
+                if i < fromSps {
+                    var index: u32 = 0
+                    if spsCount > 1 { index = bits_module.read(b, ceilLog2(spsCount)) }
+                    used = sps.*.longTerm.used_by_curr_pic_lt_sps_flag & (@intCast(u32, 1) << @intCast(u5, index & 31)) != 0
+                } else {
+                    _ = bits_module.read(b, @intCast(u32, sps.*.std.log2_max_pic_order_cnt_lsb_minus4) + 4)
+                    used = bits_module.flag(b)
+                }
+                if used { s.*.ltCurr += 1 }
+                if bits_module.flag(b) { _ = bits_module.ue(b) }
+                i += 1
+            }
+        }
+        if sf & video.StdVideoH265SpsFlags_sps_temporal_mvp_enabled_flag != 0 { s.*.temporalMvp = bits_module.flag(b) }
+    }
+    s.*.totalCurr = s.*.stBefore + s.*.stAfter + s.*.ltCurr
+    s.*.saoLuma = false
+    s.*.saoChroma = false
+    if sf & video.StdVideoH265SpsFlags_sample_adaptive_offset_enabled_flag != 0 {
+        s.*.saoLuma = bits_module.flag(b)
+        if sps.*.std.chroma_format_idc != 0 { s.*.saoChroma = bits_module.flag(b) }
+    }
+    s.*.active[0] = 0
+    s.*.active[1] = 0
+    s.*.modify[0] = false
+    s.*.modify[1] = false
+    s.*.mvdL1Zero = false
+    s.*.cabacInit = false
+    s.*.colFromL0 = true
+    s.*.colRefIdx = 0
+    s.*.maxMergeCand = 5
+    s.*.lumaLog2 = 0
+    s.*.chromaLog2 = 0
+    if s.*.sliceType != h265.SLICE_I {
+        s.*.active[0] = @intCast(u32, p.*.num_ref_idx_l0_default_active_minus1) + 1
+        if s.*.sliceType == h265.SLICE_B { s.*.active[1] = @intCast(u32, p.*.num_ref_idx_l1_default_active_minus1) + 1 }
+        if bits_module.flag(b) {
+            s.*.active[0] = bits_module.ue(b) + 1
+            if s.*.sliceType == h265.SLICE_B { s.*.active[1] = bits_module.ue(b) + 1 }
+        }
+        if s.*.active[0] > 15 || s.*.active[1] > 15 { return Status.corrupt }
+        if p.*.flags.bits0 & video.StdVideoH265PpsFlags_lists_modification_present_flag != 0 && s.*.totalCurr > 1 {
+            const width = ceilLog2(s.*.totalCurr)
+            var list: usize = 0
+            while list < 2 {
+                if list == 1 && s.*.sliceType != h265.SLICE_B { break }
+                s.*.modify[list] = bits_module.flag(b)
+                if s.*.modify[list] {
+                    var i: u32 = 0
+                    while i < s.*.active[list] {
+                        s.*.entries[list][i] = bits_module.read(b, width)
+                        i += 1
+                    }
+                }
+                list += 1
+            }
+        }
+        if s.*.sliceType == h265.SLICE_B { s.*.mvdL1Zero = bits_module.flag(b) }
+        if p.*.flags.bits0 & video.StdVideoH265PpsFlags_cabac_init_present_flag != 0 { s.*.cabacInit = bits_module.flag(b) }
+        if s.*.temporalMvp {
+            if s.*.sliceType == h265.SLICE_B { s.*.colFromL0 = bits_module.flag(b) }
+            const fromList: usize = if s.*.colFromL0 { 0 } else { 1 }
+            if s.*.active[fromList] > 1 { s.*.colRefIdx = bits_module.ue(b) }
+            if s.*.colRefIdx >= s.*.active[fromList] { return Status.corrupt }
+        }
+        const weighted = (s.*.sliceType == h265.SLICE_P && p.*.flags.bits0 & video.StdVideoH265PpsFlags_weighted_pred_flag != 0) || (s.*.sliceType == h265.SLICE_B && p.*.flags.bits0 & video.StdVideoH265PpsFlags_weighted_bipred_flag != 0)
+        if weighted {
+            if !predWeightTable(d, sps) { return Status.corrupt }
+        } else {
+            defaultWeights(d)
+        }
+        s.*.maxMergeCand = 5 - bits_module.ue(b)
+        if s.*.maxMergeCand < 1 || s.*.maxMergeCand > 5 { return Status.corrupt }
+    }
+    s.*.qpDelta = bits_module.se(b)
+    s.*.cbQpOffset = 0
+    s.*.crQpOffset = 0
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_pps_slice_chroma_qp_offsets_present_flag != 0 {
+        s.*.cbQpOffset = bits_module.se(b)
+        s.*.crQpOffset = bits_module.se(b)
+    }
+    s.*.deblockingDisabled = p.*.flags.bits0 & video.StdVideoH265PpsFlags_pps_deblocking_filter_disabled_flag != 0
+    s.*.betaOffset = @intCast(i32, p.*.pps_beta_offset_div2) * 2
+    s.*.tcOffset = @intCast(i32, p.*.pps_tc_offset_div2) * 2
+    var overridden = false
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_deblocking_filter_override_enabled_flag != 0 { overridden = bits_module.flag(b) }
+    if overridden {
+        s.*.deblockingDisabled = bits_module.flag(b)
+        if !s.*.deblockingDisabled {
+            s.*.betaOffset = bits_module.se(b) * 2
+            s.*.tcOffset = bits_module.se(b) * 2
+        }
+    }
+    s.*.loopFilterAcross = p.*.flags.bits0 & video.StdVideoH265PpsFlags_pps_loop_filter_across_slices_enabled_flag != 0
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_pps_loop_filter_across_slices_enabled_flag != 0 && (s.*.saoLuma || s.*.saoChroma || !s.*.deblockingDisabled) {
+        s.*.loopFilterAcross = bits_module.flag(b)
+    }
+    if b.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn defaultWeights(d: *Decoder) -> void {
+    const s = &d.*.header
+    s.*.lumaLog2 = 0
+    s.*.chromaLog2 = 0
+    var list: usize = 0
+    while list < 2 {
+        var i: usize = 0
+        while i < 16 {
+            s.*.lumaWeight[list][i] = 1
+            s.*.lumaOffset[list][i] = 0
+            s.*.chromaWeight[list][i][0] = 1
+            s.*.chromaWeight[list][i][1] = 1
+            s.*.chromaOffset[list][i][0] = 0
+            s.*.chromaOffset[list][i][1] = 0
+            i += 1
+        }
+        list += 1
+    }
+}
+
+// pred_weight_table() (7.3.6.3): the weights and offsets (offsets at the
+// bit depth: Main 10's shifted).
+fn predWeightTable(d: *Decoder, sps: *h265.Sps) -> bool {
+    const b = &d.*.bits
+    const s = &d.*.header
+    s.*.lumaLog2 = bits_module.ue(b)
+    if s.*.lumaLog2 > 7 { return false }
+    const chroma = sps.*.std.chroma_format_idc != 0
+    var chromaLog2 = @intCast(i32, s.*.lumaLog2)
+    if chroma { chromaLog2 += bits_module.se(b) }
+    if chromaLog2 < 0 || chromaLog2 > 7 { return false }
+    s.*.chromaLog2 = @intCast(u32, chromaLog2)
+    const shiftY = @intCast(i32, d.*.bitDepth) - 8
+    const shiftC = @intCast(i32, d.*.bitDepthC) - 8
+    const wpOffsetHalfC = shl(1, 7 + shiftC) >> @intCast(u5, shiftC)
+    var list: usize = 0
+    while list < 2 {
+        if list == 1 && s.*.sliceType != h265.SLICE_B { break }
+        const count = @intCast(usize, s.*.active[list])
+        var lumaFlags: [16]bool = undefined
+        var chromaFlags: [16]bool = undefined
+        var i: usize = 0
+        while i < count {
+            lumaFlags[i] = bits_module.flag(b)
+            i += 1
+        }
+        i = 0
+        while i < count {
+            chromaFlags[i] = false
+            if chroma { chromaFlags[i] = bits_module.flag(b) }
+            i += 1
+        }
+        i = 0
+        while i < count {
+            s.*.lumaWeight[list][i] = shl(1, @intCast(i32, s.*.lumaLog2))
+            s.*.lumaOffset[list][i] = 0
+            if lumaFlags[i] {
+                s.*.lumaWeight[list][i] += bits_module.se(b)
+                s.*.lumaOffset[list][i] = shl(bits_module.se(b), shiftY)
+            }
+            var c: usize = 0
+            while c < 2 {
+                s.*.chromaWeight[list][i][c] = shl(1, chromaLog2)
+                s.*.chromaOffset[list][i][c] = 0
+                if chromaFlags[i] {
+                    const deltaWeight = bits_module.se(b)
+                    const weight = shl(1, chromaLog2) + deltaWeight
+                    s.*.chromaWeight[list][i][c] = weight
+                    const deltaOffset = bits_module.se(b)
+                    // (7-56)
+                    const offset = clip3(-wpOffsetHalfC, wpOffsetHalfC - 1, (wpOffsetHalfC - ((wpOffsetHalfC * weight) >> @intCast(u5, chromaLog2))) + deltaOffset)
+                    s.*.chromaOffset[list][i][c] = shl(offset, shiftC)
+                }
+                c += 1
+            }
+            i += 1
+        }
+        list += 1
+    }
+    return !b.*.failed
+}
+
+// The reference picture lists (8.3.4) from the picture's reference
+// picture set (std.h265's slots) and the slice's modifications.
+fn buildLists(d: *Decoder, h: *h265.Decoder) -> void {
+    const s = &d.*.header
+    const info = &h.*.picture.info
+    var temp: [32]usize = undefined
+    var tempLong: [32]bool = undefined
+    var list: usize = 0
+    while list < 2 {
+        d.*.refCount[list] = 0
+        if list == 0 && s.*.sliceType == h265.SLICE_I { break }
+        if list == 1 && s.*.sliceType != h265.SLICE_B { break }
+        const active = s.*.active[list]
+        const total = if s.*.totalCurr > active { s.*.totalCurr } else { active }
+        var count: usize = 0
+        while count < @intCast(usize, total) && s.*.totalCurr > 0 {
+            var k: u32 = 0
+            const firstCount = if list == 0 { s.*.stBefore } else { s.*.stAfter }
+            const secondCount = if list == 0 { s.*.stAfter } else { s.*.stBefore }
+            while k < firstCount && count < @intCast(usize, total) {
+                const slotByte = if list == 0 { info.*.RefPicSetStCurrBefore[k] } else { info.*.RefPicSetStCurrAfter[k] }
+                temp[count] = slotOf(d, slotByte)
+                tempLong[count] = false
+                count += 1
+                k += 1
+            }
+            k = 0
+            while k < secondCount && count < @intCast(usize, total) {
+                const slotByte = if list == 0 { info.*.RefPicSetStCurrAfter[k] } else { info.*.RefPicSetStCurrBefore[k] }
+                temp[count] = slotOf(d, slotByte)
+                tempLong[count] = false
+                count += 1
+                k += 1
+            }
+            k = 0
+            while k < s.*.ltCurr && count < @intCast(usize, total) {
+                temp[count] = slotOf(d, info.*.RefPicSetLtCurr[k])
+                tempLong[count] = true
+                count += 1
+                k += 1
+            }
+        }
+        var i: usize = 0
+        while i < @intCast(usize, active) {
+            var from = i
+            if s.*.modify[list] { from = @intCast(usize, s.*.entries[list][i]) }
+            if count == 0 || from >= count { from = 0 }
+            const slot = if count == 0 { d.*.slot } else { temp[from] }
+            d.*.refs[list][i] = slot
+            d.*.refPocs[list][i] = d.*.frames[slot].poc
+            d.*.refLong[list][i] = count != 0 && tempLong[from]
+            i += 1
+        }
+        d.*.refCount[list] = active
+        list += 1
+    }
+    // NoBackwardPredFlag (8.5.3.2.8): no reference after the picture.
+    d.*.noBackwardPred = true
+    list = 0
+    while list < 2 {
+        var i: u32 = 0
+        while i < d.*.refCount[list] {
+            if d.*.refPocs[list][i] > d.*.poc { d.*.noBackwardPred = false }
+            i += 1
+        }
+        list += 1
+    }
+}
+
+// A slot std.h265 named (NO_SLOT: a missing reference) as one with a
+// frame: the missing one's own (grey) when it has none.
+fn slotOf(d: *Decoder, slot: u8) -> usize {
+    if slot != h265.NO_SLOT && @intCast(usize, slot) < h265.SLOTS && d.*.frames[@intCast(usize, slot)].allocated { return @intCast(usize, slot) }
+    var k: usize = 0
+    while k < h265.SLOTS {
+        if k != d.*.slot && d.*.frames[k].allocated { return k }
+        k += 1
+    }
+    return d.*.slot
+}
+
+// ---- Availability (6.4) ----
+
+fn blockAt(d: *Decoder, x: i32, y: i32) -> usize { return @intCast(usize, (y >> 2) * @intCast(i32, d.*.blocksW) + (x >> 2)) }
+
+fn ctbOf(d: *Decoder, x: i32, y: i32) -> usize { return @intCast(usize, shr(y, @intCast(i32, d.*.log2Ctb)) * @intCast(i32, d.*.ctbW) + shr(x, @intCast(i32, d.*.log2Ctb))) }
+
+// The z-scan availability of (xN, yN) from (xCurr, yCurr) (6.4.1): in
+// the picture, decoded before, in the same slice and tile.
+fn available(d: *Decoder, xCurr: i32, yCurr: i32, xN: i32, yN: i32) -> bool {
+    if xN < 0 || yN < 0 || xN >= @intCast(i32, d.*.width) || yN >= @intCast(i32, d.*.height) { return false }
+    if d.*.zscan[blockAt(d, xN, yN)] > d.*.zscan[blockAt(d, xCurr, yCurr)] { return false }
+    const ctbN = ctbOf(d, xN, yN)
+    if d.*.ctbs[ctbN].sliceAddr != d.*.sliceAddr { return false }
+    if d.*.tileId[ctbN] != d.*.tileId[ctbOf(d, xCurr, yCurr)] { return false }
+    return true
+}
+
+// A prediction block's neighbour (6.4.2): available and not intra.
+fn availablePb(d: *Decoder, xCb: i32, yCb: i32, nCbS: i32, xPb: i32, yPb: i32, nPbW: i32, nPbH: i32, partIdx: u32, xN: i32, yN: i32) -> bool {
+    var result = false
+    if xCb <= xN && yCb <= yN && xCb + nCbS > xN && yCb + nCbS > yN {
+        result = !((nPbW << 1) == nCbS && (nPbH << 1) == nCbS && partIdx == 1 && yCb + nPbH <= yN && xCb + nPbW > xN)
+    } else {
+        result = available(d, xPb, yPb, xN, yN)
+    }
+    if result && d.*.predMode[blockAt(d, xN, yN)] == MODE_INTRA { return false }
+    return result
+}
+
+// ---- Slice data (7.3.8) ----
+
+fn decodeSliceData(d: *Decoder) -> Status {
+    const s = &d.*.header
+    const p = &d.*.pps.*.std
+    const wpp = p.*.flags.bits0 & video.StdVideoH265PpsFlags_entropy_coding_sync_enabled_flag != 0
+    const tiles = p.*.flags.bits0 & video.StdVideoH265PpsFlags_tiles_enabled_flag != 0
+    var ts = d.*.rsToTs[s.*.address]
+    // The entry point offsets are not needed: each substream follows the
+    // last after its alignment.
+    cabacStart(d)
+    var rs = s.*.address
+    var resetQg = true
+    if !s.*.dependent || tileStart(d, rs) {
+        initContexts(d)
+    } else if wpp && rowStart(d, rs) {
+        wppStart(d, rs)
+    } else {
+        // A dependent segment goes on with the contexts and QP its
+        // slice's last segment ended with.
+        copyBytes(&d.*.contexts, &d.*.dsContexts, tables.CONTEXTS)
+        resetQg = false
+    }
+    if resetQg {
+        d.*.qpY = sliceQp(d)
+        d.*.qpPrev = d.*.qpY
+    }
+    d.*.qgReset = resetQg
+    while true {
+        const xCtb = @intCast(i32, (rs % d.*.ctbW) << @intCast(u5, d.*.log2Ctb))
+        const yCtb = @intCast(i32, (rs / d.*.ctbW) << @intCast(u5, d.*.log2Ctb))
+        const info = &d.*.ctbs[rs]
+        info.*.sliceAddr = d.*.sliceAddr
+        info.*.tile = d.*.tileId[rs]
+        info.*.deblockingDisabled = s.*.deblockingDisabled
+        info.*.betaOffset = s.*.betaOffset
+        info.*.tcOffset = s.*.tcOffset
+        info.*.loopFilterAcross = s.*.loopFilterAcross
+        d.*.ctbAddrRs = rs
+        if s.*.saoLuma || s.*.saoChroma {
+            saoSyntax(d, rs)
+        } else {
+            info.*.saoType[0] = 0
+            info.*.saoType[1] = 0
+            info.*.saoType[2] = 0
+        }
+        if !codingQuadtree(d, xCtb, yCtb, @intCast(i32, d.*.log2Ctb), 0) { return Status.corrupt }
+        if d.*.bits.failed { return Status.corrupt }
+        const end = terminate(d) == 1
+        if (rs + 1) % d.*.ctbW == 0 { rowDone(d, rs / d.*.ctbW) }
+        // The wavefront's contexts after a row's second CTB (in its tile).
+        if wpp && rs % d.*.ctbW >= 1 && !rowStart(d, rs) && rowStart(d, rs - 1) { copyBytes(&d.*.wppContexts, &d.*.contexts, tables.CONTEXTS) }
+        ts += 1
+        if end { break }
+        if ts >= d.*.ctbCount { return Status.corrupt }
+        const nextRs = d.*.tsToRs[ts]
+        const newTile = tiles && d.*.tileId[nextRs] != d.*.tileId[rs]
+        const newRow = wpp && rowStart(d, nextRs)
+        rs = nextRs
+        if newTile || newRow {
+            // end_of_subset_one_bit, byte_alignment(), a new substream.
+            _ = terminate(d)
+            cabacStart(d)
+            if newTile { initContexts(d) } else { wppStart(d, rs) }
+            d.*.qgReset = true
+        }
+    }
+    copyBytes(&d.*.dsContexts, &d.*.contexts, tables.CONTEXTS)
+    return Status.ok
+}
+
+// A wavefront row's contexts (9.3.1): the row above's after its second
+// CTB when that CTB is there, else initialized.
+fn wppStart(d: *Decoder, rs: u32) -> void {
+    const xCtb = @intCast(i32, (rs % d.*.ctbW) << @intCast(u5, d.*.log2Ctb))
+    const yCtb = @intCast(i32, (rs / d.*.ctbW) << @intCast(u5, d.*.log2Ctb))
+    const size = @intCast(i32, d.*.ctbSize)
+    // The CTB above right decides (9.3.1).
+    if available(d, xCtb, yCtb, xCtb + size, yCtb - size) {
+        copyBytes(&d.*.contexts, &d.*.wppContexts, tables.CONTEXTS)
+    } else {
+        initContexts(d)
+    }
+}
+
+// Whether CTB `rs` begins a CTB row of its tile, or a tile.
+fn rowStart(d: *Decoder, rs: u32) -> bool { return rs % d.*.ctbW == 0 || d.*.tileId[rs - 1] != d.*.tileId[rs] }
+fn tileStart(d: *Decoder, rs: u32) -> bool { return rs == 0 || d.*.tileId[d.*.tsToRs[d.*.rsToTs[rs] - 1]] != d.*.tileId[rs] }
+
+// sao() (7.3.8.3) of CTB `rs`.
+fn saoSyntax(d: *Decoder, rs: u32) -> void {
+    const s = &d.*.header
+    const info = &d.*.ctbs[rs]
+    const rx = rs % d.*.ctbW
+    const ry = rs / d.*.ctbW
+    var mergeLeft = false
+    var mergeUp = false
+    if rx > 0 {
+        const left = rs - 1
+        if @intCast(i32, left) >= d.*.sliceAddr && d.*.ctbs[left].sliceAddr == d.*.sliceAddr && d.*.tileId[left] == d.*.tileId[rs] { mergeLeft = decision(d, tables.SAO_MERGE_FLAG) == 1 }
+    }
+    if ry > 0 && !mergeLeft {
+        const up = rs - d.*.ctbW
+        if @intCast(i32, up) >= d.*.sliceAddr && d.*.ctbs[up].sliceAddr == d.*.sliceAddr && d.*.tileId[up] == d.*.tileId[rs] { mergeUp = decision(d, tables.SAO_MERGE_FLAG) == 1 }
+    }
+    if mergeLeft || mergeUp {
+        const from = &d.*.ctbs[if mergeLeft { rs - 1 } else { rs - d.*.ctbW }]
+        var c: usize = 0
+        while c < 3 {
+            info.*.saoType[c] = from.*.saoType[c]
+            info.*.saoClass[c] = from.*.saoClass[c]
+            var k: usize = 0
+            while k < 4 {
+                info.*.saoOffset[c][k] = from.*.saoOffset[c][k]
+                k += 1
+            }
+            c += 1
+        }
+        return
+    }
+    const components: usize = if d.*.chromaFormat == 0 { 1 } else { 3 }
+    var c: usize = 0
+    while c < 3 {
+        info.*.saoType[c] = 0
+        if c >= components || (c == 0 && !s.*.saoLuma) || (c > 0 && !s.*.saoChroma) {
+            c += 1
+            continue
+        }
+        if c == 2 {
+            info.*.saoType[2] = info.*.saoType[1]
+            info.*.saoClass[2] = info.*.saoClass[1]
+        } else {
+            var kind: u8 = 0
+            if decision(d, tables.SAO_TYPE_IDX) == 1 { kind = if bypass(d) == 0 { 1 } else { 2 } }
+            info.*.saoType[c] = kind
+        }
+        if info.*.saoType[c] == 0 {
+            c += 1
+            continue
+        }
+        const depth = if c == 0 { d.*.bitDepth } else { d.*.bitDepthC }
+        const limited: u32 = if depth > 10 { 10 } else { depth }
+        const cMax = (@intCast(u32, 1) << @intCast(u5, limited - 5)) - 1
+        var magnitudes: [4]i32 = undefined
+        var k: usize = 0
+        while k < 4 {
+            var value: u32 = 0
+            while value < cMax && bypass(d) == 1 { value += 1 }
+            magnitudes[k] = @intCast(i32, value)
+            k += 1
+        }
+        if info.*.saoType[c] == 1 {
+            k = 0
+            while k < 4 {
+                if magnitudes[k] != 0 && bypass(d) == 1 { magnitudes[k] = -magnitudes[k] }
+                k += 1
+            }
+            info.*.saoClass[c] = @intCast(u8, bypassBits(d, 5))
+        } else {
+            magnitudes[2] = -magnitudes[2]
+            magnitudes[3] = -magnitudes[3]
+            if c == 0 || c == 1 { info.*.saoClass[c] = @intCast(u8, bypassBits(d, 2)) }
+            if c == 1 { info.*.saoClass[2] = info.*.saoClass[1] }
+        }
+        k = 0
+        while k < 4 {
+            // (log2_sao_offset_scale is 0 without the range extension.)
+            info.*.saoOffset[c][k] = @intCast(i16, magnitudes[k])
+            k += 1
+        }
+        c += 1
+    }
+}
+
+fn setBlocks(map: [*]u8, d: *Decoder, x: i32, y: i32, w: i32, h: i32, value: u8) -> void {
+    var by = y >> 2
+    const endY = minimum((y + h + 3) >> 2, @intCast(i32, d.*.blocksH))
+    const endX = minimum((x + w + 3) >> 2, @intCast(i32, d.*.blocksW))
+    while by < endY {
+        var bx = x >> 2
+        while bx < endX {
+            map[@intCast(usize, by * @intCast(i32, d.*.blocksW) + bx)] = value
+            bx += 1
+        }
+        by += 1
+    }
+}
+
+// coding_quadtree() (7.3.8.4).
+fn codingQuadtree(d: *Decoder, x0: i32, y0: i32, log2CbSize: i32, depth: u32) -> bool {
+    const size = shl(1, log2CbSize)
+    const minCb = @intCast(i32, d.*.log2MinCb)
+    var split = log2CbSize > minCb
+    if x0 + size <= @intCast(i32, d.*.width) && y0 + size <= @intCast(i32, d.*.height) && log2CbSize > minCb {
+        var inc: usize = 0
+        if available(d, x0, y0, x0 - 1, y0) && @intCast(u32, d.*.ctDepth[blockAt(d, x0 - 1, y0)]) > depth { inc += 1 }
+        if available(d, x0, y0, x0, y0 - 1) && @intCast(u32, d.*.ctDepth[blockAt(d, x0, y0 - 1)]) > depth { inc += 1 }
+        split = decision(d, tables.SPLIT_CODING_UNIT_FLAG + inc) == 1
+    }
+    const p = &d.*.pps.*.std
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_cu_qp_delta_enabled_flag != 0 && log2CbSize >= @intCast(i32, d.*.log2Ctb) - @intCast(i32, p.*.diff_cu_qp_delta_depth) {
+        d.*.cuQpDeltaCoded = false
+        d.*.cuQpDelta = 0
+        startQg(d, x0, y0)
+    } else if log2CbSize >= @intCast(i32, d.*.log2Ctb) - @intCast(i32, p.*.diff_cu_qp_delta_depth) {
+        startQg(d, x0, y0)
+    }
+    if split {
+        const half = size >> 1
+        if !codingQuadtree(d, x0, y0, log2CbSize - 1, depth + 1) { return false }
+        if x0 + half < @intCast(i32, d.*.width) {
+            if !codingQuadtree(d, x0 + half, y0, log2CbSize - 1, depth + 1) { return false }
+        }
+        if y0 + half < @intCast(i32, d.*.height) {
+            if !codingQuadtree(d, x0, y0 + half, log2CbSize - 1, depth + 1) { return false }
+        }
+        if x0 + half < @intCast(i32, d.*.width) && y0 + half < @intCast(i32, d.*.height) {
+            if !codingQuadtree(d, x0 + half, y0 + half, log2CbSize - 1, depth + 1) { return false }
+        }
+        return true
+    }
+    return codingUnit(d, x0, y0, log2CbSize, depth)
+}
+
+// A quantization group begins (8.6.1): qPY_PRED from the left and above
+// groups in the CTB, else the previous QpY in decoding order (the slice's
+// QP at a slice, tile or wavefront row start).
+fn startQg(d: *Decoder, xQg: i32, yQg: i32) -> void {
+    // (Called for each enclosing node too: qPY_PREV stays the last
+    // coding unit's until one is decoded.)
+    var previous = d.*.qpPrev
+    if d.*.qgReset { previous = sliceQp(d) }
+    const ctb = ctbOf(d, xQg, yQg)
+    var a = previous
+    var b = previous
+    if available(d, xQg, yQg, xQg - 1, yQg) && ctbOf(d, xQg - 1, yQg) == ctb { a = @intCast(i32, d.*.qp[blockAt(d, xQg - 1, yQg)]) }
+    if available(d, xQg, yQg, xQg, yQg - 1) && ctbOf(d, xQg, yQg - 1) == ctb { b = @intCast(i32, d.*.qp[blockAt(d, xQg, yQg - 1)]) }
+    d.*.qpYPred = (a + b + 1) >> 1
+    d.*.qpY = d.*.qpYPred
+}
+
+// QpY of the group with CuQpDeltaVal (8-283).
+fn applyQpDelta(d: *Decoder) -> void {
+    const offset = 6 * (@intCast(i32, d.*.bitDepth) - 8)
+    const range = 52 + offset
+    d.*.qpY = ((d.*.qpYPred + d.*.cuQpDelta + 52 + 2 * offset) % range) - offset
+}
+
+// coding_unit() (7.3.8.5).
+fn codingUnit(d: *Decoder, x0: i32, y0: i32, log2CbSize: i32, depth: u32) -> bool {
+    const s = &d.*.header
+    const p = &d.*.pps.*.std
+    const sps = d.*.sps
+    const nCbS = shl(1, log2CbSize)
+    d.*.bypass = false
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_transquant_bypass_enabled_flag != 0 { d.*.bypass = decision(d, tables.CU_TRANSQUANT_BYPASS_FLAG) == 1 }
+    var skipped = false
+    if s.*.sliceType != h265.SLICE_I {
+        var inc: usize = 0
+        if available(d, x0, y0, x0 - 1, y0) && d.*.skip[blockAt(d, x0 - 1, y0)] != 0 { inc += 1 }
+        if available(d, x0, y0, x0, y0 - 1) && d.*.skip[blockAt(d, x0, y0 - 1)] != 0 { inc += 1 }
+        skipped = decision(d, tables.SKIP_FLAG + inc) == 1
+    }
+    setBlocks(d.*.ctDepth, d, x0, y0, nCbS, nCbS, @intCast(u8, depth))
+    setBlocks(d.*.skip, d, x0, y0, nCbS, nCbS, if skipped { 1 } else { 0 })
+    setBlocks(d.*.coded, d, x0, y0, nCbS, nCbS, 0)
+    setBlocks(d.*.noFilter, d, x0, y0, nCbS, nCbS, if d.*.bypass { 1 } else { 0 })
+    // The CU's edges for the deblocking filter.
+    markEdges(d, x0, y0, nCbS, nCbS, 3)
+    if skipped {
+        d.*.cuPredMode = MODE_SKIP
+        setBlocks(d.*.predMode, d, x0, y0, nCbS, nCbS, MODE_SKIP)
+        d.*.partMode = PART_2Nx2N
+        if !predictionUnit(d, x0, y0, nCbS, x0, y0, nCbS, nCbS, 0, true) { return false }
+        setQp(d, x0, y0, nCbS)
+        return true
+    }
+    var intra = s.*.sliceType == h265.SLICE_I
+    if s.*.sliceType != h265.SLICE_I { intra = decision(d, tables.PRED_MODE_FLAG) == 1 }
+    d.*.cuPredMode = if intra { MODE_INTRA } else { MODE_INTER }
+    setBlocks(d.*.predMode, d, x0, y0, nCbS, nCbS, d.*.cuPredMode)
+    var part = PART_2Nx2N
+    if !intra || log2CbSize == @intCast(i32, d.*.log2MinCb) {
+        part = partMode(d, intra, log2CbSize)
+    }
+    d.*.partMode = part
+    if intra {
+        markIntra(d, x0, y0, nCbS)
+        var pcm = false
+        const sf = sps.*.std.flags.bits0
+        if part == PART_2Nx2N && sf & video.StdVideoH265SpsFlags_pcm_enabled_flag != 0 {
+            const minPcm = @intCast(i32, sps.*.std.log2_min_pcm_luma_coding_block_size_minus3) + 3
+            const maxPcm = minPcm + @intCast(i32, sps.*.std.log2_diff_max_min_pcm_luma_coding_block_size)
+            if log2CbSize >= minPcm && log2CbSize <= maxPcm { pcm = terminate(d) == 1 }
+        }
+        if pcm {
+            if !pcmSamples(d, x0, y0, log2CbSize) { return false }
+            setQp(d, x0, y0, nCbS)
+            return true
+        }
+        intraModesSyntax(d, x0, y0, nCbS, part)
+    } else {
+        d.*.mergeFlag = false
+        const half = nCbS >> 1
+        const quarter = nCbS >> 2
+        if part == PART_2Nx2N {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, nCbS, nCbS, 0, false) { return false }
+        } else if part == PART_2NxN {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, nCbS, half, 0, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0 + half, nCbS, half, 1, false) { return false }
+        } else if part == PART_Nx2N {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, half, nCbS, 0, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0 + half, y0, half, nCbS, 1, false) { return false }
+        } else if part == PART_2NxnU {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, nCbS, quarter, 0, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0 + quarter, nCbS, nCbS - quarter, 1, false) { return false }
+        } else if part == PART_2NxnD {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, nCbS, nCbS - quarter, 0, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0 + nCbS - quarter, nCbS, quarter, 1, false) { return false }
+        } else if part == PART_nLx2N {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, quarter, nCbS, 0, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0 + quarter, y0, nCbS - quarter, nCbS, 1, false) { return false }
+        } else if part == PART_nRx2N {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, nCbS - quarter, nCbS, 0, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0 + nCbS - quarter, y0, quarter, nCbS, 1, false) { return false }
+        } else {
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0, half, half, 0, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0 + half, y0, half, half, 1, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0, y0 + half, half, half, 2, false) { return false }
+            if !predictionUnit(d, x0, y0, nCbS, x0 + half, y0 + half, half, half, 3, false) { return false }
+        }
+    }
+    var rootCbf = true
+    if !intra && !(part == PART_2Nx2N && d.*.mergeFlag) { rootCbf = decision(d, tables.NO_RESIDUAL_DATA_FLAG) == 1 }
+    if rootCbf {
+        const intraSplit = intra && part == PART_NxN
+        var maxDepth = @intCast(u32, sps.*.std.max_transform_hierarchy_depth_inter)
+        if intra { maxDepth = @intCast(u32, sps.*.std.max_transform_hierarchy_depth_intra) + (if intraSplit { @intCast(u32, 1) } else { @intCast(u32, 0) }) }
+        d.*.maxTrafoDepth = maxDepth
+        d.*.intraSplit = intraSplit
+        if !transformTree(d, x0, y0, x0, y0, log2CbSize, 0, 0, true, true, x0, y0, nCbS) { return false }
+    } else if intra {
+        // (Not reached: intra always has a transform tree.)
+    }
+    setQp(d, x0, y0, nCbS)
+    return !d.*.bits.failed
+}
+
+fn setQp(d: *Decoder, x0: i32, y0: i32, size: i32) -> void {
+    d.*.qpPrev = d.*.qpY
+    d.*.qgReset = false
+    var by = y0 >> 2
+    const endY = minimum((y0 + size) >> 2, @intCast(i32, d.*.blocksH))
+    const endX = minimum((x0 + size) >> 2, @intCast(i32, d.*.blocksW))
+    while by < endY {
+        var bx = x0 >> 2
+        while bx < endX {
+            d.*.qp[@intCast(usize, by * @intCast(i32, d.*.blocksW) + bx)] = @intCast(i8, d.*.qpY)
+            bx += 1
+        }
+        by += 1
+    }
+}
+
+// Marks a block's left (bits 0/1) and top (bits 2/3) edges; `kind` 1 a
+// transform edge, 2 a prediction edge, 3 both.
+fn markEdges(d: *Decoder, x0: i32, y0: i32, w: i32, h: i32, kind: u8) -> void {
+    var y = y0
+    while y < y0 + h && y < @intCast(i32, d.*.height) {
+        const at = blockAt(d, x0, y)
+        d.*.edges[at] |= kind
+        y += 4
+    }
+    var x = x0
+    while x < x0 + w && x < @intCast(i32, d.*.width) {
+        const at = blockAt(d, x, y0)
+        d.*.edges[at] |= kind << 2
+        x += 4
+    }
+}
+
+fn partMode(d: *Decoder, intra: bool, log2CbSize: i32) -> u32 {
+    if decision(d, tables.PART_MODE) == 1 { return PART_2Nx2N }
+    if log2CbSize == @intCast(i32, d.*.log2MinCb) {
+        if intra { return PART_NxN }
+        if decision(d, tables.PART_MODE + 1) == 1 { return PART_2NxN }
+        if log2CbSize == 3 { return PART_Nx2N }
+        if decision(d, tables.PART_MODE + 2) == 1 { return PART_Nx2N }
+        return PART_NxN
+    }
+    if d.*.sps.*.std.flags.bits0 & video.StdVideoH265SpsFlags_amp_enabled_flag == 0 {
+        if decision(d, tables.PART_MODE + 1) == 1 { return PART_2NxN }
+        return PART_Nx2N
+    }
+    if decision(d, tables.PART_MODE + 1) == 1 {
+        if decision(d, tables.PART_MODE + 3) == 1 { return PART_2NxN }
+        return if bypass(d) == 1 { PART_2NxnD } else { PART_2NxnU }
+    }
+    if decision(d, tables.PART_MODE + 3) == 1 { return PART_Nx2N }
+    return if bypass(d) == 1 { PART_nRx2N } else { PART_nLx2N }
+}
+
+// The luma intra modes of the CU's prediction blocks (8.4.2) and the
+// chroma mode (8.4.3).
+fn intraModesSyntax(d: *Decoder, x0: i32, y0: i32, nCbS: i32, part: u32) -> void {
+    const count: usize = if part == PART_NxN { 4 } else { 1 }
+    const pbOffset = if part == PART_NxN { nCbS >> 1 } else { nCbS }
+    var prevFlag: [4]bool = undefined
+    var k: usize = 0
+    while k < count {
+        prevFlag[k] = decision(d, tables.PREV_INTRA_LUMA_PRED_FLAG) == 1
+        k += 1
+    }
+    k = 0
+    while k < count {
+        const xPb = x0 + pbOffset * @intCast(i32, k & 1)
+        const yPb = y0 + pbOffset * @intCast(i32, k >> 1)
+        // candidates (8.4.2): left, and above within the CTB row.
+        var a: u32 = 1
+        if available(d, xPb, yPb, xPb - 1, yPb) {
+            const at = blockAt(d, xPb - 1, yPb)
+            if d.*.predMode[at] == MODE_INTRA { a = @intCast(u32, d.*.intraMode[at]) }
+        }
+        var b: u32 = 1
+        if available(d, xPb, yPb, xPb, yPb - 1) && yPb - 1 >= shl(shr(yPb, @intCast(i32, d.*.log2Ctb)), @intCast(i32, d.*.log2Ctb)) {
+            const at = blockAt(d, xPb, yPb - 1)
+            if d.*.predMode[at] == MODE_INTRA { b = @intCast(u32, d.*.intraMode[at]) }
+        }
+        var list: [3]u32 = undefined
+        if a == b {
+            if a < 2 {
+                list[0] = 0
+                list[1] = 1
+                list[2] = 26
+            } else {
+                list[0] = a
+                list[1] = 2 + ((a + 29) % 32)
+                list[2] = 2 + ((a - 2 + 1) % 32)
+            }
+        } else {
+            list[0] = a
+            list[1] = b
+            if a != 0 && b != 0 {
+                list[2] = 0
+            } else if a != 1 && b != 1 {
+                list[2] = 1
+            } else {
+                list[2] = 26
+            }
+        }
+        var mode: u32 = 0
+        if prevFlag[k] {
+            var index: usize = 0
+            if bypass(d) == 1 {
+                index = 1
+                if bypass(d) == 1 { index = 2 }
+            }
+            mode = list[index]
+        } else {
+            mode = bypassBits(d, 5)
+            // The candidates in ascending order.
+            if list[0] > list[1] {
+                const t = list[0]
+                list[0] = list[1]
+                list[1] = t
+            }
+            if list[0] > list[2] {
+                const t = list[0]
+                list[0] = list[2]
+                list[2] = t
+            }
+            if list[1] > list[2] {
+                const t = list[1]
+                list[1] = list[2]
+                list[2] = t
+            }
+            var j: usize = 0
+            while j < 3 {
+                if mode >= list[j] { mode += 1 }
+                j += 1
+            }
+        }
+        d.*.intraModes[k] = mode
+        setBlocks(d.*.intraMode, d, xPb, yPb, pbOffset, pbOffset, @intCast(u8, mode))
+        k += 1
+    }
+    if d.*.chromaFormat == 0 { return }
+    var chroma: u32 = 4
+    if decision(d, tables.INTRA_CHROMA_PRED_MODE) == 1 { chroma = bypassBits(d, 2) }
+    const luma = d.*.intraModes[0]
+    var mode: u32 = luma
+    if chroma == 0 { mode = if luma == 0 { 34 } else { 0 } }
+    if chroma == 1 { mode = if luma == 26 { 34 } else { 26 } }
+    if chroma == 2 { mode = if luma == 10 { 34 } else { 10 } }
+    if chroma == 3 { mode = if luma == 1 { 34 } else { 1 } }
+    d.*.intraChroma = mode
+}
+
+// pcm_sample() (7.3.8.7): the samples as they are, then the entropy
+// decoder anew (9.3.2.5).
+fn pcmSamples(d: *Decoder, x0: i32, y0: i32, log2CbSize: i32) -> bool {
+    const sps = d.*.sps
+    const b = &d.*.bits
+    bits_module.alignToByte(b)
+    const size = shl(1, log2CbSize)
+    const lumaBits = @intCast(u32, sps.*.std.pcm_sample_bit_depth_luma_minus1) + 1
+    const chromaBits = @intCast(u32, sps.*.std.pcm_sample_bit_depth_chroma_minus1) + 1
+    const frame = d.*.frame
+    const width = @intCast(i32, d.*.width)
+    var y: i32 = 0
+    while y < size {
+        var x: i32 = 0
+        while x < size {
+            const value = bits_module.read(b, lumaBits) << @intCast(u5, d.*.bitDepth - lumaBits)
+            frame.*.planes[0][@intCast(usize, (y0 + y) * width + x0 + x)] = @intCast(u16, value)
+            x += 1
+        }
+        y += 1
+    }
+    if d.*.chromaFormat != 0 {
+        var c: usize = 1
+        while c < 3 {
+            y = 0
+            while y < size / 2 {
+                var x: i32 = 0
+                while x < size / 2 {
+                    const value = bits_module.read(b, chromaBits) << @intCast(u5, d.*.bitDepthC - chromaBits)
+                    frame.*.planes[c][@intCast(usize, (y0 / 2 + y) * (width / 2) + x0 / 2 + x)] = @intCast(u16, value)
+                    x += 1
+                }
+                y += 1
+            }
+            c += 1
+        }
+    }
+    if sps.*.std.flags.bits0 & video.StdVideoH265SpsFlags_pcm_loop_filter_disabled_flag != 0 { setBlocks(d.*.noFilter, d, x0, y0, size, size, 1) }
+    setBlocks(d.*.intraMode, d, x0, y0, size, size, 1)
+    cabacStart(d)
+    return !b.*.failed
+}
+
+// transform_tree() (7.3.8.8); (xCu, yCu, nCbS) the CU's.
+fn transformTree(d: *Decoder, x0: i32, y0: i32, xBase: i32, yBase: i32, log2Size: i32, depth: u32, blkIdx: u32, parentCb: bool, parentCr: bool, xCu: i32, yCu: i32, nCbS: i32) -> bool {
+    const sps = d.*.sps
+    const intra = d.*.cuPredMode == MODE_INTRA
+    const interSplit = sps.*.std.max_transform_hierarchy_depth_inter == 0 && d.*.cuPredMode == MODE_INTER && d.*.partMode != PART_2Nx2N && depth == 0
+    var split = false
+    if log2Size <= @intCast(i32, d.*.log2MaxTb) && log2Size > @intCast(i32, d.*.log2MinTb) && depth < d.*.maxTrafoDepth && !(d.*.intraSplit && depth == 0) {
+        split = decision(d, tables.SPLIT_TRANSFORM_FLAG + @intCast(usize, 5 - log2Size)) == 1
+    } else {
+        split = log2Size > @intCast(i32, d.*.log2MaxTb) || (d.*.intraSplit && depth == 0) || interSplit
+    }
+    var cbfCb = false
+    var cbfCr = false
+    if log2Size > 2 && d.*.chromaFormat != 0 {
+        if depth == 0 || parentCb { cbfCb = decision(d, tables.CBF_CB_CR + @intCast(usize, depth)) == 1 }
+        if depth == 0 || parentCr { cbfCr = decision(d, tables.CBF_CB_CR + @intCast(usize, depth)) == 1 }
+    } else if log2Size == 2 && d.*.chromaFormat != 0 {
+        // 4x4 luma blocks: the chroma block is their parent's.
+        cbfCb = parentCb
+        cbfCr = parentCr
+    }
+    if split {
+        const half = shl(1, log2Size - 1)
+        if !transformTree(d, x0, y0, x0, y0, log2Size - 1, depth + 1, 0, cbfCb, cbfCr, xCu, yCu, nCbS) { return false }
+        if !transformTree(d, x0 + half, y0, x0, y0, log2Size - 1, depth + 1, 1, cbfCb, cbfCr, xCu, yCu, nCbS) { return false }
+        if !transformTree(d, x0, y0 + half, x0, y0, log2Size - 1, depth + 1, 2, cbfCb, cbfCr, xCu, yCu, nCbS) { return false }
+        if !transformTree(d, x0 + half, y0 + half, x0, y0, log2Size - 1, depth + 1, 3, cbfCb, cbfCr, xCu, yCu, nCbS) { return false }
+        return true
+    }
+    var cbfLuma = true
+    if intra || depth != 0 || cbfCb || cbfCr { cbfLuma = decision(d, tables.CBF_LUMA + (if depth == 0 { @intCast(usize, 1) } else { @intCast(usize, 0) })) == 1 }
+    return transformUnit(d, x0, y0, xBase, yBase, log2Size, blkIdx, cbfLuma, cbfCb, cbfCr)
+}
+
+// transform_unit() (7.3.8.10) with the intra prediction of its blocks
+// and the residuals added.
+fn transformUnit(d: *Decoder, x0: i32, y0: i32, xBase: i32, yBase: i32, log2Size: i32, blkIdx: u32, cbfLuma: bool, cbfCb: bool, cbfCr: bool) -> bool {
+    const size = shl(1, log2Size)
+    markEdges(d, x0, y0, size, size, 1)
+    const intra = d.*.cuPredMode == MODE_INTRA
+    const chromaHere = d.*.chromaFormat != 0 && (log2Size > 2 || blkIdx == 3)
+    if cbfLuma || cbfCb || cbfCr {
+        const p = &d.*.pps.*.std
+        if p.*.flags.bits0 & video.StdVideoH265PpsFlags_cu_qp_delta_enabled_flag != 0 && !d.*.cuQpDeltaCoded {
+            var magnitude: i32 = 0
+            var inc: usize = 0
+            while magnitude < 5 && decision(d, tables.CU_QP_DELTA + inc) == 1 {
+                magnitude += 1
+                inc = 1
+            }
+            if magnitude >= 5 {
+                var k: u32 = 0
+                while k < 16 && bypass(d) == 1 {
+                    magnitude += shl(1, @intCast(i32, k))
+                    k += 1
+                }
+                while k > 0 {
+                    k -= 1
+                    magnitude += shl(@intCast(i32, bypass(d)), @intCast(i32, k))
+                }
+            }
+            if magnitude > 0 && bypass(d) == 1 { magnitude = -magnitude }
+            d.*.cuQpDelta = magnitude
+            d.*.cuQpDeltaCoded = true
+            applyQpDelta(d)
+        }
+    }
+    // Luma.
+    if intra { predictIntra(d, x0, y0, log2Size, 0, intraModeAt(d, x0, y0)) }
+    if cbfLuma {
+        setBlocks(d.*.coded, d, x0, y0, size, size, 1)
+        if !residual(d, x0, y0, log2Size, 0) { return false }
+    }
+    if !chromaHere { return true }
+    // Chroma: half the size, or the 4x4 luma blocks' parent's at blkIdx 3.
+    var xc = x0 / 2
+    var yc = y0 / 2
+    var log2C = log2Size - 1
+    if log2Size == 2 {
+        xc = xBase / 2
+        yc = yBase / 2
+        log2C = 2
+    }
+    var c: u32 = 1
+    while c < 3 {
+        if intra { predictIntra(d, xc, yc, log2C, c, d.*.intraChroma) }
+        const coded = if c == 1 { cbfCb } else { cbfCr }
+        if coded {
+            if !residual(d, xc, yc, log2C, c) { return false }
+        }
+        c += 1
+    }
+    return true
+}
+
+fn intraModeAt(d: *Decoder, x: i32, y: i32) -> u32 { return @intCast(u32, d.*.intraMode[blockAt(d, x, y)]) }
+
+
+// ---- Residuals (7.3.8.11, 8.6) ----
+
+var LEVEL_SCALE = [6]i32{ 40, 45, 51, 57, 64, 72 }
+var QPC_TABLE = [14]i32{ 29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37 }
+var CTX_MAP_4X4 = [16]u8{ 0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8 }
+var DST = [16]i32{ 29, 55, 74, 84, 74, 74, 0, -74, 84, -29, -74, 55, 55, -84, 74, -29 }
+
+// Qp′ of component `c` (8.6.1).
+fn qpOf(d: *Decoder, c: u32) -> i32 {
+    if c == 0 { return d.*.qpY + 6 * (@intCast(i32, d.*.bitDepth) - 8) }
+    const offsetC = 6 * (@intCast(i32, d.*.bitDepthC) - 8)
+    var offset = if c == 1 { @intCast(i32, d.*.pps.*.std.pps_cb_qp_offset) + d.*.header.cbQpOffset } else { @intCast(i32, d.*.pps.*.std.pps_cr_qp_offset) + d.*.header.crQpOffset }
+    const qpi = clip3(-offsetC, 57, d.*.qpY + offset)
+    var qpc = qpi
+    if d.*.chromaFormat == 1 {
+        if qpi >= 30 && qpi <= 43 {
+            qpc = QPC_TABLE[@intCast(usize, qpi - 30)]
+        } else if qpi > 43 {
+            qpc = qpi - 6
+        }
+    } else if qpi > 51 {
+        qpc = 51
+    }
+    return qpc + offsetC
+}
+
+// residual_coding() of a transform block of component `c` at (x0, y0)
+// in its plane, then the block scaled, transformed and added.
+fn residual(d: *Decoder, x0: i32, y0: i32, log2Size: i32, c: u32) -> bool {
+    const size = shl(1, log2Size)
+    const n = @intCast(usize, size * size)
+    const coeffs: [*]i32 = &d.*.coefficients
+    var k: usize = 0
+    while k < n {
+        coeffs[k] = 0
+        k += 1
+    }
+    const p = &d.*.pps.*.std
+    const chroma = c > 0
+    var transformSkip = false
+    if p.*.flags.bits0 & video.StdVideoH265PpsFlags_transform_skip_enabled_flag != 0 && !d.*.bypass && log2Size <= 2 {
+        transformSkip = decision(d, tables.TRANSFORM_SKIP_FLAG + (if chroma { @intCast(usize, 1) } else { @intCast(usize, 0) })) == 1
+    }
+    // last_sig_coeff_x/y.
+    const max = (log2Size << 1) - 1
+    var ctxOffset: i32 = 15
+    var ctxShift: i32 = log2Size - 2
+    if !chroma {
+        ctxOffset = 3 * (log2Size - 2) + ((log2Size - 1) >> 2)
+        ctxShift = (log2Size + 1) >> 2
+    }
+    var prefixX: i32 = 0
+    while prefixX < max && decision(d, tables.LAST_SIGNIFICANT_COEFF_X_PREFIX + @intCast(usize, shr(prefixX, ctxShift) + ctxOffset)) == 1 { prefixX += 1 }
+    var prefixY: i32 = 0
+    while prefixY < max && decision(d, tables.LAST_SIGNIFICANT_COEFF_Y_PREFIX + @intCast(usize, shr(prefixY, ctxShift) + ctxOffset)) == 1 { prefixY += 1 }
+    var lastX = prefixX
+    var lastY = prefixY
+    if prefixX > 3 {
+        const length = (prefixX >> 1) - 1
+        lastX = shl(1, length) * (2 + (prefixX & 1)) + @intCast(i32, bypassBits(d, @intCast(u32, length)))
+    }
+    if prefixY > 3 {
+        const length = (prefixY >> 1) - 1
+        lastY = shl(1, length) * (2 + (prefixY & 1)) + @intCast(i32, bypassBits(d, @intCast(u32, length)))
+    }
+    // The scan (7.4.9.11).
+    var scanIdx: u32 = 0
+    const intra = d.*.cuPredMode == MODE_INTRA
+    const mode = if chroma { d.*.intraChroma } else { intraModeAt(d, x0, y0) }
+    if intra && (log2Size == 2 || (log2Size == 3 && !chroma)) {
+        if mode >= 6 && mode <= 14 { scanIdx = 2 }
+        if mode >= 22 && mode <= 30 { scanIdx = 1 }
+    }
+    if scanIdx == 2 {
+        const t = lastX
+        lastX = lastY
+        lastY = t
+    }
+    if lastX >= size || lastY >= size { return false }
+    var cgScan: [*]u8 = &DIAG8
+    var subScan: [*]u8 = &DIAG4
+    var cgCount: i32 = 1
+    if scanIdx == 0 {
+        if log2Size == 3 {
+            cgScan = &DIAG2
+            cgCount = 4
+        } else if log2Size == 4 {
+            cgScan = &DIAG4
+            cgCount = 16
+        } else if log2Size == 5 {
+            cgScan = &DIAG8
+            cgCount = 64
+        }
+    } else {
+        subScan = if scanIdx == 1 { &HORIZ4 } else { &VERT4 }
+        if log2Size == 3 {
+            cgScan = if scanIdx == 1 { &HORIZ2 } else { &VERT2 }
+            cgCount = 4
+        }
+    }
+    if log2Size == 2 { cgCount = 1 }
+    // The last coefficient's group and position in it.
+    const lastCg = (lastX >> 2) | ((lastY >> 2) << 4)
+    var lastSubBlock: i32 = 0
+    if cgCount > 1 {
+        while lastSubBlock < cgCount && @intCast(i32, cgScan[@intCast(usize, lastSubBlock)]) != lastCg { lastSubBlock += 1 }
+        if lastSubBlock >= cgCount { return false }
+    }
+    const lastIn = (lastX & 3) | ((lastY & 3) << 4)
+    var lastPos: i32 = 0
+    while lastPos < 16 && @intCast(i32, subScan[@intCast(usize, lastPos)]) != lastIn { lastPos += 1 }
+    // Coded sub-block flags, per CG (8x8 of them at most).
+    var groups: [64]bool = undefined
+    k = 0
+    while k < 64 {
+        groups[k] = false
+        k += 1
+    }
+    const cgWidth = shl(1, log2Size - 2)
+    const signHidingEnabled = p.*.flags.bits0 & video.StdVideoH265PpsFlags_sign_data_hiding_enabled_flag != 0
+    var greater1Ctx: i32 = 1
+    var i = lastSubBlock
+    while i >= 0 {
+        var xCg: i32 = 0
+        var yCg: i32 = 0
+        if cgCount > 1 {
+            const position = @intCast(i32, cgScan[@intCast(usize, i)])
+            xCg = position & 15
+            yCg = position >> 4
+        }
+        var inferDc = false
+        var codedGroup = true
+        if i < lastSubBlock && i > 0 {
+            var ctx: i32 = 0
+            if xCg < cgWidth - 1 && groups[@intCast(usize, yCg * 8 + xCg + 1)] { ctx += 1 }
+            if yCg < cgWidth - 1 && groups[@intCast(usize, (yCg + 1) * 8 + xCg)] { ctx += 1 }
+            codedGroup = decision(d, tables.SIGNIFICANT_COEFF_GROUP_FLAG + @intCast(usize, minimum(ctx, 1) + (if chroma { 2 } else { 0 }))) == 1
+            inferDc = true
+        }
+        groups[@intCast(usize, yCg * 8 + xCg)] = codedGroup
+        var prevSig: i32 = 0
+        if xCg < cgWidth - 1 && groups[@intCast(usize, yCg * 8 + xCg + 1)] { prevSig += 1 }
+        if yCg < cgWidth - 1 && groups[@intCast(usize, (yCg + 1) * 8 + xCg)] { prevSig += 2 }
+        // The significant positions (in the CG's scan), last first.
+        var significant: [16]i32 = undefined
+        var count: usize = 0
+        var nEnd: i32 = 15
+        if i == lastSubBlock {
+            nEnd = lastPos - 1
+            significant[0] = lastPos
+            count = 1
+        }
+        if codedGroup {
+            var base: i32 = if chroma { 27 } else { 0 }
+            if log2Size != 2 {
+                if !chroma {
+                    if xCg > 0 || yCg > 0 { base += 3 }
+                    if log2Size == 3 {
+                        base += if scanIdx == 0 { 9 } else { 15 }
+                    } else {
+                        base += 21
+                    }
+                } else {
+                    base += if log2Size == 3 { 9 } else { 12 }
+                }
+            }
+            var position = nEnd
+            while position > 0 {
+                const at = @intCast(i32, subScan[@intCast(usize, position)])
+                const xP = at & 15
+                const yP = at >> 4
+                var ctx: i32 = 0
+                if log2Size == 2 {
+                    ctx = @intCast(i32, CTX_MAP_4X4[@intCast(usize, (yP << 2) + xP)])
+                } else if prevSig == 0 {
+                    ctx = if xP + yP == 0 { 2 } else if xP + yP < 3 { 1 } else { 0 }
+                } else if prevSig == 1 {
+                    ctx = if yP == 0 { 2 } else if yP == 1 { 1 } else { 0 }
+                } else if prevSig == 2 {
+                    ctx = if xP == 0 { 2 } else if xP == 1 { 1 } else { 0 }
+                } else {
+                    ctx = 2
+                }
+                if decision(d, tables.SIGNIFICANT_COEFF_FLAG + @intCast(usize, ctx + base)) == 1 {
+                    significant[count] = position
+                    count += 1
+                    inferDc = false
+                }
+                position -= 1
+            }
+            if nEnd >= 0 {
+                if !inferDc {
+                    var ctx: i32 = base + 2
+                    if i == 0 { ctx = if chroma { 27 } else { 0 } }
+                    if decision(d, tables.SIGNIFICANT_COEFF_FLAG + @intCast(usize, ctx)) == 1 {
+                        significant[count] = 0
+                        count += 1
+                    }
+                } else {
+                    significant[count] = 0
+                    count += 1
+                }
+            }
+        }
+        if count > 0 {
+            var ctxSet: i32 = if i > 0 && !chroma { 2 } else { 0 }
+            if i != lastSubBlock && greater1Ctx == 0 { ctxSet += 1 }
+            greater1Ctx = 1
+            var greater1: [8]i32 = undefined
+            var firstGreater1: i32 = -1
+            var m: usize = 0
+            while m < count && m < 8 {
+                const inc = (ctxSet << 2) + greater1Ctx + (if chroma { 16 } else { 0 })
+                greater1[m] = @intCast(i32, decision(d, tables.COEFF_ABS_LEVEL_GREATER1_FLAG + @intCast(usize, inc)))
+                if greater1[m] == 1 {
+                    greater1Ctx = 0
+                    if firstGreater1 == -1 { firstGreater1 = @intCast(i32, m) }
+                } else if greater1Ctx > 0 && greater1Ctx < 3 {
+                    greater1Ctx += 1
+                }
+                m += 1
+            }
+            const lastNz = significant[0]
+            const firstNz = significant[count - 1]
+            const signHidden = signHidingEnabled && !d.*.bypass && lastNz - firstNz >= 4
+            if firstGreater1 != -1 {
+                greater1[@intCast(usize, firstGreater1)] += @intCast(i32, decision(d, tables.COEFF_ABS_LEVEL_GREATER2_FLAG + @intCast(usize, ctxSet + (if chroma { 4 } else { 0 }))))
+            }
+            const signCount = if signHidden { count - 1 } else { count }
+            var signs: u32 = 0
+            if signCount > 0 { signs = bypassBits(d, @intCast(u32, signCount)) << @intCast(u5, 32 - signCount) }
+            var rice: i32 = 0
+            var sumAbs: i32 = 0
+            m = 0
+            while m < count {
+                const position = significant[m]
+                const at = @intCast(i32, subScan[@intCast(usize, position)])
+                const xC = (xCg << 2) + (at & 15)
+                const yC = (yCg << 2) + (at >> 4)
+                var level: i32 = 0
+                if m < 8 {
+                    level = 1 + greater1[m]
+                    const threshold: i32 = if @intCast(i32, m) == firstGreater1 { 3 } else { 2 }
+                    if level == threshold {
+                        level += remainingLevel(d, rice)
+                        if level > 3 * shl(1, rice) { rice = minimum(rice + 1, 4) }
+                    }
+                } else {
+                    level = 1 + remainingLevel(d, rice)
+                    if level > 3 * shl(1, rice) { rice = minimum(rice + 1, 4) }
+                }
+                if signHidden {
+                    sumAbs += level
+                    if position == firstNz && (sumAbs & 1) == 1 { level = -level }
+                }
+                if !(signHidden && position == firstNz) {
+                    if signs & 0x80000000 != 0 { level = -level }
+                    signs <<= 1
+                }
+                coeffs[@intCast(usize, yC * size + xC)] = level
+                m += 1
+            }
+        }
+        i -= 1
+    }
+    if d.*.bits.failed { return false }
+    reconstructResidual(d, x0, y0, log2Size, c, transformSkip, intra && !chroma && log2Size == 2)
+    return true
+}
+
+// coeff_abs_level_remaining (9.3.3.11) with Rice parameter `rice`.
+fn remainingLevel(d: *Decoder, rice: i32) -> i32 {
+    var prefix: i32 = 0
+    while prefix < 32 && bypass(d) == 1 { prefix += 1 }
+    if prefix < 3 {
+        return shl(prefix, rice) + @intCast(i32, bypassBits(d, @intCast(u32, rice)))
+    }
+    const extra = prefix - 3
+    if extra + rice > 26 {
+        d.*.bits.failed = true
+        return 0
+    }
+    return shl(shl(1, extra) + 2, rice) + @intCast(i32, bypassBits(d, @intCast(u32, extra + rice)))
+}
+
+// The coefficients scaled (8.6.3), transformed (8.6.4) and the residual
+// added to the plane (8.6.7).
+fn reconstructResidual(d: *Decoder, x0: i32, y0: i32, log2Size: i32, c: u32, transformSkip: bool, dst: bool) -> void {
+    const size = shl(1, log2Size)
+    const coeffs: [*]i32 = &d.*.coefficients
+    const out: [*]i32 = &d.*.residual
+    const n = @intCast(usize, size * size)
+    const depth = @intCast(i32, if c == 0 { d.*.bitDepth } else { d.*.bitDepthC })
+    if d.*.bypass {
+        var k: usize = 0
+        while k < n {
+            out[k] = coeffs[k]
+            k += 1
+        }
+    } else {
+        // Scaling.
+        const qp = qpOf(d, c)
+        const bdShift = depth + log2Size - 5
+        const scale = @intCast(i64, LEVEL_SCALE[@intCast(usize, qp % 6)]) << @intCast(u6, qp / 6)
+        const lists = d.*.sps.*.std.flags.bits0 & video.StdVideoH265SpsFlags_scaling_list_enabled_flag != 0 && !(transformSkip && log2Size > 2)
+        const matrix = @intCast(usize, (if d.*.cuPredMode == MODE_INTRA { 0 } else { 3 }) + @intCast(i32, c))
+        const sizeId = @intCast(usize, log2Size - 2)
+        const round = @intCast(i64, 1) << @intCast(u6, bdShift - 1)
+        // The extent of the coefficients (the transform skips the rest).
+        var rows: i32 = 0
+        var columns: i32 = 0
+        var y: i32 = 0
+        while y < size {
+            var x: i32 = 0
+            while x < size {
+                const at = @intCast(usize, y * size + x)
+                if coeffs[at] != 0 {
+                    var m: i64 = 16
+                    if lists {
+                        if log2Size == 2 {
+                            m = @intCast(i64, d.*.scaling[0][matrix][@intCast(usize, y * 4 + x)])
+                        } else if log2Size >= 4 && x == 0 && y == 0 {
+                            m = @intCast(i64, d.*.scalingDc[sizeId][matrix])
+                        } else {
+                            const step = log2Size - 3
+                            m = @intCast(i64, d.*.scaling[sizeId][matrix][@intCast(usize, shr(y, step) * 8 + shr(x, step))])
+                        }
+                    }
+                    var value = (@intCast(i64, coeffs[at]) * m * scale + round) >> @intCast(u6, bdShift)
+                    if value < -32768 { value = -32768 }
+                    if value > 32767 { value = 32767 }
+                    coeffs[at] = @intCast(i32, value)
+                    if y >= rows { rows = y + 1 }
+                    if x >= columns { columns = x + 1 }
+                }
+                x += 1
+            }
+            y += 1
+        }
+        if transformSkip {
+            const tsShift = 5 + log2Size
+            const shift = 20 - depth
+            var k: usize = 0
+            while k < n {
+                out[k] = (shl(coeffs[k], tsShift) + shl(1, shift - 1)) >> @intCast(u5, shift)
+                k += 1
+            }
+        } else {
+            inverseTransform(d, log2Size, depth, dst, rows, columns)
+        }
+    }
+    // Added to the prediction, clipped.
+    const frame = d.*.frame
+    const plane = frame.*.planes[c]
+    const stride = @intCast(i32, if c == 0 { d.*.width } else { d.*.width / 2 })
+    const top = shl(1, depth) - 1
+    var y: i32 = 0
+    while y < size {
+        var x: i32 = 0
+        while x < size {
+            const at = @intCast(usize, (y0 + y) * stride + x0 + x)
+            plane[at] = @intCast(u16, clip3(0, top, @intCast(i32, plane[at]) + out[@intCast(usize, y * size + x)]))
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// The two-stage inverse transform (8.6.4.2) of the scaled coefficients
+// into the residual: columns, clipped to 16 bits after >> 7, then rows
+// >> (20 - bitDepth). Coefficients only in the first `rows` rows and
+// `columns` columns.
+fn inverseTransform(d: *Decoder, log2Size: i32, depth: i32, dst: bool, rows: i32, columns: i32) -> void {
+    const size = shl(1, log2Size)
+    const coeffs: [*]i32 = &d.*.coefficients
+    const mid: [*]i32 = &d.*.intermediate
+    const out: [*]i32 = &d.*.residual
+    const stride = shr(32, log2Size)
+    const shift2 = 20 - depth
+    const round2 = shl(1, shift2 - 1)
+    // Columns (those past `columns` are zero).
+    var x: i32 = 0
+    while x < size {
+        if x >= columns {
+            var i: i32 = 0
+            while i < size {
+                mid[@intCast(usize, i * size + x)] = 0
+                i += 1
+            }
+            x += 1
+            continue
+        }
+        var i: i32 = 0
+        while i < size {
+            var sum: i32 = 0
+            var j: i32 = 0
+            while j < rows {
+                const coefficient = coeffs[@intCast(usize, j * size + x)]
+                if coefficient != 0 {
+                    const basis = if dst { DST[@intCast(usize, j * 4 + i)] } else { @intCast(i32, tables.TRANSFORM[@intCast(usize, j * stride * 32 + i)]) }
+                    sum += basis * coefficient
+                }
+                j += 1
+            }
+            mid[@intCast(usize, i * size + x)] = clip3(-32768, 32767, (sum + 64) >> 7)
+            i += 1
+        }
+        x += 1
+    }
+    // Rows.
+    var y: i32 = 0
+    while y < size {
+        var i: i32 = 0
+        while i < size {
+            var sum: i32 = 0
+            var j: i32 = 0
+            while j < columns {
+                const value = mid[@intCast(usize, y * size + j)]
+                if value != 0 {
+                    const basis = if dst { DST[@intCast(usize, j * 4 + i)] } else { @intCast(i32, tables.TRANSFORM[@intCast(usize, j * stride * 32 + i)]) }
+                    sum += basis * value
+                }
+                j += 1
+            }
+            out[@intCast(usize, y * size + i)] = (sum + round2) >> @intCast(u5, shift2)
+            i += 1
+        }
+        y += 1
+    }
+}
+
+// ---- Intra prediction (8.4.4.2) ----
+
+var INTRA_ANGLE = [35]i32{ 0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32 }
+var INV_ANGLE = [15]i32{ -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482, -630, -910, -1638, -4096 }
+
+// Whether the sample at (x, y) of component `c`'s plane can be a
+// reference for the block at (xCurr, yCurr) (both in the plane): decoded,
+// in the slice and tile, intra with constrained intra prediction.
+fn intraAvailable(d: *Decoder, c: u32, xCurr: i32, yCurr: i32, x: i32, y: i32) -> bool {
+    const scale: i32 = if c == 0 { 0 } else { 1 }
+    const xL = shl(x, scale)
+    const yL = shl(y, scale)
+    if !available(d, shl(xCurr, scale), shl(yCurr, scale), xL, yL) { return false }
+    if d.*.pps.*.std.flags.bits0 & video.StdVideoH265PpsFlags_constrained_intra_pred_flag != 0 && d.*.predMode[blockAt(d, xL, yL)] != MODE_INTRA { return false }
+    return true
+}
+
+// The prediction of the block of component `c` at (x0, y0) in its plane,
+// 2^log2Size square, with intra mode `mode`, written into the plane.
+fn predictIntra(d: *Decoder, x0: i32, y0: i32, log2Size: i32, c: u32, mode: u32) -> void {
+    const n = shl(1, log2Size)
+    const depth = @intCast(i32, if c == 0 { d.*.bitDepth } else { d.*.bitDepthC })
+    const plane = d.*.frame.*.planes[c]
+    const stride = @intCast(i32, if c == 0 { d.*.width } else { d.*.width / 2 })
+    // The references in one line: p[-1][2n-1] .. p[-1][0] (0 .. 2n-1),
+    // p[-1][-1] (2n), p[0][-1] .. p[2n-1][-1] (2n+1 .. 4n).
+    const line: [*]i32 = &d.*.refLine
+    var valid: [257]bool = undefined
+    const total = 4 * n + 1
+    // Availability per minimum block (4 luma samples, 2 chroma ones).
+    const unit: i32 = if c == 0 { 4 } else { 2 }
+    var any = false
+    var k: i32 = 0
+    while k < 2 * n {
+        // Left column, from the bottom.
+        const y = y0 + 2 * n - 1 - k
+        // (Checked at each minimum block's lowest sample.)
+        var ok = false
+        if (y - y0) % unit == unit - 1 { ok = intraAvailable(d, c, x0, y0, x0 - 1, y) } else { ok = valid[@intCast(usize, k - 1)] }
+        valid[@intCast(usize, k)] = ok
+        if ok {
+            line[@intCast(usize, k)] = @intCast(i32, plane[@intCast(usize, y * stride + x0 - 1)])
+            any = true
+        }
+        k += 1
+    }
+    const cornerOk = intraAvailable(d, c, x0, y0, x0 - 1, y0 - 1)
+    valid[@intCast(usize, 2 * n)] = cornerOk
+    if cornerOk {
+        line[@intCast(usize, 2 * n)] = @intCast(i32, plane[@intCast(usize, (y0 - 1) * stride + x0 - 1)])
+        any = true
+    }
+    k = 0
+    while k < 2 * n {
+        const x = x0 + k
+        var ok = false
+        if k % unit == 0 { ok = intraAvailable(d, c, x0, y0, x, y0 - 1) } else { ok = valid[@intCast(usize, 2 * n + k)] }
+        valid[@intCast(usize, 2 * n + 1 + k)] = ok
+        if ok {
+            line[@intCast(usize, 2 * n + 1 + k)] = @intCast(i32, plane[@intCast(usize, (y0 - 1) * stride + x)])
+            any = true
+        }
+        k += 1
+    }
+    // Substitution (8.4.4.2.2).
+    if !any {
+        const middle = shl(1, depth - 1)
+        k = 0
+        while k < total {
+            line[@intCast(usize, k)] = middle
+            k += 1
+        }
+    } else {
+        if !valid[0] {
+            var j: i32 = 1
+            while j < total && !valid[@intCast(usize, j)] { j += 1 }
+            line[0] = line[@intCast(usize, j)]
+        }
+        k = 1
+        while k < total {
+            if !valid[@intCast(usize, k)] { line[@intCast(usize, k)] = line[@intCast(usize, k - 1)] }
+            k += 1
+        }
+    }
+    // Filtering (8.4.4.2.3), luma only.
+    var source: [*]i32 = line
+    if c == 0 && mode != 1 && n != 4 {
+        const distance = minimum(absolute(@intCast(i32, mode) - 26), absolute(@intCast(i32, mode) - 10))
+        const threshold: i32 = if n == 8 { 7 } else if n == 16 { 1 } else { 0 }
+        if distance > threshold {
+            const filtered: [*]i32 = &d.*.filtered
+            const sf = d.*.sps.*.std.flags.bits0
+            const bottom = line[0]
+            const corner = line[@intCast(usize, 2 * n)]
+            const right = line[@intCast(usize, 4 * n)]
+            const strong = sf & video.StdVideoH265SpsFlags_strong_intra_smoothing_enabled_flag != 0 && n == 32 && absolute(corner + right - 2 * line[@intCast(usize, 3 * n)]) < shl(1, depth - 5) && absolute(corner + bottom - 2 * line[@intCast(usize, n)]) < shl(1, depth - 5)
+            if strong {
+                // Linear between the corner and the ends.
+                filtered[0] = bottom
+                filtered[@intCast(usize, 2 * n)] = corner
+                filtered[@intCast(usize, 4 * n)] = right
+                k = 0
+                while k < 63 {
+                    // p[-1][k] at 63 - k, p[k][-1] at 65 + k.
+                    filtered[@intCast(usize, 63 - k)] = ((63 - k) * corner + (k + 1) * bottom + 32) >> 6
+                    filtered[@intCast(usize, 65 + k)] = ((63 - k) * corner + (k + 1) * right + 32) >> 6
+                    k += 1
+                }
+            } else {
+                filtered[0] = line[0]
+                filtered[@intCast(usize, total - 1)] = line[@intCast(usize, total - 1)]
+                k = 1
+                while k < total - 1 {
+                    filtered[@intCast(usize, k)] = (line[@intCast(usize, k - 1)] + 2 * line[@intCast(usize, k)] + line[@intCast(usize, k + 1)] + 2) >> 2
+                    k += 1
+                }
+            }
+            source = filtered
+        }
+    }
+    const corner = 2 * n
+    const top = 2 * n + 1
+    // left(y) = source[2n - 1 - y], top(x) = source[2n + 1 + x].
+    const maxValue = shl(1, depth) - 1
+    if mode == 0 {
+        // Planar.
+        const topRight = source[@intCast(usize, top + n)]
+        const bottomLeft = source[@intCast(usize, corner - 1 - n)]
+        var y: i32 = 0
+        while y < n {
+            const left = source[@intCast(usize, corner - 1 - y)]
+            var x: i32 = 0
+            while x < n {
+                const above = source[@intCast(usize, top + x)]
+                const value = ((n - 1 - x) * left + (x + 1) * topRight + (n - 1 - y) * above + (y + 1) * bottomLeft + n) >> @intCast(u5, log2Size + 1)
+                plane[@intCast(usize, (y0 + y) * stride + x0 + x)] = @intCast(u16, value)
+                x += 1
+            }
+            y += 1
+        }
+        return
+    }
+    if mode == 1 {
+        // DC.
+        var sum: i32 = n
+        k = 0
+        while k < n {
+            sum += source[@intCast(usize, top + k)] + source[@intCast(usize, corner - 1 - k)]
+            k += 1
+        }
+        const dc = sum >> @intCast(u5, log2Size + 1)
+        var y: i32 = 0
+        while y < n {
+            var x: i32 = 0
+            while x < n {
+                plane[@intCast(usize, (y0 + y) * stride + x0 + x)] = @intCast(u16, dc)
+                x += 1
+            }
+            y += 1
+        }
+        if c == 0 && n < 32 {
+            plane[@intCast(usize, y0 * stride + x0)] = @intCast(u16, (source[@intCast(usize, corner - 1)] + 2 * dc + source[@intCast(usize, top)] + 2) >> 2)
+            k = 1
+            while k < n {
+                plane[@intCast(usize, y0 * stride + x0 + k)] = @intCast(u16, (source[@intCast(usize, top + k)] + 3 * dc + 2) >> 2)
+                plane[@intCast(usize, (y0 + k) * stride + x0)] = @intCast(u16, (source[@intCast(usize, corner - 1 - k)] + 3 * dc + 2) >> 2)
+                k += 1
+            }
+        }
+        return
+    }
+    // Angular: ref[] (offset 64) along the main direction.
+    const angle = INTRA_ANGLE[@intCast(usize, mode)]
+    const ref: [*]i32 = &d.*.refTop
+    const base = 64
+    const vertical = mode >= 18
+    // main(i) the samples along the main side: i = 0 the corner.
+    k = 0
+    while k <= 2 * n {
+        ref[@intCast(usize, base + k)] = if vertical { source[@intCast(usize, corner + k)] } else { source[@intCast(usize, corner - k)] }
+        k += 1
+    }
+    if angle < 0 {
+        const last = (n * angle) >> 5
+        if last < -1 {
+            const inverse = INV_ANGLE[@intCast(usize, mode - 11)]
+            k = last
+            while k <= -1 {
+                const side = -1 + ((k * inverse + 128) >> 8)
+                // The other side's sample at side: index side + 1 from the corner.
+                ref[@intCast(usize, base + k)] = if vertical { source[@intCast(usize, corner - (side + 1))] } else { source[@intCast(usize, corner + side + 1)] }
+                k += 1
+            }
+        }
+    }
+    var y: i32 = 0
+    while y < n {
+        var x: i32 = 0
+        while x < n {
+            // Along the main direction: i the position across, j along.
+            const i = if vertical { x } else { y }
+            const j = if vertical { y } else { x }
+            const position = (j + 1) * angle
+            const index = position >> 5
+            const fraction = position & 31
+            var value: i32 = 0
+            if fraction != 0 {
+                value = ((32 - fraction) * ref[@intCast(usize, base + i + index + 1)] + fraction * ref[@intCast(usize, base + i + index + 2)] + 16) >> 5
+            } else {
+                value = ref[@intCast(usize, base + i + index + 1)]
+            }
+            plane[@intCast(usize, (y0 + y) * stride + x0 + x)] = @intCast(u16, value)
+            x += 1
+        }
+        y += 1
+    }
+    // The edge filters of the pure vertical and horizontal modes.
+    if c == 0 && n < 32 {
+        if mode == 26 {
+            k = 0
+            while k < n {
+                const value = source[@intCast(usize, top)] + ((source[@intCast(usize, corner - 1 - k)] - source[@intCast(usize, corner)]) >> 1)
+                plane[@intCast(usize, (y0 + k) * stride + x0)] = @intCast(u16, clip3(0, maxValue, value))
+                k += 1
+            }
+        } else if mode == 10 {
+            k = 0
+            while k < n {
+                const value = source[@intCast(usize, corner - 1)] + ((source[@intCast(usize, top + k)] - source[@intCast(usize, corner)]) >> 1)
+                plane[@intCast(usize, y0 * stride + x0 + k)] = @intCast(u16, clip3(0, maxValue, value))
+                k += 1
+            }
+        }
+    }
+}
+
+// ---- Inter prediction (8.5.3) ----
+
+// The motion of a prediction block: per list the vector and the
+// reference index (-1: the list unused).
+const Motion = struct {
+    mv: [2][2]i32
+    ref: [2]i32
+}
+
+fn wrap16(value: i32) -> i32 {
+    const u = value & 0xffff
+    return if u >= 32768 { u - 65536 } else { u }
+}
+
+// The motion of the current picture's 4x4 block `at`.
+fn motionOf(d: *Decoder, at: usize, out: *Motion) -> void {
+    const frame = d.*.frame
+    var list: usize = 0
+    while list < 2 {
+        out.*.ref[list] = @intCast(i32, frame.*.refIdx[at * 2 + list])
+        out.*.mv[list][0] = @intCast(i32, frame.*.mv[at * 4 + list * 2])
+        out.*.mv[list][1] = @intCast(i32, frame.*.mv[at * 4 + list * 2 + 1])
+        list += 1
+    }
+}
+
+fn sameMotion(a: *Motion, b: *Motion) -> bool {
+    var list: usize = 0
+    while list < 2 {
+        if a.*.ref[list] != b.*.ref[list] { return false }
+        if a.*.ref[list] >= 0 && (a.*.mv[list][0] != b.*.mv[list][0] || a.*.mv[list][1] != b.*.mv[list][1]) { return false }
+        list += 1
+    }
+    return true
+}
+
+// The motion vector `mv` scaled by the POC distances (8-179 to 8-182).
+fn scaleMv(mv: i32, td0: i32, tb0: i32) -> i32 {
+    const td = clip3(-128, 127, td0)
+    const tb = clip3(-128, 127, tb0)
+    const tx = (16384 + (absolute(td) >> 1)) / td
+    const factor = clip3(-4096, 4095, (tb * tx + 32) >> 6)
+    const product = factor * mv
+    return clip3(-32768, 32767, sign(product) * ((absolute(product) + 127) >> 8))
+}
+
+// The temporal motion vector predictor of list `x` with reference
+// `refIdx` (8.5.3.2.8); false when there is none.
+fn temporalMv(d: *Decoder, xCb: i32, yCb: i32, xPb: i32, yPb: i32, nPbW: i32, nPbH: i32, refIdx: i32, x: usize, out: *[2]i32) -> bool {
+    const s = &d.*.header
+    const colList: usize = if s.*.sliceType == h265.SLICE_B && !s.*.colFromL0 { 1 } else { 0 }
+    const colSlot = d.*.refs[colList][@intCast(usize, s.*.colRefIdx)]
+    if colSlot == d.*.slot { return false }
+    const col = &d.*.frames[colSlot]
+    const log2Ctb = @intCast(i32, d.*.log2Ctb)
+    // (The collocated blocks are in the CTB row's rows at most.)
+    if d.*.threaded { awaitCounter(&col.*.motionRows, &col.*.writing, @intCast(u32, minimum(shl(shr(yCb, log2Ctb) + 1, log2Ctb), @intCast(i32, d.*.height)))) }
+    // Bottom right, in the CTB row; else the centre.
+    const xBr = xPb + nPbW
+    const yBr = yPb + nPbH
+    if shr(yCb, log2Ctb) == shr(yBr, log2Ctb) && yBr < @intCast(i32, d.*.height) && xBr < @intCast(i32, d.*.width) {
+        if colocated(d, col, (xBr >> 4) << 4, (yBr >> 4) << 4, refIdx, x, out) { return true }
+    }
+    return colocated(d, col, ((xPb + (nPbW >> 1)) >> 4) << 4, ((yPb + (nPbH >> 1)) >> 4) << 4, refIdx, x, out)
+}
+
+// The collocated motion vectors (8.5.3.2.9) of the block at (x, y) in
+// `col`.
+fn colocated(d: *Decoder, col: *Frame, x: i32, y: i32, refIdx: i32, list: usize, out: *[2]i32) -> bool {
+    const at = blockAt(d, x, y)
+    if col.*.intra[at] != 0 { return false }
+    const ref0 = col.*.refIdx[at * 2]
+    const ref1 = col.*.refIdx[at * 2 + 1]
+    if ref0 < 0 && ref1 < 0 { return false }
+    var listCol: usize = 0
+    if ref0 < 0 {
+        listCol = 1
+    } else if ref1 >= 0 {
+        if d.*.noBackwardPred {
+            listCol = list
+        } else {
+            listCol = if d.*.header.colFromL0 { 1 } else { 0 }
+        }
+    }
+    const currentLong = d.*.refLong[list][@intCast(usize, refIdx)]
+    const colLong = col.*.refLong[at * 2 + listCol] != 0
+    if currentLong != colLong { return false }
+    const mvx = @intCast(i32, col.*.mv[at * 4 + listCol * 2])
+    const mvy = @intCast(i32, col.*.mv[at * 4 + listCol * 2 + 1])
+    const colDiff = col.*.poc - col.*.refPoc[at * 2 + listCol]
+    const currDiff = d.*.poc - d.*.refPocs[list][@intCast(usize, refIdx)]
+    if currentLong || colDiff == currDiff || colDiff == 0 {
+        out.*[0] = mvx
+        out.*[1] = mvy
+    } else {
+        out.*[0] = scaleMv(mvx, colDiff, currDiff)
+        out.*[1] = scaleMv(mvy, colDiff, currDiff)
+    }
+    return true
+}
+
+// The merge candidate `mergeIdx` (8.5.3.2.2 to 8.5.3.2.5).
+fn mergeMotion(d: *Decoder, xCb: i32, yCb: i32, nCbS: i32, xPb0: i32, yPb0: i32, nPbW0: i32, nPbH0: i32, partIdx0: u32, mergeIdx: u32, out: *Motion) -> void {
+    const s = &d.*.header
+    var xPb = xPb0
+    var yPb = yPb0
+    var nPbW = nPbW0
+    var nPbH = nPbH0
+    var partIdx = partIdx0
+    const level = @intCast(i32, d.*.pps.*.std.log2_parallel_merge_level_minus2) + 2
+    if level > 2 && nCbS == 8 {
+        xPb = xCb
+        yPb = yCb
+        nPbW = nCbS
+        nPbH = nCbS
+        partIdx = 0
+    }
+    const part = d.*.partMode
+    var list: [5]Motion = undefined
+    var count: u32 = 0
+    const wanted = mergeIdx + 1
+    // A1.
+    const xA1 = xPb - 1
+    const yA1 = yPb + nPbH - 1
+    var a1 = false
+    var motionA1: Motion = undefined
+    if !(shr(xPb, level) == shr(xA1, level) && shr(yPb, level) == shr(yA1, level)) && !(partIdx == 1 && (part == PART_Nx2N || part == PART_nLx2N || part == PART_nRx2N)) {
+        a1 = availablePb(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, xA1, yA1)
+        if a1 {
+            motionOf(d, blockAt(d, xA1, yA1), &motionA1)
+            list[count] = motionA1
+            count += 1
+        }
+    }
+    // B1.
+    const xB1 = xPb + nPbW - 1
+    const yB1 = yPb - 1
+    var b1 = false
+    var motionB1: Motion = undefined
+    if count < wanted && !(shr(xPb, level) == shr(xB1, level) && shr(yPb, level) == shr(yB1, level)) && !(partIdx == 1 && (part == PART_2NxN || part == PART_2NxnU || part == PART_2NxnD)) {
+        b1 = availablePb(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, xB1, yB1)
+        if b1 {
+            motionOf(d, blockAt(d, xB1, yB1), &motionB1)
+            if !(a1 && sameMotion(&motionA1, &motionB1)) {
+                list[count] = motionB1
+                count += 1
+            }
+        }
+    }
+    // B0.
+    const xB0 = xPb + nPbW
+    const yB0 = yPb - 1
+    var b0 = false
+    if count < wanted && !(shr(xPb, level) == shr(xB0, level) && shr(yPb, level) == shr(yB0, level)) {
+        b0 = availablePb(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, xB0, yB0)
+        if b0 {
+            var motion: Motion = undefined
+            motionOf(d, blockAt(d, xB0, yB0), &motion)
+            if !(b1 && sameMotion(&motionB1, &motion)) {
+                list[count] = motion
+                count += 1
+            }
+        }
+    }
+    // A0.
+    const xA0 = xPb - 1
+    const yA0 = yPb + nPbH
+    var a0 = false
+    if count < wanted && !(shr(xPb, level) == shr(xA0, level) && shr(yPb, level) == shr(yA0, level)) {
+        a0 = availablePb(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, xA0, yA0)
+        if a0 {
+            var motion: Motion = undefined
+            motionOf(d, blockAt(d, xA0, yA0), &motion)
+            if !(a1 && sameMotion(&motionA1, &motion)) {
+                list[count] = motion
+                count += 1
+            }
+        }
+    }
+    // B2.
+    const xB2 = xPb - 1
+    const yB2 = yPb - 1
+    if count < wanted && count != 4 && !(shr(xPb, level) == shr(xB2, level) && shr(yPb, level) == shr(yB2, level)) {
+        if availablePb(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, xB2, yB2) {
+            var motion: Motion = undefined
+            motionOf(d, blockAt(d, xB2, yB2), &motion)
+            if !(a1 && sameMotion(&motionA1, &motion)) && !(b1 && sameMotion(&motionB1, &motion)) {
+                list[count] = motion
+                count += 1
+            }
+        }
+    }
+    // Temporal.
+    if count < wanted && s.*.temporalMvp {
+        var motion: Motion = undefined
+        motion.ref[0] = -1
+        motion.ref[1] = -1
+        motion.mv[0][0] = 0
+        motion.mv[0][1] = 0
+        motion.mv[1][0] = 0
+        motion.mv[1][1] = 0
+        if temporalMv(d, xCb, yCb, xPb, yPb, nPbW, nPbH, 0, 0, &motion.mv[0]) { motion.ref[0] = 0 }
+        if s.*.sliceType == h265.SLICE_B && temporalMv(d, xCb, yCb, xPb, yPb, nPbW, nPbH, 0, 1, &motion.mv[1]) { motion.ref[1] = 0 }
+        if motion.ref[0] >= 0 || motion.ref[1] >= 0 {
+            list[count] = motion
+            count += 1
+        }
+    }
+    // Combined bi-predictive (B slices).
+    const original = count
+    if count < wanted && s.*.sliceType == h265.SLICE_B && original > 1 && original < s.*.maxMergeCand {
+        var combIdx: u32 = 0
+        while combIdx < original * (original - 1) && count < wanted {
+            const l0 = &list[@intCast(usize, COMBINED_L0[combIdx])]
+            const l1 = &list[@intCast(usize, COMBINED_L1[combIdx])]
+            if l0.*.ref[0] >= 0 && l1.*.ref[1] >= 0 && (d.*.refPocs[0][@intCast(usize, l0.*.ref[0])] != d.*.refPocs[1][@intCast(usize, l1.*.ref[1])] || l0.*.mv[0][0] != l1.*.mv[1][0] || l0.*.mv[0][1] != l1.*.mv[1][1]) {
+                var motion: Motion = undefined
+                motion.ref[0] = l0.*.ref[0]
+                motion.ref[1] = l1.*.ref[1]
+                motion.mv[0][0] = l0.*.mv[0][0]
+                motion.mv[0][1] = l0.*.mv[0][1]
+                motion.mv[1][0] = l1.*.mv[1][0]
+                motion.mv[1][1] = l1.*.mv[1][1]
+                list[count] = motion
+                count += 1
+            }
+            combIdx += 1
+        }
+    }
+    // Zero candidates.
+    var references = d.*.refCount[0]
+    if s.*.sliceType == h265.SLICE_B && d.*.refCount[1] < references { references = d.*.refCount[1] }
+    var zeroIdx: u32 = 0
+    while count < wanted {
+        var motion: Motion = undefined
+        const index = if zeroIdx < references { @intCast(i32, zeroIdx) } else { 0 }
+        motion.ref[0] = index
+        motion.ref[1] = if s.*.sliceType == h265.SLICE_B { index } else { -1 }
+        motion.mv[0][0] = 0
+        motion.mv[0][1] = 0
+        motion.mv[1][0] = 0
+        motion.mv[1][1] = 0
+        list[count] = motion
+        count += 1
+        zeroIdx += 1
+    }
+    out.* = list[mergeIdx]
+    // 8x4 and 4x8 blocks are not bi-predicted.
+    if out.*.ref[0] >= 0 && out.*.ref[1] >= 0 && nPbW0 + nPbH0 == 12 { out.*.ref[1] = -1 }
+}
+
+var COMBINED_L0 = [12]u8{ 0, 1, 0, 2, 1, 2, 0, 3, 1, 3, 2, 3 }
+var COMBINED_L1 = [12]u8{ 1, 0, 2, 0, 2, 1, 3, 0, 3, 1, 3, 2 }
+
+// A spatial AMVP neighbour's vector for list `x` and reference `refIdx`
+// referring to the same picture (no scaling): list X first, then Y.
+fn amvpSame(d: *Decoder, motion: *Motion, x: usize, refIdx: i32, out: *[2]i32) -> bool {
+    const target = d.*.refPocs[x][@intCast(usize, refIdx)]
+    var k: usize = 0
+    while k < 2 {
+        const list = if k == 0 { x } else { 1 - x }
+        if motion.*.ref[list] >= 0 && d.*.refPocs[list][@intCast(usize, motion.*.ref[list])] == target {
+            out.*[0] = motion.*.mv[list][0]
+            out.*[1] = motion.*.mv[list][1]
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// The same with any picture of the same long-term marking, scaled by the
+// POC distances when both are short-term.
+fn amvpScaled(d: *Decoder, motion: *Motion, x: usize, refIdx: i32, out: *[2]i32) -> bool {
+    const currentLong = d.*.refLong[x][@intCast(usize, refIdx)]
+    const target = d.*.refPocs[x][@intCast(usize, refIdx)]
+    var k: usize = 0
+    while k < 2 {
+        const list = if k == 0 { x } else { 1 - x }
+        if motion.*.ref[list] >= 0 && d.*.refLong[list][@intCast(usize, motion.*.ref[list])] == currentLong {
+            out.*[0] = motion.*.mv[list][0]
+            out.*[1] = motion.*.mv[list][1]
+            const poc = d.*.refPocs[list][@intCast(usize, motion.*.ref[list])]
+            if !currentLong && poc != target {
+                var td = d.*.poc - poc
+                if td == 0 { td = 1 }
+                const tb = d.*.poc - target
+                out.*[0] = scaleMv(out.*[0], td, tb)
+                out.*[1] = scaleMv(out.*[1], td, tb)
+            }
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// The motion vector predictor `flag` of list `x` (8.5.3.2.6, 8.5.3.2.7).
+fn amvp(d: *Decoder, xCb: i32, yCb: i32, nCbS: i32, xPb: i32, yPb: i32, nPbW: i32, nPbH: i32, partIdx: u32, x: usize, refIdx: i32, flag: u32, out: *[2]i32) -> void {
+    var neighbours: [5]Motion = undefined
+    var present: [5]bool = undefined
+    // A0, A1, B0, B1, B2.
+    const xs = [5]i32{ xPb - 1, xPb - 1, xPb + nPbW, xPb + nPbW - 1, xPb - 1 }
+    const ys = [5]i32{ yPb + nPbH, yPb + nPbH - 1, yPb - 1, yPb - 1, yPb - 1 }
+    var k: usize = 0
+    while k < 5 {
+        present[k] = availablePb(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, xs[k], ys[k])
+        if present[k] { motionOf(d, blockAt(d, xs[k], ys[k]), &neighbours[k]) }
+        k += 1
+    }
+    const isScaled = present[0] || present[1]
+    var mvA: [2]i32 = undefined
+    var mvB: [2]i32 = undefined
+    var hasA = false
+    k = 0
+    while k < 2 && !hasA {
+        if present[k] { hasA = amvpSame(d, &neighbours[k], x, refIdx, &mvA) }
+        k += 1
+    }
+    k = 0
+    while k < 2 && !hasA {
+        if present[k] { hasA = amvpScaled(d, &neighbours[k], x, refIdx, &mvA) }
+        k += 1
+    }
+    var hasB = false
+    k = 2
+    while k < 5 && !hasB {
+        if present[k] { hasB = amvpSame(d, &neighbours[k], x, refIdx, &mvB) }
+        k += 1
+    }
+    if !isScaled {
+        if hasB {
+            hasA = true
+            mvA = mvB
+        }
+        hasB = false
+        k = 2
+        while k < 5 && !hasB {
+            if present[k] { hasB = amvpScaled(d, &neighbours[k], x, refIdx, &mvB) }
+            k += 1
+        }
+    }
+    var candidates: [2][2]i32 = undefined
+    candidates[0][0] = 0
+    candidates[0][1] = 0
+    candidates[1][0] = 0
+    candidates[1][1] = 0
+    var count: u32 = 0
+    if hasA {
+        candidates[0] = mvA
+        count = 1
+    }
+    if hasB && (!hasA || mvA[0] != mvB[0] || mvA[1] != mvB[1]) {
+        candidates[count] = mvB
+        count += 1
+    }
+    if count < 2 && flag == count && d.*.header.temporalMvp {
+        var mvCol: [2]i32 = undefined
+        if temporalMv(d, xCb, yCb, xPb, yPb, nPbW, nPbH, refIdx, x, &mvCol) {
+            candidates[count] = mvCol
+            count += 1
+        }
+    }
+    out.* = candidates[flag]
+}
+
+// prediction_unit() (7.3.8.6) and the block predicted into the picture.
+fn predictionUnit(d: *Decoder, xCb: i32, yCb: i32, nCbS: i32, xPb: i32, yPb: i32, nPbW: i32, nPbH: i32, partIdx: u32, skipped: bool) -> bool {
+    const s = &d.*.header
+    var motion: Motion = undefined
+    var merge = skipped
+    if !skipped { merge = decision(d, tables.MERGE_FLAG) == 1 }
+    if merge {
+        if partIdx == 0 { d.*.mergeFlag = true }
+        var index: u32 = 0
+        if s.*.maxMergeCand > 1 {
+            index = decision(d, tables.MERGE_IDX)
+            if index == 1 {
+                while index < s.*.maxMergeCand - 1 && bypass(d) == 1 { index += 1 }
+            }
+        }
+        mergeMotion(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, index, &motion)
+    } else {
+        var predIdc: u32 = 0
+        if s.*.sliceType == h265.SLICE_B {
+            if nPbW + nPbH == 12 {
+                predIdc = decision(d, tables.INTER_PRED_IDC + 4)
+            } else if decision(d, tables.INTER_PRED_IDC + @intCast(usize, d.*.ctDepth[blockAt(d, xCb, yCb)])) == 1 {
+                predIdc = 2
+            } else {
+                predIdc = decision(d, tables.INTER_PRED_IDC + 4)
+            }
+        }
+        var mvd: [2][2]i32 = undefined
+        var flags: [2]u32 = undefined
+        var list: usize = 0
+        while list < 2 {
+            motion.ref[list] = -1
+            mvd[list][0] = 0
+            mvd[list][1] = 0
+            flags[list] = 0
+            const used = (list == 0 && predIdc != 1) || (list == 1 && predIdc != 0)
+            if used {
+                var refIdx: u32 = 0
+                const max = s.*.active[list] - 1
+                if max > 0 {
+                    const maxCtx = if max < 2 { max } else { 2 }
+                    while refIdx < maxCtx && decision(d, tables.REF_IDX_L0 + @intCast(usize, refIdx)) == 1 { refIdx += 1 }
+                    if refIdx == 2 {
+                        while refIdx < max && bypass(d) == 1 { refIdx += 1 }
+                    }
+                }
+                motion.ref[list] = @intCast(i32, refIdx)
+                if !(list == 1 && s.*.mvdL1Zero && predIdc == 2) { mvdCoding(d, &mvd[list]) }
+                flags[list] = decision(d, tables.MVP_LX_FLAG)
+            }
+            list += 1
+        }
+        list = 0
+        while list < 2 {
+            if motion.ref[list] >= 0 {
+                var predictor: [2]i32 = undefined
+                amvp(d, xCb, yCb, nCbS, xPb, yPb, nPbW, nPbH, partIdx, list, motion.ref[list], flags[list], &predictor)
+                motion.mv[list][0] = wrap16(predictor[0] + mvd[list][0])
+                motion.mv[list][1] = wrap16(predictor[1] + mvd[list][1])
+            } else {
+                motion.mv[list][0] = 0
+                motion.mv[list][1] = 0
+            }
+            list += 1
+        }
+    }
+    if d.*.bits.failed { return false }
+    // A reference index past the list (a corrupt stream) is the first.
+    var list: usize = 0
+    while list < 2 {
+        if motion.ref[list] >= @intCast(i32, d.*.refCount[list]) { motion.ref[list] = if d.*.refCount[list] > 0 { 0 } else { -1 } }
+        list += 1
+    }
+    if motion.ref[0] < 0 && motion.ref[1] < 0 { motion.ref[0] = 0 }
+    if d.*.refCount[0] == 0 { return false }
+    predictInter(d, xPb, yPb, nPbW, nPbH, &motion)
+    storeMotion(d, xPb, yPb, nPbW, nPbH, &motion)
+    markEdges(d, xPb, yPb, nPbW, nPbH, 2)
+    return true
+}
+
+// mvd_coding() (7.3.8.9).
+fn mvdCoding(d: *Decoder, out: *[2]i32) -> void {
+    var greater0: [2]bool = undefined
+    var greater1: [2]bool = undefined
+    greater0[0] = decision(d, tables.ABS_MVD_GREATER0_FLAG) == 1
+    greater0[1] = decision(d, tables.ABS_MVD_GREATER0_FLAG) == 1
+    greater1[0] = false
+    greater1[1] = false
+    if greater0[0] { greater1[0] = decision(d, tables.ABS_MVD_GREATER1_FLAG + 1) == 1 }
+    if greater0[1] { greater1[1] = decision(d, tables.ABS_MVD_GREATER1_FLAG + 1) == 1 }
+    var k: usize = 0
+    while k < 2 {
+        var value: i32 = 0
+        if greater0[k] {
+            value = 1
+            if greater1[k] {
+                // abs_mvd_minus2: Exp-Golomb of order 1.
+                value = 2
+                var order: i32 = 1
+                while order < 32 && bypass(d) == 1 {
+                    value += shl(1, order)
+                    order += 1
+                }
+                while order > 0 {
+                    order -= 1
+                    value += shl(@intCast(i32, bypass(d)), order)
+                }
+            }
+            if bypass(d) == 1 { value = -value }
+        }
+        out.*[k] = value
+        k += 1
+    }
+}
+
+// The motion into the current picture's 4x4 blocks.
+fn storeMotion(d: *Decoder, x0: i32, y0: i32, w: i32, h: i32, motion: *Motion) -> void {
+    const frame = d.*.frame
+    var by = y0 >> 2
+    while by < (y0 + h) >> 2 {
+        var bx = x0 >> 2
+        while bx < (x0 + w) >> 2 {
+            const at = @intCast(usize, by * @intCast(i32, d.*.blocksW) + bx)
+            var list: usize = 0
+            while list < 2 {
+                const ref = motion.*.ref[list]
+                frame.*.refIdx[at * 2 + list] = @intCast(i8, ref)
+                frame.*.mv[at * 4 + list * 2] = @intCast(i16, if ref >= 0 { motion.*.mv[list][0] } else { 0 })
+                frame.*.mv[at * 4 + list * 2 + 1] = @intCast(i16, if ref >= 0 { motion.*.mv[list][1] } else { 0 })
+                frame.*.refPoc[at * 2 + list] = if ref >= 0 { d.*.refPocs[list][@intCast(usize, ref)] } else { 0 }
+                frame.*.refLong[at * 2 + list] = if ref >= 0 && d.*.refLong[list][@intCast(usize, ref)] { 1 } else { 0 }
+                list += 1
+            }
+            frame.*.intra[at] = 0
+            bx += 1
+        }
+        by += 1
+    }
+}
+
+// An intra coding unit's blocks: no motion.
+fn markIntra(d: *Decoder, x0: i32, y0: i32, size: i32) -> void {
+    const frame = d.*.frame
+    var by = y0 >> 2
+    while by < (y0 + size) >> 2 {
+        var bx = x0 >> 2
+        while bx < (x0 + size) >> 2 {
+            const at = @intCast(usize, by * @intCast(i32, d.*.blocksW) + bx)
+            frame.*.refIdx[at * 2] = -1
+            frame.*.refIdx[at * 2 + 1] = -1
+            frame.*.intra[at] = 1
+            bx += 1
+        }
+        by += 1
+    }
+}
+
+// The samples of a block of `plane` (pw x ph) at (x, y) + fractions
+// (fx, fy) interpolated (8.5.3.3.3): 14-bit values into `out`, w wide.
+fn interpolate(d: *Decoder, plane: [*]u16, pw: i32, ph: i32, x: i32, y: i32, w: i32, h: i32, fx: i32, fy: i32, chroma: bool, depth: i32, out: [*]i32) -> void {
+    const taps: i32 = if chroma { 4 } else { 8 }
+    const before: i32 = if chroma { 1 } else { 3 }
+    const shift1 = @intCast(u5, depth - 8)
+    const shift3 = @intCast(u5, 14 - depth)
+    const rows = h + taps - 1
+    const columns = w + taps - 1
+    // The reference samples: the plane itself when the block and its
+    // margins are inside, else a copy with the edges repeated.
+    var source: [*]u16 = plane
+    var stride = pw
+    var origin = (y - before) * pw + x - before
+    if x - before < 0 || y - before < 0 || x - before + columns > pw || y - before + rows > ph {
+        const window: [*]u16 = &d.*.window
+        var r: i32 = 0
+        while r < rows {
+            const row = clip3(0, ph - 1, y - before + r) * pw
+            var c: i32 = 0
+            while c < columns {
+                window[@intCast(usize, r * columns + c)] = plane[@intCast(usize, row + clip3(0, pw - 1, x - before + c))]
+                c += 1
+            }
+            r += 1
+        }
+        source = window
+        stride = columns
+        origin = 0
+    }
+    if fx == 0 && fy == 0 {
+        var r: i32 = 0
+        while r < h {
+            var at = origin + (r + before) * stride + before
+            var o = r * w
+            const end = o + w
+            while o < end {
+                out[@intCast(usize, o)] = @intCast(i32, source[@intCast(usize, at)]) << shift3
+                at += 1
+                o += 1
+            }
+            r += 1
+        }
+        return
+    }
+    // The filters' taps.
+    var h0: i32 = 0
+    var h1: i32 = 0
+    var h2: i32 = 0
+    var h3: i32 = 0
+    var h4: i32 = 0
+    var h5: i32 = 0
+    var h6: i32 = 0
+    var h7: i32 = 0
+    var v0: i32 = 0
+    var v1: i32 = 0
+    var v2: i32 = 0
+    var v3: i32 = 0
+    var v4: i32 = 0
+    var v5: i32 = 0
+    var v6: i32 = 0
+    var v7: i32 = 0
+    if chroma {
+        const hb = @intCast(usize, fx * 4)
+        const vb = @intCast(usize, fy * 4)
+        h0 = @intCast(i32, tables.EPEL[hb])
+        h1 = @intCast(i32, tables.EPEL[hb + 1])
+        h2 = @intCast(i32, tables.EPEL[hb + 2])
+        h3 = @intCast(i32, tables.EPEL[hb + 3])
+        v0 = @intCast(i32, tables.EPEL[vb])
+        v1 = @intCast(i32, tables.EPEL[vb + 1])
+        v2 = @intCast(i32, tables.EPEL[vb + 2])
+        v3 = @intCast(i32, tables.EPEL[vb + 3])
+    } else {
+        const hb = @intCast(usize, fx * 8)
+        const vb = @intCast(usize, fy * 8)
+        h0 = @intCast(i32, tables.QPEL[hb])
+        h1 = @intCast(i32, tables.QPEL[hb + 1])
+        h2 = @intCast(i32, tables.QPEL[hb + 2])
+        h3 = @intCast(i32, tables.QPEL[hb + 3])
+        h4 = @intCast(i32, tables.QPEL[hb + 4])
+        h5 = @intCast(i32, tables.QPEL[hb + 5])
+        h6 = @intCast(i32, tables.QPEL[hb + 6])
+        h7 = @intCast(i32, tables.QPEL[hb + 7])
+        v0 = @intCast(i32, tables.QPEL[vb])
+        v1 = @intCast(i32, tables.QPEL[vb + 1])
+        v2 = @intCast(i32, tables.QPEL[vb + 2])
+        v3 = @intCast(i32, tables.QPEL[vb + 3])
+        v4 = @intCast(i32, tables.QPEL[vb + 4])
+        v5 = @intCast(i32, tables.QPEL[vb + 5])
+        v6 = @intCast(i32, tables.QPEL[vb + 6])
+        v7 = @intCast(i32, tables.QPEL[vb + 7])
+    }
+    if fy == 0 {
+        // Horizontal only.
+        var r: i32 = 0
+        while r < h {
+            var at = @intCast(usize, origin + (r + before) * stride)
+            var o = @intCast(usize, r * w)
+            const end = o + @intCast(usize, w)
+            if chroma {
+                while o < end {
+                    out[o] = (h0 * @intCast(i32, source[at]) + h1 * @intCast(i32, source[at + 1]) + h2 * @intCast(i32, source[at + 2]) + h3 * @intCast(i32, source[at + 3])) >> shift1
+                    at += 1
+                    o += 1
+                }
+            } else {
+                while o < end {
+                    out[o] = (h0 * @intCast(i32, source[at]) + h1 * @intCast(i32, source[at + 1]) + h2 * @intCast(i32, source[at + 2]) + h3 * @intCast(i32, source[at + 3]) + h4 * @intCast(i32, source[at + 4]) + h5 * @intCast(i32, source[at + 5]) + h6 * @intCast(i32, source[at + 6]) + h7 * @intCast(i32, source[at + 7])) >> shift1
+                    at += 1
+                    o += 1
+                }
+            }
+            r += 1
+        }
+        return
+    }
+    if fx == 0 {
+        // Vertical only.
+        const s = @intCast(usize, stride)
+        var r: i32 = 0
+        while r < h {
+            var at = @intCast(usize, origin + r * stride + before)
+            var o = @intCast(usize, r * w)
+            const end = o + @intCast(usize, w)
+            if chroma {
+                while o < end {
+                    out[o] = (v0 * @intCast(i32, source[at]) + v1 * @intCast(i32, source[at + s]) + v2 * @intCast(i32, source[at + 2 * s]) + v3 * @intCast(i32, source[at + 3 * s])) >> shift1
+                    at += 1
+                    o += 1
+                }
+            } else {
+                while o < end {
+                    out[o] = (v0 * @intCast(i32, source[at]) + v1 * @intCast(i32, source[at + s]) + v2 * @intCast(i32, source[at + 2 * s]) + v3 * @intCast(i32, source[at + 3 * s]) + v4 * @intCast(i32, source[at + 4 * s]) + v5 * @intCast(i32, source[at + 5 * s]) + v6 * @intCast(i32, source[at + 6 * s]) + v7 * @intCast(i32, source[at + 7 * s])) >> shift1
+                    at += 1
+                    o += 1
+                }
+            }
+            r += 1
+        }
+        return
+    }
+    // Both: the rows filtered horizontally, then vertically (>> 6).
+    const temp: [*]i32 = &d.*.filtered
+    var r: i32 = 0
+    while r < rows {
+        var at = @intCast(usize, origin + r * stride)
+        var o = @intCast(usize, r * w)
+        const end = o + @intCast(usize, w)
+        if chroma {
+            while o < end {
+                temp[o] = (h0 * @intCast(i32, source[at]) + h1 * @intCast(i32, source[at + 1]) + h2 * @intCast(i32, source[at + 2]) + h3 * @intCast(i32, source[at + 3])) >> shift1
+                at += 1
+                o += 1
+            }
+        } else {
+            while o < end {
+                temp[o] = (h0 * @intCast(i32, source[at]) + h1 * @intCast(i32, source[at + 1]) + h2 * @intCast(i32, source[at + 2]) + h3 * @intCast(i32, source[at + 3]) + h4 * @intCast(i32, source[at + 4]) + h5 * @intCast(i32, source[at + 5]) + h6 * @intCast(i32, source[at + 6]) + h7 * @intCast(i32, source[at + 7])) >> shift1
+                at += 1
+                o += 1
+            }
+        }
+        r += 1
+    }
+    const s = @intCast(usize, w)
+    var o: usize = 0
+    const total = @intCast(usize, w * h)
+    if chroma {
+        while o < total {
+            out[o] = (v0 * temp[o] + v1 * temp[o + s] + v2 * temp[o + 2 * s] + v3 * temp[o + 3 * s]) >> 6
+            o += 1
+        }
+    } else {
+        while o < total {
+            out[o] = (v0 * temp[o] + v1 * temp[o + s] + v2 * temp[o + 2 * s] + v3 * temp[o + 3 * s] + v4 * temp[o + 4 * s] + v5 * temp[o + 5 * s] + v6 * temp[o + 6 * s] + v7 * temp[o + 7 * s]) >> 6
+            o += 1
+        }
+    }
+}
+
+// The block's prediction (8.5.3.3): each component interpolated from its
+// references and weighted (8.5.3.3.4.3; the default weights are the
+// explicit formula's with weight 1 and offset 0).
+fn predictInter(d: *Decoder, xPb: i32, yPb: i32, w: i32, h: i32, motion: *Motion) -> void {
+    const s = &d.*.header
+    const components: u32 = if d.*.chromaFormat == 0 { 1 } else { 3 }
+    if d.*.threaded {
+        // The reference rows read: luma's 8-tap window, chroma's 4-tap.
+        var list: usize = 0
+        while list < 2 {
+            if motion.*.ref[list] >= 0 {
+                const frame = &d.*.frames[d.*.refs[list][@intCast(usize, motion.*.ref[list])]]
+                const mvy = motion.*.mv[list][1]
+                const luma = yPb + h + (mvy >> 2) + 4
+                const chroma = 2 * ((yPb >> 1) + (h >> 1) + (mvy >> 3) + 2)
+                const needed = clip3(0, @intCast(i32, d.*.height), maximum(luma, chroma))
+                awaitCounter(&frame.*.progress, &frame.*.writing, @intCast(u32, needed))
+            }
+            list += 1
+        }
+    }
+    var c: u32 = 0
+    while c < components {
+        const chroma = c > 0
+        const depth = @intCast(i32, if chroma { d.*.bitDepthC } else { d.*.bitDepth })
+        const pw = @intCast(i32, if chroma { d.*.width / 2 } else { d.*.width })
+        const ph = @intCast(i32, if chroma { d.*.height / 2 } else { d.*.height })
+        const bw = if chroma { w >> 1 } else { w }
+        const bh = if chroma { h >> 1 } else { h }
+        const bx = if chroma { xPb >> 1 } else { xPb }
+        const by = if chroma { yPb >> 1 } else { yPb }
+        var list: usize = 0
+        while list < 2 {
+            const ref = motion.*.ref[list]
+            if ref >= 0 {
+                const frame = &d.*.frames[d.*.refs[list][@intCast(usize, ref)]]
+                const mvx = motion.*.mv[list][0]
+                const mvy = motion.*.mv[list][1]
+                const out: [*]i32 = if list == 0 { &d.*.pred0 } else { &d.*.pred1 }
+                if chroma {
+                    interpolate(d, frame.*.planes[c], pw, ph, bx + (mvx >> 3), by + (mvy >> 3), bw, bh, mvx & 7, mvy & 7, true, depth, out)
+                } else {
+                    interpolate(d, frame.*.planes[0], pw, ph, bx + (mvx >> 2), by + (mvy >> 2), bw, bh, mvx & 3, mvy & 3, false, depth, out)
+                }
+            }
+            list += 1
+        }
+        // Weighting.
+        const shift1 = 14 - depth
+        const log2Wd = @intCast(i32, if chroma { s.*.chromaLog2 } else { s.*.lumaLog2 }) + shift1
+        const maxValue = shl(1, depth) - 1
+        var w0: i32 = 0
+        var o0: i32 = 0
+        var w1: i32 = 0
+        var o1: i32 = 0
+        if motion.*.ref[0] >= 0 {
+            const r0 = @intCast(usize, motion.*.ref[0])
+            w0 = if chroma { s.*.chromaWeight[0][r0][c - 1] } else { s.*.lumaWeight[0][r0] }
+            o0 = if chroma { s.*.chromaOffset[0][r0][c - 1] } else { s.*.lumaOffset[0][r0] }
+        }
+        if motion.*.ref[1] >= 0 {
+            const r1 = @intCast(usize, motion.*.ref[1])
+            w1 = if chroma { s.*.chromaWeight[1][r1][c - 1] } else { s.*.lumaWeight[1][r1] }
+            o1 = if chroma { s.*.chromaOffset[1][r1][c - 1] } else { s.*.lumaOffset[1][r1] }
+        }
+        const plane = d.*.frame.*.planes[c]
+        const p0: [*]i32 = &d.*.pred0
+        const p1: [*]i32 = &d.*.pred1
+        const both = motion.*.ref[0] >= 0 && motion.*.ref[1] >= 0
+        const single: [*]i32 = if motion.*.ref[0] >= 0 { p0 } else { p1 }
+        const ws = if motion.*.ref[0] >= 0 { w0 } else { w1 }
+        const os = if motion.*.ref[0] >= 0 { o0 } else { o1 }
+        const round = if log2Wd >= 1 { shl(1, log2Wd - 1) } else { 0 }
+        const biOffset = shl(o0 + o1 + 1, log2Wd)
+        var y: i32 = 0
+        const shiftBi = @intCast(u5, log2Wd + 1)
+        const shiftUni = @intCast(u5, if log2Wd >= 1 { log2Wd } else { 0 })
+        while y < bh {
+            var at = @intCast(usize, y * bw)
+            var target = @intCast(usize, (by + y) * pw + bx)
+            const end = at + @intCast(usize, bw)
+            if both {
+                while at < end {
+                    var value = (p0[at] * w0 + p1[at] * w1 + biOffset) >> shiftBi
+                    if value < 0 { value = 0 }
+                    if value > maxValue { value = maxValue }
+                    plane[target] = @intCast(u16, value)
+                    at += 1
+                    target += 1
+                }
+            } else {
+                while at < end {
+                    var value = ((single[at] * ws + round) >> shiftUni) + os
+                    if value < 0 { value = 0 }
+                    if value > maxValue { value = maxValue }
+                    plane[target] = @intCast(u16, value)
+                    at += 1
+                    target += 1
+                }
+            }
+            y += 1
+        }
+        c += 1
+    }
+}
+
+// ---- The deblocking filter (8.7.2) ----
+
+// The boundary strength of the edge between 4x4 blocks `p` and `q`
+// (8.7.2.4); `transform` whether it is a transform block edge.
+fn boundaryStrength(d: *Decoder, p: usize, q: usize, transform: bool) -> u8 {
+    const frame = d.*.frame
+    if d.*.predMode[p] == MODE_INTRA || d.*.predMode[q] == MODE_INTRA { return 2 }
+    if transform && (d.*.coded[p] != 0 || d.*.coded[q] != 0) { return 1 }
+    // The motion: the pictures referenced and the vectors.
+    const pr0 = frame.*.refIdx[p * 2] >= 0
+    const pr1 = frame.*.refIdx[p * 2 + 1] >= 0
+    const qr0 = frame.*.refIdx[q * 2] >= 0
+    const qr1 = frame.*.refIdx[q * 2 + 1] >= 0
+    const pCount = (if pr0 { 1 } else { 0 }) + (if pr1 { 1 } else { 0 })
+    const qCount = (if qr0 { 1 } else { 0 }) + (if qr1 { 1 } else { 0 })
+    if pCount != qCount { return 1 }
+    const mv = frame.*.mv
+    if pCount == 1 {
+        const pl: usize = if pr0 { 0 } else { 1 }
+        const ql: usize = if qr0 { 0 } else { 1 }
+        if frame.*.refPoc[p * 2 + pl] != frame.*.refPoc[q * 2 + ql] { return 1 }
+        if far(mv, p * 4 + pl * 2, q * 4 + ql * 2) { return 1 }
+        return 0
+    }
+    const p0 = frame.*.refPoc[p * 2]
+    const p1 = frame.*.refPoc[p * 2 + 1]
+    const q0 = frame.*.refPoc[q * 2]
+    const q1 = frame.*.refPoc[q * 2 + 1]
+    if p0 == q0 && p0 == p1 && q0 == q1 {
+        // All four the same picture: either pairing close enough.
+        const straight = far(mv, p * 4, q * 4) || far(mv, p * 4 + 2, q * 4 + 2)
+        const crossed = far(mv, p * 4, q * 4 + 2) || far(mv, p * 4 + 2, q * 4)
+        return if straight && crossed { 1 } else { 0 }
+    }
+    if p0 == q0 && p1 == q1 {
+        return if far(mv, p * 4, q * 4) || far(mv, p * 4 + 2, q * 4 + 2) { 1 } else { 0 }
+    }
+    if p0 == q1 && p1 == q0 {
+        return if far(mv, p * 4, q * 4 + 2) || far(mv, p * 4 + 2, q * 4) { 1 } else { 0 }
+    }
+    return 1
+}
+
+// Whether two vectors differ by four quarter samples or more.
+fn far(mv: [*]i16, a: usize, b: usize) -> bool {
+    return absolute(@intCast(i32, mv[a]) - @intCast(i32, mv[b])) >= 4 || absolute(@intCast(i32, mv[a + 1]) - @intCast(i32, mv[b + 1])) >= 4
+}
+
+// Whether the edge into block (x, y) from its neighbour (xp, yp) is
+// filtered: the q side's slice filters, the edge is not across a slice or
+// tile boundary that is kept.
+fn edgeFiltered(d: *Decoder, x: i32, y: i32, xp: i32, yp: i32) -> bool {
+    const q = &d.*.ctbs[ctbOf(d, x, y)]
+    if q.*.deblockingDisabled { return false }
+    const pAt = ctbOf(d, xp, yp)
+    const qAt = ctbOf(d, x, y)
+    if pAt == qAt { return true }
+    const p = &d.*.ctbs[pAt]
+    if p.*.sliceAddr != q.*.sliceAddr && !q.*.loopFilterAcross { return false }
+    if d.*.tileId[pAt] != d.*.tileId[qAt] && d.*.pps.*.std.flags.bits0 & video.StdVideoH265PpsFlags_loop_filter_across_tiles_enabled_flag == 0 { return false }
+    return true
+}
+
+// bS of every edge on the 8x8 grid (0 where not filtered) in the 4x4
+// block rows [first, end).
+fn strengths(d: *Decoder, first: i32, end: i32) -> void {
+    const bw = @intCast(i32, d.*.blocksW)
+    var by = first
+    while by < end {
+        var bx: i32 = 0
+        while bx < bw {
+            const at = @intCast(usize, by * bw + bx)
+            const edges = d.*.edges[at]
+            var vertical: u8 = 0
+            var horizontal: u8 = 0
+            if bx > 0 && bx & 1 == 0 && edges & 3 != 0 && edgeFiltered(d, bx * 4, by * 4, bx * 4 - 1, by * 4) {
+                vertical = boundaryStrength(d, at - 1, at, edges & 1 != 0)
+            }
+            if by > 0 && by & 1 == 0 && edges & 12 != 0 && edgeFiltered(d, bx * 4, by * 4, bx * 4, by * 4 - 1) {
+                horizontal = boundaryStrength(d, at - @intCast(usize, bw), at, edges & 4 != 0)
+            }
+            d.*.bsV[at] = vertical
+            d.*.bsH[at] = horizontal
+            bx += 1
+        }
+        by += 1
+    }
+}
+
+// A luma edge's four lines (8.7.2.5.3, 8.7.2.5.6, 8.7.2.5.7): q0 of the
+// first line at `at`, `across` the step to q1, `along` to the next line.
+fn filterLuma(d: *Decoder, plane: [*]u16, at: i32, across: i32, along: i32, bS: i32, qpL: i32, betaOffset: i32, tcOffset: i32, noP: bool, noQ: bool) -> void {
+    const depth = @intCast(i32, d.*.bitDepth)
+    const scale = depth - 8
+    const beta = shl(@intCast(i32, tables.BETA[@intCast(usize, clip3(0, 51, qpL + betaOffset))]), scale)
+    const tc = shl(@intCast(i32, tables.TC[@intCast(usize, clip3(0, 53, qpL + 2 * (bS - 1) + tcOffset))]), scale)
+    if tc == 0 && beta == 0 { return }
+    const line3 = at + 3 * along
+    const dp0 = absolute(sampleAt(plane, at, across, -3) - 2 * sampleAt(plane, at, across, -2) + sampleAt(plane, at, across, -1))
+    const dp3 = absolute(sampleAt(plane, line3, across, -3) - 2 * sampleAt(plane, line3, across, -2) + sampleAt(plane, line3, across, -1))
+    const dq0 = absolute(sampleAt(plane, at, across, 2) - 2 * sampleAt(plane, at, across, 1) + sampleAt(plane, at, across, 0))
+    const dq3 = absolute(sampleAt(plane, line3, across, 2) - 2 * sampleAt(plane, line3, across, 1) + sampleAt(plane, line3, across, 0))
+    const dpq0 = dp0 + dq0
+    const dpq3 = dp3 + dq3
+    const dp = dp0 + dp3
+    const dq = dq0 + dq3
+    if dpq0 + dpq3 >= beta { return }
+    const strong = strongDecision(plane, at, across, 2 * dpq0, beta, tc) && strongDecision(plane, line3, across, 2 * dpq3, beta, tc)
+    const sideThreshold = (beta + (beta >> 1)) >> 3
+    const dEp = dp < sideThreshold
+    const dEq = dq < sideThreshold
+    const maxValue = shl(1, depth) - 1
+    var k: i32 = 0
+    while k < 4 {
+        const base = at + k * along
+        const p0 = sampleAt(plane, base, across, -1)
+        const p1 = sampleAt(plane, base, across, -2)
+        const p2 = sampleAt(plane, base, across, -3)
+        const p3 = sampleAt(plane, base, across, -4)
+        const q0 = sampleAt(plane, base, across, 0)
+        const q1 = sampleAt(plane, base, across, 1)
+        const q2 = sampleAt(plane, base, across, 2)
+        const q3 = sampleAt(plane, base, across, 3)
+        if strong {
+            const tc2 = 2 * tc
+            if !noP {
+                setSample(plane, base, across, -1, clip3(p0 - tc2, p0 + tc2, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3))
+                setSample(plane, base, across, -2, clip3(p1 - tc2, p1 + tc2, (p2 + p1 + p0 + q0 + 2) >> 2))
+                setSample(plane, base, across, -3, clip3(p2 - tc2, p2 + tc2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3))
+            }
+            if !noQ {
+                setSample(plane, base, across, 0, clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3))
+                setSample(plane, base, across, 1, clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2))
+                setSample(plane, base, across, 2, clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3))
+            }
+        } else {
+            var delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4
+            if absolute(delta) < tc * 10 {
+                delta = clip3(-tc, tc, delta)
+                if !noP {
+                    setSample(plane, base, across, -1, clip3(0, maxValue, p0 + delta))
+                    if dEp {
+                        const deltaP = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1)
+                        setSample(plane, base, across, -2, clip3(0, maxValue, p1 + deltaP))
+                    }
+                }
+                if !noQ {
+                    setSample(plane, base, across, 0, clip3(0, maxValue, q0 - delta))
+                    if dEq {
+                        const deltaQ = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1)
+                        setSample(plane, base, across, 1, clip3(0, maxValue, q1 + deltaQ))
+                    }
+                }
+            }
+        }
+        k += 1
+    }
+}
+
+fn sampleAt(plane: [*]u16, at: i32, across: i32, k: i32) -> i32 { return @intCast(i32, plane[@intCast(usize, at + k * across)]) }
+fn setSample(plane: [*]u16, at: i32, across: i32, k: i32, value: i32) -> void { plane[@intCast(usize, at + k * across)] = @intCast(u16, value) }
+
+fn strongDecision(plane: [*]u16, at: i32, across: i32, dpq: i32, beta: i32, tc: i32) -> bool {
+    const p0 = sampleAt(plane, at, across, -1)
+    const p3 = sampleAt(plane, at, across, -4)
+    const q0 = sampleAt(plane, at, across, 0)
+    const q3 = sampleAt(plane, at, across, 3)
+    return dpq < (beta >> 2) && absolute(p3 - p0) + absolute(q0 - q3) < (beta >> 3) && absolute(p0 - q0) < ((5 * tc + 1) >> 1)
+}
+
+// tC of a chroma edge (8.7.2.5.5) from the luma QPs' average.
+fn chromaTc(d: *Decoder, qpL: i32, c: u32, tcOffset: i32) -> i32 {
+    const offset = if c == 1 { @intCast(i32, d.*.pps.*.std.pps_cb_qp_offset) } else { @intCast(i32, d.*.pps.*.std.pps_cr_qp_offset) }
+    const qpi = clip3(0, 57, qpL + offset)
+    var qpc = qpi
+    if d.*.chromaFormat == 1 {
+        if qpi >= 30 && qpi <= 43 {
+            qpc = QPC_TABLE[@intCast(usize, qpi - 30)]
+        } else if qpi > 43 {
+            qpc = qpi - 6
+        }
+    } else {
+        qpc = minimum(qpi, 51)
+    }
+    return shl(@intCast(i32, tables.TC[@intCast(usize, clip3(0, 53, qpc + 2 + tcOffset))]), @intCast(i32, d.*.bitDepthC) - 8)
+}
+
+// A chroma edge's four lines (8.7.2.5.8).
+fn filterChroma(d: *Decoder, plane: [*]u16, at: i32, across: i32, along: i32, tc: i32, noP: bool, noQ: bool) -> void {
+    if tc == 0 { return }
+    const maxValue = shl(1, @intCast(i32, d.*.bitDepthC)) - 1
+    var k: i32 = 0
+    while k < 4 {
+        const base = at + k * along
+        const p0 = sampleAt(plane, base, across, -1)
+        const p1 = sampleAt(plane, base, across, -2)
+        const q0 = sampleAt(plane, base, across, 0)
+        const q1 = sampleAt(plane, base, across, 1)
+        const delta = clip3(-tc, tc, ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3))
+        if !noP { setSample(plane, base, across, -1, clip3(0, maxValue, p0 + delta)) }
+        if !noQ { setSample(plane, base, across, 0, clip3(0, maxValue, q0 - delta)) }
+        k += 1
+    }
+}
+
+// The edges of the 4x4 block rows [first, end) deblocked: vertical
+// ones, then horizontal ones (those above the first row's top edge are
+// done: the edges filtered later touch other samples).
+fn deblock(d: *Decoder, first: i32, end: i32) -> void {
+    strengths(d, first, end)
+    const bw = @intCast(i32, d.*.blocksW)
+    const width = @intCast(i32, d.*.width)
+    const chromaWidth = width / 2
+    var pass: u32 = 0
+    while pass < 2 {
+        const vertical = pass == 0
+        const map = if vertical { d.*.bsV } else { d.*.bsH }
+        var by = first
+        while by < end {
+            var bx: i32 = 0
+            while bx < bw {
+                const at = @intCast(usize, by * bw + bx)
+                const bS = @intCast(i32, map[at])
+                if bS == 0 {
+                    bx += 1
+                    continue
+                }
+                const pAt = if vertical { at - 1 } else { at - @intCast(usize, bw) }
+                const x = bx * 4
+                const y = by * 4
+                const qpL = (@intCast(i32, d.*.qp[pAt]) + @intCast(i32, d.*.qp[at]) + 1) >> 1
+                const info = &d.*.ctbs[ctbOf(d, x, y)]
+                const noP = d.*.noFilter[pAt] != 0
+                const noQ = d.*.noFilter[at] != 0
+                if vertical {
+                    filterLuma(d, d.*.frame.*.planes[0], y * width + x, 1, width, bS, qpL, info.*.betaOffset, info.*.tcOffset, noP, noQ)
+                } else {
+                    filterLuma(d, d.*.frame.*.planes[0], y * width + x, width, 1, bS, qpL, info.*.betaOffset, info.*.tcOffset, noP, noQ)
+                }
+                // Chroma: bS 2 on the 8x8 chroma grid, four chroma lines
+                // per luma block pair.
+                if bS == 2 && d.*.chromaFormat != 0 && (if vertical { bx & 3 == 0 && by & 1 == 0 } else { by & 3 == 0 && bx & 1 == 0 }) {
+                    var c: u32 = 1
+                    while c < 3 {
+                        const tc = chromaTc(d, qpL, c, info.*.tcOffset)
+                        const xc = x / 2
+                        const yc = y / 2
+                        if vertical {
+                            filterChroma(d, d.*.frame.*.planes[c], yc * chromaWidth + xc, 1, chromaWidth, tc, noP, noQ)
+                        } else {
+                            filterChroma(d, d.*.frame.*.planes[c], yc * chromaWidth + xc, chromaWidth, 1, tc, noP, noQ)
+                        }
+                        c += 1
+                    }
+                }
+                bx += 1
+            }
+            by += 1
+        }
+        pass += 1
+    }
+}
+
+// ---- Sample adaptive offset (8.7.3) ----
+
+var SAO_DX = [8]i32{ -1, 1, 0, 0, -1, 1, 1, -1 }
+var SAO_DY = [8]i32{ 0, 0, -1, 1, -1, 1, -1, 1 }
+
+// Whether the edge offset may use the neighbour at luma (xn, yn) of the
+// sample at luma (x, y) (in other CTBs: slices and tiles).
+fn saoNeighbour(d: *Decoder, x: i32, y: i32, xn: i32, yn: i32) -> bool {
+    const a = ctbOf(d, x, y)
+    const b = ctbOf(d, xn, yn)
+    if a == b { return true }
+    const ca = &d.*.ctbs[a]
+    const cb = &d.*.ctbs[b]
+    if ca.*.sliceAddr != cb.*.sliceAddr {
+        // The later slice's flag decides.
+        if d.*.rsToTs[b] < d.*.rsToTs[a] && !ca.*.loopFilterAcross { return false }
+        if d.*.rsToTs[a] < d.*.rsToTs[b] && !cb.*.loopFilterAcross { return false }
+    }
+    if d.*.tileId[a] != d.*.tileId[b] && d.*.pps.*.std.flags.bits0 & video.StdVideoH265PpsFlags_loop_filter_across_tiles_enabled_flag == 0 { return false }
+    return true
+}
+
+// The deblocked samples of luma rows [first, end) (and their chroma
+// rows) kept for SAO, which reads them while it writes the picture.
+fn keepRows(d: *Decoder, first: i32, end: i32) -> void {
+    const components: u32 = if d.*.chromaFormat == 0 { 1 } else { 3 }
+    var c: u32 = 0
+    while c < components {
+        const scale: i32 = if c == 0 { 0 } else { 1 }
+        const pw = @intCast(usize, @intCast(i32, d.*.width) >> @intCast(u5, scale))
+        const from = @intCast(usize, first >> @intCast(u5, scale)) * pw
+        const to = @intCast(usize, end >> @intCast(u5, scale)) * pw
+        const source = d.*.frame.*.planes[c]
+        const target = d.*.saoCopy[c]
+        var k = from
+        while k < to {
+            target[k] = source[k]
+            k += 1
+        }
+        c += 1
+    }
+}
+
+// SAO of CTB row `row` (8.7.3) from the kept deblocked samples.
+fn saoRow(d: *Decoder, row: u32) -> void {
+    const components: u32 = if d.*.chromaFormat == 0 { 1 } else { 3 }
+    var c: u32 = 0
+    while c < components {
+        const source = d.*.saoCopy[c]
+        const plane = d.*.frame.*.planes[c]
+        const scale: i32 = if c == 0 { 0 } else { 1 }
+        const pw = @intCast(i32, d.*.width) >> @intCast(u5, scale)
+        const ph = @intCast(i32, d.*.height) >> @intCast(u5, scale)
+        const ctb = @intCast(i32, d.*.ctbSize) >> @intCast(u5, scale)
+        const depth = @intCast(i32, if c == 0 { d.*.bitDepth } else { d.*.bitDepthC })
+        const maxValue = shl(1, depth) - 1
+        var rs = row * d.*.ctbW
+        const rowEnd = rs + d.*.ctbW
+        while rs < rowEnd {
+            const info = &d.*.ctbs[rs]
+            const kind = info.*.saoType[c]
+            if info.*.sliceAddr < 0 || kind == 0 {
+                rs += 1
+                continue
+            }
+            const x0 = @intCast(i32, rs % d.*.ctbW) * ctb
+            const y0 = @intCast(i32, rs / d.*.ctbW) * ctb
+            const x1 = minimum(x0 + ctb, pw)
+            const y1 = minimum(y0 + ctb, ph)
+            var offsets: [5]i32 = undefined
+            offsets[0] = 0
+            var k: usize = 0
+            while k < 4 {
+                offsets[k + 1] = @intCast(i32, info.*.saoOffset[c][k])
+                k += 1
+            }
+            var bands: [32]i32 = undefined
+            if kind == 1 {
+                k = 0
+                while k < 32 {
+                    bands[k] = 0
+                    k += 1
+                }
+                k = 0
+                while k < 4 {
+                    bands[(k + @intCast(usize, info.*.saoClass[c])) & 31] = @intCast(i32, k) + 1
+                    k += 1
+                }
+            }
+            const eoClass: usize = if kind == 2 { @intCast(usize, info.*.saoClass[c] & 3) } else { 0 }
+            const dxA = SAO_DX[eoClass * 2]
+            const dyA = SAO_DY[eoClass * 2]
+            const dxB = SAO_DX[eoClass * 2 + 1]
+            const dyB = SAO_DY[eoClass * 2 + 1]
+            const bandShift = @intCast(u5, depth - 5)
+            // Whether a coding unit in the CTB skips the loop filters.
+            var anyNoFilter = false
+            var by = shl(y0, scale) >> 2
+            while by < (shl(y1, scale) + 3) >> 2 && !anyNoFilter {
+                var bx = shl(x0, scale) >> 2
+                while bx < (shl(x1, scale) + 3) >> 2 {
+                    if d.*.noFilter[@intCast(usize, by * @intCast(i32, d.*.blocksW) + bx)] != 0 { anyNoFilter = true }
+                    bx += 1
+                }
+                by += 1
+            }
+            var y = y0
+            while y < y1 {
+                var x = x0
+                const edgeRow = y == y0 || y == y1 - 1
+                while x < x1 {
+                    if anyNoFilter && d.*.noFilter[blockAt(d, shl(x, scale), shl(y, scale))] != 0 {
+                        x += 1
+                        continue
+                    }
+                    const at = @intCast(usize, y * pw + x)
+                    const value = @intCast(i32, source[at])
+                    if kind == 1 {
+                        const band = bands[@intCast(usize, value >> bandShift)]
+                        plane[at] = @intCast(u16, clip3(0, maxValue, value + offsets[@intCast(usize, band)]))
+                    } else {
+                        const ax = x + dxA
+                        const ay = y + dyA
+                        const bx = x + dxB
+                        const by2 = y + dyB
+                        var usable = ax >= 0 && ay >= 0 && bx >= 0 && by2 >= 0 && ax < pw && bx < pw && ay < ph && by2 < ph
+                        if usable && (edgeRow || x == x0 || x == x1 - 1) {
+                            const xl = shl(x, scale)
+                            const yl = shl(y, scale)
+                            usable = saoNeighbour(d, xl, yl, shl(ax, scale), shl(ay, scale)) && saoNeighbour(d, xl, yl, shl(bx, scale), shl(by2, scale))
+                        }
+                        if usable {
+                            const a = @intCast(i32, source[@intCast(usize, ay * pw + ax)])
+                            const b = @intCast(i32, source[@intCast(usize, by2 * pw + bx)])
+                            var edge = 2 + (if value > a { 1 } else if value < a { -1 } else { 0 }) + (if value > b { 1 } else if value < b { -1 } else { 0 })
+                            if edge <= 2 { edge = if edge == 2 { 0 } else { edge + 1 } }
+                            plane[at] = @intCast(u16, clip3(0, maxValue, value + offsets[@intCast(usize, edge)]))
+                        }
+                    }
+                    x += 1
+                }
+                y += 1
+            }
+            rs += 1
+        }
+        c += 1
+    }
+}
+
+// The loop filters of CTB row `row` (all of its CTBs and those above
+// decoded): its edges deblocked, the rows deblocked for good kept, the
+// row above given its SAO (and this one when it is the last); then the
+// rows final told.
+fn filterRow(d: *Decoder, row: u32) -> void {
+    const ctb = @intCast(i32, d.*.ctbSize)
+    const height = @intCast(i32, d.*.height)
+    const last = row + 1 == d.*.ctbH
+    const top = @intCast(i32, row) * ctb
+    const bottom = minimum(top + ctb, height)
+    deblock(d, top >> 2, (bottom + 3) >> 2)
+    if d.*.pictureSao {
+        // Deblocked for good: up to the next row's edge's reach (3 luma
+        // rows; chroma 1, kept with its luma pair).
+        const keepFrom = maximum(0, top - 4)
+        const keepTo = if last { height } else { bottom - 4 }
+        keepRows(d, keepFrom, keepTo)
+        if row > 0 { saoRow(d, row - 1) }
+        if last { saoRow(d, row) }
+    }
+    const final = if last { height } else if d.*.pictureSao { top } else { bottom - 4 }
+    publish(d, &d.*.frame.*.progress, @intCast(u32, maximum(final, 0)))
+}
+
+// A CTB row decoded (in order): its motion told, the loop filters of the
+// row above (whose samples the row's intra prediction read unfiltered).
+fn rowDone(d: *Decoder, row: u32) -> void {
+    if !d.*.rowWise || row != d.*.rowsDecoded { return }
+    d.*.rowsDecoded += 1
+    const rows = (row + 1) * d.*.ctbSize
+    publish(d, &d.*.frame.*.motionRows, if rows < d.*.height { rows } else { d.*.height })
+    if row >= 1 {
+        filterRow(d, row - 1)
+        d.*.rowsFiltered += 1
+    }
+}
+
+// The picture's end: the rows not filtered yet.
+fn finishRows(d: *Decoder) -> void {
+    publish(d, &d.*.frame.*.motionRows, d.*.height)
+    while d.*.rowsFiltered < d.*.ctbH {
+        filterRow(d, d.*.rowsFiltered)
+        d.*.rowsFiltered += 1
+    }
+    publish(d, &d.*.frame.*.progress, d.*.height)
+}
+
+fn publish(d: *Decoder, counter: *u32, value: u32) -> void {
+    @atomicStore(u32, counter, value, release)
+    if d.*.threaded { _ = thread.futexWake(counter, 2147483647, true) }
+}
+
+// Waits until `counter` reaches `needed` while the frame is being
+// written (a frame no picture writes is final).
+fn awaitCounter(counter: *u32, writing: *u32, needed: u32) -> void {
+    while true {
+        const have = @atomicLoad(u32, counter, acquire)
+        if have >= needed { return }
+        if @atomicLoad(u32, writing, acquire) == 0 { return }
+        _ = thread.futexWait(counter, have, 0, true)
+    }
+}
+
+// ---- The picture ----
+
+// The slice segment header's end (7.3.6.1): entry points, the extension,
+// byte_alignment().
+fn headerTail(d: *Decoder) -> bool {
+    const b = &d.*.bits
+    const flags = d.*.pps.*.std.flags.bits0
+    if flags & (video.StdVideoH265PpsFlags_tiles_enabled_flag | video.StdVideoH265PpsFlags_entropy_coding_sync_enabled_flag) != 0 {
+        const count = bits_module.ue(b)
+        if count > 0 {
+            const length = bits_module.ue(b) + 1
+            if length > 32 { return false }
+            bits_module.skip(b, @intCast(usize, count) * @intCast(usize, length))
+        }
+    }
+    if flags & video.StdVideoH265PpsFlags_slice_segment_header_extension_present_flag != 0 {
+        const length = bits_module.ue(b)
+        bits_module.skip(b, @intCast(usize, length) * 8)
+    }
+    _ = bits_module.read(b, 1)
+    bits_module.alignToByte(b)
+    return !b.*.failed
+}
+
+// The frame of the picture in `slot` (sized; its POC, crop and id).
+fn startFrame(d: *Decoder, slot: usize, poc: i32, sps: *h265.Sps) -> bool {
+    if !ensureFrame(d, slot) { return false }
+    const frame = &d.*.frames[slot]
+    frame.*.poc = poc
+    frame.*.crop[0] = sps.*.cropLeft
+    frame.*.crop[1] = sps.*.cropTop
+    frame.*.crop[2] = sps.*.cropRight
+    frame.*.crop[3] = sps.*.cropBottom
+    frame.*.id = d.*.nextId
+    d.*.nextId += 1
+    return true
+}
+
+// The decoder's state for a new picture in `slot`.
+fn startPicture(d: *Decoder, slot: usize, poc: i32) -> void {
+    d.*.slot = slot
+    d.*.frame = &d.*.frames[slot]
+    d.*.poc = poc
+    var rs: u32 = 0
+    while rs < d.*.ctbCount {
+        d.*.ctbs[rs].sliceAddr = -1
+        d.*.ctbs[rs].saoType[0] = 0
+        d.*.ctbs[rs].saoType[1] = 0
+        d.*.ctbs[rs].saoType[2] = 0
+        rs += 1
+    }
+    zero(d.*.edges, d.*.mapBytes)
+    d.*.rowsDecoded = 0
+    d.*.rowsFiltered = 0
+    d.*.frame.*.progress = 0
+    d.*.frame.*.motionRows = 0
+}
+
+// Whether std.h265.decode decodes the SPS's pictures: 4:2:0 or 4:0:0, 8
+// to 10 bits.
+fn decodable(sps: *h265.Sps) -> bool {
+    return sps.*.std.chroma_format_idc <= 1 && sps.*.std.bit_depth_luma_minus8 <= 2 && sps.*.std.bit_depth_chroma_minus8 <= 2
+}
+
+// Decodes the picture std.h265 read last (h.picture, from the access
+// unit at `bytes`) into its slot: every slice segment, the loop filters
+// row by row.
+pub fn decodePicture(d: *Decoder, h: *h265.Decoder, bytes: [*]const u8) -> Status {
+    const picture = &h.*.picture
+    const sps = h265.spsAt(h, @intCast(usize, picture.*.spsId))
+    const pps = h265.ppsAt(h, @intCast(usize, picture.*.ppsId))
+    if !sps.*.present || !pps.*.present { return Status.corrupt }
+    if !decodable(sps) { return Status.unsupported }
+    d.*.sps = sps
+    d.*.pps = pps
+    if d.*.mapBytes == 0 || d.*.preparedFor != @intFromPtr(h) || d.*.preparedGeneration != h.*.generation || d.*.preparedPps != @intFromPtr(pps) {
+        if !prepare(d, sps, pps) { return Status.noMemory }
+        d.*.preparedFor = @intFromPtr(h)
+        d.*.preparedGeneration = h.*.generation
+        d.*.preparedPps = @intFromPtr(pps)
+    }
+    const slot = picture.*.slot
+    if !startFrame(d, slot, picture.*.poc, sps) { return Status.noMemory }
+    startPicture(d, slot, picture.*.poc)
+    var failed = false
+    var i: usize = 0
+    while i < picture.*.sliceCount {
+        const offset = @intCast(usize, picture.*.sliceOffsets[i])
+        const length = @intCast(usize, picture.*.sliceLengths[i])
+        i += 1
+        if length < 3 { continue }
+        if !loadSlice(d, h, &bytes[offset], length, pps) {
+            failed = true
+            continue
+        }
+        if decodeSliceData(d) != Status.ok { failed = true }
+    }
+    finishRows(d)
+    d.*.decoded += 1
+    if failed { return Status.corrupt }
+    return Status.ok
+}
+
+// A slice segment NAL unit's header read (`nal` its `length` bytes):
+// the RBSP loaded, the header and its reference lists; false when it is
+// broken or not of the picture's PPS.
+fn loadSlice(d: *Decoder, h: *h265.Decoder, nal: [*]const u8, length: usize, pps: *h265.Pps) -> bool {
+    const kind = (nal[0] >> 1) & 63
+    // (The loader skips the header's second byte as its first.)
+    if !bits_module.load(&d.*.bits, &nal[1], length - 1) { return false }
+    if parseHeader(d, h, kind) != Status.ok { return false }
+    if d.*.pps != pps { return false }
+    if !d.*.header.dependent {
+        d.*.sliceAddr = @intCast(i32, d.*.header.address)
+        buildLists(d, h)
+    }
+    return headerTail(d)
+}
+
+// ---- Decoding on threads (a Pool) ----
+//
+// A Pool decodes several pictures at once, each on a worker thread of its
+// own (frame threading), as std.h264.decode's does: submit() takes the
+// picture std.h265 started, reads its slice headers and builds its
+// reference lists on the caller's thread (std.h265's state is the
+// caller's) and hands the slice data to a worker. A worker's motion
+// compensation waits for the rows of a reference picture still being
+// decoded that it reads (the rows loop filtered: the filters run a CTB
+// row behind the decoding), and temporal motion vectors for the
+// collocated picture's motion. A slot's frame is written again only when
+// the pictures reading it and its last decode are done; awaitSlot() waits
+// for a slot's picture before it is read. Workers allocate nothing (the
+// caller's thread sizes everything), and they block every signal but a
+// fault's.
+
+pub const MAX_THREADS: usize = 16
+// Pictures in flight at most.
+const JOBS: usize = 18
+const STACK_SIZE: usize = 1048576
+
+// What a worker needs of a slice segment: its header, the reference
+// lists, its PPS, and its RBSP (after the header).
+const SliceJob = struct {
+    header: Header
+    sliceAddr: i32
+    refs: [2][MAX_REFS]usize
+    refPocs: [2][MAX_REFS]i32
+    refLong: [2][MAX_REFS]bool
+    refCount: [2]u32
+    noBackwardPred: bool
+    pps: h265.Pps
+    offset: usize
+    length: usize
+    at: usize
+    stop: usize
+}
+
+const Job = struct {
+    // 1 when no worker has it (finished or never given).
+    done: u32
+    slot: usize
+    poc: i32
+    sps: h265.Sps
+    slices: [*]SliceJob
+    sliceCount: usize
+    sliceCapacity: usize
+    // The slices' RBSPs, each with 16 zero bytes after it.
+    bytes: [*]u8
+    used: usize
+    byteCapacity: usize
+    // The slots the picture reads (a bit each).
+    readers: u32
+    status: Status
+}
+
+const Seat = struct {
+    // The Pool's address (see std.h264.decode's Seat).
+    pool: usize
+    d: *Decoder
+    stack: usize
+    // The thread's id, zeroed by the kernel when it ends.
+    tid: u32
+}
+
+pub const Pool = struct {
+    allocator: Allocator
+    // Reads the slice headers on the caller's thread; owns the frames.
+    root: *Decoder
+    threads: usize
+    seats: [MAX_THREADS]Seat
+    // Decodes on the caller's thread when there are no threads.
+    inline_: *Decoder
+    jobs: [*]Job
+    // Pictures submitted and taken by workers; `signal` counts changes
+    // the workers wait on, `quit` ends them.
+    submitted: u32
+    taken: u32
+    signal: u32
+    quit: u32
+    // Pictures std.h265 gave out, held (h.holdOutputs) until decoded:
+    // slots and POCs, oldest first; the slot nextReady() gave last,
+    // released at the next call (h265.SLOTS: none).
+    outputSlots: [h265.SLOTS]usize
+    outputPocs: [h265.SLOTS]i32
+    outputCount: usize
+    given: usize
+}
+
+// A pool of `threads` workers (0: every picture decoded in submit(), on
+// the caller's thread); null without memory.
+pub fn createPool(allocator: Allocator, threads: usize) -> ?*Pool {
+    const memory = allocator.alloc(@sizeOf(Pool), 16)
+    if memory == null { return null }
+    var pool: *Pool = undefined
+    unsafe { pool = @ptrCast(*Pool, memory.?) }
+    unsafe { zero(@ptrCast([*]u8, pool), @sizeOf(Pool)) }
+    pool.*.allocator = allocator
+    const root = create(allocator)
+    if root == null {
+        allocator.free(memory.?, @sizeOf(Pool), 16)
+        return null
+    }
+    pool.*.root = root.?
+    const jobs = allocator.alloc(JOBS * @sizeOf(Job), 16)
+    const helper = createSharing(allocator, root.?.*.frames)
+    if jobs == null || helper == null {
+        destroy(root.?)
+        allocator.free(memory.?, @sizeOf(Pool), 16)
+        return null
+    }
+    zero(jobs.?, JOBS * @sizeOf(Job))
+    unsafe { pool.*.jobs = @ptrCast([*]Job, jobs.?) }
+    var k: usize = 0
+    while k < JOBS {
+        pool.*.jobs[k].done = 1
+        k += 1
+    }
+    pool.*.inline_ = helper.?
+    pool.*.given = h265.SLOTS
+    const wanted = if threads > MAX_THREADS { MAX_THREADS } else { threads }
+    while pool.*.threads < wanted {
+        if !startWorker(pool, pool.*.threads) { break }
+        pool.*.threads += 1
+    }
+    return pool
+}
+
+fn startWorker(pool: *Pool, index: usize) -> bool {
+    const seat = &pool.*.seats[index]
+    const d = createSharing(pool.*.allocator, pool.*.root.*.frames)
+    if d == null { return false }
+    const stack = pool.*.allocator.alloc(STACK_SIZE, 4096)
+    if stack == null {
+        destroy(d.?)
+        return false
+    }
+    d.?.*.threaded = true
+    seat.*.pool = @intFromPtr(pool)
+    seat.*.d = d.?
+    seat.*.stack = @intFromPtr(stack.?)
+    seat.*.tid = 0
+    const flags = thread.THREAD_CLONE_FLAGS | thread.CLONE_CHILD_SETTID | thread.CLONE_CHILD_CLEARTID
+    const started = @spawnThread(flags, seat.*.stack + STACK_SIZE, 0, @intFromPtr(&seat.*.tid), 0, mlx_h265_decode_worker, @intFromPtr(seat))
+    if started <= 0 {
+        pool.*.allocator.free(stack.?, STACK_SIZE, 4096)
+        destroy(d.?)
+        return false
+    }
+    return true
+}
+
+// A worker thread: an export, so that in a plugin the thread has an
+// aggregate arena of its own (see std.h264.decode's worker).
+export fn mlx_h265_decode_worker(argument: usize) -> usize {
+    var seat: *Seat = unsafe { @ptrFromInt(*Seat, argument) }
+    // Every signal blocked but a fault's (SIGILL, SIGTRAP, SIGABRT,
+    // SIGBUS, SIGFPE, SIGSEGV), which the crash report takes here.
+    var others: u64 = 18446744073709551615 & ~@intCast(u64, 0x4f8)
+    _ = thread.syscall4(linux.SYS_rt_sigprocmask, 0, @intFromPtr(&others), 0, 8)
+    var pool: *Pool = unsafe { @ptrFromInt(*Pool, seat.*.pool) }
+    while true {
+        const signal = @atomicLoad(u32, &pool.*.signal, acquire)
+        if @atomicLoad(u32, &pool.*.quit, acquire) != 0 { return 0 }
+        const taken = @atomicLoad(u32, &pool.*.taken, acquire)
+        if taken != @atomicLoad(u32, &pool.*.submitted, acquire) {
+            const swapped = @cmpxchgWeak(u32, &pool.*.taken, taken, taken +% 1, acq_rel, acquire)
+            if swapped.0 { runJob(seat.*.d, &pool.*.jobs[@intCast(usize, taken) % JOBS]) }
+            continue
+        }
+        _ = thread.futexWait(&pool.*.signal, signal, 0, true)
+    }
+    return 0
+}
+
+fn awaitZero(word: *u32) -> void {
+    while true {
+        const value = @atomicLoad(u32, word, acquire)
+        if value == 0 { return }
+        _ = thread.futexWait(word, value, 0, true)
+    }
+}
+
+fn awaitJob(job: *Job) -> void {
+    while @atomicLoad(u32, &job.*.done, acquire) == 0 { _ = thread.futexWait(&job.*.done, 0, 0, true) }
+}
+
+// Waits until every picture submitted is decoded.
+pub fn drain(pool: *Pool) -> void {
+    var k: usize = 0
+    while k < JOBS {
+        awaitJob(&pool.*.jobs[k])
+        k += 1
+    }
+}
+
+// Waits until the picture in `slot` is decoded (before reading it).
+pub fn awaitSlot(pool: *Pool, slot: usize) -> void {
+    if slot >= h265.SLOTS { return }
+    awaitZero(&pool.*.root.*.frames[slot].writing)
+}
+
+pub fn poolPlanes(pool: *Pool, slot: usize) -> Planes { return planes(pool.*.root, slot) }
+
+// planes8() of a slot's picture decoded by the pool (its 8-bit planes,
+// kept until the next call).
+pub fn poolPlanes8(pool: *Pool, slot: usize, y: *[*]const u8, cb: *[*]const u8, cr: *[*]const u8) -> bool { return planes8(pool.*.root, slot, y, cb, cr) }
+
+pub fn destroyPool(pool: *Pool) -> void {
+    drain(pool)
+    @atomicStore(u32, &pool.*.quit, 1, release)
+    _ = @atomicRmw(u32, &pool.*.signal, add, 1, acq_rel)
+    _ = thread.futexWake(&pool.*.signal, 2147483647, true)
+    const a = pool.*.allocator
+    var k: usize = 0
+    while k < pool.*.threads {
+        const seat = &pool.*.seats[k]
+        // The kernel zeroes the id and wakes it (a shared futex) when the
+        // thread has ended; its stack is free then.
+        while true {
+            const tid = @atomicLoad(u32, &seat.*.tid, acquire)
+            if tid == 0 { break }
+            _ = thread.futexWait(&seat.*.tid, tid, 0, false)
+        }
+        var stack: [*]u8 = undefined
+        unsafe { stack = @ptrFromInt([*]u8, seat.*.stack) }
+        a.free(stack, STACK_SIZE, 4096)
+        destroy(seat.*.d)
+        k += 1
+    }
+    k = 0
+    while k < JOBS {
+        const job = &pool.*.jobs[k]
+        if job.*.sliceCapacity != 0 {
+            unsafe { a.free(@ptrCast([*]u8, job.*.slices), job.*.sliceCapacity * @sizeOf(SliceJob), 16) }
+        }
+        if job.*.byteCapacity != 0 { a.free(job.*.bytes, job.*.byteCapacity, 16) }
+        k += 1
+    }
+    unsafe { a.free(@ptrCast([*]u8, pool.*.jobs), JOBS * @sizeOf(Job), 16) }
+    destroy(pool.*.inline_)
+    destroy(pool.*.root)
+    unsafe { a.free(@ptrCast([*]u8, pool), @sizeOf(Pool), 16) }
+}
+
+// Room in a job for `slices` slices and `bytes` bytes: false without
+// memory.
+fn reserveJob(pool: *Pool, job: *Job, slices: usize, bytes: usize) -> bool {
+    const a = pool.*.allocator
+    if slices > job.*.sliceCapacity {
+        var capacity: usize = 4
+        while capacity < slices { capacity *= 2 }
+        const memory = a.alloc(capacity * @sizeOf(SliceJob), 16)
+        if memory == null { return false }
+        if job.*.sliceCapacity != 0 {
+            unsafe {
+                copyBytes(memory.?, @ptrCast([*]const u8, job.*.slices), job.*.sliceCount * @sizeOf(SliceJob))
+                a.free(@ptrCast([*]u8, job.*.slices), job.*.sliceCapacity * @sizeOf(SliceJob), 16)
+            }
+        }
+        unsafe { job.*.slices = @ptrCast([*]SliceJob, memory.?) }
+        job.*.sliceCapacity = capacity
+    }
+    if bytes > job.*.byteCapacity {
+        var capacity: usize = 65536
+        while capacity < bytes { capacity *= 2 }
+        const memory = a.alloc(capacity, 16)
+        if memory == null { return false }
+        if job.*.byteCapacity != 0 {
+            copyBytes(memory.?, job.*.bytes, job.*.used)
+            a.free(job.*.bytes, job.*.byteCapacity, 16)
+        }
+        job.*.bytes = memory.?
+        job.*.byteCapacity = capacity
+    }
+    return true
+}
+
+// Starts decoding the picture std.h265 started (h.picture) from the
+// access unit's bytes (decodePicture's arguments): its slice segments'
+// headers read and reference lists built now, the rest on a worker (or
+// now, without threads). The bytes may be reused when it returns.
+pub fn submit(pool: *Pool, h: *h265.Decoder, bytes: [*]const u8) -> Status {
+    const root = pool.*.root
+    const picture = &h.*.picture
+    const slot = picture.*.slot
+    if slot >= h265.SLOTS { return Status.corrupt }
+    const sps = h265.spsAt(h, @intCast(usize, picture.*.spsId))
+    const pps = h265.ppsAt(h, @intCast(usize, picture.*.ppsId))
+    if !sps.*.present || !pps.*.present { return Status.corrupt }
+    if !decodable(sps) { return Status.unsupported }
+    // A new size: what is in flight first (the maps are made again).
+    if root.*.mapBytes != 0 && (sps.*.width != root.*.width || sps.*.height != root.*.height || sps.*.log2CtbSize != root.*.log2Ctb || sps.*.std.chroma_format_idc != root.*.chromaFormat) { drain(pool) }
+    if !prepare(root, sps, pps) || !prepareSize(pool.*.inline_, sps) { return Status.noMemory }
+    var k: usize = 0
+    while k < pool.*.threads {
+        if !prepareSize(pool.*.seats[k].d, sps) { return Status.noMemory }
+        k += 1
+    }
+    const sequence = pool.*.submitted
+    const job = &pool.*.jobs[@intCast(usize, sequence) % JOBS]
+    awaitJob(job)
+    // The slot's last decode and the pictures reading it as a reference.
+    const frame = &root.*.frames[slot]
+    awaitZero(&frame.*.writing)
+    awaitZero(&frame.*.readers)
+    if !startFrame(root, slot, picture.*.poc, sps) { return Status.noMemory }
+    root.*.slot = slot
+    root.*.frame = frame
+    root.*.poc = picture.*.poc
+    unsafe { copyBytes(@ptrCast([*]u8, &job.*.sps), @ptrCast([*]const u8, sps), @sizeOf(h265.Sps)) }
+    job.*.slot = slot
+    job.*.poc = picture.*.poc
+    job.*.sliceCount = 0
+    job.*.used = 0
+    job.*.readers = 0
+    job.*.status = Status.ok
+    var index: usize = 0
+    while index < picture.*.sliceCount {
+        const offset = @intCast(usize, picture.*.sliceOffsets[index])
+        const length = @intCast(usize, picture.*.sliceLengths[index])
+        index += 1
+        if length < 3 { continue }
+        if !loadSlice(root, h, &bytes[offset], length, pps) {
+            job.*.status = Status.corrupt
+            continue
+        }
+        const rbsp = root.*.bits.length + 16
+        if !reserveJob(pool, job, job.*.sliceCount + 1, job.*.used + rbsp) { return Status.noMemory }
+        const slice = &job.*.slices[job.*.sliceCount]
+        unsafe {
+            copyBytes(@ptrCast([*]u8, &slice.*.header), @ptrCast([*]const u8, &root.*.header), @sizeOf(Header))
+            copyBytes(@ptrCast([*]u8, &slice.*.refs), @ptrCast([*]const u8, &root.*.refs), @sizeOf([2][MAX_REFS]usize))
+            copyBytes(@ptrCast([*]u8, &slice.*.refPocs), @ptrCast([*]const u8, &root.*.refPocs), @sizeOf([2][MAX_REFS]i32))
+            copyBytes(@ptrCast([*]u8, &slice.*.refLong), @ptrCast([*]const u8, &root.*.refLong), @sizeOf([2][MAX_REFS]bool))
+            copyBytes(@ptrCast([*]u8, &slice.*.pps), @ptrCast([*]const u8, pps), @sizeOf(h265.Pps))
+        }
+        slice.*.sliceAddr = root.*.sliceAddr
+        slice.*.refCount[0] = root.*.refCount[0]
+        slice.*.refCount[1] = root.*.refCount[1]
+        slice.*.noBackwardPred = root.*.noBackwardPred
+        slice.*.offset = job.*.used
+        slice.*.length = root.*.bits.length
+        slice.*.at = root.*.bits.at
+        slice.*.stop = root.*.bits.stop
+        copyBytes(&job.*.bytes[job.*.used], root.*.bits.bytes, rbsp)
+        job.*.used += (rbsp + 15) & ~@intCast(usize, 15)
+        var list: usize = 0
+        while list < 2 {
+            var i: usize = 0
+            while i < @intCast(usize, root.*.refCount[list]) && i < MAX_REFS {
+                const reference = root.*.refs[list][i]
+                if reference < h265.SLOTS && reference != slot { job.*.readers |= @intCast(u32, 1) << @intCast(u5, reference) }
+                i += 1
+            }
+            list += 1
+        }
+        job.*.sliceCount += 1
+    }
+    var reference: usize = 0
+    while reference < h265.SLOTS {
+        if job.*.readers & (@intCast(u32, 1) << @intCast(u5, reference)) != 0 { _ = @atomicRmw(u32, &root.*.frames[reference].readers, add, 1, acq_rel) }
+        reference += 1
+    }
+    frame.*.progress = 0
+    frame.*.motionRows = 0
+    @atomicStore(u32, &frame.*.writing, 1, release)
+    @atomicStore(u32, &job.*.done, 0, release)
+    if pool.*.threads == 0 {
+        runJob(pool.*.inline_, job)
+        return job.*.status
+    }
+    @atomicStore(u32, &pool.*.submitted, sequence +% 1, release)
+    _ = @atomicRmw(u32, &pool.*.signal, add, 1, acq_rel)
+    _ = thread.futexWake(&pool.*.signal, 1, true)
+    return Status.ok
+}
+
+// Decodes a job's picture on `d`, then lets go of the slots it read and
+// of its own.
+fn runJob(d: *Decoder, job: *Job) -> void {
+    if job.*.sliceCount > 0 {
+        prepareStream(d, &job.*.sps, &job.*.slices[0].pps)
+        startPicture(d, job.*.slot, job.*.poc)
+        d.*.sps = &job.*.sps
+        var index: usize = 0
+        while index < job.*.sliceCount {
+            const slice = &job.*.slices[index]
+            index += 1
+            unsafe {
+                copyBytes(@ptrCast([*]u8, &d.*.header), @ptrCast([*]const u8, &slice.*.header), @sizeOf(Header))
+                copyBytes(@ptrCast([*]u8, &d.*.refs), @ptrCast([*]const u8, &slice.*.refs), @sizeOf([2][MAX_REFS]usize))
+                copyBytes(@ptrCast([*]u8, &d.*.refPocs), @ptrCast([*]const u8, &slice.*.refPocs), @sizeOf([2][MAX_REFS]i32))
+                copyBytes(@ptrCast([*]u8, &d.*.refLong), @ptrCast([*]const u8, &slice.*.refLong), @sizeOf([2][MAX_REFS]bool))
+            }
+            d.*.sliceAddr = slice.*.sliceAddr
+            d.*.refCount[0] = slice.*.refCount[0]
+            d.*.refCount[1] = slice.*.refCount[1]
+            d.*.noBackwardPred = slice.*.noBackwardPred
+            d.*.pps = &slice.*.pps
+            // The RBSP is the job's (the worker's reader owns no bytes).
+            d.*.bits.bytes = &job.*.bytes[slice.*.offset]
+            d.*.bits.capacity = 0
+            d.*.bits.length = slice.*.length
+            d.*.bits.at = slice.*.at
+            d.*.bits.stop = slice.*.stop
+            d.*.bits.failed = false
+            const status = decodeSliceData(d)
+            if status != Status.ok { job.*.status = status }
+        }
+        finishRows(d)
+    } else {
+        d.*.frame = &d.*.frames[job.*.slot]
+        publish(d, &d.*.frame.*.motionRows, d.*.frame.*.height)
+        publish(d, &d.*.frame.*.progress, d.*.frame.*.height)
+    }
+    const frames = d.*.frames
+    var reference: usize = 0
+    while reference < h265.SLOTS {
+        if job.*.readers & (@intCast(u32, 1) << @intCast(u5, reference)) != 0 {
+            _ = @atomicRmw(u32, &frames[reference].readers, sub, 1, acq_rel)
+            _ = thread.futexWake(&frames[reference].readers, 2147483647, true)
+        }
+        reference += 1
+    }
+    const frame = &frames[job.*.slot]
+    @atomicStore(u32, &frame.*.writing, 0, release)
+    _ = thread.futexWake(&frame.*.writing, 2147483647, true)
+    _ = thread.futexWake(&frame.*.progress, 2147483647, true)
+    _ = thread.futexWake(&frame.*.motionRows, 2147483647, true)
+    @atomicStore(u32, &job.*.done, 1, release)
+    _ = thread.futexWake(&job.*.done, 2147483647, true)
+}
+
+// The next picture to present (std.h265.nextOutput's, with the pool's
+// decoding behind it): pictures given out by std.h265 wait in the pool,
+// their slots held, until decoded, so that the caller goes on submitting
+// meanwhile; true with its slot and POC once the oldest is decoded, or
+// (waiting for it) when as many wait as the slots allow or the stream is
+// being flushed. The slot is the caller's until the next call.
+pub fn nextReady(pool: *Pool, h: *h265.Decoder, slot: *usize, poc: *i32) -> bool {
+    if pool.*.given < h265.SLOTS {
+        h265.releaseSlot(h, pool.*.given)
+        pool.*.given = h265.SLOTS
+    }
+    h.*.holdOutputs = true
+    var outSlot: usize = 0
+    var outPoc: i32 = 0
+    while pool.*.outputCount < h265.SLOTS && h265.nextOutput(h, &outSlot, &outPoc) {
+        pool.*.outputSlots[pool.*.outputCount] = outSlot
+        pool.*.outputPocs[pool.*.outputCount] = outPoc
+        pool.*.outputCount += 1
+    }
+    if pool.*.outputCount == 0 { return false }
+    // Slots std.h265 leaves for held pictures: SLOTS less its DPB and the
+    // picture being started.
+    var room: usize = 0
+    if h265.SLOTS > @intCast(usize, h.*.dpbPictures) + 2 { room = h265.SLOTS - @intCast(usize, h.*.dpbPictures) - 2 }
+    if room > pool.*.threads + 1 { room = pool.*.threads + 1 }
+    const first = pool.*.outputSlots[0]
+    const decoded = @atomicLoad(u32, &pool.*.root.*.frames[first].writing, acquire) == 0
+    if !decoded && pool.*.outputCount <= room && !h.*.flushing { return false }
+    awaitSlot(pool, first)
+    slot.* = first
+    poc.* = pool.*.outputPocs[0]
+    var k: usize = 1
+    while k < pool.*.outputCount {
+        pool.*.outputSlots[k - 1] = pool.*.outputSlots[k]
+        pool.*.outputPocs[k - 1] = pool.*.outputPocs[k]
+        k += 1
+    }
+    pool.*.outputCount -= 1
+    pool.*.given = first
+    return true
+}

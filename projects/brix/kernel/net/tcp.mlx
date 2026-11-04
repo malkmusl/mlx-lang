@@ -1,0 +1,581 @@
+// TCP: a connection per TCP socket (sockets.mlx): active open (SYN,
+// SYN+ACK, ACK), passive open for a listening socket, data in segments
+// of MSS bytes within the peer's window from a send ring (sent again
+// after a timeout, doubling, given up after RETRIES), data received in
+// order into the socket's ring (out of order: dropped, acknowledged
+// again), the window the ring's room, FIN both ways, RST. Options: only
+// the MSS. No selective acknowledgement, no slow start (the window
+// alone paces), no delayed acknowledgement.
+const memory = @import("../memory.mlx")
+const layout = @import("../../layout.mlx")
+const clock = @import("../clock.mlx")
+const Bytes = @import("../bytes.mlx").Bytes
+const stack = @import("./stack.mlx")
+const sockets = @import("./sockets.mlx")
+const Status = @import("../status.mlx").Status
+const Page = memory.Page
+const limits = @import("./limits.mlx")
+
+pub const State = enum(u8) { closed, listen, syn_sent, syn_received, established, fin_wait_1, fin_wait_2, close_wait, closing, last_ack, time_wait }
+
+const FIN: usize = 1
+const SYN: usize = 2
+const RST: usize = 4
+const PSH: usize = 8
+const ACK: usize = 16
+const HEADER: usize = 20
+pub const MSS: usize = 1460
+const SEND_RING: usize = limits.RING
+const SEND_PAGES: usize = SEND_RING / Page.SIZE
+const SECOND: usize = 1000000000
+const FIRST_RTO: usize = SECOND
+const MAX_RTO: usize = 8 * SECOND
+const RETRIES: usize = 10
+const TIME_WAIT: usize = 2 * SECOND
+const MAX_PENDING: usize = 4
+const ECONNREFUSED: isize = -111
+const ECONNRESET: isize = -104
+const ETIMEDOUT: isize = -110
+
+fn mask(v: usize) -> usize { return v & 0xFFFFFFFF }
+// Whether sequence number `a` is after `b`.
+fn after(a: usize, b: usize) -> bool { return a != b && mask(a -% b) < 0x80000000 }
+fn afterOrAt(a: usize, b: usize) -> bool { return a == b || after(a, b) }
+
+pub const Connection = struct {
+    socket: usize
+    state: State
+    localPort: usize
+    remote: stack.Ip
+    remotePort: usize
+    iss: usize
+    sndUna: usize
+    sndNxt: usize
+    rcvNxt: usize
+    peerWindow: usize
+    mss: usize
+    // The send ring (physical pages): the bytes from sndUna on, `count`
+    // of them (unacknowledged first, then unsent).
+    ring: usize
+    head: usize
+    count: usize
+    // A FIN wanted after the data, and sent (it takes a sequence number).
+    finQueued: bool
+    finSent: bool
+    // The retransmission: when (0: nothing in flight), how long, how often.
+    rtoDeadline: usize
+    rto: usize
+    retries: usize
+    timeWaitDeadline: usize
+    // The window we last told was small.
+    windowClosed: bool
+    // push is running (a segment to ourselves comes back into the
+    // connection before push goes on: no second push then).
+    pushing: bool
+    // A listener's connections established, not yet accepted.
+    pending: [MAX_PENDING]usize
+    pendingCount: usize
+
+    fn bytes(self: *const Self) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.ring)) }
+
+    pub fn init(self: *Self, socket: usize) -> bool {
+        self.*.socket = socket
+        self.*.state = State.closed
+        self.*.ring = memory.allFrames().allocateContiguous(SEND_PAGES)
+        if self.*.ring == 0 { return false }
+        self.*.head = 0
+        self.*.count = 0
+        self.*.finQueued = false
+        self.*.finSent = false
+        self.*.rtoDeadline = 0
+        self.*.rto = FIRST_RTO
+        self.*.retries = 0
+        self.*.timeWaitDeadline = 0
+        self.*.windowClosed = false
+        self.*.pushing = false
+        self.*.pendingCount = 0
+        self.*.peerWindow = MSS
+        self.*.mss = MSS
+        return true
+    }
+
+    pub fn deinit(self: *Self) -> void {
+        if self.*.ring != 0 {
+            var k: usize = 0
+            while k < SEND_PAGES {
+                memory.allFrames().free(self.*.ring + k * Page.SIZE)
+                k += 1
+            }
+        }
+        self.*.ring = 0
+        self.*.state = State.closed
+    }
+
+    pub fn done(self: *const Self) -> bool { return self.*.state == State.closed }
+
+    fn window(self: *Self) -> usize {
+        const room = sockets.sockets().at(self.*.socket).room()
+        self.*.windowClosed = room < 2 * MSS
+        return if room > 65535 { 65535 } else { room }
+    }
+
+    // A segment to the peer: `flags`, sequence number `seq`, `length`
+    // bytes of data already at the payload area after the header.
+    fn segment(self: *Self, flags: usize, seq: usize, length: usize) -> bool {
+        const h = stack.payloadArea()
+        var headerLength: usize = HEADER
+        if flags & SYN != 0 {
+            // The MSS option.
+            h[20] = 2
+            h[21] = 4
+            stack.putBe16(h, 22, MSS)
+            headerLength = 24
+        }
+        stack.putBe16(h, 0, self.*.localPort)
+        stack.putBe16(h, 2, self.*.remotePort)
+        stack.putBe32(h, 4, mask(seq))
+        stack.putBe32(h, 8, if flags & ACK != 0 { mask(self.*.rcvNxt) } else { 0 })
+        h[12] = @intCast(u8, (headerLength / 4) << 4)
+        h[13] = @intCast(u8, flags)
+        stack.putBe16(h, 14, self.window())
+        stack.putBe16(h, 16, 0)
+        stack.putBe16(h, 18, 0)
+        const total = headerLength + length
+        stack.putBe16(h, 16, stack.checksum(h, total, stack.pseudoSum(stack.configuration().*.address, self.*.remote, stack.PROTOCOL_TCP, total)))
+        return stack.send(stack.PROTOCOL_TCP, self.*.remote, total)
+    }
+
+    // A reset for a segment of no connection (no socket: window 0).
+    fn segmentStray(self: *Self, flags: usize, seq: usize) -> bool {
+        const h = stack.payloadArea()
+        stack.putBe16(h, 0, self.*.localPort)
+        stack.putBe16(h, 2, self.*.remotePort)
+        stack.putBe32(h, 4, mask(seq))
+        stack.putBe32(h, 8, if flags & ACK != 0 { mask(self.*.rcvNxt) } else { 0 })
+        h[12] = @intCast(u8, (HEADER / 4) << 4)
+        h[13] = @intCast(u8, flags)
+        stack.putBe16(h, 14, 0)
+        stack.putBe16(h, 16, 0)
+        stack.putBe16(h, 18, 0)
+        stack.putBe16(h, 16, stack.checksum(h, HEADER, stack.pseudoSum(stack.configuration().*.address, self.*.remote, stack.PROTOCOL_TCP, HEADER)))
+        return stack.send(stack.PROTOCOL_TCP, self.*.remote, HEADER)
+    }
+
+    fn arm(self: *Self) -> void {
+        if self.*.rtoDeadline == 0 { self.*.rtoDeadline = clock.system().monotonic() + self.*.rto }
+    }
+
+    // The connection opened to `remote`:`port` from `localPort` (the SYN
+    // sent; it is established when the SYN+ACK comes).
+    pub fn open(self: *Self, localPort: usize, remote: stack.Ip, port: usize) -> isize {
+        if self.*.state != State.closed { return Status.invalid }
+        self.*.localPort = localPort
+        self.*.remote = remote
+        self.*.remotePort = port
+        self.*.iss = mask(clock.system().monotonic() / 64)
+        self.*.sndUna = self.*.iss
+        self.*.sndNxt = mask(self.*.iss + 1)
+        self.*.rcvNxt = 0
+        self.*.state = State.syn_sent
+        self.*.rto = FIRST_RTO
+        self.*.retries = 0
+        _ = self.segment(SYN, self.*.iss, 0)
+        self.arm()
+        return 0
+    }
+
+    pub fn listen(self: *Self, port: usize) -> void {
+        self.*.localPort = port
+        self.*.state = State.listen
+        self.*.pendingCount = 0
+    }
+
+    pub fn hasPending(self: *const Self) -> bool { return self.*.pendingCount > 0 }
+
+    // The next established connection of a listener: its socket's index,
+    // or would_block.
+    pub fn takePending(self: *Self) -> isize {
+        if self.*.pendingCount == 0 { return Status.would_block }
+        const index = self.*.pending[0]
+        var k: usize = 1
+        while k < self.*.pendingCount {
+            self.*.pending[k - 1] = self.*.pending[k]
+            k += 1
+        }
+        self.*.pendingCount -= 1
+        sockets.sockets().at(index).*.holders = 1
+        return @intCast(isize, index)
+    }
+
+    fn unsent(self: *const Self) -> usize { return self.*.count - mask(self.*.sndNxt -% self.*.sndUna) + (if self.*.finSent { 1 } else { 0 }) }
+
+    pub fn sendRoom(self: *const Self) -> usize { return SEND_RING - self.*.count }
+
+    // `length` bytes from `data` into the send ring and on their way: how
+    // many were taken, would_block when none fit, peer_gone when the
+    // connection takes no more.
+    pub fn send(self: *Self, data: [*]const u8, length: usize) -> isize {
+        if self.*.state != State.established && self.*.state != State.close_wait { return Status.peer_gone }
+        if self.*.finQueued { return Status.peer_gone }
+        const room = self.sendRoom()
+        if room == 0 { return Status.would_block }
+        const taken = if length > room { room } else { length }
+        const b = self.bytes()
+        var k: usize = 0
+        while k < taken {
+            b[(self.*.head + self.*.count + k) % SEND_RING] = data[k]
+            k += 1
+        }
+        self.*.count += taken
+        self.push()
+        return @intCast(isize, taken)
+    }
+
+    // `length` bytes of the ring from `from` (an offset from sndUna) to
+    // the payload area after the header.
+    fn copyOut(self: *const Self, from: usize, length: usize) -> void {
+        const b = self.bytes()
+        const into = Bytes.pointer(@intFromPtr(stack.payloadArea()) + HEADER)
+        var k: usize = 0
+        while k < length {
+            into[k] = b[(self.*.head + from + k) % SEND_RING]
+            k += 1
+        }
+    }
+
+    // What can go now: segments of unsent bytes within the peer's
+    // window, then the FIN when every byte went.
+    fn push(self: *Self) -> void {
+        if self.*.state != State.established && self.*.state != State.close_wait && self.*.state != State.fin_wait_1 && self.*.state != State.closing && self.*.state != State.last_ack { return }
+        if self.*.pushing { return }
+        self.*.pushing = true
+        while true {
+            const inFlight = mask(self.*.sndNxt -% self.*.sndUna)
+            if inFlight > self.*.count || self.*.count - inFlight == 0 || inFlight >= self.*.peerWindow { break }
+            const left = self.*.count - inFlight
+            var chunk = if left > self.*.mss { self.*.mss } else { left }
+            if chunk > self.*.peerWindow - inFlight { chunk = self.*.peerWindow - inFlight }
+            self.copyOut(inFlight, chunk)
+            // (The sequence number moves first: the segment's answer may
+            // come back before segment returns, to ourselves.)
+            const seq = self.*.sndNxt
+            self.*.sndNxt = mask(seq + chunk)
+            if !self.segment(ACK | (if chunk == left { PSH } else { 0 }), seq, chunk) {
+                self.*.sndNxt = seq
+                break
+            }
+            self.arm()
+        }
+        if self.*.finQueued && !self.*.finSent && self.*.count == mask(self.*.sndNxt -% self.*.sndUna) {
+            const seq = self.*.sndNxt
+            self.*.finSent = true
+            self.*.sndNxt = mask(seq + 1)
+            self.*.state = if self.*.state == State.close_wait { State.last_ack } else { State.fin_wait_1 }
+            if self.segment(FIN | ACK, seq, 0) {
+                self.arm()
+            } else {
+                self.*.finSent = false
+                self.*.sndNxt = seq
+                self.*.state = if self.*.state == State.last_ack { State.close_wait } else { State.established }
+            }
+        }
+        self.*.pushing = false
+    }
+
+    // The socket's last descriptor went (or shutdown): the data still
+    // goes, then the FIN; a connection not yet made is dropped.
+    pub fn close(self: *Self) -> void {
+        if self.*.state == State.established || self.*.state == State.close_wait {
+            self.*.finQueued = true
+            self.push()
+            return
+        }
+        if self.*.state == State.listen {
+            // The connections waiting to be accepted go.
+            var k: usize = 0
+            while k < self.*.pendingCount {
+                connections[self.*.pending[k]].abort()
+                connections[self.*.pending[k]].deinit()
+                sockets.sockets().drop(self.*.pending[k])
+                k += 1
+            }
+            self.*.pendingCount = 0
+            self.*.state = State.closed
+            return
+        }
+        if self.*.state == State.syn_sent || self.*.state == State.syn_received { self.abort() }
+    }
+
+    // The connection reset (RST to the peer when one was made).
+    fn abort(self: *Self) -> void {
+        if self.*.state != State.closed && self.*.state != State.listen && self.*.state != State.syn_sent { _ = self.segment(RST | ACK, self.*.sndNxt, 0) }
+        self.*.state = State.closed
+        self.*.rtoDeadline = 0
+    }
+
+    // The window told again when it was small and the reader made room.
+    pub fn windowOpened(self: *Self) -> void {
+        if self.*.windowClosed && (self.*.state == State.established || self.*.state == State.fin_wait_1 || self.*.state == State.fin_wait_2) {
+            _ = self.segment(ACK, self.*.sndNxt, 0)
+        }
+    }
+
+    // The connection is over: the socket hears; nobody's, it goes.
+    fn finishedNow(self: *Self) -> void {
+        self.*.state = State.closed
+        self.*.rtoDeadline = 0
+        sockets.sockets().changed(self.*.socket)
+        if sockets.sockets().holdersOf(self.*.socket) == 0 {
+            self.deinit()
+            sockets.sockets().drop(self.*.socket)
+        }
+    }
+
+    // The peer's acknowledgement `ack` (and its window): the bytes it
+    // covers leave the ring.
+    fn acknowledged(self: *Self, ack: usize, peerWindow: usize) -> void {
+        self.*.peerWindow = peerWindow
+        if !after(ack, self.*.sndUna) || after(ack, self.*.sndNxt) { return }
+        var covered = mask(ack -% self.*.sndUna)
+        var finAcked = false
+        if self.*.finSent && ack == self.*.sndNxt {
+            covered -= 1
+            finAcked = true
+        }
+        if covered > self.*.count { covered = self.*.count }
+        self.*.head = (self.*.head + covered) % SEND_RING
+        self.*.count -= covered
+        self.*.sndUna = ack
+        self.*.retries = 0
+        self.*.rto = FIRST_RTO
+        self.*.rtoDeadline = if ack == self.*.sndNxt { 0 } else { clock.system().monotonic() + self.*.rto }
+        if covered > 0 { sockets.sockets().roomMade(self.*.socket) }
+        if finAcked {
+            if self.*.state == State.fin_wait_1 { self.*.state = State.fin_wait_2 }
+            if self.*.state == State.closing { self.enterTimeWait() }
+            if self.*.state == State.last_ack { self.finishedNow() }
+        }
+    }
+
+    fn enterTimeWait(self: *Self) -> void {
+        self.*.state = State.time_wait
+        self.*.rtoDeadline = 0
+        self.*.timeWaitDeadline = clock.system().monotonic() + TIME_WAIT
+    }
+
+    // A segment for this connection.
+    fn take(self: *Self, seq: usize, ack: usize, flags: usize, peerWindow: usize, data: [*]const u8, length: usize, options: [*]const u8, optionsLength: usize) -> void {
+        if flags & RST != 0 {
+            if self.*.state == State.syn_sent {
+                if ack == self.*.sndNxt { self.fail(ECONNREFUSED) }
+                return
+            }
+            self.fail(ECONNRESET)
+            return
+        }
+        if self.*.state == State.syn_sent {
+            if flags & SYN == 0 || flags & ACK == 0 || ack != self.*.sndNxt { return }
+            self.*.rcvNxt = mask(seq + 1)
+            self.readOptions(options, optionsLength)
+            self.acknowledged(ack, peerWindow)
+            self.*.state = State.established
+            _ = self.segment(ACK, self.*.sndNxt, 0)
+            sockets.Sockets.established(self.*.socket)
+            return
+        }
+        if self.*.state == State.syn_received {
+            if flags & ACK == 0 || ack != self.*.sndNxt { return }
+            self.acknowledged(ack, peerWindow)
+            self.*.state = State.established
+            const listener = sockets.Sockets.listenerFor(self.*.localPort)
+            if listener != sockets.MAX {
+                const l = &connections[listener]
+                if l.*.pendingCount < MAX_PENDING {
+                    l.*.pending[l.*.pendingCount] = self.*.socket
+                    l.*.pendingCount += 1
+                    sockets.sockets().roomMade(listener)
+                } else {
+                    self.abort()
+                    self.deinit()
+                    sockets.sockets().drop(self.*.socket)
+                    return
+                }
+            }
+            sockets.Sockets.established(self.*.socket)
+            // (The data of this segment, below.)
+        }
+        if flags & ACK == 0 { return }
+        if self.*.state == State.time_wait {
+            if flags & FIN != 0 { _ = self.segment(ACK, self.*.sndNxt, 0) }
+            return
+        }
+        self.acknowledged(ack, peerWindow)
+        if self.*.state == State.closed { return }
+        // Data in order, into the socket; otherwise the acknowledgement
+        // says what is wanted.
+        var consumed: usize = 0
+        if length > 0 {
+            if seq == self.*.rcvNxt {
+                consumed = sockets.Sockets.deliverBytes(self.*.socket, data, length)
+                self.*.rcvNxt = mask(self.*.rcvNxt + consumed)
+            }
+            _ = self.segment(ACK, self.*.sndNxt, 0)
+        }
+        if flags & FIN != 0 && mask(seq + consumed) == self.*.rcvNxt && consumed == length {
+            self.*.rcvNxt = mask(self.*.rcvNxt + 1)
+            sockets.Sockets.peerClosed(self.*.socket)
+            if self.*.state == State.established { self.*.state = State.close_wait }
+            if self.*.state == State.fin_wait_1 { self.*.state = State.closing }
+            if self.*.state == State.fin_wait_2 { self.enterTimeWait() }
+            _ = self.segment(ACK, self.*.sndNxt, 0)
+        }
+        self.push()
+    }
+
+    fn readOptions(self: *Self, options: [*]const u8, length: usize) -> void {
+        var at: usize = 0
+        while at < length {
+            const kind = options[at]
+            if kind == 0 { return }
+            if kind == 1 {
+                at += 1
+                continue
+            }
+            if at + 1 >= length { return }
+            const size = @intCast(usize, options[at + 1])
+            if size < 2 || at + size > length { return }
+            if kind == 2 && size == 4 {
+                const mss = stack.be16(options, at + 2)
+                if mss >= 536 && mss < MSS { self.*.mss = mss }
+            }
+            at += size
+        }
+    }
+
+    fn fail(self: *Self, code: isize) -> void {
+        sockets.Sockets.failed(self.*.socket, code)
+        self.finishedNow()
+    }
+
+    // The retransmission timer (every tick): what the peer did not
+    // acknowledge in time, sent again; given up after RETRIES.
+    fn tick(self: *Self, now: usize) -> void {
+        if self.*.state == State.time_wait && now >= self.*.timeWaitDeadline {
+            self.finishedNow()
+            return
+        }
+        if self.*.rtoDeadline == 0 || now < self.*.rtoDeadline { return }
+        self.*.retries += 1
+        if self.*.retries > RETRIES {
+            self.fail(ETIMEDOUT)
+            return
+        }
+        self.*.rto = if self.*.rto * 2 > MAX_RTO { MAX_RTO } else { self.*.rto * 2 }
+        self.*.rtoDeadline = now + self.*.rto
+        if self.*.state == State.syn_sent {
+            _ = self.segment(SYN, self.*.iss, 0)
+            return
+        }
+        if self.*.state == State.syn_received {
+            _ = self.segment(SYN | ACK, self.*.iss, 0)
+            return
+        }
+        const inFlight = mask(self.*.sndNxt -% self.*.sndUna)
+        const dataInFlight = if self.*.finSent && inFlight > 0 { inFlight - 1 } else { inFlight }
+        if dataInFlight > 0 {
+            const chunk = if dataInFlight > self.*.mss { self.*.mss } else { dataInFlight }
+            self.copyOut(0, chunk)
+            _ = self.segment(ACK | PSH, self.*.sndUna, chunk)
+        } else if self.*.finSent {
+            _ = self.segment(FIN | ACK, mask(self.*.sndNxt - 1), 0)
+        }
+    }
+}
+
+var connections: [limits.MAX_SOCKETS]Connection = undefined // (per run)
+
+pub fn connectionAt(index: usize) -> *Connection { return &connections[index] }
+
+pub fn init() -> void {
+    var k: usize = 0
+    while k < limits.MAX_SOCKETS {
+        connections[k].state = State.closed
+        k += 1
+    }
+}
+
+// A segment from the stack: to its connection, or to a listener (a SYN:
+// a new connection), or answered with a reset.
+pub fn receive(source: stack.Ip, destination: stack.Ip, bytes: [*]const u8, length: usize) -> void {
+    if length < HEADER { return }
+    if stack.checksum(bytes, length, stack.pseudoSum(source, destination, stack.PROTOCOL_TCP, length)) != 0 { return }
+    const sourcePort = stack.be16(bytes, 0)
+    const port = stack.be16(bytes, 2)
+    const seq = stack.be32(bytes, 4)
+    const ack = stack.be32(bytes, 8)
+    const headerLength = @intCast(usize, bytes[12] >> 4) * 4
+    if headerLength < HEADER || headerLength > length { return }
+    const flags = @intCast(usize, bytes[13])
+    const peerWindow = stack.be16(bytes, 14)
+    const data = Bytes.pointer(@intFromPtr(bytes) + headerLength)
+    const dataLength = length - headerLength
+    const options = Bytes.pointer(@intFromPtr(bytes) + HEADER)
+    const table = sockets.sockets()
+    var k: usize = 0
+    while k < sockets.MAX {
+        const s = table.at(k)
+        if s.*.kind == sockets.Kind.tcp && !s.*.listening && connections[k].state != State.closed && s.*.localPort == port && s.*.remotePort == sourcePort && stack.same(s.*.remote, source) {
+            connections[k].take(seq, ack, flags, peerWindow, data, dataLength, options, headerLength - HEADER)
+            return
+        }
+        k += 1
+    }
+    const listener = sockets.Sockets.listenerFor(port)
+    if listener != sockets.MAX && flags & SYN != 0 && flags & ACK == 0 {
+        const made = table.openAccepted(port, source, sourcePort)
+        if made < 0 { return }
+        const c = &connections[@bitCast(usize, made)]
+        if !c.init(@bitCast(usize, made)) {
+            table.abandon(@bitCast(usize, made))
+            return
+        }
+        c.*.localPort = port
+        c.*.remote = source
+        c.*.remotePort = sourcePort
+        c.*.iss = mask(clock.system().monotonic() / 64)
+        c.*.sndUna = c.*.iss
+        c.*.sndNxt = mask(c.*.iss + 1)
+        c.*.rcvNxt = mask(seq + 1)
+        c.*.state = State.syn_received
+        c.readOptions(options, headerLength - HEADER)
+        c.*.peerWindow = peerWindow
+        _ = c.segment(SYN | ACK, c.*.iss, 0)
+        c.arm()
+        return
+    }
+    // Nobody's: a reset (unless it was one).
+    if flags & RST == 0 {
+        var stray: Connection = undefined
+        stray.localPort = port
+        stray.remote = source
+        stray.remotePort = sourcePort
+        stray.rcvNxt = mask(seq + dataLength + (if flags & SYN != 0 { 1 } else { 0 }))
+        stray.socket = sockets.MAX
+        if flags & ACK != 0 {
+            _ = stray.segmentStray(RST, ack)
+        } else {
+            _ = stray.segmentStray(RST | ACK, 0)
+        }
+    }
+}
+
+// The timers of every connection.
+pub fn tick() -> void {
+    const now = clock.system().monotonic()
+    var k: usize = 0
+    while k < sockets.MAX {
+        const s = sockets.sockets().at(k)
+        if s.*.kind == sockets.Kind.tcp && !s.*.listening { connections[k].tick(now) }
+        k += 1
+    }
+}

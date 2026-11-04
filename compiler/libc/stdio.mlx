@@ -33,6 +33,12 @@ const F_OWNER: usize = 80        // the locking thread
 const F_FLAGS: usize = 88        // u32: this library's flags below
 const F_NEXT: usize = 96         // the open streams' list
 const F_FD: usize = 112          // i32 _fileno
+const F_MEM_PTR: usize = 120     // a memory stream (open_memstream): the caller's char **
+const F_MEM_SIZE: usize = 128    // and its size_t *
+const F_MEM_BUFFER: usize = 136  // the text, NUL-terminated, F_MEM_LENGTH bytes in F_MEM_CAPACITY
+const F_MEM_LENGTH: usize = 144
+const F_MEM_CAPACITY: usize = 152
+const F_MEM_POSITION: usize = 160  // where the next byte goes
 const F_SMALL: usize = 200       // 16 bytes: an unbuffered stream's buffer (8 spare, 8 data)
 const F_SIZE: usize = 216
 
@@ -56,6 +62,7 @@ const BUFFERING_DECIDED: u32 = 512
 const READING: u32 = 1024
 const WRITING: u32 = 2048
 const SPARE: u32 = 4096          // eight bytes before the buffer, for ungetc at its start
+const MEMORY: u32 = 8192         // writes go to the memory stream's buffer, not a descriptor
 
 pub const BUFFER_SIZE: usize = 4096
 
@@ -227,11 +234,72 @@ fn flushWrites(file: usize) -> bool {
     if pending == 0 { return true }
     const base = sys.getPointer(file + F_WRITE_BASE)
     sys.putPointer(file + F_WRITE_PTR, base)
-    if !writeAll(descriptor(file), base, pending) {
+    if !emit(file, base, pending) {
         addFlags(file, ERROR_SEEN)
         return false
     }
     return true
+}
+
+// Bytes leaving the stream: to its descriptor, or into a memory stream's buffer.
+fn emit(file: usize, source: usize, count: usize) -> bool {
+    if flags(file) & MEMORY != 0 { return memoryWrite(file, source, count) }
+    return writeAll(descriptor(file), source, count)
+}
+
+// --- memory streams (open_memstream) --------------------------------------------
+
+fn memoryWrite(file: usize, source: usize, count: usize) -> bool {
+    const position = sys.getPointer(file + F_MEM_POSITION)
+    const needed = position + count + 1
+    var capacity = sys.getPointer(file + F_MEM_CAPACITY)
+    var buffer = sys.getPointer(file + F_MEM_BUFFER)
+    if needed > capacity {
+        while capacity < needed { capacity *= 2 }
+        const grown = heap.realloc(buffer, capacity)
+        if grown == 0 {
+            errno.set(sys.ENOMEM)
+            return false
+        }
+        buffer = grown
+        sys.putPointer(file + F_MEM_BUFFER, buffer)
+        sys.putPointer(file + F_MEM_CAPACITY, capacity)
+    }
+    sys.copy(buffer + position, source, count)
+    if position + count > sys.getPointer(file + F_MEM_LENGTH) { sys.putPointer(file + F_MEM_LENGTH, position + count) }
+    sys.putPointer(file + F_MEM_POSITION, position + count)
+    return true
+}
+
+// The caller's pointer and size, with the text NUL-terminated: after every
+// flush and at close, as glibc does.
+fn publishMemory(file: usize) -> void {
+    const buffer = sys.getPointer(file + F_MEM_BUFFER)
+    const length = sys.getPointer(file + F_MEM_LENGTH)
+    sys.put8(buffer + length, 0)
+    sys.putPointer(sys.getPointer(file + F_MEM_PTR), buffer)
+    sys.putPointer(sys.getPointer(file + F_MEM_SIZE), length)
+}
+
+pub export fn open_memstream(pointer: usize, size: usize) -> usize {
+    standardStreams()
+    const buffer = heap.allocate(64, 16)
+    if buffer == 0 {
+        errno.set(sys.ENOMEM)
+        return 0
+    }
+    const file = newStream(-1, WRITABLE | MEMORY)
+    if file == 0 {
+        heap.release(buffer)
+        errno.set(sys.ENOMEM)
+        return 0
+    }
+    sys.putPointer(file + F_MEM_PTR, pointer)
+    sys.putPointer(file + F_MEM_SIZE, size)
+    sys.putPointer(file + F_MEM_BUFFER, buffer)
+    sys.putPointer(file + F_MEM_CAPACITY, 64)
+    publishMemory(file)
+    return file
 }
 
 // Buffered input given back to the descriptor's position.
@@ -296,7 +364,7 @@ pub fn putBytes(file: usize, source: usize, count: usize) -> usize {
     dropReads(file)
     decideBuffering(file)
     if flags(file) & UNBUFFERED != 0 || !ensureBuffer(file) {
-        if !writeAll(descriptor(file), source, count) {
+        if !emit(file, source, count) {
             addFlags(file, ERROR_SEEN)
             return 0
         }
@@ -315,7 +383,7 @@ pub fn putBytes(file: usize, source: usize, count: usize) -> usize {
         if room > count - done { room = count - done }
         if pending == 0 && count - done >= capacity {
             // Whole buffers go straight out.
-            if !writeAll(descriptor(file), source + done, capacity) {
+            if !emit(file, source + done, capacity) {
                 addFlags(file, ERROR_SEEN)
                 return done
             }
@@ -500,7 +568,11 @@ pub export fn fclose(handle: usize) -> i32 {
     var status: i32 = 0
     if !flushWrites(file) { status = -1 }
     dropReads(file)
-    if unistd.close(descriptor(file)) != 0 { status = -1 }
+    if flags(file) & MEMORY != 0 {
+        publishMemory(file)
+    } else if unistd.close(descriptor(file)) != 0 {
+        status = -1
+    }
     releaseBuffer(file)
     setReadPointers(file, 0, 0, 0)
     setWritePointers(file, 0, 0, 0)
@@ -523,6 +595,7 @@ pub export fn fflush(handle: usize) -> i32 {
     const file = fileOf(handle)
     lockFile(file)
     const ok = flushWrites(file)
+    if ok && flags(file) & MEMORY != 0 { publishMemory(file) }
     unlockFile(file)
     return if ok { 0 } else { -1 }
 }
@@ -796,6 +869,18 @@ pub export fn fseeko(handle: usize, offset: i64, whence: i32) -> i32 {
     setReadPointers(file, 0, 0, 0)
     setWritePointers(file, 0, 0, 0)
     clearFlags(file, READING | WRITING | EOF_SEEN)
+    if flags(file) & MEMORY != 0 {
+        var from: i64 = 0
+        if whence == 1 { from = @intCast(i64, sys.getPointer(file + F_MEM_POSITION)) }
+        if whence == 2 { from = @intCast(i64, sys.getPointer(file + F_MEM_LENGTH)) }
+        unlockFile(file)
+        if from + target < 0 {
+            errno.set(sys.EINVAL)
+            return -1
+        }
+        sys.putPointer(file + F_MEM_POSITION, @intCast(usize, from + target))
+        return 0
+    }
     const sought = unistd.lseek(descriptor(file), target, whence)
     unlockFile(file)
     return if sought < 0 { -1 } else { 0 }
@@ -807,6 +892,11 @@ pub export fn fseeko64(handle: usize, offset: i64, whence: i32) -> i32 { return 
 pub export fn ftello(handle: usize) -> i64 {
     const file = fileOf(handle)
     lockFile(file)
+    if flags(file) & MEMORY != 0 {
+        const at = @intCast(i64, sys.getPointer(file + F_MEM_POSITION) + pendingWrites(file))
+        unlockFile(file)
+        return at
+    }
     var position = unistd.lseek(descriptor(file), 0, 1)
     if position >= 0 {
         if flags(file) & READING != 0 {

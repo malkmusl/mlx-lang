@@ -602,7 +602,10 @@ adds on x86_64:
   no system call either way (see [Formats](formats.md#shared-objects));
 - a program with imports is a dynamically linked executable (see
   [Formats](formats.md#dynamically-linked-executables)) that exits through
-  libc's `exit`, so stdio is flushed and library destructors run.
+  libc's `exit`, so stdio is flushed and library destructors run. An
+  import counts when the program calls it or takes its address: an
+  `extern("c")` some imported module declares but the program never uses
+  leaves it static.
 
 `tests/247_foreign_c_runtime.mlx` covers direct imports, a variadic import,
 `dlopen`/`dlsym` and calls through the result, a `qsort` callback, an export

@@ -1,0 +1,373 @@
+// Physical frames (4 KiB) and address spaces. Frames come from
+// Memory.FREE to the end of memory (the Multiboot information's, within
+// the mapped GiB); freed ones are kept on a list. A frame can be shared
+// (by address spaces after a fork, by files): it counts who holds it and
+// is free when the last one lets it go; a shared page is copied when one
+// of them writes to it (copy on write). Page tables are reached through
+// the kernel's view of physical memory.
+const layout = @import("../layout.mlx")
+const cpu = @import("./cpu.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+
+pub const Page = struct {
+    pub const SIZE: usize = 4096
+    pub const PRESENT: usize = 1
+    pub const WRITABLE: usize = 2
+    pub const USER: usize = 4
+    // An available bit of an entry: the page is shared, written only
+    // after a copy (it is mapped read-only).
+    pub const COPY_ON_WRITE: usize = 0x200
+    // Another: the page is a memory object's, shared by every space that
+    // maps it (a copy of the space shares it as it is, never copied).
+    pub const SHARED: usize = 0x400
+    // The frame's address in an entry.
+    pub const ADDRESS: usize = 0x000FFFFFFFFFF000
+
+    pub fn down(value: usize) -> usize { return value & ~(SIZE - 1) }
+    pub fn up(value: usize) -> usize { return (value + SIZE - 1) & ~(SIZE - 1) }
+}
+
+pub const Frames = struct {
+    // A frame is held by at most this many (sharing more copies it).
+    pub const MAX_HOLDERS: usize = 0xFFFF
+
+    next: usize
+    end: usize
+    freeList: usize
+    freeCount: usize
+    // How many hold each frame (a u16 per frame, in frames of their own).
+    holders: [*]u16
+
+    // Memory from the Multiboot information (mem_upper: KiB above 1 MiB).
+    pub fn init(self: *Self) -> void {
+        self.*.next = cpu.BootInfo.get(layout.Info.FREE_PHYS)
+        self.*.freeList = 0
+        self.*.freeCount = 0
+        var end: usize = 128 * 1024 * 1024
+        const mbi = cpu.BootInfo.get(layout.Info.MBI)
+        if mbi != 0 {
+            const info = Bytes.pointer(layout.Memory.virtual(mbi))
+            if Bytes.read32(info, 0) & 1 != 0 { end = 0x100000 + Bytes.read32(info, 8) * 1024 }
+        }
+        if end > layout.Memory.MAPPED_LIMIT { end = layout.Memory.MAPPED_LIMIT }
+        self.*.end = Page.down(end)
+        // The counts first, taken from the start of the free frames.
+        const countBytes = Page.up(self.*.end / Page.SIZE * 2)
+        self.*.holders = unsafe { @ptrFromInt([*]u16, layout.Memory.virtual(self.*.next)) }
+        Bytes.zeroWords(layout.Memory.virtual(self.*.next), countBytes)
+        self.*.next += countBytes
+    }
+
+    // How many hold the frame.
+    pub fn holderCount(self: *const Self, frame: usize) -> usize { return @intCast(usize, self.*.holders[frame / Page.SIZE]) }
+
+    // One more holds the frame; false when it is held by too many (the
+    // caller copies it instead).
+    pub fn share(self: *Self, frame: usize) -> bool {
+        const at = frame / Page.SIZE
+        if @intCast(usize, self.*.holders[at]) >= MAX_HOLDERS { return false }
+        self.*.holders[at] += 1
+        return true
+    }
+
+    pub fn totalBytes(self: *const Self) -> usize { return self.*.end }
+    pub fn freeBytes(self: *const Self) -> usize { return self.*.end - self.*.next + self.*.freeCount * Page.SIZE }
+
+    // A zeroed frame's physical address; 0 when memory is out.
+    pub fn allocate(self: *Self) -> usize {
+        var frame: usize = 0
+        if self.*.freeList != 0 {
+            frame = self.*.freeList
+            self.*.freeList = Bytes.read64(Bytes.pointer(layout.Memory.virtual(frame)), 0)
+            self.*.freeCount -= 1
+        } else if self.*.next < self.*.end {
+            frame = self.*.next
+            self.*.next += Page.SIZE
+        } else {
+            return 0
+        }
+        Bytes.zeroWords(layout.Memory.virtual(frame), Page.SIZE)
+        self.*.holders[frame / Page.SIZE] = 1
+        return frame
+    }
+
+    // `count` frames one after the other (for a device that wants them
+    // so), zeroed: the first one's address; 0 when there are not that
+    // many left in one piece.
+    pub fn allocateContiguous(self: *Self, count: usize) -> usize {
+        if self.*.end - self.*.next < count * Page.SIZE { return 0 }
+        const first = self.*.next
+        self.*.next += count * Page.SIZE
+        var k: usize = 0
+        while k < count {
+            Bytes.zeroWords(layout.Memory.virtual(first + k * Page.SIZE), Page.SIZE)
+            self.*.holders[(first + k * Page.SIZE) / Page.SIZE] = 1
+            k += 1
+        }
+        return first
+    }
+
+    // A holder lets the frame go; it is free when it was the last.
+    pub fn free(self: *Self, frame: usize) -> void {
+        const at = frame / Page.SIZE
+        if self.*.holders[at] > 1 {
+            self.*.holders[at] -= 1
+            return
+        }
+        self.*.holders[at] = 0
+        Bytes.write64(Bytes.pointer(layout.Memory.virtual(frame)), 0, self.*.freeList)
+        self.*.freeList = frame
+        self.*.freeCount += 1
+    }
+}
+
+var frames: Frames = undefined // (per run)
+
+pub fn allFrames() -> *Frames { return &frames }
+
+// An address space: its PML4 (physical), the kernel's half (entry 256 of
+// the boot tables) in it. The lower half is the program's.
+pub const Space = struct {
+    root: usize
+
+    // A new space; its root is 0 when memory is out.
+    pub fn create() -> Space {
+        const root = frames.allocate()
+        if root != 0 { entries(root)[256] = entries(layout.Memory.BLOB + layout.Blob.PML4)[256] }
+        return Space.{ .root = root }
+    }
+
+    // The boot page tables: the kernel's half, and the first GiB at 0
+    // (the space in use while a process's own is freed).
+    pub fn boot() -> Space { return Space.{ .root = layout.Memory.BLOB + layout.Blob.PML4 } }
+
+    pub fn isValid(self: Self) -> bool { return self.root != 0 }
+
+    // The processor uses this space from now on.
+    pub fn activate(self: Self) -> void { cpu.Cpu.usePageTables(self.root) }
+
+    fn entries(table: usize) -> [*]usize { return unsafe { @ptrFromInt([*]usize, layout.Memory.virtual(table)) } }
+
+    // The table `index` of `table` points to, made when `create`; 0 when
+    // there is none.
+    fn next(table: usize, index: usize, create: bool) -> usize {
+        const slots = entries(table)
+        if slots[index] & Page.PRESENT == 0 {
+            if !create { return 0 }
+            const fresh = frames.allocate()
+            if fresh == 0 { return 0 }
+            slots[index] = fresh | Page.PRESENT | Page.WRITABLE | Page.USER
+        }
+        return slots[index] & Page.ADDRESS
+    }
+
+    // The page table entry of `address`; null without the tables (made
+    // first when `create`).
+    fn entry(self: Self, address: usize, create: bool) -> ?*usize {
+        const pdpt = next(self.root, (address >> 39) & 511, create)
+        if pdpt == 0 { return null }
+        const pd = next(pdpt, (address >> 30) & 511, create)
+        if pd == 0 { return null }
+        const pt = next(pd, (address >> 21) & 511, create)
+        if pt == 0 { return null }
+        return &entries(pt)[(address >> 12) & 511]
+    }
+
+    // Maps the page at `address` to `frame` with `flags`; false when
+    // memory for a table is out.
+    pub fn map(self: Self, address: usize, frame: usize, flags: usize) -> bool {
+        const slot = self.entry(address, true)
+        if slot == null { return false }
+        slot.?.* = (frame & Page.ADDRESS) | flags | Page.PRESENT
+        return true
+    }
+
+    // The frame the page at `address` is mapped to; 0 when none.
+    pub fn translate(self: Self, address: usize) -> usize {
+        const slot = self.entry(address, false)
+        if slot == null || slot.?.* & Page.PRESENT == 0 { return 0 }
+        return slot.?.* & Page.ADDRESS
+    }
+
+    // A fresh zeroed page at `address` (user, writable); false when
+    // memory is out.
+    pub fn back(self: Self, address: usize) -> bool {
+        const frame = frames.allocate()
+        if frame == 0 { return false }
+        if !self.map(Page.down(address), frame, Page.PRESENT | Page.WRITABLE | Page.USER) {
+            frames.free(frame)
+            return false
+        }
+        return true
+    }
+
+    // The page at `address` unmapped and its frame freed (when it had
+    // one).
+    pub fn release(self: Self, address: usize) -> void {
+        const slot = self.entry(address, false)
+        if slot == null || slot.?.* & Page.PRESENT == 0 { return }
+        frames.free(slot.?.* & Page.ADDRESS)
+        slot.?.* = 0
+        cpu.Cpu.invalidatePage(address)
+    }
+
+    // `length` bytes from `from` into the space at `address`, pages made as
+    // needed (through the kernel's view of their frames, whichever space
+    // is in use); false when memory is out.
+    pub fn write(self: Self, address: usize, from: [*]const u8, length: usize) -> bool {
+        var done: usize = 0
+        while done < length {
+            const at = address + done
+            var frame = self.translate(at)
+            if frame == 0 {
+                if !self.back(at) { return false }
+                frame = self.translate(at)
+            }
+            const offset = at & (Page.SIZE - 1)
+            var chunk = Page.SIZE - offset
+            if chunk > length - done { chunk = length - done }
+            Bytes.copy(Bytes.pointer(layout.Memory.virtual(frame) + offset), unsafe { @ptrFromInt([*]const u8, @intFromPtr(from) + done) }, chunk)
+            done += chunk
+        }
+        return true
+    }
+
+    pub fn writeWord(self: Self, address: usize, value: usize) -> bool {
+        var bytes: [8]u8 = undefined
+        Bytes.write64(&bytes, 0, value)
+        return self.write(address, &bytes, 8)
+    }
+
+    // A copy of the lower half that shares its pages (a fork's child):
+    // every writable page becomes read-only and copy-on-write in both
+    // spaces (the caller makes the processor forget the old mappings);
+    // the root is 0 when memory is out (what was made is freed again).
+    pub fn clone(self: Self) -> Space {
+        const copy = Space.create()
+        if !copy.isValid() { return copy }
+        var i: usize = 0
+        while i < 256 {
+            const pdpt = next(self.root, i, false)
+            if pdpt != 0 {
+                var j: usize = 0
+                while j < 512 {
+                    const pd = next(pdpt, j, false)
+                    if pd != 0 {
+                        var k: usize = 0
+                        while k < 512 {
+                            const pt = next(pd, k, false)
+                            if pt != 0 && !shareTable(copy, pt, (i << 39) | (j << 30) | (k << 21)) {
+                                copy.destroy()
+                                return Space.{ .root = 0 }
+                            }
+                            k += 1
+                        }
+                    }
+                    j += 1
+                }
+            }
+            i += 1
+        }
+        return copy
+    }
+
+    // The pages of the page table `pt` (mapping from `base` on) shared
+    // with `into`, copy-on-write (copied when too many share one).
+    fn shareTable(into: Space, pt: usize, base: usize) -> bool {
+        var l: usize = 0
+        while l < 512 {
+            const slot = &entries(pt)[l]
+            const value = slot.*
+            if value & Page.PRESENT != 0 {
+                const frame = value & Page.ADDRESS
+                var flags = value & (Page.SIZE - 1)
+                if flags & Page.SHARED != 0 {
+                    // A memory object's page stays shared, as writable as
+                    // it was.
+                    if !frames.share(frame) { return false }
+                    if !into.map(base | (l << 12), frame, flags) {
+                        frames.free(frame)
+                        return false
+                    }
+                } else if frames.share(frame) {
+                    if flags & Page.WRITABLE != 0 {
+                        flags = (flags & ~Page.WRITABLE) | Page.COPY_ON_WRITE
+                        slot.* = frame | flags
+                    }
+                    if !into.map(base | (l << 12), frame, flags) {
+                        frames.free(frame)
+                        return false
+                    }
+                } else {
+                    const copy = frames.allocate()
+                    if copy == 0 { return false }
+                    Bytes.copyWords(layout.Memory.virtual(copy), layout.Memory.virtual(frame), Page.SIZE)
+                    if !into.map(base | (l << 12), copy, flags) {
+                        frames.free(copy)
+                        return false
+                    }
+                }
+            }
+            l += 1
+        }
+        return true
+    }
+
+    // A write to the copy-on-write page at `address`: the page becomes
+    // the space's own (copied when others still hold it) and writable.
+    // False when the page is not copy-on-write (or memory is out).
+    pub fn copyOnWrite(self: Self, address: usize) -> bool {
+        const slot = self.entry(address, false)
+        if slot == null { return false }
+        const value = slot.?.*
+        if value & Page.PRESENT == 0 || value & Page.COPY_ON_WRITE == 0 { return false }
+        const frame = value & Page.ADDRESS
+        const flags = (value & (Page.SIZE - 1) & ~Page.COPY_ON_WRITE) | Page.WRITABLE
+        if frames.holderCount(frame) == 1 {
+            slot.?.* = frame | flags
+        } else {
+            const copy = frames.allocate()
+            if copy == 0 { return false }
+            Bytes.copyWords(layout.Memory.virtual(copy), layout.Memory.virtual(frame), Page.SIZE)
+            slot.?.* = copy | flags
+            frames.free(frame)
+        }
+        cpu.Cpu.invalidatePage(address)
+        return true
+    }
+
+    // Every page and table of the lower half freed, the PML4 too.
+    pub fn destroy(self: Self) -> void {
+        var i: usize = 0
+        while i < 256 {
+            const pdpt = next(self.root, i, false)
+            if pdpt != 0 {
+                var j: usize = 0
+                while j < 512 {
+                    const pd = next(pdpt, j, false)
+                    if pd != 0 {
+                        var k: usize = 0
+                        while k < 512 {
+                            const pt = next(pd, k, false)
+                            if pt != 0 {
+                                var l: usize = 0
+                                while l < 512 {
+                                    const value = entries(pt)[l]
+                                    if value & Page.PRESENT != 0 { frames.free(value & Page.ADDRESS) }
+                                    l += 1
+                                }
+                                frames.free(pt)
+                            }
+                            k += 1
+                        }
+                        frames.free(pd)
+                    }
+                    j += 1
+                }
+                frames.free(pdpt)
+            }
+            i += 1
+        }
+        frames.free(self.root)
+    }
+}

@@ -79,6 +79,7 @@
 #include "port/MlxWebPort.h"
 #include "port/embed/MlxFrameLoaderClient.h"
 #include "UserAgent.h"
+#include "port/platform/mlx/MediaSessionMlx.h"
 #include "port/platform/mlx/UserAgentMlx.h"
 #include "CookieJar.h"
 #include "port/embed/MlxNetwork.h"
@@ -204,6 +205,9 @@ struct VoyagerEngine {
     // (x, y, width, height each, from the page's origin), at most
     // CAPACITY: how many.
     int (*damage)(Engine*, int* rects, int capacity);
+    // The tab the desktop's media controls asked to show (MPRIS Raise:
+    // the one whose page plays), 0 for none.
+    int (*raised)(Engine*);
 };
 
 // The modifiers as voyager.mlx gives them.
@@ -453,6 +457,11 @@ struct Tab {
     IntPoint lastPressPosition;
     MouseButton pressedButton { MouseButton::None };
     MonotonicTime lastUpdate;
+    // isForcedDark's last answer, for which document and when (the page's
+    // style sheets are walked again at most every 250 ms).
+    const void* darkDesignDocument { nullptr };
+    MonotonicTime darkDesignCheckedAt;
+    bool darkDesign { false };
     // A link pressed with the middle button or Ctrl: opened in a tab
     // behind on the release (the page sees neither).
     URL heldLink;
@@ -467,8 +476,13 @@ struct Engine {
     // The tabs the engine opened itself, for the window: id, and whether
     // shown at once.
     Vector<std::pair<int, bool>> opened;
+    // The tabs the media controls asked to show, for the window.
+    Vector<int> raised;
     IntSize size;
     bool dark { false };
+    // Forced dark allowed (voyager.conf's force-dark): a page without a
+    // dark design of its own painted dark on a dark desktop.
+    bool forceDark { false };
     // VOYAGER_TRACE in the environment: each event on standard error.
     bool trace { false };
     // Composited (each tab's MlxLayerTreeHost); --no-compositing: each
@@ -582,6 +596,7 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
         ReferrerPolicy::EmptyString
     };
     tab->page = Page::create(WTF::move(configuration));
+    MediaSessionMlx::singleton().addPage(*tab->page);
     auto& settings = tab->page->settings();
     settings.setScriptEnabled(true);
     if (engine.compositing) {
@@ -606,6 +621,19 @@ Tab* makeTab(Engine& engine, LocalFrame* opener)
     settings.setLocalStorageEnabled(true);
     settings.setSessionStorageEnabled(true);
     settings.setDownloadAttributeEnabled(true);
+    // The generic families' fonts, as Fontconfig's aliases (what the
+    // port's FontCache gives the generic families anyway, so pages look
+    // the same). WebCore's defaults are empty (WebKit's UI process sets
+    // them): `font-family: -webkit-body` (YouTube's search box) was then a
+    // null family, which a Backspace's typing style handed the CSS value
+    // pool as a key, Voyager dying.
+    settings.setStandardFontFamily("serif"_s);
+    settings.setSerifFontFamily("serif"_s);
+    settings.setSansSerifFontFamily("sans-serif"_s);
+    settings.setFixedFontFamily("monospace"_s);
+    settings.setCursiveFontFamily("cursive"_s);
+    settings.setFantasyFontFamily("fantasy"_s);
+    settings.setPictographFontFamily("serif"_s);
     tab->frame = tab->page->localMainFrame();
     if (!tab->frame || !tab->client)
         return nullptr;
@@ -696,6 +724,7 @@ void engineClose(Engine* engine, int id)
     tab->frame->loader().stopAllLoaders();
     tab->frame->loader().detachFromParent();
     MlxProfile::pageClosed(*tab->page);
+    MediaSessionMlx::singleton().removePage(*tab->page);
     tab->frame = nullptr;
     tab->page = nullptr;
     tab->host = nullptr;
@@ -736,6 +765,15 @@ int engineOpened(Engine* engine, int* foreground)
 int engineLoad(Engine* engine, int id, const char* target)
 {
     return loadInto(tabOf(engine, id), target);
+}
+
+int engineRaised(Engine* engine)
+{
+    if (engine->raised.isEmpty())
+        return 0;
+    int id = engine->raised.first();
+    engine->raised.removeAt(0);
+    return id;
 }
 
 void engineResize(Engine* engine, int width, int height)
@@ -837,15 +875,23 @@ int engineDamage(Engine* engine, int* rects, int capacity)
     return count;
 }
 
-// Whether the tab is painted in forced dark: the desktop dark, its page
-// without a dark design of its own (always: Voyager has no setting for
-// it, it follows the desktop).
+// Whether the tab is painted in forced dark: forced dark allowed
+// (voyager.conf's force-dark), the desktop dark, its page without a dark
+// design of its own.
 bool isForcedDark(Engine* engine, Tab* tab)
 {
-    if (!engine->dark || !tab)
+    if (!engine->dark || !engine->forceDark || !tab)
         return false;
     RefPtr document = tab->frame->document();
-    return document && !mlxPageHasDarkDesign(*document);
+    if (!document)
+        return false;
+    auto now = MonotonicTime::now();
+    if (tab->darkDesignDocument != document.get() || now - tab->darkDesignCheckedAt >= 250_ms) {
+        tab->darkDesignDocument = document.get();
+        tab->darkDesignCheckedAt = now;
+        tab->darkDesign = mlxPageHasDarkDesign(*document);
+    }
+    return !tab->darkDesign;
 }
 
 // --no-compositing: the view painted whole into the window's pixels on
@@ -1093,16 +1139,26 @@ int engineLoading(Engine* engine, int id)
     return tab && tab->frame->loader().isLoading() ? 1 : 0;
 }
 
-// The desktop's scheme: every page's appearance follows it at once (its
-// media queries evaluated again, its styles and the view's background
-// resolved again), no reload.
-void engineSetDark(Engine* engine, int dark)
+// The desktop's scheme (bit 0: dark) and whether forced dark is allowed
+// (bit 1): every page's appearance follows the scheme at once (its media
+// queries evaluated again, its styles and the view's background resolved
+// again), no reload.
+void engineSetDark(Engine* engine, int scheme)
 {
-    if (engine->trace)
-        fprintf(stderr, "voyager: appearance %s\n", dark ? "dark" : "light");
+    bool dark = scheme & 1;
+    bool forceDark = scheme & 2;
+    if (engine->trace) {
+        if (dark != engine->dark)
+            fprintf(stderr, "voyager: appearance %s\n", dark ? "dark" : "light");
+        if (forceDark != engine->forceDark)
+            fprintf(stderr, "voyager: forced dark %s\n", forceDark ? "allowed" : "off");
+    }
+    bool schemeChanged = dark != engine->dark;
     engine->dark = dark;
+    engine->forceDark = forceDark;
     for (auto& tab : engine->tabs.values()) {
-        tab->page->setUseColorAppearance(dark, false);
+        if (schemeChanged)
+            tab->page->setUseColorAppearance(dark, false);
         tab->dirty = true;
     }
 }
@@ -1417,6 +1473,16 @@ int main(int argc, char** argv)
     engine.size = size;
     engine.trace = getenv("VOYAGER_TRACE");
     engine.compositing = compositing;
+    // The media controls' Raise: the window shows the tab that plays.
+    MediaSessionMlx::singleton().setRaiseHandler([](Page& page) {
+        for (auto& tab : engine.tabs.values()) {
+            if (tab->page.get() == &page) {
+                engine.raised.append(tab->id);
+                signalWindow(engine);
+                return;
+            }
+        }
+    });
     // The window wakes for the main thread's work and for each frame: the
     // run loop's wake-up (a task dispatched to it from another thread: the
     // frame clock's rendering update, the network's data) and the
@@ -1483,7 +1549,7 @@ int main(int argc, char** argv)
         engineReload, engineStop, engineLoading, engineSetDark, engineForcedDark,
         engineChooser, engineChoose, engineSetDownloads, engineDownloadCount, engineDownload,
         engineDownloadPath, engineDownloadType, engineDownloadAction,
-        engineDescriptor, engineWake, engineDamage
+        engineDescriptor, engineWake, engineDamage, engineRaised
     };
     // main's arguments, then the environment with MLX_CANVAS=cpu (the
     // window drawn into wl_shm buffers on the CPU, which the engine

@@ -1,0 +1,470 @@
+// The network: Ethernet frames of the device (virtionet.mlx), ARP (a
+// table of the neighbours' addresses, requests when one is missing),
+// IPv4 (one address, netmask and gateway: a packet goes to a neighbour
+// of the subnet or to the gateway; no fragments), ICMP (echo answered;
+// echo requests sent, the replies counted) and the dispatch to UDP and
+// TCP (udp.mlx, tcp.mlx). The configuration is QEMU's user network's by
+// default (10.0.2.15/24, gateway 10.0.2.2, name server 10.0.2.3) or
+// /system/settings/network's (address, netmask, gateway, nameserver).
+const console = @import("../console.mlx")
+const clock = @import("../clock.mlx")
+const virtionet = @import("../virtionet.mlx")
+const Bytes = @import("../bytes.mlx").Bytes
+const udp = @import("./udp.mlx")
+const tcp = @import("./tcp.mlx")
+const sockets = @import("./sockets.mlx")
+const dhcp = @import("./dhcp.mlx")
+
+pub const Ip = [4]u8
+pub const Mac = [6]u8
+
+pub const ETHERNET_HEADER: usize = 14
+pub const IP_HEADER: usize = 20
+pub const TYPE_IPV4: usize = 0x0800
+pub const TYPE_ARP: usize = 0x0806
+pub const PROTOCOL_ICMP: u8 = 1
+pub const PROTOCOL_TCP: u8 = 6
+pub const PROTOCOL_UDP: u8 = 17
+// The most an IP payload may be (the frame's 1514 less the headers).
+pub const MAX_PAYLOAD: usize = 1514 - ETHERNET_HEADER - IP_HEADER
+
+pub const Config = struct {
+    up: bool
+    address: Ip
+    mask: Ip
+    gateway: Ip
+    nameServer: Ip
+}
+
+pub const Neighbour = struct {
+    valid: bool
+    ip: Ip
+    mac: Mac
+    // When it was learnt (nanoseconds since boot).
+    when: usize
+}
+
+const MAX_NEIGHBOURS: usize = 16
+// A neighbour is asked again after this long.
+const NEIGHBOUR_LIFE: usize = 600 * 1000000000
+
+var config: Config = undefined // (per run)
+var neighbours: [MAX_NEIGHBOURS]Neighbour = undefined // (per run)
+// A frame being made (Ethernet, IP, the payload), and a packet to
+// ourselves on its way in.
+var frame: [2048]u8 = undefined // (per run)
+var loopback: [2048]u8 = undefined // (per run)
+// Echo replies that came (the boot's self-test, ping).
+var echoReplies: usize = 0 // (per run)
+var lastEchoFrom: Ip = undefined // (per run)
+
+pub fn configuration() -> *Config { return &config }
+pub fn echoRepliesSeen() -> usize { return echoReplies }
+pub fn lastEchoSource() -> Ip { return lastEchoFrom }
+
+pub fn same(a: Ip, b: Ip) -> bool { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3] }
+
+pub fn ipOf(a: u8, b: u8, c: u8, d: u8) -> Ip { return [4]u8{ a, b, c, d } }
+
+// The network up with QEMU's user network's addresses (the settings
+// file may change them: settings).
+pub fn init() -> void {
+    config.up = virtionet.device().*.present
+    config.address = ipOf(10, 0, 2, 15)
+    config.mask = ipOf(255, 255, 255, 0)
+    config.gateway = ipOf(10, 0, 2, 2)
+    config.nameServer = ipOf(10, 0, 2, 3)
+    var k: usize = 0
+    while k < MAX_NEIGHBOURS {
+        neighbours[k].valid = false
+        k += 1
+    }
+    echoReplies = 0
+    sockets.sockets().init()
+    udp.init()
+    tcp.init()
+    if config.up { arpRequest(config.gateway) }
+}
+
+// The settings' text (address, netmask, gateway, nameserver lines) taken
+// over: whether it gave an address.
+pub fn settings(text: []const u8) -> bool {
+    var given = false
+    var at: usize = 0
+    while at < text.length {
+        var end = at
+        while end < text.length && text[end] != 10 { end += 1 }
+        const line = text[at..end]
+        var space: usize = 0
+        while space < line.length && line[space] != 32 { space += 1 }
+        if space < line.length {
+            const key = line[0..space]
+            var value: Ip = undefined
+            if parseIp(line[space + 1..line.length], &value) {
+                if sameText(key, "address") {
+                    config.address = value
+                    given = true
+                }
+                if sameText(key, "netmask") { config.mask = value }
+                if sameText(key, "gateway") { config.gateway = value }
+                if sameText(key, "nameserver") { config.nameServer = value }
+            }
+        }
+        at = end + 1
+    }
+    return given
+}
+
+fn sameText(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var k: usize = 0
+    while k < a.length {
+        if a[k] != b[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// "a.b.c.d" (blanks around it ignored).
+pub fn parseIp(text: []const u8, into: *Ip) -> bool {
+    var part: usize = 0
+    var value: usize = 0
+    var digits: usize = 0
+    var k: usize = 0
+    while k < text.length {
+        const c = text[k]
+        if c >= 48 && c <= 57 {
+            value = value * 10 + @intCast(usize, c - 48)
+            digits += 1
+            if value > 255 { return false }
+        } else if c == 46 {
+            if digits == 0 || part == 3 { return false }
+            into.*[part] = @intCast(u8, value)
+            part += 1
+            value = 0
+            digits = 0
+        } else if c != 32 && c != 9 && c != 13 {
+            return false
+        }
+        k += 1
+    }
+    if part != 3 || digits == 0 { return false }
+    into.*[3] = @intCast(u8, value)
+    return true
+}
+
+pub fn writeIp(ip: Ip, out: console.Console) -> void {
+    out.decimal(@intCast(usize, ip[0]))
+    out.write(".")
+    out.decimal(@intCast(usize, ip[1]))
+    out.write(".")
+    out.decimal(@intCast(usize, ip[2]))
+    out.write(".")
+    out.decimal(@intCast(usize, ip[3]))
+}
+
+pub fn writeMac(mac: Mac, out: console.Console) -> void {
+    var k: usize = 0
+    while k < 6 {
+        if k > 0 { out.write(":") }
+        out.hexByte(@intCast(usize, mac[k]))
+        k += 1
+    }
+}
+
+// ---- byte order ----
+
+pub fn be16(bytes: [*]const u8, at: usize) -> usize { return (@intCast(usize, bytes[at]) << 8) | @intCast(usize, bytes[at + 1]) }
+pub fn be32(bytes: [*]const u8, at: usize) -> usize { return (be16(bytes, at) << 16) | be16(bytes, at + 2) }
+pub fn putBe16(bytes: [*]u8, at: usize, value: usize) -> void {
+    bytes[at] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 1] = @intCast(u8, value & 255)
+}
+pub fn putBe32(bytes: [*]u8, at: usize, value: usize) -> void {
+    putBe16(bytes, at, (value >> 16) & 0xFFFF)
+    putBe16(bytes, at + 2, value & 0xFFFF)
+}
+pub fn putIp(bytes: [*]u8, at: usize, ip: Ip) -> void {
+    bytes[at] = ip[0]
+    bytes[at + 1] = ip[1]
+    bytes[at + 2] = ip[2]
+    bytes[at + 3] = ip[3]
+}
+pub fn getIp(bytes: [*]const u8, at: usize) -> Ip { return [4]u8{ bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3] } }
+
+// The Internet checksum of `length` bytes, folded, starting from
+// `initial` (a pseudo-header's sum, for TCP and UDP).
+pub fn checksum(bytes: [*]const u8, length: usize, initial: usize) -> usize {
+    var sum = initial
+    var k: usize = 0
+    while k + 1 < length {
+        sum += be16(bytes, k)
+        k += 2
+    }
+    if k < length { sum += @intCast(usize, bytes[k]) << 8 }
+    while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16) }
+    return (~sum) & 0xFFFF
+}
+
+// The pseudo-header's sum for TCP or UDP (added as the checksum's
+// `initial`, not folded).
+pub fn pseudoSum(source: Ip, destination: Ip, protocol: u8, length: usize) -> usize {
+    return be16(&source, 0) + be16(&source, 2) + be16(&destination, 0) + be16(&destination, 2) + @intCast(usize, protocol) + length
+}
+
+// ---- Ethernet ----
+
+fn sendFrame(destination: Mac, kind: usize, length: usize) -> bool {
+    const f: [*]u8 = &frame
+    var k: usize = 0
+    while k < 6 {
+        f[k] = destination[k]
+        f[6 + k] = virtionet.device().*.mac[k]
+        k += 1
+    }
+    putBe16(f, 12, kind)
+    var total = ETHERNET_HEADER + length
+    if total < 60 {
+        Bytes.fill(Bytes.pointer(@intFromPtr(f) + total), 60 - total, 0)
+        total = 60
+    }
+    return virtionet.device().transmit(f, total)
+}
+
+// A frame from the device.
+pub fn receive(bytes: [*]const u8, length: usize) -> void {
+    if length < ETHERNET_HEADER { return }
+    const kind = be16(bytes, 12)
+    const payload = Bytes.pointer(@intFromPtr(bytes) + ETHERNET_HEADER)
+    if kind == TYPE_ARP { arpReceive(payload, length - ETHERNET_HEADER) }
+    if kind == TYPE_IPV4 { ipReceive(payload, length - ETHERNET_HEADER) }
+}
+
+// ---- ARP ----
+
+const BROADCAST: Mac = [6]u8{ 255, 255, 255, 255, 255, 255 }
+
+fn learn(ip: Ip, mac: Mac) -> void {
+    var free: usize = MAX_NEIGHBOURS
+    var oldest: usize = 0
+    var k: usize = 0
+    while k < MAX_NEIGHBOURS {
+        if neighbours[k].valid && same(neighbours[k].ip, ip) {
+            neighbours[k].mac = mac
+            neighbours[k].when = clock.system().monotonic()
+            return
+        }
+        if !neighbours[k].valid && free == MAX_NEIGHBOURS { free = k }
+        if neighbours[k].when < neighbours[oldest].when { oldest = k }
+        k += 1
+    }
+    const slot = if free < MAX_NEIGHBOURS { free } else { oldest }
+    neighbours[slot].valid = true
+    neighbours[slot].ip = ip
+    neighbours[slot].mac = mac
+    neighbours[slot].when = clock.system().monotonic()
+}
+
+// The neighbour's address: (whether it is known, its slot). Unknown:
+// asked for (the packet is dropped; the sender tries again).
+fn neighbour(ip: Ip) -> (bool, usize) {
+    var k: usize = 0
+    while k < MAX_NEIGHBOURS {
+        if neighbours[k].valid && same(neighbours[k].ip, ip) {
+            if clock.system().monotonic() - neighbours[k].when > NEIGHBOUR_LIFE { arpRequest(ip) }
+            return -> (true, k)
+        }
+        k += 1
+    }
+    arpRequest(ip)
+    return -> (false, 0)
+}
+
+fn arpRequest(ip: Ip) -> void {
+    const f: [*]u8 = Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER)
+    putBe16(f, 0, 1) // Ethernet
+    putBe16(f, 2, TYPE_IPV4)
+    f[4] = 6
+    f[5] = 4
+    putBe16(f, 6, 1) // request
+    var k: usize = 0
+    while k < 6 {
+        f[8 + k] = virtionet.device().*.mac[k]
+        f[18 + k] = 0
+        k += 1
+    }
+    putIp(f, 14, config.address)
+    putIp(f, 24, ip)
+    _ = sendFrame(BROADCAST, TYPE_ARP, 28)
+}
+
+fn arpReceive(bytes: [*]const u8, length: usize) -> void {
+    if length < 28 || be16(bytes, 2) != TYPE_IPV4 || bytes[4] != 6 || bytes[5] != 4 { return }
+    const operation = be16(bytes, 6)
+    var senderMac: Mac = undefined
+    var k: usize = 0
+    while k < 6 {
+        senderMac[k] = bytes[8 + k]
+        k += 1
+    }
+    const senderIp = getIp(bytes, 14)
+    const targetIp = getIp(bytes, 24)
+    learn(senderIp, senderMac)
+    if operation == 1 && same(targetIp, config.address) {
+        // A request for our address: the reply.
+        const f: [*]u8 = Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER)
+        putBe16(f, 0, 1)
+        putBe16(f, 2, TYPE_IPV4)
+        f[4] = 6
+        f[5] = 4
+        putBe16(f, 6, 2)
+        k = 0
+        while k < 6 {
+            f[8 + k] = virtionet.device().*.mac[k]
+            f[18 + k] = senderMac[k]
+            k += 1
+        }
+        putIp(f, 14, config.address)
+        putIp(f, 24, senderIp)
+        _ = sendFrame(senderMac, TYPE_ARP, 28)
+    }
+}
+
+// ---- IPv4 ----
+
+var identification: usize = 0 // (per run)
+
+// Whether `ip` is on our subnet.
+fn local(ip: Ip) -> bool {
+    var k: usize = 0
+    while k < 4 {
+        if (ip[k] & config.mask[k]) != (config.address[k] & config.mask[k]) { return false }
+        k += 1
+    }
+    return true
+}
+
+// Room for a packet's payload in the frame being made (after the IP
+// header): the caller fills it, then `send`s.
+pub fn payloadArea() -> [*]u8 { return Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER + IP_HEADER) }
+
+// The payload (`length` bytes at payloadArea) sent to `destination` as
+// `protocol`; false when it is too long, the neighbour is unknown yet,
+// or the device is busy.
+pub fn send(protocol: u8, destination: Ip, length: usize) -> bool { return sendFrom(config.address, protocol, destination, length) }
+
+// The same from `source` (0.0.0.0 while DHCP runs).
+pub fn sendFrom(source: Ip, protocol: u8, destination: Ip, length: usize) -> bool {
+    if !config.up || length > MAX_PAYLOAD { return false }
+    const hop = if local(destination) || same(destination, ipOf(255, 255, 255, 255)) { destination } else { config.gateway }
+    var mac: Mac = BROADCAST
+    if !same(hop, ipOf(255, 255, 255, 255)) && !same(destination, config.address) {
+        const found = neighbour(hop)
+        if !found.0 { return false }
+        mac = neighbours[found.1].mac
+    }
+    const h: [*]u8 = Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER)
+    h[0] = 0x45
+    h[1] = 0
+    putBe16(h, 2, IP_HEADER + length)
+    putBe16(h, 4, identification & 0xFFFF)
+    identification += 1
+    putBe16(h, 6, 0x4000) // don't fragment
+    h[8] = 64
+    h[9] = protocol
+    putBe16(h, 10, 0)
+    putIp(h, 12, source)
+    putIp(h, 16, destination)
+    putBe16(h, 10, checksum(h, IP_HEADER, 0))
+    if same(destination, config.address) {
+        // To ourselves: taken in at once (from a copy: the receiver's
+        // answers use the frame).
+        Bytes.copy(&loopback, h, IP_HEADER + length)
+        ipReceive(&loopback, IP_HEADER + length)
+        return true
+    }
+    return sendFrame(mac, TYPE_IPV4, IP_HEADER + length)
+}
+
+fn ipReceive(bytes: [*]const u8, length: usize) -> void {
+    if length < IP_HEADER || bytes[0] >> 4 != 4 { return }
+    const headerLength = @intCast(usize, bytes[0] & 15) * 4
+    const total = be16(bytes, 2)
+    if headerLength < IP_HEADER || total < headerLength || total > length { return }
+    if checksum(bytes, headerLength, 0) != 0 { return }
+    // A fragment: not taken.
+    if be16(bytes, 6) & 0x3FFF != 0 { return }
+    const destination = getIp(bytes, 16)
+    if !same(destination, config.address) && !same(destination, ipOf(255, 255, 255, 255)) { return }
+    const source = getIp(bytes, 12)
+    const protocol = bytes[9]
+    const payload = Bytes.pointer(@intFromPtr(bytes) + headerLength)
+    const payloadLength = total - headerLength
+    if protocol == PROTOCOL_ICMP { icmpReceive(source, payload, payloadLength) }
+    if protocol == PROTOCOL_UDP { udp.receive(source, destination, payload, payloadLength) }
+    if protocol == PROTOCOL_TCP { tcp.receive(source, destination, payload, payloadLength) }
+}
+
+// ---- ICMP ----
+
+fn icmpReceive(source: Ip, bytes: [*]const u8, length: usize) -> void {
+    if length < 8 || checksum(bytes, length, 0) != 0 { return }
+    if bytes[0] == 8 && bytes[1] == 0 {
+        // An echo request: the reply, the data as it came.
+        const reply = payloadArea()
+        Bytes.copy(reply, bytes, length)
+        reply[0] = 0
+        putBe16(reply, 2, 0)
+        putBe16(reply, 2, checksum(reply, length, 0))
+        _ = send(PROTOCOL_ICMP, source, length)
+    }
+    if bytes[0] == 0 && bytes[1] == 0 {
+        echoReplies += 1
+        lastEchoFrom = source
+        // A ping socket's (its identifier).
+        sockets.Sockets.deliverDatagram(be16(bytes, 4), source, 0, bytes, length)
+    }
+}
+
+// An echo request a ping socket sends (`message`: the ICMP message as
+// the program made it; the identifier becomes the socket's port, the
+// checksum is made here).
+pub fn sendEcho(identifier: usize, destination: Ip, message: [*]const u8, length: usize) -> bool {
+    if length < 8 || length > MAX_PAYLOAD { return false }
+    const request = payloadArea()
+    Bytes.copy(request, message, length)
+    request[0] = 8
+    request[1] = 0
+    putBe16(request, 2, 0)
+    putBe16(request, 4, identifier)
+    putBe16(request, 2, checksum(request, length, 0))
+    return send(PROTOCOL_ICMP, destination, length)
+}
+
+// The timers (every tick of the first processor's timer).
+pub fn tick() -> void {
+    tcp.tick()
+    dhcp.tick()
+}
+
+// An echo request (`identifier`, `sequence`, 32 bytes of data) to
+// `destination`; false when it could not go.
+pub fn ping(destination: Ip, identifier: usize, sequence: usize) -> bool {
+    const request = payloadArea()
+    request[0] = 8
+    request[1] = 0
+    putBe16(request, 2, 0)
+    putBe16(request, 4, identifier)
+    putBe16(request, 6, sequence)
+    var k: usize = 0
+    while k < 32 {
+        request[8 + k] = @intCast(u8, 48 + k % 10)
+        k += 1
+    }
+    putBe16(request, 2, checksum(request, 40, 0))
+    return send(PROTOCOL_ICMP, destination, 40)
+}
+
+// The device's frames taken in now (where the stack waits for an
+// answer without the interrupt: the boot's self-test).
+pub fn poll() -> void { virtionet.device().receive() }

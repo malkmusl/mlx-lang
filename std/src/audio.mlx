@@ -25,6 +25,7 @@ const std = @import("std")
 const allocator_module = @import("../bootstrap/allocator.mlx")
 const linux = @import("../bootstrap/os/linux.mlx")
 const dbus = @import("./dbus.mlx")
+const ipc = @import("./ipc.mlx")
 
 pub const Allocator = allocator_module.Allocator
 
@@ -233,8 +234,67 @@ fn askChannel(client: *dbus.Client, reply: *dbus.Header) -> bool {
     return serial != 0 && dbus.waitReply(client, serial, reply, 10000)
 }
 
+fn nativeErrorIs(reply: *const ipc.Message, name: []const u8) -> bool {
+    if reply.*.kind != ipc.ERROR || reply.*.errorName.length != name.length { return false }
+    var index: usize = 0
+    while index < name.length {
+        if reply.*.errorName[index] != name[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// org.mlx.IPC.Connect(org.mlx.Audio) in MLXIPC's own format: the reply.
+fn askChannelNative(client: *ipc.Client, reply: *ipc.Message) -> bool {
+    var body: [64]u8 = undefined
+    const bytes: [*]u8 = &body
+    var writing: ipc.Writer = undefined
+    ipc.begin(&writing, bytes, 64)
+    ipc.putString(&writing, BUS_NAME)
+    const serial = ipc.call(client, "org.freedesktop.DBus", "/org/mlx/IPC", "org.mlx.IPC", "Connect", "s", bytes, writing.length)
+    return serial != 0 && ipc.waitReply(client, serial, reply, 10000)
+}
+
+// The channel to MLX Audio through the bus in MLXIPC's own format
+// (std.ipc: one round trip to connect, no SASL): OK with the channel's
+// descriptor, NO_BUS when the bus does not speak it (dbus-daemon, say:
+// the D-Bus format is tried then), NO_SERVER or NOT_ALLOWED.
+fn connectNative(allocator: Allocator, environment: [*][*]const u8, descriptor: *isize) -> u32 {
+    const memory = allocator.alloc(@sizeOf(ipc.Client), 16)
+    if memory == null { return NO_BUS }
+    const client: *ipc.Client = unsafe { @ptrCast(*ipc.Client, memory.?) }
+    if !ipc.connectSession(client, allocator, environment) {
+        allocator.free(memory.?, @sizeOf(ipc.Client), 16)
+        return NO_BUS
+    }
+    var reply: ipc.Message = undefined
+    var result = OK
+    if !askChannelNative(client, &reply) {
+        result = NO_SERVER
+    } else if nativeErrorIs(&reply, "org.freedesktop.DBus.Error.NameHasNoOwner") {
+        var body: [64]u8 = undefined
+        const bytes: [*]u8 = &body
+        var writing: ipc.Writer = undefined
+        ipc.begin(&writing, bytes, 64)
+        ipc.putString(&writing, BUS_NAME)
+        ipc.putU32(&writing, 0)
+        const serial = ipc.call(client, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "StartServiceByName", "su", bytes, writing.length)
+        if serial == 0 || !ipc.waitReply(client, serial, &reply, 30000) || reply.kind == ipc.ERROR || !askChannelNative(client, &reply) { result = NO_SERVER }
+    }
+    if result == OK && reply.kind == ipc.ERROR { result = if nativeErrorIs(&reply, "org.freedesktop.DBus.Error.AccessDenied") { NOT_ALLOWED } else { NO_SERVER } }
+    if result == OK {
+        descriptor.* = ipc.descriptorOf(client, 0)
+        if descriptor.* < 0 { result = NO_SERVER }
+    }
+    ipc.disconnect(client, allocator)
+    allocator.free(memory.?, @sizeOf(ipc.Client), 16)
+    return result
+}
+
 // Connects to MLX Audio through the session bus (starting it when a
-// service file provides it): OK, NO_BUS, NO_SERVER or NOT_ALLOWED.
+// service file provides it): OK, NO_BUS, NO_SERVER or NOT_ALLOWED. The
+// bus is asked in MLXIPC's own format first, in D-Bus's when it does
+// not answer that; the channel is the same either way.
 pub fn connect(audio: *Audio, allocator: Allocator, environment: [*][*]const u8) -> u32 {
     audio.*.connected = false
     audio.*.nextId = 1
@@ -244,10 +304,22 @@ pub fn connect(audio: *Audio, allocator: Allocator, environment: [*][*]const u8)
         streamAt(audio, index).*.used = false
         index += 1
     }
+    var descriptor: isize = -1
+    var result = connectNative(allocator, environment, &descriptor)
+    if result == NO_BUS { result = connectDBus(allocator, environment, &descriptor) }
+    if result != OK { return result }
+    return openChannel(audio, allocator, descriptor)
+}
+
+// The channel through the bus in the D-Bus format.
+fn connectDBus(allocator: Allocator, environment: [*][*]const u8, descriptor: *isize) -> u32 {
     const memory = allocator.alloc(@sizeOf(dbus.Client), 16)
     if memory == null { return NO_BUS }
     const client: *dbus.Client = unsafe { @ptrCast(*dbus.Client, memory.?) }
-    if !dbus.connectSession(client, allocator, environment) { return NO_BUS }
+    if !dbus.connectSession(client, allocator, environment) {
+        allocator.free(memory.?, @sizeOf(dbus.Client), 16)
+        return NO_BUS
+    }
     var reply: dbus.Header = undefined
     var result = OK
     if !askChannel(client, &reply) {
@@ -264,15 +336,18 @@ pub fn connect(audio: *Audio, allocator: Allocator, environment: [*][*]const u8)
         if serial == 0 || !dbus.waitReply(client, serial, &reply, 30000) || reply.kind == dbus.ERROR || !askChannel(client, &reply) { result = NO_SERVER }
     }
     if result == OK && reply.kind == dbus.ERROR { result = if errorIs(client, &reply, "org.freedesktop.DBus.Error.AccessDenied") { NOT_ALLOWED } else { NO_SERVER } }
-    var descriptor: isize = -1
     if result == OK {
-        descriptor = dbus.descriptorOf(client, 0)
-        if descriptor < 0 { result = NO_SERVER }
+        descriptor.* = dbus.descriptorOf(client, 0)
+        if descriptor.* < 0 { result = NO_SERVER }
     }
     // The bus is not needed any more: the channel is.
     dbus.disconnect(client, allocator)
     allocator.free(memory.?, @sizeOf(dbus.Client), 16)
-    if result != OK { return result }
+    return result
+}
+
+// The connection over the channel `descriptor`.
+fn openChannel(audio: *Audio, allocator: Allocator, descriptor: isize) -> u32 {
     if !dbus.open(channelOf(audio), allocator, descriptor) {
         std.linux.close(descriptor)
         return NO_SERVER

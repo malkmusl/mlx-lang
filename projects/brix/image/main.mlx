@@ -1,0 +1,330 @@
+// brix-image KERNEL OUT [NAME=FILE | DIRECTORY/ ...]: brixOS's boot image, for a
+// Multiboot loader (QEMU's -kernel, GRUB's multiboot), or, OUT ending in
+// .efi, an EFI application holding it (efi.mlx): the boot blob (a
+// Multiboot header with load addresses, the 32-bit code that turns on
+// long mode, the GDT, TSS and IDT, the trap stubs and the SYSCALL entry),
+// the kernel (an ELF of mlx4's --target=x86_64-freestanding, whose code
+// is position-independent) and an initial file archive of the files
+// named. The boot code is AT&T assembly assembled by mlx-cc's assembler
+// (assemble.mlx, compiler/cc/asm.mlx).
+//
+// Physical memory, and the image laid out the same from 1 MiB on:
+//
+//   0x00100000  the blob: header, boot info, GDT, TSS, IDT, code
+//   0x00108000  page tables (PML4, PDPT, PD: 1 GiB in 2 MiB pages)
+//   0x00120000  the boot stack (to 0x00140000), then the trap and
+//               system call stack (to 0x00180000)
+//   0x00200000  the kernel's segments, as linked (from 0x400000)
+//   after it    the archive (page aligned), up to the kernel's arena
+//   0x04000000  the kernel's arena (32 MiB), then the frames it hands out
+//
+// The kernel runs in the higher half: virtual 0xFFFF800000000000 + the
+// physical address (all of the first GiB), so that user programs keep the
+// lower half (mlx4's programs load at 0x400000).
+const std = @import("std")
+const layout = @import("../layout.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const assemble = @import("./assemble.mlx")
+const efi = @import("./efi.mlx")
+const ap = @import("./ap.mlx")
+const blob = @import("./blob.mlx")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stderr(), text) }
+
+fn fail(text: []const u8) -> u8 {
+    say("brix-image: ")
+    say(text)
+    say("\n")
+    return 1
+}
+
+fn u16At(bytes: [*]const u8, at: usize) -> usize { return @intCast(usize, bytes[at]) | (@intCast(usize, bytes[at + 1]) << 8) }
+fn u32At(bytes: [*]const u8, at: usize) -> usize { return u16At(bytes, at) | (u16At(bytes, at + 2) << 16) }
+fn u64At(bytes: [*]const u8, at: usize) -> usize { return u32At(bytes, at) | (u32At(bytes, at + 4) << 32) }
+
+// The address of the kernel's symbol `name` (exactly, or as the suffix
+// ":name" of mlx4's "file:line:name" symbols); 0 when there is none.
+fn symbol(elf: [*]const u8, length: usize, name: []const u8) -> usize {
+    const sections = u64At(elf, 40)
+    const count = u16At(elf, 60)
+    var k: usize = 0
+    while k < count {
+        const header = sections + k * 64
+        if header + 64 > length { return 0 }
+        if u32At(elf, header + 4) == 2 {
+            const table = u64At(elf, header + 24)
+            const size = u64At(elf, header + 32)
+            const strings = sections + u32At(elf, header + 40) * 64
+            const names = u64At(elf, strings + 24)
+            var entry: usize = 0
+            while entry + 24 <= size {
+                const at = table + entry
+                const nameAt = names + u32At(elf, at)
+                var end = nameAt
+                while end < length && elf[end] != 0 { end += 1 }
+                const nameLength = end - nameAt
+                var matches = nameLength >= name.length
+                if matches {
+                    const from = nameAt + nameLength - name.length
+                    var i: usize = 0
+                    while i < name.length {
+                        if elf[from + i] != name[i] { matches = false }
+                        i += 1
+                    }
+                    if matches && nameLength > name.length && elf[from - 1] != 58 { matches = false }
+                }
+                if matches { return u64At(elf, at + 8) }
+                entry += 24
+            }
+        }
+        k += 1
+    }
+    return 0
+}
+
+// The archive's layout: the magic and the count, then a record per file
+// (its name, NUL padded, then its offset and size).
+const Archive = struct {
+    pub const RECORDS: usize = 16
+    pub const RECORD: usize = 64
+    pub const NAME_CAPACITY: usize = 48
+    pub const MAX_FILES: usize = 256
+}
+
+// Whether `left` sorts after `right` (bytewise).
+fn after(left: []const u8, right: []const u8) -> bool {
+    var k: usize = 0
+    while k < left.length && k < right.length {
+        if left[k] != right[k] { return left[k] > right[k] }
+        k += 1
+    }
+    return left.length > right.length
+}
+
+// The files for the archive, sorted by name.
+const Files = struct {
+    names: [Archive.MAX_FILES][]const u8
+    contents: [Archive.MAX_FILES][*]const u8
+    lengths: [Archive.MAX_FILES]usize
+    count: usize
+
+    // The file at `path` (NUL-terminated) as `name`.
+    pub fn add(self: *Self, allocator: std.heap.Allocator, name: []const u8, path: [*]const u8) -> bool {
+        if self.*.count == Archive.MAX_FILES || name.length >= Archive.NAME_CAPACITY { return false }
+        const data = std.fs.readFileAlloc(path, allocator)
+        if data == null { return false }
+        // In order of name.
+        var at = self.*.count
+        while at > 0 && after(self.*.names[at - 1], name) {
+            self.*.names[at] = self.*.names[at - 1]
+            self.*.contents[at] = self.*.contents[at - 1]
+            self.*.lengths[at] = self.*.lengths[at - 1]
+            at -= 1
+        }
+        self.*.names[at] = name
+        self.*.contents[at] = unsafe { @ptrCast([*]const u8, data.?.items) }
+        self.*.lengths[at] = data.?.length
+        self.*.count += 1
+        return true
+    }
+
+    // Every regular file of the directory `path` (ending in "/") under
+    // its own name.
+    pub fn addDirectory(self: *Self, allocator: std.heap.Allocator, path: []const u8) -> bool {
+        const directory_path = std.text.zeroTerminated(allocator.alloc(path.length + 1, 1).?, path.length + 1, path)
+        const directory = std.fs.open(directory_path, 65536, 0)
+        if !std.fs.isValid(directory) { return false }
+        const buffer = allocator.alloc(65536, 8).?
+        var reader = std.fs.entries(directory, buffer, 65536)
+        var entry: std.fs.Entry = undefined
+        while std.fs.nextEntry(&reader, &entry) {
+            if entry.kind != std.fs.ENTRY_FILE { continue }
+            const name = std.string.asSlice(entry.name)
+            const copy = allocator.alloc(name.length + 1, 1).?
+            var k: usize = 0
+            while k < name.length {
+                copy[k] = name[k]
+                k += 1
+            }
+            const full = allocator.alloc(path.length + name.length + 1, 1).?
+            var length = std.text.append(full, 0, path.length + name.length + 1, path)
+            length = std.text.append(full, length, path.length + name.length + 1, name)
+            full[length] = 0
+            if !self.add(allocator, copy[0..name.length], full) {
+                _ = std.fs.close(directory)
+                return false
+            }
+        }
+        _ = std.fs.close(directory)
+        return !reader.failed
+    }
+}
+
+// ".efi" in either case (EFI/BOOT/BOOTX64.EFI).
+fn isEfi(suffix: []const u8) -> bool {
+    const lower = ".efi"
+    var k: usize = 0
+    while k < 4 {
+        const c = if suffix[k] >= 65 && suffix[k] <= 90 { suffix[k] + 32 } else { suffix[k] }
+        if c != lower[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    const allocator = std.heap.allocator()
+    const count = std.process.count(arguments)
+    if count < 3 { return fail("usage: brix-image KERNEL OUT [NAME=FILE | DIRECTORY/ ...]") }
+    if !assemble.init() { return fail("no memory for the assembler") }
+    const loaded = std.fs.readFileAlloc(std.process.argument(arguments, 1).pointer, allocator)
+    if loaded == null { return fail("cannot read the kernel") }
+    const elf: [*]const u8 = unsafe { @ptrCast([*]const u8, loaded.?.items) }
+    const elfLength = loaded.?.length
+    if elfLength < 64 || elf[0] != 127 || elf[1] != 69 || elf[4] != 2 || u16At(elf, 18) != 62 { return fail("the kernel is not an x86_64 ELF") }
+
+    // The kernel's memory image: its PT_LOAD segments from 0x400000 on.
+    const phoff = u64At(elf, 32)
+    const phnum = u16At(elf, 56)
+    var kernelSize: usize = 0
+    var k: usize = 0
+    while k < phnum {
+        const at = phoff + k * 56
+        if u32At(elf, at) == 1 {
+            const end = u64At(elf, at + 16) + u64At(elf, at + 40)
+            if u64At(elf, at + 16) < layout.Memory.LINK_BASE { return fail("a kernel segment below 0x400000") }
+            if end - layout.Memory.LINK_BASE > kernelSize { kernelSize = end - layout.Memory.LINK_BASE }
+        }
+        k += 1
+    }
+    kernelSize = (kernelSize + 4095) & ~@intCast(usize, 4095)
+    if kernelSize == 0 || layout.Memory.KERNEL + kernelSize > layout.Memory.ARENA { return fail("the kernel does not fit below its arena") }
+    const entry = u64At(elf, 24)
+    const trap = symbol(elf, elfLength, "brix_trap")
+    if trap == 0 { return fail("the kernel has no brix_trap") }
+    const apEntry = symbol(elf, elfLength, "brix_ap")
+    if apEntry == 0 { return fail("the kernel has no brix_ap") }
+
+    // The archive's files.
+    var list: Files = undefined
+    list.count = 0
+    var a: usize = 3
+    while a < count {
+        const spec = std.process.argument(arguments, a)
+        const text = spec.pointer[0..spec.length]
+        if text.length > 1 && text[text.length - 1] == 47 {
+            if !list.addDirectory(allocator, text) { return fail("cannot read a directory for the archive (or a name is too long, or there are too many files)") }
+        } else {
+            var eq: usize = 0
+            while eq < text.length && text[eq] != 61 { eq += 1 }
+            if eq == 0 || eq >= text.length { return fail("a file is NAME=PATH or DIRECTORY/") }
+            if !list.add(allocator, text[0..eq], &spec.pointer[eq + 1]) { return fail("cannot read a file for the archive (or its name is too long, or there are too many)") }
+        }
+        a += 1
+    }
+    const files = list.count
+    const headerSize = (Archive.RECORDS + files * Archive.RECORD + 4095) & ~@intCast(usize, 4095)
+    var archiveSize = headerSize
+    var f: usize = 0
+    while f < files {
+        archiveSize += (list.lengths[f] + 4095) & ~@intCast(usize, 4095)
+        f += 1
+    }
+
+    const archivePhys = layout.Memory.KERNEL + kernelSize
+    if archivePhys + archiveSize > layout.Memory.ARENA { return fail("the archive does not fit below the kernel's arena") }
+    const total = archivePhys + archiveSize - layout.Memory.BLOB
+    const image = allocator.alloc(total, 16).?
+    var z: usize = 0
+    while z < total {
+        image[z] = 0
+        z += 1
+    }
+
+    // The kernel's segments.
+    k = 0
+    while k < phnum {
+        const at = phoff + k * 56
+        if u32At(elf, at) == 1 {
+            const offset = u64At(elf, at + 8)
+            const vaddr = u64At(elf, at + 16)
+            const fileSize = u64At(elf, at + 32)
+            const target = layout.Memory.KERNEL - layout.Memory.BLOB + vaddr - layout.Memory.LINK_BASE
+            var b: usize = 0
+            while b < fileSize {
+                image[target + b] = elf[offset + b]
+                b += 1
+            }
+        }
+        k += 1
+    }
+
+    // The archive: "BRIXFS01", the count, then per file its name (48
+    // bytes), offset (from the archive's start) and size; the files page
+    // aligned after the first page.
+    const archive = archivePhys - layout.Memory.BLOB
+    const magic = "BRIXFS01"
+    var m: usize = 0
+    while m < 8 {
+        image[archive + m] = magic[m]
+        m += 1
+    }
+    Bytes.put64(image, archive + 8, files)
+    var dataAt = headerSize
+    f = 0
+    while f < files {
+        const record = archive + Archive.RECORDS + f * Archive.RECORD
+        const name = list.names[f]
+        var c: usize = 0
+        while c < name.length {
+            image[record + c] = name[c]
+            c += 1
+        }
+        Bytes.put64(image, record + Archive.NAME_CAPACITY, dataAt)
+        Bytes.put64(image, record + Archive.NAME_CAPACITY + 8, list.lengths[f])
+        const source = list.contents[f]
+        c = 0
+        while c < list.lengths[f] {
+            image[archive + dataAt + c] = source[c]
+            c += 1
+        }
+        dataAt += (list.lengths[f] + 4095) & ~@intCast(usize, 4095)
+        f += 1
+    }
+
+    // The blob.
+    const virtualEntry = layout.Memory.KERNEL_VIRTUAL + layout.Memory.KERNEL + entry - layout.Memory.LINK_BASE
+    const virtualTrap = layout.Memory.KERNEL_VIRTUAL + layout.Memory.KERNEL + trap - layout.Memory.LINK_BASE
+    const virtualAp = layout.Memory.KERNEL_VIRTUAL + layout.Memory.KERNEL + apEntry - layout.Memory.LINK_BASE
+    if !blob.build(image, virtualEntry, virtualTrap, virtualAp, kernelSize, archivePhys, archiveSize) {
+        say("brix-image: the blob's code: ")
+        say(assemble.problem())
+        say("\n")
+        return 1
+    }
+    if !ap.build(image) {
+        say("brix-image: the other processors' trampoline: ")
+        say(assemble.problem())
+        say("\n")
+        return 1
+    }
+
+    // OUT.efi: the image inside an EFI application that loads it as a
+    // Multiboot loader would (efi.mlx).
+    const output = std.process.argument(arguments, 2)
+    const outputName = std.string.asSlice(output)
+    if outputName.length > 4 && isEfi(outputName[outputName.length - 4..outputName.length]) {
+        var fileSize: usize = 0
+        const application = efi.build(image, total, &fileSize)
+        if application == null {
+            say("brix-image: the EFI loader: ")
+            say(assemble.problem())
+            say("\n")
+            return 1
+        }
+        if !std.fs.writeFile(output.pointer, application.?, fileSize, 420) { return fail("cannot write the EFI application") }
+        return 0
+    }
+    if !std.fs.writeFile(output.pointer, image, total, 420) { return fail("cannot write the image") }
+    return 0
+}

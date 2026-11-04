@@ -1,0 +1,798 @@
+// The system calls on paths and files: Linux's numbers, the path relative
+// to the working directory or to a descriptor's directory (AT_FDCWD for
+// the working one), the file system of vfs.mlx. Linux programs' paths of
+// Unix's layout are mapped onto brixOS's (`Compat`); /proc/self/exe names
+// the program the process runs (a shell runs scripts by it).
+const process = @import("../process.mlx")
+const files = @import("../files.mlx")
+const vfs = @import("../vfs.mlx")
+const memory = @import("../memory.mlx")
+const clock = @import("../clock.mlx")
+const volume = @import("../volume.mlx")
+const block = @import("../block.mlx")
+const ext2 = @import("../ext2.mlx")
+const BrixfsFormat = @import("../../brixfs.mlx").Brixfs
+const Bytes = @import("../bytes.mlx").Bytes
+const Errno = @import("./errno.mlx").Errno
+const Status = @import("../status.mlx").Status
+const names = @import("../names.mlx")
+const Process = process.Process
+const Vfs = vfs.Vfs
+const NodeKind = vfs.NodeKind
+const Open = files.Open
+
+// Linux x86-64's numbers of the calls this module answers.
+pub const FileNumber = struct {
+    pub const OPEN: usize = 2
+    pub const STAT: usize = 4
+    pub const FSTAT: usize = 5
+    pub const LSTAT: usize = 6
+    pub const ACCESS: usize = 21
+    pub const FSYNC: usize = 74
+    pub const FDATASYNC: usize = 75
+    pub const TRUNCATE: usize = 76
+    pub const FTRUNCATE: usize = 77
+    pub const GETCWD: usize = 79
+    pub const CHDIR: usize = 80
+    pub const FCHDIR: usize = 81
+    pub const RENAME: usize = 82
+    pub const MKDIR: usize = 83
+    pub const RMDIR: usize = 84
+    pub const CREAT: usize = 85
+    pub const LINK: usize = 86
+    pub const UNLINK: usize = 87
+    pub const SYMLINK: usize = 88
+    pub const READLINK: usize = 89
+    pub const CHMOD: usize = 90
+    pub const FCHMOD: usize = 91
+    pub const CHOWN: usize = 92
+    pub const FCHOWN: usize = 93
+    pub const LCHOWN: usize = 94
+    pub const MKNOD: usize = 133
+    pub const STATFS: usize = 137
+    pub const FSTATFS: usize = 138
+    pub const SYNC: usize = 162
+    pub const GETDENTS64: usize = 217
+    pub const OPENAT: usize = 257
+    pub const MKDIRAT: usize = 258
+    pub const MKNODAT: usize = 259
+    pub const FCHOWNAT: usize = 260
+    pub const NEWFSTATAT: usize = 262
+    pub const UNLINKAT: usize = 263
+    pub const RENAMEAT: usize = 264
+    pub const LINKAT: usize = 265
+    pub const SYMLINKAT: usize = 266
+    pub const READLINKAT: usize = 267
+    pub const FCHMODAT: usize = 268
+    pub const FACCESSAT: usize = 269
+    pub const UTIMENSAT: usize = 280
+    pub const SYNCFS: usize = 306
+    pub const RENAMEAT2: usize = 316
+    pub const COPY_FILE_RANGE: usize = 326
+    pub const STATX: usize = 332
+    pub const FACCESSAT2: usize = 439
+    // brixOS's own, past Linux's numbers: a snapshot of a tree (source,
+    // destination, flags: READ_ONLY), and taking one out (path).
+    pub const SNAPSHOT: usize = 1000
+    pub const REMOVE_SNAPSHOT: usize = 1001
+    // The disk's volume mounted (after it was formatted).
+    pub const MOUNT: usize = 1002
+}
+
+// SNAPSHOT's flags.
+pub const Snapshot = struct {
+    pub const READ_ONLY: usize = 1
+}
+
+// The paths Linux programs expect, onto brixOS's layout: a path that
+// starts with one of them (a whole component) is read with the other in
+// its place. Nothing of Unix's layout is in the tree itself.
+pub const Compat = struct {
+    pub const CAPACITY: usize = 4096
+
+    fn startsWith(path: [*]const u8, prefix: []const u8) -> bool {
+        var k: usize = 0
+        while k < prefix.length {
+            if path[k] != prefix[k] { return false }
+            k += 1
+        }
+        return path[k] == 0 || path[k] == 47
+    }
+
+    fn replace(path: [*]const u8, prefix: []const u8, with: []const u8, buffer: [*]u8) -> [*]const u8 {
+        var rest = prefix.length
+        var length = with.length
+        Bytes.copy(buffer, with.pointer, with.length)
+        while path[rest] != 0 && length < CAPACITY - 1 {
+            buffer[length] = path[rest]
+            length += 1
+            rest += 1
+        }
+        buffer[length] = 0
+        return buffer
+    }
+
+    // `path` as brixOS names it: itself, or its translation in `buffer`.
+    pub fn native(path: [*]const u8, buffer: [*]u8) -> [*]const u8 {
+        if startsWith(path, "/dev") { return replace(path, "/dev", "/devices", buffer) }
+        if startsWith(path, "/tmp") { return replace(path, "/tmp", "/temporary", buffer) }
+        if startsWith(path, "/etc/passwd") { return replace(path, "/etc/passwd", "/system/settings/users", buffer) }
+        if startsWith(path, "/etc/group") { return replace(path, "/etc/group", "/system/settings/groups", buffer) }
+        if startsWith(path, "/etc/resolv.conf") { return replace(path, "/etc/resolv.conf", "/system/settings/resolv.conf", buffer) }
+        if startsWith(path, "/etc/hosts") { return replace(path, "/etc/hosts", "/system/settings/hosts", buffer) }
+        return path
+    }
+}
+
+// The translations of a call's paths (two at most: rename, link).
+var firstPath: [Compat.CAPACITY]u8 = undefined // (per run)
+var secondPath: [Compat.CAPACITY]u8 = undefined // (per run)
+
+fn translationBuffer(slot: usize) -> [*]u8 { return if slot == 0 { &firstPath } else { &secondPath } }
+
+pub const FileCalls = struct {
+    const AT_FDCWD: isize = -100
+    const AT_REMOVEDIR: usize = 0x200
+    const AT_EMPTY_PATH: usize = 0x1000
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100
+    const AT_SYMLINK_FOLLOW: usize = 0x400
+    const S_IFMT: usize = 0xF000
+    const S_IFIFO: usize = 0x1000
+    const S_IFREG: usize = 0x8000
+    const RENAME_NOREPLACE: usize = 1
+    const X_OK: usize = 1
+    const EXECUTE_BITS: usize = 0x49
+    const UTIME_NOW: usize = 0x3FFFFFFF
+    const UTIME_OMIT: usize = 0x3FFFFFFE
+    const TMPFS_MAGIC: usize = 0x01021994
+    // statfs's f_type of a brixfs volume ("BRIX").
+    const BRIXFS_MAGIC: usize = 0x58495242
+    const STATFS_SIZE: usize = 120
+    const SELF_EXE = "/proc/self/exe"
+
+    // A descriptor argument (an int: its upper half is not the caller's).
+    fn descriptor(value: usize) -> isize { return @intCast(isize, @bitCast(i32, @intCast(u32, value & 0xFFFFFFFF))) }
+
+    pub fn handles(number: usize) -> bool {
+        return number == FileNumber.OPEN || number == FileNumber.STAT || number == FileNumber.FSTAT || number == FileNumber.LSTAT || number == FileNumber.ACCESS || (number >= FileNumber.FSYNC && number <= FileNumber.LCHOWN) || number == FileNumber.MKNOD || number == FileNumber.STATFS || number == FileNumber.FSTATFS || number == FileNumber.SYNC || number == FileNumber.GETDENTS64 || (number >= FileNumber.OPENAT && number <= FileNumber.FACCESSAT) || number == FileNumber.UTIMENSAT || number == FileNumber.SYNCFS || number == FileNumber.RENAMEAT2 || number == FileNumber.STATX || number == FileNumber.FACCESSAT2 || number == FileNumber.COPY_FILE_RANGE || number == FileNumber.SNAPSHOT || number == FileNumber.REMOVE_SNAPSHOT || number == FileNumber.MOUNT
+    }
+
+    pub fn call(p: *Process, number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+        const fd = descriptor(a1)
+        if number == FileNumber.OPEN { return open(p, AT_FDCWD, a1, a2, a3) }
+        if number == FileNumber.OPENAT { return open(p, fd, a2, a3, a4) }
+        if number == FileNumber.CREAT { return open(p, AT_FDCWD, a1, Open.CREATE | Open.WRITE_ONLY | Open.TRUNCATE, a2) }
+        if number == FileNumber.STAT { return statusOf(p, AT_FDCWD, a1, 0, a2, false) }
+        if number == FileNumber.LSTAT { return statusOf(p, AT_FDCWD, a1, AT_SYMLINK_NOFOLLOW, a2, false) }
+        if number == FileNumber.FSTAT { return statusOfDescriptor(p, fd, a2, false) }
+        if number == FileNumber.NEWFSTATAT { return statusOf(p, fd, a2, a4, a3, false) }
+        if number == FileNumber.STATX { return statusOf(p, fd, a2, a3, a5, true) }
+        if number == FileNumber.ACCESS { return access(p, AT_FDCWD, a1, a2) }
+        if number == FileNumber.FACCESSAT || number == FileNumber.FACCESSAT2 { return access(p, fd, a2, a3) }
+        if number == FileNumber.GETCWD { return workingDirectory(p, a1, a2) }
+        if number == FileNumber.CHDIR { return changeDirectory(p, AT_FDCWD, a1) }
+        if number == FileNumber.FCHDIR {
+            const node = p.*.files.nodeOf(fd)
+            if node == Vfs.NONE { return Errno.EBADF }
+            if !vfs.fileSystem().node(node).isDirectory() { return Errno.ENOTDIR }
+            p.setDirectory(node)
+            return 0
+        }
+        if number == FileNumber.MKDIR { return makeDirectory(p, AT_FDCWD, a1, a2) }
+        if number == FileNumber.MKDIRAT { return makeDirectory(p, fd, a2, a3) }
+        if number == FileNumber.RMDIR { return remove(p, AT_FDCWD, a1, true) }
+        if number == FileNumber.UNLINK { return remove(p, AT_FDCWD, a1, false) }
+        if number == FileNumber.UNLINKAT { return remove(p, fd, a2, a3 & AT_REMOVEDIR != 0) }
+        if number == FileNumber.RENAME { return rename(p, AT_FDCWD, a1, AT_FDCWD, a2, 0) }
+        if number == FileNumber.RENAMEAT { return rename(p, fd, a2, descriptor(a3), a4, 0) }
+        if number == FileNumber.RENAMEAT2 { return rename(p, fd, a2, descriptor(a3), a4, a5) }
+        if number == FileNumber.LINK { return link(p, AT_FDCWD, a1, AT_FDCWD, a2, 0) }
+        if number == FileNumber.LINKAT { return link(p, fd, a2, descriptor(a3), a4, a5) }
+        if number == FileNumber.SYMLINK { return symbolicLink(p, a1, AT_FDCWD, a2) }
+        if number == FileNumber.SYMLINKAT { return symbolicLink(p, a1, descriptor(a2), a3) }
+        // FIFOs and files; no device files made by programs.
+        if number == FileNumber.MKNOD { return makeNode(p, AT_FDCWD, a1, a2) }
+        if number == FileNumber.MKNODAT { return makeNode(p, fd, a2, a3) }
+        if number == FileNumber.READLINK { return readLink(p, AT_FDCWD, a1, a2, a3) }
+        if number == FileNumber.READLINKAT { return readLink(p, fd, a2, a3, a4) }
+        if number == FileNumber.TRUNCATE { return truncatePath(p, a1, a2) }
+        if number == FileNumber.FTRUNCATE {
+            const node = p.*.files.nodeOf(fd)
+            if node == Vfs.NONE { return Errno.EBADF }
+            return truncateNode(node, a2)
+        }
+        if number == FileNumber.CHMOD { return changeMode(p, AT_FDCWD, a1, a2) }
+        if number == FileNumber.FCHMODAT { return changeMode(p, fd, a2, a3) }
+        if number == FileNumber.FCHMOD {
+            const node = p.*.files.nodeOf(fd)
+            if node == Vfs.NONE { return Errno.EBADF }
+            return setMode(node, a2)
+        }
+        if number == FileNumber.CHOWN {
+            const found = resolve(p, AT_FDCWD, a1)
+            return if found < 0 { found } else { changeOwner(p, @bitCast(usize, found), a2, a3) }
+        }
+        if number == FileNumber.LCHOWN {
+            const found = resolveLink(p, AT_FDCWD, a1)
+            return if found < 0 { found } else { changeOwner(p, @bitCast(usize, found), a2, a3) }
+        }
+        if number == FileNumber.FCHOWNAT {
+            const found = resolveWith(p, fd, a2, a5 & AT_SYMLINK_NOFOLLOW == 0)
+            return if found < 0 { found } else { changeOwner(p, @bitCast(usize, found), a3, a4) }
+        }
+        if number == FileNumber.FCHOWN {
+            const node = p.*.files.nodeOf(fd)
+            if node == Vfs.NONE { return Errno.EBADF }
+            return changeOwner(p, node, a2, a3)
+        }
+        if number == FileNumber.UTIMENSAT { return setTimes(p, fd, a2, a3, a4) }
+        // What changed goes to the disk.
+        if number == FileNumber.FSYNC || number == FileNumber.FDATASYNC || number == FileNumber.SYNCFS {
+            if p.*.files.get(fd) == null { return Errno.EBADF }
+            return if volume.commitAll() { 0 } else { -5 }
+        }
+        if number == FileNumber.SYNC {
+            _ = volume.commitAll()
+            return 0
+        }
+        if number == FileNumber.STATFS {
+            const found = resolve(p, AT_FDCWD, a1)
+            if found < 0 { return found }
+            return fileSystemStatus(p, @bitCast(usize, found), a2)
+        }
+        if number == FileNumber.FSTATFS {
+            if p.*.files.get(fd) == null { return Errno.EBADF }
+            return fileSystemStatus(p, p.*.files.nodeOf(fd), a2)
+        }
+        if number == FileNumber.SNAPSHOT { return snapshot(p, a1, a2, a3) }
+        if number == FileNumber.REMOVE_SNAPSHOT { return removeSnapshot(p, a1) }
+        if number == FileNumber.MOUNT {
+            // (a1: the device's name, a2 its length: "disk0", "disk1p2".)
+            if a2 > block.NAME_CAPACITY || !p.prepare(a1, a2) { return Errno.EINVAL }
+            const which = block.named(Bytes.pointer(a1)[0..a2])
+            if which == block.MAX_BLOCKS { return Errno.ENODEV }
+            if volume.storeAt(which).*.mounted { return Errno.EBUSY }
+            return if volume.storeAt(which).mount(which) { 0 } else { Errno.EINVAL }
+        }
+        if number == FileNumber.COPY_FILE_RANGE { return copyRange(p, fd, a2, descriptor(a3), a4, a5) }
+        if number == FileNumber.GETDENTS64 {
+            if !p.prepare(a2, a3) { return Errno.EFAULT }
+            return p.*.files.entries(fd, Bytes.pointer(a2), a3)
+        }
+        return Errno.ENOSYS
+    }
+
+    // ---- paths ----
+
+    fn isSelfExe(path: [*]const u8) -> bool {
+        var k: usize = 0
+        while k < SELF_EXE.length {
+            if path[k] != SELF_EXE[k] { return false }
+            k += 1
+        }
+        return path[k] == 0
+    }
+
+    // The directory relative paths start from: the working one
+    // (AT_FDCWD) or a descriptor's; -errno.
+    fn base(p: *Process, dirfd: isize) -> isize {
+        if dirfd == AT_FDCWD { return @intCast(isize, p.*.directory) }
+        const node = p.*.files.nodeOf(dirfd)
+        if node == Vfs.NONE { return Errno.EBADF }
+        if !vfs.fileSystem().node(node).isDirectory() { return Errno.ENOTDIR }
+        return @intCast(isize, node)
+    }
+
+    // The node a path argument names, links followed; -errno (EFAULT when
+    // it is not the process's).
+    pub fn resolve(p: *Process, dirfd: isize, path: usize) -> isize { return resolveWith(p, dirfd, path, true) }
+
+    // The same, a link as the last component that link.
+    fn resolveLink(p: *Process, dirfd: isize, path: usize) -> isize { return resolveWith(p, dirfd, path, false) }
+
+    fn resolveWith(p: *Process, dirfd: isize, path: usize, follow: bool) -> isize {
+        if !p.prepareString(path) { return Errno.EFAULT }
+        if isSelfExe(Bytes.pointer(path)) { return if p.*.program == Vfs.NONE { Errno.ENOENT } else { @intCast(isize, p.*.program) } }
+        const text = Compat.native(Bytes.pointer(path), translationBuffer(0))
+        if text[0] == 0 { return Errno.ENOENT }
+        const from = if text[0] == 47 { @intCast(isize, Vfs.ROOT) } else { base(p, dirfd) }
+        if from < 0 { return from }
+        if !follow { return vfs.fileSystem().resolveLink(@bitCast(usize, from), text) }
+        return vfs.fileSystem().resolve(@bitCast(usize, from), text)
+    }
+
+    // The directory that would hold a path's last component (its node, or
+    // -errno), the component into `name`.
+    fn resolveParent(p: *Process, dirfd: isize, path: usize, name: *[]const u8, slot: usize) -> isize {
+        if !p.prepareString(path) { return Errno.EFAULT }
+        const text = Compat.native(Bytes.pointer(path), translationBuffer(slot))
+        if text[0] == 0 { return Errno.ENOENT }
+        const from = if text[0] == 47 { @intCast(isize, Vfs.ROOT) } else { base(p, dirfd) }
+        if from < 0 { return from }
+        return vfs.fileSystem().resolveParent(@bitCast(usize, from), text, name)
+    }
+
+    // For execve: whether the path is /proc/self/exe, and the directory
+    // that names a path's last component.
+    pub fn isSelfExePath(p: *Process, path: usize) -> bool { return p.prepareString(path) && isSelfExe(Bytes.pointer(path)) }
+
+    pub fn parentOf(p: *Process, path: usize, name: *[]const u8) -> isize { return resolveParent(p, AT_FDCWD, path, name, 0) }
+
+    // EROFS when the node is part of a read-only snapshot, else 0.
+    fn changeable(node: usize) -> isize { return names.changeable(node) }
+
+    fn isDot(name: []const u8) -> bool { return names.isDot(name) }
+
+    // ---- the calls ----
+
+    fn open(p: *Process, dirfd: isize, path: usize, flags: usize, mode: usize) -> isize {
+        const tree = vfs.fileSystem()
+        // O_CREAT|O_EXCL and O_NOFOLLOW: a link is not followed (it is
+        // there; it is not opened).
+        const follow = flags & Open.NO_FOLLOW == 0 && !(flags & Open.CREATE != 0 && flags & Open.EXCLUSIVE != 0)
+        var found = resolveWith(p, dirfd, path, follow)
+        if found >= 0 && flags & Open.CREATE != 0 && flags & Open.EXCLUSIVE != 0 { return Errno.EEXIST }
+        if found >= 0 && tree.node(@bitCast(usize, found)).isLink() { return Errno.ELOOP }
+        if found == Status.not_found && flags & Open.CREATE != 0 {
+            var name: []const u8 = undefined
+            const directory = resolveParent(p, dirfd, path, &name, 0)
+            if directory < 0 { return directory }
+            if name.length == 0 || isDot(name) { return Errno.EISDIR }
+            if changeable(@bitCast(usize, directory)) < 0 { return Errno.EROFS }
+            if !tree.permits(@bitCast(usize, directory), Vfs.WRITE) { return Errno.EACCES }
+            const made = tree.create(NodeKind.file, mode & ~p.*.umask)
+            if made == Vfs.NONE { return Errno.ENOSPC }
+            tree.own(made, p.*.user, p.*.group_id)
+            const linked = tree.link(@bitCast(usize, directory), name.pointer, name.length, made)
+            if linked < 0 {
+                tree.retain(made)
+                tree.release(made)
+                return linked
+            }
+            found = @intCast(isize, made)
+        }
+        if found < 0 { return found }
+        const node = @bitCast(usize, found)
+        const n = tree.node(node)
+        if flags & Open.DIRECTORY != 0 && !n.isDirectory() { return Errno.ENOTDIR }
+        if n.isDirectory() && Open.writes(flags) { return Errno.EISDIR }
+        if n.*.readOnly && (Open.writes(flags) || flags & Open.TRUNCATE != 0) { return Errno.EROFS }
+        if (Open.reads(flags) && !tree.permits(node, Vfs.READ)) || ((Open.writes(flags) || flags & Open.TRUNCATE != 0) && !tree.permits(node, Vfs.WRITE)) { return Errno.EACCES }
+        // The disk is the volume's while it is mounted.
+        if n.*.kind == NodeKind.disk && volume.storeAt(n.*.archiveIndex).*.mounted && Open.writes(flags) { return Errno.EBUSY }
+        if n.*.kind == NodeKind.fifo { return p.*.files.openFifo(node, flags) }
+        if flags & Open.TRUNCATE != 0 && Open.writes(flags) && n.isRegular() {
+            const truncated = tree.truncate(node, 0)
+            if truncated < 0 { return truncated }
+        }
+        return p.*.files.openNode(node, flags)
+    }
+
+    fn statusOf(p: *Process, dirfd: isize, path: usize, flags: usize, address: usize, statx: bool) -> isize {
+        const size = if statx { files.Stat.STATX_SIZE } else { files.Stat.SIZE }
+        if !p.prepare(address, size) { return Errno.EFAULT }
+        if flags & AT_EMPTY_PATH != 0 && p.prepareString(path) && Bytes.pointer(path)[0] == 0 {
+            if dirfd == AT_FDCWD {
+                files.Stat.ofNode(p.*.directory, Bytes.pointer(address), statx)
+                return 0
+            }
+            return p.*.files.status(dirfd, Bytes.pointer(address), statx)
+        }
+        const found = resolveWith(p, dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0)
+        if found < 0 { return found }
+        files.Stat.ofNode(@bitCast(usize, found), Bytes.pointer(address), statx)
+        return 0
+    }
+
+    fn statusOfDescriptor(p: *Process, fd: isize, address: usize, statx: bool) -> isize {
+        if !p.prepare(address, if statx { files.Stat.STATX_SIZE } else { files.Stat.SIZE }) { return Errno.EFAULT }
+        return p.*.files.status(fd, Bytes.pointer(address), statx)
+    }
+
+    // access: whether it is there (and, for X_OK, a directory or a file
+    // with an execute bit: there is one user, and it may do the rest).
+    fn access(p: *Process, dirfd: isize, path: usize, mode: usize) -> isize {
+        const found = resolve(p, dirfd, path)
+        if found < 0 { return found }
+        const n = vfs.fileSystem().node(@bitCast(usize, found))
+        if mode & X_OK != 0 && n.isRegular() && n.*.mode & EXECUTE_BITS == 0 { return Errno.EACCES }
+        if !vfs.fileSystem().permits(@bitCast(usize, found), mode & 7) { return Errno.EACCES }
+        return 0
+    }
+
+    fn exists(p: *Process, dirfd: isize, path: usize) -> isize {
+        const found = resolve(p, dirfd, path)
+        return if found < 0 { found } else { 0 }
+    }
+
+    fn workingDirectory(p: *Process, address: usize, capacity: usize) -> isize {
+        if !p.prepare(address, capacity) { return Errno.EFAULT }
+        const length = vfs.fileSystem().pathOf(p.*.directory, Bytes.pointer(address), capacity)
+        if length == 0 { return Errno.ERANGE }
+        return @intCast(isize, length + 1)
+    }
+
+    fn changeDirectory(p: *Process, dirfd: isize, path: usize) -> isize {
+        const found = resolve(p, dirfd, path)
+        if found < 0 { return found }
+        const node = @bitCast(usize, found)
+        if !vfs.fileSystem().node(node).isDirectory() { return Errno.ENOTDIR }
+        if !vfs.fileSystem().permits(node, Vfs.EXECUTE) { return Errno.EACCES }
+        p.setDirectory(node)
+        return 0
+    }
+
+    fn makeDirectory(p: *Process, dirfd: isize, path: usize, mode: usize) -> isize {
+        var name: []const u8 = undefined
+        const directory = resolveParent(p, dirfd, path, &name, 0)
+        if directory < 0 { return directory }
+        if name.length == 0 || isDot(name) { return Errno.EEXIST }
+        // What is there already says so before a read-only directory does
+        // (mkdir -p walks into /volumes this way).
+        if vfs.fileSystem().lookup(@bitCast(usize, directory), name.pointer, name.length) != Vfs.NONE { return Errno.EEXIST }
+        if changeable(@bitCast(usize, directory)) < 0 { return Errno.EROFS }
+        if !vfs.fileSystem().permits(@bitCast(usize, directory), Vfs.WRITE) { return Errno.EACCES }
+        const made = vfs.fileSystem().makeDirectory(@bitCast(usize, directory), name, mode & ~p.*.umask)
+        if made >= 0 { vfs.fileSystem().own(@bitCast(usize, made), p.*.user, p.*.group_id) }
+        return if made < 0 { made } else { 0 }
+    }
+
+    // unlink, or rmdir (`directory`).
+    fn remove(p: *Process, dirfd: isize, path: usize, directory: bool) -> isize {
+        const tree = vfs.fileSystem()
+        var name: []const u8 = undefined
+        const parent = resolveParent(p, dirfd, path, &name, 0)
+        if parent < 0 { return parent }
+        if name.length == 0 { return Errno.EBUSY }
+        if isDot(name) { return if directory { Errno.EINVAL } else { Errno.EISDIR } }
+        const target = tree.lookup(@bitCast(usize, parent), name.pointer, name.length)
+        if target == Vfs.NONE { return Errno.ENOENT }
+        if changeable(@bitCast(usize, parent)) < 0 { return Errno.EROFS }
+        const n = tree.node(target)
+        if directory {
+            if !n.isDirectory() { return Errno.ENOTDIR }
+            if target == Vfs.ROOT { return Errno.EBUSY }
+            if !tree.isEmpty(target) { return Errno.ENOTEMPTY }
+        } else if n.isDirectory() {
+            return Errno.EISDIR
+        }
+        return tree.unlink(@bitCast(usize, parent), name.pointer, name.length)
+    }
+
+    fn rename(p: *Process, oldDirfd: isize, oldPath: usize, newDirfd: isize, newPath: usize, flags: usize) -> isize {
+        var oldName: []const u8 = undefined
+        var newName: []const u8 = undefined
+        const from = resolveParent(p, oldDirfd, oldPath, &oldName, 0)
+        if from < 0 { return from }
+        const to = resolveParent(p, newDirfd, newPath, &newName, 1)
+        if to < 0 { return to }
+        return names.rename(@bitCast(usize, from), oldName, @bitCast(usize, to), newName, flags & RENAME_NOREPLACE != 0)
+    }
+
+    // link, linkat (a link as the source is linked itself unless
+    // AT_SYMLINK_FOLLOW).
+    fn link(p: *Process, oldDirfd: isize, oldPath: usize, newDirfd: isize, newPath: usize, flags: usize) -> isize {
+        const found = resolveWith(p, oldDirfd, oldPath, flags & AT_SYMLINK_FOLLOW != 0)
+        if found < 0 { return found }
+        const node = @bitCast(usize, found)
+        if vfs.fileSystem().node(node).isDirectory() { return Errno.EPERM }
+        var name: []const u8 = undefined
+        const directory = resolveParent(p, newDirfd, newPath, &name, 1)
+        if directory < 0 { return directory }
+        if name.length == 0 || isDot(name) { return Errno.EEXIST }
+        if changeable(@bitCast(usize, directory)) < 0 { return Errno.EROFS }
+        return vfs.fileSystem().link(@bitCast(usize, directory), name.pointer, name.length, node)
+    }
+
+    // A new node of `kind` named by a path: its index, or -errno.
+    fn makeNamed(p: *Process, dirfd: isize, path: usize, kind: NodeKind, mode: usize) -> isize {
+        const tree = vfs.fileSystem()
+        var name: []const u8 = undefined
+        const directory = resolveParent(p, dirfd, path, &name, 1)
+        if directory < 0 { return directory }
+        if name.length == 0 || isDot(name) { return Errno.EEXIST }
+        if changeable(@bitCast(usize, directory)) < 0 { return Errno.EROFS }
+        if tree.lookup(@bitCast(usize, directory), name.pointer, name.length) != Vfs.NONE { return Errno.EEXIST }
+        if !tree.permits(@bitCast(usize, directory), Vfs.WRITE) { return Errno.EACCES }
+        const made = tree.create(kind, mode)
+        if made == Vfs.NONE { return Errno.ENOSPC }
+        tree.own(made, p.*.user, p.*.group_id)
+        // Held until it is linked (a failed link frees it).
+        tree.retain(made)
+        const linked = tree.link(@bitCast(usize, directory), name.pointer, name.length, made)
+        if linked < 0 {
+            tree.release(made)
+            return linked
+        }
+        tree.release(made)
+        return @intCast(isize, made)
+    }
+
+    // symlink, symlinkat: a link holding `target` as it is.
+    fn symbolicLink(p: *Process, target: usize, dirfd: isize, path: usize) -> isize {
+        if !p.prepareString(target) { return Errno.EFAULT }
+        const text = Bytes.pointer(target)
+        var length: usize = 0
+        while text[length] != 0 { length += 1 }
+        if length == 0 { return Errno.ENOENT }
+        if length >= memory.Page.SIZE { return Errno.ENAMETOOLONG }
+        const made = makeNamed(p, dirfd, path, NodeKind.symlink, 0x1FF)
+        if made < 0 { return made }
+        const node = @bitCast(usize, made)
+        const written = vfs.fileSystem().write(node, 0, text, length)
+        if written < 0 {
+            var name: []const u8 = undefined
+            const directory = resolveParent(p, dirfd, path, &name, 1)
+            if directory >= 0 { _ = vfs.fileSystem().unlink(@bitCast(usize, directory), name.pointer, name.length) }
+            return written
+        }
+        return 0
+    }
+
+    // mknod, mknodat: a FIFO, or an empty file.
+    fn makeNode(p: *Process, dirfd: isize, path: usize, mode: usize) -> isize {
+        const format = mode & S_IFMT
+        if format != S_IFIFO && format != S_IFREG && format != 0 { return Errno.EPERM }
+        const made = makeNamed(p, dirfd, path, if format == S_IFIFO { NodeKind.fifo } else { NodeKind.file }, mode & 0xFFF & ~p.*.umask)
+        return if made < 0 { made } else { 0 }
+    }
+
+    // readlink: a link's target; /proc/self/exe's is the program's path.
+    fn readLink(p: *Process, dirfd: isize, path: usize, address: usize, capacity: usize) -> isize {
+        if !p.prepareString(path) { return Errno.EFAULT }
+        if !isSelfExe(Bytes.pointer(path)) {
+            const found = resolveLink(p, dirfd, path)
+            if found < 0 { return found }
+            const node = @bitCast(usize, found)
+            const tree = vfs.fileSystem()
+            if !tree.node(node).isLink() { return Errno.EINVAL }
+            const size = tree.node(node).*.size
+            const count = if size > capacity { capacity } else { size }
+            if !p.prepare(address, count) { return Errno.EFAULT }
+            return @intCast(isize, tree.read(node, 0, Bytes.pointer(address), count))
+        }
+        if p.*.program == Vfs.NONE { return Errno.ENOENT }
+        var buffer: [512]u8 = undefined
+        const tree = vfs.fileSystem()
+        var length = tree.pathOf(p.*.programDirectory, &buffer, 512)
+        if length == 0 { return Errno.ENOENT }
+        // The program's name in that directory.
+        var slot: usize = 0
+        while slot < tree.slotCount(p.*.programDirectory) {
+            var name: [*]const u8 = undefined
+            var nameLength: usize = 0
+            if tree.entry(p.*.programDirectory, slot, &name, &nameLength) == p.*.program && length + 1 + nameLength < 512 {
+                if length > 1 {
+                    buffer[length] = 47
+                    length += 1
+                }
+                Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(&buffer) + length) }, name, nameLength)
+                length += nameLength
+                break
+            }
+            slot += 1
+        }
+        const count = if length > capacity { capacity } else { length }
+        if !p.prepare(address, count) { return Errno.EFAULT }
+        Bytes.copy(Bytes.pointer(address), &buffer, count)
+        return @intCast(isize, count)
+    }
+
+    fn truncateNode(node: usize, size: usize) -> isize {
+        if changeable(node) < 0 { return Errno.EROFS }
+        const n = vfs.fileSystem().node(node)
+        if n.isDirectory() { return Errno.EISDIR }
+        if !n.isRegular() { return Errno.EINVAL }
+        if !vfs.fileSystem().permits(node, Vfs.WRITE) { return Errno.EACCES }
+        return vfs.fileSystem().truncate(node, size)
+    }
+
+    fn truncatePath(p: *Process, path: usize, size: usize) -> isize {
+        const found = resolve(p, AT_FDCWD, path)
+        if found < 0 { return found }
+        return truncateNode(@bitCast(usize, found), size)
+    }
+
+    // chown: the owner (-1: as it is) and the group; the system's user
+    // may set any, an owner only the group.
+    fn changeOwner(p: *Process, node: usize, user: usize, group: usize) -> isize {
+        const tree = vfs.fileSystem()
+        const n = tree.node(node)
+        if changeable(node) < 0 { return Errno.EROFS }
+        const none: usize = 0xFFFFFFFF
+        const newUser = if user & 0xFFFFFFFF == none { n.*.user } else { user & 0xFFFFFFFF }
+        const newGroup = if group & 0xFFFFFFFF == none { n.*.group } else { group & 0xFFFFFFFF }
+        if p.*.user != 0 && (p.*.user != n.*.user || newUser != n.*.user) { return Errno.EPERM }
+        tree.own(node, newUser, newGroup)
+        n.*.changed = clock.system().realtime() / clock.Clock.NANOSECONDS
+        tree.touch(node, false)
+        return 0
+    }
+
+    // Whether the caller is the node's owner (or the system's user): who
+    // may change its mode, its times, its owner.
+    fn owns(node: usize) -> bool {
+        const tree = vfs.fileSystem()
+        return tree.*.actorUser == 0 || tree.*.actorUser == tree.node(node).*.user
+    }
+
+    fn setMode(node: usize, mode: usize) -> isize {
+        if changeable(node) < 0 { return Errno.EROFS }
+        if !owns(node) { return Errno.EPERM }
+        const n = vfs.fileSystem().node(node)
+        n.*.mode = mode & 0xFFF
+        n.*.changed = clock.system().realtime() / clock.Clock.NANOSECONDS
+        vfs.fileSystem().touch(node, false)
+        return 0
+    }
+
+    fn changeMode(p: *Process, dirfd: isize, path: usize, mode: usize) -> isize {
+        const found = resolve(p, dirfd, path)
+        if found < 0 { return found }
+        return setMode(@bitCast(usize, found), mode)
+    }
+
+    // utimensat(dirfd, path or NULL (the descriptor), times or NULL (now)).
+    fn setTimes(p: *Process, dirfd: isize, path: usize, times: usize, flags: usize) -> isize {
+        _ = flags
+        var node: usize = Vfs.NONE
+        if path == 0 {
+            node = p.*.files.nodeOf(dirfd)
+            if node == Vfs.NONE { return Errno.EBADF }
+        } else {
+            const found = resolve(p, dirfd, path)
+            if found < 0 { return found }
+            node = @bitCast(usize, found)
+        }
+        if changeable(node) < 0 { return Errno.EROFS }
+        if !owns(node) && !vfs.fileSystem().permits(node, Vfs.WRITE) { return Errno.EPERM }
+        const n = vfs.fileSystem().node(node)
+        const now = clock.system().realtime() / clock.Clock.NANOSECONDS
+        if times == 0 {
+            n.*.accessed = now
+            n.*.modified = now
+        } else {
+            if !p.prepare(times, 32) { return Errno.EFAULT }
+            const t = Bytes.pointer(times)
+            const accessedNanoseconds = Bytes.read64(t, 8)
+            const modifiedNanoseconds = Bytes.read64(t, 24)
+            if accessedNanoseconds != UTIME_OMIT { n.*.accessed = if accessedNanoseconds == UTIME_NOW { now } else { Bytes.read64(t, 0) } }
+            if modifiedNanoseconds != UTIME_OMIT { n.*.modified = if modifiedNanoseconds == UTIME_NOW { now } else { Bytes.read64(t, 16) } }
+        }
+        n.*.changed = now
+        vfs.fileSystem().touch(node, false)
+        return 0
+    }
+
+    // A regular file's node a descriptor holds, opened to read (or to
+    // write without O_APPEND); NONE when it is not that.
+    fn regularNode(p: *Process, fd: isize, writing: bool) -> usize {
+        const slot = p.*.files.get(fd)
+        if slot == null || slot.?.*.kind != files.Kind.node { return Vfs.NONE }
+        const flags = slot.?.*.flags
+        if writing && (!Open.writes(flags) || flags & Open.APPEND != 0) { return Vfs.NONE }
+        if !writing && !Open.reads(flags) { return Vfs.NONE }
+        if !vfs.fileSystem().node(slot.?.*.index).isRegular() { return Vfs.NONE }
+        return slot.?.*.index
+    }
+
+    // An offset argument: the value at `address`, or the descriptor's
+    // offset when it is 0.
+    fn offsetOf(p: *Process, fd: isize, address: usize, value: *usize) -> bool {
+        if address == 0 {
+            value.* = p.*.files.get(fd).?.*.offset
+            return true
+        }
+        if !p.prepare(address, 8) { return false }
+        value.* = Bytes.read64(Bytes.pointer(address), 0)
+        return true
+    }
+
+    fn setOffset(p: *Process, fd: isize, address: usize, value: usize) -> void {
+        if address == 0 {
+            p.*.files.get(fd).?.*.offset = value
+        } else {
+            Bytes.write64(Bytes.pointer(address), 0, value)
+        }
+    }
+
+    // copy_file_range: whole pages are shared between the files (copy on
+    // write), the rest copied.
+    fn copyRange(p: *Process, fdIn: isize, offsetIn: usize, fdOut: isize, offsetOut: usize, length: usize) -> isize {
+        const from = regularNode(p, fdIn, false)
+        const to = regularNode(p, fdOut, true)
+        if from == Vfs.NONE || to == Vfs.NONE { return if p.*.files.get(fdIn) == null || p.*.files.get(fdOut) == null { Errno.EBADF } else { Errno.EINVAL } }
+        var at: usize = 0
+        var into: usize = 0
+        if !offsetOf(p, fdIn, offsetIn, &at) || !offsetOf(p, fdOut, offsetOut, &into) { return Errno.EFAULT }
+        if from == to && at < into + length && into < at + length { return Errno.EINVAL }
+        const copied = vfs.fileSystem().copyRange(from, at, to, into, length)
+        if copied > 0 {
+            setOffset(p, fdIn, offsetIn, at + @bitCast(usize, copied))
+            setOffset(p, fdOut, offsetOut, into + @bitCast(usize, copied))
+        }
+        return copied
+    }
+
+    // ioctl FICLONE: the file `fd` becomes a clone of `source` (all its
+    // pages shared).
+    pub fn cloneFile(p: *Process, fd: isize, source: isize) -> isize {
+        const from = regularNode(p, source, false)
+        const to = regularNode(p, fd, true)
+        if from == Vfs.NONE || to == Vfs.NONE { return Errno.EINVAL }
+        if from == to { return 0 }
+        const tree = vfs.fileSystem()
+        const truncated = tree.truncate(to, 0)
+        if truncated < 0 { return truncated }
+        const size = tree.node(from).*.size
+        const copied = tree.copyRange(from, 0, to, 0, size)
+        if copied < 0 { return copied }
+        return if @bitCast(usize, copied) == size { 0 } else { Errno.ENOSPC }
+    }
+
+    // SNAPSHOT: a copy of the tree `source` at `destination` (a new name)
+    // whose files share their pages with the originals; read-only with
+    // Snapshot.READ_ONLY.
+    fn snapshot(p: *Process, source: usize, destination: usize, flags: usize) -> isize {
+        const found = resolve(p, AT_FDCWD, source)
+        if found < 0 { return found }
+        var name: []const u8 = undefined
+        const directory = resolveParent(p, AT_FDCWD, destination, &name, 1)
+        if directory < 0 { return directory }
+        return names.snapshot(@bitCast(usize, found), @bitCast(usize, directory), name, flags & Snapshot.READ_ONLY != 0)
+    }
+
+    // REMOVE_SNAPSHOT: a snapshot (read-only or not) taken out with all
+    // it holds.
+    fn removeSnapshot(p: *Process, path: usize) -> isize {
+        const tree = vfs.fileSystem()
+        var name: []const u8 = undefined
+        const directory = resolveParent(p, AT_FDCWD, path, &name, 0)
+        if directory < 0 { return directory }
+        if name.length == 0 || isDot(name) { return Errno.EBUSY }
+        const target = tree.lookup(@bitCast(usize, directory), name.pointer, name.length)
+        if target == Vfs.NONE { return Errno.ENOENT }
+        // A snapshot on the disk.
+        var view: usize = 0
+        const holder = volume.storeWithSnapshot(target, &view)
+        if holder != null { return holder.?.removeSnapshot(view) }
+        if changeable(@bitCast(usize, directory)) < 0 { return Errno.EROFS }
+        // Held while its contents go, then unnamed.
+        tree.retain(target)
+        tree.removeTree(target)
+        const removed = tree.unlink(@bitCast(usize, directory), name.pointer, name.length)
+        tree.release(target)
+        return removed
+    }
+
+    // statfs: a volume's room is its disk's (brixfs), the tmpfs's is
+    // memory's.
+    fn fileSystemStatus(p: *Process, node: usize, address: usize) -> isize {
+        if !p.prepare(address, STATFS_SIZE) { return Errno.EFAULT }
+        const into = Bytes.pointer(address)
+        Bytes.fill(into, STATFS_SIZE, 0)
+        if node != Vfs.NONE && vfs.fileSystem().node(node).*.volume != 0 && !ext2.isExt2(vfs.fileSystem().node(node).*.volume) {
+            const disk0 = volume.storeOf(vfs.fileSystem().node(node).*.volume)
+            Bytes.write64(into, 0, BRIXFS_MAGIC)
+            Bytes.write64(into, 8, memory.Page.SIZE)
+            Bytes.write64(into, 16, disk0.*.superblock.blocks)
+            Bytes.write64(into, 24, disk0.freeBlocks())
+            Bytes.write64(into, 32, disk0.freeBlocks())
+            Bytes.write64(into, 40, BrixfsFormat.MAX_INODES)
+            Bytes.write64(into, 48, BrixfsFormat.MAX_INODES - disk0.*.superblock.nextInode)
+            Bytes.write64(into, 64, BrixfsFormat.NAME_MAX)
+            Bytes.write64(into, 72, memory.Page.SIZE)
+            return 0
+        }
+        const frames = memory.allFrames()
+        Bytes.write64(into, 0, TMPFS_MAGIC)
+        Bytes.write64(into, 8, memory.Page.SIZE)
+        Bytes.write64(into, 16, frames.totalBytes() / memory.Page.SIZE)
+        Bytes.write64(into, 24, frames.freeBytes() / memory.Page.SIZE)
+        Bytes.write64(into, 32, frames.freeBytes() / memory.Page.SIZE)
+        Bytes.write64(into, 40, vfs.fileSystem().nodeCount())
+        Bytes.write64(into, 64, Vfs.NAME_MAX)
+        Bytes.write64(into, 72, memory.Page.SIZE)
+        return 0
+    }
+}

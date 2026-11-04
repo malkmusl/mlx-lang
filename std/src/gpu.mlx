@@ -55,12 +55,19 @@ pub const Options = struct {
     // Enable buffer sharing (dma-buf import/export, imported host memory)
     // as far as the device supports it.
     wantSharing: bool
+    // Ask for the device's video decoder too (std.gpu.video): a queue of
+    // its video decode family and the VK_KHR_video_decode_* extensions,
+    // when it has them (`videoH264` tells); a device with one is chosen
+    // over one without.
+    wantVideo: bool
     // A TraceFn address (0: none), called with each step's name before it
     // runs, to find where a driver fails (examples/vulkan-android logs them).
     trace: usize
 }
 
 pub const TraceFn = fn([*]const u8) -> void
+
+pub const NONE_FAMILY: u32 = 4294967295
 
 pub fn defaultOptions(name: [*]const u8) -> Options {
     return Options.{
@@ -70,6 +77,7 @@ pub fn defaultOptions(name: [*]const u8) -> Options {
         .deviceExtensions = null,
         .deviceExtensionCount = 0,
         .wantSharing = false,
+        .wantVideo = false,
         .trace = 0,
     }
 }
@@ -105,6 +113,12 @@ pub const Context = struct {
     dmaBufExport: bool
     hostMemory: bool
     hostAlignment: u64
+    // The video decode queue (with wantVideo): its family (NONE_FAMILY
+    // without one), the queue, and the codecs it decodes.
+    videoFamily: u32
+    videoQueue: vk.Queue
+    videoH264: bool
+    videoH265: bool
     trace: usize
     // std.gpu.diagnostics' state (0: none): the GPU's crashes and profile.
     diagnostics: usize
@@ -166,8 +180,40 @@ fn hasDeviceExtension(context: *Context, name: [*]const u8) -> bool {
     return found
 }
 
+// The device's video decode queue family (NONE_FAMILY without one) and
+// the codecs it decodes, from VK_KHR_video_queue's queue family
+// properties.
+fn videoFamily(context: *Context, physical: vk.PhysicalDevice, family_count: u32, h264: *bool, h265: *bool) -> u32 {
+    var properties: [16]vk.QueueFamilyProperties2 = undefined
+    var video: [16]vk.QueueFamilyVideoPropertiesKHR = undefined
+    var index: u32 = 0
+    while index < family_count {
+        properties[index] = vk.QueueFamilyProperties2.init()
+        video[index] = vk.QueueFamilyVideoPropertiesKHR.init()
+        properties[index].pNext = &video[index]
+        index += 1
+    }
+    var count = family_count
+    step(context, "vkGetPhysicalDeviceQueueFamilyProperties2")
+    vk.getPhysicalDeviceQueueFamilyProperties2(context.*.instanceCommands, physical, &count, &properties)
+    index = 0
+    while index < count {
+        if properties[index].queueFamilyProperties.queueFlags & vk.QUEUE_VIDEO_DECODE_BIT_KHR != 0 {
+            const operations = video[index].videoCodecOperations
+            if operations & (vk.VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR | vk.VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR) != 0 {
+                h264.* = operations & vk.VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR != 0
+                h265.* = operations & vk.VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR != 0
+                return index
+            }
+        }
+        index += 1
+    }
+    return NONE_FAMILY
+}
+
 // Creates the instance and a device with one compute-capable queue on
-// `driver` (opened with std.vulkan.loader).
+// `driver` (opened with std.vulkan.loader), and the video decode queue
+// when asked for.
 pub fn open(context: *Context, driver: loader.Driver, options: *const Options, allocator: Allocator) -> Status {
     context.*.allocator = allocator
     context.*.driver = driver
@@ -175,6 +221,10 @@ pub fn open(context: *Context, driver: loader.Driver, options: *const Options, a
     context.*.dmaBufExport = false
     context.*.hostMemory = false
     context.*.hostAlignment = 4096
+    context.*.videoFamily = NONE_FAMILY
+    context.*.videoQueue = 0
+    context.*.videoH264 = false
+    context.*.videoH265 = false
     context.*.trace = options.*.trace
     context.*.pending = false
     context.*.diagnostics = 0
@@ -208,19 +258,34 @@ pub fn open(context: *Context, driver: loader.Driver, options: *const Options, a
     unsafe { _ = vk.enumeratePhysicalDevices(context.*.instanceCommands, instance, &physical_count, &physical_devices) }
     var chosen = false
     var device_index: u32 = 0
-    while device_index < physical_count && !chosen {
+    while device_index < physical_count && !(chosen && (!options.*.wantVideo || context.*.videoFamily != NONE_FAMILY)) {
         var families: [16]vk.QueueFamilyProperties = undefined
         var family_count: u32 = 16
         step(context, "vkGetPhysicalDeviceQueueFamilyProperties")
         vk.getPhysicalDeviceQueueFamilyProperties(context.*.instanceCommands, physical_devices[device_index], &family_count, &families)
+        var compute_family = NONE_FAMILY
         var family: u32 = 0
-        while family < family_count && !chosen {
-            if families[family].queueFlags & vk.QUEUE_COMPUTE_BIT != 0 {
-                context.*.physical = physical_devices[device_index]
-                context.*.family = family
-                chosen = true
-            }
+        while family < family_count {
+            if families[family].queueFlags & vk.QUEUE_COMPUTE_BIT != 0 && compute_family == NONE_FAMILY { compute_family = family }
             family += 1
+        }
+        if compute_family == NONE_FAMILY {
+            device_index += 1
+            continue
+        }
+        var video_family = NONE_FAMILY
+        var h264 = false
+        var h265 = false
+        if options.*.wantVideo { video_family = videoFamily(context, physical_devices[device_index], family_count, &h264, &h265) }
+        // The first device with a compute queue, unless a later one also
+        // decodes video and this one does not.
+        if !chosen || (options.*.wantVideo && context.*.videoFamily == NONE_FAMILY && video_family != NONE_FAMILY) {
+            context.*.physical = physical_devices[device_index]
+            context.*.family = compute_family
+            context.*.videoFamily = video_family
+            context.*.videoH264 = h264
+            context.*.videoH265 = h265
+            chosen = true
         }
         device_index += 1
     }
@@ -251,9 +316,9 @@ pub fn open(context: *Context, driver: loader.Driver, options: *const Options, a
         memory_type += 1
     }
 
-    // Device extensions: the caller's, plus dma-buf sharing when wanted and
-    // supported.
-    var names: [12][*]const u8 = undefined
+    // Device extensions: the caller's, plus dma-buf sharing and video
+    // decoding when wanted and supported.
+    var names: [20][*]const u8 = undefined
     var name_count: u32 = 0
     var extension: u32 = 0
     while extension < options.*.deviceExtensionCount && name_count < 8 {
@@ -289,14 +354,66 @@ pub fn open(context: *Context, driver: loader.Driver, options: *const Options, a
             if host_properties.minImportedHostPointerAlignment > 0 { context.*.hostAlignment = host_properties.minImportedHostPointerAlignment }
         }
     }
-    var queue_info = vk.DeviceQueueCreateInfo.init()
-    queue_info.queueFamilyIndex = context.*.family
-    queue_info.queueCount = 1
-    var priority: u32 = 1065353216 // 1.0f
-    unsafe { queue_info.pQueuePriorities = @ptrCast([*]const f32, &priority) }
+    var synchronization2 = vk.PhysicalDeviceSynchronization2Features.init()
+    synchronization2.synchronization2 = vk.TRUE
     var device_info = vk.DeviceCreateInfo.init()
+    if context.*.videoFamily != NONE_FAMILY {
+        var video_queue: [*]const u8 = undefined
+        var decode_queue: [*]const u8 = undefined
+        var decode_h264: [*]const u8 = undefined
+        var decode_h265: [*]const u8 = undefined
+        var sync2: [*]const u8 = undefined
+        unsafe {
+            video_queue = @ptrCast([*]const u8, vk.KHR_VIDEO_QUEUE_EXTENSION_NAME)
+            decode_queue = @ptrCast([*]const u8, vk.KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME)
+            decode_h264 = @ptrCast([*]const u8, vk.KHR_VIDEO_DECODE_H264_EXTENSION_NAME)
+            decode_h265 = @ptrCast([*]const u8, vk.KHR_VIDEO_DECODE_H265_EXTENSION_NAME)
+            sync2 = @ptrCast([*]const u8, vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME)
+        }
+        if hasDeviceExtension(context, video_queue) && hasDeviceExtension(context, decode_queue) && (context.*.videoH264 && hasDeviceExtension(context, decode_h264) || context.*.videoH265 && hasDeviceExtension(context, decode_h265)) {
+            names[name_count] = video_queue
+            names[name_count + 1] = decode_queue
+            name_count += 2
+            if context.*.videoH264 && hasDeviceExtension(context, decode_h264) {
+                names[name_count] = decode_h264
+                name_count += 1
+            } else {
+                context.*.videoH264 = false
+            }
+            if context.*.videoH265 && hasDeviceExtension(context, decode_h265) {
+                names[name_count] = decode_h265
+                name_count += 1
+            } else {
+                context.*.videoH265 = false
+            }
+            // The video queue needs synchronization2: the feature, and the
+            // extension on a device before 1.3.
+            if hasDeviceExtension(context, sync2) {
+                names[name_count] = sync2
+                name_count += 1
+            }
+            device_info.pNext = &synchronization2
+        } else {
+            context.*.videoFamily = NONE_FAMILY
+            context.*.videoH264 = false
+            context.*.videoH265 = false
+        }
+    }
+    var queue_infos: [2]vk.DeviceQueueCreateInfo = undefined
+    queue_infos[0] = vk.DeviceQueueCreateInfo.init()
+    queue_infos[0].queueFamilyIndex = context.*.family
+    queue_infos[0].queueCount = 1
+    var priority: u32 = 1065353216 // 1.0f
+    unsafe { queue_infos[0].pQueuePriorities = @ptrCast([*]const f32, &priority) }
     device_info.queueCreateInfoCount = 1
-    device_info.pQueueCreateInfos = &queue_info
+    if context.*.videoFamily != NONE_FAMILY && context.*.videoFamily != context.*.family {
+        queue_infos[1] = vk.DeviceQueueCreateInfo.init()
+        queue_infos[1].queueFamilyIndex = context.*.videoFamily
+        queue_infos[1].queueCount = 1
+        unsafe { queue_infos[1].pQueuePriorities = @ptrCast([*]const f32, &priority) }
+        device_info.queueCreateInfoCount = 2
+    }
+    device_info.pQueueCreateInfos = &queue_infos
     device_info.enabledExtensionCount = name_count
     unsafe { device_info.ppEnabledExtensionNames = @ptrCast([*]const [*]const u8, &names) }
     var device: vk.Device = 0
@@ -309,6 +426,12 @@ pub fn open(context: *Context, driver: loader.Driver, options: *const Options, a
     step(context, "vkGetDeviceQueue")
     vk.getDeviceQueue(context.*.commands, device, context.*.family, 0, &queue)
     context.*.queue = queue
+    if context.*.videoFamily != NONE_FAMILY {
+        var video_queue: vk.Queue = 0
+        step(context, "vkGetDeviceQueue (video)")
+        vk.getDeviceQueue(context.*.commands, device, context.*.videoFamily, 0, &video_queue)
+        context.*.videoQueue = video_queue
+    }
 
     // One command buffer, fence and descriptor pool, reused every frame.
     var pool_info = vk.CommandPoolCreateInfo.init()

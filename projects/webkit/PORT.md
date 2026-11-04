@@ -460,6 +460,122 @@ mlx-cc compiles both as released now:
   layout 44 of 44, paint 19 of 19, storage 63 of 63, network 37 of 37,
   crypto 231 of 231, compositing 103 of 103, webgl 62 of 62,
   check_voyager.sh, check_webkit_upstream.sh.
+- **M8, part 6** (JavaScriptCore's JIT finished): WebCore's CSS selector
+  JIT is on (`ENABLE_CSS_SELECTOR_JIT`, as WebKit has it with the JIT on
+  x86-64). The selector it compiled for `:root::view-transition` crashed
+  on the saved en.wikipedia.org/wiki/WebKit page, a pointer read a byte
+  off: the compiler's StackAllocator (cssjit/StackAllocator.h) computes
+  `stackReference - stackUnitInBytes()`, a StackReference converting to
+  unsigned, and mlx-cc took LayoutUnit's `operator-(int, const
+  LayoutUnit &)` for it (the class through its conversion, the unsigned
+  through LayoutUnit's converting constructor) instead of the built-in
+  subtraction: popAndDiscardUpTo's offsets came out in LayoutUnit's
+  sixty-fourths, the generated code addressed its stack slots wrongly.
+  mlx-cc weighs the built-in operator as a candidate now
+  ([over.match.oper]; epoch 40, test builtinoperatorcandidate), with the
+  fixes B3, Air, the FTL and WebAssembly's sources needed (the epoch's
+  list in compiler/cc/epoch.mlx). The Wikipedia page lays out with the
+  selector JIT as without the JIT (its render tree the same), in 40 s.
+  Checks: layout 44 of 44, paint 19 of 19, storage 63 of 63, network 37
+  of 37, crypto 231 of 231, compositing 103 of 103, webgl 62 of 62,
+  check_voyager.sh, check_cpp.sh (585 programs), check_jsc_mlxlibc.sh,
+  check_webkit_upstream.sh.
+
+  An exception thrown in JIT code escaped its `try` (a direct eval's, a
+  `replace` callback's, a JSON reviver's, a sort comparator's once the
+  caller was compiled): mlx-cc made every JIT operation's
+  `ExceptionOperationResult` through ExceptionOperationImplicitResult's
+  conversion to a bare `T` (the value alone, the exception flag lost)
+  instead of its conversion to `ExceptionOperationResult<T>`; and
+  `c ? T(a) : T(b)` moved the branch's temporary into the result by its
+  bytes, so the DFG's `Vector<CallVariant, 1>` of a call's status
+  pointed into a dead temporary's inline buffer and libpas freed it
+  (handleArraySort). Epoch 41 (conversiontemplateordering,
+  conditionalinlinebuffer); tests/jsc/exceptions.js
+  (check_jsc_mlxlibc.sh) throws each 3000 times.
+
+  The rare stop of webcore-dump on a CheckedPtr to a dead ScheduledTask
+  of the generic RunLoop's timer tree (about one run in 30 of crypto's
+  RSA key generation, with or without the JIT) is WebKit's, not a
+  miscompilation: RedBlackTree::remove takes a node out but leaves its
+  m_left and m_right, CheckedPtrs, at the children it had; when one of
+  those children's timer is destroyed, WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR
+  finds it still counted (scribbles and leaks it), and the removed task's
+  next insert releases the dead child. Three timers do it every time
+  (tests/wtf-runloop.cpp, built as `webkit-wtf-runloop`; WebKit's main
+  branch has the same `remove`). port/wtf/RunLoopGenericMlx.cpp compiles
+  RunLoopGeneric.cpp with an explicit specialization of the tree's
+  `remove` for the run loop's tasks (WebKit's body, then the node's
+  reset), declared before its first use; wtf-runloop's 20000 random
+  timer steps pass (check_jsc_mlxlibc.sh), and crypto's five RSA
+  key-generation tests passed 150 runs of 150.
+
+  fast/selectors: tools/check_webkit_mlx_selectors.sh runs the
+  dumpAsText tests of WebKit's fast/selectors that pass
+  (tests/layout/selectors.txt: 219 of the 251 that dump text) with the
+  selector JIT. The other 32 fail with or without the JIT, for what
+  webcore-dump's test runner lacks: eventSender (:hover, :active, access
+  keys), UIHelper, internals' style invalidation counters and selector
+  filter hashes, an active and focused window (:focus-within,
+  :focus-visible, setWindowIsKey, read-only inputs), a harness file of
+  imported/w3c (selector-aliases.html); three print a blank line or a
+  word apart from the expected text. A test has 180 s there:
+  case-insensitive-attribute-register-requirement-1.html, right but
+  slow, takes about 56 s (the runner's default is 60) because each of
+  its 973 checks adds a line to the document and its next
+  getComputedStyle resolves the style of the whole, longer document:
+  seven tenths of a profile in Style::TreeResolver, three tenths of
+  all the samples libpas' allocation (below, "What M8's fifth part
+  leaves").
+
+  The FTL (B3 and Air) and WebAssembly are on (`ENABLE_FTL_JIT`,
+  `ENABLE_WEBASSEMBLY`, `_BBQJIT`, `_OMGJIT`, as WPE has them on x86-64;
+  WebKit's B3 needs WebAssembly's headers, so the two go together): the
+  in-place interpreter (IPInt, offlineasm's X86_64 back end with its
+  SIMD), BBQ and OMG, bounds checks by the fault handler (a signal on
+  the 4 GB reservation). What it took, epoch 42 (each with a test of
+  compiler/cc/tests): the inline assembler's VEX.128 packed instructions
+  and SSE4.1's pmovsx/pmovzx (every form of LLIntAssembly.h's encoded as
+  GNU as encodes it; asmavx); offlineasm's 64-bit truncation constants
+  as Ruby has them; directives among a macro call's arguments
+  (WasmBBQJIT.cpp's `#if CPU(X86_64)` in EMIT_BINARY); a constrained
+  parameter's concept by its namespace's name (FTLLowerDFGToB3.cpp's
+  `isFunction Func1` beside a member function isFunction); a constexpr
+  local made by a class's constexpr conversion (`std::is_signed<T>()`);
+  a function by value against a template's `const T &` for an rvalue;
+  `extern "C"` kept beside C++ overloads (runWebAssemblySuspendingFunction,
+  which IPInt calls); no code after a return, break or goto up to a label
+  (B3LowerMacros.cpp calls the 32-bit ARM's Math::i64_div_u after `if
+  constexpr (!isARM_THUMB2()) break;`); a qualified call weighs its
+  namespace's functions only (simdutf's scalar UTF-8 length called
+  itself through `using namespace simdutf;` in an unnamed namespace);
+  a lambda in a lambda holds the class's `this` (OMG's patchpoint
+  generators ran after their outer lambdas); `reinterpret_cast<void *&>
+  ((uintptr_t &) gregs[REG_RIP]) = ...` writes the register (the fault
+  handler returned to the faulting load for ever); a generic lambda's
+  parameters hide the function's locals from `[=]` (B3's CheckSpecial
+  copied the CCallHelpers and freed its buffer twice); a const integer
+  local's speculative read leaves no temporaries (the FTL's OSR exit
+  destroyed a RefPtr never made); mlxlibcpp's ranges projections through
+  pointer elements (Air sorted its stack slots unsorted, and spills took
+  the callee saves' places). tests/jsc/wasm.js (modules made byte by
+  byte: the tiers, traps, the fault handler, memory.grow, tables,
+  imports, SIMD) prints what node does; check_jsc_mlxlibc.sh runs every
+  script again with the tiers early (the FTL after 40 runs, BBQ after 10
+  calls, OMG after 20) and with eager compilation. Numbers: bench.js
+  1.2 to 1.3 s with the FTL as without it (each section is too short for the FTL to pay; 1.05 s at M8's fifth part, the noise of this machine since); a hot numeric kernel 260 ms with the DFG, 214 ms with the FTL;
+  bench.html in webcore-dump 1.1 to 1.4 s; the saved Wikipedia page in 48 s with the FTL as without it, its render tree the same (40 s at the selector JIT; style, layout and libpas' allocation are its time, JavaScript a fifth). Checks: layout 44 of 44, paint 19 of 19,
+  storage 63 of 63, network 37 of 37, crypto 231 of 231, compositing 103
+  of 103, webgl 62 of 62, selectors 219 of 219, check_voyager.sh,
+  check_cpp.sh (597 programs), check_cc.sh, check_jsc_mlxlibc.sh,
+  check_webkit_upstream.sh.
+
+  mlx-codemap knew little of JavaScriptCore's JIT: a header's shard of
+  the index is written by the first unit that reads it, and the first
+  to read LinkBuffer.h had the assembler off (one `#if
+  ENABLE(ASSEMBLER)` line of it). mlx-cc counts what each file's false
+  groups leave out (an `S` record) and writes a shard again when a unit
+  leaves out less (tools/check_codemap_cpp.sh, arcs.h).
 - **Real sites** (after M6): news.ycombinator.com, en.wikipedia.org,
   www.wikipedia.org, info.cern.ch, example.com, google.com and
   lite.duckduckgo.com load and paint at webcore-dump's 1280x800 (the
@@ -585,7 +701,7 @@ port in the tarball that builds WebCore without GLib).
 
 | | Choice | Why |
 |---|---|---|
-| Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
+| Event loop | `USE_GENERIC_EVENT_LOOP` (RunLoopGeneric.cpp, through port/wtf/RunLoopGenericMlx.cpp, WorkQueueGeneric.cpp, MainThreadGeneric.cpp; JSCOnly's lists/wtf.txt) | No GLib; the generic loop is WTF's own code, timers included |
 | Graphics | `USE_SKIA`, CPU raster; no `USE_CAIRO` | Skia compiles here already (`webkit-skia`); WebCore's only living 2D back end besides Cairo (GTK/WPE moved to Skia); CPU first, no EGL |
 | Compositing | `USE_COORDINATED_GRAPHICS` and `USE_TEXTURE_MAPPER` on (since M8), layers composited on the GPU by TextureMapper over ANGLE's GLES (since M8's third part), on the CPU by `SkiaCompositingLayer` without a Vulkan device or on a CPU's (lavapipe), unless `MLX_COMPOSITING=gpu`; asynchronous scrolling on a scrolling thread | WPE's and GTK's layers, tiles, TextureMapper and scrolling tree as they are ("Compositing") |
 | WebGL | `ENABLE_WEBGL` and `USE_ANGLE` (since M8): `GraphicsContextGLANGLE` with the port's GraphicsContextGLMlx, ANGLE on Vulkan (libmlxvulkan.so) | ANGLE is WebKit's WebGL everywhere; Vulkan is what std.gpu speaks, and lavapipe runs it without a GPU ("WebGL") |
@@ -597,8 +713,9 @@ port in the tarball that builds WebCore without GLib).
 | Text | `USE_ICU` through mlx-unicode | below |
 | Theme | `USE_THEME_ADWAITA` (the class RenderTheme::singleton() is, ScrollbarThemeAdwaita: GraphicsContext drawing, light and dark; their GLib resources under `USE(GLIB)`), with the port's members and controls in std.ui.theme's colours (below, "The theme"); `ENABLE_DARK_MODE_CSS` (the page's dark appearance: the embedder's `Page::setUseColorAppearance`) | WebKit's own non-native theme, which has the dark variant the desktop's scheme asks for |
 | Crypto | PAL's digests ours (std.sha1, std.sha2: `port/pal/CryptoDigestMlx.cpp`); WebCrypto, which 2.54 always compiles (there is no `ENABLE_WEB_CRYPTO` any more), is the port's `crypto/mlx` over std.crypto, std.aes, std.asn1 and std.random (M7: "Compression, WOFF, crypto") | no libgcrypt, no libtasn1 |
-| Off | `ENABLE_VIDEO`, `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
-| JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; no FTL (B3/Air), no WebAssembly; `ENABLE_CSS_SELECTOR_JIT` off ("What M8's fifth part leaves") | JavaScriptCore's own tiers on x86-64, made by the port's own toolchain: bench.js runs in 1.05 s, 8.4 s with the C loop (below) |
+| Media | `ENABLE_VIDEO`, `ENABLE_MEDIA_SOURCE` and `ENABLE_MEDIA_SESSION` (since M8's media part): the port's own engine, MediaPlayerPrivateMlx (below, "Media"), over std.mp4, std.aac, std.h264, std.gpu.video (Vulkan video) and std.audio through the Mlx side | the audio and video elements, Media Source Extensions (YouTube's player), no GStreamer |
+| Off | `ENABLE_WEB_AUDIO`, `ENABLE_MEDIA_STREAM`, `ENABLE_WEB_RTC`, `ENABLE_ENCRYPTED_MEDIA`, `ENABLE_WEBXR`, `ENABLE_GAMEPAD`, `ENABLE_SPEECH_SYNTHESIS`, `ENABLE_SPELLCHECK`, `ENABLE_XSLT`, `ENABLE_DRAG_SUPPORT` (until M5), `ENABLE_REMOTE_INSPECTOR`, `ENABLE_NOTIFICATIONS`, `ENABLE_GPU_PROCESS`, `USE_GSTREAMER`, `USE_ATSPI`, `USE_LIBWPE`, `USE_GBM`, `USE_LIBDRM`, `USE_AVIF`, `USE_JPEGXL`, `USE_WOFF2` | media, devices and accessibility come after the page itself |
+| JavaScript | `ENABLE_JIT` and `ENABLE_DFG_JIT` (since M8's fifth part): the LLInt in x86-64 assembly (offlineasm's X86_64 back end, which mlx-cc assembles), the Baseline JIT and the DFG; `ENABLE_FTL_JIT` and `ENABLE_WEBASSEMBLY` with BBQ and OMG (since M8's sixth part): the FTL (B3 and Air), WebAssembly's in-place interpreter and tiers, bounds checks by the fault handler; WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, since M8's sixth part) | JavaScriptCore's own tiers on x86-64, as WPE has them, made by the port's own toolchain: bench.js runs in 1.2 s, 8.4 s with the C loop (below) |
 
 ### WTF, bmalloc, JavaScriptCore
 
@@ -608,8 +725,28 @@ As M1 has them: JSCOnly's sources (lists/wtf.txt: `generic/`,
 `MemoryPressureHandlerUnix`, `LanguageUnix`, `TimeZone.cpp` with mlx-unicode
 and std.timezone, `TextBreakIteratorInternalICUUnix`.
 
+**Memory.** bmalloc's libpas is WebKit's allocator, as upstream has it
+(`USE_SYSTEM_MALLOC` off). libpas is written for a compiler that inlines
+its `PAS_ALWAYS_INLINE` chains and folds its heap configuration (a 1 KiB
+struct built as a compound literal at every use, passed by value down
+ten levels) to constants. mlx-cc built that configuration on the stack
+at every call: one allocation with its free cost 12 µs, and a Google
+page spent 60% of its time in fastMalloc and fastFree. mlx-cc now folds
+the configuration's loads in the shared LIR (region loads,
+compiler/cc/README.md) and packs the frame's places that are left: the
+allocation and free fast paths keep no copy and no zeroing of it, their
+frames go from 20 to 25 KiB to 0.5 to 1.2 KiB, and an allocation with its
+free costs 290 ns (a loop of 4 million allocations of 16 to 240 bytes;
+mlxlibc's malloc 217 ns). With WebCore and JavaScriptCore as they were,
+libpas and WTF compiled again: the saved Wikipedia page in webcore-dump
+in 6 s instead of 21 s, its render tree the same; bench.html in 1.2 s
+instead of 30 s. (`USE_SYSTEM_MALLOC` was on for a day as the way
+around it.)
+
 **The main loop.** WebCore and the embedder run on the main thread's
-`RunLoop` (RunLoopGeneric: a condition variable, a tree of timers). The
+`RunLoop` (RunLoopGeneric: a condition variable, a tree of timers;
+port/wtf/RunLoopGenericMlx.cpp compiles WebKit's file with its tree's
+`remove` leaving the removed task unlinked, M8's sixth part). The
 port's I/O (the Wayland socket, network sockets, file watchers) is waited
 for by one thread of the port's Mlx side on std.linux's epoll, timerfd
 and eventfd, which hands each ready source to the main thread with
@@ -990,11 +1127,14 @@ ScrollbarThemeAdwaita's (overlay scrollbars in the scheme's grey).
 
 ### Forced dark mode
 
-A page with no dark design of its own is painted dark on a dark desktop,
-always (Voyager has no button, key or setting for it: it follows the
-desktop's scheme, as it does for its toolbar and for the pages'
-`prefers-color-scheme`; on a light desktop pages are painted as they
-are), as Chrome's "Auto Dark Mode for Web Contents" does, by the port's
+With forced dark on, a page with no dark design of its own is painted
+dark on a dark desktop (on a light desktop pages are painted as they
+are; with it off, the default, a page keeps its own look and only gets
+`prefers-color-scheme: dark`). Voyager's setting is `force-dark = on` in
+`$XDG_CONFIG_HOME/mlx/voyager.conf`, switched (and written) by
+Ctrl+Shift+D, `VOYAGER_FORCE_DARK=1` or `0` overriding it; the engine
+gets it with the desktop's scheme (`setDark`'s bit 1). It works as
+Chrome's "Auto Dark Mode for Web Contents" does, by the port's
 painting layer (`MlxDarkMode.h`), not by WebKit: the embedder paints the
 view through `MlxDarkModeCanvas`, a Skia canvas (an `SkNWayCanvas` in
 front of the target) whose draws change their paint: a solid colour
@@ -1443,6 +1583,206 @@ the Mlx side's port/mlx/crypto.mlx (MlxWebPort.h's `mlxweb_crypto_*`):
 | Localized strings | `LocalizedStringsMlx.cpp` (English first) |
 | Memory pressure | WTF's Unix handler; the compositor's memory notices later |
 
+### Media
+
+`ENABLE_VIDEO` and `ENABLE_MEDIA_SOURCE` are on; the engine is the
+port's own, registered by `MlxPlatformStrategies::initialize` through
+`MediaPlayerFactorySupport::callRegisterMediaEngine` (WebKit's own hook
+for an engine of the embedder's): `port/platform/graphics/mlx/MediaPlayerPrivateMlx`
+(the MediaPlayerPrivateInterface), `MediaSourcePrivateMlx` and
+`SourceBufferPrivateMlx` (WebCore's generic SourceBufferPrivate does the
+track buffers, the coded frame processing and eviction; the port's
+subclass parses what a page appends and hands the samples back to the
+player), `MediaSampleMlx.h` (a sample's bytes and times, the tracks and
+descriptions of an initialization segment). It plays MP4: H.264
+(`avc1`, `avc3`) and AAC-LC (`mp4a.40.2`; HE-AAC as its core) in
+`video/mp4`, `audio/mp4` and `audio/aac`, which is what YouTube serves
+through MSE besides VP9/AV1 in WebM, and what a GPU of the RX 580's
+generation decodes; H.265 (`hvc1`, `hev1`, Main and Main 10) on a
+device's video decoder when it takes it, else on the CPU
+(std.h265.decode, below).
+
+The Mlx side (port/mlx/media.mlx, `mlxweb_media_*` and `mlxweb_audio_*`)
+is std.mp4 (the demuxer: a whole file's sample tables with seeking, or
+an initialization segment and media segments with the samples of each
+`moof`), std.aac (the decoder, 1024 float samples per channel and block),
+std.h264 (parameter sets, slice headers, picture order counts, the
+reference marking and the decoded picture buffer: what a decoder that
+takes whole pictures, the GPU's through std.vulkan's video extensions,
+needs per access unit) and std.audio (a playback stream on MLX Audio
+over its MLXIPC channel: `write` blocks as the server takes the frames).
+
+The desktop's media controls see Voyager as an MPRIS player on MLXIPC:
+port/mlx/mediasession.mlx owns `org.mpris.MediaPlayer2.voyager` and
+answers the Properties, Player and root interfaces in MLXIPC's own
+format (std.ipc; the bus carries them to the top bar, a D-Bus client),
+and `MediaSessionMlx` (port/platform/mlx) tells it what plays from
+WebCore's media sessions (the pages' managers' current session and its
+NowPlayingInfo: the title, duration, position, whether it seeks; the
+embedder registers its pages) and polls it from the main thread for the
+controls' commands, which go to the session as remote control commands
+(play, pause, toggle, stop, next, previous, seek) that the media
+element carries out; Raise shows the tab that plays (the engine's
+`raised` poll, as `opened`). A player that stopped leaves the bus after
+half a minute. With ENABLE_MEDIA_SESSION on, a page's MediaSession
+(navigator.mediaSession: YouTube's title, artist and artwork, its
+nexttrack and previoustrack handlers, which CanGoNext and
+CanGoPrevious tell) is what the controls show and command; without
+one, the title is the document's. The artwork WebCore loaded (or the
+page's icon) is written once per track as a PNG under
+`$XDG_RUNTIME_DIR` (`mlxweb_media_session_cover`: voyager-cover-PID-N.png,
+the one before deleted, the last on close) and told as a file://
+mpris:artUrl, the form the top bar's popup shows.
+
+A video or audio element's `controls` are WebKit's modern media
+controls: RenderThemeMlx gives WebCore their script and style sheet
+from the user agent bundles the build makes of
+Modules/modern-media-controls, and their icons from files (the
+directory `MLX_WEBKIT_MEDIA_ICONS` names, else the source tree's
+`images/adwaita` under the working directory, else
+`/usr/share/mlx/voyager/media-controls`).
+`tools/check_mpris.sh` runs the player on mlx-ipcd against dbus-send,
+gdbus and dbus-monitor (the properties, the commands, the signals).
+
+A plain file is loaded whole through the player's resource loader
+(WebCore's MediaResourceLoader over the port's loader strategy) and
+demuxed; a media source's samples come from its source buffers. Sound
+runs on a thread of the player's: it decodes the next audio sample and
+hands it to MLX Audio, which paces it; the frames handed over, less the
+stream's latency, are the clock the video follows and `currentTime()`
+reports (without an audio track, the monotonic time since play). Video
+runs on a thread of its own too: the samples go through std.h264's
+picture order as they come (one picture ahead) and are decoded by the
+GPU's video decoder (`mlxweb_video_*`: std.gpu.video over
+std.vulkan's VK_KHR_video_decode_h264, on the first driver whose device
+has a video decode queue; RADV's UVD on the RX 580, which RADV
+offers only with `RADV_EXPERIMENTAL=video_decode` in the environment,
+`RADV_PERFTEST=video_decode` in Mesa before 26, as UVD's decoding stays
+experimental there: the player sets both before it opens the driver,
+unless the environment has them; VCN's is on by itself since Mesa 24.2): each
+picture's slices go to a
+Vulkan video session, the decoded picture buffer is one layered image,
+every picture is read back after its decode (NV12 into a buffer of the
+device's) and every frame due is converted to BGRA by std.gpu's nv12
+kernel, read back and, at its presentation time (the sample's, by the
+slot it was decoded into; a seek drops the frame waiting), handed to
+the layer as a NativeImage (`CoordinatedPlatformLayerBufferNativeImage`),
+also kept for `paint`.
+Without a decoding device the pictures are decoded on the CPU by
+std.h264.decode (below), into the same slots, converted to BGRA with the
+same matrix (std.gpu.video's `streamColour` and `convertI420`) and shown
+the same way; `MLX_VIDEO_DECODER=cpu` takes the CPU's even with a
+device, `MLX_VIDEO_DECODER=gpu` the GPU's only (without a device the
+video's box is then black: a black frame of its size handed to the
+layer, and the frames are counted). `examples/vulkan-decode` decodes a
+file on the device alone.
+
+std.h264.decode (std/src/h264/decode.mlx, with std/src/h264/bits.mlx and
+the tables of std/src/h264/tables.mlx) decodes the pictures std.h264
+starts, slice by slice: CAVLC and CABAC, I, P and B slices (every
+macroblock and sub-macroblock type, direct prediction spatial and
+temporal, B_Skip), intra 4x4, 8x8 and 16x16 prediction, the 4x4 and 8x8
+transforms with scaling matrices, weighted prediction explicit and
+implicit, the deblocking filter; Baseline, Main and High profile 4:2:0
+8-bit frames (field pictures and MBAFF are refused). It decodes the ITU's
+conformance streams of those profiles bit-exact (BA*, CABA*, CANL, CAPCM,
+CAQP, CAWP, CVWP, CVBS, CVSE, MIDR, MPS, MR1, NRF, SVA), and x264's High
+profile streams (8x8 transform, pyramid B, temporal direct, weighted
+P/B, slices) as ffmpeg does; tests/422_h264_cpu_decode_runtime.mlx
+checks test.mp4's output. A slice that cannot be decoded leaves its
+macroblocks concealed (the first reference's samples, or grey) and the
+picture's other slices decoded. The player decodes on a pool of threads
+(std.h264.decode's `Pool`, frame threading: one per processor but the
+caller's, at most 16, or `MLX_VIDEO_THREADS`): the caller's thread reads
+each picture's slice headers and builds its reference lists, a worker
+decodes it, its motion compensation waiting for the rows of a reference
+still being decoded (each picture's rows are filtered and published as
+they are done) and its direct prediction for the colocated motion; a slot
+is written again only when the pictures reading it are done, and
+pictures given out wait in the pool, their slots held by std.h264
+(`holdOutputs`), until decoded (`mlxweb_video_next_output`). On one
+thread 320x240 decodes at about 180 pictures a second and 1080p High at
+about 7; four processors decode 1080p about three times as fast, and the
+pool grows with the processors.
+
+std.h265.decode (std/src/h265/decode.mlx, with the standard's tables in
+std/src/h265/tables.mlx) decodes the pictures std.h265 starts the same
+way: the Main and Main 10 profiles
+(4:2:0 and 4:0:0, 8 to 10 bits, every picture size the levels allow, to
+8192x4320), I, P and B slices, slice segments dependent and not, tiles
+and wavefront substreams, the coding quadtree with CABAC, intra
+prediction (planar, DC, the 33 angles, the reference substitution and
+smoothing, constrained intra), inter prediction (merge with spatial,
+temporal, combined and zero candidates, the parallel merge level, AMVP,
+temporal motion vectors from the collocated picture, the 8-tap and
+4-tap interpolation, weighted prediction default and explicit),
+asymmetric partitions, PCM, transform skip, lossless coding units,
+scaling lists, sign data hiding, the DST and the inverse transforms to
+32x32, the deblocking filter and SAO. It decodes the 143 streams of the
+ITU's HEVC_v1 conformance suite that are Main or Main 10 (AMP, AMVP,
+CAINIT, CIP, CONFWIN, DBLK, DELTAQP, DSLICE, ENTP, EXT, FILLER, HRD,
+INITQP, IPRED, ipcm, LS, LTRPSPS, MAXBINS, MERGE, MVCLIP, MVDL1ZERO,
+MVEDGE, NoOutPrior, NUT, OPFLAG, PMERGE, POC, PPS, PS, RAP, RPLM, RPS,
+RQT, SAO, SAODBLK, SDH, SLICES, SLIST, SLPPLP, STRUCT, TILES, TMVP,
+TSCL, TSKIP, TSUNEQBD, TUSIZE, VPSID, VPSSPSPPS, WP, WPP) bit-exact,
+the yuv MD5s they come with; tests/424_h265_cpu_decode_runtime.mlx
+checks a Main 10 stream's output. Samples are 16-bit whatever the
+depth; `planes8` rounds them to 8 bits for the player's conversion.
+The loop filters run a CTB row behind the decoding (the row below's
+intra prediction reads the unfiltered samples), SAO a row behind the
+deblocking, so that a picture's rows are final as it goes (with tiles,
+at its end). Its `Pool` is std.h264.decode's design: the caller's
+thread reads the slice segment headers and builds the reference lists,
+a worker decodes the picture, waiting for the reference rows its motion
+compensation reads and for the collocated picture's motion rows. One
+thread decodes x265's 1080p at about 7 pictures a second, three about
+12.
+`MLX_TRACE_MEDIA=1` traces the players on standard error ("media: ..."):
+the codecs a page asks about, loads, tracks, ready and network states,
+play, pause, seeks, the decoder opened (the GPU's or the CPU's) or not, every 120th frame's
+counts and the end.
+tools/check_voyager.sh's scenario 26 plays WebKit's test.mp4 (6 s of
+H.264 with a silent AAC track) by itself in Voyager
+(projects/voyager/tests/media.html: the page turns green on `playing`,
+blue on `ended`, and tells the end's time in its title; its H.265
+twin, hevc.html, plays a small hvc1 file decoded by std.h265.decode).
+Scenario 27 types into two text areas and presses Backspace in each
+(edit.html): the typing style copies the computed font-family, which
+must hold no null family (the CSS value pool's key). The top area's is a
+generic family, whose names are WebCore's name tables, which
+`MlxPlatformStrategies::initialize` sets up as WebKit's process warming
+does (`ProcessWarming::initializeNames`; without them `sans-serif` was
+a null string: Google's search box); the bottom one's is
+`-webkit-body`, the page settings' standard family, which Voyager's
+engine sets with the other generic families' to Fontconfig's aliases
+(`serif`, `sans-serif`, `monospace`, ...: what the port's FontCache gives
+them anyway; WebCore's defaults are empty, and an empty standard family
+was a null string: YouTube's search box).
+
+On a machine with a video decoder (RADV's RX 580: Voyager asks RADV for
+it, see above; vulkaninfo and vulkan-decode need
+`RADV_EXPERIMENTAL=video_decode` exported), the stack is tried bottom up:
+
+    vulkaninfo | grep VK_KHR_video_decode_h264      # the extension is there
+    ./mlx build examples
+    mlx-out/bin/vulkan-decode --trace projects/webkit/upstream/Tools/TestWebKitAPI/Resources/test.mp4 out.png 50
+    ffmpeg -i some.mp4 -c:v libx265 -tag:v hvc1 hevc.mp4  # an H.265 file (any)
+    mlx-out/bin/vulkan-decode --trace hevc.mp4 hevc.png 50 # VK_KHR_video_decode_h265
+    ./mlx build webkit-mlx-voyager
+    tools/check_voyager.sh                          # scenario 26 among them
+
+(The RX 580 decodes test.mp4's 182 pictures without a failure at 236
+frames a second, 9 DPB slots of 17, the colour conversion on the GPU.)
+
+then a page with a video (a file: URL of test.mp4, then YouTube): the
+top bar shows the player (title, artist and cover from YouTube's
+MediaSession), its buttons play, pause, skip and seek, Raise shows the
+tab. Without the extension the CPU decodes the pictures
+(std.h264.decode, above).
+Seeking resets the decoders, the demuxer's cursors (to the sync sample
+before the time) and the clock; a media source's seek waits for its
+buffers (`waitForTarget`) and re-enqueues from the time.
+
 ### One process first
 
 **Recommendation: the first runnable milestones embed WebCore in
@@ -1476,7 +1816,8 @@ processes come later, if at all before Lattice.**
 
 The port's C++ reaches std through `export` functions with the C ABI.
 Most belong in the port's Mlx plugin (projects/webkit/port/mlx,
-`libmlxwebport.so`), which imports std.http, std.png and the others and
+`libmlxwebport.so`), which imports std.http, std.png, std.mp4, std.aac,
+std.h264, std.audio and the others and
 exports what the port's C++ needs in its shapes (a decoder object with
 `append`/`frame` functions, an HTTP request with callbacks): std's own
 APIs are Mlx slices and structs, not C. Rules of exports apply: an
@@ -1503,7 +1844,7 @@ port/mlx/api/MlxWebPort.mlx into the port's generated directory
 | M5 | A Voyager window | Voyager shows a page on our compositor (wl_shm buffers of std/src/wayland's client), scrolls, follows links, takes keys and the mouse (focus, text fields, selection), copies and pastes | a scripted session (key and pointer events through the compositor's test interface) and a screenshot compared |
 | M6 | The network | http and https pages load (std.http, std.tls with std.x509's chain checks), redirects, cookies, caching headers, forms, `fetch` and XHR, WebSockets | tools/check_webkit_mlx_network.sh: a local std.http server's pages over http and https (done); real sites by hand |
 | M7 | Storage and the rest of a browser's basics | local storage, IndexedDB (mlx-sqlite3), the HTTP cache on disk, WebCrypto (`crypto/mlx`), downloads, file uploads (std.fs) | WebKit's LayoutTests of those areas that run in a single process: tools/check_webkit_mlx_storage.sh and check_webkit_mlx_crypto.sh, the network check's downloads and uploads, check_voyager.sh's (done, both parts) |
-| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (std.audio, std.matroska), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done); the JIT: tools/check_jsc_mlxlibc.sh's scripts and bench.js (part 5 done: the LLInt in assembly, Baseline and DFG) |
+| M8 and on | Beyond the bootstrap | composited layers on the CPU (scrolling, animations), the JIT, media (MP4, AAC, H.264 and MSE over std.mp4, std.aac, std.h264, std.audio, the pictures decoded by the GPU through std.gpu.video: the media part), WebGL (ANGLE on std.gpu's Vulkan), accessibility (AT-SPI over std.dbus), processes per tab | composited layers: tools/check_webkit_mlx_compositing.sh, check_webkit_mlx_paint.sh's composited pages, check_voyager.sh's scenarios 22 and 23 (part 1 done); WebGL: tools/check_mlx_vulkan.sh, check_webkit_mlx_webgl.sh, check_webkit_mlx_paint.sh's WebGL pages, check_voyager.sh's scenario 24 (part 2 done); the JIT: tools/check_jsc_mlxlibc.sh's scripts and bench.js (part 5 done: the LLInt in assembly, Baseline and DFG; part 6 done: the CSS selector JIT, the FTL, WebAssembly) |
 
 M2 waits mostly on mlx-cc's C++ (WEBCORE.md: 35 of 52 sampled files
 compile); the port's sources for M2 can be written beside it, since each
@@ -1685,19 +2026,10 @@ What M2 found, and how the port meets it without a patch:
   it); there is no dialog to choose a name or a folder (Safari's default
   has none either). The file chooser has no previews.
 - **What M8's fifth part leaves** (JavaScriptCore's JIT):
-  - The FTL (B3 and Air) and WebAssembly are off: the next tiers.
-  - WebCore's CSS selector JIT (`ENABLE_CSS_SELECTOR_JIT`, which WebKit
-    turns on with the JIT) is off: a selector it compiled crashed
-    (a pointer read shifted by a byte) styling the saved Wikipedia page,
-    though the layout, paint and compositing checks passed with it.
-  - Half of the Wikipedia page's time is bmalloc's (libpas') allocation,
-    which mlx-cc compiles without inlining (about 41% of a profile with
-    the LLInt).
-  - Rarely (about one run in 30 of crypto's RSA key generation, with or
-    without the JIT), webcore-dump stops on a CheckedPtr to a dead
-    ScheduledTask in the generic RunLoop's timer tree:
-    RedBlackTree::remove leaves a removed node's children in it, and a
-    node inserted again releases them after they died.
+  - Half of the Wikipedia page's time was bmalloc's (libpas') allocation,
+    which mlx-cc compiled without folding its configuration (about 41% of
+    a profile with the LLInt; 60% of Google's): mlx-cc folds it now
+    ("Memory" above), 40 times cheaper an allocation.
 - **What M8's first part leaves** (composited layers on the CPU):
   - Voyager presents a frame on its window's thread, which is WebCore's
     main thread: the compositor composites, scrolls and animates on its

@@ -1,0 +1,260 @@
+// The calls std's files and clocks make on brixOS (host.mlx is Linux's):
+// brixOS's own. std keeps descriptor numbers, as the Linux layer gives
+// them out, and reads and writes them by their handles, which it
+// remembers; a remembered handle that a close or a dup2 made stale is
+// invalid (its generation), so it is asked for again and the call made
+// once more. The native statuses reach std's callers as the errno values
+// they check.
+const linux = @import("./linux.mlx")
+const brix = @import("./brix.mlx")
+
+pub const REALTIME: usize = 0
+pub const MONOTONIC: usize = 1
+
+const DESCRIPTORS: usize = 64
+
+var remembered: [DESCRIPTORS]u32 = undefined // (per run)
+// Where each descriptor's directory reading is: 0 before ".", 1 before
+// "..", then 2 + node_list's cookie.
+var cookies: [DESCRIPTORS]usize = undefined // (per run)
+var primed: bool = false // (per run)
+
+fn prime() -> void {
+    if primed { return }
+    var k: usize = 0
+    while k < DESCRIPTORS {
+        remembered[k] = 0
+        cookies[k] = 0
+        k += 1
+    }
+    primed = true
+}
+
+// The handle of a descriptor (0 when it is not open), asked for again
+// when `fresh`.
+fn handleFor(descriptor: isize, fresh: bool) -> u32 {
+    if descriptor < 0 || descriptor >= @intCast(isize, DESCRIPTORS) { return brix.ofDescriptor(descriptor) }
+    prime()
+    const k = @bitCast(usize, descriptor)
+    if fresh || remembered[k] == 0 { remembered[k] = brix.ofDescriptor(descriptor) }
+    return remembered[k]
+}
+
+fn forget(descriptor: isize) -> void {
+    if descriptor < 0 || descriptor >= @intCast(isize, DESCRIPTORS) { return }
+    prime()
+    remembered[@bitCast(usize, descriptor)] = 0
+    cookies[@bitCast(usize, descriptor)] = 0
+}
+
+// A streaming read or write of a descriptor through its handle.
+fn transfer(descriptor: isize, address: usize, length: usize, writing: bool) -> isize {
+    const number = if writing { brix.WRITE } else { brix.READ }
+    var result = brix.call4(number, @intCast(usize, handleFor(descriptor, false)), address, length, brix.STREAM)
+    if result == -brix.Status.invalid_handle { result = brix.call4(number, @intCast(usize, handleFor(descriptor, true)), address, length, brix.STREAM) }
+    // One the upcall came in (std.events) is made again.
+    while result == -brix.Status.interrupted { result = brix.call4(number, @intCast(usize, handleFor(descriptor, false)), address, length, brix.STREAM) }
+    return asErrno(result)
+}
+
+// Linux's open flags std passes, and how they read in node_open's.
+const O_ACCESS: usize = 3
+const O_CREAT: usize = 64
+const O_EXCL: usize = 128
+const O_TRUNC: usize = 512
+const AT_FDCWD: isize = -100
+
+// open: by node_open (brixOS's paths: /temporary, /devices, ...), its
+// handle remembered for its descriptor; flags node_open has no word for
+// (append, no-follow, directory only, ...) go to the Linux layer's open.
+pub fn open(path: [*]const u8, flags: usize, mode: usize) -> isize { return openAt(AT_FDCWD, path, flags, mode) }
+
+pub fn openAt(directory: isize, path: [*]const u8, flags: usize, mode: usize) -> isize {
+    if flags & ~(O_ACCESS | O_CREAT | O_EXCL | O_TRUNC) != 0 || flags & O_ACCESS == O_ACCESS {
+        return linux.syscall4(linux.SYS_openat, @bitCast(usize, directory), @intFromPtr(path), flags, mode)
+    }
+    var native: usize = 0
+    const access = flags & O_ACCESS
+    if access == 0 || access == 2 { native |= brix.Open.READ }
+    if access == 1 || access == 2 { native |= brix.Open.WRITE }
+    if flags & O_CREAT != 0 { native |= brix.Open.CREATE }
+    if flags & O_EXCL != 0 { native |= brix.Open.EXCLUSIVE }
+    if flags & O_TRUNC != 0 { native |= brix.Open.TRUNCATE }
+    var length: usize = 0
+    while path[length] != 0 { length += 1 }
+    var base: u32 = 0
+    if directory != AT_FDCWD { base = handleFor(directory, false) }
+    const opened = brix.call5(brix.NODE_OPEN, @intCast(usize, base), @intFromPtr(path), length, native, mode)
+    if opened < 0 { return asErrno(opened) }
+    // The handle's slot is the Linux layer's descriptor.
+    return remember(@intCast(u32, opened))
+}
+
+pub fn read(descriptor: isize, destination: usize, length: usize) -> isize { return transfer(descriptor, destination, length, false) }
+
+pub fn write(descriptor: isize, source: usize, length: usize) -> isize { return transfer(descriptor, source, length, true) }
+
+// getdents64's records, made from node_list's (".", ".." first, as the
+// Linux layer gives them; no inode numbers: 0).
+pub fn readDirectory(descriptor: isize, destination: usize, capacity: usize) -> isize {
+    if descriptor < 0 || descriptor >= @intCast(isize, DESCRIPTORS) {
+        return linux.syscall3(linux.SYS_getdents64, @bitCast(usize, descriptor), destination, capacity)
+    }
+    prime()
+    const k = @bitCast(usize, descriptor)
+    const into = unsafe { @ptrFromInt([*]u8, destination) }
+    var at: usize = 0
+    while cookies[k] < 2 {
+        const name = if cookies[k] == 0 { "." } else { ".." }
+        if !record(into, capacity, &at, name, 4, cookies[k] + 1) { return if at > 0 { @intCast(isize, at) } else { -22 } }
+        cookies[k] += 1
+    }
+    var listed: [4096]u8 = undefined
+    const room = if capacity < 4096 { capacity } else { 4096 }
+    var got = brix.call4(brix.NODE_LIST, @intCast(usize, handleFor(descriptor, false)), @intFromPtr(&listed), room, cookies[k] - 2)
+    if got == -brix.Status.invalid_handle { got = brix.call4(brix.NODE_LIST, @intCast(usize, handleFor(descriptor, true)), @intFromPtr(&listed), room, cookies[k] - 2) }
+    if got < 0 { return if at > 0 { @intCast(isize, at) } else { asErrno(got) } }
+    var offset: usize = 0
+    while offset < @bitCast(usize, got) {
+        const next = read64(&listed, offset)
+        const kind = @intCast(usize, listed[offset + 8])
+        const length = @intCast(usize, listed[offset + 12]) | (@intCast(usize, listed[offset + 13]) << 8)
+        if !record(into, capacity, &at, listed[offset + 16..offset + 16 + length], typeOf(kind), next + 2) {
+            if at == 0 { return -22 }
+            break
+        }
+        cookies[k] = next + 2
+        offset += (16 + length + 7) & ~@intCast(usize, 7)
+    }
+    return @intCast(isize, at)
+}
+
+fn read64(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var k: usize = 8
+    while k > 0 {
+        k -= 1
+        value = (value << 8) | @intCast(usize, bytes[at + k])
+    }
+    return value
+}
+
+// A getdents64 record (no inode, `next` as its offset) at `at`; false
+// when it does not fit.
+fn record(into: [*]u8, capacity: usize, at: *usize, name: []const u8, kind: u8, next: usize) -> bool {
+    const size = (19 + name.length + 1 + 7) & ~@intCast(usize, 7)
+    if at.* + size > capacity { return false }
+    const base = at.*
+    var k: usize = 0
+    while k < size {
+        into[base + k] = 0
+        k += 1
+    }
+    k = 0
+    while k < 8 {
+        into[base + 8 + k] = @intCast(u8, (next >> @intCast(u6, k * 8)) & 0xFF)
+        k += 1
+    }
+    into[base + 16] = @intCast(u8, size & 0xFF)
+    into[base + 17] = @intCast(u8, size >> 8)
+    into[base + 18] = kind
+    k = 0
+    while k < name.length {
+        into[base + 19 + k] = name[k]
+        k += 1
+    }
+    at.* = base + size
+    return true
+}
+
+// node_list's kinds as getdents64's.
+fn typeOf(kind: usize) -> u8 {
+    if kind == 1 { return 8 }
+    if kind == 2 { return 4 }
+    if kind == 3 { return 10 }
+    if kind == 4 { return 1 }
+    if kind == 5 { return 2 }
+    return 0
+}
+
+// stream_pair: the ends' handles, whose slots are the descriptors.
+pub fn pipe(ends: *[2]isize) -> bool {
+    var handles: [2]u32 = [2]u32{ 0, 0 }
+    if brix.streamPair(&handles) < 0 { return false }
+    ends.*[0] = remember(handles[0])
+    ends.*[1] = remember(handles[1])
+    return true
+}
+
+// A handle's descriptor (its slot), remembered.
+fn remember(handle: u32) -> isize {
+    const descriptor = @intCast(isize, (handle & 0xFF) - 1)
+    if descriptor < @intCast(isize, DESCRIPTORS) {
+        prime()
+        remembered[@bitCast(usize, descriptor)] = handle
+        cookies[@bitCast(usize, descriptor)] = 0
+    }
+    return descriptor
+}
+
+// node_path of the working directory: its length with the NUL.
+pub fn workingDirectory(destination: usize, length: usize) -> isize {
+    const got = brix.pathOf(0, unsafe { @ptrFromInt([*]u8, destination) }[0..length])
+    if got < 0 { return if -got == 17 { -34 } else { asErrno(got) } }
+    return got + 1
+}
+
+// The directory opened by node_open, made the working one.
+pub fn changeDirectory(path: [*]const u8) -> isize {
+    const opened = open(path, O_ACCESS & 0, 0)
+    if opened < 0 { return opened }
+    const result = brix.setDirectory(handleFor(opened, false))
+    _ = close(opened)
+    return asErrno(result)
+}
+
+pub fn close(descriptor: isize) -> isize {
+    forget(descriptor)
+    return linux.syscall1(linux.SYS_close, @bitCast(usize, descriptor))
+}
+
+pub fn clock(which: usize, seconds: *isize, nanoseconds: *isize) -> bool {
+    const now = brix.clock(if which == REALTIME { brix.Clock.REAL_TIME } else { brix.Clock.MONOTONIC })
+    seconds.* = @bitCast(isize, now / 1000000000)
+    nanoseconds.* = @bitCast(isize, now % 1000000000)
+    return true
+}
+
+// A Status as Linux's errno (for std's callers that check them).
+pub fn asErrno(result: isize) -> isize {
+    if result >= 0 { return result }
+    const code = -result
+    if code == brix.Status.invalid_handle || code == brix.Status.no_right { return -9 }
+    if code == brix.Status.wrong_kind { return -29 }
+    if code == brix.Status.would_block { return -11 }
+    if code == brix.Status.timed_out { return -110 }
+    if code == brix.Status.not_found { return -2 }
+    if code == brix.Status.exists { return -17 }
+    if code == brix.Status.no_memory { return -12 }
+    if code == brix.Status.bad_address { return -14 }
+    if code == brix.Status.peer_gone { return -32 }
+    if code == brix.Status.interrupted { return -4 }
+    if code == brix.Status.unsupported { return -38 }
+    // not_directory, is_directory, not_empty, read_only, too_large,
+    // busy, denied, too_many, link_loop, no_space, io_error,
+    // cross_volume, name_too_long.
+    if code == 13 { return -20 }
+    if code == 14 { return -21 }
+    if code == 15 { return -39 }
+    if code == 16 { return -30 }
+    if code == 17 { return -27 }
+    if code == 19 { return -16 }
+    if code == 20 { return -13 }
+    if code == 21 { return -24 }
+    if code == 22 { return -40 }
+    if code == 23 { return -28 }
+    if code == 24 { return -5 }
+    if code == 25 { return -18 }
+    if code == 26 { return -36 }
+    return -22
+}

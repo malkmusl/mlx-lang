@@ -54,6 +54,24 @@ compare_tail() {
 compare_uname() {
     "$bin_dir/uname" "$@" > "$work_dir/actual" || return 1
     /usr/bin/uname "$@" > "$work_dir/expected" || return 1
+    # Debian's and Fedora's uname are patched to print the machine for -p
+    # and -i (GNU's own prints "unknown", and -a leaves unknown out): the
+    # expected -a without those two then.
+    if [[ "$(/usr/bin/uname -p)" != unknown ]]; then
+        local machine
+        machine=$(/usr/bin/uname -m)
+        if [[ "$*" == -a ]]; then
+            sed -i "s/ $machine $machine $machine / $machine /" "$work_dir/expected"
+        elif [[ "$*" == *-p* || "$*" == *-i* ]]; then
+            # The fields in uname's order, -p and -i as GNU prints them.
+            local field fields=()
+            for field in s n r v m p i o; do
+                [[ " $* " == *" -$field "* ]] || continue
+                if [[ $field == p || $field == i ]]; then fields+=(unknown); else fields+=("$(/usr/bin/uname "-$field")"); fi
+            done
+            echo "${fields[*]}" > "$work_dir/expected"
+        fi
+    fi
     cmp "$work_dir/actual" "$work_dir/expected"
 }
 
@@ -174,8 +192,17 @@ read -r lines words bytes < "$work_dir/actual"
 read -r bytes name < <(tail -n 1 "$work_dir/actual")
 [[ "$bytes" == 23 && "$name" == total ]] || fail 'wc total differs'
 
+# Words as GNU coreutils 9.11 counts them (older wc, 9.4 for one, differ:
+# it let 0xA0 join words and controls start none): white space is 9 to 13,
+# the space and, in the C locale, 0xA0; in UTF-8 Unicode's spaces and the
+# no-break ones; anything else, a control or an encoding error too, is part
+# of a word.
 printf 'a b\tc\nd\ve\ff\rg\240h\n' > "$work_dir/whitespace"
-compare_wc "$work_dir/whitespace" || fail 'wc whitespace classification differs'
+[[ "$(LC_ALL=C "$bin_dir/wc" < "$work_dir/whitespace" | tr -s ' ')" == ' 2 8 16' ]] || fail 'wc whitespace classification differs'
+printf '\001 x\177y \200' > "$work_dir/words"
+[[ "$(LC_ALL=C "$bin_dir/wc" -w < "$work_dir/words")" == 3 ]] || fail 'wc counts controls as no word'
+printf 'a\302\240b \342\200\203c \377d\302' > "$work_dir/words"
+[[ "$(LC_ALL=C.UTF-8 "$bin_dir/wc" -w < "$work_dir/words")" == 4 && "$(LC_ALL=C.UTF-8 "$bin_dir/wc" -m < "$work_dir/words")" == 8 ]] || fail 'wc UTF-8 words or characters differ'
 printf 'ab\tcd\n12345\nlast' > "$work_dir/wc-flags"
 compare_wc_flags -m "$work_dir/wc-flags" || fail 'wc character count differs'
 compare_wc_flags -L "$work_dir/wc-flags" || fail 'wc maximum line length differs'
@@ -197,7 +224,11 @@ if "$bin_dir/wc" --files0-from="$work_dir/wc-files0" "$work_dir/a" >/dev/null 2>
 fi
 
 dd if=/dev/urandom of="$work_dir/random" bs=64K count=1 status=none
-compare_wc "$work_dir/random" || fail 'wc binary input counts differ'
+# Words of 9.11 from any wc: every byte that is not white space (9 to 13,
+# the space, 0xA0) as an 'x', 0xA0 as a space.
+read -r random_lines random_words random_bytes _ < <(LC_ALL=C "$bin_dir/wc" "$work_dir/random")
+expected_words=$(LC_ALL=C tr -c ' \t\n\v\f\r\240' 'x' < "$work_dir/random" | LC_ALL=C tr '\240' ' ' | LC_ALL=C /usr/bin/wc -w)
+[[ "$random_lines" == "$(LC_ALL=C /usr/bin/wc -l < "$work_dir/random")" && "$random_bytes" == 65536 && "$random_words" == "$expected_words" ]] || fail 'wc binary input counts differ'
 
 "$bin_dir/pwd" -P > "$work_dir/actual"
 /usr/bin/pwd -P > "$work_dir/expected"
@@ -467,6 +498,10 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'env direct execution differ
 /usr/bin/env -i "$bin_dir/env" PATH=/usr/bin ANSWER=43 printenv ANSWER > "$work_dir/actual"
 printf '43\n' > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'env PATH execution differs'
+
+# A command whose second letter is an option's (a, C, S) is a command.
+/usr/bin/env -i PATH=/usr/bin "$bin_dir/env" false > "$work_dir/actual" && fail 'env false succeeded'
+[[ ! -s "$work_dir/actual" ]] || fail 'env false printed the environment'
 
 set +e
 /usr/bin/env -i "$bin_dir/env" /bin/sh -c 'exit 7'
@@ -1015,9 +1050,15 @@ for block_size in K KB KiB M MB MiB E EB; do
     LC_ALL=C /usr/bin/ls -ln --block-size="$block_size" --time-style=long-iso /etc/passwd > "$work_dir/expected"
     cmp "$work_dir/actual" "$work_dir/expected" || fail "ls --block-size=$block_size output differs"
 done
+# The behavioral target is 9.11; a host's older GNU ls is told what 9.5
+# on does by itself (--dired implies -l).
+host_ls_version=$(/usr/bin/ls --version | head -n 1 | awk '{print $NF}')
+host_ls_older() { [[ "$(printf '%s\n%s\n' "$1" "$host_ls_version" | sort -V | head -n 1)" != "$1" ]]; }
+host_dired_flags=
+host_ls_older 9.5 && host_dired_flags=-l
 for ls_flags in '--dired --time-style=long-iso' '--dired -l --quoting-style=shell-escape --time-style=long-iso'; do
     LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-quote" > "$work_dir/actual"
-    LC_ALL=C /usr/bin/ls $ls_flags "$work_dir/ls-quote" > "$work_dir/expected"
+    LC_ALL=C /usr/bin/ls $host_dired_flags $ls_flags "$work_dir/ls-quote" > "$work_dir/expected"
     cmp "$work_dir/actual" "$work_dir/expected" || fail "ls $ls_flags dired output differs"
 done
 LS_COLORS='di=31:ex=32:ln=33:*.txt=35' LC_ALL=C "$bin_dir/ls" --color=always -F1 "$work_dir/ls-tree" > "$work_dir/actual"
@@ -1025,6 +1066,8 @@ LS_COLORS='di=31:ex=32:ln=33:*.txt=35' LC_ALL=C /usr/bin/ls --color=always -F1 "
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls color output differs'
 LC_ALL=C "$bin_dir/ls" --hyperlink=always -1 "$work_dir/ls-tree" > "$work_dir/actual"
 LC_ALL=C /usr/bin/ls --hyperlink=always -1 "$work_dir/ls-tree" > "$work_dir/expected"
+# (Older GNU ls ended the hyperlinks' escapes in BEL, 9.11 in ESC \.)
+sed -i 's/\x07/\x1b\\/g' "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls hyperlink output differs'
 for ls_flags in '-Z1' '-iZ1' '-lZ --time-style=long-iso'; do
     LC_ALL=C "$bin_dir/ls" $ls_flags "$work_dir/ls-tree" > "$work_dir/actual"
@@ -1041,6 +1084,8 @@ gnu_ls_status=$?
 set -e
 [[ "$mlx_ls_status" -eq "$gnu_ls_status" ]] || fail 'ls recursive cycle status differs'
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'ls recursive cycle output differs'
+# (GNU's messages start with the name it was run by.)
+sed -i 's|^/usr/bin/ls:|ls:|' "$work_dir/expected-error"
 cmp "$work_dir/actual-error" "$work_dir/expected-error" || fail 'ls recursive cycle diagnostic differs'
 ln -s ls-tree/subdirectory "$work_dir/ls-directory-link"
 for ls_flags in '-l --time-style=long-iso' '-H -l --time-style=long-iso' '-F1'; do
@@ -1460,6 +1505,11 @@ cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -s output differs'
 "$bin_dir/paste" -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
 /usr/bin/paste -d, "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
 cmp "$work_dir/actual" "$work_dir/expected" || fail 'paste -d, output differs'
+for options in -sd+ -zsd, "-sd :" -sz; do
+    "$bin_dir/paste" $options "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/actual"
+    /usr/bin/paste $options "$work_dir/paste1" "$work_dir/paste2" > "$work_dir/expected"
+    cmp "$work_dir/actual" "$work_dir/expected" || fail "paste $options (grouped options) output differs"
+done
 
 printf 'a\nb\nc\nd\ne\n' > "$work_dir/shuf1"
 sort "$work_dir/shuf1" > "$work_dir/shuf1-sorted"
@@ -1478,6 +1528,19 @@ diff <("$bin_dir/date" -u '+%Y-%m-%d %H:%M') <(/usr/bin/date -u '+%Y-%m-%d %H:%M
 diff <("$bin_dir/date" -d @1700000000 -R) <(/usr/bin/date -d @1700000000 -R) > /dev/null || fail 'date -R output differs'
 diff <("$bin_dir/date" -d @1700000000 -Iseconds) <(/usr/bin/date -d @1700000000 -Iseconds) > /dev/null || fail 'date -Iseconds output differs'
 diff <("$bin_dir/date" -d @1700000000 --rfc-3339=seconds) <(/usr/bin/date -d @1700000000 --rfc-3339=seconds) > /dev/null || fail 'date --rfc-3339=seconds output differs'
+# The O modifier as coreutils 9.11 has it (older ones handed it to the C
+# library): flags and widths apply, %OY is a year, %Oc and %Ox are bad.
+[[ "$(LC_ALL=C "$bin_dir/date" -u -d @0 '+%OY|%+Oe|%-OW|%Oq|%O::z|%Ob|%#OB|%Oc|%Ox')" == '1970|01|0|1|+00:00:00|Jan|JANUARY|%Oc|%Ox' ]] || fail 'date O modifier output differs'
+# +FORMAT is strftime as coreutils has it: flags, widths, ISO weeks, %C,
+# %:z, glibc's %c; $TZ; @SECONDS with a fraction (negative: toward the
+# past). (No O modifier here: the host's GNU may be older than 9.11's.)
+for date_format in '+%G-W%V-%u %U %W %C %g' '+%_5d|%-m|%010Y|%^b|%#A|%#Z' '+%:z %::z %:::z %z' '+%c|%x|%X|%r|%^c|%_30c' '+%F %10F %-D %R %T %s %N %3N %q' '+%%|%Q|%5|%Ea|%-%'; do
+    for date_zone in UTC America/St_Johns Asia/Kolkata; do
+        for date_stamp in @0 @1609459199 @1609675200.25 @-1.5; do
+            diff <(TZ=$date_zone LC_ALL=C "$bin_dir/date" -d $date_stamp "$date_format") <(TZ=$date_zone LC_ALL=C /usr/bin/date -d $date_stamp "$date_format") > /dev/null || fail "date -d $date_stamp '$date_format' (TZ=$date_zone) output differs"
+        done
+    done
+done
 diff <("$bin_dir/date" -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') <(/usr/bin/date -d @1700000000 '+%Y-%m-%d %H:%M:%S %a %Z') > /dev/null || fail 'date custom format output differs'
 diff <("$bin_dir/date" -d @1700000000) <(/usr/bin/date -d @1700000000) > /dev/null || fail 'date -d @epoch output differs'
 diff <("$bin_dir/date" -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') <(/usr/bin/date -d '2024-01-15 10:30:00' '+%Y-%m-%d %H:%M:%S') > /dev/null || fail 'date -d STRING output differs'
@@ -1567,6 +1630,24 @@ diff <("$bin_dir/pr" -l 20 -t -o 4 "$work_dir/prtest") <(/usr/bin/pr -l 20 -t -o
 diff <("$bin_dir/pr" -l 20 -F "$work_dir/prtest" | normalize_pr_date) <(/usr/bin/pr -l 20 -F "$work_dir/prtest" | normalize_pr_date) > /dev/null || fail 'pr -F output differs'
 printf '1\n2\n3\n' > "$work_dir/pr3"
 diff <("$bin_dir/pr" -l 15 "$work_dir/pr3" | normalize_pr_date) <(/usr/bin/pr -l 15 "$work_dir/pr3" | normalize_pr_date) > /dev/null || fail 'pr short-input padding output differs'
+# Columns down (balanced on the last page), across, files in parallel,
+# truncation and joined lines, separators, tabs both ways, control
+# characters, numbering, page ranges, form feeds held to the next page;
+# the header's date is the file's (fixed here), in TZ=UTC.
+seq 200 > "$work_dir/pr200"
+printf 'alpha\tbeta\nctl\001x\nback\bspace\na line too long for a narrow column of a page\n\fafter a form feed\n\tlast\n' > "$work_dir/prmixed"
+touch -d '2020-05-06 07:08:09' "$work_dir/pr200" "$work_dir/prmixed"
+# The header: -D as strftime has it, widths as mbswidth counts them.
+for pr_flags in '-D %_5d|%^b|%G-W%V|%:z|%-%' '-D %c' '-h 日本語-é- x' '-h abc\001\377'; do
+    diff <(TZ=Asia/Kolkata LC_ALL=C.UTF-8 "$bin_dir/pr" -l 11 "$pr_flags" "$work_dir/pr200" 2>&1 | head -n 4) <(TZ=Asia/Kolkata LC_ALL=C.UTF-8 /usr/bin/pr -l 11 "$pr_flags" "$work_dir/pr200" 2>&1 | head -n 4) > /dev/null || fail "pr $pr_flags header differs"
+done
+for pr_flags in '-3' '-2 -a' '-4 -t -a' '-m' '-3 -l 20' '-J -2' '-W 20' '-w 40 -3' '-s: -3' '-S|| -2' '-e:4 -t' '-i.5 -t' '-c' '-v' '-n:3 -2' '-N 5 -n' '-d -2' '-o 3 -2' '+2:3 -3' '-D %d.%m.%Y -2' '-F -3' '-T -2' '-2 -h TITLE'; do
+    for pr_input in pr200 prmixed; do
+        pr_files="$work_dir/$pr_input"
+        [[ "$pr_flags" == -m ]] && pr_files="$work_dir/pr200 $work_dir/prmixed"
+        diff <(TZ=UTC LC_ALL=C "$bin_dir/pr" $pr_flags $pr_files) <(TZ=UTC LC_ALL=C /usr/bin/pr $pr_flags $pr_files) > /dev/null || fail "pr $pr_flags $pr_input output differs"
+    done
+done
 
 # Every utility installs std.crash first thing in main: a crash says the
 # function, the line and the callers on stderr and is kept in crashes.log.

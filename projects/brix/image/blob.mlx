@@ -1,0 +1,514 @@
+// brix-image's boot blob: the Multiboot header, the boot info, the GDT,
+// TSSs and IDT, and the code, assembled into the image's first MiB (it is
+// loaded at BLOB_PHYS). The code is AT&T assembly (mlx-cc's assembler,
+// assemble.mlx; the layout's numbers as `.set` constants, its parts at
+// their offsets by `.org`):
+//
+// - code32: the Multiboot entry (32-bit protected mode, paging off): the
+//   page tables (the first GiB in 2 MiB pages, at 0 and at the kernel's
+//   higher half), PAE, long mode and SYSCALL enabled, paging on, the GDT,
+//   a far jump to code64.
+// - code64: on to the higher half (Info.NEXT, where the other processors
+//   come in too, their number in ebx), the GDT and a CS of it again, the
+//   IDT, the processor's TSS, its block as the kernel's GS base
+//   (layout.PerCpu), the SYSCALL MSRs (the kernel's selectors, the
+//   entry, flags masked: IF, TF, DF, AC), SSE and write protection
+//   (CR0.WP, for copy on write) on; then the first processor's boot stack
+//   and the kernel's _start with its arena (rdi, rsi), another's trap
+//   stack and brix_ap with its number.
+// - syscall: SYSCALL's entry. From user mode (a return address in the
+//   lower half): the processor's trap stack (swapgs, its block), a trap
+//   frame (vector 0x80) and the common trap path. From the kernel: one
+//   of its operations (layout.Op: port I/O, control registers, MSRs, the
+//   time-stamp counter, entering user mode), then back by the saved
+//   flags and return address.
+// - stubs and trap: a stub per vector pushes a zero error code where the
+//   CPU pushes none and its vector; the common path pushes the registers
+//   (the frame: r15 .. rax, vector, error, rip, cs, rflags, rsp, ss) and
+//   the SSE registers below, from user mode swaps GS to the kernel's and
+//   loads the processor's arena registers (r14, r15), and calls the
+//   kernel's brix_trap with the frame, then returns by IRETQ (GS swapped
+//   back on the way to user mode; also after a system call).
+const layout = @import("../layout.mlx")
+const assemble = @import("./assemble.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+
+// The vectors with an error code the CPU pushes.
+fn hasErrorCode(vector: usize) -> bool {
+    return vector == 8 || (vector >= 10 && vector <= 14) || vector == 17 || vector == 21 || vector == 29 || vector == 30
+}
+
+const CODE32 = [_][]const u8{
+    ".code32",
+    "cli",
+    "movl %ebx, INFO_MBI",
+    // The page directory: 512 pages of 2 MiB (present, writable).
+    "movl $PD, %edi",
+    "movl $0x83, %eax",
+    "movl $512, %ecx",
+    "1: movl %eax, (%edi)",
+    "addl $0x200000, %eax",
+    "addl $8, %edi",
+    "decl %ecx",
+    "jnz 1b",
+    "movl $PD + 3, PDPT",
+    "movl $PDPT + 3, PML4",
+    "movl $PDPT + 3, PML4 + 256 * 8",
+    "movl $PML4, %eax",
+    "movl %eax, %cr3",
+    "movl %cr4, %eax",
+    "orl $0x20, %eax", // PAE
+    "movl %eax, %cr4",
+    "movl $0xC0000080, %ecx", // IA32_EFER
+    "rdmsr",
+    "orl $0x101, %eax", // SCE, LME
+    "wrmsr",
+    "movl %cr0, %eax",
+    "orl $0x80000001, %eax", // PG, PE
+    "movl %eax, %cr0",
+    "lgdtl GDTR32_PHYS",
+    "ljmpl $KERNEL_CODE, $CODE64_PHYS"
+}
+
+const CODE64 = [_][]const u8{
+    ".code64",
+    // (Still at the identity mapping.)
+    "movw $KERNEL_DATA, %ax",
+    "movw %ax, %ds",
+    "movw %ax, %es",
+    "movw %ax, %ss",
+    "xorl %eax, %eax",
+    "movw %ax, %fs",
+    "movw %ax, %gs",
+    "xorl %ebx, %ebx", // processor 0
+    "movabs $next, %rax",
+    "jmp *%rax",
+    // (The other processors come in here, their number in ebx, without
+    // a stack: the processor's trap stack for now.)
+    "next:",
+    "movabs $PERCPU + PC_TRAP_STACK, %rax",
+    "movl %ebx, %edx",
+    "shlq $6, %rdx",
+    "movq (%rax, %rdx), %rsp",
+    "movabs $GDTR64, %rax",
+    "lgdt (%rax)",
+    "pushq $KERNEL_CODE",
+    "leaq 3(%rip), %rax",
+    "pushq %rax",
+    "lretq",
+    "movw $KERNEL_DATA, %ax", // (the data segments of this GDT)
+    "movw %ax, %ds",
+    "movw %ax, %es",
+    "movw %ax, %ss",
+    "movabs $IDTR, %rax",
+    "lidt (%rax)",
+    // The processor's TSS (selector TSS + 16 * its number).
+    "movl %ebx, %eax",
+    "shll $4, %eax",
+    "addl $TSS_SELECTOR, %eax",
+    "ltr %ax",
+    // Its block as the kernel's GS base (GS_BASE; KERNEL_GS_BASE, the
+    // user's, 0): PERCPU + 64 * its number.
+    "movabs $PERCPU, %rax",
+    "movl %ebx, %edx",
+    "shlq $6, %rdx",
+    "addq %rdx, %rax",
+    "movq %rax, %rdx",
+    "shrq $32, %rdx",
+    "movl $0xC0000101, %ecx", // IA32_GS_BASE
+    "wrmsr",
+    "movl $0xC0000102, %ecx", // IA32_KERNEL_GS_BASE
+    "xorl %eax, %eax",
+    "xorl %edx, %edx",
+    "wrmsr",
+    "movl $0xC0000081, %ecx", // IA32_STAR: SYSRET's base 0x18, SYSCALL's 0x08
+    "xorl %eax, %eax",
+    "movl $0x00180008, %edx",
+    "wrmsr",
+    "movl $0xC0000082, %ecx", // IA32_LSTAR
+    "movabs $syscall_entry, %rax",
+    "movq %rax, %rdx",
+    "shrq $32, %rdx",
+    "wrmsr",
+    "movl $0xC0000084, %ecx", // IA32_FMASK: IF, TF, DF, AC
+    "movl $0x40700, %eax",
+    "xorl %edx, %edx",
+    "wrmsr",
+    "movq %cr0, %rax",
+    "andq $-5, %rax", // ~EM
+    "orq $2, %rax", // MP
+    "orq $0x10000, %rax", // WP: the kernel's writes respect read-only pages too (copy on write)
+    "movq %rax, %cr0",
+    "movq %cr4, %rax",
+    "orq $0x600, %rax", // OSFXSR, OSXMMEXCPT
+    "movq %rax, %cr4",
+    "testl %ebx, %ebx",
+    "jnz ap_path", // another processor
+    "movabs $BOOT_STACK, %rsp",
+    "movabs $ARENA0, %rdi", // the first processor's share of the arena
+    "movabs $ARENA0_END, %rsi",
+    "movabs $_start, %rax",
+    "call *%rax",
+    "cli",
+    "1: hlt",
+    "jmp 1b",
+    // Another processor: its trap stack (below the room for a trap frame
+    // the kernel makes there), its arena, then brix_ap with its number.
+    "ap_path:",
+    "movq %gs:PC_TRAP_STACK, %rsp",
+    "subq $1024, %rsp",
+    "movq %gs:PC_ARENA_BASE, %r14",
+    "movq %gs:PC_ARENA_END, %r15",
+    "movl %ebx, %edi",
+    "movabs $brix_ap, %rax",
+    "call *%rax",
+    "cli",
+    "1: hlt",
+    "jmp 1b"
+}
+
+const SYSCALL = [_][]const u8{
+    "syscall_entry:",
+    "testq %rcx, %rcx",
+    "js kop", // the kernel's operations
+    // The processor's block (swapgs: GS the kernel's), its trap stack;
+    // GS the user's again for the common path, which swaps it.
+    "swapgs",
+    "movq %rsp, %gs:PC_USER_RSP",
+    "movq %gs:PC_TRAP_STACK, %rsp",
+    "pushq $USER_DATA", // ss
+    "pushq %gs:PC_USER_RSP", // rsp
+    "pushq %r11", // rflags
+    "pushq $USER_CODE", // cs
+    "pushq %rcx", // rip
+    "pushq $0", // error
+    "pushq $SYSCALL_VECTOR", // vector
+    "swapgs",
+    "jmp trap",
+    // The kernel's operations (rdx kept; rax the result).
+    "kop:",
+    "pushq %rdx",
+    "cmpq $OP_OUTB, %rax",
+    "jne 1f",
+    "movq %rdi, %rdx",
+    "movq %rsi, %rax",
+    "outb %al, %dx",
+    "jmp kret",
+    "1: cmpq $OP_INB, %rax",
+    "jne 1f",
+    "movq %rdi, %rdx",
+    "xorl %eax, %eax",
+    "inb %dx, %al",
+    "jmp kret",
+    "1: cmpq $OP_WAIT, %rax",
+    "jne 1f",
+    "sti",
+    "hlt",
+    "cli",
+    "jmp kret",
+    "1: cmpq $OP_READ_CR2, %rax",
+    "jne 1f",
+    "movq %cr2, %rax",
+    "jmp kret",
+    "1: cmpq $OP_WRITE_CR3, %rax",
+    "jne 1f",
+    "movq %rdi, %cr3",
+    "jmp kret",
+    "1: cmpq $OP_READ_CR3, %rax",
+    "jne 1f",
+    "movq %cr3, %rax",
+    "jmp kret",
+    "1: cmpq $OP_INVLPG, %rax",
+    "jne 1f",
+    "invlpg (%rdi)",
+    "jmp kret",
+    "1: cmpq $OP_WRMSR, %rax",
+    "jne 1f",
+    "pushq %rcx",
+    "movl %edi, %ecx",
+    "movl %esi, %eax",
+    "movq %rsi, %rdx",
+    "shrq $32, %rdx",
+    "wrmsr",
+    "popq %rcx",
+    "jmp kret",
+    "1: cmpq $OP_ENTER_USER, %rax",
+    "jne 1f",
+    // An IRETQ frame: ss, rsp (rsi), rflags (IF), cs, rip (rdi); every
+    // register zero; GS the user's.
+    "pushq $USER_DATA",
+    "pushq %rsi",
+    "pushq $0x202",
+    "pushq $USER_CODE",
+    "pushq %rdi",
+    "xorl %eax, %eax",
+    "xorl %ebx, %ebx",
+    "xorl %ecx, %ecx",
+    "xorl %edx, %edx",
+    "xorl %esi, %esi",
+    "xorl %edi, %edi",
+    "xorl %ebp, %ebp",
+    "xorl %r8d, %r8d",
+    "xorl %r9d, %r9d",
+    "xorl %r10d, %r10d",
+    "xorl %r11d, %r11d",
+    "xorl %r12d, %r12d",
+    "xorl %r13d, %r13d",
+    "xorl %r14d, %r14d",
+    "xorl %r15d, %r15d",
+    "swapgs",
+    "iretq",
+    "1: cmpq $OP_OUTW, %rax",
+    "jne 1f",
+    "movq %rdi, %rdx",
+    "movq %rsi, %rax",
+    "outw %ax, %dx",
+    "jmp kret",
+    "1: cmpq $OP_OUTL, %rax",
+    "jne 1f",
+    "movq %rdi, %rdx",
+    "movq %rsi, %rax",
+    "outl %eax, %dx",
+    "jmp kret",
+    "1: cmpq $OP_INL, %rax",
+    "jne 1f",
+    "movq %rdi, %rdx",
+    "inl %dx, %eax",
+    "jmp kret",
+    "1: cmpq $OP_RDTSC, %rax",
+    "jne 1f",
+    "rdtsc",
+    "shlq $32, %rdx",
+    "orq %rdx, %rax",
+    "jmp kret",
+    "1: cmpq $OP_INW, %rax",
+    "jne 1f",
+    "movq %rdi, %rdx",
+    "xorl %eax, %eax",
+    "inw %dx, %ax",
+    "jmp kret",
+    "1: cmpq $OP_CPU_ID, %rax",
+    "jne 1f",
+    "movq %gs:PC_INDEX, %rax",
+    "jmp kret",
+    "1: cmpq $OP_RESUME, %rax",
+    "jne kret",
+    "movq %rdi, %rsp", // the frame's SSE area
+    "jmp trap_return",
+    "kret:",
+    "popq %rdx",
+    "pushq %r11",
+    "popfq",
+    "jmp *%rcx"
+}
+
+const TRAP = [_][]const u8{
+    "trap:",
+    "pushq %rax",
+    "pushq %rbx",
+    "pushq %rcx",
+    "pushq %rdx",
+    "pushq %rsi",
+    "pushq %rdi",
+    "pushq %rbp",
+    "pushq %r8",
+    "pushq %r9",
+    "pushq %r10",
+    "pushq %r11",
+    "pushq %r12",
+    "pushq %r13",
+    "pushq %r14",
+    "pushq %r15",
+    "movq %rsp, %rdi",
+    // The SSE registers kept (the kernel's code uses them too).
+    "subq $512, %rsp",
+    "fxsave (%rsp)",
+    // From the kernel (an interrupt while it waits, a fault in a system
+    // call), its arena registers stay: what it allocated is in use.
+    "testb $3, FRAME_CS(%rdi)",
+    "jz 1f",
+    "swapgs", // GS the kernel's: the processor's block
+    "movq %gs:PC_ARENA_BASE, %r14",
+    "movq %gs:PC_ARENA_END, %r15",
+    "1: movabs $brix_trap, %rax",
+    "call *%rax",
+    // (Op.RESUME comes in here with rsp at a frame's SSE area.)
+    "trap_return:",
+    "fxrstor (%rsp)",
+    "addq $512, %rsp",
+    "popq %r15",
+    "popq %r14",
+    "popq %r13",
+    "popq %r12",
+    "popq %r11",
+    "popq %r10",
+    "popq %r9",
+    "popq %r8",
+    "popq %rbp",
+    "popq %rdi",
+    "popq %rsi",
+    "popq %rdx",
+    "popq %rcx",
+    "popq %rbx",
+    "popq %rax",
+    "addq $16, %rsp", // vector, error
+    "testb $3, 8(%rsp)", // cs
+    "jz 1f",
+    "swapgs", // GS the user's
+    "1: iretq"
+}
+
+// The blob's code and tables into `image` (at its start). Whether it
+// could be made (else assemble.problem says why).
+pub fn build(image: [*]u8, entry: usize, trap: usize, apEntry: usize, kernelSize: usize, archivePhys: usize, archiveSize: usize) -> bool {
+    const phys = layout.Memory.BLOB
+    const info = layout.Blob.BOOT_INFO
+
+    // The code: one text from the blob's start (its parts at their
+    // offsets), the layout's numbers as constants.
+    var t: assemble.Text = undefined
+    if !t.init() { return false }
+    t.set("INFO_MBI", phys + info + layout.Info.MBI)
+    t.set("PD", phys + layout.Blob.PD)
+    t.set("PDPT", phys + layout.Blob.PDPT)
+    t.set("PML4", phys + layout.Blob.PML4)
+    t.set("GDTR32_PHYS", phys + layout.Blob.GDTR32)
+    t.set("CODE64_PHYS", phys + layout.Blob.CODE64)
+    t.set("GDTR64", layout.Blob.virtual(layout.Blob.GDTR64))
+    t.set("IDTR", layout.Blob.virtual(layout.Blob.IDTR))
+    t.set("PERCPU", layout.Blob.perCpuOf(0))
+    t.set("BOOT_STACK", layout.Blob.virtual(layout.Blob.BOOT_STACK_TOP))
+    t.set("ARENA0", layout.Memory.KERNEL_VIRTUAL + layout.Memory.arenaOf(0))
+    t.set("ARENA0_END", layout.Memory.KERNEL_VIRTUAL + layout.Memory.arenaOf(1))
+    t.set("KERNEL_CODE", layout.Selector.KERNEL_CODE)
+    t.set("KERNEL_DATA", layout.Selector.KERNEL_DATA)
+    t.set("USER_DATA", layout.Selector.USER_DATA)
+    t.set("USER_CODE", layout.Selector.USER_CODE)
+    t.set("TSS_SELECTOR", layout.Selector.TSS)
+    t.set("SYSCALL_VECTOR", layout.Vector.SYSCALL)
+    t.set("PC_TRAP_STACK", layout.PerCpu.TRAP_STACK)
+    t.set("PC_USER_RSP", layout.PerCpu.USER_RSP)
+    t.set("PC_ARENA_BASE", layout.PerCpu.ARENA_BASE)
+    t.set("PC_ARENA_END", layout.PerCpu.ARENA_END)
+    t.set("PC_INDEX", layout.PerCpu.INDEX)
+    t.set("FRAME_CS", 18 * 8)
+    t.set("OP_OUTB", layout.Op.OUTB)
+    t.set("OP_INB", layout.Op.INB)
+    t.set("OP_WAIT", layout.Op.WAIT)
+    t.set("OP_READ_CR2", layout.Op.READ_CR2)
+    t.set("OP_WRITE_CR3", layout.Op.WRITE_CR3)
+    t.set("OP_READ_CR3", layout.Op.READ_CR3)
+    t.set("OP_INVLPG", layout.Op.INVLPG)
+    t.set("OP_WRMSR", layout.Op.WRMSR)
+    t.set("OP_ENTER_USER", layout.Op.ENTER_USER)
+    t.set("OP_OUTW", layout.Op.OUTW)
+    t.set("OP_OUTL", layout.Op.OUTL)
+    t.set("OP_INL", layout.Op.INL)
+    t.set("OP_RDTSC", layout.Op.RDTSC)
+    t.set("OP_INW", layout.Op.INW)
+    t.set("OP_CPU_ID", layout.Op.CPU_ID)
+    t.set("OP_RESUME", layout.Op.RESUME)
+    // Where code64 goes on (the other processors' trampoline reads it).
+    t.org(info + layout.Info.NEXT)
+    t.line(".quad next")
+    t.org(layout.Blob.CODE32)
+    t.lines(CODE32[0..CODE32.length])
+    t.org(layout.Blob.CODE64)
+    t.lines(CODE64[0..CODE64.length])
+    t.lines(SYSCALL[0..SYSCALL.length])
+    t.lines(TRAP[0..TRAP.length])
+    // The stubs, 16 bytes each.
+    var vector: usize = 0
+    while vector < 256 {
+        t.org(layout.Blob.STUBS + vector * 16)
+        if !hasErrorCode(vector) { t.line("pushq $0") }
+        t.add("pushq $")
+        t.decimal(vector)
+        t.add("\n")
+        t.line("jmp trap")
+        vector += 1
+    }
+    const externals = [_]assemble.External{
+        assemble.External.{ .name = "_start", .address = entry },
+        assemble.External.{ .name = "brix_trap", .address = trap },
+        assemble.External.{ .name = "brix_ap", .address = apEntry }
+    }
+    // (The code first: the text's parts leave zeros between them, which
+    // the tables below fill.)
+    if !assemble.place(image, 0, layout.Blob.GDT, t.text(), layout.Blob.virtual(0), externals[0..externals.length]) { return false }
+    // (The code of code64 before the IDT.)
+    const stubs = assemble.offsetOf("trap_return")
+    if stubs == null || stubs.? >= layout.Blob.IDT { return false }
+
+    // The Multiboot header: magic, flags (modules page aligned, memory
+    // information, the load addresses below), checksum, header, load,
+    // load end (0: the whole file), bss end (none), entry.
+    const magic: usize = 0x1BADB002
+    const flags: usize = 0x00010003
+    Bytes.put32(image, layout.Blob.HEADER, magic)
+    Bytes.put32(image, layout.Blob.HEADER + 4, flags)
+    Bytes.put32(image, layout.Blob.HEADER + 8, (0x100000000 - ((magic + flags) & 0xffffffff)) & 0xffffffff)
+    Bytes.put32(image, layout.Blob.HEADER + 12, phys)
+    Bytes.put32(image, layout.Blob.HEADER + 16, phys)
+    Bytes.put32(image, layout.Blob.HEADER + 20, 0)
+    Bytes.put32(image, layout.Blob.HEADER + 24, 0)
+    Bytes.put32(image, layout.Blob.HEADER + 28, phys + layout.Blob.CODE32)
+
+    // The boot info (the kernel reads it: cpu.BootInfo).
+    Bytes.put64(image, info + layout.Info.KERNEL_PHYS, layout.Memory.KERNEL)
+    Bytes.put64(image, info + layout.Info.KERNEL_SIZE, kernelSize)
+    Bytes.put64(image, info + layout.Info.ARCHIVE_PHYS, archivePhys)
+    Bytes.put64(image, info + layout.Info.ARCHIVE_SIZE, archiveSize)
+    Bytes.put64(image, info + layout.Info.ARENA_BASE, layout.Memory.KERNEL_VIRTUAL + layout.Memory.ARENA)
+    Bytes.put64(image, info + layout.Info.ARENA_END, layout.Memory.KERNEL_VIRTUAL + layout.Memory.ARENA + layout.Memory.ARENA_SIZE)
+    Bytes.put64(image, info + layout.Info.FREE_PHYS, layout.Memory.FREE)
+
+    // The GDT: null, kernel code (64-bit), kernel data, user code 32
+    // (SYSRET's base), user data, user code (64-bit), a TSS (16 bytes)
+    // per processor.
+    Bytes.put64(image, layout.Blob.GDT + 0x08, 0x00AF9A000000FFFF)
+    Bytes.put64(image, layout.Blob.GDT + 0x10, 0x00CF92000000FFFF)
+    Bytes.put64(image, layout.Blob.GDT + 0x18, 0x00CFFA000000FFFF)
+    Bytes.put64(image, layout.Blob.GDT + 0x20, 0x00CFF2000000FFFF)
+    Bytes.put64(image, layout.Blob.GDT + 0x28, 0x00AFFA000000FFFF)
+    var cpu: usize = 0
+    while cpu < layout.Memory.MAX_CPUS {
+        const tss = layout.Blob.tssOf(cpu)
+        const tssLow = 103 | ((tss & 0xffff) << 16) | (((tss >> 16) & 0xff) << 32) | (0x89 << 40) | (((tss >> 24) & 0xff) << 56)
+        Bytes.put64(image, layout.Blob.GDT + layout.Selector.TSS + 16 * cpu, tssLow)
+        Bytes.put64(image, layout.Blob.GDT + layout.Selector.TSS + 16 * cpu + 8, tss >> 32)
+        // Its TSS: no I/O map (rsp0, the trap stack: the first
+        // processor's here, the others' by the kernel).
+        Bytes.put16(image, layout.Blob.TSS + cpu * layout.Blob.TSS_SIZE + 102, 104)
+        cpu += 1
+    }
+    const gdtLimit = layout.Selector.TSS + 16 * layout.Memory.MAX_CPUS - 1
+    Bytes.put16(image, layout.Blob.GDTR32, gdtLimit)
+    Bytes.put32(image, layout.Blob.GDTR32 + 2, phys + layout.Blob.GDT)
+    Bytes.put16(image, layout.Blob.GDTR64, gdtLimit)
+    Bytes.put64(image, layout.Blob.GDTR64 + 2, layout.Blob.virtual(layout.Blob.GDT))
+    Bytes.put64(image, layout.Blob.TSS + 4, layout.Blob.virtual(layout.Blob.TRAP_STACK_TOP))
+    // The first processor's block: its trap stack, its arena, its number.
+    Bytes.put64(image, layout.Blob.PERCPU + layout.PerCpu.TRAP_STACK, layout.Blob.virtual(layout.Blob.TRAP_STACK_TOP))
+    Bytes.put64(image, layout.Blob.PERCPU + layout.PerCpu.ARENA_BASE, layout.Memory.KERNEL_VIRTUAL + layout.Memory.arenaOf(0))
+    Bytes.put64(image, layout.Blob.PERCPU + layout.PerCpu.ARENA_END, layout.Memory.KERNEL_VIRTUAL + layout.Memory.arenaOf(1))
+    Bytes.put64(image, layout.Blob.PERCPU + layout.PerCpu.INDEX, 0)
+    // The IDT: interrupt gates (kernel code, DPL 0) to the stubs.
+    Bytes.put16(image, layout.Blob.IDTR, 4095)
+    Bytes.put64(image, layout.Blob.IDTR + 2, layout.Blob.virtual(layout.Blob.IDT))
+    vector = 0
+    while vector < 256 {
+        const handler = layout.Blob.virtual(layout.Blob.STUBS + vector * 16)
+        const gate = layout.Blob.IDT + vector * 16
+        Bytes.put16(image, gate, handler & 0xffff)
+        Bytes.put16(image, gate + 2, layout.Selector.KERNEL_CODE)
+        image[gate + 4] = 0
+        image[gate + 5] = 0x8E
+        Bytes.put16(image, gate + 6, (handler >> 16) & 0xffff)
+        Bytes.put32(image, gate + 8, (handler >> 32) & 0xffffffff)
+        Bytes.put32(image, gate + 12, 0)
+        vector += 1
+    }
+
+    return true
+}

@@ -1,0 +1,689 @@
+// A process's descriptors: nodes of the file system (files, directories,
+// the terminal and the other devices) and the ends of pipes. 0, 1 and 2
+// are the console at the start.
+const terminal = @import("./terminal.mlx")
+const pipes = @import("./pipe.mlx")
+const wait = @import("./wait.mlx")
+const vfs = @import("./vfs.mlx")
+const block = @import("./block.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const Status = @import("./status.mlx").Status
+const NodeKind = vfs.NodeKind
+const channels = @import("./channel.mlx")
+const timers = @import("./timer.mlx")
+const memoryObjects = @import("./memoryobjects.mlx")
+const sockets = @import("./net/sockets.mlx")
+const socketApi = @import("./net/api.mlx")
+const stack = @import("./net/stack.mlx")
+
+// A pipe's read end, its write end, or both (a FIFO opened O_RDWR).
+// A slot names nothing, a node, a pipe's end(s), a process (the native
+// interface's process handles: index its pid), a channel's end (index
+// the channel * 2 + its side), a group (index its number), a timer or a
+// memory object (index its slot in their tables).
+pub const Kind = enum(u8) { none, node, pipe_read, pipe_write, pipe_both, process, channel, group, timer, memory, socket }
+
+// O_NONBLOCK in a descriptor's flags (sockets: calls that would wait
+// say EAGAIN).
+pub const O_NONBLOCK: usize = 2048
+
+// Where a socket read on a plain descriptor puts the datagram's source
+// (not wanted).
+var udpFrom: stack.Ip = undefined // (per run)
+var udpFromPort: usize = 0 // (per run)
+
+pub const Descriptor = struct {
+    kind: Kind
+    // The node, or the pipe (its ends).
+    index: usize
+    offset: usize
+    // open's flags that stay: the access mode, O_APPEND.
+    flags: usize
+    closeOnExec: bool
+    // Counts the slot's uses: a native handle names the slot and the
+    // generation it had, so a handle kept past a close stays invalid
+    // when the slot is used again.
+    generation: u32
+}
+
+// open's flags.
+pub const Open = struct {
+    pub const ACCESS: usize = 3
+    pub const READ_ONLY: usize = 0
+    pub const WRITE_ONLY: usize = 1
+    pub const READ_WRITE: usize = 2
+    pub const CREATE: usize = 0x40
+    pub const EXCLUSIVE: usize = 0x80
+    pub const TRUNCATE: usize = 0x200
+    pub const APPEND: usize = 0x400
+    pub const DIRECTORY: usize = 0x10000
+    pub const NO_FOLLOW: usize = 0x20000
+    pub const CLOSE_ON_EXEC: usize = 0x80000
+
+    pub fn reads(flags: usize) -> bool { return flags & ACCESS != WRITE_ONLY }
+    pub fn writes(flags: usize) -> bool { return flags & ACCESS != READ_ONLY }
+}
+
+// struct stat (Linux x86-64, 144 bytes) and struct statx (256 bytes) of a
+// node, or of a pipe.
+pub const Stat = struct {
+    pub const SIZE: usize = 144
+    pub const STATX_SIZE: usize = 256
+    const STATX_BASIC_STATS: usize = 0x7FF
+    const S_IFIFO: usize = 0x1000
+    const S_IFCHR: usize = 0x2000
+    const S_IFDIR: usize = 0x4000
+    const S_IFBLK: usize = 0x6000
+    const S_IFREG: usize = 0x8000
+    const S_IFLNK: usize = 0xA000
+
+    // st_mode's type bits and the device number of a node.
+    fn typeOf(kind: NodeKind) -> usize {
+        return match kind {
+            .directory => S_IFDIR,
+            .file => S_IFREG,
+            .archive => S_IFREG,
+            .terminal => S_IFCHR,
+            .null_device => S_IFCHR,
+            .zero_device => S_IFCHR,
+            .disk => S_IFBLK,
+            .symlink => S_IFLNK,
+            .fifo => S_IFIFO,
+            .free => 0
+        }
+    }
+
+    // (major << 8 | minor) as Linux numbers them: tty 4:1, null 1:3,
+    // zero 1:5.
+    fn deviceOf(kind: NodeKind) -> usize {
+        if kind == NodeKind.terminal { return 0x401 }
+        if kind == NodeKind.null_device { return 0x103 }
+        if kind == NodeKind.zero_device { return 0x105 }
+        // A virtio disk, as Linux numbers its first (major 254).
+        if kind == NodeKind.disk { return 0xFE00 }
+        return 0
+    }
+
+    // A node of a volume is its inode on the disk, on a file system of
+    // its own (st_dev 2 and on: one a view); the tree's other nodes are
+    // their indexes on st_dev 1.
+    pub fn ofNode(index: usize, into: [*]u8, statx: bool) -> void {
+        const n = vfs.fileSystem().node(index)
+        const filesystem = 1 + n.*.volume
+        const inode = if n.*.volume != 0 { n.*.diskInode } else { index }
+        write(into, statx, typeOf(n.*.kind) | n.*.mode, filesystem, inode, n.*.links, n.*.size, deviceOf(n.*.kind), n.*.accessed, n.*.modified, n.*.changed, n.*.user, n.*.group)
+    }
+
+    pub fn ofPipe(index: usize, into: [*]u8, statx: bool) -> void { write(into, statx, S_IFIFO | 0x180, 1, 0x10000 + index, 1, 0, 0, 0, 0, 0, 0, 0) }
+
+    fn write(into: [*]u8, statx: bool, mode: usize, filesystem: usize, inode: usize, links: usize, size: usize, device: usize, accessed: usize, modified: usize, changed: usize, user: usize, group: usize) -> void {
+        if statx {
+            Bytes.fill(into, STATX_SIZE, 0)
+            Bytes.write32(into, 0, STATX_BASIC_STATS)
+            Bytes.write32(into, 4, 4096)
+            Bytes.write32(into, 16, links)
+            Bytes.write32(into, 20, user)
+            Bytes.write32(into, 24, group)
+            Bytes.write16(into, 28, mode)
+            Bytes.write64(into, 32, inode)
+            Bytes.write64(into, 40, size)
+            Bytes.write64(into, 48, (size + 511) / 512)
+            Bytes.write64(into, 64, accessed)
+            Bytes.write64(into, 80, changed)
+            Bytes.write64(into, 96, changed)
+            Bytes.write64(into, 112, modified)
+            Bytes.write32(into, 128, device >> 8)
+            Bytes.write32(into, 132, device & 255)
+            Bytes.write32(into, 140, filesystem)
+            return
+        }
+        Bytes.fill(into, SIZE, 0)
+        Bytes.write64(into, 0, filesystem) // st_dev
+        Bytes.write64(into, 8, inode)
+        Bytes.write64(into, 16, links)
+        Bytes.write32(into, 24, mode)
+        Bytes.write32(into, 28, user)
+        Bytes.write32(into, 32, group)
+        Bytes.write64(into, 40, device)
+        Bytes.write64(into, 48, size)
+        Bytes.write64(into, 56, 4096) // st_blksize
+        Bytes.write64(into, 64, (size + 511) / 512)
+        Bytes.write64(into, 72, accessed)
+        Bytes.write64(into, 88, modified)
+        Bytes.write64(into, 104, changed)
+    }
+}
+
+pub const Descriptors = struct {
+    pub const MAX: usize = 64
+    const DT_FIFO: u8 = 1
+    const DT_CHR: u8 = 2
+    const DT_LNK: u8 = 10
+    const DT_DIR: u8 = 4
+    const DT_REG: u8 = 8
+
+    slots: [MAX]Descriptor
+
+    // 0, 1 and 2 on the console, the rest closed.
+    pub fn init(self: *Self) -> void {
+        const console = vfs.fileSystem().*.console
+        var k: usize = 0
+        while k < MAX {
+            self.*.slots[k].kind = Kind.none
+            self.*.slots[k].index = 0
+            self.*.slots[k].offset = 0
+            self.*.slots[k].flags = 0
+            self.*.slots[k].closeOnExec = false
+            self.*.slots[k].generation = 1
+            if k < 3 {
+                self.*.slots[k].kind = Kind.node
+                self.*.slots[k].index = console
+                self.*.slots[k].flags = Open.READ_WRITE
+                vfs.fileSystem().retain(console)
+            }
+            k += 1
+        }
+    }
+
+    // Whether a descriptor of `kind` is a pipe's reader, its writer.
+    fn reads(kind: Kind) -> bool { return kind == Kind.pipe_read || kind == Kind.pipe_both }
+
+    fn writes(kind: Kind) -> bool { return kind == Kind.pipe_write || kind == Kind.pipe_both }
+
+    // One more descriptor of what `d` is (a node is held, a pipe counts
+    // its ends).
+    fn retain(d: *const Descriptor) -> void {
+        if d.*.kind == Kind.node { vfs.fileSystem().retain(d.*.index) }
+        if d.*.kind == Kind.channel { channels.table().retain(d.*.index) }
+        if d.*.kind == Kind.timer { timers.table().retain(d.*.index) }
+        if d.*.kind == Kind.memory { memoryObjects.table().retain(d.*.index) }
+        if d.*.kind == Kind.socket { socketApi.retain(d.*.index) }
+        if reads(d.*.kind) { pipes.table().at(d.*.index).*.readers += 1 }
+        if writes(d.*.kind) { pipes.table().at(d.*.index).*.writers += 1 }
+    }
+
+    fn release(d: *const Descriptor) -> void {
+        if d.*.kind == Kind.node { vfs.fileSystem().release(d.*.index) }
+        if d.*.kind == Kind.channel { channels.table().release(d.*.index) }
+        if d.*.kind == Kind.timer { timers.table().release(d.*.index) }
+        if d.*.kind == Kind.memory { memoryObjects.table().release(d.*.index) }
+        if d.*.kind == Kind.socket { socketApi.release(d.*.index) }
+        if reads(d.*.kind) { pipes.table().at(d.*.index).*.readers -= 1 }
+        if writes(d.*.kind) { pipes.table().at(d.*.index).*.writers -= 1 }
+        if reads(d.*.kind) || writes(d.*.kind) { pipes.table().changed() }
+    }
+
+    // `to` becomes a copy of `from` (what `to` was closed first).
+    fn place(self: *Self, to: usize, from: *const Descriptor, closeOnExec: bool) -> void {
+        retain(from)
+        const slot = &self.*.slots[to]
+        if slot.*.kind != Kind.none {
+            release(slot)
+            nextGeneration(slot)
+        }
+        slot.*.kind = from.*.kind
+        slot.*.index = from.*.index
+        slot.*.offset = from.*.offset
+        slot.*.flags = from.*.flags
+        slot.*.closeOnExec = closeOnExec
+    }
+
+    // The descriptors of `other` (a fork's child gets its parent's).
+    pub fn copyFrom(self: *Self, other: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            self.*.slots[k].kind = Kind.none
+            self.*.slots[k].generation = other.*.slots[k].generation
+            if other.*.slots[k].kind != Kind.none { self.place(k, &other.*.slots[k], other.*.slots[k].closeOnExec) }
+            k += 1
+        }
+    }
+
+    // Every descriptor closed (a process ends).
+    pub fn closeAll(self: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            _ = self.close(@intCast(isize, k))
+            k += 1
+        }
+    }
+
+    // Those marked close-on-exec closed (execve).
+    pub fn closeOnExec(self: *Self) -> void {
+        var k: usize = 0
+        while k < MAX {
+            if self.*.slots[k].closeOnExec { _ = self.close(@intCast(isize, k)) }
+            k += 1
+        }
+    }
+
+    // The open descriptor `fd`; null when it is not one.
+    pub fn get(self: *Self, fd: isize) -> ?*Descriptor {
+        if fd < 0 || fd >= @intCast(isize, MAX) { return null }
+        const slot = &self.*.slots[@bitCast(usize, fd)]
+        if slot.*.kind == Kind.none { return null }
+        return slot
+    }
+
+    pub fn kindOf(self: *Self, fd: isize) -> Kind {
+        const slot = self.get(fd)
+        if slot == null { return Kind.none }
+        return slot.?.*.kind
+    }
+
+    // The node `fd` holds; vfs.Vfs.NONE when it holds none.
+    pub fn nodeOf(self: *Self, fd: isize) -> usize {
+        const slot = self.get(fd)
+        if slot == null || slot.?.*.kind != Kind.node { return vfs.Vfs.NONE }
+        return slot.?.*.index
+    }
+
+    fn lowestFree(self: *Self, from: usize) -> isize {
+        var k = from
+        while k < MAX {
+            if self.*.slots[k].kind == Kind.none { return @intCast(isize, k) }
+            k += 1
+        }
+        return Status.too_many
+    }
+
+    // A descriptor of the node `index` (opened with `flags`): its number,
+    // or -errno.
+    pub fn openNode(self: *Self, index: usize, flags: usize) -> isize {
+        const fd = self.lowestFree(0)
+        if fd < 0 { return fd }
+        const slot = &self.*.slots[@bitCast(usize, fd)]
+        slot.*.kind = Kind.node
+        slot.*.index = index
+        slot.*.offset = 0
+        slot.*.flags = flags & (Open.ACCESS | Open.APPEND)
+        slot.*.closeOnExec = flags & Open.CLOSE_ON_EXEC != 0
+        vfs.fileSystem().retain(index)
+        return fd
+    }
+
+    // A descriptor of socket `index` (one holder already counted): its
+    // number, or -errno.
+    pub fn openSocket(self: *Self, index: usize, flags: usize) -> isize {
+        const fd = self.lowestFree(0)
+        if fd < 0 { return fd }
+        const slot = &self.*.slots[@bitCast(usize, fd)]
+        slot.*.kind = Kind.socket
+        slot.*.index = index
+        slot.*.offset = 0
+        slot.*.flags = flags & (Open.ACCESS | O_NONBLOCK)
+        slot.*.closeOnExec = flags & Open.CLOSE_ON_EXEC != 0
+        return fd
+    }
+
+    // A descriptor of the FIFO `node`: its pipe's read end, its write end
+    // (opened to write), or both (O_RDWR: it waits for no one); its
+    // number, or -errno.
+    pub fn openFifo(self: *Self, node: usize, flags: usize) -> isize {
+        const fd = self.lowestFree(0)
+        if fd < 0 { return fd }
+        const n = vfs.fileSystem().node(node)
+        const index = pipes.table().ofFifo(node, n.*.pipe)
+        if index == pipes.Pipes.MAX { return Status.too_many }
+        n.*.pipe = index + 1
+        const end = pipes.table().at(index)
+        const slot = &self.*.slots[@bitCast(usize, fd)]
+        if flags & Open.ACCESS == Open.READ_WRITE {
+            slot.*.kind = Kind.pipe_both
+            end.*.readers += 1
+            end.*.writers += 1
+            end.*.hadReader = true
+            end.*.hadWriter = true
+        } else if Open.writes(flags) {
+            slot.*.kind = Kind.pipe_write
+            end.*.writers += 1
+            end.*.hadWriter = true
+        } else {
+            slot.*.kind = Kind.pipe_read
+            end.*.readers += 1
+            end.*.hadReader = true
+        }
+        slot.*.index = index
+        slot.*.offset = 0
+        slot.*.flags = flags & Open.ACCESS
+        slot.*.closeOnExec = flags & Open.CLOSE_ON_EXEC != 0
+        pipes.table().changed()
+        return fd
+    }
+
+    // A new pipe: its read end at fds[0], its write end at fds[1].
+    pub fn pipe(self: *Self, fds: *[2]isize, flags: usize) -> isize {
+        const readEnd = self.lowestFree(0)
+        if readEnd < 0 { return readEnd }
+        self.*.slots[@bitCast(usize, readEnd)].kind = Kind.pipe_read
+        const writeEnd = self.lowestFree(0)
+        self.*.slots[@bitCast(usize, readEnd)].kind = Kind.none
+        if writeEnd < 0 { return writeEnd }
+        const index = pipes.table().create()
+        if index == pipes.Pipes.MAX { return Status.too_many }
+        const ends = [2]isize{ readEnd, writeEnd }
+        var k: usize = 0
+        while k < 2 {
+            const slot = &self.*.slots[@bitCast(usize, ends[k])]
+            slot.*.kind = if k == 0 { Kind.pipe_read } else { Kind.pipe_write }
+            slot.*.index = index
+            slot.*.offset = 0
+            slot.*.flags = if k == 0 { Open.READ_ONLY } else { Open.WRITE_ONLY }
+            slot.*.closeOnExec = flags & Open.CLOSE_ON_EXEC != 0
+            fds.*[k] = ends[k]
+            k += 1
+        }
+        return 0
+    }
+
+    pub fn close(self: *Self, fd: isize) -> isize {
+        const slot = self.get(fd)
+        if slot == null { return Status.invalid_handle }
+        release(slot.?)
+        slot.?.*.kind = Kind.none
+        nextGeneration(slot.?)
+        return 0
+    }
+
+    // A descriptor moved into a message that is dropped (its channel
+    // went): what it names is let go.
+    pub fn dropMoved(d: *const Descriptor) -> void { release(d) }
+
+    // `d` (moved in from a message: already held) at the lowest free
+    // slot; its number, or too_many.
+    pub fn insert(self: *Self, d: *const Descriptor) -> isize {
+        const fd = self.lowestFree(0)
+        if fd < 0 { return fd }
+        const slot = &self.*.slots[@bitCast(usize, fd)]
+        slot.*.kind = d.*.kind
+        slot.*.index = d.*.index
+        slot.*.offset = d.*.offset
+        slot.*.flags = d.*.flags
+        slot.*.closeOnExec = false
+        return fd
+    }
+
+    // `fd` taken out of the table without letting go of what it names
+    // (it moves into a message).
+    pub fn takeOut(self: *Self, fd: isize, into: *Descriptor) -> bool {
+        const slot = self.get(fd)
+        if slot == null { return false }
+        into.*.kind = slot.?.*.kind
+        into.*.index = slot.?.*.index
+        into.*.offset = slot.?.*.offset
+        into.*.flags = slot.?.*.flags
+        into.*.closeOnExec = false
+        into.*.generation = 0
+        slot.?.*.kind = Kind.none
+        nextGeneration(slot.?)
+        return true
+    }
+
+    // A copy of `from` (another process's descriptor) at `to` (spawn
+    // gives a new process its handles so).
+    pub fn adoptAt(self: *Self, to: usize, from: *const Descriptor) -> void { self.place(to, from, false) }
+
+    // A slot naming `kind` with `index` (a process, a channel's end: the
+    // caller holds what it names already); its number, or too_many. A
+    // process's or a group's goes when the program is replaced.
+    pub fn openObject(self: *Self, kind: Kind, index: usize, flags: usize) -> isize {
+        const fd = self.lowestFree(0)
+        if fd < 0 { return fd }
+        const slot = &self.*.slots[@bitCast(usize, fd)]
+        slot.*.kind = kind
+        slot.*.index = index
+        slot.*.offset = 0
+        slot.*.flags = flags
+        slot.*.closeOnExec = kind == Kind.process || kind == Kind.group
+        return fd
+    }
+
+    fn nextGeneration(slot: *Descriptor) -> void { slot.*.generation = if slot.*.generation >= 0xFFFFFF { 1 } else { slot.*.generation + 1 } }
+
+    // The generation of `fd`'s slot (0 when it is not open).
+    pub fn generationOf(self: *Self, fd: isize) -> u32 {
+        const slot = self.get(fd)
+        if slot == null { return 0 }
+        return slot.?.*.generation
+    }
+
+    // A copy of `fd` at the lowest free number from `from` on.
+    pub fn duplicate(self: *Self, fd: isize, from: usize, closeOnExec: bool) -> isize {
+        const slot = self.get(fd)
+        if slot == null { return Status.invalid_handle }
+        const copy = self.lowestFree(from)
+        if copy < 0 { return copy }
+        self.place(@bitCast(usize, copy), slot.?, closeOnExec)
+        return copy
+    }
+
+    // A copy of `fd` as `to` (closing what `to` was).
+    pub fn duplicateTo(self: *Self, fd: isize, to: isize) -> isize {
+        const slot = self.get(fd)
+        if slot == null || to < 0 || to >= @intCast(isize, MAX) { return Status.invalid_handle }
+        if fd != to { self.place(@bitCast(usize, to), slot.?, false) }
+        return to
+    }
+
+    // A read: the bytes, 0 at the end, -errno, or wait.BLOCKED with what
+    // to wait for in `waiting`.
+    pub fn read(self: *Self, fd: isize, into: [*]u8, capacity: usize, waiting: *wait.Wait) -> isize {
+        const slot = self.get(fd)
+        if slot == null || !Open.reads(slot.?.*.flags) { return Status.invalid_handle }
+        const d = slot.?
+        if reads(d.*.kind) {
+            const end = pipes.table().at(d.*.index)
+            if capacity == 0 { return 0 }
+            if end.*.count == 0 {
+                if end.ended() { return 0 }
+                waiting.* = wait.Wait.on(wait.WaitKind.pipe_read, @intCast(isize, d.*.index), 0)
+                return wait.BLOCKED
+            }
+            pipes.table().changed()
+            return @intCast(isize, end.read(into, capacity))
+        }
+        if d.*.kind == Kind.socket {
+            const s = sockets.sockets()
+            const got = if s.at(d.*.index).*.kind != sockets.Kind.tcp { s.receiveDatagram(d.*.index, into, capacity, &udpFrom, &udpFromPort) } else { socketApi.receiveBytes(d.*.index, into, capacity) }
+            if got == Status.would_block {
+                if d.*.flags & O_NONBLOCK != 0 { return Status.would_block }
+                waiting.* = wait.Wait.on(wait.WaitKind.socket, @intCast(isize, d.*.index), 0)
+                waiting.*.options = s.generationOf(d.*.index)
+                return wait.BLOCKED
+            }
+            return got
+        }
+        if d.*.kind != Kind.node { return Status.invalid_handle }
+        const tree = vfs.fileSystem()
+        const n = tree.node(d.*.index)
+        if n.*.kind == NodeKind.terminal {
+            const result = terminal.serialConsole().read(into, capacity)
+            if result == wait.BLOCKED { waiting.* = wait.Wait.on(wait.WaitKind.terminal, 0, 0) }
+            return result
+        }
+        if n.*.kind == NodeKind.null_device { return 0 }
+        if n.*.kind == NodeKind.zero_device {
+            Bytes.fill(into, capacity, 0)
+            return @intCast(isize, capacity)
+        }
+        if n.*.kind == NodeKind.directory { return Status.is_directory }
+        if n.*.kind == NodeKind.disk {
+            const got = block.at(n.*.archiveIndex).read(d.*.offset, into, capacity)
+            if got > 0 { d.*.offset += @bitCast(usize, got) }
+            return got
+        }
+        const count = tree.read(d.*.index, d.*.offset, into, capacity)
+        d.*.offset += count
+        return @intCast(isize, count)
+    }
+
+    // A write: the bytes taken, -errno, or wait.BLOCKED (a full pipe).
+    pub fn write(self: *Self, fd: isize, from: [*]const u8, length: usize, waiting: *wait.Wait) -> isize {
+        const slot = self.get(fd)
+        if slot == null || !Open.writes(slot.?.*.flags) { return Status.invalid_handle }
+        const d = slot.?
+        if writes(d.*.kind) {
+            const end = pipes.table().at(d.*.index)
+            if end.broken() { return Status.peer_gone }
+            if length == 0 { return 0 }
+            if !end.writable() {
+                waiting.* = wait.Wait.on(wait.WaitKind.pipe_write, @intCast(isize, d.*.index), 0)
+                return wait.BLOCKED
+            }
+            pipes.table().changed()
+            return @intCast(isize, end.write(from, length))
+        }
+        if d.*.kind == Kind.socket {
+            const s = sockets.sockets()
+            const sent = if s.at(d.*.index).*.kind != sockets.Kind.tcp { s.sendDatagram(d.*.index, stack.ipOf(0, 0, 0, 0), 0, from, length) } else { socketApi.sendBytes(d.*.index, from, length) }
+            if sent == Status.would_block {
+                if d.*.flags & O_NONBLOCK != 0 { return Status.would_block }
+                waiting.* = wait.Wait.on(wait.WaitKind.socket, @intCast(isize, d.*.index), 0)
+                waiting.*.options = s.generationOf(d.*.index)
+                return wait.BLOCKED
+            }
+            return sent
+        }
+        if d.*.kind != Kind.node { return Status.invalid_handle }
+        const tree = vfs.fileSystem()
+        const n = tree.node(d.*.index)
+        if n.*.kind == NodeKind.terminal {
+            terminal.serialConsole().write(from, length)
+            return @intCast(isize, length)
+        }
+        if n.*.kind == NodeKind.null_device || n.*.kind == NodeKind.zero_device { return @intCast(isize, length) }
+        if n.*.kind == NodeKind.directory { return Status.is_directory }
+        if n.*.kind == NodeKind.disk {
+            const put = block.at(n.*.archiveIndex).write(d.*.offset, from, length)
+            if put > 0 { d.*.offset += @bitCast(usize, put) }
+            return put
+        }
+        if d.*.flags & Open.APPEND != 0 { d.*.offset = n.*.size }
+        const written = tree.write(d.*.index, d.*.offset, from, length)
+        if written > 0 { d.*.offset += @bitCast(usize, written) }
+        return written
+    }
+
+    pub fn seek(self: *Self, fd: isize, to: isize, whence: usize) -> isize {
+        const slot = self.get(fd)
+        if slot == null { return Status.invalid_handle }
+        const d = slot.?
+        if d.*.kind != Kind.node { return Status.wrong_kind }
+        const n = vfs.fileSystem().node(d.*.index)
+        if n.*.kind == NodeKind.terminal { return Status.wrong_kind }
+        if whence > 2 { return Status.invalid }
+        var base: isize = 0
+        if whence == 1 { base = @intCast(isize, d.*.offset) }
+        if whence == 2 { base = @intCast(isize, n.*.size) }
+        const position = base + to
+        if position < 0 { return Status.invalid }
+        d.*.offset = @bitCast(usize, position)
+        return position
+    }
+
+    // fstat's struct stat, or statx's.
+    pub fn status(self: *Self, fd: isize, into: [*]u8, statx: bool) -> isize {
+        const slot = self.get(fd)
+        if slot == null { return Status.invalid_handle }
+        const d = slot.?
+        if d.*.kind == Kind.node {
+            Stat.ofNode(d.*.index, into, statx)
+        } else if reads(d.*.kind) || writes(d.*.kind) {
+            Stat.ofPipe(d.*.index, into, statx)
+        } else {
+            return Status.wrong_kind
+        }
+        return 0
+    }
+
+    // A read or write at `offset` of the file `fd` (its own offset and
+    // O_APPEND left as they are): the bytes, -errno, or wait.BLOCKED.
+    pub fn transferAt(self: *Self, fd: isize, buffer: [*]u8, length: usize, offset: usize, writing: bool, waiting: *wait.Wait) -> isize {
+        const slot = self.get(fd)
+        if slot == null { return Status.invalid_handle }
+        if slot.?.*.kind != Kind.node || vfs.fileSystem().node(slot.?.*.index).*.kind == NodeKind.terminal { return Status.wrong_kind }
+        if @bitCast(isize, offset) < 0 { return Status.invalid }
+        const saved = slot.?.*.offset
+        const savedFlags = slot.?.*.flags
+        slot.?.*.offset = offset
+        slot.?.*.flags &= ~Open.APPEND
+        const result = if writing { self.write(fd, buffer, length, waiting) } else { self.read(fd, buffer, length, waiting) }
+        slot.?.*.offset = saved
+        slot.?.*.flags = savedFlags
+        return result
+    }
+
+    // Whether `fd` is the terminal.
+    pub fn isTerminal(self: *Self, fd: isize) -> bool {
+        const slot = self.get(fd)
+        if slot == null || slot.?.*.kind != Kind.node { return false }
+        return vfs.fileSystem().node(slot.?.*.index).*.kind == NodeKind.terminal
+    }
+
+    // Whether `fd` could be read (POLLIN) or written (POLLOUT) without
+    // waiting.
+    pub fn readable(self: *Self, fd: isize) -> bool {
+        const slot = self.get(fd)
+        if slot == null { return false }
+        const d = slot.?
+        if d.*.kind == Kind.socket { return socketApi.readable(d.*.index) }
+        if reads(d.*.kind) { return pipes.table().at(d.*.index).readable() }
+        if d.*.kind != Kind.node { return false }
+        if vfs.fileSystem().node(d.*.index).*.kind == NodeKind.terminal { return terminal.serialConsole().pending() }
+        return true
+    }
+
+    pub fn writable(self: *Self, fd: isize) -> bool {
+        const slot = self.get(fd)
+        if slot == null { return false }
+        const d = slot.?
+        if d.*.kind == Kind.socket { return socketApi.writable(d.*.index) }
+        if writes(d.*.kind) { return pipes.table().at(d.*.index).writable() }
+        return d.*.kind == Kind.node
+    }
+
+    // getdents64: ".", "..", then the directory's entries, from the
+    // descriptor's offset (the next slot + 2).
+    pub fn entries(self: *Self, fd: isize, into: [*]u8, capacity: usize) -> isize {
+        const slot = self.get(fd)
+        if slot == null { return Status.invalid_handle }
+        const d = slot.?
+        if d.*.kind != Kind.node { return Status.not_directory }
+        const tree = vfs.fileSystem()
+        const directory = d.*.index
+        if !tree.node(directory).isDirectory() { return Status.not_directory }
+        var used: usize = 0
+        while d.*.offset < tree.slotCount(directory) + 2 {
+            const at = d.*.offset
+            var name: [*]const u8 = undefined
+            var nameLength: usize = 0
+            var target: usize = 0
+            if at < 2 {
+                name = unsafe { @ptrCast([*]const u8, "..") }
+                nameLength = at + 1
+                target = if at == 0 { directory } else { tree.node(directory).*.parent }
+            } else {
+                target = tree.entry(directory, at - 2, &name, &nameLength)
+            }
+            if target != vfs.Vfs.NONE {
+                // d_ino, d_off, d_reclen, d_type, the name and its NUL, to 8.
+                const size = (19 + nameLength + 1 + 7) / 8 * 8
+                if used + size > capacity {
+                    if used == 0 { return Status.invalid }
+                    break
+                }
+                const record: [*]u8 = unsafe { @ptrFromInt([*]u8, @intFromPtr(into) + used) }
+                Bytes.fill(record, size, 0)
+                Bytes.write64(record, 0, target)
+                Bytes.write64(record, 8, at + 1)
+                Bytes.write16(record, 16, size)
+                const kind = tree.node(target).*.kind
+                record[18] = if kind == NodeKind.directory { DT_DIR } else if kind == NodeKind.file || kind == NodeKind.archive { DT_REG } else if kind == NodeKind.symlink { DT_LNK } else if kind == NodeKind.fifo { DT_FIFO } else { DT_CHR }
+                Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(record) + 19) }, name, nameLength)
+                used += size
+            }
+            d.*.offset += 1
+        }
+        return @intCast(isize, used)
+    }
+}

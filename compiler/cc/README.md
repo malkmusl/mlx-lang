@@ -188,6 +188,170 @@ interpreter; `--dynamic-linker PATH` (also `-Wl,--dynamic-linker=PATH`)
 names another, such as mlxlibc's `libmlxc.so.1`, so it starts on that
 alone.
 
+## The LIR back end
+
+By default (`-fbackend=lir`, or `MLX_CC_BACKEND=lir` in the
+environment; `-fbackend=stack` or `MLX_CC_BACKEND=stack` is the stack
+machine alone, and the environment leaves the command line, and so `mlx
+build`'s cache keys, as they are) each function body is made not as the
+stack machine of gen.mlx but as the Mlx compiler's own intermediate
+representation, LIR (`compiler/selfhost/ir`),
+which mlx4's optimizer (constants folded, loads of locals forwarded and
+locals held as values, copies propagated, a load of what the block
+loaded already a copy of it, stores and dead values dropped,
+blocks only fallen into joined to the block before them, the most used
+locals and parameters of a function in rbx, r12, r13, r14 and r15,
+`int`, `unsigned` and byte locals among them, each register kept
+extended to the word)
+and its x86-64 back end (a block's intermediate values in rsi, rdi, r8,
+r9 and r10 until a call or the block's end, an operand read last
+operated on in its own register, loads and leas straight into theirs,
+a call's arguments moved from wherever they are at once, `p[i]` one
+indexed load, store or lea)
+then turn into code, through the one encoder both share. The
+lowering is `ir.mlx` (the syntax tree to LIR: the C semantics, the
+System V classification of calls and parameters) and `irgen.mlx` (the
+LIR through mlx4's passes and back end into the object, and the few
+instructions the back end leaves to its client). A function the lowering
+does not cover yet (`ir.unsupported` says which) is made by the stack
+machine as before, in the same object: the two agree on the ABI, the
+frame pointer, the data area, the symbols and the labels, so a program
+may mix them freely. `MLX_CC_STATS` counts the functions each way and the
+reasons; `MLX_CC_LIR_TRACE` prints every function's LIR as lowered and as
+optimized, with its locals and its frame; `MLX_CC_LIR_LIMIT=N` lowers
+only the first N functions of the run, the rest by the stack machine, to
+find by bisection the function a lowering gets wrong.
+
+What C needs that mlx4's LIR did not have, added to it with mlx4's own
+output byte for byte as before (its lowering makes none of them):
+
+- `extend` (arg0 made canonical for an integer of arg1 bits, sign- or
+  zero-extended): C's narrow arithmetic. Every integer is 64 bits wide in
+  the LIR and kept canonical for its C type, as the stack machine keeps
+  rax; an `int` sum is a 64-bit `add` and an `extend 32`. The lowering
+  remembers what each value is canonical for already (a narrow load, an
+  extend, a comparison's 0 or 1, a local's value, a call's narrow result
+  the back end extends) and extends no such value again; the optimizer
+  folds an extend of a constant, and one of a load or an extend of the
+  same width and sign.
+- `frame_local` (arg0 the offset of a place of the frame, below rbp or,
+  negative, the caller's arguments above it): a local whose address is
+  taken, an aggregate, a parameter passed in memory, each where
+  genstmt.assignOffsets put it; the back end reads and writes the place
+  directly (`mov rax, [rbp - 24]`), and fuses a constant member offset
+  into the access. A scalar local whose address is never taken (`p += 1`
+  takes it as `tmp = &p; *tmp = *tmp + 1`; the lowering reads through
+  such a temporary) is an 8-byte `alloca` holding its canonical value,
+  what the optimizer promotes and the register pass may hold in a
+  register. The back end's `State` in its client mode (`preciseSlots`)
+  gives the slot of a value read for the last time to the next value
+  (`releaseDead` after each instruction; a value made before a loop and
+  read in it lives to the loop's back edge; a gep fused into the access
+  after it keeps its operands until then), and sizes the frame by the
+  most values live at once, not by the function's instructions: a
+  thousand-case switch no longer takes eight bytes a case, and
+  JavaScriptCore's DFG fits its 1 MB compiler threads.
+- `external` and `external_value` (arg0 the client's word, arg1 and arg2
+  its operands in extraData): an instruction the back end leaves to the
+  client, which runs the emission loop itself and emits these with the
+  x86.mlx and gen.mlx it has: the address of a global (its definition in
+  the data area, a name of another object, a thread-local variable's, an
+  import's), a memzero, the bit builtins, `pause` and the fences, and an
+  asm statement with operands (its assembled bytes between the loads of
+  its register operands from their slots and the stores back, as
+  gen.genAsmCode emits them). An
+  `external` may read and write memory and is a barrier to the passes
+  that keep values in or out of it; an `external_value` is an address
+  computed, dropped when nothing reads it.
+- `FLAG_C_CALL` on a call or a return: the C ABI's conventions. A call
+  sets al to the number of vector registers its arguments take (a
+  variadic callee reads it), so a call through a pointer goes through
+  r11; a narrow result has its upper bits made canonical. A struct
+  returned in registers is a tuple of its eightbytes (an integer one in
+  rax then rdx, a floating one in xmm0 then xmm1, by class), returned as
+  a `tuple_literal` and read from a call as `tuple_element`s; one over 16
+  bytes goes through the hidden first parameter, as the stack machine
+  passes it. A struct argument passed in registers is its eightbytes as
+  separate arguments; one passed in memory is its words, after every
+  argument passed in a register, the integer registers padded to six
+  with zeros when any argument goes to the stack so that the back end's
+  own counting puts no word of them in a register.
+- `optimize.runLocal`: the passes within one function (no dead function
+  removal, no escape analysis of the arena, which the C code never
+  allocates from), for an LIR holding one function at a time; the back
+  end's `State` takes the function's block labels from a base
+  (`.block_N`, unique in the object), the C frame's size (the LIR's
+  value slots lie below genstmt's locals) and a slot budget of 8 bytes
+  per instruction (C values are one word).
+
+Calls are inlined (`-fno-inline`, `MLX_CC_INLINE=0`: not): a direct
+call of a function of the unit whose body is small (48 nodes of the
+syntax tree; 600 for one declared `always_inline`; never one declared
+`noinline`, variadic, or recursive into itself) is lowered as the body
+in place of the call, to a depth of 4 and 20000 nodes a caller
+(libpas's always_inline chains, which pass their configurations as
+structs by value, fit). The arguments are stored into the parameters,
+which are locals of the caller from then on (slots, or places of its
+frame below its own locals; a struct's bytes copied into its place), a
+`return` stores the result into a slot (a struct is made into the
+call's buffer; a reference is the object's address, which the call's
+dereference reads through) and branches to the block after the body,
+and the body's labels are salted per site. A pointer or reference parameter given a
+local's address (`this`, `const T &`, through `&*p` or a cast) that the
+body only reads through, or copies (`tmp = this`, a compound
+assignment's temporary) or passes on to another body inlined, is an
+alias of that local: no address is stored, `p->m` is the local's
+member. A call that is a statement (`a += b;`) does not deliver its
+result, so a `return *this` leaves `this` an alias. After the body, a
+place of the frame that is only loaded and stored whole, one width
+(such a local of one scalar member, LayoutUnit or RefPtr, a parameter
+or temporary of such a type, a struct copied through) becomes an 8-byte
+slot like a scalar local's, which the optimizer forwards loads of and
+the register pass may keep in a register (`MLX_CC_PROMOTE=0`: not;
+ir.promotePlaces). A place that is copied, passed on by value and read
+in parts, but whose address nothing else takes (a struct passed by
+value through inlined calls: libpas's heap configuration, a 1 KiB
+compound literal handed down ten `always_inline` levels), has its
+loads folded in the shared LIR (`compiler/selfhost/ir/region_loads.mlx`,
+after single-store promotion and copy propagation): a load is the value
+the last write of its bytes left there, followed through each copy back
+to the store, the zeroing or the constant bytes it came from, and with
+the load's register class (a double's bits read as a word are bitcast);
+a place then read by nothing loses its writes, the copies into it with
+them. What is left of the frame's places is packed after the optimizer
+(`compiler/selfhost/ir/frame.mlx`, a `frame_local` carrying its place's
+size), so the frame is as big as what is still reached. To narrow a
+miscompilation: `MLX_CC_NO_REGION_FOLD` and `MLX_CC_NO_REGION_DROP` turn
+the folding or the dropping off, `MLX_CC_REGION_ONLY=TEXT` keeps both
+to the units whose path holds TEXT, `MLX_CC_REGION_FUNCTION=TEXT` to the
+functions whose symbol holds it, and `MLX_CC_REGION_LIMIT=N` folds at
+most N loads of a function, to find the wrong one by bisection;
+`MLX_CC_LIR_TRACE` prints each function's regions (loads folded, writes
+and places dropped, why the others were not folded), each fold (the
+load, the write followed, the value) and the frame before and after
+packing. `tests/pasconfig.c` is libpas's shape; tools/check_cc.sh checks
+that its `allocate` keeps no copy, no zeroing and no place of the
+configuration. An inline function of a header (a weak
+symbol) is still made in a unit that inlines every call of it, as a
+call would have it: another unit may call it with only its declaration
+in sight (WebCore's `*Inlines.h`). `MLX_CC_STATS` counts the calls
+inlined and the places promoted, `MLX_CC_LIR_TRACE` names them, the
+parameters bound as aliases and why a local keeps none.
+
+What stays the stack machine's, function by function: `long double`
+(the x87 stack is not in the LIR), wide integers, variadic function
+definitions and `va_arg`, `cpuid`, `rdtsc` and the other asm forms the
+compiler knows by name, computed `goto`, `__builtin_alloca`, 16-byte
+atomics, `setjmp`'s returns, and arguments passed in memory at an
+alignment of 16. File-scope `asm` is the object's as before.
+
+Measured (tools/check_cc_projects.sh's SQLite 3.46.1 amalgamation, this
+machine): the shell compiles in 1.8 s against 1.3 s (2468 of its 2495
+functions lowered), its program is 3.3 MB against 4.2 MB, and a workload
+of 300,000 rows inserted, indexed, grouped, joined and updated runs in
+1.4 to 1.8 s against 2.8 to 3.4 s. JavaScriptCore built so passes
+check_jsc_mlxlibc.sh, bench.js in 0.75 s against 1.05 to 1.3 s.
+
 ## Headers
 
 `include/` holds mlx-cc's own C headers (`stdio.h`, `stdlib.h`,
@@ -209,13 +373,15 @@ in `/usr/local/lib/mlx-cc/include`.
 | Constants and strings | `literal.mlx`, `extended.mlx` (long double constants) |
 | Types and syntax tree | `types.mlx`, `ast.mlx` |
 | Parser | `cursor.mlx`, `state.mlx`, `scope.mlx`, `decl.mlx`, `initializer.mlx`, `expr.mlx`, `stmt.mlx`, `typing.mlx`, `eval.mlx` |
-| Code | `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions) |
+| Code | `ir.mlx`, `irgen.mlx` (function bodies through mlx4's LIR and back end, below), `x86.mlx` (instructions), `gen.mlx` (expressions, calls), `genstmt.mlx` (statements, functions: the stack machine) |
 | Object and program | `program.mlx` (linking by name, data area, the relocatable object; the program through mlx-ld), `compiler/ld/main.mlx` (mlx-ld: `compiler/selfhost/object/link.mlx` as a program, the link map), `ar.mlx` (mlx-ar) |
 | The C variant | `standard.mlx` (`-std=`: the macros, the keywords) |
 | Prefix snapshots | `snapshot.mlx` (below) |
 | Driver | `main.mlx` |
 
-The code generator is a stack machine on rax (xmm0 for floating values),
+Function bodies go through mlx4's LIR ("The LIR back end", below); what
+its lowering does not cover, and everything around the bodies, is the
+stack machine's: a stack machine on rax (xmm0 for floating values),
 with every integer kept canonical for its type in the whole register.
 Calls follow the System V AMD64 ABI, structs passed and returned by value
 included, and variadic functions set up the ABI's register save area so a
@@ -468,14 +634,24 @@ plain C as predefined macros (`__builtin_memcpy`, `__builtin_expect`,
 `__builtin_isnan`, `__builtin_inf`, `__builtin_constant_p` as 0, ...;
 `tests/builtins.c` against gcc; `__builtin_frame_address(n)` and
 `__builtin_return_address(n)` walk the rbp chain every function keeps).
-`<mmintrin.h>`, `<xmmintrin.h>` and `<emmintrin.h>` (and
-`smmintrin.h`, `immintrin.h`, `x86intrin.h` over them) give all of
-x86-64's baseline intrinsics, MMX's, SSE's and SSE2's, as plain
-functions over unions of lanes (`__m64`, `__m128`, `__m128d`,
-`__m128i`, 16-byte aligned), with the instructions' results
-(`tests/ssebaseline.c` against gcc's build, `tests/cpp/ssebaseline.cpp`):
-SIMDe's native x86 path compiles on them (`SIMDE_X86_SSE2_NATIVE`,
-which WebKit's port defines). `__SSE__` and `__SSE2__` are not
+`<mmintrin.h>`, `<xmmintrin.h>` and `<emmintrin.h>` give all of
+x86-64's baseline intrinsics, MMX's, SSE's and SSE2's, over unions of
+lanes (`__m64`, `__m128`, `__m128d`, `__m128i`, 16-byte aligned); each
+SSE one is its instruction: `__builtin_mlxcc_asm(text, a, b, c)` runs
+the assembled text with a, b and c in rdi, rsi and rdx and rax its
+result, so `_mm_add_epi8` is two `movdqu`, a `paddb` and a `movdqu`
+back, and nothing else once inlined (the ones with an immediate are
+macros of a statement expression over `__builtin_mlxcc_asmi(text, i,
+...)`, which puts the constant in for `%i`; the lane sets and
+extractions are plain stores and loads). `<pmmintrin.h>`,
+`<tmmintrin.h>`, `<smmintrin.h>` and `<nmmintrin.h>` (`immintrin.h`
+and `x86intrin.h` over them) add SSE3, SSSE3, SSE4.1 and SSE4.2 the
+same way (x86-64-v2: `pshufb`, the blends, `ptest`, the widening
+conversions, the roundings, `pcmpgtq`; the horizontal sums and dot
+products lane by lane). `tests/ssebaseline.c` and `tests/sse4.c` print
+what gcc's build does, `tests/fixedasm.c` the builtin alone,
+`tests/cpp/ssebaseline.cpp` in C++. SIMDe's native x86 path compiles
+on them (`SIMDE_X86_SSE2_NATIVE`, which WebKit's port defines). `__SSE__` and `__SSE2__` are not
 predefined, there being no GCC vector types, which code testing them
 takes to come with the intrinsics. C++20's three-way comparison `<=>`
 (`tests/cpp/compare.cpp`) gives a class's operator function or, between
@@ -656,8 +832,10 @@ body is not made for a call in an unevaluated operand
 An error inside a template instance names the instances being read and
 where each was needed. WTF's `Assertions.cpp` compiles with what came
 next (`tests/cpp/wtfforms2.cpp`, `wtfforms3.cpp`): GCC's
-`__builtin_add_overflow`, `sub` and `mul` (computed exactly in a
-130-bit integer); a member's default argument read when a call needs
+`__builtin_add_overflow`, `sub` and `mul` (the instruction and its
+overflow flag when the operands and the result are one 4- or 8-byte
+integer type, WTF's `Checked<T>`; computed exactly in a 130-bit
+integer otherwise, `tests/overflowfast.c`); a member's default argument read when a call needs
 it (it may name members declared later); a class nested in a class or
 a class template defined outside it (`template <..> class Outer::Inner
 {...}`); a constexpr function reading a string literal, taking a
@@ -814,7 +992,16 @@ GNU as makes it, the stack 16-byte aligned at a call (libpas's
 double-free check), and the data directives (`tests/inlineasm.c`
 against gcc's build;
 `tests/asmencoding.c` prints each instruction's bytes, which are GNU
-as's). JavaScriptCore's copy loops for the garbage collector
+as's). For boot code (brixOS's boot blob, projects/brix/image) top-level
+assembly also has `.code16`, `.code32` and `.code64`, `.org`, `.set`,
+the system instructions (cli, sti, hlt, lgdt, lidt, ltr, invlpg,
+swapgs, rdmsr, wrmsr, iretq, lretq, ljmp, in, out, fxsave, fxrstor,
+the control and segment registers), segment overrides (`%gs:8`) and
+relocations for `movabs $symbol, %reg` and `ljmp $sel, $symbol`
+(`tests/bootasm.c`). The SSE instructions are SSE2's, SSSE3's and SSE4's over packed
+values too (`paddb` to `pcmpgtq`, the shuffles, blends and roundings
+with their immediates, `pmovmskb`, `ptest`): the legacy encodings of
+the VEX.128 ones WebAssembly's interpreter uses, from the same table. JavaScriptCore's copy loops for the garbage collector
 (`movups` through `xmm0`-`xmm3` with local labels), `rep stosq`, `divq`
 and the register saves of its stack scan are written so.
 JavaScriptCore came next (its build without JIT): its first unified
@@ -913,9 +1100,11 @@ into every C++ program by itself as `libmlxcpp.a` from `$MLX_CC_LIB`,
   thread-local variable is the program's own (local exec): one in a
   shared library, or a C++ `thread_local` object constructed per
   thread, is not supported (the main thread's is constructed at start). Inline
-  `asm` has no floating-point register operands (`x`, `t`), no `asm
-  goto`, no data naming a symbol and no other sections; the x87 and AVX
-  instructions are not assembled. No `_Float16`; and with no GCC vector
+  `asm` has no floating-point register operands (`x`, `t`; the
+  intrinsics headers get by with `__builtin_mlxcc_asm`), no `asm goto`,
+  no data naming a symbol and no other sections; the x87 instructions,
+  and of AVX only the VEX.128 ones the WebAssembly interpreter uses,
+  are assembled. No `_Float16`; and with no GCC vector
   types `__SSE__` and `__SSE2__` are not predefined, though the
   intrinsics are there.
 - `va_arg` of a struct of 16 bytes or less reads it from the stack, where

@@ -1,0 +1,235 @@
+// Events (spec/04-stdlib/os/brix.xml, <Events>): what happens to a
+// process (Ctrl-C at its session, a child that changed, a fault, a
+// request to end or stop) as a record of a kind and a detail. A kind the
+// program has not claimed takes its default action (end, stop, go on, or
+// nothing); a claimed one waits in the process's queue for the program,
+// which takes it, or the kernel runs the program's one upcall for it.
+//
+// A process that never claimed a kind nor set an upcall sees events
+// through the Linux layer's view instead (linux/signals.mlx: signal
+// numbers, handlers, masks): the scheduler hands its events there.
+const Frame = @import("./frame.mlx").Frame
+const Sse = @import("./frame.mlx").Sse
+const Bytes = @import("./bytes.mlx").Bytes
+const layout = @import("../layout.mlx")
+
+pub const Event = struct {
+    pub const INTERRUPT: u32 = 1
+    pub const QUIT: u32 = 2
+    pub const SUSPEND: u32 = 3
+    pub const RESUME: u32 = 4
+    pub const TERMINATE: u32 = 5
+    pub const HANGUP: u32 = 6
+    pub const CHILD: u32 = 7
+    pub const FAULT: u32 = 8
+    pub const READ_BEHIND: u32 = 9
+    pub const HALT: u32 = 10
+    pub const KILL: u32 = 11
+    // Nothing to do by default: the session's size changed, urgent data.
+    pub const NOTICE: u32 = 12
+    // Ends by default: one the program and its senders give a meaning.
+    pub const USER: u32 = 13
+    // Ends by default: the process wrote to a stream whose reader is gone.
+    pub const BROKEN: u32 = 14
+    pub const COUNT: u32 = 15
+
+    pub fn valid(kind: u32) -> bool { return kind >= 1 && kind < COUNT }
+
+    pub fn bit(kind: u32) -> u32 {
+        const one: u32 = 1
+        return one << @intCast(u5, kind)
+    }
+
+    pub fn claimable(kind: u32) -> bool { return valid(kind) && kind != HALT && kind != KILL }
+
+    pub fn stops(kind: u32) -> bool { return kind == SUSPEND || kind == READ_BEHIND || kind == HALT }
+
+    pub fn ignoredByDefault(kind: u32) -> bool { return kind == CHILD || kind == NOTICE || kind == RESUME }
+}
+
+// A record as events_take gives it.
+pub const Record = struct {
+    kind: u32
+    detail: u32
+    // The process that sent it (0: the kernel).
+    sender: u32
+    reserved: u32
+}
+
+// How a process ended: by process_exit (a code) or by an event.
+pub const Ending = struct {
+    exited: bool
+    code: usize
+    kind: u32
+    detail: u32
+
+    pub fn exit(code: usize) -> Ending { return Ending.{ .exited = true, .code = code & 255, .kind = 0, .detail = 0 } }
+
+    pub fn event(kind: u32, detail: u32) -> Ending { return Ending.{ .exited = false, .code = 0, .kind = kind, .detail = detail } }
+}
+
+// A change of a process its parent has not taken yet.
+pub const Change = struct {
+    pub const NONE: u8 = 0
+    pub const STOPPED: u8 = 1
+    pub const WENT_ON: u8 = 2
+
+    what: u8
+    // The event that stopped it.
+    kind: u32
+    detail: u32
+
+    pub fn none() -> Change { return Change.{ .what = NONE, .kind = 0, .detail = 0 } }
+}
+
+// A process's events.
+pub const Events = struct {
+    pub const QUEUE: usize = 16
+    // The context record an upcall gets: the registers (a Frame), then
+    // the SSE registers (16-aligned).
+    pub const CONTEXT_SIZE: usize = 176 + 16 + Sse.SIZE
+    const ALIGN_16: usize = 0xFFFFFFFFFFFFFFF0
+    const ALIGN_64: usize = 0xFFFFFFFFFFFFFFC0
+    const USER_FLAGS: usize = 0x40DD5
+    const IF_FLAG: usize = 0x202
+
+    // The process claimed a kind or set an upcall: its events are its
+    // own (not the Linux layer's view).
+    native: bool
+    claimed: u32
+    queue: [QUEUE]Record
+    count: usize
+    upcallEntry: usize
+    upcallStack: usize
+    upcallSize: usize
+    inUpcall: bool
+
+    pub fn init(self: *Self) -> void {
+        self.*.native = false
+        self.*.claimed = 0
+        self.*.count = 0
+        self.*.upcallEntry = 0
+        self.*.upcallStack = 0
+        self.*.upcallSize = 0
+        self.*.inUpcall = false
+    }
+
+    // A branch's child: what its parent claimed and its upcall; nothing
+    // queued.
+    pub fn inherit(self: *Self, parent: *const Self) -> void {
+        self.init()
+        self.*.native = parent.*.native
+        self.*.claimed = parent.*.claimed
+        self.*.upcallEntry = parent.*.upcallEntry
+        self.*.upcallStack = parent.*.upcallStack
+        self.*.upcallSize = parent.*.upcallSize
+    }
+
+    // Another program in the process: nothing claimed, no upcall; what
+    // is queued stays.
+    pub fn replace(self: *Self) -> void {
+        self.*.native = false
+        self.*.claimed = 0
+        self.*.upcallEntry = 0
+        self.*.upcallStack = 0
+        self.*.upcallSize = 0
+        self.*.inUpcall = false
+    }
+
+    pub fn claim(self: *Self, kinds: u32) -> void {
+        self.*.native = true
+        self.*.claimed = kinds & ~(Event.bit(Event.HALT) | Event.bit(Event.KILL))
+    }
+
+    pub fn isClaimed(self: *const Self, kind: u32) -> bool { return self.*.claimed & Event.bit(kind) != 0 }
+
+    pub fn setUpcall(self: *Self, entry: usize, stack: usize, size: usize) -> void {
+        self.*.native = true
+        self.*.upcallEntry = entry
+        self.*.upcallStack = stack
+        self.*.upcallSize = size
+    }
+
+    // `record` queued: once for a kind and detail; a resumption drops the
+    // stops that wait, a stop the resumption; lost when the queue is full.
+    pub fn add(self: *Self, record: Record) -> void {
+        if record.kind == Event.RESUME { self.drop(Event.bit(Event.SUSPEND) | Event.bit(Event.READ_BEHIND) | Event.bit(Event.HALT)) }
+        if Event.stops(record.kind) { self.drop(Event.bit(Event.RESUME)) }
+        var k: usize = 0
+        while k < self.*.count {
+            if self.*.queue[k].kind == record.kind && self.*.queue[k].detail == record.detail { return }
+            k += 1
+        }
+        if self.*.count == QUEUE { return }
+        self.*.queue[self.*.count] = record
+        self.*.count += 1
+    }
+
+    fn drop(self: *Self, kinds: u32) -> void {
+        var kept: usize = 0
+        var k: usize = 0
+        while k < self.*.count {
+            if kinds & Event.bit(self.*.queue[k].kind) == 0 {
+                self.*.queue[kept] = self.*.queue[k]
+                kept += 1
+            }
+            k += 1
+        }
+        self.*.count = kept
+    }
+
+    // The index of the first record the kernel acts on now (one not
+    // claimed, or a claimed one when the upcall can run); count when none.
+    pub fn next(self: *const Self) -> usize {
+        var k: usize = 0
+        while k < self.*.count {
+            const kind = self.*.queue[k].kind
+            if !self.isClaimed(kind) { return k }
+            if self.*.upcallEntry != 0 && !self.*.inUpcall { return k }
+            k += 1
+        }
+        return self.*.count
+    }
+
+    pub fn removeAt(self: *Self, index: usize) -> Record {
+        const record = self.*.queue[index]
+        var k = index
+        while k + 1 < self.*.count {
+            self.*.queue[k] = self.*.queue[k + 1]
+            k += 1
+        }
+        self.*.count -= 1
+        return record
+    }
+
+    // Whether the kernel has an event to act on (a waiting process wakes).
+    pub fn pending(self: *const Self) -> bool { return self.next() < self.*.count }
+
+    // The upcall runs on return (`frame`: the process's registers): the
+    // registers and SSE registers in a context record at the top of the
+    // upcall's stack (`base`, writable: contextAt's), entry(context).
+    pub fn contextAt(self: *const Self) -> usize { return ((self.*.upcallStack + self.*.upcallSize - CONTEXT_SIZE) & ALIGN_64) }
+
+    pub fn enter(self: *Self, frame: *Frame, base: usize) -> void {
+        Bytes.copy(Bytes.pointer(base), Bytes.pointer(@intFromPtr(frame)), 176)
+        Bytes.copy(Bytes.pointer(base + 192), frame.sse(), Sse.SIZE)
+        frame.*.rsp = base - 8
+        frame.*.rip = self.*.upcallEntry
+        frame.*.rdi = base
+        frame.*.rflags = frame.*.rflags & ~@intCast(usize, 0x500)
+        Sse.reset(frame.sse())
+        self.*.inUpcall = true
+    }
+
+    // upcall_return: the registers the context record at `base`
+    // (readable) holds.
+    pub fn leave(self: *Self, frame: *Frame, base: usize) -> void {
+        Bytes.copy(Bytes.pointer(@intFromPtr(frame)), Bytes.pointer(base), 176)
+        Bytes.copy(frame.sse(), Bytes.pointer(base + 192), Sse.SIZE)
+        Bytes.write32(frame.sse(), 24, Bytes.read32(frame.sse(), 24) & 0xFFFF)
+        frame.*.rflags = (frame.*.rflags & USER_FLAGS) | IF_FLAG
+        frame.*.cs = layout.Selector.USER_CODE
+        frame.*.ss = layout.Selector.USER_DATA
+        self.*.inUpcall = false
+    }
+}

@@ -1,0 +1,276 @@
+// The serial line as a terminal: the termios a program sets (TCSETS) and
+// what it means here. Output: OPOST with ONLCR turns "\n" into "\r\n".
+// Input: canonical mode (ICANON) edits a line (ECHO, erase, kill, EOF)
+// and gives it at its end; raw mode gives the bytes as they come. ICRNL
+// turns the carriage return a terminal sends for Enter into "\n". The
+// bytes that come are taken when they come (receive: the serial line's
+// interrupt) into a queue; ISIG's characters are seen there (Ctrl-C an
+// interrupt, Ctrl-\ quit, Ctrl-Z suspend for the foreground group), so they
+// reach a program that does not read.
+const serial = @import("./serial.mlx")
+const cpu = @import("./cpu.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const wait = @import("./wait.mlx")
+
+pub const Terminal = struct {
+    // struct termios (Linux's kernel layout): four flag words, the line
+    // discipline, the control characters.
+    pub const TERMIOS_SIZE: usize = 36
+    pub const LINE_CAPACITY: usize = 1024
+    pub const QUEUE_CAPACITY: usize = 4096
+    const INPUT_FLAGS: usize = 0
+    const OUTPUT_FLAGS: usize = 4
+    const CONTROL_FLAGS: usize = 8
+    const LOCAL_FLAGS: usize = 12
+    const CHARACTERS: usize = 17
+    const ICRNL: usize = 0x100
+    const OPOST: usize = 0x1
+    const ONLCR: usize = 0x4
+    const ICANON: usize = 0x2
+    const ECHO: usize = 0x8
+    const ISIG: usize = 0x1
+    const VINTR: usize = 0
+    const VQUIT: usize = 1
+    const VSUSP: usize = 10
+    // The events of ISIG's characters (events.mlx: interrupt, quit,
+    // suspend).
+    const INTERRUPT: usize = 1
+    const QUIT: usize = 2
+    const SUSPEND: usize = 3
+    const VERASE: usize = 2
+    const VKILL: usize = 3
+    const VEOF: usize = 4
+    const VMIN: usize = 6
+    const BACKSPACE: u8 = 8
+
+    uart: serial.Uart
+    termios: [TERMIOS_SIZE]u8
+    // Canonical mode: the line being edited, then (once it ends) given
+    // out from lineGiven to lineReady before the next is edited.
+    line: [LINE_CAPACITY]u8
+    lineLength: usize
+    lineReady: usize
+    lineGiven: usize
+    // EOF typed on an empty line (the next read gives 0).
+    endOfFile: bool
+    // The events ISIG's characters asked for (a bit each, by kind),
+    // for the foreground group.
+    signalsDue: usize
+    // The bytes that came and were not read yet (a ring).
+    queue: [QUEUE_CAPACITY]u8
+    queueHead: usize
+    queueCount: usize
+
+    // A cooked terminal on `uart`: ICRNL IXON, OPOST ONLCR, B38400 CS8
+    // CREAD, ISIG ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN, the
+    // usual characters.
+    pub fn init(self: *Self, uart: serial.Uart) -> void {
+        self.*.uart = uart
+        Bytes.fill(&self.*.termios, TERMIOS_SIZE, 0)
+        Bytes.write32(&self.*.termios, INPUT_FLAGS, 0x500)
+        Bytes.write32(&self.*.termios, OUTPUT_FLAGS, 0x5)
+        Bytes.write32(&self.*.termios, CONTROL_FLAGS, 0xBF)
+        Bytes.write32(&self.*.termios, LOCAL_FLAGS, 0x8A3B)
+        self.*.termios[CHARACTERS + VINTR] = 3
+        self.*.termios[CHARACTERS + VQUIT] = 28
+        self.*.termios[CHARACTERS + VSUSP] = 26
+        self.*.termios[CHARACTERS + VERASE] = 127
+        self.*.termios[CHARACTERS + VKILL] = 21
+        self.*.termios[CHARACTERS + VEOF] = 4
+        self.*.termios[CHARACTERS + VMIN] = 1
+        self.*.lineLength = 0
+        self.*.lineReady = 0
+        self.*.lineGiven = 0
+        self.*.endOfFile = false
+        self.*.signalsDue = 0
+        self.*.queueHead = 0
+        self.*.queueCount = 0
+    }
+
+    fn flags(self: *const Self, which: usize) -> usize { return Bytes.read32(&self.*.termios, which) }
+
+    fn character(self: *const Self, which: usize) -> u8 { return self.*.termios[CHARACTERS + which] }
+
+    fn canonical(self: *const Self) -> bool { return self.flags(LOCAL_FLAGS) & ICANON != 0 }
+
+    pub fn getAttributes(self: *const Self, into: [*]u8) -> void { Bytes.copy(into, &self.*.termios, TERMIOS_SIZE) }
+
+    pub fn setAttributes(self: *Self, from: [*]const u8) -> void { Bytes.copy(&self.*.termios, from, TERMIOS_SIZE) }
+
+    pub fn write(self: *const Self, bytes: [*]const u8, length: usize) -> void {
+        const translate = self.flags(OUTPUT_FLAGS) & (OPOST | ONLCR) == (OPOST | ONLCR)
+        var k: usize = 0
+        while k < length {
+            if bytes[k] == 10 && translate { self.*.uart.put(13) }
+            self.*.uart.put(bytes[k])
+            k += 1
+        }
+    }
+
+    // The bytes the line has into the queue. ISIG's characters are not
+    // queued: they ask for their signal and drop what was typed (echoed as
+    // ^C, ^\ or ^Z in canonical mode).
+    pub fn receive(self: *Self) -> void {
+        while self.*.uart.ready() {
+            const byte = @intCast(u8, cpu.Port.in8(self.*.uart.port))
+            const signal = self.signalOf(byte)
+            if signal != 0 {
+                if self.canonical() && self.flags(LOCAL_FLAGS) & ECHO != 0 {
+                    self.echoText(if signal == INTERRUPT { "^C\r\n" } else if signal == QUIT { "^\\\r\n" } else { "^Z\r\n" })
+                }
+                self.*.lineLength = 0
+                self.*.queueCount = 0
+                const one: usize = 1
+                self.*.signalsDue |= one << @intCast(u6, signal)
+                continue
+            }
+            if self.*.queueCount < QUEUE_CAPACITY {
+                self.*.queue[(self.*.queueHead + self.*.queueCount) % QUEUE_CAPACITY] = byte
+                self.*.queueCount += 1
+            }
+        }
+    }
+
+    // The event `byte` stands for with ISIG; 0 for none.
+    fn signalOf(self: *const Self, byte: u8) -> usize {
+        if self.flags(LOCAL_FLAGS) & ISIG == 0 || byte == 0 { return 0 }
+        if byte == self.character(VINTR) { return INTERRUPT }
+        if byte == self.character(VQUIT) { return QUIT }
+        if byte == self.character(VSUSP) { return SUSPEND }
+        return 0
+    }
+
+    // Whether a byte is queued (what came since is taken first).
+    fn available(self: *Self) -> bool {
+        self.receive()
+        return self.*.queueCount > 0
+    }
+
+    // The next queued byte (there is one), a carriage return as "\n"
+    // with ICRNL.
+    fn input(self: *Self) -> u8 {
+        const byte = self.*.queue[self.*.queueHead]
+        self.*.queueHead = (self.*.queueHead + 1) % QUEUE_CAPACITY
+        self.*.queueCount -= 1
+        if byte == 13 && self.flags(INPUT_FLAGS) & ICRNL != 0 { return 10 }
+        return byte
+    }
+
+    fn echoText(self: *const Self, text: []const u8) -> void {
+        var k: usize = 0
+        while k < text.length {
+            self.*.uart.put(text[k])
+            k += 1
+        }
+    }
+
+    fn rubOut(self: *const Self, echo: bool) -> void {
+        if echo { self.echoText("\x08 \x08") }
+    }
+
+    fn hasLine(self: *const Self) -> bool { return self.*.lineGiven < self.*.lineReady }
+
+    // Canonical mode: the bytes that came, edited into the line (erase,
+    // kill, EOF, Ctrl-C), until a line is complete.
+    fn feed(self: *Self) -> void {
+        const echo = self.flags(LOCAL_FLAGS) & ECHO != 0
+        while !self.hasLine() && !self.*.endOfFile && self.available() {
+            const byte = self.input()
+            if byte == self.character(VERASE) || byte == BACKSPACE {
+                if self.*.lineLength > 0 {
+                    self.*.lineLength -= 1
+                    self.rubOut(echo)
+                }
+                continue
+            }
+            if byte == self.character(VKILL) {
+                while self.*.lineLength > 0 {
+                    self.*.lineLength -= 1
+                    self.rubOut(echo)
+                }
+                continue
+            }
+            if byte == self.character(VEOF) {
+                if self.*.lineLength == 0 {
+                    self.*.endOfFile = true
+                } else {
+                    self.*.lineReady = self.*.lineLength
+                    self.*.lineGiven = 0
+                }
+                continue
+            }
+            if self.*.lineLength < LINE_CAPACITY - 1 {
+                self.*.line[self.*.lineLength] = byte
+                self.*.lineLength += 1
+                if echo {
+                    if byte == 10 { self.*.uart.put(13) }
+                    self.*.uart.put(byte)
+                }
+            }
+            if byte == 10 {
+                self.*.lineReady = self.*.lineLength
+                self.*.lineGiven = 0
+            }
+        }
+    }
+
+    // Bytes for a read of at most `capacity`: those there are (a line in
+    // canonical mode), 0 at EOF, or wait.BLOCKED when there are none yet.
+    pub fn read(self: *Self, into: [*]u8, capacity: usize) -> isize {
+        if capacity == 0 { return 0 }
+        if !self.canonical() {
+            if !self.available() { return wait.BLOCKED }
+            var count: usize = 0
+            while count < capacity && self.available() {
+                into[count] = self.input()
+                count += 1
+            }
+            return @intCast(isize, count)
+        }
+        self.feed()
+        if self.hasLine() {
+            var count: usize = 0
+            while count < capacity && self.hasLine() {
+                into[count] = self.*.line[self.*.lineGiven]
+                self.*.lineGiven += 1
+                count += 1
+            }
+            if !self.hasLine() {
+                self.*.lineReady = 0
+                self.*.lineGiven = 0
+                self.*.lineLength = 0
+            }
+            return @intCast(isize, count)
+        }
+        if self.*.endOfFile {
+            self.*.endOfFile = false
+            return 0
+        }
+        return wait.BLOCKED
+    }
+
+    // Whether a read would give something now (in canonical mode, the
+    // input that came is edited first).
+    pub fn pending(self: *Self) -> bool {
+        if !self.canonical() { return self.available() }
+        self.feed()
+        return self.hasLine() || self.*.endOfFile
+    }
+
+    // An event ISIG's characters asked for since the last time this was
+    // asked (taken); 0 when none did.
+    pub fn takeEvent(self: *Self) -> u32 {
+        self.receive()
+        if self.*.signalsDue == 0 { return 0 }
+        var signal: usize = 1
+        const one: usize = 1
+        while self.*.signalsDue & (one << @intCast(u6, signal)) == 0 { signal += 1 }
+        self.*.signalsDue &= ~(one << @intCast(u6, signal))
+        return @intCast(u32, signal)
+    }
+}
+
+var console: Terminal = undefined // (per run)
+
+// The terminal on the serial console.
+pub fn serialConsole() -> *Terminal { return &console }

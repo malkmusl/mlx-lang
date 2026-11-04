@@ -9,6 +9,7 @@ const sys = @import("./sys.mlx")
 const tty = @import("std.terminal.tty")
 const state = @import("./state.mlx")
 const traps = @import("./traps.mlx")
+const host = @import("./host.mlx")
 
 const Shell = state.Shell
 const Job = state.Job
@@ -25,12 +26,12 @@ pub fn setup(shell: *Shell) -> bool {
         if copy < 0 { return false }
         shell.*.terminal = copy
     }
-    shell.*.shellGroup = tty.processGroup()
-    if tty.foregroundGroup(shell.*.terminal) != shell.*.shellGroup {
+    shell.*.shellGroup = host.ownGroup()
+    if !host.inFront(shell.*.terminal, shell.*.shellGroup) {
         // Started inside another shell's job: a group of its own.
-        _ = tty.setProcessGroup(0, 0)
-        shell.*.shellGroup = std.linux.getpid()
-        _ = tty.setForegroundGroup(shell.*.terminal, shell.*.shellGroup)
+        host.dropGroup(shell.*.shellGroup)
+        shell.*.shellGroup = host.joinGroup(0, 0)
+        host.setFront(shell.*.terminal, shell.*.shellGroup)
     }
     _ = std.linux.process.setSignalHandler(std.linux.SIGTSTP, 1)
     _ = std.linux.process.setSignalHandler(std.linux.SIGTTIN, 1)
@@ -59,9 +60,8 @@ pub fn enterChild(shell: *Shell, group: isize, foreground: bool) -> void {
     const was_interactive = shell.*.interactive
     shell.*.interactive = false
     if shell.*.jobControl {
-        const own = if group == 0 { std.linux.getpid() } else { group }
-        _ = tty.setProcessGroup(0, own)
-        if foreground { _ = tty.setForegroundGroup(shell.*.terminal, own) }
+        const own = host.joinGroup(0, group)
+        if foreground { host.setFront(shell.*.terminal, own) }
         _ = std.linux.process.setSignalHandler(std.linux.SIGTSTP, 0)
         _ = std.linux.process.setSignalHandler(std.linux.SIGTTIN, 0)
         _ = std.linux.process.setSignalHandler(std.linux.SIGTTOU, 0)
@@ -79,15 +79,21 @@ pub fn enterChild(shell: *Shell, group: isize, foreground: bool) -> void {
 
 // In the parent right after the fork of a job's process: puts it in its
 // group too (whichever of parent and child comes first), so that the next
-// process of a pipeline can join that group.
-pub fn placeChild(shell: *Shell, pid: isize, group: isize) -> void {
-    if !shell.*.jobControl { return }
-    _ = tty.setProcessGroup(pid, if group == 0 { pid } else { group })
+// process of a pipeline can join that group. The job's group (0: a new
+// one, the child's); without job control the child stands for it.
+pub fn placeChild(shell: *Shell, pid: isize, group: isize) -> isize {
+    if !shell.*.jobControl { return if group == 0 { pid } else { group } }
+    const joined = host.joinGroup(pid, group)
+    if group != 0 {
+        host.dropGroup(joined)
+        return group
+    }
+    return joined
 }
 
 // The terminal back to the shell after a foreground job.
 fn takeTerminal(shell: *Shell) -> void {
-    if shell.*.jobControl { _ = tty.setForegroundGroup(shell.*.terminal, shell.*.shellGroup) }
+    if shell.*.jobControl { host.setFront(shell.*.terminal, shell.*.shellGroup) }
 }
 
 // Adds a job; its number (the slot plus one), 0 when the table is full.
@@ -115,7 +121,9 @@ pub fn add(shell: *Shell, pid: isize, group: isize, text: []const u8, job_state:
 }
 
 pub fn forget(shell: *Shell, slot: usize) -> void {
-    state.jobAt(shell, slot).*.pid = 0
+    const job = state.jobAt(shell, slot)
+    if shell.*.jobControl && job.*.group != job.*.pid { host.dropGroup(job.*.group) }
+    job.*.pid = 0
     if shell.*.currentJob == slot + 1 { shell.*.currentJob = 0 }
     while shell.*.jobCount > 0 && state.jobAt(shell, shell.*.jobCount - 1).*.pid == 0 { shell.*.jobCount -= 1 }
 }
@@ -226,7 +234,7 @@ pub fn waitJob(shell: *Shell, slot: usize) -> usize {
     var raw: usize = 0
     var status: usize = 0
     const flags = if shell.*.jobControl { std.linux.WUNTRACED } else { 0 }
-    const waited = std.linux.process.waitProcess(job.*.pid, &raw, flags)
+    const waited = host.waitChild(job.*.pid, &raw, flags)
     if waited == job.*.pid && std.linux.process.stopped(raw) && shell.*.jobControl {
         job.*.state = state.JOB_STOPPED
         job.*.reported = true
@@ -247,13 +255,14 @@ pub fn waitJob(shell: *Shell, slot: usize) -> usize {
 pub fn waitForeground(shell: *Shell, pid: isize, group: isize, text: []const u8) -> usize {
     if !shell.*.jobControl {
         var raw: usize = 0
-        _ = std.linux.process.waitProcess(pid, &raw, 0)
+        _ = host.waitChild(pid, &raw, 0)
         return std.linux.process.exitStatus(raw)
     }
     const number = add(shell, pid, group, text, state.JOB_RUNNING)
     if number == 0 {
         var raw: usize = 0
-        _ = std.linux.process.waitProcess(pid, &raw, 0)
+        _ = host.waitChild(pid, &raw, 0)
+        if group != pid { host.dropGroup(group) }
         takeTerminal(shell)
         return std.linux.process.exitStatus(raw)
     }
@@ -270,7 +279,7 @@ pub fn waitPipeline(shell: *Shell, pids: [*]const isize, count: usize, group: is
     while index < count {
         var raw: usize = 0
         const flags = if shell.*.jobControl { std.linux.WUNTRACED } else { 0 }
-        const waited = std.linux.process.waitProcess(pids[index], &raw, flags)
+        const waited = host.waitChild(pids[index], &raw, flags)
         const last = index + 1 == count
         if waited == pids[index] && std.linux.process.stopped(raw) {
             stopped = true
@@ -299,7 +308,7 @@ pub fn update(shell: *Shell) -> void {
     var rounds: usize = 0
     while rounds < 256 {
         var raw: usize = 0
-        const pid = std.linux.process.waitProcess(-1, &raw, std.linux.WNOHANG | std.linux.WUNTRACED | std.linux.WCONTINUED)
+        const pid = host.waitChild(-1, &raw, std.linux.WNOHANG | std.linux.WUNTRACED | std.linux.WCONTINUED)
         if pid <= 0 { return }
         const slot = slotOfPid(shell, pid)
         if slot != state.MAX_JOBS {
@@ -398,12 +407,12 @@ pub fn continueJob(shell: *Shell, slot: usize, foreground: bool) -> usize {
         const text = state.jobText(shell, job)
         _ = std.linux.writeAll(1, text)
         _ = std.linux.writeAll(1, "\n")
-        _ = tty.setForegroundGroup(shell.*.terminal, job.*.group)
-        if job.*.state == state.JOB_STOPPED { _ = std.linux.process.kill(0 - job.*.group, std.linux.SIGCONT) }
+        host.setFront(shell.*.terminal, job.*.group)
+        if job.*.state == state.JOB_STOPPED { _ = host.signal(0 - job.*.group, std.linux.SIGCONT) }
         job.*.state = state.JOB_RUNNING
         return waitJob(shell, slot)
     }
-    if job.*.state == state.JOB_STOPPED { _ = std.linux.process.kill(0 - job.*.group, std.linux.SIGCONT) }
+    if job.*.state == state.JOB_STOPPED { _ = host.signal(0 - job.*.group, std.linux.SIGCONT) }
     job.*.state = state.JOB_RUNNING
     job.*.reported = true
     var line: [4200]u8 = undefined

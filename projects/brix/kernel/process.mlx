@@ -1,0 +1,521 @@
+// A process: a static ELF program from the boot archive in its own
+// address space, with its descriptors, its place among the others (pid,
+// parent, group), what it waits for and, while it does not run, its
+// registers. Its memory: the program's
+// segments, the break after them, anonymous mappings from MMAP_BASE up,
+// the stack under STACK_TOP; all but the segments are pages made on first
+// touch (a page fault in one of the regions, or the kernel preparing a
+// range it is handed).
+const cpu = @import("./cpu.mlx")
+const memory = @import("./memory.mlx")
+const files = @import("./files.mlx")
+const Elf = @import("./elf.mlx").Elf
+const Segment = @import("./elf.mlx").Segment
+const frame_module = @import("./frame.mlx")
+const Frame = frame_module.Frame
+const wait = @import("./wait.mlx")
+const signals_module = @import("./linux/signals.mlx")
+const events_module = @import("./events.mlx")
+const vfs = @import("./vfs.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const Status = @import("./status.mlx").Status
+const Page = memory.Page
+const Space = memory.Space
+
+// [start, end) of the program's memory, made on first touch.
+pub const Region = struct {
+    start: usize
+    end: usize
+
+    pub fn contains(self: Self, address: usize) -> bool { return address >= self.start && address < self.end }
+}
+
+// NUL-terminated strings for a program's argv or envp (in the kernel, or
+// in the memory of the process that is in use: execve's).
+pub const Strings = struct {
+    items: [*]const [*]const u8
+    count: usize
+}
+
+// running: on a processor now (no other takes it).
+pub const State = enum(u8) { free, ready, blocked, zombie, stopped, running }
+
+// What load says.
+pub const Loaded = enum(u8) { done, missing, not_a_program, no_memory }
+
+pub const Process = struct {
+    pub const STACK_TOP: usize = 0x7FFFFFFFF000
+    pub const STACK_SIZE: usize = 8 * 1024 * 1024
+    pub const MMAP_BASE: usize = 0x100000000000
+    pub const USER_LIMIT: usize = 0x800000000000
+    pub const MAX_REGIONS: usize = 256
+    // How many argv and envp strings a program gets at most.
+    pub const MAX_STRINGS: usize = 256
+    // The auxiliary vector's keys.
+    const AT_NULL: usize = 0
+    const AT_PHDR: usize = 3
+    const AT_PHENT: usize = 4
+    const AT_PHNUM: usize = 5
+    const AT_PAGESZ: usize = 6
+    const AT_ENTRY: usize = 9
+    const AT_UID: usize = 11
+    const AT_RANDOM: usize = 25
+
+    state: State
+    pid: usize
+    parentPid: usize
+    group: usize
+    // How it ended, once a zombie.
+    ending: events_module.Ending
+    // A stop or a going on its parent has not taken yet.
+    change: events_module.Change
+    waitingFor: wait.Wait
+    // What a native wait watches (waitingFor.kind handles).
+    waitItems: [wait.HandleWait.MAX]wait.HandleWait
+    waitCount: usize
+    // The deadline of the wait passed (the call it makes again ends).
+    timedOut: bool
+    // It waits in a system call (its registers at the SYSCALL, to make it
+    // again): an upcall or a handler that runs first may end the call.
+    inCall: bool
+    // Its events (what it claimed, its queue, its upcall), and the Linux
+    // layer's view of them (signal actions, masks, pending signals).
+    events: events_module.Events
+    signals: signals_module.Signals
+    // The registers while it does not run, and its FS base.
+    context: Frame
+    // Its SSE registers while it does not run.
+    sse: [frame_module.Sse.SIZE]u8
+    fsBase: usize
+    // The working directory, and the program it runs and the directory
+    // that names it (for /proc/self/exe); nodes it holds.
+    directory: usize
+    program: usize
+    programDirectory: usize
+    // The permission bits files and directories it makes do not get.
+    umask: usize
+    // Its user and group (0: the system's).
+    user: usize
+    group_id: usize
+    space: Space
+    entry: usize
+    stack: usize
+    breakStart: usize
+    breakEnd: usize
+    mmapNext: usize
+    programHeaders: usize
+    programHeaderCount: usize
+    regions: [MAX_REGIONS]Region
+    regionCount: usize
+    files: files.Descriptors
+
+    // A fresh process `pid` (child of `parentPid`): no memory, the
+    // terminal on 0, 1 and 2.
+    pub fn init(self: *Self, pid: usize, parentPid: usize) -> void {
+        self.*.state = State.ready
+        self.*.pid = pid
+        self.*.parentPid = parentPid
+        self.*.group = pid
+        self.*.ending = events_module.Ending.exit(0)
+        self.*.change = events_module.Change.none()
+        self.*.waitingFor = wait.Wait.none()
+        self.*.waitCount = 0
+        self.*.timedOut = false
+        self.*.inCall = false
+        self.*.events.init()
+        self.*.signals.init()
+        self.*.fsBase = 0
+        self.*.directory = vfs.Vfs.NONE
+        self.*.program = vfs.Vfs.NONE
+        self.*.programDirectory = vfs.Vfs.NONE
+        self.*.umask = 0x12
+        self.*.user = 0
+        self.*.group_id = 0
+        self.*.space = Space.{ .root = 0 }
+        self.*.breakStart = 0
+        self.*.breakEnd = 0
+        self.*.mmapNext = MMAP_BASE
+        self.*.regionCount = 0
+        self.*.files.init()
+    }
+
+    // The memory, descriptors and registers of `parent` copied (a fork:
+    // the child's call returns 0); false when memory is out.
+    pub fn forkFrom(self: *Self, parent: *Self, frame: *const Frame) -> bool {
+        const space = parent.*.space.clone()
+        if !space.isValid() { return false }
+        self.*.space = space
+        self.*.group = parent.*.group
+        self.*.fsBase = parent.*.fsBase
+        self.*.umask = parent.*.umask
+        self.*.user = parent.*.user
+        self.*.group_id = parent.*.group_id
+        self.setDirectory(parent.*.directory)
+        self.setProgram(parent.*.program, parent.*.programDirectory)
+        self.*.entry = parent.*.entry
+        self.*.stack = parent.*.stack
+        self.*.breakStart = parent.*.breakStart
+        self.*.breakEnd = parent.*.breakEnd
+        self.*.mmapNext = parent.*.mmapNext
+        self.*.programHeaders = parent.*.programHeaders
+        self.*.programHeaderCount = parent.*.programHeaderCount
+        var k: usize = 0
+        while k < parent.*.regionCount {
+            self.*.regions[k].start = parent.*.regions[k].start
+            self.*.regions[k].end = parent.*.regions[k].end
+            k += 1
+        }
+        self.*.regionCount = parent.*.regionCount
+        self.*.files.copyFrom(&parent.*.files)
+        self.*.events.inherit(&parent.*.events)
+        self.*.signals.inherit(&parent.*.signals)
+        self.*.context = frame.*
+        self.*.context.rax = 0
+        Bytes.copy(&self.*.sse, frame.sse(), frame_module.Sse.SIZE)
+        return true
+    }
+
+    // The working directory becomes `node` (held; the one before let go).
+    pub fn setDirectory(self: *Self, node: usize) -> void {
+        const tree = vfs.fileSystem()
+        if node != vfs.Vfs.NONE { tree.retain(node) }
+        if self.*.directory != vfs.Vfs.NONE { tree.release(self.*.directory) }
+        self.*.directory = node
+    }
+
+    // The program it runs becomes `node`, named by `directory`.
+    pub fn setProgram(self: *Self, node: usize, directory: usize) -> void {
+        const tree = vfs.fileSystem()
+        if node != vfs.Vfs.NONE { tree.retain(node) }
+        if directory != vfs.Vfs.NONE { tree.retain(directory) }
+        if self.*.program != vfs.Vfs.NONE { tree.release(self.*.program) }
+        if self.*.programDirectory != vfs.Vfs.NONE { tree.release(self.*.programDirectory) }
+        self.*.program = node
+        self.*.programDirectory = directory
+    }
+
+    // The nodes it holds let go (it ends).
+    pub fn releaseNodes(self: *Self) -> void {
+        self.setDirectory(vfs.Vfs.NONE)
+        self.setProgram(vfs.Vfs.NONE, vfs.Vfs.NONE)
+    }
+
+    // Its memory freed (the boot tables in use when it was its own).
+    pub fn releaseMemory(self: *Self) -> void {
+        if !self.*.space.isValid() { return }
+        if cpu.Cpu.pageTables() == self.*.space.root { Space.boot().activate() }
+        self.*.space.destroy()
+        self.*.space = Space.{ .root = 0 }
+    }
+
+    // ---- regions ----
+
+    fn inRegion(self: *const Self, address: usize) -> bool {
+        if address >= self.*.breakStart && address < self.*.breakEnd { return true }
+        if address >= STACK_TOP - STACK_SIZE && address < STACK_TOP { return true }
+        var k: usize = 0
+        while k < self.*.regionCount {
+            if self.*.regions[k].contains(address) { return true }
+            k += 1
+        }
+        return false
+    }
+
+    fn addRegion(self: *Self, start: usize, end: usize) -> bool {
+        if self.*.regionCount == MAX_REGIONS { return false }
+        self.*.regions[self.*.regionCount] = Region.{ .start = start, .end = end }
+        self.*.regionCount += 1
+        return true
+    }
+
+    // [start, end) out of the regions (cutting or splitting them), its
+    // touched pages freed.
+    fn removeRange(self: *Self, start: usize, end: usize) -> void {
+        var k: usize = 0
+        while k < self.*.regionCount {
+            const region = self.*.regions[k]
+            if end <= region.start || start >= region.end {
+                k += 1
+                continue
+            }
+            var page = if start > region.start { start } else { region.start }
+            const last = if end < region.end { end } else { region.end }
+            while page < last {
+                self.*.space.release(page)
+                page += Page.SIZE
+            }
+            if start <= region.start && end >= region.end {
+                self.*.regionCount -= 1
+                self.*.regions[k] = self.*.regions[self.*.regionCount]
+                continue
+            }
+            if start <= region.start {
+                self.*.regions[k].start = end
+            } else if end >= region.end {
+                self.*.regions[k].end = start
+            } else {
+                self.*.regions[k].end = start
+                _ = self.addRegion(end, region.end)
+            }
+            k += 1
+        }
+    }
+
+    // A page fault at `address` (a write when `write`): true when the
+    // page is there now (a copy-on-write page became the process's own,
+    // or a page of a region was made).
+    pub fn fault(self: *Self, address: usize, write: bool) -> bool {
+        if address >= USER_LIMIT { return false }
+        if write && self.*.space.copyOnWrite(address) { return true }
+        if !self.inRegion(address) { return false }
+        if self.*.space.translate(address) != 0 { return false }
+        return self.*.space.back(address)
+    }
+
+    // ---- the program's memory, for the kernel ----
+
+    // [address, address + length) usable by the kernel: below the
+    // kernel's half, and every page mapped (made now when in a region).
+    pub fn prepare(self: *Self, address: usize, length: usize) -> bool {
+        if length == 0 { return true }
+        if address >= USER_LIMIT || length > USER_LIMIT - address { return false }
+        var page = Page.down(address)
+        while page < address + length {
+            if self.*.space.translate(page) == 0 {
+                if !self.inRegion(page) || !self.*.space.back(page) { return false }
+            }
+            page += Page.SIZE
+        }
+        return true
+    }
+
+    // A NUL-terminated string at `address`, its pages made; false when
+    // it is not the program's (or longer than a page).
+    pub fn prepareString(self: *Self, address: usize) -> bool {
+        var at = address
+        while at < address + Page.SIZE {
+            if !self.prepare(at, 1) { return false }
+            if Bytes.pointer(at)[0] == 0 { return true }
+            at += 1
+        }
+        return false
+    }
+
+    // ---- system calls on memory ----
+
+    pub fn mmap(self: *Self, address: usize, length: usize, fixed: bool) -> isize {
+        if length == 0 { return Status.invalid }
+        const size = Page.up(length)
+        var start: usize = 0
+        if fixed {
+            if address & (Page.SIZE - 1) != 0 || address >= USER_LIMIT || size > USER_LIMIT - address { return Status.invalid }
+            start = address
+            self.removeRange(start, start + size)
+        } else {
+            start = self.*.mmapNext
+            self.*.mmapNext += size + Page.SIZE
+        }
+        if !self.addRegion(start, start + size) { return Status.no_memory }
+        return @bitCast(isize, start)
+    }
+
+    // `size` bytes of addresses of their own (a region, pages mapped by
+    // the caller with mapPage): the start, or a Status.
+    pub fn reserve(self: *Self, size: usize) -> isize {
+        if size == 0 { return Status.invalid }
+        const start = self.*.mmapNext
+        if !self.addRegion(start, start + size) { return Status.no_memory }
+        self.*.mmapNext += size + Page.SIZE
+        return @bitCast(isize, start)
+    }
+
+    // The page at `address` mapped to `frame` (held by the caller for
+    // the mapping) with `flags`; false when memory for a table is out.
+    pub fn mapPage(self: *Self, address: usize, frame: usize, flags: usize) -> bool { return self.*.space.map(address, frame, flags) }
+
+    // [start, end) given up (what reserve gave, its pages let go).
+    pub fn unreserve(self: *Self, start: usize, end: usize) -> void { self.removeRange(start, end) }
+
+    // Frames (a memory object's) mapped one after the other at a place
+    // of their own, shared (each held once more), writable when
+    // `writable`: the address, or a Status.
+    pub fn mapShared(self: *Self, frameList: []const usize, writable: bool) -> isize {
+        const count = frameList.length
+        if count == 0 { return Status.invalid }
+        const start = self.*.mmapNext
+        const size = count * Page.SIZE
+        if !self.addRegion(start, start + size) { return Status.no_memory }
+        self.*.mmapNext += size + Page.SIZE
+        const flags = Page.PRESENT | Page.USER | Page.SHARED | (if writable { Page.WRITABLE } else { 0 })
+        var k: usize = 0
+        while k < count {
+            const frame = frameList[k]
+            if !memory.allFrames().share(frame) {
+                self.removeRange(start, start + size)
+                return Status.no_memory
+            }
+            if !self.*.space.map(start + k * Page.SIZE, frame, flags) {
+                memory.allFrames().free(frame)
+                self.removeRange(start, start + size)
+                return Status.no_memory
+            }
+            k += 1
+        }
+        return @bitCast(isize, start)
+    }
+
+    pub fn munmap(self: *Self, address: usize, length: usize) -> isize {
+        if address & (Page.SIZE - 1) != 0 || address >= USER_LIMIT { return Status.invalid }
+        self.removeRange(address, address + Page.up(length))
+        return 0
+    }
+
+    pub fn brk(self: *Self, wanted: usize) -> usize {
+        if wanted < self.*.breakStart || wanted >= MMAP_BASE { return self.*.breakEnd }
+        const end = Page.up(wanted)
+        var page = end
+        while page < self.*.breakEnd {
+            self.*.space.release(page)
+            page += Page.SIZE
+        }
+        self.*.breakEnd = end
+        return wanted
+    }
+
+    // ---- loading ----
+
+    // The segments of `elf` into `target`; the end of the highest, or 0
+    // when one does not fit or memory is out.
+    fn loadSegments(self: *Self, target: Space, elf: *const Elf) -> usize {
+        var highest: usize = 0
+        var k: usize = 0
+        while k < elf.headerCount() {
+            var segment: Segment = undefined
+            if elf.segment(k, &segment) {
+                if segment.offset + segment.fileSize > elf.*.size || segment.address >= MMAP_BASE { return 0 }
+                if segment.offset == 0 { self.*.programHeaders = segment.address + elf.headerOffset() }
+                if !elf.copy(segment.offset, segment.fileSize, target, segment.address) { return 0 }
+                // The rest of the segment: zero pages.
+                var page = Page.up(segment.address + segment.fileSize)
+                while page < segment.address + segment.memorySize {
+                    if target.translate(page) == 0 && !target.back(page) { return 0 }
+                    page += Page.SIZE
+                }
+                if segment.address + segment.memorySize > highest { highest = segment.address + segment.memorySize }
+            }
+            k += 1
+        }
+        return highest
+    }
+
+    // The stack the program starts with: argc, argv, envp, the auxiliary
+    // vector, then the strings and 16 random bytes at the top. Its
+    // pointer; 0 when memory is out.
+    fn buildStack(self: *Self, target: Space, arguments: Strings, environment: Strings) -> usize {
+        const total = arguments.count + environment.count
+        // The strings' room.
+        var bytes: usize = 0
+        var k: usize = 0
+        while k < total {
+            bytes += Bytes.length(string(arguments, environment, k)) + 1
+            k += 1
+        }
+        const strings = STACK_TOP - 16 - bytes
+        var random = strings - strings % 16 - 16
+        var seed = cpu.Cpu.timestamp() | 1
+        var r: usize = 0
+        while r < 2 {
+            seed ^= seed << 13
+            seed ^= seed >> 7
+            seed ^= seed << 17
+            if !target.writeWord(random + r * 8, seed) { return 0 }
+            r += 1
+        }
+        // argc, argv and its NULL, envp and its NULL, 8 auxiliary pairs.
+        const words = 1 + arguments.count + 1 + environment.count + 1 + 16
+        var top = random - words * 8
+        top -= top % 16
+        var at = top
+        if !target.writeWord(at, arguments.count) { return 0 }
+        at += 8
+        var text = strings
+        k = 0
+        while k < total {
+            const item = string(arguments, environment, k)
+            const n = Bytes.length(item) + 1
+            if !target.write(text, item, n) || !target.writeWord(at, text) { return 0 }
+            text += n
+            at += 8
+            k += 1
+            if k == arguments.count {
+                if !target.writeWord(at, 0) { return 0 }
+                at += 8
+            }
+        }
+        if !target.writeWord(at, 0) { return 0 }
+        at += 8
+        const auxiliary = [16]usize{ AT_PHDR, self.*.programHeaders, AT_PHENT, Elf.HEADER_SIZE, AT_PHNUM, self.*.programHeaderCount, AT_PAGESZ, Page.SIZE, AT_ENTRY, self.*.entry, AT_UID, 0, AT_RANDOM, random, AT_NULL, 0 }
+        var a: usize = 0
+        while a < 16 {
+            if !target.writeWord(at, auxiliary[a]) { return 0 }
+            at += 8
+            a += 1
+        }
+        return top
+    }
+
+    fn string(arguments: Strings, environment: Strings, k: usize) -> [*]const u8 {
+        return if k < arguments.count { arguments.items[k] } else { environment.items[k - arguments.count] }
+    }
+
+    // The NULL-terminated array of strings at `address` in the process's
+    // memory (argv, envp); a count above MAX_STRINGS when it is not
+    // readable or too long.
+    pub fn strings(self: *Self, address: usize) -> Strings {
+        const bad = Strings.{ .items = unsafe { @ptrFromInt([*]const [*]const u8, 8) }, .count = MAX_STRINGS + 1 }
+        if address == 0 { return Strings.{ .items = unsafe { @ptrFromInt([*]const [*]const u8, 8) }, .count = 0 } }
+        var count: usize = 0
+        while true {
+            if count > MAX_STRINGS || !self.prepare(address + count * 8, 8) { return bad }
+            const item = Bytes.read64(Bytes.pointer(address + count * 8), 0)
+            if item == 0 { break }
+            if !self.prepareString(item) { return bad }
+            count += 1
+        }
+        return Strings.{ .items = unsafe { @ptrFromInt([*]const [*]const u8, address) }, .count = count }
+    }
+
+    // The program in the file `node` loaded into a new address space,
+    // which becomes the process's and the one in use (the old one freed).
+    // The strings may be in the old one (execve's).
+    pub fn load(self: *Self, node: usize, arguments: Strings, environment: Strings) -> Loaded {
+        if node == vfs.Vfs.NONE { return Loaded.missing }
+        // (A program gets its name as argv[0]; argv's NULL follows it.)
+        if arguments.count == 0 { return Loaded.not_a_program }
+        const elf = Elf.open(node)
+        if !elf.isProgram() { return Loaded.not_a_program }
+        const target = Space.create()
+        if !target.isValid() { return Loaded.no_memory }
+        const highest = self.loadSegments(target, &elf)
+        const entry = elf.entry()
+        const savedEntry = self.*.entry
+        self.*.entry = entry
+        self.*.programHeaderCount = elf.headerCount()
+        const stack = if highest == 0 { 0 } else { self.buildStack(target, arguments, environment) }
+        if stack == 0 {
+            self.*.entry = savedEntry
+            target.destroy()
+            return Loaded.no_memory
+        }
+        self.*.stack = stack
+        self.*.breakStart = Page.up(highest)
+        self.*.breakEnd = self.*.breakStart
+        self.*.mmapNext = MMAP_BASE
+        self.*.regionCount = 0
+        const old = self.*.space
+        self.*.space = target
+        target.activate()
+        if old.isValid() { old.destroy() }
+        return Loaded.done
+    }
+}

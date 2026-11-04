@@ -1,463 +1,1788 @@
+// pr: paginate or columnate files for printing, as GNU coreutils' pr
+// (src/pr.c) does it, function by function: columns down (-COLUMN, stored
+// and balanced on the last page), across (-a) and files in parallel (-m);
+// truncation to the page width (-w, -W) or joined lines (-J); separators
+// (-s, -S); tabs expanded on input (-e) and made on output (-i, assumed
+// with columns); control characters shown (-c, -v); line numbers (-n, -N);
+// a page range (+FIRST[:LAST], --pages); headers with the file's time in
+// a date format (-D); form feeds in the input hold a column until the
+// next page.
 const std = @import("std")
 const common = @import("../common.mlx")
 const timezone = @import("../ls/timezone.mlx")
+const strftime = @import("../strftime.mlx")
+const properties = @import("std.unicode.properties")
 const crash = @import("std.crash")
 
-const Options = struct {
-    pageLength: usize
-    pageWidth: usize
-    omitHeader: bool
-    hasHeaderText: bool
-    headerText: std.string.String
-    numberLines: bool
-    numberWidth: usize
-    numberSep: u8
-    indent: usize
-    doubleSpace: bool
-    formFeed: bool
-    action: u8
-    invalid: bool
-    firstFile: usize
+// A column's file: read, at a form feed (with storing), held until the
+// next page, ended.
+const OPEN: u8 = 0
+const FF_FOUND: u8 = 1
+const ON_HOLD: u8 = 2
+const CLOSED: u8 = 3
+
+const EOF: isize = -1
+// A start position that does not pad (columns not truncated).
+const ANYWHERE: isize = 0
+const LINES_PER_HEADER: isize = 5
+const LINES_PER_FOOTER: isize = 5
+const INT_MAX: isize = 2147483647
+const OUT_SIZE: usize = 65536
+
+// A file's bytes, read whole, and where reading is.
+const Input = struct {
+    bytes: [*]u8
+    length: usize
+    position: usize
 }
 
-fn parseOptions(arguments: [][*]const u8) -> Options {
-    var result = Options.{
-        .pageLength = 66, .pageWidth = 72, .omitHeader = false,
-        .hasHeaderText = false, .headerText = std.string.fromSlice(""),
-        .numberLines = false, .numberWidth = 5, .numberSep = 9,
-        .indent = 0, .doubleSpace = false, .formFeed = false,
-        .action = 0, .invalid = false, .firstFile = 1,
+const Column = struct {
+    // Its input (every column of one file shares the file's).
+    input: usize
+    name: std.string.String
+    status: u8
+    // Index of its current line in the line vector (stored columns).
+    currentLine: isize
+    linesStored: isize
+    // Stored lines left, or lines that fit on the page.
+    linesToPrint: isize
+    // The horizontal position its text starts at.
+    startPosition: isize
+    numbered: bool
+    // A full page printed without a form feed: one right after is dropped.
+    fullPagePrinted: bool
+}
+
+const Pr = struct {
+    arguments: [][*]const u8
+    columnVector: [*]Column
+    columnCapacity: usize
+    inputs: [*]Input
+    inputCount: usize
+    // Stored lines (columns down): their bytes, where each starts, the
+    // position after each.
+    buff: [*]u8
+    buffCurrent: usize
+    buffAllocated: usize
+    lineVector: [*]isize
+    endVector: [*]isize
+    // Output, buffered.
+    out: [*]u8
+    outLength: usize
+
+    parallelFiles: bool
+    alignEmptyCols: bool
+    emptyLine: bool
+    ffOnly: bool
+    explicitColumns: bool
+    extremities: bool
+    keepFF: bool
+    printAFF: bool
+    printAHeader: bool
+    useFormFeed: bool
+    printAcrossFlag: bool
+    storingColumns: bool
+    balanceColumns: bool
+    linesPerPage: isize
+    linesPerBody: isize
+    charsPerLine: isize
+    truncateLines: bool
+    joinLines: bool
+    charsPerColumn: isize
+    untabifyInput: bool
+    inputTabChar: u8
+    charsPerInputTab: isize
+    tabifyOutput: bool
+    outputTabChar: u8
+    charsPerOutputTab: isize
+    spacesNotPrinted: isize
+    charsPerMargin: isize
+    outputPosition: isize
+    inputPosition: isize
+    failedOpens: bool
+    columns: isize
+    firstPageNumber: usize
+    lastPageNumber: usize
+    filesReadyToRead: isize
+    pageNumber: usize
+    lineNumber: isize
+    numberedLines: bool
+    numberSeparator: u8
+    lineCount: isize
+    skipCount: bool
+    startLineNum: isize
+    charsPerNumber: isize
+    numberWidth: isize
+    useEscSequence: bool
+    useCntrlPrefix: bool
+    doubleSpace: bool
+    totalFiles: isize
+    ignoreFailedOpens: bool
+    useColSeparator: bool
+    colSepString: std.string.String
+    colSepLength: isize
+    separatorsNotPrinted: isize
+    paddingNotPrinted: isize
+    padVertically: bool
+    hasCustomHeader: bool
+    customHeader: std.string.String
+    dateFormat: std.string.String
+    zone: timezone.Context
+    dateText: strftime.Text
+    hasDateText: bool
+    fileText: std.string.String
+    headerWidthAvailable: isize
+    clumpBuff: [*]u8
+    // "%*d" of a line number (as wide as its digits ask, at least).
+    numberBuff: [*]u8
+    lastLine: bool
+    // The time of headers without a file's, taken once.
+    nowSeconds: isize
+    nowNanoseconds: isize
+    nowTaken: bool
+    utf8: bool
+}
+
+// ---- memory and output ----
+
+fn allocate(bytes: usize) -> [*]u8 {
+    const allocator: std.allocator.Allocator = std.heap.allocator()
+    const got = allocator.alloc(if bytes == 0 { 8 } else { bytes }, 8)
+    if got == null {
+        common.writeMessage("pr", "memory exhausted")
+        _ = std.linux.syscall1(std.linux.SYS_exit_group, 1)
     }
-    const count = std.process.count(arguments)
-    var index: usize = 1
-    while index < count {
-        const argument = std.process.argument(arguments, index)
-        if common.equals(argument, "--") {
-            index += 1
+    return got.?
+}
+
+fn release(memory: [*]u8, bytes: usize) -> void {
+    const allocator: std.allocator.Allocator = std.heap.allocator()
+    allocator.free(memory, if bytes == 0 { 8 } else { bytes }, 8)
+}
+
+fn flush(self: *Pr) -> void {
+    if self.*.outLength > 0 {
+        unsafe { _ = std.io.writeAllBytes(std.io.stdout(), @ptrCast([*]const u8, self.*.out), self.*.outLength) }
+    }
+    self.*.outLength = 0
+}
+
+inline fn putchar(self: *Pr, c: u8) -> void {
+    if self.*.outLength == OUT_SIZE { flush(self) }
+    self.*.out[self.*.outLength] = c
+    self.*.outLength += 1
+}
+
+fn putText(self: *Pr, text: []const u8) -> void {
+    var k: usize = 0
+    while k < text.length {
+        putchar(self, text[k])
+        k += 1
+    }
+}
+
+fn putString(self: *Pr, text: std.string.String) -> void {
+    var k: usize = 0
+    while k < text.length {
+        putchar(self, text.pointer[k])
+        k += 1
+    }
+}
+
+fn putSpaces(self: *Pr, count: isize) -> void {
+    var k: isize = 0
+    while k < count {
+        putchar(self, 32)
+        k += 1
+    }
+}
+
+// A fatal error: what was printed goes out, the message, exit 1.
+fn die(self: *Pr, message: []const u8) -> void {
+    flush(self)
+    common.writeMessage("pr", message)
+    _ = std.linux.syscall1(std.linux.SYS_exit_group, 1)
+}
+
+inline fn isprint(c: u8) -> bool { return c >= 32 && c < 127 }
+
+// The columns `text` takes, as gnulib's mbswidth counts them (flags 0):
+// in the C locale a printable byte or one past ASCII is a column, a control
+// none; in UTF-8 a character its wcwidth (East Asian wide ones two,
+// combining ones none), an unprintable one a column unless it is a
+// control, a byte that makes no character a column, a sequence the text
+// ends in one.
+fn textWidth(self: *Pr, pointer: [*]const u8, length: usize) -> isize {
+    var width: isize = 0
+    var k: usize = 0
+    while k < length {
+        const byte = pointer[k]
+        if !self.*.utf8 || byte < 128 {
+            if !(byte < 32 || byte == 127) { width += 1 }
+            k += 1
+            continue
+        }
+        // A UTF-8 sequence as glibc decodes it: no overlong forms or
+        // surrogates (their second byte tells), the old five- and six-byte
+        // forms too.
+        var need: usize = 0
+        var value: u32 = 0
+        if byte >= 194 && byte < 224 {
+            need = 1
+            value = @intCast(u32, byte & 31)
+        } else if byte >= 224 && byte < 240 {
+            need = 2
+            value = @intCast(u32, byte & 15)
+        } else if byte >= 240 && byte < 248 {
+            need = 3
+            value = @intCast(u32, byte & 7)
+        } else if byte >= 248 && byte < 252 {
+            need = 4
+            value = @intCast(u32, byte & 3)
+        } else if byte >= 252 && byte < 254 {
+            need = 5
+            value = @intCast(u32, byte & 1)
+        }
+        if need == 0 {
+            width += 1
+            k += 1
+            continue
+        }
+        var j: usize = 1
+        var valid = true
+        var incomplete = false
+        while j <= need {
+            if k + j >= length {
+                incomplete = true
+                break
+            }
+            const next = pointer[k + j]
+            if next & 192 != 128 || (j == 1 && ((byte == 224 && next < 160) || (byte == 237 && next >= 160) || (byte == 240 && next < 144) || (byte == 248 && next < 136) || (byte == 252 && next < 132))) {
+                valid = false
+                break
+            }
+            value = (value << 6) | @intCast(u32, next & 63)
+            j += 1
+        }
+        if !valid {
+            width += 1
+            k += 1
+            continue
+        }
+        if incomplete {
+            // The text ends inside the character: one column, the end.
+            return width + 1
+        }
+        width += characterWidth(value)
+        k += need + 1
+    }
+    return width
+}
+
+// mbswidth's count for one character: wcwidth when it is printable, else
+// one column unless it is a control.
+fn characterWidth(c: u32) -> isize {
+    if c < 160 { return if c >= 127 { 0 } else { 1 } }
+    const category = properties.generalCategory(c)
+    // (glibc counts the line and paragraph separators among the controls.)
+    if category == properties.GeneralCategory.control || category == properties.GeneralCategory.lineSeparator || category == properties.GeneralCategory.paragraphSeparator { return 0 }
+    if category == properties.GeneralCategory.unassigned || category == properties.GeneralCategory.surrogate { return 1 }
+    return @intCast(isize, properties.columnWidth(c))
+}
+
+// ---- input ----
+
+inline fn column(self: *Pr, index: isize) -> *Column { return &self.*.columnVector[@bitCast(usize, index)] }
+
+inline fn getc(self: *Pr, p: *Column) -> isize {
+    const input = &self.*.inputs[p.*.input]
+    if input.*.position >= input.*.length {
+        input.*.position = input.*.length + 1
+        return EOF
+    }
+    const c = input.*.bytes[input.*.position]
+    input.*.position += 1
+    return @intCast(isize, c)
+}
+
+fn ungetc(self: *Pr, c: isize, p: *Column) -> void {
+    if c == EOF { return }
+    const input = &self.*.inputs[p.*.input]
+    input.*.position -= 1
+}
+
+// ---- the page ----
+
+fn colsReadyToPrint(self: *Pr) -> isize {
+    var n: isize = 0
+    var i: isize = 0
+    while i < self.*.columns {
+        const q = column(self, i)
+        if q.*.status == OPEN || q.*.status == FF_FOUND || (self.*.storingColumns && q.*.linesStored > 0 && q.*.linesToPrint > 0) { n += 1 }
+        i += 1
+    }
+    return n
+}
+
+fn initParameters(self: *Pr, numberOfFiles: isize) -> void {
+    var charsUsedByNumber: isize = 0
+    self.*.linesPerBody = self.*.linesPerPage - LINES_PER_HEADER - LINES_PER_FOOTER
+    if self.*.linesPerBody <= 0 {
+        self.*.extremities = false
+        self.*.keepFF = true
+    }
+    if !self.*.extremities { self.*.linesPerBody = self.*.linesPerPage }
+    if self.*.doubleSpace {
+        self.*.linesPerBody = self.*.linesPerBody / 2
+        if self.*.linesPerBody < 1 { self.*.linesPerBody = 1 }
+    }
+    if numberOfFiles == 0 { self.*.parallelFiles = false }
+    if self.*.parallelFiles { self.*.columns = numberOfFiles }
+    if self.*.storingColumns { self.*.balanceColumns = true }
+    // Tabification is assumed for multiple columns.
+    if self.*.columns > 1 {
+        if !self.*.useColSeparator {
+            self.*.colSepString = if self.*.joinLines { std.string.fromSlice("\t") } else { std.string.fromSlice(" ") }
+            self.*.colSepLength = 1
+            self.*.useColSeparator = true
+        } else if !self.*.joinLines && self.*.colSepLength == 1 && self.*.colSepString.pointer[0] == 9 {
+            self.*.colSepString = std.string.fromSlice(" ")
+        }
+        self.*.truncateLines = true
+        if !(self.*.colSepLength == 1 && self.*.colSepString.pointer[0] == 9) { self.*.untabifyInput = true }
+        self.*.tabifyOutput = true
+    } else {
+        self.*.storingColumns = false
+    }
+    // -J dominates -w in any case.
+    if self.*.joinLines { self.*.truncateLines = false }
+    if self.*.numberedLines {
+        self.*.lineCount = self.*.startLineNum
+        if self.*.numberSeparator == 9 {
+            self.*.numberWidth = self.*.charsPerNumber + (8 - self.*.charsPerNumber % 8)
+        } else {
+            self.*.numberWidth = self.*.charsPerNumber + 1
+        }
+        if self.*.parallelFiles { charsUsedByNumber = self.*.numberWidth }
+    }
+    const sepChars = (self.*.columns - 1) * self.*.colSepLength
+    const usefulChars = self.*.charsPerLine - charsUsedByNumber - sepChars
+    self.*.charsPerColumn = usefulChars / self.*.columns
+    if self.*.charsPerColumn < 1 { die(self, "page width too narrow") }
+    var clump: isize = self.*.charsPerInputTab
+    if clump < 8 { clump = 8 }
+    self.*.clumpBuff = allocate(@bitCast(usize, clump))
+    if self.*.numberedLines { self.*.numberBuff = allocate(@bitCast(usize, self.*.charsPerNumber) + 32) }
+}
+
+// A file read whole into an input of its own; false (said, unless -r)
+// when it cannot be read.
+fn openFile(self: *Pr, name: std.string.String, p: *Column) -> bool {
+    const data = common.readOperand(name)
+    if data == null {
+        self.*.failedOpens = true
+        if !self.*.ignoreFailedOpens { common.writeFileError("pr", name) }
+        return false
+    }
+    const list = data.?
+    const bytes = allocate(list.length)
+    var k: usize = 0
+    unsafe {
+        const source = @ptrCast([*]const u8, list.items)
+        while k < list.length {
+            bytes[k] = source[k]
+            k += 1
+        }
+    }
+    list.deinit()
+    self.*.inputs[self.*.inputCount] = Input.{ .bytes = bytes, .length = k, .position = 0 }
+    p.*.input = self.*.inputCount
+    self.*.inputCount += 1
+    p.*.name = if common.isDash(name) { std.string.fromSlice("standard input") } else { name }
+    p.*.status = OPEN
+    p.*.fullPagePrinted = false
+    self.*.totalFiles += 1
+    return true
+}
+
+fn initFps(self: *Pr, numberOfFiles: isize, first: usize) -> bool {
+    self.*.totalFiles = 0
+    self.*.columnCapacity = @bitCast(usize, self.*.columns)
+    self.*.columnVector = unsafe { @ptrCast([*]Column, allocate(self.*.columnCapacity * @sizeOf(Column))) }
+    const slots: usize = if numberOfFiles > 0 { @bitCast(usize, numberOfFiles) } else { 1 }
+    self.*.inputs = unsafe { @ptrCast([*]Input, allocate(slots * @sizeOf(Input))) }
+    self.*.inputCount = 0
+    var k: usize = 0
+    while k < self.*.columnCapacity {
+        const p = &self.*.columnVector[k]
+        p.*.input = 0
+        p.*.status = CLOSED
+        p.*.currentLine = 0
+        p.*.linesStored = 0
+        p.*.linesToPrint = 0
+        p.*.startPosition = 0
+        p.*.numbered = false
+        p.*.fullPagePrinted = false
+        k += 1
+    }
+    if self.*.parallelFiles {
+        var at: isize = 0
+        var left = numberOfFiles
+        var argument = first
+        while left > 0 {
+            if openFile(self, std.process.argument(self.*.arguments, argument), column(self, at)) {
+                at += 1
+            } else {
+                self.*.columns -= 1
+            }
+            left -= 1
+            argument += 1
+        }
+        if self.*.columns == 0 { return false }
+        initHeader(self, std.string.fromSlice(""), false)
+    } else {
+        const p = column(self, 0)
+        if numberOfFiles > 0 {
+            const name = std.process.argument(self.*.arguments, first)
+            if !openFile(self, name, p) { return false }
+            initHeader(self, name, !common.isDash(name))
+            p.*.linesStored = 0
+        } else {
+            if !openFile(self, std.string.fromSlice("-"), p) { return false }
+            initHeader(self, std.string.fromSlice(""), false)
+            p.*.linesStored = 0
+        }
+        var i: isize = 1
+        while i < self.*.columns {
+            const q = column(self, i)
+            q.*.name = p.*.name
+            q.*.input = p.*.input
+            q.*.status = OPEN
+            q.*.fullPagePrinted = false
+            q.*.linesStored = 0
+            i += 1
+        }
+    }
+    self.*.filesReadyToRead = self.*.totalFiles
+    return true
+}
+
+fn initFuncs(self: *Pr) -> void {
+    var h = self.*.charsPerMargin
+    var hNext: isize = ANYWHERE
+    if self.*.truncateLines {
+        if self.*.parallelFiles && self.*.numberedLines {
+            hNext = h + self.*.charsPerColumn + self.*.numberWidth
+        } else {
+            hNext = h + self.*.charsPerColumn
+        }
+    }
+    h = h + self.*.colSepLength
+    var i: isize = 1
+    while i < self.*.columns {
+        const p = column(self, i - 1)
+        p.*.numbered = self.*.numberedLines && (!self.*.parallelFiles || i == 1)
+        p.*.startPosition = h
+        if !self.*.truncateLines {
+            h = ANYWHERE
+            hNext = ANYWHERE
+        } else {
+            h = hNext + self.*.colSepLength
+            hNext = h + self.*.charsPerColumn
+        }
+        i += 1
+    }
+    const p = column(self, self.*.columns - 1)
+    p.*.numbered = self.*.numberedLines && (!self.*.parallelFiles || i == 1)
+    p.*.startPosition = h
+}
+
+fn closeFile(self: *Pr, p: *Column) -> void {
+    if p.*.status == CLOSED { return }
+    if !self.*.parallelFiles {
+        var i: isize = 0
+        while i < self.*.columns {
+            const q = column(self, i)
+            q.*.status = CLOSED
+            if q.*.linesStored == 0 { q.*.linesToPrint = 0 }
+            i += 1
+        }
+    } else {
+        p.*.status = CLOSED
+        p.*.linesToPrint = 0
+    }
+    self.*.filesReadyToRead -= 1
+}
+
+fn holdFile(self: *Pr, p: *Column) -> void {
+    if !self.*.parallelFiles {
+        var i: isize = 0
+        while i < self.*.columns {
+            column(self, i).*.status = if self.*.storingColumns { FF_FOUND } else { ON_HOLD }
+            i += 1
+        }
+    } else {
+        p.*.status = ON_HOLD
+    }
+    p.*.linesToPrint = 0
+    self.*.filesReadyToRead -= 1
+}
+
+fn resetStatus(self: *Pr) -> void {
+    var i: isize = 0
+    while i < self.*.columns {
+        const p = column(self, i)
+        if p.*.status == ON_HOLD {
+            p.*.status = OPEN
+            self.*.filesReadyToRead += 1
+        }
+        i += 1
+    }
+    if self.*.storingColumns {
+        self.*.filesReadyToRead = if column(self, 0).*.status == CLOSED { 0 } else { 1 }
+    }
+}
+
+fn printFiles(self: *Pr, numberOfFiles: isize, first: usize) -> void {
+    initParameters(self, numberOfFiles)
+    if !initFps(self, numberOfFiles, first) { return }
+    if self.*.storingColumns { initStoreCols(self) }
+    if self.*.firstPageNumber > 1 {
+        if !skipToPage(self, self.*.firstPageNumber) {
+            freeInputs(self)
+            return
+        }
+        self.*.pageNumber = self.*.firstPageNumber
+    } else {
+        self.*.pageNumber = 1
+    }
+    initFuncs(self)
+    self.*.lineNumber = self.*.lineCount
+    while printPage(self) {}
+    freeInputs(self)
+}
+
+fn freeInputs(self: *Pr) -> void {
+    var k: usize = 0
+    while k < self.*.inputCount {
+        release(self.*.inputs[k].bytes, self.*.inputs[k].length)
+        k += 1
+    }
+    self.*.inputCount = 0
+}
+
+// The header's date (a file's modification time, else now) and text.
+fn initHeader(self: *Pr, filename: std.string.String, hasFile: bool) -> void {
+    var seconds: isize = 0
+    var nanoseconds: isize = 0
+    var stamped = false
+    if hasFile {
+        var status: std.fs.Stat = undefined
+        if std.fs.status(filename.pointer, &status) == 0 {
+            seconds = status.modifiedSeconds
+            nanoseconds = status.modifiedNanoseconds
+            stamped = true
+        }
+    }
+    if !stamped {
+        if !self.*.nowTaken {
+            const now = std.time.realtime()
+            self.*.nowSeconds = now.seconds
+            self.*.nowNanoseconds = now.nanoseconds
+            self.*.nowTaken = true
+        }
+        seconds = self.*.nowSeconds
+        nanoseconds = self.*.nowNanoseconds
+    }
+    formatDate(self, seconds, nanoseconds)
+    self.*.fileText = if self.*.hasCustomHeader { self.*.customHeader } else if hasFile { filename } else { std.string.fromSlice("") }
+    self.*.headerWidthAvailable = self.*.charsPerLine - textWidth(self, self.*.dateText.bytes, self.*.dateText.length) - textWidth(self, self.*.fileText.pointer, self.*.fileText.length)
+}
+
+fn initPage(self: *Pr) -> void {
+    if self.*.storingColumns {
+        storeColumns(self)
+        var j: isize = 0
+        while j < self.*.columns - 1 {
+            const p = column(self, j)
+            p.*.linesToPrint = p.*.linesStored
+            j += 1
+        }
+        const p = column(self, self.*.columns - 1)
+        if self.*.balanceColumns {
+            p.*.linesToPrint = p.*.linesStored
+        } else {
+            p.*.linesToPrint = if p.*.status == OPEN { self.*.linesPerBody } else { 0 }
+        }
+    } else {
+        var j: isize = 0
+        while j < self.*.columns {
+            const p = column(self, j)
+            p.*.linesToPrint = if p.*.status == OPEN { self.*.linesPerBody } else { 0 }
+            j += 1
+        }
+    }
+}
+
+fn alignColumn(self: *Pr, p: *Column) -> void {
+    self.*.paddingNotPrinted = p.*.startPosition
+    if self.*.colSepLength < self.*.paddingNotPrinted {
+        padAcrossTo(self, self.*.paddingNotPrinted - self.*.colSepLength)
+        self.*.paddingNotPrinted = ANYWHERE
+    }
+    if self.*.useColSeparator { printSepString(self) }
+    if p.*.numbered { addLineNumber(self, p) }
+}
+
+fn printLine(self: *Pr, p: *Column) -> bool {
+    if self.*.storingColumns { return printStored(self, p) }
+    return readLine(self, p)
+}
+
+fn printPage(self: *Pr) -> bool {
+    initPage(self)
+    if colsReadyToPrint(self) == 0 { return false }
+    if self.*.extremities { self.*.printAHeader = true }
+    self.*.padVertically = false
+    var pv = false
+    var linesLeftOnPage = self.*.linesPerBody
+    if self.*.doubleSpace { linesLeftOnPage *= 2 }
+    while linesLeftOnPage > 0 && colsReadyToPrint(self) > 0 {
+        self.*.outputPosition = 0
+        self.*.spacesNotPrinted = 0
+        self.*.separatorsNotPrinted = 0
+        self.*.padVertically = false
+        self.*.alignEmptyCols = false
+        self.*.emptyLine = true
+        var j: isize = 1
+        while j <= self.*.columns {
+            const p = column(self, j - 1)
+            self.*.inputPosition = 0
+            if p.*.linesToPrint > 0 || p.*.status == FF_FOUND {
+                self.*.ffOnly = false
+                self.*.paddingNotPrinted = p.*.startPosition
+                if !printLine(self, p) { readRestOfLine(self, p) }
+                pv = pv || self.*.padVertically
+                p.*.linesToPrint -= 1
+                if p.*.linesToPrint <= 0 {
+                    if colsReadyToPrint(self) == 0 { break }
+                }
+                // The file changed its status to ON_HOLD or CLOSED.
+                if self.*.parallelFiles && p.*.status != OPEN {
+                    if self.*.emptyLine {
+                        self.*.alignEmptyCols = true
+                    } else if p.*.status == CLOSED || (p.*.status == ON_HOLD && self.*.ffOnly) {
+                        alignColumn(self, p)
+                    }
+                }
+            } else if self.*.parallelFiles {
+                if self.*.emptyLine { self.*.alignEmptyCols = true } else { alignColumn(self, p) }
+            }
+            if self.*.useColSeparator { self.*.separatorsNotPrinted += 1 }
+            j += 1
+        }
+        if self.*.padVertically {
+            putchar(self, 10)
+            linesLeftOnPage -= 1
+        }
+        if colsReadyToPrint(self) == 0 && !self.*.extremities { break }
+        if self.*.doubleSpace && pv {
+            putchar(self, 10)
+            linesLeftOnPage -= 1
+        }
+    }
+    if linesLeftOnPage == 0 {
+        var j: isize = 0
+        while j < self.*.columns {
+            const p = column(self, j)
+            if p.*.status == OPEN { p.*.fullPagePrinted = true }
+            j += 1
+        }
+    }
+    self.*.padVertically = pv
+    if self.*.padVertically && self.*.extremities {
+        padDown(self, linesLeftOnPage + LINES_PER_FOOTER)
+    } else if self.*.keepFF && self.*.printAFF {
+        putchar(self, 12)
+        self.*.printAFF = false
+    }
+    self.*.pageNumber += 1
+    if self.*.lastPageNumber < self.*.pageNumber { return false }
+    resetStatus(self)
+    return true
+}
+
+// ---- columns down: stored ----
+
+fn initStoreCols(self: *Pr) -> void {
+    const totalLines = @bitCast(usize, self.*.linesPerBody * self.*.columns)
+    self.*.lineVector = unsafe { @ptrCast([*]isize, allocate((totalLines + 1) * 8)) }
+    self.*.endVector = unsafe { @ptrCast([*]isize, allocate(totalLines * 8)) }
+    self.*.buffAllocated = totalLines * (@bitCast(usize, self.*.charsPerColumn) + 1) * 2
+    self.*.buff = allocate(self.*.buffAllocated)
+}
+
+fn storeColumns(self: *Pr) -> void {
+    var line: isize = 0
+    self.*.buffCurrent = 0
+    var buffStart: usize = 0
+    const lastCol = if self.*.balanceColumns { self.*.columns } else { self.*.columns - 1 }
+    var i: isize = 1
+    while i <= lastCol {
+        column(self, i - 1).*.linesStored = 0
+        i += 1
+    }
+    i = 1
+    while i <= lastCol && self.*.filesReadyToRead != 0 {
+        const p = column(self, i - 1)
+        p.*.currentLine = line
+        var j = self.*.linesPerBody
+        while j != 0 && self.*.filesReadyToRead != 0 {
+            if p.*.status == OPEN {
+                self.*.inputPosition = 0
+                if !readLine(self, p) { readRestOfLine(self, p) }
+                if p.*.status == OPEN || buffStart != self.*.buffCurrent {
+                    p.*.linesStored += 1
+                    self.*.lineVector[@bitCast(usize, line)] = @bitCast(isize, buffStart)
+                    self.*.endVector[@bitCast(usize, line)] = self.*.inputPosition
+                    line += 1
+                    buffStart = self.*.buffCurrent
+                }
+            }
+            j -= 1
+        }
+        i += 1
+    }
+    self.*.lineVector[@bitCast(usize, line)] = @bitCast(isize, buffStart)
+    if self.*.balanceColumns { balance(self, line) }
+}
+
+fn balance(self: *Pr, totalStored: isize) -> void {
+    var firstLine: isize = 0
+    var i: isize = 1
+    while i <= self.*.columns {
+        const p = column(self, i - 1)
+        var lines = totalStored / self.*.columns
+        if i <= totalStored % self.*.columns { lines += 1 }
+        p.*.linesStored = lines
+        p.*.currentLine = firstLine
+        firstLine += lines
+        i += 1
+    }
+}
+
+inline fn storeChar(self: *Pr, c: u8) -> void {
+    if self.*.buffCurrent >= self.*.buffAllocated {
+        const grown = self.*.buffAllocated * 2 + 64
+        const bigger = allocate(grown)
+        var k: usize = 0
+        while k < self.*.buffCurrent {
+            bigger[k] = self.*.buff[k]
+            k += 1
+        }
+        release(self.*.buff, self.*.buffAllocated)
+        self.*.buff = bigger
+        self.*.buffAllocated = grown
+    }
+    self.*.buff[self.*.buffCurrent] = c
+    self.*.buffCurrent += 1
+}
+
+// What a column does with a character: stores it (columns down) or
+// prints it.
+inline fn charFunc(self: *Pr, c: u8) -> void {
+    if self.*.storingColumns { storeChar(self, c) } else { printChar(self, c) }
+}
+
+fn addLineNumber(self: *Pr, p: *Column) -> void {
+    _ = p
+    // "%*d" of the number, its last charsPerNumber characters (the high
+    // digits cut off).
+    const text = self.*.numberBuff
+    var length: usize = 0
+    var magnitude: usize = if self.*.lineNumber < 0 { @bitCast(usize, -(self.*.lineNumber + 1)) + 1 } else { @bitCast(usize, self.*.lineNumber) }
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    while magnitude > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + magnitude % 10)
+        magnitude /= 10
+        count += 1
+    }
+    const sign: usize = if self.*.lineNumber < 0 { 1 } else { 0 }
+    const width = @bitCast(usize, self.*.charsPerNumber)
+    while length + count + sign < width {
+        text[length] = 32
+        length += 1
+    }
+    if sign == 1 {
+        text[length] = 45
+        length += 1
+    }
+    while count > 0 {
+        count -= 1
+        text[length] = digits[count]
+        length += 1
+    }
+    self.*.lineNumber += 1
+    var k = length - width
+    while k < length {
+        charFunc(self, text[k])
+        k += 1
+    }
+    if self.*.columns > 1 {
+        if self.*.numberSeparator == 9 {
+            var i = self.*.numberWidth - self.*.charsPerNumber
+            while i > 0 {
+                charFunc(self, 32)
+                i -= 1
+            }
+        } else {
+            charFunc(self, self.*.numberSeparator)
+        }
+    } else {
+        charFunc(self, self.*.numberSeparator)
+        if self.*.numberSeparator == 9 {
+            self.*.outputPosition = self.*.outputPosition + (self.*.charsPerOutputTab - self.*.outputPosition % self.*.charsPerOutputTab)
+        }
+    }
+    if self.*.truncateLines && !self.*.parallelFiles { self.*.inputPosition += self.*.numberWidth }
+}
+
+fn padAcrossTo(self: *Pr, position: isize) -> void {
+    var h = self.*.outputPosition
+    if self.*.tabifyOutput {
+        self.*.spacesNotPrinted = position - self.*.outputPosition
+    } else {
+        h += 1
+        while h <= position {
+            putchar(self, 32)
+            h += 1
+        }
+        self.*.outputPosition = position
+    }
+}
+
+fn padDown(self: *Pr, lines: isize) -> void {
+    if self.*.useFormFeed {
+        putchar(self, 12)
+    } else {
+        var i = lines
+        while i > 0 {
+            putchar(self, 10)
+            i -= 1
+        }
+    }
+}
+
+fn readRestOfLine(self: *Pr, p: *Column) -> void {
+    while true {
+        var c = getc(self, p)
+        if c == 10 { return }
+        if c == 12 {
+            c = getc(self, p)
+            if c != 10 { ungetc(self, c, p) }
+            if self.*.keepFF { self.*.printAFF = true }
+            holdFile(self, p)
+            return
+        }
+        if c == EOF {
+            closeFile(self, p)
+            return
+        }
+    }
+}
+
+fn skipRead(self: *Pr, p: *Column, columnNumber: isize) -> void {
+    var singleFF = false
+    var c = getc(self, p)
+    if c == 12 && p.*.fullPagePrinted {
+        c = getc(self, p)
+        if c == 10 { c = getc(self, p) }
+    }
+    p.*.fullPagePrinted = false
+    if c == 12 { singleFF = true }
+    if self.*.lastLine { p.*.fullPagePrinted = true }
+    while c != 10 {
+        if c == 12 {
+            if self.*.lastLine {
+                if !self.*.parallelFiles {
+                    var i: isize = 0
+                    while i < self.*.columns {
+                        column(self, i).*.fullPagePrinted = false
+                        i += 1
+                    }
+                } else {
+                    p.*.fullPagePrinted = false
+                }
+            }
+            c = getc(self, p)
+            if c != 10 { ungetc(self, c, p) }
+            holdFile(self, p)
+            break
+        } else if c == EOF {
+            closeFile(self, p)
             break
         }
-        if argument.length < 2 || argument.pointer[0] != 45 || common.isDash(argument) { break }
-        if common.equals(argument, "--help") {
-            result.action = 1
-            index += 1
-            continue
-        }
-        if common.equals(argument, "--version") {
-            result.action = 2
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-t") || common.equals(argument, "--omit-header") || common.equals(argument, "-T") || common.equals(argument, "--omit-pagination") {
-            result.omitHeader = true
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-d") || common.equals(argument, "--double-space") {
-            result.doubleSpace = true
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-F") || common.equals(argument, "-f") || common.equals(argument, "--form-feed") {
-            result.formFeed = true
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-r") || common.equals(argument, "--no-file-warnings") {
-            index += 1
-            continue
-        }
-        if std.string.startsWith(argument, std.string.fromSlice("--length=")) {
-            const parsed = std.parse.unsigned(std.string.slice(argument, 9, argument.length))
-            if !parsed.valid || parsed.value == 0 { result.invalid = true } else { result.pageLength = parsed.value }
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-l") || common.equals(argument, "--length") {
-            index += 1
-            if index >= count {
-                result.invalid = true
-                break
-            }
-            const parsed = std.parse.unsigned(std.process.argument(arguments, index))
-            if !parsed.valid || parsed.value == 0 { result.invalid = true } else { result.pageLength = parsed.value }
-            index += 1
-            continue
-        }
-        if std.string.startsWith(argument, std.string.fromSlice("--width=")) {
-            const parsed = std.parse.unsigned(std.string.slice(argument, 8, argument.length))
-            if !parsed.valid || parsed.value == 0 { result.invalid = true } else { result.pageWidth = parsed.value }
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-w") || common.equals(argument, "--width") || common.equals(argument, "-W") || common.equals(argument, "--page-width") {
-            index += 1
-            if index >= count {
-                result.invalid = true
-                break
-            }
-            const parsed = std.parse.unsigned(std.process.argument(arguments, index))
-            if !parsed.valid || parsed.value == 0 { result.invalid = true } else { result.pageWidth = parsed.value }
-            index += 1
-            continue
-        }
-        if std.string.startsWith(argument, std.string.fromSlice("--header=")) {
-            result.hasHeaderText = true
-            result.headerText = std.string.slice(argument, 9, argument.length)
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-h") || common.equals(argument, "--header") {
-            index += 1
-            if index >= count {
-                result.invalid = true
-                break
-            }
-            result.hasHeaderText = true
-            result.headerText = std.process.argument(arguments, index)
-            index += 1
-            continue
-        }
-        if std.string.startsWith(argument, std.string.fromSlice("--indent=")) {
-            const parsed = std.parse.unsigned(std.string.slice(argument, 9, argument.length))
-            if !parsed.valid { result.invalid = true } else { result.indent = parsed.value }
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-o") || common.equals(argument, "--indent") {
-            index += 1
-            if index >= count {
-                result.invalid = true
-                break
-            }
-            const parsed = std.parse.unsigned(std.process.argument(arguments, index))
-            if !parsed.valid { result.invalid = true } else { result.indent = parsed.value }
-            index += 1
-            continue
-        }
-        if common.equals(argument, "-n") || common.equals(argument, "--number-lines") {
-            result.numberLines = true
-            index += 1
-            continue
-        }
-        if std.string.startsWith(argument, std.string.fromSlice("--number-lines=")) {
-            result.numberLines = true
-            const value = std.string.slice(argument, 15, argument.length)
-            if value.length > 0 {
-                result.numberSep = value.pointer[0]
-                if value.length > 1 {
-                    const parsed = std.parse.unsigned(std.string.slice(value, 1, value.length))
-                    if parsed.valid { result.numberWidth = parsed.value }
+        c = getc(self, p)
+    }
+    if self.*.skipCount {
+        if (!self.*.parallelFiles || columnNumber == 1) && !singleFF { self.*.lineCount += 1 }
+    }
+}
+
+fn printWhiteSpace(self: *Pr) -> void {
+    var hOld = self.*.outputPosition
+    const goal = hOld + self.*.spacesNotPrinted
+    while goal - hOld > 1 {
+        const hNew = hOld + (self.*.charsPerOutputTab - hOld % self.*.charsPerOutputTab)
+        if hNew > goal { break }
+        putchar(self, self.*.outputTabChar)
+        hOld = hNew
+    }
+    hOld += 1
+    while hOld <= goal {
+        putchar(self, 32)
+        hOld += 1
+    }
+    self.*.outputPosition = goal
+    self.*.spacesNotPrinted = 0
+}
+
+fn printSepString(self: *Pr) -> void {
+    var s: usize = 0
+    var l = self.*.colSepLength
+    if self.*.separatorsNotPrinted <= 0 {
+        if self.*.spacesNotPrinted > 0 { printWhiteSpace(self) }
+    } else {
+        while self.*.separatorsNotPrinted > 0 {
+            while l > 0 {
+                l -= 1
+                const byte = self.*.colSepString.pointer[s]
+                if byte == 32 {
+                    s += 1
+                    self.*.spacesNotPrinted += 1
+                } else {
+                    if self.*.spacesNotPrinted > 0 { printWhiteSpace(self) }
+                    putchar(self, byte)
+                    s += 1
+                    self.*.outputPosition += 1
                 }
             }
-            index += 1
-            continue
+            if self.*.spacesNotPrinted > 0 { printWhiteSpace(self) }
+            self.*.separatorsNotPrinted -= 1
         }
-        if argument.length > 2 && argument.pointer[1] == 110 {
-            result.numberLines = true
-            const value = std.string.slice(argument, 2, argument.length)
-            if value.length > 0 && !std.ascii.isDigit(value.pointer[0]) {
-                result.numberSep = value.pointer[0]
-                if value.length > 1 {
-                    const parsed = std.parse.unsigned(std.string.slice(value, 1, value.length))
-                    if parsed.valid { result.numberWidth = parsed.value }
-                }
-            } else if value.length > 0 {
-                const parsed = std.parse.unsigned(value)
-                if parsed.valid { result.numberWidth = parsed.value }
+    }
+}
+
+fn printClump(self: *Pr, n: isize) -> void {
+    var k: isize = 0
+    while k < n {
+        charFunc(self, self.*.clumpBuff[@bitCast(usize, k)])
+        k += 1
+    }
+}
+
+inline fn printChar(self: *Pr, c: u8) -> void {
+    if self.*.tabifyOutput {
+        if c == 32 {
+            self.*.spacesNotPrinted += 1
+            return
+        } else if self.*.spacesNotPrinted > 0 {
+            printWhiteSpace(self)
+        }
+        // Nonprintables are assumed to have width 0, except '\b'.
+        if !isprint(c) {
+            if c == 8 { self.*.outputPosition -= 1 }
+        } else {
+            self.*.outputPosition += 1
+        }
+    }
+    putchar(self, c)
+}
+
+fn skipToPage(self: *Pr, page: usize) -> bool {
+    var n: usize = 1
+    while n < page {
+        var i: isize = 1
+        while i < self.*.linesPerBody {
+            var j: isize = 1
+            while j <= self.*.columns {
+                const p = column(self, j - 1)
+                if p.*.status == OPEN { skipRead(self, p, j) }
+                j += 1
             }
-            index += 1
-            continue
+            i += 1
         }
-        if argument.length > 2 && argument.pointer[1] == 111 {
-            const parsed = std.parse.unsigned(std.string.slice(argument, 2, argument.length))
-            if !parsed.valid { result.invalid = true } else { result.indent = parsed.value }
-            index += 1
-            continue
+        self.*.lastLine = true
+        var j: isize = 1
+        while j <= self.*.columns {
+            const p = column(self, j - 1)
+            if p.*.status == OPEN { skipRead(self, p, j) }
+            j += 1
         }
-        if argument.length > 2 && argument.pointer[1] == 108 {
-            const parsed = std.parse.unsigned(std.string.slice(argument, 2, argument.length))
-            if !parsed.valid || parsed.value == 0 { result.invalid = true } else { result.pageLength = parsed.value }
-            index += 1
-            continue
+        if self.*.storingColumns {
+            j = 1
+            while j <= self.*.columns {
+                const p = column(self, j - 1)
+                if p.*.status != CLOSED { p.*.status = ON_HOLD }
+                j += 1
+            }
         }
-        result.invalid = true
-        index += 1
+        resetStatus(self)
+        self.*.lastLine = false
+        if self.*.filesReadyToRead < 1 {
+            flush(self)
+            _ = std.io.writeAll(std.io.stderr(), "pr: starting page number ")
+            _ = std.io.writeUnsigned(std.io.stderr(), page)
+            _ = std.io.writeAll(std.io.stderr(), " exceeds page count ")
+            _ = std.io.writeUnsigned(std.io.stderr(), n)
+            _ = std.io.writeAll(std.io.stderr(), "\n")
+            break
+        }
+        n += 1
     }
-    if result.pageLength <= 10 { result.omitHeader = true }
-    result.firstFile = index
-    return result
+    return self.*.filesReadyToRead > 0
 }
 
-const Calendar = struct {
-    year: isize
-    month: usize
-    day: usize
-    hour: usize
-    minute: usize
+// "%*s" of " " for `width`: the space, padded to the width.
+fn padField(self: *Pr, width: isize) -> void {
+    putSpaces(self, if width > 1 { width } else { 1 })
 }
 
-fn leap(year: isize) -> bool { return year % 4 == 0 && year % 100 != 0 || year % 400 == 0 }
-
-fn monthDays(year: isize, month: usize) -> usize {
-    if month == 2 { return if leap(year) { 29 } else { 28 } }
-    if month == 4 || month == 6 || month == 9 || month == 11 { return 30 }
-    return 31
-}
-
-fn floorDays(seconds: isize) -> isize {
-    if seconds >= 0 { return seconds / 86400 }
-    return -((-seconds + 86399) / 86400)
-}
-
-fn calendarFromSeconds(seconds: isize) -> Calendar {
-    const days = floorDays(seconds)
-    const clock = @intCast(usize, seconds - days * 86400)
-    const shifted = days + 719468
-    const era = if shifted >= 0 { shifted / 146097 } else { (shifted - 146096) / 146097 }
-    const dayOfEra = shifted - era * 146097
-    const yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
-    var year = yearOfEra + era * 400
-    const dayOfYearMarch = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
-    const monthPart = (5 * dayOfYearMarch + 2) / 153
-    const day = dayOfYearMarch - (153 * monthPart + 2) / 5 + 1
-    const month = if monthPart < 10 { monthPart + 3 } else { monthPart - 9 }
-    if month <= 2 { year += 1 }
-    return Calendar.{ .year = year, .month = @intCast(usize, month), .day = @intCast(usize, day), .hour = clock / 3600, .minute = clock / 60 % 60 }
-}
-
-fn digitsOf(value: usize) -> usize {
-    var result: usize = 1
-    var remaining = value
-    while remaining >= 10 {
-        remaining /= 10
-        result += 1
+fn printHeader(self: *Pr) -> void {
+    self.*.outputPosition = 0
+    padAcrossTo(self, self.*.charsPerMargin)
+    printWhiteSpace(self)
+    var pageText: [32]u8 = undefined
+    var pageLength: usize = 0
+    const prefix = "Page "
+    while pageLength < prefix.length {
+        pageText[pageLength] = prefix[pageLength]
+        pageLength += 1
     }
-    return result
-}
-
-fn writeNumber(file: std.fs.File, value: usize, width: usize, pad: u8) -> bool {
-    const length = digitsOf(value)
-    var padCount = if width > length { width - length } else { 0 }
-    while padCount > 0 {
-        if !std.io.writeAll(file, if pad == 48 { "0" } else { " " }) { return false }
-        padCount -= 1
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var value = self.*.pageNumber
+    while value > 0 || count == 0 {
+        digits[count] = @intCast(u8, 48 + value % 10)
+        value /= 10
+        count += 1
     }
-    return std.io.writeUnsigned(file, value)
+    while count > 0 {
+        count -= 1
+        pageText[pageLength] = digits[count]
+        pageLength += 1
+    }
+    var available = self.*.headerWidthAvailable - @bitCast(isize, pageLength)
+    if available < 0 { available = 0 }
+    const lhs = available >> 1
+    const rhs = available - lhs
+    putText(self, "\n\n")
+    putSpaces(self, self.*.charsPerMargin)
+    var k: usize = 0
+    while k < self.*.dateText.length {
+        putchar(self, self.*.dateText.bytes[k])
+        k += 1
+    }
+    padField(self, lhs)
+    putString(self, self.*.fileText)
+    padField(self, rhs)
+    putText(self, pageText[0..pageLength])
+    putText(self, "\n\n\n")
+    self.*.printAHeader = false
+    self.*.outputPosition = 0
 }
 
-fn writeSpaces(file: std.fs.File, count: usize) -> bool {
-    var i: usize = 0
-    while i < count {
-        if !std.io.writeAll(file, " ") { return false }
-        i += 1
+// A line of the column printed (or stored); false when it was cut at the
+// column's width (the rest is then read past).
+fn readLine(self: *Pr, p: *Column) -> bool {
+    var chars: isize = 0
+    var c = getc(self, p)
+    var lastInputPosition = self.*.inputPosition
+    if c == 12 && p.*.fullPagePrinted {
+        c = getc(self, p)
+        if c == 10 { c = getc(self, p) }
+    }
+    p.*.fullPagePrinted = false
+    if c == 12 {
+        c = getc(self, p)
+        if c != 10 { ungetc(self, c, p) }
+        self.*.ffOnly = true
+        if self.*.printAHeader && !self.*.storingColumns {
+            self.*.padVertically = true
+            printHeader(self)
+        } else if self.*.keepFF {
+            self.*.printAFF = true
+        }
+        holdFile(self, p)
+        return true
+    }
+    if c == EOF {
+        closeFile(self, p)
+        return true
+    }
+    if c != 10 { chars = charToClump(self, @intCast(u8, c)) }
+    if self.*.truncateLines && self.*.inputPosition > self.*.charsPerColumn {
+        self.*.inputPosition = lastInputPosition
+        return false
+    }
+    if !self.*.storingColumns {
+        self.*.padVertically = true
+        if self.*.printAHeader && !self.*.storingColumns { printHeader(self) }
+        if self.*.parallelFiles && self.*.alignEmptyCols {
+            // Empty columns aligned at the beginning of a line.
+            const k = self.*.separatorsNotPrinted
+            self.*.separatorsNotPrinted = 0
+            var j: isize = 1
+            while j <= k {
+                alignColumn(self, column(self, j - 1))
+                self.*.separatorsNotPrinted += 1
+                j += 1
+            }
+            self.*.paddingNotPrinted = p.*.startPosition
+            self.*.spacesNotPrinted = if self.*.truncateLines { self.*.charsPerColumn } else { 0 }
+            self.*.alignEmptyCols = false
+        }
+        if self.*.colSepLength < self.*.paddingNotPrinted {
+            padAcrossTo(self, self.*.paddingNotPrinted - self.*.colSepLength)
+            self.*.paddingNotPrinted = ANYWHERE
+        }
+        if self.*.useColSeparator { printSepString(self) }
+    }
+    if p.*.numbered { addLineNumber(self, p) }
+    self.*.emptyLine = false
+    if c == 10 { return true }
+    printClump(self, chars)
+    while true {
+        c = getc(self, p)
+        if c == 10 { return true }
+        if c == 12 {
+            c = getc(self, p)
+            if c != 10 { ungetc(self, c, p) }
+            if self.*.keepFF { self.*.printAFF = true }
+            holdFile(self, p)
+            return true
+        }
+        if c == EOF {
+            closeFile(self, p)
+            return true
+        }
+        lastInputPosition = self.*.inputPosition
+        chars = charToClump(self, @intCast(u8, c))
+        if self.*.truncateLines && self.*.inputPosition > self.*.charsPerColumn {
+            self.*.inputPosition = lastInputPosition
+            return false
+        }
+        printClump(self, chars)
     }
     return true
 }
 
-fn dateTimeText(buffer: [*]u8) -> usize {
-    const zone = timezone.init(std.string.fromSlice(""))
-    const now = std.time.realtime()
-    const offset = timezone.offset(zone, now.seconds)
-    const value = calendarFromSeconds(now.seconds + offset)
-    timezone.deinit(zone)
-    var pos: usize = 0
-    var digits: [4]u8 = [4]u8{ 0, 0, 0, 0 }
-    var y = value.year
-    if y < 0 { y = 0 }
-    digits[0] = 48 + @intCast(u8, (y / 1000) % 10)
-    digits[1] = 48 + @intCast(u8, (y / 100) % 10)
-    digits[2] = 48 + @intCast(u8, (y / 10) % 10)
-    digits[3] = 48 + @intCast(u8, y % 10)
-    var i: usize = 0
-    while i < 4 {
-        buffer[pos] = digits[i]
-        pos += 1
-        i += 1
-    }
-    buffer[pos] = 45
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.month / 10)
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.month % 10)
-    pos += 1
-    buffer[pos] = 45
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.day / 10)
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.day % 10)
-    pos += 1
-    buffer[pos] = 32
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.hour / 10)
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.hour % 10)
-    pos += 1
-    buffer[pos] = 58
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.minute / 10)
-    pos += 1
-    buffer[pos] = 48 + @intCast(u8, value.minute % 10)
-    pos += 1
-    return pos
-}
-
-fn writeHeaderLine(file: std.fs.File, options: Options, dateText: [*]const u8, dateLength: usize, headerText: std.string.String, pageNumber: usize) -> bool {
-    unsafe { if !std.io.writeAllBytes(file, dateText, dateLength) { return false } }
-    const pageDigits = digitsOf(pageNumber)
-    const pagePartLength = 5 + pageDigits
-    if options.pageWidth <= dateLength + pagePartLength { return std.io.print("Page ") && std.io.writeUnsigned(file, pageNumber) }
-    const midWidth = options.pageWidth - dateLength - pagePartLength
-    const headerLength = if headerText.length < midWidth { headerText.length } else { midWidth }
-    const leftPad = (midWidth - headerLength) / 2
-    const rightPad = midWidth - headerLength - leftPad
-    if !writeSpaces(file, leftPad) { return false }
-    if headerLength > 0 { if !std.io.writeAllBytes(file, headerText.pointer, headerLength) { return false } }
-    if !writeSpaces(file, rightPad) { return false }
-    if !std.io.print("Page ") { return false }
-    return std.io.writeUnsigned(file, pageNumber)
-}
-
-fn writeSep(file: std.fs.File, sep: u8) -> bool {
-    var buffer: [1]u8 = [1]u8{ sep }
-    unsafe { return std.io.writeAllBytes(file, @ptrCast([*]const u8, buffer[0..1]), 1) }
-}
-
-fn processLines(options: Options, path: std.string.String, displayName: std.string.String, linePtr: [*][*]const u8, lineLen: [*]usize, totalLines: usize, dateText: [*]const u8, dateLength: usize) -> bool {
-    const stdout = std.io.stdout()
-    const headerText = if options.hasHeaderText { options.headerText } else { displayName }
-    var headerTrailer: usize = 0
-    if !options.omitHeader { headerTrailer = if options.formFeed { 5 } else { 10 } }
-    const contentBudget = if options.pageLength > headerTrailer { options.pageLength - headerTrailer } else { 1 }
-    const effectiveBudget = if options.doubleSpace { if contentBudget > 1 { contentBudget / 2 } else { 1 } } else { contentBudget }
-
-    var lineNumberCounter: usize = 1
-    var pageNumber: usize = 1
-    var lineIndex: usize = 0
-    var ok = true
-    var producedPage = false
-    while ok && (lineIndex < totalLines || !producedPage) {
-        producedPage = true
-        if !options.omitHeader {
-            if !std.io.print("\n\n") { ok = false }
-            if ok && !writeHeaderLine(stdout, options, dateText, dateLength, headerText, pageNumber) { ok = false }
-            if ok && !std.io.print("\n\n\n") { ok = false }
-        }
-        const remaining = if lineIndex < totalLines { totalLines - lineIndex } else { 0 }
-        const linesThisPage = if effectiveBudget < remaining { effectiveBudget } else { remaining }
-        const padContent = !options.omitHeader && !options.formFeed
-        const slotBound = if padContent { effectiveBudget } else { linesThisPage }
-        var slot: usize = 0
-        while ok && slot < slotBound {
-            if !writeSpaces(stdout, options.indent) { ok = false }
-            if ok && slot < linesThisPage {
-                if options.numberLines {
-                    if !writeNumber(stdout, lineNumberCounter, options.numberWidth, 32) { ok = false }
-                    if ok && !writeSep(stdout, options.numberSep) { ok = false }
-                    lineNumberCounter += 1
-                }
-                if ok && lineLen[lineIndex + slot] > 0 {
-                    unsafe { if !std.io.writeAllBytes(stdout, linePtr[lineIndex + slot], lineLen[lineIndex + slot]) { ok = false } }
-                }
-            }
-            if ok && !std.io.print("\n") { ok = false }
-            if ok && options.doubleSpace && !std.io.print("\n") { ok = false }
-            slot += 1
-        }
-        if ok {
-            if options.formFeed && !options.omitHeader {
-                var ffBuffer: [1]u8 = [1]u8{ 12 }
-                unsafe { ok = std.io.writeAllBytes(stdout, @ptrCast([*]const u8, ffBuffer[0..1]), 1) }
-            } else if !options.omitHeader {
-                ok = std.io.print("\n\n\n\n\n")
-            }
-        }
-        lineIndex += linesThisPage
-        pageNumber += 1
-    }
-    return ok
-}
-
-fn processPath(options: Options, path: std.string.String, dateText: [*]const u8, dateLength: usize) -> bool {
-    var opened = false
-    const data = common.readOperandOrSay("pr", path, &opened)
-    if !opened {
-        data.deinit()
-        return false
-    }
-    const allocator: std.allocator.Allocator = std.heap.allocator()
-    var ok = true
-    unsafe {
-        var raw: [*]const u8 = undefined
-        raw = @ptrCast([*]const u8, data.items)
-        var totalLines: usize = 0
-        var i: usize = 0
-        while i < data.length {
-            if raw[i] == 10 { totalLines += 1 }
+fn printStored(self: *Pr, p: *Column) -> bool {
+    const line = p.*.currentLine
+    p.*.currentLine += 1
+    var first = @bitCast(usize, self.*.lineVector[@bitCast(usize, line)])
+    const last = @bitCast(usize, self.*.lineVector[@bitCast(usize, line + 1)])
+    self.*.padVertically = true
+    if self.*.printAHeader { printHeader(self) }
+    if p.*.status == FF_FOUND {
+        var i: isize = 0
+        while i < self.*.columns {
+            column(self, i).*.status = ON_HOLD
             i += 1
         }
-        if data.length > 0 && raw[data.length - 1] != 10 { totalLines += 1 }
-        var linePtr: [*][*]const u8 = undefined
-        var lineLen: [*]usize = undefined
-        if totalLines > 0 {
-            const ptrAlloc = allocator.alloc(totalLines * 8, 8)
-            const lenAlloc = allocator.alloc(totalLines * 8, 8)
-            linePtr = @ptrCast([*][*]const u8, ptrAlloc.?)
-            lineLen = @ptrCast([*]usize, lenAlloc.?)
-            var idx: usize = 0
-            var lineStart: usize = 0
-            i = 0
-            while i < data.length {
-                if raw[i] == 10 {
-                    linePtr[idx] = raw + lineStart
-                    lineLen[idx] = i - lineStart
-                    idx += 1
-                    lineStart = i + 1
-                }
+        if column(self, 0).*.linesToPrint <= 0 {
+            if !self.*.extremities { self.*.padVertically = false }
+            return true
+        }
+    }
+    if self.*.colSepLength < self.*.paddingNotPrinted {
+        padAcrossTo(self, self.*.paddingNotPrinted - self.*.colSepLength)
+        self.*.paddingNotPrinted = ANYWHERE
+    }
+    if self.*.useColSeparator { printSepString(self) }
+    while first != last {
+        printChar(self, self.*.buff[first])
+        first += 1
+    }
+    if self.*.spacesNotPrinted == 0 {
+        self.*.outputPosition = p.*.startPosition + self.*.endVector[@bitCast(usize, line)]
+        if p.*.startPosition - self.*.colSepLength == self.*.charsPerMargin { self.*.outputPosition -= self.*.colSepLength }
+    }
+    return true
+}
+
+fn octal(self: *Pr, at: usize, value: u8) -> void {
+    self.*.clumpBuff[at] = 92
+    self.*.clumpBuff[at + 1] = 48 + (value >> 6)
+    self.*.clumpBuff[at + 2] = 48 + ((value >> 3) & 7)
+    self.*.clumpBuff[at + 3] = 48 + (value & 7)
+}
+
+// A character as the clump that shows it (a tab as spaces when expanding,
+// a control as ^X or \ooo when asked); its byte count. The input position
+// moves by the clump's width.
+fn charToClump(self: *Pr, c: u8) -> isize {
+    var width: isize = 0
+    var chars: isize = 0
+    var charsPerC: isize = 8
+    if c == self.*.inputTabChar { charsPerC = self.*.charsPerInputTab }
+    if c == self.*.inputTabChar || c == 9 {
+        width = charsPerC - self.*.inputPosition % charsPerC
+        if self.*.untabifyInput {
+            var i: isize = 0
+            while i < width {
+                self.*.clumpBuff[@bitCast(usize, i)] = 32
                 i += 1
             }
-            if lineStart < data.length {
-                linePtr[idx] = raw + lineStart
-                lineLen[idx] = data.length - lineStart
-                idx += 1
-            }
+            chars = width
+        } else {
+            self.*.clumpBuff[0] = c
+            chars = 1
         }
-        const displayName = if common.isDash(path) { std.string.fromSlice("<standard input>") } else { path }
-        ok = processLines(options, path, displayName, linePtr, lineLen, totalLines, dateText, dateLength)
+    } else if !isprint(c) {
+        if self.*.useEscSequence {
+            width = 4
+            chars = 4
+            octal(self, 0, c)
+        } else if self.*.useCntrlPrefix {
+            if c < 128 {
+                width = 2
+                chars = 2
+                self.*.clumpBuff[0] = 94
+                self.*.clumpBuff[1] = c ^ 64
+            } else {
+                width = 4
+                chars = 4
+                octal(self, 0, c)
+            }
+        } else if c == 8 {
+            width = -1
+            chars = 1
+            self.*.clumpBuff[0] = c
+        } else {
+            width = 0
+            chars = 1
+            self.*.clumpBuff[0] = c
+        }
+    } else {
+        width = 1
+        chars = 1
+        self.*.clumpBuff[0] = c
     }
-    data.deinit()
-    return ok
+    // Too many backspaces put us at position 0, never below.
+    if width < 0 && self.*.inputPosition == 0 {
+        chars = 0
+        self.*.inputPosition = 0
+    } else if width < 0 && self.*.inputPosition <= -width {
+        self.*.inputPosition = 0
+    } else {
+        self.*.inputPosition += width
+    }
+    return chars
+}
+
+// ---- the header's date ----
+
+// The date of `seconds` in the date format (strftime's, gnulib's).
+fn formatDate(self: *Pr, seconds: isize, nanoseconds: isize) -> void {
+    if self.*.hasDateText { strftime.release(self.*.dateText) }
+    const time = strftime.local(seconds, nanoseconds, self.*.zone)
+    self.*.dateText = strftime.format(std.string.asSlice(self.*.dateFormat), time)
+    self.*.hasDateText = true
+}
+
+// ---- options ----
+
+// A number of an option, MIN to INT_MAX; a fatal error when it is not.
+fn optionNumber(self: *Pr, text: std.string.String, min: isize, message: []const u8) -> isize {
+    var k: usize = 0
+    var negative = false
+    if k < text.length && (text.pointer[k] == 45 || text.pointer[k] == 43) {
+        negative = text.pointer[k] == 45
+        k += 1
+    }
+    var value: isize = 0
+    var digits: usize = 0
+    var valid = k < text.length
+    while k < text.length {
+        const byte = text.pointer[k]
+        if byte < 48 || byte > 57 {
+            valid = false
+            break
+        }
+        value = value * 10 + @intCast(isize, byte - 48)
+        if value > INT_MAX + 1 { value = INT_MAX + 1 }
+        digits += 1
+        k += 1
+    }
+    if negative { value = -value }
+    if !valid || digits == 0 || value < min || value > INT_MAX {
+        flush(self)
+        _ = std.io.writeAll(std.io.stderr(), "pr: ")
+        _ = std.io.writeAll(std.io.stderr(), message)
+        _ = std.io.writeAll(std.io.stderr(), ": '")
+        _ = std.io.writeString(std.io.stderr(), text)
+        _ = std.io.writeAll(std.io.stderr(), "'\n")
+        _ = std.linux.syscall1(std.linux.SYS_exit_group, 1)
+    }
+    return value
+}
+
+// -cNNN: an optional character, then an optional width (above 0).
+fn optionCharacter(self: *Pr, text: std.string.String, option: u8, character: *u8, number: *isize) -> void {
+    var k: usize = 0
+    if text.length == 0 { badUsage(self) }
+    if text.pointer[0] < 48 || text.pointer[0] > 57 {
+        character.* = text.pointer[0]
+        k = 1
+    }
+    if k < text.length {
+        _ = option
+        const value = optionNumber(self, std.string.slice(text, k, text.length), 1, "extra characters or invalid number in the argument")
+        number.* = value
+    }
+}
+
+fn badUsage(self: *Pr) -> void {
+    flush(self)
+    _ = std.io.writeAll(std.io.stderr(), "Try 'pr --help' for more information.\n")
+    _ = std.linux.syscall1(std.linux.SYS_exit_group, 1)
+}
+
+// +FIRST[:LAST] (or --pages=): false when it is no page range.
+fn pageRange(self: *Pr, text: std.string.String) -> bool {
+    var k: usize = 0
+    var first: usize = 0
+    var digits: usize = 0
+    while k < text.length && text.pointer[k] >= 48 && text.pointer[k] <= 57 {
+        first = first * 10 + @intCast(usize, text.pointer[k] - 48)
+        digits += 1
+        k += 1
+    }
+    if digits == 0 || first == 0 { return false }
+    var last: usize = 18446744073709551615
+    if k < text.length && text.pointer[k] == 58 {
+        k += 1
+        var lastDigits: usize = 0
+        last = 0
+        while k < text.length && text.pointer[k] >= 48 && text.pointer[k] <= 57 {
+            last = last * 10 + @intCast(usize, text.pointer[k] - 48)
+            lastDigits += 1
+            k += 1
+        }
+        if lastDigits == 0 || last < first { return false }
+    }
+    if k != text.length { return false }
+    self.*.firstPageNumber = first
+    self.*.lastPageNumber = last
+    return true
+}
+
+const LONG_NAMES = [25][]const u8{ "pages", "columns", "across", "show-control-chars", "double-space", "date-format", "expand-tabs", "form-feed", "header", "output-tabs", "join-lines", "length", "merge", "number-lines", "first-line-number", "indent", "no-file-warnings", "separator", "sep-string", "omit-header", "omit-pagination", "show-nonprinting", "width", "page-width", "help" }
+// The short option each long one is, 1 and 2 for --pages and --columns,
+// 3 for --help (--version is apart: it names no other).
+const LONG_CODES = [25]u8{ 1, 2, 97, 99, 100, 68, 101, 102, 104, 105, 74, 108, 109, 110, 78, 111, 114, 115, 83, 116, 84, 118, 119, 87, 3 }
+// 0 no argument, 1 required, 2 optional.
+const LONG_ARGUMENTS = [25]u8{ 1, 1, 0, 0, 0, 1, 2, 0, 1, 2, 0, 1, 0, 2, 1, 1, 0, 2, 2, 0, 0, 0, 1, 1, 0 }
+
+fn shortArgument(byte: u8) -> u8 {
+    if byte == 68 || byte == 78 || byte == 87 || byte == 104 || byte == 108 || byte == 111 || byte == 119 { return 1 }
+    if byte == 83 || byte == 101 || byte == 105 || byte == 110 || byte == 115 { return 2 }
+    return 0
+}
+
+fn knownShort(byte: u8) -> bool {
+    return (byte >= 48 && byte <= 57) || byte == 70 || byte == 74 || byte == 84 || byte == 97 || byte == 98 || byte == 99 || byte == 100 || byte == 102 || byte == 109 || byte == 114 || byte == 116 || byte == 118 || shortArgument(byte) != 0
+}
+
+const Parsed = struct {
+    oldW: bool
+    oldS: bool
+    oldOptions: bool
+    columnDigits: isize
+    hasColumnDigits: bool
+}
+
+// One option (its letter or code) with its argument, if any.
+fn applyOption(self: *Pr, code: u8, argument: std.string.String, hasArgument: bool, parsed: *Parsed) -> void {
+    if code >= 48 && code <= 57 {
+        // Old-style column counts (-3, -12): digits accumulate.
+        if !parsed.*.hasColumnDigits { parsed.*.columnDigits = 0 }
+        parsed.*.columnDigits = parsed.*.columnDigits * 10 + @intCast(isize, code - 48)
+        if parsed.*.columnDigits > INT_MAX { parsed.*.columnDigits = INT_MAX + 1 }
+        parsed.*.hasColumnDigits = true
+        return
+    }
+    if code == 1 {
+        if !pageRange(self, argument) {
+            flush(self)
+            _ = std.io.writeAll(std.io.stderr(), "pr: invalid page range '")
+            _ = std.io.writeString(std.io.stderr(), argument)
+            _ = std.io.writeAll(std.io.stderr(), "'\n")
+            _ = std.linux.syscall1(std.linux.SYS_exit_group, 1)
+        }
+    } else if code == 2 {
+        self.*.columns = optionNumber(self, argument, 1, "invalid number of columns")
+        self.*.explicitColumns = true
+        parsed.*.hasColumnDigits = false
+    } else if code == 97 {
+        self.*.printAcrossFlag = true
+        self.*.storingColumns = false
+    } else if code == 98 { self.*.balanceColumns = true } else if code == 99 { self.*.useCntrlPrefix = true } else if code == 100 { self.*.doubleSpace = true } else if code == 68 {
+        self.*.dateFormat = argument
+    } else if code == 101 {
+        if hasArgument { optionCharacter(self, argument, 101, &self.*.inputTabChar, &self.*.charsPerInputTab) }
+        self.*.untabifyInput = true
+    } else if code == 102 || code == 70 { self.*.useFormFeed = true } else if code == 104 {
+        self.*.hasCustomHeader = true
+        self.*.customHeader = argument
+    } else if code == 105 {
+        if hasArgument { optionCharacter(self, argument, 105, &self.*.outputTabChar, &self.*.charsPerOutputTab) }
+        self.*.tabifyOutput = true
+    } else if code == 74 { self.*.joinLines = true } else if code == 108 {
+        self.*.linesPerPage = optionNumber(self, argument, 1, "'-l PAGE_LENGTH' invalid number of lines")
+    } else if code == 109 {
+        self.*.parallelFiles = true
+        self.*.storingColumns = false
+    } else if code == 110 {
+        self.*.numberedLines = true
+        if hasArgument { optionCharacter(self, argument, 110, &self.*.numberSeparator, &self.*.charsPerNumber) }
+    } else if code == 78 {
+        self.*.skipCount = false
+        self.*.startLineNum = optionNumber(self, argument, -INT_MAX - 1, "'-N NUMBER' invalid starting line number")
+    } else if code == 111 {
+        self.*.charsPerMargin = optionNumber(self, argument, 0, "'-o MARGIN' invalid line offset")
+    } else if code == 114 { self.*.ignoreFailedOpens = true } else if code == 115 {
+        parsed.*.oldOptions = true
+        parsed.*.oldS = true
+        if !self.*.useColSeparator && hasArgument {
+            self.*.colSepString = argument
+            self.*.colSepLength = @bitCast(isize, argument.length)
+        }
+    } else if code == 83 {
+        parsed.*.oldS = false
+        self.*.colSepString = std.string.fromSlice("")
+        self.*.colSepLength = 0
+        self.*.useColSeparator = true
+        if hasArgument {
+            self.*.colSepString = argument
+            self.*.colSepLength = @bitCast(isize, argument.length)
+        }
+    } else if code == 116 {
+        self.*.extremities = false
+        self.*.keepFF = true
+    } else if code == 84 {
+        self.*.extremities = false
+        self.*.keepFF = false
+    } else if code == 118 { self.*.useEscSequence = true } else if code == 119 {
+        parsed.*.oldOptions = true
+        parsed.*.oldW = true
+        const width = optionNumber(self, argument, 1, "'-w PAGE_WIDTH' invalid number of characters")
+        if !self.*.truncateLines { self.*.charsPerLine = width }
+    } else if code == 87 {
+        parsed.*.oldW = false
+        self.*.truncateLines = true
+        self.*.charsPerLine = optionNumber(self, argument, 1, "'-W PAGE_WIDTH' invalid number of characters")
+    }
 }
 
 fn printHelp() -> u8 {
-    return if std.io.print("Usage: pr [OPTION]... [FILE]...\nPaginate or columnate FILE(s) for printing.\n  -d, --double-space         double space the output\n  -F, -f, --form-feed        use form feeds instead of newlines to separate pages\n  -h, --header=HEADER        use a centered HEADER instead of filename\n  -l, --length=PAGE_LENGTH   set the page length (66)\n  -n[SEP[DIGITS]], --number-lines[=SEP[DIGITS]]  number lines\n  -o, --indent=MARGIN        offset each line with MARGIN spaces\n  -t, --omit-header          omit page headers and trailers\n      --help     display this help and exit\n      --version  output version information and exit\n") { 0 } else { 1 }
+    return if std.io.print("Usage: pr [OPTION]... [FILE]...\nPaginate or columnate FILE(s) for printing.\n  +FIRST_PAGE[:LAST_PAGE], --pages=FIRST_PAGE[:LAST_PAGE]\n                    begin [stop] printing with page FIRST_[LAST_]PAGE\n  -COLUMN, --columns=COLUMN\n                    output COLUMN columns and print columns down\n  -a, --across      print columns across rather than down\n  -c, --show-control-chars\n                    use hat notation (^G) and octal backslash notation\n  -d, --double-space\n                    double space the output\n  -D, --date-format=FORMAT\n                    use FORMAT for the header date\n  -e[CHAR[WIDTH]], --expand-tabs[=CHAR[WIDTH]]\n                    expand input CHARs (TABs) to tab WIDTH (8)\n  -F, -f, --form-feed\n                    use form feeds instead of newlines to separate pages\n  -h, --header=HEADER\n                    use a centered HEADER instead of filename in page header\n  -i[CHAR[WIDTH]], --output-tabs[=CHAR[WIDTH]]\n                    replace spaces with CHARs (TABs) to tab WIDTH (8)\n  -J, --join-lines  merge full lines, turns off -W line truncation\n  -l, --length=PAGE_LENGTH\n                    set the page length to PAGE_LENGTH (66) lines\n  -m, --merge       print all files in parallel, one in each column\n  -n[SEP[DIGITS]], --number-lines[=SEP[DIGITS]]\n                    number lines, use DIGITS (5) digits, then SEP (TAB)\n  -N, --first-line-number=NUMBER\n                    start counting with NUMBER at 1st line of first page printed\n  -o, --indent=MARGIN\n                    offset each line with MARGIN (zero) spaces\n  -r, --no-file-warnings\n                    omit warning when a file cannot be opened\n  -s[CHAR], --separator[=CHAR]\n                    separate columns by a single character, default for CHAR\n                    is the <TAB> character without -w and 'no char' with -w\n  -S[STRING], --sep-string[=STRING]\n                    separate columns by STRING\n  -t, --omit-header  omit page headers and trailers\n  -T, --omit-pagination\n                    omit page headers and trailers, eliminate any pagination\n  -v, --show-nonprinting\n                    use octal backslash notation\n  -w, --width=PAGE_WIDTH\n                    set page width to PAGE_WIDTH (72) characters for\n                    multiple text-column output only\n  -W, --page-width=PAGE_WIDTH\n                    set page width to PAGE_WIDTH (72) characters always\n      --help        display this help and exit\n      --version     output version information and exit\n") { 0 } else { 1 }
+}
+
+// getopt's words: a short option's letter, a long option whole.
+fn unknownOption(self: *Pr, text: std.string.String) -> void {
+    flush(self)
+    _ = std.io.writeAll(std.io.stderr(), if text.length == 1 { "pr: invalid option -- '" } else { "pr: unrecognized option '" })
+    _ = std.io.writeString(std.io.stderr(), text)
+    _ = std.io.writeAll(std.io.stderr(), "'\n")
+    badUsage(self)
+}
+
+fn missingArgument(self: *Pr, text: std.string.String) -> void {
+    flush(self)
+    _ = std.io.writeAll(std.io.stderr(), "pr: option requires an argument -- '")
+    _ = std.io.writeString(std.io.stderr(), text)
+    _ = std.io.writeAll(std.io.stderr(), "'\n")
+    badUsage(self)
 }
 
 pub fn main(arguments: [][*]const u8) -> u8 {
     crash.install()
-    const options = parseOptions(arguments)
-    if options.action == 1 { return printHelp() }
-    if options.action == 2 { return if std.io.print("mlx pr 0.1.0\n") { 0 } else { 1 } }
-    if options.invalid {
-        common.writeMessage("pr", "invalid option")
-        return 1
-    }
-    var dateBuffer: [32]u8 = undefined
-    var dateLength: usize = 0
-    unsafe { dateLength = dateTimeText(@ptrCast([*]u8, dateBuffer[0..32])) }
+    var state: Pr = undefined
+    const self = &state
+    self.*.arguments = arguments
+    self.*.out = allocate(OUT_SIZE)
+    self.*.outLength = 0
+    self.*.parallelFiles = false
+    self.*.alignEmptyCols = false
+    self.*.emptyLine = false
+    self.*.ffOnly = false
+    self.*.explicitColumns = false
+    self.*.extremities = true
+    self.*.keepFF = false
+    self.*.printAFF = false
+    self.*.printAHeader = false
+    self.*.useFormFeed = false
+    self.*.printAcrossFlag = false
+    self.*.storingColumns = true
+    self.*.balanceColumns = false
+    self.*.linesPerPage = 66
+    self.*.linesPerBody = 0
+    self.*.charsPerLine = 72
+    self.*.truncateLines = false
+    self.*.joinLines = false
+    self.*.charsPerColumn = 0
+    self.*.untabifyInput = false
+    self.*.inputTabChar = 9
+    self.*.charsPerInputTab = 8
+    self.*.tabifyOutput = false
+    self.*.outputTabChar = 9
+    self.*.charsPerOutputTab = 8
+    self.*.spacesNotPrinted = 0
+    self.*.charsPerMargin = 0
+    self.*.outputPosition = 0
+    self.*.inputPosition = 0
+    self.*.failedOpens = false
+    self.*.columns = 1
+    self.*.firstPageNumber = 0
+    self.*.lastPageNumber = 18446744073709551615
+    self.*.filesReadyToRead = 0
+    self.*.pageNumber = 0
+    self.*.lineNumber = 0
+    self.*.numberedLines = false
+    self.*.numberSeparator = 9
+    self.*.lineCount = 1
+    self.*.skipCount = true
+    self.*.startLineNum = 1
+    self.*.charsPerNumber = 5
+    self.*.numberWidth = 0
+    self.*.useEscSequence = false
+    self.*.useCntrlPrefix = false
+    self.*.doubleSpace = false
+    self.*.totalFiles = 0
+    self.*.ignoreFailedOpens = false
+    self.*.useColSeparator = false
+    self.*.colSepString = std.string.fromSlice("")
+    self.*.colSepLength = 0
+    self.*.separatorsNotPrinted = 0
+    self.*.paddingNotPrinted = 0
+    self.*.padVertically = false
+    self.*.hasCustomHeader = false
+    self.*.customHeader = std.string.fromSlice("")
+    self.*.dateFormat = std.string.fromSlice("")
+    self.*.hasDateText = false
+    self.*.fileText = std.string.fromSlice("")
+    self.*.headerWidthAvailable = 0
+    self.*.lastLine = false
+    self.*.nowTaken = false
+    self.*.inputCount = 0
+    self.*.buffCurrent = 0
+    self.*.buffAllocated = 0
+    self.*.columnCapacity = 0
 
+    var locale = std.process.environment(arguments, "LC_ALL")
+    if locale == null || locale.?.length == 0 { locale = std.process.environment(arguments, "LC_CTYPE") }
+    if locale == null || locale.?.length == 0 { locale = std.process.environment(arguments, "LANG") }
+    self.*.utf8 = false
+    if locale != null {
+        const text = locale.?
+        var k: usize = 0
+        while k + 4 < text.length + 1 {
+            if k + 5 <= text.length && (text.pointer[k] == 85 || text.pointer[k] == 117) && (text.pointer[k + 1] == 84 || text.pointer[k + 1] == 116) && (text.pointer[k + 2] == 70 || text.pointer[k + 2] == 102) && ((text.pointer[k + 3] == 45 && text.pointer[k + 4] == 56) || text.pointer[k + 3] == 56) { self.*.utf8 = true }
+            if k + 4 <= text.length && (text.pointer[k] == 85 || text.pointer[k] == 117) && (text.pointer[k + 1] == 84 || text.pointer[k + 1] == 116) && (text.pointer[k + 2] == 70 || text.pointer[k + 2] == 102) && text.pointer[k + 3] == 56 { self.*.utf8 = true }
+            k += 1
+        }
+    }
+
+    // The options, in order with the operands (files and +FIRST:LAST).
+    var parsed = Parsed.{ .oldW = false, .oldS = false, .oldOptions = false, .columnDigits = 0, .hasColumnDigits = false }
     const count = std.process.count(arguments)
-    var status: u8 = 0
-    unsafe {
-        if options.firstFile >= count {
-            if !processPath(options, std.string.fromSlice("-"), @ptrCast([*]const u8, dateBuffer[0..32]), dateLength) { status = 1 }
-        } else {
-            var index = options.firstFile
-            while index < count {
-                if !processPath(options, std.process.argument(arguments, index), @ptrCast([*]const u8, dateBuffer[0..32]), dateLength) { status = 1 }
+    const allocator: std.allocator.Allocator = std.heap.allocator()
+    const fileSlots = allocator.alloc((count + 1) * 8, 8).?
+    var files: [*]usize = undefined
+    unsafe { files = @ptrCast([*]usize, fileSlots) }
+    var fileCount: usize = 0
+    var index: usize = 1
+    var optionsDone = false
+    // Digits accumulate only while no other option comes between.
+    var lastWasDigit = false
+    while index < count {
+        const argument = std.process.argument(arguments, index)
+        if optionsDone || argument.length < 2 || argument.pointer[0] != 45 {
+            if !optionsDone && argument.length > 1 && argument.pointer[0] == 43 && self.*.firstPageNumber == 0 && pageRange(self, std.string.slice(argument, 1, argument.length)) {
+                lastWasDigit = false
                 index += 1
+                continue
+            }
+            files[fileCount] = index
+            fileCount += 1
+            lastWasDigit = false
+            index += 1
+            continue
+        }
+        if common.equals(argument, "--") {
+            optionsDone = true
+            index += 1
+            continue
+        }
+        if argument.pointer[1] == 45 {
+            // A long option: its name (or a unique start of one), =VALUE.
+            var nameEnd: usize = 2
+            while nameEnd < argument.length && argument.pointer[nameEnd] != 61 { nameEnd += 1 }
+            const name = std.string.slice(argument, 2, nameEnd)
+            if std.string.eql(name, std.string.fromSlice("version")) || (name.length >= 2 && std.string.startsWith(std.string.fromSlice("version"), name)) {
+                return if std.io.print("mlx pr 0.1.0\n") { 0 } else { 1 }
+            }
+            var found: usize = 25
+            var matches: usize = 0
+            var n: usize = 0
+            while n < 25 {
+                const candidate = std.string.fromSlice(LONG_NAMES[n])
+                if std.string.eql(candidate, name) {
+                    found = n
+                    matches = 1
+                    break
+                }
+                if name.length > 0 && std.string.startsWith(candidate, name) {
+                    found = n
+                    matches += 1
+                }
+                n += 1
+            }
+            if matches != 1 { unknownOption(self, argument) }
+            const code = LONG_CODES[found]
+            if code == 3 { return printHelp() }
+            var value = std.string.fromSlice("")
+            var hasValue = false
+            if nameEnd < argument.length {
+                if LONG_ARGUMENTS[found] == 0 { unknownOption(self, argument) }
+                value = std.string.slice(argument, nameEnd + 1, argument.length)
+                hasValue = true
+            } else if LONG_ARGUMENTS[found] == 1 {
+                index += 1
+                if index >= count { missingArgument(self, argument) }
+                value = std.process.argument(arguments, index)
+                hasValue = true
+            }
+            if code == 1 && !hasValue { unknownOption(self, argument) }
+            applyOption(self, code, value, hasValue, &parsed)
+            lastWasDigit = false
+            index += 1
+            continue
+        }
+        // Short options, clustered.
+        var at: usize = 1
+        while at < argument.length {
+            const byte = argument.pointer[at]
+            if !knownShort(byte) { unknownOption(self, std.string.slice(argument, at, at + 1)) }
+            const kind = shortArgument(byte)
+            const digit = byte >= 48 && byte <= 57
+            if digit && !lastWasDigit { parsed.hasColumnDigits = false }
+            if kind == 0 {
+                applyOption(self, byte, std.string.fromSlice(""), false, &parsed)
+                lastWasDigit = digit
+                at += 1
+                continue
+            }
+            lastWasDigit = false
+            const rest = std.string.slice(argument, at + 1, argument.length)
+            if kind == 2 {
+                applyOption(self, byte, rest, rest.length > 0, &parsed)
+            } else if rest.length > 0 {
+                applyOption(self, byte, rest, true, &parsed)
+            } else {
+                index += 1
+                if index >= count { missingArgument(self, std.string.slice(argument, at, at + 1)) }
+                applyOption(self, byte, std.process.argument(arguments, index), true, &parsed)
+            }
+            break
+        }
+        index += 1
+    }
+    if parsed.hasColumnDigits {
+        if parsed.columnDigits < 1 || parsed.columnDigits > INT_MAX {
+            die(self, "invalid number of columns")
+        }
+        self.*.columns = parsed.columnDigits
+        self.*.explicitColumns = true
+    }
+
+    // The header's date format, and its zone ($TZ).
+    if self.*.dateFormat.length == 0 {
+        const posix = std.process.environment(arguments, "POSIXLY_CORRECT")
+        self.*.dateFormat = if posix != null && !self.*.utf8 { std.string.fromSlice("%b %e %H:%M %Y") } else { std.string.fromSlice("%Y-%m-%d %H:%M") }
+    }
+    const tz = std.process.environment(arguments, "TZ")
+    self.*.zone = timezone.init(if tz == null { std.string.fromSlice("") } else { tz.? })
+
+    if self.*.firstPageNumber == 0 { self.*.firstPageNumber = 1 }
+    if self.*.parallelFiles && self.*.explicitColumns { die(self, "cannot specify number of columns when printing in parallel") }
+    if self.*.parallelFiles && self.*.printAcrossFlag { die(self, "cannot specify both printing across and printing in parallel") }
+
+    // Old options translated (as other Unix pr utilities read them).
+    if parsed.oldOptions {
+        if parsed.oldW {
+            if self.*.parallelFiles || self.*.explicitColumns {
+                self.*.truncateLines = true
+                if parsed.oldS { self.*.useColSeparator = true }
+            } else {
+                self.*.joinLines = true
+            }
+        } else if !self.*.useColSeparator {
+            if parsed.oldS && (self.*.parallelFiles || self.*.explicitColumns) {
+                if !self.*.truncateLines {
+                    self.*.joinLines = true
+                    if self.*.colSepLength > 0 { self.*.useColSeparator = true }
+                } else {
+                    self.*.useColSeparator = true
+                }
             }
         }
     }
-    return status
+
+    if fileCount == 0 {
+        printFiles(self, 0, 0)
+    } else if self.*.parallelFiles {
+        printParallel(self, files, fileCount)
+    } else {
+        var k: usize = 0
+        while k < fileCount {
+            printFiles(self, 1, files[k])
+            k += 1
+        }
+    }
+    flush(self)
+    timezone.deinit(self.*.zone)
+    return if self.*.failedOpens { 1 } else { 0 }
 }
 
+// Files in parallel (-m): initFps opens arguments first..first+n, which
+// must be adjacent; with operands among options they are gathered first.
+fn printParallel(self: *Pr, files: [*]usize, fileCount: usize) -> void {
+    var adjacent = true
+    var k: usize = 1
+    while k < fileCount {
+        if files[k] != files[k - 1] + 1 { adjacent = false }
+        k += 1
+    }
+    if adjacent {
+        printFiles(self, @bitCast(isize, fileCount), files[0])
+        return
+    }
+    // Gather them into an argument list of their own.
+    const allocator: std.allocator.Allocator = std.heap.allocator()
+    const memory = allocator.alloc(fileCount * 8, 8).?
+    var gathered: [*][*]const u8 = undefined
+    unsafe { gathered = @ptrCast([*][*]const u8, memory) }
+    k = 0
+    while k < fileCount {
+        gathered[k] = self.*.arguments[files[k]]
+        k += 1
+    }
+    const saved = self.*.arguments
+    unsafe { self.*.arguments = gathered[0..fileCount] }
+    printFiles(self, @bitCast(isize, fileCount), 0)
+    self.*.arguments = saved
+}

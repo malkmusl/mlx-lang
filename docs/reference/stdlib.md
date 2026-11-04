@@ -83,8 +83,15 @@ spec-only until a bootstrap or extensions module exists.
 A module may differ by platform: `std.X` is `std/src/X.<platform>.mlx`
 when the standard library has one for the target's platform (`linux` for
 `x86_64-linux` and `aarch64-linux`, `android` for `aarch64-android`), else
-`std/src/X.mlx`. `std.platform` (`platform.linux.mlx`,
-`platform.android.mlx`) names the platform, and `std.ui.host` is how a
+`std/src/X.mlx`; a relative import (`./os/host.mlx`) is chosen the same
+way (`std/bootstrap/os/host.brixos.mlx` for `x86_64-brixos`), which keeps
+the Linux file what the compiler itself is built from, by any compiler
+that builds it. `std.platform` (`platform.linux.mlx`,
+`platform.android.mlx`, `platform.brixos.mlx`) names the platform and
+where its users, groups, programs, resolv.conf, hosts and trusted
+certificates files are (`USERS`, `GROUPS`, `PROGRAMS`, `RESOLV_CONF`,
+`HOSTS`, `CA_CERTIFICATES`: /etc's on Linux, /system/settings's on
+brixOS), and `std.ui.host` is how a
 std.ui app runs on each (see [UI](ui.md)), so a program's own source is the
 same for every target (`tests/290_platform_module_runtime.mlx`).
 
@@ -116,8 +123,9 @@ checked as Name, NCName, QName or Nmtoken (`validName`, `isName`,
 materialized from the Vulkan registry, with `std.vulkan.loader` and
 `std.vulkan.icd` in `std/src/vulkan/`) and `std.spirv.core`,
 `std.spirv.builder`, `std.spirv.module` and `std.spirv.compute`
-(`std/src/spirv/`) and `std.gpu` with `std.gpu.shaders`, `std.gpu.text`
-and `std.gpu.swapchain` (`std/src/gpu.mlx`, `std/src/gpu/`) are Stage-1
+(`std/src/spirv/`) and `std.gpu` with `std.gpu.shaders`, `std.gpu.text`,
+`std.gpu.swapchain` and `std.gpu.video` (H.264 on the GPU's video
+decoder) (`std/src/gpu.mlx`, `std/src/gpu/`) are Stage-1
 extensions of the same kind; see [Vulkan, SPIR-V and JSON](vulkan.md)
 (`tests/248_json_runtime.mlx` covers `std.json`).
 
@@ -352,7 +360,9 @@ small message in either format, about 40 µs over a direct channel;
 
 `std.audio` (`std/src/audio.mlx`) is MLX Audio's protocol and client:
 `connect` finds the sound server on the session bus and gets a direct
-MLXIPC channel to it (starting it when needed), `openStream` opens a
+MLXIPC channel to it (starting it when needed; the bus is asked in
+MLXIPC's own format, `std.ipc`, and in D-Bus's when it does not speak
+that), `openStream` opens a
 playing or recording stream (any rate, 1 to 8 channels, S16, S32 or
 F32; `refusal` says when the app's MLXIPC permissions refused it),
 `write` plays as fast as the server asks, `read` returns what was
@@ -501,6 +511,14 @@ the member) writes one member; `readFile` and `writeFile` do a whole
 file at once. Each buffers 8 KiB in memory of the allocator.
 `tests/385_flate_gzip_runtime.mlx` writes and reads files in odd pieces,
 two members, a plain file, trailing data, damaged and truncated members.
+
+`std.tar` (`std/src/tar.mlx`) is tar archives (POSIX ustar): `parseHeader`
+reads a 512-byte header block into a `Header` (kind, name with the prefix
+joined, size, mode, link target; GNU's long-name members are told by their
+kind), `writeHeader` makes one (the name split around a slash into prefix
+and name when longer than 100 bytes, the checksum), and `reader`/`next`
+give the regular files of an archive held in memory. projects/tar is the
+program over it (`tar -czf`, `-xzf`, `-tf`, on Linux and brixOS).
 
 `std.crc` (`std/src/crc.mlx`) has the check values: `crc32(crc, data,
 length)` (the CRC-32 of gzip, zlib, PNG and ZIP, 0 to start),
@@ -1433,12 +1451,20 @@ handed over at `extraAt`, `keep`/`keepAlso` stay open across execve and
 directory, `newSession` gives it a session of its own, `unblockSignals`
 clears the mask a parent with a signal descriptor left, `detach` starts
 the program from an intermediate child reaped at once, and `shareMemory`
-vforks (for large parents). `start` returns the pid (or -errno);
-`startReading` hands back the read end of a pipe the child writes to;
-`capture` runs it to its end with its output kept; `wait` and `ended`
-give the exit code or 128 plus the signal; `execute` and `executeIn` are
-the PATH lookup for children that fork themselves, and `find` is where a
-name would run from. A program that cannot run exits with 127.
+vforks (for large parents). `start` returns a `Child` (`started()`; its
+`id` is -errno when it did not start): on Linux a pid, on brixOS a
+process handle (process_spawn with exactly its input, output, errors and
+the descriptors placed at their numbers; with `directory`, `newSession`,
+`detach` or `unblockSignals` the Linux layer forks), and `child.pid()`
+for Linux's own calls. `startReading` hands back the read end of a pipe
+the child writes to; `capture` runs it to its end with its output kept;
+`wait` and `ended` give an `Ending` (`exited` and its `code`, or what
+ended it: the signal's number on Linux, the event's kind on brixOS;
+`status()` as a shell's $?); `terminate` and `kill` ask it to end and end
+it. `execute` and `executeIn` are the PATH lookup for children that fork
+themselves, and `find` is where a name would run from; without PATH,
+`std.platform.PROGRAMS` (brixOS: /system/programs). A program that cannot
+run exits with 127.
 
 ```mlx
 const spawn = @import("std.spawn")
@@ -1446,8 +1472,29 @@ const spawn = @import("std.spawn")
 var options = spawn.options(program, argv, envp)
 options.searchPath = true
 var output: [4096]u8 = undefined
-var status: usize = 0
-const length = spawn.capture(&options, true, &output, 4096, &status)
+var ending = spawn.Ending.lost()
+const length = spawn.capture(&options, true, &output, 4096, &ending)
+if ending.status() != 0 { ... }
+```
+
+## Events on brixOS (`std.events`)
+
+**Implementation:** `std/src/events.mlx`
+**Source tests:** `projects/brix/tools/kinds` (compared by `tools/check_brix.sh`)
+
+brixOS's events (spec/04-stdlib/os/brix.xml, `<Events>`) for a program
+built with `--target=x86_64-brixos`: `handle(kind, handler)` runs
+`handler(record)` for each event of that kind, from the program's one
+upcall on a stack of its own; `release(kind)` gives the kind back its
+default. A read or write through std's files that the upcall came in is
+made again; a wait ends with `interrupted`. Halt and kill cannot be
+handled. Built for another system, `handle` says false.
+
+```mlx
+const events = @import("std.events")
+
+fn onUser(record: events.Record) -> void { ... }
+_ = events.handle(events.Event.USER, onUser)
 ```
 
 ## Git repositories (`std.git`)

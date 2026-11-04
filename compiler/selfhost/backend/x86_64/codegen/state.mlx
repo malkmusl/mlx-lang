@@ -7,14 +7,34 @@ const operands = @import("../../../ir/operands.mlx")
 const type_store = @import("../../../sema/types/store.mlx")
 
 const BLOCK_LABEL_STRIDE: usize = 32
+// The most operands an instruction's dead values are looked for among
+// (releaseDead; one with more keeps its operands' slots).
+const OPERAND_CAPACITY: usize = 256
 // How many lazy loads a block may hold at once; a further one takes its
 // slot at once.
 const LAZY_PENDING: usize = 32
+// The caller-saved registers a block's single-word values are kept in
+// instead of their frame slots (State.cacheResult): no emitter but a
+// call's, a memory copy's or an external instruction's writes them.
+const CACHE_COUNT: usize = 5
+
+pub fn cacheRegister(at: usize) -> target.Register {
+    if at == 0 { return target.Register.rsi }
+    if at == 1 { return target.Register.rdi }
+    if at == 2 { return target.Register.r8 }
+    if at == 3 { return target.Register.r9 }
+    return target.Register.r10
+}
 
 // Between Mlx functions a value of several words (a slice, an error union,
 // a tuple) comes back in these registers, a word each; the caller stores
 // them before anything else runs. Foreign code sees rax and rdx only.
 pub const RETURN_WORDS: usize = 9
+
+// The callee-saved registers locals live in (lir.registerHome's 1 to 5,
+// State.homeRegister): r14 and r15 only in a client's code (mlx-cc's),
+// which keeps no arena in them.
+pub const HOMES: usize = 5
 
 pub fn returnRegister(word: usize) -> target.Register {
     if word == 0 { return target.Register.rax }
@@ -70,13 +90,18 @@ pub const State = struct {
     lazyPendingCount: usize
     lazyValueCount: usize
     // The store an arithmetic instruction already did by updating the
-    // local's register in place (Arithmetic.emitInPlace).
+    // local's register in place (Arithmetic.emitInPlace), and the extend
+    // between them it did too.
     storeDone: usize
+    extendDone: usize
     inPlaceCount: usize
     // A gep with a constant offset left to the load or store right after
     // it, which reads [base + fusedOffset] (Memory.emitGep).
     fusedGep: usize
     fusedOffset: i32
+    // A fused gep whose index is a value scaled by 1, 2, 4 or 8: the
+    // load or store addresses [base + index * scale].
+    fusedScaled: bool
     fusedAddressCount: usize
     slotEpoch: usize
     addrSlots: *vector.Vector
@@ -92,6 +117,22 @@ pub const State = struct {
     pendingRaxVreg: usize
     pendingImmediateVreg: usize
     pendingImmediateValue: i64
+    // Single-word integer values read only in their own block before the
+    // next instruction that writes the cache registers (a call) are kept
+    // in one of them (cacheRegister) instead of a frame slot, until the
+    // block ends: cacheAt the register's index per value (cacheEpochs
+    // stamped with the function's epoch), cacheOwners the value per
+    // register (NONE: free; a value read last before the instruction
+    // being emitted frees its register). blockEnds: per instruction, the
+    // index of the branch, return or label its block ends with;
+    // nextClobber: the next instruction at or after it that writes the
+    // cache registers (instCount when none).
+    cacheEpochs: [*]usize
+    cacheAt: [*]u8
+    cacheOwners: [*]usize
+    blockEnds: [*]usize
+    nextClobber: [*]usize
+    cachedValueCount: usize
     frameSize: usize
     // The callee-saved registers this function keeps locals in (bit r for
     // lir.registerHome's r), saved in the prologue at registerSave + 8 * r
@@ -113,7 +154,51 @@ pub const State = struct {
     // (--stack-arena, bytes) they reserve it below their frame instead.
     plugin: bool
     stackArena: usize
+    // No operating system: _start takes the arena from rdi (its start) and
+    // rsi (its end) and halts after main (--target=x86_64-freestanding).
+    freestanding: bool
+    // A program for brixOS (--target=x86_64-brixos): it ends by brixOS's
+    // own process_exit, not Linux's exit.
+    brixos: bool
     rodataOffset: usize
+    // A client lowering one function at a time into LIRs of its own
+    // (mlx-cc) gives each function's block labels other names: block N is
+    // named .block_<N + blockLabelBase>. It may know that a value takes
+    // fewer frame bytes than the budget below (slotBudget per instruction,
+    // 24 for mlx4's LIR, whose values may be three words), and may keep
+    // slotBase bytes of the frame below rbp for its own locals
+    // (lir.Opcode.frame_local reaches them), the LIR's slots below those.
+    blockLabelBase: usize
+    slotBudget: usize
+    slotBase: usize
+    // Whether the frame is sized by the values that take a slot (a
+    // client's LIR of one-word values, whose constants, places of the
+    // frame and control flow take none) instead of every instruction.
+    preciseSlots: bool
+    // With preciseSlots, the slots of values read for the last time
+    // (releaseDead, which the client calls after each instruction) are
+    // given out again: the frame holds the most values live at once, not
+    // every value. liveMarks (stamped with liveEpoch) keep the estimate's
+    // simulation from counting a value dead twice.
+    freeSlots: [*]i32
+    freeSlotCount: usize
+    liveMarks: [*]usize
+    liveEpoch: usize
+    operandBuffer: [*]usize
+    // Per block label, its instruction (extendLoopLives).
+    labelIndices: [*]usize
+    // The values whose life a loop's back edge extended to it: per
+    // instruction the head of a list through deathNext (an entry whose
+    // lastUse moved on since is passed over).
+    deathHead: [*]usize
+    deathNext: [*]usize
+    // The most bytes of slots a function of the client's took (its
+    // frame's estimate must cover it: irgen checks).
+    slotHighWater: i32
+    // The encoder's fixups name the block labels by pointer into
+    // blockLabelStorage: a client that destroys the state before the
+    // fixups are applied (mlx-cc, a state per function) keeps the storage.
+    keepBlockLabels: bool
     allocator: allocator_module.Allocator
 
     pub fn create(alloc: allocator_module.Allocator, enc: *encoder.Encoder, lir: *lir_module.Lir, types: *type_store.Store) -> *Self {
@@ -134,12 +219,29 @@ pub const State = struct {
             state.*.lastUse = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
             state.*.lazyEpochs = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
             state.*.lazyPending = @ptrCast([*]usize, alloc.alloc(LAZY_PENDING * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.freeSlots = @ptrCast([*]i32, alloc.alloc(state.*.slotCapacity * state.*.componentStride * @sizeOf(i32), @alignOf(i32)).?)
+            state.*.freeSlotCount = 0
+            state.*.liveMarks = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.liveEpoch = 0
+            state.*.operandBuffer = @ptrCast([*]usize, alloc.alloc(OPERAND_CAPACITY * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.labelIndices = @ptrCast([*]usize, alloc.alloc((Self.maximumBlockLabel(lir) + 1) * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.deathHead = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.deathNext = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.cacheEpochs = @ptrCast([*]usize, alloc.alloc(state.*.slotCapacity * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.cacheAt = alloc.alloc(state.*.slotCapacity, 1).?
+            state.*.cacheOwners = @ptrCast([*]usize, alloc.alloc(CACHE_COUNT * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.blockEnds = @ptrCast([*]usize, alloc.alloc((state.*.slotCapacity + 1) * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.nextClobber = @ptrCast([*]usize, alloc.alloc((state.*.slotCapacity + 1) * @sizeOf(usize), @alignOf(usize)).?)
+            state.*.cachedValueCount = 0
+            state.*.slotHighWater = 0
             state.*.lazyPendingCount = 0
             state.*.lazyValueCount = 0
             state.*.storeDone = lir_module.NONE
+            state.*.extendDone = lir_module.NONE
             state.*.inPlaceCount = 0
             state.*.fusedGep = lir_module.NONE
             state.*.fusedOffset = 0
+            state.*.fusedScaled = false
             state.*.fusedAddressCount = 0
             state.*.slotEpoch = 0
             state.*.addrSlots = Self.createVector(alloc, @sizeOf(VregMap), @alignOf(VregMap), 64)
@@ -164,19 +266,31 @@ pub const State = struct {
             state.*.shared = false
             state.*.plugin = false
             state.*.stackArena = 0
+            state.*.freestanding = false
+            state.*.brixos = false
             state.*.rodataOffset = 0
+            state.*.blockLabelBase = 0
+            state.*.slotBudget = 24
+            state.*.slotBase = 0
+            state.*.preciseSlots = false
+            state.*.keepBlockLabels = false
             state.*.allocator = alloc
             Self.initializeEpochs(state)
             Self.initializeLastUses(state)
+            Self.initializeBlocks(state)
             Self.initializeBlockLabels(state)
             return state
         }
     }
 
+    // Whether the program calls (or takes the address of) a C function:
+    // an extern("c") declared in some imported module and never used
+    // leaves the program static (it ends by exit_group, not libc's exit).
     fn hasImports(lir: *lir_module.Lir) -> bool {
         var index: usize = 0
-        while index < lir_module.symbolCount(lir) {
-            if lir_module.symbolFlags(lir, index) & lir_module.SYMBOL_IMPORT != 0 { return true }
+        while index < lir_module.instCount(lir) {
+            const instruction = lir_module.getInst(lir, index)
+            if (instruction.opcode == lir_module.Opcode.direct_call || instruction.opcode == lir_module.Opcode.func_sym) && lir_module.symbolFlags(lir, instruction.arg0) & lir_module.SYMBOL_IMPORT != 0 { return true }
             index += 1
         }
         return false
@@ -198,6 +312,9 @@ pub const State = struct {
 
     fn instructionWords(types: *type_store.Store, instruction: lir_module.Inst) -> usize {
         if instruction.opcode == lir_module.Opcode.tuple_literal { return instruction.arg1 }
+        // (Two result words, whatever its type says: whether it swapped,
+        // then the value seen.)
+        if instruction.opcode == lir_module.Opcode.cmpxchg { return 2 }
         return Self.wordsOf(types, instruction.typeId)
     }
 
@@ -228,6 +345,10 @@ pub const State = struct {
             state.*.componentCounts[index] = 0
             state.*.frameAddressEpochs[index] = 0
             state.*.lazyEpochs[index] = lir_module.NONE
+            state.*.cacheEpochs[index] = lir_module.NONE
+            state.*.liveMarks[index] = 0
+            state.*.deathHead[index] = lir_module.NONE
+            state.*.deathNext[index] = lir_module.NONE
             index += 1
         }
     }
@@ -246,6 +367,42 @@ pub const State = struct {
         }
     }
 
+    // blockEnds and nextClobber, from the end.
+    fn initializeBlocks(state: *Self) -> void {
+        const count = lir_module.instCount(state.*.lir)
+        var at: usize = 0
+        while at < CACHE_COUNT {
+            state.*.cacheOwners[at] = lir_module.NONE
+            at += 1
+        }
+        state.*.blockEnds[count] = count
+        state.*.nextClobber[count] = count
+        var index = count
+        while index > 0 {
+            index -= 1
+            const opcode = lir_module.getInst(state.*.lir, index).opcode
+            state.*.blockEnds[index] = if Self.isBlockEnd(opcode) { index } else { state.*.blockEnds[index + 1] }
+            state.*.nextClobber[index] = if Self.clobbersCache(opcode) { index } else { state.*.nextClobber[index + 1] }
+        }
+    }
+
+    fn isBlockEnd(opcode: lir_module.Opcode) -> bool {
+        return opcode == lir_module.Opcode.label || opcode == lir_module.Opcode.br || opcode == lir_module.Opcode.condbr || opcode == lir_module.Opcode.icmp_br ||
+            opcode == lir_module.Opcode.ret || opcode == lir_module.Opcode.ret_slice || opcode == lir_module.Opcode.ret_error || opcode == lir_module.Opcode.ret_error_union ||
+            opcode == lir_module.Opcode.unreachable_inst
+    }
+
+    // Whether an instruction's code may write the cache registers: a
+    // call (its arguments go to rdi, rsi, r8, r9), a system call, a copy
+    // (rep movsb), a thread's start, the client's external instructions
+    // (an asm text), and the atomics' loops and byte_mask_64, which use
+    // rsi or r8 and r9.
+    fn clobbersCache(opcode: lir_module.Opcode) -> bool {
+        return opcode == lir_module.Opcode.call || opcode == lir_module.Opcode.direct_call || opcode == lir_module.Opcode.syscall ||
+            opcode == lir_module.Opcode.mem_copy || opcode == lir_module.Opcode.clone_thread || opcode == lir_module.Opcode.external ||
+            opcode == lir_module.Opcode.external_value || opcode == lir_module.Opcode.atomic_rmw || opcode == lir_module.Opcode.byte_mask_64
+    }
+
     fn initializeBlockLabels(state: *Self) -> void {
         var index: usize = 0
         while index < state.*.blockLabelCapacity {
@@ -255,7 +412,7 @@ pub const State = struct {
     }
 
     fn isUnaryValue(opcode: lir_module.Opcode) -> bool {
-        return opcode == lir_module.Opcode.copy || opcode == lir_module.Opcode.cast || opcode == lir_module.Opcode.bitcast || opcode == lir_module.Opcode.aggregate_copy || opcode == lir_module.Opcode.load || opcode == lir_module.Opcode.popcount || opcode == lir_module.Opcode.error_test || opcode == lir_module.Opcode.error_payload || opcode == lir_module.Opcode.error_payload_part || opcode == lir_module.Opcode.tuple_element
+        return opcode == lir_module.Opcode.copy || opcode == lir_module.Opcode.cast || opcode == lir_module.Opcode.bitcast || opcode == lir_module.Opcode.aggregate_copy || opcode == lir_module.Opcode.load || opcode == lir_module.Opcode.popcount || opcode == lir_module.Opcode.error_test || opcode == lir_module.Opcode.error_payload || opcode == lir_module.Opcode.error_payload_part || opcode == lir_module.Opcode.tuple_element || opcode == lir_module.Opcode.extend
     }
 
     fn isBinaryValue(opcode: lir_module.Opcode) -> bool {
@@ -296,8 +453,19 @@ pub const State = struct {
             state.*.allocator.free(@ptrCast([*]u8, state.*.lastUse), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
             state.*.allocator.free(@ptrCast([*]u8, state.*.lazyEpochs), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
             state.*.allocator.free(@ptrCast([*]u8, state.*.lazyPending), LAZY_PENDING * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.freeSlots), state.*.slotCapacity * state.*.componentStride * @sizeOf(i32), @alignOf(i32))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.liveMarks), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.operandBuffer), OPERAND_CAPACITY * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.labelIndices), state.*.blockLabelCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.deathHead), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.deathNext), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.cacheEpochs), state.*.slotCapacity * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(state.*.cacheAt, state.*.slotCapacity, 1)
+            state.*.allocator.free(@ptrCast([*]u8, state.*.cacheOwners), CACHE_COUNT * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.blockEnds), (state.*.slotCapacity + 1) * @sizeOf(usize), @alignOf(usize))
+            state.*.allocator.free(@ptrCast([*]u8, state.*.nextClobber), (state.*.slotCapacity + 1) * @sizeOf(usize), @alignOf(usize))
             state.*.allocator.free(@ptrCast([*]u8, state.*.blockLabelLengths), state.*.blockLabelCapacity * @sizeOf(usize), @alignOf(usize))
-            state.*.allocator.free(state.*.blockLabelStorage, state.*.blockLabelCapacity * BLOCK_LABEL_STRIDE, 1)
+            if !state.*.keepBlockLabels { state.*.allocator.free(state.*.blockLabelStorage, state.*.blockLabelCapacity * BLOCK_LABEL_STRIDE, 1) }
         }
         Self.destroyVector(state, state.*.addrSlots)
         unsafe { state.*.allocator.free(@ptrCast([*]u8, state), @sizeOf(Self), @alignOf(Self)) }
@@ -329,33 +497,248 @@ pub const State = struct {
     // through it is put there first.
     pub fn allocateOp(state: *Self, vreg: usize) -> i32 {
         if Self.isLazy(state, vreg) { return Self.materialize(state, vreg) }
+        if Self.isCached(state, vreg) { return Self.materializeCached(state, vreg) }
+        if Self.isHomedParameter(state, vreg) { return Self.materializeHomedParameter(state, vreg) }
         return Self.allocateSlot(state, vreg)
+    }
+
+    // A parameter kept in a callee-saved register for the function
+    // (lir.parameterHome): one integer word (a float or multiword
+    // parameter stays in its slot, whatever the pass gave it).
+    pub fn isHomedParameter(state: *Self, vreg: usize) -> bool {
+        if vreg >= state.*.slotCapacity || lir_module.parameterHome(state.*.lir, vreg) == 0 { return false }
+        return Self.deferrable(state, vreg)
+    }
+
+    pub fn parameterRegister(state: *Self, vreg: usize) -> target.Register {
+        return Self.homeRegister(lir_module.parameterHome(state.*.lir, vreg))
+    }
+
+    // Its slot, written from the register once (the value never changes).
+    fn materializeHomedParameter(state: *Self, vreg: usize) -> i32 {
+        if state.*.slotEpochs[vreg] == state.*.slotEpoch { return state.*.vregSlots[vreg] }
+        const slot = Self.allocateSlot(state, vreg)
+        encoder.emitMovMemReg(state.*.enc, slot, Self.parameterRegister(state, vreg))
+        return slot
+    }
+
+    // The register cache (cacheRegister).
+    pub fn isCached(state: *Self, vreg: usize) -> bool {
+        return vreg < state.*.slotCapacity && state.*.cacheEpochs[vreg] == state.*.slotEpoch && state.*.cacheOwners[@intCast(usize, state.*.cacheAt[vreg])] == vreg
+    }
+
+    pub fn cachedRegister(state: *Self, vreg: usize) -> target.Register {
+        return cacheRegister(@intCast(usize, state.*.cacheAt[vreg]))
+    }
+
+    // Whether the value of the instruction at `index` can live in a cache
+    // register: one integer word, read, and read last in its block before
+    // the next instruction that writes the registers.
+    fn cacheable(state: *Self, index: usize) -> bool {
+        if index >= state.*.slotCapacity || !Self.deferrable(state, index) { return false }
+        const last = state.*.lastUse[index]
+        if last == lir_module.NONE || last > state.*.blockEnds[index] { return false }
+        const clobber = state.*.nextClobber[index + 1]
+        if clobber > last { return true }
+        // (A call reads its arguments from the registers before it writes
+        // them.)
+        if clobber != last { return false }
+        const reader = lir_module.getInst(state.*.lir, last).opcode
+        return reader == lir_module.Opcode.call || reader == lir_module.Opcode.direct_call
+    }
+
+    // A free cache register (one whose value was read last before the
+    // instruction at `index`), or CACHE_COUNT.
+    fn freeCacheRegister(state: *Self, index: usize) -> usize {
+        var at: usize = 0
+        while at < CACHE_COUNT {
+            const owner = state.*.cacheOwners[at]
+            if owner == lir_module.NONE || state.*.lastUse[owner] < index { return at }
+            at += 1
+        }
+        return CACHE_COUNT
+    }
+
+    // The value of the instruction at `index` is in rax: true when it was
+    // moved into a cache register instead of its slot.
+    fn cacheRax(state: *Self, index: usize) -> bool {
+        const at = Self.takeCacheRegister(state, index)
+        if at == CACHE_COUNT { return false }
+        encoder.emitMovRegReg(state.*.enc, cacheRegister(at), target.Register.rax)
+        return true
+    }
+
+    fn takeCacheRegister(state: *Self, index: usize) -> usize {
+        if !Self.cacheable(state, index) || state.*.slotEpochs[index] == state.*.slotEpoch { return CACHE_COUNT }
+        const at = Self.freeCacheRegister(state, index)
+        if at == CACHE_COUNT { return CACHE_COUNT }
+        const previous = state.*.cacheOwners[at]
+        if previous != lir_module.NONE { state.*.cacheEpochs[previous] = lir_module.NONE }
+        state.*.cacheOwners[at] = index
+        state.*.cacheEpochs[index] = state.*.slotEpoch
+        state.*.cacheAt[index] = @intCast(u8, at)
+        state.*.cachedValueCount += 1
+        return at
+    }
+
+    // A cached value's slot, written from its register once (it stays in
+    // the register too).
+    fn materializeCached(state: *Self, vreg: usize) -> i32 {
+        if state.*.slotEpochs[vreg] == state.*.slotEpoch { return state.*.vregSlots[vreg] }
+        const slot = Self.allocateSlot(state, vreg)
+        encoder.emitMovMemReg(state.*.enc, slot, Self.cachedRegister(state, vreg))
+        return slot
+    }
+
+    // The register of an operand the instruction at `index` reads last,
+    // for its result to take over (the operation done on the register in
+    // place): the operand leaves the cache, the result enters it.
+    pub fn takeOperandRegister(state: *Self, index: usize, operand: usize) -> (bool, target.Register) {
+        if !Self.isCached(state, operand) || state.*.lastUse[operand] != index { return -> (false, target.Register.rax) }
+        if !Self.cacheable(state, index) || state.*.slotEpochs[index] == state.*.slotEpoch { return -> (false, target.Register.rax) }
+        const at = @intCast(usize, state.*.cacheAt[operand])
+        state.*.cacheEpochs[operand] = lir_module.NONE
+        state.*.cacheOwners[at] = index
+        state.*.cacheEpochs[index] = state.*.slotEpoch
+        state.*.cacheAt[index] = @intCast(u8, at)
+        state.*.cachedValueCount += 1
+        return -> (true, cacheRegister(at))
+    }
+
+    // The register an instruction computes its result in, taken before
+    // its code: a free cache register when the result can live there (and
+    // would not stay in rax for the next instruction), else rax. The
+    // result is stored with storeResult.
+    pub fn resultRegister(state: *Self, index: usize) -> target.Register {
+        if Self.canRetainNext(state, index) { return target.Register.rax }
+        const at = Self.takeCacheRegister(state, index)
+        if at == CACHE_COUNT { return target.Register.rax }
+        return cacheRegister(at)
+    }
+
+    pub fn storeResult(state: *Self, index: usize, register: target.Register) -> void {
+        if register == target.Register.rax { Self.storeRaxResult(state, index) }
+    }
+
+    fn uncache(state: *Self, vreg: usize) -> void {
+        state.*.cacheOwners[@intCast(usize, state.*.cacheAt[vreg])] = lir_module.NONE
+        state.*.cacheEpochs[vreg] = lir_module.NONE
+    }
+
+    // Before the instruction at `index`: the cached values an instruction
+    // after it reads (at it too, with `including`) go to their slots; with
+    // `drop` none stays cached.
+    fn spillCache(state: *Self, index: usize, including: bool, drop: bool) -> void {
+        var at: usize = 0
+        while at < CACHE_COUNT {
+            const owner = state.*.cacheOwners[at]
+            if owner != lir_module.NONE {
+                const last = state.*.lastUse[owner]
+                if last != lir_module.NONE && (last > index || (including && last == index)) {
+                    const slot = Self.materializeCached(state, owner)
+                }
+                if drop { Self.uncache(state, owner) }
+            }
+            at += 1
+        }
     }
 
     fn allocateSlot(state: *Self, vreg: usize) -> i32 {
         if state.*.slotEpochs[vreg] == state.*.slotEpoch { return state.*.vregSlots[vreg] }
-        const slot = state.*.nextStackSlot
-        state.*.nextStackSlot = slot + 8
+        const slot = Self.takeSlot(state)
         state.*.slotEpochs[vreg] = state.*.slotEpoch
         state.*.vregSlots[vreg] = slot
         state.*.componentCounts[vreg] = 1
         return slot
     }
 
+    // A free slot of the frame: one given back (preciseSlots), else the
+    // next.
+    fn takeSlot(state: *Self) -> i32 {
+        if state.*.preciseSlots && state.*.freeSlotCount > 0 {
+            state.*.freeSlotCount -= 1
+            return state.*.freeSlots[state.*.freeSlotCount]
+        }
+        const slot = state.*.nextStackSlot
+        state.*.nextStackSlot = slot + 8
+        if state.*.nextStackSlot > state.*.slotHighWater { state.*.slotHighWater = state.*.nextStackSlot }
+        return slot
+    }
+
+    // After the instruction at `index` is emitted (preciseSlots): the
+    // slots of the values it read for the last time, and its own when
+    // nothing reads it, are given back.
+    pub fn releaseDead(state: *Self, index: usize, instruction: lir_module.Inst) -> void {
+        if !state.*.preciseSlots { return }
+        // A gep fused into the load or store after it reads its operands
+        // there: they are given back after that one.
+        if state.*.fusedGep == index { return }
+        Self.releaseOperands(state, index, instruction, index)
+        if index > 0 && (instruction.opcode == lir_module.Opcode.load || instruction.opcode == lir_module.Opcode.store) && instruction.arg0 == index - 1 {
+            const previous = lir_module.getInst(state.*.lir, index - 1)
+            if previous.opcode == lir_module.Opcode.gep && state.*.lastUse[index - 1] == index { Self.releaseOperands(state, index - 1, previous, index - 1) }
+        }
+        // The values a loop kept alive to this branch.
+        var dying = if index < state.*.slotCapacity { state.*.deathHead[index] } else { lir_module.NONE }
+        while dying != lir_module.NONE {
+            if state.*.lastUse[dying] == index { Self.releaseSlots(state, dying) }
+            dying = state.*.deathNext[dying]
+        }
+        if index < state.*.slotCapacity && state.*.lastUse[index] == lir_module.NONE && state.*.pendingRaxVreg != index && state.*.pendingImmediateVreg != index { Self.releaseSlots(state, index) }
+    }
+
+    // The slots of the values `instruction` (at `index`) reads for the
+    // last time (their last use being `last`).
+    fn releaseOperands(state: *Self, index: usize, instruction: lir_module.Inst, last: usize) -> void {
+        const count = operands.collect(state.*.lir, instruction, state.*.operandBuffer, OPERAND_CAPACITY)
+        if count > OPERAND_CAPACITY { return }
+        var at: usize = 0
+        while at < count {
+            const vreg = state.*.operandBuffer[at]
+            if vreg < state.*.slotCapacity && state.*.lastUse[vreg] == last { Self.releaseSlots(state, vreg) }
+            at += 1
+        }
+    }
+
+    fn releaseSlots(state: *Self, vreg: usize) -> void {
+        if state.*.slotEpochs[vreg] != state.*.slotEpoch { return }
+        state.*.freeSlots[state.*.freeSlotCount] = state.*.vregSlots[vreg]
+        state.*.freeSlotCount += 1
+        var component: usize = 1
+        while component < state.*.componentCounts[vreg] {
+            state.*.freeSlots[state.*.freeSlotCount] = state.*.componentSlots[vreg * state.*.componentStride + component]
+            state.*.freeSlotCount += 1
+            component += 1
+        }
+        state.*.slotEpochs[vreg] = 0
+        state.*.componentCounts[vreg] = 0
+    }
+
     pub fn isLazy(state: *Self, vreg: usize) -> bool {
         return vreg < state.*.slotCapacity && state.*.lazyEpochs[vreg] == state.*.slotEpoch
     }
 
-    // The register a lazy load reads (0 for a lazy constant).
+    // The register a lazy load reads (0 for a lazy constant or a lazy
+    // place of the frame).
     fn lazyHome(state: *Self, vreg: usize) -> usize {
         const instruction = lir_module.getInst(state.*.lir, vreg)
         if instruction.opcode != lir_module.Opcode.load { return 0 }
         return lir_module.registerHome(state.*.lir, instruction.arg0)
     }
 
+    // A lazy place of the frame (lir.Opcode.frame_local, a client's):
+    // its address is an lea wherever it is read as a value.
+    fn isLazyPlace(state: *Self, vreg: usize) -> bool {
+        return lir_module.getInst(state.*.lir, vreg).opcode == lir_module.Opcode.frame_local
+    }
+
+    fn placeOffset(state: *Self, vreg: usize) -> i32 {
+        return @intCast(i32, @bitCast(i64, @intCast(u64, lir_module.getInst(state.*.lir, vreg).arg0)))
+    }
+
     // A lazy constant's value.
     pub fn constantValue(state: *Self, vreg: usize) -> (bool, i64) {
-        if !Self.isLazy(state, vreg) || Self.lazyHome(state, vreg) != 0 { return -> (false, 0) }
+        if !Self.isLazy(state, vreg) || Self.lazyHome(state, vreg) != 0 || Self.isLazyPlace(state, vreg) { return -> (false, 0) }
         return -> (true, Self.lazyConstant(state, vreg))
     }
 
@@ -365,6 +748,8 @@ pub const State = struct {
 
     // The register a lazy load can be read from where it is used.
     pub fn lazyRegister(state: *Self, vreg: usize) -> (bool, target.Register) {
+        if Self.isCached(state, vreg) { return -> (true, Self.cachedRegister(state, vreg)) }
+        if Self.isHomedParameter(state, vreg) { return -> (true, Self.parameterRegister(state, vreg)) }
         if !Self.isLazy(state, vreg) { return -> (false, target.Register.rax) }
         const home = Self.lazyHome(state, vreg)
         if home == 0 { return -> (false, target.Register.rax) }
@@ -384,6 +769,13 @@ pub const State = struct {
         return true
     }
 
+    // A frame_local: left lazy (an lea where it is read as a value; a
+    // load or a store through it reaches the place itself).
+    pub fn deferPlace(state: *Self, index: usize) -> void {
+        state.*.lazyEpochs[index] = state.*.slotEpoch
+        state.*.lazyValueCount += 1
+    }
+
     // A whole-word load of a local kept in a register: true when it is
     // left lazy.
     pub fn deferRegisterLoad(state: *Self, index: usize) -> bool {
@@ -401,6 +793,13 @@ pub const State = struct {
     fn materialize(state: *Self, vreg: usize) -> i32 {
         const slot = Self.allocateSlot(state, vreg)
         const home = Self.lazyHome(state, vreg)
+        if home == 0 && Self.isLazyPlace(state, vreg) {
+            // (Through r11: no value of the instruction being emitted is
+            // in it.)
+            encoder.emitLeaRegMem(state.*.enc, target.Register.r11, Self.placeOffset(state, vreg))
+            encoder.emitMovMemReg(state.*.enc, slot, target.Register.r11)
+            return slot
+        }
         if home == 0 {
             encoder.emitMovMemImm32(state.*.enc, slot, @intCast(i32, Self.lazyConstant(state, vreg)))
             return slot
@@ -415,17 +814,43 @@ pub const State = struct {
     // go to their slots (a later block may be reached on another path, or
     // after the register changed). A function's label starts afresh.
     pub fn settleLazy(state: *Self, index: usize, instruction: lir_module.Inst) -> void {
+        Self.settleCache(state, index, instruction)
         if state.*.lazyPendingCount == 0 { return }
         const opcode = instruction.opcode
         if opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE {
             state.*.lazyPendingCount = 0
             return
         }
-        if opcode == lir_module.Opcode.label || opcode == lir_module.Opcode.br || opcode == lir_module.Opcode.condbr || opcode == lir_module.Opcode.icmp_br ||
-            opcode == lir_module.Opcode.ret || opcode == lir_module.Opcode.ret_slice || opcode == lir_module.Opcode.ret_error || opcode == lir_module.Opcode.ret_error_union ||
-            opcode == lir_module.Opcode.unreachable_inst {
-            Self.spillLazy(state, index, 0)
+        if Self.isBlockEnd(opcode) { Self.spillLazy(state, index, 0) }
+    }
+
+    // Before the instruction at `index`: at a block's end, the cached
+    // values read after it go to their slots (the code lies before a
+    // label, on the path falling through to it) and the cache empties at
+    // the label after it; before an instruction that writes the cache
+    // registers, its own operands too.
+    fn settleCache(state: *Self, index: usize, instruction: lir_module.Inst) -> void {
+        const opcode = instruction.opcode
+        if opcode == lir_module.Opcode.label {
+            Self.spillCache(state, index, false, true)
+            return
         }
+        if index > 0 && Self.isBlockEnd(lir_module.getInst(state.*.lir, index - 1).opcode) { Self.spillCache(state, index, false, true) }
+        if Self.isBlockEnd(opcode) {
+            Self.spillCache(state, index, false, false)
+        } else if opcode == lir_module.Opcode.call || opcode == lir_module.Opcode.direct_call {
+            // The arguments are read from their registers (Calls.loadRegisterArguments,
+            // a parallel move); the cache is dropped once the call is made
+            // (Calls.finishCall).
+            Self.spillCache(state, index, false, false)
+        } else if Self.clobbersCache(opcode) {
+            Self.spillCache(state, index, true, true)
+        }
+    }
+
+    // After a call: the registers hold nothing of the cache's.
+    pub fn dropCache(state: *Self) -> void {
+        Self.spillCache(state, lir_module.NONE, false, true)
     }
 
     // Before a store into register `home` (0: before a block ends): the
@@ -455,7 +880,7 @@ pub const State = struct {
     }
 
     pub fn takeImmediate32(state: *Self, vreg: usize) -> (bool, i32) {
-        if Self.isLazy(state, vreg) && Self.lazyHome(state, vreg) == 0 { return -> (true, @intCast(i32, Self.lazyConstant(state, vreg))) }
+        if Self.isLazy(state, vreg) && Self.lazyHome(state, vreg) == 0 && !Self.isLazyPlace(state, vreg) { return -> (true, @intCast(i32, Self.lazyConstant(state, vreg))) }
         if state.*.pendingImmediateVreg != vreg { return -> (false, 0) }
         const value = state.*.pendingImmediateValue
         if value < -2147483648 || value > 2147483647 { return -> (false, 0) }
@@ -469,10 +894,14 @@ pub const State = struct {
         state.*.frameAddressOffsets[vreg] = rbp_offset
     }
 
-    // The frame slot `vreg` is the address of, if it is one.
+    // The frame slot `vreg` is the address of, if it is one (an 8-byte
+    // alloca's, or a client's place of the frame, lir.Opcode.frame_local).
     pub fn frameAddress(state: *Self, vreg: usize) -> (bool, i32) {
-        if vreg >= state.*.slotCapacity || state.*.frameAddressEpochs[vreg] != state.*.slotEpoch { return -> (false, 0) }
-        return -> (true, state.*.frameAddressOffsets[vreg])
+        if vreg >= state.*.slotCapacity { return -> (false, 0) }
+        if state.*.frameAddressEpochs[vreg] == state.*.slotEpoch { return -> (true, state.*.frameAddressOffsets[vreg]) }
+        const instruction = lir_module.getInst(state.*.lir, vreg)
+        if instruction.opcode == lir_module.Opcode.frame_local { return -> (true, @intCast(i32, @bitCast(i64, @intCast(u64, instruction.arg0)))) }
+        return -> (false, 0)
     }
 
     // A value used without being loaded: if it was kept in rax for this
@@ -485,9 +914,19 @@ pub const State = struct {
     }
 
     pub fn loadOp(state: *Self, destination: target.Register, vreg: usize) -> void {
+        if Self.isCached(state, vreg) {
+            encoder.emitMovRegReg(state.*.enc, destination, Self.cachedRegister(state, vreg))
+            return
+        }
+        if Self.isHomedParameter(state, vreg) {
+            encoder.emitMovRegReg(state.*.enc, destination, Self.parameterRegister(state, vreg))
+            return
+        }
         if Self.isLazy(state, vreg) {
             const home = Self.lazyHome(state, vreg)
-            if home == 0 {
+            if home == 0 && Self.isLazyPlace(state, vreg) {
+                encoder.emitLeaRegMem(state.*.enc, destination, Self.placeOffset(state, vreg))
+            } else if home == 0 {
                 encoder.emitMovRegImm64(state.*.enc, destination, Self.lazyConstant(state, vreg))
             } else {
                 encoder.emitMovRegReg(state.*.enc, destination, Self.homeRegister(home))
@@ -525,6 +964,11 @@ pub const State = struct {
             state.*.deferredSpillCount += 1
             return
         }
+        const at = Self.takeCacheRegister(state, index)
+        if at != CACHE_COUNT {
+            encoder.emitMovRegImm64(state.*.enc, cacheRegister(at), value)
+            return
+        }
         encoder.emitMovRegImm64(state.*.enc, target.Register.rax, value)
         encoder.emitMovMemReg(state.*.enc, Self.allocateOp(state, index), target.Register.rax)
     }
@@ -535,6 +979,7 @@ pub const State = struct {
             state.*.deferredSpillCount += 1
             return
         }
+        if Self.cacheRax(state, index) { return }
         encoder.emitMovMemReg(state.*.enc, Self.allocateOp(state, index), target.Register.rax)
     }
 
@@ -559,8 +1004,7 @@ pub const State = struct {
         const found = Self.getComponent(state, vreg, component)
         if found.0 { return found.1 }
         if state.*.slotEpochs[vreg] != state.*.slotEpoch { const primary = Self.allocateOp(state, vreg) }
-        const slot = state.*.nextStackSlot
-        state.*.nextStackSlot = slot + 8
+        const slot = Self.takeSlot(state)
         state.*.componentSlots[vreg * state.*.componentStride + component] = slot
         if component + 1 > state.*.componentCounts[vreg] { state.*.componentCounts[vreg] = component + 1 }
         return slot
@@ -614,6 +1058,18 @@ pub const State = struct {
             return -> (value.*.bits, value.*.flags & type_store.FLAG_SIGNED != 0)
         }
         return -> (0, false)
+    }
+
+    pub fn isTuple(state: *Self, type_id: usize) -> bool {
+        return type_id != lir_module.NONE && type_id < type_store.Store.count(state.*.typeStore) && type_store.Store.get(state.*.typeStore, type_id).*.kind == type_store.Kind.tuple
+    }
+
+    pub fn tupleElementCount(state: *Self, type_id: usize) -> usize {
+        return type_store.Store.get(state.*.typeStore, type_id).*.extraLength
+    }
+
+    pub fn tupleElementType(state: *Self, type_id: usize, element: usize) -> usize {
+        return type_store.Store.extraAt(state.*.typeStore, type_store.Store.get(state.*.typeStore, type_id).*.extraStart + element)
     }
 
     pub fn isErrorUnion(state: *Self, type_id: usize) -> bool {
@@ -672,17 +1128,28 @@ pub const State = struct {
 
     pub fn incomingArgumentSlot(index: usize) -> i32 { return @intCast(i32, (index + 1) * 8) }
 
-    // The register a local lives in (ir/registers.mlx: 1 rbx, 2 r12, 3 r13).
+    // The register a local lives in (ir/registers.mlx: 1 rbx, 2 r12, 3 r13,
+    // 4 r14, 5 r15).
     pub fn homeRegister(home: usize) -> target.Register {
         if home == 1 { return target.Register.rbx }
         if home == 2 { return target.Register.r12 }
-        return target.Register.r13
+        if home == 3 { return target.Register.r13 }
+        if home == 4 { return target.Register.r14 }
+        return target.Register.r15
     }
 
     pub fn homeBit(home: usize) -> usize {
-        if home == 1 { return 2 }
-        if home == 2 { return 4 }
-        return 8
+        return @intCast(usize, 1) << @intCast(u6, home)
+    }
+
+    // After a store into the register of the local `slot` (an alloca
+    // with a register home): a local of 4 bytes or a byte keeps its
+    // register extended to the word (lir.registerWidth), as its loads
+    // read it.
+    pub fn extendHome(state: *Self, slot: usize) -> void {
+        const code = lir_module.registerWidth(state.*.lir, slot)
+        if code == lir_module.WIDTH_WORD { return }
+        encoder.emitExtend(state.*.enc, Self.homeRegister(lir_module.registerHome(state.*.lir, slot)), lir_module.widthBits(code), lir_module.widthSigned(code))
     }
 
     // Which of them the function from `label_index` keeps locals in.
@@ -695,6 +1162,7 @@ pub const State = struct {
             if instruction.opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE { break }
             const home = lir_module.registerHome(state.*.lir, index)
             if home != 0 { mask = mask | Self.homeBit(home) }
+            if Self.isHomedParameter(state, index) { mask = mask | Self.homeBit(lir_module.parameterHome(state.*.lir, index)) }
             index += 1
         }
         return mask
@@ -707,11 +1175,13 @@ pub const State = struct {
         state.*.slotEpoch += 1
         state.*.lazyPendingCount = 0
         state.*.fusedGep = lir_module.NONE
-        state.*.nextStackSlot = 8
+        state.*.nextStackSlot = @intCast(i32, state.*.slotBase) + 8
+        state.*.freeSlotCount = 0
         state.*.frameSize = frame_size
     }
 
     pub fn functionFrameSize(state: *Self, label_index: usize) -> usize {
+        if state.*.preciseSlots { return Self.liveFrameSize(state, label_index) }
         var index = label_index + 1
         var count: usize = 0
         const total = lir_module.instCount(state.*.lir)
@@ -722,17 +1192,155 @@ pub const State = struct {
         while index < total {
             const instruction = lir_module.getInst(state.*.lir, index)
             if instruction.opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE { break }
-            if instruction.opcode != lir_module.Opcode.dead {
+            if instruction.opcode != lir_module.Opcode.dead && (!state.*.preciseSlots || Self.takesSlot(state, index, instruction)) {
                 count += 1
-                // Three words each are in the budget; a tuple of more takes
-                // a slot for every further one.
+                // Three words each are in the budget (one of a client's);
+                // a tuple of more takes a slot for every further one.
                 const words = Self.instructionWords(state.*.typeStore, instruction)
-                if words > 3 { regions += (words - 3) * 8 }
+                if words * 8 > state.*.slotBudget { regions += words * 8 - state.*.slotBudget }
             }
             if instruction.opcode == lir_module.Opcode.alloca && instruction.arg0 != lir_module.NONE && (instruction.arg1 == 1 || instruction.arg1 == 2) { regions += (instruction.arg0 + 7) & ~@intCast(usize, 7) }
+            if state.*.preciseSlots && instruction.opcode == lir_module.Opcode.alloca && instruction.arg0 == lir_module.NONE && lir_module.registerHome(state.*.lir, index) == 0 { regions += 8 }
             index += 1
         }
-        return (count * 24 + regions + 271) & ~@intCast(usize, 15)
+        return (count * state.*.slotBudget + regions + state.*.slotBase + 271) & ~@intCast(usize, 15)
+    }
+
+    // The frame of a client's function (preciseSlots): the most words of
+    // values live at once (a value lives from its instruction to the last
+    // that reads it; releaseDead gives the slots back), the regions and
+    // the words of the 8-byte allocas, the client's own bytes.
+    fn liveFrameSize(state: *Self, label_index: usize) -> usize {
+        Self.extendLoopLives(state, label_index)
+        var index = label_index + 1
+        const total = lir_module.instCount(state.*.lir)
+        var regions: usize = 0
+        var live: usize = 0
+        var most: usize = 0
+        state.*.liveEpoch += 1
+        // The parameters are stored at the prologue, all at once.
+        var parameters: usize = 0
+        while index < total {
+            const instruction = lir_module.getInst(state.*.lir, index)
+            if instruction.opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE { break }
+            if instruction.opcode == lir_module.Opcode.param { parameters += 1 }
+            index += 1
+        }
+        live = parameters
+        most = live
+        index = label_index + 1
+        while index < total {
+            const instruction = lir_module.getInst(state.*.lir, index)
+            if instruction.opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE { break }
+            if instruction.opcode == lir_module.Opcode.param {
+                // (Counted at the prologue; dies as the others.)
+                state.*.liveMarks[index] = state.*.liveEpoch
+                if state.*.lastUse[index] == lir_module.NONE {
+                    live -= 1
+                    state.*.liveMarks[index] = 0
+                }
+                index += 1
+                continue
+            }
+            if instruction.opcode == lir_module.Opcode.alloca && instruction.arg0 != lir_module.NONE && (instruction.arg1 == 1 || instruction.arg1 == 2) { regions += (instruction.arg0 + 7) & ~@intCast(usize, 7) }
+            if instruction.opcode == lir_module.Opcode.alloca && instruction.arg0 == lir_module.NONE && lir_module.registerHome(state.*.lir, index) == 0 { regions += 8 }
+            if instruction.opcode != lir_module.Opcode.dead && Self.takesSlot(state, index, instruction) {
+                var words = Self.instructionWords(state.*.typeStore, instruction)
+                if words == 0 { words = 1 }
+                state.*.liveMarks[index] = state.*.liveEpoch
+                live += words
+                if live > most { most = live }
+                if state.*.lastUse[index] == lir_module.NONE {
+                    live -= words
+                    state.*.liveMarks[index] = 0
+                }
+            }
+            const count = operands.collect(state.*.lir, instruction, state.*.operandBuffer, OPERAND_CAPACITY)
+            if count <= OPERAND_CAPACITY {
+                var at: usize = 0
+                while at < count {
+                    live = Self.simulateDeath(state, state.*.operandBuffer[at], index, live)
+                    at += 1
+                }
+            }
+            var dying = state.*.deathHead[index]
+            while dying != lir_module.NONE {
+                live = Self.simulateDeath(state, dying, index, live)
+                dying = state.*.deathNext[dying]
+            }
+            index += 1
+        }
+        return (most * 8 + regions + state.*.slotBase + 79) & ~@intCast(usize, 15)
+    }
+
+    // The estimate's `live` after `vreg`, when it is read for the last
+    // time at `index` and was counted.
+    fn simulateDeath(state: *Self, vreg: usize, index: usize, live: usize) -> usize {
+        if vreg >= state.*.slotCapacity || state.*.lastUse[vreg] != index || state.*.liveMarks[vreg] != state.*.liveEpoch { return live }
+        var words = Self.instructionWords(state.*.typeStore, lir_module.getInst(state.*.lir, vreg))
+        if words == 0 { words = 1 }
+        state.*.liveMarks[vreg] = 0
+        return live - words
+    }
+
+    // A value made before a loop and read in it is read again on every
+    // pass: it lives to the loop's end, the branch back (lastUse, which
+    // the text's last read put inside the loop, moved there). The back
+    // edges in their order: an outer loop's, later in the text, carries
+    // on from what an inner one's left.
+    fn extendLoopLives(state: *Self, label_index: usize) -> void {
+        const total = lir_module.instCount(state.*.lir)
+        var index = label_index + 1
+        while index < total {
+            const instruction = lir_module.getInst(state.*.lir, index)
+            if instruction.opcode == lir_module.Opcode.label && instruction.arg0 != lir_module.NONE { break }
+            state.*.deathHead[index] = lir_module.NONE
+            state.*.deathNext[index] = lir_module.NONE
+            if instruction.opcode == lir_module.Opcode.label && instruction.arg1 != lir_module.NONE && instruction.arg1 < state.*.blockLabelCapacity { state.*.labelIndices[instruction.arg1] = index }
+            index += 1
+        }
+        const end = index
+        index = label_index + 1
+        while index < end {
+            const instruction = lir_module.getInst(state.*.lir, index)
+            if instruction.opcode == lir_module.Opcode.br {
+                Self.extendOverLoop(state, label_index, instruction.arg0, index)
+            } else if instruction.opcode == lir_module.Opcode.condbr || instruction.opcode == lir_module.Opcode.icmp_br {
+                Self.extendOverLoop(state, label_index, instruction.arg1, index)
+                Self.extendOverLoop(state, label_index, instruction.arg2, index)
+            }
+            index += 1
+        }
+    }
+
+    fn extendOverLoop(state: *Self, label_index: usize, block: usize, branch: usize) -> void {
+        if block == lir_module.NONE || block >= state.*.blockLabelCapacity { return }
+        const target = state.*.labelIndices[block]
+        if target <= label_index || target >= branch { return }
+        var value = label_index + 1
+        while value < target {
+            const last = state.*.lastUse[value]
+            if last != lir_module.NONE && last > target && last < branch {
+                state.*.lastUse[value] = branch
+                state.*.deathNext[value] = state.*.deathHead[branch]
+                state.*.deathHead[branch] = value
+            }
+            value += 1
+        }
+    }
+
+    // Whether the instruction may take a slot of the frame (preciseSlots):
+    // not the control flow or the stores. (A lazy constant or place of
+    // the frame takes one where it is read as a memory operand.)
+    fn takesSlot(state: *Self, index: usize, instruction: lir_module.Inst) -> bool {
+        const opcode = instruction.opcode
+        if opcode == lir_module.Opcode.label || opcode == lir_module.Opcode.br || opcode == lir_module.Opcode.condbr || opcode == lir_module.Opcode.icmp_br ||
+            opcode == lir_module.Opcode.ret || opcode == lir_module.Opcode.ret_slice || opcode == lir_module.Opcode.ret_error || opcode == lir_module.Opcode.ret_error_union ||
+            opcode == lir_module.Opcode.unreachable_inst || opcode == lir_module.Opcode.store || opcode == lir_module.Opcode.mem_copy || opcode == lir_module.Opcode.atomic_store ||
+            opcode == lir_module.Opcode.fence {
+            return false
+        }
+        return true
     }
 
     pub fn blockLabelName(state: *Self, index: usize) -> ([*]const u8, usize) {
@@ -749,14 +1357,15 @@ pub const State = struct {
         result[5] = 107
         result[6] = 95
         var length: usize = 7
-        if index == 0 {
+        const number = index + state.*.blockLabelBase
+        if number == 0 {
             result[length] = 48
             length += 1
         } else {
             var divisor: usize = 1
-            while index / divisor >= 10 { divisor *= 10 }
+            while number / divisor >= 10 { divisor *= 10 }
             while divisor > 0 {
-                result[length] = @intCast(u8, 48 + (index / divisor) % 10)
+                result[length] = @intCast(u8, 48 + (number / divisor) % 10)
                 length += 1
                 divisor /= 10
             }

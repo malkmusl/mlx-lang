@@ -1,10 +1,11 @@
 /* <xmmintrin.h>: the SSE intrinsics (x86-64's baseline; mlx-cc does not
    predefine __SSE__, having no GCC vector types: <mmintrin.h>), over an
-   __m128 that is a union of its lanes (no vector registers), each a plain
-   function with the instruction's result: comparisons as all-ones lanes,
-   min and max giving the second operand when one is NaN, the conversions
-   rounding to nearest even and giving the "integer indefinite" value
-   when out of range. The MXCSR is the processor's (stmxcsr, ldmxcsr). */
+   __m128 that is a union of its lanes (no vector registers), each its
+   instruction (__builtin_mlxcc_asm, the macros below, which <emmintrin.h>
+   shares): comparisons as all-ones lanes, min and max giving the second
+   operand when one is NaN, the conversions rounding to nearest even and
+   giving the "integer indefinite" value when out of range. The MXCSR is
+   the processor's (stmxcsr, ldmxcsr). */
 #ifndef _MLXCC_XMMINTRIN_H
 #define _MLXCC_XMMINTRIN_H
 #include <mmintrin.h>
@@ -19,6 +20,22 @@ typedef union __attribute__((__aligned__(16))) {
 typedef __m128 __m128_u;
 
 #define _MM_SHUFFLE(z, y, x, w) (((z) << 6) | ((y) << 4) | ((x) << 2) | (w))
+
+/* The instruction over a (at rdi, xmm0) and b (at rsi, xmm1), the
+   result stored over a; the R forms with b the destination (a's lt is
+   b's gt); the unary ones over a alone; the masks to eax. The loads are
+   unaligned (movdqu, movupd): nothing is asked of the locals. */
+#define __MLXCC_BIN(name, type, insn) \
+    static inline type name(type a, type b) { __builtin_mlxcc_asm("movdqu (%rdi), %xmm0\nmovdqu (%rsi), %xmm1\n" insn " %xmm1, %xmm0\nmovdqu %xmm0, (%rdi)", &a, &b); return a; }
+#define __MLXCC_BINR(name, type, insn) \
+    static inline type name(type a, type b) { __builtin_mlxcc_asm("movdqu (%rdi), %xmm0\nmovdqu (%rsi), %xmm1\n" insn " %xmm0, %xmm1\nmovdqu %xmm1, (%rdi)", &a, &b); return a; }
+#define __MLXCC_UNARY(name, type, insn) \
+    static inline type name(type a) { __builtin_mlxcc_asm("movdqu (%rdi), %xmm0\n" insn " %xmm0, %xmm0\nmovdqu %xmm0, (%rdi)", &a); return a; }
+#define __MLXCC_CONVERT(name, from, to, insn) \
+    static inline to name(from a) { to r; __builtin_mlxcc_asm("movdqu (%rsi), %xmm0\n" insn " %xmm0, %xmm0\nmovdqu %xmm0, (%rdi)", &r, &a); return r; }
+#define __MLXCC_MASK(name, type, insn) \
+    static inline int name(type a) { return (int)__builtin_mlxcc_asm("movdqu (%rdi), %xmm0\n" insn " %xmm0, %eax", &a); }
+
 
 #define _MM_EXCEPT_INVALID 0x0001
 #define _MM_EXCEPT_DENORM 0x0002
@@ -83,63 +100,81 @@ static inline __m128 _mm_undefined_ps(void) { return _mm_setzero_ps(); }
 static inline __m128 _mm_set_ss(float w) { __m128 r = _mm_setzero_ps(); r.__f[0] = w; return r; }
 static inline __m128 _mm_set_ps(float z, float y, float x, float w) { __m128 r; r.__f[0] = w; r.__f[1] = x; r.__f[2] = y; r.__f[3] = z; return r; }
 static inline __m128 _mm_setr_ps(float w, float x, float y, float z) { return _mm_set_ps(z, y, x, w); }
-static inline __m128 _mm_set1_ps(float w) { return _mm_set_ps(w, w, w, w); }
+static inline __m128 _mm_set1_ps(float w) { __m128 r; __builtin_mlxcc_asm("movss (%rsi), %xmm0\nshufps $0, %xmm0, %xmm0\nmovups %xmm0, (%rdi)", &r, &w); return r; }
 #define _mm_set_ps1 _mm_set1_ps
 static inline float _mm_cvtss_f32(__m128 a) { return a.__f[0]; }
-static inline __m128 _mm_load_ss(const float *p) { return _mm_set_ss(*p); }
-static inline __m128 _mm_load1_ps(const float *p) { return _mm_set1_ps(*p); }
+static inline __m128 _mm_load_ss(const float *p) { __m128 r; __builtin_mlxcc_asm("movss (%rsi), %xmm0\nmovups %xmm0, (%rdi)", &r, p); return r; }
+static inline __m128 _mm_load1_ps(const float *p) { __m128 r; __builtin_mlxcc_asm("movss (%rsi), %xmm0\nshufps $0, %xmm0, %xmm0\nmovups %xmm0, (%rdi)", &r, p); return r; }
 #define _mm_load_ps1 _mm_load1_ps
-static inline __m128 _mm_loadu_ps(const float *p) { __m128 r; __builtin_memcpy(&r, p, 16); return r; }
+static inline __m128 _mm_loadu_ps(const float *p) { __m128 r; __builtin_mlxcc_asm("movups (%rsi), %xmm0\nmovups %xmm0, (%rdi)", &r, p); return r; }
 static inline __m128 _mm_load_ps(const float *p) { return _mm_loadu_ps(p); }
-static inline __m128 _mm_loadr_ps(const float *p) { return _mm_set_ps(p[0], p[1], p[2], p[3]); }
-static inline __m128 _mm_loadh_pi(__m128 a, const __m64 *p) { __builtin_memcpy(&a.__f[2], p, 8); return a; }
-static inline __m128 _mm_loadl_pi(__m128 a, const __m64 *p) { __builtin_memcpy(&a.__f[0], p, 8); return a; }
+static inline __m128 _mm_loadr_ps(const float *p) { __m128 r; __builtin_mlxcc_asm("movups (%rsi), %xmm0\nshufps $27, %xmm0, %xmm0\nmovups %xmm0, (%rdi)", &r, p); return r; }
+static inline __m128 _mm_loadh_pi(__m128 a, const __m64 *p) { __builtin_mlxcc_asm("movups (%rdi), %xmm0\nmovhps (%rsi), %xmm0\nmovups %xmm0, (%rdi)", &a, p); return a; }
+static inline __m128 _mm_loadl_pi(__m128 a, const __m64 *p) { __builtin_mlxcc_asm("movups (%rdi), %xmm0\nmovlps (%rsi), %xmm0\nmovups %xmm0, (%rdi)", &a, p); return a; }
 static inline void _mm_store_ss(float *p, __m128 a) { *p = a.__f[0]; }
-static inline void _mm_storeu_ps(float *p, __m128 a) { __builtin_memcpy(p, &a, 16); }
+static inline void _mm_storeu_ps(float *p, __m128 a) { __builtin_mlxcc_asm("movups (%rsi), %xmm0\nmovups %xmm0, (%rdi)", p, &a); }
 static inline void _mm_store_ps(float *p, __m128 a) { _mm_storeu_ps(p, a); }
 static inline void _mm_store1_ps(float *p, __m128 a) { p[0] = p[1] = p[2] = p[3] = a.__f[0]; }
 #define _mm_store_ps1 _mm_store1_ps
 static inline void _mm_storer_ps(float *p, __m128 a) { p[0] = a.__f[3]; p[1] = a.__f[2]; p[2] = a.__f[1]; p[3] = a.__f[0]; }
-static inline void _mm_storeh_pi(__m64 *p, __m128 a) { __builtin_memcpy(p, &a.__f[2], 8); }
-static inline void _mm_storel_pi(__m64 *p, __m128 a) { __builtin_memcpy(p, &a.__f[0], 8); }
+static inline void _mm_storeh_pi(__m64 *p, __m128 a) { __builtin_mlxcc_asm("movups (%rsi), %xmm0\nmovhps %xmm0, (%rdi)", p, &a); }
+static inline void _mm_storel_pi(__m64 *p, __m128 a) { __builtin_mlxcc_asm("movups (%rsi), %xmm0\nmovlps %xmm0, (%rdi)", p, &a); }
 static inline void _mm_stream_ps(float *p, __m128 a) { _mm_storeu_ps(p, a); }
 static inline void _mm_stream_pi(__m64 *p, __m64 a) { *p = a; }
-static inline __m128 _mm_move_ss(__m128 a, __m128 b) { a.__f[0] = b.__f[0]; return a; }
+static inline __m128 _mm_move_ss(__m128 a, __m128 b) { __builtin_mlxcc_asm("movups (%rdi), %xmm0\nmovups (%rsi), %xmm1\nmovss %xmm1, %xmm0\nmovups %xmm0, (%rdi)", &a, &b); return a; }
 
-/* Lane by lane over all four lanes (_ps) or the first (_ss, the others
-   a's): R.F = EXPR over x and y. */
-#define __MLXCC_MAPPS(name, F, expr) \
-    static inline __m128 name##_ps(__m128 a, __m128 b) { __m128 r; int i; for (i = 0; i < 4; i++) { float x = a.__f[i], y = b.__f[i]; (void)x; (void)y; r.F[i] = (expr); } return r; } \
-    static inline __m128 name##_ss(__m128 a, __m128 b) { float x = a.__f[0], y = b.__f[0]; (void)x; (void)y; a.F[0] = (expr); return a; }
-__MLXCC_MAPPS(_mm_add, __f, x + y)
-__MLXCC_MAPPS(_mm_sub, __f, x - y)
-__MLXCC_MAPPS(_mm_mul, __f, x * y)
-__MLXCC_MAPPS(_mm_div, __f, x / y)
-__MLXCC_MAPPS(_mm_min, __f, x < y ? x : y)
-__MLXCC_MAPPS(_mm_max, __f, x > y ? x : y)
-__MLXCC_MAPPS(_mm_cmpeq, __i, x == y ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmplt, __i, x < y ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmple, __i, x <= y ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpgt, __i, x > y ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpge, __i, x >= y ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpneq, __i, !(x == y) ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpnlt, __i, !(x < y) ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpnle, __i, !(x <= y) ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpngt, __i, !(x > y) ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpnge, __i, !(x >= y) ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpord, __i, (x == x && y == y) ? -1 : 0)
-__MLXCC_MAPPS(_mm_cmpunord, __i, (x != x || y != y) ? -1 : 0)
+/* All four lanes (_ps) or the first (_ss, the others a's). */
+__MLXCC_BIN(_mm_add_ps, __m128, "addps")
+__MLXCC_BIN(_mm_add_ss, __m128, "addss")
+__MLXCC_BIN(_mm_sub_ps, __m128, "subps")
+__MLXCC_BIN(_mm_sub_ss, __m128, "subss")
+__MLXCC_BIN(_mm_mul_ps, __m128, "mulps")
+__MLXCC_BIN(_mm_mul_ss, __m128, "mulss")
+__MLXCC_BIN(_mm_div_ps, __m128, "divps")
+__MLXCC_BIN(_mm_div_ss, __m128, "divss")
+__MLXCC_BIN(_mm_min_ps, __m128, "minps")
+__MLXCC_BIN(_mm_max_ps, __m128, "maxps")
+static inline __m128 _mm_min_ss(__m128 a, __m128 b) { float x = a.__f[0], y = b.__f[0]; a.__f[0] = x < y ? x : y; return a; }
+static inline __m128 _mm_max_ss(__m128 a, __m128 b) { float x = a.__f[0], y = b.__f[0]; a.__f[0] = x > y ? x : y; return a; }
+__MLXCC_BIN(_mm_cmpeq_ps, __m128, "cmpeqps")
+__MLXCC_BIN(_mm_cmplt_ps, __m128, "cmpltps")
+__MLXCC_BIN(_mm_cmple_ps, __m128, "cmpleps")
+__MLXCC_BINR(_mm_cmpgt_ps, __m128, "cmpltps")
+__MLXCC_BINR(_mm_cmpge_ps, __m128, "cmpleps")
+__MLXCC_BIN(_mm_cmpneq_ps, __m128, "cmpneqps")
+__MLXCC_BIN(_mm_cmpnlt_ps, __m128, "cmpnltps")
+__MLXCC_BIN(_mm_cmpnle_ps, __m128, "cmpnleps")
+__MLXCC_BINR(_mm_cmpngt_ps, __m128, "cmpnltps")
+__MLXCC_BINR(_mm_cmpnge_ps, __m128, "cmpnleps")
+__MLXCC_BIN(_mm_cmpord_ps, __m128, "cmpordps")
+__MLXCC_BIN(_mm_cmpunord_ps, __m128, "cmpunordps")
+#define __MLXCC_CMPSS(name, expr) \
+    static inline __m128 name##_ss(__m128 a, __m128 b) { float x = a.__f[0], y = b.__f[0]; a.__i[0] = (expr) ? -1 : 0; return a; }
+__MLXCC_CMPSS(_mm_cmpeq, x == y)
+__MLXCC_CMPSS(_mm_cmplt, x < y)
+__MLXCC_CMPSS(_mm_cmple, x <= y)
+__MLXCC_CMPSS(_mm_cmpgt, x > y)
+__MLXCC_CMPSS(_mm_cmpge, x >= y)
+__MLXCC_CMPSS(_mm_cmpneq, !(x == y))
+__MLXCC_CMPSS(_mm_cmpnlt, !(x < y))
+__MLXCC_CMPSS(_mm_cmpnle, !(x <= y))
+__MLXCC_CMPSS(_mm_cmpngt, !(x > y))
+__MLXCC_CMPSS(_mm_cmpnge, !(x >= y))
+__MLXCC_CMPSS(_mm_cmpord, x == x && y == y)
+__MLXCC_CMPSS(_mm_cmpunord, x != x || y != y)
+__MLXCC_UNARY(_mm_sqrt_ps, __m128, "sqrtps")
+__MLXCC_UNARY(_mm_sqrt_ss, __m128, "sqrtss")
+/* (rcpps and rsqrtps are approximations; these are exact.) */
 #define __MLXCC_UNARYPS(name, expr) \
     static inline __m128 name##_ps(__m128 a) { int i; for (i = 0; i < 4; i++) { float x = a.__f[i]; a.__f[i] = (expr); } return a; } \
     static inline __m128 name##_ss(__m128 a) { float x = a.__f[0]; a.__f[0] = (expr); return a; }
-__MLXCC_UNARYPS(_mm_sqrt, __mlxcc_sqrtf(x))
 __MLXCC_UNARYPS(_mm_rcp, 1.0f / x)
 __MLXCC_UNARYPS(_mm_rsqrt, 1.0f / __mlxcc_sqrtf(x))
 
-static inline __m128 _mm_and_ps(__m128 a, __m128 b) { a.__q[0] &= b.__q[0]; a.__q[1] &= b.__q[1]; return a; }
-static inline __m128 _mm_andnot_ps(__m128 a, __m128 b) { b.__q[0] &= ~a.__q[0]; b.__q[1] &= ~a.__q[1]; return b; }
-static inline __m128 _mm_or_ps(__m128 a, __m128 b) { a.__q[0] |= b.__q[0]; a.__q[1] |= b.__q[1]; return a; }
-static inline __m128 _mm_xor_ps(__m128 a, __m128 b) { a.__q[0] ^= b.__q[0]; a.__q[1] ^= b.__q[1]; return a; }
+__MLXCC_BIN(_mm_and_ps, __m128, "andps")
+__MLXCC_BIN(_mm_andnot_ps, __m128, "andnps")
+__MLXCC_BIN(_mm_or_ps, __m128, "orps")
+__MLXCC_BIN(_mm_xor_ps, __m128, "xorps")
 
 /* comiss and ucomiss: false when either is NaN (but neq, true). */
 #define __MLXCC_COMISS(op, expr) \
@@ -152,17 +187,17 @@ __MLXCC_COMISS(gt, x > y)
 __MLXCC_COMISS(ge, x >= y)
 __MLXCC_COMISS(neq, !(x == y))
 
-static inline int _mm_cvtss_si32(__m128 a) { return __mlxcc_cvt32(__mlxcc_rint(a.__f[0])); }
+static inline int _mm_cvtss_si32(__m128 a) { return (int)__builtin_mlxcc_asm("cvtss2si (%rdi), %eax", &a); }
 #define _mm_cvt_ss2si _mm_cvtss_si32
-static inline long long _mm_cvtss_si64(__m128 a) { return __mlxcc_cvt64(__mlxcc_rint(a.__f[0])); }
-static inline int _mm_cvttss_si32(__m128 a) { return __mlxcc_cvt32(a.__f[0]); }
+static inline long long _mm_cvtss_si64(__m128 a) { return __builtin_mlxcc_asm("cvtss2si (%rdi), %rax", &a); }
+static inline int _mm_cvttss_si32(__m128 a) { return (int)__builtin_mlxcc_asm("cvttss2si (%rdi), %eax", &a); }
 #define _mm_cvtt_ss2si _mm_cvttss_si32
-static inline long long _mm_cvttss_si64(__m128 a) { return __mlxcc_cvt64(a.__f[0]); }
+static inline long long _mm_cvttss_si64(__m128 a) { return __builtin_mlxcc_asm("cvttss2si (%rdi), %rax", &a); }
 #define _mm_cvttss_si64x _mm_cvttss_si64
 #define _mm_cvtss_si64x _mm_cvtss_si64
-static inline __m128 _mm_cvtsi32_ss(__m128 a, int b) { a.__f[0] = (float)b; return a; }
+static inline __m128 _mm_cvtsi32_ss(__m128 a, int b) { __builtin_mlxcc_asm("movups (%rdi), %xmm0\ncvtsi2ss %esi, %xmm0\nmovups %xmm0, (%rdi)", &a, b); return a; }
 #define _mm_cvt_si2ss _mm_cvtsi32_ss
-static inline __m128 _mm_cvtsi64_ss(__m128 a, long long b) { a.__f[0] = (float)b; return a; }
+static inline __m128 _mm_cvtsi64_ss(__m128 a, long long b) { __builtin_mlxcc_asm("movups (%rdi), %xmm0\ncvtsi2ssq %rsi, %xmm0\nmovups %xmm0, (%rdi)", &a, b); return a; }
 #define _mm_cvtsi64x_ss _mm_cvtsi64_ss
 static inline __m64 _mm_cvtps_pi32(__m128 a) { __m64 r; r.__i[0] = __mlxcc_cvt32(__mlxcc_rint(a.__f[0])); r.__i[1] = __mlxcc_cvt32(__mlxcc_rint(a.__f[1])); return r; }
 #define _mm_cvt_ps2pi _mm_cvtps_pi32
@@ -187,14 +222,12 @@ static inline __m64 _mm_cvtps_pi8(__m128 a) {
     return r;
 }
 
-static inline __m128 _mm_shuffle_ps(__m128 a, __m128 b, int imm) {
-    __m128 r; r.__f[0] = a.__f[imm & 3]; r.__f[1] = a.__f[(imm >> 2) & 3]; r.__f[2] = b.__f[(imm >> 4) & 3]; r.__f[3] = b.__f[(imm >> 6) & 3]; return r;
-}
-static inline __m128 _mm_unpackhi_ps(__m128 a, __m128 b) { return _mm_set_ps(b.__f[3], a.__f[3], b.__f[2], a.__f[2]); }
-static inline __m128 _mm_unpacklo_ps(__m128 a, __m128 b) { return _mm_set_ps(b.__f[1], a.__f[1], b.__f[0], a.__f[0]); }
-static inline __m128 _mm_movehl_ps(__m128 a, __m128 b) { return _mm_set_ps(a.__f[3], a.__f[2], b.__f[3], b.__f[2]); }
-static inline __m128 _mm_movelh_ps(__m128 a, __m128 b) { return _mm_set_ps(b.__f[1], b.__f[0], a.__f[1], a.__f[0]); }
-static inline int _mm_movemask_ps(__m128 a) { int m = 0, i; for (i = 0; i < 4; i++) if (a.__i[i] < 0) m |= 1 << i; return m; }
+#define _mm_shuffle_ps(a, b, imm) ({ __m128 __a = (a), __b = (b); __builtin_mlxcc_asmi("movups (%rdi), %xmm0\nmovups (%rsi), %xmm1\nshufps $%i, %xmm1, %xmm0\nmovups %xmm0, (%rdi)", (imm), &__a, &__b); __a; })
+__MLXCC_BIN(_mm_unpackhi_ps, __m128, "unpckhps")
+__MLXCC_BIN(_mm_unpacklo_ps, __m128, "unpcklps")
+__MLXCC_BIN(_mm_movehl_ps, __m128, "movhlps")
+__MLXCC_BIN(_mm_movelh_ps, __m128, "movlhps")
+__MLXCC_MASK(_mm_movemask_ps, __m128, "movmskps")
 
 /* The MMX extensions SSE brought. */
 static inline int _mm_extract_pi16(__m64 a, int imm) { return a.__us[imm & 3]; }

@@ -202,6 +202,111 @@ builtins, and `importC` in Mlx (C and C++ code as Mlx code) follows. The other w
 driver for one GPU family in Mlx (`docs/VULKAN.md` has the first steps)
 takes Mesa out of the picture for that hardware.
 
+## Phase 6b: mlx-cc's code to gcc -O2's speed
+
+Voyager runs, and runs slowly: a profile of its main thread on Google
+and YouTube (`mlx-profile`, 2026-10-28) is flat, the top of it bmalloc's
+`ALWAYS_INLINE` allocation path, `LayoutUnit`'s accessors,
+`OptionSet::containsAny` and `_mm_cmpeq_epi8` as real calls, and 128-bit
+arithmetic through `__mlxcc_wide_*`: the compiler, not one hot spot.
+JavaScriptCore's JIT tiers (LLInt as assembly, Baseline, DFG, FTL,
+WebAssembly) are in, so the C++ is what is left to speed up. The LIR back
+end (mlx4's own LIR, optimizer and register allocation, the default
+since epoch 44) is the first step: SQLite's workload 2.8 s -> 1.43 s,
+bench.js 1.05 s -> 0.75 s. The measure for the rest is a workload's time
+against gcc -O2's, not an estimate: the goal is under 2x on native
+WebKit work (webcore-dump laying out and painting tests/bench's pages,
+jsc on bench.js, SQLite) before anything is called fast.
+
+- [x] Inlining in the LIR lowering: `always_inline` and small functions
+  (accessors, operators, intrinsics) of the unit at their call sites
+  (epoch 45; `__OPTIMIZE__` defined for libpas's `PAS_ALWAYS_INLINE`,
+  epoch 46). jsc's bench.js 0.74 s, webcore-dump bench.html 1.73 s (the
+  LIR build before it was not timed on the same page). Checked by eye on
+  a LayoutUnit loop (epoch 49): functions returning a reference
+  (`operator+=`) are inlined too, `this` and reference parameters are
+  aliases of the locals they name, a call that is a statement delivers
+  no result, and a local of one scalar member becomes a slot the
+  register pass may keep in a register: the loop's body went from 50
+  instructions to 22 (gcc -O2: 7). What is left in it is the back
+  end's: every intermediate value stored to its frame slot and read
+  back, one working register (rax) and three callee-saved ones for
+  locals.
+- [x] The back end's register allocation (epoch 52): a block's
+  intermediate values live in rsi, rdi, r8, r9 and r10 (State.cacheResult
+  in `backend/x86_64/codegen/state.mlx`), spilled to their slots only
+  before a call or the block's end when read after it; an operand read
+  last is operated on in its own register and the result takes it
+  over (`x * x`, `extend`, `copy` without code); loads and leas go
+  straight into the result's register; the optimizer joins a block
+  only fallen into to the block before it (the inliner left one per
+  call), so the cache lives across what were block boundaries; mlx-cc's
+  functions keep locals in five callee-saved registers (r14 and r15
+  too: C code keeps no arena in them), `int`, `unsigned` and byte
+  locals among them (the register holds the value extended; a store
+  re-extends it, `x = x + 1` with its `extend` done in place); a
+  discarded call at the end of a comma (an operator's, its argument
+  evaluated before) delivers no result; a function's parameters compete
+  with its locals for the registers (registers.parameterHomes, the
+  value moved into one on entry), so `this` lives in a register; a
+  call's arguments and its address (r11) are loaded as a parallel
+  move from wherever they are, the cache's registers included (the
+  call reads them before it writes them), and a shift by a constant
+  is a shift by an immediate; `p[i]` is a gep the back end makes one
+  indexed load, store or lea of ([base + index * 4], an index read
+  last scaled in its own register otherwise), a pointer plus a
+  constant (a vtable entry's) a gep folded into the access, and a
+  load of what the block already loaded (the vtable pointer for two
+  virtual calls, a member read twice) a copy of it. The LayoutUnit
+  loop's body: 11 instructions (was 22; gcc -O2: 7), with no frame
+  access at all; a virtual call: the vtable pointer and two entries
+  loaded, two moves and the call. Found on the way: the encoder's rax
+  slot cache
+  was not reset by `setcc` and the memory-operand ALU forms, and mlx4
+  miscompiles an assignment to a tuple's field (`held.0 = true` does
+  nothing), so the back end uses separate variables.
+- [x] The `extend` after an `int` operation (epoch 53): dropped when
+  every reader takes the low 32 bits alone (an operator producing low
+  bits from low bits, a store of 4 bytes or fewer); kept before a
+  compare, a shift right, a division, an address, a whole-word store, a
+  return or a call's argument (epoch 54: the parameter may be 64 bits
+  wide, the extend being that conversion).
+- [ ] The vtable's adjustment entry read only for a class with more
+  than one base; values live across blocks in registers; a function's
+  prologue saving only the registers it uses (it does) and no frame
+  for a function needing none.
+- [x] SIMD intrinsics as their instructions (epoch 47): the SSE, SSE2,
+  SSE3, SSSE3, SSE4.1 and SSE4.2 headers over `__builtin_mlxcc_asm`,
+  the assembler knowing the packed-integer instructions
+  (compiler/cc/README.md, "Inline assembly").
+- [x] `__builtin_add_overflow`, `sub` and `mul` of one 4- or 8-byte
+  type as the instruction and its flag (epoch 48): a function holding
+  one no longer falls back to the stack machine with the wide runtime.
+- [ ] 128-bit arithmetic as instructions where x86-64 has them (`mul`,
+  add with carry, shifts), the helpers for the rest; `__int128` values
+  in the LIR instead of the stack machine.
+- [x] The benchmark: tools/bench_native.sh times jsc on bench.js and
+  webcore-dump on bench.html (medians; gcc -O2's build of WebKit is not
+  in the repository, so its numbers come from outside). Epoch 46: 0.74 s
+  / 1.73 s / 0.89 s (without scripts); epoch 48 (SSE instructions, the
+  overflow builtins): 0.77 s / 1.67 s / 0.92 s; epoch 51 (reference
+  results inlined, parameter aliases, places promoted, struct
+  parameters of any size): 0.65 s / 1.73 s / 0.97 s, the layout and
+  paint checks green. JavaScriptCore gains, WebCore's layout does not:
+  its time is the back end's frame traffic, not calls.
+- [ ] Voyager profiled again under the same conditions (the same URLs
+  and machine): the main thread, `MlxCompositor`, `MlxGPUPainting`,
+  and JavaScript, layout, painting and compositing told apart. Seen on
+  bench.js with `JSC_reportCompileTimes=true` (epoch 48): the tiers all
+  run (34 compiles, FTL among them), but compiling is where the time
+  goes: 958 ms of compile time in an 814 ms run (on its threads), one
+  FTL compile of a 416-byte function 142 ms (DFG 56, B3 86), which a
+  gcc-built JavaScriptCore does in a few milliseconds. The JIT's own
+  C++ (DFG, B3, Air) is the code to make fast, not the JavaScript it
+  emits.
+- [ ] Zero-copy presentation on a real GPU: the window's buffer a dma-buf
+  the compositor imports (it can), instead of wl_shm read back.
+
 ## Phase 7: boot and bootstrap
 
 1. Boot without GRUB: the kernel's EFI stub started directly, or an EFI

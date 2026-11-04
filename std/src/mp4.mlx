@@ -1,0 +1,1325 @@
+// std.mp4: reads MP4 (ISO base media, ISO/IEC 14496-12) files and
+// streams: the movie's tracks (video: H.264/AVC, H.265/HEVC, VP9, AV1;
+// sound: AAC, Opus) with their codec configuration, and the samples of a
+// plain file (the sample tables of `moov`) or of a fragmented one (`moof`
+// + `mdat`, as YouTube's and every other MSE player's segments come).
+//
+//     var movie: mp4.Movie = undefined
+//     mp4.init(&movie, allocator)
+//     var samples: mp4.Samples = undefined
+//     mp4.initSamples(&samples, allocator)
+//     // A whole file in memory, or an MSE initialization segment:
+//     var used: usize = 0
+//     const status = mp4.parse(&movie, bytes, length, &samples, &used)
+//     // A plain file: the samples in order (and seek to a key frame):
+//     var sample: mp4.Sample = undefined
+//     while mp4.nextSample(&movie, track, &sample) { ... bytes[sample.offset ..] }
+//     // A fragmented one: parse() lists each fragment's samples in
+//     // `samples` (offsets count from `bytes`); `used` is how many bytes
+//     // were whole boxes: keep the rest and give it again with more.
+//
+// Times are in the track's `timescale` (dts, pts; a `ctts`/`trun`
+// composition offset applied to pts; the edit list's shift in
+// `editMediaTime` and `editDelay` for the caller to apply to the
+// presentation). A sample's bytes are as stored: AVC and HEVC samples
+// are length-prefixed NAL units (`nalLengthSize`), which annexB() turns
+// into start-code form for a decoder; the parameter sets (SPS, PPS; HEVC's
+// VPS) come from parameterSet(). An AAC track has its
+// AudioSpecificConfig read (object type, rate, channels) and kept in
+// `config`.
+//
+// Damaged data gives Status.corrupt, never a trap: every box is checked
+// against its enclosing box before it is read.
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const mem = @import("../bootstrap/mem.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const MAX_TRACKS: usize = 8
+// Codec configuration kept per track (avcC, hvcC, AudioSpecificConfig, ...).
+pub const CONFIG_CAPACITY: usize = 4096
+
+pub const Status = enum(u8) {
+    ok,
+    // A top-level box is not complete: give the bytes from `used` on
+    // again with more after them.
+    needMore,
+    corrupt,
+    unsupported,
+    noMemory
+}
+
+pub fn statusMessage(status: Status) -> []const u8 {
+    if status == Status.ok { return "ok" }
+    if status == Status.needMore { return "needs more data" }
+    if status == Status.corrupt { return "a damaged MP4" }
+    if status == Status.unsupported { return "an MP4 feature not supported" }
+    return "out of memory"
+}
+
+// Track kinds and codecs.
+pub const KIND_OTHER: u8 = 0
+pub const KIND_VIDEO: u8 = 1
+pub const KIND_AUDIO: u8 = 2
+
+pub const CODEC_UNKNOWN: u8 = 0
+pub const CODEC_H264: u8 = 1
+pub const CODEC_H265: u8 = 2
+pub const CODEC_VP9: u8 = 3
+pub const CODEC_AV1: u8 = 4
+pub const CODEC_AAC: u8 = 16
+pub const CODEC_OPUS: u8 = 17
+
+const FTYP: u32 = 0x66747970
+const STYP: u32 = 0x73747970
+const MOOV: u32 = 0x6d6f6f76
+const MOOF: u32 = 0x6d6f6f66
+const MDAT: u32 = 0x6d646174
+const FREE: u32 = 0x66726565
+const SKIP: u32 = 0x736b6970
+const SIDX: u32 = 0x73696478
+const MVHD: u32 = 0x6d766864
+const TRAK: u32 = 0x7472616b
+const TKHD: u32 = 0x746b6864
+const MDIA: u32 = 0x6d646961
+const MDHD: u32 = 0x6d646864
+const HDLR: u32 = 0x68646c72
+const MINF: u32 = 0x6d696e66
+const STBL: u32 = 0x7374626c
+const STSD: u32 = 0x73747364
+const STTS: u32 = 0x73747473
+const CTTS: u32 = 0x63747473
+const STSC: u32 = 0x73747363
+const STSZ: u32 = 0x7374737a
+const STZ2: u32 = 0x73747a32
+const STCO: u32 = 0x7374636f
+const CO64: u32 = 0x636f3634
+const STSS: u32 = 0x73747373
+const MVEX: u32 = 0x6d766578
+const TREX: u32 = 0x74726578
+const TRAF: u32 = 0x74726166
+const TFHD: u32 = 0x74666864
+const TFDT: u32 = 0x74666474
+const TRUN: u32 = 0x7472756e
+const EDTS: u32 = 0x65647473
+const ELST: u32 = 0x656c7374
+const AVC1: u32 = 0x61766331
+const AVC3: u32 = 0x61766333
+const HVC1: u32 = 0x68766331
+const HEV1: u32 = 0x68657631
+const MP4A: u32 = 0x6d703461
+const AVCC: u32 = 0x61766343
+const HVCC: u32 = 0x68766343
+const ESDS: u32 = 0x65736473
+const VIDE: u32 = 0x76696465
+const SOUN: u32 = 0x736f756e
+const OPUS: u32 = 0x4f707573
+const DOPS: u32 = 0x644f7073
+const VP09: u32 = 0x76703039
+const VPCC: u32 = 0x76706343
+const AV01: u32 = 0x61763031
+const AV1C: u32 = 0x61763143
+
+// tfhd flags.
+const TF_BASE_DATA_OFFSET: u32 = 0x1
+const TF_DESCRIPTION: u32 = 0x2
+const TF_DEFAULT_DURATION: u32 = 0x8
+const TF_DEFAULT_SIZE: u32 = 0x10
+const TF_DEFAULT_FLAGS: u32 = 0x20
+const TF_DURATION_IS_EMPTY: u32 = 0x10000
+const TF_DEFAULT_BASE_IS_MOOF: u32 = 0x20000
+// trun flags.
+const TR_DATA_OFFSET: u32 = 0x1
+const TR_FIRST_FLAGS: u32 = 0x4
+const TR_DURATION: u32 = 0x100
+const TR_SIZE: u32 = 0x200
+const TR_FLAGS: u32 = 0x400
+const TR_COMPOSITION: u32 = 0x800
+
+// A sample: where its bytes are (an offset into the bytes parse() was
+// given, a file offset for a plain file), its times in the track's
+// timescale, whether it is a sync (key) sample.
+pub const Sample = struct {
+    track: usize
+    offset: usize
+    size: usize
+    dts: u64
+    pts: i64
+    duration: u32
+    sync: bool
+}
+
+// The samples of a fragment, as a growing array.
+pub const Samples = struct {
+    items: [*]Sample
+    count: usize
+    capacity: usize
+    allocator: Allocator
+}
+
+pub fn initSamples(samples: *Samples, allocator: Allocator) -> void {
+    samples.*.count = 0
+    samples.*.capacity = 0
+    samples.*.allocator = allocator
+}
+
+pub fn clearSamples(samples: *Samples) -> void { samples.*.count = 0 }
+
+pub fn deinitSamples(samples: *Samples) -> void {
+    if samples.*.capacity == 0 { return }
+    unsafe { samples.*.allocator.free(@ptrCast([*]u8, samples.*.items), samples.*.capacity * @sizeOf(Sample), 16) }
+    samples.*.capacity = 0
+    samples.*.count = 0
+}
+
+fn addSample(samples: *Samples, sample: Sample) -> bool {
+    if samples.*.count == samples.*.capacity {
+        const capacity = if samples.*.capacity == 0 { 256 } else { samples.*.capacity * 2 }
+        const memory = samples.*.allocator.alloc(capacity * @sizeOf(Sample), 16)
+        if memory == null { return false }
+        var items: [*]Sample = undefined
+        unsafe { items = @ptrCast([*]Sample, memory.?) }
+        var index: usize = 0
+        while index < samples.*.count {
+            items[index] = samples.*.items[index]
+            index += 1
+        }
+        if samples.*.capacity != 0 {
+            unsafe { samples.*.allocator.free(@ptrCast([*]u8, samples.*.items), samples.*.capacity * @sizeOf(Sample), 16) }
+        }
+        samples.*.items = items
+        samples.*.capacity = capacity
+    }
+    samples.*.items[samples.*.count] = sample
+    samples.*.count += 1
+    return true
+}
+
+// A table of a plain file's `stbl`: where its entries start in the
+// movie's copy of `moov`, and how many there are.
+const Table = struct {
+    at: usize
+    count: usize
+}
+
+pub const Track = struct {
+    id: u32
+    kind: u8
+    codec: u8
+    timescale: u32
+    duration: u64
+    width: u32
+    height: u32
+    channels: u32
+    rate: u32
+    // AAC's audio object type (2: LC, 5: HE, 29: HE v2); the sampling
+    // frequency index and channel configuration are in `rate` and
+    // `channels`.
+    audioObjectType: u8
+    // AVC/HEVC: bytes of each NAL unit's length prefix (1, 2 or 4).
+    nalLengthSize: u8
+    // The codec configuration: avcC's or hvcC's contents (from the
+    // configurationVersion byte), AAC's AudioSpecificConfig, dOps, vpcC,
+    // av1C.
+    config: [CONFIG_CAPACITY]u8
+    configLength: usize
+    // The edit list: the media time the presentation starts at and the
+    // delay before it (both in the track's timescale), from the first
+    // non-empty and the first empty edit.
+    editMediaTime: u64
+    editDelay: u64
+    // The sample tables of a plain file (stsz's entry 0 is the fixed
+    // size when `sizeTable.count` is 0 and `fixedSize` is not).
+    timeTable: Table
+    compositionTable: Table
+    compositionVersion: u8
+    chunkTable: Table
+    sizeTable: Table
+    fixedSize: u32
+    offsetTable: Table
+    offset64: bool
+    syncTable: Table
+    sampleCount: usize
+    // The cursor of nextSample.
+    sampleIndex: usize
+    timeEntry: usize
+    timeLeft: u32
+    timeDelta: u32
+    compositionEntry: usize
+    compositionLeft: u32
+    compositionOffset: i64
+    chunkIndex: usize
+    chunkEntry: usize
+    sampleInChunk: usize
+    chunkOffset: u64
+    dts: u64
+    // trex defaults for fragments, and the fragment cursor (the next
+    // sample's decode time, from tfdt or the samples before).
+    defaultDuration: u32
+    defaultSize: u32
+    defaultFlags: u32
+    fragmentDts: u64
+    hasFragmentDts: bool
+}
+
+pub const Movie = struct {
+    allocator: Allocator
+    timescale: u32
+    duration: u64
+    tracks: [MAX_TRACKS]Track
+    trackCount: usize
+    // A copy of `moov` (the sample tables point into it).
+    moov: [*]u8
+    moovLength: usize
+    fragmented: bool
+    // The number of the last fragment (mfhd).
+    sequence: u32
+}
+
+pub fn init(movie: *Movie, allocator: Allocator) -> void {
+    movie.*.allocator = allocator
+    movie.*.timescale = 1000
+    movie.*.duration = 0
+    movie.*.trackCount = 0
+    movie.*.moovLength = 0
+    movie.*.fragmented = false
+    movie.*.sequence = 0
+}
+
+pub fn deinit(movie: *Movie) -> void {
+    if movie.*.moovLength != 0 {
+        unsafe { movie.*.allocator.free(movie.*.moov, movie.*.moovLength, 16) }
+    }
+    movie.*.moovLength = 0
+    movie.*.trackCount = 0
+}
+
+pub fn track(movie: *Movie, index: usize) -> *Track {
+    unsafe { return @ptrCast(*Track, &movie.*.tracks[index]) }
+}
+
+// The index of the track with ID `id`, or MAX_TRACKS.
+pub fn trackIndex(movie: *Movie, id: u32) -> usize {
+    var index: usize = 0
+    while index < movie.*.trackCount {
+        if movie.*.tracks[index].id == id { return index }
+        index += 1
+    }
+    return MAX_TRACKS
+}
+
+// The first track of a kind, or MAX_TRACKS.
+pub fn trackOfKind(movie: *Movie, kind: u8) -> usize {
+    var index: usize = 0
+    while index < movie.*.trackCount {
+        if movie.*.tracks[index].kind == kind { return index }
+        index += 1
+    }
+    return MAX_TRACKS
+}
+
+fn u8At(bytes: [*]const u8, at: usize) -> u32 { return @intCast(u32, bytes[at]) }
+fn u16At(bytes: [*]const u8, at: usize) -> u32 { return @intCast(u32, mem.readU16Big(bytes, at)) }
+fn u32At(bytes: [*]const u8, at: usize) -> u32 { return mem.readU32Big(bytes, at) }
+fn u64At(bytes: [*]const u8, at: usize) -> u64 { return mem.readU64Big(bytes, at) }
+
+// A box at `at` within [at, end): its type, where its contents start
+// and end. False when its header does not fit or its size is bad.
+// `needMore` tells a top-level box that is cut short from a damaged one.
+const Box = struct {
+    kind: u32
+    contents: usize
+    end: usize
+}
+
+fn readBox(bytes: [*]const u8, at: usize, end: usize, box: *Box) -> bool {
+    if at + 8 > end { return false }
+    var size: u64 = @intCast(u64, u32At(bytes, at))
+    box.*.kind = u32At(bytes, at + 4)
+    var header: usize = 8
+    if size == 1 {
+        if at + 16 > end { return false }
+        size = u64At(bytes, at + 8)
+        header = 16
+    } else if size == 0 {
+        size = @intCast(u64, end - at)
+    }
+    if size < @intCast(u64, header) || size > @intCast(u64, end - at) { return false }
+    box.*.contents = at + header
+    box.*.end = at + @intCast(usize, size)
+    return true
+}
+
+// The size a top-level box at `at` claims (0 when its header is not
+// there yet), to tell "needs more" from "damaged".
+fn claimedSize(bytes: [*]const u8, at: usize, end: usize) -> u64 {
+    if at + 8 > end { return 0 }
+    const size = @intCast(u64, u32At(bytes, at))
+    if size == 1 {
+        if at + 16 > end { return 0 }
+        return u64At(bytes, at + 8)
+    }
+    return size
+}
+
+// Parses the boxes in bytes[0 .. length): `moov` sets up the movie (its
+// tracks and tables), each `moof` lists its samples (reading their
+// bytes from the `mdat` that follows), other boxes are skipped. `used`
+// is how far whole top-level boxes went; a box that is cut short
+// answers needMore (it is not consumed). A plain file is given whole.
+pub fn parse(movie: *Movie, bytes: [*]const u8, length: usize, samples: *Samples, used: *usize) -> Status {
+    var at: usize = 0
+    used.* = 0
+    while at < length {
+        var box: Box = undefined
+        if !readBox(bytes, at, length, &box) {
+            const claimed = claimedSize(bytes, at, length)
+            if claimed == 0 || claimed > @intCast(u64, length - at) { return Status.needMore }
+            return Status.corrupt
+        }
+        if box.kind == MOOV {
+            const status = parseMoov(movie, bytes, box.contents, box.end)
+            if status != Status.ok { return status }
+        } else if box.kind == MOOF {
+            const status = parseMoof(movie, bytes, at, box.contents, box.end, length, samples)
+            if status != Status.ok { return status }
+        }
+        // ftyp, styp, sidx, free, mdat, uuid, ...: nothing to read.
+        at = box.end
+        used.* = at
+    }
+    return Status.ok
+}
+
+// ---- moov ----
+
+fn parseMoov(movie: *Movie, bytes: [*]const u8, start: usize, end: usize) -> Status {
+    // Keep a copy: the sample tables are read from it later.
+    if movie.*.moovLength != 0 {
+        unsafe { movie.*.allocator.free(movie.*.moov, movie.*.moovLength, 16) }
+        movie.*.moovLength = 0
+    }
+    movie.*.trackCount = 0
+    const length = end - start
+    const memory = movie.*.allocator.alloc(length, 16)
+    if memory == null { return Status.noMemory }
+    movie.*.moov = memory.?
+    movie.*.moovLength = length
+    var index: usize = 0
+    while index < length {
+        movie.*.moov[index] = bytes[start + index]
+        index += 1
+    }
+    const moov: [*]const u8 = movie.*.moov
+    var at: usize = 0
+    while at < length {
+        var box: Box = undefined
+        if !readBox(moov, at, length, &box) { return Status.corrupt }
+        if box.kind == MVHD {
+            if box.contents + 4 > box.end { return Status.corrupt }
+            const version = u8At(moov, box.contents)
+            if version == 1 {
+                if box.contents + 32 > box.end { return Status.corrupt }
+                movie.*.timescale = u32At(moov, box.contents + 20)
+                movie.*.duration = u64At(moov, box.contents + 24)
+            } else {
+                if box.contents + 20 > box.end { return Status.corrupt }
+                movie.*.timescale = u32At(moov, box.contents + 12)
+                movie.*.duration = @intCast(u64, u32At(moov, box.contents + 16))
+            }
+            if movie.*.timescale == 0 { return Status.corrupt }
+        } else if box.kind == TRAK {
+            const status = parseTrak(movie, moov, box.contents, box.end)
+            if status != Status.ok { return status }
+        }
+        at = box.end
+    }
+    // mvex after the tracks it refers to, wherever it is in moov.
+    at = 0
+    while at < length {
+        var box: Box = undefined
+        if !readBox(moov, at, length, &box) { return Status.corrupt }
+        if box.kind == MVEX {
+            const status = parseMvex(movie, moov, box.contents, box.end)
+            if status != Status.ok { return status }
+        }
+        at = box.end
+    }
+    return Status.ok
+}
+
+fn clearTrack(track_: *Track) -> void {
+    track_.*.id = 0
+    track_.*.kind = KIND_OTHER
+    track_.*.codec = CODEC_UNKNOWN
+    track_.*.timescale = 0
+    track_.*.duration = 0
+    track_.*.width = 0
+    track_.*.height = 0
+    track_.*.channels = 0
+    track_.*.rate = 0
+    track_.*.audioObjectType = 0
+    track_.*.nalLengthSize = 4
+    track_.*.configLength = 0
+    track_.*.editMediaTime = 0
+    track_.*.editDelay = 0
+    track_.*.timeTable.count = 0
+    track_.*.compositionTable.count = 0
+    track_.*.compositionVersion = 0
+    track_.*.chunkTable.count = 0
+    track_.*.sizeTable.count = 0
+    track_.*.fixedSize = 0
+    track_.*.offsetTable.count = 0
+    track_.*.offset64 = false
+    track_.*.syncTable.count = 0
+    track_.*.sampleCount = 0
+    track_.*.defaultDuration = 0
+    track_.*.defaultSize = 0
+    track_.*.defaultFlags = 0
+    track_.*.fragmentDts = 0
+    track_.*.hasFragmentDts = false
+    resetCursor(track_)
+}
+
+fn parseTrak(movie: *Movie, moov: [*]const u8, start: usize, end: usize) -> Status {
+    if movie.*.trackCount >= MAX_TRACKS { return Status.ok }
+    const track_ = track(movie, movie.*.trackCount)
+    clearTrack(track_)
+    var at = start
+    while at < end {
+        var box: Box = undefined
+        if !readBox(moov, at, end, &box) { return Status.corrupt }
+        if box.kind == TKHD {
+            if box.contents + 4 > box.end { return Status.corrupt }
+            const version = u8At(moov, box.contents)
+            // Version 1 has 64-bit times: the ID and the fields after the
+            // duration (8 reserved, layer, alternate group, volume, 2
+            // reserved, the 36-byte matrix, then width and height as
+            // 16.16) move by 12.
+            const idAt: usize = if version == 1 { 20 } else { 12 }
+            const fixed: usize = if version == 1 { 36 } else { 24 }
+            if box.contents + fixed + 60 > box.end { return Status.corrupt }
+            track_.*.id = u32At(moov, box.contents + idAt)
+            track_.*.width = u32At(moov, box.contents + fixed + 52) >> 16
+            track_.*.height = u32At(moov, box.contents + fixed + 56) >> 16
+        } else if box.kind == EDTS {
+            const status = parseEdts(track_, moov, box.contents, box.end)
+            if status != Status.ok { return status }
+        } else if box.kind == MDIA {
+            const status = parseMdia(track_, moov, box.contents, box.end)
+            if status != Status.ok { return status }
+        }
+        at = box.end
+    }
+    if track_.*.timescale == 0 { return Status.corrupt }
+    movie.*.trackCount += 1
+    return Status.ok
+}
+
+fn parseEdts(track_: *Track, moov: [*]const u8, start: usize, end: usize) -> Status {
+    var at = start
+    while at < end {
+        var box: Box = undefined
+        if !readBox(moov, at, end, &box) { return Status.corrupt }
+        if box.kind == ELST {
+            if box.contents + 8 > box.end { return Status.corrupt }
+            const version = u8At(moov, box.contents)
+            const count = u32At(moov, box.contents + 4)
+            const entry: usize = if version == 1 { 20 } else { 12 }
+            var index: u32 = 0
+            var cursor = box.contents + 8
+            var delay: u64 = 0
+            var sawMedia = false
+            while index < count {
+                if cursor + entry > box.end { return Status.corrupt }
+                var segment: u64 = 0
+                var media: u64 = 0
+                if version == 1 {
+                    segment = u64At(moov, cursor)
+                    media = u64At(moov, cursor + 8)
+                } else {
+                    segment = @intCast(u64, u32At(moov, cursor))
+                    media = @intCast(u64, u32At(moov, cursor + 4))
+                    if media == 0xffffffff { media = 0xffffffffffffffff }
+                }
+                if media == 0xffffffffffffffff {
+                    // An empty edit: a delay, in the movie's timescale
+                    // (converted by the caller: the movie's scale is not
+                    // known here, so it is kept as given in movie units
+                    // and scaled in applyMovieScale).
+                    if !sawMedia { delay += segment }
+                } else if !sawMedia {
+                    track_.*.editMediaTime = media
+                    sawMedia = true
+                }
+                cursor += entry
+                index += 1
+            }
+            track_.*.editDelay = delay
+        }
+        at = box.end
+    }
+    return Status.ok
+}
+
+fn parseMdia(track_: *Track, moov: [*]const u8, start: usize, end: usize) -> Status {
+    var at = start
+    while at < end {
+        var box: Box = undefined
+        if !readBox(moov, at, end, &box) { return Status.corrupt }
+        if box.kind == MDHD {
+            if box.contents + 4 > box.end { return Status.corrupt }
+            const version = u8At(moov, box.contents)
+            if version == 1 {
+                if box.contents + 32 > box.end { return Status.corrupt }
+                track_.*.timescale = u32At(moov, box.contents + 20)
+                track_.*.duration = u64At(moov, box.contents + 24)
+            } else {
+                if box.contents + 20 > box.end { return Status.corrupt }
+                track_.*.timescale = u32At(moov, box.contents + 12)
+                track_.*.duration = @intCast(u64, u32At(moov, box.contents + 16))
+            }
+        } else if box.kind == HDLR {
+            if box.contents + 12 > box.end { return Status.corrupt }
+            const handler = u32At(moov, box.contents + 8)
+            if handler == VIDE { track_.*.kind = KIND_VIDEO }
+            if handler == SOUN { track_.*.kind = KIND_AUDIO }
+        } else if box.kind == MINF {
+            const status = parseMinf(track_, moov, box.contents, box.end)
+            if status != Status.ok { return status }
+        }
+        at = box.end
+    }
+    return Status.ok
+}
+
+fn parseMinf(track_: *Track, moov: [*]const u8, start: usize, end: usize) -> Status {
+    var at = start
+    while at < end {
+        var box: Box = undefined
+        if !readBox(moov, at, end, &box) { return Status.corrupt }
+        if box.kind == STBL {
+            const status = parseStbl(track_, moov, box.contents, box.end)
+            if status != Status.ok { return status }
+        }
+        at = box.end
+    }
+    return Status.ok
+}
+
+// A full box's entry table: version/flags, a count, then `entrySize`
+// bytes per entry, all within the box.
+fn readTable(moov: [*]const u8, box: *Box, entrySize: usize, table: *Table) -> bool {
+    if box.*.contents + 8 > box.*.end { return false }
+    const count = @intCast(usize, u32At(moov, box.*.contents + 4))
+    if count > (box.*.end - box.*.contents - 8) / entrySize { return false }
+    table.*.at = box.*.contents + 8
+    table.*.count = count
+    return true
+}
+
+fn parseStbl(track_: *Track, moov: [*]const u8, start: usize, end: usize) -> Status {
+    var at = start
+    while at < end {
+        var box: Box = undefined
+        if !readBox(moov, at, end, &box) { return Status.corrupt }
+        if box.kind == STSD {
+            const status = parseStsd(track_, moov, box.contents, box.end)
+            if status != Status.ok { return status }
+        } else if box.kind == STTS {
+            if !readTable(moov, &box, 8, &track_.*.timeTable) { return Status.corrupt }
+        } else if box.kind == CTTS {
+            if !readTable(moov, &box, 8, &track_.*.compositionTable) { return Status.corrupt }
+            track_.*.compositionVersion = @intCast(u8, u8At(moov, box.contents))
+        } else if box.kind == STSC {
+            if !readTable(moov, &box, 12, &track_.*.chunkTable) { return Status.corrupt }
+        } else if box.kind == STSZ {
+            if box.contents + 12 > box.end { return Status.corrupt }
+            track_.*.fixedSize = u32At(moov, box.contents + 4)
+            const count = @intCast(usize, u32At(moov, box.contents + 8))
+            track_.*.sampleCount = count
+            if track_.*.fixedSize == 0 {
+                if count > (box.end - box.contents - 12) / 4 { return Status.corrupt }
+                track_.*.sizeTable.at = box.contents + 12
+                track_.*.sizeTable.count = count
+            }
+        } else if box.kind == STZ2 {
+            return Status.unsupported
+        } else if box.kind == STCO {
+            if !readTable(moov, &box, 4, &track_.*.offsetTable) { return Status.corrupt }
+            track_.*.offset64 = false
+        } else if box.kind == CO64 {
+            if !readTable(moov, &box, 8, &track_.*.offsetTable) { return Status.corrupt }
+            track_.*.offset64 = true
+        } else if box.kind == STSS {
+            if !readTable(moov, &box, 4, &track_.*.syncTable) { return Status.corrupt }
+        }
+        at = box.end
+    }
+    return Status.ok
+}
+
+fn keepConfig(track_: *Track, moov: [*]const u8, start: usize, end: usize) -> void {
+    var length = end - start
+    if length > CONFIG_CAPACITY { length = CONFIG_CAPACITY }
+    var index: usize = 0
+    while index < length {
+        track_.*.config[index] = moov[start + index]
+        index += 1
+    }
+    track_.*.configLength = length
+}
+
+fn parseStsd(track_: *Track, moov: [*]const u8, start: usize, end: usize) -> Status {
+    if start + 8 > end { return Status.corrupt }
+    const count = u32At(moov, start + 4)
+    if count == 0 { return Status.ok }
+    // Only the first sample description is used.
+    var entry: Box = undefined
+    if !readBox(moov, start + 8, end, &entry) { return Status.corrupt }
+    const kind = entry.kind
+    if kind == AVC1 || kind == AVC3 || kind == HVC1 || kind == HEV1 || kind == VP09 || kind == AV01 {
+        // VisualSampleEntry: 6 reserved + 2 data_reference_index, 16
+        // predefined/reserved, width, height, 8 (resolutions), 4
+        // reserved, 2 frame_count, 32 compressorname, 2 depth, 2
+        // predefined: 78 bytes, then the configuration boxes.
+        if entry.contents + 78 > entry.end { return Status.corrupt }
+        track_.*.kind = KIND_VIDEO
+        if track_.*.width == 0 { track_.*.width = u16At(moov, entry.contents + 24) }
+        if track_.*.height == 0 { track_.*.height = u16At(moov, entry.contents + 26) }
+        if kind == AVC1 || kind == AVC3 { track_.*.codec = CODEC_H264 }
+        if kind == HVC1 || kind == HEV1 { track_.*.codec = CODEC_H265 }
+        if kind == VP09 { track_.*.codec = CODEC_VP9 }
+        if kind == AV01 { track_.*.codec = CODEC_AV1 }
+        var at = entry.contents + 78
+        while at < entry.end {
+            var box: Box = undefined
+            if !readBox(moov, at, entry.end, &box) { return Status.corrupt }
+            if box.kind == AVCC || box.kind == HVCC || box.kind == VPCC || box.kind == AV1C {
+                keepConfig(track_, moov, box.contents, box.end)
+                if box.kind == AVCC && box.end - box.contents >= 5 {
+                    track_.*.nalLengthSize = @intCast(u8, (u8At(moov, box.contents + 4) & 3) + 1)
+                }
+                if box.kind == HVCC && box.end - box.contents >= 22 {
+                    track_.*.nalLengthSize = @intCast(u8, (u8At(moov, box.contents + 21) & 3) + 1)
+                }
+            }
+            at = box.end
+        }
+    } else if kind == MP4A || kind == OPUS {
+        // AudioSampleEntry: 6 reserved + 2 index, 8 reserved, 2
+        // channelcount, 2 samplesize, 2 predefined, 2 reserved, 4
+        // samplerate (16.16): 28 bytes, then the boxes.
+        if entry.contents + 28 > entry.end { return Status.corrupt }
+        track_.*.kind = KIND_AUDIO
+        const version = u16At(moov, entry.contents + 8)
+        track_.*.channels = u16At(moov, entry.contents + 16)
+        track_.*.rate = u32At(moov, entry.contents + 24) >> 16
+        var at = entry.contents + 28
+        // QuickTime's version 1 and 2 entries have more fixed fields.
+        if kind == MP4A && version == 1 { at += 16 }
+        if kind == MP4A && version == 2 { at += 36 }
+        if kind == OPUS { track_.*.codec = CODEC_OPUS }
+        while at < entry.end {
+            var box: Box = undefined
+            if !readBox(moov, at, entry.end, &box) { return Status.corrupt }
+            if box.kind == ESDS {
+                const status = parseEsds(track_, moov, box.contents, box.end)
+                if status != Status.ok { return status }
+            } else if box.kind == DOPS {
+                keepConfig(track_, moov, box.contents, box.end)
+                if box.end - box.contents >= 11 {
+                    track_.*.channels = u8At(moov, box.contents + 1)
+                    // Opus always decodes at 48 kHz.
+                    track_.*.rate = 48000
+                }
+            }
+            at = box.end
+        }
+    }
+    return Status.ok
+}
+
+// An MPEG-4 descriptor's size: 1 to 4 bytes of 7 bits, the high bit
+// saying another follows.
+fn descriptorSize(moov: [*]const u8, at: *usize, end: usize) -> usize {
+    var size: usize = 0
+    var count: usize = 0
+    while count < 4 && at.* < end {
+        const byte = moov[at.*]
+        at.* += 1
+        size = (size << 7) | @intCast(usize, byte & 127)
+        count += 1
+        if byte & 128 == 0 { break }
+    }
+    return size
+}
+
+var SAMPLING_RATES = [13]u32{96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350}
+
+// esds: ES_Descriptor (3) > DecoderConfigDescriptor (4) >
+// DecoderSpecificInfo (5) = AudioSpecificConfig.
+fn parseEsds(track_: *Track, moov: [*]const u8, start: usize, end: usize) -> Status {
+    var at = start + 4
+    if at >= end || moov[at] != 3 { return Status.corrupt }
+    at += 1
+    const esEnd = at
+    _ = esEnd
+    var size = descriptorSize(moov, &at, end)
+    _ = size
+    // ES_ID (2), flags (1), then optional fields by the flags.
+    if at + 3 > end { return Status.corrupt }
+    const flags = moov[at + 2]
+    at += 3
+    if flags & 0x80 != 0 { at += 2 }
+    if flags & 0x40 != 0 {
+        if at >= end { return Status.corrupt }
+        at += 1 + @intCast(usize, moov[at])
+    }
+    if flags & 0x20 != 0 { at += 2 }
+    if at >= end || moov[at] != 4 { return Status.corrupt }
+    at += 1
+    size = descriptorSize(moov, &at, end)
+    // objectTypeIndication (1), streamType (1), bufferSizeDB (3),
+    // maxBitrate (4), avgBitrate (4).
+    if at + 13 > end { return Status.corrupt }
+    const objectType = moov[at]
+    at += 13
+    // 0x40: MPEG-4 audio; 0x66-0x68: MPEG-2 AAC.
+    if objectType == 0x40 || objectType == 0x66 || objectType == 0x67 || objectType == 0x68 {
+        track_.*.codec = CODEC_AAC
+    }
+    if at >= end || moov[at] != 5 { return Status.ok }
+    at += 1
+    size = descriptorSize(moov, &at, end)
+    if size > end - at { return Status.corrupt }
+    keepConfig(track_, moov, at, at + size)
+    if track_.*.codec == CODEC_AAC && size >= 2 {
+        // AudioSpecificConfig: 5 bits object type (31: 6 more), 4 bits
+        // frequency index (15: 24 bits of rate), 4 bits channels.
+        var bits: u32 = (u8At(moov, at) << 8) | u8At(moov, at + 1)
+        var objectTypeAudio: u32 = bits >> 11
+        var position: u32 = 5
+        if objectTypeAudio == 31 {
+            if size < 3 { return Status.corrupt }
+            bits = (bits << 8) | u8At(moov, at + 2)
+            objectTypeAudio = 32 + ((bits >> 8) & 63)
+            position = 11
+            // The 24-bit word now holds 13 more bits after the type.
+        }
+        track_.*.audioObjectType = @intCast(u8, objectTypeAudio)
+        // Read the frequency index and channel configuration bit by bit.
+        var reader = BitReader.{ .bytes = moov, .at = at, .end = at + size, .bit = position }
+        const frequencyIndex = readBits(&reader, 4)
+        var rate: u32 = 0
+        if frequencyIndex == 15 {
+            rate = readBits(&reader, 24)
+        } else if frequencyIndex < 13 {
+            rate = SAMPLING_RATES[@intCast(usize, frequencyIndex)]
+        }
+        const channels = readBits(&reader, 4)
+        if rate != 0 { track_.*.rate = rate }
+        if channels != 0 && channels <= 7 { track_.*.channels = if channels == 7 { 8 } else { channels } }
+        // HE-AAC signalled explicitly: the extension's rate is the one
+        // heard (SBR doubles it).
+        if objectTypeAudio == 5 || objectTypeAudio == 29 {
+            const extensionIndex = readBits(&reader, 4)
+            if extensionIndex == 15 {
+                track_.*.rate = readBits(&reader, 24)
+            } else if extensionIndex < 13 {
+                track_.*.rate = SAMPLING_RATES[@intCast(usize, extensionIndex)]
+            }
+        }
+    }
+    return Status.ok
+}
+
+const BitReader = struct {
+    bytes: [*]const u8
+    at: usize
+    end: usize
+    bit: u32
+}
+
+fn readBits(reader: *BitReader, count: u32) -> u32 {
+    var value: u32 = 0
+    var left = count
+    while left > 0 {
+        if reader.*.at >= reader.*.end { return value << left }
+        const byte = @intCast(u32, reader.*.bytes[reader.*.at])
+        const available = 8 - reader.*.bit
+        var take = left
+        if take > available { take = available }
+        const shifted = (byte >> (available - take)) & ((@intCast(u32, 1) << take) - 1)
+        value = (value << take) | shifted
+        reader.*.bit += take
+        if reader.*.bit == 8 {
+            reader.*.bit = 0
+            reader.*.at += 1
+        }
+        left -= take
+    }
+    return value
+}
+
+fn parseMvex(movie: *Movie, moov: [*]const u8, start: usize, end: usize) -> Status {
+    movie.*.fragmented = true
+    var at = start
+    while at < end {
+        var box: Box = undefined
+        if !readBox(moov, at, end, &box) { return Status.corrupt }
+        if box.kind == TREX {
+            if box.contents + 24 > box.end { return Status.corrupt }
+            const index = trackIndex(movie, u32At(moov, box.contents + 4))
+            if index < MAX_TRACKS {
+                const track_ = track(movie, index)
+                track_.*.defaultDuration = u32At(moov, box.contents + 12)
+                track_.*.defaultSize = u32At(moov, box.contents + 16)
+                track_.*.defaultFlags = u32At(moov, box.contents + 20)
+            }
+        }
+        at = box.end
+    }
+    return Status.ok
+}
+
+// ---- A plain file's samples ----
+
+fn resetCursor(track_: *Track) -> void {
+    track_.*.sampleIndex = 0
+    track_.*.timeEntry = 0
+    track_.*.timeLeft = 0
+    track_.*.timeDelta = 0
+    track_.*.compositionEntry = 0
+    track_.*.compositionLeft = 0
+    track_.*.compositionOffset = 0
+    track_.*.chunkIndex = 0
+    track_.*.chunkEntry = 0
+    track_.*.sampleInChunk = 0
+    track_.*.chunkOffset = 0
+    track_.*.dts = 0
+}
+
+fn chunkOffsetAt(movie: *Movie, track_: *Track, chunk: usize) -> u64 {
+    if chunk >= track_.*.offsetTable.count { return 0 }
+    if track_.*.offset64 { return u64At(movie.*.moov, track_.*.offsetTable.at + chunk * 8) }
+    return @intCast(u64, u32At(movie.*.moov, track_.*.offsetTable.at + chunk * 4))
+}
+
+// Samples per chunk for chunk `chunk` (0-based): from the stsc entry
+// in force (entries are 1-based first_chunk ranges).
+fn samplesInChunk(movie: *Movie, track_: *Track, entry: usize) -> usize {
+    if entry >= track_.*.chunkTable.count { return 0 }
+    return @intCast(usize, u32At(movie.*.moov, track_.*.chunkTable.at + entry * 12 + 4))
+}
+
+fn chunkEntryStart(movie: *Movie, track_: *Track, entry: usize) -> usize {
+    return @intCast(usize, u32At(movie.*.moov, track_.*.chunkTable.at + entry * 12))
+}
+
+fn sampleSize(movie: *Movie, track_: *Track, index: usize) -> usize {
+    if track_.*.sizeTable.count == 0 { return @intCast(usize, track_.*.fixedSize) }
+    if index >= track_.*.sizeTable.count { return 0 }
+    return @intCast(usize, u32At(movie.*.moov, track_.*.sizeTable.at + index * 4))
+}
+
+fn isSync(movie: *Movie, track_: *Track, index: usize) -> bool {
+    if track_.*.syncTable.count == 0 { return true }
+    // Binary search for sample number index + 1.
+    const number = @intCast(u32, index + 1)
+    var low: usize = 0
+    var high: usize = track_.*.syncTable.count
+    while low < high {
+        const middle = (low + high) / 2
+        const entry = u32At(movie.*.moov, track_.*.syncTable.at + middle * 4)
+        if entry == number { return true }
+        if entry < number { low = middle + 1 } else { high = middle }
+    }
+    return false
+}
+
+// The next sample of a plain file's track `index` (a cursor per track,
+// from the start; seek() moves it). False at the end.
+pub fn nextSample(movie: *Movie, index: usize, sample: *Sample) -> bool {
+    if index >= movie.*.trackCount { return false }
+    const track_ = track(movie, index)
+    const moov = movie.*.moov
+    const at = track_.*.sampleIndex
+    if at >= track_.*.sampleCount { return false }
+    // Duration from stts.
+    while track_.*.timeLeft == 0 {
+        if track_.*.timeEntry >= track_.*.timeTable.count { return false }
+        track_.*.timeLeft = u32At(moov, track_.*.timeTable.at + track_.*.timeEntry * 8)
+        track_.*.timeDelta = u32At(moov, track_.*.timeTable.at + track_.*.timeEntry * 8 + 4)
+        track_.*.timeEntry += 1
+    }
+    // Composition offset from ctts.
+    while track_.*.compositionLeft == 0 && track_.*.compositionEntry < track_.*.compositionTable.count {
+        const base = track_.*.compositionTable.at + track_.*.compositionEntry * 8
+        track_.*.compositionLeft = u32At(moov, base)
+        track_.*.compositionOffset = signed32(u32At(moov, base + 4), track_.*.compositionVersion == 1)
+        track_.*.compositionEntry += 1
+    }
+    // The chunk: when the current one is used up, the next.
+    if track_.*.sampleInChunk == 0 {
+        // The stsc entry in force for chunkIndex (1-based first_chunk).
+        while track_.*.chunkEntry + 1 < track_.*.chunkTable.count && chunkEntryStart(movie, track_, track_.*.chunkEntry + 1) <= track_.*.chunkIndex + 1 {
+            track_.*.chunkEntry += 1
+        }
+        track_.*.chunkOffset = chunkOffsetAt(movie, track_, track_.*.chunkIndex)
+    }
+    const size = sampleSize(movie, track_, at)
+    sample.*.track = index
+    sample.*.offset = @intCast(usize, track_.*.chunkOffset)
+    sample.*.size = size
+    sample.*.dts = track_.*.dts
+    sample.*.pts = @intCast(i64, track_.*.dts) + track_.*.compositionOffset
+    sample.*.duration = track_.*.timeDelta
+    sample.*.sync = isSync(movie, track_, at)
+    // Advance.
+    track_.*.chunkOffset += @intCast(u64, size)
+    track_.*.sampleInChunk += 1
+    if track_.*.sampleInChunk >= samplesInChunk(movie, track_, track_.*.chunkEntry) {
+        track_.*.sampleInChunk = 0
+        track_.*.chunkIndex += 1
+    }
+    track_.*.dts += @intCast(u64, track_.*.timeDelta)
+    track_.*.timeLeft -= 1
+    if track_.*.compositionLeft > 0 { track_.*.compositionLeft -= 1 }
+    track_.*.sampleIndex = at + 1
+    return true
+}
+
+fn signed32(raw: u32, signed: bool) -> i64 {
+    if signed && raw >= 0x80000000 { return 0 - @intCast(i64, 0x100000000 - @intCast(u64, raw)) }
+    return @intCast(i64, raw)
+}
+
+// Moves track `index`'s cursor to the last sync sample whose decode
+// time is at or before `time` (track timescale), or the first sample.
+pub fn seek(movie: *Movie, index: usize, time: u64) -> void {
+    if index >= movie.*.trackCount { return }
+    const track_ = track(movie, index)
+    resetCursor(track_)
+    var sample: Sample = undefined
+    var saved: Track = track_.*
+    var found = false
+    while nextSample(movie, index, &sample) {
+        if sample.dts > time { break }
+        if sample.sync {
+            // The state before this sample was read is where to go.
+            found = true
+        }
+        if sample.sync { saved = track_.* }
+        // `saved` holds the cursor after the sync sample; step back one.
+    }
+    if !found {
+        resetCursor(track_)
+        return
+    }
+    track_.* = saved
+    // Re-read: the cursor is after the sync sample; move it back by
+    // replaying from the start to its index.
+    const target = saved.sampleIndex - 1
+    resetCursor(track_)
+    while track_.*.sampleIndex < target {
+        if !nextSample(movie, index, &sample) { break }
+    }
+}
+
+// ---- Fragments ----
+
+fn parseMoof(movie: *Movie, bytes: [*]const u8, moofStart: usize, start: usize, end: usize, length: usize, samples: *Samples) -> Status {
+    // First pass: find how far the samples reach; if beyond the bytes
+    // given, the caller must bring more (the mdat is not here yet).
+    var at = start
+    const first = samples.*.count
+    while at < end {
+        var box: Box = undefined
+        if !readBox(bytes, at, end, &box) { return Status.corrupt }
+        if box.kind == 0x6d666864 {
+            if box.contents + 8 > box.end { return Status.corrupt }
+            movie.*.sequence = u32At(bytes, box.contents + 4)
+        } else if box.kind == TRAF {
+            const status = parseTraf(movie, bytes, moofStart, box.contents, box.end, length, samples)
+            if status != Status.ok {
+                samples.*.count = first
+                return status
+            }
+        }
+        at = box.end
+    }
+    return Status.ok
+}
+
+fn parseTraf(movie: *Movie, bytes: [*]const u8, moofStart: usize, start: usize, end: usize, length: usize, samples: *Samples) -> Status {
+    // tfhd first.
+    var at = start
+    var trackSlot: usize = MAX_TRACKS
+    var flags: u32 = 0
+    var base: u64 = @intCast(u64, moofStart)
+    var defaultDuration: u32 = 0
+    var defaultSize: u32 = 0
+    var defaultFlags: u32 = 0
+    var dts: u64 = 0
+    var haveDts = false
+    while at < end {
+        var box: Box = undefined
+        if !readBox(bytes, at, end, &box) { return Status.corrupt }
+        if box.kind == TFHD {
+            if box.contents + 8 > box.end { return Status.corrupt }
+            flags = u32At(bytes, box.contents) & 0xffffff
+            trackSlot = trackIndex(movie, u32At(bytes, box.contents + 4))
+            if trackSlot >= MAX_TRACKS { return Status.corrupt }
+            const track_ = track(movie, trackSlot)
+            defaultDuration = track_.*.defaultDuration
+            defaultSize = track_.*.defaultSize
+            defaultFlags = track_.*.defaultFlags
+            var cursor = box.contents + 8
+            if flags & TF_BASE_DATA_OFFSET != 0 {
+                if cursor + 8 > box.end { return Status.corrupt }
+                base = u64At(bytes, cursor)
+                cursor += 8
+            }
+            if flags & TF_DESCRIPTION != 0 { cursor += 4 }
+            if flags & TF_DEFAULT_DURATION != 0 {
+                if cursor + 4 > box.end { return Status.corrupt }
+                defaultDuration = u32At(bytes, cursor)
+                cursor += 4
+            }
+            if flags & TF_DEFAULT_SIZE != 0 {
+                if cursor + 4 > box.end { return Status.corrupt }
+                defaultSize = u32At(bytes, cursor)
+                cursor += 4
+            }
+            if flags & TF_DEFAULT_FLAGS != 0 {
+                if cursor + 4 > box.end { return Status.corrupt }
+                defaultFlags = u32At(bytes, cursor)
+                cursor += 4
+            }
+            if cursor > box.end { return Status.corrupt }
+        } else if box.kind == TFDT {
+            if box.contents + 8 > box.end { return Status.corrupt }
+            if u8At(bytes, box.contents) == 1 {
+                if box.contents + 12 > box.end { return Status.corrupt }
+                dts = u64At(bytes, box.contents + 4)
+            } else {
+                dts = @intCast(u64, u32At(bytes, box.contents + 4))
+            }
+            haveDts = true
+        }
+        at = box.end
+    }
+    if trackSlot >= MAX_TRACKS { return Status.corrupt }
+    const track_ = track(movie, trackSlot)
+    if !haveDts {
+        dts = track_.*.fragmentDts
+    }
+    if flags & TF_DURATION_IS_EMPTY != 0 {
+        track_.*.fragmentDts = dts
+        track_.*.hasFragmentDts = true
+        return Status.ok
+    }
+    // Then the runs.
+    var offset: u64 = base
+    at = start
+    while at < end {
+        var box: Box = undefined
+        if !readBox(bytes, at, end, &box) { return Status.corrupt }
+        if box.kind == TRUN {
+            if box.contents + 8 > box.end { return Status.corrupt }
+            const runFlags = u32At(bytes, box.contents) & 0xffffff
+            const count = u32At(bytes, box.contents + 4)
+            var cursor = box.contents + 8
+            var runOffset = offset
+            if runFlags & TR_DATA_OFFSET != 0 {
+                if cursor + 4 > box.end { return Status.corrupt }
+                runOffset = @intCast(u64, @intCast(i64, base) + signed32(u32At(bytes, cursor), true))
+                cursor += 4
+            }
+            var firstFlags = defaultFlags
+            if runFlags & TR_FIRST_FLAGS != 0 {
+                if cursor + 4 > box.end { return Status.corrupt }
+                firstFlags = u32At(bytes, cursor)
+                cursor += 4
+            }
+            var entrySize: usize = 0
+            if runFlags & TR_DURATION != 0 { entrySize += 4 }
+            if runFlags & TR_SIZE != 0 { entrySize += 4 }
+            if runFlags & TR_FLAGS != 0 { entrySize += 4 }
+            if runFlags & TR_COMPOSITION != 0 { entrySize += 4 }
+            if entrySize != 0 && @intCast(usize, count) > (box.end - cursor) / entrySize { return Status.corrupt }
+            var index: u32 = 0
+            while index < count {
+                var duration = defaultDuration
+                var size = defaultSize
+                var sampleFlags = if index == 0 { firstFlags } else { defaultFlags }
+                var composition: i64 = 0
+                if runFlags & TR_DURATION != 0 {
+                    duration = u32At(bytes, cursor)
+                    cursor += 4
+                }
+                if runFlags & TR_SIZE != 0 {
+                    size = u32At(bytes, cursor)
+                    cursor += 4
+                }
+                if runFlags & TR_FLAGS != 0 {
+                    sampleFlags = u32At(bytes, cursor)
+                    cursor += 4
+                }
+                if runFlags & TR_COMPOSITION != 0 {
+                    composition = signed32(u32At(bytes, cursor), true)
+                    cursor += 4
+                }
+                if runOffset + @intCast(u64, size) > @intCast(u64, length) { return Status.needMore }
+                var sample: Sample = undefined
+                sample.track = trackSlot
+                sample.offset = @intCast(usize, runOffset)
+                sample.size = @intCast(usize, size)
+                sample.dts = dts
+                sample.pts = @intCast(i64, dts) + composition
+                sample.duration = duration
+                // sample_depends_on == 2 (bits 24-25) or not non-sync.
+                sample.sync = (sampleFlags & 0x10000) == 0
+                if !addSample(samples, sample) { return Status.noMemory }
+                runOffset += @intCast(u64, size)
+                dts += @intCast(u64, duration)
+                index += 1
+            }
+            offset = runOffset
+        }
+        at = box.end
+    }
+    track_.*.fragmentDts = dts
+    track_.*.hasFragmentDts = true
+    return Status.ok
+}
+
+// ---- Codec configuration ----
+
+// Parameter set `index` of an AVC track (the SPSs, then the PPSs) or an
+// HEVC track (the arrays in order: VPS, SPS, PPS as hvcC lists them),
+// without a start code. False when there is no such set.
+pub fn parameterSet(track_: *Track, index: usize, out: *[]const u8) -> bool {
+    const config: [*]const u8 = &track_.*.config
+    const length = track_.*.configLength
+    if track_.*.codec == CODEC_H264 {
+        if length < 6 { return false }
+        var at: usize = 5
+        var count = @intCast(usize, config[at] & 31)
+        at += 1
+        var seen: usize = 0
+        var group: usize = 0
+        while group < 2 {
+            var set: usize = 0
+            while set < count {
+                if at + 2 > length { return false }
+                const size = @intCast(usize, u16At(config, at))
+                at += 2
+                if at + size > length { return false }
+                if seen == index {
+                    out.* = config[at .. at + size]
+                    return true
+                }
+                seen += 1
+                at += size
+                set += 1
+            }
+            group += 1
+            if group == 1 {
+                if at >= length { return false }
+                count = @intCast(usize, config[at])
+                at += 1
+            }
+        }
+        return false
+    }
+    if track_.*.codec == CODEC_H265 {
+        if length < 23 { return false }
+        var at: usize = 22
+        const arrays = @intCast(usize, config[at])
+        at += 1
+        var seen: usize = 0
+        var array: usize = 0
+        while array < arrays {
+            if at + 3 > length { return false }
+            const count = @intCast(usize, u16At(config, at + 1))
+            at += 3
+            var set: usize = 0
+            while set < count {
+                if at + 2 > length { return false }
+                const size = @intCast(usize, u16At(config, at))
+                at += 2
+                if at + size > length { return false }
+                if seen == index {
+                    out.* = config[at .. at + size]
+                    return true
+                }
+                seen += 1
+                at += size
+                set += 1
+            }
+            array += 1
+        }
+        return false
+    }
+    return false
+}
+
+// Turns a length-prefixed AVC/HEVC sample into Annex B form (each NAL
+// unit after a 4-byte start code) in `out` (`capacity` bytes): the
+// bytes written, or 0 when the sample is damaged or `out` too small.
+// annexBSize gives the size needed.
+pub fn annexBSize(track_: *Track, sample: [*]const u8, length: usize) -> usize {
+    const prefix = @intCast(usize, track_.*.nalLengthSize)
+    var at: usize = 0
+    var total: usize = 0
+    while at + prefix <= length {
+        const size = nalLength(sample, at, prefix)
+        at += prefix
+        if size > length - at { return 0 }
+        total += 4 + size
+        at += size
+    }
+    return total
+}
+
+fn nalLength(sample: [*]const u8, at: usize, prefix: usize) -> usize {
+    var size: usize = 0
+    var index: usize = 0
+    while index < prefix {
+        size = (size << 8) | @intCast(usize, sample[at + index])
+        index += 1
+    }
+    return size
+}
+
+pub fn annexB(track_: *Track, sample: [*]const u8, length: usize, out: [*]u8, capacity: usize) -> usize {
+    const prefix = @intCast(usize, track_.*.nalLengthSize)
+    var at: usize = 0
+    var written: usize = 0
+    while at + prefix <= length {
+        const size = nalLength(sample, at, prefix)
+        at += prefix
+        if size > length - at || written + 4 + size > capacity { return 0 }
+        out[written] = 0
+        out[written + 1] = 0
+        out[written + 2] = 0
+        out[written + 3] = 1
+        written += 4
+        var index: usize = 0
+        while index < size {
+            out[written + index] = sample[at + index]
+            index += 1
+        }
+        written += size
+        at += size
+    }
+    return written
+}
+
+// Converts a time in one timescale to another (rounded down).
+pub fn rescale(time: u64, from: u32, to: u32) -> u64 {
+    if from == 0 { return 0 }
+    return (time * @intCast(u64, to)) / @intCast(u64, from)
+}

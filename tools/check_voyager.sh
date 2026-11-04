@@ -119,8 +119,9 @@
 #      textures released on the main thread's run loop, whichever page
 #      asked for them first).
 #
-#   tools/check_voyager.sh [--no-build] [--keep DIR]
+#   tools/check_voyager.sh [--no-build] [--voyager PROGRAM] [--keep DIR]
 #     (--keep: the screenshots and Voyager's log, kept in DIR)
+#     (--voyager: that program checked instead, not built)
 set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -128,9 +129,12 @@ cd "$repo_root"
 fail() { echo "FAIL $1" >&2; exit 1; }
 build=1
 keep=""
+voyager=$repo_root/mlx-out/webkit/mlx/bin/voyager
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-build) build=0 ;;
+        # (Another program checked, linked by hand: implies --no-build.)
+        --voyager) voyager=$(realpath "$2"); build=0; shift ;;
         --keep) keep=$2; shift ;;
         *) echo "FAIL unknown argument $1" >&2; exit 1 ;;
     esac
@@ -142,7 +146,6 @@ if [[ $build -eq 1 ]]; then
     ./mlx build libc webkit-mlx-voyager > /dev/null 2>&1 || fail "./mlx build webkit-mlx-voyager"
     echo "ok   ./mlx build webkit-mlx-voyager"
 fi
-voyager=$repo_root/mlx-out/webkit/mlx/bin/voyager
 [[ -x "$voyager" ]] || fail "$voyager is missing"
 compiler=${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}
 
@@ -511,8 +514,8 @@ for shot in light dark; do
     [[ $scheme == "$expected" ]] || fail "the prefers-color-scheme box is #$scheme, not #$expected, when $shot"
 done
 echo "ok   a switch of the desktop's scheme: the toolbar and the page follow it, without a reload"
-# 13: forced dark mode, following the desktop.
-write_runner "$work/voyager-forced" second.html
+# 13: forced dark mode (on: VOYAGER_FORCE_DARK=1), following the desktop.
+write_runner "$work/voyager-forced" second.html VOYAGER_FORCE_DARK=1
 echo "color-scheme = dark" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
 x0=$page_x0
 y0=$page_y0
@@ -541,6 +544,24 @@ grep -q "^voyager: tab 1 forced dark no$" "$log" || { cat "$log" >&2; fail "the 
 square=$(pixel_of "$work/unforced.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
 [[ $square == ffffff ]] || fail "the square is not white again on a light desktop (#$square)"
 echo "ok   the desktop switched to light: the page is painted as it is again"
+# 13b: forced dark off by default: on a dark desktop a page without a dark
+# design is as it is; Ctrl+Shift+D turns forced dark on (and writes
+# voyager.conf's force-dark).
+write_runner "$work/voyager-unforced" second.html
+echo "color-scheme = dark" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
+rm -f "$XDG_CONFIG_HOME/mlx/voyager.conf"
+printf 'wait 12000\nshot %s\ndown 29\ndown 42\ndown 32\nup 32\nup 42\nup 29\nwait 4000\nshot %s\nclose\n' "$work/plain.ppm" "$work/toggled.ppm" > "$work/toggle.script"
+run_scenario toggle "$work/toggle.script" "$work/voyager-unforced"
+log=$work/voyager.log
+square=$(pixel_of "$work/plain.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
+[[ $square == ffffff ]] || { cat "$log" >&2; fail "second.html was painted dark on a dark desktop with forced dark off (#$square)"; }
+grep -q "^voyager: tab 1 forced dark yes$" "$log" || { cat "$log" >&2; fail "Ctrl+Shift+D did not turn forced dark on"; }
+square=$(pixel_of "$work/toggled.ppm" $(( x0 + 100 )) $(( y0 + 100 )))
+[[ $(lightness_of "$square") == dark ]] || fail "the square is not dark after Ctrl+Shift+D (#$square)"
+grep -q "^force-dark = on$" "$XDG_CONFIG_HOME/mlx/voyager.conf" 2> /dev/null || fail "Ctrl+Shift+D did not write force-dark = on to voyager.conf"
+rm -f "$XDG_CONFIG_HOME/mlx/voyager.conf"
+echo "color-scheme = light" > "$XDG_CONFIG_HOME/mlx/appearance.conf"
+echo "ok   forced dark is off by default (a page without a dark design stays white on a dark desktop); Ctrl+Shift+D turns it on and keeps it in voyager.conf"
 # 14: the internal pages.
 write_runner "$work/voyager-internal" voyager://about
 address_script() {
@@ -820,4 +841,126 @@ else
         echo "ok   tabs of layers opened and closed (the first among them): the share group's textures $idle, $most, then $last again"
     fi
 fi
+# 26: a video playing by itself (media.html: WebKit's test.mp4 of 6 s,
+# H.264 with a silent AAC track, through the port's media engine; no
+# sound server here, so the clock runs by the wall, and no GPU decoder
+# on lavapipe, so std.h264.decode decodes the pictures on the CPU): the
+# page reports playing and the end through its title and its
+# background, and the video's box shows its pictures (test.mp4 is
+# black with white text, a white disc and colour bars).
+write_runner "$work/voyager-media" media.html
+printf 'wait 5000\nshot %s\nwait 9000\nshot %s\nclose\n' "$work/media-playing.ppm" "$work/media-ended.ppm" > "$work/media.script"
+run_scenario media "$work/media.script" "$work/voyager-media"
+log=$work/voyager.log
+grep -q "^voyager: title media:playing" "$log" || { cat "$log" >&2; fail "the video did not start playing (no media:playing title)"; }
+ended=$(grep -o "^voyager: title media:ended:[0-9]*" "$log" | tail -1 | cut -d: -f4)
+[[ -n "$ended" ]] && (( ended >= 5 && ended <= 7 )) || { cat "$log" >&2; fail "the video did not end at its 6 s (${ended:-no end})"; }
+playing=$(box_of "$work/media-playing.ppm" 00c000)
+[[ -n "$playing" ]] || fail "the page was not green while the video played"
+ended_box=$(box_of "$work/media-ended.ppm" 0000c0)
+[[ -n "$ended_box" ]] || fail "the page was not blue after the video ended"
+frame=$(box_of "$work/media-playing.ppm" 000000)
+read -r fx fy fw fh <<< "$frame"
+[[ -n "$frame" ]] && (( fw >= 300 && fh >= 220 )) || fail "no video box of 320x240 in the screenshot (its black: ${frame:-none})"
+decoded=$(python3 -I - "$work/media-playing.ppm" "$fx" "$fy" "$fw" "$fh" << 'EOF'
+import sys
+path = sys.argv[1]
+x0, y0, w, h = (int(v) for v in sys.argv[2:6])
+data = open(path, "rb").read()
+fields, at = [], 0
+while len(fields) < 4:
+    while data[at:at + 1].isspace():
+        at += 1
+    if data[at:at + 1] == b"#":
+        at = data.index(b"\n", at)
+        continue
+    end = at
+    while not data[end:end + 1].isspace():
+        end += 1
+    fields.append(data[at:end])
+    at = end
+width = int(fields[1])
+pixels = data[at + 1:]
+white = yellow = 0
+for y in range(y0, y0 + h):
+    for x in range(x0, x0 + w):
+        r, g, b = pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+        if r > 200 and g > 200 and b > 200:
+            white += 1
+        elif r > 150 and g > 150 and b < 90:
+            yellow += 1
+print(white, yellow)
+EOF
+)
+read -r white yellow <<< "$decoded"
+(( white >= 1000 && yellow >= 100 )) || fail "the video's box does not show its pictures (${white:-?} white and ${yellow:-?} yellow pixels; the CPU's decoder did not run?)"
+echo "ok   a video plays by itself and ends at $ended s: the page green then blue, the video's box ${fw}x${fh} showing its pictures (decoded on the CPU)"
+# 26b: an H.265 video playing by itself (hevc.html: 3 s of testsrc,
+# 320x240, hvc1; no GPU decoder on lavapipe, so std.h265.decode decodes
+# it on the CPU): the page reports playing and the end through its title
+# and its background, and the video's box shows its colour bars (red and
+# blue pixels in the page, which is green while it plays).
+write_runner "$work/voyager-hevc" hevc.html
+printf 'wait 3000\nshot %s\nwait 6000\nshot %s\nclose\n' "$work/hevc-playing.ppm" "$work/hevc-ended.ppm" > "$work/hevc.script"
+run_scenario hevc "$work/hevc.script" "$work/voyager-hevc"
+log=$work/voyager.log
+grep -q "^voyager: title hevc:playing" "$log" || { cat "$log" >&2; fail "the H.265 video did not start playing (no hevc:playing title)"; }
+ended=$(grep -o "^voyager: title hevc:ended:[0-9]*" "$log" | tail -1 | cut -d: -f4)
+[[ -n "$ended" ]] && (( ended >= 2 && ended <= 4 )) || { cat "$log" >&2; fail "the H.265 video did not end at its 3 s (${ended:-no end})"; }
+page=$(box_of "$work/hevc-playing.ppm" 00c000)
+read -r px py pw ph <<< "$page"
+[[ -n "$page" ]] || fail "the page was not green while the H.265 video played"
+[[ -n "$(box_of "$work/hevc-ended.ppm" 0000c0)" ]] || fail "the page was not blue after the H.265 video ended"
+decoded=$(python3 -I - "$work/hevc-playing.ppm" "$px" "$py" "$pw" "$ph" << 'EOF'
+import sys
+path = sys.argv[1]
+x0, y0, w, h = (int(v) for v in sys.argv[2:6])
+data = open(path, "rb").read()
+fields, at = [], 0
+while len(fields) < 4:
+    while data[at:at + 1].isspace():
+        at += 1
+    if data[at:at + 1] == b"#":
+        at = data.index(b"\n", at)
+        continue
+    end = at
+    while not data[end:end + 1].isspace():
+        end += 1
+    fields.append(data[at:end])
+    at = end
+width = int(fields[1])
+pixels = data[at + 1:]
+red = blue = 0
+for y in range(y0, y0 + h):
+    for x in range(x0, x0 + w):
+        r, g, b = pixels[(y * width + x) * 3:(y * width + x) * 3 + 3]
+        if r > 180 and g < 80 and b < 80:
+            red += 1
+        elif b > 180 and r < 80 and g < 80:
+            blue += 1
+print(red, blue)
+EOF
+)
+read -r red blue <<< "$decoded"
+(( red >= 500 && blue >= 500 )) || fail "the H.265 video's box does not show its pictures (${red:-?} red and ${blue:-?} blue pixels; the CPU's H.265 decoder did not run?)"
+echo "ok   an H.265 video plays by itself and ends at $ended s: the page green then blue, the video showing its colour bars (decoded on the CPU by std.h265.decode)"
+# 27: typing into text areas (edit.html) and a Backspace in each: the
+# delete command copies the computed font-family into the typing style,
+# which asks the CSS value pool for each family. The top area's font is
+# sans-serif, as Google's search box (WebCore's name tables must be
+# initialized: a generic family that was a null string was the pool's
+# key, Voyager dying on the first Backspace in Google's search box); the
+# bottom one's -webkit-body, as YouTube's (the page settings' standard
+# family: empty, it was a null family, Voyager dying on a Backspace in
+# YouTube's search box). The page's title tells the text after each
+# change.
+write_runner "$work/voyager-edit" edit.html
+printf 'wait 5000\npointer %d %d\npress 272\nrelease 272\nwait 800\ntype ab\nwait 800\ndown 14\nup 14\nwait 1500\npointer %d %d\npress 272\nrelease 272\nwait 800\ntype cd\nwait 800\ndown 14\nup 14\nwait 1500\nclose\n' $(( page_x0 + 300 )) $(( page_y0 + 100 )) $(( page_x0 + 300 )) $(( page_y0 + 500 )) > "$work/edit.script"
+run_scenario edit "$work/edit.script" "$work/voyager-edit"
+log=$work/voyager.log
+grep -q "^voyager: title edit:top:ab$" "$log" || { cat "$log" >&2; fail "typing into the top text area did not reach it (no edit:top:ab title)"; }
+grep -q "^voyager: title edit:top:a$" "$log" || { cat "$log" >&2; fail "Backspace did not delete the top area's last character (no edit:top:a title)"; }
+grep -q "^voyager: title edit:bottom:cd$" "$log" || { cat "$log" >&2; fail "typing into the bottom (-webkit-body) text area did not reach it (no edit:bottom:cd title)"; }
+grep -q "^voyager: title edit:bottom:c$" "$log" || { cat "$log" >&2; fail "Backspace did not delete the bottom (-webkit-body) area's last character (no edit:bottom:c title)"; }
+echo "ok   typing into text areas of a generic family and of -webkit-body and a Backspace in each (the typing style's font-family)"
 echo "check_voyager.sh: all checks passed"

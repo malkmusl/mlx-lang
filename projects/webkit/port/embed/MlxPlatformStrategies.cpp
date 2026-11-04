@@ -11,6 +11,10 @@
 #include "LocalFrame.h"
 #include "MIMETypeRegistry.h"
 #include "MediaStrategy.h"
+#if ENABLE(VIDEO)
+#include "MediaPlayer.h"
+#include "MediaPlayerPrivateMlx.h"
+#endif
 #include "NetworkLoadMetrics.h"
 #include "ResourceError.h"
 #include "ResourceHandle.h"
@@ -23,6 +27,7 @@
 #include "Document.h"
 #include "OriginAccessPatterns.h"
 #include "ProcessCapabilities.h"
+#include "ProcessWarming.h"
 #include "SecurityOrigin.h"
 #include "port/MlxWebPort.h"
 #include "port/platform/graphics/mlx/MlxSkiaRoutines.h"
@@ -298,11 +303,23 @@ void MlxPlatformStrategies::initialize()
 {
     static MlxPlatformStrategies* strategies = new MlxPlatformStrategies;
     setPlatformStrategies(strategies);
+    // WebCore's name tables, the generic font families among them
+    // (WebKitFontFamilyNames: without init() `sans-serif` is a null
+    // family, which the typing style's copy of the computed
+    // font-family handed the CSS value pool as a key, Voyager dying on
+    // a Backspace in Google's search box), as WebKit's process warming
+    // does before any page.
+    ProcessWarming::initializeNames();
     // (Every buffer of the process on the CPU: no GPU is used, so the
     // layers' tiles and images are raster ones, PORT.md "Compositing".)
     ProcessCapabilities::setCanUseAcceleratedBuffers(false);
     // (Skia's row blends and fills, the port's: SkiaRoutinesMlx.cpp.)
     installMlxSkiaRoutines();
+#if ENABLE(VIDEO)
+    // The media engine (MP4, AAC, H.264 over the Mlx side; PORT.md,
+    // "Media"), registered before any player asks for one.
+    MediaPlayerFactorySupport::callRegisterMediaEngine(MediaPlayerPrivateMlx::registerMediaEngine);
+#endif
 }
 
 LoaderStrategy* MlxPlatformStrategies::createLoaderStrategy()

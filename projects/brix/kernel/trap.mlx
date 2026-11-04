@@ -1,0 +1,305 @@
+// Traps: the boot blob's common trap path calls brix_trap with the frame
+// it made. System calls go to the system; a call that waits, or a
+// process that ends, lets the next process run (its registers into the
+// frame). Interrupts: the timer, in user mode, ends the time slice; the
+// serial line's bytes go to the terminal (Ctrl-C: SIGINT to the
+// foreground group). Page faults in a process's regions get their page;
+// its other faults raise their signal (SIGSEGV, SIGILL, ...); the
+// kernel's halt the processor. On the way back to user mode the
+// process's signals are delivered: its handler, or the default action
+// (a process ended: the next one runs; the shell is started again).
+// Every entry takes the kernel lock (smp.mlx): the kernel runs on one
+// processor at a time. brix_ap is another processor's entry: it runs
+// the kernel from then on, its time slices by its local APIC's timer.
+const cpu = @import("./cpu.mlx")
+const smp = @import("./smp.mlx")
+const layout = @import("../layout.mlx")
+const console = @import("./console.mlx")
+const scheduler = @import("./scheduler.mlx")
+const system = @import("./linux/system.mlx")
+const native = @import("./native/calls.mlx")
+const call = @import("./call.mlx")
+const status_module = @import("./status.mlx")
+const shell = @import("./shell.mlx")
+const wait = @import("./wait.mlx")
+const frame_module = @import("./frame.mlx")
+const Frame = frame_module.Frame
+const Exception = frame_module.Exception
+const Process = @import("./process.mlx").Process
+const events = @import("./events.mlx")
+const Event = events.Event
+const Ending = events.Ending
+const terminal = @import("./terminal.mlx")
+const virtio = @import("./virtio.mlx")
+const virtionet = @import("./virtionet.mlx")
+const stack = @import("./net/stack.mlx")
+const Irq = @import("./interrupts.mlx").Irq
+const signals = @import("./linux/signals.mlx")
+const Signal = signals.Signal
+const Signals = signals.Signals
+
+export fn brix_trap(address: usize) -> void {
+    const frame = Frame.at(address)
+    const id = cpu.Cpu.id()
+    smp.lock(id)
+    handle(frame)
+    // Back to user mode: the events the process can take now.
+    deliver(frame)
+    // A process another processor could run: an idle one woken.
+    scheduler.processes().kickIdle()
+    smp.unlock()
+}
+
+// Another processor's entry (its number `id`; from the boot blob, on its
+// trap stack below the room for a frame): it takes the kernel, starts
+// its timer and runs the next process that can go on (a frame for it at
+// the top of its trap stack, entered as the trap path returns), idling
+// until there is one.
+export fn brix_ap(id: usize) -> void {
+    smp.lock(id)
+    smp.joined(id)
+    console.out.write("brixOS: processor ")
+    console.out.decimal(id)
+    console.out.write(" runs\n")
+    smp.startTimer()
+    const top = cpu.BootInfo.perCpu(layout.PerCpu.TRAP_STACK)
+    const frame = Frame.at(top - @sizeOf(Frame))
+    const table = scheduler.processes()
+    while true {
+        if table.switchTo(frame) {
+            deliver(frame)
+            // This path's arena allocations go with it (nothing of them
+            // is used from here on).
+            smp.resetArena(id)
+            smp.unlock()
+            cpu.Cpu.resume(@intFromPtr(frame) - frame_module.Sse.SIZE)
+        }
+        smp.rest(id, true)
+        smp.unlock()
+        cpu.Cpu.wait()
+        smp.lock(id)
+        smp.rest(id, false)
+    }
+}
+
+fn handle(frame: *Frame) -> void {
+    const table = scheduler.processes()
+    const p = table.running()
+    if frame.isSystemCall() {
+        const number = frame.*.rax
+        // brixOS's own calls, or Linux's (the translation layer).
+        if native.isNative(number) {
+            after(frame, p, number, native.calls().handle(frame, p))
+        } else {
+            after(frame, p, number, system.system().handle(frame, p))
+        }
+        return
+    }
+    // A page fault in a process's memory (also the kernel's, writing to
+    // a copy-on-write page of the process for a system call).
+    if frame.*.vector == Exception.PAGE_FAULT && p.fault(cpu.Cpu.faultAddress(), frame.*.code & Exception.WRITE != 0) { return }
+    const irq = Irq.of(frame.*.vector)
+    if irq < Irq.COUNT {
+        interrupt(frame, irq)
+        return
+    }
+    // This processor's local APIC timer: its time slice is over.
+    if frame.*.vector == layout.Vector.LAPIC_TIMER {
+        smp.endOfInterrupt()
+        if frame.fromUser() { next(frame, table.preempt(frame)) }
+        return
+    }
+    // Woken (it idled: its idle loop looks for the process).
+    if frame.*.vector == layout.Vector.WAKE {
+        smp.endOfInterrupt()
+        return
+    }
+    if frame.*.vector >= Exception.COUNT { return }
+    // A fault of the program: the fault event (its detail the processor's
+    // exception), which its upcall may take, or, in the Linux layer's
+    // view, its signal (SIGSEGV, SIGILL, SIGFPE, ...) for a handler; a
+    // report on the console when it ends the program.
+    if frame.fromUser() {
+        const address = if frame.*.vector == Exception.PAGE_FAULT { cpu.Cpu.faultAddress() } else { frame.*.rip }
+        if p.*.events.native {
+            if p.*.events.isClaimed(Event.FAULT) && p.*.events.upcallEntry != 0 && !p.*.events.inUpcall {
+                p.*.events.add(events.Record.{ .kind = Event.FAULT, .detail = @intCast(u32, frame.*.vector), .sender = 0, .reserved = @intCast(u32, address & 0xFFFFFFFF) })
+                return
+            }
+            frame.report()
+            end(frame, p, Ending.event(Event.FAULT, @intCast(u32, frame.*.vector)))
+            return
+        }
+        const number = signals.ofException(frame.*.vector)
+        p.*.signals.force(number, address)
+        if !p.*.signals.caught(number) { frame.report() }
+        return
+    }
+    frame.report()
+    while true { cpu.Cpu.wait() }
+}
+
+// What follows a system call: the process goes on, waits (the next one
+// runs), or ended.
+fn after(frame: *Frame, p: *Process, number: usize, outcome: call.Outcome) -> void {
+    const table = scheduler.processes()
+    match outcome.kind {
+        .done => {},
+        .replaced => {},
+        .blocked => next(frame, table.suspend(frame, outcome.waiting, number)),
+        .yielded => next(frame, table.suspend(frame, wait.Wait.none(), number)),
+        .exited => end(frame, p, Ending.exit(outcome.status)),
+        .ended => next(frame, table.switchTo(frame))
+    }
+}
+
+// The events of the process returning to user mode in `frame`, and of
+// the next ones when it stops or ends. The first process, the shell, is
+// ended only by its faults (it starts again) and never stops.
+fn deliver(frame: *Frame) -> void {
+    const table = scheduler.processes()
+    while frame.fromUser() {
+        const p = table.running()
+        const goOn = if p.*.events.native { deliverNative(frame, p) } else { deliverLinux(frame, p) }
+        if !goOn {
+            p.*.inCall = false
+            return
+        }
+    }
+}
+
+// A native process's events: a claimed one runs the upcall (it stays
+// queued for events_take), the others their default action. Whether to
+// look again (at this process or the one that runs now).
+fn deliverNative(frame: *Frame, p: *Process) -> bool {
+    const table = scheduler.processes()
+    const index = p.*.events.next()
+    if index == p.*.events.count { return false }
+    const record = p.*.events.queue[index]
+    if p.*.events.isClaimed(record.kind) {
+        // A call the upcall interrupts ends: interrupted.
+        if p.*.inCall {
+            frame.*.rax = @bitCast(usize, -status_module.Status.code(status_module.Status.interrupted))
+            frame.*.rip += 2
+            p.*.inCall = false
+        }
+        const base = p.*.events.contextAt()
+        if base != 0 && p.prepare(base, events.Events.CONTEXT_SIZE) {
+            p.*.events.enter(frame, base)
+            return false
+        }
+        // No stack for the upcall: the program ends as by a fault.
+        end(frame, p, Ending.event(Event.FAULT, 0))
+        return true
+    }
+    _ = p.*.events.removeAt(index)
+    if record.kind == Event.FAULT {
+        end(frame, p, Ending.event(record.kind, record.detail))
+    } else if Event.ignoredByDefault(record.kind) || p.*.pid == scheduler.Scheduler.FIRST_PID {
+        // Nothing.
+    } else if Event.stops(record.kind) {
+        p.*.inCall = false
+        next(frame, table.stop(frame, record.kind, record.detail))
+    } else {
+        end(frame, p, Ending.event(record.kind, record.detail))
+    }
+    return true
+}
+
+// The Linux layer's view: the lowest signal the process can take now;
+// its handler runs (on an rt_sigframe), or its default action: nothing,
+// the process stops (job control) or ends.
+fn deliverLinux(frame: *Frame, p: *Process) -> bool {
+    const table = scheduler.processes()
+    const fault = p.*.signals.faulted()
+    const number = p.*.signals.take()
+    if number == 0 { return false }
+    const event = signals.eventOf(number)
+    if p.*.signals.caught(number) {
+        const call = frame.*.rax
+        p.*.signals.endCall(frame, number, call == system.Number.PAUSE || call == system.Number.RT_SIGSUSPEND, &p.*.inCall)
+        // A native call says so in its own status.
+        if native.isNative(call) && frame.*.rax == @bitCast(usize, @intCast(isize, -4)) { frame.*.rax = @bitCast(usize, -status_module.Status.code(status_module.Status.interrupted)) }
+        const base = p.*.signals.place(frame, number)
+        if base != 0 && p.prepare(base, Signals.extent(base)) {
+            p.*.signals.enter(frame, number, base)
+            return false
+        }
+        // No room for the frame (or no restorer): the program ends as by
+        // SIGSEGV.
+        const segv = signals.eventOf(Signal.SEGV)
+        end(frame, p, Ending.event(segv.kind, segv.detail))
+    } else if fault == number {
+        end(frame, p, Ending.event(event.kind, event.detail))
+    } else if p.*.pid == scheduler.Scheduler.FIRST_PID || p.*.signals.ignoredNow(number) {
+        // Nothing (the shell neither ends nor stops by a signal).
+    } else if p.*.signals.stopsNow(number) {
+        p.*.inCall = false
+        next(frame, table.stop(frame, event.kind, event.detail))
+    } else {
+        end(frame, p, Ending.event(event.kind, event.detail))
+    }
+    return true
+}
+
+// An interrupt: in the kernel (it waits in the idle loop) only taken
+// note of; in user mode, the running process may give way.
+fn interrupt(frame: *Frame, irq: usize) -> void {
+    if Irq.spurious(irq) { return }
+    const table = scheduler.processes()
+    if irq == Irq.TIMER {
+        Irq.acknowledge(irq)
+        stack.tick()
+        if frame.fromUser() { next(frame, table.preempt(frame)) }
+        return
+    }
+    // The network device's.
+    if virtionet.device().*.present && virtionet.device().*.irq == irq && virtionet.device().interrupted() {
+        Irq.acknowledge(irq)
+        return
+    }
+    // A disk's (every disk on the line asked: they may share one).
+    var which: usize = 0
+    var disks = false
+    while which < virtio.count() {
+        if virtio.diskAt(which).*.irq == irq {
+            _ = virtio.diskAt(which).interrupted()
+            disks = true
+        }
+        which += 1
+    }
+    if disks {
+        Irq.acknowledge(irq)
+        return
+    }
+    if irq == Irq.SERIAL {
+        terminal.serialConsole().receive()
+        Irq.acknowledge(irq)
+        // Ctrl-C, Ctrl-\, Ctrl-Z: their events to the foreground group
+        // (delivered on the way back to user mode; in the idle loop, the
+        // scheduler sends them).
+        if frame.fromUser() { table.terminalSignals() }
+        return
+    }
+    Irq.acknowledge(irq)
+}
+
+// The process `p` ended (`ending`): the next one runs, or the shell
+// starts again when it was the shell.
+fn end(frame: *Frame, p: *Process, ending: Ending) -> void {
+    if p.*.pid == scheduler.Scheduler.FIRST_PID {
+        console.out.write("brixOS: the shell ended (")
+        console.out.decimal(if ending.exited { ending.code } else { 128 + signals.numberOf(ending.kind, ending.detail) })
+        console.out.write(")\n")
+        shell.restart(frame)
+        return
+    }
+    const table = scheduler.processes()
+    table.terminate(p, ending)
+    next(frame, table.switchTo(frame))
+}
+
+// After a switch: when no process could run, the shell starts over.
+fn next(frame: *Frame, switched: bool) -> void {
+    if !switched { shell.restart(frame) }
+}

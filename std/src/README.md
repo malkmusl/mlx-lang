@@ -68,6 +68,29 @@ process group.
 WPA2 needs (`tools/check_wifi.sh`); and AES-128/192/256 bitsliced in
 constant time, four blocks at once, for TLS.
 
+`mp4.mlx` (`std.mp4`) reads MP4 (ISO base media) files and MSE segments:
+the tracks (H.264, H.265, VP9, AV1, AAC, Opus) with their codec
+configuration (avcC/hvcC parameter sets, AudioSpecificConfig), a plain
+file's samples from its sample tables with seeking to sync samples, a
+fragmented file's samples from each `moof`+`mdat` (test 416;
+tests/support/mp4_corpus.py makes the files).
+
+`aac.mlx` (`std.aac`) decodes AAC-LC (MPEG-4 audio object type 2, the
+`mp4a.40.2` of YouTube and MP4 files): every tool of the LC profile
+(channel pairs, M/S and intensity stereo, PNS, TNS, pulses, the four
+window sequences with sine and KBD windows, the IMDCT through a
+quarter-size FFT) from an AudioSpecificConfig or ADTS; HE-AAC's SBR is
+read past (test 417, against the WAV a Chromium test sound was encoded
+from). `aac/tables.mlx` holds the standard's codebooks and band tables.
+
+`h264.mlx` (`std.h264`) reads H.264 streams for a decoder that is given
+whole pictures (the GPU's through Vulkan video, or a software one):
+NAL units in Annex B or length-prefixed framing, SPS and PPS into the
+Vulkan video registry's structures (`std.vulkan.video`), slice headers,
+and the process around pictures: picture order counts, reference
+marking (sliding window and MMCO), the decoded picture buffer's slots
+and the output order (test 418 on WebKit's test.mp4). Frames only.
+
 `flate/gzip.mlx` (`std.flate.gzip`) reads and writes gzip files in
 pieces for Mlx programs, what zlib's gz* functions do (test 385).
 
@@ -141,7 +164,12 @@ yescrypt ($y$, Ubuntu's default) and scrypt ($7$) ones,
 `tools/check_crypt.sh` compares it with the system's crypt(3).
 `vulkan.mlx` (`std.vulkan`) is the Vulkan API, materialized from
 `std/registry/vulkan/vk.xml` by `vulkan/registry.mlx` and
-`vulkan/materialize.mlx` — do not edit it by hand. `vulkan/loader.mlx`
+`vulkan/materialize.mlx` — do not edit it by hand; it includes the video
+decoding extensions (VK_KHR_video_queue, video_decode_queue,
+video_decode_h264, video_decode_h265), whose StdVideo* parameter
+structures are `vulkan/video.mlx` (`std.vulkan.video`, materialized from
+`std/registry/vulkan/video.xml` by `video_materialize.py`, the layouts
+checked against the C headers). `vulkan/loader.mlx`
 (`std.vulkan.loader`) finds and opens drivers without a C loader, and
 `vulkan/icd.mlx` (`std.vulkan.icd`) is the driver side of that interface.
 `spirv/core.mlx` (`std.spirv.core`, generated from
@@ -149,9 +177,17 @@ yescrypt ($y$, Ubuntu's default) and scrypt ($7$) ones,
 `spirv/module.mlx` write, read and validate SPIR-V, and
 `spirv/compute.mlx` (`std.spirv.compute`) declares compute kernels.
 `gpu.mlx` (`std.gpu`) runs compute kernels on pixel buffers (one device and
-queue, dma-buf and host-memory sharing), with `gpu/shaders.mlx`
+queue, dma-buf and host-memory sharing, the device's video decode queue
+when asked for), with `gpu/shaders.mlx`
 (`std.gpu.shaders`), `gpu/text.mlx` (`std.gpu.text`) and
-`gpu/swapchain.mlx` (`std.gpu.swapchain`). See `docs/reference/vulkan.md`.
+`gpu/swapchain.mlx` (`std.gpu.swapchain`). `gpu/video.mlx`
+(`std.gpu.video`) decodes the H.264 pictures `std.h264` reads on the
+GPU's video decoder (VK_KHR_video_decode_h264: a session per stream, the
+DPB as one layered image, the slices in a bitstream buffer) and reads
+the frames back as BGRA (NV12 converted by the `nv12` kernel of
+`gpu/video_shader.mlx`, or on the host; test 419 on lavapipe,
+`examples/vulkan-decode` on a decoding device). See
+`docs/reference/vulkan.md`.
 
 `truetype.mlx` (`std.truetype`) and `truetype/` are the font engine:
 TrueType and OpenType (CFF, CFF2) fonts, variable and color fonts, read

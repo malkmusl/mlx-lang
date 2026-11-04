@@ -1,0 +1,1385 @@
+// std.aac: decodes AAC-LC (MPEG-4 Part 3, ISO/IEC 14496-3, audio object
+// type 2: what YouTube, MP4 files and HLS streams carry as mp4a.40.2)
+// into interleaved floating-point samples: each raw data block (one
+// sample of an MP4 track, or one ADTS frame) gives 1024 samples per
+// channel.
+//
+//     const d = aac.create(allocator)                  (it is large)
+//     aac.configure(d, config, length)                 (the AudioSpecificConfig)
+//     var pcm: [2048]f32 = undefined
+//     if aac.decode(d, bytes, length, &pcm) == aac.Status.ok { ... d.*.channels }
+//     aac.destroy(d)
+//
+// The tools of the LC profile: single and paired channel elements, LFE,
+// the twelve Huffman codebooks with their escapes, scalefactors, pulse
+// data, M/S and intensity stereo, perceptual noise substitution, temporal
+// noise shaping, the long, start, eight-short and stop window sequences
+// with sine and Kaiser-Bessel windows, the inverse MDCT through a
+// quarter-size FFT. Program configs (PCE), data streams (DSE) and fill
+// elements (FIL) are read past; the SBR of HE-AAC in fill elements is
+// not decoded (the core plays at its own rate). Main/LTP prediction,
+// coupling channels and gain control are refused as unsupported.
+//
+// Samples come out in [-1, 1]; a track's rate and channels are the
+// decoder's after configure().
+const allocator_module = @import("../bootstrap/allocator.mlx")
+const math = @import("./math.mlx")
+const tables = @import("./aac/tables.mlx")
+
+pub const Allocator = allocator_module.Allocator
+
+pub const FRAME: usize = 1024
+pub const MAX_CHANNELS: usize = 8
+
+pub const Status = enum(u8) {
+    ok,
+    // The decoder is not configured, or the frame is damaged (a bad
+    // code, a read past its end, an element that cannot be).
+    corrupt,
+    unsupported,
+    noMemory
+}
+
+const MAX_BANDS: usize = 52
+const MAX_GROUPS: usize = 8
+const SFB_SLOTS: usize = MAX_GROUPS * MAX_BANDS
+const TNS_MAX_ORDER: usize = 20
+const NODE_CAPACITY: usize = 4096
+
+const ZERO_HCB: u8 = 0
+const FIRST_PAIR_HCB: u8 = 5
+const ESC_HCB: u8 = 11
+const NOISE_HCB: u8 = 13
+const INTENSITY_HCB2: u8 = 14
+const INTENSITY_HCB: u8 = 15
+
+const ONLY_LONG: u8 = 0
+const LONG_START: u8 = 1
+const EIGHT_SHORT: u8 = 2
+const LONG_STOP: u8 = 3
+
+// What is read of one channel's stream in a frame.
+const Ics = struct {
+    windowSequence: u8
+    windowShape: u8
+    maxSfb: usize
+    groups: usize
+    groupLength: [MAX_GROUPS]u8
+    // The band edges of this window kind: tables index and count.
+    bandStart: usize
+    bands: usize
+    short: bool
+    globalGain: u32
+    codebook: [SFB_SLOTS]u8
+    // The gain of each (group, band): 2^((sf - 100) / 4) / 32768 for
+    // spectral bands, the noise energy's for PNS bands, 2^(-position / 4)
+    // for intensity bands.
+    gain: [SFB_SLOTS]f32
+    quantized: [FRAME]i32
+    spectrum: [FRAME]f32
+    pulsePresent: bool
+    pulseCount: usize
+    pulseStartBand: usize
+    pulseOffset: [4]u32
+    pulseAmplitude: [4]u32
+    tnsPresent: bool
+    tnsFilters: [MAX_GROUPS]u8
+    tnsLength: [MAX_GROUPS * 4]u8
+    tnsOrder: [MAX_GROUPS * 4]u8
+    tnsDirection: [MAX_GROUPS * 4]bool
+    tnsCoef: [MAX_GROUPS * 4 * TNS_MAX_ORDER]f32
+}
+
+// A channel's state across frames.
+const Channel = struct {
+    overlap: [FRAME]f32
+    previousShape: u8
+}
+
+const Reader = struct {
+    bytes: [*]const u8
+    length: usize
+    // The bit position.
+    at: usize
+    failed: bool
+}
+
+pub const Decoder = struct {
+    allocator: Allocator
+    configured: bool
+    samplingIndex: usize
+    rate: u32
+    channelConfig: u32
+    // Channels the last frame had (what decode() wrote).
+    channels: usize
+    channelState: [MAX_CHANNELS]Channel
+    a: Ics
+    b: Ics
+    msMaskPresent: bool
+    msUsed: [SFB_SLOTS]bool
+    // Huffman trees: node n's children at nodes[2n], nodes[2n + 1]; 0 is
+    // no child, 0x8000 | entry a leaf.
+    nodes: [NODE_CAPACITY * 2]u16
+    nodeCount: usize
+    roots: [12]u16
+    iq: [8192]f32
+    gains: [256]f32
+    sineLong: [1024]f32
+    kbdLong: [1024]f32
+    sineShort: [128]f32
+    kbdShort: [128]f32
+    // The 512-point FFT's twiddles (the 64-point one uses every eighth)
+    // and bit reversals; the DCT-IV twiddles of both sizes.
+    twiddleCos: [256]f32
+    twiddleSin: [256]f32
+    reverse512: [512]u16
+    reverse64: [64]u16
+    dctCosLong: [512]f32
+    dctSinLong: [512]f32
+    dctCosShort: [64]f32
+    dctSinShort: [64]f32
+    // TNS coefficients by 2 * coef_compress + coef_res, then the code
+    // (4.6.9.3: sin(q pi / (2^R - 1)) for q >= 0, sin(q pi / (2^R + 1))
+    // below, q the code as a signed value, R = coef_res + 3).
+    tnsTable: [64]f32
+    // Work: the IMDCT's complex values, its DCT-IV and output; the
+    // frame's channels before interleaving.
+    work: [1024]f32
+    dct: [1024]f32
+    buffer: [2048]f32
+    planar: [MAX_CHANNELS * FRAME]f32
+    noiseState: u32
+}
+
+pub fn create(allocator: Allocator) -> ?*Decoder {
+    const memory = allocator.alloc(@sizeOf(Decoder), 16)
+    if memory == null { return null }
+    var d: *Decoder = undefined
+    unsafe { d = @ptrCast(*Decoder, memory.?) }
+    d.*.allocator = allocator
+    d.*.configured = false
+    d.*.channels = 0
+    d.*.noiseState = 0x1f2e3d4c
+    var channel: usize = 0
+    while channel < MAX_CHANNELS {
+        d.*.channelState[channel].previousShape = 0
+        var index: usize = 0
+        while index < FRAME {
+            d.*.channelState[channel].overlap[index] = 0.0
+            index += 1
+        }
+        channel += 1
+    }
+    buildTrees(d)
+    buildTables(d)
+    buildTnsTable(d)
+    return d
+}
+
+pub fn destroy(d: *Decoder) -> void {
+    unsafe { d.*.allocator.free(@ptrCast([*]u8, d), @sizeOf(Decoder), 16) }
+}
+
+// Forgets the overlap of earlier frames (after a seek).
+pub fn reset(d: *Decoder) -> void {
+    var channel: usize = 0
+    while channel < MAX_CHANNELS {
+        var index: usize = 0
+        while index < FRAME {
+            d.*.channelState[channel].overlap[index] = 0.0
+            index += 1
+        }
+        channel += 1
+    }
+}
+
+var SAMPLING_RATES = [13]u32{96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350}
+
+// Configures the decoder from an AudioSpecificConfig (an MP4 track's
+// esds, std.mp4's Track.config). HE-AAC (object types 5 and 29) is
+// taken as its LC core.
+pub fn configure(d: *Decoder, config: [*]const u8, length: usize) -> Status {
+    var reader = Reader.{ .bytes = config, .length = length, .at = 0, .failed = false }
+    var objectType = readBits(&reader, 5)
+    if objectType == 31 { objectType = 32 + readBits(&reader, 6) }
+    var frequencyIndex = readBits(&reader, 4)
+    var rate: u32 = 0
+    if frequencyIndex == 15 { rate = readBits(&reader, 24) }
+    const channelConfig = readBits(&reader, 4)
+    if objectType == 5 || objectType == 29 {
+        // The extension's rate is the one SBR would make; the core plays
+        // at the base rate read above.
+        const extensionIndex = readBits(&reader, 4)
+        if extensionIndex == 15 { _ = readBits(&reader, 24) }
+        objectType = readBits(&reader, 5)
+    }
+    if reader.failed { return Status.corrupt }
+    if objectType != 2 { return Status.unsupported }
+    if frequencyIndex == 15 {
+        // The nearest table entry decides the band tables.
+        frequencyIndex = 0
+        var best: u32 = 0xffffffff
+        var index: u32 = 0
+        while index < 12 {
+            const table = SAMPLING_RATES[@intCast(usize, index)]
+            const distance = if table > rate { table - rate } else { rate - table }
+            if distance < best {
+                best = distance
+                frequencyIndex = index
+            }
+            index += 1
+        }
+    } else if frequencyIndex > 12 {
+        return Status.corrupt
+    } else {
+        rate = SAMPLING_RATES[@intCast(usize, frequencyIndex)]
+    }
+    if frequencyIndex == 12 { frequencyIndex = 11 }
+    // GASpecificConfig: frameLengthFlag (960 samples: unsupported),
+    // dependsOnCoreCoder, extensionFlag.
+    if readBits(&reader, 1) == 1 { return Status.unsupported }
+    if readBits(&reader, 1) == 1 { _ = readBits(&reader, 14) }
+    _ = readBits(&reader, 1)
+    d.*.samplingIndex = @intCast(usize, frequencyIndex)
+    d.*.rate = rate
+    d.*.channelConfig = channelConfig
+    d.*.configured = true
+    reset(d)
+    return Status.ok
+}
+
+// Configures from an ADTS frame header (raw .aac streams): the rate and
+// channels of the header; adtsFrame() then finds each frame.
+pub fn configureAdts(d: *Decoder, header: [*]const u8, length: usize) -> Status {
+    if length < 7 { return Status.corrupt }
+    if header[0] != 0xff || (header[1] & 0xf6) != 0xf0 { return Status.corrupt }
+    const profile = @intCast(u32, header[2] >> 6)
+    if profile != 1 { return Status.unsupported }
+    const frequencyIndex = @intCast(u32, (header[2] >> 2) & 15)
+    if frequencyIndex > 12 { return Status.corrupt }
+    d.*.samplingIndex = @intCast(usize, if frequencyIndex == 12 { 11 } else { frequencyIndex })
+    d.*.rate = SAMPLING_RATES[@intCast(usize, frequencyIndex)]
+    d.*.channelConfig = (@intCast(u32, header[2] & 1) << 2) | @intCast(u32, header[3] >> 6)
+    d.*.configured = true
+    reset(d)
+    return Status.ok
+}
+
+// The ADTS frame at `at`: its raw data block's offset and length;
+// false when no frame starts there or it is cut short.
+pub fn adtsFrame(bytes: [*]const u8, length: usize, at: usize, dataOffset: *usize, dataLength: *usize) -> bool {
+    if at + 7 > length { return false }
+    if bytes[at] != 0xff || (bytes[at + 1] & 0xf6) != 0xf0 { return false }
+    const protectionAbsent = bytes[at + 1] & 1
+    const frameLength = (@intCast(usize, bytes[at + 3] & 3) << 11) | (@intCast(usize, bytes[at + 4]) << 3) | @intCast(usize, bytes[at + 5] >> 5)
+    const headerLength: usize = if protectionAbsent == 1 { 7 } else { 9 }
+    if frameLength < headerLength || at + frameLength > length { return false }
+    dataOffset.* = at + headerLength
+    dataLength.* = frameLength - headerLength
+    return true
+}
+
+// ---- Bits ----
+
+fn readBits(reader: *Reader, count: u32) -> u32 {
+    var value: u32 = 0
+    var left = count
+    while left > 0 {
+        const byteIndex = reader.*.at >> 3
+        if byteIndex >= reader.*.length {
+            reader.*.failed = true
+            return 0
+        }
+        const bit = @intCast(u32, reader.*.at & 7)
+        const available = 8 - bit
+        var take = left
+        if take > available { take = available }
+        const byte = @intCast(u32, reader.*.bytes[byteIndex])
+        const piece = (byte >> (available - take)) & ((@intCast(u32, 1) << take) - 1)
+        value = (value << take) | piece
+        reader.*.at += @intCast(usize, take)
+        left -= take
+    }
+    return value
+}
+
+fn readBit(reader: *Reader) -> u32 { return readBits(reader, 1) }
+
+fn skipBits(reader: *Reader, count: usize) -> void {
+    reader.*.at += count
+    if (reader.*.at + 7) >> 3 > reader.*.length { reader.*.failed = true }
+}
+
+fn alignByte(reader: *Reader) -> void {
+    reader.*.at = (reader.*.at + 7) & ~@intCast(usize, 7)
+}
+
+// ---- Huffman trees ----
+
+fn newNode(d: *Decoder) -> u16 {
+    const node = d.*.nodeCount
+    d.*.nodeCount += 1
+    d.*.nodes[node * 2] = 0
+    d.*.nodes[node * 2 + 1] = 0
+    return @intCast(u16, node)
+}
+
+fn addCode(d: *Decoder, root: u16, length: u32, code: u32, entry: usize) -> void {
+    var node = root
+    var bit: u32 = length
+    while bit > 1 {
+        bit -= 1
+        const side = @intCast(usize, (code >> bit) & 1)
+        var next = d.*.nodes[@intCast(usize, node) * 2 + side]
+        if next == 0 {
+            next = newNode(d)
+            d.*.nodes[@intCast(usize, node) * 2 + side] = next
+        }
+        node = next
+    }
+    d.*.nodes[@intCast(usize, node) * 2 + @intCast(usize, code & 1)] = @intCast(u16, 0x8000 | entry)
+}
+
+fn addBook(d: *Decoder, book: usize, lengths: [*]const u8, codes: [*]const u32, count: usize) -> void {
+    const root = newNode(d)
+    d.*.roots[book] = root
+    var entry: usize = 0
+    while entry < count {
+        addCode(d, root, @intCast(u32, lengths[entry]), codes[entry], entry)
+        entry += 1
+    }
+}
+
+fn buildTrees(d: *Decoder) -> void {
+    d.*.nodeCount = 1
+    d.*.nodes[0] = 0
+    d.*.nodes[1] = 0
+    addBook(d, 0, &tables.LENGTHS_SF, &tables.CODES_SF, 121)
+    addBook(d, 1, &tables.LENGTHS_1, &tables.CODES_1, 81)
+    addBook(d, 2, &tables.LENGTHS_2, &tables.CODES_2, 81)
+    addBook(d, 3, &tables.LENGTHS_3, &tables.CODES_3, 81)
+    addBook(d, 4, &tables.LENGTHS_4, &tables.CODES_4, 81)
+    addBook(d, 5, &tables.LENGTHS_5, &tables.CODES_5, 81)
+    addBook(d, 6, &tables.LENGTHS_6, &tables.CODES_6, 81)
+    addBook(d, 7, &tables.LENGTHS_7, &tables.CODES_7, 64)
+    addBook(d, 8, &tables.LENGTHS_8, &tables.CODES_8, 64)
+    addBook(d, 9, &tables.LENGTHS_9, &tables.CODES_9, 169)
+    addBook(d, 10, &tables.LENGTHS_10, &tables.CODES_10, 169)
+    addBook(d, 11, &tables.LENGTHS_11, &tables.CODES_11, 289)
+}
+
+// The entry a codeword of `book` names, or 0xffff.
+fn decodeCode(d: *Decoder, reader: *Reader, book: usize) -> usize {
+    var node = @intCast(usize, d.*.roots[book])
+    while true {
+        const bit = @intCast(usize, readBit(reader))
+        if reader.*.failed { return 0xffff }
+        const next = @intCast(usize, d.*.nodes[node * 2 + bit])
+        if next == 0 {
+            reader.*.failed = true
+            return 0xffff
+        }
+        if next & 0x8000 != 0 { return next & 0x7fff }
+        node = next
+    }
+    return 0xffff
+}
+
+fn valueOf(book: usize, entry: usize, which: usize) -> i32 {
+    if book == 1 { return @intCast(i32, tables.VALUES_1[entry * 4 + which]) }
+    if book == 2 { return @intCast(i32, tables.VALUES_2[entry * 4 + which]) }
+    if book == 3 { return @intCast(i32, tables.VALUES_3[entry * 4 + which]) }
+    if book == 4 { return @intCast(i32, tables.VALUES_4[entry * 4 + which]) }
+    if book == 5 { return @intCast(i32, tables.VALUES_5[entry * 2 + which]) }
+    if book == 6 { return @intCast(i32, tables.VALUES_6[entry * 2 + which]) }
+    if book == 7 { return @intCast(i32, tables.VALUES_7[entry * 2 + which]) }
+    if book == 8 { return @intCast(i32, tables.VALUES_8[entry * 2 + which]) }
+    if book == 9 { return @intCast(i32, tables.VALUES_9[entry * 2 + which]) }
+    if book == 10 { return @intCast(i32, tables.VALUES_10[entry * 2 + which]) }
+    return @intCast(i32, tables.VALUES_11[entry * 2 + which])
+}
+
+// Codebooks whose values come unsigned, a sign bit after each non-zero.
+fn isUnsigned(book: usize) -> bool {
+    return book == 3 || book == 4 || book >= 7
+}
+
+fn readEscape(reader: *Reader, value: i32) -> i32 {
+    var count: u32 = 4
+    while readBit(reader) == 1 {
+        count += 1
+        if count > 20 || reader.*.failed {
+            reader.*.failed = true
+            return 0
+        }
+    }
+    const magnitude = @intCast(i32, readBits(reader, count) | (@intCast(u32, 1) << count))
+    if value < 0 { return -magnitude }
+    return magnitude
+}
+
+// Decodes one codeword of `book` into values[0 .. 4) (quads) or [0 .. 2).
+fn decodeSpectral(d: *Decoder, reader: *Reader, book: usize, values: [*]i32) -> void {
+    const entry = decodeCode(d, reader, book)
+    if entry == 0xffff { return }
+    const count: usize = if book < @intCast(usize, FIRST_PAIR_HCB) { 4 } else { 2 }
+    var index: usize = 0
+    while index < count {
+        values[index] = valueOf(book, entry, index)
+        index += 1
+    }
+    if isUnsigned(book) {
+        index = 0
+        while index < count {
+            if values[index] != 0 && readBit(reader) == 1 { values[index] = -values[index] }
+            index += 1
+        }
+    }
+    if book == 11 {
+        if values[0] == 16 || values[0] == -16 { values[0] = readEscape(reader, values[0]) }
+        if values[1] == 16 || values[1] == -16 { values[1] = readEscape(reader, values[1]) }
+    }
+}
+
+// ---- Tables ----
+
+fn bessel0(x: f64) -> f64 {
+    var sum: f64 = 1.0
+    var term: f64 = 1.0
+    var k: f64 = 1.0
+    while k < 80.0 {
+        const factor = x / (2.0 * k)
+        term = term * factor * factor
+        sum += term
+        if term < sum * 1e-17 { break }
+        k += 1.0
+    }
+    return sum
+}
+
+// A Kaiser-Bessel-derived window of 2 * half points (its first half).
+fn kbdWindow(window: [*]f32, half: usize, alpha: f64) -> void {
+    var total: f64 = 0.0
+    var sums: [1025]f64 = undefined
+    var index: usize = 0
+    while index <= half {
+        const t = (@floatFromInt(f64, index) - @floatFromInt(f64, half) / 2.0) / (@floatFromInt(f64, half) / 2.0)
+        const w = bessel0(math.pi * alpha * math.sqrt(1.0 - t * t))
+        total += w
+        sums[index] = total
+        index += 1
+    }
+    index = 0
+    while index < half {
+        window[index] = @floatCast(f32, math.sqrt(sums[index] / total))
+        index += 1
+    }
+}
+
+fn buildTables(d: *Decoder) -> void {
+    var index: usize = 0
+    while index < 8192 {
+        d.*.iq[index] = @floatCast(f32, math.pow(@floatFromInt(f64, index), 4.0 / 3.0))
+        index += 1
+    }
+    index = 0
+    while index < 256 {
+        d.*.gains[index] = @floatCast(f32, math.pow(2.0, 0.25 * (@floatFromInt(f64, index) - 100.0)) / 32768.0)
+        index += 1
+    }
+    index = 0
+    while index < 1024 {
+        d.*.sineLong[index] = @floatCast(f32, math.sin(math.pi * (@floatFromInt(f64, index) + 0.5) / 2048.0))
+        index += 1
+    }
+    index = 0
+    while index < 128 {
+        d.*.sineShort[index] = @floatCast(f32, math.sin(math.pi * (@floatFromInt(f64, index) + 0.5) / 256.0))
+        index += 1
+    }
+    kbdWindow(&d.*.kbdLong, 1024, 4.0)
+    kbdWindow(&d.*.kbdShort, 128, 6.0)
+    index = 0
+    while index < 256 {
+        const angle = math.tau * @floatFromInt(f64, index) / 512.0
+        d.*.twiddleCos[index] = @floatCast(f32, math.cos(angle))
+        d.*.twiddleSin[index] = @floatCast(f32, math.sin(angle))
+        index += 1
+    }
+    index = 0
+    while index < 512 {
+        d.*.reverse512[index] = @intCast(u16, reverseBits(index, 9))
+        if index < 64 { d.*.reverse64[index] = @intCast(u16, reverseBits(index, 6)) }
+        const angle = math.pi * (@floatFromInt(f64, index) + 0.125) / 1024.0
+        d.*.dctCosLong[index] = @floatCast(f32, math.cos(angle))
+        d.*.dctSinLong[index] = @floatCast(f32, math.sin(angle))
+        if index < 64 {
+            const short = math.pi * (@floatFromInt(f64, index) + 0.125) / 128.0
+            d.*.dctCosShort[index] = @floatCast(f32, math.cos(short))
+            d.*.dctSinShort[index] = @floatCast(f32, math.sin(short))
+        }
+        index += 1
+    }
+}
+
+fn buildTnsTable(d: *Decoder) -> void {
+    var table: usize = 0
+    while table < 4 {
+        const compress = table / 2
+        const resolution = table % 2
+        const r = resolution + 3
+        const bits = r - compress
+        var code: usize = 0
+        while code < 16 {
+            var value: f64 = 0.0
+            if code < (@intCast(usize, 1) << bits) {
+                var q: f64 = @floatFromInt(f64, code)
+                if code >= (@intCast(usize, 1) << (bits - 1)) { q -= @floatFromInt(f64, @intCast(usize, 1) << bits) }
+                const scale = @floatFromInt(f64, @intCast(usize, 1) << r)
+                if q >= 0.0 {
+                    value = math.sin(q * math.pi / (scale - 1.0))
+                } else {
+                    value = math.sin(q * math.pi / (scale + 1.0))
+                }
+            }
+            d.*.tnsTable[table * 16 + code] = @floatCast(f32, value)
+            code += 1
+        }
+        table += 1
+    }
+}
+
+fn reverseBits(value: usize, bits: usize) -> usize {
+    var result: usize = 0
+    var index: usize = 0
+    while index < bits {
+        result = (result << 1) | ((value >> index) & 1)
+        index += 1
+    }
+    return result
+}
+
+// ---- The frame ----
+
+// Decodes one raw data block into `out` (1024 samples per channel,
+// interleaved; room for MAX_CHANNELS * 1024); the channels decoded are
+// d.channels.
+pub fn decode(d: *Decoder, bytes: [*]const u8, length: usize, out: [*]f32) -> Status {
+    if !d.*.configured { return Status.corrupt }
+    var reader = Reader.{ .bytes = bytes, .length = length, .at = 0, .failed = false }
+    var channel: usize = 0
+    while true {
+        const id = readBits(&reader, 3)
+        if reader.failed { return Status.corrupt }
+        if id == 7 { break }
+        if id == 0 || id == 3 {
+            // SCE, LFE.
+            _ = readBits(&reader, 4)
+            if channel >= MAX_CHANNELS { return Status.unsupported }
+            const status = readIcs(d, &reader, &d.*.a, false)
+            if status != Status.ok { return status }
+            finishIcs(d, &d.*.a)
+            render(d, &d.*.a, channel)
+            channel += 1
+        } else if id == 1 {
+            if channel + 2 > MAX_CHANNELS { return Status.unsupported }
+            const status = readPair(d, &reader)
+            if status != Status.ok { return status }
+            render(d, &d.*.a, channel)
+            render(d, &d.*.b, channel + 1)
+            channel += 2
+        } else if id == 2 {
+            return Status.unsupported
+        } else if id == 4 {
+            // DSE.
+            _ = readBits(&reader, 4)
+            const aligned = readBit(&reader)
+            var count = readBits(&reader, 8)
+            if count == 255 { count += readBits(&reader, 8) }
+            if aligned == 1 { alignByte(&reader) }
+            skipBits(&reader, @intCast(usize, count) * 8)
+        } else if id == 5 {
+            const status = readProgramConfig(d, &reader)
+            if status != Status.ok { return status }
+        } else if id == 6 {
+            var count = readBits(&reader, 4)
+            if count == 15 { count += readBits(&reader, 8) - 1 }
+            skipBits(&reader, @intCast(usize, count) * 8)
+        }
+        if reader.failed { return Status.corrupt }
+    }
+    if channel == 0 { return Status.corrupt }
+    d.*.channels = channel
+    var c: usize = 0
+    while c < channel {
+        var i: usize = 0
+        while i < FRAME {
+            out[i * channel + c] = d.*.planar[c * FRAME + i]
+            i += 1
+        }
+        c += 1
+    }
+    return Status.ok
+}
+
+fn readProgramConfig(d: *Decoder, reader: *Reader) -> Status {
+    _ = readBits(reader, 4)
+    _ = readBits(reader, 2)
+    const frequencyIndex = readBits(reader, 4)
+    const front = readBits(reader, 4)
+    const side = readBits(reader, 4)
+    const back = readBits(reader, 4)
+    const lfe = readBits(reader, 2)
+    const assoc = readBits(reader, 3)
+    const coupling = readBits(reader, 4)
+    if readBit(reader) == 1 { _ = readBits(reader, 4) }
+    if readBit(reader) == 1 { _ = readBits(reader, 4) }
+    if readBit(reader) == 1 { _ = readBits(reader, 3) }
+    skipBits(reader, @intCast(usize, front + side + back) * 5)
+    skipBits(reader, @intCast(usize, lfe + assoc) * 4)
+    skipBits(reader, @intCast(usize, coupling) * 5)
+    alignByte(reader)
+    const comment = readBits(reader, 8)
+    skipBits(reader, @intCast(usize, comment) * 8)
+    if reader.*.failed { return Status.corrupt }
+    if frequencyIndex <= 12 && d.*.samplingIndex != @intCast(usize, frequencyIndex) {
+        d.*.samplingIndex = @intCast(usize, if frequencyIndex == 12 { 11 } else { frequencyIndex })
+        d.*.rate = SAMPLING_RATES[@intCast(usize, frequencyIndex)]
+    }
+    return Status.ok
+}
+
+fn readPair(d: *Decoder, reader: *Reader) -> Status {
+    _ = readBits(reader, 4)
+    const commonWindow = readBit(reader) == 1
+    d.*.msMaskPresent = false
+    if commonWindow {
+        const status = readIcsInfo(d, reader, &d.*.a)
+        if status != Status.ok { return status }
+        copyIcsInfo(&d.*.a, &d.*.b)
+        const mask = readBits(reader, 2)
+        const slots = d.*.a.groups * d.*.a.maxSfb
+        if mask == 1 {
+            d.*.msMaskPresent = true
+            var index: usize = 0
+            while index < slots {
+                d.*.msUsed[index] = readBit(reader) == 1
+                index += 1
+            }
+        } else if mask == 2 {
+            d.*.msMaskPresent = true
+            var index: usize = 0
+            while index < slots {
+                d.*.msUsed[index] = true
+                index += 1
+            }
+        } else if mask == 3 {
+            return Status.corrupt
+        }
+    }
+    var status = readIcs(d, reader, &d.*.a, commonWindow)
+    if status != Status.ok { return status }
+    status = readIcs(d, reader, &d.*.b, commonWindow)
+    if status != Status.ok { return status }
+    finishIcs(d, &d.*.a)
+    finishIcs(d, &d.*.b)
+    if commonWindow && d.*.msMaskPresent { applyMidSide(d) }
+    applyIntensity(d)
+    return Status.ok
+}
+
+fn copyIcsInfo(from: *Ics, to: *Ics) -> void {
+    to.*.windowSequence = from.*.windowSequence
+    to.*.windowShape = from.*.windowShape
+    to.*.maxSfb = from.*.maxSfb
+    to.*.groups = from.*.groups
+    var index: usize = 0
+    while index < MAX_GROUPS {
+        to.*.groupLength[index] = from.*.groupLength[index]
+        index += 1
+    }
+    to.*.bandStart = from.*.bandStart
+    to.*.bands = from.*.bands
+    to.*.short = from.*.short
+}
+
+fn readIcsInfo(d: *Decoder, reader: *Reader, ics: *Ics) -> Status {
+    _ = readBit(reader)
+    ics.*.windowSequence = @intCast(u8, readBits(reader, 2))
+    ics.*.windowShape = @intCast(u8, readBit(reader))
+    ics.*.groups = 1
+    ics.*.groupLength[0] = 1
+    if ics.*.windowSequence == EIGHT_SHORT {
+        ics.*.maxSfb = @intCast(usize, readBits(reader, 4))
+        var index: usize = 0
+        while index < 7 {
+            if readBit(reader) == 1 {
+                ics.*.groupLength[ics.*.groups - 1] += 1
+            } else {
+                ics.*.groupLength[ics.*.groups] = 1
+                ics.*.groups += 1
+            }
+            index += 1
+        }
+        ics.*.short = true
+        ics.*.bandStart = @intCast(usize, tables.SHORT_START[d.*.samplingIndex])
+        ics.*.bands = @intCast(usize, tables.SHORT_BANDS[d.*.samplingIndex])
+    } else {
+        ics.*.maxSfb = @intCast(usize, readBits(reader, 6))
+        ics.*.short = false
+        ics.*.bandStart = @intCast(usize, tables.LONG_START[d.*.samplingIndex])
+        ics.*.bands = @intCast(usize, tables.LONG_BANDS[d.*.samplingIndex])
+        if readBit(reader) == 1 { return Status.unsupported }
+    }
+    if ics.*.maxSfb > ics.*.bands { return Status.corrupt }
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn bandOffset(ics: *Ics, band: usize) -> usize {
+    if ics.*.short { return @intCast(usize, tables.SHORT_OFFSETS[ics.*.bandStart + band]) }
+    return @intCast(usize, tables.LONG_OFFSETS[ics.*.bandStart + band])
+}
+
+fn readIcs(d: *Decoder, reader: *Reader, ics: *Ics, commonWindow: bool) -> Status {
+    ics.*.globalGain = readBits(reader, 8)
+    if !commonWindow {
+        const status = readIcsInfo(d, reader, ics)
+        if status != Status.ok { return status }
+    }
+    var status = readSections(reader, ics)
+    if status != Status.ok { return status }
+    status = readScalefactors(d, reader, ics)
+    if status != Status.ok { return status }
+    ics.*.pulsePresent = readBit(reader) == 1
+    if ics.*.pulsePresent {
+        if ics.*.short { return Status.corrupt }
+        ics.*.pulseCount = @intCast(usize, readBits(reader, 2)) + 1
+        ics.*.pulseStartBand = @intCast(usize, readBits(reader, 6))
+        if ics.*.pulseStartBand > ics.*.bands { return Status.corrupt }
+        var index: usize = 0
+        while index < ics.*.pulseCount {
+            ics.*.pulseOffset[index] = readBits(reader, 5)
+            ics.*.pulseAmplitude[index] = readBits(reader, 4)
+            index += 1
+        }
+    }
+    ics.*.tnsPresent = readBit(reader) == 1
+    if ics.*.tnsPresent {
+        status = readTns(d, reader, ics)
+        if status != Status.ok { return status }
+    }
+    if readBit(reader) == 1 { return Status.unsupported }
+    status = readSpectrum(d, reader, ics)
+    if status != Status.ok { return status }
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn readSections(reader: *Reader, ics: *Ics) -> Status {
+    const bits: u32 = if ics.*.short { 3 } else { 5 }
+    const escape: u32 = (@intCast(u32, 1) << bits) - 1
+    var group: usize = 0
+    while group < ics.*.groups {
+        var band: usize = 0
+        while band < ics.*.maxSfb {
+            const book = readBits(reader, 4)
+            if book == 12 { return Status.corrupt }
+            var end = band
+            var increment = readBits(reader, bits)
+            while increment == escape {
+                end += @intCast(usize, increment)
+                increment = readBits(reader, bits)
+                if reader.*.failed { return Status.corrupt }
+            }
+            end += @intCast(usize, increment)
+            if end > ics.*.maxSfb { return Status.corrupt }
+            while band < end {
+                ics.*.codebook[group * MAX_BANDS + band] = @intCast(u8, book)
+                band += 1
+            }
+        }
+        group += 1
+    }
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn readScalefactors(d: *Decoder, reader: *Reader, ics: *Ics) -> Status {
+    var spectral: i32 = @intCast(i32, ics.*.globalGain)
+    var noise: i32 = @intCast(i32, ics.*.globalGain) - 90
+    var position: i32 = 0
+    var noiseFirst = true
+    var group: usize = 0
+    while group < ics.*.groups {
+        var band: usize = 0
+        while band < ics.*.maxSfb {
+            const slot = group * MAX_BANDS + band
+            const book = ics.*.codebook[slot]
+            if book == ZERO_HCB {
+                ics.*.gain[slot] = 0.0
+            } else if book == INTENSITY_HCB || book == INTENSITY_HCB2 {
+                const entry = decodeCode(d, reader, 0)
+                if entry == 0xffff { return Status.corrupt }
+                position += @intCast(i32, tables.VALUES_SF[entry]) - 60
+                var clamped = position
+                if clamped < -155 { clamped = -155 }
+                if clamped > 100 { clamped = 100 }
+                ics.*.gain[slot] = @floatCast(f32, math.pow(2.0, -0.25 * @floatFromInt(f64, clamped)))
+            } else if book == NOISE_HCB {
+                if noiseFirst {
+                    noise += @intCast(i32, readBits(reader, 9)) - 256
+                    noiseFirst = false
+                } else {
+                    const entry = decodeCode(d, reader, 0)
+                    if entry == 0xffff { return Status.corrupt }
+                    noise += @intCast(i32, tables.VALUES_SF[entry]) - 60
+                }
+                var clamped = noise
+                if clamped < -100 { clamped = -100 }
+                if clamped > 155 { clamped = 155 }
+                ics.*.gain[slot] = @floatCast(f32, math.pow(2.0, 0.25 * @floatFromInt(f64, clamped)) / 32768.0)
+            } else {
+                const entry = decodeCode(d, reader, 0)
+                if entry == 0xffff { return Status.corrupt }
+                spectral += @intCast(i32, tables.VALUES_SF[entry]) - 60
+                if spectral < 0 || spectral > 255 { return Status.corrupt }
+                ics.*.gain[slot] = d.*.gains[@intCast(usize, spectral)]
+            }
+            band += 1
+        }
+        group += 1
+    }
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn readTns(d: *Decoder, reader: *Reader, ics: *Ics) -> Status {
+    const windows: usize = if ics.*.short { 8 } else { 1 }
+    const filterBits: u32 = if ics.*.short { 1 } else { 2 }
+    const lengthBits: u32 = if ics.*.short { 4 } else { 6 }
+    const orderBits: u32 = if ics.*.short { 3 } else { 5 }
+    var window: usize = 0
+    while window < windows {
+        const filters = readBits(reader, filterBits)
+        ics.*.tnsFilters[window] = @intCast(u8, filters)
+        if filters != 0 {
+            const resolution = readBit(reader)
+            var filter: usize = 0
+            while filter < @intCast(usize, filters) {
+                const slot = window * 4 + filter
+                ics.*.tnsLength[slot] = @intCast(u8, readBits(reader, lengthBits))
+                const order = readBits(reader, orderBits)
+                if order > 20 { return Status.corrupt }
+                ics.*.tnsOrder[slot] = @intCast(u8, order)
+                if order != 0 {
+                    ics.*.tnsDirection[slot] = readBit(reader) == 1
+                    const compress = readBit(reader)
+                    const coefBits = resolution + 3 - compress
+                    const table = @intCast(usize, 2 * compress + resolution)
+                    var index: usize = 0
+                    while index < @intCast(usize, order) {
+                        const code = @intCast(usize, readBits(reader, coefBits))
+                        ics.*.tnsCoef[slot * TNS_MAX_ORDER + index] = d.*.tnsTable[table * 16 + code]
+                        index += 1
+                    }
+                }
+                filter += 1
+            }
+        }
+        window += 1
+    }
+    if reader.*.failed { return Status.corrupt }
+    return Status.ok
+}
+
+fn nextNoise(d: *Decoder) -> i32 {
+    d.*.noiseState = d.*.noiseState *% 1664525 +% 1013904223
+    // The low 31 bits with the high bit's sign: a 32-bit signed value.
+    const value = d.*.noiseState
+    if value >= 0x80000000 { return 0 - @intCast(i32, 0x100000000 - @intCast(u64, value)) }
+    return @intCast(i32, value)
+}
+
+// The quantized values (and PNS noise in the spectrum) of every band.
+fn readSpectrum(d: *Decoder, reader: *Reader, ics: *Ics) -> Status {
+    var index: usize = 0
+    while index < FRAME {
+        ics.*.quantized[index] = 0
+        ics.*.spectrum[index] = 0.0
+        index += 1
+    }
+    var values: [4]i32 = undefined
+    var groupOffset: usize = 0
+    var group: usize = 0
+    while group < ics.*.groups {
+        const windows = @intCast(usize, ics.*.groupLength[group])
+        var band: usize = 0
+        while band < ics.*.maxSfb {
+            const slot = group * MAX_BANDS + band
+            const book = ics.*.codebook[slot]
+            const start = bandOffset(ics, band)
+            const width = bandOffset(ics, band + 1) - start
+            if book == NOISE_HCB {
+                var window: usize = 0
+                while window < windows {
+                    const base = groupOffset + window * 128 + start
+                    var energy: f32 = 0.0
+                    var k: usize = 0
+                    while k < width {
+                        const noise = @floatFromInt(f32, nextNoise(d))
+                        ics.*.spectrum[base + k] = noise
+                        energy += noise * noise
+                        k += 1
+                    }
+                    const scale = ics.*.gain[slot] / @sqrt(energy)
+                    k = 0
+                    while k < width {
+                        ics.*.spectrum[base + k] *= scale
+                        k += 1
+                    }
+                    window += 1
+                }
+            } else if book != ZERO_HCB && book != INTENSITY_HCB && book != INTENSITY_HCB2 {
+                const count: usize = if book >= FIRST_PAIR_HCB { 2 } else { 4 }
+                var window: usize = 0
+                while window < windows {
+                    const base = groupOffset + window * 128 + start
+                    var k: usize = 0
+                    while k < width {
+                        decodeSpectral(d, reader, @intCast(usize, book), &values)
+                        if reader.*.failed { return Status.corrupt }
+                        var j: usize = 0
+                        while j < count {
+                            ics.*.quantized[base + k + j] = values[j]
+                            j += 1
+                        }
+                        k += count
+                    }
+                    window += 1
+                }
+            }
+            band += 1
+        }
+        groupOffset += windows * 128
+        group += 1
+    }
+    return Status.ok
+}
+
+fn dequantize(d: *Decoder, value: i32, gain: f32) -> f32 {
+    var magnitude = value
+    if magnitude < 0 { magnitude = -magnitude }
+    var scaled: f32 = 0.0
+    if magnitude < 8192 {
+        scaled = d.*.iq[@intCast(usize, magnitude)]
+    } else {
+        scaled = @floatCast(f32, math.pow(@floatFromInt(f64, magnitude), 4.0 / 3.0))
+    }
+    if value < 0 { return -scaled * gain }
+    return scaled * gain
+}
+
+// Pulses added, values dequantized and scaled: the spectrum of a channel
+// before the stereo tools.
+fn finishIcs(d: *Decoder, ics: *Ics) -> void {
+    if ics.*.pulsePresent {
+        var k = bandOffset(ics, ics.*.pulseStartBand)
+        var index: usize = 0
+        while index < ics.*.pulseCount {
+            k += @intCast(usize, ics.*.pulseOffset[index])
+            if k >= FRAME { break }
+            const amplitude = @intCast(i32, ics.*.pulseAmplitude[index])
+            if ics.*.quantized[k] > 0 {
+                ics.*.quantized[k] += amplitude
+            } else {
+                ics.*.quantized[k] -= amplitude
+            }
+            index += 1
+        }
+    }
+    var groupOffset: usize = 0
+    var group: usize = 0
+    while group < ics.*.groups {
+        const windows = @intCast(usize, ics.*.groupLength[group])
+        var band: usize = 0
+        while band < ics.*.maxSfb {
+            const slot = group * MAX_BANDS + band
+            const book = ics.*.codebook[slot]
+            if book != ZERO_HCB && book != NOISE_HCB && book != INTENSITY_HCB && book != INTENSITY_HCB2 {
+                const start = bandOffset(ics, band)
+                const end = bandOffset(ics, band + 1)
+                const gain = ics.*.gain[slot]
+                var window: usize = 0
+                while window < windows {
+                    const base = groupOffset + window * 128
+                    var k = start
+                    while k < end {
+                        ics.*.spectrum[base + k] = dequantize(d, ics.*.quantized[base + k], gain)
+                        k += 1
+                    }
+                    window += 1
+                }
+            }
+            band += 1
+        }
+        groupOffset += windows * 128
+        group += 1
+    }
+}
+
+// M/S stereo: the pair's spectra are mid and side where ms_used says
+// so (bands neither channel codes as noise or intensity), on the
+// dequantized spectra.
+fn applyMidSide(d: *Decoder) -> void {
+    const a = &d.*.a
+    const b = &d.*.b
+    var groupOffset: usize = 0
+    var group: usize = 0
+    while group < a.*.groups {
+        const windows = @intCast(usize, a.*.groupLength[group])
+        var band: usize = 0
+        while band < a.*.maxSfb {
+            const slot = group * MAX_BANDS + band
+            if d.*.msUsed[slot] && a.*.codebook[slot] < NOISE_HCB && b.*.codebook[slot] < NOISE_HCB {
+                const start = bandOffset(a, band)
+                const end = bandOffset(a, band + 1)
+                var window: usize = 0
+                while window < windows {
+                    const base = groupOffset + window * 128
+                    var k = start
+                    while k < end {
+                        const mid = a.*.spectrum[base + k]
+                        const side = b.*.spectrum[base + k]
+                        a.*.spectrum[base + k] = mid + side
+                        b.*.spectrum[base + k] = mid - side
+                        k += 1
+                    }
+                    window += 1
+                }
+            }
+            band += 1
+        }
+        groupOffset += windows * 128
+        group += 1
+    }
+}
+
+// Intensity stereo: the right channel's intensity bands are the left's
+// spectrum scaled (and flipped where ms_used says so).
+fn applyIntensity(d: *Decoder) -> void {
+    const a = &d.*.a
+    const b = &d.*.b
+    var groupOffset: usize = 0
+    var group: usize = 0
+    while group < b.*.groups {
+        const windows = @intCast(usize, b.*.groupLength[group])
+        var band: usize = 0
+        while band < b.*.maxSfb {
+            const slot = group * MAX_BANDS + band
+            const book = b.*.codebook[slot]
+            if book == INTENSITY_HCB || book == INTENSITY_HCB2 {
+                var scale = b.*.gain[slot]
+                if book == INTENSITY_HCB2 { scale = -scale }
+                if d.*.msMaskPresent && d.*.msUsed[slot] { scale = -scale }
+                const start = bandOffset(b, band)
+                const end = bandOffset(b, band + 1)
+                var window: usize = 0
+                while window < windows {
+                    const base = groupOffset + window * 128
+                    var k = start
+                    while k < end {
+                        b.*.spectrum[base + k] = a.*.spectrum[base + k] * scale
+                        k += 1
+                    }
+                    window += 1
+                }
+            }
+            band += 1
+        }
+        groupOffset += windows * 128
+        group += 1
+    }
+}
+
+// ---- TNS ----
+
+fn applyTns(d: *Decoder, ics: *Ics) -> void {
+    const windows: usize = if ics.*.short { 8 } else { 1 }
+    const maxBands: usize = if ics.*.short { @intCast(usize, tables.TNS_MAX_BANDS_SHORT[d.*.samplingIndex]) } else { @intCast(usize, tables.TNS_MAX_BANDS_LONG[d.*.samplingIndex]) }
+    var window: usize = 0
+    while window < windows {
+        var bottom = ics.*.bands
+        var filter: usize = 0
+        while filter < @intCast(usize, ics.*.tnsFilters[window]) {
+            const slot = window * 4 + filter
+            const top = bottom
+            const length = @intCast(usize, ics.*.tnsLength[slot])
+            bottom = if length > top { 0 } else { top - length }
+            const order = @intCast(usize, ics.*.tnsOrder[slot])
+            filter += 1
+            if order == 0 { continue }
+            // Reflection coefficients to the filter's direct form.
+            var a: [TNS_MAX_ORDER + 1]f32 = undefined
+            var b: [TNS_MAX_ORDER + 1]f32 = undefined
+            a[0] = 1.0
+            var m: usize = 1
+            while m <= order {
+                const reflection = ics.*.tnsCoef[slot * TNS_MAX_ORDER + m - 1]
+                var i: usize = 1
+                while i < m {
+                    b[i] = a[i] + reflection * a[m - i]
+                    i += 1
+                }
+                i = 1
+                while i < m {
+                    a[i] = b[i]
+                    i += 1
+                }
+                a[m] = reflection
+                m += 1
+            }
+            var startBand = bottom
+            if startBand > maxBands { startBand = maxBands }
+            if startBand > ics.*.maxSfb { startBand = ics.*.maxSfb }
+            var endBand = top
+            if endBand > maxBands { endBand = maxBands }
+            if endBand > ics.*.maxSfb { endBand = ics.*.maxSfb }
+            const start = bandOffset(ics, startBand)
+            const end = bandOffset(ics, endBand)
+            if end <= start { continue }
+            const size = end - start
+            var state: [TNS_MAX_ORDER]f32 = undefined
+            var i: usize = 0
+            while i < order {
+                state[i] = 0.0
+                i += 1
+            }
+            const base = window * 128
+            var n: usize = 0
+            while n < size {
+                const at = if ics.*.tnsDirection[slot] { base + end - 1 - n } else { base + start + n }
+                var y = ics.*.spectrum[at]
+                var j: usize = 0
+                while j < order {
+                    y -= state[j] * a[j + 1]
+                    j += 1
+                }
+                j = order - 1
+                while j > 0 {
+                    state[j] = state[j - 1]
+                    j -= 1
+                }
+                state[0] = y
+                ics.*.spectrum[at] = y
+                n += 1
+            }
+        }
+        window += 1
+    }
+}
+
+// ---- The filter bank ----
+
+// An in-place complex FFT of `count` points (512 or 64) in d.work (re,
+// im interleaved), forward, decimation in time.
+fn fft(d: *Decoder, count: usize) -> void {
+    const work: [*]f32 = &d.*.work
+    // Bit-reversed order.
+    var index: usize = 0
+    while index < count {
+        const target = if count == 512 { @intCast(usize, d.*.reverse512[index]) } else { @intCast(usize, d.*.reverse64[index]) }
+        if target > index {
+            const re = work[index * 2]
+            const im = work[index * 2 + 1]
+            work[index * 2] = work[target * 2]
+            work[index * 2 + 1] = work[target * 2 + 1]
+            work[target * 2] = re
+            work[target * 2 + 1] = im
+        }
+        index += 1
+    }
+    var size: usize = 2
+    while size <= count {
+        const half = size / 2
+        // The angle 2 pi k / size is the 512-table's entry k * 512 / size.
+        const step = 512 / size
+        var start: usize = 0
+        while start < count {
+            var k: usize = 0
+            while k < half {
+                const c = d.*.twiddleCos[k * step]
+                const s = d.*.twiddleSin[k * step]
+                const even = start + k
+                const odd = start + k + half
+                // exp(-i angle) * odd
+                const re = work[odd * 2] * c + work[odd * 2 + 1] * s
+                const im = work[odd * 2 + 1] * c - work[odd * 2] * s
+                work[odd * 2] = work[even * 2] - re
+                work[odd * 2 + 1] = work[even * 2 + 1] - im
+                work[even * 2] += re
+                work[even * 2 + 1] += im
+                k += 1
+            }
+            start += size
+        }
+        size *= 2
+    }
+}
+
+// The inverse MDCT of `half` coefficients (1024 or 128) at `spectrum`
+// into d.buffer[at .. at + 2 * half): the DCT-IV through a complex FFT
+// of half / 2 points, then the IMDCT's symmetries; scaled by 2 / N.
+fn imdct(d: *Decoder, spectrum: [*]const f32, half: usize, at: usize) -> void {
+    const quarter = half / 2
+    const work: [*]f32 = &d.*.work
+    var k: usize = 0
+    while k < quarter {
+        const re = spectrum[2 * k]
+        const im = spectrum[half - 1 - 2 * k]
+        const c = if half == 1024 { d.*.dctCosLong[k] } else { d.*.dctCosShort[k] }
+        const s = if half == 1024 { d.*.dctSinLong[k] } else { d.*.dctSinShort[k] }
+        // (re + i im) * exp(-i angle)
+        work[k * 2] = re * c + im * s
+        work[k * 2 + 1] = im * c - re * s
+        k += 1
+    }
+    fft(d, quarter)
+    const dct: [*]f32 = &d.*.dct
+    k = 0
+    while k < quarter {
+        const c = if half == 1024 { d.*.dctCosLong[k] } else { d.*.dctCosShort[k] }
+        const s = if half == 1024 { d.*.dctSinLong[k] } else { d.*.dctSinShort[k] }
+        const re = work[k * 2] * c + work[k * 2 + 1] * s
+        const im = work[k * 2 + 1] * c - work[k * 2] * s
+        dct[2 * k] = re
+        dct[half - 1 - 2 * k] = -im
+        k += 1
+    }
+    const scale: f32 = 2.0 / @floatFromInt(f32, 2 * half)
+    const out: [*]f32 = &d.*.buffer[at]
+    var n: usize = 0
+    while n < half / 2 {
+        out[n] = dct[n + half / 2] * scale
+        n += 1
+    }
+    while n < 3 * half / 2 {
+        out[n] = -dct[3 * half / 2 - 1 - n] * scale
+        n += 1
+    }
+    while n < 2 * half {
+        out[n] = -dct[n - 3 * half / 2] * scale
+        n += 1
+    }
+}
+
+fn longWindow(d: *Decoder, shape: u8) -> [*]const f32 {
+    if shape == 1 { return &d.*.kbdLong }
+    return &d.*.sineLong
+}
+
+fn shortWindow(d: *Decoder, shape: u8) -> [*]const f32 {
+    if shape == 1 { return &d.*.kbdShort }
+    return &d.*.sineShort
+}
+
+// TNS, the IMDCT, windowing and overlap-add of channel `channel`'s
+// spectrum into d.planar (decode() interleaves the frame at the end).
+fn render(d: *Decoder, ics: *Ics, channel: usize) -> void {
+    if ics.*.tnsPresent { applyTns(d, ics) }
+    const state = &d.*.channelState[channel]
+    const overlap: [*]f32 = &state.*.overlap
+    const buffer: [*]f32 = &d.*.buffer
+    const previousLong = longWindow(d, state.*.previousShape)
+    const previousShort = shortWindow(d, state.*.previousShape)
+    const currentLong = longWindow(d, ics.*.windowShape)
+    const currentShort = shortWindow(d, ics.*.windowShape)
+    var samples: [FRAME]f32 = undefined
+    const sequence = ics.*.windowSequence
+    var i: usize = 0
+    if sequence == ONLY_LONG {
+        imdct(d, &ics.*.spectrum, 1024, 0)
+        while i < 1024 {
+            samples[i] = overlap[i] + buffer[i] * previousLong[i]
+            overlap[i] = buffer[1024 + i] * currentLong[1023 - i]
+            i += 1
+        }
+    } else if sequence == LONG_START {
+        imdct(d, &ics.*.spectrum, 1024, 0)
+        while i < 1024 {
+            samples[i] = overlap[i] + buffer[i] * previousLong[i]
+            i += 1
+        }
+        i = 0
+        while i < 448 {
+            overlap[i] = buffer[1024 + i]
+            overlap[576 + i] = 0.0
+            i += 1
+        }
+        i = 0
+        while i < 128 {
+            overlap[448 + i] = buffer[1472 + i] * currentShort[127 - i]
+            i += 1
+        }
+    } else if sequence == EIGHT_SHORT {
+        var window: usize = 0
+        while window < 8 {
+            imdct(d, &ics.*.spectrum[window * 128], 128, window * 256)
+            window += 1
+        }
+        while i < 448 {
+            samples[i] = overlap[i]
+            i += 1
+        }
+        i = 0
+        while i < 128 {
+            samples[448 + i] = overlap[448 + i] + buffer[i] * previousShort[i]
+            samples[576 + i] = overlap[576 + i] + buffer[128 + i] * currentShort[127 - i] + buffer[256 + i] * currentShort[i]
+            samples[704 + i] = overlap[704 + i] + buffer[384 + i] * currentShort[127 - i] + buffer[512 + i] * currentShort[i]
+            samples[832 + i] = overlap[832 + i] + buffer[640 + i] * currentShort[127 - i] + buffer[768 + i] * currentShort[i]
+            const fifth = buffer[896 + i] * currentShort[127 - i] + buffer[1024 + i] * currentShort[i]
+            if i < 64 {
+                samples[960 + i] = overlap[960 + i] + fifth
+            } else {
+                overlap[i - 64] = fifth
+            }
+            overlap[64 + i] = buffer[1152 + i] * currentShort[127 - i] + buffer[1280 + i] * currentShort[i]
+            overlap[192 + i] = buffer[1408 + i] * currentShort[127 - i] + buffer[1536 + i] * currentShort[i]
+            overlap[320 + i] = buffer[1664 + i] * currentShort[127 - i] + buffer[1792 + i] * currentShort[i]
+            overlap[448 + i] = buffer[1920 + i] * currentShort[127 - i]
+            i += 1
+        }
+        i = 576
+        while i < 1024 {
+            overlap[i] = 0.0
+            i += 1
+        }
+    } else {
+        imdct(d, &ics.*.spectrum, 1024, 0)
+        while i < 448 {
+            samples[i] = overlap[i]
+            i += 1
+        }
+        i = 0
+        while i < 128 {
+            samples[448 + i] = overlap[448 + i] + buffer[448 + i] * previousShort[i]
+            i += 1
+        }
+        i = 576
+        while i < 1024 {
+            samples[i] = overlap[i] + buffer[i]
+            i += 1
+        }
+        i = 0
+        while i < 1024 {
+            overlap[i] = buffer[1024 + i] * currentLong[1023 - i]
+            i += 1
+        }
+    }
+    state.*.previousShape = ics.*.windowShape
+    i = 0
+    while i < FRAME {
+        d.*.planar[channel * FRAME + i] = samples[i]
+        i += 1
+    }
+}
