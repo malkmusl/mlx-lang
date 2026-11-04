@@ -97,7 +97,12 @@ brixfs on it, a copy-on-write format of brixOS's own (A/B superblocks,
 commits of the changed blocks when idle or at sync with the device
 flushed, inode numbers reused, snapshots as kept roots, directories
 leaving memory when nodes run short) mounted at
-/volumes/disk0 (`./mlx build brix`, `tools/check_brix.sh`). Note:
+/volumes/disk0 (`./mlx build brix`, `tools/check_brix.sh`). The first
+process is mlx-init (projects/init/brixos.mlx, on brixOS's own
+interface: the services of /system/settings/init/services, mlx-initctl
+over a FIFO, system_power), which shows the boot with mlx-splash on the
+display (projects/desktop/splash/brixos.mlx, the framebuffer) and then
+runs mlx-console on it (tools/check_brix_init.sh). Note:
 ROADMAP.md is written for a Linux kernel ("replacing it is not the
 goal"); brixOS is the Stage 4 target of AGENT_IMPLEMENTATION.md and
 spec/04-stdlib/os/brix.xml.

@@ -49,14 +49,16 @@ done
 # (The font mlx-console draws with, so that brixOS builds the image the
 # host builds, with the font in it.)
 font=()
-if [[ -f /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf ]]; then font=(fonts/DejaVuSansMono.ttf=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf); fi
+for name in DejaVuSansMono.ttf DejaVuSans.ttf; do
+    if [[ -f /usr/share/fonts/truetype/dejavu/$name ]]; then font+=("fonts/$name=/usr/share/fonts/truetype/dejavu/$name"); fi
+done
 "$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "wget=$work/wget" "tar=$work/tar" "brixfs=$work/brixfs" "mlx4=$work/mlx4" "${font[@]}" "$work/bin/"
 echo "ok   the kernel, wget, tar, brixfs, mlx4 for brixOS and a boot image build"
 
 # What the brix group needs of the repository, as an archive (our tar),
 # and the same files built on the host for comparison.
 parts=(build.mlx VERSION mlx-out/version.mlx compiler/selfhost compiler/cc/asm.mlx compiler/cc/base.mlx std/src std/bootstrap
-    projects/brix projects/shell projects/coreutils projects/wget projects/ping projects/tar projects/console tools/build-number)
+    projects/brix projects/shell projects/coreutils projects/wget projects/ping projects/tar projects/console projects/init projects/desktop/splash tools/build-number)
 for list in projects/webkit/*.mlx; do parts+=("$list"); done
 "$work/tar-host" -czf "$work/www/mlx.tar.gz" "${parts[@]}"
 members=$("$work/tar-host" -tzf "$work/www/mlx.tar.gz" | wc -l)

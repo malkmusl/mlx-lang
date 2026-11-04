@@ -14,9 +14,11 @@ requirements are spec/04-stdlib/os/brix.xml:
 ## What runs
 
 brixOS boots in QEMU (`-kernel`, Multiboot), says itself on the serial
-line and runs mlx-sh in user mode on it, and the programs of its boot
-archive (the coreutils) as processes of their own, on a file system in
-memory with brixOS's own layout and copy on write:
+line and starts mlx-init as its first process (the init below: it runs
+mlx-sh on the serial line and, on a display, the boot screen and then
+the virtual console), the programs of its boot archive (the coreutils)
+as processes of their own, on a file system in memory with brixOS's own
+layout and copy on write:
 
     ./mlx build brix           # also mlx-out/bin/brix/disk.img (64 MiB)
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
@@ -113,12 +115,13 @@ are named for what they hold:
 
     /system/programs   the programs (the boot archive; read-only bytes,
                        copied into pages of their own when written)
-    /system/settings   the system's settings: users, groups
+    /system/settings   the system's settings: users, groups, init/services
     /devices           console, tty, null, zero, disk0, disk1, ... (the
                        virtio disks), framebuffer, keyboard
     /system/fonts      the fonts of the boot archive (DejaVu Sans Mono)
     /users/root        the user's home (the shell starts there)
-    /temporary         scratch space
+    /temporary         scratch space (init/control, the init's FIFO;
+                       logs/NAME.log, the services' output)
     /volumes           each disk's volume (diskN: brixfs, or ext2
                        read-only) and the brixfs volumes' snapshots
 
@@ -472,8 +475,10 @@ The pieces:
     `brix_trap` (system calls and the switches they bring, the timer's
     and the serial line's interrupts, page faults of a process's regions, a crash
     report for the rest: a faulting program ends with SIGSEGV), and
-    mlx-sh as the first process, started again (every other process
-    ending) when it exits or faults.
+    the first process (mlx-init, or mlx-sh without it), started again
+    (every other process ending) when it exits or faults; power.mlx:
+    system_power (the volumes committed, then halt, ACPI's power-off or
+    the reset line).
 
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
@@ -614,6 +619,42 @@ image there. tools/check_brix_build.sh does it (87 steps, 3 to 4 minutes
 in QEMU without KVM) and compares the kernel and the boot image with the
 host's build from the same archive: byte for byte the same.
 
+## The init and the boot screen
+
+The first process is /system/programs/mlx-init (projects/init/brixos.mlx,
+the same service files as MLX/Linux's mlx-init; without it in the
+archive the kernel runs mlx-sh itself, as the checks' own images do).
+The kernel gives it the serial console as its input, output, errors and
+session, and starts it again when it ends. It reads
+/system/settings/init/services/NAME.service (the image carries
+projects/brix/settings/init/services: `serial-shell`, mlx-sh with
+`stdio = /devices/console`, and `console`, mlx-console with
+`screen = yes`), starts each service with process_spawn and roles of its
+own (the terminal named by `stdio` as input, output, errors and session,
+the service's group in front of it; else a stream the init reads and
+appends to /temporary/logs/NAME.log, or says itself with
+`log = console`), waits on everything at once (the processes' endings,
+the output streams, the control FIFO, the next deadline: one wait, no
+signals), starts ended services again after a growing pause, and ends
+the system with system_power (call 50: every volume committed, then
+halt, poweroff or reboot; QEMU exits with -no-reboot).
+
+`mlx-initctl status | start NAME | stop NAME | restart NAME | reload |
+poweroff | reboot | halt` asks over the FIFO /temporary/init/control
+(one line: the asker's own FIFO, the request); the answer comes on the
+asker's FIFO, the text Linux's mlx-init answers.
+
+With a display and mlx-splash in the programs (projects/desktop/splash/
+brixos.mlx: the same picture as MLX/Linux's boot splash, drawn by this
+one process into /devices/framebuffer), the init starts the splash first,
+on two streams (its input: Plymouth's requests as the init sends them,
+"U" a service starting, "u" the progress; its output: the answers), and
+tells it to quit, keeping its picture, before a service with
+`screen = yes` starts, at the earliest 3 s after the splash came up.
+tools/check_brix_init.sh boots it all: the oneshots, the splash on the
+screen, the console's prompt after it (pixel for pixel), the control,
+the poweroff.
+
 ## The virtual console
 
 brixOS is usable on a screen: `mlx-console` (projects/console/brixos.mlx,
@@ -643,8 +684,9 @@ same text with the same code and font.
 
 ## Next
 
-1. mlx-console started by the kernel on a display at boot (the serial
-   shell beside it); programs loaded through node_map (their text shared);
+1. The shutdown on the screen (the splash in its shutdown mode) and
+   mlx-initctl asking the splash for a message; programs loaded through
+   node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
    (GOP's) for EFI boots; the kernel on the

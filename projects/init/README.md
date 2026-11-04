@@ -27,6 +27,26 @@ into that services directory: `mlx-ipcd`, then `mlx-netd`, and
 `mlx-login` after both. Its `--destdir` mode stages the same definitions
 without touching the host.
 
+## On brixOS
+
+`brixos.mlx` is the init of brixOS (mlx-out/bin/brix/mlx-init, in the
+boot image, the kernel's first process): the same service files, read
+from `/system/settings/init/services`, the same supervision and the same
+`mlx-initctl` requests, on brixOS's own interface alone. Services start
+by `process_spawn` with roles (a `stdio` terminal as input, output,
+errors and session, their group in front of it; else a stream whose
+output goes to `/temporary/logs/NAME.log`, or to the console with
+`log = console`); the loop is one native wait on the processes, the
+streams, the control and the next deadline (no signals, no event loop
+descriptors); `mlx-initctl` asks over a FIFO (`/temporary/init/control`,
+one line naming the asker's own reply FIFO); `poweroff`, `reboot` and
+`halt` go to the kernel's `system_power`. No mounts, hostname, accounts,
+log rotation or uevents there. With a display the init shows the boot
+with mlx-splash (projects/desktop/splash/brixos.mlx) and quits it before
+a service with `screen = yes` (mlx-console) takes the screen; the
+picture stays at least 3 s. projects/brix/README.md says more;
+tools/check_brix_init.sh checks it in QEMU.
+
 ## What happens at boot
 
 1. `/proc`, `/sys`, `/dev` (devtmpfs), `/dev/pts`, `/dev/shm` and `/run`
@@ -87,6 +107,8 @@ user = NAME                              # account to run as
 group = NAME                             # optional group override; otherwise
                                          # the user's primary group
 disabled = yes                           # defined, not started at boot
+screen = yes                             # takes the screen: the boot splash
+                                         # is told to quit first (brixOS)
 ```
 
 Every service runs in a session and process group of its own. Without

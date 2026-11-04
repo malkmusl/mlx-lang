@@ -57,6 +57,21 @@ mlx-splash --size 3840x2160 --bench 60          # set-up and frame times
 (9.4 s of frames). `--threads N` draws with N threads (default: one for
 each processor).
 
+## On brixOS
+
+`brixos.mlx` is the splash as brixOS's boot screen (mlx-out/bin/brix/
+mlx-splash, in the boot image): the same picture (scene.mlx and the
+drawing modules, one thread), into /devices/framebuffer (the geometry
+read, the pixels mapped by node_map; the changed tiles copied, red and
+blue swapped when the framebuffer wants them so). There is no socket: the
+init starts it on two streams and sends Plymouth's requests on its
+input ("U" a service starting, "u" the progress in percent, "C", "M",
+"m", "Q" with its first argument byte set to keep the picture), each
+answered with ACK or NAK on its output; when the input ends, the splash
+quits. `--mode`, `--fps N` and `--snapshot PNG` (the last frame when it
+quits) are its options. projects/init/brixos.mlx says when it is shown;
+tools/check_brix_init.sh looks at the screen.
+
 ## What it is told
 
 | Request | Plymouth's byte | What the splash does |
