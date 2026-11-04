@@ -2924,6 +2924,9 @@ fn lowerBuiltin(builder: *LirBuilder, node_index: usize) -> usize {
     }
     if kind == builtins.Kind.spawnThread { return lowerSpawnThread(builder, node_index) }
     if kind == builtins.Kind.typeOf || kind == builtins.Kind.childType { return lir.NONE }
+    // A module (`const x = @import("x")` in a body) has no run-time value:
+    // what is reached through it is resolved by name (lowerField, calls).
+    if kind == builtins.Kind.import { return lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0)) }
     if kind == builtins.Kind.sizeOf || kind == builtins.Kind.alignOf || kind == builtins.Kind.bitSizeOf || kind == builtins.Kind.fieldCount || kind == builtins.Kind.offsetOf ||
        kind == builtins.Kind.isArray || kind == builtins.Kind.isBool || kind == builtins.Kind.isCopyable || kind == builtins.Kind.isEnum || kind == builtins.Kind.isErrorUnion || kind == builtins.Kind.isFloat || kind == builtins.Kind.isInteger || kind == builtins.Kind.isOptional || kind == builtins.Kind.isPointer || kind == builtins.Kind.isSigned || kind == builtins.Kind.isSlice || kind == builtins.Kind.isStruct || kind == builtins.Kind.isTuple || kind == builtins.Kind.isUnion {
         const value = lowerComptimeValue(builder, node_index)
@@ -3119,11 +3122,17 @@ fn extendAsType(builder: *LirBuilder, value: usize, source_type_id: usize, resul
         return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, result_type_id, float_raised, float_shift))
     }
     if source_type.*.kind != types_store.Kind.integer { return value }
-    if bits >= 64 || bits > integerBitWidth(builder, source_type_id) || result_signed == (source_type.*.flags & types_store.FLAG_SIGNED != 0) { return value }
-    if !result_signed { return maskInteger(builder, value, result_type_id) }
-    const shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 64 - bits))
-    const raised = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shl, result_type_id, value, shift))
-    return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, result_type_id, raised, shift))
+    if bits >= 64 { return value }
+    const source_bits = integerBitWidth(builder, source_type_id)
+    // Narrowing (`@intCast(u8, wide)`): the value cut to the result's width
+    // and extended as the result type extends it, so the register holds
+    // the canonical value (its high bits were the source's before). The
+    // same at one width when the signedness changes.
+    if bits < source_bits || result_signed != (source_type.*.flags & types_store.FLAG_SIGNED != 0) {
+        if bits > source_bits { return value }
+        return wrapInteger(builder, value, result_type_id)
+    }
+    return value
 }
 
 fn lowerFieldAddress(builder: *LirBuilder, node_index: usize) -> usize {
@@ -3494,6 +3503,9 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
     }
     if node.tag == ast.Tag.builtin_call {
         const kind = builtins.lookup(builder.*.sourcePointer[0..builder.*.sourceLength], getTokens(builder).*, node.mainToken)
+        // `@import("x")` is the module it names (the loader wrote its type
+        // into the node), wherever it is written.
+        if kind == builtins.Kind.import { return if model.hasImportType(node.extra) { model.decodeImportType(node.extra) } else { 0 } }
         if kind == builtins.Kind.typeOf || kind == builtins.Kind.childType || kind == builtins.Kind.fieldType || kind == builtins.Kind.typeInfo || kind == builtins.Kind.decl {
             return types_store.Store.primitive(builder.*.typeStore, types_store.Kind.type_type)
         }
@@ -3695,6 +3707,37 @@ fn isSlicePointerField(builder: *LirBuilder, field_token: usize) -> bool {
     unsafe { return mem.eql(tokenPointer(builder, field_token), @ptrCast([*]const u8, "pointer"), 7) }
 }
 
+// The module type of a field expression's base when the base is a local
+// bound to a module (`const x = @import("x")`, `const io = std.io` in a
+// body) or an `@import` written in place; else 0.
+fn moduleBaseType(builder: *LirBuilder, base_index: usize) -> usize {
+    const base_node = ast_store.Store.get(getNodes(builder), base_index)
+    var type_id: usize = 0
+    if base_node.tag == ast.Tag.identifier || base_node.tag == ast.Tag.named_type {
+        const binding = findBindingRecord(builder, tokenPointer(builder, base_node.mainToken), tokenLength(builder, base_node.mainToken))
+        if @intFromPtr(binding) == 0 { return 0 }
+        type_id = binding.*.typeId
+    } else if base_node.tag == ast.Tag.builtin_call {
+        type_id = expressionType(builder, base_index)
+    }
+    if type_id == 0 { return 0 }
+    return if types_store.Store.get(builder.*.typeStore, type_id).*.kind == types_store.Kind.module { type_id } else { 0 }
+}
+
+// The declaration named `field` of the module type `module_type_id`:
+// (true, symbol index), else (false, 0).
+fn moduleDeclaration(builder: *LirBuilder, module_type_id: usize, field_pointer: [*]const u8, field_length: usize) -> (bool, usize) {
+    const module_type = types_store.Store.get(builder.*.typeStore, module_type_id)
+    var declaration_index: usize = 0
+    while declaration_index < module_type.*.extraLength {
+        const symbol_index = types_store.Store.extraAt(builder.*.typeStore, module_type.*.extraStart + declaration_index)
+        const declaration = symbols_store.Store.get(builder.*.symbolStore, symbol_index)
+        if declaration.*.nameLength == field_length && mem.eql(declaration.*.namePointer, field_pointer, field_length) { return -> (true, symbol_index) }
+        declaration_index += 1
+    }
+    return -> (false, 0)
+}
+
 fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
     const nodes = getNodes(builder)
     const node = ast_store.Store.get(nodes, node_index)
@@ -3703,6 +3746,13 @@ fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
     if referenced_method.0 {
         const method = symbols_store.Store.get(builder.*.symbolStore, referenced_method.1)
         if method.*.ownerTypeId != 0 { return lowerSymbolValue(builder, referenced_method.1, method, moduleForSymbol(builder, referenced_method.1)) }
+    }
+    const module_base = moduleBaseType(builder, node.lhs)
+    if module_base != 0 {
+        const found = moduleDeclaration(builder, module_base, tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))
+        if found.0 {
+            return lowerSymbolValue(builder, found.1, symbols_store.Store.get(builder.*.symbolStore, found.1), types_store.Store.get(builder.*.typeStore, module_base).*.bits)
+        }
     }
     if tokenKind(builder, node.mainToken) == lexer.Kind.integer {
         const field_index = lowerIntValue(builder, node.mainToken)
@@ -4119,6 +4169,9 @@ fn lowerShiftOperator(builder: *LirBuilder, kind: lexer.Kind, lhs: usize, rhs: u
         return wide.shift(&context, type_id, value, count, !shifts_right)
     }
     var shifted = lir.addInst(builder.*.lir, lir.binary(shift_opcode, type_id, lhs, count))
+    // A left shift of a narrow integer loses the bits shifted out: the
+    // result cut to the type's width (and sign-extended when signed).
+    if !shifts_right && width < 64 { shifted = wrapInteger(builder, shifted, type_id) }
     if kind == lexer.Kind.shift_left_pipe || kind == lexer.Kind.shift_left_percent_pipe {
         shifted = emitArithmeticPolicy(builder, lexer.Kind.plus_pipe, lir.Opcode.shl, lhs, count, type_id)
     }
@@ -5833,5 +5886,13 @@ fn lowerUnary(builder: *LirBuilder, node_index: usize) -> usize {
     if kind == lexer.Kind.dot_question { return lowerOptionalUnwrap(builder, n.lhs, operand) }
     if kind == lexer.Kind.keyword_try { return lowerTry(builder, node_index, operand) }
     if kind == lexer.Kind.dot_asterisk { return lowerDereference(builder, n.lhs, operand) }
-    return lowerUnaryValue(builder, kind, operand)
+    const value = lowerUnaryValue(builder, kind, operand)
+    // `~x` of a narrow integer: the complement within the type's width.
+    if kind == lexer.Kind.tilde {
+        const operand_type = expressionType(builder, n.lhs)
+        if operand_type != 0 && types_store.Store.get(builder.*.typeStore, operand_type).*.kind == types_store.Kind.integer && integerBitWidth(builder, operand_type) < 64 {
+            return wrapInteger(builder, value, operand_type)
+        }
+    }
+    return value
 }
