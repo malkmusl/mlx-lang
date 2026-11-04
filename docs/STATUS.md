@@ -104,8 +104,10 @@ over a FIFO, system_power), which shows the boot with mlx-splash on the
 display (projects/desktop/splash/brixos.mlx, the framebuffer) and then
 runs the desktop on it: mlx-compositor with std.wayland's transport over
 channels and listener nodes, its backend on the framebuffer, the keyboard
-and the mouse, mlx-terminal as a client (tools/check_brix_desktop.sh;
-mlx-console instead with tools/check_brix_init.sh). Note:
+and the mouse, its clients' keymap from the image, the launcher, the dock
+and the top bar started with process_spawn on channels, mlx-terminal as a
+client (tools/check_brix_desktop.sh; mlx-console instead with
+tools/check_brix_init.sh). Note:
 ROADMAP.md is written for a Linux kernel ("replacing it is not the
 goal"); brixOS is the Stage 4 target of AGENT_IMPLEMENTATION.md and
 spec/04-stdlib/os/brix.xml.

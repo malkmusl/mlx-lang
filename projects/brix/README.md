@@ -725,25 +725,48 @@ each a platform file the compiler picks for `--target=x86_64-brixos`:
 - **std.terminal.pty** opens the terminal's shell on a session pair
   (spec calls 48 and 49) and spawns it natively with roles; std.ui's
   host for brixOS is Linux's (the Wayland client code).
+- **The compositor's children** (projects/desktop/compositor/
+  children.brixos.mlx) start with process_spawn: the program's node
+  (found in PATH), our input, output, errors and session as its roles,
+  and for a helper one end of a channel pair as its own role (Role.OWN;
+  the helper finds it there, projects/desktop/shared/channel.mlx, and
+  reads and sends messages on it; on Linux the same code is a socket
+  pair numbered in MLX_DOCK_FD and the like). The children are process
+  handles, asked whether they ended at every turn of the loop.
+- **The keymap**: brixOS has no XKB data, so the image carries
+  /system/settings/keyboard/us.xkb, compiled on the host from its XKB
+  data by projects/brix/tools/keymap (brix-keymap, a step of the image's
+  build; the entry is left out on a host without the data, and the
+  clients then type by their own US fallback), and the compositor hands
+  it to its clients (XKB_DEFAULT_LAYOUT picks another file there).
+
+The helpers are in the image and start with the compositor: the top bar
+(mlx-topbar: the clock, the workspaces), the dock (mlx-dock: the apps
+button, the terminal, the trash) and the launcher (mlx-launcher, shown
+by Super or the dock's apps button; it offers the desktop entries of
+/system/share/applications, XDG_DATA_DIRS in desktop.service: the
+terminal's, projects/desktop/terminal/mlx-terminal.desktop).
+
+![The desktop: the top bar, the terminal, the launcher over the dock](screenshots/desktop.png)
 
 `mlx-initctl start console` runs mlx-console beside it (console.service
 is disabled by default: one program draws the screen; disable the
 desktop and enable the console for the plain virtual console).
 tools/check_brix_desktop.sh boots the image, sees the compositor take
-the screen after the splash, opens the terminal with Alt+Enter (its
-window on the display, the blue of its title bar counted), types a
-command through the compositor into its shell (a file read back from the
-serial shell), moves the mouse through QEMU's monitor (the cursor's white
-counted right of the window) and powers off. The desktop's helpers
-(launcher, dock, top bar) are not in the image yet, and the compositor
-starts programs through the Linux layer (fork and execve) rather than
-process_spawn.
+the screen after the splash with the keymap and the helpers' layers,
+opens the terminal with Alt+Enter (its window on the display, the blue
+of its title bar counted), types a command through the compositor into
+its shell (a file read back from the serial shell), moves the mouse
+through QEMU's monitor (the cursor's white counted right of the window),
+clicks the dock's apps button (the launcher comes up) and powers off.
+The greeter (a login screen on a private connection, WAYLAND_SOCKET) is
+not on brixOS yet, nor is Xwayland.
 
 ## Next
 
-1. The desktop's rest on brixOS: the compositor starting programs with
-   process_spawn, a keymap for the clients, the launcher, dock and top
-   bar in the image, mlx-terminal's font settings from /system.
+1. The desktop's rest on brixOS: a login (the greeter on a channel as
+   WAYLAND_SOCKET, accounts), the terminal's font settings from /system,
+   icons for the launcher and the dock in the image.
 2. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console

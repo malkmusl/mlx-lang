@@ -43,8 +43,9 @@ one line naming the asker's own reply FIFO); `poweroff`, `reboot` and
 `halt` go to the kernel's `system_power`. No mounts, hostname, accounts,
 log rotation or uevents there. With a display the init shows the boot
 with mlx-splash (projects/desktop/splash/brixos.mlx) and quits it before
-a service with `screen = yes` (the desktop, mlx-compositor; or
-mlx-console, `console.service`, disabled by default) takes the screen; the
+a service with `screen = yes` (the desktop, mlx-compositor, with
+XDG_DATA_DIRS=/system/share for its launcher's entries; or mlx-console,
+`console.service`, disabled by default) takes the screen; the
 picture stays at least 3 s; `mlx-initctl message TEXT` puts a line on
 it, and a poweroff or reboot shows the shutdown with the splash in that
 mode, each stopping service named. projects/brix/README.md says more;

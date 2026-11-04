@@ -4,11 +4,16 @@
 # a client): mlx-init starts mlx-compositor as the screen service
 # (desktop.service) after the boot splash; it draws on the framebuffer,
 # reads the keyboard and the mouse, listens for Wayland clients on a
-# listener node (/temporary/wayland-mlx); Alt+Enter opens mlx-terminal,
-# whose window the compositor maps; what is typed goes through the
-# compositor (wl_keyboard) to the terminal and its mlx-sh on a session
-# pair; the mouse moves the cursor. The screen is dumped through QEMU's
-# monitor, which also moves the mouse.
+# listener node (/temporary/wayland-mlx), hands its clients the keymap
+# from /system/settings/keyboard (compiled on the host by brix-keymap,
+# when the host has the XKB data), and starts its helpers with
+# process_spawn, each on a channel (children.brixos.mlx): the dock and
+# the top bar take their layers, the dock's apps button shows the
+# launcher; Alt+Enter opens mlx-terminal, whose window the compositor
+# maps; what is typed goes through the compositor (wl_keyboard) to the
+# terminal and its mlx-sh on a session pair; the mouse moves the cursor.
+# The screen is dumped through QEMU's monitor, which also moves and
+# clicks the mouse.
 #
 #   tools/check_brix_desktop.sh [compiler]
 set -euo pipefail
@@ -49,6 +54,15 @@ mkdir -p "$work/bin" "$work/services"
 "$compiler" --quiet $brix projects/desktop/splash/brixos.mlx -o "$work/mlx-splash"
 "$compiler" --quiet $brix projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
 "$compiler" --quiet $brix projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet $brix projects/desktop/launcher/main.mlx -o "$work/mlx-launcher"
+"$compiler" --quiet $brix projects/desktop/dock/main.mlx -o "$work/mlx-dock"
+"$compiler" --quiet $brix projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
+keymap=()
+if [[ -f /usr/share/X11/xkb/rules/evdev ]]; then
+    "$compiler" --quiet projects/brix/tools/keymap/main.mlx -o "$work/brix-keymap"
+    "$work/brix-keymap" us "$work/us.xkb"
+    keymap=("settings/keyboard/us.xkb=$work/us.xkb")
+fi
 for program in cat echo uname; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
@@ -60,8 +74,8 @@ sed -e 's/^exec = mlx-compositor$/exec = mlx-compositor --verbose/' -e '$a log =
 grep -q '^exec = mlx-compositor --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "mlx-init=$work/mlx-init" "mlx-initctl=$work/mlx-initctl" "mlx-splash=$work/mlx-splash" "mlx-compositor=$work/mlx-compositor" "mlx-terminal=$work/mlx-terminal" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
-echo "ok   the kernel, mlx-init, mlx-splash, mlx-compositor, mlx-terminal and a boot image with the desktop service build"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "mlx-init=$work/mlx-init" "mlx-initctl=$work/mlx-initctl" "mlx-splash=$work/mlx-splash" "mlx-compositor=$work/mlx-compositor" "mlx-terminal=$work/mlx-terminal" "mlx-launcher=$work/mlx-launcher" "mlx-dock=$work/mlx-dock" "mlx-topbar=$work/mlx-topbar" "share/applications/mlx-terminal.desktop=projects/desktop/terminal/mlx-terminal.desktop" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
+echo "ok   the kernel, mlx-init, mlx-splash, mlx-compositor, mlx-terminal, the launcher, the dock, the top bar$([[ ${#keymap[@]} -gt 0 ]] && echo ", the us keymap") and a boot image with the desktop service build"
 
 # The QEMU monitor on a socket: screen dumps, keys, the mouse.
 monitor() {
@@ -84,7 +98,8 @@ PY
 }
 # Of a PPM dump: how many pixels are the compositor's title-bar blue
 # (the focused window's bar and border, #5aa0ff), and how many are white
-# (the cursor's arrow and the terminal's text) right of column 700.
+# (the cursor's arrow and the terminal's text) right of column 700,
+# between the top bar and the dock.
 measure() {
     python3 - "$1" <<'PY'
 import sys
@@ -100,7 +115,7 @@ for y in range(height):
         i = row + x * 3
         r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
         if abs(r - 0x5a) < 24 and abs(g - 0xa0) < 24 and b > 220: blue += 1
-        if x > 700 and r > 240 and g > 240 and b > 240: white_right += 1
+        if x > 700 and 40 < y < 600 and r > 240 and g > 240 and b > 240: white_right += 1
 print(blue, white_right)
 PY
 }
@@ -129,6 +144,16 @@ wait_for '^root@brix:[^#]*# '
 wait_for '^mlx-splash: told to quit, the picture stays$'
 wait_for '^settings: border #5aa0ff'
 echo "ok   mlx-init starts the desktop as the screen service after the splash; mlx-compositor is up on the framebuffer"
+if [[ ${#keymap[@]} -gt 0 ]]; then
+    wait_for '^keyboard: keymap from /system/settings/keyboard$'
+    echo "ok   the compositor hands its clients the keymap of /system/settings/keyboard/us.xkb (brix-keymap, from the host's XKB data)"
+fi
+# The helpers, started with process_spawn on their channels: the dock
+# and the top bar as layers.
+wait_for '^launch: mlx-dock$'
+wait_for '^layer: mlx-dock '
+wait_for '^layer: mlx-topbar 1024x30 at 0,0 in layer 2$'
+echo "ok   the compositor starts its helpers natively (process_spawn): the dock and the top bar take their layers"
 # Alt+Enter: the compositor starts mlx-terminal, which connects over the
 # listener node and maps its window.
 monitor "sendkey alt-ret"
@@ -172,6 +197,14 @@ for (( i = 0; i < 20; i++ )); do
 done
 (( moved > 20 )) || fail "the cursor did not move right ($moved white pixels right of the window)"
 echo "ok   the mouse (/devices/mouse, PS/2 packets by IRQ 12) moves the cursor ($moved pixels of it right of the window)"
+# A click on the dock's apps button (the dock's middle bottom, 353+45
+# from the left and 618+95 from the top; the cursor is at 812,544 now):
+# the dock tells the compositor on its channel, which shows the launcher.
+monitor "mouse_move -200 100" "mouse_move -167 69" "mouse_button 1" "mouse_button 0"
+wait_for '^layer: mlx-launcher '
+wait_for '^focus: mlx-launcher$'
+echo "ok   the dock's apps button (a message on its channel) shows the launcher, which takes the keyboard"
+monitor "sendkey esc"
 printf 'mlx-initctl poweroff\r' >&3
 wait_for '^mlx-init: poweroff$'
 wait_for '^brixOS: powering off$'

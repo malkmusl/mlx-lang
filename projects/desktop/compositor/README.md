@@ -602,9 +602,14 @@ modifiers followed from the keys (no keymap is sent to clients: they type
 by their own US fallback); the mouse (/devices/mouse) gives PS/2 packets,
 turned into pointer motion and buttons. Clients connect over std.wayland's
 brixOS transport (a listener node, /temporary/wayland-mlx, and channels;
-docs/reference/wayland.md). No logind, VT, D-Bus, Vulkan or Xwayland
-there; the helpers are not in the image yet; programs start through the
-Linux layer. tools/check_brix_desktop.sh runs it in QEMU.
+docs/reference/wayland.md); the keymap comes from
+/system/settings/keyboard/LAYOUT.xkb (compiled on the host by
+brix-keymap into the boot image). Programs and the helpers start with
+process_spawn ([`children.brixos.mlx`](children.brixos.mlx), the
+helper's channel end as its own role; [`children.mlx`](children.mlx) is
+the Linux side of the same interface, fork, execve and socket pairs).
+No logind, VT, D-Bus, Vulkan or Xwayland there, and no greeter yet.
+tools/check_brix_desktop.sh runs it in QEMU.
 
 ## Desktop session (GDM, SDDM)
 
