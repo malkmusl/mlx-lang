@@ -615,11 +615,11 @@ projects/webkit/*.mlx, tools/build-number) is enough:
     cd /volumes/disk0 && tar -xzf mlx.tar.gz && mlx4 build brix -j 2
 
 builds the kernel, brix-image, the tools, the coreutils, the desktop's
-programs and the boot image there. tools/check_brix_build.sh does it (99
-steps; some 25 minutes in QEMU without KVM, the compositor the largest
-unit; 2 GiB, since two compilers of its size run at once and the runner
-has no memory figures there) and compares the kernel and the boot image
-with the host's build from the same archive: byte for byte the same.
+programs and the boot image there (the fonts and the keymap from the system's own files, so
+the image is the host's). tools/check_brix_build.sh does it (99 steps,
+the compositor the largest unit) and compares the kernel and the boot
+image with the host's build from the same archive: byte for byte the
+same.
 
 ## The init and the boot screen
 

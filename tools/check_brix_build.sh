@@ -52,6 +52,14 @@ font=()
 for name in DejaVuSansMono.ttf DejaVuSans.ttf; do
     if [[ -f /usr/share/fonts/truetype/dejavu/$name ]]; then font+=("fonts/$name=/usr/share/fonts/truetype/dejavu/$name"); fi
 done
+# (The keymap too, when the host has the XKB data: brixOS's build takes
+# the system's own, /system/settings/keyboard/us.xkb, where the host's
+# takes the one it compiles.)
+if [[ -f /usr/share/X11/xkb/rules/evdev ]]; then
+    "$compiler" --quiet projects/brix/tools/keymap/main.mlx -o "$work/brix-keymap"
+    "$work/brix-keymap" us "$work/us.xkb"
+    font+=("settings/keyboard/us.xkb=$work/us.xkb")
+fi
 "$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "wget=$work/wget" "tar=$work/tar" "brixfs=$work/brixfs" "mlx4=$work/mlx4" "${font[@]}" "$work/bin/"
 echo "ok   the kernel, wget, tar, brixfs, mlx4 for brixOS and a boot image build"
 
@@ -84,7 +92,7 @@ done
 rm -f "$work/input"
 mkfifo "$work/input"
 : > "$work/serial.txt"
-qemu-system-x86_64 -m 2G -smp 2 -display none -monitor none -no-reboot -cpu max -serial stdio \
+qemu-system-x86_64 -m 1G -smp 2 -display none -monitor none -no-reboot -cpu max -serial stdio \
     -kernel "$work/brix.img" -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
     -drive "file=$work/disk0.img,format=raw,if=virtio" < "$work/input" > "$work/serial.txt" 2>&1 &
 qemu_pid=$!
