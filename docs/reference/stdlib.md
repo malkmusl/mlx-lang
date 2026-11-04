@@ -1454,9 +1454,12 @@ the program from an intermediate child reaped at once, and `shareMemory`
 vforks (for large parents). `start` returns a `Child` (`started()`; its
 `id` is -errno when it did not start): on Linux a pid, on brixOS a
 process handle (process_spawn with exactly its input, output, errors and
-the descriptors placed at their numbers; with `directory`, `newSession`,
-`detach` or `unblockSignals` the Linux layer forks), and `child.pid()`
-for Linux's own calls. `startReading` hands back the read end of a pipe
+the descriptors placed at their numbers, named as the input, output and
+errors roles of its start block, with the parent's session passed on as
+the session role; with `directory`, `newSession`, `detach` or
+`unblockSignals` the Linux layer forks), and `child.pid()` for Linux's
+own calls. A brixOS program reads its roles with `std.os.brix.startRoles`
+or `handleFor(Role.SESSION)`. `startReading` hands back the read end of a pipe
 the child writes to; `capture` runs it to its end with its output kept;
 `wait` and `ended` give an `Ending` (`exited` and its `code`, or what
 ended it: the signal's number on Linux, the event's kind on brixOS;

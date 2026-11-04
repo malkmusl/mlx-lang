@@ -494,6 +494,19 @@ layer (kernel/linux: system.mlx, filecalls.mlx, errno.mlx) for the
 programs built for Linux, and std.posix will be a facade over the native
 calls.
 
+A program starts with a start block (spec call 20, 22 and 47): its
+arguments and environment (on its stack, as Linux lays them out) and its
+handles by role, records of a role and a handle: input 1, output 2,
+errors 3, directory 4 (a directory handle: the working directory at the
+start), session 5 (the terminal; the first shell's 0 is one), a
+spawner's own from 16. process_spawn takes the block and the handles the
+child gets (a role names one of them); process_replace takes a block
+naming the caller's own; a branch copies the roles; process_start gives
+a program its roles as (role, handle) records (std.os.brix: `Start`,
+`RoleRecord`, `Role`, `startRoles`, `handleFor`). std.spawn and mlx-sh
+pass input, output, errors and their session on; the native tool prints
+what it got (tools/check_brix.sh).
+
 What there is: kernel/native (calls.mlx, objects.mlx, processes.mlx,
 nodes.mlx, streams.mlx): handles (close, duplicate, info), wait, read and
 write (at a position or streaming), nodes (open with read, write,
@@ -601,8 +614,7 @@ host's build from the same archive: byte for byte the same.
 
 ## Next
 
-1. A start block for programs (their handles by role, the session's
-   among them); programs loaded through node_map (their text shared);
+1. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
    (GOP's) for EFI boots; the kernel on the

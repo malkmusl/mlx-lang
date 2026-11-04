@@ -306,6 +306,12 @@ under another handle
 close twice (invalid handle) 1
 read from a closed handle (invalid handle) 1
 real time after 2023
+start roles 4
+input is descriptor 0
+output is descriptor 1
+errors is descriptor 2
+session kind (session) 6
+no directory role
 END
 output | sed -n '/^@@ native$/,/^@@ end 7$/p' | sed '1d;$d' | grep -v '^$' > "$work/native.brix"
 diff "$work/native.expected" "$work/native.brix" > "$work/native.diff" || fail "the native calls answer otherwise (< expected, > brixOS): $(cat "$work/native.diff")"
