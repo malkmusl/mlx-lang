@@ -121,8 +121,10 @@ wait_for "^wget: mlx.tar.gz: $size bytes$" 1 1800
 type_line 'tar -xzf mlx.tar.gz; echo tar $?'
 wait_for '^tar 0$' 1 3000
 echo "ok   the archive fetched and unpacked in brixOS"
-type_line 'mlx4 build brix -j 2; echo build $?'
-wait_for '^build 0$' 1 18000
+# (One job at a time: the runner has no memory figures on brixOS, and two
+# compilers of the compositor's size do not fit in the GiB the kernel maps.)
+type_line 'mlx4 build brix -j 1; echo build $?'
+wait_for '^build 0$' 1 36000
 wait_for "^mlx build: WebKit's steps are left out" 0 || true
 grep -q "WebKit's steps are left out" <(output) || fail "the build in brixOS did not say WebKit is left out"
 built=$(output | grep -o 'mlx build: [0-9]* built' | tail -n 1)

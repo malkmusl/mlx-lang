@@ -605,14 +605,15 @@ members, a file's bytes, the program's output and the compilers' bytes.
 mlx-out/build/runner.mlx (build.mlx on std.build) and runs it, and the
 runner starts its jobs as processes (std.spawn's native path, by node
 handles) and waits for them by their process handles; without
-/proc/meminfo the jobs are limited by -j alone, and without a home
-directory the result cache is off. build.mlx leaves WebKit's steps out
+/proc/meminfo the jobs are limited by -j alone (so `-j 1` on the GiB the
+kernel maps: two compilers of the compositor's size do not fit there),
+and without a home directory the result cache is off. build.mlx leaves WebKit's steps out
 where projects/webkit/upstream is missing, so the part of the repository
 the brix group needs (build.mlx, compiler/selfhost, the assembler's
 asm.mlx and base.mlx, std, projects/brix and the programs in the image,
 projects/webkit/*.mlx, tools/build-number) is enough:
 
-    cd /volumes/disk0 && tar -xzf mlx.tar.gz && mlx4 build brix -j 2
+    cd /volumes/disk0 && tar -xzf mlx.tar.gz && mlx4 build brix -j 1
 
 builds the kernel, brix-image, the tools, the coreutils, the desktop's
 programs and the boot image there (the fonts and the keymap from the system's own files, so
@@ -768,7 +769,10 @@ not on brixOS yet, nor is Xwayland.
 
 1. The desktop's rest on brixOS: a login (the greeter on a channel as
    WAYLAND_SOCKET, accounts), the terminal's font settings from /system,
-   icons for the launcher and the dock in the image.
+   icons for the launcher and the dock in the image. Memory figures for
+   the build runner on brixOS (and Build.memory for the big units), so
+   `mlx build` can run more than one job there; the compiler saying "out
+   of memory" rather than faulting when memory runs out.
 2. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
