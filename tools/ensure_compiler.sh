@@ -720,6 +720,16 @@ lets_locals_shadow_members() {
     [[ $status -eq 13 ]]
 }
 
+# Whether $1 names the symbol its backend cannot resolve (MLX-E3004 with
+# "unresolved backend symbol: main" for a module without main).
+names_unresolved_symbols() {
+    local probe status=0 output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" --quiet tests/support/no_main.mlx -o "$probe/probe" 2>&1) || status=$?
+    rm -rf -- "$probe"
+    [[ $status -ne 0 ]] && grep -q "unresolved backend symbol: main" <<< "$output"
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -771,6 +781,7 @@ probes=(
     "builds_freestanding_kernels|kernels (--target=x86_64-freestanding)"
     "resolves_aggregate_constant_lengths|a struct's constants as its array fields' lengths"
     "lets_locals_shadow_members|locals shadowing their struct's members and module declarations"
+    "names_unresolved_symbols|the unresolved backend symbol named (MLX-E3004)"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
