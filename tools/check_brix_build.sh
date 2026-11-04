@@ -84,7 +84,7 @@ done
 rm -f "$work/input"
 mkfifo "$work/input"
 : > "$work/serial.txt"
-qemu-system-x86_64 -m 1G -smp 2 -display none -monitor none -no-reboot -cpu max -serial stdio \
+qemu-system-x86_64 -m 2G -smp 2 -display none -monitor none -no-reboot -cpu max -serial stdio \
     -kernel "$work/brix.img" -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
     -drive "file=$work/disk0.img,format=raw,if=virtio" < "$work/input" > "$work/serial.txt" 2>&1 &
 qemu_pid=$!
