@@ -68,9 +68,10 @@ EFI/BOOT/BOOTX64.EFI on a FAT partition):
 brix-image writes an EFI application when its output ends in .efi
 (image/efi.mlx): a PE32+ file with the Multiboot image in it and a
 loader in front that does a Multiboot loader's part (the memory map's
-end below 4 GiB as mem_upper, ExitBootServices, out of long mode, the
-image to 1 MiB, the blob's entry). The console stays the serial line
-(no GOP framebuffer yet).
+end below 4 GiB as mem_upper, the display's framebuffer from the
+Graphics Output Protocol into the boot info, ExitBootServices, out of
+long mode, the image to 1 MiB, the blob's entry). The kernel's console
+stays the serial line; the screen is mlx-console's (below).
 
     brixOS: kernel at 0x200000, 292 KiB
     brixOS: 511 MiB (415 free), 2076 MHz
@@ -114,7 +115,8 @@ are named for what they hold:
                        copied into pages of their own when written)
     /system/settings   the system's settings: users, groups
     /devices           console, tty, null, zero, disk0, disk1, ... (the
-                       virtio disks)
+                       virtio disks), framebuffer, keyboard
+    /system/fonts      the fonts of the boot archive (DejaVu Sans Mono)
     /users/root        the user's home (the shell starts there)
     /temporary         scratch space
     /volumes           each disk's volume (diskN: brixfs, or ext2
@@ -612,9 +614,37 @@ image there. tools/check_brix_build.sh does it (87 steps, 3 to 4 minutes
 in QEMU without KVM) and compares the kernel and the boot image with the
 host's build from the same archive: byte for byte the same.
 
+## The virtual console
+
+brixOS is usable on a screen: `mlx-console` (projects/console/brixos.mlx,
+mlx-out/bin/brix/mlx-console, in the boot image) is the Linux console's
+program with brixOS's devices under it: the display's pixels come from
+/devices/framebuffer (kernel/display.mlx: the Bochs VBE adapter QEMU
+gives a Multiboot boot, set to 1024x768, or the framebuffer the EFI
+loader found through GOP, in the boot info; a read gives width, height,
+pitch and format, node_map the pixels, 32 bits each, blue first), the
+keys from /devices/keyboard (kernel/keyboard.mlx: the PS/2 keyboard's
+scancodes by IRQ 1, decoded by the console as a US layout with Shift,
+Ctrl, Alt, Caps Lock, the arrows, F1 to F12), and mlx-sh runs on a
+session pair (spec calls 48 and 49: a terminal of its own, kernel/
+terminal.mlx's table; the console holds the control side, the shell the
+session as its input, output, errors and session roles; `session_size`
+is what TIOCGWINSZ answers). The emulation and the drawing are
+std.terminal and std.ui.terminal, the text std.truetype from
+/system/fonts/DejaVuSansMono.ttf (the image carries the host's DejaVu
+Sans Mono as fonts/DejaVuSansMono.ttf; an archive name with a directory
+goes under /system). The kernel itself draws nothing: its console stays
+the serial line, where `mlx-console &` starts the screen's.
+
+tools/check_brix_console.sh types on the keyboard through QEMU's
+monitor (sendkey), dumps the screen (screendump) and compares it pixel
+for pixel with what projects/brix/tools/screen draws on the host for the
+same text with the same code and font.
+
 ## Next
 
-1. Programs loaded through node_map (their text shared);
+1. mlx-console started by the kernel on a display at boot (the serial
+   shell beside it); programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
    (GOP's) for EFI boots; the kernel on the

@@ -1,0 +1,437 @@
+// mlx-console on brixOS: the virtual console. The display's pixels come
+// from /devices/framebuffer (node_map), the keys from /devices/keyboard
+// (PS/2 scancodes, decoded here as a US layout: letters, digits, the
+// punctuation, Shift, Ctrl, Alt, Caps Lock, the arrows, Home, End, Page
+// Up and Down, Insert, Delete, F1 to F12), the program runs on a session
+// pair (session_pair: the control side here, the session as its input,
+// output, errors and session roles). The emulation and the drawing are
+// std.terminal and std.ui.terminal, as mlx-terminal's and the Linux
+// console's; the text is drawn with std.truetype from a TrueType file.
+//
+//   mlx-console [--font FILE] [--font-size N] [--history N] [-- PROGRAM ARGS...]
+//
+// The font is /system/fonts/DejaVuSansMono.ttf unless given (the boot
+// image carries it as fonts/DejaVuSansMono.ttf), the program mlx-sh. The
+// console says its screen on stderr when it starts ("mlx-console:
+// 1024x768, 128x48 cells") and ends with the program's status.
+const std = @import("std")
+const crash = @import("std.crash")
+const brix = std.os.brix
+const ui = @import("std.ui")
+const terminal = @import("std.terminal")
+const ui_terminal = @import("std.ui.terminal")
+const text_module = @import("std.ui.text")
+const canvas_module = @import("std.ui.canvas")
+const ui_keys = @import("std.ui.keys")
+
+const Allocator = std.heap.Allocator
+const MAX_ARGUMENTS: usize = 32
+
+const Console = struct {
+    allocator: Allocator
+    framebuffer: brix.Handle
+    width: usize
+    height: usize
+    pitch: usize
+    format: usize
+    pixels: [*]u32
+    canvas: canvas_module.Canvas
+    screen: terminal.Screen
+    mono: text_module.Text
+    view: ui_terminal.View
+    control: brix.Handle
+    session: brix.Handle
+    keyboard: brix.Handle
+    child: brix.Handle
+    columns: usize
+    rows: usize
+    // The keyboard's state: Shift, Ctrl, Alt held, Caps Lock on, an
+    // extended scancode (0xE0) under way.
+    shift: bool
+    control_: bool
+    alt: bool
+    caps: bool
+    extended: bool
+}
+
+fn say(text: []const u8) -> void { _ = brix.write(brix.ofDescriptor(2), text, brix.STREAM) }
+
+fn sayNumber(value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var at: usize = 20
+    var rest = value
+    while true {
+        at -= 1
+        digits[at] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+        if rest == 0 { break }
+    }
+    say(digits[at..20])
+}
+
+fn parseNumber(text: []const u8) -> usize {
+    var value: usize = 0
+    var k: usize = 0
+    while k < text.length && text[k] >= 48 && text[k] <= 57 {
+        value = value * 10 + @intCast(usize, text[k] - 48)
+        k += 1
+    }
+    return value
+}
+
+fn same(left: []const u8, right: []const u8) -> bool {
+    if left.length != right.length { return false }
+    var k: usize = 0
+    while k < left.length {
+        if left[k] != right[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// ---- the display ----
+
+fn word(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var k: usize = 0
+    while k < 8 {
+        value |= @intCast(usize, bytes[at + k]) << @intCast(u6, k * 8)
+        k += 1
+    }
+    return value
+}
+
+fn openDisplay(console: *Console) -> bool {
+    const opened = brix.open(0, "/devices/framebuffer", brix.Open.READ | brix.Open.WRITE, 0)
+    if opened < 0 {
+        say("mlx-console: no /devices/framebuffer (no display)\n")
+        return false
+    }
+    console.*.framebuffer = @intCast(u32, opened)
+    var record: [32]u8 = undefined
+    if brix.read(console.*.framebuffer, record[0..32], 0) != 32 {
+        say("mlx-console: cannot read the framebuffer's geometry\n")
+        return false
+    }
+    const words: [*]const u8 = &record
+    console.*.width = word(words, 0)
+    console.*.height = word(words, 8)
+    console.*.pitch = word(words, 16)
+    console.*.format = word(words, 24)
+    const mapped = brix.mapNode(console.*.framebuffer, 0, console.*.pitch * console.*.height)
+    if mapped < 0 {
+        say("mlx-console: cannot map the framebuffer\n")
+        return false
+    }
+    console.*.pixels = unsafe { @ptrFromInt([*]u32, @bitCast(usize, mapped)) }
+    const memory = console.*.allocator.alloc(console.*.width * console.*.height * 4, 16)
+    if memory == null {
+        say("mlx-console: out of memory for the screen\n")
+        return false
+    }
+    console.*.canvas.pixels = unsafe { @ptrCast([*]u32, memory.?) }
+    console.*.canvas.width = console.*.width
+    console.*.canvas.height = console.*.height
+    console.*.canvas.stride = console.*.width
+    console.*.canvas.swapRedBlue = false
+    console.*.canvas.device = 0
+    console.*.canvas.opacity = 255
+    return true
+}
+
+// The canvas onto the display (ARGB words are BGRX bytes; RGBX swapped).
+fn show(console: *Console) -> void {
+    var y: usize = 0
+    while y < console.*.height {
+        const row: [*]u32 = unsafe { @ptrFromInt([*]u32, @intFromPtr(console.*.pixels) + y * console.*.pitch) }
+        const source = y * console.*.width
+        var x: usize = 0
+        if console.*.format == 2 {
+            while x < console.*.width {
+                const pixel = console.*.canvas.pixels[source + x]
+                row[x] = (pixel & 0xFF00FF00) | ((pixel & 255) << 16) | ((pixel >> 16) & 255)
+                x += 1
+            }
+        } else {
+            while x < console.*.width {
+                row[x] = console.*.canvas.pixels[source + x]
+                x += 1
+            }
+        }
+        y += 1
+    }
+}
+
+fn draw(console: *Console) -> void {
+    ui_terminal.draw(&console.*.view, &console.*.canvas, ui.rect(0, 0, @intCast(i32, console.*.width), @intCast(i32, console.*.height)))
+    show(console)
+}
+
+// ---- the keyboard ----
+
+// The character a scancode (set 1, the main block) types without and
+// with Shift on a US keyboard; 0 for none.
+fn plainOf(code: u8) -> u8 {
+    const row = "\x00\x1b1234567890-=\x08\tqwertyuiop[]\n\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 "
+    return if @intCast(usize, code) < row.length { row[@intCast(usize, code)] } else { 0 }
+}
+
+fn shiftedOf(code: u8) -> u8 {
+    const row = "\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\n\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?\x00*\x00 "
+    return if @intCast(usize, code) < row.length { row[@intCast(usize, code)] } else { 0 }
+}
+
+fn isLetter(byte: u8) -> bool { return byte >= 97 && byte <= 122 }
+
+// A key (its Linux code, what it types) to the program.
+fn press(console: *Console, code: u32, plainByte: u8, typedByte: u8) -> void {
+    var modifiers: u32 = 0
+    if console.*.shift { modifiers |= ui_keys.SHIFT }
+    if console.*.control_ { modifiers |= ui_keys.CONTROL }
+    if console.*.alt { modifiers |= ui_keys.ALT }
+    var typed: [1]u8 = undefined
+    var plain: [1]u8 = undefined
+    typed[0] = typedByte
+    plain[0] = plainByte
+    const typedLength: usize = if typedByte == 0 || console.*.control_ || console.*.alt { 0 } else { 1 }
+    const plainLength: usize = if plainByte == 0 { 0 } else { 1 }
+    var out: [16]u8 = undefined
+    const outBytes: [*]u8 = &out
+    const length = ui_terminal.key(&console.*.view, code, modifiers, typed[0..typedLength], plain[0..plainLength], outBytes)
+    if length > 0 { _ = brix.write(console.*.control, out[0..length], brix.STREAM) }
+}
+
+// A scancode from the keyboard: the modifiers' state, else a key.
+fn scancode(console: *Console, byte: u8) -> void {
+    if byte == 0xE0 {
+        console.*.extended = true
+        return
+    }
+    const released = byte & 0x80 != 0
+    const code = byte & 0x7F
+    const extended = console.*.extended
+    console.*.extended = false
+    // Shift 0x2A, 0x36; Ctrl 0x1D (and E0 1D); Alt 0x38 (and E0 38); Caps
+    // Lock 0x3A.
+    if code == 0x2A || code == 0x36 {
+        console.*.shift = !released
+        return
+    }
+    if code == 0x1D {
+        console.*.control_ = !released
+        return
+    }
+    if code == 0x38 {
+        console.*.alt = !released
+        return
+    }
+    if code == 0x3A {
+        if !released { console.*.caps = !console.*.caps }
+        return
+    }
+    if released { return }
+    if extended {
+        // The navigation keys and the keypad's Enter, as Linux codes them.
+        var linux: u32 = 0
+        if code == 0x48 { linux = 103 } else if code == 0x50 { linux = 108 } else if code == 0x4B { linux = 105 } else if code == 0x4D { linux = 106 } else if code == 0x47 { linux = 102 } else if code == 0x4F { linux = 107 } else if code == 0x49 { linux = 104 } else if code == 0x51 { linux = 109 } else if code == 0x52 { linux = 110 } else if code == 0x53 { linux = 111 } else if code == 0x1C { linux = 96 } else if code == 0x35 { linux = 98 }
+        if linux != 0 { press(console, linux, if linux == 96 { 10 } else if linux == 98 { 47 } else { 0 }, if linux == 96 { 10 } else if linux == 98 { 47 } else { 0 }) }
+        return
+    }
+    // The main block's codes are Linux's (KEY_ESC 1 ... KEY_F12 88).
+    const plain = plainOf(code)
+    var typed = if console.*.shift { shiftedOf(code) } else { plain }
+    if console.*.caps && isLetter(plain) { typed = if console.*.shift { plain } else { shiftedOf(code) } }
+    press(console, @intCast(u32, code), plain, typed)
+}
+
+// ---- the program ----
+
+fn startProgram(console: *Console, arguments: [][*]const u8, programAt: usize) -> bool {
+    var ends: [2]u32 = undefined
+    if brix.sessionPair(&ends) < 0 {
+        say("mlx-console: no session pair\n")
+        return false
+    }
+    console.*.control = ends[0]
+    console.*.session = ends[1]
+    _ = brix.sessionSize(console.*.session, console.*.columns, console.*.rows)
+    var argv: [MAX_ARGUMENTS][*]const u8 = undefined
+    var argc: usize = 0
+    const count = std.process.count(arguments)
+    if programAt != 0 {
+        while programAt + argc < count && argc < MAX_ARGUMENTS - 1 {
+            argv[argc] = std.process.argument(arguments, programAt + argc).pointer
+            argc += 1
+        }
+    } else {
+        argv[0] = "/system/programs/mlx-sh".pointer
+        argc = 1
+    }
+    argv[argc] = unsafe { @ptrFromInt([*]const u8, 0) }
+    var length: usize = 0
+    while argv[0][length] != 0 { length += 1 }
+    const opened = brix.open(0, argv[0][0..length], brix.Open.READ, 0)
+    if opened < 0 {
+        say("mlx-console: cannot open the program\n")
+        return false
+    }
+    const program = @intCast(u32, opened)
+    var roles: [4]brix.RoleRecord = undefined
+    roles[0] = brix.RoleRecord.{ .role = brix.Role.INPUT, .handle = console.*.session }
+    roles[1] = brix.RoleRecord.{ .role = brix.Role.OUTPUT, .handle = console.*.session }
+    roles[2] = brix.RoleRecord.{ .role = brix.Role.ERRORS, .handle = console.*.session }
+    roles[3] = brix.RoleRecord.{ .role = brix.Role.SESSION, .handle = console.*.session }
+    const argvPointer: [*][*]const u8 = &argv
+    const begin = brix.Start.{ .arguments = @intFromPtr(argvPointer), .environment = @intFromPtr(std.process.environmentEntries(arguments)), .roles = @intFromPtr(&roles), .count = 4 }
+    var handles: [3]u32 = [3]u32{ console.*.session, console.*.session, console.*.session }
+    const spawned = brix.spawn(program, &begin, handles[0..3])
+    _ = brix.close(program)
+    if spawned < 0 {
+        say("mlx-console: the program could not be started\n")
+        return false
+    }
+    console.*.child = @intCast(u32, spawned)
+    // Its own group, in front of the session.
+    const group = brix.joinGroup(console.*.child, 0)
+    if group >= 0 {
+        _ = brix.front(console.*.session, @intCast(u32, group))
+        _ = brix.close(@intCast(u32, group))
+    }
+    return true
+}
+
+// What the program wrote, into the screen; its answers back.
+fn readOutput(console: *Console) -> void {
+    var buffer: [65536]u8 = undefined
+    const got = brix.read(console.*.control, buffer[0..65536], brix.STREAM)
+    if got > 0 { terminal.feed(&console.*.screen, buffer[0..@bitCast(usize, got)]) }
+    var answers: [256]u8 = undefined
+    const answerBytes: [*]u8 = &answers
+    const length = terminal.takeResponses(&console.*.screen, answerBytes, 256)
+    if length > 0 { _ = brix.write(console.*.control, answers[0..length], brix.STREAM) }
+    _ = terminal.takeTitleChange(&console.*.screen)
+    _ = terminal.takeBell(&console.*.screen)
+}
+
+fn readKeys(console: *Console) -> void {
+    var codes: [64]u8 = undefined
+    const got = brix.read(console.*.keyboard, codes[0..64], brix.STREAM)
+    var k: usize = 0
+    while got > 0 && k < @bitCast(usize, got) {
+        scancode(console, codes[k])
+        k += 1
+    }
+}
+
+// Waits on the program's output, the keyboard and the program's end;
+// draws what changed. The program's exit status.
+fn run(console: *Console) -> u8 {
+    draw(console)
+    var status: u8 = 0
+    while true {
+        var items: [3]brix.WaitItem = undefined
+        items[0] = brix.WaitItem.{ .handle = console.*.control, .want = brix.State.READABLE, .seen = 0, .reserved = 0 }
+        items[1] = brix.WaitItem.{ .handle = console.*.keyboard, .want = brix.State.READABLE, .seen = 0, .reserved = 0 }
+        items[2] = brix.WaitItem.{ .handle = console.*.child, .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+        _ = brix.wait(items[0..3], brix.FOREVER)
+        if items[0].seen & brix.State.READABLE != 0 { readOutput(console) }
+        if items[1].seen & brix.State.READABLE != 0 { readKeys(console) }
+        if terminal.takeDirty(&console.*.screen) { draw(console) }
+        if items[2].seen & brix.State.ENDED != 0 {
+            var change = brix.Change.{ .what = 0, .value = 0, .detail = 0, .reserved = 0 }
+            if brix.change(console.*.child, &change) == 0 && change.what == brix.Change.EXITED { status = @intCast(u8, change.value & 255) }
+            // What it wrote last.
+            readOutput(console)
+            if terminal.takeDirty(&console.*.screen) { draw(console) }
+            return status
+        }
+    }
+    return status
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    _ = crash.install()
+    const allocator = std.heap.allocator()
+    const memory = allocator.alloc(@sizeOf(Console), 16)
+    if memory == null {
+        say("mlx-console: out of memory\n")
+        return 1
+    }
+    const console: *Console = unsafe { @ptrCast(*Console, memory.?) }
+    console.*.allocator = allocator
+    console.*.shift = false
+    console.*.control_ = false
+    console.*.alt = false
+    console.*.caps = false
+    console.*.extended = false
+    var fontPath: []const u8 = "/system/fonts/DejaVuSansMono.ttf"
+    var fontSize: usize = 16
+    var history: usize = 2000
+    var programAt: usize = 0
+    const count = std.process.count(arguments)
+    var k: usize = 1
+    while k < count {
+        const argument = std.string.asSlice(std.process.argument(arguments, k))
+        if same(argument, "--font") && k + 1 < count {
+            k += 1
+            fontPath = std.string.asSlice(std.process.argument(arguments, k))
+        } else if same(argument, "--font-size") && k + 1 < count {
+            k += 1
+            fontSize = parseNumber(std.string.asSlice(std.process.argument(arguments, k)))
+        } else if same(argument, "--history") && k + 1 < count {
+            k += 1
+            history = parseNumber(std.string.asSlice(std.process.argument(arguments, k)))
+        } else if same(argument, "--") {
+            programAt = k + 1
+            break
+        } else {
+            say("usage: mlx-console [--font FILE] [--font-size N] [--history N] [-- PROGRAM ARGS...]\n")
+            return 2
+        }
+        k += 1
+    }
+    if fontSize < 6 || fontSize > 64 { fontSize = 16 }
+    if !openDisplay(console) { return 1 }
+    var path: [256]u8 = undefined
+    if fontPath.length >= 256 { return 1 }
+    k = 0
+    while k < fontPath.length {
+        path[k] = fontPath[k]
+        k += 1
+    }
+    path[fontPath.length] = 0
+    const pathPointer: [*]const u8 = &path
+    if !text_module.loadFontFile(&console.*.mono, pathPointer, @intCast(u32, fontSize), allocator) {
+        say("mlx-console: no font at ")
+        say(fontPath)
+        say("\n")
+        return 1
+    }
+    ui_terminal.init(&console.*.view, &console.*.screen, &console.*.mono, @intCast(i32, fontSize), 0)
+    console.*.columns = ui_terminal.columnsFor(&console.*.view, @intCast(i32, console.*.width))
+    console.*.rows = ui_terminal.rowsFor(&console.*.view, @intCast(i32, console.*.height))
+    if console.*.columns < 2 { console.*.columns = 2 }
+    if console.*.rows < 1 { console.*.rows = 1 }
+    if !terminal.init(&console.*.screen, allocator, console.*.columns, console.*.rows, history) {
+        say("mlx-console: out of memory for the screen\n")
+        return 1
+    }
+    console.*.view.focused = true
+    const keyboard = brix.open(0, "/devices/keyboard", brix.Open.READ, 0)
+    if keyboard < 0 {
+        say("mlx-console: no /devices/keyboard\n")
+        return 1
+    }
+    console.*.keyboard = @intCast(u32, keyboard)
+    say("mlx-console: ")
+    sayNumber(console.*.width)
+    say("x")
+    sayNumber(console.*.height)
+    say(", ")
+    sayNumber(console.*.columns)
+    say("x")
+    sayNumber(console.*.rows)
+    say(" cells\n")
+    if !startProgram(console, arguments, programAt) { return 1 }
+    return run(console)
+}

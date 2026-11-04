@@ -32,6 +32,21 @@ program or installed, else `/bin/sh`). The console ends with the
 program's status, and with 0 on SIGTERM, SIGINT or SIGHUP after putting
 the console back into text mode.
 
+## On brixOS
+
+`brixos.mlx` is the same console for brixOS (mlx-out/bin/brix/mlx-console,
+`--target=x86_64-brixos`): the screen is /devices/framebuffer (its
+geometry read, its pixels mapped by node_map), the keys come from
+/devices/keyboard (PS/2 scancodes, decoded as a US layout here: no XKB
+data there yet), the program runs on a session pair (`session_pair`,
+brixOS's pty) with the session as its input, output, errors and session
+roles, and the loop is one native wait on the control side, the keyboard
+and the program. Options: `--font FILE` (default
+/system/fonts/DejaVuSansMono.ttf), `--font-size N`, `--history N`,
+`-- PROGRAM ARGS...` (default mlx-sh). projects/brix/README.md says how
+the kernel provides the devices; tools/check_brix_console.sh checks the
+screen pixel for pixel.
+
 ## How it works
 
 - `framebuffer.mlx`: `/dev/fb0` is read with `FBIOGET_VSCREENINFO` and

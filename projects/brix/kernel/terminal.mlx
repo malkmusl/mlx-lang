@@ -1,16 +1,24 @@
-// The serial line as a terminal: the termios a program sets (TCSETS) and
-// what it means here. Output: OPOST with ONLCR turns "\n" into "\r\n".
-// Input: canonical mode (ICANON) edits a line (ECHO, erase, kill, EOF)
-// and gives it at its end; raw mode gives the bytes as they come. ICRNL
-// turns the carriage return a terminal sends for Enter into "\n". The
-// bytes that come are taken when they come (receive: the serial line's
-// interrupt) into a queue; ISIG's characters are seen there (Ctrl-C an
-// interrupt, Ctrl-\ quit, Ctrl-Z suspend for the foreground group), so they
-// reach a program that does not read.
+// A terminal: the termios a program sets (TCSETS) and what it means
+// here. Output: OPOST with ONLCR turns "\n" into "\r\n". Input: canonical
+// mode (ICANON) edits a line (ECHO, erase, kill, EOF) and gives it at its
+// end; raw mode gives the bytes as they come. ICRNL turns the carriage
+// return a terminal sends for Enter into "\n". The bytes that come are
+// taken when they come into a queue; ISIG's characters are seen there
+// (Ctrl-C an interrupt, Ctrl-\ quit, Ctrl-Z suspend for the terminal's
+// front group), so they reach a program that does not read.
+//
+// Terminal 0 is the serial line (its bytes by the line's interrupt). The
+// others are session pairs (session_pair): what programs write goes into
+// a ring the control side reads, and what the control side writes is the
+// input, as typed. mlx-console holds the control side of one and draws
+// it on the screen. Each terminal has its front group and its size.
 const serial = @import("./serial.mlx")
 const cpu = @import("./cpu.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
 const wait = @import("./wait.mlx")
+
+pub const MAX: usize = 8
+pub const NONE: usize = 0xFFFFFFFFFFFFFFFF
 
 pub const Terminal = struct {
     // struct termios (Linux's kernel layout): four flag words, the line
@@ -18,6 +26,7 @@ pub const Terminal = struct {
     pub const TERMIOS_SIZE: usize = 36
     pub const LINE_CAPACITY: usize = 1024
     pub const QUEUE_CAPACITY: usize = 4096
+    pub const OUT_CAPACITY: usize = 16384
     const INPUT_FLAGS: usize = 0
     const OUTPUT_FLAGS: usize = 4
     const CONTROL_FLAGS: usize = 8
@@ -43,6 +52,10 @@ pub const Terminal = struct {
     const VMIN: usize = 6
     const BACKSPACE: u8 = 8
 
+    // Whether this terminal is one (a session pair's, once opened).
+    inUse: bool
+    // The serial line, or a session pair's rings.
+    serial: bool
     uart: serial.Uart
     termios: [TERMIOS_SIZE]u8
     // Canonical mode: the line being edited, then (once it ends) given
@@ -54,17 +67,28 @@ pub const Terminal = struct {
     // EOF typed on an empty line (the next read gives 0).
     endOfFile: bool
     // The events ISIG's characters asked for (a bit each, by kind),
-    // for the foreground group.
+    // for the front group.
     signalsDue: usize
     // The bytes that came and were not read yet (a ring).
     queue: [QUEUE_CAPACITY]u8
     queueHead: usize
     queueCount: usize
+    // A session pair: what was written, for the control side (a ring).
+    out: [OUT_CAPACITY]u8
+    outHead: usize
+    outCount: usize
+    // The front group (its process group number; 0: none), the size
+    // in cells.
+    foreground: usize
+    columns: usize
+    rows: usize
 
-    // A cooked terminal on `uart`: ICRNL IXON, OPOST ONLCR, B38400 CS8
-    // CREAD, ISIG ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN, the
-    // usual characters.
-    pub fn init(self: *Self, uart: serial.Uart) -> void {
+    // A cooked terminal: ICRNL IXON, OPOST ONLCR, B38400 CS8 CREAD, ISIG
+    // ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN, the usual characters;
+    // on `uart` when `onSerial`.
+    pub fn init(self: *Self, onSerial: bool, uart: serial.Uart) -> void {
+        self.*.inUse = true
+        self.*.serial = onSerial
         self.*.uart = uart
         Bytes.fill(&self.*.termios, TERMIOS_SIZE, 0)
         Bytes.write32(&self.*.termios, INPUT_FLAGS, 0x500)
@@ -85,6 +109,11 @@ pub const Terminal = struct {
         self.*.signalsDue = 0
         self.*.queueHead = 0
         self.*.queueCount = 0
+        self.*.outHead = 0
+        self.*.outCount = 0
+        self.*.foreground = 0
+        self.*.columns = 80
+        self.*.rows = 24
     }
 
     fn flags(self: *const Self, which: usize) -> usize { return Bytes.read32(&self.*.termios, which) }
@@ -97,39 +126,86 @@ pub const Terminal = struct {
 
     pub fn setAttributes(self: *Self, from: [*]const u8) -> void { Bytes.copy(&self.*.termios, from, TERMIOS_SIZE) }
 
-    pub fn write(self: *const Self, bytes: [*]const u8, length: usize) -> void {
+    // A byte out: on the line, or into the ring for the control side
+    // (the oldest goes when it is full).
+    fn put(self: *Self, byte: u8) -> void {
+        if self.*.serial {
+            self.*.uart.put(byte)
+            return
+        }
+        if self.*.outCount == OUT_CAPACITY {
+            self.*.outHead = (self.*.outHead + 1) % OUT_CAPACITY
+            self.*.outCount -= 1
+        }
+        self.*.out[(self.*.outHead + self.*.outCount) % OUT_CAPACITY] = byte
+        self.*.outCount += 1
+    }
+
+    pub fn write(self: *Self, bytes: [*]const u8, length: usize) -> void {
         const translate = self.flags(OUTPUT_FLAGS) & (OPOST | ONLCR) == (OPOST | ONLCR)
         var k: usize = 0
         while k < length {
-            if bytes[k] == 10 && translate { self.*.uart.put(13) }
-            self.*.uart.put(bytes[k])
+            if bytes[k] == 10 && translate { self.put(13) }
+            self.put(bytes[k])
             k += 1
         }
     }
 
-    // The bytes the line has into the queue. ISIG's characters are not
-    // queued: they ask for their signal and drop what was typed (echoed as
-    // ^C, ^\ or ^Z in canonical mode).
+    // The bytes the serial line has, as typed (accept).
     pub fn receive(self: *Self) -> void {
+        if !self.*.serial { return }
         while self.*.uart.ready() {
-            const byte = @intCast(u8, cpu.Port.in8(self.*.uart.port))
-            const signal = self.signalOf(byte)
-            if signal != 0 {
-                if self.canonical() && self.flags(LOCAL_FLAGS) & ECHO != 0 {
-                    self.echoText(if signal == INTERRUPT { "^C\r\n" } else if signal == QUIT { "^\\\r\n" } else { "^Z\r\n" })
-                }
-                self.*.lineLength = 0
-                self.*.queueCount = 0
-                const one: usize = 1
-                self.*.signalsDue |= one << @intCast(u6, signal)
-                continue
-            }
-            if self.*.queueCount < QUEUE_CAPACITY {
-                self.*.queue[(self.*.queueHead + self.*.queueCount) % QUEUE_CAPACITY] = byte
-                self.*.queueCount += 1
-            }
+            self.accept(@intCast(u8, cpu.Port.in8(self.*.uart.port)))
         }
     }
+
+    // A byte typed, into the queue. ISIG's characters are not queued:
+    // they ask for their signal and drop what was typed (echoed as ^C,
+    // ^\ or ^Z in canonical mode).
+    pub fn accept(self: *Self, byte: u8) -> void {
+        const signal = self.signalOf(byte)
+        if signal != 0 {
+            if self.canonical() && self.flags(LOCAL_FLAGS) & ECHO != 0 {
+                self.echoText(if signal == INTERRUPT { "^C\r\n" } else if signal == QUIT { "^\\\r\n" } else { "^Z\r\n" })
+            }
+            self.*.lineLength = 0
+            self.*.queueCount = 0
+            const one: usize = 1
+            self.*.signalsDue |= one << @intCast(u6, signal)
+            return
+        }
+        if self.*.queueCount < QUEUE_CAPACITY {
+            self.*.queue[(self.*.queueHead + self.*.queueCount) % QUEUE_CAPACITY] = byte
+            self.*.queueCount += 1
+        }
+    }
+
+    // ---- the control side of a session pair ----
+
+    // What programs wrote, up to `capacity` bytes; wait.BLOCKED when
+    // nothing has been written since.
+    pub fn controlRead(self: *Self, into: [*]u8, capacity: usize) -> isize {
+        if self.*.outCount == 0 { return wait.BLOCKED }
+        var got: usize = 0
+        while got < capacity && self.*.outCount > 0 {
+            into[got] = self.*.out[self.*.outHead]
+            self.*.outHead = (self.*.outHead + 1) % OUT_CAPACITY
+            self.*.outCount -= 1
+            got += 1
+        }
+        return @intCast(isize, got)
+    }
+
+    // Bytes typed at the control side: the terminal's input.
+    pub fn controlWrite(self: *Self, from: [*]const u8, length: usize) -> void {
+        var k: usize = 0
+        while k < length {
+            self.accept(from[k])
+            k += 1
+        }
+    }
+
+    pub fn controlPending(self: *const Self) -> bool { return self.*.outCount > 0 }
 
     // The event `byte` stands for with ISIG; 0 for none.
     fn signalOf(self: *const Self, byte: u8) -> usize {
@@ -156,15 +232,15 @@ pub const Terminal = struct {
         return byte
     }
 
-    fn echoText(self: *const Self, text: []const u8) -> void {
+    fn echoText(self: *Self, text: []const u8) -> void {
         var k: usize = 0
         while k < text.length {
-            self.*.uart.put(text[k])
+            self.put(text[k])
             k += 1
         }
     }
 
-    fn rubOut(self: *const Self, echo: bool) -> void {
+    fn rubOut(self: *Self, echo: bool) -> void {
         if echo { self.echoText("\x08 \x08") }
     }
 
@@ -203,8 +279,8 @@ pub const Terminal = struct {
                 self.*.line[self.*.lineLength] = byte
                 self.*.lineLength += 1
                 if echo {
-                    if byte == 10 { self.*.uart.put(13) }
-                    self.*.uart.put(byte)
+                    if byte == 10 { self.put(13) }
+                    self.put(byte)
                 }
             }
             if byte == 10 {
@@ -270,7 +346,45 @@ pub const Terminal = struct {
     }
 }
 
-var console: Terminal = undefined // (per run)
+var terminals: [MAX]Terminal = undefined // (per run)
 
-// The terminal on the serial console.
-pub fn serialConsole() -> *Terminal { return &console }
+// The terminal on the serial console (terminal 0).
+pub fn serialConsole() -> *Terminal { return &terminals[0] }
+
+pub fn at(index: usize) -> *Terminal { return &terminals[index] }
+
+pub fn count() -> usize { return MAX }
+
+// Terminal 0 on the serial line, the rest free.
+pub fn init() -> void {
+    terminals[0].init(true, serial.com1)
+    var k: usize = 1
+    while k < MAX {
+        terminals[k].inUse = false
+        k += 1
+    }
+}
+
+// A session pair's terminal, made (its index), or NONE when every one is
+// in use.
+pub fn open() -> usize {
+    var k: usize = 1
+    while k < MAX {
+        if !terminals[k].inUse {
+            terminals[k].init(false, serial.com1)
+            return k
+        }
+        k += 1
+    }
+    return NONE
+}
+
+// Whether `group` is the front group of some terminal.
+pub fn isFront(group: usize) -> bool {
+    var k: usize = 0
+    while k < MAX {
+        if terminals[k].inUse && terminals[k].foreground == group { return true }
+        k += 1
+    }
+    return false
+}
