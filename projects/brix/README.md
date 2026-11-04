@@ -628,8 +628,9 @@ The kernel gives it the serial console as its input, output, errors and
 session, and starts it again when it ends. It reads
 /system/settings/init/services/NAME.service (the image carries
 projects/brix/settings/init/services: `serial-shell`, mlx-sh with
-`stdio = /devices/console`, and `console`, mlx-console with
-`screen = yes`), starts each service with process_spawn and roles of its
+`stdio = /devices/console`; `desktop`, mlx-compositor with
+`screen = yes`; and `console`, mlx-console for the screen instead,
+`disabled = yes`), starts each service with process_spawn and roles of its
 own (the terminal named by `stdio` as input, output, errors and session,
 the service's group in front of it; else a stream the init reads and
 appends to /temporary/logs/NAME.log, or says itself with
@@ -691,15 +692,65 @@ monitor (sendkey), dumps the screen (screendump) and compares it pixel
 for pixel with what projects/brix/tools/screen draws on the host for the
 same text with the same code and font.
 
+## The desktop
+
+The boot image's screen service is the desktop: `mlx-compositor`
+(projects/desktop/compositor, the repository's Wayland compositor, built
+for brixOS into mlx-out/bin/brix/mlx-compositor; settings/init/services/
+desktop.service, `screen = yes`, so the init quits the splash for it)
+with `mlx-terminal` as its first client (Alt+Enter; mlx-sh on a session
+pair in the window). Three things make it run on brixOS's own interface,
+each a platform file the compiler picks for `--target=x86_64-brixos`:
+
+- **std.wayland's transport** (std/src/wayland/transport/backend.brixos.mlx)
+  carries the Wayland wire over channels: a connection is one end of a
+  channel pair (a message a chunk of the byte stream with up to four
+  handles, brixOS's SCM_RIGHTS), the compositor's socket is a listener
+  node (spec call 51, listener_make: /temporary/wayland-mlx; a client's
+  node_open makes a channel and the listener receives its far end as a
+  message with one handle, which is `accept`), buffers are memory objects
+  (memory_object, memory_map_object, mapped on both sides), and the
+  event loops are tables of watched handles waited on with the one
+  `wait`. The wire, the protocol code, the clients and the compositor are
+  the same code as on Linux.
+- **The compositor's backend** (projects/desktop/compositor/drm.brixos.mlx)
+  is the brixOS display: the framebuffer (/devices/framebuffer, mapped
+  with node_map; the scene composed on the CPU and copied in, with the
+  damage), the keyboard (/devices/keyboard: PS/2 scancodes as evdev key
+  codes, the modifiers followed from the keys, no keymap sent) and the
+  mouse (/devices/mouse: kernel/mouse.mlx, the PS/2 auxiliary port by
+  IRQ 12, three bytes a packet, the first with bit 3 set: the buttons and
+  the motion, as wl_pointer events). No logind, no DRM, no Vulkan, no
+  Xwayland there.
+- **std.terminal.pty** opens the terminal's shell on a session pair
+  (spec calls 48 and 49) and spawns it natively with roles; std.ui's
+  host for brixOS is Linux's (the Wayland client code).
+
+`mlx-initctl start console` runs mlx-console beside it (console.service
+is disabled by default: one program draws the screen; disable the
+desktop and enable the console for the plain virtual console).
+tools/check_brix_desktop.sh boots the image, sees the compositor take
+the screen after the splash, opens the terminal with Alt+Enter (its
+window on the display, the blue of its title bar counted), types a
+command through the compositor into its shell (a file read back from the
+serial shell), moves the mouse through QEMU's monitor (the cursor's white
+counted right of the window) and powers off. The desktop's helpers
+(launcher, dock, top bar) are not in the image yet, and the compositor
+starts programs through the Linux layer (fork and execve) rather than
+process_spawn.
+
 ## Next
 
-1. Programs loaded through node_map (their text shared);
+1. The desktop's rest on brixOS: the compositor starting programs with
+   process_spawn, a keymap for the clients, the launcher, dock and top
+   bar in the image, mlx-terminal's font settings from /system.
+2. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
    (GOP's) for EFI boots; the kernel on the
    other processors (per-processor stacks, TSS and GDT, a lock, the local
    APIC's timer, IPIs); ext2 written too.
-2. std.posix as the facade for what programs still ask the Linux layer
+3. std.posix as the facade for what programs still ask the Linux layer
    (stat, fcntl, signals of their own), once the native ground holds.
 
 ## The plan from the start

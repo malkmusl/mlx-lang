@@ -588,6 +588,24 @@ compositor waiting in read(2) for a page flip after its first frame,
 deaf to clients and keys. `tools/check_compositor_device.sh` checks it
 with a blocking pipe in place of the card.
 
+### brixOS
+
+Built for brixOS (`--target=x86_64-brixos`, mlx-out/bin/brix/mlx-compositor,
+in the boot image as its screen service; projects/brix/README.md, "The
+desktop") the compositor is the same program on the system's own
+interface, with [`drm.brixos.mlx`](drm.brixos.mlx) as its backend in
+place of DRM/KMS: the framebuffer (/devices/framebuffer, mapped) is the
+one output, composed on the CPU (`--renderer cpu`, `--backend drm` are
+the defaults there) and copied in with the damage; the keyboard
+(/devices/keyboard) gives PS/2 scancodes, mapped to evdev codes, the
+modifiers followed from the keys (no keymap is sent to clients: they type
+by their own US fallback); the mouse (/devices/mouse) gives PS/2 packets,
+turned into pointer motion and buttons. Clients connect over std.wayland's
+brixOS transport (a listener node, /temporary/wayland-mlx, and channels;
+docs/reference/wayland.md). No logind, VT, D-Bus, Vulkan or Xwayland
+there; the helpers are not in the image yet; programs start through the
+Linux layer. tools/check_brix_desktop.sh runs it in QEMU.
+
 ## Desktop session (GDM, SDDM)
 
 `install_compositor.sh` at the repository root builds the compositor and

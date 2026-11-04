@@ -53,7 +53,10 @@ mkdir -p "$work/bin" "$work/services"
 for program in cat echo ls sleep; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-cp projects/brix/settings/init/services/serial-shell.service projects/brix/settings/init/services/console.service "$work/services/"
+cp projects/brix/settings/init/services/serial-shell.service "$work/services/"
+# The console as the screen service here (the shipped image has the
+# desktop there and the console disabled).
+grep -v '^disabled = ' projects/brix/settings/init/services/console.service > "$work/services/console.service"
 cat > "$work/services/hello.service" <<'EOF'
 description = a oneshot saying hello on the console
 type = oneshot
