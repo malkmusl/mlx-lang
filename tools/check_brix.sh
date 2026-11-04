@@ -526,7 +526,7 @@ wait_for '^2$'
 echo "ok   Ctrl-D ends a program's input"
 
 type_line 'exit 3'
-wait_for '^brixOS: the shell ended (3)$'
+wait_for '^brixOS: the first process ended (3)$'
 type_line 'echo again'
 wait_for '^again$'
 echo "ok   exit ends the shell and the kernel starts it again"
