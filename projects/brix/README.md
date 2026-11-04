@@ -581,6 +581,24 @@ does this with QEMU (1 GiB, two processors, a 256 MiB brixfs disk; the
 self-build takes a few minutes without KVM) and compares the archive's
 members, a file's bytes, the program's output and the compilers' bytes.
 
+`mlx build` runs in brixOS too: mlx4's build command compiles
+mlx-out/build/runner.mlx (build.mlx on std.build) and runs it, and the
+runner starts its jobs as processes (std.spawn's native path, by node
+handles) and waits for them by their process handles; without
+/proc/meminfo the jobs are limited by -j alone, and without a home
+directory the result cache is off. build.mlx leaves WebKit's steps out
+where projects/webkit/upstream is missing, so the part of the repository
+the brix group needs (build.mlx, compiler/selfhost, the assembler's
+asm.mlx and base.mlx, std, projects/brix and the programs in the image,
+projects/webkit/*.mlx, tools/build-number) is enough:
+
+    cd /volumes/disk0 && tar -xzf mlx.tar.gz && mlx4 build brix -j 2
+
+builds the kernel, brix-image, the tools, the coreutils and the boot
+image there. tools/check_brix_build.sh does it (87 steps, 3 to 4 minutes
+in QEMU without KVM) and compares the kernel and the boot image with the
+host's build from the same archive: byte for byte the same.
+
 ## Next
 
 1. A start block for programs (their handles by role, the session's
