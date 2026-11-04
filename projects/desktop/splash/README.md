@@ -68,8 +68,11 @@ init starts it on two streams and sends Plymouth's requests on its
 input ("U" a service starting, "u" the progress in percent, "C", "M",
 "m", "Q" with its first argument byte set to keep the picture), each
 answered with ACK or NAK on its output; when the input ends, the splash
-quits. `--mode`, `--fps N` and `--snapshot PNG` (the last frame when it
-quits) are its options. projects/init/brixos.mlx says when it is shown;
+quits. The init starts it again in shutdown or reboot mode when the
+system goes down, and `mlx-initctl message TEXT` reaches it as "M".
+What it is told it notes on its errors (the serial console). `--mode`,
+`--fps N` and `--snapshot PNG` (the last frame when it quits) are its
+options. projects/init/brixos.mlx says when it is shown;
 tools/check_brix_init.sh looks at the screen.
 
 ## What it is told

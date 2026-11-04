@@ -6,8 +6,8 @@
 # them with their roles (a oneshot writing to the console and to its log
 # file, the serial console's shell, a sleeper), holds the screen for the
 # splash's minimum before mlx-console takes it, answers mlx-initctl over
-# its FIFO (status, stop, start) and powers the machine off through
-# system_power. The screen is dumped through QEMU's monitor: the splash's
+# its FIFO (status, stop, start, a message for the screen), shows the
+# shutdown on the screen and powers the machine off through system_power. The screen is dumped through QEMU's monitor: the splash's
 # picture while the services start, then mlx-console's prompt, pixel for
 # pixel what the host draws for it.
 #
@@ -136,6 +136,12 @@ wait_for '^mlx-init: services defined: 5$'
 echo "ok   the kernel starts mlx-init as the first process; it reads the five services"
 wait_for '^hello-from-the-oneshot$'
 echo "ok   a oneshot with log = console writes to the serial console through the init"
+# (The splash's notes land on the serial line beside the prompt.)
+wait_for '^root@brix:[^#]*# '
+# A line for the screen from the shell, while the splash is still up.
+printf 'mlx-initctl message hello from the shell\r' >&3
+wait_for '^mlx-splash: message: hello from the shell$'
+echo "ok   mlx-initctl message puts a line on the boot screen through the init"
 # The splash is on the screen while the services start (the console is
 # held back for its minimum): a night of blue with lit pixels, not the
 # console's dark grey.
@@ -151,7 +157,7 @@ done
 (( blue > 100000 )) || fail "the boot screen is not on the display ($blue blue pixels, $lit lit)"
 (( lit > 2000 )) || fail "the boot screen shows nothing lit ($lit pixels)"
 echo "ok   mlx-splash draws the boot screen on the framebuffer while the services start ($blue blue, $lit lit pixels)"
-wait_for '^root@brix:[^#]*# $'
+wait_for '^mlx-splash: told to quit, the picture stays$'
 # Then mlx-console takes the screen: its prompt, pixel for pixel.
 same() {
     local dump=$1 text=$2 what=$3
@@ -182,8 +188,27 @@ wait_for '^sleeper  *stopped  *-  *0 *-  *sleeps, to be stopped and started$'
 printf 'mlx-initctl start sleeper; mlx-initctl status\r' >&3
 wait_for '^sleeper  *running  *[0-9]* *0 *[0-9]*s *sleeps, to be stopped and started$' 2
 echo "ok   mlx-initctl stop ends a service (terminate to its group) and start runs it again"
+printf 'mlx-initctl message\r' >&3
+wait_for '^mlx-initctl: error: no boot screen is up$'
 printf 'mlx-initctl poweroff\r' >&3
 wait_for '^mlx-init: poweroff$'
+# The shutdown on the screen: the splash in its shutdown mode says each
+# service stopping, and the display shows its night again (the console
+# ended), before the machine goes.
+wait_for '^mlx-splash: up, shutdown, on the display$'
+wait_for '^mlx-splash: stopping serial-shell$'
+lit=0
+blue=0
+for (( i = 0; i < 20; i++ )); do
+    monitor "screendump $work/shutdown.ppm" || break
+    sleep 0.2
+    read -r lit blue < <(bright "$work/shutdown.ppm" 2> /dev/null || echo 0 0)
+    (( blue > 100000 )) && break
+    sleep 0.2
+done
+(( blue > 100000 )) || fail "the shutdown screen is not on the display ($blue blue pixels, $lit lit)"
+echo "ok   the shutdown is on the screen: mlx-splash in its shutdown mode, told what stops ($blue blue pixels)"
+wait_for '^mlx-splash: told to quit$'
 wait_for '^brixOS: powering off$'
 for (( i = 0; i < 100; i++ )); do kill -0 "$qemu_pid" 2> /dev/null || break; sleep 0.1; done
 kill -0 "$qemu_pid" 2> /dev/null && fail "QEMU did not power off"

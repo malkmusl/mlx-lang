@@ -651,9 +651,18 @@ on two streams (its input: Plymouth's requests as the init sends them,
 "U" a service starting, "u" the progress; its output: the answers), and
 tells it to quit, keeping its picture, before a service with
 `screen = yes` starts, at the earliest 3 s after the splash came up.
+`mlx-initctl message TEXT` puts a line on the splash while it is up
+(`mlx-initctl message` takes it away). A poweroff or reboot shows the
+shutdown the same way: the splash in its shutdown or reboot mode, told
+each service that stops, fading out before the machine goes.
 tools/check_brix_init.sh boots it all: the oneshots, the splash on the
-screen, the console's prompt after it (pixel for pixel), the control,
-the poweroff.
+screen, the message, the console's prompt after it (pixel for pixel),
+the control, the shutdown screen, the poweroff.
+
+![The boot: the splash, then the console](screenshots/boot.gif)
+
+(screenshots/boot.mp4 is the same at 1024x768, recorded through QEMU's
+monitor; `uname -o` typed on the PS/2 keyboard at the end.)
 
 ## The virtual console
 
@@ -684,9 +693,7 @@ same text with the same code and font.
 
 ## Next
 
-1. The shutdown on the screen (the splash in its shutdown mode) and
-   mlx-initctl asking the splash for a message; programs loaded through
-   node_map (their text shared);
+1. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
    (GOP's) for EFI boots; the kernel on the

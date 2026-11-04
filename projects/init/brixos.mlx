@@ -64,6 +64,8 @@ const REPLY_CAPACITY: usize = 4000
 const REQUEST_UPDATE: u8 = 85
 const REQUEST_PROGRESS: u8 = 117
 const REQUEST_QUIT: u8 = 81
+const REQUEST_MESSAGE: u8 = 77
+const REQUEST_HIDE_MESSAGE: u8 = 109
 const ACK: u8 = 6
 
 const Init = struct {
@@ -77,9 +79,13 @@ const Init = struct {
     splashQuit: bool
     splashStartedAt: usize
     // How many services have been started this boot, of how many wanted
-    // (the progress the splash shows).
+    // (the progress the splash shows); at the shutdown, how many have
+    // ended of how many ran.
     started: usize
     wanted: usize
+    shuttingDown: bool
+    stopped: usize
+    toStop: usize
     // The wait items and which service each belongs to.
     items: [MAX_ITEMS]brix.WaitItem
     owners: [MAX_ITEMS]usize
@@ -575,13 +581,27 @@ fn tellSplash(init: *Init, service: *Service) -> void {
     sendSplash(init, REQUEST_UPDATE, config.name(service))
     var text: [8]u8 = undefined
     const pointer: [*]u8 = &text
-    const percent = if init.*.wanted == 0 { 100 } else { smaller(100, init.*.started * 100 / init.*.wanted) }
+    var percent: usize = 100
+    if init.*.shuttingDown {
+        if init.*.toStop != 0 { percent = smaller(100, init.*.stopped * 100 / init.*.toStop) }
+    } else if init.*.wanted != 0 {
+        percent = smaller(100, init.*.started * 100 / init.*.wanted)
+    }
     const length = std.text.appendUnsigned(pointer, 0, 8, percent)
     sendSplash(init, REQUEST_PROGRESS, pointer[0..length])
 }
 
-// mlx-splash on the screen, when there is one.
-fn startSplash(init: *Init) -> void {
+// mlx-initctl's message for the screen: shown by the splash ("M"), or
+// taken away ("m") when empty.
+fn showMessage(init: *Init, text: []const u8) -> bool {
+    if init.*.splash == 0 { return false }
+    sendSplash(init, if text.length == 0 { REQUEST_HIDE_MESSAGE } else { REQUEST_MESSAGE }, text)
+    return true
+}
+
+// mlx-splash on the screen, when there is one, in `mode` (boot,
+// shutdown, reboot).
+fn startSplash(init: *Init, mode: [*]const u8) -> void {
     var path: [1024]u8 = undefined
     if init.*.noSplash || !std.fs.exists(zeroTerminated(&path, FRAMEBUFFER)) || !std.fs.exists(zeroTerminated(&path, SPLASH)) { return }
     var requests: [2]u32 = undefined
@@ -589,14 +609,10 @@ fn startSplash(init: *Init) -> void {
     if brix.streamPair(&requests) < 0 || brix.streamPair(&answers) < 0 { return }
     const program = brix.open(0, SPLASH, brix.Open.READ, 0)
     if program < 0 { return }
-    var arguments: [3][*]const u8 = undefined
-    arguments[0] = SPLASH.pointer
-    arguments[1] = "--mode\x00".pointer
-    arguments[2] = "boot\x00".pointer
     var argv: [4][*]const u8 = undefined
     argv[0] = "mlx-splash\x00".pointer
     argv[1] = "--mode\x00".pointer
-    argv[2] = "boot\x00".pointer
+    argv[2] = mode
     argv[3] = unsafe { @ptrFromInt([*]const u8, 0) }
     var environment: [2][*]const u8 = undefined
     environment[0] = "PATH=/system/programs\x00".pointer
@@ -625,6 +641,18 @@ fn startSplash(init: *Init) -> void {
     init.*.splashQuit = false
     init.*.splashStartedAt = now()
     if init.*.state.*.verbose { config.say("the boot screen is up") }
+}
+
+// The splash kept up until its minimum has passed (unless it ends by
+// itself): a shutdown screen seen for a tenth of a second says nothing
+// either.
+fn holdSplash(init: *Init) -> void {
+    if init.*.splash == 0 { return }
+    const at = now()
+    if at >= init.*.splashStartedAt + SPLASH_MINIMUM { return }
+    var items: [1]brix.WaitItem = undefined
+    items[0] = brix.WaitItem.{ .handle = init.*.splash, .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+    _ = brix.wait(items[0..1], brix.clock(brix.Clock.MONOTONIC) + (init.*.splashStartedAt + SPLASH_MINIMUM - at) * 1000000)
 }
 
 // The splash is told to quit (keeping its picture when `retain`) and
@@ -768,6 +796,14 @@ fn handle(init: *Init, request: []const u8) -> void {
         _ = config.load(state)
         countWanted(init)
         tick(init)
+        replyAppend(init, "ok\n")
+        return
+    }
+    if same(verb, "message") {
+        if !showMessage(init, target) {
+            replyAppend(init, "error: no boot screen is up\n")
+            return
+        }
         replyAppend(init, "ok\n")
         return
     }
@@ -946,8 +982,19 @@ fn serve(init: *Init) -> void {
 // start order's reverse), waited for, killed when late; then the kernel.
 fn shutdown(init: *Init) -> void {
     const state = init.*.state
+    // The boot screen, when still up, makes way for the shutdown's (in
+    // its shutdown or reboot mode: "Stopping NAME" as each service ends).
     endSplash(init, false)
+    init.*.shuttingDown = true
+    init.*.stopped = 0
+    init.*.toStop = 0
     var index: usize = 0
+    while index < state.*.count {
+        if config.serviceAt(state, index).*.handle != 0 { init.*.toStop += 1 }
+        index += 1
+    }
+    startSplash(init, if state.*.action == config.ACTION_REBOOT { "reboot\x00".pointer } else { "shutdown\x00".pointer })
+    index = 0
     while index < state.*.count {
         const service = config.serviceAt(state, index)
         service.*.wanted = false
@@ -969,7 +1016,11 @@ fn shutdown(init: *Init) -> void {
         while k < init.*.itemCount {
             if init.*.items[k].seen & brix.State.ENDED != 0 {
                 const service = config.serviceAt(state, init.*.owners[k])
-                if service.*.handle != 0 { reap(init, service) }
+                if service.*.handle != 0 {
+                    reap(init, service)
+                    init.*.stopped += 1
+                    tellSplash(init, service)
+                }
             }
             k += 1
         }
@@ -983,6 +1034,9 @@ fn shutdown(init: *Init) -> void {
         }
         index += 1
     }
+    // The screen stays its minimum, fades out, then the machine goes.
+    holdSplash(init)
+    endSplash(init, false)
     const kind = if state.*.action == config.ACTION_POWEROFF { brix.Power.POWEROFF } else if state.*.action == config.ACTION_REBOOT { brix.Power.REBOOT } else { brix.Power.HALT }
     _ = brix.power(kind)
     // Not the first process (started by hand): nothing more to do.
@@ -1030,6 +1084,9 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     init.*.splashStartedAt = 0
     init.*.started = 0
     init.*.wanted = 0
+    init.*.shuttingDown = false
+    init.*.stopped = 0
+    init.*.toStop = 0
     init.*.itemCount = 0
     init.*.replyLength = 0
     init.*.noSplash = false
@@ -1058,7 +1115,7 @@ pub fn main(arguments: [][*]const u8) -> u8 {
     }
     config.say("brixOS's init")
     if !openControl(init) { return 1 }
-    startSplash(init)
+    startSplash(init, "boot\x00".pointer)
     const defined = config.load(state)
     countWanted(init)
     config.sayWith("services defined: ", "", true, defined)

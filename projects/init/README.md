@@ -44,7 +44,9 @@ one line naming the asker's own reply FIFO); `poweroff`, `reboot` and
 log rotation or uevents there. With a display the init shows the boot
 with mlx-splash (projects/desktop/splash/brixos.mlx) and quits it before
 a service with `screen = yes` (mlx-console) takes the screen; the
-picture stays at least 3 s. projects/brix/README.md says more;
+picture stays at least 3 s; `mlx-initctl message TEXT` puts a line on
+it, and a poweroff or reboot shows the shutdown with the splash in that
+mode, each stopping service named. projects/brix/README.md says more;
 tools/check_brix_init.sh checks it in QEMU.
 
 ## What happens at boot
@@ -144,6 +146,8 @@ mlx-initctl reload                       # the services directory again:
                                          # added services start, removed
                                          # ones stop
 mlx-initctl poweroff | reboot | halt
+mlx-initctl message [TEXT]               # brixOS: a line on the boot screen
+                                         # while it is up (none: taken away)
 ```
 
 The socket is `/run/mlx/init`, `--control PATH`, or `$MLX_INIT_CONTROL`.
