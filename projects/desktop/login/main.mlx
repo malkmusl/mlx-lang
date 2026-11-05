@@ -26,12 +26,15 @@
 // password is wiped. session.mlx starts the process only after dropping
 // every root credential and reports exec failure to the parent.
 const std = @import("std")
+const builtin = @import("builtin")
+const brix = @import("std").os.brix
 const dbus = @import("std.dbus")
 const crash = @import("std.crash")
 const authentication = @import("./authentication.mlx")
 const greeter_module = @import("./greeter.mlx")
 const login1 = @import("./login1.mlx")
 const session_module = @import("./session.mlx")
+const spawn_module = @import("std.spawn")
 const users_module = @import("./users.mlx")
 
 const LOGIN_NAME: []const u8 = "org.mlx.Login"
@@ -99,7 +102,8 @@ const Login = struct {
     // password of this user only.
     active: [users_module.NAME_MOST]u8
     activeLength: usize
-    sessionPid: isize
+    // The session (Linux: its pid; brixOS: its process handle).
+    session: spawn_module.Child
     // The compositor that owns the seat while no person is logged in.
     // Empty commands disable lifecycle management (useful to isolated
     // clients and checks that exercise only the bus API).
@@ -107,7 +111,7 @@ const Login = struct {
     greeterProgram: []const u8
     greeterUid: u32
     greeterGid: u32
-    greeterPid: isize
+    greeter: spawn_module.Child
     pending: [PENDING_MOST]Pending
 }
 
@@ -178,12 +182,12 @@ fn busAddress(login: *Login) -> []const u8 {
 fn greeterConfigured(login: *Login) -> bool { return login.*.greeterCompositor.length > 0 && login.*.greeterProgram.length > 0 }
 
 fn seatPid(login: *Login) -> isize {
-    if login.*.sessionPid > 0 { return login.*.sessionPid }
-    return login.*.greeterPid
+    if login.*.session.started() { return login.*.session.id }
+    return if login.*.greeter.started() { login.*.greeter.id } else { -1 }
 }
 
 fn startGreeter(login: *Login) -> bool {
-    if !greeterConfigured(login) || login.*.activeLength > 0 || login.*.greeterPid > 0 { return true }
+    if !greeterConfigured(login) || login.*.activeLength > 0 || login.*.greeter.started() { return true }
     var config = greeter_module.Config.{
         .compositor = login.*.greeterCompositor,
         .program = login.*.greeterProgram,
@@ -194,24 +198,24 @@ fn startGreeter(login: *Login) -> bool {
         .uid = login.*.greeterUid,
         .gid = login.*.greeterGid
     }
-    const pid = greeter_module.start(&config)
-    if pid < 0 {
+    const child = greeter_module.start(&config)
+    if !child.started() {
         say(login, "login: greeter could not be started\n")
         return false
     }
-    login.*.greeterPid = pid
+    login.*.greeter = child
     say(login, "login: greeter started\n")
     return true
 }
 
 fn stopGreeter(login: *Login) -> void {
-    if login.*.greeterPid <= 0 { return }
-    const pid = login.*.greeterPid
-    login.*.greeterPid = -1
+    if !login.*.greeter.started() { return }
+    const child = login.*.greeter
+    login.*.greeter = spawn_module.Child.none()
     // Revoke the old compositor before the user's compositor can ask for
     // control; waiting for NameOwnerChanged would leave a race here.
     login1.sessionEnded(login1Of(login))
-    greeter_module.stop(pid)
+    greeter_module.stop(child)
     say(login, "login: greeter stopped\n")
 }
 
@@ -241,10 +245,10 @@ fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
 fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
     if login.*.activeLength > 0 { return DENIED }
     const user = users_module.userAt(usersOf(login), index)
-    const pid = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, busAddress(login))
-    if pid < 0 { return DENIED }
+    const child = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, busAddress(login), login.*.environment)
+    if !child.started() { return DENIED }
     login.*.activeLength = std.text.append(unsafe { @ptrCast([*]u8, &login.*.active) }, 0, users_module.NAME_MOST, users_module.nameOf(user))
-    login.*.sessionPid = pid
+    login.*.session = child
     say(login, "login: session started\n")
     return ALLOWED
 }
@@ -356,25 +360,41 @@ fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
     replyBool(login, call, checked == ALLOWED)
 }
 
+fn sessionGone(login: *Login) -> void {
+    wipe(unsafe { @ptrCast([*]u8, &login.*.active) }, users_module.NAME_MOST)
+    login.*.activeLength = 0
+    login.*.session = spawn_module.Child.none()
+    login1.sessionEnded(login1Of(login))
+    say(login, "login: session ended; the seat is free\n")
+    if !startGreeter(login) { login.*.running = false }
+}
+
+fn greeterGone(login: *Login) -> void {
+    login.*.greeter = spawn_module.Child.none()
+    login1.sessionEnded(login1Of(login))
+    say(login, "login: greeter ended\n")
+    if login.*.activeLength == 0 {
+        sleep(500)
+        if !startGreeter(login) { login.*.running = false }
+    }
+}
+
+// The children that ended: the session, the greeter (Linux: also
+// login1's VT watcher, by wait4).
 fn reapSession(login: *Login) -> void {
+    if comptime builtin.os == builtin.Os.brixos {
+        var ending: spawn_module.Ending = undefined
+        if login.*.session.started() && spawn_module.ended(login.*.session, &ending) { sessionGone(login) }
+        if login.*.greeter.started() && spawn_module.ended(login.*.greeter, &ending) { greeterGone(login) }
+        return
+    }
     var status: usize = 0
     var pid = std.linux.syscall4(std.linux.SYS_wait4, 18446744073709551615, @intFromPtr(&status), 1, 0)
     while pid > 0 {
-        if pid == login.*.sessionPid {
-            wipe(unsafe { @ptrCast([*]u8, &login.*.active) }, users_module.NAME_MOST)
-            login.*.activeLength = 0
-            login.*.sessionPid = -1
-            login1.sessionEnded(login1Of(login))
-            say(login, "login: session ended; the seat is free\n")
-            if !startGreeter(login) { login.*.running = false }
-        } else if pid == login.*.greeterPid {
-            login.*.greeterPid = -1
-            login1.sessionEnded(login1Of(login))
-            say(login, "login: greeter ended\n")
-            if login.*.activeLength == 0 {
-                sleep(500)
-                if !startGreeter(login) { login.*.running = false }
-            }
+        if login.*.session.started() && pid == login.*.session.id {
+            sessionGone(login)
+        } else if login.*.greeter.started() && pid == login.*.greeter.id {
+            greeterGone(login)
         } else {
             login1.childEnded(login1Of(login), clientOf(login), pid, status)
         }
@@ -546,6 +566,9 @@ fn connectName(login: *Login) -> bool {
 // SIGCHLD must wake the daemon even when nobody calls the bus: that is
 // what releases the seat and lets the greeter lifecycle start again.
 fn signalDescriptor() -> isize {
+    // brixOS: no signal descriptor; the wait looks at the children each
+    // turn instead (its one wait takes a deadline).
+    if comptime builtin.os == builtin.Os.brixos { return -1 }
     var mask: u64 = (1 << 1) | (1 << 14) | (1 << 16)
     const blocked = std.linux.syscall4(std.linux.SYS_rt_sigprocmask, 0, @intFromPtr(&mask), 0, 8)
     if blocked != 0 { return -1 }
@@ -562,6 +585,24 @@ fn takeSignal(descriptor: isize) -> u32 {
 fn ready(entry: u64) -> bool { return (entry >> 48) & 25 != 0 }
 
 fn wait(login: *Login, signals: isize) -> void {
+    if comptime builtin.os == builtin.Os.brixos {
+        // The native wait: the bus, and the children's ends.
+        var items: [3]brix.WaitItem = undefined
+        items[0] = brix.WaitItem.{ .handle = @intCast(u32, @bitCast(usize, dbus.descriptorOfClient(clientOf(login))) & 0xFFFFFFFF), .want = brix.State.READABLE | brix.State.PEER_GONE, .seen = 0, .reserved = 0 }
+        var count: usize = 1
+        if login.*.session.started() {
+            items[count] = brix.WaitItem.{ .handle = @intCast(u32, login.*.session.id), .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+            count += 1
+        }
+        if login.*.greeter.started() {
+            items[count] = brix.WaitItem.{ .handle = @intCast(u32, login.*.greeter.id), .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+            count += 1
+        }
+        const woken = brix.wait(items[0..count], brix.FOREVER)
+        reapSession(login)
+        if login.*.running && woken > 0 && items[0].seen & (brix.State.READABLE | brix.State.PEER_GONE) != 0 { dispatch(login) }
+        return
+    }
     var entries: [2]u64 = undefined
     entries[0] = @intCast(u64, @bitCast(u32, @intCast(i32, dbus.descriptorOfClient(clientOf(login))))) | (1 << 32)
     entries[1] = @intCast(u64, @bitCast(u32, @intCast(i32, signals))) | (1 << 32)
@@ -666,12 +707,12 @@ fn run(arguments: [][*]const u8) -> !void {
     login.*.verbose = verbose
     login.*.running = true
     login.*.activeLength = 0
-    login.*.sessionPid = -1
+    login.*.session = spawn_module.Child.none()
     login.*.greeterCompositor = greeterCompositor
     login.*.greeterProgram = greeterProgram
     login.*.greeterUid = greeterUid
     login.*.greeterGid = greeterGid
-    login.*.greeterPid = -1
+    login.*.greeter = spawn_module.Child.none()
     login1.init(login1Of(login), ttyPath, allowTestDevice, login.*.environment)
     var pendingIndex: usize = 0
     while pendingIndex < PENDING_MOST {
@@ -681,7 +722,7 @@ fn run(arguments: [][*]const u8) -> !void {
     const ignored = users_module.load(usersOf(login), passwdPath)
     say(login, "login: read the configured account list\n")
     const signals = signalDescriptor()
-    if signals < 0 { try fail("mlx-login: could not create the signal descriptor", Failure.NoSignals) }
+    if signals < 0 && comptime builtin.os != builtin.Os.brixos { try fail("mlx-login: could not create the signal descriptor", Failure.NoSignals) }
     if !connectName(login) {
         try fail("mlx-login: could not own org.mlx.Login on the system bus (is mlx-ipcd --system running?)", Failure.NoBus)
     }
@@ -690,7 +731,7 @@ fn run(arguments: [][*]const u8) -> !void {
     dispatch(login)
     while login.*.running { wait(login, signals) }
     stopGreeter(login)
-    const closedSignals = std.linux.syscall1(std.linux.SYS_close, @bitCast(usize, signals))
+    if signals >= 0 { _ = std.linux.syscall1(std.linux.SYS_close, @bitCast(usize, signals)) }
 }
 
 pub fn main(arguments: [][*]const u8) -> !void {

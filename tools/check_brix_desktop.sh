@@ -69,7 +69,7 @@ done
 cp projects/brix/settings/init/services/serial-shell.service "$work/services/"
 # The desktop service as shipped, its log on the serial console
 # (--verbose: clients, windows, focus and forwarded keys).
-sed -e 's/^exec = mlx-compositor$/exec = mlx-compositor --verbose/' -e '$a log = console' -e '$a env = MLX_COMPOSITOR_LOG=-' \
+sed -e 's/^exec = mlx-compositor$/exec = mlx-compositor --verbose/' -e '/^disabled = yes$/d' -e '$a log = console' -e '$a env = MLX_COMPOSITOR_LOG=-' \
     projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
 grep -q '^exec = mlx-compositor --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 entries=()
