@@ -152,9 +152,9 @@ type_line 'echo $((6 * 7)) $(( 1 << 10 ))'
 wait_for '^42 1024$'
 echo "ok   arithmetic expansion"
 
-type_line 'pwd; cd /; echo * /system/* /system/programs/m*'
+type_line 'pwd; cd /; echo * /system/* /system/programs/flux /system/programs/m*'
 wait_for '^/users/root$'
-wait_for '^devices system temporary users volumes /system/programs /system/settings /system/programs/md5sum /system/programs/mkdir /system/programs/mkfifo /system/programs/flux /system/programs/mv$'
+wait_for '^devices system temporary users volumes /system/programs /system/settings /system/programs/flux /system/programs/md5sum /system/programs/mkdir /system/programs/mkfifo /system/programs/mv$'
 echo "ok   the working directory and a glob over the tree (brixOS's layout)"
 
 type_line 'x=brix; echo ${x}OS ${#x}'
