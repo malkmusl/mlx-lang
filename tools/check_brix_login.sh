@@ -91,9 +91,8 @@ for service in "$work"/services/*.service; do entries+=("settings/init/services/
     "synapse=$work/synapse" "sentinel=$work/sentinel" "aurora=$work/aurora" \
     "settings/users=projects/brix/settings/users" "settings/groups=projects/brix/settings/groups" "settings/shadow=projects/brix/settings/shadow" \
     "share/wayland-sessions/brix.desktop=projects/brix/settings/share/wayland-sessions/brix.desktop" \
-    "share/applications/vector.desktop=projects/desktop/terminal/vector.desktop" \
-    "share/icons/hicolor/256x256/apps/utilities-terminal.png=projects/brix/settings/share/icons/hicolor/256x256/apps/utilities-terminal.png" \
-    "share/icons/hicolor/48x48/apps/utilities-terminal.png=projects/brix/settings/share/icons/hicolor/48x48/apps/utilities-terminal.png" \
+    "share/apps/Vector.app/app.ini=projects/desktop/apps/Vector.app/app.ini" \
+    "share/apps/Vector.app/icon.png=projects/desktop/apps/Vector.app/icon.png" \
     "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" \
     "${entries[@]}" "$work/bin/"
 echo "ok   the kernel, the desktop, synapse, sentinel, aurora, the accounts and a boot image with the bus and login services build"
@@ -171,12 +170,13 @@ printf 'ls -ld /users/brix\r' >&3
 wait_for '^drwx------ 1 brix brix .* /users/brix$'
 echo "ok   the login made /users/brix and gave it to brix (uid 1000) at the first login"
 
-# The terminal icon is shipped under the hicolor theme (its path is longer
-# than a short archive name, so the archive holds it): the launcher and
-# the dock's app items draw it.
-printf 'ls /system/share/icons/hicolor/48x48/apps\r' >&3
-wait_for '^utilities-terminal.png$'
-echo "ok   the terminal icon ships under /system/share/icons/hicolor for the launcher and dock"
+# The terminal ships as an app bundle (Vector.app: app.ini and icon.png,
+# like a macOS .app) instead of a .desktop file and a theme icon; the
+# launcher reads it.
+printf 'ls -1 /system/share/apps/Vector.app\r' >&3
+wait_for '^app.ini$'
+wait_for '^icon.png$'
+echo "ok   Vector ships as an app bundle (/system/share/apps/Vector.app) for the launcher and dock"
 
 # A clean power off.
 printf 'poweroff\r' >&3 2> /dev/null || true
