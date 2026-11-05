@@ -165,6 +165,11 @@ first use (a fault makes the page and the next of its region, 16 in
 all: a fault costs far more than zeroing a page under emulation, and a
 program growing into its memory faults once in 64 KiB rather than once
 a page), copied on write after a fork, shared by memory objects; a
+processor loads a process's page tables only when they are not the ones
+it has (Space.activate: writing CR3 drops the whole TLB, and a process
+going on after a system call or a tick is in its space still; a space
+whose pages were just made copy-on-write is flushed, and a process that
+ran on another processor last is loaded anew there); a
 program that asks for more than there is gets null from mmap, and the
 runtime says "out of memory" on stderr before the program's own report.
 
