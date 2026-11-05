@@ -153,14 +153,18 @@ host.
 ## Memory and the machine's figures
 
 The kernel hands out all of the machine's memory as 4 KiB frames, from
-Memory.FREE (96 MiB: the image and the kernel's arena come first) to its
-end, the Multiboot figure (mem_upper: what lies below the hole under
-4 GiB; memory above it is not used yet). The boot tables map the first
-GiB into the kernel's view (KERNEL_VIRTUAL + physical); the kernel maps
-the rest itself as it starts (kernel/memory.mlx, mapRest: a page
-directory of 2 MiB pages for each further GiB under the boot PDPT, which
-every address space shares), up to 64 GiB (a u16 count per frame, who
-holds it, in 32 MiB of counts at most). A process's pages are made on
+Memory.FREE (96 MiB: the image and the kernel's arena come first) on, in
+spans: the Multiboot memory map's RAM regions (the one below the hole
+under 4 GiB, the ones above it, where a machine with more than 4 GiB has
+most of its memory; a loader without the map, the EFI one for now, gives
+mem_upper, the RAM below the hole). The boot tables map the first GiB
+into the kernel's view (KERNEL_VIRTUAL + physical); the kernel maps the
+rest itself as it starts (kernel/memory.mlx, mapRest: a page directory
+of 2 MiB pages for each GiB with RAM under the boot PDPT, which every
+address space shares; nothing for the hole), up to 64 GiB (a u16 count
+per frame, who holds it, in 32 MiB of counts at most). QEMU's -m 4G
+gives 4095 MiB, 3 below the hole and 1 above it, and a program writes
+and reads 3.5 GiB back. A process's pages are made on
 first use (a fault makes the page and the next of its region, 16 in
 all: a fault costs far more than zeroing a page under emulation, and a
 program growing into its memory faults once in 64 KiB rather than once
@@ -811,8 +815,9 @@ not on brixOS yet, nor is Xwayland.
 
 1. The desktop's rest on brixOS: a login (the greeter on a channel as
    WAYLAND_SOCKET, accounts), the terminal's font settings from /system,
-   icons for the launcher and the dock in the image. Memory above the
-   hole under 4 GiB (the Multiboot memory map).
+   icons for the launcher and the dock in the image. The EFI loader
+   passing the UEFI memory map on (the RAM above the hole under 4 GiB
+   for EFI boots).
 2. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console

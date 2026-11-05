@@ -32,18 +32,36 @@ pub const Page = struct {
     pub fn up(value: usize) -> usize { return (value + SIZE - 1) & ~(SIZE - 1) }
 }
 
+// A run of RAM the kernel hands out (physical, page-aligned).
+pub const Span = struct {
+    start: usize
+    end: usize
+}
+
 pub const Frames = struct {
     // A frame is held by at most this many (sharing more copies it).
     pub const MAX_HOLDERS: usize = 0xFFFF
+    pub const MAX_SPANS: usize = 8
 
+    // The RAM from Memory.FREE on, in spans (the Multiboot memory map's
+    // available regions: the one below the hole under 4 GiB, and the ones
+    // above it; without a map, one span to mem_upper's end), the span
+    // `next` is in, and the end of the last.
+    spans: [MAX_SPANS]Span
+    spanCount: usize
+    span: usize
     next: usize
     end: usize
+    // The RAM in all (the kernel's own part before FREE included).
+    total: usize
     freeList: usize
     freeCount: usize
     // How many hold each frame (a u16 per frame, in frames of their own).
     holders: [*]u16
 
-    // Memory from the Multiboot information (mem_upper: KiB above 1 MiB).
+    // Memory from the Multiboot information: mem_upper (KiB above 1 MiB),
+    // and the memory map (flag 6) where the loader gives one: the RAM
+    // above the hole under 4 GiB is there alone.
     pub fn init(self: *Self) -> void {
         var id: usize = 0
         while id < layout.Memory.MAX_CPUS {
@@ -53,14 +71,35 @@ pub const Frames = struct {
         self.*.next = cpu.BootInfo.get(layout.Info.FREE_PHYS)
         self.*.freeList = 0
         self.*.freeCount = 0
+        self.*.spanCount = 0
         var end: usize = 128 * 1024 * 1024
         const mbi = cpu.BootInfo.get(layout.Info.MBI)
         if mbi != 0 {
             const info = Bytes.pointer(layout.Memory.virtual(mbi))
-            if Bytes.read32(info, 0) & 1 != 0 { end = 0x100000 + Bytes.read32(info, 8) * 1024 }
+            const flags = Bytes.read32(info, 0)
+            if flags & 1 != 0 { end = 0x100000 + Bytes.read32(info, 8) * 1024 }
+            if flags & 64 != 0 { self.readMap(Bytes.read32(info, 48), Bytes.read32(info, 44)) }
         }
-        if end > layout.Memory.MAPPED_LIMIT { end = layout.Memory.MAPPED_LIMIT }
-        self.*.end = Page.down(end)
+        if self.*.spanCount == 0 { self.addSpan(self.*.next, Page.down(end)) }
+        // (Only what the kernel's view reaches.)
+        var k: usize = 0
+        while k < self.*.spanCount {
+            if self.*.spans[k].start >= layout.Memory.MAPPED_LIMIT {
+                self.*.spanCount = k
+                break
+            }
+            if self.*.spans[k].end > layout.Memory.MAPPED_LIMIT { self.*.spans[k].end = layout.Memory.MAPPED_LIMIT }
+            k += 1
+        }
+        self.*.end = self.*.spans[self.*.spanCount - 1].end
+        self.*.span = 0
+        self.*.next = self.*.spans[0].start
+        self.*.total = self.*.spans[0].start
+        k = 0
+        while k < self.*.spanCount {
+            self.*.total += self.*.spans[k].end - self.*.spans[k].start
+            k += 1
+        }
         self.mapRest()
         // The counts first, taken from the start of the free frames.
         const countBytes = Page.up(self.*.end / Page.SIZE * 2)
@@ -69,30 +108,62 @@ pub const Frames = struct {
         self.*.next += countBytes
     }
 
-    // The memory beyond the first GiB in the kernel's view: for each GiB
-    // of it a page directory (a frame from the start of the free ones)
-    // of 2 MiB pages under the boot PDPT, entries another mapping made
-    // (the local APIC's) left as they are.
+    // The Multiboot memory map at `address` (`length` bytes): entries of
+    // a size, a base, a length and a type (1: RAM), the RAM from the
+    // free frames on as spans.
+    fn readMap(self: *Self, address: usize, length: usize) -> void {
+        var at: usize = 0
+        while at + 24 <= length {
+            const entry = Bytes.pointer(layout.Memory.virtual(address + at))
+            const size = Bytes.read32(entry, 0)
+            if size < 20 { return }
+            if Bytes.read32(entry, 20) == 1 {
+                const base = Bytes.read64(entry, 4)
+                const bytes = Bytes.read64(entry, 12)
+                var start = Page.up(base)
+                const stop = Page.down(base + bytes)
+                if start < self.*.next { start = self.*.next }
+                if start < stop { self.addSpan(start, stop) }
+            }
+            at += size + 4
+        }
+    }
+
+    fn addSpan(self: *Self, start: usize, stop: usize) -> void {
+        if self.*.spanCount > 0 && self.*.spans[self.*.spanCount - 1].end == start {
+            self.*.spans[self.*.spanCount - 1].end = stop
+            return
+        }
+        if self.*.spanCount == MAX_SPANS { return }
+        self.*.spans[self.*.spanCount] = Span.{ .start = start, .end = stop }
+        self.*.spanCount += 1
+    }
+
+    // The RAM beyond the first GiB in the kernel's view: for each GiB
+    // with some, a page directory (a frame from the start of the free
+    // ones) of 2 MiB pages under the boot PDPT, entries another mapping
+    // made (the local APIC's) left as they are; nothing for the hole.
     fn mapRest(self: *Self) -> void {
         const pdpt = Bytes.pointer(layout.Memory.virtual(layout.Memory.BLOB + layout.Blob.PDPT))
-        var gib: usize = 1
-        while gib * layout.Memory.GIB < self.*.end {
-            if Bytes.read64(pdpt, gib * 8) & Page.PRESENT == 0 {
-                const directory = self.*.next
-                self.*.next += Page.SIZE
-                Bytes.zeroWords(layout.Memory.virtual(directory), Page.SIZE)
-                Bytes.write64(pdpt, gib * 8, directory | Page.PRESENT | Page.WRITABLE)
-            }
-            const table = Bytes.pointer(layout.Memory.virtual(Bytes.read64(pdpt, gib * 8) & Page.ADDRESS))
-            var k: usize = 0
-            while k < 512 {
-                const physical = gib * layout.Memory.GIB + k * layout.Memory.HUGE
-                if physical >= self.*.end { break }
+        var k: usize = 0
+        while k < self.*.spanCount {
+            var physical = self.*.spans[k].start & ~(layout.Memory.HUGE - 1)
+            if physical < layout.Memory.GIB { physical = layout.Memory.GIB }
+            while physical < self.*.spans[k].end {
+                const gib = physical / layout.Memory.GIB
+                if Bytes.read64(pdpt, gib * 8) & Page.PRESENT == 0 {
+                    const directory = self.*.next
+                    self.*.next += Page.SIZE
+                    Bytes.zeroWords(layout.Memory.virtual(directory), Page.SIZE)
+                    Bytes.write64(pdpt, gib * 8, directory | Page.PRESENT | Page.WRITABLE)
+                }
+                const table = Bytes.pointer(layout.Memory.virtual(Bytes.read64(pdpt, gib * 8) & Page.ADDRESS))
+                const slot = (physical / layout.Memory.HUGE) % 512
                 // Present, writable, a 2 MiB page.
-                if Bytes.read64(table, k * 8) & Page.PRESENT == 0 { Bytes.write64(table, k * 8, physical | 0x83) }
-                k += 1
+                if Bytes.read64(table, slot * 8) & Page.PRESENT == 0 { Bytes.write64(table, slot * 8, physical | 0x83) }
+                physical += layout.Memory.HUGE
             }
-            gib += 1
+            k += 1
         }
     }
 
@@ -108,8 +179,31 @@ pub const Frames = struct {
         return true
     }
 
-    pub fn totalBytes(self: *const Self) -> usize { return self.*.end }
-    pub fn freeBytes(self: *const Self) -> usize { return self.*.end - self.*.next + self.*.freeCount * Page.SIZE }
+    pub fn totalBytes(self: *const Self) -> usize { return self.*.total }
+
+    // What has never been handed out (the current span's rest and the
+    // spans after it) and what came back.
+    pub fn freeBytes(self: *const Self) -> usize {
+        var bytes = self.*.freeCount * Page.SIZE
+        if self.*.span < self.*.spanCount && self.*.next < self.*.spans[self.*.span].end { bytes += self.*.spans[self.*.span].end - self.*.next }
+        var k = self.*.span + 1
+        while k < self.*.spanCount {
+            bytes += self.*.spans[k].end - self.*.spans[k].start
+            k += 1
+        }
+        return bytes
+    }
+
+    // `next` into the next span when its own is used up; false when
+    // none is left.
+    fn advance(self: *Self) -> bool {
+        while self.*.next >= self.*.spans[self.*.span].end {
+            if self.*.span + 1 >= self.*.spanCount { return false }
+            self.*.span += 1
+            self.*.next = self.*.spans[self.*.span].start
+        }
+        return true
+    }
 
     // A zeroed frame's physical address; 0 when memory is out.
     pub fn allocate(self: *Self) -> usize {
@@ -118,7 +212,7 @@ pub const Frames = struct {
             frame = self.*.freeList
             self.*.freeList = Bytes.read64(Bytes.pointer(layout.Memory.virtual(frame)), 0)
             self.*.freeCount -= 1
-        } else if self.*.next < self.*.end {
+        } else if self.advance() {
             frame = self.*.next
             self.*.next += Page.SIZE
         } else {
@@ -133,7 +227,14 @@ pub const Frames = struct {
     // so), zeroed: the first one's address; 0 when there are not that
     // many left in one piece.
     pub fn allocateContiguous(self: *Self, count: usize) -> usize {
-        if self.*.end - self.*.next < count * Page.SIZE { return 0 }
+        if !self.advance() { return 0 }
+        // (In one span: the next one when the rest of this is too short,
+        // the rest left as it is; a device asks early, from a big span.)
+        if self.*.spans[self.*.span].end - self.*.next < count * Page.SIZE {
+            if self.*.span + 1 >= self.*.spanCount || self.*.spans[self.*.span + 1].end - self.*.spans[self.*.span + 1].start < count * Page.SIZE { return 0 }
+            self.*.span += 1
+            self.*.next = self.*.spans[self.*.span].start
+        }
         const first = self.*.next
         self.*.next += count * Page.SIZE
         var k: usize = 0
