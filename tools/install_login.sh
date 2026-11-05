@@ -3,13 +3,13 @@
 # active display manager unless --enable is present.
 #
 # Installs (PREFIX is /usr unless --prefix says otherwise):
-#   PREFIX/bin/mlx/mlx-login, mlx-greeter and mlx-lock
+#   PREFIX/bin/mlx/sentinel, aurora and umbra
 #   PREFIX/bin/mlx on PATH: /etc/profile.d/mlx.sh, /etc/environment.d/50-mlx.conf,
 #                                  /etc/systemd/system.conf.d/50-mlx-path.conf
 #                                  (tools/lib/mlx_layout.sh)
-#   /etc/systemd/system/mlx-login.service
-#   /etc/mlx/init/services/mlx-ipcd.service, mlx-netd.service and
-#                                  mlx-login.service
+#   /etc/systemd/system/sentinel.service
+#   /etc/mlx/init/services/synapse.service, nexus.service and
+#                                  sentinel.service
 #   PREFIX/share/doc/mlx/login/README.md
 #
 # Usage: tools/install_login.sh [options] [compiler]
@@ -19,7 +19,7 @@
 #                      path also works) instead of taking the programs from
 #                      ./mlx build (the login group, only what is not
 #                      current, built as the checkout's owner)
-#   --enable           make mlx-login the display-manager.service and mask
+#   --enable           make sentinel the display-manager.service and mask
 #                      the display manager that alias previously selected
 #   --disable          undo --enable from saved state; installed files stay
 #
@@ -98,7 +98,7 @@ fi
 bindir=$(mlx_bindir "$prefix")
 docdir="${prefix%/}/share/doc/mlx/login"
 system_dir="$destdir/etc/systemd/system"
-wants_path="$system_dir/graphical.target.wants/mlx-login.service"
+wants_path="$system_dir/graphical.target.wants/sentinel.service"
 display_path="$system_dir/display-manager.service"
 state_dir="$destdir/var/lib/mlx/login-installer"
 
@@ -153,7 +153,7 @@ restore_path() {
 }
 
 valid_unit_name() {
-    [[ "$1" == *.service && "$1" != display-manager.service && "$1" != mlx-login.service && "$1" != *[!A-Za-z0-9_.@-]* ]]
+    [[ "$1" == *.service && "$1" != display-manager.service && "$1" != sentinel.service && "$1" != *[!A-Za-z0-9_.@-]* ]]
 }
 
 enable_login() {
@@ -179,9 +179,9 @@ enable_login() {
         valid_unit_name "$previous" || die "invalid previous display-manager name in $state_dir"
         link_path /dev/null "$system_dir/$previous"
     fi
-    link_path /etc/systemd/system/mlx-login.service "$display_path"
-    link_path /etc/systemd/system/mlx-login.service "$wants_path"
-    echo "enabled mlx-login.service as display-manager.service"
+    link_path /etc/systemd/system/sentinel.service "$display_path"
+    link_path /etc/systemd/system/sentinel.service "$wants_path"
+    echo "enabled sentinel.service as display-manager.service"
     if [[ -n "$previous" ]]; then echo "masked the previous display manager: $previous"; fi
 }
 
@@ -204,15 +204,15 @@ disable_login() {
         restore_path graphical-wants "$wants_path"
         restore_path display-manager "$display_path"
         discard_state
-        echo "disabled mlx-login.service and restored the previous display manager state"
+        echo "disabled sentinel.service and restored the previous display manager state"
     else
-        if [[ "$(readlink -- "$wants_path" 2> /dev/null || true)" == /etc/systemd/system/mlx-login.service ]]; then
+        if [[ "$(readlink -- "$wants_path" 2> /dev/null || true)" == /etc/systemd/system/sentinel.service ]]; then
             remove_path "$wants_path"
         fi
-        if [[ "$(readlink -- "$display_path" 2> /dev/null || true)" == /etc/systemd/system/mlx-login.service ]]; then
+        if [[ "$(readlink -- "$display_path" 2> /dev/null || true)" == /etc/systemd/system/sentinel.service ]]; then
             remove_path "$display_path"
         fi
-        echo "mlx-login.service was already disabled; there was no saved display manager state"
+        echo "sentinel.service was already disabled; there was no saved display manager state"
     fi
     [[ -z "$destdir" ]] && echo "run: systemctl daemon-reload"
     return 0
@@ -234,34 +234,34 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ -n "$compiler" ]]; then
-    "$compiler" --quiet projects/desktop/login/main.mlx -o "$build/mlx-login"
-    "$compiler" --quiet projects/desktop/greeter/main.mlx -o "$build/mlx-greeter"
-    "$compiler" --quiet projects/desktop/lock/main.mlx -o "$build/mlx-lock"
+    "$compiler" --quiet projects/desktop/login/main.mlx -o "$build/sentinel"
+    "$compiler" --quiet projects/desktop/greeter/main.mlx -o "$build/aurora"
+    "$compiler" --quiet projects/desktop/lock/main.mlx -o "$build/umbra"
 else
     mlx_build login
-    cp mlx-out/bin/mlx-login mlx-out/bin/mlx-greeter mlx-out/bin/mlx-lock "$build/"
+    cp mlx-out/bin/sentinel mlx-out/bin/aurora mlx-out/bin/umbra "$build/"
 fi
-echo "built mlx-login, mlx-greeter and mlx-lock"
+echo "built sentinel, aurora and umbra"
 
 install -d "$destdir$bindir" "$system_dir" "$destdir/etc/mlx/init/services" "$destdir$docdir"
-install -m 755 "$build/mlx-login" "$build/mlx-greeter" "$build/mlx-lock" "$destdir$bindir/"
+install -m 755 "$build/sentinel" "$build/aurora" "$build/umbra" "$destdir$bindir/"
 sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$docdir|g" \
-    projects/desktop/login/examples/mlx-login.service > "$build/mlx-login.service"
-sed "s|@BINDIR@|$bindir|g" projects/desktop/ipc/examples/mlx-ipcd.init > "$build/mlx-ipcd.init"
-sed "s|@BINDIR@|$bindir|g" projects/network/examples/mlx-netd.init > "$build/mlx-netd.init"
-sed "s|@BINDIR@|$bindir|g" projects/desktop/login/examples/mlx-login.init > "$build/mlx-login.init"
-install -m 644 "$build/mlx-login.service" "$system_dir/mlx-login.service"
-install -m 644 "$build/mlx-ipcd.init" "$destdir/etc/mlx/init/services/mlx-ipcd.service"
-install -m 644 "$build/mlx-netd.init" "$destdir/etc/mlx/init/services/mlx-netd.service"
-install -m 644 "$build/mlx-login.init" "$destdir/etc/mlx/init/services/mlx-login.service"
+    projects/desktop/login/examples/sentinel.service > "$build/sentinel.service"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/ipc/examples/synapse.init > "$build/synapse.init"
+sed "s|@BINDIR@|$bindir|g" projects/network/examples/nexus.init > "$build/nexus.init"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/login/examples/sentinel.init > "$build/sentinel.init"
+install -m 644 "$build/sentinel.service" "$system_dir/sentinel.service"
+install -m 644 "$build/synapse.init" "$destdir/etc/mlx/init/services/synapse.service"
+install -m 644 "$build/nexus.init" "$destdir/etc/mlx/init/services/nexus.service"
+install -m 644 "$build/sentinel.init" "$destdir/etc/mlx/init/services/sentinel.service"
 install -m 644 projects/desktop/login/README.md "$destdir$docdir/README.md"
-echo "installed mlx-login, mlx-greeter, mlx-lock, the systemd unit and the mlx-init service set into ${destdir:-/}"
+echo "installed sentinel, aurora, umbra, the systemd unit and the impulse service set into ${destdir:-/}"
 mlx_install_path_files "$destdir" "$bindir"
 mlx_note_old_layout "$destdir" "$bindir"
 
 if $enable; then
     enable_login
-    [[ -z "$destdir" ]] && echo "run: systemctl daemon-reload && systemctl start mlx-login.service"
+    [[ -z "$destdir" ]] && echo "run: systemctl daemon-reload && systemctl start sentinel.service"
 else
     echo "to switch display managers: tools/install_login.sh --enable"
 fi

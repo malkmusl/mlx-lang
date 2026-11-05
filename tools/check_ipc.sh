@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MLXIPC (projects/desktop/ipc) end to end: mlx-ipcd as the session bus for
+# MLXIPC (projects/desktop/ipc) end to end: synapse as the session bus for
 # real D-Bus programs (dbus-send, gdbus, busctl, dbus-monitor) and for
 # mlx-ipc (std.dbus's client), its permissions per app, activation and
 # direct channels.
@@ -57,7 +57,7 @@ export XDG_STATE_HOME="$work/state"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services"
 
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$work/mlx-ipc"
 "$compiler" --quiet tests/343_ipc_wire_runtime.mlx -o "$work/wire"
 ipc="$work/mlx-ipc"
@@ -85,7 +85,7 @@ Name=org.example.Started
 Exec=$ipc serve org.example.Started
 SERVICE
 
-"$work/mlx-ipcd" --verbose --auth-timeout 2 --services "$work/services" > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose --auth-timeout 2 --services "$work/services" > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 [[ -S "$XDG_RUNTIME_DIR/bus" ]] || fail "the bus does not listen"
@@ -215,12 +215,12 @@ echo "ok   the bus ends on SIGTERM and removes its socket"
 
 # --run: a session on its own bus.
 set +e
-"$work/mlx-ipcd" --address "$work/run.sock" --run sh -c 'case "$DBUS_SESSION_BUS_ADDRESS" in *run.sock) "$0" names | grep -q org.freedesktop.DBus && exit 7;; esac; exit 1' "$ipc"
+"$work/synapse" --address "$work/run.sock" --run sh -c 'case "$DBUS_SESSION_BUS_ADDRESS" in *run.sock) "$0" names | grep -q org.freedesktop.DBus && exit 7;; esac; exit 1' "$ipc"
 status=$?
 set -e
 [[ $status -eq 7 ]] || fail "--run: exit status $status (wanted 7)"
 echo "ok   --run: the program on the bus, its exit status"
 
 mkdir -p "$work/notify-empty"
-python3 -I tools/check_ipc_notify.py "$work/mlx-ipcd" "$work" "$work/notify-empty" || fail "no READY=1 for systemd"
+python3 -I tools/check_ipc_notify.py "$work/synapse" "$work" "$work/notify-empty" || fail "no READY=1 for systemd"
 echo "all MLXIPC checks passed"

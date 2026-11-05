@@ -7,7 +7,7 @@
 #   - libpulse's functions on values (sample specs, channel maps, volumes,
 #     property lists, formats, UTF-8, times, error texts) return what
 #     PulseAudio's return (tools/libpulse_values.py, both called the same);
-#   - against mlx-audiod on MLXIPC: libpulse-simple plays (the monitor has
+#   - against resonance on MLXIPC: libpulse-simple plays (the monitor has
 #     the tone) and records (the input's tone); a GLib main loop
 #     (libpulse-mainloop-glib) connects and reads the server's info; a
 #     signal (pa_signal_new) ends pacat's main loop;
@@ -89,17 +89,17 @@ else
 fi
 
 # Against the server.
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
-"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/resonance"
 cat > "$work/services/org.mlx.Audio.service" <<SERVICE
 [D-BUS Service]
 Name=org.mlx.Audio
-Exec=$work/mlx-audiod --verbose --output null --input sine:440
+Exec=$work/resonance --verbose --output null --input sine:440
 SERVICE
-"$work/mlx-ipcd" --verbose --services "$work/services" --start org.mlx.Audio > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose --services "$work/services" --start org.mlx.Audio > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/pulse/native" ]] && break; sleep 0.1; done
-[[ -S "$XDG_RUNTIME_DIR/pulse/native" ]] || fail "mlx-audiod does not listen"
+[[ -S "$XDG_RUNTIME_DIR/pulse/native" ]] || fail "resonance does not listen"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 
 # Tone measurements, and the libraries driven through ctypes.

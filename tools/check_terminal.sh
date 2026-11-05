@@ -15,7 +15,7 @@
 #     dropped files as quoted paths;
 #   - tests/support/terminal_pty.mlx: a shell on a pty, its output through
 #     the screen, the size it was told;
-#   - mlx-terminal builds (its window needs a compositor:
+#   - vector builds (its window needs a compositor:
 #     tools/check_desktop_clients.sh runs it there).
 #
 #   tools/check_terminal.sh [compiler]
@@ -65,6 +65,6 @@ set -e
 [[ $status -eq 0 ]] || fail "std.terminal.pty: check $status failed (a shell's output through the screen, its size)"
 echo "ok   std.terminal.pty: a shell on a pty, its output and its size"
 
-"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
-echo "ok   mlx-terminal builds"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/vector"
+echo "ok   vector builds"
 echo "PASS terminal"

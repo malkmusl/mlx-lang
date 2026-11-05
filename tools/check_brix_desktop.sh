@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # brixOS's desktop (projects/desktop/compositor with its brixOS backend
-# drm.brixos.mlx, std.wayland's transport over channels, mlx-terminal as
-# a client): mlx-init starts mlx-compositor as the screen service
+# drm.brixos.mlx, std.wayland's transport over channels, vector as
+# a client): impulse starts kepler as the screen service
 # (desktop.service) after the boot splash; it draws on the framebuffer,
 # reads the keyboard and the mouse, listens for Wayland clients on a
 # listener node (/temporary/wayland-mlx), hands its clients the keymap
@@ -9,9 +9,9 @@
 # when the host has the XKB data), and starts its helpers with
 # process_spawn, each on a channel (children.brixos.mlx): the dock and
 # the top bar take their layers, the dock's apps button shows the
-# launcher; Alt+Enter opens mlx-terminal, whose window the compositor
+# launcher; Alt+Enter opens vector, whose window the compositor
 # maps; what is typed goes through the compositor (wl_keyboard) to the
-# terminal and its mlx-sh on a session pair; the mouse moves the cursor.
+# terminal and its flux on a session pair; the mouse moves the cursor.
 # The screen is dumped through QEMU's monitor, which also moves and
 # clicks the mouse.
 #
@@ -48,15 +48,15 @@ brix=--target=x86_64-brixos
 mkdir -p "$work/bin" "$work/services"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
-"$compiler" --quiet $brix projects/init/brixos.mlx -o "$work/mlx-init"
-"$compiler" --quiet $brix projects/init/tool.mlx -o "$work/mlx-initctl"
-"$compiler" --quiet $brix projects/desktop/splash/brixos.mlx -o "$work/mlx-splash"
-"$compiler" --quiet $brix projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet $brix projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
-"$compiler" --quiet $brix projects/desktop/launcher/main.mlx -o "$work/mlx-launcher"
-"$compiler" --quiet $brix projects/desktop/dock/main.mlx -o "$work/mlx-dock"
-"$compiler" --quiet $brix projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
+"$compiler" --quiet $brix projects/init/brixos.mlx -o "$work/impulse"
+"$compiler" --quiet $brix projects/init/tool.mlx -o "$work/impulsectl"
+"$compiler" --quiet $brix projects/desktop/splash/brixos.mlx -o "$work/ignition"
+"$compiler" --quiet $brix projects/desktop/compositor/main.mlx -o "$work/kepler"
+"$compiler" --quiet $brix projects/desktop/terminal/main.mlx -o "$work/vector"
+"$compiler" --quiet $brix projects/desktop/launcher/main.mlx -o "$work/launch"
+"$compiler" --quiet $brix projects/desktop/dock/main.mlx -o "$work/orbit"
+"$compiler" --quiet $brix projects/desktop/topbar/main.mlx -o "$work/horizon"
 keymap=()
 if [[ -f /usr/share/X11/xkb/rules/evdev ]]; then
     "$compiler" --quiet projects/brix/tools/keymap/main.mlx -o "$work/brix-keymap"
@@ -69,13 +69,13 @@ done
 cp projects/brix/settings/init/services/serial-shell.service "$work/services/"
 # The desktop service as shipped, its log on the serial console
 # (--verbose: clients, windows, focus and forwarded keys).
-sed -e 's/^exec = mlx-compositor$/exec = mlx-compositor --verbose/' -e '/^disabled = yes$/d' -e '$a log = console' -e '$a env = MLX_COMPOSITOR_LOG=-' \
+sed -e 's/^exec = kepler$/exec = kepler --verbose/' -e '/^disabled = yes$/d' -e '$a log = console' -e '$a env = MLX_COMPOSITOR_LOG=-' \
     projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
-grep -q '^exec = mlx-compositor --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
+grep -q '^exec = kepler --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "mlx-init=$work/mlx-init" "mlx-initctl=$work/mlx-initctl" "mlx-splash=$work/mlx-splash" "mlx-compositor=$work/mlx-compositor" "mlx-terminal=$work/mlx-terminal" "mlx-launcher=$work/mlx-launcher" "mlx-dock=$work/mlx-dock" "mlx-topbar=$work/mlx-topbar" "share/applications/mlx-terminal.desktop=projects/desktop/terminal/mlx-terminal.desktop" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
-echo "ok   the kernel, mlx-init, mlx-splash, mlx-compositor, mlx-terminal, the launcher, the dock, the top bar$([[ ${#keymap[@]} -gt 0 ]] && echo ", the us keymap") and a boot image with the desktop service build"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "share/applications/vector.desktop=projects/desktop/terminal/vector.desktop" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
+echo "ok   the kernel, impulse, ignition, kepler, vector, the launcher, the dock, the top bar$([[ ${#keymap[@]} -gt 0 ]] && echo ", the us keymap") and a boot image with the desktop service build"
 
 # The QEMU monitor on a socket: screen dumps, keys, the mouse.
 monitor() {
@@ -137,30 +137,30 @@ wait_for() {
     done
 }
 for (( i = 0; i < 100; i++ )); do [[ -S $work/monitor ]] && break; sleep 0.1; done
-wait_for '^mlx-init: brixOS.s init$'
-wait_for '^mlx-init: services defined: 2$'
+wait_for '^impulse: brixOS.s init$'
+wait_for '^impulse: services defined: 2$'
 wait_for '^root@brix:[^#]*# '
 # The splash quits for the screen service; the compositor says its settings.
-wait_for '^mlx-splash: told to quit, the picture stays$'
+wait_for '^ignition: told to quit, the picture stays$'
 wait_for '^settings: border #5aa0ff'
-echo "ok   mlx-init starts the desktop as the screen service after the splash; mlx-compositor is up on the framebuffer"
+echo "ok   impulse starts the desktop as the screen service after the splash; kepler is up on the framebuffer"
 if [[ ${#keymap[@]} -gt 0 ]]; then
     wait_for '^keyboard: keymap from /system/settings/keyboard$'
     echo "ok   the compositor hands its clients the keymap of /system/settings/keyboard/us.xkb (brix-keymap, from the host's XKB data)"
 fi
 # The helpers, started with process_spawn on their channels: the dock
 # and the top bar as layers.
-wait_for '^launch: mlx-dock$'
-wait_for '^layer: mlx-dock '
-wait_for '^layer: mlx-topbar 1024x30 at 0,0 in layer 2$'
+wait_for '^launch: orbit$'
+wait_for '^layer: orbit '
+wait_for '^layer: horizon 1024x30 at 0,0 in layer 2$'
 echo "ok   the compositor starts its helpers natively (process_spawn): the dock and the top bar take their layers"
-# Alt+Enter: the compositor starts mlx-terminal, which connects over the
+# Alt+Enter: the compositor starts vector, which connects over the
 # listener node and maps its window.
 monitor "sendkey alt-ret"
 wait_for '^client connected$'
 wait_for '^map: Mlx Terminal$'
 wait_for '^focus: Mlx Terminal$'
-echo "ok   Alt+Enter starts mlx-terminal: it connects over /temporary/wayland-mlx (a channel), its window is mapped and focused"
+echo "ok   Alt+Enter starts vector: it connects over /temporary/wayland-mlx (a channel), its window is mapped and focused"
 # The window on the screen: its blue title bar and border.
 blue=0
 white=0
@@ -181,7 +181,7 @@ monitor "sendkey e" "sendkey c" "sendkey h" "sendkey o" "sendkey spc" "sendkey t
 sleep 1
 printf 'cat /temporary/keys\r' >&3
 wait_for '^typed$'
-echo "ok   what is typed goes through the compositor (wl_keyboard) to mlx-terminal and its mlx-sh on a session pair"
+echo "ok   what is typed goes through the compositor (wl_keyboard) to vector and its flux on a session pair"
 # The mouse: QEMU's PS/2 mouse moves the cursor from the screen's middle
 # to its right, outside the window.
 read -r blue white < <(measure "$work/window.ppm")
@@ -201,15 +201,15 @@ echo "ok   the mouse (/devices/mouse, PS/2 packets by IRQ 12) moves the cursor (
 # from the left and 618+95 from the top; the cursor is at 812,544 now):
 # the dock tells the compositor on its channel, which shows the launcher.
 monitor "mouse_move -200 100" "mouse_move -167 69" "mouse_button 1" "mouse_button 0"
-wait_for '^layer: mlx-launcher '
-wait_for '^focus: mlx-launcher$'
+wait_for '^layer: launch '
+wait_for '^focus: launch$'
 echo "ok   the dock's apps button (a message on its channel) shows the launcher, which takes the keyboard"
 monitor "sendkey esc"
-printf 'mlx-initctl poweroff\r' >&3
-wait_for '^mlx-init: poweroff$'
+printf 'impulsectl poweroff\r' >&3
+wait_for '^impulse: poweroff$'
 wait_for '^brixOS: powering off$'
 for (( i = 0; i < 100; i++ )); do kill -0 "$qemu_pid" 2> /dev/null || break; sleep 0.1; done
 kill -0 "$qemu_pid" 2> /dev/null && fail "QEMU did not power off"
 qemu_pid=
-echo "ok   mlx-initctl poweroff stops the desktop and the machine powers off"
+echo "ok   impulsectl poweroff stops the desktop and the machine powers off"
 echo PASS

@@ -8,11 +8,11 @@ compositor's keymap (`std.xkb` through the host, so any layout types what
 its keys say) and encoding them as xterm does.
 
 ```sh
-mlx-out/bin/compiler/mlx4 projects/desktop/terminal/main.mlx -o mlx-terminal
-./mlx-terminal                       # $SHELL, else mlx-sh beside it or installed, else /bin/sh
-./mlx-terminal /bin/bash -l          # another program (absolute path)
-./mlx-terminal --font-size 18        # or MLX_TERMINAL_FONT_SIZE
-./mlx-terminal --columns 120 --rows 40
+mlx-out/bin/compiler/mlx4 projects/desktop/terminal/main.mlx -o vector
+./vector                       # $SHELL, else flux beside it or installed, else /bin/sh
+./vector /bin/bash -l          # another program (absolute path)
+./vector --font-size 18        # or MLX_TERMINAL_FONT_SIZE
+./vector --columns 120 --rows 40
 tools/check_terminal.sh              # the emulation, the drawing, the pty
 ```
 

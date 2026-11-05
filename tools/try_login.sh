@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Tries mlx-login on this machine for a few minutes, from the running
+# Tries sentinel on this machine for a few minutes, from the running
 # graphical session, and keeps every log of the try:
 #
-#   1. ends your mlx-compositor (the graphical session; save your work)
+#   1. ends your kepler (the graphical session; save your work)
 #   2. switches to VT 8, where no shell reads the keyboard (without a seat
 #      manager the greeter and the console both get every key)
-#   3. runs mlx-login with its greeter (as the mlx-greeter account) for
+#   3. runs sentinel with its greeter (as the aurora account) for
 #      --time seconds, then systemd ends it and every session it started
-#   4. saves the logs into ~/mlx-login-test/DATE-TIME: the greeter's
+#   4. saves the logs into ~/sentinel-test/DATE-TIME: the greeter's
 #      compositor log (copied every two seconds, its directory goes with
 #      the greeter), the session's compositor log and launcher trace, the
-#      journal of mlx-login and mlx-ipcd, the processes with their groups
+#      journal of sentinel and synapse, the processes with their groups
 #      while it ran, what each process of the session waits in, the device
 #      permissions
 #   5. switches back to the VT you were on and starts the display manager
@@ -19,11 +19,11 @@
 #   tools/try_login.sh [--time SECONDS]     (default 180)
 #
 # Run it as yourself from a terminal of the session; it asks for sudo once.
-# The work happens in a transient systemd service (mlx-login-try-*), so it
+# The work happens in a transient systemd service (sentinel-try-*), so it
 # goes on when the session it ends takes the terminal with it.
 #
 # Needs the greeter account and the device access of the greeter
-# (mlx-greeter, its udev ACL rule) set up before.
+# (aurora, its udev ACL rule) set up before.
 set -uo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -52,16 +52,16 @@ if ! $inner; then
         echo "try_login.sh: run it as yourself (it asks for sudo itself)" >&2
         exit 2
     fi
-    id mlx-greeter > /dev/null 2>&1 || { echo "try_login.sh: there is no mlx-greeter account yet" >&2; exit 1; }
-    [[ -x $bindir/mlx-login && -x $bindir/mlx-compositor && -x $bindir/mlx-greeter ]] || { echo "try_login.sh: $bindir lacks mlx-login, mlx-compositor or mlx-greeter" >&2; exit 1; }
+    id aurora > /dev/null 2>&1 || { echo "try_login.sh: there is no aurora account yet" >&2; exit 1; }
+    [[ -x $bindir/sentinel && -x $bindir/kepler && -x $bindir/aurora ]] || { echo "try_login.sh: $bindir lacks sentinel, kepler or aurora" >&2; exit 1; }
     stamp=$(date +%Y-%m-%d_%H-%M-%S)
-    out="$HOME/mlx-login-test/$stamp"
+    out="$HOME/sentinel-test/$stamp"
     mkdir -p "$out"
     sudo -v || exit 1
-    sudo systemd-run --quiet --collect --unit="mlx-login-try-$stamp" \
+    sudo systemd-run --quiet --collect --unit="sentinel-try-$stamp" \
         /bin/bash "$repo_root/tools/try_login.sh" --inner --user "$USER" --time "$seconds" --out "$out" || exit 1
     echo "The try runs now: in 5 seconds your session ends, for $seconds seconds"
-    echo "mlx-login and its greeter run on VT $test_vt, then you are back on this VT."
+    echo "sentinel and its greeter run on VT $test_vt, then you are back on this VT."
     echo "Type no real password in the greeter. The logs go to:"
     echo "    $out"
     exit 0
@@ -74,16 +74,16 @@ log="$out/try.log"
 say() { echo "$(date +%T) $*" >> "$log"; }
 home=$(getent passwd "$user" | cut -d: -f6)
 user_id=$(id -u "$user")
-greeter_uid=$(id -u mlx-greeter)
-greeter_gid=$(getent group mlx-greeter | cut -d: -f3)
+greeter_uid=$(id -u aurora)
+greeter_gid=$(getent group aurora | cut -d: -f3)
 greeter_log=/run/mlx/user/greeter/.config/mlx/compositor.log
 started=$(date +%s)
 vt_open=false
-say "try of mlx-login for $seconds s; user $user ($user_id), greeter account $greeter_uid:$greeter_gid"
+say "try of sentinel for $seconds s; user $user ($user_id), greeter account $greeter_uid:$greeter_gid"
 
 # A compositor log without its "key CODE -> WINDOW" lines: older
 # compositors wrote every key pressed into the log (with --verbose, as
-# mlx-session and mlx-login run them), what was typed into the greeter
+# mlx-session and sentinel run them), what was typed into the greeter
 # among it.
 copy_log() {
     grep -v '^key [0-9]' "$1" > "$2"
@@ -96,7 +96,7 @@ copy_log() {
 waits() {
     local name pid task fd
     echo "== $(date +%T)"
-    for name in mlx-session loginctl localectl systemctl mlx-ipcd mlx-audiod mlx-compositor mlx-launcher mlx-dock mlx-topbar Xwayland; do
+    for name in mlx-session loginctl localectl systemctl synapse resonance kepler launch orbit horizon Xwayland; do
         for pid in $(pgrep -u "$user" -x "$name"); do
             echo "-- $name $pid: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2> /dev/null)"
             for task in /proc/"$pid"/task/*; do
@@ -123,19 +123,19 @@ done
 id "$user" > "$out/id.txt" 2>&1
 {
     ls -l /dev/dri/
-    getfacl -p /dev/dri/card* /dev/input/event* 2> /dev/null | grep -E '^# file|mlx-greeter'
+    getfacl -p /dev/dri/card* /dev/input/event* 2> /dev/null | grep -E '^# file|aurora'
 } > "$out/devices.txt" 2>&1
 
 # End the session's compositor (only this user's).
 sleep 5
-pkill -TERM -u "$user" -x mlx-compositor && say "ended $user's mlx-compositor"
+pkill -TERM -u "$user" -x kepler && say "ended $user's kepler"
 for _ in $(seq 20); do
-    pgrep -u "$user" -x mlx-compositor > /dev/null || break
+    pgrep -u "$user" -x kepler > /dev/null || break
     sleep 0.5
 done
-if pgrep -u "$user" -x mlx-compositor > /dev/null; then
-    pkill -KILL -u "$user" -x mlx-compositor
-    say "mlx-compositor did not end on TERM: killed"
+if pgrep -u "$user" -x kepler > /dev/null; then
+    pkill -KILL -u "$user" -x kepler
+    say "kepler did not end on TERM: killed"
 fi
 [[ "$display_manager" == active ]] && systemctl stop display-manager && say "stopped the display manager"
 
@@ -150,20 +150,20 @@ if [[ -n "$busy" ]]; then
     say "the cards are still open (pids:$busy); no try"
     ps -o pid,user,cmd -p "$(echo "$busy" | tr ' ' ',' | sed 's/^,//')" >> "$log" 2>&1
 else
-    systemctl is-active --quiet mlx-ipcd || { systemctl start mlx-ipcd; say "started mlx-ipcd"; }
+    systemctl is-active --quiet synapse || { systemctl start synapse; say "started synapse"; }
     # The test VT shows nothing of what is typed. The console resets a VT's
     # settings when the last file on it closes, so `stty -F` alone would
     # not last: this script keeps the VT open on descriptor 3 to the end.
     exec 3<> "/dev/tty$test_vt" && vt_open=true
     $vt_open && stty -echo <&3 2> /dev/null
     timeout 10 chvt "$test_vt" || say "chvt $test_vt did not finish in 10 s"
-    systemctl reset-failed mlx-login-test 2> /dev/null
-    if systemd-run --quiet --collect --unit=mlx-login-test -p RuntimeMaxSec="$seconds" \
-        "$bindir/mlx-login" --greeter-uid "$greeter_uid" --greeter-gid "$greeter_gid" \
-        --greeter "$bindir/mlx-compositor" "$bindir/mlx-greeter"; then
-        say "mlx-login runs (mlx-login-test.service)"
+    systemctl reset-failed sentinel-test 2> /dev/null
+    if systemd-run --quiet --collect --unit=sentinel-test -p RuntimeMaxSec="$seconds" \
+        "$bindir/sentinel" --greeter-uid "$greeter_uid" --greeter-gid "$greeter_gid" \
+        --greeter "$bindir/kepler" "$bindir/aurora"; then
+        say "sentinel runs (sentinel-test.service)"
         tick=0
-        while systemctl is-active --quiet mlx-login-test; do
+        while systemctl is-active --quiet sentinel-test; do
             [[ -f "$greeter_log" ]] && copy_log "$greeter_log" "$out/greeter-compositor.log"
             if (( tick % 5 == 0 )); then
                 {
@@ -175,14 +175,14 @@ else
             tick=$((tick + 1))
             sleep 2
         done
-        say "mlx-login ended"
+        say "sentinel ended"
     else
-        say "mlx-login did not start"
+        say "sentinel did not start"
     fi
 fi
 
 # The logs, first: nothing after this may lose them.
-journalctl --since "@$started" -u mlx-login-test -u mlx-ipcd --no-pager -o short-precise > "$out/journal-mlx.txt" 2>&1
+journalctl --since "@$started" -u sentinel-test -u synapse --no-pager -o short-precise > "$out/journal-mlx.txt" 2>&1
 journalctl --since "@$started" --no-pager -o short-precise -p warning > "$out/journal-warnings.txt" 2>&1
 for file in compositor.log compositor.log.old; do
     [[ -f "$home/.config/mlx/$file" ]] && copy_log "$home/.config/mlx/$file" "$out/after-session-$file"

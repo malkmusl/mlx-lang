@@ -37,7 +37,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for program in ipc/main:mlx-ipcd compositor/main:mlx-compositor capture/main:mlx-capture; do
+for program in ipc/main:synapse compositor/main:kepler capture/main:mlx-capture; do
     "$compiler" --quiet "projects/desktop/${program%%:*}.mlx" -o "$work/${program##*:}"
 done
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
@@ -63,7 +63,7 @@ share() {
 Name=org.freedesktop.portal.Desktop
 Exec=$work/mlx-capture --portal --verbose $choose
 SERVICE
-    "$work/mlx-ipcd" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
+    "$work/synapse" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
     bus_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
     printf '%b\n' "$script" > "$work/$name.script"
@@ -72,7 +72,7 @@ SERVICE
     "$work/test-host" "host-$name" "$work/us.xkb" "$work/$name.script" > "$work/host.log" 2>&1 &
     local host=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" timeout 120 "$work/mlx-compositor" --renderer cpu --size ${SIZE:-640x400} --no-fps --socket wayland-mlx \
+    WAYLAND_DISPLAY="host-$name" timeout 120 "$work/kepler" --renderer cpu --size ${SIZE:-640x400} --no-fps --socket wayland-mlx \
         --dock none --topbar none --launcher none --xwayland none --run "$work/$name.sh" > "$work/compositor.log" 2>&1 || true
     wait "$host" || true
     kill "$bus_pid" 2> /dev/null || true

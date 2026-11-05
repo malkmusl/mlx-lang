@@ -40,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for program in ipc/main:mlx-ipcd audio/main:mlx-audiod audio/tool:mlx-audio compositor/main:mlx-compositor capture/main:mlx-capture; do
+for program in ipc/main:synapse audio/main:resonance audio/tool:mlx-audio compositor/main:kepler capture/main:mlx-capture; do
     "$compiler" --quiet "projects/desktop/${program%%:*}.mlx" -o "$work/${program##*:}"
 done
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
@@ -49,9 +49,9 @@ xkbcli compile-keymap --layout us > "$work/us.xkb"
 cat > "$work/services/org.mlx.Audio.service" <<SERVICE
 [D-BUS Service]
 Name=org.mlx.Audio
-Exec=$work/mlx-audiod --verbose --output null --input sine:880
+Exec=$work/resonance --verbose --output null --input sine:880
 SERVICE
-"$work/mlx-ipcd" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
@@ -88,7 +88,7 @@ SCRIPT
     "$work/test-host" "host-$name" "$work/us.xkb" "$work/$name.script" > "$work/host.log" 2>&1 &
     local host=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" timeout 60 "$work/mlx-compositor" --renderer cpu --size 640x400 --no-fps --socket "nested-$name" \
+    WAYLAND_DISPLAY="host-$name" timeout 60 "$work/kepler" --renderer cpu --size 640x400 --no-fps --socket "nested-$name" \
         --dock none --topbar none --launcher none --xwayland none --run "$work/$name.sh" > "$work/compositor.log" 2>&1 || true
     wait "$host" || true
     grep -q "^saved $work/$name.mkv" "$work/record.log" || fail "$name: mlx-capture did not save the recording"

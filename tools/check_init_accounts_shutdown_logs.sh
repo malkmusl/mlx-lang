@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Focused checks for mlx-init service identities, dependency-aware shutdown,
+# Focused checks for impulse service identities, dependency-aware shutdown,
 # and persistent rotating logs. The main init check invokes the same behavior
 # in its broader boot scenario; keeping this file focused makes failures much
 # easier to diagnose while developing these three features.
@@ -19,8 +19,8 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL $1" >&2; [[ -f "${2:-}" ]] && cat "$2" >&2; exit 1; }
 
-"$compiler" --quiet projects/init/main.mlx -o "$work/mlx-init"
-"$compiler" --quiet projects/init/tool.mlx -o "$work/mlx-initctl"
+"$compiler" --quiet projects/init/main.mlx -o "$work/impulse"
+"$compiler" --quiet projects/init/tool.mlx -o "$work/impulsectl"
 
 wait_for() {
     local description=$1
@@ -46,10 +46,10 @@ exec = /bin/sh -c "echo uid=\$(id -u) gid=\$(id -g) home=\$HOME user=\$USER"
 SERVICE
 cat > "$work/services/refused.service" <<SERVICE
 type = oneshot
-user = mlx-init-account-that-must-not-exist
+user = impulse-account-that-must-not-exist
 exec = /bin/sh -c "touch $work/ran-as-the-wrong-user"
 SERVICE
-"$work/mlx-init" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2> "$work/init.err" &
+"$work/impulse" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2> "$work/init.err" &
 init_pid=$!
 wait_for "the identity service did not finish" "grep -q '^uid=' '$work/log/identity.log' 2>/dev/null"
 wait_for "the unknown service account was not diagnosed" "grep -q 'refused: has an unknown or unavailable user/group' '$work/init.err' 2>/dev/null"
@@ -72,7 +72,7 @@ user = nobody
 group = nobody
 exec = /bin/sh -c "echo uid=\$(id -u) gid=\$(id -g) groups=\$(id -G)"
 SERVICE
-    unshare --map-root-user --map-users 1:100000:65534 --map-groups 1:100000:65534 "$work/mlx-init" --services "$work/services" --control "$work/run/init" --log "$work/log" 2> "$work/init.err" &
+    unshare --map-root-user --map-users 1:100000:65534 --map-groups 1:100000:65534 "$work/impulse" --services "$work/services" --control "$work/run/init" --log "$work/log" 2> "$work/init.err" &
     init_pid=$!
     wait_for "the namespace service did not drop privileges" "grep -q '^uid=' '$work/log/drop.log' 2>/dev/null"
     grep -q '^uid=65534 gid=65534 groups=65534$' "$work/log/drop.log" || fail "setgroups/setgid/setuid did not apply the configured account" "$work/log/drop.log"
@@ -95,7 +95,7 @@ after = base
 exec = /bin/sh -c "trap 'echo dependent-term >> $work/shutdown; sleep 0.25; echo dependent-end >> $work/shutdown; exit 0' TERM; echo dependent-ready >> $work/shutdown; while :; do sleep 1; done"
 stop-timeout = 2s
 SERVICE
-"$work/mlx-init" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2> "$work/init.err" &
+"$work/impulse" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2> "$work/init.err" &
 init_pid=$!
 wait_for "the dependent service did not start" "grep -q '^dependent-ready$' '$work/shutdown' 2>/dev/null"
 kill -TERM "$init_pid"
@@ -115,7 +115,7 @@ cat > "$work/services/writer.service" <<SERVICE
 exec = /bin/sh -c "n=0; while :; do echo record-\$n-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; n=\$((n+1)); done"
 stop-timeout = 1s
 SERVICE
-"$work/mlx-init" --services "$work/services" --control "$work/run/init" --log "$work/blocked/persistent" --runtime-log "$work/runtime" --log-size 32768 2> "$work/init.err" &
+"$work/impulse" --services "$work/services" --control "$work/run/init" --log "$work/blocked/persistent" --runtime-log "$work/runtime" --log-size 32768 2> "$work/init.err" &
 init_pid=$!
 wait_for "the service did not write its temporary log" "test -s '$work/runtime/writer.log'"
 rm "$work/blocked/persistent"
@@ -128,4 +128,4 @@ init_pid=
 grep -q '^record-' "$work/blocked/persistent"/writer.log* || fail "the rotated logs have no service output"
 echo "ok   logs move to writable persistent storage and rotate"
 
-echo "PASS mlx-init identities, shutdown order and logs"
+echo "PASS impulse identities, shutdown order and logs"

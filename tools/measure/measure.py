@@ -12,7 +12,7 @@ where their time and memory go and to compare before and after a change:
     process's start to its first frame, the frames (the processor's and the
     GPU's time on each), what they hold at the end;
   - the command line programs (the compiler on a large program, the
-    codemap on this repository, mlx-sh on a loop) for their wall time,
+    codemap on this repository, flux on a loop) for their wall time,
     processor time and most memory resident.
 
     tools/measure/measure.py [--compiler PATH] [--out DIR] [--only NAME,...] [--canvas gpu,cpu] [--profile] [--profile-after MS]
@@ -47,14 +47,14 @@ DESKTOP = {
     'observatory': ('projects/observatory/main.mlx', 'run', [REPO]),
 }
 BINARY = {
-    'dock': 'mlx-dock', 'topbar': 'mlx-topbar', 'launcher': 'mlx-launcher', 'files': 'mlx-files',
-    'settings': 'mlx-settings', 'terminal': 'mlx-terminal', 'observatory': 'mlx-observatory',
+    'dock': 'orbit', 'topbar': 'horizon', 'launcher': 'launch', 'files': 'polaris',
+    'settings': 'control', 'terminal': 'vector', 'observatory': 'mlx-observatory',
 }
 TOOLS = {
-    'mlx-compositor': 'projects/desktop/compositor/main.mlx',
+    'kepler': 'projects/desktop/compositor/main.mlx',
     'test-host': 'tools/wayland-test-host/main.mlx',
     'mlx-codemap': 'tools/codemap/main.mlx',
-    'mlx-sh': 'projects/shell/main.mlx',
+    'flux': 'projects/shell/main.mlx',
     'mlx-profile': 'tools/profile/main.mlx',
 }
 
@@ -187,7 +187,7 @@ def run_desktop(work, name, canvas, keymap, profile=False, profile_after=0):
             break
         time.sleep(0.05)
     program = os.path.join(work, BINARY[name])
-    command = [os.path.join(work, 'mlx-compositor'), '--no-fps', '--renderer', 'cpu', '--socket', 'nested-measure', '--size', '%dx%d' % (width, height), '--xwayland', 'none']
+    command = [os.path.join(work, 'kepler'), '--no-fps', '--renderer', 'cpu', '--socket', 'nested-measure', '--size', '%dx%d' % (width, height), '--xwayland', 'none']
     # The program through a small wrapper script: its arguments, and
     # mlx-profile when profiling.
     profiles = os.path.join(work, 'profiles-' + name + '-' + canvas)
@@ -206,7 +206,7 @@ def run_desktop(work, name, canvas, keymap, profile=False, profile_after=0):
         'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': home, 'XDG_RUNTIME_DIR': runtime, 'WAYLAND_DISPLAY': socket,
         'XDG_DATA_HOME': os.path.join(home, '.local/share'), 'XDG_DATA_DIRS': empty, 'XDG_CONFIG_HOME': os.path.join(home, '.config'),
         'VK_DRIVER_FILES': LAVAPIPE, 'MLX_CANVAS': canvas, 'MLX_FRAMES': '1', 'MLX_LEAK_CHECK': leaks, 'LANG': 'en_US.UTF-8', 'TZ': 'UTC',
-        'SHELL': os.path.join(work, 'mlx-sh'),
+        'SHELL': os.path.join(work, 'flux'),
     }
     log = open(os.path.join(work, name + '-' + canvas + '.log'), 'w')
     status = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT, timeout=180).returncode
@@ -247,7 +247,7 @@ def run_commands(compiler, work):
     return [
         run_command('compiler (observatory)', [compiler, '--quiet', 'projects/observatory/main.mlx', '-o', os.path.join(work, 'observatory-again')]),
         run_command('codemap stats (repository)', [os.path.join(work, 'mlx-codemap'), '-C', REPO, 'stats']),
-        run_command('mlx-sh (20000 turns)', [os.path.join(work, 'mlx-sh')], stdin=loop),
+        run_command('flux (20000 turns)', [os.path.join(work, 'flux')], stdin=loop),
     ]
 
 

@@ -19,14 +19,14 @@ repository does.
 | Standard library | `std` (system calls, files, formats, crypto, Wayland, Vulkan, UI) | glibc for our own code | done for what the programs use |
 | C library | mlxlibc (`compiler/libc`): 830 C names, libm and the dynamic loader | glibc, ld.so, libm | runs glibc-linked programs; `libm.so.6` in Mlx with the long double functions as x87 code; `strtold` to 64 bits; iconv missing |
 | C compiler | mlx-cc (`compiler/cc`) | gcc, as, ld for C programs | programs of C89 to C23 (`-std=`, `_BitInt`, `#embed`, x87 `long double`) build and run, on glibc and on mlxlibc alone; `-c` objects, `mlx-ar` archives and the compiler's own linker (gcc's objects link too); zlib, Lua and SQLite pass their tests; shared objects are next |
-| Init | mlx-init (`projects/init`) | systemd as PID 1, sysvinit | supervises, mounts, shuts down; no users per service, no device events |
-| Shell | mlx-sh (`projects/shell`) | bash, dash | POSIX scripts, line editor |
+| Init | impulse (`projects/init`) | systemd as PID 1, sysvinit | supervises, mounts, shuts down; no users per service, no device events |
+| Shell | flux (`projects/shell`) | bash, dash | POSIX scripts, line editor |
 | Core utilities | `projects/coreutils` (about 70 programs) | GNU coreutils | the common ones; the rest of coreutils is open |
 | System bus | MLXIPC (`projects/desktop/ipc`) | dbus-daemon | session and system bus, per-app permissions |
-| Network | mlx-netd (`projects/network`) | NetworkManager, wpa_supplicant, dhclient | cables, DHCPv4, WPA2-Personal |
+| Network | nexus (`projects/network`) | NetworkManager, wpa_supplicant, dhclient | cables, DHCPv4, WPA2-Personal |
 | Sound | MLX Audio (`projects/desktop/audio`) | PipeWire, PulseAudio | own libpulse and libpipewire for C programs |
 | Desktop | compositor, dock, launcher, top bar, settings, files, terminal | GNOME, KDE | done; greeter and lock screen open |
-| Login | mlx-login (`projects/desktop/login`) | GDM, SDDM, systemd-logind | bus and accounts done; the privileged steps are left to the owner |
+| Login | sentinel (`projects/desktop/login`) | GDM, SDDM, systemd-logind | bus and accounts done; the privileged steps are left to the owner |
 
 What a running system still takes from GNU today: glibc under the
 programs we did not write (Mesa's Vulkan drivers, Xwayland, browsers),
@@ -99,7 +99,7 @@ mlxlibc with its own libm. The gaps left are listed in
 2. `pkg-config` and the small binary tools: `nm`, `strip`, `objdump`,
    `size`, `readelf`.
 3. A build description for our own tree that needs no bash: the check
-   scripts become mlx-sh scripts or Mlx programs.
+   scripts become flux scripts or Mlx programs.
 
 ## Phase 4: the userland, complete
 
@@ -107,17 +107,17 @@ mlxlibc with its own libm. The gaps left are listed in
    tar, gzip and xz, less.
 2. util-linux's essentials: mount, umount, fdisk, mkfs for ext4 and vfat,
    fsck, losetup, dmesg, kill, su.
-3. mlx-sh far enough to run the configure scripts real projects ship.
+3. flux far enough to run the configure scripts real projects ship.
 
 ## Phase 5: the system, complete
 
-1. mlx-init: services as users, ordered shutdown, logs that survive a
+1. impulse: services as users, ordered shutdown, logs that survive a
    reboot, device events (uevents, coldplug, `/dev` permissions), readiness
    by socket, fstab and fsck.
 2. Login: the greeter, the lock screen, the seat (the part of logind the
    compositor uses), the installer for them.
 3. Updates and packages: a ports-like tree of build descriptions that
-   mlx-cc, mlx-make and mlx-sh build from source.
+   mlx-cc, mlx-make and flux build from source.
 
 ## Phase 6: C++ and the drivers
 

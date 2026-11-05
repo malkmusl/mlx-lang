@@ -1,52 +1,52 @@
-# mlx-init
+# impulse
 
-PID 1 of MLX/Linux, written in Mlx without libc: `mlx-init` mounts the
+PID 1 of MLX/Linux, written in Mlx without libc: `impulse` mounts the
 virtual file systems and what the mounts file lists, sets the hostname,
 starts the services defined in a directory in their order, supervises
 them (ended ones start again after a pause that grows while they keep
-failing), answers `mlx-initctl` over a control socket, and shuts the
+failing), answers `impulsectl` over a control socket, and shuts the
 system down in dependency order. Not PID 1 (started by hand, or by
 `tools/check_init.sh`), it supervises the same way without the mounts,
 the hostname and the reboot.
 
 ```sh
-mlx4 projects/init/main.mlx -o mlx-init
-mlx4 projects/init/tool.mlx -o mlx-initctl
+mlx4 projects/init/main.mlx -o impulse
+mlx4 projects/init/tool.mlx -o impulsectl
 tools/check_init.sh                      # the end-to-end check
 ```
 
-As the system's init: install it in `/usr/bin/mlx/mlx-init` and boot a
-separate entry with `init=/usr/bin/mlx/mlx-init`; keeping the normal entry
+As the system's init: install it in `/usr/bin/mlx/impulse` and boot a
+separate entry with `init=/usr/bin/mlx/impulse`; keeping the normal entry
 provides a systemd fallback. Put services in `/etc/mlx/init/services/`.
 Mounts and checks use the system's `/etc/fstab`; `examples/` holds a start
-(the MLXIPC system bus, network, login, the Mlx console with mlx-sh on the
+(the MLXIPC system bus, network, login, the Mlx console with flux on the
 framebuffer, and a oneshot).
 
 `tools/install_login.sh` installs a component-maintained desktop boot set
-into that services directory: `mlx-ipcd`, then `mlx-netd`, and
-`mlx-login` after both. Its `--destdir` mode stages the same definitions
+into that services directory: `synapse`, then `nexus`, and
+`sentinel` after both. Its `--destdir` mode stages the same definitions
 without touching the host.
 
 ## On brixOS
 
-`brixos.mlx` is the init of brixOS (mlx-out/bin/brix/mlx-init, in the
+`brixos.mlx` is the init of brixOS (mlx-out/bin/brix/impulse, in the
 boot image, the kernel's first process): the same service files, read
 from `/system/settings/init/services`, the same supervision and the same
-`mlx-initctl` requests, on brixOS's own interface alone. Services start
+`impulsectl` requests, on brixOS's own interface alone. Services start
 by `process_spawn` with roles (a `stdio` terminal as input, output,
 errors and session, their group in front of it; else a stream whose
 output goes to `/temporary/logs/NAME.log`, or to the console with
 `log = console`); the loop is one native wait on the processes, the
 streams, the control and the next deadline (no signals, no event loop
-descriptors); `mlx-initctl` asks over a FIFO (`/temporary/init/control`,
+descriptors); `impulsectl` asks over a FIFO (`/temporary/init/control`,
 one line naming the asker's own reply FIFO); `poweroff`, `reboot` and
 `halt` go to the kernel's `system_power`. No mounts, hostname, accounts,
 log rotation or uevents there. With a display the init shows the boot
-with mlx-splash (projects/desktop/splash/brixos.mlx) and quits it before
-a service with `screen = yes` (the desktop, mlx-compositor, with
+with ignition (projects/desktop/splash/brixos.mlx) and quits it before
+a service with `screen = yes` (the desktop, kepler, with
 XDG_DATA_DIRS=/system/share for its launcher's entries; or mlx-console,
 `console.service`, disabled by default) takes the screen; the
-picture stays at least 3 s; `mlx-initctl message TEXT` puts a line on
+picture stays at least 3 s; `impulsectl message TEXT` puts a line on
 it, and a poweroff or reboot shows the shutdown with the splash in that
 mode, each stopping service named. projects/brix/README.md says more;
 tools/check_brix_init.sh checks it in QEMU.
@@ -67,7 +67,7 @@ tools/check_brix_init.sh checks it in QEMU.
    `PARTUUID=` and `PARTLABEL=` sources use their stable `/dev/disk/by-*`
    paths. The initramfs must run its device manager (for example the classic
    mkinitcpio `udev` hook) and preserve `/dev` across `switch_root`, because
-   mlx-init deliberately does not duplicate filesystem probing to create
+   impulse deliberately does not duplicate filesystem probing to create
    those links. A check result other than clean or corrected stops the boot,
    syncs and halts before any fstab mount or service is started. A failed
    mount is reported and does not silently count as success.
@@ -88,7 +88,7 @@ tools/check_brix_init.sh checks it in QEMU.
 
 ```
 description = MLXIPC system bus
-exec = /usr/bin/mlx/mlx-ipcd --system    # the command line; double quotes
+exec = /usr/bin/mlx/synapse --system    # the command line; double quotes
                                          # keep spaces in an argument; a
                                          # program without a slash is looked
                                          # up along the standard PATH and
@@ -116,7 +116,7 @@ screen = yes                             # takes the screen: the boot splash
 ```
 
 Every service runs in a session and process group of its own. Without
-`user`/`group` it keeps the init's identity; with them, mlx-init resolves
+`user`/`group` it keeps the init's identity; with them, impulse resolves
 `/etc/passwd` and `/etc/group`, clears root's supplementary groups, then
 applies the requested gid and uid before `execve`. Unknown accounts and
 privilege changes that cannot be made are refused instead of silently
@@ -134,21 +134,21 @@ override those values (the latter two are also useful in tests).
 
 A service that ends is started again after 1 s; when it ran less than a
 minute, the pause doubles each time up to 30 s. The states
-`mlx-initctl status` shows: `waiting` (for `after`), `starting` (for
+`impulsectl status` shows: `waiting` (for `after`), `starting` (for
 `ready`, or a oneshot running), `running`, `done` (a oneshot finished),
 `stopping`, `restarting` (in its pause), `stopped`, `failed` (ended with
 a status and not started again), `disabled`.
 
-## mlx-initctl
+## impulsectl
 
 ```
-mlx-initctl status                       # one line per service
-mlx-initctl start NAME | stop NAME | restart NAME
-mlx-initctl reload                       # the services directory again:
+impulsectl status                       # one line per service
+impulsectl start NAME | stop NAME | restart NAME
+impulsectl reload                       # the services directory again:
                                          # added services start, removed
                                          # ones stop
-mlx-initctl poweroff | reboot | halt
-mlx-initctl message [TEXT]               # brixOS: a line on the boot screen
+impulsectl poweroff | reboot | halt
+impulsectl message [TEXT]               # brixOS: a line on the boot screen
                                          # while it is up (none: taken away)
 ```
 
@@ -188,7 +188,7 @@ the kernel to power off, reboot or halt.
 - `power.mlx`: the shutdown.
 - `linux.mlx`: the system calls (processes, signals, mounts, reboot, Unix
   sockets, epoll).
-- `tool.mlx`: mlx-initctl.
+- `tool.mlx`: impulsectl.
 
 ## Checks
 
@@ -198,7 +198,7 @@ and its growing pause, a disabled one, stop, start, restart, an unknown
 name, reload with an added and a removed service, SIGTERM), then as PID 1
 of a user, PID, mount and UTS namespace (`unshare`): the hostname from a
 file, a tmpfs from the mounts file, a service looking around, and a
-poweroff from `mlx-initctl` that stops the service and ends the namespace.
+poweroff from `impulsectl` that stops the service and ends the namespace.
 It also runs focused checks with a synthetic sysfs/dev tree and verifies
 that socket readiness waits for a listener rather than mere path existence,
 that user/group are applied, that dependents finish first during shutdown,
@@ -208,4 +208,4 @@ fstab fields, escapes, skip rules and fsck pass ordering are honored.
 ## Boundary
 
 No network setup is built into init itself; networking is a supervised
-`mlx-netd` service.
+`nexus` service.

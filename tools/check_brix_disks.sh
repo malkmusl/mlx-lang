@@ -32,13 +32,13 @@ mkdir -p "$work/bin" "$work/source"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 "$compiler" --quiet projects/brix/tools/ext2/main.mlx -o "$work/ext2"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet $brix projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
 "$compiler" --quiet $brix projects/brix/tools/snapshot/main.mlx -o "$work/snapshot"
 for program in ls cat cp mkdir chmod sync stat echo; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "brixfs=$work/brixfs" "snapshot=$work/snapshot" "install=projects/brix/tools/install.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "brixfs=$work/brixfs" "snapshot=$work/snapshot" "install=projects/brix/tools/install.sh" "$work/bin/"
 echo "ok   the kernel and a boot image build"
 
 head -c 8388608 /dev/zero > "$work/disk0.img"

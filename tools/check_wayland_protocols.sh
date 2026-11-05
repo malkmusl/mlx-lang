@@ -37,7 +37,7 @@ command -v xkbcli > /dev/null || { echo "check_wayland_protocols.sh: xkbcli is n
 
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/kepler"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-viewport-test/main.mlx -o "$work/viewport-test"
 "$compiler" --quiet tools/x11-clipboard-test/main.mlx -o "$work/x11-clipboard-test"
@@ -59,7 +59,7 @@ solo_run() {
     for _ in $(seq 1 50); do [[ -S "$runtime/host-$name" ]] && break; sleep 0.1; done
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="host-$name" \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/viewport-config" VK_DRIVER_FILES="$manifest" \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket "nested-$name" \
+        timeout 60 "$work/kepler" --verbose --no-fps --renderer "$renderer" --socket "nested-$name" \
         --launcher none --dock none --topbar none --run "$work/$name-client.sh" > "$work/$name.log" 2>&1 || status=$?
     wait "$host_pid" || fail "$name: the test host failed" "$work/$name-host.log"
     rm -rf -- "$runtime"

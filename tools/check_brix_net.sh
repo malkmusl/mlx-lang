@@ -36,14 +36,14 @@ brix=--target=x86_64-brixos
 mkdir -p "$work/bin" "$work/www"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet $brix projects/wget/main.mlx -o "$work/wget"
 "$compiler" --quiet $brix projects/ping/main.mlx -o "$work/ping"
 "$compiler" --quiet $brix projects/brix/tools/netcalls/main.mlx -o "$work/netcalls"
 for program in cat wc echo sha256sum; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "$work/bin/"
 echo "ok   the kernel, wget, ping, netcalls and a boot image build"
 
 # The host's HTTP server on a port of its own.

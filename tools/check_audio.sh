@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MLX Audio (projects/desktop/audio) end to end, on MLXIPC: mlx-ipcd as the
-# session bus, mlx-audiod started by it on the first use (activation),
+# MLX Audio (projects/desktop/audio) end to end, on MLXIPC: synapse as the
+# session bus, resonance started by it on the first use (activation),
 # playing into a file (--output file:) and recording from a tone or a
 # file, and mlx-audio (std.audio) as the app. The mix is checked by
 # frequency (Goertzel) and amplitude:
@@ -17,7 +17,7 @@
 #     takes playing from an unsandboxed app, and one taking org.mlx.Audio
 #     leaves the app no channel;
 #   - asking (MLXIPC's `ask`, the default for recording): the bus starts
-#     the permission agent (mlx-permissions --answer), a plain answer holds
+#     the permission agent (scope --answer), a plain answer holds
 #     for the session, a remembered one is a rule; SetPermission
 #     (mlx-ipc permit) changes it and a recording ends at once; with no
 #     agent the answer is no;
@@ -52,8 +52,8 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services"
 : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
-"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/resonance"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$work/mlx-audio"
 play="$work/mlx-audio"
 
@@ -140,9 +140,9 @@ PY
 cat > "$work/services/org.mlx.Audio.service" <<SERVICE
 [D-BUS Service]
 Name=org.mlx.Audio
-Exec=$work/mlx-audiod --verbose --output file:$work/mix.wav --input sine:440
+Exec=$work/resonance --verbose --output file:$work/mix.wav --input sine:440
 SERVICE
-"$work/mlx-ipcd" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
@@ -153,7 +153,7 @@ elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
 grep -q "starting org.mlx.Audio" "$work/bus.log" || fail "MLX Audio was not started by the bus"
 [[ $elapsed -ge 900 && $elapsed -lt 3000 ]] || fail "a 1 s tone took $elapsed ms"
 echo "ok   started on the first use; a 1 s tone takes $elapsed ms"
-pgrep -n -x mlx-audiod > "$work/audiod.pid"
+pgrep -n -x resonance > "$work/audiod.pid"
 
 "$play" tone 440 2 --volume 50 &
 first=$!
@@ -200,16 +200,16 @@ if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     # The permission agent (projects/desktop/permissions), answering at
     # once (--answer): the bus starts it when it has to ask, keeps a plain
     # answer for the session and a remembered one as a rule of ipc.conf.
-    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/mlx-permissions"
+    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/scope"
     "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$work/mlx-ipc"
     ipc="$work/mlx-ipc"
     agent() {
-        pkill -x -P "$bus_pid" mlx-permissions 2> /dev/null || true
+        pkill -x -P "$bus_pid" scope 2> /dev/null || true
         sleep 0.2
         if [[ $1 == none ]]; then
             rm -f "$work/services/org.mlx.PermissionAgent.service"
         else
-            printf '[D-BUS Service]\nName=org.mlx.PermissionAgent\nExec=%s --answer %s\n' "$work/mlx-permissions" "$1" > "$work/services/org.mlx.PermissionAgent.service"
+            printf '[D-BUS Service]\nName=org.mlx.PermissionAgent\nExec=%s --answer %s\n' "$work/scope" "$1" > "$work/services/org.mlx.PermissionAgent.service"
         fi
     }
     asked() { grep -c "asking the user whether org.example.Player may use audio.record" "$work/bus.log" || true; }
@@ -289,13 +289,13 @@ expect_sound "recorded at 48000 Hz stereo" "$work/rec.wav" 48000 2 0.9 440 16384
 expect_sound "recorded at 16000 Hz mono" "$work/rec16.wav" 16000 1 0.9 440 16384
 
 # The mix itself, from a fresh server: one tone, then two streams.
-"$work/mlx-audiod" --output "file:$work/one.wav" --input "file:$work/mono44.wav" > "$work/audiod.log" 2>&1 &
+"$work/resonance" --output "file:$work/one.wav" --input "file:$work/mono44.wav" > "$work/audiod.log" 2>&1 &
 echo $! > "$work/audiod.pid"
 sleep 0.4
 "$play" tone 440 1
 kill "$(cat "$work/audiod.pid")"; sleep 0.3
 expect_sound "a tone: 440 Hz at its amplitude, 1 s" "$work/one.wav" 48000 2 1 440 16000 1000 0
-"$work/mlx-audiod" --output "file:$work/two.wav" --input "file:$work/mono44.wav" > "$work/audiod.log" 2>&1 &
+"$work/resonance" --output "file:$work/two.wav" --input "file:$work/mono44.wav" > "$work/audiod.log" 2>&1 &
 echo $! > "$work/audiod.pid"
 sleep 0.4
 "$play" tone 440 1 --volume 50 &
@@ -309,7 +309,7 @@ expect_sound "recorded from a looped file, at 22050 Hz" "$work/fromfile.wav" 220
 
 # Sinks, monitors and app settings (routing.mlx), on a fresh server whose
 # input is an 880 Hz tone (it must never reach a monitor).
-"$work/mlx-audiod" --verbose --output "file:$work/routed.wav" --input sine:880 > "$work/audiod.log" 2>&1 &
+"$work/resonance" --verbose --output "file:$work/routed.wav" --input sine:880 > "$work/audiod.log" 2>&1 &
 echo $! > "$work/audiod.pid"
 sleep 0.4
 "$play" sink add music || fail "adding a sink"
@@ -344,7 +344,7 @@ for line in "sink = music"$'\t'"output"$'\t'"100"$'\t'"off" "sink = hidden"$'\t'
     grep -qxF "$line" "$XDG_CONFIG_HOME/mlx/audio.conf" || fail "audio.conf lacks \"$line\": $(cat "$XDG_CONFIG_HOME/mlx/audio.conf")"
 done
 kill "$(cat "$work/audiod.pid")"; sleep 0.3
-"$work/mlx-audiod" --output null --input none > "$work/audiod.log" 2>&1 &
+"$work/resonance" --output null --input none > "$work/audiod.log" 2>&1 &
 echo $! > "$work/audiod.pid"
 sleep 0.4
 apps=$("$play" apps)
@@ -362,7 +362,7 @@ python3 tools/fake_alsa.py "$work/card" --busy 2 > "$work/fake.log" 2>&1 &
 fake_pid=$!
 for _ in $(seq 1 50); do [[ -f "$work/card/ready" ]] && break; sleep 0.1; done
 allow_recording
-MLX_SND_DIR="$work/card/snd" MLX_ASOUND_DIR="$work/card/asound" "$work/mlx-audiod" --verbose > "$work/audiod.log" 2>&1 &
+MLX_SND_DIR="$work/card/snd" MLX_ASOUND_DIR="$work/card/asound" "$work/resonance" --verbose > "$work/audiod.log" 2>&1 &
 echo $! > "$work/audiod.pid"
 sleep 0.5
 expect "a busy card: playing to nobody, and why" "output-problem = busy" "$play" status
@@ -375,7 +375,7 @@ echo "ok   the card taken once free (S32_LE playback, 44100 Hz capture negotiate
 "$play" record "$work/card-rec.wav" 1 > /dev/null || fail "recording from the card"
 expect_sound "recorded from the card (44100 Hz, resampled)" "$work/card-rec.wav" 48000 2 0.9 523 12000
 
-# Controls (mlx-settings uses them): switching while a tone plays,
+# Controls (control uses them): switching while a tone plays,
 # remembered in audio.conf.
 "$play" tone 440 3 &
 first=$!

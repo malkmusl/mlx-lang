@@ -17,10 +17,10 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   - [`terminal/`](desktop/terminal/README.md): the terminal emulator, a
     window around `std.terminal` and `std.ui.terminal`;
     `tools/check_terminal.sh`.
-  - [`splash/`](desktop/splash/README.md): mlx-splash, the boot splash
+  - [`splash/`](desktop/splash/README.md): ignition, the boot splash
     in place of Plymouth (the MLX letters with orbiting rings and the
     Observatory's code graph, on KMS or the framebuffer, Plymouth's
-    protocol for systemd) and mlx-splashctl; `tools/install_splash.sh`;
+    protocol for systemd) and ignitionctl; `tools/install_splash.sh`;
     `tools/check_splash.sh`.
   - `shared/`: what the desktop's clients share: the drawing canvas (CPU
     and GPU), the layer-shell and window surface (`panel.mlx`), keyboard
@@ -45,20 +45,20 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
   the GNU variants, preprocessor, parser, x86_64 code and ELF written
   itself, its own headers); `tools/check_cc.sh`, and
   `tools/check_cc_projects.sh` for zlib, Lua and SQLite.
-- [`init/`](init/README.md): mlx-init, PID 1 of MLX/Linux (mounts,
-  services, supervision, the control socket, shutdown) and mlx-initctl;
+- [`init/`](init/README.md): impulse, PID 1 of MLX/Linux (mounts,
+  services, supervision, the control socket, shutdown) and impulsectl;
   `tools/check_init.sh`.
-- [`shell/`](shell/README.md): mlx-sh, the POSIX shell of MLX/Linux with
-  a line editor (scripts as dash runs them, the shell of mlx-terminal and
+- [`shell/`](shell/README.md): flux, the POSIX shell of MLX/Linux with
+  a line editor (scripts as dash runs them, the shell of vector and
   mlx-console); `tools/check_shell.sh`.
 - [`console/`](console/README.md): mlx-console, the terminal on the Linux
   console without a compositor (framebuffer, evdev keyboards through the
   xkb keymap, the shell on a pty); `tools/check_console.sh`.
-- [`network/`](network/README.md): mlx-netd, the network daemon in place
+- [`network/`](network/README.md): nexus, the network daemon in place
   of NetworkManager (links through route netlink, DHCPv4, static
   settings, routes by metric, resolv.conf, Wi-Fi through nl80211 with its
   own WPA2 supplicant, MLXIPC's system bus) and mlx-net; the top bar's network
-  list and mlx-settings' Network page ask it; `tools/install_network.sh`;
+  list and control' Network page ask it; `tools/install_network.sh`;
   `tools/check_network.sh`, `tools/check_wifi.sh`.
 
 What the projects share beyond one project lives in `std` (`std.gpu`,

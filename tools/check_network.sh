@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end check of projects/network (mlx-netd, mlx-net), in network
+# End-to-end check of projects/network (nexus, mlx-net), in network
 # namespaces of its own (unshare -rn: the machine's network is not
 # touched). Two links come from a second namespace that plays the
 # network: eth0 with a DHCP server (tools/network-test/dhcpd.py, a 12 s
-# lease) behind it, eth1 configured statically. mlx-netd runs with
-# MLXIPC (mlx-ipcd) as its system bus. The check:
+# lease) behind it, eth1 configured statically. nexus runs with
+# MLXIPC (synapse) as its system bus. The check:
 #
 #   - eth0 gets 10.7.0.50/24 by DHCP with its default route (metric 100),
 #     eth1 10.8.0.5/24 with its own (metric 50, set in the
@@ -37,9 +37,9 @@ unshare -rn true 2> /dev/null || { echo "check_network.sh: no network namespaces
 
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-"$compiler" --quiet projects/network/main.mlx -o "$work/mlx-netd"
+"$compiler" --quiet projects/network/main.mlx -o "$work/nexus"
 "$compiler" --quiet projects/network/tool.mlx -o "$work/mlx-net"
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 
 fail() { echo "FAIL $1" >&2; [[ -f "${2:-}" ]] && cat "$2" >&2; exit 1; }
 
@@ -81,11 +81,11 @@ eth1.dns = 10.8.0.53
 eth1.metric = 50
 CONF
 : > "$W/ipc.conf"
-"$W/mlx-ipcd" --address "$W/bus" --policy "$W/ipc.conf" > "$W/ipcd.log" 2>&1 &
+"$W/synapse" --address "$W/bus" --policy "$W/ipc.conf" > "$W/ipcd.log" 2>&1 &
 IPCD=$!
 for _ in $(seq 1 50); do [ -S "$W/bus" ] && break; sleep 0.1; done
 sleep 0.3
-"$W/mlx-netd" --config "$W/network.conf" --resolv "$W/resolv.conf" --bus "$W/bus" --verbose > "$W/netd.log" 2>&1 &
+"$W/nexus" --config "$W/network.conf" --resolv "$W/resolv.conf" --bus "$W/bus" --verbose > "$W/netd.log" 2>&1 &
 NETD=$!
 sleep 4
 snapshot bound
@@ -146,8 +146,8 @@ grep -q "^default via 10.8.0.1 dev eth1 proto static metric 50" "$work/bound-rou
 [[ "$(grep -v '^#' "$work/bound-resolv.txt" | tr '\n' ' ')" == "search test.lan nameserver 10.8.0.53 nameserver 10.7.0.53 nameserver 10.7.0.54 " ]] || fail "resolv.conf is not in the links' metric order" "$work/bound-resolv.txt"
 grep -q "^eth0 *ethernet *connected *10.7.0.50/24 *via 10.7.0.1 *dns 10.7.0.53 10.7.0.54$" "$work/bound-status.txt" || fail "mlx-net does not list eth0" "$work/bound-status.txt"
 grep -q "^eth1 *ethernet *connected *10.8.0.5/24 *via 10.8.0.1 *dns 10.8.0.53$" "$work/bound-status.txt" || fail "mlx-net does not list eth1" "$work/bound-status.txt"
-grep -q "^netd: on the system bus (also as org.freedesktop.NetworkManager)$" "$log" || fail "mlx-netd is not on the bus" "$log"
-grep -q "^netd: \(nl80211 is there (Wi-Fi)\|no nl80211 in this kernel (no Wi-Fi)\)$" "$log" || fail "mlx-netd did not say whether there is Wi-Fi" "$log"
+grep -q "^netd: on the system bus (also as org.freedesktop.NetworkManager)$" "$log" || fail "nexus is not on the bus" "$log"
+grep -q "^netd: \(nl80211 is there (Wi-Fi)\|no nl80211 in this kernel (no Wi-Fi)\)$" "$log" || fail "nexus did not say whether there is Wi-Fi" "$log"
 if [[ -f "$work/nm-state.txt" ]]; then
     grep -q "(uint32 70,)" "$work/nm-state.txt" || fail "NetworkManager's state() is not 70 (connected)" "$work/nm-state.txt"
 fi
@@ -182,5 +182,5 @@ grep -q "^discover$" "$work/dhcpd-refusing.log" && grep -q "eth0 *inet 10.7.0.50
 echo "ok   a refused renewal (NAK) starts over with DISCOVER"
 
 ! grep -q "10.8.0.5" "$work/reloaded-addresses.txt" && grep -q "^eth1 *ethernet *off" "$work/reloaded-status.txt" || fail "eth1 set to off was not taken down on SIGHUP" "$work/reloaded-status.txt"
-grep -q "^netd: ending$" "$log" || fail "mlx-netd did not end on SIGTERM" "$log"
-echo "ok   SIGHUP reads the configuration again; SIGTERM ends mlx-netd"
+grep -q "^netd: ending$" "$log" || fail "nexus did not end on SIGTERM" "$log"
+echo "ok   SIGHUP reads the configuration again; SIGTERM ends nexus"

@@ -2,7 +2,7 @@
 # brixOS's virtual console: the display (the Bochs adapter QEMU gives a
 # -kernel boot) as /devices/framebuffer, the PS/2 keyboard as
 # /devices/keyboard, a session pair, and mlx-console (projects/console/
-# brixos.mlx) drawing mlx-sh with std.truetype on the screen: typed on the
+# brixos.mlx) drawing flux with std.truetype on the screen: typed on the
 # keyboard through QEMU's monitor (sendkey), the screen dumped
 # (screendump) and compared pixel by pixel with what the same code draws
 # on the host for the same text (projects/brix/tools/screen).
@@ -38,13 +38,13 @@ brix=--target=x86_64-brixos
 mkdir -p "$work/bin"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet $brix projects/console/brixos.mlx -o "$work/mlx-console"
 "$compiler" --quiet projects/brix/tools/screen/main.mlx -o "$work/screen"
 for program in cat echo ls; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "mlx-console=$work/mlx-console" "fonts/DejaVuSansMono.ttf=$font" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "mlx-console=$work/mlx-console" "fonts/DejaVuSansMono.ttf=$font" "$work/bin/"
 echo "ok   the kernel, mlx-console for brixOS, the screen tool and a boot image build"
 
 # The QEMU monitor on a socket: keys and screen dumps.
@@ -90,7 +90,7 @@ wait_for '^crw-rw-rw- .* 29, *0 .* /devices/framebuffer$'
 wait_for '^crw-rw-rw- .* 13, *64 .* /devices/keyboard$'
 echo "ok   the display is found (1024x768, the Bochs adapter), /devices/framebuffer and /devices/keyboard are there"
 wait_for '^root@brix:[^#]*# $' 2
-# The console in the background: it takes the screen and starts mlx-sh on
+# The console in the background: it takes the screen and starts flux on
 # a session pair; the serial shell stays ours.
 printf 'mlx-console &\r' >&3
 sleep 4
@@ -108,7 +108,7 @@ same() {
     done
 }
 same "$work/prompt.ppm" 'root@brix:~# ' "the prompt alone"
-echo "ok   mlx-console draws mlx-sh's prompt on the screen, pixel for pixel what the host draws for it"
+echo "ok   mlx-console draws flux's prompt on the screen, pixel for pixel what the host draws for it"
 monitor "sendkey e" "sendkey c" "sendkey h" "sendkey o" "sendkey spc" "sendkey s" "sendkey c" "sendkey r" "sendkey e" "sendkey e" "sendkey n" "sendkey minus" "sendkey o" "sendkey k" "sendkey ret"
 same "$work/typed.ppm" 'root@brix:~# echo screen-ok\nscreen-ok\nroot@brix:~# ' "the command typed and answered"
 echo "ok   keys typed on the PS/2 keyboard reach the shell through the session pair; its answer is on the screen"

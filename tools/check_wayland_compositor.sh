@@ -36,7 +36,7 @@
 #      (the translucent preview shows while it is dragged), Super+Right to
 #      the right half, dragging it away restores its size, the top edge
 #      maximizes.
-#  10d. workspaces and scrollable tiling with the top bar (mlx-topbar): its
+#  10d. workspaces and scrollable tiling with the top bar (horizon): its
 #      tiling half turns tiling on (the windows become columns), a second
 #      window opens as a column after the first, Super+R, Super+Left and
 #      Super+Shift+Right size, focus and move columns, the floating half
@@ -53,10 +53,10 @@
 #  10g. three-finger swipes (zwp_pointer_gestures_v1 from the host): the
 #      strip follows the fingers and settles, up and down and sideways on
 #      a floating workspace pull the next workspace in or spring back.
-#  11. mlx-settings records hotkeys: while it records, the compositor
+#  11. control records hotkeys: while it records, the compositor
 #      passes every key to it (keyboard-shortcuts-inhibit), Super+Up too;
 #      Backspace unbinds one; the compositor takes the new keys at once.
-#  11b. mlx-settings' Top bar page (opened by `mlx-settings topbar`): an
+#  11b. control' Top bar page (opened by `control topbar`): an
 #      item moves up a place and another is hidden; topbar.conf says so.
 #  11c. the session lock (ext-session-lock-v1, a stand-in locker): locked,
 #      only the lock surface shows and gets the keys; a locker that dies
@@ -68,21 +68,21 @@
 #      copy it keeps in host memory) has the same pixels.
 #  13. with Xwayland and xev: an X program's window shows, takes focus and
 #      gets keys (the compositor's own X window manager).
-#  14. mlx-settings' Sound and Display pages: on MLXIPC with MLX Audio
+#  14. control' Sound and Display pages: on MLXIPC with MLX Audio
 #      (started by the bus) it mutes the output and turns the volume down;
 #      the nested compositor tells its output in <socket>.display, and the
 #      Display page's night light switch reaches compositor.conf.
-#  14a. mlx-settings' Network page without mlx-netd: with a stand-in
+#  14a. control' Network page without nexus: with a stand-in
 #      NetworkManager running it says NetworkManager runs the network and
-#      lists the kernel's links; with an mlx-netd that has its name on the
+#      lists the kernel's links; with an nexus that has its name on the
 #      system bus but does not answer, it says that.
-#  14b. mlx-settings' Network page on a system bus with fakenetd
-#      (tools/network-test) as mlx-netd: a Wi-Fi network is joined (a
+#  14b. control' Network page on a system bus with fakenetd
+#      (tools/network-test) as nexus: a Wi-Fi network is joined (a
 #      wrong passphrase refused and asked again) and forgotten.
-#  15. the permission dialog (mlx-permissions, with bwrap): a sandboxed
+#  15. the permission dialog (scope, with bwrap): a sandboxed
 #      app records, MLXIPC starts the agent, its dialog opens; Remember and
 #      Allow are clicked: the app records and ipc.conf keeps the rule;
-#      mlx-settings' Apps page shows it and denies it again.
+#      control' Apps page shows it and denies it again.
 #
 # Typed commands create marker files, so keyboard delivery is verified at the
 # shell; the moved window's focus frame is checked in the host's screenshot.
@@ -115,14 +115,14 @@ mkdir -p "$XDG_CONFIG_HOME/mlx"
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
 
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/kepler"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/vector"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 # The top bar is kept out of the compositor's directory: next to it, every
 # scenario would start it (and its bar would cover the title bars at the
 # top); the scenarios that want it name it with --topbar.
 mkdir -p "$work/bar"
-"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/bar/mlx-topbar"
+"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/bar/horizon"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
 run_scenario() {
@@ -131,7 +131,7 @@ run_scenario() {
     "$work/test-host" "host-$name" "$work/us.xkb" "$script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --socket "nested-$name" "$@" > "$work/$name-compositor.log" 2>&1
+    WAYLAND_DISPLAY="host-$name" timeout 60 "$work/kepler" --verbose --renderer "$renderer" --socket "nested-$name" "$@" > "$work/$name-compositor.log" 2>&1
     wait "$host_pid" || { echo "test host failed ($name):" >&2; cat "$work/$name-host.log" >&2; exit 1; }
 }
 
@@ -147,10 +147,10 @@ cat > "$work/greeter-wrapper" <<SCRIPT
     sleep 1
     unset WAYLAND_SOCKET
     cd "$work/attacker-dir" || exit 1
-    exec "$work/mlx-terminal"
+    exec "$work/vector"
 ) &
 cd "$work/greeter-dir" || exit 1
-exec "$work/mlx-terminal"
+exec "$work/vector"
 SCRIPT
 chmod +x "$work/greeter-wrapper"
 cat > "$work/blocked-helper" <<SCRIPT
@@ -219,7 +219,7 @@ wait 1000
 shot $work/terminals.ppm
 close
 SCRIPT
-run_scenario terminal "$work/terminal.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario terminal "$work/terminal.script" --terminal "$work/vector" --run "$work/vector"
 [[ "$(cat "$work/first.marker" 2> /dev/null)" == "mlx-typed" ]] || { echo "keyboard input did not reach the first terminal's shell" >&2; cat "$work/terminal-compositor.log" >&2; exit 1; }
 echo "ok   keys typed on the host reached the shell in the Mlx terminal"
 [[ $(grep -c "^map: Mlx Terminal" "$work/terminal-compositor.log") -eq 2 ]] || { echo "Alt+Enter did not open a second terminal" >&2; exit 1; }
@@ -257,7 +257,7 @@ wait 800
 shot $work/title.ppm
 close
 SCRIPT
-run_scenario title "$work/title.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario title "$work/title.script" --terminal "$work/vector" --run "$work/vector"
 grep -q "^move: " "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
 # edge is at x = 122, its title bar spans y = 102..121 (rounded above
@@ -334,7 +334,7 @@ enter
 wait 500
 close
 SCRIPT
-run_scenario resize "$work/resize.script" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario resize "$work/resize.script" --terminal "$work/vector" --run "$work/vector"
 for expected in "window: 852x556 at 24,24" "window: 652x396 at 224,184" "window: 492x332 at 224,184"; do
     grep -qx "$expected" "$work/resize-compositor.log" || { echo "resize: no \"$expected\"" >&2; cat "$work/resize-compositor.log" >&2; exit 1; }
 done
@@ -545,7 +545,7 @@ release 272
 wait 600
 close
 SCRIPT
-run_scenario snap "$work/snap.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario snap "$work/snap.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
 log="$work/snap-compositor.log"
 # (The work area: 1024x738 below the bar; its halves 512 wide.)
 grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,52" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
@@ -630,7 +630,7 @@ release 272
 wait 600
 close
 SCRIPT
-run_scenario workspaces "$work/workspaces.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario workspaces "$work/workspaces.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
 log="$work/workspaces-compositor.log"
 expect_line() {
     grep -q -- "$1" "$log" || { echo "workspaces: $2 (no '$1' in the log)" >&2; cat "$log" >&2; exit 1; }
@@ -692,7 +692,7 @@ wait 3000
 shot $work/glide-end.ppm
 close
 SCRIPT
-run_scenario animations "$work/animations.script" --no-fps --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario animations "$work/animations.script" --no-fps --terminal "$work/vector" --run "$work/vector"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 grep -q "^settings: .*animations slow" "$work/animations-compositor.log" || { echo "the compositor did not read animations = slow" >&2; cat "$work/animations-compositor.log" >&2; exit 1; }
 grep -q "^snap: right " "$work/animations-compositor.log" || { echo "Super+Right did not snap the window" >&2; cat "$work/animations-compositor.log" >&2; exit 1; }
@@ -775,7 +775,7 @@ scroll 2560
 wait 1000
 close
 SCRIPT
-run_scenario wheel "$work/wheel.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario wheel "$work/wheel.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
 log="$work/wheel-compositor.log"
 grep -q "^settled on column 2: " "$log" || { echo "the strip did not settle on the second column when the fingers lifted" >&2; cat "$log" >&2; exit 1; }
 [[ "$(grep "^workspace: " "$log" | tr '\n' ' ')" == "workspace: 2 workspace: 1 workspace: 2 " ]] || { echo "Super+Ctrl+wheel, Super+wheel and the wheel over the bar did not switch workspaces 2, 1, 2" >&2; cat "$log" >&2; exit 1; }
@@ -855,7 +855,7 @@ gesture-end
 wait 1000
 close
 SCRIPT
-run_scenario gestures "$work/gestures.script" --no-fps --topbar "$work/bar/mlx-topbar" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal"
+run_scenario gestures "$work/gestures.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
 log="$work/gestures-compositor.log"
 for line in "^settled on column 1: " "^swipe: workspaces up and down" "^swipe: to workspace 2" "^swipe: back from workspace 1" "^swipe: workspaces sideways" "^swipe: to workspace 1"; do
     grep -q "$line" "$log" || { echo "the swipes did not log \"$line\"" >&2; cat "$log" >&2; exit 1; }
@@ -876,7 +876,7 @@ assert frame_columns(sys.argv[3], 200) and not frame_columns(sys.argv[3], 600), 
 PY
 echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up and down or sideways, and spring back"
 
-# Scenario 11: mlx-settings (its window at (24, 24); the categories in
+# Scenario 11: control (its window at (24, 24); the categories in
 # its sidebar 28 pixels apart from y 44: General, Network, Display, Sound,
 # Apps, Window management, Top bar, Appearance, Language; on the Window management page the
 # hotkey rows 34 pixels apart from y 436, on the General page the
@@ -884,7 +884,7 @@ echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up 
 # switch). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
-"$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/mlx-settings"
+"$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/control"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
@@ -930,24 +930,24 @@ up 125
 wait 500
 close
 SCRIPT
-run_scenario hotkeys "$work/hotkeys.script" --no-fps --run "$work/mlx-settings"
+run_scenario hotkeys "$work/hotkeys.script" --no-fps --run "$work/control"
 conf="$XDG_CONFIG_HOME/mlx/compositor.conf"
 for line in "key-maximize = Super+Shift+M" "key-minimize = Super+Up" "key-terminal = none" "key-close = Alt+F4"; do
-    grep -qx "$line" "$conf" 2> /dev/null || { echo "mlx-settings did not write \"$line\"" >&2; cat "$conf" "$work/hotkeys-compositor.log" >&2; exit 1; }
+    grep -qx "$line" "$conf" 2> /dev/null || { echo "control did not write \"$line\"" >&2; cat "$conf" "$work/hotkeys-compositor.log" >&2; exit 1; }
 done
-[[ $(grep -c "^shortcuts: inhibited" "$work/hotkeys-compositor.log") -eq 3 ]] || { echo "the compositor did not pass the keys to mlx-settings while it recorded" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
-! grep -q "^maximize: Settings" "$work/hotkeys-compositor.log" || { echo "Super+Up maximized the window while mlx-settings recorded it" >&2; exit 1; }
+[[ $(grep -c "^shortcuts: inhibited" "$work/hotkeys-compositor.log") -eq 3 ]] || { echo "the compositor did not pass the keys to control while it recorded" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
+! grep -q "^maximize: Settings" "$work/hotkeys-compositor.log" || { echo "Super+Up maximized the window while control recorded it" >&2; exit 1; }
 grep -q "^minimize: Settings" "$work/hotkeys-compositor.log" || { echo "the recorded Super+Up did not minimize" >&2; cat "$work/hotkeys-compositor.log" >&2; exit 1; }
 rm -f "$conf"
-echo "ok   mlx-settings records hotkeys (the compositor's too) and the compositor uses them at once"
+echo "ok   control records hotkeys (the compositor's too) and the compositor uses them at once"
 
-# Scenario 11b: mlx-settings' Top bar page, opened by its argument (the
+# Scenario 11b: control' Top bar page, opened by its argument (the
 # rows' middles 50 pixels apart from y 229: what plays, the tray, the sound,
 # the battery, the control centre, the clock; a row's up arrow at x 670).
 # The sound moves up a place, a click on the battery's row hides it.
 cat > "$work/topbar-page.sh" <<SCRIPT
 #!/bin/sh
-exec "$work/mlx-settings" topbar
+exec "$work/control" topbar
 SCRIPT
 chmod +x "$work/topbar-page.sh"
 rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
@@ -964,9 +964,9 @@ wait 800
 close
 SCRIPT
 run_scenario topbar-page "$work/topbar-page.script" --no-fps --run "$work/topbar-page.sh"
-[[ "$(grep -v '^#' "$XDG_CONFIG_HOME/mlx/topbar.conf" 2> /dev/null | tr '\n' ' ')" == "media = on sound = on tray = on battery = off control = on clock = on " ]] || { echo "mlx-settings' Top bar page did not write the items as clicked" >&2; cat "$XDG_CONFIG_HOME/mlx/topbar.conf" "$work/topbar-page-compositor.log" >&2; exit 1; }
+[[ "$(grep -v '^#' "$XDG_CONFIG_HOME/mlx/topbar.conf" 2> /dev/null | tr '\n' ' ')" == "media = on sound = on tray = on battery = off control = on clock = on " ]] || { echo "control' Top bar page did not write the items as clicked" >&2; cat "$XDG_CONFIG_HOME/mlx/topbar.conf" "$work/topbar-page-compositor.log" >&2; exit 1; }
 rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
-echo "ok   mlx-settings' Top bar page moves an item up and hides another (topbar.conf)"
+echo "ok   control' Top bar page moves an item up and hides another (topbar.conf)"
 
 # Scenario 11c: the session lock. A terminal opens; 3 s in, a locker that
 # dies two seconds after locking without unlocking (session-lock-test
@@ -975,7 +975,7 @@ echo "ok   mlx-settings' Top bar page moves an item up and hides another (topbar
 "$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
 cat > "$work/session-lock-run.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-terminal" &
+"$work/vector" &
 sleep 3
 "$work/session-lock-test" --die
 sleep 4
@@ -1038,7 +1038,7 @@ echo "ok   the session lock: only the locker shows and gets the keys; a dead loc
 
 # Scenario 12: screen and window capture (ext-image-copy-capture-v1 with
 # ext-image-capture-source-v1 and ext-foreign-toplevel-list-v1), with
-# projects/desktop/capture (mlx-capture): the window list names mlx-settings; the
+# projects/desktop/capture (mlx-capture): the window list names control; the
 # screen and the window are saved as PNGs whose pixels agree (the window's
 # content at (24, 24) on the screen); a second frame of the screen waits
 # until something changes (the pointer moves) and carries only that as
@@ -1067,8 +1067,8 @@ pointer 660 630
 wait 1500
 close
 SCRIPT
-run_scenario capture "$work/capture.script" --no-fps --run "$work/mlx-settings" --run "$work/capture.sh"
-grep -q "org.mlx.settings  Settings" "$work/capture-list.log" || { echo "the window list does not name mlx-settings" >&2; cat "$work/capture-list.log" "$work/capture-compositor.log" >&2; exit 1; }
+run_scenario capture "$work/capture.script" --no-fps --run "$work/control" --run "$work/capture.sh"
+grep -q "org.mlx.settings  Settings" "$work/capture-list.log" || { echo "the window list does not name control" >&2; cat "$work/capture-list.log" "$work/capture-compositor.log" >&2; exit 1; }
 [[ $(grep -c "^saved " "$work/capture.log") -eq 3 ]] || { echo "mlx-capture did not save three captures" >&2; cat "$work/capture.log" "$work/capture-compositor.log" >&2; exit 1; }
 python3 - "$work" <<'PY'
 import struct, sys, zlib
@@ -1127,7 +1127,7 @@ lavapipe=/usr/share/vulkan/icd.d/lvp_icd.json
 if [[ $renderer == cpu && -f $lavapipe ]]; then
     sed -e "s|capture-screen.png|capture-vulkan.png|; s|capture.log|capture-vulkan.log|g; s|capture-list.log|capture-vulkan-list.log|" "$work/capture.sh" > "$work/capture-vulkan.sh"
     chmod +x "$work/capture-vulkan.sh"
-    VK_DRIVER_FILES=$lavapipe MLX_CANVAS=cpu run_scenario capture-vulkan "$work/capture.script" --no-fps --renderer vulkan --run "$work/mlx-settings" --run "$work/capture-vulkan.sh"
+    VK_DRIVER_FILES=$lavapipe MLX_CANVAS=cpu run_scenario capture-vulkan "$work/capture.script" --no-fps --renderer vulkan --run "$work/control" --run "$work/capture-vulkan.sh"
     grep -q "^renderer: vulkan" "$work/capture-vulkan-compositor.log" && grep -q "^renderer: the output is captured: what frames change is copied into host memory$" "$work/capture-vulkan-compositor.log" \
         || { echo "the Vulkan renderer kept no copy of the captured output in host memory" >&2; cat "$work/capture-vulkan-compositor.log" >&2; exit 1; }
     [[ $(grep -c "^saved " "$work/capture-vulkan.log") -eq 3 ]] || { echo "mlx-capture did not save three captures with the Vulkan renderer" >&2; cat "$work/capture-vulkan.log" >&2; exit 1; }
@@ -1198,22 +1198,22 @@ else
     echo "skip X programs (Xwayland or xev not installed)"
 fi
 
-# Scenario 14: mlx-settings' Sound and Display pages. MLXIPC is the
-# session bus and starts MLX Audio (into a file) when mlx-settings first
+# Scenario 14: control' Sound and Display pages. MLXIPC is the
+# session bus and starts MLX Audio (into a file) when control first
 # asks for it. On the Sound page (no sound card: Automatic at y 141, None
 # at y 179, the volume slider at y 220) None is chosen and the volume
 # dragged from 100% to about half; on the Display page the night light
 # switch (y 371) is turned on.
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
-"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/resonance"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$work/mlx-audio"
 mkdir -p "$work/services"
 cat > "$work/services/org.mlx.Audio.service" <<SERVICE
 [D-BUS Service]
 Name=org.mlx.Audio
-Exec=$work/mlx-audiod --verbose --output file:$work/mix.wav --input sine:440
+Exec=$work/resonance --verbose --output file:$work/mix.wav --input sine:440
 SERVICE
-"$work/mlx-ipcd" --services "$work/services" > "$work/ipc.log" 2>&1 &
+"$work/synapse" --services "$work/services" > "$work/ipc.log" 2>&1 &
 ipc_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
@@ -1252,42 +1252,42 @@ sleep 2
 cp "$XDG_RUNTIME_DIR/nested-pages.display" "$work/pages.display"
 SCRIPT
 chmod +x "$work/pages-watch.sh"
-run_scenario pages "$work/pages.script" --no-fps --run "$work/mlx-settings" --run "$work/pages-watch.sh"
+run_scenario pages "$work/pages.script" --no-fps --run "$work/control" --run "$work/pages-watch.sh"
 "$work/mlx-audio" status > "$work/pages-audio.txt" 2>&1 || true
 kill "$ipc_pid" 2> /dev/null || true
-pkill -x mlx-audiod 2> /dev/null || true
+pkill -x resonance 2> /dev/null || true
 unset DBUS_SESSION_BUS_ADDRESS
-grep -qx "output = null" "$work/pages-audio.txt" || { echo "mlx-settings did not switch MLX Audio's output off" >&2; cat "$work/pages-audio.txt" "$work/pages-compositor.log" >&2; exit 1; }
+grep -qx "output = null" "$work/pages-audio.txt" || { echo "control did not switch MLX Audio's output off" >&2; cat "$work/pages-audio.txt" "$work/pages-compositor.log" >&2; exit 1; }
 volume=$(sed -n 's/^volume = //p' "$work/pages-audio.txt")
-[[ -n "$volume" && $volume -gt 20000 && $volume -lt 50000 ]] || { echo "mlx-settings' volume slider set $volume" >&2; cat "$work/pages-audio.txt" >&2; exit 1; }
+[[ -n "$volume" && $volume -gt 20000 && $volume -lt 50000 ]] || { echo "control' volume slider set $volume" >&2; cat "$work/pages-audio.txt" >&2; exit 1; }
 grep -qx "backend = nested" "$work/pages.display" && grep -q "^mode = 1024x768@" "$work/pages.display" || { echo "the nested compositor did not tell its output" >&2; cat "$work/pages.display" "$work/pages-compositor.log" >&2; exit 1; }
 [[ ! -e "$XDG_RUNTIME_DIR/nested-pages.display" ]] || { echo "nested-pages.display outlived the compositor" >&2; exit 1; }
 grep -qx "night-light = on" "$XDG_CONFIG_HOME/mlx/compositor.conf" && grep -qx "display-mode = auto" "$XDG_CONFIG_HOME/mlx/compositor.conf" || { echo "the Display page did not write night light" >&2; cat "$XDG_CONFIG_HOME/mlx/compositor.conf" >&2; exit 1; }
 grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the compositor did not read night light" >&2; cat "$work/pages-compositor.log" >&2; exit 1; }
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
-echo "ok   mlx-settings' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
+echo "ok   control' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
 
-# Scenario 14b: mlx-settings' Network page (the category at y 110) on a
-# system bus of its own (mlx-ipcd --address) with tools/network-test's
-# fakenetd in mlx-netd's place: a cable and a Wi-Fi card that sees four
+# Scenario 14b: control' Network page (the category at y 110) on a
+# system bus of its own (synapse --address) with tools/network-test's
+# fakenetd in nexus's place: a cable and a Wi-Fi card that sees four
 # networks (Zuhause at y 354 needs a passphrase). Zuhause is chosen, a
 # wrong passphrase is typed (refused: the field asks again, empty), then
 # the right one (joined), then Forget (at (374, 393)). The passphrase
 # reaches fakenetd only as its length.
 "$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
-"$work/mlx-ipcd" --address "$XDG_RUNTIME_DIR/system" > "$work/system-ipc.log" 2>&1 &
+"$work/synapse" --address "$XDG_RUNTIME_DIR/system" > "$work/system-ipc.log" 2>&1 &
 system_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/system" ]] && break; sleep 0.1; done
 export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/system"
 
-# Scenario 14a: the Network page (opened by its argument) without mlx-netd,
+# Scenario 14a: the Network page (opened by its argument) without nexus,
 # first with fakenetd running as NetworkManager (the page knows it by its
 # process name; --as takes the name and answers nothing), then also as an
-# mlx-netd that does not answer. What the page finds goes to stderr
-# ("mlx-settings: network: ...").
+# nexus that does not answer. What the page finds goes to stderr
+# ("control: network: ...").
 cat > "$work/network-page.sh" <<SCRIPT
 #!/bin/sh
-exec "$work/mlx-settings" network
+exec "$work/control" network
 SCRIPT
 chmod +x "$work/network-page.sh"
 cat > "$work/no-netd.script" <<SCRIPT
@@ -1305,9 +1305,9 @@ for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fake-silent.log" && b
 run_scenario silent-netd "$work/no-netd.script" --no-fps --run "$work/network-page.sh"
 kill "$manager_pid" "$silent_pid" 2> /dev/null || true
 wait "$manager_pid" "$silent_pid" 2> /dev/null || true
-grep -q "^mlx-settings: network: mlx-netd .*; NetworkManager runs the network; the kernel's links:" "$work/no-netd-compositor.log" && ! grep -q "^mlx-settings: network: mlx-netd is on the system bus" "$work/no-netd-compositor.log" || { echo "the Network page did not say that NetworkManager runs the network" >&2; cat "$work/no-netd-compositor.log" >&2; exit 1; }
-grep -q "^mlx-settings: network: mlx-netd is on the system bus but did not answer; NetworkManager runs the network" "$work/silent-netd-compositor.log" || { echo "the Network page did not say that mlx-netd does not answer" >&2; cat "$work/silent-netd-compositor.log" >&2; exit 1; }
-echo "ok   mlx-settings' Network page without mlx-netd says why (NetworkManager runs the network; mlx-netd does not answer) and lists the kernel's links"
+grep -q "^control: network: nexus .*; NetworkManager runs the network; the kernel's links:" "$work/no-netd-compositor.log" && ! grep -q "^control: network: nexus is on the system bus" "$work/no-netd-compositor.log" || { echo "the Network page did not say that NetworkManager runs the network" >&2; cat "$work/no-netd-compositor.log" >&2; exit 1; }
+grep -q "^control: network: nexus is on the system bus but did not answer; NetworkManager runs the network" "$work/silent-netd-compositor.log" || { echo "the Network page did not say that nexus does not answer" >&2; cat "$work/silent-netd-compositor.log" >&2; exit 1; }
+echo "ok   control' Network page without nexus says why (NetworkManager runs the network; nexus does not answer) and lists the kernel's links"
 
 "$work/fakenetd" > "$work/fakenetd.log" 2>&1 &
 netd_pid=$!
@@ -1334,35 +1334,35 @@ release 272
 wait 1500
 close
 SCRIPT
-run_scenario network "$work/network.script" --no-fps --run "$work/mlx-settings"
+run_scenario network "$work/network.script" --no-fps --run "$work/control"
 kill "$netd_pid" "$system_pid" 2> /dev/null || true
 unset DBUS_SYSTEM_BUS_ADDRESS
 expected=$(printf 'fakenetd: ready\nconnect Zuhause (11 bytes)\nrefused Zuhause\nconnect Zuhause (21 bytes)\njoined Zuhause\nforget Zuhause')
-[[ "$(cat "$work/fakenetd.log")" == "$expected" ]] || { echo "mlx-settings' Network page did not join and forget Zuhause as asked" >&2; cat "$work/fakenetd.log" "$work/network-compositor.log" >&2; exit 1; }
+[[ "$(cat "$work/fakenetd.log")" == "$expected" ]] || { echo "control' Network page did not join and forget Zuhause as asked" >&2; cat "$work/fakenetd.log" "$work/network-compositor.log" >&2; exit 1; }
 ! grep -q "correct horse" "$work/fakenetd.log" "$work/network-compositor.log" || { echo "the passphrase was written out" >&2; exit 1; }
-echo "ok   mlx-settings' Network page joins a Wi-Fi network (a wrong passphrase is refused and asked again) and forgets it"
+echo "ok   control' Network page joins a Wi-Fi network (a wrong passphrase is refused and asked again) and forgets it"
 
 # Scenario 15: the permission dialog (projects/desktop/permissions). A
 # sandboxed app (bwrap with a .flatpak-info) records; MLXIPC has to ask
-# (audio.record), starts mlx-permissions from its service file, and its
+# (audio.record), starts scope from its service file, and its
 # dialog opens on the compositor (at (24, 24); the question takes two
 # lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
 # clicked: the app records and ipc.conf keeps the answer. Then
-# mlx-settings' Apps page (the category at y 194) lists the app's
+# control' Apps page (the category at y 194) lists the app's
 # microphone as allowed; Deny (at (662, 208)) is clicked: ipc.conf says
 # so.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
-    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/mlx-permissions"
+    "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/scope"
     cat > "$work/services/org.mlx.PermissionAgent.service" <<SERVICE
 [D-BUS Service]
 Name=org.mlx.PermissionAgent
-Exec=$work/mlx-permissions
+Exec=$work/scope
 SERVICE
     : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
     # The bus starts before the compositor (as in mlx-session): the agent
     # gets the compositor's display from it.
     # The apps that asked: only this scenario's.
-    XDG_STATE_HOME="$work/permission-state" WAYLAND_DISPLAY=nested-permission LC_ALL=C "$work/mlx-ipcd" --verbose --services "$work/services" > "$work/permission-ipc.log" 2>&1 &
+    XDG_STATE_HOME="$work/permission-state" WAYLAND_DISPLAY=nested-permission LC_ALL=C "$work/synapse" --verbose --services "$work/services" > "$work/permission-ipc.log" 2>&1 &
     ipc_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
     export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
@@ -1402,14 +1402,14 @@ release 272
 wait 1500
 close
 SCRIPT
-    run_scenario apps "$work/apps.script" --no-fps --run "$work/mlx-settings"
+    run_scenario apps "$work/apps.script" --no-fps --run "$work/control"
     kill "$ipc_pid" 2> /dev/null || true
-    pkill -x -P "$ipc_pid" mlx-audiod 2> /dev/null || true
+    pkill -x -P "$ipc_pid" resonance 2> /dev/null || true
     unset DBUS_SESSION_BUS_ADDRESS
     sleep 0.3
     grep -qx "deny org.example.Recorder use audio.record" "$XDG_CONFIG_HOME/mlx/ipc.conf" && [[ $(wc -l < "$XDG_CONFIG_HOME/mlx/ipc.conf") -eq 1 ]] || { echo "the Apps page did not deny the microphone: $(cat "$XDG_CONFIG_HOME/mlx/ipc.conf")" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
     grep -q "org.example.Recorder audio.record: deny" "$work/permission-ipc.log" || { echo "the bus got no SetPermission" >&2; cat "$work/permission-ipc.log" >&2; exit 1; }
-    echo "ok   mlx-settings' Apps page lists the app's permission and Deny changes it (SetPermission)"
+    echo "ok   control' Apps page lists the app's permission and Deny changes it (SetPermission)"
     : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 else
     echo "skip the permission dialog (no working bwrap)"
@@ -1451,8 +1451,8 @@ fi
 # with wl-clipboard (if available): wl-copy sets the selection, wl-paste
 # (another client) reads it through a pipe. wl-clipboard takes the
 # data-control protocol where it is offered (data_control.mlx); the data
-# device between windows is check_desktop_clients.sh's (mlx-terminal,
-# mlx-files).
+# device between windows is check_desktop_clients.sh's (vector,
+# polaris).
 if command -v wl-copy > /dev/null && command -v wl-paste > /dev/null; then
     cat > "$work/clipboard.sh" <<SCRIPT
 #!/bin/sh

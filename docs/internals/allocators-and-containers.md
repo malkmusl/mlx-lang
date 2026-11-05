@@ -124,7 +124,7 @@ ran without the check):
 | `ls -lR projects std` (coreutils) | 318 blocks, 246 KiB asked, 267 KiB in pages (7% wasted); tiny pages: 309 blocks on 5 pages, 99% full; below 256 B: 309 blocks, 3520 B in 19 KiB (82% wasted); 13 mappings, 2 holes, fragmentation 0.480; the places: 279 blocks of `std/bootstrap/path.mlx:12 allocate`, three 64 to 96 KiB vectors | 4.7 MiB resident |
 | `mlx-codemap unused` (the whole tree) | no snapshot: the index is one 3 GiB arena taken at the start, and a snapshot is written at an allocation at least a second after the last one (`std.leaks`), of which there are none | 3.2 s, 550 MiB peak |
 | `mlx-cc -c wtf/text/WTFString.cpp` | no snapshot: the arena is a raw `mmap` (build-time-notes.md has its MLX_CC_STATS: 1234 MiB arena, 406 MB in 502 blocks of 4 KiB and more, 185 MB of tokens, 154 MB of nodes) | 2.7 s, 587 MiB peak |
-| `mlx-sh -c SCRIPT` (the shell, headless) | no snapshot: the program ends within the second | — |
+| `flux -c SCRIPT` (the shell, headless) | no snapshot: the program ends within the second | — |
 
 `mlx-codemap hot` is the mlx-cc profile of the notes: `declspec`, the
 expression chain `logicalAnd` ... `postfix`, `qualifiedTypedef` and

@@ -5,7 +5,7 @@ framebuffer is the screen, the keyboards are read from their evdev nodes
 and go through the xkb keymap (`std.xkb`), the shell runs on a pty, and
 everything is drawn with the monospaced TrueType font (`std.truetype`
 through `std.ui.text`). The emulation and the drawing are the same code
-as `mlx-terminal`'s (`std.terminal`, `std.ui.terminal`); only the window
+as `vector`'s (`std.terminal`, `std.ui.terminal`); only the window
 and the input differ. It is what a system without a desktop boots into,
 and a fallback when the compositor is not running.
 
@@ -27,7 +27,7 @@ put into graphics mode, default `/dev/tty0` when a device is used) or
 `std.ui.text` finds: DejaVu Sans Mono, Liberation Mono, Noto Sans Mono),
 `--layout L` with `--variant`, `--model`, `--options` (default
 `XKB_DEFAULT_LAYOUT` and friends, else `us`), `--history N` (default
-5000), `-- PROGRAM ARGS...` (default `$SHELL`, else `mlx-sh` beside the
+5000), `-- PROGRAM ARGS...` (default `$SHELL`, else `flux` beside the
 program or installed, else `/bin/sh`). The console ends with the
 program's status, and with 0 on SIGTERM, SIGINT or SIGHUP after putting
 the console back into text mode.
@@ -43,7 +43,7 @@ brixOS's pty) with the session as its input, output, errors and session
 roles, and the loop is one native wait on the control side, the keyboard
 and the program. Options: `--font FILE` (default
 /system/fonts/DejaVuSansMono.ttf), `--font-size N`, `--history N`,
-`-- PROGRAM ARGS...` (default mlx-sh). projects/brix/README.md says how
+`-- PROGRAM ARGS...` (default flux). projects/brix/README.md says how
 the kernel provides the devices; tools/check_brix_console.sh checks the
 screen pixel for pixel.
 
@@ -54,7 +54,7 @@ screen pixel for pixel.
   byte) and mapped; the terminal is drawn on an ARGB canvas of the
   screen's size and copied over row by row whenever the screen changed.
   A file framebuffer is the same without the device. Before the device
-  is taken, the boot splash (mlx-splash or plymouthd) is told to quit,
+  is taken, the boot splash (ignition or plymouthd) is told to quit,
   giving the console back (`projects/desktop/splash/handover.mlx`).
 - `input.mlx`: every `/dev/input/eventN` whose capabilities include
   letters and a space bar is a keyboard (mice and buttons are left

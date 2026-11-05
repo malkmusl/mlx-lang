@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# mlx-init (projects/init) end to end:
+# impulse (projects/init) end to end:
 #   - as a supervisor (not PID 1): services start in their order (`after`,
 #     `ready`), a oneshot runs once, a failing service is started again
-#     with a growing pause, a disabled one is not started; mlx-initctl
+#     with a growing pause, a disabled one is not started; impulsectl
 #     shows the status and stops, starts, restarts and reloads; SIGTERM
 #     stops every service and ends the init;
 #   - as PID 1 of a user, PID, mount and UTS namespace (unshare): the
 #     hostname, the mounts file, a service looking around, and a poweroff
-#     from mlx-initctl that stops the service and ends the namespace.
+#     from impulsectl that stops the service and ends the namespace.
 #
 #   tools/check_init.sh [compiler]
 set -euo pipefail
@@ -26,11 +26,11 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL $1" >&2; [[ -f "${2:-}" ]] && cat "$2" >&2; exit 1; }
 
-"$compiler" --quiet projects/init/main.mlx -o "$work/mlx-init"
-"$compiler" --quiet projects/init/tool.mlx -o "$work/mlx-initctl"
-echo "ok   mlx-init and mlx-initctl build"
+"$compiler" --quiet projects/init/main.mlx -o "$work/impulse"
+"$compiler" --quiet projects/init/tool.mlx -o "$work/impulsectl"
+echo "ok   impulse and impulsectl build"
 
-ctl() { "$work/mlx-initctl" --control "$work/run/init" "$@"; }
+ctl() { "$work/impulsectl" --control "$work/run/init" "$@"; }
 # The state of a service from the status table.
 state_of() { ctl status | awk -v name="$1" '$1 == name { print $2 }'; }
 pid_of() { ctl status | awk -v name="$1" '$1 == name { print $3 }'; }
@@ -79,7 +79,7 @@ description = disabled
 disabled = yes
 exec = /bin/sleep 1000
 SERVICE
-"$work/mlx-init" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2> "$work/init.err" &
+"$work/impulse" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2> "$work/init.err" &
 init_pid=$!
 wait_socket "$work/run/init" "$work/init.err"
 wait_state b 50 running || fail "b did not come to run (after a, ready by its file)" "$work/init.err"
@@ -88,10 +88,10 @@ wait_state b 50 running || fail "b did not come to run (after a, ready by its fi
 [[ "$(state_of off)" == disabled ]] || fail "the disabled service is not disabled" "$work/init.err"
 [[ "$(grep -c . "$work/run/once.txt")" == 1 ]] || fail "the oneshot did not run exactly once"
 grep -q '^started$' "$work/log/a.log" || fail "a's output is not in its log" "$work/init.err"
-a_line=$(grep -n '^mlx-init: a: started' "$work/init.err" | head -1 | cut -d: -f1)
-b_line=$(grep -n '^mlx-init: b: started' "$work/init.err" | head -1 | cut -d: -f1)
+a_line=$(grep -n '^impulse: a: started' "$work/init.err" | head -1 | cut -d: -f1)
+b_line=$(grep -n '^impulse: b: started' "$work/init.err" | head -1 | cut -d: -f1)
 [[ -n "$a_line" && -n "$b_line" && "$a_line" -lt "$b_line" ]] || fail "b did not start after a" "$work/init.err"
-grep -q '^mlx-init: b: ready' "$work/init.err" || fail "b's ready path was not seen" "$work/init.err"
+grep -q '^impulse: b: ready' "$work/init.err" || fail "b's ready path was not seen" "$work/init.err"
 echo "ok   services start in order (after, ready), a oneshot runs once, a disabled one stays off, output goes to the logs"
 
 sleep 2.5
@@ -116,7 +116,7 @@ wait_state b 50 running || fail "b did not come back after restart" "$work/init.
 kill -0 "$b_pid" 2> /dev/null && fail "b's old process $b_pid is still there after restart"
 if ctl start nothere 2> "$work/nothere.err"; then fail "starting an unknown service succeeded"; fi
 grep -q 'no such service: nothere' "$work/nothere.err" || fail "the unknown service was not named" "$work/nothere.err"
-echo "ok   mlx-initctl stops, starts and restarts a service, and names an unknown one"
+echo "ok   impulsectl stops, starts and restarts a service, and names an unknown one"
 
 cat > "$work/services/c.service" <<SERVICE
 description = added later
@@ -140,7 +140,7 @@ init_pid=
 for pid in $b_pid $c_pid; do
     kill -0 "$pid" 2> /dev/null && fail "service process $pid is still there after the init ended"
 done
-grep -q '^mlx-init: services stopped, ending' "$work/init.err" || fail "the init did not say it ended" "$work/init.err"
+grep -q '^impulse: services stopped, ending' "$work/init.err" || fail "the init did not say it ended" "$work/init.err"
 echo "ok   SIGTERM stops every service and ends the init (not PID 1)"
 
 # --- As PID 1 of a namespace.
@@ -153,15 +153,15 @@ if unshare --user --map-root-user --pid --fork --mount-proc --uts true 2> /dev/n
 printf '%s\n' "\$*" >> "$ns/fsck.log"
 FSCK
     chmod 755 "$ns/fsck"
-    echo "mlx-init-test-root $ns/mnt tmpfs mode=755,size=1m 0 1" > "$ns/mounts"
+    echo "impulse-test-root $ns/mnt tmpfs mode=755,size=1m 0 1" > "$ns/mounts"
     cat > "$ns/services/probe.service" <<SERVICE
 description = looks around inside the namespace
 exec = /bin/sh -c "echo comm=\$(cat /proc/1/comm); echo host=\$(cat /proc/sys/kernel/hostname); echo mnt=\$(grep ' $ns/mnt ' /proc/self/mounts | cut -d' ' -f3); exec sleep 1000"
 SERVICE
-    unshare --user --map-root-user --pid --fork --mount-proc --uts "$work/mlx-init" --services "$ns/services" --mounts "$ns/mounts" --fsck "$ns/fsck" --hostname "$ns/hostname" --control "$ns/run/init" --log "$ns/log" --verbose 2> "$ns/init.err" &
+    unshare --user --map-root-user --pid --fork --mount-proc --uts "$work/impulse" --services "$ns/services" --mounts "$ns/mounts" --fsck "$ns/fsck" --hostname "$ns/hostname" --control "$ns/run/init" --log "$ns/log" --verbose 2> "$ns/init.err" &
     init_pid=$!
     wait_socket "$ns/run/init" "$ns/init.err"
-    nsctl() { "$work/mlx-initctl" --control "$ns/run/init" "$@"; }
+    nsctl() { "$work/impulsectl" --control "$ns/run/init" "$@"; }
     tries=0
     while ! grep -q '^mnt=' "$ns/log/probe.log" 2> /dev/null; do
         tries=$((tries + 1))
@@ -169,10 +169,10 @@ SERVICE
         sleep 0.1
     done
     [[ "$(nsctl status | awk '$1 == "probe" { print $2 }')" == running ]] || fail "the probe is not running under PID 1" "$ns/init.err"
-    grep -q '^comm=mlx-init$' "$ns/log/probe.log" || fail "PID 1 of the namespace is not mlx-init" "$ns/log/probe.log"
+    grep -q '^comm=impulse$' "$ns/log/probe.log" || fail "PID 1 of the namespace is not impulse" "$ns/log/probe.log"
     grep -q '^host=mlxtest$' "$ns/log/probe.log" || fail "the hostname was not set from the file" "$ns/log/probe.log"
     grep -q '^mnt=tmpfs$' "$ns/log/probe.log" || fail "the mounts file was not applied" "$ns/log/probe.log"
-    grep -qx -- '-a -t tmpfs mlx-init-test-root' "$ns/fsck.log" || fail "the fstab check pass did not invoke the configured fsck" "$ns/fsck.log"
+    grep -qx -- '-a -t tmpfs impulse-test-root' "$ns/fsck.log" || fail "the fstab check pass did not invoke the configured fsck" "$ns/fsck.log"
     echo "ok   as PID 1: the hostname, all fstab fields, fsck, mounts and services"
     nsctl poweroff > /dev/null || fail "poweroff was refused" "$ns/init.err"
     tries=0
@@ -182,8 +182,8 @@ SERVICE
         sleep 0.1
     done
     init_pid=
-    grep -q '^mlx-init: probe: stopped' "$ns/init.err" || fail "the service was not stopped for the poweroff" "$ns/init.err"
-    grep -q '^mlx-init: powering off' "$ns/init.err" || fail "the init did not get to the power off" "$ns/init.err"
+    grep -q '^impulse: probe: stopped' "$ns/init.err" || fail "the service was not stopped for the poweroff" "$ns/init.err"
+    grep -q '^impulse: powering off' "$ns/init.err" || fail "the init did not get to the power off" "$ns/init.err"
     echo "ok   as PID 1: poweroff stops the services, unmounts and hands over to the kernel (the namespace ends)"
 else
     echo "skip as PID 1 (unshare with a user and PID namespace does not work here)"
@@ -194,4 +194,4 @@ fi
 "$repo_root/tools/check_init_accounts_shutdown_logs.sh" "$compiler"
 "$repo_root/tools/check_init_fstab.sh" "$compiler"
 
-echo "PASS mlx-init"
+echo "PASS impulse"

@@ -22,7 +22,7 @@ Build a signed APK from the repository root:
 
 ```sh
 zig-out/bin/mlx1 projects/android/files/main.mlx \
-  -o mlx-files-android.apk \
+  -o polaris-android.apk \
   --target=aarch64-android \
   --android-package=org.mlx.files \
   --android-label="Mlx Files"

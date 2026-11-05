@@ -1,20 +1,20 @@
-# mlx-netd
+# nexus
 
 The network of MLX/Linux in place of NetworkManager, written in Mlx
-without libc. `mlx-netd` follows the links through route netlink
+without libc. `nexus` follows the links through route netlink
 (`std.netlink`), puts them up, and once a link has a carrier configures
 it: DHCPv4 or the static settings of its configuration. Wi-Fi cards are
 driven through nl80211: scans, joining open and WPA2-Personal networks
 with its own supplicant (no wpa_supplicant), saved networks. It sets the
 link's address and default route and writes the name servers of all
 links into `resolv.conf`. It answers on MLXIPC's system bus
-(`mlx-ipcd --system`, `/run/mlx/bus`; no D-Bus), where `mlx-net`, the top
-bar and mlx-settings ask it, and where apps that ask NetworkManager
+(`synapse --system`, `/run/mlx/bus`; no D-Bus), where `mlx-net`, the top
+bar and control ask it, and where apps that ask NetworkManager
 whether they are online get an answer too. Who may change the network is
 MLXIPC's permission `network.control`.
 
 ```sh
-mlx4 projects/network/main.mlx -o mlx-netd
+mlx4 projects/network/main.mlx -o nexus
 mlx4 projects/network/tool.mlx -o mlx-net
 tools/check_network.sh                   # the end-to-end check
 tools/check_wifi.sh                      # Wi-Fi crypto and WPA2 handshakes
@@ -35,7 +35,7 @@ configured statically.
 ## The daemon
 
 ```
-mlx-netd [--config FILE] [--resolv FILE] [--bus PATH] [--verbose]
+nexus [--config FILE] [--resolv FILE] [--bus PATH] [--verbose]
 ```
 
 | Option | Default |
@@ -88,7 +88,7 @@ it is not joined by itself again until a new passphrase comes.
 
 What it does not speak: WPA3 (SAE) and networks that require management
 frame protection, 802.1X (Enterprise), WEP and WPA1, hidden networks.
-Without cfg80211 in the kernel there is no nl80211; mlx-netd says so
+Without cfg80211 in the kernel there is no nl80211; nexus says so
 and drives the cables.
 
 Each link's default route carries its metric (100 on a cable, 600 on
@@ -131,22 +131,22 @@ eth1.metric = 50
 
 `Devices`, `Networks` and `Scan` are anyone's. The changes (`Up`, `Down`,
 `Reload`, `Connect`, `Disconnect`, `Forget`) are MLXIPC's permission
-`network.control`: `mlx-netd` asks the bus (`org.mlx.IPC.Check`) whether
+`network.control`: `nexus` asks the bus (`org.mlx.IPC.Check`) whether
 the app that called has it, and does the change only then (else
 `AccessDenied`). An unsandboxed app has it by default, a sandboxed one
 (Flatpak) does not; `/etc/mlx/ipc.conf` decides otherwise:
 
 ```
 deny @all use network.control
-allow mlx-settings use network.control
-allow mlx-topbar use network.control
+allow control use network.control
+allow horizon use network.control
 allow mlx-net use network.control
 ```
 
 On a bus without `org.mlx.IPC` (D-Bus, given with `--bus`) that bus's own
 policy decides.
 
-While no NetworkManager owns the name, `mlx-netd` is also
+While no NetworkManager owns the name, `nexus` is also
 `org.freedesktop.NetworkManager` at `/org/freedesktop/NetworkManager`
 with what apps ask to know whether they are online: `state()`,
 `CheckConnectivity()`, the `State`, `Connectivity` and
@@ -156,44 +156,44 @@ a link with a default route is connected).
 ## On the desktop
 
 The top bar's control centre (`projects/desktop/topbar`, network.mlx)
-asks `mlx-netd` when it opens and every second while it is open: its
+asks `nexus` when it opens and every second while it is open: its
 network tile shows what is connected (a cable before Wi-Fi, a network
 being joined), and with a Wi-Fi card it opens the list of networks under
 the tiles, the joined one first, then by signal, each with its bars, a
 lock or a check. A click joins an open or saved network on the spot
 (`Connect` with no passphrase; the row says it is joining, then shows the
 check); one that needs a passphrase, or is not supported, opens
-mlx-settings' Network page on it (`mlx-settings network SSID`).
+control' Network page on it (`control network SSID`).
 
-mlx-settings' Network page (`projects/desktop/settings/network.mlx`)
+control' Network page (`projects/desktop/settings/network.mlx`)
 shows the links with their addresses, routes and name servers and a
 switch each (`Up`, `Down`), the networks in sight (`Search again`:
 `Scan`), and for the one chosen its passphrase field (masked) and Join,
 or Disconnect and Forget once it is joined. A passphrase refused is said
 on its row and asked again.
 
-Without an answer from `mlx-netd` the page says why and what to run
-(`projects/desktop/settings/network_status.mlx`): `mlx-netd` not
+Without an answer from `nexus` the page says why and what to run
+(`projects/desktop/settings/network_status.mlx`): `nexus` not
 installed or not switched on (with `tools/install_network.sh --enable`
 and the start), installed but MLXIPC's system bus not running (starting
-`mlx-ipcd`), stopped (the start, and the journal), running but not on
-MLXIPC's bus (an older `mlx-netd` on D-Bus, or not root: install and
+`synapse`), stopped (the start, and the journal), running but not on
+MLXIPC's bus (an older `nexus` on D-Bus, or not root: install and
 restart), a rule of `/etc/mlx/ipc.conf` refusing the call (the line that
 allows it), or on the bus and silent. It says when NetworkManager runs
-(its process), looks for the systemd unit (enabled or not), the mlx-init
-service and a running `mlx-netd`, and gives systemd's, mlx-init's or the
+(its process), looks for the systemd unit (enabled or not), the impulse
+service and a running `nexus`, and gives systemd's, impulse's or the
 plain command. Meanwhile
 it lists the links as the kernel has them (route netlink: their state and
 IPv4 address), read only.
 
 Both are checked against `tools/network-test/fakenetd.mlx`, a stand-in
-for `mlx-netd` on a system bus of the check's own (a cable and four Wi-Fi
+for `nexus` on a system bus of the check's own (a cable and four Wi-Fi
 networks; it says what it was asked, a passphrase only by its length):
 `tools/check_desktop_clients.sh` joins a network from the control centre,
 `tools/check_wayland_compositor.sh` joins one from the Network page with
 a wrong and then the right passphrase, and forgets it. With `--as NAME`
 fakenetd only takes NAME and answers nothing: the same check has it play
-NetworkManager and an `mlx-netd` that hangs, and the page must say so.
+NetworkManager and an `nexus` that hangs, and the page must say so.
 
 ## Installing
 
@@ -204,26 +204,26 @@ sudo tools/install_network.sh --enable                    # and switch over
 sudo tools/install_network.sh --disable                   # back, for now
 ```
 
-It builds `mlx-netd`, `mlx-net` and MLXIPC's `mlx-ipcd` into
+It builds `nexus`, `mlx-net` and MLXIPC's `synapse` into
 `PREFIX/bin/mlx` (`--prefix`, default `/usr`: `/usr/bin/mlx`, which it
 puts on PATH, [`tools/lib/mlx_layout.sh`](../../tools/lib/mlx_layout.sh))
 and installs
 `/etc/mlx/network.conf` (an example, all commented out; an existing one
-stays), systemd units and mlx-init services for MLXIPC's system bus
-(`mlx-ipcd.service`, from `projects/desktop/ipc/examples`) and for
-`mlx-netd` (which needs it), and `/var/lib/mlx/network` (mode 0700, the
+stays), systemd units and impulse services for MLXIPC's system bus
+(`synapse.service`, from `projects/desktop/ipc/examples`) and for
+`nexus` (which needs it), and `/var/lib/mlx/network` (mode 0700, the
 saved networks). The examples are in `examples/`. D-Bus is not needed:
 dbus-daemon may run beside MLXIPC for the system's other services, and
 the D-Bus policy an earlier install left is removed. Nothing is switched
-over unless `--enable` says so: then `mlx-ipcd.service` and
-`mlx-netd.service` are enabled and NetworkManager, systemd-networkd and
+over unless `--enable` says so: then `synapse.service` and
+`nexus.service` are enabled and NetworkManager, systemd-networkd and
 wpa_supplicant are masked, the links `systemctl enable` and
 `systemctl mask` make, and what was at those places before is kept in
-`/var/lib/mlx/network-installer`. `--disable` undoes it: `mlx-netd` is
+`/var/lib/mlx/network-installer`. `--disable` undoes it: `nexus` is
 no longer enabled, the three units are as they were (an install from
-before the kept state has its masks lifted), `mlx-ipcd` stays (mlx-login
+before the kept state has its masks lifted), `synapse` stays (sentinel
 needs the bus), nothing is built or removed, and it says what to start
-again (`systemctl daemon-reload && systemctl stop mlx-netd.service &&
+again (`systemctl daemon-reload && systemctl stop nexus.service &&
 systemctl start NetworkManager.service`); `--enable` switches over
 again. The script never calls systemctl itself. `--destdir DIR` stages it
 all under DIR instead (packaging, or a look before installing); without

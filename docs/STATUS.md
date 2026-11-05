@@ -77,9 +77,9 @@ On the branch `brix-kernel` (projects/brix/README.md there): mlx4 has an
 kernel and an `x86_64-brixos` one for its programs (`@import("builtin")`
 tells a program its target at compile time, `if comptime builtin.os ==
 builtin.Os.brixos` prunes the other branch), brix-image
-makes a Multiboot image (boot blob, kernel, file archive with mlx-sh and
+makes a Multiboot image (boot blob, kernel, file archive with flux and
 the coreutils), and the kernel boots in QEMU to the serial console and
-runs mlx-sh in user mode with Linux's system call numbers; programs run
+runs flux in user mode with Linux's system call numbers; programs run
 as processes (fork, execve, wait4, pipes, Ctrl-C), scheduled when they
 wait and by the timer (the PIT's interrupt ends a time slice in user
 mode, the serial line's brings input and Ctrl-C, each process keeps its
@@ -98,22 +98,22 @@ commits of the changed blocks when idle or at sync with the device
 flushed, inode numbers reused, snapshots as kept roots, directories
 leaving memory when nodes run short) mounted at
 /volumes/disk0 (`./mlx build brix`, `tools/check_brix.sh`). The first
-process is mlx-init (projects/init/brixos.mlx, on brixOS's own
-interface: the services of /system/settings/init/services, mlx-initctl
-over a FIFO, system_power), which shows the boot with mlx-splash on the
+process is impulse (projects/init/brixos.mlx, on brixOS's own
+interface: the services of /system/settings/init/services, impulsectl
+over a FIFO, system_power), which shows the boot with ignition on the
 display (projects/desktop/splash/brixos.mlx, the framebuffer) and then
 hands out all of the machine's memory (mapped beyond the boot tables'
 first GiB), says its figures and counts through system_info (the build
 runner sizes its jobs by them in brixOS; sysinfo prints them), and
-runs the desktop on it: mlx-compositor with std.wayland's transport over
+runs the desktop on it: kepler with std.wayland's transport over
 channels and listener nodes, its backend on the framebuffer, the keyboard
 and the mouse, its clients' keymap from the image, the launcher, the dock
-and the top bar started with process_spawn on channels, mlx-terminal as a
+and the top bar started with process_spawn on channels, vector as a
 client (tools/check_brix_desktop.sh; mlx-console instead with
 tools/check_brix_init.sh). The login runs on it too, all native: the
-system bus (mlx-ipcd on a listener node), mlx-login (the greeter branched
+system bus (synapse on a listener node), sentinel (the greeter branched
 to an unprivileged identity, a password of /system/settings, then the
-person's session in their home) and the greeter (mlx-greeter), with the
+person's session in their home) and the greeter (aurora), with the
 kernel naming each bus client's program (channel_peer) and the new
 identity_set and node_own calls (tools/check_brix_login.sh). An EFI boot
 sees all of RAM: the loader passes the UEFI memory map through

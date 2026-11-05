@@ -24,9 +24,9 @@ fail() { echo "FAIL $1" >&2; cat -v "$work/serial.txt" >&2 || true; exit 1; }
 mkdir -p "$work/bin" "$work/esp/EFI/BOOT"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet --target=x86_64-brixos projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet --target=x86_64-brixos projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet --target=x86_64-brixos projects/coreutils/uname/main.mlx -o "$work/bin/uname"
-"$work/brix-image" "$work/kernel" "$work/esp/EFI/BOOT/BOOTX64.EFI" "mlx-sh=$work/mlx-sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/esp/EFI/BOOT/BOOTX64.EFI" "flux=$work/flux" "$work/bin/"
 head -c 2 "$work/esp/EFI/BOOT/BOOTX64.EFI" | grep -q MZ || fail "BOOTX64.EFI is no PE file"
 echo "ok   the kernel and BOOTX64.EFI build"
 

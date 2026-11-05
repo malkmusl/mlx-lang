@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # brixOS's init and boot screen (projects/init/brixos.mlx,
-# projects/desktop/splash/brixos.mlx): the kernel starts mlx-init as the
+# projects/desktop/splash/brixos.mlx): the kernel starts impulse as the
 # first process; it reads the services of /system/settings/init/services,
-# shows the boot on the screen with mlx-splash while they start, starts
+# shows the boot on the screen with ignition while they start, starts
 # them with their roles (a oneshot writing to the console and to its log
 # file, the serial console's shell, a sleeper), holds the screen for the
-# splash's minimum before mlx-console takes it, answers mlx-initctl over
+# splash's minimum before mlx-console takes it, answers impulsectl over
 # its FIFO (status, stop, start, a message for the screen), shows the
 # shutdown on the screen and powers the machine off through system_power. The screen is dumped through QEMU's monitor: the splash's
 # picture while the services start, then mlx-console's prompt, pixel for
@@ -44,11 +44,11 @@ brix=--target=x86_64-brixos
 mkdir -p "$work/bin" "$work/services"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet $brix projects/console/brixos.mlx -o "$work/mlx-console"
-"$compiler" --quiet $brix projects/init/brixos.mlx -o "$work/mlx-init"
-"$compiler" --quiet $brix projects/init/tool.mlx -o "$work/mlx-initctl"
-"$compiler" --quiet $brix projects/desktop/splash/brixos.mlx -o "$work/mlx-splash"
+"$compiler" --quiet $brix projects/init/brixos.mlx -o "$work/impulse"
+"$compiler" --quiet $brix projects/init/tool.mlx -o "$work/impulsectl"
+"$compiler" --quiet $brix projects/desktop/splash/brixos.mlx -o "$work/ignition"
 "$compiler" --quiet projects/brix/tools/screen/main.mlx -o "$work/screen"
 for program in cat echo ls sleep; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
@@ -75,8 +75,8 @@ exec = sleep 3600
 EOF
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "mlx-console=$work/mlx-console" "mlx-init=$work/mlx-init" "mlx-initctl=$work/mlx-initctl" "mlx-splash=$work/mlx-splash" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
-echo "ok   the kernel, mlx-init, mlx-initctl, mlx-splash, mlx-console, the screen tool and a boot image with five services build"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "mlx-console=$work/mlx-console" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
+echo "ok   the kernel, impulse, impulsectl, ignition, mlx-console, the screen tool and a boot image with five services build"
 
 # The QEMU monitor on a socket: screen dumps.
 monitor() {
@@ -134,9 +134,9 @@ wait_for() {
     done
 }
 for (( i = 0; i < 100; i++ )); do [[ -S $work/monitor ]] && break; sleep 0.1; done
-wait_for '^mlx-init: brixOS.s init$'
-wait_for '^mlx-init: services defined: 5$'
-echo "ok   the kernel starts mlx-init as the first process; it reads the five services"
+wait_for '^impulse: brixOS.s init$'
+wait_for '^impulse: services defined: 5$'
+echo "ok   the kernel starts impulse as the first process; it reads the five services"
 # (On the line the serial shell's prompt may have started: both come
 # up at once, and which prints first is the scheduler's.)
 wait_for 'hello-from-the-oneshot$'
@@ -144,9 +144,9 @@ echo "ok   a oneshot with log = console writes to the serial console through the
 # (The splash's notes land on the serial line beside the prompt.)
 wait_for '^root@brix:[^#]*# '
 # A line for the screen from the shell, while the splash is still up.
-printf 'mlx-initctl message hello from the shell\r' >&3
-wait_for '^mlx-splash: message: hello from the shell$'
-echo "ok   mlx-initctl message puts a line on the boot screen through the init"
+printf 'impulsectl message hello from the shell\r' >&3
+wait_for '^ignition: message: hello from the shell$'
+echo "ok   impulsectl message puts a line on the boot screen through the init"
 # The splash is on the screen while the services start (the console is
 # held back for its minimum): a night of blue with lit pixels, not the
 # console's dark grey.
@@ -161,8 +161,8 @@ for (( i = 0; i < 20; i++ )); do
 done
 (( blue > 100000 )) || fail "the boot screen is not on the display ($blue blue pixels, $lit lit)"
 (( lit > 2000 )) || fail "the boot screen shows nothing lit ($lit pixels)"
-echo "ok   mlx-splash draws the boot screen on the framebuffer while the services start ($blue blue, $lit lit pixels)"
-wait_for '^mlx-splash: told to quit, the picture stays$'
+echo "ok   ignition draws the boot screen on the framebuffer while the services start ($blue blue, $lit lit pixels)"
+wait_for '^ignition: told to quit, the picture stays$'
 # Then mlx-console takes the screen: its prompt, pixel for pixel.
 same() {
     local dump=$1 text=$2 what=$3
@@ -177,31 +177,31 @@ same() {
 }
 same "$work/console.ppm" 'root@brix:~# ' "mlx-console's prompt after the splash"
 echo "ok   the splash is told to quit and mlx-console takes the screen (screen = yes): its prompt, pixel for pixel"
-printf 'mlx-initctl status\r' >&3
+printf 'impulsectl status\r' >&3
 wait_for '^console  *running  *[0-9]* *0 *[0-9]*s *mlx-console on the screen$'
 wait_for '^hello  *done  *-  *0 *-  *a oneshot saying hello on the console$'
 wait_for '^logged  *done  *-  *0 *-  *a oneshot writing to its log file$'
-wait_for '^serial-shell  *running  *[0-9]* *0 *[0-9]*s *mlx-sh on the serial console$'
+wait_for '^serial-shell  *running  *[0-9]* *0 *[0-9]*s *flux on the serial console$'
 wait_for '^sleeper  *running  *[0-9]* *0 *[0-9]*s *sleeps, to be stopped and started$'
-echo "ok   mlx-initctl status over the control FIFO: the oneshots done, the others running"
+echo "ok   impulsectl status over the control FIFO: the oneshots done, the others running"
 printf 'cat /temporary/logs/logged.log\r' >&3
 wait_for '^a-line-for-the-log$'
 echo "ok   a service's output goes to its log file (/temporary/logs/NAME.log)"
-printf 'mlx-initctl stop sleeper; mlx-initctl status\r' >&3
-wait_for '^mlx-init: sleeper: stopped$'
+printf 'impulsectl stop sleeper; impulsectl status\r' >&3
+wait_for '^impulse: sleeper: stopped$'
 wait_for '^sleeper  *stopped  *-  *0 *-  *sleeps, to be stopped and started$'
-printf 'mlx-initctl start sleeper; mlx-initctl status\r' >&3
+printf 'impulsectl start sleeper; impulsectl status\r' >&3
 wait_for '^sleeper  *running  *[0-9]* *0 *[0-9]*s *sleeps, to be stopped and started$' 2
-echo "ok   mlx-initctl stop ends a service (terminate to its group) and start runs it again"
-printf 'mlx-initctl message\r' >&3
-wait_for '^mlx-initctl: error: no boot screen is up$'
-printf 'mlx-initctl poweroff\r' >&3
-wait_for '^mlx-init: poweroff$'
+echo "ok   impulsectl stop ends a service (terminate to its group) and start runs it again"
+printf 'impulsectl message\r' >&3
+wait_for '^impulsectl: error: no boot screen is up$'
+printf 'impulsectl poweroff\r' >&3
+wait_for '^impulse: poweroff$'
 # The shutdown on the screen: the splash in its shutdown mode says each
 # service stopping, and the display shows its night again (the console
 # ended), before the machine goes.
-wait_for '^mlx-splash: up, shutdown, on the display$'
-wait_for '^mlx-splash: stopping serial-shell$'
+wait_for '^ignition: up, shutdown, on the display$'
+wait_for '^ignition: stopping serial-shell$'
 lit=0
 blue=0
 for (( i = 0; i < 20; i++ )); do
@@ -212,11 +212,11 @@ for (( i = 0; i < 20; i++ )); do
     sleep 0.2
 done
 (( blue > 100000 )) || fail "the shutdown screen is not on the display ($blue blue pixels, $lit lit)"
-echo "ok   the shutdown is on the screen: mlx-splash in its shutdown mode, told what stops ($blue blue pixels)"
-wait_for '^mlx-splash: told to quit$'
+echo "ok   the shutdown is on the screen: ignition in its shutdown mode, told what stops ($blue blue pixels)"
+wait_for '^ignition: told to quit$'
 wait_for '^brixOS: powering off$'
 for (( i = 0; i < 100; i++ )); do kill -0 "$qemu_pid" 2> /dev/null || break; sleep 0.1; done
 kill -0 "$qemu_pid" 2> /dev/null && fail "QEMU did not power off"
 qemu_pid=
-echo "ok   mlx-initctl poweroff stops the services and the kernel powers the machine off (system_power)"
+echo "ok   impulsectl poweroff stops the services and the kernel powers the machine off (system_power)"
 echo PASS

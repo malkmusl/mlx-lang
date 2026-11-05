@@ -97,7 +97,7 @@ How the compiler itself works, normatively and concretely:
 Work orders for an outside assistant, to be pasted as they are:
 
 - [`prompts/login-and-init.md`](prompts/login-and-init.md) — finishing
-  the login (mlx-login, the greeter, the lock screen) and mlx-init (in
+  the login (sentinel, the greeter, the lock screen) and impulse (in
   German)
 
 ## Keeping this documentation accurate

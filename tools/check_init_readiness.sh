@@ -16,8 +16,8 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL $1" >&2; [[ -f "${2:-}" ]] && cat "$2" >&2; exit 1; }
 
-"$compiler" --quiet projects/init/main.mlx -o "$work/mlx-init"
-"$compiler" --quiet projects/init/tool.mlx -o "$work/mlx-initctl"
+"$compiler" --quiet projects/init/main.mlx -o "$work/impulse"
+"$compiler" --quiet projects/init/tool.mlx -o "$work/impulsectl"
 "$compiler" --quiet tools/init-readiness-test/server.mlx -o "$work/ready-server"
 mkdir -p "$work/services" "$work/run" "$work/log"
 cat > "$work/services/listener.service" <<SERVICE
@@ -31,16 +31,16 @@ description = waits for the listening socket
 after = listener
 exec = /bin/sh -c "touch $work/run/dependent.started; exec sleep 1000"
 SERVICE
-"$work/mlx-init" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2>"$work/init.err" &
+"$work/impulse" --services "$work/services" --control "$work/run/init" --log "$work/log" --verbose 2>"$work/init.err" &
 init_pid=$!
 
 tries=0
 while [[ ! -S "$work/run/init" ]]; do
     tries=$((tries + 1))
-    [[ $tries -lt 50 ]] || fail "mlx-init did not open its control socket" "$work/init.err"
+    [[ $tries -lt 50 ]] || fail "impulse did not open its control socket" "$work/init.err"
     sleep 0.1
 done
-ctl() { "$work/mlx-initctl" --control "$work/run/init" "$@"; }
+ctl() { "$work/impulsectl" --control "$work/run/init" "$@"; }
 
 tries=0
 while [[ ! -e "$work/run/service.sock" ]]; do
@@ -64,7 +64,7 @@ while [[ ! -f "$work/run/dependent.started" ]]; do
     [[ $tries -lt 20 ]] || fail "the dependent did not execute" "$work/init.err"
     sleep 0.05
 done
-grep -q '^mlx-init: listener: ready$' "$work/init.err" || fail "the socket readiness transition was not reported" "$work/init.err"
+grep -q '^impulse: listener: ready$' "$work/init.err" || fail "the socket readiness transition was not reported" "$work/init.err"
 
 kill -TERM "$init_pid"
 wait "$init_pid"

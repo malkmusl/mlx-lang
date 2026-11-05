@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small mlx-init control-socket fixture for the mlx-login check."""
+"""Small impulse control-socket fixture for the sentinel check."""
 
 import os
 import socket

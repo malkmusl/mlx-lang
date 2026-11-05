@@ -22,15 +22,15 @@ compiler_args=()
 [[ $# -gt 0 ]] && compiler_args=(--compiler "$1")
 tools/install_compositor_session.sh --destdir "$work/root" --replace-sound-servers "${compiler_args[@]}" > "$work/install.log"
 bindir="$work/root/usr/bin/mlx"
-entry="$work/root/usr/share/wayland-sessions/mlx-compositor.desktop"
-for program in mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod mlx-audio mlx-permissions mlx-notifyd mlx-notify; do
+entry="$work/root/usr/share/wayland-sessions/kepler.desktop"
+for program in kepler vector flux mlx-console mlx-session orbit horizon launch control polaris mlx-observatory mlx-codemap mlx-profile mlx-capture synapse mlx-ipc resonance mlx-audio scope beacon mlx-notify; do
     [[ -x "$bindir/$program" ]] || { echo "not installed: $program" >&2; cat "$work/install.log" >&2; exit 1; }
 done
 grep -qx "Exec=/usr/bin/mlx/mlx-session" "$entry" || { echo "session entry without the launcher:" >&2; cat "$entry" >&2; exit 1; }
-grep -qx "Exec=/usr/bin/mlx/mlx-audiod" "$work/root/usr/share/mlx/dbus-1/services/org.mlx.Audio.service" || { echo "MLX Audio's service file is missing" >&2; exit 1; }
-grep -qx "Exec=/usr/bin/mlx/mlx-permissions" "$work/root/usr/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service" || { echo "the permission agent's service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/resonance" "$work/root/usr/share/mlx/dbus-1/services/org.mlx.Audio.service" || { echo "MLX Audio's service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/scope" "$work/root/usr/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service" || { echo "the permission agent's service file is missing" >&2; exit 1; }
 grep -qx "Exec=/usr/bin/mlx/mlx-capture --portal" "$work/root/usr/share/mlx/dbus-1/services/org.freedesktop.portal.Desktop.service" || { echo "the screen-sharing portal's service file is missing" >&2; exit 1; }
-grep -qx "Exec=/usr/bin/mlx/mlx-notifyd" "$work/root/usr/share/mlx/dbus-1/services/org.freedesktop.Notifications.service" || { echo "the notifications' service file is missing" >&2; exit 1; }
+grep -qx "Exec=/usr/bin/mlx/beacon" "$work/root/usr/share/mlx/dbus-1/services/org.freedesktop.Notifications.service" || { echo "the notifications' service file is missing" >&2; exit 1; }
 for library in libpulse.so.0 libpulse-simple.so.0 libpulse-mainloop-glib.so.0 libasound_module_pcm_pulse.so libasound_module_ctl_pulse.so; do
     [[ -f "$work/root/usr/lib/mlx-audio/$library" ]] || { echo "MLX Audio's $library is not installed" >&2; cat "$work/install.log" >&2; exit 1; }
 done
@@ -43,8 +43,8 @@ tools/install_compositor_session.sh --destdir "$work/root" --restore-sound-serve
 [[ ! -e "$work/root/etc/alsa/conf.d/99-zz-mlx-audio.conf" && ! -e "$work/root/etc/pulse/client.conf.d/50-mlx-audio.conf" ]] || { echo "--restore-sound-servers left the settings" >&2; cat "$work/restore.log" >&2; exit 1; }
 grep -qx 'PATH=${PATH}:/usr/bin/mlx' "$work/root/etc/environment.d/50-mlx.conf" && [[ -f "$work/root/etc/profile.d/mlx.sh" ]] || { echo "/usr/bin/mlx was not put on PATH" >&2; cat "$work/install.log" >&2; exit 1; }
 files_entry="$work/root/usr/share/applications/org.mlx.files.desktop"
-grep -qx "Exec=/usr/bin/mlx/mlx-files %U" "$files_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.files.png" ]] || { echo "the file manager's entry or icon is missing" >&2; exit 1; }
-settings_entry="$work/root/usr/share/applications/mlx-settings.desktop"
+grep -qx "Exec=/usr/bin/mlx/polaris %U" "$files_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.files.png" ]] || { echo "the file manager's entry or icon is missing" >&2; exit 1; }
+settings_entry="$work/root/usr/share/applications/control.desktop"
 grep -qx "Icon=org.mlx.settings" "$settings_entry" && grep -qx "StartupWMClass=org.mlx.settings" "$settings_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.settings.png" ]] || { echo "the settings' entry or icon is missing" >&2; exit 1; }
 observatory_entry="$work/root/usr/share/applications/org.mlx.observatory.desktop"
 grep -qx "Exec=/usr/bin/mlx/mlx-observatory $repo_root" "$observatory_entry" && [[ -f "$work/root/usr/share/icons/hicolor/128x128/apps/org.mlx.observatory.png" ]] || { echo "MLX Observatory's entry or icon is missing" >&2; exit 1; }
@@ -86,7 +86,7 @@ if command -v cage > /dev/null; then
     log=$(run_session cage)
     grep -q "^output: 1280x720 (monitor 1280x720)" <<< "$log" || { echo "cage: the compositor did not take the monitor's resolution" >&2; echo "$log" >&2; exit 1; }
     grep -q "^mlx-session: keyboard de" <<< "$log" || { echo "cage: keyboard layout not passed on" >&2; exit 1; }
-    grep -q "^launch: .*/mlx-dock$" <<< "$log" || { echo "cage: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
+    grep -q "^launch: .*/orbit$" <<< "$log" || { echo "cage: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
     echo "ok   cage session: fullscreen at the monitor's 1280x720, keyboard de, the dock started"
     checked=$((checked + 1))
 else
@@ -98,11 +98,11 @@ if command -v weston > /dev/null; then
     size=$(sed -n 's/^output: \([0-9]*x[0-9]*\) (monitor \([0-9]*x[0-9]*\).*/\1 \2/p' <<< "$log")
     [[ "${size% *}" == "${size#* }" ]] || { echo "weston: output ${size% *} is not the monitor's ${size#* }" >&2; exit 1; }
     grep -q "^mlx-session: keyboard de" <<< "$log" || { echo "weston: keyboard layout not passed on" >&2; exit 1; }
-    grep -q "^launch: .*/mlx-dock$" <<< "$log" || { echo "weston: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
-    grep -q "^mlx-session: session bus: mlx-ipcd" <<< "$log" || { echo "weston: the session is not on mlx-ipcd" >&2; echo "$log" >&2; exit 1; }
+    grep -q "^launch: .*/orbit$" <<< "$log" || { echo "weston: the session did not start the dock" >&2; echo "$log" >&2; exit 1; }
+    grep -q "^mlx-session: session bus: synapse" <<< "$log" || { echo "weston: the session is not on synapse" >&2; echo "$log" >&2; exit 1; }
     grep -q "^mlx-session: sound: MLX Audio has the card; stopped for the session: pipewire.socket pipewire.service wireplumber.service" <<< "$log" || { echo "weston: PipeWire was not stopped" >&2; echo "$log" >&2; exit 1; }
     grep -q "^mlx-session: sound: given back" <<< "$log" && grep -qx -- "--user mask --runtime pipewire.socket pipewire.service wireplumber.service" "$work/systemctl.log" && grep -qx -- "--user unmask --runtime pipewire.socket pipewire.service wireplumber.service" "$work/systemctl.log" && grep -qx -- "--user start pipewire.socket" "$work/systemctl.log" || { echo "weston: PipeWire was not given back" >&2; cat "$work/systemctl.log" >&2; echo "$log" >&2; exit 1; }
-    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de, the dock started, on mlx-ipcd, PipeWire stopped and given back"
+    echo "ok   weston session (kiosk shell): fullscreen at the monitor's ${size#* }, keyboard de, the dock started, on synapse, PipeWire stopped and given back"
     checked=$((checked + 1))
 else
     echo "skip weston is not installed"

@@ -192,7 +192,7 @@ implemented: this repository has no packages from elsewhere.
 ./mlx build -j 8 --verbose       # eight jobs; name the current steps too
 ./mlx build --no-memory-limit    # -j jobs whatever the memory
 ./mlx build --dry-run            # what would be built
-./mlx build --force mlx-sh       # build it even when it is current
+./mlx build --force flux       # build it even when it is current
 ./mlx build --keep-going         # go on after a step failed
 ./mlx build --retry-failed       # run steps whose failure is remembered
 ./mlx build --verify-epoch 20    # then compile 20 cached objects again, compare

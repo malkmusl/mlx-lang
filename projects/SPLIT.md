@@ -16,7 +16,7 @@ tree is unchanged until the repositories exist.
 | `malkmusl/mlx-coreutils` | `split/mlx-coreutils` | `projects/coreutils` |
 | `malkmusl/mlx-shell` | `split/mlx-shell` | `projects/shell` |
 | `malkmusl/mlx-console` | `split/mlx-console` | `projects/console` |
-| `malkmusl/mlx-init` | `split/mlx-init` | `projects/init` |
+| `malkmusl/impulse` | `split/impulse` | `projects/init` |
 | `malkmusl/mlx-network` | `split/mlx-network` | `projects/network` |
 | `malkmusl/mlx-android` | `split/mlx-android` | `projects/android` |
 | `malkmusl/mlx-filemanager-shared` | `split/mlx-filemanager-shared` | `projects/filemanager-shared` |

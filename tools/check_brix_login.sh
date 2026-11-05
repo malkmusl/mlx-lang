@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# brixOS's login (projects/desktop/ipc mlx-ipcd, projects/desktop/login
-# mlx-login and its greeter compositor, projects/desktop/greeter
-# mlx-greeter), all native: mlx-init starts the system bus (ipcd.service,
-# mlx-ipcd on a listener node at /temporary/bus) and then the login
-# (login.service, mlx-login). mlx-login takes the screen after the splash,
-# starts the greeter (mlx-compositor --greeter mlx-greeter) dropped to an
+# brixOS's login (projects/desktop/ipc synapse, projects/desktop/login
+# sentinel and its greeter compositor, projects/desktop/greeter
+# aurora), all native: impulse starts the system bus (ipcd.service,
+# synapse on a listener node at /temporary/bus) and then the login
+# (login.service, sentinel). sentinel takes the screen after the splash,
+# starts the greeter (kepler --greeter aurora) dropped to an
 # unprivileged uid, and owns org.mlx.Login and org.freedesktop.login1 on
-# the bus. mlx-greeter connects to the compositor over a channel and to
+# the bus. aurora connects to the compositor over a channel and to
 # the bus over /temporary/bus; the kernel names its program to the bus
-# (channel_peer), so the bus's policy lets mlx-greeter use login.session.
+# (channel_peer), so the bus's policy lets aurora use login.session.
 # A password (the account brix, password "brix", of /system/settings)
-# makes mlx-login branch, take the person's identity (identity_set) and
-# replace itself with their session (mlx-compositor, the desktop) in their
+# makes sentinel branch, take the person's identity (identity_set) and
+# replace itself with their session (kepler, the desktop) in their
 # home /users/brix, made at the first login and owned by them (node_own).
 # The screen is dumped through QEMU's monitor, which also types the
 # password.
@@ -49,18 +49,18 @@ brix=--target=x86_64-brixos
 mkdir -p "$work/bin" "$work/services"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
-"$compiler" --quiet $brix projects/init/brixos.mlx -o "$work/mlx-init"
-"$compiler" --quiet $brix projects/init/tool.mlx -o "$work/mlx-initctl"
-"$compiler" --quiet $brix projects/desktop/splash/brixos.mlx -o "$work/mlx-splash"
-"$compiler" --quiet $brix projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet $brix projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
-"$compiler" --quiet $brix projects/desktop/launcher/main.mlx -o "$work/mlx-launcher"
-"$compiler" --quiet $brix projects/desktop/dock/main.mlx -o "$work/mlx-dock"
-"$compiler" --quiet $brix projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
-"$compiler" --quiet $brix projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
-"$compiler" --quiet $brix projects/desktop/login/main.mlx -o "$work/mlx-login"
-"$compiler" --quiet $brix projects/desktop/greeter/main.mlx -o "$work/mlx-greeter"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
+"$compiler" --quiet $brix projects/init/brixos.mlx -o "$work/impulse"
+"$compiler" --quiet $brix projects/init/tool.mlx -o "$work/impulsectl"
+"$compiler" --quiet $brix projects/desktop/splash/brixos.mlx -o "$work/ignition"
+"$compiler" --quiet $brix projects/desktop/compositor/main.mlx -o "$work/kepler"
+"$compiler" --quiet $brix projects/desktop/terminal/main.mlx -o "$work/vector"
+"$compiler" --quiet $brix projects/desktop/launcher/main.mlx -o "$work/launch"
+"$compiler" --quiet $brix projects/desktop/dock/main.mlx -o "$work/orbit"
+"$compiler" --quiet $brix projects/desktop/topbar/main.mlx -o "$work/horizon"
+"$compiler" --quiet $brix projects/desktop/ipc/main.mlx -o "$work/synapse"
+"$compiler" --quiet $brix projects/desktop/login/main.mlx -o "$work/sentinel"
+"$compiler" --quiet $brix projects/desktop/greeter/main.mlx -o "$work/aurora"
 keymap=()
 if [[ -f /usr/share/X11/xkb/rules/evdev ]]; then
     "$compiler" --quiet projects/brix/tools/keymap/main.mlx -o "$work/brix-keymap"
@@ -74,29 +74,29 @@ done
 cp projects/brix/settings/init/services/serial-shell.service "$work/services/"
 # The bus and the login as shipped, their logs on the serial console
 # (--verbose on the bus: which app may use which permission).
-sed -e 's/^exec = mlx-ipcd /exec = mlx-ipcd --verbose /' -e '$a log = console' \
+sed -e 's/^exec = synapse /exec = synapse --verbose /' -e '$a log = console' \
     projects/brix/settings/init/services/ipcd.service > "$work/services/ipcd.service"
-grep -q '^exec = mlx-ipcd --verbose ' "$work/services/ipcd.service" || fail "ipcd.service is not the shipped one"
+grep -q '^exec = synapse --verbose ' "$work/services/ipcd.service" || fail "ipcd.service is not the shipped one"
 sed -e '$a log = console' \
     projects/brix/settings/init/services/login.service > "$work/services/login.service"
-grep -q '^exec = mlx-login ' "$work/services/login.service" || fail "login.service is not the shipped one"
+grep -q '^exec = sentinel ' "$work/services/login.service" || fail "login.service is not the shipped one"
 # The desktop service is shipped disabled (the login has the screen).
 grep -q '^disabled = yes$' projects/brix/settings/init/services/desktop.service || fail "desktop.service is not disabled for the login"
 
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
 "$work/brix-image" "$work/kernel" "$work/brix.img" \
-    "mlx-sh=$work/mlx-sh" "mlx-init=$work/mlx-init" "mlx-initctl=$work/mlx-initctl" "mlx-splash=$work/mlx-splash" \
-    "mlx-compositor=$work/mlx-compositor" "mlx-terminal=$work/mlx-terminal" "mlx-launcher=$work/mlx-launcher" "mlx-dock=$work/mlx-dock" "mlx-topbar=$work/mlx-topbar" \
-    "mlx-ipcd=$work/mlx-ipcd" "mlx-login=$work/mlx-login" "mlx-greeter=$work/mlx-greeter" \
+    "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" \
+    "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" \
+    "synapse=$work/synapse" "sentinel=$work/sentinel" "aurora=$work/aurora" \
     "settings/users=projects/brix/settings/users" "settings/groups=projects/brix/settings/groups" "settings/shadow=projects/brix/settings/shadow" \
     "share/wayland-sessions/brix.desktop=projects/brix/settings/share/wayland-sessions/brix.desktop" \
-    "share/applications/mlx-terminal.desktop=projects/desktop/terminal/mlx-terminal.desktop" \
+    "share/applications/vector.desktop=projects/desktop/terminal/vector.desktop" \
     "share/icons/hicolor/256x256/apps/utilities-terminal.png=projects/brix/settings/share/icons/hicolor/256x256/apps/utilities-terminal.png" \
     "share/icons/hicolor/48x48/apps/utilities-terminal.png=projects/brix/settings/share/icons/hicolor/48x48/apps/utilities-terminal.png" \
     "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" \
     "${entries[@]}" "$work/bin/"
-echo "ok   the kernel, the desktop, mlx-ipcd, mlx-login, mlx-greeter, the accounts and a boot image with the bus and login services build"
+echo "ok   the kernel, the desktop, synapse, sentinel, aurora, the accounts and a boot image with the bus and login services build"
 
 # The QEMU monitor on a socket: screen dumps and keys.
 monitor() {
@@ -136,32 +136,32 @@ wait_for() {
 }
 for (( i = 0; i < 100; i++ )); do [[ -S $work/monitor ]] && break; sleep 0.1; done
 
-wait_for '^mlx-init: brixOS.s init$'
-wait_for '^mlx-init: services defined: 3$'
-echo "ok   mlx-init defines the bus, the login and the serial shell"
+wait_for '^impulse: brixOS.s init$'
+wait_for '^impulse: services defined: 3$'
+echo "ok   impulse defines the bus, the login and the serial shell"
 # The bus listens, the login owns its names and starts the greeter.
 wait_for '^ipc: listening at unix:path=/temporary/bus$'
 wait_for '^login: org.mlx.Login and org.freedesktop.login1 on the system bus'
 wait_for '^login: greeter started$'
-echo "ok   the system bus listens and mlx-login starts the greeter on the screen"
+echo "ok   the system bus listens and sentinel starts the greeter on the screen"
 # The greeter is a bus client the kernel names (channel_peer), so the
 # bus's policy can tell it apart; the greeter compositor logs to a file,
 # so the login and bus messages on the serial line are what is checked.
-wait_for '^ipc: :1\.[0-9]* is mlx-greeter$'
-echo "ok   the kernel names the greeter's program to the bus (channel_peer): it is mlx-greeter, not unknown"
+wait_for '^ipc: :1\.[0-9]* is aurora$'
+echo "ok   the kernel names the greeter's program to the bus (channel_peer): it is aurora, not unknown"
 sleep 1
 
 # The password "brix" of the account brix, one key at a time (the field
 # is focused), then Enter.
 for key in b r i x ret; do monitor "sendkey $key"; sleep 0.3; done
-# The bus allows login.session for mlx-greeter; the session starts.
-wait_for '^ipc: mlx-greeter may use login.session$'
+# The bus allows login.session for aurora; the session starts.
+wait_for '^ipc: aurora may use login.session$'
 wait_for '^login: greeter stopped$'
 wait_for '^login: session started$'
-echo "ok   mlx-greeter may use login.session; the password is accepted and the session starts"
+echo "ok   aurora may use login.session; the password is accepted and the session starts"
 # The session is the desktop, as the person, in their home (made at the
 # first login): its compositor logs under /users/brix.
-wait_for '^mlx-compositor: logging to /users/brix/'
+wait_for '^kepler: logging to /users/brix/'
 echo "ok   the session is the desktop compositor as brix, in their home /users/brix"
 
 # The home is the person's, not root's (node_own at the first login):
@@ -180,4 +180,4 @@ echo "ok   the terminal icon ships under /system/share/icons/hicolor for the lau
 
 # A clean power off.
 printf 'poweroff\r' >&3 2> /dev/null || true
-echo "PASS brixOS login: the bus, mlx-login, the greeter and the session, all native"
+echo "PASS brixOS login: the bus, sentinel, the greeter and the session, all native"

@@ -2,7 +2,7 @@
 # brixOS (projects/brix) end to end: the kernel (--target=x86_64-freestanding)
 # and brix-image build, the image boots in QEMU (the test machine; nothing
 # of it is in what is built), the kernel says itself on the serial line and
-# starts mlx-sh from the boot archive in user mode; commands typed at its
+# starts flux from the boot archive in user mode; commands typed at its
 # prompt run (builtins, arithmetic, the working directory, a glob over the
 # archive's programs in /system/programs: brixOS's own layout); programs of
 # the archive run (fork, execve, wait4, the child's pages shared copy on
@@ -64,8 +64,8 @@ fail() { echo "FAIL $1" >&2; [[ -f "$work/serial.txt" ]] && cat -v "$work/serial
 # also for Linux.
 brix=--target=x86_64-brixos
 mkdir -p "$work/bin" "$work/linux-tools"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
-shell=$work/mlx-sh
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
+shell=$work/flux
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 # Every coreutils program (built here: what is in mlx-out may be older).
@@ -78,7 +78,7 @@ printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet $b
 # own calls, which Linux does not have): the same sources built for Linux.
 mkdir -p "$work/linux-tools/bin"
 printf '%s\n' "${programs[@]}" | xargs -P "$(nproc)" -I{} "$compiler" --quiet "projects/coreutils/{}/main.mlx" -o "$work/linux-tools/bin/{}"
-"$compiler" --quiet projects/shell/main.mlx -o "$work/linux-tools/mlx-sh"
+"$compiler" --quiet projects/shell/main.mlx -o "$work/linux-tools/flux"
 (( ${#programs[@]} >= 73 )) || fail "only ${#programs[@]} coreutils programs"
 for tool in snapshot brixfs floats signals native events objects kinds; do
     "$compiler" --quiet $brix "projects/brix/tools/$tool/main.mlx" -o "$work/$tool"
@@ -86,8 +86,8 @@ done
 for tool in brixfs floats signals; do
     "$compiler" --quiet "projects/brix/tools/$tool/main.mlx" -o "$work/linux-tools/$tool"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "objects=$work/objects" "kinds=$work/kinds" "linux-cat=$work/linux-tools/bin/cat" "linux-ls=$work/linux-tools/bin/ls" "every-program=tools/brix_programs.sh" "$work/bin/"
-echo "ok   the kernel, brix-image and the boot image (mlx-sh and ${#programs[@]} coreutils programs) build"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$shell" "snapshot=$work/snapshot" "brixfs=$work/brixfs" "floats=$work/floats" "signals=$work/signals" "native=$work/native" "events=$work/events" "objects=$work/objects" "kinds=$work/kinds" "linux-cat=$work/linux-tools/bin/cat" "linux-ls=$work/linux-tools/bin/ls" "every-program=tools/brix_programs.sh" "$work/bin/"
+echo "ok   the kernel, brix-image and the boot image (flux and ${#programs[@]} coreutils programs) build"
 
 # A disk of 4 MiB that starts with a text of the host's.
 head -c 4194304 /dev/zero > "$work/disk.img"
@@ -146,7 +146,7 @@ echo "ok   the kernel boots and says itself on the serial line"
 
 type_line 'echo hello brix'
 wait_for '^hello brix$'
-echo "ok   mlx-sh runs in user mode and its builtins answer"
+echo "ok   flux runs in user mode and its builtins answer"
 
 type_line 'echo $((6 * 7)) $(( 1 << 10 ))'
 wait_for '^42 1024$'
@@ -154,7 +154,7 @@ echo "ok   arithmetic expansion"
 
 type_line 'pwd; cd /; echo * /system/* /system/programs/m*'
 wait_for '^/users/root$'
-wait_for '^devices system temporary users volumes /system/programs /system/settings /system/programs/md5sum /system/programs/mkdir /system/programs/mkfifo /system/programs/mlx-sh /system/programs/mv$'
+wait_for '^devices system temporary users volumes /system/programs /system/settings /system/programs/md5sum /system/programs/mkdir /system/programs/mkfifo /system/programs/flux /system/programs/mv$'
 echo "ok   the working directory and a glob over the tree (brixOS's layout)"
 
 type_line 'x=brix; echo ${x}OS ${#x}'
@@ -167,7 +167,7 @@ wait_for '^hello$'
 wait_for '^5$'
 echo "ok   programs of the archive run, also in pipelines; built for brixOS, uname -o says so"
 
-type_line 'ls /system/programs | wc -l; cat /system/programs/mlx-sh | wc -c'
+type_line 'ls /system/programs | wc -l; cat /system/programs/flux | wc -c'
 wait_for "^$(( ${#programs[@]} + 12 ))\$"
 wait_for "^$(stat -c %s "$shell")\$"
 echo "ok   ls lists the archive, a program reads a file through a pipe"
@@ -197,11 +197,11 @@ echo "ok   the umask, /devices/null, /devices/zero"
 
 type_line 'echo linux > /temporary/l; linux-cat /tmp/l; linux-cat /dev/null; linux-cat /etc/passwd; linux-ls /dev'
 wait_for '^linux$'
-wait_for '^root:x:0:0:root:/users/root:/system/programs/mlx-sh$'
+wait_for '^root:x:0:0:root:/users/root:/system/programs/flux$'
 wait_for '^console  disk0[[:space:]]*framebuffer  keyboard  mouse  null  tty  zero$'
 echo "ok   Linux programs' /tmp, /dev and /etc/passwd"
 
-type_line 'cat /system/programs/mlx-sh > big; before=$(stat -f -c %f .); cp big copy; after=$(stat -f -c %f .); echo shared $(( before - after < 64 )) $(wc -c < copy)'
+type_line 'cat /system/programs/flux > big; before=$(stat -f -c %f .); cp big copy; after=$(stat -f -c %f .); echo shared $(( before - after < 64 )) $(wc -c < copy)'
 wait_for "^shared 1 $(stat -c %s "$shell")\$"
 type_line 'echo more >> copy; wc -c < big; rm big copy; x=1; (x=2; echo child $x); echo parent $x'
 wait_for "^$(stat -c %s "$shell")\$" 2
@@ -231,7 +231,7 @@ wait_for '^written by brixOS$'
 [[ "$(head -c 17 "$work/disk.img")" == "written by brixOS" ]] || fail "what brixOS wrote is not in the disk image"
 echo "ok   the virtio disk: /devices/disk0 read and written, the image has it"
 
-type_line 'brixfs format /devices/disk0 && cd /volumes/disk0 && mkdir docs && echo hello volume > docs/a && seq 2000 > numbers && cp /system/programs/mlx-sh big && sync && ls; cd /temporary'
+type_line 'brixfs format /devices/disk0 && cd /volumes/disk0 && mkdir docs && echo hello volume > docs/a && seq 2000 > numbers && cp /system/programs/flux big && sync && ls; cd /temporary'
 wait_for '^brixfs: mounted at /volumes/disk0$'
 wait_for '^big  docs  numbers$'
 "$work/linux-tools/brixfs" list "$work/disk.img" > "$work/list" 2>&1 || fail "the host's brixfs cannot read the volume: $(cat "$work/list")"
@@ -253,9 +253,9 @@ echo "ok   brixfs: formatted and mounted, files on the disk (the host reads them
 # Every coreutils program as on the host: tools/brix_programs.sh's output
 # in brixOS and on the host (the same sources, built for each) the same.
 mkdir "$work/host"
-host_shell=$(realpath "$work/linux-tools/mlx-sh")
+host_shell=$(realpath "$work/linux-tools/flux")
 (cd "$work/host" && env -i T="$work/host" PATH="$work/linux-tools/bin" HOME=/users/root "$host_shell" "$repo_root/tools/brix_programs.sh" < /dev/null > "$work/programs.host" 2>&1) || true
-type_line 'mlx-sh /system/programs/every-program < /devices/null'
+type_line 'flux /system/programs/every-program < /devices/null'
 tries=0
 until output | grep -q '^@@ done$'; do
     (( tries++ < 1200 )) || fail "tools/brix_programs.sh did not end in brixOS"
@@ -456,7 +456,7 @@ wait_for '^trapped$'
 wait_for '^after trap$'
 echo "ok   signals: handlers, masks, sigtimedwait, EINTR and SA_RESTART, sigsuspend, a fault on the alternate stack, the shell's trap"
 
-type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; mlx-sh s.sh two'
+type_line 'echo "echo script \$1" > s.sh; chmod +x s.sh; ./s.sh one; flux s.sh two'
 wait_for '^script one$'
 wait_for '^script two$'
 type_line 'cp /system/programs/uname /temporary/u; /temporary/u -s; echo copied > /system/programs/seq; cat /system/programs/seq'

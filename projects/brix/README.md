@@ -14,8 +14,8 @@ requirements are spec/04-stdlib/os/brix.xml:
 ## What runs
 
 brixOS boots in QEMU (`-kernel`, Multiboot), says itself on the serial
-line and starts mlx-init as its first process (the init below: it runs
-mlx-sh on the serial line and, on a display, the boot screen and then
+line and starts impulse as its first process (the init below: it runs
+flux on the serial line and, on a display, the boot screen and then
 the virtual console), the programs of its boot archive (the coreutils)
 as processes of their own, on a file system in memory with brixOS's own
 layout and copy on write:
@@ -89,19 +89,19 @@ brixOS), and std picks its `X.brixos.mlx` files (std.platform). They
 still call the kernel by Linux's system call numbers.
     root@brix:~# ls /
     devices  system  temporary  users
-    root@brix:~# cd /temporary; cat /system/programs/mlx-sh > a
+    root@brix:~# cd /temporary; cat /system/programs/flux > a
     root@brix:/temporary# stat -f -c "%f free" .; cp a b; stat -f -c "%f free" .
     37627 free
     37617 free
 
 ## The system on the disk
 
-The boot image holds the kernel and an archive (mlx-sh, the tools, the
+The boot image holds the kernel and an archive (flux, the tools, the
 coreutils) that the first boot runs from. `install` in brixOS puts the
 system onto a brixfs volume (`brixfs format /devices/disk0; install`:
 /system, /users and /temporary copied to /volumes/disk0, committed), and
 from then on the kernel boots from the disk: a volume with
-system/programs/mlx-sh on it is the system, its /system, /users and
+system/programs/flux on it is the system, its /system, /users and
 /temporary are the tree's (vfs.graft: the same nodes as
 /volumes/disk0's; the memory-only ones go), programs run from the disk
 and what is written stays. The boot archive's /system is at
@@ -524,7 +524,7 @@ The pieces:
     `brix_trap` (system calls and the switches they bring, the timer's
     and the serial line's interrupts, page faults of a process's regions, a crash
     report for the rest: a faulting program ends with SIGSEGV), and
-    the first process (mlx-init, or mlx-sh without it), started again
+    the first process (impulse, or flux without it), started again
     (every other process ending) when it exits or faults; power.mlx:
     system_power (the volumes committed, then halt, ACPI's power-off or
     the reset line).
@@ -559,7 +559,7 @@ spawner's own from 16. process_spawn takes the block and the handles the
 child gets (a role names one of them); process_replace takes a block
 naming the caller's own; a branch copies the roles; process_start gives
 a program its roles as (role, handle) records (std.os.brix: `Start`,
-`RoleRecord`, `Role`, `startRoles`, `handleFor`). std.spawn and mlx-sh
+`RoleRecord`, `Role`, `startRoles`, `handleFor`). std.spawn and flux
 pass input, output, errors and their session on; the native tool prints
 what it got (tools/check_brix.sh).
 
@@ -673,14 +673,14 @@ same.
 
 ## The init and the boot screen
 
-The first process is /system/programs/mlx-init (projects/init/brixos.mlx,
-the same service files as MLX/Linux's mlx-init; without it in the
-archive the kernel runs mlx-sh itself, as the checks' own images do).
+The first process is /system/programs/impulse (projects/init/brixos.mlx,
+the same service files as MLX/Linux's impulse; without it in the
+archive the kernel runs flux itself, as the checks' own images do).
 The kernel gives it the serial console as its input, output, errors and
 session, and starts it again when it ends. It reads
 /system/settings/init/services/NAME.service (the image carries
-projects/brix/settings/init/services: `serial-shell`, mlx-sh with
-`stdio = /devices/console`; `desktop`, mlx-compositor with
+projects/brix/settings/init/services: `serial-shell`, flux with
+`stdio = /devices/console`; `desktop`, kepler with
 `screen = yes`; and `console`, mlx-console for the screen instead,
 `disabled = yes`), starts each service with process_spawn and roles of its
 own (the terminal named by `stdio` as input, output, errors and session,
@@ -692,20 +692,20 @@ signals), starts ended services again after a growing pause, and ends
 the system with system_power (call 50: every volume committed, then
 halt, poweroff or reboot; QEMU exits with -no-reboot).
 
-`mlx-initctl status | start NAME | stop NAME | restart NAME | reload |
+`impulsectl status | start NAME | stop NAME | restart NAME | reload |
 poweroff | reboot | halt` asks over the FIFO /temporary/init/control
 (one line: the asker's own FIFO, the request); the answer comes on the
-asker's FIFO, the text Linux's mlx-init answers.
+asker's FIFO, the text Linux's impulse answers.
 
-With a display and mlx-splash in the programs (projects/desktop/splash/
+With a display and ignition in the programs (projects/desktop/splash/
 brixos.mlx: the same picture as MLX/Linux's boot splash, drawn by this
 one process into /devices/framebuffer), the init starts the splash first,
 on two streams (its input: Plymouth's requests as the init sends them,
 "U" a service starting, "u" the progress; its output: the answers), and
 tells it to quit, keeping its picture, before a service with
 `screen = yes` starts, at the earliest 3 s after the splash came up.
-`mlx-initctl message TEXT` puts a line on the splash while it is up
-(`mlx-initctl message` takes it away). A poweroff or reboot shows the
+`impulsectl message TEXT` puts a line on the splash while it is up
+(`impulsectl message` takes it away). A poweroff or reboot shows the
 shutdown the same way: the splash in its shutdown or reboot mode, told
 each service that stops, fading out before the machine goes.
 tools/check_brix_init.sh boots it all: the oneshots, the splash on the
@@ -728,7 +728,7 @@ loader found through GOP, in the boot info; a read gives width, height,
 pitch and format, node_map the pixels, 32 bits each, blue first), the
 keys from /devices/keyboard (kernel/keyboard.mlx: the PS/2 keyboard's
 scancodes by IRQ 1, decoded by the console as a US layout with Shift,
-Ctrl, Alt, Caps Lock, the arrows, F1 to F12), and mlx-sh runs on a
+Ctrl, Alt, Caps Lock, the arrows, F1 to F12), and flux runs on a
 session pair (spec calls 48 and 49: a terminal of its own, kernel/
 terminal.mlx's table; the console holds the control side, the shell the
 session as its input, output, errors and session roles; `session_size`
@@ -746,11 +746,11 @@ same text with the same code and font.
 
 ## The desktop
 
-The boot image's screen service is the desktop: `mlx-compositor`
+The boot image's screen service is the desktop: `kepler`
 (projects/desktop/compositor, the repository's Wayland compositor, built
-for brixOS into mlx-out/bin/brix/mlx-compositor; settings/init/services/
+for brixOS into mlx-out/bin/brix/kepler; settings/init/services/
 desktop.service, `screen = yes`, so the init quits the splash for it)
-with `mlx-terminal` as its first client (Alt+Enter; mlx-sh on a session
+with `vector` as its first client (Alt+Enter; flux on a session
 pair in the window). Three things make it run on brixOS's own interface,
 each a platform file the compiler picks for `--target=x86_64-brixos`:
 
@@ -793,15 +793,15 @@ each a platform file the compiler picks for `--target=x86_64-brixos`:
   it to its clients (XKB_DEFAULT_LAYOUT picks another file there).
 
 The helpers are in the image and start with the compositor: the top bar
-(mlx-topbar: the clock, the workspaces), the dock (mlx-dock: the apps
-button, the terminal, the trash) and the launcher (mlx-launcher, shown
+(horizon: the clock, the workspaces), the dock (orbit: the apps
+button, the terminal, the trash) and the launcher (launch, shown
 by Super or the dock's apps button; it offers the desktop entries of
 /system/share/applications, XDG_DATA_DIRS in desktop.service: the
-terminal's, projects/desktop/terminal/mlx-terminal.desktop).
+terminal's, projects/desktop/terminal/vector.desktop).
 
 ![The desktop: the top bar, the terminal, the launcher over the dock](screenshots/desktop.png)
 
-`mlx-initctl start console` runs mlx-console beside it (console.service
+`impulsectl start console` runs mlx-console beside it (console.service
 is disabled by default: one program draws the screen; disable the
 desktop and enable the console for the plain virtual console).
 tools/check_brix_desktop.sh boots the image, sees the compositor take
@@ -826,27 +826,27 @@ brixOS's own interface. Three native programs make it, each the same code
 as on Linux (the platform the compiler picks for `--target=x86_64-brixos`
 decides the few calls that differ):
 
-- **mlx-ipcd** (projects/desktop/ipc) is MLXIPC, the system message bus,
+- **synapse** (projects/desktop/ipc) is MLXIPC, the system message bus,
   on a listener node at /temporary/bus (ipcd.service). Its event loop is
   std.wayland's transport, the native `wait`, not epoll; so the policy
   can tell its clients apart, the kernel names each channel's holder
   (spec call 55, channel_peer: who holds the other end, and its program's
   leaf name), which std.appid reads on brixOS in place of /proc.
-- **mlx-login** (projects/desktop/login, login.service, `screen = yes`)
+- **sentinel** (projects/desktop/login, login.service, `screen = yes`)
   takes the screen after the splash and owns org.mlx.Login and
   org.freedesktop.login1 on the bus. It starts the greeter compositor
-  (`mlx-compositor --greeter mlx-greeter`) by branching (process_branch),
+  (`kepler --greeter aurora`) by branching (process_branch),
   taking an unprivileged identity (spec call 53, identity_set: a
   process's user and group, which its children inherit, down from 0 for
   good) in a runtime directory of its own (node_make, and spec call 54,
   node_own: a node's owner and group), then replacing itself with it
   (process_replace). Its wait is the native `wait` on the bus and the
   children's handles, no signalfd.
-- **mlx-greeter** (projects/desktop/greeter) is the login screen, a
+- **aurora** (projects/desktop/greeter) is the login screen, a
   Wayland client of the greeter compositor (its connection the handle in
   its own role, WAYLAND_SOCKET) and a bus client. A password checked
   against /system/settings (users, groups, shadow: the account `brix`,
-  password `brix`) makes mlx-login branch, take the person's identity and
+  password `brix`) makes sentinel branch, take the person's identity and
   replace itself with their session (the desktop, from
   /system/share/wayland-sessions) in their home /users/NAME, made at the
   first login and given to them.
@@ -855,7 +855,7 @@ The accounts, the session entry and the services are in the image;
 desktop.service is shipped disabled (the login has the screen; enable it
 and disable the login for the desktop as root without a login).
 tools/check_brix_login.sh boots the image, sees the bus listen and
-mlx-login start the greeter, the kernel name it mlx-greeter so the policy
+sentinel start the greeter, the kernel name it aurora so the policy
 allows login.session, the password accepted and the session start as
 `brix` in /users/brix.
 

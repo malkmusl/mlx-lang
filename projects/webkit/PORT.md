@@ -1641,7 +1641,7 @@ Modules/modern-media-controls, and their icons from files (the
 directory `MLX_WEBKIT_MEDIA_ICONS` names, else the source tree's
 `images/adwaita` under the working directory, else
 `/usr/share/mlx/voyager/media-controls`).
-`tools/check_mpris.sh` runs the player on mlx-ipcd against dbus-send,
+`tools/check_mpris.sh` runs the player on synapse against dbus-send,
 gdbus and dbus-monitor (the properties, the commands, the signals).
 
 A plain file is loaded whole through the player's resource loader

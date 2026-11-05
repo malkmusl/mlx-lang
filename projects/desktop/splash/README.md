@@ -1,4 +1,4 @@
-# mlx-splash
+# ignition
 
 The boot splash of the MLX system, in place of Plymouth: the MLX letters
 in a night of indigo while the system starts, powers off or restarts.
@@ -17,7 +17,7 @@ bar.
 ![The boot splash at 1280x720](screenshots/boot.png)
 
 It speaks Plymouth's protocol, so systemd tells it what starts as it
-would tell plymouthd, and `mlx-splashctl` (or the `plymouth` tool) talks
+would tell plymouthd, and `ignitionctl` (or the `plymouth` tool) talks
 to it. Everything is Mlx on the kernel's interfaces: KMS through the
 compositor's `kms.mlx`, the Linux framebuffer, the Plymouth socket. There
 is no libc and no Plymouth library. Rendering is deliberately CPU-to-KMS:
@@ -28,7 +28,7 @@ buffers directly.
 ## Running it
 
 ```
-mlx-splash [--mode boot|shutdown|reboot|updates] [--output auto|kms|fbdev|none]
+ignition [--mode boot|shutdown|reboot|updates] [--output auto|kms|fbdev|none]
            [--card PATH | --card-fd N] [--framebuffer PATH] [--tty PATH | --no-tty]
            [--socket NAME] [--duration-file PATH] [--ask-password-dir PATH]
            [--pid-file PATH] [--snapshot PNG] [--size WxH] [--fps N] [--threads N]
@@ -46,10 +46,10 @@ last frame when it quits (the checks do this).
 Without a daemon it draws pictures:
 
 ```
-mlx-splash --size 1920x1080 --png boot.png --at 4 --status "Starting network" --progress 60
-mlx-splash --size 1280x720 --frames DIR --count 90 --fps 30 --mode shutdown
-mlx-splash --size 800x450 --frames DIR --fps 25 --story   # a whole boot, start to quit
-mlx-splash --size 3840x2160 --bench 60          # set-up and frame times
+ignition --size 1920x1080 --png boot.png --at 4 --status "Starting network" --progress 60
+ignition --size 1280x720 --frames DIR --count 90 --fps 30 --mode shutdown
+ignition --size 800x450 --frames DIR --fps 25 --story   # a whole boot, start to quit
+ignition --size 3840x2160 --bench 60          # set-up and frame times
 ```
 
 `--story` plays a boot as a script would tell it: units starting every
@@ -60,7 +60,7 @@ each processor).
 ## On brixOS
 
 `brixos.mlx` is the splash as brixOS's boot screen (mlx-out/bin/brix/
-mlx-splash, in the boot image): the same picture (scene.mlx and the
+ignition, in the boot image): the same picture (scene.mlx and the
 drawing modules, one thread), into /devices/framebuffer (the geometry
 read, the pixels mapped by node_map; the changed tiles copied, red and
 blue swapped when the framebuffer wants them so). There is no socket: the
@@ -69,7 +69,7 @@ input ("U" a service starting, "u" the progress in percent, "C", "M",
 "m", "Q" with its first argument byte set to keep the picture), each
 answered with ACK or NAK on its output; when the input ends, the splash
 quits. The init starts it again in shutdown or reboot mode when the
-system goes down, and `mlx-initctl message TEXT` reaches it as "M".
+system goes down, and `impulsectl message TEXT` reaches it as "M".
 What it is told it notes on its errors (the serial console). `--mode`,
 `--fps N` and `--snapshot PNG` (the last frame when it quits) are its
 options. projects/init/brixos.mlx says when it is shown;
@@ -105,13 +105,13 @@ At boot the bar estimates progress from the last boot's length
 the way in that time, then creeps on.
 
 ```
-mlx-splashctl ping | quit [--retain-splash] | wait | deactivate | reactivate
-mlx-splashctl show-splash | hide-splash | message TEXT | hide-message TEXT
-mlx-splashctl update TEXT | change-mode MODE | system-update PERCENT
-mlx-splashctl pause-progress | unpause-progress | has-active-vt
+ignitionctl ping | quit [--retain-splash] | wait | deactivate | reactivate
+ignitionctl show-splash | hide-splash | message TEXT | hide-message TEXT
+ignitionctl update TEXT | change-mode MODE | system-update PERCENT
+ignitionctl pause-progress | unpause-progress | has-active-vt
 ```
 
-`mlx-splashctl absent` is the inverse probe used by the real-root unit:
+`ignitionctl absent` is the inverse probe used by the real-root unit:
 it succeeds only when an initramfs splash is not already listening.
 
 The `plymouth` tool's spellings work too (`--quit`, `--ping`, `--wait`,
@@ -126,16 +126,16 @@ plymouthd:
 - the MLX compositor on the monitor (`quit --retain-splash`, then its own
   mode set, with no text console in between);
 - `mlx-console` on the framebuffer (`quit`, the console back);
-- a display manager through the drop-in `mlx-splash.conf`
+- a display manager through the drop-in `ignition.conf`
   (`ExecStartPre=-mlx-splashctl quit --retain-splash`);
-- without a display manager, `mlx-splash-quit.service` before the login
+- without a display manager, `ignition-quit.service` before the login
   prompt on the first terminal.
 
-The same mlx-splash process starts in the initramfs and stays through
+The same ignition process starts in the initramfs and stays through
 switch-root. The classic mkinitcpio runscript and the systemd initrd unit
 send it a `newroot` request once `/sysroot` is mounted; it chroots there
 before the switch, so the initramfs can be released and the boot-duration
-file and ask-password directory refer to the real root. The mlx-init
+file and ask-password directory refer to the real root. The impulse
 service is a disabled fallback, and the real-root systemd unit uses the
 abstract socket as a condition, so neither starts a duplicate.
 
@@ -153,23 +153,23 @@ which systemd-shutdown's last killing spares.
 tools/install_splash.sh [--prefix DIR] [--destdir DIR] [--enable | --disable]
 ```
 
-It installs `mlx-splash` and `mlx-splashctl`, the units `mlx-splash`
-(boot, in `sysinit.target`), `mlx-splash-quit`, `mlx-splash-poweroff`,
-`mlx-splash-reboot`, the display manager's drop-in, the disabled mlx-init
-fallback, and mkinitcpio's `install/mlx-splash` and `hooks/mlx-splash`.
+It installs `ignition` and `ignitionctl`, the units `ignition`
+(boot, in `sysinit.target`), `ignition-quit`, `ignition-poweroff`,
+`ignition-reboot`, the display manager's drop-in, the disabled impulse
+fallback, and mkinitcpio's `install/ignition` and `hooks/ignition`.
 `--enable` enables the real-root and shutdown integration and masks
 Plymouth's units, keeping what was there; `--disable` puts those units
 back.
 
-Replace `plymouth` with `mlx-splash` after `kms` in
+Replace `plymouth` with `ignition` after `kms` in
 `/etc/mkinitcpio.conf`, then rebuild the images:
 
 ```sh
 # classic initramfs
-HOOKS=(base udev autodetect microcode kms mlx-splash modconf block keyboard keymap consolefont filesystems fsck)
+HOOKS=(base udev autodetect microcode kms ignition modconf block keyboard keymap consolefont filesystems fsck)
 
 # or a systemd initramfs
-HOOKS=(base systemd autodetect microcode kms mlx-splash modconf block keyboard sd-vconsole filesystems)
+HOOKS=(base systemd autodetect microcode kms ignition modconf block keyboard sd-vconsole filesystems)
 
 sudo mkinitcpio -P
 ```
@@ -235,7 +235,7 @@ it into memory, and what changed is copied to the screen.
 | `protocol.mlx` | Plymouth's protocol, server and client |
 | `daemon.mlx` | the daemon's loop |
 | `handover.mlx` | ending the splash from the program taking the screen |
-| `tool.mlx` | mlx-splashctl |
+| `tool.mlx` | ignitionctl |
 | `preview.mlx`, `options.mlx`, `system.mlx`, `main.mlx` | pictures, the command line, system calls |
 
 ## Checks
@@ -249,7 +249,7 @@ or terminals. It covers:
     taken;
   - passwords, questions and keystrokes refused, a non-root sender
     refused;
-  - mlx-splashctl's commands, quit answered when done, the boot's length
+  - ignitionctl's commands, quit answered when done, the boot's length
     kept;
 - taking over from a stand-in plymouthd;
 - the initramfs new-root handoff in a disposable user namespace, including
@@ -267,5 +267,5 @@ or terminals. It covers:
 
 ## Not yet
 
-- mlx-init starts it at boot only, not at shutdown.
+- impulse starts it at boot only, not at shutdown.
 - No themes: the picture is the MLX one.

@@ -10,7 +10,7 @@
 #
 # With --remove it also moves the marker of --replace-sound-servers to the
 # new prefix and points the ALSA setting of MLX Audio at the new library
-# directory. Units and mlx-init services that still name an old path are
+# directory. Units and impulse services that still name an old path are
 # only reported: the installers write them anew.
 #
 # Usage: tools/remove_old_mlx_layout.sh [--remove] [--prefix DIR] [--destdir DIR]
@@ -103,7 +103,7 @@ for dir in /usr/local/bin /usr/bin; do
 done
 
 if [[ "$prefix" != "$old" ]]; then
-    for name in mlx-settings.desktop org.mlx.files.desktop org.mlx.observatory.desktop; do
+    for name in control.desktop org.mlx.files.desktop org.mlx.observatory.desktop; do
         retire "$old/share/applications/$name" "$prefix/share/applications/$name"
     done
     for name in org.mlx.files.png org.mlx.settings.png org.mlx.observatory.png; do
@@ -123,7 +123,7 @@ if [[ "$prefix" != "$old" ]]; then
         retire "$old/share/doc/mlx/$part/README.md" "$prefix/share/doc/mlx/$part/README.md"
         prune "$old/share/doc/mlx/$part" "$old/share/doc"
     done
-    retire "$old/share/wayland-sessions/mlx-compositor.desktop" "$prefix/share/wayland-sessions/mlx-compositor.desktop"
+    retire "$old/share/wayland-sessions/kepler.desktop" "$prefix/share/wayland-sessions/kepler.desktop"
     prune "$old/share/wayland-sessions" "$old/share"
 
     # The masked sound servers' list: --restore-sound-servers reads it from
