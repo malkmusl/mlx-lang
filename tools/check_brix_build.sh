@@ -127,7 +127,7 @@ type_line 'mlx4 build brix -j 2; echo build $?'
 wait_for '^build 0$' 1 36000
 wait_for "^mlx build: WebKit's steps are left out" 0 || true
 grep -q "WebKit's steps are left out" <(output) || fail "the build in brixOS did not say WebKit is left out"
-built=$(output | grep -o 'mlx build: [0-9]* built' | tail -n 1)
+built=$(output | grep -o 'mlx build: [0-9]* built[^)]*)' | tail -n 1)
 type_line 'sha256sum mlx-out/bin/brix/kernel mlx-out/bin/brix/brix.img'
 wait_for "^$kernel_sum "
 wait_for "^$image_sum "
