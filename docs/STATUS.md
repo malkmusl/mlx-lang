@@ -110,7 +110,14 @@ channels and listener nodes, its backend on the framebuffer, the keyboard
 and the mouse, its clients' keymap from the image, the launcher, the dock
 and the top bar started with process_spawn on channels, mlx-terminal as a
 client (tools/check_brix_desktop.sh; mlx-console instead with
-tools/check_brix_init.sh). Note:
+tools/check_brix_init.sh). The login runs on it too, all native: the
+system bus (mlx-ipcd on a listener node), mlx-login (the greeter branched
+to an unprivileged identity, a password of /system/settings, then the
+person's session in their home) and the greeter (mlx-greeter), with the
+kernel naming each bus client's program (channel_peer) and the new
+identity_set and node_own calls (tools/check_brix_login.sh). An EFI boot
+sees all of RAM: the loader passes the UEFI memory map through
+(tools/check_brix_efi.sh). Note:
 ROADMAP.md is written for a Linux kernel ("replacing it is not the
 goal"); brixOS is the Stage 4 target of AGENT_IMPLEMENTATION.md and
 spec/04-stdlib/os/brix.xml.

@@ -69,10 +69,12 @@ EFI/BOOT/BOOTX64.EFI on a FAT partition):
 
 brix-image writes an EFI application when its output ends in .efi
 (image/efi.mlx): a PE32+ file with the Multiboot image in it and a
-loader in front that does a Multiboot loader's part (the memory map's
-end below 4 GiB as mem_upper, the display's framebuffer from the
-Graphics Output Protocol into the boot info, ExitBootServices, out of
-long mode, the image to 1 MiB, the blob's entry). The kernel's console
+loader in front that does a Multiboot loader's part (the UEFI memory map
+passed through as a Multiboot memory map, so the kernel maps all of RAM,
+the ranges above the hole and above 4 GiB included; the display's
+framebuffer from the Graphics Output Protocol into the boot info,
+ExitBootServices, out of long mode, the image to 1 MiB, the blob's
+entry). The kernel's console
 stays the serial line; the screen is mlx-console's (below).
 
     brixOS: kernel at 0x200000, 292 KiB
@@ -156,8 +158,9 @@ The kernel hands out all of the machine's memory as 4 KiB frames, from
 Memory.FREE (96 MiB: the image and the kernel's arena come first) on, in
 spans: the Multiboot memory map's RAM regions (the one below the hole
 under 4 GiB, the ones above it, where a machine with more than 4 GiB has
-most of its memory; a loader without the map, the EFI one for now, gives
-mem_upper, the RAM below the hole). The boot tables map the first GiB
+most of its memory). The BIOS loader and the EFI loader both pass the
+map through, so an EFI boot maps all of RAM too, not only the RAM below
+the hole. The boot tables map the first GiB
 into the kernel's view (KERNEL_VIRTUAL + physical); the kernel maps the
 rest itself as it starts (kernel/memory.mlx, mapRest: a page directory
 of 2 MiB pages for each GiB with RAM under the boot PDPT, which every
@@ -808,16 +811,58 @@ of its title bar counted), types a command through the compositor into
 its shell (a file read back from the serial shell), moves the mouse
 through QEMU's monitor (the cursor's white counted right of the window),
 clicks the dock's apps button (the launcher comes up) and powers off.
-The greeter (a login screen on a private connection, WAYLAND_SOCKET) is
-not on brixOS yet, nor is Xwayland.
+Xwayland is not on brixOS.
+
+The launcher and the dock's app items draw an app's icon as a PNG from
+the hicolor theme (/system/share/icons/hicolor/NxN/apps/NAME.png); the
+image ships a terminal icon (utilities-terminal, the terminal's `Icon`)
+at 256x256 and 48x48. (The boot archive's names were widened to 72 bytes
+to hold the hicolor paths.)
+
+## The login
+
+Instead of the desktop as root, the boot image can start a login, all on
+brixOS's own interface. Three native programs make it, each the same code
+as on Linux (the platform the compiler picks for `--target=x86_64-brixos`
+decides the few calls that differ):
+
+- **mlx-ipcd** (projects/desktop/ipc) is MLXIPC, the system message bus,
+  on a listener node at /temporary/bus (ipcd.service). Its event loop is
+  std.wayland's transport, the native `wait`, not epoll; so the policy
+  can tell its clients apart, the kernel names each channel's holder
+  (spec call 55, channel_peer: who holds the other end, and its program's
+  leaf name), which std.appid reads on brixOS in place of /proc.
+- **mlx-login** (projects/desktop/login, login.service, `screen = yes`)
+  takes the screen after the splash and owns org.mlx.Login and
+  org.freedesktop.login1 on the bus. It starts the greeter compositor
+  (`mlx-compositor --greeter mlx-greeter`) by branching (process_branch),
+  taking an unprivileged identity (spec call 53, identity_set: a
+  process's user and group, which its children inherit, down from 0 for
+  good) in a runtime directory of its own (node_make, and spec call 54,
+  node_own: a node's owner and group), then replacing itself with it
+  (process_replace). Its wait is the native `wait` on the bus and the
+  children's handles, no signalfd.
+- **mlx-greeter** (projects/desktop/greeter) is the login screen, a
+  Wayland client of the greeter compositor (its connection the handle in
+  its own role, WAYLAND_SOCKET) and a bus client. A password checked
+  against /system/settings (users, groups, shadow: the account `brix`,
+  password `brix`) makes mlx-login branch, take the person's identity and
+  replace itself with their session (the desktop, from
+  /system/share/wayland-sessions) in their home /users/NAME, made at the
+  first login and given to them.
+
+The accounts, the session entry and the services are in the image;
+desktop.service is shipped disabled (the login has the screen; enable it
+and disable the login for the desktop as root without a login).
+tools/check_brix_login.sh boots the image, sees the bus listen and
+mlx-login start the greeter, the kernel name it mlx-greeter so the policy
+allows login.session, the password accepted and the session start as
+`brix` in /users/brix.
 
 ## Next
 
-1. The desktop's rest on brixOS: a login (the greeter on a channel as
-   WAYLAND_SOCKET, accounts), the terminal's font settings from /system,
-   icons for the launcher and the dock in the image. The EFI loader
-   passing the UEFI memory map on (the RAM above the hole under 4 GiB
-   for EFI boots).
+1. The desktop's rest on brixOS: the terminal's font settings from
+   /system, more app icons in the image.
 2. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console

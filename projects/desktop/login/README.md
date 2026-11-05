@@ -149,4 +149,21 @@ reboot directly.
 | `login1.mlx` | one-seat compositor control, device descriptors and VT switching |
 | `session.mlx` | runtime directory, privilege drop, environment and exec |
 | `users.mlx` | the login accounts, read from the configured passwd file |
+| `native.mlx` | brixOS: the children branched, given an identity and replaced |
 | `examples/` | systemd and mlx-init service templates used by the installer |
+
+## On brixOS
+
+The same daemon runs on brixOS (`--target=x86_64-brixos`) through the
+native interface, never the Linux layer. There is no signalfd and no
+wait4: the wait is the native `wait` on the bus connection and the
+greeter's and session's process handles, and the children are started
+by branching (process_branch), taking the target identity (identity_set)
+in a runtime directory made and owned natively (node_make, node_own),
+and replacing the branch with the program (process_replace); a stream
+pair closed on the replace reports a failure before it. `native.mlx`
+holds these, shared by `greeter.mlx` and `session.mlx`. The bus
+(projects/desktop/ipc) runs natively too, and so the policy can tell
+mlx-greeter apart, the kernel names each channel's holder program
+(channel_peer), which std.appid reads. tools/check_brix_login.sh covers
+the whole chain.
