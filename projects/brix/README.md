@@ -117,7 +117,7 @@ are named for what they hold:
                        copied into pages of their own when written)
     /system/settings   the system's settings: users, groups, init/services
     /devices           console, tty, null, zero, disk0, disk1, ... (the
-                       virtio disks), framebuffer, keyboard
+                       virtio disks), framebuffer, keyboard, mouse
     /system/fonts      the fonts of the boot archive (DejaVu Sans Mono)
     /users/root        the user's home (the shell starts there)
     /temporary         scratch space (init/control, the init's FIFO;
@@ -149,6 +149,43 @@ projects/brix/tools/signals, a line for each step of what signals do
 (handlers, masks, sigtimedwait, EINTR and SA_RESTART, sigsuspend, a
 fault on the alternate stack), which must print what it prints on the
 host.
+
+## Memory and the machine's figures
+
+The kernel hands out all of the machine's memory as 4 KiB frames, from
+Memory.FREE (96 MiB: the image and the kernel's arena come first) to its
+end, the Multiboot figure (mem_upper: what lies below the hole under
+4 GiB; memory above it is not used yet). The boot tables map the first
+GiB into the kernel's view (KERNEL_VIRTUAL + physical); the kernel maps
+the rest itself as it starts (kernel/memory.mlx, mapRest: a page
+directory of 2 MiB pages for each further GiB under the boot PDPT, which
+every address space shares), up to 64 GiB (a u16 count per frame, who
+holds it, in 32 MiB of counts at most). A process's pages are made on
+first use (a fault makes the page and the next of its region, 16 in
+all: a fault costs far more than zeroing a page under emulation, and a
+program growing into its memory faults once in 64 KiB rather than once
+a page), copied on write after a fork, shared by memory objects; a
+program that asks for more than there is gets null from mmap, and the
+runtime says "out of memory" on stderr before the program's own report.
+
+`system_info` (spec call 52, std.os.brix.systemInfo) says what the
+machine has and what the kernel did: the memory and what is free of it,
+the processors running the kernel, the uptime, and the kernel's counts
+since the boot (page faults served, system calls, switches between
+processes). `sysinfo` prints them:
+
+    memory: 2047 MiB, 1938 free
+    processors: 2
+    uptime: 6.0 s
+    page faults: 3229, system calls: 822, switches: 14
+
+std.build's runner takes its memory figures from it on brixOS (on Linux
+from /proc/meminfo), and build.mlx says what the big compiles take
+(Build.memory: the desktop's programs 350 to 420 MiB each), so `mlx build
+brix -j 2` in brixOS runs two jobs where they fit and one where they do
+not. tools/check_brix.sh runs the native test program's system_info
+line; tools/check_brix_build.sh builds the brix group in brixOS on 2 GiB
+with two jobs.
 
 ## Copy on write
 
@@ -604,16 +641,16 @@ members, a file's bytes, the program's output and the compilers' bytes.
 `mlx build` runs in brixOS too: mlx4's build command compiles
 mlx-out/build/runner.mlx (build.mlx on std.build) and runs it, and the
 runner starts its jobs as processes (std.spawn's native path, by node
-handles) and waits for them by their process handles; without
-/proc/meminfo the jobs are limited by -j alone (so `-j 1` on the GiB the
-kernel maps: two compilers of the compositor's size do not fit there),
-and without a home directory the result cache is off. build.mlx leaves WebKit's steps out
+handles) and waits for them by their process handles; the memory
+figures come from system_info (two compiles of the compositor's size
+need 2 GiB: with less, one job runs at a time whatever -j says), and
+without a home directory the result cache is off. build.mlx leaves WebKit's steps out
 where projects/webkit/upstream is missing, so the part of the repository
 the brix group needs (build.mlx, compiler/selfhost, the assembler's
 asm.mlx and base.mlx, std, projects/brix and the programs in the image,
 projects/webkit/*.mlx, tools/build-number) is enough:
 
-    cd /volumes/disk0 && tar -xzf mlx.tar.gz && mlx4 build brix -j 1
+    cd /volumes/disk0 && tar -xzf mlx.tar.gz && mlx4 build brix -j 2
 
 builds the kernel, brix-image, the tools, the coreutils, the desktop's
 programs and the boot image there (the fonts and the keymap from the system's own files, so
@@ -769,10 +806,8 @@ not on brixOS yet, nor is Xwayland.
 
 1. The desktop's rest on brixOS: a login (the greeter on a channel as
    WAYLAND_SOCKET, accounts), the terminal's font settings from /system,
-   icons for the launcher and the dock in the image. Memory figures for
-   the build runner on brixOS (and Build.memory for the big units), so
-   `mlx build` can run more than one job there; the compiler saying "out
-   of memory" rather than faulting when memory runs out.
+   icons for the launcher and the dock in the image. Memory above the
+   hole under 4 GiB (the Multiboot memory map).
 2. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console

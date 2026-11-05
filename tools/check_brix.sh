@@ -289,6 +289,8 @@ native calls
 output kind (session) 6
 output writable
 pipe kind (stream) 4
+system info words 7
+memory, free and processors make sense
 wait now (timed out) 5
 wait 50 ms (timed out) 5
 the deadline held

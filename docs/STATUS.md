@@ -102,6 +102,9 @@ process is mlx-init (projects/init/brixos.mlx, on brixOS's own
 interface: the services of /system/settings/init/services, mlx-initctl
 over a FIFO, system_power), which shows the boot with mlx-splash on the
 display (projects/desktop/splash/brixos.mlx, the framebuffer) and then
+hands out all of the machine's memory (mapped beyond the boot tables'
+first GiB), says its figures and counts through system_info (the build
+runner sizes its jobs by them in brixOS; sysinfo prints them), and
 runs the desktop on it: mlx-compositor with std.wayland's transport over
 channels and listener nodes, its backend on the framebuffer, the keyboard
 and the mouse, its clients' keymap from the image, the launcher, the dock
