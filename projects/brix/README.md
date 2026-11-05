@@ -813,11 +813,21 @@ through QEMU's monitor (the cursor's white counted right of the window),
 clicks the dock's apps button (the launcher comes up) and powers off.
 Xwayland is not on brixOS.
 
-The launcher and the dock's app items draw an app's icon as a PNG from
-the hicolor theme (/system/share/icons/hicolor/NxN/apps/NAME.png); the
-image ships a terminal icon (utilities-terminal, the terminal's `Icon`)
-at 256x256 and 48x48. (The boot archive's names were widened to 72 bytes
-to hold the hicolor paths.)
+The programs carry their product names (projects/desktop and the system
+programs): the compositor is `kepler`, the terminal `vector`, the shell
+`flux`, the dock `orbit`, the launcher `launch`, the top bar `horizon`,
+the login `sentinel`, the greeter `aurora`, the bus `synapse`, init
+`impulse` and the boot screen `ignition` (the MLX toolchain -- mlx4,
+mlx-cc and the rest -- keeps its name, and so do the MLXIPC protocol and
+the MLX_* environment).
+
+The launcher and the dock read **app bundles**, like a macOS .app: a
+directory NAME.app under /system/share/apps holding app.ini (the
+[Desktop Entry] format) and its own icon.png, so one directory replaces a
+.desktop file and a theme icon (projects/desktop/shared/apps.mlx,
+projects/desktop/apps). The image ships Vector.app (the terminal), its
+icon a dark window with a green prompt. (The boot archive's names were
+widened to 72 bytes to hold the bundle paths.)
 
 ## The login
 
