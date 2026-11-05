@@ -137,7 +137,9 @@ for (( i = 0; i < 100; i++ )); do [[ -S $work/monitor ]] && break; sleep 0.1; do
 wait_for '^mlx-init: brixOS.s init$'
 wait_for '^mlx-init: services defined: 5$'
 echo "ok   the kernel starts mlx-init as the first process; it reads the five services"
-wait_for '^hello-from-the-oneshot$'
+# (On the line the serial shell's prompt may have started: both come
+# up at once, and which prints first is the scheduler's.)
+wait_for 'hello-from-the-oneshot$'
 echo "ok   a oneshot with log = console writes to the serial console through the init"
 # (The splash's notes land on the serial line beside the prompt.)
 wait_for '^root@brix:[^#]*# '
