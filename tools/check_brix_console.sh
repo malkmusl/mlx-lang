@@ -113,7 +113,7 @@ monitor "sendkey e" "sendkey c" "sendkey h" "sendkey o" "sendkey spc" "sendkey s
 same "$work/typed.ppm" 'root@brix:~# echo screen-ok\nscreen-ok\nroot@brix:~# ' "the command typed and answered"
 echo "ok   keys typed on the PS/2 keyboard reach the shell through the session pair; its answer is on the screen"
 monitor "sendkey shift-6" "sendkey shift-2" "sendkey shift-3" "sendkey ret"
-same "$work/shifted.ppm" 'root@brix:~# echo screen-ok\nscreen-ok\nroot@brix:~# ^@#\nmlx-sh: ^@#: command not found\nroot@brix:~# ' "the shifted keys"
+same "$work/shifted.ppm" 'root@brix:~# echo screen-ok\nscreen-ok\nroot@brix:~# ^@#\nflux: ^@#: command not found\nroot@brix:~# ' "the shifted keys"
 echo "ok   Shift types the upper row's characters"
 printf 'echo serial\r' >&3
 wait_for '^serial$'
