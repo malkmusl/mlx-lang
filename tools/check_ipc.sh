@@ -226,4 +226,37 @@ echo "ok   --run: the program on the bus, its exit status"
 
 mkdir -p "$work/notify-empty"
 python3 -I tools/check_ipc_notify.py "$work/synapse" "$work" "$work/notify-empty" || fail "no READY=1 for systemd"
+
+# Native first, D-Bus as the fallback for a foreign host bus. On a real
+# dbus-daemon (not synapse) the native handshake fails and std.ipc's
+# client falls back to D-Bus, so mlx-ipc still works there: our programs
+# speak native on brixOS and fall back to the host's D-Bus until brixOS
+# has its own services.
+if command -v dbus-run-session > /dev/null; then
+    cat > "$work/fallback.sh" <<FALLBACK
+set -e
+ipc="$ipc"
+# Over a real dbus-daemon the native handshake fails and the client falls
+# back; names still come back.
+"\$ipc" names | grep -q org.freedesktop.DBus || { echo "fallback: no names"; exit 1; }
+# A service of ours on the fallback, serving over D-Bus (not "(mlx)").
+"\$ipc" serve org.example.Fallback > "$work/fallback-serve.log" 2>&1 &
+sp=\$!
+for _ in \$(seq 1 50); do grep -q serving "$work/fallback-serve.log" 2> /dev/null && break; sleep 0.1; done
+grep -q "(dbus)" "$work/fallback-serve.log" || { echo "fallback serve: \$(cat "$work/fallback-serve.log")"; kill \$sp 2>/dev/null; exit 1; }
+# mlx-ipc (fallback) calls it, and dbus-send (native D-Bus) calls it too.
+[ "\$("\$ipc" call org.example.Fallback hallo)" = hallo ] || { echo "fallback call"; kill \$sp 2>/dev/null; exit 1; }
+dbus-send --session --print-reply --dest=org.example.Fallback / org.mlx.Echo.Echo string:ok | grep -q '"ok"' || { echo "fallback dbus-send"; kill \$sp 2>/dev/null; exit 1; }
+kill \$sp 2>/dev/null || true
+exit 0
+FALLBACK
+    if dbus-run-session -- bash "$work/fallback.sh" > "$work/fallback.out" 2>&1; then
+        echo "ok   native first, D-Bus fallback: mlx-ipc works over a foreign dbus-daemon too"
+    else
+        grep -v 'fd limit' "$work/fallback.out" >&2 || true
+        fail "the D-Bus fallback did not work over a real dbus-daemon"
+    fi
+else
+    echo "skip the D-Bus fallback (no dbus-run-session)"
+fi
 echo "all MLXIPC checks passed"

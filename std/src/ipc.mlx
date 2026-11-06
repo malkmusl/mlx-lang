@@ -954,16 +954,31 @@ pub const Client = struct {
     pendingCount: usize
     // The peer closed the connection (next returns false from then on).
     closed: bool
+    // The native wire (the bus is synapse, or this is a direct channel).
+    // false after connectClient fell back to D-Bus because the bus is a
+    // foreign dbus-daemon (the host system, until brixOS has its own):
+    // then `peer` carries the connection, `out` is the scratch where a
+    // sent body is marshalled to D-Bus and a received message is turned
+    // back into the native form the caller reads.
+    native: bool
+    peer: dbus.Client
 }
 
 pub fn connectionOf(client: *Client) -> *Connection {
+    if !client.*.native { return dbus.connectionOf(&client.*.peer) }
     unsafe { return @ptrCast(*Connection, &client.*.connection) }
 }
 
 pub fn uniqueName(client: *Client) -> []const u8 {
+    if !client.*.native { return dbus.uniqueName(&client.*.peer) }
     const bytes: [*]const u8 = &client.*.unique
     return bytes[0..client.*.uniqueLength]
 }
+
+// Whether the connection speaks the native wire (the bus is synapse, or a
+// direct channel); false when connectClient fell back to D-Bus because the
+// bus is a foreign dbus-daemon.
+pub fn isNative(client: *Client) -> bool { return client.*.native }
 
 pub const EAGAIN: isize = transport.EAGAIN
 
@@ -984,6 +999,7 @@ fn flushAll(client: *Client) -> bool {
 // measured against a blocking recvmsg: the one system call cost 7 µs more
 // per round trip here, so the two stay.)
 pub fn attach(client: *Client, allocator: Allocator, descriptor: isize) -> bool {
+    client.*.native = true
     if !transport.setNonBlocking(descriptor) { return false }
     if !transport.init(connectionOf(client), allocator, descriptor) { return false }
     client.*.serial = 0
@@ -1004,7 +1020,18 @@ pub fn attach(client: *Client, allocator: Allocator, descriptor: isize) -> bool 
 // Connects to the bus at `path`: the preamble and Hello go out together,
 // the bus's preamble and the unique name come back; false when any of it
 // failed.
-pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) -> bool {
+// Frees a half-open native connection so connectClient can reconnect for
+// the D-Bus fallback.
+fn failNative(client: *Client, allocator: Allocator) -> void {
+    transport.deinit(connectionOf(client))
+    allocator.free(client.*.out, MAX_MESSAGE, 16)
+}
+
+// Tries the native handshake (the preamble and Hello out together); false
+// (and the connection freed) when it could not connect or the bus is not
+// native.
+fn tryNative(client: *Client, allocator: Allocator, path: []const u8) -> bool {
+    client.*.native = true
     const descriptor = transport.connectPath(path.pointer, path.length)
     if descriptor < 0 { return false }
     if !attach(client, allocator, descriptor) {
@@ -1017,7 +1044,10 @@ pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) ->
     writePreamble(preamble_bytes, UNIX_FDS)
     var nothing: [1]isize = [1]isize{ 0 }
     const connection = connectionOf(client)
-    if transport.queueBytes(connection, preamble_bytes, PREAMBLE, &nothing, 0) != 0 { return false }
+    if transport.queueBytes(connection, preamble_bytes, PREAMBLE, &nothing, 0) != 0 {
+        failNative(client, allocator)
+        return false
+    }
     var hello = newMessage(CALL, 0)
     hello.destination = "org.freedesktop.DBus"
     hello.path = "/org/freedesktop/DBus"
@@ -1025,27 +1055,47 @@ pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) ->
     hello.member = "Hello"
     const none: [*]const u8 = unsafe { @ptrCast([*]const u8, "") }
     const serial = send(client, &hello, none, 0, &nothing, 0)
-    if serial == 0 { return false }
-    // The bus's preamble.
+    if serial == 0 {
+        failNative(client, allocator)
+        return false
+    }
+    // The bus's preamble. A foreign dbus-daemon sends no native preamble
+    // (it reads our 'M' as bad SASL and errors or closes): readPreamble
+    // reports it, or the connection ends, and we fall back to D-Bus.
     while true {
         const available = transport.bufferedInput(connection)
         const bytes = transport.inputPointer(connection)
         var version: u8 = 0
         var flags: u8 = 0
         const state = readPreamble(bytes, available, &version, &flags)
-        if state < 0 { return false }
+        if state < 0 {
+            failNative(client, allocator)
+            return false
+        }
         if state > 0 {
-            if version != VERSION { return false }
+            if version != VERSION {
+                failNative(client, allocator)
+                return false
+            }
             client.*.unixFds = flags & UNIX_FDS != 0
             transport.consume(connection, PREAMBLE, 0)
             break
         }
-        if transport.wait(connection.*.descriptor, false, 5000) <= 0 { return false }
+        if transport.wait(connection.*.descriptor, false, 5000) <= 0 {
+            failNative(client, allocator)
+            return false
+        }
         const got = transport.receive(connection)
-        if got == 0 || (got < 0 && got != EAGAIN) { return false }
+        if got == 0 || (got < 0 && got != EAGAIN) {
+            failNative(client, allocator)
+            return false
+        }
     }
     var reply: Message = undefined
-    if !waitReply(client, serial, &reply, 5000) || reply.kind != REPLY { return false }
+    if !waitReply(client, serial, &reply, 5000) || reply.kind != REPLY {
+        failNative(client, allocator)
+        return false
+    }
     var reading = reader(bodyOf(client, &reply), reply.bodyLength)
     const unique = readString(&reading)
     var index: usize = 0
@@ -1054,7 +1104,36 @@ pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) ->
         index += 1
     }
     client.*.uniqueLength = index
-    return !reading.failed
+    if reading.failed {
+        failNative(client, allocator)
+        return false
+    }
+    return true
+}
+
+// Connects to the bus at `path`, native first. When the bus is a foreign
+// dbus-daemon (the host system, until brixOS has its own services) the
+// native handshake fails and the connection falls back to the D-Bus
+// client (std.dbus); from then on the caller's native messages are
+// marshalled to D-Bus on the way out and D-Bus messages are turned back
+// into the native form on the way in, so the caller sees one wire.
+pub fn connectClient(client: *Client, allocator: Allocator, path: []const u8) -> bool {
+    if tryNative(client, allocator, path) { return true }
+    client.*.native = false
+    if !dbus.connectClient(&client.*.peer, allocator, path) { return false }
+    const memory = allocator.alloc(MAX_MESSAGE, 16)
+    if memory == null {
+        dbus.disconnect(&client.*.peer, allocator)
+        return false
+    }
+    client.*.out = memory.?
+    client.*.serial = 0
+    client.*.uniqueLength = 0
+    client.*.unixFds = client.*.peer.unixFds
+    client.*.pendingSize = 0
+    client.*.pendingCount = 0
+    client.*.closed = false
+    return true
 }
 
 // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS, else
@@ -1076,6 +1155,25 @@ pub fn connectSession(client: *Client, allocator: Allocator, environment: [*][*]
 // and `count` descriptors (which the connection then owns): the serial,
 // 0 when it could not be sent.
 pub fn send(client: *Client, message: *Message, body: [*]const u8, length: usize, descriptors: [*]const isize, count: usize) -> u32 {
+    if !client.*.native {
+        // The caller's native message, marshalled to D-Bus (body into
+        // `out`, framed by dbus.send into the peer's buffer) and sent on
+        // the foreign bus; its serial is the peer's.
+        var header = dbus.newHeader(message.*.kind, 0)
+        header.flags = message.*.flags
+        header.path = message.*.path
+        header.interface = message.*.interface
+        header.member = message.*.member
+        header.errorName = message.*.errorName
+        header.replySerial = message.*.replySerial
+        header.hasReplySerial = message.*.replySerial != 0
+        header.destination = message.*.destination
+        header.signature = message.*.signature
+        var converting: dbus.Writer = undefined
+        dbus.begin(&converting, client.*.out, MAX_MESSAGE, false)
+        if !bodyToDBus(message.*.signature, body, length, count, &converting) { return 0 }
+        return dbus.send(&client.*.peer, &header, converting.bytes, converting.length, descriptors, count)
+    }
     client.*.serial +%= 1
     if client.*.serial == 0 { client.*.serial = 1 }
     message.*.serial = client.*.serial
@@ -1148,6 +1246,28 @@ pub fn replyError(client: *Client, request: *const Message, name: []const u8, te
 // descriptors at descriptorOf: they are the caller's (to close when it
 // does not keep them).
 pub fn next(client: *Client, message: *Message, timeout: isize) -> bool {
+    if !client.*.native {
+        // A D-Bus message from the foreign bus, turned back into the
+        // native form in `out` so the caller reads it with ipc.Reader as
+        // on a native connection.
+        var header: dbus.Header = undefined
+        if !dbus.next(&client.*.peer, &header, timeout) {
+            client.*.closed = client.*.peer.closed
+            return false
+        }
+        var writing: Writer = undefined
+        begin(&writing, client.*.out, MAX_MESSAGE)
+        if !fromDBus(&header, header.sender, dbus.bodyOf(&client.*.peer, &header), &writing) {
+            client.*.closed = true
+            return false
+        }
+        if !parse(client.*.out, writing.length, message) || !validMessage(message, advanceConst(client.*.out, message.*.bodyStart)) {
+            client.*.closed = true
+            return false
+        }
+        client.*.pendingCount = @intCast(usize, header.unixFds)
+        return true
+    }
     const connection = connectionOf(client)
     if client.*.pendingSize > 0 {
         transport.consume(connection, client.*.pendingSize, client.*.pendingCount)
@@ -1193,11 +1313,13 @@ pub fn waitReply(client: *Client, serial: u32, message: *Message, timeout: isize
 }
 
 pub fn bodyOf(client: *Client, message: *const Message) -> [*]const u8 {
+    if !client.*.native { return advanceConst(client.*.out, message.*.bodyStart) }
     return advanceConst(transport.inputPointer(connectionOf(client)), message.*.bodyStart)
 }
 
 // The message's descriptor `index` (-1 when it has none such).
 pub fn descriptorOf(client: *Client, index: usize) -> isize {
+    if !client.*.native { return dbus.descriptorOf(&client.*.peer, index) }
     if index >= client.*.pendingCount { return -1 }
     return transport.handlePointer(connectionOf(client))[index]
 }
@@ -1214,6 +1336,11 @@ pub fn waitReady(descriptor: isize, writable: bool, timeout_milliseconds: isize)
 // Ends the connection; the descriptors of the message `next` returned
 // last stay the caller's.
 pub fn disconnect(client: *Client, allocator: Allocator) -> void {
+    if !client.*.native {
+        dbus.disconnect(&client.*.peer, allocator)
+        allocator.free(client.*.out, MAX_MESSAGE, 16)
+        return
+    }
     const connection = connectionOf(client)
     if client.*.pendingSize > 0 {
         transport.consume(connection, client.*.pendingSize, client.*.pendingCount)
