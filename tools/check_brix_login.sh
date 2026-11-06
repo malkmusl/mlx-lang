@@ -142,7 +142,10 @@ echo "ok   impulse defines the bus, the login and the serial shell"
 wait_for '^ipc: listening at unix:path=/temporary/bus$'
 wait_for '^login: org.mlx.Login and org.freedesktop.login1 on the system bus'
 wait_for '^login: greeter started$'
-echo "ok   the system bus listens and sentinel starts the greeter on the screen"
+# sentinel is itself a native (mlx) bus client: it speaks MLXIPC's native
+# wire to synapse (the D-Bus path is only its fallback on a foreign host).
+wait_for '^ipc: :1\.[0-9]* is sentinel (mlx)$'
+echo "ok   the system bus listens and sentinel (a native mlx client) starts the greeter on the screen"
 # The greeter is a bus client the kernel names (channel_peer), so the
 # bus's policy can tell it apart; the greeter compositor logs to a file,
 # so the login and bus messages on the serial line are what is checked.
