@@ -181,10 +181,11 @@ socket. The bus tells the two apart by the first byte a connection sends
 carries every message between them: an Mlx program speaking natively
 calls a D-Bus service and is called by dbus-send and gdbus, a native
 service's signals reach D-Bus listeners, and dbus-monitor sees it all.
-`mlx-ipc --native` is the same tool on the native format
-(`native.mlx`); `tools/check_ipc.sh` runs it next to dbus-send, gdbus and
-dbus-monitor, and `tests/343_ipc_wire_runtime.mlx` checks the format
-itself.
+`mlx-ipc` speaks the native format by default (`native.mlx`); `--dbus`
+selects the D-Bus client (the compatibility path, `tool.mlx`), and
+`--native` is kept as an explicit alias for the default.
+`tools/check_ipc.sh` runs both next to dbus-send, gdbus and dbus-monitor,
+and `tests/343_ipc_wire_runtime.mlx` checks the format itself.
 
 Both formats carry the same messages (calls, replies, errors and signals,
 with the same header fields and the same type signatures), so nothing is
@@ -319,12 +320,13 @@ mlx-ipc protocol NAME      what NAME's owner speaks: mlx or dbus
 mlx-ipc bench NAME COUNT [BYTES]
                            COUNT Echo round trips to NAME, each of a string
                            of BYTES (5): how long one took
-mlx-ipc --native COMMAND   on the native wire format: names, apps,
-                           protocol NAME, serve NAME, call NAME TEXT,
-                           connect NAME (prints the first native message's
-                           string), emit TEXT (the signal org.mlx.Echo.Said),
-                           bench NAME COUNT [BYTES], chbench NAME COUNT [BYTES]
-                           (the round trips over a direct channel)
+(the commands above use the native wire format by default: emit TEXT
+                           sends the signal org.mlx.Echo.Said, and chbench
+                           NAME COUNT [BYTES] times the round trips over a
+                           direct channel)
+mlx-ipc --dbus COMMAND     the same commands over the D-Bus client instead
+                           (std.dbus), for the bridge and foreign buses
+mlx-ipc --native COMMAND   an explicit alias for the native default
 ```
 
 ## Modules
@@ -338,8 +340,8 @@ mlx-ipc --native COMMAND   on the native wire format: names, apps,
 | `policy.mlx` | who a connection is, the rules file, the decisions, rules written back (`setRule`) |
 | `prompts.mlx` | asking the user through the permission agent, answers for the session, the apps that asked, ListPermissions and SetPermission |
 | `activation.mlx` | `.service` files, starting services, calls waiting for them |
-| `tool.mlx` | mlx-ipc |
-| `native.mlx` | `mlx-ipc --native`: the commands on the native wire format (`std.ipc`) |
+| `tool.mlx` | mlx-ipc: dispatch (native by default, `--dbus` for the D-Bus client), and the D-Bus-client commands |
+| `native.mlx` | the native wire commands (`std.ipc`): mlx-ipc's default, and `--native` |
 
 ## Next
 
