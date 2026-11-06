@@ -157,7 +157,7 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/home"
 trap '[[ -n "$keep" ]] && mkdir -p "$keep" && cp "$work"/*.ppm "$work"/voyager.log "$keep"/ 2> /dev/null; rm -rf -- "$work"' EXIT
 
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor" || fail "the compositor does not compile"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/kepler" || fail "the compositor does not compile"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host" || fail "the test host does not compile"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -198,7 +198,7 @@ run_scenario() {
     "$work/test-host" "host-$name" "$work/us.xkb" "$script" > "$work/$name-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-$name" ]] && break; sleep 0.1; done
-    WAYLAND_DISPLAY="host-$name" timeout 180 "$work/mlx-compositor" --verbose --renderer cpu --socket "nested-$name" --run "$runner" > "$work/$name-compositor.log" 2>&1
+    WAYLAND_DISPLAY="host-$name" timeout 180 "$work/kepler" --verbose --renderer cpu --socket "nested-$name" --run "$runner" > "$work/$name-compositor.log" 2>&1
     wait "$host_pid" || { cat "$work/$name-host.log" >&2; fail "the test host failed ($name)"; }
 }
 

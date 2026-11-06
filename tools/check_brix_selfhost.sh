@@ -36,7 +36,7 @@ brix=--target=x86_64-brixos
 mkdir -p "$work/bin" "$work/www"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet $brix projects/wget/main.mlx -o "$work/wget"
 "$compiler" --quiet $brix projects/tar/main.mlx -o "$work/tar"
 "$compiler" --quiet $brix projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
@@ -46,7 +46,7 @@ mkdir -p "$work/bin" "$work/www"
 for program in cat wc ls sha256sum; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "wget=$work/wget" "tar=$work/tar" "brixfs=$work/brixfs" "mlx4=$work/mlx4" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "tar=$work/tar" "brixfs=$work/brixfs" "mlx4=$work/mlx4" "$work/bin/"
 echo "ok   the kernel, wget, tar, brixfs, mlx4 for brixOS and a boot image build"
 
 # The compiler's sources as an archive (our tar), a program to compile,

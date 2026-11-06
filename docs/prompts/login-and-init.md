@@ -1,17 +1,17 @@
 # Prompt: Login und Init fertigstellen
 
 Ein Arbeitsauftrag für einen externen Assistenten (ChatGPT): den Login
-(mlx-login, Greeter, Sperrbildschirm) und mlx-init fertig zu
+(sentinel, Greeter, Sperrbildschirm) und impulse fertig zu
 implementieren. Alles unter dem Strich wird so eingefügt.
 
 ---
 
-Du arbeitest am Repository https://github.com/malkmusl/mlx-lang, Branch `claude/linux-wayland-implementation-qf4044`. Es ist eine eigene Programmiersprache (Mlx) mit eigenem Compiler und darauf ein eigenes Linux-Userland: Init, Shell, Wayland-Compositor, Desktop-Apps, Audio, Netzwerk. Ziel ist ein System ohne GNU und ohne fremde Bibliotheken. Deine Aufgabe: **den Login (mlx-login, Greeter, Sperrbildschirm) und mlx-init fertig implementieren.**
+Du arbeitest am Repository https://github.com/malkmusl/mlx-lang, Branch `claude/linux-wayland-implementation-qf4044`. Es ist eine eigene Programmiersprache (Mlx) mit eigenem Compiler und darauf ein eigenes Linux-Userland: Init, Shell, Wayland-Compositor, Desktop-Apps, Audio, Netzwerk. Ziel ist ein System ohne GNU und ohne fremde Bibliotheken. Deine Aufgabe: **den Login (sentinel, Greeter, Sperrbildschirm) und impulse fertig implementieren.**
 
 ## Feste Regeln
 
 1. Alles in Mlx, ohne libc, ohne PAM, ohne systemd-logind, ohne D-Bus. Systemaufrufe direkt über `std.linux.syscall*`, wie im restlichen Code.
-2. Der Systembus ist MLXIPC: `mlx-ipcd --system` unter `/run/mlx/bus` (projects/desktop/ipc, README dort). Nur root darf dort Namen besitzen. Rechte pro App laufen über `org.mlx.IPC.Check(sender, permission)`. Vorbild für asynchrone Prüfung: projects/network/bus.mlx (`ask`, `answered`).
+2. Der Systembus ist MLXIPC: `synapse --system` unter `/run/mlx/bus` (projects/desktop/ipc, README dort). Nur root darf dort Namen besitzen. Rechte pro App laufen über `org.mlx.IPC.Check(sender, permission)`. Vorbild für asynchrone Prüfung: projects/network/bus.mlx (`ask`, `answered`).
 3. Stil wie im bestehenden Code: Kommentare als englische Prosa, die erklären warum. Nicht genutzte Ergebnisse als `const ignored = ...`. Dateien unter 1500 Zeilen. Jedes Projekt hat ein README, das du mitpflegst.
 4. Bauen: `mlx-out/bin/compiler/mlx4 --quiet DATEI.mlx -o PROGRAMM` (oder `tools/ensure_compiler.sh`). Jede Funktion bekommt einen Check in `tools/check_*.sh`. Die bestehenden Checks müssen grün bleiben: check_login.sh, check_init.sh, check_ipc.sh, check_network.sh, check_wayland_compositor.sh, check_desktop_clients.sh, check_compositor_session.sh.
 5. Installer arbeiten mit `--destdir DIR` (Staging) und `--enable`, wie tools/install_network.sh. Ohne `--destdir` nur als root.
@@ -27,7 +27,7 @@ Du arbeitest am Repository https://github.com/malkmusl/mlx-lang, Branch `claude/
 - Mehr als sechs Parameter mit gemischtem usize/f64 lösen nicht auf. Lange Funktionen können die Adresse lokaler Structs verlieren: Funktionen kurz halten.
 - Doppelte Feldnamen in Structs werden still angenommen: aufpassen.
 
-## Teil A: mlx-login fertigstellen (projects/desktop/login)
+## Teil A: sentinel fertigstellen (projects/desktop/login)
 
 Der Daemon läuft schon: er besitzt `org.mlx.Login`, `ListUsers` antwortet, `Login` und `Unlock` antworten mit `NotConfigured`. Es fehlen die beiden markierten Funktionen `authenticate` und `startSession` in main.mlx. Wie sie gebaut werden, steht in den Kommentaren der beiden Stubs und im README unter "The two privileged steps". `std.crypt.verify` (std/src/crypt.mlx) prüft yescrypt, `$6$` und `$5$` bereits in konstanter Zeit.
 
@@ -40,16 +40,16 @@ Danach:
 ## Teil B: Greeter und Sperrbildschirm
 
 - Compositor im Greeter-Modus (z. B. `--greeter PROGRAMM`): nur der Greeter, kein Dock, keine Leiste, keine Hotkeys außer VT-Wechsel.
-- `mlx-greeter` (neues Projekt, auf std.ui.host wie mlx-settings): Benutzerliste aus `ListUsers`, Passwortfeld mit Sternen, Sitzungsauswahl aus den `wayland-sessions`-Einträgen, Aufruf von `Login`, Fehlermeldung auf Deutsch und Englisch, Hell/Dunkel über std.ui.appearance, Optik wie die übrigen Apps.
-- `mlx-lock`: eigener Sperrbildschirm über ext-session-lock-v1, entsperrt mit `Unlock`. Er ersetzt `swaylock` als Standard für `lock-command`.
+- `aurora` (neues Projekt, auf std.ui.host wie control): Benutzerliste aus `ListUsers`, Passwortfeld mit Sternen, Sitzungsauswahl aus den `wayland-sessions`-Einträgen, Aufruf von `Login`, Fehlermeldung auf Deutsch und Englisch, Hell/Dunkel über std.ui.appearance, Optik wie die übrigen Apps.
+- `umbra`: eigener Sperrbildschirm über ext-session-lock-v1, entsperrt mit `Unlock`. Er ersetzt `swaylock` als Standard für `lock-command`.
 - Checks mit dem verschachtelten Compositor und tools/wayland-test-host, wie in check_wayland_compositor.sh.
 
 ## Teil C: Installation
 
-- `tools/install_login.sh` mit `--destdir` und `--enable`: mlx-login, mlx-greeter, mlx-lock, eine systemd-Unit `mlx-login.service` (braucht `mlx-ipcd.service`, als `display-manager.service`), dazu Dienste für mlx-init.
+- `tools/install_login.sh` mit `--destdir` und `--enable`: sentinel, aurora, umbra, eine systemd-Unit `sentinel.service` (braucht `synapse.service`, als `display-manager.service`), dazu Dienste für impulse.
 - Mit `--enable` den bisherigen Display-Manager maskieren und rückgängig machbar halten. Im Check nur mit `--destdir` arbeiten.
 
-## Teil D: mlx-init (projects/init, README-Abschnitt "Not yet")
+## Teil D: impulse (projects/init, README-Abschnitt "Not yet")
 
 In dieser Reihenfolge:
 1. `user = NAME` und `group = NAME` für Dienste.
@@ -58,7 +58,7 @@ In dieser Reihenfolge:
 4. Geräte: uevents über Netlink lesen, beim Start `/sys` durchgehen (Coldplug), Rechte und Gruppen für `/dev/dri`, `/dev/input` und `/dev/snd` setzen.
 5. Bereitschaft auch über einen Socket oder eine Nachricht, nicht nur über einen Pfad.
 6. `/etc/fstab` vollständig auswerten und eine Dateisystemprüfung einhängen.
-7. Ein Beispiel-Dienstsatz, der vom Boot bis zum Greeter alles startet: mlx-ipcd, mlx-netd, mlx-login.
+7. Ein Beispiel-Dienstsatz, der vom Boot bis zum Greeter alles startet: synapse, nexus, sentinel.
 
 Jeder Schritt bekommt Tests in `tools/check_init.sh`, im Namespace wie die bestehenden.
 

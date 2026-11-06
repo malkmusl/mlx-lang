@@ -21,11 +21,11 @@ fail() { echo "FAIL $1" >&2; cat -v "$work/serial.txt" | tail -n 40 >&2 || true;
 mkdir -p "$work/bin"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet --target=x86_64-brixos projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet --target=x86_64-brixos projects/shell/main.mlx -o "$work/flux"
 for program in seq wc cat ls echo; do
     "$compiler" --quiet --target=x86_64-brixos "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "$work/bin/"
 echo "ok   the kernel and the image (with the trampoline) build"
 {
     sleep 5

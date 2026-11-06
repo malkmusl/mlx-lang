@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The port's MPRIS player on MLXIPC end to end: mlx-ipcd as the session
+# The port's MPRIS player on MLXIPC end to end: synapse as the session
 # bus, tests/support/mpris_program.mlx (projects/webkit/port/mlx/mediasession.mlx,
 # what Voyager runs) owning org.mpris.MediaPlayer2.voyager in MLXIPC's
 # own format, and D-Bus tools as the desktop's media controls: dbus-send
@@ -38,7 +38,7 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx"
 : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 "$compiler" --quiet tests/support/mpris_program.mlx -o "$work/player"
 
 fail() {
@@ -49,7 +49,7 @@ fail() {
     exit 1
 }
 
-"$work/mlx-ipcd" --verbose > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"

@@ -1,6 +1,6 @@
-# mlx-greeter
+# aurora
 
-`mlx-greeter` is the login surface shown by `mlx-compositor --greeter`.
+`aurora` is the login surface shown by `kepler --greeter`.
 It is a normal `std.ui.host` Wayland client and follows the desktop's
 light/dark appearance. The greeter itself is unprivileged: it reads no
 account database and owns no device.
@@ -10,7 +10,7 @@ Accounts come from `org.mlx.Login.ListUsers` on the MLXIPC system bus at
 there is no external D-Bus daemon or library. Sessions come from the freedesktop
 `wayland-sessions/*.desktop` directories below `XDG_DATA_HOME` and
 `XDG_DATA_DIRS`. Only entries whose `Exec` is one executable count; the
-command is passed as data to `mlx-login`, never to a shell.
+command is passed as data to `sentinel`, never to a shell.
 
 It looks like the lock screen (`projects/desktop/lock`), fullscreen: one
 card with the account mark, the account's name, the session choice, the
@@ -22,15 +22,15 @@ or an arrow goes back). The session row below the account has arrows for
 all valid `wayland-sessions` entries. It initially chooses the entry
 running `mlx-session` (or the first entry when that is not installed),
 and sends the executable belonging to the visibly selected name to
-`mlx-login`.
+`sentinel`.
 
 The password field displays stars. On every accepted, rejected, failed,
 or closed attempt, the entire fixed password buffer and its display copy
-are overwritten. `mlx-login` performs authentication and session setup;
+are overwritten. `sentinel` performs authentication and session setup;
 after a successful `Login` reply the greeter closes so its compositor can
 release the seat.
 
 ```sh
-mlx4 projects/desktop/greeter/main.mlx -o mlx-greeter
+mlx4 projects/desktop/greeter/main.mlx -o aurora
 tools/check_greeter.sh
 ```

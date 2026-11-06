@@ -29,8 +29,8 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 export MLX_ARENA_POISON=1
 trap 'rm -rf -- "$work"' EXIT
 
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/kepler"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/vector"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
@@ -106,8 +106,8 @@ SCRIPT
 "$work/test-host" host-modules "$work/us.xkb" "$work/modules.script" > "$work/host.log" 2>&1 &
 host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-modules" ]] && break; sleep 0.1; done
-WAYLAND_DISPLAY=host-modules timeout 60 "$work/mlx-compositor" --verbose --renderer "$renderer" --socket nested-modules \
-    --modules "$work/modules" --terminal "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/compositor.log" 2>&1 &
+WAYLAND_DISPLAY=host-modules timeout 60 "$work/kepler" --verbose --renderer "$renderer" --socket nested-modules \
+    --modules "$work/modules" --terminal "$work/vector" --run "$work/vector" > "$work/compositor.log" 2>&1 &
 compositor_pid=$!
 # While the terminal runs: the changed modules, then (after the screenshot)
 # a shell for another layout. The compositor looks at the files twice a

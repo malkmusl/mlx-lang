@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Runs Files on Android: projects/desktop/files/main.mlx, the same source
-as the desktop's mlx-files, built for aarch64-android (std.ui.host) and run
+as the desktop's polaris, built for aarch64-android (std.ui.host) and run
 against the Android/Vulkan model.
 
 The fixture is a real host directory exposed as ANativeActivity's

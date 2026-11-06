@@ -54,13 +54,13 @@
 #     after the pinned ones (a window moved to workspace 2, one on 1, the
 #     pinned terminal's moved to 3 makes no group) and a click on the app
 #     of workspace 2's group brings that workspace;
-#   - runs the top bar (mlx-topbar) with a terminal: the bar (with its
+#   - runs the top bar (horizon) with a terminal: the bar (with its
 #     workspace controls in the middle) is along the
 #     top and reserves it (the terminal moves below it, maximized it stays
 #     below), shows the active app and a fixed time in German, and the
 #     local times clock.mlx computes match python's zoneinfo;
-#   - runs the top bar again on a session bus (mlx-ipcd) with MLX Audio
-#     (mlx-audiod, no sound card), a music player and a tray icon
+#   - runs the top bar again on a session bus (synapse) with MLX Audio
+#     (resonance, no sound card), a music player and a tray icon
 #     (tools/topbar-test-services) and a battery (a made-up
 #     /sys/class/power_supply): the bar is the StatusNotifierWatcher and
 #     shows what plays, the icon, the volume and the charge; its play
@@ -69,17 +69,17 @@
 #     left click Activate, the volume popup's slider, mute switch and the
 #     wheel change MLX Audio's volume, the battery popup tells the time
 #     left, and the calendar under the clock turns to the next month;
-#   - shows notifications (mlx-notifyd, mlx-notify) as bubbles and in the
+#   - shows notifications (beacon, mlx-notify) as bubbles and in the
 #     top bar's control centre: dismissing and clearing them, the volume,
 #     Do Not Disturb, night light, the light look (the portal) and a
 #     screenshot;
-#   - starts mlx-notifyd from the bus (a service file) in a session run by
-#     mlx-ipcd, as mlx-session runs it: the compositor tells the bus its
+#   - starts beacon from the bus (a service file) in a session run by
+#     synapse, as mlx-session runs it: the compositor tells the bus its
 #     WAYLAND_DISPLAY, so the bubble shows on it;
 #   - joins a Wi-Fi network from the control centre's network list with
-#     fakenetd (tools/network-test) as mlx-netd on a system bus, and opens
-#     mlx-settings' Network page for one that needs a passphrase;
-#   - runs the file manager (mlx-files) on a home of its own: it shows the
+#     fakenetd (tools/network-test) as nexus on a system bus, and opens
+#     control' Network page for one that needs a passphrase;
+#   - runs the file manager (polaris) on a home of its own: it shows the
 #     folders first, makes a folder (Ctrl+Shift+N) and names it, moves a
 #     picture into it by dragging, renames a file (F2), moves one to the
 #     trash (Delete), opens a folder with a double click, goes back with
@@ -109,24 +109,24 @@ command -v xkbcli > /dev/null || { echo "check_desktop_clients.sh: xkbcli is not
 
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
-"$compiler" --quiet projects/desktop/dock/main.mlx -o "$work/mlx-dock"
-"$compiler" --quiet projects/desktop/launcher/main.mlx -o "$work/mlx-launcher"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/kepler"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/vector"
+"$compiler" --quiet projects/desktop/dock/main.mlx -o "$work/orbit"
+"$compiler" --quiet projects/desktop/launcher/main.mlx -o "$work/launch"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tools/wayland-drag-source/main.mlx -o "$work/drag-source"
 "$compiler" --quiet tools/wayland-extras-test/main.mlx -o "$work/extras-test"
-"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/mlx-topbar"
+"$compiler" --quiet projects/desktop/topbar/main.mlx -o "$work/horizon"
 "$compiler" --quiet tools/topbar-test-services/main.mlx -o "$work/topbar-test-services"
 "$compiler" --quiet tools/session-lock-test/main.mlx -o "$work/session-lock-test"
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
-"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
-"$compiler" --quiet projects/desktop/notifications/main.mlx -o "$work/mlx-notifyd"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/resonance"
+"$compiler" --quiet projects/desktop/notifications/main.mlx -o "$work/beacon"
 "$compiler" --quiet projects/desktop/notifications/notify.mlx -o "$work/mlx-notify"
 "$compiler" --quiet projects/desktop/capture/main.mlx -o "$work/mlx-capture"
 "$compiler" --quiet tools/clock-probe/main.mlx -o "$work/clock-probe"
 "$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
-"$compiler" --quiet projects/desktop/files/main.mlx -o "$work/mlx-files"
+"$compiler" --quiet projects/desktop/files/main.mlx -o "$work/polaris"
 "$compiler" --quiet tools/x11-clipboard-test/main.mlx -o "$work/x11-clipboard-test"
 "$compiler" --quiet tools/x11-dnd-test/main.mlx -o "$work/x11-dnd-test"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
@@ -290,29 +290,29 @@ run() {
     local status=0
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-desktop \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" VK_DRIVER_FILES="$manifest" MLX_CANVAS="${2:-}" \
-        MLX_COMPOSITOR_LOG_KEYS=1 timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-desktop \
-        --terminal "$work/mlx-terminal" --launcher "$work/mlx-launcher" --dock "$work/mlx-dock" --topbar none \
-        --run "$work/mlx-terminal" --run "$work/mlx-terminal" > "$work/$name.log" 2>&1 || status=$?
+        MLX_COMPOSITOR_LOG_KEYS=1 timeout 60 "$work/kepler" --verbose --no-fps --renderer "$renderer" --socket nested-desktop \
+        --terminal "$work/vector" --launcher "$work/launch" --dock "$work/orbit" --topbar none \
+        --run "$work/vector" --run "$work/vector" > "$work/$name.log" 2>&1 || status=$?
     wait "$host_pid" || fail "$renderer: the test host failed" "$work/$name-host.log"
     rm -rf -- "$runtime"
     [[ $status -eq 0 ]] || fail "$renderer: the compositor exited with status $status" "$work/$name.log"
     local log="$work/$name.log"
 
-    grep -q "^layer: mlx-dock 433x150 at 295,618 in layer 2" "$log" || fail "$renderer: the dock is not along the bottom in the top layer" "$log"
-    grep -q "^layer: mlx-launcher 720x540 at 152,114 in layer 3" "$log" || fail "$renderer: Super did not open the launcher centred in the overlay layer" "$log"
-    grep -q "^focus: mlx-launcher" "$log" || fail "$renderer: the launcher did not get the keyboard" "$log"
-    grep -q "^key 50 -> mlx-launcher" "$log" || fail "$renderer: typing did not reach the launcher" "$log"
+    grep -q "^layer: orbit 433x150 at 295,618 in layer 2" "$log" || fail "$renderer: the dock is not along the bottom in the top layer" "$log"
+    grep -q "^layer: launch 720x540 at 152,114 in layer 3" "$log" || fail "$renderer: Super did not open the launcher centred in the overlay layer" "$log"
+    grep -q "^focus: launch" "$log" || fail "$renderer: the launcher did not get the keyboard" "$log"
+    grep -q "^key 50 -> launch" "$log" || fail "$renderer: typing did not reach the launcher" "$log"
     [[ "$(cat "$work/marks" 2> /dev/null)" == "$(printf 'started\nstarted\naction')" ]] || fail "$renderer: the launcher and the dock did not start the app, or the dock's menu its action (marks: $(cat "$work/marks" 2> /dev/null | tr '\n' ' '))" "$log"
-    [[ $(grep -c "^layer: mlx-launcher" "$log") -eq 3 ]] || fail "$renderer: the dock's apps button did not open the launcher" "$log"
-    grep -q "^key 1 -> mlx-launcher" "$log" || fail "$renderer: Escape did not reach the launcher" "$log"
+    [[ $(grep -c "^layer: launch" "$log") -eq 3 ]] || fail "$renderer: the dock's apps button did not open the launcher" "$log"
+    grep -q "^key 1 -> launch" "$log" || fail "$renderer: Escape did not reach the launcher" "$log"
     # Focus: the two terminals, the launcher, a terminal again after it
     # closed, then the other one from its preview.
     grep -q "^previews: 2 windows, panel 516x206 at 254,478" "$log" || fail "$renderer: the dock's terminal (two windows) did not show their previews above the dock" "$log"
     grep -q "^previews closed" "$log" || fail "$renderer: a click on a preview did not close them" "$log"
     [[ $(grep -c "^focus: Mlx Terminal" "$log") -ge 4 ]] || fail "$renderer: the preview did not bring the other terminal forward" "$log"
     echo "ok   $renderer: dock along the bottom, Super opens the launcher, apps start from both, the dock's previews switch windows"
-    grep -q "^drag: dropped on mlx-dock" "$log" && grep -q "^mlx-dock: pinned org.mlx.Other" "$log" || fail "$renderer: an app dragged from the launcher was not pinned to the dock" "$log"
-    grep -q "^mlx-dock: the pinned apps changed" "$log" || fail "$renderer: the dock did not take in the launcher's change to its pins" "$log"
+    grep -q "^drag: dropped on orbit" "$log" && grep -q "^orbit: pinned org.mlx.Other" "$log" || fail "$renderer: an app dragged from the launcher was not pinned to the dock" "$log"
+    grep -q "^orbit: the pinned apps changed" "$log" || fail "$renderer: the dock did not take in the launcher's change to its pins" "$log"
     [[ "$(cat "$work/config/mlx/dock")" == "$(printf 'terminal\norg.mlx.Marker')" ]] || fail "$renderer: the launcher's menu did not unpin the app (pins: $(tr '\n' ' ' < "$work/config/mlx/dock"))" "$log"
     printf 'terminal\norg.mlx.Marker\n' > "$work/config/mlx/dock"
     echo "ok   $renderer: the dock's menu runs an app's action; apps pin by dragging from the launcher and unpin from its menu"
@@ -426,14 +426,14 @@ SCRIPT
     local status=0
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-drops \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" MLX_CANVAS=cpu \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-drops \
-        --terminal "$work/mlx-terminal" --launcher none --dock "$work/mlx-dock" --topbar none --run "$work/drag.sh" > "$work/drops.log" 2>&1 || status=$?
+        timeout 60 "$work/kepler" --verbose --no-fps --renderer cpu --socket nested-drops \
+        --terminal "$work/vector" --launcher none --dock "$work/orbit" --topbar none --run "$work/drag.sh" > "$work/drops.log" 2>&1 || status=$?
     wait "$host_pid" || fail "drops: the test host failed" "$work/drops-host.log"
     rm -rf -- "$runtime"
     [[ $status -eq 0 ]] || fail "drops: the compositor exited with status $status" "$work/drops.log"
     ! grep -q "crashed" "$work/drops.log" || fail "drops: the dock crashed" "$work/drops.log"
     grep -qx "$work/home/Documents" "$work/config/mlx/dock-folders" || fail "drops: a folder dropped on the dock was not pinned (folders: $(tr '\n' ' ' < "$work/config/mlx/dock-folders"))" "$work/drops.log"
-    grep -q "^mlx-dock: moved to the trash" "$work/drops.log" || fail "drops: a file dropped on the trash was not moved there" "$work/drops.log"
+    grep -q "^orbit: moved to the trash" "$work/drops.log" || fail "drops: a file dropped on the trash was not moved there" "$work/drops.log"
     echo "ok   a folder dropped on the dock is pinned, a file dropped on the trash goes into it"
     # gio trash does the moving (when it is installed).
     if command -v gio > /dev/null; then
@@ -457,8 +457,8 @@ stack_run() {
     for _ in $(seq 1 50); do [[ -S "$runtime/host-$name" ]] && break; sleep 0.1; done
     env -i PATH="$PATH" HOME="$work/stacks/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="host-$name" \
         XDG_DATA_HOME="$work/stacks/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/stacks/config" MLX_CANVAS=cpu \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket "nested-$name" \
-        --terminal "$work/mlx-terminal" --launcher none --dock "$work/mlx-dock" --topbar none --run "$work/$name.sh" > "$work/$name.log" 2>&1 || status=$?
+        timeout 60 "$work/kepler" --verbose --no-fps --renderer cpu --socket "nested-$name" \
+        --terminal "$work/vector" --launcher none --dock "$work/orbit" --topbar none --run "$work/$name.sh" > "$work/$name.log" 2>&1 || status=$?
     wait "$host_pid" || fail "$name: the test host failed" "$work/$name-host.log"
     rm -rf -- "$runtime"
     [[ $status -eq 0 ]] || fail "$name: the compositor exited with status $status" "$work/$name.log"
@@ -496,7 +496,7 @@ wait 1500
 close
 SCRIPT
     stack_run stack-in "$work/drag-source file://$home/Other/x.txt"
-    grep -q "^mlx-dock: dropped into $home/Downloads" "$work/stack-in.log" && [[ -e "$home/Downloads/x.txt" && -e "$home/Other/x.txt" ]] || fail "stacks: a file dropped on a pinned folder was not copied into it" "$work/stack-in.log"
+    grep -q "^orbit: dropped into $home/Downloads" "$work/stack-in.log" && [[ -e "$home/Downloads/x.txt" && -e "$home/Other/x.txt" ]] || fail "stacks: a file dropped on a pinned folder was not copied into it" "$work/stack-in.log"
     echo "ok   a file dropped on a pinned folder in the dock is copied into it"
     # Newest first: x.txt, a.txt, Sub, b.txt. a.txt onto Sub, then (the
     # stack read again: Sub, x.txt, b.txt) b.txt into the file manager.
@@ -534,7 +534,7 @@ release 272
 wait 1500
 close
 SCRIPT
-    stack_run stack-out "$work/mlx-files $home/Dst"
+    stack_run stack-out "$work/polaris $home/Dst"
     [[ -e "$home/Downloads/Sub/a.txt" && ! -e "$home/Downloads/a.txt" ]] || fail "stacks: an entry dragged onto a folder in the stack did not move into it ($(ls "$home/Downloads" | tr '\n' ' '))" "$work/stack-out.log"
     echo "ok   an entry dragged onto a folder in the dock's stack moves into it"
     grep -q "^drag: dropped on Dst" "$work/stack-out.log" && [[ -e "$home/Dst/b.txt" && -e "$home/Downloads/b.txt" ]] || fail "stacks: an entry dragged out of the stack was not copied into the file manager's folder ($(ls "$home/Dst" | tr '\n' ' '))" "$work/stack-out.log"
@@ -577,7 +577,7 @@ SCRIPT
     cat > "$work/clip-files.sh" <<SCRIPT
 #!/bin/sh
 "$work/clip-readers.sh" &
-exec "$work/mlx-files" "$home/Src"
+exec "$work/polaris" "$home/Src"
 SCRIPT
     chmod +x "$work/clip-files.sh"
     stack_run clip-copy "$work/clip-files.sh"
@@ -601,7 +601,7 @@ SCRIPT
     cat > "$work/clip-paster.sh" <<SCRIPT
 #!/bin/sh
 (sleep 2; printf 'file://%s\r\n' "$home/Other/c%20d.txt" | wl-copy -t text/uri-list) &
-exec "$work/mlx-files" "$home/Paste"
+exec "$work/polaris" "$home/Paste"
 SCRIPT
     chmod +x "$work/clip-paster.sh"
     stack_run clip-paste "$work/clip-paster.sh"
@@ -730,7 +730,7 @@ xdnd_from_x() {
     echo from-x > "$home/XSrc/x.txt"
     cat > "$work/xdnd-x-clients.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-files" "$home/XDst" &
+"$work/polaris" "$home/XDst" &
 sleep 2
 exec "$work/x11-dnd-test" source "file://$home/XSrc/x.txt" > /dev/null 2> "$out/x-source.err"
 SCRIPT
@@ -762,7 +762,7 @@ SCRIPT
     echo "ok   an X program's drag goes on over a Wayland window, which takes the file; the program hears it was taken"
     cat > "$work/xdnd-back-clients.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-files" "$home/XDst" &
+"$work/polaris" "$home/XDst" &
 sleep 2
 "$work/x11-dnd-test" source file:///tmp/y.txt > /dev/null 2> "$out/back-source.err" &
 sleep 1
@@ -887,7 +887,7 @@ SCRIPT
         echo "skip smart dock edge: xev or Xwayland is not installed"
     fi
     rm -f -- "$work/stacks/config/mlx/compositor.conf"
-    [[ "$(grep -o "^dock: hidden\|^drag: started\|^dock: shown\|^mlx-dock: moved to the trash" "$work/smart-drop.log" | tr '\n' ',')" == "dock: hidden,drag: started,dock: shown,mlx-dock: moved to the trash," ]] || fail "smart dock: a drag to the bottom edge did not bring the hidden dock up to drop on ($(grep "^dock:\|^drag:\|^mlx-dock: moved" "$work/smart-drop.log" | tr '\n' ' '))" "$work/smart-drop.log"
+    [[ "$(grep -o "^dock: hidden\|^drag: started\|^dock: shown\|^orbit: moved to the trash" "$work/smart-drop.log" | tr '\n' ',')" == "dock: hidden,drag: started,dock: shown,orbit: moved to the trash," ]] || fail "smart dock: a drag to the bottom edge did not bring the hidden dock up to drop on ($(grep "^dock:\|^drag:\|^orbit: moved" "$work/smart-drop.log" | tr '\n' ' '))" "$work/smart-drop.log"
     local log="$work/smart-dock.log"
     grep -q "dock autohide smart" "$log" || fail "smart dock: the compositor did not take dock-autohide = smart" "$log"
     # Hidden only after the window was maximized, back after it was not.
@@ -908,7 +908,7 @@ dock_workspaces() {
 #!/bin/sh
 "$work/drag-source" file:///first &
 sleep 3
-"$work/mlx-terminal" &
+"$work/vector" &
 sleep 3
 exec "$work/drag-source" file:///second
 SCRIPT
@@ -945,7 +945,7 @@ SCRIPT
     rm -f -- "$work/stacks/config/mlx/compositor.conf"
     local log="$work/dock-workspaces.log"
     grep -q "dock workspaces on" "$log" || fail "dock workspaces: the compositor did not take dock-workspaces = on" "$log"
-    [[ "$(grep "^mlx-dock: by workspace: [0-9]\|^workspace: " "$log" | tr '\n' ',')" == "mlx-dock: by workspace: 1, 1 shown,mlx-dock: by workspace: 2, 1 shown,mlx-dock: by workspace: 1 2, 1 shown,workspace: 2,mlx-dock: by workspace: 1 2, 2 shown," ]] || fail "dock workspaces: the dock did not group the apps by workspace ($(grep "^mlx-dock: by\|^workspace: \|^moved" "$log" | tr '\n' ' '))" "$log"
+    [[ "$(grep "^orbit: by workspace: [0-9]\|^workspace: " "$log" | tr '\n' ',')" == "orbit: by workspace: 1, 1 shown,orbit: by workspace: 2, 1 shown,orbit: by workspace: 1 2, 1 shown,workspace: 2,orbit: by workspace: 1 2, 2 shown," ]] || fail "dock workspaces: the dock did not group the apps by workspace ($(grep "^orbit: by\|^workspace: \|^moved" "$log" | tr '\n' ' '))" "$log"
     echo "ok   dock-workspaces = on groups the apps that run by workspace after the pinned ones"
     echo "ok   a click on an app of another workspace's group brings that workspace"
 }
@@ -963,9 +963,9 @@ dock_hover() {
     printf '~/Downloads\n' > "$work/stacks/config/mlx/dock-folders"
     cat > "$work/hover-clients.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-terminal" &
+"$work/vector" &
 sleep 1
-exec "$work/mlx-terminal"
+exec "$work/vector"
 SCRIPT
     cat > "$work/dock-hover.script" <<SCRIPT
 wait 4500
@@ -1021,7 +1021,7 @@ terminal_clipboard() {
     fi
     cat > "$work/terminal-clients.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-terminal" /bin/sh -c 'printf "\\033[?2004h"; stty -echo; cat -v | tee "$work/terminal-typed.txt"' &
+"$work/vector" /bin/sh -c 'printf "\\033[?2004h"; stty -echo; cat -v | tee "$work/terminal-typed.txt"' &
 sleep 6
 wl-paste -n > "$work/terminal-pasted.txt"
 sleep 1
@@ -1122,7 +1122,7 @@ terminal_primary() {
     fi
     cat > "$work/primary-clients.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-terminal" /bin/sh -c 'stty -echo; cat -v | tee "$work/primary-typed.txt"' &
+"$work/vector" /bin/sh -c 'stty -echo; cat -v | tee "$work/primary-typed.txt"' &
 sleep 5
 wl-paste --primary -n > "$work/primary-pasted.txt"
 sleep 1
@@ -1201,24 +1201,24 @@ SCRIPT
 
 # The top bar with a terminal, at a fixed time (2024-09-27 14:05 UTC, 16:05
 # in Berlin), in German.
-# The file manager (mlx-files) on a home of its own, its apps drawing on
+# The file manager (polaris) on a home of its own, its apps drawing on
 # $1 (cpu or gpu). Its window is at (24, 24), the icons' centres 118
 # pixels apart from x 296, the rows 104 apart from y 125.
-# The control centre's network list on mlx-netd: a system bus of its own
-# (mlx-ipcd --address) with tools/network-test's fakenetd in mlx-netd's
+# The control centre's network list on nexus: a system bus of its own
+# (synapse --address) with tools/network-test's fakenetd in nexus's
 # place (a cable, and a Wi-Fi card seeing Zuhause, Buero, Cafe Sonne and
 # Nachbar by signal; the list's rows at y 309 + 34 each under the
 # tiles). The network tile (736, 119) opens the list; Cafe Sonne (open)
 # is clicked: its row says it is joining, then it is joined (a check,
 # first in the list); Zuhause (WPA2, no passphrase saved; second now)
-# opens mlx-settings' Network page on it (a stand-in mlx-settings on the
+# opens control' Network page on it (a stand-in control on the
 # PATH keeps its arguments).
 control_network() {
     local runtime
     runtime=$(mktemp -d)
     mkdir -p "$work/ccn-config/mlx" "$work/ccn-home" "$work/ccn-bin"
-    printf '#!/bin/sh\necho "$@" > "%s/ccn-settings"\n' "$work" > "$work/ccn-bin/mlx-settings"
-    chmod +x "$work/ccn-bin/mlx-settings"
+    printf '#!/bin/sh\necho "$@" > "%s/ccn-settings"\n' "$work" > "$work/ccn-bin/control"
+    chmod +x "$work/ccn-bin/control"
     cat > "$work/ccn.script" <<SCRIPT
 wait 3000
 pointer 873 15
@@ -1252,9 +1252,9 @@ SCRIPT
     # desktop portal would be, asked for the look).
     local bus=(env -i PATH="$work/ccn-bin:$PATH" HOME="$work/ccn-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/ccn-config" XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none"
         DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/system")
-    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/ccn-ipcd.log" 2>&1 &
+    "${bus[@]}" "$work/synapse" --address "$runtime/bus" > "$work/ccn-ipcd.log" 2>&1 &
     local ipcd_pid=$!
-    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/system" > "$work/ccn-system.log" 2>&1 &
+    "${bus[@]}" "$work/synapse" --address "$runtime/system" > "$work/ccn-system.log" 2>&1 &
     local system_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/bus" && -S "$runtime/system" ]] && break; sleep 0.1; done
     "${bus[@]}" "$work/fakenetd" > "$work/ccn-netd.log" 2>&1 &
@@ -1263,8 +1263,8 @@ SCRIPT
     local status=0
     "${bus[@]}" WAYLAND_DISPLAY=host-ccn MLX_CANVAS=cpu \
         LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_VERBOSE=1 \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-ccn \
-        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/ccn.log" 2>&1 || status=$?
+        timeout 60 "$work/kepler" --verbose --no-fps --renderer cpu --socket nested-ccn \
+        --terminal "$work/vector" --launcher none --dock none --topbar "$work/horizon" --run "$work/vector" > "$work/ccn.log" 2>&1 || status=$?
     wait "$host_pid" || fail "control centre network: the test host failed" "$work/ccn-host.log"
     kill "$netd_pid" "$system_pid" "$ipcd_pid" 2> /dev/null || true
     wait "$netd_pid" "$system_pid" "$ipcd_pid" 2> /dev/null || true
@@ -1299,11 +1299,11 @@ assert area(joining, 900, 368, 990, 386) != area(listed, 900, 368, 990, 386), "n
 assert area(joined, 696, 300, 790, 318) != area(listed, 696, 300, 790, 318), "the first row is not Cafe Sonne"
 assert area(joined, 970, 298, 992, 320) != area(listed, 970, 298, 992, 320), "no check"
 PY
-    echo "ok   control centre: the network list joins an open network through mlx-netd (joining, joined) and opens the Network page for one that needs a passphrase"
+    echo "ok   control centre: the network list joins an open network through nexus (joining, joined) and opens the Network page for one that needs a passphrase"
 }
 
-# Notifications in a session as mlx-session starts it: the bus (mlx-ipcd)
-# runs the compositor and starts mlx-notifyd from a service file on the
+# Notifications in a session as mlx-session starts it: the bus (synapse)
+# runs the compositor and starts beacon from a service file on the
 # first notification, with the bus's own environment, whose
 # WAYLAND_DISPLAY is not the compositor's (here the test host's; in a real
 # session none). The compositor (--session) tells the bus its
@@ -1316,13 +1316,13 @@ notify_activation() {
     cat > "$work/na-services/org.freedesktop.Notifications.service" <<SERVICE
 [D-BUS Service]
 Name=org.freedesktop.Notifications
-Exec=$work/mlx-notifyd --verbose
+Exec=$work/beacon --verbose
 SERVICE
     cat > "$work/na.sh" <<SCRIPT
 #!/bin/sh
 sleep 2
 "$work/mlx-notify" -a Test "Hallo" "Vom Bus gestartet" > "$work/na-notify.log" 2>&1
-exec "$work/mlx-terminal"
+exec "$work/vector"
 SCRIPT
     chmod +x "$work/na.sh"
     printf 'wait 6000\nclose\n' > "$work/na.script"
@@ -1332,17 +1332,17 @@ SCRIPT
     local status=0
     env -i PATH="$PATH" HOME="$work/na-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/na-config" XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" \
         WAYLAND_DISPLAY=host-na MLX_CANVAS=cpu LANG=de_DE.UTF-8 \
-        timeout 60 "$work/mlx-ipcd" --address "$runtime/bus" --services "$work/na-services" --run \
-        "$work/mlx-compositor" --backend nested --session --verbose --no-fps --renderer cpu --socket nested-na \
-        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar none --run "$work/na.sh" > "$work/na.log" 2>&1 || status=$?
+        timeout 60 "$work/synapse" --address "$runtime/bus" --services "$work/na-services" --run \
+        "$work/kepler" --backend nested --session --verbose --no-fps --renderer cpu --socket nested-na \
+        --terminal "$work/vector" --launcher none --dock none --topbar none --run "$work/na.sh" > "$work/na.log" 2>&1 || status=$?
     wait "$host_pid" || fail "notifications: the test host failed" "$work/na-host.log"
     rm -rf -- "$runtime"
     local log="$work/na.log"
     [[ $status -eq 0 ]] || fail "notifications: the session ended with status $status" "$log"
     grep -q "^session bus: services it starts get WAYLAND_DISPLAY" "$log" || fail "notifications: the compositor did not tell the bus its WAYLAND_DISPLAY" "$log"
-    grep -q "^notifyd: notification 1 \"Hallo\"$" "$log" || fail "notifications: the bus did not start mlx-notifyd, or it did not take the notification" "$log"
-    grep -q "^layer: mlx-notifications " "$log" || fail "notifications: mlx-notifyd's bubble did not show on the compositor" "$log"
-    echo "ok   notifications: the bus starts mlx-notifyd on the first one, and its bubble shows on the compositor that runs the session"
+    grep -q "^notifyd: notification 1 \"Hallo\"$" "$log" || fail "notifications: the bus did not start beacon, or it did not take the notification" "$log"
+    grep -q "^layer: mlx-notifications " "$log" || fail "notifications: beacon's bubble did not show on the compositor" "$log"
+    echo "ok   notifications: the bus starts beacon on the first one, and its bubble shows on the compositor that runs the session"
 }
 
 files() {
@@ -1439,8 +1439,8 @@ SCRIPT
     env -i PATH="$PATH" HOME="$home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-files \
         XDG_DATA_HOME="$data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/files-$canvas/config" VK_DRIVER_FILES="$manifest" MLX_CANVAS="$canvas" \
         LANG=en_US.UTF-8 TZ=UTC \
-        timeout 90 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-files \
-        --launcher none --dock none --topbar none --run "$work/mlx-files" > "$work/files-$canvas.log" 2>&1 || status=$?
+        timeout 90 "$work/kepler" --verbose --no-fps --renderer cpu --socket nested-files \
+        --launcher none --dock none --topbar none --run "$work/polaris" > "$work/files-$canvas.log" 2>&1 || status=$?
     wait "$host_pid" || fail "files: the test host failed" "$work/files-$canvas-host.log"
     rm -rf -- "$runtime"
     local log="$work/files-$canvas.log"
@@ -1491,7 +1491,7 @@ files_targets() {
     echo c > "$base/home/Work/Sub/c.txt"
     cat > "$base/drops.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-files" &
+"$work/polaris" &
 sleep 14
 exec "$work/drag-source" "file://$base/home/Work"
 SCRIPT
@@ -1572,7 +1572,7 @@ SCRIPT
     for _ in $(seq 1 50); do [[ -S "$runtime/host-targets" ]] && break; sleep 0.1; done
     env -i PATH="$PATH" HOME="$base/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-targets \
         XDG_DATA_HOME="$base/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$base/config" MLX_CANVAS=cpu LANG=en_US.UTF-8 TZ=UTC \
-        timeout 90 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-targets \
+        timeout 90 "$work/kepler" --verbose --no-fps --renderer cpu --socket nested-targets \
         --launcher none --dock none --topbar none --run "$base/drops.sh" > "$base/drops.log" 2>&1 || status=$?
     wait "$host_pid" || fail "files targets: the test host failed" "$base/host.log"
     rm -rf -- "$runtime"
@@ -1624,7 +1624,7 @@ appearance() {
         status=0
         env -i PATH="$PATH" HOME="$base/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-look XDG_CONFIG_HOME="$base/config" \
             XDG_DATA_HOME="$base/data" MLX_CANVAS=cpu LANG=en_US.UTF-8 "${scheme[@]}" \
-            timeout 30 "$work/mlx-files" "$base/home" > "$base/$run.log" 2>&1 || status=$?
+            timeout 30 "$work/polaris" "$base/home" > "$base/$run.log" 2>&1 || status=$?
         wait "$host_pid" || fail "appearance: the test host failed" "$base/$run-host.log"
         wait
         rm -rf -- "$runtime"
@@ -1647,7 +1647,7 @@ PY
     echo "ok   appearance: an app turns light when appearance.conf says so, MLX_COLOR_SCHEME fixes the scheme"
 }
 
-# The dock's stack opening in the file manager (mlx-files on the PATH):
+# The dock's stack opening in the file manager (polaris on the PATH):
 # the window grows out of the stack, the stack goes. The dock holds the
 # terminal and the Downloads folder (at x 548); its stack of ten entries
 # has its Open button at (741, 473).
@@ -1662,7 +1662,7 @@ zoom() {
     echo paper > "$base/home/Downloads/paper.pdf"
     cp tests/support/png/rgba8.png "$base/home/Downloads/pic.png"
     printf 'terminal\n' > "$base/config/mlx/dock"
-    ln -s "$work/mlx-files" "$base/bin/mlx-files"
+    ln -s "$work/polaris" "$base/bin/polaris"
     cat > "$base.script" <<SCRIPT
 wait 3500
 pointer 548 728
@@ -1685,8 +1685,8 @@ SCRIPT
     env -i PATH="$base/bin:$PATH" HOME="$base/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-zoom \
         XDG_DATA_HOME="$base/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$base/config" VK_DRIVER_FILES="$manifest" \
         LANG=en_US.UTF-8 TZ=UTC \
-        timeout 90 "$work/mlx-compositor" --verbose --no-fps --renderer "$renderer" --socket nested-zoom \
-        --launcher none --dock "$work/mlx-dock" --topbar none > "$base.log" 2>&1 || status=$?
+        timeout 90 "$work/kepler" --verbose --no-fps --renderer "$renderer" --socket nested-zoom \
+        --launcher none --dock "$work/orbit" --topbar none > "$base.log" 2>&1 || status=$?
     wait "$host_pid" || fail "zoom: the test host failed" "$base-host.log"
     rm -rf -- "$runtime"
     local log="$base.log"
@@ -1730,13 +1730,13 @@ SCRIPT
     env -i PATH="$PATH" HOME="$work/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-topbar \
         XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" XDG_CONFIG_HOME="$work/config" MLX_CANVAS=cpu \
         LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/none" \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar \
-        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar.log" 2>&1 || status=$?
+        timeout 60 "$work/kepler" --verbose --no-fps --renderer cpu --socket nested-topbar \
+        --terminal "$work/vector" --launcher none --dock none --topbar "$work/horizon" --run "$work/vector" > "$work/topbar.log" 2>&1 || status=$?
     wait "$host_pid" || fail "topbar: the test host failed" "$work/topbar-host.log"
     rm -rf -- "$runtime"
     [[ $status -eq 0 ]] || fail "topbar: the compositor exited with status $status" "$work/topbar.log"
     local log="$work/topbar.log"
-    grep -q "^layer: mlx-topbar 1024x30 at 0,0 in layer 2" "$log" || fail "topbar: the bar is not along the top in the top layer" "$log"
+    grep -q "^layer: horizon 1024x30 at 0,0 in layer 2" "$log" || fail "topbar: the bar is not along the top in the top layer" "$log"
     # The terminal came before the bar reserved the top: it moved below.
     grep -q "^window: 652x396 at 24,24" "$log" || fail "topbar: the terminal did not open at (24, 24)" "$log"
     grep -q "^maximize: Mlx Terminal" "$log" && grep -q "^window: 1020x700 at 2,52" "$log" || fail "topbar: the maximized terminal is not below the bar" "$log"
@@ -1915,15 +1915,15 @@ SCRIPT
     for _ in $(seq 1 50); do [[ -S "$runtime/host-topbar-bus" ]] && break; sleep 0.1; done
     # XDG_DATA_DIRS: the bus starts none of the system's services.
     local bus=(env -i PATH="$PATH" HOME="$work/bar-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/bar-config" XDG_DATA_DIRS="$work/none" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus")
-    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/topbar-ipcd.log" 2>&1 &
+    "${bus[@]}" "$work/synapse" --address "$runtime/bus" > "$work/topbar-ipcd.log" 2>&1 &
     local ipcd_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
-    "${bus[@]}" "$work/mlx-audiod" --output null --input none --no-pulse > "$work/topbar-audiod.log" 2>&1 &
+    "${bus[@]}" "$work/resonance" --output null --input none --no-pulse > "$work/topbar-audiod.log" 2>&1 &
     local audiod_pid=$!
     "${bus[@]}" "$work/topbar-test-services" "$work/services.log" > "$work/topbar-services.log" 2>&1 &
     local services_pid=$!
     # The control centre is hidden here (control_centre has it). Once the
-    # calendar was shown, the items are arranged anew (as mlx-settings' Top
+    # calendar was shown, the items are arranged anew (as control' Top
     # bar page writes them): the clock first, the sound hidden, the battery
     # last.
     printf 'control = off\n' > "$work/bar-config/mlx/topbar.conf"
@@ -1936,8 +1936,8 @@ SCRIPT
     local status=0
     "${bus[@]}" WAYLAND_DISPLAY=host-topbar-bus XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
         LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/power" MLX_TOPBAR_VERBOSE=1 \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-topbar-bus \
-        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/mlx-terminal" > "$work/topbar-bus.log" 2>&1 || status=$?
+        timeout 60 "$work/kepler" --verbose --no-fps --renderer cpu --socket nested-topbar-bus \
+        --terminal "$work/vector" --launcher none --dock none --topbar "$work/horizon" --run "$work/vector" > "$work/topbar-bus.log" 2>&1 || status=$?
     wait "$host_pid" || fail "topbar on the bus: the test host failed" "$work/topbar-bus-host.log"
     wait "$writer_pid" 2> /dev/null || true
     kill "$services_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
@@ -2010,14 +2010,14 @@ PY
     echo "ok   the top bar on a session bus: what plays, a tray icon with its menu, the volume, the battery and the calendar; the items rearranged; the session menu locks and logs out"
 }
 
-# Notifications and the control centre: mlx-notifyd shows a notification
+# Notifications and the control centre: beacon shows a notification
 # with a default action as a bubble (a click on it answers mlx-notify -w),
 # then five that go after 1.5 s; the bar's control centre (859+28, its
-# popup 656..1016 x 36..) gets the list from mlx-notifyd on the bus and
+# popup 656..1016 x 36..) gets the list from beacon on the bus and
 # shows it newest first, with a dot on the widget until it is opened. In
 # it: one is dismissed by its close button (the ones under it glide up),
 # the volume is dragged, Do Not Disturb and night light are turned on
-# (mlx-notifyd and compositor.conf hear of it), all are cleared, dark mode
+# (beacon and compositor.conf hear of it), all are cleared, dark mode
 # is turned off (the portal, mlx-capture --portal, keeps the look and
 # tells it: the bar and the bubbles turn light), and the screenshot tile
 # saves the screen into ~/Bilder and says so in a notification (Do Not
@@ -2033,7 +2033,7 @@ control_centre() {
     printf 'unknown\n' > "$work/net/lo/operstate"
     cat > "$work/cc.sh" <<SCRIPT
 #!/bin/sh
-"$work/mlx-notifyd" --verbose > "$work/notifyd.log" 2>&1 &
+"$work/beacon" --verbose > "$work/notifyd.log" 2>&1 &
 sleep 1
 "$work/mlx-notify" -a Frage -A default=Öffnen -t 0 -w "Eine Frage" "Ein Klick beantwortet sie." > "$work/notify-action.log" &
 sleep 3
@@ -2046,7 +2046,7 @@ sleep 0.3
 "$work/mlx-notify" -a Terminal -t 1500 "Build fertig" "312 Tests bestanden" &
 sleep 0.3
 "$work/mlx-notify" -a Updates -t 1500 "Updates verfügbar" "5 Pakete" &
-exec "$work/mlx-terminal"
+exec "$work/vector"
 SCRIPT
     chmod +x "$work/cc.sh"
     cat > "$work/cc.script" <<SCRIPT
@@ -2116,21 +2116,21 @@ SCRIPT
     XDG_RUNTIME_DIR=$runtime "$work/test-host" host-cc "$work/us.xkb" "$work/cc.script" > "$work/cc-host.log" 2>&1 &
     local host_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/host-cc" ]] && break; sleep 0.1; done
-    # No system bus (no mlx-netd): the network tile reads MLX_TOPBAR_NET.
+    # No system bus (no nexus): the network tile reads MLX_TOPBAR_NET.
     # XDG_DATA_DIRS: the bus starts none of the system's services.
     local bus=(env -i PATH="$work:$PATH" HOME="$work/cc-home" XDG_RUNTIME_DIR="$runtime" XDG_CONFIG_HOME="$work/cc-config" XDG_DATA_DIRS="$work/none" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" DBUS_SYSTEM_BUS_ADDRESS="unix:path=$runtime/no-system-bus")
-    "${bus[@]}" "$work/mlx-ipcd" --address "$runtime/bus" > "$work/cc-ipcd.log" 2>&1 &
+    "${bus[@]}" "$work/synapse" --address "$runtime/bus" > "$work/cc-ipcd.log" 2>&1 &
     local ipcd_pid=$!
     for _ in $(seq 1 50); do [[ -S "$runtime/bus" ]] && break; sleep 0.1; done
-    "${bus[@]}" "$work/mlx-audiod" --output null --input none --no-pulse > "$work/cc-audiod.log" 2>&1 &
+    "${bus[@]}" "$work/resonance" --output null --input none --no-pulse > "$work/cc-audiod.log" 2>&1 &
     local audiod_pid=$!
     "${bus[@]}" "$work/mlx-capture" --portal --verbose > "$work/cc-portal.log" 2>&1 &
     local portal_pid=$!
     local status=0
     "${bus[@]}" WAYLAND_DISPLAY=host-cc XDG_DATA_HOME="$work/data" XDG_DATA_DIRS="$work/none" MLX_CANVAS=cpu \
         LANG=de_DE.UTF-8 TZ="CET-1CEST,M3.5.0,M10.5.0/3" MLX_TOPBAR_TIME=1727445900 MLX_TOPBAR_POWER="$work/power" MLX_TOPBAR_NET="$work/net" MLX_TOPBAR_VERBOSE=1 \
-        timeout 60 "$work/mlx-compositor" --verbose --no-fps --renderer cpu --socket nested-cc \
-        --terminal "$work/mlx-terminal" --launcher none --dock none --topbar "$work/mlx-topbar" --run "$work/cc.sh" > "$work/cc.log" 2>&1 || status=$?
+        timeout 60 "$work/kepler" --verbose --no-fps --renderer cpu --socket nested-cc \
+        --terminal "$work/vector" --launcher none --dock none --topbar "$work/horizon" --run "$work/cc.sh" > "$work/cc.log" 2>&1 || status=$?
     wait "$host_pid" || fail "control centre: the test host failed" "$work/cc-host.log"
     kill "$portal_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
     wait "$portal_pid" "$audiod_pid" "$ipcd_pid" 2> /dev/null || true
@@ -2144,7 +2144,7 @@ SCRIPT
         grep -q "$line" "$log" || fail "control centre: no \"$line\"" "$log"
     done
     for line in "^notifyd: serving org.freedesktop.Notifications$" "^notifyd: notification 6 \"Updates verfügbar\"$" "^notifyd: do not disturb on$" "^notifyd: cleared$" "^notifyd: notification 7 \"Bildschirmfoto gespeichert\"$"; do
-        grep -q "$line" "$work/notifyd.log" || fail "control centre: mlx-notifyd said no \"$line\"" "$work/notifyd.log"
+        grep -q "$line" "$work/notifyd.log" || fail "control centre: beacon said no \"$line\"" "$work/notifyd.log"
     done
     grep -q "^portal: color-scheme light$" "$work/cc-portal.log" || fail "control centre: the portal did not take the light look" "$work/cc-portal.log"
     grep -qx "color-scheme = light" "$work/cc-config/mlx/appearance.conf" || fail "control centre: the look is not kept in appearance.conf" "$work/cc-portal.log"
@@ -2237,12 +2237,12 @@ host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$runtime/host-error" ]] && break; sleep 0.1; done
 status=0
 env -i PATH="$PATH" HOME="$work/error-home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=host-error MLX_CANVAS=cpu \
-    timeout 30 "$work/mlx-files" "$work/error-home" > "$work/error.log" 2>&1 || status=$?
+    timeout 30 "$work/polaris" "$work/error-home" > "$work/error.log" 2>&1 || status=$?
 wait "$host_pid" || true
 rm -rf -- "$runtime"
 [[ $status -eq 1 ]] || fail "error: the file manager exited with $status after a protocol error, not 1" "$work/error.log"
-grep -q "^mlx-files: failed: the compositor ended the connection: protocol error 0 on xdg_toplevel [0-9]*: a protocol error from the test host$" "$work/error.log" \
+grep -q "^polaris: failed: the compositor ended the connection: protocol error 0 on xdg_toplevel [0-9]*: a protocol error from the test host$" "$work/error.log" \
     && grep -q "^  from projects/desktop/files/main.mlx:[0-9]*:main+0x" "$work/error.log" || fail "error: the protocol error is not reported with where it came" "$work/error.log"
-grep -q "^crash	[0-9]*	mlx-files	the compositor ended the connection: protocol error" "$work/error-home/.local/state/mlx/crashes.log" 2> /dev/null \
+grep -q "^crash	[0-9]*	polaris	the compositor ended the connection: protocol error" "$work/error-home/.local/state/mlx/crashes.log" 2> /dev/null \
     || fail "error: the protocol error is not in crashes.log" "$work/error.log"
 echo "ok   a protocol error ending the file manager is reported and kept in crashes.log"

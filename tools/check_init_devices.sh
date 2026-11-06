@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Focused mlx-init device check. All device nodes and sysfs records are
+# Focused impulse device check. All device nodes and sysfs records are
 # synthetic; the host's /dev and /sys are never modified.
 set -euo pipefail
 
@@ -13,7 +13,7 @@ trap cleanup EXIT
 fail() { echo "FAIL $1" >&2; exit 1; }
 
 "$compiler" --quiet tools/init-devices-test/main.mlx -o "$work/init-devices-test"
-echo "ok   mlx-init device helper builds"
+echo "ok   impulse device helper builds"
 
 # The fixture's groups: the caller's, unless that is root's (gid 0, which
 # the device module reads as "no such group", as it would be for video,

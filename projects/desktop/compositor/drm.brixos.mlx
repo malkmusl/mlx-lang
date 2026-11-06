@@ -1,0 +1,347 @@
+// The freestanding backend on brixOS (the compiler takes this file for
+// drm.mlx there): the compositor drives the display and reads the input
+// devices through brixOS's own nodes, as drm.mlx does through DRM/KMS and
+// evdev on Linux.
+//
+// - Output: /devices/framebuffer (its geometry read: width, height, pitch,
+//   format; its pixels mapped by node_map). Frames are composed on the
+//   CPU into memory of our own (entries.composeCpu) and the changed rows
+//   copied into the framebuffer (red and blue swapped when it is RGBX).
+//   There is no vertical blank to wait for: frame callbacks go out as
+//   the copy is done.
+// - Input: /devices/keyboard (PS/2 scancodes, set 1: the main block's
+//   codes are evdev's key codes, the extended ones (0xE0) are mapped) and
+//   /devices/mouse (PS/2 packets: buttons, dx, dy). The keymap is
+//   xkb.mlx's (without XKB data here: the modifiers tracked for the
+//   usual keys, clients given no keymap and typing by their own US
+//   layout).
+// - No sessions, no VTs: switchTo does nothing.
+const std = @import("std")
+const brix = std.os.brix
+const evdev = std.linux.evdev
+const wl = @import("std.wayland")
+const ui = @import("std.ui")
+const state = @import("./state.mlx")
+const entries = @import("./entries.mlx")
+const scene = @import("./scene.mlx")
+const kms = @import("./kms.mlx")
+const xkb = @import("./xkb.mlx")
+
+const Compositor = state.Compositor
+
+pub const Backend = struct {
+    compositor: *Compositor
+    framebuffer: brix.Handle
+    keyboard: brix.Handle
+    mouse: brix.Handle
+    address: usize
+    pitch: usize
+    swap: bool
+    // Our frame (width * height * 4), composed on the CPU.
+    frame: [*]u8
+    // (For display.mlx, which describes the monitor from it.)
+    output: kms.Output
+    keyboardState: xkb.Keyboard
+    // The scancode before: an extended one under way.
+    extended: bool
+    // The mouse's packet under way.
+    packet: [3]u8
+    packetLength: usize
+    buttons: u32
+    presented: usize
+}
+
+fn word(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var k: usize = 8
+    while k > 0 {
+        k -= 1
+        value = (value << 8) | @intCast(usize, bytes[at + k])
+    }
+    return value
+}
+
+fn keyboardOf(backend: *Backend) -> *xkb.Keyboard {
+    unsafe { return @ptrCast(*xkb.Keyboard, &backend.*.keyboardState) }
+}
+
+fn outputOf(backend: *Backend) -> *kms.Output {
+    unsafe { return @ptrCast(*kms.Output, &backend.*.output) }
+}
+
+// The display opened and mapped; false without one.
+fn openDisplay(backend: *Backend) -> bool {
+    const opened = brix.open(0, "/devices/framebuffer", brix.Open.READ | brix.Open.WRITE, 0)
+    if opened < 0 { return false }
+    backend.*.framebuffer = @intCast(u32, opened)
+    var record: [32]u8 = undefined
+    if brix.read(backend.*.framebuffer, record[0..32], 0) != 32 { return false }
+    const words: [*]const u8 = &record
+    const width = word(words, 0)
+    const height = word(words, 8)
+    backend.*.pitch = word(words, 16)
+    backend.*.swap = word(words, 24) == 2
+    if width == 0 || height == 0 { return false }
+    const mapped = brix.mapNode(backend.*.framebuffer, 0, backend.*.pitch * height)
+    if mapped < 0 { return false }
+    backend.*.address = @bitCast(usize, mapped)
+    const output = outputOf(backend)
+    output.*.width = width
+    output.*.height = height
+    output.*.refresh = 60
+    output.*.millihertz = 60000
+    output.*.connectorType = 0
+    output.*.connectorTypeId = 1
+    output.*.modeCount = 0
+    output.*.gammaSize = 0
+    output.*.temperature = 0
+    output.*.flipPending = false
+    output.*.needsModeset = false
+    return true
+}
+
+pub fn start(compositor: *Compositor) -> usize {
+    const memory = state.allocate(compositor, @sizeOf(Backend))
+    const backend: *Backend = unsafe { @ptrCast(*Backend, memory) }
+    backend.*.compositor = compositor
+    backend.*.extended = false
+    backend.*.packetLength = 0
+    backend.*.buttons = 0
+    backend.*.presented = 0
+    if !openDisplay(backend) {
+        state.say("brix: no display (/devices/framebuffer)\n")
+        return 0
+    }
+    compositor.*.width = outputOf(backend).*.width
+    compositor.*.height = outputOf(backend).*.height
+    backend.*.frame = state.allocate(compositor, compositor.*.width * compositor.*.height * 4)
+    compositor.*.lastFrame = backend.*.frame
+    compositor.*.lastFrameStride = compositor.*.width * 4
+    compositor.*.pointerX = @intCast(i32, compositor.*.width / 2)
+    compositor.*.pointerY = @intCast(i32, compositor.*.height / 2)
+    compositor.*.pointerInside = true
+    scene.damageAll(compositor)
+    _ = xkb.load(keyboardOf(backend), compositor)
+    const keyboard = brix.open(0, "/devices/keyboard", brix.Open.READ, 0)
+    backend.*.keyboard = if keyboard < 0 { 0 } else { @intCast(u32, keyboard) }
+    if keyboard < 0 { state.say("brix: no keyboard (/devices/keyboard)\n") }
+    const mouse = brix.open(0, "/devices/mouse", brix.Open.READ, 0)
+    backend.*.mouse = if mouse < 0 { 0 } else { @intCast(u32, mouse) }
+    if mouse < 0 { state.say("brix: no mouse (/devices/mouse)\n") }
+    return @intFromPtr(memory)
+}
+
+pub fn backendAt(address: usize) -> *Backend {
+    unsafe { return @ptrFromInt(*Backend, address) }
+}
+
+// The display, as kms.Output describes one (display.mlx reads it).
+pub fn output(backend: *Backend) -> *kms.Output { return outputOf(backend) }
+
+pub fn stop(backend: *Backend) -> void {
+    if backend.*.keyboard != 0 { _ = brix.close(backend.*.keyboard) }
+    if backend.*.mouse != 0 { _ = brix.close(backend.*.mouse) }
+    _ = brix.unmap(backend.*.address, backend.*.pitch * outputOf(backend).*.height)
+    _ = brix.close(backend.*.framebuffer)
+}
+
+// ---------------------------------------------------------------------------
+// The event loop
+
+// The handles to wait on: the keyboard and the mouse.
+pub fn handles(backend: *Backend, list: [*]wl.Handle, capacity: usize) -> usize {
+    var count: usize = 0
+    if backend.*.keyboard != 0 && count < capacity {
+        list[count] = wl.Handle.fromDescriptor(@intCast(isize, backend.*.keyboard))
+        count += 1
+    }
+    if backend.*.mouse != 0 && count < capacity {
+        list[count] = wl.Handle.fromDescriptor(@intCast(isize, backend.*.mouse))
+        count += 1
+    }
+    return count
+}
+
+pub fn hasBufferedData(backend: *Backend) -> bool {
+    _ = backend
+    return false
+}
+
+fn now() -> u32 { return @intCast(u32, std.time.milliseconds() & 4294967295) }
+
+// Whether `handle` can be read now (the devices' reads would wait).
+fn readable(handle: brix.Handle) -> bool {
+    var items: [1]brix.WaitItem = undefined
+    items[0] = brix.WaitItem.{ .handle = handle, .want = brix.State.READABLE, .seen = 0, .reserved = 0 }
+    return brix.wait(items[0..1], brix.clock(brix.Clock.MONOTONIC)) > 0 && items[0].seen & brix.State.READABLE != 0
+}
+
+// An extended scancode (after 0xE0) as evdev's key code; 0 for one not
+// mapped.
+fn extendedKey(code: u8) -> u32 {
+    if code == 0x48 { return 103 }
+    if code == 0x50 { return 108 }
+    if code == 0x4B { return 105 }
+    if code == 0x4D { return 106 }
+    if code == 0x47 { return 102 }
+    if code == 0x4F { return 107 }
+    if code == 0x49 { return 104 }
+    if code == 0x51 { return 109 }
+    if code == 0x52 { return 110 }
+    if code == 0x53 { return 111 }
+    if code == 0x1C { return 96 }
+    if code == 0x1D { return 97 }
+    if code == 0x38 { return 100 }
+    if code == 0x35 { return 98 }
+    if code == 0x5B { return 125 }
+    if code == 0x5C { return 126 }
+    if code == 0x5D { return 127 }
+    return 0
+}
+
+fn keyEvent(backend: *Backend, code: u32, pressed: bool) -> void {
+    const compositor = backend.*.compositor
+    const keyboard = keyboardOf(backend)
+    const changed = xkb.key(keyboard, code, pressed)
+    entries.keyboardKey(compositor, code, pressed)
+    if changed { entries.keyboardModifiers(compositor, keyboard.*.depressed, keyboard.*.latched, keyboard.*.locked, keyboard.*.group) }
+}
+
+fn readKeyboard(backend: *Backend) -> void {
+    var codes: [64]u8 = undefined
+    const got = brix.read(backend.*.keyboard, codes[0..64], brix.STREAM)
+    if got <= 0 { return }
+    backend.*.compositor.*.time = now()
+    var k: usize = 0
+    while k < @bitCast(usize, got) {
+        const byte = codes[k]
+        k += 1
+        if byte == 0xE0 {
+            backend.*.extended = true
+            continue
+        }
+        const pressed = byte & 0x80 == 0
+        const scancode = byte & 0x7F
+        var code: u32 = 0
+        if backend.*.extended {
+            backend.*.extended = false
+            code = extendedKey(scancode)
+        } else {
+            code = @intCast(u32, scancode)
+        }
+        if code != 0 && code < 256 { keyEvent(backend, code, pressed) }
+    }
+}
+
+fn clamp(value: i32, limit: usize) -> i32 {
+    if value < 0 { return 0 }
+    if value >= @intCast(i32, limit) { return @intCast(i32, limit) - 1 }
+    return value
+}
+
+// One packet: the buttons' changes, then the motion.
+fn mousePacket(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    const first = backend.*.packet[0]
+    var dx: i32 = @intCast(i32, backend.*.packet[1])
+    var dy: i32 = @intCast(i32, backend.*.packet[2])
+    if first & 0x10 != 0 { dx -= 256 }
+    if first & 0x20 != 0 { dy -= 256 }
+    // Up on the mouse is down on the screen.
+    dy = 0 - dy
+    const buttons = @intCast(u32, first & 7)
+    var bit: u32 = 0
+    while bit < 3 {
+        const mask = @intCast(u32, 1) << @intCast(u5, bit)
+        const was = backend.*.buttons & mask != 0
+        const is = buttons & mask != 0
+        if was != is {
+            // 0 left, 1 right, 2 middle: evdev's BTN_LEFT, BTN_RIGHT, BTN_MIDDLE.
+            const button = if bit == 0 { evdev.BTN_LEFT } else if bit == 1 { evdev.BTN_RIGHT } else { evdev.BTN_MIDDLE }
+            const keyboard = keyboardOf(backend)
+            if is {
+                keyboard.*.pressedButtons = keyboard.*.pressedButtons | (@intCast(u32, 1) << @intCast(u5, button - evdev.BTN_LEFT))
+            } else {
+                keyboard.*.pressedButtons = keyboard.*.pressedButtons & (4294967295 ^ (@intCast(u32, 1) << @intCast(u5, button - evdev.BTN_LEFT)))
+            }
+            entries.pointerButton(compositor, button, is)
+        }
+        bit += 1
+    }
+    backend.*.buttons = buttons
+    if dx != 0 || dy != 0 {
+        entries.pointerRelative(compositor, dx, dy, dx, dy)
+        entries.pointerMotion(compositor, clamp(compositor.*.pointerX + dx, compositor.*.width), clamp(compositor.*.pointerY + dy, compositor.*.height))
+    }
+}
+
+fn readMouse(backend: *Backend) -> void {
+    var bytes: [96]u8 = undefined
+    const got = brix.read(backend.*.mouse, bytes[0..96], brix.STREAM)
+    if got <= 0 { return }
+    backend.*.compositor.*.time = now()
+    var k: usize = 0
+    while k < @bitCast(usize, got) {
+        const byte = bytes[k]
+        k += 1
+        // A packet starts with bit 3 set: anything else out of step is
+        // dropped until one does.
+        if backend.*.packetLength == 0 && byte & 0x08 == 0 { continue }
+        backend.*.packet[backend.*.packetLength] = byte
+        backend.*.packetLength += 1
+        if backend.*.packetLength == 3 {
+            backend.*.packetLength = 0
+            mousePacket(backend)
+        }
+    }
+}
+
+pub fn dispatch(backend: *Backend) -> void {
+    if backend.*.keyboard != 0 && readable(backend.*.keyboard) { readKeyboard(backend) }
+    if backend.*.mouse != 0 && readable(backend.*.mouse) { readMouse(backend) }
+}
+
+// Composes and shows a frame when something changed.
+pub fn present(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    if !compositor.*.needsRedraw { return }
+    const start = state.microseconds()
+    var changed: ui.Rect = undefined
+    const region = scene.takeDamage(compositor, 0, &changed)
+    entries.composeCpu(compositor, backend.*.frame, changed)
+    // The changed rows into the framebuffer.
+    var row = region.y
+    while row < ui.bottom(region) {
+        const at = @intCast(usize, row)
+        const left = @intCast(usize, region.x)
+        const count = @intCast(usize, region.width)
+        const target = backend.*.address + at * backend.*.pitch + left * 4
+        const source = @intFromPtr(backend.*.frame) + (at * compositor.*.width + left) * 4
+        if backend.*.swap {
+            const from: [*]const u32 = unsafe { @ptrFromInt([*]const u32, source) }
+            const to: [*]u32 = unsafe { @ptrFromInt([*]u32, target) }
+            var column: usize = 0
+            while column < count {
+                const pixel = from[column]
+                to[column] = (pixel & 4278255360) | ((pixel & 255) << 16) | ((pixel >> 16) & 255)
+                column += 1
+            }
+        } else {
+            state.copyPixels(target, source, count)
+        }
+        row += 1
+    }
+    compositor.*.lastFrame = backend.*.frame
+    compositor.*.lastFrameStride = compositor.*.width * 4
+    if backend.*.presented == 0 && compositor.*.verbose { state.say("brix: first frame on screen\n") }
+    backend.*.presented += 1
+    compositor.*.frames += 1
+    entries.frameDone(compositor, now())
+    state.countPresent(compositor, start)
+}
+
+// Ctrl+Alt+F<number>: no virtual terminals here.
+pub fn switchTo(backend: *Backend, number: u32) -> void {
+    _ = backend
+    _ = number
+}

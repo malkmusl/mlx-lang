@@ -1,0 +1,1126 @@
+// impulse on brixOS: the first process. The kernel starts
+// /system/programs/impulse with the serial console as its input, output,
+// errors and session. It reads the services (config.mlx: the NAME.service
+// files of /system/settings/init/services, as on Linux), starts them in
+// their order with process_spawn, each with roles of its own (a terminal
+// named by `stdio` as its input, output, errors and session, its group in
+// front of it; else a stream whose output the init appends to
+// LOGDIR/NAME.log, or says itself with `log = console`), supervises them
+// (ended ones start again after a pause that grows while they keep
+// failing), answers impulsectl over a FIFO, and ends the system with
+// system_power (poweroff, reboot, halt). Everything is brixOS's own
+// interface (std.os.brix): handles, one wait, events, no signals.
+//
+// The boot is shown on the screen: with a display (/devices/framebuffer)
+// and ignition in the programs, the splash is started first, on two
+// streams (its input: the requests, Plymouth's bytes as the init sends
+// them, "U" a service starting, "u" the progress; its output: the
+// answers), and told to quit, keeping its picture, before a service with
+// `screen = yes` (mlx-console) takes the screen.
+//
+//     mlx4 --target=x86_64-brixos projects/init/brixos.mlx -o impulse
+//
+// Options:
+//     --services DIR    the NAME.service files (default /system/settings/init/services)
+//     --control PATH    the control FIFO (default /temporary/init/control)
+//     --log DIR         the services' logs, DIR/NAME.log (default /temporary/logs)
+//     --no-splash       no boot screen
+//     --verbose         say every start, stop, ready and ending
+//
+// The control: a request is one line "REPLY VERB [NAME]" written to the
+// FIFO, REPLY a FIFO the asker made and reads; the answer is the text
+// impulse answers on Linux (status lines, then "ok" or "error: WHY").
+const std = @import("std")
+const crash = @import("std.crash")
+const brix = std.os.brix
+const config = @import("./config.mlx")
+
+const Service = config.Service
+const State = config.State
+
+const FIRST_DELAY: usize = 1000
+const MAX_DELAY: usize = 30000
+const STABLE_RUN: usize = 60000
+const READY_POLL: usize = 100
+const MAX_ARGUMENTS: usize = 64
+const MAX_ENVIRONMENT: usize = 48
+const PROGRAMS: []const u8 = "/system/programs"
+const SPLASH: []const u8 = "/system/programs/ignition"
+const NULL_DEVICE: []const u8 = "/devices/null"
+const FRAMEBUFFER: []const u8 = "/devices/framebuffer"
+// The splash answers a quit within this (ms); the services end within
+// this after a shutdown's terminate.
+const SPLASH_QUIT_TIMEOUT: usize = 5000
+// The picture stays at least this long (ms) before a service takes the
+// screen: a boot screen seen for a tenth of a second says nothing.
+const SPLASH_MINIMUM: usize = 3000
+const SHUTDOWN_TIMEOUT: usize = 8000
+// What one wait may watch (the kernel's limit): the control, the splash,
+// then the services' processes, then their output streams.
+const MAX_ITEMS: usize = 64
+const REPLY_CAPACITY: usize = 4000
+
+// Plymouth's bytes.
+const REQUEST_UPDATE: u8 = 85
+const REQUEST_PROGRESS: u8 = 117
+const REQUEST_QUIT: u8 = 81
+const REQUEST_MESSAGE: u8 = 77
+const REQUEST_HIDE_MESSAGE: u8 = 109
+const ACK: u8 = 6
+
+const Init = struct {
+    state: *State
+    control: brix.Handle
+    // The splash: its process, the requests' write end, the answers' read
+    // end (0: none).
+    splash: brix.Handle
+    splashRequests: brix.Handle
+    splashAnswers: brix.Handle
+    splashQuit: bool
+    splashStartedAt: usize
+    // How many services have been started this boot, of how many wanted
+    // (the progress the splash shows); at the shutdown, how many have
+    // ended of how many ran.
+    started: usize
+    wanted: usize
+    shuttingDown: bool
+    stopped: usize
+    toStop: usize
+    // The wait items and which service each belongs to.
+    items: [MAX_ITEMS]brix.WaitItem
+    owners: [MAX_ITEMS]usize
+    itemKinds: [MAX_ITEMS]u8
+    itemCount: usize
+    reply: [REPLY_CAPACITY]u8
+    replyLength: usize
+    noSplash: bool
+}
+
+const ITEM_CONTROL: u8 = 1
+const ITEM_SPLASH_ANSWERS: u8 = 2
+const ITEM_PROCESS: u8 = 3
+const ITEM_LOG: u8 = 4
+const ITEM_SPLASH_PROCESS: u8 = 5
+
+fn now() -> usize { return std.time.milliseconds() }
+
+fn smaller(left: usize, right: usize) -> usize { return if left < right { left } else { right } }
+
+fn same(left: []const u8, right: []const u8) -> bool { return std.text.same(left, right) }
+
+fn zeroTerminated(into: *[1024]u8, value: []const u8) -> [*]const u8 {
+    const pointer: [*]u8 = into
+    return std.text.zeroTerminated(pointer, 1024, value)
+}
+
+// ---------------------------------------------------------------------------
+// Starting
+
+fn dependenciesMet(state: *State, service: *Service) -> bool {
+    const list = config.after(service)
+    var start: usize = 0
+    while start < list.length {
+        while start < list.length && list[start] == 32 { start += 1 }
+        var end = start
+        while end < list.length && list[end] != 32 { end += 1 }
+        if end > start {
+            const found = config.find(state, list[start..end])
+            if found == null {
+                if !service.*.warned {
+                    config.sayAbout(service, "waits for a service that is not defined (after)", false, 0)
+                    service.*.warned = true
+                }
+            } else {
+                const dependency = found.?
+                if dependency.*.state != config.RUNNING && dependency.*.state != config.DONE { return false }
+            }
+        }
+        start = end
+    }
+    return true
+}
+
+fn advance(bytes: [*]u8, by: usize) -> [*]const u8 {
+    return unsafe { @ptrFromInt([*]const u8, @intFromPtr(bytes) + by) }
+}
+
+// The exec line as arguments (double quotes keep spaces in one).
+fn splitCommand(line: []const u8, storage: [*]u8, capacity: usize, items: [*][*]const u8) -> usize {
+    var count: usize = 0
+    var used: usize = 0
+    var at: usize = 0
+    while at < line.length && count + 1 < MAX_ARGUMENTS {
+        while at < line.length && (line[at] == 32 || line[at] == 9) { at += 1 }
+        if at >= line.length { break }
+        items[count] = advance(storage, used)
+        var quoted = false
+        while at < line.length && (quoted || (line[at] != 32 && line[at] != 9)) {
+            if line[at] == 34 {
+                quoted = !quoted
+            } else if used + 1 < capacity {
+                storage[used] = line[at]
+                used += 1
+            }
+            at += 1
+        }
+        storage[used] = 0
+        used += 1
+        count += 1
+    }
+    unsafe { items[count] = @ptrFromInt([*]const u8, 0) }
+    return count
+}
+
+fn addEntry(storage: [*]u8, capacity: usize, used: usize, items: [*][*]const u8, count: *usize, key: []const u8, value: []const u8) -> usize {
+    if count.* + 1 >= MAX_ENVIRONMENT { return used }
+    var at = used
+    items[count.*] = advance(storage, at)
+    at = std.text.append(storage, at, capacity, key)
+    at = std.text.append(storage, at, capacity, value)
+    if at < capacity { storage[at] = 0 }
+    count.* += 1
+    return at + 1
+}
+
+fn buildEnvironment(state: *State, service: *Service, storage: [*]u8, capacity: usize, items: [*][*]const u8) -> usize {
+    var count: usize = 0
+    var used: usize = 0
+    used = addEntry(storage, capacity, used, items, &count, "PATH=", PROGRAMS)
+    used = addEntry(storage, capacity, used, items, &count, "HOME=", "/users/root")
+    used = addEntry(storage, capacity, used, items, &count, "USER=", "root")
+    used = addEntry(storage, capacity, used, items, &count, "LOGNAME=", "root")
+    used = addEntry(storage, capacity, used, items, &count, "SHELL=", "/system/programs/flux")
+    used = addEntry(storage, capacity, used, items, &count, "TERM=", "vt100")
+    used = addEntry(storage, capacity, used, items, &count, "XDG_RUNTIME_DIR=", "/temporary")
+    used = addEntry(storage, capacity, used, items, &count, "MLX_INIT_CONTROL=", config.controlPath(state))
+    const extra = config.environment(service)
+    var start: usize = 0
+    while start < extra.length {
+        var end = start
+        while end < extra.length && extra[end] != 0 { end += 1 }
+        if end > start { used = addEntry(storage, capacity, used, items, &count, extra[start..end], "") }
+        start = end + 1
+    }
+    unsafe { items[count] = @ptrFromInt([*]const u8, 0) }
+    return count
+}
+
+// The program of an exec line: its node, opened (a name without a slash
+// is looked for in /system/programs).
+fn openProgram(name: [*]const u8) -> isize {
+    var length: usize = 0
+    var hasSlash = false
+    while name[length] != 0 {
+        if name[length] == 47 { hasSlash = true }
+        length += 1
+    }
+    if hasSlash { return brix.open(0, name[0..length], brix.Open.READ, 0) }
+    var path: [1024]u8 = undefined
+    const pointer: [*]u8 = &path
+    var at = std.text.append(pointer, 0, 1024, PROGRAMS)
+    at = std.text.append(pointer, at, 1024, "/")
+    at = std.text.append(pointer, at, 1024, name[0..length])
+    return brix.open(0, pointer[0..at], brix.Open.READ, 0)
+}
+
+// The log file of a service (LOGDIR/NAME.log, made anew each boot), or
+// 0.
+fn openLog(state: *State, service: *Service) -> brix.Handle {
+    var path: [1024]u8 = undefined
+    const pointer: [*]u8 = &path
+    var at: usize = 0
+    if service.*.logLength > 0 && !same(config.log(service), "console") {
+        at = std.text.append(pointer, 0, 1024, config.log(service))
+    } else {
+        _ = std.fs.makeDirectories(config.logDirectory(state), 0x1ED)
+        at = std.text.append(pointer, 0, 1024, config.logDirectory(state))
+        at = std.text.append(pointer, at, 1024, "/")
+        at = std.text.append(pointer, at, 1024, config.name(service))
+        at = std.text.append(pointer, at, 1024, ".log")
+    }
+    const opened = brix.open(0, pointer[0..at], brix.Open.WRITE | brix.Open.CREATE | brix.Open.TRUNCATE, 0x1A4)
+    if opened < 0 {
+        config.sayAbout(service, "cannot open its log file", false, 0)
+        return 0
+    }
+    return @intCast(u32, opened)
+}
+
+// Starts `service`: its process with its roles, its group; the splash is
+// told. Failures leave it stopped, said.
+fn spawn(init: *Init, service: *Service, at: usize) -> void {
+    const state = init.*.state
+    if service.*.execLength == 0 {
+        service.*.state = config.STOPPED
+        service.*.wanted = false
+        return
+    }
+    if service.*.screen && init.*.splash != 0 { endSplash(init, true) }
+    var argumentStorage: [config.LINE_CAPACITY + MAX_ARGUMENTS]u8 = undefined
+    var arguments: [MAX_ARGUMENTS][*]const u8 = undefined
+    const argumentItems: [*][*]const u8 = &arguments
+    const argumentBytes: [*]u8 = &argumentStorage
+    const argumentCount = splitCommand(config.exec(service), argumentBytes, config.LINE_CAPACITY + MAX_ARGUMENTS, argumentItems)
+    if argumentCount == 0 {
+        config.sayAbout(service, "has an empty exec line", false, 0)
+        service.*.state = config.STOPPED
+        service.*.wanted = false
+        return
+    }
+    var environmentStorage: [config.ENVIRONMENT_CAPACITY + 1024]u8 = undefined
+    var environment: [MAX_ENVIRONMENT][*]const u8 = undefined
+    const environmentItems: [*][*]const u8 = &environment
+    const environmentBytes: [*]u8 = &environmentStorage
+    _ = buildEnvironment(state, service, environmentBytes, config.ENVIRONMENT_CAPACITY + 1024, environmentItems)
+
+    const program = openProgram(arguments[0])
+    if program < 0 {
+        config.sayAbout(service, "its program is not there", false, 0)
+        service.*.state = config.STOPPED
+        service.*.wanted = false
+        return
+    }
+    // The handles: a terminal for all three and the session, or the null
+    // device and a stream of its own.
+    var handles: [3]u32 = undefined
+    var roles: [4]brix.RoleRecord = undefined
+    var roleCount: usize = 3
+    var terminal: brix.Handle = 0
+    var ends: [2]u32 = [2]u32{ 0, 0 }
+    var null_device: brix.Handle = 0
+    if service.*.stdioLength > 0 {
+        const opened = brix.open(0, config.stdio(service), brix.Open.READ | brix.Open.WRITE, 0)
+        if opened < 0 {
+            config.sayAbout(service, "cannot open its stdio terminal", false, 0)
+            _ = brix.close(@intCast(u32, program))
+            service.*.state = config.STOPPED
+            service.*.wanted = false
+            return
+        }
+        terminal = @intCast(u32, opened)
+        handles[0] = terminal
+        handles[1] = terminal
+        handles[2] = terminal
+        roles[3] = brix.RoleRecord.{ .role = brix.Role.SESSION, .handle = terminal }
+        roleCount = 4
+    } else {
+        const nulled = brix.open(0, NULL_DEVICE, brix.Open.READ, 0)
+        if brix.streamPair(&ends) < 0 || nulled < 0 {
+            config.sayAbout(service, "no stream for its output", false, 0)
+            _ = brix.close(@intCast(u32, program))
+            service.*.state = config.STOPPED
+            service.*.wanted = false
+            return
+        }
+        null_device = @intCast(u32, nulled)
+        handles[0] = null_device
+        handles[1] = ends[1]
+        handles[2] = ends[1]
+    }
+    roles[0] = brix.RoleRecord.{ .role = brix.Role.INPUT, .handle = handles[0] }
+    roles[1] = brix.RoleRecord.{ .role = brix.Role.OUTPUT, .handle = handles[1] }
+    roles[2] = brix.RoleRecord.{ .role = brix.Role.ERRORS, .handle = handles[2] }
+    const begin = brix.Start.{ .arguments = @intFromPtr(argumentItems), .environment = @intFromPtr(environmentItems), .roles = @intFromPtr(&roles), .count = roleCount }
+    const spawned = brix.spawn(@intCast(u32, program), &begin, handles[0..3])
+    _ = brix.close(@intCast(u32, program))
+    if null_device != 0 { _ = brix.close(null_device) }
+    if ends[1] != 0 { _ = brix.close(ends[1]) }
+    if spawned < 0 {
+        config.sayAbout(service, "could not be started", false, 0)
+        if terminal != 0 { _ = brix.close(terminal) }
+        if ends[0] != 0 { _ = brix.close(ends[0]) }
+        service.*.state = config.STOPPED
+        service.*.wanted = false
+        return
+    }
+    service.*.handle = @intCast(u32, spawned)
+    service.*.pid = @intCast(isize, service.*.handle)
+    // Its own group: what a stop ends; in front of its terminal.
+    const group = brix.joinGroup(service.*.handle, 0)
+    if group >= 0 {
+        service.*.groupHandle = @intCast(u32, group)
+        if terminal != 0 { _ = brix.front(terminal, service.*.groupHandle) }
+    }
+    if terminal != 0 { _ = brix.close(terminal) }
+    if ends[0] != 0 {
+        service.*.logStream = ends[0]
+        service.*.logFile = if same(config.log(service), "console") { 0 } else { openLog(state, service) }
+        service.*.logOffset = 0
+    }
+    state.*.sequence += 1
+    service.*.order = state.*.sequence
+    service.*.startedAt = at
+    service.*.killed = false
+    service.*.lastStatus = 0
+    service.*.state = config.STARTING
+    if service.*.readyLength == 0 && !service.*.oneshot { service.*.state = config.RUNNING }
+    if state.*.verbose || service.*.restarts > 0 { config.sayAbout(service, "started", false, 0) }
+    init.*.started += 1
+    tellSplash(init, service)
+}
+
+// ---------------------------------------------------------------------------
+// Supervising
+
+fn ended(state: *State, service: *Service, status: usize, at: usize) -> void {
+    service.*.pid = 0
+    service.*.lastStatus = status
+    if service.*.state == config.STOPPING {
+        service.*.state = config.STOPPED
+        if service.*.wanted {
+            service.*.delay = 0
+            if state.*.verbose { config.sayAbout(service, "stopped, starting again", false, 0) }
+        } else {
+            config.sayAbout(service, "stopped", false, 0)
+        }
+        return
+    }
+    if service.*.oneshot && status == 0 {
+        service.*.state = config.DONE
+        if state.*.verbose { config.sayAbout(service, "finished", false, 0) }
+        return
+    }
+    const ran = at - service.*.startedAt
+    if status == 0 { config.sayAbout(service, "ended", false, 0) } else { config.sayAbout(service, "ended with status ", true, status) }
+    if !service.*.wanted || service.*.restart == config.RESTART_NEVER || (service.*.restart == config.RESTART_ON_FAILURE && status == 0) {
+        service.*.state = config.STOPPED
+        return
+    }
+    if ran >= STABLE_RUN || service.*.delay == 0 { service.*.delay = FIRST_DELAY } else { service.*.delay = smaller(service.*.delay * 2, MAX_DELAY) }
+    service.*.restartAt = at + service.*.delay
+    service.*.restarts += 1
+    service.*.state = config.RESTARTING
+    config.sayAbout(service, "starting again in ms: ", true, service.*.delay)
+}
+
+// What the service's output stream holds, into its log (or said).
+fn relayLog(state: *State, service: *Service) -> void {
+    var buffer: [4096]u8 = undefined
+    const got = brix.read(service.*.logStream, buffer[0..4096], brix.STREAM)
+    if got <= 0 {
+        if got == 0 || got == -brix.Status.peer_gone {
+            _ = brix.close(service.*.logStream)
+            service.*.logStream = 0
+            if service.*.logFile != 0 {
+                _ = brix.close(service.*.logFile)
+                service.*.logFile = 0
+            }
+        }
+        return
+    }
+    const length = @bitCast(usize, got)
+    if service.*.logFile != 0 {
+        const written = brix.write(service.*.logFile, buffer[0..length], service.*.logOffset)
+        if written > 0 { service.*.logOffset += @bitCast(usize, written) }
+    } else {
+        _ = brix.write(brix.ofDescriptor(2), buffer[0..length], brix.STREAM)
+    }
+    _ = state
+}
+
+// The process ended: its status, its handles let go.
+fn reap(init: *Init, service: *Service) -> void {
+    var change = brix.Change.{ .what = 0, .value = 0, .detail = 0, .reserved = 0 }
+    var status: usize = 255
+    if brix.change(service.*.handle, &change) == 0 {
+        status = if change.what == brix.Change.EXITED { @intCast(usize, change.value & 255) } else { 128 + @intCast(usize, change.value & 127) }
+    }
+    _ = brix.close(service.*.handle)
+    service.*.handle = 0
+    if service.*.groupHandle != 0 {
+        _ = brix.close(service.*.groupHandle)
+        service.*.groupHandle = 0
+    }
+    // What it wrote last.
+    while service.*.logStream != 0 {
+        var item: [1]brix.WaitItem = undefined
+        item[0] = brix.WaitItem.{ .handle = service.*.logStream, .want = brix.State.READABLE | brix.State.PEER_GONE, .seen = 0, .reserved = 0 }
+        if brix.wait(item[0..1], brix.clock(brix.Clock.MONOTONIC)) <= 0 { break }
+        if item[0].seen & brix.State.READABLE == 0 {
+            _ = brix.close(service.*.logStream)
+            service.*.logStream = 0
+            break
+        }
+        relayLog(init.*.state, service)
+    }
+    if service.*.logFile != 0 {
+        _ = brix.close(service.*.logFile)
+        service.*.logFile = 0
+    }
+    ended(init.*.state, service, status, now())
+}
+
+fn terminate(service: *Service, at: usize) -> void {
+    if service.*.groupHandle != 0 { _ = brix.sendEvent(service.*.groupHandle, brix.Event.TERMINATE) } else { _ = brix.sendEvent(service.*.handle, brix.Event.TERMINATE) }
+    service.*.state = config.STOPPING
+    service.*.stoppingSince = at
+    service.*.killed = false
+}
+
+fn kill(service: *Service) -> void {
+    if service.*.groupHandle != 0 { _ = brix.sendEvent(service.*.groupHandle, brix.Event.KILL) } else { _ = brix.sendEvent(service.*.handle, brix.Event.KILL) }
+    service.*.killed = true
+}
+
+fn ready(service: *Service) -> bool {
+    var path: [1024]u8 = undefined
+    const wanted = config.ready(service)
+    if std.text.startsWith(wanted, "socket:") { return std.fs.exists(zeroTerminated(&path, wanted[7..wanted.length])) }
+    return std.fs.exists(zeroTerminated(&path, wanted))
+}
+
+// The services' states moved on: due starts, stops, kills, readiness.
+fn tick(init: *Init) -> void {
+    const state = init.*.state
+    const at = now()
+    var changed = true
+    while changed {
+        changed = false
+        var index: usize = 0
+        while index < state.*.count {
+            const service = config.serviceAt(state, index)
+            if service.*.state == config.STOPPING {
+                if !service.*.killed && at - service.*.stoppingSince >= service.*.stopTimeout {
+                    kill(service)
+                    config.sayAbout(service, "did not stop in time, killed", false, 0)
+                }
+            } else if !service.*.wanted {
+                if service.*.handle != 0 {
+                    terminate(service, at)
+                } else if service.*.state == config.WAITING || service.*.state == config.RESTARTING {
+                    service.*.state = config.STOPPED
+                }
+            } else if service.*.handle == 0 && (service.*.state == config.STOPPED || service.*.state == config.WAITING || (service.*.state == config.RESTARTING && at >= service.*.restartAt)) {
+                if dependenciesMet(state, service) && !splashStillWanted(init, service, at) {
+                    spawn(init, service, at)
+                    changed = true
+                } else if service.*.state != config.WAITING {
+                    service.*.state = config.WAITING
+                }
+            } else if service.*.state == config.STARTING && !service.*.oneshot {
+                if service.*.readyLength == 0 || ready(service) {
+                    service.*.state = config.RUNNING
+                    changed = true
+                    if state.*.verbose { config.sayAbout(service, "ready", false, 0) }
+                } else if at - service.*.startedAt >= service.*.readyTimeout {
+                    service.*.state = config.RUNNING
+                    changed = true
+                    config.sayAbout(service, "not ready in time (its ready path is not there), taken as running", false, 0)
+                }
+            }
+            index += 1
+        }
+    }
+}
+
+// Whether the screen service `service` waits for the splash's minimum.
+fn splashStillWanted(init: *Init, service: *Service, at: usize) -> bool {
+    return service.*.screen && init.*.splash != 0 && at < init.*.splashStartedAt + SPLASH_MINIMUM
+}
+
+// How long the wait may take (ms); -1 for ever.
+fn nextTimeout(init: *Init) -> isize {
+    const state = init.*.state
+    const at = now()
+    var timeout: isize = -1
+    var index: usize = 0
+    while index < state.*.count {
+        const service = config.serviceAt(state, index)
+        var due: usize = 18446744073709551615
+        if service.*.state == config.WAITING && splashStillWanted(init, service, at) {
+            due = init.*.splashStartedAt + SPLASH_MINIMUM - at
+        } else if service.*.state == config.RESTARTING {
+            due = if service.*.restartAt > at { service.*.restartAt - at } else { 0 }
+        } else if service.*.state == config.STOPPING && !service.*.killed {
+            const deadline = service.*.stoppingSince + service.*.stopTimeout
+            due = if deadline > at { deadline - at } else { 0 }
+        } else if service.*.state == config.STARTING && !service.*.oneshot {
+            due = READY_POLL
+        }
+        if due != 18446744073709551615 && (timeout < 0 || due < @intCast(usize, timeout)) { timeout = @intCast(isize, due) }
+        index += 1
+    }
+    return timeout
+}
+
+fn anyRunning(state: *State) -> bool {
+    var index: usize = 0
+    while index < state.*.count {
+        if config.serviceAt(state, index).*.handle != 0 { return true }
+        index += 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// The splash
+
+fn sendSplash(init: *Init, command: u8, argument: []const u8) -> void {
+    if init.*.splashRequests == 0 { return }
+    var bytes: [260]u8 = undefined
+    bytes[0] = command
+    var length: usize = 2
+    if argument.length == 0 {
+        bytes[1] = 0
+    } else {
+        bytes[1] = 2
+        const size = if argument.length > 250 { 250 } else { argument.length }
+        bytes[2] = @intCast(u8, size + 1)
+        var k: usize = 0
+        while k < size {
+            bytes[3 + k] = argument[k]
+            k += 1
+        }
+        bytes[3 + size] = 0
+        length = 4 + size
+    }
+    _ = brix.write(init.*.splashRequests, bytes[0..length], brix.STREAM)
+}
+
+fn tellSplash(init: *Init, service: *Service) -> void {
+    if init.*.splash == 0 { return }
+    sendSplash(init, REQUEST_UPDATE, config.name(service))
+    var text: [8]u8 = undefined
+    const pointer: [*]u8 = &text
+    var percent: usize = 100
+    if init.*.shuttingDown {
+        if init.*.toStop != 0 { percent = smaller(100, init.*.stopped * 100 / init.*.toStop) }
+    } else if init.*.wanted != 0 {
+        percent = smaller(100, init.*.started * 100 / init.*.wanted)
+    }
+    const length = std.text.appendUnsigned(pointer, 0, 8, percent)
+    sendSplash(init, REQUEST_PROGRESS, pointer[0..length])
+}
+
+// impulsectl's message for the screen: shown by the splash ("M"), or
+// taken away ("m") when empty.
+fn showMessage(init: *Init, text: []const u8) -> bool {
+    if init.*.splash == 0 { return false }
+    sendSplash(init, if text.length == 0 { REQUEST_HIDE_MESSAGE } else { REQUEST_MESSAGE }, text)
+    return true
+}
+
+// ignition on the screen, when there is one, in `mode` (boot,
+// shutdown, reboot).
+fn startSplash(init: *Init, mode: [*]const u8) -> void {
+    var path: [1024]u8 = undefined
+    if init.*.noSplash || !std.fs.exists(zeroTerminated(&path, FRAMEBUFFER)) || !std.fs.exists(zeroTerminated(&path, SPLASH)) { return }
+    var requests: [2]u32 = undefined
+    var answers: [2]u32 = undefined
+    if brix.streamPair(&requests) < 0 || brix.streamPair(&answers) < 0 { return }
+    const program = brix.open(0, SPLASH, brix.Open.READ, 0)
+    if program < 0 { return }
+    var argv: [4][*]const u8 = undefined
+    argv[0] = "ignition\x00".pointer
+    argv[1] = "--mode\x00".pointer
+    argv[2] = mode
+    argv[3] = unsafe { @ptrFromInt([*]const u8, 0) }
+    var environment: [2][*]const u8 = undefined
+    environment[0] = "PATH=/system/programs\x00".pointer
+    environment[1] = unsafe { @ptrFromInt([*]const u8, 0) }
+    const argvPointer: [*][*]const u8 = &argv
+    const environmentPointer: [*][*]const u8 = &environment
+    var handles: [3]u32 = [3]u32{ requests[0], answers[1], brix.ofDescriptor(2) }
+    var roles: [3]brix.RoleRecord = undefined
+    roles[0] = brix.RoleRecord.{ .role = brix.Role.INPUT, .handle = requests[0] }
+    roles[1] = brix.RoleRecord.{ .role = brix.Role.OUTPUT, .handle = answers[1] }
+    roles[2] = brix.RoleRecord.{ .role = brix.Role.ERRORS, .handle = handles[2] }
+    const begin = brix.Start.{ .arguments = @intFromPtr(argvPointer), .environment = @intFromPtr(environmentPointer), .roles = @intFromPtr(&roles), .count = 3 }
+    const spawned = brix.spawn(@intCast(u32, program), &begin, handles[0..3])
+    _ = brix.close(@intCast(u32, program))
+    _ = brix.close(requests[0])
+    _ = brix.close(answers[1])
+    if spawned < 0 {
+        _ = brix.close(requests[1])
+        _ = brix.close(answers[0])
+        config.say("the boot screen could not be started")
+        return
+    }
+    init.*.splash = @intCast(u32, spawned)
+    init.*.splashRequests = requests[1]
+    init.*.splashAnswers = answers[0]
+    init.*.splashQuit = false
+    init.*.splashStartedAt = now()
+    if init.*.state.*.verbose { config.say("the boot screen is up") }
+}
+
+// The splash kept up until its minimum has passed (unless it ends by
+// itself): a shutdown screen seen for a tenth of a second says nothing
+// either.
+fn holdSplash(init: *Init) -> void {
+    if init.*.splash == 0 { return }
+    const at = now()
+    if at >= init.*.splashStartedAt + SPLASH_MINIMUM { return }
+    var items: [1]brix.WaitItem = undefined
+    items[0] = brix.WaitItem.{ .handle = init.*.splash, .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+    _ = brix.wait(items[0..1], brix.clock(brix.Clock.MONOTONIC) + (init.*.splashStartedAt + SPLASH_MINIMUM - at) * 1000000)
+}
+
+// The splash is told to quit (keeping its picture when `retain`) and
+// waited for: its answer, then its end.
+fn endSplash(init: *Init, retain: bool) -> void {
+    if init.*.splash == 0 { return }
+    if !init.*.splashQuit {
+        sendSplash(init, REQUEST_QUIT, if retain { "\x01" } else { "" })
+        init.*.splashQuit = true
+    }
+    const deadline = brix.clock(brix.Clock.MONOTONIC) + SPLASH_QUIT_TIMEOUT * 1000000
+    var items: [1]brix.WaitItem = undefined
+    items[0] = brix.WaitItem.{ .handle = init.*.splash, .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+    _ = brix.wait(items[0..1], deadline)
+    if items[0].seen & brix.State.ENDED == 0 {
+        config.say("the boot screen did not quit in time")
+        _ = brix.sendEvent(init.*.splash, brix.Event.KILL)
+    }
+    _ = brix.close(init.*.splash)
+    _ = brix.close(init.*.splashRequests)
+    _ = brix.close(init.*.splashAnswers)
+    init.*.splash = 0
+    init.*.splashRequests = 0
+    init.*.splashAnswers = 0
+}
+
+// An answer from the splash (taken; its ACKs are not waited for one by
+// one), or its end on its own.
+fn splashAnswered(init: *Init) -> void {
+    var bytes: [64]u8 = undefined
+    const got = brix.read(init.*.splashAnswers, bytes[0..64], brix.STREAM)
+    if got <= 0 && got != -brix.Status.would_block { splashGone(init) }
+}
+
+fn splashGone(init: *Init) -> void {
+    if init.*.splash == 0 { return }
+    if !init.*.splashQuit { config.say("the boot screen ended") }
+    _ = brix.close(init.*.splash)
+    _ = brix.close(init.*.splashRequests)
+    _ = brix.close(init.*.splashAnswers)
+    init.*.splash = 0
+    init.*.splashRequests = 0
+    init.*.splashAnswers = 0
+}
+
+// ---------------------------------------------------------------------------
+// The control FIFO
+
+fn stateName(service: *const Service) -> []const u8 {
+    if service.*.state == config.WAITING { return "waiting" }
+    if service.*.state == config.STARTING { return "starting" }
+    if service.*.state == config.RUNNING { return "running" }
+    if service.*.state == config.DONE { return "done" }
+    if service.*.state == config.STOPPING { return "stopping" }
+    if service.*.state == config.RESTARTING { return "restarting" }
+    if service.*.wanted && service.*.lastStatus != 0 { return "failed" }
+    if service.*.disabled && !service.*.wanted { return "disabled" }
+    return "stopped"
+}
+
+fn before(left: []const u8, right: []const u8) -> bool {
+    var index: usize = 0
+    while index < left.length && index < right.length {
+        if left[index] != right[index] { return left[index] < right[index] }
+        index += 1
+    }
+    return left.length < right.length
+}
+
+fn nextByName(state: *State, previous: ?*Service) -> ?*Service {
+    var best: ?*Service = null
+    var index: usize = 0
+    while index < state.*.count {
+        const service = config.serviceAt(state, index)
+        const after_previous = previous == null || before(config.name(previous.?), config.name(service))
+        if after_previous && (best == null || before(config.name(service), config.name(best.?))) { best = service }
+        index += 1
+    }
+    return best
+}
+
+fn replyAppend(init: *Init, text: []const u8) -> void {
+    const into: [*]u8 = &init.*.reply
+    init.*.replyLength = std.text.append(into, init.*.replyLength, REPLY_CAPACITY, text)
+}
+
+fn replyNumber(init: *Init, value: usize) -> void {
+    const into: [*]u8 = &init.*.reply
+    init.*.replyLength = std.text.appendUnsigned(into, init.*.replyLength, REPLY_CAPACITY, value)
+}
+
+fn status(init: *Init) -> void {
+    const state = init.*.state
+    const at = now()
+    var current = nextByName(state, null)
+    while current != null {
+        const service = current.?
+        if init.*.replyLength + 200 > REPLY_CAPACITY { break }
+        replyAppend(init, config.name(service))
+        replyAppend(init, "\t")
+        replyAppend(init, stateName(service))
+        replyAppend(init, "\t")
+        replyNumber(init, @intCast(usize, service.*.handle))
+        replyAppend(init, "\t")
+        replyNumber(init, service.*.restarts)
+        replyAppend(init, "\t")
+        const since: usize = if service.*.handle != 0 && at >= service.*.startedAt { (at - service.*.startedAt) / 1000 } else { 0 }
+        replyNumber(init, since)
+        replyAppend(init, "\t")
+        replyAppend(init, config.description(service))
+        replyAppend(init, "\n")
+        current = nextByName(state, service)
+    }
+}
+
+fn word(request: []const u8) -> []const u8 {
+    var end: usize = 0
+    while end < request.length && request[end] != 32 { end += 1 }
+    return request[0..end]
+}
+
+fn rest(request: []const u8) -> []const u8 {
+    var start: usize = 0
+    while start < request.length && request[start] != 32 { start += 1 }
+    while start < request.length && request[start] == 32 { start += 1 }
+    return std.text.trimmed(request[start..request.length])
+}
+
+// A request handled: the reply built.
+fn handle(init: *Init, request: []const u8) -> void {
+    const state = init.*.state
+    init.*.replyLength = 0
+    const verb = word(request)
+    const target = rest(request)
+    if same(verb, "status") {
+        status(init)
+        replyAppend(init, "ok\n")
+        return
+    }
+    if same(verb, "reload") {
+        _ = config.load(state)
+        countWanted(init)
+        tick(init)
+        replyAppend(init, "ok\n")
+        return
+    }
+    if same(verb, "message") {
+        if !showMessage(init, target) {
+            replyAppend(init, "error: no boot screen is up\n")
+            return
+        }
+        replyAppend(init, "ok\n")
+        return
+    }
+    if same(verb, "poweroff") || same(verb, "reboot") || same(verb, "halt") {
+        replyAppend(init, "ok\n")
+        state.*.action = if same(verb, "poweroff") { config.ACTION_POWEROFF } else if same(verb, "reboot") { config.ACTION_REBOOT } else { config.ACTION_HALT }
+        state.*.running = false
+        config.sayWith("", verb, false, 0)
+        return
+    }
+    if same(verb, "start") || same(verb, "stop") || same(verb, "restart") {
+        if target.length == 0 {
+            replyAppend(init, "error: which service?\n")
+            return
+        }
+        const found = config.find(state, target)
+        if found == null {
+            replyAppend(init, "error: no such service: ")
+            replyAppend(init, target)
+            replyAppend(init, "\n")
+            return
+        }
+        const service = found.?
+        if same(verb, "start") {
+            if service.*.wanted && service.*.handle != 0 {
+                replyAppend(init, "error: already running: ")
+                replyAppend(init, target)
+                replyAppend(init, "\n")
+                return
+            }
+            service.*.wanted = true
+            service.*.delay = 0
+            service.*.lastStatus = 0
+            if service.*.state == config.RESTARTING || service.*.state == config.DONE { service.*.state = config.STOPPED }
+        } else if same(verb, "stop") {
+            service.*.wanted = false
+        } else {
+            service.*.wanted = true
+            service.*.delay = 0
+            if service.*.handle != 0 { terminate(service, now()) } else if service.*.state == config.RESTARTING || service.*.state == config.DONE { service.*.state = config.STOPPED }
+        }
+        tick(init)
+        replyAppend(init, "ok\n")
+        return
+    }
+    replyAppend(init, "error: unknown request: ")
+    replyAppend(init, verb)
+    replyAppend(init, "\n")
+}
+
+// A line from the control FIFO: "REPLY VERB [NAME]"; the reply written
+// to the asker's FIFO.
+fn controlReadable(init: *Init) -> void {
+    var line: [1024]u8 = undefined
+    const got = brix.read(init.*.control, line[0..1024], brix.STREAM)
+    if got <= 0 { return }
+    var length = @bitCast(usize, got)
+    // One request at a time; a second line in the same read is answered
+    // too.
+    var start: usize = 0
+    while start < length {
+        var end = start
+        while end < length && line[end] != 10 { end += 1 }
+        const request = std.text.trimmed(line[start..end])
+        start = end + 1
+        if request.length == 0 { continue }
+        const replyPath = word(request)
+        handle(init, rest(request))
+        const opened = brix.open(0, replyPath, brix.Open.WRITE, 0)
+        if opened < 0 { continue }
+        const reply: [*]const u8 = &init.*.reply
+        var written: usize = 0
+        while written < init.*.replyLength {
+            const put = brix.write(@intCast(u32, opened), reply[written..init.*.replyLength], brix.STREAM)
+            if put <= 0 { break }
+            written += @bitCast(usize, put)
+        }
+        _ = brix.close(@intCast(u32, opened))
+    }
+}
+
+fn openControl(init: *Init) -> bool {
+    const state = init.*.state
+    const path = config.controlPath(state)
+    var slash = path.length
+    while slash > 0 && path[slash - 1] != 47 { slash -= 1 }
+    if slash > 1 { _ = std.fs.makeDirectories(path[0..slash - 1], 0x1ED) }
+    _ = brix.remove(0, path)
+    if brix.make(0, path, brix.NodeKind.FIFO, 0x180, "") < 0 {
+        config.say("cannot make the control FIFO")
+        return false
+    }
+    // Both ends held: never a hangup between askers.
+    const opened = brix.open(0, path, brix.Open.READ | brix.Open.WRITE, 0)
+    if opened < 0 {
+        config.say("cannot open the control FIFO")
+        return false
+    }
+    init.*.control = @intCast(u32, opened)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The loop
+
+fn countWanted(init: *Init) -> void {
+    const state = init.*.state
+    init.*.wanted = 0
+    var index: usize = 0
+    while index < state.*.count {
+        if config.serviceAt(state, index).*.wanted { init.*.wanted += 1 }
+        index += 1
+    }
+}
+
+fn addItem(init: *Init, handle: brix.Handle, want: u32, kind: u8, owner: usize) -> void {
+    if init.*.itemCount >= MAX_ITEMS { return }
+    init.*.items[init.*.itemCount] = brix.WaitItem.{ .handle = handle, .want = want, .seen = 0, .reserved = 0 }
+    init.*.itemKinds[init.*.itemCount] = kind
+    init.*.owners[init.*.itemCount] = owner
+    init.*.itemCount += 1
+}
+
+fn serve(init: *Init) -> void {
+    const state = init.*.state
+    while state.*.running {
+        tick(init)
+        init.*.itemCount = 0
+        addItem(init, init.*.control, brix.State.READABLE, ITEM_CONTROL, 0)
+        if init.*.splash != 0 {
+            addItem(init, init.*.splashAnswers, brix.State.READABLE | brix.State.PEER_GONE, ITEM_SPLASH_ANSWERS, 0)
+            addItem(init, init.*.splash, brix.State.ENDED, ITEM_SPLASH_PROCESS, 0)
+        }
+        var index: usize = 0
+        while index < state.*.count {
+            const service = config.serviceAt(state, index)
+            if service.*.handle != 0 { addItem(init, service.*.handle, brix.State.ENDED, ITEM_PROCESS, index) }
+            index += 1
+        }
+        index = 0
+        while index < state.*.count {
+            const service = config.serviceAt(state, index)
+            if service.*.logStream != 0 { addItem(init, service.*.logStream, brix.State.READABLE | brix.State.PEER_GONE, ITEM_LOG, index) }
+            index += 1
+        }
+        const timeout = nextTimeout(init)
+        const deadline = if timeout < 0 { brix.FOREVER } else { brix.clock(brix.Clock.MONOTONIC) + @intCast(usize, timeout) * 1000000 }
+        const readyCount = brix.wait(init.*.items[0..init.*.itemCount], deadline)
+        if readyCount <= 0 { continue }
+        var k: usize = 0
+        while k < init.*.itemCount {
+            // (seen is the whole state: only the wanted bits count.)
+            const seen = init.*.items[k].seen & init.*.items[k].want
+            const kind = init.*.itemKinds[k]
+            if seen != 0 {
+                if kind == ITEM_CONTROL {
+                    controlReadable(init)
+                } else if kind == ITEM_SPLASH_ANSWERS {
+                    if init.*.splash != 0 { splashAnswered(init) }
+                } else if kind == ITEM_SPLASH_PROCESS {
+                    if init.*.splash != 0 && seen & brix.State.ENDED != 0 { splashGone(init) }
+                } else if kind == ITEM_LOG {
+                    const service = config.serviceAt(state, init.*.owners[k])
+                    if service.*.logStream != 0 { relayLog(state, service) }
+                } else if kind == ITEM_PROCESS {
+                    const service = config.serviceAt(state, init.*.owners[k])
+                    if service.*.handle != 0 && seen & brix.State.ENDED != 0 { reap(init, service) }
+                }
+            }
+            k += 1
+        }
+    }
+}
+
+// The shutdown: every service told to end (dependents first, as the
+// start order's reverse), waited for, killed when late; then the kernel.
+fn shutdown(init: *Init) -> void {
+    const state = init.*.state
+    // The boot screen, when still up, makes way for the shutdown's (in
+    // its shutdown or reboot mode: "Stopping NAME" as each service ends).
+    endSplash(init, false)
+    init.*.shuttingDown = true
+    init.*.stopped = 0
+    init.*.toStop = 0
+    var index: usize = 0
+    while index < state.*.count {
+        if config.serviceAt(state, index).*.handle != 0 { init.*.toStop += 1 }
+        index += 1
+    }
+    startSplash(init, if state.*.action == config.ACTION_REBOOT { "reboot\x00".pointer } else { "shutdown\x00".pointer })
+    index = 0
+    while index < state.*.count {
+        const service = config.serviceAt(state, index)
+        service.*.wanted = false
+        if service.*.handle != 0 && service.*.state != config.STOPPING { terminate(service, now()) }
+        index += 1
+    }
+    const deadline = now() + SHUTDOWN_TIMEOUT
+    while anyRunning(state) && now() < deadline {
+        init.*.itemCount = 0
+        index = 0
+        while index < state.*.count {
+            const service = config.serviceAt(state, index)
+            if service.*.handle != 0 { addItem(init, service.*.handle, brix.State.ENDED, ITEM_PROCESS, index) }
+            index += 1
+        }
+        const remaining = deadline - now()
+        _ = brix.wait(init.*.items[0..init.*.itemCount], brix.clock(brix.Clock.MONOTONIC) + remaining * 1000000)
+        var k: usize = 0
+        while k < init.*.itemCount {
+            if init.*.items[k].seen & brix.State.ENDED != 0 {
+                const service = config.serviceAt(state, init.*.owners[k])
+                if service.*.handle != 0 {
+                    reap(init, service)
+                    init.*.stopped += 1
+                    tellSplash(init, service)
+                }
+            }
+            k += 1
+        }
+    }
+    index = 0
+    while index < state.*.count {
+        const service = config.serviceAt(state, index)
+        if service.*.handle != 0 {
+            config.sayAbout(service, "did not end, killed", false, 0)
+            kill(service)
+        }
+        index += 1
+    }
+    // The screen stays its minimum, fades out, then the machine goes.
+    holdSplash(init)
+    endSplash(init, false)
+    const kind = if state.*.action == config.ACTION_POWEROFF { brix.Power.POWEROFF } else if state.*.action == config.ACTION_REBOOT { brix.Power.REBOOT } else { brix.Power.HALT }
+    _ = brix.power(kind)
+    // Not the first process (started by hand): nothing more to do.
+    config.say("the system cannot be powered off from here (not the first process)")
+}
+
+fn usage() -> u8 {
+    config.say("usage: impulse [--services DIR] [--control PATH] [--log DIR] [--no-splash] [--verbose]")
+    return 2
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    _ = crash.install()
+    const allocator = std.heap.allocator()
+    const stateMemory = allocator.alloc(@sizeOf(State), 16)
+    const initMemory = allocator.alloc(@sizeOf(Init), 16)
+    if stateMemory == null || initMemory == null {
+        config.say("out of memory")
+        return 1
+    }
+    const state: *State = unsafe { @ptrCast(*State, stateMemory.?) }
+    const init: *Init = unsafe { @ptrCast(*Init, initMemory.?) }
+    state.*.count = 0
+    state.*.sequence = 0
+    state.*.verbose = false
+    state.*.pid1 = true
+    state.*.running = true
+    state.*.action = config.ACTION_NONE
+    state.*.listener = -1
+    state.*.signals = -1
+    state.*.eventLoop = -1
+    state.*.logRotateSize = 0
+    config.setServicesDirectory(state, "/system/settings/init/services")
+    config.setMountsFile(state, "")
+    config.setHostnameFile(state, "")
+    config.setControlPath(state, "/temporary/init/control")
+    config.setLogDirectory(state, "/temporary/logs")
+    config.setRuntimeLogDirectory(state, "/temporary/logs")
+    init.*.state = state
+    init.*.control = 0
+    init.*.splash = 0
+    init.*.splashRequests = 0
+    init.*.splashAnswers = 0
+    init.*.splashQuit = false
+    init.*.splashStartedAt = 0
+    init.*.started = 0
+    init.*.wanted = 0
+    init.*.shuttingDown = false
+    init.*.stopped = 0
+    init.*.toStop = 0
+    init.*.itemCount = 0
+    init.*.replyLength = 0
+    init.*.noSplash = false
+
+    const count = std.process.count(arguments)
+    var k: usize = 1
+    while k < count {
+        const argument = std.string.asSlice(std.process.argument(arguments, k))
+        if same(argument, "--services") && k + 1 < count {
+            k += 1
+            config.setServicesDirectory(state, std.string.asSlice(std.process.argument(arguments, k)))
+        } else if same(argument, "--control") && k + 1 < count {
+            k += 1
+            config.setControlPath(state, std.string.asSlice(std.process.argument(arguments, k)))
+        } else if same(argument, "--log") && k + 1 < count {
+            k += 1
+            config.setLogDirectory(state, std.string.asSlice(std.process.argument(arguments, k)))
+        } else if same(argument, "--verbose") {
+            state.*.verbose = true
+        } else if same(argument, "--no-splash") {
+            init.*.noSplash = true
+        } else {
+            return usage()
+        }
+        k += 1
+    }
+    config.say("brixOS's init")
+    if !openControl(init) { return 1 }
+    startSplash(init, "boot\x00".pointer)
+    const defined = config.load(state)
+    countWanted(init)
+    config.sayWith("services defined: ", "", true, defined)
+    serve(init)
+    shutdown(init)
+    return 0
+}

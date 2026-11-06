@@ -1,6 +1,6 @@
 # MLXIPC
 
-MLXIPC is the desktop's message bus: `mlx-ipcd`, a session bus that D-Bus
+MLXIPC is the desktop's message bus: `synapse`, a session bus that D-Bus
 programs use as they would dbus-daemon, with what the D-Bus session bus
 lacks: permissions per app, permissions services ask about, and direct
 channels between two apps past the bus, and a wire format of its own for
@@ -9,15 +9,15 @@ Mlx on `std.dbus` and `std.ipc` (no libc, no libdbus). MLX Audio
 (`projects/desktop/audio`, the PipeWire replacement) runs on it.
 
 ```sh
-mlx4 projects/desktop/ipc/main.mlx -o mlx-ipcd
+mlx4 projects/desktop/ipc/main.mlx -o synapse
 mlx4 projects/desktop/ipc/tool.mlx -o mlx-ipc
-./mlx-ipcd --run mlx-compositor          # a session on this bus
+./synapse --run kepler          # a session on this bus
 tools/check_ipc.sh                       # the end-to-end check
 tools/check_mpris.sh                     # Voyager's MPRIS player on the bus
 ```
 
 The desktop session (`mlx-session`, installed by
-`tools/install_compositor_session.sh`) runs the compositor on mlx-ipcd,
+`tools/install_compositor_session.sh`) runs the compositor on synapse,
 so everything started in it gets `DBUS_SESSION_BUS_ADDRESS`
 (`MLX_SESSION_IPC=no` turns that off).
 
@@ -48,24 +48,24 @@ PulseAudio apps).
 dbus-send, gdbus, busctl and dbus-monitor are checked against it
 (`tools/check_ipc.sh`).
 
-`mlx-ipcd --system` is the same bus as the system's: it listens at
+`synapse --system` is the same bus as the system's: it listens at
 `/run/mlx/bus` (or `--address`) with the socket open to every user, root
 alone may own names, the policy comes from `/etc/mlx/ipc.conf`, and it
 starts services only from `--services DIR` (the session's are not
 root's to start). Our programs look for it there by themselves:
-mlx-netd (`projects/network`) answers on it, and mlx-net, the top bar
-and mlx-settings ask it there; other programs reach it through
+nexus (`projects/network`) answers on it, and mlx-net, the top bar
+and control ask it there; other programs reach it through
 `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/mlx/bus` (the compositor's logind
 client reads that variable). `tools/install_network.sh` installs it as
-`mlx-ipcd.service` (systemd) and for mlx-init. Under systemd it is a
+`synapse.service` (systemd) and for impulse. Under systemd it is a
 `Type=notify` service: it sends `READY=1` to `NOTIFY_SOCKET` once the
-socket takes connections, so mlx-netd and mlx-login, ordered after it,
+socket takes connections, so nexus and sentinel, ordered after it,
 find the bus there (the variable is not passed on to the services it
 starts). It is where a display
 manager of the desktop's own would offer its login and seat services.
 
 Services that do something for an app ask the bus whether that app may
-(`org.mlx.IPC.Check`, below): MLX Audio for `audio.*`, mlx-netd for
+(`org.mlx.IPC.Check`, below): MLX Audio for `audio.*`, nexus for
 `network.control` (switching links, joining and forgetting networks).
 
 ## Permissions per app
@@ -83,7 +83,7 @@ runs as the same user. MLXIPC's is per app, as in hyprtavern:
   `send_destination` does.
 - And **use** a service's permission: `audio.play`, `audio.record`,
   `audio.monitor`, `audio.control` (MLX Audio), `network.control`
-  (mlx-netd, on the system bus). Services ask the bus
+  (nexus, on the system bus). Services ask the bus
   (`org.mlx.IPC.Check(s app's connection, s permission) -> b`) before
   they do what it names, so the rules for every service are in one
   place.
@@ -127,7 +127,7 @@ A refused call gets `org.freedesktop.DBus.Error.AccessDenied`. `ask`
 When the decision is to ask, the Check waits and the bus asks the
 permission agent: `org.mlx.PermissionAgent.Ask(s app, s permission, b
 sandboxed) -> (b allowed, b remember)` on whoever owns that name. It is
-`mlx-permissions` (`projects/desktop/permissions`), started from its
+`scope` (`projects/desktop/permissions`), started from its
 service file when nobody owns the name yet; it shows a dialog. The answer
 goes to every Check waiting on the same question. Remembered, it becomes
 a rule of `ipc.conf` (the app's other lines for that permission go);
@@ -141,7 +141,7 @@ MLX Audio ends a recording whose permission went.
 
 The bus keeps which app asked for which permission
 (`$XDG_STATE_HOME/mlx/ipc-seen`, `~/.local/state/mlx/ipc-seen`), for
-mlx-settings' Apps category (`projects/desktop/settings/permissions.mlx`),
+control' Apps category (`projects/desktop/settings/permissions.mlx`),
 which shows every app with Allow, Ask, Deny or Default per permission:
 
 - `org.mlx.IPC.ListPermissions() -> a(sssb)`: app, permission, decision,
@@ -181,10 +181,11 @@ socket. The bus tells the two apart by the first byte a connection sends
 carries every message between them: an Mlx program speaking natively
 calls a D-Bus service and is called by dbus-send and gdbus, a native
 service's signals reach D-Bus listeners, and dbus-monitor sees it all.
-`mlx-ipc --native` is the same tool on the native format
-(`native.mlx`); `tools/check_ipc.sh` runs it next to dbus-send, gdbus and
-dbus-monitor, and `tests/343_ipc_wire_runtime.mlx` checks the format
-itself.
+`mlx-ipc` speaks the native format by default (`native.mlx`); `--dbus`
+selects the D-Bus client (the compatibility path, `tool.mlx`), and
+`--native` is kept as an explicit alias for the default.
+`tools/check_ipc.sh` runs both next to dbus-send, gdbus and dbus-monitor,
+and `tests/343_ipc_wire_runtime.mlx` checks the format itself.
 
 Both formats carry the same messages (calls, replies, errors and signals,
 with the same header fields and the same type signatures), so nothing is
@@ -287,7 +288,7 @@ processors), one round trip:
 
 A round trip through the bus is four hops, each a wake-up of another
 process, and the bus's own work is about 2% of it (`mlx-profile` on
-mlx-ipcd: the rest is sendmsg, recvmsg and epoll_wait). So a small
+synapse: the rest is sendmsg, recvmsg and epoll_wait). So a small
 message costs what the kernel costs, in either format, and the way to
 go faster is fewer hops: a direct channel takes two, half the time. A
 large message costs its copies: they are made a word at a time, and a
@@ -319,27 +320,28 @@ mlx-ipc protocol NAME      what NAME's owner speaks: mlx or dbus
 mlx-ipc bench NAME COUNT [BYTES]
                            COUNT Echo round trips to NAME, each of a string
                            of BYTES (5): how long one took
-mlx-ipc --native COMMAND   on the native wire format: names, apps,
-                           protocol NAME, serve NAME, call NAME TEXT,
-                           connect NAME (prints the first native message's
-                           string), emit TEXT (the signal org.mlx.Echo.Said),
-                           bench NAME COUNT [BYTES], chbench NAME COUNT [BYTES]
-                           (the round trips over a direct channel)
+(the commands above use the native wire format by default: emit TEXT
+                           sends the signal org.mlx.Echo.Said, and chbench
+                           NAME COUNT [BYTES] times the round trips over a
+                           direct channel)
+mlx-ipc --dbus COMMAND     the same commands over the D-Bus client instead
+                           (std.dbus), for the bridge and foreign buses
+mlx-ipc --native COMMAND   an explicit alias for the native default
 ```
 
 ## Modules
 
 | File | What it does |
 | --- | --- |
-| `main.mlx` | mlx-ipcd: options, listening, signals (signalfd), the policy's directory (inotify), the event loop (epoll, std.turns), `--run` |
+| `main.mlx` | synapse: options, listening, signals (signalfd), the policy's directory (inotify), the event loop (epoll, std.turns), `--run` |
 | `state.mlx` | the records: bus, clients, names, match rules, waiting replies, policy, activation |
 | `bus.mlx` | clients, authentication (D-Bus's SASL, or the native preamble), names, match rules, routing, monitors; native messages carried to D-Bus form and back |
 | `driver.mlx` | what the bus answers itself (org.freedesktop.DBus, org.mlx.IPC) and its signals |
 | `policy.mlx` | who a connection is, the rules file, the decisions, rules written back (`setRule`) |
 | `prompts.mlx` | asking the user through the permission agent, answers for the session, the apps that asked, ListPermissions and SetPermission |
 | `activation.mlx` | `.service` files, starting services, calls waiting for them |
-| `tool.mlx` | mlx-ipc |
-| `native.mlx` | `mlx-ipc --native`: the commands on the native wire format (`std.ipc`) |
+| `tool.mlx` | mlx-ipc: dispatch (native by default, `--dbus` for the D-Bus client), and the D-Bus-client commands |
+| `native.mlx` | the native wire commands (`std.ipc`): mlx-ipc's default, and `--native` |
 
 ## Next
 

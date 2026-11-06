@@ -1,4 +1,4 @@
-# Hostile clients against mlx-ipcd (tools/check_ipc.sh): each sends what a
+# Hostile clients against synapse (tools/check_ipc.sh): each sends what a
 # well-behaved client never would, in MLXIPC's native format (std.ipc) or
 # in D-Bus, and must be dropped by the bus, which goes on serving the
 # others. Then connections that never say Hello must be dropped once the

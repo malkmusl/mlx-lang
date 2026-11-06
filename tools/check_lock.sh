@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end check of mlx-lock against the nested compositor.  A small
+# End-to-end check of umbra against the nested compositor.  A small
 # org.mlx.Login stand-in accepts the second password only; neither it nor
 # the locker may print either password.
 set -euo pipefail
@@ -27,18 +27,18 @@ mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx"
 printf 'color-scheme = dark\n' > "$XDG_CONFIG_HOME/mlx/appearance.conf"
 
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet projects/desktop/lock/main.mlx -o "$work/mlx-lock"
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/kepler"
+"$compiler" --quiet projects/desktop/lock/main.mlx -o "$work/umbra"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 "$compiler" --quiet tools/lock-login-test/main.mlx -o "$work/lock-login-test"
 "$compiler" --quiet tools/lock-login-test/client.mlx -o "$work/lock-login-client"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
 
-"$work/mlx-ipcd" --address "$work/system-bus" > "$work/ipc.log" 2>&1 &
+"$work/synapse" --address "$work/system-bus" > "$work/ipc.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$work/system-bus" ]] && break; sleep 0.1; done
-[[ -S "$work/system-bus" ]] || { echo "mlx-ipcd did not open its socket" >&2; exit 1; }
+[[ -S "$work/system-bus" ]] || { echo "synapse did not open its socket" >&2; exit 1; }
 
 DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work/system-bus" "$work/lock-login-test" > "$work/login.log" 2>&1 &
 login_pid=$!
@@ -70,20 +70,20 @@ host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-lock" ]] && break; sleep 0.1; done
 
 USER=tester LANG=de_DE.UTF-8 DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work/system-bus" \
-    WAYLAND_DISPLAY=host-lock timeout 30 "$work/mlx-compositor" --verbose --renderer cpu \
-    --socket nested-lock --no-fps --run "$work/mlx-lock" > "$work/compositor.log" 2>&1
+    WAYLAND_DISPLAY=host-lock timeout 30 "$work/kepler" --verbose --renderer cpu \
+    --socket nested-lock --no-fps --run "$work/umbra" > "$work/compositor.log" 2>&1
 wait "$host_pid" || { cat "$work/host.log" "$work/compositor.log" >&2; exit 1; }
 host_pid=
 
 grep -qx 'unlock tester 5 bytes: denied' "$work/login.log" || { cat "$work/login.log" >&2; exit 1; }
 grep -qx 'unlock tester 10 bytes: allowed' "$work/login.log" || { cat "$work/login.log" >&2; exit 1; }
-for line in 'mlx-lock: locked' 'mlx-lock: authentication failed' 'mlx-lock: unlocked' 'lock: locked' 'lock: unlocked'; do
+for line in 'umbra: locked' 'umbra: authentication failed' 'umbra: unlocked' 'lock: locked' 'lock: unlocked'; do
     grep -qx "$line" "$work/compositor.log" || { echo "check_lock: missing $line" >&2; cat "$work/compositor.log" >&2; exit 1; }
 done
 ! grep -Fq 'wrong' "$work/login.log" "$work/compositor.log" "$work/ipc.log" || { echo 'check_lock: a password reached a log' >&2; exit 1; }
 ! grep -Fq 'right-pass' "$work/login.log" "$work/compositor.log" "$work/ipc.log" || { echo 'check_lock: a password reached a log' >&2; exit 1; }
-grep -aFq 'Could not unlock. Please try again.' "$work/mlx-lock"
-grep -aFq 'Entsperren fehlgeschlagen. Bitte erneut versuchen.' "$work/mlx-lock"
+grep -aFq 'Could not unlock. Please try again.' "$work/umbra"
+grep -aFq 'Entsperren fehlgeschlagen. Bitte erneut versuchen.' "$work/umbra"
 
 python3 - "$work" <<'PY'
 import pathlib, sys
@@ -113,4 +113,4 @@ assert pixel(light, 8, 8) == pixel(denied, 8, 8)
 assert pixel(after, 8, 8) != pixel(denied, 8, 8)
 PY
 
-echo 'ok   mlx-lock masks and wipes passwords, fails closed, follows appearance, and unlocks through org.mlx.Login'
+echo 'ok   umbra masks and wipes passwords, fails closed, follows appearance, and unlocks through org.mlx.Login'

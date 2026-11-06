@@ -2,6 +2,9 @@
 // the terminal and the other devices) and the ends of pipes. 0, 1 and 2
 // are the console at the start.
 const terminal = @import("./terminal.mlx")
+const display = @import("./display.mlx")
+const keyboard = @import("./keyboard.mlx")
+const mouse = @import("./mouse.mlx")
 const pipes = @import("./pipe.mlx")
 const wait = @import("./wait.mlx")
 const vfs = @import("./vfs.mlx")
@@ -40,6 +43,9 @@ pub const Descriptor = struct {
     // open's flags that stay: the access mode, O_APPEND.
     flags: usize
     closeOnExec: bool
+    // For a node opened by a path: the directory the path named it in
+    // (held like the node), for a program's /proc/self/exe; else NONE.
+    directory: usize
     // Counts the slot's uses: a native handle names the slot and the
     // generation it had, so a handle kept past a close stays invalid
     // when the slot is used again.
@@ -72,6 +78,7 @@ pub const Stat = struct {
     const STATX_BASIC_STATS: usize = 0x7FF
     const S_IFIFO: usize = 0x1000
     const S_IFCHR: usize = 0x2000
+    const S_IFSOCK: usize = 0xC000
     const S_IFDIR: usize = 0x4000
     const S_IFBLK: usize = 0x6000
     const S_IFREG: usize = 0x8000
@@ -89,6 +96,11 @@ pub const Stat = struct {
             .disk => S_IFBLK,
             .symlink => S_IFLNK,
             .fifo => S_IFIFO,
+            .session_control => S_IFCHR,
+            .framebuffer => S_IFCHR,
+            .keyboard => S_IFCHR,
+            .mouse => S_IFCHR,
+            .listener => S_IFSOCK,
             .free => 0
         }
     }
@@ -99,6 +111,11 @@ pub const Stat = struct {
         if kind == NodeKind.terminal { return 0x401 }
         if kind == NodeKind.null_device { return 0x103 }
         if kind == NodeKind.zero_device { return 0x105 }
+        // A framebuffer 29:0, an input device 13:64, a pty's master 5:2.
+        if kind == NodeKind.framebuffer { return 0x1D00 }
+        if kind == NodeKind.keyboard { return 0xD40 }
+        if kind == NodeKind.mouse { return 0xD3F }
+        if kind == NodeKind.session_control { return 0x502 }
         // A virtio disk, as Linux numbers its first (major 254).
         if kind == NodeKind.disk { return 0xFE00 }
         return 0
@@ -174,6 +191,7 @@ pub const Descriptors = struct {
             self.*.slots[k].offset = 0
             self.*.slots[k].flags = 0
             self.*.slots[k].closeOnExec = false
+            self.*.slots[k].directory = vfs.Vfs.NONE
             self.*.slots[k].generation = 1
             if k < 3 {
                 self.*.slots[k].kind = Kind.node
@@ -198,12 +216,14 @@ pub const Descriptors = struct {
         if d.*.kind == Kind.timer { timers.table().retain(d.*.index) }
         if d.*.kind == Kind.memory { memoryObjects.table().retain(d.*.index) }
         if d.*.kind == Kind.socket { socketApi.retain(d.*.index) }
+        if d.*.kind == Kind.node && d.*.directory != vfs.Vfs.NONE { vfs.fileSystem().retain(d.*.directory) }
         if reads(d.*.kind) { pipes.table().at(d.*.index).*.readers += 1 }
         if writes(d.*.kind) { pipes.table().at(d.*.index).*.writers += 1 }
     }
 
     fn release(d: *const Descriptor) -> void {
         if d.*.kind == Kind.node { vfs.fileSystem().release(d.*.index) }
+        if d.*.kind == Kind.node && d.*.directory != vfs.Vfs.NONE { vfs.fileSystem().release(d.*.directory) }
         if d.*.kind == Kind.channel { channels.table().release(d.*.index) }
         if d.*.kind == Kind.timer { timers.table().release(d.*.index) }
         if d.*.kind == Kind.memory { memoryObjects.table().release(d.*.index) }
@@ -226,6 +246,7 @@ pub const Descriptors = struct {
         slot.*.offset = from.*.offset
         slot.*.flags = from.*.flags
         slot.*.closeOnExec = closeOnExec
+        slot.*.directory = from.*.directory
     }
 
     // The descriptors of `other` (a fork's child gets its parent's).
@@ -298,7 +319,18 @@ pub const Descriptors = struct {
         slot.*.offset = 0
         slot.*.flags = flags & (Open.ACCESS | Open.APPEND)
         slot.*.closeOnExec = flags & Open.CLOSE_ON_EXEC != 0
+        slot.*.directory = vfs.Vfs.NONE
         vfs.fileSystem().retain(index)
+        return fd
+    }
+
+    // A descriptor of node `index` named by a path in `directory` (kept
+    // with it: a program started from this handle knows its own path).
+    pub fn openNodeIn(self: *Self, index: usize, flags: usize, directory: usize) -> isize {
+        const fd = self.openNode(index, flags)
+        if fd < 0 || directory == vfs.Vfs.NONE { return fd }
+        self.*.slots[@bitCast(usize, fd)].directory = directory
+        vfs.fileSystem().retain(directory)
         return fd
     }
 
@@ -413,6 +445,7 @@ pub const Descriptors = struct {
         into.*.offset = slot.?.*.offset
         into.*.flags = slot.?.*.flags
         into.*.closeOnExec = false
+        into.*.directory = slot.?.*.directory
         into.*.generation = 0
         slot.?.*.kind = Kind.none
         nextGeneration(slot.?)
@@ -497,9 +530,45 @@ pub const Descriptors = struct {
         const tree = vfs.fileSystem()
         const n = tree.node(d.*.index)
         if n.*.kind == NodeKind.terminal {
-            const result = terminal.serialConsole().read(into, capacity)
-            if result == wait.BLOCKED { waiting.* = wait.Wait.on(wait.WaitKind.terminal, 0, 0) }
+            const result = terminal.at(n.*.archiveIndex).read(into, capacity)
+            if result == wait.BLOCKED { waiting.* = wait.Wait.on(wait.WaitKind.terminal, @intCast(isize, n.*.archiveIndex), 0) }
             return result
+        }
+        if n.*.kind == NodeKind.session_control {
+            const result = terminal.at(n.*.archiveIndex).controlRead(into, capacity)
+            if result == wait.BLOCKED {
+                if d.*.flags & O_NONBLOCK != 0 { return Status.would_block }
+                waiting.* = wait.Wait.on(wait.WaitKind.session_control, @intCast(isize, n.*.archiveIndex), 0)
+            }
+            return result
+        }
+        if n.*.kind == NodeKind.keyboard {
+            const result = keyboard.ps2().read(into, capacity)
+            if result == wait.BLOCKED {
+                if d.*.flags & O_NONBLOCK != 0 { return Status.would_block }
+                waiting.* = wait.Wait.on(wait.WaitKind.keyboard, 0, 0)
+            }
+            return result
+        }
+        if n.*.kind == NodeKind.mouse {
+            const result = mouse.aux().read(into, capacity)
+            if result == wait.BLOCKED {
+                if d.*.flags & O_NONBLOCK != 0 { return Status.would_block }
+                waiting.* = wait.Wait.on(wait.WaitKind.mouse, 0, 0)
+            }
+            return result
+        }
+        if n.*.kind == NodeKind.listener { return Status.wrong_kind }
+        if n.*.kind == NodeKind.framebuffer {
+            // The geometry: four words (width, height, pitch, format).
+            var record: [32]u8 = undefined
+            display.screen().describe(&record)
+            if d.*.offset >= 32 { return 0 }
+            var count = 32 - d.*.offset
+            if count > capacity { count = capacity }
+            Bytes.copy(into, unsafe { @ptrFromInt([*]const u8, @intFromPtr(&record) + d.*.offset) }, count)
+            d.*.offset += count
+            return @intCast(isize, count)
         }
         if n.*.kind == NodeKind.null_device { return 0 }
         if n.*.kind == NodeKind.zero_device {
@@ -548,9 +617,14 @@ pub const Descriptors = struct {
         const tree = vfs.fileSystem()
         const n = tree.node(d.*.index)
         if n.*.kind == NodeKind.terminal {
-            terminal.serialConsole().write(from, length)
+            terminal.at(n.*.archiveIndex).write(from, length)
             return @intCast(isize, length)
         }
+        if n.*.kind == NodeKind.session_control {
+            terminal.at(n.*.archiveIndex).controlWrite(from, length)
+            return @intCast(isize, length)
+        }
+        if n.*.kind == NodeKind.keyboard || n.*.kind == NodeKind.mouse || n.*.kind == NodeKind.framebuffer || n.*.kind == NodeKind.listener { return Status.wrong_kind }
         if n.*.kind == NodeKind.null_device || n.*.kind == NodeKind.zero_device { return @intCast(isize, length) }
         if n.*.kind == NodeKind.directory { return Status.is_directory }
         if n.*.kind == NodeKind.disk {
@@ -613,11 +687,16 @@ pub const Descriptors = struct {
         return result
     }
 
-    // Whether `fd` is the terminal.
+    // Whether `fd` is a terminal (a session).
     pub fn isTerminal(self: *Self, fd: isize) -> bool {
         const slot = self.get(fd)
         if slot == null || slot.?.*.kind != Kind.node { return false }
         return vfs.fileSystem().node(slot.?.*.index).*.kind == NodeKind.terminal
+    }
+
+    // The terminal `fd` is (it is one: isTerminal).
+    pub fn terminalOf(self: *Self, fd: isize) -> *terminal.Terminal {
+        return terminal.at(vfs.fileSystem().node(self.get(fd).?.*.index).*.archiveIndex)
     }
 
     // Whether `fd` could be read (POLLIN) or written (POLLOUT) without
@@ -629,7 +708,11 @@ pub const Descriptors = struct {
         if d.*.kind == Kind.socket { return socketApi.readable(d.*.index) }
         if reads(d.*.kind) { return pipes.table().at(d.*.index).readable() }
         if d.*.kind != Kind.node { return false }
-        if vfs.fileSystem().node(d.*.index).*.kind == NodeKind.terminal { return terminal.serialConsole().pending() }
+        const n = vfs.fileSystem().node(d.*.index)
+        if n.*.kind == NodeKind.terminal { return terminal.at(n.*.archiveIndex).pending() }
+        if n.*.kind == NodeKind.session_control { return terminal.at(n.*.archiveIndex).controlPending() }
+        if n.*.kind == NodeKind.keyboard { return keyboard.ps2().pending() }
+        if n.*.kind == NodeKind.mouse { return mouse.aux().pending() }
         return true
     }
 

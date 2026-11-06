@@ -9,7 +9,7 @@
 # loads its pulse plugin. SYSTEM_LIBPULSE=1 leaves the apps PulseAudio's
 # libpulse (the ALSA plugin stays MLX Audio's):
 #
-#   - mlx-ipcd starts mlx-audiod at once (--start org.mlx.Audio), which
+#   - synapse starts resonance at once (--start org.mlx.Audio), which
 #     answers at $XDG_RUNTIME_DIR/pulse/native: pactl info, its sink, the
 #     input and the monitor;
 #   - streams of each sample format (S16, float, S24, S24_32, S32, U8),
@@ -64,9 +64,9 @@ allow_recording() {
 }
 allow_recording
 
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$work/mlx-ipc"
-"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/mlx-audiod"
+"$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/resonance"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$work/mlx-audio"
 tools/build_libpulse.sh --compiler "$compiler" --out "$work/lib" > /dev/null
 
@@ -161,12 +161,12 @@ expect_played() {
 cat > "$work/services/org.mlx.Audio.service" <<SERVICE
 [D-BUS Service]
 Name=org.mlx.Audio
-Exec=$work/mlx-audiod --verbose --output null --input sine:440
+Exec=$work/resonance --verbose --output null --input sine:440
 SERVICE
-"$work/mlx-ipcd" --verbose --services "$work/services" --start org.mlx.Audio > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose --services "$work/services" --start org.mlx.Audio > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/pulse/native" ]] && break; sleep 0.1; done
-[[ -S "$XDG_RUNTIME_DIR/pulse/native" ]] || fail "mlx-audiod does not listen at \$XDG_RUNTIME_DIR/pulse/native"
+[[ -S "$XDG_RUNTIME_DIR/pulse/native" ]] || fail "resonance does not listen at \$XDG_RUNTIME_DIR/pulse/native"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 ln -sf "$work/bus.log" "$work/audiod.log"
 

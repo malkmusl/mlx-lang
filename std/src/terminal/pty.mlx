@@ -12,9 +12,15 @@
 //     pty.resize(&child, columns, rows)                  // SIGWINCH to the program
 //     const status = pty.wait(&child)                    // null: still running
 const std = @import("std")
+const builtin = @import("builtin")
 
 const linux = std.linux
 const tty = std.linux.tty
+// brixOS: the pty is a session pair (session_pair: the control side
+// here, the session the program's input, output, errors and session
+// roles); `master` holds the control handle, `pid` the process handle,
+// and resize is session_size.
+const brix = std.os.brix
 
 // pty.read's answers: nothing yet, and (with 0) the program's side closed.
 pub const EAGAIN: isize = linux.EAGAIN
@@ -43,6 +49,7 @@ fn windowSize(columns: u16, rows: u16, size: [*]u8) -> void {
 // `arguments` and `environment` (null-terminated pointer arrays) on the
 // slave side. False when a step fails.
 pub fn spawn(child: *Child, path: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8, columns: u16, rows: u16) -> bool {
+    if comptime builtin.os == builtin.Os.brixos { return spawnNative(child, path, arguments, environment, columns, rows) }
     const ptmx: []const u8 = "/dev/ptmx"
     const master = linux.open(ptmx.pointer, linux.O_RDWR | linux.O_NOCTTY | linux.O_CLOEXEC, 0)
     if master < 0 { return false }
@@ -84,8 +91,56 @@ pub fn spawn(child: *Child, path: [*]const u8, arguments: [*][*]const u8, enviro
     return true
 }
 
+// brixOS: a session pair, the program spawned on the session with its
+// own group in front of it.
+fn spawnNative(child: *Child, path: [*]const u8, arguments: [*][*]const u8, environment: [*][*]const u8, columns: u16, rows: u16) -> bool {
+    var ends: [2]u32 = [2]u32{ 0, 0 }
+    if brix.sessionPair(&ends) < 0 { return false }
+    const control = ends[0]
+    const session = ends[1]
+    _ = brix.sessionSize(session, @intCast(usize, columns), @intCast(usize, rows))
+    var length: usize = 0
+    while path[length] != 0 { length += 1 }
+    const opened = brix.open(0, path[0..length], brix.Open.READ, 0)
+    if opened < 0 {
+        _ = brix.close(control)
+        _ = brix.close(session)
+        return false
+    }
+    const program = @intCast(u32, opened)
+    var roles: [4]brix.RoleRecord = undefined
+    roles[0] = brix.RoleRecord.{ .role = brix.Role.INPUT, .handle = session }
+    roles[1] = brix.RoleRecord.{ .role = brix.Role.OUTPUT, .handle = session }
+    roles[2] = brix.RoleRecord.{ .role = brix.Role.ERRORS, .handle = session }
+    roles[3] = brix.RoleRecord.{ .role = brix.Role.SESSION, .handle = session }
+    const begin = brix.Start.{ .arguments = @intFromPtr(arguments), .environment = @intFromPtr(environment), .roles = @intFromPtr(&roles), .count = 4 }
+    var handles: [3]u32 = [3]u32{ session, session, session }
+    const spawned = brix.spawn(program, &begin, handles[0..3])
+    _ = brix.close(program)
+    if spawned < 0 {
+        _ = brix.close(control)
+        _ = brix.close(session)
+        return false
+    }
+    const group = brix.joinGroup(@intCast(u32, spawned), 0)
+    if group >= 0 {
+        _ = brix.front(session, @intCast(u32, group))
+        _ = brix.close(@intCast(u32, group))
+    }
+    _ = brix.close(session)
+    child.*.master = @intCast(isize, control)
+    child.*.pid = spawned
+    child.*.ended = false
+    child.*.status = 0
+    return true
+}
+
 // Tells the program its new size (the kernel sends SIGWINCH).
 pub fn resize(child: *const Child, columns: u16, rows: u16) -> void {
+    if comptime builtin.os == builtin.Os.brixos {
+        _ = brix.sessionSize(@intCast(u32, child.*.master), @intCast(usize, columns), @intCast(usize, rows))
+        return
+    }
     var size: [8]u8 = undefined
     const size_bytes: [*]u8 = &size
     windowSize(columns, rows, size_bytes)
@@ -95,22 +150,68 @@ pub fn resize(child: *const Child, columns: u16, rows: u16) -> void {
 // What the program wrote: the bytes, EAGAIN for none yet, 0 or EIO once
 // it has closed its side.
 pub fn read(child: *const Child, buffer: [*]u8, capacity: usize) -> isize {
+    if comptime builtin.os == builtin.Os.brixos {
+        // Only what is there: the control side's reads would wait.
+        var items: [1]brix.WaitItem = undefined
+        items[0] = brix.WaitItem.{ .handle = @intCast(u32, child.*.master), .want = brix.State.READABLE | brix.State.PEER_GONE, .seen = 0, .reserved = 0 }
+        if brix.wait(items[0..1], brix.clock(brix.Clock.MONOTONIC)) <= 0 { return EAGAIN }
+        if items[0].seen & brix.State.READABLE == 0 { return 0 }
+        const got = brix.read(@intCast(u32, child.*.master), buffer[0..capacity], brix.STREAM)
+        if got == -brix.Status.would_block { return EAGAIN }
+        if got < 0 { return EIO }
+        return got
+    }
     return linux.read(child.*.master, buffer, capacity)
 }
 
 pub fn write(child: *const Child, bytes: [*]const u8, length: usize) -> void {
     var sent: usize = 0
     while sent < length {
-        const result = linux.write(child.*.master, bytes + sent, length - sent)
-        if result == linux.EAGAIN { continue }
+        var result: isize = 0
+        if comptime builtin.os == builtin.Os.brixos {
+            result = brix.write(@intCast(u32, child.*.master), bytes[sent..length], brix.STREAM)
+            if result == -brix.Status.would_block { continue }
+        } else {
+            result = linux.write(child.*.master, bytes + sent, length - sent)
+            if result == linux.EAGAIN { continue }
+        }
         if result <= 0 { return }
         sent += @bitCast(usize, result)
     }
 }
 
+// Writes what the program's side takes without waiting; how much that
+// was (the rest is the caller's to keep for later).
+pub fn writeSome(child: *const Child, bytes: [*]const u8, length: usize) -> usize {
+    var sent: usize = 0
+    while sent < length {
+        var result: isize = 0
+        if comptime builtin.os == builtin.Os.brixos {
+            result = brix.write(@intCast(u32, child.*.master), bytes[sent..length], brix.STREAM)
+        } else {
+            result = linux.write(child.*.master, bytes + sent, length - sent)
+        }
+        if result <= 0 { return sent }
+        sent += @bitCast(usize, result)
+    }
+    return sent
+}
+
 // Whether the program ended (without blocking); its status then.
 pub fn wait(child: *Child) -> ?usize {
     if child.*.ended { return child.*.status }
+    if comptime builtin.os == builtin.Os.brixos {
+        var items: [1]brix.WaitItem = undefined
+        items[0] = brix.WaitItem.{ .handle = @intCast(u32, child.*.pid), .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+        if brix.wait(items[0..1], brix.clock(brix.Clock.MONOTONIC)) <= 0 || items[0].seen & brix.State.ENDED == 0 { return null }
+        var change = brix.Change.{ .what = 0, .value = 0, .detail = 0, .reserved = 0 }
+        child.*.status = 255
+        if brix.change(@intCast(u32, child.*.pid), &change) == 0 {
+            child.*.status = if change.what == brix.Change.EXITED { @intCast(usize, change.value & 255) } else { 128 + @intCast(usize, change.value & 127) }
+        }
+        child.*.ended = true
+        return child.*.status
+    }
     var raw: usize = 0
     if linux.process.waitProcess(child.*.pid, &raw, linux.WNOHANG) != child.*.pid { return null }
     child.*.ended = true
@@ -121,6 +222,13 @@ pub fn wait(child: *Child) -> ?usize {
 // Ends the program (SIGHUP, as a closed terminal does) and the pty. A
 // program that has already ended is reaped, its status kept for wait().
 pub fn hangUp(child: *Child) -> void {
+    if comptime builtin.os == builtin.Os.brixos {
+        if !child.*.ended { _ = brix.sendEvent(@intCast(u32, child.*.pid), brix.Event.HANGUP) }
+        _ = brix.close(@intCast(u32, child.*.master))
+        _ = wait(child)
+        _ = brix.close(@intCast(u32, child.*.pid))
+        return
+    }
     if !child.*.ended { _ = linux.process.kill(child.*.pid, linux.SIGHUP) }
     linux.close(child.*.master)
     _ = wait(child)

@@ -35,8 +35,8 @@ path.
 `wl_shm` and xdg-shell, including the Mlx compositor:
 
 ```sh
-mlx4 projects/desktop/compositor/main.mlx -o mlx-compositor
-./mlx-compositor --renderer vulkan --run ./vulkan-wayland-client
+mlx4 projects/desktop/compositor/main.mlx -o kepler
+./kepler --renderer vulkan --run ./vulkan-wayland-client
 ```
 
 The shaders and device setup are shared with the other Vulkan examples in

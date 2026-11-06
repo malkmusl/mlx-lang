@@ -22,7 +22,7 @@ compositor talks to, at the lowest level it uses:
 
 The scenario: start (modeset on the connected connector at the mode the
 settings ask for: its preferred size at 50 Hz instead of 60; the output
-told in $XDG_RUNTIME_DIR/wayland-drm.display for mlx-settings; night light
+told in $XDG_RUNTIME_DIR/wayland-drm.display for control; night light
 at 3000 K in the CRTC's gamma table, the console's table kept), the Mlx
 terminal maps and gets typed into from the keyboard, the
 mouse and the touchpad move the cursor, three fingers swipe to workspace 2
@@ -787,11 +787,11 @@ def main():
         if card.pixel(0, HEIGHT - 1) != background(HEIGHT - 1):
             fail(f"background {card.pixel(0, HEIGHT - 1):#x}, expected {background(HEIGHT - 1):#x}")
         print(f"ok   logind session and devices; the card with the monitor chosen over the BMC's VGA; modeset CRTC 32 -> connector 42 at its preferred {WIDTH}x{HEIGHT}")
-        # The mode the settings asked for, told to mlx-settings.
+        # The mode the settings asked for, told to control.
         rates = [c[2] for c in recorder.calls if c[:2] == ("drm", "setcrtc_rate")]
         if rates[:1] != [50]:
             fail(f"the settings' display-mode asks for 50 Hz; the CRTC was set to {rates[:1]} Hz")
-        harness.wait_log("display: told in", 5, "the output's file for mlx-settings")
+        harness.wait_log("display: told in", 5, "the output's file for control")
         with open(os.path.join(harness.work, "wayland-drm.display")) as source:
             told = source.read().splitlines()
         for line in ("backend = drm", "output = eDP-1", f"mode = {WIDTH}x{HEIGHT}@50", "available = 1280x800@60",

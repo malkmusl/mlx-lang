@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """An emulated ALSA sound card for MLX Audio's checks (tools/check_audio.sh).
 
-There is no sound card here, so this plays one at the level mlx-audiod
+There is no sound card here, so this plays one at the level resonance
 talks to it: the kernel's PCM ioctls (projects/desktop/audio/alsa.mlx).
 Its devices are Unix sockets at DIR/snd/pcmC0D0p (playback) and pcmC0D0c
 (capture), with DIR/asound/card0/... for their names (MLX_SND_DIR and
-MLX_ASOUND_DIR point mlx-audiod there), and the ioctls arrive as frames
+MLX_ASOUND_DIR point resonance there), and the ioctls arrive as frames
 (alsa.mlx describes them): HW_PARAMS, SW_PARAMS, PREPARE, START, DROP,
 WRITEI_FRAMES, READI_FRAMES. The structures are checked against
 <sound/asound.h>'s layouts (snd_pcm_hw_params 608 bytes, snd_pcm_sw_params

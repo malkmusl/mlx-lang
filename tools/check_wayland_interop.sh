@@ -38,9 +38,9 @@ cleanup() {
 trap cleanup EXIT
 
 "$compiler" --quiet examples/wayland-client/main.mlx -o "$work/mlx-client"
-"$compiler" --quiet examples/wayland-server/main.mlx -o "$work/mlx-compositor"
+"$compiler" --quiet examples/wayland-server/main.mlx -o "$work/kepler"
 "$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-nested"
-"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/mlx-terminal"
+"$compiler" --quiet projects/desktop/terminal/main.mlx -o "$work/vector"
 
 wait_for_socket() {
     for _ in $(seq 1 50); do
@@ -59,7 +59,7 @@ WAYLAND_DISPLAY=weston-test timeout 20 "$work/mlx-client"
 echo "ok   Mlx client presented frames on weston"
 
 # 2. libwayland clients on the Mlx compositor.
-"$work/mlx-compositor" mlx-test > "$work/compositor.log" 2>&1 &
+"$work/kepler" mlx-test > "$work/compositor.log" 2>&1 &
 pids+=($!)
 wait_for_socket mlx-test
 WAYLAND_DISPLAY=mlx-test timeout 10 wayland-info > "$work/info.log"
@@ -91,7 +91,7 @@ echo "ok   Mlx client and Mlx compositor exchanged verified frames"
 
 # 4. The nested compositor as a weston client, serving two terminals.
 WAYLAND_DISPLAY=weston-test timeout 30 "$work/mlx-nested" --verbose --socket nested-test --timeout 6 \
-    --terminal "$work/mlx-terminal" --run "$work/mlx-terminal" --run weston-terminal > "$work/nested.log" 2>&1
+    --terminal "$work/vector" --run "$work/vector" --run weston-terminal > "$work/nested.log" 2>&1
 for title in "Mlx Terminal" "Wayland Terminal"; do
     grep -q "^map: $title" "$work/nested.log" || { echo "the nested compositor did not map $title" >&2; cat "$work/nested.log" >&2; exit 1; }
 done

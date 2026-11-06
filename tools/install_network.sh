@@ -1,31 +1,31 @@
 #!/usr/bin/env bash
-# Builds mlx-netd and mlx-net (projects/network) and MLXIPC's bus
-# (mlx-ipcd, projects/desktop/ipc) and installs them as the system's
+# Builds nexus and mlx-net (projects/network) and MLXIPC's bus
+# (synapse, projects/desktop/ipc) and installs them as the system's
 # network service, in place of NetworkManager, on MLXIPC's system bus
 # (/run/mlx/bus; no D-Bus). Nothing is switched over unless --enable says
 # so.
 #
 # Installs (PREFIX is /usr unless --prefix says otherwise):
-#   PREFIX/bin/mlx/mlx-netd, mlx-net, mlx-ipcd
+#   PREFIX/bin/mlx/nexus, mlx-net, synapse
 #   PREFIX/bin/mlx on PATH: /etc/profile.d/mlx.sh, /etc/environment.d/50-mlx.conf,
 #                                     /etc/systemd/system.conf.d/50-mlx-path.conf
 #                                     (tools/lib/mlx_layout.sh)
 #   /etc/mlx/network.conf             (an example, all commented out; an
 #                                     existing one stays)
-#   /etc/systemd/system/mlx-ipcd.service (MLXIPC's system bus),
-#   /etc/systemd/system/mlx-netd.service (needs it)
-#   /etc/mlx/init/services/mlx-ipcd.service, mlx-netd.service (mlx-init)
+#   /etc/systemd/system/synapse.service (MLXIPC's system bus),
+#   /etc/systemd/system/nexus.service (needs it)
+#   /etc/mlx/init/services/synapse.service, nexus.service (impulse)
 #   /var/lib/mlx/network/             (mode 0700: the saved Wi-Fi networks)
 #   PREFIX/share/doc/mlx/network/README.md, PREFIX/share/doc/mlx/ipc/README.md
-#   with --enable: mlx-ipcd.service and mlx-netd.service enabled,
+#   with --enable: synapse.service and nexus.service enabled,
 #   NetworkManager.service, systemd-networkd.service and
 #   wpa_supplicant.service masked (the symbolic links systemctl makes);
 #   what was at those places before is kept under
 #   /var/lib/mlx/network-installer
-#   with --disable: mlx-netd.service disabled and the three units as they
+#   with --disable: nexus.service disabled and the three units as they
 #   were before --enable (unmasked, when an older install kept nothing);
-#   nothing is built or installed, and mlx-ipcd.service stays enabled
-#   (mlx-login needs the bus)
+#   nothing is built or installed, and synapse.service stays enabled
+#   (sentinel needs the bus)
 #
 # Who may change the network is MLXIPC's permission network.control
 # (/etc/mlx/ipc.conf): every unsandboxed app by default, no sandboxed one.
@@ -73,9 +73,9 @@ if [[ -z "$destdir" && $(id -u) -ne 0 ]]; then
 fi
 
 system_dir="$destdir/etc/systemd/system"
-netd_wants="$system_dir/multi-user.target.wants/mlx-netd.service"
+netd_wants="$system_dir/multi-user.target.wants/nexus.service"
 state_dir="$destdir/var/lib/mlx/network-installer"
-# The services mlx-netd stands in for, masked by --enable.
+# The services nexus stands in for, masked by --enable.
 replaced=(NetworkManager.service systemd-networkd.service wpa_supplicant.service)
 
 remove_path() {
@@ -130,14 +130,14 @@ disable_network() {
     local unit restored=() start
     if [[ -f "$state_dir/enabled" ]]; then
         for unit in "${replaced[@]}"; do restore_path "$unit" "$system_dir/$unit"; done
-        restore_path mlx-netd-wants "$netd_wants"
+        restore_path nexus-wants "$netd_wants"
         rm -rf -- "$state_dir"
-        echo "disabled mlx-netd.service; ${replaced[*]} are as they were before --enable"
+        echo "disabled nexus.service; ${replaced[*]} are as they were before --enable"
     else
         # Enabled by an installer that kept nothing: undo its masks, but
-        # only while mlx-netd is enabled (a mask on a machine not switched
+        # only while nexus is enabled (a mask on a machine not switched
         # over is its owner's).
-        if [[ "$(readlink -- "$netd_wants" 2> /dev/null || true)" == /etc/systemd/system/mlx-netd.service ]]; then
+        if [[ "$(readlink -- "$netd_wants" 2> /dev/null || true)" == /etc/systemd/system/nexus.service ]]; then
             remove_path "$netd_wants"
             for unit in "${replaced[@]}"; do
                 if [[ "$(readlink -- "$system_dir/$unit" 2> /dev/null || true)" == /dev/null ]]; then
@@ -145,18 +145,18 @@ disable_network() {
                     restored+=("$unit")
                 fi
             done
-            echo "disabled mlx-netd.service; no saved state, unmasked: ${restored[*]:-nothing}"
+            echo "disabled nexus.service; no saved state, unmasked: ${restored[*]:-nothing}"
         else
-            echo "mlx-netd.service was not enabled; nothing changed"
+            echo "nexus.service was not enabled; nothing changed"
         fi
     fi
-    echo "mlx-ipcd.service stays enabled (MLXIPC's system bus, which mlx-login needs)"
+    echo "synapse.service stays enabled (MLXIPC's system bus, which sentinel needs)"
     start=$(enabled_replaced)
     if [[ -z "$destdir" ]]; then
         if [[ -n "$start" ]]; then
-            echo "run: systemctl daemon-reload && systemctl stop mlx-netd.service && systemctl start $start"
+            echo "run: systemctl daemon-reload && systemctl stop nexus.service && systemctl start $start"
         else
-            echo "run: systemctl daemon-reload && systemctl stop mlx-netd.service (and start the network service you use: none of ${replaced[*]} is enabled)"
+            echo "run: systemctl daemon-reload && systemctl stop nexus.service (and start the network service you use: none of ${replaced[*]} is enabled)"
         fi
     else
         echo "to start after daemon-reload: ${start:-none of ${replaced[*]} is enabled}"
@@ -173,34 +173,34 @@ compiler=${compiler:-${MLX_COMPILER:-}}
 build=$(mktemp -d)
 trap 'rm -rf -- "$build"' EXIT
 if [[ -n "$compiler" ]]; then
-    "$compiler" --quiet projects/network/main.mlx -o "$build/mlx-netd"
+    "$compiler" --quiet projects/network/main.mlx -o "$build/nexus"
     "$compiler" --quiet projects/network/tool.mlx -o "$build/mlx-net"
-    "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/mlx-ipcd"
+    "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$build/synapse"
 else
     mlx_build network
-    cp mlx-out/bin/mlx-netd mlx-out/bin/mlx-net mlx-out/bin/mlx-ipcd "$build/"
+    cp mlx-out/bin/nexus mlx-out/bin/mlx-net mlx-out/bin/synapse "$build/"
 fi
-echo "built mlx-netd, mlx-net and mlx-ipcd"
+echo "built nexus, mlx-net and synapse"
 
 prefix=${prefix%/}
 bindir=$(mlx_bindir "$prefix")
 install -d "$destdir$bindir" "$destdir/etc/mlx" "$destdir/etc/systemd/system" "$destdir/etc/mlx/init/services" "$destdir$prefix/share/doc/mlx/network" "$destdir$prefix/share/doc/mlx/ipc"
 install -d -m 700 "$destdir/var/lib/mlx/network"
-install -m 755 "$build/mlx-netd" "$build/mlx-net" "$build/mlx-ipcd" "$destdir$bindir/"
+install -m 755 "$build/nexus" "$build/mlx-net" "$build/synapse" "$destdir$bindir/"
 if [[ ! -e "$destdir/etc/mlx/network.conf" ]]; then
     install -m 644 projects/network/examples/network.conf "$destdir/etc/mlx/network.conf"
 fi
-sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$prefix/share/doc/mlx/network|g" projects/network/examples/mlx-netd.service > "$build/mlx-netd.service"
-sed "s|@BINDIR@|$bindir|g" projects/network/examples/mlx-netd.init > "$build/mlx-netd.init"
-sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$prefix/share/doc/mlx/ipc|g" projects/desktop/ipc/examples/mlx-ipcd.service > "$build/mlx-ipcd.service"
-sed "s|@BINDIR@|$bindir|g" projects/desktop/ipc/examples/mlx-ipcd.init > "$build/mlx-ipcd.init"
-install -m 644 "$build/mlx-netd.service" "$destdir/etc/systemd/system/mlx-netd.service"
-install -m 644 "$build/mlx-ipcd.service" "$destdir/etc/systemd/system/mlx-ipcd.service"
-install -m 644 "$build/mlx-netd.init" "$destdir/etc/mlx/init/services/mlx-netd.service"
-install -m 644 "$build/mlx-ipcd.init" "$destdir/etc/mlx/init/services/mlx-ipcd.service"
+sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$prefix/share/doc/mlx/network|g" projects/network/examples/nexus.service > "$build/nexus.service"
+sed "s|@BINDIR@|$bindir|g" projects/network/examples/nexus.init > "$build/nexus.init"
+sed -e "s|@BINDIR@|$bindir|g" -e "s|@DOCDIR@|$prefix/share/doc/mlx/ipc|g" projects/desktop/ipc/examples/synapse.service > "$build/synapse.service"
+sed "s|@BINDIR@|$bindir|g" projects/desktop/ipc/examples/synapse.init > "$build/synapse.init"
+install -m 644 "$build/nexus.service" "$destdir/etc/systemd/system/nexus.service"
+install -m 644 "$build/synapse.service" "$destdir/etc/systemd/system/synapse.service"
+install -m 644 "$build/nexus.init" "$destdir/etc/mlx/init/services/nexus.service"
+install -m 644 "$build/synapse.init" "$destdir/etc/mlx/init/services/synapse.service"
 install -m 644 projects/network/README.md "$destdir$prefix/share/doc/mlx/network/README.md"
 install -m 644 projects/desktop/ipc/README.md "$destdir$prefix/share/doc/mlx/ipc/README.md"
-echo "installed into ${destdir:-/}: $bindir/mlx-netd, $bindir/mlx-net, $bindir/mlx-ipcd, /etc/mlx/network.conf, the systemd units and mlx-init services of mlx-ipcd and mlx-netd"
+echo "installed into ${destdir:-/}: $bindir/nexus, $bindir/mlx-net, $bindir/synapse, /etc/mlx/network.conf, the systemd units and impulse services of synapse and nexus"
 mlx_install_path_files "$destdir" "$bindir"
 mlx_note_old_layout "$destdir" "$bindir"
 
@@ -210,27 +210,27 @@ if $enable; then
     if [[ ! -f "$state_dir/enabled" ]]; then
         install -d -m 700 "$state_dir"
         for unit in "${replaced[@]}"; do capture_path "$unit" "$system_dir/$unit"; done
-        capture_path mlx-netd-wants "$netd_wants"
+        capture_path nexus-wants "$netd_wants"
         echo enabled > "$state_dir/enabled"
     fi
     # What systemctl enable and mask leave: links.
     install -d "$destdir/etc/systemd/system/multi-user.target.wants"
-    ln -sf /etc/systemd/system/mlx-ipcd.service "$destdir/etc/systemd/system/multi-user.target.wants/mlx-ipcd.service"
-    ln -sf /etc/systemd/system/mlx-netd.service "$destdir/etc/systemd/system/multi-user.target.wants/mlx-netd.service"
-    # An alias the D-Bus mlx-netd of before left.
-    if [[ "$(readlink "$destdir/etc/systemd/system/dbus-org.freedesktop.NetworkManager.service" 2> /dev/null)" == /etc/systemd/system/mlx-netd.service ]]; then
+    ln -sf /etc/systemd/system/synapse.service "$destdir/etc/systemd/system/multi-user.target.wants/synapse.service"
+    ln -sf /etc/systemd/system/nexus.service "$destdir/etc/systemd/system/multi-user.target.wants/nexus.service"
+    # An alias the D-Bus nexus of before left.
+    if [[ "$(readlink "$destdir/etc/systemd/system/dbus-org.freedesktop.NetworkManager.service" 2> /dev/null)" == /etc/systemd/system/nexus.service ]]; then
         rm -f "$destdir/etc/systemd/system/dbus-org.freedesktop.NetworkManager.service"
     fi
     for unit in "${replaced[@]}"; do
         remove_path "$system_dir/$unit"
         ln -s /dev/null "$system_dir/$unit"
     done
-    echo "enabled mlx-ipcd.service and mlx-netd.service; masked NetworkManager.service, systemd-networkd.service, wpa_supplicant.service"
-    [[ -z "$destdir" ]] && echo "run: systemctl daemon-reload && systemctl start mlx-netd (it starts mlx-ipcd and stops NetworkManager)"
+    echo "enabled synapse.service and nexus.service; masked NetworkManager.service, systemd-networkd.service, wpa_supplicant.service"
+    [[ -z "$destdir" ]] && echo "run: systemctl daemon-reload && systemctl start nexus (it starts synapse and stops NetworkManager)"
 else
     echo "to switch over: tools/install_network.sh --enable (and back: --disable)"
 fi
 if [[ -z "$destdir" && -e /etc/dbus-1/system.d/org.mlx.Network.conf ]]; then
     rm -f /etc/dbus-1/system.d/org.mlx.Network.conf
-    echo "removed the D-Bus policy an earlier install left (mlx-netd is on MLXIPC now)"
+    echo "removed the D-Bus policy an earlier install left (nexus is on MLXIPC now)"
 fi

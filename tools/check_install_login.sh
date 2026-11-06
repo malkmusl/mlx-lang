@@ -75,10 +75,10 @@ system="$stage/etc/systemd/system"
 install -d "$system/graphical.target.wants"
 
 # Model an existing SDDM selection, a local SDDM override, and an unrelated
-# pre-existing link at the place systemctl enable would use for mlx-login.
+# pre-existing link at the place systemctl enable would use for sentinel.
 ln -s /usr/lib/systemd/system/sddm.service "$system/display-manager.service"
 ln -s /usr/lib/systemd/system/sddm.service "$system/sddm.service"
-ln -s /custom/preexisting-login.service "$system/graphical.target.wants/mlx-login.service"
+ln -s /custom/preexisting-login.service "$system/graphical.target.wants/sentinel.service"
 
 if tools/install_login.sh --destdir "$stage" --enable --disable --compiler "$fake_compiler" > "$work/conflict.log" 2>&1; then
     fail "--enable and --disable together were accepted"
@@ -89,35 +89,35 @@ run_installer "$work/install.log" --destdir "$stage" --prefix /opt/mlx \
     --compiler "$fake_compiler"
 assert_link "$system/display-manager.service" /usr/lib/systemd/system/sddm.service
 assert_link "$system/sddm.service" /usr/lib/systemd/system/sddm.service
-assert_link "$system/graphical.target.wants/mlx-login.service" /custom/preexisting-login.service
+assert_link "$system/graphical.target.wants/sentinel.service" /custom/preexisting-login.service
 [[ ! -e "$stage/var/lib/mlx/login-installer" ]] || fail "a plain install recorded enable state"
 
 run_installer "$work/enable.log" --destdir "$stage" --prefix /opt/mlx --enable \
     --compiler "$fake_compiler"
 
-for program in mlx-login mlx-greeter mlx-lock; do
+for program in sentinel aurora umbra; do
     path="$stage/opt/mlx/bin/mlx/$program"
     [[ -x "$path" ]] || fail "$program was not installed executable"
     source_name=${program#mlx-}
     grep -q "projects/desktop/$source_name/main.mlx" "$path" || fail "$program came from the wrong Mlx source"
 done
-[[ "$(stat -c '%a' "$stage/opt/mlx/bin/mlx/mlx-login")" == 755 ]] || fail "installed programs are not mode 0755"
+[[ "$(stat -c '%a' "$stage/opt/mlx/bin/mlx/sentinel")" == 755 ]] || fail "installed programs are not mode 0755"
 
-unit="$system/mlx-login.service"
-[[ -f "$unit" ]] || fail "mlx-login.service was not installed"
-grep -q '^Requires=mlx-ipcd.service$' "$unit" || fail "mlx-login.service does not require mlx-ipcd"
-grep -q '^Conflicts=getty@tty1.service$' "$unit" || fail "mlx-login.service does not reserve tty1 from the getty"
-grep -q '^After=mlx-ipcd.service getty@tty1.service$' "$unit" || fail "mlx-login.service does not order the tty1 handover"
-grep -q '^ExecStart=/opt/mlx/bin/mlx/mlx-login --greeter /opt/mlx/bin/mlx/mlx-compositor /opt/mlx/bin/mlx/mlx-greeter$' "$unit" || fail "mlx-login.service has the wrong ExecStart"
-grep -q '^Documentation=file:///opt/mlx/share/doc/mlx/login/README.md$' "$unit" || fail "mlx-login.service has the wrong documentation path"
-[[ "$(stat -c '%a' "$unit")" == 644 ]] || fail "mlx-login.service is not mode 0644"
+unit="$system/sentinel.service"
+[[ -f "$unit" ]] || fail "sentinel.service was not installed"
+grep -q '^Requires=synapse.service$' "$unit" || fail "sentinel.service does not require synapse"
+grep -q '^Conflicts=getty@tty1.service$' "$unit" || fail "sentinel.service does not reserve tty1 from the getty"
+grep -q '^After=synapse.service getty@tty1.service$' "$unit" || fail "sentinel.service does not order the tty1 handover"
+grep -q '^ExecStart=/opt/mlx/bin/mlx/sentinel --greeter /opt/mlx/bin/mlx/kepler /opt/mlx/bin/mlx/aurora$' "$unit" || fail "sentinel.service has the wrong ExecStart"
+grep -q '^Documentation=file:///opt/mlx/share/doc/mlx/login/README.md$' "$unit" || fail "sentinel.service has the wrong documentation path"
+[[ "$(stat -c '%a' "$unit")" == 644 ]] || fail "sentinel.service is not mode 0644"
 
 init_services="$stage/etc/mlx/init/services"
-grep -q '^exec = /opt/mlx/bin/mlx/mlx-ipcd --system$' "$init_services/mlx-ipcd.service" || fail "mlx-init IPC service was not rendered"
-grep -q '^ready = socket:/run/mlx/bus$' "$init_services/mlx-ipcd.service" || fail "mlx-init IPC service does not use socket readiness"
-grep -q '^exec = /opt/mlx/bin/mlx/mlx-netd$' "$init_services/mlx-netd.service" || fail "mlx-init network service was not rendered"
-grep -q '^exec = /opt/mlx/bin/mlx/mlx-login --greeter /opt/mlx/bin/mlx/mlx-compositor /opt/mlx/bin/mlx/mlx-greeter$' "$init_services/mlx-login.service" || fail "mlx-init login service was not rendered"
-grep -q '^after = mlx-ipcd mlx-netd$' "$init_services/mlx-login.service" || fail "mlx-init login ordering is wrong"
+grep -q '^exec = /opt/mlx/bin/mlx/synapse --system$' "$init_services/synapse.service" || fail "impulse IPC service was not rendered"
+grep -q '^ready = socket:/run/mlx/bus$' "$init_services/synapse.service" || fail "impulse IPC service does not use socket readiness"
+grep -q '^exec = /opt/mlx/bin/mlx/nexus$' "$init_services/nexus.service" || fail "impulse network service was not rendered"
+grep -q '^exec = /opt/mlx/bin/mlx/sentinel --greeter /opt/mlx/bin/mlx/kepler /opt/mlx/bin/mlx/aurora$' "$init_services/sentinel.service" || fail "impulse login service was not rendered"
+grep -q '^after = synapse nexus$' "$init_services/sentinel.service" || fail "impulse login ordering is wrong"
 [[ ! -e "$init_services/console.service" ]] || fail "the greeter boot set installed a competing tty1 console"
 grep -qx 'disabled = yes' projects/init/examples/services/console.service || fail "the optional tty1 console is enabled beside the greeter by default"
 [[ -f "$stage/opt/mlx/share/doc/mlx/login/README.md" ]] || fail "login README was not installed"
@@ -126,8 +126,8 @@ if grep -R -q '@BINDIR@\|@DOCDIR@' "$unit" "$init_services"; then
     fail "an installation placeholder remained in a staged service"
 fi
 
-assert_link "$system/display-manager.service" /etc/systemd/system/mlx-login.service
-assert_link "$system/graphical.target.wants/mlx-login.service" /etc/systemd/system/mlx-login.service
+assert_link "$system/display-manager.service" /etc/systemd/system/sentinel.service
+assert_link "$system/graphical.target.wants/sentinel.service" /etc/systemd/system/sentinel.service
 assert_link "$system/sddm.service" /dev/null
 state="$stage/var/lib/mlx/login-installer"
 [[ "$(< "$state/previous-name")" == sddm.service ]] || fail "the previous display manager name was not saved"
@@ -145,9 +145,9 @@ assert_link "$system/sddm.service" /dev/null
 run_installer "$work/disable.log" --destdir "$stage" --disable
 assert_link "$system/display-manager.service" /usr/lib/systemd/system/sddm.service
 assert_link "$system/sddm.service" /usr/lib/systemd/system/sddm.service
-assert_link "$system/graphical.target.wants/mlx-login.service" /custom/preexisting-login.service
+assert_link "$system/graphical.target.wants/sentinel.service" /custom/preexisting-login.service
 [[ ! -e "$state" ]] || fail "saved enable state remained after disable"
-[[ -x "$stage/opt/mlx/bin/mlx/mlx-login" ]] || fail "disable removed installed programs"
+[[ -x "$stage/opt/mlx/bin/mlx/sentinel" ]] || fail "disable removed installed programs"
 
 # A second disable is a no-op and must not remove anything it just restored.
 run_installer "$work/disable-again.log" --destdir "$stage" --disable
@@ -161,7 +161,7 @@ masked_system="$masked_stage/etc/systemd/system"
 install -d "$masked_system"
 ln -s /dev/null "$masked_system/display-manager.service"
 run_installer "$work/masked-enable.log" --destdir "$masked_stage" --enable --compiler "$fake_compiler"
-assert_link "$masked_system/display-manager.service" /etc/systemd/system/mlx-login.service
+assert_link "$masked_system/display-manager.service" /etc/systemd/system/sentinel.service
 run_installer "$work/masked-disable.log" --destdir "$masked_stage" --disable
 assert_link "$masked_system/display-manager.service" /dev/null
 
@@ -171,13 +171,13 @@ assert_link "$masked_system/display-manager.service" /dev/null
 real_compiler=${1:-$(tools/ensure_compiler.sh)}
 real_stage="$work/real-root"
 run_installer "$work/real-install.log" --destdir "$real_stage" --compiler "$real_compiler"
-for program in mlx-login mlx-greeter mlx-lock; do
+for program in sentinel aurora umbra; do
     [[ -s "$real_stage/usr/bin/mlx/$program" && -x "$real_stage/usr/bin/mlx/$program" ]] || \
         fail "the real $program build was not staged executable"
 done
 
-echo "ok   install_login stages all programs, units, mlx-init services and documentation"
+echo "ok   install_login stages all programs, units, impulse services and documentation"
 echo "ok   --enable is idempotent and masks the previously selected display manager"
 echo "ok   --disable restores prior aliases, overrides and masks and is idempotent"
-echo "ok   the real compiler builds and stages mlx-login, mlx-greeter and mlx-lock"
-echo "all mlx-login installer checks passed"
+echo "ok   the real compiler builds and stages sentinel, aurora and umbra"
+echo "all sentinel installer checks passed"

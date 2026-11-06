@@ -2,7 +2,7 @@
 const std = @import("std")
 const wl = @import("std.wayland")
 const ui = @import("std.ui")
-const spawn_module = @import("std.spawn")
+const children = @import("./children.mlx")
 const state = @import("./state.mlx")
 const scene = @import("./scene.mlx")
 const preview_layout = @import("./preview_layout.mlx")
@@ -15,45 +15,21 @@ const lock_module = @import("./lock.mlx")
 const windows_module = @import("./windows.mlx")
 const data_module = @import("./data.mlx")
 
-const SOCK_STREAM_CLOEXEC: usize = 524289
 
 // ---------------------------------------------------------------------------
 // Launching clients
 
 // Runs `program` (a path, or a name looked up in PATH) with our
-// WAYLAND_DISPLAY. Only called in the forked child.
-fn execute(program: [*]const u8, environment: [*][*]const u8) -> void {
-    var arguments: [2][*]const u8 = undefined
-    unsafe {
-        arguments[0] = program
-        arguments[1] = @ptrFromInt([*]const u8, 0)
-        // Without PATH a name runs nowhere.
-        spawn_module.execute(program, @ptrCast([*][*]const u8, &arguments), environment, "")
-    }
-}
-
+// WAYLAND_DISPLAY (children.mlx: a child process on Linux, process_spawn
+// on brixOS).
 pub fn launch(compositor: *shell.Compositor, program: [*]const u8) -> void {
-    if compositor.*.verbose {
-        state.say("launch: ")
-        var length: usize = 0
-        while program[length] != 0 { length += 1 }
-        _ = std.io.writeAllBytes(std.io.stdout(), program, length)
-        state.say("\n")
-    }
-    const child = std.linux.process.fork()
-    if child == 0 {
-        execute(program, compositor.*.environment)
-        std.linux.exitGroup(127)
-    }
+    _ = children.runWith(compositor, program, compositor.*.environment, -1)
 }
 
 // Sends the launcher that stays one byte (115 's': show); false when it is
-// gone (never a SIGPIPE: MSG_NOSIGNAL).
+// gone.
 pub fn tellLauncher(compositor: *shell.Compositor, command: u8) -> bool {
-    var byte: [1]u8 = [1]u8{ command }
-    const sent = std.linux.syscall6(std.linux.SYS_sendto, @bitCast(usize, compositor.*.launcherChannel), @intFromPtr(&byte), 1, std.linux.socket.MSG_DONTWAIT | std.linux.socket.MSG_NOSIGNAL, 0, 0)
-    // A full buffer (-EAGAIN) means it is busy, not gone.
-    return sent == 1 || sent == -11
+    return children.tell(compositor.*.launcherChannel, command)
 }
 
 // The helpers that stay running, started with the compositor: the launcher
@@ -75,40 +51,26 @@ pub fn startHelpers(compositor: *shell.Compositor) -> void {
 // from becoming an input path around the login screen.
 fn startGreeter(compositor: *shell.Compositor) -> void {
     if compositor.*.greeterPid >= 0 || @intFromPtr(compositor.*.greeterProgram) == 0 { return }
-    var wayland: [2]i32 = [2]i32{ -1, -1 }
-    if std.linux.syscall4(std.linux.SYS_socketpair, 1, SOCK_STREAM_CLOEXEC, 0, @intFromPtr(&wayland)) != 0 {
+    var ours: isize = -1
+    var theirs: isize = -1
+    if !children.makeChannel(&ours, &theirs) {
         state.say("greeter: cannot create its Wayland connection\n")
         compositor.*.running = false
         return
     }
-    if compositor.*.verbose {
-        state.say("greeter: launch: ")
-        var length: usize = 0
-        while compositor.*.greeterProgram[length] != 0 { length += 1 }
-        _ = std.io.writeAllBytes(std.io.stdout(), compositor.*.greeterProgram, length)
-        state.say("\n")
-    }
-    const child = std.linux.process.fork()
-    if child == 0 {
-        const ours = @intCast(usize, wayland[0])
-        const theirs = @intCast(usize, wayland[1])
-        _ = std.linux.syscall1(std.linux.SYS_close, ours)
-        _ = std.linux.keepOnExec(@bitCast(isize, theirs))
-        execute(compositor.*.greeterProgram, helperEnvironment(compositor, "WAYLAND_SOCKET=", theirs, false))
-        std.linux.exitGroup(127)
-    }
-    std.linux.close(@intCast(isize, wayland[1]))
+    if compositor.*.verbose { state.say("greeter: ") }
+    const child = children.runWith(compositor, compositor.*.greeterProgram, helperEnvironment(compositor, "WAYLAND_SOCKET=", children.childNumber(theirs), false), theirs)
     if child < 0 {
-        std.linux.close(@intCast(isize, wayland[0]))
+        children.closeChannel(ours)
         state.say("greeter: cannot start\n")
         compositor.*.running = false
         return
     }
     compositor.*.greeterPid = child
     var client: wl.server.Client = undefined
-    if !compositor.*.server.adoptClient(wl.Handle.fromDescriptor(@intCast(isize, wayland[0])), &client) {
-        std.linux.close(@intCast(isize, wayland[0]))
-        _ = std.linux.process.kill(child, std.linux.SIGKILL)
+    if !compositor.*.server.adoptClient(wl.Handle.fromDescriptor(ours), &client) {
+        children.closeChannel(ours)
+        children.kill(child)
         state.say("greeter: cannot add its Wayland connection\n")
         compositor.*.running = false
         return
@@ -149,36 +111,21 @@ fn startDock(compositor: *shell.Compositor) -> void {
     compositor.*.dockWorkspaceSignature = 0
 }
 
-// Starts `program` with one end of a new socket pair as `variable` (e.g.
-// "MLX_DOCK_FD=") in its environment; returns our end (nonblocking, not
-// inherited by other children), or -1. Its process id goes to `pid`.
+// Starts `program` with one end of a new channel (a socket pair on
+// Linux) as `variable` (e.g. "MLX_DOCK_FD=") in its environment; returns
+// our end (nonblocking, not inherited by other children), or -1. Its
+// process id goes to `pid`.
 fn startHelper(compositor: *shell.Compositor, program: [*]const u8, variable: []const u8, show: bool, pid: *isize) -> isize {
-    var descriptors: [2]i32 = [2]i32{ -1, -1 }
-    if std.linux.syscall4(std.linux.SYS_socketpair, 1, 1, 0, @intFromPtr(&descriptors)) != 0 { return -1 }
-    const ours = @intCast(usize, descriptors[0])
-    const theirs = @intCast(usize, descriptors[1])
-    _ = std.linux.syscall3(std.linux.SYS_fcntl, ours, std.linux.F_SETFD, std.linux.FD_CLOEXEC)
-    _ = std.linux.syscall3(std.linux.SYS_fcntl, ours, std.linux.F_SETFL, std.linux.O_NONBLOCK)
-    if compositor.*.verbose {
-        state.say("launch: ")
-        var length: usize = 0
-        while program[length] != 0 { length += 1 }
-        _ = std.io.writeAllBytes(std.io.stdout(), program, length)
-        state.say("\n")
-    }
-    const child = std.linux.process.fork()
-    if child == 0 {
-        _ = std.linux.syscall1(std.linux.SYS_close, ours)
-        execute(program, helperEnvironment(compositor, variable, theirs, show))
-        std.linux.exitGroup(127)
-    }
-    _ = std.linux.syscall1(std.linux.SYS_close, theirs)
+    var ours: isize = -1
+    var theirs: isize = -1
+    if !children.makeChannel(&ours, &theirs) { return -1 }
+    const child = children.runWith(compositor, program, helperEnvironment(compositor, variable, children.childNumber(theirs), show), theirs)
     if child < 0 {
-        _ = std.linux.syscall1(std.linux.SYS_close, ours)
+        children.closeChannel(ours)
         return -1
     }
     pid.* = child
-    return @intCast(isize, ours)
+    return ours
 }
 
 // Our environment for a helper, with `variable``descriptor` (and
@@ -222,8 +169,11 @@ fn helperEnvironment(compositor: *shell.Compositor, name: []const u8, descriptor
     return result
 }
 
-fn closeChannel(channel: isize) -> void {
-    if channel >= 0 { std.linux.close(channel) }
+fn closeChannel(channel: isize) -> void { children.closeChannel(channel) }
+
+pub fn closeLauncherChannel(compositor: *shell.Compositor) -> void {
+    closeChannel(compositor.*.launcherChannel)
+    compositor.*.launcherChannel = -1
 }
 
 // What the dock sent: 108 'l' is its apps button (the launcher shows,
@@ -243,8 +193,8 @@ pub fn helperMessages(compositor: *shell.Compositor) -> void {
     topbarMessages(compositor)
     if compositor.*.dockChannel < 0 { return }
     var bytes: [64]u8 = undefined
-    const count = std.linux.read(compositor.*.dockChannel, &bytes, 64)
-    if count == 0 || (count < 0 && count != -11) {
+    const count = children.receive(compositor.*.dockChannel, &bytes, 64)
+    if count == 0 {
         closeChannel(compositor.*.dockChannel)
         compositor.*.dockChannel = -1
         return
@@ -315,8 +265,8 @@ fn readU32(bytes: *[64]u8, at: usize) -> u32 {
 fn topbarMessages(compositor: *shell.Compositor) -> void {
     if compositor.*.topbarChannel < 0 { return }
     var bytes: [64]u8 = undefined
-    const count = std.linux.read(compositor.*.topbarChannel, &bytes, 64)
-    if count == 0 || (count < 0 && count != -11) {
+    const count = children.receive(compositor.*.topbarChannel, &bytes, 64)
+    if count == 0 {
         closeChannel(compositor.*.topbarChannel)
         compositor.*.topbarChannel = -1
         return
@@ -645,7 +595,7 @@ const DOCK_LINGER: u32 = 600
 const DOCK_SPEED: i32 = 1
 
 pub fn isDock(surface: *const shell.Surface) -> bool {
-    return surface.*.role == state.ROLE_LAYER && surface.*.hasLayerSurface && !surface.*.layerClosed && protocols_module.titleIs(surface, "mlx-dock")
+    return surface.*.role == state.ROLE_LAYER && surface.*.hasLayerSurface && !surface.*.layerClosed && protocols_module.titleIs(surface, "orbit")
 }
 
 // The dock's surface (0: none).
@@ -822,9 +772,8 @@ pub fn reapChildren(compositor: *shell.Compositor) -> void {
     // hears where its windows went.)
     lock_module.checkLogOut(compositor)
     notifyDock(compositor)
-    var status: usize = 0
     while true {
-        const pid = std.linux.process.waitProcess(-1, &status, std.linux.WNOHANG)
+        const pid = children.reap()
         if pid <= 0 { return }
         xwayland_module.reaped(compositor, pid)
         if pid == compositor.*.greeterPid {

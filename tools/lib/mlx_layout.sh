@@ -14,8 +14,8 @@
 #   managers, cron)                   sets one
 #   fish                              /etc/fish/conf.d/mlx.fish
 # The two edited files get BINDIR appended to their PATH values, which is
-# what mlx_remove_path_files takes away again. mlx-session, mlx-sh,
-# mlx-init, mlx-login and MLXIPC put /usr/bin/mlx on PATH themselves.
+# what mlx_remove_path_files takes away again. mlx-session, flux,
+# impulse, sentinel and MLXIPC put /usr/bin/mlx on PATH themselves.
 
 mlx_default_prefix=/usr
 
@@ -28,12 +28,12 @@ mlx_bindir() {
 # Every program an MLX installer puts in its bin directory, now or in the
 # layouts before PREFIX/bin/mlx (/usr/local/bin, /usr/bin).
 mlx_all_programs=(
-    mlx-compositor mlx-terminal mlx-sh mlx-console mlx-session mlx-dock
-    mlx-topbar mlx-launcher mlx-settings mlx-files mlx-observatory
-    mlx-codemap mlx-profile mlx-capture mlx-ipcd mlx-ipc mlx-audiod
-    mlx-audio mlx-permissions mlx-notifyd mlx-notify
-    mlx-login mlx-greeter mlx-lock
-    mlx-netd mlx-net
+    kepler vector flux mlx-console mlx-session orbit
+    horizon launch control polaris mlx-observatory
+    mlx-codemap mlx-profile mlx-capture synapse mlx-ipc resonance
+    mlx-audio scope beacon mlx-notify
+    sentinel aurora umbra
+    nexus mlx-net
 )
 
 # The files mlx_install_path_files writes, relative to DESTDIR.

@@ -1,0 +1,799 @@
+// std.wayland transport: brixOS's backend (std.os.brix, nothing of Linux).
+//
+// The same declarations as backend.mlx (Linux's), on brixOS's own objects:
+//
+// - Handle: a native handle (an isize holding the u32).
+// - Byte stream: a channel (channel_pair, channel_send, channel_receive):
+//   messages of up to 1024 bytes carrying up to four handles each, which
+//   the connection splits its output into and joins its input from, so
+//   the stream the Wayland wire expects is kept; handles arrive in order
+//   before the bytes of the message that consumes them, as they do with
+//   SCM_RIGHTS.
+// - Listening: a listener node (listener_make): opening it gives the
+//   opener a channel and sends its far end to the listener (accept takes
+//   it with channel_receive). The socket's path is the node's
+//   ($XDG_RUNTIME_DIR is /temporary on brixOS); there are no lock files.
+// - Waiting: the native wait, one item a handle; the event loop is a
+//   table of watched handles waited on together.
+// - Shared memory: memory objects (memory_object, memory_map_object).
+// - Environment: what the program's main was given, handed over by
+//   useEnvironment (no /proc here); nothing without it.
+const std = @import("std")
+const brix = std.os.brix
+const allocator_module = @import("../../../bootstrap/allocator.mlx")
+const string = @import("../../../bootstrap/string.mlx")
+const mem = @import("../../../bootstrap/mem.mlx")
+const wire = @import("../wire.mlx")
+
+pub const Allocator = allocator_module.Allocator
+pub const String = string.String
+
+// Linux's errno values, which std.wayland's callers compare against.
+pub const EAGAIN: isize = -11
+const EBADF: isize = -9
+const EPIPE: isize = -32
+const EMSGSIZE: isize = -90
+const EPROTO: isize = -71
+const ENOENT: isize = -2
+const ETIMEDOUT: isize = -110
+
+pub const INPUT_CAPACITY: usize = 65536
+pub const OUTPUT_CAPACITY: usize = 65536
+pub const OUTPUT_LIMIT: usize = 16777216
+pub const HANDLE_CAPACITY: usize = 1024
+
+// A channel message: what channel_send takes at most.
+const MESSAGE_BYTES: usize = 1024
+const MESSAGE_HANDLES: usize = 4
+// What lockPath answers (there is no lock): close() lets it be.
+const NO_LOCK: isize = 0x7FFF0000
+// Event loops are not handles: their descriptors are LOOP_BASE + the
+// loop's number, beyond any handle (a u32), and a wait on one waits on
+// everything it watches.
+const LOOP_BASE: isize = 0x100000000
+
+fn handleOf(descriptor: isize) -> brix.Handle { return @intCast(u32, @bitCast(usize, descriptor) & 0xFFFFFFFF) }
+
+// A Status (negative) as Linux's errno.
+fn errno(result: isize) -> isize {
+    if result >= 0 { return result }
+    const code = -result
+    if code == brix.Status.would_block { return EAGAIN }
+    if code == brix.Status.peer_gone { return EPIPE }
+    if code == brix.Status.invalid_handle || code == brix.Status.no_right { return EBADF }
+    if code == brix.Status.not_found { return ENOENT }
+    if code == brix.Status.timed_out { return ETIMEDOUT }
+    if code == 17 { return EMSGSIZE }
+    return EPROTO
+}
+
+// ---------------------------------------------------------------------------
+// Handles
+
+pub const Handle = struct {
+    descriptor: isize
+
+    pub fn fromDescriptor(descriptor: isize) -> Self { return Self.{ .descriptor = descriptor } }
+    pub fn invalid() -> Self { return Self.{ .descriptor = -1 } }
+    pub fn isValid(self: Self) -> bool { return self.descriptor >= 0 }
+    pub fn raw(self: Self) -> isize { return self.descriptor }
+
+    pub fn close(self: Self) -> void { closeDescriptor(self.descriptor) }
+
+    // The same object once more (every right it has), or invalid.
+    pub fn duplicate(self: Self) -> Self {
+        if self.descriptor < 0 { return invalid() }
+        var info = brix.Info.{ .kind = 0, .rights = 0, .state = 0, .reserved = 0 }
+        if brix.info(handleOf(self.descriptor), &info) < 0 { return invalid() }
+        const made = brix.duplicate(handleOf(self.descriptor), info.rights)
+        if made < 0 { return invalid() }
+        return Self.{ .descriptor = made }
+    }
+}
+
+fn closeDescriptor(descriptor: isize) -> void {
+    if descriptor < 0 || descriptor == NO_LOCK { return }
+    if descriptor >= LOOP_BASE {
+        const found = loopAt(descriptor)
+        if found != null { found.?.*.used = false }
+        return
+    }
+    _ = brix.close(handleOf(descriptor))
+}
+
+pub fn close(descriptor: isize) -> void { closeDescriptor(descriptor) }
+
+// Channels never block the connection: it asks and gets would_block.
+pub fn setNonBlocking(descriptor: isize) -> bool { return descriptor >= 0 }
+
+// ---------------------------------------------------------------------------
+// Sockets: listener nodes and channels
+
+// Opens the listener node at `path`: a channel to whoever listens there.
+pub fn connectPath(path: [*]const u8, path_length: usize) -> isize {
+    return errno(brix.open(0, path[0..path_length], brix.Open.READ | brix.Open.WRITE, 0))
+}
+
+// Who holds the other end of a channel (channel_peer).
+pub fn peerCredentials(descriptor: isize, pid: *u32, uid: *u32, gid: *u32) -> bool {
+    var peer = brix.Peer.{ .pid = 0, .user = 0, .group = 0, .nameLength = 0, .name = undefined }
+    if descriptor < 0 || brix.channelPeer(handleOf(descriptor), &peer) < 0 { return false }
+    pid.* = peer.pid
+    uid.* = peer.user
+    gid.* = peer.group
+    return true
+}
+
+// The program leaf name of who holds the other end (channel_peer); its
+// length, 0 when there is none.
+pub fn peerApp(descriptor: isize, out: [*]u8, capacity: usize) -> usize {
+    var peer = brix.Peer.{ .pid = 0, .user = 0, .group = 0, .nameLength = 0, .name = undefined }
+    if descriptor < 0 || brix.channelPeer(handleOf(descriptor), &peer) < 0 { return 0 }
+    var k: usize = 0
+    while k < @intCast(usize, peer.nameLength) && k < capacity && k < 64 {
+        out[k] = peer.name[k]
+        k += 1
+    }
+    return k
+}
+
+// Makes the listener node at `path`; the handle its connections come on.
+pub fn listenPath(path: [*]const u8, path_length: usize) -> isize {
+    return errno(brix.listen(0, path[0..path_length], 0x1B6))
+}
+
+// Takes one connection that arrived: its channel's handle, or EAGAIN.
+pub fn accept(listener: isize) -> isize {
+    var bytes: [4]u8 = undefined
+    var handles: [1]u32 = [1]u32{ 0 }
+    var sizes: [2]u32 = [2]u32{ 0, 0 }
+    const got = brix.receive(handleOf(listener), bytes[0..4], handles[0..1], &sizes)
+    if got < 0 { return errno(got) }
+    if sizes[1] != 1 || handles[0] == 0 { return EAGAIN }
+    return @intCast(isize, handles[0])
+}
+
+// A channel's two ends.
+pub fn socketPair(first: *isize, second: *isize) -> bool {
+    var ends: [2]u32 = [2]u32{ 0, 0 }
+    if brix.channelPair(&ends) < 0 { return false }
+    first.* = @intCast(isize, ends[0])
+    second.* = @intCast(isize, ends[1])
+    return true
+}
+
+// No lock files on brixOS: a listener node is taken or not.
+pub fn lockPath(path: [*]const u8) -> isize {
+    _ = path
+    return NO_LOCK
+}
+
+pub fn unlinkPath(path: [*]const u8) -> void {
+    var length: usize = 0
+    while path[length] != 0 { length += 1 }
+    _ = brix.remove(0, path[0..length])
+}
+
+fn deadlineOf(timeout_milliseconds: isize) -> usize {
+    if timeout_milliseconds < 0 { return brix.FOREVER }
+    return brix.clock(brix.Clock.MONOTONIC) + @intCast(usize, timeout_milliseconds) * 1000000
+}
+
+const WANT_READ: u32 = brix.State.READABLE | brix.State.PEER_GONE | brix.State.ENDED
+
+// The items a wait on `descriptor` takes: one for a handle, its watches'
+// for an event loop (each marked with `owner`). How many were added.
+fn addItems(descriptor: isize, writable: bool, owner: usize, items: [*]brix.WaitItem, owners: [*]usize, count: usize, capacity: usize) -> usize {
+    var added = count
+    if descriptor >= LOOP_BASE {
+        const found = loopAt(descriptor)
+        if found == null { return added }
+        const loop = found.?
+        var k: usize = 0
+        while k < loop.*.count && added < capacity {
+            const want: u32 = if loop.*.watches[k].writable { brix.State.WRITABLE | brix.State.PEER_GONE | brix.State.READABLE } else { WANT_READ }
+            items[added] = brix.WaitItem.{ .handle = handleOf(loop.*.watches[k].descriptor), .want = want, .seen = 0, .reserved = 0 }
+            owners[added] = owner
+            added += 1
+            k += 1
+        }
+        return added
+    }
+    if added < capacity {
+        items[added] = brix.WaitItem.{ .handle = handleOf(descriptor), .want = if writable { brix.State.WRITABLE | brix.State.PEER_GONE } else { WANT_READ }, .seen = 0, .reserved = 0 }
+        owners[added] = owner
+        added += 1
+    }
+    return added
+}
+
+// Waits until `descriptor` is readable (or writable): 1 when it is, 0 on
+// a timeout, else a negative errno.
+pub fn wait(descriptor: isize, writable: bool, timeout_milliseconds: isize) -> isize {
+    var items: [MAX_WATCHES]brix.WaitItem = undefined
+    var owners: [MAX_WATCHES]usize = undefined
+    const count = addItems(descriptor, writable, 0, &items, &owners, 0, MAX_WATCHES)
+    if count == 0 { return EBADF }
+    const ready = brix.wait(items[0..count], deadlineOf(timeout_milliseconds))
+    if ready == -brix.Status.timed_out { return 0 }
+    if ready < 0 { return errno(ready) }
+    return 1
+}
+
+// Waits until any of `count` descriptors (at most 16; event loops among
+// them) is readable (or hung up): how many are, 0 on a timeout, else a
+// negative errno.
+pub fn waitAny(descriptors: [*]const isize, count: usize, ready: [*]bool, timeout_milliseconds: isize) -> isize {
+    if count > 16 { return EMSGSIZE }
+    var items: [MAX_WATCHES]brix.WaitItem = undefined
+    var owners: [MAX_WATCHES]usize = undefined
+    var total: usize = 0
+    var index: usize = 0
+    while index < count {
+        total = addItems(descriptors[index], false, index, &items, &owners, total, MAX_WATCHES)
+        ready[index] = false
+        index += 1
+    }
+    if total == 0 { return EBADF }
+    const result = brix.wait(items[0..total], deadlineOf(timeout_milliseconds))
+    if result == -brix.Status.timed_out { return 0 }
+    if result < 0 { return errno(result) }
+    var found: isize = 0
+    index = 0
+    while index < total {
+        if items[index].seen & items[index].want != 0 && !ready[owners[index]] {
+            ready[owners[index]] = true
+            found += 1
+        }
+        index += 1
+    }
+    return found
+}
+
+// ---------------------------------------------------------------------------
+// Connections
+
+pub const Connection = struct {
+    descriptor: isize
+    allocator: Allocator
+    input: [*]u8
+    inputStart: usize
+    inputEnd: usize
+    inputHandles: [*]isize
+    inputHandleStart: usize
+    inputHandleEnd: usize
+    output: [*]u8
+    outputLength: usize
+    outputCapacity: usize
+    outputHandles: [*]isize
+    outputHandleCount: usize
+    outputHandlesSent: bool
+    closed: bool
+}
+
+// Takes ownership of `descriptor` (a channel end). False (leaving it
+// open) when the buffers cannot be allocated.
+pub fn init(connection: *Connection, allocator: Allocator, descriptor: isize) -> bool {
+    const input = allocator.alloc(INPUT_CAPACITY, 16)
+    if input == null { return false }
+    const output = allocator.alloc(OUTPUT_CAPACITY, 16)
+    if output == null {
+        allocator.free(input.?, INPUT_CAPACITY, 16)
+        return false
+    }
+    const input_handles = allocator.alloc(HANDLE_CAPACITY * 8, 8)
+    if input_handles == null {
+        allocator.free(input.?, INPUT_CAPACITY, 16)
+        allocator.free(output.?, OUTPUT_CAPACITY, 16)
+        return false
+    }
+    const output_handles = allocator.alloc(wire.MAX_HANDLES * 8, 8)
+    if output_handles == null {
+        allocator.free(input.?, INPUT_CAPACITY, 16)
+        allocator.free(output.?, OUTPUT_CAPACITY, 16)
+        allocator.free(input_handles.?, HANDLE_CAPACITY * 8, 8)
+        return false
+    }
+    connection.*.descriptor = descriptor
+    connection.*.allocator = allocator
+    connection.*.input = input.?
+    connection.*.inputStart = 0
+    connection.*.inputEnd = 0
+    unsafe { connection.*.inputHandles = @ptrCast([*]isize, input_handles.?) }
+    connection.*.inputHandleStart = 0
+    connection.*.inputHandleEnd = 0
+    connection.*.output = output.?
+    connection.*.outputCapacity = OUTPUT_CAPACITY
+    connection.*.outputLength = 0
+    unsafe { connection.*.outputHandles = @ptrCast([*]isize, output_handles.?) }
+    connection.*.outputHandleCount = 0
+    connection.*.outputHandlesSent = false
+    connection.*.closed = false
+    return true
+}
+
+// Closes the channel and every handle the connection still holds, then
+// releases the buffers.
+pub fn deinit(connection: *Connection) -> void {
+    closeDescriptor(connection.*.descriptor)
+    connection.*.descriptor = -1
+    var index = connection.*.inputHandleStart
+    while index < connection.*.inputHandleEnd {
+        closeDescriptor(connection.*.inputHandles[index])
+        index += 1
+    }
+    if !connection.*.outputHandlesSent {
+        index = 0
+        while index < connection.*.outputHandleCount {
+            closeDescriptor(connection.*.outputHandles[index])
+            index += 1
+        }
+    }
+    const allocator = connection.*.allocator
+    allocator.free(connection.*.input, INPUT_CAPACITY, 16)
+    allocator.free(connection.*.output, connection.*.outputCapacity, 16)
+    unsafe {
+        allocator.free(@ptrCast([*]u8, connection.*.inputHandles), HANDLE_CAPACITY * 8, 8)
+        allocator.free(@ptrCast([*]u8, connection.*.outputHandles), wire.MAX_HANDLES * 8, 8)
+    }
+    connection.*.closed = true
+}
+
+pub fn pendingOutput(connection: *const Connection) -> usize { return connection.*.outputLength }
+
+// Sends the buffered bytes as channel messages (MESSAGE_BYTES each), the
+// handles not yet sent riding the first ones, MESSAGE_HANDLES a message
+// (they leave this table as they go). 0 once everything was sent,
+// EAGAIN when the channel is full, else a negative errno.
+pub fn flush(connection: *Connection) -> isize {
+    while connection.*.outputLength > 0 {
+        var handles: [MESSAGE_HANDLES]u32 = undefined
+        var count: usize = 0
+        var remainingHandles: usize = 0
+        if !connection.*.outputHandlesSent {
+            while count < MESSAGE_HANDLES && count < connection.*.outputHandleCount {
+                handles[count] = handleOf(connection.*.outputHandles[count])
+                count += 1
+            }
+            remainingHandles = connection.*.outputHandleCount - count
+        }
+        const amount = if connection.*.outputLength > MESSAGE_BYTES { MESSAGE_BYTES } else { connection.*.outputLength }
+        const sent = brix.send(handleOf(connection.*.descriptor), connection.*.output[0..amount], handles[0..count])
+        if sent < 0 { return errno(sent) }
+        // The handles moved into the message: the ones left shift down.
+        if count > 0 {
+            var index: usize = 0
+            while index < remainingHandles {
+                connection.*.outputHandles[index] = connection.*.outputHandles[count + index]
+                index += 1
+            }
+            connection.*.outputHandleCount = remainingHandles
+            if remainingHandles == 0 { connection.*.outputHandlesSent = true }
+        }
+        const remaining = connection.*.outputLength - amount
+        var index: usize = 0
+        while index < remaining {
+            connection.*.output[index] = connection.*.output[amount + index]
+            index += 1
+        }
+        connection.*.outputLength = remaining
+        if remaining == 0 {
+            connection.*.outputHandleCount = 0
+            connection.*.outputHandlesSent = false
+        }
+    }
+    return 0
+}
+
+fn makeOutputRoom(connection: *Connection, length: usize) -> bool {
+    const needed = connection.*.outputLength + length
+    if needed <= connection.*.outputCapacity { return true }
+    if needed > OUTPUT_LIMIT { return false }
+    var capacity = connection.*.outputCapacity
+    while capacity < needed { capacity *= 2 }
+    if capacity > OUTPUT_LIMIT { capacity = OUTPUT_LIMIT }
+    const grown = connection.*.allocator.resize(connection.*.output, connection.*.outputCapacity, capacity, 16)
+    if grown == null { return false }
+    connection.*.output = grown.?
+    connection.*.outputCapacity = capacity
+    return true
+}
+
+// Appends one finished message to the output, flushing first when the
+// bytes or handles would not fit; its handles are the connection's from
+// here on. 0, EAGAIN (full and the peer not reading), or an errno.
+pub fn queue(connection: *Connection, writer: *const wire.Writer) -> isize {
+    const needs_room = connection.*.outputLength + writer.*.length > connection.*.outputCapacity
+    const needs_handles = writer.*.handleCount > 0 && (connection.*.outputHandlesSent || connection.*.outputHandleCount + writer.*.handleCount > wire.MAX_HANDLES)
+    if needs_room || needs_handles {
+        const flushed = flush(connection)
+        if flushed < 0 && flushed != EAGAIN { return flushed }
+        if !makeOutputRoom(connection, writer.*.length) { return EAGAIN }
+        if writer.*.handleCount > 0 && connection.*.outputLength > 0 { return EAGAIN }
+    }
+    wire.copyBytes(writer, connection.*.output + connection.*.outputLength)
+    connection.*.outputLength += writer.*.length
+    var index: usize = 0
+    while index < writer.*.handleCount {
+        connection.*.outputHandles[connection.*.outputHandleCount] = wire.handleAt(writer, index)
+        connection.*.outputHandleCount += 1
+        index += 1
+    }
+    return 0
+}
+
+// queue for bytes made elsewhere: `length` bytes and `count` handles.
+pub fn queueBytes(connection: *Connection, bytes: [*]const u8, length: usize, descriptors: [*]const isize, count: usize) -> isize {
+    if length > OUTPUT_CAPACITY || count > wire.MAX_HANDLES { return EMSGSIZE }
+    const needs_room = connection.*.outputLength + length > connection.*.outputCapacity
+    const needs_handles = count > 0 && (connection.*.outputHandlesSent || connection.*.outputHandleCount + count > wire.MAX_HANDLES)
+    if needs_room || needs_handles {
+        const flushed = flush(connection)
+        if flushed < 0 && flushed != EAGAIN { return flushed }
+        if !makeOutputRoom(connection, length) { return EAGAIN }
+        if count > 0 && connection.*.outputLength > 0 { return EAGAIN }
+    }
+    mem.copy(connection.*.output + connection.*.outputLength, bytes, length)
+    connection.*.outputLength += length
+    var index: usize = 0
+    while index < count {
+        connection.*.outputHandles[connection.*.outputHandleCount] = descriptors[index]
+        connection.*.outputHandleCount += 1
+        index += 1
+    }
+    return 0
+}
+
+fn compactInput(connection: *Connection) -> void {
+    if connection.*.inputStart > 0 {
+        const length = connection.*.inputEnd - connection.*.inputStart
+        const from: [*]const u8 = connection.*.input + connection.*.inputStart
+        mem.copy(connection.*.input, from, length)
+        connection.*.inputStart = 0
+        connection.*.inputEnd = length
+    }
+    if connection.*.inputHandleStart > 0 {
+        const count = connection.*.inputHandleEnd - connection.*.inputHandleStart
+        var index: usize = 0
+        while index < count {
+            connection.*.inputHandles[index] = connection.*.inputHandles[connection.*.inputHandleStart + index]
+            index += 1
+        }
+        connection.*.inputHandleStart = 0
+        connection.*.inputHandleEnd = count
+    }
+}
+
+// Takes every message the channel has, queueing their handles in order:
+// the bytes read, 0 at the end of the stream (the peer gone and nothing
+// left), EAGAIN when nothing is there, else a negative errno.
+pub fn receive(connection: *Connection) -> isize {
+    compactInput(connection)
+    var total: usize = 0
+    while true {
+        const room = INPUT_CAPACITY - connection.*.inputEnd
+        if room < MESSAGE_BYTES { return if total > 0 { @intCast(isize, total) } else { EMSGSIZE } }
+        if connection.*.inputHandleEnd + MESSAGE_HANDLES > HANDLE_CAPACITY { return if total > 0 { @intCast(isize, total) } else { EMSGSIZE } }
+        var handles: [MESSAGE_HANDLES]u32 = undefined
+        var sizes: [2]u32 = [2]u32{ 0, 0 }
+        const got = brix.receive(handleOf(connection.*.descriptor), connection.*.input[connection.*.inputEnd..connection.*.inputEnd + room], handles[0..MESSAGE_HANDLES], &sizes)
+        if got < 0 {
+            if got == -brix.Status.would_block { return if total > 0 { @intCast(isize, total) } else { EAGAIN } }
+            if got == -brix.Status.peer_gone { return @intCast(isize, total) }
+            return errno(got)
+        }
+        var index: usize = 0
+        while index < @intCast(usize, sizes[1]) {
+            connection.*.inputHandles[connection.*.inputHandleEnd] = @intCast(isize, handles[index])
+            connection.*.inputHandleEnd += 1
+            index += 1
+        }
+        connection.*.inputEnd += @intCast(usize, sizes[0])
+        total += @intCast(usize, sizes[0])
+        // A message of nothing (a connection's hello): counted as read.
+        if sizes[0] == 0 && sizes[1] == 0 { total += 0 }
+    }
+    return @intCast(isize, total)
+}
+
+pub fn bufferedInput(connection: *const Connection) -> usize {
+    return connection.*.inputEnd - connection.*.inputStart
+}
+
+pub fn bufferedHandles(connection: *const Connection) -> usize {
+    return connection.*.inputHandleEnd - connection.*.inputHandleStart
+}
+
+pub fn inputPointer(connection: *const Connection) -> [*]const u8 {
+    return connection.*.input + connection.*.inputStart
+}
+
+pub fn handlePointer(connection: *const Connection) -> [*]const isize {
+    unsafe { return @ptrFromInt([*]const isize, @intFromPtr(connection.*.inputHandles) + connection.*.inputHandleStart * 8) }
+}
+
+// Drops a processed message and hands its `handles` leading queued
+// handles to the consumer.
+pub fn consume(connection: *Connection, size: usize, handles: usize) -> void {
+    connection.*.inputStart += size
+    connection.*.inputHandleStart += handles
+    if connection.*.inputStart == connection.*.inputEnd {
+        connection.*.inputStart = 0
+        connection.*.inputEnd = 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event loop: a table of watched handles, waited on together (the records
+// a wait fills: flags and the token, as Linux's epoll gives them).
+
+pub const EPOLLIN: u32 = 1
+pub const EPOLLOUT: u32 = 4
+pub const EPOLLERR: u32 = 8
+pub const EPOLLHUP: u32 = 16
+
+const MAX_LOOPS: usize = 4
+const MAX_WATCHES: usize = 64
+const RECORD_SIZE: usize = 16
+const MAX_RECORDS: usize = 24
+
+pub const Events = struct {
+    records: [384]u8
+    count: usize
+}
+
+const Watch = struct {
+    descriptor: isize
+    token: usize
+    writable: bool
+}
+
+const Loop = struct {
+    used: bool
+    watches: [MAX_WATCHES]Watch
+    count: usize
+}
+
+var loops: [MAX_LOOPS]Loop = undefined // (per run)
+var loopsReady: bool = false // (per run)
+
+fn loopAt(event_loop: isize) -> ?*Loop {
+    if event_loop < LOOP_BASE || event_loop >= LOOP_BASE + @intCast(isize, MAX_LOOPS) { return null }
+    const loop = &loops[@bitCast(usize, event_loop - LOOP_BASE)]
+    if !loop.*.used { return null }
+    return loop
+}
+
+pub fn createEventLoop() -> isize {
+    if !loopsReady {
+        var k: usize = 0
+        while k < MAX_LOOPS {
+            loops[k].used = false
+            k += 1
+        }
+        loopsReady = true
+    }
+    var k: usize = 0
+    while k < MAX_LOOPS {
+        if !loops[k].used {
+            loops[k].used = true
+            loops[k].count = 0
+            return LOOP_BASE + @intCast(isize, k)
+        }
+        k += 1
+    }
+    return EMSGSIZE
+}
+
+pub fn watch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool {
+    const found = loopAt(event_loop)
+    if found == null { return false }
+    const loop = found.?
+    if loop.*.count >= MAX_WATCHES { return false }
+    loop.*.watches[loop.*.count] = Watch.{ .descriptor = descriptor, .token = token, .writable = writable }
+    loop.*.count += 1
+    return true
+}
+
+pub fn rewatch(event_loop: isize, descriptor: isize, token: usize, writable: bool) -> bool {
+    const found = loopAt(event_loop)
+    if found == null { return false }
+    const loop = found.?
+    var k: usize = 0
+    while k < loop.*.count {
+        if loop.*.watches[k].descriptor == descriptor {
+            loop.*.watches[k].token = token
+            loop.*.watches[k].writable = writable
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+pub fn unwatch(event_loop: isize, descriptor: isize) -> bool {
+    const found = loopAt(event_loop)
+    if found == null { return false }
+    const loop = found.?
+    var k: usize = 0
+    while k < loop.*.count {
+        if loop.*.watches[k].descriptor == descriptor {
+            loop.*.watches[k] = loop.*.watches[loop.*.count - 1]
+            loop.*.count -= 1
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+fn putRecord(events: *Events, flags: u32, token: usize) -> void {
+    if events.*.count >= MAX_RECORDS { return }
+    const at = events.*.count * RECORD_SIZE
+    const bytes: [*]u8 = &events.*.records
+    bytes[at] = @intCast(u8, flags & 255)
+    bytes[at + 1] = @intCast(u8, (flags >> 8) & 255)
+    bytes[at + 2] = 0
+    bytes[at + 3] = 0
+    var k: usize = 0
+    while k < 8 {
+        bytes[at + 8 + k] = @intCast(u8, (token >> @intCast(u6, k * 8)) & 255)
+        k += 1
+    }
+    events.*.count += 1
+}
+
+// Waits for readiness: the records' count, 0 on a timeout, else a
+// negative errno. A negative timeout waits for ever.
+pub fn waitEvents(event_loop: isize, events: *Events, timeout_milliseconds: isize) -> isize {
+    events.*.count = 0
+    const found = loopAt(event_loop)
+    if found == null { return EBADF }
+    const loop = found.?
+    var items: [MAX_WATCHES]brix.WaitItem = undefined
+    var owners: [MAX_WATCHES]usize = undefined
+    var k = addItems(event_loop, false, 0, &items, &owners, 0, MAX_WATCHES)
+    if loop.*.count == 0 {
+        // Nothing to watch: the timeout alone.
+        if timeout_milliseconds < 0 { return 0 }
+        var pause: [1]brix.WaitItem = undefined
+        pause[0] = brix.WaitItem.{ .handle = brix.ofDescriptor(2), .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+        _ = brix.wait(pause[0..1], deadlineOf(timeout_milliseconds))
+        return 0
+    }
+    const result = brix.wait(items[0..k], deadlineOf(timeout_milliseconds))
+    if result == -brix.Status.timed_out { return 0 }
+    if result < 0 { return errno(result) }
+    k = 0
+    while k < loop.*.count {
+        const seen = items[k].seen & items[k].want
+        if seen != 0 {
+            var flags: u32 = 0
+            if seen & brix.State.READABLE != 0 { flags |= EPOLLIN }
+            if seen & brix.State.WRITABLE != 0 { flags |= EPOLLOUT }
+            if seen & (brix.State.PEER_GONE | brix.State.ENDED) != 0 { flags |= EPOLLHUP }
+            putRecord(events, flags, loop.*.watches[k].token)
+        }
+        k += 1
+    }
+    return @intCast(isize, events.*.count)
+}
+
+pub fn eventFlags(events: *const Events, index: usize) -> u32 {
+    const bytes: [*]const u8 = &events.*.records
+    const at = index * RECORD_SIZE
+    return @intCast(u32, bytes[at]) | (@intCast(u32, bytes[at + 1]) << 8)
+}
+
+pub fn eventToken(events: *const Events, index: usize) -> usize {
+    const bytes: [*]const u8 = &events.*.records
+    const at = index * RECORD_SIZE + 8
+    var value: usize = 0
+    var k: usize = 8
+    while k > 0 {
+        k -= 1
+        value = (value << 8) | @intCast(usize, bytes[at + k])
+    }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// Shared memory: memory objects
+
+// A memory object of `size` bytes: its handle, or a negative errno.
+pub fn createSharedMemory(size: usize) -> isize {
+    return errno(brix.memoryObject(size))
+}
+
+// Maps `size` bytes of a memory object: the address, or 0.
+pub fn mapSharedMemory(descriptor: isize, size: usize, writable: bool) -> usize {
+    const mapped = brix.mapObject(handleOf(descriptor), 0, size, if writable { brix.Map.WRITE } else { 0 })
+    if mapped < 0 { return 0 }
+    return @bitCast(usize, mapped)
+}
+
+pub fn unmapSharedMemory(address: usize, size: usize) -> void { _ = brix.unmap(address, size) }
+
+// ---------------------------------------------------------------------------
+// Environment: what main was given, handed over by useEnvironment.
+
+pub const Environment = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+    allocator: Allocator
+}
+
+var knownEnvironment: [*][*]const u8 = undefined // (per run)
+var knownEnvironmentSet: bool = false // (per run)
+
+// The program's environment entries (std.process.environmentEntries of
+// main's arguments), for what asks the transport for them.
+pub fn useEnvironment(entries: [*][*]const u8) -> void {
+    knownEnvironment = entries
+    knownEnvironmentSet = true
+}
+
+pub fn loadEnvironment(environment: *Environment, allocator: Allocator) -> bool {
+    var capacity: usize = 16384
+    const memory = allocator.alloc(capacity, 1)
+    if memory == null { return false }
+    var bytes = memory.?
+    var length: usize = 0
+    if knownEnvironmentSet {
+        var k: usize = 0
+        while @intFromPtr(knownEnvironment[k]) != 0 {
+            const entry = knownEnvironment[k]
+            var entryLength: usize = 0
+            while entry[entryLength] != 0 { entryLength += 1 }
+            if length + entryLength + 1 > capacity {
+                const grown = allocator.resize(bytes, capacity, capacity * 2, 1)
+                if grown == null {
+                    allocator.free(bytes, capacity, 1)
+                    return false
+                }
+                bytes = grown.?
+                capacity *= 2
+            }
+            mem.copy(bytes + length, entry, entryLength)
+            length += entryLength
+            bytes[length] = 0
+            length += 1
+            k += 1
+        }
+    }
+    environment.*.bytes = bytes
+    environment.*.length = length
+    environment.*.capacity = capacity
+    environment.*.allocator = allocator
+    return true
+}
+
+// Looks up `name`; the result borrows the snapshot. A missing variable
+// has a zero pointer (wire.isNull).
+pub fn lookupEnvironment(environment: *const Environment, name: []const u8) -> String {
+    var name_length: usize = 0
+    name_length += name.length
+    var start: usize = 0
+    while start < environment.*.length {
+        var end = start
+        while end < environment.*.length && environment.*.bytes[end] != 0 { end += 1 }
+        if end - start > name_length && environment.*.bytes[start + name_length] == 61 {
+            var matches = true
+            var index: usize = 0
+            for byte in name {
+                if environment.*.bytes[start + index] != byte { matches = false }
+                index += 1
+            }
+            if matches {
+                return string.fromParts(environment.*.bytes + start + name_length + 1, end - start - name_length - 1)
+            }
+        }
+        start = end + 1
+    }
+    return wire.nullString()
+}
+
+pub fn freeEnvironment(environment: *Environment) -> void {
+    environment.*.allocator.free(environment.*.bytes, environment.*.capacity, 1)
+}

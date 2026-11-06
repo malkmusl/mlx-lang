@@ -83,7 +83,7 @@ fi
 
 # Screen sharing through this library (tools/check_screencast.sh's first
 # case, with LD_LIBRARY_PATH).
-for program in ipc/main:mlx-ipcd compositor/main:mlx-compositor capture/main:mlx-capture; do
+for program in ipc/main:synapse compositor/main:kepler capture/main:mlx-capture; do
     "$compiler" --quiet "projects/desktop/${program%%:*}.mlx" -o "$work/${program##*:}"
 done
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
@@ -93,7 +93,7 @@ cat > "$work/services/org.freedesktop.portal.Desktop.service" <<SERVICE
 Name=org.freedesktop.portal.Desktop
 Exec=$work/mlx-capture --portal --verbose --choose screen
 SERVICE
-"$work/mlx-ipcd" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose --services "$work/services" > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 [[ -S "$XDG_RUNTIME_DIR/bus" ]] || fail "MLXIPC did not come up"
@@ -114,7 +114,7 @@ chmod +x "$work/screen.sh"
 "$work/test-host" host-screen "$work/us.xkb" "$work/screen.script" > "$work/host.log" 2>&1 &
 host=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-screen" ]] && break; sleep 0.1; done
-WAYLAND_DISPLAY=host-screen timeout 120 "$work/mlx-compositor" --renderer cpu --size 640x400 --no-fps --socket wayland-mlx \
+WAYLAND_DISPLAY=host-screen timeout 120 "$work/kepler" --renderer cpu --size 640x400 --no-fps --socket wayland-mlx \
     --dock none --topbar none --launcher none --xwayland none --run "$work/screen.sh" > "$work/compositor.log" 2>&1 || true
 wait "$host" || true
 [[ "$(cat "$work/share.status" 2> /dev/null)" == 0 ]] || fail "the pipeline did not end well"

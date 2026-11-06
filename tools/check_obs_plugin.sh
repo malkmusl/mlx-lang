@@ -6,7 +6,7 @@
 # load, connect to the compositor and hand OBS frames; the recording must
 # grow, and OBS's preview (in the host's screenshot) must show the screen,
 # OBS's own window included. While it records, the source is switched to
-# mlx-settings' window and back twice, as in its properties
+# control' window and back twice, as in its properties
 # (tools/obs-test/control.py over obs-websocket): each target must hand
 # OBS frames, and OBS must never be handed an empty frame (it says
 # "Allocating 0 bytes"; newer versions end on it).
@@ -28,8 +28,8 @@ export XDG_RUNTIME_DIR="$work/runtime"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 trap 'rm -rf -- "$work"' EXIT
 
-"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/mlx-compositor"
-"$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/mlx-settings"
+"$compiler" --quiet projects/desktop/compositor/main.mlx -o "$work/kepler"
+"$compiler" --quiet projects/desktop/settings/main.mlx -o "$work/control"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet --plugin projects/desktop/capture/obs.mlx -o "$work/mlx-capture.so"
 xkbcli compile-keymap --layout us > "$work/us.xkb"
@@ -99,7 +99,7 @@ SCRIPT
 "$work/test-host" host-obs "$work/us.xkb" "$work/obs.script" > "$work/host.log" 2>&1 &
 host_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/host-obs" ]] && break; sleep 0.1; done
-WAYLAND_DISPLAY=host-obs XDG_CONFIG_HOME="$work/config" timeout 90 "$work/mlx-compositor" --verbose --renderer cpu --socket nested-obs --no-fps --launcher none --dock none --topbar none --xwayland none --size 1600x1000 --run "$work/mlx-settings" --run "$work/obs.sh" --run "$work/switch.sh" > "$work/compositor.log" 2>&1 || true
+WAYLAND_DISPLAY=host-obs XDG_CONFIG_HOME="$work/config" timeout 90 "$work/kepler" --verbose --renderer cpu --socket nested-obs --no-fps --launcher none --dock none --topbar none --xwayland none --size 1600x1000 --run "$work/control" --run "$work/obs.sh" --run "$work/switch.sh" > "$work/compositor.log" 2>&1 || true
 wait "$host_pid" || { echo "test host failed:" >&2; cat "$work/host.log" >&2; exit 1; }
 
 log=$(ls "$config"/obs-studio/logs/*.txt 2> /dev/null | head -1)

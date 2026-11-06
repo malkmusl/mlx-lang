@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# MLXIPC (projects/desktop/ipc) end to end: mlx-ipcd as the session bus for
+# MLXIPC (projects/desktop/ipc) end to end: synapse as the session bus for
 # real D-Bus programs (dbus-send, gdbus, busctl, dbus-monitor) and for
-# mlx-ipc (std.dbus's client), its permissions per app, activation and
-# direct channels.
+# mlx-ipc (native by default, --dbus for std.dbus's client), its
+# permissions per app, activation and direct channels.
 #
 #   - the bus answers org.freedesktop.DBus (ListNames, GetNameOwner,
 #     credentials, Introspect, ListActivatableNames) to dbus-send, gdbus and
 #     busctl, and dbus-monitor sees the traffic (BecomeMonitor);
-#   - `mlx-ipc serve` owns a name; dbus-send, gdbus and mlx-ipc call it, and
-#     `mlx-ipc connect` gets a direct channel to it (org.mlx.IPC.Connect);
+#   - `mlx-ipc --dbus serve` owns a name on the D-Bus client; dbus-send,
+#     gdbus and mlx-ipc call it, and `mlx-ipc --dbus connect` gets a direct
+#     channel to it (org.mlx.IPC.Connect);
 #   - MLXIPC's native wire format (std.ipc, tests/343_ipc_wire_runtime.mlx)
-#     on the same socket: `mlx-ipc --native` lists names, calls a D-Bus
-#     service and serves a name that dbus-send, gdbus and mlx-ipc call;
-#     two native programs get a direct channel; dbus-monitor sees a
-#     native signal; GetProtocol says what each connection speaks;
+#     is mlx-ipc's default on the same socket: `mlx-ipc` with no flag lists
+#     names, calls a D-Bus service and serves a name that dbus-send, gdbus
+#     and `mlx-ipc --dbus` call; two native programs get a direct channel;
+#     dbus-monitor sees a native signal; GetProtocol says what each
+#     connection speaks;
 #   - hostile clients (tools/check_ipc_hostile.py): invalid names, paths,
 #     strings, booleans, descriptor indexes, signatures and framing in
 #     either format drop the sender and nobody else; a connection that
@@ -57,7 +59,7 @@ export XDG_STATE_HOME="$work/state"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 mkdir -p "$XDG_CONFIG_HOME/mlx" "$work/services"
 
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 "$compiler" --quiet projects/desktop/ipc/tool.mlx -o "$work/mlx-ipc"
 "$compiler" --quiet tests/343_ipc_wire_runtime.mlx -o "$work/wire"
 ipc="$work/mlx-ipc"
@@ -82,10 +84,10 @@ expect() {
 cat > "$work/services/org.example.Started.service" <<SERVICE
 [D-BUS Service]
 Name=org.example.Started
-Exec=$ipc serve org.example.Started
+Exec=$ipc --dbus serve org.example.Started
 SERVICE
 
-"$work/mlx-ipcd" --verbose --auth-timeout 2 --services "$work/services" > "$work/bus.log" 2>&1 &
+"$work/synapse" --verbose --auth-timeout 2 --services "$work/services" > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 0.1; done
 [[ -S "$XDG_RUNTIME_DIR/bus" ]] || fail "the bus does not listen"
@@ -117,45 +119,46 @@ expect "login.device can be delegated explicitly" "(true,)" gdbus call --session
 : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 sleep 0.3
 
-# A service of ours, called by everyone.
-"$ipc" serve org.example.Echo > "$work/serve.log" 2>&1 &
+# A service of ours on the D-Bus client (--dbus), called by everyone.
+"$ipc" --dbus serve org.example.Echo > "$work/serve.log" 2>&1 &
 for _ in $(seq 1 50); do grep -q serving "$work/serve.log" 2> /dev/null && break; sleep 0.1; done
-expect "mlx-ipc call" "hallo welt" "$ipc" call org.example.Echo "hallo welt"
+expect "mlx-ipc call" "hallo welt" "$ipc" --dbus call org.example.Echo "hallo welt"
 expect "dbus-send calls it" 'string "von dbus-send"' dbus-send --session --print-reply --dest=org.example.Echo / org.mlx.Echo.Echo "string:von dbus-send"
 expect "gdbus calls it" "('von gdbus',)" gdbus call --session --dest org.example.Echo --object-path / --method org.mlx.Echo.Echo "von gdbus"
-expect "a direct channel" "hello from org.example.Echo" "$ipc" connect org.example.Echo
-expect "an unknown name" "ServiceUnknown" "$ipc" call org.example.Nobody x
-expect "apps" "mlx-ipc" "$ipc" apps
-expect "activation" "gestartet" "$ipc" call org.example.Started gestartet
+expect "a direct channel" "hello from org.example.Echo" "$ipc" --dbus connect org.example.Echo
+expect "an unknown name" "ServiceUnknown" "$ipc" --dbus call org.example.Nobody x
+expect "apps" "mlx-ipc" "$ipc" --dbus apps
+expect "activation" "gestartet" "$ipc" --dbus call org.example.Started gestartet
 grep -q "starting org.example.Started" "$work/bus.log" || fail "the service was not started by the bus"
 
-# The native wire format (std.ipc), on the same socket as D-Bus.
+# The native wire format (std.ipc), the default, on the same socket as
+# D-Bus. mlx-ipc speaks it with no flag; --dbus is the compatibility path.
 set +e
 "$work/wire"
 status=$?
 set -e
 [[ $status -eq 13 ]] || fail "tests/343_ipc_wire_runtime.mlx: exit $status (wanted 13)"
 echo "ok   std.ipc: values, messages and conversions (tests/343_ipc_wire_runtime.mlx)"
-expect "native: ListNames" "org.freedesktop.DBus" "$ipc" --native names
-expect "native: calls a D-Bus service" "nativ zu dbus" "$ipc" --native call org.example.Echo "nativ zu dbus"
-expect "native: a D-Bus service's protocol" "org.example.Echo: dbus" "$ipc" --native protocol org.example.Echo
-expect "native: an unknown name" "ServiceUnknown" "$ipc" --native call org.example.Nobody x
-"$ipc" --native serve org.example.Native > "$work/native.log" 2>&1 &
+expect "native: ListNames" "org.freedesktop.DBus" "$ipc" names
+expect "native: calls a D-Bus service" "nativ zu dbus" "$ipc" call org.example.Echo "nativ zu dbus"
+expect "native: a D-Bus service's protocol" "org.example.Echo: dbus" "$ipc" protocol org.example.Echo
+expect "native: an unknown name" "ServiceUnknown" "$ipc" call org.example.Nobody x
+"$ipc" serve org.example.Native > "$work/native.log" 2>&1 &
 for _ in $(seq 1 50); do grep -q serving "$work/native.log" 2> /dev/null && break; sleep 0.1; done
 grep -q "(mlx)" "$work/native.log" || fail "native serve: $(cat "$work/native.log")"
-expect "native: served and called natively" "beide nativ" "$ipc" --native call org.example.Native "beide nativ"
-expect "native: served, called by mlx-ipc on D-Bus" "dbus zu nativ" "$ipc" call org.example.Native "dbus zu nativ"
+expect "native: served and called natively" "beide nativ" "$ipc" call org.example.Native "beide nativ"
+expect "native: served, called by mlx-ipc on D-Bus" "dbus zu nativ" "$ipc" --dbus call org.example.Native "dbus zu nativ"
 expect "native: served, called by dbus-send" 'string "von dbus-send"' dbus-send --session --print-reply --dest=org.example.Native / org.mlx.Echo.Echo "string:von dbus-send"
 expect "native: served, called by gdbus" "('von gdbus',)" gdbus call --session --dest org.example.Native --object-path / --method org.mlx.Echo.Echo "von gdbus"
 expect "native: an unknown method" "UnknownMethod" gdbus call --session --dest org.example.Native --object-path / --method org.mlx.Echo.Nothing
-expect "native: its protocol" "org.example.Native: mlx" "$ipc" protocol org.example.Native
-expect "native: a direct channel, native at both ends" "org.mlx.Echo.Hello: hello from org.example.Native (mlx)" "$ipc" --native connect org.example.Native
-expect "native: apps" "mlx-ipc" "$ipc" --native apps
-expect "native: a signal" "sent org.mlx.Echo.Said" "$ipc" --native emit "signal nativ"
+expect "native: its protocol" "org.example.Native: mlx" "$ipc" --dbus protocol org.example.Native
+expect "native: a direct channel, native at both ends" "org.mlx.Echo.Hello: hello from org.example.Native (mlx)" "$ipc" connect org.example.Native
+expect "native: apps" "mlx-ipc" "$ipc" apps
+expect "native: a signal" "sent org.mlx.Echo.Said" "$ipc" emit "signal nativ"
 expect "GetProtocol is introspected" "GetProtocol" gdbus introspect --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus
 grep -q "is mlx-ipc (mlx)" "$work/bus.log" || fail "the bus did not log a native connection"
 python3 -I tools/check_ipc_hostile.py "$XDG_RUNTIME_DIR/bus" 2 || fail "a hostile client was not dropped"
-expect "the bus serves on after the hostile clients" "nach dem Sturm" "$ipc" --native call org.example.Echo "nach dem Sturm"
+expect "the bus serves on after the hostile clients" "nach dem Sturm" "$ipc" call org.example.Echo "nach dem Sturm"
 grep -q "did not say Hello in time" "$work/bus.log" || fail "no connection was dropped for its missing Hello"
 if command -v dbus-monitor > /dev/null; then
     sleep 0.3
@@ -174,15 +177,15 @@ deny dbus-send own org.example.*
 allow dbus-send own org.example.Owned
 CONF
 sleep 0.3
-expect "deny by app" "AccessDenied" "$ipc" call org.example.Echo x
-expect "deny by app, natively" "AccessDenied" "$ipc" --native call org.example.Echo x
+expect "deny by app, on the D-Bus client" "AccessDenied" "$ipc" --dbus call org.example.Echo x
+expect "deny by app, natively" "AccessDenied" "$ipc" call org.example.Echo x
 expect "deny by group" "AccessDenied" gdbus call --session --dest org.example.Echo --object-path / --method org.mlx.Echo.Echo x
 expect "others still may" 'string "ok"' dbus-send --session --print-reply --dest=org.example.Echo / org.mlx.Echo.Echo string:ok
 expect "own denied" "AccessDenied" dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.RequestName string:org.example.Other uint32:0
 expect "own allowed (the later rule)" "uint32 1" dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.RequestName string:org.example.Owned uint32:0
 : > "$XDG_CONFIG_HOME/mlx/ipc.conf"
 sleep 0.3
-expect "the rules are gone again" "x" "$ipc" call org.example.Echo x
+expect "the rules are gone again" "x" "$ipc" --dbus call org.example.Echo x
 
 # A sandboxed app.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
@@ -215,12 +218,45 @@ echo "ok   the bus ends on SIGTERM and removes its socket"
 
 # --run: a session on its own bus.
 set +e
-"$work/mlx-ipcd" --address "$work/run.sock" --run sh -c 'case "$DBUS_SESSION_BUS_ADDRESS" in *run.sock) "$0" names | grep -q org.freedesktop.DBus && exit 7;; esac; exit 1' "$ipc"
+"$work/synapse" --address "$work/run.sock" --run sh -c 'case "$DBUS_SESSION_BUS_ADDRESS" in *run.sock) "$0" names | grep -q org.freedesktop.DBus && exit 7;; esac; exit 1' "$ipc"
 status=$?
 set -e
 [[ $status -eq 7 ]] || fail "--run: exit status $status (wanted 7)"
 echo "ok   --run: the program on the bus, its exit status"
 
 mkdir -p "$work/notify-empty"
-python3 -I tools/check_ipc_notify.py "$work/mlx-ipcd" "$work" "$work/notify-empty" || fail "no READY=1 for systemd"
+python3 -I tools/check_ipc_notify.py "$work/synapse" "$work" "$work/notify-empty" || fail "no READY=1 for systemd"
+
+# Native first, D-Bus as the fallback for a foreign host bus. On a real
+# dbus-daemon (not synapse) the native handshake fails and std.ipc's
+# client falls back to D-Bus, so mlx-ipc still works there: our programs
+# speak native on brixOS and fall back to the host's D-Bus until brixOS
+# has its own services.
+if command -v dbus-run-session > /dev/null; then
+    cat > "$work/fallback.sh" <<FALLBACK
+set -e
+ipc="$ipc"
+# Over a real dbus-daemon the native handshake fails and the client falls
+# back; names still come back.
+"\$ipc" names | grep -q org.freedesktop.DBus || { echo "fallback: no names"; exit 1; }
+# A service of ours on the fallback, serving over D-Bus (not "(mlx)").
+"\$ipc" serve org.example.Fallback > "$work/fallback-serve.log" 2>&1 &
+sp=\$!
+for _ in \$(seq 1 50); do grep -q serving "$work/fallback-serve.log" 2> /dev/null && break; sleep 0.1; done
+grep -q "(dbus)" "$work/fallback-serve.log" || { echo "fallback serve: \$(cat "$work/fallback-serve.log")"; kill \$sp 2>/dev/null; exit 1; }
+# mlx-ipc (fallback) calls it, and dbus-send (native D-Bus) calls it too.
+[ "\$("\$ipc" call org.example.Fallback hallo)" = hallo ] || { echo "fallback call"; kill \$sp 2>/dev/null; exit 1; }
+dbus-send --session --print-reply --dest=org.example.Fallback / org.mlx.Echo.Echo string:ok | grep -q '"ok"' || { echo "fallback dbus-send"; kill \$sp 2>/dev/null; exit 1; }
+kill \$sp 2>/dev/null || true
+exit 0
+FALLBACK
+    if dbus-run-session -- bash "$work/fallback.sh" > "$work/fallback.out" 2>&1; then
+        echo "ok   native first, D-Bus fallback: mlx-ipc works over a foreign dbus-daemon too"
+    else
+        grep -v 'fd limit' "$work/fallback.out" >&2 || true
+        fail "the D-Bus fallback did not work over a real dbus-daemon"
+    fi
+else
+    echo "skip the D-Bus fallback (no dbus-run-session)"
+fi
 echo "all MLXIPC checks passed"

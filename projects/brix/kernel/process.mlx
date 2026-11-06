@@ -6,6 +6,7 @@
 // the stack under STACK_TOP; all but the segments are pages made on first
 // touch (a page fault in one of the regions, or the kernel preparing a
 // range it is handed).
+const layout = @import("../layout.mlx")
 const cpu = @import("./cpu.mlx")
 const memory = @import("./memory.mlx")
 const files = @import("./files.mlx")
@@ -17,6 +18,7 @@ const wait = @import("./wait.mlx")
 const signals_module = @import("./linux/signals.mlx")
 const events_module = @import("./events.mlx")
 const vfs = @import("./vfs.mlx")
+const archive = @import("./archive.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
 const Status = @import("./status.mlx").Status
 const Page = memory.Page
@@ -43,9 +45,25 @@ pub const State = enum(u8) { free, ready, blocked, zombie, stopped, running }
 // What load says.
 pub const Loaded = enum(u8) { done, missing, not_a_program, no_memory }
 
+// A role a process's handle plays (the start block's), and the
+// descriptor that plays it.
+pub const Role = struct {
+    role: u32
+    slot: u32
+}
+pub const MAX_ROLES: usize = 16
+pub const ROLE_INPUT: u32 = 1
+pub const ROLE_OUTPUT: u32 = 2
+pub const ROLE_ERRORS: u32 = 3
+pub const ROLE_DIRECTORY: u32 = 4
+pub const ROLE_SESSION: u32 = 5
+
 pub const Process = struct {
     pub const STACK_TOP: usize = 0x7FFFFFFFF000
     pub const STACK_SIZE: usize = 8 * 1024 * 1024
+    // Pages made at a fault: the faulting one and the ones after it in
+    // its region, up to this many.
+    pub const FAULT_AROUND: usize = 16
     pub const MMAP_BASE: usize = 0x100000000000
     pub const USER_LIMIT: usize = 0x800000000000
     pub const MAX_REGIONS: usize = 256
@@ -87,6 +105,10 @@ pub const Process = struct {
     // Its SSE registers while it does not run.
     sse: [frame_module.Sse.SIZE]u8
     fsBase: usize
+    // The processor it ran on last (MAX_CPUS: none yet): another one
+    // loads its page tables anew (memory.Space.activate skips the load
+    // for the one that has them, whose TLB saw every change).
+    lastCpu: usize
     // The working directory, and the program it runs and the directory
     // that names it (for /proc/self/exe); nodes it holds.
     directory: usize
@@ -108,6 +130,11 @@ pub const Process = struct {
     regions: [MAX_REGIONS]Region
     regionCount: usize
     files: files.Descriptors
+    // The roles its handles play (the start block's: input, output,
+    // errors, the session, ...), each a role and the descriptor that
+    // plays it.
+    roles: [MAX_ROLES]Role
+    roleCount: usize
 
     // A fresh process `pid` (child of `parentPid`): no memory, the
     // terminal on 0, 1 and 2.
@@ -125,6 +152,7 @@ pub const Process = struct {
         self.*.events.init()
         self.*.signals.init()
         self.*.fsBase = 0
+        self.*.lastCpu = layout.Memory.MAX_CPUS
         self.*.directory = vfs.Vfs.NONE
         self.*.program = vfs.Vfs.NONE
         self.*.programDirectory = vfs.Vfs.NONE
@@ -137,6 +165,42 @@ pub const Process = struct {
         self.*.mmapNext = MMAP_BASE
         self.*.regionCount = 0
         self.*.files.init()
+        self.defaultRoles()
+    }
+
+    // The roles when a start block names none: input, output and errors
+    // on 0, 1 and 2.
+    pub fn defaultRoles(self: *Self) -> void {
+        self.*.roles[0] = Role.{ .role = ROLE_INPUT, .slot = 0 }
+        self.*.roles[1] = Role.{ .role = ROLE_OUTPUT, .slot = 1 }
+        self.*.roles[2] = Role.{ .role = ROLE_ERRORS, .slot = 2 }
+        self.*.roleCount = 3
+    }
+
+    // `role` played by descriptor `slot` (added, or changed when the role
+    // is there already).
+    pub fn setRole(self: *Self, role: u32, slot: u32) -> void {
+        var k: usize = 0
+        while k < self.*.roleCount {
+            if self.*.roles[k].role == role {
+                self.*.roles[k].slot = slot
+                return
+            }
+            k += 1
+        }
+        if self.*.roleCount == MAX_ROLES { return }
+        self.*.roles[self.*.roleCount] = Role.{ .role = role, .slot = slot }
+        self.*.roleCount += 1
+    }
+
+    // The descriptor playing `role`, or -1.
+    pub fn slotOfRole(self: *const Self, role: u32) -> isize {
+        var k: usize = 0
+        while k < self.*.roleCount {
+            if self.*.roles[k].role == role { return @intCast(isize, self.*.roles[k].slot) }
+            k += 1
+        }
+        return -1
     }
 
     // The memory, descriptors and registers of `parent` copied (a fork:
@@ -167,6 +231,12 @@ pub const Process = struct {
         }
         self.*.regionCount = parent.*.regionCount
         self.*.files.copyFrom(&parent.*.files)
+        k = 0
+        while k < parent.*.roleCount {
+            self.*.roles[k] = parent.*.roles[k]
+            k += 1
+        }
+        self.*.roleCount = parent.*.roleCount
         self.*.events.inherit(&parent.*.events)
         self.*.signals.inherit(&parent.*.signals)
         self.*.context = frame.*
@@ -184,6 +254,28 @@ pub const Process = struct {
     }
 
     // The program it runs becomes `node`, named by `directory`.
+    // The leaf of the program's path (/system/programs/aurora ->
+    // "aurora"), for a bus to name the app; 0 when it has no path.
+    pub fn programLeaf(self: *Self, out: [*]u8, capacity: usize) -> usize {
+        if self.*.program == vfs.Vfs.NONE { return 0 }
+        const tree = vfs.fileSystem()
+        const node = tree.node(self.*.program)
+        // The archive keeps each file's name; the leaf (after the last
+        // slash) is the program's name. (A program only on disk is not
+        // named yet: its node keeps no name.)
+        if node.*.kind != vfs.NodeKind.archive { return 0 }
+        const name = archive.Archive.boot().name(node.*.archiveIndex)
+        const length = archive.Archive.boot().nameLength(node.*.archiveIndex)
+        var start = length
+        while start > 0 && name[start - 1] != 47 { start -= 1 }
+        var k: usize = 0
+        while start + k < length && k < capacity {
+            out[k] = name[start + k]
+            k += 1
+        }
+        return k
+    }
+
     pub fn setProgram(self: *Self, node: usize, directory: usize) -> void {
         const tree = vfs.fileSystem()
         if node != vfs.Vfs.NONE { tree.retain(node) }
@@ -267,9 +359,37 @@ pub const Process = struct {
     pub fn fault(self: *Self, address: usize, write: bool) -> bool {
         if address >= USER_LIMIT { return false }
         if write && self.*.space.copyOnWrite(address) { return true }
-        if !self.inRegion(address) { return false }
+        const end = self.regionEnd(address)
+        if end == 0 { return false }
         if self.*.space.translate(address) != 0 { return false }
-        return self.*.space.back(address)
+        if !self.*.space.back(address) { return false }
+        // The pages after it in the region made now too (FAULT_AROUND in
+        // all): a program that grows into its memory faults once for
+        // them, not once a page (a fault costs more than zeroing a page
+        // does, by far under emulation); what it never touches at a
+        // region's end is at most the rest of one such run.
+        var page = Page.down(address) + Page.SIZE
+        var made: usize = 1
+        while made < FAULT_AROUND && page < end {
+            if self.*.space.translate(page) != 0 { break }
+            if !self.*.space.back(page) { break }
+            page += Page.SIZE
+            made += 1
+        }
+        return true
+    }
+
+    // The end of what holds `address` (the break, the stack, a region),
+    // 0 when nothing does.
+    fn regionEnd(self: *const Self, address: usize) -> usize {
+        if address >= self.*.breakStart && address < self.*.breakEnd { return self.*.breakEnd }
+        if address >= STACK_TOP - STACK_SIZE && address < STACK_TOP { return STACK_TOP }
+        var k: usize = 0
+        while k < self.*.regionCount {
+            if self.*.regions[k].contains(address) { return self.*.regions[k].end }
+            k += 1
+        }
+        return 0
     }
 
     // ---- the program's memory, for the kernel ----

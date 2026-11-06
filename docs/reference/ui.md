@@ -148,7 +148,7 @@ A click is kept until the widget of its id takes it (the widget returns
 true) on the next frame; `view.end` says to draw again then. An app with
 its own input handling can use the ids returned by `pointerButton`, or
 `view.hitAt`, instead (MLX Observatory uses its hit codes + 1 as ids).
-When what a click starts must happen before the next frame (mlx-settings
+When what a click starts must happen before the next frame (control
 records the keys typed right after a click on a hotkey row), the event
 handler runs the frame once on `view.layoutCanvas()` (a 0 x 0 canvas: the
 widgets take the click, nothing is drawn). With `projects/desktop/shared/
@@ -213,14 +213,14 @@ client's bytes come through a pipe, a second at most per part),
 `clipboardIsOurs` says whether that was this app, and `clearClipboard`
 empties it. On Linux this is `wl_data_device`'s selection
 (`std.ui.wayland.panel_clipboard`); a phone has no system clipboard yet,
-so there an app's own copy is all there is. mlx-files puts copied files
+so there an app's own copy is all there is. polaris puts copied files
 up as `x-special/gnome-copied-files`, `text/uri-list` (with
 `application/x-kde-cutselection` for a cut) and the paths as text, and
 pastes any of these from other apps. The primary selection, the text last
 selected that a middle click pastes, is `setPrimary(text)` and
 `readPrimary()` (`std.ui.wayland.panel_primary` on
 `zwp_primary_selection_device_v1`, offered as UTF-8 text; nothing on a
-phone): mlx-terminal sets it to what is selected and pastes it on a
+phone): vector sets it to what is selected and pastes it on a
 middle click.
 
 | Platform | Drawn by | Input |
@@ -246,7 +246,7 @@ it then) or after a change not drawn yet.
 
 `examples/android/widgets.mlx` is a settings screen of switch rows, a
 check row, segments and a button, from one source on Android and on the
-desktop; mlx-settings is one on Wayland.
+desktop; control is one on Wayland.
 
 ## Tests
 

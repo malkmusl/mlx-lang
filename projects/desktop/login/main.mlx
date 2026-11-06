@@ -1,12 +1,12 @@
-// mlx-login: the desktop's login service, the replacement for a display
+// sentinel: the desktop's login service, the replacement for a display
 // manager (SDDM, GDM) and for the part of systemd-logind that starts a
 // user's session. It runs as root, owns org.mlx.Login on the MLXIPC
-// system bus (mlx-ipcd --system), and the greeter (mlx-greeter, the
+// system bus (synapse --system), and the greeter (aurora, the
 // compositor in greeter mode) talks to it over that bus. No PAM, no
 // logind, no libc.
 //
-//     mlx4 projects/desktop/login/main.mlx -o mlx-login
-//     mlx-login --verbose              (as root; from its systemd unit)
+//     mlx4 projects/desktop/login/main.mlx -o sentinel
+//     sentinel --verbose              (as root; from its systemd unit)
 //
 // The bus methods (org.mlx.Login, path /org/mlx/Login):
 //
@@ -26,12 +26,15 @@
 // password is wiped. session.mlx starts the process only after dropping
 // every root credential and reports exec failure to the parent.
 const std = @import("std")
-const dbus = @import("std.dbus")
+const builtin = @import("builtin")
+const brix = @import("std").os.brix
+const ipc = @import("std.ipc")
 const crash = @import("std.crash")
 const authentication = @import("./authentication.mlx")
 const greeter_module = @import("./greeter.mlx")
 const login1 = @import("./login1.mlx")
 const session_module = @import("./session.mlx")
+const spawn_module = @import("std.spawn")
 const users_module = @import("./users.mlx")
 
 const LOGIN_NAME: []const u8 = "org.mlx.Login"
@@ -84,7 +87,7 @@ const Pending = struct {
 }
 
 const Login = struct {
-    client: dbus.Client
+    client: ipc.Client
     login1State: login1.State
     users: users_module.Users
     environment: [*][*]const u8
@@ -99,7 +102,8 @@ const Login = struct {
     // password of this user only.
     active: [users_module.NAME_MOST]u8
     activeLength: usize
-    sessionPid: isize
+    // The session (Linux: its pid; brixOS: its process handle).
+    session: spawn_module.Child
     // The compositor that owns the seat while no person is logged in.
     // Empty commands disable lifecycle management (useful to isolated
     // clients and checks that exercise only the bus API).
@@ -107,12 +111,12 @@ const Login = struct {
     greeterProgram: []const u8
     greeterUid: u32
     greeterGid: u32
-    greeterPid: isize
+    greeter: spawn_module.Child
     pending: [PENDING_MOST]Pending
 }
 
-fn clientOf(login: *Login) -> *dbus.Client {
-    unsafe { return @ptrCast(*dbus.Client, &login.*.client) }
+fn clientOf(login: *Login) -> *ipc.Client {
+    unsafe { return @ptrCast(*ipc.Client, &login.*.client) }
 }
 
 fn usersOf(login: *Login) -> *users_module.Users {
@@ -178,40 +182,40 @@ fn busAddress(login: *Login) -> []const u8 {
 fn greeterConfigured(login: *Login) -> bool { return login.*.greeterCompositor.length > 0 && login.*.greeterProgram.length > 0 }
 
 fn seatPid(login: *Login) -> isize {
-    if login.*.sessionPid > 0 { return login.*.sessionPid }
-    return login.*.greeterPid
+    if login.*.session.started() { return login.*.session.id }
+    return if login.*.greeter.started() { login.*.greeter.id } else { -1 }
 }
 
 fn startGreeter(login: *Login) -> bool {
-    if !greeterConfigured(login) || login.*.activeLength > 0 || login.*.greeterPid > 0 { return true }
+    if !greeterConfigured(login) || login.*.activeLength > 0 || login.*.greeter.started() { return true }
     var config = greeter_module.Config.{
         .compositor = login.*.greeterCompositor,
         .program = login.*.greeterProgram,
         .runtimeRoot = login.*.runtimeRoot,
         .busAddress = busAddress(login),
         .environment = login.*.environment,
-        .busDescriptor = dbus.descriptorOfClient(clientOf(login)),
+        .busDescriptor = ipc.descriptorOfClient(clientOf(login)),
         .uid = login.*.greeterUid,
         .gid = login.*.greeterGid
     }
-    const pid = greeter_module.start(&config)
-    if pid < 0 {
+    const child = greeter_module.start(&config)
+    if !child.started() {
         say(login, "login: greeter could not be started\n")
         return false
     }
-    login.*.greeterPid = pid
+    login.*.greeter = child
     say(login, "login: greeter started\n")
     return true
 }
 
 fn stopGreeter(login: *Login) -> void {
-    if login.*.greeterPid <= 0 { return }
-    const pid = login.*.greeterPid
-    login.*.greeterPid = -1
+    if !login.*.greeter.started() { return }
+    const child = login.*.greeter
+    login.*.greeter = spawn_module.Child.none()
     // Revoke the old compositor before the user's compositor can ask for
     // control; waiting for NameOwnerChanged would leave a race here.
     login1.sessionEnded(login1Of(login))
-    greeter_module.stop(pid)
+    greeter_module.stop(child)
     say(login, "login: greeter stopped\n")
 }
 
@@ -241,10 +245,10 @@ fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
 fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
     if login.*.activeLength > 0 { return DENIED }
     const user = users_module.userAt(usersOf(login), index)
-    const pid = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, busAddress(login))
-    if pid < 0 { return DENIED }
+    const child = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, busAddress(login), login.*.environment)
+    if !child.started() { return DENIED }
     login.*.activeLength = std.text.append(unsafe { @ptrCast([*]u8, &login.*.active) }, 0, users_module.NAME_MOST, users_module.nameOf(user))
-    login.*.sessionPid = pid
+    login.*.session = child
     say(login, "login: session started\n")
     return ALLOWED
 }
@@ -254,70 +258,48 @@ fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
 // authenticate, and never a uid change beyond calling startSession.
 // ===========================================================================
 
-fn sendError(login: *Login, call: *const dbus.Header, name: []const u8, message: []const u8) -> void {
-    var header = dbus.newHeader(dbus.ERROR, 0)
-    header.errorName = name
-    header.replySerial = call.*.serial
-    header.hasReplySerial = true
-    header.destination = call.*.sender
-    header.signature = "s"
-    var body: [512]u8 = undefined
-    var writing: dbus.Writer = undefined
-    unsafe { dbus.begin(&writing, @ptrCast([*]u8, &body), 512, call.*.big) }
-    dbus.putString(&writing, message)
-    var nothing: [1]isize = [1]isize{ 0 }
-    unsafe { const sent = dbus.send(clientOf(login), &header, unsafe { @ptrCast([*]const u8, &body) }, writing.length, @ptrCast([*]const isize, &nothing), 0) }
+fn sendError(login: *Login, call: *const ipc.Message, name: []const u8, message: []const u8) -> void {
+    const sent = ipc.replyError(clientOf(login), call, name, message)
 }
 
-fn replyBool(login: *Login, call: *const dbus.Header, value: bool) -> void {
+fn replyBool(login: *Login, call: *const ipc.Message, value: bool) -> void {
     var body: [8]u8 = undefined
-    var writing: dbus.Writer = undefined
-    unsafe { dbus.begin(&writing, @ptrCast([*]u8, &body), 8, call.*.big) }
-    dbus.putBool(&writing, value)
-    var header = dbus.newHeader(dbus.METHOD_RETURN, 0)
-    header.replySerial = call.*.serial
-    header.hasReplySerial = true
-    header.destination = call.*.sender
-    header.signature = "b"
+    var writing: ipc.Writer = undefined
+    unsafe { ipc.begin(&writing, @ptrCast([*]u8, &body), 8) }
+    ipc.putBool(&writing, value)
     var nothing: [1]isize = [1]isize{ 0 }
-    unsafe { const sent = dbus.send(clientOf(login), &header, unsafe { @ptrCast([*]const u8, &body) }, writing.length, @ptrCast([*]const isize, &nothing), 0) }
+    unsafe { const sent = ipc.reply(clientOf(login), call, "b", unsafe { @ptrCast([*]const u8, &body) }, writing.length, @ptrCast([*]const isize, &nothing), 0) }
 }
 
 // ListUsers() -> a(ssss): the login accounts.
-fn listUsers(login: *Login, call: *const dbus.Header) -> void {
-    const memory = std.heap.allocator().alloc(dbus.MAX_MESSAGE, 16)
+fn listUsers(login: *Login, call: *const ipc.Message) -> void {
+    const memory = std.heap.allocator().alloc(ipc.MAX_MESSAGE, 16)
     if memory == null {
         sendError(login, call, "org.mlx.Login.Error.NoMemory", "out of memory")
         return
     }
     var body: [*]u8 = undefined
     unsafe { body = @ptrCast([*]u8, memory.?) }
-    var writing: dbus.Writer = undefined
-    dbus.begin(&writing, body, dbus.MAX_MESSAGE, call.*.big)
-    const array = dbus.beginArray(&writing, 8)
+    var writing: ipc.Writer = undefined
+    ipc.begin(&writing, body, ipc.MAX_MESSAGE)
+    const array = ipc.beginArray(&writing)
     var index: usize = 0
     while index < login.*.users.count {
         const user = users_module.userAt(usersOf(login), index)
-        dbus.pad(&writing, 8)
-        dbus.putString(&writing, users_module.nameOf(user))
-        dbus.putString(&writing, users_module.realNameOf(user))
-        dbus.putString(&writing, users_module.homeOf(user))
-        dbus.putString(&writing, users_module.shellOf(user))
+        ipc.putString(&writing, users_module.nameOf(user))
+        ipc.putString(&writing, users_module.realNameOf(user))
+        ipc.putString(&writing, users_module.homeOf(user))
+        ipc.putString(&writing, users_module.shellOf(user))
         index += 1
     }
-    dbus.endArray(&writing, array, 8)
-    var header = dbus.newHeader(dbus.METHOD_RETURN, 0)
-    header.replySerial = call.*.serial
-    header.hasReplySerial = true
-    header.destination = call.*.sender
-    header.signature = "a(ssss)"
+    ipc.endArray(&writing, array, login.*.users.count)
     var nothing: [1]isize = [1]isize{ 0 }
-    unsafe { const sent = dbus.send(clientOf(login), &header, body, writing.length, @ptrCast([*]const isize, &nothing), 0) }
-    std.heap.allocator().free(memory.?, dbus.MAX_MESSAGE, 16)
+    unsafe { const sent = ipc.reply(clientOf(login), call, "a(ssss)", body, writing.length, @ptrCast([*]const isize, &nothing), 0) }
+    std.heap.allocator().free(memory.?, ipc.MAX_MESSAGE, 16)
 }
 
 // Performs a call only after MLXIPC allowed login.session.
-fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
+fn perform(login: *Login, call: *const ipc.Message, pending: *Pending) -> void {
     const user = pendingUser(pending)
     if pending.*.kind == LOGIN_CALL {
         if login.*.activeLength > 0 {
@@ -356,25 +338,41 @@ fn perform(login: *Login, call: *const dbus.Header, pending: *Pending) -> void {
     replyBool(login, call, checked == ALLOWED)
 }
 
+fn sessionGone(login: *Login) -> void {
+    wipe(unsafe { @ptrCast([*]u8, &login.*.active) }, users_module.NAME_MOST)
+    login.*.activeLength = 0
+    login.*.session = spawn_module.Child.none()
+    login1.sessionEnded(login1Of(login))
+    say(login, "login: session ended; the seat is free\n")
+    if !startGreeter(login) { login.*.running = false }
+}
+
+fn greeterGone(login: *Login) -> void {
+    login.*.greeter = spawn_module.Child.none()
+    login1.sessionEnded(login1Of(login))
+    say(login, "login: greeter ended\n")
+    if login.*.activeLength == 0 {
+        sleep(500)
+        if !startGreeter(login) { login.*.running = false }
+    }
+}
+
+// The children that ended: the session, the greeter (Linux: also
+// login1's VT watcher, by wait4).
 fn reapSession(login: *Login) -> void {
+    if comptime builtin.os == builtin.Os.brixos {
+        var ending: spawn_module.Ending = undefined
+        if login.*.session.started() && spawn_module.ended(login.*.session, &ending) { sessionGone(login) }
+        if login.*.greeter.started() && spawn_module.ended(login.*.greeter, &ending) { greeterGone(login) }
+        return
+    }
     var status: usize = 0
     var pid = std.linux.syscall4(std.linux.SYS_wait4, 18446744073709551615, @intFromPtr(&status), 1, 0)
     while pid > 0 {
-        if pid == login.*.sessionPid {
-            wipe(unsafe { @ptrCast([*]u8, &login.*.active) }, users_module.NAME_MOST)
-            login.*.activeLength = 0
-            login.*.sessionPid = -1
-            login1.sessionEnded(login1Of(login))
-            say(login, "login: session ended; the seat is free\n")
-            if !startGreeter(login) { login.*.running = false }
-        } else if pid == login.*.greeterPid {
-            login.*.greeterPid = -1
-            login1.sessionEnded(login1Of(login))
-            say(login, "login: greeter ended\n")
-            if login.*.activeLength == 0 {
-                sleep(500)
-                if !startGreeter(login) { login.*.running = false }
-            }
+        if login.*.session.started() && pid == login.*.session.id {
+            sessionGone(login)
+        } else if login.*.greeter.started() && pid == login.*.greeter.id {
+            greeterGone(login)
         } else {
             login1.childEnded(login1Of(login), clientOf(login), pid, status)
         }
@@ -384,17 +382,17 @@ fn reapSession(login: *Login) -> void {
 
 // Asks MLXIPC about login.session. Arguments are copied before the Check
 // call and the password in the receive buffer is wiped immediately.
-fn askPermission(login: *Login, call: *const dbus.Header, body: [*]const u8, kind: u8) -> void {
+fn askPermission(login: *Login, call: *const ipc.Message, body: [*]const u8, kind: u8) -> void {
     const wanted = if kind == LOGIN_CALL { "sss" } else { "ss" }
     if !std.text.same(call.*.signature, wanted) {
         sendError(login, call, "org.freedesktop.DBus.Error.InvalidArgs", if kind == LOGIN_CALL { "Login takes (sss)" } else { "Unlock takes (ss)" })
         return
     }
-    var reading = dbus.reader(body, call.*.bodyLength, call.*.big)
-    const user = dbus.readString(&reading)
-    const password = dbus.readString(&reading)
+    var reading = ipc.reader(body, call.*.bodyLength)
+    const user = ipc.readString(&reading)
+    const password = ipc.readString(&reading)
     var session: []const u8 = ""
-    if kind == LOGIN_CALL { session = dbus.readString(&reading) }
+    if kind == LOGIN_CALL { session = ipc.readString(&reading) }
     if reading.failed || user.length == 0 || user.length > users_module.NAME_MOST || password.length > PASSWORD_MOST || session.length > SESSION_MOST || call.*.sender.length == 0 || call.*.sender.length > SENDER_MOST {
         wipeSlice(password)
         sendError(login, call, "org.freedesktop.DBus.Error.InvalidArgs", if kind == LOGIN_CALL { "Login takes bounded (sss) values" } else { "Unlock takes bounded (ss) values" })
@@ -417,11 +415,11 @@ fn askPermission(login: *Login, call: *const dbus.Header, body: [*]const u8, kin
     pending.*.sessionLength = std.text.append(pendingBytes(pending, @offsetOf(Pending, "session")), 0, SESSION_MOST, session)
     wipeSlice(password)
     var message: [256]u8 = undefined
-    var writing: dbus.Writer = undefined
-    unsafe { dbus.begin(&writing, @ptrCast([*]u8, &message), 256, false) }
-    dbus.putString(&writing, senderOf(pending))
-    dbus.putString(&writing, "login.session")
-    pending.*.check = dbus.call(clientOf(login), BUS_NAME, IPC_PATH, IPC_INTERFACE, "Check", "ss", unsafe { @ptrCast([*]const u8, &message) }, writing.length)
+    var writing: ipc.Writer = undefined
+    unsafe { ipc.begin(&writing, @ptrCast([*]u8, &message), 256) }
+    ipc.putString(&writing, senderOf(pending))
+    ipc.putString(&writing, "login.session")
+    pending.*.check = ipc.call(clientOf(login), BUS_NAME, IPC_PATH, IPC_INTERFACE, "Check", "ss", unsafe { @ptrCast([*]const u8, &message) }, writing.length)
     if pending.*.check == 0 {
         release(pending)
         sendError(login, call, "org.freedesktop.DBus.Error.AccessDenied", "the bus could not authorize login.session")
@@ -430,17 +428,17 @@ fn askPermission(login: *Login, call: *const dbus.Header, body: [*]const u8, kin
     pending.*.used = true
 }
 
-fn permissionAnswered(login: *Login, reply: *const dbus.Header) -> bool {
+fn permissionAnswered(login: *Login, reply: *const ipc.Message) -> bool {
     var slot: usize = 0
     while slot < PENDING_MOST {
         const pending = pendingAt(login, slot)
         if pending.*.used && pending.*.check == reply.*.replySerial {
             var allowed = false
-            if reply.*.kind == dbus.METHOD_RETURN && std.text.same(reply.*.sender, BUS_NAME) && std.text.same(reply.*.signature, "b") {
-                var reading = dbus.reader(dbus.bodyOf(clientOf(login), reply), reply.*.bodyLength, reply.*.big)
-                allowed = dbus.readBool(&reading) && !reading.failed
+            if reply.*.kind == ipc.REPLY && std.text.same(reply.*.sender, BUS_NAME) && std.text.same(reply.*.signature, "b") {
+                var reading = ipc.reader(ipc.bodyOf(clientOf(login), reply), reply.*.bodyLength)
+                allowed = ipc.readBool(&reading) && !reading.failed
             }
-            var call = dbus.newHeader(dbus.METHOD_CALL, pending.*.serial)
+            var call = ipc.newMessage(ipc.CALL, pending.*.serial)
             call.flags = pending.*.flags
             call.sender = senderOf(pending)
             if allowed {
@@ -459,28 +457,28 @@ fn permissionAnswered(login: *Login, reply: *const dbus.Header) -> bool {
 
 fn dispatch(login: *Login) -> void {
     reapSession(login)
-    var header: dbus.Header = undefined
-    while dbus.next(clientOf(login), &header, 0) {
-        const body = dbus.bodyOf(clientOf(login), &header)
-        if header.kind == dbus.METHOD_CALL && std.text.same(header.path, LOGIN_PATH) && std.text.same(header.interface, LOGIN_INTERFACE) {
+    var header: ipc.Message = undefined
+    while ipc.next(clientOf(login), &header, 0) {
+        const body = ipc.bodyOf(clientOf(login), &header)
+        if header.kind == ipc.CALL && std.text.same(header.path, LOGIN_PATH) && std.text.same(header.interface, LOGIN_INTERFACE) {
             if std.text.same(header.member, "ListUsers") {
                 listUsers(login, &header)
             } else if std.text.same(header.member, "Login") {
                 askPermission(login, &header, body, LOGIN_CALL)
             } else if std.text.same(header.member, "Unlock") {
                 askPermission(login, &header, body, UNLOCK_CALL)
-            } else if header.flags & dbus.NO_REPLY_EXPECTED == 0 {
-                sendError(login, &header, "org.freedesktop.DBus.Error.UnknownMethod", "mlx-login: no such method")
+            } else if header.flags & ipc.NO_REPLY_EXPECTED == 0 {
+                sendError(login, &header, "org.freedesktop.DBus.Error.UnknownMethod", "sentinel: no such method")
             }
-        } else if header.kind == dbus.METHOD_CALL && login1.called(login1Of(login), clientOf(login), &header, body, seatPid(login)) {
+        } else if header.kind == ipc.CALL && login1.called(login1Of(login), clientOf(login), &header, body, seatPid(login)) {
             // login1 answered it.
-        } else if header.kind == dbus.SIGNAL && std.text.same(header.path, BUS_PATH) && std.text.same(header.interface, BUS_NAME) && std.text.same(header.member, "NameOwnerChanged") && std.text.same(header.signature, "sss") {
-            var reading = dbus.reader(body, header.bodyLength, header.big)
-            const name = dbus.readString(&reading)
-            const old = dbus.readString(&reading)
-            const new = dbus.readString(&reading)
+        } else if header.kind == ipc.SIGNAL && std.text.same(header.path, BUS_PATH) && std.text.same(header.interface, BUS_NAME) && std.text.same(header.member, "NameOwnerChanged") && std.text.same(header.signature, "sss") {
+            var reading = ipc.reader(body, header.bodyLength)
+            const name = ipc.readString(&reading)
+            const old = ipc.readString(&reading)
+            const new = ipc.readString(&reading)
             if !reading.failed { login1.nameChanged(login1Of(login), name, old, new) }
-        } else if (header.kind == dbus.METHOD_RETURN || header.kind == dbus.ERROR) && header.hasReplySerial {
+        } else if (header.kind == ipc.REPLY || header.kind == ipc.ERROR) && header.replySerial != 0 {
             const handled = permissionAnswered(login, &header)
             if !handled { const ignored = login1.answered(login1Of(login), clientOf(login), &header, seatPid(login) > 0) }
         }
@@ -492,28 +490,28 @@ fn requestName(login: *Login, name: []const u8) -> bool {
     var requestBody: [64]u8 = undefined
     var requestBytes: [*]u8 = undefined
     unsafe { requestBytes = @ptrCast([*]u8, &requestBody) }
-    var writing: dbus.Writer = undefined
-    dbus.begin(&writing, requestBytes, 64, false)
-    dbus.putString(&writing, name)
-    dbus.putU32(&writing, 4)
-    const serial = dbus.call(clientOf(login), BUS_NAME, BUS_PATH, BUS_NAME, "RequestName", "su", requestBytes, writing.length)
-    var reply: dbus.Header = undefined
-    if serial == 0 || !dbus.waitReply(clientOf(login), serial, &reply, 5000) { return false }
-    if reply.kind != dbus.METHOD_RETURN || !std.text.same(reply.sender, BUS_NAME) || !std.text.same(reply.signature, "u") { return false }
-    var reading = dbus.reader(dbus.bodyOf(clientOf(login), &reply), reply.bodyLength, reply.big)
-    return dbus.readU32(&reading) == 1 && !reading.failed
+    var writing: ipc.Writer = undefined
+    ipc.begin(&writing, requestBytes, 64)
+    ipc.putString(&writing, name)
+    ipc.putU32(&writing, 4)
+    const serial = ipc.call(clientOf(login), BUS_NAME, BUS_PATH, BUS_NAME, "RequestName", "su", requestBytes, writing.length)
+    var reply: ipc.Message = undefined
+    if serial == 0 || !ipc.waitReply(clientOf(login), serial, &reply, 5000) { return false }
+    if reply.kind != ipc.REPLY || !std.text.same(reply.sender, BUS_NAME) || !std.text.same(reply.signature, "u") { return false }
+    var reading = ipc.reader(ipc.bodyOf(clientOf(login), &reply), reply.bodyLength)
+    return ipc.readU32(&reading) == 1 && !reading.failed
 }
 
 fn watchOwners(login: *Login) -> bool {
     const rule = "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged'"
     var body: [256]u8 = undefined
-    var writing: dbus.Writer = undefined
-    unsafe { dbus.begin(&writing, @ptrCast([*]u8, &body), 256, false) }
-    dbus.putString(&writing, rule)
-    const serial = dbus.call(clientOf(login), BUS_NAME, BUS_PATH, BUS_NAME, "AddMatch", "s", unsafe { @ptrCast([*]const u8, &body) }, writing.length)
-    var reply: dbus.Header = undefined
-    if serial == 0 || !dbus.waitReply(clientOf(login), serial, &reply, 5000) { return false }
-    return reply.kind == dbus.METHOD_RETURN && std.text.same(reply.sender, BUS_NAME)
+    var writing: ipc.Writer = undefined
+    unsafe { ipc.begin(&writing, @ptrCast([*]u8, &body), 256) }
+    ipc.putString(&writing, rule)
+    const serial = ipc.call(clientOf(login), BUS_NAME, BUS_PATH, BUS_NAME, "AddMatch", "s", unsafe { @ptrCast([*]const u8, &body) }, writing.length)
+    var reply: ipc.Message = undefined
+    if serial == 0 || !ipc.waitReply(clientOf(login), serial, &reply, 5000) { return false }
+    return reply.kind == ipc.REPLY && std.text.same(reply.sender, BUS_NAME)
 }
 
 fn connectName(login: *Login) -> bool {
@@ -539,13 +537,16 @@ fn connectName(login: *Login) -> bool {
             length += 1
         }
     }
-    if !dbus.connectClient(clientOf(login), std.heap.allocator(), pathBytes[0..length]) { return false }
+    if !ipc.connectClient(clientOf(login), std.heap.allocator(), pathBytes[0..length]) { return false }
     return requestName(login, LOGIN_NAME) && requestName(login, login1.NAME) && watchOwners(login)
 }
 
 // SIGCHLD must wake the daemon even when nobody calls the bus: that is
 // what releases the seat and lets the greeter lifecycle start again.
 fn signalDescriptor() -> isize {
+    // brixOS: no signal descriptor; the wait looks at the children each
+    // turn instead (its one wait takes a deadline).
+    if comptime builtin.os == builtin.Os.brixos { return -1 }
     var mask: u64 = (1 << 1) | (1 << 14) | (1 << 16)
     const blocked = std.linux.syscall4(std.linux.SYS_rt_sigprocmask, 0, @intFromPtr(&mask), 0, 8)
     if blocked != 0 { return -1 }
@@ -562,8 +563,26 @@ fn takeSignal(descriptor: isize) -> u32 {
 fn ready(entry: u64) -> bool { return (entry >> 48) & 25 != 0 }
 
 fn wait(login: *Login, signals: isize) -> void {
+    if comptime builtin.os == builtin.Os.brixos {
+        // The native wait: the bus, and the children's ends.
+        var items: [3]brix.WaitItem = undefined
+        items[0] = brix.WaitItem.{ .handle = @intCast(u32, @bitCast(usize, ipc.descriptorOfClient(clientOf(login))) & 0xFFFFFFFF), .want = brix.State.READABLE | brix.State.PEER_GONE, .seen = 0, .reserved = 0 }
+        var count: usize = 1
+        if login.*.session.started() {
+            items[count] = brix.WaitItem.{ .handle = @intCast(u32, login.*.session.id), .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+            count += 1
+        }
+        if login.*.greeter.started() {
+            items[count] = brix.WaitItem.{ .handle = @intCast(u32, login.*.greeter.id), .want = brix.State.ENDED, .seen = 0, .reserved = 0 }
+            count += 1
+        }
+        const woken = brix.wait(items[0..count], brix.FOREVER)
+        reapSession(login)
+        if login.*.running && woken > 0 && items[0].seen & (brix.State.READABLE | brix.State.PEER_GONE) != 0 { dispatch(login) }
+        return
+    }
     var entries: [2]u64 = undefined
-    entries[0] = @intCast(u64, @bitCast(u32, @intCast(i32, dbus.descriptorOfClient(clientOf(login))))) | (1 << 32)
+    entries[0] = @intCast(u64, @bitCast(u32, @intCast(i32, ipc.descriptorOfClient(clientOf(login))))) | (1 << 32)
     entries[1] = @intCast(u64, @bitCast(u32, @intCast(i32, signals))) | (1 << 32)
     const waited = std.linux.syscall3(std.linux.SYS_poll, @intFromPtr(&entries), 2, 18446744073709551615)
     if waited < 0 { return }
@@ -640,23 +659,23 @@ fn run(arguments: [][*]const u8) -> !void {
             greeterProgram = std.string.asSlice(std.process.argument(arguments, index))
         } else if std.string.eql(argument, std.string.fromSlice("--greeter-uid")) && index + 1 < count {
             index += 1
-            if !parseId(std.string.asSlice(std.process.argument(arguments, index)), &greeterUid) { try fail("mlx-login: --greeter-uid needs a nonzero numeric uid", Failure.Usage) }
+            if !parseId(std.string.asSlice(std.process.argument(arguments, index)), &greeterUid) { try fail("sentinel: --greeter-uid needs a nonzero numeric uid", Failure.Usage) }
         } else if std.string.eql(argument, std.string.fromSlice("--greeter-gid")) && index + 1 < count {
             index += 1
-            if !parseId(std.string.asSlice(std.process.argument(arguments, index)), &greeterGid) { try fail("mlx-login: --greeter-gid needs a nonzero numeric gid", Failure.Usage) }
+            if !parseId(std.string.asSlice(std.process.argument(arguments, index)), &greeterGid) { try fail("sentinel: --greeter-gid needs a nonzero numeric gid", Failure.Usage) }
         } else {
-            try fail("usage: mlx-login [--verbose] [--passwd FILE] [--shadow FILE] [--group FILE] [--runtime-dir DIR] [--tty FILE|none] [--test-device-null] [--greeter COMPOSITOR PROGRAM] [--greeter-uid UID] [--greeter-gid GID]", Failure.Usage)
+            try fail("usage: sentinel [--verbose] [--passwd FILE] [--shadow FILE] [--group FILE] [--runtime-dir DIR] [--tty FILE|none] [--test-device-null] [--greeter COMPOSITOR PROGRAM] [--greeter-uid UID] [--greeter-gid GID]", Failure.Usage)
         }
         index += 1
     }
     if passwdPath.length == 0 || passwdPath.length >= users_module.DATABASE_PATH_MOST || shadowPath.length == 0 || shadowPath.length >= users_module.DATABASE_PATH_MOST || groupPath.length == 0 || groupPath.length >= users_module.DATABASE_PATH_MOST || runtimeRoot.length == 0 || runtimeRoot.length >= users_module.DATABASE_PATH_MOST || ttyPath.length == 0 || ttyPath.length >= users_module.DATABASE_PATH_MOST || greeterCompositor.length >= users_module.DATABASE_PATH_MOST || greeterProgram.length >= users_module.DATABASE_PATH_MOST || (greeterCompositor.length == 0) != (greeterProgram.length == 0) {
-        try fail("mlx-login: account database path is empty or too long", Failure.Usage)
+        try fail("sentinel: account database path is empty or too long", Failure.Usage)
     }
     if std.linux.syscall0(std.linux.SYS_getuid) != 0 {
-        try fail("mlx-login: must run as root (it owns the system service and will read the configured shadow file and start sessions)", Failure.NotRoot)
+        try fail("sentinel: must run as root (it owns the system service and will read the configured shadow file and start sessions)", Failure.NotRoot)
     }
     const memory = allocator.alloc(@sizeOf(Login), 16)
-    if memory == null { try fail("mlx-login: out of memory", Failure.NoMemory) }
+    if memory == null { try fail("sentinel: out of memory", Failure.NoMemory) }
     var login: *Login = undefined
     unsafe { login = @ptrCast(*Login, memory.?) }
     login.*.environment = std.process.environmentEntries(arguments)
@@ -666,12 +685,12 @@ fn run(arguments: [][*]const u8) -> !void {
     login.*.verbose = verbose
     login.*.running = true
     login.*.activeLength = 0
-    login.*.sessionPid = -1
+    login.*.session = spawn_module.Child.none()
     login.*.greeterCompositor = greeterCompositor
     login.*.greeterProgram = greeterProgram
     login.*.greeterUid = greeterUid
     login.*.greeterGid = greeterGid
-    login.*.greeterPid = -1
+    login.*.greeter = spawn_module.Child.none()
     login1.init(login1Of(login), ttyPath, allowTestDevice, login.*.environment)
     var pendingIndex: usize = 0
     while pendingIndex < PENDING_MOST {
@@ -681,16 +700,16 @@ fn run(arguments: [][*]const u8) -> !void {
     const ignored = users_module.load(usersOf(login), passwdPath)
     say(login, "login: read the configured account list\n")
     const signals = signalDescriptor()
-    if signals < 0 { try fail("mlx-login: could not create the signal descriptor", Failure.NoSignals) }
+    if signals < 0 && comptime builtin.os != builtin.Os.brixos { try fail("sentinel: could not create the signal descriptor", Failure.NoSignals) }
     if !connectName(login) {
-        try fail("mlx-login: could not own org.mlx.Login on the system bus (is mlx-ipcd --system running?)", Failure.NoBus)
+        try fail("sentinel: could not own org.mlx.Login on the system bus (is synapse --system running?)", Failure.NoBus)
     }
     say(login, "login: org.mlx.Login and org.freedesktop.login1 on the system bus; waiting for the greeter\n")
-    if !startGreeter(login) { try fail("mlx-login: could not start the greeter compositor", Failure.NoGreeter) }
+    if !startGreeter(login) { try fail("sentinel: could not start the greeter compositor", Failure.NoGreeter) }
     dispatch(login)
     while login.*.running { wait(login, signals) }
     stopGreeter(login)
-    const closedSignals = std.linux.syscall1(std.linux.SYS_close, @bitCast(usize, signals))
+    if signals >= 0 { _ = std.linux.syscall1(std.linux.SYS_close, @bitCast(usize, signals)) }
 }
 
 pub fn main(arguments: [][*]const u8) -> !void {

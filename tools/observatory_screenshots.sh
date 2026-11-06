@@ -3,7 +3,7 @@
 # taken of this whole repository, with real data behind every finding:
 #   - crashes kept by tests/support/crash_report.mlx (crashed three ways);
 #   - profiles of mlx-observatory itself (its command line) under mlx-profile;
-#   - built programs (mlx-observatory, mlx-lsp, mlx-files) for the machine code;
+#   - built programs (mlx-observatory, mlx-lsp, polaris) for the machine code;
 #   - the Git history (blame, and the workarounds of the last 20 commits).
 # The app plays a demo script (MLX_CODEMAP_DEMO, see runDemo in
 # projects/observatory/main.mlx) under tools/wayland-test-host, drawn on
@@ -30,7 +30,7 @@ say() { echo "== $*" >&2; }
 say "building"
 "$compiler" --quiet projects/observatory/main.mlx -o "$work/bin/mlx-observatory"
 "$compiler" --quiet tools/mlx-lsp/main.mlx -o "$work/bin/mlx-lsp"
-"$compiler" --quiet projects/desktop/files/main.mlx -o "$work/bin/mlx-files"
+"$compiler" --quiet projects/desktop/files/main.mlx -o "$work/bin/polaris"
 "$compiler" --quiet tools/profile/main.mlx -o "$work/mlx-profile"
 "$compiler" --quiet tools/wayland-test-host/main.mlx -o "$work/test-host"
 "$compiler" --quiet tests/support/crash_report.mlx -o "$work/crashy"

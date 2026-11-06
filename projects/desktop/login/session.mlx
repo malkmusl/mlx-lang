@@ -2,7 +2,10 @@
 // close-on-exec pipe: the parent calls it started only after execve closed
 // the pipe, while every privilege-drop failure is reported and exits.
 const std = @import("std")
+const builtin = @import("builtin")
 const activation = @import("../ipc/activation.mlx")
+const brix = @import("std").os.brix
+const native = @import("./native.mlx")
 const spawn_module = @import("std.spawn")
 const groups_module = @import("./groups.mlx")
 const users_module = @import("./users.mlx")
@@ -13,7 +16,10 @@ const GROUP_OR_OTHER_WRITABLE: u32 = 18
 const PATH_MOST: usize = 512
 const GROUP_MOST: usize = 32
 const ENVIRONMENT_MOST: usize = 4096
-const ENVIRONMENT_ENTRIES: usize = 12
+const ENVIRONMENT_ENTRIES: usize = 13
+// The session's data directories (its .desktop files and icons): the
+// system's own on brixOS.
+fn dataDirs() -> []const u8 { return if comptime builtin.os == builtin.Os.brixos { "/system/share" } else { "/usr/local/share:/usr/share" } }
 
 fn addNumber(target: [*]u8, at: usize, value: u32) -> usize {
     var digits: [16]u8 = undefined
@@ -59,6 +65,20 @@ fn directory(path: [*]u8, owner: u32, writable: bool) -> bool {
 // Creates ROOT/UID under a trusted, root-owned base and returns its text.
 fn runtimeDirectory(root: []const u8, uid: u32, gid: u32, path: [*]u8, length: *usize) -> bool {
     if root.length == 0 || root.length + 16 >= PATH_MOST || !cString(path, PATH_MOST, root) { return false }
+    if comptime builtin.os == builtin.Os.brixos {
+        // (ROOT root's, ROOT/UID the person's, mode 700.)
+        _ = brix.make(0, root, brix.NodeKind.DIRECTORY, 493, "")
+        var at = root.length
+        if path[at - 1] != 47 {
+            path[at] = 47
+            at += 1
+        }
+        at = addNumber(path, at, uid)
+        path[at] = 0
+        if !native.ownedDirectory(path[0..at], 448, uid, gid) { return false }
+        length.* = at
+        return true
+    }
     const ignored = std.linux.syscall2(std.linux.SYS_mkdir, @intFromPtr(path), 493)
     if !directory(path, 0, false) { return false }
     var at = root.length
@@ -112,6 +132,19 @@ fn child(user: *users_module.User, program: [*]u8, home: [*]u8, runtime: []const
     var environment: [ENVIRONMENT_ENTRIES + 1][*]const u8 = undefined
     var environmentEntries: [*][*]const u8 = undefined
     unsafe { environmentEntries = @ptrCast([*][*]const u8, &environment) }
+    if !environmentOf(user, runtime, busAddress, storageBytes, environmentEntries) { childFailed(report) }
+    var arguments: [2][*]const u8 = undefined
+    unsafe {
+        arguments[0] = @ptrCast([*]const u8, program)
+        arguments[1] = @ptrFromInt([*]const u8, 0)
+        spawn_module.execute(arguments[0], @ptrCast([*][*]const u8, &arguments), environmentEntries, activation.searchPath())
+    }
+    childFailed(report)
+}
+
+// The session's environment: its entries at `environmentEntries`
+// (NULL-terminated), their text in `storage`.
+fn environmentOf(user: *users_module.User, runtime: []const u8, busAddress: []const u8, storageBytes: [*]u8, environmentEntries: [*][*]const u8) -> bool {
     var used: usize = 0
     var count: usize = 0
     const name = users_module.nameOf(user)
@@ -119,53 +152,97 @@ fn child(user: *users_module.User, program: [*]u8, home: [*]u8, runtime: []const
         entry(storageBytes, &used, environmentEntries, &count, "USER=", name) &&
         entry(storageBytes, &used, environmentEntries, &count, "LOGNAME=", name) &&
         entry(storageBytes, &used, environmentEntries, &count, "SHELL=", users_module.shellOf(user)) &&
-        entry(storageBytes, &used, environmentEntries, &count, "PATH=", "/usr/local/bin:/usr/bin:/bin:/usr/bin/mlx") &&
+        entry(storageBytes, &used, environmentEntries, &count, "PATH=", activation.searchPath()) &&
+        entry(storageBytes, &used, environmentEntries, &count, "XDG_DATA_DIRS=", dataDirs()) &&
         entry(storageBytes, &used, environmentEntries, &count, "XDG_RUNTIME_DIR=", runtime) &&
         entry(storageBytes, &used, environmentEntries, &count, "XDG_SESSION_TYPE=", "wayland") &&
         entry(storageBytes, &used, environmentEntries, &count, "XDG_SESSION_ID=", "mlx") &&
         entry(storageBytes, &used, environmentEntries, &count, "XDG_SEAT=", "seat0") &&
         entry(storageBytes, &used, environmentEntries, &count, "XDG_VTNR=", "1") &&
         entry(storageBytes, &used, environmentEntries, &count, "DBUS_SYSTEM_BUS_ADDRESS=", busAddress)
-    if !ok { childFailed(report) }
+    if !ok { return false }
     unsafe { environmentEntries[count] = @ptrFromInt([*]const u8, 0) }
-    var arguments: [2][*]const u8 = undefined
-    unsafe {
-        arguments[0] = @ptrCast([*]const u8, program)
-        arguments[1] = @ptrFromInt([*]const u8, 0)
-        spawn_module.execute(arguments[0], @ptrCast([*][*]const u8, &arguments), environmentEntries, activation.SEARCH_PATH)
-    }
-    childFailed(report)
+    return true
 }
 
-// Starts `program` as `user`; its positive pid, or -1 after any setup or
-// exec failure. `program` is one executable, never a shell command.
-pub fn start(user: *users_module.User, programText: []const u8, groupPath: []const u8, runtimeRoot: []const u8, busAddress: []const u8) -> isize {
-    if programText.length == 0 || programText.length > 255 { return -1 }
+// brixOS: the session started natively, in the person's home (made at
+// the first login, theirs) with their identity.
+fn startNative(user: *users_module.User, programText: []const u8, runtime: []const u8, busAddress: []const u8, environment: [*][*]const u8) -> spawn_module.Child {
+    const none = spawn_module.Child.{ .id = -1, .handle = true }
+    const home = users_module.homeOf(user)
+    if !native.ownedDirectory(home, 448, user.*.uid, user.*.gid) { return none }
+    var storage: [ENVIRONMENT_MOST]u8 = undefined
+    var storageBytes: [*]u8 = undefined
+    unsafe { storageBytes = @ptrCast([*]u8, &storage) }
+    var entries: [ENVIRONMENT_ENTRIES + 1][*]const u8 = undefined
+    var environmentEntries: [*][*]const u8 = undefined
+    unsafe { environmentEntries = @ptrCast([*][*]const u8, &entries) }
+    if !environmentOf(user, runtime, busAddress, storageBytes, environmentEntries) { return none }
+    var program: [256]u8 = undefined
+    var programBytes: [*]u8 = undefined
+    unsafe { programBytes = @ptrCast([*]u8, &program) }
+    if !cString(programBytes, 256, programText) { return none }
+    var arguments: [2][*]const u8 = undefined
+    var argumentEntries: [*][*]const u8 = undefined
+    unsafe {
+        arguments[0] = @ptrCast([*]const u8, programBytes)
+        arguments[1] = @ptrFromInt([*]const u8, 0)
+        argumentEntries = @ptrCast([*][*]const u8, &arguments)
+    }
+    const node = native.program(programText, environment)
+    if node == 0 { return none }
+    var ends: [2]u32 = undefined
+    if brix.streamPairWith(&ends, 1) < 0 {
+        _ = brix.close(node)
+        return none
+    }
+    const branched = brix.branch()
+    if branched == 0 {
+        _ = brix.close(ends[0])
+        native.become(user.*.uid, user.*.gid, home, node, argumentEntries, environmentEntries, ends[1])
+    }
+    _ = brix.close(ends[1])
+    _ = brix.close(node)
+    if branched < 0 {
+        _ = brix.close(ends[0])
+        return none
+    }
+    const child = spawn_module.Child.{ .id = branched, .handle = true }
+    return if native.started(child, ends[0]) { child } else { none }
+}
+
+// Starts `program` as `user`: the child when it runs; one not started()
+// after any setup failure. `program` is one executable, never a shell
+// command.
+pub fn start(user: *users_module.User, programText: []const u8, groupPath: []const u8, runtimeRoot: []const u8, busAddress: []const u8, environment: [*][*]const u8) -> spawn_module.Child {
+    const none = spawn_module.Child.{ .id = -1, .handle = comptime builtin.os == builtin.Os.brixos }
+    if programText.length == 0 || programText.length > 255 { return none }
     var index: usize = 0
     while index < programText.length {
-        if programText[index] == 0 || programText[index] == 32 || programText[index] == 9 || programText[index] == 10 { return -1 }
+        if programText[index] == 0 || programText[index] == 32 || programText[index] == 9 || programText[index] == 10 { return none }
         index += 1
     }
     var groups: [GROUP_MOST]u32 = undefined
     var groupBytes: [*]u32 = undefined
     unsafe { groupBytes = @ptrCast([*]u32, &groups) }
     var groupCount: usize = 0
-    if !groups_module.load(groupPath, users_module.nameOf(user), user.*.gid, groupBytes, &groupCount, GROUP_MOST) { return -1 }
+    if !groups_module.load(groupPath, users_module.nameOf(user), user.*.gid, groupBytes, &groupCount, GROUP_MOST) { return none }
     var runtime: [PATH_MOST]u8 = undefined
     var runtimeBytes: [*]u8 = undefined
     unsafe { runtimeBytes = @ptrCast([*]u8, &runtime) }
     var runtimeLength: usize = 0
-    if !runtimeDirectory(runtimeRoot, user.*.uid, user.*.gid, runtimeBytes, &runtimeLength) { return -1 }
+    if !runtimeDirectory(runtimeRoot, user.*.uid, user.*.gid, runtimeBytes, &runtimeLength) { return none }
+    if comptime builtin.os == builtin.Os.brixos { return startNative(user, programText, runtimeBytes[0..runtimeLength], busAddress, environment) }
     var program: [256]u8 = undefined
     var programBytes: [*]u8 = undefined
     unsafe { programBytes = @ptrCast([*]u8, &program) }
-    if !cString(programBytes, 256, programText) { return -1 }
+    if !cString(programBytes, 256, programText) { return none }
     var home: [users_module.PATH_MOST + 1]u8 = undefined
     var homeBytes: [*]u8 = undefined
     unsafe { homeBytes = @ptrCast([*]u8, &home) }
-    if !cString(homeBytes, users_module.PATH_MOST + 1, users_module.homeOf(user)) { return -1 }
+    if !cString(homeBytes, users_module.PATH_MOST + 1, users_module.homeOf(user)) { return none }
     var descriptors: [2]i32 = undefined
-    if std.linux.syscall2(std.linux.SYS_pipe2, @intFromPtr(&descriptors), std.linux.O_CLOEXEC) != 0 { return -1 }
+    if std.linux.syscall2(std.linux.SYS_pipe2, @intFromPtr(&descriptors), std.linux.O_CLOEXEC) != 0 { return none }
     const reader = @intCast(isize, descriptors[0])
     const writer = @intCast(isize, descriptors[1])
     const pid = std.linux.process.fork()
@@ -176,14 +253,14 @@ pub fn start(user: *users_module.User, programText: []const u8, groupPath: []con
     const ignoredWriter = std.linux.syscall1(std.linux.SYS_close, @bitCast(usize, writer))
     if pid < 0 {
         const ignoredReader = std.linux.syscall1(std.linux.SYS_close, @bitCast(usize, reader))
-        return -1
+        return none
     }
     var problem: [1]u8 = undefined
     var got = std.linux.read(reader, &problem, 1)
     while got == std.linux.EINTR { got = std.linux.read(reader, &problem, 1) }
     const ignoredReader = std.linux.syscall1(std.linux.SYS_close, @bitCast(usize, reader))
-    if got == 0 { return pid }
+    if got == 0 { return spawn_module.Child.{ .id = pid, .handle = false } }
     var status: usize = 0
     const ignoredWait = std.linux.syscall4(std.linux.SYS_wait4, @bitCast(usize, pid), @intFromPtr(&status), 0, 0)
-    return -1
+    return none
 }

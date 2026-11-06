@@ -85,10 +85,10 @@ echo "ok   PATH gets /usr/bin/mlx once, after the system's directories (login sh
 
 # Removed only with the last program.
 install -d "$stage/usr/bin/mlx"
-touch "$stage/usr/bin/mlx/mlx-netd"
+touch "$stage/usr/bin/mlx/nexus"
 mlx_remove_path_files "$stage" /usr/bin/mlx > /dev/null
 [[ -f "$profile" ]] || fail "the PATH additions went while a program was left"
-rm -f "$stage/usr/bin/mlx/mlx-netd"
+rm -f "$stage/usr/bin/mlx/nexus"
 mlx_remove_path_files "$stage" /usr/bin/mlx > /dev/null
 for path in "${mlx_path_files[@]}"; do
     [[ ! -e "$stage$path" ]] || fail "$path remained after the last program"
@@ -105,9 +105,9 @@ put() {
     install -d "$(dirname "$old$1")"
     printf '%s\n' "${2:-old}" > "$old$1"
 }
-put /usr/local/bin/mlx-compositor
-put /usr/local/bin/mlx-netd
-put /usr/bin/mlx-terminal
+put /usr/local/bin/kepler
+put /usr/local/bin/nexus
+put /usr/bin/vector
 put /usr/bin/ls "not ours"
 ln -s mlx-observatory "$old/usr/local/bin/mlx-codemap"
 put /usr/local/share/applications/org.mlx.files.desktop
@@ -116,50 +116,50 @@ put /usr/local/share/mlx/dbus-1/services/org.mlx.Audio.service
 put /usr/local/lib/mlx-audio/libasound_module_pcm_pulse.so
 put /usr/local/share/mlx/sound-servers-replaced pipewire.socket
 put /etc/alsa/conf.d/99-zz-mlx-audio.conf 'pcm.mlx { type pulse lib "/usr/local/lib/mlx-audio/libasound_module_pcm_pulse.so" }'
-put /etc/systemd/system/mlx-login.service 'ExecStart=/usr/local/bin/mlx-login --greeter /usr/local/bin/mlx-compositor /usr/local/bin/mlx-greeter'
-put /etc/systemd/system/mlx-netd.service 'ExecStart=/usr/bin/mlx/mlx-netd'
-for program in mlx-compositor mlx-terminal mlx-codemap mlx-observatory; do put "/usr/bin/mlx/$program" new; done
+put /etc/systemd/system/sentinel.service 'ExecStart=/usr/local/bin/sentinel --greeter /usr/local/bin/kepler /usr/local/bin/aurora'
+put /etc/systemd/system/nexus.service 'ExecStart=/usr/bin/mlx/nexus'
+for program in kepler vector mlx-codemap mlx-observatory; do put "/usr/bin/mlx/$program" new; done
 put /usr/share/applications/org.mlx.files.desktop new
 put /usr/share/mlx/dbus-1/services/org.mlx.Audio.service new
 put /usr/lib/mlx-audio/libasound_module_pcm_pulse.so new
 
 tools/remove_old_mlx_layout.sh --destdir "$old" > "$work/dry.log"
-grep -qx 'old     /usr/local/bin/mlx-compositor (now /usr/bin/mlx/mlx-compositor)' "$work/dry.log" || { cat "$work/dry.log" >&2; fail "the dry run did not list the old compositor"; }
-grep -qx 'kept    /usr/local/bin/mlx-netd (no /usr/bin/mlx/mlx-netd yet: reinstall first)' "$work/dry.log" || fail "the dry run did not keep mlx-netd"
-grep -q '^stale   /etc/systemd/system/mlx-login.service ' "$work/dry.log" || fail "the stale unit was not reported"
-if grep -q 'mlx-netd.service' "$work/dry.log"; then fail "a unit of the new layout was reported stale"; fi
-[[ -f "$old/usr/local/bin/mlx-compositor" && -L "$old/usr/local/bin/mlx-codemap" ]] || fail "the dry run removed something"
+grep -qx 'old     /usr/local/bin/kepler (now /usr/bin/mlx/kepler)' "$work/dry.log" || { cat "$work/dry.log" >&2; fail "the dry run did not list the old compositor"; }
+grep -qx 'kept    /usr/local/bin/nexus (no /usr/bin/mlx/nexus yet: reinstall first)' "$work/dry.log" || fail "the dry run did not keep nexus"
+grep -q '^stale   /etc/systemd/system/sentinel.service ' "$work/dry.log" || fail "the stale unit was not reported"
+if grep -q 'nexus.service' "$work/dry.log"; then fail "a unit of the new layout was reported stale"; fi
+[[ -f "$old/usr/local/bin/kepler" && -L "$old/usr/local/bin/mlx-codemap" ]] || fail "the dry run removed something"
 echo "ok   remove_old_mlx_layout.sh lists without --remove and changes nothing"
 
 tools/remove_old_mlx_layout.sh --destdir "$old" --remove > "$work/remove.log"
-for path in /usr/local/bin/mlx-compositor /usr/local/bin/mlx-codemap /usr/bin/mlx-terminal \
+for path in /usr/local/bin/kepler /usr/local/bin/mlx-codemap /usr/bin/vector \
     /usr/local/share/applications/org.mlx.files.desktop /usr/local/share/mlx/dbus-1/services/org.mlx.Audio.service \
     /usr/local/lib/mlx-audio/libasound_module_pcm_pulse.so /usr/local/share/mlx/sound-servers-replaced; do
     [[ ! -e "$old$path" && ! -L "$old$path" ]] || { cat "$work/remove.log" >&2; fail "$path was not removed"; }
 done
 [[ ! -e "$old/usr/local/share/mlx" && ! -e "$old/usr/local/lib/mlx-audio" ]] || fail "empty old directories remained"
-[[ -f "$old/usr/local/bin/mlx-netd" ]] || fail "mlx-netd went without a new copy"
+[[ -f "$old/usr/local/bin/nexus" ]] || fail "nexus went without a new copy"
 [[ "$(< "$old/usr/bin/ls")" == "not ours" && "$(< "$old/usr/local/share/applications/someone-else.desktop")" == "not ours" ]] || fail "a file that is not ours was touched"
-for program in mlx-compositor mlx-terminal mlx-codemap; do
+for program in kepler vector mlx-codemap; do
     [[ "$(< "$old/usr/bin/mlx/$program")" == new ]] || fail "the new $program was touched"
 done
 [[ "$(< "$old/usr/share/mlx/sound-servers-replaced")" == pipewire.socket ]] || fail "the sound servers' marker did not move"
 grep -qF 'lib "/usr/lib/mlx-audio/libasound_module_pcm_pulse.so"' "$old/etc/alsa/conf.d/99-zz-mlx-audio.conf" || fail "the ALSA setting still names the old library"
 tools/remove_old_mlx_layout.sh --destdir "$old" --remove > "$work/again.log"
-grep -qx 'kept    /usr/local/bin/mlx-netd (no /usr/bin/mlx/mlx-netd yet: reinstall first)' "$work/again.log" && \
-    grep -qx '1 kept until their new counterparts are installed' "$work/again.log" || { cat "$work/again.log" >&2; fail "a second run did more than keep mlx-netd"; }
+grep -qx 'kept    /usr/local/bin/nexus (no /usr/bin/mlx/nexus yet: reinstall first)' "$work/again.log" && \
+    grep -qx '1 kept until their new counterparts are installed' "$work/again.log" || { cat "$work/again.log" >&2; fail "a second run did more than keep nexus"; }
 echo "ok   --remove takes the old copies with new counterparts, moves the sound marker, fixes ALSA's path, keeps the rest"
 
 # mlx-session in PREFIX/bin/mlx: its MLXIPC services under PREFIX/share
-# and its directory on PATH. A stand-in mlx-ipcd records how it was run.
+# and its directory on PATH. A stand-in synapse records how it was run.
 session="$work/session-root/usr/bin/mlx"
 install -d "$session"
 install -m 755 projects/desktop/compositor/session/mlx-session "$session/mlx-session"
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "%s/ipcd-args"\nprintf "%%s\\n" "$PATH" > "%s/ipcd-path"\n' "$work" "$work" > "$session/mlx-ipcd"
-printf '#!/bin/sh\nexit 0\n' > "$session/mlx-compositor"
-chmod 755 "$session/mlx-ipcd" "$session/mlx-compositor"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "%s/ipcd-args"\nprintf "%%s\\n" "$PATH" > "%s/ipcd-path"\n' "$work" "$work" > "$session/synapse"
+printf '#!/bin/sh\nexit 0\n' > "$session/kepler"
+chmod 755 "$session/synapse" "$session/kepler"
 env -i HOME="$work/home" PATH=/usr/bin:/bin MLX_SESSION_INSIDE=1 "$session/mlx-session"
-grep -q -- "--services $work/session-root/usr/share/mlx/dbus-1/services --start org.mlx.Audio --run $session/mlx-compositor " "$work/ipcd-args" || { cat "$work/ipcd-args" >&2; fail "mlx-session gave mlx-ipcd the wrong services"; }
+grep -q -- "--services $work/session-root/usr/share/mlx/dbus-1/services --start org.mlx.Audio --run $session/kepler " "$work/ipcd-args" || { cat "$work/ipcd-args" >&2; fail "mlx-session gave synapse the wrong services"; }
 [[ "$(< "$work/ipcd-path")" == "/usr/bin:/bin:$session" ]] || fail "mlx-session's PATH is $(< "$work/ipcd-path")"
 echo "ok   mlx-session in PREFIX/bin/mlx runs MLXIPC on PREFIX/share and puts its directory on PATH"
 

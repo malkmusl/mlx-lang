@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mlx-sh (projects/shell) end to end:
+# flux (projects/shell) end to end:
 #   - `-c` snippets against dash: words, quotes, parameters and their
 #     operators, arithmetic, command substitution, globbing, pipelines,
 #     redirections and heredocs, lists, if/for/while/until/case, functions,
@@ -25,10 +25,10 @@ work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 fail() { echo "FAIL $1" >&2; [[ -f "${2:-}" ]] && cat "$2" >&2; exit 1; }
 
-"$compiler" --quiet projects/shell/main.mlx -o "$work/mlx-sh"
-sh=$work/mlx-sh
-echo "ok   mlx-sh builds"
-grep -q mlxCompositorCrashed "$sh" || fail "mlx-sh has no crash handler"
+"$compiler" --quiet projects/shell/main.mlx -o "$work/flux"
+sh=$work/flux
+echo "ok   flux builds"
+grep -q mlxCompositorCrashed "$sh" || fail "flux has no crash handler"
 
 # --- -c snippets, against dash.
 command -v dash > /dev/null || fail "dash is needed for the comparison"
@@ -162,9 +162,9 @@ for snippet in "${snippets[@]}"; do
         {
             echo "snippet $index: $snippet"
             echo "--- dash (exit $dash_status)"; cat "$work/dash.out"
-            echo "--- mlx-sh (exit $mlx_status)"; cat "$work/mlx.out"; cat "$work/mlx.err"
+            echo "--- flux (exit $mlx_status)"; cat "$work/mlx.out"; cat "$work/mlx.err"
         } > "$work/diff.txt"
-        fail "mlx-sh and dash disagree on snippet $index" "$work/diff.txt"
+        fail "flux and dash disagree on snippet $index" "$work/diff.txt"
     fi
 done
 echo "ok   $index -c snippets agree with dash (output and status)"
@@ -178,21 +178,21 @@ expect() {
     set -e
     if [[ $got -ne $status ]] || [[ "$(cat "$work/mlx.out")" != "$expected" ]]; then
         { echo "snippet: $snippet"; echo "expected (exit $status): $expected"; echo "got (exit $got):"; cat "$work/mlx.out" "$work/mlx.err"; } > "$work/diff.txt"
-        fail "mlx-sh: unexpected result" "$work/diff.txt"
+        fail "flux: unexpected result" "$work/diff.txt"
     fi
 }
 expect 'x=abcdef; echo ${x:2:2} ${x:3} ${x:0:1}' 'cd def a'
 expect 'f() { local v=in; echo $v; }; v=out; f; echo $v' $'in\nout'
-expect 'local x 2>&1' 'mlx-sh: local: not in a function' 1
+expect 'local x 2>&1' 'flux: local: not in a function' 1
 expect 'echo $((1+2' '' 2
 expect 'echo ${x!y}; echo not-reached' '' 2
 expect 'help | tr " " "\n" | grep -c "^cd$"' '1'
 expect 'echo ${x:?unset}; echo not-reached' '' 2
 expect 'echo ${x:?unset} || echo not-reached' '' 2
-expect '(echo ${x:?unset}) 2>&1; echo "reached $?"' $'mlx-sh: x: unset\nreached 2'
+expect '(echo ${x:?unset}) 2>&1; echo "reached $?"' $'flux: x: unset\nreached 2'
 # A job killed by TERM: wait says 143 (dash says 0 there).
 expect 'sleep 5 & kill %1; wait %1; echo $?' '143'
-expect '(set -u; echo $nope) 2>&1; echo "reached $?"' $'mlx-sh: nope: parameter not set\nreached 2'
+expect '(set -u; echo $nope) 2>&1; echo "reached $?"' $'flux: nope: parameter not set\nreached 2'
 expect 'alias x=y; type x; alias nothing' $'x is an alias for y' 1
 expect 'fg' '' 1
 expect 'trap "echo one" USR1 USR2; kill -USR2 $$; trap - USR1; trap' $'one\ntrap -- '"'"'echo one'"'"' USR2'
@@ -242,7 +242,7 @@ dash_status=$?
 timeout 10 "$sh" "$work/script.sh" -v notes.txt other > "$work/mlx.out" 2>&1
 mlx_status=$?
 set -e
-[[ $dash_status -eq 3 && $mlx_status -eq 3 ]] || fail "the script's exit status: dash $dash_status, mlx-sh $mlx_status" "$work/mlx.out"
+[[ $dash_status -eq 3 && $mlx_status -eq 3 ]] || fail "the script's exit status: dash $dash_status, flux $mlx_status" "$work/mlx.out"
 cmp -s "$work/dash.out" "$work/mlx.out" || { diff "$work/dash.out" "$work/mlx.out" > "$work/diff.txt" || true; fail "the script's output differs from dash" "$work/diff.txt"; }
 echo "ok   a script by path: as dash (exit 3)"
 
@@ -263,7 +263,7 @@ echo "ok   a script by shebang, from stdin, with -s"
 [[ "$(env -i PATH=/usr/bin:/bin "$sh" -c 'echo "$PATH"')" == /usr/bin:/bin:/usr/bin/mlx ]] || fail "/usr/bin/mlx was not appended to PATH"
 [[ "$(env -i PATH=/usr/bin/mlx:/bin "$sh" -c 'echo "$PATH"')" == /usr/bin/mlx:/bin ]] || fail "/usr/bin/mlx was appended twice"
 [[ "$(env -i "$sh" -c 'echo "$PATH"')" == /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/bin/mlx ]] || fail "the default PATH lacks /usr/bin/mlx"
-echo "ok   /usr/bin/mlx is on PATH once, whatever PATH mlx-sh was given"
+echo "ok   /usr/bin/mlx is on PATH once, whatever PATH flux was given"
 
 # --- --parse.
 "$sh" --parse 'if [ -f x ]; then cat x | wc -l > n; fi; f() { echo "$@"; }' > "$work/parse.out" 2>&1

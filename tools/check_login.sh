@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks mlx-login (projects/desktop/login) against a private MLXIPC
+# Checks sentinel (projects/desktop/login) against a private MLXIPC
 # system bus and private account files. It owns org.mlx.Login, lists the
 # synthetic login accounts, authorizes login.session through MLXIPC and
 # checks passwords against a private shadow source.
@@ -20,7 +20,7 @@ command -v unshare > /dev/null || { echo "check_login.sh: needs unshare (util-li
 # /dev/char, and the check cannot run there.
 [[ -e /dev/char/1:3 ]] || { echo "check_login.sh: needs /dev/char/1:3 (devtmpfs's device links; a minimal /dev has none)" >&2; exit 2; }
 
-# Both the MLXIPC system bus and mlx-login use root credentials as a
+# Both the MLXIPC system bus and sentinel use root credentials as a
 # security boundary. Keep those credentials inside a private user
 # namespace so this check never needs or exercises host root. The second
 # mapping gives the session a real non-root uid and keeps setgroups usable.
@@ -50,8 +50,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/mlx-ipcd"
-"$compiler" --quiet projects/desktop/login/main.mlx -o "$work/mlx-login"
+"$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
+"$compiler" --quiet projects/desktop/login/main.mlx -o "$work/sentinel"
 "$compiler" --quiet tools/login-test/logind-client.mlx -o "$work/login1-client"
 
 # Private fixtures prove that both file options are accepted and that the
@@ -90,7 +90,7 @@ while [[ ! -e "$work/home/finish" ]]; do sleep 0.1; done
 SESSION
 chmod 755 "$work/session.sh"
 
-# A stand-in for `mlx-compositor --greeter mlx-greeter`. mlx-login must
+# A stand-in for `kepler --greeter aurora`. sentinel must
 # launch it without root credentials, stop it before the user's session,
 # and start a fresh one after that session ends.
 cat > "$work/greeter-compositor" <<'GREETER'
@@ -100,16 +100,16 @@ printf 'start pid=%s uid=%s gid=%s args=%s\n' "$$" "$(id -u)" "$(id -g)" "$*" >>
 trap 'printf "stop pid=%s\n" "$$" >> "$log"; exit 0' TERM INT
 while :; do sleep 0.1; done
 GREETER
-cat > "$work/mlx-greeter" <<'GREETER_APP'
+cat > "$work/aurora" <<'GREETER_APP'
 #!/bin/sh
 exit 0
 GREETER_APP
-chmod 755 "$work/greeter-compositor" "$work/mlx-greeter"
+chmod 755 "$work/greeter-compositor" "$work/aurora"
 
 address="unix:path=$work/bus"
 export DBUS_SYSTEM_BUS_ADDRESS="$address"
 touch "$work/none.conf"
-"$work/mlx-ipcd" --system --address "$work/bus" --policy "$work/none.conf" > "$work/bus.log" 2>&1 &
+"$work/synapse" --system --address "$work/bus" --policy "$work/none.conf" > "$work/bus.log" 2>&1 &
 bus_pid=$!
 for _ in $(seq 1 50); do [[ -S "$work/bus" ]] && break; sleep 0.1; done
 [[ -S "$work/bus" ]] || { echo "FAIL the system bus did not come up" >&2; cat "$work/bus.log" >&2; exit 1; }
@@ -117,10 +117,10 @@ for _ in $(seq 1 50); do [[ -S "$work/bus" ]] && break; sleep 0.1; done
 python3 tools/login-test/fake-init.py "$work/init" "$work/power.log" > "$work/init.log" 2>&1 &
 init_pid=$!
 for _ in $(seq 1 50); do [[ -S "$work/init" ]] && break; sleep 0.1; done
-[[ -S "$work/init" ]] || { echo "FAIL the private mlx-init control socket did not come up" >&2; cat "$work/init.log" >&2; exit 1; }
+[[ -S "$work/init" ]] || { echo "FAIL the private impulse control socket did not come up" >&2; cat "$work/init.log" >&2; exit 1; }
 
-MLX_INIT_CONTROL="$work/init" "$work/mlx-login" --verbose --passwd "$work/passwd" --shadow "$work/shadow" --group "$work/group" --runtime-dir "$work/runtime" --tty none --test-device-null \
-    --greeter "$work/greeter-compositor" "$work/mlx-greeter" --greeter-uid 65534 --greeter-gid 65534 > "$work/login.log" 2>&1 &
+MLX_INIT_CONTROL="$work/init" "$work/sentinel" --verbose --passwd "$work/passwd" --shadow "$work/shadow" --group "$work/group" --runtime-dir "$work/runtime" --tty none --test-device-null \
+    --greeter "$work/greeter-compositor" "$work/aurora" --greeter-uid 65534 --greeter-gid 65534 > "$work/login.log" 2>&1 &
 login_pid=$!
 # Wait until it owns the name.
 owned=""
@@ -132,26 +132,26 @@ for _ in $(seq 1 50); do
     fi
     sleep 0.1
 done
-[[ -n "$owned" ]] || { echo "FAIL mlx-login did not own org.mlx.Login" >&2; cat "$work/login.log" >&2; exit 1; }
-echo "ok   mlx-login owns org.mlx.Login on the system bus"
+[[ -n "$owned" ]] || { echo "FAIL sentinel did not own org.mlx.Login" >&2; cat "$work/login.log" >&2; exit 1; }
+echo "ok   sentinel owns org.mlx.Login on the system bus"
 
 greeter_log="$work/runtime/greeter/lifecycle.log"
 for _ in $(seq 1 50); do [[ -s "$greeter_log" ]] && break; sleep 0.1; done
-[[ -s "$greeter_log" ]] || { echo "FAIL mlx-login did not start its greeter" >&2; cat "$work/login.log" >&2; exit 1; }
-grep -q "^start pid=[0-9]* uid=65534 gid=65534 args=--greeter $work/mlx-greeter$" "$greeter_log" || { echo "FAIL greeter did not have the dropped identity and expected arguments:" >&2; cat "$greeter_log" >&2; exit 1; }
+[[ -s "$greeter_log" ]] || { echo "FAIL sentinel did not start its greeter" >&2; cat "$work/login.log" >&2; exit 1; }
+grep -q "^start pid=[0-9]* uid=65534 gid=65534 args=--greeter $work/aurora$" "$greeter_log" || { echo "FAIL greeter did not have the dropped identity and expected arguments:" >&2; cat "$greeter_log" >&2; exit 1; }
 [[ $(stat -c '%u:%g:%a' "$work/runtime/greeter") == 65534:65534:700 ]] || { echo "FAIL greeter runtime directory has wrong ownership or mode" >&2; stat -c '%u:%g:%a' "$work/runtime/greeter" >&2; exit 1; }
 greeter_pid=$(sed -n 's/^start pid=\([0-9]*\).*/\1/p' "$greeter_log" | head -1)
 greeter_session=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.GetSessionByPID "uint32 $greeter_pid" 2>&1 || true)
 grep -q '/org/freedesktop/login1/session/seat0' <<< "$greeter_session" || { echo "FAIL login1 did not expose the greeter compositor as the seat" >&2; echo "$greeter_session" >&2; exit 1; }
-echo "ok   mlx-login starts the greeter compositor unprivileged and exposes its seat"
+echo "ok   sentinel starts the greeter compositor unprivileged and exposes its seat"
 
 # login1's standard power methods are authorized by MLXIPC before they
-# reach mlx-init's root-only control socket. The Can* queries reflect
+# reach impulse's root-only control socket. The Can* queries reflect
 # whether that socket accepts connections.
 can_power=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.CanPowerOff 2>&1 || true)
-grep -q "'yes'" <<< "$can_power" || { echo "FAIL login1 did not report mlx-init power-off support:" >&2; echo "$can_power" >&2; exit 1; }
+grep -q "'yes'" <<< "$can_power" || { echo "FAIL login1 did not report impulse power-off support:" >&2; echo "$can_power" >&2; exit 1; }
 invalid_power=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.PowerOff 2>&1 || true)
 grep -q 'org.freedesktop.DBus.Error.InvalidArgs' <<< "$invalid_power" || { echo "FAIL login1 accepted PowerOff without its boolean:" >&2; echo "$invalid_power" >&2; exit 1; }
@@ -160,7 +160,7 @@ sleep 0.3
 power_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.PowerOff false 2>&1 || true)
 grep -q 'org.freedesktop.DBus.Error.AccessDenied' <<< "$power_out" || { echo "FAIL login1 powered off without login.power:" >&2; echo "$power_out" >&2; exit 1; }
-[[ ! -e "$work/power.log" ]] || { echo "FAIL a denied login1 power call reached mlx-init" >&2; cat "$work/power.log" >&2; exit 1; }
+[[ ! -e "$work/power.log" ]] || { echo "FAIL a denied login1 power call reached impulse" >&2; cat "$work/power.log" >&2; exit 1; }
 echo "ok   login1 requires MLXIPC's login.power permission"
 
 # ListUsers comes only from the fixture passed with --passwd.
@@ -178,7 +178,7 @@ count=$(grep -o "('" <<< "$users" | wc -l)
 [[ "$count" == 3 ]] || { echo "FAIL ListUsers returned $count accounts instead of the three fixtures:" >&2; echo "$users" >&2; exit 1; }
 echo "ok   ListUsers names only the three accounts from the passwd fixture"
 
-# Permission is decided before mlx-login looks at an account or password.
+# Permission is decided before sentinel looks at an account or password.
 login_call() {
     gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
         --method org.mlx.Login.Login "$1" "$2" "${3:-/bin/true}" 2>&1 || true
@@ -197,8 +197,8 @@ reboot_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --obj
     --method org.freedesktop.login1.Manager.Reboot false 2>&1 || true)
 grep -q '()' <<< "$reboot_out" || { echo "FAIL login1 Reboot did not succeed:" >&2; echo "$reboot_out" >&2; exit 1; }
 for _ in $(seq 1 30); do [[ -s "$work/power.log" ]] && [[ $(wc -l < "$work/power.log") -eq 2 ]] && break; sleep 0.1; done
-[[ "$(cat "$work/power.log" 2> /dev/null)" == $'poweroff\nreboot' ]] || { echo "FAIL login1 did not forward power requests to mlx-init:" >&2; cat "$work/power.log" >&2; exit 1; }
-echo "ok   login1 PowerOff and Reboot reach mlx-init's control socket"
+[[ "$(cat "$work/power.log" 2> /dev/null)" == $'poweroff\nreboot' ]] || { echo "FAIL login1 did not forward power requests to impulse:" >&2; cat "$work/power.log" >&2; exit 1; }
+echo "ok   login1 PowerOff and Reboot reach impulse's control socket"
 
 # A socket pathname can outlive its listener. Can* must not promise an
 # operation in that state, and an authorized action must return an error.
@@ -207,22 +207,22 @@ wait "$init_pid" 2> /dev/null || true
 init_pid=""
 can_reboot=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.CanReboot 2>&1 || true)
-grep -q "'no'" <<< "$can_reboot" || { echo "FAIL login1 reported a stale mlx-init socket as usable:" >&2; echo "$can_reboot" >&2; exit 1; }
+grep -q "'no'" <<< "$can_reboot" || { echo "FAIL login1 reported a stale impulse socket as usable:" >&2; echo "$can_reboot" >&2; exit 1; }
 reboot_out=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.Reboot false 2>&1 || true)
-grep -q 'org.freedesktop.DBus.Error.Failed' <<< "$reboot_out" || { echo "FAIL login1 hid an unavailable mlx-init control socket:" >&2; echo "$reboot_out" >&2; exit 1; }
-echo "ok   login1 reports and returns an unavailable mlx-init control socket"
+grep -q 'org.freedesktop.DBus.Error.Failed' <<< "$reboot_out" || { echo "FAIL login1 hid an unavailable impulse control socket:" >&2; echo "$reboot_out" >&2; exit 1; }
+echo "ok   login1 reports and returns an unavailable impulse control socket"
 
 # The unprivileged greeter compositor uses its distinct session id before a
-# user session exists. It must receive devices through mlx-login's login1
-# bridge instead of depending on systemd/udev ACLs that mlx-init does not run.
-XDG_SESSION_ID=mlx-greeter XDG_SEAT=seat0 "$work/login1-client" > "$work/greeter-login1.log" 2>&1 || {
+# user session exists. It must receive devices through sentinel's login1
+# bridge instead of depending on systemd/udev ACLs that impulse does not run.
+XDG_SESSION_ID=aurora XDG_SEAT=seat0 "$work/login1-client" > "$work/greeter-login1.log" 2>&1 || {
     echo "FAIL the greeter compositor could not control the login seat" >&2
     cat "$work/greeter-login1.log" "$work/login.log" >&2
     exit 1
 }
 grep -q 'login1 client passed' "$work/greeter-login1.log" || { echo "FAIL greeter login1 client did not finish" >&2; cat "$work/greeter-login1.log" >&2; exit 1; }
-echo "ok   the greeter session receives devices through mlx-login login1"
+echo "ok   the greeter session receives devices through sentinel login1"
 
 login_out=$(login_call mlx-missing test-password)
 grep -q "(false,)" <<< "$login_out" || { echo "FAIL Login did not refuse an unknown account:" >&2; echo "$login_out" >&2; exit 1; }
@@ -273,7 +273,7 @@ echo "ok   Login stops the greeter before giving the seat to the user session"
 
 login1_owned=$(gdbus call --address "$address" --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
     --method org.freedesktop.DBus.NameHasOwner org.freedesktop.login1 2>&1)
-grep -q true <<< "$login1_owned" || { echo "FAIL mlx-login did not own org.freedesktop.login1" >&2; cat "$work/login.log" >&2; exit 1; }
+grep -q true <<< "$login1_owned" || { echo "FAIL sentinel did not own org.freedesktop.login1" >&2; cat "$work/login.log" >&2; exit 1; }
 session_pid=$(sed -n 's/^pid=//p' "$work/home/session.out")
 session_path=$(gdbus call --address "$address" --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 \
     --method org.freedesktop.login1.Manager.GetSessionByPID "uint32 $session_pid" 2>&1 || true)
@@ -315,7 +315,7 @@ for _ in $(seq 1 70); do
 done
 grep -q 'session ended; the seat is free' "$work/login.log" || { echo "FAIL SIGCHLD did not release the seat without bus traffic" >&2; cat "$work/login.log" >&2; exit 1; }
 for _ in $(seq 1 50); do [[ $(grep -c '^start ' "$greeter_log" 2> /dev/null || true) -ge 2 ]] && break; sleep 0.1; done
-[[ $(grep -c '^start ' "$greeter_log" 2> /dev/null || true) -ge 2 ]] || { echo "FAIL mlx-login did not restart the greeter after logout" >&2; cat "$greeter_log" "$work/login.log" >&2; exit 1; }
+[[ $(grep -c '^start ' "$greeter_log" 2> /dev/null || true) -ge 2 ]] || { echo "FAIL sentinel did not restart the greeter after logout" >&2; cat "$greeter_log" "$work/login.log" >&2; exit 1; }
 unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
     --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
 grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL the seat stayed occupied after the session ended:" >&2; echo "$unlock_out" >&2; exit 1; }
@@ -323,13 +323,13 @@ echo "ok   the seat is released when the session ends"
 echo "ok   the greeter starts again after the user session ends"
 
 if grep -qE 'test-password|wrong-password|mlxlogintestsalt' "$work/login.log"; then
-    echo "FAIL mlx-login logged password material" >&2
+    echo "FAIL sentinel logged password material" >&2
     cat "$work/login.log" >&2
     exit 1
 fi
-echo "ok   mlx-login logs no password material"
+echo "ok   sentinel logs no password material"
 
 # The daemon is still alive (it did not crash on any call).
-kill -0 "$login_pid" 2> /dev/null || { echo "FAIL mlx-login ended during the check" >&2; cat "$work/login.log" >&2; exit 1; }
-echo "ok   mlx-login stayed up through the calls"
-echo "all mlx-login checks passed"
+kill -0 "$login_pid" 2> /dev/null || { echo "FAIL sentinel ended during the check" >&2; cat "$work/login.log" >&2; exit 1; }
+echo "ok   sentinel stayed up through the calls"
+echo "all sentinel checks passed"

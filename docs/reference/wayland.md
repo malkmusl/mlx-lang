@@ -344,7 +344,7 @@ malformed arguments, requests newer than the resource version and invalid
 new ids are answered with `wl_display.error` using libwayland's codes, and
 the client is then disconnected (`tests/245_wayland_server_errors_runtime.mlx`).
 
-The Linux transport (`std/src/wayland/transport/linux.mlx`) implements the
+The Linux transport (`std/src/wayland/transport/backend.mlx`; brixOS has `backend.brixos.mlx`, the compiler picks it for that target) implements the
 five `transport.xml` rules with direct syscalls. Unix stream sockets carry
 `SCM_RIGHTS` descriptors. Received descriptors are queued in arrival order,
 and a message is only dispatched once its bytes and all of its handles are
@@ -355,6 +355,21 @@ listeners. `memfd_create` objects are mapped with `MAP_SHARED`
 (`tests/243_wayland_linux_transport_runtime.mlx`,
 `tests/242_wayland_wire_runtime.mlx`). `wl.transport.SharedMemory` and
 `wl.transport.socketPair` expose these to applications.
+
+The brixOS transport (`backend.brixos.mlx`) implements the same five rules
+on brixOS's own interface (`std.os.brix`, spec/04-stdlib/os/brix.xml): a
+connection is one end of a channel pair, each message a chunk of the byte
+stream (at most 1024 bytes) with up to four handles; a listening socket is
+a listener node (`listener_make`, call 51: opening it creates a channel,
+whose far end arrives at the listener as a message with one handle, which
+`accept` takes); `socketPair` is `channel_pair`; shared memory is a memory
+object (`memory_object`, `memory_map_object`); event loops are tables of
+watched handles, waited on with the system's one `wait` (loop descriptors
+are numbered from 0x100000000 so that `wait` and `waitAny` can tell them
+from handles); the environment (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`)
+comes from `wl.transport.useEnvironment`, since there is no /proc. The
+wire, the protocol code and the applications are the same as on Linux
+(projects/brix/README.md, "The desktop"; tools/check_brix_desktop.sh).
 
 ### Wire compatibility
 

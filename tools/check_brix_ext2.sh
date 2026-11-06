@@ -23,11 +23,11 @@ mkdir -p "$work/bin" "$work/source/docs/deep"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 "$compiler" --quiet projects/brix/tools/ext2/main.mlx -o "$work/ext2"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 for program in ls cat wc tail readlink; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "$work/bin/"
 echo "ok   the kernel, the ext2 tool and a boot image build"
 
 echo "hello ext2" > "$work/source/hello.txt"

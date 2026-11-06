@@ -1,0 +1,332 @@
+// ignition on brixOS: the boot screen. The picture (scene.mlx, the same
+// as on Linux) goes to /devices/framebuffer (its geometry read, its pixels
+// mapped by node_map); what is happening comes from the init on the
+// splash's input (Plymouth's bytes as impulse sends them: "U" the service
+// starting, "u" the progress in percent, "C" another mode, "M"/"m" a
+// message, "Q" quit, keeping the picture when its argument's first byte is
+// set), each answered with one byte (ACK 6, NAK 21) on its output. The
+// frames are paced as the daemon's (at most `--fps` a second, never more
+// than a third of the processor); the loop is one wait on the input and
+// the frame's deadline. When the input ends (the init gone), the splash
+// quits as if told to.
+//
+//     mlx4 --target=x86_64-brixos projects/desktop/splash/brixos.mlx -o ignition
+//     ignition [--mode boot|shutdown|reboot|updates] [--fps N] [--snapshot PNG]
+//
+// `--snapshot PNG` writes the last frame when it quits (a check reads it).
+// What it is told is noted on its errors (the serial console): "up",
+// "starting NAME", "message: TEXT", "told to quit".
+const std = @import("std")
+const crash = @import("std.crash")
+const brix = std.os.brix
+const png = @import("std.png")
+const math = @import("std.math")
+const paint = @import("./paint.mlx")
+const scene_module = @import("./scene.mlx")
+const state = @import("./state.mlx")
+const bands = @import("./bands.mlx")
+const options_module = @import("./options.mlx")
+
+const Scene = scene_module.Scene
+const Allocator = std.allocator.Allocator
+
+const ACK: u8 = 6
+const NAK: u8 = 21
+const FADE: f64 = 0.35
+const BUFFER_SIZE: usize = 1024
+
+const Splash = struct {
+    allocator: Allocator
+    scene: *Scene
+    framebuffer: brix.Handle
+    address: usize
+    width: usize
+    height: usize
+    pitch: usize
+    swap: bool
+    input: brix.Handle
+    output: brix.Handle
+    // The request bytes not yet whole.
+    buffer: [BUFFER_SIZE]u8
+    length: usize
+    started: f64
+    interval: f64
+    frameCost: f64
+    lastFrame: f64
+    held: u64
+    quitting: bool
+    retain: bool
+    drawing: bool
+    snapshot: [*]const u8
+    hasSnapshot: bool
+}
+
+fn say(text: []const u8) -> void { _ = brix.write(brix.ofDescriptor(2), text, brix.STREAM) }
+
+// A line on stderr (the init's: the serial console): what the splash was
+// told, so a check sees the way from impulsectl to the screen.
+fn note(first: []const u8, second: []const u8, third: []const u8) -> void {
+    var line: [320]u8 = undefined
+    const bytes: [*]u8 = &line
+    var length = std.text.append(bytes, 0, 320, first)
+    length = std.text.append(bytes, length, 320, second)
+    length = std.text.append(bytes, length, 320, third)
+    length = std.text.append(bytes, length, 320, "\n")
+    say(bytes[0..length])
+}
+
+fn seconds() -> f64 {
+    const nanoseconds: f64 = @floatFromInt(f64, @intCast(i64, brix.clock(brix.Clock.MONOTONIC)))
+    return nanoseconds / 1000000000.0
+}
+
+fn now(splash: *Splash) -> f64 { return seconds() - splash.*.started }
+
+fn word(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var k: usize = 8
+    while k > 0 {
+        k -= 1
+        value = (value << 8) | @intCast(usize, bytes[at + k])
+    }
+    return value
+}
+
+// The display: its geometry, its pixels mapped.
+fn openDisplay(splash: *Splash) -> bool {
+    const opened = brix.open(0, "/devices/framebuffer", brix.Open.READ | brix.Open.WRITE, 0)
+    if opened < 0 { return false }
+    splash.*.framebuffer = @intCast(u32, opened)
+    var record: [32]u8 = undefined
+    if brix.read(splash.*.framebuffer, record[0..32], 0) != 32 { return false }
+    const words: [*]const u8 = &record
+    splash.*.width = word(words, 0)
+    splash.*.height = word(words, 8)
+    splash.*.pitch = word(words, 16)
+    // 1: blue first (the frame's words as they are), 2: red first.
+    splash.*.swap = word(words, 24) == 2
+    if splash.*.width == 0 || splash.*.height == 0 { return false }
+    const mapped = brix.mapNode(splash.*.framebuffer, 0, splash.*.pitch * splash.*.height)
+    if mapped < 0 { return false }
+    splash.*.address = @bitCast(usize, mapped)
+    return true
+}
+
+fn drawFrame(splash: *Splash, time: f64) -> void {
+    const begun = seconds()
+    const scene = splash.*.scene
+    scene.*.targetAddress = 0
+    scene_module.draw(scene, time)
+    if splash.*.drawing {
+        state.copyFrame(scene, splash.*.address, splash.*.pitch, splash.*.held, splash.*.swap)
+        splash.*.held = scene.*.frameNumber
+    }
+    splash.*.frameCost = seconds() - begun
+    splash.*.lastFrame = time
+}
+
+fn answer(splash: *Splash, byte: u8) -> void {
+    var bytes: [1]u8 = [1]u8{ byte }
+    _ = brix.write(splash.*.output, bytes[0..1], brix.STREAM)
+}
+
+// One request handled (its argument, when it has one, NUL-terminated in
+// the buffer).
+fn handle(splash: *Splash, command: u8, argument: []const u8) -> void {
+    const scene = splash.*.scene
+    var reply = ACK
+    if command == 85 {
+        scene_module.setUnit(scene, argument)
+        note("ignition: ", if scene.*.mode == state.Mode.boot { "starting " } else { "stopping " }, argument)
+    } else if command == 117 {
+        var percent: usize = 0
+        if options_module.parseNumber(argument, &percent) && percent <= 100 {
+            scene_module.setProgress(scene, paint.toFloat(percent) / 100.0)
+            scene.*.showProgress = true
+        }
+    } else if command == 67 {
+        var mode = scene.*.mode
+        if options_module.parseMode(argument, &mode) { scene_module.setMode(scene, mode) }
+    } else if command == 77 {
+        scene_module.setMessage(scene, argument)
+        note("ignition: ", "message: ", argument)
+    } else if command == 109 {
+        scene_module.hideMessage(scene, argument)
+        note("ignition: ", "message taken away", "")
+    } else if command == 81 {
+        note("ignition: ", "told to quit", if argument.length > 0 && argument[0] != 0 { ", the picture stays" } else { "" })
+        splash.*.retain = splash.*.retain || (argument.length > 0 && argument[0] != 0)
+        splash.*.quitting = true
+        // Answered when done (finish).
+        return
+    } else if command == 80 || command == 83 || command == 108 || command == 33 || command == 65 || command == 97 || command == 36 || command == 72 {
+        // Ping, system initialized, reload, an error, pause, unpause,
+        // show, hide: nothing to do here.
+    } else {
+        reply = NAK
+    }
+    answer(splash, reply)
+}
+
+// The whole requests in the buffer, handled and taken out.
+fn parse(splash: *Splash) -> void {
+    while splash.*.length >= 2 && !splash.*.quitting {
+        const command = splash.*.buffer[0]
+        var used: usize = 2
+        var argument: []const u8 = ""
+        if splash.*.buffer[1] == 2 {
+            if splash.*.length < 3 { return }
+            const size = @intCast(usize, splash.*.buffer[2])
+            if size == 0 {
+                used = 3
+            } else {
+                if splash.*.length < 3 + size { return }
+                argument = splash.*.buffer[3..3 + size - 1]
+                used = 3 + size
+            }
+        } else if splash.*.buffer[1] != 0 {
+            // Not a request: the rest is dropped.
+            splash.*.length = 0
+            return
+        }
+        handle(splash, command, argument)
+        const rest = splash.*.length - used
+        var move: usize = 0
+        while move < rest {
+            splash.*.buffer[move] = splash.*.buffer[used + move]
+            move += 1
+        }
+        splash.*.length = rest
+    }
+}
+
+// What came on the input: requests; its end means quit.
+fn readInput(splash: *Splash) -> void {
+    const room = BUFFER_SIZE - splash.*.length
+    if room == 0 {
+        splash.*.length = 0
+        return
+    }
+    const got = brix.read(splash.*.input, splash.*.buffer[splash.*.length..BUFFER_SIZE], brix.STREAM)
+    if got == -brix.Status.would_block { return }
+    if got <= 0 {
+        splash.*.quitting = true
+        return
+    }
+    splash.*.length += @bitCast(usize, got)
+    parse(splash)
+}
+
+fn step(splash: *Splash) -> void {
+    const time = now(splash)
+    var wait: f64 = 0.5
+    const gap = math.clamp(2.0 * splash.*.frameCost, splash.*.interval, 1.0)
+    const due = splash.*.lastFrame + gap
+    if splash.*.lastFrame < 0.0 || time >= due {
+        drawFrame(splash, time)
+        wait = gap
+    } else {
+        wait = due - time
+    }
+    var items: [1]brix.WaitItem = undefined
+    items[0] = brix.WaitItem.{ .handle = splash.*.input, .want = brix.State.READABLE | brix.State.PEER_GONE, .seen = 0, .reserved = 0 }
+    const deadline = brix.clock(brix.Clock.MONOTONIC) + @intCast(usize, paint.toInt(wait * 1000000000.0)) + 1
+    const ready = brix.wait(items[0..1], deadline)
+    if ready > 0 && items[0].seen & (brix.State.READABLE | brix.State.PEER_GONE) != 0 { readInput(splash) }
+}
+
+// The end: the last frame as a PNG when asked, faded out unless the
+// picture is to stay, the quit answered.
+fn finish(splash: *Splash) -> void {
+    const scene = splash.*.scene
+    const time = now(splash)
+    if splash.*.hasSnapshot {
+        if !png.saveFile(splash.*.snapshot, scene.*.frame.pixels, scene.*.width, scene.*.height, scene.*.frame.stride, false, splash.*.allocator) { say("ignition: the snapshot could not be written\n") }
+    }
+    if !splash.*.retain && splash.*.drawing {
+        scene_module.setProgress(scene, 1.0)
+        const begun = seconds()
+        var faded = false
+        while !faded {
+            const elapsed = seconds() - begun
+            faded = elapsed >= FADE
+            scene_module.setBrightness(scene, if faded { 0.0 } else { 1.0 - elapsed / FADE })
+            drawFrame(splash, time + elapsed)
+        }
+    }
+    answer(splash, ACK)
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    _ = crash.install()
+    const allocator = std.heap.allocator()
+    const splash_memory = allocator.alloc(@sizeOf(Splash), 16)
+    const scene_memory = allocator.alloc(@sizeOf(Scene), 16)
+    const crew_memory = allocator.alloc(@sizeOf(state.Crew), 16)
+    if splash_memory == null || scene_memory == null || crew_memory == null {
+        say("ignition: out of memory\n")
+        return 1
+    }
+    var splash: *Splash = undefined
+    unsafe {
+        splash = @ptrCast(*Splash, splash_memory.?)
+        splash.*.scene = @ptrCast(*Scene, scene_memory.?)
+        splash.*.scene.*.crew = @ptrCast(*state.Crew, crew_memory.?)
+    }
+    splash.*.allocator = allocator
+    splash.*.length = 0
+    splash.*.frameCost = 0.0
+    splash.*.lastFrame = -1.0
+    splash.*.held = 0
+    splash.*.quitting = false
+    splash.*.retain = false
+    splash.*.hasSnapshot = false
+    var mode = state.Mode.boot
+    var fps: usize = 30
+    const count = std.process.count(arguments)
+    var k: usize = 1
+    while k < count {
+        const argument = std.string.asSlice(std.process.argument(arguments, k))
+        if std.text.same(argument, "--mode") && k + 1 < count {
+            k += 1
+            if !options_module.parseMode(std.string.asSlice(std.process.argument(arguments, k)), &mode) {
+                say("ignition: the mode is boot, shutdown, reboot or updates\n")
+                return 2
+            }
+        } else if std.text.same(argument, "--fps") && k + 1 < count {
+            k += 1
+            if !options_module.parseNumber(std.string.asSlice(std.process.argument(arguments, k)), &fps) || fps == 0 || fps > 120 {
+                say("ignition: --fps takes 1 to 120\n")
+                return 2
+            }
+        } else if std.text.same(argument, "--snapshot") && k + 1 < count {
+            k += 1
+            splash.*.snapshot = std.process.argument(arguments, k).pointer
+            splash.*.hasSnapshot = true
+        } else {
+            say("usage: ignition [--mode boot|shutdown|reboot|updates] [--fps N] [--snapshot PNG]\n")
+            return 2
+        }
+        k += 1
+    }
+    splash.*.interval = 1.0 / paint.toFloat(fps)
+    splash.*.input = brix.handleFor(brix.Role.INPUT)
+    splash.*.output = brix.handleFor(brix.Role.OUTPUT)
+    splash.*.drawing = openDisplay(splash)
+    if !splash.*.drawing {
+        say("ignition: no display (/devices/framebuffer): answering without a picture\n")
+        splash.*.width = 1024
+        splash.*.height = 768
+    }
+    if !scene_module.init(splash.*.scene, splash.*.width, splash.*.height, mode, allocator) {
+        say("ignition: out of memory for the picture\n")
+        return 1
+    }
+    // No threads on brixOS: the bands are drawn by this one.
+    bands.start(splash.*.scene.*.crew, 0, allocator)
+    note("ignition: up, ", if mode == state.Mode.boot { "boot" } else if mode == state.Mode.shutdown { "shutdown" } else if mode == state.Mode.reboot { "reboot" } else { "updates" }, if splash.*.drawing { ", on the display" } else { ", no display" })
+    splash.*.started = seconds()
+    while !splash.*.quitting { step(splash) }
+    finish(splash)
+    return 0
+}

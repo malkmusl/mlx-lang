@@ -1,4 +1,4 @@
-# Plays systemd's notify socket for mlx-ipcd (tools/check_ipc.sh):
+# Plays systemd's notify socket for synapse (tools/check_ipc.sh):
 # READY=1 must come, and the bus socket must exist when it does; a
 # notify socket by path and an abstract one ("@name").
 #
@@ -6,7 +6,7 @@
 import os, socket, subprocess, sys, time
 ipcd, work, empty = sys.argv[1], sys.argv[2], sys.argv[3]
 for abstract in (False, True):
-    name = "@mlx-ipcd-notify-test" if abstract else os.path.join(work, "notify")
+    name = "@synapse-notify-test" if abstract else os.path.join(work, "notify")
     if not abstract and os.path.exists(name):
         os.unlink(name)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)

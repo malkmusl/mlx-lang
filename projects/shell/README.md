@@ -1,19 +1,19 @@
-# mlx-sh
+# flux
 
 The shell of MLX/Linux, written in Mlx without libc: a POSIX shell in
 the shape of dash (scripts written for `/bin/sh` run as they do there)
-with a line editor for the terminal. It is what `mlx-terminal` and
-`mlx-console` start, what `mlx-init` services run their `exec = /bin/sh
+with a line editor for the terminal. It is what `vector` and
+`mlx-console` start, what `impulse` services run their `exec = /bin/sh
 -c` lines with once installed as `/bin/sh`, and what a script's
 `#!/bin/sh` reaches.
 
 ```sh
-mlx-out/bin/compiler/mlx4 projects/shell/main.mlx -o mlx-sh
-./mlx-sh                             # interactive on a terminal
-./mlx-sh script.sh arg...            # a script (also by #! and from stdin)
-./mlx-sh -c 'for f in *.md; do echo "$f"; done'
-./mlx-sh -s arg... < script.sh       # stdin with positional parameters
-./mlx-sh --parse 'if true; then echo x; fi'   # the tree, for debugging
+mlx-out/bin/compiler/mlx4 projects/shell/main.mlx -o flux
+./flux                             # interactive on a terminal
+./flux script.sh arg...            # a script (also by #! and from stdin)
+./flux -c 'for f in *.md; do echo "$f"; done'
+./flux -s arg... < script.sh       # stdin with positional parameters
+./flux --parse 'if true; then echo x; fi'   # the tree, for debugging
 tools/check_shell.sh                 # against dash, the editor on a pty
 ```
 
@@ -83,7 +83,7 @@ keep `~/.mlx_sh_history` (1000 lines) and take the prompt from `PS1`
   `IFS`) `readonly` `return` `set` (`-e -f -m -u -x`, `-o errexit noglob
   monitor nounset xtrace`, `--`) `shift` `trap` `true` `type` `umask`
   `unalias` `unset` `wait`. External programs are found on `PATH`; a
-  script without `#!` runs in a new mlx-sh.
+  script without `#!` runs in a new flux.
 - `set -e` leaves on a failing command (not inside conditions, `!`, the
   left sides of `&&` `||`), `set -x` traces each command on stderr,
   `set -u` makes an unset parameter an error (`${x:-word}` and its kin
@@ -102,7 +102,7 @@ name from the builtins, functions and `PATH`, of a path, of a `$name`),
 Ctrl-C (drop the line, `^C`), Ctrl-D on an empty line (leave). A line
 whose parse is incomplete gets `> ` for its next line. The editor only
 needs cursor movement (`CSI D`, `CSI K`, `\r`), so any terminal works,
-`mlx-terminal` and `mlx-console` as the Linux console and other
+`vector` and `mlx-console` as the Linux console and other
 terminals.
 
 ## Inside

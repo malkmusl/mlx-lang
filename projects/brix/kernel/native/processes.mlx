@@ -6,6 +6,8 @@ const scheduler = @import("../scheduler.mlx")
 const events = @import("../events.mlx")
 const files = @import("../files.mlx")
 const vfs = @import("../vfs.mlx")
+const terminal = @import("../terminal.mlx")
+const NodeKind = vfs.NodeKind
 const process = @import("../process.mlx")
 const Frame = @import("../frame.mlx").Frame
 const Sse = @import("../frame.mlx").Sse
@@ -48,6 +50,14 @@ pub fn programOf(p: *Process, handle: usize) -> isize {
     return @intCast(isize, slot.*.index)
 }
 
+// The directory the program handle `handle` was opened in (NONE when
+// not opened by a path): what names the program for /proc/self/exe.
+pub fn programDirectoryOf(p: *Process, handle: usize) -> usize {
+    const fd = objects.descriptorOf(p, handle)
+    if fd < 0 { return vfs.Vfs.NONE }
+    return p.*.files.get(fd).?.*.directory
+}
+
 // A handle to the process `pid` in `p`'s table.
 fn handleTo(p: *Process, pid: usize) -> isize {
     const fd = p.*.files.openObject(files.Kind.process, pid, files.Open.READ_WRITE)
@@ -56,11 +66,72 @@ fn handleTo(p: *Process, pid: usize) -> isize {
 }
 
 // The start block at `address`: its arguments and environment.
-pub fn startOf(p: *Process, address: usize, arguments: *process.Strings, environment: *process.Strings) -> bool {
-    if !p.prepare(address, 16) { return false }
+// The start block at `address` (arguments, environment, the role
+// records' address and count: four words): its strings, and its roles
+// read into `roles` (role, handle of the caller's, 8 bytes each; `count`
+// of them, at most process.MAX_ROLES).
+pub fn startOf(p: *Process, address: usize, arguments: *process.Strings, environment: *process.Strings, roles: *[process.MAX_ROLES]process.Role, count: *usize) -> bool {
+    if !p.prepare(address, 32) { return false }
     arguments.* = p.strings(Bytes.read64(Bytes.pointer(address), 0))
     environment.* = p.strings(Bytes.read64(Bytes.pointer(address), 8))
+    const records = Bytes.read64(Bytes.pointer(address), 16)
+    count.* = Bytes.read64(Bytes.pointer(address), 24)
+    if count.* > process.MAX_ROLES { return false }
+    if count.* > 0 && !p.prepare(records, count.* * 8) { return false }
+    var k: usize = 0
+    while k < count.* {
+        roles.*[k] = process.Role.{ .role = @intCast(u32, Bytes.read32(Bytes.pointer(records), k * 8)), .slot = @intCast(u32, Bytes.read32(Bytes.pointer(records), k * 8 + 4)) }
+        k += 1
+    }
     return arguments.*.count <= Process.MAX_STRINGS && environment.*.count <= Process.MAX_STRINGS
+}
+
+// The roles of a start block (each naming a handle of the caller's) as
+// the process `q`'s, where `slotOf` gives the descriptor the handle
+// has in `q` (-1: none; the role is left out); none given: the default.
+fn applyRoles(q: *Process, roles: *const [process.MAX_ROLES]process.Role, count: usize, slots: *const [process.MAX_ROLES]isize) -> void {
+    if count == 0 {
+        q.defaultRoles()
+        return
+    }
+    q.*.roleCount = 0
+    var k: usize = 0
+    while k < count {
+        if slots.*[k] >= 0 { q.setRole(roles.*[k].role, @intCast(u32, slots.*[k])) }
+        k += 1
+    }
+    // A directory handle in the directory role is the working directory.
+    const directory = q.slotOfRole(process.ROLE_DIRECTORY)
+    if directory >= 0 {
+        const slot = q.*.files.get(directory)
+        if slot != null && slot.?.*.kind == files.Kind.node && vfs.fileSystem().node(slot.?.*.index).isDirectory() { q.setDirectory(slot.?.*.index) }
+    }
+}
+
+// The roles of a replace's start block as the process's (process_replace).
+pub fn applyRolesAfterReplace(p: *Process, roles: *const [process.MAX_ROLES]process.Role, count: usize, slots: *const [process.MAX_ROLES]isize) -> void {
+    applyRoles(p, roles, count, slots)
+}
+
+// process_start: the caller's roles as (role, handle) records (8 bytes
+// each) into `address`, up to `capacity` of them; how many there are.
+pub fn start(p: *Process, address: usize, capacity: usize) -> isize {
+    var written: usize = 0
+    var k: usize = 0
+    while k < p.*.roleCount {
+        const fd = @intCast(isize, p.*.roles[k].slot)
+        const slot = p.*.files.get(fd)
+        if slot != null && slot.?.*.kind != files.Kind.none {
+            if written < capacity {
+                if !p.prepare(address + written * 8, 8) { return Status.bad_address }
+                Bytes.write32(Bytes.pointer(address), written * 8, @intCast(usize, p.*.roles[k].role))
+                Bytes.write32(Bytes.pointer(address), written * 8 + 4, objects.handleOf(p, fd))
+            }
+            written += 1
+        }
+        k += 1
+    }
+    return @intCast(isize, written)
 }
 
 // process_spawn: the program `program` in a new process, a child of `p`,
@@ -73,11 +144,27 @@ pub fn spawn(p: *Process, program: usize, start: usize, list: usize, count: usiz
     if count > SPAWN_HANDLES { return Status.too_large }
     var arguments: process.Strings = undefined
     var environment: process.Strings = undefined
-    if !startOf(p, start, &arguments, &environment) { return Status.bad_address }
+    var roles: [process.MAX_ROLES]process.Role = undefined
+    var roleCount: usize = 0
+    if !startOf(p, start, &arguments, &environment, &roles, &roleCount) { return Status.bad_address }
     if !p.prepare(list, count * 4) { return Status.bad_address }
     var k: usize = 0
     while k < count {
         if !objects.exists(p, Bytes.read32(Bytes.pointer(list), k * 4)) { return Status.invalid_handle }
+        k += 1
+    }
+    // A role's handle must be among the handles given: its place there
+    // is the child's descriptor for it.
+    var roleSlots: [process.MAX_ROLES]isize = undefined
+    k = 0
+    while k < roleCount {
+        roleSlots[k] = -1
+        var place: usize = 0
+        while place < count {
+            if Bytes.read32(Bytes.pointer(list), place * 4) == @intCast(usize, roles[k].slot) { roleSlots[k] = @intCast(isize, place) }
+            place += 1
+        }
+        if roleSlots[k] < 0 { return Status.invalid_handle }
         k += 1
     }
     const table = scheduler.processes()
@@ -106,11 +193,23 @@ pub fn spawn(p: *Process, program: usize, start: usize, list: usize, count: usiz
         q.*.state = State.free
         return if loaded == process.Loaded.no_memory { Status.no_memory } else { Status.wrong_kind }
     }
-    q.setProgram(@bitCast(usize, node), vfs.Vfs.NONE)
+    q.setProgram(@bitCast(usize, node), programDirectoryOf(p, program))
+    applyRoles(q, &roles, roleCount, &roleSlots)
     q.*.fsBase = 0
     q.*.context.setStart(q.*.entry, q.*.stack)
     Sse.reset(&q.*.sse)
     return handleTo(p, q.*.pid)
+}
+
+// identity_set: the caller's user and group, which its children inherit
+// (a process of user 0 may take any; another keeps its own: no_right).
+pub fn setIdentity(p: *Process, user: usize, group: usize) -> isize {
+    const newUser = user & 0xFFFFFFFF
+    const newGroup = group & 0xFFFFFFFF
+    if p.*.user != 0 && (newUser != p.*.user || newGroup != p.*.group_id) { return Status.no_right }
+    p.*.user = newUser
+    p.*.group_id = newGroup
+    return 0
 }
 
 // process_branch: a copy-on-write copy of `p` (its registers in `frame`),
@@ -207,6 +306,56 @@ pub fn sessionFront(p: *Process, session: usize, group: usize) -> isize {
     const named = groupOf(p, group)
     if named < 0 { return Status.invalid_handle }
     if !scheduler.processes().groupLives(@bitCast(usize, named)) { return Status.not_found }
-    scheduler.processes().*.foreground = @bitCast(usize, named)
+    terminalOf(p, session).*.foreground = @bitCast(usize, named)
+    return 0
+}
+
+// The terminal a session or control handle names (the caller checked
+// the kind).
+pub fn terminalOf(p: *Process, handle: usize) -> *terminal.Terminal {
+    const slot = p.*.files.get(objects.descriptorOf(p, handle)).?
+    return terminal.at(vfs.fileSystem().node(slot.*.index).*.archiveIndex)
+}
+
+// session_pair: a terminal of its own, its control handle and its
+// session handle (two nodes without a name) at `address`.
+pub fn sessionPair(p: *Process, address: usize) -> isize {
+    if !p.prepare(address, 8) { return Status.bad_address }
+    const index = terminal.open()
+    if index == terminal.NONE { return Status.too_many }
+    const tree = vfs.fileSystem()
+    const control = tree.create(NodeKind.session_control, 0x1B6)
+    const session = tree.create(NodeKind.terminal, 0x1B6)
+    if control == vfs.Vfs.NONE || session == vfs.Vfs.NONE {
+        terminal.at(index).*.inUse = false
+        return Status.no_memory
+    }
+    tree.node(control).*.archiveIndex = index
+    tree.node(session).*.archiveIndex = index
+    const controlFd = p.*.files.openNode(control, files.Open.READ_WRITE)
+    if controlFd < 0 { return controlFd }
+    const sessionFd = p.*.files.openNode(session, files.Open.READ_WRITE)
+    if sessionFd < 0 {
+        _ = p.*.files.close(controlFd)
+        return sessionFd
+    }
+    Bytes.write32(Bytes.pointer(address), 0, objects.handleOf(p, controlFd))
+    Bytes.write32(Bytes.pointer(address), 4, objects.handleOf(p, sessionFd))
+    return 0
+}
+
+// session_size: the terminal's size in cells (a session or control
+// handle), what TIOCGWINSZ answers.
+pub fn sessionSize(p: *Process, handle: usize, columns: usize, rows: usize) -> isize {
+    if !objects.exists(p, handle) { return Status.invalid_handle }
+    const kind = objects.kindOf(p, handle)
+    if kind != objects.ObjectKind.SESSION && kind != objects.ObjectKind.STREAM { return Status.wrong_kind }
+    const slot = p.*.files.get(objects.descriptorOf(p, handle)).?
+    if slot.*.kind != files.Kind.node { return Status.wrong_kind }
+    const n = vfs.fileSystem().node(slot.*.index)
+    if n.*.kind != NodeKind.terminal && n.*.kind != NodeKind.session_control { return Status.wrong_kind }
+    if columns == 0 || rows == 0 || columns > 1000 || rows > 1000 { return Status.invalid }
+    terminal.at(n.*.archiveIndex).*.columns = columns
+    terminal.at(n.*.archiveIndex).*.rows = rows
     return 0
 }

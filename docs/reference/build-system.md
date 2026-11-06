@@ -123,7 +123,11 @@ by Linux's system call numbers for now; std picks `X.brixos.mlx` over
 compiler builds for the system it runs on: x86_64 Linux, or brixOS for
 the mlx4 built for brixOS (`builtin.os` in the compiler's own code), so
 brixOS builds its programs and the compiler itself
-(tools/check_brix_selfhost.sh). The CPU feature set
+(tools/check_brix_selfhost.sh), and `mlx build` runs there: the runner
+waits for its jobs by their process handles (std.spawn starts them
+natively), the jobs are limited by -j alone without /proc/meminfo, and
+WebKit's steps are declared only where projects/webkit/upstream is
+(tools/check_brix_build.sh: brixOS builds its own boot image). The CPU feature set
 (`builtin.cpu`) is not there yet. The spec gives two concrete syntax
 examples for feature gating:
 
@@ -188,7 +192,7 @@ implemented: this repository has no packages from elsewhere.
 ./mlx build -j 8 --verbose       # eight jobs; name the current steps too
 ./mlx build --no-memory-limit    # -j jobs whatever the memory
 ./mlx build --dry-run            # what would be built
-./mlx build --force mlx-sh       # build it even when it is current
+./mlx build --force flux       # build it even when it is current
 ./mlx build --keep-going         # go on after a step failed
 ./mlx build --retry-failed       # run steps whose failure is remembered
 ./mlx build --verify-epoch 20    # then compile 20 cached objects again, compare

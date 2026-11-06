@@ -1,13 +1,13 @@
-# mlx-permissions
+# scope
 
-`mlx-permissions` is where the desktop asks the user whether an app may
+`scope` is where the desktop asks the user whether an app may
 do something: MLXIPC's permission agent (`projects/desktop/ipc`) and its
 dialog, in Mlx on `std.dbus` and `std.ui.host` (no libc, no GTK). It is
 also what polkit's authentication agent will stand on (below).
 
 ```sh
-mlx4 projects/desktop/permissions/main.mlx -o mlx-permissions
-mlx-permissions --ask org.example.Chat audio.record --sandboxed   # the dialog alone
+mlx4 projects/desktop/permissions/main.mlx -o scope
+scope --ask org.example.Chat audio.record --sandboxed   # the dialog alone
 tools/check_audio.sh                  # asking, answers, rules, revoking
 tools/check_wayland_compositor.sh     # scenario 15: the dialog clicked
 ```
@@ -22,7 +22,7 @@ tools/check_wayland_compositor.sh     # scenario 15: the dialog clicked
 2. The bus holds the Check and calls
    `org.mlx.PermissionAgent.Ask(s app, s permission, b sandboxed) -> (b
    allowed, b remember)`. Nobody owns that name at first: the bus starts
-   `mlx-permissions` from its service file
+   `scope` from its service file
    (`PREFIX/share/mlx/dbus-1/services/org.mlx.PermissionAgent.service`,
    installed by `tools/install_compositor_session.sh`) and asks once it
    owns the name. The agent stays for the session.
@@ -38,7 +38,7 @@ tools/check_wayland_compositor.sh     # scenario 15: the dialog clicked
    locale is.
 5. The bus answers every Check waiting on that question. Remembered, the
    answer is a rule of `ipc.conf`; otherwise it holds for the session.
-   Either can be changed in mlx-settings' Apps category
+   Either can be changed in control' Apps category
    (`projects/desktop/settings/permissions.mlx`: every app that asked,
    each permission with Allow, Ask, Deny or Default;
    `org.mlx.IPC.ListPermissions` and `SetPermission`), and services check
@@ -50,10 +50,10 @@ The dialog needs the compositor: the agent passes its own
 before the compositor.
 
 ```
-mlx-permissions                     the agent (the bus starts it)
-mlx-permissions --answer ANSWER     an agent answering at once: allow, deny,
+scope                     the agent (the bus starts it)
+scope --answer ANSWER     an agent answering at once: allow, deny,
                                     allow-remember, deny-remember (tests)
-mlx-permissions --ask APP PERMISSION [--sandboxed] [--answer-fd N]
+scope --ask APP PERMISSION [--sandboxed] [--answer-fd N]
                                     the dialog: "allow" or "deny", and
                                     " remember", to N or printed
 ```

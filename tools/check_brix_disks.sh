@@ -32,13 +32,13 @@ mkdir -p "$work/bin" "$work/source"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
 "$compiler" --quiet projects/brix/tools/ext2/main.mlx -o "$work/ext2"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet $brix projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
 "$compiler" --quiet $brix projects/brix/tools/snapshot/main.mlx -o "$work/snapshot"
 for program in ls cat cp mkdir chmod sync stat echo; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "brixfs=$work/brixfs" "snapshot=$work/snapshot" "install=projects/brix/tools/install.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "brixfs=$work/brixfs" "snapshot=$work/snapshot" "install=projects/brix/tools/install.sh" "$work/bin/"
 echo "ok   the kernel and a boot image build"
 
 head -c 8388608 /dev/zero > "$work/disk0.img"
@@ -90,7 +90,8 @@ wait_for '^brixOS: /devices/disk1, 4096 KiB'
 wait_for '^brixOS: /devices/disk2, 2048 KiB'
 wait_for '^brixOS: /volumes/disk2 (ext2, read-only)$'
 type_line 'ls /devices; cat /volumes/disk2/hello.txt; brixfs format /devices/disk0 && brixfs format /devices/disk1 && install'
-wait_for 'disk0[[:space:]]*disk1[[:space:]]*disk2'
+wait_for 'disk0[[:space:]]*disk2[[:space:]]*framebuffer'
+wait_for 'disk1[[:space:]]*disk3'
 wait_for '^from ext2$'
 wait_for '^brixfs: mounted at /volumes/disk1$'
 wait_for '^installed on /volumes/disk0: it is the system from the next boot on$'

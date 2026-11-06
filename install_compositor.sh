@@ -70,18 +70,18 @@ if [[ $mode == log ]]; then
     else
         echo "== no $log_file"
         echo "The session launcher never got far enough to write it, and a compositor"
-        echo "started by hand (mlx-compositor --backend drm) writes it only since the"
+        echo "started by hand (kepler --backend drm) writes it only since the"
         echo "install that added this line. Reinstall with this script."
     fi
-    if command -v coredumpctl > /dev/null 2>&1 && coredumpctl list mlx-compositor > /dev/null 2>&1; then
+    if command -v coredumpctl > /dev/null 2>&1 && coredumpctl list kepler > /dev/null 2>&1; then
         echo
-        echo "== the last core dump of mlx-compositor (coredumpctl): the crashing thread comes first"
-        coredumpctl info --no-pager mlx-compositor 2> /dev/null | tail -n 60 | grep -v "^ *#[0-9]* .*libc.so\|pthread_cond_wait\|libvulkan_radeon\|Stack trace of thread\|^ *$" | head -n 40
+        echo "== the last core dump of kepler (coredumpctl): the crashing thread comes first"
+        coredumpctl info --no-pager kepler 2> /dev/null | tail -n 60 | grep -v "^ *#[0-9]* .*libc.so\|pthread_cond_wait\|libvulkan_radeon\|Stack trace of thread\|^ *$" | head -n 40
     fi
     if command -v journalctl > /dev/null 2>&1; then
         echo
         echo "== the display manager's journal lines about the session (this boot)"
-        journalctl -b --no-pager -q -g 'mlx-session|mlx-compositor|wayland-sessions|Mlx' 2> /dev/null | grep -v "Stack trace of thread\|#[0-9]* .*(libc.so\|libvulkan_radeon\|^ *$" | tail -n 40 || echo "(not readable: try with sudo, or add yourself to the systemd-journal group)"
+        journalctl -b --no-pager -q -g 'mlx-session|kepler|wayland-sessions|Mlx' 2> /dev/null | grep -v "Stack trace of thread\|#[0-9]* .*(libc.so\|libvulkan_radeon\|^ *$" | tail -n 40 || echo "(not readable: try with sudo, or add yourself to the systemd-journal group)"
     fi
     exit 0
 fi
@@ -110,32 +110,32 @@ if [[ $mode == install ]]; then
     fi
     echo
     echo "== Installed files"
-    ls -l "$bindir"/mlx-compositor "$bindir"/mlx-terminal "$bindir"/mlx-session "$bindir"/mlx-dock "$bindir"/mlx-launcher "$bindir"/mlx-settings "$sessions"/mlx-compositor.desktop 2>&1
+    ls -l "$bindir"/kepler "$bindir"/vector "$bindir"/mlx-session "$bindir"/orbit "$bindir"/launch "$bindir"/control "$sessions"/kepler.desktop 2>&1
     echo
 fi
 
 echo "== The installation"
-for program in mlx-compositor mlx-terminal mlx-session mlx-dock mlx-launcher mlx-settings; do
+for program in kepler vector mlx-session orbit launch control; do
     if [[ -x "$bindir/$program" ]]; then
         ok "$bindir/$program"
     else
         bad "$bindir/$program is missing or not executable"
     fi
 done
-if [[ -x "$bindir/mlx-compositor" ]]; then
-    if head -c 4 "$bindir/mlx-compositor" | grep -q ELF; then
-        ok "mlx-compositor is a program ($(sha256sum "$bindir/mlx-compositor" | cut -c1-16))"
+if [[ -x "$bindir/kepler" ]]; then
+    if head -c 4 "$bindir/kepler" | grep -q ELF; then
+        ok "kepler is a program ($(sha256sum "$bindir/kepler" | cut -c1-16))"
     else
-        bad "$bindir/mlx-compositor is not an ELF program"
+        bad "$bindir/kepler is not an ELF program"
     fi
     # It parses its arguments and quits at once on an unknown option.
-    if "$bindir/mlx-compositor" --no-such-option > /dev/null 2>&1; then
-        bad "mlx-compositor accepted an unknown option"
+    if "$bindir/kepler" --no-such-option > /dev/null 2>&1; then
+        bad "kepler accepted an unknown option"
     else
-        ok "mlx-compositor runs (it rejects an unknown option)"
+        ok "kepler runs (it rejects an unknown option)"
     fi
 fi
-modules=${MLX_COMPOSITOR_MODULES:-$HOME/.local/lib/mlx-compositor}
+modules=${MLX_COMPOSITOR_MODULES:-$HOME/.local/lib/kepler}
 for module in libmlx-shell.so libmlx-render.so; do
     if [[ -f "$modules/$module" ]]; then
         if [[ "$(od -An -tx1 -j16 -N2 "$modules/$module" | tr -d ' ')" == "0300" ]]; then
@@ -147,17 +147,17 @@ for module in libmlx-shell.so libmlx-render.so; do
         note "no $modules/$module: the compositor runs its built-in copy (tools/build_compositor_modules.sh builds it)"
     fi
 done
-found=$(command -v mlx-compositor 2> /dev/null || true)
+found=$(command -v kepler 2> /dev/null || true)
 if [[ -n "$found" ]]; then
-    if [[ "$found" == "$bindir/mlx-compositor" ]]; then
-        ok "mlx-compositor is on PATH ($found)"
+    if [[ "$found" == "$bindir/kepler" ]]; then
+        ok "kepler is on PATH ($found)"
     else
-        note "PATH finds another mlx-compositor first: $found (the session uses $bindir/mlx-compositor); an earlier install: tools/remove_old_mlx_layout.sh shows its files, with --remove (as root) it removes them"
+        note "PATH finds another kepler first: $found (the session uses $bindir/kepler); an earlier install: tools/remove_old_mlx_layout.sh shows its files, with --remove (as root) it removes them"
     fi
 else
     note "$bindir is not on this shell's PATH yet: from the next login it is (/etc/profile.d/mlx.sh); the session does not need it"
 fi
-entry="$sessions/mlx-compositor.desktop"
+entry="$sessions/kepler.desktop"
 if [[ -f "$entry" ]]; then
     ok "$entry"
     exec_path=$(sed -n 's/^Exec=//p' "$entry")
@@ -172,8 +172,8 @@ else
     bad "$entry is missing: GDM and SDDM offer no Mlx Compositor session"
 fi
 for other in /usr/local/share/wayland-sessions /usr/share/wayland-sessions; do
-    if [[ "$other" != "$sessions" && -f "$other/mlx-compositor.desktop" ]]; then
-        note "another entry at $other/mlx-compositor.desktop (from an earlier install?); remove it if its paths are stale"
+    if [[ "$other" != "$sessions" && -f "$other/kepler.desktop" ]]; then
+        note "another entry at $other/kepler.desktop (from an earlier install?); remove it if its paths are stale"
     fi
 done
 if [[ -x "$bindir/mlx-session" ]] && ! sh -n "$bindir/mlx-session" 2> /dev/null; then

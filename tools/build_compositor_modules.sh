@@ -5,7 +5,7 @@
 #
 #   tools/build_compositor_modules.sh [options] [shell|render]...
 #     --dir DIR        where to put them (default: $MLX_COMPOSITOR_MODULES,
-#                      else ~/.local/lib/mlx-compositor, which the session
+#                      else ~/.local/lib/kepler, which the session
 #                      watches)
 #     --compiler PATH  compile with this Mlx compiler (default: ./mlx build,
 #                      which builds a module only when it is not current)
@@ -21,7 +21,7 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 source tools/lib/mlx_build.sh
 
-directory=${MLX_COMPOSITOR_MODULES:-$HOME/.local/lib/mlx-compositor}
+directory=${MLX_COMPOSITOR_MODULES:-$HOME/.local/lib/kepler}
 compiler=""
 watch=0
 kinds=()

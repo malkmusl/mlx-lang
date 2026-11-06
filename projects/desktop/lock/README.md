@@ -1,12 +1,12 @@
-# mlx-lock
+# umbra
 
-`mlx-lock` is the Mlx desktop's screen locker. It uses
+`umbra` is the Mlx desktop's screen locker. It uses
 `ext-session-lock-v1`, so the compositor hides every other surface and
 routes input only to the locker until authentication succeeds.
 
 ```sh
-mlx4 projects/desktop/lock/main.mlx -o mlx-lock
-mlx-lock
+mlx4 projects/desktop/lock/main.mlx -o umbra
+umbra
 tools/check_lock.sh
 ```
 

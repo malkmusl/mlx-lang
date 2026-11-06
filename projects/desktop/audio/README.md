@@ -3,13 +3,13 @@
 MLX Audio is the desktop's sound server, the replacement for PipeWire,
 and it runs on MLXIPC (`projects/desktop/ipc`): apps find it on the
 session bus, talk to it over a direct MLXIPC channel, and what each app
-may do with sound is an MLXIPC permission. `mlx-audiod` is the server,
+may do with sound is an MLXIPC permission. `resonance` is the server,
 `std.audio` the client library, `mlx-audio` the command line. All of it
 is Mlx: no libc, no alsa-lib, no PipeWire. PulseAudio apps reach it on
 PulseAudio's own socket (below).
 
 ```sh
-mlx4 projects/desktop/audio/main.mlx -o mlx-audiod
+mlx4 projects/desktop/audio/main.mlx -o resonance
 mlx4 projects/desktop/audio/tool.mlx -o mlx-audio
 mlx-audio play song.wav         # in the desktop session: the server starts on first use
 tools/check_audio.sh            # the end-to-end check
@@ -17,7 +17,7 @@ tools/check_audio.sh            # the end-to-end check
 
 ## How an app gets sound
 
-1. `std.audio.connect` connects to the session bus (mlx-ipcd) and calls
+1. `std.audio.connect` connects to the session bus (synapse) and calls
    `org.mlx.IPC.Connect("org.mlx.Audio")`. The bus allows it when the app
    may talk to org.mlx.Audio (every app may, sandboxed ones included,
    unless `ipc.conf` says otherwise). When the server is not running it
@@ -61,7 +61,7 @@ deny org.example.Spy talk org.mlx.Audio        # no channel at all
 
 An app with no rule for the microphone or the monitors is asked about,
 sandboxed or not: the stream waits while the user answers in
-mlx-permissions' dialog
+scope' dialog
 (`projects/desktop/permissions`). When the rules change the bus says so
 (`org.mlx.IPC.PermissionsChanged`) and the server checks every stream
 again: a recording whose permission went ends.
@@ -72,7 +72,7 @@ PipeWire), and is asked before it records or records what plays; a
 sandboxed one (Flatpak) may play, nothing else. A refused
 stream gets REFUSED with the reason, and `mlx-audio` says so. When a rule
 takes recording from an app that records, the server ends its stream
-(ENDED) once it is told to check again (SET's recheck; mlx-settings sends
+(ENDED) once it is told to check again (SET's recheck; control sends
 it after writing `ipc.conf`).
 
 ## The server
@@ -89,7 +89,7 @@ it after writing `ipc.conf`).
   keeps its memory constant however long it runs.
 
 ```
-mlx-audiod [--output auto|alsa[:pcmC1D0p]|file:PATH.wav|null]
+resonance [--output auto|alsa[:pcmC1D0p]|file:PATH.wav|null]
            [--input auto|alsa[:NAME]|sine:HZ|file:PATH.wav|none]
            [--rate HZ] [--period MS] [--verbose]
 ```
@@ -118,7 +118,7 @@ underruns. `MLX_SND_DIR` and `MLX_ASOUND_DIR` point the server at it.
 
 Programs that speak only PulseAudio (Firefox, Chromium and Electron apps,
 SDL games, mpv, VLC, GStreamer, Wine, pactl, pavucontrol) play and record
-through MLX Audio as they would through pipewire-pulse: mlx-audiod
+through MLX Audio as they would through pipewire-pulse: resonance
 answers PulseAudio's native protocol at `$XDG_RUNTIME_DIR/pulse/native`
 ([`pulse.mlx`](pulse.mlx), [`pulse_info.mlx`](pulse_info.mlx), on
 [`std.pulse`](../../../std/src/pulse.mlx)'s numbers and tagstructs, which
@@ -146,7 +146,7 @@ the socket (PulseAudio, pipewire-pulse) keeps it; `--no-pulse` leaves it
 alone.
 
 Since PulseAudio apps do not come through the bus, the session starts
-mlx-audiod with it (`mlx-ipcd --start org.mlx.Audio`). The libraries
+resonance with it (`synapse --start org.mlx.Audio`). The libraries
 they load to speak the protocol are Mlx too
 ([`compiler/libc/pulse`](../../../compiler/libc/pulse/README.md): libpulse.so.0,
 libpulse-simple.so.0, libpulse-mainloop-glib.so.0). ALSA programs
@@ -236,7 +236,7 @@ mlx-audio move STREAM SINK           one stream (its id in status)
 
 | File | What it does |
 | --- | --- |
-| `main.mlx` | mlx-audiod: options, the event loop (bus, channels, timer or sound card, signals) |
+| `main.mlx` | resonance: options, the event loop (bus, channels, timer or sound card, signals) |
 | `state.mlx` | the records: server, peers, streams, devices |
 | `protocol.mlx` | the bus (org.mlx.Audio, channels, Check), the protocol on the channels |
 | `mixer.mlx` | rings, mixing, requests, recording |
@@ -250,7 +250,7 @@ mlx-audio move STREAM SINK           one stream (its id in status)
 | `asound.conf.in` | ALSA's default device through MLX Audio's pulse plugin (`@ALSA_PLUGIN@`: its path) |
 | `tool.mlx` | mlx-audio |
 
-## In mlx-settings
+## In control
 
 The settings app's Sound page
 ([`projects/desktop/settings/sound.mlx`](../settings/sound.mlx)) shows

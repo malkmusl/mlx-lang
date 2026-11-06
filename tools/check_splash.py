@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""mlx-splash end to end, with no screen, card or terminal of the machine's:
+"""ignition end to end, with no screen, card or terminal of the machine's:
 
 - headless (--output none --no-tty): the Plymouth protocol as systemd and
   the plymouth tool speak it (an update sent without reading the answer,
   arguments, a malformed request, a second splash on the taken socket,
   passwords and questions refused, a non-root sender refused when setpriv
-  can switch to nobody), mlx-splashctl's commands, quit answered only when
+  can switch to nobody), ignitionctl's commands, quit answered only when
   done, the boot's length kept, the snapshot drawn;
 - on an emulated KMS card (tools/fake_drm_session.py's FakeCard, handed
   in with --card-fd): the mode set on the connected connector with the
@@ -72,13 +72,13 @@ def wait_socket(name, process, timeout=10):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if process.poll() is not None:
-            fail(f"mlx-splash ended early ({process.returncode}): {open(process.log_path).read()}")
+            fail(f"ignition ended early ({process.returncode}): {open(process.log_path).read()}")
         try:
             connect(name).close()
             return
         except OSError:
             time.sleep(0.02)
-    fail("mlx-splash never listened")
+    fail("ignition never listened")
 
 
 def start(name, tag, extra, pass_fds=()):
@@ -101,7 +101,7 @@ ACK, NAK = b"\x06", b"\x15"
 
 
 def headless():
-    name = f"/mlx-splash-check-{os.getpid()}"
+    name = f"/ignition-check-{os.getpid()}"
     snapshot = os.path.join(WORK, "headless.png")
     splash = start(name, "headless", ["--output", "none", "--size", "1280x720", "--snapshot", snapshot])
     wait_socket(name, splash)
@@ -144,18 +144,18 @@ def headless():
         ok("a request from another user than root is refused")
     else:
         print("skip a request from another user (setpriv could not switch):", nobody.stderr.strip())
-    # mlx-splashctl.
+    # ignitionctl.
     for words in (("ping",), ("update", "--status=dbus.service"), ("change-mode", "--updates"), ("system-update", "--progress=40"),
                   ("change-mode", "boot-up"), ("message", "Welcome"), ("hide-message", "Welcome"), ("pause-progress",),
                   ("unpause-progress",), ("--sysinit",)):
         result = ctl(name, *words)
         if result.returncode != 0:
-            fail(f"mlx-splashctl {' '.join(words)}: {result.returncode} {result.stderr}")
+            fail(f"ignitionctl {' '.join(words)}: {result.returncode} {result.stderr}")
     if ctl(name, "has-active-vt").returncode != 1:
         fail("has-active-vt said yes without a terminal")
     if ctl(name, "bogus").returncode != 2:
-        fail("mlx-splashctl took an unknown command")
-    ok("mlx-splashctl: ping, update, change-mode, system-update, messages, progress pause, has-active-vt")
+        fail("ignitionctl took an unknown command")
+    ok("ignitionctl: ping, update, change-mode, system-update, messages, progress pause, has-active-vt")
     time.sleep(1.2)
     # quit is answered once the splash is done: wait finds it gone.
     waiter = subprocess.Popen([SPLASHCTL, "--socket", name, "wait"])
@@ -169,9 +169,9 @@ def headless():
         except subprocess.TimeoutExpired:
             fail("quit was answered before the splash ended")
     if splash.returncode != 0:
-        fail(f"mlx-splash ended {splash.returncode}: {open(splash.log_path).read()}")
+        fail(f"ignition ended {splash.returncode}: {open(splash.log_path).read()}")
     if waiter.wait(timeout=5) != 0:
-        fail("mlx-splashctl wait did not return when the splash ended")
+        fail("ignitionctl wait did not return when the splash ended")
     if time.time() - began < 0.3:
         fail("quit did not fade the picture out first")
     duration = open(os.path.join(WORK, "headless-duration")).read()
@@ -187,7 +187,7 @@ def headless():
 def new_root():
     """The initramfs hands the daemon a mounted real root. The daemon must
     chroot before switch-root so its persistent paths belong to that root."""
-    name = f"/mlx-splash-newroot-{os.getpid()}"
+    name = f"/ignition-newroot-{os.getpid()}"
     root = os.path.join(WORK, "new-root")
     duration = os.path.join(root, "var/lib/mlx/splash/boot-duration")
     os.makedirs(root)
@@ -228,7 +228,7 @@ class Harness:
 
 def fake_plymouthd(name):
     """A process called plymouthd on the socket, answering one request
-    (quit, as mlx-splash should send it) and ending."""
+    (quit, as ignition should send it) and ending."""
     script = (
         "import ctypes, socket, sys\n"
         "ctypes.CDLL(None).prctl(15, b'plymouthd', 0, 0, 0)\n"
@@ -249,7 +249,7 @@ def fake_plymouthd(name):
 
 
 def take_over():
-    name = f"/mlx-splash-plymouthd-{os.getpid()}"
+    name = f"/ignition-plymouthd-{os.getpid()}"
     holder = fake_plymouthd(name)
     if holder.stdout.readline().strip() != "listening":
         fail("the stand-in plymouthd did not start")
@@ -343,7 +343,7 @@ def look(frame, pitch, width, height):
 def card_gone():
     harness = Harness()
     card = SplashCard(harness)
-    name = f"/mlx-splash-gone-{os.getpid()}"
+    name = f"/ignition-gone-{os.getpid()}"
     descriptor = card.take()
     splash = start(name, "gone", ["--card-fd", str(descriptor)], pass_fds=(descriptor,))
     os.close(descriptor)
@@ -371,7 +371,7 @@ def card_gone():
 def kms(retain):
     harness = Harness()
     card = SplashCard(harness)
-    name = f"/mlx-splash-kms-{os.getpid()}-{int(retain)}"
+    name = f"/ignition-kms-{os.getpid()}-{int(retain)}"
     descriptor = card.take()
     splash = start(name, f"kms{int(retain)}", ["--card-fd", str(descriptor)], pass_fds=(descriptor,))
     os.close(descriptor)
@@ -424,7 +424,7 @@ def kms(retain):
         if ctl(name, "quit").returncode != 0:
             fail("quit not answered ACK")
         if splash.wait(timeout=10) != 0:
-            fail(f"mlx-splash ended {splash.returncode}: {open(splash.log_path).read()}")
+            fail(f"ignition ended {splash.returncode}: {open(splash.log_path).read()}")
         if card.shown != fake.CONSOLE_FB:
             fail(f"after quit the CRTC shows {card.shown}, not the console")
         if card.framebuffers or card.buffers:
@@ -434,7 +434,7 @@ def kms(retain):
         if ctl(name, "quit", "--retain-splash").returncode != 0:
             fail("quit --retain-splash not answered ACK")
         if splash.wait(timeout=10) != 0:
-            fail(f"mlx-splash ended {splash.returncode}: {open(splash.log_path).read()}")
+            fail(f"ignition ended {splash.returncode}: {open(splash.log_path).read()}")
         if card.retained is None or card.retained[0] != card.shown:
             fail(f"the frame on screen ({card.shown}) was not closed with CLOSEFB: {record.calls[-8:]}")
         if record.count(lambda c: c[:2] == ("drm", "setcrtc") and c[3] == fake.CONSOLE_FB):

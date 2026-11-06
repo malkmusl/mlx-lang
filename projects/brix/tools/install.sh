@@ -1,7 +1,7 @@
 # install [VOLUME]: brixOS onto a volume of a disk (/volumes/disk0 unless
 # named): /system (the programs and settings), /users and /temporary
 # copied there, then committed. From the next boot on the kernel takes a
-# volume with system/programs/mlx-sh as the system: its /system, /users
+# volume with system/programs/flux as the system: its /system, /users
 # and /temporary are the disk's, and the boot archive's programs stay
 # reachable at /volumes/boot (from where a system booted from the disk
 # installs again).

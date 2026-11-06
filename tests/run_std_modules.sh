@@ -174,6 +174,8 @@ run 390_heap_runtime "the program's heap: one wherever it is asked for, in the s
 run 392_demangle_runtime "C++ names as c++filt writes them (g++'s and clang++'s manglings) and mlx-cc's own spellings; names it cannot read; a cut text"
 run 410_crypto_rsa_sizes_runtime "RSA keys of any size: a 64-bit modulus, 512 bits made and verified in its frame, 4160 bits (numbers and work on the heap) signed, verified and OAEP both ways, d alone, three primes; out of range refused"
 run 431_tar_runtime "tar headers written and read back: short and split names, a directory's slash, a link's target, the checksum, a name that cannot be stored; an archive in memory"
+run 432_local_module_alias_runtime "a module bound to a local constant in a body: calls, values and types through it"
+run 433_narrow_integers_runtime "narrow integers canonical after left shifts, complements and narrowing casts"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
 run 422_h264_cpu_decode_runtime "WebKit's test.mp4 (Main profile, B frames) decoded on the CPU through std.mp4 and std.h264: every picture, in presentation order, the planes' CRC-32 the reference decoding's"

@@ -730,6 +730,20 @@ names_unresolved_symbols() {
     [[ $status -ne 0 ]] && grep -q "unresolved backend symbol: main" <<< "$output"
 }
 
+# Whether $1 reaches a module's declarations through a local bound to it
+# (`const io = std.io` in a body: calls and types; tests/432 exits 13).
+resolves_local_module_aliases() {
+    local probe status=0
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    if "$1" --quiet tests/432_local_module_alias_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+    else
+        status=1
+    fi
+    rm -rf -- "$probe"
+    [[ $status -eq 13 ]]
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -782,6 +796,7 @@ probes=(
     "resolves_aggregate_constant_lengths|a struct's constants as its array fields' lengths"
     "lets_locals_shadow_members|locals shadowing their struct's members and module declarations"
     "names_unresolved_symbols|the unresolved backend symbol named (MLX-E3004)"
+    "resolves_local_module_aliases|a module's declarations through a local bound to it"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

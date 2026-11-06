@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Focused check for mlx-init's complete fstab fields and fsck pass ordering.
+# Focused check for impulse's complete fstab fields and fsck pass ordering.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)

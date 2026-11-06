@@ -321,7 +321,7 @@ their descriptors, for `next` to return first (a logind client must not
 lose a PauseDevice that arrived during a call). `addressPath` takes the
 socket path out of a bus address list and `systemPath` is the system
 bus's (DBUS_SYSTEM_BUS_ADDRESS, else `MLX_SYSTEM_BUS` or `SYSTEM_BUS`).
-MLXIPC's bus (`projects/desktop/ipc`, mlx-ipcd) and its tool mlx-ipc use
+MLXIPC's bus (`projects/desktop/ipc`, synapse) and its tool mlx-ipc use
 it, as do the compositor's logind session and the desktop's system bus
 clients; `tools/check_ipc.sh` runs both against dbus-send, gdbus, busctl
 and dbus-monitor, and `tests/361_dbus_keep_signals_runtime.mlx` keeps a
@@ -371,7 +371,7 @@ recorded, `drain`, `setVolume`, `list` and `closeStream`;
 (`input`, `monitor`, `monitor:SINK`), `status` and `set` read and change
 the server's state (devices, volumes, sinks, each app's route). `std.wav`
 (`std/src/wav.mlx`) reads WAVE headers (8 to 32-bit PCM, 32-bit float,
-extensible files) and writes them. `projects/desktop/audio` (mlx-audiod,
+extensible files) and writes them. `projects/desktop/audio` (resonance,
 mlx-audio) uses both; `tools/check_audio.sh` checks them end to end.
 `std.appid` (`std/src/appid.mlx`) says which app a process is, as the
 desktop names apps: `identify` gives a Flatpak app's id (from
@@ -679,10 +679,10 @@ const leaked = std.debug_allocator.deinit(&checked)   // 0: none (Zig's .ok)
 ```
 
 ```
-mlx-files[4211]: leak: 3 blocks, 12288 bytes
+polaris[4211]: leak: 3 blocks, 12288 bytes
   allocated at projects/desktop/files/icons.mlx:88:load+0x4c at projects/desktop/files/icons.mlx:91
   from projects/desktop/files/main.mlx:310:redraw+0x2f3 at projects/desktop/files/main.mlx:322
-mlx-files[4211]: 3 blocks leaked (12288 bytes) from 1 place; 940 allocations, 937 frees, 2097152 bytes out at most
+polaris[4211]: 3 blocks leaked (12288 bytes) from 1 place; 940 allocations, 937 frees, 2097152 bytes out at most
 ```
 
 Most programs take `std.page_allocator.init()` wherever they need memory
@@ -731,7 +731,7 @@ reports with `leaks.keep(memory)` (`std.debug_allocator.keep`): the
 symbols of the top bar and its popups, a terminal's grids. The
 loops of `std.ui.wayland.panel` (the dock, launcher, top bar, files,
 settings, terminal, notifications, the Observatory), the compositor,
-mlx-ipcd, mlx-audiod, mlx-netd, mlx-console and mlx-splash call these.
+synapse, resonance, nexus, mlx-console and ignition call these.
 The compositor's modules are images of their own with their own page
 allocator, and are not watched.
 
@@ -1046,7 +1046,7 @@ all: into `PATH.new`, made anew with `mode`, then renamed over `PATH`.
 `makeParents(path, mode)` makes the folders a file goes in, `isDirectory`
 follows links, and `executablePath(into, capacity)` is /proc/self/exe's
 target, NUL-terminated. The desktop's settings files, the coreutils'
-operands, mlx-init, mlx-netd, mlx-sh, the generators under std/registry
+operands, impulse, nexus, flux, the generators under std/registry
 and the compiler's own output use them.
 
 ```mlx
@@ -1311,7 +1311,7 @@ pub fn main() -> u8 {
   kernel without getrandom), `random64()` and `random32()` (mixed from the
   monotonic clock if the kernel gives nothing, so they never fail), and
   `getrandom(into, length, flags)` as the kernel answers it. Keys,
-  nonces and ids come from these: mlx-netd's DHCP transaction ids and
+  nonces and ids come from these: nexus's DHCP transaction ids and
   WPA nonces, MLXIPC's bus id, libpipewire's `pw_getrandom`/`pw_random`
   and shuf without `--random-source`.
 - Seeded, for numbers that repeat with their seed: `Xoshiro256`
@@ -1348,7 +1348,7 @@ The terminal a program runs on, on Linux: `isTerminal(descriptor)`;
 editor (no echo, no canonical input, no signals from keys, no CR
 translation or flow control, reads of one byte); and job control:
 `foregroundGroup`, `setForegroundGroup`, `setProcessGroup` and
-`processGroup`. mlx-sh's line editor and job control and ls's column
+`processGroup`. flux's line editor and job control and ls's column
 width use it; the test runs it on a pseudo-terminal of its own.
 
 ## Base directories (`std.xdg`)
@@ -1433,7 +1433,7 @@ The shell's patterns, as fnmatch has them: `*`, `?` and sets (`[a-z]`,
 `[!...]` or `[^...]`, a `]` first a member, a `[` without its `]` itself),
 over whole byte strings. `matches(pattern, text)` takes a backslash as
 making the next byte stand for itself; `matchesQuoted(pattern, literal,
-text)` takes the bytes a shell quoted instead (`literal[i] & 1`). mlx-sh's
+text)` takes the bytes a shell quoted instead (`literal[i] & 1`). flux's
 pathname expansion, `case` and `${...#...}`, and ls's `--ignore` and
 `--hide` use it.
 
@@ -1454,9 +1454,12 @@ the program from an intermediate child reaped at once, and `shareMemory`
 vforks (for large parents). `start` returns a `Child` (`started()`; its
 `id` is -errno when it did not start): on Linux a pid, on brixOS a
 process handle (process_spawn with exactly its input, output, errors and
-the descriptors placed at their numbers; with `directory`, `newSession`,
-`detach` or `unblockSignals` the Linux layer forks), and `child.pid()`
-for Linux's own calls. `startReading` hands back the read end of a pipe
+the descriptors placed at their numbers, named as the input, output and
+errors roles of its start block, with the parent's session passed on as
+the session role; with `directory`, `newSession`, `detach` or
+`unblockSignals` the Linux layer forks), and `child.pid()` for Linux's
+own calls. A brixOS program reads its roles with `std.os.brix.startRoles`
+or `handleFor(Role.SESSION)`. `startReading` hands back the read end of a pipe
 the child writes to; `capture` runs it to its end with its output kept;
 `wait` and `ended` give an `Ending` (`exited` and its `code`, or what
 ended it: the signal's number on Linux, the event's kind on brixOS;
@@ -1785,7 +1788,7 @@ the kernel's definitions for one kind of device:
   framebuffer (`query` fills a `Screen`), input devices (event records,
   `EV_*`/`KEY_*`/`BTN_*`, the `EVIOCG*` request numbers, `isKeyboard`) and
   KMS (the mode-setting ioctls, PRIME flags, capabilities, formats), which
-  mlx-console, mlx-splash and the compositor share.
+  mlx-console, ignition and the compositor share.
 
 `tests/359_linux_descriptors_runtime.mlx` (run by
 `tests/run_std_modules.sh`) takes a pipe, a timer, a signal and an event

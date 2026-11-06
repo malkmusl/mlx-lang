@@ -31,13 +31,13 @@ brix=--target=x86_64-brixos
 mkdir -p "$work/bin"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
 "$compiler" --quiet projects/brix/image/main.mlx -o "$work/brix-image"
-"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/mlx-sh"
+"$compiler" --quiet $brix projects/shell/main.mlx -o "$work/flux"
 "$compiler" --quiet $brix projects/brix/tools/brixfs/main.mlx -o "$work/brixfs"
 "$compiler" --quiet $brix projects/brix/tools/as/main.mlx -o "$work/as"
 for program in ls cat cp mkdir chmod chown sync stat uname echo seq wc rm; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "mlx-sh=$work/mlx-sh" "brixfs=$work/brixfs" "as=$work/as" "install=projects/brix/tools/install.sh" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "brixfs=$work/brixfs" "as=$work/as" "install=projects/brix/tools/install.sh" "$work/bin/"
 echo "ok   the kernel and a boot image with install build"
 
 head -c 8388608 /dev/zero > "$work/disk.img"
@@ -89,7 +89,7 @@ echo "ok   brixfs formatted in brixOS, install copies the system onto it"
 boot
 wait_for '^brixOS: / from /volumes/disk0 (the boot archive at /volumes/boot)$'
 type_line 'echo $(stat -c %i /system) $(stat -c %i /volumes/disk0/system); ls /volumes/boot; cat /system/settings/users'
-wait_for '^root:x:0:0:root:/users/root:/system/programs/mlx-sh$'
+wait_for '^root:x:0:0:root:/users/root:/system/programs/flux$'
 type_line 'uname -o; echo kept > /users/root/note; cd /temporary && seq 3 > t && cat t | wc -l; sync; echo written'
 wait_for '^brixOS$'
 wait_for '^3$'
@@ -104,10 +104,10 @@ type_line 'echo secret > /temporary/s && chmod 600 /temporary/s && chown 7:3 /te
 wait_for '^7:3$'
 wait_for '^secret$'
 wait_for '^denied 1$'
-type_line 'as 7 mlx-sh -c "echo changed > /temporary/s"; cat /temporary/s; as 8 mlx-sh -c "echo again > /temporary/s"; echo refused $(( $? != 0 )); cat /temporary/s'
+type_line 'as 7 flux -c "echo changed > /temporary/s"; cat /temporary/s; as 8 flux -c "echo again > /temporary/s"; echo refused $(( $? != 0 )); cat /temporary/s'
 wait_for '^changed$' 2
 wait_for '^refused 1$'
-type_line 'mkdir /temporary/d && chmod 700 /temporary/d && chown 7 /temporary/d && as 7 mlx-sh -c "echo in > /temporary/d/f" && as 7 cat /temporary/d/f; as 8 ls /temporary/d; echo listed $(( $? != 0 )); as 8 chmod 777 /temporary/d; echo chmod $(( $? != 0 )); as 8 as 7 cat /temporary/d/f; echo became $(( $? != 0 )); sync; echo synced'
+type_line 'mkdir /temporary/d && chmod 700 /temporary/d && chown 7 /temporary/d && as 7 flux -c "echo in > /temporary/d/f" && as 7 cat /temporary/d/f; as 8 ls /temporary/d; echo listed $(( $? != 0 )); as 8 chmod 777 /temporary/d; echo chmod $(( $? != 0 )); as 8 as 7 cat /temporary/d/f; echo became $(( $? != 0 )); sync; echo synced'
 wait_for '^in$'
 wait_for '^listed 1$'
 wait_for '^chmod 1$'

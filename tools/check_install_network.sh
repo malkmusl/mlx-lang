@@ -2,7 +2,7 @@
 # Checks tools/install_network.sh --enable and --disable, only inside
 # temporary staged roots (--destdir): --enable masks NetworkManager,
 # systemd-networkd and wpa_supplicant and keeps what was there; --disable
-# puts exactly that back, leaves mlx-ipcd enabled and says what to start;
+# puts exactly that back, leaves synapse enabled and says what to start;
 # a root enabled by an older installer (masks, no saved state) is unmasked.
 # A compiler fixture stands in for the real compiler (only its
 # `SOURCE -o OUTPUT` boundary matters here).
@@ -63,13 +63,13 @@ run_installer "$work/enable.log" --destdir "$stage" --enable "$fake_compiler"
 for unit in NetworkManager.service systemd-networkd.service wpa_supplicant.service; do
     assert_link "$system/$unit" /dev/null
 done
-assert_link "$system/multi-user.target.wants/mlx-netd.service" /etc/systemd/system/mlx-netd.service
-assert_link "$system/multi-user.target.wants/mlx-ipcd.service" /etc/systemd/system/mlx-ipcd.service
-[[ -x "$stage/usr/bin/mlx/mlx-netd" ]] || fail "mlx-netd was not installed in /usr/bin/mlx"
-grep -q '^ExecStart=/usr/bin/mlx/mlx-netd' "$system/mlx-netd.service" || fail "mlx-netd.service does not start /usr/bin/mlx/mlx-netd"
-grep -qx 'Type=notify' "$system/mlx-ipcd.service" || fail "mlx-ipcd.service does not wait for the bus's READY=1"
-grep -qx 'Documentation=file:///usr/share/doc/mlx/ipc/README.md' "$system/mlx-ipcd.service" && [[ -f "$stage/usr/share/doc/mlx/ipc/README.md" ]] || fail "mlx-ipcd.service does not point at its installed README"
-grep -qx 'Documentation=file:///usr/share/doc/mlx/network/README.md' "$system/mlx-netd.service" || fail "mlx-netd.service does not point at its installed README"
+assert_link "$system/multi-user.target.wants/nexus.service" /etc/systemd/system/nexus.service
+assert_link "$system/multi-user.target.wants/synapse.service" /etc/systemd/system/synapse.service
+[[ -x "$stage/usr/bin/mlx/nexus" ]] || fail "nexus was not installed in /usr/bin/mlx"
+grep -q '^ExecStart=/usr/bin/mlx/nexus' "$system/nexus.service" || fail "nexus.service does not start /usr/bin/mlx/nexus"
+grep -qx 'Type=notify' "$system/synapse.service" || fail "synapse.service does not wait for the bus's READY=1"
+grep -qx 'Documentation=file:///usr/share/doc/mlx/ipc/README.md' "$system/synapse.service" && [[ -f "$stage/usr/share/doc/mlx/ipc/README.md" ]] || fail "synapse.service does not point at its installed README"
+grep -qx 'Documentation=file:///usr/share/doc/mlx/network/README.md' "$system/nexus.service" || fail "nexus.service does not point at its installed README"
 grep -qx 'PATH=${PATH}:/usr/bin/mlx' "$stage/etc/environment.d/50-mlx.conf" && [[ -f "$stage/etc/profile.d/mlx.sh" && -f "$stage/etc/systemd/system.conf.d/50-mlx-path.conf" ]] || fail "/usr/bin/mlx was not put on PATH"
 # A second --enable keeps the state of before the first.
 run_installer "$work/enable-again.log" --destdir "$stage" --enable "$fake_compiler"
@@ -80,29 +80,29 @@ assert_absent "$system/NetworkManager.service"
 assert_link "$system/systemd-networkd.service" /dev/null
 [[ -f "$system/wpa_supplicant.service" && ! -L "$system/wpa_supplicant.service" ]] || fail "wpa_supplicant's override file was not restored"
 grep -qx 'ExecStart=/bin/true' "$system/wpa_supplicant.service" || fail "wpa_supplicant's override file changed"
-assert_absent "$system/multi-user.target.wants/mlx-netd.service"
-assert_link "$system/multi-user.target.wants/mlx-ipcd.service" /etc/systemd/system/mlx-ipcd.service
+assert_absent "$system/multi-user.target.wants/nexus.service"
+assert_link "$system/multi-user.target.wants/synapse.service" /etc/systemd/system/synapse.service
 assert_link "$system/multi-user.target.wants/NetworkManager.service" /usr/lib/systemd/system/NetworkManager.service
 grep -q 'to start after daemon-reload: NetworkManager.service' "$work/disable.log" || fail "--disable did not name NetworkManager to start: $(cat "$work/disable.log")"
 assert_absent "$stage/var/lib/mlx/network-installer"
-[[ -x "$stage/usr/bin/mlx/mlx-netd" ]] || fail "--disable removed the installed program"
+[[ -x "$stage/usr/bin/mlx/nexus" ]] || fail "--disable removed the installed program"
 run_installer "$work/disable-again.log" --destdir "$stage" --disable
 assert_link "$system/systemd-networkd.service" /dev/null
 grep -q 'was not enabled; nothing changed' "$work/disable-again.log" || fail "a second --disable changed something: $(cat "$work/disable-again.log")"
-echo "ok   --disable restores exactly what --enable masked, keeps mlx-ipcd, names what to start"
+echo "ok   --disable restores exactly what --enable masked, keeps synapse, names what to start"
 
 # A root an older installer enabled: masks, no saved state.
 legacy="$work/legacy"
 lsystem="$legacy/etc/systemd/system"
 install -d "$lsystem/multi-user.target.wants"
-ln -s /etc/systemd/system/mlx-netd.service "$lsystem/multi-user.target.wants/mlx-netd.service"
-ln -s /etc/systemd/system/mlx-ipcd.service "$lsystem/multi-user.target.wants/mlx-ipcd.service"
+ln -s /etc/systemd/system/nexus.service "$lsystem/multi-user.target.wants/nexus.service"
+ln -s /etc/systemd/system/synapse.service "$lsystem/multi-user.target.wants/synapse.service"
 ln -s /usr/lib/systemd/system/NetworkManager.service "$lsystem/multi-user.target.wants/NetworkManager.service"
 for unit in NetworkManager.service systemd-networkd.service wpa_supplicant.service; do ln -s /dev/null "$lsystem/$unit"; done
 run_installer "$work/legacy.log" --destdir "$legacy" --disable
 for unit in NetworkManager.service systemd-networkd.service wpa_supplicant.service; do assert_absent "$lsystem/$unit"; done
-assert_absent "$lsystem/multi-user.target.wants/mlx-netd.service"
-assert_link "$lsystem/multi-user.target.wants/mlx-ipcd.service" /etc/systemd/system/mlx-ipcd.service
+assert_absent "$lsystem/multi-user.target.wants/nexus.service"
+assert_link "$lsystem/multi-user.target.wants/synapse.service" /etc/systemd/system/synapse.service
 echo "ok   --disable on an older install unmasks the replaced services"
 
 if tools/install_network.sh --destdir "$stage" --enable --disable > "$work/both.log" 2>&1; then fail "--enable with --disable was accepted"; fi

@@ -12,7 +12,7 @@ Either way it is a compositor in its own right: programs started with its
 `WAYLAND_DISPLAY` appear as windows inside it. It picks nested when it is
 started inside a Wayland session, freestanding otherwise (`--backend
 nested|drm` decides). Freestanding, it first tells the boot splash
-(mlx-splash or plymouthd) to quit leaving its last frame, so the monitor
+(ignition or plymouthd) to quit leaving its last frame, so the monitor
 goes from the splash to the desktop with no text console in between.
 
 - Keyboard and pointer go to the clients: the pointer to the window under
@@ -49,8 +49,8 @@ The screenshots are frames the scripted test host received, taken during
 
 | Shortcut | Action |
 | --- | --- |
-| Super | open or close the app launcher (`--launcher`, default `mlx-launcher`) |
-| Alt+Enter | open a terminal (`--terminal`, default `mlx-terminal`) |
+| Super | open or close the app launcher (`--launcher`, default `launch`) |
+| Alt+Enter | open a terminal (`--terminal`, default `vector`) |
 | Alt+drag | move the window under the pointer |
 | Alt+right-drag | resize the window under the pointer from its nearest corner |
 | Alt+Tab | switch windows (of the workspace shown) |
@@ -77,9 +77,9 @@ From the repository root, with the self-hosted compiler built (see
 `docs/internals/selfhost-compiler.md`):
 
 ```sh
-mlx-out/bin/compiler/mlx4 projects/desktop/compositor/main.mlx -o mlx-compositor
-mlx-out/bin/compiler/mlx4 projects/desktop/terminal/main.mlx -o mlx-terminal
-./mlx-compositor --run ./mlx-terminal
+mlx-out/bin/compiler/mlx4 projects/desktop/compositor/main.mlx -o kepler
+mlx-out/bin/compiler/mlx4 projects/desktop/terminal/main.mlx -o vector
+./kepler --run ./vector
 ```
 
 Press Alt+Enter for more terminals. Any Wayland program works as well, for
@@ -152,7 +152,7 @@ asked to draw and `std.ui.gpu_canvas` has the `paint` compute shader draw it all
 one pass, into buffers handed to the compositor as dma-bufs
 (linux-dmabuf, ARGB8888, in device memory the compositor can map), or,
 where the driver cannot export them (lavapipe), straight into the shared
-memory it imports. Each app logs how (`mlx-dock: drawing on the gpu, into
+memory it imports. Each app logs how (`orbit: drawing on the gpu, into
 dma-bufs (DEVICE)`). Without Vulkan, or with `MLX_CANVAS=cpu`, they draw
 the same pixels on the CPU. The compositor offers them three protocols:
 
@@ -185,7 +185,7 @@ says `Terminal=true`), Escape, Super or a click outside close it.
 
 The dock sits in the top layer along the bottom edge with an exclusive
 zone. Like the launcher it is a helper the compositor starts with itself
-(`--dock PROGRAM|none`, default `mlx-dock` next to the compositor) and
+(`--dock PROGRAM|none`, default `orbit` next to the compositor) and
 keeps running: when it ends it is started again (three times at most when
 it keeps ending within five seconds). Its apps button asks the compositor
 for the launcher on its own socket pair (`MLX_DOCK_FD`), so the launcher
@@ -259,11 +259,11 @@ scaled by the previews' `shrink` kernel (with an opacity); the CPU
 renderer scales its buffer (nearest pixel) inside the frame's colour. The
 trash and a folder's "Open" grow their window out of the icon (`Z` and
 the icon's rectangle). Should the dock
-crash, it says where first (`mlx-dock: crashed: ...` and the functions,
+crash, it says where first (`orbit: crashed: ...` and the functions,
 in the compositor's log), as the compositor does, and keeps the crash
 for MLX Observatory.
 
-With `dock-autohide = on` (mlx-settings: "Always hide") the dock
+With `dock-autohide = on` (control: "Always hide") the dock
 reserves no space, so maximized windows reach the bottom edge. It slides
 out of sight once the pointer has been away from it for 0.6 seconds and
 back up when the pointer touches the output's bottom edge (a drag too,
@@ -275,7 +275,7 @@ while a window of the workspace shown (its frame and title bar) overlaps
 the dock's bar, and comes back by itself once no window does (`dock:
 nothing in its way` in the log).
 
-With `dock-workspaces = on` (mlx-settings: General, Dock, "Group by
+With `dock-workspaces = on` (control: General, Dock, "Group by
 workspace"; off by default) the dock groups the apps that run by the
 workspace their windows are on: after the pinned apps, which stay as
 they are, comes a group per workspace with windows, the first workspace
@@ -289,7 +289,7 @@ whether to group, the workspace shown, a count and per window the
 dock's handle object id (u32) and its workspace (u8), sent whenever any
 of it changed.
 
-The top bar (`mlx-topbar`, `--topbar PROGRAM|none`, started and kept
+The top bar (`horizon`, `--topbar PROGRAM|none`, started and kept
 running like the dock over `MLX_TOPBAR_FD`) sits in the top layer along
 the top edge, 30 pixels high with an exclusive zone, as the menu bar of
 macOS: maximized windows start below it and windows placed under it are
@@ -324,14 +324,14 @@ GPU.
 | Widget | Shows | Does |
 | --- | --- | --- |
 | Clock | the date and time | a calendar: today in its header (its button goes back to today's month), the month with ISO week numbers and today lit; the arrows or the wheel turn the month |
-| Control centre | toggles; a dot while notifications are unread, a moon while Do Not Disturb is on | the control centre: tiles for the network (what is connected, from mlx-netd on the system bus, else `/sys/class/net`; with a Wi-Fi card it opens the networks in sight, a click joins one or opens mlx-settings' Network page), Do Not Disturb, night light, dark mode, locking the screen and a screenshot; the volume; what plays (previous, play or pause, next); the notifications, newest first, each with its close button, and Clear all. Its button opens mlx-settings |
+| Control centre | toggles; a dot while notifications are unread, a moon while Do Not Disturb is on | the control centre: tiles for the network (what is connected, from nexus on the system bus, else `/sys/class/net`; with a Wi-Fi card it opens the networks in sight, a click joins one or opens control' Network page), Do Not Disturb, night light, dark mode, locking the screen and a screenshot; the volume; what plays (previous, play or pause, next); the notifications, newest first, each with its close button, and Clear all. Its button opens control |
 | Battery | the charge of the batteries in `/sys/class/power_supply` (not a mouse's or a headset's), red under 15 %, a bolt while it charges | a popup: charging, full or on battery, and the time to full or to empty |
-| Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's volume (the speaker mutes), the outputs to choose (automatic or a sound card), and the apps MLX Audio knows as a grid of their icons, each with its own slider (a click on the icon mutes the app, the wheel turns it; a dot over the ones playing); its button opens mlx-settings' Sound page |
+| Volume | MLX Audio's output: a speaker with one to three waves, crossed out when muted | the wheel turns it by 5 %, a middle click mutes; the popup has the output's volume (the speaker mutes), the outputs to choose (automatic or a sound card), and the apps MLX Audio knows as a grid of their icons, each with its own slider (a click on the icon mutes the app, the wheel turns it; a dot over the ones playing); its button opens control' Sound page |
 | Tray | the StatusNotifierItems (the icons Qt, GTK's libappindicator, Electron and others show): `IconPixmap`, else `IconName` from the icon themes, else the title's first letter; a red dot when one needs attention | a left click is `Activate`, a middle click `SecondaryActivate`, a right click the item's menu (`com.canonical.dbusmenu`, as the bar's own popup) or `ContextMenu` |
 | Media | the MPRIS player that played last (`org.mpris.MediaPlayer2.*`; Voyager is one on this bus, `projects/webkit/PORT.md` "Media"): a play/pause button and "Title – Artist" | the button plays or pauses; the text opens the player's name (its button and a click on the cover raise the player), the cover (a `file://` PNG), title, artist and album, where the track is (a click on the line goes there), and previous, play/pause and next |
 
 The order of these widgets and which are shown is the user's:
-mlx-settings' Top bar page (`mlx-settings topbar`) has a preview of the
+control' Top bar page (`control topbar`) has a preview of the
 bar and a row per widget with a switch and arrows to move it a place
 left or right, and writes `~/.config/mlx/topbar.conf`
 (`$XDG_CONFIG_HOME/mlx/topbar.conf`, a line a widget from left to right:
@@ -353,7 +353,7 @@ anew.
 
 ### Notifications
 
-`mlx-notifyd` ([`projects/desktop/notifications`](../notifications/main.mlx))
+`beacon` ([`projects/desktop/notifications`](../notifications/main.mlx))
 is the desktop's notification server (`org.freedesktop.Notifications`,
 the Desktop Notifications Specification 1.2, on MLXIPC; its service file
 starts it on the first notification). Notifications show as bubbles at
@@ -368,8 +368,8 @@ after its timeout (five seconds; never for critical ones or a timeout of
 `-t MS`, `-A KEY=LABEL`, `-r ID`, `-p` prints the id, `-w` waits and
 prints the action chosen).
 
-The session's bus (mlx-ipcd, which mlx-session starts before the
-compositor) starts `mlx-notifyd`, the portal and the permission agent
+The session's bus (synapse, which mlx-session starts before the
+compositor) starts `beacon`, the portal and the permission agent
 with its own environment. Once the compositor listens it tells the bus
 its `WAYLAND_DISPLAY` (and `DISPLAY`) for them
 (`UpdateActivationEnvironment`, as sway's
@@ -379,7 +379,7 @@ so a compositor nested in another desktop leaves that desktop's
 services alone. Without it a service started on demand found no
 compositor and no bubble showed.
 
-What came is kept in `mlx-notifyd` for the control centre, which asks
+What came is kept in `beacon` for the control centre, which asks
 for it on MLXIPC as well: `org.mlx.Notifications` on the same object has
 `List()` (Do Not Disturb, how many are unread, the notifications newest
 first) and says `Changed()` whenever that changes; the bar calls
@@ -391,8 +391,8 @@ first) and says `Changed()` whenever that changes; the bar calls
 The desktop is dark or light as one, every app of it: the top bar, its
 popups and the notification bubbles, the dock, the launcher and their
 menus take their colours from
-[`desktop-shared/palette.mlx`](../shared/palette.mlx); mlx-settings,
-mlx-files, mlx-terminal, MLX Observatory (its map stays dark space), the
+[`desktop-shared/palette.mlx`](../shared/palette.mlx); control,
+polaris, vector, MLX Observatory (its map stays dark space), the
 permission dialog and the screen-sharing picker from `std.ui.theme.at`.
 All of them glide from one look to the other in 300 ms when it is
 switched (std.ui.appearance follows `appearance.conf` through inotify in
@@ -407,7 +407,7 @@ as on any desktop. The control centre's tile changes it with
 light) on the same object; the portal keeps it in
 `~/.config/mlx/appearance.conf` (`color-scheme = dark`, `light` or
 `default`; dark without it) and tells everyone with `SettingChanged`.
-mlx-settings' Appearance page switches it too (Dark, Light). Without the
+control' Appearance page switches it too (Dark, Light). Without the
 portal the page writes the file itself; `MLX_COLOR_SCHEME=light` (or
 `dark`) in an app's environment fixes its look.
 
@@ -446,7 +446,7 @@ they go into it (outlined while the drag is over it), onto the sidebar's
 Trash into the trash. A folder is never copied into itself or a folder
 inside it (that copy would never end; the status bar says so). It reads a
 folder again within a second when it changes, and its labels and dates
-follow the locale. `mlx-files PATH`, `file://` URIs and `trash:///` open
+follow the locale. `polaris PATH`, `file://` URIs and `trash:///` open
 it where asked; the dock opens its folders and the trash in it when it is
 installed.
 
@@ -458,7 +458,7 @@ what it calls, uses and imports, and what calls, uses and imports it, with
 its signature and doc comment. It draws with a compute shader under the
 canvas (the panel's `scene` hook), or on the CPU.
 
-mlx-settings lists the hotkeys: a click on one records the next key
+control lists the hotkeys: a click on one records the next key
 combination (Escape keeps the old one, Backspace unbinds it, a right click
 restores the default). Meanwhile the compositor passes every key to it,
 Super and its own hotkeys too (keyboard-shortcuts-inhibit-unstable-v1,
@@ -466,7 +466,7 @@ which any client may use while it has the keyboard); Alt+Shift+Q and the
 VT switch stay the compositor's. `~/.config/mlx/dock` lists the pinned apps, one
 desktop entry id per line (`org.gnome.Nautilus`, `firefox`), `terminal` for
 the Mlx terminal; without it the dock pins the terminal and the first file
-manager (mlx-files first), browser and editor it finds. Icons are PNGs (the hicolor theme or
+manager (polaris first), browser and editor it finds. Icons are PNGs (the hicolor theme or
 `/usr/share/pixmaps`); an app with only an SVG icon gets a tile with its
 initial.
 
@@ -588,6 +588,29 @@ compositor waiting in read(2) for a page flip after its first frame,
 deaf to clients and keys. `tools/check_compositor_device.sh` checks it
 with a blocking pipe in place of the card.
 
+### brixOS
+
+Built for brixOS (`--target=x86_64-brixos`, mlx-out/bin/brix/kepler,
+in the boot image as its screen service; projects/brix/README.md, "The
+desktop") the compositor is the same program on the system's own
+interface, with [`drm.brixos.mlx`](drm.brixos.mlx) as its backend in
+place of DRM/KMS: the framebuffer (/devices/framebuffer, mapped) is the
+one output, composed on the CPU (`--renderer cpu`, `--backend drm` are
+the defaults there) and copied in with the damage; the keyboard
+(/devices/keyboard) gives PS/2 scancodes, mapped to evdev codes, the
+modifiers followed from the keys (no keymap is sent to clients: they type
+by their own US fallback); the mouse (/devices/mouse) gives PS/2 packets,
+turned into pointer motion and buttons. Clients connect over std.wayland's
+brixOS transport (a listener node, /temporary/wayland-mlx, and channels;
+docs/reference/wayland.md); the keymap comes from
+/system/settings/keyboard/LAYOUT.xkb (compiled on the host by
+brix-keymap into the boot image). Programs and the helpers start with
+process_spawn ([`children.brixos.mlx`](children.brixos.mlx), the
+helper's channel end as its own role; [`children.mlx`](children.mlx) is
+the Linux side of the same interface, fork, execve and socket pairs).
+No logind, VT, D-Bus, Vulkan or Xwayland there, and no greeter yet.
+tools/check_brix_desktop.sh runs it in QEMU.
+
 ## Desktop session (GDM, SDDM)
 
 `install_compositor.sh` at the repository root builds the compositor and
@@ -622,14 +645,14 @@ matches a build elsewhere, and a crash address from one machine finds its
 place in another's disassembly. `--compiler PATH` compiles everything with
 another compiler instead.
 
-It puts `mlx-compositor`, `mlx-terminal`, `mlx-session` and the other
+It puts `kepler`, `vector`, `mlx-session` and the other
 programs into `/usr/bin/mlx` (`PREFIX/bin/mlx`, `--prefix`, default
 `/usr`), a directory of their own that the installation puts on PATH
 after the system's directories wherever a PATH comes from: login shells,
 the user session, the system services, sudo, su and the console login,
 PAM sessions and fish (the files are listed in
 [`tools/lib/mlx_layout.sh`](../../../tools/lib/mlx_layout.sh)), and
-`mlx-compositor.desktop` into `/usr/share/wayland-sessions`
+`kepler.desktop` into `/usr/share/wayland-sessions`
 (`--sessions`), where both display managers look; programs from installs
 before that layout (in `/usr/local/bin` or `/usr/bin`) are listed by
 `tools/remove_old_mlx_layout.sh` and removed with `--remove`; `--destdir` stages everything for packaging, `--build-only` only
@@ -661,7 +684,7 @@ the compositor prints with `--verbose`: the card and mode it took
 frame on screen` once the monitor shows a frame, or `drm: modeset failed
 (errno N); nothing shown yet, trying again` when the kernel refuses the
 mode (13 is EACCES: the card is not ours, 22 EINVAL: the mode or buffer),
-every window, and how it all ended (`mlx-compositor exited with status N`
+every window, and how it all ended (`kepler exited with status N`
 or `was killed by signal N`, with the crash line below when there was
 one). A compositor that crashes within its first 20 seconds, or gives up
 that early while composing with Vulkan, is started once more with
@@ -673,7 +696,7 @@ whether the launcher was started at all (its first line is written before
 anything else), and `./install_compositor.sh --log` shows both files and
 the display manager's journal lines about the session.
 
-A compositor started by hand, `mlx-compositor --backend drm` from a text
+A compositor started by hand, `kepler --backend drm` from a text
 console, writes the same log itself (the console it was started from is
 the monitor it draws on): `MLX_COMPOSITOR_LOG` names the file, `-` keeps
 stdout, the default is `~/.config/mlx/compositor.log`, and `--verbose` is
@@ -736,7 +759,7 @@ display-mode = auto
 night-light = off
 night-light-temperature = 4000
 # The screen locker the lock hotkey and the top bar's session menu run.
-lock-command = mlx-lock
+lock-command = umbra
 ```
 
 [`projects/desktop/settings`](../settings/main.mlx) changes them, in a
@@ -762,7 +785,7 @@ Without title bars, windows move with Alt+drag.
 
 The compositor tells what it drives in
 `$XDG_RUNTIME_DIR/<socket>.display` ([`display.mlx`](display.mlx);
-removed when it ends), for mlx-settings' Display page:
+removed when it ends), for control' Display page:
 
 ```
 backend = drm
@@ -917,7 +940,7 @@ happens (`renderer: ... copying each frame`); `MLX_VULKAN_NO_HOST_IMPORT=1`
 takes this path on any driver.
 
 `--renderer auto` (the default) falls back to the CPU renderer when no
-driver works (`mlx-compositor: no usable Vulkan driver; composing on the
+driver works (`kepler: no usable Vulkan driver; composing on the
 CPU`). With several drivers installed it takes the first whose device is
 a GPU, and a CPU device (lavapipe, whose manifest sorts before RADV's)
 only when no GPU works; `--verbose` notes the ones passed over. So does a
@@ -936,18 +959,18 @@ with `scene.mlx`'s bookkeeping) and the renderer
 start-up and loads again whenever they change, without a restart:
 
 ```sh
-tools/build_compositor_modules.sh          # both, into ~/.local/lib/mlx-compositor
+tools/build_compositor_modules.sh          # both, into ~/.local/lib/kepler
 tools/build_compositor_modules.sh shell    # one
 tools/build_compositor_modules.sh --watch  # again on every saved change
 ```
 
-The desktop session watches `~/.local/lib/mlx-compositor`
+The desktop session watches `~/.local/lib/kepler`
 (`MLX_COMPOSITOR_MODULES` names another directory; `install_compositor.sh`
 builds both there); a compositor started by hand takes `--modules DIR`.
 Without the files it runs its built-in copies. The log says what happened:
 
 ```
-modules: loaded /home/you/.local/lib/mlx-compositor/libmlx-shell.so (version 2, 214 handler uses moved over)
+modules: loaded /home/you/.local/lib/kepler/libmlx-shell.so (version 2, 214 handler uses moved over)
 ```
 
 What lives across a reload stays: clients, windows, surfaces, buffers, the
@@ -1009,7 +1032,7 @@ it dies, with the function it stopped in and the functions that called
 it:
 
 ```
-mlx-compositor: crashed: illegal instruction (a failed runtime check: ...)
+kepler: crashed: illegal instruction (a failed runtime check: ...)
   at projects/desktop/compositor/shell.mlx:812:placeWindow+0x1a3 at projects/desktop/compositor/shell.mlx:830
   from projects/desktop/compositor/shell.mlx:640:mapWindow+0x88 at projects/desktop/compositor/shell.mlx:671
   from projects/desktop/compositor/main.mlx:902:run+0x2f1 at projects/desktop/compositor/main.mlx:988
@@ -1042,7 +1065,7 @@ lists them. Please include the lines in a bug report, with the commit the
 program was built from.
 
 When the compositor stops on its own it says why: for example
-`mlx-compositor: lost the session compositor: the server reported a
+`kepler: lost the session compositor: the server reported a
 protocol error (object 12, code 3): ...`, or that the Wayland socket is
 taken (`--socket NAME` picks another). When it disconnects a client, the
 log (`--verbose`, and so the session's) says why: `client disconnected: it
@@ -1055,7 +1078,7 @@ plain `client disconnected`.
 
 ```sh
 mlx4 examples/vulkan-wayland-client/main.mlx -o vulkan-wayland-client
-./mlx-compositor --renderer vulkan --run ./vulkan-wayland-client
+./kepler --renderer vulkan --run ./vulkan-wayland-client
 ```
 
 ## Supported protocol
@@ -1161,7 +1184,7 @@ locker locks and unlocks it; a second locker while one lives is refused
 (`finished`).
 
 The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
-the program `lock-command` names in the settings file (`mlx-lock` by
+the program `lock-command` names in the settings file (`umbra` by
 default; a name on `PATH` or a path). The session menu's Log Out asks the
 compositor (on the bar's channel) to close every window; it ends once
 they have, or after four seconds, and the session with it.
@@ -1715,7 +1738,7 @@ finished`.
 - `cursors.mlx`: the cursors the compositor draws itself.
 - `state.mlx`: shared records and list helpers.
 - `settings.mlx`: the settings file; `display.mlx`: the output told for
-  mlx-settings, and night light.
+  control, and night light.
 
 `tools/check_wayland_compositor.sh [compiler] [cpu|vulkan]` exercises all
 of this with scripted input (`tools/wayland-test-host`) on either renderer,

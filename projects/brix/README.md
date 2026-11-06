@@ -14,9 +14,11 @@ requirements are spec/04-stdlib/os/brix.xml:
 ## What runs
 
 brixOS boots in QEMU (`-kernel`, Multiboot), says itself on the serial
-line and runs mlx-sh in user mode on it, and the programs of its boot
-archive (the coreutils) as processes of their own, on a file system in
-memory with brixOS's own layout and copy on write:
+line and starts impulse as its first process (the init below: it runs
+flux on the serial line and, on a display, the boot screen and then
+the virtual console), the programs of its boot archive (the coreutils)
+as processes of their own, on a file system in memory with brixOS's own
+layout and copy on write:
 
     ./mlx build brix           # also mlx-out/bin/brix/disk.img (64 MiB)
     qemu-system-x86_64 -m 512M -cpu max -display none -serial stdio \
@@ -67,10 +69,13 @@ EFI/BOOT/BOOTX64.EFI on a FAT partition):
 
 brix-image writes an EFI application when its output ends in .efi
 (image/efi.mlx): a PE32+ file with the Multiboot image in it and a
-loader in front that does a Multiboot loader's part (the memory map's
-end below 4 GiB as mem_upper, ExitBootServices, out of long mode, the
-image to 1 MiB, the blob's entry). The console stays the serial line
-(no GOP framebuffer yet).
+loader in front that does a Multiboot loader's part (the UEFI memory map
+passed through as a Multiboot memory map, so the kernel maps all of RAM,
+the ranges above the hole and above 4 GiB included; the display's
+framebuffer from the Graphics Output Protocol into the boot info,
+ExitBootServices, out of long mode, the image to 1 MiB, the blob's
+entry). The kernel's console
+stays the serial line; the screen is mlx-console's (below).
 
     brixOS: kernel at 0x200000, 292 KiB
     brixOS: 511 MiB (415 free), 2076 MHz
@@ -84,19 +89,19 @@ brixOS), and std picks its `X.brixos.mlx` files (std.platform). They
 still call the kernel by Linux's system call numbers.
     root@brix:~# ls /
     devices  system  temporary  users
-    root@brix:~# cd /temporary; cat /system/programs/mlx-sh > a
+    root@brix:~# cd /temporary; cat /system/programs/flux > a
     root@brix:/temporary# stat -f -c "%f free" .; cp a b; stat -f -c "%f free" .
     37627 free
     37617 free
 
 ## The system on the disk
 
-The boot image holds the kernel and an archive (mlx-sh, the tools, the
+The boot image holds the kernel and an archive (flux, the tools, the
 coreutils) that the first boot runs from. `install` in brixOS puts the
 system onto a brixfs volume (`brixfs format /devices/disk0; install`:
 /system, /users and /temporary copied to /volumes/disk0, committed), and
 from then on the kernel boots from the disk: a volume with
-system/programs/mlx-sh on it is the system, its /system, /users and
+system/programs/flux on it is the system, its /system, /users and
 /temporary are the tree's (vfs.graft: the same nodes as
 /volumes/disk0's; the memory-only ones go), programs run from the disk
 and what is written stays. The boot archive's /system is at
@@ -112,11 +117,13 @@ are named for what they hold:
 
     /system/programs   the programs (the boot archive; read-only bytes,
                        copied into pages of their own when written)
-    /system/settings   the system's settings: users, groups
+    /system/settings   the system's settings: users, groups, init/services
     /devices           console, tty, null, zero, disk0, disk1, ... (the
-                       virtio disks)
+                       virtio disks), framebuffer, keyboard, mouse
+    /system/fonts      the fonts of the boot archive (DejaVu Sans Mono)
     /users/root        the user's home (the shell starts there)
-    /temporary         scratch space
+    /temporary         scratch space (init/control, the init's FIFO;
+                       logs/NAME.log, the services' output)
     /volumes           each disk's volume (diskN: brixfs, or ext2
                        read-only) and the brixfs volumes' snapshots
 
@@ -144,6 +151,53 @@ projects/brix/tools/signals, a line for each step of what signals do
 (handlers, masks, sigtimedwait, EINTR and SA_RESTART, sigsuspend, a
 fault on the alternate stack), which must print what it prints on the
 host.
+
+## Memory and the machine's figures
+
+The kernel hands out all of the machine's memory as 4 KiB frames, from
+Memory.FREE (96 MiB: the image and the kernel's arena come first) on, in
+spans: the Multiboot memory map's RAM regions (the one below the hole
+under 4 GiB, the ones above it, where a machine with more than 4 GiB has
+most of its memory). The BIOS loader and the EFI loader both pass the
+map through, so an EFI boot maps all of RAM too, not only the RAM below
+the hole. The boot tables map the first GiB
+into the kernel's view (KERNEL_VIRTUAL + physical); the kernel maps the
+rest itself as it starts (kernel/memory.mlx, mapRest: a page directory
+of 2 MiB pages for each GiB with RAM under the boot PDPT, which every
+address space shares; nothing for the hole), up to 64 GiB (a u16 count
+per frame, who holds it, in 32 MiB of counts at most). QEMU's -m 4G
+gives 4095 MiB, 3 below the hole and 1 above it, and a program writes
+and reads 3.5 GiB back. A process's pages are made on
+first use (a fault makes the page and the next of its region, 16 in
+all: a fault costs far more than zeroing a page under emulation, and a
+program growing into its memory faults once in 64 KiB rather than once
+a page), copied on write after a fork, shared by memory objects; a
+processor loads a process's page tables only when they are not the ones
+it has (Space.activate: writing CR3 drops the whole TLB, and a process
+going on after a system call or a tick is in its space still; a space
+whose pages were just made copy-on-write is flushed, and a process that
+ran on another processor last is loaded anew there); a
+program that asks for more than there is gets null from mmap, and the
+runtime says "out of memory" on stderr before the program's own report.
+
+`system_info` (spec call 52, std.os.brix.systemInfo) says what the
+machine has and what the kernel did: the memory and what is free of it,
+the processors running the kernel, the uptime, and the kernel's counts
+since the boot (page faults served, system calls, switches between
+processes). `sysinfo` prints them:
+
+    memory: 2047 MiB, 1938 free
+    processors: 2
+    uptime: 6.0 s
+    page faults: 3229, system calls: 822, switches: 14
+
+std.build's runner takes its memory figures from it on brixOS (on Linux
+from /proc/meminfo), and build.mlx says what the big compiles take
+(Build.memory: the desktop's programs 350 to 420 MiB each), so `mlx build
+brix -j 2` in brixOS runs two jobs where they fit and one where they do
+not. tools/check_brix.sh runs the native test program's system_info
+line; tools/check_brix_build.sh builds the brix group in brixOS on 2 GiB
+with two jobs.
 
 ## Copy on write
 
@@ -470,8 +524,10 @@ The pieces:
     `brix_trap` (system calls and the switches they bring, the timer's
     and the serial line's interrupts, page faults of a process's regions, a crash
     report for the rest: a faulting program ends with SIGSEGV), and
-    mlx-sh as the first process, started again (every other process
-    ending) when it exits or faults.
+    the first process (impulse, or flux without it), started again
+    (every other process ending) when it exits or faults; power.mlx:
+    system_power (the volumes committed, then halt, ACPI's power-off or
+    the reset line).
 
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
@@ -493,6 +549,19 @@ NATIVE_BASE (0x4000) + n; Linux's numbers below that are a translation
 layer (kernel/linux: system.mlx, filecalls.mlx, errno.mlx) for the
 programs built for Linux, and std.posix will be a facade over the native
 calls.
+
+A program starts with a start block (spec call 20, 22 and 47): its
+arguments and environment (on its stack, as Linux lays them out) and its
+handles by role, records of a role and a handle: input 1, output 2,
+errors 3, directory 4 (a directory handle: the working directory at the
+start), session 5 (the terminal; the first shell's 0 is one), a
+spawner's own from 16. process_spawn takes the block and the handles the
+child gets (a role names one of them); process_replace takes a block
+naming the caller's own; a branch copies the roles; process_start gives
+a program its roles as (role, handle) records (std.os.brix: `Start`,
+`RoleRecord`, `Role`, `startRoles`, `handleFor`). std.spawn and flux
+pass input, output, errors and their session on; the native tool prints
+what it got (tools/check_brix.sh).
 
 What there is: kernel/native (calls.mlx, objects.mlx, processes.mlx,
 nodes.mlx, streams.mlx): handles (close, duplicate, info), wait, read and
@@ -581,16 +650,236 @@ does this with QEMU (1 GiB, two processors, a 256 MiB brixfs disk; the
 self-build takes a few minutes without KVM) and compares the archive's
 members, a file's bytes, the program's output and the compilers' bytes.
 
+`mlx build` runs in brixOS too: mlx4's build command compiles
+mlx-out/build/runner.mlx (build.mlx on std.build) and runs it, and the
+runner starts its jobs as processes (std.spawn's native path, by node
+handles) and waits for them by their process handles; the memory
+figures come from system_info (two compiles of the compositor's size
+need 2 GiB: with less, one job runs at a time whatever -j says), and
+without a home directory the result cache is off. build.mlx leaves WebKit's steps out
+where projects/webkit/upstream is missing, so the part of the repository
+the brix group needs (build.mlx, compiler/selfhost, the assembler's
+asm.mlx and base.mlx, std, projects/brix and the programs in the image,
+projects/webkit/*.mlx, tools/build-number) is enough:
+
+    cd /volumes/disk0 && tar -xzf mlx.tar.gz && mlx4 build brix -j 2
+
+builds the kernel, brix-image, the tools, the coreutils, the desktop's
+programs and the boot image there (the fonts and the keymap from the system's own files, so
+the image is the host's). tools/check_brix_build.sh does it (99 steps,
+the compositor the largest unit) and compares the kernel and the boot
+image with the host's build from the same archive: byte for byte the
+same.
+
+## The init and the boot screen
+
+The first process is /system/programs/impulse (projects/init/brixos.mlx,
+the same service files as MLX/Linux's impulse; without it in the
+archive the kernel runs flux itself, as the checks' own images do).
+The kernel gives it the serial console as its input, output, errors and
+session, and starts it again when it ends. It reads
+/system/settings/init/services/NAME.service (the image carries
+projects/brix/settings/init/services: `serial-shell`, flux with
+`stdio = /devices/console`; `desktop`, kepler with
+`screen = yes`; and `console`, mlx-console for the screen instead,
+`disabled = yes`), starts each service with process_spawn and roles of its
+own (the terminal named by `stdio` as input, output, errors and session,
+the service's group in front of it; else a stream the init reads and
+appends to /temporary/logs/NAME.log, or says itself with
+`log = console`), waits on everything at once (the processes' endings,
+the output streams, the control FIFO, the next deadline: one wait, no
+signals), starts ended services again after a growing pause, and ends
+the system with system_power (call 50: every volume committed, then
+halt, poweroff or reboot; QEMU exits with -no-reboot).
+
+`impulsectl status | start NAME | stop NAME | restart NAME | reload |
+poweroff | reboot | halt` asks over the FIFO /temporary/init/control
+(one line: the asker's own FIFO, the request); the answer comes on the
+asker's FIFO, the text Linux's impulse answers.
+
+With a display and ignition in the programs (projects/desktop/splash/
+brixos.mlx: the same picture as MLX/Linux's boot splash, drawn by this
+one process into /devices/framebuffer), the init starts the splash first,
+on two streams (its input: Plymouth's requests as the init sends them,
+"U" a service starting, "u" the progress; its output: the answers), and
+tells it to quit, keeping its picture, before a service with
+`screen = yes` starts, at the earliest 3 s after the splash came up.
+`impulsectl message TEXT` puts a line on the splash while it is up
+(`impulsectl message` takes it away). A poweroff or reboot shows the
+shutdown the same way: the splash in its shutdown or reboot mode, told
+each service that stops, fading out before the machine goes.
+tools/check_brix_init.sh boots it all: the oneshots, the splash on the
+screen, the message, the console's prompt after it (pixel for pixel),
+the control, the shutdown screen, the poweroff.
+
+![The boot: the splash, then the console](screenshots/boot.gif)
+
+(screenshots/boot.mp4 is the same at 1024x768, recorded through QEMU's
+monitor; `uname -o` typed on the PS/2 keyboard at the end.)
+
+## The virtual console
+
+brixOS is usable on a screen: `mlx-console` (projects/console/brixos.mlx,
+mlx-out/bin/brix/mlx-console, in the boot image) is the Linux console's
+program with brixOS's devices under it: the display's pixels come from
+/devices/framebuffer (kernel/display.mlx: the Bochs VBE adapter QEMU
+gives a Multiboot boot, set to 1024x768, or the framebuffer the EFI
+loader found through GOP, in the boot info; a read gives width, height,
+pitch and format, node_map the pixels, 32 bits each, blue first), the
+keys from /devices/keyboard (kernel/keyboard.mlx: the PS/2 keyboard's
+scancodes by IRQ 1, decoded by the console as a US layout with Shift,
+Ctrl, Alt, Caps Lock, the arrows, F1 to F12), and flux runs on a
+session pair (spec calls 48 and 49: a terminal of its own, kernel/
+terminal.mlx's table; the console holds the control side, the shell the
+session as its input, output, errors and session roles; `session_size`
+is what TIOCGWINSZ answers). The emulation and the drawing are
+std.terminal and std.ui.terminal, the text std.truetype from
+/system/fonts/DejaVuSansMono.ttf (the image carries the host's DejaVu
+Sans Mono as fonts/DejaVuSansMono.ttf; an archive name with a directory
+goes under /system). The kernel itself draws nothing: its console stays
+the serial line, where `mlx-console &` starts the screen's.
+
+tools/check_brix_console.sh types on the keyboard through QEMU's
+monitor (sendkey), dumps the screen (screendump) and compares it pixel
+for pixel with what projects/brix/tools/screen draws on the host for the
+same text with the same code and font.
+
+## The desktop
+
+The boot image's screen service is the desktop: `kepler`
+(projects/desktop/compositor, the repository's Wayland compositor, built
+for brixOS into mlx-out/bin/brix/kepler; settings/init/services/
+desktop.service, `screen = yes`, so the init quits the splash for it)
+with `vector` as its first client (Alt+Enter; flux on a session
+pair in the window). Three things make it run on brixOS's own interface,
+each a platform file the compiler picks for `--target=x86_64-brixos`:
+
+- **std.wayland's transport** (std/src/wayland/transport/backend.brixos.mlx)
+  carries the Wayland wire over channels: a connection is one end of a
+  channel pair (a message a chunk of the byte stream with up to four
+  handles, brixOS's SCM_RIGHTS), the compositor's socket is a listener
+  node (spec call 51, listener_make: /temporary/wayland-mlx; a client's
+  node_open makes a channel and the listener receives its far end as a
+  message with one handle, which is `accept`), buffers are memory objects
+  (memory_object, memory_map_object, mapped on both sides), and the
+  event loops are tables of watched handles waited on with the one
+  `wait`. The wire, the protocol code, the clients and the compositor are
+  the same code as on Linux.
+- **The compositor's backend** (projects/desktop/compositor/drm.brixos.mlx)
+  is the brixOS display: the framebuffer (/devices/framebuffer, mapped
+  with node_map; the scene composed on the CPU and copied in, with the
+  damage), the keyboard (/devices/keyboard: PS/2 scancodes as evdev key
+  codes, the modifiers followed from the keys, no keymap sent) and the
+  mouse (/devices/mouse: kernel/mouse.mlx, the PS/2 auxiliary port by
+  IRQ 12, three bytes a packet, the first with bit 3 set: the buttons and
+  the motion, as wl_pointer events). No logind, no DRM, no Vulkan, no
+  Xwayland there.
+- **std.terminal.pty** opens the terminal's shell on a session pair
+  (spec calls 48 and 49) and spawns it natively with roles; std.ui's
+  host for brixOS is Linux's (the Wayland client code).
+- **The compositor's children** (projects/desktop/compositor/
+  children.brixos.mlx) start with process_spawn: the program's node
+  (found in PATH), our input, output, errors and session as its roles,
+  and for a helper one end of a channel pair as its own role (Role.OWN;
+  the helper finds it there, projects/desktop/shared/channel.mlx, and
+  reads and sends messages on it; on Linux the same code is a socket
+  pair numbered in MLX_DOCK_FD and the like). The children are process
+  handles, asked whether they ended at every turn of the loop.
+- **The keymap**: brixOS has no XKB data, so the image carries
+  /system/settings/keyboard/us.xkb, compiled on the host from its XKB
+  data by projects/brix/tools/keymap (brix-keymap, a step of the image's
+  build; the entry is left out on a host without the data, and the
+  clients then type by their own US fallback), and the compositor hands
+  it to its clients (XKB_DEFAULT_LAYOUT picks another file there).
+
+The helpers are in the image and start with the compositor: the top bar
+(horizon: the clock, the workspaces), the dock (orbit: the apps
+button, the terminal, the trash) and the launcher (launch, shown
+by Super or the dock's apps button; it offers the desktop entries of
+/system/share/applications, XDG_DATA_DIRS in desktop.service: the
+terminal's, projects/desktop/terminal/vector.desktop).
+
+![The desktop: the top bar, the terminal, the launcher over the dock](screenshots/desktop.png)
+
+`impulsectl start console` runs mlx-console beside it (console.service
+is disabled by default: one program draws the screen; disable the
+desktop and enable the console for the plain virtual console).
+tools/check_brix_desktop.sh boots the image, sees the compositor take
+the screen after the splash with the keymap and the helpers' layers,
+opens the terminal with Alt+Enter (its window on the display, the blue
+of its title bar counted), types a command through the compositor into
+its shell (a file read back from the serial shell), moves the mouse
+through QEMU's monitor (the cursor's white counted right of the window),
+clicks the dock's apps button (the launcher comes up) and powers off.
+Xwayland is not on brixOS.
+
+The programs carry their product names (projects/desktop and the system
+programs): the compositor is `kepler`, the terminal `vector`, the shell
+`flux`, the dock `orbit`, the launcher `launch`, the top bar `horizon`,
+the login `sentinel`, the greeter `aurora`, the bus `synapse`, init
+`impulse` and the boot screen `ignition` (the MLX toolchain -- mlx4,
+mlx-cc and the rest -- keeps its name, and so do the MLXIPC protocol and
+the MLX_* environment).
+
+The launcher and the dock read **app bundles**, like a macOS .app: a
+directory NAME.app under /system/share/apps holding app.ini (the
+[Desktop Entry] format) and its own icon.png, so one directory replaces a
+.desktop file and a theme icon (projects/desktop/shared/apps.mlx,
+projects/desktop/apps). The image ships Vector.app (the terminal), its
+icon a dark window with a green prompt. (The boot archive's names were
+widened to 72 bytes to hold the bundle paths.)
+
+## The login
+
+Instead of the desktop as root, the boot image can start a login, all on
+brixOS's own interface. Three native programs make it, each the same code
+as on Linux (the platform the compiler picks for `--target=x86_64-brixos`
+decides the few calls that differ):
+
+- **synapse** (projects/desktop/ipc) is MLXIPC, the system message bus,
+  on a listener node at /temporary/bus (ipcd.service). Its event loop is
+  std.wayland's transport, the native `wait`, not epoll; so the policy
+  can tell its clients apart, the kernel names each channel's holder
+  (spec call 55, channel_peer: who holds the other end, and its program's
+  leaf name), which std.appid reads on brixOS in place of /proc.
+- **sentinel** (projects/desktop/login, login.service, `screen = yes`)
+  takes the screen after the splash and owns org.mlx.Login and
+  org.freedesktop.login1 on the bus. It starts the greeter compositor
+  (`kepler --greeter aurora`) by branching (process_branch),
+  taking an unprivileged identity (spec call 53, identity_set: a
+  process's user and group, which its children inherit, down from 0 for
+  good) in a runtime directory of its own (node_make, and spec call 54,
+  node_own: a node's owner and group), then replacing itself with it
+  (process_replace). Its wait is the native `wait` on the bus and the
+  children's handles, no signalfd.
+- **aurora** (projects/desktop/greeter) is the login screen, a
+  Wayland client of the greeter compositor (its connection the handle in
+  its own role, WAYLAND_SOCKET) and a bus client. A password checked
+  against /system/settings (users, groups, shadow: the account `brix`,
+  password `brix`) makes sentinel branch, take the person's identity and
+  replace itself with their session (the desktop, from
+  /system/share/wayland-sessions) in their home /users/NAME, made at the
+  first login and given to them.
+
+The accounts, the session entry and the services are in the image;
+desktop.service is shipped disabled (the login has the screen; enable it
+and disable the login for the desktop as root without a login).
+tools/check_brix_login.sh boots the image, sees the bus listen and
+sentinel start the greeter, the kernel name it aurora so the policy
+allows login.session, the password accepted and the session start as
+`brix` in /users/brix.
+
 ## Next
 
-1. A start block for programs (their handles by role, the session's
-   among them); programs loaded through node_map (their text shared);
+1. The desktop's rest on brixOS: the terminal's font settings from
+   /system, more app icons in the image.
+2. Programs loaded through node_map (their text shared);
    files mapped shared and writable (the page cache telling a view's
    holds from a snapshot's); a framebuffer console
    (GOP's) for EFI boots; the kernel on the
    other processors (per-processor stacks, TSS and GDT, a lock, the local
    APIC's timer, IPIs); ext2 written too.
-2. std.posix as the facade for what programs still ask the Linux layer
+3. std.posix as the facade for what programs still ask the Linux layer
    (stat, fcntl, signals of their own), once the native ground holds.
 
 ## The plan from the start
