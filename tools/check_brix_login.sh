@@ -146,8 +146,8 @@ echo "ok   the system bus listens and sentinel starts the greeter on the screen"
 # The greeter is a bus client the kernel names (channel_peer), so the
 # bus's policy can tell it apart; the greeter compositor logs to a file,
 # so the login and bus messages on the serial line are what is checked.
-wait_for '^ipc: :1\.[0-9]* is aurora$'
-echo "ok   the kernel names the greeter's program to the bus (channel_peer): it is aurora, not unknown"
+wait_for '^ipc: :1\.[0-9]* is aurora (mlx)$'
+echo "ok   the kernel names the greeter's program to the bus (channel_peer): it is aurora, a native (mlx) client, not unknown"
 sleep 1
 
 # The password "brix" of the account brix, one key at a time (the field
