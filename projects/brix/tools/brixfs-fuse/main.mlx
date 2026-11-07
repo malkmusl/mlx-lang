@@ -1,0 +1,526 @@
+// brixfs-fuse: a read-only Linux filesystem driver for brixOS's brixfs,
+// written in Mlx. It speaks the FUSE kernel protocol over /dev/fuse
+// directly (no libfuse, no C), mounts the volume, and serves lookups,
+// attributes, directory listings and file reads out of the brixfs format
+// (projects/brix/brixfs.mlx -- the same code brixOS writes). So the files
+// brixOS keeps are reachable from Linux with the usual tools (ls, cat, cp,
+// a file manager), native end to end.
+//
+//   sudo brixfs-fuse DEVICE MOUNTPOINT      (then: sudo umount MOUNTPOINT)
+//
+// DEVICE is a brixfs partition (/dev/sdc2), a whole GPT disk (the brixfs
+// partition is found), or an image file.
+const std = @import("std")
+const crash = @import("std.crash")
+const Brixfs = @import("../../brixfs.mlx")
+
+const linux = std.linux
+
+// FUSE opcodes.
+const FUSE_LOOKUP: usize = 1
+const FUSE_FORGET: usize = 2
+const FUSE_GETATTR: usize = 3
+const FUSE_READLINK: usize = 5
+const FUSE_OPEN: usize = 14
+const FUSE_READ: usize = 15
+const FUSE_RELEASE: usize = 18
+const FUSE_INIT: usize = 26
+const FUSE_OPENDIR: usize = 27
+const FUSE_READDIR: usize = 28
+const FUSE_RELEASEDIR: usize = 29
+const FUSE_FLUSH: usize = 25
+const FUSE_FORGET_BATCH: usize = 42
+const FUSE_DESTROY: usize = 38
+// errno.
+const ENOENT: isize = 2
+const EIO: isize = 5
+const EROFS: isize = 30
+const ENOSYS: isize = 38
+// file modes.
+const S_IFDIR: usize = 0x4000
+const S_IFREG: usize = 0x8000
+const S_IFLNK: usize = 0xA000
+const DT_DIR: usize = 4
+const DT_REG: usize = 8
+const DT_LNK: usize = 10
+
+const B: usize = Brixfs.Brixfs.BLOCK
+
+var device: isize = -1 // (per run)
+var base: usize = 0 // (per run)
+var fuse: isize = -1 // (per run)
+var root: usize = 0 // the inode table's root block
+var pageA: [B]u8 = undefined
+var pageB: [B]u8 = undefined
+var extentsBuf: [B]u8 = undefined
+var pointersBuf: [B]u8 = undefined
+var dataBuf: [B]u8 = undefined
+var inbuf: [1 << 17]u8 = undefined
+var outbuf: [1 << 17]u8 = undefined
+
+fn preadFull(fd: isize, into: [*]u8, count: usize, offset: usize) -> bool {
+    var done: usize = 0
+    while done < count {
+        const here = unsafe { @ptrFromInt([*]u8, @intFromPtr(into) + done) }
+        const got = linux.syscall4(linux.SYS_pread64, @bitCast(usize, fd), @intFromPtr(here), count - done, offset + done)
+        if got <= 0 { return false }
+        done += @intCast(usize, got)
+    }
+    return true
+}
+
+// A brixfs block into `into` (BLOCK bytes); the ExtentReader's callback.
+fn readBlock(number: usize, into: [*]u8) -> bool {
+    return preadFull(device, into, B, base + number * B)
+}
+
+// Finds the brixfs superblock: the volume at offset 0, else a brixfs
+// partition of a GPT disk. Sets `base` and `root`; false when none.
+fn mountVolume() -> bool {
+    const a: [*]u8 = &pageA
+    const b: [*]u8 = &pageB
+    if trySuperblock(0) { return true }
+    // GPT: the header at LBA 1, its entries each name a partition.
+    if !preadFull(device, a, B, 512) { return false }
+    if a[0] != 69 || a[1] != 70 || a[2] != 73 || a[3] != 32 { return false } // "EFI "
+    const entriesLba = Brixfs.Brixfs.get(a, 72, 8)
+    const count = Brixfs.Brixfs.get(a, 80, 4)
+    const size = Brixfs.Brixfs.get(a, 84, 4)
+    var i: usize = 0
+    while i < count && i < 128 {
+        if !preadFull(device, b, 128, entriesLba * 512 + i * size) {
+            i += 1
+            continue
+        }
+        if Brixfs.Brixfs.get(b, 0, 8) != 0 || Brixfs.Brixfs.get(b, 8, 8) != 0 {
+            const first = Brixfs.Brixfs.get(b, 32, 8)
+            if trySuperblock(first * 512) { return true }
+        }
+        i += 1
+    }
+    return false
+}
+
+fn trySuperblock(offset: usize) -> bool {
+    const a: [*]u8 = &pageA
+    if !preadFull(device, a, B, offset) { return false }
+    var sb: Brixfs.Superblock = undefined
+    if !sb.decode(a) { return false }
+    // The valid superblock with the higher generation wins.
+    const b: [*]u8 = &pageB
+    var root0 = sb.root
+    var gen0 = sb.generation
+    if preadFull(device, b, B, offset + B) {
+        var sb1: Brixfs.Superblock = undefined
+        if sb1.decode(b) && sb1.generation > gen0 {
+            root0 = sb1.root
+            gen0 = sb1.generation
+        }
+    }
+    base = offset
+    root = root0
+    return true
+}
+
+// Inode `number` into `node`; whether it is in use.
+fn readInode(number: usize, node: *Brixfs.Inode) -> bool {
+    const a: [*]u8 = &pageA
+    if !readBlock(root, a) { return false }
+    const ibNumber = Brixfs.Brixfs.get(a, (number / Brixfs.Brixfs.INODES_PER_BLOCK) * 8, 8)
+    if ibNumber == 0 { return false }
+    const b: [*]u8 = &pageB
+    if !readBlock(ibNumber, b) { return false }
+    node.decode(b, Brixfs.Inode.offsetIn(number))
+    return node.*.kind != Brixfs.Brixfs.FREE
+}
+
+fn modeOf(node: *const Brixfs.Inode) -> usize {
+    if node.*.kind == Brixfs.Brixfs.DIRECTORY { return S_IFDIR | 0x1ED }
+    if node.*.kind == Brixfs.Brixfs.SYMLINK { return S_IFLNK | 0x1FF }
+    return S_IFREG | 0x1A4
+}
+
+fn dtOf(kind: usize) -> usize {
+    if kind == Brixfs.Brixfs.DIRECTORY { return DT_DIR }
+    if kind == Brixfs.Brixfs.SYMLINK { return DT_LNK }
+    return DT_REG
+}
+
+// Up to `size` bytes of a file from `offset` into `out`; how many.
+fn readFile(node: *const Brixfs.Inode, offset: usize, size: usize, out: [*]u8) -> usize {
+    const ext: [*]u8 = &extentsBuf
+    const ptr: [*]u8 = &pointersBuf
+    const dat: [*]u8 = &dataBuf
+    var reader: Brixfs.ExtentReader = undefined
+    reader.init()
+    var done: usize = 0
+    while done < size && offset + done < node.*.size {
+        const at = offset + done
+        const fileBlock = at / B
+        const within = at % B
+        var chunk = B - within
+        if chunk > size - done { chunk = size - done }
+        if chunk > node.*.size - at { chunk = node.*.size - at }
+        const disk = reader.blockAt(node, fileBlock, ext, ptr, readBlock)
+        const target = unsafe { @ptrFromInt([*]u8, @intFromPtr(out) + done) }
+        if disk == 0 {
+            var z: usize = 0
+            while z < chunk {
+                target[z] = 0
+                z += 1
+            }
+        } else if readBlock(disk, dat) {
+            var c: usize = 0
+            while c < chunk {
+                target[c] = dat[within + c]
+                c += 1
+            }
+        } else {
+            break
+        }
+        done += chunk
+    }
+    return done
+}
+
+// The out header (len, error, unique) plus `payloadLength` bytes already
+// at outbuf+16; written to the FUSE device.
+fn reply(unique: usize, err: isize, payloadLength: usize) -> void {
+    const o: [*]u8 = &outbuf
+    const total = 16 + payloadLength
+    Brixfs.Brixfs.put(o, 0, 4, total)
+    Brixfs.Brixfs.put(o, 4, 4, @bitCast(usize, err) & 0xFFFFFFFF)
+    Brixfs.Brixfs.put(o, 8, 8, unique)
+    _ = linux.syscall3(linux.SYS_write, @bitCast(usize, fuse), @intFromPtr(o), total)
+}
+
+// Writes a fuse_attr (88 bytes) at outbuf+`at` for inode `number`.
+fn putAttr(at: usize, number: usize, node: *const Brixfs.Inode) -> void {
+    const o: [*]u8 = &outbuf
+    var k: usize = 0
+    while k < 88 {
+        o[at + k] = 0
+        k += 1
+    }
+    Brixfs.Brixfs.put(o, at + 0, 8, number) // ino
+    Brixfs.Brixfs.put(o, at + 8, 8, node.*.size)
+    Brixfs.Brixfs.put(o, at + 16, 8, (node.*.size + 511) / 512) // blocks
+    Brixfs.Brixfs.put(o, at + 60, 4, modeOf(node))
+    Brixfs.Brixfs.put(o, at + 64, 4, if node.*.links > 0 { node.*.links } else { 1 })
+    Brixfs.Brixfs.put(o, at + 68, 4, node.*.user)
+    Brixfs.Brixfs.put(o, at + 72, 4, node.*.group)
+    Brixfs.Brixfs.put(o, at + 80, 4, 4096) // blksize
+}
+
+fn handleGetattr(unique: usize, nodeid: usize) -> void {
+    var node: Brixfs.Inode = undefined
+    if !readInode(nodeid, &node) {
+        reply(unique, -ENOENT, 0)
+        return
+    }
+    const o: [*]u8 = &outbuf
+    Brixfs.Brixfs.put(o, 16, 8, 1) // attr_valid seconds
+    Brixfs.Brixfs.put(o, 24, 4, 0)
+    Brixfs.Brixfs.put(o, 28, 4, 0)
+    putAttr(32, nodeid, &node)
+    reply(unique, 0, 104)
+}
+
+fn putEntry(unique: usize, childNumber: usize, child: *const Brixfs.Inode) -> void {
+    const o: [*]u8 = &outbuf
+    var k: usize = 0
+    while k < 40 {
+        o[16 + k] = 0
+        k += 1
+    }
+    Brixfs.Brixfs.put(o, 16, 8, childNumber) // nodeid
+    Brixfs.Brixfs.put(o, 32, 8, 1) // entry_valid
+    Brixfs.Brixfs.put(o, 40, 8, 1) // attr_valid
+    putAttr(56, childNumber, child)
+    reply(unique, 0, 128)
+}
+
+fn handleLookup(unique: usize, nodeid: usize, name: [*]const u8, nameLength: usize) -> void {
+    var dir: Brixfs.Inode = undefined
+    if !readInode(nodeid, &dir) || dir.kind != Brixfs.Brixfs.DIRECTORY {
+        reply(unique, -ENOENT, 0)
+        return
+    }
+    const found = lookupEntry(&dir, name, nameLength)
+    if found == 0 {
+        reply(unique, -ENOENT, 0)
+        return
+    }
+    var child: Brixfs.Inode = undefined
+    if !readInode(found, &child) {
+        reply(unique, -ENOENT, 0)
+        return
+    }
+    putEntry(unique, found, &child)
+}
+
+// The inode of `name` in directory `dir` (0 when there is none).
+fn lookupEntry(dir: *const Brixfs.Inode, name: [*]const u8, nameLength: usize) -> usize {
+    const page: [*]u8 = &dataBuf
+    var reader: Brixfs.ExtentReader = undefined
+    reader.init()
+    const ext: [*]u8 = &extentsBuf
+    const ptr: [*]u8 = &pointersBuf
+    var blockIndex: usize = 0
+    var scanned: usize = 0
+    while scanned < dir.*.size {
+        const disk = reader.blockAt(dir, blockIndex, ext, ptr, readBlock)
+        if disk == 0 || !readBlock(disk, page) { break }
+        var slot: usize = 0
+        while slot < B / Brixfs.Brixfs.ENTRY_SIZE && scanned + slot * Brixfs.Brixfs.ENTRY_SIZE < dir.*.size {
+            const inode = Brixfs.Entry.inode(page, slot)
+            if inode != 0 {
+                const length = Brixfs.Entry.nameLength(page, slot)
+                if length == nameLength && matches(page, Brixfs.Entry.nameAt(slot), name, nameLength) { return inode }
+            }
+            slot += 1
+        }
+        scanned += B
+        blockIndex += 1
+    }
+    return 0
+}
+
+fn matches(page: [*]const u8, at: usize, name: [*]const u8, length: usize) -> bool {
+    var k: usize = 0
+    while k < length {
+        if page[at + k] != name[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+fn handleReaddir(unique: usize, nodeid: usize, cookie: usize, size: usize) -> void {
+    var dir: Brixfs.Inode = undefined
+    if !readInode(nodeid, &dir) || dir.kind != Brixfs.Brixfs.DIRECTORY {
+        reply(unique, -ENOENT, 0)
+        return
+    }
+    const o: [*]u8 = &outbuf
+    var out: usize = 0
+    var index: usize = 0 // the running entry number (the cookie)
+    const page: [*]u8 = &dataBuf
+    var reader: Brixfs.ExtentReader = undefined
+    reader.init()
+    const ext: [*]u8 = &extentsBuf
+    const ptr: [*]u8 = &pointersBuf
+    var blockIndex: usize = 0
+    var scanned: usize = 0
+    var stop = false
+    while !stop && scanned < dir.size {
+        const disk = reader.blockAt(&dir, blockIndex, ext, ptr, readBlock)
+        if disk == 0 || !readBlock(disk, page) { break }
+        var slot: usize = 0
+        while slot < B / Brixfs.Brixfs.ENTRY_SIZE && scanned + slot * Brixfs.Brixfs.ENTRY_SIZE < dir.size {
+            const inode = Brixfs.Entry.inode(page, slot)
+            if inode != 0 {
+                index += 1
+                if index > cookie {
+                    const length = Brixfs.Entry.nameLength(page, slot)
+                    const reclen = (24 + length + 7) & @intCast(usize, 0xFFFFFFFFFFFFFFF8)
+                    if 16 + out + reclen > size + 16 || out + reclen > (1 << 17) - 16 {
+                        stop = true
+                        break
+                    }
+                    var child: Brixfs.Inode = undefined
+                    var kind: usize = Brixfs.Brixfs.FILE
+                    if readInode(inode, &child) { kind = child.kind }
+                    const at = 16 + out
+                    Brixfs.Brixfs.put(o, at + 0, 8, inode) // ino
+                    Brixfs.Brixfs.put(o, at + 8, 8, index) // off (next cookie)
+                    Brixfs.Brixfs.put(o, at + 16, 4, length) // namelen
+                    Brixfs.Brixfs.put(o, at + 20, 4, dtOf(kind)) // type
+                    var c: usize = 0
+                    const nameAt = Brixfs.Entry.nameAt(slot)
+                    while c < length {
+                        o[at + 24 + c] = page[nameAt + c]
+                        c += 1
+                    }
+                    var pad = length
+                    while pad < reclen - 24 {
+                        o[at + 24 + pad] = 0
+                        pad += 1
+                    }
+                    out += reclen
+                }
+            }
+            slot += 1
+        }
+        scanned += B
+        blockIndex += 1
+    }
+    reply(unique, 0, out)
+}
+
+fn handleRead(unique: usize, nodeid: usize, offset: usize, size: usize) -> void {
+    var node: Brixfs.Inode = undefined
+    if !readInode(nodeid, &node) {
+        reply(unique, -ENOENT, 0)
+        return
+    }
+    var want = size
+    if want > (1 << 17) - 16 { want = (1 << 17) - 16 }
+    const o: [*]u8 = &outbuf
+    const into = unsafe { @ptrFromInt([*]u8, @intFromPtr(o) + 16) }
+    const got = readFile(&node, offset, want, into)
+    reply(unique, 0, got)
+}
+
+fn handleReadlink(unique: usize, nodeid: usize) -> void {
+    var node: Brixfs.Inode = undefined
+    if !readInode(nodeid, &node) || node.kind != Brixfs.Brixfs.SYMLINK {
+        reply(unique, -ENOENT, 0)
+        return
+    }
+    const o: [*]u8 = &outbuf
+    const into = unsafe { @ptrFromInt([*]u8, @intFromPtr(o) + 16) }
+    const got = readFile(&node, 0, node.size, into)
+    reply(unique, 0, got)
+}
+
+fn handleInit(unique: usize, inAt: usize) -> void {
+    const req: [*]u8 = &inbuf
+    const theirMinor = Brixfs.Brixfs.get(req, inAt + 4, 4)
+    var minor = theirMinor
+    if minor > 31 { minor = 31 }
+    const o: [*]u8 = &outbuf
+    var k: usize = 0
+    while k < 64 {
+        o[16 + k] = 0
+        k += 1
+    }
+    Brixfs.Brixfs.put(o, 16, 4, 7) // major
+    Brixfs.Brixfs.put(o, 20, 4, minor)
+    Brixfs.Brixfs.put(o, 24, 4, Brixfs.Brixfs.get(req, inAt + 8, 4)) // max_readahead echoed
+    Brixfs.Brixfs.put(o, 28, 4, 0) // flags: no optional features
+    Brixfs.Brixfs.put(o, 36, 4, 65536) // max_write (< the read buffer)
+    Brixfs.Brixfs.put(o, 40, 4, 1) // time_gran
+    reply(unique, 0, 64)
+}
+
+fn digits(value: usize, into: [*]u8, at: usize) -> usize {
+    if value == 0 {
+        into[at] = 48
+        return at + 1
+    }
+    var buffer: [20]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while rest > 0 {
+        buffer[count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest /= 10
+    }
+    var out = at
+    while count > 0 {
+        count -= 1
+        into[out] = buffer[count]
+        out += 1
+    }
+    return out
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    crash.install()
+    if std.process.count(arguments) < 3 {
+        _ = std.io.print("usage: brixfs-fuse DEVICE MOUNTPOINT\n")
+        return 2
+    }
+    const devicePath = std.process.argument(arguments, 1)
+    const mountPath = std.process.argument(arguments, 2)
+    device = linux.syscall3(linux.SYS_open, @intFromPtr(devicePath.pointer), 0, 0) // O_RDONLY
+    if device < 0 {
+        _ = std.io.print("brixfs-fuse: cannot open the device\n")
+        return 1
+    }
+    if !mountVolume() {
+        _ = std.io.print("brixfs-fuse: no brixfs volume on the device\n")
+        return 1
+    }
+    fuse = linux.syscall3(linux.SYS_open, @intFromPtr("/dev/fuse\x00".pointer), 2, 0) // O_RDWR
+    if fuse < 0 {
+        _ = std.io.print("brixfs-fuse: cannot open /dev/fuse\n")
+        return 1
+    }
+    // mount(2): fstype "fuse", the options naming the fuse fd.
+    var options: [128]u8 = undefined
+    const opt: [*]u8 = &options
+    const prefix = "fd="
+    var at: usize = 0
+    var p: usize = 0
+    while p < prefix.length {
+        opt[at] = prefix[p]
+        at += 1
+        p += 1
+    }
+    at = digits(@bitCast(usize, fuse), opt, at)
+    const rest = ",rootmode=40000,user_id=0,group_id=0"
+    p = 0
+    while p < rest.length {
+        opt[at] = rest[p]
+        at += 1
+        p += 1
+    }
+    opt[at] = 0
+    const mounted = linux.syscall5(linux.SYS_mount, @intFromPtr("brixfs\x00".pointer), @intFromPtr(mountPath.pointer), @intFromPtr("fuse\x00".pointer), 7, @intFromPtr(opt))
+    if mounted < 0 {
+        _ = std.io.print("brixfs-fuse: mount failed (run as root)\n")
+        return 1
+    }
+    _ = std.io.print("brixfs-fuse: mounted read-only (umount to stop)\n")
+    const req: [*]u8 = &inbuf
+    while true {
+        const n = linux.syscall3(linux.SYS_read, @bitCast(usize, fuse), @intFromPtr(req), 1 << 17)
+        if n < 0 {
+            if n == -4 { continue } // EINTR
+            break // ENODEV (the mount went away) or any other error: stop
+        }
+        if n < 40 { continue }
+        const opcode = Brixfs.Brixfs.get(req, 4, 4)
+        const unique = Brixfs.Brixfs.get(req, 8, 8)
+        const nodeid = Brixfs.Brixfs.get(req, 16, 8)
+        if opcode == FUSE_INIT {
+            handleInit(unique, 40)
+        } else if opcode == FUSE_GETATTR {
+            handleGetattr(unique, nodeid)
+        } else if opcode == FUSE_LOOKUP {
+            const name = unsafe { @ptrFromInt([*]const u8, @intFromPtr(req) + 40) }
+            var length: usize = 0
+            while length < 255 && name[length] != 0 { length += 1 }
+            handleLookup(unique, nodeid, name, length)
+        } else if opcode == FUSE_OPEN || opcode == FUSE_OPENDIR {
+            const o: [*]u8 = &outbuf
+            var k: usize = 0
+            while k < 16 {
+                o[16 + k] = 0
+                k += 1
+            }
+            reply(unique, 0, 16)
+        } else if opcode == FUSE_READ {
+            const offset = Brixfs.Brixfs.get(req, 48, 8)
+            const size = Brixfs.Brixfs.get(req, 56, 4)
+            handleRead(unique, nodeid, offset, size)
+        } else if opcode == FUSE_READDIR {
+            const cookie = Brixfs.Brixfs.get(req, 48, 8)
+            const size = Brixfs.Brixfs.get(req, 56, 4)
+            handleReaddir(unique, nodeid, cookie, size)
+        } else if opcode == FUSE_READLINK {
+            handleReadlink(unique, nodeid)
+        } else if opcode == FUSE_RELEASE || opcode == FUSE_RELEASEDIR || opcode == FUSE_FLUSH {
+            reply(unique, 0, 0)
+        } else if opcode == FUSE_FORGET || opcode == FUSE_FORGET_BATCH {
+            // No reply.
+        } else if opcode == FUSE_DESTROY {
+            reply(unique, 0, 0)
+            break
+        } else {
+            reply(unique, -ENOSYS, 0)
+        }
+    }
+    return 0
+}
