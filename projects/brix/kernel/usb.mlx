@@ -1,0 +1,683 @@
+// USB on an xHCI controller (a Supermicro H11's USB 3 ports, or QEMU's
+// `-device qemu-xhci`), for keyboards and mice on real hardware where
+// there is no PS/2 i8042. The controller is a PCI device of class
+// 0C:03:30; its registers are a memory BAR (BAR0), mapped uncached. One
+// command ring, one event ring, and per device an EP0 ring and an
+// interrupt-IN ring, all polled (no interrupt): enumeration runs at boot,
+// and the HID interrupt endpoints are drained on the timer tick. Boot
+// protocol only: a keyboard's reports become Set-1 scancodes for
+// keyboard.mlx, a mouse's become PS/2 packets for mouse.mlx, so the
+// console and the compositor read them as before.
+const layout = @import("./../layout.mlx")
+const memory = @import("./memory.mlx")
+const Pci = @import("./pci.mlx").Pci
+const Bytes = @import("./bytes.mlx").Bytes
+const keyboard = @import("./keyboard.mlx")
+const mouse = @import("./mouse.mlx")
+const console = @import("./console.mlx")
+const Page = memory.Page
+
+const PATIENCE: usize = 100000000
+
+// TRB types.
+const TRB_NORMAL: usize = 1
+const TRB_SETUP: usize = 2
+const TRB_DATA: usize = 3
+const TRB_STATUS: usize = 4
+const TRB_LINK: usize = 6
+const TRB_ENABLE_SLOT: usize = 9
+const TRB_ADDRESS_DEVICE: usize = 11
+const TRB_CONFIGURE_ENDPOINT: usize = 12
+// Event TRB types.
+const EV_TRANSFER: usize = 32
+const EV_COMMAND_COMPLETE: usize = 33
+const EV_PORT_STATUS: usize = 34
+// TRB control bits.
+const TRB_CYCLE: usize = 1
+const TRB_TC: usize = 0x2 // toggle cycle (link)
+const TRB_IOC: usize = 0x20 // interrupt on completion
+const TRB_IDT: usize = 0x40 // immediate data (setup)
+const TRB_ISP: usize = 0x4 // interrupt on short packet
+const RING_SIZE: usize = 256
+
+// A producer ring (command or transfer): a page of TRBs with a Link TRB
+// at the end that wraps to the start and toggles the cycle.
+const Ring = struct {
+    base: usize // physical
+    enqueue: usize
+    cycle: usize
+
+    fn setup(self: *Self, base: usize) -> void {
+        self.*.base = base
+        self.*.enqueue = 0
+        self.*.cycle = 1
+        Bytes.zeroWords(layout.Memory.virtual(base), Page.SIZE / 8)
+        // The Link TRB at the last slot, back to the base.
+        const link = Bytes.pointer(layout.Memory.virtual(base) + (RING_SIZE - 1) * 16)
+        Bytes.write64(link, 0, base)
+        Bytes.write32(link, 8, 0)
+        Bytes.write32(link, 12, (TRB_LINK << 10) | TRB_TC | 1)
+    }
+
+    // Writes a TRB and returns its physical address. d0 is the 64-bit
+    // parameter, d2 the status dword, control the top dword without the
+    // cycle bit.
+    fn push(self: *Self, d0: usize, d2: usize, control: usize) -> usize {
+        const trb = Bytes.pointer(layout.Memory.virtual(self.*.base) + self.*.enqueue * 16)
+        Bytes.write64(trb, 0, d0)
+        Bytes.write32(trb, 8, d2)
+        Bytes.write32(trb, 12, control | self.*.cycle)
+        const addr = self.*.base + self.*.enqueue * 16
+        self.*.enqueue += 1
+        if self.*.enqueue == RING_SIZE - 1 {
+            const link = Bytes.pointer(layout.Memory.virtual(self.*.base) + (RING_SIZE - 1) * 16)
+            Bytes.write32(link, 12, (TRB_LINK << 10) | TRB_TC | self.*.cycle)
+            self.*.enqueue = 0
+            self.*.cycle = self.*.cycle ^ 1
+        }
+        return addr
+    }
+}
+
+pub const MAX_HID: usize = 4
+
+const Hid = struct {
+    present: bool
+    slot: usize
+    kind: u8 // 1 keyboard, 2 mouse
+    ring: Ring
+    report: usize // physical report buffer
+    endpoint: usize // DCI of the interrupt endpoint
+    previous: [8]u8 // last keyboard report (for release detection)
+}
+
+pub const Xhci = struct {
+    present: bool
+    regs: usize
+    opBase: usize
+    rtBase: usize
+    dbBase: usize
+    contextSize: usize // 32 or 64
+    maxSlots: usize
+    maxPorts: usize
+    dcbaa: usize // physical
+    command: Ring
+    event: usize // physical event ring
+    erst: usize // physical ERST
+    eventDequeue: usize
+    eventCycle: usize
+    hids: [MAX_HID]Hid
+    hidCount: usize
+
+    fn cap8(self: *const Self, off: usize) -> u32 { return @intCast(u32, unsafe { @ptrFromInt(*u8, self.*.regs + off) }.*) }
+    fn cap32(self: *const Self, off: usize) -> u32 { return unsafe { @ptrFromInt(*u32, self.*.regs + off) }.* }
+    fn op(self: *const Self, off: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, self.*.opBase + off) } }
+    fn rt(self: *const Self, off: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, self.*.rtBase + off) } }
+    fn doorbell(self: *const Self, slot: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, self.*.dbBase + slot * 4) } }
+    fn portReg(self: *const Self, port: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, self.*.opBase + 0x400 + (port - 1) * 0x10) } }
+
+    fn write64op(self: *const Self, off: usize, value: usize) -> void {
+        self.op(off).* = @intCast(u32, value & 0xFFFFFFFF)
+        self.op(off + 4).* = @intCast(u32, value >> 32)
+    }
+    fn write64rt(self: *const Self, off: usize, value: usize) -> void {
+        self.rt(off).* = @intCast(u32, value & 0xFFFFFFFF)
+        self.rt(off + 4).* = @intCast(u32, value >> 32)
+    }
+
+    // Brings the controller up: reset, the command and event rings, run.
+    fn start(self: *Self) -> bool {
+        const caplength = @intCast(usize, self.cap8(0x00) & 0xFF)
+        self.*.opBase = self.*.regs + caplength
+        self.*.rtBase = self.*.regs + @intCast(usize, self.cap32(0x18) & 0xFFFFFFE0)
+        self.*.dbBase = self.*.regs + @intCast(usize, self.cap32(0x14) & 0xFFFFFFFC)
+        const hcs1 = self.cap32(0x04)
+        self.*.maxSlots = @intCast(usize, hcs1 & 0xFF)
+        self.*.maxPorts = @intCast(usize, (hcs1 >> 24) & 0xFF)
+        self.*.contextSize = if self.cap32(0x10) & 0x4 != 0 { 64 } else { 32 }
+        // Stop, then reset.
+        self.op(0x00).* = self.op(0x00).* & @intCast(u32, 0xFFFFFFFF ^ 1)
+        var tries: usize = 0
+        while self.op(0x04).* & 1 == 0 {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        self.op(0x00).* = 0x2 // HCRST
+        tries = 0
+        while self.op(0x00).* & 0x2 != 0 || self.op(0x04).* & 0x800 != 0 {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        const frames = memory.allFrames()
+        self.*.dcbaa = frames.allocate()
+        const commandBase = frames.allocate()
+        self.*.event = frames.allocate()
+        self.*.erst = frames.allocate()
+        if self.*.dcbaa == 0 || commandBase == 0 || self.*.event == 0 || self.*.erst == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(self.*.dcbaa), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.event), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.erst), Page.SIZE / 8)
+        // Scratchpad buffers, if the controller wants any.
+        const hcs2 = self.cap32(0x08)
+        const scratchpads = @intCast(usize, ((hcs2 >> 21) & 0x1F) << 5 | ((hcs2 >> 27) & 0x1F))
+        if scratchpads > 0 {
+            const array = frames.allocate()
+            if array == 0 { return false }
+            Bytes.zeroWords(layout.Memory.virtual(array), Page.SIZE / 8)
+            var s: usize = 0
+            while s < scratchpads {
+                const buffer = frames.allocate()
+                if buffer == 0 { return false }
+                Bytes.write64(Bytes.pointer(layout.Memory.virtual(array)), s * 8, buffer)
+                s += 1
+            }
+            Bytes.write64(Bytes.pointer(layout.Memory.virtual(self.*.dcbaa)), 0, array)
+        }
+        self.op(0x38).* = @intCast(u32, self.*.maxSlots) // CONFIG.MaxSlotsEn
+        self.write64op(0x30, self.*.dcbaa) // DCBAAP
+        self.*.command.setup(commandBase)
+        self.write64op(0x18, commandBase | 1) // CRCR | RCS
+        // Event ring: one segment named by the ERST.
+        self.*.eventDequeue = 0
+        self.*.eventCycle = 1
+        const erst = Bytes.pointer(layout.Memory.virtual(self.*.erst))
+        Bytes.write64(erst, 0, self.*.event)
+        Bytes.write32(erst, 8, RING_SIZE)
+        Bytes.write32(erst, 12, 0)
+        self.rt(0x28).* = 1 // ERSTSZ
+        self.write64rt(0x38, self.*.event) // ERDP
+        self.write64rt(0x30, self.*.erst) // ERSTBA
+        // Run.
+        self.op(0x00).* = 1
+        tries = 0
+        while self.op(0x04).* & 1 != 0 {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        return true
+    }
+
+    // Waits for the next event with our cycle; returns whether one came and
+    // leaves its four dwords in `out` (a 4-word buffer).
+    fn nextEvent(self: *Self, out: *[4]usize) -> bool {
+        const trb = Bytes.pointer(layout.Memory.virtual(self.*.event) + self.*.eventDequeue * 16)
+        var tries: usize = 0
+        while Bytes.read32(trb, 12) & 1 != self.*.eventCycle {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        out.*[0] = Bytes.read32(trb, 0)
+        out.*[1] = Bytes.read32(trb, 4)
+        out.*[2] = Bytes.read32(trb, 8)
+        out.*[3] = Bytes.read32(trb, 12)
+        self.*.eventDequeue += 1
+        if self.*.eventDequeue == RING_SIZE {
+            self.*.eventDequeue = 0
+            self.*.eventCycle = self.*.eventCycle ^ 1
+        }
+        self.write64rt(0x38, (self.*.event + self.*.eventDequeue * 16) | 0x8) // ERDP, EHB clear
+        return true
+    }
+
+    // Reads events without waiting (for the HID poll); false when the ring
+    // is empty. Fills `out`.
+    fn pollEvent(self: *Self, out: *[4]usize) -> bool {
+        const trb = Bytes.pointer(layout.Memory.virtual(self.*.event) + self.*.eventDequeue * 16)
+        if Bytes.read32(trb, 12) & 1 != self.*.eventCycle { return false }
+        out.*[0] = Bytes.read32(trb, 0)
+        out.*[1] = Bytes.read32(trb, 4)
+        out.*[2] = Bytes.read32(trb, 8)
+        out.*[3] = Bytes.read32(trb, 12)
+        self.*.eventDequeue += 1
+        if self.*.eventDequeue == RING_SIZE {
+            self.*.eventDequeue = 0
+            self.*.eventCycle = self.*.eventCycle ^ 1
+        }
+        self.write64rt(0x38, (self.*.event + self.*.eventDequeue * 16) | 0x8)
+        return true
+    }
+
+    // Runs a command on the command ring and waits for its completion;
+    // returns the completion code and the event's slot id.
+    fn runCommand(self: *Self, d0: usize, control: usize) -> usize {
+        const addr = self.*.command.push(d0, 0, control)
+        self.doorbell(0).* = 0
+        var event: [4]usize = undefined
+        while self.nextEvent(&event) {
+            if (event[3] >> 10) & 0x3F == EV_COMMAND_COMPLETE && (event[0] | (event[1] << 32)) == addr {
+                // Completion code in status bits 24-31, slot id in control
+                // bits 24-31.
+                const code = (event[2] >> 24) & 0xFF
+                const slot = (event[3] >> 24) & 0xFF
+                return (slot << 8) | code
+            }
+        }
+        return 0
+    }
+}
+
+var controller: Xhci = undefined // (per run)
+
+pub fn device() -> *Xhci { return &controller }
+
+// A control transfer on a device's EP0 ring; whether it finished without
+// error. `buffer` is physical (used when wLength > 0).
+fn controlTransfer(self: *Xhci, hidRing: *Ring, slot: usize, requestType: usize, request: usize, value: usize, index: usize, length: usize, buffer: usize, dirIn: bool) -> bool {
+    const setup = requestType | (request << 8) | (value << 16) | (index << 32) | (length << 48)
+    const trt: usize = if length == 0 { 0 } else if dirIn { 3 } else { 2 }
+    _ = hidRing.push(setup, 8, (trt << 16) | (TRB_SETUP << 10) | TRB_IDT)
+    if length > 0 {
+        const dir: usize = if dirIn { 1 } else { 0 }
+        _ = hidRing.push(buffer, length, (dir << 16) | (TRB_DATA << 10) | TRB_ISP)
+    }
+    const statusDir: usize = if dirIn && length > 0 { 0 } else { 1 }
+    _ = hidRing.push(0, 0, (statusDir << 16) | (TRB_STATUS << 10) | TRB_IOC)
+    self.doorbell(slot).* = 1
+    var event: [4]usize = undefined
+    while self.nextEvent(&event) {
+        if (event[3] >> 10) & 0x3F == EV_TRANSFER {
+            const code = (event[2] >> 24) & 0xFF
+            return code == 1 || code == 13
+        }
+    }
+    return false
+}
+
+// A context field at a context entry (contexts are contextSize bytes).
+fn contextAt(base: usize, entry: usize, size: usize) -> [*]u8 {
+    return Bytes.pointer(layout.Memory.virtual(base) + entry * size)
+}
+
+fn maxPacket0(speed: usize) -> usize {
+    if speed == 4 { return 512 }
+    if speed == 3 { return 64 }
+    return 8
+}
+
+// Posts a Normal TRB on a HID device's interrupt ring so the controller
+// writes its next report, and rings the endpoint's doorbell.
+fn postReport(self: *Xhci, hid: *Hid) -> void {
+    _ = hid.*.ring.push(hid.*.report, 8, (TRB_NORMAL << 10) | TRB_IOC | TRB_ISP)
+    self.doorbell(hid.*.slot).* = @intCast(u32, hid.*.endpoint)
+}
+
+// Brings up every connected port's device, keeping the HID boot keyboards
+// and mice.
+fn enumerate(self: *Xhci) -> void {
+    fillScan()
+    const cs = self.*.contextSize
+    const frames = memory.allFrames()
+    var port: usize = 1
+    while port <= self.*.maxPorts && self.*.hidCount < MAX_HID {
+        const portsc = self.portReg(port).*
+        if portsc & 1 == 0 {
+            port += 1
+            continue
+        }
+        // Reset the port (keep PP, clear the write-1-to-clear change bits
+        // and PED), then wait for it to enable.
+        self.portReg(port).* = (portsc & @intCast(u32, 0xFFFFFFFF ^ 0x00FE0002)) | 0x10
+        var tries: usize = 0
+        while self.portReg(port).* & 0x2 == 0 {
+            tries += 1
+            if tries > PATIENCE { break }
+        }
+        var spin: usize = 0
+        while spin < 2000000 { spin += 1 }
+        const after = self.portReg(port).*
+        if after & 0x2 == 0 {
+            port += 1
+            continue
+        }
+        const speed = @intCast(usize, (after >> 10) & 0xF)
+        // Clear the reset-change bit.
+        self.portReg(port).* = (after & @intCast(u32, 0xFFFFFFFF ^ 0x00FE0002)) | 0x00200000
+        setupDevice(self, port, speed, cs, frames)
+        port += 1
+    }
+}
+
+fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memory.Frames) -> void {
+    const res = self.runCommand(0, TRB_ENABLE_SLOT << 10)
+    if res & 0xFF != 1 { return }
+    const slot = (res >> 8) & 0xFF
+    const devctx = frames.allocate()
+    const inctx = frames.allocate()
+    const ep0base = frames.allocate()
+    if devctx == 0 || inctx == 0 || ep0base == 0 { return }
+    Bytes.zeroWords(layout.Memory.virtual(devctx), Page.SIZE / 8)
+    Bytes.zeroWords(layout.Memory.virtual(inctx), Page.SIZE / 8)
+    Bytes.write64(Bytes.pointer(layout.Memory.virtual(self.*.dcbaa)), slot * 8, devctx)
+    var ep0: Ring = undefined
+    ep0.setup(ep0base)
+    // Input control context: add the slot and EP0.
+    Bytes.write32(contextAt(inctx, 0, cs), 4, 0x3)
+    // Slot context: one context entry, the speed, the root hub port.
+    Bytes.write32(contextAt(inctx, 1, cs), 0, (1 << 27) | (speed << 20))
+    Bytes.write32(contextAt(inctx, 1, cs), 4, port << 16)
+    // EP0 context: control, its max packet, three retries, its ring.
+    const mp0 = maxPacket0(speed)
+    Bytes.write32(contextAt(inctx, 2, cs), 4, (mp0 << 16) | (4 << 3) | (3 << 1))
+    Bytes.write64(contextAt(inctx, 2, cs), 8, ep0.base | 1)
+    const addressed = self.runCommand(inctx, (TRB_ADDRESS_DEVICE << 10) | (slot << 24))
+    if addressed & 0xFF != 1 { return }
+    const buffer = frames.allocate()
+    if buffer == 0 { return }
+    // The configuration descriptor (its total length, then the whole).
+    if !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, 9, buffer, true) { return }
+    var total = Bytes.read16(Bytes.pointer(layout.Memory.virtual(buffer)), 2)
+    if total > Page.SIZE { total = Page.SIZE }
+    if !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, total, buffer, true) { return }
+    // Walk the descriptors for a HID interface and its interrupt-IN
+    // endpoint.
+    const data = Bytes.pointer(layout.Memory.virtual(buffer))
+    const configValue = @intCast(usize, data[5])
+    var offset: usize = 0
+    var interface: usize = 0
+    var protocol: usize = 0
+    var endpoint: usize = 0
+    var interval: usize = 1
+    var found = false
+    while offset + 2 <= total {
+        const length = @intCast(usize, data[offset])
+        if length == 0 { break }
+        const kind = data[offset + 1]
+        if kind == 4 && @intCast(usize, data[offset + 5]) == 3 {
+            // A HID interface: its number and boot protocol.
+            interface = @intCast(usize, data[offset + 2])
+            protocol = @intCast(usize, data[offset + 7])
+            found = true
+        } else if kind == 5 && found && endpoint == 0 && data[offset + 2] & 0x80 != 0 && data[offset + 3] & 0x3 == 3 {
+            endpoint = @intCast(usize, data[offset + 2]) & 0xF
+            interval = @intCast(usize, data[offset + 6])
+        }
+        offset += length
+    }
+    if !found || endpoint == 0 || protocol == 0 { return }
+    if !controlTransfer(self, &ep0, slot, 0x00, 9, configValue, 0, 0, 0, false) { return } // SET_CONFIGURATION
+    // Configure the interrupt endpoint.
+    const dci = endpoint * 2 + 1
+    var intring: Ring = undefined
+    intring.setup(frames.allocate())
+    if intring.base == 0 { return }
+    Bytes.zeroWords(layout.Memory.virtual(inctx), Page.SIZE / 8)
+    Bytes.write32(contextAt(inctx, 0, cs), 4, 0x1 | (@intCast(usize, 1) << @intCast(u6, dci)))
+    Bytes.write32(contextAt(inctx, 1, cs), 0, (dci << 27) | (speed << 20))
+    Bytes.write32(contextAt(inctx, 1, cs), 4, port << 16)
+    // EP context at the DCI: interrupt IN (type 7), max packet 8, retries.
+    var intervalField = interval
+    if intervalField == 0 { intervalField = 1 }
+    Bytes.write32(contextAt(inctx, dci + 1, cs), 0, (intervalField & 0xFF) << 16)
+    Bytes.write32(contextAt(inctx, dci + 1, cs), 4, (8 << 16) | (7 << 3) | (3 << 1))
+    Bytes.write64(contextAt(inctx, dci + 1, cs), 8, intring.base | 1)
+    Bytes.write32(contextAt(inctx, dci + 1, cs), 16, 8)
+    const configured = self.runCommand(inctx, (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24))
+    if configured & 0xFF != 1 { return }
+    // Boot protocol, idle forever (report only on change).
+    _ = controlTransfer(self, &ep0, slot, 0x21, 0x0B, 0, interface, 0, 0, false) // SET_PROTOCOL boot
+    _ = controlTransfer(self, &ep0, slot, 0x21, 0x0A, 0, interface, 0, 0, false) // SET_IDLE 0
+    const report = frames.allocate()
+    if report == 0 { return }
+    const hid = &self.*.hids[self.*.hidCount]
+    hid.*.present = true
+    hid.*.slot = slot
+    hid.*.kind = @intCast(u8, protocol)
+    hid.*.ring = intring
+    hid.*.report = report
+    hid.*.endpoint = dci
+    var k: usize = 0
+    while k < 8 {
+        hid.*.previous[k] = 0
+        k += 1
+    }
+    self.*.hidCount += 1
+    postReport(self, hid)
+    console.out.write("usb: /devices/")
+    if protocol == 1 { console.out.write("keyboard") } else { console.out.write("mouse") }
+    console.out.write(" (xHCI, slot ")
+    console.out.decimal(slot)
+    console.out.write(")\n")
+}
+
+// Drains the event ring: each HID report decoded and fed to keyboard.mlx
+// or mouse.mlx, the endpoint re-armed. Called from the timer tick.
+pub fn poll() -> void {
+    if !controller.present { return }
+    var event: [4]usize = undefined
+    while controller.pollEvent(&event) {
+        if (event[3] >> 10) & 0x3F != EV_TRANSFER { continue }
+        const slot = (event[3] >> 24) & 0xFF
+        const dci = (event[3] >> 16) & 0x1F
+        var k: usize = 0
+        while k < controller.hidCount {
+            const hid = &controller.hids[k]
+            if hid.*.present && hid.*.slot == slot && hid.*.endpoint == dci {
+                const code = (event[2] >> 24) & 0xFF
+                if code == 1 || code == 13 {
+                    if hid.*.kind == 1 { decodeKeyboard(hid) } else { decodeMouse(hid) }
+                }
+                postReport(&controller, hid)
+            }
+            k += 1
+        }
+    }
+}
+
+// A boot keyboard report (8 bytes): modifiers and up to six keys. Diffed
+// against the previous report to make and break scancodes (Set 1).
+fn decodeKeyboard(hid: *Hid) -> void {
+    const report = Bytes.pointer(layout.Memory.virtual(hid.*.report))
+    // Modifier keys (byte 0): a bit each.
+    var bit: usize = 0
+    while bit < 8 {
+        const now = report[0] & (@intCast(u8, 1) << @intCast(u3, bit))
+        const was = hid.*.previous[0] & (@intCast(u8, 1) << @intCast(u3, bit))
+        if now != was { emitModifier(bit, now != 0) }
+        bit += 1
+    }
+    // The six key slots: a key present now but not before is a press, one
+    // before but not now a release.
+    var i: usize = 2
+    while i < 8 {
+        const key = report[i]
+        if key >= 4 && !inReport(hid.*.previous, key) { emitKey(@intCast(usize, key), true) }
+        i += 1
+    }
+    i = 2
+    while i < 8 {
+        const key = hid.*.previous[i]
+        if key >= 4 && !inReportFrom(report, key) { emitKey(@intCast(usize, key), false) }
+        i += 1
+    }
+    i = 0
+    while i < 8 {
+        hid.*.previous[i] = report[i]
+        i += 1
+    }
+}
+
+fn inReport(previous: [8]u8, key: u8) -> bool {
+    var i: usize = 2
+    while i < 8 {
+        if previous[i] == key { return true }
+        i += 1
+    }
+    return false
+}
+
+fn inReportFrom(report: [*]const u8, key: u8) -> bool {
+    var i: usize = 2
+    while i < 8 {
+        if report[i] == key { return true }
+        i += 1
+    }
+    return false
+}
+
+// A modifier's make/break scancode (Set 1); the right-hand ones and the
+// GUI keys are extended (0xE0-prefixed).
+fn emitModifier(bit: usize, pressed: bool) -> void {
+    var code: u8 = 0
+    var extended = false
+    if bit == 0 {
+        code = 0x1D
+    } else if bit == 1 {
+        code = 0x2A
+    } else if bit == 2 {
+        code = 0x38
+    } else if bit == 3 {
+        code = 0x5B
+        extended = true
+    } else if bit == 4 {
+        code = 0x1D
+        extended = true
+    } else if bit == 5 {
+        code = 0x36
+    } else if bit == 6 {
+        code = 0x38
+        extended = true
+    } else {
+        code = 0x5C
+        extended = true
+    }
+    if extended { keyboard.ps2().push(0xE0) }
+    keyboard.ps2().push(if pressed { code } else { code | 0x80 })
+}
+
+fn emitKey(usage: usize, pressed: bool) -> void {
+    const code = scancode[usage]
+    if code == 0 { return }
+    if extendedKey[usage] != 0 { keyboard.ps2().push(0xE0) }
+    keyboard.ps2().push(if pressed { code } else { code | 0x80 })
+}
+
+// A boot mouse report: buttons, dx, dy (relative, signed). Turned into a
+// standard PS/2 packet (its Y runs the other way) for mouse.mlx.
+fn decodeMouse(hid: *Hid) -> void {
+    const report = Bytes.pointer(layout.Memory.virtual(hid.*.report))
+    const buttons = report[0]
+    const dx = @intCast(i8, report[1])
+    const dy = @intCast(i8, report[2])
+    const psDy = -@intCast(isize, dy)
+    var b0: u8 = 0x08
+    if buttons & 1 != 0 { b0 = b0 | 0x01 }
+    if buttons & 2 != 0 { b0 = b0 | 0x02 }
+    if buttons & 4 != 0 { b0 = b0 | 0x04 }
+    if @intCast(isize, dx) < 0 { b0 = b0 | 0x10 }
+    if psDy < 0 { b0 = b0 | 0x20 }
+    mouse.aux().push(b0)
+    mouse.aux().push(report[1])
+    mouse.aux().push(@intCast(u8, psDy & 0xFF))
+}
+
+// USB HID usage -> Set 1 scancode (0 when unmapped), and which usages are
+// extended (0xE0-prefixed). Filled once at probe.
+var scancode: [256]u8 = undefined // (per run)
+var extendedKey: [256]u8 = undefined // (per run)
+var scanReady: bool = false // (per run)
+
+fn fillScan() -> void {
+    if scanReady { return }
+    var i: usize = 0
+    while i < 256 {
+        scancode[i] = 0
+        extendedKey[i] = 0
+        i += 1
+    }
+    // Letters a..z (usage 0x04..0x1D).
+    const letters = "\x1E\x30\x2E\x20\x12\x21\x22\x23\x17\x24\x25\x26\x32\x31\x18\x19\x10\x13\x1F\x14\x16\x2F\x11\x2D\x15\x2C"
+    i = 0
+    while i < 26 {
+        scancode[0x04 + i] = @intCast(u8, letters[i])
+        i += 1
+    }
+    // Digits 1..9 then 0 (usage 0x1E..0x27).
+    const digits = "\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B"
+    i = 0
+    while i < 10 {
+        scancode[0x1E + i] = @intCast(u8, digits[i])
+        i += 1
+    }
+    scancode[0x28] = 0x1C // enter
+    scancode[0x29] = 0x01 // escape
+    scancode[0x2A] = 0x0E // backspace
+    scancode[0x2B] = 0x0F // tab
+    scancode[0x2C] = 0x39 // space
+    scancode[0x2D] = 0x0C // -
+    scancode[0x2E] = 0x0D // =
+    scancode[0x2F] = 0x1A // [
+    scancode[0x30] = 0x1B // ]
+    scancode[0x31] = 0x2B // backslash
+    scancode[0x33] = 0x27 // ;
+    scancode[0x34] = 0x28 // '
+    scancode[0x35] = 0x29 // `
+    scancode[0x36] = 0x33 // ,
+    scancode[0x37] = 0x34 // .
+    scancode[0x38] = 0x35 // /
+    scancode[0x39] = 0x3A // caps lock
+    // F1..F10 (0x3A..0x43), F11, F12.
+    i = 0
+    while i < 10 {
+        scancode[0x3A + i] = @intCast(u8, 0x3B + i)
+        i += 1
+    }
+    scancode[0x44] = 0x57 // F11
+    scancode[0x45] = 0x58 // F12
+    // The navigation block: extended, 0xE0-prefixed.
+    scancode[0x49] = 0x52
+    extendedKey[0x49] = 1 // insert
+    scancode[0x4A] = 0x47
+    extendedKey[0x4A] = 1 // home
+    scancode[0x4B] = 0x49
+    extendedKey[0x4B] = 1 // page up
+    scancode[0x4C] = 0x53
+    extendedKey[0x4C] = 1 // delete
+    scancode[0x4D] = 0x4F
+    extendedKey[0x4D] = 1 // end
+    scancode[0x4E] = 0x51
+    extendedKey[0x4E] = 1 // page down
+    scancode[0x4F] = 0x4D
+    extendedKey[0x4F] = 1 // right
+    scancode[0x50] = 0x4B
+    extendedKey[0x50] = 1 // left
+    scancode[0x51] = 0x50
+    extendedKey[0x51] = 1 // down
+    scancode[0x52] = 0x48
+    extendedKey[0x52] = 1 // up
+    scanReady = true
+}
+
+// Maps the 2 MiB page holding `physical` uncached in the kernel's view (as
+// the AHCI/NVMe/igb mappings do); false when memory is out.
+fn mapDeviceUncached(physical: usize) -> bool {
+    const pdpt = Bytes.pointer(layout.Memory.virtual(layout.Memory.BLOB + layout.Blob.PDPT))
+    const slot = (physical >> 30) & 511
+    if Bytes.read64(pdpt, slot * 8) & 1 == 0 {
+        const directory = memory.allFrames().allocate()
+        if directory == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(directory), Page.SIZE / 8)
+        Bytes.write64(pdpt, slot * 8, directory | 0x3)
+    }
+    const directory = Bytes.read64(pdpt, slot * 8) & Page.ADDRESS
+    const twoMiB = (physical >> 21) << 21
+    Bytes.write64(Bytes.pointer(layout.Memory.virtual(directory)), ((physical >> 21) & 511) * 8, twoMiB | 0x83 | 0x18)
+    return true
+}
+
+// The first xHCI controller, brought up, its ports enumerated; whether
+// there is one. (Enumeration in a separate step below.)
+pub fn probe() -> bool {
+    controller.present = false
+    controller.hidCount = 0
+    const address = Pci.findClass(0x0C0330, 0xFFFFFF, 0)
+    if address == Pci.NONE { return false }
+    Pci.enableMemory(address)
+    const base = Pci.memBase(address, 0)
+    if base == 0 { return false }
+    if !mapDeviceUncached(base) { return false }
+    controller.regs = layout.Memory.virtual(base)
+    if !controller.start() { return false }
+    controller.present = true
+    enumerate(&controller)
+    return true
+}
