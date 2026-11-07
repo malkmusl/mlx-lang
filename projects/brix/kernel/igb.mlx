@@ -1,0 +1,269 @@
+// An Intel Gigabit (igb) network device, for real hardware (a Supermicro
+// H11's on-board Intel i210, or QEMU's `-device igb`) where virtio-net is
+// not there. The controller is a PCI device of Ethernet class with an
+// Intel igb-family device id; its registers are a memory BAR (BAR0),
+// mapped uncached like the AHCI/NVMe ones. Legacy receive and transmit
+// descriptor rings in memory of our own, each with its buffers; frames are
+// polled (no interrupt), driven by the timer tick and the boot self-test.
+// Presented through netdev.mlx as the one network device.
+const layout = @import("./../layout.mlx")
+const memory = @import("./memory.mlx")
+const Pci = @import("./pci.mlx").Pci
+const Bytes = @import("./bytes.mlx").Bytes
+const stack = @import("./net/stack.mlx")
+const Page = memory.Page
+
+pub const NO_IRQ: usize = 0xFF
+
+// Registers (BAR0, bytes).
+const CTRL: usize = 0x0000
+const STATUS: usize = 0x0008
+const ICR: usize = 0x1500
+const IMC: usize = 0x150C
+const RCTL: usize = 0x0100
+const TCTL: usize = 0x0400
+const TIPG: usize = 0x0410
+const RDBAL: usize = 0xC000
+const RDBAH: usize = 0xC004
+const RDLEN: usize = 0xC008
+const RDH: usize = 0xC010
+const RDT: usize = 0xC018
+const SRRCTL: usize = 0xC00C
+const RXDCTL: usize = 0xC028
+const TDBAL: usize = 0xE000
+const TDBAH: usize = 0xE004
+const TDLEN: usize = 0xE008
+const TDH: usize = 0xE010
+const TDT: usize = 0xE018
+const TXDCTL: usize = 0xE028
+const RAL0: usize = 0x5400
+const RAH0: usize = 0x5404
+// CTRL bits.
+const CTRL_SLU: u32 = 0x40
+const CTRL_ASDE: u32 = 0x20
+const CTRL_RST: u32 = 0x04000000
+// RCTL bits: enable, broadcast accept, strip CRC (buffer size 2048 = 0).
+const RCTL_EN: u32 = 0x02
+const RCTL_BAM: u32 = 0x8000
+const RCTL_SECRC: u32 = 0x04000000
+// TCTL: enable, pad short packets, a collision threshold and distance.
+const TCTL_VALUE: u32 = 0x0003F0FA
+// Queue enable bit in RXDCTL/TXDCTL.
+const QUEUE_ENABLE: u32 = 0x02000000
+// Legacy descriptor status/command.
+const DD: u8 = 0x01
+const TX_CMD: u8 = 0x0B // EOP | IFCS | RS
+
+pub const RX_COUNT: usize = 16
+pub const TX_COUNT: usize = 16
+pub const BUFFER: usize = 2048
+pub const MAX_FRAME: usize = 1514
+
+const PATIENCE: usize = 100000000
+
+pub const Igb = struct {
+    present: bool
+    irq: usize
+    mac: [6]u8
+    regs: usize
+    // The descriptor rings and the buffers, all physical (the device does
+    // DMA to them).
+    rxRing: usize
+    txRing: usize
+    rxBuffers: usize
+    txBuffers: usize
+    rxNext: usize
+    txNext: usize
+    received: usize
+    sent: usize
+
+    fn reg(self: *const Self, offset: usize) -> *u32 {
+        return unsafe { @ptrFromInt(*u32, self.*.regs + offset) }
+    }
+
+    fn rxDesc(self: *const Self, k: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.rxRing) + k * 16) }
+    fn txDesc(self: *const Self, k: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.txRing) + k * 16) }
+    fn rxBuffer(self: *const Self, k: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.rxBuffers + k * BUFFER)) }
+    fn txBuffer(self: *const Self, k: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(self.*.txBuffers + k * BUFFER)) }
+
+    // Reads the MAC and brings the receive and transmit rings up. False
+    // when memory is out. (No MAC reset: on this controller a CTRL.RST
+    // drops the link, and the firmware/NVM has already brought it up.)
+    fn start(self: *Self) -> bool {
+        // Receive and transmit off while we set the rings up, interrupts
+        // off (we poll), the cause register cleared.
+        self.reg(RCTL).* = 0
+        self.reg(TCTL).* = 0
+        self.reg(IMC).* = 0xFFFFFFFF
+        _ = self.reg(ICR).*
+        self.reg(CTRL).* = self.reg(CTRL).* | CTRL_SLU | CTRL_ASDE
+        // The MAC from the first receive address register.
+        const low = self.reg(RAL0).*
+        const high = self.reg(RAH0).*
+        self.*.mac[0] = @intCast(u8, low & 0xFF)
+        self.*.mac[1] = @intCast(u8, (low >> 8) & 0xFF)
+        self.*.mac[2] = @intCast(u8, (low >> 16) & 0xFF)
+        self.*.mac[3] = @intCast(u8, (low >> 24) & 0xFF)
+        self.*.mac[4] = @intCast(u8, high & 0xFF)
+        self.*.mac[5] = @intCast(u8, (high >> 8) & 0xFF)
+        const frames = memory.allFrames()
+        self.*.rxRing = frames.allocate()
+        self.*.txRing = frames.allocate()
+        self.*.rxBuffers = frames.allocateContiguous(RX_COUNT * BUFFER / Page.SIZE)
+        self.*.txBuffers = frames.allocateContiguous(TX_COUNT * BUFFER / Page.SIZE)
+        if self.*.rxRing == 0 || self.*.txRing == 0 || self.*.rxBuffers == 0 || self.*.txBuffers == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(self.*.rxRing), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.txRing), Page.SIZE / 8)
+        // Receive descriptors (advanced, one buffer each): the packet
+        // buffer address, the header address zero, the written-back status
+        // cleared.
+        var k: usize = 0
+        while k < RX_COUNT {
+            Bytes.write64(self.rxDesc(k), 0, self.*.rxBuffers + k * BUFFER)
+            Bytes.write64(self.rxDesc(k), 8, 0)
+            k += 1
+        }
+        self.reg(RDBAL).* = @intCast(u32, self.*.rxRing & 0xFFFFFFFF)
+        self.reg(RDBAH).* = @intCast(u32, self.*.rxRing >> 32)
+        self.reg(RDLEN).* = @intCast(u32, RX_COUNT * 16)
+        // Advanced one-buffer descriptors (DESCTYPE 001), 2 KiB buffers.
+        self.reg(SRRCTL).* = 0x02000000 | 2
+        self.reg(RXDCTL).* = QUEUE_ENABLE
+        self.reg(RDH).* = 0
+        self.reg(RDT).* = @intCast(u32, RX_COUNT - 1)
+        self.reg(RCTL).* = RCTL_EN | RCTL_BAM | RCTL_SECRC
+        self.*.rxNext = 0
+        // Transmit descriptors start "done" so the first use of each slot
+        // sees it free.
+        k = 0
+        while k < TX_COUNT {
+            self.txDesc(k)[12] = DD
+            k += 1
+        }
+        self.reg(TDBAL).* = @intCast(u32, self.*.txRing & 0xFFFFFFFF)
+        self.reg(TDBAH).* = @intCast(u32, self.*.txRing >> 32)
+        self.reg(TDLEN).* = @intCast(u32, TX_COUNT * 16)
+        self.reg(TDH).* = 0
+        self.reg(TDT).* = 0
+        self.reg(TXDCTL).* = QUEUE_ENABLE | 0x00010000 // enable, WTHRESH 1
+        self.reg(TIPG).* = 0x00602008
+        self.reg(TCTL).* = TCTL_VALUE
+        self.*.txNext = 0
+        self.*.received = 0
+        self.*.sent = 0
+        self.*.irq = NO_IRQ
+        self.*.present = true
+        return true
+    }
+
+    // `frame` (`length` bytes) to the wire; false when the slot is still in
+    // flight or the frame is too big.
+    pub fn transmit(self: *Self, frame: [*]const u8, length: usize) -> bool {
+        if !self.*.present || length > MAX_FRAME { return false }
+        const slot = self.*.txNext
+        const desc = self.txDesc(slot)
+        var tries: usize = 0
+        while desc[12] & DD == 0 {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        const into = self.txBuffer(slot)
+        Bytes.copy(into, frame, length)
+        var total = length
+        if total < 60 {
+            Bytes.fill(Bytes.pointer(@intFromPtr(into) + total), 60 - total, 0)
+            total = 60
+        }
+        Bytes.write64(desc, 0, self.*.txBuffers + slot * BUFFER)
+        Bytes.write16(desc, 8, total)
+        desc[10] = 0
+        desc[11] = TX_CMD
+        desc[12] = 0
+        desc[13] = 0
+        Bytes.write16(desc, 14, 0)
+        self.*.txNext = (slot + 1) % TX_COUNT
+        self.reg(TDT).* = @intCast(u32, self.*.txNext)
+        self.*.sent += 1
+        return true
+    }
+
+    // The frames the device received, to the stack; their descriptors
+    // handed back.
+    pub fn receive(self: *Self) -> void {
+        if !self.*.present { return }
+        while true {
+            const slot = self.*.rxNext
+            const desc = self.rxDesc(slot)
+            // Advanced writeback: the extended status (DD at bit 0) is at
+            // offset 8, the packet length at offset 12.
+            if Bytes.read32(desc, 8) & 1 == 0 { return }
+            const length = Bytes.read16(desc, 12)
+            if length > 0 && length <= BUFFER {
+                self.*.received += 1
+                stack.receive(self.rxBuffer(slot), length)
+            }
+            // Hand the descriptor back: the buffer address again, header
+            // address and status cleared.
+            Bytes.write64(desc, 0, self.*.rxBuffers + slot * BUFFER)
+            Bytes.write64(desc, 8, 0)
+            self.reg(RDT).* = @intCast(u32, slot)
+            self.*.rxNext = (slot + 1) % RX_COUNT
+        }
+    }
+
+    // Polled, so it never claims the line's interrupt.
+    pub fn interrupted(self: *Self) -> bool { return false }
+}
+
+var first: Igb = undefined // (per run)
+
+pub fn device() -> *Igb { return &first }
+
+// An Intel igb-family Ethernet device id (82575/82576, i210/i211, i350).
+fn isIgb(device: usize) -> bool {
+    return device == 0x10C9 || device == 0x10E6 || device == 0x10E7 || device == 0x10E8 ||
+        device == 0x1526 || device == 0x150A || device == 0x1518 || device == 0x10A7 ||
+        device == 0x10A9 || device == 0x10D6 || device == 0x1533 || device == 0x1536 ||
+        device == 0x1537 || device == 0x1538 || device == 0x157B || device == 0x157C ||
+        device == 0x1539 || device == 0x1521 || device == 0x1522 || device == 0x1523 ||
+        device == 0x1524
+}
+
+// Maps the 2 MiB page holding `physical` uncached in the kernel's view (as
+// the AHCI/NVMe mappings do); false when memory is out.
+fn mapDeviceUncached(physical: usize) -> bool {
+    const pdpt = Bytes.pointer(layout.Memory.virtual(layout.Memory.BLOB + layout.Blob.PDPT))
+    const slot = (physical >> 30) & 511
+    if Bytes.read64(pdpt, slot * 8) & 1 == 0 {
+        const directory = memory.allFrames().allocate()
+        if directory == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(directory), Page.SIZE / 8)
+        Bytes.write64(pdpt, slot * 8, directory | 0x3)
+    }
+    const directory = Bytes.read64(pdpt, slot * 8) & Page.ADDRESS
+    const twoMiB = (physical >> 21) << 21
+    Bytes.write64(Bytes.pointer(layout.Memory.virtual(directory)), ((physical >> 21) & 511) * 8, twoMiB | 0x83 | 0x18)
+    return true
+}
+
+// The first Intel igb Ethernet controller, made ready; whether there is
+// one.
+pub fn probe() -> bool {
+    first.present = false
+    var n: usize = 0
+    while n < 64 {
+        const address = Pci.findClass(0x020000, 0xFFFFFF, n)
+        n += 1
+        if address == Pci.NONE { return false }
+        const id = Pci.read(address, 0)
+        if id & 0xFFFF != 0x8086 { continue }
+        if !isIgb((id >> 16) & 0xFFFF) { continue }
+        Pci.enableMemory(address)
+        const base = Pci.memBase(address, 0)
+        if base == 0 { continue }
+        if !mapDeviceUncached(base) { continue }
+        first.regs = layout.Memory.virtual(base)
+        if first.start() { return true }
+    }
+    return false
+}
