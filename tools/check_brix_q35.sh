@@ -7,11 +7,12 @@
 # class, the ground the real-hardware drivers stand on; ACPI and SMP still
 # bring up the second processor on the new chipset.
 #
-# Then the real test of the AHCI (SATA) driver (ahci.mlx): the disk on the
-# AHCI controller is /devices/disk0; it is formatted as a brixfs volume, a
-# file is written and committed (WRITE_DMA_EXT and FLUSH_EXT), and after
-# another boot that file is read back (READ_DMA_EXT) -- the disk driven by
-# AHCI, not virtio.
+# Then the real test of the real-hardware disk drivers: the disk on the
+# AHCI controller is /devices/disk0 (ahci.mlx) and the NVMe namespace is
+# /devices/disk1 (nvme.mlx). Each is formatted as a brixfs volume and a
+# file written and committed (the write and flush paths), and after
+# another boot both files are read back (the read path) -- the system on
+# the SATA disk, a file on the NVMe one, neither driven by virtio.
 #
 #   tools/check_brix_q35.sh [compiler]
 set -euo pipefail
@@ -43,9 +44,11 @@ for program in ls cat sync echo cp mkdir chmod; do
 done
 "$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "brixfs=$work/brixfs" "install=projects/brix/tools/install.sh" "$work/bin/"
 truncate -s 64M "$work/disk.img"
+truncate -s 128M "$work/nvme.img"
 echo "ok   the kernel and a Q35 boot image build"
 
-# The disk sits on the Q35 machine's built-in AHCI controller (ide.0).
+# disk0 sits on the Q35 machine's built-in AHCI controller (ide.0); disk1
+# is an NVMe namespace.
 boot() {
     rm -f "$work/input"
     mkfifo "$work/input"
@@ -53,6 +56,7 @@ boot() {
     qemu-system-x86_64 -machine q35 -m 1G -smp 2 -cpu max -display none -monitor none -no-reboot \
         -serial stdio -kernel "$work/brix.img" \
         -drive id=d0,file="$work/disk.img",format=raw,if=none -device ide-hd,drive=d0,bus=ide.0 \
+        -drive id=nvm,file="$work/nvme.img",format=raw,if=none -device nvme,serial=brixnvme,drive=nvm \
         -device igb -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
         < "$work/input" > "$work/serial.txt" 2>&1 &
     qemu_pid=$!
@@ -94,26 +98,30 @@ grep -qE '^pci: [0-9a-f:.]+ .* 0x20000 Ethernet$' <(output) || fail "the Etherne
 grep -qE '^pci: [0-9a-f:.]+ .* 0xc0330 xHCI$' <(output) || fail "the xHCI (USB) controller was not enumerated"
 echo "ok   PCI enumerates the AHCI, Ethernet and xHCI controllers by class across the buses"
 
-# The disk on the AHCI controller is /devices/disk0, driven by AHCI.
+# disk0 on the AHCI controller, disk1 the NVMe namespace, each by its driver.
 wait_for '^brixOS: /devices/disk0, 65536 KiB (AHCI)$'
-echo "ok   the SATA disk is /devices/disk0, driven by the AHCI driver"
+wait_for '^brixOS: /devices/disk1, 131072 KiB (NVMe)$'
+echo "ok   the SATA disk is /devices/disk0 (AHCI) and the NVMe namespace is /devices/disk1 (NVMe)"
 
-# Format it, install the system, write a file, commit it: the AHCI driver's
-# write path (WRITE_DMA_EXT) and flush (FLUSH_EXT).
-type_line 'brixfs format /devices/disk0 && install && echo hello-ahci > /volumes/disk0/note && sync && echo written'
+# Format both, install the system on disk0, write a file on each, commit:
+# the AHCI and NVMe write and flush paths.
+type_line 'brixfs format /devices/disk0 && brixfs format /devices/disk1 && install && echo hello-ahci > /volumes/disk0/note && echo hello-nvme > /volumes/disk1/note && sync && echo written'
 wait_for '^brixfs: mounted at /volumes/disk0$'
+wait_for '^brixfs: mounted at /volumes/disk1$'
 wait_for '^installed on /volumes/disk0: it is the system from the next boot on$'
 wait_for '^written$'
 stop
-echo "ok   the AHCI disk is formatted, the system installed and a file committed"
+echo "ok   both disks formatted, the system installed on the SATA disk and a file committed on each"
 
-# Second boot: the file is read back off the AHCI disk (READ_DMA_EXT), and
-# the system itself now comes from it.
+# Second boot: the files are read back (the AHCI and NVMe read paths), and
+# the system itself now comes from the SATA disk.
 boot
 wait_for '^brixOS: /volumes/disk0 (brixfs, generation [0-9]*)$'
+wait_for '^brixOS: /volumes/disk1 (brixfs, generation [0-9]*)$'
 wait_for '^brixOS: / from /volumes/disk0'
-type_line 'cat /volumes/disk0/note'
+type_line 'cat /volumes/disk0/note /volumes/disk1/note'
 wait_for '^hello-ahci$'
+wait_for '^hello-nvme$'
 stop
-echo "ok   after another boot the file is read back off the AHCI disk and the system boots from it"
-echo "PASS brixOS on Q35: ACPI/SMP, PCI enumeration, and a brixfs volume on the SATA (AHCI) disk"
+echo "ok   after another boot both files are read back and the system boots from the SATA disk"
+echo "PASS brixOS on Q35: ACPI/SMP, PCI enumeration, and brixfs volumes on the SATA (AHCI) and NVMe disks"

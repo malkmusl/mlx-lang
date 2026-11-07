@@ -1,0 +1,319 @@
+// NVMe disks, for real hardware (a Supermicro H11's M.2/U.2 slots, or
+// QEMU's -device nvme) where neither virtio-blk nor AHCI is there. The
+// controller is a PCI device of class 01:08:02; its registers are a
+// 64-bit memory BAR (BAR0), mapped uncached like the AHCI ABAR. One admin
+// queue and one I/O queue, each a small ring in memory of our own, all
+// polled (no interrupt yet): a command is written to the submission
+// queue's tail, its doorbell rung, and the completion queue's head
+// watched for the matching phase. Data passes through a bounce buffer, as
+// AHCI and virtio do; PRP1/PRP2 (and a PRP list for a transfer over two
+// pages) point the controller at it.
+const Pci = @import("./pci.mlx").Pci
+const memory = @import("./memory.mlx")
+const layout = @import("../layout.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const Status = @import("./status.mlx").Status
+const Page = memory.Page
+
+// A transfer's most bytes (the bounce buffer: BUFFER_PAGES pages).
+const BUFFER_PAGES: usize = 8
+
+// Controller registers.
+const CAP: usize = 0x00
+const CAP_HIGH: usize = 0x04
+const CC: usize = 0x14
+const CSTS: usize = 0x1C
+const AQA: usize = 0x24
+const ASQ: usize = 0x28
+const ACQ: usize = 0x30
+const DOORBELLS: usize = 0x1000
+// CC: EN (bit 0), IOSQES = 6 (64 bytes) at 16, IOCQES = 4 (16 bytes) at 20.
+const CC_ENABLE: u32 = 0x00460001
+// CSTS bits.
+const CSTS_RDY: u32 = 0x1
+const CSTS_CFS: u32 = 0x2
+// Admin opcodes.
+const ADMIN_CREATE_SQ: usize = 0x01
+const ADMIN_CREATE_CQ: usize = 0x05
+const ADMIN_IDENTIFY: usize = 0x06
+// NVM (I/O) opcodes.
+const NVM_FLUSH: usize = 0x00
+const NVM_WRITE: usize = 0x01
+const NVM_READ: usize = 0x02
+
+const QUEUE_SIZE: usize = 8
+const PATIENCE: usize = 100000000
+
+// A submission/completion queue pair: the two rings (physical), the
+// queue's id, and where we are in each ring (the completion phase flips
+// every time the head wraps).
+const Queue = struct {
+    sq: usize
+    cq: usize
+    id: usize
+    size: usize
+    tail: usize
+    head: usize
+    phase: usize
+}
+
+pub const NvmeDisk = struct {
+    present: bool
+    index: usize
+    // The register block in the kernel's view, and the doorbell stride.
+    regs: usize
+    stride: usize
+    blockSize: usize
+    capacity: usize // in logical blocks
+    readOnly: bool
+    admin: Queue
+    io: Queue
+    // The four queue rings, the bounce buffer and a PRP list page, all
+    // physical (the controller does DMA to them).
+    buffer: usize
+    prpList: usize
+    cid: usize
+
+    fn reg(self: *const Self, offset: usize) -> *u32 {
+        return unsafe { @ptrFromInt(*u32, self.*.regs + offset) }
+    }
+
+    fn write64Reg(self: *const Self, offset: usize, value: usize) -> void {
+        self.reg(offset).* = @intCast(u32, value & 0xFFFFFFFF)
+        self.reg(offset + 4).* = @intCast(u32, value >> 32)
+    }
+
+    // A queue's submission tail (or completion head) doorbell.
+    fn doorbell(self: *const Self, qid: usize, completion: bool) -> *u32 {
+        const index = 2 * qid + (if completion { 1 } else { 0 })
+        return unsafe { @ptrFromInt(*u32, self.*.regs + DOORBELLS + index * self.*.stride) }
+    }
+
+    // Puts a 64-byte command on `q`'s submission ring, rings its doorbell,
+    // and waits for the completion with the matching phase. Whether the
+    // controller finished it without error.
+    fn submit(self: *Self, q: *Queue, opcode: usize, nsid: usize, prp1: usize, prp2: usize, cdw10: usize, cdw11: usize, cdw12: usize) -> bool {
+        self.*.cid += 1
+        const entry = Bytes.pointer(layout.Memory.virtual(q.*.sq) + q.*.tail * 64)
+        Bytes.fill(entry, 64, 0)
+        Bytes.write32(entry, 0, opcode | ((self.*.cid & 0xFFFF) << 16))
+        Bytes.write32(entry, 4, nsid)
+        Bytes.write64(entry, 24, prp1)
+        Bytes.write64(entry, 32, prp2)
+        Bytes.write32(entry, 40, cdw10)
+        Bytes.write32(entry, 44, cdw11)
+        Bytes.write32(entry, 48, cdw12)
+        q.*.tail = (q.*.tail + 1) % q.*.size
+        self.doorbell(q.*.id, false).* = @intCast(u32, q.*.tail)
+        // Watch the completion at the head until its phase flips to ours.
+        const cqe = Bytes.pointer(layout.Memory.virtual(q.*.cq) + q.*.head * 16)
+        var polls: usize = 0
+        while (Bytes.read32(cqe, 12) >> 16) & 1 != q.*.phase {
+            polls += 1
+            if polls > PATIENCE { return false }
+        }
+        const status = (Bytes.read32(cqe, 12) >> 17) & 0x7FFF
+        q.*.head = (q.*.head + 1) % q.*.size
+        if q.*.head == 0 { q.*.phase = q.*.phase ^ 1 }
+        self.doorbell(q.*.id, true).* = @intCast(u32, q.*.head)
+        return status == 0
+    }
+
+    // Brings the controller up: resets it, sets the admin queue, enables
+    // it, and creates the one I/O queue. False when it does not come ready.
+    fn start(self: *Self) -> bool {
+        self.*.stride = 4 << @intCast(u6, self.reg(CAP_HIGH).* & 0xF)
+        var size = @intCast(usize, self.reg(CAP).* & 0xFFFF) + 1
+        if size > QUEUE_SIZE { size = QUEUE_SIZE }
+        // Disable, and wait for it to go not-ready.
+        self.reg(CC).* = self.reg(CC).* & @intCast(u32, 0xFFFFFFFF ^ 1)
+        var tries: usize = 0
+        while self.reg(CSTS).* & CSTS_RDY != 0 {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        const frames = memory.allFrames()
+        self.*.admin.sq = frames.allocate()
+        self.*.admin.cq = frames.allocate()
+        self.*.io.sq = frames.allocate()
+        self.*.io.cq = frames.allocate()
+        self.*.buffer = frames.allocateContiguous(BUFFER_PAGES)
+        self.*.prpList = frames.allocate()
+        if self.*.admin.sq == 0 || self.*.admin.cq == 0 || self.*.io.sq == 0 || self.*.io.cq == 0 || self.*.buffer == 0 || self.*.prpList == 0 { return false }
+        self.*.admin.id = 0
+        self.*.admin.size = size
+        self.*.admin.tail = 0
+        self.*.admin.head = 0
+        self.*.admin.phase = 1
+        self.*.io.id = 1
+        self.*.io.size = size
+        self.*.io.tail = 0
+        self.*.io.head = 0
+        self.*.io.phase = 1
+        Bytes.zeroWords(layout.Memory.virtual(self.*.admin.sq), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.admin.cq), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.io.sq), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.io.cq), Page.SIZE / 8)
+        // The admin queue sizes and rings, then enable.
+        self.reg(AQA).* = @intCast(u32, ((size - 1) << 16) | (size - 1))
+        self.write64Reg(ASQ, self.*.admin.sq)
+        self.write64Reg(ACQ, self.*.admin.cq)
+        self.reg(CC).* = CC_ENABLE
+        tries = 0
+        while self.reg(CSTS).* & CSTS_RDY == 0 {
+            if self.reg(CSTS).* & CSTS_CFS != 0 { return false }
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        // The I/O completion queue, then its submission queue (physically
+        // contiguous, bound to that completion queue).
+        const qid: usize = 1
+        const sizeField = ((size - 1) << 16) | qid
+        if !self.submit(&self.*.admin, ADMIN_CREATE_CQ, 0, self.*.io.cq, 0, sizeField, 1, 0) { return false }
+        if !self.submit(&self.*.admin, ADMIN_CREATE_SQ, 0, self.*.io.sq, 0, sizeField, (qid << 16) | 1, 0) { return false }
+        return self.identify()
+    }
+
+    // IDENTIFY the first namespace: its size in logical blocks and the
+    // size of a block.
+    fn identify(self: *Self) -> bool {
+        if !self.submit(&self.*.admin, ADMIN_IDENTIFY, 1, self.*.buffer, 0, 0, 0, 0) { return false }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        const blocks = Bytes.read64(data, 0)
+        if blocks == 0 { return false }
+        // LBA format: the index in FLBAS (byte 26) picks a format at byte
+        // 128 + i*4; its LBADS (byte 2 of that) is log2 the block size.
+        const format = @intCast(usize, data[26]) & 0xF
+        const lbads = (Bytes.read32(data, 128 + format * 4) >> 16) & 0xFF
+        var blockSize: usize = @intCast(usize, 1) << @intCast(u6, lbads)
+        if blockSize < 512 { blockSize = 512 }
+        self.*.blockSize = blockSize
+        self.*.capacity = blocks
+        self.*.readOnly = false
+        self.*.present = true
+        return true
+    }
+
+    // A read or write of `blocks` logical blocks at `lba`, through the
+    // bounce buffer: PRP1 is its first page, PRP2 the second or a PRP list
+    // of the rest.
+    fn transfer(self: *Self, writing: bool, lba: usize, blocks: usize) -> bool {
+        const bytes = blocks * self.*.blockSize
+        const pages = (bytes + Page.SIZE - 1) / Page.SIZE
+        var prp2: usize = 0
+        if pages == 2 {
+            prp2 = self.*.buffer + Page.SIZE
+        } else if pages > 2 {
+            const list = Bytes.pointer(layout.Memory.virtual(self.*.prpList))
+            var k: usize = 1
+            while k < pages {
+                Bytes.write64(list, (k - 1) * 8, self.*.buffer + k * Page.SIZE)
+                k += 1
+            }
+            prp2 = self.*.prpList
+        }
+        const opcode = if writing { NVM_WRITE } else { NVM_READ }
+        return self.submit(&self.*.io, opcode, 1, self.*.buffer, prp2, lba & 0xFFFFFFFF, lba >> 32, (blocks - 1) & 0xFFFF)
+    }
+
+    pub fn sizeInBytes(self: *const Self) -> usize { return self.*.capacity * self.*.blockSize }
+
+    pub fn flush(self: *Self) -> bool { return self.submit(&self.*.io, NVM_FLUSH, 1, 0, 0, 0, 0, 0) }
+
+    fn maxBlocks(self: *const Self) -> usize { return BUFFER_PAGES * Page.SIZE / self.*.blockSize }
+
+    pub fn read(self: *Self, offset: usize, into: [*]u8, length: usize) -> isize {
+        const size = self.sizeInBytes()
+        if offset >= size { return 0 }
+        const total = if length > size - offset { size - offset } else { length }
+        const block = self.*.blockSize
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const lba = at / block
+            const within = at % block
+            var blocks = (within + total - done + block - 1) / block
+            if blocks > self.maxBlocks() { blocks = self.maxBlocks() }
+            if !self.transfer(false, lba, blocks) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            var chunk = blocks * block - within
+            if chunk > total - done { chunk = total - done }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(into) + done) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(data) + within) }, chunk)
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+
+    pub fn write(self: *Self, offset: usize, from: [*]const u8, length: usize) -> isize {
+        if self.*.readOnly { return Status.read_only }
+        const size = self.sizeInBytes()
+        if offset >= size { return if length == 0 { 0 } else { Status.no_space } }
+        const total = if length > size - offset { size - offset } else { length }
+        const block = self.*.blockSize
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const lba = at / block
+            const within = at % block
+            var blocks = (within + total - done + block - 1) / block
+            if blocks > self.maxBlocks() { blocks = self.maxBlocks() }
+            var chunk = blocks * block - within
+            if chunk > total - done { chunk = total - done }
+            // A block written in part keeps the rest of its bytes.
+            if (within != 0 || chunk % block != 0) && !self.transfer(false, lba, blocks) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(data) + within) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(from) + done) }, chunk)
+            if !self.transfer(true, lba, blocks) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+}
+
+pub const MAX_DISKS: usize = 4
+var disks: [MAX_DISKS]NvmeDisk = undefined // (per run)
+var diskCount: usize = 0 // (per run)
+
+pub fn count() -> usize { return diskCount }
+pub fn diskAt(index: usize) -> *NvmeDisk { return &disks[index] }
+
+// Maps the 2 MiB page holding `physical` uncached in the kernel's view (a
+// page directory under the boot PDPT for its GiB, as the AHCI mapping and
+// the local APIC's do); false when memory is out.
+fn mapDeviceUncached(physical: usize) -> bool {
+    const pdpt = Bytes.pointer(layout.Memory.virtual(layout.Memory.BLOB + layout.Blob.PDPT))
+    const slot = (physical >> 30) & 511
+    if Bytes.read64(pdpt, slot * 8) & 1 == 0 {
+        const directory = memory.allFrames().allocate()
+        if directory == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(directory), Page.SIZE / 8)
+        Bytes.write64(pdpt, slot * 8, directory | 0x3)
+    }
+    const directory = Bytes.read64(pdpt, slot * 8) & Page.ADDRESS
+    const twoMiB = (physical >> 21) << 21
+    // Present, writable, a 2 MiB page, write-through, cache-disabled.
+    Bytes.write64(Bytes.pointer(layout.Memory.virtual(directory)), ((physical >> 21) & 511) * 8, twoMiB | 0x83 | 0x18)
+    return true
+}
+
+// Every NVMe controller's first namespace, made ready: how many disks.
+pub fn probeAll() -> usize {
+    diskCount = 0
+    var n: usize = 0
+    while diskCount < MAX_DISKS {
+        const address = Pci.findClass(0x010802, 0xFFFFFF, n)
+        n += 1
+        if address == Pci.NONE { break }
+        Pci.enableMemory(address)
+        const base = Pci.memBase(address, 0)
+        if base == 0 { continue }
+        if !mapDeviceUncached(base) { continue }
+        const disk = &disks[diskCount]
+        disk.*.present = false
+        disk.*.index = diskCount
+        disk.*.regs = layout.Memory.virtual(base)
+        disk.*.cid = 0
+        if disk.start() { diskCount += 1 }
+    }
+    return diskCount
+}
