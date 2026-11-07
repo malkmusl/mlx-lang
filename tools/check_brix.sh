@@ -140,7 +140,7 @@ type_to_program() {
 
 wait_for '^brixOS: kernel at 0x200000'
 wait_for '^brixOS: [0-9]* MiB ([0-9]* free), [0-9]* MHz$'
-wait_for '^brixOS: /devices/disk0, 4096 KiB (virtio, IRQ [0-9]*)$'
+wait_for '^brixOS: /devices/disk0, 4096 KiB (virtio)$'
 wait_for '^brixOS: disk0 answers by interrupt$'
 echo "ok   the kernel boots and says itself on the serial line"
 

@@ -108,7 +108,7 @@ boot
 wait_for '^brixOS: /volumes/disk0 (brixfs, generation [0-9]*)$'
 wait_for '^brixOS: /volumes/disk1 (brixfs, generation [0-9]*)$'
 wait_for '^brixOS: / from /volumes/disk0 (the boot archive at /volumes/boot)$'
-wait_for '^brixOS: /devices/disk3, 4096 KiB (virtio, IRQ [0-9]*, partitioned)$'
+wait_for '^brixOS: /devices/disk3, 4096 KiB (virtio, partitioned)$'
 wait_for '^brixOS: /devices/disk3p1, 2048 KiB (a partition)$'
 wait_for '^brixOS: /devices/disk3p2, 1024 KiB (a partition)$'
 type_line 'cat /volumes/disk1/note; cat /volumes/disk2/hello.txt; echo $(stat -c %i /system) $(stat -c %i /volumes/disk0/system); snapshot -r /volumes/disk1 /volumes/kept && echo third > /volumes/disk1/note; ls /volumes; cat /volumes/kept/note; snapshot -d /volumes/kept; sync; echo done'

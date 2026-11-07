@@ -1,0 +1,293 @@
+// AHCI (SATA) disks, for real hardware (a Supermicro H11's on-board SATA,
+// or QEMU's q35 ich9-ahci) where virtio-blk is not there. The controller
+// is a PCI device of class 01:06:01; its registers are a memory BAR
+// (ABAR, BAR5), mapped uncached like the local APIC's. One command slot
+// per port is used, one request at a time, polled (no interrupt yet): a
+// command list, a received-FIS area and a command table in memory of our
+// own, a bounce page the data passes through, as virtio does.
+const Pci = @import("./pci.mlx").Pci
+const memory = @import("./memory.mlx")
+const layout = @import("../layout.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const Status = @import("./status.mlx").Status
+const console = @import("./console.mlx")
+const Page = memory.Page
+
+const SECTOR: usize = 512
+// A transfer's most sectors (the bounce buffer: BUFFER_PAGES pages).
+const BUFFER_PAGES: usize = 8
+const SECTORS_PER_REQUEST: usize = BUFFER_PAGES * Page.SIZE / SECTOR
+
+// HBA (generic host control) registers.
+const CAP: usize = 0x00
+const GHC: usize = 0x04
+const PI: usize = 0x0C
+const GHC_AE: usize = 0x80000000
+// A port's registers (0x100 + port * 0x80).
+const PORT_BASE: usize = 0x100
+const PORT_SIZE: usize = 0x80
+const P_CLB: usize = 0x00
+const P_CLBU: usize = 0x04
+const P_FB: usize = 0x08
+const P_FBU: usize = 0x0C
+const P_IS: usize = 0x10
+const P_CMD: usize = 0x18
+const P_TFD: usize = 0x20
+const P_SIG: usize = 0x24
+const P_SSTS: usize = 0x28
+const P_SERR: usize = 0x30
+const P_CI: usize = 0x38
+// PxCMD bits.
+const CMD_ST: usize = 0x0001
+const CMD_FRE: usize = 0x0010
+const CMD_FR: usize = 0x4000
+const CMD_CR: usize = 0x8000
+// PxTFD bits (and PxIS error).
+const TFD_BSY: usize = 0x80
+const TFD_DRQ: usize = 0x08
+const TFD_ERR: usize = 0x01
+const IS_TFES: usize = 0x40000000
+// ATA commands.
+const ATA_IDENTIFY: usize = 0xEC
+const ATA_READ_DMA_EXT: usize = 0x25
+const ATA_WRITE_DMA_EXT: usize = 0x35
+const ATA_FLUSH_EXT: usize = 0xEA
+// A SATA disk's signature in PxSIG.
+const SIG_SATA: usize = 0x00000101
+
+const PATIENCE: usize = 100000000
+
+pub const AhciDisk = struct {
+    present: bool
+    index: usize
+    // The ABAR in the kernel's view, and this disk's port.
+    abar: usize
+    port: usize
+    capacity: usize
+    readOnly: bool
+    // The command list, received FIS and command table (one frame each),
+    // and the bounce buffer, all physical (the device does DMA to them).
+    clb: usize
+    fb: usize
+    ctba: usize
+    buffer: usize
+
+    fn portReg(self: *const Self, offset: usize) -> *u32 {
+        return unsafe { @ptrFromInt(*u32, self.*.abar + PORT_BASE + self.*.port * PORT_SIZE + offset) }
+    }
+
+    // Stops the port (the command list and FIS receive off), sets up our
+    // structures, starts it again, and reads the disk's size; false when
+    // the disk did not answer.
+    fn start(self: *Self) -> bool {
+        // Stop: the command list, then the FIS receive, each waited for.
+        self.portReg(P_CMD).* = self.portReg(P_CMD).* & @intCast(u32, 0xFFFFFFFF ^ CMD_ST)
+        var tries: usize = 0
+        while self.portReg(P_CMD).* & @intCast(u32, CMD_CR) != 0 {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        self.portReg(P_CMD).* = self.portReg(P_CMD).* & @intCast(u32, 0xFFFFFFFF ^ CMD_FRE)
+        tries = 0
+        while self.portReg(P_CMD).* & @intCast(u32, CMD_FR) != 0 {
+            tries += 1
+            if tries > PATIENCE { return false }
+        }
+        const frames = memory.allFrames()
+        self.*.clb = frames.allocate()
+        self.*.fb = frames.allocate()
+        self.*.ctba = frames.allocate()
+        self.*.buffer = frames.allocateContiguous(BUFFER_PAGES)
+        if self.*.clb == 0 || self.*.fb == 0 || self.*.ctba == 0 || self.*.buffer == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(self.*.clb), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.fb), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.ctba), Page.SIZE / 8)
+        self.portReg(P_CLB).* = @intCast(u32, self.*.clb & 0xFFFFFFFF)
+        self.portReg(P_CLBU).* = @intCast(u32, self.*.clb >> 32)
+        self.portReg(P_FB).* = @intCast(u32, self.*.fb & 0xFFFFFFFF)
+        self.portReg(P_FBU).* = @intCast(u32, self.*.fb >> 32)
+        self.portReg(P_SERR).* = 0xFFFFFFFF
+        // FIS receive on, then the command list.
+        self.portReg(P_CMD).* = self.portReg(P_CMD).* | @intCast(u32, CMD_FRE)
+        self.portReg(P_CMD).* = self.portReg(P_CMD).* | @intCast(u32, CMD_ST)
+        return self.identify()
+    }
+
+    // Builds the one command (slot 0): `count` sectors at `sector` to or
+    // from the bounce buffer, or an IDENTIFY, and waits for it. Whether
+    // the device did it.
+    fn command(self: *Self, ata: usize, sector: usize, count: usize, writing: bool) -> bool {
+        const list = Bytes.pointer(layout.Memory.virtual(self.*.clb))
+        // Command header 0: a 5-DWORD command FIS, one PRD, a write flag.
+        var header0: usize = 5 | (1 << 16)
+        if writing { header0 = header0 | 0x40 }
+        Bytes.write32(list, 0, header0)
+        Bytes.write32(list, 4, 0)
+        Bytes.write32(list, 8, self.*.ctba & 0xFFFFFFFF)
+        Bytes.write32(list, 12, self.*.ctba >> 32)
+        const table = Bytes.pointer(layout.Memory.virtual(self.*.ctba))
+        Bytes.fill(table, 0x80, 0)
+        // The command FIS (host to device, register): the command, the
+        // 48-bit LBA, the sector count.
+        table[0] = 0x27
+        table[1] = 0x80
+        table[2] = @intCast(u8, ata)
+        table[3] = 0
+        table[4] = @intCast(u8, sector & 0xFF)
+        table[5] = @intCast(u8, (sector >> 8) & 0xFF)
+        table[6] = @intCast(u8, (sector >> 16) & 0xFF)
+        table[7] = 0x40
+        table[8] = @intCast(u8, (sector >> 24) & 0xFF)
+        table[9] = @intCast(u8, (sector >> 32) & 0xFF)
+        table[10] = @intCast(u8, (sector >> 40) & 0xFF)
+        table[11] = 0
+        table[12] = @intCast(u8, count & 0xFF)
+        table[13] = @intCast(u8, (count >> 8) & 0xFF)
+        // The one PRD (at 0x80 in the table): the bounce buffer, its bytes.
+        const bytes = if ata == ATA_IDENTIFY { SECTOR } else { count * SECTOR }
+        Bytes.write32(table, 0x80, self.*.buffer & 0xFFFFFFFF)
+        Bytes.write32(table, 0x84, self.*.buffer >> 32)
+        Bytes.write32(table, 0x88, 0)
+        Bytes.write32(table, 0x8C, (bytes - 1) & 0x3FFFFF)
+        // A clean slate, then issue the command on slot 0 and wait.
+        self.portReg(P_IS).* = 0xFFFFFFFF
+        self.portReg(P_SERR).* = 0xFFFFFFFF
+        var waited: usize = 0
+        while self.portReg(P_TFD).* & @intCast(u32, TFD_BSY | TFD_DRQ) != 0 {
+            waited += 1
+            if waited > PATIENCE { return false }
+        }
+        self.portReg(P_CI).* = 1
+        var polls: usize = 0
+        while self.portReg(P_CI).* & 1 != 0 {
+            if self.portReg(P_IS).* & @intCast(u32, IS_TFES) != 0 { return false }
+            polls += 1
+            if polls > PATIENCE { return false }
+        }
+        return self.portReg(P_TFD).* & @intCast(u32, TFD_BSY | TFD_ERR) == 0
+    }
+
+    // Reads the disk's size (IDENTIFY: the 48-bit sector count at words
+    // 100..103, else the 28-bit one at words 60..61).
+    fn identify(self: *Self) -> bool {
+        if !self.command(ATA_IDENTIFY, 0, 1, false) { return false }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var sectors = Bytes.read64(data, 200)
+        if sectors == 0 { sectors = Bytes.read32(data, 120) }
+        if sectors == 0 { return false }
+        self.*.capacity = sectors
+        self.*.readOnly = false
+        self.*.present = true
+        return true
+    }
+
+    pub fn sizeInBytes(self: *const Self) -> usize { return self.*.capacity * SECTOR }
+
+    pub fn flush(self: *Self) -> bool { return self.command(ATA_FLUSH_EXT, 0, 0, false) }
+
+    pub fn read(self: *Self, offset: usize, into: [*]u8, length: usize) -> isize {
+        const size = self.sizeInBytes()
+        if offset >= size { return 0 }
+        const total = if length > size - offset { size - offset } else { length }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const sector = at / SECTOR
+            const within = at % SECTOR
+            var count = (within + total - done + SECTOR - 1) / SECTOR
+            if count > SECTORS_PER_REQUEST { count = SECTORS_PER_REQUEST }
+            if !self.command(ATA_READ_DMA_EXT, sector, count, false) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            var chunk = count * SECTOR - within
+            if chunk > total - done { chunk = total - done }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(into) + done) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(data) + within) }, chunk)
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+
+    pub fn write(self: *Self, offset: usize, from: [*]const u8, length: usize) -> isize {
+        if self.*.readOnly { return Status.read_only }
+        const size = self.sizeInBytes()
+        if offset >= size { return if length == 0 { 0 } else { Status.no_space } }
+        const total = if length > size - offset { size - offset } else { length }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const sector = at / SECTOR
+            const within = at % SECTOR
+            var count = (within + total - done + SECTOR - 1) / SECTOR
+            if count > SECTORS_PER_REQUEST { count = SECTORS_PER_REQUEST }
+            var chunk = count * SECTOR - within
+            if chunk > total - done { chunk = total - done }
+            // A sector written in part keeps the rest of its bytes.
+            if (within != 0 || chunk % SECTOR != 0) && !self.command(ATA_READ_DMA_EXT, sector, count, false) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(data) + within) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(from) + done) }, chunk)
+            if !self.command(ATA_WRITE_DMA_EXT, sector, count, true) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+}
+
+pub const MAX_DISKS: usize = 4
+var disks: [MAX_DISKS]AhciDisk = undefined // (per run)
+var diskCount: usize = 0 // (per run)
+
+pub fn count() -> usize { return diskCount }
+pub fn diskAt(index: usize) -> *AhciDisk { return &disks[index] }
+
+// Maps the 2 MiB page holding `physical` uncached in the kernel's view
+// (a page directory under the boot PDPT for its GiB, as the local APIC's
+// mapping does); false when memory is out.
+fn mapDeviceUncached(physical: usize) -> bool {
+    const pdpt = Bytes.pointer(layout.Memory.virtual(layout.Memory.BLOB + layout.Blob.PDPT))
+    const slot = (physical >> 30) & 511
+    if Bytes.read64(pdpt, slot * 8) & 1 == 0 {
+        const directory = memory.allFrames().allocate()
+        if directory == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(directory), Page.SIZE / 8)
+        Bytes.write64(pdpt, slot * 8, directory | 0x3)
+    }
+    const directory = Bytes.read64(pdpt, slot * 8) & Page.ADDRESS
+    const twoMiB = (physical >> 21) << 21
+    // Present, writable, a 2 MiB page, write-through, cache-disabled.
+    Bytes.write64(Bytes.pointer(layout.Memory.virtual(directory)), ((physical >> 21) & 511) * 8, twoMiB | 0x83 | 0x18)
+    return true
+}
+
+// The first AHCI controller's SATA disks, made ready: how many.
+pub fn probeAll() -> usize {
+    diskCount = 0
+    const address = Pci.findClass(0x010601, 0xFFFFFF, 0)
+    if address == Pci.NONE { return 0 }
+    Pci.enableMemory(address)
+    const abarPhysical = Pci.memBase(address, 5)
+    if abarPhysical == 0 { return 0 }
+    if !mapDeviceUncached(abarPhysical) { return 0 }
+    const abar = layout.Memory.virtual(abarPhysical)
+    // AHCI mode on, then the ports that are implemented.
+    const ghc = unsafe { @ptrFromInt(*u32, abar + GHC) }
+    ghc.* = ghc.* | @intCast(u32, GHC_AE)
+    const implemented = unsafe { @ptrFromInt(*u32, abar + PI) }.*
+    var port: usize = 0
+    while port < 32 && diskCount < MAX_DISKS {
+        if implemented & (@intCast(u32, 1) << @intCast(u5, port)) != 0 {
+            const detReg = unsafe { @ptrFromInt(*u32, abar + PORT_BASE + port * PORT_SIZE + P_SSTS) }
+            const sigReg = unsafe { @ptrFromInt(*u32, abar + PORT_BASE + port * PORT_SIZE + P_SIG) }
+            // A device present with a live link (DET == 3) and a SATA
+            // signature.
+            if detReg.* & 0xF == 3 && @intCast(usize, sigReg.*) == SIG_SATA {
+                const disk = &disks[diskCount]
+                disk.*.present = false
+                disk.*.index = diskCount
+                disk.*.abar = abar
+                disk.*.port = port
+                if disk.start() { diskCount += 1 }
+            }
+        }
+        port += 1
+    }
+    return diskCount
+}
