@@ -1,20 +1,38 @@
 // The GPU, for real hardware: an AMD Radeon (a Supermicro H11's RX 580,
-// Polaris 10). This is the first step of a native amdgpu driver -- it
-// finds the card on PCI, enables it, and records its register, VRAM and
-// doorbell apertures so later stages (the memory controller and GART, the
-// microcode and the command rings, compute) have the ground to stand on.
-// It drives nothing yet; QEMU has no such card, so on a VM it finds none.
+// Polaris 10). A native amdgpu driver, built in stages. Stage 1 finds the
+// card on PCI, enables it, and records its register, VRAM and doorbell
+// apertures. Stage 2a maps the register aperture (BAR5) uncached and reads
+// the identity and memory-size registers through the direct and indirect
+// MMIO paths -- the ground the memory controller, GART, microcode and
+// command rings stand on. It drives nothing yet; QEMU has no such card, so
+// on a VM it finds none. The register reads can only be seen on the real
+// hardware (the "gpu:" lines on the serial console).
+const layout = @import("../layout.mlx")
+const memory = @import("./memory.mlx")
 const Pci = @import("./pci.mlx").Pci
+const Bytes = @import("./bytes.mlx").Bytes
 const console = @import("./console.mlx")
+const Page = memory.Page
 
 const VENDOR_AMD: usize = 0x1002
+
+// Registers (dword offsets, VI/Polaris). The register aperture (BAR5) is
+// 256 KiB; a register beyond it is reached through the MM_INDEX/MM_DATA
+// window at the start of the aperture.
+const mmMM_INDEX: usize = 0x0
+const mmMM_DATA: usize = 0x1
+const mmSCRATCH_REG0: usize = 0xC040
+const mmGRBM_STATUS: usize = 0x2004
+const mmCONFIG_MEMSIZE: usize = 0x150A
 
 pub const Gpu = struct {
     present: bool
     device: usize
+    revision: usize
     // The three memory apertures (physical): the registers (BAR5), the
-    // VRAM window (BAR0) and the doorbells (BAR2), with the VRAM size.
-    registers: usize
+    // VRAM window (BAR0) and the doorbells (BAR2), with their sizes.
+    registers: usize // in the kernel's view (mapped uncached)
+    registersSize: usize
     vram: usize
     vramSize: usize
     doorbells: usize
@@ -24,6 +42,49 @@ pub const Gpu = struct {
         if self.*.device == 0x67EF { return "Radeon RX 560 (Polaris 11)" }
         if self.*.device == 0x699F { return "Radeon RX 550 (Polaris 12)" }
         return "Radeon (AMD)"
+    }
+
+    // A 32-bit register: directly in the aperture, or through the
+    // MM_INDEX/MM_DATA window when its byte offset is past the aperture.
+    fn at(self: *const Self, offset: usize) -> *u32 {
+        return unsafe { @ptrFromInt(*u32, self.*.registers + offset) }
+    }
+
+    fn rreg(self: *const Self, reg: usize) -> u32 {
+        const offset = reg << 2
+        if offset < self.*.registersSize { return self.at(offset).* }
+        self.at(mmMM_INDEX * 4).* = @intCast(u32, offset)
+        return self.at(mmMM_DATA * 4).*
+    }
+
+    fn wreg(self: *const Self, reg: usize, value: u32) -> void {
+        const offset = reg << 2
+        if offset < self.*.registersSize {
+            self.at(offset).* = value
+            return
+        }
+        self.at(mmMM_INDEX * 4).* = @intCast(u32, offset)
+        self.at(mmMM_DATA * 4).* = value
+    }
+
+    // Stage 2a diagnostics (read-mostly): the memory size the straps
+    // report, a scratch register written and read back (the register path
+    // is alive), and the GRBM status. All on the serial console for the
+    // real hardware.
+    fn report(self: *const Self) -> void {
+        console.out.write("gpu: config_memsize ")
+        console.out.decimal(@intCast(usize, self.rreg(mmCONFIG_MEMSIZE)))
+        console.out.write(" MiB, revision ")
+        console.out.hex(self.*.revision)
+        console.out.write("\n")
+        self.wreg(mmSCRATCH_REG0, 0xCAFEBABE)
+        const back = self.rreg(mmSCRATCH_REG0)
+        console.out.write("gpu: scratch write/read 0x")
+        console.out.hex(@intCast(usize, back))
+        console.out.write(if back == 0xCAFEBABE { " (register path ok)\n" } else { " (MISMATCH)\n" })
+        console.out.write("gpu: grbm_status 0x")
+        console.out.hex(@intCast(usize, self.rreg(mmGRBM_STATUS)))
+        console.out.write("\n")
     }
 }
 
@@ -47,8 +108,26 @@ fn barSize(address: usize, bar: usize) -> usize {
     return (@intCast(usize, 0xFFFFFFFF) ^ mask) + 1
 }
 
-// The first AMD GPU, enabled and its apertures recorded; whether there is
-// one. (A VGA-class or display-class PCI device whose vendor is AMD.)
+// Maps the 2 MiB page holding `physical` uncached in the kernel's view (as
+// the AHCI/NVMe/igb mappings do); false when memory is out.
+fn mapDeviceUncached(physical: usize) -> bool {
+    const pdpt = Bytes.pointer(layout.Memory.virtual(layout.Memory.BLOB + layout.Blob.PDPT))
+    const slot = (physical >> 30) & 511
+    if Bytes.read64(pdpt, slot * 8) & 1 == 0 {
+        const directory = memory.allFrames().allocate()
+        if directory == 0 { return false }
+        Bytes.zeroWords(layout.Memory.virtual(directory), Page.SIZE / 8)
+        Bytes.write64(pdpt, slot * 8, directory | 0x3)
+    }
+    const directory = Bytes.read64(pdpt, slot * 8) & Page.ADDRESS
+    const twoMiB = (physical >> 21) << 21
+    Bytes.write64(Bytes.pointer(layout.Memory.virtual(directory)), ((physical >> 21) & 511) * 8, twoMiB | 0x83 | 0x18)
+    return true
+}
+
+// The first AMD GPU, enabled, its apertures recorded, its register path
+// brought up; whether there is one. (A VGA- or display-class PCI device
+// whose vendor is AMD.)
 pub fn probe() -> bool {
     gpu.present = false
     var n: usize = 0
@@ -60,10 +139,14 @@ pub fn probe() -> bool {
         if Pci.read(address, 0) & 0xFFFF != VENDOR_AMD { continue }
         Pci.enableMemory(address)
         gpu.device = (Pci.read(address, 0) >> 16) & 0xFFFF
+        gpu.revision = Pci.read(address, Pci.CLASS) & 0xFF
         gpu.vram = Pci.memBase(address, 0)
         gpu.vramSize = barSize(address, 0)
         gpu.doorbells = Pci.memBase(address, 2)
-        gpu.registers = Pci.memBase(address, 5)
+        const registersPhysical = Pci.memBase(address, 5)
+        gpu.registersSize = barSize(address, 5)
+        if registersPhysical == 0 || !mapDeviceUncached(registersPhysical) { return false }
+        gpu.registers = layout.Memory.virtual(registersPhysical)
         gpu.present = true
         console.out.write("brixOS: /devices/gpu0, ")
         console.out.write(gpu.name())
@@ -72,6 +155,7 @@ pub fn probe() -> bool {
         console.out.write(" MiB VRAM aperture, registers at ")
         console.out.hex(gpu.registers)
         console.out.write("\n")
+        gpu.report()
         return true
     }
     return false
