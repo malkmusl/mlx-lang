@@ -31,6 +31,12 @@ export MLX_CC_LIB="$PWD/mlx-out/lib"
 [[ -x mlx-out/bin/mlx-ld ]] || { echo "check_lattice_emit.sh: mlx-out/bin/mlx-ld is missing (./mlx build mlx-ld)"; exit 1; }
 export MLX_LD="$PWD/mlx-out/bin/mlx-ld"
 echo "ok   mlx-cc builds"
+# The C++ references run on mlxlibc (loader, C library and libm from
+# compiler/libc): its libm wraps the same std.math the Mlx side calls, so
+# the two sides' sines, cosines and tangents agree bit for bit.
+tools/build_mlxlibc.sh --compiler "$compiler" --out "$work/libc" > "$work/libc.log" 2>&1 || fail "mlxlibc does not build: $(tail -5 "$work/libc.log")"
+loader="$work/libc/libmlxc.so.1"
+echo "ok   mlxlibc builds (the references run on it)"
 
 # ANGLE's flags for the Vulkan backend on Linux, as projects/webkit/build.mlx compiles it.
 flags=(-DANGLE_ENABLE_ESSL -DANGLE_ENABLE_GLSL -DANGLE_ENABLE_VULKAN -DANGLE_PLATFORM_LINUX
@@ -41,7 +47,7 @@ flags=(-DANGLE_ENABLE_ESSL -DANGLE_ENABLE_GLSL -DANGLE_ENABLE_VULKAN -DANGLE_PLA
     -Imlx-out/include/mlx-zlib -Imlx-out/include/mlx-vulkan -Imlx-out/include/mlx-spirv
     -std=c++23 -include "$angle/ANGLEPrefix.h")
 
-units=(aligned_memory mathutil Float16ToFloat32 utilities)
+units=(aligned_memory mathutil Float16ToFloat32 utilities matrix_utils MemoryBuffer platform_helpers)
 for unit in "${units[@]}"; do
     "$work/mlx-cc" "${flags[@]}" --emit-mlx="$work/$unit.mlx" "$angle/src/common/$unit.cpp" 2> "$work/$unit.err" || fail "$unit.cpp does not translate: $(head -5 "$work/$unit.err")"
     if [[ $update -eq 1 ]]; then
@@ -67,7 +73,7 @@ differential() { # UNIT TEST WORDS [OTHER C++ UNITS THE REFERENCE LINKS...]
     local other
     for other in "$@"; do others+=("$angle/src/common/$other.cpp"); done
     "$work/mlx-cc" "${flags[@]}" -o "$work/${test}_ref" "$out/tests/${test}_ref.cpp" "$angle/src/common/$unit.cpp" "${others[@]}" 2> "$work/${test}_ref.err" || fail "$test: the C++ reference does not build: $(head -5 "$work/${test}_ref.err")"
-    "$work/${test}_ref" > "$work/${test}_ref.out" || fail "$test: the C++ reference does not run"
+    (env -i LD_LIBRARY_PATH="$work/libc" timeout 60 "$loader" "$work/${test}_ref" > "$work/${test}_ref.out" 2> "$work/${test}_ref.run") || fail "$test: the C++ reference does not run on mlxlibc: $(head -3 "$work/${test}_ref.run")"
     "$compiler" --quiet "$out/tests/${test}_test.mlx" -o "$work/${test}_test" 2> "$work/${test}.err" || fail "${test}_test.mlx does not compile: $(head -5 "$work/${test}.err")"
     "$work/${test}_test" > "$work/${test}_mlx.out" || fail "$test: the Mlx test does not run"
     cmp -s "$work/${test}_ref.out" "$work/${test}_mlx.out" || fail "$test: the Mlx and the C++ differ (C++ < > Mlx): $(diff "$work/${test}_ref.out" "$work/${test}_mlx.out" | head -12)"
@@ -76,4 +82,7 @@ differential() { # UNIT TEST WORDS [OTHER C++ UNITS THE REFERENCE LINKS...]
 differential mathutil mathutil "RGB9E5 packing and unpacking"
 differential Float16ToFloat32 float16 "every half-precision pattern to a float"
 differential utilities utilities "the GL type and target predicates, sizes, counts and orders over the enum range" string_utils
+differential matrix_utils matrix "Mat4 made, rotated, translated, scaled, frustum, perspective, ortho, products with a matrix and a vector"
+differential MemoryBuffer memorybuffer "a buffer resized, reserved, filled, cleared and destroyed"
+differential platform_helpers platform "the platform predicates"
 echo "check_lattice_emit.sh: all checks passed"
