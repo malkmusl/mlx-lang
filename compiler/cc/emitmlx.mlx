@@ -1,0 +1,2275 @@
+// `mlx-cc --emit-mlx=FILE`: the C++ to Mlx translator's first step
+// (projects/webkit/LATTICE.md, L0). After a unit is parsed and typed, the
+// definitions of its main file -- its structs, globals and functions, not
+// what its headers declared -- are written as Mlx from the typed tree:
+// declarations, control flow and expressions with their resolved types,
+// casts made explicit as Mlx wants them, the C functions the unit calls as
+// extern("c") declarations. It is a first version for the hand to make
+// Mlx (ownership, errors, containers): whatever the translator cannot
+// express is marked `// LATTICE: ...` in place or listed at the end of the
+// file, so the tool improves before the hand work grows.
+//
+// How the text is made: each statement is written into a buffer of its
+// own, so that an expression needing a statement before it (a temporary
+// assigned in a comma expression) can hoist one; a function's body is
+// written before its locals are declared, so only the locals the Mlx
+// uses are declared; the structs are those the written code names.
+const base = @import("./base.mlx")
+const ast = @import("./ast.mlx")
+const types = @import("./types.mlx")
+const tokens = @import("./tokens.mlx")
+const names = @import("./names.mlx")
+const program = @import("./program.mlx")
+
+pub var enabled = false
+// The output file (an address and a length: a global slice has no
+// lowering as a module variable).
+var outputAt: usize = 0
+var outputLength: usize = 0
+
+pub fn enable(path: []const u8) -> void {
+    if path.length == 0 { return }
+    enabled = true
+    outputAt = base.keep(path)
+    outputLength = path.length
+}
+
+fn outputPath() -> []const u8 { return base.bytes(outputAt, outputLength) }
+
+// ---------------------------------------------------------------------------
+// Buffers
+
+const Buffer = struct {
+    data: usize
+    length: usize
+    capacity: usize
+}
+
+fn emptyBuffer() -> Buffer { return Buffer.{ .data = 0, .length = 0, .capacity = 0 } }
+
+// Where the text goes now (swapped to write a part on its own).
+var out = Buffer.{ .data = 0, .length = 0, .capacity = 0 }
+// The statements hoisted before the statement being written.
+var pre = Buffer.{ .data = 0, .length = 0, .capacity = 0 }
+// The notes for the end of the file.
+var notes = Buffer.{ .data = 0, .length = 0, .capacity = 0 }
+var markerCount: usize = 0
+var usesStd = false
+
+fn grow(buffer: *Buffer, more: usize) -> void {
+    if buffer.*.length + more <= buffer.*.capacity { return }
+    var capacity = if buffer.*.capacity == 0 { 4096 } else { buffer.*.capacity * 2 }
+    while capacity < buffer.*.length + more { capacity *= 2 }
+    const data = base.alloc(capacity)
+    if buffer.*.length > 0 { base.copy(data, buffer.*.data, buffer.*.length) }
+    buffer.*.data = data
+    buffer.*.capacity = capacity
+}
+
+fn putTo(buffer: *Buffer, text: []const u8) -> void {
+    grow(buffer, text.length)
+    base.putText(buffer.*.data + buffer.*.length, text)
+    buffer.*.length += text.length
+}
+
+fn textOf(buffer: *const Buffer) -> []const u8 { return base.bytes(buffer.*.data, buffer.*.length) }
+
+fn put(text: []const u8) -> void { putTo(&out, text) }
+
+fn putByte(byte: u8) -> void {
+    grow(&out, 1)
+    base.put8(out.data + out.length, byte)
+    out.length += 1
+}
+
+fn putNumber(value: u64) -> void {
+    var digits: [24]u8 = undefined
+    var count: usize = 0
+    var rest = value
+    while true {
+        digits[23 - count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    const bytes: [*]u8 = &digits
+    put(bytes[24 - count..24])
+}
+
+fn putSigned(value: i64) -> void {
+    if value < 0 {
+        putByte(45)
+        putNumber(@bitCast(u64, 0 -% value))
+    } else {
+        putNumber(@bitCast(u64, value))
+    }
+}
+
+fn newline() -> void { putByte(10) }
+
+fn indent(level: usize) -> void {
+    var k: usize = 0
+    while k < level {
+        put("    ")
+        k += 1
+    }
+}
+
+// A mark in place (at a line's end or on a line of its own).
+fn marker(text: []const u8) -> void {
+    put("// LATTICE: ")
+    put(text)
+    markerCount += 1
+}
+
+// A note for the end of the file (for what is found inside an expression,
+// where no comment fits).
+fn note(text: []const u8) -> void {
+    putTo(&notes, "// LATTICE: ")
+    putTo(&notes, text)
+    putTo(&notes, "\n")
+    markerCount += 1
+}
+
+// A double as Mlx reads it back (the whole part, then up to 17 digits of
+// the fraction, trailing zeros dropped).
+fn putFloat(bits: u64) -> void {
+    const value = @bitCast(f64, bits)
+    if value != value {
+        put("0.0")
+        note("a NaN constant")
+        return
+    }
+    var v = value
+    if v < 0.0 {
+        putByte(45)
+        v = 0.0 - v
+    }
+    if v > 1000000000000000000.0 {
+        put("1000000000000000000.0")
+        note("a floating constant beyond the printer's range")
+        return
+    }
+    const floored = @floor(v)
+    const whole = @intFromFloat(u64, floored)
+    putNumber(whole)
+    putByte(46)
+    var fraction = v - floored
+    var digits: [20]u8 = undefined
+    var count: usize = 0
+    while count < 17 {
+        fraction = fraction * 10.0
+        const f = @floor(fraction)
+        const d = @intFromFloat(u64, f)
+        digits[count] = @intCast(u8, 48 + d)
+        fraction = fraction - f
+        count += 1
+    }
+    while count > 1 && digits[count - 1] == 48 { count -= 1 }
+    const p: [*]u8 = &digits
+    put(p[0..count])
+}
+
+// ---------------------------------------------------------------------------
+// Names
+
+fn isIdentByte(byte: u8) -> bool {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+
+// Mlx's keywords and the names the translation itself uses.
+fn isReserved(text: []const u8) -> bool {
+    const words = [38][]const u8{ "fn", "const", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "match", "struct", "enum", "union", "error", "try", "defer", "errdefer", "pub", "export", "inline", "noinline", "comptime", "test", "type", "unsafe", "null", "undefined", "true", "false", "self", "Self", "packed", "extern", "threadlocal", "noreturn", "anytype" }
+    for word in words {
+        if base.same(text, word) { return true }
+    }
+    return false
+}
+
+fn putIdentText(text: []const u8) -> void {
+    for byte in text {
+        putByte(if isIdentByte(byte) { byte } else { 95 })
+    }
+    if isReserved(text) { putByte(95) }
+}
+
+fn ident(id: u32) -> void {
+    if id == 0 {
+        put("anonymous")
+        return
+    }
+    putIdentText(base.nameOf(id))
+}
+
+fn startsWith(text: []const u8, prefix: []const u8) -> bool {
+    return text.length >= prefix.length && base.same(text[0..prefix.length], prefix)
+}
+
+// The part of a qualified name after its last `::`.
+fn lastComponent(text: []const u8) -> []const u8 {
+    var start: usize = 0
+    var k: usize = 0
+    while k + 1 < text.length {
+        if text[k] == 58 && text[k + 1] == 58 { start = k + 2 }
+        k += 1
+    }
+    return text[start..text.length]
+}
+
+fn putTypeName(ty: usize) -> void {
+    const name = types.at(ty).*.name
+    if name == 0 {
+        put("Anonymous")
+        return
+    }
+    putIdentText(lastComponent(base.nameOf(name)))
+}
+
+// The namespaces of a mangled name (`_ZN2gl3fooEv`: gl), written as a
+// comment; nothing for a plain C name.
+fn putNamespaceComment(obj: *ast.Obj) -> void {
+    if obj.*.linkName == 0 { return }
+    const text = base.nameOf(obj.*.linkName)
+    if !startsWith(text, "_ZN") { return }
+    var at: usize = 3
+    if at < text.length && text[at] == 75 { at += 1 }
+    var written = false
+    while at < text.length && text[at] >= 48 && text[at] <= 57 {
+        var length: usize = 0
+        while at < text.length && text[at] >= 48 && text[at] <= 57 {
+            length = length * 10 + @intCast(usize, text[at] - 48)
+            at += 1
+        }
+        if at + length > text.length { break }
+        const component = text[at..at + length]
+        at += length
+        // The last component is the function's own name.
+        const more = at < text.length && text[at] >= 48 && text[at] <= 57
+        if !more { break }
+        if !written {
+            put("// namespace ")
+            written = true
+        } else {
+            put("::")
+        }
+        put(if startsWith(component, "_GLOBAL__N_") { "(anonymous)" } else { component })
+    }
+    if written { newline() }
+}
+
+// A function of the C++ standard library (`std::` mangled: _ZSt, _ZNSt, _ZN3std).
+fn isStdFunction(obj: *ast.Obj) -> bool {
+    if obj.*.linkName == 0 { return false }
+    const text = base.nameOf(obj.*.linkName)
+    return startsWith(text, "_ZSt") || startsWith(text, "_ZNSt") || startsWith(text, "_ZN3std")
+}
+
+// ---------------------------------------------------------------------------
+// Types
+
+fn isIntKind(kind: u8) -> bool {
+    return kind == types.CHAR || kind == types.SHORT || kind == types.INT || kind == types.LONG || kind == types.ENUM
+}
+
+fn isFloatKind(kind: u8) -> bool {
+    return kind == types.FLOAT || kind == types.DOUBLE || kind == types.LDOUBLE
+}
+
+fn isRecordKind(kind: u8) -> bool { return kind == types.STRUCT || kind == types.UNION }
+
+fn putIntType(t: *types.Type) -> void {
+    putByte(if t.*.unsigned { 117 } else { 105 })
+    putNumber(@intCast(u64, t.*.size * 8))
+}
+
+// Whether two types are the same in shape (two records of `int *` are
+// two addresses in the arena).
+fn sameType(a: usize, b: usize) -> bool {
+    if a == b { return true }
+    if a == 0 || b == 0 { return false }
+    const ta = types.at(a)
+    const tb = types.at(b)
+    if ta.*.kind != tb.*.kind || ta.*.unsigned != tb.*.unsigned || ta.*.size != tb.*.size { return false }
+    const kind = ta.*.kind
+    if kind == types.PTR || kind == types.REF || kind == types.ARRAY { return sameType(ta.*.base, tb.*.base) }
+    if isRecordKind(kind) { return ta.*.name != 0 && ta.*.name == tb.*.name }
+    if kind == types.FUNC { return false }
+    return true
+}
+
+// A pointer's target kind decides the Mlx pointer: a record `*S`, a
+// function `fn`, anything else a many-item pointer `[*]T` (C indexes
+// pointers); `optional` for a C pointer (null is a value of it), not for
+// `this`, a reference, or the bare type of @ptrFromInt.
+fn putPointer(target: usize, optional: bool) -> void {
+    const t = types.at(target)
+    if optional { putByte(63) }
+    if t.*.kind == types.FUNC {
+        putType(target)
+        return
+    }
+    putByte(if isRecordKind(t.*.kind) { 42 } else { 91 })
+    if !isRecordKind(t.*.kind) { put("*]") }
+    if t.*.isConst { put("const ") }
+    if t.*.kind == types.VOID {
+        put("u8")
+    } else {
+        putType(target)
+    }
+}
+
+pub fn putType(ty: usize) -> void {
+    const t = types.at(ty)
+    const kind = t.*.kind
+    noteType(ty)
+    if kind == types.VOID {
+        put("void")
+    } else if kind == types.BOOL {
+        put("bool")
+    } else if isIntKind(kind) {
+        putIntType(t)
+    } else if kind == types.FLOAT {
+        put("f32")
+    } else if kind == types.DOUBLE || kind == types.LDOUBLE {
+        put("f64")
+    } else if kind == types.PTR {
+        putPointer(t.*.base, true)
+    } else if kind == types.REF {
+        putPointer(t.*.base, false)
+    } else if kind == types.ARRAY {
+        putByte(91)
+        putNumber(@bitCast(u64, if t.*.arrayLength < 0 { 0 } else { t.*.arrayLength }))
+        putByte(93)
+        putType(t.*.base)
+    } else if kind == types.FUNC {
+        put("fn(")
+        var p = t.*.params
+        var first = true
+        while p != 0 {
+            if !first { put(", ") }
+            first = false
+            putType(types.param(p).*.ty)
+            p = types.param(p).*.next
+        }
+        put(") -> ")
+        putType(t.*.base)
+    } else if isRecordKind(kind) {
+        putTypeName(ty)
+    } else if kind == types.TPARAM {
+        put("anytype")
+    } else if kind == types.WIDE {
+        put("u128")
+    } else {
+        put("usize")
+    }
+}
+
+// A bit-field member's own type (`unsigned x : 9` is a u9 of a packed
+// struct).
+fn putBitFieldType(member: *types.Member) -> void {
+    putByte(if types.at(member.*.ty).*.unsigned { 117 } else { 105 })
+    putNumber(@bitCast(u64, member.*.bitWidth))
+}
+
+// ---------------------------------------------------------------------------
+// What the unit mentions: the records, the functions it calls elsewhere
+
+const MAX_LIST: usize = 2048
+
+var structList: [MAX_LIST]usize = undefined
+var structCount: usize = 0
+var externList: [MAX_LIST]usize = undefined
+var externCount: usize = 0
+
+fn sameStruct(a: usize, b: usize) -> bool {
+    if a == b { return true }
+    const na = types.at(a).*.name
+    return na != 0 && na == types.at(b).*.name
+}
+
+fn noteType(ty: usize) -> void {
+    if ty == 0 { return }
+    const t = types.at(ty)
+    if !isRecordKind(t.*.kind) { return }
+    var k: usize = 0
+    while k < structCount {
+        if sameStruct(structList[k], ty) { return }
+        k += 1
+    }
+    if structCount >= MAX_LIST { return }
+    structList[structCount] = ty
+    structCount += 1
+}
+
+fn noteExtern(o: usize) -> void {
+    var k: usize = 0
+    while k < externCount {
+        if externList[k] == o { return }
+        k += 1
+    }
+    if externCount >= MAX_LIST { return }
+    externList[externCount] = o
+    externCount += 1
+}
+
+// The unit's main file (given by the driver: the parser moves state.file()
+// through the includes).
+var mainFile: u32 = 0
+
+fn inMainFile(token: usize) -> bool {
+    if token == 0 { return false }
+    return @intCast(u32, tokens.at(token).*.file) == mainFile
+}
+
+// A function defined in the main file: its body is there (its object's
+// token may be a header's prototype, the first declaration).
+fn functionHere(obj: *ast.Obj) -> bool {
+    if !obj.*.isFunction || obj.*.body == 0 { return false }
+    return inMainFile(ast.node(obj.*.body).*.token) || inMainFile(obj.*.token)
+}
+
+fn definedHere(ty: usize) -> bool {
+    const m = types.at(ty).*.members
+    if m == 0 { return false }
+    return inMainFile(types.member(m).*.token)
+}
+
+fn putPlace(token: usize) -> void {
+    if token == 0 {
+        put("?")
+        return
+    }
+    const t = tokens.at(token)
+    put(lastComponent(base.nameOf(base.fileName(@intCast(u32, t.*.file)))))
+    putByte(58)
+    putNumber(@intCast(u64, t.*.line))
+}
+
+// ---------------------------------------------------------------------------
+// Structs
+
+fn hasBitFields(ty: usize) -> bool {
+    var m = types.at(ty).*.members
+    while m != 0 {
+        if types.member(m).*.bitWidth > 0 { return true }
+        m = types.member(m).*.next
+    }
+    return false
+}
+
+fn emitStruct(ty: usize) -> void {
+    const t = types.at(ty)
+    const isPacked = hasBitFields(ty)
+    put("pub const ")
+    putTypeName(ty)
+    if t.*.kind == types.UNION {
+        put(" = extern union {\n")
+    } else {
+        put(if isPacked { " = packed struct {\n" } else { " = extern struct {\n" })
+    }
+    var m = t.*.members
+    var index: usize = 0
+    while m != 0 {
+        const member = types.member(m)
+        indent(1)
+        if member.*.isBase {
+            marker("base class ")
+            putTypeName(member.*.ty)
+            newline()
+        } else {
+            if member.*.name == 0 {
+                put("field")
+                putNumber(@intCast(u64, index))
+            } else {
+                ident(member.*.name)
+            }
+            put(": ")
+            if member.*.bitWidth > 0 {
+                putBitFieldType(member)
+            } else {
+                putType(member.*.ty)
+                if isPacked && isRecordKind(types.at(member.*.ty).*.kind) {
+                    put("  ")
+                    marker("a record inside a packed struct")
+                }
+            }
+            newline()
+        }
+        m = member.*.next
+        index += 1
+    }
+    put("}\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Globals
+
+fn readLittle(address: usize, size: i64) -> u64 {
+    var value: u64 = 0
+    var k: usize = 0
+    while k < @intCast(usize, size) && k < 8 {
+        value |= @intCast(u64, base.get8(address + k)) << @intCast(u6, k * 8)
+        k += 1
+    }
+    return value
+}
+
+fn emitGlobal(o: usize) -> void {
+    const obj = ast.obj(o)
+    const t = types.at(obj.*.ty)
+    put("// from ")
+    putPlace(obj.*.token)
+    newline()
+    putNamespaceComment(obj)
+    const constant = t.*.isConst
+    put(if constant { if obj.*.isStatic { "const " } else { "pub const " } } else { if obj.*.isStatic { "var " } else { "pub var " } })
+    ident(obj.*.name)
+    put(": ")
+    putType(obj.*.ty)
+    put(" = ")
+    const scalar = isIntKind(t.*.kind) || isFloatKind(t.*.kind) || t.*.kind == types.BOOL
+    if obj.*.initData != 0 && scalar {
+        const bits = readLittle(obj.*.initData, t.*.size)
+        if isFloatKind(t.*.kind) {
+            if t.*.size == 4 {
+                const narrow = @bitCast(f32, @intCast(u32, bits))
+                putFloat(@bitCast(u64, @floatCast(f64, narrow)))
+            } else {
+                putFloat(bits)
+            }
+        } else if t.*.kind == types.BOOL {
+            put(if bits != 0 { "true" } else { "false" })
+        } else if t.*.unsigned {
+            putNumber(bits)
+        } else {
+            const shift = @intCast(u6, 64 - t.*.size * 8)
+            putSigned((@bitCast(i64, bits) << shift) >> shift)
+        }
+    } else {
+        put("undefined")
+        if obj.*.initData != 0 {
+            put("  ")
+            marker("an initializer the translator does not read yet")
+        }
+    }
+    newline()
+    newline()
+}
+
+// ---------------------------------------------------------------------------
+// Functions: their locals
+
+var localObj: [MAX_LIST]usize = undefined
+var localName: [MAX_LIST]u32 = undefined
+var localUsed: [MAX_LIST]bool = undefined
+var localCount: usize = 0
+var scratch: [96]u8 = undefined
+
+fn nameTaken(name: u32) -> bool {
+    var k: usize = 0
+    while k < localCount {
+        if localName[k] == name { return true }
+        k += 1
+    }
+    return false
+}
+
+// A local's name in the Mlx: its own, made unique when another local of
+// the function has it (C scopes, flattened), or made up for a temporary.
+fn bindLocal(o: usize) -> u32 {
+    const obj = ast.obj(o)
+    var name = obj.*.name
+    if name == 0 || nameTaken(name) {
+        const text = if name == 0 { "tmp" } else { base.nameOf(name) }
+        var at: usize = 0
+        var k: usize = 0
+        while k < text.length && at < 80 {
+            scratch[at] = if isIdentByte(text[k]) { text[k] } else { 95 }
+            at += 1
+            k += 1
+        }
+        scratch[at] = 95
+        at += 1
+        var digits: [20]u8 = undefined
+        var count: usize = 0
+        var rest = localCount
+        while true {
+            digits[19 - count] = @intCast(u8, 48 + rest % 10)
+            count += 1
+            rest = rest / 10
+            if rest == 0 { break }
+        }
+        var d: usize = 20 - count
+        while d < 20 {
+            scratch[at] = digits[d]
+            at += 1
+            d += 1
+        }
+        const p: [*]u8 = &scratch
+        name = base.intern(p[0..at])
+    }
+    if localCount < MAX_LIST {
+        localObj[localCount] = o
+        localName[localCount] = name
+        localUsed[localCount] = false
+        localCount += 1
+    }
+    return name
+}
+
+fn putLocal(o: usize) -> void {
+    var k: usize = 0
+    while k < localCount {
+        if localObj[k] == o {
+            localUsed[k] = true
+            ident(localName[k])
+            return
+        }
+        k += 1
+    }
+    ident(ast.obj(o).*.name)
+}
+
+// A function's parameters are cells of (object, next); its locals an
+// object list (the parameters among them).
+fn isParam(function: *ast.Obj, o: usize) -> bool {
+    var c = function.*.params
+    while c != 0 {
+        if base.getWord(c) == o { return true }
+        c = base.getWord(c + 8)
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Functions: break and continue
+
+var breakLabels: [64]u32 = undefined
+var continueLabels: [64]u32 = undefined
+var loopDepth: usize = 0
+
+fn pushLoop(breakLabel: u32, continueLabel: u32) -> void {
+    if loopDepth < 64 {
+        breakLabels[loopDepth] = breakLabel
+        continueLabels[loopDepth] = continueLabel
+    }
+    loopDepth += 1
+}
+
+fn popLoop() -> void { if loopDepth > 0 { loopDepth -= 1 } }
+
+// ---------------------------------------------------------------------------
+// Statements
+
+// The indentation of the statement being written (for hoisted ones).
+var level: usize = 0
+// Hoisting off while an expression is written a second time (std::min/max).
+var hoistOff = false
+
+fn emitList(head: usize, lvl: usize) -> void {
+    var s = head
+    while s != 0 {
+        emitStmt(s, lvl)
+        s = ast.node(s).*.next
+    }
+}
+
+// A statement's body: a block's statements, or the one statement.
+fn emitBody(n: usize, lvl: usize) -> void {
+    if n == 0 { return }
+    if ast.kindOf(n) == ast.BLOCK {
+        emitList(ast.node(n).*.body, lvl)
+    } else {
+        emitStmt(n, lvl)
+    }
+}
+
+// A statement: written on its own, with what its expressions hoist
+// before it.
+fn emitStmt(n: usize, lvl: usize) -> void {
+    if n == 0 { return }
+    const savedOut = out
+    const savedPre = pre
+    const savedLevel = level
+    out = emptyBuffer()
+    pre = emptyBuffer()
+    level = lvl
+    emitStatement(n, lvl)
+    const text = out
+    const hoisted = pre
+    out = savedOut
+    pre = savedPre
+    level = savedLevel
+    if hoisted.length > 0 { put(textOf(&hoisted)) }
+    put(textOf(&text))
+}
+
+// An expression written as a statement before the current one.
+fn hoist(n: usize) -> void {
+    if hoistOff { return }
+    const savedOut = out
+    out = pre
+    emitExprStmt(n, level)
+    pre = out
+    out = savedOut
+}
+
+fn hasContinue(n: usize, label: u32) -> bool {
+    if n == 0 { return false }
+    const node = ast.node(n)
+    if node.*.kind == ast.JUMP && node.*.label == label { return true }
+    if hasContinue(node.*.lhs, label) || hasContinue(node.*.cond, label) || hasContinue(node.*.then, label) || hasContinue(node.*.els, label) { return true }
+    var s = node.*.body
+    while s != 0 {
+        if hasContinue(s, label) { return true }
+        s = ast.node(s).*.next
+    }
+    return false
+}
+
+fn emitIf(n: usize, lvl: usize) -> void {
+    const node = ast.node(n)
+    put("if ")
+    emitCond(node.*.cond)
+    put(" {\n")
+    emitBody(node.*.then, lvl + 1)
+    indent(lvl)
+    if node.*.els != 0 {
+        put("} else ")
+        if ast.kindOf(node.*.els) == ast.IF {
+            emitIf(node.*.els, lvl)
+            return
+        }
+        put("{\n")
+        emitBody(node.*.els, lvl + 1)
+        indent(lvl)
+    }
+    put("}\n")
+}
+
+// switch as match: each case an arm up to its break; a case that runs
+// into the next is marked.
+var switchBreak: u32 = 0
+var switchDefault: usize = 0
+var armOpen = false
+
+fn openArm(c: usize, lvl: usize) -> void {
+    const node = ast.node(c)
+    if armOpen {
+        indent(lvl + 1)
+        put("}  ")
+        marker("the case above falls through into this one")
+        newline()
+    }
+    indent(lvl + 1)
+    if c == switchDefault {
+        put("else => {\n")
+    } else {
+        putSigned(node.*.value)
+        if node.*.high != node.*.value {
+            put("..")
+            putSigned(node.*.high)
+        }
+        put(" => {\n")
+    }
+    armOpen = true
+}
+
+fn armStatement(s: usize, lvl: usize) -> void {
+    if s == 0 { return }
+    const node = ast.node(s)
+    if node.*.kind == ast.CASE {
+        openArm(s, lvl)
+        armStatement(node.*.lhs, lvl)
+        return
+    }
+    if node.*.kind == ast.JUMP && node.*.label == switchBreak {
+        if armOpen {
+            indent(lvl + 1)
+            put("}\n")
+            armOpen = false
+        }
+        return
+    }
+    // (A statement before the first case is unreachable in C.)
+    if armOpen { emitStmt(s, lvl + 2) }
+}
+
+fn emitSwitch(n: usize, lvl: usize) -> void {
+    const node = ast.node(n)
+    const savedBreak = switchBreak
+    const savedDefault = switchDefault
+    const savedOpen = armOpen
+    switchBreak = node.*.breakLabel
+    switchDefault = node.*.defaultCase
+    armOpen = false
+    indent(lvl)
+    put("match ")
+    emitExpr(node.*.cond)
+    put(" {\n")
+    pushLoop(node.*.breakLabel, 0)
+    var s = if node.*.then != 0 && ast.kindOf(node.*.then) == ast.BLOCK { ast.node(node.*.then).*.body } else { node.*.then }
+    while s != 0 {
+        armStatement(s, lvl)
+        s = ast.node(s).*.next
+    }
+    if armOpen {
+        indent(lvl + 1)
+        put("}\n")
+    }
+    if switchDefault == 0 {
+        indent(lvl + 1)
+        put("else => {}\n")
+    }
+    popLoop()
+    indent(lvl)
+    put("}\n")
+    switchBreak = savedBreak
+    switchDefault = savedDefault
+    armOpen = savedOpen
+}
+
+fn emitJump(n: usize, lvl: usize) -> void {
+    const label = ast.node(n).*.label
+    indent(lvl)
+    var depth = loopDepth
+    while depth > 0 {
+        depth -= 1
+        if depth >= 64 { continue }
+        if continueLabels[depth] != 0 && continueLabels[depth] == label {
+            if depth + 1 != loopDepth {
+                marker("continue of an outer loop")
+                newline()
+                return
+            }
+            put("continue\n")
+            return
+        }
+        if breakLabels[depth] == label {
+            if continueLabels[depth] == 0 {
+                marker("break out of a switch from inside a nested statement")
+                newline()
+                return
+            }
+            if depth + 1 != loopDepth {
+                marker("break out of an outer loop")
+                newline()
+                return
+            }
+            put("break\n")
+            return
+        }
+    }
+    marker("a jump the translator cannot place")
+    newline()
+}
+
+fn emitStatement(n: usize, lvl: usize) -> void {
+    const node = ast.node(n)
+    const kind = node.*.kind
+    if kind == ast.BLOCK {
+        // (C scopes flattened: the locals are declared at the top.)
+        emitList(node.*.body, lvl)
+    } else if kind == ast.EXPR_STMT {
+        emitExprStmt(node.*.lhs, lvl)
+    } else if kind == ast.RETURN {
+        indent(lvl)
+        put("return")
+        if node.*.lhs != 0 {
+            putByte(32)
+            emitExpr(node.*.lhs)
+        }
+        newline()
+    } else if kind == ast.IF {
+        indent(lvl)
+        emitIf(n, lvl)
+    } else if kind == ast.FOR {
+        if node.*.init != 0 { emitStmt(node.*.init, lvl) }
+        indent(lvl)
+        put("while ")
+        if node.*.cond != 0 { emitCond(node.*.cond) } else { put("true") }
+        put(" {\n")
+        pushLoop(node.*.breakLabel, node.*.continueLabel)
+        if node.*.inc != 0 && hasContinue(node.*.then, node.*.continueLabel) {
+            indent(lvl + 1)
+            marker("a continue in this loop skips the increment below")
+            newline()
+        }
+        emitBody(node.*.then, lvl + 1)
+        if node.*.inc != 0 { emitStmt(node.*.inc, lvl + 1) }
+        popLoop()
+        indent(lvl)
+        put("}\n")
+    } else if kind == ast.DO {
+        indent(lvl)
+        put("while true {\n")
+        pushLoop(node.*.breakLabel, node.*.continueLabel)
+        emitBody(node.*.then, lvl + 1)
+        indent(lvl + 1)
+        put("if !")
+        emitCond(node.*.cond)
+        put(" { break }\n")
+        popLoop()
+        indent(lvl)
+        put("}\n")
+    } else if kind == ast.SWITCH {
+        emitSwitch(n, lvl)
+    } else if kind == ast.CASE {
+        emitStmt(node.*.lhs, lvl)
+    } else if kind == ast.JUMP {
+        emitJump(n, lvl)
+    } else if kind == ast.GOTO {
+        indent(lvl)
+        marker("goto ")
+        ident(node.*.name)
+        newline()
+    } else if kind == ast.LABEL {
+        indent(lvl)
+        marker("label ")
+        ident(node.*.name)
+        newline()
+        emitStmt(node.*.lhs, lvl)
+    } else if kind == ast.ASM {
+        indent(lvl)
+        marker("inline assembly")
+        newline()
+    } else {
+        emitExprStmt(n, lvl)
+    }
+}
+
+fn containsText(text: []const u8, part: []const u8) -> bool {
+    if part.length > text.length { return false }
+    var at: usize = 0
+    while at + part.length <= text.length {
+        if base.same(text[at..at + part.length], part) { return true }
+        at += 1
+    }
+    return false
+}
+
+// std::initializer_list<T> (made over an array temporary: the translator
+// reads the list itself).
+fn isInitializerList(cls: usize) -> bool {
+    if cls == 0 { return false }
+    const name = types.at(cls).*.name
+    return name != 0 && containsText(base.nameOf(name), "initializer_list")
+}
+
+// Whether a tree calls a C++ operator function or makes a C++ object
+// (the stream and voidify machinery of ANGLE's ASSERT and ERR): dropped
+// with a mark, as the Mlx says it with std.io.
+fn callsOperator(n: usize) -> bool {
+    if n == 0 { return false }
+    const node = ast.node(n)
+    if node.*.kind == ast.FUNCALL && node.*.lhs != 0 && ast.kindOf(node.*.lhs) == ast.VAR {
+        const callee = ast.obj(ast.node(node.*.lhs).*.variable)
+        if callee.*.isFunction {
+            if startsWith(base.nameOf(callee.*.name), "operator") { return true }
+            if (callee.*.isConstructor || callee.*.isDestructor) && !isInitializerList(callee.*.classType) { return true }
+        }
+    }
+    if callsOperator(node.*.lhs) || callsOperator(node.*.rhs) || callsOperator(node.*.cond) || callsOperator(node.*.then) || callsOperator(node.*.els) { return true }
+    var a = node.*.args
+    while a != 0 {
+        if callsOperator(a) { return true }
+        a = ast.node(a).*.next
+    }
+    return false
+}
+
+// The string literals in a tree, quoted, one after the other (the text
+// of a dropped log message).
+fn putStrings(n: usize) -> void {
+    if n == 0 { return }
+    const node = ast.node(n)
+    if node.*.kind == ast.VAR && ast.obj(node.*.variable).*.isLiteral {
+        putByte(32)
+        putStringLiteral(ast.obj(node.*.variable))
+    }
+    putStrings(node.*.lhs)
+    putStrings(node.*.rhs)
+    putStrings(node.*.cond)
+    putStrings(node.*.then)
+    putStrings(node.*.els)
+    var a = node.*.args
+    while a != 0 {
+        putStrings(a)
+        a = ast.node(a).*.next
+    }
+}
+
+// An expression with no effect as a statement (`(void)0`).
+fn isNoop(n: usize) -> bool {
+    var e = n
+    while e != 0 && ast.kindOf(e) == ast.CAST { e = ast.node(e).*.lhs }
+    if e == 0 { return true }
+    const kind = ast.kindOf(e)
+    return kind == ast.NUM || kind == ast.VAR || kind == ast.NULL_EXPR
+}
+
+fn constantValue(n: usize) -> i64 {
+    var e = n
+    while e != 0 && ast.kindOf(e) == ast.CAST { e = ast.node(e).*.lhs }
+    if e != 0 && ast.kindOf(e) == ast.NUM { return ast.node(e).*.value }
+    return -1
+}
+
+// The zero of a type, as C's zero initialization leaves it.
+fn putZero(ty: usize) -> void {
+    const kind = types.at(ty).*.kind
+    if isIntKind(kind) {
+        put("0")
+    } else if isFloatKind(kind) {
+        put("0.0")
+    } else if kind == types.BOOL {
+        put("false")
+    } else if kind == types.PTR {
+        put("null")
+    } else {
+        put("undefined  ")
+        marker("zeroed in C")
+    }
+}
+
+fn emitMemzero(n: usize, lvl: usize) -> void {
+    const node = ast.node(n)
+    indent(lvl)
+    if node.*.variable != 0 {
+        putLocal(node.*.variable)
+        put(" = ")
+        putZero(ast.obj(node.*.variable).*.ty)
+    } else if node.*.lhs != 0 && ast.kindOf(node.*.lhs) == ast.ADDR {
+        const target = ast.node(node.*.lhs).*.lhs
+        emitLvalue(target)
+        put(" = ")
+        putZero(ast.typeOf(target))
+    } else {
+        marker("memory zeroed through an address")
+    }
+    newline()
+}
+
+// `!c` as a condition (a `!` already there is taken off).
+fn emitNegated(n: usize) -> void {
+    if ast.kindOf(n) == ast.NOT {
+        emitCond(ast.node(n).*.lhs)
+        return
+    }
+    putByte(33)
+    emitCond(n)
+}
+
+// The outermost call's function in a tree, as `name(...)` (what a
+// dropped statement was about).
+fn putCalleeName(n: usize) -> void {
+    var e = n
+    while e != 0 && (ast.kindOf(e) == ast.CAST || ast.kindOf(e) == ast.DEREF || ast.kindOf(e) == ast.ADDR || ast.kindOf(e) == ast.COMMA) {
+        e = if ast.kindOf(e) == ast.COMMA { ast.node(e).*.rhs } else { ast.node(e).*.lhs }
+    }
+    if e == 0 || ast.kindOf(e) != ast.FUNCALL { return }
+    const callee = ast.node(e).*.lhs
+    if callee == 0 || ast.kindOf(callee) != ast.VAR { return }
+    const obj = ast.obj(ast.node(callee).*.variable)
+    if isStdFunction(obj) { put("std::") }
+    if obj.*.classType != 0 {
+        putTypeName(obj.*.classType)
+        put("::")
+    }
+    ident(obj.*.name)
+    put("(...)")
+}
+
+fn emitExprStmt(n: usize, lvl: usize) -> void {
+    if n == 0 { return }
+    var e = n
+    while ast.kindOf(e) == ast.CAST && types.at(ast.typeOf(e)).*.kind == types.VOID && ast.node(e).*.lhs != 0 { e = ast.node(e).*.lhs }
+    const node = ast.node(e)
+    const kind = node.*.kind
+    if kind == ast.NUM || kind == ast.VAR || kind == ast.NULL_EXPR { return }
+    if kind == ast.COMMA {
+        emitExprStmt(node.*.lhs, lvl)
+        emitExprStmt(node.*.rhs, lvl)
+        return
+    }
+    if kind == ast.MEMZERO {
+        emitMemzero(e, lvl)
+        return
+    }
+    if kind == ast.ASSIGN && isInitializerList(ast.typeOf(node.*.lhs)) { return }
+    if kind == ast.FUNCALL && node.*.lhs != 0 && ast.kindOf(node.*.lhs) == ast.VAR && isInitializerList(ast.obj(ast.node(node.*.lhs).*.variable).*.classType) { return }
+    if kind == ast.COND && types.at(ast.typeOf(e)).*.kind == types.VOID {
+        // `c ? (void)0 : log...`: ANGLE's ASSERT and ERR. A constant
+        // condition (NDEBUG) leaves one branch; a branch that is only a
+        // dropped stream expression is no branch; a log whose other side
+        // is empty is one mark with the message's text, its gate (a call
+        // of the logging's own) dropped with it.
+        const constant = constantValue(node.*.cond)
+        if constant == 0 {
+            emitExprStmt(node.*.els, lvl)
+            return
+        }
+        if constant > 0 {
+            emitExprStmt(node.*.then, lvl)
+            return
+        }
+        const thenLive = !isNoop(node.*.then) && !callsOperator(node.*.then)
+        const elsLive = !isNoop(node.*.els) && !callsOperator(node.*.els)
+        if !thenLive && !elsLive {
+            indent(lvl)
+            marker("a log dropped:")
+            putStrings(node.*.then)
+            putStrings(node.*.els)
+            newline()
+            return
+        }
+        if thenLive && !elsLive {
+            indent(lvl)
+            put("if ")
+            emitCond(node.*.cond)
+            put(" {\n")
+            emitExprStmt(node.*.then, lvl + 1)
+            indent(lvl)
+            put("}\n")
+            return
+        }
+        if !thenLive && elsLive {
+            indent(lvl)
+            put("if ")
+            emitNegated(node.*.cond)
+            put(" {\n")
+            emitExprStmt(node.*.els, lvl + 1)
+            indent(lvl)
+            put("}\n")
+            return
+        }
+        indent(lvl)
+        put("if ")
+        emitCond(node.*.cond)
+        put(" {\n")
+        emitExprStmt(node.*.then, lvl + 1)
+        indent(lvl)
+        put("} else {\n")
+        emitExprStmt(node.*.els, lvl + 1)
+        indent(lvl)
+        put("}\n")
+        return
+    }
+    if callsOperator(e) {
+        indent(lvl)
+        marker("dropped (a C++ operator call, a stream or a temporary object): ")
+        if kind == ast.ASSIGN {
+            emitLvalue(node.*.lhs)
+            put(" = ")
+            putCalleeName(node.*.rhs)
+        } else {
+            putCalleeName(e)
+        }
+        putStrings(e)
+        newline()
+        return
+    }
+    indent(lvl)
+    if kind == ast.ASSIGN {
+        emitAssign(e)
+        newline()
+        return
+    }
+    if kind == ast.FUNCALL && types.at(ast.typeOf(e)).*.kind == types.VOID {
+        emitExpr(e)
+        newline()
+        return
+    }
+    put("_ = ")
+    emitExpr(e)
+    newline()
+}
+
+// `a = b`, with a bit-field narrowed to its width.
+fn emitAssign(n: usize) -> void {
+    const node = ast.node(n)
+    emitLvalue(node.*.lhs)
+    put(" = ")
+    if ast.kindOf(node.*.lhs) == ast.MEMBER {
+        const member = types.member(ast.node(node.*.lhs).*.member)
+        if member.*.bitWidth > 0 {
+            put("@intCast(")
+            putBitFieldType(member)
+            put(", ")
+            emitExpr(node.*.rhs)
+            putByte(41)
+            return
+        }
+    }
+    emitExpr(node.*.rhs)
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+
+fn isBoolish(n: usize) -> bool {
+    const kind = ast.kindOf(n)
+    if kind == ast.EQ || kind == ast.NE || kind == ast.LT || kind == ast.LE || kind == ast.LOGAND || kind == ast.LOGOR || kind == ast.NOT { return true }
+    return types.at(ast.typeOf(n)).*.kind == types.BOOL
+}
+
+// A condition: Mlx wants a bool where C takes any scalar.
+fn emitCond(n: usize) -> void {
+    if isBoolish(n) {
+        emitExpr(n)
+        return
+    }
+    putByte(40)
+    emitExpr(n)
+    put(if types.at(ast.typeOf(n)).*.kind == types.PTR { " != null)" } else { " != 0)" })
+}
+
+fn shiftType(ty: usize) -> []const u8 {
+    const size = types.at(ty).*.size
+    if size <= 1 { return "u3" }
+    if size == 2 { return "u4" }
+    if size == 4 { return "u5" }
+    return "u6"
+}
+
+fn binary(n: usize, operator: []const u8) -> void {
+    const node = ast.node(n)
+    putByte(40)
+    emitExpr(node.*.lhs)
+    put(operator)
+    emitExpr(node.*.rhs)
+    putByte(41)
+}
+
+// Whether a pointer-typed expression is never null in the Mlx: `this`
+// (self), a reference.
+fn isPlainPointer(n: usize) -> bool {
+    if ast.kindOf(n) != ast.VAR { return false }
+    const obj = ast.obj(ast.node(n).*.variable)
+    return obj.*.name == names.K_THIS || types.at(obj.*.ty).*.kind == types.REF
+}
+
+// An index from a byte offset the front end scaled (`i * size`, or a
+// constant), back in elements.
+// A node under the casts the front end wraps around it (an offset cast
+// to a pointer's width, an address cast to another pointer type).
+fn uncast(n: usize) -> usize {
+    var e = n
+    while e != 0 && ast.kindOf(e) == ast.CAST && ast.node(e).*.lhs != 0 { e = ast.node(e).*.lhs }
+    return e
+}
+
+fn putIndex(given: usize, elementSize: i64) -> void {
+    const offset = uncast(given)
+    if elementSize <= 1 {
+        emitExpr(offset)
+        return
+    }
+    if ast.kindOf(offset) == ast.NUM {
+        putSigned(ast.node(offset).*.value / elementSize)
+        return
+    }
+    if ast.kindOf(offset) == ast.MUL {
+        const m = ast.node(offset)
+        const l = uncast(m.*.lhs)
+        const r = uncast(m.*.rhs)
+        if ast.kindOf(r) == ast.NUM && ast.node(r).*.value == elementSize {
+            emitExpr(l)
+            return
+        }
+        if ast.kindOf(l) == ast.NUM && ast.node(l).*.value == elementSize {
+            emitExpr(r)
+            return
+        }
+    }
+    put("(")
+    emitExpr(offset)
+    put(" / ")
+    putSigned(elementSize)
+    putByte(41)
+}
+
+// `*p`: through an optional pointer `.?`, then `.*` for a record, `[0]`
+// for a many-item pointer.
+// std::min(a, b) / std::max(a, b) called with references and read
+// through: the comparison inline (its arguments written twice: fine for
+// variables and constants, noted for calls).
+fn stdMinMax(call: usize) -> u8 {
+    const callee = ast.node(call).*.lhs
+    if callee == 0 || ast.kindOf(callee) != ast.VAR { return 0 }
+    const obj = ast.obj(ast.node(callee).*.variable)
+    if !obj.*.isFunction || !isStdFunction(obj) { return 0 }
+    const first = ast.node(call).*.args
+    if first == 0 || ast.node(first).*.next == 0 || ast.node(ast.node(first).*.next).*.next != 0 { return 0 }
+    const name = base.nameOf(obj.*.name)
+    if base.same(name, "min") { return 1 }
+    if base.same(name, "max") { return 2 }
+    return 0
+}
+
+// The value a reference argument refers to.
+fn emitRefValue(given: usize) -> void {
+    var n = given
+    while true {
+        if ast.kindOf(n) == ast.CAST && ast.node(n).*.lhs != 0 && (types.at(ast.typeOf(n)).*.kind == types.REF || types.at(ast.typeOf(n)).*.kind == types.PTR) {
+            n = ast.node(n).*.lhs
+        } else if ast.kindOf(n) == ast.COMMA {
+            // `tmp = v, &tmp`: the store before the statement, the address.
+            hoist(ast.node(n).*.lhs)
+            n = ast.node(n).*.rhs
+        } else {
+            break
+        }
+    }
+    if ast.kindOf(n) == ast.ADDR {
+        const inner = ast.node(n).*.lhs
+        if ast.kindOf(inner) == ast.DEREF && ast.kindOf(ast.node(inner).*.lhs) == ast.FUNCALL && stdMinMax(ast.node(inner).*.lhs) != 0 {
+            emitMinMax(ast.node(inner).*.lhs)
+            return
+        }
+        if ast.kindOf(inner) == ast.FUNCALL { note("an argument of std::min/max is a call, written twice") }
+        emitExpr(inner)
+        return
+    }
+    // A reference or pointer value: read through.
+    emitExpr(n)
+    const t = types.at(ast.typeOf(n))
+    if t.*.kind == types.REF || t.*.kind == types.PTR { putDerefSuffix(ast.typeOf(n), isPlainPointer(n)) }
+}
+
+fn emitMinMax(call: usize) -> void {
+    const which = stdMinMax(call)
+    const a = ast.node(call).*.args
+    const b = ast.node(a).*.next
+    put("(if (")
+    emitRefValue(a)
+    put(if which == 1 { " < " } else { " > " })
+    emitRefValue(b)
+    put(") { ")
+    const savedHoist = hoistOff
+    hoistOff = true
+    emitRefValue(a)
+    put(" } else { ")
+    emitRefValue(b)
+    put(" })")
+    hoistOff = savedHoist
+}
+
+
+// What follows a pointer-valued expression of type `ptrType` to reach
+// the value: `.*` for a record (and a function), `[0]` for a many-item
+// pointer, through `.?` first unless the pointer is known not null.
+fn putDerefSuffix(ptrType: usize, plain: bool) -> void {
+    const pt = types.at(ptrType)
+    const target = types.at(pt.*.base)
+    const record = isRecordKind(target.*.kind) || target.*.kind == types.FUNC
+    if pt.*.kind == types.REF || plain {
+        put(if record { ".*" } else { "[0]" })
+    } else {
+        put(if record { ".?.*" } else { ".?[0]" })
+    }
+}
+
+// std::max / std::min of a braced list (`std::max({a, b, c})`): the
+// list is an initializer_list made over an array temporary; its elements'
+// stores are hoisted, the comparison folded over the elements.
+fn listArray(n: usize, array: *usize, length: *i64) -> void {
+    if n == 0 { return }
+    const node = ast.node(n)
+    if node.*.kind == ast.VAR && array.* == 0 {
+        const t = types.at(ast.obj(node.*.variable).*.ty)
+        if t.*.kind == types.ARRAY && ast.obj(node.*.variable).*.isLocal {
+            array.* = node.*.variable
+            length.* = t.*.arrayLength
+        }
+    }
+    listArray(node.*.lhs, array, length)
+    listArray(node.*.rhs, array, length)
+    listArray(node.*.cond, array, length)
+    listArray(node.*.then, array, length)
+    listArray(node.*.els, array, length)
+    listArray(node.*.init, array, length)
+    var b = node.*.body
+    while b != 0 {
+        listArray(b, array, length)
+        b = ast.node(b).*.next
+    }
+    var a = node.*.args
+    while a != 0 {
+        listArray(a, array, length)
+        a = ast.node(a).*.next
+    }
+}
+
+// The assignments in a tree (the list's element stores), as statements
+// before the current one.
+fn hoistAssignments(n: usize) -> void {
+    if n == 0 { return }
+    const node = ast.node(n)
+    if node.*.kind == ast.ASSIGN {
+        // The list object made of the stores and its constructor
+        // (`list = (stores, initializer_list(first, count))`): the stores
+        // in it; an element's store itself.
+        if isInitializerList(ast.typeOf(node.*.lhs)) { hoistAssignments(node.*.rhs) } else { hoist(n) }
+        return
+    }
+    hoistAssignments(node.*.lhs)
+    hoistAssignments(node.*.rhs)
+    hoistAssignments(node.*.cond)
+    hoistAssignments(node.*.then)
+    hoistAssignments(node.*.els)
+    hoistAssignments(node.*.init)
+    var b = node.*.body
+    while b != 0 {
+        hoistAssignments(b)
+        b = ast.node(b).*.next
+    }
+    var a = node.*.args
+    while a != 0 {
+        hoistAssignments(a)
+        a = ast.node(a).*.next
+    }
+}
+
+fn putElement(array: usize, k: i64) -> void {
+    putLocal(array)
+    putByte(91)
+    putSigned(k)
+    putByte(93)
+}
+
+// max(a[k], max(a[k+1], ...)) from element k on.
+fn putListFold(array: usize, k: i64, length: i64, which: u8) -> void {
+    if k + 1 >= length {
+        putElement(array, k)
+        return
+    }
+    put("(if (")
+    putElement(array, k)
+    put(if which == 1 { " < " } else { " > " })
+    putListFold(array, k + 1, length, which)
+    put(") { ")
+    putElement(array, k)
+    put(" } else { ")
+    putListFold(array, k + 1, length, which)
+    put(" })")
+}
+
+// A compact dump of a tree into the notes (the translator's own eyes).
+fn noteTree(n: usize, depth: usize) -> void {
+    if n == 0 || depth > 12 { return }
+    const node = ast.node(n)
+    putTo(&notes, "//   ")
+    var d: usize = 0
+    while d < depth {
+        putTo(&notes, ". ")
+        d += 1
+    }
+    putTo(&notes, "kind ")
+    var digits: [8]u8 = undefined
+    var count: usize = 0
+    var rest: usize = @intCast(usize, node.*.kind)
+    while true {
+        digits[7 - count] = @intCast(u8, 48 + rest % 10)
+        count += 1
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    const dp: [*]u8 = &digits
+    putTo(&notes, dp[8 - count..8])
+    if node.*.kind == ast.VAR && node.*.variable != 0 {
+        putTo(&notes, " ")
+        putTo(&notes, base.nameOf(ast.obj(node.*.variable).*.name))
+    }
+    if node.*.kind == ast.FUNCALL && node.*.lhs != 0 && ast.kindOf(node.*.lhs) == ast.VAR {
+        putTo(&notes, " call ")
+        putTo(&notes, base.nameOf(ast.obj(ast.node(node.*.lhs).*.variable).*.name))
+    }
+    putTo(&notes, "\n")
+    noteTree(node.*.lhs, depth + 1)
+    noteTree(node.*.rhs, depth + 1)
+    noteTree(node.*.cond, depth + 1)
+    noteTree(node.*.then, depth + 1)
+    noteTree(node.*.els, depth + 1)
+    var a = node.*.args
+    while a != 0 {
+        noteTree(a, depth + 1)
+        a = ast.node(a).*.next
+    }
+}
+
+fn emitListMinMax(call: usize, which: u8) -> bool {
+    const arg = ast.node(call).*.args
+    var array: usize = 0
+    var length: i64 = 0
+    listArray(arg, &array, &length)
+    if array == 0 || length < 1 || length > 16 { return false }
+    // The argument is `zeroing, ((store, store), store), list`
+    // (cpp.listTemporary): the element stores before the statement, the
+    // list object itself left out.
+    hoistAssignments(arg)
+    putListFold(array, 0, length, which)
+    return true
+}
+
+fn emitDeref(n: usize) -> void {
+    const node = ast.node(n)
+    if node.*.lhs == 0 {
+        put("0")
+        note("a dereference of nothing")
+        return
+    }
+    if ast.kindOf(node.*.lhs) == ast.FUNCALL && stdMinMax(node.*.lhs) != 0 {
+        emitMinMax(node.*.lhs)
+        return
+    }
+    if ast.kindOf(node.*.lhs) == ast.ADDR {
+        // `*&x`: x.
+        emitLvalue(ast.node(node.*.lhs).*.lhs)
+        return
+    }
+    if ast.kindOf(node.*.lhs) == ast.ADD {
+        // `*(p + i)`, `a[i]`: an index (the C++ front end scales the
+        // offset by the element's size; the index is taken back).
+        const sum = ast.node(node.*.lhs)
+        var baseExpr = sum.*.lhs
+        var bt = types.at(ast.typeOf(baseExpr))
+        var elementSize: i64 = if bt.*.kind == types.PTR || bt.*.kind == types.ARRAY { types.at(bt.*.base).*.size } else { 1 }
+        // (`(const E *)&array + i`: the array under the cast.)
+        if bt.*.kind == types.PTR && ast.kindOf(baseExpr) == ast.CAST && ast.kindOf(uncast(baseExpr)) == ast.ADDR && types.at(ast.typeOf(ast.node(uncast(baseExpr)).*.lhs)).*.kind == types.ARRAY && types.at(types.at(ast.typeOf(ast.node(uncast(baseExpr)).*.lhs)).*.base).*.size == elementSize {
+            baseExpr = uncast(baseExpr)
+        }
+        if bt.*.kind == types.PTR && ast.kindOf(baseExpr) == ast.ADDR && types.at(ast.typeOf(ast.node(baseExpr).*.lhs)).*.kind == types.ARRAY {
+            // `&array + i`: the array indexed.
+            baseExpr = ast.node(baseExpr).*.lhs
+            bt = types.at(ast.typeOf(baseExpr))
+            elementSize = types.at(bt.*.base).*.size
+            emitLvalue(baseExpr)
+            putByte(91)
+            putIndex(sum.*.rhs, elementSize)
+            putByte(93)
+            return
+        }
+        if bt.*.kind == types.ARRAY || bt.*.kind == types.PTR {
+            emitExpr(baseExpr)
+            if bt.*.kind == types.PTR && !isPlainPointer(baseExpr) { put(".?") }
+            putByte(91)
+            putIndex(sum.*.rhs, elementSize)
+            putByte(93)
+            return
+        }
+    }
+    emitExpr(node.*.lhs)
+    putDerefSuffix(ast.typeOf(node.*.lhs), isPlainPointer(node.*.lhs))
+}
+
+// An expression written where it is assigned to (a bit-field read is
+// widened, a bit-field written is not).
+fn emitLvalue(n: usize) -> void {
+    if ast.kindOf(n) == ast.MEMBER {
+        const node = ast.node(n)
+        emitExpr(node.*.lhs)
+        putByte(46)
+        const member = types.member(node.*.member)
+        if member.*.name == 0 { put("field") } else { ident(member.*.name) }
+        return
+    }
+    emitExpr(n)
+}
+
+fn emitCast(n: usize) -> void {
+    const node = ast.node(n)
+    const to = node.*.ty
+    const from = ast.typeOf(node.*.lhs)
+    const tt = types.at(to)
+    const ft = types.at(from)
+    const tk = tt.*.kind
+    const fk = ft.*.kind
+    if tk == types.VOID {
+        emitExpr(node.*.lhs)
+        return
+    }
+    if tk == types.BOOL {
+        emitCond(node.*.lhs)
+        return
+    }
+    if tk == types.REF {
+        // Binding a reference: the operand is the address already.
+        emitExpr(node.*.lhs)
+        return
+    }
+    const toInt = isIntKind(tk)
+    const fromInt = isIntKind(fk) || fk == types.BOOL
+    const toFloat = isFloatKind(tk)
+    const fromFloat = isFloatKind(fk)
+    const toPtr = tk == types.PTR
+    const fromPtr = fk == types.PTR || fk == types.ARRAY || fk == types.FUNC || fk == types.REF
+    if toInt && fromInt {
+        if fk == types.BOOL {
+            put("@intFromBool(")
+            emitExpr(node.*.lhs)
+            putByte(41)
+            return
+        }
+        if tt.*.size == ft.*.size && tt.*.unsigned == ft.*.unsigned {
+            emitExpr(node.*.lhs)
+            return
+        }
+        put(if tt.*.size == ft.*.size { "@bitCast(" } else { "@intCast(" })
+        putType(to)
+        put(", ")
+        emitExpr(node.*.lhs)
+        putByte(41)
+        return
+    }
+    if toFloat && fromInt {
+        if ast.kindOf(node.*.lhs) == ast.NUM {
+            const v = ast.node(node.*.lhs).*.value
+            if v < 0 { putByte(45) }
+            putNumber(@bitCast(u64, if v < 0 { 0 -% v } else { v }))
+            put(".0")
+            return
+        }
+        put("@floatFromInt(")
+        putType(to)
+        put(", ")
+        emitExpr(node.*.lhs)
+        putByte(41)
+        return
+    }
+    if toInt && fromFloat {
+        put("@intFromFloat(")
+        putType(to)
+        put(", ")
+        emitExpr(node.*.lhs)
+        putByte(41)
+        return
+    }
+    if toFloat && fromFloat {
+        if tt.*.size == ft.*.size {
+            emitExpr(node.*.lhs)
+            return
+        }
+        put("@floatCast(")
+        putType(to)
+        put(", ")
+        emitExpr(node.*.lhs)
+        putByte(41)
+        return
+    }
+    if toPtr && fromInt {
+        if constantValue(node.*.lhs) == 0 && ast.kindOf(node.*.lhs) == ast.NUM {
+            put("null")
+            return
+        }
+        put("unsafe { @ptrFromInt(")
+        putPointer(tt.*.base, false)
+        put(", ")
+        emitExpr(node.*.lhs)
+        put(") }")
+        return
+    }
+    if toInt && fromPtr {
+        put("@intFromPtr(")
+        emitExpr(node.*.lhs)
+        putByte(41)
+        return
+    }
+    if toPtr && fromPtr {
+        if fk == types.ARRAY {
+            putByte(38)
+            emitExpr(node.*.lhs)
+            return
+        }
+        if fk == types.REF || sameType(tt.*.base, ft.*.base) {
+            emitExpr(node.*.lhs)
+            return
+        }
+        put("unsafe { @ptrCast(")
+        putType(to)
+        put(", ")
+        emitExpr(node.*.lhs)
+        put(") }")
+        return
+    }
+    note("a cast the translator does not know")
+    emitExpr(node.*.lhs)
+}
+
+fn putStringLiteral(obj: *ast.Obj) -> void {
+    putByte(34)
+    const length = types.at(obj.*.ty).*.arrayLength
+    var k: usize = 0
+    while length > 0 && k + 1 < @intCast(usize, length) {
+        const byte = base.get8(obj.*.initData + k)
+        if byte == 34 || byte == 92 {
+            putByte(92)
+            putByte(byte)
+        } else if byte == 10 {
+            put("\\n")
+        } else if byte == 13 {
+            put("\\r")
+        } else if byte == 9 {
+            put("\\t")
+        } else if byte < 32 || byte >= 127 {
+            put("\\x")
+            const high = byte >> 4
+            const low = byte & 15
+            putByte(if high < 10 { 48 + high } else { 87 + high })
+            putByte(if low < 10 { 48 + low } else { 87 + low })
+        } else {
+            putByte(byte)
+        }
+        k += 1
+    }
+    putByte(34)
+}
+
+// A float argument as f64 for std.math (and back for a float result).
+fn putAsDouble(n: usize) -> void {
+    if ast.kindOf(n) == ast.NUM || (ast.kindOf(n) == ast.CAST && ast.kindOf(ast.node(n).*.lhs) == ast.NUM) {
+        emitExpr(n)
+        return
+    }
+    if types.at(ast.typeOf(n)).*.size == 4 {
+        put("@floatCast(f64, ")
+        emitExpr(n)
+        putByte(41)
+    } else {
+        emitExpr(n)
+    }
+}
+
+// The calls the translator knows: ANGLE's bitCast, the standard
+// library's math; true when written.
+fn emitKnownCall(node: *ast.Node, obj: *ast.Obj) -> bool {
+    const name = base.nameOf(obj.*.name)
+    const first = node.*.args
+    if first == 0 { return false }
+    const second = ast.node(first).*.next
+    if obj.*.classType == 0 && base.same(name, "bitCast") && second == 0 {
+        // gl::bitCast<T>(x): @bitCast (its argument a reference).
+        put("@bitCast(")
+        putType(node.*.ty)
+        put(", ")
+        if ast.kindOf(first) == ast.ADDR { emitExpr(ast.node(first).*.lhs) } else { emitDeref(first) }
+        putByte(41)
+        return true
+    }
+    if !isStdFunction(obj) { return false }
+    if second == 0 && (base.same(name, "min") || base.same(name, "max")) {
+        if emitListMinMax(@intFromPtr(node), if base.same(name, "min") { 1 } else { 2 }) { return true }
+        note("std::min/max of a list the translator could not read")
+        return false
+    }
+    if second == 0 && (base.same(name, "floor") || base.same(name, "ceil") || base.same(name, "sqrt")) {
+        putByte(64)
+        put(name)
+        putByte(40)
+        emitExpr(first)
+        putByte(41)
+        return true
+    }
+    const resultFloat = types.at(node.*.ty).*.size == 4
+    if second != 0 && ast.node(second).*.next == 0 && base.same(name, "pow") {
+        usesStd = true
+        if resultFloat { put("@floatCast(f32, ") }
+        put("math.pow(")
+        putAsDouble(first)
+        put(", ")
+        putAsDouble(second)
+        putByte(41)
+        if resultFloat { putByte(41) }
+        return true
+    }
+    if second == 0 && base.same(name, "log") {
+        usesStd = true
+        if resultFloat { put("@floatCast(f32, ") }
+        put("math.ln(")
+        putAsDouble(first)
+        putByte(41)
+        if resultFloat { putByte(41) }
+        return true
+    }
+    return false
+}
+
+fn emitCall(n: usize) -> void {
+    const node = ast.node(n)
+    const callee = node.*.lhs
+    if callee != 0 && ast.kindOf(callee) == ast.VAR && ast.obj(ast.node(callee).*.variable).*.isFunction {
+        const o = ast.node(callee).*.variable
+        const obj = ast.obj(o)
+        if emitKnownCall(node, obj) { return }
+        if obj.*.body == 0 || !inMainFile(obj.*.token) { noteExtern(o) }
+        if obj.*.classType != 0 {
+            putTypeName(obj.*.classType)
+            putByte(95)
+        }
+        ident(obj.*.name)
+    } else if callee != 0 {
+        emitExpr(callee)
+    } else {
+        put("call")
+    }
+    putByte(40)
+    var a = node.*.args
+    var first = true
+    while a != 0 {
+        if !first { put(", ") }
+        first = false
+        emitExpr(a)
+        a = ast.node(a).*.next
+    }
+    putByte(41)
+}
+
+pub fn emitExpr(n: usize) -> void {
+    if n == 0 {
+        put("0")
+        return
+    }
+    const node = ast.node(n)
+    const kind = node.*.kind
+    if kind == ast.NUM {
+        const t = types.at(node.*.ty)
+        if isFloatKind(t.*.kind) {
+            // (A float constant is kept as a double's bits.)
+            putFloat(@bitCast(u64, node.*.value))
+        } else if t.*.kind == types.BOOL {
+            put(if node.*.value != 0 { "true" } else { "false" })
+        } else if t.*.unsigned {
+            putNumber(@bitCast(u64, node.*.value))
+        } else {
+            putSigned(node.*.value)
+        }
+    } else if kind == ast.VAR {
+        const o = node.*.variable
+        const obj = ast.obj(o)
+        if obj.*.isLiteral {
+            putStringLiteral(obj)
+        } else if obj.*.name == names.K_THIS {
+            put("self")
+        } else if obj.*.isLocal {
+            putLocal(o)
+        } else {
+            ident(obj.*.name)
+        }
+    } else if kind == ast.MEMBER {
+        const member = types.member(node.*.member)
+        if member.*.bitWidth > 0 {
+            // A bit-field read, widened to its declared type.
+            put("@intCast(")
+            putType(member.*.ty)
+            put(", ")
+            emitLvalue(n)
+            putByte(41)
+        } else {
+            emitLvalue(n)
+        }
+    } else if kind == ast.DEREF {
+        emitDeref(n)
+    } else if kind == ast.ADDR {
+        putByte(38)
+        emitLvalue(node.*.lhs)
+    } else if kind == ast.NOT {
+        if isBoolish(node.*.lhs) {
+            putByte(33)
+            emitExpr(node.*.lhs)
+        } else {
+            putByte(40)
+            emitExpr(node.*.lhs)
+            put(if types.at(ast.typeOf(node.*.lhs)).*.kind == types.PTR { " == null)" } else { " == 0)" })
+        }
+    } else if kind == ast.BITNOT {
+        putByte(126)
+        emitExpr(node.*.lhs)
+    } else if kind == ast.NEG {
+        put("(-")
+        emitExpr(node.*.lhs)
+        putByte(41)
+    } else if kind == ast.LOGAND || kind == ast.LOGOR {
+        putByte(40)
+        emitCond(node.*.lhs)
+        put(if kind == ast.LOGAND { " && " } else { " || " })
+        emitCond(node.*.rhs)
+        putByte(41)
+    } else if kind == ast.ADD {
+        binary(n, " + ")
+    } else if kind == ast.SUB {
+        binary(n, " - ")
+    } else if kind == ast.MUL {
+        binary(n, " * ")
+    } else if kind == ast.DIV {
+        binary(n, " / ")
+    } else if kind == ast.MOD {
+        binary(n, " % ")
+    } else if kind == ast.BITAND {
+        binary(n, " & ")
+    } else if kind == ast.BITOR {
+        binary(n, " | ")
+    } else if kind == ast.BITXOR {
+        binary(n, " ^ ")
+    } else if kind == ast.EQ {
+        binary(n, " == ")
+    } else if kind == ast.NE {
+        binary(n, " != ")
+    } else if kind == ast.LT {
+        binary(n, " < ")
+    } else if kind == ast.LE {
+        binary(n, " <= ")
+    } else if kind == ast.SHL || kind == ast.SHR {
+        putByte(40)
+        emitExpr(node.*.lhs)
+        put(if kind == ast.SHL { " << @intCast(" } else { " >> @intCast(" })
+        put(shiftType(node.*.ty))
+        put(", ")
+        emitExpr(node.*.rhs)
+        put("))")
+    } else if kind == ast.ASSIGN {
+        // An assignment inside an expression: done before the statement,
+        // its value the variable.
+        hoist(n)
+        emitLvalue(node.*.lhs)
+    } else if kind == ast.COND {
+        put("(if ")
+        emitCond(node.*.cond)
+        put(" { ")
+        emitExpr(node.*.then)
+        put(" } else { ")
+        emitExpr(node.*.els)
+        put(" })")
+    } else if kind == ast.COMMA {
+        // `a, b`: a before the statement, b the value.
+        hoist(node.*.lhs)
+        emitExpr(node.*.rhs)
+    } else if kind == ast.CAST {
+        emitCast(n)
+    } else if kind == ast.FUNCALL {
+        emitCall(n)
+    } else if kind == ast.NULL_EXPR {
+        put("null")
+    } else if kind == ast.MEMZERO {
+        put("undefined")
+    } else if kind == ast.BITCAST {
+        put("@bitCast(")
+        putType(node.*.ty)
+        put(", ")
+        emitExpr(node.*.lhs)
+        putByte(41)
+    } else if kind == ast.STMT_EXPR {
+        note("a statement expression")
+        put("0")
+    } else {
+        var text: [48]u8 = undefined
+        const p: [*]u8 = &text
+        const label = "a node the translator does not know, kind "
+        var at: usize = 0
+        while at < label.length {
+            text[at] = label[at]
+            at += 1
+        }
+        text[at] = @intCast(u8, 48 + kind / 10)
+        text[at + 1] = @intCast(u8, 48 + kind % 10)
+        note(p[0..at + 2])
+        put("0")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Functions
+
+// Whether a type names a record the file does not define (a header's).
+fn hasForeignRecord(ty: usize) -> bool {
+    if ty == 0 { return false }
+    const t = types.at(ty)
+    if t.*.kind == types.PTR || t.*.kind == types.REF || t.*.kind == types.ARRAY { return hasForeignRecord(t.*.base) }
+    if isRecordKind(t.*.kind) { return !definedHere(ty) }
+    return false
+}
+
+fn signatureIsForeign(obj: *ast.Obj) -> bool {
+    if obj.*.classType != 0 && !definedHere(obj.*.classType) { return true }
+    if hasForeignRecord(types.at(obj.*.ty).*.base) { return true }
+    var c = obj.*.params
+    while c != 0 {
+        if hasForeignRecord(ast.obj(base.getWord(c)).*.ty) { return true }
+        c = base.getWord(c + 8)
+    }
+    return false
+}
+
+// `text` with every line a comment.
+fn putCommented(text: []const u8) -> void {
+    var lineStart = true
+    for byte in text {
+        if lineStart && byte != 10 { put("// ") }
+        putByte(byte)
+        lineStart = byte == 10
+    }
+}
+
+fn emitFunction(o: usize) -> void {
+    const obj = ast.obj(o)
+    if signatureIsForeign(obj) {
+        // Written as a comment: it cannot compile until the types it
+        // takes exist in Mlx (a header's record, a C++ class). What it
+        // alone called or named is not declared for it.
+        const savedOut = out
+        const savedExterns = externCount
+        const savedStructs = structCount
+        out = emptyBuffer()
+        emitFunctionText(o)
+        const text = out
+        out = savedOut
+        externCount = savedExterns
+        structCount = savedStructs
+        marker("this function takes or returns a type from a header (translate that first); its translation:")
+        newline()
+        putCommented(textOf(&text))
+        return
+    }
+    emitFunctionText(o)
+}
+
+fn emitFunctionText(o: usize) -> void {
+    const obj = ast.obj(o)
+    localCount = 0
+    loopDepth = 0
+    put("// from ")
+    putPlace(obj.*.token)
+    newline()
+    putNamespaceComment(obj)
+    put(if obj.*.isStatic { "fn " } else { "pub fn " })
+    if obj.*.classType != 0 {
+        putTypeName(obj.*.classType)
+        putByte(95)
+    }
+    ident(obj.*.name)
+    putByte(40)
+    var c = obj.*.params
+    var first = true
+    while c != 0 {
+        const p = base.getWord(c)
+        const param = ast.obj(p)
+        c = base.getWord(c + 8)
+        // (The hidden result buffer of a function returning a class by
+        // value is the return value in Mlx.)
+        if param.*.isResultBuffer { continue }
+        if !first { put(", ") }
+        first = false
+        if param.*.name == names.K_THIS {
+            put("self: ")
+            putPointer(types.at(param.*.ty).*.base, false)
+        } else {
+            ident(bindLocal(p))
+            put(": ")
+            putType(param.*.ty)
+        }
+    }
+    put(") -> ")
+    putType(types.at(obj.*.ty).*.base)
+    put(" {\n")
+    // The locals get their names, in declaration order (the list is the
+    // other way round).
+    const firstLocal = localCount
+    var l = obj.*.locals
+    var count: usize = 0
+    while l != 0 {
+        count += 1
+        l = ast.obj(l).*.next
+    }
+    var order: [MAX_LIST]usize = undefined
+    l = obj.*.locals
+    var k = count
+    while l != 0 {
+        k -= 1
+        if k < MAX_LIST { order[k] = l }
+        l = ast.obj(l).*.next
+    }
+    k = 0
+    while k < count && k < MAX_LIST {
+        const local = ast.obj(order[k])
+        if !isParam(obj, order[k]) && !local.*.isLiteral && !local.*.isResultBuffer && local.*.name != names.K_THIS { _ = bindLocal(order[k]) }
+        k += 1
+    }
+    // The body, then the locals it uses declared before it.
+    const savedOut = out
+    out = emptyBuffer()
+    emitBody(obj.*.body, 1)
+    const body = out
+    out = savedOut
+    k = firstLocal
+    while k < localCount {
+        if localUsed[k] && !isParam(obj, localObj[k]) {
+            indent(1)
+            put("var ")
+            ident(localName[k])
+            put(": ")
+            putType(ast.obj(localObj[k]).*.ty)
+            put(" = undefined\n")
+        }
+        k += 1
+    }
+    put(textOf(&body))
+    put("}\n\n")
+}
+
+fn emitExtern(o: usize) -> void {
+    const obj = ast.obj(o)
+    const t = types.at(obj.*.ty)
+    put("extern(\"c\") fn ")
+    if obj.*.classType != 0 {
+        putTypeName(obj.*.classType)
+        putByte(95)
+    }
+    ident(obj.*.name)
+    putByte(40)
+    var p = t.*.params
+    var first = true
+    var index: usize = 0
+    while p != 0 {
+        if !first { put(", ") }
+        first = false
+        const param = types.param(p)
+        if param.*.name == names.K_THIS {
+            put("self: ")
+            putPointer(types.at(param.*.ty).*.base, false)
+        } else {
+            if param.*.name == 0 {
+                put("argument")
+                putNumber(@intCast(u64, index))
+            } else {
+                ident(param.*.name)
+            }
+            put(": ")
+            putType(param.*.ty)
+        }
+        p = param.*.next
+        index += 1
+    }
+    put(") -> ")
+    putType(t.*.base)
+    if t.*.variadic {
+        put("  ")
+        marker("variadic in C: the arguments after these are not declared")
+    }
+    newline()
+    if obj.*.linkName != 0 && !obj.*.externC {
+        marker("the C++ symbol is ")
+        put(base.nameOf(obj.*.linkName))
+        put(" (mangled: a C shim is needed to call it)")
+        newline()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The unit
+
+pub fn writeUnit(globals: usize, file: u32) -> void {
+    mainFile = file
+    out = emptyBuffer()
+    pre = emptyBuffer()
+    notes = emptyBuffer()
+    markerCount = 0
+    structCount = 0
+    externCount = 0
+    usesStd = false
+    // The globals and functions of the main file (the records and the
+    // calls they mention are noted as they are written).
+    var functions: usize = 0
+    var o = globals
+    while o != 0 {
+        const obj = ast.obj(o)
+        if !obj.*.isFunction && !obj.*.isLocal && !obj.*.isLiteral && inMainFile(obj.*.token) && !(obj.*.isExtern && !obj.*.isDefinition) { emitGlobal(o) }
+        o = obj.*.next
+    }
+    o = globals
+    while o != 0 {
+        const obj = ast.obj(o)
+        if functionHere(obj) {
+            emitFunction(o)
+            functions += 1
+        }
+        o = obj.*.next
+    }
+    const body = out
+    // The records: those defined here as structs, the others as marks.
+    out = emptyBuffer()
+    var k: usize = 0
+    while k < structCount {
+        if definedHere(structList[k]) { emitStruct(structList[k]) }
+        k += 1
+    }
+    var foreign: usize = 0
+    k = 0
+    while k < structCount {
+        if !definedHere(structList[k]) {
+            marker("the type ")
+            putTypeName(structList[k])
+            put(" comes from a header (")
+            put(base.nameOf(types.at(structList[k]).*.name))
+            put("): translate or import it\n")
+            foreign += 1
+        }
+        k += 1
+    }
+    if foreign > 0 { newline() }
+    const records = out
+    // The calls outside the file.
+    out = emptyBuffer()
+    if externCount > 0 {
+        put("// Called, defined elsewhere:\n")
+        k = 0
+        while k < externCount {
+            emitExtern(externList[k])
+            k += 1
+        }
+        newline()
+    }
+    const externs = out
+    // The file.
+    out = emptyBuffer()
+    put("// Translated by mlx-cc --emit-mlx from ")
+    put(base.nameOf(base.fileName(mainFile)))
+    put(": a first version of the C++ (LATTICE.md).\n")
+    put("// The `// LATTICE:` marks name what the hand settles; the notes at the end list the rest.\n")
+    if usesStd { put("const math = @import(\"std.math\")\n") }
+    newline()
+    put(textOf(&records))
+    put(textOf(&body))
+    if functions == 0 {
+        marker("no function of the main file (id ")
+        putNumber(@intCast(u64, mainFile))
+        put(") was found; the objects seen, with their files:\n")
+        o = globals
+        var shown: usize = 0
+        while o != 0 && shown < 40 {
+            const obj = ast.obj(o)
+            if !obj.*.isLocal && !obj.*.isLiteral {
+                put("//   ")
+                ident(obj.*.name)
+                put(if obj.*.isFunction { " fn" } else { " var" })
+                put(" token-file ")
+                putNumber(if obj.*.token != 0 { @intCast(u64, tokens.at(obj.*.token).*.file) } else { 0 })
+                newline()
+                shown += 1
+            }
+            o = obj.*.next
+        }
+    }
+    put(textOf(&externs))
+    if notes.length > 0 {
+        put("// Notes:\n")
+        put(textOf(&notes))
+    }
+    put("// LATTICE: ")
+    putNumber(@intCast(u64, markerCount))
+    put(" marks in this file.\n")
+    if !program.writeBytes(outputPath(), out.data, out.length) {
+        base.say("mlx-cc: cannot write ")
+        base.say(outputPath())
+        base.say("\n")
+        base.exit(1)
+    }
+}

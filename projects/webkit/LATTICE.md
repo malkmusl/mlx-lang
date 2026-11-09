@@ -58,6 +58,44 @@ then makes it Mlx (ownership, errors, containers), and the differential
 tests say when it is right. What the translator cannot express is listed
 per component, so the tool improves before the hand work grows.
 
+### The translator today (L0)
+
+`mlx-cc --emit-mlx=FILE unit.cpp` (compiler/cc/emitmlx.mlx) writes the
+definitions of a unit's main file -- its structs, globals and functions,
+not what its headers declare -- as Mlx from mlx-cc's typed tree, after the
+unit is parsed and type-checked with the same flags the build uses. What
+it does now:
+
+- declarations: structs (a group of bit-fields as a `packed struct`),
+  module constants and variables with their initial values, functions
+  with Mlx types for the C++ ones (`?[*]T` for pointers, `u64`, `f32`,
+  ...), the C functions the unit calls as `extern("c")` declarations;
+- statements: blocks, `if`, `while`/`for` as `while` with labelled
+  `break` and `continue`, `switch` as `match`, returns; a comma
+  expression's temporaries hoisted as statements before the one they
+  serve; only the locals the Mlx uses are declared;
+- expressions with their resolved types: casts written as
+  `@intCast`/`@floatCast`/`@floatFromInt`/`@intFromFloat`/`@bitCast`,
+  `@ptrCast` and `@ptrFromInt` in `unsafe`, `*(p + i)` back to `p[i]`,
+  `std::min`/`max` (two arguments or a braced list) inline, `floor`,
+  `ceil`, `sqrt`, `pow` and `log` on std.math, `gl::bitCast` as
+  `@bitCast`, string literals;
+- ANGLE's `ASSERT`/`ERR` stream machinery dropped with a
+  `// LATTICE: a log dropped:` mark carrying the message's strings.
+
+What it leaves to the hand is marked `// LATTICE:` in place and counted at
+the end of the file: a function taking or returning a type a header
+defines (written out, commented, until that header is translated),
+operator and stream calls, variadic C functions. The output is kept in
+the repository (projects/lattice/angle/common), regenerated with
+`tools/check_lattice_emit.sh --update`, and the check fails when the
+translator's output drifts from what is kept. The pilot units: ANGLE's
+aligned_memory.cpp (its unit test as Mlx) and mathutil.cpp (RGB9E5
+packing; a differential test prints the same bits from the Mlx and from
+the C++ built by mlx-cc). Along the way mlx4 learnt packed structs laid
+out in bits (tests/434_packed_struct_runtime.mlx): C++ bit-fields are
+everywhere in ANGLE.
+
 ## The pilot: ANGLE
 
 ANGLE (Source/ThirdParty/ANGLE) comes first: it is self-contained, its
@@ -93,7 +131,7 @@ The order:
 
 | | Goal | Done when |
 |---|---|---|
-| L0 | Groundwork | WebKit in the repository unmodified and guarded (done); the build takes it from there (done); the code map indexes everything compiled; `mlx-cc --emit-mlx` translates a sample of ANGLE's common/ that compiles with mlx4 and passes ANGLE's own tests of it |
+| L0 | Groundwork | WebKit in the repository unmodified and guarded (done); the build takes it from there (done); the code map indexes everything compiled; `mlx-cc --emit-mlx` translates a sample of ANGLE's common/ that compiles with mlx4 and passes ANGLE's own tests of it (done for aligned_memory and mathutil: tools/check_lattice_emit.sh) |
 | L1 | ANGLE's shader translator in Mlx | the differential tests above pass for every shader of the WebGL tests; Voyager runs WebGL with it |
 | L2 | ANGLE in Mlx | WebGL checks and paint pages the same with the Mlx ANGLE; the C++ ANGLE retired from the build |
 | L3 | The plan for WebKit | from L0–L2's experience: the order of WTF, JavaScriptCore, WebCore and the port, what is translated and what is rewritten, written here |
