@@ -152,6 +152,13 @@ fn main() u8 {
 
 (`tests/114_unsigned_comparison_runtime.mlx`)
 
+## Float negation
+
+`-x` on an `f32` or `f64` flips the sign bit, as IEEE 754 negation does:
+`-(0.0)` is `-0.0` (equal to `0.0`, its bit pattern `0x80000000`), and
+`-(-0.0)` is `+0.0`; it is not `0.0 - x`, which would turn both zeros
+into `+0.0` (`tests/435_float_negative_zero_runtime.mlx`).
+
 ## Float literals
 
 Float literals accept a decimal exponent suffix (`e`/`E`, with an optional
