@@ -72,18 +72,30 @@ it does now:
   the headers' constants the functions name, functions with Mlx types
   for the C++ ones (`?[*]T` for pointers, `u64`, `f32`, a plain `char`
   as `u8`), C++ overloads told apart by their parameter types in the
-  name, the C functions the unit calls as `extern("c")` declarations;
+  name, the C library's functions the unit calls (`malloc`, `memcpy`,
+  `strlen`, `strtod`, `fputs`, `operator new`...) as calls on a runtime
+  module written in Mlx (projects/lattice/runtime/c.mlx: no C library
+  under the translation), anything else called but not defined as an
+  `extern("c")` declaration;
 - statements: blocks, `if`, `while`/`for` as `while` with labelled
-  `break` and `continue`, `switch` as `match` (grouped case labels as
-  ranges, the body repeated under the labels a range cannot join; a
-  return ends the arm), `do { } while (0)` as its body, returns; a comma
-  expression's temporaries hoisted as statements before the one they
-  serve; only the locals the Mlx uses are declared, a value-initializing
-  zero before an initializer dropped;
+  `break` and `continue` (a `for` loop's increment runs before each
+  `continue`; a condition that hoists statements, `i-- > 0`, becomes a
+  `while true` with the condition tested first), `switch` as `match`
+  (grouped case labels as ranges, the body repeated under the labels a
+  range cannot join; a return ends the arm; the `default` arm written
+  last, as Mlx tries the arms in order; `break` and `continue` pass
+  through the arms to the loop around), `do { } while (0)` as its body,
+  returns (and `return undefined` after a body that ends in a `for (;;)`
+  with the returns inside); a comma expression's temporaries hoisted as
+  statements before the one they serve; only the locals the Mlx uses are
+  declared, a value-initializing zero before an initializer dropped;
 - expressions with their resolved types: casts written as
   `@intCast`/`@floatCast`/`@floatFromInt`/`@intFromFloat`/`@bitCast`,
   `@ptrCast` and `@ptrFromInt` in `unsafe`, `*(p + i)` and a decayed
-  array's `a + i` back to `p[i]` with a usize index, `std::min`/`max`
+  array's `a + i` back to `p[i]` with a usize index (through a many-item
+  view when `p` points at records: Mlx's `*S` does not index), `p - n`
+  as `&p[i - n]`, a C pointer unwrapped (`.?`) where the callee takes
+  `this` or a reference or a reference variable is bound, `std::min`/`max`
   (two arguments or a braced list) inline, `floor`, `ceil`, `sqrt`,
   `pow` and `log` on std.math, `std::numeric_limits<T>::max()`/`min()`
   as the number, `gl::bitCast` as `@bitCast`, string literals (`"gl_"`
@@ -109,26 +121,53 @@ N>` is `[N]T` with `data()`, `size()` and `[]` inline; `std::move` and
 number; the C library's and `std::` math functions are std.math and the
 float builtins.
 
+Headers resolve to modules, so the output is pure Mlx with no C or C++
+under it. `--emit-mlx-units=LIST` names the units translated alongside:
+a function or record a header declares whose definition is another
+unit's (utilities.cpp calling string_utils.cpp's `BeginsWith`,
+`IndexRange` from the header of another unit) is `unit.name` on
+`const unit = @import("./unit.mlx")`, not an extern. `--emit-mlx-std=
+IMPORT` names the std module: mlxlibcpp's string.cpp translated by the
+same translator (projects/lattice/runtime/libcpp.mlx, 228 functions,
+no externs; the file's explicit instantiations say which of the
+header's templates it exports), so `std::string`, `std::string_view`
+and `char_traits<char>` are `libcpp.string`, `libcpp.basic_string_view_
+...` with every method (`libcpp.string_find_const__const_string_u64`)
+-- the std headers `string` and `string_view` belong to that module, the
+other std headers' template instances (`std::vector<T>`, `std::
+allocator<T>`) come along with each unit that uses them. Overloads are
+named by their parameter types without the module, so the name is the
+same inside the module and in the units that import it. Every inline
+body is read when translating (not only the ones a unit calls), so a
+header's record comes along with all its methods. The C library is the
+runtime module: `c.malloc`, `c.strtod`, `c.stdout()`, `c.fputs` and the
+rest in Mlx over std.heap and std.io (projects/lattice/runtime/c.mlx),
+`--emit-mlx-runtime=IMPORT` says where it is.
+
 What it leaves to the hand is marked `// LATTICE:` in place and counted at
 the end of the file: a function taking or returning a type the Mlx lacks
-(a `std::string`, a `std::vector`, a `std::tuple`; written out,
-commented, until the hand gives the type an Mlx shape), one calling such
-a function, stream calls, variadic C calls (`printf`). The output is kept
-in the repository (projects/lattice/angle/common), regenerated with
-`tools/check_lattice_emit.sh --update`, and the check fails when the
-translator's output drifts from what is kept. The pilot units: ANGLE's
-aligned_memory.cpp (its unit test as Mlx), mathutil.cpp (RGB9E5
-packing), Float16ToFloat32.cpp (every half-precision pattern),
+(a `std::vector<std::tuple>`, an `ifstream`, a lambda's closure; written
+out, commented, until the hand gives the type an Mlx shape), one calling
+such a function (or one held back so), stream calls, variadic C calls
+(`printf`, `snprintf`), a `goto`. The output is kept in the repository
+(projects/lattice/angle/common and projects/lattice/runtime/libcpp.mlx),
+regenerated with `tools/check_lattice_emit.sh --update`, and the check
+fails when the translator's output drifts from what is kept. The pilot
+units: ANGLE's aligned_memory.cpp (its unit test as Mlx), mathutil.cpp
+(RGB9E5 packing), Float16ToFloat32.cpp (every half-precision pattern),
 utilities.cpp (the GL type and target predicates, sizes, counts and
 orders over the whole enum range), matrix_utils.cpp (Mat4 made, rotated,
-translated, scaled, frustum, perspective, ortho, products), MemoryBuffer.cpp
-(a buffer resized, reserved, filled, cleared, destroyed) and
-platform_helpers.cpp; each differential test prints the same, bit for
-bit, from the Mlx and from the C++ built by mlx-cc and run on mlxlibc
-(whose libm wraps the same std.math). Along the way mlx4 learnt packed
-structs laid out in bits (tests/434_packed_struct_runtime.mlx: C++
-bit-fields are everywhere in ANGLE) and to negate a float by its sign
-bit (tests/435_float_negative_zero_runtime.mlx: Mat4::Ortho's `-0.0`).
+translated, scaled, frustum, perspective, ortho, products),
+MemoryBuffer.cpp (a buffer resized, reserved, filled, cleared,
+destroyed), platform_helpers.cpp and string_utils.cpp (splitting,
+trimming, prefixes, affixes, tokens, case, replacement and wildcards,
+through the std module's string and string_view); each differential test
+prints the same, bit for bit, from the Mlx and from the C++ built by
+mlx-cc and run on mlxlibc (whose libm wraps the same std.math). Along
+the way mlx4 learnt packed structs laid out in bits
+(tests/434_packed_struct_runtime.mlx: C++ bit-fields are everywhere in
+ANGLE) and to negate a float by its sign bit
+(tests/435_float_negative_zero_runtime.mlx: Mat4::Ortho's `-0.0`).
 
 ## The pilot: ANGLE
 
@@ -165,7 +204,7 @@ The order:
 
 | | Goal | Done when |
 |---|---|---|
-| L0 | Groundwork | WebKit in the repository unmodified and guarded (done); the build takes it from there (done); the code map indexes everything compiled; `mlx-cc --emit-mlx` translates a sample of ANGLE's common/ that compiles with mlx4 and passes ANGLE's own tests of it (done: seven units, tools/check_lattice_emit.sh) |
+| L0 | Groundwork | WebKit in the repository unmodified and guarded (done); the build takes it from there (done); the code map indexes everything compiled; `mlx-cc --emit-mlx` translates a sample of ANGLE's common/ that compiles with mlx4 and passes ANGLE's own tests of it (done: eight units and mlxlibcpp's string as the std module, pure Mlx on a runtime module in Mlx, tools/check_lattice_emit.sh) |
 | L1 | ANGLE's shader translator in Mlx | the differential tests above pass for every shader of the WebGL tests; Voyager runs WebGL with it |
 | L2 | ANGLE in Mlx | WebGL checks and paint pages the same with the Mlx ANGLE; the C++ ANGLE retired from the build |
 | L3 | The plan for WebKit | from L0–L2's experience: the order of WTF, JavaScriptCore, WebCore and the port, what is translated and what is rewritten, written here |

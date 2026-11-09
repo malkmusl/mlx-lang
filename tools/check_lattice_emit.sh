@@ -47,16 +47,29 @@ flags=(-DANGLE_ENABLE_ESSL -DANGLE_ENABLE_GLSL -DANGLE_ENABLE_VULKAN -DANGLE_PLA
     -Imlx-out/include/mlx-zlib -Imlx-out/include/mlx-vulkan -Imlx-out/include/mlx-spirv
     -std=c++23 -include "$angle/ANGLEPrefix.h")
 
-units=(aligned_memory mathutil Float16ToFloat32 utilities matrix_utils MemoryBuffer platform_helpers)
+# The C++ library's string (mlxlibcpp, compiler/libcpp/string.cpp) as the
+# std module the translations call (projects/lattice/runtime/libcpp.mlx).
+runtime=projects/lattice/runtime
+"$work/mlx-cc" -std=c++23 --emit-mlx-runtime=./c.mlx --emit-mlx="$work/libcpp.mlx" compiler/libcpp/string.cpp 2> "$work/libcpp.err" || fail "string.cpp does not translate: $(head -5 "$work/libcpp.err")"
+if [[ $update -eq 1 ]]; then
+    cp "$work/libcpp.mlx" "$runtime/libcpp.mlx"
+elif ! cmp -s "$work/libcpp.mlx" "$runtime/libcpp.mlx"; then
+    fail "$runtime/libcpp.mlx is not what the translator writes now (tools/check_lattice_emit.sh --update): $(diff "$runtime/libcpp.mlx" "$work/libcpp.mlx" | head -12)"
+fi
+echo "ok   mlxlibcpp's string translated ($(grep -c '^pub fn\|^fn' "$runtime/libcpp.mlx") functions, $(grep -c 'LATTICE:' "$runtime/libcpp.mlx") marks for the hand)"
+
+units=(aligned_memory mathutil Float16ToFloat32 utilities matrix_utils MemoryBuffer platform_helpers string_utils)
+unit_list=$(IFS=,; echo "${units[*]}")
 for unit in "${units[@]}"; do
-    "$work/mlx-cc" "${flags[@]}" --emit-mlx="$work/$unit.mlx" "$angle/src/common/$unit.cpp" 2> "$work/$unit.err" || fail "$unit.cpp does not translate: $(head -5 "$work/$unit.err")"
+    "$work/mlx-cc" "${flags[@]}" --emit-mlx-units="$unit_list" --emit-mlx-std=../../runtime/libcpp.mlx --emit-mlx="$work/$unit.mlx" "$angle/src/common/$unit.cpp" 2> "$work/$unit.err" || fail "$unit.cpp does not translate: $(head -5 "$work/$unit.err")"
     if [[ $update -eq 1 ]]; then
         cp "$work/$unit.mlx" "$out/$unit.mlx"
     elif ! cmp -s "$work/$unit.mlx" "$out/$unit.mlx"; then
         fail "$out/$unit.mlx is not what the translator writes now (tools/check_lattice_emit.sh --update): $(diff "$out/$unit.mlx" "$work/$unit.mlx" | head -12)"
     fi
     marks=$(grep -c '^// LATTICE:\|// LATTICE: ' "$out/$unit.mlx" || true)
-    echo "ok   $unit.cpp translated ($(grep -c '^pub fn\|^fn' "$out/$unit.mlx") functions, $marks marks for the hand)"
+    externs=$(grep -c '^extern("c")' "$out/$unit.mlx" || true)
+    echo "ok   $unit.cpp translated ($(grep -c '^pub fn\|^fn' "$out/$unit.mlx") functions, $marks marks for the hand, $externs C externs)"
 done
 
 # ANGLE's aligned_memory test (aligned_memory_unittest.cpp) as Mlx on the translated module.
@@ -85,4 +98,5 @@ differential utilities utilities "the GL type and target predicates, sizes, coun
 differential matrix_utils matrix "Mat4 made, rotated, translated, scaled, frustum, perspective, ortho, products with a matrix and a vector"
 differential MemoryBuffer memorybuffer "a buffer resized, reserved, filled, cleared and destroyed"
 differential platform_helpers platform "the platform predicates"
+differential string_utils string_utils "splitting, trimming, prefixes, affixes, tokens, case, replacement and wildcards through the std module"
 echo "check_lattice_emit.sh: all checks passed"

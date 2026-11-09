@@ -15,6 +15,15 @@ What is here is the translator's output and the tests of it:
   unit test as Mlx where it has one (aligned_memory), else a differential
   test: an Mlx driver and a C++ reference (built by mlx-cc against the
   C++ unit) print the same lines for the same inputs.
+- `runtime/c.mlx`: the C library the translated code calls (`c.malloc`,
+  `c.memcpy`, `c.strtod`, `c.fputs`...), written in Mlx over std.heap and
+  std.io; the translator's `--emit-mlx-runtime` names it. Written by
+  hand.
+- `runtime/libcpp.mlx`: the std module, mlxlibcpp's string.cpp
+  (compiler/libcpp) translated by the same translator: `std::string`,
+  `std::string_view` and `char_traits<char>` with all their methods, as
+  `libcpp.string`, `libcpp.string_find...`; the translator's
+  `--emit-mlx-std` names it. Generated, like the units.
 
 `tools/check_lattice_emit.sh` builds mlx-cc, translates the units,
 compares the output with the files here, compiles them with mlx4 and runs

@@ -368,4 +368,11 @@ double stod(const string &text, size_t *end) {
 
 float stof(const string &text, size_t *end) { return (float)stod(text, end); }
 
+// The whole of the header's templates this file stands for, defined
+// here (the C++ to Mlx translator writes this file as the std module,
+// projects/lattice/runtime/libcpp.mlx: every member it has is one the
+// translated units can call).
+template struct char_traits<char>;
+template class basic_string_view<char>;
+
 }
