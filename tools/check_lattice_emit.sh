@@ -41,7 +41,7 @@ flags=(-DANGLE_ENABLE_ESSL -DANGLE_ENABLE_GLSL -DANGLE_ENABLE_VULKAN -DANGLE_PLA
     -Imlx-out/include/mlx-zlib -Imlx-out/include/mlx-vulkan -Imlx-out/include/mlx-spirv
     -std=c++23 -include "$angle/ANGLEPrefix.h")
 
-units=(aligned_memory mathutil)
+units=(aligned_memory mathutil Float16ToFloat32 utilities)
 for unit in "${units[@]}"; do
     "$work/mlx-cc" "${flags[@]}" --emit-mlx="$work/$unit.mlx" "$angle/src/common/$unit.cpp" 2> "$work/$unit.err" || fail "$unit.cpp does not translate: $(head -5 "$work/$unit.err")"
     if [[ $update -eq 1 ]]; then
@@ -58,11 +58,22 @@ done
 "$work/aligned_test" > "$work/aligned.out" 2>&1 || fail "the aligned_memory test: $(cat "$work/aligned.out")"
 echo "ok   $(cat "$work/aligned.out")"
 
-# The mathutil differential test: the C++ (built by mlx-cc) and the Mlx print the same.
-"$work/mlx-cc" "${flags[@]}" -o "$work/mathutil_ref" "$out/tests/mathutil_ref.cpp" "$angle/src/common/mathutil.cpp" 2> "$work/ref.err" || fail "the C++ reference does not build: $(head -5 "$work/ref.err")"
-"$work/mathutil_ref" > "$work/ref.out" || fail "the C++ reference does not run"
-"$compiler" --quiet "$out/tests/mathutil_test.mlx" -o "$work/mathutil_test" 2> "$work/mathutil.err" || fail "mathutil_test.mlx does not compile: $(head -5 "$work/mathutil.err")"
-"$work/mathutil_test" > "$work/mlx.out" || fail "the Mlx mathutil test does not run"
-cmp -s "$work/ref.out" "$work/mlx.out" || fail "mathutil: the Mlx and the C++ differ (C++ < > Mlx): $(diff "$work/ref.out" "$work/mlx.out" | head -12)"
-echo "ok   mathutil: RGB9E5 packing and unpacking, $(wc -l < "$work/ref.out") inputs the same in Mlx and C++"
+# A differential test: the C++ reference (built by mlx-cc against the C++
+# unit) and the Mlx driver (on the translated module) print the same.
+differential() { # UNIT TEST WORDS [OTHER C++ UNITS THE REFERENCE LINKS...]
+    local unit=$1 test=$2 words=$3
+    shift 3
+    local others=()
+    local other
+    for other in "$@"; do others+=("$angle/src/common/$other.cpp"); done
+    "$work/mlx-cc" "${flags[@]}" -o "$work/${test}_ref" "$out/tests/${test}_ref.cpp" "$angle/src/common/$unit.cpp" "${others[@]}" 2> "$work/${test}_ref.err" || fail "$test: the C++ reference does not build: $(head -5 "$work/${test}_ref.err")"
+    "$work/${test}_ref" > "$work/${test}_ref.out" || fail "$test: the C++ reference does not run"
+    "$compiler" --quiet "$out/tests/${test}_test.mlx" -o "$work/${test}_test" 2> "$work/${test}.err" || fail "${test}_test.mlx does not compile: $(head -5 "$work/${test}.err")"
+    "$work/${test}_test" > "$work/${test}_mlx.out" || fail "$test: the Mlx test does not run"
+    cmp -s "$work/${test}_ref.out" "$work/${test}_mlx.out" || fail "$test: the Mlx and the C++ differ (C++ < > Mlx): $(diff "$work/${test}_ref.out" "$work/${test}_mlx.out" | head -12)"
+    echo "ok   $unit: $words, $(wc -l < "$work/${test}_ref.out") lines the same in Mlx and C++"
+}
+differential mathutil mathutil "RGB9E5 packing and unpacking"
+differential Float16ToFloat32 float16 "every half-precision pattern to a float"
+differential utilities utilities "the GL type and target predicates, sizes, counts and orders over the enum range" string_utils
 echo "check_lattice_emit.sh: all checks passed"

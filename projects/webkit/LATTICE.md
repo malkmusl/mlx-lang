@@ -67,19 +67,27 @@ unit is parsed and type-checked with the same flags the build uses. What
 it does now:
 
 - declarations: structs (a group of bit-fields as a `packed struct`),
-  module constants and variables with their initial values, functions
-  with Mlx types for the C++ ones (`?[*]T` for pointers, `u64`, `f32`,
-  ...), the C functions the unit calls as `extern("c")` declarations;
+  module constants and variables with their initial values (arrays of
+  scalars as `[N]T{ ... }` literals, the tables of Float16ToFloat32),
+  the headers' constants the functions name, functions with Mlx types
+  for the C++ ones (`?[*]T` for pointers, `u64`, `f32`, a plain `char`
+  as `u8`), C++ overloads told apart by their parameter types in the
+  name, the C functions the unit calls as `extern("c")` declarations;
 - statements: blocks, `if`, `while`/`for` as `while` with labelled
-  `break` and `continue`, `switch` as `match`, returns; a comma
+  `break` and `continue`, `switch` as `match` (grouped case labels as
+  ranges, the body repeated under the labels a range cannot join; a
+  return ends the arm), `do { } while (0)` as its body, returns; a comma
   expression's temporaries hoisted as statements before the one they
-  serve; only the locals the Mlx uses are declared;
+  serve; only the locals the Mlx uses are declared, a value-initializing
+  zero before an initializer dropped;
 - expressions with their resolved types: casts written as
   `@intCast`/`@floatCast`/`@floatFromInt`/`@intFromFloat`/`@bitCast`,
-  `@ptrCast` and `@ptrFromInt` in `unsafe`, `*(p + i)` back to `p[i]`,
-  `std::min`/`max` (two arguments or a braced list) inline, `floor`,
-  `ceil`, `sqrt`, `pow` and `log` on std.math, `gl::bitCast` as
-  `@bitCast`, string literals;
+  `@ptrCast` and `@ptrFromInt` in `unsafe`, `*(p + i)` and a decayed
+  array's `a + i` back to `p[i]` with a usize index, `std::min`/`max`
+  (two arguments or a braced list) inline, `floor`, `ceil`, `sqrt`,
+  `pow` and `log` on std.math, `std::numeric_limits<T>::max()`/`min()`
+  as the number, `gl::bitCast` as `@bitCast`, string literals (`"gl_"`
+  where a `const char *` is wanted as `"gl_".pointer`);
 - ANGLE's `ASSERT`/`ERR` stream machinery dropped with a
   `// LATTICE: a log dropped:` mark carrying the message's strings.
 
@@ -90,11 +98,15 @@ operator and stream calls, variadic C functions. The output is kept in
 the repository (projects/lattice/angle/common), regenerated with
 `tools/check_lattice_emit.sh --update`, and the check fails when the
 translator's output drifts from what is kept. The pilot units: ANGLE's
-aligned_memory.cpp (its unit test as Mlx) and mathutil.cpp (RGB9E5
-packing; a differential test prints the same bits from the Mlx and from
-the C++ built by mlx-cc). Along the way mlx4 learnt packed structs laid
-out in bits (tests/434_packed_struct_runtime.mlx): C++ bit-fields are
-everywhere in ANGLE.
+aligned_memory.cpp (its unit test as Mlx), mathutil.cpp (RGB9E5
+packing), Float16ToFloat32.cpp (every half-precision pattern) and
+utilities.cpp (the GL type and target predicates, sizes, counts and
+orders over the whole enum range; what takes a `std::string`, a
+`std::vector` or an `IndexRange` is still commented out); each
+differential test prints the same from the Mlx and from the C++ built by
+mlx-cc. Along the way mlx4 learnt packed structs laid out in bits
+(tests/434_packed_struct_runtime.mlx): C++ bit-fields are everywhere in
+ANGLE.
 
 ## The pilot: ANGLE
 
