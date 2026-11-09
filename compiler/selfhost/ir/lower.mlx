@@ -545,6 +545,29 @@ fn writeInitialBytes(builder: *LirBuilder, node_index: usize, type_id: usize, ta
     }
     if node.tag == ast.Tag.aggregate_literal {
         if value_type.*.kind != types_store.Kind.struct_type { return false }
+        if value_type.*.flags & types_store.FLAG_PACKED != 0 {
+            // A packed struct's constant: the fields' bits in one word.
+            var word: u64 = 0
+            var packed_index = node.rhs
+            while packed_index != ast.NONE {
+                const initializer = ast_store.Store.get(nodes, packed_index)
+                const field = packedFieldIn(builder, type_id, initializer.mainToken)
+                if !field.found { return false }
+                const scalar = lowerComptimeValue(builder, initializer.rhs)
+                if scalar.kind != comptime_value.Kind.integer && scalar.kind != comptime_value.Kind.boolean { return false }
+                const bits = types_store.Store.bitSizeOf(builder.*.typeStore, field.fieldTypeId)
+                const field_bits = @bitCast(u64, @intCast(i64, scalar.integer)) & @intCast(u64, packedMask(bits))
+                word = word | (field_bits << @intCast(u6, field.bitOffset))
+                packed_index = initializer.next
+            }
+            const size = types_store.Store.sizeOf(builder.*.typeStore, type_id)
+            var byte: usize = 0
+            while byte < size {
+                target[byte] = @intCast(u8, (word >> @intCast(u6, byte * 8)) & 255)
+                byte += 1
+            }
+            return true
+        }
         var initializer_index = node.rhs
         while initializer_index != ast.NONE {
             const initializer = ast_store.Store.get(nodes, initializer_index)
@@ -2446,6 +2469,26 @@ fn lowerAggregateLiteral(builder: *LirBuilder, node_index: usize) -> usize {
     const aggregate_type = types_store.Store.get(builder.*.typeStore, type_id)
     var initializer_index = node.rhs
     var count: usize = 0
+    if aggregate_type.*.kind == types_store.Kind.struct_type && aggregate_type.*.flags & types_store.FLAG_PACKED != 0 {
+        // A packed struct: its word zeroed, each field put into its bits.
+        const size = types_store.Store.sizeOf(builder.*.typeStore, type_id)
+        var zero_store = lir.initInst(lir.Opcode.store, lir.NONE)
+        zero_store.arg0 = base
+        zero_store.arg1 = lir.addInst(builder.*.lir, lir.constI(packedWordType(builder, type_id), 0))
+        zero_store.arg2 = size
+        lir.addInst(builder.*.lir, zero_store)
+        while initializer_index != ast.NONE && count < node.extra {
+            const initializer = ast_store.Store.get(nodes, initializer_index)
+            const field = packedFieldIn(builder, type_id, initializer.mainToken)
+            if field.found && ast_store.Store.get(nodes, initializer.rhs).tag != ast.Tag.undefined_literal {
+                const value = widenToType(builder, narrowFloat(builder, lowerNode(builder, initializer.rhs), field.fieldTypeId), field.fieldTypeId)
+                packedFieldStore(builder, base, field, value)
+            }
+            initializer_index = initializer.next
+            count += 1
+        }
+        return base
+    }
     while initializer_index != ast.NONE && count < node.extra {
         const initializer = ast_store.Store.get(nodes, initializer_index)
         const metadata = fieldMetadata(builder, type_id, initializer.mainToken)
@@ -3066,6 +3109,31 @@ fn lowerBuiltin(builder: *LirBuilder, node_index: usize) -> usize {
         }
         var context = wideContext(builder)
         const source_type_id = expressionType(builder, argument)
+        if kind == builtins.Kind.bitCast && !isWideType(builder, result_type_id) {
+            // A struct's bits as an integer (`@bitCast(u32, packed_value)`:
+            // the struct is in memory, the integer its word), and an
+            // integer's as a struct (a word stored, the struct at it).
+            if aggregate_copy.isMemoryType(builder.*.typeStore, source_type_id) && isIntegerKind(builder, result_type_id) {
+                var word_load = lir.initInst(lir.Opcode.load, result_type_id)
+                word_load.arg0 = value
+                word_load.arg1 = storageWidth(builder, result_type_id)
+                word_load.arg2 = if isSignedIntegerType(builder, result_type_id) { 1 } else { 0 }
+                return lir.addInst(builder.*.lir, word_load)
+            }
+            if aggregate_copy.isMemoryType(builder.*.typeStore, result_type_id) && isIntegerKind(builder, source_type_id) {
+                var allocation_size = types_store.Store.sizeOf(builder.*.typeStore, result_type_id)
+                if allocation_size < 8 { allocation_size = 8 }
+                var allocation = lir.initInst(lir.Opcode.alloca, result_type_id)
+                allocation.arg0 = allocation_size
+                const base = lir.addInst(builder.*.lir, allocation)
+                var word_store = lir.initInst(lir.Opcode.store, lir.NONE)
+                word_store.arg0 = base
+                word_store.arg1 = value
+                word_store.arg2 = storageWidth(builder, source_type_id)
+                lir.addInst(builder.*.lir, word_store)
+                return base
+            }
+        }
         if (kind == builtins.Kind.intCast || kind == builtins.Kind.bitCast) && (isWideType(builder, result_type_id) || wide.isWideValue(&context, value)) {
             // To a wide integer: widened by the source's sign, then made
             // the result's width; from one: the low bits as the result.
@@ -3142,6 +3210,8 @@ fn lowerFieldAddress(builder: *LirBuilder, node_index: usize) -> usize {
     if base_type == 0 { return lir.NONE }
     const metadata = fieldMetadata(builder, base_type, node.mainToken)
     if !metadata.found { return lir.NONE }
+    // (A packed struct's field is bits of a word: no address of its own.)
+    if packedFieldIn(builder, base_type, node.mainToken).found { return lir.NONE }
     const base = lowerNode(builder, node.lhs)
     if base == lir.NONE { return lir.NONE }
     const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, metadata.offset))
@@ -3396,6 +3466,104 @@ fn aggregateTypeFromPrefix(builder: *LirBuilder, node_index: usize) -> usize {
     const referenced = referencedSymbolIndex(builder, node_index)
     if !referenced.0 { return resolveTypeNode(builder, node_index) }
     return symbols_store.Store.get(builder.*.symbolStore, referenced.1).*.valueTypeId
+}
+
+// A field of a packed struct (spec aggregates.xml PackedLayout): its
+// offset is in bits inside the one word (1, 2, 4 or 8 bytes) the struct
+// is; it is read and written with shifts and masks, never by address.
+const PackedField = struct {
+    found: bool
+    aggregateTypeId: usize
+    fieldTypeId: usize
+    bitOffset: usize
+}
+
+fn noPackedField() -> PackedField {
+    return PackedField.{ .found = false, .aggregateTypeId = 0, .fieldTypeId = 0, .bitOffset = 0 }
+}
+
+// `base.name` where base is a packed struct (or a pointer to one).
+fn packedFieldOf(builder: *LirBuilder, node_index: usize) -> PackedField {
+    if node_index == ast.NONE { return noPackedField() }
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag != ast.Tag.field_expression || node.lhs == ast.NONE { return noPackedField() }
+    return packedFieldIn(builder, expressionType(builder, node.lhs), node.mainToken)
+}
+
+fn packedFieldIn(builder: *LirBuilder, type_id: usize, field_token: usize) -> PackedField {
+    if type_id == 0 { return noPackedField() }
+    var aggregate_id = type_id
+    var aggregate = types_store.Store.get(builder.*.typeStore, aggregate_id)
+    if aggregate.*.kind == types_store.Kind.pointer || aggregate.*.kind == types_store.Kind.many_pointer {
+        aggregate_id = aggregate.*.lhs
+        aggregate = types_store.Store.get(builder.*.typeStore, aggregate_id)
+    }
+    if aggregate.*.kind != types_store.Kind.struct_type || aggregate.*.flags & types_store.FLAG_PACKED == 0 { return noPackedField() }
+    const metadata = fieldMetadata(builder, aggregate_id, field_token)
+    if !metadata.found { return noPackedField() }
+    return PackedField.{ .found = true, .aggregateTypeId = aggregate_id, .fieldTypeId = metadata.typeId, .bitOffset = metadata.offset }
+}
+
+fn packedMask(bits: usize) -> usize {
+    if bits >= 64 { return 18446744073709551615 }
+    return (@intCast(usize, 1) << @intCast(u6, bits)) - 1
+}
+
+// The unsigned integer of the struct's word.
+fn packedWordType(builder: *LirBuilder, aggregate_type_id: usize) -> usize {
+    return types_store.Store.integer(builder.*.typeStore, false, types_store.Store.sizeOf(builder.*.typeStore, aggregate_type_id) * 8)
+}
+
+// The field's value out of the struct's word at `address`: the word
+// shifted down and masked, a signed field's sign spread over the register.
+fn packedFieldLoad(builder: *LirBuilder, address: usize, field: PackedField) -> usize {
+    const size = types_store.Store.sizeOf(builder.*.typeStore, field.aggregateTypeId)
+    const word_type = packedWordType(builder, field.aggregateTypeId)
+    var load = lir.initInst(lir.Opcode.load, word_type)
+    load.arg0 = address
+    load.arg1 = size
+    var word = lir.addInst(builder.*.lir, load)
+    const bits = types_store.Store.bitSizeOf(builder.*.typeStore, field.fieldTypeId)
+    if field.bitOffset > 0 {
+        const shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, field.bitOffset))
+        word = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, word_type, word, shift))
+    }
+    if bits < 64 {
+        const mask = lir.addInst(builder.*.lir, lir.constI(word_type, packedMask(bits)))
+        word = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, field.fieldTypeId, word, mask))
+    }
+    if isSignedIntegerType(builder, field.fieldTypeId) { return wrapInteger(builder, word, field.fieldTypeId) }
+    return word
+}
+
+// `value` put into the field's bits of the struct's word at `address`
+// (the other bits kept).
+fn packedFieldStore(builder: *LirBuilder, address: usize, field: PackedField, value: usize) -> void {
+    const size = types_store.Store.sizeOf(builder.*.typeStore, field.aggregateTypeId)
+    const word_type = packedWordType(builder, field.aggregateTypeId)
+    var load = lir.initInst(lir.Opcode.load, word_type)
+    load.arg0 = address
+    load.arg1 = size
+    const word = lir.addInst(builder.*.lir, load)
+    const bits = types_store.Store.bitSizeOf(builder.*.typeStore, field.fieldTypeId)
+    const mask = packedMask(bits)
+    var placed = value
+    if bits < 64 {
+        const mask_value = lir.addInst(builder.*.lir, lir.constI(word_type, mask))
+        placed = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word_type, placed, mask_value))
+    }
+    if field.bitOffset > 0 {
+        const shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, field.bitOffset))
+        placed = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shl, word_type, placed, shift))
+    }
+    const keep = lir.addInst(builder.*.lir, lir.constI(word_type, ~(mask << @intCast(u6, field.bitOffset))))
+    const cleared = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, word_type, word, keep))
+    const merged = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, word_type, cleared, placed))
+    var store = lir.initInst(lir.Opcode.store, lir.NONE)
+    store.arg0 = address
+    store.arg1 = merged
+    store.arg2 = size
+    lir.addInst(builder.*.lir, store)
 }
 
 fn fieldMetadataByName(builder: *LirBuilder, type_id: usize, name_pointer: [*]const u8, name_length: usize) -> FieldMetadata {
@@ -3846,6 +4014,12 @@ fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
                 }
             }
         }
+    }
+    const packed_field = packedFieldOf(builder, node_index)
+    if packed_field.found {
+        const base = lowerNode(builder, node.lhs)
+        if base == lir.NONE { return lir.NONE }
+        return packedFieldLoad(builder, base, packed_field)
     }
     const metadata = fieldMetadata(builder, expressionType(builder, node.lhs), node.mainToken)
     if metadata.found {
@@ -4528,6 +4702,20 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
         if kind == lexer.Kind.equal && isDiscardTarget(builder, n.lhs) {
             const dropped = lowerNode(builder, n.rhs)
             return lir.NONE
+        }
+        // `packed.field = value`, `packed.field op= value`: the field's bits
+        // of the struct's word.
+        const packed_target = packedFieldOf(builder, n.lhs)
+        if packed_target.found {
+            const base = lowerNode(builder, ast_store.Store.get(nodes, n.lhs).lhs)
+            if base == lir.NONE { return lir.NONE }
+            var value = widenToType(builder, narrowFloat(builder, lowerNode(builder, n.rhs), packed_target.fieldTypeId), packed_target.fieldTypeId)
+            if kind != lexer.Kind.equal {
+                const current = packedFieldLoad(builder, base, packed_target)
+                value = lowerValueOperator(builder, assignmentOperator(kind), current, value, packed_target.fieldTypeId)
+            }
+            packedFieldStore(builder, base, packed_target, value)
+            return value
         }
         const address = lowerAddress(builder, n.lhs)
         if address == lir.NONE { return lir.NONE }

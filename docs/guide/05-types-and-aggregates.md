@@ -123,6 +123,39 @@ pub fn main() u8 {
 
 (`tests/15_aggregate_builtins.mlx`)
 
+### Packed structs
+
+A `packed struct` has no padding: each field takes exactly the bits of
+its type (`u9` nine, `i4` four, a `bool` its byte), one after the other
+from bit 0, and the struct is the integer that holds them all, 1, 2, 4 or
+8 bytes (a packed struct holds at most 64 bits; a wider one is refused).
+It is how a register, a wire format or a C bit-field group is spelled:
+
+```mlx
+const Color = packed struct {
+    r: u9
+    g: u9
+    b: u9
+    e: u5
+}
+
+pub fn main() u8 {
+    var c: Color = undefined
+    c.r = 300
+    c.e = 31
+    c.e -= 1
+    const word = @bitCast(u32, c) // 300 | 30 << 27
+    const back = @bitCast(Color, word)
+    return @intCast(u8, back.e)
+}
+```
+
+A field is read and written with shifts and masks on the whole word; a
+signed field comes back with its sign. A literal, a module-level
+constant and `@bitCast` to and from an integer of the struct's width all
+work; what a packed field has not got is an address: `&c.r` is not
+allowed (`tests/434_packed_struct_runtime.mlx`).
+
 ## Methods
 
 A struct can declare functions in its body. `Self` refers to the enclosing

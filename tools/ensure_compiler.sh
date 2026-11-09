@@ -477,6 +477,22 @@ resolves_recursive_types() {
     return $ok
 }
 
+# Whether $1 lays a packed struct out in bits (spec aggregates.xml
+# PackedLayout: tests/434_packed_struct_runtime.mlx exits 13); older
+# compilers read `packed` and laid the fields out byte by byte.
+lays_out_packed_structs() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/434_packed_struct_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 rejects an integer written out that its type cannot hold
 # (tests/335_type_mismatches.mlx); older compilers kept its low bits.
 checks_literal_ranges() {
@@ -797,6 +813,7 @@ probes=(
     "lets_locals_shadow_members|locals shadowing their struct's members and module declarations"
     "names_unresolved_symbols|the unresolved backend symbol named (MLX-E3004)"
     "resolves_local_module_aliases|a module's declarations through a local bound to it"
+    "lays_out_packed_structs|packed structs laid out in bits"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

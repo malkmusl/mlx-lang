@@ -340,6 +340,19 @@ for direct, method, generic and indirect calls alike, and the optimizer
 checks that each direct call agrees with its callee
 (`tests/329_return_storage_runtime.mlx`).
 
+## Packed structs
+
+A `packed struct` (spec aggregates.xml, PackedLayout) is one integer:
+its fields occupy their exact bit widths from bit 0 upwards, in
+declaration order, with no padding, and the struct's size and alignment
+are those of the smallest of u8, u16, u32 and u64 that holds the bits
+(so a 27-bit struct is 4 bytes aligned to 4, as a C bit-field group in an
+`unsigned int` is). A wider struct than 64 bits is refused. As an
+argument or a result it is classified as that integer's size would be
+(the aggregate classification above). Fields are never addressed: the
+compiler loads the word, shifts and masks (`ir/lower.mlx`,
+`packedFieldLoad`/`packedFieldStore`).
+
 ## Multiple returns
 
 A source-level multiple return (`-> (T, U, ...)`) is classified exactly as

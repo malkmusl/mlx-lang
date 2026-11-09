@@ -176,6 +176,7 @@ run 410_crypto_rsa_sizes_runtime "RSA keys of any size: a 64-bit modulus, 512 bi
 run 431_tar_runtime "tar headers written and read back: short and split names, a directory's slash, a link's target, the checksum, a name that cannot be stored; an archive in memory"
 run 432_local_module_alias_runtime "a module bound to a local constant in a body: calls, values and types through it"
 run 433_narrow_integers_runtime "narrow integers canonical after left shifts, complements and narrowing casts"
+run 434_packed_struct_runtime "packed structs: fields at bit offsets in one word of 1, 2, 4 or 8 bytes, read and written with shifts and masks, signed fields with their sign, literals and constants, @bitCast to and from the word's integer"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
 run 422_h264_cpu_decode_runtime "WebKit's test.mp4 (Main profile, B frames) decoded on the CPU through std.mp4 and std.h264: every picture, in presentation order, the planes' CRC-32 the reference decoding's"
@@ -184,6 +185,17 @@ run 424_h265_cpu_decode_runtime "a 64x64 H.265 Main 10 stream (weighted B frames
 run 425_vp9_header_runtime "a 48x32 VP9 stream's uncompressed headers (profile, depth, subsampling, size, frame types, references and their slots, refresh flags, the compressed header's place), a superframe's index split, a broken frame marker refused"
 run 417_aac_decode_runtime "AAC-LC decoded from an MP4 and an ADTS stream, each within 15 dB of the WAV it was encoded from; damaged blocks refused; reset"
 run 416_mp4_demux_runtime "MP4 files read: a plain file's sample tables (chunks, composition offsets, sync samples, an edit list, seeking), fragments (trex defaults, tfdt, trun flags, one without tfdt), avcC parameter sets and Annex B, AudioSpecificConfig, a fragment cut short, damage"
+
+# A packed struct wider than a word is refused with the message that says
+# so (tests/support/packed_too_wide).
+too_wide=$("$compiler" --quiet tests/support/packed_too_wide/main.mlx -o "$work/too_wide" 2>&1 || true)
+if grep -q 'MLX-E4001: a packed struct holds at most 64 bits' <<< "$too_wide"; then
+    echo "ok   packed_too_wide: a packed struct of 80 bits refused"
+else
+    echo "FAIL packed_too_wide: expected the 64-bit message, got:"
+    echo "$too_wide" | head -3
+    failures=$((failures + 1))
+fi
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
