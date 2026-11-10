@@ -93,6 +93,79 @@ pub fn setStdModule(path: []const u8) -> void {
     stdModuleLength = path.length
 }
 
+// The std module's file where the translator reads it
+// (`--emit-mlx-std-file=FILE`; without it the import, from the directory
+// of the file written).
+var stdFileAt: usize = 0
+var stdFileLength: usize = 0
+
+pub fn setStdModuleFile(path: []const u8) -> void {
+    stdFileAt = base.keep(path)
+    stdFileLength = path.length
+}
+
+// The records the std module declares (its `pub const NAME = ... struct`
+// lines): what a unit names `libcpp.NAME`. Another instance of the same
+// headers' templates (basic_string over another allocator, hash<string>)
+// comes along with the unit, as vector<T> does.
+const MAX_STD_RECORDS: usize = 1024
+var stdRecords: [MAX_STD_RECORDS]u32 = undefined
+var stdRecordCount: usize = 0
+var stdRecordsRead = false
+
+fn readStdRecords() -> void {
+    stdRecordsRead = true
+    var id: u32 = 0
+    if stdFileLength > 0 {
+        id = base.readFile(base.bytes(stdFileAt, stdFileLength))
+    } else {
+        var path = emptyBuffer()
+        const output = outputPath()
+        var end = output.length
+        while end > 0 && output[end - 1] != 47 { end -= 1 }
+        putTo(&path, output[0..end])
+        putTo(&path, base.bytes(stdModuleAt, stdModuleLength))
+        id = base.readFile(textOf(&path))
+    }
+    if id == 0 { return }
+    const text = base.bytes(base.fileData(id), base.fileLength(id))
+    var k: usize = 0
+    while k < text.length {
+        var end = k
+        while end < text.length && text[end] != 10 { end += 1 }
+        const line = text[k..end]
+        if startsWith(line, "pub const ") && (containsText(line, "struct {") || containsText(line, "union {")) {
+            var stop: usize = 10
+            while stop < line.length && line[stop] != 32 { stop += 1 }
+            if stdRecordCount < MAX_STD_RECORDS {
+                stdRecords[stdRecordCount] = base.intern(line[10..stop])
+                stdRecordCount += 1
+            }
+        }
+        k = end + 1
+    }
+}
+
+// Whether the std module has the record (every record of its headers
+// when the module cannot be read).
+fn stdModuleHas(ty: usize) -> bool {
+    if !stdRecordsRead { readStdRecords() }
+    if stdRecordCount == 0 { return true }
+    var text = emptyBuffer()
+    const savedOut = out
+    out = text
+    putTypeName(ty)
+    text = out
+    out = savedOut
+    const name = base.intern(textOf(&text))
+    var k: usize = 0
+    while k < stdRecordCount {
+        if stdRecords[k] == name { return true }
+        k += 1
+    }
+    return false
+}
+
 fn fileOfToken(token: usize) -> []const u8 {
     return base.nameOf(base.fileName(@intCast(u32, tokens.at(token).*.file)))
 }
@@ -312,7 +385,7 @@ fn moduleOfTypeScan(ty: usize) -> u32 {
         // The library's: the std module's when it has the header; the
         // other headers' template instances (vector<T>, optional<T>) come
         // along with the unit.
-        if stdModuleLength == 0 || !isStdModuleHeader(path) { return 0 }
+        if stdModuleLength == 0 || !isStdModuleHeader(path) || !stdModuleHas(ty) { return 0 }
         return base.intern("libcpp")
     }
     // (A template's instance is made in each unit that uses it.)
@@ -796,7 +869,8 @@ pub fn putType(ty: usize) -> void {
 // A bit-field member's own type (`unsigned x : 9` is a u9 of a packed
 // struct).
 fn putBitFieldType(member: *types.Member) -> void {
-    putByte(if types.at(member.*.ty).*.unsigned { 117 } else { 105 })
+    const t = types.at(member.*.ty)
+    putByte(if t.*.unsigned || t.*.kind == types.BOOL { 117 } else { 105 })
     putNumber(@bitCast(u64, member.*.bitWidth))
 }
 
@@ -1077,68 +1151,250 @@ fn putPlace(token: usize) -> void {
 // ---------------------------------------------------------------------------
 // Structs
 
-fn hasBitFields(ty: usize) -> bool {
+// A record's bit-fields are kept in words of their own: each run of them
+// is a packed struct of 1, 2, 4 or 8 bytes at the bytes the C++ layout
+// gives the fields (the member `bitsN`, N its byte offset, of the type
+// `Record_bitsN`). The record itself stays an extern struct, its other
+// members where C++ has them.
+const Word = struct {
+    // Its first byte and its bytes (0: the field shares bytes with a
+    // neighbour that is no bit-field, no word of its own holds it).
+    start: i64
+    size: i64
+    // Its first member (0: no word).
+    first: usize
+}
+
+fn sameMember(m: usize, target: usize) -> bool {
+    if m == target { return true }
+    if target == 0 { return false }
+    const a = types.member(m)
+    const b = types.member(target)
+    return a.*.name != 0 && a.*.name == b.*.name && a.*.offset == b.*.offset && a.*.bitOffset == b.*.bitOffset && a.*.bitWidth == b.*.bitWidth
+}
+
+// Where the member after the bit-fields from `m` on starts (the record's
+// end when none follows).
+fn nextPlainOffset(ty: usize, from: usize) -> i64 {
+    var m = from
+    while m != 0 {
+        const member = types.member(m)
+        if member.*.bitWidth == 0 && !(member.*.isBase && types.emptyClass(member.*.ty)) { return member.*.offset }
+        m = member.*.next
+    }
+    return types.size(ty)
+}
+
+// The bytes of a word that starts at or before byte `low`, holds the
+// bits up to `bitsEnd` and lies between `floor` and `limit`: the smallest
+// of `least`, .., 8 that does, 0 for none.
+fn fitWord(low: i64, bitsEnd: i64, floor: i64, limit: i64, least: i64) -> i64 {
+    var size = least
+    while size <= 8 {
+        const start = low - low % size
+        if start >= floor && (start + size) * 8 >= bitsEnd && start + size <= limit { return size }
+        size = size * 2
+    }
+    return 0
+}
+
+// The word the bit-field `target` of `ty` is in.
+fn wordOf(ty: usize, target: usize) -> Word {
+    const isUnion = types.at(ty).*.kind == types.UNION
+    var word = Word.{ .start = 0, .size = 0, .first = 0 }
+    var open = false
+    var found = false
+    var floor: i64 = 0
     var m = types.at(ty).*.members
     while m != 0 {
-        if types.member(m).*.bitWidth > 0 { return true }
+        const member = types.member(m)
+        if member.*.bitWidth > 0 {
+            const from = member.*.offset * 8 + member.*.bitOffset
+            const to = from + member.*.bitWidth
+            const limit = if isUnion { types.size(ty) } else { nextPlainOffset(ty, m) }
+            var joined = false
+            if open && !isUnion && word.size > 0 {
+                if from >= word.start * 8 && to <= (word.start + word.size) * 8 {
+                    joined = true
+                } else if word.size < 8 {
+                    const larger = fitWord(word.start, to, floor, limit, word.size * 2)
+                    if larger != 0 {
+                        word.start = word.start - word.start % larger
+                        word.size = larger
+                        joined = true
+                    }
+                }
+            }
+            if !joined {
+                if found { return word }
+                if open && !isUnion && word.start + word.size > floor { floor = word.start + word.size }
+                const low = from / 8
+                const size = fitWord(low, to, floor, limit, 1)
+                word = Word.{ .start = if size == 0 { low } else { low - low % size }, .size = size, .first = m }
+                open = true
+            }
+            if sameMember(m, target) { found = true }
+        } else if member.*.bitWidth == 0 && !(member.*.isBase && types.emptyClass(member.*.ty)) {
+            if found { return word }
+            open = false
+            if !isUnion { floor = member.*.offset + types.size(member.*.ty) }
+        }
+        m = member.*.next
+    }
+    if found { return word }
+    return Word.{ .start = 0, .size = 0, .first = 0 }
+}
+
+// A member's place among its record's (a union's unnamed members and
+// words are told apart by it: they all start at byte 0).
+fn placeOf(ty: usize, target: usize) -> u64 {
+    var place: u64 = 0
+    var m = types.at(ty).*.members
+    while m != 0 {
+        if sameMember(m, target) { return place }
+        place += 1
         m = types.member(m).*.next
     }
-    return false
+    return place
+}
+
+// A word's member name: `bitsN`, N its byte in the object (`base`: where
+// the record lies in it, a base class's members being the object's own).
+fn putWordName(ty: usize, word: Word, base: i64) -> void {
+    put("bits")
+    putNumber(@bitCast(u64, base + word.start))
+    if types.at(ty).*.kind == types.UNION {
+        putByte(95)
+        putNumber(placeOf(ty, word.first))
+    }
+}
+
+fn putWordType(ty: usize, word: Word) -> void {
+    putTypeRef(ty)
+    putByte(95)
+    putWordName(ty, word, 0)
+}
+
+// An unnamed member's name (an anonymous union or struct, the table
+// pointer): `fieldN`, N its byte in the object; in a union its place.
+fn putUnnamed(ty: usize, m: usize, base: i64) -> void {
+    put("field")
+    if ty != 0 && types.at(ty).*.kind == types.UNION {
+        putNumber(placeOf(ty, m))
+    } else {
+        putNumber(@bitCast(u64, base + types.member(m).*.offset))
+    }
+}
+
+// The packed structs of a record's words, before the record.
+fn emitWords(ty: usize) -> void {
+    var m = types.at(ty).*.members
+    while m != 0 {
+        const member = types.member(m)
+        if member.*.bitWidth > 0 {
+            const word = wordOf(ty, m)
+            if word.first == m && word.size > 0 {
+                put("pub const ")
+                putTypeName(ty)
+                putByte(95)
+                putWordName(ty, word, 0)
+                put(" = packed struct {\n")
+                var bit = word.start * 8
+                var k = m
+                while k != 0 {
+                    const field = types.member(k)
+                    if field.*.bitWidth == 0 && !(field.*.isBase && types.emptyClass(field.*.ty)) { break }
+                    if field.*.bitWidth > 0 {
+                        if wordOf(ty, k).first != m { break }
+                        const from = field.*.offset * 8 + field.*.bitOffset
+                        if field.*.name != 0 {
+                            if from > bit { putUnusedBits(bit - word.start * 8, from - bit) }
+                            indent(1)
+                            ident(field.*.name)
+                            put(": ")
+                            putBitFieldType(field)
+                            newline()
+                            bit = from + field.*.bitWidth
+                        }
+                    }
+                    k = field.*.next
+                }
+                const end = (word.start + word.size) * 8
+                if end > bit { putUnusedBits(bit - word.start * 8, end - bit) }
+                put("}\n\n")
+            }
+        }
+        m = member.*.next
+    }
+}
+
+fn putUnusedBits(at: i64, count: i64) -> void {
+    indent(1)
+    put("unused")
+    putNumber(@bitCast(u64, at))
+    put(": u")
+    putNumber(@bitCast(u64, count))
+    newline()
 }
 
 fn emitStruct(ty: usize) -> void {
     const t = types.at(ty)
-    const isPacked = hasBitFields(ty)
+    emitWords(ty)
     put("pub const ")
     putTypeName(ty)
-    if t.*.kind == types.UNION {
-        put(" = extern union {\n")
-    } else {
-        put(if isPacked { " = packed struct {\n" } else { " = extern struct {\n" })
-    }
-    putMembers(t.*.members, isPacked, 0)
+    put(if t.*.kind == types.UNION { " = extern union {\n" } else { " = extern struct {\n" })
+    putMembers(ty, 0)
     put("}\n\n")
 }
 
 // The members of a struct, one a line; a base class's in place (the base
-// object comes first in the layout; a virtual base is marked).
-fn putMembers(first: usize, isPacked: bool, from: usize) -> void {
-    var m = first
-    var index: usize = from
+// object comes first in the layout; a virtual base is marked). `base`:
+// where the record lies in the object written.
+fn putMembers(ty: usize, base: i64) -> void {
+    var m = types.at(ty).*.members
     while m != 0 {
         const member = types.member(m)
-        indent(1)
-        if member.*.isBase && !member.*.isVirtual && types.at(member.*.ty).*.members != 0 {
+        if member.*.bitWidth != 0 {
+            if member.*.bitWidth > 0 {
+                const word = wordOf(ty, m)
+                if word.first == m {
+                    indent(1)
+                    if word.size == 0 {
+                        marker("the bit-field ")
+                        if member.*.name != 0 { ident(member.*.name) }
+                        put(" shares its bytes with a neighbour")
+                    } else {
+                        putWordName(ty, word, base)
+                        put(": ")
+                        putWordType(ty, word)
+                    }
+                    newline()
+                }
+            }
+        } else if member.*.isBase && !member.*.isVirtual && types.at(member.*.ty).*.members != 0 {
+            indent(1)
             put("// the base class ")
             putTypeName(member.*.ty)
             put(":\n")
             noteType(member.*.ty)
-            putMembers(types.at(member.*.ty).*.members, isPacked, index)
+            putMembers(member.*.ty, base + member.*.offset)
         } else if member.*.isBase {
+            indent(1)
             marker("base class ")
             putTypeName(member.*.ty)
             newline()
         } else {
+            indent(1)
             if member.*.name == 0 {
-                put("field")
-                putNumber(@intCast(u64, index))
+                putUnnamed(ty, m, base)
             } else {
                 ident(member.*.name)
             }
             put(": ")
-            if member.*.bitWidth > 0 {
-                putBitFieldType(member)
-            } else {
-                putType(member.*.ty)
-                if isPacked && isRecordKind(types.at(member.*.ty).*.kind) {
-                    put("  ")
-                    marker("a record inside a packed struct")
-                }
-            }
+            putType(member.*.ty)
             newline()
         }
         m = member.*.next
-        index += 1
     }
 }
 
@@ -2521,6 +2777,16 @@ fn emitAssign(n: usize) -> void {
     if ast.kindOf(node.*.lhs) == ast.MEMBER {
         const member = types.member(ast.node(node.*.lhs).*.member)
         if member.*.bitWidth > 0 {
+            if isBoolish(node.*.rhs) {
+                put("(if ")
+                emitExpr(node.*.rhs)
+                put(" { @intCast(")
+                putBitFieldType(member)
+                put(", 1) } else { @intCast(")
+                putBitFieldType(member)
+                put(", 0) })")
+                return
+            }
             put("@intCast(")
             putBitFieldType(member)
             put(", ")
@@ -3134,12 +3400,73 @@ fn emitLvalue(n: usize) -> void {
             emitExpr(node.*.lhs)
             return
         }
-        emitExpr(node.*.lhs)
+        // (Through a base class: the base's members are the object's own.)
+        if ast.kindOf(node.*.lhs) == ast.MEMBER && types.member(ast.node(node.*.lhs).*.member).*.isBase {
+            emitLvalue(node.*.lhs)
+        } else {
+            emitExpr(node.*.lhs)
+        }
         putByte(46)
-        if member.*.name == 0 { put("field") } else { ident(member.*.name) }
+        // (Where the record lies in the object: the base classes it is
+        // reached through.)
+        var base: i64 = 0
+        var inner = node.*.lhs
+        while ast.kindOf(inner) == ast.MEMBER && types.member(ast.node(inner).*.member).*.isBase {
+            base += types.member(ast.node(inner).*.member).*.offset
+            inner = ast.node(inner).*.lhs
+        }
+        const lhsType = ast.typeOf(node.*.lhs)
+        const owner = if lhsType != 0 { types.unqualified(lhsType) } else { 0 }
+        if member.*.bitWidth > 0 {
+            const word = if owner != 0 { wordOf(owner, node.*.member) } else { Word.{ .start = 0, .size = 0, .first = 0 } }
+            if word.first == 0 || word.size == 0 {
+                note("a bit-field without a word of its own is read or written")
+                put("bits")
+            } else {
+                putWordName(owner, word, base)
+            }
+            putByte(46)
+        }
+        if member.*.name == 0 { putUnnamed(owner, node.*.member, base) } else { ident(member.*.name) }
         return
     }
     emitExpr(n)
+}
+
+// The address of a base-class subobject (`n`: the object's member that is
+// the base). The base's members are the object's own: the object's
+// address as the base's, moved to where the base lies when that is not
+// the object's start (a second base, a base of one).
+fn baseOffset(n: usize) -> i64 {
+    var offset: i64 = 0
+    var object = n
+    while ast.kindOf(object) == ast.MEMBER && types.member(ast.node(object).*.member).*.isBase {
+        offset += types.member(ast.node(object).*.member).*.offset
+        object = ast.node(object).*.lhs
+    }
+    return offset
+}
+
+fn putBaseAddress(n: usize) -> void {
+    var offset: i64 = 0
+    var object = n
+    while ast.kindOf(object) == ast.MEMBER && types.member(ast.node(object).*.member).*.isBase {
+        offset += types.member(ast.node(object).*.member).*.offset
+        object = ast.node(object).*.lhs
+    }
+    put("unsafe { @ptrCast(*")
+    putType(types.unqualified(ast.typeOf(n)))
+    put(", &")
+    if offset == 0 {
+        emitLvalue(object)
+    } else {
+        put("unsafe { @ptrCast([*]u8, &")
+        emitLvalue(object)
+        put(") }[")
+        putNumber(@bitCast(u64, offset))
+        putByte(93)
+    }
+    put(") }")
 }
 
 // A branch of `c ? a : b`. Of pointers, both sides are given the
@@ -3962,11 +4289,22 @@ pub fn emitExpr(n: usize) -> void {
         const member = types.member(node.*.member)
         if member.*.bitWidth > 0 {
             // A bit-field read, widened to its declared type.
-            put("@intCast(")
-            putType(member.*.ty)
-            put(", ")
-            emitLvalue(n)
-            putByte(41)
+            if types.at(member.*.ty).*.kind == types.BOOL {
+                putByte(40)
+                emitLvalue(n)
+                put(" != 0)")
+            } else {
+                put("@intCast(")
+                putType(member.*.ty)
+                put(", ")
+                emitLvalue(n)
+                putByte(41)
+            }
+        } else if member.*.isBase && baseOffset(n) != 0 {
+            // (A base-class subobject as a value, where it lies in the
+            // object; the first base's is the object's start.)
+            putBaseAddress(n)
+            put(".*")
         } else {
             emitLvalue(n)
         }
@@ -3984,14 +4322,7 @@ pub fn emitExpr(n: usize) -> void {
             // `&*p`: the pointer (or reference) itself.
             emitExpr(ast.node(node.*.lhs).*.lhs)
         } else if ast.kindOf(node.*.lhs) == ast.MEMBER && types.member(ast.node(node.*.lhs).*.member).*.isBase {
-            // The address of a base-class subobject (the base's members
-            // are the object's own): the object's address as the base's.
-            const baseType = ast.typeOf(node.*.lhs)
-            put("unsafe { @ptrCast(*")
-            putType(types.unqualified(baseType))
-            put(", &")
-            emitLvalue(ast.node(node.*.lhs).*.lhs)
-            put(") }")
+            putBaseAddress(node.*.lhs)
         } else {
             putByte(38)
             emitLvalue(node.*.lhs)

@@ -61,7 +61,7 @@ echo "ok   mlxlibcpp's string translated ($(grep -c '^pub fn\|^fn' "$runtime/lib
 units=(aligned_memory mathutil Float16ToFloat32 utilities matrix_utils MemoryBuffer platform_helpers string_utils)
 unit_list=$(IFS=,; echo "${units[*]}")
 for unit in "${units[@]}"; do
-    "$work/mlx-cc" "${flags[@]}" --emit-mlx-units="$unit_list" --emit-mlx-std=../../runtime/libcpp.mlx --emit-mlx="$work/$unit.mlx" "$angle/src/common/$unit.cpp" 2> "$work/$unit.err" || fail "$unit.cpp does not translate: $(head -5 "$work/$unit.err")"
+    "$work/mlx-cc" "${flags[@]}" --emit-mlx-units="$unit_list" --emit-mlx-std=../../runtime/libcpp.mlx --emit-mlx-std-file="$work/libcpp.mlx" --emit-mlx="$work/$unit.mlx" "$angle/src/common/$unit.cpp" 2> "$work/$unit.err" || fail "$unit.cpp does not translate: $(head -5 "$work/$unit.err")"
     if [[ $update -eq 1 ]]; then
         cp "$work/$unit.mlx" "$out/$unit.mlx"
     elif ! cmp -s "$work/$unit.mlx" "$out/$unit.mlx"; then
@@ -105,7 +105,7 @@ differential string_utils string_utils "splitting, trimming, prefixes, affixes, 
 # kept, compiled and run against the C++.
 feature() { # DIRECTORY NAME WORDS
     local directory=projects/lattice/tests/$1 name=$2 words=$3
-    "$work/mlx-cc" -std=c++23 --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-std=../../runtime/libcpp.mlx --emit-mlx="$work/$name.mlx" "$directory/$name.cpp" 2> "$work/$name.err" || fail "$name.cpp does not translate: $(head -5 "$work/$name.err")"
+    "$work/mlx-cc" -std=c++23 --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-std=../../runtime/libcpp.mlx --emit-mlx-std-file="$work/libcpp.mlx" --emit-mlx="$work/$name.mlx" "$directory/$name.cpp" 2> "$work/$name.err" || fail "$name.cpp does not translate: $(head -5 "$work/$name.err")"
     if [[ $update -eq 1 ]]; then
         cp "$work/$name.mlx" "$directory/$name.mlx"
     elif ! cmp -s "$work/$name.mlx" "$directory/$name.mlx"; then
@@ -119,4 +119,5 @@ feature() { # DIRECTORY NAME WORDS
     echo "ok   $name: $words, the same in Mlx and C++ ($(tr '\n' ' ' < "$work/${name}_ref.out"))"
 }
 feature virtual shapes "virtual functions: overriding, a pure virtual, deletion through the base, a second base's adjustment of this"
+feature bits bits "bit-fields in words of their own, an anonymous union, two bases with table pointers"
 echo "check_lattice_emit.sh: all checks passed"
