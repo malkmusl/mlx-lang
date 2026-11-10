@@ -524,6 +524,37 @@ types_functions_named_ahead() {
     return $ok
 }
 
+# Whether $1 lets a function end with a `while true` no `break` ends
+# (tests/440_endless_loop_ends_function_runtime.mlx exits 13).
+ends_functions_with_endless_loops() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/440_endless_loop_ends_function_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 resolves the records of modules that import one another and
+# name one another (tests/441_types_across_import_ring_runtime.mlx exits
+# 13).
+resolves_types_across_import_rings() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/441_types_across_import_ring_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 gives a module-level var its floats and addresses
 # (tests/438_global_address_initializers_runtime.mlx exits 13).
 initializes_globals_with_addresses() {
@@ -896,6 +927,8 @@ probes=(
     "atomics_take_optional_pointers|atomics on optional pointers"
     "initializes_globals_with_addresses|module-level vars initialized with floats and addresses"
     "types_functions_named_ahead|a function named in an initializer above its declaration"
+    "ends_functions_with_endless_loops|a function ending with a while true no break ends"
+    "resolves_types_across_import_rings|records of modules that import one another naming one another"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

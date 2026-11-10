@@ -156,6 +156,35 @@ globals.cursor = &scratch
 `tests/support/module_globals.mlx`; `export var` makes one a data symbol C
 code shares, see [Formats](../reference/formats.md#globals))
 
+Modules may import one another, and name one another's types in their
+own: a struct of one with a pointer to a struct of the other and that one
+with a pointer back, a struct of one inside a struct of the other.
+Whichever module's declarations are worked out first, a declaration of a
+module whose turn has not come is resolved when it is named, in its own
+module:
+
+```mlx
+// a.mlx
+const b = @import("./b.mlx")
+pub const A = extern struct {
+    next: ?*b.B
+    pair: b.Pair
+}
+
+// b.mlx
+const a = @import("./a.mlx")
+pub const B = extern struct {
+    back: ?*a.A
+}
+pub const Pair = extern struct {
+    n: u32
+}
+```
+
+(`tests/441_types_across_import_ring_runtime.mlx` → 13, three modules in
+`tests/support/type_ring`.) Two structs that hold one another by value
+have no layout, in one module or in two.
+
 ## Visibility
 
 Only `pub` declarations are visible outside their module. Accessing a
