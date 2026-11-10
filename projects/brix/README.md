@@ -194,7 +194,8 @@ runtime says "out of memory" on stderr before the program's own report.
 machine has and what the kernel did: the memory and what is free of it,
 the processors running the kernel, the uptime, and the kernel's counts
 since the boot (page faults served, system calls, switches between
-processes, the interrupts the devices sent as messages). `sysinfo`
+processes, the interrupts the devices sent as messages), and how long
+processors waited for the kernel while another held it. `sysinfo`
 prints them:
 
     memory: 2047 MiB, 1938 free
@@ -202,6 +203,17 @@ prints them:
     uptime: 6.0 s
     page faults: 3229, system calls: 822, switches: 14
     device interrupts: 57
+    waits for the kernel: 41.220 ms in all; the longest 2.104 ms (behind process 7 in brixOS call 17); in the last 10 to 20 s 0.310 ms (behind process 3 at fault 14)
+    idle processors' waits for the kernel: 12.007 ms
+
+The waits are those of processors that had something to run: a program
+that stutters behind another's call (a driver waiting for its device, a
+long copy) shows there, with the process and the call that held the
+kernel for most of the wait. The second line sums the waits of
+processors that had nothing to run (their ticks queue behind whoever is
+in the kernel and delay nobody). Nothing is measured where the kernel is
+free when asked for; tools/check_brix_smp.sh runs `sysinfo` on four
+processors.
 
 std.build's runner takes its memory figures from it on brixOS (on Linux
 from /proc/meminfo), and build.mlx says what the big compiles take
