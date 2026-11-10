@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
 firmware=""
-for candidate in /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share/OVMF/OVMF.fd; do
+for candidate in /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd; do
     [[ -f $candidate ]] && firmware=$candidate && break
 done
 if ! command -v qemu-system-x86_64 > /dev/null || [[ -z $firmware ]]; then
@@ -33,13 +33,15 @@ echo "ok   the kernel and BOOTX64.EFI build"
 # Enough RAM that it spans the memory hole below 4 GiB and reaches past
 # it: the kernel must count all of it from the EFI memory map (the loader
 # passes it through as a Multiboot map), not only the RAM below the hole.
+# (The firmware takes its time where the processor is emulated: the
+# command is typed late and the machine given long enough.)
 {
-    sleep 14
+    sleep 45
     printf 'echo started by UEFI; uname -o\r'
-    sleep 4
-} | timeout 50 qemu-system-x86_64 -m 6G -cpu max -display none -serial stdio -net none \
+    sleep 8
+} | timeout 90 qemu-system-x86_64 -m 6G -cpu max -display none -serial stdio -net none \
     -bios "$firmware" -drive "format=raw,file=fat:rw:$work/esp" 2>&1 | tr -d '\r' > "$work/serial.txt" || true
-for expected in '^brixOS: kernel at 0x200000' '^brixOS: display [0-9]*x[0-9]* at 0x[0-9a-f]* (the firmware.s)$' '^brixOS: [0-9]* MiB' '^started by UEFI$' '^brixOS$'; do
+for expected in '^brixOS: kernel at 0x200000' '^brixOS: display [0-9]*x[0-9]* pitch [0-9]* format [0-9]* at 0x[0-9a-f]* (the firmware.s)$' '^brixOS: [0-9]* MiB' '^started by UEFI$' '^brixOS$'; do
     grep -aq "$expected" "$work/serial.txt" || fail "no \"$expected\" on the serial line"
 done
 echo "ok   OVMF starts it; the kernel learns its memory from the EFI memory map and its display from GOP, the shell answers"

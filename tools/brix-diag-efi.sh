@@ -23,9 +23,7 @@ brix=--target=x86_64-brixos
 for p in flux:projects/shell sysinfo:projects/brix/tools/sysinfo brixfs:projects/brix/tools/brixfs \
          klogsave:projects/brix/tools/klogsave impulse:projects/init/brixos impulsectl:projects/init/tool; do
     name=${p%%:*}; src=${p##*:}/main.mlx
-    # brixfs is a host tool here (format/read), the rest are brixOS programs.
-    if [ "$name" = brixfs ]; then "$compiler" --quiet "$src" -o "$out/$name"
-    elif [ "$name" = impulsectl ]; then "$compiler" --quiet $brix "projects/init/tool.mlx" -o "$out/$name"
+    if [ "$name" = impulsectl ]; then "$compiler" --quiet $brix "projects/init/tool.mlx" -o "$out/$name"
     elif [ "$name" = impulse ]; then "$compiler" --quiet $brix "projects/init/brixos.mlx" -o "$out/$name"
     else "$compiler" --quiet $brix "$src" -o "$out/$name"; fi
 done
@@ -45,3 +43,36 @@ mlx-out/bin/brix-image "$out/kernel" "$efi" \
     "$out/coreutils/"
 echo "wrote $efi"
 echo "Flash it to the ESP as /EFI/BOOT/BOOTX64.EFI to see the boot log on screen."
+
+# A second one with a shell on the screen (mlx-out/bin/brix/BOOTX64-console.EFI):
+# the same without a graphical session, but with mlx-console, the virtual
+# console, started by the init (console.service, enabled here): flux on the
+# framebuffer with the USB keyboard, for a machine with no serial line when
+# the desktop does not come up. mlx-console takes the framebuffer, so the
+# kernel's own log leaves the screen; `cat /devices/klog` shows it there.
+font=
+for candidate in /usr/share/fonts/truetype/dejavu /usr/share/fonts/dejavu /usr/share/fonts/TTF /usr/share/fonts/dejavu-sans-mono-fonts; do
+    if [ -f "$candidate/DejaVuSansMono.ttf" ]; then font="$candidate/DejaVuSansMono.ttf"; break; fi
+done
+if [ -z "$font" ]; then
+    echo "no DejaVuSansMono.ttf found: the console image is not built"
+    exit 0
+fi
+"$compiler" --quiet $brix projects/console/brixos.mlx -o "$out/mlx-console"
+services=$(mktemp -d)
+trap 'rm -rf -- "$services"' EXIT
+sed '/^disabled = yes$/d' projects/brix/settings/init/services/console.service > "$services/console.service"
+console="$out/BOOTX64-console.EFI"
+mlx-out/bin/brix-image "$out/kernel" "$console" \
+    flux="$out/flux" sysinfo="$out/sysinfo" brixfs="$out/brixfs" klogsave="$out/klogsave" \
+    impulse="$out/impulse" impulsectl="$out/impulsectl" mlx-console="$out/mlx-console" \
+    "fonts/DejaVuSansMono.ttf=$font" \
+    settings/init/services/serial-shell.service=projects/brix/settings/init/services/serial-shell.service \
+    settings/init/services/klogsave.service=projects/brix/settings/init/services/klogsave.service \
+    "settings/init/services/console.service=$services/console.service" \
+    settings/users=projects/brix/settings/users \
+    settings/groups=projects/brix/settings/groups \
+    settings/shadow=projects/brix/settings/shadow \
+    "$out/coreutils/"
+echo "wrote $console"
+echo "Flash that one instead for a shell on the screen (USB keyboard); cat /devices/klog shows the boot log."
