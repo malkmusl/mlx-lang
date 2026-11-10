@@ -189,6 +189,8 @@ run 444_statement_after_postfix_runtime "a line ending in .* or .? ends its stat
 run 445_constant_address_runtime "the address of a module-level constant, of this module or an imported one: a copy of its value in the function"
 run 448_power_of_two_division_runtime "a division by a constant power of two and its remainder, shifted and masked: every integer type and divisor against the divisor read at run time, signed ones toward zero"
 run 449_power_of_two_multiplication_runtime "a product by a constant power of two, shifted: every integer type and factor against the factor read at run time, a checked product that does not fit still trapping, elements reached by an index"
+run 450_mem_block_moves_runtime "std's mem.copy and mem.set by blocks: the bytes a byte loop gives at the lengths where words, half-KiB blocks and pages hand over, sixteen alignments, overlapping copies both ways"
+run 451_kernel_bytes_runtime "the kernel's Bytes.fill and Bytes.copy (block moves, words, bytes) built for the host: the bytes a byte loop gives at the hand-over lengths, sixteen alignments"
 run 441_types_across_import_ring_runtime "records of three modules that import one another naming one another: pointers, records inside, a function type, sizes"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
