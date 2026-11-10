@@ -119,6 +119,17 @@ const AddressTakenName = struct {
     token: usize
 }
 
+// A place in a global's initial bytes that holds an address (a function,
+// a string's bytes, another global): the bytes start zero there and
+// `__mlx_init_globals` writes the address when the program starts, from
+// the initializer's expression.
+const GlobalInit = struct {
+    symbolIndex: usize
+    offset: usize
+    node: usize
+    moduleId: usize
+}
+
 pub const LirBuilder = struct {
     lir: *lir.Lir
     loader: *loader_module.Loader
@@ -170,6 +181,12 @@ pub const LirBuilder = struct {
     resolvedTypeQueries: usize
     resolvedTypeHits: usize
     unsupportedLoweringCount: usize
+    // The places in globals' initial bytes that hold addresses
+    // (GlobalInit), and the global whose bytes are being written: its
+    // image's address (0: none) and its symbol.
+    globalInits: *vector.Vector
+    initImageBase: usize
+    initSymbolIndex: usize
     // The operator or builtin being lowered (for an unsupported form).
     operatorToken: usize
     firstUnsupportedOffset: usize
@@ -223,6 +240,7 @@ pub fn init(
         const inline_stack = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const address_taken_names = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const address_taken_modules = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const global_inits = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const symbol_capacity = if symbol_store.*.length > 0 { symbol_store.*.length } else { 1 }
         const lir_symbol_ids = @ptrCast([*]usize, allocator.alloc(symbol_capacity * @sizeOf(usize), @alignOf(usize)).?)
         const type_cache = @ptrCast([*]NodeTypeCache, allocator.alloc(@sizeOf(NodeTypeCache), @alignOf(NodeTypeCache)).?)
@@ -235,6 +253,7 @@ pub fn init(
         vector.Vector.initAt(inline_stack, allocator, @sizeOf(usize), @alignOf(usize), 16)
         vector.Vector.initAt(address_taken_names, allocator, @sizeOf(AddressTakenName), @alignOf(AddressTakenName), 64)
         vector.Vector.initAt(address_taken_modules, allocator, @sizeOf(usize), @alignOf(usize), 16)
+        vector.Vector.initAt(global_inits, allocator, @sizeOf(GlobalInit), @alignOf(GlobalInit), 16)
         var symbol_index: usize = 0
         while symbol_index < symbol_capacity {
             lir_symbol_ids[symbol_index] = lir.NONE
@@ -277,6 +296,9 @@ pub fn init(
             .resolvedTypeQueries = 0,
             .resolvedTypeHits = 0,
             .unsupportedLoweringCount = 0,
+            .globalInits = global_inits,
+            .initImageBase = 0,
+            .initSymbolIndex = 0,
             .operatorToken = 0,
             .firstUnsupportedOffset = 0,
             .firstUnsupportedLength = 0,
@@ -415,6 +437,76 @@ pub fn generateModule(builder: *LirBuilder, module_id: usize) -> void {
     generate(builder, module.*.rootNode)
 }
 
+// The name of the function that writes the globals' addresses.
+pub const GLOBAL_INIT_NAME = "__mlx_init_globals"
+
+pub fn globalInitializerCount(builder: *LirBuilder) -> usize { return builder.*.globalInits.*.length }
+
+// `__mlx_init_globals`: every address a global's initializer names
+// (GlobalInit) stored at its place, each lowered as the expression it is.
+// The program's start calls it before main (`has_start`; a shared object
+// has no start of its own: such an initializer is reported there).
+pub fn generateGlobalInitializers(builder: *LirBuilder, has_start: bool) -> void {
+    if builder.*.globalInits.*.length == 0 { return }
+    if !has_start {
+        var first: GlobalInit = undefined
+        unsafe { first = @ptrCast(*GlobalInit, vector.Vector.at(builder.*.globalInits.*, 0)).* }
+        switchToModule(builder, first.moduleId)
+        recordUnsupportedBuiltin(builder, ast_store.Store.get(getNodes(builder), first.node).mainToken)
+        return
+    }
+    var name: [*]const u8 = undefined
+    unsafe { name = @ptrCast([*]const u8, GLOBAL_INIT_NAME) }
+    const function_symbol = lir.addSymbol(builder.*.lir, name, GLOBAL_INIT_NAME.length)
+    const void_type = types_store.Store.primitive(builder.*.typeStore, types_store.Kind.void_type)
+    lir.addInst(builder.*.lir, lir.labelInst(void_type, function_symbol))
+    const bindings_len = builder.*.bindings.*.length
+    const binding_components_len = builder.*.bindingComponents.*.length
+    const saved_return_type = builder.*.currentReturnType
+    const saved_frame_storage = builder.*.frameStorageCount
+    const saved_return_slot = builder.*.returnSlot
+    const saved_module = builder.*.currentModuleId
+    builder.*.currentReturnType = void_type
+    builder.*.frameStorageCount = 0
+    builder.*.paramCounter = 0
+    builder.*.returnSlot = lir.NONE
+    // (The list grows while it is walked: a value that names a global not
+    // made yet makes it, with its own addresses.)
+    var index: usize = 0
+    while index < builder.*.globalInits.*.length {
+        var entry: GlobalInit = undefined
+        unsafe { entry = @ptrCast(*GlobalInit, vector.Vector.at(builder.*.globalInits.*, index)).* }
+        switchToModule(builder, entry.moduleId)
+        const value = lowerNode(builder, entry.node)
+        if value == lir.NONE {
+            recordUnsupportedBuiltin(builder, ast_store.Store.get(getNodes(builder), entry.node).mainToken)
+        } else {
+            var place = globalAddress(builder, entry.symbolIndex)
+            if entry.offset != 0 {
+                const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, entry.offset))
+                var address = lir.initInst(lir.Opcode.gep, lir.NONE)
+                address.arg0 = place
+                address.arg1 = offset
+                address.arg2 = 1
+                place = lir.addInst(builder.*.lir, address)
+            }
+            var store = lir.initInst(lir.Opcode.store, lir.NONE)
+            store.arg0 = place
+            store.arg1 = value
+            lir.addInst(builder.*.lir, store)
+        }
+        index += 1
+    }
+    const implicit_result = lir.addInst(builder.*.lir, lir.constI(void_type, 0))
+    lir.addInst(builder.*.lir, lir.retInst(void_type, implicit_result))
+    builder.*.bindings.*.length = bindings_len
+    builder.*.bindingComponents.*.length = binding_components_len
+    builder.*.currentReturnType = saved_return_type
+    builder.*.frameStorageCount = saved_frame_storage
+    builder.*.returnSlot = saved_return_slot
+    switchToModule(builder, saved_module)
+}
+
 pub fn generate(builder: *LirBuilder, root_index: usize) -> void {
     const nodes = getNodes(builder)
     if root_index == ast.NONE || root_index >= nodes.*.length { return }
@@ -484,12 +576,30 @@ fn globalIndexFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                         target[index] = 0
                         index += 1
                     }
+                    const saved_base = builder.*.initImageBase
+                    const saved_symbol = builder.*.initSymbolIndex
+                    const inits_before = builder.*.globalInits.*.length
+                    builder.*.initImageBase = @intFromPtr(target)
+                    builder.*.initSymbolIndex = symbol_index
                     if writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target) {
                         bytes = target
                         byte_count = size
                     } else {
+                        builder.*.globalInits.*.length = inits_before
                         recordUnsupportedBuiltin(builder, initializer.mainToken)
                     }
+                    builder.*.initImageBase = saved_base
+                    builder.*.initSymbolIndex = saved_symbol
+                }
+            } else if isAddressType(builder, symbol.*.typeId) && initializer.tag != ast.Tag.undefined_literal && initializer.tag != ast.Tag.null_literal {
+                // A pointer or a function: its address, written at the start.
+                addGlobalInit(builder, symbol_index, 0, declaration.rhs)
+            } else if types_store.Store.get(builder.*.typeStore, symbol.*.typeId).*.kind == types_store.Kind.float {
+                const float_bits = floatInitializerBits(builder, declaration.rhs)
+                if float_bits.0 {
+                    value = if size == 4 { @intCast(u64, narrowFloatBits(float_bits.1)) } else { float_bits.1 }
+                } else {
+                    recordUnsupportedBuiltin(builder, initializer.mainToken)
                 }
             } else if isScalarInitializer(initializer.tag) {
                 const initial = lowerComptimeValue(builder, declaration.rhs)
@@ -523,8 +633,53 @@ fn isScalarInitializer(tag: ast.Tag) -> bool {
 // type's size): array literals element by element, struct literals field
 // by field, scalars at their width; false for a value not known at
 // compile time.
-fn writeInitialBytes(builder: *LirBuilder, node_index: usize, type_id: usize, target: [*]u8) -> bool {
+// Whether a type is one word holding an address: a pointer, a function,
+// or the optional of one (null its zero).
+fn isAddressType(builder: *LirBuilder, type_id: usize) -> bool {
+    if type_id == 0 { return false }
+    var value = types_store.Store.get(builder.*.typeStore, type_id)
+    if value.*.kind == types_store.Kind.optional && value.*.lhs != 0 { value = types_store.Store.get(builder.*.typeStore, value.*.lhs) }
+    return value.*.kind == types_store.Kind.pointer || value.*.kind == types_store.Kind.many_pointer || value.*.kind == types_store.Kind.function
+}
+
+fn addGlobalInit(builder: *LirBuilder, symbol_index: usize, offset: usize, node_index: usize) -> void {
+    var entry = GlobalInit.{ .symbolIndex = symbol_index, .offset = offset, .node = node_index, .moduleId = builder.*.currentModuleId }
+    unsafe { const appended = vector.Vector.appendAt(builder.*.globalInits, @ptrCast([*]const u8, &entry)) }
+}
+
+// A float initializer's f64 bits: a literal, a negated one, an integer
+// literal; false for another form.
+fn floatInitializerBits(builder: *LirBuilder, node_index: usize) -> (bool, u64) {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag == ast.Tag.float_literal {
+        return -> (true, @intCast(u64, decimal.parse(tokenPointer(builder, node.mainToken), tokenLength(builder, node.mainToken))))
+    }
+    if node.tag == ast.Tag.unary_expression && tokenKind(builder, node.mainToken) == lexer.Kind.minus && node.lhs != ast.NONE {
+        const operand = floatInitializerBits(builder, node.lhs)
+        if !operand.0 { return -> (false, 0) }
+        return -> (true, operand.1 ^ (@intCast(u64, 1) << 63))
+    }
+    if node.tag == ast.Tag.integer_literal {
+        const scalar = lowerComptimeValue(builder, node_index)
+        if scalar.kind != comptime_value.Kind.integer { return -> (false, 0) }
+        return -> (true, @bitCast(u64, @floatFromInt(f64, scalar.integer)))
+    }
+    return -> (false, 0)
+}
+
+// An f64's bits as the f32 nearest to it.
+fn narrowFloatBits(bits: u64) -> u32 {
+    return @bitCast(u32, @floatCast(f32, @bitCast(f64, bits)))
+}
+
+fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, target: [*]u8) -> bool {
     const nodes = getNodes(builder)
+    // (An `unsafe { ... }` around the value is the value.)
+    var node_index = given_index
+    while node_index != ast.NONE && (ast_store.Store.get(nodes, node_index).tag == ast.Tag.unsafe_block || ast_store.Store.get(nodes, node_index).tag == ast.Tag.unsafe_expression) {
+        node_index = ast_store.Store.get(nodes, node_index).lhs
+    }
+    if node_index == ast.NONE { return false }
     const node = ast_store.Store.get(nodes, node_index)
     const value_type = types_store.Store.get(builder.*.typeStore, type_id)
     if node.tag == ast.Tag.array_literal {
@@ -581,6 +736,25 @@ fn writeInitialBytes(builder: *LirBuilder, node_index: usize, type_id: usize, ta
         return true
     }
     if node.tag == ast.Tag.undefined_literal || node.tag == ast.Tag.null_literal { return true }
+    if value_type.*.kind == types_store.Kind.float {
+        const float_bits = floatInitializerBits(builder, node_index)
+        if !float_bits.0 { return false }
+        const float_width: usize = if value_type.*.bits == 32 { 4 } else { 8 }
+        const stored: u64 = if float_width == 4 { @intCast(u64, narrowFloatBits(float_bits.1)) } else { float_bits.1 }
+        var float_byte: usize = 0
+        while float_byte < float_width {
+            target[float_byte] = @intCast(u8, (stored >> @intCast(u6, float_byte * 8)) & 255)
+            float_byte += 1
+        }
+        return true
+    }
+    if isAddressType(builder, type_id) {
+        // An address (a function, a string's bytes, another global): the
+        // word stays zero here and is written when the program starts.
+        if builder.*.initImageBase == 0 { return false }
+        addGlobalInit(builder, builder.*.initSymbolIndex, @intFromPtr(target) - builder.*.initImageBase, given_index)
+        return true
+    }
     if !isScalarInitializer(node.tag) { return false }
     const scalar = lowerComptimeValue(builder, node_index)
     if scalar.kind != comptime_value.Kind.integer && scalar.kind != comptime_value.Kind.boolean { return false }

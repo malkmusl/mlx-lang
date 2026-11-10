@@ -180,6 +180,7 @@ run 434_packed_struct_runtime "packed structs: fields at bit offsets in one word
 run 435_float_negative_zero_runtime "a float's negation flips its sign bit: -(0.0) is -0.0, in f32 and f64"
 run 436_function_type_in_builtin_runtime "a function type where a builtin takes a type: fn, ?fn and [*]?fn in @ptrCast"
 run 437_atomic_optional_pointer_runtime "atomics on an optional pointer: load, store and exchange of ?*T and ?[*]T"
+run 438_global_address_initializers_runtime "module-level vars initialized with floats and addresses: functions, strings, another global's element; one address for a table wherever it is named"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
 run 422_h264_cpu_decode_runtime "WebKit's test.mp4 (Main profile, B frames) decoded on the CPU through std.mp4 and std.h264: every picture, in presentation order, the planes' CRC-32 the reference decoding's"

@@ -116,8 +116,16 @@ if cLength(pointer) != 14 || pointer[3] != 75 { return 3 }
 
 A module-level `var` is a global: one slot in the program's data area that
 every function sees, with its initial value (`spec/00-language/modules.xml`
-asks that it be comptime evaluable; an integer or bool, or `undefined` and
-`null` for a zeroed slot, an aggregate among them). `pub var` opens it to
+asks that it be comptime evaluable; an integer, bool or float, or
+`undefined` and `null` for a zeroed slot, an aggregate among them). An
+initializer may also name addresses: a function, a string's bytes
+(`"text".pointer`), another global or an element of one (`&table[2]`), in
+a pointer of its own or inside an array or struct literal. The global's
+bytes are static data, at one address wherever it is named (a table of
+functions other objects point into); the addresses in them are written
+when the program starts, before `main`
+(`tests/438_global_address_initializers_runtime.mlx`). A `const`
+aggregate, by contrast, is a value built where it is used. `pub var` opens it to
 other modules, which read and write it as `module.name` and may take its
 address:
 

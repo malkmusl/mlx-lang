@@ -635,9 +635,14 @@ usable.
 A module-level `var` (`var counter: u32 = 0`, `pub var` for other modules,
 `export var` for C) lives in the image's data area, not in any frame: one
 slot per global after the area's fixed words, aligned to its type and at
-least 8 bytes long, with the initial value of an integer, bool, array or
-struct literal initializer written into the image byte by byte
-(`undefined` and `null` zero it). Code takes a slot's address RIP-relative
+least 8 bytes long, with the initial value of an integer, bool, float,
+array or struct literal initializer written into the image byte by byte
+(`undefined` and `null` zero it). A word of the initializer that is an
+address (a function, a string literal's bytes, another global or its
+element) is zero in the image; the function `__mlx_init_globals`, which
+the lowering makes when a program has such words, stores each one, and
+`_start` calls it before `main`. A `--shared` object or `--plugin` has no
+start of its own: such an initializer is reported there. Code takes a slot's address RIP-relative
 on x86_64 (`lea reg, [rip + disp32]` with a fixup the pipeline resolves
 against where the area lands) and with `adrp`/`add` on aarch64; reads,
 writes, `&global`, field and index access then work on that address
