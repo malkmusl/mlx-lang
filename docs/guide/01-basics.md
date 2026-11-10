@@ -23,7 +23,11 @@ var b = a
 - `var` declares a mutable binding.
 
 Statements are newline-terminated — there is no `;` at the end of a
-statement.
+statement. A line ends its statement when its last token ends an
+expression: a name, a literal, `)`, `]`, `}`, a postfix `.*` or `.?`
+(`return`, `break` and `continue` too). The next line's `(` or `[` then
+begins a statement; it is no call or index of the value before
+(`tests/444_statement_after_postfix_runtime.mlx` → 13).
 
 ## Declaration modifiers
 

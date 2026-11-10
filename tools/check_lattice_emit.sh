@@ -166,5 +166,7 @@ program program "main shapes" "two units as one program: a header's record, temp
 program incomplete "user maker" "records only declared in one unit and defined in the other: references to them kept, returned and handed on"
 program lists "lists" "an initializer_list of records, an array of records as a pointer, a vector of pairs and a map from braced lists, a table's rows, references to arrays of char"
 program statics "statics" "objects made before main: constant ones as data (bit-fields in their words, a pointer into an array, a table of pointers to them, an empty record), one with a constructor through the unit's start, static locals behind their guards"
+program casts2 "casts2" "const cast away, a function kept as a data pointer and called again, a std::array by reference, this handed to a template by reference"
+program shapes "shapes" "operators outside a class and an assignment through a converting constructor, a parameter named as a class, the address of one of two strings, arrays or variables, one object's address indexed, an array of arrays as its bytes, const dropped below the first pointer, the library's math of an integer, a function pointer taking a function pointer, a temporary moved into an element"
 program twins "first second" "two units each with a record of its own under one name: two records, each in its unit"
 echo "check_lattice_emit.sh: all checks passed"

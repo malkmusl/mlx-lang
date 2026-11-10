@@ -199,6 +199,12 @@ where a builtin takes one, bare or under the type prefixes:
 
 (`tests/436_function_type_in_builtin_runtime.mlx` → 13)
 
+A parameter of a function type may be a function type itself, or a tuple:
+`?fn(*Color, ?fn(?[*]const u8, ?[*]u8) -> void, ?[*]u8) -> void` is a
+function of three parameters, the second a function of two.
+
+(`tests/443_function_type_parameters_runtime.mlx` → 13)
+
 ## `inline`/`noinline`
 
 The `inline` and `noinline` modifiers are a request/veto, not a semantic

@@ -165,14 +165,57 @@ the address of a copy the caller made). The overflow builtins
 (`c.mul_overflow_u64`), `std::atomic<T>` the atomic builtins, bit
 counting `@popCount` and the runtime's `clz`/`ctz`.
 
-What it leaves to the hand is marked `// LATTICE:` in place and counted at
+What C++ has and Mlx has not is written out of what Mlx has:
+
+- **Variadic functions** take their extra arguments as words,
+  `va_arguments: []const u64` (an integer extended, a pointer's
+  address, a double's bits); a call packs them, `[_]u64{ a, b }[0..2]`.
+  `va_list` is the runtime's record (`c.VaList`, laid out as the System
+  V one, the words its overflow area), `va_start`, `va_arg` and
+  `va_copy` its functions. The C library's `printf` family, `sscanf`,
+  `syscall` and `fcntl` are the runtime's, over mlxlibc's format engine
+  (itself Mlx).
+- **`goto`, and a `switch` whose cases fall through**, are a dispatcher:
+  the statements between the labels are numbered states of a labelled
+  `while true`, a jump sets the state and continues it, falling through
+  is the next state (flex's and bison's tables in the shader translator
+  run so). A loop a jump leaves gets its label when the jump is written.
+- **Objects made before `main`** (a class object with a constructor, a
+  variable whose initializer is no constant) are constructed in the
+  unit's `pub fn lattice_start()`, which the program's `start()` calls
+  for every unit, the library's first; constant objects are static data
+  (bit-fields in their words, addresses of functions, of other objects
+  and into arrays, a vtable's address point). A static local is behind
+  its guard (`c.__mlxcc_guard_acquire`).
+- **A pointer to a member function** is a word, the function's address
+  or, for a virtual one, its table offset and one (functions begin at
+  multiples of 16, so the low bit tells them apart); the call reads the
+  table when the bit is set.
+- **What one side of `?:`, `&&` or `||` hoists** (a temporary
+  constructed for one arm) runs on that side's condition: the condition
+  is kept in a variable of the function (`chosen_N`), the hoisted
+  statements go under an `if` of it, and the expression reads it.
+- **Operators outside a class** are functions like any other
+  (`angle_base_internal_add`); an object of a class copied by its bytes
+  that is assigned a value of another type is assigned the temporary its
+  converting constructor makes.
+- **Names** the Mlx would confuse are told apart: a member that hides a
+  base's (`name_2`), a record or C++ function beside a C function of
+  its name (`stat_`), a local named as a class the module writes
+  (`string_3`), two records of one name in two units, unnamed globals
+  (`anonymous_2`).
+
+`MLX_CC_EMIT_TRACE=1` writes every expression statement under a comment
+with its tree as the front end handed it over (node kinds, variables'
+names, type kinds): where a line of the Mlx is not what the C++ says,
+the tree shows whether the translator or the front end is wrong.
+
+What is left to the hand is marked `// LATTICE:` in place and counted at
 the end of the file: a function taking or returning a type the Mlx lacks
-by value (a class with a virtual base, an `ifstream`, a lambda's
-closure; written out, commented, until the type has an Mlx shape -- a
+by value (written out, commented, until the type has an Mlx shape -- a
 pointer to such a type is passed along, the type declared opaque), one
-calling such a function (or one held back so), one with variadic
-arguments, a `goto` or `alloca`, inline assembly (cpuid, the time
-stamp), stream calls, variadic C calls (`printf`, `snprintf`). Nothing is
+calling such a function (or one held back so), `alloca`, inline
+assembly (cpuid, the time stamp), ANGLE's log streams. Nothing is
 made up: what the translator cannot write is a comment, never a `0`. The output is kept in the repository
 (projects/lattice/angle/common and projects/lattice/runtime/libcpp.mlx),
 regenerated with `tools/check_lattice_emit.sh --update`, and the check
