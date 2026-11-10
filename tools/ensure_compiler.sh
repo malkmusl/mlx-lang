@@ -45,6 +45,21 @@ writes_shared_objects() {
     return $ok
 }
 
+# Whether a program $1 builds for brixOS that names a C function leaves by
+# brixOS's own process_exit when main returns (no import of the C
+# library's exit, which nothing there would fill).
+leaves_brixos_by_process_exit() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet --target=x86_64-brixos tests/support/brixos_linked_exit/main.mlx -o "$probe/probe" > /dev/null 2>&1 \
+        && tr '\0' '\n' < "$probe/probe" | grep -qx 'getpid' && ! tr '\0' '\n' < "$probe/probe" | grep -qx 'exit'; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 names the functions in a symbol table (.symtab), which the
 # crash reports of the desktop programs read.
 writes_symbol_tables() {
@@ -929,6 +944,7 @@ probes=(
     "types_functions_named_ahead|a function named in an initializer above its declaration"
     "ends_functions_with_endless_loops|a function ending with a while true no break ends"
     "resolves_types_across_import_rings|records of modules that import one another naming one another"
+    "leaves_brixos_by_process_exit|a linked brixOS program leaving by process_exit"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
