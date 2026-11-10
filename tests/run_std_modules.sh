@@ -186,6 +186,7 @@ run 440_endless_loop_ends_function_runtime "a function ending with a while true 
 run 442_function_alignment_runtime "functions begin at multiples of 16: an address through an integer and back, its low bits free"
 run 443_function_type_parameters_runtime "a function type with a function type or a tuple among its parameters keeps its own parameters"
 run 444_statement_after_postfix_runtime "a line ending in .* or .? ends its statement: the next line's ( begins one"
+run 445_constant_address_runtime "the address of a module-level constant, of this module or an imported one: a copy of its value in the function"
 run 441_types_across_import_ring_runtime "records of three modules that import one another naming one another: pointers, records inside, a function type, sizes"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"

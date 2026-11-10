@@ -127,7 +127,11 @@ when the program starts, before `main`
 (`tests/438_global_address_initializers_runtime.mlx`). The function
 named may be declared further down the module, as any module-level
 declaration may (`tests/439_function_before_declaration_runtime.mlx`). A
-`const` aggregate, by contrast, is a value built where it is used. `pub var` opens it to
+`const` aggregate, by contrast, is a value built where it is used; so is
+every module-level `const`: it has no storage, and `&LIMIT` (or
+`&module.LIMIT`) is the address of a copy of its value in the function
+that takes it, good for a `*const T` parameter and no identity of the
+constant (`tests/445_constant_address_runtime.mlx`). `pub var` opens it to
 other modules, which read and write it as `module.name` and may take its
 address:
 

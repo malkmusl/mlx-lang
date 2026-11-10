@@ -570,6 +570,21 @@ ends_statements_after_postfix() {
     return $ok
 }
 
+# Whether $1 gives a module-level constant an address (a copy of its
+# value in the function; tests/445_constant_address_runtime.mlx exits 13).
+addresses_constants() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/445_constant_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether functions $1 builds begin at multiples of 16
 # (tests/442_function_alignment_runtime.mlx exits 13).
 aligns_functions() {
@@ -981,6 +996,7 @@ probes=(
     "aligns_functions|functions at multiples of 16"
     "nests_function_types|function types with function types among their parameters"
     "ends_statements_after_postfix|a statement ended by a line's last .* or .?"
+    "addresses_constants|the address of a module-level constant"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

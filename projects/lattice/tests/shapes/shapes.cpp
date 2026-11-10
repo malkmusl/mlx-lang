@@ -188,9 +188,138 @@ static unsigned fast()
     ++it;
     return count * 1000 + (unsigned)*it * 100 + (unsigned)records.mData[0].b * 10 + (unsigned)numbers.mData[0];
 }
+// A base class's part returned by reference, a constant pointer taken by
+// reference, a number wider than an int where an int is taken, a pointer
+// made of an integer tested and read, a signed char as a plain one, a
+// call through a variable of a function pointer type.
+struct Sink
+{
+    int n = 4;
+};
+struct Tag
+{
+    int t = 1;
+};
+struct Wide : Tag, Sink
+{
+    int m = 2;
+};
+struct Log
+{
+    Wide mWide;
+    Sink &sink() { return mWide; }
+};
+static const char *const kMessage = "seven!!";
+static unsigned length(const char *const &text)
+{
+    unsigned n = 0;
+    while (text[n] != 0)
+    {
+        n++;
+    }
+    return n;
+}
+static int index(int i) { return i; }
+typedef unsigned (*Handler)(unsigned);
+static unsigned twice(unsigned n) { return n * 2; }
+static unsigned through(uintptr_t raw, unsigned n)
+{
+    if (reinterpret_cast<void *>(raw) == nullptr)
+    {
+        return 0;
+    }
+    if (!reinterpret_cast<unsigned char *>(raw))
+    {
+        return 1;
+    }
+    return reinterpret_cast<const unsigned *>(raw)[0] + n;
+}
+static signed char narrow(signed char c) { return c; }
+static unsigned text(signed char c)
+{
+    char plain = static_cast<char>(narrow(c));
+    return (unsigned char)plain;
+}
+static unsigned more()
+{
+    unsigned sum = length(kMessage);
+    sum += (unsigned)index(0xFFFFFFFF) + 10;
+    unsigned value = 30;
+    sum += through(reinterpret_cast<uintptr_t>(&value), 5);
+    sum += through(0, 5);
+    sum += text(-2);
+    Log log;
+    Sink &out = log.sink();
+    out.n += 3;
+    sum += (unsigned)log.mWide.n * 1000;
+    Handler handler = twice;
+    sum += handler(3);
+    return sum;
+}
+// A constant made when the program starts and one made at its first use
+// are variables; `*rows` of an array of arrays is its first row; a
+// pointer to an array is stepped over the arrays.
+static unsigned calls = 0;
+static bool answer()
+{
+    calls++;
+    return true;
+}
+static unsigned count()
+{
+    calls++;
+    return 40;
+}
+static const unsigned kStart = count();
+static bool once()
+{
+    static const bool cached = answer();
+    return cached;
+}
+struct Image
+{
+    int id;
+};
+static unsigned firstOf(const unsigned char *row) { return row[0] + row[3]; }
+static unsigned rows()
+{
+    unsigned char pixels[3][4];
+    for (int i = 0; i < 3; i++)
+    {
+        for (int j = 0; j < 4; j++)
+        {
+            pixels[i][j] = (unsigned char)(i * 10 + j);
+        }
+    }
+    unsigned sum = firstOf(*pixels);
+    Image images[2][3];
+    int next = 0;
+    for (auto &line : images)
+    {
+        for (auto &image : line)
+        {
+            image.id = next++;
+        }
+    }
+    Image(*line)[3] = images;
+    ++line;
+    sum += (unsigned)(*line)[1].id * 100;
+    for (Image(*it)[3] = images; it != images + 2; ++it)
+    {
+        sum += (unsigned)(*it)[2].id;
+    }
+    return sum;
+}
+static unsigned made()
+{
+    unsigned sum = kStart;
+    sum += once() ? 1 : 0;
+    sum += once() ? 1 : 0;
+    return (sum * 10 + calls) * 1000 + rows();
+}
 unsigned run()
 {
-    unsigned sum = 0;
+    unsigned sum = more() + made();
     sum += blocks(10, 4, 2);
     sum += blocks(1, 4, 5);
     sum += blocks(8, 0, 1);
