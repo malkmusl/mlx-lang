@@ -316,11 +316,11 @@ What is not there yet: a device plugged in after the boot, interrupts
 for these devices (they are polled), the x2APIC's way of reaching
 processors.
 
-(A table read by index is a `var`: the font's glyphs were a `const`
-array, a value built where it is used, and each row of each character
-drawn built all 1520 bytes of it in the kernel's arena, which was full
-after 173 characters. That, not a driver, was the freeze after "probing
-storage".)
+(The font's glyphs were a `const` array, a value built where it was
+used: each row of each character drawn built all 1520 bytes of it in the
+kernel's arena, which was full after 173 characters. That, not a driver,
+was the freeze after "probing storage". The table is a `var` now, and
+mlx4 reads a `const` table from static data as well.)
 
 ## The network
 

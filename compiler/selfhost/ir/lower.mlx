@@ -187,6 +187,11 @@ pub const LirBuilder = struct {
     globalInits: *vector.Vector
     initImageBase: usize
     initSymbolIndex: usize
+    // The module-level constants read from static data (constantImageFor):
+    // for each sema symbol the global that holds its image, lir.NONE while
+    // nobody asked, NO_IMAGE when it has none; and how many have one.
+    constantImages: [*]usize
+    constantImageCount: usize
     // The operator or builtin being lowered (for an unsupported form).
     operatorToken: usize
     firstUnsupportedOffset: usize
@@ -243,6 +248,7 @@ pub fn init(
         const global_inits = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const symbol_capacity = if symbol_store.*.length > 0 { symbol_store.*.length } else { 1 }
         const lir_symbol_ids = @ptrCast([*]usize, allocator.alloc(symbol_capacity * @sizeOf(usize), @alignOf(usize)).?)
+        const constant_images = @ptrCast([*]usize, allocator.alloc(symbol_capacity * @sizeOf(usize), @alignOf(usize)).?)
         const type_cache = @ptrCast([*]NodeTypeCache, allocator.alloc(@sizeOf(NodeTypeCache), @alignOf(NodeTypeCache)).?)
         vector.Vector.initAt(bindings, allocator, @sizeOf(Binding), @alignOf(Binding), 32)
         vector.Vector.initAt(binding_components, allocator, @sizeOf(usize), @alignOf(usize), 64)
@@ -257,6 +263,7 @@ pub fn init(
         var symbol_index: usize = 0
         while symbol_index < symbol_capacity {
             lir_symbol_ids[symbol_index] = lir.NONE
+            constant_images[symbol_index] = lir.NONE
             symbol_index += 1
         }
         type_cache[0].expressionModule = 0
@@ -297,6 +304,8 @@ pub fn init(
             .resolvedTypeHits = 0,
             .unsupportedLoweringCount = 0,
             .globalInits = global_inits,
+            .constantImages = constant_images,
+            .constantImageCount = 0,
             .initImageBase = 0,
             .initSymbolIndex = 0,
             .operatorToken = 0,
@@ -579,9 +588,23 @@ fn globalIndexFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                     const saved_base = builder.*.initImageBase
                     const saved_symbol = builder.*.initSymbolIndex
                     const inits_before = builder.*.globalInits.*.length
+                    // (A global is made the first time it is named, which
+                    // may be inside a function: the initializer's names
+                    // are its module's, not that function's locals. A
+                    // local `FLAG` stood in for the module's `FLAG` in
+                    // `var table = [2]bool{ FLAG, true }`.)
+                    var own_bindings: vector.Vector = undefined
+                    vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
+                    const saved_bindings = builder.*.bindings
+                    const components_length = builder.*.bindingComponents.*.length
+                    builder.*.bindings = &own_bindings
                     builder.*.initImageBase = @intFromPtr(target)
                     builder.*.initSymbolIndex = symbol_index
-                    if writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target) {
+                    const written = writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target)
+                    builder.*.bindings = saved_bindings
+                    builder.*.bindingComponents.*.length = components_length
+                    vector.Vector.deinit(own_bindings)
+                    if written {
                         bytes = target
                         byte_count = size
                     } else {
@@ -770,6 +793,141 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
     if tagged { target[width] = 1 }
     return true
 }
+
+// A module-level `const` is a value built where it is used: every use
+// lowers its initializer again. For a table (an array or struct literal of
+// values known at compile time) that is all of its elements stored one by
+// one to read one of them, in storage of the using function's, or of the
+// aggregate arena, which is never freed, when it is over what a frame
+// takes. Such a constant has one image in the data area instead, as a
+// `var` has: its elements and fields are read from there (lowerPlace:
+// `TABLE[i]`, `TABLE.field`, `TABLE.length`), and where its whole value is
+// used (handed to a function, sliced, copied into a variable) the value is
+// one copy of the image, storage of its own as before: nothing can write
+// into the image, so it is the same value at every use.
+//
+// The constant's image (a global's index), made the first time it is asked
+// for; lir.NONE when the constant has none: no array or struct, a member
+// of an aggregate, an initializer that is no literal or holds what is not
+// known until the program runs or an address (those are written when the
+// program starts, which a constant must not wait for).
+const NO_IMAGE: usize = lir.NONE - 1
+
+fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
+    if symbol_index >= builder.*.lirSymbolCapacity { return lir.NONE }
+    const known = builder.*.constantImages[symbol_index]
+    if known == NO_IMAGE { return lir.NONE }
+    if known != lir.NONE { return known }
+    builder.*.constantImages[symbol_index] = NO_IMAGE
+    const symbol = symbols_store.Store.get(builder.*.symbolStore, symbol_index)
+    if symbol.*.flags & symbol_module.FLAG_CONSTANT == 0 { return lir.NONE }
+    if symbol.*.flags & (symbol_module.FLAG_FUNCTION | symbol_module.FLAG_PARAMETER | symbol_module.FLAG_EXTERN | symbol_module.FLAG_THREADLOCAL) != 0 { return lir.NONE }
+    if symbol.*.declaration == ast.NONE || symbol.*.typeId == 0 || symbol.*.ownerTypeId != 0 { return lir.NONE }
+    if !aggregate_copy.isMemoryType(builder.*.typeStore, symbol.*.typeId) { return lir.NONE }
+    const size = types_store.Store.sizeOf(builder.*.typeStore, symbol.*.typeId)
+    if size == 0 { return lir.NONE }
+    const module_id = moduleForSymbol(builder, symbol_index)
+    const previous_module = builder.*.currentModuleId
+    if module_id != previous_module { switchToModule(builder, module_id) }
+    var made = lir.NONE
+    const nodes = getNodes(builder)
+    if symbol.*.declaration < nodes.*.length {
+        const declaration = ast_store.Store.get(nodes, symbol.*.declaration)
+        if declaration.tag == ast.Tag.constant_declaration && declaration.rhs != ast.NONE {
+            // (An `unsafe { ... }` around the value is the value.)
+            var value_node = declaration.rhs
+            while value_node != ast.NONE && (ast_store.Store.get(nodes, value_node).tag == ast.Tag.unsafe_block || ast_store.Store.get(nodes, value_node).tag == ast.Tag.unsafe_expression) {
+                value_node = ast_store.Store.get(nodes, value_node).lhs
+            }
+            var literal = false
+            if value_node != ast.NONE {
+                const initializer = ast_store.Store.get(nodes, value_node)
+                const value_type = types_store.Store.get(builder.*.typeStore, symbol.*.typeId)
+                if initializer.tag == ast.Tag.aggregate_literal && value_type.*.kind == types_store.Kind.struct_type { literal = true }
+                if initializer.tag == ast.Tag.array_literal && value_type.*.kind == types_store.Kind.array {
+                    // (Every element written: a literal of fewer is no
+                    // value of the type as the literal's lowering has it.)
+                    var count: usize = 0
+                    var child = initializer.lhs
+                    while child != ast.NONE {
+                        count += 1
+                        child = ast_store.Store.get(nodes, child).next
+                    }
+                    literal = count == value_type.*.bits
+                }
+            }
+            const image = if literal { builder.*.allocator.alloc(size, 8) } else { null }
+            if image != null {
+                var target = image.?
+                var index: usize = 0
+                while index < size {
+                    target[index] = 0
+                    index += 1
+                }
+                // The initializer read as its module has it: no local of
+                // the function that happens to use the constant first, no
+                // instance's scope, no owner; and with no image to write
+                // addresses for (initImageBase 0: an address in the value
+                // makes it no image).
+                var own_bindings: vector.Vector = undefined
+                vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
+                const saved_bindings = builder.*.bindings
+                const components_length = builder.*.bindingComponents.*.length
+                const saved_scope = builder.*.scopeOverride
+                const saved_owner = builder.*.currentMethodOwner
+                const saved_base = builder.*.initImageBase
+                const inits_before = builder.*.globalInits.*.length
+                const unsupported_before = builder.*.unsupportedLoweringCount
+                builder.*.bindings = &own_bindings
+                builder.*.scopeOverride = 0
+                builder.*.currentMethodOwner = lir.NONE
+                builder.*.initImageBase = 0
+                const written = writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target)
+                builder.*.initImageBase = saved_base
+                builder.*.globalInits.*.length = inits_before
+                builder.*.currentMethodOwner = saved_owner
+                builder.*.scopeOverride = saved_scope
+                builder.*.bindings = saved_bindings
+                builder.*.bindingComponents.*.length = components_length
+                vector.Vector.deinit(own_bindings)
+                if written && builder.*.unsupportedLoweringCount == unsupported_before {
+                    var alignment = types_store.Store.alignOf(builder.*.typeStore, symbol.*.typeId)
+                    if alignment == 0 { alignment = 1 }
+                    const label = lir.globalLabel(builder.*.lir, lir.globalCount(builder.*.lir))
+                    made = lir.addGlobal(builder.*.lir, label.0, label.1, size, alignment, 0, target, size, false, symbol_index)
+                }
+            }
+        }
+    }
+    if module_id != previous_module { switchToModule(builder, previous_module) }
+    if made != lir.NONE {
+        builder.*.constantImages[symbol_index] = made
+        builder.*.constantImageCount += 1
+    }
+    return made
+}
+
+// Whether the expression names a constant that has an image (`TABLE`,
+// `module.TABLE`), and its symbol.
+fn constantTarget(builder: *LirBuilder, node_index: usize) -> (bool, usize) {
+    if node_index == ast.NONE { return -> (false, 0) }
+    const tag = ast_store.Store.get(getNodes(builder), node_index).tag
+    if tag != ast.Tag.identifier && tag != ast.Tag.field_expression { return -> (false, 0) }
+    const referenced = referencedSymbolIndex(builder, node_index)
+    if !referenced.0 || constantImageFor(builder, referenced.1) == lir.NONE { return -> (false, 0) }
+    return -> (true, referenced.1)
+}
+
+// The address of what `node_index` names, for reading an element or a
+// field of it: a constant's image where it has one, else its value as it
+// lowers.
+fn lowerPlace(builder: *LirBuilder, node_index: usize) -> usize {
+    const constant = constantTarget(builder, node_index)
+    if constant.0 { return globalAddress(builder, constant.1) }
+    return lowerNode(builder, node_index)
+}
+
+pub fn constantImageCount(builder: *LirBuilder) -> usize { return builder.*.constantImageCount }
 
 fn globalAddress(builder: *LirBuilder, symbol_index: usize) -> usize {
     var inst = lir.initInst(lir.Opcode.global_address, lir.NONE)
@@ -3386,7 +3544,7 @@ fn lowerFieldAddress(builder: *LirBuilder, node_index: usize) -> usize {
     if !metadata.found { return lir.NONE }
     // (A packed struct's field is bits of a word: no address of its own.)
     if packedFieldIn(builder, base_type, node.mainToken).found { return lir.NONE }
-    const base = lowerNode(builder, node.lhs)
+    const base = lowerPlace(builder, node.lhs)
     if base == lir.NONE { return lir.NONE }
     const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, metadata.offset))
     var address = lir.initInst(lir.Opcode.gep, lir.NONE)
@@ -3407,7 +3565,8 @@ fn lowerIndexAddress(builder: *LirBuilder, node_index: usize) -> usize {
     if element_type == 0 { return lir.NONE }
     var stride = types_store.Store.sizeOf(builder.*.typeStore, element_type)
     if stride == 0 { stride = 1 }
-    const base = lowerNode(builder, node.lhs)
+    // (An array that is a constant with an image is read there.)
+    const base = if container_type.*.kind == types_store.Kind.array { lowerPlace(builder, node.lhs) } else { lowerNode(builder, node.lhs) }
     const index = lowerNode(builder, node.rhs)
     if builder.*.runtimeSafety {
         var length = lir.NONE
@@ -3448,6 +3607,9 @@ fn lowerSymbolValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_m
         return lir.addInst(builder.*.lir, function_inst)
     }
     if isGlobalSymbol(symbol) { return lowerGlobalValue(builder, symbol_index, symbol) }
+    // (A table with an image: its value is a copy of it, storage of its
+    // own as the literal's would be, made by one copy.)
+    if constantImageFor(builder, symbol_index) != lir.NONE { return copyAggregate(builder, globalAddress(builder, symbol_index), symbol.*.typeId, false) }
     return lowerConstantInitializer(builder, symbol, module_id)
 }
 
@@ -3455,7 +3617,8 @@ fn lowerSymbolValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_m
 // to its initializer, in its own module, where it is used: a string to its
 // literal (emitted with the program's other literals), a float to its
 // constant, a struct, array or tuple literal (slices in it too) to a value
-// built there, another constant's name to that constant's value. The initializer gets bindings of its own while it is
+// built there, another constant's name to that constant's value, an
+// element of another (`const THIRD = TABLE[2]`) to that element. The initializer gets bindings of its own while it is
 // lowered: a local of the using function must not stand in for a name of
 // the constant's module.
 fn lowerConstantInitializer(builder: *LirBuilder, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
@@ -3471,7 +3634,7 @@ fn lowerConstantInitializer(builder: *LirBuilder, symbol: *symbol_module.Symbol,
             const initializer = ast_store.Store.get(nodes, declaration.rhs)
             if initializer.tag == ast.Tag.string_literal {
                 result = lowerStringLiteral(builder, initializer.mainToken)
-            } else if initializer.tag == ast.Tag.float_literal || initializer.tag == ast.Tag.unary_expression || initializer.tag == ast.Tag.binary_expression || initializer.tag == ast.Tag.aggregate_literal || initializer.tag == ast.Tag.array_literal || initializer.tag == ast.Tag.tuple_literal || initializer.tag == ast.Tag.identifier || initializer.tag == ast.Tag.field_expression {
+            } else if initializer.tag == ast.Tag.float_literal || initializer.tag == ast.Tag.unary_expression || initializer.tag == ast.Tag.binary_expression || initializer.tag == ast.Tag.aggregate_literal || initializer.tag == ast.Tag.array_literal || initializer.tag == ast.Tag.tuple_literal || initializer.tag == ast.Tag.identifier || initializer.tag == ast.Tag.field_expression || initializer.tag == ast.Tag.index_expression {
                 // (A name, `NAME` or `module.NAME`, is another constant:
                 // its value, lowered as it lowers.)
                 var own_bindings: vector.Vector = undefined
@@ -4211,6 +4374,9 @@ fn lowerField(builder: *LirBuilder, node_index: usize) -> usize {
             return lir.addInst(builder.*.lir, pointer)
         }
         if base_type.*.kind == types_store.Kind.slice || base_type.*.kind == types_store.Kind.array {
+            // (An array's length is its type's. A constant with an image
+            // is not built to say it.)
+            if base_type.*.kind == types_store.Kind.array && constantTarget(builder, node.lhs).0 { return lir.addInst(builder.*.lir, lir.constI(lir.NONE, base_type.*.bits)) }
             const base_value = lowerNode(builder, node.lhs)
             var length_value: usize = 0
             if base_type.*.kind == types_store.Kind.array {

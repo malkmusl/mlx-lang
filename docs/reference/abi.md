@@ -659,6 +659,22 @@ own copy of such a variable (`R_X86_64_COPY`, as gcc does for `optind` or
 `stdout`), the dynamic linker binds the symbol to that copy, and the slot
 makes the Mlx code read and write the copy too.
 
+A module-level `const` that is a table has such a slot too (`ir/lower.mlx`,
+`constantImageFor`): an array or struct literal, every element given, of
+values known at compile time and no address among them (those would wait
+for `__mlx_init_globals`, which a constant must not). It is made the
+first time the constant is used. `TABLE[i]`, `TABLE.field`, an element of
+an element, `&TABLE[i]` (a pointer to a constant) and `TABLE.length` work
+on the slot's address; nothing the compiler emits writes there. Any other
+use of the constant is its value: an `alloca` of the type and one
+`mem_copy` from the slot, so a slice of it, a pointer capture over it or a
+callee that is handed it writes into storage of that use's own, as when
+the value was built there element by element. A constant with addresses
+in it, one whose initializer is no literal, and a member of an aggregate
+are lowered as before: their initializer, where they are used
+(`tests/442_constant_table_static_runtime.mlx`,
+`tests/333_module_slices_runtime.mlx`).
+
 ## Atomics
 
 The atomic builtins (`spec/00-language/atomics-tls.xml`, `<CallShapes>`;

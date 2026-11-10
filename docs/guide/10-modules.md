@@ -127,12 +127,20 @@ when the program starts, before `main`
 (`tests/438_global_address_initializers_runtime.mlx`). The function
 named may be declared further down the module, as any module-level
 declaration may (`tests/439_function_before_declaration_runtime.mlx`). A
-`const` aggregate, by contrast, is a value built where it is used: every
-`TABLE[i]` of a `const TABLE = [1520]u8{ ... }` builds all of its bytes
-first, and one too large for the function's frame (over 1 KiB) takes them
-from the aggregate arena, which is not freed. A table that is read by
-index belongs in a `var` (brixOS's console drew its font from a `const`
-array and filled the kernel's arena in 173 characters). `pub var` opens it to
+`const` aggregate, by contrast, is a value: where it is handed to a
+function, sliced or copied into a variable it is storage of that use's
+own, and nothing written there shows in the constant. A table (an array
+or struct literal of values known at compile time, no addresses among
+them) is not built anew for that: it has one image in the data area, as
+a `var` has; `TABLE[i]`, `TABLE.field` and `TABLE.length` read it there,
+and a use of the whole value is one copy of it
+(`tests/442_constant_table_static_runtime.mlx`; before, every `TABLE[i]`
+of a `const TABLE = [1520]u8{ ... }` stored all of its bytes first, a
+table over what a frame takes in the aggregate arena, which is not freed:
+brixOS's console drew its font so and filled the kernel's arena in 173
+characters). A constant that holds addresses (strings, functions) or
+values not known until the program runs is still built where it is used.
+`pub var` opens a global to
 other modules, which read and write it as `module.name` and may take its
 address:
 

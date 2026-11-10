@@ -585,6 +585,23 @@ initializes_globals_with_addresses() {
     return $ok
 }
 
+# Whether $1 reads a module-level const table from static data
+# (tests/442_constant_table_static_runtime.mlx exits 13: an element or the
+# length of a large table takes nothing from the aggregate arena, and the
+# table's value is still a value).
+reads_constant_tables_from_static_data() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/442_constant_table_static_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 takes an optional pointer as an atomic's type
 # (tests/437_atomic_optional_pointer_runtime.mlx exits 13).
 atomics_take_optional_pointers() {
@@ -945,6 +962,7 @@ probes=(
     "ends_functions_with_endless_loops|a function ending with a while true no break ends"
     "resolves_types_across_import_rings|records of modules that import one another naming one another"
     "leaves_brixos_by_process_exit|a linked brixOS program leaving by process_exit"
+    "reads_constant_tables_from_static_data|module-level const tables read from static data"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
