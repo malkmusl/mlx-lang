@@ -257,6 +257,54 @@ asked still waits inside the kernel meanwhile: no other one runs until
 the request is done.
 While a volume is mounted from it, a /devices/diskN is not writable.
 
+## On a real machine
+
+Beside virtio, the kernel drives what a board has (a Supermicro H11 with
+an EPYC is the one it is brought up on; QEMU's q35 machine with `-device
+ahci`, `nvme`, `igb` and `qemu-xhci` stands in for it,
+tools/check_brix_q35.sh, check_brix_usb.sh, check_brix_net_igb.sh):
+SATA disks on every AHCI controller (ahci.mlx), NVMe namespaces
+(nvme.mlx), an Intel igb network controller (igb.mlx), USB boot keyboards
+and mice on an xHCI controller (usb.mlx: there is no PS/2 there). The
+drivers are polled; each wait is a deadline on the clock
+(clock.Deadline), never a count of register reads, which is a blink on
+one machine and minutes on another, and each step that fails says so
+with what it saw ("ahci: port 4: the device stays busy (SSTS ... TFD
+...)", "usb: port 3: the device takes no address (completion code 4)").
+A controller is taken from the firmware first where it says it holds it
+(AHCI's BOHC, xHCI's USB Legacy Support). A device's registers are
+mapped by `memory.Device.map`: below 511 GiB at the kernel's direct
+offset, beyond (a 64-bit BAR the firmware put high, as OVMF does with
+the xHCI's) in a window of the kernel's own.
+
+The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
+often has no serial line, so the kernel's messages are also drawn on the
+firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so
+that a scroll never reads the adapter's memory back, the framebuffer
+mapped write-combining) until a graphical program maps it, and kept in a
+log (/devices/klog; klogsave writes it to boot.log on the brixfs
+volumes). A fault of the kernel's own stops it with a report on the
+screen (trap.mlx `stop`: what, where, the registers, the callers), drawn
+over whatever is there.
+
+    tools/brix-diag-efi.sh
+
+writes two images for such a machine beside the build's: BOOTX64-diag.EFI
+(no graphical session: the kernel's log stays on the screen to be read or
+photographed) and BOOTX64-console.EFI (mlx-console on the screen: a
+shell with the USB keyboard; `cat /devices/klog` shows the log).
+
+What is not there yet: the other processors when started by UEFI (the
+ACPI tables' root is looked for in the BIOS area, where a UEFI firmware
+does not keep it: one processor runs), keyboards behind a USB hub, more
+than the first xHCI controller, interrupts for these devices.
+
+(A table read by index is a `var`: the font's glyphs were a `const`
+array, a value built where it is used, and each row of each character
+drawn built all 1520 bytes of it in the kernel's arena, which was full
+after 173 characters. That, not a driver, was the freeze after "probing
+storage".)
+
 ## The network
 
 A virtio network device (QEMU's `-netdev user,id=n0 -device
