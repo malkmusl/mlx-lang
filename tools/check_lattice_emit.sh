@@ -99,4 +99,24 @@ differential matrix_utils matrix "Mat4 made, rotated, translated, scaled, frustu
 differential MemoryBuffer memorybuffer "a buffer resized, reserved, filled, cleared and destroyed"
 differential platform_helpers platform "the platform predicates"
 differential string_utils string_utils "splitting, trimming, prefixes, affixes, tokens, case, replacement and wildcards through the std module"
+
+# The translator's own tests (projects/lattice/tests): small C++ files,
+# each with what one feature of C++ needs of the translation, translated,
+# kept, compiled and run against the C++.
+feature() { # DIRECTORY NAME WORDS
+    local directory=projects/lattice/tests/$1 name=$2 words=$3
+    "$work/mlx-cc" -std=c++23 --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-std=../../runtime/libcpp.mlx --emit-mlx="$work/$name.mlx" "$directory/$name.cpp" 2> "$work/$name.err" || fail "$name.cpp does not translate: $(head -5 "$work/$name.err")"
+    if [[ $update -eq 1 ]]; then
+        cp "$work/$name.mlx" "$directory/$name.mlx"
+    elif ! cmp -s "$work/$name.mlx" "$directory/$name.mlx"; then
+        fail "$directory/$name.mlx is not what the translator writes now (tools/check_lattice_emit.sh --update): $(diff "$directory/$name.mlx" "$work/$name.mlx" | head -12)"
+    fi
+    "$work/mlx-cc" -std=c++23 -o "$work/${name}_ref" "$directory/${name}_ref.cpp" "$directory/$name.cpp" 2> "$work/${name}_ref.err" || fail "$name: the C++ reference does not build: $(head -5 "$work/${name}_ref.err")"
+    (env -i LD_LIBRARY_PATH="$work/libc" timeout 60 "$loader" "$work/${name}_ref" > "$work/${name}_ref.out" 2> "$work/${name}_ref.run") || fail "$name: the C++ reference does not run on mlxlibc: $(head -3 "$work/${name}_ref.run")"
+    "$compiler" --quiet "$directory/${name}_test.mlx" -o "$work/${name}_test" 2> "$work/${name}.err" || fail "${name}_test.mlx does not compile: $(head -5 "$work/${name}.err")"
+    "$work/${name}_test" > "$work/${name}_mlx.out" || fail "$name: the Mlx test does not run"
+    cmp -s "$work/${name}_ref.out" "$work/${name}_mlx.out" || fail "$name: the Mlx and the C++ differ (C++ < > Mlx): $(diff "$work/${name}_ref.out" "$work/${name}_mlx.out" | head -12)"
+    echo "ok   $name: $words, the same in Mlx and C++ ($(tr '\n' ' ' < "$work/${name}_ref.out"))"
+}
+feature virtual shapes "virtual functions: overriding, a pure virtual, deletion through the base, a second base's adjustment of this"
 echo "check_lattice_emit.sh: all checks passed"
