@@ -39,6 +39,14 @@ run() {
 }
 run 443_constant_slices_runtime "slices of variables and of mutable pointers' targets written, slices of constants and of by-value parameters read, a callee's changes in its own copy"
 run 442_constant_table_static_runtime "a constant table's slices and pointer captures read its image"
+# (Its main returns an error union: 0 when every check held.)
+if "$compiler" --quiet tests/445_tried_places_runtime.mlx -o "$work/445_tried_places_runtime" > "$work/445.log" 2>&1 && (cd tests && "$work/445_tried_places_runtime"); then
+    echo "ok   445_tried_places_runtime: places reached through a try are as writable as without one"
+else
+    echo "FAIL 445_tried_places_runtime"
+    head -3 "$work/445.log"
+    failures=$((failures + 1))
+fi
 
 expect() {
     local fixture=$1 message=$2
@@ -63,12 +71,16 @@ expect constant_to_callee "$constant"
 expect constant_captured "$unwritable"
 expect constant_declared_mutable "$constant"
 expect constant_member "$constant"
+expect constant_field "$constant"
+expect constant_two_modules "$constant"
 expect local_constant "$constant"
 expect parameter_written "$unwritable"
 expect parameter_to_callee "$constant"
 expect parameter_captured "$unwritable"
 expect parameter_field "$constant"
 expect const_pointer_target "$constant"
+expect const_self_field "$constant"
+expect optional_payload "$constant"
 expect call_result "$constant"
 
 if [[ $failures -ne 0 ]]; then

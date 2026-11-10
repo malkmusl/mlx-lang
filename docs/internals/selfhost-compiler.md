@@ -365,9 +365,14 @@ array's type carries no constness: `array[a..b]` is a `[]T` and `for
 *item in array` binds a `*T` where the array is a variable, a field or
 an element of one or what a mutable pointer points to; a `[]const T` and
 a `*const T` where it is a constant, a parameter (taken by value, but the
-caller's storage) or no place at all, a call's result
-(`tests/443_constant_slices_runtime.mlx`; the programs this refuses are in
-`tests/support/constant_slices_invalid`). The body of a generic function
+caller's storage) or no place at all, a call's result or an optional's
+payload (`tests/443_constant_slices_runtime.mlx`; the programs this
+refuses are in `tests/support/constant_slices_invalid`). `isMutable` types
+a place's parts with the function's return type, as the expression
+around it is typed, so a `try` among them has its type
+(`tests/445_tried_places_runtime.mlx`: without it such a place counted
+as not writable), and follows a module's member through any number of
+modules (`a.b.table`). The body of a generic function
 (an `anytype` or `comptime` parameter) is not analyzed here
 (`functions.isGeneric`), so this, like every rule about what may be
 written, does not reach into one; the lowering's own `expressionType`

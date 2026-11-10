@@ -946,6 +946,21 @@ takes_addresses_of_constants() {
     return $ok
 }
 
+# Whether $1 takes a place with a `try` among its parts for as writable
+# as it is without one (tests/445_tried_places_runtime.mlx compiles and
+# ends with 0; earlier compilers typed such a place's parts without the
+# function's return type and refused its slice where a `[]T` was wanted).
+writes_places_through_try() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/445_tried_places_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -1012,6 +1027,7 @@ probes=(
     "aligns_functions|functions at multiples of 16"
     "types_slices_of_constants|slices of constants and of by-value parameters as []const T"
     "takes_addresses_of_constants|the address of a module-level constant"
+    "writes_places_through_try|places with a try among their parts as writable as without"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

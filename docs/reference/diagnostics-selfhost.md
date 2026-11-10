@@ -195,7 +195,7 @@ fn clear(taken: [8]u8) -> void { fill(taken[0..]) }
 ```
 
 ```text
-tests/support/constant_slices_invalid/parameter_written.mlx:6:5: error: MLX-E4001: this place cannot be written: it is a constant, a parameter or a call's result, or is reached through a `*const` pointer or a `[]const` slice
+tests/support/constant_slices_invalid/parameter_written.mlx:6:5: error: MLX-E4001: this place cannot be written: it is a constant, a parameter, a call's result or an optional's payload, or is reached through a `*const` pointer or a `[]const` slice
 tests/support/constant_slices_invalid/parameter_written.mlx:6:13: error: MLX-E4001: expression type could not be resolved
 ...
 tests/support/constant_slices_invalid/parameter_to_callee.mlx:11:39: error: MLX-E4001: expected `[]u8`, found `[]const u8`

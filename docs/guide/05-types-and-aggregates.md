@@ -391,9 +391,10 @@ The slice of an array is as writable as the array is. Of a `var`, of a
 field or an element of one and of what a `*T` points to it is a `[]T`,
 and what is written through it is written in the array. Of a constant (a
 module's or a local `const`: `tail` above), of a parameter, of a field or
-an element of one, of what a `*const T` points to and of a call's result
-it is a `[]const T`: it reads the array, no element is assigned through
-it, and it does not go where a `[]T` is taken. An array parameter is
+an element of one, of what a `*const T` points to, of a call's result and
+of an optional's payload (`held.?[0..]`: bind the payload to a `var`
+first to change it) it is a `[]const T`: it reads the array, no element
+is assigned through it, and it does not go where a `[]T` is taken. An array parameter is
 taken by value, but its bytes are the caller's (aggregates are passed by
 address): a callee that wants to change them makes its own copy first.
 

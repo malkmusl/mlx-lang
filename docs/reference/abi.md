@@ -679,10 +679,14 @@ use of the constant is its value: an `alloca` of the type and one
 `mem_copy` from the slot, so a callee that is handed it writes into
 storage of that use's own, as when the value was built there element by
 element. A slice of it and a pointer capture over it work on such a copy
-too, although nothing is written through them any more: they are a
+too. Nothing that sema checks writes through them any more: they are a
 `[]const T` and a `*const T` (`sema/declarations.mlx`, the slice
-expression; `tests/443_constant_slices_runtime.mlx`), so the lowering
-could let them read the slot. A constant with addresses
+expression; `tests/443_constant_slices_runtime.mlx`). But the body of a
+generic function (an `anytype` or `comptime` parameter) is not checked,
+and one handed such a slice can still store through it: into the copy,
+which is why the copy stays until instantiated bodies are checked (the
+slot's address there would let that store change the table for
+everyone). A constant with addresses
 in it, one whose initializer is no literal, and a member of an aggregate
 are lowered as before: their initializer, where they are used
 (`tests/442_constant_table_static_runtime.mlx`,
