@@ -123,4 +123,37 @@ feature bits bits "bit-fields in words of their own, an anonymous union, two bas
 feature idioms idioms "pointers stepped through members, std::array members, same-named static locals, a class beside a function of its name, references from pointers, an object in storage, an atomic pointer"
 feature values values "a class with a copy constructor taken by value, an empty base, a base assigned through the derived object, a reference from a virtual call"
 feature overflow overflow "the overflow builtins over 32 and 64 bits, signed and unsigned, and with operands and a result of different types"
+
+# A program of several units translated as one (compiler/cc/emitmlx.mlx,
+# "One program of many units"): each unit lists what it defines, the lists
+# make the manifest (a thing's home, its name), each unit is translated
+# with it. The modules are kept beside their C++; the test module calls
+# the main unit's `run`, as the C++ reference does.
+program() { # DIRECTORY "UNITS" WORDS
+    local name=$1 directory=projects/lattice/tests/$1 units=$2 words=$3 unit sources=()
+    : > "$work/$name.units"
+    for unit in $units; do
+        "$work/mlx-cc" -std=c++23 --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-unit="$unit" --emit-mlx-index="$work/$name.$unit.idx" --emit-mlx=/dev/null "$directory/$unit.cpp" 2> "$work/$name.$unit.err" || fail "$name: $unit.cpp does not translate: $(head -5 "$work/$name.$unit.err")"
+        printf '%s\t%s\n' "$unit" "$work/$name.$unit.idx" >> "$work/$name.units"
+        sources+=("$directory/$unit.cpp")
+    done
+    "$work/mlx-cc" --lattice-units="$work/$name.units" --lattice-manifest="$work/$name.manifest" > "$work/$name.manifest.log" 2>&1 || fail "$name: the manifest was not made: $(head -3 "$work/$name.manifest.log")"
+    for unit in $units; do
+        "$work/mlx-cc" -std=c++23 --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-unit="$unit" --emit-mlx-manifest="$work/$name.manifest" --emit-mlx="$work/$name.$unit.mlx" "$directory/$unit.cpp" 2> "$work/$name.$unit.err" || fail "$name: $unit.cpp does not translate with the manifest: $(head -5 "$work/$name.$unit.err")"
+        if [[ $update -eq 1 ]]; then
+            cp "$work/$name.$unit.mlx" "$directory/$unit.mlx"
+        elif ! cmp -s "$work/$name.$unit.mlx" "$directory/$unit.mlx"; then
+            fail "$directory/$unit.mlx is not what the translator writes now (tools/check_lattice_emit.sh --update): $(diff "$directory/$unit.mlx" "$work/$name.$unit.mlx" | head -12)"
+        fi
+    done
+    "$work/mlx-cc" -std=c++23 -o "$work/${name}_ref" "$directory/${name}_ref.cpp" "${sources[@]}" 2> "$work/${name}_ref.err" || fail "$name: the C++ reference does not build: $(head -5 "$work/${name}_ref.err")"
+    (env -i LD_LIBRARY_PATH="$work/libc" timeout 60 "$loader" "$work/${name}_ref" > "$work/${name}_ref.out" 2> "$work/${name}_ref.run") || fail "$name: the C++ reference does not run on mlxlibc: $(head -3 "$work/${name}_ref.run")"
+    "$compiler" --quiet "$directory/${name}_test.mlx" -o "$work/${name}_test" 2> "$work/${name}.err" || fail "${name}_test.mlx does not compile: $(head -5 "$work/${name}.err")"
+    "$work/${name}_test" > "$work/${name}_mlx.out" || fail "$name: the Mlx test does not run"
+    cmp -s "$work/${name}_ref.out" "$work/${name}_mlx.out" || fail "$name: the Mlx and the C++ differ (C++ < > Mlx): $(diff "$work/${name}_ref.out" "$work/${name}_mlx.out" | head -12)"
+    echo "ok   $name: $words, the same in Mlx and C++ ($(tr '\n' ' ' < "$work/${name}_ref.out"))"
+}
+
+program library "library" "the library's classes as records: map and set, shared_ptr, mutex, optional, a vector from a braced list, sort, lambdas, function"
+program program "main shapes" "two units as one program: a header's record, template instances and inline function in one home, a class made in one unit and deleted in the other"
 echo "check_lattice_emit.sh: all checks passed"
