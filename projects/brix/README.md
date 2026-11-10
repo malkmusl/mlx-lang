@@ -1101,8 +1101,10 @@ Vector from the launcher and looks at the bar's names, the dock's icons
 and the pins (pinned by the dock's menu, there again after the desktop is
 started again, unpinned; pinned and unpinned by the launcher's menu, the
 latter from a pins file of before that names the app twice; pinned by
-dragging); tests/run_desktop_apps.sh asks the same of apps.mlx on the
-host.
+dragging), and at an app installed while the desktop runs (all three read
+the apps again when an application directory changes, the user's own
+/users/NAME/.local/share/apps before the system's);
+tests/run_desktop_apps.sh asks the same of apps.mlx on the host.
 
 ## The login
 
