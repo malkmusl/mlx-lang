@@ -604,11 +604,18 @@ them.
 `tools/check_wayland_interop.sh` also runs the nested compositor inside
 weston. `tests/268_compositor_damage_runtime.mlx` (run by
 `tests/run_wayland.sh`) plays random changes to a scene (windows moved,
-raised, resized and redrawn, focus, the cursor, a popup, and a desktop's
-background with a blurred bar and dock over it) against the compositor's
-damage tracking: frames composed only in what each output buffer lacks
-must equal frames composed from scratch, with no blur kept from an earlier
+raised, resized and redrawn, focus, the cursor, a popup, buffers
+committed with the damage their clients name, and a desktop's background
+with a blurred bar and dock over it) against the compositor's damage
+tracking: frames composed only in what each output buffer lacks must
+equal frames composed from scratch, with no blur kept from an earlier
 frame; the blur itself is held against the plain box passes.
+`tests/290_compositor_commit_damage_runtime.mlx` commits random frames
+with their damage: the part copied must leave the surface with the pixels
+and the opacity of a whole copy, and nothing from outside the damage.
+`tools/check_compositor_commit.sh` runs a client that names its damage
+and fills the rest of its buffer with other pixels in the nested
+compositor: the screen must be the one whole commits give.
 
 The shell and the renderer can run as shared objects that the compositor
 loads again whenever they are rebuilt, while its clients stay connected

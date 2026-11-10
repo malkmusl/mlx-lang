@@ -912,6 +912,41 @@ frame where it took 21, the top bar committing 1.3 ms where it took 22, a
 maximized window committing 16 ms where it took 42, the whole screen 6 ms
 where it took 32, the bar's blur made anew 4.4 ms where it took 21.
 
+A client says what its commit changed (`wl_surface.damage`,
+`damage_buffer`), and the CPU renderer takes it at its word when the
+buffer is the size of the one before and no viewport scales it: only that
+part of the buffer is copied into the surface's own pixels
+(`buffers.mlx`, `takePixels`), and only that part of the scene is damaged,
+where the surface is (`windows.mlx`, `applyCommit`; `scene.damagePart`),
+not the window with its frame. A terminal that printed a line has that
+line copied and composed: on a 3840x1080 screen a maximized window's
+commit of one text line moves about 1 MiB (copied in, composed, copied
+out) in under 0.2 ms where the whole window moved 68 MiB in 15 ms. The
+rest of the copy stays as it is and the buffer is not read there, so a
+client may name less than it drew but never less than it changed. A
+whole buffer is copied two pixels to a 64-bit word, their alpha bytes
+ANDed on the way (15 MiB in about 3 ms where a pixel at a time took 5.6).
+Whether the surface is opaque (its rows are then copied, not blended) is
+read from the copy: all of it on a whole commit, the part replaced on one
+in part, and the rest only when the row known to be translucent was
+replaced by opaque pixels. A commit that names no damage or all of the
+buffer, a buffer of another size, a viewport, a client that set a buffer
+scale or transform (neither is applied, so what it calls surface
+coordinates are not buffer pixels): all of the buffer is copied and the
+window damaged, as before. The window is damaged whole, though only the
+part is copied, while it grows open or slides with its workspace (its
+buffer is not drawn pixel for pixel in its place then), and when the
+damage lies off the output, so that a frame comes and with it the
+client's frame callback. The copy is kept rather than the client's buffer
+shown in place, as the Vulkan renderer does it: the buffer is released
+with the commit, so a std.ui client draws every frame into the same one,
+which holds the frame before (what makes drawing and naming a part
+possible), and what the compositor composes from is never memory a client
+is writing. `tests/290_compositor_commit_damage_runtime.mlx` holds
+commits in part against whole ones (pixels and opacity), and
+`tools/check_compositor_commit.sh` the screen of the nested compositor
+with a client that fills its buffer with other pixels around its damage.
+
 Composition itself works on whole pixels
 and 64-bit words (`state.copyPixels`, `fillPixels`), copies opaque
 windows' rows outright and blends the three channels of a translucent
@@ -1758,7 +1793,8 @@ finished`.
   xdg-shell. Its parts: `protocols.mlx` (layer shell, the window list for
   docks, decorations, blur regions), `windows.mlx` (focus, window states,
   resizing, input delivery, mapping), `buffers.mlx` (what a commit does
-  with the buffer: copied or held, cropped and scaled by a viewport),
+  with the buffer: copied, where the client says it changed, or held;
+  cropped and scaled by a viewport),
   `viewport.mlx` (viewporter, fractional-scale, single-pixel-buffer),
   `presentation.mlx` (presentation feedback), `data_control.mlx`
   (clipboard tools), `dialogs.mlx` (windows of windows, modal dialogs),

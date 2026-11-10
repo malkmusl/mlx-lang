@@ -44,9 +44,10 @@ for test in tests/240_*.mlx tests/241_*.mlx tests/242_*.mlx tests/243_*.mlx test
 done
 
 # The compositor's damage tracking (frames composed in what changed must
-# equal frames composed from scratch) and its hit-testing with input
-# regions.
-for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_region_runtime.mlx; do
+# equal frames composed from scratch), its hit-testing with input regions,
+# and what it takes of a buffer committed with damage (the part named, and
+# the surface must hold what a whole copy gives).
+for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_region_runtime.mlx tests/290_compositor_commit_damage_runtime.mlx; do
     if ! "$compiler" --quiet "$test" -o "$work/test" 2> "$work/errors"; then
         echo "FAIL (compile) $test"
         cat "$work/errors"
