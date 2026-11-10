@@ -1290,8 +1290,9 @@ still switches terminals when freestanding). The locker unlocks once its
 user has authenticated; the compositor itself knows nothing of
 passwords. A locker that goes without unlocking (it crashed, it was
 killed) leaves the session locked and the screen blank until a new
-locker locks and unlocks it; a second locker while one lives is refused
-(`finished`).
+locker locks and unlocks it: the lock hotkey, the one hotkey that works
+then, starts `lock-command` again. A second locker while one lives is
+refused (`finished`).
 
 The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
 the program `lock-command` names in the settings file (`umbra` by

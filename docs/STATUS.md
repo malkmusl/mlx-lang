@@ -115,7 +115,10 @@ system bus (synapse on a listener node), sentinel (the greeter branched
 to an unprivileged identity, a password of /system/settings, then the
 person's session in their home) and the greeter (aurora), with the
 kernel naming each bus client's program (channel_peer) and the new
-identity_set and node_own calls (tools/check_brix_login.sh). An EFI boot
+identity_set and node_own calls (tools/check_brix_login.sh), and the
+session's lock (umbra on Super+L, asking sentinel over the bus in the
+native format; sentinel unlocks only for the user the kernel names as
+the caller: tools/check_brix_lock.sh). An EFI boot
 sees all of RAM: the loader passes the UEFI memory map through
 (tools/check_brix_efi.sh). Note:
 ROADMAP.md is written for a Linux kernel ("replacing it is not the

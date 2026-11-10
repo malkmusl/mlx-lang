@@ -71,12 +71,22 @@ command is run.
 | --- | --- |
 | `ListUsers() -> a(ssss)` | the login accounts of the configured passwd file: name, full name, home, shell |
 | `Login(s user, s password, s session) -> b` | checks the password, and on a match starts `session` as `user` |
-| `Unlock(s user, s password) -> b` | checks the password of the user who already holds the seat (the lock screen) |
+| `Unlock(s user, s password) -> b` | checks the password of the user who already holds the seat (the lock screen), for a caller who is that user |
 
 `ListUsers` reads the configured passwd file, `/etc/passwd` by default;
 that file is world-readable and holds no secrets. The greeter shows that
 list, takes a password, and calls `Login`. A wrong password is held back
 for two seconds before the "no", to slow guessing.
+
+`Unlock` does not take the caller's word for who asks. After MLXIPC
+allowed `login.session`, sentinel asks the bus which user the calling
+connection is (`GetConnectionUnixUser`: what the kernel told the bus
+when the caller connected, the channel's peer on brixOS, the socket's
+credentials on Linux). The password is checked only when that user holds
+the seat and `user` names them; root may ask for them. Anyone else gets
+the delayed "no", and no password is checked for them. `--verbose` says
+`login: unlock allowed`, `login: unlock refused`, or that the caller is
+not the session's user.
 
 ## The two privileged steps
 
@@ -166,4 +176,6 @@ holds these, shared by `greeter.mlx` and `session.mlx`. The bus
 (projects/desktop/ipc) runs natively too, and so the policy can tell
 aurora apart, the kernel names each channel's holder program
 (channel_peer), which std.appid reads. tools/check_brix_login.sh covers
-the whole chain.
+the whole chain. The same call gives the bus each client's user, which
+is what Unlock's caller check rests on there; tools/check_brix_lock.sh
+covers the lock (umbra) and that check.

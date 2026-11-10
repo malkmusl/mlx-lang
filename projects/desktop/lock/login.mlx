@@ -1,32 +1,57 @@
-// The one privileged request umbra makes.  This module owns the MLXIPC
-// system-bus connection so the drawing and input side never has to keep a
-// second password copy. `std.dbus` is only MLXIPC's libc-free wire codec;
-// this does not contact dbus-daemon or link libdbus. The outgoing message
-// body is wiped as soon as the codec call has consumed it; malformed,
-// missing and error replies all fail closed.
+// The one privileged request umbra makes, on MLXIPC's system bus in
+// MLXIPC's own native format (std.ipc), as the greeter's: native first.
+// The bus carries it to the login service whichever format that speaks,
+// and tells the service who asks (the user the kernel named when this
+// connection was made), so the name sent here is checked against that
+// and decides nothing by itself. On a host whose system bus is a foreign
+// dbus-daemon std.ipc falls back to D-Bus's format by itself; this does
+// not link libdbus. This module owns the connection so the drawing and
+// input side never has to keep a second password copy. The outgoing
+// message body and every page the message was built in or queued on are
+// wiped as soon as the call is sent; malformed, missing and error replies
+// all fail closed.
+//
+// Whose answer counts: the bus carries a reply nobody asked for when its
+// rules let the sender talk to the receiver (by default they do), so any
+// program on the bus can send this connection a "true" with the serial an
+// Unlock will have. Before each Unlock the bus is asked which connection
+// owns org.mlx.Login now (on the system bus only root owns a name), and
+// only that connection's reply is the answer; the bus stamps every
+// message with its real sender. A reply from anyone else is passed over.
 const std = @import("std")
-const dbus = @import("std.dbus")
+const ipc = @import("std.ipc")
 
 const NAME: []const u8 = "org.mlx.Login"
 const PATH: []const u8 = "/org/mlx/Login"
+const BUS: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+// How long the bus may take to name the service's connection, and the
+// service to answer (its own questions to the bus, the check, and the
+// delay before a "no"), in milliseconds.
+const BUS_WAIT: usize = 2000
+const ANSWER_WAIT: usize = 5000
+// A unique name's most bytes (the bus's are a few; D-Bus allows 255).
+const OWNER_MOST: usize = 64
 
 pub const DENIED: u8 = 0
 pub const ALLOWED: u8 = 1
 pub const UNAVAILABLE: u8 = 2
 
 pub const Login = struct {
-    client: dbus.Client
+    client: ipc.Client
     connected: bool
     environment: [*][*]const u8
 }
 
-fn clientOf(login: *Login) -> *dbus.Client {
-    unsafe { return @ptrCast(*dbus.Client, &login.*.client) }
+fn clientOf(login: *Login) -> *ipc.Client {
+    unsafe { return @ptrCast(*ipc.Client, &login.*.client) }
 }
 
-// The system bus's socket: DBUS_SYSTEM_BUS_ADDRESS's unix:path=, else
-// MLXIPC's system bus.
-fn busPath(environment: [*][*]const u8) -> []const u8 { return dbus.systemPath(environment, dbus.MLX_SYSTEM_BUS) }
+// The system bus's address: DBUS_SYSTEM_BUS_ADDRESS's unix:path= (the
+// login service gives the session the bus it is on: a listener node on
+// brixOS), else MLXIPC's system bus. The address is shared with D-Bus
+// programs; the wire is native.
+fn busPath(environment: [*][*]const u8) -> []const u8 { return ipc.systemPath(environment, ipc.MLX_SYSTEM_BUS) }
 
 fn wipe(bytes: [*]u8, length: usize) -> void {
     var index: usize = 0
@@ -44,18 +69,60 @@ pub fn init(login: *Login, environment: [*][*]const u8) -> void {
 fn connect(login: *Login) -> bool {
     if login.*.connected && !clientOf(login).*.closed { return true }
     if login.*.connected {
-        dbus.disconnect(clientOf(login), std.heap.allocator())
+        ipc.disconnect(clientOf(login), std.heap.allocator())
         login.*.connected = false
     }
-    if !dbus.connectClient(clientOf(login), std.heap.allocator(), busPath(login.*.environment)) { return false }
+    if !ipc.connectClient(clientOf(login), std.heap.allocator(), busPath(login.*.environment)) { return false }
     login.*.connected = true
     return true
 }
 
 pub fn close(login: *Login) -> void {
     if !login.*.connected { return }
-    dbus.disconnect(clientOf(login), std.heap.allocator())
+    ipc.disconnect(clientOf(login), std.heap.allocator())
     login.*.connected = false
+}
+
+// The send flushes before it returns, but the page the message was built
+// in and the connection's output page otherwise keep the marshalled
+// password (on the D-Bus fallback the D-Bus client's page as well).
+fn wipeSent(client: *ipc.Client) -> void {
+    wipe(client.*.out, ipc.MAX_MESSAGE)
+    wipe(ipc.connectionOf(client).*.output, ipc.MAX_MESSAGE)
+    if !ipc.isNative(client) { wipe(client.*.peer.out, ipc.MAX_MESSAGE) }
+}
+
+// The reply or error to the call `serial` that `sender` (a unique name)
+// or the bus itself sent, within `milliseconds` in all; what anyone else
+// sent as a reply to it is passed over, as every other message is. False
+// when none came in time or the connection ended.
+fn answerOf(client: *ipc.Client, serial: u32, sender: []const u8, reply: *ipc.Message, milliseconds: usize) -> bool {
+    const until = std.time.milliseconds() + milliseconds
+    var now = std.time.milliseconds()
+    while now < until && ipc.next(client, reply, @intCast(isize, until - now)) {
+        if (reply.*.kind == ipc.REPLY || reply.*.kind == ipc.ERROR) && reply.*.replySerial == serial && (std.text.same(reply.*.sender, sender) || std.text.same(reply.*.sender, BUS)) { return true }
+        now = std.time.milliseconds()
+    }
+    return false
+}
+
+// Asks the bus which connection owns org.mlx.Login now: its unique name
+// into `owner` (OWNER_MOST bytes), the length; 0 when nobody does, the
+// bus did not say, or what it said is no unique name.
+fn serviceOwner(client: *ipc.Client, owner: [*]u8) -> usize {
+    var body: [64]u8 = undefined
+    var bytes: [*]u8 = undefined
+    unsafe { bytes = @ptrCast([*]u8, &body) }
+    var writing: ipc.Writer = undefined
+    ipc.begin(&writing, bytes, 64)
+    ipc.putString(&writing, NAME)
+    const serial = ipc.call(client, BUS, BUS_PATH, BUS, "GetNameOwner", "s", bytes, writing.length)
+    var reply: ipc.Message = undefined
+    if serial == 0 || !answerOf(client, serial, BUS, &reply, BUS_WAIT) || reply.kind != ipc.REPLY || !std.text.same(reply.signature, "s") { return 0 }
+    var reading = ipc.reader(ipc.bodyOf(client, &reply), reply.bodyLength)
+    const name = ipc.readString(&reading)
+    if reading.failed || name.length < 2 || name.length > OWNER_MOST || name[0] != 58 { return 0 }
+    return std.text.append(owner, 0, OWNER_MOST, name)
 }
 
 // `secret` is mutable on purpose: every return path wipes all of its
@@ -74,36 +141,47 @@ pub fn unlock(login: *Login, user: []const u8, secret: [*]u8, length: usize, cap
         wipe(secret, capacity)
         return UNAVAILABLE
     }
+    // Whose answer will count, before the password goes anywhere.
+    var owner: [OWNER_MOST]u8 = undefined
+    var ownerBytes: [*]u8 = undefined
+    unsafe { ownerBytes = @ptrCast([*]u8, &owner) }
+    const ownerLength = serviceOwner(clientOf(login), ownerBytes)
+    if ownerLength == 0 {
+        // No login service, or the bus is gone (a send that failed does
+        // not say which): the next attempt opens the bus anew.
+        wipe(secret, capacity)
+        close(login)
+        return UNAVAILABLE
+    }
 
     var body: [640]u8 = undefined
     var bytes: [*]u8 = undefined
     unsafe { bytes = @ptrCast([*]u8, &body) }
-    var writing: dbus.Writer = undefined
-    dbus.begin(&writing, bytes, 640, false)
-    dbus.putString(&writing, user)
-    dbus.putString(&writing, secret[0..length])
+    var writing: ipc.Writer = undefined
+    ipc.begin(&writing, bytes, 640)
+    ipc.putString(&writing, user)
+    ipc.putString(&writing, secret[0..length])
     if writing.failed {
         wipe(bytes, 640)
         wipe(secret, capacity)
         return DENIED
     }
     const client = clientOf(login)
-    const serial = dbus.call(client, NAME, PATH, NAME, "Unlock", "ss", bytes, writing.length)
+    const serial = ipc.call(client, NAME, PATH, NAME, "Unlock", "ss", bytes, writing.length)
     wipe(bytes, 640)
     wipe(secret, capacity)
-    // The MLXIPC send flushes before returning, but its two reusable output
-    // pages otherwise retain the marshalled password.
-    wipe(client.*.out, dbus.MAX_MESSAGE)
-    wipe(dbus.connectionOf(client).*.output, dbus.MAX_MESSAGE)
+    wipeSent(client)
     if serial == 0 {
         close(login)
         return UNAVAILABLE
     }
 
-    var reply: dbus.Header = undefined
-    if !dbus.waitReply(client, serial, &reply, 5000) || reply.kind != dbus.METHOD_RETURN || !std.text.same(reply.signature, "b") { return UNAVAILABLE }
-    var reading = dbus.reader(dbus.bodyOf(client, &reply), reply.bodyLength, reply.big)
-    const allowed = dbus.readBool(&reading)
+    // The service's own reply alone is the answer (an error, the bus's
+    // among them, is none); a "true" from another connection is not.
+    var reply: ipc.Message = undefined
+    if !answerOf(client, serial, ownerBytes[0..ownerLength], &reply, ANSWER_WAIT) || reply.kind != ipc.REPLY || !std.text.same(reply.sender, ownerBytes[0..ownerLength]) || !std.text.same(reply.signature, "b") { return UNAVAILABLE }
+    var reading = ipc.reader(ipc.bodyOf(client, &reply), reply.bodyLength)
+    const allowed = ipc.readBool(&reading)
     if reading.failed { return UNAVAILABLE }
     return if allowed { ALLOWED } else { DENIED }
 }

@@ -1038,8 +1038,9 @@ pulls it) and powers off. Xwayland is not on brixOS.
 The programs carry their product names (projects/desktop and the system
 programs): the compositor is `kepler`, the terminal `vector`, the shell
 `flux`, the dock `orbit`, the launcher `launch`, the top bar `horizon`,
-the login `sentinel`, the greeter `aurora`, the bus `synapse`, init
-`impulse` and the boot screen `ignition` (the MLX toolchain -- mlx4,
+the login `sentinel`, the greeter `aurora`, the screen lock `umbra`, the
+bus `synapse`, init `impulse` and the boot screen `ignition` (the MLX
+toolchain -- mlx4,
 mlx-cc and the rest -- keeps its name, and so do the MLXIPC protocol and
 the MLX_* environment).
 
@@ -1082,6 +1083,16 @@ decides the few calls that differ):
   replace itself with their session (the desktop, from
   /system/share/wayland-sessions) in their home /users/NAME, made at the
   first login and given to them.
+- **umbra** (projects/desktop/lock) is the session's lock: Super+L (the
+  compositor's lock hotkey; `lock-command` in compositor.conf names
+  another program) or the top bar's session menu starts it. It takes the
+  session through ext-session-lock-v1, so only its card is on the
+  screen, and asks sentinel org.mlx.Login.Unlock on the bus in MLXIPC's
+  native format. The bus lets the program umbra use login.session and
+  tells sentinel which user the caller is (channel_peer again: the
+  kernel's word, not a name the caller gives); sentinel checks the
+  password only for the person who holds the seat. A wrong password, no
+  answer or no service leaves the session locked.
 
 The accounts, the session entry and the services are in the image;
 desktop.service is shipped disabled (the login has the screen; enable it
@@ -1089,7 +1100,13 @@ and disable the login for the desktop as root without a login).
 tools/check_brix_login.sh boots the image, sees the bus listen and
 sentinel start the greeter, the kernel name it aurora so the policy
 allows login.session, the password accepted and the session start as
-`brix` in /users/brix.
+`brix` in /users/brix. tools/check_brix_lock.sh logs in the same way,
+locks the session with Super+L, sees the lock card on the display, types
+a wrong password while another user's program on the bus answers "yes"
+in sentinel's place (still locked, the card says so) and the right one
+(the desktop is back), has another user ask with the right password
+(refused), has a locker die without unlocking (still locked; Super+L
+starts umbra again) and finds neither password in a log.
 
 ## Next
 
