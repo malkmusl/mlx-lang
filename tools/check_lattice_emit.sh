@@ -165,5 +165,6 @@ program library "library" "the library's classes as records: map and set, shared
 program program "main shapes" "two units as one program: a header's record, template instances and inline function in one home, a class made in one unit and deleted in the other"
 program incomplete "user maker" "records only declared in one unit and defined in the other: references to them kept, returned and handed on"
 program lists "lists" "an initializer_list of records, an array of records as a pointer, a vector of pairs and a map from braced lists, a table's rows, references to arrays of char"
+program statics "statics" "objects made before main: constant ones as data (bit-fields in their words, a pointer into an array, a table of pointers to them, an empty record), one with a constructor through the unit's start, static locals behind their guards"
 program twins "first second" "two units each with a record of its own under one name: two records, each in its unit"
 echo "check_lattice_emit.sh: all checks passed"

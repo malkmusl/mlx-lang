@@ -130,7 +130,19 @@ sed "s#\"../../../compiler/libc/#\"$(realpath --relative-to="$out/units" compile
         echo "const $name = @import(\"./$name.mlx\")"
     done < "$out/units.txt"
     echo
+    # The program's start: every unit's global objects made (its
+    # lattice_start), the C++ library's units first, then in the list's
+    # order (C++ leaves the order among units open).
+    echo "// The units' global objects made, as C++ makes them before main."
+    echo "pub fn start() -> void {"
+    { grep '^libcpp/' "$out/units.txt"; grep -v '^libcpp/' "$out/units.txt"; } | while read -r path; do
+        name=$(module_of "$path")
+        grep -q '^pub fn lattice_start' "$out/units/$name.mlx" && echo "    $name.lattice_start()"
+    done
+    echo "}"
+    echo
     echo "pub fn main() -> u8 {"
+    echo "    start()"
     echo "    return 0"
     echo "}"
 } > "$out/units/angle.mlx"
@@ -144,7 +156,11 @@ held=$(cat $modules | grep -c '^// LATTICE: this function')
 externs=$(cat $modules | grep -h '^extern("c") fn ' | sort -u | wc -l)
 # shellcheck disable=SC2086
 bytes=$(cat $modules | wc -c)
-echo "$units modules, $functions functions written, $held held back, $externs functions declared extern, $bytes bytes of Mlx"
+# shellcheck disable=SC2086
+marks=$(cat $modules | grep -c '// LATTICE: ' || true)
+# shellcheck disable=SC2086
+summaries=$(cat $modules | grep -c '^// LATTICE: [0-9]* marks in this file' || true)
+echo "$units modules, $functions functions written, $held held back, $externs functions declared extern, $((marks - summaries)) marks, $bytes bytes of Mlx"
 
 if [[ $compile == 1 ]]; then
     echo "4. the program through mlx4"
