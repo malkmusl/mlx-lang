@@ -209,6 +209,46 @@ storage, an atomic pointer), `values` (a class with a copy constructor
 by value, an empty base, a base assigned through the derived object) and
 `overflow` (the overflow builtins at the edges of each type).
 
+### One program of many units
+
+A unit translated alone carries along what its headers define, so a
+record, an inline function or a template's instance is written in every
+unit that uses it, a type of its own in each, and a call into another
+unit is an `extern` declaration. For one program each such thing has one
+home (compiler/cc/emitmlx.mlx, "One program of many units"), in three
+steps that `tools/lattice_translate.sh` runs over ANGLE and the C++
+library's own units (compiler/libcpp):
+
+1. `mlx-cc --emit-mlx-unit=NAME --emit-mlx-index=FILE`: the unit is
+   translated and lists every definition it writes: a record (in full or
+   opaque), a variable, a function with the name it would have alone and
+   the name with its parameter types, whether it is held back on its own
+   account, the functions it calls, and what it waits for.
+2. `mlx-cc --lattice-manifest=OUT --lattice-units=LIST`
+   (compiler/cc/lattice.mlx): a thing's home is the first unit that
+   defines it (a record's the first that writes it in full); its name is
+   unique in its home (a function's carries its parameter types when
+   another function of the home has the name); a function is held back
+   when one it calls is, in whatever unit -- a fixed point over the
+   calls of the whole program.
+3. `mlx-cc --emit-mlx-unit=NAME --emit-mlx-manifest=FILE`: the unit is
+   translated again. It walks what it walked before; a definition whose
+   home is another unit is dropped, names are the manifest's, and what
+   lives elsewhere is named through its home's module
+   (`src__common__string_utils.angle_BeginsWith(...)`,
+   `?*src__libANGLE__Context.gl_Context`). A module imports the modules
+   it names; they import each other freely.
+
+A thing's key says what it is across the units: a function's and a
+variable's C++ symbol (with the unit before it when it is the unit's
+own: `static`, an anonymous namespace), a record's C++ name. In such a
+program the library's classes are records like any other -- `std::mutex`,
+the tree under `std::map` and `std::set`, `shared_ptr`'s control block,
+`std::function`, a lambda's closure -- and the library's own units
+(`libcpp/string.cpp`, `iostream.cpp`) are units of the program: the std
+module of a unit translated alone is not needed. `tools/lattice_why.sh
+DIR` ranks what the functions held back wait for.
+
 ### Where ANGLE stands
 
 `tools/lattice_survey.sh --compile` runs the translator over every unit
