@@ -123,6 +123,9 @@ feature bits bits "bit-fields in words of their own, an anonymous union, two bas
 feature idioms idioms "pointers stepped through members, std::array members, same-named static locals, a class beside a function of its name, references from pointers, an object in storage, an atomic pointer"
 feature values values "a class with a copy constructor taken by value, an empty base, a base assigned through the derived object, a reference from a virtual call"
 feature overflow overflow "the overflow builtins over 32 and 64 bits, signed and unsigned, and with operands and a result of different types"
+feature variadic variadic "functions with variable arguments: va_start, va_arg, va_copy, a va_list handed on, a method, and the printf family of the runtime"
+feature cnames cnames "C's struct stat beside stat(), sigaction, std::copysign beside C's copysign: the names kept apart"
+feature casts casts "a cast that keeps the element under an address taken again, an array's storage as bytes"
 
 # A program of several units translated as one (compiler/cc/emitmlx.mlx,
 # "One program of many units"): each unit lists what it defines, the lists
@@ -156,4 +159,5 @@ program() { # DIRECTORY "UNITS" WORDS
 
 program library "library" "the library's classes as records: map and set, shared_ptr, mutex, optional, a vector from a braced list, sort, lambdas, function"
 program program "main shapes" "two units as one program: a header's record, template instances and inline function in one home, a class made in one unit and deleted in the other"
+program incomplete "user maker" "records only declared in one unit and defined in the other: references to them kept, returned and handed on"
 echo "check_lattice_emit.sh: all checks passed"

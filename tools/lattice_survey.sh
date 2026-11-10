@@ -79,7 +79,10 @@ export -f survey_one
 export out angle flags compile compiler
 
 # (The runtime and the std module beside the translations, for --compile.)
-cp projects/lattice/runtime/c.mlx projects/lattice/runtime/libcpp.mlx "$out/units/"
+cp projects/lattice/runtime/libcpp.mlx "$out/units/"
+# (The runtime imports mlxlibc's printf engine by its place in the
+# repository: the copy names it from where the copy is.)
+sed "s#\"../../../compiler/libc/#\"$(realpath --relative-to="$out/units" compiler/libc)/#" projects/lattice/runtime/c.mlx > "$out/units/c.mlx"
 
 for list in "${lists[@]}"; do grep -E '\.(cpp|cc|c)$' "projects/webkit/lists/$list.txt"; done | sort -u > "$out/units.txt"
 xargs -P "$jobs" -I{} bash -c 'survey_one "$@"' _ {} < "$out/units.txt" > "$out/survey.tsv"

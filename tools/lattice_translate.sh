@@ -120,7 +120,9 @@ fi
 
 # The runtime and the std module beside the modules, and the program: a
 # module that imports every unit.
-cp projects/lattice/runtime/c.mlx "$out/units/"
+# (The runtime imports mlxlibc's printf engine by its place in the
+# repository: the copy names it from where the copy is.)
+sed "s#\"../../../compiler/libc/#\"$(realpath --relative-to="$out/units" compiler/libc)/#" projects/lattice/runtime/c.mlx > "$out/units/c.mlx"
 {
     echo "// ANGLE as one Mlx program: every unit a module (tools/lattice_translate.sh)."
     while read -r path; do
