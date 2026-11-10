@@ -66,9 +66,14 @@ not what its headers declare -- as Mlx from mlx-cc's typed tree, after the
 unit is parsed and type-checked with the same flags the build uses. What
 it does now:
 
-- declarations: structs (a group of bit-fields as a `packed struct`),
-  module constants and variables with their initial values (arrays of
-  scalars as `[N]T{ ... }` literals, the tables of Float16ToFloat32),
+- declarations: structs as `extern struct`s with the C++ layout (each
+  run of bit-fields a `packed struct` word of 1, 2, 4 or 8 bytes at the
+  bytes C++ gives it, `bits8: Record_bits8`; an unnamed member -- an
+  anonymous union, a table pointer -- `fieldN` by its byte in the
+  object), module constants and variables with their initial values
+  (arrays of scalars as `[N]T{ ... }` literals, the tables of
+  Float16ToFloat32; tables of records, a base class's members in place;
+  addresses of functions, strings and other variables),
   the headers' constants the functions name, functions with Mlx types
   for the C++ ones (`?[*]T` for pointers, `u64`, `f32`, a plain `char`
   as `u8`), C++ overloads told apart by their parameter types in the
@@ -144,15 +149,31 @@ runtime module: `c.malloc`, `c.strtod`, `c.stdout()`, `c.fputs` and the
 rest in Mlx over std.heap and std.io (projects/lattice/runtime/c.mlx),
 `--emit-mlx-runtime=IMPORT` says where it is.
 
+Classes with virtual functions are records like the others: the table
+pointer is a member (`field0`, a second base's `field16`), the vtable a
+module-level `var` of function addresses (static data: one address,
+which every object of the class points at), a virtual call the function
+read from the object's table at its slot and called with the adjusted
+`this`, as the front end lowered it; `delete p` through a base calls
+the class's deleting destructor (`Class_deinit_deleting`, written from
+the destructor and `operator delete`). A base class that is not the
+object's start is addressed where it lies; a class made from or
+assigned through its base writes the base's bytes. A class with a copy
+constructor taken by value is taken by value in the Mlx (C++ hands over
+the address of a copy the caller made). The overflow builtins
+(`__builtin_mul_overflow`) are calls of the runtime
+(`c.mul_overflow_u64`), `std::atomic<T>` the atomic builtins, bit
+counting `@popCount` and the runtime's `clz`/`ctz`.
+
 What it leaves to the hand is marked `// LATTICE:` in place and counted at
 the end of the file: a function taking or returning a type the Mlx lacks
-by value (a class with virtual functions, an `ifstream`, a lambda's
+by value (a class with a virtual base, an `ifstream`, a lambda's
 closure; written out, commented, until the type has an Mlx shape -- a
 pointer to such a type is passed along, the type declared opaque), one
 calling such a function (or one held back so), one with variadic
-arguments, a `goto` or `alloca`, stream calls, variadic C calls
-(`printf`, `snprintf`). Nothing is made up: what the translator cannot
-write is a comment, never a `0`. The output is kept in the repository
+arguments, a `goto` or `alloca`, inline assembly (cpuid, the time
+stamp), stream calls, variadic C calls (`printf`, `snprintf`). Nothing is
+made up: what the translator cannot write is a comment, never a `0`. The output is kept in the repository
 (projects/lattice/angle/common and projects/lattice/runtime/libcpp.mlx),
 regenerated with `tools/check_lattice_emit.sh --update`, and the check
 fails when the translator's output drifts from what is kept. The pilot
@@ -169,8 +190,24 @@ prints the same, bit for bit, from the Mlx and from the C++ built by
 mlx-cc and run on mlxlibc (whose libm wraps the same std.math). Along
 the way mlx4 learnt packed structs laid out in bits
 (tests/434_packed_struct_runtime.mlx: C++ bit-fields are everywhere in
-ANGLE) and to negate a float by its sign bit
-(tests/435_float_negative_zero_runtime.mlx: Mat4::Ortho's `-0.0`).
+ANGLE), to negate a float by its sign bit
+(tests/435_float_negative_zero_runtime.mlx: Mat4::Ortho's `-0.0`),
+function types where a builtin takes a type (436: a virtual call's
+`@ptrCast(fn(...) -> T, slot)`), atomics on optional pointers (437:
+`std::atomic<T *>`), and module-level variables initialized with floats
+and addresses (438: a vtable is static data at one address; a `const`
+aggregate is a value built where it is used).
+
+Beside the units, five feature tests translate a small C++ file each and
+compare its result with the C++'s (projects/lattice/tests): `virtual`
+(overriding, a pure virtual, deletion through the base, a second base),
+`bits` (bit-fields beside other members, an anonymous union, two bases
+with table pointers), `idioms` (pointers stepped through members,
+`std::array` members, static locals of one name, a class beside a
+function of its name, references from pointers, an object in bytes of
+storage, an atomic pointer), `values` (a class with a copy constructor
+by value, an empty base, a base assigned through the derived object) and
+`overflow` (the overflow builtins at the edges of each type).
 
 ### Where ANGLE stands
 
