@@ -3,15 +3,20 @@
 // not there. The controller is a PCI device of Ethernet class with an
 // Intel igb-family device id; its registers are a memory BAR (BAR0),
 // mapped uncached like the AHCI/NVMe ones. Legacy receive and transmit
-// descriptor rings in memory of our own, each with its buffers; frames are
-// polled (no interrupt), driven by the timer tick and the boot self-test.
-// Presented through netdev.mlx as the one network device.
+// descriptor rings in memory of our own, each with its buffers. A received
+// frame raises the device's message-signalled interrupt (MSI, to
+// layout.Vector.NET on the first processor's local APIC) when the device
+// and the processor have one; the timer tick looks at the ring as well (a
+// machine where no message comes is served by that alone, a hundredth of
+// a second late at most). Presented through netdev.mlx as the one network
+// device.
 const layout = @import("./../layout.mlx")
 const memory = @import("./memory.mlx")
 const Pci = @import("./pci.mlx").Pci
 const Bytes = @import("./bytes.mlx").Bytes
 const stack = @import("./net/stack.mlx")
 const clock = @import("./clock.mlx")
+const smp = @import("./smp.mlx")
 const Deadline = clock.Deadline
 const Page = memory.Page
 
@@ -20,8 +25,13 @@ pub const NO_IRQ: usize = 0xFF
 // Registers (BAR0, bytes).
 const CTRL: usize = 0x0000
 const STATUS: usize = 0x0008
-const ICR: usize = 0x1500
-const IMC: usize = 0x150C
+// (The interrupt registers where every controller of the family has
+// them, and Linux's driver reaches them: the newer ones show them at
+// 0x1500 as well, QEMU's igb only here.)
+const ICR: usize = 0x00C0
+const IMS: usize = 0x00D0
+const IMC: usize = 0x00D8
+const EITR0: usize = 0x1680
 const RCTL: usize = 0x0100
 const TCTL: usize = 0x0400
 const TIPG: usize = 0x0410
@@ -54,6 +64,14 @@ const RCTL_SECRC: u32 = 0x04000000
 const TCTL_VALUE: u32 = 0x0003F0FA
 // Queue enable bit in RXDCTL/TXDCTL.
 const QUEUE_ENABLE: u32 = 0x02000000
+// Interrupt causes: the link changed, the receive ring runs low, a frame
+// was written to it.
+const CAUSE_LINK: u32 = 0x04
+const CAUSE_RING_LOW: u32 = 0x10
+const CAUSE_RECEIVED: u32 = 0x80
+// The least time between two interrupts (EITR's interval, in its units of
+// about a microsecond: some 6000 interrupts a second at most).
+const INTERRUPT_INTERVAL: u32 = 648
 // Legacy descriptor status/command.
 const DD: u8 = 0x01
 const TX_CMD: u8 = 0x0B // EOP | IFCS | RS
@@ -73,6 +91,9 @@ const RECEIVE_MS: usize = 5
 pub const Igb = struct {
     present: bool
     irq: usize
+    // Whether received frames raise the device's message (MSI).
+    signalled: bool
+    interrupts: usize
     mac: [6]u8
     regs: usize
     // The descriptor rings and the buffers, all physical (the device does
@@ -121,8 +142,8 @@ pub const Igb = struct {
         self.*.rxBuffers = frames.allocateContiguous(RX_COUNT * BUFFER / Page.SIZE)
         self.*.txBuffers = frames.allocateContiguous(TX_COUNT * BUFFER / Page.SIZE)
         if self.*.rxRing == 0 || self.*.txRing == 0 || self.*.rxBuffers == 0 || self.*.txBuffers == 0 { return false }
-        Bytes.zeroWords(layout.Memory.virtual(self.*.rxRing), Page.SIZE / 8)
-        Bytes.zeroWords(layout.Memory.virtual(self.*.txRing), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.rxRing), Page.SIZE)
+        Bytes.zeroWords(layout.Memory.virtual(self.*.txRing), Page.SIZE)
         // Receive descriptors (advanced, one buffer each): the packet
         // buffer address, the header address zero, the written-back status
         // cleared.
@@ -161,8 +182,24 @@ pub const Igb = struct {
         self.*.received = 0
         self.*.sent = 0
         self.*.irq = NO_IRQ
+        self.*.signalled = false
+        self.*.interrupts = 0
         self.*.present = true
         return true
+    }
+
+    // The device's interrupt as a message to the first processor (the
+    // PCI function at `address`): a received frame, a ring running low and
+    // a link change raise it, not more often than INTERRUPT_INTERVAL.
+    // Left polled when the device or the processor has no way for it.
+    fn signal(self: *Self, address: usize) -> void {
+        const apic = smp.localApic()
+        if !apic.0 { return }
+        if !Pci.enableMsi(address, layout.Vector.NET, apic.1) { return }
+        self.reg(EITR0).* = INTERRUPT_INTERVAL
+        _ = self.reg(ICR).*
+        self.reg(IMS).* = CAUSE_RECEIVED | CAUSE_RING_LOW | CAUSE_LINK
+        self.*.signalled = true
     }
 
     // `frame` (`length` bytes) to the wire; false when the slot is still in
@@ -202,6 +239,15 @@ pub const Igb = struct {
     // handed back.
     pub fn receive(self: *Self) -> void {
         if !self.*.present { return }
+        // The causes taken note of before the ring is looked at (read,
+        // and written back: either clears them): a frame that comes after
+        // this raises the interrupt anew, one that came before is found
+        // in the ring below. The tick's look does the same, or a cause it
+        // left standing would keep every later interrupt from coming.
+        if self.*.signalled {
+            const causes = self.reg(ICR).*
+            if causes != 0 { self.reg(ICR).* = causes }
+        }
         // At most this many frames a call: frames that come as fast as
         // they are handled would keep the kernel in here (the timer's
         // interrupt, the kernel held) for good.
@@ -230,8 +276,11 @@ pub const Igb = struct {
         }
     }
 
-    // Polled, so it never claims the line's interrupt.
-    pub fn interrupted(self: *Self) -> bool { return false }
+    // The device's message came (layout.Vector.NET): its frames taken.
+    pub fn interrupted(self: *Self) -> void {
+        self.*.interrupts += 1
+        self.receive()
+    }
 }
 
 var first: Igb = undefined // (per run)
@@ -265,7 +314,10 @@ pub fn probe() -> bool {
         if base == 0 { continue }
         first.regs = memory.Device.map(base, REGISTERS, memory.Device.UNCACHED)
         if first.regs == 0 { continue }
-        if first.start() { return true }
+        if first.start() {
+            first.signal(address)
+            return true
+        }
     }
     return false
 }

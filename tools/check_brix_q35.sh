@@ -94,7 +94,7 @@ echo "ok   ACPI and SMP bring up the second processor on the Q35 chipset"
 # PCI across every bus: the AHCI, Ethernet and xHCI controllers the real
 # hardware drivers will drive, found by their class code.
 grep -qE '^ahci: controller 00:1f\.2, registers at 0x[0-9a-f]+, CAP 0x[0-9a-f]+, ports 0x[0-9a-f]+' <(output) || fail "the AHCI (SATA) controller was not found"
-wait_for '^brixOS: /devices/net0, [0-9a-f:]* (igb)$'
+wait_for '^brixOS: /devices/net0, [0-9a-f:]* (igb, message-signalled)$'
 wait_for '^usb: xHCI controller [0-9a-f:.]*, registers at 0x[0-9a-f]*$'
 echo "ok   PCI enumerates the AHCI, Ethernet and xHCI controllers by class across the buses"
 

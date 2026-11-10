@@ -10,6 +10,12 @@
 // woken by an IPI (Vector.WAKE) when a process can run. At most
 // layout.Memory.MAX_CPUS run it; the rest stay in the trampoline,
 // halted.
+//
+// The local APICs are reached the way the firmware left them: their
+// registers in memory at 0xFEE00000 (xAPIC), or as model-specific
+// registers (x2APIC: a firmware does that on a machine whose processors'
+// ids do not fit eight bits, or when it is told to). A processor that
+// comes up in the other mode is put into the first one's.
 const layout = @import("../layout.mlx")
 const memory = @import("./memory.mlx")
 const clock = @import("./clock.mlx")
@@ -18,9 +24,14 @@ const Bytes = @import("./bytes.mlx").Bytes
 const console = @import("./console.mlx")
 const vfs = @import("./vfs.mlx")
 
-// The local APIC's registers (its page mapped uncached at its physical
-// address in the kernel's view).
+// The local APIC's registers: offsets in its page (mapped uncached at its
+// physical address in the kernel's view); in x2APIC mode register `offset`
+// is the model-specific register X2_BASE + offset / 16.
 const LAPIC: usize = 0xFEE00000
+const X2_BASE: usize = 0x800
+// IA32_APIC_BASE's bits: the local APIC is on, and in x2APIC mode.
+const APIC_ON: usize = 0x800
+const APIC_X2: usize = 0x400
 const ID: usize = 0x20
 const EOI: usize = 0xB0
 const SPURIOUS: usize = 0xF0
@@ -70,6 +81,12 @@ pub const Processors = struct {
     // The local APIC's timer ticks in 10 ms (a time slice).
     timerTicks: usize
     mapped: bool
+    // Whether the first processor's local APIC was looked at, answers
+    // (IPIs can be sent, a device's message taken), and is in x2APIC
+    // mode.
+    looked: bool
+    usable: bool
+    x2: bool
 }
 
 var found: Processors = undefined // (per run)
@@ -236,6 +253,28 @@ fn allowed() -> usize {
 
 fn reg(offset: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, layout.Memory.virtual(LAPIC) + offset) } }
 
+// A register of this processor's local APIC read and written, by the way
+// it is reached.
+fn get(offset: usize) -> u32 {
+    if found.x2 { return @intCast(u32, cpu.Msr.read(X2_BASE + (offset >> 4)) & 0xFFFFFFFF) }
+    return reg(offset).*
+}
+
+fn put(offset: usize, value: u32) -> void {
+    if found.x2 {
+        cpu.Msr.write(X2_BASE + (offset >> 4), @intCast(usize, value))
+        return
+    }
+    reg(offset).* = value
+}
+
+// This processor's local APIC's id (all 32 bits of the register in x2APIC
+// mode, its top eight otherwise).
+fn ownId() -> usize {
+    const value = @intCast(usize, get(ID))
+    return if found.x2 { value } else { value >> 24 }
+}
+
 // The local APIC's page in the kernel's view, uncached; false when
 // memory is out.
 fn mapApic() -> bool {
@@ -245,12 +284,56 @@ fn mapApic() -> bool {
     return true
 }
 
+// The first processor's local APIC looked at, once: which way it is
+// reached, whether it answers there, and on (its spurious vector set).
+// False when it is off, not where the kernel looks, or silent.
+fn ready() -> bool {
+    if found.looked { return found.usable }
+    found.looked = true
+    found.usable = false
+    const base = cpu.Msr.read(cpu.Msr.APIC_BASE)
+    if base & APIC_ON == 0 { return false }
+    found.x2 = base & APIC_X2 != 0
+    if !found.x2 {
+        if base & 0xFFFFFF000 != LAPIC { return false }
+        if !mapApic() { return false }
+    }
+    const version = @intCast(usize, get(VERSION))
+    if version == 0 || version == 0xFFFFFFFF { return false }
+    put(SPURIOUS, 0x100 | @intCast(u32, layout.Vector.SPURIOUS))
+    found.usable = true
+    return true
+}
+
+// This processor's local APIC in the mode the first one's is in (a
+// firmware sets them all alike; one that did not would leave a processor
+// whose timer and IPIs go nowhere). From x2APIC back to its registers in
+// memory only by way of off.
+fn adopt() -> void {
+    const base = cpu.Msr.read(cpu.Msr.APIC_BASE)
+    if found.x2 && base & APIC_X2 == 0 {
+        if base & APIC_ON == 0 { cpu.Msr.write(cpu.Msr.APIC_BASE, base | APIC_ON) }
+        cpu.Msr.write(cpu.Msr.APIC_BASE, base | APIC_ON | APIC_X2)
+    } else if !found.x2 && base & APIC_X2 != 0 {
+        cpu.Msr.write(cpu.Msr.APIC_BASE, base & ~(APIC_ON | APIC_X2))
+        cpu.Msr.write(cpu.Msr.APIC_BASE, (base & ~APIC_X2) | APIC_ON)
+    }
+}
+
 fn wait(nanoseconds: usize) -> void {
     const until = clock.system().monotonic() + nanoseconds
     while clock.system().monotonic() < until {}
 }
 
+// An IPI to the processor whose local APIC's id is `apic`. In memory: the
+// id's eight bits, then the command, waited for until it is delivered; in
+// x2APIC mode one register takes both (all 32 bits of the id) and there
+// is nothing to wait for.
 fn send(apic: usize, command: u32) -> void {
+    if found.x2 {
+        cpu.Msr.write(X2_BASE + (ICR_LOW >> 4), (apic << 32) | @intCast(usize, command))
+        return
+    }
     reg(ICR_HIGH).* = @intCast(u32, apic << 24)
     reg(ICR_LOW).* = command
     var tries: usize = 0
@@ -260,13 +343,13 @@ fn send(apic: usize, command: u32) -> void {
 // The local APIC's timer ticks in 10 ms, measured on this processor
 // (the timer counts the bus clock, the same on every one).
 fn measureTimer() -> void {
-    reg(SPURIOUS).* = 0x100 | @intCast(u32, layout.Vector.SPURIOUS)
-    reg(TIMER_DIVIDE).* = 0xB
-    reg(LVT_TIMER).* = TIMER_MASKED | @intCast(u32, layout.Vector.LAPIC_TIMER)
-    reg(TIMER_INITIAL).* = 0xFFFFFFFF
+    put(SPURIOUS, 0x100 | @intCast(u32, layout.Vector.SPURIOUS))
+    put(TIMER_DIVIDE, 0xB)
+    put(LVT_TIMER, TIMER_MASKED | @intCast(u32, layout.Vector.LAPIC_TIMER))
+    put(TIMER_INITIAL, 0xFFFFFFFF)
     wait(10000000)
-    const left = @intCast(usize, reg(TIMER_CURRENT).*)
-    reg(TIMER_INITIAL).* = 0
+    const left = @intCast(usize, get(TIMER_CURRENT))
+    put(TIMER_INITIAL, 0)
     found.timerTicks = 0xFFFFFFFF - left
 }
 
@@ -274,28 +357,26 @@ fn measureTimer() -> void {
 // every 10 ms, its time slice.
 pub fn startTimer() -> void {
     if found.timerTicks == 0 { return }
-    reg(SPURIOUS).* = 0x100 | @intCast(u32, layout.Vector.SPURIOUS)
-    reg(TIMER_DIVIDE).* = 0xB
-    reg(LVT_TIMER).* = TIMER_PERIODIC | @intCast(u32, layout.Vector.LAPIC_TIMER)
-    reg(TIMER_INITIAL).* = @intCast(u32, found.timerTicks)
+    put(SPURIOUS, 0x100 | @intCast(u32, layout.Vector.SPURIOUS))
+    put(TIMER_DIVIDE, 0xB)
+    put(LVT_TIMER, TIMER_PERIODIC | @intCast(u32, layout.Vector.LAPIC_TIMER))
+    put(TIMER_INITIAL, @intCast(u32, found.timerTicks))
 }
 
 // The end of a local APIC interrupt (its timer's, a device's message).
-pub fn endOfInterrupt() -> void { reg(EOI).* = 0 }
+pub fn endOfInterrupt() -> void { put(EOI, 0) }
 
 // This processor's local APIC made ready to take a device's interrupt (a
-// message-signalled one: Pci.enableMsi): in the kernel's view, on (its
-// spurious vector set), answering there; whether it is, and its id for
-// the message's address. Also on a machine where one processor runs
-// (the others' start does as much on the way). Not in x2APIC mode.
+// message-signalled one: Pci.enableMsi, Pci.enableMsix): on (its
+// spurious vector set) and answering; whether it is, and its id for the
+// message's address. Also on a machine where one processor runs (the
+// others' start does as much on the way). A message's address has eight
+// bits for the id: a processor whose id does not fit takes none.
 pub fn localApic() -> (bool, usize) {
-    // (Bit 11: the local APIC is on; bit 10: in x2APIC mode.)
-    if cpu.Msr.read(cpu.Msr.APIC_BASE) & 0xC00 != 0x800 { return -> (false, 0) }
-    if !mapApic() { return -> (false, 0) }
-    const version = @intCast(usize, reg(VERSION).*)
-    if version == 0 || version == 0xFFFFFFFF { return -> (false, 0) }
-    reg(SPURIOUS).* = 0x100 | @intCast(u32, layout.Vector.SPURIOUS)
-    return -> (true, @intCast(usize, reg(ID).* >> 24))
+    if !ready() { return -> (false, 0) }
+    const id = ownId()
+    if id >= 255 { return -> (false, 0) }
+    return -> (true, id)
 }
 
 // Processor `k`'s block and TSS: a trap stack of its own, its share of
@@ -339,10 +420,13 @@ pub fn start() -> void {
         out.write("brixOS: the ACPI tables name no processors (one runs)\n")
         return
     }
+    // How the local APICs are reached decides which processors can be
+    // (below), so it is looked at first.
+    const answering = ready()
     // The MADT's entries (a type, a length): a processor's local APIC
     // (type 0: an 8-bit id) or its x2APIC (type 9: a 32-bit id), each
-    // enabled. An id of 255 or more needs the x2APIC's way of sending,
-    // which is not here: such a processor is counted and left.
+    // enabled. An id of 255 or more is reached in x2APIC mode only: when
+    // the firmware left the other, such a processor is counted and left.
     const table = Bytes.pointer(madt)
     const madtLength = Bytes.read32(table, 4)
     found.count = 0
@@ -356,7 +440,7 @@ pub fn start() -> void {
             list(@intCast(usize, table[at + 3]))
         } else if kind == 9 && size >= 16 && Bytes.read32(table, at + 8) & 1 != 0 {
             const id = Bytes.read32(table, at + 4)
-            if id < 255 { list(id) } else { beyond += 1 }
+            if id < 255 || found.x2 { list(id) } else { beyond += 1 }
         }
         at += size
     }
@@ -376,25 +460,24 @@ pub fn start() -> void {
         out.write(" processors; /system/settings/processors lets one run\n")
         return
     }
-    // The local APICs where the kernel looks for them, and answering
-    // there: a firmware that left them in x2APIC mode has none in memory
-    // (the registers read as nothing), and IPIs written there go nowhere.
-    if Bytes.read32(table, 36) != LAPIC {
+    // The local APICs on, where the kernel looks for them (in memory, or
+    // as model-specific registers), and answering there.
+    const base = cpu.Msr.read(cpu.Msr.APIC_BASE)
+    if base & APIC_ON == 0 {
+        out.write("brixOS: the local APIC is off (one processor runs)\n")
+        return
+    }
+    if !found.x2 && (Bytes.read32(table, 36) != LAPIC || base & 0xFFFFFF000 != LAPIC) {
         out.write("brixOS: the local APICs are at ")
-        out.hex(Bytes.read32(table, 36))
+        out.hex(base & 0xFFFFFF000)
         out.write(", not where the kernel looks (one processor runs)\n")
         return
     }
-    if cpu.Msr.read(cpu.Msr.APIC_BASE) & 0x400 != 0 {
-        out.write("brixOS: the firmware left the local APICs in x2APIC mode (one processor runs)\n")
+    if !answering {
+        out.write("brixOS: the local APIC does not answer (one processor runs)\n")
         return
     }
-    if !mapApic() { return }
-    const version = @intCast(usize, reg(VERSION).*)
-    if version == 0 || version == 0xFFFFFFFF {
-        out.write("brixOS: the local APIC does not answer in memory (one processor runs)\n")
-        return
-    }
+    if found.x2 { out.write("brixOS: the local APICs are in x2APIC mode\n") }
     measureTimer()
     if found.timerTicks == 0 {
         out.write("brixOS: the local APIC's timer does not count (one processor runs)\n")
@@ -410,7 +493,7 @@ pub fn start() -> void {
     Bytes.copy(physical(layout.Ap.START), physical(layout.Memory.BLOB + layout.Blob.AP), layout.Ap.SIZE)
     const counter = unsafe { @ptrFromInt(*u32, layout.Memory.virtual(layout.Ap.START + layout.Ap.STARTED)) }
     counter.* = 0
-    const own = @intCast(usize, reg(ID).* >> 24)
+    const own = ownId()
     apic.at(0).* = own
     k = 0
     var others: usize = 0
@@ -456,7 +539,8 @@ pub fn arenaRelease(mark: usize) -> void {
 // Processor `id` runs the kernel from now on (its first entry).
 pub fn joined(id: usize) -> void {
     if id + 1 > found.running { found.running = id + 1 }
-    apic.at(id).* = @intCast(usize, reg(ID).* >> 24)
+    adopt()
+    apic.at(id).* = ownId()
 }
 
 // Processor `id` idles from now on (`resting`), or no more.
@@ -477,7 +561,7 @@ pub fn idleProcessor() -> (bool, usize) {
 // process to run). It counts as awake from now on: one wake-up at a
 // time.
 pub fn wake(id: usize) -> void {
-    if !found.mapped { return }
+    if !found.usable { return }
     idle.at(id).* = false
     send(apic.at(id).*, 0x4000 | @intCast(u32, layout.Vector.WAKE))
 }

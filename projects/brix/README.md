@@ -184,12 +184,14 @@ runtime says "out of memory" on stderr before the program's own report.
 machine has and what the kernel did: the memory and what is free of it,
 the processors running the kernel, the uptime, and the kernel's counts
 since the boot (page faults served, system calls, switches between
-processes). `sysinfo` prints them:
+processes, the interrupts the devices sent as messages). `sysinfo`
+prints them:
 
     memory: 2047 MiB, 1938 free
     processors: 2
     uptime: 6.0 s
     page faults: 3229, system calls: 822, switches: 14
+    device interrupts: 57
 
 std.build's runner takes its memory figures from it on brixOS (on Linux
 from /proc/meminfo), and build.mlx says what the big compiles take
@@ -266,16 +268,39 @@ tools/check_brix_q35.sh, check_brix_usb.sh, check_brix_net_igb.sh):
 SATA disks on every AHCI controller (ahci.mlx), NVMe namespaces
 (nvme.mlx), an Intel igb network controller (igb.mlx), USB boot keyboards
 and mice on every xHCI controller, also behind hubs (usb.mlx: there is no
-PS/2 there). The drivers are polled; each wait is a deadline on the clock
-(clock.Deadline), never a count of register reads, which is a blink on
-one machine and minutes on another, and each step that fails says so
-with what it saw ("ahci: port 4: the device stays busy (SSTS ... TFD
-...)", "usb: port 3.2: the device takes no address (completion code
-4)"). A controller is taken from the firmware first where it says it
-holds it (AHCI's BOHC, xHCI's USB Legacy Support). A device's registers
-are mapped by `memory.Device.map`: below 511 GiB at the kernel's direct
-offset, beyond (a 64-bit BAR the firmware put high, as OVMF does with
-the xHCI's) in a window of the kernel's own.
+PS/2 there). Each wait is a deadline on the clock (clock.Deadline), never
+a count of register reads, which is a blink on one machine and minutes
+on another, and each step that fails says so with what it saw ("ahci:
+port 4: the device stays busy (SSTS ... TFD ...)", "usb: port 3.2: the
+device takes no address (completion code 4)"). A controller is taken
+from the firmware first where it says it holds it (AHCI's BOHC, xHCI's
+USB Legacy Support). A device's registers are mapped by
+`memory.Device.map`: below 511 GiB at the kernel's direct offset, beyond
+(a 64-bit BAR the firmware put high, as OVMF does with the xHCI's) in a
+window of the kernel's own.
+
+The network controller and the USB controllers raise their interrupts as
+messages (MSI, or MSI-X where a controller has only that: `Pci.enableMsi`,
+`Pci.enableMsix`) to vectors of their own on the first processor's local
+APIC (layout.Vector.NET, USB; trap.mlx ends each at the local APIC): a
+received frame and a keyboard's report are served when they come. The
+timer tick looks at both as well, so a machine where no message arrives
+(no MSI capability, a local APIC that is off) works as before, a
+hundredth of a second later at most; `sysinfo`'s "device interrupts" says
+which it is. The disks' commands are waited for where they are issued
+(the kernel runs a call to its end), as before.
+
+USB devices may be plugged in and pulled out while the system runs. Every
+port, a controller's or a hub's, goes through the same states a step at a
+time (usb.mlx `Port`: settling, reset, recovery, bring-up); the boot runs
+these steps until every port rests, afterwards the tick and the
+controller's interrupt do, and the waits in between are deadlines a step
+looks at, so the kernel is held only for a command's or a request's round
+trip. A hub says which of its ports changed on its status endpoint. A
+device that goes gives its slot and its memory back, a hub's devices
+with it, and a keyboard's held keys are released. What the kernel has
+to say about it afterwards is in its log (/devices/klog), not on the
+console.
 
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
@@ -291,9 +316,12 @@ registers, the callers), drawn over whatever is there.
 The loader hands the kernel the ACPI tables' root from the firmware's
 configuration table (a UEFI firmware keeps none in the BIOS area), so the
 other processors are found and started there too (smp.mlx: the XSDT, the
-MADT's local APIC and x2APIC entries; not when the firmware left the
-local APICs in x2APIC mode, which is said). /system/settings/processors
-(a number) limits how many run the kernel.
+MADT's local APIC and x2APIC entries). The local APICs are reached the
+way the firmware left them: their registers in memory, or, in x2APIC
+mode, as model-specific registers (IPIs with 32-bit ids, the timer, the
+end of an interrupt); this second way is written to the manuals and has
+not run anywhere yet (QEMU's emulation here has no x2APIC).
+/system/settings/processors (a number) limits how many run the kernel.
 
     tools/brix-diag-efi.sh
 
@@ -312,9 +340,9 @@ archive by name (`Archive.find`), a vector for its interrupt
 picture is the console and the desktop's screen: the file's head says
 what must not be done to the card while it is.
 
-What is not there yet: a device plugged in after the boot, interrupts
-for these devices (they are polled), the x2APIC's way of reaching
-processors.
+What is not there yet: disks served by their interrupts (AHCI, NVMe: a
+command is waited for), USB devices other than boot keyboards, mice and
+hubs, a network controller's link going down and up said to the stack.
 
 (The font's glyphs were a `const` array, a value built where it was
 used: each row of each character drawn built all 1520 bytes of it in the

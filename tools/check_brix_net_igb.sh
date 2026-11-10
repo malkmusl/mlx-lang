@@ -5,8 +5,9 @@
 # network (the guest is 10.0.2.15, the host 10.0.2.2, a name server at
 # 10.0.2.3); the kernel's stack, Linux's socket calls for std.net, and
 # wget fetching files from an HTTP server on the host; ping to the
-# gateway; brixOS's own socket calls. The igb device is polled (no
-# interrupt), driven by the timer tick.
+# gateway; brixOS's own socket calls. The device's frames come by its
+# message-signalled interrupt (MSI); the timer tick looks at its ring as
+# well.
 #
 #   tools/check_brix_net_igb.sh [compiler]
 set -euo pipefail
@@ -40,10 +41,11 @@ mkdir -p "$work/bin" "$work/www"
 "$compiler" --quiet $brix projects/wget/main.mlx -o "$work/wget"
 "$compiler" --quiet $brix projects/ping/main.mlx -o "$work/ping"
 "$compiler" --quiet $brix projects/brix/tools/netcalls/main.mlx -o "$work/netcalls"
+"$compiler" --quiet $brix projects/brix/tools/sysinfo/main.mlx -o "$work/sysinfo"
 for program in cat wc echo sha256sum; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "sysinfo=$work/sysinfo" "$work/bin/"
 echo "ok   the kernel, wget, ping, netcalls and a boot image build"
 
 # The host's HTTP server on a port of its own.
@@ -80,7 +82,7 @@ type_line() {
     wait_for '^root@brix:[^#]*# $' "$prompts"
     printf '%s\r' "$1" >&3
 }
-wait_for '^brixOS: /devices/net0, [0-9a-f:]* (igb)$'
+wait_for '^brixOS: /devices/net0, [0-9a-f:]* (igb, message-signalled)$'
 wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
 type_line 'cat /system/settings/resolv.conf'
 wait_for '^nameserver 10.0.2.3$'
@@ -104,4 +106,9 @@ wait_for '^wget: http://10.0.2.2:[0-9]*/missing.txt: the server answered 404$'
 wait_for '^status 1$'
 grep -q 'GET /hello.txt HTTP/1.1" 200' "$work/server.txt" || fail "the host's server did not see the request"
 echo "ok   wget fetches a small and a large file over TCP from the host via igb, and reports a 404"
+# The frames came by the device's interrupt (a message to the processor,
+# MSI), not only by the timer tick's look at the ring.
+type_line 'sysinfo'
+wait_for '^device interrupts: [1-9][0-9]*$'
+echo "ok   the device's message-signalled interrupt brings its frames"
 echo PASS
