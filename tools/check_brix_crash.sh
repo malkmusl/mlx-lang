@@ -7,7 +7,8 @@
 # own file says where its segments are and what it is called, and is read
 # into memory for its symbol and line tables):
 #   - a store through address 0 three calls below main names the program,
-#     the fault's address, the function, each caller and their lines;
+#     the fault's address, the function, each caller and their lines, also
+#     in a program that takes brixOS's events itself (std.events);
 #   - a failed runtime check, an abort, a stack overflow (the recursion
 #     said once) and a full value arena are said as on the host;
 #   - a failure (crash.fail) is reported with its callers (fail calls the
@@ -95,6 +96,15 @@ grep -q '^  from tests/support/crash_report.mlx:77:outer+0x[0-9a-f]* at tests/su
 grep -q '^  from tests/support/crash_report.mlx:31:main+0x[0-9a-f]* at tests/support/crash_report.mlx:35$' "$work/zero.out" || fail "main (line 35) is not among the callers" "$work/zero.out"
 grep -q '^  from _start+0x[0-9a-f]*' "$work/zero.out" || fail "_start is not among the callers" "$work/zero.out"
 echo "ok   a store through address 0 three calls deep names the program, the function, its callers and their lines"
+
+# A program that takes events of brixOS's itself (std.events: the kernel
+# then gives it its events, not signals) still has its report: a fault it
+# did not claim goes to the handler the report installed.
+run events 139
+grep -q '^crashy: crashed: segmentation fault touching 0x0$' "$work/events.out" || fail "a program that claimed an event has no crash report" "$work/events.out"
+grep -q '^  at tests/support/crash_report.mlx:21:store+0x[0-9a-f]* at tests/support/crash_report.mlx:22$' "$work/events.out" || fail "the fault of a program that claimed an event is not placed in store" "$work/events.out"
+grep -q '^  from tests/support/crash_report.mlx:31:main+0x[0-9a-f]* at tests/support/crash_report.mlx:35$' "$work/events.out" || fail "main is not among the callers of a program that claimed an event" "$work/events.out"
+echo "ok   a program that takes brixOS's events itself keeps its crash report"
 
 run index 132
 grep -q '^crashy: crashed: illegal instruction (a failed runtime check' "$work/index.out" || fail "no crash line" "$work/index.out"
