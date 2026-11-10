@@ -815,6 +815,37 @@ slot narrower than a word is read and written in place (`movzx rax, byte
 [rbp - 0x88]`). With single-store promotion this brought the compiler's
 own build to 3.08 billion instructions and its binary to 1.45 MB.
 
+**Powers of two without the divide** (x86_64,
+`Arithmetic.emitPowerOfTwoDivision`, `emitPowerOfTwoMultiplication`,
+`Memory.emitScale`). A division or a remainder whose divisor is a
+constant 2^n does not reach the processor's `div` (14 to 46 cycles on a
+Zen 1). An unsigned quotient is `shr` by n, its remainder an `and` with
+2^n - 1 (`mov r32, r32` for 2^32, a shift left and back for a wider mask,
+which is no 32-bit immediate). A signed one adds 2^n - 1 to a negative
+dividend first (`mov rcx, x`, `sar rcx, 63`, `shr rcx, 64 - n`, `add x,
+rcx`), so that `sar` rounds toward zero as `idiv` does, and takes it off
+again after the mask for the remainder, which keeps the dividend's sign.
+A product by a constant 2^n, on either side, and an index scaled by an
+element of 2^n bytes are `shl`. Each is the word the 64-bit `div`, `idiv`
+or `imul` left for every operand, so narrow types and mlx-cc's C and C++
+(the same back end) need no case of their own, and a checked product
+traps as before: the check compares the product with the type's largest
+value (`emitArithmeticPolicy` in `ir/lower.mlx`), no code reads a
+multiplication's flags. The constant is read from the operand's `const_i`
+(`State.constantPowerOfTwo`), wherever its value is kept. Left as they
+were: divisors and factors that are no power of two, the lowest i64 as a
+signed divisor (its bits are 2^63's), and the aarch64 back end. brixOS's
+kernel went from 222 `div` to 75 and from 643 `imul` by an immediate to
+245, kepler built for brixOS from 265 `div` and 190 `idiv` to 119 and 75
+and from 1,892 such `imul` to 346 (`backend divisions and products by a
+power of two shifted` counts them); a loop with `/ 8` in its condition
+takes 0.29 ns a turn instead of 2.4.
+`tests/448_power_of_two_division_runtime.mlx` holds every integer type
+and divisor against the same divisor read at run time,
+`tests/449_power_of_two_multiplication_runtime.mlx` the products, a
+checked one that does not fit still trapping, and elements reached by an
+index; `compiler/cc/tests/powertwo.c` is the same for C.
+
 Between Mlx functions a value of several words comes back a word per
 register: `rax`, `rdx`, `rcx`, `r8`, `r9`, `r10`, `r11`, `rsi`, `rdi`
 (`state_module.returnRegister`, nine words; `x0` to `x7` on aarch64), and

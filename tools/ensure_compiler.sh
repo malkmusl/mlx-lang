@@ -1010,6 +1010,24 @@ writes_places_through_try() {
     return $ok
 }
 
+# Whether $1 shifts and masks where a divisor or a factor is a constant
+# power of two instead of dividing or multiplying (x86_64
+# codegen/arithmetic.mlx), and the program still runs right
+# (tests/448_power_of_two_division_runtime.mlx exits 13).
+shifts_powers_of_two() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    output=$("$1" tests/448_power_of_two_division_runtime.mlx -o "$probe/probe" 2>&1) || true
+    if grep -q "divisions and products by a power of two shifted: [1-9]" <<< "$output"; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -1080,6 +1098,7 @@ probes=(
     "nests_function_types|function types with function types among their parameters"
     "ends_statements_after_postfix|a statement ended by a line's last .* or .?"
     "addresses_constants|the address of a module-level constant"
+    "shifts_powers_of_two|divisions and products by a constant power of two as shifts and masks"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).
