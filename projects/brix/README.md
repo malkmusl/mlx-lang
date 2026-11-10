@@ -287,7 +287,9 @@ received frame and a keyboard's report are served when they come. The
 timer tick looks at both as well, so a machine where no message arrives
 (no MSI capability, a local APIC that is off) works as before, a
 hundredth of a second later at most; `sysinfo`'s "device interrupts" says
-which it is. The disks' commands are waited for where they are issued
+which it is, and /system/settings/interrupts with the word `polled` in it
+keeps every device to the tick (for a board whose messages are in
+doubt). The disks' commands are waited for where they are issued
 (the kernel runs a call to its end), as before.
 
 USB devices may be plugged in and pulled out while the system runs. Every
