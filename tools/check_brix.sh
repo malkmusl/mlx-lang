@@ -198,7 +198,7 @@ echo "ok   the umask, /devices/null, /devices/zero"
 type_line 'echo linux > /temporary/l; linux-cat /tmp/l; linux-cat /dev/null; linux-cat /etc/passwd; linux-ls /dev'
 wait_for '^linux$'
 wait_for '^root:x:0:0:root:/users/root:/system/programs/flux$'
-wait_for '^console  disk0[[:space:]]*framebuffer  keyboard  mouse  null  tty  zero$'
+wait_for '^console  disk0[[:space:]]*framebuffer  keyboard  klog  mouse  null  tty  zero$'
 echo "ok   Linux programs' /tmp, /dev and /etc/passwd"
 
 type_line 'cat /system/programs/flux > big; before=$(stat -f -c %f .); cp big copy; after=$(stat -f -c %f .); echo shared $(( before - after < 64 )) $(wc -c < copy)'

@@ -93,9 +93,9 @@ echo "ok   ACPI and SMP bring up the second processor on the Q35 chipset"
 
 # PCI across every bus: the AHCI, Ethernet and xHCI controllers the real
 # hardware drivers will drive, found by their class code.
-grep -qE '^pci: 00:1f\.2 .* 0x10601 AHCI$' <(output) || fail "the AHCI (SATA) controller was not enumerated"
-grep -qE '^pci: [0-9a-f:.]+ .* 0x20000 Ethernet$' <(output) || fail "the Ethernet controller was not enumerated"
-grep -qE '^pci: [0-9a-f:.]+ .* 0xc0330 xHCI$' <(output) || fail "the xHCI (USB) controller was not enumerated"
+grep -qE '^ahci: controller 00:1f\.2, registers at 0x[0-9a-f]+, CAP 0x[0-9a-f]+, ports 0x[0-9a-f]+' <(output) || fail "the AHCI (SATA) controller was not found"
+wait_for '^brixOS: /devices/net0, [0-9a-f:]* (igb)$'
+wait_for '^usb: xHCI controller [0-9a-f:.]*, registers at 0x[0-9a-f]*$'
 echo "ok   PCI enumerates the AHCI, Ethernet and xHCI controllers by class across the buses"
 
 # disk0 on the AHCI controller, disk1 the NVMe namespace, each by its driver.

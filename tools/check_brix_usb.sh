@@ -33,9 +33,9 @@ timeout 40 qemu-system-x86_64 -machine q35 -m 1G -smp 2 -cpu max -display none -
     < /dev/null > "$work/serial.txt" 2>&1 || true
 out() { tr -d '\r' < "$work/serial.txt"; }
 
-grep -qE '^pci: [0-9a-f:.]+ .* 0xc0330 xHCI$' <(out) || fail "the xHCI controller was not enumerated"
+grep -qE '^usb: xHCI controller [0-9a-f:.]+, registers at 0x[0-9a-f]+$' <(out) || fail "the xHCI controller was not found"
 echo "ok   PCI finds the xHCI controller"
-grep -q '^usb: /devices/keyboard (xHCI, slot [0-9]*)$' <(out) || fail "the USB keyboard was not brought up"
-grep -q '^usb: /devices/mouse (xHCI, slot [0-9]*)$' <(out) || fail "the USB mouse was not brought up"
+grep -qE '^usb: /devices/keyboard \(xHCI slot [0-9]+ if [0-9]+ dci [0-9]+\)$' <(out) || fail "the USB keyboard was not brought up"
+grep -qE '^usb: /devices/mouse \(xHCI slot [0-9]+ if [0-9]+ dci [0-9]+\)$' <(out) || fail "the USB mouse was not brought up"
 echo "ok   the USB keyboard and mouse are enumerated over xHCI (slot, address, descriptors, config, boot protocol)"
 echo "PASS brixOS on Q35: a USB keyboard and mouse on the xHCI controller"

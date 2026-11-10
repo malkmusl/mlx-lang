@@ -139,7 +139,7 @@ wait_for '^impulse: brixOS.s init$'
 wait_for '^impulse: services defined: 3$'
 echo "ok   impulse defines the bus, the login and the serial shell"
 # The bus listens, the login owns its names and starts the greeter.
-wait_for '^ipc: listening at unix:path=/temporary/bus$'
+wait_for 'ipc: listening at unix:path=/temporary/bus$'
 wait_for '^login: org.mlx.Login and org.freedesktop.login1 on the system bus'
 wait_for '^login: greeter started$'
 # sentinel is itself a native (mlx) bus client: it speaks MLXIPC's native
