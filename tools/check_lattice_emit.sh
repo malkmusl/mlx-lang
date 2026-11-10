@@ -125,6 +125,8 @@ feature values values "a class with a copy constructor taken by value, an empty 
 feature overflow overflow "the overflow builtins over 32 and 64 bits, signed and unsigned, and with operands and a result of different types"
 feature variadic variadic "functions with variable arguments: va_start, va_arg, va_copy, a va_list handed on, a method, and the printf family of the runtime"
 feature system system "the system by number as foreign code calls it: a futex wait and wake, fcntl, and sscanf"
+feature jumps jumps "goto: labels at a function's top (a parser's loop) and in a loop's body (a scanner's), a goto out of two loops; a switch whose cases run on and one with a break inside an if; continue and break across them"
+feature hides hides "a member with the name of a base class's member, twice over: both fields of the record, each reached by its class"
 feature cnames cnames "C's struct stat beside stat(), sigaction, std::copysign beside C's copysign: the names kept apart"
 feature casts casts "a cast that keeps the element under an address taken again, an array's storage as bytes"
 
