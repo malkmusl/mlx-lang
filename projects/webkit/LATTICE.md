@@ -302,10 +302,10 @@ lines of C++ without the headers) and the C++ library's four units
 | | |
 |---|---|
 | modules | 341, 66.3 MB of Mlx, each thing once, in its home |
-| functions written | 38,162 |
+| functions written | 38,283 (xxHash, a C unit, among them) |
 | functions held back (written as comments) | 0 |
 | what mlx4 says | the program compiles: every function passes the analysis, the lowering and the code generator; an executable of 28.9 MB in 19 s |
-| functions declared `extern` | 302 by name |
+| functions the executable asks its loader for | 229 |
 | `// LATTICE:` marks in live code | 124 objects zeroed through an address, 51 initializers not read, 10 floating constants, 7 unknown nodes, 4 `std::min` arguments (the other marks are comments: a base class's name, a C++ symbol) |
 
 Three levels, and where each is:
@@ -313,28 +313,31 @@ Three levels, and where each is:
 1. **Proven** (the differential test prints the same from the Mlx and
    the C++): eight units of `src/common`, 3,091 lines, and the feature
    and program tests of the translator itself (projects/lattice/tests,
-   twenty of them: virtual calls, bit-fields, variadics, jumps,
+   twenty-one of them: virtual calls, bit-fields, variadics, jumps,
    objects made before main, two units as one program, the shapes the
-   whole program showed).
+   whole program showed, a C unit).
 2. **Compiles**: all of ANGLE, as one program. This is what the work
    of the last rounds was: 7,154 functions were held back when the
    units were translated alone; with every unit translated together
    none is, and mlx4 accepts all of them.
-3. **Runs**: not yet. The executable asks its loader for the 302
-   functions it declares `extern`, and they are the rest of the way to
-   an ANGLE without C or C++ under it:
-   - 153 Vulkan functions (`vk*`) and 20 of the memory allocator
-     (`vma_*`): std.vulkan has Vulkan in Mlx; the translation names the
-     C functions still.
-   - 100 or so of the C library (`pthread_*`, `dlopen`, `fopen`,
-     `getenv`, `stat`, the float math functions `sinf`...): the runtime
-     module (projects/lattice/runtime/c.mlx) has the first sixty over
-     std; mlxlibc has all of them in Mlx.
-   - 9 of zlib (`deflate`, `inflate`, `crc32_z`) and 6 of xxHash: std
-     has both.
-   - 20 functions of the C++ library declared with their C++ symbols
-     (`std::array<T, N>::fill`): header functions the translator did
-     not carry along.
+3. **Runs**: not yet. The executable asks its loader for 229
+   functions, and they are the rest of the way to an ANGLE without C
+   or C++ under it:
+   - 146 Vulkan functions (`vk*`): compiler/libc/vulkan has Vulkan's C
+     API in Mlx over std.vulkan (`export fn vkCmdDraw`); imported into
+     the program, the loader binds the calls to it.
+   - 16 of the memory allocator's wrapper (`vma_*`): the port's own
+     C++ (projects/webkit/port/angle/vk_mem_alloc_wrapper.cpp), a unit
+     to translate with the others.
+   - 60 or so of the C library (`pthread_*`, `dlopen`, `fopen`,
+     `getenv`, `stat`, a few float functions): mlxlibc has them in Mlx;
+     the runtime module (projects/lattice/runtime/c.mlx) has the first
+     sixty over std.
+   - 8 of zlib (`deflate`, `inflate`, `crc32_z`): compiler/libc/zlib
+     has them in Mlx.
+   (xxHash, a C unit whose functions its header defines, and
+   `std::array<T, N>::fill`, twenty instances, were on this list and
+   are translated now.)
 
 What mlx4 and mlx-cc learnt on the way (each with its test): record
 types across modules that import one another (441), a function ended by
@@ -345,9 +348,9 @@ constant (445), an arena of 8 GiB of address space; in mlx-cc, an
 assignment through a converting constructor of a class copied by its
 bytes, and `auto &row` over an array of arrays.
 
-The order of what is next: the 302 externs (the C library through the
-runtime, Vulkan through std.vulkan, zlib and xxHash through std, the 20
-library functions carried along), so that the program starts; the
+The order of what is next: the 229 functions (the modules of
+compiler/libc imported into the program or loaded beside it, the
+allocator's wrapper translated), so that the program starts; the
 shader translator run against the C++ one shader by shader; the marks
 in live code; the EGL and GLES entry points as `export fn`, which is
 what WebKit links.
