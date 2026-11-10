@@ -167,7 +167,7 @@ wait_for '^ignition: told to quit, the picture stays$'
 # animation stutters this line tells drawing from the copy to the display
 # from a splash kept waiting.
 wait_for '^ignition: [0-9]*x[0-9]*, [0-9]* frames in [0-9.]* s ([0-9.]* a second); a frame: [0-9.]* ms to draw, [0-9.]* ms to the display, [0-9.]* ms at most$'
-echo "ok   the splash says what its frames cost (drawing, the copy to the display, the longest) when it ends"
+echo "ok   the splash says what its frames cost when it ends: $(output | grep -a '^ignition: [0-9]*x[0-9]*, ' | head -1 | sed 's/^ignition: //')"
 # Then mlx-console takes the screen: its prompt, pixel for pixel.
 same() {
     local dump=$1 text=$2 what=$3
