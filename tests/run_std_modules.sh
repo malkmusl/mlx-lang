@@ -183,6 +183,7 @@ run 437_atomic_optional_pointer_runtime "atomics on an optional pointer: load, s
 run 438_global_address_initializers_runtime "module-level vars initialized with floats and addresses: functions, strings, another global's element; one address for a table wherever it is named"
 run 439_function_before_declaration_runtime "a function named in a module-level initializer above its declaration: a table and a pointer before their functions"
 run 440_endless_loop_ends_function_runtime "a function ending with a while true that no break ends; breaks of inner and outer loops, a continue that names it"
+run 442_function_alignment_runtime "functions begin at multiples of 16: an address through an integer and back, its low bits free"
 run 441_types_across_import_ring_runtime "records of three modules that import one another naming one another: pointers, records inside, a function type, sizes"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
