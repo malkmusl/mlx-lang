@@ -302,7 +302,7 @@ lines of C++ without the headers) and the C++ library's four units
 | | |
 |---|---|
 | modules | 341, 66.3 MB of Mlx, each thing once, in its home |
-| functions written | 38,283 (xxHash, a C unit, among them) |
+| functions written | 38,275 (xxHash, a C unit, among them) |
 | functions held back (written as comments) | 0 |
 | what mlx4 says | the program compiles: every function passes the analysis, the lowering and the code generator; an executable of 28.9 MB in 19 s |
 | functions the executable asks its loader for | 229 |
