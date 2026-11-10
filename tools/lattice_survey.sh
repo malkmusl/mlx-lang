@@ -55,6 +55,8 @@ survey_one() {
     local source=$angle/$path
     local standard="-std=c++23 -include $angle/ANGLEPrefix.h -include $out/defines.h"
     [[ $path == *.c ]] && standard="-std=c11"
+    # (As projects/webkit/angle.mlx's sourceFlags: the port's header first.)
+    [[ $path == src/libANGLE/renderer/vulkan/vk_helpers.cpp ]] && standard="$standard -include projects/webkit/port/angle/VkHelpersMlx.h"
     local lines status=ok functions=0 held=0 marks=0 externs=0 compiled=-
     lines=$(wc -l < "$source")
     # shellcheck disable=SC2086
@@ -82,38 +84,36 @@ cp projects/lattice/runtime/c.mlx projects/lattice/runtime/libcpp.mlx "$out/unit
 for list in "${lists[@]}"; do grep -E '\.(cpp|cc|c)$' "projects/webkit/lists/$list.txt"; done | sort -u > "$out/units.txt"
 xargs -P "$jobs" -I{} bash -c 'survey_one "$@"' _ {} < "$out/units.txt" > "$out/survey.tsv"
 
-awk -F'\t' -v compile="$compile" '
-function group(path,    parts, n) {
-    n = split(path, parts, "/")
-    if (parts[1] != "src") return parts[1]
-    if (parts[2] == "libANGLE" && parts[3] == "renderer") return "src/libANGLE/renderer" (n > 4 ? "/" parts[4] : "")
-    if (parts[2] == "compiler") return "src/compiler/" parts[3]
-    return "src/" parts[2]
-}
-{
-    g = group($1)
-    units[g]++; lines[g] += $2
-    if ($3 == "ok") { ok[g]++; functions[g] += $4; held[g] += $5; marks[g] += $6; externs[g] += $7 }
-    if ($8 == "yes") compiled[g]++
-    order[g] = 1
-}
-END {
-    printf "%-34s %5s %8s %6s %9s %6s %5s %6s %7s", "part", "units", "lines", "transl", "functions", "held", "live%", "marks", "externs"
-    if (compile == 1) printf " %8s", "compiles"
-    printf "\n"
-    n = asorti(order, names)
-    for (i = 1; i <= n; i++) {
-        g = names[i]
-        total = functions[g] + held[g]
-        printf "%-34s %5d %8d %6d %9d %6d %5.1f %6d %7d", g, units[g], lines[g], ok[g], functions[g], held[g], (total ? 100 * functions[g] / total : 0), marks[g], externs[g]
-        if (compile == 1) printf " %8d", compiled[g]
-        printf "\n"
-        U += units[g]; L += lines[g]; O += ok[g]; F += functions[g]; H += held[g]; M += marks[g]; E += externs[g]; C += compiled[g]
+summarize() {
+    awk -F'\t' -v compile="$compile" -v total="$1" '
+    function group(path,    parts, n) {
+        n = split(path, parts, "/")
+        if (total == 1) return "all"
+        if (parts[1] != "src") return parts[1]
+        if (parts[2] == "libANGLE" && parts[3] == "renderer") return "src/libANGLE/renderer" (n > 4 ? "/" parts[4] : "")
+        if (parts[2] == "compiler") return "src/compiler/" parts[3]
+        return "src/" parts[2]
     }
-    printf "%-34s %5d %8d %6d %9d %6d %5.1f %6d %7d", "all", U, L, O, F, H, (F + H ? 100 * F / (F + H) : 0), M, E
-    if (compile == 1) printf " %8d", C
-    printf "\n"
-}' "$out/survey.tsv"
+    {
+        g = group($1)
+        units[g]++; lines[g] += $2
+        if ($3 == "ok") { ok[g]++; functions[g] += $4; held[g] += $5; marks[g] += $6; externs[g] += $7 }
+        if ($8 == "yes") compiled[g]++
+    }
+    END {
+        for (g in units) {
+            sum = functions[g] + held[g]
+            printf "%-34s %5d %8d %6d %9d %6d %5.1f %6d %7d", g, units[g], lines[g], ok[g], functions[g], held[g], (sum ? 100 * functions[g] / sum : 0), marks[g], externs[g]
+            if (compile == 1) printf " %8d", compiled[g]
+            printf "\n"
+        }
+    }' "$out/survey.tsv"
+}
+printf "%-34s %5s %8s %6s %9s %6s %5s %6s %7s" "part" "units" "lines" "transl" "functions" "held" "live%" "marks" "externs"
+[[ $compile == 1 ]] && printf " %8s" "compiles"
+printf "\n"
+summarize 0 | sort
+summarize 1
 failed=$(awk -F'\t' '$3 != "ok"' "$out/survey.tsv" | wc -l)
 if [[ $failed -gt 0 ]]; then
     echo "units the translator fails on:"
