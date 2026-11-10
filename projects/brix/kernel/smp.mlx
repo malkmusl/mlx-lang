@@ -15,6 +15,8 @@ const memory = @import("./memory.mlx")
 const clock = @import("./clock.mlx")
 const cpu = @import("./cpu.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
+const console = @import("./console.mlx")
+const vfs = @import("./vfs.mlx")
 
 // The local APIC's registers (its page mapped uncached at its physical
 // address in the kernel's view).
@@ -28,10 +30,14 @@ const LVT_TIMER: usize = 0x320
 const TIMER_INITIAL: usize = 0x380
 const TIMER_CURRENT: usize = 0x390
 const TIMER_DIVIDE: usize = 0x3E0
+const VERSION: usize = 0x30
 const DELIVERY_PENDING: u32 = 0x1000
 const TIMER_PERIODIC: u32 = 0x20000
 const TIMER_MASKED: u32 = 0x10000
-const MAX_LISTED: usize = 32
+// The processors the firmware may name (a board with two large ones).
+const MAX_LISTED: usize = 256
+// An ACPI table's most bytes (what is taken for one; they are a few KiB).
+const MAX_TABLE: usize = 0x100000
 // A trap stack: 64 pages (as the first processor's).
 const STACK_PAGES: usize = 64
 
@@ -114,32 +120,118 @@ fn same(bytes: [*]const u8, text: []const u8) -> bool {
     return true
 }
 
-// The RSDP: in the EBDA's first KiB or the BIOS area (0xE0000..0xFFFFF),
-// on a 16-byte boundary, its checksum right; 0 when there is none (an EFI
-// boot keeps it in the firmware's configuration table).
+// The firmware's memory at `address` (`length` bytes of its ACPI tables:
+// no RAM the kernel hands out, so nothing has put it in the kernel's
+// view) where the kernel sees it; 0 when it cannot be.
+fn firmware(address: usize, length: usize) -> usize {
+    if address == 0 || length == 0 { return 0 }
+    return memory.Device.map(address, length, 0)
+}
+
+// Whether the `length` bytes at `at` (in the kernel's view) add up to 0,
+// as an ACPI structure's do.
+fn sums(at: usize, length: usize) -> bool {
+    const bytes = Bytes.pointer(at)
+    var total: usize = 0
+    var k: usize = 0
+    while k < length {
+        total += @intCast(usize, bytes[k])
+        k += 1
+    }
+    return total & 0xFF == 0
+}
+
+// The RSDP, in the kernel's view: the one a UEFI firmware named (the EFI
+// loader passes it on: such a firmware keeps none in the BIOS area), else
+// the BIOS's, in the EBDA's first KiB or at 0xE0000..0xFFFFF on a 16-byte
+// boundary; its checksum right. 0 when there is none.
 fn rsdp() -> usize {
+    const given = cpu.BootInfo.get(layout.Info.RSDP)
+    if given != 0 {
+        const at = firmware(given, 36)
+        if at != 0 && same(Bytes.pointer(at), "RSD PTR ") && sums(at, 20) { return at }
+    }
     const ebda = Bytes.read16(physical(0x40E), 0) << 4
     var at = ebda
     while ebda != 0 && at < ebda + 1024 {
-        if same(physical(at), "RSD PTR ") && sum(at, 20) { return at }
+        if same(physical(at), "RSD PTR ") && sums(layout.Memory.virtual(at), 20) { return layout.Memory.virtual(at) }
         at += 16
     }
     at = 0xE0000
     while at < 0x100000 {
-        if same(physical(at), "RSD PTR ") && sum(at, 20) { return at }
+        if same(physical(at), "RSD PTR ") && sums(layout.Memory.virtual(at), 20) { return layout.Memory.virtual(at) }
         at += 16
     }
     return 0
 }
 
-fn sum(at: usize, length: usize) -> bool {
-    var total: usize = 0
+// The ACPI table at the physical `address`, all of it in the kernel's
+// view; 0 when there is none (or its length is no table's).
+fn acpiTable(address: usize) -> usize {
+    const header = firmware(address, 36)
+    if header == 0 { return 0 }
+    const length = Bytes.read32(Bytes.pointer(header), 4)
+    if length < 36 || length > MAX_TABLE { return 0 }
+    return firmware(address, length)
+}
+
+// The MADT ("APIC") among the tables the RSDP at `root` names: the
+// XSDT's 64-bit entries when it has one (ACPI 2.0; a firmware may give
+// no RSDT then), else the RSDT's 32-bit ones. 0 when there is none.
+fn madtOf(root: usize) -> usize {
+    const pointer = Bytes.pointer(root)
+    var list: usize = 0
+    var width: usize = 8
+    if pointer[15] >= 2 { list = acpiTable(Bytes.read64(pointer, 24)) }
+    if list == 0 {
+        list = acpiTable(Bytes.read32(pointer, 16))
+        width = 4
+    }
+    if list == 0 { return 0 }
+    const entries = Bytes.pointer(list)
+    const length = Bytes.read32(entries, 4)
+    var at: usize = 36
+    while at + width <= length {
+        const address = if width == 8 { Bytes.read64(entries, at) } else { Bytes.read32(entries, at) }
+        const table = acpiTable(address)
+        if table != 0 && same(Bytes.pointer(table), "APIC") { return table }
+        at += width
+    }
+    return 0
+}
+
+// One more processor the firmware names (its local APIC's id), unless it
+// is listed already.
+fn list(id: usize) -> void {
     var k: usize = 0
-    while k < length {
-        total += @intCast(usize, physical(at)[k])
+    while k < found.count {
+        if found.apicIds[k] == id { return }
         k += 1
     }
-    return total & 0xFF == 0
+    if found.count < MAX_LISTED {
+        found.apicIds[found.count] = id
+        found.count += 1
+    }
+}
+
+// How many processors may run the kernel: /system/settings/processors
+// (a number; 1: only the first) when the image has it, else all the
+// kernel has room for. The way to start a machine on one processor when
+// the others are in doubt.
+fn allowed() -> usize {
+    const tree = vfs.fileSystem()
+    const file = tree.resolve(vfs.Vfs.ROOT, "/system/settings/processors\x00".pointer)
+    if file < 0 { return MAX_CPUS }
+    var text: [16]u8 = undefined
+    const length = tree.read(@bitCast(usize, file), 0, &text, 16)
+    var value: usize = 0
+    var k: usize = 0
+    while k < length && text[k] >= 48 && text[k] <= 57 {
+        value = value * 10 + @intCast(usize, text[k] - 48)
+        k += 1
+    }
+    if k == 0 || value == 0 { return MAX_CPUS }
+    return if value > MAX_CPUS { MAX_CPUS } else { value }
 }
 
 fn reg(offset: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, layout.Memory.virtual(LAPIC) + offset) } }
@@ -222,38 +314,77 @@ pub fn start() -> void {
     found.running = 1
     found.timerTicks = 0
     found.mapped = false
-    const pointer = rsdp()
-    if pointer == 0 { return }
-    const rsdt = Bytes.read32(physical(pointer), 16)
-    if rsdt == 0 || rsdt >= layout.Memory.MAPPED_LIMIT { return }
-    const length = Bytes.read32(physical(rsdt), 4)
-    var madt: usize = 0
-    var at: usize = 36
-    while at + 4 <= length {
-        const table = Bytes.read32(physical(rsdt), at)
-        if table != 0 && table < layout.Memory.MAPPED_LIMIT && same(physical(table), "APIC") { madt = table }
-        at += 4
+    const out = console.out
+    const root = rsdp()
+    if root == 0 {
+        out.write("brixOS: no ACPI tables found (one processor runs)\n")
+        return
     }
-    if madt == 0 { return }
-    const madtLength = Bytes.read32(physical(madt), 4)
+    const madt = madtOf(root)
+    if madt == 0 {
+        out.write("brixOS: the ACPI tables name no processors (one runs)\n")
+        return
+    }
+    // The MADT's entries (a type, a length): a processor's local APIC
+    // (type 0: an 8-bit id) or its x2APIC (type 9: a 32-bit id), each
+    // enabled. An id of 255 or more needs the x2APIC's way of sending,
+    // which is not here: such a processor is counted and left.
+    const table = Bytes.pointer(madt)
+    const madtLength = Bytes.read32(table, 4)
     found.count = 0
-    at = 44
+    var beyond: usize = 0
+    var at: usize = 44
     while at + 2 <= madtLength {
-        const kind = physical(madt)[at]
-        const size = @intCast(usize, physical(madt)[at + 1])
-        if size < 2 { break }
-        // A processor's local APIC, enabled.
-        if kind == 0 && Bytes.read32(physical(madt), at + 4) & 1 != 0 && found.count < MAX_LISTED {
-            found.apicIds[found.count] = @intCast(usize, physical(madt)[at + 3])
-            found.count += 1
+        const kind = table[at]
+        const size = @intCast(usize, table[at + 1])
+        if size < 2 || at + size > madtLength { break }
+        if kind == 0 && size >= 8 && Bytes.read32(table, at + 4) & 1 != 0 {
+            list(@intCast(usize, table[at + 3]))
+        } else if kind == 9 && size >= 16 && Bytes.read32(table, at + 8) & 1 != 0 {
+            const id = Bytes.read32(table, at + 4)
+            if id < 255 { list(id) } else { beyond += 1 }
         }
         at += size
     }
-    if found.count < 2 || !mapApic() { return }
+    if beyond != 0 {
+        out.write("brixOS: ")
+        out.decimal(beyond)
+        out.write(" processors are reached by x2APIC only (left alone)\n")
+    }
+    if found.count < 2 {
+        if found.count == 0 { found.count = 1 }
+        return
+    }
+    const limit = allowed()
+    if limit < 2 {
+        out.write("brixOS: ")
+        out.decimal(found.count)
+        out.write(" processors; /system/settings/processors lets one run\n")
+        return
+    }
+    // The local APICs where the kernel looks for them, and answering
+    // there: a firmware that left them in x2APIC mode has none in memory
+    // (the registers read as nothing), and IPIs written there go nowhere.
+    if Bytes.read32(table, 36) != LAPIC {
+        out.write("brixOS: the local APICs are at ")
+        out.hex(Bytes.read32(table, 36))
+        out.write(", not where the kernel looks (one processor runs)\n")
+        return
+    }
+    if !mapApic() { return }
+    const version = @intCast(usize, reg(VERSION).*)
+    if version == 0 || version == 0xFFFFFFFF {
+        out.write("brixOS: the local APIC does not answer in memory (x2APIC mode: one processor runs)\n")
+        return
+    }
     measureTimer()
+    if found.timerTicks == 0 {
+        out.write("brixOS: the local APIC's timer does not count (one processor runs)\n")
+        return
+    }
     // The blocks of those that will run the kernel.
     var k: usize = 1
-    while k < found.count && k < MAX_CPUS {
+    while k < found.count && k < limit {
         if !prepare(k) { return }
         k += 1
     }
@@ -265,7 +396,7 @@ pub fn start() -> void {
     apic.at(0).* = own
     k = 0
     var others: usize = 0
-    while k < found.count && others < MAX_CPUS - 1 {
+    while k < found.count && others < limit - 1 {
         const apic = found.apicIds[k]
         if apic != own {
             others += 1

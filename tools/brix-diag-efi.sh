@@ -31,10 +31,18 @@ for p in cat ls echo mkdir sync cp rm; do
     "$compiler" --quiet $brix "projects/coreutils/$p/main.mlx" -o "$out/coreutils/$p" 2>/dev/null || true
 done
 
+# Both images run on one processor (/system/settings/processors: 1): what
+# they are for is finding out what is wrong, and the other processors are
+# one thing less to be in doubt. The build's own image starts them.
+services=$(mktemp -d)
+trap 'rm -rf -- "$services"' EXIT
+echo 1 > "$services/processors"
+
 efi="$out/BOOTX64-diag.EFI"
 mlx-out/bin/brix-image "$out/kernel" "$efi" \
     flux="$out/flux" sysinfo="$out/sysinfo" brixfs="$out/brixfs" klogsave="$out/klogsave" \
     impulse="$out/impulse" impulsectl="$out/impulsectl" \
+    "settings/processors=$services/processors" \
     settings/init/services/serial-shell.service=projects/brix/settings/init/services/serial-shell.service \
     settings/init/services/klogsave.service=projects/brix/settings/init/services/klogsave.service \
     settings/users=projects/brix/settings/users \
@@ -59,8 +67,6 @@ if [ -z "$font" ]; then
     exit 0
 fi
 "$compiler" --quiet $brix projects/console/brixos.mlx -o "$out/mlx-console"
-services=$(mktemp -d)
-trap 'rm -rf -- "$services"' EXIT
 sed '/^disabled = yes$/d' projects/brix/settings/init/services/console.service > "$services/console.service"
 console="$out/BOOTX64-console.EFI"
 mlx-out/bin/brix-image "$out/kernel" "$console" \
@@ -70,6 +76,7 @@ mlx-out/bin/brix-image "$out/kernel" "$console" \
     settings/init/services/serial-shell.service=projects/brix/settings/init/services/serial-shell.service \
     settings/init/services/klogsave.service=projects/brix/settings/init/services/klogsave.service \
     "settings/init/services/console.service=$services/console.service" \
+    "settings/processors=$services/processors" \
     settings/users=projects/brix/settings/users \
     settings/groups=projects/brix/settings/groups \
     settings/shadow=projects/brix/settings/shadow \
