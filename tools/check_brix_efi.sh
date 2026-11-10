@@ -3,7 +3,8 @@
 # that loads the Multiboot image as a Multiboot loader would: the memory
 # map, ExitBootServices, out of long mode, the image to 1 MiB) as
 # EFI/BOOT/BOOTX64.EFI on a FAT disk, started by OVMF in QEMU; the kernel
-# says itself, the shell answers.
+# says itself, the shell answers. And the display's mode: the one the
+# image names is set when the firmware has it.
 #
 #   tools/check_brix_efi.sh [compiler]
 set -euo pipefail
@@ -18,8 +19,43 @@ if ! command -v qemu-system-x86_64 > /dev/null || [[ -z $firmware ]]; then
     exit 0
 fi
 work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
+qemu_pid=
+cleanup() {
+    exec 3>&- 2> /dev/null || true
+    [[ -n "$qemu_pid" ]] && kill "$qemu_pid" 2> /dev/null || true
+    rm -rf -- "$work"
+}
+trap cleanup EXIT
 fail() { echo "FAIL $1" >&2; cat -v "$work/serial.txt" >&2 || true; exit 1; }
+
+# OVMF and the image on its FAT disk in QEMU with `$1` of memory, the
+# serial line the shell's; and its end.
+start() {
+    rm -f "$work/input"
+    mkfifo "$work/input"
+    : > "$work/serial.txt"
+    qemu-system-x86_64 -m "$1" -cpu max -display none -monitor none -no-reboot -serial stdio -net none \
+        -bios "$firmware" -drive "format=raw,file=fat:rw:$work/esp" < "$work/input" > "$work/serial.txt" 2>&1 &
+    qemu_pid=$!
+    exec 3> "$work/input"
+}
+stop() {
+    exec 3>&-
+    kill "$qemu_pid" 2> /dev/null || true
+    wait "$qemu_pid" 2> /dev/null || true
+    qemu_pid=
+}
+output() { sed 's/\x1b\[K//g' "$work/serial.txt" | tr '\r' '\n'; }
+# Waits (the firmware takes its time where the processor is emulated: up
+# to three minutes) until the output has a line matching $1.
+wait_for() {
+    local tries=0
+    while ! output | grep -aq -- "$1"; do
+        (( tries++ < 1800 )) || fail "no \"$1\" on the serial line"
+        kill -0 "$qemu_pid" 2> /dev/null || fail "QEMU ended"
+        sleep 0.1
+    done
+}
 
 mkdir -p "$work/bin" "$work/esp/EFI/BOOT"
 "$compiler" --quiet --target=x86_64-freestanding projects/brix/kernel/main.mlx -o "$work/kernel"
@@ -33,21 +69,42 @@ echo "ok   the kernel and BOOTX64.EFI build"
 # Enough RAM that it spans the memory hole below 4 GiB and reaches past
 # it: the kernel must count all of it from the EFI memory map (the loader
 # passes it through as a Multiboot map), not only the RAM below the hole.
-# (The firmware takes its time where the processor is emulated: the
-# command is typed late and the machine given long enough.)
-{
-    sleep 45
-    printf 'echo started by UEFI; uname -o\r'
-    sleep 8
-} | timeout 90 qemu-system-x86_64 -m 6G -cpu max -display none -serial stdio -net none \
-    -bios "$firmware" -drive "format=raw,file=fat:rw:$work/esp" 2>&1 | tr -d '\r' > "$work/serial.txt" || true
-for expected in '^brixOS: kernel at 0x200000' '^brixOS: display [0-9]*x[0-9]* pitch [0-9]* format [0-9]* at 0x[0-9a-f]* (the firmware.s)$' '^brixOS: [0-9]* MiB' '^started by UEFI$' '^brixOS$'; do
-    grep -aq "$expected" "$work/serial.txt" || fail "no \"$expected\" on the serial line"
-done
+start 6G
+wait_for '^brixOS: kernel at 0x200000'
+wait_for '^brixOS: display [0-9]*x[0-9]* pitch [0-9]* format [0-9]* at 0x[0-9a-f]* (the firmware.s)$'
+wait_for '^brixOS: [0-9]* MiB'
+wait_for '^root@brix:[^#]*# $'
+printf 'echo started by UEFI; uname -o\r' >&3
+wait_for '^started by UEFI$'
+wait_for '^brixOS$'
+stop
 echo "ok   OVMF starts it; the kernel learns its memory from the EFI memory map and its display from GOP, the shell answers"
 # The 6 GiB are all counted: more than the ~2.75 GiB below the hole, so
 # the map's ranges above 4 GiB were passed through and mapped.
-seen=$(grep -a '^brixOS: [0-9]* MiB' "$work/serial.txt" | head -1 | grep -ao '[0-9]*' | head -1)
+seen=$(output | grep -a '^brixOS: [0-9]* MiB' | head -1 | grep -ao '[0-9]*' | head -1)
 [[ -n $seen && $seen -ge 5000 ]] || fail "the kernel saw only ${seen:-?} MiB of 6144 (RAM above the hole was lost)"
 echo "ok   with 6 GiB the kernel counts ${seen} MiB: the RAM above the memory hole, from the EFI map"
+
+# The display's mode. The loader does not take whatever mode the firmware
+# was left in: it sets the monitor's own (its EDID's) when the firmware
+# has it, or the one the image names in settings/display. OVMF starts in
+# 1280x800; an image built for 1920x1080 comes up in that, one that names
+# a mode the firmware does not have stays in the firmware's.
+default=$(output | grep -a '^brixOS: display [0-9]*x[0-9]* ' | head -1 | grep -ao '[0-9][0-9]*x[0-9][0-9]*' | head -1)
+# The image built for the display mode $1, started; `got`: the mode the
+# kernel says it has.
+got=
+mode_with() {
+    printf '%s\n' "$1" > "$work/display"
+    "$work/brix-image" "$work/kernel" "$work/esp/EFI/BOOT/BOOTX64.EFI" "flux=$work/flux" "settings/display=$work/display" "$work/bin/"
+    start 1G
+    wait_for '^brixOS: display [0-9]*x[0-9]* '
+    stop
+    got=$(output | grep -a '^brixOS: display [0-9]*x[0-9]* ' | head -1 | grep -ao '[0-9][0-9]*x[0-9][0-9]*' | head -1)
+}
+mode_with 1920x1080
+[[ $got == 1920x1080 ]] || fail "an image built for 1920x1080 came up in $got (the firmware's own was $default)"
+mode_with 1234x567
+[[ $got == "$default" ]] || fail "an image built for a mode the firmware lacks came up in $got, not the firmware's $default"
+echo "ok   the loader sets the display mode the image names when the firmware has it (1920x1080 instead of $default), and leaves the firmware's otherwise"
 echo PASS

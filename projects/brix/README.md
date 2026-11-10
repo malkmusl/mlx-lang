@@ -314,6 +314,19 @@ with it, and a keyboard's held keys are released. What the kernel has
 to say about it afterwards is in its log (/devices/klog), not on the
 console.
 
+The picture's mode is the monitor's own where the firmware can set it:
+the loader (image/efi.mlx) reads what the monitor says of itself (its
+EDID, the firmware's EDID Active protocol: the first timing is the mode
+it prefers), finds that size among the firmware's modes and sets it,
+instead of taking the mode the firmware was left in (often a smaller
+one, or one of another shape that the monitor stretches). An image may
+name a mode itself: a file settings/display in the archive, "3840x2160"
+(that mode, when the firmware has it) or "firmware" (the firmware's,
+come what may); brix-image builds the loader for it. The kernel says
+the display it got, and when that is not the monitor's own mode
+("brixOS: the monitor's own mode is 3840x2160, which the firmware did
+not set").
+
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
 firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so
