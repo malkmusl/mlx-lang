@@ -83,7 +83,7 @@ wait_for() {
         sleep 0.1
     done
 }
-wait_for '^brixOS: display 1024x768 at 0x[0-9a-f]* (Bochs VBE)$'
+wait_for '^brixOS: display 1024x768 pitch 4096 format 1 at 0x[0-9a-f]* (Bochs VBE)$'
 wait_for '^root@brix:[^#]*# $'
 printf 'ls -l /devices/framebuffer /devices/keyboard\r' >&3
 wait_for '^crw-rw-rw- .* 29, *0 .* /devices/framebuffer$'
