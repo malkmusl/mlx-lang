@@ -1,13 +1,19 @@
-// USB on an xHCI controller (a Supermicro H11's USB 3 ports, or QEMU's
+// USB on xHCI controllers (a Supermicro H11's USB 3 ports, or QEMU's
 // `-device qemu-xhci`), for keyboards and mice on real hardware where
-// there is no PS/2 i8042. The controller is a PCI device of class
-// 0C:03:30; its registers are a memory BAR (BAR0), mapped uncached. One
-// command ring, one event ring, and per device an EP0 ring and an
-// interrupt-IN ring, all polled (no interrupt): enumeration runs at boot,
-// and the HID interrupt endpoints are drained on the timer tick. Boot
-// protocol only: a keyboard's reports become Set-1 scancodes for
-// keyboard.mlx, a mouse's become PS/2 packets for mouse.mlx, so the
-// console and the compositor read them as before.
+// there is no PS/2 i8042. A controller is a PCI device of class 0C:03:30;
+// its registers are a memory BAR (BAR0), mapped uncached. Every
+// controller is driven (a board has several, and which one the keyboard
+// is on is not to be known). One command ring, one event ring, and per
+// device an EP0 ring and an interrupt-IN ring, all polled (no interrupt):
+// enumeration runs at boot, and the HID interrupt endpoints are drained
+// on the timer tick. A hub's ports are powered, reset and looked at as
+// the controller's own are (a keyboard behind a monitor's hub, a front
+// panel's or a board's management controller's virtual one), down to
+// five hubs deep, a low- or full-speed device behind a high-speed hub by
+// that hub's transaction translator. Boot protocol only: a keyboard's
+// reports become Set-1 scancodes for keyboard.mlx, a mouse's become PS/2
+// packets for mouse.mlx, so the console and the compositor read them as
+// before. What is plugged in after the boot is not seen.
 const layout = @import("./../layout.mlx")
 const memory = @import("./memory.mlx")
 const Pci = @import("./pci.mlx").Pci
@@ -28,6 +34,7 @@ const RESET_MS: usize = 2000
 const HANDOFF_MS: usize = 1000
 const PORT_MS: usize = 500
 const EVENT_MS: usize = 3000
+const HUB_PORT_MS: usize = 500
 // The register block (the capability, operational, runtime and doorbell
 // registers: BAR0, 64 KiB), what is mapped.
 const REGISTERS: usize = 0x10000
@@ -41,6 +48,7 @@ const TRB_LINK: usize = 6
 const TRB_ENABLE_SLOT: usize = 9
 const TRB_ADDRESS_DEVICE: usize = 11
 const TRB_CONFIGURE_ENDPOINT: usize = 12
+const TRB_EVALUATE_CONTEXT: usize = 13
 // Event TRB types.
 const EV_TRANSFER: usize = 32
 const EV_COMMAND_COMPLETE: usize = 33
@@ -93,6 +101,15 @@ const Ring = struct {
 }
 
 pub const MAX_HID: usize = 4
+// The controllers driven, and how many hubs deep a device may be (what a
+// route string holds).
+pub const MAX_CONTROLLERS: usize = 4
+const MAX_DEPTH: usize = 5
+// Device speeds as the controller names them.
+const SPEED_FULL: usize = 1
+const SPEED_LOW: usize = 2
+const SPEED_HIGH: usize = 3
+const SPEED_SUPER: usize = 4
 
 const Hid = struct {
     present: bool
@@ -312,33 +329,100 @@ pub const Xhci = struct {
                 const slot = (event[3] >> 24) & 0xFF
                 return (slot << 8) | code
             }
+            // (A report of a keyboard or mouse brought up before: taken,
+            // or its endpoint would never be armed again.)
+            self.dispatch(&event)
         }
         return 0
     }
+
+    // An event that is a report of one of the HID devices: decoded, the
+    // endpoint armed for the next. Any other event is none of ours here.
+    fn dispatch(self: *Self, event: *const [4]usize) -> void {
+        if (event.*[3] >> 10) & 0x3F != EV_TRANSFER { return }
+        const slot = (event.*[3] >> 24) & 0xFF
+        const dci = (event.*[3] >> 16) & 0x1F
+        var k: usize = 0
+        while k < self.*.hidCount {
+            const hid = &self.*.hids[k]
+            if hid.*.present && hid.*.slot == slot && hid.*.endpoint == dci {
+                const code = (event.*[2] >> 24) & 0xFF
+                if code == 1 || code == 13 {
+                    if hid.*.kind == 1 { decodeKeyboard(hid) } else { decodeMouse(hid) }
+                }
+                postReport(self, hid)
+            }
+            k += 1
+        }
+    }
 }
 
-var controller: Xhci = undefined // (per run)
+var controllers: [MAX_CONTROLLERS]Xhci = undefined // (per run)
+var controllerCount: usize = 0 // (per run)
 
-pub fn device() -> *Xhci { return &controller }
+// Where a device is: the controller's port its tree hangs on, the ports
+// of the hubs on the way (the route string: four bits a hub, the first
+// one lowest), how many hubs that is, its speed, and for a low- or
+// full-speed device behind a high-speed hub that hub's slot and port
+// (its transaction translator; 0: none).
+const Place = struct {
+    rootPort: usize
+    route: usize
+    depth: usize
+    speed: usize
+    ttSlot: usize
+    ttPort: usize
+}
+
+// "usb: port 5.2" (the root port, then each hub's port).
+fn sayPlace(place: Place) -> void {
+    console.out.write("usb: port ")
+    console.out.decimal(place.rootPort)
+    var tier: usize = 0
+    while tier < place.depth {
+        console.out.write(".")
+        console.out.decimal((place.route >> @intCast(u6, tier * 4)) & 0xF)
+        tier += 1
+    }
+}
+
+// "usb: port N: TEXT" (and the controller's completion code, when one
+// says why): where a device's bring-up ended.
+fn gaveUp(place: Place, text: []const u8, code: usize) -> void {
+    sayPlace(place)
+    console.out.write(": ")
+    console.out.write(text)
+    if code != 0 {
+        console.out.write(" (completion code ")
+        console.out.decimal(code)
+        console.out.write(")")
+    }
+    console.out.write("\n")
+}
 
 // A control transfer on a device's EP0 ring; whether it finished without
-// error. `buffer` is physical (used when wLength > 0).
-fn controlTransfer(self: *Xhci, hidRing: *Ring, slot: usize, requestType: usize, request: usize, value: usize, index: usize, length: usize, buffer: usize, dirIn: bool) -> bool {
+// error. `buffer` is physical (used when wLength > 0). It is over with
+// its status stage's event (a short data stage has one of its own
+// before); events of other devices on the way are handled as they are.
+fn controlTransfer(self: *Xhci, ring: *Ring, slot: usize, requestType: usize, request: usize, value: usize, index: usize, length: usize, buffer: usize, dirIn: bool) -> bool {
     const setup = requestType | (request << 8) | (value << 16) | (index << 32) | (length << 48)
     const trt: usize = if length == 0 { 0 } else if dirIn { 3 } else { 2 }
-    _ = hidRing.push(setup, 8, (trt << 16) | (TRB_SETUP << 10) | TRB_IDT)
+    _ = ring.push(setup, 8, (trt << 16) | (TRB_SETUP << 10) | TRB_IDT)
     if length > 0 {
         const dir: usize = if dirIn { 1 } else { 0 }
-        _ = hidRing.push(buffer, length, (dir << 16) | (TRB_DATA << 10) | TRB_ISP)
+        _ = ring.push(buffer, length, (dir << 16) | (TRB_DATA << 10) | TRB_ISP)
     }
     const statusDir: usize = if dirIn && length > 0 { 0 } else { 1 }
-    _ = hidRing.push(0, 0, (statusDir << 16) | (TRB_STATUS << 10) | TRB_IOC)
+    const last = ring.push(0, 0, (statusDir << 16) | (TRB_STATUS << 10) | TRB_IOC)
     self.doorbell(slot).* = 1
     var event: [4]usize = undefined
     while self.nextEvent(&event) {
-        if (event[3] >> 10) & 0x3F == EV_TRANSFER {
+        if (event[3] >> 10) & 0x3F == EV_TRANSFER && (event[3] >> 24) & 0xFF == slot && (event[3] >> 16) & 0x1F == 1 {
             const code = (event[2] >> 24) & 0xFF
-            return code == 1 || code == 13
+            if code != 1 && code != 13 { return false }
+            if (event[0] | (event[1] << 32)) == last { return true }
+        } else {
+            self.dispatch(&event)
         }
     }
     return false
@@ -350,9 +434,33 @@ fn contextAt(base: usize, entry: usize, size: usize) -> [*]u8 {
 }
 
 fn maxPacket0(speed: usize) -> usize {
-    if speed == 4 { return 512 }
-    if speed == 3 { return 64 }
+    if speed == SPEED_SUPER { return 512 }
+    if speed == SPEED_HIGH { return 64 }
     return 8
+}
+
+// An interrupt endpoint's interval as the controller counts it (the
+// exponent n of 2^n * 125 microseconds): a high- or super-speed device
+// gives n + 1 in its descriptor, a low- or full-speed one milliseconds.
+fn intervalOf(speed: usize, described: usize) -> usize {
+    if speed == SPEED_HIGH || speed == SPEED_SUPER {
+        if described == 0 { return 0 }
+        return if described > 16 { 15 } else { described - 1 }
+    }
+    const microframes = if described == 0 { 8 } else { described * 8 }
+    var n: usize = 3
+    while n < 10 && (@intCast(usize, 2) << @intCast(u6, n)) <= microframes { n += 1 }
+    return n
+}
+
+// A device's slot context in the input context at `inctx`: where it is,
+// `entries` context entries, and for a hub its ports and its translator's
+// think time (`hubPorts` 0: no hub).
+fn slotContext(inctx: usize, cs: usize, place: Place, entries: usize, hubPorts: usize, thinkTime: usize) -> void {
+    const hub: usize = if hubPorts != 0 { 1 << 26 } else { 0 }
+    Bytes.write32(contextAt(inctx, 1, cs), 0, (entries << 27) | hub | (place.speed << 20) | (place.route & 0xFFFFF))
+    Bytes.write32(contextAt(inctx, 1, cs), 4, (hubPorts << 24) | (place.rootPort << 16))
+    Bytes.write32(contextAt(inctx, 1, cs), 8, (thinkTime << 16) | (place.ttPort << 8) | place.ttSlot)
 }
 
 // Posts a Normal TRB on a HID device's interrupt ring so the controller
@@ -365,13 +473,10 @@ fn postReport(self: *Xhci, hid: *Hid) -> void {
 // Brings up every connected port's device, keeping the HID boot keyboards
 // and mice.
 fn enumerate(self: *Xhci) -> void {
-    fillScan()
-    const cs = self.*.contextSize
-    const frames = memory.allFrames()
     console.out.write("usb: xHCI ")
     console.out.decimal(self.*.maxPorts)
     console.out.write(" ports, context size ")
-    console.out.decimal(cs)
+    console.out.decimal(self.*.contextSize)
     console.out.write("\n")
     var port: usize = 1
     while port <= self.*.maxPorts && self.*.hidCount < MAX_HID {
@@ -405,35 +510,25 @@ fn enumerate(self: *Xhci) -> void {
         const speed = @intCast(usize, (after >> 10) & 0xF)
         // Clear the reset-change bit.
         self.portReg(port).* = (after & @intCast(u32, 0xFFFFFFFF ^ 0x00FE0002)) | 0x00200000
-        setupDevice(self, port, speed, cs, frames)
+        setupDevice(self, Place.{ .rootPort = port, .route = 0, .depth = 0, .speed = speed, .ttSlot = 0, .ttPort = 0 })
         port += 1
     }
 }
 
-// "usb: port N: TEXT" (and the controller's completion code, when one
-// says why): where a device's bring-up ended.
-fn gaveUp(port: usize, text: []const u8, code: usize) -> void {
-    console.out.write("usb: port ")
-    console.out.decimal(port)
-    console.out.write(": ")
-    console.out.write(text)
-    if code != 0 {
-        console.out.write(" (completion code ")
-        console.out.decimal(code)
-        console.out.write(")")
-    }
-    console.out.write("\n")
-}
-
-fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memory.Frames) -> void {
+// The device at `place` given a slot and an address, its descriptors
+// read: a hub's ports looked at in turn (setupHub), a boot keyboard's or
+// mouse's interrupt endpoints configured and their reports asked for.
+fn setupDevice(self: *Xhci, place: Place) -> void {
+    const cs = self.*.contextSize
+    const frames = memory.allFrames()
+    const speed = place.speed
     const res = self.runCommand(0, TRB_ENABLE_SLOT << 10)
     if res & 0xFF != 1 {
-        gaveUp(port, "no slot for it", res & 0xFF)
+        gaveUp(place, "no slot for it", res & 0xFF)
         return
     }
     const slot = (res >> 8) & 0xFF
-    console.out.write("usb: port ")
-    console.out.decimal(port)
+    sayPlace(place)
     console.out.write(" -> slot ")
     console.out.decimal(slot)
     console.out.write(" speed ")
@@ -443,44 +538,60 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
     const inctx = frames.allocate()
     const ep0base = frames.allocate()
     if devctx == 0 || inctx == 0 || ep0base == 0 { return }
-    Bytes.zeroWords(layout.Memory.virtual(devctx), Page.SIZE / 8)
-    Bytes.zeroWords(layout.Memory.virtual(inctx), Page.SIZE / 8)
     Bytes.write64(Bytes.pointer(layout.Memory.virtual(self.*.dcbaa)), slot * 8, devctx)
     var ep0: Ring = undefined
     ep0.setup(ep0base)
     // Input control context: add the slot and EP0.
     Bytes.write32(contextAt(inctx, 0, cs), 4, 0x3)
-    // Slot context: one context entry, the speed, the root hub port.
-    Bytes.write32(contextAt(inctx, 1, cs), 0, (1 << 27) | (speed << 20))
-    Bytes.write32(contextAt(inctx, 1, cs), 4, port << 16)
+    slotContext(inctx, cs, place, 1, 0, 0)
     // EP0 context: control, its max packet, three retries, its ring.
-    const mp0 = maxPacket0(speed)
-    Bytes.write32(contextAt(inctx, 2, cs), 4, (mp0 << 16) | (4 << 3) | (3 << 1))
+    Bytes.write32(contextAt(inctx, 2, cs), 4, (maxPacket0(speed) << 16) | (4 << 3) | (3 << 1))
     Bytes.write64(contextAt(inctx, 2, cs), 8, ep0.base | 1)
     const addressed = self.runCommand(inctx, (TRB_ADDRESS_DEVICE << 10) | (slot << 24))
     if addressed & 0xFF != 1 {
-        gaveUp(port, "the device takes no address", addressed & 0xFF)
+        gaveUp(place, "the device takes no address", addressed & 0xFF)
         return
     }
     const buffer = frames.allocate()
     if buffer == 0 { return }
+    const data = Bytes.pointer(layout.Memory.virtual(buffer))
+    // A full-speed device's control endpoint takes packets of 8, 16, 32
+    // or 64 bytes: its descriptor's first eight say which, and the
+    // controller is told before more is asked than fits in eight.
+    if speed == SPEED_FULL {
+        if !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0100, 0, 8, buffer, true) {
+            gaveUp(place, "the device does not describe itself", 0)
+            return
+        }
+        const packet = @intCast(usize, data[7])
+        if packet == 16 || packet == 32 || packet == 64 {
+            Bytes.zeroWords(layout.Memory.virtual(inctx), Page.SIZE)
+            Bytes.write32(contextAt(inctx, 0, cs), 4, 0x2)
+            Bytes.write32(contextAt(inctx, 2, cs), 4, (packet << 16) | (4 << 3) | (3 << 1))
+            const evaluated = self.runCommand(inctx, (TRB_EVALUATE_CONTEXT << 10) | (slot << 24))
+            if evaluated & 0xFF != 1 {
+                gaveUp(place, "its control endpoint's packet size is not taken", evaluated & 0xFF)
+                return
+            }
+        }
+    }
     // The configuration descriptor (its total length, then the whole).
     if !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, 9, buffer, true) {
-        gaveUp(port, "the device does not describe itself", 0)
+        gaveUp(place, "the device does not describe its configuration", 0)
         return
     }
-    var total = Bytes.read16(Bytes.pointer(layout.Memory.virtual(buffer)), 2)
+    var total = Bytes.read16(data, 2)
     if total > Page.SIZE { total = Page.SIZE }
     if total < 9 || !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, total, buffer, true) {
-        gaveUp(port, "the device does not describe its configuration", 0)
+        gaveUp(place, "the device does not describe its configuration", 0)
         return
     }
     // Walk the descriptors, collecting every boot-HID interface (keyboard
     // protocol 1, mouse protocol 2) with its own interrupt-IN endpoint. A
     // device can carry more than one (a keyboard with a mouse-emulation
     // interface, a combined receiver), so each interface is bound to its
-    // own endpoint -- not the first endpoint to the last interface.
-    const data = Bytes.pointer(layout.Memory.virtual(buffer))
+    // own endpoint -- not the first endpoint to the last interface. A
+    // hub says so by its interface's class.
     const configValue = @intCast(usize, data[5])
     var ifNum: [4]usize = undefined
     var ifProto: [4]usize = undefined
@@ -491,16 +602,18 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
     var curClass: usize = 0
     var curProto: usize = 0
     var curHasEp = true
+    var hub = false
     var offset: usize = 0
     while offset + 2 <= total {
         const length = @intCast(usize, data[offset])
-        if length == 0 { break }
+        if length < 2 || offset + length > total { break }
         const kind = data[offset + 1]
-        if kind == 4 {
+        if kind == 4 && length >= 9 {
             curIf = @intCast(usize, data[offset + 2])
             curClass = @intCast(usize, data[offset + 5])
             curProto = @intCast(usize, data[offset + 7])
             curHasEp = false
+            if curClass == 9 { hub = true }
             console.out.write("usb:   interface ")
             console.out.decimal(curIf)
             console.out.write(" class ")
@@ -510,7 +623,7 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
             console.out.write(" proto ")
             console.out.decimal(curProto)
             console.out.write("\n")
-        } else if kind == 5 {
+        } else if kind == 5 && length >= 7 {
             const addr = @intCast(usize, data[offset + 2])
             const attr = @intCast(usize, data[offset + 3])
             console.out.write("usb:     endpoint 0x")
@@ -518,7 +631,7 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
             console.out.write(" attr 0x")
             console.out.hexByte(attr)
             console.out.write("\n")
-            if curClass == 3 && (curProto == 1 || curProto == 2) && addr & 0x80 != 0 && attr & 0x3 == 3 && !curHasEp && count < 4 {
+            if curClass == 3 && (curProto == 1 || curProto == 2) && addr & 0x80 != 0 && attr & 0x3 == 3 && addr & 0xF != 0 && !curHasEp && count < 4 {
                 ifNum[count] = curIf
                 ifProto[count] = curProto
                 ifEp[count] = addr & 0xF
@@ -529,6 +642,10 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
         }
         offset += length
     }
+    if hub {
+        setupHub(self, place, slot, &ep0, buffer, inctx, configValue)
+        return
+    }
     if count == 0 {
         console.out.write("usb: slot ")
         console.out.decimal(slot)
@@ -536,7 +653,7 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
         return
     }
     if !controlTransfer(self, &ep0, slot, 0x00, 9, configValue, 0, 0, 0, false) { // SET_CONFIGURATION
-        gaveUp(port, "the device does not take its configuration", 0)
+        gaveUp(place, "the device does not take its configuration", 0)
         return
     }
     // Configure each collected interface's interrupt endpoint and register
@@ -551,21 +668,20 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
         if ringBase == 0 || report == 0 { break }
         var intring: Ring = undefined
         intring.setup(ringBase)
-        var intervalField = ifInt[k]
-        if intervalField == 0 { intervalField = 1 }
-        Bytes.zeroWords(layout.Memory.virtual(inctx), Page.SIZE / 8)
+        Bytes.zeroWords(layout.Memory.virtual(inctx), Page.SIZE)
         Bytes.write32(contextAt(inctx, 0, cs), 4, 0x1 | (@intCast(usize, 1) << @intCast(u6, dci)))
-        Bytes.write32(contextAt(inctx, 1, cs), 0, (entries << 27) | (speed << 20))
-        Bytes.write32(contextAt(inctx, 1, cs), 4, port << 16)
-        Bytes.write32(contextAt(inctx, dci + 1, cs), 0, (intervalField & 0xFF) << 16)
+        slotContext(inctx, cs, place, entries, 0, 0)
+        Bytes.write32(contextAt(inctx, dci + 1, cs), 0, intervalOf(speed, ifInt[k]) << 16)
         Bytes.write32(contextAt(inctx, dci + 1, cs), 4, (8 << 16) | (7 << 3) | (3 << 1))
         Bytes.write64(contextAt(inctx, dci + 1, cs), 8, intring.base | 1)
-        Bytes.write32(contextAt(inctx, dci + 1, cs), 16, 8)
+        Bytes.write32(contextAt(inctx, dci + 1, cs), 16, (8 << 16) | 8)
         const configured = self.runCommand(inctx, (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24))
         if configured & 0xFF != 1 {
             console.out.write("usb: configure-endpoint failed, dci ")
             console.out.decimal(dci)
-            console.out.write("\n")
+            console.out.write(" (completion code ")
+            console.out.decimal(configured & 0xFF)
+            console.out.write(")\n")
             k += 1
             continue
         }
@@ -600,27 +716,121 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
     }
 }
 
-// Drains the event ring: each HID report decoded and fed to keyboard.mlx
+// A hub port's status and change words (GET_STATUS: four bytes); all
+// ones when the hub does not answer.
+fn hubPortStatus(self: *Xhci, ep0: *Ring, slot: usize, buffer: usize, port: usize) -> usize {
+    if !controlTransfer(self, ep0, slot, 0xA3, 0, 0, port, 4, buffer, true) { return 0xFFFFFFFF }
+    return Bytes.read32(Bytes.pointer(layout.Memory.virtual(buffer)), 0)
+}
+
+// The hub in `slot` (at `place`, configured here): its ports powered,
+// each one with a device reset and that device brought up in turn
+// (setupDevice, one hub deeper). A USB 3 hub's own ports carry no
+// keyboard or mouse (those are on the USB 2 hub it comes with, which
+// the controller shows on a port of its own).
+fn setupHub(self: *Xhci, place: Place, slot: usize, ep0: *Ring, buffer: usize, inctx: usize, configValue: usize) -> void {
+    const cs = self.*.contextSize
+    if place.speed == SPEED_SUPER {
+        gaveUp(place, "a USB 3 hub (keyboards and mice are on its USB 2 side)", 0)
+        return
+    }
+    if place.depth >= MAX_DEPTH {
+        gaveUp(place, "a hub too many hubs deep", 0)
+        return
+    }
+    if !controlTransfer(self, ep0, slot, 0x00, 9, configValue, 0, 0, 0, false) {
+        gaveUp(place, "the hub does not take its configuration", 0)
+        return
+    }
+    // The hub descriptor: how many ports, its translator's think time,
+    // how long its ports take to have power.
+    if !controlTransfer(self, ep0, slot, 0xA0, 6, 0x2900, 0, 8, buffer, true) {
+        gaveUp(place, "the hub does not describe itself", 0)
+        return
+    }
+    const data = Bytes.pointer(layout.Memory.virtual(buffer))
+    var ports = @intCast(usize, data[2])
+    // (A route string names ports 1 to 15.)
+    if ports > 15 { ports = 15 }
+    const thinkTime: usize = if place.speed == SPEED_HIGH { (Bytes.read16(data, 3) >> 5) & 3 } else { 0 }
+    var powerMs = @intCast(usize, data[5]) * 2
+    if powerMs < 100 { powerMs = 100 }
+    // The controller told that the slot is a hub's (it routes what is
+    // behind by it): the slot context alone, by Configure Endpoint.
+    Bytes.zeroWords(layout.Memory.virtual(inctx), Page.SIZE)
+    Bytes.write32(contextAt(inctx, 0, cs), 4, 0x1)
+    slotContext(inctx, cs, place, 1, ports, thinkTime)
+    const told = self.runCommand(inctx, (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24))
+    if told & 0xFF != 1 {
+        gaveUp(place, "the controller does not take the slot as a hub's", told & 0xFF)
+        return
+    }
+    sayPlace(place)
+    console.out.write(": a hub of ")
+    console.out.decimal(ports)
+    console.out.write(" ports\n")
+    var port: usize = 1
+    while port <= ports {
+        _ = controlTransfer(self, ep0, slot, 0x23, 3, 8, port, 0, 0, false) // SET_FEATURE PORT_POWER
+        port += 1
+    }
+    clock.pause(powerMs * 1000)
+    port = 1
+    while port <= ports && self.*.hidCount < MAX_HID {
+        var status = hubPortStatus(self, ep0, slot, buffer, port)
+        if status == 0xFFFFFFFF || status & 1 == 0 {
+            port += 1
+            continue
+        }
+        // Reset (the port enables by it), waited for, its change bits
+        // cleared.
+        _ = controlTransfer(self, ep0, slot, 0x23, 3, 4, port, 0, 0, false) // SET_FEATURE PORT_RESET
+        const deadline = Deadline.after(HUB_PORT_MS)
+        while true {
+            clock.pause(10000)
+            status = hubPortStatus(self, ep0, slot, buffer, port)
+            if status != 0xFFFFFFFF && status & 0x10 == 0 && status & 0x2 != 0 { break }
+            if deadline.passed() { break }
+        }
+        _ = controlTransfer(self, ep0, slot, 0x23, 1, 20, port, 0, 0, false) // CLEAR_FEATURE C_PORT_RESET
+        _ = controlTransfer(self, ep0, slot, 0x23, 1, 16, port, 0, 0, false) // CLEAR_FEATURE C_PORT_CONNECTION
+        const child = Place.{
+            .rootPort = place.rootPort,
+            .route = place.route | (port << @intCast(u6, place.depth * 4)),
+            .depth = place.depth + 1,
+            // (Bit 9: a low-speed device; bit 10: a high-speed one.)
+            .speed = if status & 0x200 != 0 { SPEED_LOW } else if status & 0x400 != 0 { SPEED_HIGH } else { SPEED_FULL },
+            .ttSlot = 0,
+            .ttPort = 0
+        }
+        if status == 0xFFFFFFFF || status & 0x2 == 0 {
+            gaveUp(child, "does not enable after its reset", 0)
+            port += 1
+            continue
+        }
+        // (The device's time to recover from the reset.)
+        clock.pause(20000)
+        var placed = child
+        if child.speed != SPEED_HIGH {
+            // Low or full speed: by this hub's translator when it is a
+            // high-speed hub, else by the one this hub itself goes by.
+            placed.ttSlot = if place.speed == SPEED_HIGH { slot } else { place.ttSlot }
+            placed.ttPort = if place.speed == SPEED_HIGH { port } else { place.ttPort }
+        }
+        setupDevice(self, placed)
+        port += 1
+    }
+}
+
+// Drains the event rings: each HID report decoded and fed to keyboard.mlx
 // or mouse.mlx, the endpoint re-armed. Called from the timer tick.
 pub fn poll() -> void {
-    if !controller.present { return }
-    var event: [4]usize = undefined
-    while controller.pollEvent(&event) {
-        if (event[3] >> 10) & 0x3F != EV_TRANSFER { continue }
-        const slot = (event[3] >> 24) & 0xFF
-        const dci = (event[3] >> 16) & 0x1F
-        var k: usize = 0
-        while k < controller.hidCount {
-            const hid = &controller.hids[k]
-            if hid.*.present && hid.*.slot == slot && hid.*.endpoint == dci {
-                const code = (event[2] >> 24) & 0xFF
-                if code == 1 || code == 13 {
-                    if hid.*.kind == 1 { decodeKeyboard(hid) } else { decodeMouse(hid) }
-                }
-                postReport(&controller, hid)
-            }
-            k += 1
-        }
+    var c: usize = 0
+    while c < controllerCount {
+        const controller = &controllers[c]
+        var event: [4]usize = undefined
+        while controller.pollEvent(&event) { controller.dispatch(&event) }
+        c += 1
     }
 }
 
@@ -808,35 +1018,41 @@ fn fillScan() -> void {
     scanReady = true
 }
 
-// The first xHCI controller, brought up, its ports enumerated; whether
-// there is one. (Enumeration in a separate step below.)
+// Every xHCI controller (MAX_CONTROLLERS at most) brought up, its ports
+// enumerated; whether there is one.
 pub fn probe() -> bool {
-    controller.present = false
-    controller.hidCount = 0
-    const address = Pci.findClass(0x0C0330, 0xFFFFFF, 0)
-    if address == Pci.NONE {
-        console.out.write("usb: no xHCI controller\n")
-        return false
+    controllerCount = 0
+    fillScan()
+    var n: usize = 0
+    while controllerCount < MAX_CONTROLLERS {
+        const address = Pci.findClass(0x0C0330, 0xFFFFFF, n)
+        if address == Pci.NONE { break }
+        n += 1
+        const controller = &controllers[controllerCount]
+        controller.*.present = false
+        controller.*.hidCount = 0
+        Pci.enableMemory(address)
+        const base = Pci.memBase(address, 0)
+        console.out.write("usb: xHCI controller ")
+        console.out.hexByte((address >> 16) & 0xFF)
+        console.out.write(":")
+        console.out.hexByte((address >> 11) & 0x1F)
+        console.out.write(".")
+        console.out.decimal((address >> 8) & 0x7)
+        console.out.write(", registers at ")
+        console.out.hex(base)
+        console.out.write("\n")
+        if base == 0 { continue }
+        controller.*.regs = memory.Device.map(base, REGISTERS, memory.Device.UNCACHED)
+        if controller.*.regs == 0 {
+            console.out.write("usb: no room to map its registers\n")
+            continue
+        }
+        if !controller.start() { continue }
+        controller.*.present = true
+        controllerCount += 1
+        enumerate(controller)
     }
-    Pci.enableMemory(address)
-    const base = Pci.memBase(address, 0)
-    console.out.write("usb: xHCI controller ")
-    console.out.hexByte((address >> 16) & 0xFF)
-    console.out.write(":")
-    console.out.hexByte((address >> 11) & 0x1F)
-    console.out.write(".")
-    console.out.decimal((address >> 8) & 0x7)
-    console.out.write(", registers at ")
-    console.out.hex(base)
-    console.out.write("\n")
-    if base == 0 { return false }
-    controller.regs = memory.Device.map(base, REGISTERS, memory.Device.UNCACHED)
-    if controller.regs == 0 {
-        console.out.write("usb: no room to map its registers\n")
-        return false
-    }
-    if !controller.start() { return false }
-    controller.present = true
-    enumerate(&controller)
-    return true
+    if n == 0 { console.out.write("usb: no xHCI controller\n") }
+    return controllerCount > 0
 }
