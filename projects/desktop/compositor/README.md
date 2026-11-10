@@ -311,8 +311,12 @@ macOS: maximized windows start below it and windows placed under it are
 moved down. It is translucent over a blur and shows a mark and the name
 of the active window's app on the left (its desktop entry's name, else
 its app id or title; a click on the mark opens the session menu: the
-settings, Lock Screen and Log Out, which asks first; see Locking and
-logging out), the workspaces in the middle (see Snapping,
+settings, Lock Screen, Log Out, Restart and Shut Down, the last three
+asking first; see Locking and logging out; a restart or a shut down is a
+log out after which the compositor asks the login service to end the
+system, which it does for the user who holds the seat:
+[`../login/README.md`](../login/README.md)), the workspaces in the middle
+(see Snapping,
 workspaces and tiling), and the date and time on the right ("So. 27. Sep.
 16:05" when `LC_ALL`, `LC_TIME` or `LANG` is German, else "Sun 27 Sep
 16:05"). The time zone comes from `$TZ` (a zone name looked up in

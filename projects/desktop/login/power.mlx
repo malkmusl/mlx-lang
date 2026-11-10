@@ -1,0 +1,271 @@
+// Restarting the machine and shutting it down, asked of the login service
+// by the desktop: the session's compositor (the top bar's session menu) or
+// the greeter (projects/desktop/shared/system_end.mlx is their side).
+//
+// The methods (org.mlx.Login, path /org/mlx/Login; MLXIPC's own format,
+// or D-Bus through the bus's bridge):
+//
+//     PowerOff() -> b     the machine is shut down
+//     Restart() -> b      the machine is restarted
+//
+// Who may. The login service asks the bus two things about the caller,
+// and the bus answers both from what the kernel says of the connection
+// (its program and its user: channel_peer on brixOS, the socket's
+// credentials on Linux), never from what the caller says of itself:
+//
+//   1. org.mlx.IPC.Check(caller, "login.power"): the bus's policy for the
+//      app (projects/desktop/ipc/policy.mlx).
+//   2. org.freedesktop.DBus.GetConnectionUnixUser(caller): the caller's
+//      user must be the one who holds the seat, which is the person
+//      logged in, or the greeter's user while nobody is.
+//
+// A program of another user, and any program whose user has no session on
+// the seat, gets AccessDenied and nothing happens. Where no init listens
+// (a system another init runs) every caller gets an error: no session is
+// ended for a request nobody takes. An allowed call is answered true;
+// main.mlx then ends the seat's compositor (which leaves its last frame
+// for the shutdown's screen) and asks the init (`request`: impulse's
+// control, which only the system may write) to reboot or to power off.
+// The init stops the services and has the kernel end the machine.
+const std = @import("std")
+const ipc = @import("std.ipc")
+const system_end = @import("../shared/system_end.mlx")
+const init_request = @import("../../init/request.mlx")
+
+// What `message` made of a message: not this file's; taken care of; or an
+// allowed call, the system to be ended that way.
+pub const NOT_MINE: u8 = 0
+pub const HANDLED: u8 = 1
+pub const RESTART: u8 = 2
+pub const POWER_OFF: u8 = 3
+
+const BUS_NAME: []const u8 = "org.freedesktop.DBus"
+const BUS_PATH: []const u8 = "/org/freedesktop/DBus"
+const IPC_PATH: []const u8 = "/org/mlx/IPC"
+const IPC_INTERFACE: []const u8 = "org.mlx.IPC"
+const PERMISSION: []const u8 = "login.power"
+const DENIED: []const u8 = "org.freedesktop.DBus.Error.AccessDenied"
+
+const PENDING_MOST: usize = 4
+const SENDER_MOST: usize = 128
+// The question a call waits for.
+const ASKED_PERMISSION: u8 = 1
+const ASKED_USER: u8 = 2
+
+// A call that waits for the bus's word about its caller.
+const Pending = struct {
+    used: bool
+    // The question put to the bus (its serial), and which it is.
+    question: u32
+    asked: u8
+    kind: u8
+    // The caller's call, for the answer.
+    serial: u32
+    flags: u8
+    sender: [SENDER_MOST]u8
+    senderLength: usize
+}
+
+var pending: [PENDING_MOST]Pending = undefined // (per run)
+var prepared = false // (per run)
+
+fn prepare() -> void {
+    if prepared { return }
+    prepared = true
+    var index: usize = 0
+    while index < PENDING_MOST {
+        pending[index].used = false
+        index += 1
+    }
+}
+
+fn senderOf(waiting: *const Pending) -> []const u8 {
+    const bytes: [*]const u8 = &waiting.*.sender
+    return bytes[0..waiting.*.senderLength]
+}
+
+fn say(verbose: bool, text: []const u8) -> void {
+    if verbose { _ = std.io.writeAll(std.io.stdout(), text) }
+}
+
+fn sayNumber(verbose: bool, value: usize) -> void {
+    var digits: [24]u8 = undefined
+    const bytes: [*]u8 = &digits
+    say(verbose, bytes[0..std.text.appendUnsigned(bytes, 0, 24, value)])
+}
+
+fn what(kind: u8) -> []const u8 { return if kind == RESTART { "restart" } else { "power off" } }
+
+// The caller's call again, as far as an answer needs it.
+fn callOf(waiting: *const Pending) -> ipc.Message {
+    var call = ipc.newMessage(ipc.CALL, waiting.*.serial)
+    call.flags = waiting.*.flags
+    call.sender = senderOf(waiting)
+    return call
+}
+
+fn refuse(client: *ipc.Client, waiting: *Pending, why: []const u8) -> void {
+    const call = callOf(waiting)
+    _ = ipc.replyError(client, &call, DENIED, why)
+    waiting.*.used = false
+}
+
+// A question about the caller to the bus (`member` of `interface` at
+// `path`, the caller's name and, with one, `second`); its serial, 0 when
+// it could not be sent.
+fn askBus(client: *ipc.Client, path: []const u8, interface: []const u8, member: []const u8, caller: []const u8, second: []const u8) -> u32 {
+    var body: [320]u8 = undefined
+    const bytes: [*]u8 = &body
+    var writing: ipc.Writer = undefined
+    ipc.begin(&writing, bytes, 320)
+    ipc.putString(&writing, caller)
+    if second.length > 0 { ipc.putString(&writing, second) }
+    if writing.failed { return 0 }
+    return ipc.call(client, BUS_NAME, path, interface, member, if second.length > 0 { "ss" } else { "s" }, bytes, writing.length)
+}
+
+// A call of PowerOff or Restart: the bus is asked whether the app may.
+fn called(client: *ipc.Client, call: *const ipc.Message, kind: u8) -> void {
+    if call.*.signature.length != 0 || call.*.sender.length == 0 || call.*.sender.length > SENDER_MOST {
+        _ = ipc.replyError(client, call, "org.freedesktop.DBus.Error.InvalidArgs", "PowerOff and Restart take no arguments")
+        return
+    }
+    var slot: usize = 0
+    while slot < PENDING_MOST && pending[slot].used { slot += 1 }
+    if slot == PENDING_MOST {
+        _ = ipc.replyError(client, call, "org.mlx.Login.Error.Busy", "too many requests wait for the bus")
+        return
+    }
+    const waiting = &pending[slot]
+    waiting.*.kind = kind
+    waiting.*.serial = call.*.serial
+    waiting.*.flags = call.*.flags
+    const sender: [*]u8 = &waiting.*.sender
+    waiting.*.senderLength = std.text.append(sender, 0, SENDER_MOST, call.*.sender)
+    waiting.*.asked = ASKED_PERMISSION
+    waiting.*.question = askBus(client, IPC_PATH, IPC_INTERFACE, "Check", senderOf(waiting), PERMISSION)
+    if waiting.*.question == 0 {
+        _ = ipc.replyError(client, call, DENIED, "the bus could not be asked about login.power")
+        return
+    }
+    waiting.*.used = true
+}
+
+// The bus's answer to a question: the next question, a refusal, or the
+// call allowed (RESTART or POWER_OFF; else HANDLED). `seat`: the user
+// who holds the seat (-1: nobody); `environment` names the init's control.
+fn answered(client: *ipc.Client, waiting: *Pending, reply: *const ipc.Message, seat: isize, environment: [*][*]const u8, verbose: bool) -> u8 {
+    const fromBus = reply.*.kind == ipc.REPLY && std.text.same(reply.*.sender, BUS_NAME)
+    if waiting.*.asked == ASKED_PERMISSION {
+        var allowed = false
+        if fromBus && std.text.same(reply.*.signature, "b") {
+            var reading = ipc.reader(ipc.bodyOf(client, reply), reply.*.bodyLength)
+            allowed = ipc.readBool(&reading) && !reading.failed
+        }
+        if !allowed {
+            say(verbose, "login: ")
+            say(verbose, what(waiting.*.kind))
+            say(verbose, " refused: the bus does not let ")
+            say(verbose, senderOf(waiting))
+            say(verbose, " use login.power\n")
+            refuse(client, waiting, "this app may not restart the machine or shut it down (login.power)")
+            return HANDLED
+        }
+        waiting.*.asked = ASKED_USER
+        waiting.*.question = askBus(client, BUS_PATH, BUS_NAME, "GetConnectionUnixUser", senderOf(waiting), "")
+        if waiting.*.question == 0 { refuse(client, waiting, "the bus could not be asked who the caller is") }
+        return HANDLED
+    }
+    var known = false
+    var user: usize = 0
+    if fromBus && std.text.same(reply.*.signature, "u") {
+        var reading = ipc.reader(ipc.bodyOf(client, reply), reply.*.bodyLength)
+        user = @intCast(usize, ipc.readU32(&reading))
+        known = !reading.failed
+    }
+    if !known || seat < 0 || user != @bitCast(usize, seat) {
+        say(verbose, "login: ")
+        say(verbose, what(waiting.*.kind))
+        say(verbose, " refused: ")
+        say(verbose, senderOf(waiting))
+        if known {
+            say(verbose, " is user ")
+            sayNumber(verbose, user)
+        } else {
+            say(verbose, " is nobody the bus knows")
+        }
+        if seat < 0 {
+            say(verbose, ", and nobody holds the seat\n")
+        } else {
+            say(verbose, ", the seat is user ")
+            sayNumber(verbose, @bitCast(usize, seat))
+            say(verbose, "'s\n")
+        }
+        refuse(client, waiting, "only the user at this machine's screen may restart it or shut it down")
+        return HANDLED
+    }
+    if !init_request.listens(init_request.place(environment)) {
+        say(verbose, "login: ")
+        say(verbose, what(waiting.*.kind))
+        say(verbose, " refused: no init listens for it\n")
+        const call = callOf(waiting)
+        _ = ipc.replyError(client, &call, "org.mlx.Login.Error.NoInit", "no init listens: the machine cannot be restarted or shut down from here")
+        waiting.*.used = false
+        return HANDLED
+    }
+    say(verbose, "login: ")
+    say(verbose, what(waiting.*.kind))
+    say(verbose, " asked by ")
+    say(verbose, senderOf(waiting))
+    say(verbose, ", user ")
+    sayNumber(verbose, user)
+    say(verbose, ", who holds the seat\n")
+    var body: [8]u8 = undefined
+    const bytes: [*]u8 = &body
+    var writing: ipc.Writer = undefined
+    ipc.begin(&writing, bytes, 8)
+    ipc.putBool(&writing, true)
+    var nothing: [1]isize = [1]isize{ 0 }
+    const call = callOf(waiting)
+    _ = ipc.reply(client, &call, "b", bytes, writing.length, &nothing, 0)
+    const kind = waiting.*.kind
+    waiting.*.used = false
+    return kind
+}
+
+// A message from the bus looked at: one of the two calls, or the bus's
+// answer about a caller. What came of it (NOT_MINE: the message is for
+// the rest of the service). `seat`: the user who holds the seat (-1:
+// nobody); `environment` names the init's control (MLX_INIT_CONTROL).
+pub fn message(client: *ipc.Client, header: *const ipc.Message, seat: isize, environment: [*][*]const u8, verbose: bool) -> u8 {
+    prepare()
+    if header.*.kind == ipc.CALL {
+        if !std.text.same(header.*.path, system_end.PATH) || !std.text.same(header.*.interface, system_end.INTERFACE) { return NOT_MINE }
+        if std.text.same(header.*.member, system_end.member(system_end.RESTART)) {
+            called(client, header, RESTART)
+            return HANDLED
+        }
+        if std.text.same(header.*.member, system_end.member(system_end.SHUT_DOWN)) {
+            called(client, header, POWER_OFF)
+            return HANDLED
+        }
+        return NOT_MINE
+    }
+    if (header.*.kind != ipc.REPLY && header.*.kind != ipc.ERROR) || header.*.replySerial == 0 { return NOT_MINE }
+    var slot: usize = 0
+    while slot < PENDING_MOST {
+        if pending[slot].used && pending[slot].question == header.*.replySerial { return answered(client, &pending[slot], header, seat, environment, verbose) }
+        slot += 1
+    }
+    return NOT_MINE
+}
+
+// The init asked to end the system (`kind`: RESTART or POWER_OFF) on its
+// control, which `environment` names (MLX_INIT_CONTROL); whether it took
+// the request.
+pub fn request(kind: u8, environment: [*][*]const u8) -> bool {
+    var reply: [256]u8 = undefined
+    const bytes: [*]u8 = &reply
+    const got = init_request.send(init_request.place(environment), if kind == RESTART { "reboot" } else { "poweroff" }, "", bytes, 256)
+    return got > 0 && init_request.accepted(bytes[0..@bitCast(usize, got)])
+}

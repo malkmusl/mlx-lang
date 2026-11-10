@@ -742,8 +742,26 @@ The pieces:
     report for the rest: a faulting program ends with SIGSEGV), and
     the first process (impulse, or flux without it), started again
     (every other process ending) when it exits or faults; power.mlx:
-    system_power (the volumes committed, then halt, ACPI's power-off or
-    the reset line).
+    system_power (the volumes committed, the other processors stopped,
+    then halt, power off or restart); acpi.mlx: the firmware's tables
+    read (never run), for smp.mlx's processors and for the system's end.
+
+The machine is powered off by ACPI's soft off (S5): the sleep type the
+DSDT's `\_S5` names, written with the sleep enable bit to the PM1 control
+register the FADT names, ACPI mode turned on first where the firmware
+left it off. There is no AML interpreter: `\_S5` is a name with a
+package of small constants in every table seen, and that one form is
+read, inside the table's own length. A restart is the FADT's reset
+register where there is one, then port 0xCF9, then the keyboard
+controller's reset line where there is a controller, last a fault the
+processor cannot take. The kernel says at boot what it found:
+
+    brixOS: power off by ACPI: PM1a control at 0x604, S5 type 0 (ACPI mode is off: turned on first, 0x2 to port 0xb2); reset by ACPI's reset register (port 0xcf9, value 0xf)
+
+and at the end each step it takes. A machine whose tables give no S5 (the
+line says why) gets the ports of QEMU's chipsets tried, which are also
+the last attempt everywhere; one that is still on afterwards says so on
+the screen and stays halted.
 
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
@@ -915,7 +933,23 @@ halt, poweroff or reboot; QEMU exits with -no-reboot).
 `impulsectl status | start NAME | stop NAME | restart NAME | reload |
 poweroff | reboot | halt` asks over the FIFO /temporary/init/control
 (one line: the asker's own FIFO, the request); the answer comes on the
-asker's FIFO, the text Linux's impulse answers.
+asker's FIFO, the text Linux's impulse answers. Only the system may
+write that FIFO.
+
+The desktop ends the system through the login service. The top bar's
+session menu (under the mark at its left) has Log Out, Restart and Shut
+Down, each asking first; the greeter has Restart and Shut Down under its
+card. A log out ends the session, and sentinel starts the greeter again.
+For the other two the compositor (once the windows were asked to close)
+or the greeter calls org.mlx.Login.Restart or PowerOff on the system bus;
+sentinel asks the bus who calls (the kernel names the caller's program and
+user to the bus: channel_peer) and does it only for the user who holds
+the seat, the person logged in or, while nobody is, the greeter's. Then
+it ends the seat's compositor and writes `reboot` or `poweroff` to the
+init's FIFO. tools/check_brix_session.sh does all of it in QEMU with the
+pointer: a refusal (root on the serial console does not hold the seat), a
+log out and a second login, a restart into a second boot, a shut down
+that ends QEMU, and the kernel's lines about ACPI on q35 and pc.
 
 With a display and ignition in the programs (projects/desktop/splash/
 brixos.mlx: the same picture as MLX/Linux's boot splash, drawn by this

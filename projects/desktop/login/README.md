@@ -148,6 +148,49 @@ entry the login service uses `/run/mlx/init`. A missing, stale or refusing
 socket produces a D-Bus `Failed` error instead of attempting a kernel
 reboot directly.
 
+## Restarting and shutting down
+
+The desktop's own way to end the system is on `org.mlx.Login`
+([`power.mlx`](power.mlx)), in MLXIPC's native format; the login1 methods
+above are the surface for foreign software, and on brixOS they reach
+nothing (they speak to impulse's Linux socket).
+
+| Method | What it does |
+| --- | --- |
+| `Restart() -> b` | the machine is restarted |
+| `PowerOff() -> b` | the machine is shut down |
+
+Who may is decided here, by two questions to the bus about the caller.
+The bus answers both from what the kernel says of the connection (its
+program and its user: channel_peer on brixOS, the socket's credentials on
+Linux), never from what the caller says of itself:
+
+1. `org.mlx.IPC.Check(caller, "login.power")`: the bus's policy for the
+   app (an app that is not sandboxed has it unless `ipc.conf` says
+   otherwise).
+2. `org.freedesktop.DBus.GetConnectionUnixUser(caller)`: the caller's user
+   must be the one who holds the seat: the person logged in, or the
+   greeter's user while nobody is.
+
+A program of another user (root's shell on a serial console too: root has
+`impulsectl`), and any program whose user has no session on the seat, gets
+`AccessDenied` and nothing happens; where no init listens (a system
+another init runs) every caller gets an error, so that no session ends for
+a request nobody takes. An allowed call is answered `true`;
+then the seat's compositor is told to end (it leaves its last frame for
+the shutdown's screen) and the init is asked on its control
+([`projects/init/request.mlx`](../../init/request.mlx)): on brixOS the FIFO
+`/temporary/init/control`, which only the system may write, on Linux the
+socket `$MLX_INIT_CONTROL`. impulse stops the services and has the kernel
+end the machine.
+
+The askers are the session's compositor, for the top bar's session menu
+(Restart and Shut Down, after the windows were asked to close), and the
+greeter, for the two buttons under its card; both through
+[`projects/desktop/shared/system_end.mlx`](../shared/system_end.mlx).
+`tools/check_brix_session.sh` goes the whole way in QEMU: the refusal, a
+log out, a restart into a second boot, a shut down.
+
 ## Files
 
 | File | What it does |
@@ -157,6 +200,7 @@ reboot directly.
 | `greeter.mlx` | unprivileged greeter-compositor process lifecycle |
 | `groups.mlx` | the primary and supplementary groups for a session |
 | `login1.mlx` | one-seat compositor control, device descriptors and VT switching |
+| `power.mlx` | Restart and PowerOff: who may (the user who holds the seat), and the request to the init |
 | `session.mlx` | runtime directory, privilege drop, environment and exec |
 | `users.mlx` | the login accounts, read from the configured passwd file |
 | `native.mlx` | brixOS: the children branched, given an identity and replaced |
