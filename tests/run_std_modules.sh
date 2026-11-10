@@ -191,6 +191,7 @@ run 448_power_of_two_division_runtime "a division by a constant power of two and
 run 449_power_of_two_multiplication_runtime "a product by a constant power of two, shifted: every integer type and factor against the factor read at run time, a checked product that does not fit still trapping, elements reached by an index"
 run 450_mem_block_moves_runtime "std's mem.copy and mem.set by blocks: the bytes a byte loop gives at the lengths where words, half-KiB blocks and pages hand over, sixteen alignments, overlapping copies both ways"
 run 451_kernel_bytes_runtime "the kernel's Bytes.fill and Bytes.copy (block moves, words, bytes) built for the host: the bytes a byte loop gives at the hand-over lengths, sixteen alignments"
+run 453_splash_squeeze_runtime "ignition's frame brought to a narrower display's width (a picture drawn for the screen's shape): means by hand and against whole numbers, parts as the whole, nothing outside their reach"
 run 441_types_across_import_ring_runtime "records of three modules that import one another naming one another: pointers, records inside, a function type, sizes"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"

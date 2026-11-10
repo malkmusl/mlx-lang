@@ -77,9 +77,27 @@ nobody reads the framebuffer back. The init starts it again in shutdown
 or reboot mode when the system goes down, and `impulsectl message TEXT`
 reaches it as "M".
 What it is told it notes on its errors (the serial console). `--mode`,
-`--fps N` and `--snapshot PNG` (the last frame when it quits) are its
-options. projects/init/brixos.mlx says when it is shown;
-tools/check_brix_init.sh looks at the screen.
+`--fps N`, `--snapshot PNG` (the last frame when it quits, as drawn) and
+`--screen WIDTH:HEIGHT` are its options. projects/init/brixos.mlx says
+when it is shown; tools/check_brix_init.sh looks at the screen.
+
+The picture is drawn for the screen's shape, not the display mode's. A
+card's firmware often has no mode of a wide monitor's shape (1280x960 is
+the nearest for a 3840x1080 monitor); the monitor stretches the mode it
+gets across the screen, and rings drawn round are ellipses, the letters
+nearly three times as wide as meant. /devices/framebuffer says the
+screen's shape with its geometry (the monitor's own mode, else the mode
+the image names; `--screen 32:9` says another). Where the screen is wider
+in shape than the mode, the scene is as many pixels across as give a
+picture of the mode's height that shape (3413 for 1280x960 on 32:9; four
+times the mode's width at most), and each frame goes out brought to the
+mode's width (`paint.squeezeOut`: a pixel out is the mean of the stretch
+of the row it stands for; only the changed tiles' runs, as before). The
+picture left for the next program is the one the display holds. With the
+monitor's own mode set (the card's driver, one day) the shapes are one
+and nothing is brought together. tools/check_brix_shape.sh measures the
+letters on the screen; tests/453_splash_squeeze_runtime.mlx the means.
+A screen narrower in shape than its mode is left as it is.
 
 ## What it is told
 

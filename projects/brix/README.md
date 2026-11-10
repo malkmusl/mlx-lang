@@ -350,6 +350,16 @@ firmware's was ("brixOS: the loader set this mode, the nearest the
 firmware has to the monitor's own; the firmware's was 1024x768"), what
 the monitor says when the picture is another, a mode the firmware
 refused, the firmware's modes, and how many graphics outputs it offers.
+The shape of the screen goes on to the programs: /devices/framebuffer's
+geometry ends with it as a width and a height (the monitor's own mode
+when it says one, else the mode the loader looked for, else the
+picture's own size), and where the picture is of another shape the kernel
+says so ("brixOS: the picture is shown on a screen of the shape
+3840:1080 (the monitor's own mode); ..."). The boot screen draws for that
+shape and is round on a monitor that stretches the mode
+(projects/desktop/splash, tools/check_brix_shape.sh); the desktop does
+not yet (text brought together would not be readable: it waits for the
+monitor's own mode).
 
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
