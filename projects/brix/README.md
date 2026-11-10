@@ -133,6 +133,14 @@ of Unix's paths. The system call layer, not the tree, maps them:
 → /system/settings/users and groups, `/proc/self/exe` → the program the
 process runs. `ls /` shows only brixOS's own directories.
 
+A program's crash report (std.crash) is the host's there: with no
+/proc/self/maps and no /proc/self/comm, the program's own file (what
+/proc/self/exe links to) says where its segments are and what it is
+called, and is read into memory for its symbol and line tables; mincore
+says which of the stack's and the arena's pages are there
+(tools/check_brix_crash.sh runs the host's crashing program under flux
+and holds its reports to the host's).
+
 Besides files and directories the tree holds symbolic links (a link's
 target is its data; `Vfs.walk` follows links in the middle of a path,
 and the last one unless lstat, readlink, O_NOFOLLOW or O_CREAT|O_EXCL

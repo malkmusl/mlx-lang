@@ -122,7 +122,7 @@ echo "ok   every crash is kept in \$XDG_STATE_HOME/mlx/crashes.log, the context 
 # The coreutils install it through projects/coreutils' shared modules
 # (digest_cli.mlx for the sums) or their own main.
 missing=$(grep -oE '(Build\.)?program\(b, ([a-z_]+, )?"[^"]+", "[^"]+"' build.mlx | sed 's/.*", "//; s/"$//' | sort -u | while read -r root; do
-    [[ "$root" == *coreutils* || "$root" == *android* || "$root" == projects/brix/kernel/* ]] && continue
+    [[ "$root" == *coreutils* || "$root" == *android* || "$root" == projects/brix/kernel/main.mlx ]] && continue
     grep -qE 'crash[a-z_]*\.install\(' "$root" || echo "$root"
 done)
 [[ -z "$missing" ]] || fail "these programs do not install the crash report (std.crash install() first in main): $missing"
