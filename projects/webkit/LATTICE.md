@@ -146,10 +146,13 @@ rest in Mlx over std.heap and std.io (projects/lattice/runtime/c.mlx),
 
 What it leaves to the hand is marked `// LATTICE:` in place and counted at
 the end of the file: a function taking or returning a type the Mlx lacks
-(a `std::vector<std::tuple>`, an `ifstream`, a lambda's closure; written
-out, commented, until the hand gives the type an Mlx shape), one calling
-such a function (or one held back so), stream calls, variadic C calls
-(`printf`, `snprintf`), a `goto`. The output is kept in the repository
+by value (a class with virtual functions, an `ifstream`, a lambda's
+closure; written out, commented, until the type has an Mlx shape -- a
+pointer to such a type is passed along, the type declared opaque), one
+calling such a function (or one held back so), one with variadic
+arguments, a `goto` or `alloca`, stream calls, variadic C calls
+(`printf`, `snprintf`). Nothing is made up: what the translator cannot
+write is a comment, never a `0`. The output is kept in the repository
 (projects/lattice/angle/common and projects/lattice/runtime/libcpp.mlx),
 regenerated with `tools/check_lattice_emit.sh --update`, and the check
 fails when the translator's output drifts from what is kept. The pilot
@@ -168,6 +171,63 @@ the way mlx4 learnt packed structs laid out in bits
 (tests/434_packed_struct_runtime.mlx: C++ bit-fields are everywhere in
 ANGLE) and to negate a float by its sign bit
 (tests/435_float_negative_zero_runtime.mlx: Mat4::Ortho's `-0.0`).
+
+### Where ANGLE stands
+
+`tools/lattice_survey.sh --compile` runs the translator over every unit
+the build compiles of ANGLE (projects/webkit/lists/angle*.txt: 337
+units, 397,199 lines of C++ without the headers) and counts what comes
+out. The functions include the headers' that each unit carries along, so
+one function counts in every unit that has it; `held` are the functions
+written as comments (they work on a type or call a function the Mlx
+lacks); `compiles` are the modules mlx4 accepts on their own.
+
+| part | units | lines | functions | held | live | compiles |
+|---|---|---|---|---|---|---|
+| `src/common` | 35 | 22,853 | 1,758 | 115 | 93.9% | 23 |
+| `src/compiler/preprocessor` | 11 | 6,592 | 240 | 49 | 83.0% | 6 |
+| `src/compiler/translator` | 120 | 98,406 | 18,568 | 1,249 | 93.7% | 39 |
+| `src/gpu_info_util`, `src/image_util` | 11 | 8,152 | 702 | 16 | 97.8% | 5 |
+| `src/libANGLE` | 69 | 99,858 | 16,656 | 3,182 | 84.0% | 11 |
+| `src/libANGLE/renderer` | 21 | 10,789 | 1,725 | 88 | 95.1% | 3 |
+| `src/libANGLE/renderer/vulkan` | 55 | 92,843 | 20,820 | 1,935 | 91.5% | 8 |
+| `src/libEGL`, `src/libGLESv2`, zlib's wrapper | 15 | 57,706 | 1,203 | 1,005 | 54.5% | 12 |
+| all | 337 | 397,199 | 61,672 | 7,639 | 89.0% | 107 |
+
+Three levels, and where each is:
+
+1. **Proven** (the differential test prints the same from the Mlx and
+   the C++): eight units of `src/common`, 3,091 lines, 0.8% of ANGLE.
+2. **Compiles** as an Mlx module: 107 of 337 units.
+3. **Translates** (a first version written, the gaps marked): all 337
+   units, 89% of their functions.
+
+What holds the rest, in the order of what it would free:
+
+- **Classes with virtual functions.** They are opaque still: a pointer
+  to one is passed along, a function that reads one or calls its methods
+  is held back. The front end has the calls lowered already (the table's
+  address stored in the constructor, a call through a function pointer
+  read from it), and Mlx can say all of it (function pointers in tables,
+  read through a raw pointer: tests/436); what is missing is the record
+  with its table pointer, the tables as data, and the thunks of
+  multiple inheritance. Most of libANGLE and the Vulkan backend is
+  behind this (`gl::Context`, `rx::ContextVk`, `sh::TIntermTraverser`,
+  `angle::Subject`).
+- **The library's containers and streams** beyond string:
+  `std::map`/`set`/`unordered_map` (their node types), `shared_ptr`,
+  `std::function` and lambdas' closures, `ostringstream`/`ifstream`.
+  Each becomes a module as string did, or comes along as a template
+  instance once its parts translate.
+- **The entry points** (`src/libGLESv2`, 52% live): generated code whose
+  every function takes the context; freed with the first item.
+- A long tail the compile errors name: two functions of one Mlx name in
+  a module (25 units), a packed struct over 64 bits (6), an atomic of a
+  struct (2).
+
+The 25,180 `// LATTICE:` marks and the 5,454 calls still declared
+`extern` (functions of units not named as siblings in the survey, of
+libc beyond the runtime, of Vulkan) are the hand's list after that.
 
 ## The pilot: ANGLE
 
