@@ -359,7 +359,19 @@ struct or union naming a field twice is rejected with `MLX-E3002`
 (`tests/313_duplicate_field.mlx`). `&place` is as writable as the place:
 `&value.field` of a variable, `&pointer.*.field` through a mutable pointer
 and `&array[i]` are `*T`, through a constant `*const T`
-(`tests/307_field_address_runtime.mlx`).
+(`tests/307_field_address_runtime.mlx`). The slice of an array and a
+pointer capture over one ask the same question (`isMutable`), because an
+array's type carries no constness: `array[a..b]` is a `[]T` and `for
+*item in array` binds a `*T` where the array is a variable, a field or
+an element of one or what a mutable pointer points to; a `[]const T` and
+a `*const T` where it is a constant, a parameter (taken by value, but the
+caller's storage) or no place at all, a call's result
+(`tests/443_constant_slices_runtime.mlx`; the programs this refuses are in
+`tests/support/constant_slices_invalid`). The body of a generic function
+(an `anytype` or `comptime` parameter) is not analyzed here
+(`functions.isGeneric`), so this, like every rule about what may be
+written, does not reach into one; the lowering's own `expressionType`
+still gives every array's slice the type `[]T`.
 
 ## Comptime evaluation (`sema/comptime/evaluate.mlx`)
 

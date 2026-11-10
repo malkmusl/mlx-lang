@@ -915,6 +915,37 @@ resolves_local_module_aliases() {
     [[ $status -eq 13 ]]
 }
 
+# Whether $1 gives the slice of an array that cannot be written (a
+# constant, a parameter taken by value) the type `[]const T`: the slice
+# of an array parameter is refused where a `[]u8` is taken
+# (tests/support/constant_slices_invalid/parameter_to_callee.mlx). Older
+# compilers made it a `[]u8`, through which the callee wrote into its
+# caller's array.
+types_slices_of_constants() {
+    local probe status=0 output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" --quiet tests/support/constant_slices_invalid/parameter_to_callee.mlx -o "$probe/probe" 2>&1) || status=$?
+    rm -rf -- "$probe"
+    [[ $status -ne 0 ]] && grep -qF 'expected `[]u8`, found `[]const u8`' <<< "$output"
+}
+
+# Whether $1 gives the address of a module-level constant
+# (tests/444_constant_address_runtime.mlx exits 13: `&TABLE` is the
+# table's image, `&WORD` a slot holding it; earlier compilers lowered
+# either to no address, and a read through it faulted).
+takes_addresses_of_constants() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/444_constant_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -979,6 +1010,8 @@ probes=(
     "leaves_brixos_by_process_exit|a linked brixOS program leaving by process_exit"
     "reads_constant_tables_from_static_data|module-level const tables read from static data"
     "aligns_functions|functions at multiples of 16"
+    "types_slices_of_constants|slices of constants and of by-value parameters as []const T"
+    "takes_addresses_of_constants|the address of a module-level constant"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

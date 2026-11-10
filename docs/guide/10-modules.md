@@ -128,18 +128,22 @@ when the program starts, before `main`
 named may be declared further down the module, as any module-level
 declaration may (`tests/439_function_before_declaration_runtime.mlx`). A
 `const` aggregate, by contrast, is a value: where it is handed to a
-function, sliced or copied into a variable it is storage of that use's
-own, and nothing written there shows in the constant. A table (an array
-or struct literal of values known at compile time, no addresses among
-them) is not built anew for that: it has one image in the data area, as
-a `var` has; `TABLE[i]`, `TABLE.field` and `TABLE.length` read it there,
-and a use of the whole value is one copy of it
+function or copied into a variable it is storage of that use's own, and
+nothing written there shows in the constant; a slice of it is a `[]const
+T` and a pointer capture over it a `*const T`, which read it and write
+nothing ([Arrays and slices](05-types-and-aggregates.md#arrays-and-slices)).
+A table (an array or struct literal of values known at compile time, no
+addresses among them) is not built anew for that: it has one image in the
+data area, as a `var` has; `TABLE[i]`, `TABLE.field` and `TABLE.length`
+read it there, and a use of the whole value is one copy of it
 (`tests/442_constant_table_static_runtime.mlx`; before, every `TABLE[i]`
 of a `const TABLE = [1520]u8{ ... }` stored all of its bytes first, a
 table over what a frame takes in the aggregate arena, which is not freed:
 brixOS's console drew its font so and filled the kernel's arena in 173
 characters). A constant that holds addresses (strings, functions) or
 values not known until the program runs is still built where it is used.
+`&TABLE` is a pointer to a constant, to the table's image where it has
+one (`tests/444_constant_address_runtime.mlx`).
 `pub var` opens a global to
 other modules, which read and write it as `module.name` and may take its
 address:

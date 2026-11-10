@@ -198,6 +198,14 @@ pub fn main() u8 {
 
 (`tests/66_pointer_deref_runtime.mlx` → 8, see also `tests/57_array_pointer_capture_runtime.mlx`)
 
+The pointer is a `*T` where the elements may be written (a `var` array, a
+`[]T`) and a `*const T` where they may not (a constant, an array
+parameter, a `[]const T`), as the array's slice would be a `[]T` or a
+`[]const T` ([Arrays and slices](05-types-and-aggregates.md#arrays-and-slices)):
+`for *item in TABLE { item.* = 0 }` over a `const TABLE` is refused
+(`tests/443_constant_slices_runtime.mlx`,
+`tests/support/constant_slices_invalid/constant_captured.mlx`).
+
 ## Labels
 
 Any loop can carry a `label:` prefix. `break :label` and `continue :label`

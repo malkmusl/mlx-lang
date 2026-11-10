@@ -676,13 +676,26 @@ first time the constant is used. `TABLE[i]`, `TABLE.field`, an element of
 an element, `&TABLE[i]` (a pointer to a constant) and `TABLE.length` work
 on the slot's address; nothing the compiler emits writes there. Any other
 use of the constant is its value: an `alloca` of the type and one
-`mem_copy` from the slot, so a slice of it, a pointer capture over it or a
-callee that is handed it writes into storage of that use's own, as when
-the value was built there element by element. A constant with addresses
+`mem_copy` from the slot, so a callee that is handed it writes into
+storage of that use's own, as when the value was built there element by
+element. A slice of it and a pointer capture over it work on such a copy
+too, although nothing is written through them any more: they are a
+`[]const T` and a `*const T` (`sema/declarations.mlx`, the slice
+expression; `tests/443_constant_slices_runtime.mlx`), so the lowering
+could let them read the slot. A constant with addresses
 in it, one whose initializer is no literal, and a member of an aggregate
 are lowered as before: their initializer, where they are used
 (`tests/442_constant_table_static_runtime.mlx`,
 `tests/333_module_slices_runtime.mlx`).
+
+The address of a module-level constant, `&NAME` (a pointer to a
+constant), is the slot's for a table that has one, so `&TABLE` and
+`&TABLE[0]` are the same address and stay it; for another struct, union
+or array it is the value built where it is used, and for an integer, an
+enum's value, a boolean or a pointer a slot of the function that holds
+it (`lowerAddressOf`, `tests/444_constant_address_runtime.mlx`; before,
+such an expression lowered to no address at all, and a read through it
+faulted).
 
 ## Atomics
 
