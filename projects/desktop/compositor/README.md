@@ -110,8 +110,23 @@ mode described below), `--launcher PROGRAM|none` (what Super starts),
 X programs), `--run PROGRAM`
 (repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
 frames-per-second counters in the title bars), `--verbose` (which also
-logs, once a second, `perf:` lines with the frame rate and how long a
-frame takes to compose and present).
+logs, once a second while frames are shown, a `perf:` line).
+
+The `perf:` line says the frames shown since the last one, how long a
+frame took on average and at most, and of that the composing and the
+frame's way into the output's memory:
+
+```
+perf: 60 fps (60 frames in 1003 ms), a frame takes 6337 us on average: composing 4379 us (uploading 0, GPU 0, copying out 0), to the screen 1958 us; 7027 us at most
+```
+
+`composing` is the renderer's work (in brackets its parts with Vulkan),
+`to the screen` the copy of the composed rows into a dumb buffer or, on
+brixOS, into the framebuffer; what is left of a frame's time is the
+bookkeeping around the two. The line comes with the first frame a second
+or more after the last line's, so it can span a rest; past five seconds
+it gives no rate (`perf: 3 frames in 12034 ms with a rest, a frame takes
+...`).
 
 Each title bar shows the window's frames per second (the buffers it
 committed) and the desktop's (frames shown). Shown frames follow the
@@ -622,6 +637,27 @@ ends, also when it is told to (the terminate event, which sentinel sends
 the greeter's before the session starts and the init a service it
 stops); one that is killed or crashes leaves none, and the next starts
 without a fade.
+Every pixel there is made on the CPU, on one processor, so the frame's
+way to the screen ([`framebuffer.mlx`](framebuffer.mlx)) is kept short:
+the changed rows are copied whole (`state.copyPixels`; red and blue
+swapped two pixels to a 64-bit word for a red-first framebuffer), and
+nothing is read from the device. While the fade runs the frame is still
+composed only in what changed, and the whole of it is blended over the
+previous picture on its way out, four channels to a word (the same
+pixels as a blend a pixel at a time:
+`tests/446_compositor_framebuffer_runtime.mlx` compares them over every
+value); the fade's last frame is the whole screen at full weight.
+There is no vertical blank to wait for, so the backend paces its frames
+by a clock of its own: a frame, and with it the clients' frame
+callbacks, goes out no sooner than a frame's time (16.7 ms at 60 a
+second) after the one before was due, the loop sleeps until then, and
+what is damaged meanwhile is composed as one frame. A client that draws as
+fast as it is allowed thus gets 60 frames a second, not as many as the
+processor can compose; on a desktop at rest nothing is held back, and a
+pointer move is on the screen at once. On the machine the `perf:` lines
+of `--verbose` tell where a frame's time goes: `composing` is our own
+memory, `to the screen` the copy (or the fade's blend) into the
+framebuffer.
 No logind, VT, D-Bus, Vulkan or Xwayland there; the login is sentinel's,
 with aurora as the greeter on a compositor of its own
 (tools/check_brix_login.sh). tools/check_brix_desktop.sh runs the desktop

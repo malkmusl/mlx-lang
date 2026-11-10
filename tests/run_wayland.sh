@@ -45,9 +45,12 @@ done
 
 # The compositor's damage tracking (frames composed in what changed must
 # equal frames composed from scratch), its hit-testing with input regions,
-# and what it takes of a buffer committed with damage (the part named, and
-# the surface must hold what a whole copy gives).
-for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_region_runtime.mlx tests/290_compositor_commit_damage_runtime.mlx; do
+# what it takes of a buffer committed with damage (the part named, and
+# the surface must hold what a whole copy gives), and a frame's rows on
+# their way into a framebuffer (copied, red and blue swapped, blended over
+# the picture before: the same pixels as a pixel at a time) with the frame
+# clock that paces them.
+for test in tests/268_compositor_damage_runtime.mlx tests/270_compositor_input_region_runtime.mlx tests/290_compositor_commit_damage_runtime.mlx tests/446_compositor_framebuffer_runtime.mlx; do
     if ! "$compiler" --quiet "$test" -o "$work/test" 2> "$work/errors"; then
         echo "FAIL (compile) $test"
         cat "$work/errors"

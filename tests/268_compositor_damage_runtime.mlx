@@ -10,6 +10,17 @@
 // kept the freestanding way (composed once, its damaged part copied into
 // each slot).
 //
+// The brixOS backend's way to its framebuffer (drm.brixos.mlx, with
+// framebuffer.mlx's rows) is played along on two devices of ordinary
+// memory, their rows longer than the frame's: a red-first one that gets
+// the rows the first slot lacks whenever a frame goes into that slot (the
+// frames between are the ones the backend holds back for their time: their
+// damage is gathered), and one the opening crossfade runs on: the frame,
+// composed only in what changed, is blended whole over a picture before at
+// a weight that rises with the frames, and must be the blend, a pixel at a
+// time, of that picture and a frame composed from scratch; the fade's last
+// frame is the whole frame at full weight.
+//
 // The blur behind a surface is kept from frame to frame and made again
 // only where what lies below the surface changed, so the frame from
 // scratch is composed with nothing kept (scene.composeAnew): a blur kept
@@ -35,11 +46,16 @@ const ui = @import("std.ui")
 const state = @import("../projects/desktop/compositor/state.mlx")
 const scene = @import("../projects/desktop/compositor/scene.mlx")
 const buffers = @import("../projects/desktop/compositor/buffers.mlx")
+const framebuffer = @import("../projects/desktop/compositor/framebuffer.mlx")
 
 const Compositor = state.Compositor
 const Surface = state.Surface
 
 const WINDOWS: usize = 4
+// What a device's rows are longer than a frame's by (bytes), and what a
+// device holds where nothing was written.
+const PITCH_MORE: usize = 24
+const UNTOUCHED: u32 = 3735928559
 // A count that says "keeps no valid blur" (keptTiles).
 const NOTHING: usize = 18446744073709551615
 
@@ -197,6 +213,52 @@ fn differs(a: [*]const u8, b: [*]const u8, count: usize) -> usize {
         index += 1
     }
     return count
+}
+
+// A pixel of the frame as a device wants it (red and blue swapped for a
+// red-first one), and the crossfade's blend a pixel at a time: `from`
+// toward `to` by weight `t` (0..256) per byte channel, the high byte
+// `to`'s (as drm.brixos.mlx had them before framebuffer.mlx's rows).
+fn devicePixel(pixel: u32, swap: bool) -> u32 {
+    if swap { return (pixel & 4278255360) | ((pixel & 255) << 16) | ((pixel >> 16) & 255) }
+    return pixel
+}
+
+fn blend(from: u32, to: u32, t: usize) -> u32 {
+    const it = 256 - t
+    const r = (@intCast(usize, from & 255) * it + @intCast(usize, to & 255) * t) >> 8
+    const g = (@intCast(usize, (from >> 8) & 255) * it + @intCast(usize, (to >> 8) & 255) * t) >> 8
+    const b = (@intCast(usize, (from >> 16) & 255) * it + @intCast(usize, (to >> 16) & 255) * t) >> 8
+    return (to & 4278190080) | (@intCast(u32, b & 255) << 16) | (@intCast(u32, g & 255) << 8) | @intCast(u32, r & 255)
+}
+
+// Where `device` (rows `width` * 4 + PITCH_MORE bytes apart) differs from
+// what it should hold: `reference` blended at `weight` over `before` (256:
+// the reference alone), as a device with `swap` wants it, and nothing
+// written past a row's pixels. The byte's place in the frame, `bytes` when
+// all is as it should be.
+fn deviceDiffers(device: [*]const u8, reference: [*]const u8, before: [*]const u8, width: usize, bytes: usize, weight: usize, swap: bool) -> usize {
+    const pixels: [*]const u32 = unsafe { @ptrFromInt([*]const u32, @intFromPtr(device)) }
+    const wanted: [*]const u32 = unsafe { @ptrFromInt([*]const u32, @intFromPtr(reference)) }
+    const prior: [*]const u32 = unsafe { @ptrFromInt([*]const u32, @intFromPtr(before)) }
+    const row = width + PITCH_MORE / 4
+    var y: usize = 0
+    while y < bytes / 4 / width {
+        var x: usize = 0
+        while x < row {
+            const got = pixels[y * row + x]
+            if x >= width {
+                if got != UNTOUCHED { return (y * width + width - 1) * 4 }
+            } else {
+                const at = y * width + x
+                const pixel = if weight < 256 { blend(prior[at], wanted[at], weight) } else { wanted[at] }
+                if got != devicePixel(pixel, swap) { return at * 4 }
+            }
+            x += 1
+        }
+        y += 1
+    }
+    return bytes
 }
 
 fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
@@ -522,7 +584,10 @@ fn checkBlur(seed: *u64) -> bool {
 
 // What frames are composed into: the two slots composed the nested way,
 // the two filled the freestanding way from our own frame, that frame, and
-// the frame from scratch.
+// the frame from scratch. And the brixOS backend's two devices (their rows
+// `pitch` bytes apart): the red-first one given the rows the first slot
+// lacks, the one the crossfade runs on, the picture it fades in from, and
+// the frames presented (the fade's weight rises with them).
 const Screens = struct {
     width: usize
     bytes: usize
@@ -530,6 +595,11 @@ const Screens = struct {
     copied: [2][*]u8
     frame: [*]u8
     reference: [*]u8
+    pitch: usize
+    device: [*]u8
+    faded: [*]u8
+    before: [*]u8
+    frames: usize
     // What the last frame's slot lacked.
     region: ui.Rect
 }
@@ -554,6 +624,21 @@ fn makeScreens(compositor: *Compositor, screens: *Screens) -> void {
         screens.*.frame[index] = 3
         index += 1
     }
+    // The devices: nothing written yet; the picture before is noise.
+    const height = compositor.*.height
+    screens.*.pitch = compositor.*.width * 4 + PITCH_MORE
+    screens.*.device = state.allocate(compositor, screens.*.pitch * height)
+    screens.*.faded = state.allocate(compositor, screens.*.pitch * height)
+    screens.*.before = state.allocate(compositor, screens.*.bytes)
+    screens.*.frames = 0
+    state.fillPixels(@intFromPtr(screens.*.device), screens.*.pitch * height / 4, UNTOUCHED)
+    state.fillPixels(@intFromPtr(screens.*.faded), screens.*.pitch * height / 4, UNTOUCHED)
+    var noise: u64 = 88172645463325252
+    index = 0
+    while index < screens.*.bytes {
+        screens.*.before[index] = @intCast(u8, random(&noise, 256))
+        index += 1
+    }
 }
 
 // A frame into `slot`: composed into the slot itself (nested), and our
@@ -575,6 +660,16 @@ fn present(compositor: *Compositor, screens: *Screens, slot: usize, frame_first:
         state.copyPixels(@intFromPtr(screens.*.copied[slot]) + line, @intFromPtr(screens.*.frame) + line, @intCast(usize, region.width))
         row += 1
     }
+    // The brixOS backend's framebuffer (red first here): the rows the first
+    // slot lacks when the frame goes there. And its opening crossfade: the
+    // whole frame over the picture before, the weight rising, for a
+    // blue-first and a red-first device in turn.
+    const stride = screens.*.width * 4
+    if slot == 0 { framebuffer.copyRows(@intFromPtr(screens.*.device), screens.*.pitch, @intFromPtr(screens.*.frame), stride, region, true) }
+    const weight = screens.*.frames % 256
+    const swap = screens.*.frames & 1 == 1
+    screens.*.frames += 1
+    framebuffer.fadeRows(@intFromPtr(screens.*.faded), screens.*.pitch, @intFromPtr(screens.*.frame), @intFromPtr(screens.*.before), stride, scene.outputRect(compositor), weight, swap)
     // The truth: everything from scratch, nothing kept.
     scene.composeAnew(compositor, screens.*.reference, scene.outputRect(compositor))
     at.* = differs(screens.*.slots[slot], screens.*.reference, screens.*.bytes)
@@ -583,6 +678,27 @@ fn present(compositor: *Compositor, screens: *Screens, slot: usize, frame_first:
     if at.* < screens.*.bytes { return "the frame composed in what changed" }
     at.* = differs(screens.*.copied[slot], screens.*.reference, screens.*.bytes)
     if at.* < screens.*.bytes { return "the slot copied from the frame" }
+    if slot == 0 {
+        at.* = deviceDiffers(screens.*.device, screens.*.reference, screens.*.before, screens.*.width, screens.*.bytes, 256, true)
+        if at.* < screens.*.bytes { return "the red-first device, given the rows it lacks," }
+    }
+    at.* = deviceDiffers(screens.*.faded, screens.*.reference, screens.*.before, screens.*.width, screens.*.bytes, weight, swap)
+    if at.* < screens.*.bytes { return "the frame blended over the picture before" }
+    return ""
+}
+
+// The crossfade's last frame as the backend makes it: the whole output
+// damaged, the frame at full weight in every row of the device. Returns
+// what differs (at `at.*`), or "" when nothing does.
+fn presentLast(compositor: *Compositor, screens: *Screens, at: *usize) -> []const u8 {
+    scene.damageAll(compositor)
+    var changed: ui.Rect = undefined
+    const region = scene.takeDamage(compositor, 0, &changed)
+    scene.compose(compositor, screens.*.frame, changed)
+    framebuffer.copyRows(@intFromPtr(screens.*.faded), screens.*.pitch, @intFromPtr(screens.*.frame), screens.*.width * 4, region, false)
+    scene.composeAnew(compositor, screens.*.reference, scene.outputRect(compositor))
+    at.* = deviceDiffers(screens.*.faded, screens.*.reference, screens.*.before, screens.*.width, screens.*.bytes, 256, false)
+    if at.* < screens.*.bytes { return "the fade's last frame" }
     return ""
 }
 
@@ -1283,6 +1399,9 @@ fn play(width: usize, height: usize, steps: usize, desktop: bool, start: u64) ->
         say(" steps: too few to tell\n")
         return false
     }
+    var at: usize = 0
+    const wrong = presentLast(&compositor, &screens, &at)
+    if wrong.length != 0 { return fail(width, steps, 0, wrong, at) }
     return true
 }
 

@@ -1,0 +1,316 @@
+// A composed frame's way into a framebuffer that is only written, and the
+// frame clock of a display without a vertical blank
+// (projects/desktop/compositor/framebuffer.mlx, the brixOS backend's):
+//
+// - fadeRows, the opening crossfade two pixels to a word, gives the pixels
+//   the blend gave a pixel at a time (blend and devicePixel below, as
+//   drm.brixos.mlx had them): for every weight (0..256), every value a
+//   channel of the picture before and of the frame can have, in each of a
+//   pair's two places and as a row's last odd pixel, for a blue-first and a
+//   red-first device;
+// - copyRows copies an area's rows as they are or with red and blue
+//   swapped, whatever its left edge and width;
+// - both write the area's pixels and nothing else of the device (its rows
+//   are longer than the frame's);
+// - the clock: a frame on a desktop at rest goes out at once, a client that
+//   draws as fast as it is allowed gets the display's rate (waits rounded
+//   up to whole milliseconds and ending late), and no frame follows another
+//   sooner than a frame's time less the lateness the clock forgives.
+//
+// Exits 13.
+const std = @import("std")
+const ui = @import("std.ui")
+const framebuffer = @import("../projects/desktop/compositor/framebuffer.mlx")
+
+// A pixel of the frame as the device wants it.
+fn devicePixel(pixel: u32, swap: bool) -> u32 {
+    if swap { return (pixel & 4278255360) | ((pixel & 255) << 16) | ((pixel >> 16) & 255) }
+    return pixel
+}
+
+// `from` toward `to` by weight `t` (0..256), per byte channel; the high
+// byte is taken from `to` (the frame's X).
+fn blend(from: u32, to: u32, t: usize) -> u32 {
+    const it = 256 - t
+    const r = (@intCast(usize, from & 255) * it + @intCast(usize, to & 255) * t) >> 8
+    const g = (@intCast(usize, (from >> 8) & 255) * it + @intCast(usize, (to >> 8) & 255) * t) >> 8
+    const b = (@intCast(usize, (from >> 16) & 255) * it + @intCast(usize, (to >> 16) & 255) * t) >> 8
+    return (to & 4278190080) | (@intCast(u32, b & 255) << 16) | (@intCast(u32, g & 255) << 8) | @intCast(u32, r & 255)
+}
+
+// xorshift64.
+fn random(seed: *u64, limit: u64) -> u64 {
+    var value = seed.*
+    value = value ^ (value << 13)
+    value = value ^ (value >> 7)
+    value = value ^ (value << 17)
+    seed.* = value
+    return value % limit
+}
+
+// What the device holds where nothing was written.
+const UNTOUCHED: u32 = 3735928559
+
+// Room for `count` pixels.
+fn room(allocator: std.allocator.Allocator, count: usize) -> [*]u32 {
+    unsafe { return @ptrFromInt([*]u32, @intFromPtr(allocator.alloc(count * 4, 16).?)) }
+}
+
+fn fill(pixels: [*]u32, count: usize, value: u32) -> void {
+    var index: usize = 0
+    while index < count {
+        pixels[index] = value
+        index += 1
+    }
+}
+
+// Whether the device (rows `pitch` pixels long, `rows` of them) holds
+// `expected` (rows `width` pixels long) inside `area` and is untouched
+// everywhere else.
+fn holds(device: [*]const u32, pitch: usize, rows: usize, expected: [*]const u32, width: usize, area: ui.Rect) -> bool {
+    const left = @intCast(usize, area.x)
+    const right = left + @intCast(usize, area.width)
+    const top = @intCast(usize, area.y)
+    const bottom = top + @intCast(usize, area.height)
+    var y: usize = 0
+    while y < rows {
+        const inside_row = y >= top && y < bottom
+        var x: usize = 0
+        while x < pitch {
+            const got = device[y * pitch + x]
+            if inside_row && x >= left && x < right {
+                if got != expected[y * width + x] { return false }
+            } else if got != UNTOUCHED {
+                return false
+            }
+            x += 1
+        }
+        y += 1
+    }
+    return true
+}
+
+fn say(text: []const u8, value: usize) -> void {
+    _ = std.io.writeAll(std.io.stdout(), text)
+    _ = std.io.writeUnsigned(std.io.stdout(), value)
+    _ = std.io.writeAll(std.io.stdout(), "\n")
+}
+
+// The crossfade over every value. The pictures are 257 x 256: column x of
+// the picture before and row y of the frame give each channel all of its
+// values (a different one in each channel, so a carry from one into the
+// next would show), the high bytes are noise.
+const FADE_WIDTH: usize = 257
+const FADE_HEIGHT: usize = 256
+
+fn fadeEverywhere(allocator: std.allocator.Allocator) -> u8 {
+    const count = FADE_WIDTH * FADE_HEIGHT
+    // The device's rows are three pixels longer than the frame's.
+    const pitch = FADE_WIDTH + 3
+    const before: [*]u32 = room(allocator, count)
+    const frame: [*]u32 = room(allocator, count)
+    const expected: [*]u32 = room(allocator, count)
+    const device: [*]u32 = room(allocator, pitch * FADE_HEIGHT)
+    var generator: u64 = 88172645463325252
+    var y: usize = 0
+    while y < FADE_HEIGHT {
+        var x: usize = 0
+        while x < FADE_WIDTH {
+            const p = @intCast(u32, x & 255)
+            const f = @intCast(u32, y)
+            before[y * FADE_WIDTH + x] = (@intCast(u32, random(&generator, 256)) << 24) | ((255 - p) << 16) | (((p * 7 + 3) & 255) << 8) | p
+            frame[y * FADE_WIDTH + x] = (@intCast(u32, random(&generator, 256)) << 24) | (((f * 13 + 5) & 255) << 16) | ((255 - f) << 8) | f
+            x += 1
+        }
+        y += 1
+    }
+    const whole = ui.rect(0, 0, @intCast(i32, FADE_WIDTH), @intCast(i32, FADE_HEIGHT))
+    // (From the second column on: every pixel in the pair's other place,
+    // and no odd one at the end.)
+    const shifted = ui.rect(1, 0, @intCast(i32, FADE_WIDTH) - 1, @intCast(i32, FADE_HEIGHT))
+    var swapped: usize = 0
+    while swapped < 2 {
+        const swap = swapped == 1
+        var weight: usize = 0
+        while weight <= 256 {
+            var index: usize = 0
+            while index < count {
+                expected[index] = devicePixel(blend(before[index], frame[index], weight), swap)
+                index += 1
+            }
+            fill(device, pitch * FADE_HEIGHT, UNTOUCHED)
+            framebuffer.fadeRows(@intFromPtr(device), pitch * 4, @intFromPtr(frame), @intFromPtr(before), FADE_WIDTH * 4, whole, weight, swap)
+            if !holds(device, pitch, FADE_HEIGHT, expected, FADE_WIDTH, whole) {
+                say(if swap { "the fade (red first) differs from the blend a pixel at a time at weight " } else { "the fade differs from the blend a pixel at a time at weight " }, weight)
+                return 1
+            }
+            fill(device, pitch * FADE_HEIGHT, UNTOUCHED)
+            framebuffer.fadeRows(@intFromPtr(device), pitch * 4, @intFromPtr(frame), @intFromPtr(before), FADE_WIDTH * 4, shifted, weight, swap)
+            if !holds(device, pitch, FADE_HEIGHT, expected, FADE_WIDTH, shifted) {
+                say("the fade from the second column on differs at weight ", weight)
+                return 2
+            }
+            // Every column alone: each pixel as a row's odd last one.
+            fill(device, pitch * FADE_HEIGHT, UNTOUCHED)
+            var column: usize = 0
+            while column < 256 {
+                framebuffer.fadeRows(@intFromPtr(device), pitch * 4, @intFromPtr(frame), @intFromPtr(before), FADE_WIDTH * 4, ui.rect(@intCast(i32, column), 0, 1, @intCast(i32, FADE_HEIGHT)), weight, swap)
+                column += 1
+            }
+            if !holds(device, pitch, FADE_HEIGHT, expected, FADE_WIDTH, ui.rect(0, 0, 256, @intCast(i32, FADE_HEIGHT))) {
+                say("the fade of single pixels differs at weight ", weight)
+                return 3
+            }
+            weight += 1
+        }
+        swapped += 1
+    }
+    // At full weight the fade is the copy.
+    fill(device, pitch * FADE_HEIGHT, UNTOUCHED)
+    framebuffer.copyRows(@intFromPtr(device), pitch * 4, @intFromPtr(frame), FADE_WIDTH * 4, whole, false)
+    fill(expected, count, 0)
+    var row: usize = 0
+    while row < FADE_HEIGHT {
+        var x: usize = 0
+        while x < FADE_WIDTH {
+            expected[row * FADE_WIDTH + x] = blend(before[row * FADE_WIDTH + x], frame[row * FADE_WIDTH + x], 256)
+            x += 1
+        }
+        row += 1
+    }
+    if !holds(device, pitch, FADE_HEIGHT, expected, FADE_WIDTH, whole) { return 4 }
+    return 0
+}
+
+// Areas of every left edge and width, copied as they are and with red and
+// blue swapped.
+const COPY_WIDTH: usize = 67
+const COPY_HEIGHT: usize = 23
+
+fn copyEverywhere(allocator: std.allocator.Allocator) -> u8 {
+    const count = COPY_WIDTH * COPY_HEIGHT
+    const pitch = COPY_WIDTH + 5
+    const frame: [*]u32 = room(allocator, count)
+    const expected: [*]u32 = room(allocator, count)
+    const device: [*]u32 = room(allocator, pitch * COPY_HEIGHT)
+    var generator: u64 = 2463534242
+    var index: usize = 0
+    while index < count {
+        frame[index] = @intCast(u32, random(&generator, 4294967296))
+        index += 1
+    }
+    var swapped: usize = 0
+    while swapped < 2 {
+        const swap = swapped == 1
+        index = 0
+        while index < count {
+            expected[index] = devicePixel(frame[index], swap)
+            index += 1
+        }
+        var left: usize = 0
+        while left < COPY_WIDTH {
+            var width: usize = 0
+            while left + width <= COPY_WIDTH {
+                const top = (left * 3 + width) % (COPY_HEIGHT - 2)
+                const area = ui.rect(@intCast(i32, left), @intCast(i32, top), @intCast(i32, width), 2)
+                fill(device, pitch * COPY_HEIGHT, UNTOUCHED)
+                framebuffer.copyRows(@intFromPtr(device), pitch * 4, @intFromPtr(frame), COPY_WIDTH * 4, area, swap)
+                if !holds(device, pitch, COPY_HEIGHT, expected, COPY_WIDTH, if width == 0 { ui.rect(0, 0, 0, 0) } else { area }) {
+                    say(if swap { "rows copied with red and blue swapped differ, from column " } else { "rows copied differ, from column " }, left)
+                    say("  pixels: ", width)
+                    return 5
+                }
+                width += 1
+            }
+            left += 1
+        }
+        swapped += 1
+    }
+    return 0
+}
+
+// The frame clock, played: `spent` microseconds of composing and copying a
+// frame, a client that has its next frame's damage ready `drawn`
+// microseconds after its frame callback, waits of whole milliseconds that
+// end `late` microseconds after their time. For one second from a desktop
+// at rest: how many frames went out, and the shortest time between two.
+fn played(interval: usize, spent: usize, drawn: usize, late: usize, shortest: *usize) -> usize {
+    var now: usize = 5000000
+    const end = now + 1000000
+    var due: usize = 0
+    var frames: usize = 0
+    var last: usize = 0
+    shortest.* = 1000000
+    while now < end {
+        const wait = framebuffer.frameWait(due, now)
+        if wait != 0 {
+            // The loop sleeps (drm.brixos.mlx frameWait: whole milliseconds).
+            now += (wait + 999) / 1000 * 1000 + late
+            continue
+        }
+        due = framebuffer.nextDue(due, now, interval)
+        if frames > 0 && now - last < shortest.* { shortest.* = now - last }
+        last = now
+        frames += 1
+        // The frame is made, its callbacks go out, the client draws again.
+        now += spent + drawn
+    }
+    return frames
+}
+
+fn clock() -> u8 {
+    const interval: usize = 16666
+    // The lateness the clock forgives.
+    const late = interval / framebuffer.LATE_PART
+    // Nothing shown yet, or the last frame long ago: at once.
+    if framebuffer.frameWait(0, 1) != 0 { return 6 }
+    if framebuffer.frameWait(1000, 1000) != 0 { return 6 }
+    if framebuffer.frameWait(1000, 400) != 600 { return 6 }
+    // The first frame starts the clock; one on time keeps it (the next is
+    // due a frame's time after this one was), a late one starts it again.
+    if framebuffer.nextDue(0, 70000, interval) != 70000 + interval { return 7 }
+    if framebuffer.nextDue(70000, 70000, interval) != 70000 + interval { return 7 }
+    if framebuffer.nextDue(70000, 70900, interval) != 70000 + interval { return 7 }
+    if framebuffer.nextDue(70000, 70000 + late, interval) != 70000 + interval { return 7 }
+    if framebuffer.nextDue(70000, 70001 + late, interval) != 70001 + late + interval { return 7 }
+    if framebuffer.nextDue(70000, 900000, interval) != 900000 + interval { return 7 }
+    var shortest: usize = 0
+    // A client drawing as fast as it is allowed (3 ms a frame of ours, 2 ms
+    // of its own): the display's 60 frames in the second, not the 200 it
+    // could draw, and not the 58 that waits a millisecond long would leave;
+    // also when every wait ends late (0.4 ms, 3 ms).
+    var frames = played(interval, 3000, 2000, 0, &shortest)
+    if frames < 60 || frames > 61 { return 8 }
+    if shortest < interval - late { return 8 }
+    frames = played(interval, 3000, 2000, 400, &shortest)
+    if frames < 60 || frames > 61 { return 9 }
+    if shortest < interval - late { return 9 }
+    frames = played(interval, 3000, 2000, 3000, &shortest)
+    if frames < 60 || frames > 61 { return 9 }
+    if shortest < interval - late { return 9 }
+    // Waits that end later than the clock forgives (6 ms): the frames fall
+    // behind the display's rate, and none follows another too soon.
+    frames = played(interval, 3000, 2000, 6000, &shortest)
+    if frames < 40 || frames > 50 { return 9 }
+    if shortest < interval { return 9 }
+    // Frames that take longer than their time (25 ms): one after the
+    // other, none held back.
+    frames = played(interval, 25000, 0, 0, &shortest)
+    if frames != 40 { return 10 }
+    // A client slower than the display (it draws for 30 ms): every one of
+    // its frames at once.
+    frames = played(interval, 3000, 30000, 0, &shortest)
+    if frames != 31 { return 11 }
+    return 0
+}
+
+pub fn main() -> u8 {
+    const allocator = std.page_allocator.init()
+    var result = fadeEverywhere(allocator)
+    if result != 0 { return result }
+    result = copyEverywhere(allocator)
+    if result != 0 { return result }
+    result = clock()
+    if result != 0 { return result }
+    return 13
+}
