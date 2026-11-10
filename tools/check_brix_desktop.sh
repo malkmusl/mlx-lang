@@ -211,6 +211,23 @@ wait_for '^layer: launch '
 wait_for '^focus: launch$'
 echo "ok   the dock's apps button (a message on its channel) shows the launcher, which takes the keyboard"
 monitor "sendkey esc"
+# The top bar's workspace controls (in its middle: a button per
+# workspace, then the floating/tiling button), both ways on the bar's
+# channel: a click on the button "2" (481 to 505 from the left while two
+# show; the cursor is at 445,713) reaches the compositor, which switches
+# and tells the bar the workspaces; the bar then shows a third button and
+# its tiling part has moved to 557 to 585, where the next click turns
+# tiling on for workspace 2 (a bar that had not heard of the switch would
+# not be hit there, and would name workspace 1). Then back to workspace 1.
+monitor "mouse_move 48 -200" "mouse_move 0 -200" "mouse_move 0 -200" "mouse_move 0 -98" "mouse_button 1" "mouse_button 0"
+wait_for '^workspace: 2$'
+sleep 1
+monitor "mouse_move 78 0" "mouse_button 1" "mouse_button 0"
+wait_for '^tiling: on (workspace 2)$'
+sleep 1
+monitor "mouse_move -120 0" "mouse_button 1" "mouse_button 0"
+wait_for '^workspace: 1$'
+echo "ok   the top bar's workspace buttons and its tiling button work on the bar's channel, both ways (workspace 2, tiling on there, back to 1)"
 printf 'impulsectl poweroff\r' >&3
 wait_for '^impulse: poweroff$'
 # Told to end (the terminate event), the compositor leaves its last frame
