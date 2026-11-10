@@ -129,6 +129,24 @@ type_line 'sysinfo'
 wait_for '^device interrupts: [1-9][0-9]*$'
 echo "ok   the controller's interrupt comes as a message (MSI-X); a key typed on the USB keyboard is read from /devices/keyboard"
 
+# The mouse: the kernel reads from its report descriptor where its reports
+# have x, y and the buttons (a mouse need not send the boot protocol's
+# three bytes: many send numbered reports with 16-bit movement), and two
+# movements arrive at /devices/mouse as PS/2 packets (08 1e 14: 30 right
+# and 20 up; 38 fb f7: 5 left and 9 down). The log has the reports as they
+# came from the USB mouse.
+wait_for "^usb: the mouse's reports: x 8 bits at 8, y 8 bits at 16, 5 buttons at 0\$"
+type_line 'head -c 6 /devices/mouse | base64'
+sleep 1
+monitor "mouse_move 30 -20"
+sleep 0.5
+monitor "mouse_move -5 9"
+wait_for '^CB4UOPv3$'
+type_line 'cat /devices/klog'
+wait_for '^usb: mouse report, 4 bytes: 00 1e ec 00$'
+wait_for '^usb: mouse report, 4 bytes: 00 fb 09 00$'
+echo "ok   the USB mouse's reports are read by its report descriptor: movements arrive at /devices/mouse"
+
 # A hub, then a keyboard behind it, while the system runs (the kernel's
 # word about them is in its log, not on the console).
 monitor "device_add usb-hub,bus=xhci.0,port=3,id=hub"

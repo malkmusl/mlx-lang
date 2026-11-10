@@ -337,10 +337,11 @@ monitor stretches). Only the EDID of the display in use counts (a server
 board's management controller has a display of its own), and on the
 monitor's word the loader never goes to a picture of fewer pixels than
 the firmware's. When the firmware lacks the mode (a card's firmware
-often has no 3840x1080 for a wide monitor), the loader takes the
-largest mode that is no wider and no higher, if that is a larger
-picture than the firmware's: still stretched, but less; the monitor's
-own mode then takes the card's driver. An image may name a mode
+often has no 3840x1080 for a wide monitor), the loader takes, of the
+modes no wider and no higher, the one that shows most of a picture of
+that shape (1280x960 before 1280x1024 on such a monitor), if that is
+more than the firmware's own mode shows: still stretched, but less; the
+monitor's own mode then takes the card's driver. An image may name a mode
 itself: a file settings/display in the archive, "3840x2160" (that mode,
 or the nearest below it) or "firmware" (the firmware's, come what may);
 brix-image builds the loader for it. The kernel's log says what
