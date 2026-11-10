@@ -294,71 +294,63 @@ DIR` ranks what the functions held back wait for.
 
 ### Where ANGLE stands
 
-`tools/lattice_survey.sh --compile` runs the translator over every unit
-the build compiles of ANGLE (projects/webkit/lists/angle*.txt: 337
-units, 397,199 lines of C++ without the headers) and counts what comes
-out. The functions include the headers' that each unit carries along, so
-one function counts in every unit that has it; `held` are the functions
-written as comments (they work on a type or call a function the Mlx
-lacks); `compiles` are the modules mlx4 accepts on their own.
+`tools/lattice_translate.sh --compile` translates every unit the build
+compiles of ANGLE (projects/webkit/lists/angle*.txt: 337 units, 397,199
+lines of C++ without the headers) and the C++ library's four units
+(compiler/libcpp) as one Mlx program, and gives it to mlx4:
 
-| part | units | lines | functions | held | live | compiles |
-|---|---|---|---|---|---|---|
-| `src/common` | 35 | 22,853 | 1,780 | 123 | 93.5% | 33 |
-| `src/compiler/preprocessor` | 11 | 6,592 | 303 | 48 | 86.3% | 11 |
-| `src/compiler/translator` | 120 | 98,406 | 53,256 | 713 | 98.7% | 112 |
-| `src/gpu_info_util`, `src/image_util` | 11 | 8,152 | 699 | 20 | 97.2% | 10 |
-| `src/libANGLE` | 69 | 99,858 | 31,834 | 2,744 | 92.1% | 58 |
-| `src/libANGLE/renderer` | 21 | 10,789 | 4,152 | 79 | 98.1% | 18 |
-| `src/libANGLE/renderer/vulkan` | 55 | 92,843 | 65,193 | 2,385 | 96.5% | 43 |
-| `src/libEGL`, `src/libGLESv2`, zlib's wrapper | 15 | 57,706 | 1,652 | 1,042 | 61.3% | 13 |
-| all | 337 | 397,199 | 158,869 | 7,154 | 95.7% | 298 |
+| | |
+|---|---|
+| modules | 341, 66.3 MB of Mlx, each thing once, in its home |
+| functions written | 38,162 |
+| functions held back (written as comments) | 0 |
+| what mlx4 says | the program compiles: every function passes the analysis, the lowering and the code generator; an executable of 28.9 MB in 19 s |
+| functions declared `extern` | 302 by name |
+| `// LATTICE:` marks in live code | 124 objects zeroed through an address, 51 initializers not read, 10 floating constants, 7 unknown nodes, 4 `std::min` arguments (the other marks are comments: a base class's name, a C++ symbol) |
 
 Three levels, and where each is:
 
 1. **Proven** (the differential test prints the same from the Mlx and
-   the C++): eight units of `src/common`, 3,091 lines, 0.8% of ANGLE,
-   and the five feature tests of the translator itself.
-2. **Compiles** as an Mlx module: 298 of 337 units (81 before classes
-   with virtual functions, bit-field words and static tables).
-3. **Translates** (a first version written, the gaps marked): all 337
-   units, 95.7% of their functions.
+   the C++): eight units of `src/common`, 3,091 lines, and the feature
+   and program tests of the translator itself (projects/lattice/tests,
+   twenty-two of them: virtual calls, bit-fields, variadics, jumps,
+   objects made before main, two units as one program, the shapes the
+   whole program showed).
+2. **Compiles**: all of ANGLE, as one program. This is what the work
+   of the last rounds was: 7,154 functions were held back when the
+   units were translated alone; with every unit translated together
+   none is, and mlx4 accepts all of them.
+3. **Runs**: not yet. The executable asks its loader for the 302
+   functions it declares `extern`, and they are the rest of the way to
+   an ANGLE without C or C++ under it:
+   - 153 Vulkan functions (`vk*`) and 20 of the memory allocator
+     (`vma_*`): std.vulkan has Vulkan in Mlx; the translation names the
+     C functions still.
+   - 100 or so of the C library (`pthread_*`, `dlopen`, `fopen`,
+     `getenv`, `stat`, the float math functions `sinf`...): the runtime
+     module (projects/lattice/runtime/c.mlx) has the first sixty over
+     std; mlxlibc has all of them in Mlx.
+   - 9 of zlib (`deflate`, `inflate`, `crc32_z`) and 6 of xxHash: std
+     has both.
+   - 20 functions of the C++ library declared with their C++ symbols
+     (`std::array<T, N>::fill`): header functions the translator did
+     not carry along.
 
-A module that compiles is not yet a part of a program: each unit is
-translated on its own. What stands between this and an ANGLE in Mlx, in
-the order of the work:
+What mlx4 and mlx-cc learnt on the way (each with its test): record
+types across modules that import one another (441), a function ended by
+an endless loop (440), functions at multiples of 16 (442), function
+types with function types among their parameters (443), a statement
+ended by a line's last `.*` or `.?` (444), the address of a module-level
+constant (445), an arena of 8 GiB of address space; in mlx-cc, an
+assignment through a converting constructor of a class copied by its
+bytes, and `auto &row` over an array of arrays.
 
-- **One program instead of 337 modules.** A record a header defines and
-  a template's instance come along with every unit that uses them: a
-  type of its own in each module, where C++ has one. Calls into another
-  unit are `extern` declarations (15,395 of them) unless the unit is
-  named with `--emit-mlx-units`. The units have to be translated
-  together: every header record and every template instance once, in a
-  module that is its home, and a call into another unit `module.name`.
-  Then a linked program: the shader translator first, tested against
-  the C++ one shader by shader.
-- **The library's containers and streams** beyond string:
-  `std::map`/`set`/`unordered_map` (their node types), `shared_ptr`,
-  `std::function` and lambdas' closures, `ostringstream`/`ifstream`.
-  Each becomes a module as string did, or comes along as a template
-  instance once its parts translate. Most of the 7,154 functions held
-  back wait for these (a function that calls a held-back one is held
-  back with it).
-- **The entry points** (`src/libGLESv2`, 61% live): generated code whose
-  every function takes the context and validates through the classes
-  above.
-- **The Vulkan backend's calls** (`vk*`, 7,544 externs under
-  `renderer/vulkan`): std.vulkan has them in Mlx; the translation names
-  the C functions still.
-- The 39 modules mlx4 refuses: pointers to arrays stepped as pointers
-  (`T (*)[2]`), a constant array's address where a mutable pointer is
-  wanted, parameter packs taken by value, a lambda's closure called by
-  name, classes with virtual bases, `snprintf` and `fcntl` with their
-  variadic arguments, and two tables of functions mlx4 does not resolve
-  (not understood yet).
-
-The 47,670 `// LATTICE:` marks (dropped logs and stream expressions for
-the most part) are the hand's list after that.
+The order of what is next: the 302 externs (the C library through the
+runtime, Vulkan through std.vulkan, zlib and xxHash through std, the 20
+library functions carried along), so that the program starts; the
+shader translator run against the C++ one shader by shader; the marks
+in live code; the EGL and GLES entry points as `export fn`, which is
+what WebKit links.
 
 ## The pilot: ANGLE
 
