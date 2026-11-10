@@ -159,6 +159,7 @@ nothing (they speak to impulse's Linux socket).
 | --- | --- |
 | `Restart() -> b` | the machine is restarted |
 | `PowerOff() -> b` | the machine is shut down |
+| `MayEndSystem() -> b` | whether either would be done for this caller (the same questions, nothing done): the compositor asks it before it closes a session's windows |
 
 Who may is decided here, by two questions to the bus about the caller.
 The bus answers both from what the kernel says of the connection (its

@@ -751,7 +751,9 @@ DSDT's `\_S5` names, written with the sleep enable bit to the PM1 control
 register the FADT names, ACPI mode turned on first where the firmware
 left it off. There is no AML interpreter: `\_S5` is a name with a
 package of small constants in every table seen, and that one form is
-read, inside the table's own length. A restart is the FADT's reset
+read, inside the table's own length; a package that is not two sleep
+types, or two definitions that differ, is not taken (what went to the
+register would be a guess). A restart is the FADT's reset
 register where there is one, then port 0xCF9, then the keyboard
 controller's reset line where there is a controller, last a fault the
 processor cannot take. The kernel says at boot what it found:
@@ -761,7 +763,8 @@ processor cannot take. The kernel says at boot what it found:
 and at the end each step it takes. A machine whose tables give no S5 (the
 line says why) gets the ports of QEMU's chipsets tried, which are also
 the last attempt everywhere; one that is still on afterwards says so on
-the screen and stays halted.
+the screen, with the line above and the steps it took (they were said
+while a program had the display), and stays halted.
 
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
