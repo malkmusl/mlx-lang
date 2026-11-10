@@ -399,6 +399,44 @@ archive by name (`Archive.find`), a vector for its interrupt
 picture is the console and the desktop's screen: the file's head says
 what must not be done to the card while it is.
 
+Its display controller (DCE 11.2) is read, not yet set
+(gpu_display.mlx; the register numbers are those of Linux's
+dce_11_2_d.h, vid.h and gmc_8_1_d.h, looked up there; only a Polaris
+card's is read, on another AMD card the same numbers are other
+registers and the log says that it is not read). For every
+controller that is on the log says the timing (the size shown, the
+totals, blanking and sync), the primary surface (its address in the
+card's memory, pitch, extent, control word), the viewport and what it
+is to fill, the scaler (mode, taps, ratios, borders) with the line
+buffer before it, the encoder it goes out by (DisplayPort with its
+lanes, or TMDS) and the frames it counts in a second with the pixel
+clock that follows (measured: the PLL's dividers are not read). Then
+one line says what it shows:
+
+    gpu: controller 0 shows 3840x1080 from a picture of 1280x960: the card scales
+    gpu: controller 0 shows a picture of 1280x960 as it is: the monitor is sent 1280x960
+
+In the first case a picture of the size shown needs only a surface of
+that size, the viewport, the scaler and the line buffer set on the
+running controller, and "gpu: would set" lines say with what (the
+surface in the aperture after the firmware's picture and surface); that
+is the monitor's own size only if the firmware runs the monitor's own
+timing, which the kernel cannot tell (it does not read the EDID). In the
+second the pixel clock, the timing and the link have to be set, which
+is not there yet. Numbers that do not fit together (a total smaller
+than what is shown, a viewport that is not the firmware's picture, an
+address outside the aperture) are not concluded from: "gpu: the
+read-out is not plausible (...): the register map needs correcting".
+The registers themselves
+("gpu: raw 1b80: 00000f9f ...": a register's number, then its value and
+those of the registers after it) are in the log only
+(/devices/klog); a shell shows them by themselves with
+
+    while read l; do case "$l" in "gpu: raw"*) echo "$l";; esac; done < /devices/klog
+
+tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
+numbers on the host.
+
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and
 hubs, a network controller's link going down and up said to the stack.
