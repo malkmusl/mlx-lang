@@ -100,7 +100,23 @@ pub fn processors() -> *Processors { return &found }
 // The kernel lock: the processor holding it (+ 1; 0: none) and how
 // often it took it (an interrupt while it waits inside the kernel takes
 // it again).
-var lockOwner: usize = 0 // (per run)
+//
+// A processor that waits only LOOKS at the word until it reads free, and
+// tries to take it then (a compare-and-swap asks for the word's cache
+// line for itself whether it succeeds or not: seven processors doing
+// that in a loop keep taking the line from the one that holds the lock,
+// which then waits for memory at every step of its own work, and from
+// each other). Between two looks it pauses (the processor's hint that
+// this is a wait: Cpu.relax). The word has a cache line to itself: what
+// lies beside it (the depth, the processor's number, which the holder
+// reads all the time) must not travel with it.
+const Lock = struct {
+    before: [8]usize
+    owner: usize
+    after: [7]usize
+}
+
+var kernel: Lock = undefined // (per run)
 var lockDepth: usize = 0 // (per run)
 // The processor the kernel runs on (valid while it holds the lock).
 var current: usize = 0 // (per run)
@@ -109,13 +125,18 @@ pub fn currentCpu() -> usize { return current }
 
 // The kernel taken by processor `id` (waited for when another has it).
 pub fn lock(id: usize) -> void {
-    if lockOwner == id + 1 {
+    // (Its own number is there only while it holds the lock: a second
+    // entry.)
+    if @atomicLoad(usize, &kernel.owner, monotonic) == id + 1 {
         lockDepth += 1
         return
     }
     while true {
-        const taken = @cmpxchgWeak(usize, &lockOwner, 0, id + 1, acquire, monotonic)
-        if taken.0 { break }
+        if @atomicLoad(usize, &kernel.owner, monotonic) == 0 {
+            const taken = @cmpxchgWeak(usize, &kernel.owner, 0, id + 1, acquire, monotonic)
+            if taken.0 { break }
+        }
+        cpu.Cpu.relax()
     }
     lockDepth = 1
     current = id
@@ -123,7 +144,7 @@ pub fn lock(id: usize) -> void {
 
 pub fn unlock() -> void {
     lockDepth -= 1
-    if lockDepth == 0 { @atomicStore(usize, &lockOwner, 0, release) }
+    if lockDepth == 0 { @atomicStore(usize, &kernel.owner, 0, release) }
 }
 
 fn physical(address: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(address)) }
@@ -366,6 +387,70 @@ pub fn startTimer() -> void {
 // The end of a local APIC interrupt (its timer's, a device's message).
 pub fn endOfInterrupt() -> void { put(EOI, 0) }
 
+// A time slice, in the clock's nanoseconds (what timerTicks counts).
+const SLICE: usize = 10000000
+// The shortest wait a timer is set for (what setting it takes).
+const SHORTEST: usize = 20000
+
+// The processor whose timer is set for a wait's deadline (+ 1; 0: none),
+// and that deadline: one processor wakes for it, not every idle one (seven
+// that wake for one process's frame only queue for the kernel to find it
+// taken).
+var waker: usize = 0 // (per run)
+var wakerDeadline: usize = 0 // (per run)
+
+// This processor, about to halt with nothing to run, woken at `deadline`
+// (the clock's nanoseconds; 0: none): its local APIC's timer set for the
+// time until then when that is sooner than its next tick, and no other
+// processor's is set for as soon. A process that waits with a deadline (a
+// frame's, a sleep's) is found by a processor looking for work, and an
+// idle one looks when an interrupt wakes it: the tick alone made every
+// such wait a hundredth of a second coarse (thirty frames a second came
+// out as 30, 30, 40 ms at best, with one processor as 25 a second).
+// Whether the timer was set: then `disarm` after the halt puts it back.
+// The first processor's time slices are the PIT's, its local APIC's timer
+// is free for this; another's counts its slices, and only its period is
+// shortened for once.
+pub fn arm(deadline: usize) -> bool {
+    if deadline == 0 || !found.usable || found.timerTicks == 0 { return false }
+    if waker != 0 && waker != current + 1 && wakerDeadline <= deadline { return false }
+    const now = clock.system().monotonic()
+    var left: usize = if deadline > now { deadline - now } else { 0 }
+    if left >= SLICE { return false }
+    if left < SHORTEST { left = SHORTEST }
+    const ticks = left * found.timerTicks / SLICE
+    if current != 0 {
+        // (Sooner than the tick that is on its way already?)
+        if ticks >= @intCast(usize, get(TIMER_CURRENT)) { return false }
+    } else {
+        put(TIMER_DIVIDE, 0xB)
+        put(LVT_TIMER, @intCast(u32, layout.Vector.LAPIC_TIMER))
+    }
+    put(TIMER_INITIAL, @intCast(u32, if ticks == 0 { 1 } else { ticks }))
+    waker = current + 1
+    wakerDeadline = deadline
+    return true
+}
+
+// After the halt `arm` set the timer for: the first processor's timer
+// off again, another's back to its slices.
+pub fn disarm() -> void {
+    put(TIMER_INITIAL, if current != 0 { @intCast(u32, found.timerTicks) } else { 0 })
+    if waker == current + 1 { waker = 0 }
+}
+
+// This processor goes on with a process while a wait's `deadline` (0:
+// none) is less than a time slice away and no processor's timer is set
+// for it (this one's was, or the wait is new): an idle one is woken, which
+// sets its own on its way back to the halt.
+pub fn cover(deadline: usize) -> void {
+    if deadline == 0 || !found.usable || found.timerTicks == 0 { return }
+    if waker != 0 && waker != current + 1 && wakerDeadline <= deadline { return }
+    if deadline >= clock.system().monotonic() + SLICE { return }
+    const other = idleProcessor()
+    if other.0 { wake(other.1) }
+}
+
 // Whether the devices may raise their interrupts as messages:
 // /system/settings/interrupts saying "polled" keeps them looked at on the
 // timer tick alone (the way to start a machine whose messages are in
@@ -425,6 +510,10 @@ pub fn start() -> void {
     found.running = 1
     found.timerTicks = 0
     const out = console.out
+    // The local APIC's timer measured where there is one, also on a
+    // machine where one processor runs: waits with a deadline are woken
+    // by it (arm).
+    if ready() { measureTimer() }
     const root = rsdp()
     if root == 0 {
         out.write("brixOS: no ACPI tables found (one processor runs)\n")
@@ -493,7 +582,6 @@ pub fn start() -> void {
         return
     }
     if found.x2 { out.write("brixOS: the local APICs are in x2APIC mode\n") }
-    measureTimer()
     if found.timerTicks == 0 {
         out.write("brixOS: the local APIC's timer does not count (one processor runs)\n")
         return
